@@ -31,3 +31,8 @@ getrandom = "0.2"
 indexmap = "2"
 ureq = { workspace = true, optional = true }
 tiny_http = { workspace = true, optional = true }
+
+# the hub service (B1 `python -m xbt402.hub --config hub.json`); the library needs none of these
+[[bin]]
+name = "xbt402-hub"
+required-features = ["rpc", "http-client", "http-server"]
