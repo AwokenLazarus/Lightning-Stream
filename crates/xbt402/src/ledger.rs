@@ -115,7 +115,7 @@ impl Ledger {
             let f = File::open(path).map_err(io_err)?;
             for line in BufReader::new(f).lines() {
                 let Ok(line) = line else { break };
-                let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+                let Ok(v) = crate::json::parse(&line) else { continue };
                 let st = ChannelState::from_json(&v)?;
                 channels.insert(st.params.channel_id(), st);
             }

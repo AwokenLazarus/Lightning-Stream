@@ -37,7 +37,7 @@ fn die(msg: String) -> ! {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let conf_path = args.iter().position(|a| a == "--config").and_then(|i| args.get(i + 1)).unwrap_or_else(|| die("usage: xbt402-hub --config hub.json [--close-all]".into()));
-    let conf: Value = serde_json::from_str(&std::fs::read_to_string(expand(conf_path)).unwrap_or_else(|e| die(format!("config: {e}"))))
+    let conf: Value = xbt402::json::parse(&std::fs::read_to_string(expand(conf_path)).unwrap_or_else(|e| die(format!("config: {e}"))))
         .unwrap_or_else(|e| die(format!("config: {e}")));
     let node = &conf["node"];
     let host = node.get("host").and_then(Value::as_str).unwrap_or("127.0.0.1");

@@ -184,7 +184,7 @@ fn provider(node: Arc<StubNode>, handler_body: &'static [u8], ctype: bool) -> Pr
 }
 
 fn body_json(r: &HttpResponse) -> Value {
-    serde_json::from_slice(&r.body).unwrap_or(Value::Null)
+    xbt402::json::parse_slice(&r.body).unwrap_or(Value::Null)
 }
 
 fn hdr(r: &HttpResponse, k: &str) -> String {

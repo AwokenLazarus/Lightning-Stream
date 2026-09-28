@@ -234,7 +234,7 @@ fn route_request(net: &Arc<MemNet>, pay: &RoutePayer, sh: &Arc<Shard>, tamper: O
     let hdr = b64json(&json!({"x402Version": 2, "accepted": accepted, "payload": pl}));
     let r = NetTransport(net.clone()).request("POST", &format!("{HUB}{HUB_ROUTE_PATH}"), body.as_bytes(), &[("PAYMENT-SIGNATURE".into(), hdr)]).unwrap();
     pay.signer().void_lock(&chan).unwrap();
-    (r.status, serde_json::from_slice(&r.body).unwrap_or(Value::Null))
+    (r.status, xbt402::json::parse_slice(&r.body).unwrap_or(Value::Null))
 }
 
 fn world(n: usize, kw: PKw) -> W {
@@ -440,7 +440,7 @@ fn hub_lock(w: &W, route_over: Value, pl_over: Value) -> (u16, Value) {
     pl["auth"] = request_auth(&key, &p2.channel_id(), pl.get("seq"), pl.get("cum"), None, &request_digest("POST", ROUTE_LOCK_PATH, body.as_bytes())).into();
     let r = NetTransport(w.net.clone()).request("POST", &format!("{o}{ROUTE_LOCK_PATH}"), body.as_bytes(),
                                                   &[("PAYMENT-SIGNATURE".into(), b64json(&json!({"x402Version": 2, "accepted": {}, "payload": pl})))]).unwrap();
-    (r.status, serde_json::from_slice(&r.body).unwrap())
+    (r.status, xbt402::json::parse_slice(&r.body).unwrap())
 }
 
 #[test]

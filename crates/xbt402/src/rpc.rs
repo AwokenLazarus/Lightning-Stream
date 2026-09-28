@@ -52,7 +52,7 @@ impl Rpc {
             Err(e) => return fail("rpc_error", e.to_string()),
         };
         let text = resp.into_string().map_err(|e| ChannelError::new("rpc_error", e.to_string()))?;
-        let v: Value = serde_json::from_str(&text).map_err(|e| ChannelError::new("rpc_error", e.to_string()))?;
+        let v: Value = crate::json::parse(&text).map_err(|e| ChannelError::new("rpc_error", e.to_string()))?;
         if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
             return fail("rpc_error", err.get("message").and_then(Value::as_str).unwrap_or("error").to_string());
         }

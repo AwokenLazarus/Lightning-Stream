@@ -910,7 +910,7 @@ impl Provider {
         }
         let pk = path_key(path);
         if [FACILITATOR_SUPPORTED, FACILITATOR_VERIFY, FACILITATOR_SETTLE].contains(&pk) {
-            let parsed = || serde_json::from_slice::<Value>(body).map_err(|e| ChannelError::new("bad_request", e.to_string()));
+            let parsed = || crate::json::parse_slice(body).map_err(|e| ChannelError::new("bad_request", e.to_string()));
             let r = match (method, pk) {
                 ("GET", FACILITATOR_SUPPORTED) => Ok(self.supported()),
                 ("POST", FACILITATOR_VERIFY) => parsed().map(|v| self.facilitator_verify(&v)),
@@ -939,7 +939,7 @@ impl Provider {
                 _ => None,
             };
             let Some(action) = action.filter(|_| method == "POST") else { return HttpResponse::text(404, "not found") };
-            let r = serde_json::from_slice::<Value>(body).map_err(|e| ChannelError::new("bad_request", e.to_string())).and_then(|v| action(self, &v));
+            let r = crate::json::parse_slice(body).map_err(|e| ChannelError::new("bad_request", e.to_string())).and_then(|v| action(self, &v));
             return match r {
                 Ok(v) => HttpResponse::json(200, &v),
                 Err(e) => HttpResponse::json(400, &json!({"error": e.code, "detail": e.to_string()})),

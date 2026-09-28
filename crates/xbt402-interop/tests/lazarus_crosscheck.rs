@@ -47,7 +47,7 @@ fn profile0_pow_hash_matches_lazarus_protocol() {
 
 #[test]
 fn captured_knots_headers_match_lazarus_protocol() {
-    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(xbt402_interop::vectors_dir().join("blake2b_regtest.json")).unwrap()).unwrap();
+    let v: serde_json::Value = xbt402::json::parse(&std::fs::read_to_string(xbt402_interop::vectors_dir().join("blake2b_regtest.json")).unwrap()).unwrap();
     let mut n = 0;
     for h in v["headers"].as_array().unwrap() {
         let raw = hex::decode(h["header"].as_str().unwrap()).unwrap();

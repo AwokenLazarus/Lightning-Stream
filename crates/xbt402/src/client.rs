@@ -190,7 +190,7 @@ impl Client {
     fn post(&self, url: &str, obj: &Value) -> Result<Value> {
         let r = self.transport.request("POST", url, crate::json::dumps(obj).as_bytes(),
                                        &[("Content-Type".into(), "application/json".into())])?;
-        let data: Value = serde_json::from_slice(&r.body).map_err(|_| ChannelError::new("provider_error", format!("HTTP {} non-JSON", r.status)))?;
+        let data: Value = crate::json::parse_slice(&r.body).map_err(|_| ChannelError::new("provider_error", format!("HTTP {} non-JSON", r.status)))?;
         if r.status != 200 {
             // the provider's words go in the message, never in the code an agent reports (L12)
             let code = data.get("error").and_then(Value::as_str).filter(|c| safe_code(c)).unwrap_or("provider_error");
@@ -540,11 +540,11 @@ impl Client {
         if r.status == 402 {
             // refused: the provider did not keep the conditional state
             ch.pending_cond = None;
-            let code = serde_json::from_slice::<Value>(&r.body).ok().and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_string))
+            let code = crate::json::parse_slice(&r.body).ok().and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_string))
                 .filter(|c| safe_code(c)).unwrap_or_else(|| "refused".into());
             return fail(&code, "conditional call refused");
         }
-        let k = serde_json::from_slice::<Value>(&r.body).ok().and_then(|v| v.get("preimage").and_then(Value::as_str).and_then(|k| hex::decode(k).ok()))
+        let k = crate::json::parse_slice(&r.body).ok().and_then(|v| v.get("preimage").and_then(Value::as_str).and_then(|k| hex::decode(k).ok()))
             .ok_or_else(|| ChannelError::new("no_preimage", format!("HTTP {} without k: recover_conditional reads k from the provider's claim", r.status)))?;
         if sha256(&k) != h {
             return fail("bad_preimage", "provider preimage does not match H");

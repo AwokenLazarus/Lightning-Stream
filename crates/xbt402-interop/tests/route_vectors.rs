@@ -6,7 +6,7 @@ use xbt402_interop::vectors_dir;
 
 fn published() -> (String, Value) {
     let s = std::fs::read_to_string(vectors_dir().join("xbt402_routing_vectors.json")).unwrap();
-    let v = serde_json::from_str(&s).unwrap();
+    let v = xbt402::json::parse(&s).unwrap();
     (s, v)
 }
 

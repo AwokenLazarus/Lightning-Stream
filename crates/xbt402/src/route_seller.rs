@@ -142,7 +142,7 @@ impl RouteSeller {
             PathBuf::from(format!("{}.routes.json", s.strip_suffix(".json").unwrap_or(&s)))
         });
         let mut st = SellerState { quote_seq: now_i(), ..Default::default() };
-        if let Some(raw) = path.as_ref().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
+        if let Some(raw) = path.as_ref().and_then(|p| std::fs::read(p).ok()).and_then(|b| crate::json::parse_slice(&b).ok()) {
             for (k, v) in raw.get("sessions").and_then(Value::as_object).into_iter().flatten() {
                 if let Some(s) = RouteSession::from_json(v) {
                     st.sessions.insert(k.clone(), s);
@@ -500,7 +500,7 @@ impl Provider {
         let hdr = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("PAYMENT-SIGNATURE")).map(|(_, v)| v.as_str()).unwrap_or("");
         let parsed = (|| -> Option<(Value, Value)> {
             let pl = unb64json(hdr).ok()?.get("payload")?.clone();
-            let route = serde_json::from_slice::<Value>(body).ok()?.get("route")?.clone();
+            let route = crate::json::parse_slice(body).ok()?.get("route")?.clone();
             (pl.is_object() && route.is_object()).then_some((pl, route))
         })();
         let Some((pl, route)) = parsed else { return err_json(400, "bad_payload", "") };
@@ -605,7 +605,7 @@ mod tests {
         let mut s = RouteSession { session: "s".into(), client_pub: "02".into(), path: "/p".into(), created: 1.5, seq: 3,
                                    accrued_amsat: 813_000_000_000_123_456_789 * 1000, paid_sat: 9, calls: 4, unpaid_since: 0.0,
                                    lock_id: "l".into(), t: "00".into(), point: "02".into(), valid_until: 7.25, last_lock: json!({}), locks: 1 };
-        let v: Value = serde_json::from_str(&dumps(&s.to_json())).unwrap();
+        let v: Value = crate::json::parse(&dumps(&s.to_json())).unwrap();
         assert_eq!(RouteSession::from_json(&v).unwrap(), s);
         s.paid_sat = 10_000_000_000;
         assert!(s.owed_amsat() < 0);

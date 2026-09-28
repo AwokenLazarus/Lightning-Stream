@@ -9,7 +9,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("--check") {
         let path = args.get(1).expect("--check FILE");
-        let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).expect("read")).expect("json");
+        let doc: serde_json::Value = xbt402::json::parse(&std::fs::read_to_string(path).expect("read")).expect("json");
         let bad = check(&doc);
         let n = check_count(&doc);
         if bad.is_empty() {

@@ -18,7 +18,7 @@ socket, RemoteSigner behind RoutePayer, ch1 funded from the signer's hot key) ag
 hub + providers at 100x the prices (so ch1 passes its dust floor and each lock is a new signer state), with
 the same checks plus the signer's: every lock pre-signed in the signer under
 policy:routing, the routed 24 h spend == ch1's signed state, ch1's change to the hot key, the log intact.
-Ports: base+10*i .. +2 (hub, providers); the RSS runs at base+100+10*j. Env: XBT402_B1, XBT402_DATADIR,
+Ports: base+10*i .. +2 (hub, providers); the RSS runs at base+ROUTE_RSS_OFFSET+10*j (default 100). Env: XBT402_B1, XBT402_DATADIR,
 XBT402_RPCPORT, RS_BIN, PY, ROUTE_PB, ROUTE_RUN, ROUTE_ONLY (e.g. "RS-PY-RS,PY-RS-PY,RSS-RS-RS"),
 ROUTE_SECONDS, ROUTE_RATE."""
 import itertools
@@ -43,6 +43,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 RS = os.environ["RS_BIN"]
 PY = os.environ.get("PY", sys.executable)
 PB = int(os.environ.get("ROUTE_PB", "33100"))
+RSS_OFFSET = int(os.environ.get("ROUTE_RSS_OFFSET", "100"))
 RUN = os.environ["ROUTE_RUN"]
 SECONDS = float(os.environ.get("ROUTE_SECONDS", "6"))
 RATE = float(os.environ.get("ROUTE_RATE", "10"))
@@ -157,7 +158,7 @@ def start_rust_signer(d, hub_url):
 
 def scenario(i, client, hub_impl, prov_impl):
     name = f"{client}-{hub_impl}-{prov_impl}"
-    base = PB + 10 + 10 * i if client != "RSS" else PB + 100 + 10 * i
+    base = PB + 10 + 10 * i if client != "RSS" else PB + RSS_OFFSET + 10 * i
     hub_port, ports = base, [base + 1, base + 2]
     d = os.path.join(RUN, name)
     os.makedirs(d, exist_ok=True)

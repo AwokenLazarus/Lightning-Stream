@@ -362,7 +362,7 @@ fn payee_pays_checks(v: &Value) -> Vec<String> {
 
 fn read_json(path: &Path) -> Result<Value, String> {
     let s = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    serde_json::from_str(&s).map_err(|e| format!("{}: {e}", path.display()))
+    xbt402::json::parse(&s).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// The 50 xbt402 vectors.

@@ -23,9 +23,7 @@ sha2.workspace = true
 hex.workspace = true
 thiserror.workspace = true
 serde.workspace = true
-# arbitrary_precision: routed prices and meters are amsat (1e-21 sat) integers far above u64, and signed
-# quotes must round-trip them exactly (B1 writes Python ints)
-serde_json = { workspace = true, features = ["arbitrary_precision"] }
+serde_json.workspace = true
 base64.workspace = true
 getrandom = "0.2"
 indexmap = "2"

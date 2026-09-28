@@ -257,7 +257,7 @@ impl RoutePayer {
 
     fn post(&self, url: &str, v: &Value) -> Result<Value> {
         let r = self.http.request("POST", url, dumps(v).as_bytes(), &[("Content-Type".into(), "application/json".into())])?;
-        let data: Value = serde_json::from_slice(&r.body).map_err(|_| ChannelError::new("provider_error", format!("HTTP {} non-JSON", r.status)))?;
+        let data: Value = crate::json::parse_slice(&r.body).map_err(|_| ChannelError::new("provider_error", format!("HTTP {} non-JSON", r.status)))?;
         if r.status != 200 {
             let code = data.get("error").and_then(Value::as_str).filter(|c| safe_code(c)).unwrap_or("provider_error");
             return fail(code, py_str(data.get("detail")));
@@ -372,7 +372,7 @@ impl RoutePayer {
         lk(&sh.state).call_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
         let mut state = hdr_json(&r, "ROUTE-STATE");
         if state.is_none() && r.status == 402 {
-            let doc: Value = serde_json::from_slice(&r.body).unwrap_or(Value::Null);
+            let doc: Value = crate::json::parse_slice(&r.body).unwrap_or(Value::Null);
             state = doc.get("routeState").cloned();
             lk(&sh.state).stopped = doc.get("error").and_then(Value::as_str).unwrap_or("refused").to_string();
         }
@@ -576,7 +576,7 @@ impl RoutePayer {
                                   &[("PAYMENT-SIGNATURE".into(), b64json(&json!({"x402Version": 2, "accepted": accepted, "payload": pl}))),
                                     ("Content-Type".into(), "application/json".into())]);
         let (status, doc) = match r {
-            Ok(r) => (r.status, serde_json::from_slice::<Value>(&r.body).unwrap_or(Value::Null)),
+            Ok(r) => (r.status, crate::json::parse_slice(&r.body).unwrap_or(Value::Null)),
             Err(_) => (0, Value::Null),
         };
         let mut st = lk(&self.st);

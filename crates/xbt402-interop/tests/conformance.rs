@@ -5,7 +5,7 @@ use xbt402_interop::conformance::{run_all, xbt402_check};
 use xbt402_interop::vectors_dir;
 
 fn published() -> Value {
-    serde_json::from_str(&std::fs::read_to_string(vectors_dir().join("xbt402_vectors.json")).unwrap()).unwrap()
+    xbt402::json::parse(&std::fs::read_to_string(vectors_dir().join("xbt402_vectors.json")).unwrap()).unwrap()
 }
 
 #[test]

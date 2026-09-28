@@ -266,7 +266,7 @@ impl OutBook {
     pub fn open(path: Option<&Path>) -> Result<Self> {
         let mut b = Self { path: path.map(Path::to_path_buf), ..Default::default() };
         if let Some(raw) = path.and_then(|p| std::fs::read(p).ok()) {
-            let v: Value = serde_json::from_slice(&raw).map_err(|e| ChannelError::new("ledger_error", e.to_string()))?;
+            let v: Value = crate::json::parse_slice(&raw).map_err(|e| ChannelError::new("ledger_error", e.to_string()))?;
             for (k, c) in v.get("chans").and_then(Value::as_object).into_iter().flatten() {
                 b.chans.insert(k.clone(), OutChannel::from_json(c)?);
             }
@@ -539,7 +539,7 @@ impl RouteHub {
         let t0 = Instant::now();
         let parsed = (|| -> Option<(Value, Value, i128, i128, String, String)> {
             let pl = unb64json(hdr).ok()?.get("payload")?.clone();
-            let rt = serde_json::from_slice::<Value>(body).ok()?.get("route")?.clone();
+            let rt = crate::json::parse_slice(body).ok()?.get("route")?.clone();
             if !pl.is_object() || !rt.is_object() {
                 return None;
             }
@@ -777,7 +777,7 @@ impl RouteHub {
         let hdrs = vec![("PAYMENT-SIGNATURE".to_string(), b64json(&json!({"x402Version": 2, "accepted": oc.terms, "payload": pl}))),
                         ("Content-Type".to_string(), "application/json".to_string())];
         let r = self.http.request("POST", &format!("{origin}{ROUTE_LOCK_PATH}"), body.as_bytes(), &hdrs).ok()?;
-        let doc: Value = serde_json::from_slice(&r.body).ok()?;
+        let doc: Value = crate::json::parse_slice(&r.body).ok()?;
         if r.status == 200 && doc.is_object() && truthy(doc.get("secret")) {
             return Some(doc);
         }
@@ -932,12 +932,12 @@ impl RouteHub {
 
     fn get_json(&self, url: &str) -> Result<(u16, Value)> {
         let r = self.http.request("GET", url, b"", &[])?;
-        Ok((r.status, serde_json::from_slice(&r.body).unwrap_or(Value::Null)))
+        Ok((r.status, crate::json::parse_slice(&r.body).unwrap_or(Value::Null)))
     }
 
     fn post_json(&self, url: &str, v: &Value) -> Result<(u16, Value)> {
         let r = self.http.request("POST", url, dumps(v).as_bytes(), &[("Content-Type".into(), "application/json".into())])?;
-        Ok((r.status, serde_json::from_slice(&r.body).unwrap_or(Value::Null)))
+        Ok((r.status, crate::json::parse_slice(&r.body).unwrap_or(Value::Null)))
     }
 
     /// Fund a ch2 to `origin` from the hub's own wallet. It opens (the watcher) once the funding

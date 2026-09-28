@@ -35,7 +35,7 @@ use xbt_primitives::tx::Tx;
 
 use crate::channel::DUST;
 use crate::error::{fail, ChannelError, Result};
-use crate::json::{dumps_compact, py_str};
+use crate::json::{dumps_compact, int_text, py_str};
 
 pub const AMSAT_PER_SAT: u128 = 1_000_000_000_000_000_000_000;
 pub const AMSAT_PER_MSAT: u128 = 1_000_000_000_000_000_000;
@@ -122,7 +122,8 @@ pub fn verify_body(pub_hex: &str, tag: &str, body: &Value, sig_hex: &str) -> boo
 
 fn get_i(d: &Map<String, Value>, k: &str, code: &str) -> Result<i128> {
     match d.get(k) {
-        Some(Value::Number(n)) => n.to_string().parse::<i128>().map_err(|_| ChannelError::new(code, format!("{k} is not an integer"))),
+        Some(v @ (Value::Number(_) | Value::Object(_))) => int_text(v).and_then(|t| t.parse::<i128>().ok())
+            .ok_or_else(|| ChannelError::new(code, format!("{k} is not an integer"))),
         _ => fail(code, format!("'{k}'")),
     }
 }
@@ -137,18 +138,17 @@ fn obj<'a>(d: &'a Value, code: &str, what: &str) -> Result<&'a Map<String, Value
 
 /// A JSON integer of any size (amsat).
 pub fn int_value(n: u128) -> Value {
-    Value::Number(n.to_string().parse::<Number>().unwrap_or_else(|_| Number::from(0)))
+    crate::json::big_uint(n)
 }
 
 /// A JSON integer or decimal string as u128 (`int(x)` on the reference's amsat fields).
 pub fn u128_of(v: Option<&Value>) -> Option<u128> {
     match v? {
-        Value::Number(n) => n.to_string().parse().ok(),
         Value::String(s) => {
             let t = s.trim();
             (!t.is_empty() && t.len() <= 39 && t.bytes().all(|c| c.is_ascii_digit())).then(|| t.parse().ok()).flatten()
         }
-        _ => None,
+        v => int_text(v)?.parse().ok(),
     }
 }
 
@@ -490,7 +490,7 @@ mod tests {
         let pq = PriceQuote { pay_to: hex::encode(ecdsa::pubkey(&sk)), network: "n".into(), path: "/v1".into(),
                               amsat_per_call: 813 * 10u128.pow(18) + 123_456_789, unit: "call".into(), seq: 1, issued_at: 1, valid_until: 2,
                               sig: String::new() }.sign(&sk);
-        let wire: Value = serde_json::from_str(&crate::json::dumps(&pq.to_json())).unwrap();
+        let wire: Value = crate::json::parse(&crate::json::dumps(&pq.to_json())).unwrap();
         let back = PriceQuote::from_json(&wire).unwrap();
         assert!(back.verify());
         assert_eq!(back.amsat_per_call, 813_000_000_000_123_456_789);

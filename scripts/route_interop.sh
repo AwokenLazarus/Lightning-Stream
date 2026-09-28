@@ -19,6 +19,8 @@ cd "$(dirname "$0")/.."
 ROOT=$PWD
 B1=${XBT402_B1:-$HOME/xbt-rnd/b1-agp-029}
 PB=${XBT_RS_ROUTE_PORT_BASE:-33100}
+# the RSS runs sit at PB+RSS+10*j (j = 0, 1); ROUTE_RSS_OFFSET=3 keeps every port below PB+100
+RSS=${ROUTE_RSS_OFFSET:-100}
 R=${XBT_RS_RUN:-$ROOT/run}/route-$$
 export XBT402_B1=$B1
 export XBT_BIN=${XBT_BIN:-$HOME/lazarus-regtest/b1-xbt402/knots-29.4.2}
@@ -27,7 +29,7 @@ export XBT402_RPCPORT=$((PB + 1)) XBT402_P2PPORT=$((PB + 2))
 export XBT402_MATURITY_PAD=6800
 export PY=${XBT402_PYTHON:-$HOME/xbt-rnd/b1/.venv/bin/python}
 [ -x "$PY" ] || PY=python3
-export RS_BIN=$ROOT/target/release ROUTE_PB=$PB ROUTE_RUN=$R
+export RS_BIN=$ROOT/target/release ROUTE_PB=$PB ROUTE_RUN=$R ROUTE_RSS_OFFSET=$RSS
 SOAK=(systemd-run --user --scope -q -p CPUQuota=200% -p MemoryMax=4G nice -n 19)
 mkdir -p "$R"
 cleanup() {
@@ -40,7 +42,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
 
-ports=$(seq $((PB + 1)) $((PB + 2)); seq $((PB + 10)) $((PB + 94)); seq $((PB + 100)) $((PB + 112)))
+ports=$(seq $((PB + 1)) $((PB + 2)); seq $((PB + 10)) $((PB + 94)); seq $((PB + RSS)) $((PB + RSS + 2)); seq $((PB + RSS + 10)) $((PB + RSS + 12)))
 python3 "$HOME/xbt-rnd/xbt-063/tools/portcheck.py" wait $ports
 "${SOAK[@]}" cargo build -q -j2 --release -p xbt402-interop --bins
 "${SOAK[@]}" cargo build -q -j2 --release -p xbt402 --all-features --bin xbt402-hub

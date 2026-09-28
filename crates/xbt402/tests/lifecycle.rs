@@ -301,19 +301,19 @@ fn refusals() {
     let hdr = vec![("PAYMENT-SIGNATURE".to_string(), b64json(&payment_payload(&acc, &pl)))];
     assert_eq!(prov.serve("GET", "/v1/q", &hdr, b"", "", None).status, 200);
     let replay = prov.serve("GET", "/v1/q", &hdr, b"", "", None);
-    let b: Value = serde_json::from_slice(&replay.body).unwrap();
+    let b: Value = xbt402::json::parse_slice(&replay.body).unwrap();
     assert_eq!((replay.status, b["error"].as_str().unwrap(), b.get("channel").is_none()), (402, "bad_auth", true));
     // the same payload for another request body does not authenticate
     let mut pl2 = pl.clone();
     pl2["seq"] = json!(ch.seq + 5);
     let other = vec![("PAYMENT-SIGNATURE".to_string(), b64json(&payment_payload(&acc, &pl2)))];
-    let b: Value = serde_json::from_slice(&prov.serve("GET", "/v1/q", &other, b"", "", None).body).unwrap();
+    let b: Value = xbt402::json::parse_slice(&prov.serve("GET", "/v1/q", &other, b"", "", None).body).unwrap();
     assert_eq!(b["error"], "bad_auth");
     // wrong network / payTo
     let mut acc2 = acc.clone();
     acc2["network"] = "bip122:22222222222222222222222222222222".into();
     let wrong = vec![("PAYMENT-SIGNATURE".to_string(), b64json(&payment_payload(&acc2, &pl2)))];
-    let b: Value = serde_json::from_slice(&prov.serve("GET", "/v1/q", &wrong, b"", "", None).body).unwrap();
+    let b: Value = xbt402::json::parse_slice(&prov.serve("GET", "/v1/q", &wrong, b"", "", None).body).unwrap();
     assert_eq!(b["error"], "unsupported_scheme_or_network");
     // a lowered state is stale; a relabelled signature is refused
     let v = prov.facilitator_verify(&facilitator_request(&acc, &json!({"chan": chan, "cum": "547", "sig": sig546})));
@@ -321,11 +321,11 @@ fn refusals() {
     // body over the limit; the routing lock endpoint (AGP-026) refuses a request without a payment as B1 does
     assert_eq!(prov.serve("POST", "/v1/q", &[], &vec![0u8; MAX_BODY + 1], "", None).status, 400);
     let r = prov.serve("POST", LOCK_PATH, &[], b"{}", "", None);
-    assert_eq!((r.status, serde_json::from_slice::<Value>(&r.body).unwrap()["error"].clone()), (400, json!("bad_payload")));
+    assert_eq!((r.status, xbt402::json::parse_slice(&r.body).unwrap()["error"].clone()), (400, json!("bad_payload")));
     assert_eq!(prov.serve("GET", LOCK_PATH, &[], b"", "", None).status, 405);
     // a close not signed by the payer
     let r = prov.serve("POST", CLOSE_PATH, &[], json!({"chan": chan, "sig": "3006020101020101"}).to_string().as_bytes(), "", None);
-    assert_eq!(serde_json::from_slice::<Value>(&r.body).unwrap()["error"], "bad_sig");
+    assert_eq!(xbt402::json::parse_slice(&r.body).unwrap()["error"], "bad_sig");
     // a price raised mid-channel is refused by the client
     let prov2 = Arc::new(Provider::new(chain.clone(), secret("provider payTo"), ProviderConfig::new(NET), Ledger::in_memory(),
                                        Box::new(|_, _| 5_000), Box::new(|_, _, _| HttpResponse::new(200, vec![], vec![]))).unwrap());

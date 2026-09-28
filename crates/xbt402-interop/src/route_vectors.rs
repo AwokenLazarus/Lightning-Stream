@@ -219,7 +219,7 @@ fn write_indent(out: &mut String, v: &Value, level: usize) {
             out.push_str(&pad(level));
             out.push(']');
         }
-        Value::Object(m) if !m.is_empty() => {
+        Value::Object(m) if !m.is_empty() && xbt402::json::as_big_int(v).is_none() => {
             out.push_str("{\n");
             for (i, (k, x)) in m.iter().enumerate() {
                 out.push_str(&pad(level + 1));
@@ -371,7 +371,7 @@ pub fn check(doc: &Value) -> Vec<String> {
     ok("lock ch1 completion (t + r) is a valid 0x21 state".into(), sig1.last() == Some(&0x21) && ecdsa::verify(&p1.payer_pub, &z1, &sig1[..sig1.len() - 1])
         && Sc::from_hex64(s(lk, "hubSecret")) == Some(s1) && scalar(lk, "clientReceipt") == Some(t));
     ok("lock provider answer signed".into(), state_verify(&pubh(&key("lock/provider")), &lk["providerAnswer"]["session"]));
-    let rb: Value = serde_json::from_str(s(lk, "routeBody")).unwrap_or(Value::Null);
+    let rb: Value = xbt402::json::parse(s(lk, "routeBody")).unwrap_or(Value::Null);
     ok("lock the invoice and fee quote in the route body verify".into(),
        Invoice::from_json(&rb["route"]["invoice"]).is_ok_and(|i| i.verify()) && FeeQuote::from_json(&rb["route"]["feeQuote"]).is_ok_and(|q| q.verify()));
     bad

@@ -47,7 +47,7 @@ pub fn b64json(v: &Value) -> String {
 /// Inverse of [`b64json`].
 pub fn unb64json(s: &str) -> Result<Value> {
     let raw = B64.decode(s.trim()).map_err(|_| ChannelError::new("bad_payload", "not base64"))?;
-    serde_json::from_slice(&raw).map_err(|_| ChannelError::new("bad_payload", "not JSON"))
+    crate::json::parse_slice(&raw).map_err(|_| ChannelError::new("bad_payload", "not JSON"))
 }
 
 /// `sha256(method | path | body)` hex: which request a payment or receipt is for.
