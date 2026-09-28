@@ -225,8 +225,10 @@ also the only option buildable here without pulling from a registry.
 - cmp: the same choice, with `cmpd` per backend.
 
 **Build tooling.** This host has no rootless Docker, podman or buildah. `docker buildx` runs through the
-docker group (no sudo), and needs no binfmt because the Dockerfile has no `RUN`. The exported OCI
-archives are reproducible: `SOURCE_DATE_EPOCH` is the commit time, and `rewrite-timestamp` is set.
+docker group (no sudo), and needs no binfmt because the Dockerfile has no `RUN`. The exports are
+built for reproducibility: `SOURCE_DATE_EPOCH` is the commit time, `rewrite-timestamp` is set, and the base layer is
+generated deterministically. The base layer digest was the same on every build. Byte-identical rebuilds of the
+binary layers have not been verified yet.
 
 ## 7. Test
 
