@@ -110,7 +110,9 @@ def main():
             return sats_from_xbt(v)
         except ValueError:
             return None  # B2 raises: the request fails
-    sats = [[v, sx(v)] for v in ["0", "1", "0.00000546", "0.1", "1.5", "0.123456789", "-1", "12", ".5", 0, 1, 0.5, 1e-05, 2.00000001, "abc", "1.x"]]
+    sats = [[v, sx(v)] for v in ["0", "1", "0.00000546", "0.1", "1.5", "0.123456789", "-1", "12", ".5",
+                                 0, 1, 0.5, 1e-05, 2.00000001, "abc", "1.x",
+                                 0.00001, "1e-05", 0.00000001, 21e6]]
     msgs = {
         "approve": approval.canonical_message("tok-_A1", C, 5000, 1790000900).hex(),
         "recover": approval.recover_message(C, 1790000900).hex(),
