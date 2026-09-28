@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/xbt-primitives", "crates/xbt402", "crates/xbt402-interop"]
+members = ["crates/xbt-primitives", "crates/xbt402", "crates/xbt402-interop", "crates/xbt-electrum"]
 
 [workspace.package]
 version = "0.1.0"
@@ -25,6 +25,7 @@ ureq = "2.12"
 tiny_http = "0.12"
 xbt-primitives = { path = "crates/xbt-primitives" }
 xbt402 = { path = "crates/xbt402" }
+xbt-electrum = { path = "crates/xbt-electrum" }
 
 [profile.release]
 opt-level = 3
