@@ -37,29 +37,32 @@ use crate::{err, Result};
 
 pub const XBT_SATS: i64 = 100_000_000;
 
-/// Decimal-safe XBT → sats (B2 `sats_from_xbt`): -1 for a negative amount.
-pub fn sats_from_xbt(v: Option<&Value>) -> i64 {
+/// Decimal-safe XBT → sats (B2 `sats_from_xbt`): -1 for a negative amount, `None` where B2's
+/// `int()` raises (the request then fails).
+pub fn sats_from_xbt(v: Option<&Value>) -> Option<i64> {
     let s = match v {
         None | Some(Value::Null) => "0".to_string(),
         Some(Value::String(s)) => s.trim().to_string(),
         Some(Value::Number(n)) => {
             if let Some(i) = n.as_i64() { i.to_string() } else { crate::pyjson::py_float(n.as_f64().unwrap_or(0.0)) }
         }
-        Some(Value::Bool(b)) => (*b as i64).to_string(),
+        Some(Value::Bool(false)) => "0".to_string(),
+        Some(Value::Bool(true)) => "True".to_string(),
         Some(other) => other.to_string(),
     };
-    if s.is_empty() || s == "false" {
-        return 0;
-    }
     if s.starts_with('-') {
-        return -1;
+        return Some(-1);
     }
+    let int = |x: &str| -> Option<i64> {
+        let x = x.strip_prefix('+').unwrap_or(x);
+        if x.is_empty() || !x.bytes().all(|c| c.is_ascii_digit()) { None } else { x.parse().ok() }
+    };
     match s.split_once('.') {
         Some((whole, frac)) => {
             let frac: String = format!("{frac}00000000").chars().take(8).collect();
-            whole.parse::<i64>().unwrap_or(0) * XBT_SATS + frac.parse::<i64>().unwrap_or(0)
+            Some(int(if whole.is_empty() { "0" } else { whole })? * XBT_SATS + int(&frac)?)
         }
-        None => s.parse::<i64>().unwrap_or(0) * XBT_SATS,
+        None => Some(int(&s)? * XBT_SATS),
     }
 }
 
@@ -262,7 +265,7 @@ impl Signer {
                                 "not_ported": ["vault", "treasury", "forward"], "hot": self.hot_status(false), "channels": self.book.list_public()}))
             }
             "quote_payment" => {
-                let d = self.engine.quote(&self.payment(p))?;
+                let d = self.engine.quote(&self.payment(p)?)?;
                 let mut out = d.as_value();
                 out["fee_estimate"] = self.node.call("estimatesmartfee", json!([1])).unwrap_or(Value::Null);
                 sanitize(out)
@@ -437,14 +440,14 @@ impl Signer {
         })
     }
 
-    fn payment(&self, p: &Value) -> Payment {
+    fn payment(&self, p: &Value) -> Result<Payment> {
         let amount = match p.get("amount_sats").filter(|v| !v.is_null()) {
-            Some(v) => py_int(Some(v)).unwrap_or(0),
-            None => sats_from_xbt(p.get("amount_xbt")),
+            Some(v) => py_int(Some(v)).ok_or_else(|| err("bad_request", "amount_sats is not an integer"))?,
+            None => sats_from_xbt(p.get("amount_xbt")).ok_or_else(|| err("bad_request", "amount_xbt is not a decimal number"))?,
         };
         let to = str_or_empty(p.get("to"));
         let to = if to.is_empty() { str_or_empty(p.get("dest")) } else { to };
-        Payment::new(&to, amount, &str_or_empty(p.get("memo")))
+        Ok(Payment::new(&to, amount, &str_or_empty(p.get("memo"))))
     }
 
     // --- refund custody, the watcher, the human sweep --------------------------------------------------
@@ -663,7 +666,7 @@ impl Signer {
     }
 
     fn pay_locked(&self, p: &Value, human: bool) -> Result<Value> {
-        let pay = self.payment(p);
+        let pay = self.payment(p)?;
         let d = self.engine.evaluate(&pay, human)?;
         if !d.allowed() {
             return Ok(d.as_value());
@@ -990,7 +993,7 @@ impl Signer {
         }
         let amount = match p.get("amount_sats").filter(|v| !v.is_null()) {
             Some(v) => py_int(Some(v)).unwrap_or(0),
-            None => sats_from_xbt(p.get("amount_xbt")),
+            None => sats_from_xbt(p.get("amount_xbt")).unwrap_or(-1),
         };
         let expiry = py_int(p.get("expiry")).unwrap_or(0);
         let sig_hex = { let s = str_or_empty(p.get("signature")); if s.is_empty() { str_or_empty(p.get("sig")) } else { s } };
@@ -1064,5 +1067,11 @@ impl Signer {
                 println!("watcher: {}", crate::pyjson::dumps_sorted_compact(&a));
             }
         }
+    }
+}
+
+impl std::fmt::Debug for Signer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Signer").field("root", &self.root).field("chain", &self.chain).field("mining", &self.mining).finish_non_exhaustive()
     }
 }
