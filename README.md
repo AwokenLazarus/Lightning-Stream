@@ -13,7 +13,7 @@ Local repo, no remote. Workspace crates:
 | `xbt402` | channel params, payee tweak v2, funding script, states, close, rollover, refund, v1.2 payee-pays, conditional hash locks, the 402 wire, receipts, request auth, provider verifier, payer client, ledger | library |
 | `xbt402-interop` | conformance suite, Rust→JSON vector emitter, regtest cross-implementation tools | no (`publish = false`) |
 
-References (read-only): B1 `agp-029` `3d48f4c` (`~/xbt-rnd/b1-agp-029`, `xbt402/`; AGP-023 `f105ccc` plus the AGP-029 close report), B2 `agp-next2`
+References (read-only): B1 `agp-029` `a7c3521` (`~/xbt-rnd/b1-agp-029`, `xbt402/`; AGP-023 `f105ccc` plus the AGP-029 close report), B2 `agp-next2`
 `04c3f56` (`~/xbt-rnd/b2`, `agentwallet/headers.py`), and `lazarus-protocol` (`~/Bitcoin/lazarus/protocol`).
 
 ## Build and verify
