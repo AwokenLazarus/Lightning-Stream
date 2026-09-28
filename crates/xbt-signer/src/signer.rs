@@ -175,6 +175,8 @@ pub struct SignerOptions {
     pub adaptor: Option<Arc<dyn AdaptorScheme>>,
     /// Overrides `B2_ANCHOR_SOCK`.
     pub anchor: Option<AnchorClient>,
+    /// Overrides `B2_HOT_KEYFILE` / `B2_HOT_PASSPHRASE` (the container entry point's secret source, AGP-038).
+    pub keystore: Option<Arc<KeyStore>>,
 }
 
 pub struct Signer {
@@ -229,7 +231,10 @@ impl Signer {
         let sock_path = std::env::var("B2_SIGNER_SOCK").map(PathBuf::from).unwrap_or_else(|_| run.join("signer.sock"));
         let pub_hex = raw.get("human_pubkey").and_then(Value::as_str).unwrap_or("").trim().to_string();
         let human_pubkey = if pub_hex.is_empty() { vec![] } else { x2b(&pub_hex).ok_or_else(|| err("policy", "human_pubkey is not hex"))? };
-        let keystore = KeyStore::from_env(Some(&run), true)?.map(Arc::new);
+        let keystore = match opts.keystore.clone() {
+            Some(k) => Some(k),
+            None => KeyStore::from_env(Some(&run), true)?.map(Arc::new),
+        };
         if keystore.is_none() && !KeyStore::plaintext_allowed() {
             return Err(err("keystore", "the signer's hot key must be encrypted at rest: set B2_HOT_KEYFILE (a 32-byte key file outside the run dir) \
                                         or B2_HOT_PASSPHRASE (B2_HOT_ALLOW_PLAINTEXT=1 for tests)"));

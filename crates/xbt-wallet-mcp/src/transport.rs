@@ -49,8 +49,11 @@ pub fn serve_stdio(server: Arc<Server>) {
     }
 }
 
+/// The readiness probe behind `GET /readyz`: ready or not, and a JSON status.
+pub type ReadyFn = Arc<dyn Fn() -> (bool, Value) + Send + Sync>;
+
 /// Settings of the HTTP transport.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct HttpConfig {
     /// `host:port` to listen on (loopback unless `allow_remote`).
     pub addr: String,
@@ -59,6 +62,24 @@ pub struct HttpConfig {
     /// When set, every request needs `Authorization: Bearer <token>`.
     pub token: Option<String>,
     pub allow_remote: bool,
+    /// A path prefix a reverse proxy keeps (`XBT_BASE_PATH`): `<base>/mcp`, `<base>/healthz`. Requests
+    /// without it are served too, for proxies that strip it.
+    pub base: String,
+    /// `GET /readyz`; `None`: ready whenever the process serves.
+    pub ready: Option<ReadyFn>,
+}
+
+impl HttpConfig {
+    pub fn new(addr: impl Into<String>) -> Self {
+        Self { addr: addr.into(), path: "/mcp".into(), token: None, allow_remote: false, base: String::new(), ready: None }
+    }
+}
+
+impl std::fmt::Debug for HttpConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpConfig").field("addr", &self.addr).field("path", &self.path).field("token", &self.token.as_ref().map(|_| "<set>"))
+            .field("allow_remote", &self.allow_remote).field("base", &self.base).finish()
+    }
 }
 
 const MAX_SESSIONS: usize = 256;
@@ -104,7 +125,21 @@ fn same(a: &str, b: &str) -> bool {
 type Sessions = Arc<Mutex<HashMap<String, (Session, std::time::Instant)>>>;
 
 fn handle_http(server: &Server, cfg: &HttpConfig, sessions: &Sessions, mut req: tiny_http::Request) {
-    let path = req.url().split('?').next().unwrap_or("").to_string();
+    let raw = req.url().split('?').next().unwrap_or("").to_string();
+    let path = xbt_svc::proxy::strip_base(&raw, &cfg.base).unwrap_or(raw);
+    // health probes (Docker HEALTHCHECK, Umbrel, StartOS): no token, no session, nothing secret
+    if matches!(path.as_str(), "/healthz" | "/readyz") && matches!(req.method(), Method::Get | Method::Head) {
+        if path == "/healthz" {
+            return reply(req, 200, serde_json::json!({"ok": true, "service": "xbt-wallet-mcp"}).to_string(), &[]);
+        }
+        let (ok, status) = cfg.ready.as_ref().map(|f| f()).unwrap_or((true, serde_json::json!({})));
+        let mut body = serde_json::json!({"ok": ok, "service": "xbt-wallet-mcp"});
+        if let (Some(b), Value::Object(m)) = (body.as_object_mut(), status) {
+            b.extend(m);
+        }
+        body["ok"] = ok.into();
+        return reply(req, if ok { 200 } else { 503 }, body.to_string(), &[]);
+    }
     if path != cfg.path {
         return reply(req, 404, rpc_error(-32600, "Not found"), &[]);
     }
@@ -183,7 +218,7 @@ pub fn serve_http(server: Arc<Server>, cfg: HttpConfig) -> Result<(), String> {
         return Err("--http-allow-remote needs XBT_MCP_HTTP_TOKEN".into());
     }
     let http = tiny_http::Server::http(&cfg.addr).map_err(|e| format!("{}: {e}", cfg.addr))?;
-    eprintln!("xbt-wallet-mcp: streamable HTTP on http://{}{}", cfg.addr, cfg.path);
+    eprintln!("xbt-wallet-mcp: streamable HTTP on http://{}{}{} (health: /healthz, /readyz)", cfg.addr, xbt_svc::proxy::normalize_base(&cfg.base), cfg.path);
     let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
     let cfg = Arc::new(cfg);
     for req in http.incoming_requests() {

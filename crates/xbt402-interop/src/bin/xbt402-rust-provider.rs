@@ -3,6 +3,7 @@
 //!
 //! xbt402-rust-provider --port P --rpc-port R --cookie PATH [--close-fee-payer payer|payee]
 //!                      [--conditional PATH:PRICE:PLAINTEXT] [--ledger FILE] [--price SAT]
+//!                      [--bind ADDR] [--rpc-host HOST]   (default 127.0.0.1; the container test, AGP-038)
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,7 +23,7 @@ fn arg(name: &str) -> Option<String> {
 
 fn main() {
     let port = arg("--port").expect("--port");
-    let rpc = Rpc::from_cookie(&format!("http://127.0.0.1:{}", arg("--rpc-port").expect("--rpc-port")),
+    let rpc = Rpc::from_cookie(&format!("http://{}:{}", arg("--rpc-host").unwrap_or_else(|| "127.0.0.1".into()), arg("--rpc-port").expect("--rpc-port")),
                                std::path::Path::new(&arg("--cookie").expect("--cookie"))).expect("cookie");
     let anchor = rpc.call("getblockhash", json!([101])).expect("block 101");
     let network = network_id(anchor.as_str().expect("hash"));
@@ -55,8 +56,9 @@ fn main() {
             eprintln!("watcher: {e}");
         }
     });
-    let hs = xbt402::http::serve_http(prov.clone(), &format!("127.0.0.1:{port}"), 4).expect("bind");
-    println!("xbt402-rust-provider ready on 127.0.0.1:{port} network {network} payTo {} closeFeePayer {:?}",
+    let bind = arg("--bind").unwrap_or_else(|| "127.0.0.1".into());
+    let hs = xbt402::http::serve_http(prov.clone(), &format!("{bind}:{port}"), 4).expect("bind");
+    println!("xbt402-rust-provider ready on {bind}:{port} network {network} payTo {} closeFeePayer {:?}",
              prov.pay_to(), prov.cfg.close_fee_payer);
     for h in hs {
         let _ = h.join();

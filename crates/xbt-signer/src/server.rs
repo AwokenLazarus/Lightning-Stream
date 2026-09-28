@@ -29,9 +29,23 @@ fn handle(signer: &Signer, req: &Value) -> Result<Value> {
     signer.handle(method, req.get("params").unwrap_or(&json!({})))
 }
 
+/// The socket's mode: `B2_SIGNER_SOCK_MODE` (octal, default 600). 660 lets the signer's group (the
+/// MCP's container, AGP-038) connect; never wider than 660.
+pub fn sock_mode() -> Result<u32> {
+    let raw = std::env::var("B2_SIGNER_SOCK_MODE").unwrap_or_default();
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(0o600);
+    }
+    match u32::from_str_radix(raw, 8) {
+        Ok(m) if m & !0o660 == 0 => Ok(m),
+        _ => Err(err("config", format!("B2_SIGNER_SOCK_MODE={raw}: an octal mode within 660"))),
+    }
+}
+
 /// Bind `sock` and serve it on background threads, with the watcher when `watch` is set.
 pub fn spawn(signer: Arc<Signer>, sock: &Path, watch: bool) -> Result<Running> {
-    let listener = Listener::bind(sock, 0o600).map_err(|e| err("io", format!("{}: {e}", sock.display())))?;
+    let listener = Listener::bind(sock, sock_mode()?).map_err(|e| err("io", format!("{}: {e}", sock.display())))?;
     let stop = Arc::new(AtomicBool::new(false));
     if watch && signer.watch_interval > 0.0 {
         let (s, st) = (signer.clone(), stop.clone());

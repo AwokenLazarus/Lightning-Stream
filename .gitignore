@@ -3,3 +3,5 @@
 *.tmp
 /run
 /dist/logs
+/dist/oci/*.tar
+/dist/oci/ctx
