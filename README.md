@@ -23,18 +23,22 @@ cargo test -j2 --workspace
 cargo build -j2 --release --target aarch64-unknown-linux-gnu -p xbt402
 ./scripts/conformance.sh           # N/N byte-identical, both directions
 ./scripts/regtest_interop.sh       # Rust <-> Python on a private Knots 29.4.2 regtest node
+./scripts/build_matrix.sh          # every AGP-031 target; writes dist/MATRIX.md
 ```
 
 Run heavy work under a CPU and memory cap:
 `systemd-run --user --scope -p CPUQuota=200% -p MemoryMax=4G nice -n 19 ...` (the scripts do).
 
-**aarch64.** There is no system cross toolchain on the build host, so zig is the C compiler (for
-libsecp256k1) and the linker. Set it up once with
+**Cross builds (AGP-031).** There is no system cross toolchain on the build host, so zig is the C
+compiler (libsecp256k1) and the rustc linker. Set it up once with
 `python3 -m venv ~/.local/share/ziglang-venv && ~/.local/share/ziglang-venv/bin/pip install ziglang`.
-`.cargo/config.toml` points the aarch64 target at `tools/zig-cc-aarch64` (glibc 2.28 floor). The
-offline self-test `cargo build --release --target aarch64-unknown-linux-gnu -p xbt402 --example selftest`
-links to a 1.99 MB aarch64 PIE (2.30 MB on x86_64). A Pi can run it; build-host has no aarch64
-emulator.
+`.cargo/config.toml` points every non-host target at `tools/zig-cc` (GNU/Linux glibc floor 2.28;
+musl targets are statically linked). `scripts/build_matrix.sh` builds `xbt-primitives`, `xbt402`
+and the offline `selftest` example in `release` and `release-small` (opt-level `z`, fat LTO) for
+x86_64/aarch64/armv7/riscv64 Linux (glibc + static musl), macOS x86_64/arm64, and Windows x86_64,
+and writes sizes plus status to `dist/MATRIX.md`. The self-test is executed on the host for
+x86_64; other arches need a user-mode emulator already on PATH (the script never installs
+binfmt/qemu).
 
 Dependencies: `secp256k1` 0.29 (libsecp256k1, the global context), `sha2`, `ripemd`, `blake2`,
 `hmac`, `ruint` (256-bit targets and work), `serde_json` with `preserve_order`, `base64`, `thiserror`,
