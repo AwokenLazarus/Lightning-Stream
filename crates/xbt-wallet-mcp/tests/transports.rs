@@ -209,3 +209,27 @@ fn http_refuses_non_loopback_without_token() {
     let out = Command::new(BIN).env_clear().args(["--http", "0.0.0.0:33593", "--http-allow-remote"]).output().unwrap();
     assert!(String::from_utf8_lossy(&out.stderr).contains("needs XBT_MCP_HTTP_TOKEN"));
 }
+
+/// A tool call sent before initialize is refused even when initialize follows at once (the call runs
+/// on its own thread; it must see the session as it was when the call arrived).
+#[test]
+fn stdio_call_before_initialize_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sock, seen) = mock_signer(dir.path());
+    for _ in 0..20 {
+        let mut s = Stdio_::start(&sock);
+        s.send(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "balance", "arguments": {}}}));
+        s.send(&init_msg(2));
+        let mut got = std::collections::HashMap::new();
+        for _ in 0..2 {
+            let mut line = String::new();
+            s.out.read_line(&mut line).unwrap();
+            let v: Value = serde_json::from_str(&line).unwrap();
+            got.insert(v["id"].as_u64().unwrap(), v);
+        }
+        assert_eq!(got[&1]["error"]["code"], -32602, "{}", got[&1]);
+        drop(s.child.stdin.take());
+        let _ = s.child.wait();
+    }
+    assert!(seen.lock().unwrap().is_empty());
+}

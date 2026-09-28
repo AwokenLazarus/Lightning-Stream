@@ -28,9 +28,10 @@ pub fn serve_stdio(server: Arc<Server>) {
         }
         let Ok(msg) = xbt402::json::parse(&line) else { continue };
         if Server::is_slow(&msg) {
-            let (server, out, sess) = (server.clone(), out.clone(), sess.clone());
+            // the session as it is when the call arrives (an initialize read later must not count)
+            let mut s = sess.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            let (server, out) = (server.clone(), out.clone());
             workers.push(std::thread::spawn(move || {
-                let mut s = sess.lock().unwrap_or_else(|p| p.into_inner()).clone();
                 if let Some(r) = server.handle(&mut s, &msg) {
                     send(&out, &r);
                 }
