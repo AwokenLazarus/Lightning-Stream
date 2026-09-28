@@ -405,13 +405,23 @@ pub fn sign_with_type(sk: &SecretKey, msg: &[u8; 32], hash_type: u8) -> Vec<u8> 
     s
 }
 
-/// Client side of one channel: holds the payer key, signs ever-increasing cumulative amounts.
-#[derive(Debug, Clone)]
+/// Client side of one channel: signs ever-increasing cumulative amounts, either with the payer
+/// key it holds or through a [`StateSigner`](crate::signer::StateSigner) that holds the key
+/// (AGP-027: B2's signer process; the client then never sees the secret).
+#[derive(Clone)]
 pub struct Payer {
     pub params: ChannelParams,
-    secret: SecretKey,
+    secret: Option<SecretKey>,
+    backend: Option<std::sync::Arc<dyn crate::signer::StateSigner>>,
     /// Highest cumulative amount signed so far.
     pub signed: u64,
+}
+
+impl std::fmt::Debug for Payer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Payer").field("params", &self.params).field("signed", &self.signed)
+            .field("key", &if self.backend.is_some() { "signer" } else { "local" }).finish()
+    }
 }
 
 impl Payer {
@@ -419,11 +429,26 @@ impl Payer {
         if ecdsa::pubkey(&secret) != params.payer_pub {
             return fail("bad_key", "secret does not match payer_pub");
         }
-        Ok(Self { params, secret, signed: 0 })
+        Ok(Self { params, secret: Some(secret), backend: None, signed: 0 })
     }
 
-    pub fn secret(&self) -> &SecretKey {
-        &self.secret
+    /// A payer whose key lives in `backend` (the channel must already be attached there).
+    pub fn with_backend(params: ChannelParams, backend: std::sync::Arc<dyn crate::signer::StateSigner>) -> Self {
+        Self { params, secret: None, backend: Some(backend), signed: 0 }
+    }
+
+    /// The payer key, when this payer holds it (`None` with a signer backend).
+    pub fn secret(&self) -> Option<&SecretKey> {
+        self.secret.as_ref()
+    }
+
+    /// The signer backend, if the key lives in one.
+    pub fn backend(&self) -> Option<&std::sync::Arc<dyn crate::signer::StateSigner>> {
+        self.backend.as_ref()
+    }
+
+    fn key(&self) -> Result<&SecretKey> {
+        self.secret.as_ref().ok_or_else(|| ChannelError::new("bad_key", "the payer key lives in a signer"))
     }
 
     /// The payer's 0x21 signature (DER || 0x21) for the state paying `amount`. Never lower.
@@ -431,8 +456,13 @@ impl Payer {
         if amount < self.signed {
             return fail("stale_amount", "never sign a lower cumulative amount");
         }
-        let tx = self.params.state_tx(amount)?;
-        let sig = sign_with_type(&self.secret, &self.params.sighash(&tx)?, SIGHASH_ALL_UNIFIED);
+        let sig = match &self.backend {
+            Some(b) => b.sign_state(&self.params.channel_id(), amount)?,
+            None => {
+                let tx = self.params.state_tx(amount)?;
+                sign_with_type(self.key()?, &self.params.sighash(&tx)?, SIGHASH_ALL_UNIFIED)
+            }
+        };
         self.signed = amount;
         Ok(sig)
     }
@@ -442,8 +472,11 @@ impl Payer {
         if amount < self.signed {
             return fail("stale_amount", "never sign a lower cumulative amount");
         }
+        if let Some(b) = &self.backend {
+            return b.sign_state_a3(&self.params.channel_id(), amount);
+        }
         let tx = self.params.state_tx_a3(amount)?;
-        Ok(sign_with_type(&self.secret, &self.params.sighash_a3(&tx)?, SIGHASH_SINGLE_ACP_UNIFIED))
+        Ok(sign_with_type(self.key()?, &self.params.sighash_a3(&tx)?, SIGHASH_SINGLE_ACP_UNIFIED))
     }
 
     /// The payer's signature for a rollover tx (the provider co-signs and broadcasts it).
@@ -451,14 +484,43 @@ impl Payer {
         if amount < self.signed {
             return fail("stale_amount", "never sign a lower cumulative amount");
         }
-        let tx = self.params.rollover_tx(amount, next_spk, next_capacity)?;
-        let sig = sign_with_type(&self.secret, &self.params.sighash(&tx)?, SIGHASH_ALL_UNIFIED);
+        let sig = match &self.backend {
+            Some(b) => b.sign_rollover(&self.params.channel_id(), amount, next_spk, next_capacity)?,
+            None => {
+                let tx = self.params.rollover_tx(amount, next_spk, next_capacity)?;
+                sign_with_type(self.key()?, &self.params.sighash(&tx)?, SIGHASH_ALL_UNIFIED)
+            }
+        };
         self.signed = amount;
         Ok(sig)
     }
 
+    /// The payer's close authorisation (DER over `close_message(chan)`).
+    pub fn sign_close(&self) -> Result<Vec<u8>> {
+        let chan = self.params.channel_id();
+        match &self.backend {
+            Some(b) => b.sign_close(&chan),
+            None => Ok(ecdsa::sign(self.key()?, &crate::wire::close_message(&chan))),
+        }
+    }
+
+    /// The 0x21 hash-locked state paying `uncond` plus `cond`'s amount.
+    pub fn sign_conditional(&self, uncond: u64, cond: &crate::conditional::ConditionalParams) -> Result<Vec<u8>> {
+        match &self.backend {
+            Some(b) => b.sign_conditional(&self.params.channel_id(), uncond, cond),
+            None => {
+                let tx = cond.state_tx(uncond)?;
+                Ok(sign_with_type(self.key()?, &cond.sighash(&tx)?, SIGHASH_ALL_UNIFIED))
+            }
+        }
+    }
+
+    /// The signed CLTV refund. A signer backend decides the destination and fee itself.
     pub fn refund_tx(&self, dest_spk: Option<&[u8]>, fee: Option<u64>) -> Result<Tx> {
-        self.params.refund_tx(&self.secret, dest_spk, fee)
+        match &self.backend {
+            Some(b) => Tx::parse_hex(&b.sign_refund(&self.params.channel_id())?).map_err(ChannelError::from),
+            None => self.params.refund_tx(self.key()?, dest_spk, fee),
+        }
     }
 }
 

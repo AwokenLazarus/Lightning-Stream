@@ -12,6 +12,8 @@
 //!   facilitator bodies.
 //! * [`provider`]: the resource-server verifier ([`provider::Provider::serve`]).
 //! * [`client`]: the payer SDK ([`client::Client`]), transport-agnostic.
+//! * [`signer`]: the [`signer::StateSigner`] seam, so the payer's keys can live in another
+//!   process (B2's signer, `xbt-signer`); [`signer::LocalSigner`] keeps them in memory.
 //! * [`funding`]: funding checks against a [`funding::ChainBackend`].
 //!
 //! Optional features: `http-client` (ureq transport), `http-server` (tiny_http around the
@@ -25,6 +27,7 @@ pub mod funding;
 pub mod json;
 pub mod ledger;
 pub mod provider;
+pub mod signer;
 pub mod wire;
 #[cfg(feature = "rpc")]
 pub mod rpc;

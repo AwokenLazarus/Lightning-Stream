@@ -222,7 +222,7 @@ fn watcher_closes_with_an_unfolded_conditional_state_and_claims() {
     let h: [u8; 32] = hex::decode(acc["extra"]["conditional"]["hash"].as_str().unwrap()).unwrap().try_into().unwrap();
     let cp = xbt402::conditional::ConditionalParams::new(ch.payer.params.clone(), h, 1_000, 10).unwrap();
     let tx = cp.state_tx(ch.payer.signed).unwrap();
-    let sig = hex::encode(xbt402::channel::sign_with_type(ch.payer.secret(), &cp.sighash(&tx).unwrap(), 0x21));
+    let sig = hex::encode(xbt402::channel::sign_with_type(ch.payer.secret().unwrap(), &cp.sighash(&tx).unwrap(), 0x21));
     ch.seq += 1;
     let chan = ch.payer.params.channel_id();
     let mut pl = json!({"chan": chan, "seq": ch.seq, "cum": ch.payer.signed.to_string(), "hashlock": hex::encode(h), "sig": sig});
@@ -384,4 +384,63 @@ fn hostile_requests_never_panic() {
         let _ = prov.serve("GET", "/v1/q", &[("PAYMENT-SIGNATURE".into(), h.into())], b"", "", None);
     }
     assert!(n > 300);
+}
+
+// --- AGP-027: payer keys behind the StateSigner seam -------------------------------------------
+
+#[test]
+fn signer_backed_client_never_holds_a_payer_key() {
+    use xbt402::signer::{LocalSigner, StateSigner};
+    let chain = MemChain::new();
+    let prov = provider_with(chain.clone(), ProviderConfig::new(NET), Ledger::in_memory());
+    prov.offer_conditional("/v1/report", 900, b"the secret report", None);
+    let signer: Arc<dyn StateSigner> = Arc::new(LocalSigner::new());
+    let mut c = client(&chain, &prov).with_signer(signer.clone());
+    for i in 0..4 {
+        let r = c.request("POST", &format!("{O}/v1/infer?i={i}"), b"{}").unwrap();
+        assert_eq!(r.status, 200, "call {i}: {}", String::from_utf8_lossy(&r.body));
+    }
+    let ch = c.channels[O].clone();
+    assert!(ch.payer.secret().is_none(), "the client holds no payer secret");
+    assert!(ch.payer.backend().is_some());
+    assert_eq!(ch.auth_key, [0u8; 32], "no ECDH key in the client");
+    assert_eq!(ch.receipts.len(), 4);
+    // hash-locked sale signed by the signer
+    let (_, plain) = c.request_conditional("GET", &format!("{O}/v1/report"), b"").unwrap();
+    assert_eq!(plain, b"the secret report");
+    // the refund kept at open came from the signer and spends this channel
+    let p = c.channels[O].payer.params.clone();
+    let refund = Tx::parse_hex(&ch.refund_hex).unwrap();
+    assert_eq!(refund.locktime, p.expiry);
+    assert_eq!(refund.inputs[0].prevout.txid_hex(), p.funding_txid());
+    // the close authorisation comes from the signer too
+    let r = c.close(O).unwrap();
+    let close = chain.sent().last().unwrap().clone();
+    assert_eq!(outputs_to(&close, &p.payee_spk) as u64, py_u64_of(&r["cum"]));
+    // a stale state is refused by the signer, not only by the client
+    assert_eq!(signer.sign_state(&p.channel_id(), 1).unwrap_err().code, "stale_amount");
+}
+
+#[test]
+fn signer_backed_rollover_keeps_the_next_key_in_the_signer() {
+    use xbt402::signer::{LocalSigner, StateSigner};
+    let chain = MemChain::new();
+    let prov = provider_with(chain.clone(), ProviderConfig::new(NET), Ledger::in_memory());
+    let signer: Arc<dyn StateSigner> = Arc::new(LocalSigner::new());
+    let mut c = client(&chain, &prov).with_signer(signer);
+    for _ in 0..3 {
+        assert_eq!(c.request("GET", &format!("{O}/v1/q"), b"").unwrap().status, 200);
+    }
+    let old = c.channels[O].payer.params.clone();
+    let r = c.rollover(O).unwrap();
+    let next = c.channels[O].payer.params.clone();
+    assert_ne!(old.channel_id(), next.channel_id());
+    assert_eq!(r["nextChan"], format!("{}:1", r["txid"].as_str().unwrap()));
+    assert!(c.channels[O].payer.secret().is_none());
+    c.open_rolled(O).unwrap();
+    assert_eq!(c.request("GET", &format!("{O}/v1/q"), b"").unwrap().status, 200);
+}
+
+fn py_u64_of(v: &Value) -> u64 {
+    v.as_str().and_then(|s| s.parse().ok()).or_else(|| v.as_u64()).unwrap()
 }

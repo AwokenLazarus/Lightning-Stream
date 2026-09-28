@@ -7,6 +7,7 @@
 //! Budgets: per call (`max_price`), per channel (`capacity`), overall (`budget_sats`) and per day
 //! (`daily_budget`).
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
@@ -16,11 +17,12 @@ use xbt_primitives::hash::sha256;
 use xbt_primitives::secp256k1::SecretKey;
 use xbt_primitives::tx::Tx;
 
-use crate::channel::{channel_auth_key, sign_with_type, ChannelParams, FeePayer, Payer, DERIVATION, DUST};
+use crate::channel::{channel_auth_key, ChannelParams, FeePayer, Payer, DERIVATION, DUST};
 use crate::conditional::{decrypt, preimage_from_tx, ConditionalParams};
 use crate::error::{fail, ChannelError, Result};
 use crate::json::{py_int, py_str, py_u64, truthy};
 use crate::provider::HttpResponse;
+use crate::signer::StateSigner;
 use crate::wire::*;
 
 /// How the client talks HTTP. Header names in the response may be any case.
@@ -109,6 +111,8 @@ pub struct Client {
     pub on_refund: Option<RefundHook>,
     /// Channels replaced by a rollover, until their successor is opened at the provider.
     pub pending_rolled: HashMap<String, ClientChannel>,
+    /// AGP-027: where the payer keys live (B2's signer). `None`: this client holds them.
+    signer: Option<Arc<dyn StateSigner>>,
 }
 
 fn now() -> u64 {
@@ -116,13 +120,7 @@ fn now() -> u64 {
 }
 
 fn random_secret() -> SecretKey {
-    loop {
-        let mut b = [0u8; 32];
-        getrandom::getrandom(&mut b).expect("OS randomness");
-        if let Ok(sk) = SecretKey::from_slice(&b) {
-            return sk;
-        }
-    }
+    crate::signer::random_secret()
 }
 
 /// `("https://host:port", "/path?query")` of a URL, as the reference splits it.
@@ -144,7 +142,44 @@ fn ex_u64(ex: &Value, k: &str) -> Result<u64> {
 impl Client {
     pub fn new(cfg: ClientConfig, transport: Box<dyn Transport>, wallet: Box<dyn Wallet>,
                height: HeightFn) -> Self {
-        Self { cfg, transport, wallet, height, channels: HashMap::new(), opened_sats: 0, day_spent: 0, day_start: now(), on_refund: None, pending_rolled: HashMap::new() }
+        Self { cfg, transport, wallet, height, channels: HashMap::new(), opened_sats: 0, day_spent: 0, day_start: now(), on_refund: None,
+               pending_rolled: HashMap::new(), signer: None }
+    }
+
+    /// Keep every payer key in `signer` (B2's signer process): the client asks it for keys,
+    /// states, closes, refunds and request auth, and never holds a payer secret itself.
+    pub fn with_signer(mut self, signer: Arc<dyn StateSigner>) -> Self {
+        self.signer = Some(signer);
+        self
+    }
+
+    /// A payer key for a new channel to `key_origin`: (pubkey, the local secret if we hold it,
+    /// the payer change spk the signer asks for).
+    fn fresh_key(&self, key_origin: &str) -> Result<(Vec<u8>, Option<SecretKey>, Option<Vec<u8>>)> {
+        match &self.signer {
+            Some(s) => Ok((s.new_key(key_origin)?.to_vec(), None, s.payer_spk()?)),
+            None => {
+                let sk = random_secret();
+                Ok((ecdsa::pubkey(&sk).to_vec(), Some(sk), None))
+            }
+        }
+    }
+
+    /// Bind a funded channel's key: (payer, refund hex, request-auth key; zero with a signer).
+    fn bind_key(&self, key_origin: &str, p: ChannelParams, secret: Option<SecretKey>) -> Result<(Payer, String, [u8; 32])> {
+        match (&self.signer, secret) {
+            (Some(s), _) => {
+                s.attach(key_origin, &p)?;
+                let refund_hex = s.sign_refund(&p.channel_id())?;
+                Ok((Payer::with_backend(p, s.clone()), refund_hex, [0u8; 32]))
+            }
+            (None, Some(sk)) => {
+                let refund_hex = p.refund_tx(&sk, None, None)?.to_hex();
+                let auth_key = channel_auth_key(&sk, &p.payee_pub)?;
+                Ok((Payer::new(p, sk)?, refund_hex, auth_key))
+            }
+            (None, None) => fail("bad_key", "no payer key"),
+        }
     }
 
     /// bech32 hrp for funding addresses on this client's network.
@@ -202,18 +237,16 @@ impl Client {
         if cap > max_cap || self.opened_sats + cap > self.cfg.budget_sats {
             return fail("budget", "channel capacity outside provider range or our budget");
         }
-        let secret = random_secret();
-        let pubk = ecdsa::pubkey(&secret);
         let expiry = (self.height)()? + self.expiry_blocks(&ex)?;
         let pay_to = hex::decode(acc.get("payTo").and_then(Value::as_str).unwrap_or("")).map_err(|_| ChannelError::new("bad_offer", "payTo"))?;
         let close_fee = ex_u64(&ex, "closeFeeSat")?;
-        let p = ChannelParams::derive(&pay_to, &pubk, expiry, close_fee, None, &self.cfg.network, fee_payer)?;
+        let (pubk, secret, payer_spk) = self.fresh_key(origin)?;
+        let p = ChannelParams::derive(&pay_to, &pubk, expiry, close_fee, payer_spk, &self.cfg.network, fee_payer)?;
         let addr = segwit_address(self.hrp(), &p.spk())?;
         let (txid, vout) = self.wallet.fund(&addr, cap)?;
         let p = p.with_funding(&txid, vout, cap)?;
         self.opened_sats += cap;
-        let refund_hex = p.refund_tx(&secret, None, None)?.to_hex();
-        let auth_key = channel_auth_key(&secret, &p.payee_pub)?;
+        let (payer, refund_hex, auth_key) = self.bind_key(origin, p.clone(), secret)?;
         let price = py_u64(acc.get("amount")).unwrap_or(0);
         if let Some(cb) = &self.on_refund {
             cb(&refund_hex, expiry);
@@ -229,15 +262,21 @@ impl Client {
             // a provider that did not take our terms would refuse every state we sign
             return fail("bad_fee_payer", "the provider opened the channel with another closeFeePayer");
         }
-        Ok(ClientChannel { payer: Payer::new(p, secret)?, origin: origin.into(), accepted: acc.clone(), refund_hex, auth_key, price,
+        Ok(ClientChannel { payer, origin: origin.into(), accepted: acc.clone(), refund_hex, auth_key, price,
                            slack_msat: 0, seq: 0, spent_msat: 0, last_sig: String::new(), pending_cond: None, acked_cum: 0, receipts: vec![] })
     }
 
-    fn auth(ch: &ClientChannel, pl: &mut Value, method: &str, path: &str, body: &[u8]) {
+    fn auth(ch: &ClientChannel, pl: &mut Value, method: &str, path: &str, body: &[u8]) -> Result<()> {
         let req = request_digest(method, path, body);
         let sig = pl.get("sig").and_then(Value::as_str).map(str::to_string);
-        let a = request_auth(&ch.auth_key, &py_str(pl.get("chan")), pl.get("seq"), pl.get("cum"), sig.as_deref(), &req);
+        let chan = py_str(pl.get("chan"));
+        let a = match ch.payer.backend() {
+            // with a signer the ECDH channel key never leaves it
+            Some(b) => b.request_auth(&chan, pl.get("seq"), pl.get("cum"), sig.as_deref(), &req)?,
+            None => request_auth(&ch.auth_key, &chan, pl.get("seq"), pl.get("cum"), sig.as_deref(), &req),
+        };
         pl["auth"] = a.into();
+        Ok(())
     }
 
     fn check_daily(&mut self, sats: u64) -> Result<()> {
@@ -281,7 +320,7 @@ impl Client {
             pl["sig"] = ch.last_sig.clone().into();       // signed but not yet seen to arrive
         }
         let ch = &self.channels[origin];
-        Self::auth(ch, &mut pl, method, path, body);
+        Self::auth(ch, &mut pl, method, path, body)?;
         Ok(pl)
     }
 
@@ -373,7 +412,7 @@ impl Client {
         let pl = self.payload(origin, 0, "", "", b"")?;
         let ch = &self.channels[origin];
         let chan = ch.payer.params.channel_id();
-        let sig = hex::encode(ecdsa::sign(ch.payer.secret(), &close_message(&chan)));
+        let sig = hex::encode(ch.payer.sign_close()?);
         let url = format!("{origin}{}", ch.accepted.get("extra").and_then(|e| e.get("closeUrl")).and_then(Value::as_str).unwrap_or(CLOSE_PATH));
         self.post(&url, &json!({"chan": chan, "sig": sig, "payload": pl}))
     }
@@ -388,10 +427,12 @@ impl Client {
         let expiry = h + self.expiry_blocks(&ex)?;
         let mut owed = (ch.spent_msat / 1000).max(ch.payer.signed);
         owed = owed.max(ch.payer.params.min_amount());
-        let secret = random_secret();
         let pay_to = hex::decode(ch.accepted.get("payTo").and_then(Value::as_str).unwrap_or("")).map_err(|_| ChannelError::code("bad_offer"))?;
+        let next_origin = format!("{origin}/next");
+        let (next_pub, secret, next_payer_spk) = self.fresh_key(&next_origin)?;
+        let ch = self.channels.get(origin).ok_or_else(|| ChannelError::code("no_channel"))?;
         let p = &ch.payer.params;
-        let next = ChannelParams::derive(&pay_to, &ecdsa::pubkey(&secret), expiry, p.close_fee, None, &self.cfg.network, p.close_fee_payer)?;
+        let next = ChannelParams::derive(&pay_to, &next_pub, expiry, p.close_fee, next_payer_spk, &self.cfg.network, p.close_fee_payer)?;
         let next_cap = p.rollover_next_capacity(owed);
         if next_cap < ex_u64(&ex, "minCapacity")? {
             return fail("exhausted", "not enough leftover to roll into a new channel");
@@ -410,13 +451,12 @@ impl Client {
             return fail("bad_rollover", "the provider's rollover differs from the one we signed");
         }
         let np = next.with_funding(&txid, 1, next_cap)?;
-        let refund_hex = np.refund_tx(&secret, None, None)?.to_hex();
+        let (payer, refund_hex, auth_key) = self.bind_key(&next_origin, np, secret)?;
         if let Some(cb) = &self.on_refund {
             cb(&refund_hex, expiry);
         }
         let ch = self.channels.get_mut(origin).ok_or_else(|| ChannelError::code("no_channel"))?;
-        let auth_key = channel_auth_key(&secret, &np.payee_pub)?;
-        let mut next_ch = ClientChannel { payer: Payer::new(np, secret)?, origin: origin.into(), accepted: ch.accepted.clone(), refund_hex,
+        let mut next_ch = ClientChannel { payer, origin: origin.into(), accepted: ch.accepted.clone(), refund_hex,
                                           auth_key, price: ch.price, slack_msat: 0, seq: 0, spent_msat: 0, last_sig: String::new(),
                                           pending_cond: None, acked_cum: 0, receipts: vec![] };
         std::mem::swap(ch, &mut next_ch);
@@ -489,13 +529,12 @@ impl Client {
         let ch = self.channels.get_mut(&origin).ok_or_else(|| ChannelError::code("no_channel"))?;
         let cp = ConditionalParams::new(ch.payer.params.clone(), h, cond_amt, csv)?;
         let uncond = ch.payer.signed;
-        let tx = cp.state_tx(uncond)?;
-        let sig = hex::encode(sign_with_type(ch.payer.secret(), &cp.sighash(&tx)?, 0x21));
+        let sig = hex::encode(ch.payer.sign_conditional(uncond, &cp)?);
         self.day_spent += cond_amt;
         ch.pending_cond = Some(PendingCond { hash: h, cipher: cipher.clone(), amount: cond_amt });
         ch.seq += 1;
         let mut pl = json!({"chan": ch.payer.params.channel_id(), "seq": ch.seq, "cum": uncond.to_string(), "hashlock": hex::encode(h), "sig": sig});
-        Self::auth(ch, &mut pl, method, &path, body);
+        Self::auth(ch, &mut pl, method, &path, body)?;
         let hdrs = vec![("PAYMENT-SIGNATURE".to_string(), b64json(&payment_payload(&acc, &pl)))];
         let r = self.transport.request(method, url, body, &hdrs)?;
         if r.status == 402 {
