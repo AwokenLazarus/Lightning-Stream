@@ -1152,6 +1152,103 @@
     "closeFeePayer": "payee",
     "minCum": "1146"
    }
+  },
+  "close": {
+   "calls": 10,
+   "price": 150,
+   "spentMsat": 1500000,
+   "request": {
+    "chan": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969:0",
+    "sig": "3045022100e7a54459d7799adfedae63a45f0c92c72927821b757abec9edd9c5ec0845b9b9022040026b0f61434a877f8aecb4c64352808f32f23654c2c5bba4fc7f50ed745d0a",
+    "payload": {
+     "chan": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969:0",
+     "cum": "1500",
+     "sig": "30450221009374856229c12a66ded01586cd9fca1e1b2f0d05d731fab2a9fb5af2fd9fc81202200c97ef463c40f3f4f06c528a2809f6e2aa7eaf13587de43686b225a7aa4ee17821"
+    }
+   },
+   "status": 200,
+   "response": {
+    "chan": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969:0",
+    "txid": "7c5593cfb6827035ee89466601c23779c4b699df8c15a368623f148e5c7ddb58",
+    "cum": "1500",
+    "unpaidMsat": "0",
+    "payeeFee": "600",
+    "payeeNet": "900"
+   },
+   "closeTx": "0200000000010169b9e5df5448a28a7a882902615db02d422acc30fbbec03edc9ea228a6bb3b1a0000000000fdffffff02840300000000000016001490ea9528fed9a831489e4ce6e6a04daf56d44d956407030000000000160014ed3aef46c951f2db84d5672d34002b471c0f8765044830450221009374856229c12a66ded01586cd9fca1e1b2f0d05d731fab2a9fb5af2fd9fc81202200c97ef463c40f3f4f06c528a2809f6e2aa7eaf13587de43686b225a7aa4ee17821483045022100d84faf84fc4a63ee43e3629d983220943d85ce8819ba0e4ab803370abd451a8602205449d26fcb7a306784ec6582556408fe246e4cfe11308808b0661477ef8644d22101014e632103c71471249f74aa0663dffabd5a60a7cccf3eda8101917719b86208c4986fc9efad6702de07b1756821033d9897ea5a2e67f0f2396bb2e515932a4844be53f0cbdc75b6f95ec9222c6bfeac00000000",
+   "settle": {
+    "request": {
+     "x402Version": 2,
+     "paymentPayload": {
+      "x402Version": 2,
+      "accepted": {
+       "scheme": "xbt-channel",
+       "network": "bip122:0000000000000050c1e5f69672f45929",
+       "amount": "150",
+       "asset": "XBT:sat",
+       "payTo": "02caf6f4712d871ae8f807ca4ea6696b088dc1c8bcf6796a6d52f902e2fbb1b770",
+       "maxTimeoutSeconds": 30,
+       "extra": {
+        "minCapacity": "20000",
+        "maxCapacity": "10000000",
+        "minExpiryBlocks": 1008,
+        "maxExpiryBlocks": 8640,
+        "closeMarginBlocks": 144,
+        "minConf": 1,
+        "closeFeeSat": "600",
+        "openUrl": "/x402/xbt-channel/open",
+        "closeUrl": "/x402/xbt-channel/close",
+        "billing": "postpay",
+        "derivation": "v2"
+       }
+      },
+      "payload": {
+       "chan": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969:0",
+       "sig": "3045022100e7a54459d7799adfedae63a45f0c92c72927821b757abec9edd9c5ec0845b9b9022040026b0f61434a877f8aecb4c64352808f32f23654c2c5bba4fc7f50ed745d0a",
+       "payload": {
+        "chan": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969:0",
+        "cum": "1500",
+        "sig": "30450221009374856229c12a66ded01586cd9fca1e1b2f0d05d731fab2a9fb5af2fd9fc81202200c97ef463c40f3f4f06c528a2809f6e2aa7eaf13587de43686b225a7aa4ee17821"
+       }
+      }
+     },
+     "paymentRequirements": {
+      "scheme": "xbt-channel",
+      "network": "bip122:0000000000000050c1e5f69672f45929",
+      "amount": "150",
+      "asset": "XBT:sat",
+      "payTo": "02caf6f4712d871ae8f807ca4ea6696b088dc1c8bcf6796a6d52f902e2fbb1b770",
+      "maxTimeoutSeconds": 30,
+      "extra": {
+       "minCapacity": "20000",
+       "maxCapacity": "10000000",
+       "minExpiryBlocks": 1008,
+       "maxExpiryBlocks": 8640,
+       "closeMarginBlocks": 144,
+       "minConf": 1,
+       "closeFeeSat": "600",
+       "openUrl": "/x402/xbt-channel/open",
+       "closeUrl": "/x402/xbt-channel/close",
+       "billing": "postpay",
+       "derivation": "v2"
+      }
+     }
+    },
+    "status": 200,
+    "response": {
+     "success": true,
+     "transaction": "7c5593cfb6827035ee89466601c23779c4b699df8c15a368623f148e5c7ddb58",
+     "network": "bip122:0000000000000050c1e5f69672f45929",
+     "payer": "033d9897ea5a2e67f0f2396bb2e515932a4844be53f0cbdc75b6f95ec9222c6bfe",
+     "amount": "1500",
+     "extra": {
+      "chan": "1a3bbba628a29edc3ec0befb30cc2a422db05d610229887a8aa24854dfe5b969:0",
+      "unpaidMsat": "0",
+      "payeeFee": "600",
+      "payeeNet": "900"
+     }
+    }
+   }
   }
  }
 }

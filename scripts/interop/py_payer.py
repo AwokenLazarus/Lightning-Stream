@@ -5,7 +5,7 @@ on-chain amounts are checked exactly. Prints one JSON line; exit 0 only if every
     py_payer.py URL [CALLS] [CONDITIONAL_PATH]
 Env: XBT402_B1, XBT402_DATADIR, XBT402_RPCPORT."""
 import json, os, sys
-sys.path.insert(0, os.environ.get("XBT402_B1", os.path.expanduser("~/xbt-rnd/b1-agp-023")))
+sys.path.insert(0, os.environ.get("XBT402_B1", os.path.expanduser("~/xbt-rnd/b1-agp-029")))
 from xbt402.rpc import RPC  # noqa: E402
 from xbt402.tx import Tx  # noqa: E402
 from xbt402.x402_channel import XbtChannelClient, network_id  # noqa: E402
@@ -51,8 +51,11 @@ checks = {
     "payer_output_exact": payer_out == p.capacity - p.payer_fee - cum,
     "fee_exact": p.capacity - payee_out - payer_out == p.close_fee,
     "close_confirmed": raw.get("confirmations", 0) >= 1,
-    # the reference's close report: cum = what the close pays the payee (net of a payee-paid fee)
-    "provider_report_as_reference": reported == payee_out and unpaid == spent_sat * 1000 - reported * 1000,
+    # the close report (AGP-029): cum = the gross state the payer signed, unpaidMsat = spent - cum (0
+    # when fully paid, never the provider's own close fee); payee-pays adds payeeFee and payeeNet
+    "provider_report_gross": reported == cum and unpaid == max(0, ch.spent_msat - reported * 1000),
+    "provider_report_fee": ((close.get("payeeFee"), close.get("payeeNet")) == (str(p.close_fee), str(payee_out))
+                            if p.payee_fee else "payeeFee" not in close and "payeeNet" not in close),
 }
 ok = all(checks.values()) and (cond is None or cond["status"] == 200)
 print(json.dumps({"ok": ok, "impl": "python-payer", "url": url, "network": net, "chan": p.channel_id,

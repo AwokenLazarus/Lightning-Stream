@@ -376,13 +376,14 @@ pub fn gen_payee_pays() -> Value {
     let v11 = Payer::new(params(&a, EXPIRY, CAPACITY, 0, FeePayer::Payer), a).expect("payer").sign_state(150_000).expect("sig");
     let sign21 = |d: [u8; 32]| { let mut s = ecdsa::sign(&a, &d); s.push(SIGHASH_ALL_UNIFIED); hex::encode(s) };
     let node = Arc::new(StubNode::new(p.clone(), TIP));
-    let prov = provider(node, b"{}", false);
+    let prov = provider(node.clone(), b"{}", false);
     let terms = prov.terms();
     let mut req = open_request(&p);
     req["channel"]["closeFeePayer"] = "payee".into();
     req["hub"] = json!({"payTo": pubhex(&hub_secret()), "sig": hex::encode(ecdsa::sign(&hub_secret(), &hub_channel_message(&p.channel_id())))});
     let open_url = terms["extra"]["openUrl"].as_str().unwrap_or("").to_string();
     let r = prov.serve("POST", &open_url, &[], xbt402::json::dumps(&req).as_bytes(), "", None);
+    let close_section = payee_pays_close(&prov, &node, &p, &a);
     json!({"payerSecret": sechex(&a), "payeeSecret": sechex(&payee_secret), "params": p.to_json(), "chan": p.channel_id(),
            "minCum": p.min_amount(), "maxCum": p.max_amount(), "states": states,
            "closeTx": {"cum": 150_000, "hex": close.to_hex(), "txid": close.txid()},
@@ -400,7 +401,44 @@ pub fn gen_payee_pays() -> Value {
                {"why": "below the least state: the payee output would be dust after its close fee",
                 "cum": p.min_amount() - 1, "payerSig": hex::encode(&sigs[0]), "error": "bad_amount"},
            ],
-           "terms": terms, "open": {"request": req, "status": r.status, "response": body_json(&r)}})
+           "terms": terms, "open": {"request": req, "status": r.status, "response": body_json(&r)},
+           "close": close_section})
+}
+
+/// AGP-029: ten 150-sat postpay calls, a close whose final state pays the 1,500 owed, and the same
+/// close through /x402/settle. Both report the gross cum (what the payer paid) with payeeFee and
+/// payeeNet; unpaidMsat is spent - gross (0), never the provider's own close fee.
+fn payee_pays_close(prov: &Provider, node: &StubNode, p: &ChannelParams, a: &SecretKey) -> Value {
+    let acc = prov.requirements(PRICE);
+    let mut payer = Payer::new(p.clone(), *a).expect("payer");
+    let k = channel_auth_key(a, &p.payee_pub).expect("K");
+    let chan = p.channel_id();
+    let (mut spent_msat, mut seq) = (0u64, 0u64);
+    for _ in 0..10 {                        // postpay: each call pays for the calls before it
+        let need = spent_msat.div_ceil(1000);
+        let cum = need.max(payer.signed).max(if need > 0 { p.min_amount() } else { 0 });
+        seq += 1;
+        let mut pl = json!({"chan": chan, "seq": seq, "cum": cum.to_string()});
+        if cum > payer.signed {
+            pl["sig"] = hex::encode(payer.sign_state(cum).expect("sig")).into();
+        }
+        let sig = pl.get("sig").and_then(Value::as_str).map(str::to_string);
+        pl["auth"] = request_auth(&k, &chan, Some(&json!(seq)), pl.get("cum"), sig.as_deref(), &request_digest("GET", "/v1/x", b"")).into();
+        let r = prov.serve("GET", "/v1/x", &sig_hdr(&b64json(&payment_payload(&acc, &pl))), b"", "", None);
+        let resp = unb64json(&hdr(&r, "PAYMENT-RESPONSE")).expect("PAYMENT-RESPONSE");
+        spent_msat = receipt_of(&resp).expect("receipt")["spentMsat"].as_str().and_then(|s| s.parse().ok()).expect("spentMsat");
+    }
+    let fin = spent_msat.div_ceil(1000).max(payer.signed);
+    let pl = json!({"chan": chan, "cum": fin.to_string(), "sig": hex::encode(payer.sign_state(fin).expect("sig"))});
+    let req = json!({"chan": chan, "sig": hex::encode(ecdsa::sign(a, &close_message(&chan))), "payload": pl});
+    let close_url = acc["extra"]["closeUrl"].as_str().unwrap_or("").to_string();
+    let r = prov.serve("POST", &close_url, &[], xbt402::json::dumps(&req).as_bytes(), "", None);
+    let mut out = json!({"calls": 10, "price": PRICE, "spentMsat": spent_msat, "request": req, "status": r.status,
+                         "response": body_json(&r), "closeTx": node.sent().last().cloned().unwrap_or_default()});
+    let sreq = facilitator_request(&acc, &req);
+    let r = prov.serve("POST", FACILITATOR_SETTLE, &[], xbt402::json::dumps(&sreq).as_bytes(), "", None);
+    out["settle"] = json!({"request": sreq, "status": r.status, "response": body_json(&r)});
+    out
 }
 
 /// The whole vector file, as `check_vectors.py --write` writes it.

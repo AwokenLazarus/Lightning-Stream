@@ -1,5 +1,5 @@
 #!/bin/bash
-# Cross-implementation run on regtest: the Rust xbt402 against the Python reference (B1 agp-023).
+# Cross-implementation run on regtest: the Rust xbt402 against the Python reference (B1 agp-029).
 # A private Knots 29.4.2 node (RDTS on, #419 long coinbase maturity, BLAKE2b from block 101: B1's
 # scripts/node.sh flags), two Python B1 providers and two Rust providers, then:
 #   A1  Rust payer   -> Python provider  10 calls + 1 hash-locked conditional call, close  (v1.1 payer-pays)
@@ -14,7 +14,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
-B1=${XBT402_B1:-$HOME/xbt-rnd/b1-agp-023}
+B1=${XBT402_B1:-$HOME/xbt-rnd/b1-agp-029}
 R=${XBT_RS_RUN:-$ROOT/run}
 PB=${XBT_RS_PORT_BASE:-33000}
 export XBT402_B1=$B1

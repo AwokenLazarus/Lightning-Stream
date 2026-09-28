@@ -127,6 +127,8 @@ fn postpay_ten_calls_then_cooperative_close() {
     let r = c.close(O).unwrap();
     assert_eq!(r["cum"], "1500");
     assert_eq!(r["unpaidMsat"], "0");
+    assert!(r.get("payeeFee").is_none() && r.get("payeeNet").is_none(), "v1.1 answer unchanged: {r}");
+    assert_eq!(r.as_object().unwrap().keys().collect::<Vec<_>>(), ["chan", "txid", "cum", "unpaidMsat"]);
     let close = chain.sent().last().unwrap().clone();
     let p = &ch.payer.params;
     assert_eq!(outputs_to(&close, &p.payee_spk), 1500);
@@ -168,10 +170,20 @@ fn payee_pays_v12_close_fee_comes_out_of_the_payee() {
     let p = c.channels[O].payer.params.clone();
     assert_eq!(p.close_fee_payer, FeePayer::Payee);
     assert_eq!(p.min_amount(), DUST + 600);
-    c.close(O).unwrap();
+    let r = c.close(O).unwrap();
     let close = chain.sent().last().unwrap().clone();
     assert_eq!(outputs_to(&close, &p.payee_spk), 1500 - 600);
     assert_eq!(outputs_to(&close, &p.payer_spk), (p.capacity - 1500) as i64);
+    // AGP-029: the report is the gross cum the payer paid, the fee is the payee's, nothing is unpaid
+    assert_eq!(r, json!({"chan": p.channel_id(), "txid": close.txid(), "cum": "1500", "unpaidMsat": "0",
+                         "payeeFee": "600", "payeeNet": "900"}));
+    let chan = p.channel_id();
+    let sig = hex::encode(xbt_primitives::ecdsa::sign(c.channels[O].payer.secret(), &xbt402::wire::close_message(&chan)));
+    let acc = prov.requirements(150);
+    let s = prov.facilitator_settle(&json!({"x402Version": 2, "paymentPayload": {"x402Version": 2, "accepted": acc, "payload": {"chan": chan, "sig": sig}},
+                                            "paymentRequirements": acc}));
+    assert_eq!((&s["amount"], &s["transaction"]), (&json!("1500"), &json!(close.txid())));
+    assert_eq!(s["extra"], json!({"chan": chan, "unpaidMsat": "0", "payeeFee": "600", "payeeNet": "900"}));
 }
 
 #[test]

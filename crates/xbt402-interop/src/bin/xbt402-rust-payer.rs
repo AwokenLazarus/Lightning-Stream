@@ -114,9 +114,15 @@ fn run() -> Result<Value> {
         "payer_output_exact": payer_out == want_payer,
         "fee_exact": p.capacity as i64 - payee_out - payer_out == p.close_fee as i64,
         "close_confirmed": raw["confirmations"].as_u64().unwrap_or(0) >= 1,
-        // the reference's close report: cum = what the close pays the payee (net of a payee-paid fee),
-        // unpaidMsat = spent - that (so under payee-pays it is the close fee). Both implementations agree.
-        "provider_report_as_reference": reported == payee_out as u64 && unpaid == spent_sat * 1000 - reported * 1000,
+        // the close report (AGP-029): cum = the gross state the payer signed, unpaidMsat = spent - cum
+        // (0 when fully paid, never the provider's own close fee); under payee-pays payeeFee is the
+        // close fee and payeeNet what the payee output holds, and payer-pays carries neither.
+        "provider_report_gross": reported == signed && unpaid == ch.spent_msat.saturating_sub(reported * 1000),
+        "provider_report_fee": if p.payee_fee() > 0 {
+            close["payeeFee"] == p.close_fee.to_string() && close["payeeNet"] == payee_out.to_string()
+        } else {
+            close.get("payeeFee").is_none() && close.get("payeeNet").is_none()
+        },
     });
     let ok = checks.as_object().map(|m| m.values().all(|v| v == &Value::Bool(true))).unwrap_or(false)
         && (cond.is_null() || cond["status"] == 200) && (roll.is_null() || roll["ok"] == true);

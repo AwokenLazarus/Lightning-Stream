@@ -13,7 +13,7 @@ Local repo, no remote. Workspace crates:
 | `xbt402` | channel params, payee tweak v2, funding script, states, close, rollover, refund, v1.2 payee-pays, conditional hash locks, the 402 wire, receipts, request auth, provider verifier, payer client, ledger | library |
 | `xbt402-interop` | conformance suite, Rust→JSON vector emitter, regtest cross-implementation tools | no (`publish = false`) |
 
-References (read-only): B1 `agp-023` `f105ccc` (`~/xbt-rnd/b1-agp-023`, `xbt402/`), B2 `agp-next2`
+References (read-only): B1 `agp-029` `3d48f4c` (`~/xbt-rnd/b1-agp-029`, `xbt402/`; AGP-023 `f105ccc` plus the AGP-029 close report), B2 `agp-next2`
 `04c3f56` (`~/xbt-rnd/b2`, `agentwallet/headers.py`), and `lazarus-protocol` (`~/Bitcoin/lazarus/protocol`).
 
 ## Build and verify
@@ -114,11 +114,11 @@ untrusted input: parsers and the provider are fuzzed with hostile bytes and JSON
 
 | group | vectors | source | result |
 |---|---|---|---|
-| xbt402 v1.1 + v1.2 (counted as `check_vectors.py` counts them) | 49 | B1 agp-023 `docs/x402/vectors.json` | 49/49 byte-identical |
+| xbt402 v1.1 + v1.2 (counted as `check_vectors.py` counts them) | 50 | B1 agp-029 `docs/x402/vectors.json` | 50/50 byte-identical |
 | UnifiedSighash (Knots hf-sighash-opt-in reference) | 166 | B1 `tests/data/unified_sighash.json` | 166/166 |
 | BLAKE2b header v2, every hash stage | 5 | B2 `tests/vectors/block_header_v2.json` | 5/5 |
 | Knots BLAKE2b regtest capture: 24 headers across v1/v2, 3 blocks' merkle roots, a header chain | 28 | B2 `tests/vectors/blake2b_regtest.json` | 28/28 |
-| **total** | **248** | | **248/248** |
+| **total** | **249** | | **249/249** |
 
 It works in both directions:
 
@@ -129,7 +129,7 @@ It works in both directions:
   of `check_vectors.py`, ported to Rust, run over the published values: refusal codes, which key
   signed what, receipts, script layouts.
 * Reference → Rust. B1's `check_vectors.py` checks the Rust-emitted file: `diff(python_generate(), rust)`
-  plus `independent_checks(rust)`. The result is 49 vectors, 0 mismatches under both Python ECC
+  plus `independent_checks(rust)`. The result is 50 vectors, 0 mismatches under both Python ECC
   backends (pure Python and coincurve/libsecp256k1).
 
 Mutation tests prove each check bites: a tampered value fails exactly its own vector. The pinned
@@ -169,11 +169,14 @@ It starts no miners. Each close is mined, then its outputs are checked exactly.
   client, is AGP-027: `Payer` holds its key today, behind the same `sign_state` seam. The Electrum
   light backend is AGP-028 and will reuse `header::HeaderChain`.
 
-## A reference behaviour worth a look (reproduced faithfully)
+## The v1.2 payee-pays close report (AGP-029)
 
-Under v1.2 payee-pays, the close response reports `cum` as what the close pays the payee **net of
-its fee** (900 for a 1500 state with a 600 fee), and `unpaidMsat` as `spent − that`. So it shows
-the close fee as unpaid (600000), and `/x402/settle`'s `amount` likewise. The on-chain amounts are
-right. B1 `x402_channel.py` does this (`_close_paid` sums the payee outputs), and the Rust port
-matches it byte for byte. The interop run records it as `provider_report_as_reference`. Whether the
-reference should report the gross `cum` is for the lead (AGP-023 follow-up), not this port.
+AGP-025 found that under v1.2 payee-pays the close answer reported `cum` as the payee's output **net
+of its fee** (900 for a 1,500 state with a 600 fee) and `unpaidMsat` as `spent − that`, so the close
+fee showed up as unpaid (600000); `/x402/settle`'s `amount` likewise. The on-chain amounts were right.
+AGP-029 fixed the report in B1 and here, byte for byte: `cum` / `amount` are the gross state the
+payer paid, `unpaidMsat` = `spent − cum × 1000`, and a payee-pays answer adds `payeeFee` and
+`payeeNet` (in `/x402/settle`, inside `extra`). A payer-pays (v1.1) answer is unchanged. The vector
+`payeePays.close` pins it (ten 150-sat calls closed at 1,500: `cum "1500"`, `unpaidMsat "0"`,
+`payeeFee "600"`, `payeeNet "900"`), and the interop payers check it as `provider_report_gross` and
+`provider_report_fee`.

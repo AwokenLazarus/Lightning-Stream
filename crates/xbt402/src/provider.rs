@@ -454,9 +454,11 @@ impl Provider {
         let r = self.close_locked(&mut l, &mut st);
         l.channels.insert(cid.clone(), st.clone());
         let txid = r?;
-        let paid = self.close_paid(&st)?;
-        let owed = st.spent_msat as i128 - paid as i128 * 1000;
-        Ok(json!({"chan": cid, "txid": txid, "cum": paid.to_string(), "unpaidMsat": owed.max(0).to_string()}))
+        let mut out = json!({"chan": cid, "txid": txid});
+        if let (Some(o), Value::Object(rep)) = (out.as_object_mut(), self.close_report(&st)?) {
+            o.extend(rep);
+        }
+        Ok(out)
     }
 
     // hash-locked conditional state (M6) --------------------------------------------------
@@ -592,9 +594,12 @@ impl Provider {
         Ok(())
     }
 
+    /// Sat the payer paid by the recorded close: its gross state (a conditional close: uncond +
+    /// condAmount, before the claim fee). Under v1.2 payee-pays the provider's outputs hold this less
+    /// payeeFee (AGP-029): the fee is the provider's cost, never an amount the payer still owes.
     fn close_paid(&self, st: &ChannelState) -> Result<u64> {
         if let Some(p) = st.extra.get("close_paid").and_then(Value::as_u64) {
-            return Ok(p);
+            return Ok(p + st.params.payee_fee());     // the provider's outputs of the close actually sent
         }
         if truthy(st.extra.get("cond_close")) {
             if let Some((cp, uncond, _)) = self.cond_state(st)? {
@@ -602,6 +607,21 @@ impl Provider {
             }
         }
         Ok(st.best_cum)
+    }
+
+    /// The close answer's amounts: `cum` gross and `unpaidMsat` = spent - gross. A payee-pays channel
+    /// adds `payeeFee` and `payeeNet` (what the provider's outputs hold); a payer-pays (v1.1) answer is
+    /// unchanged byte for byte.
+    fn close_report(&self, st: &ChannelState) -> Result<Value> {
+        let paid = self.close_paid(st)?;
+        let owed = st.spent_msat as i128 - paid as i128 * 1000;
+        let mut out = json!({"cum": paid.to_string(), "unpaidMsat": owed.max(0).to_string()});
+        let fee = st.params.payee_fee();
+        if fee > 0 {
+            out["payeeFee"] = fee.to_string().into();
+            out["payeeNet"] = paid.saturating_sub(fee).to_string().into();
+        }
+        Ok(out)
     }
 
     fn watch_one(&self, l: &mut Ledger, st: &mut ChannelState, h: u32, out: &mut Vec<String>) -> Result<()> {
@@ -781,10 +801,13 @@ impl Provider {
             let r = self.close(pl)?;
             let cid = r["chan"].as_str().unwrap_or("").to_string();
             let st = lock(&self.ledger).channels.get(&cid).cloned().ok_or_else(|| ChannelError::code("unknown_channel"))?;
-            let paid = self.close_paid(&st)?;
+            let mut extra = json!({"chan": cid, "unpaidMsat": r["unpaidMsat"]});
+            if r.get("payeeFee").is_some() {
+                extra["payeeFee"] = r["payeeFee"].clone();
+                extra["payeeNet"] = r["payeeNet"].clone();
+            }
             Ok(json!({"success": true, "transaction": r["txid"], "network": self.cfg.network,
-                      "payer": hex::encode(st.params.payer_pub), "amount": paid.to_string(),
-                      "extra": {"chan": cid, "unpaidMsat": r["unpaidMsat"]}}))
+                      "payer": hex::encode(st.params.payer_pub), "amount": r["cum"], "extra": extra}))
         })();
         r.unwrap_or_else(|e| {
             let code = if e.code == "bad_request" { "bad_payload" } else { e.code.as_str() };

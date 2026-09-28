@@ -15,9 +15,9 @@ fn every_published_vector_is_byte_identical() {
     for g in &groups {
         assert!(g.ok(), "{}: {}/{} {:?}", g.name, g.passed, g.total, g.failures);
     }
-    assert_eq!(groups[0].total, 49, "check_vectors.py counts 49 xbt402 vectors");
+    assert_eq!(groups[0].total, 50, "check_vectors.py counts 50 xbt402 vectors");
     assert_eq!(groups[1].total, 166);
-    assert_eq!(total, 248);
+    assert_eq!(total, 249);
 }
 
 fn failing(v: &Value) -> Vec<String> {
@@ -49,6 +49,19 @@ fn a_wrong_refusal_code_fails() {
     let mut v = published();
     v["payeePays"]["invalid"][1]["error"] = "bad_sig".into();   // below the least state: bad_amount
     assert_eq!(failing(&v), vec!["payeePays.invalid[1]"]);
+}
+
+#[test]
+fn a_net_close_report_fails_the_close_vector() {
+    // AGP-029: the pre-fix report (cum = the payee's net output, the fee counted as unpaid)
+    let mut v = published();
+    for (k, val) in [("cum", "900"), ("unpaidMsat", "600000")] {
+        v["payeePays"]["close"]["response"][k] = val.into();
+    }
+    assert_eq!(failing(&v), vec!["payeePays.close"]);
+    let mut v = published();
+    v["payeePays"]["close"]["settle"]["response"]["amount"] = "900".into();
+    assert_eq!(failing(&v), vec!["payeePays.close"]);
 }
 
 #[test]

@@ -2,7 +2,7 @@
 //! for byte, plus the behaviour the vectors record (what must be refused, and with which code;
 //! which key signed what). Each group reports N/N.
 //!
-//! * xbt402 (B1 `agp-023` `docs/x402/vectors.json`, 49 vectors, counted as `check_vectors.py`
+//! * xbt402 (B1 `agp-029` `docs/x402/vectors.json`, 50 vectors, counted as `check_vectors.py`
 //!   counts them): the Rust emitter ([`crate::vectors::generate`]) rebuilds the whole file and every
 //!   difference is charged to the vector it belongs to; then the independent checks of
 //!   `check_vectors.py` run in Rust against the published values.
@@ -109,7 +109,7 @@ fn u(v: &Value) -> u64 {
     v.as_u64().unwrap_or(u64::MAX)
 }
 
-/// The xbt402 vector units, keyed as `check_vectors.py` counts them (49 for the v1.2 file).
+/// The xbt402 vector units, keyed as `check_vectors.py` counts them (50 for the v1.2 file with AGP-029's payeePays.close).
 fn units(v: &Value) -> Vec<String> {
     let n = |p: &str| v.pointer(p).and_then(Value::as_array).map(Vec::len).unwrap_or(0);
     let mut out = vec![];
@@ -125,6 +125,7 @@ fn units(v: &Value) -> Vec<String> {
     for i in 0..n("/payeePays/states") { out.push(format!("payeePays.states[{i}]")); }
     for i in 0..n("/payeePays/invalid") { out.push(format!("payeePays.invalid[{i}]")); }
     for k in ["closeTx", "a3State", "rollover", "conditional", "terms", "open"] { out.push(format!("payeePays.{k}")); }
+    if v.pointer("/payeePays/close").is_some() { out.push("payeePays.close".into()); }
     out
 }
 
@@ -331,6 +332,31 @@ fn payee_pays_checks(v: &Value) -> Vec<String> {
     let o = &pp["open"];
     need(o["status"] == 200 && o["response"]["closeFeePayer"] == "payee" && o["response"]["minCum"].as_str() == Some((DUST + p.close_fee).to_string().as_str())
          && o["response"]["chan"].as_str() == Some(p.channel_id().as_str()), "open: echoes closeFeePayer and minCum");
+    // AGP-029: the close answer and /x402/settle report the gross cum with payeeFee and payeeNet
+    let c = &pp["close"];
+    if c.is_null() {
+        need(false, "close: missing");
+        return errs;
+    }
+    let cum = c["request"]["payload"]["cum"].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    let spent = u(&c["spentMsat"]);
+    let (r, sr) = (&c["response"], &c["settle"]["response"]);
+    let ctx = Tx::parse_hex(c["closeTx"].as_str().unwrap_or("")).ok();
+    need(cum == spent.div_ceil(1000) && cum == u(&c["calls"]).saturating_mul(u(&c["price"])), "close: the final state is not what is owed");
+    need(ctx.as_ref().is_some_and(|t| t.outputs.len() == 2 && t.outputs[0].value == cum as i64 - fee && t.outputs[0].script_pubkey == p.payee_spk
+                                  && t.outputs[1].value == cap - cum as i64 && t.outputs[1].script_pubkey == p.payer_spk
+                                  && r["txid"].as_str() == Some(t.txid().as_str())
+                                  && t.inputs[0].witness.first().map(hex::encode).as_deref() == c["request"]["payload"]["sig"].as_str()),
+         "close: the tx is not the final state [cum - closeFee to P, capacity - cum to A]");
+    let txid = ctx.map(|t| t.txid()).unwrap_or_default();
+    let want = serde_json::json!({"chan": p.channel_id(), "txid": txid, "cum": cum.to_string(),
+                                  "unpaidMsat": spent.saturating_sub(cum * 1000).to_string(),
+                                  "payeeFee": fee.to_string(), "payeeNet": (cum as i64 - fee).to_string()});
+    need(c["status"] == 200 && *r == want, "close: the answer must report the gross cum, payeeFee, payeeNet and unpaidMsat = spent - gross");
+    let want_extra = serde_json::json!({"chan": r["chan"], "unpaidMsat": r["unpaidMsat"], "payeeFee": r["payeeFee"], "payeeNet": r["payeeNet"]});
+    need(c["settle"]["status"] == 200 && sr["success"] == true && sr["transaction"].as_str() == Some(txid.as_str())
+         && sr["amount"].as_str() == Some(cum.to_string().as_str()) && sr["payer"].as_str() == Some(hex::encode(p.payer_pub).as_str())
+         && sr["extra"] == want_extra, "close: settle amount must be the gross cum, extra must carry unpaidMsat, payeeFee and payeeNet");
     errs
 }
 
@@ -339,7 +365,7 @@ fn read_json(path: &Path) -> Result<Value, String> {
     serde_json::from_str(&s).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// The 49 xbt402 vectors.
+/// The 50 xbt402 vectors.
 pub fn xbt402_group(path: &Path) -> Group {
     let mut g = Group { name: "xbt402 (v1.1 + v1.2)".into(), source: path.display().to_string(), total: 0, passed: 0, failures: vec![] };
     match read_json(path) {
