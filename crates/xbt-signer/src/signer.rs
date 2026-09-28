@@ -37,9 +37,15 @@ use crate::{err, Result};
 
 pub const XBT_SATS: i64 = 100_000_000;
 
-/// Decimal-safe XBT → sats (B2 `sats_from_xbt`): -1 for a negative amount, `None` where B2's
-/// `int()` raises (the request then fails).
-pub fn sats_from_xbt(v: Option<&Value>) -> Option<i64> {
+/// Same texts as B2 `sats_from_xbt` (`agentwallet/signer.py`).
+pub const ERR_NOT_DECIMAL: &str = "amount_xbt is not a decimal number";
+pub const ERR_NOT_FINITE: &str = "amount_xbt must be a finite number";
+pub const ERR_NEGATIVE: &str = "amount_xbt must not be negative";
+pub const ERR_PRECISION: &str = "amount_xbt has more than 8 decimal places";
+
+/// Exact XBT → sats (B2 `sats_from_xbt`): at most 8 decimal places; refuse negatives, NaN and inf.
+/// Scientific notation (`1e-05`) is accepted. Extra precision is an error, never truncated.
+pub fn sats_from_xbt(v: Option<&Value>) -> std::result::Result<i64, &'static str> {
     let s = match v {
         None | Some(Value::Null) => "0".to_string(),
         Some(Value::String(s)) => s.trim().to_string(),
@@ -50,20 +56,84 @@ pub fn sats_from_xbt(v: Option<&Value>) -> Option<i64> {
         Some(Value::Bool(true)) => "True".to_string(),
         Some(other) => other.to_string(),
     };
-    if s.starts_with('-') {
-        return Some(-1);
+    parse_xbt_decimal(&s)
+}
+
+fn parse_xbt_decimal(s: &str) -> std::result::Result<i64, &'static str> {
+    let s = s.trim();
+    if is_non_finite_token(s) {
+        return Err(ERR_NOT_FINITE);
     }
-    let int = |x: &str| -> Option<i64> {
-        let x = x.strip_prefix('+').unwrap_or(x);
-        if x.is_empty() || !x.bytes().all(|c| c.is_ascii_digit()) { None } else { x.parse().ok() }
+    let (neg, rest) = if let Some(r) = s.strip_prefix('-') {
+        (true, r)
+    } else if let Some(r) = s.strip_prefix('+') {
+        (false, r)
+    } else {
+        (false, s)
     };
-    match s.split_once('.') {
-        Some((whole, frac)) => {
-            let frac: String = format!("{frac}00000000").chars().take(8).collect();
-            Some(int(if whole.is_empty() { "0" } else { whole })? * XBT_SATS + int(&frac)?)
-        }
-        None => Some(int(&s)? * XBT_SATS),
+    if is_non_finite_token(rest) {
+        return Err(ERR_NOT_FINITE);
     }
+    let (mant, exp) = match rest.find(['e', 'E']) {
+        Some(i) => {
+            let e: i32 = rest[i + 1..].parse().map_err(|_| ERR_NOT_DECIMAL)?;
+            (&rest[..i], e)
+        }
+        None => (rest, 0),
+    };
+    if mant.is_empty() {
+        return Err(ERR_NOT_DECIMAL);
+    }
+    let (whole, frac) = match mant.split_once('.') {
+        Some((w, f)) => (w, f),
+        None => (mant, ""),
+    };
+    if !whole.bytes().all(|c| c.is_ascii_digit()) || !frac.bytes().all(|c| c.is_ascii_digit()) {
+        return Err(ERR_NOT_DECIMAL);
+    }
+    if whole.is_empty() && frac.is_empty() {
+        return Err(ERR_NOT_DECIMAL);
+    }
+    let mut digits = String::with_capacity(whole.len() + frac.len() + 1);
+    digits.push_str(if whole.is_empty() { "0" } else { whole });
+    digits.push_str(frac);
+    let power = exp
+        .checked_sub(frac.len() as i32)
+        .and_then(|p| p.checked_add(8))
+        .ok_or(ERR_NOT_DECIMAL)?;
+    let digits = digits.trim_start_matches('0');
+    if digits.is_empty() {
+        return Ok(0);
+    }
+    if neg {
+        return Err(ERR_NEGATIVE);
+    }
+    let n: i128 = digits.parse().map_err(|_| ERR_NOT_DECIMAL)?;
+    let sats = if power >= 0 {
+        let mut v = n;
+        for _ in 0..power {
+            v = v.checked_mul(10).ok_or(ERR_NOT_DECIMAL)?;
+        }
+        v
+    } else {
+        let places = u32::try_from(-power).map_err(|_| ERR_NOT_DECIMAL)?;
+        if places > 38 {
+            return Err(ERR_PRECISION);
+        }
+        let div = 10i128.checked_pow(places).ok_or(ERR_PRECISION)?;
+        if n % div != 0 {
+            return Err(ERR_PRECISION);
+        }
+        n / div
+    };
+    i64::try_from(sats).map_err(|_| ERR_NOT_DECIMAL)
+}
+
+fn is_non_finite_token(s: &str) -> bool {
+    matches!(
+        s.to_ascii_lowercase().as_str(),
+        "nan" | "+nan" | "-nan" | "inf" | "+inf" | "-inf" | "infinity" | "+infinity" | "-infinity"
+    )
 }
 
 pub fn deny(rule: &str, reason: impl Into<String>) -> Value {
@@ -450,7 +520,7 @@ impl Signer {
     fn payment(&self, p: &Value) -> Result<Payment> {
         let amount = match p.get("amount_sats").filter(|v| !v.is_null()) {
             Some(v) => py_int(Some(v)).ok_or_else(|| err("bad_request", "amount_sats is not an integer"))?,
-            None => sats_from_xbt(p.get("amount_xbt")).ok_or_else(|| err("bad_request", "amount_xbt is not a decimal number"))?,
+            None => sats_from_xbt(p.get("amount_xbt")).map_err(|m| err("bad_request", m))?,
         };
         let to = str_or_empty(p.get("to"));
         let to = if to.is_empty() { str_or_empty(p.get("dest")) } else { to };
@@ -1008,7 +1078,7 @@ impl Signer {
         }
         let amount = match p.get("amount_sats").filter(|v| !v.is_null()) {
             Some(v) => py_int(Some(v)).unwrap_or(0),
-            None => sats_from_xbt(p.get("amount_xbt")).unwrap_or(-1),
+            None => sats_from_xbt(p.get("amount_xbt")).map_err(|m| err("bad_request", m))?,
         };
         let expiry = py_int(p.get("expiry")).unwrap_or(0);
         let sig_hex = { let s = str_or_empty(p.get("signature")); if s.is_empty() { str_or_empty(p.get("sig")) } else { s } };

@@ -53,7 +53,11 @@ fn helpers_match_b2() {
         assert_eq!(normalize_dest(pair[0].as_str().unwrap()), pair[1].as_str().unwrap(), "{pair}");
     }
     for pair in v["sats_from_xbt"].as_array().unwrap() {
-        assert_eq!(xbt_signer::signer::sats_from_xbt(Some(&pair[0])), pair[1].as_i64(), "{pair}");
+        let got = xbt_signer::signer::sats_from_xbt(Some(&pair[0]));
+        match pair[1].as_i64() {
+            Some(want) => assert_eq!(got, Ok(want), "{pair}"),
+            None => assert!(got.is_err(), "{pair} should err, got {got:?}"),
+        }
     }
     let m = &v["messages"];
     let c = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
