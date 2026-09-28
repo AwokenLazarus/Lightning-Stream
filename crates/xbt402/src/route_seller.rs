@@ -302,7 +302,7 @@ impl RouteSeller {
         let (Some(sid), Some(seq), Some(auth)) = (h.get("session"), py_int(h.get("seq")), h.get("auth")) else { return Err("bad_payload") };
         let (sid, auth) = (py_str(Some(sid)), py_str(Some(auth)));
         let mut st = self.lock();
-        if st.sessions.get(&sid).is_none_or(|s| s.path != path) {
+        if !st.sessions.get(&sid).is_some_and(|s| s.path == path) {
             return Err("unknown_session");
         }
         let key = self.key(&mut st, &sid).map_err(|_| "bad_auth")?;
@@ -373,6 +373,15 @@ impl Provider {
         let r = self.close_locked(&mut l, &mut st);
         l.channels.insert(cid, st);
         r
+    }
+
+    /// The payee's own 0x21 signature for `chan`'s state paying `cum` (the provider can always
+    /// sign its half; tests use it to show a held pre-signature cannot complete a close).
+    #[doc(hidden)]
+    pub fn payee_sign_state(&self, chan: &str, cum: u64) -> Result<Vec<u8>> {
+        let st = self.channel_state(chan).ok_or_else(|| ChannelError::code("unknown_channel"))?;
+        let tx = st.params.state_tx(cum)?;
+        Ok(crate::channel::sign_with_type(&self.chan_secret(&st.params)?, &st.params.sighash(&tx)?, SIGHASH_ALL_UNIFIED))
     }
 
     /// The routing book (sessions, held locks).

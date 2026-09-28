@@ -83,6 +83,10 @@ pub struct ShardState {
     pub locked_sat: u64,
     pub calls: u64,
     pub last_lock: Value,
+    /// The lockId of the last lock we completed: an invoice is paid once. A ROUTE-STATE produced
+    /// before that lock completed can still carry its invoice; locking it again would be answered
+    /// with the hub's saved answer, which a floor lock (no T1 to check) would count twice.
+    pub last_locked: String,
     /// Why the provider stopped serving us ("" while it serves).
     pub stopped: String,
     pub call_ms: Vec<f64>,
@@ -213,7 +217,7 @@ impl RoutePayer {
         for acc in pr.get("accepts").and_then(Value::as_array).into_iter().flatten() {
             if acc.get("scheme").and_then(Value::as_str) == Some(SCHEME) && acc.get("network").and_then(Value::as_str) == Some(&self.cfg.network) {
                 let ex = acc.get("extra").cloned().unwrap_or(Value::Null);
-                if py_u64(ex.get("closeFeeSat")).is_none_or(|f| f > self.cfg.max_close_fee) {
+                if !py_u64(ex.get("closeFeeSat")).is_some_and(|f| f <= self.cfg.max_close_fee) {
                     return fail("bad_offer", "closeFeeSat above our cap");
                 }
                 if let Some(fp) = ex.get("closeFeePayer") {
@@ -416,6 +420,7 @@ impl RoutePayer {
         {
             let mut s = lk(&p.shard.state);
             s.locked_sat += p.d;
+            s.last_locked = p.lock_id.clone();
             s.lock_ms.push(p.t0.elapsed().as_secs_f64() * 1000.0);
         }
         st.stats.locks += 1;
@@ -503,8 +508,10 @@ impl RoutePayer {
             let inv = lk(&sh.state).invoice.clone();
             let vu = inv.get("validUntil").and_then(Value::as_f64).unwrap_or(0.0);
             let rts = st.quote.as_ref().map(|q| q.reveal_timeout_sec).unwrap_or(10) as f64;
-            // the hub may wait revealTimeoutSec for the provider: lock only with that much invoice left
-            if due < 1 || vu < now_f() + 1.0 + rts {
+            // the hub may wait revealTimeoutSec for the provider: lock only with that much invoice left;
+            // and never an invoice already paid (wait for the fresh one in the next ROUTE-STATE)
+            let paid_already = inv.get("lockId").and_then(Value::as_str) == Some(sh.snapshot().last_locked.as_str());
+            if due < 1 || vu < now_f() + 1.0 + rts || paid_already {
                 return Ok(None);
             }
             if !st.quote.as_ref().is_some_and(|q| q.live(now_f() + 30.0)) {

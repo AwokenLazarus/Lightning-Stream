@@ -10,7 +10,7 @@ Local repo, no remote. Workspace crates:
 | crate | what | published |
 |---|---|---|
 | `xbt-primitives` | tx (de)serialization with witness, scripts, bech32/bech32m per chain, UnifiedSighash 0x21/0xA3, strict-DER low-S ECDSA (libsecp256k1), BLAKE2b header v2 + PoW + Knots retarget + most-work header chain, network ids | library (for other projects too) |
-| `xbt402` | channel params, payee tweak v2, funding script, states, close, rollover, refund, v1.2 payee-pays, conditional hash locks, the 402 wire, receipts, request auth, provider verifier, payer client, ledger | library |
+| `xbt402` | channel params, payee tweak v2, funding script, states, close, rollover, refund, v1.2 payee-pays, conditional hash locks, the 402 wire, receipts, request auth, provider verifier, payer client, ledger; hub routing (AGP-026): ECDSA adaptor locks, provider route offers, `RouteHub` + the `xbt402-hub` service, `RoutePayer`, `StateSigner` | library (+ `xbt402-hub` bin) |
 | `xbt402-interop` | conformance suite, Rust→JSON vector emitter, regtest cross-implementation tools | no (`publish = false`) |
 
 References (read-only): B1 `agp-023` `f105ccc` (`~/xbt-rnd/b1-agp-023`, `xbt402/`), B2 `agp-next2`
@@ -23,6 +23,8 @@ cargo test -j2 --workspace
 cargo build -j2 --release --target aarch64-unknown-linux-gnu -p xbt402
 ./scripts/conformance.sh           # N/N byte-identical, both directions
 ./scripts/regtest_interop.sh       # Rust <-> Python on a private Knots 29.4.2 regtest node
+./scripts/route_interop.sh         # routed: every client x hub x provider (Rust/Python) + the all-Rust demo
+cargo run --release -p xbt402 --example adaptor_bench
 ```
 
 Run heavy work under a CPU and memory cap:
@@ -164,8 +166,10 @@ It starts no miners. Each close is mined, then its outputs are checked exactly.
   an uncompressed key would change the funding script.
 * **Parsing is stricter.** The segwit flag must be `0x01`, trailing bytes after a tx are refused, a
   mixed-case bech32 address is refused (BIP173), and bech32m/v1+ addresses are supported.
-* **Not in this wave.** Hub routing (`/x402/xbt-channel/lock`, routed sessions, RoutePayer, adaptor
-  locks) returns 404 here and is AGP-026. The B2 signer backend, which keeps payer keys out of the
+* **Routing keeps the last 256 lock answers per channel** (B1 keeps all). Only the pending lock is
+  ever retried; an older lockId is refused as `bad_invoice`.
+* **A paid invoice is never locked again** (AGP-026 fix, see below).
+* **Not in this wave.** The B2 signer backend, which keeps payer keys out of the
   client, is AGP-027: `Payer` holds its key today, behind the same `sign_state` seam. The Electrum
   light backend is AGP-028 and will reuse `header::HeaderChain`.
 
@@ -177,3 +181,69 @@ the close fee as unpaid (600000), and `/x402/settle`'s `amount` likewise. The on
 right. B1 `x402_channel.py` does this (`_close_paid` sums the payee outputs), and the Rust port
 matches it byte for byte. The interop run records it as `provider_report_as_reference`. Whether the
 reference should report the gross `cum` is for the lead (AGP-023 follow-up), not this port.
+
+## Hub routing (AGP-026)
+
+A port of B1 agp-023 `xbt402/adaptor.py`, `route.py`, `hub.py`, `route_client.py` and the provider's
+routing endpoints (AGP-021 + AGP-023 v1.2), wire-compatible in every direction.
+
+```rust
+use xbt402::{adaptor, route::*, route_seller::RouteOffer, hub::{RouteHub, HubConfig}, route_client::*, signer::*};
+
+// provider (shard server): sell a path through hubs, metered in amsat (1e-21 sat)
+prov.offer_route(RouteOffer { window: 1.0, lock_wait: 2.0, invoice_ttl: 15.0, ..RouteOffer::new("/forward", amsat_per_call) });
+// hub (merchant --hub mode): library, or `xbt402-hub --config hub.json` (B1's config format)
+let hub = Arc::new(RouteHub::new(chain, spend_scan, wallet, transport, pay_to_secret, &network, Some(datadir), HubConfig::from_json(&conf)?)?);
+hub.connect("http://shard:port", None, None)?; let _stop = hub.watch(Duration::from_secs(5));
+xbt402::http::serve_service(hub.clone(), "127.0.0.1:9480", 16)?;
+// client: one ch1 to the hub, per-window locks off the data path; keys behind StateSigner
+let payer = Arc::new(RoutePayer::new(hub_url, RoutePayerConfig::new(&network), signer, transport, height));
+payer.open()?; let sh = payer.shard("http://shard:port/forward", "POST")?; payer.start(Duration::from_millis(500));
+let r = payer.call(&sh, "POST", chunk)?;      // a 402 with error route_credit: the shard stopped serving
+payer.stop(); payer.close()?;
+```
+
+* `adaptor`: pre-sign / pre-verify / adapt / extract with B1's DLEQ encoding. Every secret operation
+  runs in libsecp256k1 (point multiplications, scalar products and sums via `seckey_tweak_mul/add`,
+  inversions as a fixed ladder over n − 2), so unlike the Python there is no bigint remainder.
+  `AdaptorBackend` is the seam for a libsecp256k1-zkp backend. Timings (`adaptor_bench`, x86_64):
+  presign 99 µs, preverify 132 µs, adapt 22 µs, extract 42 µs (B1 Python + coincurve: 297/501/147/190).
+* `route`: `route_ok`, `FeeQuote` + `fee_due` (carry in 1e-6 msat), `PriceQuote`, `Invoice`,
+  ROUTE-STATE signatures, session/call/lock auth, `next_cum`, `SpendScan` (no txindex; `Rpc` has it).
+* `route_seller`: route offers, sessions, ROUTE-AUTH/ROUTE-STATE, `POST /x402/xbt-channel/lock`
+  (pre-verify, write-ahead, idempotent), hub binding, `close_now`.
+* `hub`: `RouteHub`, `HubConfig` (fees, fee strategy flat/utilization/callable, liquidity cap, lock
+  caps, reveal timeout, `ch1/ch2_close_fee_payer`), the 7 ordered checks with B1's codes, the watcher
+  (open, retry, write-off, t from a ch2 close, rollover at the net threshold, ch1 margin).
+* `route_client`: `RoutePayer`. `signer`: `StateSigner` (B1 `ChannelSigner` / B2 `xbt402_*` names;
+  AGP-027 implements it over the B2 socket) and `LocalSigner`.
+* `http::serve_service` serves a provider or a hub (`HttpService`).
+* `serde_json` runs with `arbitrary_precision`: amsat prices exceed u64 and signed quotes must
+  round-trip Python's ints exactly.
+
+**Routing conformance** (`conformance.sh` step 4): `scripts/route_vectors.py` generates
+`vectors/xbt402_routing_vectors.json` from B1 (nonces injected, byte-identical under both B1 ECC
+backends); the Rust emitter reproduces it byte for byte; Rust re-verifies it (79/79 checks) and B1
+re-verifies the Rust file. It covers 5 adaptor cases, quotes (an amsat price above 2^64), invoices,
+ROUTE-STATE, auths, `route_ok`/`next_cum` tables and one two-hop lock end to end.
+
+**Routed cross-implementation** (`route_interop.sh`, ports 33100–33199): all 8 combinations of
+client × hub × provider in Rust or Python, 2 providers each, exact amounts on chain for every ch1
+and ch2 close; then `xbt402-route-demo`, the AGP-021 demo in Rust (4 providers, rollover, a
+non-revealing provider, a withholding hub): see AGP-026's result for the tables.
+
+**A client bug found here (fixed in Rust, present in B1).** A lock can complete while the client
+still holds a ROUTE-STATE from before it, with the same invoice. Locking that invoice again gets the
+hub's saved answer; a normal lock rejects it (it does not open the new T1), but a *floor* lock only
+checks t·G == T and counted d + f twice, after which every lock on ch1 was `bad_amount`. The Rust
+`RoutePayer` never locks an invoice it already paid (`ShardState::last_locked`, test
+`a_paid_invoice_is_never_locked_again_even_a_floor_lock`). B1 `route_client.py` reproduces it
+(client routed 10 sat, hub 7) and needs the same one-line guard.
+
+## Portability
+
+No platform-specific dependencies: libsecp256k1 (C, via `secp256k1-sys`), pure-Rust hashes and JSON,
+`getrandom`, std threads (no async runtime). The optional HTTP features use `ureq` with rustls/ring
+(no OpenSSL) and `tiny_http`. `cargo check -p xbt402` (library, and all features + the hub binary)
+passes for x86_64/aarch64 Linux gnu and musl, armv7 and riscv64 Linux, x86_64/aarch64 macOS and
+x86_64 Windows (gnu), with zig as the cross C compiler; aarch64 links (`xbt402-hub` 4.5 MB).

@@ -889,3 +889,58 @@ fn v12_provider_refuses_an_early_rollover() {
     let ev = w.hub.rollover(&w.oc()).unwrap();
     assert_eq!(ev["event"], "ch2_rollover");
 }
+
+#[test]
+fn a_paid_invoice_is_never_locked_again_even_a_floor_lock() {
+    // regression (found by the all-Rust demo): a lock completes while the client still holds a
+    // ROUTE-STATE from before it (the same invoice); locking that invoice again got the hub's saved
+    // answer, which a floor lock accepted: d + f counted twice, then every lock was bad_amount
+    let w = world(1, PKw::default());
+    assert_eq!(w.pay.lock(w.sh()).unwrap().unwrap()["status"], "paid"); // cum 546: the floor
+    stream(&w.pay, w.sh(), 4);
+    let old_inv = w.sh().snapshot().invoice;
+    let r = w.pay.lock(w.sh()).unwrap().unwrap();
+    assert_eq!(r["status"], "paid");
+    assert_eq!(w.pay.stats().floor_locks, 1);
+    // the stale view: the paid invoice, and more accrued
+    {
+        let mut s = w.sh().state.lock().unwrap();
+        s.invoice = old_inv;
+        s.accrued_amsat += 3 * AMSAT_PER_SAT;
+    }
+    assert!(w.pay.lock(w.sh()).unwrap().is_none(), "locked a paid invoice");
+    let (routed, _, fee_paid, signed) = w.pay.counters();
+    assert_eq!((routed, fee_paid, signed.max(DUST)), (w.st1().extra["routed_sat"].as_u64().unwrap(), w.st1().extra["fee_paid"].as_u64().unwrap(), w.st1().best_cum));
+    // the next real ROUTE-STATE brings a fresh invoice and routing goes on in step
+    stream(&w.pay, w.sh(), 5);
+    assert_eq!(w.pay.lock(w.sh()).unwrap().unwrap()["status"], "paid");
+    assert_eq!(w.pay.counters().0, w.st1().extra["routed_sat"].as_u64().unwrap());
+}
+
+#[test]
+fn hostile_routing_input_never_panics() {
+    // hub /x402/route, provider /lock and routed calls with malformed headers and bodies: every answer
+    // is a 4xx (or a 402 refusal), never a panic or a 5xx
+    let w = world(1, PKw::default());
+    let t = NetTransport(w.net.clone());
+    let chan = w.pay.chan().unwrap();
+    let ch2 = w.oc().params.channel_id();
+    let hdrs = [String::new(), "!!".into(), b64json(&json!(null)), b64json(&json!({"payload": []})), b64json(&json!({"payload": {"chan": chan}})),
+                b64json(&json!({"payload": {"chan": chan, "seq": "x", "cum": {}, "adaptor": 5, "point": "zz"}})),
+                b64json(&json!({"payload": {"chan": ch2, "seq": 99, "cum": "-1", "adaptor": {"R": "00"}, "point": "02"}})),
+                b64json(&json!({"session": 1, "seq": -5, "auth": null})), b64json(&json!({"session": w.sh().session, "seq": "1e999", "auth": "00"}))];
+    let bodies: [&[u8]; 7] = [b"", b"{", b"[]", br#"{"route": 5}"#, br#"{"route": {"amount": "x", "fee": [], "lockId": {}, "provider": null}}"#,
+                              br#"{"route": {"amount": 99999999999999999999999, "fee": -1, "lockId": "a", "provider": "http://p0.test", "point": "02", "tweak": "zz"}}"#,
+                              br#"{"route": {"session": "s", "lockId": "l", "amount": -3, "lockAuth": 1, "hub": []}}"#];
+    for h in &hdrs {
+        for b in bodies {
+            for (url, name) in [(format!("{HUB}{HUB_ROUTE_PATH}"), "PAYMENT-SIGNATURE"), (format!("{}{ROUTE_LOCK_PATH}", w.origin()), "PAYMENT-SIGNATURE"),
+                                (format!("{}/v1/chunk", w.origin()), "ROUTE-AUTH"), (format!("{}/v1/chunk", w.origin()), "ROUTE-CLIENT")] {
+                let r = t.request("POST", &url, b, &[(name.into(), h.clone())]).unwrap();
+                assert!((400..500).contains(&r.status), "{url} {name}={h} body={} -> {}", String::from_utf8_lossy(b), r.status);
+            }
+        }
+    }
+    // and the honest path still works afterwards
+    assert_eq!(w.pay.lock(w.sh()).unwrap().unwrap()["status"], "paid");
+}

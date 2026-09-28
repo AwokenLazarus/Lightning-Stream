@@ -926,7 +926,7 @@ impl Provider {
         let hdr = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("PAYMENT-SIGNATURE")).map(|(_, v)| v.clone());
         let hval = |name: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str()).filter(|v| !v.is_empty());
         let routed = self.routes.has_offer(pk);
-        if routed && hdr.as_deref().is_none_or(str::is_empty) {
+        if routed && !hdr.as_deref().is_some_and(|h| !h.is_empty()) {
             if let Some(ra) = hval("ROUTE-AUTH") {
                 return self.routed_call(method, path, pk, ra, body, url);
             }

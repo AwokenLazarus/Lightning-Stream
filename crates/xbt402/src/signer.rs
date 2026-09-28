@@ -92,12 +92,14 @@ struct Inner {
     given_up: HashMap<String, Vec<Lock>>,
 }
 
+/// `policy(chan, amount)`: Err denies the signature.
+pub type PolicyFn = Box<dyn Fn(&str, u64) -> Result<()> + Send + Sync>;
+
 /// Keys in this process (B1 `ChannelSigner`). `policy(chan, amount)` may deny a signature.
 pub struct LocalSigner {
     inner: Mutex<Inner>,
     wallet: Option<Box<dyn Wallet>>,
-    #[allow(clippy::type_complexity)]
-    policy: Option<Box<dyn Fn(&str, u64) -> Result<()> + Send + Sync>>,
+    policy: Option<PolicyFn>,
 }
 
 impl LocalSigner {
@@ -106,7 +108,7 @@ impl LocalSigner {
     }
 
     /// Refuse signatures `policy(chan, amount)` denies.
-    pub fn with_policy(mut self, policy: Box<dyn Fn(&str, u64) -> Result<()> + Send + Sync>) -> Self {
+    pub fn with_policy(mut self, policy: PolicyFn) -> Self {
         self.policy = Some(policy);
         self
     }

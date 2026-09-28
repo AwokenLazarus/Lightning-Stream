@@ -1157,7 +1157,7 @@ impl RouteHub {
         // a spent funding with a pending or written-off lock: read t off the close
         if (!oc.pending.is_empty() || !oc.stale.is_empty()) && self.chain.get_tx_out(&p.funding_txid(), p.funding_vout(), true)?.is_none() {
             if let Some(tx) = self.scan.find_spend(&p.funding_txid(), p.funding_vout(), oc.scanned_to)? {
-                out.extend(self.from_close(&oc, &tx));
+                out.extend(self.secrets_from_close(&oc, &tx));
                 let mut b = lk(&self.out);
                 if let Some(c) = b.chans.get_mut(origin).filter(|c| c.params.channel_id() == p.channel_id()) {
                     c.state = "closed".into();
@@ -1196,7 +1196,7 @@ impl RouteHub {
         Ok(out)
     }
 
-    fn from_close(&self, oc: &OutChannel, tx: &Tx) -> Vec<Value> {
+    fn secrets_from_close(&self, oc: &OutChannel, tx: &Tx) -> Vec<Value> {
         let mut out = vec![];
         let mut locks: Vec<Value> = vec![];
         if !oc.pending.is_empty() {
