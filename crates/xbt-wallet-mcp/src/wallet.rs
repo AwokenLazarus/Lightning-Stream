@@ -241,6 +241,9 @@ impl xbt402::client::Wallet for Funding {
 struct LocalPayer {
     client: Client,
     remote: RemoteSigner,
+    /// For the unpaid first request that learns this call's price (as the signer's own xbt402_pay does).
+    http: UreqTransport,
+    network: String,
 }
 
 fn deny(e: xbt402::ChannelError) -> Value {
@@ -270,13 +273,36 @@ impl LocalPayer {
             }
             client = client.with_ledger(Box::new(FileClientLedger::open(p).map_err(|e| e.msg)?)).map_err(|e| e.msg)?;
         }
-        Ok(Self { client, remote })
+        Ok(Self { client, remote, http: UreqTransport::default(), network: cfg.network.clone() })
     }
 
     /// One paid call through xbt402's `Client`. The provider's body and receipt only come back under
     /// `untrusted_provider_response`, as the signer's own `xbt402_pay` returns them.
     fn pay(&mut self, url: &str, method: &str, body: &str, max_sats: u64) -> Value {
         let (origin, _) = split_url(url);
+        let cap = xbt_signer::session::body_cap();
+        // This call's price, before anything is signed: an open channel pays without a 402 first, and
+        // xbt402's Client checks max_price only when it opens one, so max_sats is enforced here.
+        let probe = match xbt402::client::Transport::request(&self.http, method, url, body.as_bytes(), &[]) {
+            Ok(r) => r,
+            Err(e) => return deny(e),
+        };
+        if probe.status != 402 {
+            let text: String = String::from_utf8_lossy(&probe.body).chars().take(cap).collect();
+            return json!({"status": probe.status, "charged_sats": 0, "note": "no 402 (already free or error)", "payer": LOCAL_PAYER,
+                          UNTRUSTED_KEY: untrusted(&text, Value::Null)});
+        }
+        let offer = probe.header("PAYMENT-REQUIRED").and_then(|h| xbt402::wire::unb64json(h).ok());
+        let price = offer.as_ref().and_then(|pr| pr.get("accepts")).and_then(Value::as_array).into_iter().flatten()
+            .find(|a| a.get("scheme").and_then(Value::as_str) == Some("xbt-channel") && a.get("network").and_then(Value::as_str) == Some(self.network.as_str()))
+            .and_then(|a| xbt402::json::py_u64(a.get("amount")));
+        let Some(price) = price else {
+            return deny(xbt402::ChannelError::new("bad_offer", format!("no xbt-channel offer on {}", self.network)));
+        };
+        if price > max_sats {
+            return json!({"verdict": "deny", "rule": "max_sats", "reason": format!("quoted {price} > max_sats {max_sats}"), "charged_sats": 0,
+                          "payer": LOCAL_PAYER});
+        }
         self.client.cfg.max_price = max_sats;
         let before = self.client.channels.get(&origin).map(|c| (c.receipts.len(), c.payer.signed));
         let opened = before.is_none();
@@ -285,16 +311,16 @@ impl LocalPayer {
             Err(e) => return deny(e),
         };
         self.client.trim_receipts(64);
-        let cap = xbt_signer::session::body_cap();
         let text: String = String::from_utf8_lossy(&r.body).chars().take(cap).collect();
         let Some(ch) = self.client.channels.get(&origin) else {
-            return json!({"status": r.status, "charged_sats": 0, "note": "no 402 (already free or error)", "payer": LOCAL_PAYER,
+            return json!({"status": r.status, "charged_sats": 0, "note": "no channel was opened", "payer": LOCAL_PAYER,
                           UNTRUSTED_KEY: untrusted(&text, Value::Null)});
         };
         let (n0, _) = before.unwrap_or((0, 0));
         let receipt = if ch.receipts.len() > n0 { ch.receipts.last().cloned().unwrap_or(Value::Null) } else { Value::Null };
         let charged = if r.status < 400 { xbt402::json::py_u64(receipt.get("charged")).unwrap_or(0) } else { 0 };
         let mut out = json!({"status": r.status, "charged_sats": charged, "chan": ch.payer.params.channel_id(), "cum": ch.payer.signed,
+                             "owed_sats": ch.spent_msat.div_ceil(1000), "billing": ch.accepted.get("extra").and_then(|e| e.get("billing")).cloned().unwrap_or("postpay".into()),
                              "opened": if opened { json!({"funding_txid": ch.payer.params.funding_txid(), "funding_sats": ch.payer.params.capacity}) } else { Value::Null },
                              "payer": LOCAL_PAYER, UNTRUSTED_KEY: untrusted(&text, receipt)});
         if r.body.len() > cap {
@@ -317,14 +343,13 @@ impl LocalPayer {
     }
 
     fn close(&mut self, origin: &str) -> Value {
-        let (chan, cum) = {
-            let ch = &self.client.channels[origin];
-            (ch.payer.params.channel_id(), ch.payer.signed)
-        };
+        let chan = self.client.channels[origin].payer.params.channel_id();
         let r = match self.client.close(origin) {
             Ok(r) => r,
             Err(e) => return deny(e),
         };
+        // the close's own state: in postpay it is the first to cover the last call
+        let cum = self.client.channels.get(origin).map(|c| c.payer.signed).unwrap_or(0);
         let txid = r.get("txid").and_then(Value::as_str)
             .filter(|t| t.len() == 64 && t.bytes().all(|c| c.is_ascii_hexdigit())).map(str::to_string);
         let marked = self.remote.mark_closed(&chan, txid.as_deref().unwrap_or(""));
