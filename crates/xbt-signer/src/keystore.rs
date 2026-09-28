@@ -91,6 +91,15 @@ impl KeyStore {
         Ok(None)
     }
 
+    /// The wrapping secret itself (the 32-byte key, or the passphrase): only for the human-signed
+    /// backup export (AGP-039), which seals it under the backup passphrase before it leaves.
+    pub(crate) fn wrapping_secret(&self) -> Vec<u8> {
+        match &self.src {
+            Source::Key(k) => k.to_vec(),
+            Source::Passphrase(pw) => pw.clone(),
+        }
+    }
+
     pub fn plaintext_allowed() -> bool {
         std::env::var(ENV_ALLOW_PLAINTEXT).map(|v| v == "1").unwrap_or(false)
     }

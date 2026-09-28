@@ -152,7 +152,8 @@ pub fn check_route(policy: &RoutePolicy, spend: &RouteSpend, hub: &str, amount: 
 /// B2's `RouteSigner`: the routing policy on every adaptor lock, over the channel book.
 pub struct RouteSigner {
     pub book: Arc<ChannelBook>,
-    pub policy: RoutePolicy,
+    /// Live: a human-signed `policy_set` (AGP-039) swaps it. Read with [`RouteSigner::policy`].
+    policy: std::sync::RwLock<RoutePolicy>,
     pub spend: RouteSpend,
     pub engine: Option<Arc<PolicyEngine>>,
     pub adaptor: Option<Arc<dyn AdaptorScheme>>,
@@ -162,7 +163,15 @@ pub struct RouteSigner {
 impl RouteSigner {
     pub fn new(book: Arc<ChannelBook>, policy: RoutePolicy, state_path: Option<&Path>, engine: Option<Arc<PolicyEngine>>,
                adaptor: Option<Arc<dyn AdaptorScheme>>) -> Self {
-        Self { book, policy, spend: RouteSpend::open(state_path), engine, adaptor, denials: Mutex::new(vec![]) }
+        Self { book, policy: std::sync::RwLock::new(policy), spend: RouteSpend::open(state_path), engine, adaptor, denials: Mutex::new(vec![]) }
+    }
+
+    pub fn policy(&self) -> RoutePolicy {
+        self.policy.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    pub fn set_policy(&self, p: RoutePolicy) {
+        *self.policy.write().unwrap_or_else(|e| e.into_inner()) = p;
     }
 
     fn dest(&self, chan: &str) -> Result<String> {
@@ -190,7 +199,7 @@ impl RouteSigner {
         let hub = route.get("hub").and_then(Value::as_str).filter(|h| !h.is_empty()).map(str::to_string)
             .unwrap_or_else(|| if rec.origin.is_empty() { dest.clone() } else { rec.origin.clone() });
         let increase = cum - rec.used_sats;
-        let mut denied = check_route(&self.policy, &self.spend, &hub, py_int(route.get("amount")).unwrap_or(0),
+        let mut denied = check_route(&self.policy(), &self.spend, &hub, py_int(route.get("amount")).unwrap_or(0),
                                      py_int(route.get("fee")).unwrap_or(0), increase, self.pending_sats(), now_f64());
         if denied.is_none() {
             if let Some(engine) = &self.engine {
@@ -247,7 +256,7 @@ impl RouteSigner {
     pub fn status(&self) -> Value {
         let pending: Map<String, Value> = self.book.unsettled_records().into_iter().filter(|r| r.has_pending_lock())
             .map(|r| (r.chan.clone(), json!({"cum": r.pending_lock["cum"], "route": r.pending_lock.get("route")}))).collect();
-        json!({"policy": self.policy.public(), "spent_24h_sats": self.spend.since(now_f64() - DAY_S), "pending": pending,
+        json!({"policy": self.policy().public(), "spent_24h_sats": self.spend.since(now_f64() - DAY_S), "pending": pending,
                "adaptor": if self.adaptor.is_some() { "available" } else { "unavailable (AGP-026)" }})
     }
 }

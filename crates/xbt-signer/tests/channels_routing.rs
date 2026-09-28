@@ -154,7 +154,7 @@ fn a_lock_is_written_ahead_recovered_after_a_restart_and_resolved_once() {
                                                          "route": {"hub": PROVIDER, "amount": 993, "fee": 6, "lockId": "L2"}}));
     assert_eq!(r["verdict"], "allow", "{r}");
     // the daily routing budget counts resolved (600) and pending (999) locks
-    let pol = &rig.s.routing.policy;
+    let pol = &rig.s.routing.policy();
     assert!(xbt_signer::routing::check_route(pol, &rig.s.routing.spend, PROVIDER, 993, 6, 999, rig.s.routing.pending_sats(),
                                              xbt_signer::pyjson::now_f64()).is_none());
     let d = xbt_signer::routing::check_route(pol, &rig.s.routing.spend, PROVIDER, 1_395, 6, 1_402, rig.s.routing.pending_sats(),
@@ -177,7 +177,7 @@ fn without_an_adaptor_implementation_routed_locks_are_refused() {
     let chan = rig.open()["chan"].as_str().unwrap().to_string();
     // the signer's default scheme is xbt402's adaptor (AGP-034); a RouteSigner built without one refuses
     assert_eq!(rig.call("routing_status", json!({}))["adaptor"], "available");
-    let bare = xbt_signer::routing::RouteSigner::new(rig.s.book.clone(), rig.s.routing.policy.clone(), None, None, None);
+    let bare = xbt_signer::routing::RouteSigner::new(rig.s.book.clone(), rig.s.routing.policy(), None, None, None);
     let e = bare.sign_state_adaptor(&chan, 1_146, &point(&secret("t")), json!({"hub": PROVIDER, "amount": 594, "fee": 6})).unwrap_err();
     assert_eq!(e.code, "adaptor_unavailable");
     assert_eq!(bare.status()["adaptor"], "unavailable (AGP-026)");

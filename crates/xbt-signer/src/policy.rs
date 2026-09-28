@@ -8,7 +8,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
@@ -219,6 +219,137 @@ impl PolicyConfig {
     }
 }
 
+/// Every key policy.json may hold (B2's `PolicyConfig` plus `human_pubkey`, `recovery_address`).
+pub const POLICY_KEYS: [&str; 28] = ["allowlist", "max_per_tx_sats", "daily_budget_sats", "weekly_budget_sats", "per_counterparty_cap_sats",
+    "velocity_max", "velocity_window_s", "human_threshold_sats", "split_window_s", "approval_ttl_s", "channel_expiry_blocks", "treasury_csv",
+    "counterparties", "refund_enabled", "refund_margin_blocks", "hot_balance_cap_sats", "forward", "routing", "anchor_interval_s",
+    "anchor_required", "regtest_mine", "open_wait_s", "open_retry_s", "close_fee_max_sats", "human_pubkey", "recovery_address",
+    "vault", "treasury"];
+
+/// Fields a running signer reads only at start: a `policy_set` records them and they apply on the next start.
+pub const RESTART_KEYS: [&str; 8] = ["anchor_interval_s", "anchor_required", "regtest_mine", "open_wait_s", "refund_margin_blocks",
+    "close_fee_max_sats", "treasury_csv", "forward"];
+
+/// AGP-039: the checks a new policy.json must pass before a signer accepts it (the web UI's editor
+/// shows exactly these). `errors` refuse it: the engine's own parse errors first (`PolicyConfig::from_value`),
+/// then values the engine would accept but that cannot mean what the human wants. `warnings` do not refuse.
+pub fn validate_policy(raw: &Value) -> (Vec<String>, Vec<String>) {
+    let (mut errors, mut warnings) = (vec![], vec![]);
+    let Some(obj) = raw.as_object() else { return (vec!["policy.json: not a JSON object".into()], warnings) };
+    let c = match PolicyConfig::from_value(raw) {
+        Ok(c) => c,
+        Err(e) => return (vec![e.msg], warnings),
+    };
+    for k in obj.keys() {
+        if !POLICY_KEYS.contains(&k.as_str()) {
+            warnings.push(format!("policy.json {k}: unknown key (the signer ignores it)"));
+        }
+    }
+    let nonneg = [("max_per_tx_sats", c.max_per_tx_sats), ("daily_budget_sats", c.daily_budget_sats), ("weekly_budget_sats", c.weekly_budget_sats),
+                  ("per_counterparty_cap_sats", c.per_counterparty_cap_sats), ("velocity_max", c.velocity_max), ("human_threshold_sats", c.human_threshold_sats),
+                  ("split_window_s", c.split_window_s), ("hot_balance_cap_sats", c.hot_balance_cap_sats), ("refund_margin_blocks", c.refund_margin_blocks),
+                  ("anchor_interval_s", c.anchor_interval_s), ("open_wait_s", c.open_wait_s), ("open_retry_s", c.open_retry_s),
+                  ("close_fee_max_sats", c.close_fee_max_sats), ("treasury_csv", c.treasury_csv)];
+    for (k, v) in nonneg {
+        if v < 0 {
+            errors.push(format!("policy.json {k}: must be >= 0 (got {v})"));
+        }
+    }
+    let positive = [("velocity_window_s", c.velocity_window_s), ("approval_ttl_s", c.approval_ttl_s), ("channel_expiry_blocks", c.channel_expiry_blocks)];
+    for (k, v) in positive {
+        if v <= 0 {
+            errors.push(format!("policy.json {k}: must be > 0 (got {v})"));
+        }
+    }
+    if c.approval_ttl_s > 7 * 86_400 {
+        errors.push(format!("policy.json approval_ttl_s: at most 604800 s (got {})", c.approval_ttl_s));
+    }
+    if c.channel_expiry_blocks > 0 && c.refund_margin_blocks >= c.channel_expiry_blocks {
+        errors.push(format!("policy.json refund_margin_blocks {} must be below channel_expiry_blocks {}", c.refund_margin_blocks, c.channel_expiry_blocks));
+    }
+    if c.daily_budget_sats > c.weekly_budget_sats {
+        warnings.push(format!("daily_budget_sats {} is above weekly_budget_sats {}: the weekly budget binds first", c.daily_budget_sats, c.weekly_budget_sats));
+    }
+    if c.human_threshold_sats > c.max_per_tx_sats {
+        warnings.push(format!("human_threshold_sats {} is above max_per_tx_sats {}: no payment will ever need a human", c.human_threshold_sats, c.max_per_tx_sats));
+    }
+    if c.human_threshold_sats == 0 {
+        warnings.push("human_threshold_sats 0: every payment needs a human approval".into());
+    }
+    match obj.get("allowlist") {
+        None | Some(Value::Array(_)) => {}
+        Some(_) => errors.push("policy.json allowlist: must be a list".into()),
+    }
+    for (i, a) in obj.get("allowlist").and_then(Value::as_array).into_iter().flatten().enumerate() {
+        match a.as_str() {
+            None => errors.push(format!("policy.json allowlist[{i}]: not a string")),
+            Some(s) if normalize_dest(s).is_empty() => errors.push(format!("policy.json allowlist[{i}]: empty")),
+            Some(s) if s.trim().contains(char::is_whitespace) =>
+                errors.push(format!("policy.json allowlist[{i}]: {s:?} contains whitespace")),
+            _ => {}
+        }
+    }
+    match obj.get("counterparties") {
+        None | Some(Value::Object(_)) => {}
+        Some(_) => errors.push("policy.json counterparties: must be an object".into()),
+    }
+    for (k, v) in obj.get("counterparties").and_then(Value::as_object).into_iter().flatten() {
+        if normalize_dest(k).is_empty() {
+            errors.push("policy.json counterparties: an empty destination".into());
+        }
+        let Some(m) = v.as_object() else {
+            errors.push(format!("policy.json counterparties[{k}]: must be an object"));
+            continue;
+        };
+        if let Some(pt) = m.get("pay_to") {
+            let ok = pt.as_str().map(str::trim).and_then(|h| hex::decode(h).ok())
+                .is_some_and(|b| b.len() == 33 && (b[0] == 2 || b[0] == 3) && xbt_primitives::secp256k1::PublicKey::from_slice(&b).is_ok());
+            if !ok {
+                errors.push(format!("policy.json counterparties[{k}].pay_to: not a compressed secp256k1 public key (66 hex)"));
+            }
+        }
+    }
+    if let Some(h) = obj.get("human_pubkey").filter(|v| !v.is_null()) {
+        let ok = h.as_str().map(str::trim).is_some_and(|x| x.is_empty() || hex::decode(x).is_ok_and(|b| b.len() == 32));
+        if !ok {
+            errors.push("policy.json human_pubkey: must be 64 hex characters (an ed25519 public key)".into());
+        }
+    }
+    match obj.get("routing") {
+        None => {}
+        Some(Value::Object(r)) => {
+            for k in ["max_lock_sats", "daily_budget_sats"] {
+                if let Some(v) = r.get(k) {
+                    match py_int(Some(v)) {
+                        None => errors.push(format!("policy.json routing.{k}: not an integer")),
+                        Some(n) if n < 0 => errors.push(format!("policy.json routing.{k}: must be >= 0 (got {n})")),
+                        _ => {}
+                    }
+                }
+            }
+            match r.get("hubs") {
+                None | Some(Value::Object(_)) => {}
+                Some(_) => errors.push("policy.json routing.hubs: must be an object".into()),
+            }
+            for (h, v) in r.get("hubs").and_then(Value::as_object).into_iter().flatten() {
+                if !(h.starts_with("http://") || h.starts_with("https://")) || normalize_dest(h).is_empty() {
+                    errors.push(format!("policy.json routing.hubs[{h}]: must be an http(s) origin"));
+                }
+                for k in ["max_fee_ppm", "max_fee_base_msat"] {
+                    match v.get(k).map(|x| py_int(Some(x))) {
+                        None => {}
+                        Some(None) => errors.push(format!("policy.json routing.hubs[{h}].{k}: not an integer")),
+                        Some(Some(n)) if n < 0 => errors.push(format!("policy.json routing.hubs[{h}].{k}: must be >= 0 (got {n})")),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Some(_) => errors.push("policy.json routing: must be an object".into()),
+    }
+    (errors, warnings)
+}
+
 /// One committed payment.
 #[derive(Debug, Clone)]
 pub struct LedgerEntry {
@@ -330,6 +461,24 @@ impl PolicyStore {
         Ok(out)
     }
 
+    /// Every stored approval (AGP-039: the web UI's queue), token → payload.
+    pub fn approvals(&self) -> Result<Map<String, Value>> {
+        let _g = self.lock.lock();
+        Ok(self.read()?.get("approvals").and_then(Value::as_object).cloned().unwrap_or_default())
+    }
+
+    /// Merge `fields` into a stored approval; `false` if the token is unknown.
+    pub fn update_approval(&self, token: &str, fields: &Value) -> Result<bool> {
+        let _g = self.lock.lock();
+        let mut d = self.read()?;
+        let Some(a) = d.get_mut("approvals").and_then(|a| a.get_mut(token)).and_then(Value::as_object_mut) else { return Ok(false) };
+        for (k, v) in fields.as_object().into_iter().flatten() {
+            a.insert(k.clone(), v.clone());
+        }
+        self.write(&d)?;
+        Ok(true)
+    }
+
     pub fn get_approval(&self, token: &str) -> Result<Option<Value>> {
         let _g = self.lock.lock();
         Ok(self.read()?.get("approvals").and_then(|a| a.get(token)).cloned())
@@ -344,8 +493,9 @@ pub fn token_urlsafe() -> String {
 }
 
 pub struct PolicyEngine {
-    pub config: PolicyConfig,
-    pub allowlist: Vec<String>,
+    /// Live: the web UI's human-signed `policy_set` (AGP-039) swaps it without a restart.
+    config: RwLock<PolicyConfig>,
+    allowlist: RwLock<Vec<String>>,
     pub store: PolicyStore,
     pub audit: AuditLog,
     pub clock: Clock,
@@ -354,7 +504,23 @@ pub struct PolicyEngine {
 impl PolicyEngine {
     pub fn new(config: PolicyConfig, store: PolicyStore, audit: AuditLog, clock: Option<Clock>) -> Self {
         let allowlist = config.normalized_allowlist();
-        Self { config, allowlist, store, audit, clock: clock.unwrap_or_else(|| Arc::new(now_f64)) }
+        Self { config: RwLock::new(config), allowlist: RwLock::new(allowlist), store, audit, clock: clock.unwrap_or_else(|| Arc::new(now_f64)) }
+    }
+
+    /// The policy in force now.
+    pub fn config(&self) -> PolicyConfig {
+        self.config.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// The normalized allowlist in force now.
+    pub fn allowlist(&self) -> Vec<String> {
+        self.allowlist.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Replace the policy (AGP-039 `policy_set`); later decisions use it.
+    pub fn set_config(&self, config: PolicyConfig) {
+        *self.allowlist.write().unwrap_or_else(|p| p.into_inner()) = config.normalized_allowlist();
+        *self.config.write().unwrap_or_else(|p| p.into_inner()) = config;
     }
 
     pub fn now(&self) -> f64 {
@@ -372,7 +538,8 @@ impl PolicyEngine {
     pub fn evaluate(&self, payment: &Payment, human: bool) -> Result<Decision> {
         let now = self.now();
         let p = payment.normalized(now);
-        let cfg = &self.config;
+        let cfg = &self.config();
+        let allowlist = self.allowlist();
         let ledger = self.store.payments()?;
         let daily = Self::spent(&ledger, DAY_S, now, None);
         let weekly = Self::spent(&ledger, WEEK_S, now, None);
@@ -394,7 +561,7 @@ impl PolicyEngine {
         if p.dest.is_empty() {
             return Ok(decide(Deny, "dest", "destination address required".into(), None, None));
         }
-        if !self.allowlist.contains(&p.dest) {
+        if !allowlist.contains(&p.dest) {
             return Ok(decide(Deny, "allowlist", format!("destination not on allowlist: {}", p.dest), None, None));
         }
         if p.amount_sats > cfg.max_per_tx_sats {

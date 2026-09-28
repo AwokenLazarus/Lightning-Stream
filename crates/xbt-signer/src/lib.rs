@@ -15,7 +15,10 @@
 //! * [`session`]: `xbt402_pay` inside the signer (open, minConf wait, paid calls, close).
 //! * [`routing`]: the routing policy and adaptor-lock book operations (AGP-021).
 //! * [`signer`]: the request handler and the watcher; [`server`]: the socket.
+//! * [`admin`]: the web UI's methods (AGP-039): the approval queue, human-signed policy changes, key
+//!   enrolment and rotation, backups.
 //! * [`client`]: the socket client and [`client::RemoteSigner`], an xbt402 `StateSigner`/`Wallet`.
+pub mod admin;
 pub mod anchor;
 pub mod client;
 pub mod approval;

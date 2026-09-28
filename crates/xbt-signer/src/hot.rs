@@ -124,7 +124,8 @@ pub struct HotWallet {
     pub hrp: String,
     keystore: Option<Arc<KeyStore>>,
     audit: Option<Arc<SigAudit>>,
-    pub cap_sats: i64,
+    /// Live: a human-signed `policy_set` (AGP-039) changes it. Read with [`HotWallet::cap_sats`].
+    cap_sats: std::sync::atomic::AtomicI64,
     utxo_salt: [u8; 16],
     inner: Mutex<Inner>,
 }
@@ -151,7 +152,7 @@ impl HotWallet {
         let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "hot".into());
         let utxo_path = path.with_file_name(format!("{stem}_utxos.json"));
         let placeholder = HotKey::new(new_secret(), hrp, 0.0)?;
-        let w = Self { path: path.into(), utxo_path, node, hrp: hrp.into(), keystore, audit, cap_sats,
+        let w = Self { path: path.into(), utxo_path, node, hrp: hrp.into(), keystore, audit, cap_sats: std::sync::atomic::AtomicI64::new(cap_sats),
                        utxo_salt: crate::keystore::random_bytes::<16>(),
                        inner: Mutex::new(Inner { current: placeholder, retired: vec![], utxos: vec![], stale: vec![], last_reconcile: json!({}) }) };
         w.load_or_create()?;
@@ -168,6 +169,15 @@ impl HotWallet {
 
     pub fn encrypted(&self) -> bool {
         self.keystore.is_some()
+    }
+
+    /// The hot balance cap (0 = none).
+    pub fn cap_sats(&self) -> i64 {
+        self.cap_sats.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn set_cap_sats(&self, v: i64) {
+        self.cap_sats.store(v, std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn address(&self) -> String {
@@ -555,7 +565,7 @@ impl HotWallet {
     }
 
     pub fn over_cap(&self) -> bool {
-        self.cap_sats > 0 && self.balance_sats() > self.cap_sats
+        self.cap_sats() > 0 && self.balance_sats() > self.cap_sats()
     }
 
     /// Before a new channel is funded: above the cap, a human sweeps first (`hot_balance_cap`).
@@ -563,7 +573,7 @@ impl HotWallet {
         if self.over_cap() {
             return Err(err("hot_balance_cap", format!(
                 "hot key holds {} sats, above its {} sat cap: a human must sweep it (agentwallet-approve sweep) before new channels are funded",
-                self.balance_sats(), self.cap_sats)));
+                self.balance_sats(), self.cap_sats())));
         }
         Ok(())
     }
@@ -579,7 +589,7 @@ impl HotWallet {
         let retired: i64 = g.utxos.iter().filter(|u| !u.spk.is_empty() && u.spk != cur).map(|u| u.value).sum();
         json!({"hot_address": g.current.address, "hot_spk": cur, "hot_sats": bal, "hot_utxos": g.utxos.len(),
                "hot_stale_utxos": g.stale.len(), "hot_encrypted": self.encrypted(), "hot_retired_keys": g.retired.len(),
-               "hot_retired_sats": retired, "hot_cap_sats": self.cap_sats, "hot_over_cap": self.cap_sats > 0 && bal > self.cap_sats})
+               "hot_retired_sats": retired, "hot_cap_sats": self.cap_sats(), "hot_over_cap": self.cap_sats() > 0 && bal > self.cap_sats()})
     }
 
     // --- spending --------------------------------------------------------------------------------
