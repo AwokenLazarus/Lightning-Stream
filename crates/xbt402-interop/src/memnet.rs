@@ -2,7 +2,7 @@
 //! ([`MemChain`]: the node calls, the watcher's spend scan and a wallet) and an in-process HTTP
 //! network ([`MemNet`]: origin → service, with answers that can be dropped after serving). No
 //! sockets, no node.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use xbt402::client::{Transport, Wallet};
@@ -19,11 +19,17 @@ struct ChainState {
     height: u32,
     utxos: HashMap<(String, u32), UtxoInfo>,
     spent: HashMap<(String, u32), String>,
+    /// Spends that are in a block (the rest are in the mempool).
+    mined: HashSet<(String, u32)>,
     raw: HashMap<String, String>,
+    /// `estimatesmartfee`, sat/vB (None: no estimate).
+    fee_rate: Option<f64>,
 }
 
 /// A fake node: fundings appear with 6 confirmations, broadcasts spend their inputs (a conflicting
-/// spend is refused) and create unconfirmed outputs; `confirm_all` confirms everything.
+/// spend is refused; a tx not final at the tip too) and create unconfirmed outputs; `confirm_all`
+/// confirms everything. `gettxout` without the mempool still shows an output spent only in the
+/// mempool, as a node does.
 pub struct MemChain {
     st: Mutex<ChainState>,
 }
@@ -46,9 +52,35 @@ impl MemChain {
     }
 
     pub fn confirm_all(&self) {
-        for u in self.st().utxos.values_mut() {
+        let mut st = self.st();
+        for u in st.utxos.values_mut() {
             u.confirmations = u.confirmations.max(1);
         }
+        let spent: Vec<_> = st.spent.keys().cloned().collect();
+        st.mined.extend(spent);
+    }
+
+    /// `n` blocks: every mempool tx and spend confirms.
+    pub fn mine(&self, n: u32) {
+        self.st().height += n;
+        self.confirm_all();
+    }
+
+    /// A mempool tx leaves the mempool (expired, or replaced by what the caller broadcasts next).
+    pub fn evict(&self, txid: &str) {
+        let mut st = self.st();
+        st.spent.retain(|_, s| s != txid);
+        st.utxos.retain(|k, _| k.0 != txid);
+        st.raw.remove(txid);
+    }
+
+    /// The spender of an outpoint, if any.
+    pub fn spender(&self, txid: &str, vout: u32) -> Option<String> {
+        self.st().spent.get(&(txid.to_string(), vout)).cloned()
+    }
+
+    pub fn set_fee_rate(&self, sat_per_vb: Option<f64>) {
+        self.st().fee_rate = sat_per_vb;
     }
 
     pub fn raw(&self, txid: &str) -> Option<Tx> {
@@ -77,10 +109,10 @@ impl ChainBackend for MemChain {
         Ok(self.height())
     }
 
-    fn get_tx_out(&self, txid: &str, vout: u32, _mempool: bool) -> Result<Option<UtxoInfo>> {
+    fn get_tx_out(&self, txid: &str, vout: u32, mempool: bool) -> Result<Option<UtxoInfo>> {
         let st = self.st();
         let k = (txid.to_string(), vout);
-        if st.spent.contains_key(&k) {
+        if st.spent.contains_key(&k) && (mempool || st.mined.contains(&k)) {
             return Ok(None);
         }
         Ok(st.utxos.get(&k).cloned())
@@ -92,6 +124,9 @@ impl ChainBackend for MemChain {
         let mut st = self.st();
         if st.raw.contains_key(&txid) {
             return Ok(txid);
+        }
+        if tx.locktime > st.height && tx.locktime < 500_000_000 {
+            return Err(ChannelError::new("rpc_error", "non-final"));
         }
         for i in &tx.inputs {
             let k = (i.prevout.txid_hex(), i.prevout.vout);
@@ -118,6 +153,16 @@ impl SpendScan for MemChain {
     fn find_spend(&self, txid: &str, vout: u32, _from: u32) -> Result<Option<Tx>> {
         let st = self.st();
         Ok(st.spent.get(&(txid.to_string(), vout)).and_then(|s| st.raw.get(s)).and_then(|h| Tx::parse_hex(h).ok()))
+    }
+
+    fn scan_spk(&self, spk: &[u8]) -> Result<Vec<(String, u32, u64)>> {
+        let st = self.st();
+        Ok(st.utxos.iter().filter(|(k, u)| u.script_pubkey == spk && u.confirmations >= 1 && !st.spent.contains_key(*k))
+            .map(|(k, u)| (k.0.clone(), k.1, u.value)).collect())
+    }
+
+    fn fee_rate(&self, _target: u32) -> Result<Option<f64>> {
+        Ok(self.st().fee_rate)
     }
 }
 

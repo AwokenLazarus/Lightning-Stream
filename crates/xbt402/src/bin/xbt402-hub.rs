@@ -44,6 +44,7 @@ fn main() {
     let rpc = Rpc::from_cookie(&format!("http://{host}:{}", node["rpcport"]), &expand(node["cookie"].as_str().unwrap_or("")))
         .unwrap_or_else(|e| die(format!("node: {e}")));
     let wallet = rpc.wallet(node.get("wallet").and_then(Value::as_str).unwrap_or("hub"));
+    let refunds = wallet.clone();
     let key = std::fs::read_to_string(expand(conf["pay_to_key_file"].as_str().unwrap_or(""))).unwrap_or_else(|e| die(format!("pay_to_key_file: {e}")));
     let secret = Sc::from_hex_mod_n(key.trim()).and_then(|s| s.secret()).unwrap_or_else(|| die("pay_to_key_file: not a hex secret".into()));
     let cfg = HubConfig::from_json(conf.get("hub").unwrap_or(&json!({}))).unwrap_or_else(|e| die(format!("hub config: {e}")));
@@ -52,6 +53,11 @@ fn main() {
     let rpc = Arc::new(rpc);
     let hub = RouteHub::new(rpc.clone(), rpc.clone(), Box::new(wallet), Box::new(UreqTransport::default()), secret, network, Some(&datadir), cfg)
         .unwrap_or_else(|e| die(format!("{e}")));
+    // ch2 refunds pay the hub's wallet, not the per-channel payer key (AGP-037)
+    hub.set_refund_to(Some(Box::new(move || {
+        refunds.call("getnewaddress", json!([]))?.as_str().map(str::to_string)
+            .ok_or_else(|| xbt402::error::ChannelError::new("rpc_error", "getnewaddress"))
+    })));
     if args.iter().any(|a| a == "--close-all") {
         let mut closes = vec![];
         for (origin, oc) in hub.out_channels() {

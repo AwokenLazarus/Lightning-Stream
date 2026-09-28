@@ -35,6 +35,16 @@
 //! ch1 lock with t + r; rolls ch2 over once the provider's net payout reaches its settleMultiple ×
 //! closeFee or ch2 nears expiry (never while a lock is pending); and closes ch1s at their margin.
 //!
+//! Money safety (AGP-037, as B1): a ch2's key and params are on disk (state `funding`) before the
+//! wallet funds it, and a rollover's next ch2 (`next`) before the rollover request leaves; every
+//! non-final ch2 (funded, open, refunded, closed but unconfirmed) is reconciled against the chain each
+//! tick (a spent funding is read, the ch2 marked closed with the real spender and its locks' secrets
+//! recovered; the hub's refund is final once confirmed and rebroadcast while it is not; a provider
+//! close that beats it reverts its fee); refunds go out at expiry (unsigned) or expiry +
+//! `refund_grace_blocks` (signed) at a hub-chosen fee; `close_ch2` checks the provider's reply
+//! against the ledger; a provider's /terms are bounded before anything is funded; refills go through
+//! the refill hook (default: [`RouteHub::connect`]).
+//!
 //! Close fees (v1.2): ch2 is payee-pays by default (each provider pays its own settlement), ch1
 //! payer-pays (the client), and `extra.routing` advertises both.
 //!
@@ -48,14 +58,14 @@ use std::time::{Duration, Instant};
 
 use indexmap::IndexMap;
 use serde_json::{json, Map, Value};
-use xbt_primitives::address::segwit_address;
+use xbt_primitives::address::{address_to_spk, segwit_address};
 use xbt_primitives::ecdsa;
 use xbt_primitives::secp256k1::SecretKey;
 use xbt_primitives::sighash::SIGHASH_ALL_UNIFIED;
 use xbt_primitives::tx::Tx;
 
 use crate::adaptor::{self, PreSig, Sc};
-use crate::channel::{canonical_chan, channel_auth_key, settle_due, sign_with_type, ChannelParams, FeePayer};
+use crate::channel::{canonical_chan, channel_auth_key, settle_due, sign_with_type, ChannelParams, FeePayer, DUST};
 use crate::client::{Transport, Wallet};
 use crate::error::{fail, ChannelError, Result};
 use crate::funding::{ChainBackend, FundingPolicy};
@@ -101,6 +111,23 @@ pub struct HubConfig {
     pub hrp: String,
     /// `{"min_expiry_blocks", "max_expiry_blocks", ...}`: ch1's funding policy (FundingPolicy fields).
     pub policy: Value,
+    /// Bounds on a provider's /terms before the hub funds a ch2 (AGP-037); refused `bad_terms`.
+    /// minExpiryBlocks + 6 must fit, and the expiry is clamped to it (0: 2 × `ch2_expiry_blocks`).
+    pub ch2_max_expiry_blocks: u32,
+    pub ch2_max_close_fee_sat: u64,
+    /// `ch2_close_fee_multiple` × closeFeeSat ≤ capacity.
+    pub ch2_close_fee_multiple: u64,
+    pub ch2_max_min_conf: u64,
+    /// 0: `ch2_capacity`.
+    pub ch2_max_min_capacity: u64,
+    pub ch2_max_settle_multiple: u64,
+    /// A signed ch2 is refunded this many blocks past expiry (an unsigned one at expiry).
+    pub refund_grace_blocks: u32,
+    pub refund_conf_target: u32,
+    /// sat/vB floor of the refund fee (estimatesmartfee × vsize above it).
+    pub refund_min_feerate: f64,
+    /// A `funding` record the chain never shows is dropped after this many blocks (key kept).
+    pub funding_timeout_blocks: u32,
 }
 
 impl Default for HubConfig {
@@ -108,13 +135,18 @@ impl Default for HubConfig {
         Self { fee_base_msat: 1_000, fee_ppm: 2_000, fee_strategy: json!({"kind": "flat"}), quote_ttl: 600, max_lock_sat: 50_000,
                max_unguarded_lock_sat: 500, delta: 144, reveal_timeout: 10.0, ch2_capacity: 100_000, ch2_expiry_blocks: 1_100,
                liquidity_cap_sat: 0, close_fee: 600, ch1_close_fee_payer: FeePayer::Payer, ch2_close_fee_payer: FeePayer::Payee,
-               close_margin: 144, rollover_margin: 36, hrp: "bcrt".into(), policy: json!({"min_expiry_blocks": 1_008, "max_expiry_blocks": 8_640}) }
+               close_margin: 144, rollover_margin: 36, hrp: "bcrt".into(), policy: json!({"min_expiry_blocks": 1_008, "max_expiry_blocks": 8_640}),
+               ch2_max_expiry_blocks: 0, ch2_max_close_fee_sat: 5_000, ch2_close_fee_multiple: 20, ch2_max_min_conf: 6, ch2_max_min_capacity: 0,
+               ch2_max_settle_multiple: 100, refund_grace_blocks: 6, refund_conf_target: 6, refund_min_feerate: 1.0, funding_timeout_blocks: 6 }
     }
 }
 
-const HUB_KEYS: [&str; 19] = ["fee_base_msat", "fee_ppm", "fee_strategy", "quote_ttl", "max_lock_sat", "max_unguarded_lock_sat", "delta",
+const HUB_KEYS: [&str; 29] = ["fee_base_msat", "fee_ppm", "fee_strategy", "quote_ttl", "max_lock_sat", "max_unguarded_lock_sat", "delta",
                               "reveal_timeout", "ch2_capacity", "ch2_expiry_blocks", "liquidity_cap_sat", "close_fee",
-                              "ch1_close_fee_payer", "ch2_close_fee_payer", "close_margin", "rollover_margin", "hrp", "policy", "_comment"];
+                              "ch1_close_fee_payer", "ch2_close_fee_payer", "close_margin", "rollover_margin", "hrp", "policy", "_comment",
+                              "ch2_max_expiry_blocks", "ch2_max_close_fee_sat", "ch2_close_fee_multiple", "ch2_max_min_conf",
+                              "ch2_max_min_capacity", "ch2_max_settle_multiple", "refund_grace_blocks", "refund_conf_target",
+                              "refund_min_feerate", "funding_timeout_blocks"];
 
 impl HubConfig {
     /// From the operator's JSON (B1 `HubConfig.from_dict`): unknown keys are refused.
@@ -168,6 +200,18 @@ impl HubConfig {
             }
             c.policy = p.clone();
         }
+        c.ch2_max_expiry_blocks = u32_("ch2_max_expiry_blocks", c.ch2_max_expiry_blocks)?;
+        c.ch2_max_close_fee_sat = u("ch2_max_close_fee_sat", c.ch2_max_close_fee_sat)?;
+        c.ch2_close_fee_multiple = u("ch2_close_fee_multiple", c.ch2_close_fee_multiple)?;
+        c.ch2_max_min_conf = u("ch2_max_min_conf", c.ch2_max_min_conf)?;
+        c.ch2_max_min_capacity = u("ch2_max_min_capacity", c.ch2_max_min_capacity)?;
+        c.ch2_max_settle_multiple = u("ch2_max_settle_multiple", c.ch2_max_settle_multiple)?;
+        c.refund_grace_blocks = u32_("refund_grace_blocks", c.refund_grace_blocks)?;
+        c.refund_conf_target = u32_("refund_conf_target", c.refund_conf_target)?;
+        if let Some(v) = m.get("refund_min_feerate") {
+            c.refund_min_feerate = v.as_f64().filter(|x| *x >= 0.0).ok_or_else(|| bad("refund_min_feerate must be a number".into()))?;
+        }
+        c.funding_timeout_blocks = u32_("funding_timeout_blocks", c.funding_timeout_blocks)?;
         c.funding_policy()?;
         Ok(c)
     }
@@ -204,7 +248,7 @@ pub struct OutChannel {
     pub params: ChannelParams,
     /// Payer key (regtest: stored here; production: a B2-style signer).
     pub secret: String,
-    /// funded -> open -> closed | rolled.
+    /// funding -> funded -> open -> closed | rolled | refunded; funding -> dropped.
     pub state: String,
     /// Highest cumulative state the provider can close with.
     pub signed: u64,
@@ -224,14 +268,39 @@ pub struct OutChannel {
     pub rolled_to: String,
     pub opened_at: u32,
     pub scanned_to: u32,
+    /// The hub's broadcast refund (AGP-037).
+    pub refund_txid: String,
+    /// Its fee; 0 again if a provider close won instead.
+    pub refund_fee: u64,
+    /// The funding's spend is confirmed: nothing left to watch (JSON `final`).
+    pub final_: bool,
+    /// Write-ahead: the rollover's next ch2 (empty: none).
+    pub next: Map<String, Value>,
+    /// The wallet's fund call failed: reconciled against the chain.
+    pub fund_error: String,
 }
 
+/// States in which the hub's coins are committed.
+pub const LIVE: [&str; 3] = ["funding", "funded", "open"];
+/// States the watcher reconciles until `final`.
+pub const NONFINAL: [&str; 4] = ["funded", "open", "refunded", "closed"];
+
 impl OutChannel {
+    /// A new ch2 record (no state signed yet).
+    #[allow(clippy::too_many_arguments)]
+    pub fn fresh(origin: &str, pay_to: &str, params: ChannelParams, secret: &SecretKey, state: &str, settle_multiple: u64, terms: &Value, tip: u32) -> Self {
+        Self { origin: origin.into(), pay_to: pay_to.into(), params, secret: hex::encode(secret.secret_bytes()), state: state.into(), signed: 0,
+               routed: 0, seq: 0, pending: Map::new(), stale: vec![], settle_multiple, terms: terms.clone(), refund_hex: String::new(),
+               blocked: String::new(), close_txid: String::new(), rolled_to: String::new(), opened_at: tip, scanned_to: tip,
+               refund_txid: String::new(), refund_fee: 0, final_: false, next: Map::new(), fund_error: String::new() }
+    }
+
     pub fn to_json(&self) -> Value {
         json!({"origin": self.origin, "pay_to": self.pay_to, "params": self.params.to_json(), "secret": self.secret, "state": self.state,
                "signed": self.signed, "routed": self.routed, "seq": self.seq, "pending": self.pending, "stale": self.stale,
                "settle_multiple": self.settle_multiple, "terms": self.terms, "refund_hex": self.refund_hex, "blocked": self.blocked,
-               "close_txid": self.close_txid, "rolled_to": self.rolled_to, "opened_at": self.opened_at, "scanned_to": self.scanned_to})
+               "close_txid": self.close_txid, "rolled_to": self.rolled_to, "opened_at": self.opened_at, "scanned_to": self.scanned_to,
+               "refund_txid": self.refund_txid, "refund_fee": self.refund_fee, "final": self.final_, "next": self.next, "fund_error": self.fund_error})
     }
 
     pub fn from_json(v: &Value) -> Result<Self> {
@@ -242,7 +311,9 @@ impl OutChannel {
                   pending: v.get("pending").and_then(Value::as_object).cloned().unwrap_or_default(),
                   stale: v.get("stale").and_then(Value::as_array).cloned().unwrap_or_default(), settle_multiple: n("settle_multiple"),
                   terms: v.get("terms").cloned().unwrap_or(Value::Null), refund_hex: s("refund_hex"), blocked: s("blocked"),
-                  close_txid: s("close_txid"), rolled_to: s("rolled_to"), opened_at: n("opened_at") as u32, scanned_to: n("scanned_to") as u32 })
+                  close_txid: s("close_txid"), rolled_to: s("rolled_to"), opened_at: n("opened_at") as u32, scanned_to: n("scanned_to") as u32,
+                  refund_txid: s("refund_txid"), refund_fee: n("refund_fee"), final_: v.get("final").and_then(Value::as_bool).unwrap_or(false),
+                  next: v.get("next").and_then(Value::as_object).cloned().unwrap_or_default(), fund_error: s("fund_error") })
     }
 
     fn secret_key(&self) -> Result<SecretKey> {
@@ -304,6 +375,20 @@ pub struct HubStats {
 /// `callable(hub) -> (fee_base_msat, fee_ppm)`.
 pub type FeeStrategyFn = Box<dyn Fn(&RouteHub) -> (u64, u64) + Send + Sync>;
 
+/// `refill(hub, origin)`: fund the ch2 that replaces a closed one (an embedder's own path, with its
+/// lock and cap). Default: [`RouteHub::connect`].
+pub type RefillFn = Box<dyn Fn(&RouteHub, &str) -> Result<()> + Send + Sync>;
+
+/// `refund_to()`: the address a ch2 refund pays (default: the ch2's payer key).
+pub type RefundToFn = Box<dyn Fn() -> Result<String> + Send + Sync>;
+
+/// Where a ch2 record lives: the live book (by origin) or the archive (by index).
+#[derive(Clone, Copy, Debug)]
+enum Loc<'a> {
+    Live(&'a str),
+    Archived(usize),
+}
+
 /// A provider's busy flag: the route request in flight, or the watcher, owns its ch2.
 struct Busy<'a> {
     set: &'a Mutex<HashSet<String>>,
@@ -334,10 +419,16 @@ pub struct RouteHub {
     quote_seq: Mutex<i64>,
     reveal_timeout_bits: AtomicU64,
     fee_strategy: Option<FeeStrategyFn>,
+    refill: Mutex<Option<RefillFn>>,
+    refund_to: Mutex<Option<RefundToFn>>,
     /// Tests/demo: "" | "receipt" (keep t + r from the client) | "all" (forward nothing).
     pub withhold: Mutex<String>,
     pub events: Mutex<Vec<Value>>,
     pub stats: Mutex<HubStats>,
+}
+
+fn committed(b: &OutBook) -> u64 {
+    b.chans.values().filter(|c| LIVE.contains(&c.state.as_str())).map(|c| c.params.capacity).sum()
 }
 
 fn err(status: u16, code: &str, detail: &str, extra: Value) -> HttpResponse {
@@ -380,7 +471,8 @@ impl RouteHub {
         let out = OutBook::open(datadir.map(|d| d.join("ch2.json")).as_deref())?;
         Ok(Self { pay_to: hex::encode(ecdsa::pubkey(&pay_to_secret)), cfg, chain, scan, wallet, http, secret: pay_to_secret,
                   network: network.into(), inbound, out: Mutex::new(out), busy: Mutex::new(HashSet::new()), quote: Mutex::new(None),
-                  quote_seq: Mutex::new(now_i()), reveal_timeout_bits: AtomicU64::new(0), fee_strategy: None, withhold: Mutex::new(String::new()), events: Mutex::new(vec![]),
+                  quote_seq: Mutex::new(now_i()), reveal_timeout_bits: AtomicU64::new(0), fee_strategy: None,
+                  refill: Mutex::new(None), refund_to: Mutex::new(None), withhold: Mutex::new(String::new()), events: Mutex::new(vec![]),
                   stats: Mutex::new(HubStats::default()) })
     }
 
@@ -403,6 +495,16 @@ impl RouteHub {
         let r = f(&mut b);
         let _ = b.save();
         r
+    }
+
+    /// Replace the default refill ([`RouteHub::connect`]) with an embedder's path.
+    pub fn set_refill(&self, f: Option<RefillFn>) {
+        *lk(&self.refill) = f;
+    }
+
+    /// Pay ch2 refunds to this hook's address (default: the ch2's payer key).
+    pub fn set_refund_to(&self, f: Option<RefundToFn>) {
+        *lk(&self.refund_to) = f;
     }
 
     /// Replace the configured fee strategy with a callable.
@@ -439,9 +541,17 @@ impl RouteHub {
         lk(&self.events).push(e);
     }
 
-    /// The hub's own coins in live ch2s (funded or open).
+    /// The hub's own coins in live ch2s (funding, funded or open).
     pub fn committed_sat(&self) -> u64 {
-        lk(&self.out).chans.values().filter(|c| c.state == "funded" || c.state == "open").map(|c| c.params.capacity).sum()
+        committed(&lk(&self.out))
+    }
+
+    /// Fees of the hub's own ch2 refunds that spent (or still may spend) their fundings.
+    pub fn refund_fees_sat(&self) -> u64 {
+        let b = lk(&self.out);
+        let live = b.chans.values().filter(|c| c.state == "refunded").map(|c| c.refund_fee);
+        let old = b.archived.iter().filter(|r| r.get("state").and_then(Value::as_str) == Some("refunded")).map(|r| py_u64(r.get("refund_fee")).unwrap_or(0));
+        live.chain(old).sum()
     }
 
     fn configured_fees(&self) -> Result<(u64, u64)> {
@@ -940,61 +1050,185 @@ impl RouteHub {
         Ok((r.status, crate::json::parse_slice(&r.body).unwrap_or(Value::Null)))
     }
 
+    /// Bound a provider's /terms before the hub funds anything (AGP-037): (capacity, blocks) or
+    /// `bad_terms`. A provider must not be able to set a ch2 the hub can never use or get back: an
+    /// expiry decades away, a close fee that eats the capacity, a minConf never reached.
+    pub fn ch2_terms(&self, terms: &Value, capacity: Option<u64>, expiry_blocks: Option<u32>) -> Result<(u64, u32)> {
+        let c = &self.cfg;
+        let bad = |w: &str| ChannelError::new("bad_terms", format!("malformed /terms: {w}"));
+        let ex = terms.get("extra").filter(|e| e.is_object()).ok_or_else(|| bad("extra"))?;
+        let pay_to = terms.get("payTo").and_then(Value::as_str).and_then(|h| hex::decode(h).ok()).filter(|b| b.len() == 33);
+        pay_to.ok_or_else(|| bad("payTo"))?;
+        let num = |k: &str| py_u64(ex.get(k)).ok_or_else(|| bad(k));
+        let close_fee = num("closeFeeSat")?;
+        let min_cap = num("minCapacity")?;
+        let lo = num("minExpiryBlocks")?.saturating_add(6);
+        let hi = num("maxExpiryBlocks")?.saturating_sub(1);
+        let min_conf = if ex.get("minConf").is_some() { num("minConf")? } else { 1 };
+        let mult = if ex.get("settleMultiple").is_some() { num("settleMultiple")? } else { 20 };
+        let max_blocks = if c.ch2_max_expiry_blocks > 0 { c.ch2_max_expiry_blocks as u64 } else { 2 * c.ch2_expiry_blocks as u64 };
+        let max_min_cap = if c.ch2_max_min_capacity > 0 { c.ch2_max_min_capacity } else { c.ch2_capacity };
+        let cap = capacity.unwrap_or(c.ch2_capacity).max(min_cap);
+        let why = if close_fee > c.ch2_max_close_fee_sat {
+            format!("closeFeeSat {close_fee} > ch2_max_close_fee_sat {}", c.ch2_max_close_fee_sat)
+        } else if close_fee.saturating_mul(c.ch2_close_fee_multiple) > cap {
+            format!("{} x closeFeeSat {close_fee} > capacity {cap}", c.ch2_close_fee_multiple)
+        } else if min_cap > max_min_cap {
+            format!("minCapacity {min_cap} > ch2_max_min_capacity {max_min_cap}")
+        } else if lo > max_blocks || lo > hi {
+            format!("minExpiryBlocks + 6 = {lo} > max expiry {}", max_blocks.min(hi))
+        } else if min_conf > c.ch2_max_min_conf {
+            format!("minConf {min_conf} > ch2_max_min_conf {}", c.ch2_max_min_conf)
+        } else if !(1..=c.ch2_max_settle_multiple).contains(&mult) {
+            format!("settleMultiple {mult} outside [1, {}]", c.ch2_max_settle_multiple)
+        } else {
+            String::new()
+        };
+        if !why.is_empty() {
+            return fail("bad_terms", why);
+        }
+        let want = expiry_blocks.unwrap_or(c.ch2_expiry_blocks) as u64;
+        Ok((cap, want.max(lo).min(hi).min(max_blocks) as u32))
+    }
+
     /// Fund a ch2 to `origin` from the hub's own wallet. It opens (the watcher) once the funding
     /// has the provider's minConf.
     pub fn connect(&self, origin: &str, capacity: Option<u64>, expiry_blocks: Option<u32>) -> Result<OutChannel> {
         let origin = origin.trim_end_matches('/');
+        if lk(&self.out).chans.get(origin).is_some_and(|c| c.state == "funding") {
+            return fail("ch2_funding", format!("a ch2 to {origin} is being funded (the watcher reconciles it)"));
+        }
         let (st, terms) = self.get_json(&format!("{origin}{TERMS_PATH}"))?;
         if st != 200 {
             return fail("provider_error", format!("terms: HTTP {st}"));
         }
-        let ex = terms.get("extra").cloned().unwrap_or(Value::Null);
+        let ex = terms.get("extra").filter(|e| e.is_object()).ok_or_else(|| ChannelError::new("bad_terms", "terms are not a JSON object with extra"))?;
         let offered = ex.get("closeFeePayer").and_then(Value::as_str).unwrap_or("payer");
         if self.cfg.ch2_close_fee_payer == FeePayer::Payee && offered != "payee" {
             return fail("bad_fee_payer", format!("{origin} does not offer payee-pays routed channels (closeFeePayer {offered:?}); \
                                                   set ch2_close_fee_payer payer to fund it"));
         }
-        let min_cap = py_u64(ex.get("minCapacity")).ok_or_else(|| ChannelError::new("bad_offer", "minCapacity"))?;
-        let cap = capacity.unwrap_or(self.cfg.ch2_capacity).max(min_cap);
-        let blocks = self.ch2_blocks(&ex, expiry_blocks.unwrap_or(self.cfg.ch2_expiry_blocks))?;
+        let (cap, blocks) = self.ch2_terms(&terms, capacity, expiry_blocks)?;
         self.fund_ch2(origin, &terms, cap, self.chain.block_count()? + blocks)
     }
 
-    fn ch2_blocks(&self, ex: &Value, want: u32) -> Result<u32> {
-        let lo = py_u64(ex.get("minExpiryBlocks")).ok_or_else(|| ChannelError::new("bad_offer", "minExpiryBlocks"))? + 6;
-        let hi = py_u64(ex.get("maxExpiryBlocks")).ok_or_else(|| ChannelError::new("bad_offer", "maxExpiryBlocks"))?.saturating_sub(1);
-        Ok((want as u64).max(lo).min(hi) as u32)
-    }
-
+    /// Write-ahead (AGP-037): the ch2's key and params are on disk, state `funding`, before the
+    /// wallet runs, and the cap check and that record are one step under the book's lock.
     fn fund_ch2(&self, origin: &str, terms: &Value, cap: u64, expiry: u32) -> Result<OutChannel> {
-        if self.cfg.liquidity_cap_sat > 0 {
-            let freed = lk(&self.out).chans.get(origin).filter(|o| o.state == "funded" || o.state == "open").map(|o| o.params.capacity).unwrap_or(0);
-            let committed = self.committed_sat();
-            if committed - freed + cap > self.cfg.liquidity_cap_sat {
-                return fail("liquidity_cap", format!("{committed} + {cap} sat > liquidity_cap_sat {}", self.cfg.liquidity_cap_sat));
-            }
-        }
         let secret = adaptor::random_secret();
         let pay_to = terms.get("payTo").and_then(Value::as_str).ok_or_else(|| ChannelError::new("bad_offer", "payTo"))?.to_string();
         let ex = terms.get("extra").cloned().unwrap_or(Value::Null);
         let close_fee = py_u64(ex.get("closeFeeSat")).ok_or_else(|| ChannelError::new("bad_offer", "closeFeeSat"))?;
-        let p = ChannelParams::derive(&hex::decode(&pay_to).map_err(|_| ChannelError::new("bad_offer", "payTo"))?, &ecdsa::pubkey(&secret),
-                                      expiry, close_fee, None, &self.network, self.cfg.ch2_close_fee_payer)?;
-        let (txid, vout) = self.wallet.fund(&segwit_address(&self.cfg.hrp, &p.spk())?, cap)?;
-        let p = p.with_funding(&txid, vout, cap)?;
+        let mut p = ChannelParams::derive(&hex::decode(&pay_to).map_err(|_| ChannelError::new("bad_offer", "payTo"))?, &ecdsa::pubkey(&secret),
+                                          expiry, close_fee, None, &self.network, self.cfg.ch2_close_fee_payer)?;
+        p.capacity = cap;
+        let address = segwit_address(&self.cfg.hrp, &p.spk())?;
         let tip = self.chain.block_count()?;
-        let oc = OutChannel { origin: origin.into(), pay_to, refund_hex: p.refund_tx(&secret, None, None)?.to_hex(), params: p,
-                              secret: hex::encode(secret.secret_bytes()), state: "funded".into(), signed: 0, routed: 0, seq: 0,
-                              pending: Map::new(), stale: vec![], settle_multiple: py_u64(ex.get("settleMultiple")).unwrap_or(20),
-                              terms: terms.clone(), blocked: String::new(), close_txid: String::new(), rolled_to: String::new(),
-                              opened_at: tip, scanned_to: tip };
-        let mut b = lk(&self.out);
-        if let Some(old) = b.chans.get(origin).cloned() {
-            b.archived.push(old.to_json());
+        let oc = OutChannel::fresh(origin, &pay_to, p, &secret, "funding", py_u64(ex.get("settleMultiple")).unwrap_or(20), terms, tip);
+        {
+            let mut b = lk(&self.out);
+            let old = b.chans.get(origin).cloned();
+            if old.as_ref().is_some_and(|o| o.state == "funding") {
+                return fail("ch2_funding", format!("a ch2 to {origin} is being funded"));
+            }
+            if self.cfg.liquidity_cap_sat > 0 {
+                let freed = old.as_ref().filter(|o| LIVE.contains(&o.state.as_str())).map(|o| o.params.capacity).unwrap_or(0);
+                let c = committed(&b);
+                if c - freed + cap > self.cfg.liquidity_cap_sat {
+                    return fail("liquidity_cap", format!("{c} + {cap} sat > liquidity_cap_sat {}", self.cfg.liquidity_cap_sat));
+                }
+            }
+            if let Some(old) = old {
+                b.archived.push(old.to_json());
+            }
+            b.chans.insert(origin.into(), oc.clone());
+            b.save()?;
         }
-        b.chans.insert(origin.into(), oc.clone());
+        let (txid, vout) = match self.wallet.fund(&address, cap) {
+            Ok(r) => r,
+            Err(e) => {
+                // it may have broadcast: the record stays for the watcher
+                let msg: String = e.to_string().chars().take(200).collect();
+                self.upd(Loc::Live(origin), &oc, |c| c.fund_error = msg.clone())?;
+                self.event(json!({"event": "ch2_fund_failed", "provider": origin, "error": msg}));
+                return fail("fund_failed", format!("fund hook: {msg} (the watcher reconciles the record)"));
+            }
+        };
+        self.funded(Loc::Live(origin), &oc, &txid, vout, cap)?;
+        Ok(lk(&self.out).chans.get(origin).cloned().unwrap_or(oc))
+    }
+
+    /// Apply `f` to the record at `loc` that is `oc`'s ch2 (same payer key), and save. None: gone.
+    fn upd<R>(&self, loc: Loc<'_>, oc: &OutChannel, f: impl FnOnce(&mut OutChannel) -> R) -> Result<Option<R>> {
+        let mut b = lk(&self.out);
+        let r = match loc {
+            Loc::Live(origin) => b.chans.get_mut(origin).filter(|c| c.params.payer_pub == oc.params.payer_pub).map(f),
+            Loc::Archived(i) => match b.archived.get(i).map(OutChannel::from_json) {
+                Some(Ok(mut c)) if c.params.payer_pub == oc.params.payer_pub => {
+                    let r = f(&mut c);
+                    b.archived[i] = c.to_json();
+                    Some(r)
+                }
+                _ => None,
+            },
+        };
         b.save()?;
-        Ok(oc)
+        Ok(r)
+    }
+
+    fn get(&self, loc: Loc<'_>) -> Option<OutChannel> {
+        let b = lk(&self.out);
+        match loc {
+            Loc::Live(origin) => b.chans.get(origin).cloned(),
+            Loc::Archived(i) => b.archived.get(i).and_then(|v| OutChannel::from_json(v).ok()),
+        }
+    }
+
+    fn funded(&self, loc: Loc<'_>, oc: &OutChannel, txid: &str, vout: u32, cap: u64) -> Result<()> {
+        let p = oc.params.clone().with_funding(txid, vout, cap)?;
+        let refund = p.refund_tx(&oc.secret_key()?, None, None)?.to_hex(); // fallback; the watcher refunds at its own fee
+        self.upd(loc, oc, |c| {
+            c.params = p;
+            c.state = "funded".into();
+            c.refund_hex = refund;
+        })?;
+        Ok(())
+    }
+
+    /// A `funding` record (the wallet call failed, or the hub stopped mid-fund): the funding on
+    /// chain -> funded, and the open goes on; none within `funding_timeout_blocks` -> dropped
+    /// (archived with its key, so a late confirmation can still be refunded by hand).
+    fn reconcile_funding(&self, origin: &str, oc: &OutChannel, tip: u32) -> Result<Vec<Value>> {
+        let hits = match self.scan.scan_spk(&oc.params.spk()) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("hub: scantxoutset for {origin}: {e}");
+                vec![]
+            }
+        };
+        if let Some((txid, vout, sats)) = hits.into_iter().find(|h| h.2 >= DUST) {
+            self.funded(Loc::Live(origin), oc, &txid, vout, sats)?;
+            let chan = self.get(Loc::Live(origin)).map(|c| c.params.channel_id()).unwrap_or_default();
+            let ev = json!({"event": "ch2_funding_recovered", "provider": origin, "chan": chan});
+            self.event(ev.clone());
+            return Ok(vec![ev]);
+        }
+        if tip.saturating_sub(oc.opened_at) < self.cfg.funding_timeout_blocks {
+            return Ok(vec![]);
+        }
+        {
+            let mut b = lk(&self.out);
+            if let Some(c) = b.chans.get(origin).filter(|c| c.params.payer_pub == oc.params.payer_pub).cloned() {
+                let mut c = c;
+                c.state = "dropped".into();
+                b.archived.push(c.to_json());
+                b.chans.shift_remove(origin);
+            }
+            b.save()?;
+        }
+        let ev = json!({"event": "ch2_funding_dropped", "provider": origin, "error": oc.fund_error});
+        self.event(ev.clone());
+        Ok(vec![ev])
     }
 
     fn open(&self, oc: &OutChannel) -> Result<bool> {
@@ -1028,14 +1262,16 @@ impl RouteHub {
     }
 
     /// One tx pays the provider its balance and funds the next ch2 (rollover instead of close).
+    /// The next ch2's key is written ahead (`next`), and its funding txid is known before the
+    /// request leaves, so a lost answer is finished by the watcher when that tx spends the funding.
     pub fn rollover(&self, oc: &OutChannel) -> Result<Value> {
         let p = &oc.params;
         let amount = oc.signed;
         let next_cap = p.rollover_next_capacity(amount);
         let min_cap = oc.term_u64("minCapacity").unwrap_or(0);
         let tip = self.chain.block_count()?;
-        let ex = oc.terms.get("extra").cloned().unwrap_or(Value::Null);
-        let expiry = tip + self.ch2_blocks(&ex, self.cfg.ch2_expiry_blocks)?;
+        let (_, blocks) = self.ch2_terms(&oc.terms, None, None)?;
+        let expiry = tip + blocks;
         if next_cap < min_cap.max(p.min_amount()) {
             return self.close_ch2(oc, true);
         }
@@ -1043,77 +1279,216 @@ impl RouteHub {
         let nxt = ChannelParams::derive(&hex::decode(&oc.pay_to).unwrap_or_default(), &ecdsa::pubkey(&secret), expiry, p.close_fee, None,
                                         &self.network, p.close_fee_payer)?;
         let tx = p.rollover_tx(amount, &nxt.spk(), next_cap)?;
+        let txid = tx.txid();
+        let nxt = nxt.with_funding(&txid, 1, next_cap)?;
+        let mut new = OutChannel::fresh(&oc.origin, &oc.pay_to, nxt.clone(), &secret, "funded", oc.settle_multiple, &oc.terms, tip);
+        new.refund_hex = nxt.refund_tx(&secret, None, None)?.to_hex();
+        let next = new.to_json().as_object().cloned().unwrap_or_default();
+        // write-ahead: the next ch2's key before the request
+        if self.upd(Loc::Live(&oc.origin), oc, |c| c.next = next)?.is_none() {
+            return fail("bad_state", "the hub's channel to that provider changed");
+        }
         let sig = sign_with_type(&oc.secret_key()?, &p.sighash(&tx)?, SIGHASH_ALL_UNIFIED);
         let req = json!({"chan": p.channel_id(), "amount": amount, "sig": hex::encode(sig),
                          "next": {"payerPub": hex::encode(nxt.payer_pub), "payerSpk": hex::encode(&nxt.payer_spk), "expiry": expiry}});
-        let (st, doc) = self.post_json(&format!("{}{ROLLOVER_PATH}", oc.origin), &req)?;
+        let (st, doc) = self.post_json(&format!("{}{ROLLOVER_PATH}", oc.origin), &req)
+            .map_err(|e| ChannelError::new("provider_error", format!("rollover: {e}")))?;
         if st != 200 {
+            if [400, 401, 403].contains(&st) {
+                // refused: nothing was broadcast
+                self.upd(Loc::Live(&oc.origin), oc, |c| c.next = Map::new())?;
+            }
             let code = doc.get("error").and_then(Value::as_str).filter(|c| safe_code(c)).unwrap_or("provider_error");
-            return fail(code, doc.to_string());
+            return fail(code, doc.to_string().chars().take(200).collect::<String>());
         }
-        let txid = py_str(doc.get("txid"));
-        let nxt = nxt.with_funding(&txid, 1, next_cap)?;
-        let new = OutChannel { origin: oc.origin.clone(), pay_to: oc.pay_to.clone(), refund_hex: nxt.refund_tx(&secret, None, None)?.to_hex(),
-                               params: nxt, secret: hex::encode(secret.secret_bytes()), state: "funded".into(), signed: 0, routed: 0, seq: 0,
-                               pending: Map::new(), stale: vec![], settle_multiple: oc.settle_multiple, terms: oc.terms.clone(),
-                               blocked: String::new(), close_txid: String::new(), rolled_to: String::new(), opened_at: tip, scanned_to: tip };
+        if py_str(doc.get("txid")).to_lowercase() != txid {
+            return fail("bad_rollover_reply", format!("rollover reply {} is not tx {txid}", doc.to_string().chars().take(120).collect::<String>()));
+        }
+        let cur = self.get(Loc::Live(&oc.origin)).unwrap_or_else(|| oc.clone());
+        self.finish_rollover(Loc::Live(&oc.origin), &cur, amount)
+    }
+
+    fn finish_rollover(&self, loc: Loc<'_>, oc: &OutChannel, amount: u64) -> Result<Value> {
+        let new = OutChannel::from_json(&Value::Object(oc.next.clone()))?;
+        let txid = new.params.funding_txid();
         {
             let mut b = lk(&self.out);
             let mut old = oc.clone();
-            if let Some(c) = b.chans.get(&oc.origin).filter(|c| c.params.channel_id() == p.channel_id()) {
-                old = c.clone();
-            }
             old.state = "rolled".into();
             old.rolled_to = format!("{txid}:1");
             old.close_txid = txid.clone();
-            b.archived.push(old.to_json());
-            b.chans.insert(oc.origin.clone(), new.clone());
+            old.next = Map::new();
+            match loc {
+                Loc::Live(origin) if b.chans.get(origin).is_some_and(|c| c.params.payer_pub == oc.params.payer_pub) => {
+                    b.archived.push(old.to_json());
+                    b.chans.insert(origin.into(), new.clone());
+                }
+                Loc::Archived(i) if i < b.archived.len() => {
+                    b.archived[i] = old.to_json();
+                    b.archived.push(new.to_json());
+                }
+                _ => {
+                    b.archived.push(old.to_json());
+                    b.archived.push(new.to_json());
+                }
+            }
             b.save()?;
         }
         let ev = json!({"event": "ch2_rollover", "provider": oc.origin, "txid": txid, "amount": amount, "next": new.params.channel_id(),
-                        "nextCapacity": next_cap});
+                        "nextCapacity": new.params.capacity});
         self.event(ev.clone());
         Ok(ev)
     }
 
-    /// Ask the provider to close ch2 (payer-signed close request); with `refill`, fund a new one.
+    /// Ask the provider to close ch2 (payer-signed close request); with `refill`, fund a new one
+    /// through the refill hook. The provider's reply must match the ledger (AGP-037): a 64-hex
+    /// txid, cum = a state the hub signed (its best, or a pending or written-off lock's), and on a
+    /// payee-pays ch2 payeeFee = the close fee, payeeNet = cum − payeeFee. Anything else is
+    /// `bad_close_reply` and changes nothing: the watcher reads the real close off the chain.
     pub fn close_ch2(&self, oc: &OutChannel, refill: bool) -> Result<Value> {
         let p = &oc.params;
         if oc.signed == 0 {
             // nothing signed on this ch2 (e.g. a fresh rollover): nothing to close; the hub's refund
-            // (refund_hex, valid at expiry) returns the coins, or the next routed lock uses it
+            // (at expiry, by the watcher) returns the coins, or the next routed lock uses it
             let ev = json!({"event": "ch2_idle", "provider": oc.origin, "chan": p.channel_id(), "capacity": p.capacity});
             self.event(ev.clone());
             return Ok(ev);
         }
         let req = json!({"chan": p.channel_id(), "sig": hex::encode(ecdsa::sign(&oc.secret_key()?, &close_message(&p.channel_id())))});
         let close_url = oc.terms.get("extra").and_then(|e| e.get("closeUrl")).and_then(Value::as_str).unwrap_or(CLOSE_PATH);
-        let (st, doc) = self.post_json(&format!("{}{close_url}", oc.origin), &req)?;
+        let (st, doc) = self.post_json(&format!("{}{close_url}", oc.origin), &req)
+            .map_err(|e| ChannelError::new("provider_error", format!("close: {e}")))?;
         if st != 200 {
-            return fail("provider_error", doc.to_string());
+            return fail("provider_error", doc.to_string().chars().take(200).collect::<String>());
         }
-        let txid = py_str(doc.get("txid"));
-        {
-            let mut b = lk(&self.out);
-            if let Some(c) = b.chans.get_mut(&oc.origin).filter(|c| c.params.channel_id() == p.channel_id()) {
-                c.state = "closed".into();
-                c.close_txid = txid.clone();
-            }
-            b.save()?;
-        }
-        let ev = json!({"event": "ch2_close", "provider": oc.origin, "txid": txid, "amount": py_u64(doc.get("cum")).unwrap_or(0),
-                        "chan": p.channel_id()});
-        self.event(ev.clone());
+        let (txid, cum) = self.check_close_reply(oc, &doc)?;
+        self.upd(Loc::Live(&oc.origin), oc, |c| {
+            c.state = "closed".into();
+            c.close_txid = txid.clone();
+        })?;
+        let mut ev = json!({"event": "ch2_close", "provider": oc.origin, "chan": p.channel_id(), "txid": txid, "amount": cum,
+                            "payeeFee": p.payee_fee(), "payeeNet": cum.saturating_sub(p.payee_fee())});
         if refill {
-            self.connect(&oc.origin, None, None)?;
+            let hook = lk(&self.refill);
+            let r = match hook.as_ref() {
+                Some(f) => f(self, &oc.origin),
+                None => self.connect(&oc.origin, None, None).map(|_| ()),
+            };
+            drop(hook);
+            if let Err(e) = r {
+                // the close stands; the refill is reported
+                let msg: String = e.to_string().chars().take(200).collect();
+                ev["refillError"] = msg.clone().into();
+                self.event(json!({"event": "ch2_refill_failed", "provider": oc.origin, "error": msg}));
+            }
         }
+        self.event(ev.clone());
         Ok(ev)
+    }
+
+    fn check_close_reply(&self, oc: &OutChannel, doc: &Value) -> Result<(String, u64)> {
+        let p = &oc.params;
+        let bad = |why: String| {
+            self.event(json!({"event": "ch2_close_bad_reply", "provider": oc.origin, "chan": p.channel_id(), "why": why}));
+            ChannelError::new("bad_close_reply", why)
+        };
+        if !doc.is_object() {
+            return Err(bad("not a JSON object".into()));
+        }
+        let txid = doc.get("txid").and_then(Value::as_str).filter(|t| t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()));
+        let Some(txid) = txid else {
+            return Err(bad(format!("txid {:?}", doc.get("txid").map(|v| v.to_string().chars().take(70).collect::<String>()))));
+        };
+        let cum = match doc.get("cum") {
+            Some(Value::String(c)) => c.parse::<u64>().ok().filter(|_| c.bytes().all(|b| b.is_ascii_digit())),
+            Some(Value::Number(n)) => n.as_u64(),
+            _ => None,
+        };
+        let Some(cum) = cum else { return Err(bad(format!("cum {:?}", doc.get("cum").map(|v| v.to_string().chars().take(40).collect::<String>())))) };
+        let mut allowed = vec![oc.signed];
+        if !oc.pending.is_empty() {
+            allowed.push(py_u64(oc.pending.get("cum")).unwrap_or(u64::MAX));
+        }
+        allowed.extend(oc.stale.iter().map(|s| py_u64(s.get("cum")).unwrap_or(u64::MAX)));
+        if !allowed.contains(&cum) {
+            return Err(bad(format!("cum {cum} is no state the hub signed (best {})", oc.signed)));
+        }
+        if let Some(ch) = doc.get("chan") {
+            if ch.as_str() != Some(p.channel_id().as_str()) {
+                return Err(bad(format!("chan {}", ch.to_string().chars().take(80).collect::<String>())));
+            }
+        }
+        if p.payee_fee() > 0 {
+            for (k, want) in [("payeeFee", p.payee_fee()), ("payeeNet", cum.saturating_sub(p.payee_fee()))] {
+                if let Some(v) = doc.get(k) {
+                    if py_str(Some(v)) != want.to_string() {
+                        return Err(bad(format!("{k} {} != {want}", v.to_string().chars().take(30).collect::<String>())));
+                    }
+                }
+            }
+        }
+        Ok((txid.to_lowercase(), cum))
+    }
+
+    // --- refunds -------------------------------------------------------------------------------------
+
+    /// The hub's fee for a ch2 refund: estimatesmartfee(`refund_conf_target`) × vsize, at least
+    /// `refund_min_feerate` sat/vB; never the provider's closeFee, and never below dust left over.
+    pub fn refund_fee(&self, p: &ChannelParams, dest: Option<&[u8]>) -> Result<u64> {
+        let one = Sc::from_u64(1).secret().ok_or_else(|| ChannelError::new("bad_state", "key"))?;
+        let vsize = p.refund_tx(&one, dest, Some(0))?.vsize() + 1; // +1: a 73-byte signature at worst
+        let mut rate = self.cfg.refund_min_feerate;
+        if let Ok(Some(r)) = self.scan.fee_rate(self.cfg.refund_conf_target) {
+            rate = rate.max(r);
+        }
+        Ok(((rate * vsize as f64).ceil() as u64).min(p.capacity.saturating_sub(DUST)))
+    }
+
+    fn refund_due(&self, oc: &OutChannel, tip: u32) -> bool {
+        if !["funded", "open", "closed"].contains(&oc.state.as_str()) || !oc.pending.is_empty() || oc.params.funding.is_none() {
+            return false;
+        }
+        let grace = if oc.signed >= oc.params.min_amount() { self.cfg.refund_grace_blocks } else { 0 };
+        tip as u64 >= oc.params.expiry as u64 + grace as u64
+    }
+
+    fn refund(&self, loc: Loc<'_>, oc: &OutChannel, again: bool) -> Result<Vec<Value>> {
+        let p = &oc.params;
+        let (mut hex_, mut txid, mut fee) = (oc.refund_hex.clone(), oc.refund_txid.clone(), oc.refund_fee);
+        if !(again && !txid.is_empty()) {
+            let dest = match lk(&self.refund_to).as_ref() {
+                Some(f) => Some(address_to_spk(&f()?, Some(&self.cfg.hrp)).map_err(|e| ChannelError::new("bad_address", e.to_string()))?),
+                None => None,
+            };
+            let f = self.refund_fee(p, dest.as_deref())?;
+            let tx = p.refund_tx(&oc.secret_key()?, dest.as_deref(), Some(f))?;
+            (hex_, txid, fee) = (tx.to_hex(), tx.txid(), f);
+            // write-ahead: the refund we will look for
+            let (h, t) = (hex_.clone(), txid.clone());
+            self.upd(loc, oc, |c| {
+                c.refund_hex = h;
+                c.refund_txid = t;
+                c.refund_fee = f;
+            })?;
+        }
+        if let Err(e) = self.chain.send_raw_transaction(&hex_) {
+            // e.g. the provider's close got there first: the reconcile sees it
+            let ev = json!({"event": "ch2_refund_failed", "provider": oc.origin, "chan": p.channel_id(),
+                            "error": e.to_string().chars().take(200).collect::<String>()});
+            self.event(ev.clone());
+            return Ok(vec![ev]);
+        }
+        self.upd(loc, oc, |c| c.state = "refunded".into())?;
+        let ev = json!({"event": if again { "ch2_refund_rebroadcast" } else { "ch2_refund" }, "provider": oc.origin, "chan": p.channel_id(),
+                        "txid": txid, "fee": fee, "signed": oc.signed});
+        self.event(ev.clone());
+        Ok(vec![ev])
     }
 
     // --- watcher -----------------------------------------------------------------------------------
 
-    /// One watcher pass over every ch2, then ch1's closes. Errors are per channel and never stop
-    /// the rest. Returns what it did.
+    /// One watcher pass over every ch2 (then the replaced ones still unsettled in the archive), then
+    /// ch1's closes. Errors are per channel and never stop the rest. Returns what it did.
     pub fn watch_tick(&self) -> Vec<Value> {
         let mut acts = vec![];
         let tip = match self.chain.block_count() {
@@ -1129,9 +1504,19 @@ impl RouteHub {
             let Some(busy) = self.acquire(&origin, Duration::ZERO) else { continue };
             match self.watch_out(&origin, tip) {
                 Ok(mut a) => acts.append(&mut a),
-                Err(e) => eprintln!("hub watcher {origin}: {e}"),
+                Err(e) => self.watch_error(&origin, "watch", &e),
             }
             drop(busy);
+        }
+        let archived: Vec<(usize, String)> = lk(&self.out).archived.iter().enumerate()
+            .filter(|(_, r)| NONFINAL.contains(&r.get("state").and_then(Value::as_str).unwrap_or("")) && !truthy(r.get("final")))
+            .map(|(i, r)| (i, py_str(r.get("origin")))).collect();
+        for (i, origin) in archived {
+            // replaced ch2s are still the hub's coins
+            match self.reconcile(Loc::Archived(i), tip) {
+                Ok(mut a) => acts.append(&mut a),
+                Err(e) => self.watch_error(&origin, "archived", &e),
+            }
         }
         match self.inbound.close_due() {
             Ok(txs) => acts.extend(txs.into_iter().map(|t| json!({"event": "ch1_close", "txid": t}))),
@@ -1140,9 +1525,26 @@ impl RouteHub {
         acts
     }
 
+    fn watch_error(&self, origin: &str, step: &str, e: &ChannelError) {
+        let msg: String = e.to_string().chars().take(200).collect();
+        eprintln!("hub watcher {origin} ({step}): {msg}");
+        self.event(json!({"event": "ch2_watch_error", "provider": origin, "step": step, "error": msg}));
+    }
+
     fn watch_out(&self, origin: &str, tip: u32) -> Result<Vec<Value>> {
         let mut out = vec![];
-        let Some(oc) = lk(&self.out).chans.get(origin).cloned() else { return Ok(out) };
+        let Some(oc) = self.get(Loc::Live(origin)) else { return Ok(out) };
+        if oc.state == "funding" {
+            return self.reconcile_funding(origin, &oc, tip);
+        }
+        // its own step: a failure here never skips the rest
+        match self.reconcile(Loc::Live(origin), tip) {
+            Ok(mut a) => out.append(&mut a),
+            Err(e) => self.watch_error(origin, "reconcile", &e),
+        }
+        let Some(oc) = self.get(Loc::Live(origin)).filter(|c| c.params.payer_pub == oc.params.payer_pub) else {
+            return Ok(out); // finished a rollover: the next ch2 is watched next tick
+        };
         let p = &oc.params;
         if oc.state == "funded" {
             let min_conf = oc.term_u64("minConf").unwrap_or(1) as u32;
@@ -1153,19 +1555,6 @@ impl RouteHub {
         }
         if oc.state != "open" {
             return Ok(out);
-        }
-        // a spent funding with a pending or written-off lock: read t off the close
-        if (!oc.pending.is_empty() || !oc.stale.is_empty()) && self.chain.get_tx_out(&p.funding_txid(), p.funding_vout(), true)?.is_none() {
-            if let Some(tx) = self.scan.find_spend(&p.funding_txid(), p.funding_vout(), oc.scanned_to)? {
-                out.extend(self.secrets_from_close(&oc, &tx));
-                let mut b = lk(&self.out);
-                if let Some(c) = b.chans.get_mut(origin).filter(|c| c.params.channel_id() == p.channel_id()) {
-                    c.state = "closed".into();
-                    c.close_txid = tx.txid();
-                }
-                b.save()?;
-                return Ok(out);
-            }
         }
         if !oc.pending.is_empty() {
             let at = oc.pending.get("at").and_then(Value::as_f64).unwrap_or(0.0);
@@ -1185,18 +1574,107 @@ impl RouteHub {
             return Ok(out);
         }
         // settlement: the provider's net payout >= its settleMultiple × closeFee, or near ch2's close
-        // margin as the provider counts it (it co-signs only then): roll over
+        // margin as the provider counts it (it co-signs only then): roll over. Past expiry the refund
+        // took over.
         let due = settle_due(p, oc.signed, oc.settle_multiple);
         let margin = oc.term_u64("closeMarginBlocks").unwrap_or(self.cfg.close_margin as u64) as i64;
         let grace = (self.cfg.rollover_margin as u64).min(oc.term_u64("rolloverGraceBlocks").unwrap_or(self.cfg.rollover_margin as u64)) as i64;
         let near = tip as i64 >= p.expiry as i64 - margin - grace;
-        if (due || near) && oc.signed >= p.min_amount() {
+        if (due || near) && oc.signed >= p.min_amount() && tip < p.expiry {
             out.push(self.rollover(&oc)?);
         }
         Ok(out)
     }
 
-    fn secrets_from_close(&self, oc: &OutChannel, tx: &Tx) -> Vec<Value> {
+    /// Check one non-final ch2's funding against the chain (AGP-037).
+    /// Unspent: refund it when due; rebroadcast our refund if it left the mempool. Spent by the
+    /// rollover we wrote ahead: finish it. Spent by our refund: final once confirmed. Spent by
+    /// anything else (the provider's close): read the locks' secrets off it, mark it closed with the
+    /// real txid, and take back the refund fee if our refund lost. Spent, spender not found: with
+    /// locks outstanding leave it (their secrets are on that tx); without, closed, txid unknown.
+    fn reconcile(&self, loc: Loc<'_>, tip: u32) -> Result<Vec<Value>> {
+        let mut out = vec![];
+        let Some(oc) = self.get(loc) else { return Ok(out) };
+        if oc.final_ || !NONFINAL.contains(&oc.state.as_str()) || oc.params.funding.is_none() {
+            return Ok(out);
+        }
+        let (txid, vout) = (oc.params.funding_txid(), oc.params.funding_vout());
+        if self.chain.get_tx_out(&txid, vout, true)?.is_some() {
+            if oc.state == "refunded" {
+                // our refund left the mempool: send it again
+                return self.refund(loc, &oc, true);
+            }
+            if self.refund_due(&oc, tip) {
+                return self.refund(loc, &oc, false);
+            }
+            return Ok(out);
+        }
+        let confirmed = self.chain.get_tx_out(&txid, vout, false)?.is_none();
+        let locks = !oc.pending.is_empty() || !oc.stale.is_empty();
+        if oc.state == "closed" && !oc.close_txid.is_empty() && !locks && oc.refund_txid.is_empty() {
+            if confirmed {
+                // the provider's close as it told us: done
+                self.upd(loc, &oc, |c| c.final_ = true)?;
+            }
+            return Ok(out);
+        }
+        let Some(tx) = self.scan.find_spend(&txid, vout, oc.scanned_to)? else {
+            if oc.state == "open" && !locks {
+                self.upd(loc, &oc, |c| {
+                    c.state = "closed".into();
+                    c.close_txid = String::new();
+                })?;
+                let ev = json!({"event": "ch2_closed", "provider": oc.origin, "chan": oc.params.channel_id(), "txid": "", "by": "unknown"});
+                self.event(ev.clone());
+                out.push(ev);
+            }
+            return Ok(out);
+        };
+        let spender = tx.txid();
+        if !oc.next.is_empty() && OutChannel::from_json(&Value::Object(oc.next.clone())).is_ok_and(|n| n.params.funding_txid() == spender) {
+            return Ok(vec![self.finish_rollover(loc, &oc, oc.signed)?]);
+        }
+        if spender == oc.refund_txid {
+            self.upd(loc, &oc, |c| {
+                c.state = "refunded".into();
+                c.final_ = confirmed;
+            })?;
+            if confirmed {
+                let ev = json!({"event": "ch2_refund_confirmed", "provider": oc.origin, "chan": oc.params.channel_id(), "txid": spender,
+                                "fee": oc.refund_fee});
+                self.event(ev.clone());
+                out.push(ev);
+            }
+            return Ok(out);
+        }
+        if locks {
+            out.extend(self.secrets_from_close(loc, &oc, &tx));
+        }
+        let lost = if oc.refund_txid.is_empty() { 0 } else { oc.refund_fee };
+        let changed = oc.state != "closed" || oc.close_txid != spender;
+        let sp = spender.clone();
+        self.upd(loc, &oc, |c| {
+            c.state = "closed".into();
+            c.close_txid = sp;
+            c.final_ = confirmed;
+            c.next = Map::new();
+            if lost > 0 {
+                c.refund_fee = 0;
+            }
+        })?;
+        if changed {
+            let mut ev = json!({"event": "ch2_closed", "provider": oc.origin, "chan": oc.params.channel_id(), "txid": spender, "by": "provider"});
+            if !oc.refund_txid.is_empty() {
+                ev["refundLost"] = oc.refund_txid.clone().into();
+                ev["refundFeeReverted"] = lost.into();
+            }
+            self.event(ev.clone());
+            out.push(ev);
+        }
+        Ok(out)
+    }
+
+    fn secrets_from_close(&self, loc: Loc<'_>, oc: &OutChannel, tx: &Tx) -> Vec<Value> {
         let mut out = vec![];
         let mut locks: Vec<Value> = vec![];
         if !oc.pending.is_empty() {
@@ -1209,18 +1687,14 @@ impl RouteHub {
             let Ok(tp) = adaptor::dec_hex(&py_str(lk1.get("T"))) else { continue };
             let Some(t) = adaptor::secret_from_witness(&pre, &wit, &tp) else { continue };
             let lid = py_str(lk1.get("lockId"));
-            {
-                let mut b = lk(&self.out);
-                if let Some(c) = b.chans.get_mut(&oc.origin).filter(|c| c.params.channel_id() == oc.params.channel_id()) {
-                    c.signed = c.signed.max(py_u64(lk1.get("cum")).unwrap_or(0));
-                    if c.pending.get("lockId").and_then(Value::as_str) == Some(lid.as_str()) {
-                        c.routed += py_u64(lk1.get("d")).unwrap_or(0);
-                        c.pending = Map::new();
-                    }
-                    c.stale.retain(|s| s.get("lockId").and_then(Value::as_str) != Some(lid.as_str()));
+            let _ = self.upd(loc, oc, |c| {
+                c.signed = c.signed.max(py_u64(lk1.get("cum")).unwrap_or(0));
+                if c.pending.get("lockId").and_then(Value::as_str) == Some(lid.as_str()) {
+                    c.routed += py_u64(lk1.get("d")).unwrap_or(0);
+                    c.pending = Map::new();
                 }
-                let _ = b.save();
-            }
+                c.stale.retain(|s| s.get("lockId").and_then(Value::as_str) != Some(lid.as_str()));
+            });
             let res = self.complete_ch1(&py_str(lk1.get("ch1")), &lid, &t, &format!("ch2 close {}", tx.txid()));
             out.push(json!({"event": "secret_from_close", "provider": oc.origin, "lockId": lid, "close": tx.txid(), "ch1_completed": res.is_some()}));
         }

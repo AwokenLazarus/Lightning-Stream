@@ -420,6 +420,17 @@ pub fn lock_auth(key: &[u8; 32], session: &str, lock_id: &str, amount: i128, poi
 /// the mempool first, then blocks from `from_height` up.
 pub trait SpendScan: Send + Sync {
     fn find_spend(&self, txid: &str, vout: u32, from_height: u32) -> Result<Option<Tx>>;
+
+    /// Confirmed unspent outputs paying `spk` as (display txid, vout, sats) (`scantxoutset`, no
+    /// wallet or txindex needed): how the hub finds a funding its wallet call lost (AGP-037).
+    fn scan_spk(&self, _spk: &[u8]) -> Result<Vec<(String, u32, u64)>> {
+        Ok(vec![])
+    }
+
+    /// `estimatesmartfee target` in sat/vB; None without an estimate (the refund fee's floor applies).
+    fn fee_rate(&self, _target: u32) -> Result<Option<f64>> {
+        Ok(None)
+    }
 }
 
 #[cfg(feature = "rpc")]
@@ -445,6 +456,19 @@ impl SpendScan for crate::rpc::Rpc {
             }
         }
         Ok(None)
+    }
+
+    fn scan_spk(&self, spk: &[u8]) -> Result<Vec<(String, u32, u64)>> {
+        let r = self.call("scantxoutset", json!(["start", [format!("raw({})", hex::encode(spk))]]))?;
+        Ok(r.get("unspents").and_then(Value::as_array).into_iter().flatten().filter_map(|u| {
+            let sats = xbt_primitives::amount::Amount::from_btc_f64(u.get("amount")?.as_f64()?).ok()?.to_sat();
+            Some((u.get("txid")?.as_str()?.to_string(), u32::try_from(u.get("vout")?.as_u64()?).ok()?, sats))
+        }).collect())
+    }
+
+    fn fee_rate(&self, target: u32) -> Result<Option<f64>> {
+        let r = self.call("estimatesmartfee", json!([target]))?;
+        Ok(r.get("feerate").and_then(Value::as_f64).filter(|f| *f > 0.0).map(|f| f * 1e8 / 1000.0))
     }
 }
 
