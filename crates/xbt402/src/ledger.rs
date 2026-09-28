@@ -103,6 +103,11 @@ impl Ledger {
         Self::default()
     }
 
+    /// Where this ledger lives (None in memory).
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
     /// Replay and compact the log at `path` (created if missing).
     pub fn open(path: &Path) -> Result<Self> {
         let mut channels = IndexMap::new();

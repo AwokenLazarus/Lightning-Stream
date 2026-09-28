@@ -318,9 +318,11 @@ fn refusals() {
     // a lowered state is stale; a relabelled signature is refused
     let v = prov.facilitator_verify(&facilitator_request(&acc, &json!({"chan": chan, "cum": "547", "sig": sig546})));
     assert_eq!(v["invalidReason"], "invalid_xbt_channel_signature");
-    // body over the limit, and routing (AGP-026) is not served
+    // body over the limit; the routing lock endpoint (AGP-026) refuses a request without a payment as B1 does
     assert_eq!(prov.serve("POST", "/v1/q", &[], &vec![0u8; MAX_BODY + 1], "", None).status, 400);
-    assert_eq!(prov.serve("POST", LOCK_PATH, &[], b"{}", "", None).status, 404);
+    let r = prov.serve("POST", LOCK_PATH, &[], b"{}", "", None);
+    assert_eq!((r.status, serde_json::from_slice::<Value>(&r.body).unwrap()["error"].clone()), (400, json!("bad_payload")));
+    assert_eq!(prov.serve("GET", LOCK_PATH, &[], b"", "", None).status, 405);
     // a close not signed by the payer
     let r = prov.serve("POST", CLOSE_PATH, &[], json!({"chan": chan, "sig": "3006020101020101"}).to_string().as_bytes(), "", None);
     assert_eq!(serde_json::from_slice::<Value>(&r.body).unwrap()["error"], "bad_sig");

@@ -3,7 +3,7 @@
 #[cfg(feature = "http-client")]
 pub use client::UreqTransport;
 #[cfg(feature = "http-server")]
-pub use server::serve_http;
+pub use server::{serve_http, serve_service, HttpService};
 
 #[cfg(feature = "http-client")]
 mod client {
@@ -54,7 +54,34 @@ mod server {
     use std::sync::Arc;
     use std::thread::JoinHandle;
 
+    use crate::hub::RouteHub;
     use crate::provider::{HttpResponse, Provider};
+
+    /// Anything served over HTTP by [`serve_service`]: a provider, or a routing hub.
+    pub trait HttpService: Send + Sync {
+        fn body_limit(&self, path: &str) -> usize;
+        fn serve(&self, method: &str, path: &str, headers: &[(String, String)], body: &[u8], url: &str) -> HttpResponse;
+    }
+
+    impl HttpService for Provider {
+        fn body_limit(&self, path: &str) -> usize {
+            Provider::body_limit(self, path, None)
+        }
+
+        fn serve(&self, method: &str, path: &str, headers: &[(String, String)], body: &[u8], url: &str) -> HttpResponse {
+            Provider::serve(self, method, path, headers, body, url, None)
+        }
+    }
+
+    impl HttpService for RouteHub {
+        fn body_limit(&self, path: &str) -> usize {
+            RouteHub::body_limit(self, path, None)
+        }
+
+        fn serve(&self, method: &str, path: &str, headers: &[(String, String)], body: &[u8], url: &str) -> HttpResponse {
+            RouteHub::serve(self, method, path, headers, body, url, None)
+        }
+    }
 
     fn respond(req: tiny_http::Request, r: HttpResponse) {
         let mut resp = tiny_http::Response::from_data(r.body).with_status_code(r.status);
@@ -69,6 +96,12 @@ mod server {
     /// Serve `provider` on `addr` with `threads` workers. Content-Length bodies only (a chunked
     /// body is refused, as the reference does), bounded by the provider's body limit.
     pub fn serve_http(provider: Arc<Provider>, addr: &str, threads: usize) -> std::io::Result<Vec<JoinHandle<()>>> {
+        serve_service(provider, addr, threads)
+    }
+
+    /// Serve any [`HttpService`] (a [`RouteHub`] blocks a worker while it waits for a provider's
+    /// reveal, so give a hub a few more threads than it has concurrent clients).
+    pub fn serve_service(provider: Arc<dyn HttpService>, addr: &str, threads: usize) -> std::io::Result<Vec<JoinHandle<()>>> {
         let server = Arc::new(tiny_http::Server::http(addr).map_err(|e| std::io::Error::other(e.to_string()))?);
         let mut hs = vec![];
         for _ in 0..threads.max(1) {
@@ -86,7 +119,7 @@ mod server {
                         respond(req, HttpResponse::new(400, vec![], b"duplicate PAYMENT-SIGNATURE".to_vec()));
                         continue;
                     }
-                    let limit = provider.body_limit(&url, None);
+                    let limit = provider.body_limit(&url);
                     if req.body_length().unwrap_or(0) > limit {
                         respond(req, HttpResponse::new(413, vec![], b"bad content-length".to_vec()));
                         continue;
@@ -98,7 +131,7 @@ mod server {
                     }
                     let host = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("Host")).map(|(_, v)| v.clone()).unwrap_or_default();
                     let method = req.method().to_string();
-                    let r = provider.serve(&method, &url, &headers, &body, &format!("http://{host}{url}"), None);
+                    let r = provider.serve(&method, &url, &headers, &body, &format!("http://{host}{url}"));
                     respond(req, r);
                 }
             }));

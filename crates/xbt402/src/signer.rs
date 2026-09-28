@@ -10,6 +10,14 @@
 //! for callers that do not run a separate signer process. `xbt-signer` provides the B2 signer
 //! (a Unix-socket process with sealed keys and the policy engine) and a socket client that
 //! implements this trait.
+//!
+//! Routed payments (AGP-026) add [`RouteSigner`], an extension of the same seam with B1's adaptor
+//! lock methods (`sign_state_adaptor`, `resolve_lock`, `void_lock`, `adopt_lock`, `recover_lock`),
+//! which B2's signer socket serves as `xbt402_*`. [`crate::route_client::RoutePayer`] runs over it,
+//! and funds its channel through a [`crate::client::Wallet`] (funding is the wallet's job, not the
+//! signer's). Lock rules are B1's: one pending lock per channel; the lock `(cum, pre, r, T, T1)` is
+//! recorded before the pre-signature leaves; `resolve_lock` takes t + r (from the hub) or t (the
+//! provider's receipt); a given-up lock can be adopted later only by its own cum.
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -17,6 +25,9 @@ use serde_json::Value;
 use xbt_primitives::ecdsa::{self, PubkeyBytes};
 use xbt_primitives::secp256k1::SecretKey;
 use xbt_primitives::sighash::{SIGHASH_ALL_UNIFIED, SIGHASH_SINGLE_ACP_UNIFIED};
+use xbt_primitives::tx::Tx;
+
+use crate::adaptor::{self, PreSig, Sc};
 
 use crate::channel::{channel_auth_key, sign_with_type, ChannelParams};
 use crate::conditional::ConditionalParams;
@@ -51,10 +62,54 @@ pub trait StateSigner: Send + Sync {
     fn sign_conditional(&self, chan: &str, uncond: u64, cond: &ConditionalParams) -> Result<Vec<u8>>;
 }
 
+/// What [`RouteSigner::sign_state_adaptor`] returns (B1's dict, typed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdaptorLock {
+    /// The pre-signature of state(cum) under T1.
+    pub pre: PreSig,
+    /// T1 = T + r·G (compressed).
+    pub point: PubkeyBytes,
+    /// r, the payer's fresh tweak (the hub learns it with the lock).
+    pub tweak: [u8; 32],
+    pub cum: u64,
+}
+
+/// A pending (or given-up) adaptor lock: `{cum, pre, r, T, T1, route}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingLock {
+    pub cum: u64,
+    pub pre: PreSig,
+    pub r: [u8; 32],
+    /// T, the provider's invoice point.
+    pub t: PubkeyBytes,
+    /// T1 = T + r·G.
+    pub t1: PubkeyBytes,
+    pub route: Value,
+}
+
+/// The routed-payment extension of [`StateSigner`]: adaptor-locked states through a hub (AGP-026).
+/// Secrets and points are typed; `route` is the lock's context (`hub`, `provider`, `lockId`,
+/// `amount`, `fee`) that a policy-checking signer (B2, `xbt-signer`) enforces its routing policy on.
+pub trait RouteSigner: StateSigner {
+    /// Pre-sign state(cum) under T1 = T + r·G (`point` = T; r is fresh here). Raises the signed
+    /// amount only when resolved or adopted.
+    fn sign_state_adaptor(&self, chan: &str, cum: u64, point: &PubkeyBytes, route: &Value) -> Result<AdaptorLock>;
+    /// The lock was paid: `secret` is t + r (the hub) or t (the provider). Returns t.
+    fn resolve_lock(&self, chan: &str, secret: &[u8; 32]) -> Result<[u8; 32]>;
+    /// Give the pending lock up (the hub refused it, or its invoice expired). `true` if one was pending.
+    fn void_lock(&self, chan: &str) -> Result<bool>;
+    /// A lock this signer gave up was completed after all (the hub read t off a close).
+    fn adopt_lock(&self, chan: &str, cum: u64) -> Result<()>;
+    /// t from the hub's ch1 close, which carries the completed pre-signature (t + r).
+    fn recover_lock(&self, chan: &str, close_tx: &Tx) -> Result<[u8; 32]>;
+}
+
 struct LocalChannel {
     secret: SecretKey,
     params: ChannelParams,
     signed: u64,
+    lock: Option<PendingLock>,
+    given_up: Vec<PendingLock>,
 }
 
 /// In-memory [`StateSigner`] (B1 `ChannelSigner` without a policy hook).
@@ -85,6 +140,16 @@ impl LocalSigner {
         let c = g.get_mut(chan).ok_or_else(|| ChannelError::new("unknown_channel", chan.to_string()))?;
         f(c)
     }
+
+    /// The highest amount signed on `chan` (0 if unknown).
+    pub fn signed(&self, chan: &str) -> u64 {
+        self.with(chan, |c| Ok(c.signed)).unwrap_or(0)
+    }
+
+    /// The pending lock on `chan`, if any.
+    pub fn pending_lock(&self, chan: &str) -> Option<PendingLock> {
+        self.with(chan, |c| Ok(c.lock.clone())).ok().flatten()
+    }
 }
 
 impl StateSigner for LocalSigner {
@@ -103,7 +168,7 @@ impl StateSigner for LocalSigner {
         }
         let chan = params.channel_id();
         self.chans.lock().map_err(|_| ChannelError::code("poisoned"))?
-            .insert(chan.clone(), LocalChannel { secret: sk, params: params.clone(), signed: 0 });
+            .insert(chan.clone(), LocalChannel { secret: sk, params: params.clone(), signed: 0, lock: None, given_up: vec![] });
         Ok(chan)
     }
 
@@ -163,5 +228,81 @@ impl StateSigner for LocalSigner {
             let tx = cond.state_tx(uncond)?;
             Ok(sign_with_type(&c.secret, &cond.sighash(&tx)?, SIGHASH_ALL_UNIFIED))
         })
+    }
+}
+
+fn dec_point(p: &PubkeyBytes) -> Result<xbt_primitives::secp256k1::PublicKey> {
+    adaptor::dec(p)
+}
+
+impl RouteSigner for LocalSigner {
+    fn sign_state_adaptor(&self, chan: &str, cum: u64, point: &PubkeyBytes, route: &Value) -> Result<AdaptorLock> {
+        self.with(chan, |c| {
+            if c.lock.is_some() {
+                return fail("lock_outstanding", "one adaptor lock per channel at a time");
+            }
+            if cum <= c.signed {
+                return fail("stale_amount", "a lock must raise the signed amount");
+            }
+            let t = dec_point(point)?;
+            let r = random_secret();
+            let t1 = adaptor::add(Some(&t), Some(&adaptor::point_of(&r))).ok_or_else(|| ChannelError::new("bad_point", "T + r·G at infinity"))?;
+            let pre = adaptor::presign(&c.secret, &c.params.sighash(&c.params.state_tx(cum)?)?, &t1)?;
+            let lk = PendingLock { cum, pre: pre.clone(), r: r.secret_bytes(), t: *point, t1: adaptor::enc(&t1), route: route.clone() };
+            // recorded before the pre-signature leaves
+            c.lock = Some(lk.clone());
+            Ok(AdaptorLock { pre, point: lk.t1, tweak: lk.r, cum })
+        })
+    }
+
+    fn resolve_lock(&self, chan: &str, secret: &[u8; 32]) -> Result<[u8; 32]> {
+        self.with(chan, |c| {
+            let lk = c.lock.clone().ok_or_else(|| ChannelError::new("no_state", "no pending lock"))?;
+            let y = Sc::reduce(secret).secret().ok_or_else(|| ChannelError::new("bad_secret", "not a secret"))?;
+            let yp = adaptor::enc(&adaptor::point_of(&y));
+            let t = if yp == lk.t1 {
+                Sc::from_secret(&y).sub(&Sc::reduce(&lk.r))
+            } else if yp == lk.t {
+                Sc::from_secret(&y)
+            } else {
+                return fail("bad_secret", "secret opens neither T1 nor T");
+            };
+            c.signed = c.signed.max(lk.cum);
+            c.lock = None;
+            Ok(t.0)
+        })
+    }
+
+    fn void_lock(&self, chan: &str) -> Result<bool> {
+        self.with(chan, |c| match c.lock.take() {
+            Some(lk) => {
+                c.given_up.push(lk);
+                if c.given_up.len() > 16 {
+                    c.given_up.remove(0);
+                }
+                Ok(true)
+            }
+            None => Ok(false),
+        })
+    }
+
+    fn adopt_lock(&self, chan: &str, cum: u64) -> Result<()> {
+        self.with(chan, |c| {
+            let i = c.given_up.iter().position(|l| l.cum == cum).ok_or_else(|| ChannelError::new("bad_amount", "not a lock this signer pre-signed"))?;
+            if c.lock.is_some() {
+                return fail("lock_outstanding", "resolve or void the pending lock first");
+            }
+            c.given_up.remove(i);
+            c.signed = c.signed.max(cum);
+            Ok(())
+        })
+    }
+
+    fn recover_lock(&self, chan: &str, close_tx: &Tx) -> Result<[u8; 32]> {
+        let lk = self.pending_lock(chan).ok_or_else(|| ChannelError::new("no_state", "no pending lock"))?;
+        let t1 = dec_point(&lk.t1)?;
+        let wit = close_tx.inputs.first().map(|i| i.witness.clone()).unwrap_or_default();
+        let y = adaptor::secret_from_witness(&lk.pre, &wit, &t1).ok_or_else(|| ChannelError::new("bad_secret", "this close does not carry the lock"))?;
+        self.resolve_lock(chan, &y.secret_bytes())
     }
 }

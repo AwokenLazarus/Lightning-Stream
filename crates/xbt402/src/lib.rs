@@ -19,14 +19,19 @@
 //! Optional features: `http-client` (ureq transport), `http-server` (tiny_http around the
 //! provider), `rpc` (bitcoind JSON-RPC backend and wallet).
 
+pub mod adaptor;
 pub mod channel;
 pub mod client;
 pub mod conditional;
 pub mod error;
 pub mod funding;
+pub mod hub;
 pub mod json;
 pub mod ledger;
 pub mod provider;
+pub mod route;
+pub mod route_client;
+pub mod route_seller;
 pub mod signer;
 pub mod wire;
 #[cfg(feature = "rpc")]

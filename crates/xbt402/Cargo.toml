@@ -23,9 +23,16 @@ sha2.workspace = true
 hex.workspace = true
 thiserror.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+# arbitrary_precision: routed prices and meters are amsat (1e-21 sat) integers far above u64, and signed
+# quotes must round-trip them exactly (B1 writes Python ints)
+serde_json = { workspace = true, features = ["arbitrary_precision"] }
 base64.workspace = true
 getrandom = "0.2"
 indexmap = "2"
 ureq = { workspace = true, optional = true }
 tiny_http = { workspace = true, optional = true }
+
+# the hub service (B1 `python -m xbt402.hub --config hub.json`); the library needs none of these
+[[bin]]
+name = "xbt402-hub"
+required-features = ["rpc", "http-client", "http-server"]
