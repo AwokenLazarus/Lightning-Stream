@@ -12,6 +12,8 @@ Local repo, no remote. Workspace crates:
 | `xbt-primitives` | tx (de)serialization with witness, scripts, bech32/bech32m per chain, UnifiedSighash 0x21/0xA3, strict-DER low-S ECDSA (libsecp256k1), BLAKE2b header v2 + PoW + Knots retarget + most-work header chain, network ids | library (for other projects too) |
 | `xbt402` | channel params, payee tweak v2, funding script, states, close, rollover, refund, v1.2 payee-pays, conditional hash locks, the 402 wire, receipts, request auth, provider verifier, payer client, ledger; the signer seam (`StateSigner` + the routing extension `RouteSigner`); hub routing (AGP-026): ECDSA adaptor locks, provider route offers, `RouteHub` + the `xbt402-hub` service, `RoutePayer` | library (+ `xbt402-hub` bin) |
 | `xbt-signer` | B2's agent-wallet signer (AGP-027): keys never in the client (xbt402 `StateSigner` and `RouteSigner`), B2's policy engine and routing policy, sealed hot/channel keys, write-ahead opens, refund custody, anchored signature log; B2's socket protocol and file formats. See `crates/xbt-signer/README.md` | binaries `xbt-signer`, `xbt-anchor-witness`, `xbt-signer-payer` |
+| `xbt402` | channel params, payee tweak v2, funding script, states, close, rollover, refund, v1.2 payee-pays, conditional hash locks, the 402 wire, receipts, request auth, provider verifier, payer client, ledger | library |
+| `xbt-electrum` | the light chain backend: Electrum servers (TCP/TLS, batching, several servers) checked against our own `HeaderChain` and Merkle proofs; `xbt402::ChainBackend`, a typed API, and the node-RPC surface of the client path | library |
 | `xbt402-interop` | conformance suite, Rust→JSON vector emitter, regtest cross-implementation tools | no (`publish = false`) |
 
 References (read-only): B1 `agp-029` `a7c3521` (`~/xbt-rnd/b1-agp-029`, `xbt402/`; AGP-023 `f105ccc` plus the AGP-029 close report), B2 `agp-next2`
@@ -28,6 +30,7 @@ cargo build -j2 --release --target aarch64-unknown-linux-gnu -p xbt402
 ./scripts/route_interop.sh         # routed: every client x hub x provider (Rust/Python), the all-Rust demo, + a Rust payer on the Rust signer
 cargo run --release -p xbt402 --example adaptor_bench
 ./scripts/build_matrix.sh          # every AGP-031 target; writes dist/MATRIX.md
+./scripts/electrum_interop.sh      # the light Rust payer on real electrs (tcp + TLS) vs the Python provider
 ```
 
 Run heavy work under a CPU and memory cap:
@@ -254,3 +257,58 @@ No platform-specific dependencies: libsecp256k1 (C, via `secp256k1-sys`), pure-R
 (no OpenSSL) and `tiny_http`. `cargo check -p xbt402` (library, and all features + the hub binary)
 passes for x86_64/aarch64 Linux gnu and musl, armv7 and riscv64 Linux, x86_64/aarch64 macOS and
 x86_64 Windows (gnu), with zig as the cross C compiler; aarch64 links (`xbt402-hub` 4.5 MB).
+Under v1.2 payee-pays, the close response reports `cum` as what the close pays the payee **net of
+its fee** (900 for a 1500 state with a 600 fee), and `unpaidMsat` as `spent − that`. So it shows
+the close fee as unpaid (600000), and `/x402/settle`'s `amount` likewise. The on-chain amounts are
+right. B1 `x402_channel.py` does this (`_close_paid` sums the payee outputs), and the Rust port
+matches it byte for byte. The interop run records it as `provider_report_as_reference`. Whether the
+reference should report the gross `cum` is for the lead (AGP-023 follow-up), not this port.
+
+## The light backend: xbt-electrum (AGP-028)
+
+A client with no node: the xbt402 payer (and later the wallet) reads the chain from Electrum servers
+and trusts only what it can check. A port of B2's `agentwallet/electrum.py` (AGP-024) with the same
+trust rules; the threat model is in B2 `docs/B2_CHAIN_BACKEND.md` and the crate docs.
+
+```rust
+use xbt_electrum::{Config, ElectrumBackend};
+let mut cfg = Config::new(&["tcp://127.0.0.1:50001", "ssl://electrum.example:50002"], "main");  // mainnet: checkpoint 961640
+cfg.store_path = Some(run_dir.join("headers-main.bin"));        // verified headers, re-verified at load
+let chain = std::sync::Arc::new(ElectrumBackend::new(cfg)?);      // or Config::from_env (B2's variables)
+let n = chain.block_count()?;                                     // our verified tip
+let out = chain.tx_out(txid, vout, true)?;                        // proven confirmations; a mempool spend never hides it
+chain.watch(&[&funding_spk])?; chain.wait_for_change(timeout);    // scripthash/headers subscriptions wake a watcher
+let prov = Provider::new(chain.clone(), ...);                     // any ChainBackend user
+let v = chain.call("gettxout", &json!([txid, 0, true]))?;         // the node RPCs of the client path, answered as the node does
+```
+
+* **Headers**: `HeaderChain` from the pinned checkpoint (PoW, Knots retarget, linkage, height, time),
+  most work wins, caught up in batches of 4x2016 headers per round trip. Servers that answer but
+  cannot serve the checkpoint mean the wrong chain (`Kind::CheckpointMismatch`).
+* **Transactions**: the raw tx must re-serialize and hash to the txid; confirmed only with a Merkle
+  proof into our header whose committed txcount fixes the proof's depth and position bound.
+* **Servers**: histories and unspent lists are the union over every live server (queried in
+  parallel), broadcasts go to all, the fee estimate is the median (and marked unverified).
+* **Refunds cannot be suppressed**: a spend seen only in a mempool never makes an output count as spent.
+* Node-only calls (wallet, `getblock`, mining) are refused with `Kind::LightBackend`.
+
+Tests: `crates/xbt-electrum/tests/backend.rs` runs every call, TLS, batching, persistence, reconnects
+and subscriptions against a simulated chain and Electrum server (`sim` feature), and the lying servers:
+a hidden tx, withheld headers and a stale tip, a lying fee, the wrong chain, a weaker and a stronger
+(reorging) chain, three kinds of bad proof, a substituted tx, wrong heights, an invented spend that
+tries to stop a refund, and broadcasts answered with another txid.
+
+`scripts/electrum_interop.sh` (ports 33300-33399) runs a light Rust payer (its own hot key; every read
+and broadcast through Electrum) against two patched electrs 0.11.1 (AGP-024), one behind TLS, both
+required, on a Knots 29.4.2 regtest node, against the Python B1 provider. The node is only the faucet,
+the miner, and the oracle every answer is compared with.
+
+| | provider | what | result |
+|---|---|---|---|
+| E1 | Python B1, v1.1 payer-pays | open, 10 calls, close; the close change counted late (mempool hint, then proof after the block's notification) | payee 1500, payer 197900, 14/14 checks, 35/35 answers = node |
+| E2 | Python B1, v1.2 payee-pays | same | payee 900, payer 198500, 14/14, 35/35 |
+| E3 | Python B1 (then killed) | open, 3 calls, the provider vanishes; early refund refused (non-final); refund at expiry via Electrum, proven | refund 199400, 10/10, 18/18 |
+
+Deliberately different from B2's Python: `gettxspendingprevout` reports mempool spends only, as
+Knots does (the Python also reported confirmed spends; the typed `spending_tx` still does), and the
+fee estimate is the median over servers (the Python took the first answer).
