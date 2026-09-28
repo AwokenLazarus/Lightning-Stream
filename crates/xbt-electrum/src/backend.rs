@@ -154,6 +154,9 @@ pub struct Utxo {
     pub value: u64,
     pub script_pubkey: Vec<u8>,
     pub height: u32,
+    /// The block the Merkle proof ties it to (display hex).
+    pub block_hash: String,
+    pub coinbase: bool,
 }
 
 /// A fee estimate. Never verifiable: the median over the servers that answered, so one lying
@@ -798,13 +801,14 @@ impl ElectrumBackend {
                 Some(o) if o.script_pubkey == spk => {}
                 _ => continue,
             }
-            let Some(TxStatus::Confirmed { height, .. }) = self.confirmed(&mut i, &txid, &claims[&(txid.clone(), n)])? else {
+            let Some(TxStatus::Confirmed { height, block_hash }) = self.confirmed(&mut i, &txid, &claims[&(txid.clone(), n)])? else {
                 continue; // the UTXO set holds confirmed coins only
             };
             if self.spender(&mut i, &txid, n, spk, false)?.is_some() {
                 continue;
             }
-            out.push(Utxo { txid, vout: n, value: tx.outputs[n as usize].value.max(0) as u64, script_pubkey: spk.to_vec(), height });
+            out.push(Utxo { txid, vout: n, value: tx.outputs[n as usize].value.max(0) as u64, script_pubkey: spk.to_vec(), height,
+                           block_hash: hex::encode(block_hash), coinbase: is_coinbase(&tx) });
         }
         Ok(out)
     }
@@ -928,7 +932,12 @@ impl ElectrumBackend {
         let vin: Vec<Value> = tx.inputs.iter().map(|i| if cb {
             json!({"coinbase": hex::encode(&i.script_sig)})
         } else {
-            json!({"txid": i.prevout.txid_hex(), "vout": i.prevout.vout})
+            let mut v = json!({"txid": i.prevout.txid_hex(), "vout": i.prevout.vout,
+                               "scriptSig": {"hex": hex::encode(&i.script_sig)}, "sequence": i.sequence});
+            if !i.witness.is_empty() {
+                v["txinwitness"] = i.witness.iter().map(hex::encode).collect::<Vec<_>>().into();
+            }
+            v
         }).collect();
         let vout: Vec<Value> = tx.outputs.iter().enumerate().map(|(n, o)| {
             json!({"n": n, "value": o.value as f64 / SATS, "scriptPubKey": self.spk_json(&o.script_pubkey)})
@@ -1004,7 +1013,8 @@ impl ElectrumBackend {
                     let txid = op.get("txid").and_then(Value::as_str).ok_or_else(|| bad("txid"))?.to_ascii_lowercase();
                     let vout = op.get("vout").and_then(Value::as_u64).and_then(|v| u32::try_from(v).ok()).ok_or_else(|| bad("vout"))?;
                     let mut row = json!({"txid": txid, "vout": vout});
-                    if let Some((sp, _)) = self.spending_tx(&txid, vout)? {
+                    // as the node answers it: the mempool only (a confirmed spend shows as a spent gettxout)
+                    if let Some((sp, TxStatus::Mempool)) = self.spending_tx(&txid, vout)? {
                         row["spendingtxid"] = sp.into();
                     }
                     res.push(row);
@@ -1048,7 +1058,8 @@ impl ElectrumBackend {
                     for u in self.unspent(&spk)? {
                         total += u.value;
                         unspents.push(json!({"txid": u.txid, "vout": u.vout, "scriptPubKey": hex::encode(&u.script_pubkey), "desc": d,
-                                             "amount": u.value as f64 / SATS, "height": u.height}));
+                                             "amount": u.value as f64 / SATS, "coinbase": u.coinbase, "height": u.height,
+                                             "blockhash": u.block_hash}));
                     }
                 }
                 let i = lock(&self.inner);

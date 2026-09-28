@@ -79,9 +79,12 @@ fn every_call_answers_from_verified_data() {
     assert_eq!(raw["confirmations"], 0);
     chain.lock().unwrap().mine(1);
     assert_eq!(call(&b, "gettxout", json!([t1, 1, true])), Value::Null, "proven spent once confirmed");
+    assert_eq!(call(&b, "gettxspendingprevout", json!([[{"txid": t1, "vout": 1}]]))[0].get("spendingtxid"), None,
+               "as the node: gettxspendingprevout reports mempool spends only");
+    assert_eq!(b.spending_tx(&t1, 1).unwrap().map(|x| x.0), Some(sp.clone()), "the typed call reports the proven spend");
     let raw = call(&b, "getrawtransaction", json!([sp, true]));
     assert_eq!((raw["confirmations"].as_u64(), raw["height"].as_u64()), (Some(1), Some(302)));
-    assert_eq!(raw["vin"][0], json!({"txid": t1, "vout": 1}));
+    assert_eq!((raw["vin"][0]["txid"].as_str(), raw["vin"][0]["vout"].as_u64(), raw["vin"][0]["sequence"].as_u64()), (Some(t1.as_str()), Some(1), Some(0xFFFF_FFFD)));
     assert_eq!(call(&b, "getrawtransaction", json!([sp, false, raw["blockhash"]])), raw["hex"]);
     assert!(b.call("getrawtransaction", &json!([sp, false, tip_hash])).is_err(), "not in that block");
     assert!(b.call("getrawtransaction", &json!(["00".repeat(32)])).is_err());
