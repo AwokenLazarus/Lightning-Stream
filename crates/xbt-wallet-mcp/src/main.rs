@@ -134,7 +134,8 @@ fn main() {
                                                 mcp-http-token (XBT_SECRET_MCP_HTTP_TOKEN_FILE, $CREDENTIALS_DIRECTORY or the data dir)"),
         Some(t) => Some(t),
         None => {
-            let found = if remote && allow_remote {
+            // generated only where it can be kept (a data dir); otherwise serve_http refuses the listener
+            let found = if remote && allow_remote && secrets.dir.is_some() {
                 Some(secrets.get_or_create("mcp-http-token", || xbt_svc::to_hex(&xbt_svc::random_bytes(32)).into_bytes()))
             } else {
                 secrets.get("mcp-http-token").transpose()

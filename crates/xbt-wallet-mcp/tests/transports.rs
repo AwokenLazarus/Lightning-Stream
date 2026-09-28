@@ -233,3 +233,52 @@ fn stdio_call_before_initialize_is_refused() {
     }
     assert!(seen.lock().unwrap().is_empty());
 }
+
+/// AGP-038 container mode: XBT_DATA_DIR, a non-loopback listener with a generated token, a base path,
+/// /healthz and /readyz following the signer's readiness file. Port 33740 (AGP-038's 33700-33799).
+#[test]
+fn data_dir_mode_health_token_and_base_path() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let (sock, _) = mock_signer(dir.path());
+    let data = dir.path().join("data");
+    let child = Command::new(BIN).env_clear().env("XBT_DATA_DIR", &data).env("B2_SIGNER_SOCK", &sock).env("XBT_BASE_PATH", "/w/")
+        .env("XBT_MCP_HTTP", "0.0.0.0:33740").stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let h = Http { child, base: "http://127.0.0.1:33740".into() };
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(("127.0.0.1", 33740)).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let tok_path = data.join("mcp/secrets/mcp-http-token");
+    let token = std::fs::read_to_string(&tok_path).unwrap();
+    assert_eq!(token.len(), 64);
+    assert_eq!(std::fs::metadata(&tok_path).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(std::fs::metadata(data.join("mcp/secrets")).unwrap().permissions().mode() & 0o777, 0o700);
+    assert_eq!(req("GET", &format!("{}/healthz", h.base), None, &[]).0, 200);
+    assert_eq!(req("GET", &format!("{}/w/healthz", h.base), None, &[]).0, 200);
+    // the signer answers, but its readiness file is missing: not ready
+    let (st, _, body) = req("GET", &format!("{}/w/readyz", h.base), None, &[]);
+    assert_eq!(st, 503, "{body}");
+    let ready = data.join("run/signer/ready.json");
+    std::fs::create_dir_all(ready.parent().unwrap()).unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
+    std::fs::write(&ready, json!({"ok": false, "ts": now}).to_string()).unwrap();
+    assert_eq!(req("GET", &format!("{}/readyz", h.base), None, &[]).0, 503);
+    std::fs::write(&ready, json!({"ok": true, "ts": now}).to_string()).unwrap();
+    let (st, _, body) = req("GET", &format!("{}/readyz", h.base), None, &[]);
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["signer"]["reachable"], true);
+    std::fs::write(&ready, json!({"ok": true, "ts": now - 3600.0}).to_string()).unwrap();
+    assert_eq!(req("GET", &format!("{}/readyz", h.base), None, &[]).0, 503); // stale
+    // MCP itself: the token, under the base path and without it (a proxy that strips it)
+    let auth = format!("Bearer {token}");
+    assert_eq!(req("POST", &format!("{}/w/mcp", h.base), Some(&init_msg(1)), &[]).0, 401);
+    assert_eq!(req("POST", &format!("{}/w/mcp", h.base), Some(&init_msg(1)), &[("Authorization", &auth)]).0, 200);
+    assert_eq!(req("POST", &format!("{}/mcp", h.base), Some(&init_msg(1)), &[("Authorization", &auth)]).0, 200);
+    // production mode (a data dir) refuses the token as a plain env value
+    let out = Command::new(BIN).env_clear().env("XBT_DATA_DIR", &data).env("XBT_MCP_HTTP_TOKEN", "x")
+        .env("XBT_MCP_HTTP", "127.0.0.1:33741").env("B2_SIGNER_SOCK", &sock).output().unwrap();
+    assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("refused in production mode"));
+}
