@@ -1,0 +1,545 @@
+//! The payer SDK: pays x402 `xbt-channel` providers over any [`Transport`]. A port of B1
+//! `XbtChannelClient`: it opens a channel on the first 402 (funding through a [`Wallet`] hook),
+//! signs ever-increasing states (postpay: each call pays for the calls before it), authenticates
+//! every request, checks every receipt, keeps the refund, closes cooperatively, buys hash-locked
+//! deliverables and rolls a channel over.
+//!
+//! Budgets: per call (`max_price`), per channel (`capacity`), overall (`budget_sats`) and per day
+//! (`daily_budget`).
+use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde_json::{json, Value};
+use xbt_primitives::address::segwit_address;
+use xbt_primitives::ecdsa;
+use xbt_primitives::hash::sha256;
+use xbt_primitives::secp256k1::SecretKey;
+use xbt_primitives::tx::Tx;
+
+use crate::channel::{channel_auth_key, sign_with_type, ChannelParams, FeePayer, Payer, DERIVATION, DUST};
+use crate::conditional::{decrypt, preimage_from_tx, ConditionalParams};
+use crate::error::{fail, ChannelError, Result};
+use crate::json::{py_int, py_str, py_u64, truthy};
+use crate::provider::HttpResponse;
+use crate::wire::*;
+
+/// How the client talks HTTP. Header names in the response may be any case.
+pub trait Transport: Send + Sync {
+    fn request(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)]) -> Result<HttpResponse>;
+}
+
+/// The only wallet hook: fund `address` with `sats`, return the funding outpoint (display txid,
+/// vout). In production this is the B2 agent wallet (policy-checked), so the SDK never holds
+/// funding keys.
+pub trait Wallet: Send + Sync {
+    fn fund(&self, address: &str, sats: u64) -> Result<(String, u32)>;
+}
+
+/// Client settings (the reference's constructor keywords).
+#[derive(Debug, Clone)]
+pub struct ClientConfig {
+    pub network: String,
+    pub capacity: u64,
+    pub expiry_blocks: u32,
+    /// Most a call (or a conditional increment) may cost, in sats.
+    pub max_price: u64,
+    pub max_close_fee: u64,
+    /// Total capacity this client may open.
+    pub budget_sats: u64,
+    /// Sats signed per 24 h (0 = no limit).
+    pub daily_budget: u64,
+}
+
+impl ClientConfig {
+    pub fn new(network: &str) -> Self {
+        Self { network: network.into(), capacity: 200_000, expiry_blocks: 1_008, max_price: 1_000, max_close_fee: 2_000,
+               budget_sats: 1_000_000, daily_budget: 0 }
+    }
+}
+
+/// A conditional call signed but not yet delivered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingCond {
+    pub hash: [u8; 32],
+    pub cipher: Vec<u8>,
+    pub amount: u64,
+}
+
+/// One channel to one origin.
+#[derive(Debug, Clone)]
+pub struct ClientChannel {
+    pub payer: Payer,
+    pub origin: String,
+    /// The PaymentRequirements as received (echoed verbatim in PAYMENT-SIGNATURE).
+    pub accepted: Value,
+    pub refund_hex: String,
+    pub auth_key: [u8; 32],
+    /// Sat per call agreed at open: a 402 may not raise it mid-channel.
+    pub price: u64,
+    /// Charges adopted from a 402 without a receipt, over the channel's life.
+    pub slack_msat: u64,
+    pub seq: u64,
+    /// From the last verified receipt.
+    pub spent_msat: u64,
+    /// Our signature for `payer.signed`, resent until a receipt shows it arrived.
+    pub last_sig: String,
+    pub pending_cond: Option<PendingCond>,
+    /// The provider's best cum per its last receipt.
+    pub acked_cum: u64,
+    pub receipts: Vec<Value>,
+}
+
+/// The payer SDK.
+pub struct Client {
+    pub cfg: ClientConfig,
+    transport: Box<dyn Transport>,
+    wallet: Box<dyn Wallet>,
+    height: Box<dyn Fn() -> Result<u32> + Send + Sync>,
+    pub channels: HashMap<String, ClientChannel>,
+    pub opened_sats: u64,
+    pub day_spent: u64,
+    day_start: u64,
+    /// Called with (refund hex, expiry) for every channel opened: keep it, broadcast after expiry.
+    pub on_refund: Option<Box<dyn Fn(&str, u32) + Send + Sync>>,
+    /// Channels replaced by a rollover, until their successor is opened at the provider.
+    pub pending_rolled: HashMap<String, ClientChannel>,
+}
+
+fn now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn random_secret() -> SecretKey {
+    loop {
+        let mut b = [0u8; 32];
+        getrandom::getrandom(&mut b).expect("OS randomness");
+        if let Ok(sk) = SecretKey::from_slice(&b) {
+            return sk;
+        }
+    }
+}
+
+/// `("https://host:port", "/path?query")` of a URL, as the reference splits it.
+pub fn split_url(url: &str) -> (String, String) {
+    let parts: Vec<&str> = url.split('/').collect();
+    let origin = parts[..parts.len().min(3)].join("/");
+    let path = format!("/{}", if parts.len() > 3 { parts[3..].join("/") } else { String::new() });
+    (origin, path)
+}
+
+fn header<'a>(r: &'a HttpResponse, name: &str) -> Option<&'a str> {
+    r.header(name)
+}
+
+fn ex_u64(ex: &Value, k: &str) -> Result<u64> {
+    py_u64(ex.get(k)).ok_or_else(|| ChannelError::new("bad_offer", format!("extra.{k} missing")))
+}
+
+impl Client {
+    pub fn new(cfg: ClientConfig, transport: Box<dyn Transport>, wallet: Box<dyn Wallet>,
+               height: Box<dyn Fn() -> Result<u32> + Send + Sync>) -> Self {
+        Self { cfg, transport, wallet, height, channels: HashMap::new(), opened_sats: 0, day_spent: 0, day_start: now(), on_refund: None, pending_rolled: HashMap::new() }
+    }
+
+    /// bech32 hrp for funding addresses on this client's network.
+    pub fn hrp(&self) -> &'static str {
+        if self.cfg.network == XBT_MAINNET { "bc" } else { "bcrt" }
+    }
+
+    fn post(&self, url: &str, obj: &Value) -> Result<Value> {
+        let r = self.transport.request("POST", url, crate::json::dumps(obj).as_bytes(),
+                                       &[("Content-Type".into(), "application/json".into())])?;
+        let data: Value = serde_json::from_slice(&r.body).map_err(|_| ChannelError::new("provider_error", format!("HTTP {} non-JSON", r.status)))?;
+        if r.status != 200 {
+            // the provider's words go in the message, never in the code an agent reports (L12)
+            let code = data.get("error").and_then(Value::as_str).filter(|c| safe_code(c)).unwrap_or("provider_error");
+            return fail(code, py_str(data.get("detail")));
+        }
+        Ok(data)
+    }
+
+    fn pick(&self, pr: &Value) -> Result<Value> {
+        for acc in pr.get("accepts").and_then(Value::as_array).into_iter().flatten() {
+            if acc.get("scheme").and_then(Value::as_str) == Some(SCHEME) && acc.get("network").and_then(Value::as_str) == Some(&self.cfg.network) {
+                let amount = py_u64(acc.get("amount")).ok_or_else(|| ChannelError::new("bad_offer", "amount"))?;
+                if amount > self.cfg.max_price {
+                    return fail("too_expensive", format!("{amount} sat > max {}", self.cfg.max_price));
+                }
+                let ex = acc.get("extra").cloned().unwrap_or(Value::Null);
+                if ex_u64(&ex, "closeFeeSat")? > self.cfg.max_close_fee {
+                    return fail("bad_offer", "closeFeeSat above our cap");
+                }
+                if let Some(fp) = ex.get("closeFeePayer") {
+                    FeePayer::parse(fp.as_str().unwrap_or("")).map_err(|_| ChannelError::new("bad_offer", "unknown closeFeePayer"))?;
+                }
+                if ex.get("derivation").and_then(Value::as_str) != Some(DERIVATION) {
+                    // before funding: never strand coins
+                    return fail("bad_offer", format!("payee key derivation {}, this client speaks {DERIVATION:?} (xbt402 v1.1)", py_str(ex.get("derivation"))));
+                }
+                return Ok(acc.clone());
+            }
+        }
+        fail("no_scheme", format!("no {SCHEME} offer on {}", self.cfg.network))
+    }
+
+    fn expiry_blocks(&self, ex: &Value) -> Result<u32> {
+        let lo = ex_u64(ex, "minExpiryBlocks")? + 6;
+        let hi = ex_u64(ex, "maxExpiryBlocks")?.saturating_sub(1);
+        u32::try_from((self.cfg.expiry_blocks as u64).max(lo).min(hi)).map_err(|_| ChannelError::new("bad_offer", "expiry blocks"))
+    }
+
+    fn open(&mut self, origin: &str, acc: &Value) -> Result<ClientChannel> {
+        let ex = acc.get("extra").cloned().unwrap_or(Value::Null);
+        let fee_payer = FeePayer::parse(ex.get("closeFeePayer").and_then(Value::as_str).unwrap_or("payer"))?;
+        let cap = self.cfg.capacity.max(ex_u64(&ex, "minCapacity")?);
+        let max_cap = py_u64(ex.get("maxCapacity")).unwrap_or(cap);
+        if cap > max_cap || self.opened_sats + cap > self.cfg.budget_sats {
+            return fail("budget", "channel capacity outside provider range or our budget");
+        }
+        let secret = random_secret();
+        let pubk = ecdsa::pubkey(&secret);
+        let expiry = (self.height)()? + self.expiry_blocks(&ex)?;
+        let pay_to = hex::decode(acc.get("payTo").and_then(Value::as_str).unwrap_or("")).map_err(|_| ChannelError::new("bad_offer", "payTo"))?;
+        let close_fee = ex_u64(&ex, "closeFeeSat")?;
+        let p = ChannelParams::derive(&pay_to, &pubk, expiry, close_fee, None, &self.cfg.network, fee_payer)?;
+        let addr = segwit_address(self.hrp(), &p.spk())?;
+        let (txid, vout) = self.wallet.fund(&addr, cap)?;
+        let p = p.with_funding(&txid, vout, cap)?;
+        self.opened_sats += cap;
+        let refund_hex = p.refund_tx(&secret, None, None)?.to_hex();
+        let auth_key = channel_auth_key(&secret, &p.payee_pub)?;
+        let price = py_u64(acc.get("amount")).unwrap_or(0);
+        if let Some(cb) = &self.on_refund {
+            cb(&refund_hex, expiry);
+        }
+        let mut c = json!({"txid": txid, "vout": vout, "capacity": cap, "expiry": expiry, "payerPub": hex::encode(p.payer_pub),
+                           "payerSpk": hex::encode(&p.payer_spk), "redeemScript": hex::encode(p.script())});
+        if fee_payer != FeePayer::Payer {
+            c["closeFeePayer"] = fee_payer.as_str().into();
+        }
+        let open_url = format!("{origin}{}", ex.get("openUrl").and_then(Value::as_str).unwrap_or(OPEN_PATH));
+        let r = self.post(&open_url, &json!({"x402Version": 2, "network": self.cfg.network, "channel": c}))?;
+        if r.get("closeFeePayer").and_then(Value::as_str).unwrap_or("payer") != fee_payer.as_str() {
+            // a provider that did not take our terms would refuse every state we sign
+            return fail("bad_fee_payer", "the provider opened the channel with another closeFeePayer");
+        }
+        Ok(ClientChannel { payer: Payer::new(p, secret)?, origin: origin.into(), accepted: acc.clone(), refund_hex, auth_key, price,
+                           slack_msat: 0, seq: 0, spent_msat: 0, last_sig: String::new(), pending_cond: None, acked_cum: 0, receipts: vec![] })
+    }
+
+    fn auth(ch: &ClientChannel, pl: &mut Value, method: &str, path: &str, body: &[u8]) {
+        let req = request_digest(method, path, body);
+        let sig = pl.get("sig").and_then(Value::as_str).map(str::to_string);
+        let a = request_auth(&ch.auth_key, &py_str(pl.get("chan")), pl.get("seq"), pl.get("cum"), sig.as_deref(), &req);
+        pl["auth"] = a.into();
+    }
+
+    fn check_daily(&mut self, sats: u64) -> Result<()> {
+        if self.cfg.daily_budget > 0 && now().saturating_sub(self.day_start) > 86_400 {
+            self.day_spent = 0;
+            self.day_start = now();
+        }
+        if self.cfg.daily_budget > 0 && self.day_spent + sats > self.cfg.daily_budget {
+            return fail("budget", "daily budget exhausted");
+        }
+        Ok(())
+    }
+
+    fn payload(&mut self, origin: &str, price: u64, method: &str, path: &str, body: &[u8]) -> Result<Value> {
+        let ch = self.channels.get(origin).ok_or_else(|| ChannelError::code("no_channel"))?;
+        let billing = ch.accepted.get("extra").and_then(|e| e.get("billing")).and_then(Value::as_str).unwrap_or("postpay");
+        let need_msat = ch.spent_msat + if billing == "prepay" { price * 1000 } else { 0 };
+        let mut cum = need_msat.div_ceil(1000).max(ch.payer.signed);
+        let pmin = ch.payer.params.min_amount();
+        if cum > 0 && cum < pmin {
+            cum = pmin;
+        }
+        let delta = cum - ch.payer.signed;
+        self.check_daily(delta)?;
+        let ch = self.channels.get_mut(origin).ok_or_else(|| ChannelError::code("no_channel"))?;
+        let remaining = ch.payer.params.max_amount() as i128 - ch.payer.signed.max(ch.spent_msat / 1000) as i128;
+        if remaining < price as i128 && ch.payer.signed > 0 {
+            return fail("exhausted", "channel low: roll it over (Client::rollover) or close and reopen");
+        }
+        ch.seq += 1;
+        let mut pl = json!({"chan": ch.payer.params.channel_id(), "seq": ch.seq, "cum": cum.to_string()});
+        if cum > ch.payer.signed {
+            if cum > ch.payer.params.max_amount() {
+                return fail("exhausted", "channel capacity used up: close and reopen");
+            }
+            let sig = hex::encode(ch.payer.sign_state(cum)?);
+            ch.last_sig = sig.clone();
+            pl["sig"] = sig.into();
+            self.day_spent += delta;
+        } else if cum == ch.payer.signed && ch.payer.signed > ch.acked_cum && !ch.last_sig.is_empty() {
+            pl["sig"] = ch.last_sig.clone().into();       // signed but not yet seen to arrive
+        }
+        let ch = &self.channels[origin];
+        Self::auth(ch, &mut pl, method, path, body);
+        Ok(pl)
+    }
+
+    fn signature_header(&mut self, origin: &str, method: &str, path: &str, body: &[u8]) -> Result<Vec<(String, String)>> {
+        let accepted = self.channels[origin].accepted.clone();
+        let price = py_u64(accepted.get("amount")).unwrap_or(0);
+        let pl = self.payload(origin, price, method, path, body)?;
+        Ok(vec![("PAYMENT-SIGNATURE".into(), b64json(&payment_payload(&accepted, &pl)))])
+    }
+
+    /// One paid HTTP request. Opens a channel on the first 402 from an origin.
+    pub fn request(&mut self, method: &str, url: &str, body: &[u8]) -> Result<HttpResponse> {
+        let (origin, path) = split_url(url);
+        let mut hdrs = vec![];
+        if self.channels.contains_key(&origin) {
+            hdrs = self.signature_header(&origin, method, &path, body)?;
+        }
+        let mut r = self.transport.request(method, url, body, &hdrs)?;
+        if r.status == 402 {
+            let pr = unb64json(header(&r, "PAYMENT-REQUIRED").ok_or_else(|| ChannelError::new("bad_offer", "402 without PAYMENT-REQUIRED"))?)?;
+            let acc = self.pick(&pr)?;
+            if !self.channels.contains_key(&origin) {
+                let ch = self.open(&origin, &acc)?;
+                self.channels.insert(origin.clone(), ch);
+            }
+            let ch = self.channels.get_mut(&origin).ok_or_else(|| ChannelError::code("no_channel"))?;
+            let amount = py_u64(acc.get("amount")).unwrap_or(0);
+            if ch.price > 0 && amount > ch.price {
+                return fail("bad_offer", format!("price raised mid-channel: {} -> {amount} sat", ch.price));
+            }
+            ch.accepted = acc.clone();
+            if let Some(chv) = pr.get("channel") {
+                // the provider's view: at most one unreceipted call over the channel's life
+                let claimed = py_u64(chv.get("spentMsat")).unwrap_or(0);
+                let extra = claimed.saturating_sub(ch.spent_msat);
+                if extra > 0 && ch.slack_msat + extra > amount * 1000 {
+                    return fail("bad_offer", "provider claims charges we have no receipts for");
+                }
+                ch.slack_msat += extra;
+                ch.spent_msat = ch.spent_msat.max(claimed);
+            }
+            let hdrs = self.signature_header(&origin, method, &path, body)?;
+            r = self.transport.request(method, url, body, &hdrs)?;
+        }
+        if let Some(h) = header(&r, "PAYMENT-RESPONSE") {
+            let resp = unb64json(h)?;
+            self.receipt(&origin, &resp, method, &path, body, None)?;
+        }
+        Ok(r)
+    }
+
+    /// Check a PAYMENT-RESPONSE against what we signed and were quoted, and adopt it. `quote`:
+    /// what this call may cost (the price pinned at open, or a conditional amount).
+    fn receipt(&mut self, origin: &str, resp: &Value, method: &str, path: &str, body: &[u8], quote: Option<u64>) -> Result<()> {
+        let network = self.cfg.network.clone();
+        let ch = self.channels.get_mut(origin).ok_or_else(|| ChannelError::code("no_channel"))?;
+        let quote = quote.filter(|q| *q > 0).unwrap_or(if ch.price > 0 { ch.price } else { py_u64(ch.accepted.get("amount")).unwrap_or(0) });
+        let r = receipt_of(resp)?.clone();
+        if resp.get("network").and_then(Value::as_str) != Some(network.as_str())
+            || resp.get("payer").and_then(Value::as_str) != Some(hex::encode(ch.payer.params.payer_pub).as_str())
+        {
+            return fail("bad_receipt", "PAYMENT-RESPONSE is for another network or payer");
+        }
+        if py_str(r.get("req")) != request_digest(method, path, body) {
+            return fail("bad_receipt", "receipt is for another request");
+        }
+        let sig = hex::decode(py_str(r.get("sig"))).unwrap_or_default();
+        if !ecdsa::verify(&ch.payer.params.payee_pub, &receipt_message(&r), &sig) {
+            return fail("bad_receipt", "receipt not signed by the channel payee key");
+        }
+        let (rcum, charged, spent) = (py_int(r.get("cum")).unwrap_or(-1), py_int(r.get("charged")).unwrap_or(-1), py_int(r.get("spentMsat")).unwrap_or(-1));
+        if rcum < 0 || charged < 0 || spent < 0 {
+            return fail("bad_receipt", "receipt amounts are not non-negative integers");
+        }
+        if rcum > ch.payer.signed as i128 || charged > quote as i128 {
+            return fail("bad_receipt", "provider claims more than we signed or were quoted");
+        }
+        if spent - ch.spent_msat as i128 > quote as i128 * 1000 {
+            return fail("bad_receipt", "provider charged more than one call");
+        }
+        ch.spent_msat = spent as u64;
+        ch.acked_cum = ch.acked_cum.max(rcum as u64);
+        ch.receipts.push(r);
+        Ok(())
+    }
+
+    /// Cooperative close; in postpay the final state pays exactly what is owed.
+    pub fn close(&mut self, origin: &str) -> Result<Value> {
+        let pl = self.payload(origin, 0, "", "", b"")?;
+        let ch = &self.channels[origin];
+        let chan = ch.payer.params.channel_id();
+        let sig = hex::encode(ecdsa::sign(ch.payer.secret(), &close_message(&chan)));
+        let url = format!("{origin}{}", ch.accepted.get("extra").and_then(|e| e.get("closeUrl")).and_then(Value::as_str).unwrap_or(CLOSE_PATH));
+        self.post(&url, &json!({"chan": chan, "sig": sig, "payload": pl}))
+    }
+
+    /// Roll the channel to `origin` over: one tx pays the provider what is owed and funds a new
+    /// channel with the rest; the provider co-signs and broadcasts it. Returns the provider's
+    /// answer (`nextChan`, `nextCapacity`); call [`Client::open_rolled`] once it confirms.
+    pub fn rollover(&mut self, origin: &str) -> Result<Value> {
+        let h = (self.height)()?;
+        let ch = self.channels.get(origin).ok_or_else(|| ChannelError::code("no_channel"))?;
+        let ex = ch.accepted.get("extra").cloned().unwrap_or(Value::Null);
+        let expiry = h + self.expiry_blocks(&ex)?;
+        let mut owed = (ch.spent_msat / 1000).max(ch.payer.signed);
+        owed = owed.max(ch.payer.params.min_amount());
+        let secret = random_secret();
+        let pay_to = hex::decode(ch.accepted.get("payTo").and_then(Value::as_str).unwrap_or("")).map_err(|_| ChannelError::code("bad_offer"))?;
+        let p = &ch.payer.params;
+        let next = ChannelParams::derive(&pay_to, &ecdsa::pubkey(&secret), expiry, p.close_fee, None, &self.cfg.network, p.close_fee_payer)?;
+        let next_cap = p.rollover_next_capacity(owed);
+        if next_cap < ex_u64(&ex, "minCapacity")? {
+            return fail("exhausted", "not enough leftover to roll into a new channel");
+        }
+        let chan = p.channel_id();
+        let next_spk = next.spk();
+        let ch = self.channels.get_mut(origin).ok_or_else(|| ChannelError::code("no_channel"))?;
+        let sig = hex::encode(ch.payer.sign_rollover(owed, &next_spk, next_cap)?);
+        let body = json!({"chan": chan, "amount": owed, "next": {"payerPub": hex::encode(next.payer_pub), "expiry": expiry,
+                          "payerSpk": hex::encode(&next.payer_spk)}, "sig": sig});
+        let r = self.post(&format!("{origin}{ROLLOVER_PATH}"), &body)?;
+        let txid = r.get("txid").and_then(Value::as_str).unwrap_or("").to_string();
+        if r.get("nextChan").and_then(Value::as_str) != Some(format!("{txid}:1").as_str())
+            || py_u64(r.get("nextCapacity")) != Some(next_cap)
+        {
+            return fail("bad_rollover", "the provider's rollover differs from the one we signed");
+        }
+        let np = next.with_funding(&txid, 1, next_cap)?;
+        let refund_hex = np.refund_tx(&secret, None, None)?.to_hex();
+        if let Some(cb) = &self.on_refund {
+            cb(&refund_hex, expiry);
+        }
+        let ch = self.channels.get_mut(origin).ok_or_else(|| ChannelError::code("no_channel"))?;
+        let auth_key = channel_auth_key(&secret, &np.payee_pub)?;
+        let mut next_ch = ClientChannel { payer: Payer::new(np, secret)?, origin: origin.into(), accepted: ch.accepted.clone(), refund_hex,
+                                          auth_key, price: ch.price, slack_msat: 0, seq: 0, spent_msat: 0, last_sig: String::new(),
+                                          pending_cond: None, acked_cum: 0, receipts: vec![] };
+        std::mem::swap(ch, &mut next_ch);
+        self.pending_rolled.insert(origin.to_string(), next_ch);
+        Ok(r)
+    }
+
+    /// Register the rolled-over channel with the provider (its funding must have confirmed).
+    pub fn open_rolled(&mut self, origin: &str) -> Result<Value> {
+        let ch = &self.channels[origin];
+        let p = &ch.payer.params;
+        let c = json!({"txid": p.funding_txid(), "vout": p.funding_vout(), "capacity": p.capacity, "expiry": p.expiry,
+                       "payerPub": hex::encode(p.payer_pub), "payerSpk": hex::encode(&p.payer_spk), "redeemScript": hex::encode(p.script())});
+        let mut c = c;
+        if p.close_fee_payer != FeePayer::Payer {
+            c["closeFeePayer"] = p.close_fee_payer.as_str().into();
+        }
+        let url = format!("{origin}{}", ch.accepted.get("extra").and_then(|e| e.get("openUrl")).and_then(Value::as_str).unwrap_or(OPEN_PATH));
+        let r = self.post(&url, &json!({"x402Version": 2, "network": self.cfg.network, "channel": c}))?;
+        self.pending_rolled.remove(origin);
+        Ok(r)
+    }
+
+    /// Pay-on-preimage: sign a hash-locked increment, receive the key, check it, and fold the
+    /// increment into a plain state. Returns the response and the decrypted deliverable.
+    pub fn request_conditional(&mut self, method: &str, url: &str, body: &[u8]) -> Result<(HttpResponse, Vec<u8>)> {
+        let (origin, path) = split_url(url);
+        let r = self.transport.request(method, url, body, &[])?;
+        if r.status != 402 {
+            return fail("bad_offer", "expected a 402 with a hashlock");
+        }
+        let pr = unb64json(header(&r, "PAYMENT-REQUIRED").ok_or_else(|| ChannelError::code("bad_offer"))?)?;
+        let acc = self.pick(&pr)?;
+        let extra = acc.get("extra").and_then(|e| e.get("conditional")).cloned().unwrap_or(Value::Null);
+        if !truthy(extra.get("hash")) {
+            return fail("bad_offer", "no conditional hashlock in the 402");
+        }
+        let cipher = extra.get("cipher").and_then(Value::as_str).and_then(|c| hex::decode(c).ok())
+            .ok_or_else(|| ChannelError::new("bad_offer", "conditional offer carries no ciphertext"))?;
+        if !self.channels.contains_key(&origin) {
+            let ch = self.open(&origin, &acc)?;
+            self.channels.insert(origin.clone(), ch);
+        }
+        let amount = py_u64(acc.get("amount")).unwrap_or(0);
+        {
+            let ch = self.channels.get_mut(&origin).ok_or_else(|| ChannelError::code("no_channel"))?;
+            if ch.price > 0 && amount > ch.price {
+                return fail("bad_offer", format!("price raised mid-channel: {} -> {amount} sat", ch.price));
+            }
+            ch.accepted = acc.clone();
+        }
+        let (signed, acked, last) = {
+            let ch = &self.channels[&origin];
+            (ch.payer.signed, ch.acked_cum, ch.last_sig.clone())
+        };
+        if signed > acked && !last.is_empty() {
+            self.hand_over(&origin, &acc, signed, &last);    // a lost fold first (L9)
+        }
+        let h: [u8; 32] = extra.get("hash").and_then(Value::as_str).and_then(|x| hex::decode(x).ok()).and_then(|v| v.try_into().ok())
+            .ok_or_else(|| ChannelError::new("bad_offer", "hash"))?;
+        let cond_amt = py_u64(extra.get("amount")).ok_or_else(|| ChannelError::new("bad_offer", "amount"))?;
+        if cond_amt > self.cfg.max_price {
+            return fail("too_expensive", format!("conditional {cond_amt} sat > max {}", self.cfg.max_price));
+        }
+        if cond_amt < DUST {
+            return fail("bad_offer", "conditional amount below dust");
+        }
+        self.check_daily(cond_amt)?;
+        let csv = py_u64(extra.get("csvDelta")).unwrap_or(10) as u32;
+        let ch = self.channels.get_mut(&origin).ok_or_else(|| ChannelError::code("no_channel"))?;
+        let cp = ConditionalParams::new(ch.payer.params.clone(), h, cond_amt, csv)?;
+        let uncond = ch.payer.signed;
+        let tx = cp.state_tx(uncond)?;
+        let sig = hex::encode(sign_with_type(ch.payer.secret(), &cp.sighash(&tx)?, 0x21));
+        self.day_spent += cond_amt;
+        ch.pending_cond = Some(PendingCond { hash: h, cipher: cipher.clone(), amount: cond_amt });
+        ch.seq += 1;
+        let mut pl = json!({"chan": ch.payer.params.channel_id(), "seq": ch.seq, "cum": uncond.to_string(), "hashlock": hex::encode(h), "sig": sig});
+        Self::auth(ch, &mut pl, method, &path, body);
+        let hdrs = vec![("PAYMENT-SIGNATURE".to_string(), b64json(&payment_payload(&acc, &pl)))];
+        let r = self.transport.request(method, url, body, &hdrs)?;
+        if r.status == 402 {
+            // refused: the provider did not keep the conditional state
+            ch.pending_cond = None;
+            let code = serde_json::from_slice::<Value>(&r.body).ok().and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_string))
+                .filter(|c| safe_code(c)).unwrap_or_else(|| "refused".into());
+            return fail(&code, "conditional call refused");
+        }
+        let k = serde_json::from_slice::<Value>(&r.body).ok().and_then(|v| v.get("preimage").and_then(Value::as_str).and_then(|k| hex::decode(k).ok()))
+            .ok_or_else(|| ChannelError::new("no_preimage", format!("HTTP {} without k: recover_conditional reads k from the provider's claim", r.status)))?;
+        if sha256(&k) != h {
+            return fail("bad_preimage", "provider preimage does not match H");
+        }
+        let plain = decrypt(&cipher, &k);
+        ch.pending_cond = None;
+        if let Some(hv) = header(&r, "PAYMENT-RESPONSE") {
+            let resp = unb64json(hv)?;
+            self.receipt(&origin, &resp, method, &path, body, Some(cond_amt))?;
+        }
+        // upgrade: fold the increment into a plain state and hand it over now
+        let ch = self.channels.get_mut(&origin).ok_or_else(|| ChannelError::code("no_channel"))?;
+        let new_cum = (uncond + cond_amt).max(ch.payer.params.min_amount());
+        if new_cum > ch.payer.signed {
+            ch.last_sig = hex::encode(ch.payer.sign_state(new_cum)?);
+        }
+        let last = ch.last_sig.clone();
+        self.hand_over(&origin, &acc, new_cum, &last);
+        Ok((r, plain))
+    }
+
+    /// POST a signed state to /x402/verify; on failure the next paid call carries it again.
+    fn hand_over(&mut self, origin: &str, acc: &Value, cum: u64, sig: &str) {
+        let chan = self.channels[origin].payer.params.channel_id();
+        let req = facilitator_request(acc, &json!({"chan": chan, "cum": cum.to_string(), "sig": sig}));
+        if let Ok(v) = self.post(&format!("{origin}{FACILITATOR_VERIFY}"), &req) {
+            if v.get("isValid") == Some(&Value::Bool(true)) {
+                if let Some(ch) = self.channels.get_mut(origin) {
+                    ch.acked_cum = ch.acked_cum.max(cum);
+                }
+            }
+        }
+    }
+
+    /// The deliverable of a signed hash lock whose paid response never arrived, from the
+    /// provider's claim transaction (which reveals k on-chain).
+    pub fn recover_conditional(&self, origin: &str, claim: &Tx) -> Result<Vec<u8>> {
+        let pc = self.channels.get(origin).and_then(|c| c.pending_cond.clone())
+            .ok_or_else(|| ChannelError::new("no_state", "no pending conditional call on this channel"))?;
+        let k = preimage_from_tx(claim, &pc.hash).ok_or_else(|| ChannelError::new("bad_preimage", "this transaction does not reveal k"))?;
+        Ok(decrypt(&pc.cipher, &k))
+    }
+}
