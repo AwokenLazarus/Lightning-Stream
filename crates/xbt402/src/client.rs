@@ -378,6 +378,16 @@ impl Client {
         l.save(&recs)
     }
 
+    /// Keep only the newest `keep` receipts per channel. A receipt is kept for every call (about
+    /// 0.4 KB of JSON, more as a `Value`), so a long-lived payer with many origins trims them now
+    /// and then.
+    pub fn trim_receipts(&mut self, keep: usize) {
+        for ch in self.channels.values_mut() {
+            let n = ch.receipts.len().saturating_sub(keep);
+            ch.receipts.drain(..n);
+        }
+    }
+
     /// Save after an operation on `origin`: the operation's own error wins over the ledger's.
     fn saved<T>(&self, origin: &str, r: Result<T>) -> Result<T> {
         let p = self.persist(Some(origin));

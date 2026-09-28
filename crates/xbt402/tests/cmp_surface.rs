@@ -259,6 +259,8 @@ fn a_local_key_client_restarts_from_any_client_ledger() {
     assert!(c.channels["http://vendor.test"].payer.secret().is_some());
     assert_eq!(c.request("GET", "http://vendor.test/v1/q?i=3", b"").unwrap().status, 200);
     assert_eq!(c.channels["http://vendor.test"].payer.params.channel_id(), chan);
+    c.trim_receipts(1);
+    assert_eq!(c.channels["http://vendor.test"].receipts.len(), 1);
     let r = c.close("http://vendor.test").unwrap();
     assert_eq!(r["cum"], "600");
     assert_eq!(store.load().unwrap().iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), ["book", "chan http://vendor.test"]);

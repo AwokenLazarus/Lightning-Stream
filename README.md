@@ -31,6 +31,10 @@ cargo build -j2 --release --target aarch64-unknown-linux-gnu -p xbt402
 cargo run --release -p xbt402 --example adaptor_bench
 ./scripts/build_matrix.sh          # every AGP-031 target; writes dist/MATRIX.md
 ./scripts/electrum_interop.sh      # the light Rust payer on real electrs (tcp + TLS) vs the Python provider
+cargo test -j2 -p xbt402 --no-default-features --test cmp_surface   # AGP-035: what cmp links, no features
+./scripts/cmp_clean_build.sh [REF] # AGP-035: clean clone, no .cargo, cargo-zigbuild, x86_64/aarch64/armv7 musl
+scripts/cmp_keys_ecdsa.py          # AGP-035: xbt_primitives::ecdsa vs cmp/keys.py, byte for byte
+cargo test -j2 --manifest-path tools/lazarus-crosscheck/Cargo.toml  # header/PoW vs the pool's lazarus-protocol
 ```
 
 Run heavy work under a CPU and memory cap:
@@ -48,7 +52,8 @@ x86_64; other arches need a user-mode emulator already on PATH (the script never
 binfmt/qemu).
 
 Dependencies: `secp256k1` 0.29 (libsecp256k1, the global context), `sha2`, `ripemd`, `blake2`,
-`hmac`, `ruint` (256-bit targets and work), `serde_json` with `preserve_order`, `base64`, `thiserror`,
+`hmac`, `ruint` (256-bit targets and work), `serde_json` with `preserve_order` (never
+`arbitrary_precision`, AGP-035), `base64`, `thiserror`,
 `getrandom`, `indexmap`. Optional: `ureq` (features `http-client`, `rpc`) and `tiny_http` (`http-server`).
 std only; no_std isn't a goal.
 
@@ -108,10 +113,13 @@ client.close(origin)?;
   `SettlementResponse`, `VerifyResponse`, `SupportedResponse`, `OpenChannel`, `OpenResponse`, `CloseResponse`).
 * `provider`: `Provider` (serve, open, close, rollover, facilitator verify/settle/supported, terms,
   offer_conditional, close_due, sweep_payee), `ProviderConfig`.
-* `client`: `Client`, `ClientConfig`, and the two hooks the application supplies: `Transport` and `Wallet`.
+* `client`: `Client`, `ClientConfig`, and the two hooks the application supplies: `Transport` and `Wallet`;
+  optionally a `ClientLedger` for the channel book (`Client::with_ledger`, `FileClientLedger`,
+  `MemoryClientLedger`; AGP-035).
 * `funding`: `ChainBackend` (the four node calls), `FundingPolicy`, `check_funding`.
 * `ledger`: `ChannelState`, `Ledger` (in memory, or an fsynced append-only JSONL file).
-* `json`: JSON written byte-exactly as Python's `json.dumps`, which the wire headers need.
+* `json`: JSON written byte-exactly as Python's `json.dumps`, which the wire headers need, and read
+  losslessly by `json::parse` (integers of any size, correctly rounded floats; see below).
 * Features: `http-client` (`http::UreqTransport`), `http-server` (`http::serve_http`), `rpc`
   (`rpc::Rpc`: bitcoind JSON-RPC as `ChainBackend` and `Wallet`). cmp can bring its own transport.
 
@@ -147,8 +155,8 @@ Mutation tests prove each check bites: a tampered value fails exactly its own ve
 copies in `vectors/` are checked against the source files on every run.
 
 The header/PoW code is also cross-checked against `lazarus-protocol`, the pool's Rust, through a
-path dev-dependency (`crates/xbt402-interop/tests/lazarus_crosscheck.rs`; nothing is written to
-`~/Bitcoin`). It covers 2,000 random profile-0 headers (pow hash, h2, time, height), the Knots-captured
+path dev-dependency of a standalone crate outside the workspace (`tools/lazarus-crosscheck`, so a
+clean checkout never needs `~/Bitcoin`; nothing is written there). It covers 2,000 random profile-0 headers (pow hash, h2, time, height), the Knots-captured
 v2 headers, more than 4,000 compact targets, and merkle roots. The mainnet retarget rule is checked on
 400 cases recorded from B2's Python (`scripts/gen_retarget_cases.py` → `vectors/retarget_main_cases.json`).
 
@@ -228,8 +236,8 @@ payer.stop(); payer.close()?;
   (open, retry, write-off, t from a ch2 close, rollover at the net threshold, ch1 margin).
 * `route_client`: `RoutePayer`, over `signer::RouteSigner` (below) and a `client::Wallet`.
 * `http::serve_service` serves a provider or a hub (`HttpService`).
-* `serde_json` runs with `arbitrary_precision`: amsat prices exceed u64 and signed quotes must
-  round-trip Python's ints exactly.
+* amsat prices exceed u64 and signed quotes must round-trip Python's ints exactly. Since AGP-035 that
+  is `xbt402::json`'s job, not serde_json's `arbitrary_precision` (see "Linking xbt-rs from cmp").
 
 **Routing conformance** (`conformance.sh` step 4): `scripts/route_vectors.py` generates
 `vectors/xbt402_routing_vectors.json` from B1 (nonces injected, byte-identical under both B1 ECC
@@ -237,7 +245,8 @@ backends); the Rust emitter reproduces it byte for byte; Rust re-verifies it (79
 re-verifies the Rust file. It covers 5 adaptor cases, quotes (an amsat price above 2^64), invoices,
 ROUTE-STATE, auths, `route_ok`/`next_cum` tables and one two-hop lock end to end.
 
-**Routed cross-implementation** (`route_interop.sh`, ports 33100–33199): all 8 combinations of
+**Routed cross-implementation** (`route_interop.sh`, ports 33100–33212; `XBT_RS_ROUTE_PORT_BASE=B
+ROUTE_RSS_OFFSET=3` keeps every port in B..B+99): all 8 combinations of
 client × hub × provider in Rust or Python, 2 providers each, exact amounts on chain for every ch1
 and ch2 close; then `xbt402-route-demo`, the AGP-021 demo in Rust (4 providers, rollover, a
 non-revealing provider, a withholding hub): see AGP-026's result for the tables.
@@ -312,3 +321,104 @@ the miner, and the oracle every answer is compared with.
 Deliberately different from B2's Python: `gettxspendingprevout` reports mempool spends only, as
 Knots does (the Python also reported confirmed spends; the typed `spending_tx` still does), and the
 fee estimate is the median over servers (the Python took the first answer).
+
+## Linking xbt-rs from cmp (AGP-035)
+
+xbt-compute's Rust runtime pins this repo by full rev with `default-features = false`. What that
+gets, and what it must not get:
+
+**No `arbitrary_precision`.** Cargo unifies features, so a serde_json feature here would change
+`serde_json::Number` in every crate cmp links. `cargo tree -e features -i serde_json` shows only
+`default`, `std`, `preserve_order` and `indexmap`. Routed amsat prices and meters (above u64) are
+still exact: `xbt402::json::parse` reads JSON without serde_json ever rounding a number through
+f64, holding an integer beyond i64/u64 as a reserved one-key object `{"$xbt402::int": "<decimal>"}`
+(`json::big_int`/`big_uint`/`as_big_int`/`int_text`), which `json::dumps`/`dumps_compact`/`canon`
+write back as the bare integer. Floats are parsed with Rust's correctly rounded parser and written
+as Python's `repr`. A document that contains the reserved key itself is refused. Every xbt402 input
+goes through `json::parse`, and every output through `json::dumps`: the 249 + 79 vectors are
+byte-identical both ways and `route_interop` is green. If cmp handles xbt402 JSON itself, it reads
+with `xbt402::json::parse` and writes with `xbt402::json::dumps*`. `serde_json::to_string` would
+print a big integer as the reserved object.
+
+Options weighed for this (best-performing-stack rule):
+
+| option | exact amsat | cmp's serde_json untouched | change in xbt-rs | risk |
+|---|---|---|---|---|
+| keep `arbitrary_precision` | yes | **no** (the reason for AGP-035) | none | changes cmp's numbers |
+| a number newtype over `RawValue` (`raw_value` feature) | yes | yes (`raw_value` adds a type, changes no semantics) | typed structs instead of `Value` across hub, seller, route client and vectors (~4k lines) | large rewrite of byte-exact code |
+| decimal strings at the Rust boundary | no: B1 signs amsat as a JSON *number*, a string canonicalises differently | yes | small | breaks signature interop |
+| a canonical writer for the signed messages only | signing yes, but the parse is still lossy | yes | medium | quotes nested in 402 bodies are still rounded on read |
+| **a lossless parse front end + reserved big-int object (chosen)** | yes, in both directions | yes, no serde_json features at all | `json.rs` (+ 25 call sites `serde_json::from_*` → `json::parse*`) | the reserved object must not leak through `serde_json::to_string`: every writer is `json::dumps*` |
+
+**Clean-checkout builds.** `scripts/cmp_clean_build.sh [REF]` clones REF, deletes `.cargo/`, refuses
+if any other cargo config or cross build variable is in effect, then runs `cargo zigbuild --release
+--locked` (cargo-zigbuild 0.23.4 from `~/xbt-rnd/tools/zigbuild`, zig 0.16.0 from the ziglang venv)
+of `-p xbt402 --no-default-features` and `-p xbt-signer` for x86_64/aarch64-unknown-linux-musl and
+armv7-unknown-linux-musleabihf, checks each binary is a static ELF of its machine, and builds and runs
+a cmp-shaped consumer that takes `xbt402` and `xbt-signer` as git dependencies. The one blocker was
+here, not in the build: `xbt402-interop`'s path dev-dependency on `~/Bitcoin/lazarus/protocol` kept a
+clean clone from even loading the workspace. That cross-check now lives in `tools/lazarus-crosscheck`.
+
+**The surface with no features** (`crates/xbt402/tests/cmp_surface.rs`, run with
+`--no-default-features` and only cmp-style `Transport`, `Wallet`, `ChainBackend` + `SpendScan` and a
+signer):
+* `Provider::new(chain, pay_to, cfg, ledger, price, handler)` takes its `Ledger`
+  (`Ledger::open(path)` or `in_memory()`) and `Provider::serve(...)` is the whole HTTP surface.
+* `Client::new(cfg, transport, wallet, height).with_signer(signer).with_ledger(ledger)?`: the
+  channel book goes to any `ClientLedger` (`load`/`save` of keyed JSON records). `FileClientLedger` is
+  an fsynced JSONL file, mode 0600, compacted on open; `MemoryClientLedger` is in memory. Every paid
+  call, close and rollover saves what it touched (`Client::persist` after hand edits). A signer-held
+  channel is stored as `"key": "signer"` and needs the same signer to load; a local key is stored as
+  its secret. Additive: without `with_ledger` nothing changes.
+* One process holds a Provider ledger and a Client ledger at once (the MoE dispatcher sells and buys).
+  The test runs that, restarts the client from its file, and keeps paying on the same channels.
+* `RoutePayer::new(hub, cfg, route_signer, wallet, transport, height)` pays two providers through
+  one hub channel, one of them priced above u64 amsat.
+
+**ECDSA vs `cmp/keys.py`.** `scripts/cmp_keys_ecdsa.py` (with cmp's venv; cmp's tree is only read,
+no bytecode is written) signs 2,000 (secret, message) pairs with `OperatorKey(secret).sign(msg)` and with
+`xbt_primitives::ecdsa::sign(secret, sha256(msg))` (via `xbt-ecdsa-cmp`). Edge keys 1, 2, 3, n−1,
+n−2, 2^255 and messages from empty to 1 KiB give identical pubs and identical strict-DER low-S
+signatures, and 4,000 cross-verifications agree.
+
+### Micro-payments: 16–64 vendors at a few msat per call
+
+**Direct channels (one per origin).** Numbers are the defaults (`ProviderConfig`, `ClientConfig`,
+`channel.rs`):
+
+| per origin | amount |
+|---|---|
+| funding tx (1 P2WPKH in → P2WSH + change) | ~153 vB; ~306 sat at 2 sat/vB |
+| capacity locked | `ClientConfig.capacity` 200,000 sat (provider floor `min_capacity` 20,000) |
+| first state (the least the vendor is ever paid) | `min_amount()` = DUST 546 sat (payer pays the close fee), 1,146 sat under v1.2 payee-pays |
+| close | `STATE_VSIZE` 190 vB, `closeFeeSat` 600 sat |
+| wait before the first paid call | `min_conf` 1 block (3 above 1,000,000 sat capacity) |
+
+So each direct vendor costs at least 546 + 600 + ~306 ≈ 1,450 sat of floor plus fees over a
+channel's life, whatever it is used for. Prices on direct channels are whole sats per call (`PriceFn`,
+`ChargeFn`). The provider meters `spentMsat` and reports `owedMsat` = spent − 1000·cum. Postpay
+signs a new state only when ⌈spentMsat/1000⌉ passes the last signed cum, so one floor state covers
+the first 546 sat of use. A metered call can charge less than its price, but not
+less than 1 sat. **Do not price a direct vendor below the DUST floor over the channel's life, and do
+not use direct channels for sub-sat calls.**
+
+**~64 channels in one Client:** memory is ~0.5 KB of struct plus ~1.9 KB of JSON per channel
+(`accepted` terms, params, refund), about 160 KB for 64. Receipts are also kept per call (0.4 KB of
+JSON each, more as a `Value`): 64 vendors × 10,000 calls is 640,000 receipts, so call
+`Client::trim_receipts(n)` now and then. A `FileClientLedger` saves at most 16 receipts per channel,
+about 8.7 KB per channel record. Opening means 64 fundings (~9,800 vB), 64 confirmations to wait for,
+and 12.8 M sat locked at the default capacity. Note that the default `budget_sats` of 1,000,000 stops
+at 5 channels: raise it. Closing means 64 × 190 vB ≈ 12,200 vB and 64 × 600 = 38,400 sat of close
+fees, plus 64 × 546 = 34,944 sat of floors. In total that is ~22,000 vB on chain and ~93,000 sat of
+fees and floors before any real use.
+
+**Hub routing (the intended answer).** One ch1 to a hub (one funding, one close, one floor: ~340 vB
+and ~1,450 sat in all) reaches every vendor. The hub runs the ch2s and charges `feeBaseMsat` +
+`feePpm` per lock (defaults 1,000 msat + 2,000 ppm; carried exactly in 1e-6 msat, charged as the
+ceil of the running total, never rounded per lock). Prices are amsat per call (1 sat = 10^21 amsat)
+with exact meters on both sides and signed ROUTE-STATEs per call. Locks are per window (`window`
+1 s) of ⌈owed⌉ sat, so at 5 msat per call a vendor is paid 1 sat per 200 calls, with no rounding lost.
+`credit_msat` caps unpaid credit. That per-window lock *is* the aggregated per-N-calls payment. We
+advise against a separate aggregation API: the window and the amsat meter already amortise it,
+without giving up the per-call evidence.
+
