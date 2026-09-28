@@ -135,7 +135,7 @@ fn a_policy_change_needs_the_human_key_is_validated_like_the_engine_and_applies_
     // the prepared policy keeps the enrolled human key, whatever the form says
     pol["human_pubkey"] = "00".repeat(32).into();
     let (prep, set) = sign_policy(&rig, pol.clone());
-    assert_eq!(prep["text"].as_str().unwrap().contains(&hex::encode(human().verifying_key().to_bytes())), true);
+    assert!(prep["text"].as_str().unwrap().contains(&hex::encode(human().verifying_key().to_bytes())));
     assert!(prep["diff"].as_array().unwrap().iter().any(|d| d["key"] == "open_wait_s" && d["restart"] == true));
     // a bad signature, a tampered text, an expired one
     let mut bad = set.clone();

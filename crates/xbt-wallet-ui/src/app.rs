@@ -102,7 +102,7 @@ fn state_of(c: &Value) -> &'static str {
 /// The signer did it: no deny, no `ok: false`, no error.
 fn ok_of(r: &Value) -> bool {
     r.is_object() && !matches!(r.get("verdict").and_then(Value::as_str), Some("deny") | Some("needs_human"))
-        && r.get("ok") != Some(&Value::Bool(false)) && r.get("error").is_none_or(Value::is_null)
+        && r.get("ok") != Some(&Value::Bool(false)) && r.get("error").map_or(true, Value::is_null)
 }
 
 fn reason_of(r: &Value) -> String {
@@ -926,7 +926,7 @@ impl App {
                 Ok((st, body)) => {
                     let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
                     let up = st == 200 && v.get("ok") != Some(&Value::Bool(false)) && v.get("ready") != Some(&Value::Bool(false));
-                    let mut rows = vec![("Status", format!("<span class=\"tag {}\">{}</span> HTTP {st}", if up { "ok" } else { "bad" }, if up { "up" } else { "not ready" }))];
+                    let rows = vec![("Status", format!("<span class=\"tag {}\">{}</span> HTTP {st}", if up { "ok" } else { "bad" }, if up { "up" } else { "not ready" }))];
                     let mut extra: Vec<(String, String)> = vec![];
                     if let Some(m) = v.as_object() {
                         for (k, x) in m {
@@ -936,7 +936,7 @@ impl App {
                             }
                         }
                     }
-                    let mut html = kv(&rows.drain(..).collect::<Vec<_>>());
+                    let mut html = kv(&rows);
                     if !extra.is_empty() {
                         html.push_str(&kv(&extra.iter().map(|(k, v)| (k.as_str(), v.clone())).collect::<Vec<_>>()));
                     }

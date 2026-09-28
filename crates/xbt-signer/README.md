@@ -91,6 +91,32 @@ ECDSA adaptor (AGP-026, wire-compatible with B1 `adaptor.py`), the default `chan
 | `xbt402_recover_lock` | `chan`, `txid`, `blockhash`, or `hex` (new: the raw close) | `{t}`; only a secret opening the stored T1 counts |
 | `routing_status` | | policy, 24 h spend, pending locks, `adaptor: available` |
 
+### For the web UI (AGP-039)
+
+These are the methods behind `xbt-wallet-ui` (see its README). Every one that raises what the wallet
+may spend, or that moves or exports keys, needs a signature by the human's ed25519 key. The domains
+are in `approval.rs`. None of these methods is an MCP tool.
+
+| method | params | result |
+|---|---|---|
+| `approvals` | | pending, approved (xbt402 grants) and expired approval tokens with dest, amount, memo, url, expiry |
+| `approval_status` | `token` | `pending`, `approved`, `used`, `denied`, `expired` or `unknown` |
+| `deny_approval` | `token`, `reason` | drops the token (no signature: the agent can only lose its own request) |
+| `policy_get` / `policy_validate` | / `policy` | the file, its SHA-256 and the values in force; the validator's `errors` (the engine's parse errors first) and `warnings` |
+| `policy_prepare` | `policy` | the canonical text, `prev_sha256`, `expiry`, the message to sign, and a diff; the human key is kept |
+| `policy_set` | `text`, `prev_sha256`, `expiry`, `signature` | writes policy.json atomically (the old file is kept as `.prev`) and puts it in force without a restart; start-only keys are reported in `pending_restart` |
+| `human_key_enroll` | `pubkey` | the first human key, only while none is enrolled (trust on first use) |
+| `human_key_rotate` | `pubkey`, `expiry`, `signature` (by the current key) | the new human key |
+| `rotate_hot_key_signed` | `expiry`, `signature` | `rotate_hot_key`, logged under `human:rotate_signature` |
+| `backup_export` | `backup_pass`, `expiry`, `signature` | policy, sealed keys, books and logs, plus the wrapping secret sealed under the backup passphrase |
+| `keystore_status`, `channel_reports` | | the wrapping-key source and mode; each close's report (AGP-029: cum, unpaidMsat, payeeFee, payeeNet) |
+
+An over-threshold `xbt402_pay` stores its approval as `kind: "xbt402"` with its url and method.
+`approve` of such a token grants it: nothing is paid yet. The agent's next `xbt402_pay` with the same
+url, method and `max_sats` then pays under it once, with `human = true`, and returns `approved: true`.
+Other tokens keep B2's `approve`, which pays at once. `close_channel` now returns B2's AGP-029
+`close_report`.
+
 ## Not ported
 
 Each of these answers that it is unavailable:

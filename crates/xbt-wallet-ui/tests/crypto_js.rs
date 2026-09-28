@@ -6,12 +6,8 @@ use xbt_signer::approval;
 
 fn node() -> Option<String> {
     let home = std::env::var("HOME").unwrap_or_default();
-    for n in ["node".to_string(), format!("{home}/.local/share/nodejs/bin/node")] {
-        if std::process::Command::new(&n).arg("--version").output().is_ok_and(|o| o.status.success()) {
-            return Some(n);
-        }
-    }
-    None
+    ["node".to_string(), format!("{home}/.local/share/nodejs/bin/node")].into_iter()
+        .find(|n| std::process::Command::new(n).arg("--version").output().is_ok_and(|o| o.status.success()))
 }
 
 fn run(args: &[&str]) -> Option<std::process::Output> {
