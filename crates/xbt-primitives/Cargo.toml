@@ -18,3 +18,4 @@ ruint.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+ruint = { workspace = true, features = ["std"] }

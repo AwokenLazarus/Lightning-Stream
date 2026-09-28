@@ -141,8 +141,8 @@ mod tests {
     #[test]
     fn matches_python() {
         let v = json!({"b": 1, "a": [true, null, "x\u{e9}\n"], "c": {"d": "\u{1F600}"}});
-        assert_eq!(dumps(&v), r#"{"b": 1, "a": [true, null, "xé\n"], "c": {"d": "😀"}}"#);
-        assert_eq!(dumps_compact(&v), r#"{"b":1,"a":[true,null,"xé\n"],"c":{"d":"😀"}}"#);
+        assert_eq!(dumps(&v), "{\"b\": 1, \"a\": [true, null, \"x\\u00e9\\n\"], \"c\": {\"d\": \"\\ud83d\\ude00\"}}");
+        assert_eq!(dumps_compact(&v), "{\"b\":1,\"a\":[true,null,\"x\\u00e9\\n\"],\"c\":{\"d\":\"\\ud83d\\ude00\"}}");
         assert_eq!(py_str(Some(&json!(5))), "5");
         assert_eq!(py_str(None), "None");
         assert_eq!(py_int(Some(&json!(" 12 "))), Some(12));

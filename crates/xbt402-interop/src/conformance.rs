@@ -287,50 +287,50 @@ fn conditional_checks(v: &Value) -> Vec<String> {
 
 fn payee_pays_checks(v: &Value) -> Vec<String> {
     let mut errs = vec![];
-    let mut need = |ok: bool, what: &str| if !ok { errs.push(format!("payeePays: {what}")) };
+    let mut need = |ok: bool, what: &str| if !ok { errs.push(format!("payeePays.{what}")) };
     let pp = &v["payeePays"];
     let Ok(p) = ChannelParams::from_json(&pp["params"]) else { return vec!["payeePays: params".into()] };
     let (cap, fee) = (p.capacity as i64, p.close_fee as i64);
-    need(p.close_fee_payer == FeePayer::Payee && u(&pp["minCum"]) == DUST + p.close_fee && u(&pp["maxCum"]) == p.capacity, "params");
+    need(p.close_fee_payer == FeePayer::Payee && u(&pp["minCum"]) == DUST + p.close_fee && u(&pp["maxCum"]) == p.capacity, "params: fee payer, min, max");
     for (i, s) in pp["states"].as_array().into_iter().flatten().enumerate() {
         let cum = u(&s["cum"]) as i64;
         let mut want = vec![serde_json::json!([cum - fee, hex::encode(&p.payee_spk)])];
         if cap - cum >= DUST as i64 {
             want.push(serde_json::json!([cap - cum, hex::encode(&p.payer_spk)]));
         }
-        need(s["outputs"] == Value::Array(want), &format!("states[{i}] outputs"));
+        need(s["outputs"] == Value::Array(want), &format!("states[{i}]: outputs"));
         let sig = h(&s["payerSig"]);
-        need(sig.last() == Some(&SIGHASH_ALL_UNIFIED) && ecdsa::verify(&p.payer_pub, &h32(&s["sighash"]), &sig[..sig.len().saturating_sub(1)]), &format!("states[{i}] sig"));
+        need(sig.last() == Some(&SIGHASH_ALL_UNIFIED) && ecdsa::verify(&p.payer_pub, &h32(&s["sighash"]), &sig[..sig.len().saturating_sub(1)]), &format!("states[{i}]: sig"));
     }
     if let Ok(payee) = Payee::new(p.clone(), secret(&pp["payeeSecret"])) {
         for (i, bad) in pp["invalid"].as_array().into_iter().flatten().enumerate() {
             match payee.verify_state(u(&bad["cum"]), &h(&bad["payerSig"])) {
-                Ok(()) => need(false, &format!("invalid[{i}] accepted")),
+                Ok(()) => need(false, &format!("invalid[{i}]: accepted")),
                 Err(e) => need(e.code == bad["error"].as_str().unwrap_or(""), &format!("invalid[{i}]: got {}", e.code)),
             }
         }
     } else {
-        need(false, "payee key");
+        need(false, "params: payee key");
     }
     let a3 = Tx::parse_hex(pp["a3State"]["unsignedTx"].as_str().unwrap_or("")).ok();
     let sig = h(&pp["a3State"]["payerSig"]);
     need(a3.is_some_and(|a3| a3.outputs[0].value == cap - 150_000 && a3.outputs[0].script_pubkey == p.payer_spk && a3.outputs[1].value == 150_000 - fee)
-         && sig.last() == Some(&SIGHASH_SINGLE_ACP_UNIFIED) && ecdsa::verify(&p.payer_pub, &h32(&pp["a3State"]["sighash"]), &sig[..sig.len().saturating_sub(1)]), "a3State");
+         && sig.last() == Some(&SIGHASH_SINGLE_ACP_UNIFIED) && ecdsa::verify(&p.payer_pub, &h32(&pp["a3State"]["sighash"]), &sig[..sig.len().saturating_sub(1)]), "a3State: output 0 / 0xA3 signature");
     let r = &pp["rollover"];
     let rt = Tx::parse_hex(r["unsignedTx"].as_str().unwrap_or("")).ok();
     let amount = u(&r["amount"]) as i64;
     need(rt.is_some_and(|t| t.outputs.len() == 2 && t.outputs[0].value == amount - fee && t.outputs[1].value == cap - amount
                         && hex::encode(&t.outputs[1].script_pubkey) == r["nextSpk"].as_str().unwrap_or(""))
-         && u(&r["nextCapacity"]) as i64 == cap - amount, "rollover");
+         && u(&r["nextCapacity"]) as i64 == cap - amount, "rollover: outputs");
     let c = &pp["conditional"];
     let ct = Tx::parse_hex(c["unsignedTx"].as_str().unwrap_or("")).ok();
     let uncond = u(&c["uncond"]) as i64;
     need(ct.is_some_and(|t| t.outputs.len() == 3 && t.outputs[0].value == uncond - fee && t.outputs[1].value == u(&c["condAmount"]) as i64
-                        && t.outputs[2].value == cap - uncond - u(&c["condAmount"]) as i64) && uncond >= DUST as i64 + fee, "conditional");
-    need(pp["terms"]["extra"]["closeFeePayer"] == "payee" && pp["terms"]["extra"].get("settleMultiple").is_some(), "terms");
+                        && t.outputs[2].value == cap - uncond - u(&c["condAmount"]) as i64) && uncond >= DUST as i64 + fee, "conditional: fee from the payee's output");
+    need(pp["terms"]["extra"]["closeFeePayer"] == "payee" && pp["terms"]["extra"].get("settleMultiple").is_some(), "terms: closeFeePayer/settleMultiple");
     let o = &pp["open"];
     need(o["status"] == 200 && o["response"]["closeFeePayer"] == "payee" && o["response"]["minCum"].as_str() == Some((DUST + p.close_fee).to_string().as_str())
-         && o["response"]["chan"].as_str() == Some(p.channel_id().as_str()), "open");
+         && o["response"]["chan"].as_str() == Some(p.channel_id().as_str()), "open: echoes closeFeePayer and minCum");
     errs
 }
 
@@ -342,13 +342,19 @@ fn read_json(path: &Path) -> Result<Value, String> {
 /// The 49 xbt402 vectors.
 pub fn xbt402_group(path: &Path) -> Group {
     let mut g = Group { name: "xbt402 (v1.1 + v1.2)".into(), source: path.display().to_string(), total: 0, passed: 0, failures: vec![] };
-    let want = match read_json(path) {
-        Ok(v) => v,
+    match read_json(path) {
+        Ok(want) => xbt402_check(&want, &g.source),
         Err(e) => {
             g.failures.push(e);
-            return g;
+            g
         }
-    };
+    }
+}
+
+/// [`xbt402_group`] over an already-loaded vector file.
+pub fn xbt402_check(want: &Value, source: &str) -> Group {
+    let mut g = Group { name: "xbt402 (v1.1 + v1.2)".into(), source: source.into(), total: 0, passed: 0, failures: vec![] };
+    let want = want.clone();
     let all = units(&want);
     g.total = all.len();
     let got = vectors::generate();
