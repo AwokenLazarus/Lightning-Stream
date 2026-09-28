@@ -6,8 +6,17 @@
 //!
 //! Budgets: per call (`max_price`), per channel (`capacity`), overall (`budget_sats`) and per day
 //! (`daily_budget`).
+//!
+//! The channel book lives in memory unless a [`ClientLedger`] is injected ([`Client::with_ledger`],
+//! AGP-035): then every paid call, close and rollover saves the channels it touched, and a new
+//! process restores them. A provider [`Ledger`](crate::ledger::Ledger) and a client ledger are
+//! independent values, so one process can sell (a [`Provider`](crate::provider::Provider)) and buy
+//! (a [`Client`]) at once.
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
@@ -97,6 +106,189 @@ pub struct ClientChannel {
     pub receipts: Vec<Value>,
 }
 
+/// Receipts kept per channel record in a [`ClientLedger`] (the newest; memory keeps them all).
+pub const LEDGER_RECEIPTS: usize = 16;
+
+impl ClientChannel {
+    /// The channel's ledger record. A payer key held here is written as its secret (hex): keep
+    /// such a ledger private, or let a signer hold the keys (`"key": "signer"`).
+    pub fn to_json(&self) -> Value {
+        let key = match self.payer.secret() {
+            Some(sk) => hex::encode(sk.secret_bytes()),
+            None => "signer".into(),
+        };
+        let pending = self.pending_cond.as_ref().map(|c| json!({"hash": hex::encode(c.hash), "cipher": hex::encode(&c.cipher), "amount": c.amount}));
+        let from = self.receipts.len().saturating_sub(LEDGER_RECEIPTS);
+        json!({"origin": self.origin, "params": self.payer.params.to_json(), "signed": self.payer.signed, "key": key,
+               "accepted": self.accepted, "refund_hex": self.refund_hex, "auth_key": hex::encode(self.auth_key), "price": self.price,
+               "slack_msat": self.slack_msat, "seq": self.seq, "spent_msat": self.spent_msat, "last_sig": self.last_sig,
+               "pending_cond": pending, "acked_cum": self.acked_cum, "receipts": &self.receipts[from..]})
+    }
+
+    /// Inverse of [`to_json`](Self::to_json). A `"signer"` record needs the signer that holds its
+    /// key (the channel is already attached there).
+    pub fn from_json(v: &Value, signer: Option<&Arc<dyn StateSigner>>) -> Result<Self> {
+        let bad = |k: &str| ChannelError::new("ledger_error", format!("client channel record: {k}"));
+        let s = |k: &str| v.get(k).and_then(Value::as_str).ok_or_else(|| bad(k));
+        let n = |k: &str| v.get(k).and_then(Value::as_u64).ok_or_else(|| bad(k));
+        let h = |x: &str, k: &str| hex::decode(x).map_err(|_| bad(k));
+        let params = ChannelParams::from_json(v.get("params").ok_or_else(|| bad("params"))?)?;
+        let mut payer = match s("key")? {
+            "signer" => Payer::with_backend(params, signer.ok_or_else(|| ChannelError::new("no_signer", "this channel's key is in a signer: call with_signer before with_ledger"))?.clone()),
+            k => Payer::new(params, SecretKey::from_slice(&h(k, "key")?).map_err(|_| bad("key"))?)?,
+        };
+        payer.signed = n("signed")?;
+        let pending_cond = match v.get("pending_cond") {
+            Some(Value::Null) | None => None,
+            Some(c) => Some(PendingCond {
+                hash: h(c.get("hash").and_then(Value::as_str).unwrap_or(""), "pending_cond.hash")?.try_into().map_err(|_| bad("pending_cond.hash"))?,
+                cipher: h(c.get("cipher").and_then(Value::as_str).unwrap_or(""), "pending_cond.cipher")?,
+                amount: c.get("amount").and_then(Value::as_u64).ok_or_else(|| bad("pending_cond.amount"))?,
+            }),
+        };
+        Ok(Self {
+            payer,
+            origin: s("origin")?.into(),
+            accepted: v.get("accepted").cloned().unwrap_or(Value::Null),
+            refund_hex: s("refund_hex")?.into(),
+            auth_key: h(s("auth_key")?, "auth_key")?.try_into().map_err(|_| bad("auth_key"))?,
+            price: n("price")?,
+            slack_msat: n("slack_msat")?,
+            seq: n("seq")?,
+            spent_msat: n("spent_msat")?,
+            last_sig: s("last_sig")?.into(),
+            pending_cond,
+            acked_cum: n("acked_cum")?,
+            receipts: v.get("receipts").and_then(Value::as_array).cloned().unwrap_or_default(),
+        })
+    }
+}
+
+/// Where a [`Client`] keeps its channel book (AGP-035). Records are JSON under string keys:
+/// `"book"` (the budget counters), `"chan <origin>"` and `"rolled <origin>"` (a channel replaced by
+/// a rollover, until its successor is opened); `null` removes a key. Implement it over any store;
+/// [`FileClientLedger`] and [`MemoryClientLedger`] are provided.
+pub trait ClientLedger: Send + Sync {
+    /// The latest record per key (no `null`s), in the order the keys were first saved.
+    fn load(&self) -> Result<Vec<(String, Value)>>;
+    /// Save these records together, durably before returning.
+    fn save(&self, records: &[(String, Value)]) -> Result<()>;
+}
+
+/// A [`ClientLedger`] in memory (tests, or a caller that persists [`Client::channels`] itself).
+#[derive(Debug, Default)]
+pub struct MemoryClientLedger(Mutex<indexmap::IndexMap<String, Value>>);
+
+impl ClientLedger for MemoryClientLedger {
+    fn load(&self) -> Result<Vec<(String, Value)>> {
+        Ok(self.0.lock().unwrap_or_else(|p| p.into_inner()).iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+    }
+
+    fn save(&self, records: &[(String, Value)]) -> Result<()> {
+        let mut m = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        for (k, v) in records {
+            if v.is_null() {
+                m.shift_remove(k);
+            } else {
+                m.insert(k.clone(), v.clone());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A [`ClientLedger`] file: JSON lines `{"k": key, "v": record}`, appended and fsynced per save,
+/// replayed and compacted on open (like the provider's [`Ledger`](crate::ledger::Ledger)). Created
+/// mode 0600 on Unix: records of channels whose keys this client holds carry the payer secret.
+#[derive(Debug)]
+pub struct FileClientLedger {
+    path: PathBuf,
+    file: Mutex<File>,
+}
+
+fn ledger_io(e: std::io::Error) -> ChannelError {
+    ChannelError::new("ledger_error", e.to_string())
+}
+
+fn private_file(path: &Path, append: bool) -> std::io::Result<File> {
+    let mut o = OpenOptions::new();
+    if append {
+        o.append(true).create(true);
+    } else {
+        o.write(true).create(true).truncate(true);
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    o.open(path)
+}
+
+impl FileClientLedger {
+    /// Replay and compact the log at `path` (created if missing).
+    pub fn open(path: &Path) -> Result<Self> {
+        let mut recs: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
+        if path.exists() {
+            for line in BufReader::new(File::open(path).map_err(ledger_io)?).lines() {
+                let Ok(line) = line else { break };
+                let Ok(v) = crate::json::parse(&line) else { continue };  // a torn last line
+                let (Some(k), Some(r)) = (v.get("k").and_then(Value::as_str), v.get("v")) else { continue };
+                if r.is_null() {
+                    recs.shift_remove(k);
+                } else {
+                    recs.insert(k.to_string(), r.clone());
+                }
+            }
+        }
+        if let Some(d) = path.parent() {
+            std::fs::create_dir_all(d).map_err(ledger_io)?;
+        }
+        let tmp = path.with_extension("tmp");
+        {
+            let mut f = private_file(&tmp, false).map_err(ledger_io)?;
+            for (k, v) in &recs {
+                writeln!(f, "{}", crate::json::dumps_compact(&json!({"k": k, "v": v}))).map_err(ledger_io)?;
+            }
+            f.sync_all().map_err(ledger_io)?;
+        }
+        std::fs::rename(&tmp, path).map_err(ledger_io)?;
+        if let Some(Ok(dir)) = path.parent().map(File::open) {
+            let _ = dir.sync_all();
+        }
+        Ok(Self { path: path.to_path_buf(), file: Mutex::new(private_file(path, true).map_err(ledger_io)?) })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl ClientLedger for FileClientLedger {
+    fn load(&self) -> Result<Vec<(String, Value)>> {
+        let mut recs: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
+        for line in BufReader::new(File::open(&self.path).map_err(ledger_io)?).lines() {
+            let Ok(line) = line else { break };
+            let Ok(v) = crate::json::parse(&line) else { continue };
+            let (Some(k), Some(r)) = (v.get("k").and_then(Value::as_str), v.get("v")) else { continue };
+            if r.is_null() {
+                recs.shift_remove(k);
+            } else {
+                recs.insert(k.to_string(), r.clone());
+            }
+        }
+        Ok(recs.into_iter().collect())
+    }
+
+    fn save(&self, records: &[(String, Value)]) -> Result<()> {
+        let mut buf = String::new();
+        for (k, v) in records {
+            buf.push_str(&crate::json::dumps_compact(&json!({"k": k, "v": v})));
+            buf.push('\n');
+        }
+        let mut f = self.file.lock().unwrap_or_else(|p| p.into_inner());
+        f.write_all(buf.as_bytes()).map_err(ledger_io)?;
+        f.sync_data().map_err(ledger_io)
+    }
+}
+
 /// The payer SDK.
 pub struct Client {
     pub cfg: ClientConfig,
@@ -113,6 +305,8 @@ pub struct Client {
     pub pending_rolled: HashMap<String, ClientChannel>,
     /// AGP-027: where the payer keys live (B2's signer). `None`: this client holds them.
     signer: Option<Arc<dyn StateSigner>>,
+    /// AGP-035: where the channel book is saved. `None`: memory only.
+    ledger: Option<Box<dyn ClientLedger>>,
 }
 
 fn now() -> u64 {
@@ -143,7 +337,52 @@ impl Client {
     pub fn new(cfg: ClientConfig, transport: Box<dyn Transport>, wallet: Box<dyn Wallet>,
                height: HeightFn) -> Self {
         Self { cfg, transport, wallet, height, channels: HashMap::new(), opened_sats: 0, day_spent: 0, day_start: now(), on_refund: None,
-               pending_rolled: HashMap::new(), signer: None }
+               pending_rolled: HashMap::new(), signer: None, ledger: None }
+    }
+
+    /// Keep the channel book in `ledger` (AGP-035): restore what it holds, then save the channels
+    /// each paid call, close and rollover touches. Call [`with_signer`](Self::with_signer) first
+    /// when the payer keys live in a signer.
+    pub fn with_ledger(mut self, ledger: Box<dyn ClientLedger>) -> Result<Self> {
+        for (k, v) in ledger.load()? {
+            let n = |f: &str| v.get(f).and_then(Value::as_u64).unwrap_or(0);
+            if k == "book" {
+                (self.opened_sats, self.day_spent, self.day_start) = (n("opened_sats"), n("day_spent"), n("day_start"));
+            } else if let Some(o) = k.strip_prefix("chan ") {
+                self.channels.insert(o.to_string(), ClientChannel::from_json(&v, self.signer.as_ref())?);
+            } else if let Some(o) = k.strip_prefix("rolled ") {
+                self.pending_rolled.insert(o.to_string(), ClientChannel::from_json(&v, self.signer.as_ref())?);
+            }
+        }
+        self.ledger = Some(ledger);
+        Ok(self)
+    }
+
+    /// Save the budget counters and `origin`'s channels (every channel when `None`) to the
+    /// injected ledger; a no-op without one. The SDK calls it after each operation; call it after
+    /// changing [`channels`](Self::channels) by hand.
+    pub fn persist(&self, origin: Option<&str>) -> Result<()> {
+        let Some(l) = &self.ledger else { return Ok(()) };
+        let mut recs = vec![("book".to_string(), json!({"opened_sats": self.opened_sats, "day_spent": self.day_spent, "day_start": self.day_start}))];
+        let rec = |c: Option<&ClientChannel>| c.map(ClientChannel::to_json).unwrap_or(Value::Null);
+        match origin {
+            Some(o) => {
+                recs.push((format!("chan {o}"), rec(self.channels.get(o))));
+                recs.push((format!("rolled {o}"), rec(self.pending_rolled.get(o))));
+            }
+            None => {
+                recs.extend(self.channels.iter().map(|(o, c)| (format!("chan {o}"), c.to_json())));
+                recs.extend(self.pending_rolled.iter().map(|(o, c)| (format!("rolled {o}"), c.to_json())));
+            }
+        }
+        l.save(&recs)
+    }
+
+    /// Save after an operation on `origin`: the operation's own error wins over the ledger's.
+    fn saved<T>(&self, origin: &str, r: Result<T>) -> Result<T> {
+        let p = self.persist(Some(origin));
+        let v = r?;
+        p.map(|_| v)
     }
 
     /// Keep every payer key in `signer` (B2's signer process): the client asks it for keys,
@@ -333,6 +572,11 @@ impl Client {
 
     /// One paid HTTP request. Opens a channel on the first 402 from an origin.
     pub fn request(&mut self, method: &str, url: &str, body: &[u8]) -> Result<HttpResponse> {
+        let r = self.request_inner(method, url, body);
+        self.saved(&split_url(url).0, r)
+    }
+
+    fn request_inner(&mut self, method: &str, url: &str, body: &[u8]) -> Result<HttpResponse> {
         let (origin, path) = split_url(url);
         let mut hdrs = vec![];
         if self.channels.contains_key(&origin) {
@@ -409,6 +653,11 @@ impl Client {
 
     /// Cooperative close; in postpay the final state pays exactly what is owed.
     pub fn close(&mut self, origin: &str) -> Result<Value> {
+        let r = self.close_inner(origin);
+        self.saved(origin, r)
+    }
+
+    fn close_inner(&mut self, origin: &str) -> Result<Value> {
         let pl = self.payload(origin, 0, "", "", b"")?;
         let ch = &self.channels[origin];
         let chan = ch.payer.params.channel_id();
@@ -421,6 +670,11 @@ impl Client {
     /// channel with the rest; the provider co-signs and broadcasts it. Returns the provider's
     /// answer (`nextChan`, `nextCapacity`); call [`Client::open_rolled`] once it confirms.
     pub fn rollover(&mut self, origin: &str) -> Result<Value> {
+        let r = self.rollover_inner(origin);
+        self.saved(origin, r)
+    }
+
+    fn rollover_inner(&mut self, origin: &str) -> Result<Value> {
         let h = (self.height)()?;
         let ch = self.channels.get(origin).ok_or_else(|| ChannelError::code("no_channel"))?;
         let ex = ch.accepted.get("extra").cloned().unwrap_or(Value::Null);
@@ -466,6 +720,11 @@ impl Client {
 
     /// Register the rolled-over channel with the provider (its funding must have confirmed).
     pub fn open_rolled(&mut self, origin: &str) -> Result<Value> {
+        let r = self.open_rolled_inner(origin);
+        self.saved(origin, r)
+    }
+
+    fn open_rolled_inner(&mut self, origin: &str) -> Result<Value> {
         let ch = &self.channels[origin];
         let p = &ch.payer.params;
         let c = json!({"txid": p.funding_txid(), "vout": p.funding_vout(), "capacity": p.capacity, "expiry": p.expiry,
@@ -483,6 +742,11 @@ impl Client {
     /// Pay-on-preimage: sign a hash-locked increment, receive the key, check it, and fold the
     /// increment into a plain state. Returns the response and the decrypted deliverable.
     pub fn request_conditional(&mut self, method: &str, url: &str, body: &[u8]) -> Result<(HttpResponse, Vec<u8>)> {
+        let r = self.request_conditional_inner(method, url, body);
+        self.saved(&split_url(url).0, r)
+    }
+
+    fn request_conditional_inner(&mut self, method: &str, url: &str, body: &[u8]) -> Result<(HttpResponse, Vec<u8>)> {
         let (origin, path) = split_url(url);
         let r = self.transport.request(method, url, body, &[])?;
         if r.status != 402 {

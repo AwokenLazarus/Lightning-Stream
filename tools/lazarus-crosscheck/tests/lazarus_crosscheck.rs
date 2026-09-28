@@ -1,5 +1,6 @@
 //! Cross-check of xbt-primitives' header/PoW code against the pool's own Rust, `lazarus-protocol`
-//! (~/Bitcoin/lazarus/protocol, a read-only path dev-dependency). lazarus-protocol implements the
+//! (~/Bitcoin/lazarus/protocol, a read-only path dev-dependency of this standalone crate, outside the
+//! workspace so a clean checkout never needs it). lazarus-protocol implements the
 //! ASIC profile 0 the pool mines; every profile-0 header, random or captured from Knots, must hash
 //! the same, and compact targets and merkle roots must agree.
 use lazarus_protocol::pow as lz;
@@ -47,7 +48,8 @@ fn profile0_pow_hash_matches_lazarus_protocol() {
 
 #[test]
 fn captured_knots_headers_match_lazarus_protocol() {
-    let v: serde_json::Value = xbt402::json::parse(&std::fs::read_to_string(xbt402_interop::vectors_dir().join("blake2b_regtest.json")).unwrap()).unwrap();
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vectors/blake2b_regtest.json");
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     let mut n = 0;
     for h in v["headers"].as_array().unwrap() {
         let raw = hex::decode(h["header"].as_str().unwrap()).unwrap();

@@ -14,7 +14,3 @@ hex.workspace = true
 # the Rust B2 signer behind the Rust RoutePayer (xbt402-route-payer --signer-sock, AGP-034)
 xbt-signer.workspace = true
 
-[dev-dependencies]
-# read-only cross-check of the header/PoW code against the pool's Rust (AGP-025 spec: a path
-# dev-dependency on ~/Bitcoin/lazarus/protocol; nothing is written there)
-lazarus-protocol = { path = "../../../../Bitcoin/lazarus/protocol" }
