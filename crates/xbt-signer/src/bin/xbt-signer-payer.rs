@@ -2,7 +2,9 @@
 //! `RemoteSigner` over the B2 socket. Pays `--calls` requests to `--url`, optionally closes, and
 //! prints a JSON report.
 //!   xbt-signer-payer --sock SOCK --url URL --network NET [--calls 10] [--capacity 10000]
-//!                    [--max-price 1000] [--expiry-blocks 1008] [--close]
+//!                    [--max-price 1000] [--expiry-blocks 1008] [--min-conf 1] [--close]
+//! The funding goes through the signer's `fund`; the payer then waits (up to 180 s) until the
+//! signer's node shows `--min-conf` confirmations before it posts the open (B2's P2).
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -18,6 +20,29 @@ fn arg(args: &[String], name: &str) -> Option<String> {
 
 fn num(args: &[String], name: &str, d: u64) -> u64 {
     arg(args, name).and_then(|v| v.parse().ok()).unwrap_or(d)
+}
+
+/// The signer's `fund`, then a wait for the funding's confirmations (the provider needs minConf).
+struct Funding {
+    remote: RemoteSigner,
+    min_conf: u64,
+}
+
+impl xbt402::client::Wallet for Funding {
+    fn fund(&self, address: &str, sats: u64) -> xbt402::Result<(String, u32)> {
+        let (txid, vout) = xbt402::client::Wallet::fund(&self.remote, address, sats)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+        loop {
+            let v = self.remote.client.call("tx_confirmations", json!({"txid": txid, "vout": vout}))?;
+            if v["confirmations"].as_u64().unwrap_or(0) >= self.min_conf {
+                return Ok((txid, vout));
+            }
+            if std::time::Instant::now() > deadline {
+                return Err(xbt402::ChannelError::new("funding_unconfirmed", "the funding did not confirm in time"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    }
 }
 
 fn main() {
@@ -36,7 +61,7 @@ fn main() {
         Ok(v.get("height").and_then(Value::as_u64).unwrap_or(0) as u32)
     });
     let signer: Arc<dyn StateSigner> = Arc::new(remote.clone());
-    let mut client = Client::new(cfg, Box::new(UreqTransport::default()), Box::new(remote.clone()), height).with_signer(signer);
+    let mut client = Client::new(cfg, Box::new(UreqTransport::default()), Box::new(Funding { remote: remote.clone(), min_conf: num(&args, "--min-conf", 1) }), height).with_signer(signer);
     let (origin, _) = split_url(&url);
     let mut calls = vec![];
     let mut report = json!({"ok": false});

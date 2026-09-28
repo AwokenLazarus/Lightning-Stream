@@ -1,0 +1,115 @@
+# xbt-signer
+
+B2's agent-wallet signer in Rust (AGP-027). One process holds every key. The model-facing process
+(B2's Python MCP server, or a Rust payer through `client::RemoteSigner`) only calls its socket. The
+signer carries:
+
+- B2's policy engine;
+- sealed hot and channel keys;
+- the write-ahead channel open (P1) and the minConf wait (P2);
+- refund custody at expiry (the watcher);
+- the AGP-022 close-change retry;
+- the hash-chained signature log, anchored with B2's witness.
+
+It uses B2's socket protocol (`b2/docs/B2_SIGNER_API.md`) and B2's on-disk formats, so either signer
+runs behind either client and opens the other's files.
+
+Reference: B2 `agp-next2` `04c3f56` (`agentwallet/signer.py`, `channels.py`, `hot.py`, `keystore.py`,
+`sigaudit.py`, `anchor.py`, `policy.py`, `routing.py`, `xbt402.py`, `stream.py`, `netparams.py`).
+
+## Run
+
+```bash
+cargo build -j2 --release -p xbt-signer --bins
+B2_HOT_KEYFILE=/secure/hot.key B2_ANCHOR_SOCK=/run/witness/w.sock B2_RPCPORT=8332 B2_DATADIR=~/.bitcoin \
+  target/release/xbt-signer --root ~/wallet          # policy.json in ~/wallet, state in ~/wallet/.run
+target/release/xbt-signer --root ~/wallet --check    # every start-up check (chain, P3, keys, anchor), then exit
+target/release/xbt-anchor-witness serve --store /var/lib/witness --sock /run/witness/w.sock   # its own user
+target/release/xbt-anchor-witness check --store /var/lib/witness --log ~/wallet/.run/signatures.jsonl
+```
+
+The environment is B2's:
+
+- `B2_ROOT`, `B2_DATADIR`, `B2_RPCPORT`, `B2_WALLET`;
+- `B2_CHAIN` (must agree with the node);
+- `B2_SIGNER_SOCK`: a path, or `tcp://127.0.0.1:PORT` (see Portability);
+- `B2_HOT_KEYFILE` or `B2_HOT_PASSPHRASE`: exactly one; the passphrase is removed from the environment once read;
+- `B2_HOT_ALLOW_PLAINTEXT=1`: tests only;
+- `B2_ANCHOR_SOCK`, `B2_WATCH_INTERVAL`, `B2_HOT_SCAN`, `B2_CALLS_JSONL`, `B2_BODY_DIR`, `B2_BODY_CAP`.
+
+## Socket methods
+
+### B2's methods
+
+Every B2 method listed below behaves as in B2:
+
+- `balance`, `quote_payment`, `pay`, `approve`, `history`;
+- `health`, `chain_backend`, `channels`, `hot_address`, `notice_hot_txid`, `fund`;
+- `open_channel`, `sign_state`, `xbt402_pay`;
+- `xbt402_request_auth`, `xbt402_sign_state_a3`;
+- `xbt402_sign_state_adaptor`, `xbt402_resolve_lock`, `xbt402_void_lock`, `xbt402_adopt_lock`, `xbt402_recover_lock`;
+- `routing_status`, `close_channel`, `xbt402_refund` (alias `refund_channel`), `watch_tick`;
+- `rotate_hot_key`, `sweep_hot`, `signatures`, `anchor_now`, `anchor_status`, `hot_reconcile`.
+
+`xbt402_pay` includes streamed results (`xbt402-merkle-v1`).
+
+### New for an external payer
+
+These are B1's `ChannelSigner` interface, so a client never holds a payer key. Each one is
+policy-checked where it raises the signed amount.
+
+| method | params | result |
+|---|---|---|
+| `xbt402_new_key` | `origin` | `{pub}`: a fresh payer key, sealed on disk at once as `pending:<origin>` |
+| `xbt402_attach` | `origin`, `params` (ChannelParams `to_dict`) | `{chan, dest}`: binds the issued key to the funded channel (open at once); `<origin>/next` is a rollover's successor |
+| `xbt402_sign_state` (= `sign_state`) | `chan` or `dest`, `cum` | policy on `cum - used`, then `{verdict, chan, cum, sig}` |
+| `xbt402_sign_rollover` | `chan`, `amount`, `next_spk`, `next_capacity` | policy on the increase, then `{sig}` (audit kind `channel_rollover`) |
+| `xbt402_sign_conditional` | `chan`, `uncond`, `hash`, `amount`, `csv_delta` | policy on `uncond + amount - used`, then `{sig}` |
+| `xbt402_sign_close` | `chan` | `{sig}` (close authorisation) |
+| `xbt402_sign_refund` | `chan` | `{hex, expiry, to}`: the CLTV refund, always to the hot key |
+| `xbt402_mark_closed` | `chan`, `txid` | the channel's record after its change was learned (AGP-022) |
+| `tx_confirmations` | `txid`, `vout` | `{confirmations, height}` (read-only; for the payer's P2 wait) |
+
+`client::RemoteSigner` implements `xbt402::signer::StateSigner` and `xbt402::client::Wallet` over
+these methods: `Client::new(..).with_signer(Arc::new(RemoteSigner::new(sock)))`.
+
+## Not ported
+
+Each of these answers that it is unavailable:
+
+- **The forward rail** (`forward.py`): `forward_status` answers `ported: false`, and `forward_recover`
+  is refused. `xbt402_pay` refuses an offer with `extra.forward` before any payment
+  (`deny/forward_disabled`).
+- **The CSV treasury and the presigned vault**: `fund_treasury`, `recover_treasury` and
+  `recover_vault` answer `ok: false`, and `balance` reports `vault`/`treasury` as null.
+- **The Electrum light backend** (AGP-024). With `B2_CHAIN_BACKEND=electrum` the signer refuses to
+  start; AGP-028 owns Electrum.
+- **The adaptor-signature crypto** (B1 `adaptor.py`; AGP-026 is porting it). The routing policy, the
+  write-ahead lock book, resolve, void, adopt and recover are all here, behind the
+  `channels::AdaptorScheme` trait (`presign`, `extract`). Without an implementation,
+  `xbt402_sign_state_adaptor` answers `deny/adaptor_unavailable`. The tests use a labelled test
+  double.
+
+## Portability
+
+The library has no platform-specific dependencies:
+
+- No OpenSSL: HTTP is `ureq` with rustls/ring, the workspace's existing choice.
+- No async runtime: blocking threads, like B2.
+- File modes (0600/0640) are applied under `cfg(unix)` (`fsx.rs`).
+- The socket (`ipc.rs`) is a Unix-domain socket on Unix, which is B2's protocol and is
+  access-controlled by its 0600 mode. On every platform it can also be `tcp://127.0.0.1:PORT`,
+  bound to loopback only.
+
+`cargo check -p xbt-signer --bins` passes for:
+
+- Linux on x86_64, aarch64, armv7 and riscv64 (glibc) and on x86_64, aarch64 and armv7 (musl);
+- macOS on x86_64 and aarch64;
+- Windows on x86_64 (gnu).
+
+The C compiler for libsecp256k1 and ring is zig. An aarch64 binary links to 4.6 MB.
+
+**What cannot be fully portable:** on Windows, std has no Unix sockets, so the signer listens on
+loopback TCP. Any local user can connect to it, whereas a 0600 socket file restricts it to the
+signer's user. Run it on a single-user host or firewall the port per user, until a named-pipe
+transport is added. File modes are no-ops there; protect the run directory with ACLs.

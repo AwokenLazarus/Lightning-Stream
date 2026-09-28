@@ -282,6 +282,12 @@ impl Signer {
             "health" => json!({"ok": true, "wallet": self.node.wallet(), "chain": self.chain, "hrp": self.hrp, "mining": self.mining,
                                "implementation": "xbt-signer (Rust)"}),
             "chain_backend" => json!({"backend": "rpc"}),
+            // read-only: an external payer waits for its funding's minConf (P2) through this
+            "tx_confirmations" => {
+                let r = self.node.call("gettxout", json!([s("txid"), py_int(p.get("vout")).unwrap_or(0), true]))?;
+                json!({"confirmations": if r.is_null() { Value::Null } else { r.get("confirmations").cloned().unwrap_or(0.into()) },
+                       "height": self.height_safe()})
+            }
             "channels" => sanitize(json!({"channels": self.book.list_public(), "height": self.height_safe()})),
             "hot_address" => sanitize(self.hot_status(false)),
             "notice_hot_txid" => {
