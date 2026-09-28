@@ -178,7 +178,7 @@ fn payee_pays_v12_close_fee_comes_out_of_the_payee() {
     assert_eq!(r, json!({"chan": p.channel_id(), "txid": close.txid(), "cum": "1500", "unpaidMsat": "0",
                          "payeeFee": "600", "payeeNet": "900"}));
     let chan = p.channel_id();
-    let sig = hex::encode(xbt_primitives::ecdsa::sign(c.channels[O].payer.secret(), &xbt402::wire::close_message(&chan)));
+    let sig = hex::encode(xbt_primitives::ecdsa::sign(c.channels[O].payer.secret().unwrap(), &xbt402::wire::close_message(&chan)));
     let acc = prov.requirements(150);
     let s = prov.facilitator_settle(&json!({"x402Version": 2, "paymentPayload": {"x402Version": 2, "accepted": acc, "payload": {"chan": chan, "sig": sig}},
                                             "paymentRequirements": acc}));
