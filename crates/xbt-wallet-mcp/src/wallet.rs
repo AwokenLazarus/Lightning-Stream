@@ -376,12 +376,17 @@ pub struct Wallet {
     pub sock: PathBuf,
     pub timeout: Duration,
     pub mode: PayerMode,
+    /// AGP-039 `XBT_MCP_APPROVAL_WAIT_S`: how long an over-threshold `xbt402_pay` waits for the
+    /// human's approval (in the wallet's web UI) before it answers `needs_human`. 0 (the default) is
+    /// B2's behaviour: answer at once.
+    pub approval_wait: Duration,
     local: Mutex<Option<LocalPayer>>,
 }
 
 impl Wallet {
     pub fn new(sock: PathBuf, mode: PayerMode) -> Self {
-        Self { sock, timeout: default_timeout(), mode, local: Mutex::new(None) }
+        let wait = std::env::var("XBT_MCP_APPROVAL_WAIT_S").ok().and_then(|v| v.parse::<f64>().ok()).filter(|w| w.is_finite() && *w > 0.0).unwrap_or(0.0);
+        Self { sock, timeout: default_timeout(), mode, local: Mutex::new(None), approval_wait: Duration::from_secs_f64(wait.min(86_400.0)) }
     }
 
     /// B2's environment: `B2_SIGNER_SOCK` / `B2_ROOT`, `B2_SIGNER_TIMEOUT`, plus `XBT_MCP_PAYER`.
@@ -396,6 +401,46 @@ impl Wallet {
 
     pub fn signer(&self, method: &str, params: &Value) -> Result<Value, String> {
         signer_call(&self.sock, self.timeout, method, params)
+    }
+
+    /// The signer's `xbt402_pay`; an over-threshold call waits up to `approval_wait` for the human.
+    /// Once the human approved in the UI the signer holds a one-time grant for exactly this call
+    /// (url, method, max_sats), and the same call again pays under it. A deny or expiry answers the
+    /// original `needs_human` with `approval_state`. The model never sees or needs a signature.
+    fn xbt402_pay_waiting(&self, params: &Map<String, Value>) -> Result<Value, String> {
+        let args = Value::Object(params.clone());
+        let first = self.signer("xbt402_pay", &args)?;
+        if self.approval_wait.is_zero() || first.get("verdict").and_then(Value::as_str) != Some("needs_human") {
+            return Ok(first);
+        }
+        let Some(token) = first.get("approval_token").and_then(Value::as_str).map(str::to_string) else { return Ok(first) };
+        let until = std::time::Instant::now() + self.approval_wait;
+        let mut state = String::from("pending");
+        while std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(500));
+            state = self.signer("approval_status", &json!({"token": token}))?.get("state").and_then(Value::as_str).unwrap_or("unknown").to_string();
+            if state == "approved" {
+                let mut paid = self.signer("xbt402_pay", &args)?;
+                // a new channel's first call can be "pending" (funding waits for a block): the grant
+                // stays until it is used, so keep calling while the wait lasts
+                while paid.get("verdict").and_then(Value::as_str) == Some("pending") && std::time::Instant::now() < until {
+                    std::thread::sleep(Duration::from_secs(1));
+                    paid = self.signer("xbt402_pay", &args)?;
+                }
+                if let Value::Object(m) = &mut paid {
+                    m.insert("waited_for_human".into(), Value::Bool(true));
+                }
+                return Ok(paid);
+            }
+            if state != "pending" {
+                break;
+            }
+        }
+        let mut out = first;
+        if let Value::Object(m) = &mut out {
+            m.insert("approval_state".into(), state.into());
+        }
+        Ok(out)
     }
 
     fn with_local<T>(&self, f: impl FnOnce(&mut LocalPayer) -> T) -> Result<T, String> {
@@ -424,6 +469,7 @@ impl Wallet {
                     None => self.signer(name, &Value::Object(params))?,
                 }
             }
+            "xbt402_pay" => self.xbt402_pay_waiting(&params)?,
             _ => self.signer(name, &Value::Object(params))?,
         };
         pack(result)

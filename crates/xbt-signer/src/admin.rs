@@ -46,6 +46,17 @@ fn outcome(state: &str, extra: Value) -> Value {
     v
 }
 
+/// The values in force, defaults included (the UI shows them for keys policy.json leaves out).
+pub fn effective(c: &PolicyConfig) -> Value {
+    json!({"max_per_tx_sats": c.max_per_tx_sats, "daily_budget_sats": c.daily_budget_sats, "weekly_budget_sats": c.weekly_budget_sats,
+           "per_counterparty_cap_sats": c.per_counterparty_cap_sats, "velocity_max": c.velocity_max, "velocity_window_s": c.velocity_window_s,
+           "human_threshold_sats": c.human_threshold_sats, "split_window_s": c.split_window_s, "approval_ttl_s": c.approval_ttl_s,
+           "channel_expiry_blocks": c.channel_expiry_blocks, "treasury_csv": c.treasury_csv, "refund_enabled": c.refund_enabled,
+           "refund_margin_blocks": c.refund_margin_blocks, "hot_balance_cap_sats": c.hot_balance_cap_sats, "anchor_interval_s": c.anchor_interval_s,
+           "anchor_required": c.anchor_required, "open_wait_s": c.open_wait_s, "open_retry_s": c.open_retry_s, "close_fee_max_sats": c.close_fee_max_sats,
+           "regtest_mine": c.regtest_mine, "forward": c.forward})
+}
+
 impl Signer {
     fn policy_path(&self) -> std::path::PathBuf {
         self.root.join("policy.json")
@@ -95,8 +106,11 @@ impl Signer {
     }
 
     /// Restart-only keys whose value on disk differs from the one this process started with.
+    /// Compared as the values in force (defaults included), so writing a default out is no change.
     fn pending_restart(&self, raw: &Value) -> Vec<String> {
-        RESTART_KEYS.iter().filter(|k| raw.get(**k) != self.boot_policy.get(**k)).map(|k| k.to_string()).collect()
+        let (Ok(now), Ok(boot)) = (PolicyConfig::from_value(raw), PolicyConfig::from_value(&self.boot_policy)) else { return vec![] };
+        let (a, b) = (effective(&now), effective(&boot));
+        RESTART_KEYS.iter().filter(|k| a.get(**k) != b.get(**k)).map(|k| k.to_string()).collect()
     }
 
     fn check_sig(&self, msg: &[u8], p: &Value, expiry: i64) -> Option<Value> {
@@ -179,7 +193,7 @@ impl Signer {
         let (errors, warnings) = validate_policy(&raw);
         Ok(json!({"policy": raw, "text": text, "sha256": sha256_hex(text.as_bytes()), "human_key": hex::encode(self.human_key()),
                   "restart_keys": RESTART_KEYS, "pending_restart": self.pending_restart(&raw), "errors": errors, "warnings": warnings,
-                  "routing": self.routing.policy().public(), "hot_cap_sats": self.hot.cap_sats()}))
+                  "routing": self.routing.policy().public(), "hot_cap_sats": self.hot.cap_sats(), "effective": effective(&self.config())}))
     }
 
     /// Validate a proposed policy and return the exact text and message the human signs.
