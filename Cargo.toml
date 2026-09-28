@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/xbt-primitives", "crates/xbt402", "crates/xbt402-interop", "crates/xbt-signer", "crates/xbt-electrum", "crates/xbt-wallet-mcp"]
+members = ["crates/xbt-primitives", "crates/xbt402", "crates/xbt402-interop", "crates/xbt-signer", "crates/xbt-electrum", "crates/xbt-wallet-mcp", "crates/xbt-svc"]
 
 [workspace.package]
 version = "0.1.0"
@@ -27,6 +27,7 @@ xbt-primitives = { path = "crates/xbt-primitives" }
 xbt402 = { path = "crates/xbt402" }
 xbt-signer = { path = "crates/xbt-signer" }
 xbt-electrum = { path = "crates/xbt-electrum" }
+xbt-svc = { path = "crates/xbt-svc" }
 
 [profile.release]
 opt-level = 3

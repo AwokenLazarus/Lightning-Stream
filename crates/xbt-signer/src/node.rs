@@ -51,18 +51,28 @@ pub struct KnotsRpc {
     pub datadir: PathBuf,
     pub wallet_name: String,
     pub port: String,
+    pub host: String,
+    pub auth_file: Option<PathBuf>,
     allow_generate: AtomicBool,
     agent: ureq::Agent,
 }
 
 impl KnotsRpc {
-    /// `B2_RPCPORT` (default 19443) on 127.0.0.1.
+    /// `B2_RPCPORT` (default 19443) on `B2_RPCHOST` (default 127.0.0.1; a container reaches its node
+    /// by service name). Credentials: `B2_RPCCOOKIE` (a file holding `user:password`, cookie format:
+    /// a node's cookie on a shared volume, or rpcauth credentials) or the cookie in `datadir`.
     pub fn new(datadir: &Path, wallet: &str) -> Self {
-        Self { datadir: datadir.into(), wallet_name: wallet.into(), port: std::env::var("B2_RPCPORT").unwrap_or_else(|_| "19443".into()),
+        let env = |k: &str| std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+        Self { datadir: datadir.into(), wallet_name: wallet.into(), port: env("B2_RPCPORT").unwrap_or_else(|| "19443".into()),
+               host: env("B2_RPCHOST").unwrap_or_else(|| "127.0.0.1".into()), auth_file: env("B2_RPCCOOKIE").map(PathBuf::from),
                allow_generate: AtomicBool::new(false), agent: ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build() }
     }
 
     fn cookie(&self) -> Result<String> {
+        if let Some(f) = &self.auth_file {
+            return std::fs::read_to_string(f).map(|t| t.trim().to_string())
+                .map_err(|e| err("rpc_error", format!("RPC credentials {}: {e}", f.display())));
+        }
         for c in [self.datadir.join("regtest").join(".cookie"), self.datadir.join(".cookie")] {
             if let Ok(t) = std::fs::read_to_string(&c) {
                 return Ok(t.trim().to_string());
@@ -82,7 +92,7 @@ impl Node for KnotsRpc {
             return Err(err("rpc_error", format!("signer refuses {method}: mining is for regtest only")));
         }
         let auth = format!("Basic {}", B64.encode(self.cookie()?));
-        let url = format!("http://127.0.0.1:{}/wallet/{}", self.port, self.wallet_name);
+        let url = format!("http://{}:{}/wallet/{}", self.host, self.port, self.wallet_name);
         let body = json!({"jsonrpc": "1.0", "id": "b2", "method": method, "params": params});
         let resp = match self.agent.post(&url).set("Authorization", &auth).set("Content-Type", "application/json").send_string(&body.to_string()) {
             Ok(r) => r,
