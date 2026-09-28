@@ -151,7 +151,7 @@ fn coerce(ty: Ty, v: &Value) -> Result<Value, (&'static str, &'static str)> {
             let f = n.as_f64().unwrap_or(0.0);
             if f.fract() != 0.0 {
                 Err(("int_from_float", "Input should be a valid integer, got a number with a fractional part"))
-            } else if f.abs() >= 9.223372036854775807e18 {
+            } else if f.abs() >= i64::MAX as f64 {
                 Err(("int_parsing_size", "Unable to parse input string as an integer, exceeded maximum size"))
             } else {
                 Ok(Value::from(f as i64))
