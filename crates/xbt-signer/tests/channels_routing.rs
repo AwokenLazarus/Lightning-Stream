@@ -1,7 +1,8 @@
 //! Channel budget and unacknowledged states (mirrors B2 tests/test_channel_budget.py,
 //! test_unacked_state.py, test_channel_policy.py), routing policy and adaptor locks (mirrors
-//! tests/test_routing.py, with a test-double adaptor scheme), and the external Rust payer over the
-//! signer socket (keys never in the client).
+//! tests/test_routing.py, with a test-double adaptor scheme and with xbt402's real one over the
+//! socket as an xbt402 `RouteSigner`), and the external Rust payer over the signer socket (keys never
+//! in the client).
 mod common;
 
 use std::sync::atomic::Ordering;
@@ -10,7 +11,8 @@ use std::sync::Arc;
 use common::*;
 use serde_json::{json, Value};
 use xbt402::client::{Client, ClientConfig};
-use xbt402::signer::StateSigner;
+use xbt402::adaptor;
+use xbt402::signer::{RouteSigner, StateSigner};
 use xbt_primitives::secp256k1::{Scalar, SecretKey};
 use xbt_signer::channels::ChannelBook;
 use xbt_signer::client::RemoteSigner;
@@ -173,12 +175,82 @@ fn without_an_adaptor_implementation_routed_locks_are_refused() {
                                           "daily_budget_sats": 3000}}), false);
     rig.fund_hot(1, 12_000);
     let chan = rig.open()["chan"].as_str().unwrap().to_string();
-    let r = rig.call("xbt402_sign_state_adaptor", json!({"chan": chan, "cum": 1_146, "point": point(&secret("t")),
-                                                         "route": {"hub": PROVIDER, "amount": 594, "fee": 6}}));
-    assert_eq!(r["rule"], "adaptor_unavailable");
+    // the signer's default scheme is xbt402's adaptor (AGP-034); a RouteSigner built without one refuses
+    assert_eq!(rig.call("routing_status", json!({}))["adaptor"], "available");
+    let bare = xbt_signer::routing::RouteSigner::new(rig.s.book.clone(), rig.s.routing.policy.clone(), None, None, None);
+    let e = bare.sign_state_adaptor(&chan, 1_146, &point(&secret("t")), json!({"hub": PROVIDER, "amount": 594, "fee": 6})).unwrap_err();
+    assert_eq!(e.code, "adaptor_unavailable");
+    assert_eq!(bare.status()["adaptor"], "unavailable (AGP-026)");
     assert_eq!(rig.call("routing_status", json!({}))["policy"]["enabled"], true);
     let off = Rig::new(json!({}), false);
     assert_eq!(off.call("routing_status", json!({}))["policy"]["enabled"], false);
+}
+
+/// xbt402's RouteSigner over the socket with the real ECDSA adaptor: the pre-signature verifies
+/// against the channel's exact state under T1 = T + r·G, t comes back from t + r (the hub) and from
+/// a close's witness (recover, raw tx passed), void/adopt follow B2, and the routing policy decides
+/// before anything is signed.
+#[cfg(unix)]
+#[test]
+fn route_signer_over_the_socket_with_the_real_adaptor() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let rig = Rig::build(json!({"routing": {"hubs": {PROVIDER: {"max_fee_ppm": 5000, "max_fee_base_msat": 2000}}, "max_lock_sats": 2000,
+                                            "daily_budget_sats": 3000}}), false, "regtest", None);
+    rig.fund_hot(1, 12_000);
+    rig.open();
+    let sock = rig.dir.path().join("signer.sock");
+    let _srv = xbt_signer::server::spawn(rig.s.clone(), &sock, false).unwrap();
+    let remote = RemoteSigner::new(&sock);
+    let rs: &dyn RouteSigner = &remote;
+    let rec = rig.s.book.get(PROVIDER).unwrap();
+    let (chan, params) = (rec.chan.clone(), rec.params().unwrap());
+    let route = |amount: u64, fee: u64, id: &str| json!({"hub": PROVIDER, "amount": amount, "fee": fee, "lockId": id});
+    let pt = |t: &SecretKey| adaptor::enc(&adaptor::point_of(t));
+
+    // policy first: another hub, a fee over the cap; nothing is signed
+    let presigs = || rig.sigs().iter().filter(|x| x["kind"] == "adaptor_presig").count();
+    let t1s = secret("t1");
+    let bad = json!({"hub": "http://other.hub", "amount": 594, "fee": 6});
+    assert_eq!(rs.sign_state_adaptor(&chan, 1_146, &pt(&t1s), &bad).unwrap_err().code, "route_hub");
+    assert_eq!(rs.sign_state_adaptor(&chan, 1_146, &pt(&t1s), &route(594, 7, "L0")).unwrap_err().code, "route_fee_cap");
+    assert_eq!(presigs(), 0);
+
+    // lock 1: a real pre-signature of state(1146) under T + r·G, resolved by the hub's t + r
+    let l1 = rs.sign_state_adaptor(&chan, 1_146, &pt(&t1s), &route(594, 6, "L1")).unwrap();
+    let r1 = SecretKey::from_slice(&l1.tweak).unwrap();
+    let t1_point = adaptor::add(Some(&adaptor::point_of(&t1s)), Some(&adaptor::point_of(&r1))).unwrap();
+    assert_eq!(l1.point, adaptor::enc(&t1_point));
+    let z = params.sighash(&params.state_tx(1_146).unwrap()).unwrap();
+    assert!(adaptor::preverify(&params.payer_pub, &z, &t1_point, &l1.pre), "pre-verifies against the exact state");
+    assert_eq!(rs.sign_state_adaptor(&chan, 1_446, &pt(&t1s), &route(294, 5, "Lx")).unwrap_err().code, "lock_outstanding");
+    assert_eq!(rs.resolve_lock(&chan, &secret("wrong").secret_bytes()).unwrap_err().code, "bad_secret");
+    let y1 = t1s.add_tweak(&Scalar::from(r1)).unwrap();
+    assert_eq!(rs.resolve_lock(&chan, &y1.secret_bytes()).unwrap(), t1s.secret_bytes());
+    assert_eq!(rig.s.book.get(PROVIDER).unwrap().used_sats, 1_146);
+    assert_eq!(presigs(), 1);
+
+    // lock 2: the hub's close carries the completed signature; the payer passes the raw tx
+    let t2s = secret("t2");
+    let l2 = rs.sign_state_adaptor(&chan, 1_446, &pt(&t2s), &route(294, 5, "L2")).unwrap();
+    let y2 = t2s.add_tweak(&Scalar::from(SecretKey::from_slice(&l2.tweak).unwrap())).unwrap();
+    let mut sig = adaptor::adapt(&l2.pre, &y2).unwrap();
+    sig.push(0x21);
+    assert!(xbt_primitives::ecdsa::verify(&params.payer_pub, &params.sighash(&params.state_tx(1_446).unwrap()).unwrap(), &sig[..sig.len() - 1]),
+            "the completion is the payer's valid signature of state(1446)");
+    let mut tx = params.state_tx(1_446).unwrap();
+    tx.inputs[0].witness = vec![sig, vec![0u8; 71]];
+    assert_eq!(rs.recover_lock(&chan, &tx).unwrap(), t2s.secret_bytes());
+    assert_eq!(rig.s.book.get(PROVIDER).unwrap().used_sats, 1_446);
+
+    // lock 3: given up, then adopted by its own cum only
+    let l3 = rs.sign_state_adaptor(&chan, 1_646, &pt(&secret("t3")), &route(194, 4, "L3")).unwrap();
+    assert!(rs.void_lock(&chan).unwrap());
+    assert!(!rs.void_lock(&chan).unwrap());
+    assert_eq!(rs.adopt_lock(&chan, 9_999).unwrap_err().code, "bad_amount");
+    rs.adopt_lock(&chan, l3.cum).unwrap();
+    assert_eq!(rig.s.book.get(PROVIDER).unwrap().used_sats, 1_646);
+    assert_eq!(rig.call("routing_status", json!({}))["spent_24h_sats"], 600 + 300 + 200);
+    assert_eq!(rig.call("signatures", json!({}))["chain_ok"], true);
 }
 
 // --- the Rust payer over the socket -------------------------------------------------------------

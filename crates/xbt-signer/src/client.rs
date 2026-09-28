@@ -1,6 +1,7 @@
-//! The signer socket's client, and [`RemoteSigner`]: an xbt402 [`StateSigner`] and [`Wallet`]
-//! whose keys live in the signer process, so a Rust payer (`xbt402::client::Client::with_signer`)
-//! never holds a payer secret. Every state it asks for goes through the signer's policy engine.
+//! The signer socket's client, and [`RemoteSigner`]: an xbt402 [`StateSigner`], [`RouteSigner`] and
+//! [`Wallet`] whose keys live in the signer process, so a Rust payer (`xbt402::client::Client::with_signer`,
+//! `xbt402::route_client::RoutePayer`) never holds a payer secret. Every state it asks for goes
+//! through the signer's policy engine, and every adaptor lock through its routing policy first.
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -9,8 +10,10 @@ use serde_json::{json, Value};
 use xbt402::channel::ChannelParams;
 use xbt402::client::Wallet;
 use xbt402::conditional::ConditionalParams;
-use xbt402::signer::StateSigner;
+use xbt402::adaptor::PreSig;
+use xbt402::signer::{AdaptorLock, RouteSigner, StateSigner};
 use xbt_primitives::ecdsa::PubkeyBytes;
+use xbt_primitives::tx::Tx;
 
 use crate::ipc::Stream;
 use crate::pyjson::dumps;
@@ -55,6 +58,10 @@ fn checked(v: Value) -> Result<Value> {
 
 fn hex_field(v: &Value, k: &str) -> Result<Vec<u8>> {
     v.get(k).and_then(Value::as_str).and_then(|x| hex::decode(x).ok()).ok_or_else(|| err("signer_error", format!("no {k} in the signer's answer")))
+}
+
+fn hex_n<const N: usize>(v: &Value, k: &str) -> Result<[u8; N]> {
+    hex_field(v, k)?.try_into().map_err(|_| err("signer_error", format!("{k} in the signer's answer is not {N} bytes")))
 }
 
 /// xbt402's signer seam over the B2 socket.
@@ -122,6 +129,36 @@ impl StateSigner for RemoteSigner {
     fn sign_conditional(&self, chan: &str, uncond: u64, cond: &ConditionalParams) -> xbt402::Result<Vec<u8>> {
         hex_field(&self.call("xbt402_sign_conditional", json!({"chan": chan, "uncond": uncond, "hash": hex::encode(cond.h),
                                                                 "amount": cond.cond_amount, "csv_delta": cond.csv_delta}))?, "sig")
+    }
+}
+
+/// B2's `xbt402_*` lock methods; the signer applies its routing policy (hub allowlist, fee cap,
+/// `max_lock_sats`, the 24 h routed budget) and then the policy engine before it pre-signs.
+impl RouteSigner for RemoteSigner {
+    fn sign_state_adaptor(&self, chan: &str, cum: u64, point: &PubkeyBytes, route: &Value) -> xbt402::Result<AdaptorLock> {
+        let v = self.call("xbt402_sign_state_adaptor", json!({"chan": chan, "cum": cum, "point": hex::encode(point), "route": route}))?;
+        let pre = PreSig::from_json(v.get("adaptor").unwrap_or(&Value::Null)).map_err(|e| err("signer_error", e.msg))?;
+        let got = v.get("cum").and_then(Value::as_u64).unwrap_or(0);
+        if got != cum {
+            return Err(err("signer_error", format!("the signer locked {got}, not {cum}")));
+        }
+        Ok(AdaptorLock { pre, point: hex_n(&v, "point")?, tweak: hex_n(&v, "tweak")?, cum })
+    }
+
+    fn resolve_lock(&self, chan: &str, secret: &[u8; 32]) -> xbt402::Result<[u8; 32]> {
+        hex_n(&self.call("xbt402_resolve_lock", json!({"chan": chan, "secret": hex::encode(secret)}))?, "t")
+    }
+
+    fn void_lock(&self, chan: &str) -> xbt402::Result<bool> {
+        Ok(self.call("xbt402_void_lock", json!({"chan": chan}))?.get("voided").and_then(Value::as_bool).unwrap_or(false))
+    }
+
+    fn adopt_lock(&self, chan: &str, cum: u64) -> xbt402::Result<()> {
+        self.call("xbt402_adopt_lock", json!({"chan": chan, "cum": cum})).map(|_| ())
+    }
+
+    fn recover_lock(&self, chan: &str, close_tx: &Tx) -> xbt402::Result<[u8; 32]> {
+        hex_n(&self.call("xbt402_recover_lock", json!({"chan": chan, "txid": close_tx.txid(), "hex": close_tx.to_hex()}))?, "t")
     }
 }
 

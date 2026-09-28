@@ -7,11 +7,15 @@
 //! Before an adaptor pre-signature: the hub is allowed, its fee is within that hub's caps (plus 1 sat
 //! of carried remainder), the lock is within `max_lock_sats`, and the 24 h routed spend (resolved
 //! locks plus pending ones) stays within `daily_budget_sats`; then the policy engine decides on the
-//! increase as a payment to the hub. The crypto is the [`AdaptorScheme`] seam (AGP-026).
+//! increase as a payment to the hub. The crypto is the [`AdaptorScheme`] seam; [`Xbt402Adaptor`] is
+//! xbt402's ECDSA adaptor (AGP-026, wire-compatible with B1 `adaptor.py`) and the signer's default.
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Map, Value};
+
+use xbt402::adaptor::{self, PreSig};
+use xbt_primitives::secp256k1::{PublicKey, SecretKey};
 
 use crate::channels::{AdaptorScheme, ChannelBook};
 use crate::policy::{normalize_dest, Payment, PolicyEngine};
@@ -19,6 +23,21 @@ use crate::pyjson::{dumps, now_f64, py_int, ts_value};
 use crate::{err, Result};
 
 pub const DAY_S: f64 = 86_400.0;
+
+/// xbt402's ECDSA adaptor (DLEQ-proven pre-signatures in libsecp256k1, AGP-026): what B2 gets from
+/// B1's `xbt402/adaptor.py`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Xbt402Adaptor;
+
+impl AdaptorScheme for Xbt402Adaptor {
+    fn presign(&self, secret: &SecretKey, z: &[u8; 32], t1: &PublicKey) -> Result<Value> {
+        Ok(adaptor::presign(secret, z, t1)?.to_json())
+    }
+
+    fn extract(&self, pre: &Value, sig: &[u8], t1: &PublicKey) -> Option<[u8; 32]> {
+        adaptor::extract(&PreSig::from_json(pre).ok()?, sig, t1).map(|y| y.secret_bytes())
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct RoutePolicy {

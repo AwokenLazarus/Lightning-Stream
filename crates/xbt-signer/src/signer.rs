@@ -95,7 +95,8 @@ pub fn address_to_spk(addr: &str, hrp: &str) -> Result<Vec<u8>> {
     Ok(spk)
 }
 
-/// How to build a signer (tests inject a node, a transport, a clock, an adaptor scheme).
+/// How to build a signer (tests inject a node, a transport, a clock, an adaptor scheme; the default
+/// scheme is [`crate::routing::Xbt402Adaptor`]).
 #[derive(Default)]
 pub struct SignerOptions {
     pub node: Option<Arc<dyn Node>>,
@@ -182,7 +183,7 @@ impl Signer {
         let session = Session::new(book.clone(), hot.clone(), node.clone(), transport, &chain, mine, config.open_wait_s as f64,
                                    config.close_fee_max_sats, config.refund_margin_blocks)?;
         let routing = RouteSigner::new(book.clone(), RoutePolicy::from_value(&config.routing), Some(&run.join("routing.json")),
-                                       Some(engine.clone()), opts.adaptor.clone());
+                                       Some(engine.clone()), Some(opts.adaptor.clone().unwrap_or_else(|| Arc::new(crate::routing::Xbt402Adaptor))));
         let watch_interval = std::env::var("B2_WATCH_INTERVAL").ok().and_then(|v| v.parse().ok()).unwrap_or(10.0);
         Ok(Arc::new(Self { root: root.into(), run, config, engine, node, chain, hrp, mining, sock_path, human_pubkey, spend: Mutex::new(()),
                            keystore, sigaudit, anchor, hot, book, session, routing, open_tried: Mutex::new(HashMap::new()), watch_interval }))
@@ -960,9 +961,17 @@ impl Signer {
         with(self.book.get(&dest).map(|r| r.public()).unwrap_or(json!({})), json!({"verdict": "allow"}))
     }
 
+    /// t + r off the hub's ch1 close: by txid (blockhash on a pruned node), as B2. Extension: the
+    /// caller may pass the raw close as `hex` (a payer that already holds it, and a node without the
+    /// tx); only its witness is read, and a secret counts only if it opens the stored T1.
     fn recover_lock(&self, p: &Value) -> Value {
-        let raw = node::get_tx(&*self.node, &str_or_empty(p.get("txid")), &str_or_empty(p.get("blockhash")))
-            .and_then(|v| v.get("hex").and_then(Value::as_str).map(str::to_string));
+        let given = str_or_empty(p.get("hex"));
+        let raw = if !given.is_empty() {
+            Some(given)
+        } else {
+            node::get_tx(&*self.node, &str_or_empty(p.get("txid")), &str_or_empty(p.get("blockhash")))
+                .and_then(|v| v.get("hex").and_then(Value::as_str).map(str::to_string))
+        };
         let Some(raw) = raw else { return deny("unknown_tx", "close transaction not found") };
         let Ok(tx) = Tx::parse_hex(&raw) else { return deny("unknown_tx", "close transaction does not parse") };
         let wit = tx.inputs.first().map(|i| i.witness.clone()).unwrap_or_default();

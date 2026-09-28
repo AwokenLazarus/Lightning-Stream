@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Routed cross-implementation runs on regtest (AGP-026), driven by scripts/route_interop.sh.
 
-Every combination of client x hub x provider, each Rust (xbt-rs) or Python (B1 agp-023): 1 client with
+Every combination of client x hub x provider, each Rust (xbt-rs) or Python (B1 agp-029): 1 client with
 ONE channel to the hub, 1 hub funding one ch2 to each of 2 providers, `SECONDS` of streamed calls at
 `RATE`/s per provider with per-window adaptor locks, then the client closes ch1 (the hub broadcasts), the
 hub is stopped and its operator tool closes every ch2 (the provider broadcasts). A block is mined and
@@ -13,14 +13,21 @@ every close is checked on chain to the sat:
        paid that provider == what the provider signed as paid (ROUTE-STATE)
   meters: provider meter == client meter to the amsat; paid <= ceil(accrued); the hub fee carried
        exactly: fees == ceil(units / 1e9); sum over ch2s == routed on ch1 - fees
-Ports: base+10*i .. +2 (hub, providers). Env: XBT402_B1, XBT402_DATADIR, XBT402_RPCPORT, RS_BIN, PY,
-ROUTE_PB, ROUTE_RUN, ROUTE_ONLY (e.g. "RS-PY-RS,PY-RS-PY"), ROUTE_SECONDS, ROUTE_RATE."""
+Then (AGP-034) the Rust payer with its keys in the Rust B2 signer (client "RSS": xbt-signer on a Unix
+socket, RemoteSigner behind RoutePayer, ch1 funded from the signer's hot key) against a Rust and a Python
+hub + providers at 100x the prices (so ch1 passes its dust floor and each lock is a new signer state), with
+the same checks plus the signer's: every lock pre-signed in the signer under
+policy:routing, the routed 24 h spend == ch1's signed state, ch1's change to the hot key, the log intact.
+Ports: base+10*i .. +2 (hub, providers); the RSS runs at base+100+10*j. Env: XBT402_B1, XBT402_DATADIR,
+XBT402_RPCPORT, RS_BIN, PY, ROUTE_PB, ROUTE_RUN, ROUTE_ONLY (e.g. "RS-PY-RS,PY-RS-PY,RSS-RS-RS"),
+ROUTE_SECONDS, ROUTE_RATE."""
 import itertools
 import json
 import math
 import os
 import secrets
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -98,9 +105,59 @@ def stop(p):
             p.kill()
 
 
+def signer_call(sock, method, **params):
+    """One request on the B2 signer socket (newline-delimited JSON)."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+        c.settimeout(60)
+        c.connect(sock)
+        c.sendall((json.dumps({"id": 1, "method": method, "params": params}) + "\n").encode())
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = c.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    resp = json.loads(buf)
+    if resp.get("error"):
+        raise RuntimeError(f"signer {method}: {resp['error']}")
+    return resp["result"]
+
+
+def start_rust_signer(d, hub_url):
+    """xbt-signer (the B2 signer in Rust) with a routing policy for `hub_url`; its hot key funded."""
+    root = os.path.join(d, "signer")
+    os.makedirs(root, exist_ok=True)
+    key = os.path.join(d, "signer.key")          # outside the signer's run dir, as B2 requires
+    with open(key, "w") as f:
+        f.write(secrets.token_hex(32))
+    os.chmod(key, 0o600)
+    policy = {"allowlist": [hub_url], "max_per_tx_sats": 20000, "daily_budget_sats": 200000, "weekly_budget_sats": 200000,
+              "per_counterparty_cap_sats": 200000, "velocity_max": 100000, "velocity_window_s": 3600, "human_threshold_sats": 20001,
+              "split_window_s": 0, "refund_enabled": True, "hot_balance_cap_sats": 0, "regtest_mine": False, "anchor_required": False,
+              "routing": {"hubs": {hub_url: {"max_fee_ppm": 2000, "max_fee_base_msat": 100}}, "max_lock_sats": 20000,
+                          "daily_budget_sats": 100000}}
+    with open(os.path.join(root, "policy.json"), "w") as f:
+        json.dump(policy, f, indent=1)
+    sock = os.path.join(root, "signer.sock")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("B2_")}
+    env.update({"B2_ROOT": root, "B2_DATADIR": os.environ["XBT402_DATADIR"], "B2_RPCPORT": RPCPORT, "B2_WALLET": "agent",
+                "B2_CHAIN": "regtest", "B2_SIGNER_SOCK": sock, "B2_CONF": "/dev/null", "B2_HOT_KEYFILE": key, "B2_WATCH_INTERVAL": "2"})
+    proc = spawn([f"{RS}/xbt-signer", "--root", root], env=env)
+    end = time.time() + 30
+    while time.time() < end and not os.path.exists(sock):
+        time.sleep(0.2)
+    h = signer_call(sock, "health")
+    assert h.get("implementation") == "xbt-signer (Rust)", h
+    hot = signer_call(sock, "hot_address")
+    txid = W.sendtoaddress(hot["hot_address"], 1_000_000 / SAT)
+    mine()
+    signer_call(sock, "notice_hot_txid", txid=txid)
+    return proc, sock, hot["hot_spk"], policy
+
+
 def scenario(i, client, hub_impl, prov_impl):
     name = f"{client}-{hub_impl}-{prov_impl}"
-    base = PB + 10 + 10 * i
+    base = PB + 10 + 10 * i if client != "RSS" else PB + 100 + 10 * i
     hub_port, ports = base, [base + 1, base + 2]
     d = os.path.join(RUN, name)
     os.makedirs(d, exist_ok=True)
@@ -112,7 +169,10 @@ def scenario(i, client, hub_impl, prov_impl):
     procs, miner_stop = [], threading.Event()
     try:
         urls = [f"http://127.0.0.1:{p}" for p in ports]
-        for j, (port, price) in enumerate(zip(ports, PRICES)):
+        # RSS: 100x the prices, so ch1 goes well past its 546-sat floor and every window's lock is a
+        # new adaptor state the signer must pre-sign under its routing policy
+        prices = [x * 100 for x in PRICES] if client == "RSS" else PRICES
+        for j, (port, price) in enumerate(zip(ports, prices)):
             sec = f"{secrets.randbelow(2 ** 255) + 1:064x}"
             if prov_impl == "RS":
                 cmd = [f"{RS}/xbt402-route-provider", "--port", str(port), "--rpc-port", RPCPORT, "--cookie", COOKIE,
@@ -155,7 +215,12 @@ def scenario(i, client, hub_impl, prov_impl):
         check("v1.2: the hub advertises ch1 payer-pays, ch2 payee-pays",
               r and (r.get("ch1CloseFeePayer"), r.get("ch2CloseFeePayer")) == ("payer", "payee"))
         shard_urls = ",".join(u + "/v1/chunk" for u in urls)
-        if client == "RS":
+        if client == "RSS":
+            sproc, sock, hot_spk, spol = start_rust_signer(d, hub_url)
+            procs.append(sproc)
+            ccmd = [f"{RS}/xbt402-route-payer", "--hub", hub_url, "--shards", shard_urls, "--rpc-port", RPCPORT, "--cookie", COOKIE,
+                    "--seconds", str(SECONDS), "--rate", str(RATE), "--signer-sock", sock]
+        elif client == "RS":
             ccmd = [f"{RS}/xbt402-route-payer", "--hub", hub_url, "--shards", shard_urls, "--rpc-port", RPCPORT, "--cookie", COOKIE,
                     "--seconds", str(SECONDS), "--rate", str(RATE)]
         else:
@@ -218,6 +283,27 @@ def scenario(i, client, hub_impl, prov_impl):
         check("both ch2s closed", len(closed["closes"]) == 2)
         check("sum over ch2s == routed on ch1 - fees", total2 == s["routed_sat"] - s["fee_paid_sat"],
               f"{total2} == {s['routed_sat']} - {s['fee_paid_sat']}")
+        if client == "RSS":
+            sv = res.get("signer") or {}
+            kinds = [tuple(k) for k in sv.get("signatures") or []]
+            presig = [k for k in kinds if k[0] == "adaptor_presig"]
+            nonfloor = s["locks"] - s["floor_locks"]
+            check("signer: every non-floor lock pre-signed in the Rust signer under policy:routing (the client holds no key)",
+                  len(presig) == nonfloor >= 1 and all(k[1] == "xbt402_sign_state_adaptor" and k[2] == "policy:routing" for k in presig),
+                  f"{len(presig)} presigs, {nonfloor} locks")
+            rt = sv.get("routing") or {}
+            check("signer: routed 24 h spend == ch1's signed state; no lock pending; adaptor available",
+                  rt.get("spent_24h_sats") == cum1 and not rt.get("pending") and rt.get("adaptor") == "available",
+                  f"spent {rt.get('spent_24h_sats')} vs cum1 {cum1}, pending {rt.get('pending')}")
+            check("signer: ch1 funded from the hot key, its close change back to the hot key, marked closed",
+                  p1["payer_spk"] == hot_spk and ("funding", "fund", "method:fund") in kinds
+                  and ("close_auth", "xbt402_sign_close", "client:close") in kinds
+                  and (sv.get("mark_closed") or {}).get("state") == "closed", str(sv.get("mark_closed"))[:200])
+            mc = sv.get("mark_closed") or {}
+            check("signer: it learned ch1's close change to the hot key (xbt402_mark_closed)",
+                  mc.get("close_change") == ("counted" if change1 >= 546 else mc.get("close_change")) and mc.get("closed_txid", c1["txid"]) == c1["txid"],
+                  str(mc)[:200])
+            check("signer: signature log chain intact", sv.get("chain_ok") is True)
         return {"scenario": name, "client": client, "hub": hub_impl, "provider": prov_impl, "ok": all(c["ok"] for c in checks),
                 "checks": checks, "lockMs": res["lockMs"], "callMs": res["callMs"], "routed": s["routed_sat"], "fees": s["fee_paid_sat"],
                 "ch1": {"txid": c1["txid"], "cum": cum1}, "ch2": [{"txid": (c.get("close") or {}).get("txid"), "state": c["ch2"]["signed"],
@@ -233,9 +319,16 @@ def scenario(i, client, hub_impl, prov_impl):
 
 def main():
     only = [x for x in os.environ.get("ROUTE_ONLY", "").split(",") if x]
-    combos = [c for c in itertools.product(("RS", "PY"), repeat=3) if not only or "-".join(c) in only]
+    combos = [(i, c) for i, c in enumerate(itertools.product(("RS", "PY"), repeat=3))]
+    combos += [(j, ("RSS", h, p)) for j, (h, p) in enumerate((("RS", "RS"), ("PY", "PY")))]
+    combos = [(i, c) for i, c in combos if not only or "-".join(c) in only]
+    if "agent" not in node.listwallets():
+        try:
+            node.loadwallet("agent")
+        except Exception:  # noqa: BLE001
+            node.createwallet("agent", True, True, "", False, True)   # the signer's watch-only wallet, as B2's
     results = []
-    for i, (c, h, p) in enumerate(combos):
+    for i, (c, h, p) in combos:
         t0 = time.time()
         r = scenario(i, c, h, p)
         r["seconds"] = round(time.time() - t0, 1)

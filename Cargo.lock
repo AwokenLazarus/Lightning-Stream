@@ -2631,6 +2631,7 @@ dependencies = [
  "lazarus-protocol",
  "serde_json",
  "xbt-primitives",
+ "xbt-signer",
  "xbt402",
 ]
 

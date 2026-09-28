@@ -47,7 +47,7 @@ Every B2 method listed below behaves as in B2:
 - `health`, `chain_backend`, `channels`, `hot_address`, `notice_hot_txid`, `fund`;
 - `open_channel`, `sign_state`, `xbt402_pay`;
 - `xbt402_request_auth`, `xbt402_sign_state_a3`;
-- `xbt402_sign_state_adaptor`, `xbt402_resolve_lock`, `xbt402_void_lock`, `xbt402_adopt_lock`, `xbt402_recover_lock`;
+- `xbt402_sign_state_adaptor`, `xbt402_resolve_lock`, `xbt402_void_lock`, `xbt402_adopt_lock`, `xbt402_recover_lock` (below);
 - `routing_status`, `close_channel`, `xbt402_refund` (alias `refund_channel`), `watch_tick`;
 - `rotate_hot_key`, `sweep_hot`, `signatures`, `anchor_now`, `anchor_status`, `hot_reconcile`.
 
@@ -73,6 +73,24 @@ policy-checked where it raises the signed amount.
 `client::RemoteSigner` implements `xbt402::signer::StateSigner` and `xbt402::client::Wallet` over
 these methods: `Client::new(..).with_signer(Arc::new(RemoteSigner::new(sock)))`.
 
+### Routed payments (AGP-034)
+
+`client::RemoteSigner` also implements `xbt402::signer::RouteSigner` over B2's lock methods, so
+`xbt402::route_client::RoutePayer::new(hub, cfg, Arc::new(remote.clone()), Arc::new(remote), ..)` routes
+with every key in the signer. Before each pre-signature the signer applies the routing policy (hub
+allowlist, fee cap with carry, `max_lock_sats`, the 24 h routed budget over resolved plus pending
+locks) and then the policy engine on the increase. The crypto is `routing::Xbt402Adaptor`, xbt402's
+ECDSA adaptor (AGP-026, wire-compatible with B1 `adaptor.py`), the default `channels::AdaptorScheme`.
+
+| method | params | result |
+|---|---|---|
+| `xbt402_sign_state_adaptor` | `chan`, `cum`, `point` (T), `route` (`hub`, `amount`, `fee`, `lockId`) | routing policy, engine, then `{verdict, adaptor, point (T1), tweak (r), cum}`; the lock is written ahead |
+| `xbt402_resolve_lock` | `chan`, `secret` (t + r or t) | `{t}` |
+| `xbt402_void_lock` | `chan` | `{voided}` |
+| `xbt402_adopt_lock` | `chan`, `cum` | `{adopted}` (only a given-up lock's own cum, with no lock pending) |
+| `xbt402_recover_lock` | `chan`, `txid`, `blockhash`, or `hex` (new: the raw close) | `{t}`; only a secret opening the stored T1 counts |
+| `routing_status` | | policy, 24 h spend, pending locks, `adaptor: available` |
+
 ## Not ported
 
 Each of these answers that it is unavailable:
@@ -84,11 +102,6 @@ Each of these answers that it is unavailable:
   `recover_vault` answer `ok: false`, and `balance` reports `vault`/`treasury` as null.
 - **The Electrum light backend** (AGP-024). With `B2_CHAIN_BACKEND=electrum` the signer refuses to
   start; AGP-028 owns Electrum.
-- **The adaptor-signature crypto** (B1 `adaptor.py`; AGP-026 is porting it). The routing policy, the
-  write-ahead lock book, resolve, void, adopt and recover are all here, behind the
-  `channels::AdaptorScheme` trait (`presign`, `extract`). Without an implementation,
-  `xbt402_sign_state_adaptor` answers `deny/adaptor_unavailable`. The tests use a labelled test
-  double.
 
 ## Portability
 
