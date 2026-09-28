@@ -8,7 +8,8 @@
 #    refuse if any other cargo config or build env could still steer the build;
 # 2. serde_json is built without arbitrary_precision (cmp's feature unification);
 # 3. cargo zigbuild --release --locked for x86_64/aarch64-unknown-linux-musl and
-#    armv7-unknown-linux-musleabihf: `-p xbt402 --no-default-features` and `-p xbt-signer`; every
+#    armv7-unknown-linux-musleabihf: `-p xbt402 --no-default-features`, `-p xbt-signer` and (AGP-030)
+#    `-p xbt-wallet-mcp`; every
 #    binary must be a static ELF of the right machine;
 # 4. a cmp-shaped consumer outside the repo: xbt402 + xbt-signer as git dependencies at REF's commit,
 #    default-features = false, its own serde_json (no features), built for aarch64 musl.
@@ -83,7 +84,7 @@ check_bin() { # target path
 
 echo "== 3. cargo zigbuild --release --locked"
 for t in "${TARGETS[@]}"; do
-  for spec in "-p xbt402 --no-default-features" "-p xbt-signer"; do
+  for spec in "-p xbt402 --no-default-features" "-p xbt-signer" "-p xbt-wallet-mcp"; do
     # shellcheck disable=SC2086
     if (cd "$W/xbt-rs" && "${SOAK[@]}" "$ZB" zigbuild -q -j2 --release --locked --target "$t" $spec) > "$W/build.log" 2>&1; then
       echo "  built $t $spec"
@@ -92,7 +93,7 @@ for t in "${TARGETS[@]}"; do
     fi
   done
   [ -f "$W/target/$t/release/libxbt402.rlib" ] && echo "  ok    $t libxbt402.rlib" || bad "$t: no libxbt402.rlib"
-  for b in xbt-signer xbt-anchor-witness xbt-signer-payer; do
+  for b in xbt-signer xbt-anchor-witness xbt-signer-payer xbt-wallet-mcp; do
     [ -f "$W/target/$t/release/$b" ] && check_bin "$t" "$W/target/$t/release/$b" || bad "$t: no $b"
   done
 done
