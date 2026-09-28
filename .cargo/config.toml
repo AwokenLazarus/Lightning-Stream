@@ -1,0 +1,8 @@
+# aarch64 (Raspberry Pi class) cross builds: `cargo build --target aarch64-unknown-linux-gnu -p xbt402`.
+# zig is the C compiler (libsecp256k1) and the linker: see tools/zig-cc-aarch64.
+[target.aarch64-unknown-linux-gnu]
+linker = "tools/zig-cc-aarch64"
+
+[env]
+CC_aarch64_unknown_linux_gnu = { value = "tools/zig-cc-aarch64", relative = true }
+AR_aarch64_unknown_linux_gnu = { value = "tools/zig-ar", relative = true }

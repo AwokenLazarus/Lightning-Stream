@@ -147,7 +147,7 @@ impl Tx {
     pub fn vsize(&self) -> usize {
         let base = self.serialize_with(false).len();
         let total = self.serialize_with(true).len();
-        (base * 3 + total + 3) / 4
+        (base * 3 + total).div_ceil(4)
     }
 
     /// Parse a whole transaction; trailing bytes are an error. Every count and length is checked

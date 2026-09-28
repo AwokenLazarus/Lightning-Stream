@@ -122,7 +122,8 @@ pub fn gen_auth() -> Value {
     let shared = ecdsa::ecdh_x(&a, &ecdsa::public_key(&p.payee_pub).expect("P"));
     let sig546 = hex::encode(Payer::new(p.clone(), a).expect("payer").sign_state(546).expect("sig"));
     let chan = p.channel_id();
-    let rows: [(&str, &str, &[u8], u64, &str, Option<&str>); 3] = [
+    type Case<'a> = (&'a str, &'a str, &'a [u8], u64, &'a str, Option<&'a str>);
+    let rows: [Case; 3] = [
         ("GET", "/v1/quote?pair=XBT-USD", b"", 1, "0", None),
         ("POST", "/v1/infer", br#"{"prompt":"hello"}"#, 2, "546", Some(sig546.as_str())),
         ("POST", "/v1/a%20b?x=1", b"\x00\x01binary", 7, "1200", None),

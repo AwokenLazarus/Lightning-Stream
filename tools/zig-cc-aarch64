@@ -1,0 +1,15 @@
+#!/bin/sh
+# C compiler/linker for aarch64-unknown-linux-gnu via zig (no system cross toolchain on the build host,
+# no sudo). zig comes from the ziglang wheel: python3 -m venv ~/.local/share/ziglang-venv &&
+# ~/.local/share/ziglang-venv/bin/pip install ziglang. Override with XBT_ZIG_PY.
+PY=${XBT_ZIG_PY:-$HOME/.local/share/ziglang-venv/bin/python}
+args=""
+for a in "$@"; do
+  case "$a" in
+    --target=*|-target=*) ;;                  # cc-rs passes the Rust triple; zig gets its own below
+    -Wl,--as-needed|-Wl,-Bdynamic|-Wl,-Bstatic) ;;
+    -Wl,--fix-cortex-a53-843419|-fuse-ld=*|-B*gcc-ld) ;;   # rustc's lld/gcc-ld hints; zig links itself
+    *) args="$args '$(printf %s "$a" | sed "s/'/'\\\\''/g")'" ;;
+  esac
+done
+eval exec "\"$PY\"" -m ziglang cc -target aarch64-linux-gnu.2.28 $args

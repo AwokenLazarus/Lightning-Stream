@@ -521,7 +521,8 @@ impl Provider {
             let Some(chain) = self.chain.get_tx_out(&st.closed_txid, vout, false)? else { return Ok(()) };
             let depth = chain.confirmations.min(32);
             let cond_amount = self.cond_state(st)?.map(|c| c.0.cond_amount).unwrap_or(0);
-            let bumped = self.cfg.claim_fee.checked_shl(depth).unwrap_or(u64::MAX).min(cond_amount.saturating_sub(DUST));
+            let shifted = if self.cfg.claim_fee.leading_zeros() >= depth { self.cfg.claim_fee << depth } else { u64::MAX };
+            let bumped = shifted.min(cond_amount.saturating_sub(DUST));
             if bumped <= fee {
                 return Ok(());
             }
@@ -1014,7 +1015,7 @@ impl Provider {
             if st.spent_msat as u128 + price as u128 * 1000 > st.params.max_amount() as u128 * 1000 {
                 return refuse(&mut l, &st, "channel_exhausted", price);
             }
-            st.spent_msat += price * 1000;                // reserve the max; refunded below if metered lower
+            st.spent_msat = st.spent_msat.saturating_add(price.saturating_mul(1000));   // reserve the max; refunded below if metered lower
             if let Err(e) = self.save_state(&mut l, &st) {
                 return HttpResponse::json(500, &json!({"error": e.code, "detail": e.to_string()}));
             }
@@ -1041,10 +1042,10 @@ impl Provider {
         let (receipt, secret, payer) = {
             let mut l = lock(&self.ledger);
             let Some(mut st) = l.channels.get(&cid).cloned() else { return HttpResponse::text(500, "channel vanished") };
-            st.spent_msat -= (price - charged) * 1000;
+            st.spent_msat = st.spent_msat.saturating_sub((price - charged).saturating_mul(1000));
             if resp.status >= 500 {
                 // don't bill failed calls
-                st.spent_msat -= charged * 1000;
+                st.spent_msat = st.spent_msat.saturating_sub(charged.saturating_mul(1000));
                 charged = 0;
             }
             if charged != price {

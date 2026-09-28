@@ -57,6 +57,12 @@ impl ClientConfig {
     }
 }
 
+/// Called with (refund tx hex, expiry height).
+pub type RefundHook = Box<dyn Fn(&str, u32) + Send + Sync>;
+
+/// The chain tip, for channel expiries.
+pub type HeightFn = Box<dyn Fn() -> Result<u32> + Send + Sync>;
+
 /// A conditional call signed but not yet delivered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingCond {
@@ -94,13 +100,13 @@ pub struct Client {
     pub cfg: ClientConfig,
     transport: Box<dyn Transport>,
     wallet: Box<dyn Wallet>,
-    height: Box<dyn Fn() -> Result<u32> + Send + Sync>,
+    height: HeightFn,
     pub channels: HashMap<String, ClientChannel>,
     pub opened_sats: u64,
     pub day_spent: u64,
     day_start: u64,
     /// Called with (refund hex, expiry) for every channel opened: keep it, broadcast after expiry.
-    pub on_refund: Option<Box<dyn Fn(&str, u32) + Send + Sync>>,
+    pub on_refund: Option<RefundHook>,
     /// Channels replaced by a rollover, until their successor is opened at the provider.
     pub pending_rolled: HashMap<String, ClientChannel>,
 }
@@ -137,7 +143,7 @@ fn ex_u64(ex: &Value, k: &str) -> Result<u64> {
 
 impl Client {
     pub fn new(cfg: ClientConfig, transport: Box<dyn Transport>, wallet: Box<dyn Wallet>,
-               height: Box<dyn Fn() -> Result<u32> + Send + Sync>) -> Self {
+               height: HeightFn) -> Self {
         Self { cfg, transport, wallet, height, channels: HashMap::new(), opened_sats: 0, day_spent: 0, day_start: now(), on_refund: None, pending_rolled: HashMap::new() }
     }
 

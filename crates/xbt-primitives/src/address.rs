@@ -37,7 +37,7 @@ fn convert_bits(data: &[u8], from: u32, to: u32, pad: bool) -> Result<Vec<u8>> {
         if (v as u32) >> from != 0 {
             return Err(Error::BadAddress("value out of range".into()));
         }
-        acc = ((acc << from) | v as u32) & 0xFFFF_FFFF;
+        acc = (acc << from) | v as u32;
         bits += from;
         while bits >= to {
             bits -= to;
