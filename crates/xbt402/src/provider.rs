@@ -2,7 +2,8 @@
 //! application handler. A port of B1 `XbtChannelProvider` (v1.1 + v1.2): the 402 challenge, open,
 //! paid calls with request auth and signed receipts, postpay/prepay billing, metered charges,
 //! hash-locked conditional sales, cooperative close, rollover, the facilitator endpoints and the
-//! expiry watcher. Hub routing (`/x402/xbt-channel/lock`, routed sessions) is AGP-026.
+//! expiry watcher. Hub routing (route offers, routed sessions, `/x402/xbt-channel/lock`) lives in
+//! [`crate::route_seller`] (AGP-026).
 //!
 //! [`Provider::serve`] is transport-independent: give it the method, path, headers and body of a
 //! request and send back what it returns. The `http-server` feature wraps it in `tiny_http`.
@@ -125,9 +126,10 @@ pub struct Provider {
     auth_keys: Mutex<HashMap<String, [u8; 32]>>,
     height: Mutex<Option<(u32, Instant)>>,
     cond: Mutex<HashMap<String, CondOffer>>,
-    price: PriceFn,
-    handler: Handler,
+    pub(crate) price: PriceFn,
+    pub(crate) handler: Handler,
     charge: Option<ChargeFn>,
+    pub(crate) routes: crate::route_seller::RouteSeller,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -162,6 +164,7 @@ impl Provider {
         if cfg.max_body < 1 {
             return fail("bad_config", "max_body must be >= 1");
         }
+        let routes = crate::route_seller::RouteSeller::new(&ledger, pay_to_secret, &cfg.network, cfg.settle_multiple);
         Ok(Self {
             pay_to: hex::encode(ecdsa::pubkey(&pay_to_secret)),
             cfg,
@@ -175,6 +178,7 @@ impl Provider {
             price,
             handler,
             charge: None,
+            routes,
         })
     }
 
@@ -187,6 +191,11 @@ impl Provider {
     /// The compressed payTo key (hex).
     pub fn pay_to(&self) -> &str {
         &self.pay_to
+    }
+
+    /// The ledger, locked (the hub's ch1 book and the routing endpoints work under it).
+    pub(crate) fn ledger_lock(&self) -> MutexGuard<'_, Ledger> {
+        lock(&self.ledger)
     }
 
     /// A snapshot of one channel's state.
@@ -244,7 +253,7 @@ impl Provider {
         ex["settleMultiple"] = self.cfg.settle_multiple.into();
         ex["closeFeePayer"] = self.cfg.route_close_fee_payer.as_str().into();
         ex["rolloverGraceBlocks"] = self.cfg.rollover_grace.into();
-        ex["routes"] = json!([]);
+        ex["routes"] = json!(self.routes.offer_paths());
         req
     }
 
@@ -253,15 +262,21 @@ impl Provider {
     }
 
     fn payment_required(&self, url: &str, price: u64, error: &str, st: Option<&ChannelState>) -> HttpResponse {
+        let body = self.payment_required_doc(url, price, error, st);
+        self.required_response(&body)
+    }
+
+    /// The PaymentRequired document of a 402.
+    pub(crate) fn payment_required_doc(&self, url: &str, price: u64, error: &str, st: Option<&ChannelState>) -> Value {
         let mut body = json!({"x402Version": 2, "error": error, "resource": {"url": url}, "accepts": [self.requirements(price)]});
         if let Some(st) = st {
             body["channel"] = json!({"chan": st.params.channel_id(), "cum": st.best_cum.to_string(), "seq": st.seq,
                                      "spentMsat": st.spent_msat.to_string()});
         }
-        self.required_response(&body)
+        body
     }
 
-    fn required_response(&self, body: &Value) -> HttpResponse {
+    pub(crate) fn required_response(&self, body: &Value) -> HttpResponse {
         HttpResponse::new(402, vec![("PAYMENT-REQUIRED".into(), b64json(body)), ("Content-Type".into(), "application/json".into())],
                           dumps(body))
     }
@@ -280,19 +295,19 @@ impl Provider {
         Ok(pe)
     }
 
-    fn payee(&self, st: &ChannelState) -> Result<Payee> {
+    pub(crate) fn payee(&self, st: &ChannelState) -> Result<Payee> {
         let mut pe = self.channel_payee(&st.params)?;
         pe.best_amount = st.best_cum;
         pe.best_sig = hex::decode(&st.best_sig).unwrap_or_default();
         Ok(pe)
     }
 
-    fn chan_secret(&self, p: &ChannelParams) -> Result<SecretKey> {
+    pub(crate) fn chan_secret(&self, p: &ChannelParams) -> Result<SecretKey> {
         Ok(*self.channel_payee(p)?.secret())
     }
 
     /// payload.auth is the channel's HMAC over this request and a seq above every earlier one.
-    fn authentic(&self, st: &ChannelState, pl: &Value, method: &str, path: &str, body: &[u8]) -> bool {
+    pub(crate) fn authentic(&self, st: &ChannelState, pl: &Value, method: &str, path: &str, body: &[u8]) -> bool {
         let Some(seq) = py_int(pl.get("seq")) else { return false };
         if seq <= st.seq as i128 {
             return false;
@@ -546,7 +561,7 @@ impl Provider {
         (0..tx.outputs.len() as u32).any(|n| matches!(self.chain.get_tx_out(txid, n, true), Ok(Some(_))))
     }
 
-    fn close_locked(&self, l: &mut Ledger, st: &mut ChannelState) -> Result<String> {
+    pub(crate) fn close_locked(&self, l: &mut Ledger, st: &mut ChannelState) -> Result<String> {
         if st.closed_txid.is_empty() {
             let (tx, conditional) = self.close_tx(st)?;
             let txid = tx.txid();
@@ -563,7 +578,7 @@ impl Provider {
         Ok(st.closed_txid.clone())
     }
 
-    fn save_state(&self, l: &mut Ledger, st: &ChannelState) -> Result<()> {
+    pub(crate) fn save_state(&self, l: &mut Ledger, st: &ChannelState) -> Result<()> {
         let cid = st.params.channel_id();
         l.channels.insert(cid.clone(), st.clone());
         l.save(&[&cid])
@@ -592,7 +607,7 @@ impl Provider {
         Ok(())
     }
 
-    fn close_paid(&self, st: &ChannelState) -> Result<u64> {
+    pub(crate) fn close_paid(&self, st: &ChannelState) -> Result<u64> {
         if let Some(p) = st.extra.get("close_paid").and_then(Value::as_u64) {
             return Ok(p);
         }
@@ -885,7 +900,10 @@ impl Provider {
             };
         }
         if path == LOCK_PATH {
-            return HttpResponse::text(404, "hub routing is not in this build (AGP-026)");
+            if method != "POST" {
+                return HttpResponse::text(405, "method not allowed");
+            }
+            return self.route_lock(method, path, headers, body);
         }
         if path == TERMS_PATH && method == "GET" {
             return HttpResponse::json(200, &self.terms());
@@ -906,6 +924,14 @@ impl Provider {
         }
         let url = if url.is_empty() { path } else { url };
         let hdr = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("PAYMENT-SIGNATURE")).map(|(_, v)| v.clone());
+        let hval = |name: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str()).filter(|v| !v.is_empty());
+        let routed = self.routes.has_offer(pk);
+        if routed && hdr.as_deref().is_none_or(str::is_empty) {
+            if let Some(ra) = hval("ROUTE-AUTH") {
+                return self.routed_call(method, path, pk, ra, body, url);
+            }
+            return self.route_offer_402(method, path, pk, hval("ROUTE-CLIENT").unwrap_or(""), url);
+        }
         let price = (self.price)(method, path);
         let Some(hdr) = hdr else {
             let cond = lock(&self.cond);
