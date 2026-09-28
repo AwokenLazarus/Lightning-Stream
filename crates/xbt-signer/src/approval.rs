@@ -5,6 +5,11 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 pub const DOMAIN: &[u8] = b"xbt-agentwallet-approve-v1";
 pub const RECOVER_DOMAIN: &[u8] = b"xbt-agentwallet-recover-v1";
 pub const SWEEP_DOMAIN: &[u8] = b"xbt-agentwallet-hot-sweep-v1";
+/// AGP-039 (the web UI): a new policy.json, the human key's rotation, a hot-key rotation, a backup export.
+pub const POLICY_DOMAIN: &[u8] = b"xbt-agentwallet-policy-v1";
+pub const HUMAN_KEY_DOMAIN: &[u8] = b"xbt-agentwallet-human-key-v1";
+pub const ROTATE_DOMAIN: &[u8] = b"xbt-agentwallet-hot-rotate-v1";
+pub const BACKUP_DOMAIN: &[u8] = b"xbt-agentwallet-backup-v1";
 
 fn join(parts: &[&[u8]]) -> Vec<u8> {
     parts.join(&b'\n')
@@ -22,6 +27,28 @@ pub fn recover_message(recovery_address: &str, expiry: i64) -> Vec<u8> {
 /// AGP-013: a human moves `amount_sats` out of the hot key to `dest`.
 pub fn sweep_message(hot_address: &str, dest: &str, amount_sats: i64, expiry: i64) -> Vec<u8> {
     join(&[SWEEP_DOMAIN, hot_address.as_bytes(), dest.as_bytes(), amount_sats.to_string().as_bytes(), expiry.to_string().as_bytes()])
+}
+
+/// AGP-039: replace the policy whose file hashes to `prev_sha256` by exactly `policy_text` (the bytes
+/// the signer writes), valid until `expiry`. Binding the previous hash stops a replay of an older change.
+pub fn policy_message(prev_sha256: &str, expiry: i64, policy_text: &str) -> Vec<u8> {
+    join(&[POLICY_DOMAIN, prev_sha256.as_bytes(), expiry.to_string().as_bytes(), policy_text.as_bytes()])
+}
+
+/// AGP-039: the current human key hands over to `new_pub_hex`.
+pub fn human_key_message(old_pub_hex: &str, new_pub_hex: &str, expiry: i64) -> Vec<u8> {
+    join(&[HUMAN_KEY_DOMAIN, old_pub_hex.as_bytes(), new_pub_hex.as_bytes(), expiry.to_string().as_bytes()])
+}
+
+/// AGP-039: rotate the hot key whose address is `hot_address` (its coins sweep to the new key).
+pub fn rotate_message(hot_address: &str, expiry: i64) -> Vec<u8> {
+    join(&[ROTATE_DOMAIN, hot_address.as_bytes(), expiry.to_string().as_bytes()])
+}
+
+/// AGP-039: export the wallet backup (the sealed files plus the wrapping secret sealed under a backup
+/// passphrase), valid until `expiry`.
+pub fn backup_message(hot_address: &str, expiry: i64) -> Vec<u8> {
+    join(&[BACKUP_DOMAIN, hot_address.as_bytes(), expiry.to_string().as_bytes()])
 }
 
 /// Ed25519 verification; any malformed key or signature is `false`.

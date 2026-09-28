@@ -18,8 +18,10 @@ pub const LATEST: &str = "2025-11-25";
 /// The exact MCP surface (B2 `MCP_TOOL_NAMES`).
 pub const TOOL_NAMES: [&str; 10] = ["balance", "quote_payment", "pay", "history", "channels", "xbt402_pay", "close_channel",
                                     "xbt402_refund", "forward_status", "forward_recover"];
-/// Never tools: a model cannot approve its own payments or move the hot key (B2 `FORBIDDEN_MCP_TOOLS`).
-pub const FORBIDDEN: [&str; 5] = ["approve", "recover_vault", "recover_treasury", "sweep_hot", "rotate_hot_key"];
+/// Never tools: a model cannot approve its own payments or move the hot key (B2 `FORBIDDEN_MCP_TOOLS`),
+/// nor reach the web UI's methods (AGP-039): the policy, the human key, the signed rotation, the backup.
+pub const FORBIDDEN: [&str; 12] = ["approve", "recover_vault", "recover_treasury", "sweep_hot", "rotate_hot_key", "deny_approval", "policy_prepare",
+                                   "policy_set", "human_key_enroll", "human_key_rotate", "rotate_hot_key_signed", "backup_export"];
 
 /// B2's `tools/list` result, verbatim (names, descriptions, input and output schemas).
 pub fn tools() -> Value {

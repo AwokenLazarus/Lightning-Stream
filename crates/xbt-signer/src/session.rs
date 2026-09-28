@@ -662,6 +662,7 @@ impl Session {
         // the provider's reply is untrusted data: only a txid-shaped txid becomes the wallet's own field
         let txid = reply.as_ref().and_then(|r| r.get("txid")).and_then(Value::as_str)
             .filter(|t| t.len() == 64 && t.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))).map(str::to_string);
+        let report = Self::close_report(reply.as_ref(), &rec);
         let close_hex = Self::close_hex(reply.as_ref(), txid.as_deref(), &rec);
         if let (Some(mine), Some(_)) = (&self.mine, &txid) {
             let _ = mine(1); // regtest only (P3)
@@ -675,7 +676,39 @@ impl Session {
                                  "hot_spk": hot_spk, "close_change": change["status"]}));
         Ok(json!({"verdict": "allow", "rail": "xbt402", "dest": dest, "txid": txid, "chan": rec.chan, "cum": rec.used_sats,
                   "change_spk": rec.payer_spk, "hot_spk": hot_spk, "change_to_hot": rec.payer_spk == hot_spk,
-                  "close_change": change["status"], UNTRUSTED_KEY: untrusted(&preview(&r.body, body_cap()), Value::Null)}))
+                  "close_change": change["status"], "close_report": report,
+                  UNTRUSTED_KEY: untrusted(&preview(&r.body, body_cap()), Value::Null)}))
+    }
+
+    /// B2 `close_report` (AGP-029, agp-next3 `6090990`): the provider's (untrusted) close amounts, as
+    /// integers only, checked against our own state. xbt402 v1.2: `cum` is the gross state we paid,
+    /// `unpaidMsat` = spent - cum, and a payee-pays channel adds `payeeFee` (the provider's own close
+    /// fee) and `payeeNet`. status: "ok" when the report matches what we signed and owes nothing;
+    /// "debt" when the provider says we still owe; "mismatch" when its numbers disagree.
+    pub fn close_report(reply: Option<&Value>, rec: &ChannelRecord) -> Value {
+        let num = |k: &str| -> Option<i64> {
+            match reply.and_then(|r| r.get(k)) {
+                Some(Value::Number(n)) => n.as_i64().filter(|v| *v >= 0),
+                Some(Value::String(s)) => s.trim().parse::<i64>().ok().filter(|v| *v >= 0),
+                _ => None,
+            }
+        };
+        let (cum, unpaid, fee, net) = (num("cum"), num("unpaidMsat"), num("payeeFee"), num("payeeNet"));
+        let payee_pays = rec.close_fee_payer == "payee";
+        let fee_ok = if payee_pays { fee == Some(rec.close_fee) && net == Some(cum.unwrap_or(0) - rec.close_fee) } else { fee.is_none() && net.is_none() };
+        let status = if unpaid.is_some_and(|u| u != 0) {
+            "debt"
+        } else if cum != Some(rec.used_sats) || unpaid.is_none() || !fee_ok {
+            "mismatch"
+        } else {
+            "ok"
+        };
+        let mut out = json!({"status": status, "cum": cum, "unpaid_msat": unpaid});
+        if payee_pays {
+            out["payee_fee"] = fee.into();
+            out["payee_net"] = net.into();
+        }
+        out
     }
 }
 

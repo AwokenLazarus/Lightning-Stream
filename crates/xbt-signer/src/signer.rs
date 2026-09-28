@@ -14,7 +14,7 @@
 //! Electrum light backend; their methods answer that they are unavailable.
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -182,15 +182,20 @@ pub struct SignerOptions {
 pub struct Signer {
     pub root: PathBuf,
     pub run: PathBuf,
-    pub config: PolicyConfig,
+    /// Live (AGP-039 `policy_set`): read with [`Signer::config`].
+    config: RwLock<PolicyConfig>,
     pub engine: Arc<PolicyEngine>,
     pub node: Arc<dyn Node>,
     pub chain: String,
     pub hrp: String,
     pub mining: bool,
     pub sock_path: PathBuf,
-    human_pubkey: Vec<u8>,
-    spend: Mutex<()>,
+    human_pubkey: RwLock<Vec<u8>>,
+    pub(crate) spend: Mutex<()>,
+    /// AGP-039: what became of an approval token that left the ledger (denied, used, expired).
+    pub(crate) approval_outcomes: Mutex<HashMap<String, Value>>,
+    /// policy.json as this process read it at start (restart-only keys are compared with it).
+    pub(crate) boot_policy: Value,
     pub keystore: Option<Arc<KeyStore>>,
     pub sigaudit: Arc<SigAudit>,
     pub anchor: Anchorer,
@@ -260,7 +265,8 @@ impl Signer {
         let routing = RouteSigner::new(book.clone(), RoutePolicy::from_value(&config.routing), Some(&run.join("routing.json")),
                                        Some(engine.clone()), Some(opts.adaptor.clone().unwrap_or_else(|| Arc::new(crate::routing::Xbt402Adaptor))));
         let watch_interval = std::env::var("B2_WATCH_INTERVAL").ok().and_then(|v| v.parse().ok()).unwrap_or(10.0);
-        Ok(Arc::new(Self { root: root.into(), run, config, engine, node, chain, hrp, mining, sock_path, human_pubkey, spend: Mutex::new(()),
+        Ok(Arc::new(Self { root: root.into(), run, config: RwLock::new(config), engine, node, chain, hrp, mining, sock_path,
+                           human_pubkey: RwLock::new(human_pubkey), spend: Mutex::new(()), approval_outcomes: Mutex::new(HashMap::new()), boot_policy: raw,
                            keystore, sigaudit, anchor, hot, book, session, routing, open_tried: Mutex::new(HashMap::new()), watch_interval }))
     }
 
@@ -290,7 +296,25 @@ impl Signer {
         Ok(())
     }
 
-    fn lock(&self) -> MutexGuard<'_, ()> {
+    /// The policy in force now.
+    pub fn config(&self) -> PolicyConfig {
+        self.config.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    pub(crate) fn set_config_live(&self, c: PolicyConfig) {
+        *self.config.write().unwrap_or_else(|p| p.into_inner()) = c;
+    }
+
+    /// The human's ed25519 public key (empty: none enrolled).
+    pub fn human_key(&self) -> Vec<u8> {
+        self.human_pubkey.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    pub(crate) fn set_human_key(&self, k: Vec<u8>) {
+        *self.human_pubkey.write().unwrap_or_else(|p| p.into_inner()) = k;
+    }
+
+    pub(crate) fn lock(&self) -> MutexGuard<'_, ()> {
         match self.spend.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
@@ -312,7 +336,7 @@ impl Signer {
         node::height(&*self.node).map(|h| h as i64)
     }
 
-    fn height_safe(&self) -> i64 {
+    pub(crate) fn height_safe(&self) -> i64 {
         self.height().unwrap_or(0)
     }
 
@@ -483,15 +507,7 @@ impl Signer {
             "forward_recover" => deny("forward_disabled", "the forward rail is not ported to the Rust signer"),
             "rotate_hot_key" => {
                 let _g = self.lock();
-                sigaudit::set_rule("operator:rotate_hot_key");
-                let out = self.hot.rotate()?;
-                self.engine.audit.append(json!({"type": "hot_rotation", "ts": ts_value(self.now()), "old_address": out["old_address"],
-                                                "new_address": out["new_address"], "sweep_txid": out["sweep"].get("txid")}));
-                if !out["sweep"].is_null() {
-                    self.mine_safe();
-                }
-                self.anchor_after("rotation");
-                sanitize(with(out, self.hot.status()))
+                self.rotate_locked("operator:rotate_hot_key")?
             }
             "sweep_hot" => {
                 let _g = self.lock();
@@ -518,8 +534,24 @@ impl Signer {
                 let scan = p.get("scan").map(|v| truthy(Some(v))).unwrap_or(true);
                 sanitize(with(self.hot.reconcile(scan), self.hot_status(true)))
             }
-            other => return Err(err("unknown_method", format!("unknown method {other}"))),
+            other => match self.admin_dispatch(other, p) {
+                Some(r) => r?,
+                None => return Err(err("unknown_method", format!("unknown method {other}"))),
+            },
         })
+    }
+
+    /// Rotate the hot key (the caller holds the spend lock); `rule` names who asked in the signature log.
+    pub(crate) fn rotate_locked(&self, rule: &str) -> Result<Value> {
+        sigaudit::set_rule(rule);
+        let out = self.hot.rotate()?;
+        self.engine.audit.append(json!({"type": "hot_rotation", "ts": ts_value(self.now()), "old_address": out["old_address"],
+                                        "new_address": out["new_address"], "sweep_txid": out["sweep"].get("txid")}));
+        if !out["sweep"].is_null() {
+            self.mine_safe();
+        }
+        self.anchor_after("rotation");
+        Ok(sanitize(with(out, self.hot.status())))
     }
 
     fn payment(&self, p: &Value) -> Result<Payment> {
@@ -537,7 +569,7 @@ impl Signer {
     /// Broadcast the payer's CLTV refund of a channel the provider did not close. The refund always
     /// pays the current hot key: nothing the caller passes can redirect it.
     pub fn refund_locked(&self, key: &str, auto: bool) -> Result<Value> {
-        if !self.config.refund_enabled {
+        if !self.config().refund_enabled {
             return Ok(deny("refund_disabled", "refunds are off in this policy"));
         }
         let dest = if key.is_empty() { None } else { self.book.find_dest(key) };
@@ -644,12 +676,12 @@ impl Signer {
         let Ok(h) = self.height() else { return actions };
         for rec in self.book.pending_records() {
             // P1/P2: finish opens a crash or a wait left behind
-            if h >= rec.expiry - self.config.refund_margin_blocks {
+            if h >= rec.expiry - self.config().refund_margin_blocks {
                 continue;
             }
             {
                 let mut tried = self.open_tried.lock().unwrap_or_else(|p| p.into_inner());
-                if now_f64() - tried.get(&rec.dest).copied().unwrap_or(0.0) < self.config.open_retry_s as f64 {
+                if now_f64() - tried.get(&rec.dest).copied().unwrap_or(0.0) < self.config().open_retry_s as f64 {
                     continue;
                 }
                 tried.insert(rec.dest.clone(), now_f64());
@@ -722,7 +754,7 @@ impl Signer {
                                                         x2b(&str_or_empty(p.get("signature")))) else {
             return json!({"ok": false, "reason": "bad amount, expiry or signature"});
         };
-        if self.human_pubkey.is_empty() || sig.is_empty() || !verify(&self.human_pubkey, &sweep_message(&self.hot.address(), &to, amount, expiry), &sig) {
+        if self.human_key().is_empty() || sig.is_empty() || !verify(&self.human_key(), &sweep_message(&self.hot.address(), &to, amount, expiry), &sig) {
             return json!({"ok": false, "reason": "sweep_hot requires a valid human signature"});
         }
         if (expiry as f64) < self.now() {
@@ -744,7 +776,7 @@ impl Signer {
 
     fn uses_channel(&self, dest: &str) -> bool {
         let dest = normalize_dest(dest);
-        self.book.has(&dest) || !self.config.pay_to_for(&dest).is_empty() || dest.starts_with("http://") || dest.starts_with("https://")
+        self.book.has(&dest) || !self.config().pay_to_for(&dest).is_empty() || dest.starts_with("http://") || dest.starts_with("https://")
     }
 
     fn pay_locked(&self, p: &Value, human: bool) -> Result<Value> {
@@ -790,15 +822,15 @@ impl Signer {
         if let Some(existing) = self.book.get(&dest).filter(|r| r.state == "open") {
             return Ok(with(json!({"verdict": "allow", "already": true}), existing.public()));
         }
-        let pay_to = { let v = str_or_empty(p.get("pay_to")); if v.trim().is_empty() { self.config.pay_to_for(&dest) } else { v.trim().to_string() } };
+        let pay_to = { let v = str_or_empty(p.get("pay_to")); if v.trim().is_empty() { self.config().pay_to_for(&dest) } else { v.trim().to_string() } };
         if pay_to.is_empty() {
             return Ok(deny("pay_to", format!("no payTo pubkey registered for {dest}")));
         }
-        let cap = py_int(p.get("cap_sats")).filter(|v| *v != 0).unwrap_or(self.config.per_counterparty_cap_sats);
-        let expiry_blocks = py_int(p.get("expiry_blocks")).filter(|v| *v != 0).unwrap_or(self.config.channel_expiry_blocks);
+        let cap = py_int(p.get("cap_sats")).filter(|v| *v != 0).unwrap_or(self.config().per_counterparty_cap_sats);
+        let expiry_blocks = py_int(p.get("expiry_blocks")).filter(|v| *v != 0).unwrap_or(self.config().channel_expiry_blocks);
         let close_fee = py_int(p.get("close_fee")).filter(|v| *v != 0).unwrap_or(600);
         if let Err(e) = self.hot.check_channel_funding() {
-            return Ok(with(deny("hot_balance_cap", e.msg), json!({"action": "human_sweep", "hot_sats": self.hot.balance_sats(), "cap_sats": self.hot.cap_sats})));
+            return Ok(with(deny("hot_balance_cap", e.msg), json!({"action": "human_sweep", "hot_sats": self.hot.balance_sats(), "cap_sats": self.hot.cap_sats()})));
         }
         let (secret, payer_pub) = self.book.new_payer_key();
         let open_height = self.height()?;
@@ -826,7 +858,7 @@ impl Signer {
         match e.code.as_str() {
             "channel_cap" => deny("channel_cap", e.msg.clone()),
             "hot_balance_cap" => with(deny("hot_balance_cap", e.msg.clone()),
-                                      json!({"action": "human_sweep", "hot_sats": self.hot.balance_sats(), "cap_sats": self.hot.cap_sats})),
+                                      json!({"action": "human_sweep", "hot_sats": self.hot.balance_sats(), "cap_sats": self.hot.cap_sats()})),
             c if INTERNAL.contains(&c) => deny("xbt402", e.msg.clone()),
             c => deny(c, e.msg.clone()),
         }
@@ -854,10 +886,10 @@ impl Signer {
         if max_sats < 0 {
             return deny("amount", "max_sats must be >= 0");
         }
-        let (exp, cap) = (self.config.channel_expiry_blocks, self.config.per_counterparty_cap_sats);
+        let (exp, cap) = (self.config().channel_expiry_blocks, self.config().per_counterparty_cap_sats);
         if max_sats == 0 {
             // free-only: allowlisted dest, no channel open or update; a >0 price is refused in pay_once
-            if !self.engine.allowlist.contains(&dest) {
+            if !self.engine.allowlist().contains(&dest) {
                 return deny("allowlist", format!("destination not on allowlist: {dest}"));
             }
             return match self.session.pay_once(&url, &method, &raw, 0, exp, cap) {
@@ -867,14 +899,21 @@ impl Signer {
             };
         }
         let pay = Payment::new(&dest, max_sats, &format!("xbt402 {method} {url}"));
-        let d = match self.engine.evaluate(&pay, false) {
+        // AGP-039: a human-approved grant for exactly this call pays as B2's approve does (human = true)
+        let grant = self.find_xbt402_grant(&dest, max_sats, &url, &method);
+        let d = match self.engine.evaluate(&pay, grant.is_some()) {
             Ok(d) => d,
             Err(e) => return deny("xbt402", e.msg),
         };
+        if d.verdict == crate::policy::Verdict::NeedsHuman {
+            if let Some(t) = &d.approval_token {
+                let _ = self.engine.store.update_approval(t, &json!({"kind": "xbt402", "url": url, "method": method}));
+            }
+        }
         if !d.allowed() {
             return d.as_value();
         }
-        sigaudit::set_rule(&format!("policy:{}", d.rule));
+        sigaudit::set_rule(&if grant.is_some() { "human:approval_signature".to_string() } else { format!("policy:{}", d.rule) });
         let result = match self.session.pay_once(&url, &method, &raw, max_sats, exp, cap) {
             Ok(r) => r,
             Err(e) => return self.pay_deny(&e),
@@ -888,6 +927,10 @@ impl Signer {
             if let Err(e) = self.engine.commit(&Payment::new(&dest, charged, &pay.memo), &chan) {
                 return deny("xbt402", e.msg);
             }
+        }
+        if let Some(t) = &grant {
+            self.use_xbt402_grant(t, charged);
+            return with(with(d.as_value(), result), json!({"rail": "xbt402", "approved": true, "approval_token": t}));
         }
         with(with(d.as_value(), result), json!({"rail": "xbt402"}))
     }
@@ -1070,6 +1113,7 @@ impl Signer {
             Ok(v) => v,
             Err(e) => deny("close_channel", e.msg),
         };
+        self.save_close_report(&out);
         self.anchor_after("close");
         out
     }
@@ -1088,11 +1132,12 @@ impl Signer {
         let expiry = py_int(p.get("expiry")).unwrap_or(0);
         let sig_hex = { let s = str_or_empty(p.get("signature")); if s.is_empty() { str_or_empty(p.get("sig")) } else { s } };
         let Some(signature) = x2b(&sig_hex) else { return Ok(deny("approval_sig", "signature is not valid hex")) };
-        if self.human_pubkey.is_empty() {
+        let human_pubkey = self.human_key();
+        if human_pubkey.is_empty() {
             return Ok(deny("approval_sig", "signer has no human public key configured"));
         }
         let now = self.now();
-        if signature.is_empty() || !verify_approval(&self.human_pubkey, &token, &dest, amount, expiry, &signature) {
+        if signature.is_empty() || !verify_approval(&human_pubkey, &token, &dest, amount, expiry, &signature) {
             self.engine.audit.append(json!({"type": "decision", "verdict": "deny", "rule": "approval_sig", "reason": "missing or invalid human signature",
                                             "dest": dest, "amount_sats": amount, "ts": ts_value(now)}));
             return Ok(deny("approval_sig", "missing or invalid human signature over (token, dest, amount, expiry)"));
@@ -1107,6 +1152,7 @@ impl Signer {
         let stored_exp = py_int(payload.get("expires")).unwrap_or(0);
         if (stored_exp as f64) < now || (expiry as f64) < now {
             self.engine.store.pop_approval(&token)?;
+            self.note_expired(&token);
             self.engine.audit.append(json!({"type": "approval_expired", "token": token, "ts": ts_value(now)}));
             return Ok(deny("approval_expired", "approval token expired"));
         }
@@ -1115,7 +1161,11 @@ impl Signer {
                                             "reason": "signature fields do not match pending approval", "dest": dest, "amount_sats": amount, "ts": ts_value(now)}));
             return Ok(deny("approval_bind", "signature fields do not match the pending approval"));
         }
+        if payload.get("kind").and_then(Value::as_str) == Some("xbt402") {
+            return self.grant_xbt402(&token, &payload);
+        }
         let Some(pay) = self.engine.consume_approval(&token)? else { return Ok(deny("approval", "unknown or expired approval token")) };
+        self.note_used(&token);
         let _g = self.lock();
         let mut settled = self.pay_locked(&json!({"to": pay.dest, "amount_sats": pay.amount_sats, "memo": pay.memo}), true)?;
         if settled["verdict"] == "allow" {
