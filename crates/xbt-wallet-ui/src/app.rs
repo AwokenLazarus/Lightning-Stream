@@ -336,7 +336,8 @@ impl App {
             }),
             "/deny" => back("./approvals", self.call("deny_approval", json!({"token": g("token"), "reason": g("reason")})), &|_| "Denied.".into()),
             "/policy" => self.policy_preview(ctx, f),
-            "/policy-apply" => back("./policy", self.call("policy_set", json!({"text": f.get("text").cloned().unwrap_or_default(),
+            // browsers submit line breaks as CRLF; the signed text is LF only (JSON escapes a CR inside a string)
+            "/policy-apply" => back("./policy", self.call("policy_set", json!({"text": f.get("text").map(|t| t.replace("\r\n", "\n")).unwrap_or_default(),
                                                                               "prev_sha256": g("prev_sha256"), "expiry": i("expiry"), "signature": sig()})), &|v| {
                 let pr = v.get("pending_restart").and_then(Value::as_array).map(|a| a.iter().map(|x| txt(Some(x))).collect::<Vec<_>>().join(", ")).unwrap_or_default();
                 if pr.is_empty() { "Policy applied; it is in force now.".into() } else { format!("Policy applied. These take effect when the signer restarts: {pr}.") }

@@ -213,7 +213,8 @@
   function say(el, text, bad) {
     if (!el) return;
     el.textContent = text;
-    el.className = "msg " + (bad ? "bad" : "ok");
+    el.classList.remove("ok", "bad");
+    el.classList.add("msg", bad ? "bad" : "ok");
   }
   function fields(form) {
     var f = {};

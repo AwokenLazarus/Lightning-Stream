@@ -81,3 +81,5 @@ ol.steps { list-style: none; padding: 0; }
 .approval.pending { border-left: 4px solid var(--warn); }
 .approval.approved { border-left: 4px solid var(--ok); }
 [hidden] { display: none !important; }
+dl.kv dt { overflow-wrap: normal; word-break: normal; }
+section.grid { margin-bottom: 24px; }
