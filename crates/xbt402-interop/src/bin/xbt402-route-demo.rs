@@ -1,9 +1,10 @@
 //! The AGP-021 demo scenarios, all Rust, on regtest (a port of B1 `scripts/demo_route.py`; run by
 //! `scripts/route_interop.sh`). Real HTTP (tiny_http + ureq) between every party.
 //!
-//! 1 client (LocalSigner), 1 hub, 4 providers: operator 1 runs A and B under ONE payTo key, C and D
-//! are separate operators. The client has ONE channel (to the hub); the hub funds one ch2 to each
-//! provider itself, payee-pays (v1.2).
+//! 1 client (LocalSigner), 1 hub, 4 providers: operator 1 runs A and B under ONE payTo key (one
+//! provider serving two mounts on two ports), C and D are separate operators. The client has ONE
+//! channel (to the hub); the hub funds one ch2 per payTo itself (AGP-044: A and B share one),
+//! payee-pays (v1.2).
 //!
 //! * phase 1 (~10 s): the client streams to all 4 at 12 calls/s each; per-window adaptor locks pay
 //!   each provider's accrued amount through the hub. A and B cost under a sat per call (amsat, B with
@@ -60,6 +61,11 @@ fn price(n: &str) -> u128 {
         "C" => 20 * AMSAT_PER_SAT,
         _ => 40 * AMSAT_PER_SAT,
     }
+}
+
+/// Each provider's metered mount (A and B are two mounts of operator 1's one provider).
+fn mount(n: &str) -> &'static str {
+    if n == "B" { "/v1/chunk-b" } else { "/v1/chunk" }
 }
 
 fn sk(n: u64) -> SecretKey {
@@ -135,6 +141,15 @@ fn main() {
     let mut provs: HashMap<&str, Arc<Provider>> = HashMap::new();
     let mut urls: HashMap<&str, String> = HashMap::new();
     for (i, n) in NAMES.iter().enumerate() {
+        urls.insert(n, format!("http://127.0.0.1:{}", pb + 1 + i as u16));
+        if *n == "B" {
+            // operator 1's second mount, on its own port: the same provider (one payTo, one ledger)
+            let a = provs["A"].clone();
+            a.offer_route(RouteOffer { window: WINDOW, lock_wait: LOCK_WAIT, invoice_ttl: INVOICE_TTL, ..RouteOffer::new(mount(n), price(n)) });
+            serve_http(a.clone(), &format!("127.0.0.1:{}", pb + 1 + i as u16), 8).expect("bind provider");
+            provs.insert(n, a);
+            continue;
+        }
         let mut cfg = ProviderConfig::new(&net);
         cfg.close_margin = 144;
         cfg.policy = FundingPolicy { min_capacity: 20_000, min_expiry_blocks: 1_008, max_expiry_blocks: 8_640, close_margin: 144, ..FundingPolicy::default() };
@@ -145,11 +160,10 @@ fn main() {
         let p = Provider::new(Arc::new(rpc.clone()), sk(keys[i]), cfg, ledger, Box::new(|_, _| 1000), Box::new(move |_, _, _| {
             HttpResponse::new(200, vec![("Content-Type".into(), "application/json".into())], json!({"shard": name}).to_string())
         })).unwrap();
-        p.offer_route(RouteOffer { window: WINDOW, lock_wait: LOCK_WAIT, invoice_ttl: INVOICE_TTL, ..RouteOffer::new("/v1/chunk", price(n)) });
+        p.offer_route(RouteOffer { window: WINDOW, lock_wait: LOCK_WAIT, invoice_ttl: INVOICE_TTL, ..RouteOffer::new(mount(n), price(n)) });
         let p = Arc::new(p);
         serve_http(p.clone(), &format!("127.0.0.1:{}", pb + 1 + i as u16), 8).expect("bind provider");
         provs.insert(n, p);
-        urls.insert(n, format!("http://127.0.0.1:{}", pb + 1 + i as u16));
     }
     ck.check("operator 1 runs A and B under one payTo key", provs["A"].pay_to() == provs["B"].pay_to() && provs["A"].pay_to() != provs["C"].pay_to(),
              format!("{}...", &provs["A"].pay_to()[..18]));
@@ -162,21 +176,28 @@ fn main() {
                                      &net, Some(&run.join("hub")), cfg).unwrap());
     serve_service(hub.clone(), &format!("127.0.0.1:{pb}"), 16).expect("bind hub");
     let hub_url = format!("http://127.0.0.1:{pb}");
-    println!("== hub funds one channel to each provider from its own wallet (providers open nothing)");
+    println!("== hub funds one channel per payTo from its own wallet (providers open nothing)");
+    let committed0 = hub.committed_sat();
     for n in NAMES {
         let cap = if n == "D" { 30_000 } else { 150_000 };
         let oc = hub.connect(&urls[n], Some(cap), None).expect("connect");
-        println!("   ch2 hub->{n}: {}... capacity {cap}", &oc.params.channel_id()[..20]);
+        println!("   ch2 hub->{n}: {}... capacity {}{}", &oc.params.channel_id()[..20], oc.params.capacity,
+                 if oc.origin != urls[n] { " (A's: one ch2 per payTo)" } else { "" });
     }
     hub.watch_tick();
-    let opened: Vec<&str> = NAMES.iter().copied().filter(|n| hub.out_channels()[&urls[n]].state == "open").collect();
+    let ch2 = |n: &str| hub.ch2_for(&urls[n]).expect("ch2");
+    let opened: Vec<&str> = NAMES.iter().copied().filter(|n| ch2(n).state == "open").collect();
     ck.check("hub-funded ch2 open to all 4 providers", opened.len() == 4, opened.join(","));
+    ck.check("one live ch2 per payTo: A and B share one ch2, 3 funded for 4 origins, the cap counts it once",
+             ch2("A").params.channel_id() == ch2("B").params.channel_id() && hub.out_channels().len() == 3
+             && hub.committed_sat() - committed0 == 150_000 * 2 + 30_000,
+             format!("{} ch2s, {} sat committed", hub.out_channels().len(), hub.committed_sat() - committed0));
     let r402 = hub.serve("GET", HUB_ROUTE_PATH, &[], b"", "", None);
     let routing = xbt402::wire::unb64json(r402.header("PAYMENT-REQUIRED").unwrap()).unwrap()["accepts"][0]["extra"]["routing"].clone();
-    let payee_all = NAMES.iter().all(|n| hub.out_channels()[&urls[n]].params.close_fee_payer == xbt402::channel::FeePayer::Payee);
+    let payee_all = NAMES.iter().all(|n| ch2(n).params.close_fee_payer == xbt402::channel::FeePayer::Payee);
     ck.check("v1.2: the hub advertises payee-pays ch2 (ch1 payer-pays) and every ch2 is payee-pays",
              routing["ch1CloseFeePayer"] == "payer" && routing["ch2CloseFeePayer"] == "payee" && payee_all,
-             format!("ch2 minCum {}", hub.out_channels()[&urls["A"]].params.min_amount()));
+             format!("ch2 minCum {}", ch2("A").params.min_amount()));
 
     // --- client ----------------------------------------------------------------------------------
     let signer = Arc::new(LocalSigner::new());
@@ -185,7 +206,7 @@ fn main() {
                                          Box::new(move || node.block_count())));
     let ch1 = payer.open().expect("open ch1");
     println!("== client (Rust LocalSigner) opened ONE channel to the hub: {}... capacity {}", &ch1["chan"].as_str().unwrap()[..20], ch1["capacity"]);
-    let shards: HashMap<&str, Arc<Shard>> = NAMES.iter().map(|n| (*n, payer.shard(&format!("{}/v1/chunk", urls[n]), "POST").unwrap())).collect();
+    let shards: HashMap<&str, Arc<Shard>> = NAMES.iter().map(|n| (*n, payer.shard(&format!("{}{}", urls[n], mount(n)), "POST").unwrap())).collect();
 
     // background: a block every 1.5 s (rollover confirmations), the hub's watcher every 0.3 s
     let stop_bg = Arc::new(AtomicBool::new(false));
@@ -266,7 +287,7 @@ fn main() {
     ck.check("provider C: >= 10 updates/s until it stopped revealing", rate_c >= 10.0, format!("{rate_c:.1}/s"));
     let hev = hub.events.lock().unwrap().clone();
     let rolls: Vec<Value> = hev.iter().filter(|e| e["event"] == "ch2_rollover").cloned().collect();
-    let fee_d = hub.out_channels()[&urls["D"]].params.close_fee;
+    let fee_d = ch2("D").params.close_fee;
     ck.check("hub rolled D's channel over at D's threshold (net payout >= 2x its own close fee)",
              !rolls.is_empty() && rolls.iter().all(|r| r["amount"].as_u64().unwrap() - fee_d >= 2 * fee_d),
              format!("{} rollover(s), amounts {:?}", rolls.len(), rolls.iter().map(|r| r["amount"].as_u64().unwrap()).collect::<Vec<_>>()));
@@ -282,7 +303,7 @@ fn main() {
                  format!("{confs} conf, payee output {paid}, next ch2 {} = {cap} - {amount}", r["nextCapacity"]));
     }
     let voids_c = hev.iter().filter(|e| e["event"] == "void" && e["provider"] == urls["C"].as_str()).count();
-    let oc_c = hub.out_channels()[&urls["C"]].clone();
+    let oc_c = ch2("C");
     ck.check("C never revealed: the hub wrote the lock off, stopped routing to C", voids_c > 0 && !oc_c.blocked.is_empty(),
              format!("{voids_c} lock(s) written off, blocked: {}", oc_c.blocked));
     let held: Vec<Value> = provs["C"].routes().lock().held.iter().filter(|h| xbt402::json::truthy(h.get("pre"))).cloned().collect();
@@ -337,9 +358,11 @@ fn main() {
     let (routed, fee_units, fee_paid, _) = payer.counters();
     ck.check("hub fee carried exactly across every lock: fees == ceil(units / 1e9)", fee_paid as u128 == ceil_div(fee_units, FEE_UNITS_PER_SAT),
              format!("{fee_paid} sat for {fee_units} units"));
-    let oc_now = hub.out_channels();
-    ck.check("one payee key per operator: A and B share payTo, their ch2 payee keys differ",
-             oc_now[&urls["A"]].pay_to == oc_now[&urls["B"]].pay_to && oc_now[&urls["A"]].params.payee_pub != oc_now[&urls["B"]].params.payee_pub, String::new());
+    let ab = ch2("A");
+    let (la, lb) = (shards["A"].snapshot().locked_sat, shards["B"].snapshot().locked_sat);
+    ck.check("one ch2 per payTo: A's and B's locks all went over operator 1's one ch2",
+             ch2("B").params.channel_id() == ab.params.channel_id() && ab.routed == la + lb && la > 0 && lb > 0,
+             format!("ch2 routed {} = A {la} + B {lb}", ab.routed));
     let at_fwd = hub.stats.lock().unwrap().ch1_locks_at_forward.clone();
     ck.check("fan-out: at most one lock pending on ch1 at every forward", !at_fwd.is_empty() && at_fwd.iter().all(|n| *n == 1),
              format!("{} forwards", at_fwd.len()));
@@ -351,9 +374,9 @@ fn main() {
     let c1 = payer.close().expect("close ch1");
     let mut closes = vec![];
     for n in NAMES {
-        let oc = hub.out_channels()[&urls[n]].clone();
-        if oc.state == "open" {
-            closes.push((n, hub.close_ch2(&oc, false).expect("close ch2")));
+        // B's ch2 is A's: closed once
+        if let Some(oc) = hub.ch2_for(&urls[n]).filter(|c| c.state == "open") {
+            closes.push((if n == "A" { "A+B" } else { n }, hub.close_ch2(&oc, false).expect("close ch2")));
         }
     }
     chain.mine(1);
@@ -370,7 +393,7 @@ fn main() {
             continue;
         }
         let txid = c["txid"].as_str().unwrap();
-        let p = &provs[n];
+        let p = &provs[&n[..1]];
         let st2 = p.channel_ids().iter().filter_map(|x| p.channel_state(x)).find(|s| s.closed_txid == txid).unwrap();
         let (confs, paid) = chain.payee_out(txid, &hex::encode(&st2.params.payee_spk));
         let (_, change) = chain.payee_out(txid, &hex::encode(&st2.params.payer_spk));

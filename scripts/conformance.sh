@@ -26,12 +26,13 @@ for pair in "$B1/docs/x402/vectors.json:vectors/xbt402_vectors.json" \
   if cmp -s "$src" "$pin"; then echo "  same  $pin = $src"; else echo "  DIFF  $pin != $src" >&2; exit 1; fi
 done
 
+BIN=${CARGO_TARGET_DIR:-./target}/release
 echo "== 2. Rust recomputes every published vector"
 "${SOAK[@]}" cargo build -q -j2 --release -p xbt402-interop --bins
-./target/release/xbt-conformance vectors
+"$BIN"/xbt-conformance vectors
 
 echo "== 3. reverse: Python check_vectors.py checks the Rust-emitted vector file"
-./target/release/xbt402-vectors "$OUT/rust_vectors.json"
+"$BIN"/xbt402-vectors "$OUT/rust_vectors.json"
 python3 scripts/py_check_rust_vectors.py "$OUT/rust_vectors.json"
 # and under libsecp256k1 (coincurve), from B1's venv, when there is one
 PYCC=${XBT402_PY_COINCURVE:-$HOME/xbt-rnd/b1/.venv/bin/python}
@@ -45,9 +46,9 @@ XBT402_B1=$B1 "$PYR" scripts/route_vectors.py gen "$OUT/py_routing.json"
 if cmp -s "$OUT/py_routing.json" vectors/xbt402_routing_vectors.json; then echo "  same  vectors/xbt402_routing_vectors.json = B1 (regenerated)"; else echo "  DIFF  pinned routing vectors != B1 regenerated" >&2; exit 1; fi
 XBT402_B1=$B1 python3 scripts/route_vectors.py gen "$OUT/py_routing_oracle.json"
 cmp -s "$OUT/py_routing.json" "$OUT/py_routing_oracle.json" || { echo "  DIFF  B1 coincurve != B1 oracle" >&2; exit 1; }
-./target/release/xbt402-route-vectors "$OUT/rust_routing.json"
+"$BIN"/xbt402-route-vectors "$OUT/rust_routing.json"
 if cmp -s "$OUT/rust_routing.json" vectors/xbt402_routing_vectors.json; then echo "  same  Rust-emitted routing vectors = published (byte-identical)"; else echo "  DIFF  Rust routing vectors differ" >&2; diff "$OUT/rust_routing.json" vectors/xbt402_routing_vectors.json | head -20 >&2; exit 1; fi
-./target/release/xbt402-route-vectors --check vectors/xbt402_routing_vectors.json
+"$BIN"/xbt402-route-vectors --check vectors/xbt402_routing_vectors.json
 XBT402_B1=$B1 "$PYR" scripts/route_vectors.py check "$OUT/rust_routing.json"
 XBT402_B1=$B1 python3 scripts/route_vectors.py check "$OUT/rust_routing.json"
 echo "conformance: OK"

@@ -3,12 +3,17 @@
 //! a last lock pass, then a cooperative close of ch1. Prints a JSON summary on stdout.
 //!
 //! xbt402-route-payer --hub URL --shards URL,URL --rpc-port R --cookie PATH [--seconds 6] [--rate 10]
-//!                    [--signer-sock PATH]
+//!                    [--signer-sock PATH] [--ledger PATH [--no-close]]
 //!
 //! With `--signer-sock` the keys live in the Rust B2 signer (`xbt-signer`, AGP-034): the payer is an
 //! `xbt_signer::client::RemoteSigner` (every adaptor lock under the signer's routing policy and
 //! policy engine), ch1 is funded from the signer's hot key, and after the close the signer is told
 //! (`xbt402_mark_closed`) so it counts the change.
+//!
+//! With `--ledger` (AGP-044) the payer keeps its state in a [`FileRouteLedger`] and resumes from it:
+//! run it, SIGKILL it mid-window, run it again with the same ledger (and the same signer) and it
+//! goes on with the same ch1 and the same provider sessions. `--no-close` skips the last pass and
+//! the close (a run that is meant to be killed).
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -16,7 +21,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use xbt402::client::Wallet;
 use xbt402::http::UreqTransport;
-use xbt402::route_client::{RoutePayer, RoutePayerConfig};
+use xbt402::route_client::{FileRouteLedger, RoutePayer, RoutePayerConfig};
 use xbt402::rpc::Rpc;
 use xbt402::signer::{LocalSigner, RouteSigner};
 use xbt_signer::client::RemoteSigner;
@@ -69,8 +74,13 @@ fn main() {
         None => (Arc::new(LocalSigner::new()), Arc::new(MiningWallet(rpc.clone(), addr))),
     };
     let node = rpc.clone();
-    let pay = Arc::new(RoutePayer::new(&arg("--hub").expect("--hub"), RoutePayerConfig::new(&network), signer, wallet,
-                                       Box::new(UreqTransport::default()), Box::new(move || node.block_count())));
+    let mut pay = RoutePayer::new(&arg("--hub").expect("--hub"), RoutePayerConfig::new(&network), signer, wallet,
+                                  Box::new(UreqTransport::default()), Box::new(move || node.block_count()));
+    if let Some(l) = arg("--ledger") {
+        pay = pay.with_ledger(Box::new(FileRouteLedger::open(std::path::Path::new(&l)).expect("ledger"))).expect("resume from the ledger");
+    }
+    let pay = Arc::new(pay);
+    let no_close = std::env::args().any(|a| a == "--no-close");
     let ch1 = pay.open().expect("open ch1");
     let shards: Vec<_> = arg("--shards").expect("--shards").split(',').map(|u| pay.shard(u, "POST").expect("shard")).collect();
     let (secs, rate): (f64, f64) = (arg("--seconds").map(|s| s.parse().unwrap()).unwrap_or(6.0), arg("--rate").map(|s| s.parse().unwrap()).unwrap_or(10.0));
@@ -97,6 +107,11 @@ fn main() {
     stop.store(true, Ordering::Relaxed);
     let ok: Vec<u64> = ths.into_iter().map(|t| t.join().unwrap()).collect();
     let dur = t0.elapsed().as_secs_f64();
+    if no_close {
+        pay.stop();
+        println!("{}", json!({"impl": "rust", "ch1": ch1, "summary": pay.summary(), "okCalls": ok, "seconds": dur}));
+        return;
+    }
     // last pass: pay what is due now (the provider's credit window covers the tail otherwise)
     let until = Instant::now() + Duration::from_secs(8);
     while Instant::now() < until && (pay.pending().is_some() || shards.iter().any(|s| s.due_sat() > 0)) {

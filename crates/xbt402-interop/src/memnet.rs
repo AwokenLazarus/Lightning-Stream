@@ -24,12 +24,17 @@ struct ChainState {
     raw: HashMap<String, String>,
     /// `estimatesmartfee`, sat/vB (None: no estimate).
     fee_rate: Option<f64>,
+    /// Fee and vsize of each broadcast tx (its inputs were known when it came in).
+    fees: HashMap<String, (u64, u64)>,
+    /// Blocks take only txs paying at least this, sat/vB (a fee market; 0: everything).
+    block_min_feerate: f64,
 }
 
 /// A fake node: fundings appear with 6 confirmations, broadcasts spend their inputs (a conflicting
-/// spend is refused; a tx not final at the tip too) and create unconfirmed outputs; `confirm_all`
-/// confirms everything. `gettxout` without the mempool still shows an output spent only in the
-/// mempool, as a node does.
+/// spend is refused unless it replaces a mempool spend by BIP125: the old one signals, the new one
+/// pays its fee + 1 sat/vB more; a tx not final at the tip is refused too) and create unconfirmed
+/// outputs; `confirm_all` confirms everything paying the block min feerate. `gettxout` without the
+/// mempool still shows an output spent only in the mempool, as a node does.
 pub struct MemChain {
     st: Mutex<ChainState>,
 }
@@ -53,11 +58,30 @@ impl MemChain {
 
     pub fn confirm_all(&self) {
         let mut st = self.st();
-        for u in st.utxos.values_mut() {
-            u.confirmations = u.confirmations.max(1);
+        let min = st.block_min_feerate;
+        let held: HashSet<String> = st.fees.iter().filter(|(_, (f, v))| (*f as f64) < min * *v as f64).map(|(t, _)| t.clone()).collect();
+        for (k, u) in st.utxos.iter_mut() {
+            if !held.contains(&k.0) {
+                u.confirmations = u.confirmations.max(1);
+            }
         }
-        let spent: Vec<_> = st.spent.keys().cloned().collect();
+        let spent: Vec<_> = st.spent.iter().filter(|(_, s)| !held.contains(*s)).map(|(k, _)| k.clone()).collect();
         st.mined.extend(spent);
+    }
+
+    /// Blocks take only txs paying at least `sat_per_vb` (the rest wait in the mempool).
+    pub fn set_block_min_feerate(&self, sat_per_vb: f64) {
+        self.st().block_min_feerate = sat_per_vb;
+    }
+
+    /// (fee, vsize) of a broadcast tx.
+    pub fn fee_of(&self, txid: &str) -> Option<(u64, u64)> {
+        self.st().fees.get(txid).copied()
+    }
+
+    /// Whether `txid`'s outputs are in a block.
+    pub fn confirmed(&self, txid: &str) -> bool {
+        self.st().utxos.iter().any(|(k, u)| k.0 == txid && u.confirmations >= 1)
     }
 
     /// `n` blocks: every mempool tx and spend confirms.
@@ -121,19 +145,33 @@ impl ChainBackend for MemChain {
     fn send_raw_transaction(&self, hex: &str) -> Result<String> {
         let tx = Tx::parse_hex(hex)?;
         let txid = tx.txid();
-        let mut st = self.st();
+        let st = self.st();
         if st.raw.contains_key(&txid) {
             return Ok(txid);
         }
         if tx.locktime > st.height && tx.locktime < 500_000_000 {
             return Err(ChannelError::new("rpc_error", "non-final"));
         }
+        let ins: u64 = tx.inputs.iter().map(|i| st.utxos.get(&(i.prevout.txid_hex(), i.prevout.vout)).map(|u| u.value).unwrap_or(0)).sum();
+        let outs: u64 = tx.outputs.iter().map(|o| o.value as u64).sum();
+        let (fee, vsize) = (ins.saturating_sub(outs), tx.vsize() as u64);
+        let mut replaced = vec![];
         for i in &tx.inputs {
             let k = (i.prevout.txid_hex(), i.prevout.vout);
-            if st.spent.get(&k).is_some_and(|s| *s != txid) {
+            let Some(old) = st.spent.get(&k).filter(|s| **s != txid).cloned() else { continue };
+            let signals = st.raw.get(&old).and_then(|h| Tx::parse_hex(h).ok()).is_some_and(|o| o.inputs.iter().any(|i| i.sequence < 0xFFFF_FFFE));
+            let old_fee = st.fees.get(&old).map(|f| f.0).unwrap_or(u64::MAX);
+            if st.mined.contains(&k) || !signals || fee < old_fee.saturating_add(vsize) {
                 return Err(ChannelError::new("rpc_error", "txn-mempool-conflict"));
             }
+            replaced.push(old);
         }
+        drop(st);
+        for old in replaced {
+            self.evict(&old);
+        }
+        let mut st = self.st();
+        st.fees.insert(txid.clone(), (fee, vsize));
         for i in &tx.inputs {
             st.spent.insert((i.prevout.txid_hex(), i.prevout.vout), txid.clone());
         }

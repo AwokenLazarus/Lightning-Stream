@@ -267,6 +267,93 @@ checks t·G == T and counted d + f twice, after which every lock on ch1 was `bad
 `a_paid_invoice_is_never_locked_again_even_a_floor_lock`). B1 `route_client.py` reproduces it
 (client routed 10 sat, hub 7) and needs the same one-line guard.
 
+## Hub and client leftovers (AGP-044)
+
+The routing items AGP-035 and AGP-037 left open. Items 1 and 2 are the same in B1's `xbt402/hub.py`
+(b1 `agp-044`).
+
+**1. A stuck ch2 refund is bumped by RBF.** A hub refund that is still unconfirmed
+`refund_bump_blocks` (default 3) after it was signed is signed again at a higher fee and replaces
+itself. The new fee is the estimate, at least double the stuck fee, and at least the stuck fee
++ 1 sat/vB (BIP125's increment). It is capped by `refund_max_fee_sat` (default 5,000) and always
+leaves dust. It pays the same destination as the version it replaces.
+* Hub refunds signal replaceability: nSequence `RBF_SEQUENCE` = 0xFFFFFFFD, with nLockTime still
+  enforced. `ChannelParams::refund_tx_seq` builds them; the client refund (`refund_tx`) and its
+  vector are unchanged.
+* Every version is written ahead and kept in `refund_prev` until one confirms. Whichever version
+  confirms is the refund, and its fee is the one counted.
+* Events: `ch2_refund_bump` (`replaces`, `feeFrom`), `ch2_refund_bump_capped`,
+  `ch2_refund_bump_failed` (the node refused the replacement; both versions stay tracked), and
+  `ch2_refund_confirmed` (with `versions`).
+
+Why RBF and not CPFP:
+
+| | RBF (chosen) | CPFP |
+|---|---|---|
+| who can sign | the hub alone: it holds the ch2 payer key, and the refund is 1-in-1-out | the owner of the refund output: with `refund_to` (a wallet address) the hub cannot, unless the `Wallet` trait grows a spend-this-UTXO call |
+| extra chain use | none: the same tx at a higher fee | a second tx (~110 vB) whose fee must also cover the parent |
+| a refund that left the mempool (too cheap to relay, evicted) | the higher-fee version simply goes out | no parent to attach to without package relay |
+| cost | the txid changes: every version must be tracked | the parent's txid is stable |
+| node support | a signalling refund replaces on any node | needs the parent in the mempool |
+
+A refund the hub signed before AGP-044 (0xFFFFFFFE) is replaceable only where full-RBF is on. On
+other nodes the replacement is refused (`ch2_refund_bump_failed`), and whichever version confirms
+still counts.
+
+**2. One live ch2 per payTo.** The hub identifies a provider by the payTo its /terms name, not by
+the URL it was reached at. Origins are canonical (`route::canon_origin`: scheme and host lowercased,
+the default port and trailing `/`s dropped).
+* `OutBook::origins` maps each connected origin to its payTo.
+* `connect` to an origin whose payTo already has a live ch2 funds nothing: it returns that ch2
+  (event `ch2_reuse`). The two-connects race is closed under the book lock (`ch2_funding`).
+* A route to either origin goes over that ch2, to the origin that opened it. Rollovers and refills
+  work as before. The cap counts the ch2 once.
+* The 402's `providers` lists every routable origin. `RouteHub::ch2_for(origin)` resolves an origin
+  to its ch2.
+* An operator therefore runs one paid backend (CMP-023). Two separate provider processes under one
+  key share the one ch2, and the second one's locks are refused. The demo's A and B are now two
+  mounts of one provider, on two ports.
+
+**3. The RoutePayer ledger seam.**
+```rust
+let payer = RoutePayer::new(hub_url, cfg, signer, wallet, transport, height)
+    .with_ledger(Box::new(FileRouteLedger::open(&path)?))?;   // resumes whatever the file holds
+payer.open()?;                          // {"resumed": true} with the same ch1
+let sh = payer.shard(url, "POST")?;     // the same provider session (no new 402)
+```
+* The `RouteLedger` trait is the `ClientLedger` store: every `ClientLedger` is a `RouteLedger`.
+  `FileRouteLedger` is JSON lines, fsynced, mode 0600, and compacts itself as it grows.
+  `MemoryRouteLedger` keeps the records in memory.
+* Records: `ch1`, `book` (counters, given-up locks, stats, quote), `pending`, and one `shard <url>`
+  per session.
+* Write-ahead: the lock and its ch1 seq before the request leaves, and a block of `SEQ_RESERVE`
+  (16) call seqs before the first of them leaves. The meters are saved every `persist_every`
+  answered calls (default 1).
+* Resuming a pending lock: the same request is sent again with a fresh seq and auth. The hub
+  answers a lock it completed with its saved answer, or takes a lock it never saw.
+* A presignature the ledger never recorded never left, so it is voided in the signer. A lock the
+  signer resolved just before the crash is committed on its secret (y opens T1, so t = y − r).
+* Calls a crash left unanswered are in doubt. The provider's next signed total may exceed the
+  client's meter by at most their count × the quoted price, and that gap is adopted
+  (`meter_adopted`). A larger gap is not adopted (`meter_gap`), so the mismatch stays visible.
+* No payer key, signature or refund is written: they stay in the signer (`xbt-signer`, or a
+  `LocalSigner` that outlives the payer). The file does hold each session's call-auth key, as
+  `FileClientLedger` holds `auth_key`. That key can make metered calls on its session; it can never
+  sign a state.
+
+**Tests.**
+* Rust: `tests/hub_leftovers.rs` (18) and `tests/route_payer_restart.rs` (11). Python:
+  `tests/security/test_agp044_hub_leftovers.py` (18, same names).
+* `scripts/refund_bump_regtest.sh` runs both hubs on Knots regtest. A refund is left out of blocks
+  with `generateblock ADDR []`, bumped 1 → 2 sat/vB, replaced in the node's mempool and confirmed.
+  A second run is capped (122 → 244 → 427 sat), 11/11 checks per hub.
+* `route_interop.sh` adds RSSR: the payer on xbt-signer with a route ledger is SIGKILLed mid-stream,
+  restarted on the same ledger and signer, and every on-chain check still holds to the sat.
+
+Fixed along the way: `xbt402-hub` (and B1 `python -m xbt402.hub`) asked the wallet for its default
+address type as the refund destination. That type is legacy on the Knots node, so every refund failed
+`bad_address`. Both now ask for `bech32`.
+
 ## Portability
 
 No platform-specific dependencies: libsecp256k1 (C, via `secp256k1-sys`), pure-Rust hashes and JSON,
