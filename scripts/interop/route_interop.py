@@ -246,7 +246,13 @@ def scenario(i, client, hub_impl, prov_impl):
                     time.sleep(0.2)
                 first.kill()
                 first.wait(10)
-                recs = [json.loads(x) for x in open(ledger)]
+                # a SIGKILL can land mid-append: skip a torn last line, as the Rust replay does
+                recs = []
+                for x in open(ledger):
+                    try:
+                        recs.append(json.loads(x))
+                    except ValueError:
+                        pass
                 last = {}
                 for r in recs:
                     last[r["k"]] = r["v"]
