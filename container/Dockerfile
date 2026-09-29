@@ -1,9 +1,12 @@
-# AGP-038: the agentpay images, one per binary, FROM scratch (docs/CONTAINER.md).
+# AGP-038: the agentpay images, one per binary, FROM scratch (docs/CONTAINER.md). AGP-040 adds the wallet UI
+# (AGP-039) and xbt-init, the one-shot that fixes a bind mount's owners before the services start.
 # Built by scripts/oci_build.sh with docker buildx for linux/amd64, linux/arm64 and linux/arm/v7 from the
 # static musl binaries it stages under bin/<arch>/. There is no RUN, so no emulator is needed.
 # Layer 1 (base.tar: passwd/group, /tmp, the /data skeleton with each component's owner) is byte-identical
-# in all four images and stored once. Layer 2 is the binary.
+# in all the images and stored once. Layer 2 is the binary.
 # No `# syntax=` line: the builder's built-in frontend, nothing pulled.
+
+ARG IMAGE=xbt-signer
 
 FROM scratch AS base
 ADD base.tar /
@@ -44,3 +47,29 @@ EXPOSE 9480
 USER xbt402-hub
 ENTRYPOINT ["/usr/bin/xbt402-hub"]
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 CMD ["/usr/bin/xbt402-hub", "healthcheck"]
+
+FROM base AS xbt-wallet-ui
+ARG TARGETARCH
+ARG TARGETVARIANT
+COPY --chmod=0555 bin/${TARGETARCH}${TARGETVARIANT}/xbt-wallet-ui /usr/bin/xbt-wallet-ui
+ENV XBT_UI_BIND=0.0.0.0:8480
+EXPOSE 8480
+USER xbt-wallet-ui
+ENTRYPOINT ["/usr/bin/xbt-wallet-ui"]
+CMD ["serve"]
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 CMD ["/usr/bin/xbt-wallet-ui", "healthcheck"]
+
+# The one image that runs as root: it exits once the data dir's owners and modes are right. Run it with
+# cap_drop ALL + CHOWN, FOWNER, DAC_OVERRIDE, no network, read-only (docs/CONTAINER.md §7).
+FROM base AS xbt-init
+ARG TARGETARCH
+ARG TARGETVARIANT
+COPY --chmod=0555 bin/${TARGETARCH}${TARGETVARIANT}/xbt-init /usr/bin/xbt-init
+USER 0:0
+ENTRYPOINT ["/usr/bin/xbt-init"]
+CMD ["init"]
+HEALTHCHECK NONE
+
+# `--build-arg IMAGE=<name>` without `--target` builds that one image (the ARG is at the top): for a
+# builder with no target option. scripts/oci_build.sh uses --target.
+FROM ${IMAGE} AS selected

@@ -91,8 +91,8 @@ pub struct Nav<'a> {
     pub logged_in: bool,
 }
 
-const PAGES: [(&str, &str); 8] = [("./", "Overview"), ("./approvals", "Approvals"), ("./policy", "Policy"), ("./channels", "Channels"),
-                                  ("./signatures", "Signatures"), ("./keys", "Keys"), ("./hub", "Hub"), ("./setup", "Setup")];
+const PAGES: [(&str, &str); 9] = [("./", "Overview"), ("./approvals", "Approvals"), ("./policy", "Policy"), ("./channels", "Channels"),
+                                  ("./signatures", "Signatures"), ("./keys", "Keys"), ("./agents", "Agents"), ("./hub", "Hub"), ("./setup", "Setup")];
 
 pub fn page(title: &str, nav: &Nav, flash: Option<(bool, String)>, body: &str) -> String {
     let mut links = String::new();

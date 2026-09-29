@@ -517,6 +517,27 @@ fn the_hub_page_probes_this_box_s_hub() {
 }
 
 #[test]
+fn the_agents_page_shows_the_mcp_endpoint_and_token_only_after_login() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let tdir = tempfile::tempdir().unwrap();
+    let tok = tdir.path().join("mcp-http-token");
+    let bx = start(json!({}), false, |c| {
+        c.mcp_urls = vec!["http://umbrel.local:33510/mcp".into()];
+        c.mcp_token_file = tok.clone();
+    });
+    let mut anon = B::new(&bx.base);
+    let r = anon.get("/agents");
+    assert_eq!(r.status, 303, "login first");
+    let mut br = logged_in(&bx);
+    let page = br.get("/agents").body;
+    assert!(page.contains("http://umbrel.local:33510/mcp") && page.contains("No token here yet"), "{page}");
+    std::fs::write(&tok, format!("{}\n", "ab".repeat(32))).unwrap();
+    let page = br.get("/agents").body;
+    assert!(page.contains(&"ab".repeat(32)) && page.contains("Bearer ") && page.contains("<details>"), "{page}");
+    assert!(page.contains("aria-current=\"page\">Agents"), "the nav marks the page");
+}
+
+#[test]
 fn xbt_compute_status_tile_and_link_when_configured() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let cmp = tiny_http::Server::http("127.0.0.1:0").unwrap();

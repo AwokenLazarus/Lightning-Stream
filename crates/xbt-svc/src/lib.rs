@@ -9,8 +9,12 @@
 //! * [`health`]: node sync status, the readiness file of a socket-only service, freshness checks.
 //! * [`proxy`]: base-path stripping and the public URL behind Umbrel `app_proxy`, StartOS and Tor.
 //! * [`probe`]: a minimal HTTP GET for `healthcheck` subcommands (images have no shell or curl).
+//! * [`layout`]: the data dir's owners and modes, and `xbt-init`, which makes a bind mount or a
+//!   root-owned volume match them (Umbrel, StartOS; AGP-040).
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+
+pub mod layout;
 
 /// A non-empty, trimmed environment variable.
 pub fn env(name: &str) -> Option<String> {
@@ -57,6 +61,8 @@ pub const SIGNER: &str = "signer";
 pub const WITNESS: &str = "witness";
 pub const MCP: &str = "mcp";
 pub const HUB: &str = "hub";
+/// The wallet's web UI (AGP-039): its login hash, setup code and secrets.
+pub const UI: &str = "ui";
 /// The socket directory of the signer (`signer.sock`, `ready.json`) and of the witness (`anchor.sock`).
 pub const RUN_SIGNER: &str = "signer";
 pub const RUN_ANCHOR: &str = "anchor";

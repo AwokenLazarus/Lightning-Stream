@@ -1,0 +1,34 @@
+manifestVersion: 1.1
+id: lazarus-xbt402-hub
+category: finance
+name: xbt402 Hub
+version: "0.1.0"
+tagline: Route xbt402 payments for other agents' wallets, and earn the routing fee
+description: >-
+  An optional xbt402 routing hub: agents' wallets pay services through it over payment channels on the
+  XBT chain, and the hub earns its fee. It is a paid public service on port 9480; its payment is its
+  authentication. Opening the app shows its readiness (node reachable and synced, its payTo, providers).
+
+
+  The hub funds its channels from a wallet named "hub" in the XBT node. Creating and funding that wallet
+  is an operator step (xbt-compute's node-host app, CMP-098, will do it); until then the hub serves
+  status and quotes but cannot fund a route.
+
+
+  Needs the XBT Node app. Unpublished and side-load only; the images stay on this box.
+developer: Lazarus
+website: https://lazarus-xbt.xyz
+repo: https://github.com/AwokenLazarus/Bitcoin
+support: https://github.com/AwokenLazarus/Bitcoin/issues
+port: 9481
+path: "/readyz"
+gallery: []
+releaseNotes: >-
+  0.1.0: first local package of xbt402-hub (AGP-040).
+dependencies:
+  - lazarus-xbt-knots
+defaultUsername: ""
+defaultPassword: ""
+submitter: Lazarus
+submission: unpublished-local
+icon: ""

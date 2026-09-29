@@ -62,7 +62,7 @@ fn load_config(args: &[String], data: Option<&DataDir>) -> Value {
     if !conf.get("node").is_some_and(Value::is_object) {
         conf["node"] = json!({});
     }
-    let num = |k: &str| env(k).map(|v| v.parse::<f64>().map(Value::from).unwrap_or_else(|_| die(format!("{k}={v}: not a number"))));
+    let num = |k: &str| env(k).map(|v| env_number(&v).unwrap_or_else(|| die(format!("{k}={v}: not a number"))));
     for (k, slot) in [("XBT_NODE_RPC_HOST", "host"), ("XBT_HUB_WALLET", "wallet")] {
         if let Some(v) = env(k) {
             conf["node"][slot] = v.into();
@@ -102,6 +102,12 @@ fn load_config(args: &[String], data: Option<&DataDir>) -> Value {
         }
     }
     conf
+}
+
+/// An env override's number: an integer stays an integer (`XBT_HUB_PORT=9480` must not become `9480.0`, and
+/// `XBT_HUB_THREADS` is read with `as_u64`); anything else numeric is a float (`XBT_HUB_WATCH_INTERVAL=0.5`).
+fn env_number(v: &str) -> Option<Value> {
+    v.parse::<u64>().map(Value::from).ok().or_else(|| v.parse::<f64>().ok().filter(|f| f.is_finite()).map(Value::from))
 }
 
 fn bind_addr(conf: &Value) -> String {
@@ -260,5 +266,18 @@ fn main() {
     eprintln!("xbt402 hub {} on {bind} ({network})", hub.pay_to());
     for h in handles {
         let _ = h.join();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_numbers_keep_integers() {
+        assert_eq!(bind_addr(&json!({"bind": "0.0.0.0", "port": env_number("9480").unwrap()})), "0.0.0.0:9480");
+        assert_eq!(env_number("16").unwrap().as_u64(), Some(16));
+        assert_eq!(env_number("0.5").unwrap().as_f64(), Some(0.5));
+        assert!(env_number("x").is_none() && env_number("inf").is_none());
     }
 }

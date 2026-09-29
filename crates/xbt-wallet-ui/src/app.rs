@@ -193,6 +193,7 @@ impl App {
             "/channels" => self.channels(&ctx),
             "/signatures" => self.signatures(&ctx),
             "/keys" => self.keys(&ctx),
+            "/agents" => self.agents(&ctx),
             "/hub" => self.hub(&ctx),
             "/setup" => self.setup(&ctx),
             "/api/pending" => Resp::json(200, &json!({"pending": self.pending_count()})),
@@ -867,6 +868,40 @@ impl App {
     }
 
     // --- hub and setup ------------------------------------------------------------------------------
+
+    /// How an agent connects: the MCP endpoint and its bearer token (AGP-040). A box has no terminal, so
+    /// this page is where the owner gets them. The token lets an agent pay allowlisted services within the
+    /// policy and below the human threshold; it cannot approve, change the policy or move keys.
+    fn agents(&self, ctx: &Ctx) -> Resp {
+        let mut b = String::from("<section class=\"card\"><h2>Connect an agent</h2>\
+            <p>Agents talk to the wallet's MCP server over HTTP with a bearer token. They can pay the services your policy allows, \
+            within its budgets and below the human threshold. They cannot approve payments, change the policy or move keys.</p>");
+        let urls = &self.cfg.mcp_urls;
+        if urls.is_empty() {
+            b.push_str("<p>No MCP address is configured for this page (<code>XBT_UI_MCP_URL</code>). The MCP server listens on port 33510 at <code>/mcp</code>.</p>");
+        } else {
+            b.push_str("<p>MCP endpoint:</p><ul>");
+            for u in urls {
+                b.push_str(&format!("<li><code>{}</code></li>", esc(u)));
+            }
+            b.push_str("</ul>");
+        }
+        let token = std::fs::read_to_string(&self.cfg.mcp_token_file).ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+        match token {
+            None => b.push_str(&format!("<p>No token here yet (<code>{}</code>). The box's installer copies it from the MCP server on start.</p>",
+                                        esc(&self.cfg.mcp_token_file.display().to_string()))),
+            Some(t) => {
+                let url = urls.first().cloned().unwrap_or_else(|| "http://<this box>:33510/mcp".into());
+                let snippet = json!({"mcpServers": {"xbt-wallet": {"type": "http", "url": url, "headers": {"Authorization": format!("Bearer {t}")}}}});
+                b.push_str(&format!("<details><summary>Show the bearer token</summary><p><code id=\"mcp-token\">{}</code></p>\
+                                     <p>An MCP client configuration:</p>{}</details>\
+                                     <p class=\"msg\">Treat the token like a card with a spending limit: anyone who holds it can pay what your policy allows.</p>",
+                                    esc(&t), json_block(&snippet)));
+            }
+        }
+        b.push_str("</section>");
+        self.page("Agents", ctx, b)
+    }
 
     fn hub(&self, ctx: &Ctx) -> Resp {
         let mut b = String::new();
