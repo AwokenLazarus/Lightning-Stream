@@ -609,13 +609,18 @@ fn c4_signed_quotes_end_to_end() {
 }
 
 #[test]
-fn c7_one_payee_key_for_two_devices() {
+fn c7_one_payee_key_for_two_origins_one_ch2() {
+    // AGP-044: one live ch2 per payTo. One operator key behind two origins (CMP-023: one paid
+    // provider per operator) gets ONE hub-funded ch2; both origins route over it.
     let w = world(1, PKw::default());
     let op = sk(0xA0A0);
     let a = provider(&w.chain, &w.net, &w.dir, "http://dev-a.test", op, &PKw::default());
-    let b = provider(&w.chain, &w.net, &w.dir, "http://dev-b.test", op, &PKw::default());
-    w.hub.connect("http://dev-a.test", None, None).unwrap();
-    w.hub.connect("http://dev-b.test", None, None).unwrap();
+    w.net.add("http://dev-b.test", a.clone());
+    let cap0 = w.hub.committed_sat();
+    let oa = w.hub.connect("http://dev-a.test", None, None).unwrap();
+    let ob = w.hub.connect("http://DEV-B.test:80/", None, None).unwrap(); // canonicalized
+    assert_eq!(oa.params.channel_id(), ob.params.channel_id());
+    assert_eq!(w.hub.committed_sat(), cap0 + oa.params.capacity);
     w.chain.confirm_all();
     w.hub.watch_tick();
     let sa = w.pay.shard("http://dev-a.test/v1/chunk", "POST").unwrap();
@@ -626,8 +631,8 @@ fn c7_one_payee_key_for_two_devices() {
         assert_eq!(w.pay.lock(sh).unwrap().unwrap()["status"], "paid");
     }
     let oc = w.hub.out_channels();
-    assert_ne!(oc["http://dev-a.test"].params.payee_pub, oc["http://dev-b.test"].params.payee_pub); // per-channel keys, one operator key
-    assert_eq!(a.pay_to(), b.pay_to());
+    assert!(!oc.contains_key("http://dev-b.test"));
+    assert_eq!(oc["http://dev-a.test"].routed, sa.snapshot().locked_sat + sb.snapshot().locked_sat);
 }
 
 // --- withholding ---------------------------------------------------------------------------------------

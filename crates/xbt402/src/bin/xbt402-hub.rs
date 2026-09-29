@@ -228,9 +228,10 @@ fn main() {
     let rpc = Arc::new(rpc);
     let hub = RouteHub::new(rpc.clone(), rpc.clone(), Box::new(wallet), Box::new(UreqTransport::default()), secret, &network, Some(&datadir), cfg)
         .unwrap_or_else(|e| die(format!("{e}")));
-    // ch2 refunds pay the hub's wallet, not the per-channel payer key (AGP-037)
+    // ch2 refunds pay the hub's wallet, not the per-channel payer key (AGP-037); bech32, whatever the
+    // wallet's default address type (a legacy default made every refund fail, AGP-044)
     hub.set_refund_to(Some(Box::new(move || {
-        refunds.call("getnewaddress", json!([]))?.as_str().map(str::to_string)
+        refunds.call("getnewaddress", json!(["", "bech32"]))?.as_str().map(str::to_string)
             .ok_or_else(|| xbt402::error::ChannelError::new("rpc_error", "getnewaddress"))
     })));
     if args.iter().any(|a| a == "--close-all") {

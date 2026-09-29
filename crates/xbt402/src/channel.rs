@@ -27,6 +27,9 @@ use crate::error::{fail, ChannelError, Result};
 
 /// Conservative dust floor for any output xbt402 creates.
 pub const DUST: u64 = 546;
+/// nSequence of a refund that signals replaceability (BIP125 opt-in RBF): the hub re-signs a stuck
+/// ch2 refund at a higher fee (AGP-044). Below 0xFFFFFFFE, so nLockTime is still enforced.
+pub const RBF_SEQUENCE: u32 = 0xFFFF_FFFD;
 /// 1-in/2-out close vsize estimate (plus room for a P2TR change).
 pub const STATE_VSIZE: u64 = 190;
 /// 1-in/1-out refund vsize estimate.
@@ -348,10 +351,16 @@ impl ChannelParams {
     /// The payer's unilateral refund, valid once the chain reaches `expiry`. `dest_spk` defaults
     /// to the payer's change script, `fee` to the close fee.
     pub fn refund_tx(&self, payer_secret: &SecretKey, dest_spk: Option<&[u8]>, fee: Option<u64>) -> Result<Tx> {
+        self.refund_tx_seq(payer_secret, dest_spk, fee, 0xFFFF_FFFE)
+    }
+
+    /// [`refund_tx`](Self::refund_tx) with its input's nSequence: [`RBF_SEQUENCE`] makes it
+    /// replaceable (the hub's ch2 refunds, AGP-044); any value below 0xFFFFFFFF keeps nLockTime.
+    pub fn refund_tx_seq(&self, payer_secret: &SecretKey, dest_spk: Option<&[u8]>, fee: Option<u64>, sequence: u32) -> Result<Tx> {
         let fee = fee.unwrap_or(self.close_fee);
         let value = self.capacity.checked_sub(fee).ok_or_else(|| ChannelError::new("bad_amount", "refund fee exceeds the capacity"))?;
         let dest = dest_spk.map(<[u8]>::to_vec).unwrap_or_else(|| self.payer_spk.clone());
-        let mut tx = Tx::new(2, vec![self.funding_in(0xFFFF_FFFE)?], vec![TxOut::new(value as i64, dest)], self.expiry);
+        let mut tx = Tx::new(2, vec![self.funding_in(sequence)?], vec![TxOut::new(value as i64, dest)], self.expiry);
         let mut sig = ecdsa::sign(payer_secret, &self.sighash(&tx)?);
         sig.push(SIGHASH_ALL_UNIFIED);
         tx.inputs[0].witness = vec![sig, Vec::new(), self.script()];

@@ -70,6 +70,20 @@ pub fn ceil_div(a: u128, b: u128) -> u128 {
     a.div_ceil(b)
 }
 
+/// A provider origin as the hub keys it (AGP-044, B1 `route.canon_origin`): scheme and host
+/// lowercased, the default port (`:80` for http, `:443` for https) and trailing `/`s dropped.
+pub fn canon_origin(origin: &str) -> String {
+    let o = origin.trim().trim_end_matches('/');
+    let Some(i) = o.find("://") else { return o.to_string() };
+    let (scheme, rest) = (o[..i].to_ascii_lowercase(), &o[i + 3..]);
+    let (host, path) = rest.find('/').map_or((rest, ""), |k| (&rest[..k], &rest[k..]));
+    let mut host = host.to_ascii_lowercase();
+    if (scheme == "http" && host.ends_with(":80")) || (scheme == "https" && host.ends_with(":443")) {
+        host.truncate(host.rfind(':').unwrap_or(host.len()));
+    }
+    format!("{scheme}://{host}{path}")
+}
+
 /// May the hub forward a lock from the channel expiring at `in_expiry` into the one expiring at
 /// `out_expiry`? The provider can complete and close ch2 until ch2's close margin, and its close
 /// can confirm as late as `out_expiry`; the hub then needs `delta` blocks to learn t and get ch1's

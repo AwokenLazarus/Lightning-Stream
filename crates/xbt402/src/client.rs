@@ -198,13 +198,28 @@ impl ClientLedger for MemoryClientLedger {
 }
 
 /// A [`ClientLedger`] file: JSON lines `{"k": key, "v": record}`, appended and fsynced per save,
-/// replayed and compacted on open (like the provider's [`Ledger`](crate::ledger::Ledger)). Created
-/// mode 0600 on Unix: records of channels whose keys this client holds carry the payer secret.
+/// replayed and compacted on open (like the provider's [`Ledger`](crate::ledger::Ledger)), and
+/// compacted again (a fsynced rewrite, then an atomic rename) once the appended lines outgrow the
+/// live records (AGP-044: a [`RoutePayer`](crate::route_client::RoutePayer) saves its meters per
+/// call). Created mode 0600 on Unix: records of channels whose keys this client holds carry the
+/// payer secret.
 #[derive(Debug)]
 pub struct FileClientLedger {
     path: PathBuf,
-    file: Mutex<File>,
+    inner: Mutex<LedgerFile>,
 }
+
+#[derive(Debug)]
+struct LedgerFile {
+    file: File,
+    recs: indexmap::IndexMap<String, Value>,
+    /// Bytes appended since the last compaction, and the size it left.
+    appended: u64,
+    compacted: u64,
+}
+
+/// Compact once this many bytes were appended and they are 4x the live records.
+const COMPACT_AFTER: u64 = 1 << 20;
 
 fn ledger_io(e: std::io::Error) -> ChannelError {
     ChannelError::new("ledger_error", e.to_string())
@@ -222,38 +237,54 @@ fn private_file(path: &Path, append: bool) -> std::io::Result<File> {
     o.open(path)
 }
 
+fn replay(path: &Path) -> Result<indexmap::IndexMap<String, Value>> {
+    let mut recs: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
+    if !path.exists() {
+        return Ok(recs);
+    }
+    for line in BufReader::new(File::open(path).map_err(ledger_io)?).lines() {
+        let Ok(line) = line else { break };
+        let Ok(v) = crate::json::parse(&line) else { continue };  // a torn last line
+        let (Some(k), Some(r)) = (v.get("k").and_then(Value::as_str), v.get("v")) else { continue };
+        if r.is_null() {
+            recs.shift_remove(k);
+        } else {
+            recs.insert(k.to_string(), r.clone());
+        }
+    }
+    Ok(recs)
+}
+
+/// Rewrite `path` with just `recs` (tmp, fsync, rename, fsync the dir). Returns its size.
+fn rewrite(path: &Path, recs: &indexmap::IndexMap<String, Value>) -> Result<u64> {
+    let tmp = path.with_extension("tmp");
+    let mut n = 0u64;
+    {
+        let mut f = private_file(&tmp, false).map_err(ledger_io)?;
+        for (k, v) in recs {
+            let line = format!("{}\n", crate::json::dumps_compact(&json!({"k": k, "v": v})));
+            n += line.len() as u64;
+            f.write_all(line.as_bytes()).map_err(ledger_io)?;
+        }
+        f.sync_all().map_err(ledger_io)?;
+    }
+    std::fs::rename(&tmp, path).map_err(ledger_io)?;
+    if let Some(Ok(dir)) = path.parent().map(File::open) {
+        let _ = dir.sync_all();
+    }
+    Ok(n)
+}
+
 impl FileClientLedger {
     /// Replay and compact the log at `path` (created if missing).
     pub fn open(path: &Path) -> Result<Self> {
-        let mut recs: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
-        if path.exists() {
-            for line in BufReader::new(File::open(path).map_err(ledger_io)?).lines() {
-                let Ok(line) = line else { break };
-                let Ok(v) = crate::json::parse(&line) else { continue };  // a torn last line
-                let (Some(k), Some(r)) = (v.get("k").and_then(Value::as_str), v.get("v")) else { continue };
-                if r.is_null() {
-                    recs.shift_remove(k);
-                } else {
-                    recs.insert(k.to_string(), r.clone());
-                }
-            }
-        }
+        let recs = replay(path)?;
         if let Some(d) = path.parent() {
             std::fs::create_dir_all(d).map_err(ledger_io)?;
         }
-        let tmp = path.with_extension("tmp");
-        {
-            let mut f = private_file(&tmp, false).map_err(ledger_io)?;
-            for (k, v) in &recs {
-                writeln!(f, "{}", crate::json::dumps_compact(&json!({"k": k, "v": v}))).map_err(ledger_io)?;
-            }
-            f.sync_all().map_err(ledger_io)?;
-        }
-        std::fs::rename(&tmp, path).map_err(ledger_io)?;
-        if let Some(Ok(dir)) = path.parent().map(File::open) {
-            let _ = dir.sync_all();
-        }
-        Ok(Self { path: path.to_path_buf(), file: Mutex::new(private_file(path, true).map_err(ledger_io)?) })
+        let compacted = rewrite(path, &recs)?;
+        let file = private_file(path, true).map_err(ledger_io)?;
+        Ok(Self { path: path.to_path_buf(), inner: Mutex::new(LedgerFile { file, recs, appended: 0, compacted }) })
     }
 
     pub fn path(&self) -> &Path {
@@ -263,18 +294,7 @@ impl FileClientLedger {
 
 impl ClientLedger for FileClientLedger {
     fn load(&self) -> Result<Vec<(String, Value)>> {
-        let mut recs: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
-        for line in BufReader::new(File::open(&self.path).map_err(ledger_io)?).lines() {
-            let Ok(line) = line else { break };
-            let Ok(v) = crate::json::parse(&line) else { continue };
-            let (Some(k), Some(r)) = (v.get("k").and_then(Value::as_str), v.get("v")) else { continue };
-            if r.is_null() {
-                recs.shift_remove(k);
-            } else {
-                recs.insert(k.to_string(), r.clone());
-            }
-        }
-        Ok(recs.into_iter().collect())
+        Ok(replay(&self.path)?.into_iter().collect())
     }
 
     fn save(&self, records: &[(String, Value)]) -> Result<()> {
@@ -283,9 +303,24 @@ impl ClientLedger for FileClientLedger {
             buf.push_str(&crate::json::dumps_compact(&json!({"k": k, "v": v})));
             buf.push('\n');
         }
-        let mut f = self.file.lock().unwrap_or_else(|p| p.into_inner());
-        f.write_all(buf.as_bytes()).map_err(ledger_io)?;
-        f.sync_data().map_err(ledger_io)
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        g.file.write_all(buf.as_bytes()).map_err(ledger_io)?;
+        g.file.sync_data().map_err(ledger_io)?;
+        for (k, v) in records {
+            if v.is_null() {
+                g.recs.shift_remove(k);
+            } else {
+                g.recs.insert(k.clone(), v.clone());
+            }
+        }
+        g.appended += buf.len() as u64;
+        if g.appended >= COMPACT_AFTER && g.appended >= 4 * g.compacted {
+            // the saves above are durable already: a crash in here leaves the old file or the new one
+            let size = rewrite(&self.path, &g.recs)?;
+            g.file = private_file(&self.path, true).map_err(ledger_io)?;
+            (g.appended, g.compacted) = (0, size);
+        }
+        Ok(())
     }
 }
 

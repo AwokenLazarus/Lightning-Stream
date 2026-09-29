@@ -18,6 +18,9 @@ socket, RemoteSigner behind RoutePayer, ch1 funded from the signer's hot key) ag
 hub + providers at 100x the prices (so ch1 passes its dust floor and each lock is a new signer state), with
 the same checks plus the signer's: every lock pre-signed in the signer under
 policy:routing, the routed 24 h spend == ch1's signed state, ch1's change to the hot key, the log intact.
+Then (AGP-044) "RSSR": the same RSS payer on a route ledger (--ledger), SIGKILLed mid-stream and started
+again on the same ledger and signer: it resumes the same ch1 and provider sessions, and every check above
+holds to the sat and the amsat.
 Ports: base+10*i .. +2 (hub, providers); the RSS runs at base+ROUTE_RSS_OFFSET+10*j (default 100). Env: XBT402_B1, XBT402_DATADIR,
 XBT402_RPCPORT, RS_BIN, PY, ROUTE_PB, ROUTE_RUN, ROUTE_ONLY (e.g. "RS-PY-RS,PY-RS-PY,RSS-RS-RS"),
 ROUTE_SECONDS, ROUTE_RATE."""
@@ -158,7 +161,7 @@ def start_rust_signer(d, hub_url):
 
 def scenario(i, client, hub_impl, prov_impl):
     name = f"{client}-{hub_impl}-{prov_impl}"
-    base = PB + 10 + 10 * i if client != "RSS" else PB + RSS_OFFSET + 10 * i
+    base = PB + 10 + 10 * i if client not in ("RSS", "RSSR") else PB + RSS_OFFSET + 10 * i
     hub_port, ports = base, [base + 1, base + 2]
     d = os.path.join(RUN, name)
     os.makedirs(d, exist_ok=True)
@@ -172,7 +175,7 @@ def scenario(i, client, hub_impl, prov_impl):
         urls = [f"http://127.0.0.1:{p}" for p in ports]
         # RSS: 100x the prices, so ch1 goes well past its 546-sat floor and every window's lock is a
         # new adaptor state the signer must pre-sign under its routing policy
-        prices = [x * 100 for x in PRICES] if client == "RSS" else PRICES
+        prices = [x * 100 for x in PRICES] if client in ("RSS", "RSSR") else PRICES
         for j, (port, price) in enumerate(zip(ports, prices)):
             sec = f"{secrets.randbelow(2 ** 255) + 1:064x}"
             if prov_impl == "RS":
@@ -216,11 +219,40 @@ def scenario(i, client, hub_impl, prov_impl):
         check("v1.2: the hub advertises ch1 payer-pays, ch2 payee-pays",
               r and (r.get("ch1CloseFeePayer"), r.get("ch2CloseFeePayer")) == ("payer", "payee"))
         shard_urls = ",".join(u + "/v1/chunk" for u in urls)
-        if client == "RSS":
+        restart = {}
+        if client in ("RSS", "RSSR"):
             sproc, sock, hot_spk, spol = start_rust_signer(d, hub_url)
             procs.append(sproc)
             ccmd = [f"{RS}/xbt402-route-payer", "--hub", hub_url, "--shards", shard_urls, "--rpc-port", RPCPORT, "--cookie", COOKIE,
                     "--seconds", str(SECONDS), "--rate", str(RATE), "--signer-sock", sock]
+            if client == "RSSR":
+                # AGP-044: run on a ledger, SIGKILL mid-stream, then the run below resumes from it
+                ledger = os.path.join(d, "route-payer.jsonl")
+                ccmd += ["--ledger", ledger]
+                fcmd = [f"{RS}/xbt402-route-payer", "--hub", hub_url, "--shards", shard_urls, "--rpc-port", RPCPORT, "--cookie", COOKIE,
+                        "--seconds", str(4 * SECONDS), "--rate", str(RATE), "--signer-sock", sock, "--ledger", ledger, "--no-close"]
+                first = subprocess.Popen(SOAK + fcmd, stdout=subprocess.DEVNULL, stderr=LOG)
+                deadline = time.time() + 120
+                while time.time() < deadline and first.poll() is None:
+                    # killed once both shards are past their first paid lock, mid-window
+                    try:
+                        recs = [json.loads(x) for x in open(ledger)]
+                    except (OSError, ValueError):
+                        recs = []
+                    book = [r["v"] for r in recs if r.get("k") == "book"]
+                    if book and book[-1]["stats"]["locks"] >= 2:
+                        time.sleep(SECONDS / 3)
+                        break
+                    time.sleep(0.2)
+                first.kill()
+                first.wait(10)
+                recs = [json.loads(x) for x in open(ledger)]
+                last = {}
+                for r in recs:
+                    last[r["k"]] = r["v"]
+                restart = {"killed_rc": first.returncode, "ch1_params": last["ch1"]["params"],
+                           "pending_at_kill": last.get("pending") is not None, "locks_at_kill": last["book"]["stats"]["locks"],
+                           "sessions": sorted(v["session"] for k, v in last.items() if k.startswith("shard "))}
         elif client == "RS":
             ccmd = [f"{RS}/xbt402-route-payer", "--hub", hub_url, "--shards", shard_urls, "--rpc-port", RPCPORT, "--cookie", COOKIE,
                     "--seconds", str(SECONDS), "--rate", str(RATE)]
@@ -243,6 +275,17 @@ def scenario(i, client, hub_impl, prov_impl):
         check(f"client streamed >= {0.8 * RATE:.0f} paid-route calls/s to each provider", all(x >= 0.8 * RATE for x in rates),
               ", ".join(f"{x:.1f}/s" for x in rates))
         check("locks settled, none voided", s["locks"] >= 4 and s["voided"] == 0, f"{s['locks']} locks, {s['voided']} voided")
+        if client == "RSSR":
+            ev = res.get("events") or []
+            resumed = [e for e in ev if e.get("event") == "resumed"]
+            check("restart: SIGKILLed mid-stream after >= 2 locks, the new process resumed ch1 and the same provider sessions",
+                  restart.get("killed_rc") == -9 and restart.get("locks_at_kill", 0) >= 2 and res["ch1"].get("resumed") is True
+                  and len(resumed) == 1 and res["ch1Params"] == restart.get("ch1_params")
+                  and sorted(sh["session"] for sh in s["shards"].values()) == restart.get("sessions"),
+                  f"rc {restart.get('killed_rc')}, {restart.get('locks_at_kill')} locks at the kill, pending {restart.get('pending_at_kill')}, "
+                  f"sessions {restart.get('sessions')}")
+            check("restart: the ledger holds no payer key, signature or refund (the keys stay in the signer)",
+                  all(k not in open(ledger).read() for k in ('"secret_key"', '"refund_hex"', '"best_sig"', '"payer_secret"')))
         paid_by_payto = {}
         for u, sh in s["shards"].items():
             acc = int(sh["accrued_amsat"])
@@ -284,14 +327,17 @@ def scenario(i, client, hub_impl, prov_impl):
         check("both ch2s closed", len(closed["closes"]) == 2)
         check("sum over ch2s == routed on ch1 - fees", total2 == s["routed_sat"] - s["fee_paid_sat"],
               f"{total2} == {s['routed_sat']} - {s['fee_paid_sat']}")
-        if client == "RSS":
+        if client in ("RSS", "RSSR"):
             sv = res.get("signer") or {}
             kinds = [tuple(k) for k in sv.get("signatures") or []]
             presig = [k for k in kinds if k[0] == "adaptor_presig"]
             nonfloor = s["locks"] - s["floor_locks"]
+            # RSSR: a presignature the ledger never recorded (killed between the two) is voided on resume
+            never_sent = sum(1 for e in res.get("events") or [] if e.get("event") == "void" and "never sent" in (e.get("why") or ""))
             check("signer: every non-floor lock pre-signed in the Rust signer under policy:routing (the client holds no key)",
-                  len(presig) == nonfloor >= 1 and all(k[1] == "xbt402_sign_state_adaptor" and k[2] == "policy:routing" for k in presig),
-                  f"{len(presig)} presigs, {nonfloor} locks")
+                  len(presig) == nonfloor + never_sent and nonfloor >= 1
+                  and all(k[1] == "xbt402_sign_state_adaptor" and k[2] == "policy:routing" for k in presig),
+                  f"{len(presig)} presigs, {nonfloor} locks, {never_sent} never sent")
             rt = sv.get("routing") or {}
             check("signer: routed 24 h spend == ch1's signed state; no lock pending; adaptor available",
                   rt.get("spent_24h_sats") == cum1 and not rt.get("pending") and rt.get("adaptor") == "available",
@@ -322,6 +368,7 @@ def main():
     only = [x for x in os.environ.get("ROUTE_ONLY", "").split(",") if x]
     combos = [(i, c) for i, c in enumerate(itertools.product(("RS", "PY"), repeat=3))]
     combos += [(j, ("RSS", h, p)) for j, (h, p) in enumerate((("RS", "RS"), ("PY", "PY")))]
+    combos += [(2 + j, ("RSSR", h, p)) for j, (h, p) in enumerate((("RS", "RS"), ("PY", "PY")))]
     combos = [(i, c) for i, c in combos if not only or "-".join(c) in only]
     if "agent" not in node.listwallets():
         try:
