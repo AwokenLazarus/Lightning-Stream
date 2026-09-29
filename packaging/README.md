@@ -47,18 +47,19 @@ Both platforms run the same containers, from the same images:
 | init (one-shot) | `xbt-init` (root, CHOWN/FOWNER/DAC_OVERRIDE only) | the whole data dir | none |
 | witness | `xbt-anchor-witness` (10002) | `witness/`, `run/anchor/` | none on Umbrel |
 | signer | `xbt-signer` (10001) | `signer/`, `run/signer/`, `run/anchor/` ro | the node's RPC |
-| MCP | `xbt-wallet-mcp` (10003) | `mcp/`, `run/signer/` ro | 33510, bearer token |
-| UI | `xbt-wallet-ui` (10005) | `ui/`, `run/signer/` ro | 8480 behind the box's proxy |
+| MCP | `xbt-wallet-mcp` (10003) | `mcp/`, `run/signer/` ro, `run/ui/` ro | 33510, bearer token |
+| UI | `xbt-wallet-ui` (10005) | `ui/`, `run/signer/` ro, `run/ui/` | 8480 behind the box's proxy |
 | hub (optional) | `xbt402-hub` (10004) | `hub/` | 9480, paid public API |
 
 `init` gives each sub-dir to its uid (Umbrel bind mounts arrive owned by uid 1000, StartOS volumes owned by
-root), writes the node credentials, and makes the MCP token once. It copies that token into the UI's
-secrets, where the owner reads it on the UI's **Agents** page. That page is how a box with no terminal
+root), writes the node credentials, and makes the MCP token once, as the UI's `run/ui/mcp-http-token`
+(0640; the MCP reads it by group and never writes it). The owner reads it on the UI's **Agents** page. That page is how a box with no terminal
 connects an agent. The owner never needs a shell:
 
 - **Umbrel:** log in with the password the dashboard shows (`${APP_PASSWORD}`, `deterministicPassword`).
   Then Setup: enrol the approval key (it stays in the browser) and sign a policy. Then Agents: copy the MCP
-  endpoint `http://umbrel.local:33510/mcp` and the token.
+  endpoint `http://umbrel.local:33510/mcp` and the token. If the token leaks, rotate it on that same page
+  (no terminal, no restart). The Hub page shows this box's hub receive address when the hub app is installed.
 - **StartOS:** run the *Node connection* action (a critical task until done). Start the service. *Web UI
   setup code* gives the one-time code; in the UI, choose a password (only its scrypt hash is kept). Then
   the same Setup and Agents steps; *Agent connection* also shows the MCP addresses and token. The UI, the
@@ -100,9 +101,12 @@ sharing the uid table with the services, `FROM scratch`, on all three architectu
 
 The export contract is five variables: host, RPC port, chain, user, password. cmp's node-host app
 (CMP-098) must export the same names. Until then `lazarus-xbt-knots` is a stand-in, reusing A3's
-`xbt-a3-knots:29.4.2`, which is amd64-only. StartOS has no XBT node package yet (Start9's bitcoind is the
-SHA256d chain), so the node there is an external connection (the *Node connection* action). When CMP-099
-exists, it becomes a declared dependency next to "external".
+`xbt-a3-knots:29.4.2`, which is **amd64-only**. A Pi or other arm64/armv7 box has no stand-in node:
+install CMP-098's real `knots-xbt` app when it exists (same `APP_XBT_KNOTS_*` names). Building Knots
+29.4.2 for those arches under soak is not a packaging job. See `umbrel/lazarus-xbt-knots/README.md`.
+StartOS has no XBT node package yet (Start9's bitcoind is the SHA256d chain), so the node there is an
+external connection (the *Node connection* action). When CMP-099 exists, it becomes a declared
+dependency next to "external".
 
 **The optional hub.**
 
@@ -154,13 +158,17 @@ applied there.
 - No install on a real Umbrel or StartOS box (needs Mike). The StartOS build targets StartOS 0.4
   (`osVersion` 0.4.0-beta.10 in the manifest, start-sdk 2.0.9).
 - The XBT node:
-  - on Umbrel, a stand-in, amd64-only, until CMP-098;
+  - on Umbrel, a stand-in, **amd64-only**, until CMP-098 (documented dependency: same `APP_XBT_KNOTS_*`);
   - on StartOS, an external connection until CMP-099;
   - no Electrum fallback (AGP-028).
-- The hub funds routes from a node wallet named `hub`. Creating and funding it needs a terminal or cmp's
-  node-host app.
-- On Umbrel the hub's port 9480 is LAN/clearnet only. A Tor address for it needs an Umbrel hidden-service
-  declaration, which is not done. On StartOS, Tor is the owner's choice per interface.
+- The hub creates the node wallet named `hub` on start and shows a receive address on the wallet UI Hub
+  page (and `/readyz`). Funding is send-to-address; no terminal.
+- On Umbrel the hub reads `APP_HIDDEN_SERVICE` (umbrelOS gives every app, including a second app, a
+  hidden service via app_proxy) and shows it as `tor` on `/readyz` and the Hub page. On StartOS, Tor is
+  the owner's choice per interface.
+- Token rotation: the wallet UI Agents page writes a new token into `run/ui/mcp-http-token`; the MCP reads
+  it on every request, so the old token gets 401 at once. The MCP has no rotation endpoint (docs/CONTAINER.md
+  §10). StartOS also keeps the delete-and-restart action.
 - The StartOS package's text is English only; other locales fall back to it. Translations, gallery images
   and icons are store-submission work.
 - The images are referenced by tag (`:0.1.0`) and side-loaded with `docker load`. A store needs registry

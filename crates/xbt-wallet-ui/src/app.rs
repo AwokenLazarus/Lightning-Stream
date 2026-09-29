@@ -350,6 +350,17 @@ impl App {
                              &|v| format!("Swept {} sats to {} (txid {}).", int(v.get("swept_sats")), txt(v.get("to")), txt(v.get("txid")))),
             "/rotate" => back("./keys", self.call("rotate_hot_key_signed", json!({"expiry": i("expiry"), "signature": sig()})),
                               &|v| format!("Hot key rotated: new address {}.", txt(v.get("new_address")))),
+            "/rotate-token" => {
+                if g("confirm") != "1" {
+                    self.flash(ctx, false, "tick the box to rotate the agent token");
+                    return Resp::redirect("./agents");
+                }
+                match self.rotate_mcp_token() {
+                    Ok(_) => self.flash(ctx, true, "Agent token rotated. Give your agents the new token from this page."),
+                    Err(e) => self.flash(ctx, false, e),
+                }
+                Resp::redirect("./agents")
+            }
             "/anchor-now" => back("./signatures", self.call("anchor_now", json!({"reason": "operator:ui"})), &|_| "Anchored.".into()),
             "/channel-close" => back("./channels", self.call("close_channel", json!({"counterparty": g("counterparty")})),
                                      &|v| format!("Closed: txid {}, close report {}.", txt(v.get("txid")), txt(v.pointer("/close_report/status")))),
@@ -897,10 +908,29 @@ impl App {
                                      <p>An MCP client configuration:</p>{}</details>\
                                      <p class=\"msg\">Treat the token like a card with a spending limit: anyone who holds it can pay what your policy allows.</p>",
                                     esc(&t), json_block(&snippet)));
+                b.push_str(&format!("<form method=\"post\" action=\"./rotate-token\" class=\"stack\">{}<p>If the token leaked, replace it here. \
+                    Every agent loses access until you give it the new one. No terminal and no app restart.</p>\
+                    <label><input type=\"checkbox\" name=\"confirm\" value=\"1\" required> I will give my agents the new token</label>\
+                    <button type=\"submit\">Rotate the token</button></form>", Self::csrf_input(ctx)));
             }
         }
         b.push_str("</section>");
         self.page("Agents", ctx, b)
+    }
+
+    /// Replace the MCP bearer token (AGP-042). The UI owns the token file and the MCP only reads it, on
+    /// every request, so the old token stops working at once. The MCP is never asked: rotation must not be
+    /// reachable with the token it replaces, and the new token goes nowhere but this file and this page.
+    fn rotate_mcp_token(&self) -> Result<(), String> {
+        let p = &self.cfg.mcp_token_file;
+        let md = std::fs::symlink_metadata(p).map_err(|e| format!("read token: {e}"))?;
+        if !md.file_type().is_file() {
+            return Err("the token file is not a regular file".into());
+        }
+        // keep the mode xbt-init gave it (0640 on a box: the MCP reads it by group), never a bit for others
+        let mode = mode_bits(&md) & 0o640;
+        let new = hex::encode(crate::random_bytes::<32>());
+        xbt_svc::replace_secret_file(p, format!("{new}\n").as_bytes(), mode | 0o600).map_err(|e| format!("{}: {e}", p.display()))
     }
 
     fn hub(&self, ctx: &Ctx) -> Resp {
@@ -937,7 +967,27 @@ impl App {
             Some(u) => {
                 let probe = |path: &str| http_get(&format!("{u}{path}"));
                 b.push_str(&format!("<p><code>{}</code></p>", esc(u)));
-                for path in ["/healthz", "/readyz", "/x402/supported"] {
+                match probe("/readyz") {
+                    Ok((st, body)) => {
+                        if let Ok(v) = serde_json::from_str::<Value>(&body) {
+                            if let Some(addr) = v.pointer("/wallet/receive_address").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                                let bal = v.pointer("/wallet/balance_sats").and_then(Value::as_u64).unwrap_or(0);
+                                b.push_str(&format!("<section class=\"card\" id=\"hub-funding\"><h3>Fund the hub</h3>\
+                                    <p>Send XBT to this address. The hub created the node wallet named <code>{}</code> for you; no terminal.</p>\
+                                    <p>Receive address: <code id=\"hub-receive\">{}</code></p><p>Balance: {}</p>",
+                                    esc(v.pointer("/wallet/name").and_then(Value::as_str).unwrap_or("hub")), esc(addr), sats(bal as i64)));
+                                if let Some(onion) = v.get("tor").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                                    b.push_str(&format!("<p>Tor: <code id=\"hub-tor\">{}</code></p>", esc(onion)));
+                                }
+                                b.push_str("</section>");
+                            }
+                        }
+                        b.push_str(&format!("<p><span class=\"tag {}\">{st}</span> <code>/readyz</code></p><pre class=\"json\">{}</pre>",
+                                            if st == 200 { "ok" } else { "bad" }, esc(&short(&body, 2000))));
+                    }
+                    Err(e) => b.push_str(&format!("<p><span class=\"tag bad\">unreachable</span> <code>/readyz</code>: {}</p>", esc(&e))),
+                }
+                for path in ["/healthz", "/x402/supported"] {
                     match probe(path) {
                         Ok((st, body)) => b.push_str(&format!("<p><span class=\"tag {}\">{st}</span> <code>{path}</code></p><pre class=\"json\">{}</pre>",
                                                               if st == 200 { "ok" } else { "bad" }, esc(&short(&body, 2000)))),
@@ -1027,6 +1077,17 @@ impl App {
         b.push_str("</ol>");
         self.page("Setup", ctx, b)
     }
+}
+
+#[cfg(unix)]
+fn mode_bits(md: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    md.permissions().mode() & 0o777
+}
+
+#[cfg(not(unix))]
+fn mode_bits(_: &std::fs::Metadata) -> u32 {
+    0o600
 }
 
 /// A plain-HTTP GET with a short timeout (the hub is on the box's own network).

@@ -83,6 +83,8 @@ services:
     volumes:
       - ${APP_DATA_DIR}/data/mcp:/data/mcp
       - ${APP_DATA_DIR}/data/run/signer:/data/run/signer:ro
+      # the bearer token is the UI's file (0640, group xbt-wallet-ui): read on every request, never written here
+      - ${APP_DATA_DIR}/data/run/ui:/data/run/ui:ro
 
   ui:
     <<: *service
@@ -96,3 +98,5 @@ services:
     volumes:
       - ${APP_DATA_DIR}/data/ui:/data/ui
       - ${APP_DATA_DIR}/data/run/signer:/data/run/signer:ro
+      # the UI owns the MCP token (run/ui/mcp-http-token) and rotates it on its Agents page (AGP-042)
+      - ${APP_DATA_DIR}/data/run/ui:/data/run/ui

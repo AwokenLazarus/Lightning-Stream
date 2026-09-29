@@ -21,13 +21,13 @@ the services your policy allows, within its budgets, and anything above your thr
 - Payments above your threshold appear under **Approvals**; approve or deny them there, signed with your key.
 - **Channels** shows the agent's payment channels, their close reports and refunds; **Signatures** the
   signature log and its anchors.
-- The token lets an agent pay what your policy allows. If it leaks, run *Rotate the agent token* and give your
-  agents the new one.
+- The token lets an agent pay what your policy allows. If it leaks, open the **Agents** page and rotate it
+  there (no restart), or run the *Rotate the agent token* action. Give your agents the new one.
 
 ## Optional: the xbt402 hub
 
-*Enable the xbt402 hub* runs a routing hub other wallets pay through. It funds routes from a wallet named `hub`
-in your node, which you create and fund yourself.
+*Enable the xbt402 hub* runs a routing hub other wallets pay through. The hub creates a node wallet named
+`hub` and shows a receive address on the web UI **Hub** page. Send XBT there; no terminal.
 
 ## Password
 

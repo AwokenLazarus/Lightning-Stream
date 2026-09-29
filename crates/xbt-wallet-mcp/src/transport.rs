@@ -3,6 +3,7 @@
 //! never pushes, DELETE ends a session). Blocking threads, no async runtime.
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
@@ -61,6 +62,11 @@ pub struct HttpConfig {
     pub path: String,
     /// When set, every request needs `Authorization: Bearer <token>`.
     pub token: Option<String>,
+    /// When set, the token is this file, read on every request and never written: the UI owns it and
+    /// rotates it on its Agents page, so a rotation takes effect at once, with no restart (AGP-042). An
+    /// unreadable or empty file refuses every request (it never falls back to `token`). The MCP has no
+    /// rotation endpoint: a bearer token must not be able to replace itself.
+    pub token_file: Option<PathBuf>,
     pub allow_remote: bool,
     /// A path prefix a reverse proxy keeps (`XBT_BASE_PATH`): `<base>/mcp`, `<base>/healthz`. Requests
     /// without it are served too, for proxies that strip it.
@@ -71,7 +77,7 @@ pub struct HttpConfig {
 
 impl HttpConfig {
     pub fn new(addr: impl Into<String>) -> Self {
-        Self { addr: addr.into(), path: "/mcp".into(), token: None, allow_remote: false, base: String::new(), ready: None }
+        Self { addr: addr.into(), path: "/mcp".into(), token: None, token_file: None, allow_remote: false, base: String::new(), ready: None }
     }
 }
 
@@ -122,6 +128,33 @@ fn same(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// The token in force: the token file when there is one (fail closed: `Err` when it cannot be read),
+/// else the configured value.
+fn live_token(cfg: &HttpConfig) -> Result<Option<String>, String> {
+    let Some(p) = &cfg.token_file else { return Ok(cfg.token.clone()) };
+    read_token_file(p).map(Some)
+}
+
+/// Read the token file: a regular file (not a symlink), no bits for others, not empty.
+pub fn read_token_file(p: &std::path::Path) -> Result<String, String> {
+    let md = std::fs::symlink_metadata(p).map_err(|e| format!("{}: {e}", p.display()))?;
+    if !md.file_type().is_file() {
+        return Err(format!("{}: not a regular file", p.display()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if md.permissions().mode() & 0o007 != 0 {
+            return Err(format!("{}: readable by others; refused", p.display()));
+        }
+    }
+    let t = std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?.trim().to_string();
+    if t.is_empty() {
+        return Err(format!("{}: empty", p.display()));
+    }
+    Ok(t)
+}
+
 type Sessions = Arc<Mutex<HashMap<String, (Session, std::time::Instant)>>>;
 
 fn handle_http(server: &Server, cfg: &HttpConfig, sessions: &Sessions, mut req: tiny_http::Request) {
@@ -150,9 +183,16 @@ fn handle_http(server: &Server, cfg: &HttpConfig, sessions: &Sessions, mut req: 
             return reply(req, 403, rpc_error(-32600, "Forbidden origin"), &[]);
         }
     }
-    if let Some(t) = &cfg.token {
+    let want = match live_token(cfg) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("xbt-wallet-mcp: bearer token: {e}");
+            return reply(req, 503, rpc_error(-32603, "the bearer token is unavailable"), &[]);
+        }
+    };
+    if let Some(t) = want {
         let got = header(&req, "Authorization").and_then(|a| a.strip_prefix("Bearer ")).unwrap_or("");
-        if !same(got, t) {
+        if !same(got, &t) {
             return reply(req, 401, rpc_error(-32600, "Unauthorized"), &[("WWW-Authenticate", "Bearer".into())]);
         }
     }
@@ -214,7 +254,7 @@ pub fn serve_http(server: Arc<Server>, cfg: HttpConfig) -> Result<(), String> {
     if !cfg.allow_remote && !is_loopback_host(host) {
         return Err(format!("{}: not a loopback address (pass --http-allow-remote with XBT_MCP_HTTP_TOKEN to listen elsewhere)", cfg.addr));
     }
-    if cfg.allow_remote && cfg.token.is_none() {
+    if cfg.allow_remote && !matches!(live_token(&cfg), Ok(Some(_))) {
         return Err("--http-allow-remote needs XBT_MCP_HTTP_TOKEN".into());
     }
     let http = tiny_http::Server::http(&cfg.addr).map_err(|e| format!("{}: {e}", cfg.addr))?;

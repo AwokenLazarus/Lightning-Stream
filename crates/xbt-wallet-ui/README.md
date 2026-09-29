@@ -8,7 +8,8 @@ The agent wallet's web UI, for a box with no terminal (Umbrel, StartOS), from AG
 - see channels (open, pending, closed, refunded), with the close report (including `payeeFee`) and the refund ETA;
 - see the signature log and its anchor verification;
 - sweep and rotate the hot key, signed by the human;
-- see the hub's status and the xbt-compute node/hub status;
+- see the hub's status and the xbt-compute node/hub status, and fund this box's hub (receive address, no terminal);
+- rotate the agent MCP token from the Agents page (no terminal, no restart);
 - run a first-time setup wizard (the approval key, the policy template, the wrapping key and backup).
 
 The UI is a separate process that talks only to the signer socket, as the MCP server does. It never
@@ -39,6 +40,8 @@ Without a password source, the first start prints a one-time setup code and writ
 | `XBT_UI_HUB_URL` | | this box's xbt402 hub; its `/healthz`, `/readyz` and `/x402/supported` are shown on the Hub page |
 | `XBT_UI_CMP_URL` | | xbt-compute's node/hub status page, linked from Overview and Hub |
 | `XBT_UI_CMP_STATUS_URL` | | xbt-compute's status JSON (e.g. its `/readyz`, CONTRACT §U), shown as a compact tile |
+| `XBT_UI_MCP_URL` | | MCP endpoint(s) shown on the Agents page |
+| `XBT_UI_MCP_TOKEN_FILE` | `$XBT_DATA_DIR/run/ui/mcp-http-token`, else `<data dir>/secrets/mcp-http-token` | the bearer token shown on Agents. The UI owns it and rotates it there (atomic replace, mode kept, never world-readable); the MCP only reads it (AGP-042) |
 
 `GET /healthz` is always 200. `GET /readyz` is 200 when the signer answers, else 503. Neither needs
 a login, and neither reveals wallet state.

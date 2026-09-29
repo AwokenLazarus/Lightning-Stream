@@ -2619,6 +2619,7 @@ dependencies = [
  "ureq",
  "xbt-primitives",
  "xbt-signer",
+ "xbt-svc",
  "xbt-wallet-mcp",
  "xbt402",
 ]

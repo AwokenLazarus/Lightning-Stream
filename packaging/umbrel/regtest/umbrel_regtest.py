@@ -26,7 +26,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from regtest_lib import (POLICY_BASE, Chain, Mcp, Miner, Ui, check, docker, ensure_provider_image, field, http, log, open_log,  # noqa: E402
+from regtest_lib import (agent_rotation_attempts, leaks, POLICY_BASE, Chain, Mcp, Miner, Ui, check, docker, ensure_provider_image, field, http, log, open_log,  # noqa: E402
                          owner_setup, root_helper, sh, start_proxy, status, wait_until, write_results)
 
 OUT, RUN = sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "1"
@@ -37,7 +37,12 @@ PID = os.getpid()
 NET = f"agp040-umbrel-{PID}"
 APPS_DIR = os.path.join(OUT, "app-data")
 SEED = os.urandom(32).hex()
-P_MCP, P_HUB, P_UI, P_PROXY, P_PROV = 34010, 34020, 34030, 34080, 34040
+P_MCP = int(os.environ.get("UMBREL_TEST_MCP_PORT", "34010"))
+P_HUB = int(os.environ.get("UMBREL_TEST_HUB_PORT", "34020"))
+P_UI = int(os.environ.get("UMBREL_TEST_UI_PORT", "34030"))
+P_PROXY = int(os.environ.get("UMBREL_TEST_PROXY_PORT", "34080"))
+P_PROV = int(os.environ.get("UMBREL_TEST_PROV_PORT", "34040"))
+HUB_ONION = os.environ.get("UMBREL_TEST_HUB_ONION", "http://agp042-hub.onion")
 SIGN_BIN = os.path.join(ROOT, "dist/oci/ctx/bin/amd64/xbt-wallet-ui")
 KNOTS, WALLET, HUB = "lazarus-xbt-knots", "lazarus-xbt-agent-wallet", "lazarus-xbt402-hub"
 PROVIDER = "http://agp040-provider-%d:9500" % PID
@@ -71,6 +76,7 @@ def compose(app, *args, check_rc=True):
     # the node app's regtest profile: its exports say the chain is regtest (the only exported value the test changes)
     env = {**os.environ, **exports_env(INSTALLED), "APP_XBT_KNOTS_CHAIN": "regtest", "APP_DATA_DIR": data, "APP_SEED": derive(f"app-{app}-seed"),
            "APP_PASSWORD": app_password(app), "DEVICE_DOMAIN_NAME": "127.0.0.1", "DEVICE_HOSTNAME": "umbrel",
+           "APP_HIDDEN_SERVICE": HUB_ONION if app == HUB else "",
            "UMBREL_TEST_NET": NET, "UMBREL_TEST_CONF": HERE, "UMBREL_TEST_MCP_PORT": str(P_MCP), "UMBREL_TEST_UI_PORT": str(P_UI),
            "UMBREL_TEST_HUB_PORT": str(P_HUB)}
     return sh("docker", "compose", "--compatibility", "-p", app, "--project-directory", data,
@@ -141,13 +147,13 @@ def main():
     rep = json.loads(docker("logs", cname(WALLET, "init")).stdout.strip().splitlines()[-1])
     check("I", "init (xbt-init) ran first and exited 0: the layout check passed, secrets provisioned (names only in its report)",
           init_c["State"]["ExitCode"] == 0 and rep["ok"] and {(s["component"], s["name"]) for s in rep["secrets"]} >= {
-              ("signer", "node-rpc-auth"), ("ui", "xbt-ui-password"), ("mcp", "mcp-http-token"), ("ui", "mcp-http-token")}
+              ("signer", "node-rpc-auth"), ("ui", "xbt-ui-password"), ("ui", "run/ui/mcp-http-token")}
           and app_password(WALLET) not in json.dumps(rep) and chain.p not in json.dumps(rep), {"exit": init_c["State"]["ExitCode"], "report": rep})
     ls = root_helper(wdata, "stat -c '%u:%g %a %n' /d/signer /d/witness /d/mcp /d/ui /d/run/signer /d/run/anchor /d/signer/secrets/node-rpc-auth "
-                            "/d/ui/secrets/xbt-ui-password /d/mcp/secrets/mcp-http-token /d/ui/secrets/mcp-http-token").stdout.split("\n")
+                            "/d/ui/secrets/xbt-ui-password /d/run/ui /d/run/ui/mcp-http-token").stdout.split("\n")
     want = ["10001:10001 700 /d/signer", "10002:10002 700 /d/witness", "10003:10003 700 /d/mcp", "10005:10005 700 /d/ui",
             "10001:10001 750 /d/run/signer", "10002:10002 750 /d/run/anchor", "10001:10001 600 /d/signer/secrets/node-rpc-auth",
-            "10005:10005 600 /d/ui/secrets/xbt-ui-password", "10003:10003 600 /d/mcp/secrets/mcp-http-token", "10005:10005 600 /d/ui/secrets/mcp-http-token"]
+            "10005:10005 600 /d/ui/secrets/xbt-ui-password", "10005:10005 750 /d/run/ui", "10005:10005 640 /d/run/ui/mcp-http-token"]
     check("I", "the bind mount (app-data copied as the box user, uid 1000) now has CONTAINER.md's owners: one uid per component",
           [x for x in ls if x] == want, ls)
     try:
@@ -206,7 +212,7 @@ def main():
         compose(WALLET, "restart", "signer")
         wait_until(lambda: status(f"http://127.0.0.1:{P_MCP}/readyz") == 200, 120, "MCP ready after the signer restart")
     token, agents = mcp_token_from_ui(ui)
-    disk_token = root_helper(wdata, "cat /d/mcp/secrets/mcp-http-token").stdout.strip()
+    disk_token = root_helper(wdata, "cat /d/run/ui/mcp-http-token").stdout.strip()
     check("U", "the Agents page gives the owner the MCP endpoint and the token the MCP server uses",
           token == disk_token and "http://127.0.0.1:33510/mcp" in agents, {"page_has_token": bool(token)})
 
@@ -250,6 +256,40 @@ def main():
     r2 = agent.tool("xbt402_pay", url=f"{PROVIDER}/v1/agp040", max_sats=1000)
     check("R", "a second paid call reuses the channel (no new open), 150 sat",
           r2.get("status") == 200 and r2.get("chan") == r1.get("chan") and not r2.get("opened") and r2.get("charged_sats") == 150, r2)
+    log("== W: rotate the agent token in the UI (no restart); an agent cannot rotate it")
+    mcp_base = f"http://127.0.0.1:{P_MCP}"
+    tries = agent_rotation_attempts(mcp_base, [token])
+    unchanged = root_helper(wdata, "cat /d/run/ui/mcp-http-token").stdout.strip() == token
+    check("W", "an agent holding the token (and the old owner header) cannot rotate it: the MCP has no rotation endpoint",
+          all(st in (401, 404, 405) for _, st, _, _ in tries) and unchanged, [(w, st) for w, st, _, _ in tries])
+    agent_old = Mcp(mcp_base, token)
+    agent_old.start()
+    ui2.post("/agents", "/rotate-token", {"confirm": "1"})
+    flash_rot = ui2.flash("/agents")
+    new_token, _ = mcp_token_from_ui(ui2)
+    st_old = Mcp(mcp_base, token).start()[0]
+    st_old_session = agent_old.post({"jsonrpc": "2.0", "id": 99, "method": "tools/list"})[0]
+    disk = root_helper(wdata, "stat -c '%u:%g %a' /d/run/ui/mcp-http-token; cat /d/run/ui/mcp-http-token; "
+                              "ls -A /d/run/ui; ls /d/mcp/secrets /d/ui/secrets").stdout.split("\n")
+    agent_new = Mcp(mcp_base, new_token or "")
+    st_new = agent_new.start()[0]
+    check("W", "Agents page rotate: the old token gets 401 at once (its open session too), the new one works, no restart; "
+               "the UI's file is replaced atomically, 10005:10005 0640, no temp file, no stale copies",
+          "rotated" in flash_rot.lower() and new_token and new_token != token and st_old == 401 and st_old_session == 401 and st_new == 200
+          and disk[:3] == ["10005:10005 640", new_token, "mcp-http-token"] and "mcp-http-token" not in "\n".join(disk[3:]),
+          {"flash": flash_rot, "old": st_old, "old_session": st_old_session, "new": st_new, "disk": [d if d != new_token else "<token>" for d in disk]})
+    seen = agent_rotation_attempts(mcp_base, [token, new_token or ""])
+    seen.append(("tools/list", *http("POST", agent_new.url, json.dumps({"jsonrpc": "2.0", "id": 5, "method": "tools/list"}).encode(),
+                                     {"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
+                                      "Authorization": f"Bearer {new_token}", "Mcp-Session-Id": agent_new.sid or ""})))
+    for p in ("/healthz", "/readyz"):
+        seen.append((p, *http("GET", mcp_base + p)))
+    check("W", "after the rotation no MCP response (headers or body) carries the new token, and the file still holds it",
+          not leaks(seen, new_token) and all(st in (401, 404, 405) for _, st, _, _ in seen[:8])
+          and root_helper(wdata, "cat /d/run/ui/mcp-http-token").stdout.strip() == new_token,
+          {"leaks": leaks(seen, new_token), "statuses": [(w, st) for w, st, _, _ in seen]})
+    agent = Mcp(mcp_base, new_token)  # the paying agent now holds the new token
+    agent.start()
     time.sleep(6)
     wc = docker("run", "--rm", "--user", "0", "--network", "none", "-v", f"{wdata}/witness:/data/witness:ro", "-v", f"{wdata}/signer:/data/signer:ro",
                 "xbt-anchor-witness:0.1.0", "check", "--store", "/data/witness", "--log", "/data/signer/.run/signatures.jsonl", check_rc=False)
@@ -263,14 +303,24 @@ def main():
     hk = root_helper(os.path.join(APPS_DIR, HUB, "data"), "stat -c '%u:%g %a %n' /d/hub /d/hub/secrets/hub-payto-key /d/hub/secrets/node-rpc-auth").stdout
     check("H", "hub app: init gave data/hub to uid 10004; /readyz 200 (node synced); payTo key generated 0600",
           hub1["ok"] and "10004:10004 700 /d/hub" in hk and "10004:10004 600 /d/hub/secrets/hub-payto-key" in hk, {"readyz": hub1, "stat": hk})
+    w1 = hub1.get("wallet") or {}
+    addr = w1.get("receive_address") or ""
+    check("H", "hub created the node wallet named hub and persisted a receive address (no terminal)",
+          w1.get("name") == "hub" and addr.startswith("bcrt1"), w1)
+    check("H", "hub /readyz reports the Umbrel Tor onion (APP_HIDDEN_SERVICE on a second app)",
+          hub1.get("tor") == HUB_ONION, hub1.get("tor"))
     hp = ui2.get("/hub")  # the session from after the app restart
     check("H", "the wallet UI's Hub page reaches the hub app at lazarus-xbt402-hub_hub_1:9480 (the box network)",
           '<span class="tag ok">200</span> <code>/readyz</code>' in hp, hp[-800:])
+    check("H", "the Hub page shows the receive address and Tor onion (fund, no terminal)",
+          f'id="hub-receive">{addr}' in hp and f'id="hub-tor">{HUB_ONION}' in hp, hp[-800:])
     compose(HUB, "stop")
     compose(HUB, "up", "-d")
     wait_until(lambda: status(f"http://127.0.0.1:{P_HUB}/readyz") == 200, 120, "hub /readyz after restart")
     hub2 = json.loads(http("GET", f"http://127.0.0.1:{P_HUB}/readyz")[2])
-    check("H", "hub app restart: the same payTo", hub1["pay_to"] == hub2["pay_to"], [hub1["pay_to"], hub2["pay_to"]])
+    check("H", "hub app restart: the same payTo and the same receive address",
+          hub1["pay_to"] == hub2["pay_to"] and (hub2.get("wallet") or {}).get("receive_address") == addr,
+          [hub1["pay_to"], hub2["pay_to"], addr, (hub2.get("wallet") or {}).get("receive_address")])
 
     # --- G: readiness follows the node ------------------------------------------------------------------------
     log("== G: /readyz follows the node app")

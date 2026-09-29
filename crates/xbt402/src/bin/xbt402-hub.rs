@@ -23,7 +23,9 @@
 //! `pay_to_key_file`, else the secret `hub-payto-key` (generated 0600 on first run). Behind a proxy:
 //! `XBT_BASE_PATH`, `XBT_PUBLIC_URL` (the 402's `resource.url` base), `XBT_TRUST_FORWARDED=1`
 //! (`X-Forwarded-Proto/Host/Prefix`). `GET /healthz`: the process; `GET /readyz`: the node reachable
-//! and synced.
+//! and synced. AGP-042: `/readyz` also reports the node wallet named `hub` (created and loaded on
+//! start), a stable receive address, its balance, and an Umbrel Tor onion when `XBT_HUB_ONION` /
+//! `APP_HIDDEN_SERVICE` is set.
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -144,10 +146,74 @@ fn network(conf: &Value, rpc: &Rpc) -> String {
     xbt_primitives::network::network_id(hash.as_str().unwrap_or(""))
 }
 
+/// Whether `name` is already in `listwallets`.
+fn wallet_is_loaded(loaded: &Value, name: &str) -> bool {
+    loaded.as_array().is_some_and(|a| a.iter().any(|w| w.as_str() == Some(name)))
+}
+
+/// Create or load the node's wallet named `name` (the hub funds routes from it).
+fn ensure_named_wallet(rpc: &Rpc, name: &str) -> Result<(), String> {
+    let loaded = rpc.call("listwallets", json!([])).map_err(|e| e.to_string())?;
+    if wallet_is_loaded(&loaded, name) {
+        return Ok(());
+    }
+    match rpc.call("loadwallet", json!([name])) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let load_err = e.to_string();
+            if load_err.contains("already loaded") {
+                return Ok(());
+            }
+            match rpc.call("createwallet", json!([name])) {
+                Ok(_) => Ok(()),
+                Err(ce) => {
+                    let create_err = ce.to_string();
+                    if create_err.contains("already exists") {
+                        rpc.call("loadwallet", json!([name])).map(|_| ()).map_err(|e| e.to_string())
+                    } else {
+                        Err(format!("loadwallet: {load_err}; createwallet: {create_err}"))
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn funding_address(wallet: &Rpc) -> Result<String, String> {
+    wallet.call("getnewaddress", json!(["funding", "bech32"])).map_err(|e| e.to_string())?
+        .as_str().map(str::to_string).ok_or_else(|| "getnewaddress: not a string".into())
+}
+
+/// A stable receive address: the file if present, else `getnewaddress` and persist.
+fn persist_receive_address(path: &std::path::Path, new_addr: impl FnOnce() -> Result<String, String>) -> Result<String, String> {
+    if let Ok(a) = std::fs::read_to_string(path) {
+        let a = a.trim().to_string();
+        if !a.is_empty() {
+            return Ok(a);
+        }
+    }
+    let a = new_addr()?;
+    if let Some(d) = path.parent() {
+        xbt_svc::ensure_dir(d, 0o700).map_err(|e| format!("{}: {e}", d.display()))?;
+    }
+    std::fs::write(path, format!("{a}\n")).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(a)
+}
+
+fn wallet_status(wallet: &Rpc, name: &str, receive: Option<&str>) -> Value {
+    let bal = wallet.call("getbalance", json!([])).ok().and_then(|v| v.as_f64())
+        .and_then(|btc| xbt_primitives::amount::Amount::from_btc_f64(btc).ok()).map(|a| a.to_sat());
+    json!({"name": name, "loaded": receive.is_some() || bal.is_some(), "receive_address": receive, "balance_sats": bal})
+}
+
 /// The hub behind a reverse proxy: health endpoints, the base path, the public URL.
 struct Front {
     hub: Arc<RouteHub>,
     rpc: Arc<Rpc>,
+    wallet: Arc<Rpc>,
+    wallet_name: String,
+    receive_address: Option<String>,
+    onion: Option<String>,
     base: String,
     public: Option<String>,
     trust_forwarded: bool,
@@ -171,7 +237,9 @@ impl HttpService for Front {
                 let node = health::node_status(self.rpc.call("getblockchaininfo", json!([])).map_err(|e| e.to_string()));
                 let ok = node["reachable"] == true && node["synced"] == true;
                 json_resp(if ok { 200 } else { 503 }, json!({"ok": ok, "service": "xbt402-hub", "node": node,
-                                                             "pay_to": self.hub.pay_to(), "providers": self.hub.out_channels().len()}))
+                                                             "pay_to": self.hub.pay_to(), "providers": self.hub.out_channels().len(),
+                                                             "wallet": wallet_status(&self.wallet, &self.wallet_name, self.receive_address.as_deref()),
+                                                             "tor": self.onion}))
             }
             _ => {
                 let url = proxy::public_url(headers, path, &self.base, self.public.as_deref(), self.trust_forwarded);
@@ -200,7 +268,11 @@ fn main() {
     let mode = Mode::from_env().unwrap_or_else(|e| die(e));
     let secrets = Secrets::for_component(data.as_ref(), xbt_svc::HUB, mode);
     let rpc = node_rpc(&conf, &secrets);
-    let wallet = rpc.wallet(conf["node"].get("wallet").and_then(Value::as_str).unwrap_or("hub"));
+    let wallet_name = conf["node"].get("wallet").and_then(Value::as_str).unwrap_or("hub").to_string();
+    if let Err(e) = ensure_named_wallet(&rpc, &wallet_name) {
+        eprintln!("xbt402-hub: wallet {wallet_name}: {e} (status and quotes still work; funding needs this wallet)");
+    }
+    let wallet = rpc.wallet(&wallet_name);
     let refunds = wallet.clone();
     let key = match conf.get("pay_to_key_file").and_then(Value::as_str) {
         Some(f) => std::fs::read_to_string(expand(f)).unwrap_or_else(|e| die(format!("pay_to_key_file: {e}"))),
@@ -225,8 +297,13 @@ fn main() {
     if data.is_some() {
         xbt_svc::ensure_dir(&datadir, 0o700).unwrap_or_else(|e| die(format!("{}: {e}", datadir.display())));
     }
+    let receive_address = persist_receive_address(&datadir.join("receive-address"), || funding_address(&wallet))
+        .map_err(|e| { eprintln!("xbt402-hub: receive address: {e}"); e }).ok();
+    if let Some(a) = &receive_address {
+        eprintln!("xbt402-hub: fund the hub wallet '{wallet_name}' at {a}");
+    }
     let rpc = Arc::new(rpc);
-    let hub = RouteHub::new(rpc.clone(), rpc.clone(), Box::new(wallet), Box::new(UreqTransport::default()), secret, &network, Some(&datadir), cfg)
+    let hub = RouteHub::new(rpc.clone(), rpc.clone(), Box::new(wallet.clone()), Box::new(UreqTransport::default()), secret, &network, Some(&datadir), cfg)
         .unwrap_or_else(|e| die(format!("{e}")));
     // ch2 refunds pay the hub's wallet, not the per-channel payer key (AGP-037)
     hub.set_refund_to(Some(Box::new(move || {
@@ -260,8 +337,13 @@ fn main() {
     let _stop = hub.watch(Duration::from_secs_f64(conf.get("watch_interval").and_then(Value::as_f64).unwrap_or(5.0)));
     let bind = bind_addr(&conf);
     let threads = conf.get("threads").and_then(Value::as_u64).unwrap_or(16) as usize;
-    let front = Arc::new(Front { hub: hub.clone(), rpc: rpc.clone(), base, public: env("XBT_PUBLIC_URL"),
-                                 trust_forwarded: env_bool("XBT_TRUST_FORWARDED", false) });
+    let onion = env("XBT_HUB_ONION").or_else(|| env("APP_HIDDEN_SERVICE")).map(|h| {
+        let h = h.trim().trim_end_matches('/');
+        if h.starts_with("http://") || h.starts_with("https://") { h.to_string() } else { format!("http://{h}") }
+    }).filter(|h| h.contains('.'));
+    let wallet = Arc::new(wallet);
+    let front = Arc::new(Front { hub: hub.clone(), rpc: rpc.clone(), wallet, wallet_name, receive_address, onion,
+                                 base, public: env("XBT_PUBLIC_URL"), trust_forwarded: env_bool("XBT_TRUST_FORWARDED", false) });
     let handles = serve_service(front, &bind, threads).unwrap_or_else(|e| die(format!("bind {bind}: {e}")));
     eprintln!("xbt402 hub {} on {bind} ({network})", hub.pay_to());
     for h in handles {
@@ -279,5 +361,25 @@ mod tests {
         assert_eq!(env_number("16").unwrap().as_u64(), Some(16));
         assert_eq!(env_number("0.5").unwrap().as_f64(), Some(0.5));
         assert!(env_number("x").is_none() && env_number("inf").is_none());
+    }
+
+    #[test]
+    fn wallet_list_and_stable_receive_address() {
+        assert!(wallet_is_loaded(&json!(["hub", "agent"]), "hub"));
+        assert!(!wallet_is_loaded(&json!(["agent"]), "hub"));
+        assert!(!wallet_is_loaded(&json!([]), "hub"));
+        let t = std::env::temp_dir().join(format!("agp042-hub-addr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(&t).unwrap();
+        let p = t.join("receive-address");
+        let first = persist_receive_address(&p, || Ok("bcrt1qfirst".into())).unwrap();
+        let again = persist_receive_address(&p, || Ok("bcrt1qsecond".into())).unwrap();
+        assert_eq!((first.as_str(), again.as_str()), ("bcrt1qfirst", "bcrt1qfirst"));
+        assert_eq!(std::fs::read_to_string(&p).unwrap().trim(), "bcrt1qfirst");
+        let st = wallet_status(&Rpc::new("http://127.0.0.1:1", "u", "p"), "hub", Some("bcrt1qfirst"));
+        assert_eq!(st["name"], "hub");
+        assert_eq!(st["receive_address"], "bcrt1qfirst");
+        assert_eq!(st["loaded"], true);
+        let _ = std::fs::remove_dir_all(&t);
     }
 }

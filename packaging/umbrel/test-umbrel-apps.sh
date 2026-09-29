@@ -2,7 +2,8 @@
 # AGP-040 verify for the Umbrel apps (SOV-005's test-umbrel-app.sh shape): lint the store, then install the
 # node, wallet and hub apps from cold on a regtest chain the way umbrelOS does (umbrel_regtest.py), RUNS times
 # (default 2), and print RESULT PASS|FAIL with each run's time to a ready wallet.
-# Needs the images loaded (scripts/oci_build.sh --load). Ports 34000-34099 on 127.0.0.1 only. Soak rules:
+# Needs the images loaded (scripts/oci_build.sh --load). Ports 34000-34099 on 127.0.0.1 only (UMBREL_TEST_PORTS=LO-HI
+# and UMBREL_TEST_*_PORT move them). Soak rules:
 # CPUQuota 200%, MemoryMax 4G, nice 19. Starts no miners (blocks come from generatetoaddress). Never pushes,
 # never submits to a store. Evidence: run/umbrel-test/<stamp>/.
 set -euo pipefail
@@ -16,8 +17,9 @@ RUNS=${RUNS:-2}
 STAMP=$(date +%Y%m%d-%H%M%S)
 OUT=$ROOT/run/umbrel-test/$STAMP
 mkdir -p "$OUT"
-busy=$(ss -ltnH | awk '{print $4}' | sed 's/.*://' | awk '$1>=34000 && $1<=34099' | sort -u | tr '\n' ' ')
-[ -z "$busy" ] || { echo "test-umbrel-apps: ports busy in 34000-34099: $busy" >&2; exit 1; }
+PORTS=${UMBREL_TEST_PORTS:-34000-34099}
+busy=$(ss -ltnH | awk '{print $4}' | sed 's/.*://' | awk -v lo="${PORTS%-*}" -v hi="${PORTS#*-}" '$1>=lo && $1<=hi' | sort -u | tr '\n' ' ')
+[ -z "$busy" ] || { echo "test-umbrel-apps: ports busy in $PORTS: $busy" >&2; exit 1; }
 for i in xbt-signer xbt-anchor-witness xbt-wallet-mcp xbt-wallet-ui xbt402-hub xbt-init; do
   docker image inspect "$i:0.1.0" >/dev/null 2>&1 || { echo "test-umbrel-apps: image $i:0.1.0 missing (scripts/oci_build.sh --load)" >&2; exit 1; }
 done

@@ -34,8 +34,9 @@ LOCAL_IMAGES = re.compile(r"^(xbt-signer|xbt-anchor-witness|xbt-wallet-mcp|xbt40
 AGENTPAY = {
     "xbt-signer": ("signer", "signer", {"anchor"}),
     "xbt-anchor-witness": ("witness", "anchor", set()),
-    "xbt-wallet-mcp": ("mcp", None, {"signer"}),
-    "xbt-wallet-ui": ("ui", None, {"signer"}),
+    # AGP-042: run/ui holds the UI-owned MCP token; the MCP may only read it
+    "xbt-wallet-mcp": ("mcp", None, {"signer", "ui"}),
+    "xbt-wallet-ui": ("ui", "ui", {"signer"}),
     "xbt402-hub": ("hub", None, set()),
 }
 INIT_CAPS = {"CHOWN", "FOWNER", "DAC_OVERRIDE"}

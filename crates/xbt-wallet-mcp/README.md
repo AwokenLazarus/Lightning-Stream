@@ -80,6 +80,7 @@ xbt-wallet-mcp --list-tools                                       # the tool lis
 | `B2_BODY_CAP` | the provider body preview in local-payer answers (default 12000 chars) |
 | `XBT_MCP_PAYER` | `signer` (the default) or `local` (see below) |
 | `XBT_MCP_HTTP_TOKEN` | the bearer token that HTTP requests must carry |
+| `XBT_MCP_HTTP_TOKEN_FILE` | AGP-042: the bearer token as a file someone else owns (default `$XBT_DATA_DIR/run/ui/mcp-http-token` when it exists: the web UI's). Read on every request and never written, so the owner's rotation in the UI cuts the old token off at once; unreadable, empty or world-readable refuses every request. There is no rotation endpoint. |
 | `XBT_MCP_APPROVAL_WAIT_S` | AGP-039: seconds an over-threshold `xbt402_pay` waits for the human to approve it in the wallet's web UI (`xbt-wallet-ui`); approved, the same call is paid and the answer has `waited_for_human: true`. 0 (the default): answer `needs_human` at once, as B2 does; the agent may then repeat the identical call after the approval. Signer payer mode only. |
 
 Give the MCP process nothing else. It must **not** get `B2_HOT_KEYFILE`, `B2_HOT_PASSPHRASE`, node

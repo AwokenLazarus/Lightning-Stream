@@ -68,6 +68,10 @@ pub const RELAY: &str = "relay";
 /// The socket directory of the signer (`signer.sock`, `ready.json`) and of the witness (`anchor.sock`).
 pub const RUN_SIGNER: &str = "signer";
 pub const RUN_ANCHOR: &str = "anchor";
+/// The UI's shared dir (AGP-042): `mcp-http-token`, which the UI writes and the MCP only reads (group).
+pub const RUN_UI: &str = "ui";
+/// The MCP bearer token's name, in `run/ui/` on a box (AGP-042) or `mcp/secrets/` without a UI.
+pub const MCP_TOKEN: &str = "mcp-http-token";
 
 /// The data dir: `$XBT_DATA_DIR/<component>/` for state, `$XBT_DATA_DIR/run/<component>/` for sockets
 /// and readiness files (override `XBT_RUN_DIR`), the witness store at `$XBT_WITNESS_DIR` (default
@@ -115,6 +119,11 @@ impl DataDir {
     /// The anchor witness's socket.
     pub fn anchor_sock(&self) -> PathBuf {
         self.run(RUN_ANCHOR).join("anchor.sock")
+    }
+
+    /// The MCP bearer token the UI owns and the MCP reads (AGP-042): `run/ui/mcp-http-token`.
+    pub fn mcp_token(&self) -> PathBuf {
+        self.run(RUN_UI).join(MCP_TOKEN)
     }
 }
 
@@ -165,6 +174,41 @@ pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
     }
     std::fs::rename(&tmp, path)?;
     set_mode(path, mode)
+}
+
+/// Replace a secret file atomically (AGP-042: the rotated MCP token). A temp file with a random name
+/// is created exclusively in the same directory, mode 0600 (never through a planted symlink), written
+/// and fsynced; only then does it get `mode` (0600 or 0640, never a bit for others) and is renamed over
+/// `path`, and the directory is fsynced. Readers see the old value or the new one, never a partial one,
+/// and nobody outside the owner (and, with 0640, its group) can read it at any moment.
+pub fn replace_secret_file(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    if mode & 0o137 != 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("secret mode {mode:o}: at most 0640")));
+    }
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let name = path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?;
+    let tmp = dir.join(format!(".{}.{}.tmp", name.to_string_lossy(), to_hex(&random_bytes(8))));
+    let res = (|| {
+        let mut f = open_private(&tmp, true)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+            f.sync_all()?;
+        }
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res?;
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
 }
 
 fn open_private(path: &Path, exclusive: bool) -> io::Result<std::fs::File> {
@@ -613,5 +657,44 @@ mod tests {
         assert_eq!(health::node_status(Err("down".into()))["reachable"], false);
         assert_eq!(probe::local_addr("0.0.0.0:80"), "127.0.0.1:80");
         assert_eq!(probe::local_addr("[::]:80"), "[::1]:80");
+    }
+
+    /// AGP-042: the rotated MCP token is replaced atomically and is never readable by others.
+    #[cfg(unix)]
+    #[test]
+    fn replace_secret_file_is_atomic_and_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o750)).unwrap();
+        let p = d.path().join(MCP_TOKEN);
+        // the temp file is 0600 from its creation, before a byte is written (umask cannot widen it)
+        let t = d.path().join("t");
+        let f = open_private(&t, true).unwrap();
+        assert_eq!(f.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        drop(f);
+        assert!(open_private(&t, true).is_err(), "exclusive: an existing (or planted) temp path is refused");
+        std::fs::remove_file(&t).unwrap();
+        replace_secret_file(&p, b"old", 0o640).unwrap();
+        assert_eq!(mode_of(&p), 0o640);
+        // a reader holding the old file keeps reading the old inode; the path flips to the new value
+        let held = std::fs::File::open(&p).unwrap();
+        replace_secret_file(&p, b"new", 0o600).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"new");
+        assert_eq!(mode_of(&p), 0o600);
+        assert_eq!(std::io::read_to_string(held).unwrap(), "old");
+        let left: Vec<_> = std::fs::read_dir(d.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left, vec![std::ffi::OsString::from(MCP_TOKEN)], "no temp file left behind");
+        for bad in [0o644, 0o604, 0o660, 0o700] {
+            assert!(replace_secret_file(&p, b"x", bad).is_err(), "{bad:o}");
+        }
+        assert_eq!(std::fs::read(&p).unwrap(), b"new");
+        // a symlink at the target is replaced, not followed
+        let victim = d.path().join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        let link = d.path().join("link");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        replace_secret_file(&link, b"tok", 0o640).unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_file());
     }
 }

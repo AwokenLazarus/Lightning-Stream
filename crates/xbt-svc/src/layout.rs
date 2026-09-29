@@ -11,9 +11,12 @@
 //! * when a component dir had another owner (a fresh bind mount, or a box that ran everything as 1000),
 //!   gives it and everything under it to the component. It never follows a symlink (`lchown`, no descent);
 //! * provisions the secrets a box's installer holds: `node-rpc-auth` into `signer/` and `hub/`, the UI
-//!   password into `ui/`, and the MCP bearer token, generated once, into `mcp/` and a copy into `ui/`
-//!   (the UI's Agents page shows it to the owner). A secret is rewritten only when its value changes;
-//!   a generated one never is.
+//!   password into `ui/`, and the MCP bearer token, generated once. With the UI (a box), the token is
+//!   `run/ui/mcp-http-token`: owned by the UI (uid 10005), 0640, in `run/ui/` (0750), and the MCP reads it
+//!   through the `xbt-wallet-ui` group. Only the UI can replace it (the Agents page rotates it); the MCP
+//!   has no way to (AGP-042). An older layout's copies (`mcp/secrets/`, `ui/secrets/`) are moved there
+//!   once and removed. Without the UI, the token stays `mcp/secrets/mcp-http-token`. A secret is
+//!   rewritten only when its value changes; a generated one never is.
 //!
 //! It reports what it did as JSON (names, owners and modes; never a secret's value).
 use serde_json::{json, Value};
@@ -39,7 +42,10 @@ pub const COMPONENTS: &[Component] = &[
 ];
 
 /// The socket dirs: (dir under `run/`, the component that serves it).
-pub const RUN_DIRS: &[(&str, &str)] = &[(crate::RUN_SIGNER, crate::SIGNER), (crate::RUN_ANCHOR, crate::WITNESS)];
+pub const RUN_DIRS: &[(&str, &str)] = &[(crate::RUN_SIGNER, crate::SIGNER), (crate::RUN_ANCHOR, crate::WITNESS), (crate::RUN_UI, crate::UI)];
+
+/// The shared MCP token's mode: the UI reads and writes it, the MCP (in the UI's group) reads it.
+pub const MCP_TOKEN_MODE: u32 = 0o640;
 
 pub fn component(name: &str) -> Option<&'static Component> {
     COMPONENTS.iter().find(|c| c.name == name)
@@ -153,17 +159,17 @@ fn own_dir(dir: &Path, uid: u32, mode: u32, recurse: bool) -> Result<Value, Stri
               "was": {"uid": u0, "gid": g0, "mode": format!("{m0:o}")}, "chowned": changed}))
 }
 
-/// Write a secret owned by `uid`, 0600, only when its value differs. The temp file is created
+/// Write a secret owned by `uid` with `mode` (0600, or 0640 for the shared MCP token), only when its value differs. The temp file is created
 /// exclusively (never through a symlink a service may have planted) and renamed over the target.
 #[cfg(unix)]
-fn put_secret(path: &Path, value: &[u8], uid: u32) -> Result<&'static str, String> {
+fn put_secret(path: &Path, value: &[u8], uid: u32, mode: u32) -> Result<&'static str, String> {
     let ctx = |e: io::Error| format!("{}: {e}", path.display());
     if let Ok(md) = std::fs::symlink_metadata(path) {
         if md.file_type().is_file() && std::fs::read(path).map(|b| b == value).unwrap_or(false) {
             let (u, g, m) = owner_mode(path).map_err(ctx)?;
-            if (u, g, m) != (uid, uid, 0o600) {
+            if (u, g, m) != (uid, uid, mode) {
                 lchown(path, uid).map_err(ctx)?;
-                crate::set_mode(path, 0o600).map_err(ctx)?;
+                crate::set_mode(path, mode).map_err(ctx)?;
                 return Ok("fixed");
             }
             return Ok("unchanged");
@@ -179,6 +185,10 @@ fn put_secret(path: &Path, value: &[u8], uid: u32) -> Result<&'static str, Strin
     let mut f = o.open(&tmp).map_err(ctx)?;
     std::os::unix::fs::fchown(&f, Some(uid), Some(uid)).map_err(ctx)?;
     f.write_all(value).and_then(|_| f.sync_all()).map_err(ctx)?;
+    if mode != 0o600 {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(mode)).and_then(|_| f.sync_all()).map_err(ctx)?;
+    }
     drop(f);
     std::fs::rename(&tmp, path).map_err(ctx)?;
     Ok("written")
@@ -226,7 +236,7 @@ fn init_with(root: &Path, names: &[String], prov: &Provision, uid_of: &dyn Fn(&C
     let mut secrets = vec![];
     let mut put = |comp: &str, name: &str, value: &[u8]| -> Result<(), String> {
         let c = component(comp).expect("known");
-        let r = put_secret(&root.join(comp).join("secrets").join(name), value, uid_of(c))?;
+        let r = put_secret(&root.join(comp).join("secrets").join(name), value, uid_of(c), 0o600)?;
         secrets.push(json!({"component": comp, "name": name, "result": r}));
         Ok(())
     };
@@ -243,20 +253,25 @@ fn init_with(root: &Path, names: &[String], prov: &Provision, uid_of: &dyn Fn(&C
         }
     }
     if has(crate::MCP) {
-        let tp = root.join(crate::MCP).join("secrets").join("mcp-http-token");
-        let token = match read_regular(&tp) {
-            Some(t) => {
-                put(crate::MCP, "mcp-http-token", &t)?; // owner and mode only; the value stays
-                t
-            }
-            None => {
-                let t = crate::to_hex(&crate::random_bytes(32)).into_bytes();
-                put(crate::MCP, "mcp-http-token", &t)?;
-                t
-            }
-        };
+        let tp = root.join(crate::MCP).join("secrets").join(crate::MCP_TOKEN);
+        let ui_copy = root.join(crate::UI).join("secrets").join(crate::MCP_TOKEN);
+        let shared = root.join("run").join(crate::RUN_UI).join(crate::MCP_TOKEN);
+        let fresh = || crate::to_hex(&crate::random_bytes(32)).into_bytes();
         if has(crate::UI) {
-            put(crate::UI, "mcp-http-token", &token)?;
+            // the UI owns the token (it rotates it); the MCP only reads it. The first run of this layout
+            // keeps an older layout's token, so agents keep working across the upgrade.
+            let token = read_regular(&shared).or_else(|| read_regular(&tp)).unwrap_or_else(fresh);
+            let r = put_secret(&shared, &token, uid_of(component(crate::UI).expect("known")), MCP_TOKEN_MODE)?;
+            secrets.push(json!({"component": crate::UI, "name": format!("run/{}/{}", crate::RUN_UI, crate::MCP_TOKEN), "result": r}));
+            for (comp, old) in [(crate::MCP, &tp), (crate::UI, &ui_copy)] {
+                if std::fs::symlink_metadata(old).is_ok() {
+                    std::fs::remove_file(old).map_err(|e| format!("{}: {e}", old.display()))?;
+                    secrets.push(json!({"component": comp, "name": crate::MCP_TOKEN, "result": "removed"}));
+                }
+            }
+        } else {
+            // an existing value stays (owner and mode only)
+            put(crate::MCP, crate::MCP_TOKEN, &read_regular(&tp).unwrap_or_else(fresh))?;
         }
     }
     Ok(json!({"ok": true, "root": root.display().to_string(), "dirs": dirs, "secrets": secrets}))
@@ -295,6 +310,9 @@ pub fn check(root: &Path, names: &[String]) -> Value {
             if *server == c.name {
                 want(root.join("run").join(dir), c.uid, 0o750);
             }
+        }
+        if c.name == crate::UI && names.iter().any(|n| n == crate::MCP) {
+            want(root.join("run").join(crate::RUN_UI).join(crate::MCP_TOKEN), c.uid, MCP_TOKEN_MODE);
         }
     }
     json!({"ok": problems.is_empty(), "problems": problems, "paths": rows})
@@ -344,19 +362,26 @@ mod tests {
         let prov = Provision { node_rpc_auth: Some("xbt:pw".into()), ui_password: Some("correct horse".into()) };
         let r = init_as(&root, &names, &prov, uid).unwrap();
         assert_eq!(r["ok"], true);
-        let tok = std::fs::read_to_string(root.join("mcp/secrets/mcp-http-token")).unwrap();
+        // AGP-042: with the UI, the token is the UI's run/ui/mcp-http-token (0640, the MCP reads it by group)
+        let tok = std::fs::read_to_string(root.join("run/ui/mcp-http-token")).unwrap();
         assert_eq!(tok.len(), 64);
-        assert_eq!(std::fs::read_to_string(root.join("ui/secrets/mcp-http-token")).unwrap(), tok);
+        assert!(!root.join("mcp/secrets/mcp-http-token").exists() && !root.join("ui/secrets/mcp-http-token").exists());
+        assert_eq!(std::fs::metadata(root.join("run/ui/mcp-http-token")).unwrap().mode() & 0o777, 0o640);
+        assert_eq!(std::fs::metadata(root.join("run/ui")).unwrap().mode() & 0o777, 0o750);
         assert_eq!(std::fs::read_to_string(root.join("signer/secrets/node-rpc-auth")).unwrap(), "xbt:pw");
         assert!(!root.join("hub").exists(), "only the listed components");
-        for p in ["signer/secrets/node-rpc-auth", "ui/secrets/xbt-ui-password", "mcp/secrets/mcp-http-token"] {
+        for p in ["signer/secrets/node-rpc-auth", "ui/secrets/xbt-ui-password"] {
             assert_eq!(std::fs::metadata(root.join(p)).unwrap().mode() & 0o777, 0o600, "{p}");
         }
         assert_eq!(std::fs::metadata(root.join("run/signer")).unwrap().mode() & 0o777, 0o750);
         // a second run keeps the token and rewrites nothing
         let r2 = init_as(&root, &names, &prov, uid).unwrap();
         assert!(r2["secrets"].as_array().unwrap().iter().all(|s| s["result"] == "unchanged"), "{r2}");
-        assert_eq!(std::fs::read_to_string(root.join("mcp/secrets/mcp-http-token")).unwrap(), tok);
+        assert_eq!(std::fs::read_to_string(root.join("run/ui/mcp-http-token")).unwrap(), tok);
+        // a rotated token (the UI replaced it) survives a restart's init
+        crate::replace_secret_file(&root.join("run/ui/mcp-http-token"), b"rotated", 0o640).unwrap();
+        init_as(&root, &names, &prov, uid).unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("run/ui/mcp-http-token")).unwrap(), "rotated");
         // a changed node password is rewritten; a planted symlink at the temp path is not followed
         let victim = t.path().join("victim");
         std::fs::write(&victim, "keep").unwrap();
@@ -371,6 +396,30 @@ mod tests {
         std::fs::create_dir_all(&root2).unwrap();
         std::os::unix::fs::symlink(t.path().join("elsewhere"), root2.join("signer")).unwrap();
         assert!(init_as(&root2, &["signer".to_string()], &Provision::default(), uid).is_err());
+    }
+
+    /// An AGP-040 data dir (the token in mcp/secrets and a copy in ui/secrets) upgrades with the same token;
+    /// without the UI the token stays the MCP's own secret.
+    #[test]
+    fn mcp_token_upgrade_and_mcp_only() {
+        let uid = me();
+        if uid == 0 {
+            return;
+        }
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("data");
+        let mcp_only: Vec<String> = ["signer", "mcp"].iter().map(|s| s.to_string()).collect();
+        init_as(&root, &mcp_only, &Provision::default(), uid).unwrap();
+        let old = std::fs::read_to_string(root.join("mcp/secrets/mcp-http-token")).unwrap();
+        assert_eq!(std::fs::metadata(root.join("mcp/secrets/mcp-http-token")).unwrap().mode() & 0o777, 0o600);
+        assert!(!root.join("run/ui").exists());
+        std::fs::create_dir_all(root.join("ui/secrets")).unwrap();
+        std::fs::write(root.join("ui/secrets/mcp-http-token"), &old).unwrap();
+        let all: Vec<String> = ["signer", "mcp", "ui"].iter().map(|s| s.to_string()).collect();
+        let r = init_as(&root, &all, &Provision::default(), uid).unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("run/ui/mcp-http-token")).unwrap(), old, "agents keep their token");
+        assert!(!root.join("mcp/secrets/mcp-http-token").exists() && !root.join("ui/secrets/mcp-http-token").exists(), "{r}");
+        assert!(!r.to_string().contains(&old), "the report never holds a secret");
     }
 
     fn init_as(root: &Path, names: &[String], prov: &Provision, uid: u32) -> Result<Value, String> {
