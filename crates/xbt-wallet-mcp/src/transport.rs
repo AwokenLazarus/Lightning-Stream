@@ -62,8 +62,10 @@ pub struct HttpConfig {
     pub path: String,
     /// When set, every request needs `Authorization: Bearer <token>`.
     pub token: Option<String>,
-    /// When set, the live token is this file (re-read on each request) so `POST /rotate-token` takes
-    /// effect without a restart. The UI's Agents page rotates it (AGP-042).
+    /// When set, the token is this file, read on every request and never written: the UI owns it and
+    /// rotates it on its Agents page, so a rotation takes effect at once, with no restart (AGP-042). An
+    /// unreadable or empty file refuses every request (it never falls back to `token`). The MCP has no
+    /// rotation endpoint: a bearer token must not be able to replace itself.
     pub token_file: Option<PathBuf>,
     pub allow_remote: bool,
     /// A path prefix a reverse proxy keeps (`XBT_BASE_PATH`): `<base>/mcp`, `<base>/healthz`. Requests
@@ -126,47 +128,31 @@ fn same(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// The token in force: the file (after a rotation) else the configured value.
-fn live_token(cfg: &HttpConfig) -> Option<String> {
-    if let Some(p) = &cfg.token_file {
-        if let Ok(t) = std::fs::read_to_string(p) {
-            let t = t.trim().to_string();
-            if !t.is_empty() {
-                return Some(t);
-            }
-        }
-    }
-    cfg.token.clone()
+/// The token in force: the token file when there is one (fail closed: `Err` when it cannot be read),
+/// else the configured value.
+fn live_token(cfg: &HttpConfig) -> Result<Option<String>, String> {
+    let Some(p) = &cfg.token_file else { return Ok(cfg.token.clone()) };
+    read_token_file(p).map(Some)
 }
 
-fn rotate_token(cfg: &HttpConfig, mut req: tiny_http::Request) {
-    let mut discard = Vec::new();
-    let _ = std::io::Read::read_to_end(&mut std::io::Read::take(req.as_reader(), 4096), &mut discard);
-    let Some(want) = live_token(cfg) else {
-        return reply(req, 400, serde_json::json!({"ok": false, "error": "no token to rotate"}).to_string(), &[]);
-    };
-    let got = header(&req, "Authorization").and_then(|a| a.strip_prefix("Bearer ")).unwrap_or("");
-    if !same(got, &want) {
-        return reply(req, 401, serde_json::json!({"ok": false, "error": "Unauthorized"}).to_string(), &[("WWW-Authenticate", "Bearer".into())]);
-    }
-    // the UI sends this; a stock MCP client does not. An agent that has the token can still rotate if
-    // it copies the header (it already has spend-under-policy). The owner then rotates again in the UI.
-    if header(&req, "X-XBT-Rotate") != Some("owner") {
-        return reply(req, 403, serde_json::json!({"ok": false, "error": "owner header required"}).to_string(), &[]);
-    }
-    let Some(path) = &cfg.token_file else {
-        return reply(req, 400, serde_json::json!({"ok": false, "error": "token is not a rotatable file"}).to_string(), &[]);
-    };
-    let new = xbt_svc::to_hex(&xbt_svc::random_bytes(32));
-    if let Err(e) = std::fs::write(path, &new) {
-        return reply(req, 500, serde_json::json!({"ok": false, "error": e.to_string()}).to_string(), &[]);
+/// Read the token file: a regular file (not a symlink), no bits for others, not empty.
+pub fn read_token_file(p: &std::path::Path) -> Result<String, String> {
+    let md = std::fs::symlink_metadata(p).map_err(|e| format!("{}: {e}", p.display()))?;
+    if !md.file_type().is_file() {
+        return Err(format!("{}: not a regular file", p.display()));
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        if md.permissions().mode() & 0o007 != 0 {
+            return Err(format!("{}: readable by others; refused", p.display()));
+        }
     }
-    reply(req, 200, serde_json::json!({"ok": true, "token": new}).to_string(), &[])
+    let t = std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?.trim().to_string();
+    if t.is_empty() {
+        return Err(format!("{}: empty", p.display()));
+    }
+    Ok(t)
 }
 
 type Sessions = Arc<Mutex<HashMap<String, (Session, std::time::Instant)>>>;
@@ -174,10 +160,6 @@ type Sessions = Arc<Mutex<HashMap<String, (Session, std::time::Instant)>>>;
 fn handle_http(server: &Server, cfg: &HttpConfig, sessions: &Sessions, mut req: tiny_http::Request) {
     let raw = req.url().split('?').next().unwrap_or("").to_string();
     let path = xbt_svc::proxy::strip_base(&raw, &cfg.base).unwrap_or(raw);
-    // owner token rotation (the UI's Agents page). Not an MCP tool: agents must not list it.
-    if path == "/rotate-token" && matches!(req.method(), Method::Post) {
-        return rotate_token(cfg, req);
-    }
     // health probes (Docker HEALTHCHECK, Umbrel, StartOS): no token, no session, nothing secret
     if matches!(path.as_str(), "/healthz" | "/readyz") && matches!(req.method(), Method::Get | Method::Head) {
         if path == "/healthz" {
@@ -201,7 +183,14 @@ fn handle_http(server: &Server, cfg: &HttpConfig, sessions: &Sessions, mut req: 
             return reply(req, 403, rpc_error(-32600, "Forbidden origin"), &[]);
         }
     }
-    if let Some(t) = live_token(cfg) {
+    let want = match live_token(cfg) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("xbt-wallet-mcp: bearer token: {e}");
+            return reply(req, 503, rpc_error(-32603, "the bearer token is unavailable"), &[]);
+        }
+    };
+    if let Some(t) = want {
         let got = header(&req, "Authorization").and_then(|a| a.strip_prefix("Bearer ")).unwrap_or("");
         if !same(got, &t) {
             return reply(req, 401, rpc_error(-32600, "Unauthorized"), &[("WWW-Authenticate", "Bearer".into())]);
@@ -265,7 +254,7 @@ pub fn serve_http(server: Arc<Server>, cfg: HttpConfig) -> Result<(), String> {
     if !cfg.allow_remote && !is_loopback_host(host) {
         return Err(format!("{}: not a loopback address (pass --http-allow-remote with XBT_MCP_HTTP_TOKEN to listen elsewhere)", cfg.addr));
     }
-    if cfg.allow_remote && live_token(&cfg).is_none() {
+    if cfg.allow_remote && !matches!(live_token(&cfg), Ok(Some(_))) {
         return Err("--http-allow-remote needs XBT_MCP_HTTP_TOKEN".into());
     }
     let http = tiny_http::Server::http(&cfg.addr).map_err(|e| format!("{}: {e}", cfg.addr))?;

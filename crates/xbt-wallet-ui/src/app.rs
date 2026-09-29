@@ -918,32 +918,19 @@ impl App {
         self.page("Agents", ctx, b)
     }
 
-    /// Replace the MCP bearer token: ask the MCP (it owns the live file), then write our copy.
-    fn rotate_mcp_token(&self) -> Result<String, String> {
-        let current = std::fs::read_to_string(&self.cfg.mcp_token_file).map_err(|e| format!("read token: {e}"))?;
-        let current = current.trim();
-        if current.is_empty() {
-            return Err("no token to rotate".into());
+    /// Replace the MCP bearer token (AGP-042). The UI owns the token file and the MCP only reads it, on
+    /// every request, so the old token stops working at once. The MCP is never asked: rotation must not be
+    /// reachable with the token it replaces, and the new token goes nowhere but this file and this page.
+    fn rotate_mcp_token(&self) -> Result<(), String> {
+        let p = &self.cfg.mcp_token_file;
+        let md = std::fs::symlink_metadata(p).map_err(|e| format!("read token: {e}"))?;
+        if !md.file_type().is_file() {
+            return Err("the token file is not a regular file".into());
         }
-        let new = if let Some(url) = &self.cfg.mcp_rotate_url {
-            let (st, body) = http_post(url, current, &[("X-XBT-Rotate", "owner")])?;
-            if st != 200 {
-                return Err(format!("the MCP refused rotation (HTTP {st}): {}", short(&body, 200)));
-            }
-            let v: Value = serde_json::from_str(&body).map_err(|e| format!("rotate reply: {e}"))?;
-            let t = v.get("token").and_then(Value::as_str).unwrap_or("").trim().to_string();
-            if t.len() != 64 || !t.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err("the MCP did not return a new token".into());
-            }
-            t
-        } else {
-            hex::encode(crate::random_bytes::<32>())
-        };
-        write_token_file(&self.cfg.mcp_token_file, &new)?;
-        if let Some(peer) = &self.cfg.mcp_token_peer {
-            write_token_file(peer, &new)?;
-        }
-        Ok(new)
+        // keep the mode xbt-init gave it (0640 on a box: the MCP reads it by group), never a bit for others
+        let mode = mode_bits(&md) & 0o640;
+        let new = hex::encode(crate::random_bytes::<32>());
+        xbt_svc::replace_secret_file(p, format!("{new}\n").as_bytes(), mode | 0o600).map_err(|e| format!("{}: {e}", p.display()))
     }
 
     fn hub(&self, ctx: &Ctx) -> Resp {
@@ -1092,44 +1079,15 @@ impl App {
     }
 }
 
-fn write_token_file(path: &std::path::Path, token: &str) -> Result<(), String> {
-    if let Some(d) = path.parent() {
-        std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
-    }
-    std::fs::write(path, format!("{token}\n")).map_err(|e| format!("{}: {e}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
+#[cfg(unix)]
+fn mode_bits(md: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    md.permissions().mode() & 0o777
 }
 
-/// A plain-HTTP POST with a short timeout (the MCP rotate endpoint on the box network).
-fn http_post(url: &str, bearer: &str, extra: &[(&str, &str)]) -> Result<(u16, String), String> {
-    use std::io::{Read, Write};
-    let rest = url.strip_prefix("http://").ok_or("only http:// rotate URLs")?;
-    let (hostport, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
-    };
-    let addr = std::net::ToSocketAddrs::to_socket_addrs(&if hostport.contains(':') { hostport.to_string() } else { format!("{hostport}:80") })
-        .map_err(|e| e.to_string())?.next().ok_or("no address")?;
-    let t = std::time::Duration::from_secs(5);
-    let mut s = std::net::TcpStream::connect_timeout(&addr, t).map_err(|e| e.to_string())?;
-    s.set_read_timeout(Some(t)).ok();
-    let mut hdrs = format!("POST {path} HTTP/1.0\r\nHost: {hostport}\r\nAuthorization: Bearer {bearer}\r\nContent-Length: 0\r\nConnection: close\r\n");
-    for (k, v) in extra {
-        hdrs.push_str(&format!("{k}: {v}\r\n"));
-    }
-    hdrs.push_str("\r\n");
-    s.write_all(hdrs.as_bytes()).map_err(|e| e.to_string())?;
-    let mut buf = Vec::new();
-    s.take(16 * 1024).read_to_end(&mut buf).map_err(|e| e.to_string())?;
-    let text = String::from_utf8_lossy(&buf).to_string();
-    let status = text.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
-    let body = text.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
-    Ok((status, body))
+#[cfg(not(unix))]
+fn mode_bits(_: &std::fs::Metadata) -> u32 {
+    0o600
 }
 
 /// A plain-HTTP GET with a short timeout (the hub is on the box's own network).

@@ -14,8 +14,8 @@ volume `startos` holds `store.json` (the node connection, the hub switch) and is
 | init (oneshot) | xbt-init | root | all | exits 0 |
 | witness | xbt-anchor-witness | xbt-anchor-witness | witness, run/anchor | `xbt-anchor-witness healthcheck` |
 | signer | xbt-signer | xbt-signer | signer, run/signer, run/anchor (ro) | `xbt-signer healthcheck` |
-| mcp | xbt-wallet-mcp | xbt-wallet-mcp | mcp, run/signer (ro) | port 33510 |
-| ui | xbt-wallet-ui | xbt-wallet-ui | ui, run/signer (ro) | port 8480 |
+| mcp | xbt-wallet-mcp | xbt-wallet-mcp | mcp, run/signer (ro), run/ui (ro) | port 33510 |
+| ui | xbt-wallet-ui | xbt-wallet-ui | ui, run/signer (ro), run/ui | port 8480 |
 | hub (if enabled) | xbt402-hub | xbt402-hub | hub | port 9480 |
 
 Health check `wallet-ready`: the MCP's `/readyz` (200: synced and unlocked; 503: loading, with the reason).
@@ -31,8 +31,8 @@ enabled). StartOS terminates TLS and adds X-Forwarded-Proto, so the UI's cookie 
 |---|---|
 | node-config | node RPC host, port, user, password, chain (a critical task until set) |
 | ui-setup-code | the UI's one-time setup code (`main/ui/setup-code`), while no password is set |
-| agent-connection | the MCP addresses and the bearer token (`main/mcp/secrets/mcp-http-token`) |
-| rotate-agent-token | delete the MCP token (and the UI's copy) and restart: xbt-init makes a new one. Prefer the web UI Agents page (`POST /rotate-token`), which needs no restart. |
+| agent-connection | the MCP addresses and the bearer token (`main/run/ui/mcp-http-token`) |
+| rotate-agent-token | delete the MCP token and restart: xbt-init makes a new one. The web UI Agents page rotates it with no restart (the UI owns the token; the MCP only reads it). |
 | hub-toggle | enable or disable the xbt402 hub |
 | reset-ui-password | delete `main/ui/password.scrypt` and restart |
 

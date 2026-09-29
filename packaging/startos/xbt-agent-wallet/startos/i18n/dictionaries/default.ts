@@ -32,7 +32,7 @@ const dict = {
   'Web UI password reset': 28,
   'Run Web UI setup code once the service is running again.': 29,
   'Rotate the agent token': 30,
-  'Replace the MCP bearer token, for example if it leaked. Prefer the Agents page in the web UI (no restart). This action deletes both copies and restarts.': 31,
+  'Replace the MCP bearer token, for example if it leaked. The Agents page in the web UI does this with no restart; this action restarts the service.': 31,
   'Every agent loses access until you give it the new token (Agent connection).': 32,
   'Agent token rotated': 33,
   'Run Agent connection once the service is running again, and give your agents the new token.': 34,

@@ -17,7 +17,10 @@
 //! `XBT_BASE_PATH` (a prefix the reverse proxy keeps), `XBT_MCP_HTTP_ALLOW_REMOTE`. With `XBT_DATA_DIR`
 //! the signer socket defaults to `run/signer/signer.sock` and a listener on a non-loopback address
 //! is allowed, always behind the bearer token: the secret `mcp-http-token` (generated 0600 into
-//! `mcp/secrets/` on first run). `GET /healthz` is the process; `GET /readyz` is the signer answering
+//! `mcp/secrets/` on first run). On a box with the web UI (AGP-042) the token is the UI's file instead:
+//! `XBT_MCP_HTTP_TOKEN_FILE`, default `run/ui/mcp-http-token` when it exists (xbt-init makes it, 0640,
+//! group `xbt-wallet-ui`). The MCP reads it on every request and never writes it, so the owner's
+//! rotation on the UI's Agents page cuts the old token off at once. `GET /healthz` is the process; `GET /readyz` is the signer answering
 //! and its readiness file (node synced, keys unlocked, witness reachable) fresh and ok.
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,7 +29,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use xbt_svc::{env, env_bool, health, probe, DataDir, Mode, Secrets};
 use xbt_wallet_mcp::mcp::{tools, Server};
-use xbt_wallet_mcp::transport::{serve_http, serve_stdio, HttpConfig, ReadyFn};
+use xbt_wallet_mcp::transport::{read_token_file, serve_http, serve_stdio, HttpConfig, ReadyFn};
 use xbt_wallet_mcp::wallet::Wallet;
 
 fn arg(args: &[String], name: &str) -> Option<String> {
@@ -129,7 +132,18 @@ fn main() {
     let allow_remote = args.iter().any(|a| a == "--http-allow-remote") || env_bool("XBT_MCP_HTTP_ALLOW_REMOTE", data.is_some());
     // the token: the old env value (dev mode), else the secret; a non-loopback listener always needs one
     let secrets = Secrets::for_component(data.as_ref(), xbt_svc::MCP, mode);
+    // AGP-042: the UI's token file (read-only here), when there is one
+    let token_file = env("XBT_MCP_HTTP_TOKEN_FILE").map(PathBuf::from)
+        .or_else(|| data.as_ref().map(DataDir::mcp_token).filter(|p| std::fs::symlink_metadata(p).is_ok()));
+    if let Some(p) = &token_file {
+        if env("XBT_MCP_HTTP_TOKEN").is_some() {
+            die("set XBT_MCP_HTTP_TOKEN_FILE or XBT_MCP_HTTP_TOKEN, not both");
+        }
+        read_token_file(p).unwrap_or_else(|e| die(&format!("bearer token: {e}")));
+        eprintln!("xbt-wallet-mcp: bearer token from {} (read on every request; the UI rotates it)", p.display());
+    }
     let token = match env("XBT_MCP_HTTP_TOKEN") {
+        _ if token_file.is_some() => None,
         Some(_) if mode.is_production() => die("XBT_MCP_HTTP_TOKEN is a plain env secret, refused in production mode: use the secret \
                                                 mcp-http-token (XBT_SECRET_MCP_HTTP_TOKEN_FILE, $CREDENTIALS_DIRECTORY or the data dir)"),
         Some(t) => Some(t),
@@ -150,7 +164,6 @@ fn main() {
         }
     };
     let ready_file = env("XBT_SIGNER_READY_FILE").map(PathBuf::from).or_else(|| data.as_ref().map(DataDir::signer_ready));
-    let token_file = secrets.dir.as_ref().map(|d| d.join("mcp-http-token"));
     let cfg = HttpConfig { addr, path, token, token_file, allow_remote, base, ready: Some(readiness(wallet, ready_file)) };
     if let Err(e) = serve_http(server, cfg) {
         die(&e);

@@ -101,7 +101,8 @@ export function services(cfg: Config): ServiceSpec[] {
       command: ['/usr/bin/xbt-wallet-mcp'],
       // an over-threshold payment waits this long for the owner's approval in the UI
       env: { XBT_MCP_HTTP: `0.0.0.0:${PORTS.mcp}`, XBT_MCP_APPROVAL_WAIT_S: '300' },
-      mounts: [vol('mcp', '/data/mcp'), vol('run/signer', '/data/run/signer', true)],
+      // the bearer token is the UI's run/ui/mcp-http-token (0640, group xbt-wallet-ui): read-only here (AGP-042)
+      mounts: [vol('mcp', '/data/mcp'), vol('run/signer', '/data/run/signer', true), vol('run/ui', '/data/run/ui', true)],
       requires: ['signer'],
       port: PORTS.mcp,
     },
@@ -113,10 +114,10 @@ export function services(cfg: Config): ServiceSpec[] {
         XBT_UI_BIND: `0.0.0.0:${PORTS.ui}`,
         XBT_UI_SIGNER_SOCK: '/data/run/signer/signer.sock',
         XBT_UI_MCP_URL: cfg.mcpUrls.join(','),
-        XBT_UI_MCP_ROTATE_URL: `http://127.0.0.1:${PORTS.mcp}/rotate-token`,
         ...(cfg.hubEnabled ? { XBT_UI_HUB_URL: `http://127.0.0.1:${PORTS.hub}` } : {}),
       },
-      mounts: [vol('ui', '/data/ui'), vol('run/signer', '/data/run/signer', true)],
+      // the UI owns the MCP token and rotates it on its Agents page (AGP-042)
+      mounts: [vol('ui', '/data/ui'), vol('run/signer', '/data/run/signer', true), vol('run/ui', '/data/run/ui')],
       requires: ['signer'],
       port: PORTS.ui,
     },

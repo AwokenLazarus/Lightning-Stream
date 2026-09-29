@@ -83,6 +83,8 @@ services:
     volumes:
       - ${APP_DATA_DIR}/data/mcp:/data/mcp
       - ${APP_DATA_DIR}/data/run/signer:/data/run/signer:ro
+      # the bearer token is the UI's file (0640, group xbt-wallet-ui): read on every request, never written here
+      - ${APP_DATA_DIR}/data/run/ui:/data/run/ui:ro
 
   ui:
     <<: *service
@@ -92,9 +94,9 @@ services:
       XBT_UI_PASSWORD_FILE: /data/ui/secrets/xbt-ui-password
       XBT_UI_SIGNER_SOCK: /data/run/signer/signer.sock
       XBT_UI_MCP_URL: http://${DEVICE_DOMAIN_NAME}:33510/mcp
-      # the MCP owns the live token (uid 10003); the UI asks it to rotate, then writes the owner's copy
-      XBT_UI_MCP_ROTATE_URL: http://lazarus-xbt-agent-wallet_mcp_1:33510/rotate-token
       XBT_UI_HUB_URL: http://lazarus-xbt402-hub_hub_1:9480
     volumes:
       - ${APP_DATA_DIR}/data/ui:/data/ui
       - ${APP_DATA_DIR}/data/run/signer:/data/run/signer:ro
+      # the UI owns the MCP token (run/ui/mcp-http-token) and rotates it on its Agents page (AGP-042)
+      - ${APP_DATA_DIR}/data/run/ui:/data/run/ui

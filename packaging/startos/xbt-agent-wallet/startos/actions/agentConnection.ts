@@ -13,7 +13,7 @@ export const agentConnection = sdk.Action.withoutInput(
     visibility: 'enabled',
   },
   async ({ effects }) => {
-    const token = String(await sdk.volumes.main.readFile('mcp/secrets/mcp-http-token', 'utf8').catch(() => '')).trim()
+    const token = String(await sdk.volumes.main.readFile('run/ui/mcp-http-token', 'utf8').catch(() => '')).trim()
     const host = await sdk.host.getOwn(effects, 'mcp').once()
     const iface = Object.values(host?.bindings ?? {})
       .flatMap((b) => Object.values(b.interfaces))

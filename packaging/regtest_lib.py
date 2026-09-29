@@ -124,6 +124,23 @@ class Mcp:
             return {"_text": text}
 
 
+def agent_rotation_attempts(base, tokens):
+    """AGP-042: everything an agent holding a token could try in order to rotate it through the MCP. Returns
+    [(what, status, headers, body)]. The MCP has no rotation endpoint, so none of these may succeed."""
+    out = []
+    for t in tokens:
+        h = {"Authorization": f"Bearer {t}", "X-XBT-Rotate": "owner", "Content-Type": "application/json"}
+        for method, path in (("POST", "/rotate-token"), ("POST", "/mcp/rotate-token"), ("GET", "/rotate-token"), ("PUT", "/mcp")):
+            st, hd, body = http(method, base.rstrip("/") + path, b"{}", h, timeout=20)
+            out.append((f"{method} {path} ({t[:6]}..)", st, hd, body))
+    return out
+
+
+def leaks(responses, secret):
+    """The responses (what, status, headers, body) whose headers or body contain `secret`."""
+    return [r[0] for r in responses if secret and (secret in r[3] or secret in json.dumps(r[2]))]
+
+
 def unescape(s):
     return s.replace("&quot;", '"').replace("&#39;", "'").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
 

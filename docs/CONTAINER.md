@@ -32,12 +32,14 @@ tmpfs `/tmp`.
   run/<component>/ the server's uid and gid, 0750: its sockets (0660) and readiness file (0640)
      run/signer/   signer.sock, ready.json
      run/anchor/   anchor.sock
+     run/ui/       mcp-http-token (0640): the MCP bearer token, owned by the UI, read by the MCP (AGP-042)
 ```
 
 Rules:
 - **A container mounts only its own sub-dir**, plus the `run/<peer>/` directories of the sockets it
   connects to. Read-only is enough to connect to a Unix socket.
-  - The MCP mounts `mcp/` and `run/signer/` (ro). So does the UI, with `ui/`.
+  - The MCP mounts `mcp/` and `run/signer/` (ro). So does the UI, with `ui/`. With the UI, the MCP also
+    mounts `run/ui/` (ro) and the UI mounts it read-write (AGP-042, §8).
   - The signer mounts `signer/`, `run/signer/` and `run/anchor/` (ro).
   - The witness mounts `witness/` and `run/anchor/`.
 - **Separately mountable paths** have their own override variable, for another disk, another owner or
@@ -100,7 +102,7 @@ the data dir, and in the env variable (upper-cased, `-` → `_`). Lookup order (
 | `signer-wrap-key` | signer | 32-byte AES-256-GCM wrapping key for the sealed hot and channel keys (raw or 64 hex) | generated |
 | `signer-passphrase` | signer | instead of the wrap key: scrypt passphrase (B2 format) | never generated |
 | `node-rpc-auth` | signer, hub (cmp: any node client) | `user:password` in cookie format (a node's `.cookie` works as is) | provisioned by the installer |
-| `mcp-http-token` | mcp | bearer token for MCP over HTTP (64 hex) | generated when listening off loopback (on a box, by `xbt-init`, which also copies it to `ui/secrets/` for the UI's Agents page) |
+| `mcp-http-token` | mcp (ui on a box) | bearer token for MCP over HTTP (64 hex) | generated when listening off loopback. On a box with the UI, `xbt-init` makes it `run/ui/mcp-http-token` instead: owned by the UI, 0640, the MCP reads it by group on every request and never writes it (AGP-042, §8) |
 | `xbt-ui-password` | ui | the UI login password, when the platform sets it (Umbrel `${APP_PASSWORD}`, via `xbt-init`); otherwise the UI's own first-run setup code | never generated |
 | `hub-payto-key` | hub | payTo secret (hex scalar) | generated |
 | `operator-passphrase` | cmp-node | cmp operator key passphrase (cmp.keys) | cmp's rule |
@@ -170,7 +172,7 @@ Every setting has an env variable. Files are optional.
 |---|---|
 | signer | B2's `B2_*` env (unchanged), plus `XBT_NODE_RPC_HOST`, `XBT_NODE_RPC_PORT`, `XBT_CHAIN`, `XBT_NODE_WALLET`. Policy: `XBT_SIGNER_POLICY` (JSON; authoritative, and rewrites `policy.json` when it changes), or `XBT_SIGNER_POLICY_FILE`, or the existing `policy.json`, or a default that pays nobody. `XBT_ANCHOR=off` runs without a witness. New knobs: `B2_RPCHOST`, `B2_RPCCOOKIE` (a credentials file), `B2_SIGNER_SOCK_MODE` (≤ 660). |
 | witness | `XBT_WITNESS_DIR`, `XBT_ANCHOR_SOCK` (defaults under `/data`) |
-| MCP | `XBT_MCP_HTTP`, `XBT_MCP_PATH`, `XBT_BASE_PATH`, `XBT_MCP_HTTP_ALLOW_REMOTE`, the existing `XBT_MCP_*` payer settings, and `B2_SIGNER_SOCK` (default `/data/run/signer/signer.sock`). Owner token rotation: `POST /rotate-token` with `Authorization: Bearer <current>` and `X-XBT-Rotate: owner` (the UI's Agents page; not an MCP tool). |
+| MCP | `XBT_MCP_HTTP`, `XBT_MCP_PATH`, `XBT_BASE_PATH`, `XBT_MCP_HTTP_ALLOW_REMOTE`, the existing `XBT_MCP_*` payer settings, and `B2_SIGNER_SOCK` (default `/data/run/signer/signer.sock`). `XBT_MCP_HTTP_TOKEN_FILE` (default `run/ui/mcp-http-token` when it exists): the UI-owned token, read on every request, fail closed. The MCP has no rotation endpoint (AGP-042). |
 | hub | `hub.json` (`--config`, `XBT_HUB_CONFIG`, or `/data/hub/hub.json`), each field overridable: `XBT_NODE_RPC_HOST`, `XBT_NODE_RPC_PORT`, `XBT_HUB_WALLET`, `XBT_HUB_NETWORK` (default: derived from the node's anchor block), `XBT_HUB_BIND`, `XBT_HUB_PORT`, `XBT_HUB_DATADIR`, `XBT_HUB_CONNECT`, `XBT_HUB_JSON`, `XBT_HUB_WATCH_INTERVAL`, `XBT_HUB_THREADS`, `XBT_PUBLIC_URL`, `XBT_TRUST_FORWARDED`, `XBT_HUB_ONION` (or `APP_HIDDEN_SERVICE`: umbrelOS gives every app, including a second app, a hidden service) |
 
 None of these binaries depends on systemd. `$CREDENTIALS_DIRECTORY` is just one secret source.
@@ -254,15 +256,16 @@ Ports 33700–33799. Evidence is written to `run/container-test/<stamp>/`.
 
 `xbt-init` (in `xbt-svc`, image `xbt-init`) makes a data dir match §1 before the services start:
 
-- creates `<component>/` and `<component>/secrets/` (0700) and `run/signer/`, `run/anchor/` (0750), owned by
-  each component's uid;
+- creates `<component>/` and `<component>/secrets/` (0700) and `run/signer/`, `run/anchor/`, `run/ui/` (0750),
+  owned by each component's uid;
 - when a component dir had another owner, gives it and its contents to the component (`lchown`, no descent
   into symlinks); on a second start nothing changes;
 - provisions the secrets an installer holds, from `XBT_INIT_*` (plain env values are fine here: it is the
   installer's step and exits before any service starts; the services still read files only):
   `XBT_INIT_NODE_RPC_AUTH[_FILE]` or `XBT_INIT_NODE_RPC_USER` + `_PASS` → `signer/` and `hub/secrets/node-rpc-auth`;
-  `XBT_INIT_UI_PASSWORD[_FILE]` → `ui/secrets/xbt-ui-password`; the MCP token, generated once into `mcp/` and
-  copied into `ui/`. A secret is rewritten only when its value changes, through an exclusively created temp
+  `XBT_INIT_UI_PASSWORD[_FILE]` → `ui/secrets/xbt-ui-password`; the MCP token, generated once: with the UI,
+  `run/ui/mcp-http-token` (uid 10005, 0640; an AGP-040 token in `mcp/secrets/` is moved there and the old
+  copies removed, so agents keep working), without it `mcp/secrets/mcp-http-token`. A secret is rewritten only when its value changes, through an exclusively created temp
   file (a symlink a service planted is never followed);
 - prints a JSON report (names, owners, modes; never a value); `xbt-init check` only reports.
 
@@ -281,3 +284,29 @@ Run it with `user: 0:0`, `network_mode: none`, `read_only`, `cap_drop: ALL` + `C
 table and the secret rules with the services, `FROM scratch` like every other image, for amd64, arm64 and
 arm/v7. A busybox shell script would need a base image pulled from a registry and would duplicate the layout
 in shell. Go would add a second toolchain for 300 lines.
+
+## 9. MCP token rotation: the UI owns the token (AGP-042)
+
+A leaked agent token must be revocable by the owner and by nobody else. So the thing that rotates it is
+something agents never hold: the UI (uid 10005, behind the owner's login). The MCP has no rotation
+endpoint at all; a bearer token cannot replace itself.
+
+- `run/ui/mcp-http-token` is owned by `xbt-wallet-ui`, mode 0640, in `run/ui/` (0750). `xbt-wallet-mcp` is a
+  member of the `xbt-wallet-ui` group (the base layer's `/etc/group`), mounts `run/ui/` read-only and reads
+  the file on **every** request. An unreadable, empty, symlinked or world-readable file refuses every
+  request (503); it never falls back to an older value.
+- The Agents page's *Rotate the token* writes a new random token with `xbt_svc::replace_secret_file`: a
+  randomly named temp file created exclusively (O_EXCL, never through a planted symlink) with mode 0600 in
+  the same directory, written, fsynced, then given 0640, renamed over the token and the directory fsynced.
+  No reader ever sees a partial token, and nobody outside the owner and its group can read it at any moment.
+  The old token gets 401 on the next request, including on sessions it already opened.
+- The new token is shown only on the owner's Agents page; the MCP never returns it.
+
+Compared (the lead's options):
+
+| option | rotation authorised by | agent can defeat it? | moving parts | chosen |
+|---|---|---|---|---|
+| (a) UI writes a file the MCP only reads | the owner's UI login (uid 10005 owns the file) | no: no endpoint, no write access | a group and a ro mount | **yes** |
+| (b) owner rotation key, HMAC'd request to the MCP | a second key kept only by the UI | no, if the key and replay window are right | a key to provision, an HMAC + nonce store, still an endpoint | no: more crypto and an endpoint to get right, for the same result |
+| (c) a human-signed signer method | the enrolled human key (like AGP-039's signed actions) | no | the signer would then have to own and push the MCP's token | no: the signer holds no MCP secret today; needs a signature for a routine, low-value action |
+

@@ -47,13 +47,13 @@ Both platforms run the same containers, from the same images:
 | init (one-shot) | `xbt-init` (root, CHOWN/FOWNER/DAC_OVERRIDE only) | the whole data dir | none |
 | witness | `xbt-anchor-witness` (10002) | `witness/`, `run/anchor/` | none on Umbrel |
 | signer | `xbt-signer` (10001) | `signer/`, `run/signer/`, `run/anchor/` ro | the node's RPC |
-| MCP | `xbt-wallet-mcp` (10003) | `mcp/`, `run/signer/` ro | 33510, bearer token |
-| UI | `xbt-wallet-ui` (10005) | `ui/`, `run/signer/` ro | 8480 behind the box's proxy |
+| MCP | `xbt-wallet-mcp` (10003) | `mcp/`, `run/signer/` ro, `run/ui/` ro | 33510, bearer token |
+| UI | `xbt-wallet-ui` (10005) | `ui/`, `run/signer/` ro, `run/ui/` | 8480 behind the box's proxy |
 | hub (optional) | `xbt402-hub` (10004) | `hub/` | 9480, paid public API |
 
 `init` gives each sub-dir to its uid (Umbrel bind mounts arrive owned by uid 1000, StartOS volumes owned by
-root), writes the node credentials, and makes the MCP token once. It copies that token into the UI's
-secrets, where the owner reads it on the UI's **Agents** page. That page is how a box with no terminal
+root), writes the node credentials, and makes the MCP token once, as the UI's `run/ui/mcp-http-token`
+(0640; the MCP reads it by group and never writes it). The owner reads it on the UI's **Agents** page. That page is how a box with no terminal
 connects an agent. The owner never needs a shell:
 
 - **Umbrel:** log in with the password the dashboard shows (`${APP_PASSWORD}`, `deterministicPassword`).
@@ -166,8 +166,9 @@ applied there.
 - On Umbrel the hub reads `APP_HIDDEN_SERVICE` (umbrelOS gives every app, including a second app, a
   hidden service via app_proxy) and shows it as `tor` on `/readyz` and the Hub page. On StartOS, Tor is
   the owner's choice per interface.
-- Token rotation: the wallet UI Agents page (`POST /rotate-token` on the MCP). StartOS also keeps the
-  delete-and-restart action.
+- Token rotation: the wallet UI Agents page writes a new token into `run/ui/mcp-http-token`; the MCP reads
+  it on every request, so the old token gets 401 at once. The MCP has no rotation endpoint (docs/CONTAINER.md
+  §9). StartOS also keeps the delete-and-restart action.
 - The StartOS package's text is English only; other locales fall back to it. Translations, gallery images
   and icons are store-submission work.
 - The images are referenced by tag (`:0.1.0`) and side-loaded with `docker load`. A store needs registry

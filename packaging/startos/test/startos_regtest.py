@@ -27,14 +27,17 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 PKG = os.path.join(os.path.dirname(HERE), "xbt-agent-wallet")
 sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
-from regtest_lib import (POLICY_BASE, ROOT, Chain, Mcp, Miner, Ui, check, docker, ensure_provider_image, field, http, log, open_log,  # noqa: E402
+from regtest_lib import (agent_rotation_attempts, leaks, POLICY_BASE, ROOT, Chain, Mcp, Miner, Ui, check, docker, ensure_provider_image, field, http, log, open_log,  # noqa: E402
                          owner_setup, sh, status, wait_until, write_results)
 
 OUT = sys.argv[1]
 PID = os.getpid()
 P = f"agp040-s9-{PID}"
 NET = f"{P}-net"
-P_UI, P_MCP, P_HUB, P_PROV = 34130, 34110, 34120, 34140
+P_MCP = int(os.environ.get("STARTOS_TEST_MCP_PORT", "34110"))
+P_HUB = int(os.environ.get("STARTOS_TEST_HUB_PORT", "34120"))
+P_UI = int(os.environ.get("STARTOS_TEST_UI_PORT", "34130"))
+P_PROV = int(os.environ.get("STARTOS_TEST_PROV_PORT", "34140"))
 SIGN_BIN = os.path.join(ROOT, "dist/oci/ctx/bin/amd64/xbt-wallet-ui")
 RPC_USER, RPC_PASS = "xbt", os.urandom(16).hex()
 PROVIDER = f"http://{P}-provider:9500"
@@ -134,14 +137,15 @@ def main():
     check("I", "init on the root-owned empty volume exits 0; its own layout check passes",
           before[:3] == ["0:0", "755", "0"] and code == 0 and rep.get("ok"), {"before": before, "report": rep})
     ls = vol_sh(vol, "stat -c '%u:%g %a %n' /v/signer /v/witness /v/mcp /v/ui /v/hub /v/run/signer /v/run/anchor /v/signer/secrets/node-rpc-auth "
-                     "/v/hub/secrets/node-rpc-auth /v/mcp/secrets/mcp-http-token /v/ui/secrets/mcp-http-token; ls /v/ui/secrets").stdout.split("\n")
-    check("I", "each component's sub-path owned by its uid (0700; sockets 0750); node credentials for signer and hub; MCP token and its UI copy; "
+                     "/v/hub/secrets/node-rpc-auth /v/run/ui /v/run/ui/mcp-http-token; ls /v/ui/secrets /v/mcp/secrets").stdout.split("\n")
+    check("I", "each component's sub-path owned by its uid (0700; sockets 0750); node credentials for signer and hub; the MCP token "
+               "is the UI's run/ui/mcp-http-token (0640, the MCP reads it by group), with no other copy; "
                "no UI password file (StartOS uses the UI's own setup code)",
           ls[:11] == ["10001:10001 700 /v/signer", "10002:10002 700 /v/witness", "10003:10003 700 /v/mcp", "10005:10005 700 /v/ui",
                       "10004:10004 700 /v/hub", "10001:10001 750 /v/run/signer", "10002:10002 750 /v/run/anchor",
                       "10001:10001 600 /v/signer/secrets/node-rpc-auth", "10004:10004 600 /v/hub/secrets/node-rpc-auth",
-                      "10003:10003 600 /v/mcp/secrets/mcp-http-token", "10005:10005 600 /v/ui/secrets/mcp-http-token"]
-          and "xbt-ui-password" not in ls, ls)
+                      "10005:10005 750 /v/run/ui", "10005:10005 640 /v/run/ui/mcp-http-token"]
+          and "xbt-ui-password" not in ls and "mcp-http-token" not in ls[11:], ls)
     wait_until(lambda: status(f"http://127.0.0.1:{P_MCP}/readyz") == 200 and status(f"http://127.0.0.1:{P_UI}/readyz") == 200
                and status(f"http://127.0.0.1:{P_HUB}/readyz") == 200, 180, "MCP, UI and hub /readyz 200")
     check("I", f"MCP, UI and hub ready {time.time() - t0:.1f} s after install (the ports the package's readiness checks watch)", True)
@@ -175,7 +179,7 @@ def main():
     page = ui.get("/agents")
     m = re.search(r'<code id="mcp-token">([0-9a-f]{64})</code>', page)
     token = m.group(1) if m else None
-    disk = vol_sh(vol, "cat /v/mcp/secrets/mcp-http-token").stdout.strip()
+    disk = vol_sh(vol, "cat /v/run/ui/mcp-http-token").stdout.strip()
     check("U", "the UI's Agents page (and the Agent connection action, which reads the same file) gives the MCP URL and token",
           token == disk and f"http://127.0.0.1:{P_MCP}/mcp" in page, {"token_ok": token == disk})
 
@@ -249,18 +253,34 @@ def main():
           {"init": rep3.get("ok"), "login": st, "channels": chans3})
     r3 = agent.tool("xbt402_pay", url=f"{PROVIDER}/v1/agp040", max_sats=1000)
     check("B", "after the restore the agent pays again over the same channel", r3.get("status") == 200 and r3.get("chan") == r1.get("chan"), r3)
+    mcp_base = f"http://127.0.0.1:{P_MCP}"
+    tries = agent_rotation_attempts(mcp_base, [token])
+    check("W", "an agent holding the token (and the old owner header) cannot rotate it: the MCP has no rotation endpoint",
+          all(st in (401, 404, 405) for _, st, _, _ in tries) and vol_sh(vol2, "cat /v/run/ui/mcp-http-token").stdout.strip() == token,
+          [(w, st) for w, st, _, _ in tries])
     ui.post("/agents", "/rotate-token", {"confirm": "1"})
     flash_rot = ui.flash("/agents")
     page_rot = ui.get("/agents")
     m_rot = re.search(r'<code id="mcp-token">([0-9a-f]{64})</code>', page_rot)
     ui_tok = m_rot.group(1) if m_rot else None
-    mcp_tok = vol_sh(vol2, "cat /v/mcp/secrets/mcp-http-token").stdout.strip()
-    ui_disk = vol_sh(vol2, "cat /v/ui/secrets/mcp-http-token").stdout.strip()
-    st_old_ui = Mcp(f"http://127.0.0.1:{P_MCP}", token).start()[0]
-    st_new_ui = Mcp(f"http://127.0.0.1:{P_MCP}", ui_tok or "").start()[0]
-    check("W", "Agents page rotate (no restart): new token, both copies match, old gets 401, new works",
-          "rotated" in flash_rot.lower() and ui_tok and ui_tok != token and ui_tok == mcp_tok == ui_disk
-          and st_old_ui == 401 and st_new_ui == 200, {"flash": flash_rot, "old": st_old_ui, "new": st_new_ui})
+    st_old_ui = Mcp(mcp_base, token).start()[0]
+    st_old_session = agent.post({"jsonrpc": "2.0", "id": 99, "method": "tools/list"})[0]
+    disk = vol_sh(vol2, "stat -c '%u:%g %a' /v/run/ui/mcp-http-token; cat /v/run/ui/mcp-http-token; ls -A /v/run/ui").stdout.split("\n")
+    agent_new = Mcp(mcp_base, ui_tok or "")
+    st_new_ui = agent_new.start()[0]
+    seen = agent_rotation_attempts(mcp_base, [token, ui_tok or ""])
+    seen.append(("tools/list", *http("POST", agent_new.url, json.dumps({"jsonrpc": "2.0", "id": 5, "method": "tools/list"}).encode(),
+                                     {"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
+                                      "Authorization": f"Bearer {ui_tok}", "Mcp-Session-Id": agent_new.sid or ""})))
+    for pth in ("/healthz", "/readyz"):
+        seen.append((pth, *http("GET", mcp_base + pth)))
+    check("W", "Agents page rotate (no restart): old token 401 at once (its open session too), new works; the UI's file replaced "
+               "atomically (10005:10005 0640, no temp file); no MCP response carries the new token",
+          "rotated" in flash_rot.lower() and ui_tok and ui_tok != token and st_old_ui == 401 and st_old_session == 401 and st_new_ui == 200
+          and disk[:3] == ["10005:10005 640", ui_tok, "mcp-http-token"] and not leaks(seen, ui_tok),
+          {"flash": flash_rot, "old": st_old_ui, "old_session": st_old_session, "new": st_new_ui,
+           "disk": [d if d != ui_tok else "<token>" for d in disk], "leaks": leaks(seen, ui_tok)})
+    token = ui_tok  # the owner hands the agents the new token
     time.sleep(6)
     wc = docker("run", "--rm", "--user", "0", "--network", "none",
                 "--mount", f"type=volume,src={vol2},dst=/data/witness,volume-subpath=witness,volume-nocopy=true,readonly",
@@ -282,16 +302,15 @@ def main():
 
     # --- W: Rotate the agent token (the action deletes both copies and restarts; xbt-init makes a new one) -------------
     log("== W: rotate the agent token")
-    vol_sh(vol2, "rm -f /v/mcp/secrets/mcp-http-token /v/ui/secrets/mcp-http-token", ro=False)
+    vol_sh(vol2, "rm -f /v/run/ui/mcp-http-token /v/mcp/secrets/mcp-http-token", ro=False)
     stop_all()
     start_all(sp, vol2)
     wait_until(lambda: status(f"http://127.0.0.1:{P_MCP}/readyz") == 200, 120, "MCP back after the rotation")
-    new_tok = vol_sh(vol2, "cat /v/mcp/secrets/mcp-http-token").stdout.strip()
-    ui_copy = vol_sh(vol2, "cat /v/ui/secrets/mcp-http-token").stdout.strip()
+    new_tok = vol_sh(vol2, "cat /v/run/ui/mcp-http-token").stdout.strip()
     st_old_tok = Mcp(f"http://127.0.0.1:{P_MCP}", token).start()[0]
     st_new_tok = Mcp(f"http://127.0.0.1:{P_MCP}", new_tok).start()[0]
-    check("W", "after Rotate the agent token: a new token (the UI's copy matches); the old one gets 401, the new one works",
-          len(new_tok) == 64 and new_tok != token and ui_copy == new_tok and st_old_tok == 401 and st_new_tok == 200, [st_old_tok, st_new_tok])
+    check("W", "after Rotate the agent token: a new token in the UI's file; the old one gets 401, the new one works",
+          len(new_tok) == 64 and new_tok != token and st_old_tok == 401 and st_new_tok == 200, [st_old_tok, st_new_tok])
     new_code = vol_sh(vol2, "cat /v/ui/setup-code").stdout.strip()  # still waiting: no password was set since the reset
 
     # --- H: the hub ------------------------------------------------------------------------------------------------

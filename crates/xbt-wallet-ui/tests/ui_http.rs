@@ -536,17 +536,53 @@ fn the_agents_page_shows_the_mcp_endpoint_and_token_only_after_login() {
     let mut br = logged_in(&bx);
     let page = br.get("/agents").body;
     assert!(page.contains("http://umbrel.local:33510/mcp") && page.contains("No token here yet"), "{page}");
-    std::fs::write(&tok, format!("{}\n", "ab".repeat(32))).unwrap();
+    // as xbt-init leaves it on a box: 0640, the MCP reads it by group
+    xbt_svc::replace_secret_file(&tok, format!("{}\n", "ab".repeat(32)).as_bytes(), 0o640).unwrap();
     let page = br.get("/agents").body;
     assert!(page.contains(&"ab".repeat(32)) && page.contains("Bearer ") && page.contains("<details>"), "{page}");
     assert!(page.contains("aria-current=\"page\">Agents") && page.contains("Rotate the token"), "{page}");
+    // AGP-042: the real MCP HTTP transport, reading the same file (the UI never calls it to rotate)
+    let wallet = std::sync::Arc::new(xbt_wallet_mcp::wallet::Wallet::new(tdir.path().join("no-signer.sock"),
+                                                                          xbt_wallet_mcp::wallet::PayerMode::Signer));
+    let mut cfg = xbt_wallet_mcp::transport::HttpConfig::new("127.0.0.1:34202");
+    cfg.token_file = Some(tok.clone());
+    let server = std::sync::Arc::new(xbt_wallet_mcp::mcp::Server::new(wallet));
+    std::thread::spawn(move || xbt_wallet_mcp::transport::serve_http(server, cfg));
+    let mcp_init = |t: &str| {
+        for _ in 0..100 {
+            let r = ureq::post("http://127.0.0.1:34202/mcp").set("Accept", "application/json, text/event-stream")
+                .set("Authorization", &format!("Bearer {t}"))
+                .send_string(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26",
+                                     "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}}).to_string());
+            match r {
+                Ok(x) => return x.status(),
+                Err(ureq::Error::Status(c, _)) => return c,
+                Err(_) => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+        panic!("mcp not listening")
+    };
+    assert_eq!(mcp_init(&"ab".repeat(32)), 200);
+    // no confirmation box: nothing changes
+    let r = br.act("/agents", "/rotate-token", &[]);
+    assert!(br.flash_after(&r).contains("tick the box"));
+    assert_eq!(std::fs::read_to_string(&tok).unwrap().trim(), "ab".repeat(32));
     let r = br.act("/agents", "/rotate-token", &[("confirm", "1")]);
     let flash = br.flash_after(&r);
     assert!(flash.contains("Agent token rotated"), "{flash}");
+    // the old token is refused on the next request; the new one (shown only on this page) works
+    assert_eq!(mcp_init(&"ab".repeat(32)), 401);
     let page = br.get("/agents").body;
     let new = regex_token(&page);
-    assert_ne!(new, "ab".repeat(32));
+    assert!(new.len() == 64 && new != "ab".repeat(32));
     assert_eq!(std::fs::read_to_string(&tok).unwrap().trim(), new);
+    assert_eq!(mcp_init(&new), 200);
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&tok).unwrap().permissions().mode() & 0o777, 0o640, "the mode is kept: group, never others");
+    }
+    let left: Vec<_> = std::fs::read_dir(tdir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+    assert!(left.iter().all(|n| !n.contains(".tmp")), "{left:?}");
 }
 
 fn regex_token(page: &str) -> String {

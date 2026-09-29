@@ -41,8 +41,7 @@ Without a password source, the first start prints a one-time setup code and writ
 | `XBT_UI_CMP_URL` | | xbt-compute's node/hub status page, linked from Overview and Hub |
 | `XBT_UI_CMP_STATUS_URL` | | xbt-compute's status JSON (e.g. its `/readyz`, CONTRACT §U), shown as a compact tile |
 | `XBT_UI_MCP_URL` | | MCP endpoint(s) shown on the Agents page |
-| `XBT_UI_MCP_TOKEN_FILE` | `<data dir>/secrets/mcp-http-token` | the bearer token shown on Agents (`xbt-init` copies it) |
-| `XBT_UI_MCP_ROTATE_URL` | | the MCP's `POST /rotate-token` on the box network (Umbrel / StartOS) |
+| `XBT_UI_MCP_TOKEN_FILE` | `$XBT_DATA_DIR/run/ui/mcp-http-token`, else `<data dir>/secrets/mcp-http-token` | the bearer token shown on Agents. The UI owns it and rotates it there (atomic replace, mode kept, never world-readable); the MCP only reads it (AGP-042) |
 
 `GET /healthz` is always 200. `GET /readyz` is 200 when the signer answers, else 503. Neither needs
 a login, and neither reveals wallet state.
