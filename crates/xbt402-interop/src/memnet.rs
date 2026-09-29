@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use xbt402::client::{Transport, Wallet};
+use xbt402::client::{Transport, Wallet, WalletSend};
 use xbt402::error::{ChannelError, Result};
 use xbt402::funding::{ChainBackend, UtxoInfo};
 use xbt402::http::HttpService;
@@ -28,13 +28,30 @@ struct ChainState {
     fees: HashMap<String, (u64, u64)>,
     /// Blocks take only txs paying at least this, sat/vB (a fee market; 0: everything).
     block_min_feerate: f64,
+    /// Txs in the mempool whose outputs `gettxout` does not show (`hide_outputs`).
+    hidden: HashSet<String>,
+    /// The wallet's sends (AGP-045), remembered after they leave the mempool, in send order.
+    wallet: Vec<WalletTx>,
+}
+
+#[derive(Clone)]
+struct WalletTx {
+    address: String,
+    txid: String,
+    vout: u32,
+    sats: u64,
+    spk: Vec<u8>,
+    abandoned: bool,
+    conflicted: bool,
 }
 
 /// A fake node: fundings appear with 6 confirmations, broadcasts spend their inputs (a conflicting
 /// spend is refused unless it replaces a mempool spend by BIP125: the old one signals, the new one
 /// pays its fee + 1 sat/vB more; a tx not final at the tip is refused too) and create unconfirmed
 /// outputs; `confirm_all` confirms everything paying the block min feerate. `gettxout` without the
-/// mempool still shows an output spent only in the mempool, as a node does.
+/// mempool still shows an output spent only in the mempool, as a node does. It is also the fund
+/// wallet (AGP-045): every `fund` is a wallet send (`wallet_sends_to`, `wallet_send`), remembered
+/// after it leaves the mempool; `abandon` / `conflict` mark one that can never confirm.
 pub struct MemChain {
     st: Mutex<ChainState>,
 }
@@ -109,6 +126,44 @@ impl MemChain {
 
     pub fn raw(&self, txid: &str) -> Option<Tx> {
         self.st().raw.get(txid).and_then(|h| Tx::parse_hex(h).ok())
+    }
+
+    /// A wallet send of `sats` to `address` with `confirmations` (0: in the mempool).
+    pub fn fund_with(&self, address: &str, sats: u64, confirmations: u32) -> Result<(String, u32)> {
+        let spk = address_to_spk(address, Some("bcrt")).map_err(|e| ChannelError::new("bad_address", e.to_string()))?;
+        let txid = rand_txid();
+        let mut st = self.st();
+        st.utxos.insert((txid.clone(), 0), UtxoInfo { confirmations, value: sats, script_pubkey: spk.clone(), coinbase: false });
+        st.wallet.push(WalletTx { address: address.into(), txid: txid.clone(), vout: 0, sats, spk, abandoned: false, conflicted: false });
+        Ok((txid, 0))
+    }
+
+    /// The wallet rebroadcasts an evicted send and it confirms.
+    pub fn confirm_late(&self, txid: &str) {
+        let mut st = self.st();
+        if let Some(w) = st.wallet.iter().find(|w| w.txid == txid).cloned() {
+            st.utxos.insert((w.txid, w.vout), UtxoInfo { confirmations: 1, value: w.sats, script_pubkey: w.spk, coinbase: false });
+        }
+    }
+
+    /// The wallet gives up on a send that left the mempool (`abandontransaction`).
+    pub fn abandon(&self, txid: &str) {
+        self.evict(txid);
+        self.st().wallet.iter_mut().filter(|w| w.txid == txid).for_each(|w| w.abandoned = true);
+    }
+
+    /// A send double-spent by a confirmed tx (`gettransaction` confirmations -1).
+    pub fn conflict(&self, txid: &str) {
+        self.evict(txid);
+        self.st().wallet.iter_mut().filter(|w| w.txid == txid).for_each(|w| w.conflicted = true);
+    }
+
+    /// Hide a tx's outputs from `gettxout` while it stays in the mempool (an output a node does not
+    /// show: only `getmempoolentry` sees the tx).
+    pub fn hide_outputs(&self, txid: &str) {
+        let mut st = self.st();
+        st.utxos.retain(|k, _| k.0 != txid);
+        st.hidden.insert(txid.to_string());
     }
 }
 
@@ -202,14 +257,29 @@ impl SpendScan for MemChain {
     fn fee_rate(&self, _target: u32) -> Result<Option<f64>> {
         Ok(self.st().fee_rate)
     }
+
+    fn in_mempool(&self, txid: &str) -> Result<bool> {
+        let st = self.st();
+        Ok(st.hidden.contains(txid) || st.utxos.iter().any(|(k, u)| k.0 == txid && u.confirmations == 0))
+    }
 }
 
 impl Wallet for MemChain {
     fn fund(&self, address: &str, sats: u64) -> Result<(String, u32)> {
-        let spk = address_to_spk(address, Some("bcrt")).map_err(|e| ChannelError::new("bad_address", e.to_string()))?;
-        let txid = rand_txid();
-        self.st().utxos.insert((txid.clone(), 0), UtxoInfo { confirmations: 6, value: sats, script_pubkey: spk, coinbase: false });
-        Ok((txid, 0))
+        self.fund_with(address, sats, 6)
+    }
+
+    fn wallet_sends_to(&self, address: &str) -> Result<Vec<String>> {
+        Ok(self.st().wallet.iter().filter(|w| w.address == address).map(|w| w.txid.clone()).collect())
+    }
+
+    fn wallet_send(&self, txid: &str, address: &str) -> Result<Option<WalletSend>> {
+        let st = self.st();
+        Ok(st.wallet.iter().find(|w| w.txid == txid && w.address == address).map(|w| {
+            let conf = st.utxos.get(&(w.txid.clone(), w.vout)).map(|u| u.confirmations as i64).unwrap_or(0);
+            WalletSend { txid: w.txid.clone(), vout: w.vout, sats: w.sats, confirmations: if w.conflicted { -1 } else { conf },
+                         abandoned: w.abandoned }
+        }))
     }
 }
 
@@ -219,6 +289,14 @@ pub struct ChainWallet(pub Arc<MemChain>);
 impl Wallet for ChainWallet {
     fn fund(&self, address: &str, sats: u64) -> Result<(String, u32)> {
         self.0.fund(address, sats)
+    }
+
+    fn wallet_sends_to(&self, address: &str) -> Result<Vec<String>> {
+        self.0.wallet_sends_to(address)
+    }
+
+    fn wallet_send(&self, txid: &str, address: &str) -> Result<Option<WalletSend>> {
+        self.0.wallet_send(txid, address)
     }
 }
 

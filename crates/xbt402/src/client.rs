@@ -44,6 +44,36 @@ pub trait Transport: Send + Sync {
 /// funding keys.
 pub trait Wallet: Send + Sync {
     fn fund(&self, address: &str, sats: u64) -> Result<(String, u32)>;
+
+    /// Txids of the sends this wallet made to `address` (`listtransactions`): how a hub finds a
+    /// funding whose `fund` call failed after it broadcast (AGP-045). Default: none known.
+    fn wallet_sends_to(&self, _address: &str) -> Result<Vec<String>> {
+        Ok(vec![])
+    }
+
+    /// The wallet's view of its send `txid` to `address` (`gettransaction`); None when it is not the
+    /// wallet's or pays nothing to `address`. Default: none known.
+    fn wallet_send(&self, _txid: &str, _address: &str) -> Result<Option<WalletSend>> {
+        Ok(None)
+    }
+}
+
+/// A send the wallet knows (AGP-045): its output to the address and whether it can still confirm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletSend {
+    pub txid: String,
+    pub vout: u32,
+    pub sats: u64,
+    /// `gettransaction` confirmations: < 0 when the send conflicts with a confirmed tx.
+    pub confirmations: i64,
+    pub abandoned: bool,
+}
+
+impl WalletSend {
+    /// Conflicted or abandoned: it never confirms.
+    pub fn failed(&self) -> bool {
+        self.confirmations < 0 || self.abandoned
+    }
 }
 
 /// Client settings (the reference's constructor keywords).

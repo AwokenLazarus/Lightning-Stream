@@ -383,14 +383,15 @@ fn rc_provider_self_close_of_a_signed_ch2_without_a_lock() {
     let oc = w.oc(0);
     assert!(oc.pending.is_empty() && oc.stale.is_empty());
     let txid = w.provider_closes(0);
-    let acts = w.hub.watch_tick();
-    assert!(has(&acts, |a| a["event"] == "ch2_closed" && a["txid"] == txid.as_str()), "{acts:?}");
+    let acts = w.hub.watch_tick(); // in the mempool: closing (AGP-045)
+    assert!(has(&acts, |a| a["event"] == "ch2_closing" && a["txid"] == txid.as_str()), "{acts:?}");
     let oc = w.oc(0);
-    assert_eq!((oc.state.as_str(), oc.close_txid.as_str(), oc.final_), ("closed", txid.as_str(), false));
+    assert_eq!((oc.state.as_str(), oc.close_txid.as_str(), oc.final_), ("closing", txid.as_str(), false));
     assert_eq!(w.hub.committed_sat(), 0);
     w.chain.mine(1);
-    w.hub.watch_tick();
-    assert!(w.oc(0).final_);
+    let acts = w.hub.watch_tick();
+    assert!(has(&acts, |a| a["event"] == "ch2_closed" && a["txid"] == txid.as_str()), "{acts:?}");
+    assert_eq!((w.oc(0).state.as_str(), w.oc(0).final_), ("closed", true));
     let n = w.hub.events.lock().unwrap().len();
     w.hub.watch_tick(); // final: nothing more, no retries
     assert_eq!(w.hub.events.lock().unwrap().len(), n);
@@ -413,7 +414,10 @@ fn rc_close_reply_without_txid_after_the_provider_closed() {
     let closed: Vec<String> = p.channel_ids().iter().filter_map(|c| p.channel_state(c)).filter(|s| !s.closed_txid.is_empty()).map(|s| s.closed_txid).collect();
     assert_eq!(closed.len(), 1);
     let acts = w.hub.watch_tick(); // ...the chain does
-    assert!(has(&acts, |a| a["event"] == "ch2_closed"), "{acts:?}");
+    assert!(has(&acts, |a| a["event"] == "ch2_closing"), "{acts:?}");
+    assert_eq!((w.oc(0).state.as_str(), w.oc(0).close_txid.as_str()), ("closing", closed[0].as_str()));
+    w.chain.mine(1);
+    w.hub.watch_tick();
     assert_eq!((w.oc(0).state.as_str(), w.oc(0).close_txid.as_str()), ("closed", closed[0].as_str()));
     assert_eq!(w.hub.committed_sat(), 0);
     w.hub.watch_tick();
@@ -532,19 +536,22 @@ fn rf_provider_close_beats_the_refund_secret_recovered_fee_reverted() {
     w.net.set_drop(w.origin(0), None);
     let close = w.provider_closes(0);
     assert_eq!(w.chain.spender(&oc.params.funding_txid(), oc.params.funding_vout()), Some(close.clone()));
-    let acts = w.hub.watch_tick();
+    let fees = w.hub.refund_fees_sat();
+    let acts = w.hub.watch_tick(); // the close is in the mempool: the secret is read now
     assert!(has(&acts, |a| a["event"] == "secret_from_close" && a["lockId"] == stale_id.as_str() && a["ch1_completed"] == true), "{acts:?}");
+    let oc = w.oc(0);
+    assert_eq!((oc.state.as_str(), oc.close_txid.as_str(), oc.stale.len()), ("closing", close.as_str(), 0));
+    assert_eq!(w.hub.refund_fees_sat(), fees); // ...but the refund fee stays booked (AGP-045)
+    let st1 = w.hub.ch1_state(&w.pay.chan().unwrap()).unwrap();
+    assert!(st1.extra["recovered"].as_array().unwrap().iter().any(|r| r["lockId"] == stale_id.as_str()));
+    w.chain.mine(1);
+    let acts = w.hub.watch_tick();
     let ev = acts.iter().find(|a| a["event"] == "ch2_closed").expect("closed");
     assert_eq!(ev["txid"], close.as_str());
     assert!(ev["refundFeeReverted"].as_u64().unwrap() > 0);
     let oc = w.oc(0);
-    assert_eq!((oc.state.as_str(), oc.close_txid.as_str(), oc.stale.len()), ("closed", close.as_str(), 0));
+    assert_eq!((oc.state.as_str(), oc.close_txid.as_str(), oc.final_), ("closed", close.as_str(), true));
     assert_eq!(w.hub.refund_fees_sat(), w.oc(1).refund_fee); // only the idle ch2's
-    let st1 = w.hub.ch1_state(&w.pay.chan().unwrap()).unwrap();
-    assert!(st1.extra["recovered"].as_array().unwrap().iter().any(|r| r["lockId"] == stale_id.as_str()));
-    w.chain.mine(1);
-    w.hub.watch_tick();
-    assert!(w.oc(0).final_);
 }
 
 // --- 4 close_ch2 validates the provider's reply -------------------------------------------------------
@@ -558,6 +565,9 @@ fn bad_reply(edit: fn(&Value) -> Value, why: &str) {
     assert_eq!((w.oc(0).state.as_str(), w.oc(0).close_txid.as_str()), ("open", ""));
     w.hub.watch_tick(); // the watcher survives and reconciles
     assert!(w.events("ch2_watch_error").is_empty());
+    assert_eq!(w.oc(0).state, "closing"); // the provider's close, in the mempool
+    w.chain.mine(1);
+    w.hub.watch_tick();
     assert_eq!(w.oc(0).state, "closed");
 }
 
@@ -613,7 +623,10 @@ fn cr_a_good_reply_reports_gross_cum_payee_fee_and_net() {
     assert_eq!(p.close_fee_payer, FeePayer::Payee);
     assert_eq!((ev["amount"].as_u64(), ev["payeeFee"].as_u64(), ev["payeeNet"].as_u64()), (Some(oc.signed), Some(p.close_fee), Some(oc.signed - p.close_fee)));
     assert_eq!(ev["chan"], p.channel_id().as_str());
-    assert_eq!(w.oc(0).state, "closed");
+    assert_eq!((w.oc(0).state.as_str(), w.oc(0).close_txid.as_str()), ("closing", ev["txid"].as_str().unwrap())); // closed once it confirms (AGP-045)
+    w.chain.mine(1);
+    w.hub.watch_tick();
+    assert_eq!((w.oc(0).state.as_str(), w.oc(0).final_), ("closed", true));
 }
 
 // --- 5 bounded /terms ---------------------------------------------------------------------------------
@@ -715,7 +728,7 @@ fn rh_default_refill_is_connect_with_its_terms_checks() {
     wrap(&w.net, w.origin(0), &w.provs[0].1, terms_edit(json!({"closeFeeSat": 25_000}))); // terms turned hostile
     let ev = w.hub.close_ch2(&w.oc(0), true).unwrap();
     assert!(ev["refillError"].as_str().unwrap().contains("bad_terms"), "{ev}");
-    assert_eq!(w.oc(0).state, "closed"); // the close stands
+    assert_eq!(w.oc(0).state, "closing"); // the close stands
     assert!(!w.events("ch2_refill_failed").is_empty());
 }
 

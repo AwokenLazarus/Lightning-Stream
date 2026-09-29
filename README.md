@@ -354,6 +354,68 @@ Fixed along the way: `xbt402-hub` (and B1 `python -m xbt402.hub`) asked the wall
 address type as the refund destination. That type is legacy on the Knots node, so every refund failed
 `bad_address`. Both now ask for `bech32`.
 
+## RouteHub reconcile fixes (AGP-045)
+
+Three items from cmp-lead's CMP-012 review of the hub (b1 `agp-037`). All three are the same in B1's
+`xbt402/hub.py` (b1 `agp-045`), with the same record fields, states, events and test names.
+
+**1. The refill hook is looked up at each refill.** `set_refill` may be called at any time (`None`
+restores `connect`). The hook is now called with no hub lock held, so a hook may replace itself or
+call back into the hub. Before, `close_ch2` held the refill mutex during the call, and such a hook
+deadlocked. In B1, `hub.refill` is a property (`refill or self.connect`, looked up per call), so
+assigning `hub.connect` after construction takes effect.
+
+**2. A `funding` record is not reconciled by `scantxoutset` alone.** `scantxoutset` sees only the
+confirmed UTXO set, so a funding still in the mempool at `funding_timeout_blocks` used to be
+dropped and never refunded. The watcher now looks in this order:
+* the sends the fund wallet knows to the ch2 address: `Wallet::wallet_sends_to` (`listtransactions`)
+  and `Wallet::wallet_send` (`gettransaction`: vout, sats, confirmations, abandoned), with the
+  record's own `fund_txid` first;
+* each send's output via `gettxout` including the mempool, and the send via
+  `SpendScan::in_mempool` (`getmempoolentry`);
+* `scantxoutset` last, for a fund hook outside the wallet.
+
+What happens next:
+* Found in a block or the mempool: the record is `funded`, and it opens once it has minConf.
+* Not found by `funding_timeout_blocks`: the record is `dropped`, with its key kept.
+  * If the wallet still knows the send (not conflicted, not abandoned), `fund_txid`/`fund_vout` are
+    kept and the archived record is watched. If the send confirms late, the record becomes `funded`
+    in the archive (`ch2_funding_late`) and is refunded at expiry like any unused ch2. If the wallet
+    later reports it conflicted or abandoned, it is final (`ch2_funding_failed`).
+  * A send that failed outright (none known, conflicted or abandoned) is dropped and final.
+
+The new trait methods have defaults (empty or false), so existing `Wallet` and `SpendScan`
+implementations compile unchanged. `Rpc` implements them.
+
+**3. A ch2 is `closed` only on a confirmed spender.** A new state, `closing`, is non-final and not
+live: the hub never routes over it or rolls it over.
+* A provider's close seen in the mempool makes the ch2 `closing` (`ch2_closing`, with
+  `refundAtRisk` when a refund fee is booked). So does `close_ch2`'s good reply.
+* Lock secrets are still read off the mempool close at once.
+* Only a confirmed spender sets `closed` and `final` and takes the refund fee back (`ch2_closed`,
+  `refundFeeReverted`). Until then the fee stays booked (`refund_fees_sat` counts a `closing` ch2
+  whose `close_prev` is `refunded`).
+* If the funding is unspent again (the close left the mempool), `ch2_close_vanished` fires:
+  * a ch2 that was refunded goes back to `refunded`: its fee is booked again and the refund goes out
+    again;
+  * any other ch2 stays `closing` and is refunded at expiry unless the close returns.
+
+New `ch2.json` fields (both languages): `close_prev`, `fund_txid`, `fund_vout`.
+
+**For cmp.**
+* Embedders that read `state == "closed"` right after a close should expect `closing` first.
+* Pass the fund wallet's RPC handle: B1 `RouteHub(..., wallet=)`, Rust through the `Wallet`
+  methods.
+* Handle the events `ch2_closing`, `ch2_close_vanished`, `ch2_funding_late` and
+  `ch2_funding_failed`.
+
+Tests: `crates/xbt402-interop/tests/hub_reconcile.rs` (16), and B1
+`tests/security/test_agp045_hub_reconcile.py` (16) with the same names. On regtest,
+`scripts/funding_reconcile_regtest.sh` runs Knots 29.4.2 with the Rust hub
+(`xbt402-funding-reconcile`) and the Python hub:
+* a mempool funding past the timeout is recovered and opened;
+* a conflicted funding is dropped but watched, then failed (`gettransaction` confirmations −1).
+
 ## Portability
 
 No platform-specific dependencies: libsecp256k1 (C, via `secp256k1-sys`), pure-Rust hashes and JSON,

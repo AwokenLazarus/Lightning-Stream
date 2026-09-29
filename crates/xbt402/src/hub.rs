@@ -37,10 +37,15 @@
 //!
 //! Money safety (AGP-037, as B1): a ch2's key and params are on disk (state `funding`) before the
 //! wallet funds it, and a rollover's next ch2 (`next`) before the rollover request leaves; every
-//! non-final ch2 (funded, open, refunded, closed but unconfirmed) is reconciled against the chain each
-//! tick (a spent funding is read, the ch2 marked closed with the real spender and its locks' secrets
-//! recovered; the hub's refund is final once confirmed and rebroadcast while it is not; a provider
-//! close that beats it reverts its fee); refunds go out at expiry (unsigned) or expiry +
+//! non-final ch2 (funded, open, refunded, closing, closed but unconfirmed) is reconciled against the
+//! chain each tick (a spent funding is read and its locks' secrets recovered; a provider's close in
+//! the mempool makes the ch2 `closing`, a confirmed one `closed` with the real spender (AGP-045); the
+//! hub's refund is final once confirmed and rebroadcast while it is not; a provider close that beats
+//! it reverts its fee once it confirms, and a mempool close that vanishes restores the refund, fee
+//! booked); a `funding` record whose wallet call failed is looked for in the wallet
+//! (`gettransaction`), the mempool (`gettxout` incl. the mempool, `getmempoolentry`) and the UTXO set
+//! (`scantxoutset`), dropped only when none shows it, and a dropped one whose send the wallet still
+//! knows is watched and refunded at expiry if it confirms late (AGP-045); refunds go out at expiry (unsigned) or expiry +
 //! `refund_grace_blocks` (signed) at a hub-chosen fee; `close_ch2` checks the provider's reply
 //! against the ledger; a provider's /terms are bounded before anything is funded; refills go through
 //! the refill hook (default: [`RouteHub::connect`]).
@@ -66,7 +71,7 @@ use xbt_primitives::tx::Tx;
 
 use crate::adaptor::{self, PreSig, Sc};
 use crate::channel::{canonical_chan, channel_auth_key, settle_due, sign_with_type, ChannelParams, FeePayer, DUST, RBF_SEQUENCE};
-use crate::client::{Transport, Wallet};
+use crate::client::{Transport, Wallet, WalletSend};
 use crate::error::{fail, ChannelError, Result};
 use crate::funding::{ChainBackend, FundingPolicy};
 use crate::json::{dumps, py_int, py_str, py_u64, truthy};
@@ -256,7 +261,7 @@ pub struct OutChannel {
     pub params: ChannelParams,
     /// Payer key (regtest: stored here; production: a B2-style signer).
     pub secret: String,
-    /// funding -> funded -> open -> closed | rolled | refunded; funding -> dropped.
+    /// funding -> funded -> open -> closing -> closed | rolled | refunded; funding -> dropped.
     pub state: String,
     /// Highest cumulative state the provider can close with.
     pub signed: u64,
@@ -290,12 +295,30 @@ pub struct OutChannel {
     pub refund_at: u32,
     /// Earlier refund versions it replaced, `{txid, fee}`: any of them may still confirm.
     pub refund_prev: Vec<Value>,
+    /// The state a `closing` ch2 left (AGP-045): `refunded` is restored if the close vanishes.
+    pub close_prev: String,
+    /// The funding send the hub knows of (the wallet's), watched while `dropped` (AGP-045).
+    pub fund_txid: String,
+    pub fund_vout: u32,
 }
 
 /// States in which the hub's coins are committed.
 pub const LIVE: [&str; 3] = ["funding", "funded", "open"];
 /// States the watcher reconciles until `final`.
-pub const NONFINAL: [&str; 4] = ["funded", "open", "refunded", "closed"];
+pub const NONFINAL: [&str; 5] = ["funded", "open", "refunded", "closing", "closed"];
+
+/// An archived record the watcher still reconciles: a non-final ch2, or a dropped funding whose
+/// send is known (it may confirm late: AGP-045).
+pub fn watched(r: &Value) -> bool {
+    let st = r.get("state").and_then(Value::as_str).unwrap_or("");
+    !truthy(r.get("final")) && (NONFINAL.contains(&st) || (st == "dropped" && !py_str(r.get("fund_txid")).is_empty()))
+}
+
+/// The record's refund fee counts: refunded, or refunded and now `closing` on a spender that has
+/// not confirmed (un-booked only when that close confirms: AGP-045).
+fn refund_booked(state: &str, close_prev: &str) -> bool {
+    state == "refunded" || (state == "closing" && close_prev == "refunded")
+}
 
 impl OutChannel {
     /// A new ch2 record (no state signed yet).
@@ -305,7 +328,7 @@ impl OutChannel {
                routed: 0, seq: 0, pending: Map::new(), stale: vec![], settle_multiple, terms: terms.clone(), refund_hex: String::new(),
                blocked: String::new(), close_txid: String::new(), rolled_to: String::new(), opened_at: tip, scanned_to: tip,
                refund_txid: String::new(), refund_fee: 0, final_: false, next: Map::new(), fund_error: String::new(),
-               refund_at: 0, refund_prev: vec![] }
+               refund_at: 0, refund_prev: vec![], close_prev: String::new(), fund_txid: String::new(), fund_vout: 0 }
     }
 
     pub fn to_json(&self) -> Value {
@@ -314,7 +337,8 @@ impl OutChannel {
                "settle_multiple": self.settle_multiple, "terms": self.terms, "refund_hex": self.refund_hex, "blocked": self.blocked,
                "close_txid": self.close_txid, "rolled_to": self.rolled_to, "opened_at": self.opened_at, "scanned_to": self.scanned_to,
                "refund_txid": self.refund_txid, "refund_fee": self.refund_fee, "final": self.final_, "next": self.next, "fund_error": self.fund_error,
-               "refund_at": self.refund_at, "refund_prev": self.refund_prev})
+               "refund_at": self.refund_at, "refund_prev": self.refund_prev, "close_prev": self.close_prev, "fund_txid": self.fund_txid,
+               "fund_vout": self.fund_vout})
     }
 
     pub fn from_json(v: &Value) -> Result<Self> {
@@ -328,7 +352,8 @@ impl OutChannel {
                   close_txid: s("close_txid"), rolled_to: s("rolled_to"), opened_at: n("opened_at") as u32, scanned_to: n("scanned_to") as u32,
                   refund_txid: s("refund_txid"), refund_fee: n("refund_fee"), final_: v.get("final").and_then(Value::as_bool).unwrap_or(false),
                   next: v.get("next").and_then(Value::as_object).cloned().unwrap_or_default(), fund_error: s("fund_error"),
-                  refund_at: n("refund_at") as u32, refund_prev: v.get("refund_prev").and_then(Value::as_array).cloned().unwrap_or_default() })
+                  refund_at: n("refund_at") as u32, refund_prev: v.get("refund_prev").and_then(Value::as_array).cloned().unwrap_or_default(),
+                  close_prev: s("close_prev"), fund_txid: s("fund_txid"), fund_vout: n("fund_vout") as u32 })
     }
 
     fn secret_key(&self) -> Result<SecretKey> {
@@ -419,6 +444,9 @@ pub type FeeStrategyFn = Box<dyn Fn(&RouteHub) -> (u64, u64) + Send + Sync>;
 /// lock and cap). Default: [`RouteHub::connect`].
 pub type RefillFn = Box<dyn Fn(&RouteHub, &str) -> Result<()> + Send + Sync>;
 
+/// A refill hook as stored: shared, so a call runs without the hook's lock held (AGP-045).
+type SharedRefill = Arc<dyn Fn(&RouteHub, &str) -> Result<()> + Send + Sync>;
+
 /// `refund_to()`: the address a ch2 refund pays (default: the ch2's payer key).
 pub type RefundToFn = Box<dyn Fn() -> Result<String> + Send + Sync>;
 
@@ -459,7 +487,7 @@ pub struct RouteHub {
     quote_seq: Mutex<i64>,
     reveal_timeout_bits: AtomicU64,
     fee_strategy: Option<FeeStrategyFn>,
-    refill: Mutex<Option<RefillFn>>,
+    refill: Mutex<Option<SharedRefill>>,
     refund_to: Mutex<Option<RefundToFn>>,
     /// Tests/demo: "" | "receipt" (keep t + r from the client) | "all" (forward nothing).
     pub withhold: Mutex<String>,
@@ -537,9 +565,11 @@ impl RouteHub {
         r
     }
 
-    /// Replace the default refill ([`RouteHub::connect`]) with an embedder's path.
+    /// Replace the default refill ([`RouteHub::connect`]) with an embedder's path (None: back to
+    /// `connect`). The hook is looked up at each refill and called without any hub lock held, so it
+    /// may be replaced at any time, from the hook itself too (AGP-045).
     pub fn set_refill(&self, f: Option<RefillFn>) {
-        *lk(&self.refill) = f;
+        *lk(&self.refill) = f.map(SharedRefill::from);
     }
 
     /// Pay ch2 refunds to this hook's address (default: the ch2's payer key).
@@ -596,8 +626,9 @@ impl RouteHub {
     /// Fees of the hub's own ch2 refunds that spent (or still may spend) their fundings.
     pub fn refund_fees_sat(&self) -> u64 {
         let b = lk(&self.out);
-        let live = b.chans.values().filter(|c| c.state == "refunded").map(|c| c.refund_fee);
-        let old = b.archived.iter().filter(|r| r.get("state").and_then(Value::as_str) == Some("refunded")).map(|r| py_u64(r.get("refund_fee")).unwrap_or(0));
+        let live = b.chans.values().filter(|c| refund_booked(&c.state, &c.close_prev)).map(|c| c.refund_fee);
+        let old = b.archived.iter().filter(|r| refund_booked(&py_str(r.get("state")), &py_str(r.get("close_prev"))))
+            .map(|r| py_u64(r.get("refund_fee")).unwrap_or(0));
         live.chain(old).sum()
     }
 
@@ -1271,14 +1302,55 @@ impl RouteHub {
             c.params = p;
             c.state = "funded".into();
             c.refund_hex = refund;
+            c.fund_txid = txid.to_string();
+            c.fund_vout = vout;
         })?;
         Ok(())
     }
 
-    /// A `funding` record (the wallet call failed, or the hub stopped mid-fund): the funding on
-    /// chain -> funded, and the open goes on; none within `funding_timeout_blocks` -> dropped
-    /// (archived with its key, so a late confirmation can still be refunded by hand).
+    /// What the fund wallet knows of sends to this ch2's address (`listtransactions` +
+    /// `gettransaction`), the record's own `fund_txid` first. Empty without a wallet view.
+    fn wallet_sends(&self, oc: &OutChannel) -> Vec<WalletSend> {
+        let Ok(addr) = segwit_address(&self.cfg.hrp, &oc.params.spk()) else { return vec![] };
+        let mut txids: Vec<String> = if oc.fund_txid.is_empty() { vec![] } else { vec![oc.fund_txid.clone()] };
+        match self.wallet.wallet_sends_to(&addr) {
+            Ok(l) => txids.extend(l.into_iter().filter(|t| *t != oc.fund_txid)),
+            Err(e) => eprintln!("hub: listtransactions for {}: {e}", oc.origin),
+        }
+        txids.into_iter().filter_map(|t| match self.wallet.wallet_send(&t, &addr) {
+            Ok(Some(w)) => Some(w),
+            // not the wallet's (an embedder's own fund hook): the record's own send, still checked on chain
+            _ if t == oc.fund_txid => Some(WalletSend { txid: t, vout: oc.fund_vout, sats: 0, confirmations: 0, abandoned: false }),
+            _ => None,
+        }).collect()
+    }
+
+    /// `gettxout` incl. the mempool: the output's sats while it is unspent.
+    fn utxo_sats(&self, txid: &str, vout: u32) -> Result<Option<u64>> {
+        Ok(self.chain.get_tx_out(txid, vout, true)?.map(|u| u.value))
+    }
+
+    /// A `funding` record (the wallet call failed, or the hub stopped mid-fund). Where the funding may
+    /// be (AGP-045, not only `scantxoutset`, which sees the confirmed UTXO set only): the sends the
+    /// wallet knows (`gettransaction`), each checked with `gettxout` incl. the mempool and
+    /// `getmempoolentry`, then `scantxoutset` (a fund hook outside the wallet). Found, in a block or
+    /// the mempool -> funded, and the open goes on once it has minConf. Not found within
+    /// `funding_timeout_blocks` -> dropped (archived with its key): a send the wallet still knows (not
+    /// conflicted or abandoned) is watched while dropped and refunded at expiry if it confirms late; a
+    /// genuinely failed send is final.
     fn reconcile_funding(&self, origin: &str, oc: &OutChannel, tip: u32) -> Result<Vec<Value>> {
+        let mut pending: Option<WalletSend> = None;
+        for w in self.wallet_sends(oc) {
+            if let Some(sats) = self.utxo_sats(&w.txid, w.vout)?.filter(|s| *s >= DUST) {
+                return self.recovered(origin, oc, &w.txid, w.vout, sats);
+            }
+            if w.failed() {
+                continue; // conflicted or abandoned: never confirms
+            }
+            if pending.is_none() || self.scan.in_mempool(&w.txid).unwrap_or(false) {
+                pending = Some(w);
+            }
+        }
         let hits = match self.scan.scan_spk(&oc.params.spk()) {
             Ok(h) => h,
             Err(e) => {
@@ -1287,28 +1359,69 @@ impl RouteHub {
             }
         };
         if let Some((txid, vout, sats)) = hits.into_iter().find(|h| h.2 >= DUST) {
-            self.funded(Loc::Live(origin), oc, &txid, vout, sats)?;
-            let chan = self.get(Loc::Live(origin)).map(|c| c.params.channel_id()).unwrap_or_default();
-            let ev = json!({"event": "ch2_funding_recovered", "provider": origin, "chan": chan});
-            self.event(ev.clone());
-            return Ok(vec![ev]);
+            return self.recovered(origin, oc, &txid, vout, sats);
         }
         if tip.saturating_sub(oc.opened_at) < self.cfg.funding_timeout_blocks {
             return Ok(vec![]);
         }
+        let mut watching = None;
         {
             let mut b = lk(&self.out);
-            if let Some(c) = b.chans.get(origin).filter(|c| c.params.payer_pub == oc.params.payer_pub).cloned() {
-                let mut c = c;
+            if let Some(mut c) = b.chans.get(origin).filter(|c| c.params.payer_pub == oc.params.payer_pub).cloned() {
                 c.state = "dropped".into();
+                match &pending {
+                    // its send may still confirm: keep watching it
+                    Some(w) => {
+                        c.fund_txid = w.txid.clone();
+                        c.fund_vout = w.vout;
+                        watching = Some(w.txid.clone());
+                    }
+                    None => c.final_ = true,
+                }
                 b.archived.push(c.to_json());
                 b.chans.shift_remove(origin);
             }
             b.save()?;
         }
-        let ev = json!({"event": "ch2_funding_dropped", "provider": origin, "error": oc.fund_error});
+        let mut ev = json!({"event": "ch2_funding_dropped", "provider": origin, "error": oc.fund_error});
+        if let Some(t) = watching {
+            ev["watching"] = t.into();
+        }
         self.event(ev.clone());
         Ok(vec![ev])
+    }
+
+    fn recovered(&self, origin: &str, oc: &OutChannel, txid: &str, vout: u32, sats: u64) -> Result<Vec<Value>> {
+        self.funded(Loc::Live(origin), oc, txid, vout, sats)?;
+        let chan = self.get(Loc::Live(origin)).map(|c| c.params.channel_id()).unwrap_or_default();
+        let ev = json!({"event": "ch2_funding_recovered", "provider": origin, "chan": chan, "txid": txid});
+        self.event(ev.clone());
+        Ok(vec![ev])
+    }
+
+    /// A dropped funding whose send is known (AGP-045). Its output appears (it confirmed late, or is
+    /// back in the mempool) -> funded, in the archive: never opened, refunded at expiry by the
+    /// reconcile like any unused ch2 (event `ch2_funding_late`). The wallet says it can never confirm
+    /// (conflicted or abandoned) -> final (event `ch2_funding_failed`).
+    fn reconcile_dropped(&self, i: usize) -> Result<Vec<Value>> {
+        let loc = Loc::Archived(i);
+        let Some(oc) = self.get(loc) else { return Ok(vec![]) };
+        if let Some(sats) = self.utxo_sats(&oc.fund_txid, oc.fund_vout)?.filter(|s| *s >= DUST) {
+            self.funded(loc, &oc, &oc.fund_txid, oc.fund_vout, sats)?;
+            let p = self.get(loc).map(|c| c.params).unwrap_or(oc.params);
+            let ev = json!({"event": "ch2_funding_late", "provider": oc.origin, "chan": p.channel_id(), "txid": oc.fund_txid,
+                            "capacity": sats, "refundAt": p.expiry});
+            self.event(ev.clone());
+            return Ok(vec![ev]);
+        }
+        if let Some(w) = self.wallet_sends(&oc).into_iter().find(|w| w.txid == oc.fund_txid && w.failed()) {
+            self.upd(loc, &oc, |c| c.final_ = true)?;
+            let ev = json!({"event": "ch2_funding_failed", "provider": oc.origin, "txid": oc.fund_txid,
+                            "why": if w.abandoned { "abandoned" } else { "conflicted" }});
+            self.event(ev.clone());
+            return Ok(vec![ev]);
+        }
+        Ok(vec![])
     }
 
     fn open(&self, oc: &OutChannel) -> Result<bool> {
@@ -1424,7 +1537,8 @@ impl RouteHub {
     /// through the refill hook. The provider's reply must match the ledger (AGP-037): a 64-hex
     /// txid, cum = a state the hub signed (its best, or a pending or written-off lock's), and on a
     /// payee-pays ch2 payeeFee = the close fee, payeeNet = cum − payeeFee. Anything else is
-    /// `bad_close_reply` and changes nothing: the watcher reads the real close off the chain.
+    /// `bad_close_reply` and changes nothing: the watcher reads the real close off the chain. A good
+    /// reply makes the ch2 `closing` (AGP-045): it is `closed` once the watcher sees the close confirm.
     pub fn close_ch2(&self, oc: &OutChannel, refill: bool) -> Result<Value> {
         let p = &oc.params;
         if oc.signed == 0 {
@@ -1443,18 +1557,17 @@ impl RouteHub {
         }
         let (txid, cum) = self.check_close_reply(oc, &doc)?;
         self.upd(Loc::Live(&oc.origin), oc, |c| {
-            c.state = "closed".into();
+            c.close_prev = std::mem::replace(&mut c.state, "closing".into());
             c.close_txid = txid.clone();
         })?;
         let mut ev = json!({"event": "ch2_close", "provider": oc.origin, "chan": p.channel_id(), "txid": txid, "amount": cum,
                             "payeeFee": p.payee_fee(), "payeeNet": cum.saturating_sub(p.payee_fee())});
         if refill {
-            let hook = lk(&self.refill);
-            let r = match hook.as_ref() {
+            let hook = lk(&self.refill).clone(); // looked up now; the lock is released before the call
+            let r = match hook {
                 Some(f) => f(self, &oc.origin),
                 None => self.connect(&oc.origin, None, None).map(|_| ()),
             };
-            drop(hook);
             if let Err(e) = r {
                 // the close stands; the refill is reported
                 let msg: String = e.to_string().chars().take(200).collect();
@@ -1541,7 +1654,7 @@ impl RouteHub {
     }
 
     fn refund_due(&self, oc: &OutChannel, tip: u32) -> bool {
-        if !["funded", "open", "closed"].contains(&oc.state.as_str()) || !oc.pending.is_empty() || oc.params.funding.is_none() {
+        if !["funded", "open", "closing", "closed"].contains(&oc.state.as_str()) || !oc.pending.is_empty() || oc.params.funding.is_none() {
             return false;
         }
         let grace = if oc.signed >= oc.params.min_amount() { self.cfg.refund_grace_blocks } else { 0 };
@@ -1649,12 +1762,13 @@ impl RouteHub {
             }
             drop(busy);
         }
-        let archived: Vec<(usize, String)> = lk(&self.out).archived.iter().enumerate()
-            .filter(|(_, r)| NONFINAL.contains(&r.get("state").and_then(Value::as_str).unwrap_or("")) && !truthy(r.get("final")))
-            .map(|(i, r)| (i, py_str(r.get("origin")))).collect();
-        for (i, origin) in archived {
-            // replaced ch2s are still the hub's coins
-            match self.reconcile(Loc::Archived(i), tip) {
+        let archived: Vec<(usize, String, bool)> = lk(&self.out).archived.iter().enumerate()
+            .filter(|(_, r)| watched(r))
+            .map(|(i, r)| (i, py_str(r.get("origin")), r.get("state").and_then(Value::as_str) == Some("dropped"))).collect();
+        for (i, origin, dropped) in archived {
+            // replaced ch2s are still the hub's coins, and so is a dropped funding that may confirm late
+            let r = if dropped { self.reconcile_dropped(i) } else { self.reconcile(Loc::Archived(i), tip) };
+            match r {
                 Ok(mut a) => acts.append(&mut a),
                 Err(e) => self.watch_error(&origin, "archived", &e),
             }
@@ -1730,9 +1844,13 @@ impl RouteHub {
     /// Check one non-final ch2's funding against the chain (AGP-037).
     /// Unspent: refund it when due; rebroadcast our refund if it left the mempool. Spent by the
     /// rollover we wrote ahead: finish it. Spent by our refund: final once confirmed. Spent by
-    /// anything else (the provider's close): read the locks' secrets off it, mark it closed with the
-    /// real txid, and take back the refund fee if our refund lost. Spent, spender not found: with
-    /// locks outstanding leave it (their secrets are on that tx); without, closed, txid unknown.
+    /// anything else (the provider's close): read the locks' secrets off it; in the mempool it is only
+    /// `closing` (AGP-045: the refund fee stays booked), and once it confirms the ch2 is `closed` with
+    /// the real txid and the refund fee is taken back if our refund lost. A `closing` ch2 whose spender
+    /// left the mempool is `refunded` again if it was (the fee re-booked), else it stays `closing` and
+    /// is refunded at expiry unless the close comes back. Spent, spender not found: with locks
+    /// outstanding leave it (their secrets are on that tx); without, closing (closed once confirmed),
+    /// txid unknown.
     fn reconcile(&self, loc: Loc<'_>, tip: u32) -> Result<Vec<Value>> {
         let mut out = vec![];
         let Some(oc) = self.get(loc) else { return Ok(out) };
@@ -1740,32 +1858,55 @@ impl RouteHub {
             return Ok(out);
         }
         let (txid, vout) = (oc.params.funding_txid(), oc.params.funding_vout());
+        let chan = oc.params.channel_id();
         if self.chain.get_tx_out(&txid, vout, true)?.is_some() {
+            let mut oc = oc;
+            if oc.state == "closing" && (!oc.close_txid.is_empty() || oc.close_prev == "refunded") {
+                out.extend(self.close_vanished(loc, &oc)?);
+                let Some(cur) = self.get(loc).filter(|c| c.params.payer_pub == oc.params.payer_pub) else { return Ok(out) };
+                oc = cur;
+            }
             if oc.state == "refunded" || self.refund_due(&oc, tip) {
                 // due, or our refund left the mempool: send it (again, or bumped once it waited)
-                return self.refund(loc, &oc, tip);
+                out.extend(self.refund(loc, &oc, tip)?);
             }
             return Ok(out);
         }
         let confirmed = self.chain.get_tx_out(&txid, vout, false)?.is_none();
         let locks = !oc.pending.is_empty() || !oc.stale.is_empty();
-        if oc.state == "closed" && !oc.close_txid.is_empty() && !locks && oc.refund_txid.is_empty() {
-            if confirmed {
-                // the provider's close as it told us: done
-                self.upd(loc, &oc, |c| c.final_ = true)?;
-            }
-            return Ok(out);
+        if oc.state == "closing" && !oc.close_txid.is_empty() && !locks && oc.refund_txid.is_empty() && confirmed {
+            // the provider's close as it told us, confirmed: done
+            self.upd(loc, &oc, |c| {
+                c.state = "closed".into();
+                c.final_ = true;
+            })?;
+            let ev = json!({"event": "ch2_closed", "provider": oc.origin, "chan": chan, "txid": oc.close_txid, "by": "provider"});
+            self.event(ev.clone());
+            return Ok(vec![ev]);
         }
         let Some(tx) = self.scan.find_spend(&txid, vout, oc.scanned_to)? else {
-            if oc.state == "open" && !locks {
-                self.upd(loc, &oc, |c| {
-                    c.state = "closed".into();
-                    c.close_txid = String::new();
-                })?;
-                let ev = json!({"event": "ch2_closed", "provider": oc.origin, "chan": oc.params.channel_id(), "txid": "", "by": "unknown"});
-                self.event(ev.clone());
-                out.push(ev);
+            // a funded one may not be visible yet; with locks, their secrets are on that tx: wait for
+            // it. A closing one closes once the spend confirms, unless it was refunded (the spender may
+            // be our refund: the fee stays booked until the spender is found)
+            if locks || !["open", "closing"].contains(&oc.state.as_str()) {
+                return Ok(out);
             }
+            if oc.state == "closing" && (!confirmed || oc.close_prev == "refunded") {
+                return Ok(out);
+            }
+            let st = if confirmed { "closed" } else { "closing" };
+            let was_open = oc.state == "open";
+            let r = self.upd(loc, &oc, |c| {
+                if was_open {
+                    c.close_prev = "open".into();
+                    c.close_txid = String::new();
+                }
+                c.state = st.into();
+                c.close_txid.clone()
+            })?;
+            let ev = json!({"event": format!("ch2_{st}"), "provider": oc.origin, "chan": chan, "txid": r.unwrap_or_default(), "by": "unknown"});
+            self.event(ev.clone());
+            out.push(ev);
             return Ok(out);
         };
         let spender = tx.txid();
@@ -1789,7 +1930,7 @@ impl RouteHub {
                 }
             })?;
             if confirmed {
-                let ev = json!({"event": "ch2_refund_confirmed", "provider": oc.origin, "chan": oc.params.channel_id(), "txid": spender,
+                let ev = json!({"event": "ch2_refund_confirmed", "provider": oc.origin, "chan": chan, "txid": spender,
                                 "fee": fee, "versions": oc.refund_prev.len() + 1});
                 self.event(ev.clone());
                 out.push(ev);
@@ -1802,30 +1943,72 @@ impl RouteHub {
             return Ok(out);
         }
         if locks {
-            out.extend(self.secrets_from_close(loc, &oc, &tx));
+            out.extend(self.secrets_from_close(loc, &oc, &tx)); // the secrets are on it, confirmed or not
+        }
+        if !confirmed {
+            // in the mempool: it may still be replaced or expire, so the ch2 is only closing and a
+            // refund fee stays booked until it confirms
+            if oc.state == "closing" && oc.close_txid == spender {
+                return Ok(out);
+            }
+            let sp = spender.clone();
+            let at_risk = refund_booked(&oc.state, &oc.close_prev);
+            self.upd(loc, &oc, |c| {
+                if c.state != "closing" {
+                    c.close_prev = std::mem::take(&mut c.state);
+                }
+                c.state = "closing".into();
+                c.close_txid = sp;
+            })?;
+            let mut ev = json!({"event": "ch2_closing", "provider": oc.origin, "chan": chan, "txid": spender, "by": "provider"});
+            if at_risk {
+                ev["refundAtRisk"] = oc.refund_txid.clone().into();
+            }
+            self.event(ev.clone());
+            out.push(ev);
+            return Ok(out);
         }
         let lost = if oc.refund_txid.is_empty() { 0 } else { oc.refund_fee };
-        let changed = oc.state != "closed" || oc.close_txid != spender;
         let sp = spender.clone();
         self.upd(loc, &oc, |c| {
             c.state = "closed".into();
             c.close_txid = sp;
-            c.final_ = confirmed;
+            c.final_ = true;
             c.next = Map::new();
             if lost > 0 {
                 c.refund_fee = 0;
             }
         })?;
-        if changed {
-            let mut ev = json!({"event": "ch2_closed", "provider": oc.origin, "chan": oc.params.channel_id(), "txid": spender, "by": "provider"});
-            if !oc.refund_txid.is_empty() {
-                ev["refundLost"] = oc.refund_txid.clone().into();
-                ev["refundFeeReverted"] = lost.into();
-            }
-            self.event(ev.clone());
-            out.push(ev);
+        let mut ev = json!({"event": "ch2_closed", "provider": oc.origin, "chan": chan, "txid": spender, "by": "provider"});
+        if !oc.refund_txid.is_empty() {
+            ev["refundLost"] = oc.refund_txid.clone().into();
+            ev["refundFeeReverted"] = lost.into();
         }
+        self.event(ev.clone());
+        out.push(ev);
         Ok(out)
+    }
+
+    /// A `closing` ch2's funding is unspent again: the close left the mempool (replaced, expired) or
+    /// never reached this node. A ch2 that was refunded is refunded again (its fee booked again, and
+    /// the refund goes out once more); any other stays `closing` (the hub never routes over it again)
+    /// and is refunded at expiry unless the provider's close comes back.
+    fn close_vanished(&self, loc: Loc<'_>, oc: &OutChannel) -> Result<Vec<Value>> {
+        let state = self.upd(loc, oc, |c| {
+            if c.close_prev == "refunded" {
+                c.state = "refunded".into();
+                c.close_prev = String::new();
+            }
+            c.close_txid = String::new();
+            c.state.clone()
+        })?.unwrap_or_else(|| oc.state.clone());
+        let mut ev = json!({"event": "ch2_close_vanished", "provider": oc.origin, "chan": oc.params.channel_id(), "txid": oc.close_txid,
+                            "state": state});
+        if state == "refunded" {
+            ev["feeRebooked"] = oc.refund_fee.into();
+        }
+        self.event(ev.clone());
+        Ok(vec![ev])
     }
 
     fn secrets_from_close(&self, loc: Loc<'_>, oc: &OutChannel, tx: &Tx) -> Vec<Value> {

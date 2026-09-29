@@ -7,7 +7,7 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 use xbt_primitives::amount::Amount;
 
-use crate::client::Wallet;
+use crate::client::{Wallet, WalletSend};
 use crate::error::{fail, ChannelError, Result};
 use crate::funding::{ChainBackend, UtxoInfo};
 
@@ -104,5 +104,35 @@ impl Wallet for Rpc {
                 .and_then(|o| o.get("n")).and_then(Value::as_u64)
         }).ok_or_else(|| ChannelError::new("rpc_error", "funding output not found"))?;
         Ok((txid, vout as u32))
+    }
+
+    fn wallet_sends_to(&self, address: &str) -> Result<Vec<String>> {
+        let r = self.call("listtransactions", json!(["*", 1000, 0, true]))?;
+        let mut out: Vec<String> = vec![];
+        for t in r.as_array().into_iter().flatten() {
+            if t.get("category").and_then(Value::as_str) == Some("send") && t.get("address").and_then(Value::as_str) == Some(address) {
+                if let Some(id) = t.get("txid").and_then(Value::as_str).filter(|id| !out.iter().any(|o| o == id)) {
+                    out.push(id.to_string());
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn wallet_send(&self, txid: &str, address: &str) -> Result<Option<WalletSend>> {
+        let Ok(tx) = self.call("gettransaction", json!([txid, true, true])) else { return Ok(None) };
+        let out = tx.get("decoded").and_then(|d| d.get("vout")).and_then(Value::as_array).and_then(|outs| {
+            outs.iter().find(|o| o.get("scriptPubKey").and_then(|s| s.get("address")).and_then(Value::as_str) == Some(address))
+        });
+        let Some(o) = out else { return Ok(None) };
+        let sats = o.get("value").and_then(Value::as_f64).and_then(|v| Amount::from_btc_f64(v).ok()).map(|a| a.to_sat()).unwrap_or(0);
+        Ok(Some(WalletSend {
+            txid: txid.to_string(),
+            vout: o.get("n").and_then(Value::as_u64).unwrap_or(0) as u32,
+            sats,
+            confirmations: tx.get("confirmations").and_then(Value::as_i64).unwrap_or(0),
+            abandoned: tx.get("details").and_then(Value::as_array).into_iter().flatten()
+                .any(|d| d.get("abandoned").and_then(Value::as_bool).unwrap_or(false)),
+        }))
     }
 }

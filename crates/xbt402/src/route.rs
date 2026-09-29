@@ -445,6 +445,11 @@ pub trait SpendScan: Send + Sync {
     fn fee_rate(&self, _target: u32) -> Result<Option<f64>> {
         Ok(None)
     }
+
+    /// `getmempoolentry txid`: is the tx in this node's mempool (AGP-045)? Default: unknown (false).
+    fn in_mempool(&self, _txid: &str) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 #[cfg(feature = "rpc")]
@@ -483,6 +488,10 @@ impl SpendScan for crate::rpc::Rpc {
     fn fee_rate(&self, target: u32) -> Result<Option<f64>> {
         let r = self.call("estimatesmartfee", json!([target]))?;
         Ok(r.get("feerate").and_then(Value::as_f64).filter(|f| *f > 0.0).map(|f| f * 1e8 / 1000.0))
+    }
+
+    fn in_mempool(&self, txid: &str) -> Result<bool> {
+        Ok(self.call("getmempoolentry", json!([txid])).is_ok_and(|v| !v.is_null()))
     }
 }
 
