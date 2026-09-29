@@ -350,6 +350,17 @@ impl App {
                              &|v| format!("Swept {} sats to {} (txid {}).", int(v.get("swept_sats")), txt(v.get("to")), txt(v.get("txid")))),
             "/rotate" => back("./keys", self.call("rotate_hot_key_signed", json!({"expiry": i("expiry"), "signature": sig()})),
                               &|v| format!("Hot key rotated: new address {}.", txt(v.get("new_address")))),
+            "/rotate-token" => {
+                if g("confirm") != "1" {
+                    self.flash(ctx, false, "tick the box to rotate the agent token");
+                    return Resp::redirect("./agents");
+                }
+                match self.rotate_mcp_token() {
+                    Ok(_) => self.flash(ctx, true, "Agent token rotated. Give your agents the new token from this page."),
+                    Err(e) => self.flash(ctx, false, e),
+                }
+                Resp::redirect("./agents")
+            }
             "/anchor-now" => back("./signatures", self.call("anchor_now", json!({"reason": "operator:ui"})), &|_| "Anchored.".into()),
             "/channel-close" => back("./channels", self.call("close_channel", json!({"counterparty": g("counterparty")})),
                                      &|v| format!("Closed: txid {}, close report {}.", txt(v.get("txid")), txt(v.pointer("/close_report/status")))),
@@ -897,10 +908,42 @@ impl App {
                                      <p>An MCP client configuration:</p>{}</details>\
                                      <p class=\"msg\">Treat the token like a card with a spending limit: anyone who holds it can pay what your policy allows.</p>",
                                     esc(&t), json_block(&snippet)));
+                b.push_str(&format!("<form method=\"post\" action=\"./rotate-token\" class=\"stack\">{}<p>If the token leaked, replace it here. \
+                    Every agent loses access until you give it the new one. No terminal and no app restart.</p>\
+                    <label><input type=\"checkbox\" name=\"confirm\" value=\"1\" required> I will give my agents the new token</label>\
+                    <button type=\"submit\">Rotate the token</button></form>", Self::csrf_input(ctx)));
             }
         }
         b.push_str("</section>");
         self.page("Agents", ctx, b)
+    }
+
+    /// Replace the MCP bearer token: ask the MCP (it owns the live file), then write our copy.
+    fn rotate_mcp_token(&self) -> Result<String, String> {
+        let current = std::fs::read_to_string(&self.cfg.mcp_token_file).map_err(|e| format!("read token: {e}"))?;
+        let current = current.trim();
+        if current.is_empty() {
+            return Err("no token to rotate".into());
+        }
+        let new = if let Some(url) = &self.cfg.mcp_rotate_url {
+            let (st, body) = http_post(url, current, &[("X-XBT-Rotate", "owner")])?;
+            if st != 200 {
+                return Err(format!("the MCP refused rotation (HTTP {st}): {}", short(&body, 200)));
+            }
+            let v: Value = serde_json::from_str(&body).map_err(|e| format!("rotate reply: {e}"))?;
+            let t = v.get("token").and_then(Value::as_str).unwrap_or("").trim().to_string();
+            if t.len() != 64 || !t.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err("the MCP did not return a new token".into());
+            }
+            t
+        } else {
+            hex::encode(crate::random_bytes::<32>())
+        };
+        write_token_file(&self.cfg.mcp_token_file, &new)?;
+        if let Some(peer) = &self.cfg.mcp_token_peer {
+            write_token_file(peer, &new)?;
+        }
+        Ok(new)
     }
 
     fn hub(&self, ctx: &Ctx) -> Resp {
@@ -937,7 +980,27 @@ impl App {
             Some(u) => {
                 let probe = |path: &str| http_get(&format!("{u}{path}"));
                 b.push_str(&format!("<p><code>{}</code></p>", esc(u)));
-                for path in ["/healthz", "/readyz", "/x402/supported"] {
+                match probe("/readyz") {
+                    Ok((st, body)) => {
+                        if let Ok(v) = serde_json::from_str::<Value>(&body) {
+                            if let Some(addr) = v.pointer("/wallet/receive_address").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                                let bal = v.pointer("/wallet/balance_sats").and_then(Value::as_u64).unwrap_or(0);
+                                b.push_str(&format!("<section class=\"card\" id=\"hub-funding\"><h3>Fund the hub</h3>\
+                                    <p>Send XBT to this address. The hub created the node wallet named <code>{}</code> for you; no terminal.</p>\
+                                    <p>Receive address: <code id=\"hub-receive\">{}</code></p><p>Balance: {}</p>",
+                                    esc(v.pointer("/wallet/name").and_then(Value::as_str).unwrap_or("hub")), esc(addr), sats(bal as i64)));
+                                if let Some(onion) = v.get("tor").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                                    b.push_str(&format!("<p>Tor: <code id=\"hub-tor\">{}</code></p>", esc(onion)));
+                                }
+                                b.push_str("</section>");
+                            }
+                        }
+                        b.push_str(&format!("<p><span class=\"tag {}\">{st}</span> <code>/readyz</code></p><pre class=\"json\">{}</pre>",
+                                            if st == 200 { "ok" } else { "bad" }, esc(&short(&body, 2000))));
+                    }
+                    Err(e) => b.push_str(&format!("<p><span class=\"tag bad\">unreachable</span> <code>/readyz</code>: {}</p>", esc(&e))),
+                }
+                for path in ["/healthz", "/x402/supported"] {
                     match probe(path) {
                         Ok((st, body)) => b.push_str(&format!("<p><span class=\"tag {}\">{st}</span> <code>{path}</code></p><pre class=\"json\">{}</pre>",
                                                               if st == 200 { "ok" } else { "bad" }, esc(&short(&body, 2000)))),
@@ -1027,6 +1090,46 @@ impl App {
         b.push_str("</ol>");
         self.page("Setup", ctx, b)
     }
+}
+
+fn write_token_file(path: &std::path::Path, token: &str) -> Result<(), String> {
+    if let Some(d) = path.parent() {
+        std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+    }
+    std::fs::write(path, format!("{token}\n")).map_err(|e| format!("{}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+/// A plain-HTTP POST with a short timeout (the MCP rotate endpoint on the box network).
+fn http_post(url: &str, bearer: &str, extra: &[(&str, &str)]) -> Result<(u16, String), String> {
+    use std::io::{Read, Write};
+    let rest = url.strip_prefix("http://").ok_or("only http:// rotate URLs")?;
+    let (hostport, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let addr = std::net::ToSocketAddrs::to_socket_addrs(&if hostport.contains(':') { hostport.to_string() } else { format!("{hostport}:80") })
+        .map_err(|e| e.to_string())?.next().ok_or("no address")?;
+    let t = std::time::Duration::from_secs(5);
+    let mut s = std::net::TcpStream::connect_timeout(&addr, t).map_err(|e| e.to_string())?;
+    s.set_read_timeout(Some(t)).ok();
+    let mut hdrs = format!("POST {path} HTTP/1.0\r\nHost: {hostport}\r\nAuthorization: Bearer {bearer}\r\nContent-Length: 0\r\nConnection: close\r\n");
+    for (k, v) in extra {
+        hdrs.push_str(&format!("{k}: {v}\r\n"));
+    }
+    hdrs.push_str("\r\n");
+    s.write_all(hdrs.as_bytes()).map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    s.take(16 * 1024).read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&buf).to_string();
+    let status = text.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+    let body = text.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
+    Ok((status, body))
 }
 
 /// A plain-HTTP GET with a short timeout (the hub is on the box's own network).

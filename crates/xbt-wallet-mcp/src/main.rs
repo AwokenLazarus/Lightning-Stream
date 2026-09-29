@@ -150,7 +150,8 @@ fn main() {
         }
     };
     let ready_file = env("XBT_SIGNER_READY_FILE").map(PathBuf::from).or_else(|| data.as_ref().map(DataDir::signer_ready));
-    let cfg = HttpConfig { addr, path, token, allow_remote, base, ready: Some(readiness(wallet, ready_file)) };
+    let token_file = secrets.dir.as_ref().map(|d| d.join("mcp-http-token"));
+    let cfg = HttpConfig { addr, path, token, token_file, allow_remote, base, ready: Some(readiness(wallet, ready_file)) };
     if let Err(e) = serve_http(server, cfg) {
         die(&e);
     }

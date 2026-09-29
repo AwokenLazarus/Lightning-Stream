@@ -249,6 +249,18 @@ def main():
           {"init": rep3.get("ok"), "login": st, "channels": chans3})
     r3 = agent.tool("xbt402_pay", url=f"{PROVIDER}/v1/agp040", max_sats=1000)
     check("B", "after the restore the agent pays again over the same channel", r3.get("status") == 200 and r3.get("chan") == r1.get("chan"), r3)
+    ui.post("/agents", "/rotate-token", {"confirm": "1"})
+    flash_rot = ui.flash("/agents")
+    page_rot = ui.get("/agents")
+    m_rot = re.search(r'<code id="mcp-token">([0-9a-f]{64})</code>', page_rot)
+    ui_tok = m_rot.group(1) if m_rot else None
+    mcp_tok = vol_sh(vol2, "cat /v/mcp/secrets/mcp-http-token").stdout.strip()
+    ui_disk = vol_sh(vol2, "cat /v/ui/secrets/mcp-http-token").stdout.strip()
+    st_old_ui = Mcp(f"http://127.0.0.1:{P_MCP}", token).start()[0]
+    st_new_ui = Mcp(f"http://127.0.0.1:{P_MCP}", ui_tok or "").start()[0]
+    check("W", "Agents page rotate (no restart): new token, both copies match, old gets 401, new works",
+          "rotated" in flash_rot.lower() and ui_tok and ui_tok != token and ui_tok == mcp_tok == ui_disk
+          and st_old_ui == 401 and st_new_ui == 200, {"flash": flash_rot, "old": st_old_ui, "new": st_new_ui})
     time.sleep(6)
     wc = docker("run", "--rm", "--user", "0", "--network", "none",
                 "--mount", f"type=volume,src={vol2},dst=/data/witness,volume-subpath=witness,volume-nocopy=true,readonly",
@@ -288,8 +300,12 @@ def main():
     ui.req("POST", "/setup-password", {"code": new_code, "password": pw, "password2": pw})
     ui.login(pw)
     hp = ui.get("/hub")
+    w = hub.get("wallet") or {}
+    addr = w.get("receive_address") or ""
     check("H", "hub enabled: /readyz 200 with its payTo; the UI's Hub page reaches it on 127.0.0.1:9480 (the shared namespace)",
           hub.get("ok") and '<span class="tag ok">200</span> <code>/readyz</code>' in hp, hub)
+    check("H", "hub created wallet hub and the Hub page shows the receive address (no terminal)",
+          w.get("name") == "hub" and addr.startswith("bcrt1") and f'id="hub-receive">{addr}' in hp, w)
     with open(os.path.join(OUT, "facts.json"), "w") as f:
         json.dump({"r1": r1, "r2": r2, "r3": r3, "init_install": rep, "init_after_root_chown": rep2, "init_after_restore": rep3}, f, indent=1, default=str)
 

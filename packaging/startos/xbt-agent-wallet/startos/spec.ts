@@ -113,6 +113,7 @@ export function services(cfg: Config): ServiceSpec[] {
         XBT_UI_BIND: `0.0.0.0:${PORTS.ui}`,
         XBT_UI_SIGNER_SOCK: '/data/run/signer/signer.sock',
         XBT_UI_MCP_URL: cfg.mcpUrls.join(','),
+        XBT_UI_MCP_ROTATE_URL: `http://127.0.0.1:${PORTS.mcp}/rotate-token`,
         ...(cfg.hubEnabled ? { XBT_UI_HUB_URL: `http://127.0.0.1:${PORTS.hub}` } : {}),
       },
       mounts: [vol('ui', '/data/ui'), vol('run/signer', '/data/run/signer', true)],

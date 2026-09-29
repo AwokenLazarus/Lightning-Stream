@@ -277,6 +277,16 @@ fn data_dir_mode_health_token_and_base_path() {
     assert_eq!(req("POST", &format!("{}/w/mcp", h.base), Some(&init_msg(1)), &[]).0, 401);
     assert_eq!(req("POST", &format!("{}/w/mcp", h.base), Some(&init_msg(1)), &[("Authorization", &auth)]).0, 200);
     assert_eq!(req("POST", &format!("{}/mcp", h.base), Some(&init_msg(1)), &[("Authorization", &auth)]).0, 200);
+    // AGP-042: owner rotation without a restart (the UI's Agents page)
+    assert_eq!(req("POST", &format!("{}/rotate-token", h.base), None, &[("Authorization", &auth)]).0, 403);
+    let (st, _, body) = req("POST", &format!("{}/rotate-token", h.base), None, &[("Authorization", &auth), ("X-XBT-Rotate", "owner")]);
+    assert_eq!(st, 200, "{body}");
+    let new = serde_json::from_str::<Value>(&body).unwrap()["token"].as_str().unwrap().to_string();
+    assert_eq!(new.len(), 64);
+    assert_ne!(new, token.trim());
+    assert_eq!(std::fs::read_to_string(&tok_path).unwrap().trim(), new);
+    assert_eq!(req("POST", &format!("{}/mcp", h.base), Some(&init_msg(1)), &[("Authorization", &auth)]).0, 401);
+    assert_eq!(req("POST", &format!("{}/mcp", h.base), Some(&init_msg(1)), &[("Authorization", &format!("Bearer {new}"))]).0, 200);
     // production mode (a data dir) refuses the token as a plain env value
     let out = Command::new(BIN).env_clear().env("XBT_DATA_DIR", &data).env("XBT_MCP_HTTP_TOKEN", "x")
         .env("XBT_MCP_HTTP", "127.0.0.1:33741").env("B2_SIGNER_SOCK", &sock).output().unwrap();

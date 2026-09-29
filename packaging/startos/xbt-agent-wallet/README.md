@@ -32,7 +32,7 @@ enabled). StartOS terminates TLS and adds X-Forwarded-Proto, so the UI's cookie 
 | node-config | node RPC host, port, user, password, chain (a critical task until set) |
 | ui-setup-code | the UI's one-time setup code (`main/ui/setup-code`), while no password is set |
 | agent-connection | the MCP addresses and the bearer token (`main/mcp/secrets/mcp-http-token`) |
-| rotate-agent-token | delete the MCP token (and the UI's copy) and restart: xbt-init makes a new one |
+| rotate-agent-token | delete the MCP token (and the UI's copy) and restart: xbt-init makes a new one. Prefer the web UI Agents page (`POST /rotate-token`), which needs no restart. |
 | hub-toggle | enable or disable the xbt402 hub |
 | reset-ui-password | delete `main/ui/password.scrypt` and restart |
 

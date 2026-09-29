@@ -18,6 +18,8 @@
 //! | `XBT_UI_CMP_STATUS_URL` | | xbt-compute's status JSON (`http://…/readyz`, CONTRACT §U), read server-side for a compact tile |
 //! | `XBT_UI_MCP_URL` | | the MCP endpoint(s) agents connect to, comma-separated (`http://umbrel.local:33510/mcp`), shown on the Agents page |
 //! | `XBT_UI_MCP_TOKEN_FILE` | `<data dir>/secrets/mcp-http-token` | the MCP bearer token, shown to the logged-in owner on the Agents page (`xbt-init` copies it there on a box) |
+//! | `XBT_UI_MCP_ROTATE_URL` | | the MCP's `POST /rotate-token` (box network). The Agents page uses it so Umbrel has a rotate action with no terminal. |
+//! | `XBT_UI_MCP_TOKEN_PEER` | | optional second path to write the new token (tests) |
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -39,6 +41,8 @@ pub struct Config {
     pub cmp_status_url: Option<String>,
     pub mcp_urls: Vec<String>,
     pub mcp_token_file: PathBuf,
+    pub mcp_rotate_url: Option<String>,
+    pub mcp_token_peer: Option<PathBuf>,
     pub threads: usize,
 }
 
@@ -102,6 +106,8 @@ impl Config {
             cmp_status_url: env("XBT_UI_CMP_STATUS_URL"),
             mcp_urls: env("XBT_UI_MCP_URL").map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default(),
             mcp_token_file: env("XBT_UI_MCP_TOKEN_FILE").map(PathBuf::from).unwrap_or_else(|| data_dir.join("secrets").join("mcp-http-token")),
+            mcp_rotate_url: env("XBT_UI_MCP_ROTATE_URL").map(|u| u.trim_end_matches('/').to_string()),
+            mcp_token_peer: env("XBT_UI_MCP_TOKEN_PEER").map(PathBuf::from),
             data_dir,
             threads: secs("XBT_UI_THREADS", 4) as usize,
         })
@@ -111,6 +117,7 @@ impl Config {
     pub fn for_test(signer_sock: PathBuf, data_dir: PathBuf, bind: &str) -> Self {
         Self { bind: bind.into(), signer_sock, data_dir, password: None, base_path: "/".into(), session_idle: Duration::from_secs(900),
                session_max: Duration::from_secs(28_800), secure_cookie: None, allow_ips: vec![], setup_open: false, hub_url: None, cmp_url: None,
-               cmp_status_url: None, mcp_urls: vec![], mcp_token_file: PathBuf::from("/nonexistent/mcp-http-token"), threads: 4 }
+               cmp_status_url: None, mcp_urls: vec![], mcp_token_file: PathBuf::from("/nonexistent/mcp-http-token"),
+               mcp_rotate_url: None, mcp_token_peer: None, threads: 4 }
     }
 }

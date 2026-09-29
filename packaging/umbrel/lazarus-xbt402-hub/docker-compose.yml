@@ -49,6 +49,8 @@ services:
       XBT_NODE_RPC_PORT: ${APP_XBT_KNOTS_RPC_PORT}
       # the 402's resource.url follows the address a client used (LAN, Tor, app_proxy)
       XBT_TRUST_FORWARDED: "1"
+      # umbrelOS gives every app, including this second one, a hidden service via app_proxy
+      XBT_HUB_ONION: ${APP_HIDDEN_SERVICE}
     ports:
       - "9480:9480"
     volumes:

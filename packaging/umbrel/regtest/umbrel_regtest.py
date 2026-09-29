@@ -37,7 +37,12 @@ PID = os.getpid()
 NET = f"agp040-umbrel-{PID}"
 APPS_DIR = os.path.join(OUT, "app-data")
 SEED = os.urandom(32).hex()
-P_MCP, P_HUB, P_UI, P_PROXY, P_PROV = 34010, 34020, 34030, 34080, 34040
+P_MCP = int(os.environ.get("UMBREL_TEST_MCP_PORT", "34010"))
+P_HUB = int(os.environ.get("UMBREL_TEST_HUB_PORT", "34020"))
+P_UI = int(os.environ.get("UMBREL_TEST_UI_PORT", "34030"))
+P_PROXY = int(os.environ.get("UMBREL_TEST_PROXY_PORT", "34080"))
+P_PROV = int(os.environ.get("UMBREL_TEST_PROV_PORT", "34040"))
+HUB_ONION = os.environ.get("UMBREL_TEST_HUB_ONION", "http://agp042-hub.onion")
 SIGN_BIN = os.path.join(ROOT, "dist/oci/ctx/bin/amd64/xbt-wallet-ui")
 KNOTS, WALLET, HUB = "lazarus-xbt-knots", "lazarus-xbt-agent-wallet", "lazarus-xbt402-hub"
 PROVIDER = "http://agp040-provider-%d:9500" % PID
@@ -71,6 +76,7 @@ def compose(app, *args, check_rc=True):
     # the node app's regtest profile: its exports say the chain is regtest (the only exported value the test changes)
     env = {**os.environ, **exports_env(INSTALLED), "APP_XBT_KNOTS_CHAIN": "regtest", "APP_DATA_DIR": data, "APP_SEED": derive(f"app-{app}-seed"),
            "APP_PASSWORD": app_password(app), "DEVICE_DOMAIN_NAME": "127.0.0.1", "DEVICE_HOSTNAME": "umbrel",
+           "APP_HIDDEN_SERVICE": HUB_ONION if app == HUB else "",
            "UMBREL_TEST_NET": NET, "UMBREL_TEST_CONF": HERE, "UMBREL_TEST_MCP_PORT": str(P_MCP), "UMBREL_TEST_UI_PORT": str(P_UI),
            "UMBREL_TEST_HUB_PORT": str(P_HUB)}
     return sh("docker", "compose", "--compatibility", "-p", app, "--project-directory", data,
@@ -250,6 +256,17 @@ def main():
     r2 = agent.tool("xbt402_pay", url=f"{PROVIDER}/v1/agp040", max_sats=1000)
     check("R", "a second paid call reuses the channel (no new open), 150 sat",
           r2.get("status") == 200 and r2.get("chan") == r1.get("chan") and not r2.get("opened") and r2.get("charged_sats") == 150, r2)
+    log("== W: rotate the agent token in the UI (no restart)")
+    ui2.post("/agents", "/rotate-token", {"confirm": "1"})
+    flash_rot = ui2.flash("/agents")
+    new_token, _ = mcp_token_from_ui(ui2)
+    disk_new = root_helper(wdata, "cat /d/mcp/secrets/mcp-http-token").stdout.strip()
+    ui_copy = root_helper(wdata, "cat /d/ui/secrets/mcp-http-token").stdout.strip()
+    st_old = Mcp(f"http://127.0.0.1:{P_MCP}", token).start()[0]
+    st_new = Mcp(f"http://127.0.0.1:{P_MCP}", new_token or "").start()[0]
+    check("W", "Agents page rotate: new token, UI copy matches MCP, old gets 401, new works, no restart",
+          "rotated" in flash_rot.lower() and new_token and new_token != token and new_token == disk_new == ui_copy
+          and st_old == 401 and st_new == 200, {"flash": flash_rot, "old": st_old, "new": st_new})
     time.sleep(6)
     wc = docker("run", "--rm", "--user", "0", "--network", "none", "-v", f"{wdata}/witness:/data/witness:ro", "-v", f"{wdata}/signer:/data/signer:ro",
                 "xbt-anchor-witness:0.1.0", "check", "--store", "/data/witness", "--log", "/data/signer/.run/signatures.jsonl", check_rc=False)
@@ -263,14 +280,24 @@ def main():
     hk = root_helper(os.path.join(APPS_DIR, HUB, "data"), "stat -c '%u:%g %a %n' /d/hub /d/hub/secrets/hub-payto-key /d/hub/secrets/node-rpc-auth").stdout
     check("H", "hub app: init gave data/hub to uid 10004; /readyz 200 (node synced); payTo key generated 0600",
           hub1["ok"] and "10004:10004 700 /d/hub" in hk and "10004:10004 600 /d/hub/secrets/hub-payto-key" in hk, {"readyz": hub1, "stat": hk})
+    w1 = hub1.get("wallet") or {}
+    addr = w1.get("receive_address") or ""
+    check("H", "hub created the node wallet named hub and persisted a receive address (no terminal)",
+          w1.get("name") == "hub" and addr.startswith("bcrt1"), w1)
+    check("H", "hub /readyz reports the Umbrel Tor onion (APP_HIDDEN_SERVICE on a second app)",
+          hub1.get("tor") == HUB_ONION, hub1.get("tor"))
     hp = ui2.get("/hub")  # the session from after the app restart
     check("H", "the wallet UI's Hub page reaches the hub app at lazarus-xbt402-hub_hub_1:9480 (the box network)",
           '<span class="tag ok">200</span> <code>/readyz</code>' in hp, hp[-800:])
+    check("H", "the Hub page shows the receive address and Tor onion (fund, no terminal)",
+          f'id="hub-receive">{addr}' in hp and f'id="hub-tor">{HUB_ONION}' in hp, hp[-800:])
     compose(HUB, "stop")
     compose(HUB, "up", "-d")
     wait_until(lambda: status(f"http://127.0.0.1:{P_HUB}/readyz") == 200, 120, "hub /readyz after restart")
     hub2 = json.loads(http("GET", f"http://127.0.0.1:{P_HUB}/readyz")[2])
-    check("H", "hub app restart: the same payTo", hub1["pay_to"] == hub2["pay_to"], [hub1["pay_to"], hub2["pay_to"]])
+    check("H", "hub app restart: the same payTo and the same receive address",
+          hub1["pay_to"] == hub2["pay_to"] and (hub2.get("wallet") or {}).get("receive_address") == addr,
+          [hub1["pay_to"], hub2["pay_to"], addr, (hub2.get("wallet") or {}).get("receive_address")])
 
     # --- G: readiness follows the node ------------------------------------------------------------------------
     log("== G: /readyz follows the node app")

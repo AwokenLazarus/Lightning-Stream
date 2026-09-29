@@ -503,7 +503,11 @@ fn the_hub_page_probes_this_box_s_hub() {
     let hub_addr = hub.server_addr().to_ip().unwrap();
     std::thread::spawn(move || {
         while let Ok(rq) = hub.recv() {
-            let (code, body) = if rq.url() == "/healthz" { (200, "{\"ok\":true,\"role\":\"hub\"}") } else { (404, "no") };
+            let (code, body) = match rq.url() {
+                "/healthz" => (200, "{\"ok\":true,\"role\":\"hub\"}"),
+                "/readyz" => (200, "{\"ok\":true,\"wallet\":{\"name\":\"hub\",\"loaded\":true,\"receive_address\":\"bcrt1qhubrecv\",\"balance_sats\":0},\"tor\":\"http://hubtest.onion\"}"),
+                _ => (404, "no"),
+            };
             let _ = rq.respond(tiny_http::Response::from_string(body).with_status_code(code));
         }
     });
@@ -513,6 +517,7 @@ fn the_hub_page_probes_this_box_s_hub() {
     let page = br.get("/hub").body;
     assert!(page.contains("<span class=\"tag ok\">on</span>") && page.contains("5000 ppm"), "{page}");
     assert!(page.contains("&quot;role&quot;:&quot;hub&quot;"), "the hub's /healthz is shown");
+    assert!(page.contains("id=\"hub-receive\">bcrt1qhubrecv") && page.contains("id=\"hub-tor\">http://hubtest.onion"), "{page}");
     assert!(!page.contains("XBT Compute"), "no cmp tile unless configured");
 }
 
@@ -534,7 +539,20 @@ fn the_agents_page_shows_the_mcp_endpoint_and_token_only_after_login() {
     std::fs::write(&tok, format!("{}\n", "ab".repeat(32))).unwrap();
     let page = br.get("/agents").body;
     assert!(page.contains(&"ab".repeat(32)) && page.contains("Bearer ") && page.contains("<details>"), "{page}");
-    assert!(page.contains("aria-current=\"page\">Agents"), "the nav marks the page");
+    assert!(page.contains("aria-current=\"page\">Agents") && page.contains("Rotate the token"), "{page}");
+    let r = br.act("/agents", "/rotate-token", &[("confirm", "1")]);
+    let flash = br.flash_after(&r);
+    assert!(flash.contains("Agent token rotated"), "{flash}");
+    let page = br.get("/agents").body;
+    let new = regex_token(&page);
+    assert_ne!(new, "ab".repeat(32));
+    assert_eq!(std::fs::read_to_string(&tok).unwrap().trim(), new);
+}
+
+fn regex_token(page: &str) -> String {
+    let i = page.find("<code id=\"mcp-token\">").expect("token on page");
+    let rest = &page[i + "<code id=\"mcp-token\">".len()..];
+    rest[..rest.find("</code>").unwrap()].to_string()
 }
 
 #[test]

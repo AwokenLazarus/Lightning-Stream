@@ -337,6 +337,28 @@ impl Secrets {
         }
     }
 
+    /// Overwrite an existing data-dir secret (or create it). Used to rotate `mcp-http-token`.
+    /// File 0600, directory 0700, fsynced. Refuses a path outside the secrets dir.
+    pub fn replace(&self, name: &str, bytes: &[u8]) -> Result<Secret, String> {
+        if name.is_empty() || name.contains('/') || name.contains('\0') {
+            return Err("secret name refused".into());
+        }
+        let dir = self.dir.as_ref().ok_or_else(|| format!("secret {name}: nowhere to write (set XBT_DATA_DIR)"))?;
+        ensure_dir(dir, 0o700).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let p = dir.join(name);
+        let tmp = dir.join(format!(".{name}.xbt-tmp"));
+        {
+            let mut f = open_private(&tmp, false).map_err(|e| format!("{}: {e}", tmp.display()))?;
+            f.write_all(bytes).and_then(|_| f.sync_all()).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        }
+        std::fs::rename(&tmp, &p).map_err(|e| format!("{}: {e}", p.display()))?;
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+        self.check_private(&p)?;
+        Ok(Secret { bytes: bytes.to_vec(), origin: Origin::DataDir(p) })
+    }
+
     fn check_private(&self, p: &Path) -> Result<(), String> {
         let m = mode_of(p);
         if self.mode.is_production() && cfg!(unix) && m & 0o077 != 0 {
@@ -551,6 +573,15 @@ mod tests {
         assert!(format!("{:?}", dev.get("t-one").unwrap().unwrap()).contains("5 bytes"));
         clear();
         assert!(Secrets::new(None, Mode::Production).get_or_create("t-one", Vec::new).unwrap_err().contains("nowhere to create"));
+        let d2 = tempfile::tempdir().unwrap();
+        let s2 = Secrets::for_component(Some(&DataDir::new(d2.path())), SIGNER, Mode::Production);
+        s2.get_or_create("t-one", || b"old".to_vec()).unwrap();
+        let r = s2.replace("t-one", b"new-token").unwrap();
+        assert_eq!(r.bytes, b"new-token");
+        assert_eq!(std::fs::read(d2.path().join("signer/secrets/t-one")).unwrap(), b"new-token");
+        #[cfg(unix)]
+        assert_eq!(mode_of(&d2.path().join("signer/secrets/t-one")), 0o600);
+        assert!(s2.replace("bad/name", b"x").is_err());
     }
 
     #[test]
