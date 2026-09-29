@@ -619,7 +619,7 @@ mod tests {
         assert_eq!(r.client(&fwd, Some(a)), Some("192.0.2.7".parse().unwrap()));
         // health is never rate limited
         assert_eq!(r.public("GET", "/relay/healthz", &[], Some(a)).status, 200);
-        assert_eq!(r.limiter.allow(a), false);
+        assert!(!r.limiter.allow(a));
     }
 
     #[test]

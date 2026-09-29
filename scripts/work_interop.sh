@@ -8,6 +8,8 @@
 #   scripts/work_interop.sh                         Rust payer  -> Rust provider   (default)
 #   PAYER=py  scripts/work_interop.sh               Python payer (xbt-063 flagship.pww_payer) -> Rust provider
 #   PROVIDER=py scripts/work_interop.sh             Rust payer  -> Python provider (xbt-063 flagship.server WorkRail)
+#   RELAY=py    scripts/work_interop.sh             the XBT-053 Python relay instead of the Rust xbt-work-relay (AGP-043;
+#                                                   the Rust relay is the default: primed pushes to its push listener)
 #
 # Everything else is the reference stack: isolated Knots 29.4.2 regtest (xbt-063 scripts/node.sh, BLAKE2b
 # from 101), primed built from ~/Bitcoin.worktrees/rnd-agp-011 (no source change), the stock C
@@ -23,6 +25,7 @@ X053=${XBT053:-$HOME/xbt-rnd/XBT-053}
 PRIMED=${PRIMED:-$HOME/Bitcoin.worktrees/rnd-agp-011/prime/target/release/primed}
 PAYER=${PAYER:-rust}
 PROVIDER=${PROVIDER:-rust}
+RELAY_IMPL=${RELAY:-rust}
 export FLAGSHIP_PORT_BASE=${WORK_PORT_BASE:-34100}
 BASE=$FLAGSHIP_PORT_BASE
 export XBT063_RUN=${WORK_RUN:-$ROOT/run/work-$BASE}
@@ -31,8 +34,8 @@ T=${CARGO_TARGET_DIR:-$HOME/xbt-rnd/xbt-rs-target}/release
 CALLS=${WORK_CALLS:-2}
 MINER_MAX_SECS=${WORK_MAX_SECS:-1500}
 RPC_A=$((BASE + 1)); RPC_B=$((BASE + 3))
-API=$((BASE + 12)); PRIME=$((BASE + 20)); STATS=$((BASE + 21)); STRATUM=$((BASE + 22)); GWAPI=$((BASE + 23)); RELAY=$((BASE + 24))
-PORTS=($RPC_A $((BASE + 2)) $RPC_B $((BASE + 4)) $API $PRIME $STATS $STRATUM $GWAPI $RELAY)
+API=$((BASE + 12)); PRIME=$((BASE + 20)); STATS=$((BASE + 21)); STRATUM=$((BASE + 22)); GWAPI=$((BASE + 23)); RELAY=$((BASE + 24)); PUSH=$((BASE + 25))
+PORTS=($RPC_A $((BASE + 2)) $RPC_B $((BASE + 4)) $API $PRIME $STATS $STRATUM $GWAPI $RELAY $PUSH)
 STAMP=$(date +%Y%m%d-%H%M%S)
 EVIDENCE=${WORK_EVIDENCE:-$ROOT/docs/work-interop-agp032-$(date +%F)-payer-$PAYER-provider-$PROVIDER.json}
 PY=$X063/.venv/bin/python
@@ -59,7 +62,7 @@ for f in "$PRIMED" "$X063/build/datum_gateway-fte" "$X063/build/stratum-grind"; 
   [ -x "$f" ] || { echo "missing $f (build primed in ~/Bitcoin.worktrees/rnd-agp-011/prime: cargo build --release -p primed)" >&2; exit 1; }
 done
 echo "== build the Rust tools (release, -j2)"
-nice -n 10 cargo build -q -j2 --release -p xbt-work --features tools --bins
+nice -n 10 cargo build -q -j2 --release -p xbt-work --features tools --bins -p xbt-work-relay
 cleanup
 rm -rf "${RUN:?}"; mkdir -p "$RUN/prime"
 python3 "$X063/tools/portcheck.py" wait --timeout 75 "${PORTS[@]}" || { echo "work_interop: ports busy" >&2; exit 1; }
@@ -72,8 +75,16 @@ POOLPAY=$(cli -rpcwallet=faucet getnewaddress pool bech32)
 PROVIDER_ID=$(cli -rpcwallet=faucet getnewaddress provider bech32)
 COOKIE_A=$RUN/node-a/regtest/.cookie; COOKIE_B=$RUN/node-b/regtest/.cookie
 
-echo "== blinded receipt relay (XBT-053 agp-011) on ${RELAY}"
-(cd "$X053" && exec python3 -m relay --host 127.0.0.1 --port "$RELAY") >"$RUN/relay.log" 2>&1 & PIDS+=($!)
+if [ "$RELAY_IMPL" = rust ]; then
+  echo "== blinded receipt relay (Rust xbt-work-relay) on ${RELAY}, pushes on ${PUSH}"
+  "$T/xbt-work-relay" --bind "127.0.0.1:${RELAY}" --push-bind "127.0.0.1:${PUSH}" --store "$RUN/relay-blobs" --rate 50 --burst 200 \
+      >"$RUN/relay.log" 2>&1 & PIDS+=($!)
+  RELAY_PUSH_URL="http://127.0.0.1:${PUSH}"
+else
+  echo "== blinded receipt relay (XBT-053 agp-011) on ${RELAY}"
+  (cd "$X053" && exec python3 -m relay --host 127.0.0.1 --port "$RELAY") >"$RUN/relay.log" 2>&1 & PIDS+=($!)
+  RELAY_PUSH_URL="http://127.0.0.1:${RELAY}"
+fi
 wait_http "http://127.0.0.1:${RELAY}/health" "receipt relay" 15
 
 echo "== primed ($(git -C "$(dirname "$PRIMED")/../.." rev-parse --short HEAD 2>/dev/null || echo ?), rnd/agp-011) on ${PRIME}/${STATS}"
@@ -98,7 +109,7 @@ network = "regtest"
 rpc = "http://127.0.0.1:${RPC_A}"
 rpc-cookie = "$COOKIE_A"
 poll = 0.5
-receipt-relay = "http://127.0.0.1:${RELAY}"
+receipt-relay = "${RELAY_PUSH_URL}"
 EOF
 "$PRIMED" -c "$RUN/prime.toml" check >/dev/null
 PRIME_PUB=$("$PRIMED" -c "$RUN/prime.toml" pubkey)
@@ -199,11 +210,12 @@ set +e; wait "$PAYER_PID"; rc=$?; set -e; PAYER_PID=""
 kill_miner "$MINER_PID"; MINER_PID=""
 cat "$RUN/payer.log"
 cp "$RUN/evidence.json" "$EVIDENCE"
-python3 - "$EVIDENCE" "$PAYER" "$PROVIDER" "$(git -C "$ROOT" rev-parse --short HEAD)" <<'EOF'
+python3 - "$EVIDENCE" "$PAYER" "$PROVIDER" "$(git -C "$ROOT" rev-parse --short HEAD)" \
+  "$([ "$RELAY_IMPL" = rust ] && echo "Rust xbt-work-relay (AGP-043)" || echo "XBT-053 agp-011")" <<'EOF'
 import json, sys
-p, payer, provider, head = sys.argv[1:]
+p, payer, provider, head, relay = sys.argv[1:]
 v = json.load(open(p))
-v["run"] = {"payer": payer, "provider": provider, "xbt_rs": head, "primed": "rnd/agp-011", "relay": "XBT-053 agp-011"}
+v["run"] = {"payer": payer, "provider": provider, "xbt_rs": head, "primed": "rnd/agp-011", "relay": relay}
 json.dump(v, open(p, "w"), indent=1)
 print(f"evidence: {p}  ({sum(c['ok'] for c in v['checks'])}/{len(v['checks'])} checks ok)")
 EOF

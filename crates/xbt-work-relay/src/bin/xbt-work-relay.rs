@@ -70,7 +70,7 @@ fn main() {
     let data = DataDir::from_env();
     let push_bind = opt(&args, "--push-bind", "XBT_RELAY_PUSH_BIND").unwrap_or_else(|| "127.0.0.1:9491".into());
     let push_bind = (push_bind != "off").then_some(push_bind);
-    let secrets = Secrets::for_component(data.as_ref(), "relay", mode);
+    let secrets = Secrets::for_component(data.as_ref(), xbt_svc::RELAY, mode);
     let push_token = secrets.get("relay-push-token").unwrap_or_else(|e| die(e))
         .map(|s| s.text().unwrap_or_else(|e| die(e)).trim().to_string()).filter(|t| !t.is_empty());
     if let Some(pb) = &push_bind {
@@ -84,7 +84,7 @@ fn main() {
     let store_dir = if args.iter().any(|a| a == "--memory") {
         None
     } else {
-        opt(&args, "--store", "XBT_RELAY_STORE").map(Into::into).or_else(|| data.as_ref().map(|d| d.component("relay").join("blobs")))
+        opt(&args, "--store", "XBT_RELAY_STORE").map(Into::into).or_else(|| data.as_ref().map(|d| d.component(xbt_svc::RELAY).join("blobs")))
     };
     let store = match &store_dir {
         Some(d) => Store::disk(d, max_entries, ttl).unwrap_or_else(|e| die(format!("store {}: {e}", d.display()))),

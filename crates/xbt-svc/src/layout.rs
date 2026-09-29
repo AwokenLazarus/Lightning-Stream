@@ -35,6 +35,7 @@ pub const COMPONENTS: &[Component] = &[
     Component { name: crate::MCP, user: "xbt-wallet-mcp", uid: 10003 },
     Component { name: crate::HUB, user: "xbt402-hub", uid: 10004 },
     Component { name: crate::UI, user: "xbt-wallet-ui", uid: 10005 },
+    Component { name: crate::RELAY, user: "xbt-work-relay", uid: 10006 },
 ];
 
 /// The socket dirs: (dir under `run/`, the component that serves it).
@@ -311,7 +312,7 @@ mod tests {
     #[test]
     fn table_matches_container_md() {
         let t: Vec<_> = COMPONENTS.iter().map(|c| (c.name, c.uid)).collect();
-        assert_eq!(t, vec![("signer", 10001), ("witness", 10002), ("mcp", 10003), ("hub", 10004), ("ui", 10005)]);
+        assert_eq!(t, vec![("signer", 10001), ("witness", 10002), ("mcp", 10003), ("hub", 10004), ("ui", 10005), ("relay", 10006)]);
     }
 
     #[test]

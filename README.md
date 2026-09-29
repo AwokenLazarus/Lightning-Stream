@@ -379,6 +379,32 @@ release and release-small, 1.8–2.5 MB self-test). The self-test runs natively 
 musl. Pure-Rust Ed25519 (`ed25519-dalek`) and ChaCha20-Poly1305 (RustCrypto); libsecp256k1 only
 through `xbt-primitives` (NTA BIP340).
 
+## xbt-work follow-ups: caps, the Rust relay, a live NTA leg (AGP-043)
+
+* **§13.1 credit caps.** `WorkConfig::caps` (`CreditCaps { per_invoice, total }`, work units) caps credit that
+  no passing audit covers yet. Receipted work beyond the caps is **held**: kept in the book, not spendable, and
+  credited once a coinbase audit passes above it. The audit intervals record every receipted increase whether
+  credited or held, so the audit bound never depends on the caps. Owed carry counts as unaudited credit too:
+  above `max_owed_carry_sats`, or growing over `carry_growth_blocks` audited blocks, no new credit is extended
+  until carry is released. A call the held work would have paid is refused with `credit_cap`, `carry_cap` or
+  `carry_growing` and the balances in `work` (`heldWork`, `unauditedWork`, the caps); the Rust payer reports
+  that as its error instead of paying again. Auditing a block again replaces its verdict and carry. Without caps
+  the book is the reference, byte for byte (the vectors are unchanged: 91/91 and 124/0).
+  `xbt-work-provider`: `--cap-invoice[-sats]`, `--cap-total[-sats]` (sats are converted at each epoch's price),
+  `--max-carry-sats`, `--carry-growth-blocks`, `--nta` (refuse an identity that is not key-path P2TR, §13.8),
+  `--audit-depth K` (audit every pool block K deep on its own), `GET /admin/xbt-work/report`.
+* **The Rust relay server.** `crates/xbt-work-relay`, binary and image `xbt-work-relay` (docs/CONTAINER.md §9): a
+  keyless store of exactly-1,052-byte blobs; a public GET-only listener (no listing, `no-store`, a token bucket
+  per client) and a separate push listener for the Prime (optional bearer token `relay-push-token`); one file
+  per lookup on disk, bounded by count and age. `scripts/work_interop.sh` now uses it by default (`RELAY=py` for
+  the XBT-053 relay); `scripts/relay_container_test.sh` tests the image.
+* **The live NTA leg.** `scripts/work_nta.sh` (ports 34300–34349, ~20 min): AGP-011's NTA regtest stack with the
+  Rust provider (`--nta`, caps 1/1, carry cap 10 XBT), the Rust payer and the Rust relay. A: paid, the cap holds
+  the new share (`credit_cap` live), the audit releases it. B: signer stopped, a signed `unattested` deferral
+  line, the Rust audit passes on it (a fraud proof without it), carry freezes new credit (`carry_cap` live). C:
+  paid with the carry, released. D: a pool block outside the invoice covers the rest. Then the payer's 19 checks.
+  42/42 on 2026-09-29 (`docs/work-nta-agp043-20260929-032035/`).
+
 ## Linking xbt-rs from cmp (AGP-035)
 
 xbt-compute's Rust runtime pins this repo by full rev with `default-features = false`. What that

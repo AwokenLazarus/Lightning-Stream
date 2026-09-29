@@ -10,7 +10,7 @@
 # datum_gateway (xbt-063-agp-011 run/cgw), XBT-053 nta.py/receipts.py (keys, and the Python relay client as a
 # cross-check). The Rust side: xbt-work-provider, xbt-work-payer, xbt-work-relay from this tree.
 #
-# Ports WORK_NTA_BASE..+99 (default 34300), preflighted. Datadirs under run/work-nta-<base>/. Every exit, pass or
+# Ports WORK_NTA_BASE..+49 (default 34300; it uses +1..+25), preflighted; the leftover-miner sweep covers only these. Datadirs under run/work-nta-<base>/. Every exit, pass or
 # fail, copies every log into docs/work-nta-agp043-<stamp>/ (WORK_NTA_OUT to override). The whole run is one
 # systemd-run --user scope (CPUQuota=200%, MemoryMax=4G, nice 19); cargo -j2; the miner 2 threads under `timeout`.
 set -euo pipefail
@@ -21,7 +21,7 @@ if [ -z "${WORK_NTA_SCOPED:-}" ]; then
     nice -n 19 bash "$ROOT/scripts/$(basename "$0")" "$@"
 fi
 BASE=${WORK_NTA_BASE:-34300}
-END=$((BASE + 99))
+END=$((BASE + 49))   # its own ports only (BASE..+25): a run beside it at +50 keeps its miner
 RUN=$ROOT/run/work-nta-$BASE
 STAMP=$(date +%Y%m%d-%H%M%S)
 OUT=${WORK_NTA_OUT:-$ROOT/docs/work-nta-agp043-$STAMP}

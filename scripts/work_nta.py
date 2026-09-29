@@ -157,19 +157,23 @@ def payees_and_atts(cb):
 
 
 # ------------------------------------------------------------------ HTTP
+def _body(b, raw):
+    if raw:
+        return b
+    try:
+        return json.loads(b) if b else {}
+    except ValueError:
+        return {"text": b.decode(errors="replace")}
+
+
 def http(url, body=None, method=None, timeout=15, raw=False):
     data = body if isinstance(body, (bytes, type(None))) else json.dumps(body).encode()
     req = urllib.request.Request(url, data, {"Content-Type": "application/json"} if data else {}, method=method)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            b = r.read()
-            return r.status, (b if raw else (json.loads(b) if b else {})), dict(r.headers)
+            return r.status, _body(r.read(), raw), dict(r.headers)
     except urllib.error.HTTPError as e:
-        b = e.read()
-        try:
-            return e.code, (b if raw else json.loads(b)), dict(e.headers)
-        except ValueError:
-            return e.code, {}, dict(e.headers)
+        return e.code, _body(e.read(), raw), dict(e.headers)
 
 
 def get(path):

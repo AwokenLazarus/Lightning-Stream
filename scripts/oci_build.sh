@@ -1,6 +1,6 @@
 #!/bin/bash
 # AGP-038: multi-arch OCI images of the agentpay services, saved locally (never pushed).
-#   xbt-signer, xbt-anchor-witness, xbt-wallet-mcp, xbt402-hub; AGP-040: xbt-wallet-ui, xbt-init
+#   xbt-signer, xbt-anchor-witness, xbt-wallet-mcp, xbt402-hub; AGP-040: xbt-wallet-ui, xbt-init; AGP-043: xbt-work-relay
 #   platforms linux/amd64, linux/arm64, linux/arm/v7, FROM scratch, static musl (zig), docs/CONTAINER.md
 #
 # Steps: build the static musl binaries for the three targets (release profile, cargo -j2 under the soak
@@ -12,20 +12,28 @@
 #
 # The Dockerfile has no RUN, so building the arm images needs no emulator (no binfmt, no qemu). The tool is
 # docker buildx through the docker group (no sudo); this host has no rootless Docker, podman or buildah.
-#   scripts/oci_build.sh [--load] [--skip-cargo]
+#   scripts/oci_build.sh [--load] [--skip-cargo] [--only IMAGE[,IMAGE...]]
+# The binaries come from $CARGO_TARGET_DIR (default target/). --only builds a subset (the base layer is shared,
+# so a subset's archives match the others only when built from the same mkbase.py).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
 LOAD=0
 CARGO=1
-for a in "$@"; do
-  case $a in
+ONLY=""
+while [ $# -gt 0 ]; do
+  case $1 in
     --load) LOAD=1 ;;
     --skip-cargo) CARGO=0 ;;
-    *) echo "usage: $0 [--load] [--skip-cargo]" >&2; exit 2 ;;
+    --only) ONLY=$2; shift ;;
+    *) echo "usage: $0 [--load] [--skip-cargo] [--only IMAGE[,IMAGE...]]" >&2; exit 2 ;;
   esac
+  shift
 done
-IMAGES=(xbt-signer xbt-anchor-witness xbt-wallet-mcp xbt402-hub xbt-wallet-ui xbt-init)
+IMAGES=(xbt-signer xbt-anchor-witness xbt-wallet-mcp xbt402-hub xbt-wallet-ui xbt-init xbt-work-relay)
+[ -n "$ONLY" ] && IMAGES=(${ONLY//,/ })
+TGT=${CARGO_TARGET_DIR:-target}
+want() { [[ " ${IMAGES[*]} " == *" $1 "* ]]; }
 # rust target -> buildx TARGETARCH+TARGETVARIANT
 declare -A ARCH=([x86_64-unknown-linux-musl]=amd64 [aarch64-unknown-linux-musl]=arm64 [armv7-unknown-linux-musleabihf]=armv7)
 PLATFORMS=linux/amd64,linux/arm64,linux/arm/v7
@@ -44,16 +52,21 @@ mkdir -p "$CTX"
 if [ $CARGO = 1 ]; then
   for t in "${!ARCH[@]}"; do
     echo "== cargo build --release --target $t"
-    "${SOAK[@]}" cargo build -q -j2 --release --target "$t" -p xbt-signer --bin xbt-signer --bin xbt-anchor-witness
-    "${SOAK[@]}" cargo build -q -j2 --release --target "$t" -p xbt-wallet-mcp
-    "${SOAK[@]}" cargo build -q -j2 --release --target "$t" -p xbt402 --features rpc,http-client,http-server --bin xbt402-hub
-    "${SOAK[@]}" cargo build -q -j2 --release --target "$t" -p xbt-wallet-ui -p xbt-svc --bin xbt-wallet-ui --bin xbt-init
+    if want xbt-signer || want xbt-anchor-witness; then
+      "${SOAK[@]}" cargo build -q -j2 --release --target "$t" -p xbt-signer --bin xbt-signer --bin xbt-anchor-witness
+    fi
+    if want xbt-wallet-mcp; then "${SOAK[@]}" cargo build -q -j2 --release --target "$t" -p xbt-wallet-mcp; fi
+    if want xbt402-hub; then "${SOAK[@]}" cargo build -q -j2 --release --target "$t" -p xbt402 --features rpc,http-client,http-server --bin xbt402-hub; fi
+    if want xbt-wallet-ui || want xbt-init; then
+      "${SOAK[@]}" cargo build -q -j2 --release --target "$t" -p xbt-wallet-ui -p xbt-svc --bin xbt-wallet-ui --bin xbt-init
+    fi
+    if want xbt-work-relay; then "${SOAK[@]}" cargo build -q -j2 --release --target "$t" -p xbt-work-relay --bin xbt-work-relay; fi
   done
 fi
 for t in "${!ARCH[@]}"; do
   mkdir -p "$CTX/bin/${ARCH[$t]}"
   for b in "${IMAGES[@]}"; do
-    f=target/$t/release/$b
+    f=$TGT/$t/release/$b
     [ -x "$f" ] || { echo "oci_build: $f missing (run without --skip-cargo)" >&2; exit 1; }
     file -b "$f" | grep -q "statically linked" || { echo "oci_build: $f is not static: $(file -b "$f")" >&2; exit 1; }
     cp "$f" "$CTX/bin/${ARCH[$t]}/$b"

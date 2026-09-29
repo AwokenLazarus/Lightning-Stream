@@ -24,6 +24,7 @@ tmpfs `/tmp`.
   mcp/             agp  uid 10003  0700  secrets/, mcp-payer.jsonl (local payer mode)
   hub/             agp  uid 10004  0700  hub.json (optional), state/, secrets/
   ui/              agp  uid 10005  0700  password.scrypt (the login hash), setup-code (first run only), secrets/
+  relay/           agp  uid 10006  0700  blobs/ (the xbt-work receipt relay's sealed blobs, one file each), secrets/
   cmp-node/        cmp  uid 10011  0700  operator key, operator service, merchant ledgers and meters, secrets/
   cmpd/            cmp  uid 10012  0700  device runtime state, secrets/
   cmpd-cache/      cmp  uid 10012  0700  the model span cache: LARGE, its own mount (CMP_CACHE_DIR), safe to prune
@@ -71,6 +72,7 @@ UID table (the images' `USER`; the cmp rows are reserved):
 | 10003 | xbt-wallet-mcp | xbt-wallet-mcp |
 | 10004 | xbt402-hub | xbt402-hub |
 | 10005 | xbt-wallet-ui | xbt-wallet-ui |
+| 10006 | xbt-work-relay | xbt-work-relay (AGP-043) |
 | 0 | root | xbt-init (a one-shot that exits; §8) |
 | 10011 | cmp-node | cmp-node (reserved) |
 | 10012 | cmpd | cmpd-* (reserved) |
@@ -103,6 +105,7 @@ the data dir, and in the env variable (upper-cased, `-` → `_`). Lookup order (
 | `mcp-http-token` | mcp | bearer token for MCP over HTTP (64 hex) | generated when listening off loopback (on a box, by `xbt-init`, which also copies it to `ui/secrets/` for the UI's Agents page) |
 | `xbt-ui-password` | ui | the UI login password, when the platform sets it (Umbrel `${APP_PASSWORD}`, via `xbt-init`); otherwise the UI's own first-run setup code | never generated |
 | `hub-payto-key` | hub | payTo secret (hex scalar) | generated |
+| `relay-push-token` | relay | bearer token the Prime's pushes must carry (any string) | never generated: set it, or `XBT_RELAY_PUSH_ALLOW_OPEN=1` for a push port only the Prime reaches |
 | `operator-passphrase` | cmp-node | cmp operator key passphrase (cmp.keys) | cmp's rule |
 | `client-passphrase` | cmp-client | cmp client identity passphrase (cmp.keys) | cmp's rule |
 
@@ -128,6 +131,7 @@ Every HTTP service serves these without auth (probes cannot send tokens). The bo
 | `xbt402-hub` | the node is reachable and synced; the body also gives `pay_to` and the provider count |
 | `xbt-signer` (socket only) | readiness **file** `run/signer/ready.json`, rewritten every `XBT_READY_INTERVAL` s (default 5), `ok` when all of these hold: node reachable and synced, keys unlocked, the witness answering `latest` (when anchoring is on), the signer's own socket answering `health` |
 | `xbt-anchor-witness` (socket only) | `xbt-anchor-witness healthcheck`: the witness answers `latest` |
+| `xbt-work-relay` | its blob store is writable (no node: the relay only stores what the Prime pushes) |
 
 **Why the signer has a readiness file, not a health listener.** The signer holds every key. A file adds
 no network surface at all, where a listener would add one, even on loopback. The file works in a
@@ -171,6 +175,7 @@ Every setting has an env variable. Files are optional.
 | signer | B2's `B2_*` env (unchanged), plus `XBT_NODE_RPC_HOST`, `XBT_NODE_RPC_PORT`, `XBT_CHAIN`, `XBT_NODE_WALLET`. Policy: `XBT_SIGNER_POLICY` (JSON; authoritative, and rewrites `policy.json` when it changes), or `XBT_SIGNER_POLICY_FILE`, or the existing `policy.json`, or a default that pays nobody. `XBT_ANCHOR=off` runs without a witness. New knobs: `B2_RPCHOST`, `B2_RPCCOOKIE` (a credentials file), `B2_SIGNER_SOCK_MODE` (≤ 660). |
 | witness | `XBT_WITNESS_DIR`, `XBT_ANCHOR_SOCK` (defaults under `/data`) |
 | MCP | `XBT_MCP_HTTP`, `XBT_MCP_PATH`, `XBT_BASE_PATH`, `XBT_MCP_HTTP_ALLOW_REMOTE`, the existing `XBT_MCP_*` payer settings, and `B2_SIGNER_SOCK` (default `/data/run/signer/signer.sock`) |
+| relay | `XBT_RELAY_BIND` (image `0.0.0.0:9490`, public, GET only), `XBT_RELAY_PUSH_BIND` (image `0.0.0.0:9491`, the Prime's pushes; `off`), `XBT_RELAY_STORE` (default `/data/relay/blobs`), `XBT_RELAY_RATE`/`_BURST` (GETs per second per client, default 10/40), `XBT_RELAY_MAX_ENTRIES` (1,000,000), `XBT_RELAY_TTL_DAYS` (30), `XBT_RELAY_THREADS`, `XBT_RELAY_PUSH_ALLOW_OPEN`, `XBT_BASE_PATH`, `XBT_TRUST_FORWARDED` (count clients by the proxy's `X-Forwarded-For` hop) |
 | hub | `hub.json` (`--config`, `XBT_HUB_CONFIG`, or `/data/hub/hub.json`), each field overridable: `XBT_NODE_RPC_HOST`, `XBT_NODE_RPC_PORT`, `XBT_HUB_WALLET`, `XBT_HUB_NETWORK` (default: derived from the node's anchor block), `XBT_HUB_BIND`, `XBT_HUB_PORT`, `XBT_HUB_DATADIR`, `XBT_HUB_CONNECT`, `XBT_HUB_JSON`, `XBT_HUB_WATCH_INTERVAL`, `XBT_HUB_THREADS`, `XBT_PUBLIC_URL`, `XBT_TRUST_FORWARDED` |
 
 None of these binaries depends on systemd. `$CREDENTIALS_DIRECTORY` is just one secret source.
@@ -178,7 +183,8 @@ None of these binaries depends on systemd. `$CREDENTIALS_DIRECTORY` is just one 
 ## 6. Images
 
 `scripts/oci_build.sh` builds one image per binary for **linux/amd64, linux/arm64 and linux/arm/v7**:
-`xbt-signer`, `xbt-anchor-witness`, `xbt-wallet-mcp`, `xbt402-hub`, `xbt-wallet-ui` and `xbt-init`. Each
+`xbt-signer`, `xbt-anchor-witness`, `xbt-wallet-mcp`, `xbt402-hub`, `xbt-wallet-ui`, `xbt-init` and (AGP-043)
+`xbt-work-relay` (`--only IMAGE,...` builds a subset; the binaries come from `$CARGO_TARGET_DIR`). Each
 is `FROM scratch` with the static musl binary (built with zig). There is no `RUN`, so no emulator or
 binfmt is needed. The images are saved as OCI archives in `dist/oci/*.tar` (never pushed), with digests
 and sizes in `dist/oci/IMAGES.md`. `scripts/oci_inspect.py` checks every platform: architecture, static
@@ -281,3 +287,41 @@ Run it with `user: 0:0`, `network_mode: none`, `read_only`, `cap_drop: ALL` + `C
 table and the secret rules with the services, `FROM scratch` like every other image, for amd64, arm64 and
 arm/v7. A busybox shell script would need a base image pulled from a registry and would duplicate the layout
 in shell. Go would add a second toolchain for 300 lines.
+
+## 9. The xbt-work receipt relay (AGP-043)
+
+`xbt-work-relay` (crate `xbt-work-relay`, image `xbt-work-relay`, uid 10006) is the blinded receipt relay of
+pay-with-work (xbt-work spec §11.1): the Prime pushes each invoice's latest signed receipt, sealed with a key only a
+holder of the invoice can derive, and payers and providers fetch it by a 256-bit lookup. The relay holds no key and
+parses nothing.
+
+- **Two listeners.** `9490` is public and read-only: `GET /<lookup>` (also `/work-receipts/v1/<lookup>`, the Python
+  reference's path) → `200` with the blob or `404`. `9491` takes the Prime's `PUT /<lookup>` (and `DELETE` to retire an
+  invoice) and belongs on a private network. A push needs `Authorization: Bearer <relay-push-token>` when the secret
+  is set. Without one, a push listener off loopback is refused at start unless `XBT_RELAY_PUSH_ALLOW_OPEN=1` (primed
+  `rnd/agp-011` sends no token yet, so its push port must be reachable only from the Prime).
+- **What the spec asks of it.** Blobs must be exactly 1,052 bytes (nonce + `pad₁₀₂₄` + tag), so every entry has one
+  size. There is no listing route and `GET /` is `404`. Every response carries `Cache-Control: no-store`. GETs are
+  rate-limited per client (a token bucket per address). No lookup is ever logged, only counters every 5 minutes.
+- **Store.** One file per lookup under `/data/relay/blobs/<lookup[..2]>/<lookup>`, 0600, written through a temp file and a
+  rename. It needs no in-memory index and survives a restart. It is bounded by `XBT_RELAY_MAX_ENTRIES` (a push of a new
+  lookup beyond it is `507`) and by `XBT_RELAY_TTL_DAYS` (an entry not pushed again for that long expires and is swept).
+- `/healthz`, `/readyz` (the store is writable), `/health` (the Python relay's probe), and `xbt-work-relay healthcheck
+  [--ready]` for the image's HEALTHCHECK.
+- Tests: `cargo test -p xbt-work-relay` (the store, the listeners, the token, the rate limit, and an HTTP round trip with
+  the Rust relay client); `scripts/relay_container_test.sh` (the amd64 image on Docker); `scripts/work_nta.sh` (primed
+  pushing to it live on an NTA regtest chain).
+
+**Language and architecture: Rust (chosen).**
+
+| option | performance, smallest target | reach | install | safety | fit | maintain |
+|---|---|---|---|---|---|---|
+| **Rust + tiny_http, one static binary (chosen)** | 0.83–0.88 MB static binary, ~0.45 MB compressed image; threads, no GC, no runtime | amd64, arm64, arm/v7 images; every AGP-031 target | `FROM scratch`, like every other image; or one binary on bare metal | memory-safe; parses only a path and a length-checked body | shares `xbt-svc` (data dir, secrets, probes, base path) with the other services; tested against the Rust relay client in-process | the same workspace and CI as the rails |
+| Python (XBT-053 `relay/`, kept as the reference) | an interpreter per box; in-memory only | wherever Python runs | a Python base image (~50 MB) and a venv | memory-safe | the reference, but no token, no size check, no rate limit, no persistence | a second service stack to maintain |
+| Go | small static binary, GC | wide | `FROM scratch` possible | memory-safe | would duplicate the data-dir and secret rules in a new language | a second toolchain |
+| A Cloudflare Worker + KV | no box at all | global edge | a Cloudflare account | memory-safe | a third party sees every lookup and its timing; unavailable to a box-only operator | a separate deployment path |
+| nginx / Caddy serving a directory, WebDAV for pushes | small | wide | a stock image | mature | cannot enforce the exact blob size, would need care to hide the directory listing, and adds an image pulled from a registry | configuration, not code |
+
+A relay is a small keyless blob store, so the choice follows the other services: the widest hardware reach with the
+smallest image, no base image to pull, and the same secret and data-dir rules. The Python relay stays as the
+reference, and each is tested against the other side's client.

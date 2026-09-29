@@ -63,6 +63,8 @@ pub const MCP: &str = "mcp";
 pub const HUB: &str = "hub";
 /// The wallet's web UI (AGP-039): its login hash, setup code and secrets.
 pub const UI: &str = "ui";
+/// The xbt-work blinded receipt relay (AGP-043): its blob store and push token.
+pub const RELAY: &str = "relay";
 /// The socket directory of the signer (`signer.sock`, `ready.json`) and of the witness (`anchor.sock`).
 pub const RUN_SIGNER: &str = "signer";
 pub const RUN_ANCHOR: &str = "anchor";
