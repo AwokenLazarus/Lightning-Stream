@@ -374,9 +374,8 @@ fn main() {
     let c1 = payer.close().expect("close ch1");
     let mut closes = vec![];
     for n in NAMES {
-        let oc = ch2(n);
-        if oc.state == "open" {
-            // B's ch2 is A's: closed once
+        // B's ch2 is A's: closed once
+        if let Some(oc) = hub.ch2_for(&urls[n]).filter(|c| c.state == "open") {
             closes.push((if n == "A" { "A+B" } else { n }, hub.close_ch2(&oc, false).expect("close ch2")));
         }
     }

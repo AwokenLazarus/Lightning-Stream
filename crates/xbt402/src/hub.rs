@@ -372,7 +372,7 @@ impl OutBook {
 
     /// The live ch2 (funding, funded or open) to `pay_to`, by key.
     pub fn live_for_pay_to(&self, pay_to: &str) -> Option<String> {
-        self.chans.iter().find(|(_, c)| c.pay_to == pay_to && LIVE.contains(&c.state.as_str())).map(|(k, _)| k.clone())
+        self.chans.iter().find(|(_, c)| c.pay_to.eq_ignore_ascii_case(pay_to) && LIVE.contains(&c.state.as_str())).map(|(k, _)| k.clone())
     }
 
     /// The key of the ch2 that serves `origin` (canonical): its own record while live, else the live
@@ -1192,7 +1192,7 @@ impl RouteHub {
     /// wallet runs, and the cap check and that record are one step under the book's lock.
     fn fund_ch2(&self, origin: &str, terms: &Value, cap: u64, expiry: u32) -> Result<OutChannel> {
         let secret = adaptor::random_secret();
-        let pay_to = terms.get("payTo").and_then(Value::as_str).ok_or_else(|| ChannelError::new("bad_offer", "payTo"))?.to_lowercase();
+        let pay_to = terms.get("payTo").and_then(Value::as_str).ok_or_else(|| ChannelError::new("bad_offer", "payTo"))?.to_string();
         let ex = terms.get("extra").cloned().unwrap_or(Value::Null);
         let close_fee = py_u64(ex.get("closeFeeSat")).ok_or_else(|| ChannelError::new("bad_offer", "closeFeeSat"))?;
         let mut p = ChannelParams::derive(&hex::decode(&pay_to).map_err(|_| ChannelError::new("bad_offer", "payTo"))?, &ecdsa::pubkey(&secret),
