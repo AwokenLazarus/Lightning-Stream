@@ -1,6 +1,6 @@
-// AGP-039: the browser crypto in assets/ui.js against published vectors.
+// AGP-039 / AGP-041: the browser crypto in assets/ui.js against published vectors.
 //   node crypto_test.mjs          RFC 8032 ed25519, FIPS 180 / RFC 4231 SHA-512 and HMAC, PBKDF2 (Python hashlib),
-//                                 the PIN wrap round trip; exits 1 on a mismatch
+//                                 passphrase rules, the wrap round trip, and 60k → 210k migration
 //   node crypto_test.mjs emit     JSON: every signed message kind signed with a fixed seed, for
 //                                 tests/crypto_js.rs to check against xbt_signer::approval and ed25519-dalek
 import { createRequire } from "node:module";
@@ -54,16 +54,44 @@ for (const [sk, pk, m, sig] of V) {
   eq("ed25519 pub " + pk.slice(0, 8), hex(W.publicKey(unhex(sk))), pk);
   eq("ed25519 sig " + pk.slice(0, 8), hex(W.sign(unhex(sk), unhex(m))), sig);
 }
-// the PIN wrap
+// passphrase strength (AGP-041)
+eq("short refused", W.passphraseStrength("short-pass").ok ? "ok" : W.passphraseStrength("short-pass").reason,
+   "the passphrase needs at least 12 characters");
+eq("all-digit refused", W.passphraseStrength("123456789012").ok ? "ok" : W.passphraseStrength("123456789012").reason,
+   "the passphrase cannot be only digits");
+eq("spaced digits refused", W.passphraseStrength("1234 5678 9012").ok ? "ok" : "refused", "refused");
+eq("repeated refused", W.passphraseStrength("abababababab").ok ? "ok" : W.passphraseStrength("abababababab").reason,
+   "the passphrase cannot be a repeated pattern");
+eq("same-char refused", W.passphraseStrength("aaaaaaaaaaaa").ok ? "ok" : "refused", "refused");
+eq("good passphrase", String(W.passphraseStrength("wallet-pass-41").ok), "true");
+eq("default iter", String(W.ITER), "210000");
+eq("legacy iter", String(W.LEGACY_ITER), "60000");
+// the wrap (new parameters) and a wrong passphrase
 const seed = unhex("42".repeat(32));
+const pass = "wallet-pass-41";
 const t0 = Date.now();
-const w = W.wrap(seed, "correct pin");
+const w = W.wrap(seed, pass);
 const ms = Date.now() - t0;
-eq("unwrap", hex(W.unwrap(w, "correct pin")), hex(seed));
+eq("new wrap iter", String(w.iter), "210000");
+eq("unwrap", hex(W.unwrap(w, pass)), hex(seed));
 let refused = false;
-try { W.unwrap(w, "wrong pin"); } catch (e) { refused = e.message === "wrong PIN"; }
-eq("wrong pin refused", String(refused), "true");
+try { W.unwrap(w, "wrong passphrase!!"); } catch (e) { refused = e.message === "wrong passphrase"; }
+eq("wrong passphrase refused", String(refused), "true");
+// migration: an AGP-039 wrap (60k) unlocks once and is re-wrapped at 210k
+const tLegacy = Date.now();
+const old = W.wrap(seed, "correct pin", W.LEGACY_ITER);
+const legacyMs = Date.now() - tLegacy;
+eq("legacy wrap iter", String(old.iter), "60000");
+eq("legacy needs migrate", String(W.needsMigrate(old)), "true");
+eq("new wrap no migrate", String(W.needsMigrate(w)), "false");
+const tMig = Date.now();
+const unlocked = W.unlock(old, "correct pin");
+const migMs = Date.now() - tMig;
+eq("legacy unwrap", hex(unlocked.seed), hex(seed));
+eq("migrated flag", String(unlocked.migrated), "true");
+eq("migrated iter", String(unlocked.wrapped.iter), "210000");
+eq("unlock after migration", hex(W.unwrap(unlocked.wrapped, "correct pin")), hex(seed));
 const t1 = Date.now();
 W.sign(seed, utf8("x"));
-console.log(`crypto_test: ${n - fail}/${n} vectors OK; PIN wrap (${w.iter} PBKDF2 iterations) ${ms} ms, one signature ${Date.now() - t1} ms`);
+console.log(`crypto_test: ${n - fail}/${n} vectors OK; wrap ${w.iter} iter ${ms} ms, legacy ${old.iter} ${legacyMs} ms, migrate+rewrap ${migMs} ms, one signature ${Date.now() - t1} ms`);
 process.exit(fail ? 1 : 0);

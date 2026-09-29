@@ -69,6 +69,10 @@ summary { cursor: pointer; color: var(--accent); }
 .msg { margin: 6px 0; }
 .msg.bad { color: var(--bad); }
 .msg.ok { color: var(--ok); }
+.hint { margin: 0 0 8px; font-size: 0.9em; color: var(--muted); }
+.hint.warn { color: var(--warn); }
+.hint.bad { color: var(--bad); }
+.hint.ok { color: var(--ok); }
 .empty { color: var(--muted); font-style: italic; }
 .small { color: var(--muted); font-size: 0.85em; }
 .scroll { overflow-x: auto; }

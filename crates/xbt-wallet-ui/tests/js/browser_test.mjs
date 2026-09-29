@@ -86,29 +86,48 @@ try {
   await ev("document.getElementById('keygen-new').click()");
   const backup = await ev("document.getElementById('keygen-backup').textContent");
   check("a 64-hex backup is shown", /^[0-9a-f]{64}$/.test(backup), backup);
-  await set("#keygen-confirm", backup.slice(-8)); await set("#keygen-pin", "246810"); await set("#keygen-pin2", "246810");
+  await set("#keygen-confirm", backup.slice(-8));
+  await set("#keygen-pin", "246810"); await set("#keygen-pin2", "246810");
   await ev("document.getElementById('keygen-save').click()");
-  for (let i = 0; i < 200 && !(await ev("document.getElementById('keygen-msg').textContent")).includes("Saved"); i++) await sleep(50);
+  await sleep(100);
+  const weakMsg = await ev("document.getElementById('keygen-msg').textContent");
+  check("a weak passphrase is refused", /at least 12 characters|only digits|repeated pattern/.test(weakMsg), weakMsg);
+  const hint = await ev("document.getElementById('keygen-strength').textContent");
+  check("a strength hint is shown", /12 characters|only digits|Strength:/.test(hint), hint);
+  const PASS = "wallet-pass-41";
+  await set("#keygen-pin", PASS); await set("#keygen-pin2", PASS);
+  await ev("document.getElementById('keygen-save').click()");
+  for (let i = 0; i < 400 && !(await ev("document.getElementById('keygen-msg').textContent")).includes("Saved"); i++) await sleep(50);
   const stored = await ev("localStorage.getItem('xbt-wallet-human-key-v1')");
   check("the key is stored encrypted in the browser, not in the clear", stored && !stored.includes(backup), stored);
   const pub = JSON.parse(stored).pub;
+  check("a new wrap uses 210000 PBKDF2 iterations", JSON.parse(stored).iter === 210000, stored);
   await shot("02-setup-key", 1100);
   await submitAndWait("document.getElementById('enroll-form').submit()");
   check("the public key is enrolled", (await flash()).includes("Approval key enrolled"), await flash());
   check("the page knows this browser holds the enrolled key", (await ev("document.getElementById('browser-key').textContent")).includes("holds the enrolled"));
-  // 3. approve the waiting call: signed in the page with the PIN
+  // 3. plant an AGP-039 (60k) wrap of the same seed, then approve: unlocks, migrates, unlocks again later
+  const planted = await ev(`(function(){
+    var seed = XbtWallet.unhex(${JSON.stringify(backup)});
+    var w = XbtWallet.wrap(seed, ${JSON.stringify(PASS)}, XbtWallet.LEGACY_ITER);
+    XbtWallet.saveKey(w);
+    return JSON.parse(localStorage.getItem(XbtWallet.STORE)).iter;
+  })()`);
+  check("a 60k wrap was planted for migration", planted === 60000, String(planted));
   await go("/approvals");
   await shot("03-approvals", 1100);
   await shot("03-approvals-phone", 390);
   const wrongPin = async () => {
-    await set("form[data-sign=approve] input.pin", "000000");
+    await set("form[data-sign=approve] input.pin", "000000000000");
     await ev("document.querySelector('form[data-sign=approve] button[type=submit]').click()");
-    for (let i = 0; i < 100; i++) { await sleep(50); const m = await ev("document.querySelector('form[data-sign=approve] .sign-msg').textContent"); if (m && m !== "signing…") return m; }
+    for (let i = 0; i < 200; i++) { await sleep(50); const m = await ev("document.querySelector('form[data-sign=approve] .sign-msg').textContent"); if (m && m !== "signing…") return m; }
   };
-  check("a wrong PIN is refused in the browser", (await wrongPin()) === "wrong PIN");
-  await set("form[data-sign=approve] input.pin", "246810");
+  check("a wrong passphrase is refused in the browser", (await wrongPin()) === "wrong passphrase");
+  await set("form[data-sign=approve] input.pin", PASS);
   await submitAndWait("document.querySelector('form[data-sign=approve] button[type=submit]').click()");
   check("approved in the UI", (await flash()).startsWith("Approved."), await flash());
+  const after = await ev("JSON.parse(localStorage.getItem('xbt-wallet-human-key-v1')).iter");
+  check("the 60k wrap migrated to 210000 on unlock", after === 210000, String(after));
   // 4. a policy change, signed in the page
   await go("/policy?template=starter");
   await shot("04-policy", 1100);
@@ -117,14 +136,15 @@ try {
   await submitAndWait("document.querySelector('form.policy').submit()");
   check("the review shows the text to sign", await ev("!!document.querySelector('pre.signed-text')"));
   await shot("05-policy-review", 1100);
-  await set("form[data-sign=policy] input.pin", "246810");
+  await set("form[data-sign=policy] input.pin", PASS);
   await submitAndWait("document.querySelector('form[data-sign=policy] button[type=submit]').click()");
   check("the signed policy is applied", (await flash()).startsWith("Policy applied"), await flash());
+  check("unlock after migration still works", (await ev("JSON.parse(localStorage.getItem('xbt-wallet-human-key-v1')).iter")) === 210000);
   // 5. a tampered review is refused before signing
   await go("/policy");
   await submitAndWait("document.querySelector('form.policy').submit()");
   await ev("document.querySelector('pre.signed-text').textContent += ' '");
-  await set("form[data-sign=policy] input.pin", "246810");
+  await set("form[data-sign=policy] input.pin", PASS);
   await ev("document.querySelector('form[data-sign=policy] button[type=submit]').click()");
   await sleep(300);
   check("text shown != text signed is refused", (await ev("document.querySelector('form[data-sign=policy] .sign-msg').textContent")).includes("refused"));

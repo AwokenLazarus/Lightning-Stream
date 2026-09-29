@@ -77,10 +77,13 @@ but they add proc-macro dependencies for about 15 pages. Everything user-control
   `backup_export`), not trust in the UI. A compromised UI process or MCP process cannot raise the
   budget or approve a payment.
 - **Where the approving key lives: in the owner's browser.** The key is generated there with
-  `crypto.getRandomValues` and kept in `localStorage`, XORed with a PBKDF2-HMAC-SHA512 pad of a PIN
-  (60,000 iterations) and a MAC. The owner writes down its 64-hex backup once. Only the public key
-  goes to the box (`human_key_enroll`, trust on first use while no key is enrolled; after that,
-  `human_key_rotate` signed by the old key).
+  `crypto.getRandomValues` and kept in `localStorage`, XORed with a PBKDF2-HMAC-SHA512 pad of a
+  passphrase (210,000 iterations, OWASP 2023+) and a MAC. New passphrases must be at least 12
+  characters and are refused if they are only digits or a repeated pattern; the page shows a
+  strength hint. A wrap stored at the AGP-039 cost (60,000) unlocks once and is re-wrapped at
+  210,000. The owner writes down its 64-hex backup once. Only the public key goes to the box
+  (`human_key_enroll`, trust on first use while no key is enrolled; after that, `human_key_rotate`
+  signed by the old key).
 
   The message is signed in the page. `ui.js` rebuilds it from the fields shown; for a policy, it
   signs the text shown, and refuses if the displayed text differs.
@@ -95,6 +98,17 @@ but they add proc-macro dependencies for about 15 pages. Everything user-control
   | WebAuthn/passkeys | Needs a secure context (https or localhost), and Umbrel is plain http on the LAN. Authenticators sign `authenticatorData ‖ clientDataHash` with P-256 bound to an origin, not our ed25519 message, so the signer would need a WebAuthn verifier and an origin that changes with .onion and LAN names. |
   | WebCrypto Ed25519 | Also secure-context only. Pure JS works everywhere: `tests/js/crypto_test.mjs` checks it against RFC 8032, RFC 4231 and hashlib vectors, and `tests/crypto_js.rs` checks it against the signer's bytes and ed25519-dalek. |
   | a separate phone app | The strongest isolation, but a second app to build and ship. The paste-a-signature path supports it today. |
+
+  KDF options for the wrap (AGP-041; measured on Node, Ryzen 9 9950X3D):
+
+  | option | unlock (this host) | phone / Pi-served page | reach | install | safety | choice |
+  |---|---|---|---|---|---|---|
+  | **PBKDF2-SHA512 210k, already in ui.js** | 2.7 s | ~4–7 s estimated (over the ~2 s goal) | every browser, including plain-http Umbrel | none; the script is already there | OWASP 2023+; hashlib-tested | **chosen** |
+  | PBKDF2-SHA512 60k (AGP-039) | 1.0 s | ~2–3 s | same | same | a 6-digit PIN is offline-bruteforceable | kept only as the migration source |
+  | scrypt / argon2id in new pure JS | unknown; OWASP scrypt is 128 MB | worse on a phone tab | same if we write it | thousands of unaudited lines, no CDN | memory-hard, but new primitives (SHA-256, Salsa20) | rejected: no in-tree implementation, large audit surface |
+  | WebCrypto PBKDF2 only | tens of ms | tens of ms | **secure context only** (https / localhost); Umbrel LAN is http | none | same count, native speed | rejected as the only path; Umbrel has no SubtleCrypto |
+
+  The wrap stays pure JS so a phone on a Pi-served Umbrel page still unlocks. 210k in that JS is slower than ~2 s on a mid-range phone; that is the cost of OWASP's count without a CDN or a new KDF.
 
   The trade-off: the key protects against the model and agents, against a stolen or compromised box
   disk, and against the signer and MCP processes. It does not protect against a fully compromised

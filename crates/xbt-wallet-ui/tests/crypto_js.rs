@@ -21,7 +21,13 @@ fn ui_js_vectors() {
     let Some(o) = run(&[]) else { return eprintln!("node not found: skipped") };
     let out = String::from_utf8_lossy(&o.stdout);
     assert!(o.status.success(), "{out}{}", String::from_utf8_lossy(&o.stderr));
-    assert!(out.contains("18/18 vectors OK"), "{out}");
+    assert!(out.contains("vectors OK"), "{out}");
+    let start = out.find("crypto_test: ").expect(&out) + "crypto_test: ".len();
+    let score = out[start..].split(" vectors").next().expect(&out);
+    let (got, want) = score.split_once('/').expect(&out);
+    assert_eq!(got, want, "a vector failed: {out}");
+    let total: u32 = want.parse().expect(score);
+    assert!(total >= 25, "expected the AGP-041 vectors, got {score}: {out}");
 }
 
 #[test]

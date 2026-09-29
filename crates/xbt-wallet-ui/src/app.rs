@@ -237,7 +237,7 @@ impl App {
         }
         format!("<form method=\"post\" action=\"{action}\" data-sign=\"{kind}\" data-human=\"{}\" class=\"signed\">{}{h}{visible}\
                  <input type=\"hidden\" name=\"signature\" value=\"\">\
-                 <div class=\"row\"><input class=\"pin\" type=\"password\" autocomplete=\"off\" inputmode=\"text\" placeholder=\"Key PIN\" aria-label=\"Key PIN\">\
+                 <div class=\"row\"><input class=\"pin\" type=\"password\" autocomplete=\"off\" inputmode=\"text\" placeholder=\"Key passphrase\" aria-label=\"Key passphrase\">\
                  <button type=\"submit\">{}</button></div><p class=\"sign-msg\" aria-live=\"polite\"></p>\
                  {}</form>",
                 esc(human), Self::csrf_input(ctx), esc(button), message.html())
@@ -797,14 +797,16 @@ impl App {
         };
         format!("<div id=\"keygen\" class=\"card\"><h3>An approval key in this browser</h3>\
             <p>The key is made here and never sent to the box; only its public half is. It is kept in this browser's storage, \
-            encrypted under a PIN. Write the backup down: it is the only copy.</p>\
+            encrypted under a passphrase. Write the backup down: it is the only copy.</p>\
             <p><button type=\"button\" id=\"keygen-new\">Make a new key</button></p>\
             <details><summary>…or restore a key from its backup</summary><input id=\"keygen-import-hex\" class=\"mono\" placeholder=\"64 hex characters\" autocomplete=\"off\">\
             <button type=\"button\" id=\"keygen-import\">Use this key</button></details>\
             <div id=\"keygen-step2\" hidden><p>Backup (keep it offline):</p><pre id=\"keygen-backup\" class=\"hex\"></pre>\
             <label>Type its last 8 characters<input id=\"keygen-confirm\" autocomplete=\"off\"></label>\
-            <label>PIN for this browser (at least 6 characters)<input id=\"keygen-pin\" type=\"password\" autocomplete=\"new-password\"></label>\
-            <label>PIN again<input id=\"keygen-pin2\" type=\"password\" autocomplete=\"new-password\"></label>\
+            <label>Passphrase for this browser (at least 12 characters, not only digits or a repeated pattern)\
+            <input id=\"keygen-pin\" type=\"password\" autocomplete=\"new-password\" minlength=\"12\"></label>\
+            <p id=\"keygen-strength\" class=\"hint\" aria-live=\"polite\">At least 12 characters, not only digits, not a repeated pattern.</p>\
+            <label>Passphrase again<input id=\"keygen-pin2\" type=\"password\" autocomplete=\"new-password\" minlength=\"12\"></label>\
             <button type=\"button\" id=\"keygen-save\">Save the key in this browser</button></div>\
             <p id=\"keygen-msg\" class=\"msg\" aria-live=\"polite\"></p>{enroll_form}\
             <p><button type=\"button\" id=\"keygen-forget\" class=\"link\">Remove the key from this browser</button></p></div>")
@@ -828,7 +830,7 @@ impl App {
             b.push_str("<details><summary>Put the enrolled key in this browser (from its backup)</summary>");
             b.push_str(&self.keygen_block(ctx, false));
             b.push_str("</details><details><summary>Replace the approval key</summary><p>A new key is made in this browser, and the \
-                current one signs the handover. The new key is kept under the same PIN; write its backup down from the key page afterwards.</p>");
+                current one signs the handover. The new key is kept under the same passphrase; write its backup down from the key page afterwards.</p>");
             b.push_str(&self.signed_form(ctx, "./human-key-rotate", "human-key", &human, &[("old_pub", human.clone()), ("pubkey", String::new()),
                                          ("expiry", exp.to_string())], "", "Make a new key and hand over", Ext::Browser));
             b.push_str("</details>");

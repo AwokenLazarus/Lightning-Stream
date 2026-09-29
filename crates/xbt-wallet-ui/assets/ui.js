@@ -1,7 +1,9 @@
-// xbt-wallet-ui (AGP-039): the human's ed25519 key lives in this browser, never on the box.
+// xbt-wallet-ui (AGP-039, AGP-041): the human's ed25519 key lives in this browser, never on the box.
 // Pure JavaScript: WebCrypto is only there in a secure context, and a box is often plain http on the
 // LAN or an .onion. SHA-512, HMAC, PBKDF2 and ed25519 (RFC 8032) below; tests/js/crypto_test.mjs
 // checks them against RFC 8032 and RFC 4231 vectors and against the signer (ed25519-dalek).
+// AGP-041: wrap the seed under a passphrase (≥12, not all-digit, not a repeated pattern) with
+// PBKDF2-SHA512 at 210,000 iterations (OWASP). A 60k wrap unlocks once and is re-wrapped.
 "use strict";
 (function (root) {
   // ---- bytes ------------------------------------------------------------------------------------
@@ -177,31 +179,74 @@
     backup: function (f) { return joinLines(["xbt-agentwallet-backup-v1", f.hot_address, String(f.expiry)]); }
   };
 
-  // ---- the key in this browser: the seed XORed with a PBKDF2 pad of the PIN, and a MAC ------------
-  var STORE = "xbt-wallet-human-key-v1", PENDING = "xbt-wallet-human-key-pending-v1", ITER = 60000;
+  // ---- the key in this browser: the seed XORed with a PBKDF2 pad of the passphrase, and a MAC ------
+  // ITER is OWASP 2023+ for PBKDF2-HMAC-SHA512. LEGACY_ITER is AGP-039's wrap; unlock once, then re-wrap.
+  var STORE = "xbt-wallet-human-key-v1", PENDING = "xbt-wallet-human-key-pending-v1";
+  var ITER = 210000, LEGACY_ITER = 60000;
   function storage() { try { return root.localStorage; } catch (e) { return null; } }
+  function isRepeatedPattern(pw) {
+    var n = pw.length, i, block, k;
+    if (n < 2) return false;
+    if (/^(.)\1+$/.test(pw)) return true;
+    for (i = 1; i <= Math.floor(n / 2); i++) {
+      if (n % i) continue;
+      block = pw.slice(0, i);
+      for (k = i; k < n; k += i) if (pw.slice(k, k + i) !== block) break;
+      if (k >= n) return true;
+    }
+    return false;
+  }
+  function passphraseStrength(pw) {
+    pw = String(pw || "");
+    var digits = pw.replace(/\s+/g, "");
+    var classes = (/[a-z]/.test(pw) ? 1 : 0) + (/[A-Z]/.test(pw) ? 1 : 0) + (/[0-9]/.test(pw) ? 1 : 0) + (/[^A-Za-z0-9\s]/.test(pw) ? 1 : 0);
+    var reason = "", score = 0, hint;
+    if (pw.length < 12) reason = "the passphrase needs at least 12 characters";
+    else if (/^\d+$/.test(digits)) reason = "the passphrase cannot be only digits";
+    else if (isRepeatedPattern(pw)) reason = "the passphrase cannot be a repeated pattern";
+    else {
+      score = 1;
+      if (pw.length >= 12 && classes >= 2) score = 2;
+      if (pw.length >= 16 && classes >= 3) score = 3;
+    }
+    hint = score === 0 ? reason : score === 1 ? "weak — add length or mixed characters" : score === 2 ? "fair" : "strong";
+    return { ok: score > 0, score: score, hint: hint, reason: reason };
+  }
   function wrap(seed, pin, iter) {
-    var salt = randomBytes(16), dk = pbkdf2(utf8(pin), salt, iter || ITER, 64);
+    var n = iter || ITER, salt = randomBytes(16), dk = pbkdf2(utf8(pin), salt, n, 64);
     var ct = new Uint8Array(32);
     for (var i = 0; i < 32; i++) ct[i] = seed[i] ^ dk[i];
-    return { v: 1, kdf: "pbkdf2-sha512", iter: iter || ITER, salt: hex(salt), ct: hex(ct),
+    return { v: 1, kdf: "pbkdf2-sha512", iter: n, salt: hex(salt), ct: hex(ct),
              mac: hex(hmacSha512(dk.subarray(32), ct).subarray(0, 16)), pub: hex(publicKey(seed)) };
   }
   function unwrap(w, pin) {
     var dk = pbkdf2(utf8(pin), unhex(w.salt), w.iter, 64), ct = unhex(w.ct);
-    if (hex(hmacSha512(dk.subarray(32), ct).subarray(0, 16)) !== w.mac) throw new Error("wrong PIN");
+    if (hex(hmacSha512(dk.subarray(32), ct).subarray(0, 16)) !== w.mac) throw new Error("wrong passphrase");
     var seed = new Uint8Array(32);
     for (var i = 0; i < 32; i++) seed[i] = ct[i] ^ dk[i];
     if (hex(publicKey(seed)) !== w.pub) throw new Error("the stored key is damaged");
     return seed;
+  }
+  function needsMigrate(w) {
+    return !!(w && w.kdf === "pbkdf2-sha512" && ((w.iter | 0) < ITER));
+  }
+  function unlock(w, pin) {
+    var seed = unwrap(w, pin), migrated = false, stored = w;
+    if (needsMigrate(w)) {
+      stored = wrap(seed, pin, ITER);
+      try { saveKey(stored); } catch (e) { /* node / no localStorage: the caller keeps `wrapped` */ }
+      migrated = true;
+    }
+    return { seed: seed, wrapped: stored, migrated: migrated };
   }
   function loadKey(slot) { var s = storage(); try { return s ? JSON.parse(s.getItem(slot || STORE) || "null") : null; } catch (e) { return null; } }
   function saveKey(w, slot) { var s = storage(); if (!s) throw new Error("this browser keeps no local storage"); s.setItem(slot || STORE, JSON.stringify(w)); }
   function dropKey(slot) { var s = storage(); if (s) s.removeItem(slot || STORE); }
 
   var api = { hex: hex, unhex: unhex, utf8: utf8, sha512: sha512, hmacSha512: hmacSha512, pbkdf2: pbkdf2, publicKey: publicKey,
-              sign: sign, MSG: MSG, wrap: wrap, unwrap: unwrap, loadKey: loadKey, saveKey: saveKey, dropKey: dropKey, STORE: STORE,
-              PENDING: PENDING };
+              sign: sign, MSG: MSG, wrap: wrap, unwrap: unwrap, unlock: unlock, needsMigrate: needsMigrate,
+              passphraseStrength: passphraseStrength, loadKey: loadKey, saveKey: saveKey, dropKey: dropKey,
+              STORE: STORE, PENDING: PENDING, ITER: ITER, LEGACY_ITER: LEGACY_ITER };
   root.XbtWallet = api;
   if (typeof module !== "undefined") module.exports = api;
 
@@ -238,11 +283,12 @@
       if (enrolled && enrolled !== w.pub) { say(out, "the key in this browser is not the enrolled human key", true); return; }
       var pinEl = $("input.pin", form);
       var pin = pinEl ? pinEl.value : "";
-      if (!pin) { say(out, "enter your PIN", true); return; }
+      if (!pin) { say(out, "enter your passphrase", true); return; }
       say(out, "signing…");
       setTimeout(function () {
         try {
-          var seed = unwrap(w, pin);
+          var unlocked = unlock(w, pin);
+          var seed = unlocked.seed;
           if (kind === "human-key") {
             // the new key is made here and kept aside until the signer answers
             var fresh = randomBytes(32);
@@ -275,29 +321,40 @@
     }
   }
 
-  // Key setup: generate, show the backup, confirm it, protect it with a PIN, enrol the public key.
+  // Key setup: generate, show the backup, confirm it, protect it with a passphrase, enrol the public key.
   var gen = $("#keygen");
   if (gen) {
     var seed = null;
+    function paintStrength(pw) {
+      var el = $("#keygen-strength");
+      if (!el) return;
+      var s = passphraseStrength(pw);
+      el.textContent = s.ok ? ("Strength: " + s.hint) : (pw ? s.reason : "At least 12 characters, not only digits, not a repeated pattern.");
+      el.className = "hint" + (pw ? (s.ok ? (s.score >= 3 ? " ok" : " warn") : " bad") : "");
+    }
     $("#keygen-new").addEventListener("click", function () {
       seed = randomBytes(32);
       $("#keygen-backup").textContent = hex(seed);
       $("#keygen-step2").hidden = false;
+      paintStrength($("#keygen-pin").value);
     });
     $("#keygen-import").addEventListener("click", function () {
       try { seed = unhex($("#keygen-import-hex").value); if (seed.length !== 32) throw new Error("the key is 64 hex characters"); }
       catch (e) { say($("#keygen-msg"), e.message, true); return; }
       $("#keygen-backup").textContent = hex(seed);
       $("#keygen-step2").hidden = false;
+      paintStrength($("#keygen-pin").value);
     });
+    $("#keygen-pin").addEventListener("input", function () { paintStrength(this.value); });
     $("#keygen-save").addEventListener("click", function () {
       var msg = $("#keygen-msg");
       if (!seed) { say(msg, "generate or import a key first", true); return; }
       var tail = hex(seed).slice(-8);
       if ($("#keygen-confirm").value.trim().toLowerCase() !== tail) { say(msg, "type the last 8 characters of your backup to confirm you saved it", true); return; }
       var p1 = $("#keygen-pin").value, p2 = $("#keygen-pin2").value;
-      if (p1.length < 6) { say(msg, "the PIN needs at least 6 characters", true); return; }
-      if (p1 !== p2) { say(msg, "the PINs differ", true); return; }
+      var strength = passphraseStrength(p1);
+      if (!strength.ok) { say(msg, strength.reason, true); paintStrength(p1); return; }
+      if (p1 !== p2) { say(msg, "the passphrases differ", true); return; }
       say(msg, "protecting the key…");
       setTimeout(function () {
         try {
