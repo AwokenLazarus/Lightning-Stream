@@ -15,6 +15,7 @@
 //! * [`signer`]: the [`signer::StateSigner`] seam, so the payer's keys can live in another
 //!   process (B2's signer, `xbt-signer`); [`signer::LocalSigner`] keeps them in memory.
 //! * [`funding`]: funding checks against a [`funding::ChainBackend`].
+//! * [`scheme`]: the seam for a second x402 scheme beside `xbt-channel` (`xbt-work`, AGP-032).
 //!
 //! Optional features: `http-client` (ureq transport), `http-server` (tiny_http around the
 //! provider), `rpc` (bitcoind JSON-RPC backend and wallet).
@@ -32,6 +33,7 @@ pub mod provider;
 pub mod route;
 pub mod route_client;
 pub mod route_seller;
+pub mod scheme;
 pub mod signer;
 pub mod wire;
 #[cfg(feature = "rpc")]

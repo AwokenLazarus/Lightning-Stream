@@ -130,6 +130,8 @@ pub struct Provider {
     pub(crate) handler: Handler,
     charge: Option<ChargeFn>,
     pub(crate) routes: crate::route_seller::RouteSeller,
+    /// AGP-032: other schemes offered beside xbt-channel (xbt-work).
+    schemes: Vec<Arc<dyn crate::scheme::ProviderScheme>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -179,12 +181,21 @@ impl Provider {
             handler,
             charge: None,
             routes,
+            schemes: vec![],
         })
     }
 
     /// Meter calls: the charge may lower (never raise) the price after serving.
     pub fn with_charge(mut self, charge: ChargeFn) -> Self {
         self.charge = Some(charge);
+        self
+    }
+
+    /// Offer another scheme beside xbt-channel (AGP-032): its requirements follow the channel's in
+    /// every unpaid 402, its control endpoints are served, and a PAYMENT-SIGNATURE whose
+    /// `accepted.scheme` is its scheme is verified and settled by it.
+    pub fn with_scheme(mut self, s: Arc<dyn crate::scheme::ProviderScheme>) -> Self {
+        self.schemes.push(s);
         self
     }
 
@@ -931,6 +942,11 @@ impl Provider {
         if path == TERMS_PATH && method == "GET" {
             return HttpResponse::json(200, &self.terms());
         }
+        for s in &self.schemes {
+            if let Some(r) = s.control(method, path, headers, body) {
+                return r;
+            }
+        }
         if path.starts_with("/x402/xbt-channel/") {
             let action: Option<fn(&Self, &Value) -> Result<Value>> = match path {
                 OPEN_PATH => Some(Self::open),
@@ -966,13 +982,21 @@ impl Provider {
                                                                     "csvDelta": CSV_DELTA, "cipher": hex::encode(&offer.cipher)});
                 return self.required_response(&body);
             }
-            return self.payment_required(url, price, "payment_required", None);
+            let mut body = self.payment_required_doc(url, price, "payment_required", None);
+            if let Some(a) = body.get_mut("accepts").and_then(Value::as_array_mut) {
+                a.extend(self.schemes.iter().filter_map(|s| s.requirements(method, path, price)));
+            }
+            return self.required_response(&body);
         };
         let (acc, pl) = match unb64json(&hdr) {
             Ok(pp) => {
                 let (Some(acc), Some(pl)) = (pp.get("accepted").filter(|a| a.is_object()), pp.get("payload").filter(|p| p.is_object())) else {
                     return self.payment_required(url, price, "bad_payload", None);
                 };
+                let other = acc.get("scheme").and_then(Value::as_str).and_then(|sc| self.schemes.iter().find(|s| s.scheme() == sc));
+                if let Some(s) = other {
+                    return self.serve_other(s.as_ref(), &pp, method, path, body, price, url);
+                }
                 if pp.get("x402Version").and_then(Value::as_u64) != Some(2) || acc.get("scheme").and_then(Value::as_str) != Some(SCHEME)
                     || acc.get("network").and_then(Value::as_str) != Some(self.cfg.network.as_str())
                     || acc.get("payTo").and_then(Value::as_str) != Some(self.pay_to.as_str())
@@ -1113,6 +1137,23 @@ impl Provider {
         let mut receipt = receipt;
         receipt["sig"] = hex::encode(ecdsa::sign(&secret, &receipt_message(&receipt))).into();
         let sr = settlement_response(&receipt, &self.cfg.network, &payer, resp.status < 400);
+        resp.headers.push(("PAYMENT-RESPONSE".into(), b64json(&sr)));
+        resp
+    }
+
+    /// A call paid with another scheme: it verifies and debits, the handler runs, it settles.
+    #[allow(clippy::too_many_arguments)]
+    fn serve_other(&self, s: &dyn crate::scheme::ProviderScheme, pp: &Value, method: &str, path: &str, body: &[u8], price: u64,
+                   url: &str) -> HttpResponse {
+        let charge = match s.authorize(pp, method, path, body, price, url) {
+            Ok(c) => c,
+            Err(doc) => return self.required_response(&doc),
+        };
+        let mut resp = (self.handler)(method, path, body);
+        if resp.headers.iter().any(|(k, v)| k.contains(['\r', '\n', '\0']) || v.contains(['\r', '\n', '\0'])) {
+            resp = HttpResponse::text(500, "handler returned a header with CR/LF");
+        }
+        let sr = charge.settle(resp.status);
         resp.headers.push(("PAYMENT-RESPONSE".into(), b64json(&sr)));
         resp
     }

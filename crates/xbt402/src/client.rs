@@ -307,6 +307,8 @@ pub struct Client {
     signer: Option<Arc<dyn StateSigner>>,
     /// AGP-035: where the channel book is saved. `None`: memory only.
     ledger: Option<Box<dyn ClientLedger>>,
+    /// AGP-032: other schemes this client pays with, preferred over xbt-channel when offered.
+    payers: Vec<Arc<dyn crate::scheme::SchemePayer>>,
 }
 
 fn now() -> u64 {
@@ -337,7 +339,14 @@ impl Client {
     pub fn new(cfg: ClientConfig, transport: Box<dyn Transport>, wallet: Box<dyn Wallet>,
                height: HeightFn) -> Self {
         Self { cfg, transport, wallet, height, channels: HashMap::new(), opened_sats: 0, day_spent: 0, day_start: now(), on_refund: None,
-               pending_rolled: HashMap::new(), signer: None, ledger: None }
+               pending_rolled: HashMap::new(), signer: None, ledger: None, payers: vec![] }
+    }
+
+    /// Pay with another scheme (AGP-032, `xbt-work`) whenever a 402 offers it: it is preferred
+    /// over opening or using a channel, and it checks the PAYMENT-RESPONSE of the calls it paid.
+    pub fn with_payer(mut self, p: Arc<dyn crate::scheme::SchemePayer>) -> Self {
+        self.payers.push(p);
+        self
     }
 
     /// Keep the channel book in `ledger` (AGP-035): restore what it holds, then save the channels
@@ -589,12 +598,32 @@ impl Client {
     fn request_inner(&mut self, method: &str, url: &str, body: &[u8]) -> Result<HttpResponse> {
         let (origin, path) = split_url(url);
         let mut hdrs = vec![];
-        if self.channels.contains_key(&origin) {
+        let mut used: Option<Arc<dyn crate::scheme::SchemePayer>> = None;
+        for p in &self.payers {
+            if let Some(h) = p.upfront(&origin, method, &path, body)? {
+                hdrs = h;
+                used = Some(p.clone());
+                break;
+            }
+        }
+        if used.is_none() && self.channels.contains_key(&origin) {
             hdrs = self.signature_header(&origin, method, &path, body)?;
         }
         let mut r = self.transport.request(method, url, body, &hdrs)?;
         if r.status == 402 {
             let pr = unb64json(header(&r, "PAYMENT-REQUIRED").ok_or_else(|| ChannelError::new("bad_offer", "402 without PAYMENT-REQUIRED"))?)?;
+            let offered = |sc: &str| pr.get("accepts").and_then(Value::as_array).into_iter().flatten()
+                .find(|a| a.get("scheme").and_then(Value::as_str) == Some(sc) && a.get("network").and_then(Value::as_str) == Some(&self.cfg.network))
+                .cloned();
+            if let Some((p, acc)) = self.payers.iter().find_map(|p| offered(p.scheme()).map(|a| (p.clone(), a))) {
+                let h = p.answer(self.transport.as_ref(), &origin, &acc, &pr, method, &path, body)?;
+                r = self.transport.request(method, url, body, &h)?;
+                if let Some(h) = header(&r, "PAYMENT-RESPONSE") {
+                    p.check(&origin, &unb64json(h)?, method, &path, body)?;
+                }
+                return Ok(r);
+            }
+            used = None;
             let acc = self.pick(&pr)?;
             if !self.channels.contains_key(&origin) {
                 let ch = self.open(&origin, &acc)?;
@@ -621,7 +650,10 @@ impl Client {
         }
         if let Some(h) = header(&r, "PAYMENT-RESPONSE") {
             let resp = unb64json(h)?;
-            self.receipt(&origin, &resp, method, &path, body, None)?;
+            match &used {
+                Some(p) => p.check(&origin, &resp, method, &path, body)?,
+                None => self.receipt(&origin, &resp, method, &path, body, None)?,
+            }
         }
         Ok(r)
     }
