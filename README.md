@@ -330,6 +330,55 @@ Deliberately different from B2's Python: `gettxspendingprevout` reports mempool 
 Knots does (the Python also reported confirmed spends; the typed `spending_tx` still does), and the
 fee estimate is the median over servers (the Python took the first answer).
 
+## Pay-with-work: xbt-work (AGP-032)
+
+`crates/xbt-work` implements the x402 scheme `xbt-work` (v1 draft, XBT-053 `agp-011`
+`docs/xbt-work-spec-v1-draft.md`): a client with hashrate pays by mining. It mines as
+`<identity>.pw-<invoice>` so the Prime credits the provider, then presents the Prime's signed
+cumulative receipt with each call. It ports XBT-053 `receipts.py`, `nta.py` and `relay/`, plus the
+xbt-070 coinbase audit.
+
+* **Provider.** `Provider::new(..).with_scheme(Arc::new(WorkScheme(Arc::new(WorkProvider::new(cfg)?))))`:
+  every unpaid 402 lists `xbt-channel` and `xbt-work`. `POST /x402/xbt-work/invoice` issues invoices
+  (`Cache-Control: no-store`, a bound on unfunded invoices, `429 too_many_invoices`). Payments are
+  checked in the §9.1 order and debited durably (a 0600 state file, write+fsync+rename) before the
+  handler runs. A handler answer ≥ 500 releases the debit. `refresh` pulls receipts through the
+  blinded relay; `set_epoch` re-prices new 402s (§6.3). After an equivocation or a failed audit, the
+  Prime's receipts are refused.
+* **Payer.** `Client::new(..).with_payer(Arc::new(WorkPayer::new(cfg)?))`: on a 402 offering
+  `xbt-work` it takes an invoice (`prepare` returns the username to mine as), fetches and verifies the
+  latest receipt through the relay, and presents it with a fresh `n` and `auth`. It checks every
+  `SettlementResponse`: the invoice, `req`, the charge within the quote, and `spentWork` growing by
+  exactly `charged`. An optional pinned Prime key is checked against the offer.
+* **Audit.** `WorkProvider::audit(window, deferrals, V, paid)` applies §10.3 with the provider's own
+  intervals and counts signed deferral lines (NTA `unattested` carry) as debt. The carry ledger
+  tracks what is owed. A failing block yields a §10.4 fraud proof that `check_fraud_proof` verifies
+  from its signed contents alone. Per invoice, the proof carries the latest receipt and the in-span
+  receipt that brackets the window, so a third party can prove the work.
+
+Conformance (`scripts/work_conformance.sh`): the Rust emitter rebuilds XBT-053's `vectors.json`
+byte for byte (`cmp`). The Rust checks pass 91/91 over the published file (16 sections recomputed,
+75 independent checks). XBT-053's own `check_work_vectors.py` passes 124/124 over the Rust-emitted
+file.
+
+Regtest (`scripts/work_interop.sh`, ports 34100–34199) uses primed `rnd/agp-011`, the stock DATUM
+gateway, stratum-grind and the XBT-053 relay. Results on 2026-09-29 (evidence in
+`docs/work-interop-agp032-*.json`):
+
+| payer | provider | checks |
+|---|---|---|
+| Rust (xbt402 Client + WorkPayer) | Rust (xbt402 Provider + WorkProvider) | 20/20, incl. the provider's own audit and both fraud proofs |
+| Python (xbt-063 `pww_payer`) | Rust | 20/20 |
+| Rust | Python (xbt-063 `flagship.server` WorkRail) | 18/18 |
+
+Regtest's difficulty makes `8 × D` less than one share, so primed runs with `window-min-work = 64`.
+Otherwise the window holds only the latest share and no receipted span can be proven inside it.
+
+Portability (`scripts/work_matrix.sh` → `dist/WORK_MATRIX.md`): 20/20 builds (10 AGP-031 targets ×
+release and release-small, 1.8–2.5 MB self-test). The self-test runs natively on x86_64 glibc and
+musl. Pure-Rust Ed25519 (`ed25519-dalek`) and ChaCha20-Poly1305 (RustCrypto); libsecp256k1 only
+through `xbt-primitives` (NTA BIP340).
+
 ## Linking xbt-rs from cmp (AGP-035)
 
 xbt-compute's Rust runtime pins this repo by full rev with `default-features = false`. What that
