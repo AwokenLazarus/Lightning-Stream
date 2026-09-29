@@ -53,7 +53,7 @@ fi
 for t in "${!ARCH[@]}"; do
   mkdir -p "$CTX/bin/${ARCH[$t]}"
   for b in "${IMAGES[@]}"; do
-    f=target/$t/release/$b
+    f=${CARGO_TARGET_DIR:-target}/$t/release/$b
     [ -x "$f" ] || { echo "oci_build: $f missing (run without --skip-cargo)" >&2; exit 1; }
     file -b "$f" | grep -q "statically linked" || { echo "oci_build: $f is not static: $(file -b "$f")" >&2; exit 1; }
     cp "$f" "$CTX/bin/${ARCH[$t]}/$b"

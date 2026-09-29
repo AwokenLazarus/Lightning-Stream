@@ -45,6 +45,12 @@ if [ "${PACKAGING:-}" = 1 ]; then
   mkdir -p run/verify-agp042
   scripts/oci_build.sh --load >run/verify-agp042/oci_build.log 2>&1
   grep -q "^Checks: PASS" dist/oci/IMAGES.md
+  # the shared target dir is shared with other worktrees (same crate hashes): prove these are this branch's binaries
+  for a in amd64 arm64 armv7; do
+    f=dist/oci/ctx/bin/$a/xbt-wallet-mcp
+    grep -qa XBT_MCP_HTTP_TOKEN_FILE "$f" && ! grep -qa rotate-token "$f" || { echo "$f is not this branch's MCP" >&2; exit 1; }
+  done
+  echo "images: this branch's MCP (token file, no rotate endpoint) for amd64, arm64, armv7"
   export UMBREL_TEST_PORTS=34210-34250 UMBREL_TEST_MCP_PORT=34210 UMBREL_TEST_HUB_PORT=34220 UMBREL_TEST_UI_PORT=34230
   export UMBREL_TEST_PROV_PORT=34240 UMBREL_TEST_PROXY_PORT=34250
   export STARTOS_TEST_PORTS=34260-34290 STARTOS_TEST_MCP_PORT=34260 STARTOS_TEST_HUB_PORT=34270 STARTOS_TEST_UI_PORT=34280

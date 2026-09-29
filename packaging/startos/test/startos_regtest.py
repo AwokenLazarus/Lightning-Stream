@@ -107,7 +107,9 @@ def main():
     by = {s["id"]: s for s in sp["services"]}
     check("I", "the package spec: init runs as root; every daemon as its image's user; each mounts only its own sub-paths",
           by["init"].get("user") == "root" and all(not by[i].get("user") for i in ("witness", "signer", "mcp", "ui", "hub"))
-          and [m["subpath"] for m in by["mcp"]["mounts"]] == ["mcp", "run/signer"] and by["mcp"]["mounts"][1]["readonly"]
+          and [m["subpath"] for m in by["mcp"]["mounts"]] == ["mcp", "run/signer", "run/ui"]
+          and by["mcp"]["mounts"][1]["readonly"] and by["mcp"]["mounts"][2]["readonly"]
+          and [(m["subpath"], m["readonly"]) for m in by["ui"]["mounts"]] == [("ui", False), ("run/signer", True), ("run/ui", False)]
           and [m["subpath"] for m in by["witness"]["mounts"]] == ["witness", "run/anchor"], sp["services"])
 
     # --- the external node (the Node connection action's values) and the provider -------------------------------
