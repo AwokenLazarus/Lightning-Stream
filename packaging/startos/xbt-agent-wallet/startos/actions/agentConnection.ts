@@ -16,9 +16,9 @@ export const agentConnection = sdk.Action.withoutInput(
     const token = String(await sdk.volumes.main.readFile('mcp/secrets/mcp-http-token', 'utf8').catch(() => '')).trim()
     const host = await sdk.host.getOwn(effects, 'mcp').once()
     const iface = Object.values(host?.bindings ?? {})
-      .flatMap(b => Object.values(b.interfaces))
-      .find(i => i.id === 'mcp')
-    const urls = (iface?.addressInfo?.nonLocal.format('urlstring') ?? []).map(u => u.replace(/\/$/, '') + '/mcp')
+      .flatMap((b) => Object.values(b.interfaces))
+      .find((i) => i.id === 'mcp')
+    const urls = (iface?.addressInfo?.nonLocal.format('urlstring') ?? []).map((u) => u.replace(/\/$/, '') + '/mcp')
     if (!token) {
       return { version: '1', title: i18n('Agent connection'), message: i18n('Start the service once to create the token.'), result: null }
     }
@@ -29,7 +29,15 @@ export const agentConnection = sdk.Action.withoutInput(
       result: {
         type: 'group',
         value: [
-          ...urls.map(u => ({ type: 'single' as const, name: i18n('MCP endpoint'), description: null, value: u, masked: false, copyable: true, qr: false })),
+          ...urls.map((u) => ({
+            type: 'single' as const,
+            name: i18n('MCP endpoint'),
+            description: null,
+            value: u,
+            masked: false,
+            copyable: true,
+            qr: false,
+          })),
           { type: 'single', name: i18n('Bearer token'), description: null, value: token, masked: true, copyable: true, qr: false },
         ],
       },

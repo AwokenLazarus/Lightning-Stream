@@ -56,8 +56,10 @@ export const nodeConfig = sdk.Action.withInput(
   },
   inputSpec,
   async () => {
-    const n = await storeJson.read(s => s.node).once()
-    return n ? { host: n.host || undefined, port: n.port, user: n.user || undefined, password: n.password || undefined, chain: n.chain } : {}
+    const n = await storeJson.read((s) => s.node).once()
+    return n
+      ? { host: n.host || undefined, port: n.port, user: n.user || undefined, password: n.password || undefined, chain: n.chain }
+      : {}
   },
   async ({ effects, input }) => {
     if (input.user.includes(':')) throw new Error(i18n('The RPC user cannot contain a colon'))

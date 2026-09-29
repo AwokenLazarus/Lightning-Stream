@@ -1,2 +1,6 @@
-TODO: Replace this file with your package's license, and set the matching
-`license` field in startos/manifest/index.ts.
+The XBT Agent Wallet StartOS package is licensed under either of
+
+  * Apache License, Version 2.0 (https://www.apache.org/licenses/LICENSE-2.0)
+  * MIT license (https://opensource.org/licenses/MIT)
+
+at your option, like the xbt-rs workspace it packages (`license = "MIT OR Apache-2.0"`).

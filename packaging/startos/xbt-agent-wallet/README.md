@@ -1,87 +1,42 @@
-<p align="center">
-  <img src="icon.svg" alt="Hello World Logo" width="21%">
-</p>
+# XBT Agent Wallet for StartOS
 
-# Hello World on StartOS
+Technical reference for this package (AGP-040). The user guide is `instructions.md`; the design, the tests
+and the choices are in `../../README.md` and the container standard in `docs/CONTAINER.md` (xbt-rs).
 
-> Everything not listed in this document should behave the same as upstream Hello World.
-> If a feature, setting, or behavior is not mentioned here, the upstream
-> documentation is accurate and fully applicable — see the Documentation section of
-> `instructions.md` for links.
+## Containers
 
-<!--
-TODO: fill in the sections below, then delete these comments.
+`startos/spec.ts` lists them as data; `startos/main.ts` turns that into StartOS daemons, and
+`../test/startos_regtest.py` runs the same spec on Docker. Volume `main` is the data dir (docs/CONTAINER.md §1);
+volume `startos` holds `store.json` (the node connection, the hub switch) and is mounted by nothing.
 
-Read Writing Service READMEs first — it is the authority on who reads this file,
-why the heading set is fixed and ordered, and what belongs in each section:
+| daemon | image | user | mounts of `main` | ready |
+|---|---|---|---|---|
+| init (oneshot) | xbt-init | root | all | exits 0 |
+| witness | xbt-anchor-witness | xbt-anchor-witness | witness, run/anchor | `xbt-anchor-witness healthcheck` |
+| signer | xbt-signer | xbt-signer | signer, run/signer, run/anchor (ro) | `xbt-signer healthcheck` |
+| mcp | xbt-wallet-mcp | xbt-wallet-mcp | mcp, run/signer (ro) | port 33510 |
+| ui | xbt-wallet-ui | xbt-wallet-ui | ui, run/signer (ro) | port 8480 |
+| hub (if enabled) | xbt402-hub | xbt402-hub | hub | port 9480 |
 
-  ../src/writing-readmes.md
-  https://docs.start9.com/packaging/writing-readmes.html
--->
+Health check `wallet-ready`: the MCP's `/readyz` (200: synced and unlocked; 503: loading, with the reason).
 
-## Table of Contents
+## Interfaces
 
-<!-- TODO: link every section present below -->
-
-## Image and Container Runtime
-
-<!-- TODO: image source, architectures, entrypoint, and the subcontainers this package runs -->
-
-## Volume and Data Layout
-
-<!-- TODO -->
-
-## File Models
-
-<!-- TODO: each config file the package owns — format, how it's seeded, what rewrites it, and whether a hand edit survives -->
-
-## Dependencies
-
-<!-- TODO: list each dependency, or "None." -->
-
-## Network Access and Interfaces
-
-<!-- TODO -->
-
-## Installation and First-Run Flow
-
-<!-- TODO: what setup differs from upstream, and any ordering the user must respect -->
+`ui` (web UI, port 8480, external 80), `mcp` (API, 33510, path `/mcp`, masked), `hub` (API, 9480, only when
+enabled). StartOS terminates TLS and adds X-Forwarded-Proto, so the UI's cookie is `Secure` over https.
 
 ## Actions
 
-<!-- TODO: each user-facing action — when to run it, what it changes, cost, repeat safety. Or "None." -->
+| action | what |
+|---|---|
+| node-config | node RPC host, port, user, password, chain (a critical task until set) |
+| ui-setup-code | the UI's one-time setup code (`main/ui/setup-code`), while no password is set |
+| agent-connection | the MCP addresses and the bearer token (`main/mcp/secrets/mcp-http-token`) |
+| rotate-agent-token | delete the MCP token (and the UI's copy) and restart: xbt-init makes a new one |
+| hub-toggle | enable or disable the xbt402 hub |
+| reset-ui-password | delete `main/ui/password.scrypt` and restart |
 
-## Tasks
+## Build
 
-<!-- TODO: each task — what raises it, severity, what clears it. Or "None." -->
-
-## Health Checks
-
-<!-- TODO: what each check probes, and what a failure means -->
-
-## Backups and Restore
-
-<!-- TODO -->
-
-## Limitations and Differences
-
-<!-- TODO -->
-
----
-
-## Quick Reference for AI Consumers
-
-```yaml
-package_id: 'hello-world'
-image:
-architectures: []
-subcontainers: []
-volumes: {}
-file_models: []
-startos_managed_env_vars: []
-dependencies: []
-interfaces: {}
-actions: []
-tasks: []
-health_checks: []
-```
+`../build.sh` (needs the images loaded by `scripts/oci_build.sh --load`, start-cli 2.1.0 and the
+`../tools/tar2sqfs` shim) writes `dist/startos/xbt-agent-wallet_{x86_64,aarch64}.s9pk`. Never `make publish`.

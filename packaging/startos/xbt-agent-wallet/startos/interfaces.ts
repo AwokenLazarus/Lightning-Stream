@@ -45,7 +45,7 @@ export const setInterfaces = sdk.setupInterfaces(async ({ effects }) => {
     ]),
   )
 
-  const hubEnabled = await storeJson.read(s => s.hubEnabled).const(effects)
+  const hubEnabled = await storeJson.read((s) => s.hubEnabled).const(effects)
   if (hubEnabled) {
     const hub = await sdk.MultiHost.of(effects, 'hub').bindPort(PORTS.hub, { protocol: 'http', preferredExternalPort: PORTS.hub })
     receipts.push(

@@ -1,17 +1,12 @@
-# Updating the upstream version
+# Updating
 
-<!--
-TODO: Describe what "upstream" means for Hello World (a Docker image pinned by tag, a git
-submodule, or a self-built image) and how to track its version. See UPDATING.md in other
-packages for the pattern, and start-technologies/projects/start-sdk/docs/src/versions.md for the version rules.
-Remove these comments.
--->
+"Upstream" is the xbt-rs workspace itself: the six images `scripts/oci_build.sh --load` makes and loads as
+`<image>:<version>` (`startos/spec.ts`, `IMAGES`). There is no external image to track.
 
-## Determining the upstream version
+## A new xbt-rs version
 
-<!-- TODO: where the current pin lives in startos/manifest/index.ts, and how to fetch the
-     latest upstream version (e.g. `gh release view -R <org>/<repo> --json tagName -q .tagName`). -->
-
-## Applying the bump
-
-<!-- TODO: the exact file and field to edit, including any tag-format quirks. -->
+1. Bump `version` in the workspace `Cargo.toml`; `scripts/oci_build.sh --load` then tags the images with it.
+2. Set the same tag in `startos/spec.ts` (`IMAGES`) and in `packaging/umbrel/*/docker-compose.yml`.
+3. Add a `startos/versions/v<version>.ts` with release notes (and a migration if the data layout changed:
+   docs/CONTAINER.md is the contract), make it `current`, and move the old one to `other`.
+4. `packaging/startos/test-startos.sh` (build, inspect, regtest), then side-load.

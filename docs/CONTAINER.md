@@ -3,8 +3,9 @@
 Umbrel and StartOS (Start9) run our services as containers. This page is the **shared standard** for
 xbt-agentpay and xbt-compute (cmp CONTRACT §U). cmp has no layout yet, so it adopts this one. Its
 components already have their places here. agentpay implements it in `xbt-signer`,
-`xbt-anchor-witness`, `xbt-wallet-mcp` and `xbt402-hub`. The code is in the `xbt-svc` crate.
-`scripts/container_test.sh` tests it on regtest.
+`xbt-anchor-witness`, `xbt-wallet-mcp`, `xbt402-hub` and the wallet UI `xbt-wallet-ui` (AGP-039). The code is
+in the `xbt-svc` crate. `scripts/container_test.sh` tests it on regtest. The Umbrel apps and the StartOS
+package built on it (AGP-040) are in `packaging/` (README there).
 
 Status: **proposal, pending cmp-lead's OK** (forwarded by agp-lead, 2026-09-28).
 
@@ -22,6 +23,7 @@ tmpfs `/tmp`.
   witness/         agp  uid 10002  0700  anchors.jsonl, alerts.jsonl       (XBT_WITNESS_DIR: own mount, own owner)
   mcp/             agp  uid 10003  0700  secrets/, mcp-payer.jsonl (local payer mode)
   hub/             agp  uid 10004  0700  hub.json (optional), state/, secrets/
+  ui/              agp  uid 10005  0700  password.scrypt (the login hash), setup-code (first run only), secrets/
   cmp-node/        cmp  uid 10011  0700  operator key, operator service, merchant ledgers and meters, secrets/
   cmpd/            cmp  uid 10012  0700  device runtime state, secrets/
   cmpd-cache/      cmp  uid 10012  0700  the model span cache: LARGE, its own mount (CMP_CACHE_DIR), safe to prune
@@ -35,7 +37,7 @@ tmpfs `/tmp`.
 Rules:
 - **A container mounts only its own sub-dir**, plus the `run/<peer>/` directories of the sockets it
   connects to. Read-only is enough to connect to a Unix socket.
-  - The MCP mounts `mcp/` and `run/signer/` (ro).
+  - The MCP mounts `mcp/` and `run/signer/` (ro). So does the UI, with `ui/`.
   - The signer mounts `signer/`, `run/signer/` and `run/anchor/` (ro).
   - The witness mounts `witness/` and `run/anchor/`.
 - **Separately mountable paths** have their own override variable, for another disk, another owner or
@@ -44,14 +46,16 @@ Rules:
   - `XBT_RUN_DIR`: the socket root.
   - `CMP_CACHE_DIR`: the span cache.
 - **Owners:** each image's shared base layer carries the `/data` skeleton with the owners above. A
-  Docker named volume mounted there takes its owner from the image on first use. Bind mounts (Umbrel's
-  `${APP_DATA_DIR}`) need the installer, or an init container, to `chown` each sub-dir once.
-  - If a box runs everything as one user (Umbrel's usual `user: 1000:1000`), the layout still works.
-  - What is lost then is the separation between the witness and the signer. Umbrel packaging
-    (CMP-098 / AGP-P-002) should keep the UIDs.
+  Docker named volume mounted there takes its owner from the image on first use. A bind mount does not:
+  Umbrel's `${APP_DATA_DIR}` arrives owned by the box user (1000), and a StartOS volume root-owned.
+  **Decided (AGP-040): an init one-shot, `xbt-init`, keeps the per-component uids** (§8). It runs before
+  the services on every start, as root with no network and only `CHOWN`, `FOWNER`, `DAC_OVERRIDE`, and
+  gives each sub-dir (and, when its owner was wrong, everything under it, never following a symlink) to its
+  component. One uid for everything (Umbrel's usual `user: 1000:1000`) would also run, but it loses the
+  separation between the witness and the signer, and lets the MCP and the UI read the signer's sealed keys.
 - **Socket groups:** a socket's group is its server's group, and each client is a member of it.
   `/etc/group` in the images:
-  - `xbt-signer` group: `xbt-wallet-mcp` is a member;
+  - `xbt-signer` group: `xbt-wallet-mcp` and `xbt-wallet-ui` are members;
   - `xbt-anchor-witness` group: `xbt-signer` is a member.
 
   So the MCP cannot reach the witness, and the witness cannot reach the signer.
@@ -66,6 +70,8 @@ UID table (the images' `USER`; the cmp rows are reserved):
 | 10002 | xbt-anchor-witness | xbt-anchor-witness |
 | 10003 | xbt-wallet-mcp | xbt-wallet-mcp |
 | 10004 | xbt402-hub | xbt402-hub |
+| 10005 | xbt-wallet-ui | xbt-wallet-ui |
+| 0 | root | xbt-init (a one-shot that exits; §8) |
 | 10011 | cmp-node | cmp-node (reserved) |
 | 10012 | cmpd | cmpd-* (reserved) |
 | 10013 | cmp-client | cmp-client (reserved) |
@@ -94,7 +100,8 @@ the data dir, and in the env variable (upper-cased, `-` → `_`). Lookup order (
 | `signer-wrap-key` | signer | 32-byte AES-256-GCM wrapping key for the sealed hot and channel keys (raw or 64 hex) | generated |
 | `signer-passphrase` | signer | instead of the wrap key: scrypt passphrase (B2 format) | never generated |
 | `node-rpc-auth` | signer, hub (cmp: any node client) | `user:password` in cookie format (a node's `.cookie` works as is) | provisioned by the installer |
-| `mcp-http-token` | mcp | bearer token for MCP over HTTP (64 hex) | generated when listening off loopback |
+| `mcp-http-token` | mcp | bearer token for MCP over HTTP (64 hex) | generated when listening off loopback (on a box, by `xbt-init`, which also copies it to `ui/secrets/` for the UI's Agents page) |
+| `xbt-ui-password` | ui | the UI login password, when the platform sets it (Umbrel `${APP_PASSWORD}`, via `xbt-init`); otherwise the UI's own first-run setup code | never generated |
 | `hub-payto-key` | hub | payTo secret (hex scalar) | generated |
 | `operator-passphrase` | cmp-node | cmp operator key passphrase (cmp.keys) | cmp's rule |
 | `client-passphrase` | cmp-client | cmp client identity passphrase (cmp.keys) | cmp's rule |
@@ -170,7 +177,8 @@ None of these binaries depends on systemd. `$CREDENTIALS_DIRECTORY` is just one 
 
 ## 6. Images
 
-`scripts/oci_build.sh` builds one image per binary for **linux/amd64, linux/arm64 and linux/arm/v7**. Each
+`scripts/oci_build.sh` builds one image per binary for **linux/amd64, linux/arm64 and linux/arm/v7**:
+`xbt-signer`, `xbt-anchor-witness`, `xbt-wallet-mcp`, `xbt402-hub`, `xbt-wallet-ui` and `xbt-init`. Each
 is `FROM scratch` with the static musl binary (built with zig). There is no `RUN`, so no emulator or
 binfmt is needed. The images are saved as OCI archives in `dist/oci/*.tar` (never pushed), with digests
 and sizes in `dist/oci/IMAGES.md`. `scripts/oci_inspect.py` checks every platform: architecture, static
@@ -181,7 +189,7 @@ ELF, non-root, HEALTHCHECK, two layers, and the shared base layer.
   deterministically by `container/mkbase.py`.
 - **Layer 2** is the binary.
 - **Config:**
-  - `USER` is the component's user, never root;
+  - `USER` is the component's user, never root (except `xbt-init`, §8);
   - `ENV XBT_DATA_DIR=/data XBT_MODE=production`;
   - `ENTRYPOINT` is the binary;
   - `HEALTHCHECK` runs the binary's own `healthcheck`.
@@ -241,3 +249,35 @@ volumes). The test:
 4. checks the hub behind a proxy.
 
 Ports 33700–33799. Evidence is written to `run/container-test/<stamp>/`.
+
+## 8. Bind mounts and `xbt-init` (AGP-040)
+
+`xbt-init` (in `xbt-svc`, image `xbt-init`) makes a data dir match §1 before the services start:
+
+- creates `<component>/` and `<component>/secrets/` (0700) and `run/signer/`, `run/anchor/` (0750), owned by
+  each component's uid;
+- when a component dir had another owner, gives it and its contents to the component (`lchown`, no descent
+  into symlinks); on a second start nothing changes;
+- provisions the secrets an installer holds, from `XBT_INIT_*` (plain env values are fine here: it is the
+  installer's step and exits before any service starts; the services still read files only):
+  `XBT_INIT_NODE_RPC_AUTH[_FILE]` or `XBT_INIT_NODE_RPC_USER` + `_PASS` → `signer/` and `hub/secrets/node-rpc-auth`;
+  `XBT_INIT_UI_PASSWORD[_FILE]` → `ui/secrets/xbt-ui-password`; the MCP token, generated once into `mcp/` and
+  copied into `ui/`. A secret is rewritten only when its value changes, through an exclusively created temp
+  file (a symlink a service planted is never followed);
+- prints a JSON report (names, owners, modes; never a value); `xbt-init check` only reports.
+
+Run it with `user: 0:0`, `network_mode: none`, `read_only`, `cap_drop: ALL` + `CHOWN`, `FOWNER`,
+`DAC_OVERRIDE`, and `XBT_INIT_COMPONENTS` = the components the app runs. Each service then waits for it
+(`depends_on: condition: service_completed_successfully`; a StartOS oneshot).
+
+| option for a bind mount's owners | for | against |
+|---|---|---|
+| **an init one-shot (`xbt-init`, chosen)** | keeps every uid split (the witness store, the sealed keys); works the same on Umbrel, StartOS (volumes arrive root-owned on every start) and plain compose; also repairs a restore | one short-lived root container (no network, three capabilities) |
+| one uid (`user: 1000:1000` everywhere) | no root container at all | the witness can be rewritten by the signer's user; the MCP and UI can read the signer's keys |
+| an umbrelOS `hooks/pre-start` script | no extra image | Umbrel only (StartOS has no hooks), runs on the host as root with a full shell |
+| named volumes only | Docker copies the image's owners | Umbrel apps keep data under `${APP_DATA_DIR}` (backups, uninstall); StartOS has its own volumes |
+
+**Language for `xbt-init`: Rust (chosen)**, a 0.5 MB static binary in the same workspace, sharing the uid
+table and the secret rules with the services, `FROM scratch` like every other image, for amd64, arm64 and
+arm/v7. A busybox shell script would need a base image pulled from a registry and would duplicate the layout
+in shell. Go would add a second toolchain for 300 lines.

@@ -10,12 +10,12 @@ export const main = sdk.setupMain(async ({ effects }) => {
   // the MCP interface's addresses, for the UI's Agents page (main re-runs when they change)
   const mcpHost = await sdk.host.getOwn(effects, 'mcp').const()
   const mcpIface = Object.values(mcpHost?.bindings ?? {})
-    .flatMap(b => Object.values(b.interfaces))
-    .find(i => i.id === 'mcp')
-  const mcpUrls = (mcpIface?.addressInfo?.nonLocal.format('urlstring') ?? []).map(u => u.replace(/\/$/, '') + '/mcp')
+    .flatMap((b) => Object.values(b.interfaces))
+    .find((i) => i.id === 'mcp')
+  const mcpUrls = (mcpIface?.addressInfo?.nonLocal.format('urlstring') ?? []).map((u) => u.replace(/\/$/, '') + '/mcp')
 
   const specs = services({ node: store.node, hubEnabled: store.hubEnabled, mcpUrls })
-  const spec = (id: ServiceSpec['id']) => specs.find(s => s.id === id) as ServiceSpec
+  const spec = (id: ServiceSpec['id']) => specs.find((s) => s.id === id) as ServiceSpec
 
   const sub = (s: ServiceSpec) => {
     let mounts = sdk.Mounts.of()
@@ -74,7 +74,9 @@ export const main = sdk.setupMain(async ({ effects }) => {
           try {
             const r = await fetch(`http://127.0.0.1:${PORTS.mcp}/readyz`)
             if (r.status === 200) return { result: 'success', message: i18n('Ready: the node is synced and the keys are unlocked') }
-            const body = (await r.json().catch(() => ({}))) as { signer_ready?: { node?: { reachable?: boolean; synced?: boolean }; witness?: { reachable?: boolean } } }
+            const body = (await r.json().catch(() => ({}))) as {
+              signer_ready?: { node?: { reachable?: boolean; synced?: boolean }; witness?: { reachable?: boolean } }
+            }
             const sr = body.signer_ready ?? {}
             const why = !sr.node?.reachable
               ? i18n('The XBT node is not reachable: check the Node connection action')

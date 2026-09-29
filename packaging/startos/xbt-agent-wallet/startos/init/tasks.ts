@@ -11,8 +11,8 @@ export const seedStore = sdk.setupOnInit(async (effects, kind) => {
 })
 
 /** The service cannot start without a node: a critical task until the Node connection action is saved. */
-export const watchNode = sdk.setupOnInit(async effects => {
-  const node = await storeJson.read(s => s.node).const(effects)
+export const watchNode = sdk.setupOnInit(async (effects) => {
+  const node = await storeJson.read((s) => s.node).const(effects)
   if (!nodeConfigured(node)) {
     await sdk.action.createOwnTask(effects, nodeConfig, 'critical', {
       reason: i18n('Connect the wallet to your XBT node before starting it'),

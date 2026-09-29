@@ -268,6 +268,20 @@ def main():
     check("W", "after a reset the old password gets no session (the UI sends every request to its first-run page) and a new setup code waits",
           len(new_code) >= 10 and new_code != code_txt and not old.cookie and loc_old.endswith("setup-password"), {"old_login": [st_old, loc_old, old.cookie]})
 
+    # --- W: Rotate the agent token (the action deletes both copies and restarts; xbt-init makes a new one) -------------
+    log("== W: rotate the agent token")
+    vol_sh(vol2, "rm -f /v/mcp/secrets/mcp-http-token /v/ui/secrets/mcp-http-token", ro=False)
+    stop_all()
+    start_all(sp, vol2)
+    wait_until(lambda: status(f"http://127.0.0.1:{P_MCP}/readyz") == 200, 120, "MCP back after the rotation")
+    new_tok = vol_sh(vol2, "cat /v/mcp/secrets/mcp-http-token").stdout.strip()
+    ui_copy = vol_sh(vol2, "cat /v/ui/secrets/mcp-http-token").stdout.strip()
+    st_old_tok = Mcp(f"http://127.0.0.1:{P_MCP}", token).start()[0]
+    st_new_tok = Mcp(f"http://127.0.0.1:{P_MCP}", new_tok).start()[0]
+    check("W", "after Rotate the agent token: a new token (the UI's copy matches); the old one gets 401, the new one works",
+          len(new_tok) == 64 and new_tok != token and ui_copy == new_tok and st_old_tok == 401 and st_new_tok == 200, [st_old_tok, st_new_tok])
+    new_code = vol_sh(vol2, "cat /v/ui/setup-code").stdout.strip()  # still waiting: no password was set since the reset
+
     # --- H: the hub ------------------------------------------------------------------------------------------------
     hub = json.loads(http("GET", f"http://127.0.0.1:{P_HUB}/readyz")[2])
     ui = Ui(f"http://127.0.0.1:{P_UI}")
