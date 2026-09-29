@@ -6,9 +6,10 @@
 //! §13.1 caps (AGP-043): with [`CreditCaps`] set, a receipt's increase is credited only as far as the
 //! caps on *unaudited* credit allow, per invoice and in total. The rest is **held**: receipted by the
 //! Prime, kept in the book, but not spendable. Each credited increase stays unaudited until a coinbase
-//! audit that passes at a height above it ([`ReceiptBook::audited`]); held work is then credited the
-//! next time the receipt (or a later one) is offered. Without caps nothing is held and the book
-//! behaves exactly as the reference.
+//! audit that passes at a height above it ([`ReceiptBook::audited`]), which then credits held work
+//! ([`ReceiptBook::release_held`]). The audit intervals record every receipted increase whether it is
+//! credited or held: the Prime signed for all of it, so the audit bound never depends on the caps.
+//! Without caps nothing is held and the book behaves exactly as the reference.
 use std::collections::HashMap;
 
 use ed25519_dalek::VerifyingKey;
@@ -79,8 +80,6 @@ pub struct ReceiptBook {
     pub fraud: Vec<Equivocation>,
     /// Credited increases no passing audit covers yet: (invoice, hi, work).
     pub unaudited: Vec<(String, u32, u64)>,
-    /// invoice -> the lowest height of its held (receipted, not yet credited) work.
-    held_lo: HashMap<String, u32>,
     /// The caps in force (configuration, not state).
     pub caps: CreditCaps,
     /// Set: no new credit at all (the carry rules of §10.3/§13.1), with the reason's short code.
@@ -90,7 +89,7 @@ pub struct ReceiptBook {
 impl ReceiptBook {
     pub fn new(identity: &str, prime_pubkey: VerifyingKey, prime_id: u32) -> Self {
         Self { identity: identity.into(), prime_pubkey, prime_id, last: IndexMap::new(), by_seq: HashMap::new(),
-               credited: HashMap::new(), intervals: vec![], fraud: vec![], unaudited: vec![], held_lo: HashMap::new(),
+               credited: HashMap::new(), intervals: vec![], fraud: vec![], unaudited: vec![],
                caps: CreditCaps::default(), frozen: None }
     }
 
@@ -133,25 +132,15 @@ impl ReceiptBook {
         before - self.unaudited_work(None)
     }
 
-    /// Credit `invoice`'s held work as far as the caps allow; returns the work credited.
+    /// Credit `invoice`'s held work as far as the caps allow; returns the work credited. The credit
+    /// stays unaudited until an audit passes above the best receipt's last share.
     fn credit(&mut self, invoice: &str) -> u64 {
         let before = *self.credited.entry(invoice.to_string()).or_insert(0);
-        let Some(best) = self.last.get(invoice).map(|s| s.receipt.clone()) else { return 0 };
-        let want = best.cum_work.saturating_sub(before);
-        if want == 0 {
-            self.held_lo.remove(invoice);
-            return 0;
-        }
-        let grant = want.min(self.room(invoice));
-        if grant == 0 {
-            return 0;
-        }
-        let lo = self.held_lo.get(invoice).copied().unwrap_or(best.first_height);
-        self.intervals.push((lo, best.last_height, grant));
-        self.unaudited.push((invoice.to_string(), best.last_height, grant));
-        self.credited.insert(invoice.to_string(), before + grant);
-        if grant == want {
-            self.held_lo.remove(invoice);
+        let Some((cum, hi)) = self.last.get(invoice).map(|s| (s.receipt.cum_work, s.receipt.last_height)) else { return 0 };
+        let grant = cum.saturating_sub(before).min(self.room(invoice));
+        if grant > 0 {
+            self.unaudited.push((invoice.to_string(), hi, grant));
+            self.credited.insert(invoice.to_string(), before + grant);
         }
         grant
     }
@@ -210,15 +199,16 @@ impl ReceiptBook {
         if r.seq == 0 {
             return Ok(0);
         }
-        // the new work's shares lie above the previous receipt's last height, and held work (if
-        // any) from where it started
-        let lo = match (self.held_lo.get(invoice), &prev) {
-            (Some(l), _) => *l,
-            (None, Some(p)) if p.receipt.seq != 0 => p.receipt.last_height,
+        // the audit interval: all the work this receipt adds, credited or held
+        let lo = match &prev {
+            Some(p) if p.receipt.seq != 0 => p.receipt.last_height,
             _ => r.first_height,
         };
+        let added = r.cum_work.saturating_sub(prev.as_ref().map_or(0, |p| p.receipt.cum_work));
+        if added > 0 {
+            self.intervals.push((lo, r.last_height, added));
+        }
         self.last.insert(invoice.to_string(), s.clone());
-        self.held_lo.insert(invoice.to_string(), lo);
         Ok(self.credit(invoice))
     }
 
@@ -251,10 +241,9 @@ impl ReceiptBook {
         let iv: Vec<Value> = self.intervals.iter().map(|(lo, hi, w)| Value::from(vec![Value::from(*lo), Value::from(*hi), Value::from(*w)])).collect();
         let cr: serde_json::Map<String, Value> = self.last.keys().map(|k| (k.clone(), self.credited.get(k).copied().unwrap_or(0).into())).collect();
         let ua: Vec<Value> = self.unaudited.iter().map(|(i, hi, w)| Value::from(vec![Value::from(i.clone()), Value::from(*hi), Value::from(*w)])).collect();
-        let hl: serde_json::Map<String, Value> = self.held_lo.iter().map(|(k, v)| (k.clone(), (*v).into())).collect();
         obj([("last", last.into()), ("credited", Value::Object(cr)), ("intervals", iv.into()),
              ("fraud", self.fraud.iter().map(Equivocation::to_json).collect::<Vec<_>>().into()),
-             ("unaudited", ua.into()), ("heldLo", Value::Object(hl))])
+             ("unaudited", ua.into())])
     }
 
     /// Restore [`ReceiptBook::to_json`]. Every held receipt must still verify.
@@ -279,9 +268,6 @@ impl ReceiptBook {
             let inv = u.get(0).and_then(Value::as_str).ok_or_else(|| bad("unaudited"))?;
             let f = |j: usize| u.get(j).and_then(Value::as_u64).ok_or_else(|| bad("unaudited"));
             self.unaudited.push((inv.to_string(), f(1)? as u32, f(2)?));
-        }
-        for (k, lo) in v.get("heldLo").and_then(Value::as_object).into_iter().flatten() {
-            self.held_lo.insert(k.clone(), lo.as_u64().ok_or_else(|| bad("heldLo"))? as u32);
         }
         for e in v.get("fraud").and_then(Value::as_array).into_iter().flatten() {
             let line = |k: &str| -> Result<Signed> {
@@ -351,12 +337,14 @@ mod tests {
         assert_eq!(b.accept(&k.sign(&rj(2, 15, 103, 104)).unwrap(), J).unwrap(), 10);
         assert_eq!((b.unaudited_work(None), b.held_total(), b.room(J)), (30, 13, 0));
         assert!(b.funded(J));
+        // the audit intervals hold all the receipted work, credited or not
+        assert_eq!(b.intervals, vec![(101, 102, 12), (102, 104, 16), (103, 104, 15)]);
         // an audit at 104 covers only the credits whose shares are all below it
         assert_eq!(b.audited(104), 12);
         assert_eq!(b.unaudited_work(None), 18);
-        // a later receipt of I: its interval starts where the held work started (102), not at 104
+        // a later receipt of I: 12 more receipted; room for 12 under the invoice cap, 8 stay held
         assert_eq!(b.accept(&k.sign(&r(9, 40, 101, 106)).unwrap(), I).unwrap(), 12);
-        assert_eq!(b.intervals, vec![(101, 102, 12), (102, 104, 8), (103, 104, 10), (102, 106, 12)]);
+        assert_eq!(*b.intervals.last().unwrap(), (104, 106, 12));
         assert_eq!(b.held(I), 8);
         // everything below 107 audited: held work flows again, as far as the caps allow
         b.audited(107);
@@ -371,7 +359,7 @@ mod tests {
         c.load(&b.to_json()).unwrap();
         assert_eq!((c.unaudited.clone(), c.held(I), c.credited[I]), (b.unaudited.clone(), 4, 40));
         assert_eq!(c.accept(&k.sign(&r(10, 44, 101, 107)).unwrap(), I).unwrap(), 4);
-        assert_eq!(*c.intervals.last().unwrap(), (106, 107, 4));
+        assert_eq!(c.intervals, b.intervals);
     }
 
     #[test]

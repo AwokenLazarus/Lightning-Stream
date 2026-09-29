@@ -77,6 +77,8 @@ pub struct WorkConfig {
     /// §10.3: owed carry grew over each of the last N audited blocks: stop new credit (set it when the
     /// provider attests every tip, so growth means the Prime is not paying).
     pub carry_growth_blocks: Option<usize>,
+    /// The chain enforces payee attestation (§13.8): the identity must be a key-path P2TR address.
+    pub nta: bool,
 }
 
 impl WorkConfig {
@@ -84,7 +86,7 @@ impl WorkConfig {
         Self { network: network.into(), identity: canonical_identity(identity), prime_id, prime_pubkey_hex: prime_pubkey_hex.into(),
                receipt_url: receipt_url.into(), relay_url: None, amount: Amount::Fixed(1), invoice_price_sats: 0,
                invoice_ttl_secs: 3600, max_unfunded: 10_000, max_timeout_secs: 3600, state_path: None, caps: CreditCaps::default(),
-               max_owed_carry_sats: None, carry_growth_blocks: None }
+               max_owed_carry_sats: None, carry_growth_blocks: None, nta: false }
     }
 }
 
@@ -131,6 +133,13 @@ impl WorkProvider {
     pub fn new(cfg: WorkConfig) -> Result<Self> {
         if !valid_identity(&cfg.identity) {
             return fail("bad_config", "identity outside the grammar (§4.2)");
+        }
+        if cfg.nta {
+            // §13.8 rule 1: any other script cannot be a payee; the Prime could only carry its share forever
+            let spk = xbt_primitives::address::address_to_spk(&cfg.identity, None).unwrap_or_default();
+            if !crate::nta::is_payee_script(&spk) {
+                return fail("bad_config", "the identity is not a key-path P2TR address: it cannot be paid under payee attestation (§13.8)");
+            }
         }
         let pubkey = pubkey_from_hex(&cfg.prime_pubkey_hex).map_err(|e| WorkError::new("bad_config", e.0))?;
         let mut book = ReceiptBook::new(&cfg.identity, pubkey, cfg.prime_id);

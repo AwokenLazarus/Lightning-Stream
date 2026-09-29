@@ -334,12 +334,13 @@ fn credit_caps_end_to_end() {
     assert_eq!(w.work.exposure(), (45, 35));
     assert_eq!(w.work.report()["credit"]["unauditedWork"], json!(45));
 
-    // a pool block at 104 passes its audit: the 45 are covered, the held 35 are credited
+    // a pool block at 104 passes its audit (its bound counts all 80 receipted units, credited or held):
+    // the 45 credited are covered, the held 35 are credited
     let v = 5_000_000_000u64;
     let stmt = |h: u32, c: &str| WindowStatement { prime_id: 70, height: h, block_hash: c.repeat(32), window_start: 100, window_work: 1000,
                                                   min_payout: 546, fee_bps: 0 };
-    let o = w.work.audit(&w.prime.sign_window(&stmt(104, "a1")).unwrap(), &[], v, 225_000_000).unwrap();
-    assert!(o.ok && o.proven_work == 45);
+    let o = w.work.audit(&w.prime.sign_window(&stmt(104, "a1")).unwrap(), &[], v, 400_000_000).unwrap();
+    assert!(o.ok && o.proven_work == 80);
     assert_eq!(w.work.exposure(), (35, 0));
     assert_eq!(w.work.balance(&ia), Some((50, 30)));
     assert_eq!(ca.request("GET", &format!("{API}/v1/a4"), b"").unwrap().status, 200);

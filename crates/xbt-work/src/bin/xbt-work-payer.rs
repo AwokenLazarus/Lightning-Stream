@@ -12,6 +12,9 @@
 //!     over the provider's admin endpoint), print the evidence JSON. Exit 0 when every check passes.
 //!     `--pause-file`: written once the receipts cover the calls (the harness pauses the miner), then
 //!     the receipt must stay unchanged for 12 s before paying, so the refusals see a settled balance.
+//! xbt-work-payer call BASE PATH --state FILE
+//!     one paid call with the Rust Client (AGP-043: the live cap refusals); prints
+//!     `{"status", "error", "code", "balanceWork", "heldWork"}` and exits 0 on HTTP 200, 1 otherwise.
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -306,6 +309,25 @@ fn pay(base: &str, calls: usize, secs: f64, state: &str) -> i32 {
     if c.ok { 0 } else { 1 }
 }
 
+fn call(base: &str, path: &str, state: &str) -> i32 {
+    let meta = xbt402::json::parse(&std::fs::read_to_string(meta_path(state)).expect("prepare first")).expect("meta");
+    let net = meta["network"].as_str().expect("network").to_string();
+    let p = payer(state, &net);
+    let mut client = Client::new(ClientConfig::new(&net), Box::new(UreqTransport::default()), Box::new(NoWallet), Box::new(|| Ok(0)))
+        .with_payer(p.clone());
+    let out = match client.request("GET", &format!("{base}{path}"), b"") {
+        Ok(r) => {
+            let pr = r.header("PAYMENT-REQUIRED").and_then(|h| unb64json(h).ok()).unwrap_or(Value::Null);
+            let resp = r.header("PAYMENT-RESPONSE").and_then(|h| unb64json(h).ok()).unwrap_or(Value::Null);
+            json!({"status": r.status, "error": pr["error"], "code": pr["error"], "heldWork": pr["work"]["heldWork"],
+                   "balanceWork": resp["extra"]["receipt"]["balanceWork"], "creditedWork": resp["extra"]["receipt"]["creditedWork"]})
+        }
+        Err(e) => json!({"status": Value::Null, "error": e.to_string(), "code": e.code}),
+    };
+    println!("{}", xbt402::json::dumps(&out));
+    if out["status"] == json!(200) { 0 } else { 1 }
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let state = arg("--state").expect("--state FILE");
@@ -314,9 +336,11 @@ fn main() {
             prepare(a.get(2).expect("BASE"), &state);
             0
         }
+        Some("call") => call(a.get(2).expect("BASE"), a.get(3).expect("PATH"), &state),
         Some("pay") => pay(a.get(2).expect("BASE"), a.get(3).expect("CALLS").parse().expect("calls"), a.get(4).expect("SECS").parse().expect("secs"), &state),
         _ => {
-            eprintln!("usage: xbt-work-payer prepare BASE --state F | pay BASE CALLS SECS --state F --rpc-port R --cookie C --window-url U");
+            eprintln!("usage: xbt-work-payer prepare BASE --state F | pay BASE CALLS SECS --state F --rpc-port R --cookie C --window-url U \
+                       | call BASE PATH --state F");
             2
         }
     };
