@@ -14,6 +14,7 @@ use xbt402::provider::{HttpResponse, Provider, ProviderConfig};
 use xbt402::wire::{b64json, unb64json};
 use xbt_primitives::secp256k1::SecretKey;
 use xbt_work::audit::{check_fraud_proof, Deferral, WindowStatement};
+use xbt_work::book::CreditCaps;
 use xbt_work::payer::{PayerConfig, WorkPayer};
 use xbt_work::provider::{Amount, WorkConfig, WorkProvider, WorkScheme};
 use xbt_work::receipt::{PrimeKey, WorkReceipt};
@@ -80,12 +81,17 @@ struct World {
 
 impl World {
     fn new(state: Option<std::path::PathBuf>) -> Self {
+        Self::new_with(state, |_| {})
+    }
+
+    fn new_with(state: Option<std::path::PathBuf>, f: impl FnOnce(&mut WorkConfig)) -> Self {
         let prime = PrimeKey::from_seed(70, &[9u8; 32]);
         let net = Arc::new(Net { api: Mutex::new(None), relay: Mutex::new(HashMap::new()) });
         let mut cfg = WorkConfig::new(NET, &PROV.to_uppercase(), 70, &format!("{}{}", prime.pubkey_hex(), "ab".repeat(32)), "http://prime.test/receipt");
         cfg.relay_url = Some(RELAY.into());
         cfg.amount = Amount::Fixed(10);
         cfg.state_path = state;
+        f(&mut cfg);
         let work = Arc::new(WorkProvider::new(cfg).unwrap());
         let w = World { t: T(net), prime, work };
         w.install();
@@ -294,4 +300,96 @@ fn state_survives_a_restart() {
     assert_eq!(c2.request("GET", &format!("{API}/v1/c"), b"").unwrap().status, 200);
     assert_eq!(c2.request("GET", &format!("{API}/v1/d"), b"").unwrap_err().code, "insufficient_work");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// §13.1 (AGP-043): unaudited credit capped per invoice and in total, the rest held until an audit
+/// passes; owed carry over its cap, or growing block after block, stops new credit until released.
+#[test]
+fn credit_caps_end_to_end() {
+    let w = World::new_with(None, |c| {
+        c.caps = CreditCaps { per_invoice: Some(30), total: Some(45) };
+        c.max_owed_carry_sats = Some(100_000_000);
+    });
+    let (pa, pb) = (w.payer(), w.payer());
+    let ia = pa.prepare(&w.t, &format!("{API}/v1/pools")).unwrap().invoice_id().to_string();
+    let ib = pb.prepare(&w.t, &format!("{API}/v1/pools")).unwrap().invoice_id().to_string();
+    let (mut ca, mut cb) = (w.client(pa.clone()), w.client(pb.clone()));
+
+    // A mines 50 units: 30 are credited (the invoice cap), 20 held
+    w.credit(&ia, 5, 50, 101, 103);
+    for i in 0..3 {
+        assert_eq!(ca.request("GET", &format!("{API}/v1/a{i}"), b"").unwrap().status, 200);
+    }
+    assert_eq!(ca.request("GET", &format!("{API}/v1/a3"), b"").unwrap_err().code, "credit_cap");
+    let best = pa.session(API).unwrap().best.unwrap();
+    let (st, pr) = w.raw("/v1/a3", &pa.header_with(API, &best.receipt.to_doc(), &hex::encode(best.sig), "GET", "/v1/a3", b"").unwrap());
+    assert_eq!((st, err(&pr)), (402, "credit_cap"));
+    assert_eq!((pr["work"]["creditedWork"].clone(), pr["work"]["heldWork"].clone(), pr["work"]["capInvoiceWork"].clone()),
+               (json!("30"), json!("20"), json!("30")));
+    // B mines 30: the total cap (45) leaves 15
+    w.credit(&ib, 3, 30, 101, 103);
+    assert_eq!(cb.request("GET", &format!("{API}/v1/b0"), b"").unwrap().status, 200);
+    assert_eq!(cb.request("GET", &format!("{API}/v1/b1"), b"").unwrap_err().code, "credit_cap");
+    assert_eq!(w.work.balance(&ib), Some((15, 10)));
+    assert_eq!(w.work.exposure(), (45, 35));
+    assert_eq!(w.work.report()["credit"]["unauditedWork"], json!(45));
+
+    // a pool block at 104 passes its audit: the 45 are covered, the held 35 are credited
+    let v = 5_000_000_000u64;
+    let stmt = |h: u32, c: &str| WindowStatement { prime_id: 70, height: h, block_hash: c.repeat(32), window_start: 100, window_work: 1000,
+                                                  min_payout: 546, fee_bps: 0 };
+    let o = w.work.audit(&w.prime.sign_window(&stmt(104, "a1")).unwrap(), &[], v, 225_000_000).unwrap();
+    assert!(o.ok && o.proven_work == 45);
+    assert_eq!(w.work.exposure(), (35, 0));
+    assert_eq!(w.work.balance(&ia), Some((50, 30)));
+    assert_eq!(ca.request("GET", &format!("{API}/v1/a4"), b"").unwrap().status, 200);
+    assert_eq!(cb.request("GET", &format!("{API}/v1/b2"), b"").unwrap().status, 200);
+
+    // block 105 (80 units in its window) defers the provider's 400M sats (unattested): owed carry over the 100M cap
+    let sw = w.prime.sign_window(&stmt(105, "a2")).unwrap();
+    let dl = w.prime.sign_deferral(&Deferral { prime_id: 70, height: 105, block_hash: "a2".repeat(32), identity: PROV.into(), sats: 400_000_000,
+                                                reason: "unattested".into() }).unwrap();
+    assert!(w.work.audit(&sw, std::slice::from_ref(&dl), v, 0).unwrap().ok);
+    // auditing it again counts the carry once
+    assert!(w.work.audit(&sw, std::slice::from_ref(&dl), v, 0).unwrap().ok);
+    assert_eq!(w.work.carry().owed(), 400_000_000);
+    assert_eq!(w.work.report()["credit"]["frozen"], json!("carry_cap"));
+    // no new credit while it is owed: A's next receipt is held, the call refused with carry_cap
+    w.credit(&ia, 9, 70, 104, 106);
+    assert_eq!(w.work.refresh(&w.t).iter().find(|(i, _)| *i == ia).unwrap().1, Ok(0));
+    assert_eq!(ca.request("GET", &format!("{API}/v1/a5"), b"").unwrap().status, 200);  // the last 10 of its 50
+    assert_eq!(ca.request("GET", &format!("{API}/v1/a6"), b"").unwrap_err().code, "carry_cap");
+    // block 106 pays the share plus the carry: released, credit flows again
+    let o = w.work.audit(&w.prime.sign_window(&stmt(106, "a3")).unwrap(), &[], v, 800_000_000).unwrap();
+    assert!(o.ok && o.expected_sats == 400_000_000);
+    assert_eq!(w.work.carry().owed(), 0);
+    assert_eq!(w.work.report()["credit"]["frozen"], Value::Null);
+    assert_eq!(w.work.balance(&ia), Some((70, 50)));
+    assert_eq!(ca.request("GET", &format!("{API}/v1/a7"), b"").unwrap().status, 200);
+}
+
+#[test]
+fn carry_that_keeps_growing_stops_credit() {
+    let w = World::new_with(None, |c| c.carry_growth_blocks = Some(2));
+    let payer = w.payer();
+    let inv = payer.prepare(&w.t, &format!("{API}/v1/pools")).unwrap().invoice_id().to_string();
+    let v = 5_000_000_000u64;
+    let grow = |h: u32, sats: u64| {
+        let s = WindowStatement { prime_id: 70, height: h, block_hash: format!("{h:064x}"), window_start: 100, window_work: 1000, min_payout: 546, fee_bps: 0 };
+        let dl = w.prime.sign_deferral(&Deferral { prime_id: 70, height: h, block_hash: s.block_hash.clone(), identity: PROV.into(), sats,
+                                                    reason: "unattested".into() }).unwrap();
+        assert!(w.work.audit(&w.prime.sign_window(&s).unwrap(), &[dl], v, 0).unwrap().ok);
+    };
+    grow(110, 1_000);
+    assert_eq!(w.work.report()["credit"]["frozen"], Value::Null);
+    grow(111, 1_000);
+    assert_eq!(w.work.report()["credit"]["frozen"], json!("carry_growing"));
+    w.credit(&inv, 2, 20, 111, 112);
+    assert_eq!(w.work.refresh(&w.t)[0].1, Ok(0));
+    let mut client = w.client(payer);
+    // the first call answers the unpaid 402 with the receipt: the provider's refusal comes back as is
+    let r = client.request("GET", &format!("{API}/v1/x"), b"").unwrap();
+    assert_eq!((r.status, err(&unb64json(r.header("PAYMENT-REQUIRED").unwrap()).unwrap())), (402, "carry_growing"));
+    // the next one (header up front) turns it into the payer's error
+    assert_eq!(client.request("GET", &format!("{API}/v1/y"), b"").unwrap_err().code, "carry_growing");
 }

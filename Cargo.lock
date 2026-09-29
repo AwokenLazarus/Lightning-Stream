@@ -2641,6 +2641,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "xbt-work-relay"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tempfile",
+ "tiny_http",
+ "xbt-svc",
+ "xbt-work",
+ "xbt402",
+]
+
+[[package]]
 name = "xbt402"
 version = "0.1.0"
 dependencies = [

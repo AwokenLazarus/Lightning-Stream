@@ -9,6 +9,13 @@
 //!   released if the handler answers ≥ 500, and answered with the `SettlementResponse` of §9.3.
 //! * [`WorkProvider::refresh`] pulls the latest receipts through the blinded relay (§11.1), and
 //!   [`WorkProvider::audit`] checks a pool coinbase against the book (§10), with the carry ledger.
+//! * §13.1 credit caps (AGP-043, [`WorkConfig::caps`]): unaudited credit is capped per invoice and in
+//!   total; work beyond the caps is held and credited after the next passing audit. The carry the
+//!   Prime owes counts too: above [`WorkConfig::max_owed_carry_sats`], or when it
+//!   [keeps growing](crate::audit::CarryLedger::keeps_growing) over
+//!   [`WorkConfig::carry_growth_blocks`] audited blocks, no new credit is extended until carry is
+//!   released. A call the held work would have paid is refused with `credit_cap`, `carry_cap` or
+//!   `carry_growing` (and the balances in `work`), never with a silent loss: the receipts stay held.
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
@@ -24,7 +31,7 @@ use xbt402::wire::settlement_response;
 
 use crate::audit::{audit_block, AuditOutcome, CarryLedger, SignedDeferral, SignedWindow};
 use crate::auth::{auth_tag, request_digest, tag_eq};
-use crate::book::ReceiptBook;
+use crate::book::{CreditCaps, ReceiptBook};
 use crate::error::{fail, Result, WorkError};
 use crate::grammar::{canonical_identity, random_invoice, uint, valid_identity, U64};
 use crate::pricing::Pricing;
@@ -63,13 +70,21 @@ pub struct WorkConfig {
     pub max_timeout_secs: u64,
     /// Where the book is kept (recorded before each handler runs). None: memory only.
     pub state_path: Option<PathBuf>,
+    /// §13.1: caps on unaudited credit, in work units (about one window's value each).
+    pub caps: CreditCaps,
+    /// §10.3/§13.1: owed carry above this (sats) stops new credit until carry is released.
+    pub max_owed_carry_sats: Option<u64>,
+    /// §10.3: owed carry grew over each of the last N audited blocks: stop new credit (set it when the
+    /// provider attests every tip, so growth means the Prime is not paying).
+    pub carry_growth_blocks: Option<usize>,
 }
 
 impl WorkConfig {
     pub fn new(network: &str, identity: &str, prime_id: u32, prime_pubkey_hex: &str, receipt_url: &str) -> Self {
         Self { network: network.into(), identity: canonical_identity(identity), prime_id, prime_pubkey_hex: prime_pubkey_hex.into(),
                receipt_url: receipt_url.into(), relay_url: None, amount: Amount::Fixed(1), invoice_price_sats: 0,
-               invoice_ttl_secs: 3600, max_unfunded: 10_000, max_timeout_secs: 3600, state_path: None }
+               invoice_ttl_secs: 3600, max_unfunded: 10_000, max_timeout_secs: 3600, state_path: None, caps: CreditCaps::default(),
+               max_owed_carry_sats: None, carry_growth_blocks: None }
     }
 }
 
@@ -118,10 +133,39 @@ impl WorkProvider {
             return fail("bad_config", "identity outside the grammar (§4.2)");
         }
         let pubkey = pubkey_from_hex(&cfg.prime_pubkey_hex).map_err(|e| WorkError::new("bad_config", e.0))?;
-        let book = ReceiptBook::new(&cfg.identity, pubkey, cfg.prime_id);
+        let mut book = ReceiptBook::new(&cfg.identity, pubkey, cfg.prime_id);
+        book.caps = cfg.caps;
         let wp = Self { pubkey, rule: Mutex::new(cfg.amount.clone()), state: Mutex::new(State { invoices: HashMap::new(), book, carry: CarryLedger::default(), audits: vec![], distrust: None }), cfg };
         wp.load()?;
+        wp.carry_rules(&mut wp.lock());
         Ok(wp)
+    }
+
+    /// §10.3/§13.1: freeze new credit while the owed carry is over its cap or keeps growing.
+    fn carry_rules(&self, st: &mut State) {
+        st.book.frozen = if self.cfg.max_owed_carry_sats.is_some_and(|m| st.carry.owed() > m) {
+            Some("carry_cap".into())
+        } else if self.cfg.carry_growth_blocks.is_some_and(|n| st.carry.keeps_growing(n)) {
+            Some("carry_growing".into())
+        } else {
+            None
+        };
+    }
+
+    /// Change the caps (e.g. re-derived from sats at a new epoch). Held work the new caps allow is
+    /// credited at once.
+    pub fn set_caps(&self, caps: CreditCaps) -> Result<Vec<(String, u64)>> {
+        let mut st = self.lock();
+        st.book.caps = caps;
+        let r = st.book.release_held();
+        self.save(&st)?;
+        Ok(r)
+    }
+
+    /// (unaudited, held) work: credit no audit covers yet, and receipted work the caps hold back.
+    pub fn exposure(&self) -> (u64, u64) {
+        let st = self.lock();
+        (st.book.unaudited_work(None), st.book.held_total())
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -193,8 +237,8 @@ impl WorkProvider {
             let mut st = self.lock();
             let t = now();
             let State { invoices, book, .. } = &mut *st;
-            invoices.retain(|k, v| book.credited.get(k).copied().unwrap_or(0) > 0 || v.expires_at >= t);
-            let unfunded = invoices.keys().filter(|k| book.credited.get(*k).copied().unwrap_or(0) == 0).count();
+            invoices.retain(|k, v| book.funded(k) || v.expires_at >= t);
+            let unfunded = invoices.keys().filter(|k| !book.funded(k)).count();
             if unfunded >= self.cfg.max_unfunded {
                 return fail("too_many_invoices", "");
             }
@@ -236,7 +280,7 @@ impl WorkProvider {
     pub fn invoices(&self) -> Vec<String> {
         let st = self.lock();
         let t = now();
-        let mut v: Vec<String> = st.invoices.iter().filter(|(k, i)| !i.retired && (st.book.credited.contains_key(*k) || i.expires_at >= t))
+        let mut v: Vec<String> = st.invoices.iter().filter(|(k, i)| !i.retired && (st.book.credited.contains_key(*k) || st.book.funded(k) || i.expires_at >= t))
             .map(|(k, _)| k.clone()).collect();
         v.sort();
         v
@@ -279,19 +323,32 @@ impl WorkProvider {
         out
     }
 
-    /// §10.3 for one pool coinbase: records the verdict (and the carry it defers or releases).
+    /// §10.3 for one pool coinbase: records the verdict (and the carry it defers or releases). Auditing
+    /// a block again (more receipts, the statement's lines fetched again) replaces its earlier verdict
+    /// and carry, so nothing is counted twice. A pass covers every credit with shares below the block
+    /// (§13.1): held work is credited as far as the caps then allow.
     pub fn audit(&self, sw: &SignedWindow, deferred: &[SignedDeferral], coinbase_value_sats: u64, paid_sats: u64) -> Result<AuditOutcome> {
         let mut st = self.lock();
         let o = audit_block(&st.book, sw, coinbase_value_sats, paid_sats, deferred)?;
         st.carry.record(sw.stmt.height, &o);
+        let mut released = 0;
         if !o.ok && st.distrust.is_none() {
             st.distrust = Some(("wrong_prime".into(), format!("the Prime's coinbase at height {} failed the audit", sw.stmt.height)));
         }
-        let mut rec = obj([("height", sw.stmt.height.into()), ("ok", o.ok.into()), ("expectedSats", o.expected_sats.into()),
-                           ("paidSats", paid_sats.into()), ("deferredSats", o.deferred_sats.into()), ("provenWork", o.proven_work.into())]);
+        self.carry_rules(&mut st);
+        if o.ok {
+            released = st.book.audited(sw.stmt.height);
+            st.book.release_held();
+        }
+        let mut rec = obj([("height", sw.stmt.height.into()), ("blockHash", sw.stmt.block_hash.clone().into()), ("ok", o.ok.into()),
+                           ("expectedSats", o.expected_sats.into()), ("paidSats", paid_sats.into()), ("deferredSats", o.deferred_sats.into()),
+                           ("provenWork", o.proven_work.into()), ("coveredWork", released.into()),
+                           ("owedCarrySats", st.carry.owed().into())]);
         if let Some(p) = &o.proof {
             rec["proof"] = p.clone();
         }
+        let (h, hash) = (u64::from(sw.stmt.height), sw.stmt.block_hash.as_str());
+        st.audits.retain(|a| !(a.get("height").and_then(Value::as_u64) == Some(h) && a.get("blockHash").and_then(Value::as_str) == Some(hash)));
         st.audits.push(rec);
         self.save(&st)?;
         Ok(o)
@@ -304,7 +361,12 @@ impl WorkProvider {
     /// Audit log, equivocations and carry, as JSON.
     pub fn report(&self) -> Value {
         let st = self.lock();
-        obj([("audits", st.audits.clone().into()), ("carry", st.carry.to_json()),
+        let caps = |c: Option<u64>| c.map(Value::from).unwrap_or(Value::Null);
+        let credit = obj([("unauditedWork", st.book.unaudited_work(None).into()), ("heldWork", st.book.held_total().into()),
+                          ("capInvoiceWork", caps(st.book.caps.per_invoice)), ("capTotalWork", caps(st.book.caps.total)),
+                          ("maxOwedCarrySats", caps(self.cfg.max_owed_carry_sats)),
+                          ("frozen", st.book.frozen.clone().map(Value::from).unwrap_or(Value::Null))]);
+        obj([("audits", st.audits.clone().into()), ("carry", st.carry.to_json()), ("credit", credit),
              ("distrust", st.distrust.as_ref().map(|(c, m)| obj([("code", c.clone().into()), ("why", m.clone().into())])).unwrap_or(Value::Null)),
              ("equivocations", st.book.fraud.iter().map(|e| e.to_json()).collect::<Vec<_>>().into()),
              ("intervals", st.book.to_json()["intervals"].clone())])
@@ -320,7 +382,8 @@ impl WorkProvider {
         }).collect();
         let doc = obj([("version", 1.into()), ("identity", self.cfg.identity.clone().into()), ("invoices", Value::Object(inv)),
                        ("book", st.book.to_json()), ("audits", st.audits.clone().into()),
-                       ("carry", obj([("deferred", st.carry.deferred_total.into()), ("released", st.carry.released_total.into())])),
+                       ("carry", obj([("deferred", st.carry.deferred_total.into()), ("released", st.carry.released_total.into()),
+                                      ("blocks", st.carry.blocks.iter().map(|(h, e, p, d)| Value::from(vec![Value::from(*h), Value::from(*e), Value::from(*p), Value::from(*d)])).collect::<Vec<_>>().into())])),
                        ("distrust", st.distrust.as_ref().map(|(c, m)| Value::from(vec![c.clone(), m.clone()])).unwrap_or(Value::Null))]);
         crate::fsx::write_private(path, dumps(&doc).as_bytes()).map_err(|e| WorkError::new("state_io", e.to_string()))
     }
@@ -347,6 +410,10 @@ impl WorkProvider {
         st.audits = v.get("audits").and_then(Value::as_array).cloned().unwrap_or_default();
         st.carry.deferred_total = v.pointer("/carry/deferred").and_then(Value::as_u64).unwrap_or(0);
         st.carry.released_total = v.pointer("/carry/released").and_then(Value::as_u64).unwrap_or(0);
+        for b in v.pointer("/carry/blocks").and_then(Value::as_array).into_iter().flatten() {
+            let f = |j: usize| b.get(j).and_then(Value::as_u64).ok_or_else(|| bad("carry block"));
+            st.carry.blocks.push((f(0)? as u32, f(1)?, f(2)?, f(3)?));
+        }
         st.distrust = v.get("distrust").and_then(Value::as_array).and_then(|a| Some((a.first()?.as_str()?.to_string(), a.get(1)?.as_str()?.to_string())));
         Ok(())
     }
@@ -384,7 +451,7 @@ impl WorkProvider {
         let t = now();
         let State { invoices, book, .. } = &mut *st;
         // 4. issued here, not expired (unfunded), not retired
-        let funded = book.credited.get(&r.invoice).copied().unwrap_or(0) > 0;
+        let funded = book.funded(&r.invoice);
         let Some(inv) = invoices.get_mut(&r.invoice).filter(|i| !i.retired && (funded || i.expires_at >= t)) else {
             return refuse("unknown_invoice");
         };
@@ -420,10 +487,26 @@ impl WorkProvider {
         let inv = invoices.get_mut(&invoice).expect("checked above");
         // 9. billing
         if credited.saturating_sub(inv.spent) < amount {
-            let work = obj([("invoice", invoice.clone().into()), ("creditedWork", credited.to_string().into()),
-                            ("spentWork", inv.spent.to_string().into())]);
+            let held = book.held(&invoice);
+            let mut work = obj([("invoice", invoice.clone().into()), ("creditedWork", credited.to_string().into()),
+                                ("spentWork", inv.spent.to_string().into())]);
+            // §13.1: receipted work the caps hold back would have paid: say why, and what is held
+            let code = if held > 0 {
+                work["heldWork"] = held.to_string().into();
+                work["unauditedWork"] = book.unaudited_work(Some(&invoice)).to_string().into();
+                work["unauditedTotalWork"] = book.unaudited_work(None).to_string().into();
+                if let Some(c) = book.caps.per_invoice {
+                    work["capInvoiceWork"] = c.to_string().into();
+                }
+                if let Some(c) = book.caps.total {
+                    work["capTotalWork"] = c.to_string().into();
+                }
+                book.frozen.clone().unwrap_or_else(|| "credit_cap".into())
+            } else {
+                "insufficient_work".into()
+            };
             let _ = self.save(&st);
-            return Err(("insufficient_work".into(), Some(work)));
+            return Err((code, Some(work)));
         }
         inv.spent += amount;
         let spent = inv.spent;

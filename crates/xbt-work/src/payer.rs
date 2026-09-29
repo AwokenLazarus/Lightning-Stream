@@ -325,6 +325,13 @@ impl SchemePayer for WorkPayer {
                 }
             }
         }
+        // §13.1: the provider holds receipted work beyond its caps on unaudited credit (or while the
+        // Prime owes it carry) until its next passing audit. Paying again now cannot succeed.
+        if let Some(code) = pr.get("error").and_then(Value::as_str).filter(|c| matches!(*c, "credit_cap" | "carry_cap" | "carry_growing")) {
+            let held = pr.pointer("/work/heldWork").and_then(|v| py_u64(Some(v))).unwrap_or(0);
+            return Err(ChannelError::new(code, format!("the provider holds {held} receipted work units uncredited until its next audited pool \
+                                                        block ({code}); retry later")));
+        }
         let best = self.refresh(t, origin).map_err(xerr)?;
         let s = self.session(origin).expect("session");
         if best.as_ref().map(|b| b.receipt.cum_work).unwrap_or(0).saturating_sub(s.spent) < s.amount() {

@@ -308,10 +308,19 @@ pub struct CarryLedger {
 }
 
 impl CarryLedger {
+    /// Record a block's verdict. A block audited again replaces its earlier entry.
     pub fn record(&mut self, height: u32, o: &AuditOutcome) {
+        let entry = (height, o.expected_sats, o.paid_sats, o.deferred_sats);
+        match self.blocks.iter().position(|b| b.0 == height) {
+            Some(i) => {
+                let (_, e, p, d) = std::mem::replace(&mut self.blocks[i], entry);
+                self.deferred_total = self.deferred_total.saturating_sub(d);
+                self.released_total = self.released_total.saturating_sub(p.saturating_sub(e));
+            }
+            None => self.blocks.push(entry),
+        }
         self.deferred_total = self.deferred_total.saturating_add(o.deferred_sats);
         self.released_total = self.released_total.saturating_add(o.paid_sats.saturating_sub(o.expected_sats));
-        self.blocks.push((height, o.expected_sats, o.paid_sats, o.deferred_sats));
     }
 
     /// Carry still owed.
@@ -362,5 +371,8 @@ mod tests {
         c.record(12, &o(100, 250, 0));
         assert_eq!(c.owed(), 50);
         assert!(!c.keeps_growing(2));
+        // auditing a block again replaces it
+        c.record(12, &o(100, 300, 0));
+        assert_eq!((c.owed(), c.blocks.len()), (0, 3));
     }
 }
