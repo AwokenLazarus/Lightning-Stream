@@ -3,7 +3,9 @@
 # with make-before-break (the next ch2 taken unconfirmed, bounded) in both hubs and both providers
 # (Rust xbt-rs, Python B1 agp-053): ZERO refused locks. Also the pre-AGP-053 baseline (provider
 # --zero-conf-max 0), a rollover kept out of blocks (the fallback: the provider's cap, then the hub
-# holds), and a reorg across the switch. scripts/interop/rollover_load.py has the runs and checks.
+# holds), and a reorg across the switch (cap/close-margin route_blocked only in the reorg window,
+# reported as refusedDuringReorg; plain runs stay zero refusals). scripts/interop/rollover_load.py
+# has the runs and checks.
 # A private Knots 29.4.2 node (B1's scripts/node.sh flags); blocks from the driver's miner only.
 # Ports 34900-34999 (AGP-053). Node and processes wiped on exit. Soak rules: CPUQuota 200%, 4G, nice 19.
 # Env: XBT402_B1, LOAD_ONLY, LOAD_SECONDS, LOAD_RATE, LOAD_BLOCK_S, LOAD_STUCK_S, LOAD_REORG_S, LOAD_REPORT.

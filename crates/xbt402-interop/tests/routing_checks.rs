@@ -686,7 +686,7 @@ fn stale_answer_to_a_given_up_lock_then_resync() {
     w.hub.set_withhold("");
     w.pay.expire_pending(); // given up; no ROUTE-STATE seen since
     assert_eq!(w.pay.stats().voided, 1);
-    assert_eq!(w.pay.lock(w.sh()).unwrap().unwrap(), json!({"status": "refused", "error": "stale_answer"}));
+    assert_eq!(w.pay.lock(w.sh()).unwrap().unwrap(), json!({"status": "refused", "error": "stale_answer", "detail": "hub answer does not open this lock"}));
     stream(&w.pay, w.sh(), 3); // a fresh invoice (and lastLock) arrives
     assert_eq!(w.pay.lock(w.sh()).unwrap().unwrap()["status"], "resynced");
     stream(&w.pay, w.sh(), 3);
@@ -703,7 +703,8 @@ fn provider_never_reveals_hub_writes_off_and_blocks() {
     stream(&w.pay, w.sh(), 30);
     w.hub.set_reveal_timeout(0.3);
     let (b1, b2) = (w.st1().best_cum, w.st2().best_cum);
-    assert_eq!(w.pay.lock(w.sh()).unwrap().unwrap(), json!({"status": "refused", "error": "route_failed"}));
+    let refused = w.pay.lock(w.sh()).unwrap().unwrap();
+    assert_eq!((refused["status"].as_str(), refused["error"].as_str()), (Some("refused"), Some("route_failed")), "{refused}");
     assert_eq!((w.st1().best_cum, w.st2().best_cum), (b1, b2));
     let oc = w.oc();
     assert!(!oc.blocked.is_empty());

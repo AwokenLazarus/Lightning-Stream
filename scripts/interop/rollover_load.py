@@ -16,7 +16,12 @@ state. Runs (hub-provider):
                   child's signed state never above the cap); once it confirms, routing resumes
   <H>-<P>-reorg   a reorg across the switch: once a rollover's child is confirmed, the block holding it
                   is invalidated (the rollover is back in the mempool, the hub sees the child unconfirmed
-                  again), the miner pauses LOAD_REORG_S, then the new chain confirms it: ZERO refusals
+                  again), the miner pauses LOAD_REORG_S, then the new chain confirms it. route_blocked
+                  refusals are allowed only when every one is the zero-conf cap or close-margin reason
+                  for that reorged ch2, and only between the reorg mark and that ch2 re-confirming (or
+                  its next rollover). Counted as refusedDuringReorg. Plain <H>-<P> stays ZERO refusals.
+                  Optional kinds (LOAD_ONLY): reorg-cap (pause until the cap is hit, then re-confirm;
+                  asserts those refusals happen and stop) and reorg-zero (mine immediately; asserts zero)
 Money checks for every run: each rollover tx pays the provider signed - closeFee (payee-pays) and the
 next ch2 capacity - signed; the next ch2's capacity is that output; routed over all of the provider's
 ch2s == what the client paid that shard; no lock pending or written off anywhere.
@@ -52,6 +57,34 @@ SOAK = ["systemd-run", "--user", "--scope", "-q", "-p", "CPUQuota=200%", "-p", "
 PRICE = 24 * 10 ** 21                  # 24 sat a call: ch2 reaches 2 x closeFee net every ~5 s at 15 locks/s
 SETTLE, CLOSE_FEE = 2, 600
 SAT = 100_000_000
+
+
+def reorg_allowed_refusal(code, detail):
+    """True if this lock refusal is the intended safety stop on an unconfirmed rollover child."""
+    d = (detail or "").lower()
+    if code == "route_blocked":
+        return "zero-conf cap" in d or "close margin" in d
+    if code == "zero_conf_cap":
+        return True
+    return code == "unconfirmed" and ("close margin" in d or "rollover" in d)
+
+
+def client_refusals(res):
+    """Each refusal as {t, ts, code, detail}. Prefers the client's refusals list; falls back to timeline."""
+    out = list(res.get("refusals") or [])
+    if out:
+        return out
+    recs = []
+    for x in res.get("timeline") or []:
+        if not (isinstance(x, list) and len(x) >= 3 and x[1] == "refused"):
+            continue
+        third = x[2]
+        if isinstance(third, dict):
+            recs.append({"t": x[0], "ts": third.get("ts"), "code": third.get("code", ""), "detail": third.get("detail", "")})
+        else:
+            recs.append({"t": x[0], "ts": None, "code": third, "detail": ""})
+    return recs
+
 
 node = RPC.from_env()
 W = node.wallet("w")
@@ -138,7 +171,8 @@ class Miner:
 
 def scenario(i, name):
     parts = name.split("-")
-    hub_impl, prov_impl, kind = parts[0], parts[1], (parts[2] if len(parts) > 2 else "after")
+    hub_impl, prov_impl, kind = parts[0], parts[1], ("-".join(parts[2:]) if len(parts) > 2 else "after")
+    is_reorg = kind.startswith("reorg")
     base = PB + 10 + 8 * i
     hub_port, prov_port = base, base + 1
     d = os.path.join(RUN, name)
@@ -150,7 +184,8 @@ def scenario(i, name):
         checks.append({"check": what, "ok": bool(ok), "detail": detail})
 
     def mark(what, **kw):
-        marks.append({"t": round(time.time() - (t_start[0] or time.time()), 3), "what": what, **kw})
+        now = time.time()
+        marks.append({"t": round(now - (t_start[0] or now), 3), "ts": now, "what": what, **kw})
 
     procs, miner, client = [], None, None
     zc = "0" if kind == "before" else "default"
@@ -221,21 +256,35 @@ def scenario(i, name):
                     miner.empty.set()
                     stuck = {"txid": txid, "chan": chan, "at": time.time()}
                     mark("stuck", txid=txid)
-                if kind == "reorg" and reorg is None and rec.get("rolled_from") and z.get("confirmed") and rec.get("state") == "open":
+                if is_reorg and reorg is None and rec.get("rolled_from") and z.get("confirmed") and rec.get("state") == "open":
                     txid = rec["params"]["funding_txid"]
                     miner.hold.set()
                     blk = node.getrawtransaction(txid, True).get("blockhash")
                     node.invalidateblock(blk)
-                    reorg = {"txid": txid, "chan": chan, "block": blk, "at": time.time()}
-                    mark("invalidateblock", txid=txid, block=blk, inMempool=txid in node.getrawmempool())
+                    reorg = {"txid": txid, "chan": chan, "block": blk, "at": time.time(),
+                             "signed": int(rec.get("signed", 0)), "maxCum": int(z.get("maxCum", 0))}
+                    mark("invalidateblock", txid=txid, block=blk, inMempool=txid in node.getrawmempool(),
+                         signed=reorg["signed"], maxCum=reorg["maxCum"])
+                    if kind == "reorg-zero":
+                        mine_one()
+                        miner.hold.clear()
+                        reorg["resumed"] = time.time()
+                        mark("miner_resumed", why="reorg-zero immediate remine")
+                if kind == "reorg-cap" and reorg and not reorg.get("resumed") and rec.get("rolled_from"):
+                    rec_chan = f"{rec['params'].get('funding_txid')}:{rec['params'].get('funding_vout')}"
+                    if rec_chan == reorg["chan"] and int(rec.get("signed", 0)) >= int((rec.get("zero_conf") or {}).get("maxCum") or reorg["maxCum"] or 0):
+                        reorg["capHit"] = int(rec.get("signed", 0))
             if stuck and not stuck.get("released") and time.time() - stuck["at"] >= STUCK_S:
                 miner.empty.clear()
                 stuck["released"] = time.time()
                 mark("released", txid=stuck["txid"])
-            if reorg and not reorg.get("resumed") and time.time() - reorg["at"] >= REORG_S:
-                miner.hold.clear()
-                reorg["resumed"] = time.time()
-                mark("miner_resumed")
+            if reorg and not reorg.get("resumed"):
+                hold_s = 20.0 if kind == "reorg-cap" else (0.0 if kind == "reorg-zero" else REORG_S)
+                cap_done = kind == "reorg-cap" and reorg.get("capHit") and time.time() - reorg["at"] >= 1.0
+                if kind != "reorg-zero" and (time.time() - reorg["at"] >= hold_s or cap_done):
+                    miner.hold.clear()
+                    reorg["resumed"] = time.time()
+                    mark("miner_resumed", capHit=reorg.get("capHit"))
             time.sleep(0.2)
         res = json.load(open(out_path))
         miner.stop.set()
@@ -247,23 +296,65 @@ def scenario(i, name):
         # --- checks ---------------------------------------------------------------------------------
         rolled = [r for r in recs if r.get("state") == "rolled"]
         refused, bad = res.get("refused", {}), res.get("badCalls", {})
-        if kind != "stuck":                # a held rollover pauses routing past the cap, by design
+        if kind not in ("stuck", "before"):  # before/stuck pause routing (block-interval gaps / the cap), so paid rate drops
             check(f"lock rate >= 10/s ({res.get('lockRate')})", res.get("lockRate", 0) >= 10, "")
-        if kind in ("after", "reorg"):
-            check(f"rollovers under load ({len(rolled)})", len(rolled) >= (3 if kind == "after" else 1), "")
+        if kind == "after":
+            check(f"rollovers under load ({len(rolled)})", len(rolled) >= 3, "")
             check("zero refused locks (no route_blocked, nothing to fail over on)", not refused, json.dumps(refused))
             check("every call 200 (no session stalled)", not bad, json.dumps(bad))
-            # a child opens unconfirmed (zeroConf), or plainly if a block confirmed it before the open
             zcs = [bool(r.get("zero_conf")) for r in recs if r.get("rolled_from")]
             check(f"next ch2s taken unconfirmed ({sum(zcs)} of {len(zcs)}; the rest confirmed before the open)", any(zcs), json.dumps(zcs))
         if kind == "before":
             check(f"rollovers under load ({len(rolled)})", len(rolled) >= 2, "")
             check("baseline: the gap is there (route_blocked refusals)", refused.get("route_blocked", 0) > 0, json.dumps(refused))
-        if kind == "reorg":
+        refused_during_reorg = []
+        if is_reorg:
+            check(f"rollovers under load ({len(rolled)})", len(rolled) >= 1, "")
+            check("every call 200 (no session stalled)", not bad, json.dumps(bad))
+            zcs = [bool(r.get("zero_conf")) for r in recs if r.get("rolled_from")]
+            check(f"next ch2s taken unconfirmed ({sum(zcs)} of {len(zcs)}; the rest confirmed before the open)", any(zcs), json.dumps(zcs))
             check("reorg: the hub saw the child unconfirmed again", reorg is not None and any(m["what"] == "zero_conf_unconfirmed" and m["chan"] == reorg["chan"]
                                                                                               and m["t"] >= reorg["at"] - t_start[0] for m in marks),
                   json.dumps(reorg))
             check("reorg: re-confirmed on the new chain", reorg is not None and zc_seen.get(reorg["chan"]) is True, "")
+            start_ts = (reorg or {}).get("at")
+            end_ts = None
+            if reorg:
+                for m in marks:
+                    mts = m.get("ts")
+                    if mts is None:
+                        mts = (t_start[0] or 0) + m.get("t", 0)
+                    if mts < start_ts:
+                        continue
+                    if m["what"] == "zero_conf_confirmed" and m.get("chan") == reorg["chan"]:
+                        end_ts = mts
+                        break
+                    if m["what"] == "rollover" and m.get("parent") == reorg["chan"]:
+                        end_ts = mts
+                        break
+            outside, bad_reason = [], []
+            for rec in client_refusals(res):
+                ts = rec.get("ts")
+                if ts is None:
+                    ts = (t_start[0] or 0) + float(rec.get("t") or 0)
+                in_win = start_ts is not None and ts + 0.05 >= start_ts and (end_ts is None or ts <= end_ts + 0.5)
+                if in_win:
+                    refused_during_reorg.append(rec)
+                    if not reorg_allowed_refusal(rec.get("code"), rec.get("detail")):
+                        bad_reason.append(rec)
+                else:
+                    outside.append(rec)
+            check("reorg: no refusals outside the reorg window (reorg mark → re-confirm or next rollover)",
+                  not outside, json.dumps(outside)[:500])
+            check("reorg: every refusal in the window is zero-conf cap or close-margin for the reorged ch2",
+                  not bad_reason, json.dumps(bad_reason)[:500])
+            if kind == "reorg-cap":
+                check("reorg-cap: the pause exceeded headroom (cap refusals happened)", len(refused_during_reorg) > 0,
+                      json.dumps(refused_during_reorg[:5])[:400])
+            if kind == "reorg-zero":
+                check("reorg-zero: the pause stayed under headroom (zero refusals)", not refused_during_reorg,
+                      json.dumps(refused_during_reorg)[:400])
+
         if kind == "stuck":
             capped = [c for c, (hi, cap) in max_unconf.items() if stuck and c == stuck["chan"]]
             hi, cap = max_unconf.get(stuck["chan"], (0, 0)) if stuck else (0, 0)
@@ -300,8 +391,9 @@ def scenario(i, name):
         check(f"routed over all ch2s == what the client's locks paid ({routed} == {paid})", routed == paid and paid > 0, "")
         check("no ch2 lock pending or written off", all(not r.get("pending") and not r.get("stale") for r in recs), "")
         return {"run": name, "ok": all(c["ok"] for c in checks), "checks": checks, "rollovers": len(rolled),
-                "client": {k: res.get(k) for k in ("seconds", "calls", "locksPaid", "lockRate", "refused", "badCalls", "lockOther",
-                                                  "maxGapMs", "gapsOver1s", "gapP50Ms", "lockMs")},
+                "client": {k: res.get(k) for k in ("seconds", "calls", "locksPaid", "lockRate", "refused", "refusals", "badCalls",
+                                                  "lockOther", "maxGapMs", "gapsOver1s", "gapP50Ms", "lockMs")},
+                "refusedDuringReorg": refused_during_reorg, "refusedDuringReorgN": len(refused_during_reorg),
                 "refusedPerRollover": round(sum(refused.values()) / max(1, len(rolled)), 2),
                 "timeline": res.get("timeline", [])[:200], "marks": marks,
                 "book": [{k: r.get(k) for k in ("state", "rolled_from", "zero_conf", "signed", "routed", "opened_at", "blocked", "close_txid")}
@@ -321,6 +413,9 @@ def scenario(i, name):
 def main():
     runs = ["RS-RS", "PY-PY", "RS-PY", "PY-RS", "RS-RS-before", "PY-PY-before", "RS-RS-stuck", "PY-PY-stuck", "RS-RS-reorg", "PY-PY-reorg"]
     only = [x for x in os.environ.get("LOAD_ONLY", "").split(",") if x]
+    for name in only:
+        if name not in runs:
+            runs.append(name)
     results = []
     for i, name in enumerate(runs):
         if only and name not in only:
@@ -328,8 +423,9 @@ def main():
         r = scenario(i, name)
         results.append(r)
         c = r.get("client") or {}
-        print(f"  {name:13s} {'PASS' if r['ok'] else 'FAIL'}  rollovers {r.get('rollovers')}  locks/s {c.get('lockRate')}  "
-              f"refused {c.get('refused')}  badCalls {c.get('badCalls')}  maxGapMs {c.get('maxGapMs')}  "
+        print(f"  {name:16s} {'PASS' if r['ok'] else 'FAIL'}  rollovers {r.get('rollovers')}  locks/s {c.get('lockRate')}  "
+              f"refused {c.get('refused')}  refusedDuringReorg {r.get('refusedDuringReorgN')}  "
+              f"badCalls {c.get('badCalls')}  maxGapMs {c.get('maxGapMs')}  "
               f"refused/rollover {r.get('refusedPerRollover')}", flush=True)
         for ch in r["checks"]:
             if not ch["ok"]:

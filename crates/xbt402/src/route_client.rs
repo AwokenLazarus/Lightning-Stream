@@ -952,7 +952,7 @@ impl RoutePayer {
                     self.void(&mut st, &p, "hub answer does not open this lock");
                     self.event(json!({"event": "stale_answer", "lockId": p.lock_id, "cum1": doc.get("cum")}));
                     self.persist_lock_state(&st, Some(&p.shard));
-                    return Ok(Some(json!({"status": "refused", "error": "stale_answer"})));
+                    return Ok(Some(json!({"status": "refused", "error": "stale_answer", "detail": "hub answer does not open this lock"})));
                 }
                 match self.signer.resolve_lock(&chan, &y.secret_bytes()) {
                     Ok(t) => hex::encode(t),
@@ -983,12 +983,13 @@ impl RoutePayer {
                 }
                 // the hub refused (or the provider did, through it): nothing was completed with t
                 *st.stats.refused.entry(code.clone()).or_insert(0) += 1;
+                let detail = doc.get("detail").and_then(Value::as_str).unwrap_or("").to_string();
                 let shard = st.pending.take().map(|p| {
                     self.void(&mut st, &p, &format!("hub: {code}"));
                     p.shard
                 });
                 self.persist_lock_state(&st, shard.as_ref());
-                return Ok(Some(json!({"status": "refused", "error": code})));
+                return Ok(Some(json!({"status": "refused", "error": code, "detail": detail})));
             }
         }
         Ok(Some(json!({"status": "pending", "http": status})))

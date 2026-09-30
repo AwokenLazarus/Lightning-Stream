@@ -1,15 +1,16 @@
 //! The client of the AGP-053 rollover-under-load test (scripts/rollover_load_regtest.sh): one ch1 to
 //! the hub, one routed shard, and a lock after every call at `--rate` per second for `--seconds`, so
 //! the provider's ch2 is rolled over while locks stream. Every lock's outcome and time is recorded;
-//! the JSON summary on stdout has the paid locks, each refusal by code (a refused lock is what makes a
-//! client fail over), calls that were not 200 (a session the provider stopped serving), and the gaps
-//! between paid locks. Then a last pass pays what is due and ch1 is closed cooperatively.
+//! the JSON summary on stdout has the paid locks, each refusal's code and detail plus timestamp
+//! (`refusals`: `{t, ts, code, detail}`; a refused lock is what makes a client fail over), calls that
+//! were not 200 (a session the provider stopped serving), and the gaps between paid locks. Then a last
+//! pass pays what is due and ch1 is closed cooperatively.
 //!
 //! xbt402-rollover-load --hub URL --shard URL --rpc-port R --cookie PATH [--seconds 60] [--rate 15]
 //!                      [--progress FILE]
-//! `--progress` is rewritten every second with {t, paid, refused} (the driver acts on it).
+//! `--progress` is rewritten every second with {t, paid, refused, refusals} (the driver acts on it).
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Map, Value};
 use xbt402::client::Wallet;
@@ -49,6 +50,10 @@ fn bump(m: &mut Map<String, Value>, k: &str) {
     m.insert(k.into(), n.into());
 }
 
+fn unix_now() -> f64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
+}
+
 fn main() {
     let rpc = Rpc::from_cookie(&format!("http://127.0.0.1:{}", arg("--rpc-port").expect("--rpc-port")),
                                std::path::Path::new(&arg("--cookie").expect("--cookie"))).expect("cookie");
@@ -68,6 +73,7 @@ fn main() {
     let t0 = Instant::now();
     let (mut paid, mut calls, mut idle) = (0u64, 0u64, 0u64);
     let (mut refused, mut other, mut bad_calls) = (Map::new(), Map::new(), Map::new());
+    let mut refusals: Vec<Value> = vec![];
     let mut timeline: Vec<Value> = vec![];
     let mut paid_at: Vec<f64> = vec![];
     let mut lock_ms: Vec<f64> = vec![];
@@ -96,8 +102,11 @@ fn main() {
             }
             Ok(Some(v)) if v["status"] == "refused" => {
                 let code = v["error"].as_str().unwrap_or("?").to_string();
+                let detail = v["detail"].as_str().unwrap_or("").to_string();
                 bump(&mut refused, &code);
-                timeline.push(json!([round3(t), "refused", code]));
+                let rec = json!({"t": round3(t), "ts": round3(unix_now()), "code": code, "detail": detail});
+                refusals.push(rec.clone());
+                timeline.push(json!([round3(t), "refused", rec]));
             }
             Ok(Some(v)) => {
                 let k = v["status"].as_str().unwrap_or("?").to_string();
@@ -114,7 +123,7 @@ fn main() {
             let el = t0.elapsed().as_secs_f64();
             if el - last_progress >= 1.0 {
                 last_progress = el;
-                let _ = std::fs::write(p, json!({"t": round3(el), "paid": paid, "refused": refused, "badCalls": bad_calls}).to_string());
+                let _ = std::fs::write(p, json!({"t": round3(el), "paid": paid, "refused": refused, "refusals": refusals, "badCalls": bad_calls}).to_string());
             }
         }
         if let Some(d) = next.checked_duration_since(Instant::now()) {
@@ -133,7 +142,7 @@ fn main() {
     }
     let close = pay.close().map_err(|e| e.to_string());
     let out = json!({"ch1": ch1, "seconds": round3(dur), "rate": rate, "calls": calls, "badCalls": bad_calls, "locksPaid": paid,
-                     "lockRate": round3(paid as f64 / dur), "refused": refused, "lockOther": other, "idleTicks": idle,
+                     "lockRate": round3(paid as f64 / dur), "refused": refused, "refusals": refusals, "lockOther": other, "idleTicks": idle,
                      "maxGapMs": round3(max_gap), "gapsOver1s": over_1s, "gapP50Ms": round3(pct(&mut gaps, 0.5)),
                      "lockMs": {"p50": round3(pct(&mut lock_ms.clone(), 0.5)), "p95": round3(pct(&mut lock_ms, 0.95))},
                      "timeline": timeline, "summary": pay.summary(), "close": close.unwrap_or_else(|e| json!({"error": e})),
