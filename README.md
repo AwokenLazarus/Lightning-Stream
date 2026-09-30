@@ -416,6 +416,80 @@ Tests: `crates/xbt402-interop/tests/hub_reconcile.rs` (16), and B1
 * a mempool funding past the timeout is recovered and opened;
 * a conflicted funding is dropped but watched, then failed (`gettransaction` confirmations −1).
 
+## Make-before-break ch2 rollover (AGP-053)
+
+Before this, a ch2 rollover was break-before-make. The rollover tx pays the provider and funds the
+next ch2 in one tx, but the next ch2 opened only once it had the provider's minConf. Until then the
+hub refused every lock to that provider (`route_blocked`); on a real chain that lasts a block
+interval (cmp CMP-024). Now the next ch2 is routed at once, before it confirms. B1's
+`xbt402/hub.py` and `x402_channel.py` (b1 `agp-053`) do the same, with the same fields, events and
+wire.
+
+**Why this is safe for the provider.** The next ch2 spends the old ch2's funding. That funding is the
+provider's own confirmed, hub-bound channel. Before its expiry, every spend of it needs the
+provider's signature, so only the provider can sign a tx that conflicts with the rollover; the hub's
+refund is valid only after expiry. The provider takes the unconfirmed child (`zero_conf` on its
+ledger row) only when all of these hold:
+* it is the `rollover_to` of one of its own channels, bound to the same hub;
+* that parent has its `conf_for` confirmations;
+* the tip is below the parent's close margin (`until` = parent expiry − close_margin).
+
+While the child is unconfirmed, the provider takes locks only up to
+`ProviderConfig::rollover_zero_conf_max` (cum; default 2 × settleMultiple × closeFee; 0 turns the
+feature off) and only before `until`. Otherwise it refuses `zero_conf_cap` or `unconfirmed`. It also
+refuses to roll over an unconfirmed child. The watcher recomputes all of this each tick, so a reorg
+of the rollover applies the bounds again, and a reorg of the parent suspends the child.
+
+**Wire.** The only change is an optional `zeroConf: {parent, maxCum (string), until}` in the
+`/x402/xbt-channel/open` reply, plus the lock refusal code `zero_conf_cap`. The routing vectors and
+`/terms` are unchanged. A provider without this feature refuses the unconfirmed open, and the hub
+opens the child at minConf as before.
+
+**Hub.**
+* The hub calls `/open` for the child right after the provider's rollover reply, still holding that
+  provider's busy flag. The next lock therefore goes over the child. It is not refused as `funded`:
+  a route request that finds a rollover child waits for the flag and is checked again once the
+  flag is free.
+* `route` re-reads the ch2 under the busy flag and makes the channel checks again on the ch2 the
+  lock will use: pending, open, blocked, the expiry rule and the zero-conf bounds.
+* The hub keeps the provider's `maxCum` and `until`, so it refuses `route_blocked` before it signs
+  or sends anything past them. It never rolls over an unconfirmed child.
+* New record fields: `rolled_from` and `zero_conf` (`{parent, maxCum, until, confirmed}`).
+* New config key: `zero_conf_rollover` (default true).
+* New events:
+  * `ch2_open` with `zeroConf`;
+  * `ch2_zero_conf_confirmed` and `ch2_zero_conf_reorg`;
+  * `ch2_rollover_vanished` / `ch2_rollover_back`: the rollover left the mempool and the parent is
+    unspent. The child is blocked with `ROLLOVER_GONE` until the provider's watcher sends the
+    rollover again.
+  * `ch2_rollover_replaced`: another tx spent the parent. The child never existed, so it is
+    `dropped` and final, and any secrets of the parent's written-off locks are read off that tx.
+* The watcher no longer starves a provider that streams locks. A tick first tries each provider's
+  flag without waiting, then waits for the skipped ones between two locks: 250 ms each, 1 s per tick
+  in all. Before, a tick in step with the locks could miss every gap, and a due rollover waited a
+  long time.
+* Liquidity is unchanged: the child reuses the old ch2's coins, so there is still one live ch2 per
+  payTo and `committed_sat` counts each coin once.
+
+Tests: `crates/xbt402-interop/tests/hub_make_before_break.rs` (13), and B1
+`tests/security/test_agp053_make_before_break.py` (15). `routing_checks` c5 now expects the next
+ch2 to be open at once.
+
+On regtest, `scripts/rollover_load_regtest.sh` (ports 34900–34999; driver
+`scripts/interop/rollover_load.py`, client bin `xbt402-rollover-load`) runs one lock after every call
+at 15/s, one block every 3 s, for 45 s. It covers every hub × provider pair of Rust and B1. The runs:
+* 7–8 rollovers per run, with zero refused locks, every call 200, max gap between paid locks
+  80–197 ms;
+* the pre-AGP-053 baseline (`--zero-conf-max 0`): about 24 `route_blocked` per rollover and gaps of
+  3.1 s;
+* a rollover held out of blocks: locks run on the unconfirmed child up to the cap, then the hub
+  holds until the rollover confirms;
+* a reorg across the switch: zero refusals.
+
+Every run also checks the money on chain. Each rollover tx pays signed − closeFee to the provider and
+capacity − signed to the next ch2. The total routed over all ch2s equals what the client's locks
+paid.
+
 ## Portability
 
 No platform-specific dependencies: libsecp256k1 (C, via `secp256k1-sys`), pure-Rust hashes and JSON,

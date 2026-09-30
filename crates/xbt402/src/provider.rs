@@ -84,6 +84,11 @@ pub struct ProviderConfig {
     pub route_close_fee_payer: FeePayer,
     /// Blocks before the close margin a rollover is due anyway.
     pub rollover_grace: u32,
+    /// AGP-053 make-before-break: a hub-bound channel's rollover child is taken unconfirmed (its parent
+    /// is our own confirmed channel, and only we can sign a conflicting spend of it before its expiry),
+    /// up to this cum while it stays unconfirmed. None: two settlements' worth (2 × settle_multiple ×
+    /// close_fee); 0: never (the hub opens it at minConf).
+    pub rollover_zero_conf_max: Option<u64>,
 }
 
 impl ProviderConfig {
@@ -103,7 +108,13 @@ impl ProviderConfig {
             close_fee_payer: FeePayer::Payer,
             route_close_fee_payer: FeePayer::Payee,
             rollover_grace: 36,
+            rollover_zero_conf_max: None,
         }
+    }
+
+    /// The effective zero-conf rollover cap (AGP-053).
+    pub fn zero_conf_max(&self) -> u64 {
+        self.rollover_zero_conf_max.unwrap_or_else(|| self.settle_multiple.saturating_mul(2).saturating_mul(self.close_fee))
     }
 }
 
@@ -213,6 +224,23 @@ impl Provider {
     pub fn channel_state(&self, chan: &str) -> Option<ChannelState> {
         let c = canonical_chan(chan).ok()?;
         lock(&self.ledger).channels.get(&c).cloned()
+    }
+
+    /// Edit a channel's state and save it (tests).
+    #[doc(hidden)]
+    pub fn with_state<R>(&self, chan: &str, f: impl FnOnce(&mut ChannelState) -> R) -> Result<R> {
+        let mut l = lock(&self.ledger);
+        let mut st = l.channels.get(chan).cloned().ok_or_else(|| ChannelError::code("unknown_channel"))?;
+        let r = f(&mut st);
+        self.save_state(&mut l, &st)?;
+        Ok(r)
+    }
+
+    /// This provider's best close of a channel as a signed tx (tests: a close that replaces a rollover).
+    #[doc(hidden)]
+    pub fn best_close_hex(&self, chan: &str) -> Result<String> {
+        let st = self.channel_state(chan).ok_or_else(|| ChannelError::code("unknown_channel"))?;
+        Ok(self.close_tx(&st)?.0.to_hex())
     }
 
     pub fn channel_ids(&self) -> Vec<String> {
@@ -420,26 +448,109 @@ impl Provider {
             }
         }
         let cid = p.channel_id();
-        let confs = {
+        let (confs, zc) = {
             let mut l = lock(&self.ledger);
             if l.channels.contains_key(&cid) {
                 return fail("duplicate_channel", "");
             }
-            let confs = check_funding(self.chain.as_ref(), &p, &self.cfg.policy)?;
+            let (confs, zc) = match check_funding(self.chain.as_ref(), &p, &self.cfg.policy) {
+                Ok(c) => (c, None),
+                Err(e) if e.code == "unconfirmed" => match self.zero_conf_child(&l, &p, &hub)? {
+                    Some(zc) => {
+                        let pol = FundingPolicy { zero_conf_max: p.capacity, ..self.cfg.policy.clone() };
+                        (check_funding(self.chain.as_ref(), &p, &pol)?, Some(zc))
+                    }
+                    None => return Err(e),
+                },
+                Err(e) => return Err(e),
+            };
             let mut st = ChannelState::new(p.clone());
             if !hub.is_empty() {
                 st.extra.insert("hub".into(), hub.into());
             }
+            if let Some(zc) = &zc {
+                st.extra.insert("zero_conf".into(), zc.clone());
+            }
             l.channels.insert(cid.clone(), st);
             l.save(&[&cid])?;
-            confs
+            (confs, zc)
         };
         let mut out = json!({"chan": cid, "expiry": p.expiry, "maxCum": p.max_amount().to_string(), "confirmations": confs});
         if p.close_fee_payer != FeePayer::Payer {
             out["closeFeePayer"] = p.close_fee_payer.as_str().into();
             out["minCum"] = p.min_amount().to_string().into();
         }
+        if let Some(zc) = zc {
+            out["zeroConf"] = json!({"parent": zc["parent"], "maxCum": py_u64(zc.get("maxCum")).unwrap_or(0).to_string(), "until": zc["until"]});
+        }
         Ok(out)
+    }
+
+    /// AGP-053: the unconfirmed channel `p` is the rollover child of one of our hub-bound channels (the
+    /// tx we co-signed and broadcast, `rollover_to`), bound to the same hub, whose own funding is
+    /// confirmed (conf_for) and which is before its close margin: take it now, bounded (`zero_conf` on
+    /// the child). Before the parent's expiry only this provider can sign a spend of the parent other
+    /// than that rollover, so the child exists unless we replace it ourselves, or the rollover is still
+    /// unconfirmed at the parent's expiry (the payer's refund): locks are taken until `until` only.
+    fn zero_conf_child(&self, l: &Ledger, p: &ChannelParams, hub: &str) -> Result<Option<Value>> {
+        let cap = self.cfg.zero_conf_max();
+        if hub.is_empty() || cap == 0 {
+            return Ok(None);
+        }
+        let cid = p.channel_id();
+        let parent = l.channels.values().find(|s| {
+            s.extra.get("rollover_to").and_then(Value::as_str) == Some(cid.as_str()) && s.extra.get("hub").and_then(Value::as_str) == Some(hub)
+        });
+        let Some(parent) = parent else { return Ok(None) };
+        let pp = &parent.params;
+        let need = self.cfg.policy.conf_for(pp.capacity);
+        let until = pp.expiry.saturating_sub(self.cfg.close_margin);
+        if self.height()? >= until || !self.confirmed(&pp.funding_txid(), pp.funding_vout(), need)? {
+            return Ok(None);
+        }
+        if self.chain.get_tx_out(&p.funding_txid(), p.funding_vout(), true)?.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(json!({"parent": pp.channel_id(), "need": need, "maxCum": cap, "until": until, "confirmed": false})))
+    }
+
+    /// The output is in a block with `need` confirmations (spent in the mempool or not).
+    fn confirmed(&self, txid: &str, vout: u32, need: u32) -> Result<bool> {
+        Ok(self.chain.get_tx_out(txid, vout, false)?.is_some_and(|u| u.confirmations >= need))
+    }
+
+    /// An unconfirmed rollover child (AGP-053) is served while it is in the mempool, its parent still
+    /// has its confirmations (a reorg of the parent ends it), and before the parent's margin.
+    fn zero_conf_ok(&self, st: &ChannelState, h: u32) -> Result<bool> {
+        let Some(zc) = st.extra.get("zero_conf").filter(|z| z.is_object()) else { return Ok(false) };
+        if h as u64 >= py_u64(zc.get("until")).unwrap_or(0) {
+            return Ok(false);
+        }
+        let p = &st.params;
+        if self.chain.get_tx_out(&p.funding_txid(), p.funding_vout(), true)?.is_none() {
+            return Ok(false);
+        }
+        let parent = zc.get("parent").and_then(Value::as_str).unwrap_or("");
+        let Some((ptxid, pvout)) = parent.split_once(':') else { return Ok(false) };
+        let need = py_u64(zc.get("need")).unwrap_or(1) as u32;
+        self.confirmed(ptxid, pvout.parse().unwrap_or(u32::MAX), need)
+    }
+
+    /// Not an unconfirmed rollover child (AGP-053): a plain channel, or a child that confirmed (as the
+    /// watcher last saw it, or `live` from the node now, recorded in `st`).
+    pub(crate) fn zc_confirmed(&self, st: &mut ChannelState, live: bool) -> Result<bool> {
+        let Some(zc) = st.extra.get("zero_conf").filter(|z| z.is_object()).cloned() else { return Ok(true) };
+        if truthy(zc.get("confirmed")) {
+            return Ok(true);
+        }
+        let p = &st.params;
+        if live && self.confirmed(&p.funding_txid(), p.funding_vout(), self.cfg.policy.conf_for(p.capacity))? {
+            let mut z = zc;
+            z["confirmed"] = true.into();
+            st.extra.insert("zero_conf".into(), z);
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// This provider's settlement policy: the net payout is at least settle_multiple × closeFee,
@@ -681,6 +792,14 @@ impl Provider {
         }
         let utxo = self.chain.get_tx_out(&p.funding_txid(), p.funding_vout(), false)?;
         st.suspended = utxo.map(|u| u.confirmations < self.cfg.policy.conf_for(p.capacity)).unwrap_or(true);
+        if let Some(mut zc) = st.extra.get("zero_conf").filter(|z| z.is_object()).cloned() {
+            // AGP-053: confirmed (again, after a reorg) or not; unconfirmed, it is served under its rules
+            zc["confirmed"] = (!st.suspended).into();
+            st.extra.insert("zero_conf".into(), zc);
+            if st.suspended && self.zero_conf_ok(st, h)? {
+                st.suspended = false;
+            }
+        }
         if (!st.best_sig.is_empty() || !st.cond_sig.is_empty()) && h as i64 >= p.expiry as i64 - self.cfg.close_margin as i64 {
             out.push(self.close_locked(l, st)?);
             if truthy(st.extra.get("cond_close")) {
@@ -845,6 +964,16 @@ impl Provider {
     /// pays this provider `amount` (at least its best state) and funds the next channel.
     pub fn rollover(&self, req: &Value) -> Result<Value> {
         let cid = self.channel_id_of(Some(field(req, "chan")?))?;
+        {
+            let mut l = lock(&self.ledger);
+            let mut st = l.channels[&cid].clone();
+            if !self.zc_confirmed(&mut st, true)? {
+                return fail("unconfirmed", "the channel's funding (a rollover) is not confirmed yet");
+            }
+            if st.extra != l.channels[&cid].extra {
+                self.save_state(&mut l, &st)?;
+            }
+        }
         let p = lock(&self.ledger).channels[&cid].params.clone();
         let amount = py_u64(req.get("amount")).ok_or_else(|| ChannelError::new("bad_request", "amount"))?;
         let nxt = field(req, "next")?;

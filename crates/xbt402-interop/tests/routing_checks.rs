@@ -836,12 +836,16 @@ fn c5_hub_funds_and_rolls_ch2_at_the_providers_threshold() {
     assert_eq!(tx.outputs[1].value as u64, oc.params.capacity - oc.signed);
     assert_eq!(format!("{}:{}", tx.inputs[0].prevout.txid_hex(), tx.inputs[0].prevout.vout), first);
     let new = w.oc();
-    assert_eq!((new.state.as_str(), new.params.funding_txid()), ("funded", roll["txid"].as_str().unwrap().to_string()));
+    // make-before-break (AGP-053): the next ch2 is open at once, unconfirmed, under the provider's cap
+    assert_eq!((new.state.as_str(), new.params.funding_txid()), ("open", roll["txid"].as_str().unwrap().to_string()));
+    assert_eq!(new.zero_conf["confirmed"], false);
+    stream(&w.pay, w.sh(), 5);
+    assert_eq!(w.pay.lock(w.sh()).unwrap().unwrap()["status"], "paid"); // routing goes on over the new ch2 unconfirmed
     w.chain.confirm_all();
     w.hub.watch_tick();
-    assert_eq!(w.oc().state, "open");
+    assert_eq!((w.oc().state.as_str(), w.oc().zero_conf["confirmed"].clone()), ("open", json!(true)));
     stream(&w.pay, w.sh(), 5);
-    assert_eq!(w.pay.lock(w.sh()).unwrap().unwrap()["status"], "paid"); // routing goes on over the new ch2
+    assert_eq!(w.pay.lock(w.sh()).unwrap().unwrap()["status"], "paid"); // and once it confirmed
     assert!(w.prov().channel_state(&new.params.channel_id()).unwrap().best_cum > 0);
 }
 

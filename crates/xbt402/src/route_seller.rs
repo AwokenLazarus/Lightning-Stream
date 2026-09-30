@@ -523,6 +523,23 @@ impl Provider {
         if st.suspended {
             return err_json(400, "unconfirmed", "");
         }
+        if let Some(zc) = st.extra.get("zero_conf").filter(|z| z.is_object() && !crate::json::truthy(z.get("confirmed"))).cloned() {
+            // AGP-053: an unconfirmed rollover child, taken up to its cap and before the parent's margin
+            let Some(cum) = crate::json::py_int(pl.get("cum")) else { return err_json(400, "bad_payload", "") };
+            let until = py_u64(zc.get("until")).unwrap_or(0);
+            let max = py_u64(zc.get("maxCum")).unwrap_or(0);
+            // past a bound: look at the chain first (it may have confirmed since the watcher's tick)
+            if height as u64 >= until || cum > max as i128 {
+                match self.zc_confirmed(&mut st, true) {
+                    Ok(true) => {
+                        let _ = self.save_state(&mut l, &st);
+                    }
+                    Ok(false) if height as u64 >= until => return err_json(400, "unconfirmed", "rollover unconfirmed at the parent's close margin"),
+                    Ok(false) => return err_json(400, "zero_conf_cap", &format!("cum {cum} > {max} while the rollover is unconfirmed")),
+                    Err(e) => return err_json(500, "node_error", &e.to_string()),
+                }
+            }
+        }
         match self.complete_lock(&mut l, &mut st, &pl, &route) {
             Ok(out) => {
                 l.channels.insert(cid, st);

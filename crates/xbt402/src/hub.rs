@@ -53,6 +53,12 @@
 //! Close fees (v1.2): ch2 is payee-pays by default (each provider pays its own settlement), ch1
 //! payer-pays (the client), and `extra.routing` advertises both.
 //!
+//! Make-before-break rollover (AGP-053, as B1): the next ch2 is opened right after the rollover reply,
+//! unconfirmed, where the provider takes it (`zeroConf` in its /open reply: the child of its own
+//! confirmed hub-bound channel, up to `maxCum` and before `until`), so routing never pauses for a block;
+//! the hub keeps within those bounds itself, never rolls an unconfirmed child over, and blocks or drops
+//! a child whose rollover left the mempool or was replaced.
+//!
 //! Lock order: the ch1 ledger may be held while the out book is taken, never the reverse; a
 //! provider's busy flag is taken with a timeout (route) or not at all (watcher).
 use std::collections::{HashMap, HashSet};
@@ -138,6 +144,10 @@ pub struct HubConfig {
     pub refund_bump_blocks: u32,
     /// The most a ch2 refund may pay in fees, bumps included (and always dust left over).
     pub refund_max_fee_sat: u64,
+    /// AGP-053 (default on): open a rollover's next ch2 at once, unconfirmed, where the provider takes it
+    /// (its /open reply carries `zeroConf`), so routing to the provider never pauses for a block
+    /// (make-before-break); a provider that refuses is opened at minConf.
+    pub zero_conf_rollover: bool,
 }
 
 impl Default for HubConfig {
@@ -148,16 +158,17 @@ impl Default for HubConfig {
                close_margin: 144, rollover_margin: 36, hrp: "bcrt".into(), policy: json!({"min_expiry_blocks": 1_008, "max_expiry_blocks": 8_640}),
                ch2_max_expiry_blocks: 0, ch2_max_close_fee_sat: 5_000, ch2_close_fee_multiple: 20, ch2_max_min_conf: 6, ch2_max_min_capacity: 0,
                ch2_max_settle_multiple: 100, refund_grace_blocks: 6, refund_conf_target: 6, refund_min_feerate: 1.0, funding_timeout_blocks: 6,
-               refund_bump_blocks: 3, refund_max_fee_sat: 5_000 }
+               refund_bump_blocks: 3, refund_max_fee_sat: 5_000, zero_conf_rollover: true }
     }
 }
 
-const HUB_KEYS: [&str; 31] = ["fee_base_msat", "fee_ppm", "fee_strategy", "quote_ttl", "max_lock_sat", "max_unguarded_lock_sat", "delta",
+const HUB_KEYS: [&str; 32] = ["fee_base_msat", "fee_ppm", "fee_strategy", "quote_ttl", "max_lock_sat", "max_unguarded_lock_sat", "delta",
                               "reveal_timeout", "ch2_capacity", "ch2_expiry_blocks", "liquidity_cap_sat", "close_fee",
                               "ch1_close_fee_payer", "ch2_close_fee_payer", "close_margin", "rollover_margin", "hrp", "policy", "_comment",
                               "ch2_max_expiry_blocks", "ch2_max_close_fee_sat", "ch2_close_fee_multiple", "ch2_max_min_conf",
                               "ch2_max_min_capacity", "ch2_max_settle_multiple", "refund_grace_blocks", "refund_conf_target",
-                              "refund_min_feerate", "funding_timeout_blocks", "refund_bump_blocks", "refund_max_fee_sat"];
+                              "refund_min_feerate", "funding_timeout_blocks", "refund_bump_blocks", "refund_max_fee_sat",
+                              "zero_conf_rollover"];
 
 impl HubConfig {
     /// From the operator's JSON (B1 `HubConfig.from_dict`): unknown keys are refused.
@@ -225,6 +236,9 @@ impl HubConfig {
         c.funding_timeout_blocks = u32_("funding_timeout_blocks", c.funding_timeout_blocks)?;
         c.refund_bump_blocks = u32_("refund_bump_blocks", c.refund_bump_blocks)?;
         c.refund_max_fee_sat = u("refund_max_fee_sat", c.refund_max_fee_sat)?;
+        if let Some(v) = m.get("zero_conf_rollover") {
+            c.zero_conf_rollover = v.as_bool().ok_or_else(|| bad("zero_conf_rollover must be true or false".into()))?;
+        }
         c.funding_policy()?;
         Ok(c)
     }
@@ -300,6 +314,10 @@ pub struct OutChannel {
     /// The funding send the hub knows of (the wallet's), watched while `dropped` (AGP-045).
     pub fund_txid: String,
     pub fund_vout: u32,
+    /// The ch2 whose rollover funds this one (AGP-053).
+    pub rolled_from: String,
+    /// The provider took it unconfirmed (AGP-053): `{parent, maxCum, until, confirmed}` (empty: no).
+    pub zero_conf: Map<String, Value>,
 }
 
 /// States in which the hub's coins are committed.
@@ -328,7 +346,8 @@ impl OutChannel {
                routed: 0, seq: 0, pending: Map::new(), stale: vec![], settle_multiple, terms: terms.clone(), refund_hex: String::new(),
                blocked: String::new(), close_txid: String::new(), rolled_to: String::new(), opened_at: tip, scanned_to: tip,
                refund_txid: String::new(), refund_fee: 0, final_: false, next: Map::new(), fund_error: String::new(),
-               refund_at: 0, refund_prev: vec![], close_prev: String::new(), fund_txid: String::new(), fund_vout: 0 }
+               refund_at: 0, refund_prev: vec![], close_prev: String::new(), fund_txid: String::new(), fund_vout: 0,
+               rolled_from: String::new(), zero_conf: Map::new() }
     }
 
     pub fn to_json(&self) -> Value {
@@ -338,7 +357,7 @@ impl OutChannel {
                "close_txid": self.close_txid, "rolled_to": self.rolled_to, "opened_at": self.opened_at, "scanned_to": self.scanned_to,
                "refund_txid": self.refund_txid, "refund_fee": self.refund_fee, "final": self.final_, "next": self.next, "fund_error": self.fund_error,
                "refund_at": self.refund_at, "refund_prev": self.refund_prev, "close_prev": self.close_prev, "fund_txid": self.fund_txid,
-               "fund_vout": self.fund_vout})
+               "fund_vout": self.fund_vout, "rolled_from": self.rolled_from, "zero_conf": self.zero_conf})
     }
 
     pub fn from_json(v: &Value) -> Result<Self> {
@@ -353,7 +372,8 @@ impl OutChannel {
                   refund_txid: s("refund_txid"), refund_fee: n("refund_fee"), final_: v.get("final").and_then(Value::as_bool).unwrap_or(false),
                   next: v.get("next").and_then(Value::as_object).cloned().unwrap_or_default(), fund_error: s("fund_error"),
                   refund_at: n("refund_at") as u32, refund_prev: v.get("refund_prev").and_then(Value::as_array).cloned().unwrap_or_default(),
-                  close_prev: s("close_prev"), fund_txid: s("fund_txid"), fund_vout: n("fund_vout") as u32 })
+                  close_prev: s("close_prev"), fund_txid: s("fund_txid"), fund_vout: n("fund_vout") as u32, rolled_from: s("rolled_from"),
+                  zero_conf: v.get("zero_conf").and_then(Value::as_object).cloned().unwrap_or_default() })
     }
 
     fn secret_key(&self) -> Result<SecretKey> {
@@ -363,7 +383,15 @@ impl OutChannel {
     fn term_u64(&self, k: &str) -> Option<u64> {
         py_u64(self.terms.get("extra").and_then(|e| e.get(k)))
     }
+
+    /// An unconfirmed rollover child the provider took under its zero-conf bounds (AGP-053).
+    pub fn zero_conf_pending(&self) -> bool {
+        !self.zero_conf.is_empty() && !truthy(self.zero_conf.get("confirmed"))
+    }
 }
+
+/// Why a rollover child is blocked while its rollover is in no block and not in the mempool (AGP-053).
+pub const ROLLOVER_GONE: &str = "the rollover that funds this ch2 is in no block and not in the mempool";
 
 /// The hub's ch2s, an fsynced JSON file (keys included: regtest only).
 ///
@@ -493,7 +521,13 @@ pub struct RouteHub {
     pub withhold: Mutex<String>,
     pub events: Mutex<Vec<Value>>,
     pub stats: Mutex<HubStats>,
+    /// (chan, tip): a rollover child's unconfirmed open, tried once a block (AGP-053).
+    zc_tried: Mutex<HashSet<(String, u32)>>,
 }
+
+/// How long a watcher tick waits for one busy provider's flag, and for all of them (AGP-053).
+const WATCH_WAIT_ONE: Duration = Duration::from_millis(250);
+const WATCH_WAIT_BUDGET: Duration = Duration::from_secs(1);
 
 fn committed(b: &OutBook) -> u64 {
     b.chans.values().filter(|c| LIVE.contains(&c.state.as_str())).map(|c| c.params.capacity).sum()
@@ -541,7 +575,7 @@ impl RouteHub {
                   network: network.into(), inbound, out: Mutex::new(out), busy: Mutex::new(HashSet::new()), quote: Mutex::new(None),
                   quote_seq: Mutex::new(now_i()), reveal_timeout_bits: AtomicU64::new(0), fee_strategy: None,
                   refill: Mutex::new(None), refund_to: Mutex::new(None), withhold: Mutex::new(String::new()), events: Mutex::new(vec![]),
-                  stats: Mutex::new(HubStats::default()) })
+                  stats: Mutex::new(HubStats::default()), zc_tried: Mutex::new(HashSet::new()) })
     }
 
     /// Seconds a lock may wait for the provider's reveal (starts at `cfg.reveal_timeout`).
@@ -829,7 +863,10 @@ impl RouteHub {
         // the provider is its payTo: an origin sharing a live ch2's payTo routes over that ch2
         let key = lk(&self.out).key_for(&provider).unwrap_or_else(|| provider.clone());
         let oc = lk(&self.out).chans.get(&key).cloned();
-        let Some(oc) = oc.filter(|o| o.state == "open") else { return e400("route_blocked", "no open channel to that provider") };
+        // a rollover's next ch2 is opened (AGP-053) under the busy flag the lock takes below: it is
+        // checked again there, once it is open
+        let opening = |o: &OutChannel| o.state == "funded" && !o.rolled_from.is_empty() && self.cfg.zero_conf_rollover;
+        let Some(oc) = oc.filter(|o| o.state == "open" || opening(o)) else { return e400("route_blocked", "no open channel to that provider") };
         if !oc.blocked.is_empty() {
             return e400("route_blocked", &oc.blocked);
         }
@@ -850,10 +887,13 @@ impl RouteHub {
         let Some(busy) = self.acquire(&key, Duration::from_millis(500)) else {
             return e400("lock_outstanding", "a lock on this provider's ch2 is pending");
         };
-        let oc = match lk(&self.out).chans.get(&key).cloned() {
-            Some(o) if o.pending.is_empty() && o.state == "open" => o,
-            _ => return e400("lock_outstanding", "a lock on this provider's ch2 is pending"),
-        };
+        // re-read under the busy flag: the watcher may have rolled this ch2 over meanwhile (AGP-053), so
+        // the checks that depend on the channel are made again on the one the lock will use
+        let oc = lk(&self.out).chans.get(&key).cloned();
+        if let Some((code, why)) = self.ch2_refusal(oc.as_ref(), &st1, d, height) {
+            return e400(code, &why);
+        }
+        let oc = oc.expect("checked above");
         // write-ahead: pre1 (enough to complete ch1 from t on-chain after a crash)
         // cum passed check 3: the best state (floor) or need1
         let lock1 = json!({"lockId": lock_id, "cum": cum as u64, "floor": floor1,
@@ -871,6 +911,37 @@ impl RouteHub {
         let r = self.forward(&cid, &oc, &lock1, &rt, t0);
         drop(busy);
         r
+    }
+
+    /// (code, detail) if the ch2 (as read under its busy flag) cannot take a lock of `d` now: another
+    /// lock is pending, it is not open (a rollover child the provider did not take unconfirmed), it is blocked, the expiry rule, or (AGP-053) it is an
+    /// unconfirmed rollover child past the provider's zero-conf bounds.
+    fn ch2_refusal(&self, oc: Option<&OutChannel>, st1: &ChannelState, d: u64, tip: u32) -> Option<(&'static str, String)> {
+        let Some(oc) = oc.filter(|o| o.pending.is_empty()) else {
+            return Some(("lock_outstanding", "a lock on this provider's ch2 is pending".into()));
+        };
+        if oc.state != "open" {
+            return Some(("route_blocked", "no open channel to that provider".into()));
+        }
+        if !oc.blocked.is_empty() {
+            return Some(("route_blocked", oc.blocked.clone()));
+        }
+        let p2 = &oc.params;
+        if !route_ok(tip, st1.params.expiry, p2.expiry, self.cfg.close_margin, self.cfg.delta) && d > self.cfg.max_unguarded_lock_sat {
+            return Some(("route_expiry", format!("ch2 outlives ch1 and {d} > maxUnguardedLockSat")));
+        }
+        if oc.zero_conf_pending() {
+            let zc = &oc.zero_conf;
+            if tip as u64 >= py_u64(zc.get("until")).unwrap_or(0) {
+                return Some(("route_blocked", "the rollover funding this ch2 is unconfirmed at the parent's close margin".into()));
+            }
+            let need2 = next_cum(oc.routed, d, p2.min_amount()).max(oc.signed);
+            let max = py_u64(zc.get("maxCum")).unwrap_or(0);
+            if need2 > max {
+                return Some(("route_blocked", format!("the rollover funding this ch2 is unconfirmed: cum {need2} > the provider's zero-conf cap {max}")));
+            }
+        }
+        None
     }
 
     /// Pre-sign ch2 under T (only now), send it to the provider, settle ch1 with t + r.
@@ -1447,11 +1518,50 @@ impl RouteHub {
             b.save()?;
             return Ok(false);
         }
+        let mut zc = Map::new();
+        if let Some(z) = doc.get("zeroConf").filter(|z| z.is_object()) {
+            // AGP-053: the provider took this ch2 unconfirmed (a rollover child), bounded; a malformed
+            // bound routes nothing until it confirms
+            let (parent, max, until) = (z.get("parent").and_then(Value::as_str), py_u64(z.get("maxCum")), py_u64(z.get("until")));
+            let (parent, max, until) = match (parent, max, until) {
+                (Some(p), Some(m), Some(u)) => (p.to_string(), m, u),
+                _ => (String::new(), 0, 0),
+            };
+            zc = json!({"parent": parent, "maxCum": max, "until": until, "confirmed": false}).as_object().cloned().unwrap_or_default();
+        }
         c.state = "open".into();
+        c.zero_conf = zc.clone();
         b.save()?;
         drop(b);
-        self.event(json!({"event": "ch2_open", "provider": oc.origin, "chan": p.channel_id(), "capacity": p.capacity}));
+        let mut ev = json!({"event": "ch2_open", "provider": oc.origin, "chan": p.channel_id(), "capacity": p.capacity});
+        if !zc.is_empty() {
+            ev["zeroConf"] = zc["maxCum"].clone();
+        }
+        self.event(ev);
         Ok(true)
+    }
+
+    /// Open a rollover child before it confirms (AGP-053), at most once a block. Never fails.
+    fn open_child(&self, new: Option<OutChannel>, parent: &str) -> bool {
+        let Some(new) = new.filter(|n| self.cfg.zero_conf_rollover && n.state == "funded" && n.rolled_from == parent) else { return false };
+        let tip = match self.chain.block_count() {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
+        {
+            let mut tried = lk(&self.zc_tried);
+            if !tried.insert((new.params.channel_id(), tip)) {
+                return false;
+            }
+            tried.retain(|(_, t)| *t + 1 >= tip);
+        }
+        match self.open(&new) {
+            Ok(ok) => ok,
+            Err(e) => {
+                self.event(json!({"event": "ch2_open_failed", "provider": new.origin, "error": e.to_string().chars().take(200).collect::<String>()}));
+                false
+            }
+        }
     }
 
     /// One tx pays the provider its balance and funds the next ch2 (rollover instead of close).
@@ -1476,6 +1586,7 @@ impl RouteHub {
         let nxt = nxt.with_funding(&txid, 1, next_cap)?;
         let mut new = OutChannel::fresh(&oc.origin, &oc.pay_to, nxt.clone(), &secret, "funded", oc.settle_multiple, &oc.terms, tip);
         new.refund_hex = nxt.refund_tx(&secret, None, None)?.to_hex();
+        new.rolled_from = p.channel_id();
         let next = new.to_json().as_object().cloned().unwrap_or_default();
         // write-ahead: the next ch2's key before the request
         if self.upd(Loc::Live(&oc.origin), oc, |c| c.next = next)?.is_none() {
@@ -1498,7 +1609,12 @@ impl RouteHub {
             return fail("bad_rollover_reply", format!("rollover reply {} is not tx {txid}", doc.to_string().chars().take(120).collect::<String>()));
         }
         let cur = self.get(Loc::Live(&oc.origin)).unwrap_or_else(|| oc.clone());
-        self.finish_rollover(Loc::Live(&oc.origin), &cur, amount)
+        let ev = self.finish_rollover(Loc::Live(&oc.origin), &cur, amount)?;
+        // make-before-break (AGP-053): open the next ch2 now, still under this provider's busy flag, so
+        // the next lock goes over it; a provider that wants confirmations first refuses, and the watcher
+        // opens it at minConf
+        self.open_child(self.get(Loc::Live(&oc.origin)), &p.channel_id());
+        Ok(ev)
     }
 
     fn finish_rollover(&self, loc: Loc<'_>, oc: &OutChannel, amount: u64) -> Result<Value> {
@@ -1753,9 +1869,26 @@ impl RouteHub {
             }
         };
         let origins: Vec<String> = lk(&self.out).chans.keys().cloned().collect();
+        let mut skipped = vec![];
         for origin in origins {
             // a route request in flight owns this ch2: never race it for the same lock
-            let Some(busy) = self.acquire(&origin, Duration::ZERO) else { continue };
+            let Some(busy) = self.acquire(&origin, Duration::ZERO) else {
+                skipped.push(origin);
+                continue;
+            };
+            match self.watch_out(&origin, tip) {
+                Ok(mut a) => acts.append(&mut a),
+                Err(e) => self.watch_error(&origin, "watch", &e),
+            }
+            drop(busy);
+        }
+        // a provider streaming locks holds its flag most of the time, and a tick in step with its locks
+        // could miss every gap (a rollover never due to run, AGP-053): wait for the flag between two
+        // locks, within a budget per tick
+        let until = Instant::now() + WATCH_WAIT_BUDGET;
+        for origin in skipped {
+            let left = until.saturating_duration_since(Instant::now());
+            let Some(busy) = self.acquire(&origin, left.min(WATCH_WAIT_ONE)) else { continue };
             match self.watch_out(&origin, tip) {
                 Ok(mut a) => acts.append(&mut a),
                 Err(e) => self.watch_error(&origin, "watch", &e),
@@ -1803,13 +1936,21 @@ impl RouteHub {
         let p = &oc.params;
         if oc.state == "funded" {
             let min_conf = oc.term_u64("minConf").unwrap_or(1) as u32;
-            if self.chain.get_tx_out(&p.funding_txid(), p.funding_vout(), false)?.is_some_and(|u| u.confirmations >= min_conf) && self.open(&oc)? {
-                out.push(json!({"event": "ch2_open", "provider": origin}));
+            if self.chain.get_tx_out(&p.funding_txid(), p.funding_vout(), false)?.is_some_and(|u| u.confirmations >= min_conf) {
+                if self.open(&oc)? {
+                    out.push(json!({"event": "ch2_open", "provider": origin}));
+                }
+            } else if !oc.rolled_from.is_empty() && self.open_child(Some(oc.clone()), &oc.rolled_from) {
+                // a rollover child not opened right after the rollover (a lost reply, a restart)
+                out.push(json!({"event": "ch2_open", "provider": origin, "zeroConf": true}));
             }
             return Ok(out);
         }
         if oc.state != "open" {
             return Ok(out);
+        }
+        if !oc.zero_conf.is_empty() {
+            out.extend(self.zero_conf_tick(origin, &oc)?);
         }
         if !oc.pending.is_empty() {
             let at = oc.pending.get("at").and_then(Value::as_f64).unwrap_or(0.0);
@@ -1835,10 +1976,29 @@ impl RouteHub {
         let margin = oc.term_u64("closeMarginBlocks").unwrap_or(self.cfg.close_margin as u64) as i64;
         let grace = (self.cfg.rollover_margin as u64).min(oc.term_u64("rolloverGraceBlocks").unwrap_or(self.cfg.rollover_margin as u64)) as i64;
         let near = tip as i64 >= p.expiry as i64 - margin - grace;
-        if (due || near) && oc.signed >= p.min_amount() && tip < p.expiry {
+        // an unconfirmed rollover child is not rolled over again before it confirms (AGP-053)
+        let unconfirmed = self.get(Loc::Live(origin)).is_some_and(|c| c.zero_conf_pending());
+        if (due || near) && oc.signed >= p.min_amount() && tip < p.expiry && !unconfirmed {
             out.push(self.rollover(&oc)?);
         }
         Ok(out)
+    }
+
+    /// A ch2 the provider took unconfirmed (AGP-053): confirmed with minConf, or unconfirmed again (a
+    /// reorg), and the provider's bounds apply again.
+    fn zero_conf_tick(&self, origin: &str, oc: &OutChannel) -> Result<Vec<Value>> {
+        let p = &oc.params;
+        let min_conf = oc.term_u64("minConf").unwrap_or(1) as u32;
+        let now = self.chain.get_tx_out(&p.funding_txid(), p.funding_vout(), false)?.is_some_and(|u| u.confirmations >= min_conf);
+        if now == truthy(oc.zero_conf.get("confirmed")) {
+            return Ok(vec![]);
+        }
+        self.upd(Loc::Live(origin), oc, |c| {
+            c.zero_conf.insert("confirmed".into(), now.into());
+        })?;
+        let ev = json!({"event": if now { "ch2_zero_conf_confirmed" } else { "ch2_zero_conf_reorg" }, "provider": oc.origin, "chan": p.channel_id()});
+        self.event(ev.clone());
+        Ok(vec![ev])
     }
 
     /// Check one non-final ch2's funding against the chain (AGP-037).
@@ -1861,6 +2021,15 @@ impl RouteHub {
         let chan = oc.params.channel_id();
         if self.chain.get_tx_out(&txid, vout, true)?.is_some() {
             let mut oc = oc;
+            if oc.blocked == ROLLOVER_GONE {
+                // the rollover is back (AGP-053)
+                self.upd(loc, &oc, |c| c.blocked = String::new())?;
+                let ev = json!({"event": "ch2_rollover_back", "provider": oc.origin, "chan": chan});
+                self.event(ev.clone());
+                out.push(ev);
+                let Some(cur) = self.get(loc).filter(|c| c.params.payer_pub == oc.params.payer_pub) else { return Ok(out) };
+                oc = cur;
+            }
             if oc.state == "closing" && (!oc.close_txid.is_empty() || oc.close_prev == "refunded") {
                 out.extend(self.close_vanished(loc, &oc)?);
                 let Some(cur) = self.get(loc).filter(|c| c.params.payer_pub == oc.params.payer_pub) else { return Ok(out) };
@@ -1871,6 +2040,12 @@ impl RouteHub {
                 out.extend(self.refund(loc, &oc, tip)?);
             }
             return Ok(out);
+        }
+        if !oc.rolled_from.is_empty() && ["funded", "open"].contains(&oc.state.as_str()) {
+            if let Some(gone) = self.rollover_gone(loc, &oc)? {
+                out.extend(gone);
+                return Ok(out);
+            }
         }
         let confirmed = self.chain.get_tx_out(&txid, vout, false)?.is_none();
         let locks = !oc.pending.is_empty() || !oc.stale.is_empty();
@@ -1987,6 +2162,54 @@ impl RouteHub {
         self.event(ev.clone());
         out.push(ev);
         Ok(out)
+    }
+
+    /// A rollover child's funding output is not in the UTXO set nor the mempool (AGP-053). The rollover
+    /// tx exists (in the mempool, or its output confirmed): None, the usual reconcile (it was spent).
+    /// The parent is unspent even counting the mempool: the rollover left the mempool (the provider,
+    /// who holds it signed, sends it again), so routing stops (blocked) until it is back. The parent was
+    /// spent by another tx (the provider's own close): this ch2 never existed; it is dropped (final)
+    /// and any secrets of the parent's written-off locks are read off that close.
+    fn rollover_gone(&self, loc: Loc<'_>, oc: &OutChannel) -> Result<Option<Vec<Value>>> {
+        let p = &oc.params;
+        let txid = p.funding_txid();
+        if self.chain.get_tx_out(&txid, p.funding_vout(), false)?.is_some() || self.scan.in_mempool(&txid).unwrap_or(false) {
+            return Ok(None);
+        }
+        let Some((ptxid, pvout)) = oc.rolled_from.split_once(':') else { return Ok(None) };
+        let pvout: u32 = pvout.parse().map_err(|_| ChannelError::new("bad_state", "rolled_from"))?;
+        if self.chain.get_tx_out(ptxid, pvout, true)?.is_some() {
+            if oc.blocked == ROLLOVER_GONE {
+                return Ok(Some(vec![]));
+            }
+            self.upd(loc, oc, |c| c.blocked = ROLLOVER_GONE.into())?;
+            let ev = json!({"event": "ch2_rollover_vanished", "provider": oc.origin, "chan": p.channel_id(), "parent": oc.rolled_from});
+            self.event(ev.clone());
+            return Ok(Some(vec![ev]));
+        }
+        let Some(tx) = self.scan.find_spend(ptxid, pvout, oc.opened_at.saturating_sub(6))? else { return Ok(None) };
+        let spender = tx.txid();
+        if spender == txid {
+            return Ok(None);
+        }
+        let why = format!("the rollover was replaced by {spender}");
+        self.upd(loc, oc, |c| {
+            c.state = "dropped".into();
+            c.final_ = true;
+            c.blocked = why;
+        })?;
+        let ev = json!({"event": "ch2_rollover_replaced", "provider": oc.origin, "chan": p.channel_id(), "parent": oc.rolled_from,
+                        "spender": spender});
+        self.event(ev.clone());
+        let mut out = vec![ev];
+        let chan = p.channel_id();
+        let parents: Vec<(usize, OutChannel)> = lk(&self.out).archived.iter().enumerate()
+            .filter(|(_, r)| py_str(r.get("rolled_to")) == chan && r.get("stale").and_then(Value::as_array).is_some_and(|a| !a.is_empty()))
+            .filter_map(|(i, r)| OutChannel::from_json(r).ok().map(|c| (i, c))).collect();
+        for (i, parent) in parents {
+            out.extend(self.secrets_from_close(Loc::Archived(i), &parent, &tx));
+        }
+        Ok(Some(out))
     }
 
     /// A `closing` ch2's funding is unspent again: the close left the mempool (replaced, expired) or

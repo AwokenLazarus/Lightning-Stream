@@ -2,6 +2,9 @@
 //!
 //! xbt402-route-provider --port P --rpc-port R --cookie PATH --secret HEX --amsat N
 //!                       [--window 1.0] [--lock-wait 3.0] [--ttl 8.0] [--settle-multiple 20] [--ledger FILE]
+//!                       [--zero-conf-max SAT] [--watch-secs 5]
+//! `--zero-conf-max` (AGP-053): the cap on an unconfirmed rollover child (0: never; default: 2 ×
+//! settleMultiple × closeFee).
 //! Serves `/v1/chunk` (routed, N amsat per call) with a watcher; prints "ready" on stderr.
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,6 +35,7 @@ fn main() {
     let mut cfg = ProviderConfig::new(&network);
     cfg.policy = FundingPolicy { min_capacity: 20_000, min_expiry_blocks: 1_008, max_expiry_blocks: 8_640, close_margin: 144, ..FundingPolicy::default() };
     cfg.settle_multiple = f("--settle-multiple", 20.0) as u64;
+    cfg.rollover_zero_conf_max = arg("--zero-conf-max").map(|v| v.parse().expect("--zero-conf-max"));
     cfg.height_ttl = Duration::from_millis(500);
     let ledger = match arg("--ledger") {
         Some(p) => Ledger::open(std::path::Path::new(&p)).expect("ledger"),
@@ -52,7 +56,7 @@ fn main() {
     eprintln!("rust route provider {} on {port} ready", prov.pay_to());
     let w = prov.clone();
     std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(5));
+        std::thread::sleep(Duration::from_secs_f64(f("--watch-secs", 5.0)));
         if let Err(e) = w.close_due() {
             eprintln!("watcher: {e}");
         }

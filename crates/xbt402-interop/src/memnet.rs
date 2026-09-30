@@ -115,6 +115,21 @@ impl MemChain {
         st.raw.remove(txid);
     }
 
+    /// The block with `txid` is reorged out (AGP-053): the tx is back in the mempool, its outputs
+    /// unconfirmed and its inputs unspent in blocks again.
+    pub fn unconfirm(&self, txid: &str) {
+        let mut st = self.st();
+        for (k, u) in st.utxos.iter_mut() {
+            if k.0 == txid {
+                u.confirmations = 0;
+            }
+        }
+        let spends: Vec<_> = st.spent.iter().filter(|(_, s)| *s == txid).map(|(k, _)| k.clone()).collect();
+        for k in spends {
+            st.mined.remove(&k);
+        }
+    }
+
     /// The spender of an outpoint, if any.
     pub fn spender(&self, txid: &str, vout: u32) -> Option<String> {
         self.st().spent.get(&(txid.to_string(), vout)).cloned()
