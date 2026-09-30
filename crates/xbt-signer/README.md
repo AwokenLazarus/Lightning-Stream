@@ -117,6 +117,44 @@ url, method and `max_sats` then pays under it once, with `human = true`, and ret
 Other tokens keep B2's `approve`, which pays at once. `close_channel` now returns B2's AGP-029
 `close_report`.
 
+### Lightning: `rail=ln` (AGP-048)
+
+`ln_pay {invoice, max_sats, description?}` and `ln_status {}`. The signer pays XBT Lightning invoices
+through a Lightning Fork (LND) node, under B2's policy: `dest` is `ln:<payee node id>` (put it on the
+allowlist), and max_per_tx, the budgets, per-counterparty, velocity, split-bypass and the human
+threshold apply to the invoice amount plus the routing-fee limit. An over-threshold invoice becomes an
+approval token; the human's `approve` grants it and the agent's same `ln_pay` then pays, once.
+
+Before anything reaches the router (`src/ln.rs`, `src/bolt11.rs`):
+
+1. the invoice, decoded and signature-checked here: this chain's prefix (`lnbc` / `lnbcrt`), feature bit
+   512 (`option_blake2b`; without it the invoice is SHA-256 Lightning's), an amount, at least
+   `ln.min_expiry_s` left, `min_final_cltv` within `ln.max_cltv_blocks`, the caller's `description`
+   (plain or hashed) when given;
+2. the LN node's chain identity against the signer's own Knots node: its network, its hash at the
+   anchor height (961,640 pinned on mainnet; `ln.anchor_height` / `ln.anchor_hash` elsewhere), its tip,
+   its own bit 512, synced;
+3. the node's `DecodePayReq` must match field by field;
+4. only channels that are active, `unified_sigs`, not taproot, not zero-conf, and funded at or above
+   the split (961,632 on mainnet; `ln.split_height` elsewhere) go in `outgoing_chan_ids`.
+
+The worst case is booked to the ledger and to `.run/ln_payments.json` before the send; a settled
+payment's booking becomes what it cost, a failed one's goes (the audit log keeps `ln_amend`). A payment
+left in flight is reconciled from the node's payment list (by `ln_status`, the next `ln_pay`, the
+watcher) and blocks new LN payments until then. Each settled payment is a `ln_payment` line in the
+signature log whose `sig_sha256` is the payment hash (the log holds the SHA-256 of the preimage).
+The wallet never opens channels; `ln_status` lists the node's coins below the split, which must never
+fund one.
+
+policy.json `ln`: `enabled` (default off), `max_fee_base_sats` (10), `max_fee_ppm` (5000),
+`min_expiry_s` (60), `max_cltv_blocks` (1008), `timeout_s` (60), `anchor_height`, `anchor_hash`,
+`split_height`, `max_tip_lead` (2), `require_description` (false), `exposure_cap_sats` (0: none; above
+it `ln_status` warns). Environment: `B2_LN_REST` (`https://host:port`; plain http only on loopback),
+`B2_LN_MACAROON` (a baked macaroon with `info:read offchain:read offchain:write onchain:read` is
+enough), `B2_LN_TLS_CERT` (LND's `tls.cert`: the connection is pinned to exactly that certificate). A
+bad LN configuration shuts the rail (`ln_config`), not the signer. Regtest proof:
+`scripts/ln_rail_regtest.sh`.
+
 ## Not ported
 
 Each of these answers that it is unavailable:

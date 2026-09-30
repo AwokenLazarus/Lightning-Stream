@@ -46,6 +46,10 @@ pub fn normalize_dest(dest: &str) -> String {
         return String::new();
     }
     let lower = dest.to_lowercase();
+    // AGP-048: a Lightning payee is `ln:<node id>` (hex, case-folded)
+    if lower.starts_with("ln:") {
+        return lower;
+    }
     if lower.starts_with("bc1") || lower.starts_with("bcrt1") || lower.starts_with("tb1") {
         return lower;
     }
@@ -130,6 +134,8 @@ pub struct PolicyConfig {
     pub hot_balance_cap_sats: i64,
     pub forward: Map<String, Value>,
     pub routing: Map<String, Value>,
+    /// AGP-048 `rail=ln`: the Lightning rail's settings ([`crate::ln::LnPolicy`]).
+    pub ln: Map<String, Value>,
     pub anchor_interval_s: i64,
     pub anchor_required: bool,
     /// `None`: mine on regtest only.
@@ -144,7 +150,7 @@ impl Default for PolicyConfig {
         Self { allowlist: vec![], max_per_tx_sats: 10_000_000, daily_budget_sats: 50_000_000, weekly_budget_sats: 200_000_000,
                per_counterparty_cap_sats: 30_000_000, velocity_max: 8, velocity_window_s: 3600, human_threshold_sats: 10_000_000,
                split_window_s: 600, approval_ttl_s: 900, channel_expiry_blocks: 1008, treasury_csv: 4320, counterparties: Map::new(),
-               refund_enabled: true, refund_margin_blocks: 6, hot_balance_cap_sats: 0, forward: Map::new(), routing: Map::new(),
+               refund_enabled: true, refund_margin_blocks: 6, hot_balance_cap_sats: 0, forward: Map::new(), routing: Map::new(), ln: Map::new(),
                anchor_interval_s: 60, anchor_required: false, regtest_mine: None, open_wait_s: 1800, open_retry_s: 60,
                close_fee_max_sats: 2000 }
     }
@@ -196,6 +202,9 @@ impl PolicyConfig {
         if let Some(Value::Object(m)) = raw.get("routing") {
             c.routing = m.clone();
         }
+        if let Some(Value::Object(m)) = raw.get("ln") {
+            c.ln = m.clone();
+        }
         if let Some(Value::Array(a)) = raw.get("allowlist") {
             c.allowlist = a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
         }
@@ -220,11 +229,11 @@ impl PolicyConfig {
 }
 
 /// Every key policy.json may hold (B2's `PolicyConfig` plus `human_pubkey`, `recovery_address`).
-pub const POLICY_KEYS: [&str; 28] = ["allowlist", "max_per_tx_sats", "daily_budget_sats", "weekly_budget_sats", "per_counterparty_cap_sats",
+pub const POLICY_KEYS: [&str; 29] = ["allowlist", "max_per_tx_sats", "daily_budget_sats", "weekly_budget_sats", "per_counterparty_cap_sats",
     "velocity_max", "velocity_window_s", "human_threshold_sats", "split_window_s", "approval_ttl_s", "channel_expiry_blocks", "treasury_csv",
     "counterparties", "refund_enabled", "refund_margin_blocks", "hot_balance_cap_sats", "forward", "routing", "anchor_interval_s",
     "anchor_required", "regtest_mine", "open_wait_s", "open_retry_s", "close_fee_max_sats", "human_pubkey", "recovery_address",
-    "vault", "treasury"];
+    "vault", "treasury", "ln"];
 
 /// Fields a running signer reads only at start: a `policy_set` records them and they apply on the next start.
 pub const RESTART_KEYS: [&str; 8] = ["anchor_interval_s", "anchor_required", "regtest_mine", "open_wait_s", "refund_margin_blocks",
@@ -347,6 +356,9 @@ pub fn validate_policy(raw: &Value) -> (Vec<String>, Vec<String>) {
         }
         Some(_) => errors.push("policy.json routing: must be an object".into()),
     }
+    if let Some(l) = obj.get("ln") {
+        crate::ln::validate(l, &mut errors);
+    }
     (errors, warnings)
 }
 
@@ -441,6 +453,24 @@ impl PolicyStore {
             None => d["payments"] = json!([row]),
         }
         self.write(&d)
+    }
+
+    /// AGP-048: settle a booking. The row committed under `txid` (a Lightning payment booked at its
+    /// worst case before it was sent) becomes what was actually spent, or goes when nothing was
+    /// (`None`). `false`: no such row. The audit log keeps the history.
+    pub fn amend(&self, txid: &str, amount_sats: Option<i64>) -> Result<bool> {
+        let _g = self.lock.lock();
+        let mut d = self.read()?;
+        let Some(a) = d.get_mut("payments").and_then(Value::as_array_mut) else { return Ok(false) };
+        let Some(i) = a.iter().rposition(|e| e.get("txid").and_then(Value::as_str) == Some(txid)) else { return Ok(false) };
+        match amount_sats {
+            Some(n) => a[i]["amount_sats"] = n.into(),
+            None => {
+                a.remove(i);
+            }
+        }
+        self.write(&d)?;
+        Ok(true)
     }
 
     pub fn put_approval(&self, token: &str, payload: Value) -> Result<()> {
@@ -648,5 +678,6 @@ mod tests {
         assert_eq!(normalize_dest("https:///x"), "https:///x");
         assert_eq!(normalize_dest("HTTP://h/x"), "HTTP://h/x");
         assert_eq!(normalize_dest(""), "");
+        assert_eq!(normalize_dest(" LN:02AB "), "ln:02ab");
     }
 }

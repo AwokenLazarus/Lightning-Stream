@@ -14,6 +14,8 @@
 //! * [`channels`]: the channel book (per-counterparty Spillman channels as the budget).
 //! * [`session`]: `xbt402_pay` inside the signer (open, minConf wait, paid calls, close).
 //! * [`routing`]: the routing policy and adaptor-lock book operations (AGP-021).
+//! * [`bolt11`], [`ln`]: `rail=ln` (AGP-048): XBT Lightning invoices paid through an LND node under the
+//!   same policy, with the chain-identity, bit-512, taproot and pre-split guards.
 //! * [`signer`]: the request handler and the watcher; [`server`]: the socket.
 //! * [`admin`]: the web UI's methods (AGP-039): the approval queue, human-signed policy changes, key
 //!   enrolment and rotation, backups.
@@ -22,11 +24,13 @@ pub mod admin;
 pub mod anchor;
 pub mod client;
 pub mod approval;
+pub mod bolt11;
 pub mod channels;
 pub mod fsx;
 pub mod hot;
 pub mod ipc;
 pub mod keystore;
+pub mod ln;
 pub mod node;
 pub mod policy;
 pub mod pyjson;

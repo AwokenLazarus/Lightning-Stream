@@ -1,0 +1,35 @@
+# AGP-048 overlay on lightning-fork-lab (a5cadc5): publish only what the rail=ln regtest needs, on
+# loopback, in AGP-048's port range (34600-34699; its top, 34680+, since another lab binds 34600-34619), and cap every container's CPU.
+#   knots-b2b RPC   127.0.0.1:34681  (the signer's own node)
+#   lf1 REST        127.0.0.1:34691  (the agent's Lightning Fork node)
+#   lnd-sha REST    127.0.0.1:34693  (a stock lnd on the SHA-256 regtest: the wrong-chain backend)
+services:
+  knots-b2b:
+    cpus: 2
+    ports: ["127.0.0.1:34681:18443"]
+  bitcoind-sha:
+    cpus: 1
+  lf1:
+    cpus: 2
+    ports: ["127.0.0.1:34691:8080"]
+  lf2:
+    cpus: 2
+  lnd-sha:
+    cpus: 1
+    ports: ["127.0.0.1:34693:8080"]
+    command:
+      - --noseedbackup
+      - --bitcoin.regtest
+      - --bitcoin.node=bitcoind
+      - --bitcoind.rpchost=bitcoind-sha:18443
+      - --bitcoind.rpcuser=lab
+      - --bitcoind.rpcpass=lab
+      - --bitcoind.zmqpubrawblock=tcp://bitcoind-sha:28332
+      - --bitcoind.zmqpubrawtx=tcp://bitcoind-sha:28333
+      - --rpclisten=0.0.0.0:10009
+      - --restlisten=0.0.0.0:8080
+      - --listen=0.0.0.0:9735
+      - --externalip=lnd-sha:9735
+      - --tlsextradomain=lnd-sha
+      - --alias=lnd-sha
+      - --debuglevel=info

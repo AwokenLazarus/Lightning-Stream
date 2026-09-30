@@ -26,6 +26,7 @@ use crate::approval::{recover_message, sweep_message, verify, verify_approval, x
 use crate::channels::{AdaptorScheme, ChannelBook};
 use crate::hot::{HotWallet, DEFAULT_FEE};
 use crate::keystore::KeyStore;
+use crate::ln::{LnBackend, LnBook, LndRest};
 use crate::node::{self, KnotsRpc, Node};
 use crate::policy::{normalize_dest, AuditLog, Clock, Payment, PolicyConfig, PolicyEngine, PolicyStore};
 use crate::pyjson::{now_f64, py_int, str_or_empty, truthy, ts_value};
@@ -140,7 +141,7 @@ pub fn deny(rule: &str, reason: impl Into<String>) -> Value {
     json!({"verdict": "deny", "rule": rule, "reason": reason.into()})
 }
 
-fn with(mut v: Value, extra: Value) -> Value {
+pub(crate) fn with(mut v: Value, extra: Value) -> Value {
     if let (Value::Object(a), Value::Object(b)) = (&mut v, extra) {
         for (k, x) in b {
             a.insert(k, x);
@@ -177,6 +178,8 @@ pub struct SignerOptions {
     pub anchor: Option<AnchorClient>,
     /// Overrides `B2_HOT_KEYFILE` / `B2_HOT_PASSPHRASE` (the container entry point's secret source, AGP-038).
     pub keystore: Option<Arc<KeyStore>>,
+    /// AGP-048: the LN node `rail=ln` pays through (default: `B2_LN_REST` / `B2_LN_MACAROON` / `B2_LN_TLS_CERT`).
+    pub ln: Option<Arc<dyn LnBackend>>,
 }
 
 pub struct Signer {
@@ -205,6 +208,11 @@ pub struct Signer {
     pub routing: RouteSigner,
     open_tried: Mutex<HashMap<String, f64>>,
     pub watch_interval: f64,
+    /// AGP-048 `rail=ln`: the LN node (None: not configured), a configuration error that keeps the
+    /// rail shut, and the write-ahead payment book.
+    pub ln: Option<Arc<dyn LnBackend>>,
+    pub ln_error: Option<String>,
+    pub ln_book: LnBook,
 }
 
 impl Signer {
@@ -265,9 +273,19 @@ impl Signer {
         let routing = RouteSigner::new(book.clone(), RoutePolicy::from_value(&config.routing), Some(&run.join("routing.json")),
                                        Some(engine.clone()), Some(opts.adaptor.clone().unwrap_or_else(|| Arc::new(crate::routing::Xbt402Adaptor))));
         let watch_interval = std::env::var("B2_WATCH_INTERVAL").ok().and_then(|v| v.parse().ok()).unwrap_or(10.0);
+        // an LN misconfiguration shuts only the LN rail (every ln_pay is refused with it)
+        let (ln, ln_error) = match opts.ln.clone() {
+            Some(b) => (Some(b), None),
+            None => match LndRest::from_env() {
+                Ok(b) => (b.map(|b| Arc::new(b) as Arc<dyn LnBackend>), None),
+                Err(e) => (None, Some(e.msg)),
+            },
+        };
+        let ln_book = LnBook::open(&run.join("ln_payments.json"))?;
         Ok(Arc::new(Self { root: root.into(), run, config: RwLock::new(config), engine, node, chain, hrp, mining, sock_path,
                            human_pubkey: RwLock::new(human_pubkey), spend: Mutex::new(()), approval_outcomes: Mutex::new(HashMap::new()), boot_policy: raw,
-                           keystore, sigaudit, anchor, hot, book, session, routing, open_tried: Mutex::new(HashMap::new()), watch_interval }))
+                           keystore, sigaudit, anchor, hot, book, session, routing, open_tried: Mutex::new(HashMap::new()), watch_interval,
+                           ln, ln_error, ln_book }))
     }
 
     /// Fail closed if the signature log no longer holds the witness's latest anchor.
@@ -322,7 +340,7 @@ impl Signer {
     }
 
     /// Anchor after a close, refund or sweep. Never fails the operation that triggered it.
-    fn anchor_after(&self, reason: &str) {
+    pub(crate) fn anchor_after(&self, reason: &str) {
         if self.anchor.enabled() {
             self.anchor.anchor(reason);
         }
@@ -490,6 +508,15 @@ impl Signer {
                 sanitize(self.recover_lock(p))
             }
             "routing_status" => sanitize(self.routing.status()),
+            // AGP-048 rail=ln
+            "ln_pay" => {
+                let _g = self.lock();
+                sanitize(self.ln_pay_locked(p))
+            }
+            "ln_status" => {
+                let _g = self.lock();
+                sanitize(self.ln_status_locked())
+            }
             "close_channel" => {
                 let _g = self.lock();
                 sanitize(self.close_channel_locked(p))
@@ -743,6 +770,14 @@ impl Signer {
                     a[k] = r.get(k).cloned().unwrap_or(Value::Null);
                 }
                 actions.push(json!({"anchor": a}));
+            }
+        }
+        // AGP-048: a Lightning payment a crash or a timeout left in flight
+        if self.ln.is_some() && !self.ln_book.in_flight().is_empty() {
+            let _g = self.lock();
+            let _c = sigaudit::context(Some("watcher"), Some("watcher:ln_reconcile"));
+            for r in self.ln_reconcile_locked() {
+                actions.push(json!({"ln_reconcile": r}));
             }
         }
         actions
@@ -1161,7 +1196,7 @@ impl Signer {
                                             "reason": "signature fields do not match pending approval", "dest": dest, "amount_sats": amount, "ts": ts_value(now)}));
             return Ok(deny("approval_bind", "signature fields do not match the pending approval"));
         }
-        if payload.get("kind").and_then(Value::as_str) == Some("xbt402") {
+        if matches!(payload.get("kind").and_then(Value::as_str), Some("xbt402") | Some("ln")) {
             return self.grant_xbt402(&token, &payload);
         }
         let Some(pay) = self.engine.consume_approval(&token)? else { return Ok(deny("approval", "unknown or expired approval token")) };

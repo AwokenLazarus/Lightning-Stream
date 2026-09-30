@@ -7,6 +7,7 @@
 //! and rotation operations are not tools at all.
 //!
 //! * [`mcp`]: the protocol, answered as B2's SDK answers it; [`mcp::TOOL_NAMES`], [`mcp::FORBIDDEN`].
+//!   AGP-048 adds [`mcp::LN_TOOL_NAMES`] (`ln_pay`, `ln_status`), offered only with `XBT_MCP_LN=1`.
 //! * [`args`]: pydantic-compatible argument validation; [`pyrepr`]: Python reprs for its messages.
 //! * [`wallet`]: the signer socket, B2's `_pack` (sanitize, refuse key material, print), and the
 //!   optional in-process xbt402 payer (`XBT_MCP_PAYER=local`).

@@ -24,6 +24,17 @@ socket path.
 | `forward_status` | | the forward-market rail: limits, spend, lots |
 | `forward_recover` | `txid` | rebuilds a forward transfer from a close's witness |
 
+**Lightning (AGP-048), with `XBT_MCP_LN=1` only:**
+
+| tool | arguments | what it does |
+|---|---|---|
+| `ln_pay` | `invoice`, `max_sats`, `description=""` | pays an XBT Lightning (BOLT 11) invoice through the signer's LN node, under the same policy (`dest` is `ln:<payee node id>`). `max_sats` caps the amount plus the routing-fee limit. Refused: no feature bit 512, an LN node not verified on the XBT chain, expired or amountless invoices, no safe channel. Over the human threshold: `needs_human`; after the human's approval the same call pays |
+| `ln_status` | | the LN node's chain check, its channels with the guard verdicts, coins below the split, exposure, recent payments |
+
+Without `XBT_MCP_LN` the list is B2's exact ten (the Python conformance check depends on it). The
+LN node's REST URL, macaroon and TLS certificate are the signer's (`B2_LN_*`), never this process's.
+Node and invoice text (aliases, descriptions, failure reasons) comes back under `untrusted_ln_data`.
+
 **Never tools:** `approve`, `recover_vault`, `recover_treasury`, `sweep_hot` and `rotate_hot_key`. A
 model can't approve its own payments or move the hot key. Humans use the out-of-band
 `agentwallet-approve` CLI with the device key.

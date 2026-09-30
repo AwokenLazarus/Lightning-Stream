@@ -40,6 +40,7 @@ pub fn spec(tool: &str) -> Option<&'static [Arg]> {
                                    opt("max_sats", Ty::Int, || Value::from(1000))];
     static COUNTERPARTY: [Arg; 1] = [req("counterparty", Ty::Str)];
     static TXID: [Arg; 1] = [req("txid", Ty::Str)];
+    static LN_PAY: [Arg; 3] = [req("invoice", Ty::Str), req("max_sats", Ty::Int), opt("description", Ty::Str, empty)];
     Some(match tool {
         "balance" | "channels" | "forward_status" => &[],
         "quote_payment" | "pay" => &PAYMENT,
@@ -47,6 +48,9 @@ pub fn spec(tool: &str) -> Option<&'static [Arg]> {
         "xbt402_pay" => &XBT402_PAY,
         "close_channel" | "xbt402_refund" => &COUNTERPARTY,
         "forward_recover" => &TXID,
+        // AGP-048 (not B2's)
+        "ln_pay" => &LN_PAY,
+        "ln_status" => &[],
         _ => return None,
     })
 }

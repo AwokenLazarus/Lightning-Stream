@@ -22,6 +22,9 @@ scrypt = { version = "0.11", default-features = false }
 ed25519-dalek = "2.1"
 indexmap = "2"
 xbt-svc.workspace = true
+# AGP-048: invoice signatures (recovery) and the LND REST client's pinned TLS certificate
+secp256k1 = { workspace = true, features = ["recovery"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 [dev-dependencies]
 tempfile = "3"

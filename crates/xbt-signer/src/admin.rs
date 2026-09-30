@@ -134,7 +134,7 @@ impl Signer {
         let state = if expires < now { "expired" } else if approved { "approved" } else { "pending" };
         json!({"token": token, "dest": a.get("dest"), "amount_sats": a.get("amount_sats"), "memo": a.get("memo"), "expires": expires,
                "ts": a.get("ts"), "kind": a.get("kind").cloned().unwrap_or("pay".into()), "url": a.get("url"), "method": a.get("method"),
-               "state": state})
+               "payment_hash": a.get("payment_hash"), "state": state})
     }
 
     /// The UI's methods; `None` for a method this module does not know.
@@ -394,7 +394,8 @@ impl Signer {
         self.remember(token, outcome("used", json!({"token": token, "charged_sats": charged})));
     }
 
-    /// `approve` of an xbt402 token (the signature is already checked): mark it granted.
+    /// `approve` of an xbt402 or (AGP-048) an ln token (the signature is already checked): mark it
+    /// granted. The agent's same call again pays under it, once.
     pub(crate) fn grant_xbt402(&self, token: &str, payload: &Value) -> Result<Value> {
         if payload.get("approved") == Some(&Value::Bool(true)) {
             return Ok(deny("approval_replay", "approval token already approved"));
@@ -402,6 +403,11 @@ impl Signer {
         self.engine.store.update_approval(token, &json!({"approved": true, "approved_at": ts_value(self.engine.now())}))?;
         self.engine.audit.append(json!({"type": "approval_granted", "token": token, "dest": payload.get("dest"),
                                         "amount_sats": payload.get("amount_sats"), "url": payload.get("url"), "ts": ts_value(self.engine.now())}));
+        if payload.get("kind").and_then(Value::as_str) == Some("ln") {
+            return Ok(json!({"verdict": "allow", "approved": true, "granted": true, "rail": "ln", "token": token, "dest": payload.get("dest"),
+                             "amount_sats": payload.get("amount_sats"), "payment_hash": payload.get("payment_hash"), "expires": payload.get("expires"),
+                             "note": "the agent's next ln_pay of this invoice pays under this approval, once"}));
+        }
         Ok(json!({"verdict": "allow", "approved": true, "granted": true, "rail": "xbt402", "token": token, "dest": payload.get("dest"),
                   "amount_sats": payload.get("amount_sats"), "url": payload.get("url"), "expires": payload.get("expires"),
                   "note": "the agent's next xbt402_pay of this url with this max_sats pays under this approval, once"}))
