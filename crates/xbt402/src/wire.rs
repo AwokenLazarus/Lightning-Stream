@@ -1,4 +1,4 @@
-//! The x402 v2 `xbt-channel` wire: PAYMENT-REQUIRED / PAYMENT-SIGNATURE / PAYMENT-RESPONSE,
+//! The x402 v2 `batch-settlement` wire (XBT channel binding; `xbt-channel` accepted as an alias): PAYMENT-REQUIRED / PAYMENT-SIGNATURE / PAYMENT-RESPONSE,
 //! request authentication, receipts, and the `/x402/verify|settle|supported` facilitator bodies.
 //!
 //! ```text
@@ -25,8 +25,18 @@ use xbt_primitives::hash::tagged_hash;
 use crate::error::{fail, ChannelError, Result};
 use crate::json::{dumps_compact, py_str};
 
-pub const SCHEME: &str = "xbt-channel";
+/// x402 scheme id: the XBT network binding of upstream `batch-settlement`.
+pub const SCHEME: &str = "batch-settlement";
+/// One-release input alias. Servers and clients accept this on the wire; they emit [`SCHEME`].
+pub const SCHEME_ALIAS: &str = "xbt-channel";
+/// Reserved x402 extra key: this binding's transfer method.
+pub const ASSET_TRANSFER_METHOD: &str = "channel";
 pub const X402_VERSION: u64 = 2;
+
+/// True for the canonical scheme or the one-release `xbt-channel` alias.
+pub fn scheme_accepted(s: Option<&str>) -> bool {
+    matches!(s, Some(SCHEME) | Some(SCHEME_ALIAS))
+}
 /// Default request-body bound.
 pub const MAX_BODY: usize = 1 << 20;
 pub const FACILITATOR_VERIFY: &str = "/x402/verify";
@@ -100,15 +110,15 @@ pub fn hub_channel_message(chan: &str) -> [u8; 32] {
 /// x402 facilitator reasons for the protocol's own codes.
 pub fn upstream_code(code: &str) -> String {
     match code {
-        "unsupported_scheme_or_network" => "invalid_xbt_channel_scheme_or_network".into(),
-        "bad_payload" => "invalid_xbt_channel_payload".into(),
-        "bad_auth" => "invalid_xbt_channel_auth".into(),
-        "channel_closing" => "invalid_xbt_channel_closing".into(),
-        "bad_sig" => "invalid_xbt_channel_signature".into(),
+        "unsupported_scheme_or_network" => "invalid_batch_settlement_xbt_scheme_or_network".into(),
+        "bad_payload" => "invalid_batch_settlement_xbt_payload".into(),
+        "bad_auth" => "invalid_batch_settlement_xbt_auth".into(),
+        "channel_closing" => "invalid_batch_settlement_xbt_closing".into(),
+        "bad_sig" => "invalid_batch_settlement_xbt_signature".into(),
         "wrong_network" => "invalid_network".into(),
         "close_failed" => "unexpected_settle_error".into(),
-        "" => "invalid_xbt_channel_payload".into(),
-        other => format!("invalid_xbt_channel_{other}"),
+        "" => "invalid_batch_settlement_xbt_payload".into(),
+        other => format!("invalid_batch_settlement_xbt_{other}"),
     }
 }
 
@@ -137,8 +147,8 @@ pub fn settlement_response(receipt: &Value, network: &str, payer: &str, success:
 pub fn receipt_of(resp: &Value) -> Result<&Value> {
     let r = resp.get("extra").and_then(|e| e.get("receipt")).filter(|r| r.is_object());
     let r = match r {
-        Some(r) if r.get("scheme").and_then(Value::as_str) == Some(SCHEME) => r,
-        _ => return fail("bad_receipt", "PAYMENT-RESPONSE carries no xbt-channel receipt in extra.receipt"),
+        Some(r) if scheme_accepted(r.get("scheme").and_then(Value::as_str)) => r,
+        _ => return fail("bad_receipt", "PAYMENT-RESPONSE carries no batch-settlement receipt in extra.receipt"),
     };
     if py_str(resp["extra"].get("chargedAmount")) != py_str(r.get("charged")) {
         return fail("bad_receipt", "extra.chargedAmount differs from the signed receipt");
@@ -170,7 +180,7 @@ pub fn payment_payload(accepted: &Value, payload: &Value) -> Value {
 
 // --- typed views for applications ---------------------------------------------------------------
 
-/// `PaymentRequirements.extra` for `xbt-channel`.
+/// `PaymentRequirements.extra` for the XBT `batch-settlement` channel binding.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChannelExtra {
@@ -340,8 +350,10 @@ mod tests {
 
     #[test]
     fn codes_and_digests() {
-        assert_eq!(upstream_code("bad_sig"), "invalid_xbt_channel_signature");
-        assert_eq!(upstream_code("stale_amount"), "invalid_xbt_channel_stale_amount");
+        assert_eq!(upstream_code("bad_sig"), "invalid_batch_settlement_xbt_signature");
+        assert_eq!(upstream_code("stale_amount"), "invalid_batch_settlement_xbt_stale_amount");
+        assert!(scheme_accepted(Some(SCHEME)) && scheme_accepted(Some(SCHEME_ALIAS)));
+        assert!(!scheme_accepted(Some("exact")));
         assert!(safe_code("bad_sig") && !safe_code("Bad") && !safe_code("a b") && !safe_code("__"));
         assert_eq!(request_digest("", "", b""), hex::encode(Sha256::digest(b"||")));
         let v = json!({"a": 1});

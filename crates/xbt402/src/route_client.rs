@@ -440,7 +440,7 @@ impl RoutePayer {
 
     fn pick(&self, pr: &Value) -> Result<Value> {
         for acc in pr.get("accepts").and_then(Value::as_array).into_iter().flatten() {
-            if acc.get("scheme").and_then(Value::as_str) == Some(SCHEME) && acc.get("network").and_then(Value::as_str) == Some(&self.cfg.network) {
+            if scheme_accepted(acc.get("scheme").and_then(Value::as_str)) && acc.get("network").and_then(Value::as_str) == Some(&self.cfg.network) {
                 let ex = acc.get("extra").cloned().unwrap_or(Value::Null);
                 if !py_u64(ex.get("closeFeeSat")).is_some_and(|f| f <= self.cfg.max_close_fee) {
                     return fail("bad_offer", "closeFeeSat above our cap");

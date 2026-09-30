@@ -17,7 +17,7 @@ if [ -z "${UI_REGTEST_SCOPED:-}" ] && command -v systemd-run >/dev/null; then
 fi
 cd "$(dirname "$0")/../.."
 ROOT=$PWD
-B1=${XBT402_B1:-$HOME/xbt-rnd/b1-agp-029}
+B1=${XBT402_B1:-$HOME/xbt-rnd/b1-agp-050}
 [ -d "$B1" ] || B1=$HOME/xbt-rnd/b1
 STAMP=$(date +%Y%m%d-%H%M%S)
 R=$ROOT/run/ui-regtest/$STAMP

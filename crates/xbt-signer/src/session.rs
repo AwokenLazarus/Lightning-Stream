@@ -18,7 +18,7 @@ use xbt402::client::Transport;
 use xbt402::conditional::{encrypt, preimage_from_tx};
 use xbt402::json::{dumps, py_str};
 use xbt402::provider::HttpResponse;
-use xbt402::wire::{b64json, facilitator_request, receipt_of, request_digest, safe_code, unb64json, FACILITATOR_VERIFY, SCHEME};
+use xbt402::wire::{b64json, facilitator_request, receipt_of, request_digest, safe_code, scheme_accepted, unb64json, FACILITATOR_VERIFY};
 use xbt_primitives::ecdsa;
 use xbt_primitives::hash::{sha256, tagged_hash};
 use xbt_primitives::tx::Tx;
@@ -61,8 +61,8 @@ pub fn request_target(url: &str) -> String {
 
 fn pick_accept(pr: &Value, network: &str) -> Result<Value> {
     pr.get("accepts").and_then(Value::as_array).into_iter().flatten()
-        .find(|a| a.get("scheme").and_then(Value::as_str) == Some(SCHEME) && a.get("network").and_then(Value::as_str) == Some(network))
-        .cloned().ok_or_else(|| rt("no xbt-channel offer on this network"))
+        .find(|a| scheme_accepted(a.get("scheme").and_then(Value::as_str)) && a.get("network").and_then(Value::as_str) == Some(network))
+        .cloned().ok_or_else(|| rt("no batch-settlement offer on this network"))
 }
 
 /// Python's `int(v or default)`.

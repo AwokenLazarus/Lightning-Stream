@@ -1,4 +1,4 @@
-//! The provider (resource server) side: a facilitator-less x402 `xbt-channel` verifier around an
+//! The provider (resource server) side: a facilitator-less x402 `batch-settlement` (XBT channel) verifier around an
 //! application handler. A port of B1 `XbtChannelProvider` (v1.1 + v1.2): the 402 challenge, open,
 //! paid calls with request auth and signed receipts, postpay/prepay billing, metered charges,
 //! hash-locked conditional sales, cooperative close, rollover, the facilitator endpoints and the
@@ -130,7 +130,7 @@ struct CondOffer {
     plain: Vec<u8>,
 }
 
-/// The facilitator-less `xbt-channel` resource server.
+/// The facilitator-less `batch-settlement` (XBT channel) resource server.
 pub struct Provider {
     pub cfg: ProviderConfig,
     chain: Arc<dyn ChainBackend>,
@@ -145,7 +145,7 @@ pub struct Provider {
     pub(crate) handler: Handler,
     charge: Option<ChargeFn>,
     pub(crate) routes: crate::route_seller::RouteSeller,
-    /// AGP-032: other schemes offered beside xbt-channel (xbt-work).
+    /// AGP-032: other schemes offered beside the channel binding (xbt-work).
     schemes: Vec<Arc<dyn crate::scheme::ProviderScheme>>,
 }
 
@@ -207,7 +207,7 @@ impl Provider {
         self
     }
 
-    /// Offer another scheme beside xbt-channel (AGP-032): its requirements follow the channel's in
+    /// Offer another scheme beside the channel binding (AGP-032): its requirements follow the channel's in
     /// every unpaid 402, its control endpoints are served, and a PAYMENT-SIGNATURE whose
     /// `accepted.scheme` is its scheme is verified and settled by it.
     pub fn with_scheme(mut self, s: Arc<dyn crate::scheme::ProviderScheme>) -> Self {
@@ -283,7 +283,8 @@ impl Provider {
                       "minExpiryBlocks": p.min_expiry_blocks, "maxExpiryBlocks": p.max_expiry_blocks,
                       "closeMarginBlocks": self.cfg.close_margin, "minConf": p.min_conf,
                       "closeFeeSat": self.cfg.close_fee.to_string(), "openUrl": OPEN_PATH,
-                      "closeUrl": CLOSE_PATH, "billing": self.cfg.billing, "derivation": DERIVATION}});
+                      "closeUrl": CLOSE_PATH, "billing": self.cfg.billing, "derivation": DERIVATION,
+                      "assetTransferMethod": ASSET_TRANSFER_METHOD}});
         if self.cfg.close_fee_payer != FeePayer::Payer {
             req["extra"]["closeFeePayer"] = self.cfg.close_fee_payer.as_str().into();
         }
@@ -896,7 +897,7 @@ impl Provider {
         }
         let pp = pp.unwrap_or(&Value::Null);
         for acc in [want.unwrap_or(&Value::Null), &pp["accepted"]] {
-            if acc.get("scheme").and_then(Value::as_str) != Some(SCHEME)
+            if !scheme_accepted(acc.get("scheme").and_then(Value::as_str))
                 || acc.get("network").and_then(Value::as_str) != Some(self.cfg.network.as_str())
                 || acc.get("payTo").and_then(Value::as_str) != Some(self.pay_to.as_str())
             {
@@ -1131,7 +1132,7 @@ impl Provider {
                 if let Some(s) = other {
                     return self.serve_other(s.as_ref(), &pp, method, path, body, price, url);
                 }
-                if pp.get("x402Version").and_then(Value::as_u64) != Some(2) || acc.get("scheme").and_then(Value::as_str) != Some(SCHEME)
+                if pp.get("x402Version").and_then(Value::as_u64) != Some(2) || !scheme_accepted(acc.get("scheme").and_then(Value::as_str))
                     || acc.get("network").and_then(Value::as_str) != Some(self.cfg.network.as_str())
                     || acc.get("payTo").and_then(Value::as_str) != Some(self.pay_to.as_str())
                 {

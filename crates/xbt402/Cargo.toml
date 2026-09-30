@@ -1,6 +1,6 @@
 [package]
 name = "xbt402"
-description = "xbt402: HTTP 402 payments over XBT Spillman channels (x402 v2 scheme xbt-channel), v1.1 + v1.2"
+description = "xbt402: HTTP 402 payments over XBT Spillman channels (x402 v2 batch-settlement XBT binding; xbt-channel alias), v1.1 + v1.2"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

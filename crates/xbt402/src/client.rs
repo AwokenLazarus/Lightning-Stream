@@ -1,4 +1,4 @@
-//! The payer SDK: pays x402 `xbt-channel` providers over any [`Transport`]. A port of B1
+//! The payer SDK: pays x402 `batch-settlement` (XBT channel) providers over any [`Transport`]. A port of B1
 //! `XbtChannelClient`: it opens a channel on the first 402 (funding through a [`Wallet`] hook),
 //! signs ever-increasing states (postpay: each call pays for the calls before it), authenticates
 //! every request, checks every receipt, keeps the refund, closes cooperatively, buys hash-locked
@@ -524,7 +524,7 @@ impl Client {
 
     fn pick(&self, pr: &Value) -> Result<Value> {
         for acc in pr.get("accepts").and_then(Value::as_array).into_iter().flatten() {
-            if acc.get("scheme").and_then(Value::as_str) == Some(SCHEME) && acc.get("network").and_then(Value::as_str) == Some(&self.cfg.network) {
+            if scheme_accepted(acc.get("scheme").and_then(Value::as_str)) && acc.get("network").and_then(Value::as_str) == Some(&self.cfg.network) {
                 let amount = py_u64(acc.get("amount")).ok_or_else(|| ChannelError::new("bad_offer", "amount"))?;
                 if amount > self.cfg.max_price {
                     return fail("too_expensive", format!("{amount} sat > max {}", self.cfg.max_price));

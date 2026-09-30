@@ -3,7 +3,7 @@
     py_provider.py PORT [payer|payee] [CONDITIONAL_PATH:PRICE:PLAINTEXT]
 Env: XBT402_B1, XBT402_DATADIR, XBT402_RPCPORT (B1's RPC.from_env)."""
 import json, os, secrets, sys, tempfile
-sys.path.insert(0, os.environ.get("XBT402_B1", os.path.expanduser("~/xbt-rnd/b1-agp-029")))
+sys.path.insert(0, os.environ.get("XBT402_B1", os.path.expanduser("~/xbt-rnd/b1-agp-050")))
 from xbt402.rpc import RPC  # noqa: E402
 from xbt402.x402_channel import XbtChannelProvider, network_id  # noqa: E402
 

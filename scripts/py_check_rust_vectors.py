@@ -5,7 +5,7 @@
 
 RUST_VECTORS.json is the Rust emitter's output (`xbt402-vectors`): the whole xbt402 vector file
 rebuilt by xbt-primitives/xbt402, the Rust provider serving every round trip. This imports B1's
-`docs/x402/check_vectors.py` (B1 = $XBT402_B1, default ~/xbt-rnd/b1-agp-029) and runs, unchanged:
+`docs/x402/check_vectors.py` (B1 = $XBT402_B1, default ~/xbt-rnd/b1-agp-050) and runs, unchanged:
   * diff(python_generate(), rust): what the Python library computes vs what Rust emitted;
   * independent_checks(rust): the checks that do not trust any generator (tweak preimage layout,
     p*G = P, each signature under the key the spec names, receipts under P, the refusals with their
@@ -16,7 +16,7 @@ import json
 import os
 import sys
 
-B1 = os.environ.get("XBT402_B1", os.path.expanduser("~/xbt-rnd/b1-agp-029"))
+B1 = os.environ.get("XBT402_B1", os.path.expanduser("~/xbt-rnd/b1-agp-050"))
 sys.path.insert(0, B1)
 sys.path.insert(0, os.path.join(B1, "docs", "x402"))
 import check_vectors as cv  # noqa: E402

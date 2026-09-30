@@ -317,7 +317,7 @@ fn refusals() {
     assert_eq!(b["error"], "unsupported_scheme_or_network");
     // a lowered state is stale; a relabelled signature is refused
     let v = prov.facilitator_verify(&facilitator_request(&acc, &json!({"chan": chan, "cum": "547", "sig": sig546})));
-    assert_eq!(v["invalidReason"], "invalid_xbt_channel_signature");
+    assert_eq!(v["invalidReason"], "invalid_batch_settlement_xbt_signature");
     // body over the limit; the routing lock endpoint (AGP-026) refuses a request without a payment as B1 does
     assert_eq!(prov.serve("POST", "/v1/q", &[], &vec![0u8; MAX_BODY + 1], "", None).status, 400);
     let r = prov.serve("POST", LOCK_PATH, &[], b"{}", "", None);

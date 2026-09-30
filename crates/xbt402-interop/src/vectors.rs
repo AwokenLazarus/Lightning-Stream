@@ -444,7 +444,7 @@ fn payee_pays_close(prov: &Provider, node: &StubNode, p: &ChannelParams, a: &Sec
 /// The whole vector file, as `check_vectors.py --write` writes it.
 pub fn generate() -> Value {
     json!({
-        "title": "x402 xbt-channel test vectors",
+        "title": "x402 batch-settlement (XBT channel) test vectors",
         "version": format!("1.2-draft (payee derivation {DERIVATION}, x402 v2 SettlementResponse and facilitator shapes, closeFeePayer)"),
         "generator": "docs/x402/check_vectors.py --write, reference library xbt402 v1.2",
         "notes": ["All keys are test keys derived from sha256 of fixed strings. Never fund them.",

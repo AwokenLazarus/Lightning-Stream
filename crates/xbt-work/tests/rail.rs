@@ -143,7 +143,7 @@ fn pay_with_work_end_to_end() {
     assert_eq!(r.status, 402);
     let pr = unb64json(r.header("PAYMENT-REQUIRED").unwrap()).unwrap();
     let schemes: Vec<&str> = pr["accepts"].as_array().unwrap().iter().map(|a| a["scheme"].as_str().unwrap()).collect();
-    assert_eq!(schemes, ["xbt-channel", "xbt-work"]);
+    assert_eq!(schemes, ["batch-settlement", "xbt-work"]);
     let acc = &pr["accepts"][1];
     assert_eq!((acc["amount"].as_str(), acc["payTo"].as_str(), acc["asset"].as_str()), (Some("10"), Some(PROV), Some("XBT:work-diff1")));
 

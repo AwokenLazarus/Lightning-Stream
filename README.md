@@ -1,7 +1,8 @@
 # xbt-rs
 
 Rust rails for XBT (Bitcoin with BLAKE2b proof of work): a shared chain-primitives crate and the
-xbt402 payment-channel crate (the x402 v2 scheme `xbt-channel`, spec v1.1 plus the v1.2
+xbt402 payment-channel crate (the x402 v2 XBT binding of `batch-settlement`,
+`extra.assetTransferMethod: "channel"`; `xbt-channel` accepted as an alias; spec v1.1 plus the v1.2
 `closeFeePayer` additions). It ports the Python references and is byte-identical to them. Built for
 xbt-compute's Rust device runtime (AGP-025, owned by xbt-agentpay).
 
@@ -16,10 +17,10 @@ Local repo, no remote. Workspace crates:
 | `xbt-wallet-mcp` | the agent wallet's MCP server (AGP-030): B2's ten tools (same names, schemas, validation, results and errors as `mcp_server.py`) over stdio and streamable HTTP, talking only to the B2 signer socket (Rust or Python signer), optional in-process xbt402 payer with keys in the signer. See `crates/xbt-wallet-mcp/README.md` (Claude Code, Hermes, OpenClaw config) | binary `xbt-wallet-mcp` |
 | `xbt-electrum` | the light chain backend: Electrum servers (TCP/TLS, batching, several servers) checked against our own `HeaderChain` and Merkle proofs; `xbt402::ChainBackend`, a typed API, and the node-RPC surface of the client path | library |
 | `xbt-svc` | container-ready service plumbing (AGP-038): one data dir, the secret source, readiness, proxy URLs, probes; see `docs/CONTAINER.md` | library |
-| `xbt-work` | pay-with-work (AGP-032): the x402 scheme `xbt-work` v1 draft. Invoices (base32 ids, both usernames), the strict receipt grammar and Ed25519 verification, the provider's receipt book (delta credit, equivocation proofs, audit intervals), exact work-unit pricing per nBits epoch, the `auth` binding, the xbt-work offer beside xbt-channel in the xbt402 Provider and a payer for the xbt402 Client, window statements and NTA deferral lines, the coinbase audit with fraud proofs and a carry ledger, the blinded relay client (ChaCha20-Poly1305), NTA attestation helpers | library (+ `xbt-work-{vectors,provider,payer}` with feature `tools`) |
+| `xbt-work` | pay-with-work (AGP-032): the x402 scheme `xbt-work` v1 draft. Invoices (base32 ids, both usernames), the strict receipt grammar and Ed25519 verification, the provider's receipt book (delta credit, equivocation proofs, audit intervals), exact work-unit pricing per nBits epoch, the `auth` binding, the xbt-work offer beside the channel binding in the xbt402 Provider and a payer for the xbt402 Client, window statements and NTA deferral lines, the coinbase audit with fraud proofs and a carry ledger, the blinded relay client (ChaCha20-Poly1305), NTA attestation helpers | library (+ `xbt-work-{vectors,provider,payer}` with feature `tools`) |
 | `xbt402-interop` | conformance suite, Rust→JSON vector emitter, regtest cross-implementation tools | no (`publish = false`) |
 
-References (read-only): B1 `agp-029` `a7c3521` (`~/xbt-rnd/b1-agp-029`, `xbt402/`; AGP-023 `f105ccc` plus the AGP-029 close report), B2 `agp-next2`
+References (read-only): B1 `agp-050` (`~/xbt-rnd/b1-agp-050`, from agp-054 `0eeb6c2`; xbt402 vectors and scheme rename), B2 `agp-next3`
 `04c3f56` (`~/xbt-rnd/b2`, `agentwallet/headers.py`), and `lazarus-protocol` (`~/Bitcoin/lazarus/protocol`).
 
 ## Build and verify
@@ -612,7 +613,7 @@ cumulative receipt with each call. It ports XBT-053 `receipts.py`, `nta.py` and 
 xbt-070 coinbase audit.
 
 * **Provider.** `Provider::new(..).with_scheme(Arc::new(WorkScheme(Arc::new(WorkProvider::new(cfg)?))))`:
-  every unpaid 402 lists `xbt-channel` and `xbt-work`. `POST /x402/xbt-work/invoice` issues invoices
+  every unpaid 402 lists `batch-settlement` and `xbt-work`. `POST /x402/xbt-work/invoice` issues invoices
   (`Cache-Control: no-store`, a bound on unfunded invoices, `429 too_many_invoices`). Payments are
   checked in the §9.1 order and debited durably (a 0600 state file, write+fsync+rename) before the
   handler runs. A handler answer ≥ 500 releases the debit. `refresh` pulls receipts through the

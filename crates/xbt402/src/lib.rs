@@ -1,4 +1,5 @@
-//! xbt402: HTTP 402 payments over XBT Spillman channels, the x402 v2 scheme `xbt-channel`
+//! xbt402: HTTP 402 payments over XBT Spillman channels, the x402 v2 XBT binding of
+//! `batch-settlement` (`extra.assetTransferMethod: "channel"`; `xbt-channel` accepted as an alias)
 //! (spec v1.1 + the v1.2 `closeFeePayer` additions), in Rust.
 //!
 //! A port of the Python reference (B1 `xbt402/`), byte-identical to it: the conformance suite in
@@ -15,7 +16,7 @@
 //! * [`signer`]: the [`signer::StateSigner`] seam, so the payer's keys can live in another
 //!   process (B2's signer, `xbt-signer`); [`signer::LocalSigner`] keeps them in memory.
 //! * [`funding`]: funding checks against a [`funding::ChainBackend`].
-//! * [`scheme`]: the seam for a second x402 scheme beside `xbt-channel` (`xbt-work`, AGP-032).
+//! * [`scheme`]: the seam for a second x402 scheme beside the channel binding (`xbt-work`, AGP-032).
 //!
 //! Optional features: `http-client` (ureq transport), `http-server` (tiny_http around the
 //! provider), `rpc` (bitcoind JSON-RPC backend and wallet).

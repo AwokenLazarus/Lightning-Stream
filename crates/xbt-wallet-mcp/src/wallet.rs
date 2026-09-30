@@ -294,10 +294,10 @@ impl LocalPayer {
         }
         let offer = probe.header("PAYMENT-REQUIRED").and_then(|h| xbt402::wire::unb64json(h).ok());
         let price = offer.as_ref().and_then(|pr| pr.get("accepts")).and_then(Value::as_array).into_iter().flatten()
-            .find(|a| a.get("scheme").and_then(Value::as_str) == Some("xbt-channel") && a.get("network").and_then(Value::as_str) == Some(self.network.as_str()))
+            .find(|a| xbt402::wire::scheme_accepted(a.get("scheme").and_then(Value::as_str)) && a.get("network").and_then(Value::as_str) == Some(self.network.as_str()))
             .and_then(|a| xbt402::json::py_u64(a.get("amount")));
         let Some(price) = price else {
-            return deny(xbt402::ChannelError::new("bad_offer", format!("no xbt-channel offer on {}", self.network)));
+            return deny(xbt402::ChannelError::new("bad_offer", format!("no batch-settlement offer on {}", self.network)));
         };
         if price > max_sats {
             return json!({"verdict": "deny", "rule": "max_sats", "reason": format!("quoted {price} > max_sats {max_sats}"), "charged_sats": 0,

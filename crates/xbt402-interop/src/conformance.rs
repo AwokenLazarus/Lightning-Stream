@@ -209,7 +209,7 @@ pub fn independent_checks(v: &Value) -> Vec<String> {
             need(s["response"]["isValid"] == Value::Bool(true), format!("{at}: a signed state must be valid"));
         }
         if name.starts_with("facilitator verify,") {
-            need(s["response"] == serde_json::json!({"isValid": false, "invalidReason": "invalid_xbt_channel_signature"}), format!("{at}: relabelled cum"));
+            need(s["response"] == serde_json::json!({"isValid": false, "invalidReason": "invalid_batch_settlement_xbt_signature"}), format!("{at}: relabelled cum"));
         }
         if name.starts_with("facilitator settle") {
             let close = steps.iter().find(|c| c["step"] == "cooperative close").cloned().unwrap_or_default();
