@@ -738,28 +738,43 @@ impl RoutePayer {
         st.ch.as_ref().map(|c| c.params.channel_id()).unwrap_or_default()
     }
 
+    /// The provider's signed ROUTE-STATE says the pending lock was paid: its t is our receipt even if
+    /// the hub keeps t + r. Resolves the lock and returns true.
+    fn via_provider(&self, st: &mut PState) -> bool {
+        let Some(p) = st.pending.as_ref() else { return false };
+        let ll = lk(&p.shard.state).last_lock.clone();
+        if ll.get("lockId").and_then(Value::as_str) != Some(p.lock_id.as_str()) {
+            return false;
+        }
+        let Some(t) = Sc::from_hex_mod_n(&py_str(ll.get("secret"))).and_then(|s| s.secret()) else { return false };
+        if hex::encode(adaptor::enc(&adaptor::point_of(&t))) != p.t.to_lowercase() {
+            return false;
+        }
+        let chan = Self::chan_of(st);
+        // resumed: the signer may have resolved it just before the crash (t opens T: it was paid)
+        if !p.floor && self.signer.resolve_lock(&chan, &t.secret_bytes()).is_err() && !p.resumed {
+            return false;
+        }
+        let p = st.pending.take().expect("checked");
+        self.commit(st, &p, &hex::encode(t.secret_bytes()), "provider");
+        self.persist_lock_state(st, Some(&p.shard));
+        true
+    }
+
     fn check_pending(&self, from: Option<&Arc<Shard>>) {
         let mut st = lk(&self.st);
         let Some(p) = st.pending.as_ref() else { return };
-        if from.is_some_and(|f| !Arc::ptr_eq(f, &p.shard)) {
+        if from.is_some_and(|f| !Arc::ptr_eq(f, &p.shard) || p.inflight) {
+            // a data call never resolves a lock whose POST is still out (AGP-054): the hub's answer is
+            // on its way and settles it off the data path (the signer's and the ledger's write-ahead
+            // are fsyncs); a lost or refused answer leaves it to the next check (the provider's t)
             return;
         }
-        let ll = lk(&p.shard.state).last_lock.clone();
-        if ll.get("lockId").and_then(Value::as_str) == Some(p.lock_id.as_str()) {
-            // the provider was paid for this lock: its t is our receipt even if the hub keeps t + r
-            let Some(t) = Sc::from_hex_mod_n(&py_str(ll.get("secret"))).and_then(|s| s.secret()) else { return };
-            if hex::encode(adaptor::enc(&adaptor::point_of(&t))) != p.t.to_lowercase() {
-                return;
-            }
-            let chan = Self::chan_of(&st);
-            // resumed: the signer may have resolved it just before the crash (t opens T: it was paid)
-            if !p.floor && self.signer.resolve_lock(&chan, &t.secret_bytes()).is_err() && !p.resumed {
-                return;
-            }
-            let p = st.pending.take().expect("checked");
-            self.commit(&mut st, &p, &hex::encode(t.secret_bytes()), "provider");
-            self.persist_lock_state(&st, Some(&p.shard));
-        } else if now_f() > p.until && !p.inflight {
+        if self.via_provider(&mut st) {
+            return;
+        }
+        let Some(p) = st.pending.as_ref() else { return };
+        if now_f() > p.until && !p.inflight {
             // never while our request is out: the hub may still complete it
             let p = st.pending.take().expect("checked");
             self.void(&mut st, &p, "invoice expired unanswered");
@@ -981,7 +996,12 @@ impl RoutePayer {
                     // the hub is still forwarding the lock we sent before the restart
                     return Ok(Some(json!({"status": "pending", "why": "lock_outstanding"})));
                 }
-                // the hub refused (or the provider did, through it): nothing was completed with t
+                // the hub refused (or the provider did, through it): nothing was completed with t,
+                // unless the provider's signed ROUTE-STATE already says it was paid
+                let lock_id = st.pending.as_ref().map(|p| p.lock_id.clone()).unwrap_or_default();
+                if self.via_provider(&mut st) {
+                    return Ok(Some(json!({"status": "paid", "amount": d, "fee": f, "lockId": lock_id, "via": "provider"})));
+                }
                 *st.stats.refused.entry(code.clone()).or_insert(0) += 1;
                 let detail = doc.get("detail").and_then(Value::as_str).unwrap_or("").to_string();
                 let shard = st.pending.take().map(|p| {

@@ -26,7 +26,8 @@ Money checks for every run: each rollover tx pays the provider signed - closeFee
 next ch2 capacity - signed; the next ch2's capacity is that output; routed over all of the provider's
 ch2s == what the client paid that shard; no lock pending or written off anywhere.
 Env: XBT402_B1, XBT402_DATADIR, XBT402_RPCPORT, RS_BIN, PY, LOAD_PB, LOAD_RUN, LOAD_ONLY (e.g.
-"RS-RS,PY-PY-before"), LOAD_SECONDS, LOAD_RATE, LOAD_BLOCK_S, LOAD_STUCK_S, LOAD_REORG_S, LOAD_REPORT."""
+"RS-RS,PY-PY-before"), LOAD_SECONDS, LOAD_RATE, LOAD_BLOCK_S, LOAD_STUCK_S, LOAD_REORG_S, LOAD_REPORT,
+LOAD_ROUTE_WAL=1 (AGP-054: both providers run a RouteWal, so every call's meter is durable before its answer)."""
 import json
 import os
 import secrets
@@ -199,7 +200,14 @@ def scenario(i, name):
                 cmd += ["--zero-conf-max", zc]
         else:
             cmd = [PY, os.path.join(HERE, "py_route_provider.py"), str(prov_port), sec, str(PRICE), str(SETTLE), zc, "1"]
-        procs.append(spawn(cmd))
+        penv = None
+        if os.environ.get("LOAD_ROUTE_WAL") == "1":
+            wal = os.path.join(d, "prov.route-wal")
+            if prov_impl == "RS":
+                cmd += ["--route-wal", wal]
+            else:
+                penv = {**os.environ, "XBT402_ROUTE_WAL": wal}
+        procs.append(spawn(cmd, **({"env": penv} if penv else {})))
         assert wait_http(url + "/x402/supported"), f"provider {url} did not come up"
         key = os.path.join(d, "hub.key")
         with open(key, "w") as f:

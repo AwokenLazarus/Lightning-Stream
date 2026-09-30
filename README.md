@@ -490,6 +490,49 @@ Every run also checks the money on chain. Each rollover tx pays signed − close
 capacity − signed to the next ch2. The total routed over all ch2s equals what the client's locks
 paid.
 
+## Routed billing throughput (AGP-054)
+
+cmp measured routed decode at 0.742 of unpaid (CMP-024): about 4–5 ms of billing per stage per
+token. A profile of the per-call path traced most of it to one step. cmp's `RouteJournal`
+fdatasyncs every routed call's meter after the handler, before the answer: 2.5 ms on the lab's
+ext4, 66% of the provider-side cost. The rails' own work is small. ROUTE-STATE signing takes
+0.12 ms and the client's verify 0.03 ms (B1 with coincurve).
+
+**`RouteWal`** (`ProviderConfig::route_wal`, `RouteOffer::precharge`; B1 `route_wal=` and
+`precharge=`, same file format and rules) makes that guarantee part of the rails, without an fsync
+on the critical path:
+* Before the handler runs, `reserve` counts the call in flight at its expected charge and queues
+  the session's projected meter `{s, v, seq, calls, acc, us}`. The expected charge is the
+  precharge, or `amsat_per_call` on a flat path.
+* One writer thread appends the queue and syncs it (group commit) while the handler computes.
+* `end_call_reserved` returns the ROUTE-STATE only once a snapshot covering it is durable:
+  * the reserved snapshot, when the charge is as projected;
+  * else a corrected one, which costs one more fsync.
+* A write failure answers `500 route_wal_failed`, with no ROUTE-STATE and nothing billed.
+* The routes file keeps each session projected over its calls in flight, plus `walV`. A lock that
+  completes during a call therefore covers that call's reservation.
+* At start, a WAL snapshot wins over the routes file when its `v` is above `walV`.
+* The log is compacted to one line per session past 1 MiB.
+* The writer thread ends once its provider is dropped.
+
+After a crash:
+* every answered state survives;
+* a seq is durable before its handler runs, so a ROUTE-AUTH is never served twice;
+* the restart counts more only for calls in flight at the crash, once each, at their projected
+  charge. Those are the in-doubt chunks a client already reconciles.
+
+**RoutePayer.** A data call no longer resolves a lock whose POST to the hub is still out. The hub's
+answer settles it off the data path, so the signer's and the ledger's write-ahead fsyncs no longer
+land on a chunk. A hub refusal of a lock that the provider's signed ROUTE-STATE shows as paid now
+resolves it through the provider instead of voiding it.
+
+**ROUTE-STATE.** The window's invoice is signed once per window. The bytes are identical: ECDSA
+signing is deterministic, so no vector changes.
+
+Tests: `crates/xbt402-interop/tests/route_wal.rs` (12) and `routing_checks.rs` `agp054_*` (2). In B1:
+`tests/security/test_agp054_route_wal.py` (16). The measurements are in
+`docs/route-perf-agp054-2026-09-30.json`, from B1 `scripts/route_perf.py`.
+
 ## Portability
 
 No platform-specific dependencies: libsecp256k1 (C, via `secp256k1-sys`), pure-Rust hashes and JSON,

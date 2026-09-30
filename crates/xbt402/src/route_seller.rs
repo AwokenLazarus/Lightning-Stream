@@ -12,9 +12,15 @@
 //! One deliberate difference from the reference: a channel keeps the answers to its last 256
 //! completed locks (B1 keeps all of them). A hub retries only its one pending lock, and a replay of
 //! an older lockId is refused as `bad_invoice` (it is not the session's open invoice).
+//!
+//! AGP-054: an optional [`RouteWal`] makes each session's meter durable before its ROUTE-STATE
+//! leaves, written ahead while the handler runs (B1 `RouteWal`, same file format and rules).
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
 use xbt_primitives::ecdsa;
@@ -35,6 +41,10 @@ pub const ROUTE_LOCKS_KEPT: usize = 256;
 /// `charge(method, path, status, body) -> amsat` for a metered routed path.
 pub type RouteChargeFn = Box<dyn Fn(&str, &str, u16, &[u8]) -> u128 + Send + Sync>;
 
+/// `precharge(method, path, body) -> amsat` the call will bill, known before it runs (AGP-054): with
+/// a [`RouteWal`] its session's meter is written ahead while the handler runs. None: no overlap.
+pub type RoutePrechargeFn = Box<dyn Fn(&str, &str, &[u8]) -> Option<u128> + Send + Sync>;
+
 /// A routed path on sale.
 pub struct RouteOffer {
     pub path: String,
@@ -51,12 +61,24 @@ pub struct RouteOffer {
     /// Optional hard cap on unpaid credit, msat (0: time-based only).
     pub credit_msat: u128,
     pub charge: Option<RouteChargeFn>,
+    /// AGP-054: the charge a call will bill, before it runs (a flat path needs none).
+    pub precharge: Option<RoutePrechargeFn>,
 }
 
 impl RouteOffer {
     pub fn new(path: &str, amsat_per_call: u128) -> Self {
         Self { path: path.into(), window: 1.0, lock_wait: 2.0, invoice_ttl: 15.0, hubs: "any".into(), amsat_per_call,
-               unit: "call".into(), credit_msat: 0, charge: None }
+               unit: "call".into(), credit_msat: 0, charge: None, precharge: None }
+    }
+
+    /// What a call is expected to bill before it runs: the precharge, else the flat price of a path
+    /// without a metered charge, else unknown.
+    fn expect(&self, method: &str, path: &str, body: &[u8]) -> Option<u128> {
+        match (&self.precharge, &self.charge) {
+            (Some(f), _) => f(method, path, body),
+            (None, None) => Some(self.amsat_per_call),
+            (None, Some(_)) => None,
+        }
     }
 }
 
@@ -106,6 +128,268 @@ impl RouteSession {
     }
 }
 
+/// A routed session's meter (seq, calls, accruedAmsat, unpaid_since) made durable before the
+/// ROUTE-STATE that carries it leaves, without an fsync on the call's critical path (B1 `RouteWal`).
+///
+/// Every line is a snapshot of one session's meter projected over its calls in flight (each at the
+/// charge reserved for it before it runs), versioned by `v`. One writer thread appends whatever is
+/// queued and syncs it (group commit), so the sync runs while the handler computes. A call whose
+/// charge differs from its projection writes a corrected snapshot and waits for that one.
+///
+/// * every ROUTE-STATE that left is covered by a durable snapshot;
+/// * a restart can count more only for calls in flight at the crash, each at its projected charge
+///   (the in-doubt chunk a client already accounts for);
+/// * a seq is durable before its handler runs: no ROUTE-AUTH is served twice across a crash.
+///
+/// Replay: the highest-`v` snapshot per session wins over the routes file when its `v` is above
+/// the file's `walV`. The log is rewritten as one snapshot per session past `compact_bytes`.
+pub struct RouteWal {
+    path: PathBuf,
+    compact_bytes: AtomicU64,
+    inner: Mutex<WalInner>,
+    cv: Condvar,
+    fsyncs: AtomicU64,
+    #[doc(hidden)]
+    pub fail_writes: AtomicBool,
+    #[doc(hidden)]
+    pub sync_delay_ms: AtomicU64,
+}
+
+#[derive(Default)]
+struct WalInner {
+    v: u64,
+    queue: Vec<(u64, String, Vec<u8>)>,
+    durable: u64,
+    failed: Vec<(u64, u64)>,
+    latest: HashMap<String, Vec<u8>>,
+    error: String,
+    started: bool,
+}
+
+/// One replayed snapshot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WalRecord {
+    pub v: u64,
+    pub seq: u64,
+    pub calls: u64,
+    pub acc: u128,
+    pub us: f64,
+}
+
+fn wal_line(sid: &str, v: u64, seq: u64, calls: u64, acc: u128, us: f64) -> Vec<u8> {
+    let mut l = dumps(&json!({"acc": acc.to_string(), "calls": calls, "s": sid, "seq": seq, "us": round3(us), "v": v}));
+    l.push('\n');
+    l.into_bytes()
+}
+
+fn fsync_dir(path: &Path) {
+    if let Some(d) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        if let Ok(f) = std::fs::File::open(d) {
+            let _ = f.sync_all();
+        }
+    }
+}
+
+impl RouteWal {
+    pub fn open(path: impl Into<PathBuf>) -> Arc<Self> {
+        let wal = Arc::new(Self { path: path.into(), compact_bytes: AtomicU64::new(1 << 20), inner: Mutex::new(WalInner::default()),
+                                  cv: Condvar::new(), fsyncs: AtomicU64::new(0), fail_writes: AtomicBool::new(false),
+                                  sync_delay_ms: AtomicU64::new(0) });
+        let recs = wal.read();
+        {
+            let mut g = wal.guard();
+            for (sid, r) in recs {
+                g.v = g.v.max(r.v);
+                g.latest.insert(sid.clone(), wal_line(&sid, r.v, r.seq, r.calls, r.acc, r.us));
+            }
+            g.durable = g.v;
+        }
+        wal
+    }
+
+    fn guard(&self) -> std::sync::MutexGuard<'_, WalInner> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The last version handed out.
+    pub fn version(&self) -> u64 {
+        self.guard().v
+    }
+
+    /// How many batches were synced.
+    pub fn fsyncs(&self) -> u64 {
+        self.fsyncs.load(Ordering::Relaxed)
+    }
+
+    pub fn set_compact_bytes(&self, n: u64) {
+        self.compact_bytes.store(n, Ordering::Relaxed);
+    }
+
+    /// The highest-`v` snapshot per session, from every whole line (a torn last line was never
+    /// acknowledged: its call was never answered).
+    pub fn read(&self) -> HashMap<String, WalRecord> {
+        let mut out: HashMap<String, WalRecord> = HashMap::new();
+        let Ok(raw) = std::fs::read(&self.path) else { return out };
+        for line in raw.split(|b| *b == b'\n') {
+            let Ok(r) = crate::json::parse_slice(line) else { continue };
+            let (Some(sid), Some(v), Some(seq), Some(calls), Some(acc)) =
+                (r.get("s").and_then(Value::as_str), py_u64(r.get("v")), py_u64(r.get("seq")), py_u64(r.get("calls")), u128_of(r.get("acc")))
+            else {
+                continue;
+            };
+            let rec = WalRecord { v, seq, calls, acc, us: r.get("us").and_then(Value::as_f64).unwrap_or(0.0) };
+            if out.get(sid).map_or(true, |o| v > o.v) {
+                out.insert(sid.to_string(), rec);
+            }
+        }
+        out
+    }
+
+    /// Queue one snapshot; returns its version (the ticket to `wait` for). Never blocks on I/O.
+    pub fn submit(self: &Arc<Self>, sid: &str, seq: u64, calls: u64, acc: u128, us: f64) -> u64 {
+        let mut g = self.guard();
+        g.v += 1;
+        let v = g.v;
+        g.queue.push((v, sid.to_string(), wal_line(sid, v, seq, calls, acc, us)));
+        if !g.started {
+            g.started = true;
+            let me = Arc::clone(self);
+            std::thread::Builder::new().name("route-wal".into()).spawn(move || RouteWal::run(me)).expect("route-wal thread");
+        }
+        self.cv.notify_all();
+        v
+    }
+
+    /// Return once snapshot `v` is durable; an error if its write failed (or timed out).
+    pub fn wait(&self, v: u64, timeout: Duration) -> Result<()> {
+        let end = Instant::now() + timeout;
+        let mut g = self.guard();
+        loop {
+            if g.failed.iter().any(|(lo, hi)| (*lo..=*hi).contains(&v)) {
+                let e = if g.error.is_empty() { "write failed".to_string() } else { g.error.clone() };
+                return fail("route_wal_failed", format!("route wal {}: {e}", self.path.display()));
+            }
+            if g.durable >= v {
+                return Ok(());
+            }
+            let now = Instant::now();
+            if now >= end {
+                return fail("route_wal_failed", format!("route wal {}: not durable after {timeout:?}", self.path.display()));
+            }
+            g = self.cv.wait_timeout(g, end - now).map(|(g, _)| g).unwrap_or_else(|p| p.into_inner().0);
+        }
+    }
+
+    /// A pruned session: left out of the next compaction.
+    pub fn forget(&self, sid: &str) {
+        self.guard().latest.remove(sid);
+    }
+
+    /// The writer thread. It ends once it holds the last reference (the provider is gone).
+    fn run(self: Arc<Self>) {
+        let mut file: Option<std::fs::File> = None;
+        loop {
+            let batch = {
+                let mut g = self.guard();
+                while g.queue.is_empty() {
+                    if Arc::strong_count(&self) == 1 {
+                        return;
+                    }
+                    g = self.cv.wait_timeout(g, Duration::from_secs(1)).map(|(g, _)| g).unwrap_or_else(|p| p.into_inner().0);
+                }
+                std::mem::take(&mut g.queue)
+            };
+            let (lo, hi) = (batch[0].0, batch[batch.len() - 1].0);
+            match self.write(&mut file, &batch) {
+                Err(e) => {
+                    let mut g = self.guard();
+                    g.error = e.to_string();
+                    g.failed.push((lo, hi));
+                    let n = g.failed.len();
+                    if n > 64 {
+                        g.failed.drain(..n - 64);
+                    }
+                    g.durable = g.durable.max(hi);
+                    self.cv.notify_all();
+                }
+                Ok(size) => {
+                    {
+                        let mut g = self.guard();
+                        g.durable = hi;
+                        for (_, sid, line) in batch {
+                            g.latest.insert(sid, line);
+                        }
+                        self.cv.notify_all();
+                    }
+                    if size > self.compact_bytes.load(Ordering::Relaxed) {
+                        let _ = self.compact(&mut file);
+                    }
+                }
+            }
+        }
+    }
+
+    fn write(&self, file: &mut Option<std::fs::File>, batch: &[(u64, String, Vec<u8>)]) -> std::io::Result<u64> {
+        let mut created = false;
+        if file.is_none() {
+            created = !self.path.exists();
+            *file = Some(std::fs::OpenOptions::new().create(true).append(true).open(&self.path)?);
+        }
+        let f = file.as_mut().expect("opened");
+        let start = f.metadata()?.len();
+        let data: Vec<u8> = batch.iter().flat_map(|(_, _, l)| l.iter().copied()).collect();
+        let res = (|| {
+            if self.fail_writes.load(Ordering::Relaxed) {
+                return Err(std::io::Error::other("EIO (test)"));
+            }
+            f.write_all(&data)?;
+            let d = self.sync_delay_ms.load(Ordering::Relaxed);
+            if d > 0 {
+                std::thread::sleep(Duration::from_millis(d));
+            }
+            f.sync_data()?;
+            self.fsyncs.fetch_add(1, Ordering::Relaxed);
+            if created {
+                fsync_dir(&self.path);
+            }
+            f.metadata().map(|m| m.len())
+        })();
+        if res.is_err() && f.set_len(start).is_err() {
+            *file = None;
+        }
+        res
+    }
+
+    /// In the writer thread: one snapshot per live session, synced, renamed over the log.
+    fn compact(&self, file: &mut Option<std::fs::File>) -> std::io::Result<()> {
+        let lines: Vec<u8> = self.guard().latest.values().flat_map(|l| l.iter().copied()).collect();
+        let tmp = self.path.with_extension("wal-tmp");
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&lines)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &self.path)?;
+        fsync_dir(&self.path);
+        *file = Some(std::fs::OpenOptions::new().append(true).open(&self.path)?);
+        Ok(())
+    }
+}
+
+/// A reservation made before a routed call's handler runs: its snapshot version and expected charge.
+#[derive(Debug, Clone, Copy)]
+pub struct WalTicket {
+    pub v: u64,
+    pub expect: u128,
+}
+
+/// How long an answer waits for its snapshot at most.
+const WAL_WAIT: Duration = Duration::from_secs(30);
+
 fn token_hex(n: usize) -> String {
     let mut b = vec![0u8; n];
     getrandom::getrandom(&mut b).expect("OS randomness");
@@ -123,6 +407,12 @@ pub struct SellerState {
     /// Tests/demo: take locks, never reveal t (a withholding provider).
     pub no_reveal: bool,
     pub held: Vec<Value>,
+    /// session -> (window key, signed invoice): one signature per window (AGP-054).
+    invoices: HashMap<String, (String, Value)>,
+    /// session -> (calls, amsat) reserved and not yet ended (AGP-054).
+    inflight: HashMap<String, (u64, u128)>,
+    /// RouteWal version at the routes file's last save (its `walV`).
+    saved_v: u64,
 }
 
 /// The provider's routing book: offers, sessions (persisted next to the ledger) and the rest.
@@ -133,10 +423,11 @@ pub struct RouteSeller {
     pay_to: String,
     network: String,
     settle_multiple: u64,
+    wal: Option<Arc<RouteWal>>,
 }
 
 impl RouteSeller {
-    pub(crate) fn new(ledger: &Ledger, secret: SecretKey, network: &str, settle_multiple: u64) -> Self {
+    pub(crate) fn new(ledger: &Ledger, secret: SecretKey, network: &str, settle_multiple: u64, wal: Option<&Path>) -> Self {
         let path = ledger.path().map(|p| {
             let s = p.to_string_lossy().to_string();
             PathBuf::from(format!("{}.routes.json", s.strip_suffix(".json").unwrap_or(&s)))
@@ -148,23 +439,120 @@ impl RouteSeller {
                     st.sessions.insert(k.clone(), s);
                 }
             }
+            st.saved_v = py_u64(raw.get("walV")).unwrap_or(0);
         }
-        Self { state: Mutex::new(st), path, pay_to: hex::encode(ecdsa::pubkey(&secret)), secret, network: network.into(), settle_multiple }
+        let wal = wal.map(RouteWal::open);
+        let me = Self { state: Mutex::new(st), path, pay_to: hex::encode(ecdsa::pubkey(&secret)), secret, network: network.into(),
+                        settle_multiple, wal };
+        me.replay();
+        me
+    }
+
+    /// The RouteWal, when the provider has one.
+    pub fn wal(&self) -> Option<&Arc<RouteWal>> {
+        self.wal.as_ref()
+    }
+
+    /// At start: a session's meter from the RouteWal where its snapshot is newer than the routes
+    /// file (v above walV), then one save, so the routes file carries it.
+    fn replay(&self) {
+        let Some(wal) = &self.wal else { return };
+        let mut st = self.lock();
+        let mut changed = false;
+        for (sid, r) in wal.read() {
+            let saved = st.saved_v;
+            let Some(s) = st.sessions.get_mut(&sid) else { continue };
+            if r.v <= saved {
+                continue;
+            }
+            s.seq = s.seq.max(r.seq);
+            s.calls = r.calls;
+            s.accrued_amsat = r.acc;
+            s.unpaid_since = r.us;
+            changed = true;
+        }
+        if changed {
+            let _ = self.save(&mut st);
+        }
+    }
+
+    /// (seq, calls, accrued, unpaid_since) with the calls in flight counted at their reserved
+    /// charges: what a restart may bill.
+    fn projected(st: &SellerState, s: &RouteSession) -> (u64, u64, u128, f64) {
+        let (n, amt) = st.inflight.get(&s.session).copied().unwrap_or((0, 0));
+        let us = if amt > 0 && s.owed_amsat() <= 0 { now_f() } else { s.unpaid_since };
+        (s.seq, s.calls + n, s.accrued_amsat + amt, us)
+    }
+
+    fn submit(&self, st: &SellerState, sid: &str) -> Option<u64> {
+        let wal = self.wal.as_ref()?;
+        let s = st.sessions.get(sid)?;
+        let (seq, calls, acc, us) = Self::projected(st, s);
+        Some(wal.submit(sid, seq, calls, acc, us))
+    }
+
+    /// Before the handler runs: count the call in flight at `expect` and queue its session's
+    /// projected meter, so the sync overlaps the handler. None without a RouteWal.
+    pub fn reserve(&self, sid: &str, expect: u128) -> Option<WalTicket> {
+        self.wal.as_ref()?;
+        let mut st = self.lock();
+        if !st.sessions.contains_key(sid) {
+            return None;
+        }
+        let e = st.inflight.entry(sid.to_string()).or_insert((0, 0));
+        e.0 += 1;
+        e.1 += expect;
+        self.submit(&st, sid).map(|v| WalTicket { v, expect })
+    }
+
+    fn unreserve(st: &mut SellerState, sid: &str, t: Option<WalTicket>) {
+        let Some(t) = t else { return };
+        if let Some(e) = st.inflight.get_mut(sid) {
+            e.0 = e.0.saturating_sub(1);
+            e.1 = e.1.saturating_sub(t.expect);
+            if e.0 == 0 {
+                st.inflight.remove(sid);
+            }
+        }
+    }
+
+    /// The call billed nothing and no answer leaves: its projection is corrected (not waited for).
+    pub fn cancel(&self, sid: &str, t: Option<WalTicket>) {
+        if t.is_none() {
+            return;
+        }
+        let mut st = self.lock();
+        Self::unreserve(&mut st, sid, t);
+        self.submit(&st, sid);
     }
 
     pub fn lock(&self) -> std::sync::MutexGuard<'_, SellerState> {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    fn save(&self, st: &SellerState) -> Result<()> {
+    /// Save the routes file. A session is kept with its meter projected over its calls in flight
+    /// (the same snapshot a RouteWal line holds), so a save supersedes no reservation (AGP-054).
+    fn save(&self, st: &mut SellerState) -> Result<()> {
         let Some(path) = &self.path else { return Ok(()) };
-        let sessions: Map<String, Value> = st.sessions.iter().map(|(k, v)| (k.clone(), v.to_json())).collect();
+        if let Some(w) = &self.wal {
+            st.saved_v = w.version();
+        }
+        let sessions: Map<String, Value> = st.sessions.iter().map(|(k, v)| {
+            let mut j = v.to_json();
+            if st.inflight.contains_key(k) {
+                let (seq, calls, acc, us) = Self::projected(st, v);
+                j["seq"] = seq.into();
+                j["calls"] = calls.into();
+                j["accrued_amsat"] = int_value(acc);
+                j["unpaid_since"] = us.into();
+            }
+            (k.clone(), j)
+        }).collect();
         let tmp = path.with_extension("tmp");
         let io = |e: std::io::Error| ChannelError::new("ledger_error", e.to_string());
         {
-            use std::io::Write;
             let mut f = std::fs::File::create(&tmp).map_err(io)?;
-            f.write_all(dumps(&json!({"sessions": sessions})).as_bytes()).map_err(io)?;
+            f.write_all(dumps(&json!({"sessions": sessions, "walV": st.saved_v})).as_bytes()).map_err(io)?;
             f.sync_all().map_err(io)?;
         }
         std::fs::rename(&tmp, path).map_err(io)
@@ -215,11 +603,21 @@ impl RouteSeller {
         s.valid_until = now_f() + ttl;
     }
 
-    fn invoice(&self, st: &SellerState, s: &RouteSession) -> Value {
+    /// The window's signed invoice. It only changes with the window (and ECDSA signing is
+    /// deterministic), so it is signed once per window, not on every ROUTE-STATE (AGP-054).
+    fn invoice(&self, st: &mut SellerState, s: &RouteSession) -> Value {
         let hubs = st.offers.get(&s.path).map(|o| o.hubs.clone()).unwrap_or_else(|| "any".into());
-        Invoice { pay_to: self.pay_to.clone(), network: self.network.clone(), session: s.session.clone(), lock_id: s.lock_id.clone(),
-                  point: s.point.clone(), valid_until: round3(s.valid_until), hubs, sig: String::new() }
-            .sign(&self.secret).to_json()
+        let key = format!("{}|{}|{}|{}", s.lock_id, s.point, round3(s.valid_until), dumps(&hubs));
+        if let Some((k, inv)) = st.invoices.get(&s.session) {
+            if *k == key {
+                return inv.clone();
+            }
+        }
+        let inv = Invoice { pay_to: self.pay_to.clone(), network: self.network.clone(), session: s.session.clone(), lock_id: s.lock_id.clone(),
+                            point: s.point.clone(), valid_until: round3(s.valid_until), hubs, sig: String::new() }
+            .sign(&self.secret).to_json();
+        st.invoices.insert(s.session.clone(), (key, inv.clone()));
+        inv
     }
 
     fn open_session(&self, st: &mut SellerState, path: &str, client_pub_hex: &str) -> Result<String> {
@@ -248,7 +646,8 @@ impl RouteSeller {
                              "settleMultiple": self.settle_multiple});
         if !client_pub_hex.is_empty() {
             let sid = self.open_session(&mut st, path, client_pub_hex)?;
-            let inv = self.invoice(&st, &st.sessions[&sid]);
+            let s = st.sessions[&sid].clone();
+            let inv = self.invoice(&mut st, &s);
             out["session"] = sid.into();
             out["invoice"] = inv;
         }
@@ -322,16 +721,47 @@ impl RouteSeller {
     }
 
     pub fn end_call(&self, sid: &str, charge_amsat: u128) -> Result<Value> {
-        let mut st = self.lock();
-        let s = st.sessions.get_mut(sid).ok_or_else(|| ChannelError::code("unknown_session"))?;
-        if charge_amsat > 0 {
-            if s.owed_amsat() <= 0 {
-                s.unpaid_since = now_f();
+        self.end_call_reserved(sid, charge_amsat, None)
+    }
+
+    /// Meter the call and return its ROUTE-STATE. With a RouteWal the state is returned only once a
+    /// snapshot covering it is durable: the reserved one when the charge is what was projected, else
+    /// a fresh one. On a write failure the call is taken back (nothing billed) and the error is
+    /// `route_wal_failed`: no state may leave.
+    pub fn end_call_reserved(&self, sid: &str, charge_amsat: u128, ticket: Option<WalTicket>) -> Result<Value> {
+        let (state, v) = {
+            let mut st = self.lock();
+            Self::unreserve(&mut st, sid, ticket);
+            let s = st.sessions.get_mut(sid).ok_or_else(|| ChannelError::code("unknown_session"))?;
+            if charge_amsat > 0 {
+                if s.owed_amsat() <= 0 {
+                    s.unpaid_since = now_f();
+                }
+                s.accrued_amsat += charge_amsat;
             }
-            s.accrued_amsat += charge_amsat;
+            s.calls += 1;
+            let state = self.state_locked(&mut st, sid, charge_amsat)?;
+            let v = match ticket {
+                // a reserved snapshot (or a routes-file save after it, which projects the same way)
+                // already covers this state; any other charge needs its own
+                Some(t) if t.expect == charge_amsat && self.wal.is_some() => Some(t.v),
+                _ => self.submit(&st, sid),
+            };
+            (state, v)
+        };
+        let (Some(v), Some(wal)) = (v, &self.wal) else { return Ok(state) };
+        if let Err(e) = wal.wait(v, WAL_WAIT) {
+            let mut st = self.lock();
+            if let Some(s) = st.sessions.get_mut(sid) {
+                s.accrued_amsat -= charge_amsat;
+                s.calls = s.calls.saturating_sub(1);
+                if s.owed_amsat() <= 0 {
+                    s.unpaid_since = 0.0;
+                }
+            }
+            return Err(e);
         }
-        s.calls += 1;
-        self.state_locked(&mut st, sid, charge_amsat)
+        Ok(state)
     }
 
     fn lock_answer(&self, st: &SellerState, chan: &str, routed: u64, lock_id: &str, rec: &Value) -> Value {
@@ -490,7 +920,7 @@ impl Provider {
         sess.last_lock = json!({"lockId": lock_id, "amount": amount, "secret": s.t});
         sess.unpaid_since = if sess.owed_amsat() > 0 { now_f() } else { 0.0 };
         RouteSeller::new_window(sess, ttl);
-        routes.save(&rs)?;
+        routes.save(&mut rs)?;
         Ok(routes.lock_answer(&rs, &chan, routed + amount, &lock_id, &rec))
     }
 
@@ -572,7 +1002,21 @@ impl Provider {
             Ok((sid, Some(e))) => return refuse(e, Some(&sid)),
             Ok((sid, None)) => sid,
         };
-        let mut resp = (self.handler)(method, path, body);
+        // AGP-054: with a RouteWal, the call's projected meter is written ahead while the handler runs
+        let ticket = if self.routes.wal().is_some() {
+            let expect = self.routes.lock().offers.get(pk).and_then(|o| o.expect(method, path, body));
+            expect.and_then(|e| self.routes.reserve(&sid, e))
+        } else {
+            None
+        };
+        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.handler)(method, path, body)));
+        let mut resp = match run {
+            Ok(r) => r,
+            Err(p) => {
+                self.routes.cancel(&sid, ticket);
+                std::panic::resume_unwind(p);
+            }
+        };
         if resp.headers.iter().any(|(k, v)| k.contains(['\r', '\n', '\0']) || v.contains(['\r', '\n', '\0'])) {
             resp = HttpResponse::new(500, vec![], b"handler returned a header with CR/LF".to_vec());
         }
@@ -587,8 +1031,11 @@ impl Provider {
             }
         };
         let charge = if resp.status >= 500 { 0 } else { charge };
-        match self.routes.end_call(&sid, charge) {
+        match self.routes.end_call_reserved(&sid, charge, ticket) {
             Ok(state) => resp.headers.push(("ROUTE-STATE".into(), b64json(&state))),
+            Err(e) if e.code == "route_wal_failed" => {
+                return err_json(500, "route_wal_failed", "the route meter is not durable: this call is not billed")
+            }
             Err(e) => return err_json(500, &e.code, &e.to_string()),
         }
         resp

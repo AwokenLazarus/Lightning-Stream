@@ -962,3 +962,62 @@ fn hostile_routing_input_never_panics() {
     // and the honest path still works afterwards
     assert_eq!(w.pay.lock(w.sh()).unwrap().unwrap()["status"], "paid");
 }
+
+// --- AGP-054: the data path never resolves a lock whose POST is out --------------------------------------
+
+type After = Box<dyn Fn(&HttpResponse) -> Option<HttpResponse> + Send + Sync>;
+
+/// The hub, with `after` run once its answer to POST /x402/route is ready (and before it returns).
+struct HubHook {
+    app: Arc<RouteHub>,
+    after: After,
+}
+
+impl xbt402::http::HttpService for HubHook {
+    fn body_limit(&self, path: &str) -> usize {
+        xbt402::http::HttpService::body_limit(&*self.app, path)
+    }
+
+    fn serve(&self, method: &str, path: &str, headers: &[(String, String)], body: &[u8], url: &str) -> HttpResponse {
+        let r = xbt402::http::HttpService::serve(&*self.app, method, path, headers, body, url);
+        if path == HUB_ROUTE_PATH {
+            if let Some(x) = (self.after)(&r) {
+                return x;
+            }
+        }
+        r
+    }
+}
+
+#[test]
+fn agp054_a_data_call_never_resolves_a_lock_whose_post_is_out() {
+    let w = world(1, PKw::default());
+    let seen: Arc<std::sync::Mutex<Option<(bool, Value)>>> = Arc::default();
+    let (pay, sh, s2) = (w.pay.clone(), w.sh().clone(), seen.clone());
+    w.net.add(HUB, Arc::new(HubHook { app: w.hub.clone(), after: Box::new(move |_| {
+        pay.call(&sh, "POST", b"x").unwrap(); // the provider's ROUTE-STATE now shows t
+        *s2.lock().unwrap() = Some((pay.pending().is_some(), sh.snapshot().last_lock));
+        None
+    }) }));
+    let r = w.pay.lock(w.sh()).unwrap().unwrap();
+    let (pending, last) = seen.lock().unwrap().clone().unwrap();
+    assert!(pending, "the data call resolved the in-flight lock");
+    assert!(last.get("lockId").is_some());
+    assert_eq!(r["status"], "paid");
+    assert_eq!(w.pay.stats().via_provider, 0);
+    assert!(w.pay.pending().is_none());
+}
+
+#[test]
+fn agp054_a_refusal_of_a_lock_the_provider_was_paid_for_resolves_via_the_provider() {
+    let w = world(1, PKw::default());
+    let (pay, sh) = (w.pay.clone(), w.sh().clone());
+    w.net.add(HUB, Arc::new(HubHook { app: w.hub.clone(), after: Box::new(move |_| {
+        pay.call(&sh, "POST", b"x").unwrap();
+        Some(HttpResponse::new(502, vec![("Content-Type".into(), "application/json".into())], br#"{"error":"route_failed"}"#.to_vec()))
+    }) }));
+    let r = w.pay.lock(w.sh()).unwrap().unwrap();
+    assert_eq!((r["status"].as_str(), r["via"].as_str()), (Some("paid"), Some("provider")));
+    assert_eq!((w.pay.stats().voided, w.pay.stats().via_provider), (0, 1));
+    assert_eq!(w.pay.counters().0, w.st1().extra["routed_sat"].as_u64().unwrap());
+}

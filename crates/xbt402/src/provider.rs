@@ -89,6 +89,9 @@ pub struct ProviderConfig {
     /// up to this cum while it stays unconfirmed. None: two settlements' worth (2 × settle_multiple ×
     /// close_fee); 0: never (the hub opens it at minConf).
     pub rollover_zero_conf_max: Option<u64>,
+    /// AGP-054: a path makes each routed session's meter (seq, calls, accrued) durable before its
+    /// ROUTE-STATE leaves, written ahead while the handler runs (`RouteOffer::precharge`). None: off.
+    pub route_wal: Option<std::path::PathBuf>,
 }
 
 impl ProviderConfig {
@@ -109,6 +112,7 @@ impl ProviderConfig {
             route_close_fee_payer: FeePayer::Payee,
             rollover_grace: 36,
             rollover_zero_conf_max: None,
+            route_wal: None,
         }
     }
 
@@ -177,7 +181,8 @@ impl Provider {
         if cfg.max_body < 1 {
             return fail("bad_config", "max_body must be >= 1");
         }
-        let routes = crate::route_seller::RouteSeller::new(&ledger, pay_to_secret, &cfg.network, cfg.settle_multiple);
+        let routes = crate::route_seller::RouteSeller::new(&ledger, pay_to_secret, &cfg.network, cfg.settle_multiple,
+                                                           cfg.route_wal.as_deref());
         Ok(Self {
             pay_to: hex::encode(ecdsa::pubkey(&pay_to_secret)),
             cfg,
