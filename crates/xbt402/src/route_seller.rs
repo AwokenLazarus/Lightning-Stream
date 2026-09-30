@@ -153,6 +153,12 @@ pub struct RouteWal {
     pub fail_writes: AtomicBool,
     #[doc(hidden)]
     pub sync_delay_ms: AtomicU64,
+    /// Tests: a batch holding any version >= this (0: off) waits until it is cleared.
+    #[doc(hidden)]
+    pub hold_from: AtomicU64,
+    /// Tests: a batch holding this version (0: off) fails.
+    #[doc(hidden)]
+    pub fail_v: AtomicU64,
 }
 
 #[derive(Default)]
@@ -194,7 +200,7 @@ impl RouteWal {
     pub fn open(path: impl Into<PathBuf>) -> Arc<Self> {
         let wal = Arc::new(Self { path: path.into(), compact_bytes: AtomicU64::new(1 << 20), inner: Mutex::new(WalInner::default()),
                                   cv: Condvar::new(), fsyncs: AtomicU64::new(0), fail_writes: AtomicBool::new(false),
-                                  sync_delay_ms: AtomicU64::new(0) });
+                                  sync_delay_ms: AtomicU64::new(0), hold_from: AtomicU64::new(0), fail_v: AtomicU64::new(0) });
         let recs = wal.read();
         {
             let mut g = wal.guard();
@@ -218,6 +224,17 @@ impl RouteWal {
     /// The last version handed out.
     pub fn version(&self) -> u64 {
         self.guard().v
+    }
+
+    /// At open: versions continue above `v` (the routes file's walV). A log that lost its lines
+    /// (deleted, replaced) must not restart below it, or replay would take the routes file over
+    /// every snapshot written since.
+    pub fn resume_above(&self, v: u64) {
+        let mut g = self.guard();
+        if g.v < v {
+            g.v = v;
+            g.durable = g.durable.max(v);
+        }
     }
 
     /// How many batches were synced.
@@ -343,7 +360,15 @@ impl RouteWal {
         let start = f.metadata()?.len();
         let data: Vec<u8> = batch.iter().flat_map(|(_, _, l)| l.iter().copied()).collect();
         let res = (|| {
-            if self.fail_writes.load(Ordering::Relaxed) {
+            let hold = self.hold_from.load(Ordering::Relaxed);
+            if hold > 0 && batch.iter().any(|(v, _, _)| *v >= hold) {
+                let end = Instant::now() + Duration::from_secs(10);
+                while self.hold_from.load(Ordering::Relaxed) > 0 && Instant::now() < end {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+            let fv = self.fail_v.load(Ordering::Relaxed);
+            if self.fail_writes.load(Ordering::Relaxed) || (fv > 0 && batch.iter().any(|(v, _, _)| *v == fv)) {
                 return Err(std::io::Error::other("EIO (test)"));
             }
             f.write_all(&data)?;
@@ -413,6 +438,11 @@ pub struct SellerState {
     inflight: HashMap<String, (u64, u128)>,
     /// RouteWal version at the routes file's last save (its `walV`).
     saved_v: u64,
+    /// session -> (v, seq, calls, accrued): the meter its latest snapshot holds, v 0 for a completed
+    /// routes-file save (durable already). An answer waits for a snapshot that covers it (AGP-054 rework 1).
+    snap: HashMap<String, (u64, u64, u64, u128)>,
+    /// session -> ROUTE-STATEs built so far (a failed call's take-back guard).
+    states: HashMap<String, u64>,
 }
 
 /// The provider's routing book: offers, sessions (persisted next to the ledger) and the rest.
@@ -442,6 +472,9 @@ impl RouteSeller {
             st.saved_v = py_u64(raw.get("walV")).unwrap_or(0);
         }
         let wal = wal.map(RouteWal::open);
+        if let Some(w) = &wal {
+            w.resume_above(st.saved_v);
+        }
         let me = Self { state: Mutex::new(st), path, pay_to: hex::encode(ecdsa::pubkey(&secret)), secret, network: network.into(),
                         settle_multiple, wal };
         me.replay();
@@ -484,11 +517,27 @@ impl RouteSeller {
         (s.seq, s.calls + n, s.accrued_amsat + amt, us)
     }
 
-    fn submit(&self, st: &SellerState, sid: &str) -> Option<u64> {
+    fn submit(&self, st: &mut SellerState, sid: &str) -> Option<u64> {
         let wal = self.wal.as_ref()?;
         let s = st.sessions.get(sid)?;
         let (seq, calls, acc, us) = Self::projected(st, s);
-        Some(wal.submit(sid, seq, calls, acc, us))
+        let v = wal.submit(sid, seq, calls, acc, us);
+        st.snap.insert(sid.to_string(), (v, seq, calls, acc));
+        Some(v)
+    }
+
+    /// As a state is built from the session's meter: the version of a snapshot that covers it (seq,
+    /// calls and accrued each >= the state's), queuing a fresh one if the latest does not. The state
+    /// carries the session's CURRENT meter, which may already hold a concurrent call metered in
+    /// memory whose own snapshot is still queued, or a seq taken by begin_call and not reserved yet:
+    /// waiting only for the call's own reserved snapshot could let a state leave that a crash would
+    /// take back (AGP-054 rework 1).
+    fn covering(&self, st: &mut SellerState, sid: &str) -> Option<u64> {
+        let s = st.sessions.get(sid)?;
+        match st.snap.get(sid) {
+            Some(&(v, seq, calls, acc)) if seq >= s.seq && calls >= s.calls && acc >= s.accrued_amsat => Some(v),
+            _ => self.submit(st, sid),
+        }
     }
 
     /// Before the handler runs: count the call in flight at `expect` and queue its session's
@@ -502,7 +551,7 @@ impl RouteSeller {
         let e = st.inflight.entry(sid.to_string()).or_insert((0, 0));
         e.0 += 1;
         e.1 += expect;
-        self.submit(&st, sid).map(|v| WalTicket { v, expect })
+        self.submit(&mut st, sid).map(|v| WalTicket { v, expect })
     }
 
     fn unreserve(st: &mut SellerState, sid: &str, t: Option<WalTicket>) {
@@ -523,7 +572,7 @@ impl RouteSeller {
         }
         let mut st = self.lock();
         Self::unreserve(&mut st, sid, t);
-        self.submit(&st, sid);
+        self.submit(&mut st, sid);
     }
 
     pub fn lock(&self) -> std::sync::MutexGuard<'_, SellerState> {
@@ -555,7 +604,16 @@ impl RouteSeller {
             f.write_all(dumps(&json!({"sessions": sessions, "walV": st.saved_v})).as_bytes()).map_err(io)?;
             f.sync_all().map_err(io)?;
         }
-        std::fs::rename(&tmp, path).map_err(io)
+        std::fs::rename(&tmp, path).map_err(io)?;
+        if self.wal.is_some() {
+            // the caller holds the seller lock: the file is durable and covers each session as it is now
+            let snaps: Vec<(String, (u64, u64, u64, u128))> = st.sessions.iter().map(|(k, s)| {
+                let (seq, calls, acc, _) = Self::projected(st, s);
+                (k.clone(), (0, seq, calls, acc))
+            }).collect();
+            st.snap.extend(snaps);
+        }
+        Ok(())
     }
 
     pub fn has_offer(&self, path: &str) -> bool {
@@ -741,27 +799,58 @@ impl RouteSeller {
             }
             s.calls += 1;
             let state = self.state_locked(&mut st, sid, charge_amsat)?;
+            if self.wal.is_none() {
+                return Ok(state);
+            }
+            let gen = st.states.entry(sid.to_string()).or_insert(0);
+            *gen += 1;
+            let gen = *gen;
             let v = match ticket {
-                // a reserved snapshot (or a routes-file save after it, which projects the same way)
-                // already covers this state; any other charge needs its own
-                Some(t) if t.expect == charge_amsat && self.wal.is_some() => Some(t.v),
-                _ => self.submit(&st, sid),
+                // the session's latest snapshot, not only this call's own: the state carries the
+                // session's meter as it is now (sequentially, that is the reserved one)
+                Some(t) if t.expect == charge_amsat => self.covering(&mut st, sid),
+                // the durable meter must not keep a projection the call did not bill
+                _ => self.submit(&mut st, sid),
             };
-            (state, v)
+            (state, v.map(|v| (v, gen)))
         };
-        let (Some(v), Some(wal)) = (v, &self.wal) else { return Ok(state) };
+        let (Some((v, gen)), Some(wal)) = (v, &self.wal) else { return Ok(state) };
         if let Err(e) = wal.wait(v, WAL_WAIT) {
             let mut st = self.lock();
-            if let Some(s) = st.sessions.get_mut(sid) {
-                s.accrued_amsat -= charge_amsat;
-                s.calls = s.calls.saturating_sub(1);
-                if s.owed_amsat() <= 0 {
-                    s.unpaid_since = 0.0;
+            // taken back only while no later state carries it (a later answer's snapshot may be
+            // durable and hold it: taking it back would make the next state go backwards); it then
+            // stays billed, like a call in flight at a crash
+            if st.states.get(sid) == Some(&gen) {
+                if let Some(s) = st.sessions.get_mut(sid) {
+                    s.accrued_amsat -= charge_amsat;
+                    s.calls = s.calls.saturating_sub(1);
+                    if s.owed_amsat() <= 0 {
+                        s.unpaid_since = 0.0;
+                    }
                 }
             }
             return Err(e);
         }
         Ok(state)
+    }
+
+    /// The ROUTE-STATE a refused call's 402 carries, once a snapshot covering it is durable (the
+    /// refused call's seq was taken, and a concurrent call may be metered in memory). None when the
+    /// RouteWal cannot make it durable: the 402 then carries no state.
+    pub fn refusal_state(&self, sid: &str) -> Option<Value> {
+        let (state, v) = {
+            let mut st = self.lock();
+            let state = self.state_locked(&mut st, sid, 0).ok()?;
+            if self.wal.is_none() {
+                return Some(state);
+            }
+            *st.states.entry(sid.to_string()).or_insert(0) += 1;
+            (state, self.covering(&mut st, sid))
+        };
+        match (v, &self.wal) {
+            (Some(v), Some(wal)) => wal.wait(v, WAL_WAIT).ok().map(|_| state),
+            _ => Some(state),
+        }
     }
 
     fn lock_answer(&self, st: &SellerState, chan: &str, routed: u64, lock_id: &str, rec: &Value) -> Value {
@@ -990,10 +1079,8 @@ impl Provider {
             if let Ok(extra) = self.routes.route_extra(pk, "") {
                 doc["accepts"][0]["extra"]["route"] = extra;
             }
-            if let Some(sid) = sid {
-                if let Ok(s) = self.routes.state(sid) {
-                    doc["routeState"] = s;
-                }
+            if let Some(s) = sid.and_then(|sid| self.routes.refusal_state(sid)) {
+                doc["routeState"] = s;
             }
             self.required_response(&doc)
         };

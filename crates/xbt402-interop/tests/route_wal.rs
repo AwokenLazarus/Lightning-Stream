@@ -399,3 +399,170 @@ fn one_invoice_signature_per_window() {
     c.call(&b, b"x");
     assert_eq!(c.states[0]["invoice"], c.states[1]["invoice"]);
 }
+
+// --- AGP-054 rework 1: a ROUTE-STATE carries the session's CURRENT meter, so it may leave only once
+// a snapshot covering THAT is durable, not merely the call's own reserved one (agp-lead repro
+// b1 tests/security/lead_wal_race_repro.py). Each test holds the writer on the later snapshot and
+// checks, at the moment a state is returned, that the durable log already covers it.
+
+fn covered(b: &BoxP, sid: &str, st: &Value) -> bool {
+    let d = b.p.routes().wal().unwrap().read()[sid].clone();
+    let n = |k: &str| st[k].as_u64().unwrap();
+    d.seq >= n("seq") && d.calls >= n("calls") && d.acc >= st["accruedAmsat"].as_str().unwrap().parse::<u128>().unwrap()
+}
+
+/// Run `f` in a thread while the writer is held (`hold_from` set by the caller); it must not return while held, and at its
+/// return the durable log must cover the state it returned. Returns the state.
+fn answer_while_held(b: &BoxP, sid: &str, f: impl FnOnce() -> Option<Value> + Send + 'static) -> Value {
+    let w = b.p.routes().wal().unwrap().clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let p = b.p.clone();
+    let sid2 = sid.to_string();
+    let th = std::thread::spawn(move || {
+        let st = f().expect("a state");
+        let d = p.routes().wal().unwrap().read()[&sid2].clone();
+        tx.send((st, d)).unwrap();
+    });
+    let early = rx.recv_timeout(Duration::from_millis(300)).ok();
+    assert!(early.is_none(), "a state left while the snapshot covering it was held: {early:?}");
+    w.hold_from.store(0, Ordering::SeqCst);
+    let (st, d) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    th.join().unwrap();
+    let n = |k: &str| st[k].as_u64().unwrap();
+    assert!(d.seq >= n("seq") && d.calls >= n("calls") && d.acc >= st["accruedAmsat"].as_str().unwrap().parse::<u128>().unwrap(),
+            "durable {d:?} below the state that left {st}");
+    st
+}
+
+fn begin(b: &BoxP, c: &mut Client) -> String {
+    let h = c.headers(b"x", None);
+    let (sid, err) = b.p.routes().begin_call(PATH, &h[0].1, "POST", PATH, b"x").unwrap();
+    assert!(err.is_none());
+    sid
+}
+
+#[test]
+fn concurrent_calls_on_one_session_wait_for_the_later_snapshot() {
+    let b = BoxP::new(Opts::default(), Arc::new(ok));
+    let mut c = Client::new(&b);
+    let rs = b.p.routes();
+    let w = rs.wal().unwrap().clone();
+    let sid = begin(&b, &mut c);
+    let ta = rs.reserve(&sid, PRICE).unwrap();
+    w.wait(ta.v, Duration::from_secs(10)).unwrap();                  // A's snapshot v1 durable
+    begin(&b, &mut c);
+    w.hold_from.store(ta.v + 1, Ordering::SeqCst);
+    let tb = rs.reserve(&sid, PRICE).unwrap();                         // B's snapshot v2: writer held
+    let (p, s2) = (b.p.clone(), sid.clone());
+    let thb = std::thread::spawn(move || p.routes().end_call_reserved(&s2, PRICE, Some(tb)).unwrap());
+    std::thread::sleep(Duration::from_millis(200));                    // B metered in memory, waiting on v2
+    let (p, s2) = (b.p.clone(), sid.clone());
+    let st = answer_while_held(&b, &sid, move || p.routes().end_call_reserved(&s2, PRICE, Some(ta)).ok());
+    thb.join().unwrap();
+    assert_eq!(st["calls"], 2);
+    assert_eq!(st["accruedAmsat"].as_str().unwrap(), (2 * PRICE).to_string());
+}
+
+#[test]
+fn a_seq_taken_by_a_concurrent_begin_call_is_durable_before_a_state_carries_it() {
+    let mut b = BoxP::new(Opts::default(), Arc::new(ok));
+    let mut c = Client::new(&b);
+    let w = b.p.routes().wal().unwrap().clone();
+    let sid = begin(&b, &mut c);                                       // A: seq 1
+    let ta = b.p.routes().reserve(&sid, PRICE).unwrap();
+    w.wait(ta.v, Duration::from_secs(10)).unwrap();
+    begin(&b, &mut c);                                                 // C: seq 2, authenticated, not reserved
+    w.hold_from.store(ta.v + 1, Ordering::SeqCst);
+    let (p, s2) = (b.p.clone(), sid.clone());
+    let st = answer_while_held(&b, &sid, move || p.routes().end_call_reserved(&s2, PRICE, Some(ta)).ok());
+    assert_eq!(st["seq"], 2);
+    b.restart();                                                       // C's ROUTE-AUTH is not served again
+    assert_eq!(b.meter(&c.session).0, 2);
+}
+
+#[test]
+fn a_refusal_state_is_durable_before_the_402_carries_it() {
+    let b = BoxP::new(Opts::default(), Arc::new(ok));
+    let mut c = Client::new(&b);
+    assert_eq!(c.call(&b, b"x").status, 200);
+    let sid = begin(&b, &mut c);                                       // a refused call still takes its seq
+    let w = b.p.routes().wal().unwrap().clone();
+    w.hold_from.store(w.version() + 1, Ordering::SeqCst);
+    let (p, s2) = (b.p.clone(), sid.clone());
+    let st = answer_while_held(&b, &sid, move || p.routes().refusal_state(&s2));
+    assert_eq!(st["seq"], 2);
+}
+
+#[test]
+fn a_refusal_402_carries_a_covered_state() {
+    let mut b = BoxP::new(Opts::default(), Arc::new(ok));
+    let mut c = Client::new(&b);
+    assert_eq!(c.call(&b, b"x").status, 200);
+    b.p.routes().lock().sessions.get_mut(&c.session).unwrap().unpaid_since -= 60.0;   // past window + lock_wait
+    let r = c.call(&b, b"x");
+    assert_eq!(r.status, 402);
+    let doc = unb64json(r.header("PAYMENT-REQUIRED").unwrap()).unwrap();
+    assert_eq!(doc["routeState"]["seq"], 2);
+    assert!(covered(&b, &c.session, &doc["routeState"]));
+    b.restart();
+    assert_eq!(b.meter(&c.session), (2, 1, PRICE));
+}
+
+#[test]
+fn sequential_calls_still_answer_from_their_reserved_snapshot() {
+    let b = BoxP::new(Opts::default(), Arc::new(ok));
+    let mut c = Client::new(&b);
+    let w = b.p.routes().wal().unwrap().clone();
+    let v0 = w.version();
+    for _ in 0..10 {
+        assert_eq!(c.call(&b, b"x").status, 200);
+    }
+    assert_eq!(w.version() - v0, 10, "one snapshot per call: the overlap is kept");
+}
+
+#[test]
+fn a_lost_log_does_not_restart_below_walv() {
+    let mut b = BoxP::new(Opts::default(), Arc::new(ok));
+    let mut c = Client::new(&b);
+    for _ in 0..3 {
+        c.call(&b, b"x");
+    }
+    b.wal_settle();
+    let _other = Client::new(&b);                                      // a session open saves the routes file (walV 3)
+    std::fs::remove_file(b.dir.0.join("prov.route-wal")).unwrap();
+    b.restart();
+    assert!(b.p.routes().wal().unwrap().version() >= 3);
+    assert_eq!(c.call(&b, b"x").status, 200);
+    b.restart();                                                       // the new line wins over the file
+    assert_eq!(b.meter(&c.session), (4, 4, 4 * PRICE));
+}
+
+#[test]
+fn a_wal_failure_is_not_taken_back_once_a_later_state_carries_it() {
+    let mut b = BoxP::new(Opts::default(), Arc::new(ok));
+    let mut c = Client::new(&b);
+    let w = b.p.routes().wal().unwrap().clone();
+    let sid = begin(&b, &mut c);
+    let ta = b.p.routes().reserve(&sid, PRICE).unwrap();
+    w.wait(ta.v, Duration::from_secs(10)).unwrap();
+    begin(&b, &mut c);
+    w.hold_from.store(ta.v + 1, Ordering::SeqCst);
+    w.fail_v.store(ta.v + 1, Ordering::SeqCst);                        // v2's batch will fail
+    let tb = b.p.routes().reserve(&sid, PRICE).unwrap();
+    let (p, s2) = (b.p.clone(), sid.clone());
+    let tha = std::thread::spawn(move || p.routes().end_call_reserved(&s2, PRICE, Some(ta)).map_err(|e| e.code));
+    std::thread::sleep(Duration::from_millis(200));                    // A metered, waiting on v2
+    let (p, s2) = (b.p.clone(), sid.clone());
+    let thb = std::thread::spawn(move || p.routes().end_call_reserved(&s2, PRICE / 2, Some(tb)).map_err(|e| e.code));
+    std::thread::sleep(Duration::from_millis(200));                    // B corrected: its own v3
+    w.hold_from.store(0, Ordering::SeqCst);
+    let (a, bb) = (tha.join().unwrap(), thb.join().unwrap().unwrap());
+    assert_eq!(a.unwrap_err(), "route_wal_failed");
+    assert_eq!(bb["calls"], 2);
+    assert_eq!(bb["accruedAmsat"].as_str().unwrap(), (PRICE + PRICE / 2).to_string());
+    let m = b.meter(&c.session);
+    assert_eq!((m.1, m.2), (2, PRICE + PRICE / 2), "A stays billed: B's state already carries it");
+    w.fail_v.store(0, Ordering::SeqCst);
+    b.restart();
+    assert!(b.meter(&c.session).2 >= PRICE + PRICE / 2);
+}

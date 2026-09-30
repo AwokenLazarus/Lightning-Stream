@@ -505,13 +505,20 @@ on the critical path:
   the session's projected meter `{s, v, seq, calls, acc, us}`. The expected charge is the
   precharge, or `amsat_per_call` on a flat path.
 * One writer thread appends the queue and syncs it (group commit) while the handler computes.
-* `end_call_reserved` returns the ROUTE-STATE only once a snapshot covering it is durable:
-  * the reserved snapshot, when the charge is as projected;
-  * else a corrected one, which costs one more fsync.
-* A write failure answers `500 route_wal_failed`, with no ROUTE-STATE and nothing billed.
+* `end_call_reserved` returns the ROUTE-STATE only once a snapshot covering it is durable. The
+  state carries the session's *current* meter, which can already hold a concurrent call metered
+  in memory, or a seq a later `begin_call` took:
+  * when the charge is as projected, it waits for the session's *latest* snapshot if that covers
+    the state (sequentially, the call's own reserved one), else it queues a fresh one;
+  * any other charge writes a corrected snapshot, which costs one more fsync.
+  * A refused call's 402 `routeState` (`refusal_state`) waits the same way.
+* A write failure answers `500 route_wal_failed`, with no ROUTE-STATE and nothing billed. The
+  exception is a call that a later state of the session already carries: it stays billed, like a
+  call in flight at a crash, so no state goes backwards.
 * The routes file keeps each session projected over its calls in flight, plus `walV`. A lock that
   completes during a call therefore covers that call's reservation.
-* At start, a WAL snapshot wins over the routes file when its `v` is above `walV`.
+* At start, a WAL snapshot wins over the routes file when its `v` is above `walV`. Versions resume
+  above `walV` even if the log was lost.
 * The log is compacted to one line per session past 1 MiB.
 * The writer thread ends once its provider is dropped.
 
