@@ -31,6 +31,8 @@ pub mod hot;
 pub mod ipc;
 pub mod keystore;
 pub mod ln;
+pub mod ln_funding;
+pub mod macaroon;
 pub mod node;
 pub mod policy;
 pub mod pyjson;

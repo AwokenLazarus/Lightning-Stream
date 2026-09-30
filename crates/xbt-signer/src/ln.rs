@@ -13,9 +13,16 @@
 //!    own Knots node;
 //! 3. the node's decode of the same invoice, field by field;
 //! 4. the channels it may leave through ([`usable_channels`]): active, unified (0x21) signatures,
-//!    **not taproot**, not zero-conf, funded at or above the split height;
-//! 5. B2's policy (`dest = "ln:<payee node id>"`): allowlist, max_per_tx, budgets, per-counterparty,
-//!    velocity, split-bypass, the human threshold with the ed25519 approval.
+//!    **not taproot**, not zero-conf, funded at or above the split height, and (AGP-049) a funding
+//!    transaction proven on our own node to spend only post-split coins with 0x21 signatures
+//!    ([`crate::ln_funding`]), whatever the node's `unified_sigs` flag says;
+//! 5. (AGP-049) the node's exposure against `exposure_cap_sats`, the send rate, its watchtowers (a
+//!    tower's chain can't be verified from LF's wtclient), its macaroon on mainnet
+//!    ([`crate::macaroon`]);
+//! 6. B2's policy (`dest = "ln:<payee node id>"`): allowlist, max_per_tx, budgets, per-counterparty,
+//!    velocity, split-bypass, the human threshold with the ed25519 approval; then (AGP-049) HTLCs the
+//!    node has out that the wallet did not send count against what is left of the budgets until
+//!    they resolve.
 //!
 //! The worst case (amount + the fee limit) is booked to the ledger before the payment is sent (a
 //! write-ahead record in `ln_payments.json`); when the payment settles the booking becomes what it
@@ -72,19 +79,29 @@ pub struct LnPolicy {
     /// The LN node may be at most this many blocks ahead of the signer's node.
     pub max_tip_lead: i64,
     pub require_description: bool,
-    /// Beta exposure cap: funds on the LN node above it are reported (`ln_status`).
+    /// Beta exposure cap (AGP-049): while the LN node holds more than this (channel local balances,
+    /// HTLCs in flight and its on-chain coins), `ln_pay` refuses. 0: no cap, except on mainnet, where a
+    /// cap is required.
     pub exposure_cap_sats: i64,
+    /// At most this many payments sent to the LN node's router per hour, failed ones included
+    /// (AGP-049; LND has no per-macaroon rate limit). 0: no limit.
+    pub max_sends_per_hour: i64,
+    /// Watchtowers whose chain is not verified: `warn` (the default off mainnet) or `refuse` (mainnet).
+    pub tower_policy: Option<String>,
+    /// Tower public keys (hex) the operator has verified run on XBT (e.g. their own Lightning Fork tower).
+    pub trusted_towers: Vec<String>,
 }
 
 impl Default for LnPolicy {
     fn default() -> Self {
         Self { enabled: false, max_fee_base_sats: 10, max_fee_ppm: 5_000, min_expiry_s: 60, max_cltv_blocks: 1_008, timeout_s: 60,
-               anchor_height: None, anchor_hash: None, split_height: None, max_tip_lead: 2, require_description: false, exposure_cap_sats: 0 }
+               anchor_height: None, anchor_hash: None, split_height: None, max_tip_lead: 2, require_description: false, exposure_cap_sats: 0,
+               max_sends_per_hour: 60, tower_policy: None, trusted_towers: vec![] }
     }
 }
 
-pub const LN_INT_KEYS: [&str; 9] = ["max_fee_base_sats", "max_fee_ppm", "min_expiry_s", "max_cltv_blocks", "timeout_s", "anchor_height",
-                                    "split_height", "max_tip_lead", "exposure_cap_sats"];
+pub const LN_INT_KEYS: [&str; 10] = ["max_fee_base_sats", "max_fee_ppm", "min_expiry_s", "max_cltv_blocks", "timeout_s", "anchor_height",
+                                     "split_height", "max_tip_lead", "exposure_cap_sats", "max_sends_per_hour"];
 
 impl LnPolicy {
     pub fn from_map(m: &Map<String, Value>) -> Self {
@@ -96,7 +113,20 @@ impl LnPolicy {
                max_cltv_blocks: i("max_cltv_blocks", d.max_cltv_blocks), timeout_s: i("timeout_s", d.timeout_s),
                anchor_height: o("anchor_height"), anchor_hash: m.get("anchor_hash").and_then(Value::as_str).map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()),
                split_height: o("split_height"), max_tip_lead: i("max_tip_lead", d.max_tip_lead),
-               require_description: crate::pyjson::truthy(m.get("require_description")), exposure_cap_sats: i("exposure_cap_sats", 0) }
+               require_description: crate::pyjson::truthy(m.get("require_description")), exposure_cap_sats: i("exposure_cap_sats", 0),
+               max_sends_per_hour: i("max_sends_per_hour", d.max_sends_per_hour),
+               tower_policy: m.get("tower_policy").and_then(Value::as_str).map(|s| s.trim().to_lowercase()),
+               trusted_towers: m.get("trusted_towers").and_then(Value::as_array).into_iter().flatten()
+                   .filter_map(|t| t.as_str().map(|s| s.trim().to_lowercase())).collect() }
+    }
+
+    /// Whether a watchtower of unverified chain refuses payments (mainnet's default) or only warns.
+    pub fn towers_refuse(&self, chain: &str) -> bool {
+        match self.tower_policy.as_deref() {
+            Some("refuse") => true,
+            Some(_) => false,
+            None => chain == "main",
+        }
     }
 
     /// The routing-fee limit for an amount: base + ppm, rounded up.
@@ -135,6 +165,17 @@ pub fn validate(raw: &Value, errors: &mut Vec<String>) {
             }
             if py_int(m.get("timeout_s")) == Some(0) {
                 errors.push("policy.json ln.timeout_s: must be > 0".into());
+            }
+            if let Some(t) = m.get("tower_policy").filter(|v| !v.is_null()) {
+                if !matches!(t.as_str(), Some("warn" | "refuse")) {
+                    errors.push("policy.json ln.tower_policy: must be \"warn\" or \"refuse\"".into());
+                }
+            }
+            if let Some(t) = m.get("trusted_towers").filter(|v| !v.is_null()) {
+                let ok = t.as_array().is_some_and(|a| a.iter().all(|k| k.as_str().is_some_and(|s| s.len() == 66 && s.bytes().all(|c| c.is_ascii_hexdigit()))));
+                if !ok {
+                    errors.push("policy.json ln.trusted_towers: must be a list of 66-hex tower public keys".into());
+                }
             }
             if let Some(h) = m.get("anchor_hash").filter(|v| !v.is_null()) {
                 if !h.as_str().is_some_and(|s| s.len() == 64 && s.bytes().all(|c| c.is_ascii_hexdigit())) {
@@ -179,6 +220,15 @@ pub trait LnBackend: Send + Sync {
     fn lookup(&self, payment_hash: &str) -> Result<Option<Value>>;
     /// `GET /v1/utxos`: the node's on-chain coins.
     fn utxos(&self) -> Result<Vec<Value>>;
+    /// `GET /v2/watchtower/client`: the towers the node's wtclient backs its channels up to. An error
+    /// whose code is `ln_wtclient_off` means the wtclient is not running.
+    fn towers(&self) -> Result<Vec<Value>> {
+        Err(err("ln_wtclient_off", "this backend has no watchtower client"))
+    }
+    /// The macaroon the signer presents (to read its permissions and caveats), if any.
+    fn macaroon(&self) -> Option<Vec<u8>> {
+        None
+    }
     /// Where it is (for `ln_status`), never a credential.
     fn describe(&self) -> String;
 }
@@ -380,6 +430,20 @@ impl LnBackend for LndRest {
         Ok(self.get("/v1/utxos?min_confs=0&max_confs=2147483647")?.get("utxos").and_then(Value::as_array).cloned().unwrap_or_default())
     }
 
+    fn towers(&self) -> Result<Vec<Value>> {
+        match self.get("/v2/watchtower/client?include_sessions=false") {
+            Ok(v) => Ok(v.get("towers").and_then(Value::as_array).cloned().unwrap_or_default()),
+            // not built with wtclientrpc (404 / Unimplemented) or wtclient.active off
+            Err(e) if e.msg.contains("HTTP 404") || e.msg.contains("not active") || e.msg.contains("nimplemented")
+                || e.msg.contains("unknown service") => Err(err("ln_wtclient_off", e.msg)),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn macaroon(&self) -> Option<Vec<u8>> {
+        hex::decode(&self.macaroon_hex).ok()
+    }
+
     fn describe(&self) -> String {
         format!("lnd-rest {}", self.base)
     }
@@ -501,6 +565,90 @@ pub fn presplit_utxos(utxos: &[Value], tip: i64, split_height: i64) -> Vec<Value
         (h < split_height).then(|| json!({"outpoint": format!("{}:{}", str_or_empty(u.get("outpoint").and_then(|o| o.get("txid_str"))),
                                                                      u64_of(u.get("outpoint").and_then(|o| o.get("output_index")))),
                                            "amount_sats": i64_of(u.get("amount_sat")), "height": h}))
+    }).collect()
+}
+
+/// The payment hash of an LND `HTLC` (`hash_lock` is base64 over REST), as hex.
+fn hash_lock_hex(h: &Value) -> String {
+    let s = str_or_empty(h.get("hash_lock"));
+    if s.len() == 64 && s.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return s.to_lowercase();
+    }
+    B64.decode(&s).or_else(|_| B64URL.decode(&s)).map(hex::encode).unwrap_or(s)
+}
+
+/// Funds the LN node holds in outgoing HTLCs it started itself (forwards are paired with an incoming
+/// HTLC and move nothing of ours), locked until each HTLC's CLTV expiry: those the wallet booked, and
+/// those it did not (sent outside the wallet).
+#[derive(Debug, Default)]
+pub struct HtlcLocks {
+    pub booked_sats: i64,
+    pub unbooked_sats: i64,
+    /// The last expiry height among them (0: none).
+    pub until_height: i64,
+    pub list: Vec<Value>,
+}
+
+impl HtlcLocks {
+    pub fn report(&self, tip: i64) -> Value {
+        json!({"booked_sats": self.booked_sats, "unbooked_sats": self.unbooked_sats, "until_height": self.until_height,
+               "blocks_left": (self.until_height - tip).max(0), "htlcs": self.list})
+    }
+}
+
+pub fn htlc_locks(chans: &[Value], booked: &dyn Fn(&str) -> bool) -> HtlcLocks {
+    let all: Vec<(&Value, &Value)> = chans.iter()
+        .flat_map(|c| c.get("pending_htlcs").and_then(Value::as_array).into_iter().flatten().map(move |h| (c, h))).collect();
+    let incoming: std::collections::HashSet<String> = all.iter().filter(|(_, h)| h.get("incoming") == Some(&Value::Bool(true)))
+        .map(|(_, h)| hash_lock_hex(h)).collect();
+    let mut out = HtlcLocks::default();
+    for (c, h) in all {
+        if h.get("incoming") == Some(&Value::Bool(true)) || u64_of(h.get("forwarding_channel")) != 0 {
+            continue;
+        }
+        let hash = hash_lock_hex(h);
+        if incoming.contains(&hash) {
+            continue;
+        }
+        let amt = i64_of(h.get("amount"));
+        let exp = i64_of(h.get("expiration_height"));
+        let ours = booked(&hash);
+        if ours { out.booked_sats += amt } else { out.unbooked_sats += amt }
+        out.until_height = out.until_height.max(exp);
+        out.list.push(json!({"payment_hash": hash, "amount_sats": amt, "expiration_height": exp, "booked": ours,
+                             "chan_id": u64_of(c.get("chan_id")).to_string()}));
+    }
+    out
+}
+
+/// Whether an LND `Payment` still has an HTLC out (a FAILED payment with one is not over yet).
+pub fn htlcs_in_flight(p: &Value) -> bool {
+    p.get("htlcs").and_then(Value::as_array).is_some_and(|a| a.iter().any(|h| str_or_empty(h.get("status")) == "IN_FLIGHT"))
+}
+
+/// The CLTV height until which a payment's in-flight HTLCs can hold its funds (0: none known).
+pub fn cltv_until(p: &Value) -> i64 {
+    p.get("htlcs").and_then(Value::as_array).into_iter().flatten().filter(|h| str_or_empty(h.get("status")) == "IN_FLIGHT")
+        .map(|h| i64_of(h.get("route").and_then(|r| r.get("total_time_lock")))).max().unwrap_or(0)
+}
+
+/// The node's wtclient towers with the verdict on each: LF's wtclient identifies a tower's chain only
+/// by the genesis hash, which XBT shares with SHA-256 Bitcoin, and no tower advertises a chain feature
+/// (wtwire features 0-5 in LF .13), so a SHA-256 tower would accept sessions and watch the wrong chain
+/// (AGP-047 §4.3). A tower is verified only when the operator lists it in `ln.trusted_towers`.
+pub fn tower_report(towers: &[Value], trusted: &[String]) -> Vec<Value> {
+    towers.iter().map(|t| {
+        let raw = str_or_empty(t.get("pubkey"));
+        let pk = if raw.len() == 66 { raw.to_lowercase() } else { B64.decode(&raw).map(hex::encode).unwrap_or(raw) };
+        let infos = t.get("session_info").and_then(Value::as_array).cloned().unwrap_or_default();
+        let sessions: i64 = if infos.is_empty() { i64_of(t.get("num_sessions")) } else { infos.iter().map(|i| i64_of(i.get("num_sessions"))).sum() };
+        let active = t.get("active_session_candidate") == Some(&Value::Bool(true))
+            || infos.iter().any(|i| i.get("active_session_candidate") == Some(&Value::Bool(true)));
+        let verified = trusted.contains(&pk);
+        json!({"pubkey": pk, "addresses": t.get("addresses").cloned().unwrap_or(json!([])), "sessions": sessions, "active": active,
+               "chain_verified": verified,
+               "chain_note": if verified { "listed in ln.trusted_towers by the operator" } else {
+                   "chain not verified: LF's wtclient checks only the genesis hash, which SHA-256 Bitcoin shares; a SHA-256 tower would watch the wrong chain" }})
     }).collect()
 }
 
@@ -641,6 +789,20 @@ impl LnBook {
         self.all().into_iter().filter(|(_, r)| r.get("state").and_then(Value::as_str) == Some("sending")).collect()
     }
 
+    /// AGP-049 (risk 7): bookings released because the node had no record of them, still inside their
+    /// watch window: if the node records one late, it is booked again.
+    pub fn watched(&self, now: f64) -> Vec<(String, Value)> {
+        self.all().into_iter().filter(|(_, r)| {
+            r.get("state").and_then(Value::as_str) == Some("failed") && r.get("unseen") == Some(&Value::Bool(true))
+                && r.get("watch_until").and_then(Value::as_f64).is_some_and(|w| w >= now)
+        }).collect()
+    }
+
+    /// Payments handed to the node's router since `t` (every booking is one), failed ones included.
+    pub fn sends_since(&self, t: f64) -> usize {
+        self.all().values().filter(|r| r.get("ts").and_then(Value::as_f64).is_some_and(|ts| ts >= t)).count()
+    }
+
     /// The newest `n` records, newest first.
     pub fn recent(&self, n: usize) -> Vec<Value> {
         let mut v: Vec<(String, Value)> = self.all().into_iter().collect();
@@ -663,6 +825,8 @@ pub fn sending_record(inv: &Invoice, invoice: &str, dest: &str, booked: i64, fee
 
 // --- the signer's LN methods ------------------------------------------------------------------------
 
+use crate::ln_funding::{self, Funding};
+use crate::macaroon;
 use crate::policy::{Payment, Verdict};
 use crate::sigaudit;
 use crate::signer::{deny, with, Signer};
@@ -698,6 +862,111 @@ impl Signer {
                 && a.get("dest").and_then(Value::as_str) == Some(dest) && py_int(a.get("amount_sats")) == Some(amount)
                 && a.get("payment_hash").and_then(Value::as_str) == Some(hash)
         }).map(|(t, _)| t)
+    }
+
+    /// Every channel with the guards' verdicts; a channel that passes them carries a payment only once
+    /// its funding transaction is proven on our own node ([`ln_funding::check`], cached per funding).
+    fn ln_channels(&self, chans: &[Value], split: i64) -> (Vec<String>, Vec<Value>) {
+        let (_, mut report) = usable_channels(chans, split);
+        let mut ok = vec![];
+        for (c, r) in chans.iter().zip(report.iter_mut()) {
+            if r["usable"] != true {
+                continue;
+            }
+            let (cp, scid, cap) = (str_or_empty(c.get("channel_point")), u64_of(c.get("chan_id")), i64_of(c.get("capacity")));
+            let key = format!("{cp}/{scid}/{cap}/{split}");
+            let cached = self.ln_funding.lock().unwrap_or_else(|p| p.into_inner()).get(&key).cloned();
+            let f = cached.unwrap_or_else(|| {
+                let f = ln_funding::check(&*self.node, &cp, scid, cap, split);
+                if f.is_final() {
+                    self.ln_funding.lock().unwrap_or_else(|p| p.into_inner()).insert(key, f.clone());
+                }
+                f
+            });
+            let why = match f {
+                Funding::Proven(ev) => {
+                    r["funding"] = json!({"proven": true, "evidence": ev});
+                    ok.push(r["chan_id"].as_str().unwrap_or_default().to_string());
+                    continue;
+                }
+                Funding::Refused(why, ev) => {
+                    r["funding"] = json!({"proven": false, "reason": why, "evidence": ev});
+                    why
+                }
+                Funding::Unknown(why) => {
+                    r["funding"] = json!({"proven": false, "reason": why});
+                    why
+                }
+            };
+            r["usable"] = false.into();
+            r["refused"] = format!("funding not proven from its transaction: {why}").into();
+        }
+        (ok, report)
+    }
+
+    /// What the LN node holds (channel local balances, HTLCs in flight, on-chain coins) against
+    /// `ln.exposure_cap_sats`: the report and, when over the cap (or no cap on mainnet), the refusal.
+    fn ln_exposure(&self, pol: &LnPolicy, chans: &[Value], utxos: &[Value]) -> (Value, Option<String>) {
+        let local: i64 = chans.iter().map(|c| i64_of(c.get("local_balance"))).sum();
+        let htlc: i64 = chans.iter().map(|c| i64_of(c.get("unsettled_balance"))).sum();
+        let onchain: i64 = utxos.iter().map(|u| i64_of(u.get("amount_sat"))).sum();
+        let total = local + htlc + onchain;
+        let cap = pol.exposure_cap_sats;
+        let refusal = if cap == 0 && self.chain == "main" {
+            Some("mainnet needs ln.exposure_cap_sats: the LN node is trusted with everything it holds".to_string())
+        } else if cap > 0 && total > cap {
+            Some(format!("the LN node holds {total} sats (channels {local}, HTLCs {htlc}, on chain {onchain}), above ln.exposure_cap_sats {cap}: \
+                          move funds off it before paying through it"))
+        } else {
+            None
+        };
+        (json!({"channel_local_sats": local, "htlc_sats": htlc, "onchain_sats": onchain, "total_sats": total, "cap_sats": cap,
+                "over_cap": cap > 0 && total > cap, "enforced": true}), refusal)
+    }
+
+    /// The node's watchtowers: `(report, refusal, warnings)`. An unverified tower refuses payments when
+    /// `ln.tower_policy` is `refuse` (mainnet's default) and warns otherwise.
+    fn ln_towers(&self, ln: &dyn LnBackend, pol: &LnPolicy) -> (Value, Option<String>, Vec<String>) {
+        let refuse = pol.towers_refuse(&self.chain);
+        let mode = if refuse { "refuse" } else { "warn" };
+        match ln.towers() {
+            Ok(ts) => {
+                let rep = tower_report(&ts, &pol.trusted_towers);
+                let bad: Vec<String> = rep.iter().filter(|t| t["chain_verified"] != true).map(|t| str_or_empty(t.get("pubkey"))).collect();
+                let msg = (!bad.is_empty()).then(|| format!(
+                    "WARNING: {} watchtower(s) of unverified chain ({}): LF's wtclient checks a tower's chain only by the genesis hash, \
+                     which SHA-256 Bitcoin shares, so a SHA-256 tower would take sessions and watch the wrong chain; verify each and list \
+                     it in ln.trusted_towers, or remove it (lncli wtclient remove)", bad.len(), bad.join(", ")));
+                let v = json!({"wtclient": "active", "policy": mode, "towers": rep, "unverified": bad.len()});
+                match msg {
+                    Some(m) if refuse => (v, Some(m), vec![]),
+                    Some(m) => (v, None, vec![m]),
+                    None => (v, None, vec![]),
+                }
+            }
+            Err(e) if e.code == "ln_wtclient_off" => (json!({"wtclient": "off", "policy": mode, "towers": [],
+                                                            "note": "no watchtower client: nothing watches the channels while the node is offline"}),
+                                                      None, vec![]),
+            Err(e) => {
+                let m = format!("the LN node's watchtower list is unavailable: {}", e.msg);
+                (json!({"wtclient": "unknown", "policy": mode, "error": e.msg}), refuse.then(|| m.clone()), if refuse { vec![] } else { vec![m] })
+            }
+        }
+    }
+
+    /// The macaroon's permissions and caveats; on mainnet one that can move on-chain funds, sign or
+    /// mint macaroons is refused.
+    fn ln_macaroon(&self, ln: &dyn LnBackend) -> (Value, Option<String>) {
+        let Some(b) = ln.macaroon() else { return (Value::Null, None) };
+        match macaroon::parse(&b) {
+            Ok(m) => {
+                let d = m.dangerous_ops();
+                let refusal = (self.chain == "main" && !d.is_empty())
+                    .then(|| format!("the LN macaroon grants {}: bake one with only {}", d.join(", "), macaroon::NEEDED_OPS.join(" ")));
+                (m.report(), refusal)
+            }
+            Err(e) => (json!({"error": e}), (self.chain == "main").then(|| format!("the LN macaroon cannot be read ({e})"))),
+        }
     }
 
     /// `ln_pay`: every check, then the write-ahead booking, then the node's router.
@@ -741,6 +1010,10 @@ impl Signer {
         if let Some((h, _)) = self.ln_book.in_flight().first() {
             return self.ln_refuse("ln_in_flight", &format!("another LN payment ({h}) is still in flight"), &dest, &hash);
         }
+        if pol.max_sends_per_hour > 0 && self.ln_book.sends_since(now - 3600.0) as i64 >= pol.max_sends_per_hour {
+            return self.ln_refuse("ln_rate_limit", &format!("already {} payments sent to the LN node in the last hour (ln.max_sends_per_hour)",
+                                                            pol.max_sends_per_hour), &dest, &hash);
+        }
         let chain_ok = match verify_backend(&*ln, &*self.node, &self.chain, &pol) {
             Ok(v) => v,
             Err(e) => {
@@ -748,6 +1021,9 @@ impl Signer {
                 return self.ln_refuse(rule, &e.msg, &dest, &hash);
             }
         };
+        if let (_, Some(why)) = self.ln_macaroon(&*ln) {
+            return self.ln_refuse("ln_macaroon", &why, &dest, &hash);
+        }
         match ln.decode(&invoice) {
             Ok(d) => {
                 if let Err(why) = cross_check(&inv, &d) {
@@ -760,9 +1036,26 @@ impl Signer {
             Ok(c) => c,
             Err(e) => return self.ln_refuse("ln_backend", &e.msg, &dest, &hash),
         };
-        let (ids, report) = usable_channels(&chans, pol.split(&self.chain));
+        let utxos = if pol.exposure_cap_sats > 0 || self.chain == "main" {
+            match ln.utxos() {
+                Ok(u) => u,
+                Err(e) => return self.ln_refuse("ln_backend", &format!("the exposure cap needs the node's coins: {}", e.msg), &dest, &hash),
+            }
+        } else {
+            vec![]
+        };
+        let (exposure, over) = self.ln_exposure(&pol, &chans, &utxos);
+        if let Some(why) = over {
+            return with(self.ln_refuse("ln_exposure_cap", &why, &dest, &hash), json!({"exposure": exposure}));
+        }
+        let (towers, tower_refusal, warnings) = self.ln_towers(&*ln, &pol);
+        if let Some(why) = tower_refusal {
+            return with(self.ln_refuse("ln_tower_chain", &why, &dest, &hash), json!({"watchtowers": towers}));
+        }
+        let (ids, report) = self.ln_channels(&chans, pol.split(&self.chain));
         if ids.is_empty() {
-            return with(self.ln_refuse("ln_no_safe_channel", "no active, unified, non-taproot channel funded at or above the split height",
+            return with(self.ln_refuse("ln_no_safe_channel",
+                                       "no active, unified, non-taproot channel funded at or above the split with a funding transaction proven 0x21 on our node",
                                        &dest, &hash), json!({"channels": report}));
         }
         let pay = Payment::new(&dest, total, &format!("ln {hash}"));
@@ -779,6 +1072,18 @@ impl Signer {
         }
         if !d.allowed() {
             return with(with(d.as_value(), facts), json!({"charged_sats": 0}));
+        }
+        // HTLCs the node has out that the wallet never booked hold funds until their CLTV expiry: they
+        // count against what is left of the budgets
+        let book = self.ln_book.all();
+        let locks = htlc_locks(&chans, &|h: &str| {
+            book.get(h).and_then(|r| r.get("state")).and_then(Value::as_str).is_some_and(|s| s == "sending" || s == "settled")
+        });
+        let room = d.residual_daily_sats.min(d.residual_weekly_sats);
+        if locks.unbooked_sats > 0 && total + locks.unbooked_sats > room {
+            return with(self.ln_refuse("ln_htlc_lock", &format!(
+                "{} sats are locked in HTLCs the wallet did not send (until height {}); with this payment's {total} that exceeds the {room} sats left \
+                 in the budgets", locks.unbooked_sats, locks.until_height), &dest, &hash), json!({"htlc_locks": locks.list}));
         }
         sigaudit::set_rule(&if grant.is_some() { "human:approval_signature".to_string() } else { format!("policy:{}", d.rule) });
         // write-ahead: the worst case is booked before the router sees the invoice
@@ -798,7 +1103,7 @@ impl Signer {
                 Ok(Some(pmt)) => Some(pmt),
                 Ok(None) => {
                     let rec = self.ln_book.get(&hash).unwrap_or(Value::Null);
-                    return with(self.ln_release(&hash, &rec, &format!("not sent: {}", e.msg)), json!({"chain_check": chain_ok}));
+                    return with(self.ln_release(&hash, &rec, &format!("not sent: {}", e.msg), true), json!({"chain_check": chain_ok}));
                 }
                 Err(_) => None,
             },
@@ -814,23 +1119,38 @@ impl Signer {
                 self.use_xbt402_grant(t, py_int(out.get("charged_sats")).unwrap_or(total));
             }
         }
-        let mut out = with(with(d.as_value(), out), json!({"chain_check": chain_ok, "fee_limit_sats": fee_limit, "invoice_sats": amount}));
+        let mut out = with(with(d.as_value(), out), json!({"chain_check": chain_ok, "fee_limit_sats": fee_limit, "invoice_sats": amount,
+                                                           "exposure": exposure}));
         if grant.is_some() {
             out["approved"] = true.into();
+        }
+        if !warnings.is_empty() {
+            out["warnings"] = json!(warnings);
         }
         out
     }
 
-    /// A payment's final (or current) state from the node: settle, release, or keep it booked.
+    /// A payment's final (or current) state from the node: settle, release, or keep it booked. A
+    /// FAILED payment with an HTLC still out is not over: its funds stay locked (and booked) until the
+    /// HTLC resolves or its CLTV expires.
     fn ln_apply(&self, hash: &str, rec: &Value, pmt: &Value) -> Value {
-        match str_or_empty(pmt.get("status")).as_str() {
+        let st = str_or_empty(pmt.get("status"));
+        match st.as_str() {
             "SUCCEEDED" => self.ln_settle(hash, rec, pmt),
-            "FAILED" => {
+            "FAILED" if !htlcs_in_flight(pmt) => {
                 let why = str_or_empty(pmt.get("failure_reason"));
-                self.ln_release(hash, rec, &why)
+                self.ln_release(hash, rec, &why, false)
             }
-            st => json!({"verdict": "pending", "rail": "ln", "status": st, "payment_hash": hash, "charged_sats": py_int(rec.get("booked_sats")),
-                         "note": "in flight: the booked amount stays against the budgets until the node settles or fails it"}),
+            _ => {
+                let until = cltv_until(pmt);
+                if until > 0 && py_int(rec.get("cltv_until")) != Some(until) {
+                    let _ = self.ln_book.update(hash, json!({"cltv_until": until}));
+                }
+                json!({"verdict": "pending", "rail": "ln", "status": st, "payment_hash": hash, "charged_sats": py_int(rec.get("booked_sats")),
+                       "cltv_until": until,
+                       "note": "in flight: the booked amount stays against the budgets until the node settles or fails it (at the latest, \
+                                until its HTLCs' CLTV expiry)"})
+            }
         }
     }
 
@@ -858,44 +1178,93 @@ impl Signer {
                "value_msat": value_msat, "fee_msat": fee_msat, "charged_sats": spent, "dest": dest})
     }
 
-    fn ln_release(&self, hash: &str, rec: &Value, why: &str) -> Value {
+    /// The booking goes. `unseen`: the node had no record of the payment, so it is watched until its
+    /// invoice expires (+10 min): a node that records it late gets it booked again ([`Self::ln_rebook`]).
+    fn ln_release(&self, hash: &str, rec: &Value, why: &str, unseen: bool) -> Value {
         let dest = str_or_empty(rec.get("dest"));
         let booked = py_int(rec.get("booked_sats")).unwrap_or(0);
+        let now = self.engine.now();
         if booked > 0 {
             // nothing was spent: the booking goes (it counts for no budget and no velocity)
             let _ = self.engine.store.amend(&format!("ln:{hash}"), None);
             self.engine.audit.append(json!({"type": "ln_amend", "txid": format!("ln:{hash}"), "booked_sats": booked, "amount_sats": 0,
-                                            "ts": ts_value(self.engine.now())}));
+                                            "ts": ts_value(now)}));
         }
         let why: String = why.chars().take(300).collect();
-        let _ = self.ln_book.update(hash, json!({"state": "failed", "failure": why, "failed_ts": ts_value(self.engine.now())}));
-        self.engine.audit.append(json!({"type": "ln_failed", "dest": dest, "payment_hash": hash, "released_sats": booked,
-                                        "ts": ts_value(self.engine.now())}));
+        let mut fields = json!({"state": "failed", "failure": why, "failed_ts": ts_value(now)});
+        if unseen {
+            let exp = bolt11::decode(&str_or_empty(rec.get("invoice"))).map(|i| i.expires_at() as f64).unwrap_or(now);
+            fields["unseen"] = true.into();
+            fields["watch_until"] = ts_value(exp.max(now) + 600.0);
+        }
+        let _ = self.ln_book.update(hash, fields);
+        self.engine.audit.append(json!({"type": "ln_failed", "dest": dest, "payment_hash": hash, "released_sats": booked, "unseen": unseen,
+                                        "ts": ts_value(now)}));
         json!({"verdict": "deny", "rule": "ln_payment_failed", "reason": "the Lightning payment failed; nothing was spent",
                "rail": "ln", "status": "FAILED", "payment_hash": hash, "charged_sats": 0, UNTRUSTED_LN_KEY: untrusted_ln(json!({"failure": why}))})
     }
 
-    /// Settle or release every payment left in flight (the caller holds the spend lock).
+    /// A payment released as never sent that the node recorded afterwards: it reached the router after
+    /// all, so it is booked again, then settled or kept in flight like any other (AGP-048 risk 7).
+    fn ln_rebook(&self, hash: &str, rec: &Value, pmt: &Value) -> Value {
+        let st = str_or_empty(pmt.get("status"));
+        if st == "FAILED" && !htlcs_in_flight(pmt) {
+            let _ = self.ln_book.update(hash, json!({"unseen": false, "late_status": "FAILED"}));
+            return json!({"verdict": "deny", "rail": "ln", "status": "FAILED", "payment_hash": hash, "charged_sats": 0,
+                          "note": "the node recorded it late, and it failed"});
+        }
+        let dest = str_or_empty(rec.get("dest"));
+        let booked = py_int(rec.get("booked_sats")).unwrap_or(0);
+        let now = self.engine.now();
+        let _ = self.engine.commit(&Payment::new(&dest, booked, &format!("ln {hash} (recorded late)")), &format!("ln:{hash}"));
+        self.engine.audit.append(json!({"type": "ln_rebooked", "dest": dest, "payment_hash": hash, "booked_sats": booked, "status": st,
+                                        "ts": ts_value(now)}));
+        let _ = self.ln_book.update(hash, json!({"state": "sending", "unseen": false, "rebooked_ts": ts_value(now)}));
+        let rec = self.ln_book.get(hash).unwrap_or(Value::Null);
+        with(self.ln_apply(hash, &rec, pmt), json!({"rebooked": true}))
+    }
+
+    /// Settle or release every payment left in flight, and book again any released one the node
+    /// recorded late (the caller holds the spend lock).
     pub(crate) fn ln_reconcile_locked(&self) -> Vec<Value> {
         let Some(ln) = self.ln.clone() else { return vec![] };
         let timeout = LnPolicy::from_map(&self.config().ln).timeout_s as f64;
+        let now = self.engine.now();
         let mut out = vec![];
+        let mut chans: Option<Option<Vec<Value>>> = None;
         for (hash, rec) in self.ln_book.in_flight() {
             let r = match ln.lookup(&hash) {
                 Ok(Some(pmt)) => self.ln_apply(&hash, &rec, &pmt),
                 // the node never saw it: a crash between the booking and the send
-                Ok(None) if self.engine.now() - rec.get("ts").and_then(Value::as_f64).unwrap_or(0.0) > timeout + 60.0 =>
-                    self.ln_release(&hash, &rec, "never reached the LN node"),
+                Ok(None) if now - rec.get("ts").and_then(Value::as_f64).unwrap_or(0.0) > timeout + 60.0 => {
+                    // unless one of its channels holds an HTLC for it, whatever its payment list says
+                    let cs = chans.get_or_insert_with(|| ln.channels().ok());
+                    match cs {
+                        Some(cs) if htlc_locks(cs, &|h: &str| h == hash).booked_sats == 0 =>
+                            self.ln_release(&hash, &rec, "never reached the LN node", true),
+                        Some(_) => json!({"verdict": "pending", "status": "HTLC_OUT", "charged_sats": py_int(rec.get("booked_sats")),
+                                          "note": "the node lists no payment but a channel holds an HTLC for it: it stays booked"}),
+                        None => continue,
+                    }
+                }
                 Ok(None) => continue,
                 Err(e) => json!({"payment_hash": hash, "error": e.msg}),
             };
             out.push(json!({"payment_hash": hash, "verdict": r.get("verdict"), "status": r.get("status"), "charged_sats": r.get("charged_sats")}));
         }
+        for (hash, rec) in self.ln_book.watched(now) {
+            if let Ok(Some(pmt)) = ln.lookup(&hash) {
+                let r = self.ln_rebook(&hash, &rec, &pmt);
+                out.push(json!({"payment_hash": hash, "late": true, "verdict": r.get("verdict"), "status": r.get("status"),
+                                "charged_sats": r.get("charged_sats")}));
+            }
+        }
         out
     }
 
-    /// `ln_status`: the node, its chain check, its channels with the guard verdicts, coins that
-    /// must not fund a channel, the exposure, and recent payments.
+    /// `ln_status`: the node, its chain check, its channels with the guard verdicts and funding proofs,
+    /// coins that must not fund a channel, the exposure against its cap, the watchtowers, the macaroon,
+    /// HTLC locks, and recent payments.
     pub(crate) fn ln_status_locked(&self) -> Value {
         let pol = LnPolicy::from_map(&self.config().ln);
         let mut out = json!({"rail": "ln", "enabled": pol.enabled, "configured": self.ln.is_some(), "config_error": self.ln_error,
@@ -915,34 +1284,45 @@ impl Signer {
         };
         let split = pol.split(&self.chain);
         let chans = ln.channels().unwrap_or_default();
-        let (ids, report) = usable_channels(&chans, split);
+        let (ids, report) = self.ln_channels(&chans, split);
         let tip = node::height(&*self.node).map(|h| h as i64).unwrap_or(0);
         let utxos = ln.utxos().unwrap_or_default();
         let presplit = presplit_utxos(&utxos, tip, split);
-        let onchain: i64 = utxos.iter().map(|u| i64_of(u.get("amount_sat"))).sum();
-        let local: i64 = chans.iter().map(|c| i64_of(c.get("local_balance"))).sum();
-        let over = pol.exposure_cap_sats > 0 && onchain + local > pol.exposure_cap_sats;
+        let (exposure, over) = self.ln_exposure(&pol, &chans, &utxos);
+        let (towers, tower_refusal, mut warnings) = self.ln_towers(&*ln, &pol);
+        let (mac, mac_refusal) = self.ln_macaroon(&*ln);
+        let book = self.ln_book.all();
+        let locks = htlc_locks(&chans, &|h: &str| {
+            book.get(h).and_then(|r| r.get("state")).and_then(Value::as_str).is_some_and(|s| s == "sending" || s == "settled")
+        });
+        let in_flight: Vec<Value> = self.ln_book.in_flight().into_iter().map(|(h, r)| {
+            let until = py_int(r.get("cltv_until")).unwrap_or(0);
+            json!({"payment_hash": h, "booked_sats": py_int(r.get("booked_sats")), "cltv_until": until, "blocks_left": (until - tip).max(0)})
+        }).collect();
+        let blocked: Vec<&String> = [&over, &tower_refusal, &mac_refusal].into_iter().flatten().collect();
         out = with(out, json!({
-            "ready": chain["ok"] == true && !ids.is_empty(),
+            "ready": chain["ok"] == true && !ids.is_empty() && blocked.is_empty(),
             "node": {"identity_pubkey": str_or_empty(info.get("identity_pubkey")), "block_height": i64_of(info.get("block_height")),
                      "synced_to_chain": info.get("synced_to_chain"), "feature_512": features_have(info.get("features"), FEATURE_BLAKE2B)},
             "chain_check": chain, "split_height": split, "channels": report, "usable_channels": ids.len(),
-            "presplit_utxos": presplit,
-            "exposure": {"channel_local_sats": local, "onchain_sats": onchain, "cap_sats": pol.exposure_cap_sats, "over_cap": over},
+            "presplit_utxos": presplit, "exposure": exposure, "watchtowers": towers, "macaroon": mac,
+            "htlc_locks": locks.report(tip), "rate_limit": {"max_sends_per_hour": pol.max_sends_per_hour,
+                                                              "sent_last_hour": self.ln_book.sends_since(self.engine.now() - 3600.0)},
             "fee_limit": {"base_sats": pol.max_fee_base_sats, "ppm": pol.max_fee_ppm},
-            "in_flight": self.ln_book.in_flight().len(), "reconciled": reconciled, "recent": self.ln_book.recent(10),
+            "in_flight": in_flight.len(), "in_flight_payments": in_flight, "reconciled": reconciled, "recent": self.ln_book.recent(10),
             UNTRUSTED_LN_KEY: untrusted_ln(json!({"alias": str_or_empty(info.get("alias")), "version": str_or_empty(info.get("version"))})),
             "channel_opens": "never: this wallet pays through the node's existing channels",
         }));
         if !presplit.is_empty() {
-            out["warnings"] = json!(["the LN node holds coins confirmed below the split height: never fund a channel from them (their 0x01 commitments replay on SHA-256 Bitcoin)"]);
+            warnings.insert(0, "the LN node holds coins confirmed below the split height: never fund a channel from them (their 0x01 commitments replay on SHA-256 Bitcoin)".into());
         }
-        if over {
-            let w = format!("the LN node holds {} sats, above ln.exposure_cap_sats {}", onchain + local, pol.exposure_cap_sats);
-            match out.get_mut("warnings").and_then(Value::as_array_mut) {
-                Some(a) => a.push(w.into()),
-                None => out["warnings"] = json!([w]),
-            }
+        if locks.unbooked_sats > 0 {
+            warnings.push(format!("the LN node has {} sats in HTLCs the wallet did not send, locked until height {}: they count against the budgets",
+                                  locks.unbooked_sats, locks.until_height));
+        }
+        warnings.extend(blocked.into_iter().map(|b| format!("ln_pay refuses: {b}")));
+        if !warnings.is_empty() {
+            out["warnings"] = json!(warnings);
         }
         out
     }

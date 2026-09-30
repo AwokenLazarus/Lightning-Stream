@@ -136,24 +136,60 @@ Before anything reaches the router (`src/ln.rs`, `src/bolt11.rs`):
    its own bit 512, synced;
 3. the node's `DecodePayReq` must match field by field;
 4. only channels that are active, `unified_sigs`, not taproot, not zero-conf, and funded at or above
-   the split (961,632 on mainnet; `ln.split_height` elsewhere) go in `outgoing_chan_ids`.
+   the split (961,632 on mainnet; `ln.split_height` elsewhere) go in `outgoing_chan_ids`, and only once
+   their **funding transaction is proven on the signer's own node** (AGP-049, `src/ln_funding.rs`): the
+   transaction at the short channel id's block position is the channel point's, its output is the
+   channel's P2WSH of its capacity, every input's signatures carry sighash **0x21** and every input's
+   coin was confirmed at or above the split. LND's `unified_sigs` flag is not trusted for this. The
+   signer's node needs `txindex=1` to look up the inputs; an unprovable channel carries nothing;
+5. the node's exposure: while it holds more than `ln.exposure_cap_sats` (channel local balances, HTLCs
+   in flight and its on-chain coins), `ln_pay` refuses (`ln_exposure_cap`); mainnet requires a cap;
+6. the send rate: at most `ln.max_sends_per_hour` payments reach the router per hour, failed ones
+   included (`ln_rate_limit`; LND has no per-macaroon rate limit);
+7. the watchtowers (`GET /v2/watchtower/client`): Lightning Fork's wtclient identifies a tower's chain
+   only by the genesis hash, which SHA-256 Bitcoin shares, and no tower advertises a chain feature, so
+   every tower is unverified unless listed in `ln.trusted_towers`. `ln.tower_policy` `warn` (the default
+   off mainnet: a loud warning in `ln_status` and `ln_pay`) or `refuse` (mainnet's default:
+   `ln_tower_chain`);
+8. the macaroon, read from the file (`src/macaroon.rs`): `ln_status` shows its permissions and
+   caveats; on mainnet one granting `onchain:write`, `macaroon:*` or `signer:generate` is refused
+   (`ln_macaroon`);
+9. HTLCs under CLTV: outgoing HTLCs the node started that the wallet did not book (sent outside it)
+   hold funds until their expiry and count against what is left of the daily and weekly budgets
+   (`ln_htlc_lock`) until they resolve. The wallet's own in-flight payments stay booked, with the CLTV
+   height they can hold funds until, and a FAILED payment with an HTLC still out stays booked.
 
 The worst case is booked to the ledger and to `.run/ln_payments.json` before the send; a settled
 payment's booking becomes what it cost, a failed one's goes (the audit log keeps `ln_amend`). A payment
 left in flight is reconciled from the node's payment list (by `ln_status`, the next `ln_pay`, the
-watcher) and blocks new LN payments until then. Each settled payment is a `ln_payment` line in the
+watcher) and blocks new LN payments until then. A booking released because the node had no record of it
+(a crash before the send, or a send that errored) is watched until its invoice has expired (+10 min):
+if the node records it late, it is booked again and settled or kept in flight (AGP-048 risk 7); one
+whose HTLC is on a channel is not released at all. Each settled payment is a `ln_payment` line in the
 signature log whose `sig_sha256` is the payment hash (the log holds the SHA-256 of the preimage).
 The wallet never opens channels; `ln_status` lists the node's coins below the split, which must never
 fund one.
 
 policy.json `ln`: `enabled` (default off), `max_fee_base_sats` (10), `max_fee_ppm` (5000),
 `min_expiry_s` (60), `max_cltv_blocks` (1008), `timeout_s` (60), `anchor_height`, `anchor_hash`,
-`split_height`, `max_tip_lead` (2), `require_description` (false), `exposure_cap_sats` (0: none; above
-it `ln_status` warns). Environment: `B2_LN_REST` (`https://host:port`; plain http only on loopback),
-`B2_LN_MACAROON` (a baked macaroon with `info:read offchain:read offchain:write onchain:read` is
-enough), `B2_LN_TLS_CERT` (LND's `tls.cert`: the connection is pinned to exactly that certificate). A
-bad LN configuration shuts the rail (`ln_config`), not the signer. Regtest proof:
-`scripts/ln_rail_regtest.sh`.
+`split_height`, `max_tip_lead` (2), `require_description` (false), `exposure_cap_sats` (0: none, not
+allowed on mainnet), `max_sends_per_hour` (60; 0: none), `tower_policy` (`warn` / `refuse`; default
+`refuse` on mainnet), `trusted_towers` (tower public keys, hex). Environment: `B2_LN_REST`
+(`https://host:port`; plain http only on loopback), `B2_LN_MACAROON`, `B2_LN_TLS_CERT` (LND's
+`tls.cert`: the connection is pinned to exactly that certificate). A bad LN configuration shuts the
+rail (`ln_config`), not the signer. Regtest proof: `scripts/ln_rail_regtest.sh`.
+
+**The macaroon.** Bake one with only what the rail needs and a lifetime:
+
+    lncli bakemacaroon --save_to=rail.macaroon --timeout=2592000 info:read offchain:read offchain:write onchain:read
+
+`offchain:read` also covers the watchtower list. **IP caveats do not bind REST callers.** LND checks
+`ipaddr` / `iprange` against the gRPC peer, and its REST gateway is an in-process gRPC client dialling
+`127.0.0.1`: over REST, `--ip_address=127.0.0.1` passes every caller and any other address refuses
+every call (shown on the lab, S12; over gRPC the caveat binds). So for this REST client, restrict the
+REST listener itself: bind `restlisten` to a private interface or loopback (with an SSH or WireGuard
+tunnel) and firewall it to the signer's host. The signer's own `max_sends_per_hour` is the rate limit;
+LND has none per macaroon.
 
 ## Not ported
 

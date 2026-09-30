@@ -12,6 +12,17 @@ stock lnd on a SHA-256 regtest). Run by scripts/ln_rail_regtest.sh, which brings
   S7  a second signer whose LN node is the stock lnd on the SHA-256 chain -> refused (ln_chain)
   S8  the signature log and the audit log hold every payment and refusal; the ledger is exact
   S9  the MCP surface: 12 tools with XBT_MCP_LN=1, approve is not a tool
+  AGP-049:
+  S10 funding proven from the transaction on our Knots node: the unified channel's input is 0x21 and
+      post-split; a channel LF opens from the pre-split coin A2 (0x21, LND says unified) is refused
+  S11 ln.exposure_cap_sats below what lf1 holds -> ln_exposure_cap, no HTLC
+  S12 the macaroon: permissions and caveats in ln_status; an ipaddr caveat binds gRPC callers but not
+      REST ones (LND's REST gateway dials gRPC from 127.0.0.1)
+  S13 ln.max_sends_per_hour 1 -> the second send is refused ln_rate_limit
+  S14 lf2 runs a watchtower, lf1's wtclient uses it: ln_status lists it, chain not verified, warns;
+      tower_policy refuse -> ln_tower_chain; listed in trusted_towers -> paid
+  S15 a hold invoice: the payment stays in flight, booked, with its CLTV height; an HTLC lf1 sends
+      outside the wallet counts against the budget (ln_htlc_lock) until it is cancelled
 
 Environment: LAB (the lab checkout), OUT (report dir), BIN (the release binaries), RUN (scratch dir).
 """
@@ -103,7 +114,7 @@ class Mcp:
         self.p = subprocess.Popen([f"{BIN}/xbt-wallet-mcp", "--stdio"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=open(f"{RUN}/mcp.log", "a"), text=True, env=env)
         self.n = 0
-        self.req("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "agp048", "version": "1"}})
+        self.req("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "agp049", "version": "1"}})
         self.p.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
         self.p.stdin.flush()
 
@@ -124,7 +135,7 @@ class Mcp:
 
 
 def start_signer(root, sock, extra_env, log):
-    env = dict(os.environ, **extra_env, B2_SIGNER_SOCK=sock, B2_RPCHOST="127.0.0.1", B2_RPCPORT="34681",
+    env = dict(os.environ, **extra_env, B2_SIGNER_SOCK=sock, B2_RPCHOST="127.0.0.1", B2_RPCPORT="34781",
                B2_RPCCOOKIE=f"{RUN}/rpc.cookie", B2_WALLET="agent", B2_HOT_KEYFILE=f"{RUN}/keys/{os.path.basename(root)}.key",
                B2_WATCH_INTERVAL="5")
     p = subprocess.Popen([f"{BIN}/xbt-signer", "--root", root], env=env, stdout=open(log, "a"), stderr=subprocess.STDOUT)
@@ -144,8 +155,8 @@ def fetch(svc, src, dst):
     os.chmod(dst, 0o600)
 
 
-def bake(svc, dst):
-    ln(svc, "bakemacaroon", "--save_to=/tmp/rail.macaroon", "info:read", "offchain:read", "offchain:write", "onchain:read")
+def bake(svc, dst, *caveats):
+    ln(svc, "bakemacaroon", "--save_to=/tmp/rail.macaroon", *caveats, "info:read", "offchain:read", "offchain:write", "onchain:read")
     fetch(svc, "/tmp/rail.macaroon", dst)
 
 
@@ -162,6 +173,13 @@ def open_channel(*args):
                 raise
             print(f"openchannel retry {i + 1}: {str(e)[-120:]}", flush=True)
             time.sleep(5)
+
+
+def links_up():
+    """Every lf1 channel active: right after a channel opens, lf1's peer bootstrapper can open a second
+    connection to lf2 and drop the first, leaving the channels inactive for a moment (run 2 of AGP-049)."""
+    wait("lf1's channels active", 60,
+         lambda: len(ln("lf1", "listchannels", "--active_only")["channels"]) == len(ln("lf1", "listchannels")["channels"]))
 
 
 def payments(svc):
@@ -201,6 +219,7 @@ def main():
     tip = mine(1)
     wait("lf1 sees both coins", 60, lambda: synced("lf1", tip) and len(ln("lf1", "listunspent", "--min_confs=1")["utxos"]) >= 3)
     coinA, _ = outpoint_of("lf1", 50_000_000)
+    coinA2, _ = outpoint_of("lf1", 20_000_000)
     coinB, _ = outpoint_of("lf1", 100_000_000)
     REPORT["chain"] = {"activation": 20, "split_height": SPLIT, "coin_a_height": hA, "coin_b_height": hB, "lf1": lf1_pub, "lf2": lf2_pub,
                        "lnd_sha": sha_pub, "anchor_101": b2b("getblockhash", "101")}
@@ -224,12 +243,13 @@ def main():
     with open(f"{root}/policy.json", "w") as f:
         json.dump(policy(human_pub, [f"ln:{lf2_pub}", f"ln:{sha_pub}"]), f, indent=2)
     sock = f"{RUN}/signer.sock"
-    ln_env = {"B2_LN_REST": "https://127.0.0.1:34691", "B2_LN_MACAROON": f"{RUN}/lf1.macaroon", "B2_LN_TLS_CERT": f"{RUN}/lf1.tls.cert"}
+    ln_env = {"B2_LN_REST": "https://127.0.0.1:34791", "B2_LN_MACAROON": f"{RUN}/lf1.macaroon", "B2_LN_TLS_CERT": f"{RUN}/lf1.tls.cert"}
     procs = [start_signer(root, sock, ln_env, f"{RUN}/signer.log")]
     menv = {k: v for k, v in os.environ.items() if not k.startswith("B2_LN")}
     mcp = Mcp(dict(menv, B2_SIGNER_SOCK=sock, XBT_MCP_LN="1"))
     try:
         run(mcp, sock, human, lf2_pub, sha_pub, coinB, procs)
+        run_049(mcp, sock, human_pub, lf2_pub, coinA2, procs, ln_env)
     finally:
         mcp.close()
         for p in procs:
@@ -282,6 +302,7 @@ def run(mcp, sock, human, lf2_pub, sha_pub, coinB, procs):
     charged1 = r.get("charged_sats", 0)
 
     # S4: over the daily budget (30,000): denied before any HTLC
+    links_up()
     inv4 = ln("lf2", "addinvoice", "--amt=29500")
     r = mcp.tool("ln_pay", {"invoice": inv4["payment_request"], "max_sats": 40_000})
     REPORT["scenarios"]["S4_over_budget"] = r
@@ -289,6 +310,7 @@ def run(mcp, sock, human, lf2_pub, sha_pub, coinB, procs):
     check("S4 no HTLC for it on lf1", inv4["r_hash"] not in payments("lf1"), None)
 
     # S5: over the human threshold (20,000): needs_human, the human approves on the signer socket
+    links_up()
     inv5 = ln("lf2", "addinvoice", "--amt=21000")
     r = mcp.tool("ln_pay", {"invoice": inv5["payment_request"], "max_sats": 22_000})
     REPORT["scenarios"]["S5_needs_human"] = r
@@ -326,7 +348,7 @@ def run(mcp, sock, human, lf2_pub, sha_pub, coinB, procs):
         json.dump(policy(human.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex(),
                          [f"ln:{lf2_pub}", f"ln:{sha_pub}"]), f)
     sock2 = f"{RUN}/signer-wrong.sock"
-    procs.append(start_signer(root2, sock2, {"B2_LN_REST": "https://127.0.0.1:34693", "B2_LN_MACAROON": f"{RUN}/sha.macaroon",
+    procs.append(start_signer(root2, sock2, {"B2_LN_REST": "https://127.0.0.1:34793", "B2_LN_MACAROON": f"{RUN}/sha.macaroon",
                                              "B2_LN_TLS_CERT": f"{RUN}/sha.tls.cert"}, f"{RUN}/signer-wrong.log"))
     inv7 = ln("lf2", "addinvoice", "--amt=500")
     st7 = rpc_sock(sock2, "ln_status")
@@ -339,7 +361,7 @@ def run(mcp, sock, human, lf2_pub, sha_pub, coinB, procs):
     procs[-1].terminate()
     procs[-1].wait(10)
     os.remove(sock2) if os.path.exists(sock2) else None
-    procs.append(start_signer(root2, sock2, {"B2_LN_REST": "https://127.0.0.1:34691", "B2_LN_MACAROON": f"{RUN}/lf1.macaroon",
+    procs.append(start_signer(root2, sock2, {"B2_LN_REST": "https://127.0.0.1:34791", "B2_LN_MACAROON": f"{RUN}/lf1.macaroon",
                                              "B2_LN_TLS_CERT": f"{RUN}/sha.tls.cert"}, f"{RUN}/signer-wrong.log"))
     r = rpc_sock(sock2, "ln_pay", {"invoice": inv7["payment_request"], "max_sats": 1000})
     REPORT["scenarios"]["S7_wrong_cert"] = r
@@ -378,6 +400,224 @@ def run(mcp, sock, human, lf2_pub, sha_pub, coinB, procs):
     hidden = mcp_plain.tool("ln_pay", {"invoice": "x", "max_sats": 1})
     mcp_plain.close()
     check("S9 without XBT_MCP_LN: B2's exact 10, ln_pay unknown", len(plain) == 10 and hidden.get("isError"), {"tools": plain, "ln_pay": hidden})
+
+
+# --- AGP-049 ------------------------------------------------------------------------------------------
+
+def start_policy_signer(name, human_pub, lf2_pub, env, ln_extra=None, top=None):
+    """A signer of its own (root RUN/name) on lf1 with the default policy plus these ln / top-level keys."""
+    root = f"{RUN}/{name}"
+    os.makedirs(f"{root}/.run", exist_ok=True)
+    pol = policy(human_pub, [f"ln:{lf2_pub}"])
+    pol["ln"].update(ln_extra or {})
+    pol.update(top or {})
+    with open(f"{root}/policy.json", "w") as f:
+        json.dump(pol, f, indent=2)
+    sock = f"{RUN}/{name}.sock"
+    if os.path.exists(sock):
+        os.remove(sock)
+    return sock, start_signer(root, sock, env, f"{RUN}/{name}.log")
+
+
+def stop(p):
+    p.terminate()
+    p.wait(10)
+
+
+def first_hops(h):
+    p = payments("lf1").get(h, {})
+    return {x["route"]["hops"][0]["chan_id"] for x in p.get("htlcs", []) if x.get("status") == "SUCCEEDED"}
+
+
+def pay_retry(call, inv, max_sats):
+    r = call(inv, max_sats)
+    for _ in range(5):  # a channel just active can fail its first try while channel_updates settle
+        if r.get("rule") != "ln_payment_failed":
+            break
+        time.sleep(3)
+        r = call(inv, max_sats)
+    return r
+
+
+def container_net(svc, field):
+    cid = dc("ps", "-q", svc)
+    r = subprocess.run(["docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{." + field + "}}{{end}}", cid],
+                       capture_output=True, text=True, check=True)
+    return r.stdout.strip()
+
+
+def lncli_from_lf2(macaroon_host_path, *args):
+    """lncli in lf2 against lf1's gRPC (lf1:10009): the gRPC peer lf1 sees is lf2's own address."""
+    dc("cp", macaroon_host_path, "lf2:/tmp/probe.macaroon")
+    r = subprocess.run(["docker", "compose", "exec", "-T", "lf2", "lncli", "--network=regtest", "--rpcserver=lf1:10009",
+                        "--tlscertpath=/tmp/lf1.cert", "--macaroonpath=/tmp/probe.macaroon", *args], cwd=LAB, capture_output=True, text=True)
+    return r.returncode, (r.stdout + r.stderr).strip()
+
+
+def wait_status(sock, what, secs, pred):
+    last = {}
+
+    def ok():
+        nonlocal last
+        last = rpc_sock(sock, "ln_status")
+        return pred(last)
+    try:
+        wait(what, secs, ok)
+    except RuntimeError:
+        pass
+    return last
+
+
+def run_049(mcp, sock, human_pub, lf2_pub, coinA2, procs, ln_env):
+    # S10: funding proven from the transaction on our Knots node, not from LND's unified_sigs flag
+    st = mcp.tool("ln_status", {})
+    uni = [c for c in st.get("channels", []) if c.get("usable")]
+    f = uni[0].get("funding", {}) if len(uni) == 1 else {}
+    REPORT["scenarios"]["S10_status_funding"] = {"usable": uni}
+    ins = f.get("evidence", {}).get("inputs", [])
+    check("S10 the unified channel's funding is proven on our node: every input 0x21, confirmed at or above the split",
+          f.get("proven") is True and ins and all(i["sighash"] == ["0x21"] and i["height"] >= SPLIT for i in ins), f)
+    ftx = json.loads(b2b("getrawtransaction", f.get("evidence", {}).get("txid", "00"), "true")) if f.get("evidence") else {}
+    wit = [v.get("txinwitness", [""])[0][-2:] for v in ftx.get("vin", [])]
+    REPORT["scenarios"]["S10_knots_witness_sighash"] = wit
+    check("S10 cross-check with bitcoin-cli: the funding inputs' signatures end in 0x21", wit and all(w == "21" for w in wit), wit)
+    # LF opens a channel from coin A2, confirmed below the split: it signs 0x21 and LND calls it unified
+    a2 = open_channel(f"--node_key={lf2_pub}", "--local_amt=150000", f"--utxo={coinA2}")
+    mine(6)
+    wait("the coin-A2 channel active", 90, lambda: len(ln("lf1", "listchannels", "--active_only")["channels"]) == 3)
+    a2_txid = a2.get("funding_txid", "") if isinstance(a2, dict) else ""
+    lnd_view = [c for c in ln("lf1", "listchannels")["channels"] if c["channel_point"].startswith(a2_txid)]
+    st = mcp.tool("ln_status", {})
+    ch = [c for c in st.get("channels", []) if (c.get("funding") or {}).get("evidence", {}).get("txid") == a2_txid]
+    REPORT["scenarios"]["S10_presplit_channel"] = {"open": a2, "lnd": lnd_view, "ours": ch}
+    check("S10 LND reports the coin-A2 channel unified (anchors)", lnd_view and lnd_view[0].get("unified_sigs") is True, lnd_view)
+    check("S10 we refuse it: its 0x21 input was confirmed below the split",
+          ch and ch[0]["usable"] is False and "below the split" in ch[0]["refused"]
+          and ch[0]["funding"]["evidence"]["inputs"][0]["sighash"] == ["0x21"], ch)
+    links_up()
+    inv = ln("lf2", "addinvoice", "--amt=700")
+    r = pay_retry(lambda i, m: mcp.tool("ln_pay", {"invoice": i, "max_sats": m}), inv["payment_request"], 800)
+    REPORT["scenarios"]["S10_pay"] = r
+    hops = first_hops(inv["r_hash"])
+    check("S10 paid, and only through the proven channel", r.get("status") == "SUCCEEDED" and hops == {uni[0]["chan_id"]} if uni else False,
+          {"result": r, "hops": list(hops)})
+
+    # S11: the exposure cap is enforced
+    links_up()
+    s_cap, p = start_policy_signer("wallet-cap", human_pub, lf2_pub, ln_env, {"exposure_cap_sats": 100_000})
+    procs.append(p)
+    inv = ln("lf2", "addinvoice", "--amt=500")
+    r = rpc_sock(s_cap, "ln_pay", {"invoice": inv["payment_request"], "max_sats": 1000})
+    st = rpc_sock(s_cap, "ln_status")
+    REPORT["scenarios"]["S11_exposure_cap"] = {"pay": r, "exposure": st.get("exposure"), "ready": st.get("ready")}
+    check("S11 over the exposure cap: refused ln_exposure_cap", r.get("rule") == "ln_exposure_cap" and r["exposure"]["total_sats"] > 100_000, r)
+    check("S11 no HTLC for it on lf1; ln_status not ready", inv["r_hash"] not in payments("lf1") and st.get("ready") is False, st.get("exposure"))
+
+    # S12: the macaroon, and what an IP caveat does over REST and over gRPC
+    mac = mcp.tool("ln_status", {}).get("macaroon", {})
+    REPORT["scenarios"]["S12_macaroon"] = mac
+    check("S12 ln_status reads the baked macaroon: exactly the rail's 4 permissions, no IP caveat",
+          mac.get("ops") == ["info:read", "offchain:read", "offchain:write", "onchain:read"] and mac.get("ip_caveat") is None, mac)
+    gw, lf2_ip = container_net("lf1", "Gateway"), container_net("lf2", "IPAddress")
+    dc("cp", f"{RUN}/lf1.tls.cert", "lf2:/tmp/lf1.cert")
+    bake("lf1", f"{RUN}/ip-lo.macaroon", "--ip_address=127.0.0.1")
+    bake("lf1", f"{RUN}/ip-gw.macaroon", f"--ip_address={gw}")
+    bake("lf1", f"{RUN}/ip-lf2.macaroon", f"--ip_address={lf2_ip}")
+    s_lo, p = start_policy_signer("wallet-ip-lo", human_pub, lf2_pub, dict(ln_env, B2_LN_MACAROON=f"{RUN}/ip-lo.macaroon"))
+    procs.append(p)
+    st_lo = rpc_sock(s_lo, "ln_status")
+    s_gw, p = start_policy_signer("wallet-ip-gw", human_pub, lf2_pub, dict(ln_env, B2_LN_MACAROON=f"{RUN}/ip-gw.macaroon"))
+    procs.append(p)
+    st_gw = rpc_sock(s_gw, "ln_status")
+    rc_lf2, out_lf2 = lncli_from_lf2(f"{RUN}/ip-lf2.macaroon", "getinfo")
+    rc_gw, out_gw = lncli_from_lf2(f"{RUN}/ip-gw.macaroon", "getinfo")
+    REPORT["scenarios"]["S12_ip_caveat"] = {"gateway": gw, "lf2_ip": lf2_ip, "rest_127": {k: st_lo.get(k) for k in ("ready", "macaroon")},
+                                            "rest_gateway": {k: st_gw.get(k) for k in ("ready", "reason")},
+                                            "grpc_lf2_locked_to_lf2": [rc_lf2, out_lf2[-200:]], "grpc_lf2_locked_to_gateway": [rc_gw, out_gw[-200:]]}
+    check("S12 REST: a macaroon locked to 127.0.0.1 works from the host (the REST gateway's gRPC peer is loopback)",
+          st_lo.get("chain_check", {}).get("ok") is True and st_lo.get("macaroon", {}).get("ip_caveat") == "127.0.0.1", st_lo.get("macaroon"))
+    check(f"S12 REST: a macaroon locked to the caller's real address ({gw}) is refused",
+          st_gw.get("ready") is False and "locked to different IP" in str(st_gw.get("reason")), st_gw.get("reason"))
+    check("S12 gRPC: the caveat binds: locked to lf2's address works from lf2, locked to another is refused",
+          rc_lf2 == 0 and "identity_pubkey" in out_lf2 and rc_gw != 0 and "locked to different IP" in out_gw, {"lf2": out_lf2[-160:], "gw": out_gw[-160:]})
+
+    # S14 + S13: lf2's watchtower on lf1's wtclient; the tower policy; the rate limit
+    links_up()
+    tinfo = ln("lf2", "tower", "info")
+    tpub = tinfo["pubkey"]
+    ln("lf1", "wtclient", "add", f"{tpub}@lf2:9911")
+    st = mcp.tool("ln_status", {})
+    tw = st.get("watchtowers", {})
+    REPORT["scenarios"]["S14_status"] = {"watchtowers": tw, "warnings": st.get("warnings")}
+    check("S14 ln_status lists lf1's wtclient tower (lf2), chain not verified",
+          tw.get("wtclient") == "active" and [t["pubkey"] for t in tw.get("towers", [])] == [tpub] and tw["towers"][0]["chain_verified"] is False, tw)
+    check("S14 ... and warns loudly", any("WARNING" in w and tpub in w for w in st.get("warnings", [])), st.get("warnings"))
+    s_st, p = start_policy_signer("wallet-strict", human_pub, lf2_pub, ln_env, {"tower_policy": "refuse", "max_sends_per_hour": 1})
+    procs.append(p)
+    inv = ln("lf2", "addinvoice", "--amt=600")
+    r = rpc_sock(s_st, "ln_pay", {"invoice": inv["payment_request"], "max_sats": 1000})
+    REPORT["scenarios"]["S14_refuse"] = r
+    check("S14 tower_policy refuse: ln_tower_chain, no HTLC", r.get("rule") == "ln_tower_chain" and inv["r_hash"] not in payments("lf1"), r)
+    stop(p)
+    s_st, p = start_policy_signer("wallet-strict", human_pub, lf2_pub, ln_env,
+                                  {"tower_policy": "refuse", "trusted_towers": [tpub], "max_sends_per_hour": 1})
+    procs.append(p)
+    r = pay_retry(lambda i, m: rpc_sock(s_st, "ln_pay", {"invoice": i, "max_sats": m}), inv["payment_request"], 1000)
+    REPORT["scenarios"]["S14_trusted"] = r
+    check("S14 the tower in ln.trusted_towers: paid", r.get("status") == "SUCCEEDED", r)
+    inv2 = ln("lf2", "addinvoice", "--amt=600")
+    r = rpc_sock(s_st, "ln_pay", {"invoice": inv2["payment_request"], "max_sats": 1000})
+    REPORT["scenarios"]["S13_rate_limit"] = r
+    check("S13 max_sends_per_hour 1: the second send is refused ln_rate_limit, no HTLC",
+          r.get("rule") == "ln_rate_limit" and inv2["r_hash"] not in payments("lf1"), r)
+
+    # S15: a hold invoice keeps the payment in flight; an HTLC sent outside the wallet counts against the budget
+    links_up()
+    s_h, p = start_policy_signer("wallet-hold", human_pub, lf2_pub, ln_env, {"timeout_s": 5}, {"daily_budget_sats": 10_000})
+    procs.append(p)
+    pre = os.urandom(32)
+    hh = hashlib.sha256(pre).hexdigest()
+    hold = ln("lf2", "addholdinvoice", hh, "--amt=2000")
+    r = rpc_sock(s_h, "ln_pay", {"invoice": hold["payment_request"], "max_sats": 3000}, timeout=180)
+    tip = int(b2b("getblockcount"))
+    st = rpc_sock(s_h, "ln_status")
+    REPORT["scenarios"]["S15_hold_pending"] = {"pay": r, "in_flight": st.get("in_flight_payments"), "htlc_locks": st.get("htlc_locks"), "tip": tip}
+    check("S15 the held payment is pending, booked at its worst case, with its CLTV height",
+          r.get("verdict") == "pending" and st.get("in_flight") == 1 and (st.get("in_flight_payments") or [{}])[0].get("cltv_until", 0) > tip,
+          {"pay": r, "in_flight": st.get("in_flight_payments")})
+    check("S15 ln_status: the HTLC is on lf1's channel, booked", st.get("htlc_locks", {}).get("booked_sats", 0) >= 2000
+          and st["htlc_locks"]["unbooked_sats"] == 0, st.get("htlc_locks"))
+    ln("lf2", "settleinvoice", pre.hex())
+    st = wait_status(s_h, "the held payment settled", 60, lambda q: q.get("in_flight") == 0)
+    check("S15 settled by the payee: reconciled, settled", st.get("in_flight") == 0 and st.get("recent", [{}])[0].get("state") == "settled",
+          st.get("recent", [])[:1])
+    # lf1 pays a held invoice outside the wallet (lncli, not the signer)
+    pre2 = os.urandom(32)
+    h2 = hashlib.sha256(pre2).hexdigest()
+    hold2 = ln("lf2", "addholdinvoice", h2, "--amt=5000")
+    bg = subprocess.Popen(["docker", "compose", "exec", "-T", "lf1", "lncli", "--network=regtest", "--rpcserver=127.0.0.1:10009", "payinvoice",
+                           "--force", "--json", hold2["payment_request"]], cwd=LAB, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        st = wait_status(s_h, "the foreign HTLC", 60, lambda q: q.get("htlc_locks", {}).get("unbooked_sats", 0) >= 5000)
+        REPORT["scenarios"]["S15_foreign_lock"] = {"htlc_locks": st.get("htlc_locks"), "warnings": st.get("warnings")}
+        check("S15 an HTLC lf1 sent outside the wallet is seen, unbooked, with its expiry",
+              st.get("htlc_locks", {}).get("unbooked_sats") == 5000 and st["htlc_locks"]["until_height"] > tip, st.get("htlc_locks"))
+        inv3 = ln("lf2", "addinvoice", "--amt=3000")
+        r = rpc_sock(s_h, "ln_pay", {"invoice": inv3["payment_request"], "max_sats": 4000})
+        REPORT["scenarios"]["S15_lock_refused"] = r
+        check("S15 3,025 + 5,000 locked > the 8,000 left today: refused ln_htlc_lock, no HTLC",
+              r.get("rule") == "ln_htlc_lock" and inv3["r_hash"] not in payments("lf1"), r)
+        ln("lf2", "cancelinvoice", h2)
+        st = wait_status(s_h, "the foreign HTLC gone", 60, lambda q: q.get("htlc_locks", {}).get("unbooked_sats", 1) == 0)
+        r = pay_retry(lambda i, m: rpc_sock(s_h, "ln_pay", {"invoice": i, "max_sats": m}), inv3["payment_request"], 4000)
+        REPORT["scenarios"]["S15_after_cancel"] = r
+        check("S15 cancelled: the lock is gone and the same payment goes through", st.get("htlc_locks", {}).get("unbooked_sats") == 0
+              and r.get("status") == "SUCCEEDED", r)
+    finally:
+        bg.kill()
+    with open(f"{RUN}/wallet-hold/.run/ledger.json") as f:
+        led = sum(x["amount_sats"] for x in json.load(f)["payments"])
+    check("S15 the hold wallet's ledger is exact: 2,000 + 3,000 (direct peer, no fee)", led == 5000, led)
 
 
 if __name__ == "__main__":

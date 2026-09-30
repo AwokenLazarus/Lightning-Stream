@@ -213,6 +213,8 @@ pub struct Signer {
     pub ln: Option<Arc<dyn LnBackend>>,
     pub ln_error: Option<String>,
     pub ln_book: LnBook,
+    /// AGP-049: channel funding verdicts from our own node, per funding outpoint (final ones only).
+    pub(crate) ln_funding: Mutex<HashMap<String, crate::ln_funding::Funding>>,
 }
 
 impl Signer {
@@ -285,7 +287,7 @@ impl Signer {
         Ok(Arc::new(Self { root: root.into(), run, config: RwLock::new(config), engine, node, chain, hrp, mining, sock_path,
                            human_pubkey: RwLock::new(human_pubkey), spend: Mutex::new(()), approval_outcomes: Mutex::new(HashMap::new()), boot_policy: raw,
                            keystore, sigaudit, anchor, hot, book, session, routing, open_tried: Mutex::new(HashMap::new()), watch_interval,
-                           ln, ln_error, ln_book }))
+                           ln, ln_error, ln_book, ln_funding: Mutex::new(HashMap::new()) }))
     }
 
     /// Fail closed if the signature log no longer holds the witness's latest anchor.
@@ -772,8 +774,9 @@ impl Signer {
                 actions.push(json!({"anchor": a}));
             }
         }
-        // AGP-048: a Lightning payment a crash or a timeout left in flight
-        if self.ln.is_some() && !self.ln_book.in_flight().is_empty() {
+        // AGP-048: a Lightning payment a crash or a timeout left in flight (AGP-049: or one released as
+        // never sent, which the node may still record late)
+        if self.ln.is_some() && (!self.ln_book.in_flight().is_empty() || !self.ln_book.watched(self.engine.now()).is_empty()) {
             let _g = self.lock();
             let _c = sigaudit::context(Some("watcher"), Some("watcher:ln_reconcile"));
             for r in self.ln_reconcile_locked() {
