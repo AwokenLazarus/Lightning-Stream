@@ -10,7 +10,8 @@
                            channel_keys.json + channels.json, a signature log and its witness store.
                            The Rust signer must open all of them (tests/custody_compat.rs)
 
-    B2=~/xbt-rnd/b2 B1_ROOT=~/xbt-rnd/b1-agp-023 python scripts/gen_b2_signer_vectors.py
+    B2=~/xbt-rnd/b2 B1_ROOT=~/xbt-rnd/b1 python scripts/gen_b2_signer_vectors.py
+    (or XBT402_B1, which is copied into B1_ROOT when B1_ROOT is unset)
 (needs `cryptography`; the xbt-063 venv has it). Deterministic except for the random parts of
 sealing (salts, nonces) and signatures, which the Rust side only opens and verifies.
 """
@@ -23,7 +24,10 @@ from pathlib import Path
 
 B2 = Path(os.environ.get("B2", Path.home() / "xbt-rnd" / "b2"))
 sys.path.insert(0, str(B2))
-os.environ.setdefault("B1_ROOT", str(Path.home() / "xbt-rnd" / "b1-agp-023"))
+if not os.environ.get("B1_ROOT", "").strip():
+    xbt_b1 = os.environ.get("XBT402_B1", "").strip()
+    if xbt_b1:
+        os.environ["B1_ROOT"] = xbt_b1
 
 from agentwallet import approval  # noqa: E402
 import importlib  # noqa: E402
