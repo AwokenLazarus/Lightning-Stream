@@ -121,8 +121,8 @@ client.close(origin)?;
   (`PaymentRequired`, `PaymentRequirements`, `ChannelExtra`, `SchemePayload`, `Receipt`,
   `SettlementResponse`, `VerifyResponse`, `SupportedResponse`, `OpenChannel`, `OpenResponse`, `CloseResponse`).
 * `provider`: `Provider` (serve, open, close, rollover, facilitator verify/settle/supported, terms,
-  offer_conditional, close_due, sweep_payee), `ProviderConfig`.
-* `client`: `Client`, `ClientConfig`, and the two hooks the application supplies: `Transport` and `Wallet`;
+  offer_conditional, close_due, close_channel, sweep_payee, recovered_reservations), `ProviderConfig`.
+* `client`: `Client` (`request`/`request_with`, `close`/`close_with`), `CallOpts`, `ClientConfig`, and the two hooks the application supplies: `Transport` and `Wallet`;
   optionally a `ClientLedger` for the channel book (`Client::with_ledger`, `FileClientLedger`,
   `MemoryClientLedger`; AGP-035).
 * `funding`: `ChainBackend` (the four node calls), `FundingPolicy`, `check_funding`.
@@ -585,6 +585,100 @@ Tests: `crates/xbt402-interop/tests/hub_multi_process.rs` (21; B1
 `scripts/rollover_load_regtest.sh` has two more kinds, `<H>-<P>-high` and `-high-nofloor`: at 3,000 sat
 a lock the floor gives a rollover per four or more locks and zero refusals, and without it a
 rollover and a refusal per lock.
+
+## The embedder surface (AGP-059)
+For an application that meters a channel itself (cmp, CMP-051). Before this, cmp's payer was built
+on `channel` + `wire` because `Client` took no headers and signed only its own amount, and cmp's
+provider repaired the ledger's `spent_msat` after a crash. The same surface is in B1 `agp-059`
+(`docs/embedders.md` there).
+
+**Payer: its own headers and its own cumulative amount.**
+
+```rust
+use xbt402::client::CallOpts;
+
+let headers = [("X-CMP-Payer".to_string(), identity)];
+let opts = CallOpts::new().headers(&headers).cum(meter.payer_sats());   // sats, cumulative
+let resp = client.request_with("POST", &url, &frame, &opts)?;
+let done = client.close_with(origin, &CallOpts::new().cum(meter.payer_sats()))?;
+```
+
+`request` and `close` are these with `CallOpts::new()`. The headers go with every request of the
+call (the unpaid try and the paid retry); a `PAYMENT-SIGNATURE`, an empty name or a CR/LF/NUL is
+`bad_header` and nothing is sent. A chosen `cum` replaces only the amount `Client` works out from
+its receipts. Everything else `Client` does still happens: the offer checks, the price pinned at
+open, request auth, the receipt checks, the ledger save. The amount is bounded before anything is
+signed or a seq is spent:
+
+| a chosen `cum` | answer |
+|---|---|
+| below the last signed state | `bad_amount` (a state never goes down) |
+| above `max_amount()` (capacity less the payer's close fee) | `exhausted` |
+| above `ceil(receipted spentMsat / 1000)` + one call at the price pinned at open | `too_expensive` |
+| its increase over the last signed state exceeds what is left of `daily_budget` | `budget` |
+| under `min_amount()` while nothing is signed yet | sent unsigned (cum 0): never rounded up |
+
+The third bound is the one `Client` has always had implicitly: it signs what its verified receipts
+show, plus (prepay) the call it is making. So a metering embedder can sign ahead of the receipts by
+at most one call, which is what a lost answer needs. `CallOpts` is `#[non_exhaustive]`: build it
+with `new()`.
+
+**Provider: close one channel now.**
+
+```rust
+let st = provider.channel_state(&chan).ok_or(...)?;
+if idle && provider.settle_due(&st.params, st.best_cum, Some(provider.height()?), 0) {
+    match provider.close_channel(&chan) {
+        Ok(r) => info!("closed {} by {}: cum {} unpaidMsat {}", r["chan"], r["txid"], r["cum"], r["unpaidMsat"]),
+        Err(e) if matches!(e.code.as_str(), "call_in_flight" | "lock_pending" | "hub_channel" | "channel_closed" | "no_state") => {}
+        Err(e) => return Err(e),
+    }
+}
+```
+
+It is the watcher's margin close for one named channel: the same write-ahead intent, broadcast,
+record and hash-lock claim (`close_locked`), with the best signed state (the conditional state when
+that pays more). The answer is the cooperative close's (`chan`, `txid`, `cum`, `unpaidMsat`, and
+`payeeFee`/`payeeNet` under payee-pays). Refused, with nothing changed:
+
+| code | when |
+|---|---|
+| `unknown_channel` | not in this provider's ledger |
+| `channel_closed` | already closed or rolled over |
+| `lock_pending` | a routed lock is open on it (`route_lock`, `stale_locks`: a hub's ch1) |
+| `hub_channel` | a hub-funded ch2: its hub rolls it over or closes it, and the margin close still protects it |
+| `call_in_flight` | a paid call is between its reservation and its settlement: the best state does not cover it yet |
+| `no_state` | the payer has signed nothing |
+| `close_failed` | the node refused the broadcast (the intent stays; a later call or the watcher adopts or replaces it) |
+
+**Provider: the reservation crash window.** A direct call reserves its maximum price in
+`spent_msat` before the handler runs (saved, with the payer's state and the seq) and refunds the
+difference once the charge is known. A process that died in between restarted with `spent_msat`
+above what it had billed; a payer signing its own meter was then refused `insufficient_payment` on
+every later call. Now:
+
+* A metered call (a provider with `with_charge`) records its reservation in the row:
+  `extra.resv = {"<seq>": msat}`. Its settlement is always saved before the answer leaves (also
+  when the charge equals the price), which removes the record.
+* `Provider::new` refunds every reservation still recorded and saves the rows:
+  `provider.recovered_reservations()` lists `(chan, msat)` for the operator's log. After a restart
+  `spent_msat` is what was charged. A metered call in flight at the crash is charged nothing: its
+  charge was never durable and its answer never left.
+* An unmetered call's reservation is its exact charge, so nothing is recorded and a paid call is
+  still one fsync. In flight at a crash it stays charged once at its price, as before.
+* A handler or charge function that panics refunds its reservation (a guard dropped unsettled), and
+  a failed settlement save answers `500 ledger_error` with nothing charged.
+
+There is no setter for `spent_msat`, and none is needed: `reconcile_direct` in cmp can go. A ledger
+row written by an older build that crashed mid-call still holds its reservation unrecorded; nothing
+in the row tells it from a charge, so it is not touched.
+
+API changes for embedders: all additive. `Client::request_with`, `Client::close_with`, `CallOpts`;
+`Provider::close_channel`, `Provider::recovered_reservations`; `ChannelState::reserve`, `release`,
+`reserved_msat`, `refund_reservations`. Behaviour: a metered provider saves once more per call when
+the charge equals the price; a ledger row may carry `extra.resv` while a call is in flight (an older
+build reading such a ledger after a crash sees the reservation as spent, as it always did).
+Tests: `crates/xbt402/tests/lifecycle.rs` (the last seven).
 
 ## Portability
 

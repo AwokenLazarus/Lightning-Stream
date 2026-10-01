@@ -14,7 +14,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
-B1=${XBT402_B1:-$HOME/xbt-rnd/b1-agp-056}
+B1=${XBT402_B1:-$HOME/xbt-rnd/b1-agp-059}
 PB=${XBT_RS_LOAD_PORT_BASE:-34900}
 R=${XBT_RS_RUN:-$ROOT/run}/load-$$
 export XBT402_B1=$B1
