@@ -301,19 +301,10 @@ A refund the hub signed before AGP-044 (0xFFFFFFFE) is replaceable only where fu
 other nodes the replacement is refused (`ch2_refund_bump_failed`), and whichever version confirms
 still counts.
 
-**2. One live ch2 per payTo.** The hub identifies a provider by the payTo its /terms name, not by
-the URL it was reached at. Origins are canonical (`route::canon_origin`: scheme and host lowercased,
-the default port and trailing `/`s dropped).
-* `OutBook::origins` maps each connected origin to its payTo.
-* `connect` to an origin whose payTo already has a live ch2 funds nothing: it returns that ch2
-  (event `ch2_reuse`). The two-connects race is closed under the book lock (`ch2_funding`).
-* A route to either origin goes over that ch2, to the origin that opened it. Rollovers and refills
-  work as before. The cap counts the ch2 once.
-* The 402's `providers` lists every routable origin. `RouteHub::ch2_for(origin)` resolves an origin
-  to its ch2.
-* An operator therefore runs one paid backend (CMP-023). Two separate provider processes under one
-  key share the one ch2, and the second one's locks are refused. The demo's A and B are now two
-  mounts of one provider, on two ports.
+**2. One live ch2 per origin** (was: per payTo; changed by AGP-056, see "Multi-process operators"
+below). Origins are canonical (`route::canon_origin`: scheme and host lowercased, the default port and
+trailing `/`s dropped), and `connect` to an origin that already has a live ch2 funds nothing: it
+returns that ch2. The two-connects race is closed under the book lock (`ch2_funding`).
 
 **3. The RoutePayer ledger seam.**
 ```rust
@@ -540,6 +531,60 @@ signing is deterministic, so no vector changes.
 Tests: `crates/xbt402-interop/tests/route_wal.rs` (12) and `routing_checks.rs` `agp054_*` (2). In B1:
 `tests/security/test_agp054_route_wal.py` (16). The measurements are in
 `docs/route-perf-agp054-2026-09-30.json`, from B1 `scripts/route_perf.py`.
+
+## Multi-process operators, rollover relay and the settle floor (AGP-056)
+From cmp's CMP-027 gate: after a hub ch2 rollover, locks to that provider were refused
+`route_blocked` until the next block, on almost every lock. Four causes, three fixed here (hub and
+provider, the same in B1 `agp-056`) and one in cmp.
+
+**1. ch2 identity: one per provider process.** A ch2 lives in ONE provider process's ledger, with
+that process's route sessions. AGP-044 kept one live ch2 per payTo and sent the locks of a second
+origin under that key to the origin that opened the ch2. With two provider processes on one operator
+key (cmp merchants) that process has no session for them: `unknown_session`, and the client sees
+`route_failed`. The hub keys a ch2 by the canonical origin again.
+* `connect(origin)` funds that origin's own ch2. A lock goes to the origin the client named, on its ch2.
+* One payTo key holds at most `ch2_max_per_pay_to` live ch2s (default 8, 0: no bound). The next
+  `connect` is refused `pay_to_limit` and nothing is funded. `liquidity_cap_sat` counts every ch2.
+* `OutBook::live_for_pay_to` is gone (`live_keys(pay_to)` lists them); `key_for(origin)` and
+  `RouteHub::ch2_for(origin)` return the origin's own ch2 only. The event `ch2_reuse` is gone.
+* A refusal names its cause: `route_blocked` "no open channel to that provider: its payTo has a ch2
+  at <origin>, another provider process ...".
+* An operator who serves ONE provider process at two URLs should give the hub one of them: each URL
+  would get its own ch2 (they work; the capital is split).
+
+**2. Rollover relay.** The provider broadcasts a rollover on its own node. A hub with its own node
+sees it only after P2P relay, and used to block the child as vanished (`ch2_rollover_vanished`) until
+the next block. Now it blocks only if its node showed the rollover before (`fund_seen`), or still
+does not `rollover_relay_grace` seconds (default 60) after it (`rolled_at`).
+
+**3. Settle floor.** `settleMultiple × closeFee` (12,600 sat at the defaults) is when a settlement is
+worth its fee to the provider. With locks larger than that the ch2 rolled over on every lock.
+* Hub: a due rollover waits until the ch2 has taken `settle_lock_multiple` (k, default 4) × the
+  largest lock routed to that provider (`max_lock`, carried over rollovers). It never waits past the
+  point where another lock of that size would not fit, and not at all once the ch2 has had no lock
+  for `settle_idle` seconds (default 600). `settle_lock_multiple: 0` is the old rule.
+* A rollover child that could not take one more lock of that size is not made: the ch2 is closed
+  and refilled (before, such a child sat exhausted and unsigned until its expiry).
+* Provider: the default zero-conf cap of a rollover child is
+  `max(2 × settleMultiple × closeFee, 2 × settle_lock_multiple × largest lock on the parent's line)`
+  (`ProviderConfig::settle_lock_multiple`, `zero_conf_max_for`). An explicit `rollover_zero_conf_max`
+  is used as it is.
+* Why k = 4: at most one rollover per four of the largest locks (the provider's close fees and the
+  unconfirmed windows fall by the same factor), and with a ch2 capacity of five such locks, the
+  usual sizing (100k / 20k, 200k / 40k), it is the largest k that still leaves room for one more
+  lock when the rollover is due.
+
+**4. Refusal detail.** The hub's `route_failed` for a provider refusal now carries
+`provider refused the lock: <code> (<the provider's detail, printable ASCII, bounded>)`. The Rust
+`RoutePayer` already returned `detail`; B1's does now.
+
+No wire change: no new field or message, and the conformance vectors are byte-identical.
+
+Tests: `crates/xbt402-interop/tests/hub_multi_process.rs` (21; B1
+`tests/security/test_agp056_multi_process.py`, 21), each checked against 12 mutations.
+`scripts/rollover_load_regtest.sh` has two more kinds, `<H>-<P>-high` and `-high-nofloor`: at 3,000 sat
+a lock the floor gives a rollover per four or more locks and zero refusals, and without it a
+rollover and a refusal per lock.
 
 ## Portability
 

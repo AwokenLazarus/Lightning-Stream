@@ -59,6 +59,22 @@
 //! the hub keeps within those bounds itself, never rolls an unconfirmed child over, and blocks or drops
 //! a child whose rollover left the mempool or was replaced.
 //!
+//! ch2 identity (AGP-056, as B1; it replaces AGP-044's one live ch2 per payTo): a ch2 belongs to one
+//! provider PROCESS, the origin it was funded at, because that process's ledger is the only one that
+//! holds the channel and its route sessions. An operator may run several provider processes on one
+//! payTo key (cmp merchants): each gets its own ch2, and a lock is forwarded to the origin the client
+//! named, on that origin's ch2. One key takes at most `ch2_max_per_pay_to` live ch2s.
+//!
+//! Settle floor (AGP-056): with locks larger than the provider's threshold every lock rolled the ch2
+//! over. A due rollover waits until the ch2 has taken `settle_lock_multiple` × the largest lock
+//! routed to that provider, never past the point where another lock of that size would not fit, and
+//! not at all once the ch2 has had no lock for `settle_idle` seconds. A rollover child that could
+//! not take one more such lock is not made: the ch2 is closed and refilled.
+//!
+//! Rollover relay (AGP-056): the provider broadcasts the rollover on ITS node. A hub on another node
+//! sees it only after P2P relay, so the child is blocked as vanished only if the hub's node showed
+//! the rollover before, or still does not `rollover_relay_grace` seconds after it.
+//!
 //! Lock order: the ch1 ledger may be held while the out book is taken, never the reverse; a
 //! provider's busy flag is taken with a timeout (route) or not at all (watcher).
 use std::collections::{HashMap, HashSet};
@@ -148,6 +164,19 @@ pub struct HubConfig {
     /// (its /open reply carries `zeroConf`), so routing to the provider never pauses for a block
     /// (make-before-break); a provider that refuses is opened at minConf.
     pub zero_conf_rollover: bool,
+    /// AGP-056: the live ch2s one payTo key may hold over its origins (provider processes); the next
+    /// `connect` is refused `pay_to_limit`. 0: no bound.
+    pub ch2_max_per_pay_to: u64,
+    /// AGP-056 (k): a due rollover waits until the ch2 has taken k × the largest lock routed to that
+    /// provider (0: roll over at the provider's threshold). k = 4: at most one rollover per four of
+    /// the largest locks, and with the usual capacity of five such locks (100k / 20k, 200k / 40k) it
+    /// is the largest k that still leaves room for one more lock when the rollover is due.
+    pub settle_lock_multiple: u64,
+    /// Seconds without a lock after which a due ch2 rolls over at the provider's threshold.
+    pub settle_idle: f64,
+    /// AGP-056: seconds a rollover the hub's own node has not shown yet is given to arrive over P2P
+    /// (the provider broadcasts it on its node) before its ch2 is blocked as vanished.
+    pub rollover_relay_grace: f64,
 }
 
 impl Default for HubConfig {
@@ -158,17 +187,18 @@ impl Default for HubConfig {
                close_margin: 144, rollover_margin: 36, hrp: "bcrt".into(), policy: json!({"min_expiry_blocks": 1_008, "max_expiry_blocks": 8_640}),
                ch2_max_expiry_blocks: 0, ch2_max_close_fee_sat: 5_000, ch2_close_fee_multiple: 20, ch2_max_min_conf: 6, ch2_max_min_capacity: 0,
                ch2_max_settle_multiple: 100, refund_grace_blocks: 6, refund_conf_target: 6, refund_min_feerate: 1.0, funding_timeout_blocks: 6,
-               refund_bump_blocks: 3, refund_max_fee_sat: 5_000, zero_conf_rollover: true }
+               refund_bump_blocks: 3, refund_max_fee_sat: 5_000, zero_conf_rollover: true, ch2_max_per_pay_to: 8, settle_lock_multiple: 4,
+               settle_idle: 600.0, rollover_relay_grace: 60.0 }
     }
 }
 
-const HUB_KEYS: [&str; 32] = ["fee_base_msat", "fee_ppm", "fee_strategy", "quote_ttl", "max_lock_sat", "max_unguarded_lock_sat", "delta",
+const HUB_KEYS: [&str; 36] = ["fee_base_msat", "fee_ppm", "fee_strategy", "quote_ttl", "max_lock_sat", "max_unguarded_lock_sat", "delta",
                               "reveal_timeout", "ch2_capacity", "ch2_expiry_blocks", "liquidity_cap_sat", "close_fee",
                               "ch1_close_fee_payer", "ch2_close_fee_payer", "close_margin", "rollover_margin", "hrp", "policy", "_comment",
                               "ch2_max_expiry_blocks", "ch2_max_close_fee_sat", "ch2_close_fee_multiple", "ch2_max_min_conf",
                               "ch2_max_min_capacity", "ch2_max_settle_multiple", "refund_grace_blocks", "refund_conf_target",
                               "refund_min_feerate", "funding_timeout_blocks", "refund_bump_blocks", "refund_max_fee_sat",
-                              "zero_conf_rollover"];
+                              "zero_conf_rollover", "ch2_max_per_pay_to", "settle_lock_multiple", "settle_idle", "rollover_relay_grace"];
 
 impl HubConfig {
     /// From the operator's JSON (B1 `HubConfig.from_dict`): unknown keys are refused.
@@ -238,6 +268,13 @@ impl HubConfig {
         c.refund_max_fee_sat = u("refund_max_fee_sat", c.refund_max_fee_sat)?;
         if let Some(v) = m.get("zero_conf_rollover") {
             c.zero_conf_rollover = v.as_bool().ok_or_else(|| bad("zero_conf_rollover must be true or false".into()))?;
+        }
+        c.ch2_max_per_pay_to = u("ch2_max_per_pay_to", c.ch2_max_per_pay_to)?;
+        c.settle_lock_multiple = u("settle_lock_multiple", c.settle_lock_multiple)?;
+        for (k, slot) in [("settle_idle", &mut c.settle_idle), ("rollover_relay_grace", &mut c.rollover_relay_grace)] {
+            if let Some(v) = m.get(k) {
+                *slot = v.as_f64().filter(|x| *x >= 0.0).ok_or_else(|| bad(format!("{k} must be a number")))?;
+            }
         }
         c.funding_policy()?;
         Ok(c)
@@ -318,6 +355,14 @@ pub struct OutChannel {
     pub rolled_from: String,
     /// The provider took it unconfirmed (AGP-053): `{parent, maxCum, until, confirmed}` (empty: no).
     pub zero_conf: Map<String, Value>,
+    /// The largest lock routed over this ch2 and the ones it was rolled from (AGP-056).
+    pub max_lock: u64,
+    /// When the last lock on it completed (the settle floor holds only while locks come).
+    pub last_lock_at: f64,
+    /// When the rollover that funds it was co-signed (AGP-056: relay grace).
+    pub rolled_at: f64,
+    /// The hub's node has shown that rollover (mempool or a block).
+    pub fund_seen: bool,
 }
 
 /// States in which the hub's coins are committed.
@@ -347,7 +392,7 @@ impl OutChannel {
                blocked: String::new(), close_txid: String::new(), rolled_to: String::new(), opened_at: tip, scanned_to: tip,
                refund_txid: String::new(), refund_fee: 0, final_: false, next: Map::new(), fund_error: String::new(),
                refund_at: 0, refund_prev: vec![], close_prev: String::new(), fund_txid: String::new(), fund_vout: 0,
-               rolled_from: String::new(), zero_conf: Map::new() }
+               rolled_from: String::new(), zero_conf: Map::new(), max_lock: 0, last_lock_at: 0.0, rolled_at: 0.0, fund_seen: false }
     }
 
     pub fn to_json(&self) -> Value {
@@ -357,7 +402,8 @@ impl OutChannel {
                "close_txid": self.close_txid, "rolled_to": self.rolled_to, "opened_at": self.opened_at, "scanned_to": self.scanned_to,
                "refund_txid": self.refund_txid, "refund_fee": self.refund_fee, "final": self.final_, "next": self.next, "fund_error": self.fund_error,
                "refund_at": self.refund_at, "refund_prev": self.refund_prev, "close_prev": self.close_prev, "fund_txid": self.fund_txid,
-               "fund_vout": self.fund_vout, "rolled_from": self.rolled_from, "zero_conf": self.zero_conf})
+               "fund_vout": self.fund_vout, "rolled_from": self.rolled_from, "zero_conf": self.zero_conf, "max_lock": self.max_lock,
+               "last_lock_at": self.last_lock_at, "rolled_at": self.rolled_at, "fund_seen": self.fund_seen})
     }
 
     pub fn from_json(v: &Value) -> Result<Self> {
@@ -373,7 +419,10 @@ impl OutChannel {
                   next: v.get("next").and_then(Value::as_object).cloned().unwrap_or_default(), fund_error: s("fund_error"),
                   refund_at: n("refund_at") as u32, refund_prev: v.get("refund_prev").and_then(Value::as_array).cloned().unwrap_or_default(),
                   close_prev: s("close_prev"), fund_txid: s("fund_txid"), fund_vout: n("fund_vout") as u32, rolled_from: s("rolled_from"),
-                  zero_conf: v.get("zero_conf").and_then(Value::as_object).cloned().unwrap_or_default() })
+                  zero_conf: v.get("zero_conf").and_then(Value::as_object).cloned().unwrap_or_default(), max_lock: n("max_lock"),
+                  last_lock_at: v.get("last_lock_at").and_then(Value::as_f64).unwrap_or(0.0),
+                  rolled_at: v.get("rolled_at").and_then(Value::as_f64).unwrap_or(0.0),
+                  fund_seen: v.get("fund_seen").and_then(Value::as_bool).unwrap_or(false) })
     }
 
     fn secret_key(&self) -> Result<SecretKey> {
@@ -395,10 +444,12 @@ pub const ROLLOVER_GONE: &str = "the rollover that funds this ch2 is in no block
 
 /// The hub's ch2s, an fsynced JSON file (keys included: regtest only).
 ///
-/// One live ch2 per payTo (AGP-044): a provider is the payTo its /terms name, not the URL it was
-/// reached at. `origins` maps every origin the hub connected (canonical, [`canon_origin`]) to that
-/// payTo; a second origin with the payTo of a live ch2 reuses it (its locks go over that ch2, to
-/// the origin that opened it), so one operator never splits the hub's capital over several ch2s.
+/// One ch2 per origin (AGP-056, replacing AGP-044's one live ch2 per payTo): `chans` is keyed by the
+/// canonical origin ([`canon_origin`]), one provider PROCESS, because that process's ledger is the
+/// only one that holds the channel and its route sessions. An operator may run several provider
+/// processes on one payTo key (cmp merchants): each gets its own ch2, and a lock is forwarded to the
+/// origin the client named. `origins` maps every origin the hub connected to the payTo its /terms
+/// named (a record, and the per-payTo count: `ch2_max_per_pay_to`).
 #[derive(Debug, Default)]
 pub struct OutBook {
     path: Option<PathBuf>,
@@ -423,19 +474,15 @@ impl OutBook {
         Ok(b)
     }
 
-    /// The live ch2 (funding, funded or open) to `pay_to`, by key.
-    pub fn live_for_pay_to(&self, pay_to: &str) -> Option<String> {
-        self.chans.iter().find(|(_, c)| c.pay_to.eq_ignore_ascii_case(pay_to) && LIVE.contains(&c.state.as_str())).map(|(k, _)| k.clone())
+    /// The origins with a live ch2 (funding, funded or open) to `pay_to`.
+    pub fn live_keys(&self, pay_to: &str) -> Vec<String> {
+        self.chans.iter().filter(|(_, c)| c.pay_to.eq_ignore_ascii_case(pay_to) && LIVE.contains(&c.state.as_str())).map(|(k, _)| k.clone()).collect()
     }
 
-    /// The key of the ch2 that serves `origin` (canonical): its own record while live, else the live
-    /// ch2 of the payTo it was connected under, else its own record (closed, refunded, ...).
+    /// The key of the ch2 that serves `origin` (canonical): its own, and no other (AGP-056: the ch2
+    /// of another origin under the same payTo is in another process's ledger).
     pub fn key_for(&self, origin: &str) -> Option<String> {
-        if self.chans.get(origin).is_some_and(|c| LIVE.contains(&c.state.as_str())) {
-            return Some(origin.to_string());
-        }
-        let pt = self.origins.get(origin).cloned().or_else(|| self.chans.get(origin).map(|c| c.pay_to.clone()));
-        pt.and_then(|p| self.live_for_pay_to(&p)).or_else(|| self.chans.contains_key(origin).then(|| origin.to_string()))
+        self.chans.contains_key(origin).then(|| origin.to_string())
     }
 
     pub fn save(&self) -> Result<()> {
@@ -711,10 +758,8 @@ impl RouteHub {
         let q = self.fee_quote()?;
         let providers: Vec<String> = {
             let b = lk(&self.out);
-            let routable = |o: &str| b.key_for(o).and_then(|k| b.chans.get(&k)).is_some_and(|c| c.state == "open" && c.blocked.is_empty());
-            let mut v: Vec<String> = b.chans.keys().chain(b.origins.keys()).filter(|o| routable(o)).cloned().collect();
+            let mut v: Vec<String> = b.chans.iter().filter(|(_, c)| c.state == "open" && c.blocked.is_empty()).map(|(o, _)| o.clone()).collect();
             v.sort();
-            v.dedup();
             v
         };
         Ok(json!({"feeBaseMsat": q.fee_base_msat, "feePpm": q.fee_ppm, "maxLockSat": q.max_lock_sat,
@@ -860,13 +905,15 @@ impl RouteHub {
             return err(400, "route_fee", &format!("fee {f} < {f_due} due under quote {}", q.seq), json!({"feeDue": f_due}));
         }
         // 6 expiry rule ------------------------------------------------------------------------------
-        // the provider is its payTo: an origin sharing a live ch2's payTo routes over that ch2
-        let key = lk(&self.out).key_for(&provider).unwrap_or_else(|| provider.clone());
+        // the provider is the origin the client named: its own ch2, in that process's ledger (AGP-056)
+        let key = provider.clone();
         let oc = lk(&self.out).chans.get(&key).cloned();
         // a rollover's next ch2 is opened (AGP-053) under the busy flag the lock takes below: it is
         // checked again there, once it is open
         let opening = |o: &OutChannel| o.state == "funded" && !o.rolled_from.is_empty() && self.cfg.zero_conf_rollover;
-        let Some(oc) = oc.filter(|o| o.state == "open" || opening(o)) else { return e400("route_blocked", "no open channel to that provider") };
+        let Some(oc) = oc.clone().filter(|o| o.state == "open" || opening(o)) else {
+            return e400("route_blocked", &self.no_channel(&provider, oc.as_ref()));
+        };
         if !oc.blocked.is_empty() {
             return e400("route_blocked", &oc.blocked);
         }
@@ -921,7 +968,7 @@ impl RouteHub {
             return Some(("lock_outstanding", "a lock on this provider's ch2 is pending".into()));
         };
         if oc.state != "open" {
-            return Some(("route_blocked", "no open channel to that provider".into()));
+            return Some(("route_blocked", self.no_channel(&oc.origin, Some(oc))));
         }
         if !oc.blocked.is_empty() {
             return Some(("route_blocked", oc.blocked.clone()));
@@ -944,6 +991,22 @@ impl RouteHub {
         None
     }
 
+    /// Why there is no open ch2 to `origin`, for the client (AGP-056: a refusal names its cause).
+    fn no_channel(&self, origin: &str, oc: Option<&OutChannel>) -> String {
+        let Some(oc) = oc else {
+            let b = lk(&self.out);
+            let other = b.origins.get(origin).and_then(|pt| b.live_keys(pt).into_iter().find(|k| k != origin));
+            return match other {
+                Some(o) => format!("no open channel to that provider: its payTo has a ch2 at {o}, another provider process (a ch2 serves the origin it was opened at)"),
+                None => "no open channel to that provider".into(),
+            };
+        };
+        if oc.state == "funded" && !oc.rolled_from.is_empty() {
+            return "no open channel to that provider: its ch2 is a rollover the provider takes once it confirms".into();
+        }
+        format!("no open channel to that provider: its ch2 is {}", oc.state)
+    }
+
     /// Pre-sign ch2 under T (only now), send it to the provider, settle ch1 with t + r.
     fn forward(&self, ch1: &str, oc: &OutChannel, lock1: &Value, rt: &Value, t0: Instant) -> HttpResponse {
         let d = py_u64(lock1.get("d")).unwrap_or(0);
@@ -956,6 +1019,14 @@ impl RouteHub {
         let mut pre2 = None;
         if need2 > oc.signed {
             if need2 > p2.max_amount() {
+                {
+                    // the settle floor counts it (AGP-056): this ch2 is rolled over (or refilled) as soon as it is due
+                    let mut b = lk(&self.out);
+                    if let Some(c) = b.chans.get_mut(&oc.origin).filter(|c| c.params.channel_id() == p2.channel_id()) {
+                        c.max_lock = c.max_lock.max(d);
+                        let _ = b.save();
+                    }
+                }
                 self.void(ch1, &oc.origin, &p2.channel_id(), "ch2 exhausted", "");
                 return e400("route_failed", "the hub's channel to that provider is exhausted");
             }
@@ -1005,7 +1076,10 @@ impl RouteHub {
         if let Some(code) = ans.get("error").and_then(Value::as_str) {
             self.void(ch1, &oc.origin, &p2.channel_id(), &format!("provider refused: {code}"), "");
             *lk(&self.stats).refused.entry(code.to_string()).or_insert(0) += 1;
-            return err(502, "route_failed", "provider refused the lock", json!({"providerError": code}));
+            let shown = if safe_code(code) { code } else { "provider_error" };
+            let det = ans.get("detail").and_then(Value::as_str).unwrap_or("");
+            let detail = if det.is_empty() { format!("provider refused the lock: {shown}") } else { format!("provider refused the lock: {shown} ({det})") };
+            return err(502, "route_failed", &detail, json!({"providerError": code}));
         }
         let out = self.settled(ch1, &oc.origin, &ans);
         lk(&self.stats).lock_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
@@ -1050,7 +1124,12 @@ impl RouteHub {
         }
         if [400, 401, 403].contains(&r.status) {
             if let Some(e) = doc.get("error").and_then(Value::as_str) {
-                return Some(json!({"error": e.chars().take(40).collect::<String>()}));
+                let code: String = e.chars().take(40).collect();
+                // the detail is the provider's free text (untrusted): printable ASCII only, bounded
+                let det: String = doc.get("detail").and_then(Value::as_str).unwrap_or("").chars().take(160).filter(|c| (' '..='~').contains(c)).collect();
+                // B1's str(ChannelError) leads with its code
+                let det = det.strip_prefix(code.as_str()).map(|r| r.trim_start_matches([':', ' '])).unwrap_or(&det).to_string();
+                return Some(json!({"error": code, "detail": det}));
             }
         }
         None
@@ -1077,6 +1156,8 @@ impl RouteHub {
             }
             c.signed = c.signed.max(py_u64(pend.get("cum")).unwrap_or(0));
             c.routed += py_u64(pend.get("d")).unwrap_or(0);
+            c.max_lock = c.max_lock.max(py_u64(pend.get("d")).unwrap_or(0));
+            c.last_lock_at = (now_f() * 1000.0).round() / 1000.0;
             c.pending = Map::new();
             b.save().ok()?;
         }
@@ -1251,9 +1332,10 @@ impl RouteHub {
     /// Fund a ch2 to `origin` from the hub's own wallet. It opens (the watcher) once the funding
     /// has the provider's minConf.
     ///
-    /// One live ch2 per payTo (AGP-044): if the provider's payTo already has a live ch2 (under this
-    /// origin or another), nothing is funded: `origin` is recorded under that payTo and the live ch2
-    /// is returned (event `ch2_reuse`); its rollovers and refills go on as usual.
+    /// One live ch2 per origin (AGP-056): if this origin already has a live ch2 to the payTo its
+    /// /terms name, nothing is funded and that ch2 is returned. Another origin under the same payTo is
+    /// another provider process with its own ledger: it gets its own ch2, up to `ch2_max_per_pay_to`
+    /// live ch2s for that key (`pay_to_limit` beyond it; nothing is funded).
     pub fn connect(&self, origin: &str, capacity: Option<u64>, expiry_blocks: Option<u32>) -> Result<OutChannel> {
         let origin = &canon_origin(origin);
         if lk(&self.out).chans.get(origin).is_some_and(|c| c.state == "funding") {
@@ -1271,19 +1353,16 @@ impl RouteHub {
         }
         let (cap, blocks) = self.ch2_terms(&terms, capacity, expiry_blocks)?;
         let pay_to = py_str(terms.get("payTo")).to_lowercase();
-        let reused = {
+        let own = {
             let mut b = lk(&self.out);
             b.origins.insert(origin.clone(), pay_to.clone());
-            let r = b.live_for_pay_to(&pay_to).map(|k| b.chans[&k].clone());
+            let r = b.chans.get(origin).filter(|c| LIVE.contains(&c.state.as_str()) && c.pay_to.eq_ignore_ascii_case(&pay_to)).cloned();
             b.save()?;
             r
         };
-        if let Some(oc) = reused {
+        if let Some(oc) = own {
             if oc.state == "funding" {
-                return fail("ch2_funding", format!("a ch2 to payTo {}... is being funded (the watcher reconciles it)", &pay_to[..16]));
-            }
-            if oc.origin != *origin {
-                self.event(json!({"event": "ch2_reuse", "provider": origin, "ch2": oc.origin, "payTo": pay_to, "chan": oc.params.channel_id()}));
+                return fail("ch2_funding", format!("a ch2 to {origin} is being funded (the watcher reconciles it)"));
             }
             return Ok(oc);
         }
@@ -1309,9 +1388,16 @@ impl RouteHub {
             if old.as_ref().is_some_and(|o| o.state == "funding") {
                 return fail("ch2_funding", format!("a ch2 to {origin} is being funded"));
             }
-            if let Some(k) = b.live_for_pay_to(&pay_to) {
-                // one live ch2 per payTo, checked with the record's insert (two connects racing)
-                return fail("ch2_funding", format!("a live ch2 to that payTo exists ({k})"));
+            if old.as_ref().is_some_and(|o| LIVE.contains(&o.state.as_str()) && o.pay_to.eq_ignore_ascii_case(&pay_to)) {
+                // one live ch2 per origin, checked with the record's insert (two connects racing)
+                return fail("ch2_funding", format!("a live ch2 to {origin} exists"));
+            }
+            let others: Vec<String> = b.live_keys(&pay_to).into_iter().filter(|k| k != origin).collect();
+            let limit = self.cfg.ch2_max_per_pay_to as usize;
+            if limit > 0 && others.len() >= limit {
+                let some: Vec<&str> = others.iter().take(3).map(String::as_str).collect();
+                return fail("pay_to_limit", format!("payTo {}... has {} live ch2s ({}): ch2_max_per_pay_to {limit}",
+                                                    pay_to.get(..16).unwrap_or(&pay_to), others.len(), some.join(", ")));
             }
             if self.cfg.liquidity_cap_sat > 0 {
                 let freed = old.as_ref().filter(|o| LIVE.contains(&o.state.as_str())).map(|o| o.params.capacity).unwrap_or(0);
@@ -1324,6 +1410,7 @@ impl RouteHub {
                 b.archived.push(old.to_json());
             }
             b.chans.insert(origin.into(), oc.clone());
+            b.origins.insert(origin.into(), pay_to.to_lowercase());
             b.save()?;
         }
         let (txid, vout) = match self.wallet.fund(&address, cap) {
@@ -1575,7 +1662,9 @@ impl RouteHub {
         let tip = self.chain.block_count()?;
         let (_, blocks) = self.ch2_terms(&oc.terms, None, None)?;
         let expiry = tip + blocks;
-        if next_cap < min_cap.max(p.min_amount()) {
+        // too small to keep: under the provider's minimum, or (AGP-056) it could not take one more lock of
+        // the size this provider is paid in (it would sit exhausted and unsigned until its expiry)
+        if next_cap < min_cap.max(p.min_amount()) || (oc.max_lock > 0 && next_cap.saturating_sub(p.payer_fee()) < oc.max_lock.max(p.min_amount())) {
             return self.close_ch2(oc, true);
         }
         let secret = adaptor::random_secret();
@@ -1587,6 +1676,9 @@ impl RouteHub {
         let mut new = OutChannel::fresh(&oc.origin, &oc.pay_to, nxt.clone(), &secret, "funded", oc.settle_multiple, &oc.terms, tip);
         new.refund_hex = nxt.refund_tx(&secret, None, None)?.to_hex();
         new.rolled_from = p.channel_id();
+        new.max_lock = oc.max_lock;
+        new.last_lock_at = oc.last_lock_at;
+        new.rolled_at = (now_f() * 1000.0).round() / 1000.0;
         let next = new.to_json().as_object().cloned().unwrap_or_default();
         // write-ahead: the next ch2's key before the request
         if self.upd(Loc::Live(&oc.origin), oc, |c| c.next = next)?.is_none() {
@@ -1610,6 +1702,12 @@ impl RouteHub {
         }
         let cur = self.get(Loc::Live(&oc.origin)).unwrap_or_else(|| oc.clone());
         let ev = self.finish_rollover(Loc::Live(&oc.origin), &cur, amount)?;
+        // a hub on the provider's node sees the rollover at once (AGP-056); else the watcher's reconcile looks again
+        if let Some(new) = self.get(Loc::Live(&oc.origin)).filter(|c| c.rolled_from == p.channel_id() && !c.fund_seen) {
+            if matches!(self.chain.get_tx_out(&txid, 1, true), Ok(Some(_))) {
+                self.upd(Loc::Live(&oc.origin), &new, |c| c.fund_seen = true)?;
+            }
+        }
         // make-before-break (AGP-053): open the next ch2 now, still under this provider's busy flag, so
         // the next lock goes over it; a provider that wants confirmations first refuses, and the watcher
         // opens it at minConf
@@ -1972,7 +2070,7 @@ impl RouteHub {
         // settlement: the provider's net payout >= its settleMultiple × closeFee, or near ch2's close
         // margin as the provider counts it (it co-signs only then): roll over. Past expiry the refund
         // took over.
-        let due = settle_due(p, oc.signed, oc.settle_multiple);
+        let due = self.settle_due(&oc);
         let margin = oc.term_u64("closeMarginBlocks").unwrap_or(self.cfg.close_margin as u64) as i64;
         let grace = (self.cfg.rollover_margin as u64).min(oc.term_u64("rolloverGraceBlocks").unwrap_or(self.cfg.rollover_margin as u64)) as i64;
         let near = tip as i64 >= p.expiry as i64 - margin - grace;
@@ -1982,6 +2080,27 @@ impl RouteHub {
             out.push(self.rollover(&oc)?);
         }
         Ok(out)
+    }
+
+    /// The ch2 is due to roll over: the provider's net payout is at its threshold (settleMultiple ×
+    /// closeFee: the least it co-signs) and, while locks keep coming (AGP-056), the ch2 has taken
+    /// `settle_lock_multiple` × the largest lock routed to it, so a provider whose locks are larger
+    /// than its threshold is not rolled over on every lock. Never later than the point where another
+    /// lock of that size would not fit (the ch2 would be exhausted), and at once after `settle_idle`
+    /// seconds without a lock.
+    fn settle_due(&self, oc: &OutChannel) -> bool {
+        let p = &oc.params;
+        if !settle_due(p, oc.signed, oc.settle_multiple) {
+            return false;
+        }
+        let (k, big) = (self.cfg.settle_lock_multiple, oc.max_lock);
+        if k == 0 || big == 0 {
+            return true;
+        }
+        if now_f() - oc.last_lock_at >= self.cfg.settle_idle {
+            return true;
+        }
+        oc.signed >= k.saturating_mul(big) || oc.signed.saturating_add(big) > p.max_amount()
     }
 
     /// A ch2 the provider took unconfirmed (AGP-053): confirmed with minConf, or unconfirmed again (a
@@ -2021,6 +2140,11 @@ impl RouteHub {
         let chan = oc.params.channel_id();
         if self.chain.get_tx_out(&txid, vout, true)?.is_some() {
             let mut oc = oc;
+            if !oc.rolled_from.is_empty() && !oc.fund_seen {
+                // our node shows the rollover (AGP-056)
+                self.upd(loc, &oc, |c| c.fund_seen = true)?;
+                oc.fund_seen = true;
+            }
             if oc.blocked == ROLLOVER_GONE {
                 // the rollover is back (AGP-053)
                 self.upd(loc, &oc, |c| c.blocked = String::new())?;
@@ -2174,12 +2298,20 @@ impl RouteHub {
         let p = &oc.params;
         let txid = p.funding_txid();
         if self.chain.get_tx_out(&txid, p.funding_vout(), false)?.is_some() || self.scan.in_mempool(&txid).unwrap_or(false) {
+            if !oc.fund_seen {
+                self.upd(loc, oc, |c| c.fund_seen = true)?;
+            }
             return Ok(None);
         }
         let Some((ptxid, pvout)) = oc.rolled_from.split_once(':') else { return Ok(None) };
         let pvout: u32 = pvout.parse().map_err(|_| ChannelError::new("bad_state", "rolled_from"))?;
         if self.chain.get_tx_out(ptxid, pvout, true)?.is_some() {
             if oc.blocked == ROLLOVER_GONE {
+                return Ok(Some(vec![]));
+            }
+            // the provider broadcast it on ITS node: ours may not have it yet (AGP-056). Vanished only if
+            // our node showed it before, or still does not after the relay grace
+            if !oc.fund_seen && now_f() - oc.rolled_at < self.cfg.rollover_relay_grace {
                 return Ok(Some(vec![]));
             }
             self.upd(loc, oc, |c| c.blocked = ROLLOVER_GONE.into())?;
@@ -2251,6 +2383,7 @@ impl RouteHub {
                 c.signed = c.signed.max(py_u64(lk1.get("cum")).unwrap_or(0));
                 if c.pending.get("lockId").and_then(Value::as_str) == Some(lid.as_str()) {
                     c.routed += py_u64(lk1.get("d")).unwrap_or(0);
+                    c.max_lock = c.max_lock.max(py_u64(lk1.get("d")).unwrap_or(0));
                     c.pending = Map::new();
                 }
                 c.stale.retain(|s| s.get("lockId").and_then(Value::as_str) != Some(lid.as_str()));

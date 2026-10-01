@@ -22,6 +22,13 @@ state. Runs (hub-provider):
                   its next rollover). Counted as refusedDuringReorg. Plain <H>-<P> stays ZERO refusals.
                   Optional kinds (LOAD_ONLY): reorg-cap (pause until the cap is hit, then re-confirm;
                   asserts those refusals happen and stop) and reorg-zero (mine immediately; asserts zero)
+  <H>-<P>-high    AGP-056, a high price: every lock (HIGH_LOCK sat) is above the provider's settle threshold
+                  (2 x 600 net). The settle floor (settle_lock_multiple 4, the default) rolls the ch2 over
+                  once per >= 4 locks, and the provider's zero-conf cap follows the lock size: ZERO refused
+                  locks, every call 200, rollovers per paid lock <= 0.3. At LOAD_HIGH_RATE locks/s (2).
+  <H>-<P>-high-nofloor  the same price with the floor off in hub and provider (settle_lock_multiple 0), the
+                  pre-AGP-056 behaviour, measured: a rollover per paid lock, and route_blocked after each
+                  (the next lock is above the 2,400 sat zero-conf cap until a block confirms the child)
 Money checks for every run: each rollover tx pays the provider signed - closeFee (payee-pays) and the
 next ch2 capacity - signed; the next ch2's capacity is that output; routed over all of the provider's
 ch2s == what the client paid that shard; no lock pending or written off anywhere.
@@ -57,6 +64,8 @@ REORG_S = float(os.environ.get("LOAD_REORG_S", "5"))
 SOAK = ["systemd-run", "--user", "--scope", "-q", "-p", "CPUQuota=200%", "-p", "MemoryMax=4G", "nice", "-n", "19"]
 PRICE = 24 * 10 ** 21                  # 24 sat a call: ch2 reaches 2 x closeFee net every ~5 s at 15 locks/s
 SETTLE, CLOSE_FEE = 2, 600
+HIGH_LOCK = 3_000                      # sat a call in the high-price runs (AGP-056): one lock > the 1,800 sat threshold
+HIGH_RATE = float(os.environ.get("LOAD_HIGH_RATE", "2"))
 SAT = 100_000_000
 
 
@@ -174,7 +183,12 @@ def scenario(i, name):
     parts = name.split("-")
     hub_impl, prov_impl, kind = parts[0], parts[1], ("-".join(parts[2:]) if len(parts) > 2 else "after")
     is_reorg = kind.startswith("reorg")
-    base = PB + 10 + 8 * i
+    is_high = kind.startswith("high")
+    floor_k = 0 if kind == "high-nofloor" else 4
+    price, rate = (HIGH_LOCK * 10 ** 21, HIGH_RATE) if is_high else (PRICE, RATE)
+    # ten runs of 8 ports from PB+10; the AGP-056 runs take two each from PB+90 (all below PB+100)
+    # (an optional LOAD_ONLY kind runs alone on the last pair)
+    base = PB + 10 + 8 * i if i < 10 else min(PB + 90 + 2 * (i - 10), PB + 98)
     hub_port, prov_port = base, base + 1
     d = os.path.join(RUN, name)
     os.makedirs(d, exist_ok=True)
@@ -195,18 +209,20 @@ def scenario(i, name):
         sec = f"{secrets.randbelow(2 ** 255) + 1:064x}"
         if prov_impl == "RS":
             cmd = [f"{RS}/xbt402-route-provider", "--port", str(prov_port), "--rpc-port", RPCPORT, "--cookie", COOKIE, "--secret", sec,
-                   "--amsat", str(PRICE), "--settle-multiple", str(SETTLE), "--watch-secs", "1", "--ledger", os.path.join(d, "prov.jsonl")]
+                   "--amsat", str(price), "--settle-multiple", str(SETTLE), "--watch-secs", "1", "--ledger", os.path.join(d, "prov.jsonl")]
             if zc != "default":
                 cmd += ["--zero-conf-max", zc]
+            if is_high:
+                cmd += ["--settle-lock-multiple", str(floor_k)]
         else:
-            cmd = [PY, os.path.join(HERE, "py_route_provider.py"), str(prov_port), sec, str(PRICE), str(SETTLE), zc, "1"]
-        penv = None
+            cmd = [PY, os.path.join(HERE, "py_route_provider.py"), str(prov_port), sec, str(price), str(SETTLE), zc, "1"]
+        penv = {**os.environ, "XBT402_SETTLE_LOCK_MULTIPLE": str(floor_k)} if is_high and prov_impl == "PY" else None
         if os.environ.get("LOAD_ROUTE_WAL") == "1":
             wal = os.path.join(d, "prov.route-wal")
             if prov_impl == "RS":
                 cmd += ["--route-wal", wal]
             else:
-                penv = {**os.environ, "XBT402_ROUTE_WAL": wal}
+                penv = {**(penv or os.environ), "XBT402_ROUTE_WAL": wal}
         procs.append(spawn(cmd, **({"env": penv} if penv else {})))
         assert wait_http(url + "/x402/supported"), f"provider {url} did not come up"
         key = os.path.join(d, "hub.key")
@@ -219,6 +235,8 @@ def scenario(i, name):
                 "hub": {"fee_base_msat": 100, "fee_ppm": 2000, "max_lock_sat": 20000, "max_unguarded_lock_sat": 500,
                         "delta": 144, "reveal_timeout": 2.0, "ch2_capacity": 100000, "ch2_expiry_blocks": 1100,
                         "close_margin": 144, "policy": {"min_expiry_blocks": 1008, "max_expiry_blocks": 8640}}}
+        if is_high:                       # room for the whole run on one ch2 line (a rollover adds no coins)
+            conf["hub"].update(ch2_capacity=1_000_000, settle_lock_multiple=floor_k)
         cpath = os.path.join(d, "hub.json")
         with open(cpath, "w") as f:
             json.dump(conf, f)
@@ -238,7 +256,7 @@ def scenario(i, name):
         out_path = os.path.join(d, "client.json")
         with open(out_path, "w") as out:
             client = subprocess.Popen(SOAK + [f"{RS}/xbt402-rollover-load", "--hub", hub_url, "--shard", url + "/v1/chunk", "--rpc-port", RPCPORT,
-                                              "--cookie", COOKIE, "--seconds", str(SECONDS), "--rate", str(RATE), "--progress", progress],
+                                              "--cookie", COOKIE, "--seconds", str(SECONDS), "--rate", str(rate), "--progress", progress],
                                       stdout=out, stderr=LOG)
         t_start[0] = time.time()
         seen, zc_seen, stuck, reorg = set(), {}, None, None
@@ -300,11 +318,21 @@ def scenario(i, name):
         time.sleep(2.0)
         b = book(ch2_path)
         recs = records(b)
+        for _ in range(3):
+            # that block can make a ch2 due again (a child that filled while unconfirmed, AGP-056): the
+            # rollover it triggers needs its own block before the money checks read it
+            pend = [r["close_txid"] for r in recs if r.get("state") == "rolled" and r.get("close_txid")
+                    and not node.getrawtransaction(r["close_txid"], True).get("confirmations")]
+            if not pend:
+                break
+            mine_one()
+            time.sleep(2.0)
+            recs = records(book(ch2_path))
         miner.stop.set()
         # --- checks ---------------------------------------------------------------------------------
         rolled = [r for r in recs if r.get("state") == "rolled"]
         refused, bad = res.get("refused", {}), res.get("badCalls", {})
-        if kind not in ("stuck", "before"):  # before/stuck pause routing (block-interval gaps / the cap), so paid rate drops
+        if kind not in ("stuck", "before") and not is_high:  # before/stuck pause routing (block-interval gaps / the cap), so paid rate drops
             check(f"lock rate >= 10/s ({res.get('lockRate')})", res.get("lockRate", 0) >= 10, "")
         if kind == "after":
             check(f"rollovers under load ({len(rolled)})", len(rolled) >= 3, "")
@@ -312,6 +340,21 @@ def scenario(i, name):
             check("every call 200 (no session stalled)", not bad, json.dumps(bad))
             zcs = [bool(r.get("zero_conf")) for r in recs if r.get("rolled_from")]
             check(f"next ch2s taken unconfirmed ({sum(zcs)} of {len(zcs)}; the rest confirmed before the open)", any(zcs), json.dumps(zcs))
+        per_lock = round(len(rolled) / max(1, res.get("locksPaid", 0)), 3)
+        if kind == "high":
+            check(f"rollovers under load ({len(rolled)})", len(rolled) >= 2, "")
+            check("zero refused locks at a high price", not refused, json.dumps(refused))
+            check("every call 200 (no session stalled)", not bad, json.dumps(bad))
+            check(f"settle floor: rollovers per paid lock <= 0.3 ({len(rolled)} / {res.get('locksPaid')} = {per_lock})",
+                  res.get("locksPaid", 0) >= 8 and per_lock <= 0.3, "")
+            zmax = [int((r.get("zero_conf") or {}).get("maxCum", 0)) for r in recs if r.get("zero_conf")]
+            check(f"the provider's zero-conf cap follows the lock size (>= 2 x 4 x {HIGH_LOCK})",
+                  bool(zmax) and all(z >= 8 * HIGH_LOCK for z in zmax), json.dumps(zmax))
+        if kind == "high-nofloor":
+            check(f"baseline: a rollover per paid lock ({len(rolled)} / {res.get('locksPaid')} = {per_lock})",
+                  len(rolled) >= 2 and per_lock >= 0.5, "")
+            check("baseline: the next lock is refused until a block (route_blocked)", refused.get("route_blocked", 0) > 0,
+                  json.dumps(refused))
         if kind == "before":
             check(f"rollovers under load ({len(rolled)})", len(rolled) >= 2, "")
             check("baseline: the gap is there (route_blocked refusals)", refused.get("route_blocked", 0) > 0, json.dumps(refused))
@@ -398,7 +441,7 @@ def scenario(i, name):
         paid = sum(int(s["locked_sat"]) for s in shards.values())
         check(f"routed over all ch2s == what the client's locks paid ({routed} == {paid})", routed == paid and paid > 0, "")
         check("no ch2 lock pending or written off", all(not r.get("pending") and not r.get("stale") for r in recs), "")
-        return {"run": name, "ok": all(c["ok"] for c in checks), "checks": checks, "rollovers": len(rolled),
+        return {"run": name, "ok": all(c["ok"] for c in checks), "checks": checks, "rollovers": len(rolled), "rolloversPerLock": per_lock,
                 "client": {k: res.get(k) for k in ("seconds", "calls", "locksPaid", "lockRate", "refused", "refusals", "badCalls",
                                                   "lockOther", "maxGapMs", "gapsOver1s", "gapP50Ms", "lockMs")},
                 "refusedDuringReorg": refused_during_reorg, "refusedDuringReorgN": len(refused_during_reorg),
@@ -419,7 +462,8 @@ def scenario(i, name):
 
 
 def main():
-    runs = ["RS-RS", "PY-PY", "RS-PY", "PY-RS", "RS-RS-before", "PY-PY-before", "RS-RS-stuck", "PY-PY-stuck", "RS-RS-reorg", "PY-PY-reorg"]
+    runs = ["RS-RS", "PY-PY", "RS-PY", "PY-RS", "RS-RS-before", "PY-PY-before", "RS-RS-stuck", "PY-PY-stuck", "RS-RS-reorg", "PY-PY-reorg",
+            "RS-RS-high", "PY-PY-high", "RS-RS-high-nofloor", "PY-PY-high-nofloor"]
     only = [x for x in os.environ.get("LOAD_ONLY", "").split(",") if x]
     for name in only:
         if name not in runs:
@@ -434,7 +478,7 @@ def main():
         print(f"  {name:16s} {'PASS' if r['ok'] else 'FAIL'}  rollovers {r.get('rollovers')}  locks/s {c.get('lockRate')}  "
               f"refused {c.get('refused')}  refusedDuringReorg {r.get('refusedDuringReorgN')}  "
               f"badCalls {c.get('badCalls')}  maxGapMs {c.get('maxGapMs')}  "
-              f"refused/rollover {r.get('refusedPerRollover')}", flush=True)
+              f"refused/rollover {r.get('refusedPerRollover')}  rollovers/lock {r.get('rolloversPerLock')}", flush=True)
         for ch in r["checks"]:
             if not ch["ok"]:
                 print(f"      FAIL {ch['check']}: {ch['detail']}", flush=True)

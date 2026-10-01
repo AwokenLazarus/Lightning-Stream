@@ -89,6 +89,11 @@ pub struct ProviderConfig {
     /// up to this cum while it stays unconfirmed. None: two settlements' worth (2 × settle_multiple ×
     /// close_fee); 0: never (the hub opens it at minConf).
     pub rollover_zero_conf_max: Option<u64>,
+    /// AGP-056: a hub rolls a ch2 over at `settle_lock_multiple` × the largest lock when that is above
+    /// our threshold (locks larger than settle_multiple × close_fee), so the default zero-conf cap
+    /// follows it: at least 2 × this × the largest lock the parent's line took. An explicit
+    /// `rollover_zero_conf_max` is used as it is.
+    pub settle_lock_multiple: u64,
     /// AGP-054: a path makes each routed session's meter (seq, calls, accrued) durable before its
     /// ROUTE-STATE leaves, written ahead while the handler runs (`RouteOffer::precharge`). None: off.
     pub route_wal: Option<std::path::PathBuf>,
@@ -112,13 +117,25 @@ impl ProviderConfig {
             route_close_fee_payer: FeePayer::Payee,
             rollover_grace: 36,
             rollover_zero_conf_max: None,
+            settle_lock_multiple: 4,
             route_wal: None,
         }
     }
 
-    /// The effective zero-conf rollover cap (AGP-053).
+    /// The effective zero-conf rollover cap (AGP-053), whatever the locks.
     pub fn zero_conf_max(&self) -> u64 {
         self.rollover_zero_conf_max.unwrap_or_else(|| self.settle_multiple.saturating_mul(2).saturating_mul(self.close_fee))
+    }
+
+    /// The most a rollover child takes while unconfirmed when the largest lock its parent's line took
+    /// is `max_lock`: `rollover_zero_conf_max`, and by default (AGP-056) at least 2 ×
+    /// `settle_lock_multiple` × that lock, so a provider paid in locks larger than its settle
+    /// threshold is not capped below one lock.
+    pub fn zero_conf_max_for(&self, max_lock: u64) -> u64 {
+        match self.rollover_zero_conf_max {
+            Some(m) => m,
+            None => self.zero_conf_max().max(self.settle_lock_multiple.saturating_mul(2).saturating_mul(max_lock)),
+        }
     }
 }
 
@@ -472,7 +489,15 @@ impl Provider {
             };
             let mut st = ChannelState::new(p.clone());
             if !hub.is_empty() {
-                st.extra.insert("hub".into(), hub.into());
+                st.extra.insert("hub".into(), hub.as_str().into());
+                // a rollover child carries its line's largest lock on (AGP-056: the next child's cap)
+                let big = l.channels.values()
+                    .filter(|s| s.extra.get("rollover_to").and_then(Value::as_str) == Some(cid.as_str())
+                            && s.extra.get("hub").and_then(Value::as_str) == Some(hub.as_str()))
+                    .map(|s| py_u64(s.extra.get("max_lock")).unwrap_or(0)).max().unwrap_or(0);
+                if big > 0 {
+                    st.extra.insert("max_lock".into(), big.into());
+                }
             }
             if let Some(zc) = &zc {
                 st.extra.insert("zero_conf".into(), zc.clone());
@@ -517,6 +542,7 @@ impl Provider {
         if self.chain.get_tx_out(&p.funding_txid(), p.funding_vout(), true)?.is_none() {
             return Ok(None);
         }
+        let cap = self.cfg.zero_conf_max_for(py_u64(parent.extra.get("max_lock")).unwrap_or(0));
         Ok(Some(json!({"parent": pp.channel_id(), "need": need, "maxCum": cap, "until": until, "confirmed": false})))
     }
 

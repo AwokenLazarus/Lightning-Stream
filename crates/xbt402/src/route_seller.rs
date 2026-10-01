@@ -1002,6 +1002,7 @@ impl Provider {
         }
         st.extra.insert("route_locks".into(), Value::Object(locks));
         st.extra.insert("routed_sat".into(), (routed + amount).into());
+        st.extra.insert("max_lock".into(), py_u64(st.extra.get("max_lock")).unwrap_or(0).max(amount).into());
         self.save_state(l, st)?;
         let sess = rs.sessions.get_mut(&sid).ok_or_else(|| ChannelError::code("unknown_session"))?;
         sess.paid_sat += amount;
