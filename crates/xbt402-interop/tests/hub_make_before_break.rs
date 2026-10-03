@@ -63,7 +63,7 @@ struct W {
 fn world(zc_max: Option<u64>, zc: bool) -> W {
     let (chain, net, dir) = (MemChain::new(1000), MemNet::new(), TempDir::new());
     let mut hc = HubConfig::from_json(&json!({"fee_base_msat": 100, "fee_ppm": 2000, "max_lock_sat": 20000, "max_unguarded_lock_sat": 500,
-                                              "delta": 36, "reveal_timeout": 1.0, "ch2_capacity": 100000, "ch2_expiry_blocks": 1000, "settle_lock_multiple": 0,
+                                              "delta": 36, "reveal_timeout": 1.0, "ch2_capacity": 100000, "ch2_expiry_blocks": 1000, "settle_lock_multiple": 0, "refill_ahead_locks": 0,
                                               "close_margin": 36,
                                               "policy": {"min_capacity": 20000, "min_expiry_blocks": 500, "max_expiry_blocks": 8640}})).unwrap();
     hc.zero_conf_rollover = zc;

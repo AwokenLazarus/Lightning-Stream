@@ -680,6 +680,179 @@ the charge equals the price; a ledger row may carry `extra.resv` while a call is
 build reading such a ledger after a crash sees the reservation as spent, as it always did).
 Tests: `crates/xbt402/tests/lifecycle.rs` (the last seven).
 
+## ch2 lifecycle under load: the zero-conf cap and make-before-break refill (AGP-057)
+Two things still paused routing to a provider under load. Both are fixed in the hub (and one line in
+the provider), the same in B1 `agp-057` (`docs/routing.md` there). No wire change.
+
+### A. The zero-conf cap of a rollover child (cmp CMP-149)
+cmp saw about 20 `route_blocked` per R14 replay: "the rollover funding this ch2 is unconfirmed: cum
+134687 > the provider's zero-conf cap 132120". The cap is the provider's bound on what it takes over
+a rollover child that is still unconfirmed (`rollover_zero_conf_max`; by default
+`max(2 × settleMultiple × closeFee, 2 × settle_lock_multiple × the largest lock)`, here 8 × 16,515).
+
+Reproduced at cmp's lock size with four new kinds of `scripts/rollover_load_regtest.sh`: 16,515-sat
+locks at 2/s for 28 s on a 1,000,000-sat ch2, settleMultiple 20. `cmp`: cmp's own cadence (a block
+whenever the mempool is not empty, looked at every 0.4 s; the hub's watcher every second). `cmp-lag`:
+the watcher every 5 s (the hub's default). `cmp-slow`: a block only every 6 s. `cmp-slow-sized`: the
+same with the provider's cap sized for it (`--zero-conf-max` 24 locks). Every cap refusal is
+classified: was the child's rollover in a block already (the hub's flag was stale), or not.
+
+| run | refused before (base `25f5e2f`) | paid | max gap ms | refused after | paid | max gap ms |
+|---|---|---|---|---|---|---|
+| `RS-RS-cmp` | 0 | 56 | 529 | 0 | 56 | 521 |
+| `PY-PY-cmp` | 0 | 56 | 525 | 0 | 56 | 547 |
+| `RS-RS-cmp-lag` | 6 (6 stale flag, 0 unconfirmed) | 50 | 2,517 | 0 | 56 | 515 |
+| `PY-PY-cmp-lag` | 2 (2 stale flag, 0 unconfirmed) | 54 | 1,517 | 0 | 56 | 515 |
+| `RS-RS-cmp-slow` | 13 (1 stale flag, 12 unconfirmed) | 43 | 4,507 | 12 (0 stale flag, 12 unconfirmed) | 44 | 4,510 |
+| `PY-PY-cmp-slow` | 13 (1 stale flag, 12 unconfirmed) | 43 | 4,497 | 12 (0 stale flag, 12 unconfirmed) | 44 | 4,493 |
+| `RS-RS-cmp-slow-sized` | 0 | 56 | 532 | 0 | 56 | 519 |
+| `PY-PY-cmp-slow-sized` | 0 | 56 | 556 | 0 | 56 | 524 |
+
+Reports: `docs/rollover-load-agp057-cap-before-2026-10-03.json` and `...-cap-after-...` (each run's
+`capDiagnosis` has the refusals one by one). The command, in a 20-port grant:
+
+```sh
+XBT_RS_LOAD_PORT_BASE=42000 XBT_RS_LOAD_PORT_SPAN=20 \
+LOAD_ONLY=RS-RS-cmp,PY-PY-cmp,RS-RS-cmp-lag,PY-PY-cmp-lag,RS-RS-cmp-slow,PY-PY-cmp-slow,RS-RS-cmp-slow-sized,PY-PY-cmp-slow-sized \
+  lazvault heavy --project xbt-agentpay -- ./scripts/rollover_load_regtest.sh
+```
+(the before column: the same command on the base commits, `XBT402_B1=~/xbt-rnd/b1`).
+
+What the runs say:
+
+* **Nothing of the parent is carried into the cap.** A child's cum starts at 0 in the hub and at the
+  provider; `childCumCarried` is 0 in all 16 runs.
+* **The hub's stale flag (fixed).** The hub refuses before it sends anything, on its own
+  `zero_conf.confirmed`, and that flag was only the watcher's last look: a child that had confirmed
+  was refused until the next tick. Before a lock is refused on either of the provider's bounds (the
+  cap, the parent's close margin) the hub now looks at the chain itself, as the provider already did.
+  A node that does not answer leaves the bound standing (`ch2_watch_error`, step `zero_conf`).
+* **A block that lands while the provider checks the child (fixed).** Found by a `cmp-lag` run after
+  the first fix. The provider read the child's funding unconfirmed; then the block with the rollover
+  came, so the parent was spent in a block and the child was no zero-conf child any more. The open was
+  refused `unconfirmed` although the child was confirmed, and the ch2 stayed `funded` until the hub's
+  next tick (10 refusals at a 5 s watcher). `Provider::open` reads the funding once more before it
+  refuses. A refused open is also written to the hub's stderr now.
+* **The provider's own stale look at a lock (fixed).** The provider's watcher can meet the block the
+  same way and leave a confirmed child `suspended` until its next tick: a lock in between was refused
+  `unconfirmed` (two `route_failed` in a first `RS-RS-high-nofloor` run). Before it refuses a lock on
+  a suspended rollover child the provider now reads the chain, as the hub does before it sends one.
+  Any other suspended channel is refused as before.
+* **A child that really is unconfirmed is still refused (sizing).** With more than the cap's 8 locks
+  per block interval the hub refuses, as it should: that is the provider's risk bound (`cmp-slow`:
+  12 of the 13 before, and all 12 after). How many depends on where the blocks fall. A provider paid faster than
+  8 of its largest locks per block sets `rollover_zero_conf_max` to what it earns from one hub in a
+  block interval or two (`cmp-slow-sized`: zero refusals).
+
+Which of these cmp hit cannot be read off its logs (they carry no block times). Its topology (the
+hub, the operator and the miner on three nodes) adds relay time to the first case.
+
+### B. Make-before-break refill
+A rollover adds no coins, so a ch2 line carries its capacity in locks and was then closed and
+refilled. The refill is a wallet funding, which the provider cannot take unconfirmed (its payer could
+spend it again), so it opened at minConf: a block without routing to that provider.
+
+* **Funded ahead.** Once the live ch2's room is under `refill_ahead_locks` (N, default 4) × the
+  largest lock routed to that provider, the watcher funds the origin's NEXT ch2
+  (`OutBook::next_chans`, at most one per origin; `RouteHub::connect_next`). Room is what the line
+  still takes: `max_amount − signed`, less the provider's `minCapacity` (a rollover child under it is
+  not made). Not for a provider the hub stopped routing to, nor one with no lock for `settle_idle` s.
+* **Usable** means open at the provider, at its minConf. The live ch2 keeps taking locks meanwhile,
+  rollovers included.
+* **The switch** (`ch2_switch`): with the first lock the live ch2 cannot take (exhausted, no longer
+  open, or an unconfirmed rollover child at the provider's bounds); when the live ch2 is closed as
+  too small to roll over (`close_ch2(.., true)` hands over instead of funding; while the next one is
+  funded but not open yet and the live one still takes a lock, it is kept: `ch2_wait_next`); or once the live ch2
+  has had no lock for `settle_idle` seconds, so two ch2s do not stay committed to an idle provider.
+  Never while a lock is pending on the live ch2, and never because the hub stopped routing to the
+  provider (a lock it did not reveal).
+* **The old ch2** is `retired`: the watcher asks the provider to close it on its best state (once a
+  block until it answers) and reconciles it like any archived ch2. One with nothing signed has
+  nothing to close and is refunded at its expiry, as an unused ch2 always was.
+* **Bounds.** Per origin: one live ch2 plus at most one next (the AGP-056 guard, widened). An origin
+  counts once for `ch2_max_per_pay_to`. `committed_sat` counts the live ch2, the next one and a
+  retired one until its close is out, so `liquidity_cap_sat` needs room for one more `ch2_capacity`
+  than the hub has origins. Without it nothing is funded ahead (`ch2_refill_ahead_failed`, tried
+  again next block) and the refill follows the close as before.
+* **Sizing N.** N locks must cover what the provider is paid while a funding confirms and opens: the
+  locks of one block interval plus one watcher tick. `refill_ahead_locks: 0` is the old behaviour.
+* **Embedders.** `RouteHub::set_refill_ahead` replaces the default (`connect_next`). An embedder that
+  set its own `refill` and no `refill_ahead` gets none: its path, lock and cap are never bypassed.
+  `ch2.json` has a new key `next_chans`, and a record a new field `retired`.
+
+Events: `ch2_refill_ahead` {live, next, room, maxLock, capacity}, `ch2_refill_ahead_failed`,
+`ch2_switch` {from, to, why}, `ch2_wait_next`, `ch2_retire_failed`.
+
+**Exhaustion under load** (`<H>-<P>-exhaust`): 3,000-sat locks at 2/s for 60 s over a ch2 of 120,000
+sat (40 locks), a block every 3 s, `refill_ahead_locks` 16, `liquidity_cap_sat` 240,000. The line
+runs out three times. `-exhaust-before` is the same with `refill_ahead_locks` 0.
+
+| run | refused | paid | max gap ms | gaps > 1 s | wallet-funded ch2s | funded ahead | max committed sat | closes | rollovers |
+|---|---|---|---|---|---|---|---|---|---|
+| `RS-RS-exhaust` | 0 | 120 | 531 | 0 | 4 | 3 | 186,000 | 3 | 20 |
+| `PY-PY-exhaust` | 0 | 120 | 525 | 0 | 4 | 3 | 186,000 | 3 | 20 |
+| `RS-PY-exhaust` | 0 | 120 | 616 | 0 | 4 | 3 | 186,000 | 3 | 20 |
+| `PY-RS-exhaust` | 0 | 120 | 525 | 0 | 4 | 4 | 189,000 | 3 | 20 |
+| `RS-RS-exhaust-before` | 12 | 108 | 3,995 | 3 | 4 | 0 | 120,000 | 3 | 10 |
+| `PY-PY-exhaust-before` | 11 | 109 | 3,494 | 3 | 4 | 0 | 120,000 | 3 | 9 |
+
+```sh
+XBT_RS_LOAD_PORT_BASE=42000 XBT_RS_LOAD_PORT_SPAN=20 \
+LOAD_ONLY=RS-RS-exhaust,PY-PY-exhaust,RS-PY-exhaust,PY-RS-exhaust,RS-RS-exhaust-before,PY-PY-exhaust-before \
+  lazvault heavy --project xbt-agentpay -- ./scripts/rollover_load_regtest.sh
+```
+Report: `docs/rollover-load-agp057-exhaust-2026-10-03.json`. Each run also checks the money: every
+rollover tx pays the provider signed − closeFee, every replaced ch2 is closed on its signed state
+and confirmed, routed over all ch2s equals what the client paid, nothing pending or written off.
+
+Tests: `crates/xbt402-interop/tests/hub_refill_ahead.rs` (25; B1
+`tests/security/test_agp057_refill_ahead.py`, 25, where 12 of 13 mutations of the hub are caught and
+the 13th is equivalent). The older test worlds set `refill_ahead_locks: 0`, as they set
+`settle_lock_multiple: 0`.
+
+**The older runs, again** (the AGP-053 and AGP-056 kinds, on this commit; 45 s at 15 locks/s, the `high`
+kinds at 2/s). The make-before-break runs still refuse nothing; `-before`, `-stuck` and `-high-nofloor`
+are the baselines that refuse by design.
+
+| run | refused | paid | max gap ms | rollovers | checks |
+|---|---|---|---|---|---|
+| `RS-RS` | 0 | 675 | 115 | 8 | PASS |
+| `PY-PY` | 0 | 586 | 131 | 7 | PASS |
+| `RS-PY` | 0 | 603 | 232 | 7 | PASS |
+| `PY-RS` | 0 | 594 | 127 | 7 | PASS |
+| `RS-RS-before` | 143 | 532 | 3,206 | 6 | PASS |
+| `PY-PY-before` | 134 | 502 | 2,722 | 3 | PASS |
+| `RS-RS-stuck` | 158 | 456 | 14,287 | 2 | PASS |
+| `RS-RS-reorg-zero` | 0 | 656 | 123 | 8 | FAIL: reorg: the hub saw the child unconfirmed again |
+| `PY-PY-stuck` | 193 | 389 | 14,034 | 2 | PASS |
+| `RS-RS-reorg` | 35 (35 in the reorg window) | 640 | 2,299 | 5 | PASS |
+| `PY-PY-reorg` | 32 (32 in the reorg window) | 592 | 1,535 | 5 | PASS |
+| `RS-RS-high` | 0 | 90 | 554 | 16 | PASS |
+| `PY-PY-high` | 0 | 90 | 525 | 16 | PASS |
+| `RS-RS-high-nofloor` | 74 | 16 | 3,512 | 16 | PASS |
+| `PY-PY-high-nofloor` | 74 | 16 | 3,503 | 16 | PASS |
+
+Reports: `docs/rollover-load-agp057-a-2026-10-03.json` and `...-b-...` (two batches of the 20-port grant).
+
+* The `reorg` runs refuse inside the reorg window, which their checks allow and earlier reports did
+  not show (AGP-053: 0 and 0): here the first rollover waited a whole block interval (3.0 s) for its
+  block, the reorg held it 5 s more, and at 15 locks/s the child's cap (100 locks) is 6.7 s of
+  traffic. In AGP-053's report the block came 0.4 s after the rollover. So it is where the block
+  clock falls against the first rollover (probably the driver's changed start-up timing; not
+  isolated), and every refusal is the reorged child's zero-conf cap.
+* `RS-RS-reorg-zero` is an optional kind added to the batch: zero refusals, re-confirmed. Its check
+  "the hub saw the child unconfirmed again" fails: the block was re-mined 52 ms after the reorg,
+  between two watcher ticks. Whether that check ever held for this kind was not measured on the base.
+
+**The driver in a small port grant.** `XBT_RS_LOAD_PORT_SPAN` under 100 packs the selected runs two
+ports each from base + 4 (8 runs in 20 ports). Such a grant (42000-42019 here) lies in the kernel's
+ephemeral range (`ip_local_port_range` 32768-60999) and outside `ip_local_reserved_ports`
+(30000-34999 on this host, where the default base 349xx is): any local connection can hold one of
+its ports as its source port for a moment, a poll of that very port included, and a hub or provider
+then cannot bind it (`Address already in use`; it cost three runs their start today). The driver
+therefore waits for a process's "ready" line before it polls its port, and starts one that exited
+before that line again.
+
 ## Portability
 
 No platform-specific dependencies: libsecp256k1 (C, via `secp256k1-sys`), pure-Rust hashes and JSON,

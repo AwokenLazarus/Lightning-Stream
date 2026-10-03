@@ -548,6 +548,10 @@ impl Provider {
                         let pol = FundingPolicy { zero_conf_max: p.capacity, ..self.cfg.policy.clone() };
                         (check_funding(self.chain.as_ref(), &p, &pol)?, Some(zc))
                     }
+                    // AGP-057: not a child we take unconfirmed. A block that came while we looked makes
+                    // it neither: the funding read above had no confirmation yet, and the parent is now
+                    // spent in that block. Look at the funding once more (still unconfirmed: the same refusal)
+                    None if !hub.is_empty() => (check_funding(self.chain.as_ref(), &p, &self.cfg.policy)?, None),
                     None => return Err(e),
                 },
                 Err(e) => return Err(e),
