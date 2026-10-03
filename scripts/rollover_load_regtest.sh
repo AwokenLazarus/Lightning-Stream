@@ -12,6 +12,7 @@
 # Ports 34900-34999 (AGP-053). Node and processes wiped on exit. Soak rules: CPUQuota 200%, 4G, nice 19.
 # Env: XBT402_B1, LOAD_ONLY, LOAD_SECONDS, LOAD_RATE, LOAD_BLOCK_S, LOAD_STUCK_S, LOAD_REORG_S, LOAD_REPORT.
 set -euo pipefail
+lazvault hold check --project xbt-agentpay || exit 75   # IMP-030: heavy entry point, refuses during a host hold
 cd "$(dirname "$0")/.."
 ROOT=$PWD
 B1=${XBT402_B1:-$HOME/xbt-rnd/b1-agp-059}
