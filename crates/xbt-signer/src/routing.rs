@@ -249,17 +249,23 @@ impl RouteSigner {
         let mut s = Self { book, policy: std::sync::RwLock::new(policy), spend: RouteSpend::open(state_path)?, engine, adaptor,
                            denials: Mutex::new(vec![]), recovered_bookings: 0 };
         let cutoff = now_f64() - RETAIN_S;
+        let in_ledger: HashSet<String> = match &s.engine {
+            Some(e) => e.store.payments()?.into_iter().map(|p| p.txid).collect(),
+            None => HashSet::new(),
+        };
         for (chan, b) in s.book.resolved_bookings() {
-            if b.get("at").and_then(Value::as_f64).unwrap_or(0.0) >= cutoff && s.book_lock(&chan, &b, None)? {
+            if b.get("at").and_then(Value::as_f64).unwrap_or(0.0) >= cutoff && s.book_lock(&chan, &b, None, Some(&in_ledger))? {
                 s.recovered_bookings += 1;
             }
         }
         Ok(s)
     }
 
-    /// Book a resolved lock in the 24 h routing budget and the policy ledger, once per key: a row
-    /// already there (a restart re-booking what the record remembers) is left alone. `true` if it wrote.
-    fn book_lock(&self, chan: &str, b: &Value, how: Option<&str>) -> Result<bool> {
+    /// Book a resolved lock in the 24 h routing budget and the policy ledger, under its key. A lock
+    /// resolves once, so a live call (`in_ledger` `None`) always writes both rows. At start the
+    /// record's remembered locks come through here again: the spend log skips a key it holds, and
+    /// `in_ledger` (the ledger's txids) skips a payment it holds. `true` if anything was written.
+    fn book_lock(&self, chan: &str, b: &Value, how: Option<&str>, in_ledger: Option<&HashSet<String>>) -> Result<bool> {
         let key = b.get("key").and_then(Value::as_str).unwrap_or("");
         let (amount, at) = (py_int(b.get("amount")).unwrap_or(0), b.get("at").and_then(Value::as_f64).unwrap_or(0.0));
         if key.is_empty() {
@@ -272,7 +278,7 @@ impl RouteSigner {
         }
         let mut wrote = self.spend.add(row)?;
         if let Some(engine) = &self.engine {
-            if !engine.store.has_txid(key, at - 1.0) {
+            if !in_ledger.is_some_and(|l| l.contains(key)) {
                 let hub = b.get("hub").and_then(Value::as_str).filter(|h| !h.is_empty()).unwrap_or(chan);
                 let mut p = Payment::new(&normalize_dest(hub), amount, "routed lock");
                 p.ts = at;
@@ -340,7 +346,7 @@ impl RouteSigner {
 
     pub fn resolve_lock(&self, chan: &str, secret: &str) -> Result<String> {
         let res = self.book.resolve_lock(&self.dest(chan)?, secret)?;
-        self.book_lock(chan, &res["booking"], None)?;
+        self.book_lock(chan, &res["booking"], None, None)?;
         Ok(res["t"].as_str().unwrap_or("").to_string())
     }
 
@@ -352,7 +358,7 @@ impl RouteSigner {
         let res = self.book.adopt_lock(&self.dest(chan)?, cum)?;
         let amount = py_int(res.get("amount")).unwrap_or(0);
         if amount != 0 {
-            self.book_lock(chan, &res["booking"], Some("adopted"))?;
+            self.book_lock(chan, &res["booking"], Some("adopted"), None)?;
         }
         Ok(())
     }
@@ -360,7 +366,7 @@ impl RouteSigner {
     pub fn recover_lock(&self, chan: &str, witness: &[Vec<u8>]) -> Result<String> {
         let scheme = self.scheme()?;
         let res = self.book.recover_lock(&self.dest(chan)?, witness, &*scheme)?;
-        self.book_lock(chan, &res["booking"], Some("recovered"))?;
+        self.book_lock(chan, &res["booking"], Some("recovered"), None)?;
         Ok(res["t"].as_str().unwrap_or("").to_string())
     }
 

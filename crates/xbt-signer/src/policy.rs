@@ -568,11 +568,6 @@ impl PolicyStore {
         Ok(self.pay().entries.clone())
     }
 
-    /// Whether a payment with this `txid` and a `ts` of at least `since` is in the ledger.
-    pub fn has_txid(&self, txid: &str, since: f64) -> bool {
-        self.pay().entries.iter().any(|e| e.ts >= since && e.txid == txid)
-    }
-
     pub fn commit(&self, e: &LedgerEntry) -> Result<()> {
         let mut pay = self.pay();
         pay.log.append(&entry_row(e))?; // durable before it counts
@@ -922,7 +917,7 @@ mod tests {
         drop(s);
         assert_eq!(got(&PolicyStore::open(&p).unwrap()), [want, vec![("t7".to_string(), 17)]].concat());
         // an amend whose row the log does not hold is damage
-        fs::write(&p.with_file_name("ledger.payments.jsonl"), "{\"kind\":\"payments\",\"v\":1}\n{\"amend\":\"gone\",\"amount_sats\":1}\n").unwrap();
+        fs::write(p.with_file_name("ledger.payments.jsonl"), "{\"kind\":\"payments\",\"v\":1}\n{\"amend\":\"gone\",\"amount_sats\":1}\n").unwrap();
         assert_eq!(PolicyStore::open(&p).err().map(|e| e.code), Some("log".to_string()));
     }
 
