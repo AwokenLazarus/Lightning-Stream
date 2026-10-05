@@ -201,7 +201,7 @@ fn without_an_adaptor_implementation_routed_locks_are_refused() {
     let chan = rig.open()["chan"].as_str().unwrap().to_string();
     // the signer's default scheme is xbt402's adaptor (AGP-034); a RouteSigner built without one refuses
     assert_eq!(rig.call("routing_status", json!({}))["adaptor"], "available");
-    let bare = xbt_signer::routing::RouteSigner::new(rig.s.book.clone(), rig.s.routing.policy(), None, None, None);
+    let bare = xbt_signer::routing::RouteSigner::new(rig.s.book.clone(), rig.s.routing.policy(), None, None, None).unwrap();
     let e = bare.sign_state_adaptor(&chan, 1_146, &point(&secret("t")), json!({"hub": PROVIDER, "amount": 594, "fee": 6})).unwrap_err();
     assert_eq!(e.code, "adaptor_unavailable");
     assert_eq!(bare.status()["adaptor"], "unavailable (AGP-026)");
