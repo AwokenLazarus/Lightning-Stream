@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use xbt402::channel::{channel_auth_key, sign_with_type, ChannelParams, Payer};
 use xbt402::conditional::ConditionalParams;
 use xbt_primitives::ecdsa;
@@ -173,7 +174,23 @@ pub struct ChannelBook {
     audit: Option<Arc<SigAudit>>,
     /// `(height, margin)`: refuse new states once height >= expiry - margin.
     pub expiry_guard: Mutex<Option<(HeightFn, i64)>>,
+    /// AGP-055: SHA-256 of the keys document the keys file holds (`None`: no usable file yet).
+    /// `persist` rewrites the keys file only when the keys differ: a state, a lock or a seq
+    /// changes no key, and a rewrite re-seals (a fresh scrypt salt under a passphrase).
+    keys_on_disk: Mutex<Option<[u8; 32]>>,
     inner: Mutex<Inner>,
+}
+
+/// The keys file's plaintext document: every secret, sorted by channel.
+fn keys_doc(g: &Inner) -> String {
+    let mut secrets: Vec<(&String, String)> = g.secrets.iter().map(|(k, v)| (k, secret_hex(v))).collect();
+    secrets.sort();
+    let sm: serde_json::Map<String, Value> = secrets.into_iter().map(|(k, v)| (k.clone(), v.into())).collect();
+    dumps_indent(&json!({"secrets": sm}), 2, false)
+}
+
+fn doc_hash(doc: &str) -> [u8; 32] {
+    Sha256::digest(doc.as_bytes()).into()
 }
 
 fn secret_hex(s: &SecretKey) -> String {
@@ -208,6 +225,7 @@ impl ChannelBook {
             std::fs::create_dir_all(p).map_err(|e| err("io", e.to_string()))?;
         }
         let b = Self { records_path: records_path.into(), keys_path: keys_path.into(), keystore, audit, expiry_guard: Mutex::new(None),
+                       keys_on_disk: Mutex::new(None),
                        inner: Mutex::new(Inner { records: IndexMap::new(), archived: vec![], secrets: HashMap::new() }) };
         b.load()?;
         Ok(b)
@@ -215,6 +233,13 @@ impl ChannelBook {
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
         match self.inner.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
+    fn keys_seen(&self) -> MutexGuard<'_, Option<[u8; 32]>> {
+        match self.keys_on_disk.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         }
@@ -254,6 +279,8 @@ impl ChannelBook {
             }
             if plain && self.keystore.is_some() && !g.secrets.is_empty() {
                 self.persist(&g)?; // first start with a wrapping key: re-seal the plaintext file
+            } else {
+                *self.keys_seen() = Some(doc_hash(&keys_doc(&g)));
             }
         }
         Ok(())
@@ -261,14 +288,18 @@ impl ChannelBook {
 
     fn persist(&self, g: &Inner) -> Result<()> {
         // keys first: a record on disk never names a channel whose payer key is not on disk (P1)
-        let mut secrets: Vec<(&String, String)> = g.secrets.iter().map(|(k, v)| (k, secret_hex(v))).collect();
-        secrets.sort();
-        let sm: serde_json::Map<String, Value> = secrets.into_iter().map(|(k, v)| (k.clone(), v.into())).collect();
-        let mut doc = dumps_indent(&json!({"secrets": sm}), 2, false);
-        if let Some(ks) = &self.keystore {
-            doc = dumps_indent(&json!({"sealed": ks.seal(doc.as_bytes(), KEYS_AAD, None)?}), 2, false);
+        let doc = keys_doc(g);
+        let hash = doc_hash(&doc);
+        let mut on_disk = self.keys_seen();
+        if *on_disk != Some(hash) {
+            let out = match &self.keystore {
+                Some(ks) => dumps_indent(&json!({"sealed": ks.seal(doc.as_bytes(), KEYS_AAD, None)?}), 2, false),
+                None => doc,
+            };
+            write_private(&self.keys_path, &out)?;
+            *on_disk = Some(hash);
         }
-        write_private(&self.keys_path, &doc)?;
+        drop(on_disk);
         let chans: serde_json::Map<String, Value> = g.records.iter()
             .map(|(d, r)| (d.clone(), serde_json::to_value(r).unwrap_or(Value::Null))).collect();
         let mut body = json!({"channels": chans});
