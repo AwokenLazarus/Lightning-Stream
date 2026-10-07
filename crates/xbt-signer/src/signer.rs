@@ -272,6 +272,16 @@ impl Signer {
         };
         let session = Session::new(book.clone(), hot.clone(), node.clone(), transport, &chain, mine, config.open_wait_s as f64,
                                    config.close_fee_max_sats, config.refund_margin_blocks)?;
+        // AGP-063 W1: the signed increase is committed before the signature is sent. The txid is
+        // the channel and the cumulative amount, so a restart that signs nothing new does not book twice.
+        let engine_book = engine.clone();
+        session.set_spend_book(Arc::new(move |dest, delta, chan, cum| {
+            if delta <= 0 {
+                return Err(err("amount", "signed delta must be positive"));
+            }
+            engine_book.commit_once(&Payment::new(dest, delta, "xbt402 signed delta"), &format!("xbt402:{chan}:{cum}"))?;
+            Ok(())
+        }));
         let routing = RouteSigner::new(book.clone(), RoutePolicy::from_value(&config.routing), Some(&run.join("routing.json")),
                                        Some(engine.clone()), Some(opts.adaptor.clone().unwrap_or_else(|| Arc::new(crate::routing::Xbt402Adaptor))))?;
         let watch_interval = std::env::var("B2_WATCH_INTERVAL").ok().and_then(|v| v.parse().ok()).unwrap_or(10.0);
@@ -959,15 +969,11 @@ impl Signer {
         if result["verdict"] == "deny" || result["verdict"] == "pending" {
             return result;
         }
-        let charged = py_int(result.get("charged_sats")).unwrap_or(0);
-        if charged != 0 {
-            let chan = str_or_empty(result.get("chan"));
-            if let Err(e) = self.engine.commit(&Payment::new(&dest, charged, &pay.memo), &chan) {
-                return deny("xbt402", e.msg);
-            }
-        }
+        // The signed delta was committed inside the session, before the signature left (AGP-063).
+        // The seller's charged_sats is not a budget figure.
+        let booked = py_int(result.get("booked_sats")).unwrap_or(0);
         if let Some(t) = &grant {
-            self.use_xbt402_grant(t, charged);
+            self.use_xbt402_grant(t, booked);
             return with(with(d.as_value(), result), json!({"rail": "xbt402", "approved": true, "approval_token": t}));
         }
         with(with(d.as_value(), result), json!({"rail": "xbt402"}))

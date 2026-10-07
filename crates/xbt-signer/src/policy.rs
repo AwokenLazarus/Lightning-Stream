@@ -439,8 +439,12 @@ impl Payments {
     /// Apply one log line: a payment, or `{"amend": txid, "amount_sats": n | null}`.
     fn apply(&mut self, row: &Value, n: usize) -> Result<()> {
         let Some(txid) = row.get("amend").and_then(Value::as_str) else {
-            if row.get("dest").and_then(Value::as_str).is_none() || py_int(row.get("amount_sats")).is_none() || row.get("ts").and_then(Value::as_f64).is_none() {
+            let amount = py_int(row.get("amount_sats"));
+            if row.get("dest").and_then(Value::as_str).is_none() || amount.is_none() || row.get("ts").and_then(Value::as_f64).is_none() {
                 return Err(err("log", format!("{}: line {n} is not a payment", self.log.path.display())));
+            }
+            if amount.is_some_and(|a| a < 0) {
+                return Err(err("ledger", format!("{}: line {n} is a negative payment", self.log.path.display())));
             }
             self.entries.push(row_entry(row));
             return Ok(());
@@ -448,6 +452,7 @@ impl Payments {
         let i = self.entries.iter().rposition(|e| e.txid == txid)
             .ok_or_else(|| err("log", format!("{}: line {n} amends {txid:?}, which the log does not hold", self.log.path.display())))?;
         match py_int(row.get("amount_sats")) {
+            Some(a) if a < 0 => return Err(err("ledger", format!("{}: line {n} amends {txid:?} to a negative amount", self.log.path.display()))),
             Some(a) => self.entries[i].amount_sats = a,
             None => {
                 self.entries.remove(i);
@@ -569,6 +574,9 @@ impl PolicyStore {
     }
 
     pub fn commit(&self, e: &LedgerEntry) -> Result<()> {
+        if e.amount_sats < 0 {
+            return Err(err("amount", "negative ledger entry refused"));
+        }
         let mut pay = self.pay();
         pay.log.append(&entry_row(e))?; // durable before it counts
         pay.entries.push(e.clone());
@@ -585,6 +593,9 @@ impl PolicyStore {
     pub fn amend(&self, txid: &str, amount_sats: Option<i64>) -> Result<bool> {
         let mut pay = self.pay();
         let Some(i) = pay.entries.iter().rposition(|e| e.txid == txid) else { return Ok(false) };
+        if amount_sats.is_some_and(|n| n < 0) {
+            return Err(err("amount", "negative ledger entry refused"));
+        }
         pay.log.append(&json!({"amend": txid, "amount_sats": amount_sats}))?;
         match amount_sats {
             Some(n) => pay.entries[i].amount_sats = n,
@@ -686,8 +697,17 @@ impl PolicyEngine {
         (self.clock)()
     }
 
-    fn spent(ledger: &[LedgerEntry], window_s: f64, now: f64, dest: Option<&str>) -> i64 {
-        ledger.iter().filter(|p| now - p.ts <= window_s && dest.is_none_or(|d| p.dest == d)).map(|p| p.amount_sats).sum()
+    /// Sum of non-negative entries in the window. A negative entry is refused: it must not
+    /// lower a daily, weekly or per-seller total (AGP-063 W1).
+    fn spent(ledger: &[LedgerEntry], window_s: f64, now: f64, dest: Option<&str>) -> Result<i64> {
+        let mut n = 0i64;
+        for p in ledger.iter().filter(|p| now - p.ts <= window_s && dest.is_none_or(|d| p.dest == d)) {
+            if p.amount_sats < 0 {
+                return Err(err("ledger", "negative ledger entry"));
+            }
+            n = n.checked_add(p.amount_sats).ok_or_else(|| err("ledger", "ledger sum overflow"))?;
+        }
+        Ok(n)
     }
 
     fn count(ledger: &[LedgerEntry], window_s: f64, now: f64) -> i64 {
@@ -700,9 +720,9 @@ impl PolicyEngine {
         let cfg = &self.config();
         let allowlist = self.allowlist();
         let ledger = self.store.payments()?;
-        let daily = Self::spent(&ledger, DAY_S, now, None);
-        let weekly = Self::spent(&ledger, WEEK_S, now, None);
-        let cpty = Self::spent(&ledger, WEEK_S, now, Some(&p.dest));
+        let daily = Self::spent(&ledger, DAY_S, now, None)?;
+        let weekly = Self::spent(&ledger, WEEK_S, now, None)?;
+        let cpty = Self::spent(&ledger, WEEK_S, now, Some(&p.dest))?;
         let rd = (cfg.daily_budget_sats - daily).max(0);
         let rw = (cfg.weekly_budget_sats - weekly).max(0);
         let rc = (cfg.per_counterparty_cap_sats - cpty).max(0);
@@ -726,7 +746,7 @@ impl PolicyEngine {
         if p.amount_sats > cfg.max_per_tx_sats {
             return Ok(decide(Deny, "max_per_tx", format!("{} sats exceeds max_per_tx {}", p.amount_sats, cfg.max_per_tx_sats), None, None));
         }
-        let split_sum = Self::spent(&ledger, cfg.split_window_s as f64, now, Some(&p.dest)) + p.amount_sats;
+        let split_sum = Self::spent(&ledger, cfg.split_window_s as f64, now, Some(&p.dest))? + p.amount_sats;
         if split_sum > cfg.max_per_tx_sats {
             return Ok(decide(Deny, "split_bypass", format!("split window sum {split_sum} would exceed max_per_tx {}", cfg.max_per_tx_sats), None, None));
         }
@@ -760,6 +780,16 @@ impl PolicyEngine {
         self.evaluate(payment, false)
     }
 
+    /// Commit `txid` once. A repeat (the write-ahead ran, then the process restarted) does not
+    /// add a second row. `false` when this txid was already in the ledger.
+    pub fn commit_once(&self, payment: &Payment, txid: &str) -> Result<bool> {
+        if !txid.is_empty() && self.store.payments()?.iter().any(|e| e.txid == txid) {
+            return Ok(false);
+        }
+        self.commit(payment, txid)?;
+        Ok(true)
+    }
+
     /// Pop a still-valid unused token. Signature checks happen in the signer.
     pub fn consume_approval(&self, token: &str) -> Result<Option<Payment>> {
         if token.is_empty() {
@@ -786,6 +816,9 @@ impl PolicyEngine {
     }
 
     pub fn commit(&self, payment: &Payment, txid: &str) -> Result<()> {
+        if payment.amount_sats < 0 {
+            return Err(err("amount", "negative ledger entry refused"));
+        }
         let now = self.now();
         let p = payment.normalized(now);
         let ts = if p.ts != 0.0 { p.ts } else { now };
@@ -919,6 +952,22 @@ mod tests {
         // an amend whose row the log does not hold is damage
         fs::write(p.with_file_name("ledger.payments.jsonl"), "{\"kind\":\"payments\",\"v\":1}\n{\"amend\":\"gone\",\"amount_sats\":1}\n").unwrap();
         assert_eq!(PolicyStore::open(&p).err().map(|e| e.code), Some("log".to_string()));
+    }
+
+    #[test]
+    fn a_negative_entry_is_refused_and_a_negative_log_does_not_open() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("ledger.json");
+        let s = PolicyStore::open(&p).unwrap();
+        let neg = LedgerEntry { dest: "http://seller".into(), amount_sats: -10, ts: 1.0, txid: "n".into(), memo: "".into() };
+        assert_eq!(s.commit(&neg).unwrap_err().code, "amount");
+        assert!(s.payments().unwrap().is_empty());
+        assert_eq!(s.amend("n", Some(-1)).unwrap_err().code, "amount");
+        drop(s);
+        fs::write(p.with_file_name("ledger.payments.jsonl"),
+                  "{\"kind\":\"payments\",\"v\":1}\n{\"dest\":\"http://seller\",\"amount_sats\":-5,\"ts\":1.0,\"txid\":\"n\",\"memo\":\"\"}\n").unwrap();
+        fs::write(&p, "{\"approvals\":{},\"payments_log\":\"ledger.payments.jsonl\"}").unwrap();
+        assert_eq!(PolicyStore::open(&p).unwrap_err().code, "ledger");
     }
 
     #[test]

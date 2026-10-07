@@ -65,6 +65,11 @@ pub struct ChannelRecord {
     pub open_error: String,
     pub last_sig: String,
     pub acked_sats: i64,
+    /// AGP-063: cumulative sats already committed to the policy ledger for this channel.
+    /// `-1` (the serde default, so a file from before this field loads as already booked
+    /// through `used_sats`) does not re-book history. A channel opened here starts at 0,
+    /// and every signed increase is committed before the signature is sent.
+    pub ledger_booked_sats: i64,
     pub pending_lock: Value,
     pub given_up: Vec<Value>,
     /// AGP-055: the last resolved (or adopted) locks `{key, amount, hub, lockId, at}`, written with
@@ -85,7 +90,7 @@ impl Default for ChannelRecord {
                funding_vout: 0, funding_sats: 0, seq: 0, origin: String::new(), pending_cond: json!({}), state: "open".into(),
                closed_txid: String::new(), refund_txid: String::new(), open_height: 0, spent_sats: -1, open_url: String::new(),
                network: String::new(), min_conf: 0, funding_hex: String::new(), funding_height: 0, open_error: String::new(),
-               last_sig: String::new(), acked_sats: 0, pending_lock: json!({}), given_up: vec![], resolved: vec![], close_change: String::new(),
+               last_sig: String::new(), acked_sats: 0, ledger_booked_sats: -1, pending_lock: json!({}), given_up: vec![], resolved: vec![], close_change: String::new(),
                close_scan_from: 0, close_hex: String::new(), close_fee_payer: "payer".into() }
     }
 }
@@ -538,7 +543,7 @@ impl ChannelBook {
                         close_fee: p.close_fee as i64, payer_spk: hex::encode(&p.payer_spk), payee_spk: hex::encode(&p.payee_spk),
                         funding_txid: p.funding_txid(), funding_vout: p.funding_vout() as i64, funding_sats: p.capacity as i64, seq: 0,
                         origin: origin.into(), open_height, spent_sats: 0, close_fee_payer: p.close_fee_payer.as_str().into(),
-                        ..Default::default() }
+                        ledger_booked_sats: 0, ..Default::default() }
     }
 
     /// P1: record a channel and seal its payer key before its funding is broadcast. A pending or
@@ -679,6 +684,18 @@ impl ChannelBook {
         g.records.insert(dest.into(), rec.clone());
         self.persist(&g)?;
         Ok((rec, sig))
+    }
+
+    /// Remember that the policy ledger now holds this channel through `cum` (AGP-063 write-ahead).
+    pub fn mark_ledger_booked(&self, dest: &str, cum: i64) -> Result<()> {
+        let mut g = self.lock();
+        let k = Self::key_of(&g, dest)?;
+        let r = g.records.get_mut(&k).unwrap();
+        if cum > r.ledger_booked_sats {
+            r.ledger_booked_sats = cum;
+            self.persist(&g)?;
+        }
+        Ok(())
     }
 
     /// The caller (policy-checked) decided `cum`. Still refuses a cap breach. An already-signed
