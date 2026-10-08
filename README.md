@@ -1208,7 +1208,7 @@ and up.
 - xbt-wallet-ui, xbt-work-relay and xbt-wallet-mcp still served with `tiny_http`, so they kept T1's
   slowloris exposure until AGP-072 moved them to the same server ("One bounded HTTP server for every service (AGP-072)"). Moving xbt-work
   to v2 is a follow-up.
-- `scripts/conformance.sh` defaults to B1 at `~/xbt-rnd/b1-agp-068` until this merges.
+- The interop scripts' B1 default went back to `~/xbt-rnd/b1` when this merged.
 
 Tests: `crates/xbt402/tests/http_limits.rs` (`slow_bodies_do_not_stall_the_server`,
 `slow_heads_do_not_stall_the_server_and_are_cut_off`, `an_endless_header_line_is_refused`,
