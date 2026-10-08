@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use xbt402::client::Transport;
 use xbt402::http::{serve_listener, HttpService, UreqTransport};
-use xbt402::provider::HttpResponse;
+use xbt402::provider::{HttpResponse, PEER_HEADER};
 
 struct Echo;
 
@@ -177,4 +177,32 @@ fn a_body_cut_short_is_an_error() {
         "50 of 100 bytes came back as Ok with {} bytes",
         r.map(|r| r.body.len()).unwrap_or(0)
     );
+}
+
+struct Peers;
+
+impl HttpService for Peers {
+    fn body_limit(&self, _path: &str) -> usize {
+        1 << 10
+    }
+    fn serve(&self, _method: &str, _path: &str, headers: &[(String, String)], _body: &[u8], _url: &str) -> HttpResponse {
+        let peers: Vec<&str> = headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case(PEER_HEADER)).map(|(_, v)| v.as_str()).collect();
+        HttpResponse::new(200, vec![], peers.join(",").into_bytes())
+    }
+}
+
+#[test]
+fn the_peer_header_is_the_socket_peer_never_the_clients() {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    serve_listener(Arc::new(Peers), l, 2).unwrap();
+    let mut s = TcpStream::connect(&addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(format!("GET /admin/x HTTP/1.1\r\nHost: h\r\n{PEER_HEADER}: 203.0.113.9\r\nx-xbt402-peer: 203.0.113.10\r\nConnection: close\r\n\r\n").as_bytes())
+        .unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+    assert!(text.ends_with("\r\n\r\n127.0.0.1"), "only the socket's peer address reaches the service: {text}");
 }
