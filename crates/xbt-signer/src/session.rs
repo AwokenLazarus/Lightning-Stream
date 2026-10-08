@@ -127,6 +127,10 @@ pub type MineFn = Arc<dyn Fn(u64) -> Result<()> + Send + Sync>;
 /// `(dest, delta_sats, chan, cum)`.
 pub type SpendBook = Arc<dyn Fn(&str, i64, &str, i64) -> Result<()> + Send + Sync>;
 
+/// The policy's verdict on a signed increase larger than the amount it approved (a channel's
+/// dust floor). `(dest, max_sats, delta_sats)`; `Some(deny)` stops the call before anything is signed.
+pub type SpendCheck = Arc<dyn Fn(&str, i64, i64) -> Result<Option<Value>> + Send + Sync>;
+
 /// One signer-owned client session.
 pub struct Session {
     pub book: Arc<ChannelBook>,
@@ -140,6 +144,7 @@ pub struct Session {
     pub refund_margin: i64,
     net: Mutex<Option<String>>,
     spend_book: Mutex<Option<SpendBook>>,
+    spend_check: Mutex<Option<SpendCheck>>,
 }
 
 impl Session {
@@ -150,12 +155,17 @@ impl Session {
             return Err(err("chain", format!("a mining hook on {chain:?}: only regtest may mine")));
         }
         Ok(Self { book, hot, node, transport, chain: chain.into(), mine, open_wait_s, close_fee_max, refund_margin, net: Mutex::new(None),
-                  spend_book: Mutex::new(None) })
+                  spend_book: Mutex::new(None), spend_check: Mutex::new(None) })
     }
 
     /// The signer sets this so a signed increase is in the policy ledger before it leaves.
     pub fn set_spend_book(&self, book: SpendBook) {
         *self.spend_book.lock().unwrap_or_else(|p| p.into_inner()) = Some(book);
+    }
+
+    /// The signer sets this so a dust floor above `max_sats` is held to the budget too.
+    pub fn set_spend_check(&self, check: SpendCheck) {
+        *self.spend_check.lock().unwrap_or_else(|p| p.into_inner()) = Some(check);
     }
 
     pub fn height(&self) -> Result<u64> {
@@ -484,6 +494,12 @@ impl Session {
             return Ok(json!({"verdict": "deny", "rule": "max_sats", "charged_sats": 0,
                              "reason": format!("the next state signs {next} sat, {} more than the ledger holds; max_sats is {max_sats}",
                                                next - ledger_before)}));
+        }
+        if next - ledger_before > max_sats {
+            let check = self.spend_check.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            if let Some(d) = check.map(|c| c(&dest, max_sats, next - ledger_before)).transpose()?.flatten() {
+                return Ok(d);
+            }
         }
         let (rec, sig) = if resend {
             self.book.resend_state(&dest)? // same (cum, sig); do not sign a higher one (M3)

@@ -138,6 +138,19 @@ fn is_non_finite_token(s: &str) -> bool {
     )
 }
 
+/// AGP-063 W1: a channel's dust floor signs more than the amount the policy approved, so the
+/// budgets are checked again on the whole increase. A human-threshold verdict is a refusal here.
+fn floor_check(engine: &PolicyEngine, dest: &str, asked: i64, delta: i64, human: bool) -> Result<Option<Value>> {
+    let d = engine.evaluate_booking(&Payment::new(dest, asked, "dust floor"), delta, human)?;
+    if d.allowed() {
+        return Ok(None);
+    }
+    if let Some(t) = &d.approval_token {
+        engine.store.pop_approval(t)?;
+    }
+    Ok(Some(deny(&d.rule, format!("the channel's dust floor signs {delta} sat: {}", d.reason))))
+}
+
 pub fn deny(rule: &str, reason: impl Into<String>) -> Value {
     json!({"verdict": "deny", "rule": rule, "reason": reason.into()})
 }
@@ -291,6 +304,8 @@ impl Signer {
             engine_book.commit_once(&Payment::new(dest, delta, "xbt402 signed delta"), &format!("xbt402:{chan}:{cum}"))?;
             Ok(())
         }));
+        let engine_check = engine.clone();
+        session.set_spend_check(Arc::new(move |dest, asked, delta| floor_check(&engine_check, dest, asked, delta, false)));
         let routing = RouteSigner::new(book.clone(), RoutePolicy::from_value(&config.routing), Some(&run.join("routing.json")),
                                        Some(engine.clone()), Some(opts.adaptor.clone().unwrap_or_else(|| Arc::new(crate::routing::Xbt402Adaptor))))?;
         let watch_interval = std::env::var("B2_WATCH_INTERVAL").ok().and_then(|v| v.parse().ok()).unwrap_or(10.0);
@@ -845,7 +860,7 @@ impl Signer {
         sigaudit::set_rule(&if human { "human:approval_signature".to_string() } else { format!("policy:{}", d.rule) });
         let dest = pay.normalized(self.now()).dest;
         if self.uses_channel(&dest) {
-            return self.channel_pay(&pay, &dest, d.as_value());
+            return self.channel_pay(&pay, &dest, d.as_value(), human);
         }
         let xbt = format!("{:.8}", pay.amount_sats as f64 / XBT_SATS as f64);
         let txid = self.node.call("sendtoaddress", json!([pay.dest, xbt, pay.memo, "", false]))?;
@@ -854,7 +869,7 @@ impl Signer {
         Ok(with(d.as_value(), json!({"txid": txid, "rail": "onchain"})))
     }
 
-    fn channel_pay(&self, pay: &Payment, dest: &str, d: Value) -> Result<Value> {
+    fn channel_pay(&self, pay: &Payment, dest: &str, d: Value, human: bool) -> Result<Value> {
         if self.book.get(dest).is_none_or(|r| r.state != "open") {
             let opened = self.open_channel_locked(&json!({"dest": dest}))?;
             if opened["verdict"] == "deny" {
@@ -866,6 +881,11 @@ impl Signer {
             (_, Err(e)) => return Ok(deny(&e.code, e.msg)),
             (None, _) => return Ok(deny("unknown_channel", dest.to_string())),
         };
+        if cum - booked > pay.amount_sats {
+            if let Some(d) = floor_check(&self.engine, dest, pay.amount_sats, cum - booked, human)? {
+                return Ok(d);
+            }
+        }
         let txid = format!("xbt402:{chan}:{cum}");
         let added = cum > booked && self.engine.commit_once(&Payment { amount_sats: cum - booked, ..pay.clone() }, &txid)?;
         let rec = match self.book.increment(dest, pay.amount_sats) {
@@ -1106,10 +1126,15 @@ impl Signer {
                 Ok(r) => with(with(json!({"verdict": "allow", "rule": "free"}), r), json!({"rail": "xbt402"})),
             };
         }
+        // AGP-063 W1: on an open channel the most this call can book (price <= max_sats) is known
+        // before the 402, so the budgets are held to that
+        let bound = self.book.get(&dest).filter(|r| r.state == "open")
+            .and_then(|r| self.book.next_cum(&dest, max_sats).ok().map(|c| c - Session::booked_through(&r)))
+            .filter(|b| *b > 0).unwrap_or(max_sats);
         let pay = Payment::new(&dest, max_sats, &format!("xbt402 {method} {url}"));
         // AGP-039: a human-approved grant for exactly this call pays as B2's approve does (human = true)
         let grant = self.find_xbt402_grant(&dest, max_sats, &url, &method);
-        let d = match self.engine.evaluate(&pay, grant.is_some()) {
+        let d = match self.engine.evaluate_booking(&pay, bound, grant.is_some()) {
             Ok(d) => d,
             Err(e) => return deny("xbt402", e.msg),
         };

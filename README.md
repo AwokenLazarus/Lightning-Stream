@@ -881,9 +881,19 @@ what is booked; the answer reports it as `receipt_error`. The answer also carrie
 - **No negative rows.** A negative payment or amend row is refused, both when written and when the log
   is loaded, so a row can never lower a daily, weekly or per-seller total.
 - **Streams.** The stream budget is `max_sats` minus what was booked.
+- **The budget check.** The per-tx limit, the human threshold and approvals still apply to the amount
+  asked (`max_sats`, or `pay`'s `amount_sats`). The daily, weekly, per-seller and split sums apply to
+  what the call can book (`PolicyEngine::evaluate_booking`). On an open channel that is known before the
+  402: `next_cum(max_sats)` minus the booked amount. A call that fits the budget exactly is paid, even
+  when `max_sats` alone would not fit.
 - **The dust floor.** A new channel's first state signs the dust floor (546) when the price is below
-  it. Those 546 sats are booked and count against the budget, and that first state is allowed even
-  when `max_sats` is lower (500 in the runbook).
+  it. Those 546 sats are booked, and that first state is allowed even when `max_sats` is lower (500 in
+  the runbook). When the floor is more than the amount asked, the budgets are checked again on the whole
+  floor before anything is signed, on both rails (the session's `set_spend_check` hook for
+  `xbt402_pay`). A floor that does not fit is refused with the budget's rule, and the reason names the
+  dust floor. Tests: `w1_the_budget_is_checked_on_the_signed_increase_not_max_sats`,
+  `w1_a_dust_floor_above_the_remaining_budget_is_refused` and
+  `w1_the_dust_floor_on_the_pay_rail_is_held_to_the_budget`.
 - **Old records.** A record from before this field loads as booked through `used_sats` and does not
   gain the key, so B2 still loads it.
 
@@ -977,6 +987,8 @@ amount below the highest one signed (`stale_amount`) and advance it, as `sign_st
 | `fund` | `{address, sats}` | `{origin, params, address?, sats}`; `xbt402::client::Wallet::fund_channel` (`RemoteSigner` sends it) |
 | `xbt402_sign_rollover` | `{chan, amount, next_spk, next_capacity}` | the same plus `next` (the next channel's params); `StateSigner::sign_rollover_next` |
 | `xbt402_pay` answer | `charged_sats` | plus `booked_sats` and, for a bad receipt, `receipt_error` |
+| `xbt402_pay` / `pay` budget | sums held to `max_sats` / `amount_sats` | sums held to the signed increase; a dust floor above the budget is `deny/<budget rule>` |
+| `Session` (Rust) / `Xbt402Session` (B2) | `set_spend_book` | plus `set_spend_check(dest, max_sats, delta)` |
 | `rotate_hot_key` | no params | `{expiry, signature}` |
 | `deny_approval` | `{token, reason}` | plus `{expiry, signature}` while the approval is live |
 | `human_key_enroll` | `{pubkey}` | `{pubkey, code}` |

@@ -194,7 +194,8 @@ LND has none per macaroon.
 ## Budget integrity and privileged methods (AGP-063)
 
 Every signature that raises the signed amount is booked as the signed delta (`xbt402:<chan>:<cum>`)
-before it is sent, never the seller's `charged`. `minCapacity` above the owner's cap is
+before it is sent, never the seller's `charged`. The budget sums are held to that increase,
+including a channel's dust floor (`PolicyEngine::evaluate_booking`). `minCapacity` above the owner's cap is
 `deny/min_capacity`. A negative payment or amend is refused. `fund`, `open_channel`,
 `xbt402_attach` and `xbt402_sign_rollover` are bound to an issued key, the seller's verified payTo
 and the owner's bounds. `rotate_hot_key` and a live `deny_approval` need the human signature, and

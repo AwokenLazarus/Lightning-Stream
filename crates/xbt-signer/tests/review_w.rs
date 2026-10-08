@@ -115,6 +115,51 @@ fn w1_a_channel_payment_books_the_signed_delta_ahead_of_the_signature() {
     assert!(rows.contains(&format!("xbt402:{}:{cum}", r["chan"].as_str().unwrap())), "booked under the signed state's id");
 }
 
+/// W1: on an open channel the budget is held to the increase the call signs, so a call that
+/// fits exactly is paid even though max_sats alone would not fit.
+#[test]
+fn w1_the_budget_is_checked_on_the_signed_increase_not_max_sats() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let rig = Rig::new(json!({"daily_budget_sats": 1_000, "weekly_budget_sats": 1_000}), false);
+    rig.fund_hot(1, 12_000);
+    let r = rig.open();
+    assert_eq!(r["cum"], 546, "{r}");
+    let r = rig.pay();
+    assert_eq!((r["verdict"].as_str(), r["cum"].as_i64(), r["booked_sats"].as_i64()), (Some("allow"), Some(1_000), Some(454)), "{r}");
+    assert_eq!(ledger_sum(&rig), 1_000);
+    let r = rig.pay();
+    assert_eq!((r["verdict"].as_str(), rule(&r)), (Some("deny"), "daily_budget"), "{r}");
+    assert_eq!(ledger_sum(&rig), 1_000);
+}
+
+/// W1: a channel's first state signs the dust floor even for a smaller price; that floor must
+/// fit the budget too, on both rails, or nothing is signed or booked.
+#[test]
+fn w1_a_dust_floor_above_the_remaining_budget_is_refused() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let rig = Rig::new(json!({"daily_budget_sats": 520, "weekly_budget_sats": 520}), false);
+    rig.fund_hot(1, 12_000);
+    assert_eq!(rig.pay()["verdict"], "pending");
+    rig.chain.mine(1);
+    let r = rig.pay();
+    assert_eq!((r["verdict"].as_str(), rule(&r)), (Some("deny"), "daily_budget"), "{r}");
+    assert!(r["reason"].as_str().unwrap_or("").contains("dust floor"), "{r}");
+    assert_eq!(ledger_sum(&rig), 0, "the floor was neither booked nor signed");
+}
+
+#[test]
+fn w1_the_dust_floor_on_the_pay_rail_is_held_to_the_budget() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let rig = Rig::new(json!({"counterparties": {PROVIDER: {"pay_to": hex::encode(seller_pay_to())}}, "split_window_s": 0,
+                              "daily_budget_sats": 300, "weekly_budget_sats": 300}), false);
+    rig.fund_hot(1, 12_000);
+    let r = rig.call("pay", json!({"to": PROVIDER, "amount_sats": 100, "memo": "a"}));
+    assert_eq!((r["verdict"].as_str(), rule(&r)), (Some("deny"), "daily_budget"), "{r}");
+    assert_eq!(ledger_sum(&rig), 0);
+    let chans = rig.call("channels", json!({}));
+    assert!(chans["channels"].as_array().unwrap().iter().all(|c| c["used_sats"] == 0), "nothing signed: {chans}");
+}
+
 fn rule(v: &Value) -> &str {
     v["rule"].as_str().unwrap_or("")
 }
