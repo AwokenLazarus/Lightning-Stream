@@ -238,11 +238,12 @@ impl Session {
             None => 1,
             Some(v) => py_int(Some(v)).map(|x| x.max(0)).unwrap_or(1),
         };
+        let open_url = format!("{dest}{}", extra.get("openUrl").and_then(Value::as_str).unwrap_or(xbt402::wire::OPEN_PATH));
+        self.preflight(&open_url, &network, &params, funded, &fee_payer)?;
         let prep = self.hot.prepare_fund(&params.spk(), funded, DEFAULT_FEE)?;
         let params = params.with_funding(&prep.txid, 0, funded as u64)?;
         // P1 write-ahead: the payer key is sealed on disk, with everything the refund needs, before
         // the funding exists anywhere but here
-        let open_url = format!("{dest}{}", extra.get("openUrl").and_then(Value::as_str).unwrap_or(xbt402::wire::OPEN_PATH));
         self.book.add_pending(dest, secret, &params, dest, Some(cap), open_height, &open_url, &network, min_conf, &prep.hex)?;
         if let Err(e) = self.hot.broadcast(&prep) {
             self.book.drop_pending(dest, &params.channel_id())?;
@@ -252,6 +253,37 @@ impl Session {
         log_call("funding", json!({"dest": dest, "chan": params.channel_id(), "txid": prep.txid, "capacity": funded, "expiry": expiry,
                                    "min_conf": min_conf}));
         self.complete_open(dest, self.open_wait_s)
+    }
+
+    /// review C2: the provider says it opens a channel on exactly these terms before the funding
+    /// exists (a refusal after funding locks the coins until expiry). A provider from before the
+    /// preflight answers `bad_request` (no outpoint) once the terms it checks first have passed.
+    fn preflight(&self, open_url: &str, network: &str, params: &xbt402::channel::ChannelParams, funded: i64, fee_payer: &str) -> Result<()> {
+        let mut ch = json!({"capacity": funded, "expiry": params.expiry, "payerPub": hex::encode(params.payer_pub),
+                            "payerSpk": hex::encode(&params.payer_spk), "redeemScript": hex::encode(params.script())});
+        if fee_payer != "payer" {
+            ch["closeFeePayer"] = fee_payer.into();
+        }
+        let body = json!({"x402Version": 2, "network": network, "preflight": true, "channel": ch});
+        let resp = self.http("POST", open_url, dumps(&body).as_bytes(), &[("Content-Type".into(), "application/json".into())])
+            .map_err(|_| rt("open preflight failed: provider unreachable; nothing was funded"))?;
+        let reply: Option<Value> = serde_json::from_slice(&resp.body).ok();
+        if resp.status != 200 {
+            let code = reply.as_ref().and_then(|r| r.get("error")).and_then(Value::as_str).filter(|c| safe_code(c)).unwrap_or("");
+            if code == "bad_request" {
+                return Ok(());
+            }
+            let tail = if code.is_empty() { String::new() } else { format!(" {code}") };
+            return Err(rt(format!("open refused before funding: HTTP {}{tail}; nothing was funded", resp.status)));
+        }
+        let r = reply.unwrap_or(Value::Null);
+        if r.get("preflight") != Some(&Value::Bool(true)) {
+            return Err(rt("the provider did not answer the open preflight; nothing was funded"));
+        }
+        if r.get("closeFeePayer").and_then(Value::as_str).unwrap_or("payer") != fee_payer {
+            return Err(rt("the provider would open the channel with another closeFeePayer; nothing was funded"));
+        }
+        Ok(())
     }
 
     /// Confirmations of a channel's funding output; `None` when the node does not have it at all.

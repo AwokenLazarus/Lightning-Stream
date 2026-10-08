@@ -15,6 +15,13 @@
 //!                   [--prime-window N] [--prime-window-min-work W] [--window-tolerance-bps N]
 //!                   [--prime-fee-bps N] [--prime-min-payout S]
 //!                   [--max-unfunded-per-client N] [--trust-forwarded]
+//!                   [--data-dir DIR] [--watch-secs N]
+//!
+//! AGP-067 (review C4): the channel side keeps its payTo key (`DIR/payto.key`, created 0600 on first
+//! start) and its channel ledger (`DIR/channels.jsonl`, locked to one process) in `--data-dir`
+//! (`XBT_WORK_DATA_DIR`, default `./xbt-work-provider-data`), and a watcher runs `close_due` every
+//! `--watch-secs` (default 5): it closes each channel before its expiry and bumps a stuck close. A
+//! restart keeps every channel; before, a new random key and an empty ledger let each buyer refund.
 //!
 //! §13.1 caps (AGP-043): unaudited credit per invoice and in total, in work units, in sats converted
 //! at each epoch's price (without the haircut), or in calls at the `--price` (sats); `off` removes
@@ -53,9 +60,8 @@ use serde_json::{json, Value};
 use xbt402::funding::ChainBackend;
 use xbt402::http::{serve_service, HttpService, UreqTransport};
 use xbt402::ledger::Ledger;
-use xbt402::provider::{HttpResponse, Provider, ProviderConfig, PEER_HEADER};
+use xbt402::provider::{load_or_create_secret, HttpResponse, Provider, ProviderConfig, PEER_HEADER};
 use xbt402::rpc::Rpc;
-use xbt_primitives::secp256k1::SecretKey;
 use xbt_work::audit::{audit_block, check_fraud_proof};
 use xbt_work::book::CreditCaps;
 use xbt_work::chain::ChainBlock;
@@ -348,13 +354,28 @@ fn main() {
         eprintln!("xbt-work-provider: {e}");
         std::process::exit(2);
     }));
-    let mut sk = [0u8; 32];
-    getrandom::getrandom(&mut sk).expect("randomness");
+    let data = std::path::PathBuf::from(opt("--data-dir", "XBT_WORK_DATA_DIR").unwrap_or_else(|| "xbt-work-provider-data".into()));
+    let die = |e: xbt402::ChannelError| -> ! {
+        eprintln!("xbt-work-provider: {e}");
+        std::process::exit(2);
+    };
+    // the ledger first: its lock keeps a second process off this data dir, key file included
+    let ledger = Ledger::open(&data.join("channels.jsonl")).unwrap_or_else(|e| die(e));
+    let sk = load_or_create_secret(&data.join("payto.key")).unwrap_or_else(|e| die(e));
     let chain: Arc<dyn ChainBackend> = Arc::new(node.clone());
-    let prov = Arc::new(Provider::new(chain, SecretKey::from_slice(&sk).expect("key"), ProviderConfig::new(&net), Ledger::in_memory(),
+    let prov = Arc::new(Provider::new(chain, sk, ProviderConfig::new(&net), ledger,
                                       Box::new(move |_, p| if p.starts_with("/v1/") { price } else { 0 }),
-                                      Box::new(|_, p, _| answer(p))).expect("provider")
+                                      Box::new(|_, p, _| answer(p))).unwrap_or_else(|e| die(e))
         .with_scheme(Arc::new(WorkScheme(work.clone()))));
+    let (w, every) = (prov.clone(), num::<u64>("--watch-secs", "XBT_WORK_WATCH_SECS").unwrap_or(5).max(1));
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(every));
+        match w.close_due() {
+            Ok(closed) if !closed.is_empty() => eprintln!("watcher: closed {closed:?}"),
+            Ok(_) => {}
+            Err(e) => eprintln!("watcher: {e}"),
+        }
+    });
     // pull receipts through the relay, and follow the epoch (§6.3: re-price new 402s)
     let (w2, n2) = (work.clone(), node.clone());
     let pull_secs: u64 = arg("--pull-secs").map(|p| p.parse().expect("pull secs")).unwrap_or(3);
