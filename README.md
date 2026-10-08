@@ -1282,6 +1282,172 @@ Deliberately different from B2's Python: `gettxspendingprevout` reports mempool 
 Knots does (the Python also reported confirmed spends; the typed `spending_tx` still does), and the
 fee estimate is the median over servers (the Python took the first answer).
 
+## Light client and consensus edges (AGP-069, review E1–E3, S1, M1)
+
+The light backend now checks headers as Knots does from the first header above the checkpoint. It
+withholds answers while its chain is not believable, and a lying server can neither stall callers
+nor get a cheap fork believed. The hot wallet waits for the coinbase maturity the node reports. B2
+`agentwallet/headers.py`, `electrum.py`, `maturity.py` and `hot.py` on `agp-069` (`21db571`) and B1
+`xbt402/tx.py` on `agp-069` (`efd5770`) do the same, with the same test names (`test_` prefixed in
+Python). Knots line numbers below are v29.4.2.
+
+**Header rules (E3).** `HeaderChain` refuses:
+
+- a header whose top two flag bits are set (`bad-flags-highbits`, validation.cpp:4431);
+- a version below 4 once bit 31 is masked off (`bad-version`, 4757–4762);
+- a time not above the median of the 11 before it, from the first header above the checkpoint on
+  (4737);
+- on regtest, nBits other than the min-difficulty walk-back gives (pow.cpp:42–56,
+  `ChainRules::next_bits_with`);
+- any block other than the pinned one at a pinned height (`ChainRules::pins`; on mainnet 964264,
+  Knots' assumevalid block, chainparams.cpp:150).
+
+The median and the walk-back need the 10 headers below the checkpoint, so
+`set_checkpoint(raw, prior)` now takes `PRIOR_HEADERS` (10) 80-byte v1 headers. Each must hash-link
+to the one above it, and the last to the checkpoint. The backend fetches them from the servers, and
+they are never answered as ours. Testnet3, testnet4 (BIP94) and signet have no rules here, so
+`ChainRules::for_chain` refuses them and no chain starts.
+
+**Believable chain (E2).** On mainnet every chain answer fails with `Kind::Implausible` (B2:
+`ImplausibleChain`, status `"implausible"`) until the verified chain:
+
+- reaches every pinned block;
+- carries Knots' nMinimumChainWork (chainparams.cpp:149, the chainwork of 964264) less the
+  chainwork of 961640, which is 0x10c4284b5592c3c377 by Knots' `getblockheader`;
+- trails one block per 600 s since the newest pinned block by at most 2016 blocks.
+
+`Config.plausibility` overrides this (default `Plausibility::mainnet` on mainnet, none elsewhere)
+and `Config.clock` sets the clock in tests. A checkpoint of unknown chainwork gets no minimum work,
+but it still has to reach the pins.
+
+**TLS (E2).** On mainnet every server must be `ssl://`. `tcp://` is allowed only to a loopback host
+(`is_loopback_host`); anything else is `Kind::BadRequest` from `ElectrumBackend::new`.
+
+**Lying servers (E1).**
+
+- On mainnet a claimed tip is believed up to ours + (time since our tip / 150 s) + 2016
+  (`TIP_CAP_SPACING_S`). Nothing above that is fetched, and the server is flagged.
+  `Config.tip_cap_spacing_s` sets it; it is off by default elsewhere, because regtest mines blocks
+  as fast as it is asked to (the interop run's electrs were flagged until it was).
+- Each chunk is checked as it arrives (`HeaderChain::branch`, `Branch::extend`), so the first bad
+  header stops that server's sync. The branch is adopted only if it has more work and our chain
+  under it has not moved (`HeaderChain::adopt`).
+- No lock is held across a network read. Servers sync in parallel. Once a chain is held, a caller
+  that finds a sync running answers from the verified chain instead of waiting (a try-lock gate);
+  only before the first chain do callers wait.
+- Before a chain is held, a tip outside our powLimit means another chain: `Kind::CheckpointMismatch`,
+  as for a missing checkpoint.
+
+**Sighash (S1).** `unified_sighash_ext(…, SpendExt { annex, codesep_pos })` commits an annex as
+`0x01 ‖ sha256(compact_size ‖ annex)` (interpreter.cpp:1730–1732, 2152) and the position of the
+last executed OP_CODESEPARATOR after the leaf hash (1749). It refuses values the script type does not
+commit to: an annex outside taproot, an annex without the 0x50 tag, and a position outside
+tapscript. `unified_sighash` is `SpendExt::default()` and unchanged, so the 166 pinned vectors still
+match. B1's `unified_sighash` takes keyword-only `annex=` and `codesep_pos=`. Knots' REDUCED_DATA
+refuses any annex on mainnet until 2027-09-01 (2149–2150). For script type 0, `script_code` must
+already have this signature's pushes removed: Knots still runs FindAndDelete there (345–349), and
+the docs of both functions now say so. The 60 new vectors in `vectors/unified_sighash_ext.json`
+were computed with Knots' own Python test framework (`scripts/gen_unified_sighash_ext.py`); main
+matches 8 of them (the cases with neither an annex nor a codeseparator).
+
+**Coinbase maturity (M1).** The hot wallet learns which coins are coinbase outputs from
+`scantxoutset`, `gettxout`, and a funding transaction's `vin[0].coinbase`. Such a coin is spendable
+once tip + 1 ≥ h + max(depth, 100), with the depth from the node's `getdeploymentinfo`
+`long_coinbase_maturity` (Knots' mempool holds every coinbase spend to that depth,
+validation.cpp:1021–1022). A node that cannot say holds them: the light backend has no
+`getdeploymentinfo`, so a light hot wallet does not spend coinbase coins. `fund`, `rotate`, the
+sweeps and `status` (`hot_coinbase_sats`) all use it. `Maturity` moved from xbt-work to
+`xbt402::maturity` (xbt-work re-exports it), so the signer does not depend on xbt-work.
+
+**CAIP-2.** `network.rs` now says why XBT's id is keyed to block 961640 and not genesis: a
+genesis-keyed id would be Bitcoin's own.
+
+**Embedders.**
+
+| change | who must act |
+|---|---|
+| The header store records the priors; a store from an older release is ignored and the chain resyncs from the checkpoint once | nobody (one resync) |
+| `set_checkpoint(raw, prior)`; `HeaderChain::new` takes `impl Fn() -> u64` (was `Box<dyn Fn>`); `Header` gains `version` and `flags` | anyone driving `HeaderChain` directly |
+| Mainnet light backend: `ssl://` only, except loopback | configs listing `tcp://` mainnet servers |
+| New `Kind::Implausible`: retry later, as for `NotFound` | exhaustive matches on `Kind` |
+| Servers must serve the 10 v1 headers below the checkpoint (`blockchain.block.headers`; electrs does) | operators of other Electrum servers |
+| Coin records gain `"coinbase": true, "height": h` (only on coinbase coins); spending them needs `getdeploymentinfo` | hot-wallet users with mined coins |
+| `xbt_work::chain::Maturity` is `xbt402::maturity::Maturity` | nobody (re-exported) |
+
+cmp, xbt-compute, B5 and xbt-063 pin their own copies and are unaffected until they re-pin.
+Nothing on the xbt402 wire changes, and `scripts/conformance.sh` is unchanged (253/253).
+
+Choices (best-performing-stack rule; the code ships in the existing Rust crates, with the Python
+references kept in step, and adds no dependencies):
+
+| question | options | chosen, and why |
+|---|---|---|
+| not stalling on a slow or lying server | one lock across reads (main); a background sync thread with a channel; a try-lock gate | **the gate**: no new thread or state, and callers keep answering from the verified chain |
+| when headers are checked | after a whole batch (main); per chunk as it arrives; one request per header | **per chunk**: the first bad header ends the fetch, and the round trips stay batched |
+| how high a claimed tip to believe | anything; a fixed cap; a cap from elapsed time | **elapsed time** (4× the target block rate, plus 2016): a real tip always fits |
+| the headers under the checkpoint | skip the median for the first 10 (main); ship them in the binary; fetch and hash-link them | **fetch**: an operator checkpoint works too, and the hash link adds no trust in the server |
+| coinbase depth | hard-code the #419 schedule; ask the node | **the node**: it is what the mempool enforces; unknown means hold |
+| annex and codeseparator | more arguments on `unified_sighash`; a new function | **`unified_sighash_ext`**: no caller or pinned vector changes |
+
+**Cost.** Pass line declared before measuring:
+
+- (a) per 2016-header chunk, validation costs at most 10% more than on main;
+- (b) on armv7 (Cortex-A7 class), the catch-up from 961640 to a tip about 10,000 headers above it
+  takes at most 10 s of CPU, and the priors at most 10 ms;
+- (c) the plausibility check on every answer costs at most 1 µs on x86.
+
+`cargo run --release -p xbt-primitives --example header_cost` on a Ryzen 9 9950X3D, three runs
+interleaved with the same example built on main:
+
+| per header (8064 synthetic headers) | agp-069 | main |
+|---|---|---|
+| parse (BLAKE2b) and PoW alone | 810 ns | 820 ns |
+| connect, mainnet's path (no min-difficulty walk) | 940–950 ns | 950–1004 ns |
+| connect, regtest rules | 2176–2250 ns | 961–1011 ns |
+| the 61 real mainnet headers from 961640, checkpoint included | 974–990 ns | 945–973 ns |
+
+- Mainnet passes (a): no difference on its path, and +3% on the real headers.
+- **Regtest fails (a) at +125%.** All of it is Knots' min-difficulty walk-back, which on regtest
+  walks to the last 2016 boundary for every header. Mainnet never runs it. It is kept because it is
+  the Knots rule; 8064 regtest headers still take 18 ms.
+- The checkpoint with its priors costs 2.3 µs (main 0.9 µs). `branch()` at the tip copies the last
+  2016 headers once per sync round, 31 µs. `implausible()` costs 8.4 ns per answer, which passes (c).
+- There was no armv7 box or emulator, so (b) is an estimate. The armv7 build of the example
+  compiles. BLAKE2b is 64-bit arithmetic, roughly 50–100× slower per header on a 900 MHz Cortex-A7,
+  so 10,000 headers take about 0.5–1 s and the priors well under 1 ms. That passes.
+
+**What this does not fix.**
+
+- Above pin 964264 a fork is still cheap: difficulty there is `1a00f0b5`, about 2^53 hashes per
+  block. The floor only raises the bar for a fork that also hides the real tip. Releases should bump
+  the pins, and operators can set a later checkpoint.
+- A call that fans out to every server waits for the slowest one, up to the timeout (no lock held).
+- One batch can fetch up to 4×2016 junk headers before the first is checked (B2 fetches chunk by
+  chunk).
+- If blocks really did come much slower than one per 600 s for weeks, the floor would withhold
+  answers until the pins are bumped.
+- A light hot wallet cannot spend coinbase coins (fail closed).
+
+Tests, each failing on main first:
+
+- `crates/xbt-primitives/tests/header_chain.rs`: `e3_flags_highbits_and_version`,
+  `e3_median_time_from_the_first_header`, `e3_min_difficulty_walk_back`,
+  `pinned_heights_refuse_any_other_block`, `unsupported_test_networks_fail_closed`,
+  `a_branch_validates_as_it_grows` and `mainnet_checkpoint_with_its_real_priors` (the 71 real
+  headers 961630–961700 from xbt-snapshot, `vectors/mainnet_headers_961630.json`). Unit test: `mainnet_minimum_work`.
+- `crates/xbt-electrum/tests/backend.rs`:
+  - `mainnet_needs_tls`;
+  - `hostile_lying_server_cannot_stall`: main gives no answer within 10 s, and a slow server holds a
+    caller 1.2 s;
+  - `hostile_cheap_fork_is_not_believed`: main shows 20 confirmations on the fork;
+  - `tip_cap_is_mainnet_only`.
+- `crates/xbt-primitives/tests/sighash_ext.rs`: `s1_annex_and_codesep_vectors_match_knots` and
+  `s1_refuses_values_the_script_type_does_not_commit_to`.
+- `crates/xbt-signer/tests/review_e.rs`: `m1_coinbase_waits_for_the_node_maturity`,
+  `m1_coinbase_waits_when_the_node_cannot_say` and
+  `m1_coinbase_flag_from_gettxout_and_the_transaction`. On main the wallet spends a block-200
+  coinbase at block 299. Unit test: `maturity_from_the_node`.
+
 ## Pay-with-work: xbt-work (AGP-032)
 
 `crates/xbt-work` implements the x402 scheme `xbt-work` (v1 draft, XBT-053 `agp-011`

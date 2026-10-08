@@ -122,6 +122,10 @@ pub struct Config {
     pub extra_ca: Vec<PathBuf>,
     /// None: [`Plausibility::mainnet`] on mainnet, no check elsewhere.
     pub plausibility: Option<Plausibility>,
+    /// A claimed tip is believed up to one block per this many seconds since our tip's time, plus
+    /// [`HEADERS_CHUNK`]. None: [`TIP_CAP_SPACING_S`] on mainnet, no cap elsewhere (regtest mines
+    /// blocks as fast as it is asked to).
+    pub tip_cap_spacing_s: Option<u64>,
     /// The current unix time (the 2 h future rule, the tip cap, the height floor); None: the system clock.
     pub clock: Option<Clock>,
 }
@@ -132,7 +136,7 @@ impl std::fmt::Debug for Config {
             .field("checkpoint", &self.checkpoint).field("store_path", &self.store_path).field("timeout", &self.timeout)
             .field("min_servers", &self.min_servers).field("sync_interval", &self.sync_interval)
             .field("extra_ca", &self.extra_ca).field("plausibility", &self.plausibility)
-            .field("clock", &self.clock.as_ref().map(|_| "custom")).finish()
+            .field("tip_cap_spacing_s", &self.tip_cap_spacing_s).field("clock", &self.clock.as_ref().map(|_| "custom")).finish()
     }
 }
 
@@ -148,6 +152,7 @@ impl Config {
             sync_interval: Duration::from_secs(1),
             extra_ca: Vec::new(),
             plausibility: None,
+            tip_cap_spacing_s: None,
             clock: None,
         }
     }
@@ -331,6 +336,7 @@ pub struct ElectrumBackend {
     cp: (u32, [u8; 32]),
     rules: ChainRules,
     plausibility: Option<Plausibility>,
+    tip_cap_spacing_s: Option<u64>,
     clock: Clock,
     /// Held by the one sync in flight; callers with a verified chain do not wait for it.
     sync_gate: Mutex<()>,
@@ -391,6 +397,7 @@ impl ElectrumBackend {
             cp,
             rules: headers.rules.clone(),
             plausibility,
+            tip_cap_spacing_s: cfg.tip_cap_spacing_s.or((chain == Chain::Main).then_some(TIP_CAP_SPACING_S)),
             clock,
             sync_gate: Mutex::new(()),
             inner: Mutex::new(Inner {
@@ -613,7 +620,9 @@ impl ElectrumBackend {
             return Ok(());
         }
         let elapsed = (self.clock)().saturating_sub(our_time);
-        let cap = (ours as u64 + elapsed / TIP_CAP_SPACING_S + HEADERS_CHUNK as u64).min(u32::MAX as u64) as u32;
+        let cap = self.tip_cap_spacing_s.map_or(u32::MAX, |s| {
+            (ours as u64 + elapsed / s.max(1) + HEADERS_CHUNK as u64).min(u32::MAX as u64) as u32
+        });
         let end = th.min(cap);
         if th > cap {
             self.flag(&c.url, format!("headers: claims tip {th}, beyond the plausible {cap}: nothing above it is fetched"));

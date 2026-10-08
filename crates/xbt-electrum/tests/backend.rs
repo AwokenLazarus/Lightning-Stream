@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use xbt402::funding::ChainBackend;
 use xbt_electrum::sim::{mine_header, FakeElectrum, Forge, SimChain, CHECKPOINT, REGTEST_BITS, T0, TEST_CA};
+use xbt_electrum::backend::TIP_CAP_SPACING_S;
 use xbt_electrum::{scripthash, Config, ElectrumBackend, Kind, Plausibility, TxStatus};
 use xbt_primitives::header::U512;
 use xbt_primitives::tx::TxOut;
@@ -513,6 +514,7 @@ fn hostile_lying_server_cannot_stall() {
     }
     let mut c = cfg(&chain, &[&liar, &honest]);
     c.timeout = Duration::from_secs(5);
+    c.tip_cap_spacing_s = Some(TIP_CAP_SPACING_S);
     let b = Arc::new(ElectrumBackend::new(c).unwrap());
     let t = Instant::now();
     assert_eq!(b.block_count().unwrap(), 300);
@@ -539,6 +541,27 @@ fn hostile_lying_server_cannot_stall() {
     assert!(b.flags().len() < 60);
     assert!(t.elapsed() < Duration::from_millis(700), "held up {:?} by the slow server's sync", t.elapsed());
     assert_eq!(syncing.join().unwrap().unwrap(), 301, "the honest server's block still arrives");
+}
+
+/// review E1: the tip cap is a mainnet rule (regtest mines as fast as it is asked to); where it is set,
+/// a chain that outran it is caught up over more than one sync, and the server is flagged.
+#[test]
+fn tip_cap_is_mainnet_only() {
+    let chain = sim(CHECKPOINT + 4_000); // 60 s blocks: faster than one per 150 s
+    let tip_time = (T0 + 60 * (CHECKPOINT + 4_000)) as u64;
+    let s = servers(&chain, 1);
+    let mut c = cfg(&chain, &[&s[0]]);
+    c.clock = Some(Arc::new(move || tip_time));
+    let b = ElectrumBackend::new(c.clone()).unwrap();
+    assert_eq!(b.block_count().unwrap(), CHECKPOINT + 4_000);
+    assert!(b.flags().is_empty(), "{:?}", b.flags());
+
+    c.tip_cap_spacing_s = Some(TIP_CAP_SPACING_S);
+    let capped = ElectrumBackend::new(c).unwrap();
+    let cap = CHECKPOINT + 60 * 4_000 / TIP_CAP_SPACING_S as u32 + 2016;
+    assert_eq!(capped.block_count().unwrap(), cap);
+    assert!(capped.flags().iter().any(|f| f.reason.contains("beyond the plausible")), "{:?}", capped.flags());
+    assert_eq!(capped.sync(true).unwrap(), CHECKPOINT + 4_000);
 }
 
 /// review E2: a fresh client whose only server serves the real checkpoint and then a few cheap
