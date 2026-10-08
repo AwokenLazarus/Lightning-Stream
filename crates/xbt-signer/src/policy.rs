@@ -591,11 +591,11 @@ impl PolicyStore {
     /// worst case before it was sent) becomes what was actually spent, or goes when nothing was
     /// (`None`). `false`: no such row. The audit log keeps the history.
     pub fn amend(&self, txid: &str, amount_sats: Option<i64>) -> Result<bool> {
-        let mut pay = self.pay();
-        let Some(i) = pay.entries.iter().rposition(|e| e.txid == txid) else { return Ok(false) };
         if amount_sats.is_some_and(|n| n < 0) {
             return Err(err("amount", "negative ledger entry refused"));
         }
+        let mut pay = self.pay();
+        let Some(i) = pay.entries.iter().rposition(|e| e.txid == txid) else { return Ok(false) };
         pay.log.append(&json!({"amend": txid, "amount_sats": amount_sats}))?;
         match amount_sats {
             Some(n) => pay.entries[i].amount_sats = n,
@@ -967,7 +967,10 @@ mod tests {
         fs::write(p.with_file_name("ledger.payments.jsonl"),
                   "{\"kind\":\"payments\",\"v\":1}\n{\"dest\":\"http://seller\",\"amount_sats\":-5,\"ts\":1.0,\"txid\":\"n\",\"memo\":\"\"}\n").unwrap();
         fs::write(&p, "{\"approvals\":{},\"payments_log\":\"ledger.payments.jsonl\"}").unwrap();
-        assert_eq!(PolicyStore::open(&p).unwrap_err().code, "ledger");
+        match PolicyStore::open(&p) {
+            Err(e) => assert_eq!(e.code, "ledger"),
+            Ok(_) => panic!("a negative payments log must not open"),
+        }
     }
 
     #[test]

@@ -191,6 +191,14 @@ REST listener itself: bind `restlisten` to a private interface or loopback (with
 tunnel) and firewall it to the signer's host. The signer's own `max_sends_per_hour` is the rate limit;
 LND has none per macaroon.
 
+## Budget integrity (AGP-063)
+
+`xbt402_pay` commits the signed increase (`used_sats` minus what the ledger already holds for that
+channel) before the payment signature is sent. The seller's `charged` is checked (signature, request
+binding, not negative, not above the quote) and is not the amount booked. `minCapacity` above the
+owner's per-channel funding cap is `deny/min_capacity`. A negative payment or amend is refused.
+See the workspace README section "Agent-wallet budget integrity (AGP-063, W1 and W2)".
+
 ## Files and durability (AGP-055)
 
 One process owns a wallet directory. The files are B2's, byte format included: a directory written

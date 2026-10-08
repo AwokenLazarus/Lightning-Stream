@@ -67,8 +67,10 @@ pub struct ChannelRecord {
     pub acked_sats: i64,
     /// AGP-063: cumulative sats already committed to the policy ledger for this channel.
     /// `-1` (the serde default, so a file from before this field loads as already booked
-    /// through `used_sats`) does not re-book history. A channel opened here starts at 0,
-    /// and every signed increase is committed before the signature is sent.
+    /// through `used_sats`) does not re-book history and is not written, so an old record
+    /// keeps B2's field set. A channel opened here starts at 0, and every signed increase
+    /// is committed before the signature is sent.
+    #[serde(skip_serializing_if = "ledger_booked_is_legacy")]
     pub ledger_booked_sats: i64,
     pub pending_lock: Value,
     pub given_up: Vec<Value>,
@@ -93,6 +95,10 @@ impl Default for ChannelRecord {
                last_sig: String::new(), acked_sats: 0, ledger_booked_sats: -1, pending_lock: json!({}), given_up: vec![], resolved: vec![], close_change: String::new(),
                close_scan_from: 0, close_hex: String::new(), close_fee_payer: "payer".into() }
     }
+}
+
+fn ledger_booked_is_legacy(v: &i64) -> bool {
+    *v < 0
 }
 
 fn has_lock(v: &Value) -> bool {

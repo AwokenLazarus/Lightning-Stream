@@ -859,6 +859,24 @@ then cannot bind it (`Address already in use`; it cost three runs their start to
 therefore waits for a process's "ready" line before it polls its port, and starts one that exited
 before that line again.
 
+## Agent-wallet budget integrity (AGP-063, W1 and W2)
+
+`xbt402_pay` books the **signed delta**: the cumulative amount signed after the call, minus the
+amount already in the policy ledger. It does not book `charged` from the seller's PAYMENT-RESPONSE.
+The receipt is still checked: the payee's signature, the request digest, a non-negative `charged`,
+and `charged` no higher than the quoted price. A negative ledger row is refused (it cannot lower a
+daily, weekly or per-seller total). The commit happens before the signature is sent; the ledger
+txid is `xbt402:<chan>:<cum>`, so a restart books that increase once.
+
+An offer whose `minCapacity` is above the owner's per-channel cap (the cap plus the payer's close
+fee, which is what `minCapacity` bounds) is refused with `min_capacity` before any funding. The
+seller cannot raise the cap. Tests: `crates/xbt-signer/tests/review_w.rs`. A channel opened here
+records `ledger_booked_sats` (0 at open). A record from before this field loads as already booked
+through `used_sats` and does not gain the key, so B2 still loads it.
+
+The first state on a new channel signs the dust floor when that is above the price (546 rather than
+500 in the runbook). That 46 sats is part of the signed delta and counts against the budget.
+
 ## Portability
 
 No platform-specific dependencies: libsecp256k1 (C, via `secp256k1-sys`), pure-Rust hashes and JSON,
