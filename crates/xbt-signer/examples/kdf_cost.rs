@@ -15,6 +15,6 @@ fn main() {
             }
             best = best.min(t.elapsed().as_secs_f64() * 1e3);
         }
-        println!("scrypt log_n={log_n} r=8 p=1 mem={} MiB: {best:.0} ms", (128u64 * 8 << log_n) >> 20);
+        println!("scrypt log_n={log_n} r=8 p=1 mem={} MiB: {best:.0} ms", ((128u64 * 8) << log_n) >> 20);
     }
 }
