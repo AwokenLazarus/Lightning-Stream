@@ -611,7 +611,9 @@ impl Client {
     }
 
     fn expiry_blocks(&self, ex: &Value) -> Result<u32> {
-        let lo = ex_u64(ex, "minExpiryBlocks")? + 6;
+        // the provider's funding check also wants `left >= minExpiry + closeMargin`, and its policy
+        // default margin is 36
+        let lo = (ex_u64(ex, "minExpiryBlocks")? + 6).max(ex_u64(ex, "minExpiryBlocks")? + 36);
         let hi = ex_u64(ex, "maxExpiryBlocks")?.saturating_sub(1);
         u32::try_from((self.cfg.expiry_blocks as u64).max(lo).min(hi)).map_err(|_| ChannelError::new("bad_offer", "expiry blocks"))
     }

@@ -10,7 +10,7 @@ cd "$(dirname "$0")/../.."
 ROOT=$PWD
 X63=${XBT063:-$HOME/xbt-rnd/xbt-063-agp-074}
 PY=$HOME/xbt-rnd/xbt-063/.venv/bin/python
-B2=${B2_TREE:-$HOME/xbt-rnd/b2}
+B2=${B2_TREE:-$HOME/xbt-rnd/b2-agp-074}
 SOAK=(systemd-run --user --scope -q -p CPUQuota=200% -p MemoryMax=4G nice -n 19)
 declare -a RES=()
 step() {   # label, command...
