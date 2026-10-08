@@ -165,9 +165,10 @@ pub(crate) fn with(mut v: Value, extra: Value) -> Value {
 }
 
 /// The longest channel an external client may open or roll into, in blocks from now (AGP-063 W3):
-/// the policy's `channel_expiry_blocks`, but at least four weeks so a provider's minimum fits.
-fn max_expiry_blocks(cfg: &PolicyConfig) -> i64 {
-    cfg.channel_expiry_blocks.max(4032)
+/// the policy's `channel_expiry_blocks`, but at least four weeks so a provider's minimum fits. A
+/// routed ch1 must outlive the hub's ch2 to a provider, so a routing hub gets twice that.
+fn max_expiry_blocks(cfg: &PolicyConfig, hub: bool) -> i64 {
+    cfg.channel_expiry_blocks.max(4032) * if hub { 2 } else { 1 }
 }
 
 fn trunc(s: &str, n: usize) -> String {
@@ -963,8 +964,8 @@ impl Signer {
             return Ok(deny("channel_cap", format!("cap_sats {cap} is above per_counterparty_cap_sats {}", cfg.per_counterparty_cap_sats)));
         }
         let blocks = py_int(p.get("expiry_blocks")).unwrap_or(0);
-        if blocks != 0 && (blocks <= cfg.refund_margin_blocks || blocks > max_expiry_blocks(&cfg)) {
-            return Ok(deny("expiry", format!("expiry_blocks {blocks} outside ({}, {}]", cfg.refund_margin_blocks, max_expiry_blocks(&cfg))));
+        if blocks != 0 && (blocks <= cfg.refund_margin_blocks || blocks > max_expiry_blocks(&cfg, false)) {
+            return Ok(deny("expiry", format!("expiry_blocks {blocks} outside ({}, {}]", cfg.refund_margin_blocks, max_expiry_blocks(&cfg, false))));
         }
         let close_fee = py_int(p.get("close_fee")).unwrap_or(0);
         if close_fee < 0 || (cfg.close_fee_max_sats > 0 && close_fee > cfg.close_fee_max_sats) {
@@ -1022,8 +1023,10 @@ impl Signer {
         }
         let h = self.height()?;
         let rel = p.expiry as i64 - h;
-        if rel <= cfg.refund_margin_blocks || rel > max_expiry_blocks(&cfg) {
-            return Err(err("expiry", format!("expiry {} is {rel} blocks away, outside ({}, {}]", p.expiry, cfg.refund_margin_blocks, max_expiry_blocks(&cfg))));
+        let hub = crate::routing::RoutePolicy::from_value(&cfg.routing).hubs.iter().any(|(d, _, _)| *d == normalize_dest(origin));
+        let most = max_expiry_blocks(&cfg, hub);
+        if rel <= cfg.refund_margin_blocks || rel > most {
+            return Err(err("expiry", format!("expiry {} is {rel} blocks away, outside ({}, {most}]", p.expiry, cfg.refund_margin_blocks)));
         }
         Ok(())
     }
