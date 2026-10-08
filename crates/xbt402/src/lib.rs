@@ -29,6 +29,7 @@ pub mod conditional;
 pub mod error;
 pub mod funding;
 pub mod hub;
+pub mod hub_keys;
 pub mod json;
 pub mod ledger;
 pub mod maturity;

@@ -886,6 +886,7 @@ that gap closed ch1 below the lock, and the provider was still paid on ch2.
 * A ch1 lock that no route is forwarding and that sits on no ch2 can never complete: the hub
   stopped between its two write-aheads, or the `withhold "all"` test hook was used. The hub drops
   it when the client asks to close (`orphan_lock_dropped`), so it does not keep ch1 from closing.
+  (AGP-073: the watcher sweeps these too, and holds one its ch2 wrote off.)
   This is checked under the provider's busy flag, which `route()` holds from before it writes the
   lock until its forward ends, so a lock in flight is never dropped.
 
@@ -971,8 +972,8 @@ changed with H2, because a provider's refusal now blocks that ch2:
   the held base, and once by rerouting the same service. The provider's own meter credit is out of
   the hub's reach.
 * A provider that refuses after taking the pre-signature stops its ch2 for that ch2's lifetime
-  (close or refund). This is the spec's choice (no route over a stale ch2). The follow-up would be
-  to close and refill such a ch2 early.
+  (close or refund). This is the spec's choice (no route over a stale ch2). The follow-up was to
+  close and refill such a ch2 early: AGP-073 does.
 
 ## Agent-wallet budget integrity and privileged methods (AGP-063)
 
@@ -1454,6 +1455,144 @@ the MCP holds a body that never comes for over 60 s. The server's edges are in
 `crates/xbt-svc/tests/http_server.rs` (HEAD and 204, header injection, a panicking handler, the
 Content-Length rules and 100-continue, the socket peer, stop). xbt402's `http_limits.rs` passes
 unchanged. Each slow-body test waits for the 30 s body deadline.
+
+## Hub follow-ups: sealed ch2 keys, written-off ch2s, orphan locks, preflight (AGP-073)
+Four follow-ups from AGP-063 (K1) and from the trade-offs of AGP-064 and AGP-067. The same changes
+are in B1 `agp-073`, with the same test names. All the tests below fail on `main` (`20900a0`) and pass
+here.
+
+**K1: the ch2 payer keys are sealed at rest.** The hub's state file (`<datadir>/ch2.json`) held every
+ch2 payer key in plaintext: the live and next ch2s, the archive, and a rollover's next ch2 written
+ahead inside a record. Each key is now stored as `secret_sealed` in the B2 keystore's blob format:
+`{"v":1,"alg":"aes-256-gcm","kdf":"keyfile","salt":"","nonce","ct","aad":"xbt402/hub-ch2"}`. The rest
+of each record stays readable, for the operator and the reconcile tools.
+* **The wrap key** is 32 random bytes, kept in a file of mode 0600 (32 raw bytes or 64 hex). It is
+  made with `O_EXCL`, and a file that is not regular or is open to group or others is refused
+  (`keystore`). `xbt402-hub` takes it from the config's `wrap_key_file`. Failing that, in a container
+  or with `XBT_SECRETS_DIR`, it uses the secret `hub-wrap-key`, made on first start. Otherwise it uses
+  `<datadir>/hub-wrap-key` and logs a warning: beside the file it seals, it only protects copies of
+  `ch2.json` made without it.
+* **On load**, every blob is opened with the wrap key. The hub refuses to start (`keystore`) if a blob
+  does not open (another wrap key, a changed file), or if a key is not its record's `payer_pub` (a blob
+  moved to another record; checked for every record not yet final).
+* **A legacy file** with plaintext keys is read once and rewritten sealed at startup. The event is
+  `ch2_keys_sealed {count}`, with a line on stderr. The old file's blocks and any backups still hold
+  the keys.
+* A save seals only keys it has not sealed before (each blob is cached in memory), so a write does no
+  AES work once a ch2 is funded. The temp file is created 0600 before the rename.
+
+Design comparison (the best-performing-stack rule):
+
+| option | per-write cost | file readable | unattended restart |
+|---|---|---|---|
+| **per-key AES-256-GCM, cached blobs (chosen)** | a cache lookup per key (31 µs armv7, 10 records) | yes, except the keys | yes |
+| whole-file AES-256-GCM | encrypt the whole file on every write, growing with the archive | no | yes |
+| passphrase KDF (scrypt or Argon2) for the wrap key | as chosen | as chosen | no: an operator at every start |
+
+Per key keeps the write path flat on small boards and the file inspectable. `kdf: "keyfile"` leaves
+room for a passphrase later. The Rust side uses RustCrypto's `aes-gcm` and `zeroize`: pure Rust, no C,
+builds for every target in the matrix, and already in the lock through `xbt-signer` (whose keystore
+cannot be reused: `xbt-signer` depends on `xbt402`). No new duplicates in `cargo tree -d`. B1 uses
+`cryptography` (now in `requirements.txt`; only `xbt402.hub_keys` imports it).
+
+**A ch2 blocked by a written-off lock is closed early.** AGP-064 blocks routing and rollover over a ch2
+with a written-off lock until the ch2 closes or is refunded, which could be its whole life. The
+watcher now asks the provider to close that ch2 at once, once a block until it does, with the best
+state (`ch2_close`, `why: "written_off"`). A close that shows t pays the held lock on ch1; one that
+confirms without t releases the hold (AGP-064).
+* After a **refusal** (the provider answered 400 after taking the pre-signature), the hub refills: its
+  next ch2, if one was funded ahead and is open, takes over at once (`ch2_switch`, `why:
+  "written_off"`) and the old one is closed as retired (AGP-057); otherwise a new ch2 is funded after
+  the close.
+* After a **timeout** (no reveal in time), the hub stopped routing to that provider (AGP-064), so it
+  closes the ch2 and does not fund a new one.
+* A ch2 with nothing signed but a written-off lock is closed too (before, a ch2 with nothing signed
+  was "idle" and left to its refund). A failed close request is reported
+  (`ch2_written_off_close_failed`) and asked again next block.
+
+**Orphan ch1 locks are swept by the watcher.** A ch1 lock that no route is forwarding and that sits on
+no ch2 (the hub stopped between its two write-aheads) was dropped only when the client asked to
+close. The watcher now checks every open ch1 with a lock, each tick, before the margin close. The
+check runs under the provider's busy flag, which `route()` holds from before it writes the lock until
+its forward ends, so a lock in flight is never touched. AGP-064's drop had a gap: if the crash came
+between a void's two writes, ch2 had the lock written off (its pre-signature may be out) while ch1
+still had it as its lock, and the drop let ch1 close below it. Such a lock is now held in the base
+like any written-off lock (`orphan_lock_held`), and the client's close is refused `lock_pending`
+until it resolves. Other orphans are dropped as before (`orphan_lock_dropped`).
+
+With the sweep, the hub now settles a lock's ch1 side before its ch2 side (the provider's answer,
+and t read off a close). A stop between the two leaves the ch2 lock pending, which the provider's
+answer or its close completes again; the other order left a ch1 lock with no ch2 lock, which the
+sweep would drop unpaid. Completing a lock a second time returns the first result.
+
+**C2: the routed funders ask before they broadcast.** AGP-067 made the payer client preflight
+`/open`. `RoutePayer::open` (ch1, to the hub) and the hub's ch2 funding (`connect`, refills,
+`fund_ch2`) funded first and asked afterwards. Both now send the same preflight (`"preflight": true`,
+the terms, no funding outpoint) and fund only after a yes. A refusal is passed on with its code
+(`ch2_preflight_refused` on the hub), and nothing is funded or written. A provider from before AGP-067
+answers `bad_request`, and the funder goes on as before. B1's route payer already preflighted (its
+open is `XbtChannelClient._open`); its hub did not.
+
+**Cost.** Pass lines declared before measuring, armv7 musl release under `qemu-arm-static` as the
+Pi-class figure, x86_64 native beside it (`hub::tests::seal_cost`, ignored by default: `cargo test -p
+xbt402 --release --lib seal_cost -- --ignored --nocapture`):
+
+| step | pass line (armv7) | armv7 | x86_64 |
+|---|---|---|---|
+| sealing step added to a state write (10 records, keys cached) | ≤ 100 µs | 29–31 µs | 7.2 µs |
+| seal one new key (once per funded ch2) | ≤ 1 ms | 12 µs | 1.0 µs |
+| open a 100-record file at startup (opens + `payer_pub` checks) | ≤ 500 ms | 16 ms | 1.3 ms |
+
+For scale, serializing the same 10-record file costs 131 µs on armv7, before its fsync. The sweep is
+one busy-flag try per open ch1 with a lock, per tick. The preflight is one HTTP round trip per funded
+channel, not per call.
+
+**For embedders (cmp).**
+* `RouteHub::new` with a data dir makes `<datadir>/hub-wrap-key` if there is none. Use
+  `RouteHub::new_with_wrap_key(.., Some(WrapKey::load_or_create(path)?))` to keep the wrap key off the
+  data dir. In B1, pass `RouteHub(..., wrap_key=WrapKey.load_or_create(path))`. `OutBook::open` takes
+  the wrap key and refuses a file without one.
+* **Downgrade:** an older hub cannot read a sealed `ch2.json`. Old B1 fails at start (`TypeError` on
+  `secret_sealed`); old Rust loads it with empty keys and cannot sign. Keep a copy from before the
+  upgrade, plaintext keys and all, if a rollback is possible.
+* The ch2 record's `secret` field is gone from the file (it is still in memory). Tools that read keys
+  from `ch2.json` must open `secret_sealed` with the wrap key.
+* A written-off ch2 is closed early, so the provider sees a cooperative close request soon after a
+  refused or timed-out lock. A payee-pays ch2 pays its close fee then.
+* The hub and the route payer send one more `/open` (the preflight) per channel.
+* New events: `ch2_keys_sealed`, `ch2_written_off_close_failed`, `orphan_lock_held`,
+  `ch2_preflight_refused`; `ch2_close` and `ch2_switch` can carry `why: "written_off"`.
+
+Tests: `crates/xbt402-interop/tests/hub_followups.rs` (10; B1
+`tests/security/test_agp073_hub_followups.py`, the same 10):
+* K1: `k1_the_state_file_holds_no_plaintext_ch2_key`,
+  `k1_a_legacy_plaintext_state_file_is_read_once_and_rewritten_sealed`,
+  `k1_a_wrong_wrap_key_or_a_swapped_blob_is_refused`;
+* written off: `written_off_a_refused_lock_ch2_is_closed_and_refilled`,
+  `written_off_with_a_next_ch2_the_hub_switches_and_has_the_old_one_closed`,
+  `written_off_on_a_timeout_the_ch2_is_closed_and_not_refilled`;
+* orphans: `orphan_a_lock_a_crash_left_is_swept_by_the_watcher`,
+  `orphan_a_lock_its_ch2_wrote_off_before_the_crash_is_held_not_dropped`;
+* C2: `c2_the_route_payer_asks_the_hub_before_it_funds_ch1`,
+  `c2_the_hub_asks_the_provider_before_it_funds_ch2`;
+* `hub_keys` unit tests: the seal round trip and its refusals, the key file's forms, and its mode.
+
+On `main`, 9 of the 10 fail; the tenth (the wrong-key test) needs the new API. In B1 master, 9 of 10
+fail: the route payer test passes there, since B1's client already preflighted. Existing tests changed
+with the new behaviour: `hub_money_safety::wa_the_key_is_on_disk_before_fund_runs` (the key is sealed),
+`hub_reconcile::close_fields_round_trip`, and
+`hub_routing_safety::h2_a_refused_lock_stays_in_the_base_and_blocks_routing_and_rollover` (the
+watcher asks for the close itself). In B1: `test_agp037` (key on disk, rollover next key, the
+unknown-spender reconcile), `test_agp053` `HubOff` (one more `/open`) and the same `test_agp064` H2
+test.
+
+**Trade-offs.**
+* A refused first lock on a ch2 with nothing signed asks for a close every block until the provider
+  closes or the refund comes, unless a next ch2 is open.
+* The default wrap key beside the state file only protects copies of `ch2.json`. A secrets mount or
+  `wrap_key_file` elsewhere is the real protection.
+* The write does not fsync the directory after the rename, as before: no extra IO per call. A
+  follow-up could add it.
 
 ## Portability
 
