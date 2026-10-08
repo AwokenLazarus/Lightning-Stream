@@ -53,9 +53,9 @@ wait_http() {
 "${SOAK[@]}" "$PY" scripts/interop/py_provider.py "$P_PY" payer "/v1/secret:600:python-sold-this" >>"$LOG" 2>&1 & PIDS+=($!)
 "${SOAK[@]}" "$PY" scripts/interop/py_provider.py "$P_PY_PAYEE" payee >>"$LOG" 2>&1 & PIDS+=($!)
 "${SOAK[@]}" ./target/release/xbt402-rust-provider --port "$P_RS" --rpc-port "$XBT402_RPCPORT" --cookie "$COOKIE" \
-  --conditional "/v1/secret:600:rust-sold-this" --ledger "$R/rust-provider.jsonl" >>"$LOG" 2>&1 & PIDS+=($!)
+  --conditional "/v1/secret:600:rust-sold-this" --data-dir "$R/rust-provider" >>"$LOG" 2>&1 & PIDS+=($!)
 "${SOAK[@]}" ./target/release/xbt402-rust-provider --port "$P_RS_PAYEE" --rpc-port "$XBT402_RPCPORT" --cookie "$COOKIE" \
-  --close-fee-payer payee >>"$LOG" 2>&1 & PIDS+=($!)
+  --close-fee-payer payee --data-dir "$R/rust-provider-payee" >>"$LOG" 2>&1 & PIDS+=($!)
 for p in "$P_PY" "$P_PY_PAYEE" "$P_RS" "$P_RS_PAYEE"; do wait_http "$p"; done
 grep -E "ready" "$LOG" || true
 
