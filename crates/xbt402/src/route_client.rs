@@ -543,7 +543,7 @@ impl RoutePayer {
         let pay_to = hex::decode(py_str(acc.get("payTo"))).map_err(|_| ChannelError::new("bad_offer", "payTo"))?;
         let p = ChannelParams::derive(&pay_to, &pubk, expiry, py_u64(ex.get("closeFeeSat")).unwrap_or(0), payer_spk, &self.cfg.network, fee_payer)?;
         let hrp = if self.cfg.network == XBT_MAINNET { "bc" } else { "bcrt" };
-        let (txid, vout) = self.wallet.fund(&segwit_address(hrp, &p.spk())?, cap)?;
+        let (txid, vout) = self.wallet.fund_channel(&self.hub_url, &p, &segwit_address(hrp, &p.spk())?, cap)?;
         let p = p.with_funding(&txid, vout, cap)?;
         self.signer.attach(&self.hub_url, &p)?;
         self.signer.sign_refund(&p.channel_id())?;

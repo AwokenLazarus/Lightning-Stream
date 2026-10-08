@@ -974,6 +974,143 @@ changed with H2, because a provider's refusal now blocks that ch2:
   (close or refund). This is the spec's choice (no route over a stale ch2). The follow-up would be
   to close and refill such a ch2 early.
 
+## Agent-wallet budget integrity and privileged methods (AGP-063)
+
+Fixes for the external review's agent-wallet findings W1-W4, X1 and K1, plus the library payer's watermark.
+Each test fails on `main` and passes here (the run is in the task's `result.md`). Most are in
+`crates/xbt-signer/tests/review_w.rs`; B2's port (branch `agp-063`) has the same names in
+`tests/test_review_w.py`.
+
+**W1: the wallet books what it signs.** `xbt402_pay` books the **signed delta**: the cumulative amount
+signed after the call, minus what the policy ledger already holds for that channel
+(`ledger_booked_sats`). It never books `charged` from the seller's PAYMENT-RESPONSE. The receipt is
+still checked: the payee's signature, the request digest and channel, a `cum` no higher than the one
+signed, and a `charged` that is neither negative nor above the quote. A bad receipt does not change
+what is booked; the answer reports it as `receipt_error`. The answer also carries `booked_sats`.
+- **When it books.** The `pay` channel rail, `sign_state`, `xbt402_sign_state_a3`, the rollover and
+  `xbt402_sign_conditional` book before they sign, and take the row out again if signing fails.
+  `xbt402_pay` books after the state is persisted and before it is sent; a crash in between is
+  booked by the next call.
+- **No double count.** The ledger txid is `xbt402:<chan>:<cum>`, so a restart books an increase once.
+- **No lower state.** A lower `cum` is `deny/amount`.
+- **No negative rows.** A negative payment or amend row is refused, both when written and when the log
+  is loaded, so a row can never lower a daily, weekly or per-seller total.
+- **Streams.** The stream budget is `max_sats` minus what was booked.
+- **The budget check.** The per-tx limit, the human threshold and approvals still apply to the amount
+  asked (`max_sats`, or `pay`'s `amount_sats`). The daily, weekly, per-seller and split sums apply to
+  what the call can book (`PolicyEngine::evaluate_booking`). On an open channel that is known before the
+  402: `next_cum(max_sats)` minus the booked amount. A call that fits the budget exactly is paid, even
+  when `max_sats` alone would not fit.
+- **The dust floor.** A new channel's first state signs the dust floor (546) when the price is below
+  it. Those 546 sats are booked, and that first state is allowed even when `max_sats` is lower (500 in
+  the runbook). When the floor is more than the amount asked, the budgets are checked again on the whole
+  floor before anything is signed, on both rails (the session's `set_spend_check` hook for
+  `xbt402_pay`). A floor that does not fit is refused with the budget's rule, and the reason names the
+  dust floor. Tests: `w1_the_budget_is_checked_on_the_signed_increase_not_max_sats`,
+  `w1_a_dust_floor_above_the_remaining_budget_is_refused` and
+  `w1_the_dust_floor_on_the_pay_rail_is_held_to_the_budget`.
+- **Old records.** A record from before this field loads as booked through `used_sats` and does not
+  gain the key, so B2 still loads it.
+
+**W2: the seller cannot raise the cap.** An offer whose `minCapacity` is above the owner's per-channel
+cap (the cap plus the payer's close fee, which is what `minCapacity` bounds) is refused with
+`deny/min_capacity` before any funding. The combined W1+W2 test (a huge `minCapacity` and a receipt
+of zero) stops at the owner's cap.
+
+**W3: what a process on the agent socket can still do.** The agent socket is shared with the
+model-facing MCP process, so every method there either stays inside the owner's policy or needs the
+human's ed25519 signature.
+- **`fund`** pays only a channel for a payer key this signer issued (`xbt402_new_key`) to that origin,
+  and only to the seller's verified terms. The verified payTo is the policy's
+  `counterparties[origin].pay_to`, else the seller's `GET <origin>/x402/xbt-channel/terms`, which the
+  signer fetches itself, only for an allowlisted origin or routing hub, and checks for the right
+  network. The channel must also have:
+  - the hot key's change script;
+  - a close fee within `close_fee_max_sats`;
+  - an expiry in (`refund_margin_blocks`, max(`channel_expiry_blocks`, 4032)] blocks;
+  - a capacity within `per_counterparty_cap_sats` plus the payer's fee.
+
+  The funded channel is written ahead as pending, so the watcher refunds it at expiry if no attach
+  follows. Without `origin` and `params` the answer is `deny/fund_unbound`. Other codes:
+  `bad_key`, `pay_to`, `payer_spk`, `close_fee`, `expiry`, `channel_cap`, `bad_address`,
+  `channel_open`, `channel_pending`.
+- **`open_channel`** takes payTo only from the policy; a different `pay_to` parameter is `deny/pay_to`.
+  The dest must be allowlisted, and `cap_sats`, `expiry_blocks` and `close_fee` must stay inside the
+  owner's bounds.
+- **`xbt402_attach`** of a funded channel must match the pending record `fund` wrote. A `/next`
+  channel passes the same checks as `fund`.
+- **`xbt402_sign_rollover`** needs `next`: the unfunded params of the channel's own next channel. Its
+  script must be `next_spk`; it must have the same close fee and fee payer; its capacity must be
+  exactly `rollover_next_capacity(amount)`; and it passes the `fund` checks for `<origin>/next`.
+  A bare `next_spk` is `deny/rollover_unbound`. Only the increase in the signed amount is booked, not
+  the new channel's capacity, because that capacity is the wallet's own refundable channel and
+  booking it as well would count the same sats twice.
+- **`rotate_hot_key`** needs the human signature over `rotate_message(hot_address, expiry)`; it is
+  the same method as `rotate_hot_key_signed`. Codes: `human_key`, `human_sig`, `expired`.
+- **`deny_approval`** of an approval that has not expired needs the human signature over
+  `deny_message(token, expiry)` (domain `xbt-agentwallet-deny-v1`), so the agent cannot refuse for
+  the owner. An expired one can still be dropped without a signature. The UI signs it in the page,
+  like approve.
+
+**W4: the first human key.** While no human key is enrolled, the signer prints a one-time enrolment
+code (`XXXX-XXXX-XXXX`, 60 bits) to stderr and writes it to `.run/enroll-code` (0600).
+- **Enrolling.** `human_key_enroll` needs `code`. Five wrong codes replace it with a new one. Success
+  removes the code and the file.
+- **Where the owner finds it.** On Umbrel it is in the app's log (the app page, then Troubleshoot).
+  On StartOS it is in the service's Logs. Elsewhere it is on the signer's stderr or in
+  `.run/enroll-code`. The UI's enrolment form says so.
+- **Host and Origin.** The UI answers only to IP literals, single-label names (`localhost`, a
+  container name), `*.local`, `*.localhost`, `*.onion`, and the names in `XBT_UI_ALLOWED_HOSTS`;
+  anything else is 421. A POST whose `Origin` is not one of those hosts is 403. `Origin: null` is
+  accepted, because the UI sends `Referrer-Policy: no-referrer` and Chrome then sends `null` on
+  same-origin form posts. The Host check is what stops DNS rebinding.
+
+**X1: the MCP HTTP transport.**
+- **The token is always required.** With a data dir it is the `mcp-http-token` secret, generated on
+  first run. Without one it is `<signer socket dir>/mcp-http-token` (0600), generated on first run
+  and read again on restart. A non-loopback listener with no token is refused at start.
+- **Origin is checked whether or not `--http-allow-remote` is set.** It must be a loopback origin or
+  one of `XBT_MCP_ALLOWED_ORIGINS` (comma-separated). There is no same-origin exception, because a
+  DNS-rebound page has Origin equal to Host.
+- **Local payer mode** checks the signer's allowlist before any request to a URL, so a refused origin
+  is never probed.
+
+**K1: key storage.**
+- **scrypt cost.** A passphrase blob is sealed at scrypt N=2^17 (r=8, p=1, 128 MiB) and records
+  `log_n`. A blob without `log_n` (B2 and older Rust files) opens at 2^15, and only 15..=18 are read.
+  The measurements and the comparison with argon2id are in the task's `result.md`. The default
+  (Umbrel/StartOS) wrapping key is a key file, which has no KDF.
+- **Zeroised secrets.** Wrapping keys, the passphrase, derived keys and the key-file bytes are held in
+  `Zeroizing` buffers.
+- **Key file.** The key file (after symlinks are resolved) must be a regular file with no group or
+  other bits; otherwise the signer refuses to start.
+- **Durable approvals.** `PolicyStore::write` (the approvals document) writes a temp file, fsyncs
+  it, renames it, fsyncs the directory and sets mode 0600.
+- **xbt-svc ownership changes.** `xbt-svc` `own_dir`, `chown_tree` and `put_secret` open each entry
+  with `O_NOFOLLOW` and chown or chmod it through that fd. Children are named through
+  `/proc/self/fd/N`, so an entry swapped for a symlink during the walk is never followed.
+- **Deferred: sealing the hub's ch2 payer keys.** They are still stored as hex in the hub state
+  (AGP-064 is changing `hub.rs` now, and B1's `hub.py` shares the file format).
+
+**The library payer's watermark.** `Payer::sign_state_a3` and `Payer::sign_conditional` refuse an
+amount below the highest one signed (`stale_amount`) and advance it, as `sign_state` already did.
+
+**Wire changes for embedders (cmp, B1 clients, scripts).**
+
+| change | before | now |
+|---|---|---|
+| `fund` | `{address, sats}` | `{origin, params, address?, sats}`; `xbt402::client::Wallet::fund_channel` (`RemoteSigner` sends it) |
+| `xbt402_sign_rollover` | `{chan, amount, next_spk, next_capacity}` | the same plus `next` (the next channel's params); `StateSigner::sign_rollover_next` |
+| `xbt402_pay` answer | `charged_sats` | plus `booked_sats` and, for a bad receipt, `receipt_error` |
+| `xbt402_pay` / `pay` budget | sums held to `max_sats` / `amount_sats` | sums held to the signed increase; a dust floor above the budget is `deny/<budget rule>` |
+| `Session` (Rust) / `Xbt402Session` (B2) | `set_spend_book` | plus `set_spend_check(dest, max_sats, delta)` |
+| `rotate_hot_key` | no params | `{expiry, signature}` |
+| `deny_approval` | `{token, reason}` | plus `{expiry, signature}` while the approval is live |
+| `human_key_enroll` | `{pubkey}` | `{pubkey, code}` |
+| MCP HTTP | token optional on loopback | always a bearer token; Origin is checked; `XBT_MCP_ALLOWED_ORIGINS` |
+| web UI | any Host | Host allow-list (`XBT_UI_ALLOWED_HOSTS`) and an Origin check on POST |
+| keystore blob | no `log_n` | `"log_n": 17` on passphrase blobs |
+
 ## Portability
 
 No platform-specific dependencies: libsecp256k1 (C, via `secp256k1-sys`), pure-Rust hashes and JSON,
