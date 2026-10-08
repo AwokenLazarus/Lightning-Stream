@@ -12,7 +12,7 @@ use xbt402::channel::{ChannelParams, FeePayer, Payer};
 use xbt402::conditional::ConditionalParams;
 use xbt402::ledger::Ledger;
 use xbt402::provider::{HttpResponse, Provider, ProviderConfig};
-use xbt402::wire::{receipt_message, request_digest, settlement_response, SCHEME};
+use xbt402::wire::{body_hash, receipt_message, request_digest_v2, settlement_response, SCHEME};
 use xbt_primitives::ecdsa;
 use xbt_signer::channels::ChannelRecord;
 use xbt_signer::session::Session;
@@ -78,18 +78,19 @@ fn w1_a_negative_or_oversized_charged_is_refused() {
     let pk = ecdsa::pubkey(&sk);
     let rec = ChannelRecord { chan: "chan".into(), payee_pub: hex::encode(pk), used_sats: 546, ..Default::default() };
     let url = URL;
-    let req = request_digest("GET", "/agp015/echo", b"");
+    let req = request_digest_v2("GET", url, b"");
     let resp = |charged: &str| {
-        let mut r = json!({"scheme": SCHEME, "chan": "chan", "seq": "1", "cum": "546", "charged": charged, "spentMsat": "0", "req": req});
+        let mut r = json!({"scheme": SCHEME, "chan": "chan", "seq": "1", "cum": "546", "charged": charged, "spentMsat": "0", "req": req,
+                           "status": 200, "bodyHash": body_hash(b"ok")});
         r["sig"] = hex::encode(ecdsa::sign(&sk, &receipt_message(&r))).into();
         settlement_response(&r, "net", &hex::encode(pk), true)
     };
-    let neg = Session::check_seller_receipt(&rec, &resp("-5"), "GET", url, b"", 500).unwrap_err();
+    let neg = Session::check_seller_receipt(&rec, &resp("-5"), "GET", url, b"", (200, b"ok"), 500).unwrap_err();
     assert_eq!(neg.code, "bad_receipt");
     assert!(neg.msg.contains("negative"), "{}", neg.msg);
-    let over = Session::check_seller_receipt(&rec, &resp("9000"), "GET", url, b"", 500).unwrap_err();
+    let over = Session::check_seller_receipt(&rec, &resp("9000"), "GET", url, b"", (200, b"ok"), 500).unwrap_err();
     assert!(over.msg.contains("exceeds"), "{}", over.msg);
-    assert_eq!(Session::check_seller_receipt(&rec, &resp("0"), "GET", url, b"", 500).unwrap(), 0);
+    assert_eq!(Session::check_seller_receipt(&rec, &resp("0"), "GET", url, b"", (200, b"ok"), 500).unwrap(), 0);
 }
 
 /// W1/K1: a policy payment over a channel books what the wallet signs, before it signs: the dust

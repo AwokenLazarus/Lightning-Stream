@@ -18,7 +18,7 @@ use xbt402::client::Transport;
 use xbt402::conditional::{encrypt, preimage_from_tx};
 use xbt402::json::{dumps, py_str};
 use xbt402::provider::HttpResponse;
-use xbt402::wire::{b64json, facilitator_request, receipt_message, receipt_of, request_digest, safe_code, scheme_accepted, unb64json, FACILITATOR_VERIFY};
+use xbt402::wire::{b64json, body_hash, facilitator_request, receipt_message, receipt_of, request_digest_v2, safe_code, scheme_accepted, unb64json, FACILITATOR_VERIFY};
 use xbt_primitives::ecdsa;
 use xbt_primitives::hash::{sha256, tagged_hash};
 use xbt_primitives::tx::Tx;
@@ -195,7 +195,7 @@ impl Session {
         let extra = acc.get("extra").cloned().unwrap_or(json!({}));
         if extra.get("derivation").and_then(Value::as_str) != Some(DERIVATION) {
             // checked before funding: a mismatch strands the coins (no provider text: L12)
-            return Err(rt(format!("provider payee-key derivation is not {DERIVATION:?}; refused before funding")));
+            return Err(rt(format!("provider channel binding (extra.derivation) is not {DERIVATION:?}; refused before funding")));
         }
         let close_fee = or_int(extra.get("closeFeeSat"), 600)?;
         if self.close_fee_max > 0 && close_fee > self.close_fee_max {
@@ -349,7 +349,7 @@ impl Session {
 
     /// H3: bind this payload to (method, path, body). The ECDH key stays in the book.
     fn with_auth(&self, payload: &mut Value, method: &str, url: &str, body: &[u8]) -> Result<()> {
-        let req = request_digest(method, &request_target(url), body);
+        let req = request_digest_v2(method, url, body);
         let chan = py_str(payload.get("chan"));
         let sig = payload.get("sig").and_then(Value::as_str).map(str::to_string);
         payload["auth"] = self.book.request_auth(&chan, payload.get("seq"), payload.get("cum"), sig.as_deref(), &req)?.into();
@@ -388,10 +388,13 @@ impl Session {
 
     /// The seller's receipt: signature and request binding, and a `charged` that is not
     /// negative and not above the quote. The number itself is never what the wallet books.
-    pub fn check_seller_receipt(rec: &ChannelRecord, resp: &Value, method: &str, url: &str, body: &[u8], quote: i64) -> Result<i64> {
+    pub fn check_seller_receipt(rec: &ChannelRecord, resp: &Value, method: &str, url: &str, body: &[u8], answer: (u16, &[u8]), quote: i64) -> Result<i64> {
         let r = receipt_of(resp).map_err(|e| err("bad_receipt", e.to_string()))?;
-        if py_str(r.get("req")) != request_digest(method, &request_target(url), body) {
+        if py_str(r.get("req")) != request_digest_v2(method, url, body) {
             return Err(err("bad_receipt", "receipt is for another request"));
+        }
+        if r.get("status").and_then(Value::as_u64) != Some(answer.0 as u64) || py_str(r.get("bodyHash")) != body_hash(answer.1) {
+            return Err(err("bad_receipt", "receipt is for another answer (status or body differs)"));
         }
         if py_str(r.get("chan")) != rec.chan {
             return Err(err("bad_receipt", "receipt is for another channel"));
@@ -520,7 +523,7 @@ impl Session {
         let mut receipt_error = None;
         let charged = if r2.status < 400 {
             let checked = receipt.as_ref().ok_or_else(|| err("bad_receipt", "paid call returned no receipt"))
-                .and_then(|resp| Self::check_seller_receipt(&rec, resp, method, url, body, price));
+                .and_then(|resp| Self::check_seller_receipt(&rec, resp, method, url, body, (r2.status, &r2.body), price));
             checked.unwrap_or_else(|e| {
                 receipt_error = Some(e.msg);
                 0

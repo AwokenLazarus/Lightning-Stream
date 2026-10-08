@@ -63,7 +63,7 @@ binfmt/qemu).
 Dependencies: `secp256k1` 0.29 (libsecp256k1, the global context), `sha2`, `ripemd`, `blake2`,
 `hmac`, `ruint` (256-bit targets and work), `serde_json` with `preserve_order` (never
 `arbitrary_precision`, AGP-035), `base64`, `thiserror`,
-`getrandom`, `indexmap`. Optional: `ureq` (features `http-client`, `rpc`) and `tiny_http` (`http-server`).
+`getrandom`, `indexmap`. Optional: `ureq` (features `http-client`, `rpc`). The `http-server` feature is std only (AGP-068).
 std only; no_std isn't a goal.
 
 ## API overview
@@ -138,7 +138,7 @@ untrusted input: parsers and the provider are fuzzed with hostile bytes and JSON
 
 ## Conformance statement
 
-`scripts/conformance.sh` (2026-09-28):
+`scripts/conformance.sh` (2026-10-08, AGP-068):
 
 The vectors come from our own Python references (B1, B2) and from Knots. B1 and B2 are not yet
 published, so the B1/B2 groups show agreement between our two implementations, not conformance to
@@ -146,11 +146,11 @@ an outside implementation. The UnifiedSighash vectors are Knots' own file, byte 
 
 | group | vectors | source | result |
 |---|---|---|---|
-| xbt402 v1.1 + v1.2 (counted as `check_vectors.py` counts them) | 50 | B1 agp-029 `docs/x402/vectors.json` | 50/50 byte-identical |
+| xbt402 v1.1 to v1.3 (counted as `check_vectors.py` counts them) | 54 | B1 agp-068 `docs/x402/vectors.json` | 54/54 byte-identical |
 | UnifiedSighash (Knots hf-sighash-opt-in reference) | 166 | B1 `tests/data/unified_sighash.json` | 166/166 |
 | BLAKE2b header v2, every hash stage | 5 | B2 `tests/vectors/block_header_v2.json` | 5/5 |
 | Knots BLAKE2b regtest capture: 24 headers across v1/v2, 3 blocks' merkle roots, a header chain | 28 | B2 `tests/vectors/blake2b_regtest.json` | 28/28 |
-| **total** | **249** | | **249/249** |
+| **total** | **253** | | **253/253** |
 
 It works in both directions:
 
@@ -1111,11 +1111,119 @@ amount below the highest one signed (`stale_amount`) and advance it, as `sign_st
 | web UI | any Host | Host allow-list (`XBT_UI_ALLOWED_HOSTS`) and an Origin check on POST |
 | keystore blob | no `log_n` | `"log_n": 17` on passphrase blobs |
 
+## Request binding and the HTTP server (AGP-068)
+
+review T1–T4. A few slow connections must not stall a provider, and a receipt binds one request and
+the answer that was actually returned. B1 `x402_channel.py` on `agp-068` (`5032212`) does the same, and
+`tests/test_agp068.py` there uses the same test names.
+
+**Wire (v1.3).** `extra.derivation` is `"v3"`, and it is the only version signal: a v1.2 client
+requires `"v2"` and refuses the offer before it funds. The payee key is still
+`xbt-channel/payee/v2`. There is no separate binding flag, because an old client echoes whatever
+terms it was given, so a server-side check of one would never fire.
+
+- `request_digest_v2` is
+  `tagged_hash("xbt402/req/v2", f(method) ‖ f(scheme) ‖ f(host) ‖ f(port) ‖ f(target) ‖ f(body))`
+  with `f(x) = LE64(len(x)) ‖ x`. Scheme and host are lowercased, the port is decimal or the
+  scheme's default, userinfo and fragment are dropped. A provider reached at another origin, or a
+  `|` moved between target and body, gives another digest. A bare target binds no origin.
+- The client binds `origin + path`, and the server binds the URL it rebuilt from the request.
+- Receipts are `tagged_hash("xbt402/receipt/v2", …)` over the length-prefixed chan, seq, cum,
+  charged, spentMsat, req, status and bodyHash (sha256 of the body sent). The client checks status
+  and bodyHash against the bytes it received (`bad_receipt`). On a conditional call the hash lock
+  stays pending until the receipt checks out, so after a `bad_receipt` `recover_conditional` still
+  reads k from the provider's claim.
+- `seq` is the call's own, and cum and spentMsat come from the call's reservation (less its own
+  refund), not from whatever another call wrote meanwhile. A seq spent on a refusal is saved before
+  the 402 goes out (a 500 if that save fails), so a replay after a restart is still `bad_auth`.
+- The old `sha256(method|path|body)` remains as `request_digest_v1` for xbt-work's published
+  XBT-053 vectors; xbt-work still speaks v1.
+
+**HTTP server (`http-server` feature).** It is now `std::net`:
+
+- header lines are capped at 8 KiB and the header block at 32 KiB (431);
+- at most 64 connections, then 503;
+- the head must arrive within 10 s (408) and the body within 30 s, both as absolute deadlines;
+- only Content-Length bodies (Transfer-Encoding gives 501), and `Expect: 100-continue` is honoured;
+- `Connection: close` on every answer;
+- bodies are read on the connection thread, so a slow body cannot occupy a worker. Jobs go to the
+  workers through a bounded queue, and a panicking handler costs a 500, not a worker.
+
+The URL the digest is checked against is rebuilt from `Host`, the target and `X-Forwarded-Proto`
+(`https` or `http`). Both headers are client-controlled, so trusting them gives an attacker nothing
+it could not already send. Behind TLS, put a reverse proxy in front that overwrites both with the
+URL the payer used. For example, with nginx:
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:8402;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_request_buffering on;     # the proxy, not this process, absorbs slow bodies
+    client_max_body_size 1m;
+}
+```
+
+**Client (T3).** The payer's `ureq` transport refuses a declared Content-Length over 64 MiB
+(`response_too_large`) and a body shorter or longer than declared (`response_truncated`), instead
+of returning a short buffer. B1's `_read_capped` uses the same codes.
+
+Options weighed for the server (best-performing-stack rule):
+
+| option | slowloris / long headers fixable | new dependency | other cost |
+|---|---|---|---|
+| keep `tiny_http`, wrap it | no: its listener thread reads heads with no deadline or line cap | none | the bug stays |
+| vendor and patch `tiny_http` | yes | none (but a fork to carry) | maintaining a fork |
+| `rouille` | no | yes | built on `tiny_http` |
+| `hyper` | yes | yes, with an async runtime (tokio) | larger binary, a runtime on Pi-class devices |
+| `may_minihttp` | partly | yes | coroutine runtime, heavy use of `unsafe` |
+| **`std::net`, ~360 lines (chosen)** | yes | **none** (`tiny_http` dropped from xbt402) | ours to maintain; tested in `http_limits.rs` |
+
+**Cost.** Pass line declared before measuring: (a) the added per-call hashing (the v2 digest twice
+on the server, v2 receipt framing, bodyHash of a 4 KiB answer) is at most 5% of one ECDSA receipt
+signature; (b) bodyHash on armv7 keeps up with a 100 Mbit/s link (12.5 MB/s).
+`cargo run --release -p xbt402 --example binding_bench` on a Ryzen 9 9950X3D (SHA-NI) gives
+digest v1 100 ns / v2 288 ns, receipt v1 345 ns / v2 445 ns, bodyHash 4 KiB 1.7 µs, ECDSA sign
+16.2 µs, and SHA-256 at 2.5 GB/s:
+
+- framing alone adds 0.48 µs, which is 2.9% of a signature and passes (a);
+- framing plus a 4 KiB bodyHash adds 2.2 µs, which is 13.7% and **fails (a)**;
+- the bodyHash part is one SHA-256 pass over the answer, which T4 requires and the payer repeats to
+  check, and it grows with the answer size.
+
+There was no armv7 box or emulator, so the armv7 figures are estimates. Software SHA-256 on a
+Cortex-A7 at 900 MHz runs at about 25–35 cycles/byte, about 25–35 MB/s, so (b) passes with room to
+spare. Signing on 32-bit libsecp256k1 slows down by roughly the same factor as hashing, so the
+bodyHash share on armv7 is in the same 10–25% range: (a) fails there too for answers of a few KiB
+and up.
+
+**Embedders.**
+
+- cmp, xbt-compute and anyone else who builds the payload themselves must bind
+  `request_digest_v2(method, origin + target, body)` and verify receipts against the answer. A v1.2
+  digest no longer authenticates.
+- B5 and xbt-063 vendor pinned B1/B2 and are unaffected until they re-pin. On re-pin, B5
+  `fwd/server.py` must add status and bodyHash to its receipts and use the v2 digest.
+- The B2 wallet (`agp-068`, `611ec39`) binds the v2 digest, but as before it does not check receipts.
+- xbt-wallet-ui, xbt-work-relay and xbt-wallet-mcp still serve with `tiny_http`, so they keep T1's
+  slowloris exposure until they move to the same server. That is a follow-up, and so is moving
+  xbt-work to v2.
+- `scripts/conformance.sh` defaults to B1 at `~/xbt-rnd/b1-agp-068` until this merges.
+
+Tests: `crates/xbt402/tests/http_limits.rs` (`slow_bodies_do_not_stall_the_server`,
+`slow_heads_do_not_stall_the_server_and_are_cut_off`, `an_endless_header_line_is_refused`,
+`an_oversized_response_is_an_error_not_a_truncated_body`, `a_body_cut_short_is_an_error`) and the
+AGP-068 tests in `lifecycle.rs` (`a_payment_is_bound_to_one_request_and_one_origin`,
+`concurrent_calls_get_the_numbers_of_their_own_reservation`,
+`a_seq_spent_on_a_refusal_survives_a_restart`, `the_receipt_covers_the_response`,
+`an_altered_conditional_answer_keeps_the_hash_lock`).
+
 ## Portability
 
 No platform-specific dependencies: libsecp256k1 (C, via `secp256k1-sys`), pure-Rust hashes and JSON,
-`getrandom`, std threads (no async runtime). The optional HTTP features use `ureq` with rustls/ring
-(no OpenSSL) and `tiny_http`. `cargo check -p xbt402` (library, and all features + the hub binary)
+`getrandom`, std threads (no async runtime). The payer HTTP client uses `ureq` with rustls/ring
+(no OpenSSL). The xbt402 server is std (`http-server`, AGP-068). wallet-ui, the work relay and MCP
+still use `tiny_http`. `cargo check -p xbt402` (library, and all features + the hub binary)
 passes for x86_64/aarch64 Linux gnu and musl, armv7 and riscv64 Linux, x86_64/aarch64 macOS and
 x86_64 Windows (gnu), with zig as the cross C compiler; aarch64 links (`xbt402-hub` 4.5 MB).
 Under v1.2 payee-pays, the close response reports `cum` as what the close pays the payee **net of
@@ -1401,7 +1509,7 @@ f64, holding an integer beyond i64/u64 as a reserved one-key object `{"$xbt402::
 (`json::big_int`/`big_uint`/`as_big_int`/`int_text`), which `json::dumps`/`dumps_compact`/`canon`
 write back as the bare integer. Floats are parsed with Rust's correctly rounded parser and written
 as Python's `repr`. A document that contains the reserved key itself is refused. Every xbt402 input
-goes through `json::parse`, and every output through `json::dumps`: the 249 + 79 vectors are
+goes through `json::parse`, and every output through `json::dumps`: the 253 + 79 vectors are
 byte-identical both ways and `route_interop` is green. If cmp handles xbt402 JSON itself, it reads
 with `xbt402::json::parse` and writes with `xbt402::json::dumps*`. `serde_json::to_string` would
 print a big integer as the reserved object.

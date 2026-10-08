@@ -921,7 +921,7 @@ impl RouteHub {
         if path.split('?').next() == Some(HUB_ROUTE_PATH) {
             let hdr = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("PAYMENT-SIGNATURE")).map(|(_, v)| v.as_str()).filter(|v| !v.is_empty());
             if let (true, Some(h)) = (method == "POST", hdr) {
-                return self.route(method, HUB_ROUTE_PATH, h, body);
+                return self.route(method, &crate::provider::binding_url(url, HUB_ROUTE_PATH), h, body);
             }
             let mut doc = self.inbound.payment_required_doc(if url.is_empty() { path } else { url }, 0, "payment_required", None);
             match self.routing_extra() {
@@ -979,7 +979,8 @@ impl RouteHub {
 
     // --- POST /x402/route ---------------------------------------------------------------------------
 
-    fn route(&self, method: &str, path: &str, hdr: &str, body: &[u8]) -> HttpResponse {
+    /// `bind`: the request's URL as [`request_digest_v2`] binds it.
+    fn route(&self, method: &str, bind: &str, hdr: &str, body: &[u8]) -> HttpResponse {
         let t0 = Instant::now();
         let parsed = (|| -> Option<(Value, Value, i128, i128, String, String)> {
             let pl = unb64json(hdr).ok()?.get("payload")?.clone();
@@ -998,7 +999,7 @@ impl RouteHub {
         let cid = pl.get("chan").and_then(Value::as_str).and_then(|c| canonical_chan(c).ok()).filter(|c| l.channels.contains_key(c));
         let Some(cid) = cid else { return e400("unknown_channel", "") };
         let mut st1 = l.channels[&cid].clone();
-        if !self.inbound.authentic(&st1, &pl, method, path, body) {
+        if !self.inbound.authentic(&st1, &pl, method, bind, body) {
             return err(401, "bad_auth", "", json!({}));
         }
         st1.seq = py_u64(pl.get("seq")).unwrap_or(st1.seq);
@@ -1364,7 +1365,7 @@ impl RouteHub {
             pl["adaptor"] = pend["pre"].clone();
         }
         let key = channel_auth_key(&oc.secret_key().ok()?, &p2.payee_pub).ok()?;
-        pl["auth"] = request_auth(&key, &p2.channel_id(), pl.get("seq"), pl.get("cum"), None, &request_digest("POST", ROUTE_LOCK_PATH, body.as_bytes())).into();
+        pl["auth"] = request_auth(&key, &p2.channel_id(), pl.get("seq"), pl.get("cum"), None, &request_digest_v2("POST", &format!("{origin}{ROUTE_LOCK_PATH}"), body.as_bytes())).into();
         let hdrs = vec![("PAYMENT-SIGNATURE".to_string(), b64json(&json!({"x402Version": 2, "accepted": oc.terms, "payload": pl}))),
                         ("Content-Type".to_string(), "application/json".to_string())];
         let r = self.http.request("POST", &format!("{origin}{ROUTE_LOCK_PATH}"), body.as_bytes(), &hdrs).ok()?;

@@ -599,7 +599,7 @@ impl Client {
                 }
                 if ex.get("derivation").and_then(Value::as_str) != Some(DERIVATION) {
                     // before funding: never strand coins
-                    return fail("bad_offer", format!("payee key derivation {}, this client speaks {DERIVATION:?} (xbt402 v1.1)", py_str(ex.get("derivation"))));
+                    return fail("bad_offer", format!("channel binding {}, this client speaks {DERIVATION:?} (payee key v2, request binding v2)", py_str(ex.get("derivation"))));
                 }
                 return Ok(acc.clone());
             }
@@ -650,8 +650,10 @@ impl Client {
                            slack_msat: 0, seq: 0, spent_msat: 0, last_sig: String::new(), pending_cond: None, acked_cum: 0, receipts: vec![] })
     }
 
-    fn auth(ch: &ClientChannel, pl: &mut Value, method: &str, path: &str, body: &[u8]) -> Result<()> {
-        let req = request_digest(method, path, body);
+    /// `bind`: where the request goes, `origin + path` ([`request_digest_v2`]); a close's payload
+    /// binds the empty request.
+    fn auth(ch: &ClientChannel, pl: &mut Value, method: &str, bind: &str, body: &[u8]) -> Result<()> {
+        let req = request_digest_v2(method, bind, body);
         let sig = pl.get("sig").and_then(Value::as_str).map(str::to_string);
         let chan = py_str(pl.get("chan"));
         let a = match ch.payer.backend() {
@@ -720,7 +722,8 @@ impl Client {
             pl["sig"] = ch.last_sig.clone().into();       // signed but not yet seen to arrive
         }
         let ch = &self.channels[origin];
-        Self::auth(ch, &mut pl, method, path, body)?;
+        let bind = if path.is_empty() { String::new() } else { format!("{origin}{path}") };
+        Self::auth(ch, &mut pl, method, &bind, body)?;
         Ok(pl)
     }
 
@@ -805,15 +808,18 @@ impl Client {
             let resp = unb64json(h)?;
             match &used {
                 Some(p) => p.check(&origin, &resp, method, &path, body)?,
-                None => self.receipt(&origin, &resp, method, &path, body, None)?,
+                None => self.receipt(&origin, &resp, method, &path, body, (r.status, &r.body), None)?,
             }
         }
         Ok(r)
     }
 
-    /// Check a PAYMENT-RESPONSE against what we signed and were quoted, and adopt it. `quote`:
-    /// what this call may cost (the price pinned at open, or a conditional amount).
-    fn receipt(&mut self, origin: &str, resp: &Value, method: &str, path: &str, body: &[u8], quote: Option<u64>) -> Result<()> {
+    /// Check a PAYMENT-RESPONSE against what we signed and were quoted, and against the answer it
+    /// came with (`answer`: status and body), and adopt it. `quote`: what this call may cost (the
+    /// price pinned at open, or a conditional amount).
+    #[allow(clippy::too_many_arguments)]
+    fn receipt(&mut self, origin: &str, resp: &Value, method: &str, path: &str, body: &[u8], answer: (u16, &[u8]),
+               quote: Option<u64>) -> Result<()> {
         let network = self.cfg.network.clone();
         let ch = self.channels.get_mut(origin).ok_or_else(|| ChannelError::code("no_channel"))?;
         let quote = quote.filter(|q| *q > 0).unwrap_or(if ch.price > 0 { ch.price } else { py_u64(ch.accepted.get("amount")).unwrap_or(0) });
@@ -823,8 +829,12 @@ impl Client {
         {
             return fail("bad_receipt", "PAYMENT-RESPONSE is for another network or payer");
         }
-        if py_str(r.get("req")) != request_digest(method, path, body) {
+        if py_str(r.get("req")) != request_digest_v2(method, &format!("{origin}{path}"), body) {
             return fail("bad_receipt", "receipt is for another request");
+        }
+        if r.get("status").and_then(Value::as_u64) != Some(answer.0 as u64) || py_str(r.get("bodyHash")) != body_hash(answer.1) {
+            // a truncated or altered answer is not the one the provider signed for
+            return fail("bad_receipt", "receipt is for another answer (status or body differs)");
         }
         let sig = hex::decode(py_str(r.get("sig"))).unwrap_or_default();
         if !ecdsa::verify(&ch.payer.params.payee_pub, &receipt_message(&r), &sig) {
@@ -998,7 +1008,7 @@ impl Client {
         ch.pending_cond = Some(PendingCond { hash: h, cipher: cipher.clone(), amount: cond_amt });
         ch.seq += 1;
         let mut pl = json!({"chan": ch.payer.params.channel_id(), "seq": ch.seq, "cum": uncond.to_string(), "hashlock": hex::encode(h), "sig": sig});
-        Self::auth(ch, &mut pl, method, &path, body)?;
+        Self::auth(ch, &mut pl, method, &format!("{origin}{path}"), body)?;
         let hdrs = vec![("PAYMENT-SIGNATURE".to_string(), b64json(&payment_payload(&acc, &pl)))];
         let r = self.transport.request(method, url, body, &hdrs)?;
         if r.status == 402 {
@@ -1013,14 +1023,16 @@ impl Client {
         if sha256(&k) != h {
             return fail("bad_preimage", "provider preimage does not match H");
         }
-        let plain = decrypt(&cipher, &k);
-        ch.pending_cond = None;
         if let Some(hv) = header(&r, "PAYMENT-RESPONSE") {
+            // while the hash lock is pending: after a bad_receipt, recover_conditional still reads k
+            // from the provider's claim
             let resp = unb64json(hv)?;
-            self.receipt(&origin, &resp, method, &path, body, Some(cond_amt))?;
+            self.receipt(&origin, &resp, method, &path, body, (r.status, &r.body), Some(cond_amt))?;
         }
+        let plain = decrypt(&cipher, &k);
         // upgrade: fold the increment into a plain state and hand it over now
         let ch = self.channels.get_mut(&origin).ok_or_else(|| ChannelError::code("no_channel"))?;
+        ch.pending_cond = None;
         let new_cum = (uncond + cond_amt).max(ch.payer.params.min_amount());
         if new_cum > ch.payer.signed {
             ch.last_sig = hex::encode(ch.payer.sign_state(new_cum)?);
