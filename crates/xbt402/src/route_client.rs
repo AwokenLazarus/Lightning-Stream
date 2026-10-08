@@ -449,7 +449,7 @@ impl RoutePayer {
                     FeePayer::parse(fp.as_str().unwrap_or("")).map_err(|_| ChannelError::new("bad_offer", "unknown closeFeePayer"))?;
                 }
                 if ex.get("derivation").and_then(Value::as_str) != Some(DERIVATION) {
-                    return fail("bad_offer", "payee key derivation is not v2 (xbt402 v1.1)");
+                    return fail("bad_offer", format!("channel binding is not {DERIVATION:?} (payee key v2, request binding v2)"));
                 }
                 return Ok(acc.clone());
             }
@@ -637,7 +637,7 @@ impl RoutePayer {
             // write-ahead: a restart starts past every seq that may have left
             self.persist(&[(format!("shard {}", sh.url), sh.to_json())])?;
         }
-        let auth = call_auth(&sh.key, &sh.session, seq, &request_digest(method, &sh.path, body));
+        let auth = call_auth(&sh.key, &sh.session, seq, &request_digest_v2(method, &sh.url, body));
         let hdr = b64json(&json!({"session": sh.session, "seq": seq, "auth": auth}));
         let t0 = Instant::now();
         let r = self.http.request(method, &sh.url, body, &[("ROUTE-AUTH".into(), hdr)])?;
@@ -909,7 +909,7 @@ impl RoutePayer {
         let mut pl = pl.clone();
         pl["seq"] = ch.seq.into();
         let chan = ch.params.channel_id();
-        pl["auth"] = self.signer.request_auth(&chan, Some(&pl["seq"]), Some(&pl["cum"]), None, &request_digest("POST", HUB_ROUTE_PATH, body.as_bytes()))?.into();
+        pl["auth"] = self.signer.request_auth(&chan, Some(&pl["seq"]), Some(&pl["cum"]), None, &request_digest_v2("POST", &format!("{}{HUB_ROUTE_PATH}", self.hub_url), body.as_bytes()))?.into();
         Ok(pl)
     }
 

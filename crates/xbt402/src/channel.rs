@@ -38,8 +38,11 @@ pub const REFUND_VSIZE: u64 = 140;
 pub const EXPIRY_MAX: u32 = 500_000_000;
 /// v1.1 payee key derivation tag (v1.0 was "xbt-channel/payee", without the network).
 pub const PAYEE_TAG: &str = "xbt-channel/payee/v2";
-/// Advertised as `PaymentRequirements.extra.derivation`.
-pub const DERIVATION: &str = "v2";
+/// Advertised as `PaymentRequirements.extra.derivation`: what a client must speak before it funds.
+/// "v3" (AGP-068) keeps the v2 payee key ([`PAYEE_TAG`]) and binds requests with
+/// [`crate::wire::request_digest_v2`] and receipts over the answer; a "v2" client refuses it
+/// before funding, as a "v3" client refuses a "v2" server.
+pub const DERIVATION: &str = "v3";
 
 /// Who pays a state's close fee (v1.2 `closeFeePayer`; v1.1 is always the payer).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]

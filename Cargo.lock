@@ -2668,7 +2668,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
- "tiny_http",
  "ureq",
  "xbt-primitives",
  "xbt-svc",

@@ -18,7 +18,7 @@ use xbt402::client::Transport;
 use xbt402::conditional::{encrypt, preimage_from_tx};
 use xbt402::json::{dumps, py_str};
 use xbt402::provider::HttpResponse;
-use xbt402::wire::{b64json, facilitator_request, receipt_of, request_digest, safe_code, scheme_accepted, unb64json, FACILITATOR_VERIFY};
+use xbt402::wire::{b64json, facilitator_request, receipt_of, request_digest_v2, safe_code, scheme_accepted, unb64json, FACILITATOR_VERIFY};
 use xbt_primitives::ecdsa;
 use xbt_primitives::hash::{sha256, tagged_hash};
 use xbt_primitives::tx::Tx;
@@ -174,7 +174,7 @@ impl Session {
         let extra = acc.get("extra").cloned().unwrap_or(json!({}));
         if extra.get("derivation").and_then(Value::as_str) != Some(DERIVATION) {
             // checked before funding: a mismatch strands the coins (no provider text: L12)
-            return Err(rt(format!("provider payee-key derivation is not {DERIVATION:?}; refused before funding")));
+            return Err(rt(format!("provider channel binding (extra.derivation) is not {DERIVATION:?}; refused before funding")));
         }
         let close_fee = or_int(extra.get("closeFeeSat"), 600)?;
         if self.close_fee_max > 0 && close_fee > self.close_fee_max {
@@ -321,7 +321,7 @@ impl Session {
 
     /// H3: bind this payload to (method, path, body). The ECDH key stays in the book.
     fn with_auth(&self, payload: &mut Value, method: &str, url: &str, body: &[u8]) -> Result<()> {
-        let req = request_digest(method, &request_target(url), body);
+        let req = request_digest_v2(method, url, body);
         let chan = py_str(payload.get("chan"));
         let sig = payload.get("sig").and_then(Value::as_str).map(str::to_string);
         payload["auth"] = self.book.request_auth(&chan, payload.get("seq"), payload.get("cum"), sig.as_deref(), &req)?.into();
