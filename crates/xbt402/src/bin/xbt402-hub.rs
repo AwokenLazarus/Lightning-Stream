@@ -98,7 +98,7 @@ fn load_config(args: &[String], data: Option<&DataDir>) -> Value {
         let defaults = [("bind", json!("0.0.0.0")), ("port", json!(9480)),
                         ("datadir", json!(d.component(xbt_svc::HUB).join("state").to_string_lossy()))];
         for (k, v) in defaults {
-            if conf.get(k).map_or(true, Value::is_null) {
+            if conf.get(k).is_none_or(Value::is_null) {
                 conf[k] = v;
             }
         }

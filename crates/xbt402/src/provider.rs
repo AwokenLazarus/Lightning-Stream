@@ -196,7 +196,7 @@ pub struct Provider {
 fn locks_open(st: &ChannelState) -> bool {
     truthy(st.extra.get("route_lock"))
         || st.extra.get("stale_locks").and_then(Value::as_array).is_some_and(|s| {
-            s.iter().any(|x| py_u64(x.get("cum")).map_or(true, |c| c > st.best_cum))
+            s.iter().any(|x| py_u64(x.get("cum")).is_none_or(|c| c > st.best_cum))
         })
 }
 

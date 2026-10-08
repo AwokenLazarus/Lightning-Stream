@@ -27,6 +27,8 @@ References (read-only): B1 `agp-050` (`~/xbt-rnd/b1-agp-050`, from agp-054 `0eeb
 
 ```bash
 cargo test -j2 --workspace
+cargo deny check                   # AGP-075: licences (deny.toml), advisories, crates.io only
+cargo clippy --workspace --all-targets --all-features -- -D warnings   # AGP-075: clean on main
 cargo build -j2 --release --target aarch64-unknown-linux-gnu -p xbt402
 ./scripts/conformance.sh           # N/N byte-identical, both directions
 ./scripts/regtest_interop.sh       # Rust <-> Python on a private Knots 29.4.2 regtest node
@@ -1313,7 +1315,9 @@ written to a temp file, hard-linked into place (a crash leaves no half-written k
 directory is fsynced. A key file with any group or other permission bit (`mode & 0o077`), or that
 is not a key, is refused (error code `key_file`). `xbt-work-provider` runs a watcher (`close_due`) every `--watch-secs`
 (`XBT_WORK_WATCH_SECS`, default 5), which closes channels before their payers' refunds and bumps
-stuck closes. `load_or_create_secret(path)` is public for embedders.
+stuck closes. `load_or_create_secret(path)` is public for embedders. `xbt402-route-provider`
+takes the same `--data-dir` (AGP-075; default `./xbt402-route-provider-data`); `--ledger FILE`
+and `--secret HEX` still override the ledger and the key.
 
 **C5: one opener per ledger.** `Ledger::open` and `FileClientLedger::open` take an exclusive
 `flock(2)` on a sidecar `<path>.lock`, which holds the opener's pid. A second opener, in this

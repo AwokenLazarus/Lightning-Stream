@@ -131,6 +131,9 @@ pub type SpendBook = Arc<dyn Fn(&str, i64, &str, i64) -> Result<()> + Send + Syn
 /// dust floor). `(dest, max_sats, delta_sats)`; `Some(deny)` stops the call before anything is signed.
 pub type SpendCheck = Arc<dyn Fn(&str, i64, i64) -> Result<Option<Value>> + Send + Sync>;
 
+/// One stream chunk: `Ok((data, charged, chan))`, or `Err((reason, charged, chan))`.
+type ChunkStep = std::result::Result<(Vec<u8>, i64, String), (String, i64, String)>;
+
 /// One signer-owned client session.
 pub struct Session {
     pub book: Arc<ChannelBook>,
@@ -612,7 +615,7 @@ impl Session {
         for i in 0..n - 1 {
             let url = format!("{dest}{}", chunk_url.replace("{i}", &i.to_string()));
             let t = Instant::now();
-            let step = || -> std::result::Result<(Vec<u8>, i64, String), (String, i64, String)> {
+            let step = || -> ChunkStep {
                 let rec = self.book.fresh_seq(dest).map_err(|e| (e.msg, 0, String::new()))?;
                 let (r, receipt) = self.paid("GET", &url, b"", acc, json!({"chan": rec.chan, "seq": rec.seq, "cum": rec.used_sats.to_string()}))
                     .map_err(|e| (e.msg, 0, rec.chan.clone()))?;

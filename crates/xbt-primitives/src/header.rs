@@ -487,13 +487,13 @@ impl ChainRules {
     pub fn next_bits_with<'a>(&self, parent: &'a Header, child_time: u32,
                               ancestor: impl Fn(u32) -> Option<&'a Header>) -> Result<Allowed> {
         let pl_bits = target_to_bits(self.pow_limit);
-        let boundary = (parent.height as u64 + 1) % self.interval as u64 == 0;
+        let boundary = (parent.height as u64 + 1).is_multiple_of(self.interval as u64);
         if !boundary && self.allow_min_difficulty {
             if child_time as u64 > parent.time as u64 + 2 * self.spacing {
                 return Ok(Allowed::Exact(vec![pl_bits]));
             }
             let mut p = parent;
-            while p.height % self.interval != 0 && p.bits == pl_bits {
+            while !p.height.is_multiple_of(self.interval) && p.bits == pl_bits {
                 match p.height.checked_sub(1).and_then(&ancestor) {
                     Some(a) => p = a,
                     None => break,
@@ -526,7 +526,7 @@ impl ChainRules {
         if self.allow_min_difficulty || self.no_retargeting {
             return Ok(Allowed::Exact(vec![parent.bits, pl_bits]));
         }
-        if (parent.height as u64 + 1) % self.interval as u64 != 0 {
+        if !(parent.height as u64 + 1).is_multiple_of(self.interval as u64) {
             return Ok(Allowed::Exact(vec![parent.bits]));
         }
         let pt = bits_to_target(parent.bits)?;
