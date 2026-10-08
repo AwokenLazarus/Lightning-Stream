@@ -51,7 +51,13 @@ fn v1(prev_display: [u8; 32], time: u32) -> Vec<u8> {
 
 /// Seconds per run, the best of `runs`.
 fn best(runs: usize, mut f: impl FnMut()) -> f64 {
-    (0..runs).map(|_| { let t = Instant::now(); f(); t.elapsed().as_secs_f64() }).fold(f64::MAX, f64::min)
+    (0..runs)
+        .map(|_| {
+            let t = Instant::now();
+            f();
+            t.elapsed().as_secs_f64()
+        })
+        .fold(f64::MAX, f64::min)
 }
 
 fn main() {
@@ -80,16 +86,31 @@ fn main() {
     };
 
     let rules = ChainRules::regtest();
-    let pow = best(5, || for r in &raws { header::check_pow(&black_box(parse_header(r)).expect("mined"), &rules).expect("pow"); });
-    println!("parse (BLAKE2b) + PoW alone  {:8.0} ns/header", pow / n * 1e9);
+    let pow = best(5, || {
+        for r in &raws {
+            header::check_pow(&black_box(parse_header(r)).expect("mined"), &rules).expect("pow");
+        }
+    });
+    println!(
+        "parse (BLAKE2b) + PoW alone  {:8.0} ns/header",
+        pow / n * 1e9
+    );
 
     let connect = best(5, || {
         let mut c = fresh();
         for (k, chunk) in raws.chunks(CHUNK).enumerate() {
-            assert!(c.connect(101 + (k * CHUNK) as u32, chunk).expect("connect").adopted);
+            assert!(
+                c.connect(101 + (k * CHUNK) as u32, chunk)
+                    .expect("connect")
+                    .adopted
+            );
         }
     });
-    println!("connect, 4 x 2016 headers    {:8.0} ns/header  ({:.1} ms total)", connect / n * 1e9, connect * 1e3);
+    println!(
+        "connect, 4 x 2016 headers    {:8.0} ns/header  ({:.1} ms total)",
+        connect / n * 1e9,
+        connect * 1e3
+    );
 
     let streamed = best(5, || {
         let mut c = fresh();
@@ -99,41 +120,90 @@ fn main() {
         }
         assert!(c.adopt(b).expect("adopt").adopted);
     });
-    println!("streamed Branch + adopt      {:8.0} ns/header  ({:.1} ms total)", streamed / n * 1e9, streamed * 1e3);
+    println!(
+        "streamed Branch + adopt      {:8.0} ns/header  ({:.1} ms total)",
+        streamed / n * 1e9,
+        streamed * 1e3
+    );
 
     let no_walk = best(5, || {
         let mut c = fresh();
         c.rules.allow_min_difficulty = false;
         for (k, chunk) in raws.chunks(CHUNK).enumerate() {
-            assert!(c.connect(101 + (k * CHUNK) as u32, chunk).expect("connect").adopted);
+            assert!(
+                c.connect(101 + (k * CHUNK) as u32, chunk)
+                    .expect("connect")
+                    .adopted
+            );
         }
     });
-    println!("connect, mainnet's path      {:8.0} ns/header  ({:.1} ms total, no min-difficulty walk)", no_walk / n * 1e9, no_walk * 1e3);
+    println!(
+        "connect, mainnet's path      {:8.0} ns/header  ({:.1} ms total, no min-difficulty walk)",
+        no_walk / n * 1e9,
+        no_walk * 1e3
+    );
 
-    let cp_cost = best(50, || { black_box(fresh()); });
+    let cp_cost = best(50, || {
+        black_box(fresh());
+    });
     println!("checkpoint with 10 priors    {:8.1} us", cp_cost * 1e6);
 
     let mut full = fresh();
     for (k, chunk) in raws.chunks(CHUNK).enumerate() {
-        full.connect(101 + (k * CHUNK) as u32, chunk).expect("connect");
+        full.connect(101 + (k * CHUNK) as u32, chunk)
+            .expect("connect");
     }
     let tip = full.tip_height().expect("tip");
-    let br = best(50, || { black_box(full.branch(tip).expect("branch")); });
-    println!("branch() at the tip          {:8.1} us (per sync round)", br * 1e6);
+    let br = best(50, || {
+        black_box(full.branch(tip).expect("branch"));
+    });
+    println!(
+        "branch() at the tip          {:8.1} us (per sync round)",
+        br * 1e6
+    );
 
     const CALLS: u32 = 1_000_000;
-    let imp = best(5, || for _ in 0..CALLS { assert!(black_box(full.implausible(U512::ZERO, Some((600, 2016)))).is_none()); });
-    println!("implausible() per answer     {:8.1} ns", imp / CALLS as f64 * 1e9);
+    let imp = best(5, || {
+        for _ in 0..CALLS {
+            assert!(black_box(full.implausible(U512::ZERO, Some((600, 2016)))).is_none());
+        }
+    });
+    println!(
+        "implausible() per answer     {:8.1} ns",
+        imp / CALLS as f64 * 1e9
+    );
 
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../vectors/mainnet_headers_961630.json");
-    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).expect("vector")).expect("json");
-    let main: Vec<Vec<u8>> = v["headers"].as_array().expect("headers").iter()
-        .map(|h| hex::decode(h.as_str().expect("hex")).expect("hex")).collect();
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../vectors/mainnet_headers_961630.json"
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).expect("vector")).expect("json");
+    let main: Vec<Vec<u8>> = v["headers"]
+        .as_array()
+        .expect("headers")
+        .iter()
+        .map(|h| hex::decode(h.as_str().expect("hex")).expect("hex"))
+        .collect();
     let above = main.len() - 11;
     let mainnet = best(20, || {
-        let mut c = HeaderChain::with_system_clock("main", (header::MAINNET_CHECKPOINT.0, header::MAINNET_CHECKPOINT.1), None).expect("chain");
-        c.set_checkpoint(&main[10], &main[..10]).expect("checkpoint");
-        assert!(c.connect(header::MAINNET_CHECKPOINT.0, &main[11..]).expect("connect").adopted);
+        let mut c = HeaderChain::with_system_clock(
+            "main",
+            (header::MAINNET_CHECKPOINT.0, header::MAINNET_CHECKPOINT.1),
+            None,
+        )
+        .expect("chain");
+        c.set_checkpoint(&main[10], &main[..10])
+            .expect("checkpoint");
+        assert!(
+            c.connect(header::MAINNET_CHECKPOINT.0, &main[11..])
+                .expect("connect")
+                .adopted
+        );
     });
-    println!("mainnet 961640 + {above} real     {:8.1} us total ({:.0} ns/header incl. checkpoint)", mainnet * 1e6, mainnet / above as f64 * 1e9);
+    println!(
+        "mainnet 961640 + {above} real     {:8.1} us total ({:.0} ns/header incl. checkpoint)",
+        mainnet * 1e6,
+        mainnet / above as f64 * 1e9
+    );
 }

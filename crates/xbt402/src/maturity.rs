@@ -31,15 +31,37 @@ impl Maturity {
     /// deployment has only the ordinary depth; a listed one with a missing field is an error.
     pub fn from_deployments(info: &Value) -> Result<Self> {
         let Some(d) = info.get("deployments").filter(|d| d.is_object()) else {
-            return Err(ChannelError::new("node", "getdeploymentinfo has no deployments"));
+            return Err(ChannelError::new(
+                "node",
+                "getdeploymentinfo has no deployments",
+            ));
         };
-        let Some(l) = d.get("long_coinbase_maturity") else { return Ok(Self { long: None }) };
-        let f = |k: &str| l.get(k).and_then(Value::as_u64).and_then(|v| u32::try_from(v).ok());
-        match (f("coinbase_start_height"), f("height"), f("height_end"), f("maturity")) {
-            (Some(coinbase_start), Some(enforce), Some(end), Some(depth)) => {
-                Ok(Self { long: Some(LongMaturity { coinbase_start, enforce, end, depth }) })
-            }
-            _ => Err(ChannelError::new("node", "long_coinbase_maturity: a field is missing or out of range")),
+        let Some(l) = d.get("long_coinbase_maturity") else {
+            return Ok(Self { long: None });
+        };
+        let f = |k: &str| {
+            l.get(k)
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+        };
+        match (
+            f("coinbase_start_height"),
+            f("height"),
+            f("height_end"),
+            f("maturity"),
+        ) {
+            (Some(coinbase_start), Some(enforce), Some(end), Some(depth)) => Ok(Self {
+                long: Some(LongMaturity {
+                    coinbase_start,
+                    enforce,
+                    end,
+                    depth,
+                }),
+            }),
+            _ => Err(ChannelError::new(
+                "node",
+                "long_coinbase_maturity: a field is missing or out of range",
+            )),
         }
     }
 
@@ -47,7 +69,10 @@ impl Maturity {
     /// every coinbase spend to the long depth whatever its height (policy start height 0), so this
     /// is when a wallet can actually move it.
     pub fn relay_at(&self, height: u32) -> u32 {
-        height.saturating_add(self.long.map_or(ORDINARY_MATURITY, |l| l.depth.max(ORDINARY_MATURITY)))
+        height.saturating_add(
+            self.long
+                .map_or(ORDINARY_MATURITY, |l| l.depth.max(ORDINARY_MATURITY)),
+        )
     }
 
     /// The first height at which a block may include a spend of the coinbase at `height`.
@@ -59,7 +84,11 @@ impl Maturity {
         }
         let long = height.saturating_add(l.depth);
         // a spend at s needs the long depth while enforce <= s <= end, the ordinary one otherwise
-        if ordinary < l.enforce || ordinary > l.end { ordinary } else { long.min(l.end.saturating_add(1)) }
+        if ordinary < l.enforce || ordinary > l.end {
+            ordinary
+        } else {
+            long.min(l.end.saturating_add(1))
+        }
     }
 }
 
@@ -75,11 +104,27 @@ mod tests {
                                                                       "coinbase_start_height": 973440, "maturity": 6480, "active": true}}});
         let m = Maturity::from_deployments(&main).unwrap();
         assert_eq!(m.relay_at(975000), 981480);
-        assert_eq!(m.relay_at(900000), 906480, "policy holds every coinbase to the long depth");
-        assert_eq!(m.consensus_at(900000), 900100, "before coinbase_start: the ordinary depth");
-        assert_eq!(m.consensus_at(975000), 979920, "the rule ends after height_end");
+        assert_eq!(
+            m.relay_at(900000),
+            906480,
+            "policy holds every coinbase to the long depth"
+        );
+        assert_eq!(
+            m.consensus_at(900000),
+            900100,
+            "before coinbase_start: the ordinary depth"
+        );
+        assert_eq!(
+            m.consensus_at(975000),
+            979920,
+            "the rule ends after height_end"
+        );
         assert_eq!(m.consensus_at(973440), 979920);
-        assert_eq!(m.consensus_at(979900), 980000, "the ordinary depth already ends past height_end");
+        assert_eq!(
+            m.consensus_at(979900),
+            980000,
+            "the ordinary depth already ends past height_end"
+        );
         // regtest without the rule
         let reg = Maturity::from_deployments(&json!({"deployments": {"segwit": {}}})).unwrap();
         assert_eq!((reg.relay_at(110), reg.consensus_at(110)), (210, 210));
