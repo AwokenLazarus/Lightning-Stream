@@ -174,6 +174,16 @@ pub struct Provider {
     recovered: Vec<(String, u64)>,
 }
 
+/// A hub's ch1 holds a routed lock that its best state does not cover (AGP-064): the one in flight
+/// (`route_lock`), or one written off (`stale_locks`) above the best state, which the hub may still
+/// have to pay on its ch2. Closing ch1 now would close below it.
+fn locks_open(st: &ChannelState) -> bool {
+    truthy(st.extra.get("route_lock"))
+        || st.extra.get("stale_locks").and_then(Value::as_array).is_some_and(|s| {
+            s.iter().any(|x| py_u64(x.get("cum")).map_or(true, |c| c > st.best_cum))
+        })
+}
+
 /// A direct call between its reservation and its settlement (AGP-059). Dropped unsettled (the
 /// handler or the charge panicked), it refunds the reservation: nothing was charged.
 struct InCall<'a> {
@@ -687,6 +697,11 @@ impl Provider {
         }
         let mut l = lock(&self.ledger);
         let mut st = l.channels[&cid].clone();
+        // AGP-064 (H1): route() writes its lock and lets go of the ledger before it forwards, so a
+        // close here could otherwise land between the two
+        if st.closed_txid.is_empty() && locks_open(&st) {
+            return fail("lock_pending", "a routed lock is open on this channel");
+        }
         if truthy(req.get("payload")) && st.closed_txid.is_empty() {
             let r = self.apply(&mut st, &req["payload"]);
             if let Err(e) = r {
@@ -719,7 +734,7 @@ impl Provider {
         if !st.closed_txid.is_empty() {
             return fail("channel_closed", format!("closed by {}", st.closed_txid));
         }
-        if truthy(st.extra.get("route_lock")) || st.extra.get("stale_locks").and_then(Value::as_array).is_some_and(|s| !s.is_empty()) {
+        if locks_open(&st) {
             return fail("lock_pending", "a routed lock is open on this channel");
         }
         if st.extra.get("hub").is_some_and(|h| truthy(Some(h))) {
@@ -955,6 +970,12 @@ impl Provider {
             }
         }
         if (!st.best_sig.is_empty() || !st.cond_sig.is_empty()) && h as i64 >= p.expiry as i64 - self.cfg.close_margin as i64 {
+            // AGP-064: a lock in flight (seconds: the hub's revealTimeout) is let finish, in the first
+            // half of the margin only. Never for a written-off lock: a skipped margin close lets the
+            // payer refund the whole channel at expiry.
+            if truthy(st.extra.get("route_lock")) && (h as i64) < p.expiry as i64 - (self.cfg.close_margin as i64 + 1) / 2 {
+                return Ok(());
+            }
             out.push(self.close_locked(l, st)?);
             if truthy(st.extra.get("cond_close")) {
                 self.claim(st)?;
