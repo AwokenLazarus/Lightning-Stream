@@ -997,6 +997,145 @@ through `xbt-primitives` (NTA BIP340).
   paid with the carry, released. D: a pool block outside the invoice covers the rest. Then the payer's 19 checks.
   42/42 on 2026-09-29 (`docs/work-nta-agp043-20260929-032035/`).
 
+## The coinbase audit without trusting the Prime (AGP-065, review P1–P6)
+
+An external reviewer read the public snapshot (xbt-rs `9201104`). His point: the §10.3 audit took every
+number from the Prime's own window statement, so a Prime colluding with a payer could receipt work
+nobody mined and then sign a statement that excused the unpaid coinbase. Every finding was still
+present on `main` (`e0b832a`). Each now has a test in `crates/xbt-work/tests/review_p.rs`; P1–P4 were
+first run against `main` and failed there.
+
+* **P1: the provider pins the Prime's terms.** `WorkConfig::terms` (`audit::PrimeTerms { window,
+  window_min_work, window_tolerance_bps, fee_bps, max_min_payout }`) comes from the provider's config,
+  never from a statement. `PrimeTerms::bounds(&ChainBlock)` turns it into `AuditBounds`:
+  `window_work ≤ ⌈max(target(bits), target(prev_bits)) × (10⁴ + tolerance) / 10⁴⌉`, where
+  `target(b) = max(⌈window × D(b)⌉, window_min_work)` (primed's own rule, `state.rs` 651–654) and `D` is
+  the difficulty of the block's own nBits and of its parent's (the Prime may have built the window
+  under either). `fee_bps` is capped at the advertised fee, and `min_payout` at `max_min_payout`.
+  `audit_block` and `check_fraud_proof` both use `min(statement, bound)` for each value, so a third party
+  holding the same terms convicts from the proof alone. A proof that needed a bound carries it under
+  `"bounds"`; with no bound applied it is the AGP-032 document, byte for byte. A statement whose
+  `window_start` is lower than that of an audited block beneath it is refused (`window_start_regressed`)
+  and the block's credit stays held. A pass where `expected` fell below `min_payout` records the
+  shortfall as owed carry (`belowMinSats`) instead of forgiving it. Tests:
+  `p1_colluding_prime_statements_fail_the_audit` (`window_work = u64::MAX`, `fee_bps = 10000`,
+  `min_payout = u64::MAX`), `p1_an_honest_statement_is_not_bounded`, `p1_window_start_is_monotonic`,
+  `p1_a_below_min_pass_is_owed_carry`, `terms_bound_the_window`. Inside the bounds, the size of the
+  window and who did the rest of its work are still the Prime's word.
+  `docs/xbt-work-share-log-commitment.md` proposes a per-block commitment to the share log that a
+  provider can sample (a spec proposal for XBT-053, not implemented).
+* **Where the Prime validates shares.** The Prime is primed (`AwokenLazarus/Bitcoin`, branch `rnd/agp-011`,
+  `91b2d8b`); no pool code changed. `prime/primed/src/session.rs` `on_pow` (about lines 1340–1575)
+  takes the share's job and coinbase sections, then holds the job's height, parent and nBits to the pool
+  node's tip (stale, wrong-bits and dead-parent shares are refused). `prime/wire/src/verify.rs` `verify`
+  (about 420–600) rebuilds the coinbase (its BIP34 height must be the job's), refuses a coinbase that
+  does not pay the split the Prime issued, rebuilds the BLAKE2b header from the merkle branches and the
+  share's own fields, and checks the hash against the share target. Back in `on_pow`, a pool-wide set
+  allows one credit per hash per height (about 1507–1527); then the TIDES ledger is credited and, for a
+  `.pw-<invoice>` username, so is the receipt (`work_receipts.credit`, about 1563–1566). The audit does
+  not re-check shares: it cannot see them. It bounds what the Prime can claim about them.
+* **P2: a pass releases only what it covered.** The book keeps one `Span` per receipted increase:
+  invoice, `lo..hi`, work, credited, coverage (`Open`, `Covered(h)`, `Skipped(h)`). A passing audit at `H`
+  with window start `ws` covers only open spans with `lo > ws` and `hi < H`, exactly the intervals its
+  bound counted. Spans at or below `ws` are `Skipped`: no later window can count them. Up to
+  `CreditCaps::skipped` of skipped credit is forgiven; beyond that it counts against the total cap for good.
+  Covered spans are credited in full, free of the caps. Tests: `p2_a_pass_releases_only_covered_credit`,
+  `p2_skipped_credit_fills_the_total_cap`, `a_pass_covers_only_the_spans_its_bound_counts`.
+* **P3: the statement must name the node's block.** The audit takes the block from the provider's node
+  (`chain::ChainBlock { height, hash, value_sats, paid_sats, bits, prev_bits }`). A statement for another
+  height or hash fails with `wrong_block` (`p3_statement_height_must_be_the_blocks`: `height = u32::MAX`
+  and `height = window_start + 1`).
+* **P4: a missing statement is never skipped.** `tools::window`: 200 is a statement, 404 (primed's
+  "no window statement", `stats.rs` 434) is `Statement::Missing`, and anything else is an error.
+  `WorkProvider::audit_chain`: a missing statement for a coinbase that paid the identity fails the
+  audit and distrusts the Prime (`missing_statement`); for one that paid nothing it records nothing and
+  the credit stays held. The audit loop stops at a Prime or node error and resumes at that block.
+  Tests: `p4_a_statement_error_is_not_a_missing_statement`, `p4_a_missing_statement_fails_or_holds`.
+* **P5: default caps.** With no cap flag, `xbt-work-provider` caps unaudited credit at 100 calls per invoice
+  and 1,000 calls in total, and forgives at most 100 calls of skipped credit. `--cap-*-calls N` (new)
+  sets a cap in calls at `--price`, and `off` removes a cap. The library's `CreditCaps::default()` is
+  still uncapped (the reference's book, which the vectors pin). Test: `p5_the_binary_ships_non_zero_caps`.
+* **P6: invoices, issuance, state, reorgs.**
+  * An unfunded invoice past its TTL stays dormant for `invoice_grace_secs` (default 3600 s): its
+    receipts are still pulled and a receipt with work still spends on it. Only a newer invoice that
+    needs the room evicts it, oldest first (`p6_an_invoice_with_work_outlives_its_ttl`).
+  * Issuance is limited per client (`max_unfunded_per_client`, default 16, `429 too_many_invoices`). The
+    client is the TCP peer, which the xbt402 HTTP server now passes in `X-Xbt402-Peer`
+    (`xbt402::provider::PEER_HEADER`; a client-sent copy is dropped). Behind a reverse proxy,
+    `--trust-forwarded` takes the last `X-Forwarded-For` hop instead (`p6_issuance_is_limited_per_client`).
+  * The state is snapshotted under the lock with a generation number and written (fsync, rename) outside
+    it. A writer skips a snapshot older than the last one written; a failed write on the payment path
+    rolls the debit back (`p6_concurrent_writes_keep_the_newest_state`).
+  * Earlier receipts (`by_seq`) are persisted as `"receipts"` (state version 2), so a restart still
+    detects an equivocation against them. AGP-043 state migrates on load
+    (`earlier_receipts_survive_a_restart_and_agp043_state_migrates`). A state file that exists but
+    cannot be read is now an error, not an empty book.
+  * Reorgs: before each pass the audit loop compares the audited blocks with its node.
+    `WorkProvider::orphaned(h)` undoes a reorged block's verdict and carry and reopens the spans it
+    covered, so they count against the caps again (`p6_a_reorg_rolls_back_released_credit`). Audits deeper
+    than `SETTLE_DEPTH` (144) settle: their spans and the receipts under their window are pruned.
+* **DATUM usernames.** The Prime can only receipt `.pw-<invoice>` if the gateway passes the miner's
+  username through. That needs `datum.pool_pass_full_users = true`, which is the DATUM gateway's
+  default. With it false and `pool_pass_workers` on, the gateway sends `pool_address.<username>`; with
+  both false, `pool_address` alone (`datum_protocol.c` 2720–2728). Either way the Prime credits the
+  gateway's pool address and no receipt appears. `xbt-work-payer prepare --gateway-config FILE` refuses
+  such a config (`payer::check_gateway_config`, `datum_gateway_must_pass_full_usernames`). If no
+  receipt arrives within 5 minutes, `pay` prints a hint naming the setting. On regtest the first
+  receipt can take longer than that, so the hint is advice, not an error.
+* **M1: locked coinbases.** `chain::Maturity::from_deployments` reads Knots'
+  `getdeploymentinfo.deployments.long_coinbase_maturity` (`coinbase_start_height`, `height`,
+  `height_end`, `maturity`) from the node and is never hard-coded. A node without the deployment means
+  ordinary maturity (100). The choice: a locked payout **counts as paid** in the audit, because the
+  coinbase did pay the identity and the Prime cannot do better. It is reported apart as illiquid.
+  `WorkProvider::payouts(tip, &maturity)` and `GET /admin/xbt-work/report` `payouts` split the audited
+  payouts into `liquidSats` and `lockedSats`. A provider that sells credit against its payouts should
+  count only the liquid part as money in hand, and its caps bound what it extends meanwhile.
+  `relay_at(h)` is when a spend of the coinbase relays (mempool policy applies the long depth to every
+  coinbase); `consensus_at(h)` is the consensus rule (`m1_locked_payouts_are_paid_but_illiquid`,
+  `maturity_from_the_node`).
+
+**For embedders (cmp and anyone linking `xbt-work`).** Wire and behaviour changes:
+
+| change | before | now |
+|---|---|---|
+| `audit_block(book, sw, V, paid, deferred)` | statement on trust | `audit_block(book, sw, &ChainBlock, &AuditBounds, deferred)`; `AuditBounds::STATEMENT_ONLY` is the old check |
+| `check_fraud_proof(proof, pk)` | | `check_fraud_proof(proof, pk, &ChainBlock, &AuditBounds)` |
+| `WorkProvider::audit(sw, deferred, V, paid)` | | `audit(sw, deferred, &ChainBlock)`, plus `audit_chain(&ChainBlock, Statement)` |
+| `AuditOutcome` | | adds `below_min_sats`, `window_work`, `fee_bps`, `min_payout`, `bounded` |
+| `WorkConfig` | | adds `terms`, `invoice_grace_secs`, `max_unfunded_per_client`, `trust_forwarded` |
+| `CreditCaps` | `per_invoice`, `total` | adds `skipped: u64` (default 0: nothing forgiven) |
+| `tools::window` | any non-200 → `None` | 404 → `None`, other errors → `Err` |
+| provider state file | version 1 | version 2 (`spans`, `settledSkipped`, `receipts`); version 1 loads |
+| fraud proof JSON | | `"bounds"` added only when a bound applied |
+| `xbt-work-provider` | caps off by default | 100/1,000/100 calls; Prime terms flags; reorg check; admin from loopback peers only |
+| xbt402 HTTP server | | sets `X-Xbt402-Peer` to the TCP peer on every request |
+
+The pricing fee is now `terms.fee_bps`, the fee the audit holds the Prime to. Python parity: the
+same logic lives in XBT-053 (lazarus-xbt), and the spec diff is routed there. The vectors are unchanged
+(`work_conformance.sh`: 91/91 and 124/0, byte-identical).
+
+Results on 2026-10-08: `cargo test --workspace` (464 passed) and `scripts/conformance.sh`;
+`scripts/work_interop.sh` Rust → Rust 20/20 with the provider and payer pinned to primed's regtest terms
+(`--prime-window-min-work 64`), no honest statement bounded
+(`docs/work-interop-agp065-2026-10-08-payer-rust-provider-rust.json`); `scripts/work_nta.sh` 42/42 with
+primed's fee of 5,000 bps pinned (`docs/work-nta-agp065-2026-10-08/`). One NTA check changed with P2: at
+C, block 115's pass covers the B share, which is now credited outside the caps (AGP-043 held it and
+released it by cap), so nothing stays held.
+
+CPU (`examples/audit_cost.rs`; armv7 musl under `qemu-arm-static` as the Pi-class figure, x86_64 native
+beside it; pass lines declared before measuring):
+
+| step | pass line (armv7) | armv7 | x86_64 |
+|---|---|---|---|
+| `PrimeTerms::bounds` (one block) | — | 2.2 µs | 0.1 µs |
+| `audit_block`, 10 / 1,000 spans | ≤ 5 ms | 0.43 / 0.79 ms | 0.03 / 0.07 ms |
+| credit room per paid call, 1,000 spans | ≤ 1 ms | 18 µs | 1.8 µs |
+| `check_fraud_proof`, 1 / 100 invoices | ≤ 20 ms | 0.95 / 40 ms | 0.06 / 2.9 ms |
+
+The fraud-proof check misses its line at 100 invoices: 200 Ed25519 receipt verifications (AGP-032), of
+which the bounds add 2 µs. It runs once per disputed block, not per call. `ReceiptBook::credit` now
+makes one pass over the spans; before, it recomputed the caps' room for each open span.
+
 ## Linking xbt-rs from cmp (AGP-035)
 
 xbt-compute's Rust runtime pins this repo by full rev with `default-features = false`. What that

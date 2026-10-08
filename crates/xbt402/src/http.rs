@@ -55,7 +55,7 @@ mod server {
     use std::thread::JoinHandle;
 
     use crate::hub::RouteHub;
-    use crate::provider::{HttpResponse, Provider};
+    use crate::provider::{HttpResponse, Provider, PEER_HEADER};
 
     /// Anything served over HTTP by [`serve_service`]: a provider, or a routing hub.
     pub trait HttpService: Send + Sync {
@@ -109,8 +109,11 @@ mod server {
             hs.push(std::thread::spawn(move || {
                 for mut req in server.incoming_requests() {
                     let url = req.url().to_string();
-                    let headers: Vec<(String, String)> =
-                        req.headers().iter().map(|h| (h.field.as_str().as_str().to_string(), h.value.as_str().to_string())).collect();
+                    let mut headers: Vec<(String, String)> = req.headers().iter().map(|h| (h.field.as_str().as_str().to_string(), h.value.as_str().to_string()))
+                        .filter(|(k, _)| !k.eq_ignore_ascii_case(PEER_HEADER)).collect();
+                    if let Some(a) = req.remote_addr() {
+                        headers.push((PEER_HEADER.to_string(), a.ip().to_string()));
+                    }
                     if headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("Transfer-Encoding")) {
                         respond(req, HttpResponse::new(501, vec![], b"transfer-encoding not supported".to_vec()));
                         continue;
