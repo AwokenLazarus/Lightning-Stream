@@ -46,7 +46,6 @@ fn is_loopback(addr: &str) -> bool {
     matches!(host.trim_start_matches('[').trim_end_matches(']'), "127.0.0.1" | "localhost" | "::1")
 }
 
-/// The signer answers `health`, and its readiness file (when there is one) is fresh and ok.
 /// AGP-063 X1: without a data dir, the token generated on first run and kept next to the signer
 /// socket (`<run dir>/mcp-http-token`, 0600): the agent's MCP client config reads it from there.
 fn local_token() -> Result<String, String> {
@@ -63,6 +62,7 @@ fn local_token() -> Result<String, String> {
     Ok(t)
 }
 
+/// The signer answers `health`, and its readiness file (when there is one) is fresh and ok.
 fn readiness(wallet: Arc<Wallet>, ready_file: Option<PathBuf>) -> ReadyFn {
     Arc::new(move || {
         let signer = match wallet.signer("health", &json!({})) {
