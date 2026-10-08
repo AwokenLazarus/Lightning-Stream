@@ -1205,9 +1205,9 @@ and up.
 - B5 and xbt-063 vendor pinned B1/B2 and are unaffected until they re-pin. On re-pin, B5
   `fwd/server.py` must add status and bodyHash to its receipts and use the v2 digest.
 - The B2 wallet (`agp-068`, `611ec39`) binds the v2 digest, but as before it does not check receipts.
-- xbt-wallet-ui, xbt-work-relay and xbt-wallet-mcp still serve with `tiny_http`, so they keep T1's
-  slowloris exposure until they move to the same server. That is a follow-up, and so is moving
-  xbt-work to v2.
+- xbt-wallet-ui, xbt-work-relay and xbt-wallet-mcp still served with `tiny_http`, so they kept T1's
+  slowloris exposure until AGP-072 moved them to the same server (next section). Moving xbt-work
+  to v2 is a follow-up.
 - `scripts/conformance.sh` defaults to B1 at `~/xbt-rnd/b1-agp-068` until this merges.
 
 Tests: `crates/xbt402/tests/http_limits.rs` (`slow_bodies_do_not_stall_the_server`,
@@ -1218,12 +1218,99 @@ AGP-068 tests in `lifecycle.rs` (`a_payment_is_bound_to_one_request_and_one_orig
 `a_seq_spent_on_a_refusal_survives_a_restart`, `the_receipt_covers_the_response`,
 `an_altered_conditional_answer_keeps_the_hash_lock`).
 
+## One bounded HTTP server for every service (AGP-072)
+
+review T1 for the other servers. AGP-068 fixed xbt402's server only; xbt-wallet-ui, xbt-wallet-mcp
+(streamable HTTP) and xbt-work-relay (both listeners) still served with `tiny_http` 0.12, with no
+header-line cap and no read deadline, and the MCP started one thread per request with no limit.
+All three, and xbt402, now listen with **`xbt_svc::http`**: the AGP-068 server, moved into xbt-svc
+(which all four already depend on) behind a small `Handler` trait. `tiny_http` is gone from the
+workspace (`Cargo.lock` loses it; `cargo tree -i tiny_http` finds nothing).
+
+**Limits** (`xbt_svc::http::Limits::default()`, the same as AGP-068): 8 KiB header line and 32 KiB
+head (431), the head within 10 s (408) and the body within 30 s, both absolute; at most 64
+connections (503); Content-Length bodies only, at most the handler's `body_limit` (413 before a
+body byte is read; Transfer-Encoding is 501); `Expect: 100-continue`; `Connection: close`.
+
+**What changed in the server while moving it:**
+
+- Connection threads are reused (an idle one waits 60 s for the next connection) instead of one
+  spawned per connection. The accept thread only queues a connection, so it is no longer the cap.
+- A complete request runs on its connection thread once one of `threads` handler slots is free,
+  instead of being handed to a worker and back. The bound on concurrent handlers is the same;
+  two thread switches per request are gone. A panicking handler still costs a 500 and its slot
+  is given back.
+- `HEAD` gets the headers and the length but no body; 1xx, 204 and 304 carry neither.
+  `Content-Length`, `Connection` and `Transfer-Encoding` are the server's: a handler's copies are
+  dropped, as before any header holding CR, LF or NUL.
+- The server's own refusals (400, 408, 413, 431, 501, 503) are `text/plain` with `Cache-Control:
+  no-store` and `nosniff`.
+- An accept error (out of descriptors) backs off 10 ms instead of spinning; a failed thread
+  spawn closes that connection.
+
+**Per server.**
+
+| server | handler slots | body limit | kept |
+|---|---|---|---|
+| xbt402 provider / hub | the caller's `threads` | the service's, per path | public API (`serve_http`, `serve_service`, `serve_listener`, `HttpService`), `X-Xbt402-Peer` from the socket only, `X-Forwarded-Proto` + `Host` URL, duplicate `PAYMENT-SIGNATURE` is 400 |
+| xbt-wallet-ui | `XBT_UI_THREADS` (4) | 256 KiB | security headers on every app response, Host and Origin checks (AGP-063 W4), `Running` stops on drop |
+| xbt-wallet-mcp | `HTTP_WORKERS` = 16 (was unbounded) | 1 MiB | bearer token and token file, Origin allowlist (AGP-063 X1), loopback guard; new `serve_listener` for a caller-bound listener |
+| xbt-work-relay public | `--threads` (8) | 1052 B (a blob, so a misdirected push still gets 405) | rate limit per client, no-store, no listing |
+| xbt-work-relay push | `--threads`, at most 4 | 1052 B | push token, exact blob length |
+
+**Behaviour changes for operators and embedders.** Every answer closes the connection (browsers
+and the MCP SDKs reconnect; `tiny_http` kept connections alive). A chunked request body is 501
+(the MCP SDKs send Content-Length). Over-limit bodies get the server's plain-text 413 instead of
+the app's (the MCP's was a JSON-RPC error). The MCP runs at most 16 requests at once; a paid tool
+call waiting on a funding confirmation holds one, and further requests wait in their connection.
+No wire change.
+
+Options weighed (best-performing-stack rule):
+
+| option | outcome |
+|---|---|
+| each crate depends on xbt402's `http-server` | links the provider and secp256k1 into the UI and the relay, which are meant to stay small and keyless |
+| a new `xbt-http` crate | works, but xbt-svc already is the shared std-only service plumbing all four use |
+| `hyper` / `axum` | an async runtime, ruled out for Pi-class boxes (AGP-068) |
+| keep `tiny_http` behind a reverse proxy | the bare-metal default stays exposed |
+| **move the AGP-068 server into xbt-svc (chosen)** | no new dependency, one implementation and one set of tests |
+
+**Cost.** Pass line declared before measuring: (a) median latency of `GET /healthz` on loopback,
+a fresh connection per request, served by xbt-work-relay, is at most `tiny_http`'s + 50 µs; (b) on
+armv7 the extra per request is at most 0.5 ms. Measured with
+`cargo run --release -p xbt-svc --example http_bench -- 127.0.0.1:29080 /healthz 5000 8` against
+`xbt-work-relay --bind 127.0.0.1:29080 --push-bind off --memory` built from `main` (7d03b84) and
+from this branch, on a Ryzen 9 9950X3D, two runs each:
+
+| build | median | p99 | 8 clients |
+|---|---|---|---|
+| `tiny_http` (main) | 114 / 121 µs | 163 / 212 µs | 49.7k / 38.5k req/s |
+| first cut: a thread spawned per connection, worker hand-off | 147 µs | 197 µs | 28.6k req/s |
+| **reused connection threads, handler slots (shipped)** | **89 / 85 µs** | **143 / 125 µs** | **57.4k / 69.0k req/s** |
+
+(a) passes: the shipped server is faster than `tiny_http`. The first cut passed (a) on latency but
+halved throughput, because the accept thread spawned a thread per connection; that is why
+connection threads are reused. (b) was not measured (no armv7 box or emulator, as in AGP-068).
+With threads reused, a request costs the same kind of work as under `tiny_http` (a few syscalls,
+one buffer), and no thread spawn, so (b) holds by construction. The three binaries cross-build for
+`armv7-unknown-linux-musleabihf`, and the x86_64 relay binary shrinks from 1.12 MB to 0.77 MB.
+
+Tests: the AGP-068 slowloris checks as shared functions in `crates/xbt-svc/tests/common/slowloris.rs`
+(`slow_bodies_do_not_stall_and_are_cut_off`, `slow_heads_do_not_stall_and_are_cut_off`,
+`an_endless_header_line_is_refused`), run by `tests/http_limits.rs` in xbt-wallet-ui (3 tests),
+xbt-wallet-mcp (3) and xbt-work-relay (5, both listeners). All 11 fail on `main`: no 431 after
+4 MiB of one header line, slow heads held for 20 s, slow bodies stall the UI and the relay, and
+the MCP holds a body that never comes for over 60 s. The server's edges are in
+`crates/xbt-svc/tests/http_server.rs` (HEAD and 204, header injection, a panicking handler, the
+Content-Length rules and 100-continue, the socket peer, stop). xbt402's `http_limits.rs` passes
+unchanged. Each slow-body test waits for the 30 s body deadline.
+
 ## Portability
 
 No platform-specific dependencies: libsecp256k1 (C, via `secp256k1-sys`), pure-Rust hashes and JSON,
 `getrandom`, std threads (no async runtime). The payer HTTP client uses `ureq` with rustls/ring
-(no OpenSSL). The xbt402 server is std (`http-server`, AGP-068). wallet-ui, the work relay and MCP
-still use `tiny_http`. `cargo check -p xbt402` (library, and all features + the hub binary)
+(no OpenSSL). Every HTTP server (xbt402 `http-server`, wallet-ui, the work relay, the MCP) is
+`xbt_svc::http`, std only (AGP-068, AGP-072). `cargo check -p xbt402` (library, and all features + the hub binary)
 passes for x86_64/aarch64 Linux gnu and musl, armv7 and riscv64 Linux, x86_64/aarch64 macOS and
 x86_64 Windows (gnu), with zig as the cross C compiler; aarch64 links (`xbt402-hub` 4.5 MB).
 Under v1.2 payee-pays, the close response reports `cum` as what the close pays the payee **net of

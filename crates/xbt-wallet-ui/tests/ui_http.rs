@@ -522,20 +522,29 @@ fn channels_show_the_close_report_and_refund_eta_and_close_and_refund_act() {
     assert!(ov.contains("Recent activity") && ov.contains("Closed</dt><dd>1"));
 }
 
+/// A stand-in HTTP service on a port the OS picks: `answer(path)` is the status and body.
+fn mock_http(answer: fn(&str) -> (u16, &'static str)) -> std::net::SocketAddr {
+    struct Mock(fn(&str) -> (u16, &'static str));
+    impl xbt_svc::http::Handler for Mock {
+        fn body_limit(&self, _: &str, _: &str) -> usize {
+            0
+        }
+        fn handle(&self, req: xbt_svc::http::Request) -> xbt_svc::http::Response {
+            let (code, body) = (self.0)(req.path());
+            xbt_svc::http::Response::text(code, "application/json", body)
+        }
+    }
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    xbt_svc::http::serve(Arc::new(Mock(answer)), l, 2).unwrap().addr
+}
+
 #[test]
 fn the_hub_page_probes_this_box_s_hub() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
-    let hub = tiny_http::Server::http("127.0.0.1:0").unwrap();
-    let hub_addr = hub.server_addr().to_ip().unwrap();
-    std::thread::spawn(move || {
-        while let Ok(rq) = hub.recv() {
-            let (code, body) = match rq.url() {
-                "/healthz" => (200, "{\"ok\":true,\"role\":\"hub\"}"),
-                "/readyz" => (200, "{\"ok\":true,\"wallet\":{\"name\":\"hub\",\"loaded\":true,\"receive_address\":\"bcrt1qhubrecv\",\"balance_sats\":0},\"tor\":\"http://hubtest.onion\"}"),
-                _ => (404, "no"),
-            };
-            let _ = rq.respond(tiny_http::Response::from_string(body).with_status_code(code));
-        }
+    let hub_addr = mock_http(|path| match path {
+        "/healthz" => (200, "{\"ok\":true,\"role\":\"hub\"}"),
+        "/readyz" => (200, "{\"ok\":true,\"wallet\":{\"name\":\"hub\",\"loaded\":true,\"receive_address\":\"bcrt1qhubrecv\",\"balance_sats\":0},\"tor\":\"http://hubtest.onion\"}"),
+        _ => (404, "no"),
     });
     let bx = start(json!({"routing": {"hubs": {PROVIDER: {"max_fee_ppm": 5000, "max_fee_base_msat": 2000}}, "max_lock_sats": 2000,
                                       "daily_budget_sats": 3000}}), false, |c| c.hub_url = Some(format!("http://{hub_addr}")));
@@ -620,14 +629,7 @@ fn regex_token(page: &str) -> String {
 #[test]
 fn xbt_compute_status_tile_and_link_when_configured() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
-    let cmp = tiny_http::Server::http("127.0.0.1:0").unwrap();
-    let cmp_addr = cmp.server_addr().to_ip().unwrap();
-    std::thread::spawn(move || {
-        while let Ok(rq) = cmp.recv() {
-            let body = "{\"ok\":true,\"role\":\"node-host\",\"node_sync_pct\":99.7,\"services\":{\"hub\":\"up\"}}";
-            let _ = rq.respond(tiny_http::Response::from_string(body));
-        }
-    });
+    let cmp_addr = mock_http(|_| (200, "{\"ok\":true,\"role\":\"node-host\",\"node_sync_pct\":99.7,\"services\":{\"hub\":\"up\"}}"));
     let bx = start(json!({}), false, |c| {
         c.cmp_status_url = Some(format!("http://{cmp_addr}/readyz"));
         c.cmp_url = Some("http://umbrel.local:3900/".into());
