@@ -595,8 +595,13 @@ impl ElectrumBackend {
         if tip_h.height != th {
             return Err(SyncFail::Other(format!("tip at {th} commits height {}", tip_h.height)));
         }
-        header::check_pow(&tip_h, &self.rules).map_err(|e| SyncFail::Other(format!("tip at {th}: {e}")))?;
-        if !self.st().headers.ready() {
+        let ready = self.st().headers.ready();
+        header::check_pow(&tip_h, &self.rules).map_err(|e| {
+            // before we hold a chain, a tip outside our powLimit is another chain
+            let why = format!("tip at {th}: {e}");
+            if ready { SyncFail::Other(why) } else { SyncFail::OffCheckpoint(why) }
+        })?;
+        if !ready {
             self.fetch_checkpoint(c)?;
         }
         let (ours, our_time, on_ours) = {
