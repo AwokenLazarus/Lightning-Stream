@@ -26,6 +26,10 @@ use crate::json::{dumps, py_int, py_str, py_u64, truthy};
 use crate::ledger::{ChannelState, Ledger};
 use crate::wire::*;
 
+/// The header the HTTP server sets to the TCP peer's IP address. A client-sent header of this name
+/// never reaches the service.
+pub const PEER_HEADER: &str = "X-Xbt402-Peer";
+
 /// A response for the transport to send.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpResponse {
