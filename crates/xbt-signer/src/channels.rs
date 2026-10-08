@@ -441,7 +441,7 @@ impl ChannelBook {
         if amount > rec.cap_sats {
             return Err(cap_error(rec.used_sats, amount - rec.used_sats, rec.cap_sats));
         }
-        let payer = self.payer_locked(&g, &rec)?;
+        let mut payer = self.payer_locked(&g, &rec)?;
         let sig = payer.sign_state_a3(amount as u64)?;
         audit_rec(&self.audit, "channel_state_a3", &sig, &rec.chan, &rec.dest, json!({"cum": amount, "sighash": "0xa3"}))?;
         let r = g.records.get_mut(&k).unwrap();
@@ -487,7 +487,7 @@ impl ChannelBook {
         if uncond + cond_amount as i64 > rec.cap_sats {
             return Err(cap_error(rec.used_sats, uncond + cond_amount as i64 - rec.used_sats, rec.cap_sats));
         }
-        let payer = self.payer_locked(&g, &rec)?;
+        let mut payer = self.payer_locked(&g, &rec)?;
         let cp = ConditionalParams::new(payer.params.clone(), hash, cond_amount, csv_delta)?;
         let sig = payer.sign_conditional(uncond as u64, &cp)?;
         audit_rec(&self.audit, "conditional_state", &sig, &rec.chan, &rec.dest,
@@ -533,6 +533,13 @@ impl ChannelBook {
         g.secrets.insert(format!("pending:{origin}"), s);
         self.persist(&g)?;
         Ok(pubk)
+    }
+
+    /// The public key [`issue_key`](Self::issue_key) sealed for `origin`, still unused.
+    pub fn issued_pub(&self, origin: &str) -> Result<ecdsa::PubkeyBytes> {
+        let g = self.lock();
+        let s = g.secrets.get(&format!("pending:{origin}")).ok_or_else(|| err("bad_key", format!("no key was issued for {origin}: call xbt402_new_key")))?;
+        Ok(ecdsa::pubkey(s))
     }
 
     /// Take the key [`issue_key`](Self::issue_key) sealed for `origin`.
@@ -653,13 +660,12 @@ impl ChannelBook {
         Ok(())
     }
 
-    /// Atomically raise the signed cumulative amount by a charge of `amount_sats`.
-    pub fn increment(&self, dest: &str, amount_sats: i64) -> Result<(ChannelRecord, Vec<u8>)> {
+    /// `(spent, signed cum)` after a charge of `amount_sats`: the cum is never below the last one
+    /// signed, and is raised to the dust floor on a first state.
+    fn plan_increment(rec: &ChannelRecord, amount_sats: i64) -> Result<(i64, i64)> {
         if amount_sats <= 0 {
             return Err(err("bad_amount", "amount must be positive"));
         }
-        let mut g = self.lock();
-        let mut rec = g.records.get(dest).cloned().ok_or_else(|| err("unknown_channel", dest.to_string()))?;
         let spent = rec.spent();
         if spent + amount_sats > rec.cap_sats {
             return Err(cap_error(spent, amount_sats, rec.cap_sats));
@@ -673,6 +679,21 @@ impl ChannelBook {
             }
             sign_cum = floor;
         }
+        Ok((new_spent, sign_cum))
+    }
+
+    /// The cum [`increment`](Self::increment) would sign for `amount_sats`, without signing.
+    pub fn next_cum(&self, dest: &str, amount_sats: i64) -> Result<i64> {
+        let g = self.lock();
+        let rec = g.records.get(dest).ok_or_else(|| err("unknown_channel", dest.to_string()))?;
+        Ok(Self::plan_increment(rec, amount_sats)?.1)
+    }
+
+    /// Atomically raise the signed cumulative amount by a charge of `amount_sats`.
+    pub fn increment(&self, dest: &str, amount_sats: i64) -> Result<(ChannelRecord, Vec<u8>)> {
+        let mut g = self.lock();
+        let mut rec = g.records.get(dest).cloned().ok_or_else(|| err("unknown_channel", dest.to_string()))?;
+        let (new_spent, sign_cum) = Self::plan_increment(&rec, amount_sats)?;
         Self::plain_over_lock(&mut rec, sign_cum)?;
         let mut payer = self.payer_locked(&g, &rec)?;
         let mut sig = vec![];

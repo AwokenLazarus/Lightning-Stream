@@ -255,7 +255,8 @@ impl Session {
     /// Otherwise it stays pending, and the watcher retries or refunds it.
     pub fn complete_open(&self, dest: &str, wait_s: f64) -> Result<Value> {
         let Some(rec) = self.book.get(dest) else { return Ok(json!({})) };
-        if rec.state != "pending" {
+        if rec.state != "pending" || rec.open_url.is_empty() {
+            // no open_url: an external client's channel (signer `fund`); the client posts its open and attaches
             return Ok(rec.public());
         }
         let mut confs = self.funding_confirmations(&rec)?;
@@ -355,7 +356,7 @@ impl Session {
 
     /// Sats of this channel already in the policy ledger. `-1` means a pre-AGP-063 record:
     /// treat `used_sats` as already booked so an upgrade does not book history again.
-    fn booked_through(rec: &ChannelRecord) -> i64 {
+    pub fn booked_through(rec: &ChannelRecord) -> i64 {
         if rec.ledger_booked_sats < 0 { rec.used_sats } else { rec.ledger_booked_sats }
     }
 
@@ -474,7 +475,17 @@ impl Session {
         }
         let rec = self.book.get(&dest).ok_or_else(|| rt("channel vanished"))?;
         let ledger_before = Self::booked_through(&rec);
-        let (rec, sig) = if !rec.last_sig.is_empty() && rec.used_sats > rec.acked_sats {
+        let resend = !rec.last_sig.is_empty() && rec.used_sats > rec.acked_sats;
+        // The policy approved max_sats. Only a channel's first states may sign more, up to the dust
+        // floor every state pays; that floor is booked like the rest.
+        let next = if resend { rec.used_sats } else { self.book.next_cum(&dest, price)? };
+        let floor = rec.params()?.min_amount() as i64;
+        if next - ledger_before > max_sats && next > floor {
+            return Ok(json!({"verdict": "deny", "rule": "max_sats", "charged_sats": 0,
+                             "reason": format!("the next state signs {next} sat, {} more than the ledger holds; max_sats is {max_sats}",
+                                               next - ledger_before)}));
+        }
+        let (rec, sig) = if resend {
             self.book.resend_state(&dest)? // same (cum, sig); do not sign a higher one (M3)
         } else {
             self.book.increment(&dest, price)?
@@ -489,10 +500,15 @@ impl Session {
         if receipt.is_some() {
             self.book.ack_state(&dest, Some(rec.used_sats))?;
         }
+        // The state is paid and booked whatever the receipt says; a bad receipt is reported, not booked.
+        let mut receipt_error = None;
         let charged = if r2.status < 400 {
-            let resp = receipt.as_ref().ok_or_else(|| err("bad_receipt", "paid call returned no receipt"))?;
-            let rec = self.book.get(&dest).ok_or_else(|| rt("channel vanished"))?;
-            Self::check_seller_receipt(&rec, resp, method, url, body, price)?
+            let checked = receipt.as_ref().ok_or_else(|| err("bad_receipt", "paid call returned no receipt"))
+                .and_then(|resp| Self::check_seller_receipt(&rec, resp, method, url, body, price));
+            checked.unwrap_or_else(|e| {
+                receipt_error = Some(e.msg);
+                0
+            })
         } else {
             0
         };
@@ -501,11 +517,14 @@ impl Session {
         let stored = if r2.body.len() > cap { store_body(&r2.body, &format!("{}-{}", &rec.chan[..rec.chan.len().min(12)], rec.seq)) } else { json!({}) };
         let mut res = json!({"status": r2.status, "charged_sats": charged, "booked_sats": booked, "receipt": receipt, "chan": rec.chan, "cum": rec.used_sats,
                              "opened": opened, "body": preview(&r2.body, cap)});
+        if let Some(e) = receipt_error {
+            res["receipt_error"] = e.into();
+        }
         merge(&mut res, stored);
         let Ok(doc) = serde_json::from_slice::<Value>(&r2.body) else { return Ok(res) };
         if r2.status == 200 && doc.get("stream").and_then(Value::as_str) == Some("xbt402-merkle-v1") {
             res["receipt_scope"] = "manifest call only; chunk payments are in stream.paid_sats".into();
-            let s = self.stream(&dest, &acc, &doc, max_sats - charged);
+            let s = self.stream(&dest, &acc, &doc, max_sats - booked);
             let sc = s.get("stream_charged").and_then(Value::as_i64).unwrap_or(0);
             merge(&mut res, s);
             if let Value::Object(m) = &mut res {

@@ -45,6 +45,12 @@ pub trait Transport: Send + Sync {
 pub trait Wallet: Send + Sync {
     fn fund(&self, address: &str, sats: u64) -> Result<(String, u32)>;
 
+    /// Fund the channel `params` (unfunded) for the key issued for `origin` at `address`. A signer
+    /// wallet checks the channel is its own before it pays (AGP-063 W3). Default: [`Wallet::fund`].
+    fn fund_channel(&self, _origin: &str, _params: &ChannelParams, address: &str, sats: u64) -> Result<(String, u32)> {
+        self.fund(address, sats)
+    }
+
     /// Txids of the sends this wallet made to `address` (`listtransactions`): how a hub finds a
     /// funding whose `fund` call failed after it broadcast (AGP-045). Default: none known.
     fn wallet_sends_to(&self, _address: &str) -> Result<Vec<String>> {
@@ -618,7 +624,7 @@ impl Client {
         let (pubk, secret, payer_spk) = self.fresh_key(origin)?;
         let p = ChannelParams::derive(&pay_to, &pubk, expiry, close_fee, payer_spk, &self.cfg.network, fee_payer)?;
         let addr = segwit_address(self.hrp(), &p.spk())?;
-        let (txid, vout) = self.wallet.fund(&addr, cap)?;
+        let (txid, vout) = self.wallet.fund_channel(origin, &p, &addr, cap)?;
         let p = p.with_funding(&txid, vout, cap)?;
         self.opened_sats += cap;
         let (payer, refund_hex, auth_key) = self.bind_key(origin, p.clone(), secret)?;
@@ -884,9 +890,8 @@ impl Client {
             return fail("exhausted", "not enough leftover to roll into a new channel");
         }
         let chan = p.channel_id();
-        let next_spk = next.spk();
         let ch = self.channels.get_mut(origin).ok_or_else(|| ChannelError::code("no_channel"))?;
-        let sig = hex::encode(ch.payer.sign_rollover(owed, &next_spk, next_cap)?);
+        let sig = hex::encode(ch.payer.sign_rollover_next(owed, &next, next_cap)?);
         let body = json!({"chan": chan, "amount": owed, "next": {"payerPub": hex::encode(next.payer_pub), "expiry": expiry,
                           "payerSpk": hex::encode(&next.payer_spk)}, "sig": sig});
         let r = self.post(&format!("{origin}{ROLLOVER_PATH}"), &body)?;

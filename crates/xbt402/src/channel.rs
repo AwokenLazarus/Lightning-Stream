@@ -477,25 +477,40 @@ impl Payer {
     }
 
     /// The 0xA3 fee-input state signature for `amount`.
-    pub fn sign_state_a3(&self, amount: u64) -> Result<Vec<u8>> {
-        if amount < self.signed {
-            return fail("stale_amount", "never sign a lower cumulative amount");
-        }
-        if let Some(b) = &self.backend {
-            return b.sign_state_a3(&self.params.channel_id(), amount);
-        }
-        let tx = self.params.state_tx_a3(amount)?;
-        Ok(sign_with_type(self.key()?, &self.params.sighash_a3(&tx)?, SIGHASH_SINGLE_ACP_UNIFIED))
-    }
-
-    /// The payer's signature for a rollover tx (the provider co-signs and broadcasts it).
-    pub fn sign_rollover(&mut self, amount: u64, next_spk: &[u8], next_capacity: u64) -> Result<Vec<u8>> {
+    pub fn sign_state_a3(&mut self, amount: u64) -> Result<Vec<u8>> {
         if amount < self.signed {
             return fail("stale_amount", "never sign a lower cumulative amount");
         }
         let sig = match &self.backend {
-            Some(b) => b.sign_rollover(&self.params.channel_id(), amount, next_spk, next_capacity)?,
+            Some(b) => b.sign_state_a3(&self.params.channel_id(), amount)?,
             None => {
+                let tx = self.params.state_tx_a3(amount)?;
+                sign_with_type(self.key()?, &self.params.sighash_a3(&tx)?, SIGHASH_SINGLE_ACP_UNIFIED)
+            }
+        };
+        self.signed = amount;
+        Ok(sig)
+    }
+
+    /// The payer's signature for a rollover tx (the provider co-signs and broadcasts it).
+    pub fn sign_rollover(&mut self, amount: u64, next_spk: &[u8], next_capacity: u64) -> Result<Vec<u8>> {
+        self.sign_rollover_to(amount, next_spk, None, next_capacity)
+    }
+
+    /// [`Payer::sign_rollover`] into the channel `next` (unfunded), so a signer backend can check
+    /// the next channel is its own (AGP-063 W3).
+    pub fn sign_rollover_next(&mut self, amount: u64, next: &ChannelParams, next_capacity: u64) -> Result<Vec<u8>> {
+        self.sign_rollover_to(amount, &next.spk(), Some(next), next_capacity)
+    }
+
+    fn sign_rollover_to(&mut self, amount: u64, next_spk: &[u8], next: Option<&ChannelParams>, next_capacity: u64) -> Result<Vec<u8>> {
+        if amount < self.signed {
+            return fail("stale_amount", "never sign a lower cumulative amount");
+        }
+        let sig = match (&self.backend, next) {
+            (Some(b), Some(n)) => b.sign_rollover_next(&self.params.channel_id(), amount, n, next_capacity)?,
+            (Some(b), None) => b.sign_rollover(&self.params.channel_id(), amount, next_spk, next_capacity)?,
+            (None, _) => {
                 let tx = self.params.rollover_tx(amount, next_spk, next_capacity)?;
                 sign_with_type(self.key()?, &self.params.sighash(&tx)?, SIGHASH_ALL_UNIFIED)
             }
@@ -514,14 +529,19 @@ impl Payer {
     }
 
     /// The 0x21 hash-locked state paying `uncond` plus `cond`'s amount.
-    pub fn sign_conditional(&self, uncond: u64, cond: &crate::conditional::ConditionalParams) -> Result<Vec<u8>> {
-        match &self.backend {
-            Some(b) => b.sign_conditional(&self.params.channel_id(), uncond, cond),
+    pub fn sign_conditional(&mut self, uncond: u64, cond: &crate::conditional::ConditionalParams) -> Result<Vec<u8>> {
+        if uncond < self.signed {
+            return fail("stale_amount", "never sign a lower cumulative amount");
+        }
+        let sig = match &self.backend {
+            Some(b) => b.sign_conditional(&self.params.channel_id(), uncond, cond)?,
             None => {
                 let tx = cond.state_tx(uncond)?;
-                Ok(sign_with_type(self.key()?, &cond.sighash(&tx)?, SIGHASH_ALL_UNIFIED))
+                sign_with_type(self.key()?, &cond.sighash(&tx)?, SIGHASH_ALL_UNIFIED)
             }
-        }
+        };
+        self.signed = uncond;
+        Ok(sig)
     }
 
     /// The signed CLTV refund. A signer backend decides the destination and fee itself.
