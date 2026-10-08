@@ -979,9 +979,13 @@ impl Provider {
             self.save_state(l, st)?;
             if let Err(e) = self.chain.send_raw_transaction(&tx.to_hex()) {
                 // AGP-067 (C1): refused alone (below the mempool's floor), it goes in with a child
-                let bumped = self.cfg.close_bump_max_fee > 0 && self.height().and_then(|h| self.bump_close(st, h, &txid, &tx)).is_ok();
-                if !bumped && !self.tx_known(&txid, &tx) {
-                    return fail("close_failed", e.to_string());
+                let bump = if self.cfg.close_bump_max_fee > 0 { Some(self.height().and_then(|h| self.bump_close(st, h, &txid, &tx, true))) } else { None };
+                if !matches!(bump, Some(Ok(()))) && !self.tx_known(&txid, &tx) {
+                    let why = match bump {
+                        Some(Err(b)) => format!("{e}; bump: {b}"),
+                        _ => e.to_string(),
+                    };
+                    return fail("close_failed", why);
                 }
             }
             self.closed(l, st, &tx.to_hex(), &txid, conditional)?;
@@ -1018,7 +1022,8 @@ impl Provider {
     /// child (BIP125: the new one pays at least the old fee plus its own vsize). The child's fee is
     /// capped at `close_bump_max_fee` and at the output less dust. Recorded in `extra.close_bump`
     /// (`at` the last send, `rate`, `fee`, the child's `txid`/`hex`, `capped`, `replaced`).
-    fn bump_close(&self, st: &mut ChannelState, tip: u32, txid: &str, close: &Tx) -> Result<()> {
+    /// `refused_alone`: the node just refused the close alone, so it is not sent alone again.
+    fn bump_close(&self, st: &mut ChannelState, tip: u32, txid: &str, close: &Tx, refused_alone: bool) -> Result<()> {
         let p = st.params.clone();
         if self.chain.get_tx_out(&p.funding_txid(), p.funding_vout(), false)?.is_none() {
             return Ok(());      // spent in a block: the close confirmed, or the channel is gone
@@ -1026,7 +1031,9 @@ impl Provider {
         let last = st.extra.get("close_bump").cloned().filter(Value::is_object);
         let field_u64 = |k: &str| last.as_ref().and_then(|b| py_u64(b.get(k))).unwrap_or(0);
         let child_txid = last.as_ref().and_then(|b| b.get("txid")).and_then(Value::as_str).unwrap_or("").to_string();
-        let in_pool = self.tx_known(txid, close);
+        // a node may still answer for an evicted close's txid: in the pool only while the funding is spent there
+        let in_pool = self.tx_known(txid, close)
+            && matches!(self.chain.get_tx_out(&p.funding_txid(), p.funding_vout(), true), Ok(None));
         let child_in_pool = !child_txid.is_empty() && self.chain.has_transaction(&child_txid).unwrap_or(false);
         if in_pool && (child_txid.is_empty() || child_in_pool) && field_u64("seen") == tip as u64 && last.is_some() {
             return Ok(());      // looked at this block already
@@ -1043,6 +1050,9 @@ impl Provider {
             return Ok(());
         }
         let send_alone = |rec: &mut Value| -> Result<()> {
+            if refused_alone {
+                return fail("close_failed", "the node refused the close alone");
+            }
             if let Err(e) = self.chain.send_raw_transaction(&close_hex) {
                 if !self.tx_known(txid, close) {
                     return fail("close_failed", e.to_string());
@@ -1174,7 +1184,7 @@ impl Provider {
             };
             if self.cfg.close_bump_max_fee > 0 {
                 let txid = st.closed_txid.clone();
-                self.bump_close(st, h, &txid, &close)?;
+                self.bump_close(st, h, &txid, &close, false)?;
             } else if self.chain.get_tx_out(&p.funding_txid(), p.funding_vout(), true)?.is_some() {
                 // funding still unspent even counting the mempool: the close was evicted, send it again
                 self.chain.send_raw_transaction(&close.to_hex())?;

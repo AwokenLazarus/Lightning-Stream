@@ -1215,8 +1215,158 @@ Tests: `crates/xbt402/tests/http_limits.rs` (`slow_bodies_do_not_stall_the_serve
 `an_oversized_response_is_an_error_not_a_truncated_body`, `a_body_cut_short_is_an_error`) and the
 AGP-068 tests in `lifecycle.rs` (`a_payment_is_bound_to_one_request_and_one_origin`,
 `concurrent_calls_get_the_numbers_of_their_own_reservation`,
-`a_seq_spent_on_a_refusal_survives_a_restart`, `the_receipt_covers_the_response`,
+  `a_seq_spent_on_a_refusal_survives_a_restart`, `the_receipt_covers_the_response`,
 `an_altered_conditional_answer_keeps_the_hash_lock`).
+
+## Channel findings C1–C5 (AGP-067, external review)
+
+The provider's close must confirm before the payer's refund is valid, the payer must not fund a
+channel the seller then refuses, a rollover is the tx the payer signed, the payTo key and ledger
+survive a restart, and one ledger file has one writer. B1 `x402_channel.py`/`ledger.py` on branch
+`agp-067` does the same for C1, C2 and C5, and `tests/security/test_agp067_review_c.py` and
+`test_agp067_review_c1.py` there use the test names of `review_c.rs` and `review_c1.rs`. C3 does not
+apply to B1's client (it has no wire rollover; B1's hub already refuses `bad_rollover_reply`). C4 is
+xbt-rs only (B1's launcher already seals its payTo key, P7). The conformance vectors are unchanged.
+
+**Wire.**
+
+- `/open` takes `"preflight": true` with a `channel` that has no `txid`/`vout`. The provider runs
+  every check of a funded open that does not need the funding output (network, payTo, closeFeePayer,
+  redeemScript, capacity and expiry against its policy). It records nothing and answers
+  `{"preflight": true, "expiry", "maxCum", "minConf"}`, plus `closeFeePayer` and `minCum` under
+  payee-pays, or the refusal the funded open would get. The Rust client, the B1 client and the
+  xbt-signer session preflight before they fund. A provider from before AGP-067 answers
+  `bad_request` (no `vout`), and only after its own terms checks have passed, so on `bad_request`
+  the client funds and opens as before.
+- The funded `/open` carries the same fields. In the Rust client `txid` and `vout` are now the last
+  keys of `channel`, not the first (serde_json keeps insertion order); B1 keeps them first. JSON
+  key order carries no meaning.
+- A rollover reply is accepted only if `txid`, `nextChan` (`txid:1`) and `nextCapacity` match the
+  rollover tx the payer computed and signed (`bad_rollover` otherwise). The next channel's refund
+  is kept (`on_refund`) and its key bound before that check, so a provider that broadcast the real
+  tx and lied about its id cannot strand the payer's refund.
+
+**C1: the close bump.** The close pays the `closeFee` fixed at open (600 sat, about 3.5 sat/vB on a
+171 vB close). Until now a fee spike through the close margin meant the close never confirmed and
+the payer's refund took the whole channel back at expiry. Now the watcher (`close_due`, and
+`close_locked` when the node refuses the close outright) works out the package feerate the close
+needs for each block it is unconfirmed:
+
+- the highest of `close_min_feerate`, the node's estimate for confirmation within a quarter of the
+  blocks left (`estimatesmartfee`, clamped to 1–1008) and the mempool's floor
+  (`max(mempoolminfee, minrelaytxfee)`);
+- in the second half of the close margin, at least double the last send's rate once
+  `close_bump_blocks` have passed without confirming (an estimate that lags the market).
+
+If the close alone pays that, it is sent alone. Otherwise it goes out with a CPFP child that spends
+the provider's own close output back to the same key (`submitpackage`), replacing the previous
+child under BIP125 (the new child pays at least the old fee plus its own vsize). The child's fee is
+capped at `close_bump_max_fee` and at the output less dust; at the cap the last child is rebroadcast.
+`sweep_payee` spends the child's output when there is one. A node that answers `getrawtransaction`
+for an evicted close does not fool the watcher: the close counts as in the mempool only while the
+funding outpoint is spent there.
+
+- `ProviderConfig`: `close_bump_max_fee` (default 10,000 sat; 0 is main's behaviour, the close
+  rebroadcast and nothing else), `close_min_feerate` (1.0 sat/vB), `close_bump_blocks` (3).
+- `ChainBackend` gains three methods with defaults, so existing backends compile unchanged:
+  `estimate_fee_rate(target) -> Result<Option<f64>>` and `mempool_min_fee() -> Result<Option<f64>>`
+  (both default to `None`, meaning no estimate) and `submit_package(&[hex])` (default: send each in
+  order, only the last one's refusal counts). `Rpc` implements all three. An RPC error on the
+  estimate or the floor counts as no estimate; `close_min_feerate` and the doubling still apply.
+- The record is `extra.close_bump`: `{at, seen, rate, fee, txid, hex, capped, replaced:[[txid, fee]…]}`
+  (`at` is the last send, `seen` the last block looked at). `close_failed` now names the bump's error
+  after the close's own (`…; bump: close_bump_failed: …`).
+- Limits. The child can only spend what the provider's output holds, so a small channel can only be
+  bumped a little: a 2-call channel at 1,000 sat a call has 1,546 sat to give. Package relay (Knots
+  and Core 28 and later) lets a close below the dynamic `mempoolminfee` in on its child's fee, but
+  not one below the node's static `minrelaytxfee`: a node configured above 3.5 sat/vB refuses the
+  close in any package. Payer-pays closes are bumped from the provider's output too.
+
+Options weighed (best-performing-stack rule):
+
+| option | wire change | needs | cost |
+|---|---|---|---|
+| raise the fixed `closeFee` | no | nothing | paid on every close in every market; still loses to a big enough spike |
+| the 0xA3 fee-input close (SIGHASH_SINGLE\|ACP) | no | a provider wallet with spare UTXOs and their key on the watcher | a wallet hook per embedder, and UTXOs locked for every channel near its margin |
+| anchors / TRUC (v3) closes | yes: a new state tx format both sides sign | v3 relay | a protocol version and new vectors |
+| **CPFP from the provider's own close output (chosen)** | **no** | package relay (Knots 29 has it) | bounded by that output; one child sign per bump |
+
+**Cost.** Per channel in its close margin, each block: up to three extra RPCs (estimate, mempool
+info, `gettxout`) and at most one child signature. One ECDSA sign is 16.2 µs on the Ryzen 9 9950X3D
+(`binding_bench`, AGP-068) and well under a millisecond on 32-bit libsecp256k1. Nothing is added
+to a paid call.
+
+**C2: preflight.** Options weighed: hand the provider a signed, unbroadcast funding tx to check (it
+could broadcast and refuse, and every wallet would need a sign-without-broadcast hook), a separate
+`/terms` endpoint (a second code path to drift from `/open`'s checks), or **the same `/open` with
+`preflight` (chosen)**, which runs the exact checks of the funded open minus the outpoint. Cost: one
+HTTP round trip per channel open (not per call), and no signature on either side.
+
+**C3.** The client computes the rollover txid from the tx it signed (segwit: the witness is not in
+the txid) and checks the reply against it. There is no wire change and no extra cost.
+
+**C4: a provider that survives a restart.** `xbt-work-provider` and `xbt402-rust-provider` keep
+their payTo key and their ledger under `--data-dir` (`XBT_WORK_DATA_DIR`; defaults
+`./xbt-work-provider-data` and `./xbt402-rust-provider-data`). `xbt402-rust-provider --ledger FILE`
+still overrides the ledger path. The key is `DIR/payto.key`, created once with mode 0600: it is
+written to a temp file, hard-linked into place (a crash leaves no half-written key) and the
+directory is fsynced. A key file with any group or other permission bit (`mode & 0o077`), or that
+is not a key, is refused (error code `key_file`). `xbt-work-provider` runs a watcher (`close_due`) every `--watch-secs`
+(`XBT_WORK_WATCH_SECS`, default 5), which closes channels before their payers' refunds and bumps
+stuck closes. `load_or_create_secret(path)` is public for embedders.
+
+**C5: one opener per ledger.** `Ledger::open` and `FileClientLedger::open` take an exclusive
+`flock(2)` on a sidecar `<path>.lock`, which holds the opener's pid. A second opener, in this
+process or another, gets `ledger_locked` with the holder's pid. The lock goes with the ledger, and
+with the process when it dies, so a crash never leaves a stale lock. B1's `Ledger` takes the same
+lock with `fcntl.flock` (the same system call), and its `Ledger.close()` releases it. Options weighed:
+the `fs2` or `fd-lock` crates (a new dependency for what std has done since 1.89), a lock on the
+ledger file itself (the ledger is replaced by rename, which would drop the lock), a pid file without
+a lock (stale after a crash, racy), or **std `File::try_lock` on a sidecar (chosen)**: no `unsafe`, no
+new dependency, and it works on Linux, macOS and Windows. Cost: one syscall per ledger open. The
+workspace MSRV is now **1.89**.
+
+**Embedders.**
+
+- A payer client from before AGP-067 talks to a new provider unchanged (it never preflights). A
+  new client talks to an old provider through the `bad_request` fallback.
+- Anything that opens one ledger file twice in one process (tests that "restart" a provider while
+  the old instance is alive) now gets `ledger_locked`. Drop the old instance first, or copy the
+  files the way a crash leaves them: `xbt402_interop::crash_copy(from, to)` copies a ledger file or
+  directory and skips `.lock`. B1's tests use `sechelp.crashed(...)`, which releases the old
+  instance's lock.
+- A provider binary started without `--data-dir` now writes `./xbt*-provider-data` in its working
+  directory instead of keeping everything in memory.
+- Custom `ChainBackend`s get the defaults above. Override `submit_package` (and the estimate and
+  floor) to get the bump through a package-relay node; with the defaults the close and child are
+  sent one at a time, which works whenever the close alone clears the floor.
+
+**Regtest.** `scripts/close_bump_regtest.sh` (ports 24860–24869) runs `xbt402-close-bump` against a
+private Knots 29.4.2 node with `maxmempool=5`. A direct channel and a hub ch2 are each opened with
+the bump on and off. Before the close margin the mempool is filled at 9.5 sat/vB until
+`mempoolminfee` is 10.5 sat/vB, and from then on blocks take only packages paying 10 sat/vB or more.
+Result (`run/close_bump.json`):
+
+- with the bump, the direct and the ch2 close go in with a 2,351 sat child (package 10.50 sat/vB)
+  and confirm in the first block after the margin, 19 blocks before expiry, paying the provider its
+  best state;
+- without it, both closes are refused (`mempool min fee not met`) until expiry. Then the payer's
+  refund at 12 sat/vB and the hub's ch2 refund take both channels back.
+
+Tests: `crates/xbt402/tests/review_c.rs` (`c2_a_refused_open_funds_nothing`,
+`c2_the_preflight_records_nothing`, `c2_a_provider_without_preflight_still_opens`,
+`c3_a_rollover_reply_naming_another_txid_is_refused`,
+`c4_the_payto_key_persists_0600_and_a_loose_file_is_refused`,
+`c4_a_restarted_provider_keeps_its_key_and_channels_and_closes_them`,
+`c5_a_second_provider_on_one_ledger_is_refused`, `c5_a_second_client_on_one_client_ledger_is_refused`,
+`c5_another_process_holding_the_lock_is_refused`) and `review_c1.rs`
+(`c1_a_close_below_the_mempool_floor_goes_in_with_a_child`,
+`c1_without_the_bump_the_close_never_confirms`,
+`c1_the_bump_follows_the_estimate_and_escalates_near_expiry`,
+`c1_the_child_never_pays_more_than_the_cap_or_the_output`,
+`c1_the_payee_sweep_spends_the_child_after_a_bump`, `c1_a_close_that_pays_enough_is_left_alone`),
+which run against a mempool model with a floor, full RBF, `submitpackage`, an estimate and
+fee-market blocks.
 
 ## Portability
 
