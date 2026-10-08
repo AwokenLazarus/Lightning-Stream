@@ -2577,6 +2577,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "ureq",
+ "url",
  "xbt-primitives",
  "xbt-svc",
  "xbt402",
