@@ -108,7 +108,7 @@ pub fn chain_block(rpc: &Rpc, height: u32, identity: &str) -> Result<ChainBlock>
 
 /// The node's coinbase maturity (Knots `getdeploymentinfo`).
 pub fn maturity(rpc: &Rpc) -> Result<Maturity> {
-    Maturity::from_deployments(&rpc.call("getdeploymentinfo", json!([]))?)
+    Ok(Maturity::from_deployments(&rpc.call("getdeploymentinfo", json!([]))?)?)
 }
 
 /// What a coinbase pays `identity` (bech32 compared lower-case).
