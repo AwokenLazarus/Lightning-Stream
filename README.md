@@ -215,6 +215,10 @@ payer paid, `unpaidMsat` = `spent − cum × 1000`, and a payee-pays answer adds
 
 ## Hub routing (AGP-026)
 
+> **Experimental.** The hub (`RouteHub`, `xbt402-hub`, `RoutePayer`'s routing) is not
+> production-ready: do not route funds you cannot lose. `xbt402-hub` says so when it starts. No flag
+> is needed, so the demos keep running. See "Hub routing safety (AGP-064)".
+
 A port of B1 agp-023 `xbt402/adaptor.py`, `route.py`, `hub.py`, `route_client.py` and the provider's
 routing endpoints (AGP-021 + AGP-023 v1.2), wire-compatible in every direction.
 
@@ -858,6 +862,117 @@ its ports as its source port for a moment, a poll of that very port included, an
 then cannot bind it (`Address already in use`; it cost three runs their start today). The driver
 therefore waits for a process's "ready" line before it polls its port, and starts one that exited
 before that line again.
+
+## Hub routing safety (AGP-064)
+From an external review of the hub: two High findings, H1 and H2, where the hub could pay a
+provider on ch2 without being able to collect from the client on ch1. There was also a test-only
+nonce API in the library. Both were still present on `main` (`e0b832a`), and the tests below
+reproduce each one there. The same changes are in B1 `agp-064-w4`, with the same test names. The
+hub is now marked **experimental** (above, and in `xbt402-hub`'s startup log).
+
+**H1: a ch1 close while a lock is in flight.** `route()` writes ch1's `route_lock`, lets go of
+ch1's ledger, and then forwards to the provider for up to `reveal_timeout`. A cooperative close in
+that gap closed ch1 below the lock, and the provider was still paid on ch2.
+* The provider's `POST /x402/xbt-channel/close` now refuses a close with `lock_pending` while ch1
+  has a routed lock its best state does not cover: the lock in flight, or a written-off lock above
+  `best_cum`. A written-off lock that `best_cum` covers does not block. `close_channel` (AGP-059)
+  uses the same test.
+* The margin close lets a lock in flight finish, but only in the first half of the margin (the
+  lock takes seconds). It never waits for a written-off lock: a skipped margin close would let the
+  payer refund the whole channel at expiry.
+* A lock that completes after ch1 was closed below it (an operator's `close_now`, or a margin close
+  past its wait) is never counted as routed. It is counted in `HubStats::uncollected`, and the
+  event is `lock_uncollected`.
+* A ch1 lock that no route is forwarding and that sits on no ch2 can never complete: the hub
+  stopped between its two write-aheads, or the `withhold "all"` test hook was used. The hub drops
+  it when the client asks to close (`orphan_lock_dropped`), so it does not keep ch1 from closing.
+  This is checked under the provider's busy flag, which `route()` holds from before it writes the
+  lock until its forward ends, so a lock in flight is never dropped.
+
+**H2: written-off locks were superseded.** A lock is written off at `reveal_timeout`, or when the
+provider refuses it. Its ch2 pre-signature may already be out: a slow honest provider can still
+use t, and so can one that answers 400 and keeps the pre-signature. The client's next lock was
+quoted on the old base, so its state did not include the written-off amount, and a t read later off
+the ch2 close collected nothing.
+* **Hold.** If the lock was pending on ch2 when it was written off (the pre-signature may have
+  left), ch1's counters (`routed_sat`, `fee_units`, `fee_paid`) are raised to the lock's `after`.
+  What was added is stored on the lock (`stale_locks[].hold`). Later locks are quoted above it, so
+  a t read off the ch2 close later still collects. A write-off whose pre-signature never left
+  ("ch2 exhausted", a failed pre-sign, a final ch2) holds nothing and is not kept.
+* **Block.** No route over a ch2 with written-off locks (`route_blocked` "a written-off lock on
+  this ch2 is unresolved"), and no rollover of it: `rollover()` refuses with `lock_pending`, and
+  the watcher does not roll it over. The ch2's close shows whether t was used; its refund shows it
+  was not.
+* **Release.** A confirmed refund, or a confirmed provider close that does not reveal the lock's t,
+  proves it unpaid. The hold leaves the base (`lock_released`), and the lockId goes on ch1's
+  `released` list (the last 64). The client is then quoted below its signed state (the dust floor)
+  until what it signed ahead for that lock is used.
+* **`max_lock_sat`.** A written-off lock holds the client's base and blocks its ch2 until that ch2
+  resolves, so a lock should be small next to a ch2. The default is now 20,000 sat (a fifth of the
+  default `ch2_capacity`, was 50,000). `HubConfig::from_json` refuses 0 or more than half of
+  `ch2_capacity` (`bad_config`).
+
+**The client (`RoutePayer`).** A given-up lock now records the counters `before` it as well as
+`after`, whether it was a floor lock, and whether the hub `held` it. Floor locks are recorded too:
+the hub can hold one. `resync` adopts three hub views, each only when it matches a lock the client
+gave up:
+* completed: as before, the hub's best state is that lock (also after a hold);
+* held: the hub's counters are the lock's `after`, ours are its `before`, and its lockId is in
+  `held`;
+* released: our counters minus the released holds equal the hub's.
+A refusal that carries `held` is resynced at once. A held entry is kept until its release or
+completion: the 16-entry list drops the oldest entry that is not held.
+
+**Nonces.** `adaptor::presign_with_nonces` (caller-chosen k and w, for the routing vectors) is
+compiled only under `cfg(test)` or the `vector-emitter` feature, which only `xbt402-interop`
+enables. `presign` uses a private inner function. The routing vectors are byte-identical
+(`conformance.sh` step 4, 79/79). B1's `presign` never took nonces.
+
+**For embedders (cmp).** These are the wire and behaviour changes:
+* `POST /x402/route` refusals with ch1's view (`bad_amount`, and now also the 502 `route_failed`
+  of a held write-off) carry `held: [lockId]` and `released: [lockId]` beside `bestCum`,
+  `routedSat`, `feeUnits` and `feePaid`. Before, the 502 `route_failed` carried only
+  `providerError`. Old clients ignore the new fields.
+* A client close of a ch1 with a routed lock open is refused `lock_pending` (400). Retry it after
+  the lock resolves.
+* After a write-off, that provider's ch2 is `route_blocked` until the ch2 closes or is refunded.
+  The hub's switch to a ch2 funded ahead (AGP-057) can still take over.
+* `RoutePayer`'s persisted ledger: entries in `given_up` gain `before`, `floor` and `held`. Older
+  records load, with `before` taken as `after`.
+* `max_lock_sat` above half of `ch2_capacity` is now a config error. The default is 20,000.
+* `HubStats::uncollected`, and the events `lock_uncollected`, `lock_released`,
+  `orphan_lock_dropped`, `resync_hold` and `resync_release`; `void` gains `held`.
+* `presign_with_nonces` is gone from the default build (enable `vector-emitter` to get it).
+
+Tests: `crates/xbt402-interop/tests/hub_routing_safety.rs` (8; B1
+`tests/security/test_agp064_hub_safety.py`, the same 8 plus the config test). All of them fail on
+`main` and pass here:
+* H1: `h1_close_while_a_lock_is_in_flight_is_refused_either_order` (lock then close, and close
+  then lock), `h1_a_lock_completed_after_ch1_closed_below_it_is_not_counted`,
+  `h1_the_margin_close_lets_a_lock_in_flight_finish`,
+  `h1_a_lock_the_hub_never_forwarded_does_not_keep_ch1_open`;
+* H2, both unfriendly orders: `h2_a_slow_provider_stays_in_the_base_and_a_later_route_sits_above_it`
+  (the answer lost, then t on the close) and
+  `h2_a_refused_lock_stays_in_the_base_and_blocks_routing_and_rollover` (400 with the
+  pre-signature kept: routing and rollover refused, then t on the close);
+  `h2_a_refunded_ch2_gives_the_unpaid_hold_back` and
+  `h2_a_void_whose_pre_signature_never_left_holds_nothing`;
+* `hub::tests::max_lock_sat_defaults_small_and_is_at_most_half_of_ch2_capacity`.
+
+The tests use a wrapper `HttpService` around the provider (it holds the provider's answer at a
+gate, or turns it into a 400), so the shipping code has no new test hooks. Two existing tests
+changed with H2, because a provider's refusal now blocks that ch2:
+`hub_make_before_break::provider_enforces_its_cap_and_margin_itself` and
+`hub_refill_ahead::a_child_the_providers_watcher_left_suspended_is_looked_at_before_a_lock_is_refused`
+(the same two in B1).
+
+**Trade-offs.**
+* An honest slow provider, once written off, can leave the client paying the lock twice: once in
+  the held base, and once by rerouting the same service. The provider's own meter credit is out of
+  the hub's reach.
+* A provider that refuses after taking the pre-signature stops its ch2 for that ch2's lifetime
+  (close or refund). This is the spec's choice (no route over a stale ch2). The follow-up would be
+  to close and refill such a ch2 early.
 
 ## Portability
 
