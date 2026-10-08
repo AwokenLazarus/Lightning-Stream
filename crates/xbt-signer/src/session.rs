@@ -216,7 +216,9 @@ impl Session {
         }
         let min_exp = or_int(extra.get("minExpiryBlocks"), 1)?;
         let max_exp = or_int(extra.get("maxExpiryBlocks"), 100_000)?;
-        let blocks = expiry_blocks.max(min_exp + 6).min(max_exp - 1);
+        // the provider's funding check also wants `left >= minExpiry + closeMargin`, and its policy
+        // default margin is 36, so a channel opened at exactly minExpiry is refused
+        let blocks = expiry_blocks.max(min_exp + 6).max(min_exp + 36).min(max_exp - 1);
         self.hot.check_channel_funding()?; // AGP-013: above the hot-balance cap, a human sweeps first
         let open_height = self.height()? as i64;
         let expiry = open_height + blocks;
