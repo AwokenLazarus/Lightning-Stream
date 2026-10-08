@@ -93,9 +93,9 @@ impl LnNode {
     }
 
     /// A funding transaction at (height, pos) whose one input spends `prev_spk` (a coin confirmed at
-    /// `prev_height`) with this witness and scriptSig; output 0 a P2WSH of `capacity`. The channel point.
-    fn fund_with(&self, height: u64, pos: usize, capacity: i64, prev_spk: Vec<u8>, witness: Vec<Vec<u8>>, script_sig: Vec<u8>,
-                 prev_height: u64) -> String {
+    /// `prev_height`) with this witness and scriptSig; output 0 a P2WSH of 100,000 sats. The channel point.
+    fn fund_with(&self, height: u64, pos: usize, prev_spk: Vec<u8>, witness: Vec<Vec<u8>>, script_sig: Vec<u8>, prev_height: u64) -> String {
+        let capacity = 100_000;
         let mut prev = Tx::new(2, vec![TxIn::new(OutPoint::new([height as u8 ^ 0x5a; 32], pos as u32), 0)],
                                vec![TxOut::new(capacity + 5_000, prev_spk)], height as u32);
         prev.inputs[0].witness = vec![der(0x21), vec![0x02; 33]];
@@ -1065,18 +1065,19 @@ fn a_payment_released_as_never_sent_and_settled_late_is_booked_again() {
     rig.ln.set(|s| s.payments.push(json!({"payment_hash": hash, "status": "FAILED", "htlcs": []})));
     rig.call("watch_tick", json!({}));
     assert_eq!(rig.ledger_net(), 0);
-    assert!(rig.s.ln_book.watched(T0 as f64).is_empty());
+    assert!(rig.s.ln_book.watched(T0 as f64, 6_720).is_empty());
 
-    // the watch ends when the invoice has expired (+10 min): a record after that is not booked
+    // AGP-066: the watch ends once max_cltv_blocks (1,008) + 144 blocks have passed, in blocks from our
+    // tip and in time (not at the invoice's expiry + 10 min, as in AGP-049)
     let rig = LnRig::new(json!({}));
     rig.ln.set(|s| s.mode = Mode::NotSent);
-    let (inv, hash) = rig.invoice(300, 48, XBT);
+    let (inv, _) = rig.invoice(300, 48, XBT);
     rig.pay(&inv, 1000);
-    assert_eq!(rig.s.ln_book.watched(T0 as f64).len(), 1);
-    rig.clock.fetch_add(3_600 + 601, Ordering::SeqCst);
-    rig.ln.set(|s| s.payments.push(json!({"payment_hash": hash, "status": "SUCCEEDED", "value_msat": "300000", "fee_msat": "0",
-                                          "payment_preimage": hex::encode([48u8; 32]), "htlcs": []})));
-    assert!(rig.s.ln_book.watched(T0 as f64 + 4_201.0).is_empty());
+    let until = T0 as f64 + (1_008 + 144) as f64 * 600.0;
+    assert_eq!(rig.s.ln_book.watched(T0 as f64 + 4_201.0, 6_720).len(), 1);
+    assert_eq!(rig.s.ln_book.watched(until + 1.0, 6_720 + 1_152).len(), 1, "the height has not passed");
+    assert_eq!(rig.s.ln_book.watched(until, 6_720 + 1_153).len(), 1, "the time has not passed");
+    assert!(rig.s.ln_book.watched(until + 1.0, 6_720 + 1_153).is_empty());
 }
 
 #[test]
@@ -1167,7 +1168,9 @@ fn l2_the_mainnet_macaroon_holds_only_the_rails_permissions() {
         let what = format!("{}:{}", extra.0, extra.1[0]);
         assert_eq!(r["rule"], "ln_macaroon", "{what}: {r}");
         assert!(r["reason"].as_str().unwrap().contains(&what), "{r}");
-        assert_eq!(rig.call("ln_status", json!({}))["ready"], false);
+        let st = rig.call("ln_status", json!({}));
+        assert_eq!(st["ready"], false);
+        assert_eq!((&st["macaroon"]["only_needed"], &st["macaroon"]["excess_ops"]), (&json!(false), &json!([what])), "{st}");
     }
     // a macaroon whose permissions cannot be read is not least-privilege either
     rig.ln.set(|s| s.macaroon = Some(raw_macaroon(b"\x02opaque")));
@@ -1179,6 +1182,7 @@ fn l2_the_mainnet_macaroon_holds_only_the_rails_permissions() {
     let r = rig.pay(&inv, 1000);
     assert_eq!(r["verdict"], "allow", "{r}");
     assert_eq!(rig.ln.sent(), 1);
+    assert_eq!(rig.call("ln_status", json!({}))["macaroon"]["only_needed"], true);
 }
 
 /// A minimal LND REST server on loopback (plain http is allowed there). `GET /v1/payments` lists the
@@ -1204,9 +1208,9 @@ fn rest_lnd(older: Value, broken_hash: &str) -> RestLnd {
             while !head.ends_with(b"\r\n\r\n") && s.read(&mut b).unwrap_or(0) == 1 {
                 head.push(b[0]);
             }
-            let head = String::from_utf8_lossy(&head).to_lowercase();
+            let head = String::from_utf8_lossy(&head).to_string();
             let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
-            assert!(head.contains("grpc-metadata-macaroon: "), "the macaroon goes with every call");
+            assert!(head.to_lowercase().contains("grpc-metadata-macaroon: "), "the macaroon goes with every call");
             seen.lock().unwrap().push(path.clone());
             let (code, body) = if path.starts_with("/v1/payments") {
                 (200, json!({"payments": newest}).to_string())
@@ -1375,10 +1379,10 @@ fn l5_a_0x21_push_the_script_never_checks_proves_nothing() {
     let wsh = |script: &[u8]| [vec![0u8, 0x20], Sha256::digest(script).to_vec()].concat();
     // OP_DROP OP_TRUE: anyone can spend it, on any chain its coin exists on; the 0x21-shaped push is data
     let anyone = vec![0x75, 0x51];
-    let a = rig.node.fund_with(6_400, 1, 100_000, wsh(&anyone), vec![der(0x21), anyone.clone()], vec![], 6_350);
+    let a = rig.node.fund_with(6_400, 1, wsh(&anyone), vec![der(0x21), anyone.clone()], vec![], 6_350);
     // a taproot script path: which pushes its leaf checks is not read
     let tr = [vec![0x51u8, 0x20], vec![7; 32]].concat();
-    let b = rig.node.fund_with(6_401, 1, 100_000, tr, vec![[vec![5; 64], vec![0x21]].concat(), vec![0x51], vec![0xc0; 33]], vec![], 6_350);
+    let b = rig.node.fund_with(6_401, 1, tr, vec![[vec![5; 64], vec![0x21]].concat(), vec![0x51], vec![0xc0; 33]], vec![], 6_350);
     rig.ln.set(|s| s.channels = vec![with_point(chan(&scid(6_400, 1), "ANCHORS", true), &a), with_point(chan(&scid(6_401, 1), "ANCHORS", true), &b)]);
     let r = rig.pay(&inv, 1000);
     assert_eq!(r["rule"], "ln_no_safe_channel", "{r}");
@@ -1388,12 +1392,12 @@ fn l5_a_0x21_push_the_script_never_checks_proves_nothing() {
     assert_eq!(rig.ln.sent(), 0);
     // what LND's wallet spends: a 2-of-2 P2WSH signed 0x21 twice, and P2SH-P2WPKH (np2wkh)
     let ms = [vec![0x52, 0x21], vec![2; 33], vec![0x21], vec![3; 33], vec![0x52, 0xae]].concat();
-    let c = rig.node.fund_with(6_402, 1, 100_000, wsh(&ms), vec![vec![], der(0x21), der(0x21), ms.clone()], vec![], 6_350);
+    let c = rig.node.fund_with(6_402, 1, wsh(&ms), vec![vec![], der(0x21), der(0x21), ms.clone()], vec![], 6_350);
     let redeem = [vec![0u8, 0x14], vec![9; 20]].concat();
     let p2sh = [vec![0xa9, 0x14], vec![1; 20], vec![0x87]].concat();
-    let d = rig.node.fund_with(6_403, 1, 100_000, p2sh, vec![der(0x21), vec![2; 33]], [vec![22u8], redeem].concat(), 6_350);
+    let d = rig.node.fund_with(6_403, 1, p2sh, vec![der(0x21), vec![2; 33]], [vec![22u8], redeem].concat(), 6_350);
     // the same 2-of-2 with one signature 0x01
-    let e = rig.node.fund_with(6_404, 1, 100_000, wsh(&ms), vec![vec![], der(0x21), der(0x01), ms.clone()], vec![], 6_350);
+    let e = rig.node.fund_with(6_404, 1, wsh(&ms), vec![vec![], der(0x21), der(0x01), ms.clone()], vec![], 6_350);
     rig.ln.set(|s| s.channels = vec![with_point(chan(&scid(6_402, 1), "ANCHORS", true), &c), with_point(chan(&scid(6_403, 1), "ANCHORS", true), &d),
                                      with_point(chan(&scid(6_404, 1), "ANCHORS", true), &e)]);
     let r = rig.pay(&inv, 1000);

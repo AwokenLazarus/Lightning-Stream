@@ -1496,6 +1496,165 @@ The fraud-proof check misses its line at 100 invoices: 200 Ed25519 receipt verif
 which the bounds add 2 µs. It runs once per disputed block, not per call. `ReceiptBook::credit` now
 makes one pass over the spans; before, it recomputed the caps' room for each open span.
 
+## Lightning rail hardening (AGP-066, review L1–L5)
+
+An external review of the public snapshot (xbt-rs `9201104`) found five weaknesses in the payer-only
+`rail=ln` (AGP-048/049, `crates/xbt-signer/src/ln.rs`). All five were still present on `main`
+(`7d03b84`); since `9201104`, the LN code had changed only in `a64c41e` (AGP-055, how the tests read
+the ledger), which none of the findings depends on. Each
+has a test in `crates/xbt-signer/tests/ln_rail.rs` that failed on `main`; commit `fbc55b2` holds the
+tests alone. Neither Python reference has a Lightning rail (B1 `xbt402/` and B2 `agentwallet/` have
+none), so there is no parity change and no vector changed.
+
+Two design notes stand as before, and nothing below changes them:
+
+* **The wallet's policy is advisory as far as LND is concerned.** The signer's checks bind what goes
+  through the signer. Anyone holding a macaroon with more access (the node's `admin.macaroon`, `lncli`
+  on its host) bypasses all of them. That is why mainnet requires `ln.exposure_cap_sats`: the LN node
+  is trusted with everything it holds.
+* **Everything rests on the Lightning Fork's behaviour.** Its unified signatures (`option_unified_sigs`,
+  sighash 0x21) and its feature bit 512 (`option_blake2b`) are what keep a channel's transactions and
+  invoices off SHA-256 Bitcoin. The signer checks that they are in use (L5 below tightens the funding
+  proof) but cannot make the fork implement them correctly.
+
+* **L1: plain http only to a loopback address.** `LndRest::new` cut the URL's host at the first `:`,
+  so in `http://[::ffff:10.0.0.5]:8080` the leftover `[` passed as loopback, and the spending macaroon
+  crossed the LAN in cleartext. The URL is now parsed with the `url` crate (the parser `ureq` itself
+  uses, so the host checked is the host dialled). Plain http is allowed only to an IPv4 address in
+  127.0.0.0/8, to `::1`, or to an IPv4-mapped address inside 127.0.0.0/8. A hostname, `localhost`
+  included, needs https. Test: `l1_plain_http_only_to_a_loopback_address`: a table of URLs, then a
+  property over 400 random IPv4 addresses (half in 127/8), their IPv4-mapped forms and 400 random
+  IPv6 addresses (accepted exactly when in 127/8; random IPv6 never). On
+  regtest, S18 starts a signer with that URL and checks it is refused.
+* **L2: the mainnet macaroon check is an allowlist.** The check refused only `onchain:write`,
+  `macaroon:*` and `signer:generate`. A macaroon granting `uri:/lnrpc.Lightning/SendCoins` (or
+  `invoices:write`, `peers:write`, …) passed. Now, on mainnet, `ln_macaroon` refuses any permission
+  beyond the rail's four (`info:read offchain:read offchain:write onchain:read`). It also refuses a
+  macaroon whose permissions cannot be read (not an LND identifier), since one that cannot be read
+  cannot be shown to be least privilege. Off mainnet the macaroon is reported, not refused: `ln_status`
+  `macaroon.only_needed` and `excess_ops`. `dangerous_ops` stays in the report. (The field is not
+  called `least_privilege`: the response sanitizer drops every key containing `priv`, and the regtest
+  caught it.) Test:
+  `l2_the_mainnet_macaroon_holds_only_the_rails_permissions`, plus the `macaroon.rs` unit test.
+  Regtest: S17. An allowlist scoped by URI (accepting the rail's own URIs and nothing else) would also
+  work; the entity allowlist is simpler and is what `lncli bakemacaroon` produces.
+* **L3: a payment is looked up by its hash.** `lookup` scanned `GET /v1/payments` (the newest 1,000),
+  so on a busy node an older settled payment looked like no payment, and reconcile released its
+  booking. It now calls `GET /v2/router/track/{payment_hash}` (TrackPaymentV2, base64url hash), reads
+  the first line of the stream, and checks that the record's hash is the one asked for. Only LND's
+  "payment isn't initiated" answer means "no payment": grpc-gateway answers an unknown route with a 404
+  too, so the status code alone proves nothing, and any other error stays an error (nothing is
+  released). LND has no hash filter on `ListPayments`, and scanning all of its pages costs O(payments)
+  on every reconcile; TrackPaymentV2 costs one call. It needs the node built with `routerrpc` (Lightning
+  Fork releases are) and `offchain:read`, which the rail's macaroon already has. Tests:
+  `l3_a_payment_is_looked_up_by_its_hash_not_among_the_newest_1000` and
+  `l3_reconcile_does_not_release_a_settled_payment_on_a_busy_node`, against a fake REST LND on
+  loopback that holds 1,001 payments. On regtest, S16 checks both answers on lf1, and S15's reconcile
+  goes through the new lookup.
+* **L4: a late rebook that breaks the policy halts the rail.** A booking released because the node had
+  no record of it is watched; if the node records the payment late, it is booked again (`ln_rebook`).
+  That booking discarded the policy's verdict, so a release, a new payment in the freed room, and the
+  late settle could overspend the daily budget without anyone noticing. Now the rebook still books what
+  was spent (the ledger is the truth), but asks `evaluate_booking` first. If the booking breaks the
+  policy (or cannot be committed), the signer:
+  * writes a halt to `.run/ln_halt.json` (atomic write, `0600`) and audits `ln_halted`;
+  * refuses every `ln_pay` with `ln_halted` (nothing reaches the router), and `ln_status` shows
+    `halted`, `ready: false` and a warning;
+  * puts an approval of kind `ln_resume` (dest `ln:resume`, the amount rebooked) in the human's queue.
+    It is renewed while the halt stands, one live request per halt. Only the human's ed25519 signature
+    on it resumes the rail (`ln_resumed`). A wrong signature, or a token for an earlier halt, is refused.
+
+  A halt file that cannot be read counts as a halt. The watch lasted until the invoice's expiry plus
+  10 minutes, far shorter than an HTLC can stay out. It now lasts `ln.max_cltv_blocks` + 144 blocks
+  (`REBOOK_WATCH_MARGIN_BLOCKS`), counted both in blocks from the tip at release
+  (`watch_until_height`) and in time at 600 s a block. Tests:
+  `l4_a_late_rebook_that_breaks_the_policy_halts_the_rail_until_the_human_resumes_it` and
+  `l4_the_rebook_watch_lasts_as_long_as_the_htlc_can`. The AGP-048 test
+  `a_payment_released_as_never_sent_and_settled_late_is_booked_again` now checks the longer window.
+  The alert is the approval queue the human already watches: the wallet UI's card says the rail is
+  halted and that approving pays nothing. No new message type or key was needed.
+* **L5: the funding proof.**
+  * **The cache is keyed on the block.** A `Proven` verdict was cached per channel point forever, so
+    after a reorg removed the funding block the channel still carried payments. The signer now asks
+    its node for the hash at the short channel id's height on every use, and a cached verdict counts
+    only while that hash is the one it was reached on (`Funding::block_hash`, in the evidence as
+    `block_hash`). After a reorg the channel is proven again from the new block. Test:
+    `l5_a_proven_funding_is_proven_again_after_a_reorg` (refused while the block is gone, proven again
+    when it returns).
+  * **Which signatures count.** The proof read the sighash byte of every DER-shaped push, so a 0x21
+    push that the script never checks (`OP_DROP OP_TRUE`, a taproot script path) "proved" the input.
+    `ln_funding::checked_sighashes` now reads only spends whose sole condition is signatures: P2WPKH,
+    P2SH-P2WPKH, P2PKH, P2WSH or P2SH-P2WSH whose witness script is `<key> CHECKSIG` or
+    `m <keys> n CHECKMULTISIG` (with exactly its `m` signatures), and a taproot key path. Any other
+    input leaves the channel unproven, and the refusal names the input and why. Tests:
+    `l5_a_0x21_push_the_script_never_checks_proves_nothing` (an anyone-can-spend P2WSH and a taproot
+    script path are refused; LND's 2-of-2 P2WSH and np2wkh spends are proven), the unit test
+    `reads_sighash_bytes_by_input_kind`, and the property test `only_signature_only_scripts_are_read`
+    (2,000 random P2WSH witnesses: one is read only if its script is a key-check template, and then
+    yields exactly the `m` signatures that script checks).
+
+**The replay-safety reasoning, corrected** (`ln_funding.rs` module documentation):
+
+* A channel's transactions can replay on SHA-256 Bitcoin only if its funding transaction is valid
+  there too. One input with a signature that its script checks, and that SHA-256 Bitcoin cannot verify,
+  makes the transaction invalid there. The proof asks for that of every signature of every input.
+* The earlier comment said SHA-256 Bitcoin rejects a 0x21 signature. It does not: its consensus accepts
+  hash type 0x21 on legacy and segwit v0 inputs (the byte is only non-standard there; taproot does
+  reject it). The protection is the digest. An XBT signer signs 0x21 over the unified message
+  (`unified_sighash`: BIP341-shaped, committing to every input's amount and scriptPubKey). SHA-256
+  Bitcoin checks the same signature against its own legacy or BIP143 message for hash type 0x21. One
+  ECDSA signature valid under one key for both messages would need the two digests to be equal modulo
+  the group order.
+* **Why reading the bytes suffices, without verifying the signatures in the signer.** The funding
+  transaction is read from a block on the signer's own node's best chain, at the position its short
+  channel id names. That node's consensus has already verified every signature each input's script
+  checks, against XBT's message for its hash type (below an `assumevalid` block, the network that built
+  on it has). Verifying again in the signer would repeat that work and add a second ECDSA path to keep
+  in step with Knots. What the bytes alone cannot tell is which pushes the script checks, so the fix is
+  the template restriction above.
+* **The height proves nothing on its own.** A coin confirmed at or above the split is not thereby
+  XBT-only. A transaction valid on both chains (a 0x01 spend of pre-split coins, broadcast on both) has
+  the same txid on each, so its outputs exist on SHA-256 Bitcoin too, however high it confirmed here.
+  The signatures are the proof. The rule that every input's coin is confirmed at or above the split
+  stays, as an extra, conservative rule: a channel opened after the split never needs older coins.
+
+**For embedders (cmp and anyone linking `xbt-signer`).** Wire and behaviour changes:
+
+| change | before | now |
+|---|---|---|
+| `B2_LN_REST` plain http | allowed to any host starting `127.`, `localhost`, or with a `[` (the bug) | only 127.0.0.0/8, `::1`, `::ffff:127.0.0.0/104`; `localhost` needs https |
+| mainnet macaroon | refused if it grants `onchain:write`, `macaroon:*`, `signer:generate` | refused if it grants anything beyond the rail's 4 permissions, or cannot be read |
+| `ln_status.macaroon` | | adds `only_needed` (bool) |
+| payment lookup | `GET /v1/payments` (newest 1,000) | `GET /v2/router/track/{hash}`: needs `routerrpc` on the node |
+| `ln_pay` | | new rule `ln_halted` (with `halted`, the halt record) |
+| `ln_status` | | adds `halted` (`null` or `{halt_id, reason, payment_hash, dest, booked_sats, ts}`) |
+| approvals | kinds `xbt402`, `ln`, payment | adds kind `ln_resume`, dest `ln:resume`; `approve` with the human's signature resumes the rail |
+| audit log | | `ln_halted`, `ln_resumed`; `ln_rebooked` gains `breach` |
+| `.run/` | | `ln_halt.json` while halted; `ln_payments.json` records gain `watch_until_height` |
+| funding evidence | | adds `block_hash` |
+| `LnBook::watched` | `watched(now)` | `watched(now, tip)` |
+| `ln_funding` | `input_sighashes` | `checked_sighashes(&TxIn, prev_spk) -> Result<Vec<u8>, String>` |
+
+New dependency: `url` 2.5, already in the tree through `ureq` 2.12 (`cargo tree -d` shows no new
+duplicate).
+
+Results on 2026-10-08: `cargo test --workspace` (517 passed) and `scripts/conformance.sh`;
+`scripts/ln_rail_regtest.sh` 61/61 against Lightning Fork `dd659b3` (`docs/agp066_ln_rail_regtest.json`).
+S16 shows the node's answer for an unknown hash: 404 `{"error": {"code": 5, "message": "payment isn't
+initiated"}}`. Its first run also caught `least_privilege`, which the sanitizer had removed from every
+response.
+
+CPU (`crates/xbt-signer/examples/ln_funding_cost.rs`; armv7 musl under `qemu-arm-static` as the
+Pi-class figure, x86_64 native beside it; pass line declared before measuring):
+
+| step | pass line (armv7) | armv7 | x86_64 |
+|---|---|---|---|
+| `checked_sighashes`, one funding transaction of 10 inputs (P2WPKH, 2-of-3 P2WSH, P2SH-P2WPKH, P2TR key path) | ≤ 50 µs | 1.97 µs | 0.16 µs |
+
+The L5 cache check adds one `getblockhash` RPC to the signer's own node per usable channel on each
+`ln_pay` and `ln_status`: a loopback round trip, not CPU. TrackPaymentV2 replaces a 1,000-payment
+listing with one record. The L1 parse runs once, at configuration.
+
 ## Linking xbt-rs from cmp (AGP-035)
 
 xbt-compute's Rust runtime pins this repo by full rev with `default-features = false`. What that

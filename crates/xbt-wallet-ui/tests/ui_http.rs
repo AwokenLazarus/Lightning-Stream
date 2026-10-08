@@ -376,6 +376,24 @@ fn approve_a_pay_token_pays_at_once() {
 }
 
 #[test]
+fn a_halted_lightning_rail_shows_as_a_resume_request_that_pays_nothing() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let bx = start(json!({}), false, |_| {});
+    let mut br = logged_in(&bx);
+    let exp = xbt_wallet_ui::now() + 300;
+    bx.rig.s.engine.store.put_approval("resume-1", json!({"kind": "ln_resume", "halt_id": "h1", "dest": "ln:resume", "amount_sats": 3002,
+        "memo": "Lightning payments are halted: a late rebook broke the policy", "expires": exp, "ts": 1, "used": false})).unwrap();
+    let page = br.get("/approvals").body;
+    assert!(page.contains("resume Lightning payments") && page.contains("Nothing is paid when you approve"), "{page}");
+    assert!(!page.contains("paid as soon as you approve"));
+    let m = canonical_message("resume-1", "ln:resume", 3002, exp);
+    let r = br.act("/approvals", "/approve", &[("token", "resume-1"), ("dest", "ln:resume"), ("amount_sats", "3002"), ("expiry", &exp.to_string()),
+                                               ("signature", &sig(&m))]);
+    assert_eq!(br.flash_after(&r), "Resumed: the agent may pay over Lightning again, within the policy.");
+    assert!(!br.get("/approvals").body.contains("resume-1"));
+}
+
+#[test]
 fn the_policy_editor_shows_the_signer_s_errors_and_applies_a_signed_change_live() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let bx = start(json!({}), false, |_| {});
