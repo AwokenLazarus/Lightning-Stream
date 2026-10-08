@@ -563,10 +563,10 @@ impl PolicyStore {
         serde_json::from_str(&t).map_err(|e| err("io", format!("{}: {e}", self.path.display())))
     }
 
+    /// AGP-063 K1: the approvals document as every other state file: the tmp file fsynced, renamed,
+    /// the directory fsynced, 0600 (it holds approval tokens).
     fn write(&self, data: &Value) -> Result<()> {
-        let tmp = self.path.with_extension("tmp");
-        fs::write(&tmp, dumps_indent(data, 2, true)).map_err(|e| err("io", e.to_string()))?;
-        crate::fsx::rename(&tmp, &self.path).map_err(|e| err("io", e.to_string()))
+        crate::keystore::write_private(&self.path, &dumps_indent(data, 2, true))
     }
 
     pub fn payments(&self) -> Result<Vec<LedgerEntry>> {

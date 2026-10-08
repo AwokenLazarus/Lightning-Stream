@@ -82,6 +82,9 @@ impl WalletSend {
     }
 }
 
+/// A new payer key: its pubkey, the local secret if the client holds it, the payer change spk.
+type FreshKey = (Vec<u8>, Option<SecretKey>, Option<Vec<u8>>);
+
 /// Client settings (the reference's constructor keywords).
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -536,7 +539,7 @@ impl Client {
 
     /// A payer key for a new channel to `key_origin`: (pubkey, the local secret if we hold it,
     /// the payer change spk the signer asks for).
-    fn fresh_key(&self, key_origin: &str) -> Result<(Vec<u8>, Option<SecretKey>, Option<Vec<u8>>)> {
+    fn fresh_key(&self, key_origin: &str) -> Result<FreshKey> {
         match &self.signer {
             Some(s) => Ok((s.new_key(key_origin)?.to_vec(), None, s.payer_spk()?)),
             None => {

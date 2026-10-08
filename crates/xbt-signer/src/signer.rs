@@ -861,12 +861,26 @@ impl Signer {
                 return Ok(opened);
             }
         }
+        let (chan, cum, booked) = match (self.book.get(dest), self.book.next_cum(dest, pay.amount_sats)) {
+            (Some(r), Ok(cum)) => (r.chan.clone(), cum, Session::booked_through(&r)),
+            (_, Err(e)) => return Ok(deny(&e.code, e.msg)),
+            (None, _) => return Ok(deny("unknown_channel", dest.to_string())),
+        };
+        let txid = format!("xbt402:{chan}:{cum}");
+        let added = cum > booked && self.engine.commit_once(&Payment { amount_sats: cum - booked, ..pay.clone() }, &txid)?;
         let rec = match self.book.increment(dest, pay.amount_sats) {
             Ok((rec, _)) => rec,
-            Err(e) => return Ok(deny(&e.code, e.msg)),
+            Err(e) => {
+                if added {
+                    self.engine.store.amend(&txid, None)?;
+                }
+                return Ok(deny(&e.code, e.msg));
+            }
         };
-        self.engine.commit(pay, &rec.chan)?;
-        Ok(with(d, json!({"rail": "channel", "chan": rec.chan, "cum": rec.used_sats, "seq": rec.seq, "cap_sats": rec.cap_sats,
+        if cum > booked {
+            self.book.mark_ledger_booked(dest, rec.used_sats)?;
+        }
+        Ok(with(d, json!({"rail": "channel", "booked_sats": (cum - booked).max(0), "chan": rec.chan, "cum": rec.used_sats, "seq": rec.seq, "cap_sats": rec.cap_sats,
                           "used_sats": rec.used_sats})))
     }
 
