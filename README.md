@@ -1204,9 +1204,9 @@ and up.
   digest no longer authenticates.
 - B5 and xbt-063 vendor pinned B1/B2 and are unaffected until they re-pin. On re-pin, B5
   `fwd/server.py` must add status and bodyHash to its receipts and use the v2 digest.
-- The B2 wallet (`agp-068`, `611ec39`) binds the v2 digest, but as before it does not check receipts.
+- The B2 wallet (`agp-068`, `611ec39`) binds the v2 digest. Since the AGP-063 merge it also checks the seller's receipt (request binding v2, status and bodyHash), as xbt-signer does.
 - xbt-wallet-ui, xbt-work-relay and xbt-wallet-mcp still served with `tiny_http`, so they kept T1's
-  slowloris exposure until AGP-072 moved them to the same server (next section). Moving xbt-work
+  slowloris exposure until AGP-072 moved them to the same server ("One bounded HTTP server for every service (AGP-072)"). Moving xbt-work
   to v2 is a follow-up.
 - `scripts/conformance.sh` defaults to B1 at `~/xbt-rnd/b1-agp-068` until this merges.
 
