@@ -1,16 +1,16 @@
 #!/bin/bash
 # AGP-030 verify: everything result.md reports, in one run, at this commit.
 #   scripts/mcp/verify_agp030.sh            (add CLAUDE=0 to skip the two real-Claude flagships, ~$0.25 each)
-# Needs: ~/xbt-rnd/xbt-063-agp-074 (xbt-063 branch agp-074, the AGP-030 flagship on the merged B1/B2
+# Needs: ~/xbt-rnd/xbt-063 (xbt-063 master, the AGP-030 flagship on the merged B1/B2
 # pins) with its .venv (mcp 2.2.0), ~/xbt-rnd/b2 at master, hermes on PATH, claude on PATH. Ports
 # 33500-33599. Soak rules: CPUQuota 200%, 4G, nice 19, -j2. The two REAL CLAUDE steps need Claude
 # credit; CLAUDE=0 skips them.
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 ROOT=$PWD
-X63=${XBT063:-$HOME/xbt-rnd/xbt-063-agp-074}
+X63=${XBT063:-$HOME/xbt-rnd/xbt-063}
 PY=$HOME/xbt-rnd/xbt-063/.venv/bin/python
-B2=${B2_TREE:-$HOME/xbt-rnd/b2-agp-074}
+B2=${B2_TREE:-$HOME/xbt-rnd/b2}
 SOAK=(systemd-run --user --scope -q -p CPUQuota=200% -p MemoryMax=4G nice -n 19)
 declare -a RES=()
 step() {   # label, command...
