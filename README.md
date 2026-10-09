@@ -1139,8 +1139,8 @@ terms it was given, so a server-side check of one would never fire.
 - `seq` is the call's own, and cum and spentMsat come from the call's reservation (less its own
   refund), not from whatever another call wrote meanwhile. A seq spent on a refusal is saved before
   the 402 goes out (a 500 if that save fails), so a replay after a restart is still `bad_auth`.
-- The old `sha256(method|path|body)` remains as `request_digest_v1` for xbt-work's published
-  XBT-053 vectors; xbt-work still speaks v1.
+- xbt-work moved to request binding v2 with the XBT-053 vectors (AGP-074): see "Embedders on
+  xbt402 v1.3 (AGP-074)".
 
 **HTTP server (`http-server` feature).** It is now `std::net`:
 
@@ -2200,6 +2200,47 @@ Pi-class figure, x86_64 native beside it; pass line declared before measuring):
 The L5 cache check adds one `getblockhash` RPC to the signer's own node per usable channel on each
 `ln_pay` and `ln_status`: a loopback round trip, not CPU. TrackPaymentV2 replaces a 1,000-payment
 listing with one record. The L1 parse runs once, at configuration.
+
+## Embedders on xbt402 v1.3 (AGP-074)
+
+AGP-068 changed the wire (derivation v3, request binding v2, receipt v2) and left the embedders on
+their pins. This moves them.
+
+**xbt-work speaks request binding v2.** `xbt_work::auth::request_digest` is now
+`xbt402::wire::request_digest_v2`: the digest is the tagged hash of the length-prefixed method,
+scheme, host, port, target and body, taken over the URL the payer sent the request to. A bare
+target binds no origin, which is what the published vectors use. v1 (`request_digest_v1`) no longer
+authenticates. The vectors are XBT-053's `vectors.json` with the `auth` section regenerated
+(XBT-053 branch `agp-074`; `scripts/work_conformance.sh` still demands byte identity). The HMAC
+over the digest is unchanged.
+
+Options weighed for the binding (best-performing-stack rule): a digest of xbt-work's own (a second
+definition to keep equal with xbt402's, forever), keeping v1 behind a version flag (two live
+bindings, and a captured v1 header still spends), or **xbt402's v2 directly (chosen)**. One
+function, the same one B1 and the channel scheme already verify, and the published vectors move
+with it.
+
+**Cost.** Declared before measuring: moving xbt-work's digest from v1 to v2 may add at most 50 µs
+per paid call on the Ryzen 9 9950X3D, and at most 1 ms on the Pi 3's Cortex-A53. Measured with
+`cargo run --release -p xbt402 --example binding_bench` (20,000 iterations, the bench's own empty
+body): v1 98 ns, v2 273 ns, so +175 ns per call. The difference is the length prefix per field and
+the origin split; both hash the same body bytes, and the bench's own line puts a 4 KiB body at
+1,657 ns. On the Pi 3 the same SHA-256 is the cost, and 175 ns scaled by that core's gap to the
+Ryzen stays far under 1 ms. Nothing is added per byte beyond what v1 already hashed.
+
+**xbt-063.** `rehearsal/PINS` and `vendor/` move to the merged B1 and B2 masters. The flagship
+refund probe's policy carries `allowlist` and `counterparties[probe].pay_to`, because AGP-063 (W3)
+refuses an `open_channel` whose destination is not the policy's. `scripts/mcp/regtest_conformance.sh`
+and `verify_agp030.sh` default to this xbt-063 tree.
+
+**B5.** `vendor/` moves to the same masters, and `fwd/server.py` signs receipt v2: `status` and
+`bodyHash` over the answer body, with `req` bound by `request_digest_v2`.
+
+**B2.** `open_from_offer` posts the review C2 preflight `/open` (no outpoint) before it funds, as
+`Payer::open` and the B1 client do. A refusal funds nothing; a provider from before the preflight
+answers `bad_request` and the wallet funds as before.
+
+`xbt-signer`'s `request_target` is gone: nothing called it once the binding moved to the full URL.
 
 ## Linking xbt-rs from cmp (AGP-035)
 

@@ -53,12 +53,6 @@ pub fn origin_of(url: &str) -> Result<String> {
     Ok(format!("{}://{netloc}", scheme.to_ascii_lowercase()))
 }
 
-/// Path + query as the provider sees it.
-pub fn request_target(url: &str) -> String {
-    let parts: Vec<&str> = url.splitn(4, '/').collect();
-    if parts.len() > 3 { format!("/{}", parts[3]) } else { "/".into() }
-}
-
 fn pick_accept(pr: &Value, network: &str) -> Result<Value> {
     pr.get("accepts").and_then(Value::as_array).into_iter().flatten()
         .find(|a| scheme_accepted(a.get("scheme").and_then(Value::as_str)) && a.get("network").and_then(Value::as_str) == Some(network))
@@ -225,7 +219,9 @@ impl Session {
         }
         let min_exp = or_int(extra.get("minExpiryBlocks"), 1)?;
         let max_exp = or_int(extra.get("maxExpiryBlocks"), 100_000)?;
-        let blocks = expiry_blocks.max(min_exp + 6).min(max_exp - 1);
+        // the provider's funding check also wants `left >= minExpiry + closeMargin`, and its policy
+        // default margin is 36, so a channel opened at exactly minExpiry is refused
+        let blocks = expiry_blocks.max(min_exp + 6).max(min_exp + 36).min(max_exp - 1);
         self.hot.check_channel_funding()?; // AGP-013: above the hot-balance cap, a human sweeps first
         let open_height = self.height()? as i64;
         let expiry = open_height + blocks;
