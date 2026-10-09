@@ -193,7 +193,7 @@ pub struct HubConfig {
     /// `{"min_expiry_blocks", "max_expiry_blocks", ...}`: ch1's funding policy (FundingPolicy fields).
     pub policy: Value,
     /// Bounds on a provider's /terms before the hub funds a ch2 (AGP-037); refused `bad_terms`.
-    /// minExpiryBlocks + 6 must fit, and the expiry is clamped to it (0: 2 × `ch2_expiry_blocks`).
+    /// minExpiryBlocks + minConf + closeMarginBlocks must fit, and the expiry is clamped to it (0: 2 × `ch2_expiry_blocks`).
     pub ch2_max_expiry_blocks: u32,
     pub ch2_max_close_fee_sat: u64,
     /// `ch2_close_fee_multiple` × closeFeeSat ≤ capacity.
@@ -1784,9 +1784,11 @@ impl RouteHub {
         let num = |k: &str| py_u64(ex.get(k)).ok_or_else(|| bad(k));
         let close_fee = num("closeFeeSat")?;
         let min_cap = num("minCapacity")?;
-        let lo = num("minExpiryBlocks")?.saturating_add(6);
-        let hi = num("maxExpiryBlocks")?.saturating_sub(1);
         let min_conf = if ex.get("minConf").is_some() { num("minConf")? } else { 1 };
+        // the payer's rule (funding::open_expiry_floor): the ch2 funding gets minConf plus the
+        // provider's own close margin to confirm before the provider's expiry check refuses it
+        let lo = crate::funding::open_expiry_floor(num("minExpiryBlocks")?, min_conf, num("closeMarginBlocks")?);
+        let hi = num("maxExpiryBlocks")?.saturating_sub(1);
         let mult = if ex.get("settleMultiple").is_some() { num("settleMultiple")? } else { 20 };
         let max_blocks = if c.ch2_max_expiry_blocks > 0 { c.ch2_max_expiry_blocks as u64 } else { 2 * c.ch2_expiry_blocks as u64 };
         let max_min_cap = if c.ch2_max_min_capacity > 0 { c.ch2_max_min_capacity } else { c.ch2_capacity };
@@ -1797,10 +1799,10 @@ impl RouteHub {
             format!("{} x closeFeeSat {close_fee} > capacity {cap}", c.ch2_close_fee_multiple)
         } else if min_cap > max_min_cap {
             format!("minCapacity {min_cap} > ch2_max_min_capacity {max_min_cap}")
-        } else if lo > max_blocks || lo > hi {
-            format!("minExpiryBlocks + 6 = {lo} > max expiry {}", max_blocks.min(hi))
         } else if min_conf > c.ch2_max_min_conf {
             format!("minConf {min_conf} > ch2_max_min_conf {}", c.ch2_max_min_conf)
+        } else if lo > max_blocks || lo > hi {
+            format!("minExpiryBlocks + minConf + closeMarginBlocks = {lo} > max expiry {}", max_blocks.min(hi))
         } else if !(1..=c.ch2_max_settle_multiple).contains(&mult) {
             format!("settleMultiple {mult} outside [1, {}]", c.ch2_max_settle_multiple)
         } else {
