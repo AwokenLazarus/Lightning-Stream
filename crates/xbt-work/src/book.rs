@@ -155,7 +155,7 @@ impl ReceiptBook {
     }
 
     fn open_credit(&self, invoice: Option<&str>) -> u64 {
-        self.spans.iter().filter(|s| s.coverage == Coverage::Open && invoice.map_or(true, |v| v == s.invoice))
+        self.spans.iter().filter(|s| s.coverage == Coverage::Open && invoice.is_none_or(|v| v == s.invoice))
             .fold(0u64, |a, s| a.saturating_add(s.credited))
     }
 
@@ -380,7 +380,7 @@ impl ReceiptBook {
             let (state, h) = match s.coverage { Coverage::Open => ("open", 0), Coverage::Covered(h) => ("covered", h), Coverage::Skipped(h) => ("skipped", h) };
             Value::from(vec![Value::from(s.invoice.clone()), s.lo.into(), s.hi.into(), s.work.into(), s.credited.into(), state.into(), h.into()])
         }).collect();
-        let mut held: Vec<&Signed> = self.by_seq.values().filter(|s| self.last.get(&s.receipt.invoice).map_or(true, |l| l.receipt.seq != s.receipt.seq)).collect();
+        let mut held: Vec<&Signed> = self.by_seq.values().filter(|s| self.last.get(&s.receipt.invoice).is_none_or(|l| l.receipt.seq != s.receipt.seq)).collect();
         held.sort_by(|a, b| (&a.receipt.invoice, a.receipt.seq).cmp(&(&b.receipt.invoice, b.receipt.seq)));
         obj([("last", last.into()), ("credited", Value::Object(cr)), ("intervals", iv.into()),
              ("fraud", self.fraud.iter().map(Equivocation::to_json).collect::<Vec<_>>().into()),

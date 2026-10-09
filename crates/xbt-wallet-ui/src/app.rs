@@ -102,7 +102,7 @@ fn state_of(c: &Value) -> &'static str {
 /// The signer did it: no deny, no `ok: false`, no error.
 fn ok_of(r: &Value) -> bool {
     r.is_object() && !matches!(r.get("verdict").and_then(Value::as_str), Some("deny") | Some("needs_human"))
-        && r.get("ok") != Some(&Value::Bool(false)) && r.get("error").map_or(true, Value::is_null)
+        && r.get("ok") != Some(&Value::Bool(false)) && r.get("error").is_none_or(Value::is_null)
 }
 
 fn reason_of(r: &Value) -> String {

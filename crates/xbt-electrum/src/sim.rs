@@ -710,14 +710,9 @@ impl TlsProxy {
                     let _ = up_r.set_read_timeout(Some(Duration::from_millis(10)));
                     let mut up_w = up;
                     let (mut b1, mut b2) = (vec![0u8; 1 << 16], vec![0u8; 1 << 16]);
-                    loop {
-                        match link.recv(&mut b1) {
-                            Ok(Some(d)) => {
-                                if !d.is_empty() && up_w.write_all(&d).is_err() {
-                                    break;
-                                }
-                            }
-                            _ => break,
+                    while let Ok(Some(d)) = link.recv(&mut b1) {
+                        if !d.is_empty() && up_w.write_all(&d).is_err() {
+                            break;
                         }
                         match up_r.read(&mut b2) {
                             Ok(0) => break,
