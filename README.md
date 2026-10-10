@@ -1665,8 +1665,13 @@ Tests, each failing on `main` and passing here (B1: `tests/security/test_agp078_
 ## Transport, light-client and rollover closure fixes (AGP-081)
 
 The closure audit of the external review (AGP-077, list 1 items 8, 9 and 10) found these still open
-on `main` (`68d9650`). Each is the neighbour of a path an earlier fix closed. B1 and B2 `agp-081`
-carry the same changes where they have the code, with the same test names (`test_` prefixed).
+on `main` (`68d9650`). Each is the neighbour of a path an earlier fix closed. B1 `agp-081`
+(`7e28c87`) and B2 `agp-081` (`542d0ca`) carry the same changes where they have the code, with the
+same test names (`test_` prefixed): B1 `tests/security/test_agp081_closure_audit.py` (receipt,
+fragment, per-address cap, the ASGI path held to loopback and documented as needing a proxy, and
+payers opening at `minExpiryBlocks + minConf + closeMarginBlocks`), B2
+`tests/test_agp081_closure_audit.py` (the Electrum limits, where B2 had no line limit at all, and
+the fragment), with B2's own measurements from `tests/e1_attacks.py`.
 
 **A paid answer needs its receipt (T4c).** `Client::request` checked a PAYMENT-RESPONSE only when
 the header was there: with it stripped on the way, any body passed as the paid answer.
@@ -1804,6 +1809,11 @@ say the same. Run this rail over TLS to the provider.
   when no server answered, where they returned "nothing" before.
 * After a failed `Client::rollover`, look at `next_rolled`: the refund of each record is the way
   back for that next channel if its rollover confirms.
+
+Found and not fixed here: the hub's ch2 rollover writes the next ch2 ahead, but clears it when the
+provider answers 400, 401 or 403 ("refused: nothing was broadcast"). A provider that answers so
+and broadcasts anyway leaves the hub without the next ch2's key. Same in B1; a B1-only change is
+parked on B1 branch `agp-081-hub-rollover`, not reviewed, for a hub task in both languages.
 
 Noticed and not changed: after one answer lost on the way, the next receipt shows two calls' growth
 in `spentMsat` and the client refuses it `bad_receipt` (`Client::receipt` has no slack for a lost
