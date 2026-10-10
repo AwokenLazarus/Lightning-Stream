@@ -62,8 +62,8 @@ pub fn unb64json(s: &str) -> Result<Value> {
 }
 
 /// The v1 binding `sha256(method | target | body)` hex. Its fields run together and it binds no
-/// origin (review T2); xbt402 uses [`request_digest_v2`]. Only the xbt-work scheme still binds requests
-/// with it, because its published vectors (XBT-053) do.
+/// origin (review T2); xbt402 and, since AGP-074, the xbt-work scheme use [`request_digest_v2`]. Kept
+/// for the comparison in `examples/binding_bench.rs` and the collision test.
 pub fn request_digest_v1(method: &str, target: &str, body: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(method.as_bytes());

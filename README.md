@@ -1860,8 +1860,8 @@ interleaved with the same example built on main:
 
 **What this does not fix.**
 
-- Above pin 964264 a fork is still cheap: difficulty there is `1a00f0b5`, about 2^53 hashes per
-  block. The floor only raises the bar for a fork that also hides the real tip. Releases should bump
+- Above pin 964264 a fork is still cheap: difficulty there is `1a00f0b5`, about 2^56 hashes per
+  block (2^72 / 0xf0b5). The floor only raises the bar for a fork that also hides the real tip. Releases should bump
   the pins, and operators can set a later checkpoint.
 - A call that fans out to every server waits for the slowest one, up to the timeout (no lock held).
 - One batch can fetch up to 4×2016 junk headers before the first is checked (B2 fetches chunk by
@@ -2002,7 +2002,8 @@ first run against `main` and failed there.
   allows one credit per hash per height (about 1507–1527); then the TIDES ledger is credited and, for a
   `.pw-<invoice>` username, so is the receipt (`work_receipts.credit`, about 1563–1566). The audit does
   not re-check shares: it cannot see them. It bounds what the Prime can claim about them.
-* **P2: a pass releases only what it covered.** The book keeps one `Span` per receipted increase:
+* **P2: a pass releases only what it covered.** (Replaced by AGP-079 below: a pass now covers only
+  what the coinbase paid for, and nothing is forgiven. What follows is the AGP-065 design.) The book kept one `Span` per receipted increase:
   invoice, `lo..hi`, work, credited, coverage (`Open`, `Covered(h)`, `Skipped(h)`). A passing audit at `H`
   with window start `ws` covers only open spans with `lo > ws` and `hi < H`, exactly the intervals its
   bound counted. Spans at or below `ws` are `Skipped`: no later window can count them. Up to
@@ -2013,14 +2014,14 @@ first run against `main` and failed there.
   (`chain::ChainBlock { height, hash, value_sats, paid_sats, bits, prev_bits }`). A statement for another
   height or hash fails with `wrong_block` (`p3_statement_height_must_be_the_blocks`: `height = u32::MAX`
   and `height = window_start + 1`).
-* **P4: a missing statement is never skipped.** `tools::window`: 200 is a statement, 404 (primed's
+* **P4: a missing statement is never skipped.** `provider::window_statement` (`tools::window`): 200 is a statement, 404 (primed's
   "no window statement", `stats.rs` 434) is `Statement::Missing`, and anything else is an error.
   `WorkProvider::audit_chain`: a missing statement for a coinbase that paid the identity fails the
   audit and distrusts the Prime (`missing_statement`); for one that paid nothing it records nothing and
   the credit stays held. The audit loop stops at a Prime or node error and resumes at that block.
   Tests: `p4_a_statement_error_is_not_a_missing_statement`, `p4_a_missing_statement_fails_or_holds`.
 * **P5: default caps.** With no cap flag, `xbt-work-provider` caps unaudited credit at 100 calls per invoice
-  and 1,000 calls in total, and forgives at most 100 calls of skipped credit. `--cap-*-calls N` (new)
+  and 1,000 calls in total (AGP-065 also forgave 100 calls of skipped credit; AGP-079 forgives none). `--cap-*-calls N` (new)
   sets a cap in calls at `--price`, and `off` removes a cap. The library's `CreditCaps::default()` is
   still uncapped (the reference's book, which the vectors pin). Test: `p5_the_binary_ships_non_zero_caps`.
 * **P6: invoices, issuance, state, reorgs.**
@@ -2078,8 +2079,9 @@ first run against `main` and failed there.
 | `xbt-work-provider` | caps off by default | 100/1,000/100 calls; Prime terms flags; reorg check; admin from loopback peers only |
 | xbt402 HTTP server | | sets `X-Xbt402-Peer` to the TCP peer on every request |
 
-The pricing fee is now `terms.fee_bps`, the fee the audit holds the Prime to. Python parity: the
-same logic lives in XBT-053 (lazarus-xbt), and the spec diff is routed there. The vectors are unchanged
+The pricing fee is now `terms.fee_bps`, the fee the audit holds the Prime to. Python parity: there is
+none. XBT-053's Python (`receipts.py`) has the v1 draft audit only, with none of P1–P4; this crate is
+the reference for them (see AGP-079 below). The vectors are unchanged
 (`work_conformance.sh`: 91/91 and 124/0, byte-identical).
 
 Results on 2026-10-08: `cargo test --workspace` (464 passed) and `scripts/conformance.sh`;
@@ -2103,6 +2105,138 @@ beside it; pass lines declared before measuring):
 The fraud-proof check misses its line at 100 invoices: 200 Ed25519 receipt verifications (AGP-032), of
 which the bounds add 2 µs. It runs once per disputed block, not per call. `ReceiptBook::credit` now
 makes one pass over the spans; before, it recomputed the caps' room for each open span.
+
+## Pay-with-work closure fixes: credit is covered by what coinbases paid (AGP-079, P1 and P4)
+
+The closure audit (AGP-077) reproduced four routes by which a Prime colluding with a payer still got
+unmined work credited and released, and two ways an underpaid block escaped the audit. All were present
+on `main` (`0a84665`). Tests: `crates/xbt-work/tests/agp077_closure_audit.rs` (10; the six that state
+the findings failed before the fix), `review_p.rs`, and the book's unit tests.
+
+**The cause.** AGP-065 bounded every number in a window statement, but a *passing* audit still released
+all the credit its bound counted, whatever the coinbase paid. A pass is cheap for the Prime to arrange:
+a deferral line it signs counts as paid, `expected < min_payout` passes with nothing paid, a window
+that starts above the credit expects nothing, and a block with no statement has no verdict at all.
+
+**Options weighed.**
+
+| option | verdict |
+|---|---|
+| Cover a span after it was counted in N passing blocks (N = `window`) | No. An honest pool finds a Poisson(8) number of blocks while a share is in its window: fewer than 8 about 45% of the time. Which blocks are pool blocks and where the window starts are the Prime's word. |
+| Price a haircut for the risk | No. Paying one block of eight is a discount of 7/8; no usable haircut prices that. |
+| Default carry caps only | Not enough. They stop the deferral route after a few blocks, and do nothing for the other three. Kept as a second line. |
+| **Cover credit only by what coinbases paid, at the provider's own price** | Chosen. It uses nothing the Prime signs, so it closes the four routes and any other way of arranging a pass. |
+
+**The rule.** `ReceiptBook` keeps credit in the order it was granted (`credits`). When a block's audit
+passes, `WorkProvider::paid_work(&ChainBlock)` turns what its coinbase paid the identity (from the
+provider's own node) into work units at the price the provider sells work for, at that block's own
+difficulty and value: under exact pricing, the work `paidSats` buys by §6.2 with the pinned fee and the
+haircut; with a fixed amount per call, `paidSats × amount / invoice_price_sats`. `ReceiptBook::pay(h,
+work)` records it per height and the paid-for work covers the oldest credit first. Unaudited credit, the
+thing the §13.1 caps count, is the credit no coinbase has paid for yet. A failed audit pays for nothing.
+Auditing a block again replaces its payment, a reorg removes it (`uncover`), and `settle` forgets only
+payments deeper than `SETTLE_DEPTH` together with the credit they cover; a settled block audited again
+is not paid for twice (`settled_through`). Work paid for beyond the credit granted is room for new credit. The `Span`/`Coverage` states and the skipped allowance are gone.
+
+So a Prime gets credit released only by paying the provider, in coinbases of real blocks, the price of
+the calls. What it has not paid for stays inside the caps: 1,000 calls in total with the shipped
+defaults, once, not per block.
+
+| route (closure audit, list 1 item 2 and 4) | before | now | test |
+|---|---|---|---|
+| deferral lines, no carry cap | 5,000 units credited over a cap of 1,000, nothing paid | the lines pass the audit and cover nothing; the shipped carry cap freezes credit after the first | `p1_deferral_lines_do_not_release_credit_no_coinbase_paid_for`, `p1_deferral_lines_release_nothing_even_without_a_carry_cap` |
+| `min_payout` excuse | 2,000 units, nothing paid | the pass covers nothing; the total cap binds | `p1_the_min_payout_excuse_does_not_release_credit` |
+| `window_start` moved forward | all credit for 1/8 of its price | 1/8 paid covers about 1/8 (14% at the 10% haircut) | `p1_a_window_start_moved_forward_does_not_release_unpaid_credit`, `p1_one_block_of_eight_pays_for_an_eighth_under_the_shipped_defaults` |
+| unpaid pool blocks answered 404 | seven unpaid blocks vanish, the eighth releases everything | unpaid blocks cover nothing | `p4_unpaid_blocks_with_no_statement_do_not_vanish_from_the_audit` |
+| a statement the audit refuses, on a paid block | logged, no verdict, never retried | a failed audit, the Prime distrusted (`refused_statement`), exactly as with no statement | `p4_a_refused_statement_on_an_underpaid_block_is_a_failed_audit`, `p4_every_refused_statement_on_a_paid_block_distrusts_the_prime` |
+| the honest case | one pass released everything | the eight blocks of a window pay for all of it | `an_honest_window_pays_for_all_the_credit_under_the_shipped_defaults` |
+
+**P4.** `WorkProvider::audit_chain` treats a statement that `audit` refuses with one of
+`STATEMENT_REFUSALS` (`bad_window_sig`, `wrong_prime`, `wrong_block`, `bad_window`,
+`window_start_regressed`) as the block having no statement. On a coinbase that paid the identity that
+is a failed audit and distrust; the audit record carries `refusedStatement`. The audit loop no longer
+logs and moves on. A block that paid the identity nothing and has no usable statement still has no
+verdict: the provider cannot tell the Prime's unpaid block from another pool's block. It counts against
+the Prime in the only way open to the provider: it covers nothing.
+
+**Shipped defaults (`WorkConfig::shipped`, which `xbt-work-provider` starts from).** The decisions:
+
+| setting | before | now | override |
+|---|---|---|---|
+| caps on unaudited credit | 100 / 1,000 calls | the same | `--cap-invoice*`, `--cap-total*` |
+| skipped credit forgiven | 100 calls | none; the flag is ignored with a notice | — |
+| cap on owed carry | off | the value of 1,000 calls (150,000 sats at the default price) | `--max-carry-sats S`, `off` |
+| carry growth rule | off | off: at an honest Prime a share below `min-payout` grows as carry for several blocks; set it when the provider attests every tip | `--carry-growth-blocks N` |
+| work book | memory only without `--state` | `DIR/work.json` in the data dir, under the ledger's process lock | `--state FILE`, `--state off` |
+| audit loop | off without `--audit-depth` | 6 deep whenever `--window-url` is given | `--audit-depth K`, `off` |
+| no `--window-url` | silent | starts, and says that no audit runs and credit stops for good at the total cap | — |
+
+The two tests that needed `--features tools` run in the default sweep: `window_statement` moved to
+`provider.rs` (`tools::window` re-exports it) and the caps (`Cap`, `Caps::SHIPPED`) moved from the
+binary into the library. `p3_statement_height_must_be_the_blocks` now has the literal
+`height = window_start + 1` case.
+
+**Other paths to the same state, each checked.** Credit is granted in one place, `ReceiptBook::credit`,
+within `room`; these reach it or the payments:
+
+| path | covered by |
+|---|---|
+| a receipt from the relay, the Prime or a payer's header (`accept`, `refresh`, `check_and_debit`), a replay | `credit` within `room`; `caps_hold_unpaid_credit_until_a_coinbase_pays_for_it` |
+| `audit`, the admin audit endpoint, the audit loop | all go through `audit` / `audit_chain`; the admin controls (`underpayHeight`, `withoutDeferrals`) record nothing |
+| re-auditing a block | `pay` replaces: `payments_cover_the_oldest_credit_and_a_reorg_takes_them_back` |
+| a reorg (`orphaned`) | `uncover`: `p6_a_reorg_rolls_back_released_credit` |
+| settling deep audits (`record` → `settle`) | forgets only paid credit; same book test |
+| new caps at an epoch (`set_caps`) | `release_held` within the new caps |
+| a restart | `credits`, `cover`, `coverSettled` are in the state file (version 3): `unpaid_credit_and_payments_survive_a_restart` |
+| state from AGP-065 or AGP-043 | covered spans count as paid and settled; open and skipped credit loads as unpaid, none forgiven: `earlier_receipts_survive_a_restart_and_agp043_state_migrates` |
+| XBT-053's Python reference | has none of P1–P4 or of this rule: see below |
+| B1, B2 | hold no pay-with-work audit code |
+
+**Stated limits.**
+
+- An unpaid block with no statement leaves no verdict and no fraud proof. A payer's real work that a
+  Prime never pays for costs the provider up to the total cap. Naming the pool's blocks independently
+  needs the share-log commitment (`docs/xbt-work-share-log-commitment.md`, not implemented).
+- The provider now carries the pool's luck. An honest window pays in 8 blocks on average; when the pool
+  finds fewer, credit stays unaudited longer and new credit can be held at the caps until later
+  coinbases catch up. Paying for work at the list price (10% haircut) gives about 11% more cover than
+  the work mined, which absorbs part of it. Operators who trust their Prime can raise the caps.
+- Every coinbase output to the identity counts as payment, whatever it was for. Use an identity that
+  receives nothing but this Prime's pay-with-work payouts.
+- A locked coinbase payout still counts as paid (M1).
+- Exact pricing rounds up to one work unit, so a passing block that paid 1 sat pays for 1 unit
+  (0.09 sat of work on mainnet). On regtest a call costs one unit and each paying block pays for one.
+- A statement for a stale block served during a reorg, on a block that pays the identity, distrusts
+  the Prime like a missing one does. The shipped audit depth of 6 keeps the loop away from the tip.
+- State migrated from AGP-065 cannot reopen a block audited before the upgrade if it is reorged after.
+- Fraud proofs still convict only for a checker who knows the Prime's terms; T2/T4 for the xbt-work
+  rail are not part of this task.
+
+**Cost.** `cargo run --release -p xbt-work --example audit_cost` on x86_64, this branch against `main`
+(`0a84665`), 1,000 receipted increases over 100 invoices: credit room per paid call 0.02 µs (main
+1.8 µs), `audit_block` 71 µs (71 µs), `check_fraud_proof` 2.9 ms (2.9 ms). The AGP-065 pass lines are
+for armv7; armv7 was not rerun. The room is now one walk over the unpaid credit instead of over every
+span.
+
+**XBT-053.** The Python reference (`~/xbt-rnd/XBT-053`, `receipts.py`) implements the v1 draft audit:
+no bounds, no chain block, no missing-statement rule, no caps. The audit rules of AGP-065 and the cover
+rule above are specified by this crate, which is the reference for them until the spec (§10.2, §10.3,
+§13.1) carries them; the spec diff is in the task result for the XBT-053 owner. `audit_block` and
+`check_fraud_proof` are unchanged, so the vectors are too (`work_conformance.sh`).
+
+**For embedders.**
+
+| change | before | now |
+|---|---|---|
+| `CreditCaps` | `per_invoice`, `total`, `skipped` | `per_invoice`, `total` |
+| `ReceiptBook` | `spans`, `settled_skipped`, `audited(h, ws, passed)`, `skipped_work()` | `credits`, `cover`, `cover_settled`, `pay(h, work)`, `paid_work()`; `uncover` and `settle` keep their signatures |
+| `book::{Span, Coverage}` | | removed |
+| `WorkProvider` | | adds `paid_work(&ChainBlock)`; `audit_chain` returns a failed outcome for a refused statement on a paid block instead of `Err` |
+| `provider` | | adds `window_statement`, `Cap`, `Caps`, `WorkConfig::shipped`, `STATEMENT_REFUSALS`, `SHIPPED_*` |
+| audit record, report | `skippedWork`, `forgivenSkippedWork` | `paidForWork` (per audited block; in `credit`, the paid-for work not yet settled against credit), `refusedStatement`; `coveredWork` is the credit the block newly covered |
+| provider state file | version 2 | version 3 (`credits`, `cover`, `coverSettled`); versions 1 and 2 load |
+| `xbt-work-provider` | see the defaults table | |
+| `Amount::Fixed` providers | | set `invoice_price_sats`, or payments are valued at the work's §6.1 value |
 
 ## Lightning rail hardening (AGP-066, review L1–L5)
 
