@@ -538,6 +538,92 @@ mod tests {
         assert_eq!((c.cover_settled, c.settled_through, c.unaudited_work(None), c.room(I), c.best(I).map(|s| s.receipt.seq)), (15, 108, 0, 115, Some(2)));
     }
 
+    /// AGP-079, against a model over 1,200 random steps (receipts on three invoices, payments,
+    /// re-audits, reorgs, settling, a restart): unaudited credit is exactly the credit granted less
+    /// the work paid for, the invoices' shares add up to it, no grant takes it over a cap, and
+    /// settling or reloading changes none of it.
+    #[test]
+    fn unaudited_credit_is_credit_granted_less_work_paid_for() {
+        let k = PrimeKey::from_seed(70, &[1u8; 32]);
+        let invoices = [I, J, "vfer2e5e75t4tv7in42lakx6i6"];
+        let caps = CreditCaps { per_invoice: Some(400), total: Some(900) };
+        let mut b = ReceiptBook::new(P, k.pubkey(), 70);
+        b.caps = caps;
+        // xorshift64: a fixed seed, so a failure reproduces
+        let mut x = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut rnd = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let (mut seq, mut cum) = ([0u64; 3], [0u64; 3]);
+        let (mut granted, mut settled_paid, mut tip) = (0u128, 0u128, 100u32);
+        let mut paid: std::collections::BTreeMap<u32, u64> = Default::default();
+        for step in 0..1_200 {
+            let before = (b.unaudited_work(None), invoices.map(|i| b.unaudited_work(Some(i))));
+            match rnd(10) {
+                0..=4 => {
+                    let i = rnd(3) as usize;
+                    seq[i] += 1;
+                    cum[i] += 1 + rnd(120);
+                    let r = WorkReceipt { invoice: invoices[i].into(), ..r(seq[i], cum[i], 101, tip) };
+                    let g = b.accept(&k.sign(&r).unwrap(), invoices[i]).unwrap();
+                    granted += u128::from(g);
+                    if g > 0 {
+                        assert!(b.unaudited_work(None) <= caps.total.unwrap().max(before.0), "step {step}: a grant went over the total cap");
+                        assert!(b.unaudited_work(Some(invoices[i])) <= caps.per_invoice.unwrap().max(before.1[i]), "step {step}: over the invoice cap");
+                    }
+                }
+                5 | 6 => {
+                    // a new block, or one audited again (a settled one changes nothing)
+                    let h = if rnd(3) == 0 { tip.saturating_sub(rnd(30) as u32) } else { tip + 1 };
+                    tip = tip.max(h);
+                    let w = rnd(4) * rnd(150);
+                    let covered = b.pay(h, w);
+                    if h > b.settled_through {
+                        paid.remove(&h);
+                        if w > 0 {
+                            paid.insert(h, w);
+                        }
+                    }
+                    assert!(covered <= before.0, "step {step}");
+                    granted += b.release_held().iter().map(|(_, g)| u128::from(*g)).sum::<u128>();
+                }
+                7 => {
+                    let h = tip.saturating_sub(rnd(10) as u32);
+                    b.uncover(h);
+                    if h > b.settled_through {
+                        paid.remove(&h);
+                    }
+                }
+                8 => {
+                    let h = tip.saturating_sub(10 + rnd(20) as u32);
+                    let moved: Vec<u32> = paid.range(..=h).map(|(h, _)| *h).collect();
+                    for m in moved {
+                        settled_paid += u128::from(paid.remove(&m).unwrap());
+                    }
+                    // every receipt starts at 101: all but each invoice's best are forgotten
+                    b.settle(h, 101);
+                    assert_eq!((b.unaudited_work(None), invoices.map(|i| b.unaudited_work(Some(i)))), before, "step {step}: settling moved credit");
+                }
+                _ => {
+                    let mut c = ReceiptBook::new(P, k.pubkey(), 70);
+                    c.caps = caps;
+                    c.load(&b.to_json()).unwrap();
+                    assert_eq!((c.unaudited_work(None), invoices.map(|i| c.unaudited_work(Some(i))), invoices.map(|i| c.room(i))),
+                               (before.0, before.1, invoices.map(|i| b.room(i))), "step {step}: a restart moved credit");
+                    b = c;
+                }
+            }
+            let paid_for = settled_paid + paid.values().map(|w| u128::from(*w)).sum::<u128>();
+            assert_eq!(u128::from(b.unaudited_work(None)), granted.saturating_sub(paid_for), "step {step}");
+            assert_eq!(invoices.iter().map(|i| b.unaudited_work(Some(i))).sum::<u64>(), b.unaudited_work(None), "step {step}");
+            assert_eq!(b.credited.values().map(|c| u128::from(*c)).sum::<u128>(), granted, "step {step}");
+        }
+        assert!(granted > 5_000 && settled_paid > 0, "the walk granted {granted} and settled {settled_paid}");
+    }
+
     #[test]
     fn earlier_receipts_survive_a_restart_and_agp043_state_migrates() {
         let k = PrimeKey::from_seed(70, &[1u8; 32]);
