@@ -76,7 +76,7 @@ fn w1_w2_a_huge_min_capacity_and_a_zero_receipt_are_stopped_by_the_owners_cap() 
 fn w1_a_negative_or_oversized_charged_is_refused() {
     let sk = secret("payee");
     let pk = ecdsa::pubkey(&sk);
-    let rec = ChannelRecord { chan: "chan".into(), payee_pub: hex::encode(pk), used_sats: 546, ..Default::default() };
+    let rec = ChannelRecord { chan: "chan".into(), payee_pub: hex::encode(pk), used_sats: 546, seq: 1, ..Default::default() };
     let url = URL;
     let req = request_digest_v2("GET", url, b"");
     let resp = |charged: &str| {

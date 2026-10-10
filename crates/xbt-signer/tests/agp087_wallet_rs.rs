@@ -298,10 +298,32 @@ fn a_sellers_min_expiry_does_not_lock_the_channel_past_the_owners_bound() {
 /// The funding broadcast times out and so does the lookup after it (the record is kept, AGP-085).
 /// The transaction never reached the node, and from then on the node refuses it (its inputs were
 /// spent elsewhere after a `hot_reconcile`).
+///
+/// AGP-089 fixed this double, not what the test asserts: it refused the funding as
+/// `bad-txns-inputs-missingorspent` while still answering `gettxout` for those inputs as unspent,
+/// which no node does. It now does what its own description says: once the funding is lost, a
+/// transaction in a block has spent the funding's inputs (`conflict`).
 struct LostNode {
     chain: Arc<FakeChain>,
     /// 0: nothing sent yet; 1: the send timed out, the lookup is next; 2: afterwards.
     step: AtomicUsize,
+}
+
+impl LostNode {
+    /// Another transaction spends every input of `raw`, in the block at the tip.
+    fn conflict(&self, raw: &str) {
+        let tx = xbt_primitives::tx::Tx::parse_hex(raw).unwrap();
+        let mut s = self.chain.st.lock().unwrap();
+        let (h, other) = (s.height, "ee".repeat(32));
+        let vin: Vec<Value> = tx.inputs.iter().map(|i| json!({"txid": i.prevout.txid_hex(), "vout": i.prevout.vout})).collect();
+        for i in &tx.inputs {
+            let op = (i.prevout.txid_hex(), i.prevout.vout);
+            s.utxos.remove(&op);
+            s.spent_by.insert(op, other.clone());
+        }
+        s.conf_height.insert(other.clone(), h);
+        s.blocks.entry(h).or_default().push(json!({"txid": other, "vin": vin, "vout": []}));
+    }
 }
 
 impl Node for LostNode {
@@ -310,6 +332,7 @@ impl Node for LostNode {
         match (method, self.step.load(Ordering::SeqCst)) {
             ("sendrawtransaction", 0) => {
                 self.step.store(1, Ordering::SeqCst);
+                self.conflict(p[0].as_str().unwrap_or(""));
                 timeout()
             }
             ("gettxout", 1) => {

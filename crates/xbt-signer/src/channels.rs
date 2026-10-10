@@ -89,6 +89,12 @@ pub struct ChannelRecord {
     /// channel. Not written when false, so a record keeps B2's field set.
     #[serde(skip_serializing_if = "is_false")]
     pub close_unproven: bool,
+    /// AGP-089: the next channels this channel's rollover signatures may fund, `{spk, next}`
+    /// (`next`: the unfunded params). Written before the signature leaves, with the next
+    /// channel's key kept under `rolled:<chan>:<spk>`, so whichever rollover reaches the chain
+    /// can be attached and refunded. Not written when empty, so a record keeps B2's field set.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rolled_next: Vec<Value>,
 }
 
 impl Default for ChannelRecord {
@@ -99,7 +105,7 @@ impl Default for ChannelRecord {
                closed_txid: String::new(), refund_txid: String::new(), open_height: 0, spent_sats: -1, open_url: String::new(),
                network: String::new(), min_conf: 0, funding_hex: String::new(), funding_height: 0, open_error: String::new(),
                last_sig: String::new(), acked_sats: 0, ledger_booked_sats: -1, pending_lock: json!({}), given_up: vec![], resolved: vec![], close_change: String::new(),
-               close_scan_from: 0, close_hex: String::new(), close_fee_payer: "payer".into(), close_unproven: false }
+               close_scan_from: 0, close_hex: String::new(), close_fee_payer: "payer".into(), close_unproven: false, rolled_next: vec![] }
     }
 }
 
@@ -243,6 +249,15 @@ fn keys_doc(g: &Inner) -> Zeroizing<String> {
 
 fn doc_hash(doc: &str) -> [u8; 32] {
     Sha256::digest(doc.as_bytes()).into()
+}
+
+/// AGP-089: next channels one channel's rollover signatures may fund while none is attached. A
+/// retry under the same key and expiry is the same script and counts once.
+pub const MAX_ROLLED_NEXT: usize = 8;
+
+/// Where the key of a next channel a rollover of `old_chan` pays is kept until it is attached.
+fn rolled_name(old_chan: &str, next_spk: &[u8]) -> String {
+    format!("rolled:{old_chan}:{}", hex::encode(next_spk))
 }
 
 /// Resolved locks a record remembers (the newest ones).
@@ -535,8 +550,9 @@ impl ChannelBook {
         if uncond < rec.used_sats {
             return Err(err("stale_amount", format!("have {}, got {uncond}", rec.used_sats)));
         }
-        if uncond + cond_amount as i64 > rec.cap_sats {
-            return Err(cap_error(rec.used_sats, uncond + cond_amount as i64 - rec.used_sats, rec.cap_sats));
+        let total = i64::try_from(cond_amount).ok().and_then(|c| uncond.checked_add(c));
+        if total.is_none_or(|t| t > rec.cap_sats) {
+            return Err(cap_error(rec.used_sats, total.unwrap_or(i64::MAX).saturating_sub(rec.used_sats), rec.cap_sats));
         }
         let mut payer = self.payer_locked(&g, &rec)?;
         let cp = ConditionalParams::new(payer.params.clone(), hash, cond_amount, csv_delta)?;
@@ -578,10 +594,19 @@ impl ChannelBook {
 
     /// A key for an external client's channel to `origin` (the `StateSigner` API), sealed on
     /// disk at once as `pending:<origin>`: a crash between its funding and `attach` loses nothing.
+    ///
+    /// AGP-089, the rule for issued keys: **a key this signer issued is never replaced or dropped;
+    /// it leaves its slot only in the write that stores it under the channel it funds.** So asking
+    /// again answers the key already issued and still unused (a signed rollover may pay it, and the
+    /// caller may be retrying because that rollover's answer was lost).
     pub fn issue_key(&self, origin: &str) -> Result<String> {
-        let (s, pubk) = self.new_payer_key();
         let mut g = self.lock();
-        wipe(g.secrets.insert(format!("pending:{origin}"), s)); // an issued key never used is replaced
+        let name = format!("pending:{origin}");
+        if let Some(s) = g.secrets.get(&name) {
+            return Ok(hex::encode(ecdsa::pubkey(s)));
+        }
+        let (s, pubk) = self.new_payer_key();
+        g.secrets.insert(name, s);
         self.persist(&g)?;
         Ok(pubk)
     }
@@ -593,12 +618,36 @@ impl ChannelBook {
         Ok(ecdsa::pubkey(s))
     }
 
-    /// Take the key [`issue_key`](Self::issue_key) sealed for `origin`.
-    pub fn take_issued(&self, origin: &str) -> Result<SecretKey> {
+    /// AGP-089: before a rollover signature that pays `next` (unfunded) leaves, keep the next
+    /// channel's key (the one issued for `key_origin`) under that channel's own script, and its
+    /// terms in the record of the channel being rolled. Whatever happens to the issued slot
+    /// afterwards, the key of a script our signature may fund stays until that channel is attached.
+    pub fn keep_rollover_key(&self, old: &str, key_origin: &str, next: &ChannelParams) -> Result<()> {
         let mut g = self.lock();
-        let s = g.secrets.remove(&format!("pending:{origin}")).ok_or_else(|| err("bad_key", "call new_key before attach"))?;
-        self.persist(&g)?;
-        Ok(s)
+        let k = Self::key_of(&g, old)?;
+        let spk = next.spk();
+        let secret = g.secrets.get(&format!("pending:{key_origin}")).copied().filter(|s| ecdsa::pubkey(s) == next.payer_pub)
+            .ok_or_else(|| err("bad_key", "the next channel's payer key is not the one issued for this origin"))?;
+        let name = rolled_name(&g.records[&k].chan, &spk);
+        let spk_hex = hex::encode(&spk);
+        let rec = g.records.get_mut(&k).unwrap();
+        if !rec.rolled_next.iter().any(|r| r.get("spk").and_then(Value::as_str) == Some(spk_hex.as_str())) {
+            if rec.rolled_next.len() >= MAX_ROLLED_NEXT {
+                return Err(err("rollover_pending", format!("{MAX_ROLLED_NEXT} rollovers of this channel into different next channels are signed and none is attached: \
+                                                            attach the one on chain, or close the channel")));
+            }
+            rec.rolled_next.push(json!({"spk": spk_hex, "next": next.to_json()}));
+        }
+        g.secrets.insert(name, secret);
+        self.persist(&g)
+    }
+
+    /// Every record of `dest`, the live one first, then the archived ones, newest first.
+    pub fn records_of(&self, dest: &str) -> Vec<ChannelRecord> {
+        let g = self.lock();
+        let archived = g.archived.iter().rev().filter(|a| a.get("dest").and_then(Value::as_str) == Some(dest))
+            .filter_map(|a| serde_json::from_value::<ChannelRecord>(a.clone()).ok());
+        g.records.get(dest).cloned().into_iter().chain(archived).collect()
     }
 
     fn record_of(dest: &str, p: &ChannelParams, origin: &str, cap_sats: Option<i64>, open_height: i64) -> ChannelRecord {
@@ -616,24 +665,47 @@ impl ChannelBook {
     pub fn add_pending(&self, dest: &str, secret: SecretKey, p: &ChannelParams, origin: &str, cap_sats: Option<i64>, open_height: i64,
                        open_url: &str, network: &str, min_conf: i64, funding_hex: &str) -> Result<ChannelRecord> {
         let mut g = self.lock();
-        if let Some(old) = g.records.get(dest).cloned() {
+        let mut rec = Self::record_of(dest, p, origin, cap_sats, open_height);
+        rec.open_url = open_url.into();
+        rec.network = network.into();
+        rec.min_conf = min_conf;
+        rec.funding_hex = funding_hex.into();
+        Self::insert_pending(&mut g, rec.clone(), secret)?;
+        self.persist(&g)?;
+        Ok(g.records[dest].clone())
+    }
+
+    /// [`add_pending`](Self::add_pending) for an external client's channel, with the key issued
+    /// for `key_origin`. AGP-089: the key moves from its issued slot to the channel in this one
+    /// write, after every check that can refuse, so no refusal in between drops it.
+    pub fn add_pending_issued(&self, key_origin: &str, dest: &str, p: &ChannelParams, open_height: i64, network: &str, funding_hex: &str) -> Result<ChannelRecord> {
+        let mut g = self.lock();
+        let name = format!("pending:{key_origin}");
+        let secret = g.secrets.get(&name).copied().filter(|s| ecdsa::pubkey(s) == p.payer_pub)
+            .ok_or_else(|| err("bad_key", "the channel's payer key is not the one issued for this origin"))?;
+        let mut rec = Self::record_of(dest, p, key_origin, None, open_height);
+        rec.network = network.into();
+        rec.funding_hex = funding_hex.into();
+        Self::insert_pending(&mut g, rec, secret)?;
+        g.secrets.remove(&name); // moved: it is the channel's key now
+        self.persist(&g)?;
+        Ok(g.records[dest].clone())
+    }
+
+    fn insert_pending(g: &mut Inner, mut rec: ChannelRecord, secret: SecretKey) -> Result<()> {
+        let dest = rec.dest.clone();
+        if let Some(old) = g.records.get(&dest).cloned() {
             if old.state == "open" || old.state == "pending" {
                 return Err(err(&format!("channel_{}", old.state), format!("{dest} already has a {} channel {}", old.state, &old.chan[..old.chan.len().min(16)])));
             }
             Self::replaceable(&old)?;
             g.archived.push(serde_json::to_value(&old).unwrap_or(Value::Null));
         }
-        let mut rec = Self::record_of(dest, p, origin, cap_sats, open_height);
         rec.state = "pending".into();
-        rec.open_url = open_url.into();
-        rec.network = network.into();
-        rec.min_conf = min_conf;
-        rec.funding_hex = funding_hex.into();
         rec.spent_sats = 0;
-        g.records.insert(dest.into(), rec.clone());
-        g.secrets.insert(p.channel_id(), secret);
-        self.persist(&g)?;
-        Ok(rec)
+        g.secrets.insert(rec.chan.clone(), secret);
+        g.records.insert(dest, rec);
+        Ok(())
     }
 
     /// The funding of a pending channel was never broadcast: forget the record and its key.
@@ -710,6 +782,38 @@ impl ChannelBook {
         Ok(rec)
     }
 
+    /// AGP-089: the next channel a rollover of `old_chan` funded (`p`, funded), open at once. Its
+    /// key is the one [`keep_rollover_key`](Self::keep_rollover_key) kept under its script (or,
+    /// for a rollover signed before that existed, the one still issued for `key_origin`). The key
+    /// moves to the channel in the one write that records it, after every check that can refuse.
+    /// Attaching the channel already recorded answers it again.
+    pub fn add_rolled(&self, dest: &str, old_chan: &str, key_origin: &str, p: &ChannelParams, origin: &str, open_height: i64) -> Result<ChannelRecord> {
+        let rec = Self::record_of(dest, p, origin, Some(p.max_amount() as i64), open_height);
+        let mut g = self.lock();
+        if let Some(have) = g.records.get(dest).filter(|r| r.chan == rec.chan) {
+            return Ok(have.clone());
+        }
+        let (rolled, issued) = (rolled_name(old_chan, &p.spk()), format!("pending:{key_origin}"));
+        let secret = [&rolled, &issued].into_iter().filter_map(|n| g.secrets.get(n).copied()).find(|s| ecdsa::pubkey(s) == p.payer_pub)
+            .ok_or_else(|| err("bad_key", "this signer holds no key for this next channel: it signed no rollover into it"))?;
+        if let Some(old) = g.records.get(dest).cloned() {
+            if old.state == "pending" || old.state == "open" {
+                return Err(err(&format!("channel_{}", old.state), format!("{dest} has {} channel {}: the next channel's key is kept; attach again once that one is settled",
+                                                                         if old.state == "open" { "an open" } else { "a pending" }, &old.chan[..old.chan.len().min(16)])));
+            }
+            Self::replaceable(&old)?;
+            g.archived.push(serde_json::to_value(&old).unwrap_or(Value::Null));
+        }
+        g.records.insert(dest.into(), rec.clone());
+        g.secrets.insert(rec.chan.clone(), secret);
+        g.secrets.remove(&rolled);
+        if g.secrets.get(&issued).is_some_and(|s| ecdsa::pubkey(s) == p.payer_pub) {
+            g.secrets.remove(&issued); // used: the next rollover gets a key of its own
+        }
+        self.persist(&g)?;
+        Ok(rec)
+    }
+
     /// A plain state under a pending lock would sit below it (refused); one at or above it
     /// dominates the lock, which is then no longer pending.
     fn plain_over_lock(rec: &mut ChannelRecord, cum: i64) -> Result<()> {
@@ -730,10 +834,10 @@ impl ChannelBook {
             return Err(err("bad_amount", "amount must be positive"));
         }
         let spent = rec.spent();
-        if spent + amount_sats > rec.cap_sats {
+        // checked: the amount can be a seller's price, and a sum that wraps would pass the cap
+        let Some(new_spent) = spent.checked_add(amount_sats).filter(|s| *s <= rec.cap_sats) else {
             return Err(cap_error(spent, amount_sats, rec.cap_sats));
-        }
-        let new_spent = spent + amount_sats;
+        };
         let mut sign_cum = new_spent.max(rec.used_sats);
         let floor = rec.params()?.min_amount() as i64; // dust, + close_fee on a payee-pays channel (v1.2)
         if 0 < sign_cum && sign_cum < floor {

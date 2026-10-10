@@ -753,21 +753,27 @@ impl PolicyEngine {
         if p.amount_sats > cfg.max_per_tx_sats {
             return Ok(decide(Deny, "max_per_tx", format!("{} sats exceeds max_per_tx {}", p.amount_sats, cfg.max_per_tx_sats), None, None));
         }
-        let split_sum = Self::spent(&ledger, cfg.split_window_s as f64, now, Some(&p.dest))? + booked_sats;
+        // AGP-089: what this payment adds is the caller's or a seller's number; a sum that does not
+        // fit is over every budget, never a small one
+        if booked_sats < 0 {
+            return Ok(decide(Deny, "amount", "the booked amount must not be negative".into(), None, None));
+        }
+        let split_sum = Self::spent(&ledger, cfg.split_window_s as f64, now, Some(&p.dest))?.saturating_add(booked_sats);
         if split_sum > cfg.max_per_tx_sats {
             return Ok(decide(Deny, "split_bypass", format!("split window sum {split_sum} would exceed max_per_tx {}", cfg.max_per_tx_sats), None, None));
         }
         if !human && split_sum >= cfg.human_threshold_sats && p.amount_sats < cfg.human_threshold_sats {
             return Ok(decide(Deny, "split_bypass", format!("split window sum {split_sum} evades human_threshold {}", cfg.human_threshold_sats), None, None));
         }
-        if daily + booked_sats > cfg.daily_budget_sats {
-            return Ok(decide(Deny, "daily_budget", format!("daily spend {} exceeds budget {}", daily + booked_sats, cfg.daily_budget_sats), None, None));
+        let (day_sum, week_sum, cpty_sum) = (daily.saturating_add(booked_sats), weekly.saturating_add(booked_sats), cpty.saturating_add(booked_sats));
+        if day_sum > cfg.daily_budget_sats {
+            return Ok(decide(Deny, "daily_budget", format!("daily spend {day_sum} exceeds budget {}", cfg.daily_budget_sats), None, None));
         }
-        if weekly + booked_sats > cfg.weekly_budget_sats {
-            return Ok(decide(Deny, "weekly_budget", format!("weekly spend {} exceeds budget {}", weekly + booked_sats, cfg.weekly_budget_sats), None, None));
+        if week_sum > cfg.weekly_budget_sats {
+            return Ok(decide(Deny, "weekly_budget", format!("weekly spend {week_sum} exceeds budget {}", cfg.weekly_budget_sats), None, None));
         }
-        if cpty + booked_sats > cfg.per_counterparty_cap_sats {
-            return Ok(decide(Deny, "per_counterparty", format!("counterparty spend {} exceeds cap {}", cpty + booked_sats, cfg.per_counterparty_cap_sats), None, None));
+        if cpty_sum > cfg.per_counterparty_cap_sats {
+            return Ok(decide(Deny, "per_counterparty", format!("counterparty spend {cpty_sum} exceeds cap {}", cfg.per_counterparty_cap_sats), None, None));
         }
         if Self::count(&ledger, cfg.velocity_window_s as f64, now) >= cfg.velocity_max {
             return Ok(decide(Deny, "velocity", format!("already {} payments in the last {}s", cfg.velocity_max, cfg.velocity_window_s), None, None));

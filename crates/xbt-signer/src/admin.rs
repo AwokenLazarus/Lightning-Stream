@@ -35,6 +35,46 @@ pub const MIN_BACKUP_PASS: usize = 12;
 pub const ENROLL_CODE_FILE: &str = "enroll-code";
 pub const ENROLL_CODE_TRIES: u32 = 5;
 
+/// The file under `.run` that remembers which human-signed messages were used.
+pub const USED_SIGS_FILE: &str = "human_sigs.json";
+
+/// AGP-089: the rule for human signatures: **one signed message authorises one operation, once.**
+/// Every message the human signs carries an expiry and no nonce, so until now whoever held a
+/// signature could run its operation again until it expired (a second sweep, a second export). The
+/// message's hash is written here, fsynced, before its operation runs, and a message found here is
+/// refused. Entries leave when their expiry has passed (the expiry check refuses them from then
+/// on). Keyed by the message, not the signature bytes, so another encoding of a signature is the
+/// same entry. A file that cannot be read refuses the operation: it is never taken for empty.
+pub struct UsedSigs {
+    path: std::path::PathBuf,
+    lock: std::sync::Mutex<()>,
+}
+
+impl UsedSigs {
+    pub fn new(path: &Path) -> Self {
+        Self { path: path.into(), lock: std::sync::Mutex::new(()) }
+    }
+
+    /// Record `msg` as used. `false`: it was used before.
+    pub fn spend(&self, msg: &[u8], expiry: i64, now: i64) -> Result<bool> {
+        let _g = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        let mut used: Map<String, Value> = match std::fs::read_to_string(&self.path) {
+            Ok(t) => serde_json::from_str::<Value>(&t).ok().and_then(|v| v.get("used").and_then(Value::as_object).cloned())
+                .ok_or_else(|| err("human_sig", format!("{}: unreadable, so no human-signed operation runs", self.path.display())))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Map::new(),
+            Err(e) => return Err(err("io", format!("{}: {e}", self.path.display()))),
+        };
+        let key = sha256_hex(msg);
+        if used.contains_key(&key) {
+            return Ok(false);
+        }
+        used.retain(|_, exp| exp.as_i64().is_some_and(|e| e >= now));
+        used.insert(key, expiry.into());
+        write_private(&self.path, &dumps_indent(&json!({"used": used}), 2, true))?;
+        Ok(true)
+    }
+}
+
 /// The one-time code that enrols the first human key, and the wrong codes tried against it.
 #[derive(Default)]
 pub struct EnrollCode {
@@ -143,7 +183,10 @@ impl Signer {
         RESTART_KEYS.iter().filter(|k| a.get(**k) != b.get(**k)).map(|k| k.to_string()).collect()
     }
 
-    fn check_sig(&self, msg: &[u8], p: &Value, expiry: i64) -> Option<Value> {
+    /// The human signed `msg`, it has not expired, and it was not used before: `None`, and the
+    /// message is now used (AGP-089, [`UsedSigs`]). Call it last, after every check of the request
+    /// that needs no signature, so a refusal for another reason does not cost the signature.
+    pub(crate) fn check_sig(&self, msg: &[u8], p: &Value, expiry: i64) -> Option<Value> {
         let human = self.human_key();
         if human.is_empty() {
             return Some(deny("human_key", "no human key is enrolled: run the setup first"));
@@ -155,7 +198,11 @@ impl Signer {
         if expiry < self.now_i() {
             return Some(deny("expired", "the signature has expired"));
         }
-        None
+        match self.used_sigs.spend(msg, expiry, self.now_i()) {
+            Ok(true) => None,
+            Ok(false) => Some(deny("human_sig_replay", "this signature was already used: one signature authorises one operation")),
+            Err(e) => Some(deny("human_sig", e.msg)),
+        }
     }
 
     fn approval_row(token: &str, a: &Value, now: i64) -> Value {
@@ -380,15 +427,19 @@ impl Signer {
 
     fn backup_export(&self, p: &Value) -> Result<Value> {
         let expiry = py_int(p.get("expiry")).unwrap_or(0);
-        if let Some(d) = self.check_sig(&backup_message(&self.hot.address(), expiry), p, expiry) {
-            return Ok(d);
-        }
         let pass = str_or_empty(p.get("backup_pass"));
         if pass.chars().count() < MIN_BACKUP_PASS {
             return Ok(deny("backup_pass", format!("the backup passphrase needs at least {MIN_BACKUP_PASS} characters")));
         }
         let Some(ks) = &self.keystore else { return Ok(deny("keystore", "the keys are not encrypted at rest (test mode): no backup export")) };
         let _g = self.lock();
+        // AGP-089: one signature, one export. The message does not name the passphrase: the only
+        // process that holds the signature before it is used is the one that serves the page that
+        // made it, so a passphrase bound there would bind nothing against that process; what a
+        // used-once signature stops is a second export, under another passphrase, by replay.
+        if let Some(d) = self.check_sig(&backup_message(&self.hot.address(), expiry), p, expiry) {
+            return Ok(d);
+        }
         let mut files = Map::new();
         let mut add = |name: String, path: &Path| {
             if let Ok(t) = std::fs::read_to_string(path) {
