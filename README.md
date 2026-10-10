@@ -1598,6 +1598,68 @@ test.
 * The write does not fsync the directory after the rename, as before: no extra IO per call. A
   follow-up could add it.
 
+## Hub closure-audit fixes: rollover with a lock open, refused seqs, the lock bound (AGP-078)
+The closure audit of the external review (AGP-077) found three hub items still open on `main`
+(`0a84665`). Each was the neighbour of a path an earlier fix had closed. The same changes are in B1
+`agp-078`, with the same test names. The hub stays **experimental**.
+
+**H1 and H2 through a ch1 rollover.** AGP-064 made a ch1 close refuse `lock_pending` while a routed
+lock is open. `POST /x402/xbt-channel/rollover` spends the same funding and was not checked: a client
+rolled ch1 over at its old state while a lock was in flight, or held after a write-off, and the hub
+still paid the provider on ch2.
+* `Provider::rollover` now makes the same test as the close (`locks_open`: the lock in flight, or a
+  written-off lock above `best_cum`) and refuses `lock_pending` (400). The test is made under the
+  ledger lock that is held until the rollover is sent, the lock `route()` writes its ch1 lock under.
+* It refuses whatever `amount` the rollover pays, as a close refuses whatever state its payload
+  carries. A rollover that paid for the open lock would be safe for the hub's coins, but the hub's
+  counters and `complete_ch1` read `best_cum`, which a rollover does not move.
+* The hub drops a lock it never forwarded before a ch1 rollover, as before a close (the same sweep),
+  so an orphan does not keep ch1 from rolling over.
+
+Every path that spends or replaces ch1, and its lock test:
+
+| path | lock test |
+|---|---|
+| `POST /x402/xbt-channel/close` (`Provider::close`) | `locks_open`, refused `lock_pending` (AGP-064) |
+| `POST /x402/settle` (`facilitator_settle`) | calls `close`: the same |
+| `POST /x402/xbt-channel/rollover` (`Provider::rollover`) | `locks_open`, refused `lock_pending` (this change) |
+| `Provider::close_channel` (embedder API, AGP-059) | `locks_open`, refused `lock_pending` |
+| the margin close (`close_due`) | waits for a lock in flight in the first half of the margin; never for a written-off lock (AGP-064, a stated limit) |
+| `adopt_intent` (the watcher, `close_channel`) | records a spend already sent by `close` or `rollover`, which made the test before writing the intent |
+| `Provider::close_now` | none, by design: the operator's own close, not reachable over HTTP. A lock completed after it is not counted as routed |
+| the hub's ch2 `rollover` / `close_ch2` | ch2, not ch1: `rollover` refuses `lock_pending` on a pending or written-off ch2 lock (AGP-064) |
+
+**A seq spent on a refusal (review T4), on `/x402/route` and `/x402/xbt-channel/lock`.** AGP-068
+saved the seq of a refused paid call. The hub's `/route` and the provider's `/lock` still kept it
+only in memory, so after a restart the refused header authenticated again.
+* `/route`: the checks after auth moved into `RouteHub::admit`; any answer it returns without
+  writing the lock (every refusal, and the replayed answer of a completed lock) saves ch1's row
+  first. If that save fails the answer is a 500.
+* `/lock`: every answer saves the row once: `complete_lock` on each answer it gives, the caller on
+  each refusal. A lock that completes still costs one fsync, as before.
+* A request that fails auth changes nothing, as before.
+
+**`max_lock_sat`.** The bound (at most half of `ch2_capacity`, not 0) was made only by
+`HubConfig::from_json`. It is now `HubConfig::validate`, which `from_json` and `RouteHub::new` both
+call, so a config built as a struct is refused `bad_config` before anything is written. The bound is
+against the configured `ch2_capacity`; a ch2 opened with another capacity (`connect(.., Some(cap), ..)`)
+is not checked against it.
+
+**For embedders (cmp).**
+* A ch1 rollover with a routed lock open is refused `lock_pending` (400). Retry it after the lock
+  resolves, as for a close.
+* `RouteHub::new` returns `bad_config` for a `HubConfig` with `max_lock_sat` 0 or above half of
+  `ch2_capacity`.
+* A refused `/route` or `/lock` now costs one ledger write (an fsync).
+
+Tests, each failing on `main` and passing here (B1: `tests/security/test_agp078_hub_closure.py`):
+* `hub_routing_safety.rs`: `h1_a_ch1_rollover_while_a_lock_is_in_flight_is_refused`,
+  `h2_a_ch1_rollover_below_a_held_written_off_lock_is_refused` (the audit's two, from branch
+  `agp-077`), `h1_a_lock_the_hub_never_forwarded_does_not_keep_ch1_from_rolling_over`;
+* `routing_checks.rs`: `t4b_a_seq_spent_on_a_refused_route_survives_a_hub_restart`,
+  `t4b_a_seq_spent_on_a_refused_lock_survives_a_provider_restart`,
+  `hub_bounds_max_lock_sat_however_its_config_was_built`.
+
 ## Portability
 
 No platform-specific dependencies: libsecp256k1 (C, via `secp256k1-sys`), pure-Rust hashes and JSON,

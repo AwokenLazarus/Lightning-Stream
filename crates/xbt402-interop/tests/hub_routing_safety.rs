@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use xbt402::adaptor;
 use xbt402::adaptor::Sc;
-use xbt402::channel::FeePayer;
+use xbt402::channel::{ChannelParams, FeePayer};
 use xbt402::funding::FundingPolicy;
 use xbt402::http::HttpService;
 use xbt402::hub::{HubConfig, RouteHub};
@@ -23,8 +23,10 @@ use xbt402::provider::{HttpResponse, Provider, ProviderConfig};
 use xbt402::route::ROUTE_LOCK_PATH;
 use xbt402::route_client::{RoutePayer, RoutePayerConfig, Shard};
 use xbt402::route_seller::RouteOffer;
-use xbt402::signer::LocalSigner;
+use xbt402::signer::{LocalSigner, StateSigner};
+use xbt402::wire::ROLLOVER_PATH;
 use xbt402_interop::memnet::{ChainWallet, MemChain, MemNet, NetTransport};
+use xbt_primitives::ecdsa;
 use xbt_primitives::hash::sha256;
 use xbt_primitives::secp256k1::SecretKey;
 
@@ -134,6 +136,7 @@ struct W {
     hub: Arc<RouteHub>,
     provs: Vec<(String, Arc<Wrapped>)>,
     pay: Arc<RoutePayer>,
+    signer: Arc<LocalSigner>,
     shards: Vec<Arc<Shard>>,
     _dir: TempDir,
 }
@@ -160,11 +163,12 @@ impl W {
         let mut cfg = RoutePayerConfig::new(NET);
         cfg.expiry_blocks = 8_000;
         let c = chain.clone();
-        let pay = Arc::new(RoutePayer::new(HUB, cfg, Arc::new(LocalSigner::new()), Arc::new(ChainWallet(chain.clone())), Box::new(NetTransport(net.clone())),
+        let signer = Arc::new(LocalSigner::new());
+        let pay = Arc::new(RoutePayer::new(HUB, cfg, signer.clone(), Arc::new(ChainWallet(chain.clone())), Box::new(NetTransport(net.clone())),
                                            Box::new(move || Ok(c.height()))));
         pay.open().unwrap();
         let shards = provs.iter().map(|(o, _)| pay.shard(&format!("{o}/v1/chunk"), "POST").unwrap()).collect();
-        Self { chain, net, hub, provs, pay, shards, _dir: dir }
+        Self { chain, net, hub, provs, pay, signer, shards, _dir: dir }
     }
 
     fn st1(&self) -> ChannelState {
@@ -310,6 +314,93 @@ fn h1_the_margin_close_lets_a_lock_in_flight_finish() {
     assert_eq!(w.hub.inbound.close_due().unwrap().len(), 1);
     w.provs[0].1.open();
     t.join().unwrap();
+}
+
+// --- H1 and H2 through a ch1 rollover (AGP-078) ------------------------------------------------------------
+
+/// The client rolls ch1 over at `amount` through the hub's own `/x402/xbt-channel/rollover`.
+fn rollover_ch1(w: &W, amount: u64) -> (u16, Value) {
+    let st = w.st1();
+    let p = &st.params;
+    let chan = p.channel_id();
+    let expiry = w.chain.height() + 2_000;
+    let pay_to = hex::decode(w.hub.pay_to()).unwrap();
+    let next = ChannelParams::derive(&pay_to, &ecdsa::pubkey(&adaptor::random_secret()), expiry, p.close_fee, None, NET, p.close_fee_payer).unwrap();
+    let sig = w.signer.sign_rollover(&chan, amount, &next.spk(), p.rollover_next_capacity(amount)).unwrap();
+    let body = json!({"chan": chan, "amount": amount, "sig": hex::encode(sig),
+                      "next": {"payerPub": hex::encode(next.payer_pub), "expiry": expiry}});
+    let r = HttpService::serve(&*w.hub, "POST", ROLLOVER_PATH, &[], body.to_string().as_bytes(), &format!("{HUB}{ROLLOVER_PATH}"));
+    (r.status, serde_json::from_slice(&r.body).unwrap_or(Value::Null))
+}
+
+#[test]
+fn h1_a_ch1_rollover_while_a_lock_is_in_flight_is_refused() {
+    // a rollover spends ch1's funding exactly as a close does: at the client's old state it would
+    // close ch1 below the lock the hub is forwarding, and the hub would pay the provider for nothing
+    let w = W::new(1);
+    w.paid(0);
+    let before = w.st1().best_cum;
+    let t = w.lock_in_flight(0);
+    assert!(xbt402::json::truthy(w.st1().extra.get("route_lock")), "the lock is written before the forward");
+    assert_eq!(w.pay.close().unwrap_err().code, "lock_pending", "control: the cooperative close is refused");
+    let (status, doc) = rollover_ch1(&w, before);
+    w.provs[0].1.open();
+    assert_eq!(t.join().unwrap()["status"], "paid");
+    let st1 = w.st1();
+    assert!(st1.closed_txid.is_empty(), "ch1 was rolled over at {before}, below a lock in flight (HTTP {status}: {doc})");
+    assert_eq!((status, doc["error"].as_str()), (400, Some("lock_pending")), "{doc}");
+    assert!(st1.best_cum > before && st1.best_cum >= w.routed(), "the lock completed on ch1");
+    // the lock is done: the same client rolls over at the state that covers it
+    let (status, doc) = rollover_ch1(&w, st1.best_cum);
+    assert_eq!(status, 200, "{doc}");
+    assert_eq!(w.st1().closed_txid, doc["txid"].as_str().unwrap());
+}
+
+#[test]
+fn h2_a_ch1_rollover_below_a_held_written_off_lock_is_refused() {
+    // the provider takes the lock, keeps the pre-signature and answers 400: the lock is held in
+    // ch1's base. Rolling ch1 over would leave it behind, and the provider could still use t on ch2
+    let w = W::new(1);
+    w.paid(0);
+    let before = w.st1().best_cum;
+    w.provs[0].1.refuse.store(true, Ordering::SeqCst);
+    let r = w.lock(0);
+    assert_eq!((r["status"].as_str(), r["error"].as_str()), (Some("refused"), Some("route_failed")), "{r}");
+    let stale = w.stale1();
+    assert!(stale.len() == 1 && stale[0]["hold"].is_object(), "held in the base");
+    assert_eq!(w.pay.close().unwrap_err().code, "lock_pending", "control: the cooperative close is refused");
+    // at the old state, and at the highest state the client has signed
+    for amount in [before, w.signer.signed(&w.pay.chan().unwrap()).max(before)] {
+        let (status, doc) = rollover_ch1(&w, amount);
+        assert!(w.st1().closed_txid.is_empty(), "ch1 was rolled over at {amount}, below a held lock (HTTP {status}: {doc})");
+        assert_eq!((status, doc["error"].as_str()), (400, Some("lock_pending")), "{doc}");
+    }
+    // the provider uses t after all: its ch2 close gives the hub t, ch1 moves up and the lock is
+    // no longer open, so the rollover goes through at a state that pays for it
+    let st2 = w.st2(0);
+    w.provs[0].1.inner.close_now(&st2.params.channel_id()).unwrap();
+    let acts = w.hub.watch_tick();
+    assert!(acts.iter().any(|a| a["event"] == "secret_from_close"), "{acts:?}");
+    let st1 = w.st1();
+    assert!(st1.best_cum > before, "ch1 was completed from the ch2 close");
+    let (status, doc) = rollover_ch1(&w, st1.best_cum);
+    assert_eq!(status, 200, "{doc}");
+}
+
+#[test]
+fn h1_a_lock_the_hub_never_forwarded_does_not_keep_ch1_from_rolling_over() {
+    // as for the close: nothing can complete a lock that never left the hub, so the rollover drops it
+    let w = W::new(1);
+    w.paid(0);
+    let best = w.st1().best_cum;
+    w.hub.set_withhold("all");
+    stream(&w.pay, &w.shards[0], 10);
+    assert_eq!(w.pay.lock(&w.shards[0]).unwrap().unwrap()["status"], "pending");
+    assert!(xbt402::json::truthy(w.st1().extra.get("route_lock")));
+    w.hub.set_withhold("");
+    let (status, doc) = rollover_ch1(&w, best);
+    assert_eq!(status, 200, "{doc}");
+    assert!(w.hub.events.lock().unwrap().iter().any(|e| e["event"] == "orphan_lock_dropped"));
 }
 
 // --- H2 ------------------------------------------------------------------------------------------------
