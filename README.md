@@ -2753,10 +2753,36 @@ characters, 64 records, 16 paths; a field's length is checked against the bytes 
   that promise more than is there, and 20,000 random mutations and random inputs. Nothing panics and
   nothing but the signed invoice is accepted.
 
-**Not run for this change:** `scripts/ln_rail_regtest.sh`. Its lab pins Lightning Fork
-`v0.21.3-beta-blake2b.13`, below the `.17` this work reads, and it has no offer scenario. A scenario
-needs a payer node whose channels all pass the guards (the lab's `lf1` holds a taproot channel and a
-pre-split one by design). The signer has therefore not paid an offer through a running node.
+**On a running node (AGP-083).** `scripts/ln_rail_regtest.sh` now pins Lightning Fork `cebc10fe`
+(`v0.21.3-beta-blake2b.17`) and adds a third lab node, `lf3`, whose one channel is opened from a coin
+confirmed above the split. 86/86 on 2026-10-10 (`docs/agp083_ln_rail_regtest.json`): S1-S18, the
+BOLT 11 scenarios, unchanged on `.17`, and S19-S24 for offers `lf2` mints:
+
+* `lf1`, which holds a taproot channel and a pre-split one, pays no offer (`ln_offer_unsafe_channel`,
+  before any invoice is asked for) and still pays a BOLT 11 invoice.
+* An offer the allowlist does not name is denied before any invoice is asked for.
+* `lf3` pays a 15,000-sat offer it cannot yet send: the payment fails on the node
+  (`FAILURE_REASON_INSUFFICIENT_BALANCE`) with nothing charged, twice. After `lf3` has the funds and
+  the signer has restarted, the same `ln_pay` pays the stored `lni1`. `lf2` issued one invoice for
+  all of it, and the preimage is in the reply, the payment book and the signature log.
+* The same offer again: a second invoice, the same signing key, another payer id.
+* An offer with no amount and two blinded paths, paid with `amount_sats`, twice. It keeps its issuer
+  id beside the paths, and its invoices are signed by that key, not by a blinded one.
+
+The reader agreed with the node on every offer and invoice: offer id, payment hash, signing key,
+payer id, amount, and the node's own summary field by field. Two things about the fork that the
+fake node did not show, neither in the reader:
+
+* **A direct peer still costs a fee.** `lf2`'s invoices are paid over blinded paths that start at
+  its peer `lf1`, so `lf3` pays `lf3 -> lf2 -> lf1 -> lf2`: 2,246 to 3,261 msat on 15,000 sats, and
+  `lf2` needs funds towards `lf1`. The fee stays inside the limit the policy booked. The channels the
+  payee's side uses are the payee's choice; the guards cover this node's channels only.
+* **The first invoice request for an offer with blinded paths can time out.** `lf3`, not a peer of
+  the path's first node, sent its request by `lf2`; `lf1` dropped it ("onion message cycle: next hop
+  is the sending peer") and `ln_pay` answered `ln_fetch_invoice` after `ln.timeout_s`. It worked a
+  minute later, once the node had connected to `lf1` (`docs/agp083_ln_rail_regtest_run1.json`). The
+  lab now connects `lf3` to `lf1` first. Nothing is booked for a fetch that times out, but it counts
+  against `ln.max_sends_per_hour` for that offer.
 
 CPU (`crates/xbt-signer/examples/bolt12_cost.rs`; armv7 musl under `qemu-arm-static` as the Pi-class
 figure, x86_64 native beside it; pass line declared before measuring). One iteration decodes and
