@@ -16,10 +16,17 @@
 //!   [`WorkConfig::carry_growth_blocks`] audited blocks, no new credit is extended until carry is
 //!   released. A call the held work would have paid is refused with `credit_cap`, `carry_cap` or
 //!   `carry_growing` (and the balances in `work`), never with a silent loss: the receipts stay held.
+//! * AGP-079 (closure audit, P1 and P4): credit stops being unaudited only as far as coinbases paid
+//!   for it. A passing audit records the work the block's coinbase paid for at the provider's own
+//!   price ([`WorkProvider::paid_work`]), and that covers the oldest credit first. A deferral line,
+//!   the `min_payout` clause, a window start moved over the credit and a block with no statement
+//!   all leave the audit's verdict as it was and cover nothing. A statement the audit refuses is
+//!   the block having no statement ([`WorkProvider::audit_chain`]). [`WorkConfig::shipped`] is what
+//!   `xbt-work-provider` runs with when no flag is set.
 //! * AGP-065 (review P): the audit takes the block from the provider's own node ([`ChainBlock`]) and
 //!   holds the statement to the Prime's pinned [`PrimeTerms`]; window starts must not go backwards
 //!   between audited blocks; a block with no statement is audited too ([`WorkProvider::audit_chain`]);
-//!   a reorg undoes what an orphaned audit released ([`WorkProvider::orphaned`]); payouts are split
+//!   a reorg undoes what an orphaned audit covered ([`WorkProvider::orphaned`]); payouts are split
 //!   into liquid and locked by the node's coinbase maturity ([`WorkProvider::payouts`]). An unfunded
 //!   invoice past its TTL stays dormant for [`WorkConfig::invoice_grace_secs`] (work mined just
 //!   before expiry is still pulled and credited), issuance is limited per client, and state is
@@ -38,13 +45,13 @@ use xbt402::provider::{HttpResponse, PEER_HEADER};
 use xbt402::scheme::{ProviderScheme, SchemeCharge};
 use xbt402::wire::settlement_response;
 
-use crate::audit::{audit_block, AuditBounds, AuditOutcome, CarryLedger, PrimeTerms, SignedDeferral, SignedWindow};
+use crate::audit::{audit_block, window_from_doc, AuditBounds, AuditOutcome, CarryLedger, PrimeTerms, SignedDeferral, SignedWindow};
 use crate::auth::{auth_tag, request_digest, tag_eq};
 use crate::book::{CreditCaps, ReceiptBook};
 use crate::chain::{ChainBlock, Maturity};
 use crate::error::{fail, Result, WorkError};
 use crate::grammar::{canonical_identity, random_invoice, uint, valid_identity, U64};
-use crate::pricing::Pricing;
+use crate::pricing::{work_units_for_price, Pricing};
 use crate::receipt::{pubkey_from_hex, sig64, Signed, WorkReceipt};
 use crate::{ASSET, INVOICE_PATH, SCHEME};
 
@@ -57,6 +64,60 @@ pub enum Amount {
     /// by the call's price); `extra.pricing` is published.
     Priced(Pricing),
 }
+
+/// A cap on unaudited credit as an operator sets it: in work units, in sats (converted at each
+/// epoch's price, no haircut) or in calls at the call price; `Off`: no cap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cap {
+    Work(u64),
+    Sats(u64),
+    Calls(u64),
+    Off,
+}
+
+impl Cap {
+    /// The cap in work units at this epoch (None: off).
+    pub fn units(self, bits: u32, block_value_sats: u64, price_sats: u64) -> Result<Option<u64>> {
+        Ok(Some(match self {
+            Cap::Work(w) => w,
+            Cap::Sats(s) => work_units_for_price(s, bits, block_value_sats, 0, 0)?,
+            Cap::Calls(n) => work_units_for_price(price_sats, bits, block_value_sats, 0, 0)?.saturating_mul(n),
+            Cap::Off => return Ok(None),
+        }))
+    }
+
+    /// Whether the cap moves with the epoch.
+    pub fn priced(self) -> bool {
+        matches!(self, Cap::Sats(_) | Cap::Calls(_))
+    }
+}
+
+/// The two §13.1 caps as an operator sets them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Caps {
+    pub invoice: Cap,
+    pub total: Cap,
+}
+
+impl Caps {
+    /// What `xbt-work-provider` runs with when the operator sets no cap (review P5): 100 calls of
+    /// unaudited credit per invoice and 1,000 in total, in calls so they hold on any chain.
+    pub const SHIPPED: Caps = Caps { invoice: Cap::Calls(100), total: Cap::Calls(1000) };
+
+    /// The caps in work units at this epoch. A price that cannot be converted caps at 0 (holds
+    /// everything) rather than lifting the cap.
+    pub fn at(&self, bits: u32, block_value_sats: u64, price_sats: u64) -> CreditCaps {
+        let units = |c: Cap| c.units(bits, block_value_sats, price_sats).unwrap_or(Some(0));
+        CreditCaps { per_invoice: units(self.invoice), total: units(self.total) }
+    }
+}
+
+/// The shipped cap on owed carry, in calls at the call price: the value of the shipped total cap.
+pub const SHIPPED_MAX_CARRY_CALLS: u64 = 1000;
+/// The shipped audit depth (§10.3: RECOMMENDED k = 6).
+pub const SHIPPED_AUDIT_DEPTH: u32 = 6;
+/// The shipped haircut on the price in work (§6.2), in basis points.
+pub const SHIPPED_HAIRCUT_BPS: u32 = 1000;
 
 /// Provider settings.
 #[derive(Debug, Clone)]
@@ -73,7 +134,8 @@ pub struct WorkConfig {
     /// The blinded relay the provider pulls from and names in invoices (`relayUrl`).
     pub relay_url: Option<String>,
     pub amount: Amount,
-    /// The price (sats) an invoice document quotes `amount` for.
+    /// The price (sats) an invoice document quotes `amount` for. With [`Amount::Fixed`] it is also
+    /// the price coinbase payments are turned into paid-for work at ([`WorkProvider::paid_work`]).
     pub invoice_price_sats: u64,
     pub invoice_ttl_secs: u64,
     pub max_unfunded: usize,
@@ -109,6 +171,18 @@ impl WorkConfig {
                invoice_ttl_secs: 3600, max_unfunded: 10_000, max_timeout_secs: 3600, state_path: None, caps: CreditCaps::default(),
                max_owed_carry_sats: None, carry_growth_blocks: None, nta: false, terms: PrimeTerms::default(), invoice_grace_secs: 3600,
                max_unfunded_per_client: Some(16), trust_forwarded: false }
+    }
+
+    /// The settings `xbt-work-provider` runs with when no flag is set, at the node's tip (`bits`,
+    /// `block_value_sats`) and a call price of `price_sats`: exact pricing with the shipped
+    /// haircut, the shipped caps on unaudited credit ([`Caps::SHIPPED`]) and a cap on owed carry
+    /// worth [`SHIPPED_MAX_CARRY_CALLS`] calls. The binary applies its flags on top of this.
+    pub fn shipped(mut self, bits: u32, block_value_sats: u64, price_sats: u64) -> Self {
+        self.invoice_price_sats = price_sats;
+        self.amount = Amount::Priced(Pricing { price_sats, bits, block_value_sats, fee_bps: self.terms.fee_bps, haircut_bps: SHIPPED_HAIRCUT_BPS });
+        self.caps = Caps::SHIPPED.at(bits, block_value_sats, price_sats);
+        self.max_owed_carry_sats = Some(price_sats.saturating_mul(SHIPPED_MAX_CARRY_CALLS));
+        self
     }
 }
 
@@ -154,6 +228,28 @@ pub struct WorkProvider {
 pub enum Statement<'a> {
     Found(&'a SignedWindow, &'a [SignedDeferral]),
     Missing,
+}
+
+/// The codes [`WorkProvider::audit`] refuses a statement with (the statement is at fault, not the
+/// provider's node or state).
+pub const STATEMENT_REFUSALS: [&str; 5] = ["bad_window_sig", "wrong_prime", "wrong_block", "bad_window", "window_start_regressed"];
+
+/// A Prime's statement document for a pool block, as served.
+pub type ServedStatement = (SignedWindow, Vec<SignedDeferral>, Value);
+
+/// The Prime's statement for a pool block (`GET <window_url>?height=H`): None when the Prime
+/// answers 404 (it has none for that height); any other status is an error, never "none"
+/// (review P4: an unreachable Prime must not look like a block with nothing to audit).
+pub fn window_statement(t: &dyn Transport, window_url: &str, height: u32) -> Result<Option<ServedStatement>> {
+    let r = t.request("GET", &format!("{window_url}?height={height}"), b"", &[])?;
+    match r.status {
+        200 => {}
+        404 => return Ok(None),
+        s => return Err(WorkError::new("prime", format!("window statement for {height}: HTTP {s}"))),
+    }
+    let doc = xbt402::json::parse_slice(&r.body).map_err(|_| WorkError::new("prime", "window statement is not JSON"))?;
+    let (w, d) = window_from_doc(&doc).map_err(|e| WorkError::new("prime", e.0))?;
+    Ok(Some((w, d, doc)))
 }
 
 fn now() -> u64 {
@@ -210,7 +306,7 @@ impl WorkProvider {
         Ok(r)
     }
 
-    /// (unaudited, held) work: credit no audit covers yet, and receipted work the caps hold back.
+    /// (unaudited, held) work: credit no coinbase has paid for yet, and receipted work the caps hold back.
     pub fn exposure(&self) -> (u64, u64) {
         let st = self.lock();
         (st.book.unaudited_work(None), st.book.held_total())
@@ -403,15 +499,36 @@ impl WorkProvider {
         self.cfg.terms.bounds(block)
     }
 
+    /// Work units the coinbase of `block` paid for (AGP-079): what it paid the identity, at the
+    /// price the provider sells work for and at that block's own difficulty and value. With exact
+    /// pricing it is the work `paid_sats` buys under §6.2 (the pinned fee and the haircut); with a
+    /// fixed amount per call, `paid_sats` at [`WorkConfig::invoice_price_sats`] per call, or at the
+    /// work's §6.1 value when no sats price is set. Nothing a Prime signs enters it.
+    pub fn paid_work(&self, block: &ChainBlock) -> Result<u64> {
+        if block.paid_sats == 0 {
+            return Ok(0);
+        }
+        match self.rule() {
+            Amount::Priced(p) => work_units_for_price(block.paid_sats, block.bits, block.value_sats, p.fee_bps, p.haircut_bps),
+            Amount::Fixed(n) if self.cfg.invoice_price_sats > 0 => {
+                let w = u128::from(block.paid_sats) * u128::from(n.max(1)) / u128::from(self.cfg.invoice_price_sats);
+                Ok(u64::try_from(w).unwrap_or(u64::MAX))
+            }
+            Amount::Fixed(_) => work_units_for_price(block.paid_sats, block.bits, block.value_sats, self.cfg.terms.fee_bps, 0),
+        }
+    }
+
     /// §10.3 for one pool coinbase, `block` as the provider's node has it: records the verdict (and
     /// the carry it defers or releases). Auditing a block again (more receipts, the statement's
-    /// lines fetched again) replaces its earlier verdict and carry, so nothing is counted twice. A
-    /// pass covers only the credit its bound counted (§13.1, AGP-065): held work is credited as far
-    /// as the caps then allow. A statement whose window start is below that of an audited block
-    /// beneath it (or above one over it) is refused with `window_start_regressed`, recording
-    /// nothing: the block's credit stays held.
+    /// lines fetched again) replaces its earlier verdict, carry and payment, so nothing is counted
+    /// twice. A pass covers only the credit the coinbase paid for ([`WorkProvider::paid_work`],
+    /// AGP-079), oldest first; held work is credited as far as the caps then allow. A statement
+    /// whose window start is below that of an audited block beneath it (or above one over it) is
+    /// refused with `window_start_regressed`, recording nothing. A refusal here is one of
+    /// [`STATEMENT_REFUSALS`]; [`WorkProvider::audit_chain`] counts it against the Prime.
     pub fn audit(&self, sw: &SignedWindow, deferred: &[SignedDeferral], block: &ChainBlock) -> Result<AuditOutcome> {
         let bounds = self.bounds(block)?;
+        let paid_for = self.paid_work(block)?;
         let mut st = self.lock();
         let o = audit_block(&st.book, sw, block, &bounds, deferred)?;
         let (h, ws) = (sw.stmt.height, sw.stmt.window_start);
@@ -426,13 +543,14 @@ impl WorkProvider {
             st.distrust = Some(("wrong_prime".into(), format!("the Prime's coinbase at height {h} failed the audit")));
         }
         self.carry_rules(&mut st);
-        let covered = st.book.audited(h, ws, o.ok);
+        let paid_for = if o.ok { paid_for } else { 0 };
+        let covered = st.book.pay(h, paid_for);
         st.book.release_held();
         let mut rec = obj([("height", h.into()), ("blockHash", block.hash.clone().into()), ("ok", o.ok.into()),
                            ("expectedSats", o.expected_sats.into()), ("paidSats", block.paid_sats.into()), ("deferredSats", o.deferred_sats.into()),
-                           ("belowMinSats", o.below_min_sats.into()), ("provenWork", o.proven_work.into()), ("coveredWork", covered.into()),
-                           ("windowStart", ws.into()), ("windowWork", o.window_work.into()), ("bounded", o.bounded.into()),
-                           ("owedCarrySats", st.carry.owed().into())]);
+                           ("belowMinSats", o.below_min_sats.into()), ("provenWork", o.proven_work.into()), ("paidForWork", paid_for.into()),
+                           ("coveredWork", covered.into()), ("windowStart", ws.into()), ("windowWork", o.window_work.into()),
+                           ("bounded", o.bounded.into()), ("owedCarrySats", st.carry.owed().into())]);
         if let Some(p) = &o.proof {
             rec["proof"] = p.clone();
         }
@@ -440,27 +558,47 @@ impl WorkProvider {
         Ok(o)
     }
 
-    /// Audit `block` whether or not the Prime published a statement for it (review P4). A missing
-    /// statement for a coinbase that paid the identity fails the audit (the Prime paid as the pool
-    /// but will not say for what) and distrusts the Prime; for one that paid nothing it records
-    /// nothing and covers nothing, so the credit stays held. Returns None for that case.
+    /// Audit `block` whether or not the Prime published a usable statement for it (review P4). A
+    /// statement the audit refuses ([`STATEMENT_REFUSALS`]) is the block having no statement, so
+    /// garbage is never treated more gently than silence (AGP-079). With no statement, a coinbase
+    /// that paid the identity fails the audit (the Prime paid as the pool but will not say for
+    /// what) and distrusts the Prime; one that paid nothing has no verdict (the provider cannot
+    /// tell a pool block from another pool's), records nothing and covers nothing: its credit stays
+    /// unaudited, inside the caps, until some coinbase pays for it. Returns None for that case.
     pub fn audit_chain(&self, block: &ChainBlock, stmt: Statement<'_>) -> Result<Option<AuditOutcome>> {
-        match stmt {
-            Statement::Found(sw, deferred) => self.audit(sw, deferred, block).map(Some),
-            Statement::Missing if block.paid_sats == 0 => Ok(None),
-            Statement::Missing => {
-                let mut st = self.lock();
-                if st.distrust.is_none() {
-                    st.distrust = Some(("missing_statement".into(), format!("the coinbase at height {} paid the identity with no window statement", block.height)));
-                }
-                st.carry.forget(block.height);
-                let rec = obj([("height", block.height.into()), ("blockHash", block.hash.clone().into()), ("ok", false.into()),
-                               ("paidSats", block.paid_sats.into()), ("missingStatement", true.into())]);
-                self.record(&mut st, rec)?;
-                Ok(Some(AuditOutcome { ok: false, expected_sats: 0, paid_sats: block.paid_sats, deferred_sats: 0, below_min_sats: 0, proven_work: 0,
-                                       window_work: 0, fee_bps: 0, min_payout: 0, bounded: false, proof: None }))
-            }
+        let refused = match stmt {
+            Statement::Found(sw, deferred) => match self.audit(sw, deferred, block) {
+                Ok(o) => return Ok(Some(o)),
+                Err(e) if STATEMENT_REFUSALS.contains(&e.code.as_str()) => Some(e),
+                Err(e) => return Err(e),
+            },
+            Statement::Missing => None,
+        };
+        if block.paid_sats == 0 {
+            return Ok(None);
         }
+        let mut st = self.lock();
+        let mut rec = obj([("height", block.height.into()), ("blockHash", block.hash.clone().into()), ("ok", false.into()),
+                           ("paidSats", block.paid_sats.into())]);
+        let (code, why) = match &refused {
+            Some(e) => {
+                rec["refusedStatement"] = e.to_string().into();
+                ("refused_statement", format!("the coinbase at height {} paid the identity under a window statement the audit refuses: {e}", block.height))
+            }
+            None => {
+                rec["missingStatement"] = true.into();
+                ("missing_statement", format!("the coinbase at height {} paid the identity with no window statement", block.height))
+            }
+        };
+        if st.distrust.is_none() {
+            st.distrust = Some((code.into(), why));
+        }
+        st.carry.forget(block.height);
+        st.book.pay(block.height, 0);
+        self.carry_rules(&mut st);
+        self.record(&mut st, rec)?;
+        Ok(Some(AuditOutcome { ok: false, expected_sats: 0, paid_sats: block.paid_sats, deferred_sats: 0, below_min_sats: 0, proven_work: 0,
+                               window_work: 0, fee_bps: 0, min_payout: 0, bounded: false, proof: None }))
     }
 
     fn record(&self, st: &mut MutexGuard<'_, State>, rec: Value) -> Result<()> {
@@ -485,9 +623,9 @@ impl WorkProvider {
         self.lock().audits.iter().filter_map(|a| Some((u32::try_from(a.get("height")?.as_u64()?).ok()?, a.get("blockHash")?.as_str()?.to_string()))).collect()
     }
 
-    /// The audited block at `height` left the chain (review P6): its verdict, carry and the credit it
-    /// covered are undone (the spans it resolved are open again, counting against the caps). Returns
-    /// the credit that is unaudited again, or None when no audit was recorded there.
+    /// The audited block at `height` left the chain (review P6): its verdict, carry and payment are
+    /// undone (the credit it covered counts against the caps again). Returns the credit that is
+    /// unaudited again, or None when no audit was recorded there.
     pub fn orphaned(&self, height: u32) -> Result<Option<u64>> {
         let mut st = self.lock();
         let before = st.audits.len();
@@ -522,9 +660,8 @@ impl WorkProvider {
         let caps = |c: Option<u64>| c.map(Value::from).unwrap_or(Value::Null);
         let t = &self.cfg.terms;
         let credit = obj([("unauditedWork", st.book.unaudited_work(None).into()), ("heldWork", st.book.held_total().into()),
-                          ("skippedWork", st.book.skipped_work().into()),
+                          ("paidForWork", u64::try_from(st.book.paid_work()).unwrap_or(u64::MAX).into()),
                           ("capInvoiceWork", caps(st.book.caps.per_invoice)), ("capTotalWork", caps(st.book.caps.total)),
-                          ("forgivenSkippedWork", st.book.caps.skipped.into()),
                           ("primeTerms", obj([("window", t.window.into()), ("windowMinWork", t.window_min_work.into()),
                                               ("windowToleranceBps", t.window_tolerance_bps.into()), ("feeBps", t.fee_bps.into()),
                                               ("maxMinPayout", t.max_min_payout.into())])),
@@ -569,7 +706,7 @@ impl WorkProvider {
             (k.clone(), obj([("key", hex::encode(i.key).into()), ("n", i.n.into()), ("spent", i.spent.into()),
                              ("expiresAt", i.expires_at.into()), ("retired", i.retired.into())]))
         }).collect();
-        obj([("version", 2.into()), ("identity", self.cfg.identity.clone().into()), ("invoices", Value::Object(inv)),
+        obj([("version", 3.into()), ("identity", self.cfg.identity.clone().into()), ("invoices", Value::Object(inv)),
                        ("book", st.book.to_json()), ("audits", st.audits.clone().into()),
                        ("carry", obj([("deferred", st.carry.deferred_total.into()), ("released", st.carry.released_total.into()),
                                       ("blocks", st.carry.blocks.iter().map(|(h, e, p, d)| Value::from(vec![Value::from(*h), Value::from(*e), Value::from(*p), Value::from(*d)])).collect::<Vec<_>>().into())])),
@@ -588,8 +725,9 @@ impl WorkProvider {
         if v.get("identity").and_then(Value::as_str) != Some(self.cfg.identity.as_str()) {
             return Err(bad("state is for another identity"));
         }
-        // version 1 (AGP-032/043) migrates: the book rebuilds its spans from `unaudited`
-        if !matches!(v.get("version").and_then(Value::as_u64), Some(1 | 2)) {
+        // versions 1 (AGP-032/043) and 2 (AGP-065) migrate: the book rebuilds its unpaid credit
+        // from `unaudited` or from the spans
+        if !matches!(v.get("version").and_then(Value::as_u64), Some(1..=3)) {
             return Err(bad("unknown state version"));
         }
         let mut st = self.lock();
@@ -604,6 +742,12 @@ impl WorkProvider {
             st.book.load(b)?;
         }
         st.audits = v.get("audits").and_then(Value::as_array).cloned().unwrap_or_default();
+        if v.get("version").and_then(Value::as_u64) != Some(3) {
+            // state from before AGP-079: what its audits covered is already taken as paid for, so
+            // auditing those blocks again must not count their payments a second time
+            let newest = st.audits.iter().filter_map(|a| a.get("height")?.as_u64()).max().unwrap_or(0);
+            st.book.settled_through = u32::try_from(newest).unwrap_or(u32::MAX);
+        }
         st.carry.deferred_total = v.pointer("/carry/deferred").and_then(Value::as_u64).unwrap_or(0);
         st.carry.released_total = v.pointer("/carry/released").and_then(Value::as_u64).unwrap_or(0);
         for b in v.pointer("/carry/blocks").and_then(Value::as_array).into_iter().flatten() {

@@ -320,7 +320,9 @@ fn state_survives_a_restart() {
 #[test]
 fn credit_caps_end_to_end() {
     let w = World::new_with(None, |c| {
-        c.caps = CreditCaps { per_invoice: Some(30), total: Some(45), skipped: 0 };
+        c.caps = CreditCaps { per_invoice: Some(30), total: Some(45) };
+        // a call (10 units) is worth 50M sats: what each unit earns in a block that pays V/1000 for it
+        c.invoice_price_sats = 50_000_000;
         c.max_owed_carry_sats = Some(100_000_000);
     });
     let (pa, pb) = (w.payer(), w.payer());
@@ -347,15 +349,15 @@ fn credit_caps_end_to_end() {
     assert_eq!(w.work.exposure(), (45, 35));
     assert_eq!(w.work.report()["credit"]["unauditedWork"], json!(45));
 
-    // a pool block at 104 passes its audit (its bound counts all 80 receipted units, credited or held):
-    // the 45 credited are covered, the held 35 are credited
+    // a pool block at 104 passes its audit (its bound counts all 80 receipted units, credited or held)
+    // and its coinbase pays for 80 units: the 45 credited are covered, the held 35 are credited
     let v = 5_000_000_000u64;
     let stmt = |h: u32, c: &str| WindowStatement { prime_id: 70, height: h, block_hash: c.repeat(32), window_start: 100, window_work: 1000,
                                                   min_payout: 546, fee_bps: 0 };
     let sw = w.prime.sign_window(&stmt(104, "a1")).unwrap();
     let o = w.work.audit(&sw, &[], &blk(&sw, v, 400_000_000)).unwrap();
     assert!(o.ok && o.proven_work == 80);
-    // AGP-065: the held 35 lie in spans the pass counted, so they are credited covered
+    // AGP-079: the coinbase paid for the held 35 too, so they are credited covered
     assert_eq!(w.work.exposure(), (0, 0));
     assert_eq!(w.work.balance(&ia), Some((50, 30)));
     assert_eq!(ca.request("GET", &format!("{API}/v1/a4"), b"").unwrap().status, 200);
