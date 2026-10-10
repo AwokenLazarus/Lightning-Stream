@@ -116,17 +116,19 @@ fn p4_a_refused_statement_on_an_underpaid_block_is_a_failed_audit() {
     assert_eq!(wp.exposure().0, 100);
 }
 
-/// P4: a refused statement on a block that paid the identity nothing is, like no statement, no
-/// verdict: nothing is recorded and nothing is covered.
+/// P4: a refused statement on a block that paid the identity nothing covers nothing. Since
+/// AGP-084 this one, which the Prime signed for the block, is also a failed audit (it was no
+/// verdict); one that does not bind the Prime to the block still has none
+/// (`agp084_unpaid_blocks.rs`).
 #[test]
 fn p4_a_refused_statement_on_an_unpaid_block_covers_nothing() {
     let (k, wp) = world();
     let i = inv(&wp);
     credit(&k, &wp, &i, 1, 100, 101, 102);
     let sw = k.sign_window(&stmt(110, 100, 0)).unwrap();
-    assert!(wp.audit_chain(&block(110, 0), Statement::Found(&sw, &[])).unwrap().is_none());
-    assert_eq!((wp.exposure().0, wp.report()["audits"].as_array().unwrap().len()), (100, 0));
-    assert!(wp.report()["distrust"].is_null());
+    assert!(wp.audit_chain(&block(110, 0), Statement::Found(&sw, &[])).unwrap().is_some_and(|o| !o.ok));
+    assert_eq!((wp.exposure().0, wp.report()["audits"].as_array().unwrap().len()), (100, 1));
+    assert_eq!(wp.report()["distrust"]["code"], json!("refused_statement"));
 }
 
 /// P4: every kind of statement the audit refuses (no window, another block, a window start that went

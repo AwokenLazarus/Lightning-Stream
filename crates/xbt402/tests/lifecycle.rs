@@ -27,6 +27,8 @@ struct MemChain {
     utxos: Mutex<HashMap<(String, u32), UtxoInfo>>,
     sent: Mutex<Vec<Tx>>,
     n: Mutex<u64>,
+    /// AGP-084: the node answers a broadcast with an error and does not have the tx.
+    down: Mutex<bool>,
 }
 
 impl MemChain {
@@ -38,6 +40,9 @@ impl MemChain {
     fn sent(&self) -> Vec<Tx> {
         self.sent.lock().unwrap().clone()
     }
+    fn down(&self, on: bool) {
+        *self.down.lock().unwrap() = on;
+    }
 }
 
 impl ChainBackend for MemChain {
@@ -48,6 +53,9 @@ impl ChainBackend for MemChain {
         Ok(self.utxos.lock().unwrap().get(&(txid.to_string(), vout)).cloned())
     }
     fn send_raw_transaction(&self, hex: &str) -> Result<String> {
+        if *self.down.lock().unwrap() {
+            return Err(ChannelError::new("rpc_error", "timed out"));
+        }
         let tx = Tx::parse_hex(hex)?;
         let mut u = self.utxos.lock().unwrap();
         for i in &tx.inputs {
@@ -858,4 +866,107 @@ fn an_altered_conditional_answer_keeps_the_hash_lock() {
     let sent = chain.sent();
     let claim = sent.iter().find(|t| t.inputs[0].prevout.txid_hex() == closed[0]).expect("claim");
     assert_eq!(c.recover_conditional(O, claim).unwrap(), b"deliverable");
+}
+
+// --- AGP-084: a close or rollover whose broadcast errored ---------------------------------------
+
+/// Five paid calls, then the close (or the rollover) while the node answers every broadcast with
+/// an error: the provider, the client's channel, the channel id and the intent left behind.
+fn errored_spend(chain: &Arc<MemChain>, rollover: bool) -> (Arc<Provider>, Client, String, Value) {
+    let prov = provider_with(chain.clone(), ProviderConfig::new(NET), Ledger::in_memory());
+    let mut c = client(chain, &prov);
+    for _ in 0..5 {
+        c.request("GET", &format!("{O}/v1/q"), b"").unwrap();
+    }
+    let chan = c.channels[O].payer.params.channel_id();
+    chain.down(true);
+    let e = if rollover { c.rollover(O).unwrap_err() } else { c.close(O).unwrap_err() };
+    assert_eq!(e.code, "close_failed", "{e}");
+    chain.down(false);
+    let st = prov.channel_state(&chan).unwrap();
+    assert!(st.closed_txid.is_empty() && chain.sent().is_empty(), "the node took nothing");
+    let intent = st.extra["close_intent"].clone();
+    (prov, c, chan, intent)
+}
+
+#[test]
+fn a_channel_whose_spend_the_node_errored_on_serves_nothing_above_it() {
+    // the provider holds the fully signed close (or rollover). The node said no, but the tx can
+    // still reach the chain: a call served on a later state would be above what that spend pays
+    for rollover in [false, true] {
+        let chain = MemChain::new();
+        let (prov, mut c, chan, intent) = errored_spend(&chain, rollover);
+        let (paid, spent) = (py_u64_of(&json!(Tx::parse_hex(intent["hex"].as_str().unwrap()).unwrap().outputs[0].value)), prov.channel_state(&chan).unwrap().spent_msat);
+        let ch = c.channels.get_mut(O).unwrap();
+        let sig = hex::encode(ch.payer.sign_state(paid + 300).unwrap());
+        let ch = ch.clone();
+        let url = format!("{O}/v1/q");
+        let h = paid_header(&ch, 50, &(paid + 300).to_string(), Some(&sig), "GET", &url, b"");
+        let r = prov.serve("GET", "/v1/q", &h, b"", &url, None);
+        // the spend reaches the chain after all, and the watcher records it
+        chain.send_raw_transaction(intent["hex"].as_str().unwrap()).unwrap();
+        assert_eq!(prov.close_due().unwrap(), vec![intent["txid"].as_str().unwrap().to_string()]);
+        let st = prov.channel_state(&chan).unwrap();
+        assert_eq!(st.closed_txid, intent["txid"].as_str().unwrap());
+        assert_eq!((r.status, error_of(&r)), (402, "channel_closing".into()), "rollover {rollover}: a call was served above a spend that confirmed at {paid}");
+        assert_eq!(st.spent_msat, spent, "rollover {rollover}: nothing was served after the spend was signed");
+        assert_eq!(st.extra.contains_key("rollover_to"), rollover, "a rollover that lands later is recorded as one");
+    }
+}
+
+#[test]
+fn the_watcher_sends_a_close_the_node_errored_on_again() {
+    // nothing else would resolve it: the channel takes no new state until its close is on the node
+    let chain = MemChain::new();
+    let (prov, mut c, chan, intent) = errored_spend(&chain, false);
+    let txid = intent["txid"].as_str().unwrap().to_string();
+    chain.down(true);
+    assert!(prov.close_due().unwrap().is_empty());
+    let st = prov.channel_state(&chan).unwrap();
+    assert!(st.closed_txid.is_empty() && !st.close_error.is_empty(), "still open, and the failure shows: {:?}", st.close_error);
+    chain.down(false);
+    assert_eq!(prov.close_due().unwrap(), vec![txid.clone()]);
+    assert_eq!(chain.sent().last().unwrap().txid(), txid);
+    assert_eq!(prov.channel_state(&chan).unwrap().closed_txid, txid);
+    // the client asks again and gets the answer it lost
+    assert_eq!(c.close(O).unwrap()["txid"], txid);
+}
+
+#[test]
+fn the_watcher_does_not_send_a_rollover_the_client_was_told_failed() {
+    // the client was answered close_failed and may have dropped the next channel's key: sent now,
+    // the rollover would fund a channel nobody can spend from. The client rolls over again or closes
+    let chain = MemChain::new();
+    let (prov, mut c, chan, intent) = errored_spend(&chain, true);
+    assert!(prov.close_due().unwrap().is_empty() && chain.sent().is_empty());
+    assert!(prov.channel_state(&chan).unwrap().closed_txid.is_empty());
+    let r = c.rollover(O).unwrap();
+    assert_ne!(r["txid"], intent["txid"], "a new rollover, to a key the client holds");
+    assert_eq!(prov.channel_state(&chan).unwrap().closed_txid, r["txid"].as_str().unwrap());
+    assert_eq!(c.open_rolled(O).unwrap()["chan"], r["nextChan"]);
+    assert_eq!(c.request("GET", &format!("{O}/v1/q"), b"").unwrap().status, 200);
+    // or the operator closes it, at the best state
+    let chain = MemChain::new();
+    let (prov, _c, chan, intent) = errored_spend(&chain, true);
+    let r = prov.close_channel(&chan).unwrap();
+    assert_ne!(r["txid"], intent["txid"]);
+    assert_eq!(prov.channel_state(&chan).unwrap().closed_txid, r["txid"].as_str().unwrap());
+}
+
+#[test]
+fn a_spend_that_reached_the_chain_is_recorded_before_another_replaces_it() {
+    // the rollover the node errored on confirms; the client, told it failed, rolls over again or
+    // closes. Either would overwrite the intent, and the spend on the chain would never be recorded
+    for close in [false, true] {
+        let chain = MemChain::new();
+        let (prov, mut c, chan, intent) = errored_spend(&chain, true);
+        let txid = intent["txid"].as_str().unwrap();
+        chain.send_raw_transaction(intent["hex"].as_str().unwrap()).unwrap();
+        let r = if close { c.close(O).map(|r| r["txid"].clone()).map_err(|e| e.code) } else { c.rollover(O).map(|r| r["txid"].clone()).map_err(|e| e.code) };
+        let st = prov.channel_state(&chan).unwrap();
+        assert_eq!(st.closed_txid, txid, "close {close}: {r:?}");
+        assert_eq!(st.extra["rollover_to"], format!("{txid}:1"));
+        assert_eq!(r, if close { Ok(json!(txid)) } else { Err("channel_closing".to_string()) });
+        assert_eq!(chain.sent().len(), 1);
+    }
 }

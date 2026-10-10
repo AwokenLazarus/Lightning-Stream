@@ -920,6 +920,24 @@ fn hub_bounds_max_lock_sat_however_its_config_was_built() {
 }
 
 #[test]
+fn hub_bounds_max_lock_sat_against_the_capacity_a_ch2_is_opened_with() {
+    // AGP-084: the bound was made against the configured ch2_capacity only, and connect() takes
+    // another capacity (max_lock_sat is 20,000 here: a ch2 of less than 40,000 breaks AGP-064's rule)
+    let w = world(1, PKw::default());
+    let small = "http://dev-small.test";
+    provider(&w.chain, &w.net, &w.dir, small, sk(0xA0A1), &PKw::default());
+    let committed = w.hub.committed_sat();
+    let e = w.hub.connect(small, Some(39_999), None).unwrap_err();
+    assert_eq!(e.code, "bad_config", "{e}");
+    // the next ch2 of a provider it already pays, funded ahead
+    let e = w.hub.connect_next(&w.sh().origin, Some(39_999), None).unwrap_err();
+    assert_eq!(e.code, "bad_config", "{e}");
+    assert_eq!(w.hub.committed_sat(), committed, "refused before anything is funded");
+    assert_eq!(w.hub.connect(small, Some(40_000), None).unwrap().params.capacity, 40_000);
+    assert_eq!(w.hub.connect_next(&w.sh().origin, Some(40_000), None).unwrap().params.capacity, 40_000);
+}
+
+#[test]
 fn c5_hub_funds_and_rolls_ch2_at_the_providers_threshold() {
     let w = world(1, PKw { settle_multiple: 2, amsat: 40 * AMSAT_PER_SAT, ..PKw::default() });
     let first = w.oc().params.channel_id();
