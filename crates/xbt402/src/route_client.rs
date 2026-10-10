@@ -851,48 +851,106 @@ impl RoutePayer {
     ///   that ch2 resolves; our counters become its `after`, our signed state stays;
     /// - released: its ch2 resolved unpaid; the hold leaves our counters, so our next locks are
     ///   quoted below our signed state (the dust floor) until what we paid ahead for it is used.
+    ///
+    /// AGP-085: a release may come in the same view as a completion or a hold (`gone` below).
     fn resync(&self, st: &mut PState, doc: &Value) -> bool {
         let (Some(best), Some(r), Some(u), Some(pd)) = (py_u64(doc.get("bestCum")), py_u64(doc.get("routedSat")), u128_of(doc.get("feeUnits")),
                                                         py_u64(doc.get("feePaid"))) else { return false };
         let hub = (r, u, pd);
         let ours = (st.routed, st.fee_units, st.fee_paid);
         let listed = |k: &str, id: &str| doc.get(k).and_then(Value::as_array).is_some_and(|a| a.iter().any(|x| x.as_str() == Some(id)));
-        if best > st.signed {
-            let Some(i) = st.given_up.iter().position(|g| !g.floor && g.cum == best && (g.after == hub || (g.held && hub == ours))) else { return false };
-            // the refused lock goes first: a signer adopts only with no lock pending (B2's book, xbt-signer)
-            let chan = Self::chan_of(st);
-            let _ = self.signer.void_lock(&chan);
-            if self.signer.adopt_lock(&chan, best).is_err() {
-                return false;
+        // AGP-085: held locks the hub lists as released, and what they take out of the counters. A
+        // view may show a release together with a completion or a new hold (the hub released while
+        // that lock was in flight), so each case below is also tried with the released holds out
+        type C = (u64, u128, u64);
+        let adds = |g: &GivenUp| -> C { (g.after.0.saturating_sub(g.before.0), g.after.1.saturating_sub(g.before.1), g.after.2.saturating_sub(g.before.2)) };
+        let gone: Vec<usize> = (0..st.given_up.len()).filter(|&i| st.given_up[i].held && listed("released", &st.given_up[i].lock_id)).collect();
+        let less = |given: &[GivenUp], mut v: C, skip: Option<usize>| -> C {
+            for &i in gone.iter().filter(|&&i| Some(i) != skip) {
+                let a = adds(&given[i]);
+                v = (v.0.saturating_sub(a.0), v.1.saturating_sub(a.1), v.2.saturating_sub(a.2));
             }
-            (st.routed, st.fee_units, st.fee_paid, st.signed) = (r, u, pd, best);
-            let g = st.given_up.remove(i);
-            self.event(json!({"event": "resync", "lockId": g.lock_id, "cum1": best}));
-            return true;
+            v
+        };
+        // drop the given-up locks at `idx` (any order); their lockIds
+        let drop_at = |given: &mut Vec<GivenUp>, mut idx: Vec<usize>| -> Vec<String> {
+            idx.sort_unstable();
+            let mut ids: Vec<String> = idx.iter().rev().map(|&i| given.remove(i).lock_id).collect();
+            ids.reverse();
+            ids
+        };
+        if best > st.signed {
+            for gi in 0..st.given_up.len() {
+                let g = &st.given_up[gi];
+                if g.floor || g.cum != best {
+                    continue;
+                }
+                let mut rel: Vec<usize> = gone.iter().copied().filter(|&i| i != gi).collect();
+                if g.after == hub || (g.held && hub == ours) {
+                    rel.clear();
+                } else if rel.is_empty() || !(less(&st.given_up, g.after, Some(gi)) == hub || (g.held && less(&st.given_up, ours, Some(gi)) == hub)) {
+                    continue;
+                }
+                // the refused lock goes first: a signer adopts only with no lock pending (B2's book, xbt-signer)
+                let chan = Self::chan_of(st);
+                let _ = self.signer.void_lock(&chan);
+                if self.signer.adopt_lock(&chan, best).is_err() {
+                    return false;
+                }
+                (st.routed, st.fee_units, st.fee_paid, st.signed) = (r, u, pd, best);
+                let lock_id = st.given_up[gi].lock_id.clone();
+                let released = !rel.is_empty();
+                rel.push(gi);
+                let mut ids = drop_at(&mut st.given_up, rel);
+                ids.retain(|x| *x != lock_id);
+                self.event(json!({"event": "resync", "lockId": lock_id, "cum1": best}));
+                if released {
+                    self.event(json!({"event": "resync_release", "lockIds": ids, "routedSat": r}));
+                }
+                return true;
+            }
+            return false;
         }
         if best != st.signed || hub == ours {
             return false;
         }
-        let gone: Vec<usize> = (0..st.given_up.len()).filter(|&i| st.given_up[i].held && listed("released", &st.given_up[i].lock_id)).collect();
-        if !gone.is_empty() {
-            let mut want = ours;
-            for &i in &gone {
-                let g = &st.given_up[i];
-                want.0 = want.0.saturating_sub(g.after.0.saturating_sub(g.before.0));
-                want.1 = want.1.saturating_sub(g.after.1.saturating_sub(g.before.1));
-                want.2 = want.2.saturating_sub(g.after.2.saturating_sub(g.before.2));
-            }
-            if want == hub {
-                (st.routed, st.fee_units, st.fee_paid) = hub;
-                let ids: Vec<String> = gone.iter().rev().map(|&i| st.given_up.remove(i).lock_id).collect();
-                self.event(json!({"event": "resync_release", "lockIds": ids, "routedSat": r}));
-                return true;
-            }
+        let base = less(&st.given_up, ours, None);
+        if !gone.is_empty() && base == hub {
+            (st.routed, st.fee_units, st.fee_paid) = hub;
+            let ids = drop_at(&mut st.given_up, gone.clone());
+            self.event(json!({"event": "resync_release", "lockIds": ids, "routedSat": r}));
+            return true;
         }
-        let Some(g) = st.given_up.iter_mut().find(|g| !g.held && g.before == ours && g.after == hub && listed("held", &g.lock_id)) else { return false };
+        let plain = st.given_up.iter().position(|g| !g.held && g.before == ours && g.after == hub && listed("held", &g.lock_id));
+        // a hold on top of a release: the hub holds this lock by what it adds, on a base the released
+        // holds have left
+        let on_release = || {
+            st.given_up.iter().position(|g| {
+                let a = adds(g);
+                !g.held && g.before == ours && (base.0 + a.0, base.1 + a.1, base.2 + a.2) == hub && listed("held", &g.lock_id)
+            })
+        };
+        let (gi, rel) = match plain {
+            Some(i) => (i, vec![]),
+            None if !gone.is_empty() => match on_release() {
+                Some(i) => (i, gone.clone()),
+                None => return false,
+            },
+            None => return false,
+        };
+        let g = &mut st.given_up[gi];
+        if !rel.is_empty() {
+            // as if the release had been adopted first: the lock was given up on the base without them
+            (g.before, g.after) = (base, hub);
+        }
         g.held = true;
+        let lock_id = g.lock_id.clone();
         (st.routed, st.fee_units, st.fee_paid) = hub;
-        self.event(json!({"event": "resync_hold", "lockId": g.lock_id, "routedSat": r}));
+        if !rel.is_empty() {
+            let ids = drop_at(&mut st.given_up, rel);
+            self.event(json!({"event": "resync_release", "lockIds": ids, "routedSat": base.0}));
+        }
+        self.event(json!({"event": "resync_hold", "lockId": lock_id, "routedSat": r}));
         true
     }
 

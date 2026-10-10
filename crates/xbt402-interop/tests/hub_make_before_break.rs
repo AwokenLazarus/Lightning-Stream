@@ -174,7 +174,7 @@ fn child_is_not_rolled_over_before_it_confirms() {
     assert!(!evs(&w.hub.watch_tick()).contains(&"ch2_rollover".to_string()));
     let e = w.hub.rollover(&w.oc()).unwrap_err(); // and the provider would refuse it
     assert_eq!(e.code, "unconfirmed");
-    assert!(w.oc().next.is_empty());
+    assert!(!w.oc().next.is_empty(), "AGP-085: a refusal does not clear the next ch2 the hub signed for");
     let best = w.child_st(&child).best_cum;
     w.hub.with_out(|b| b.chans.get_mut(ORIGIN).unwrap().signed = best);
     w.chain.confirm_all();

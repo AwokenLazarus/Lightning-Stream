@@ -971,6 +971,69 @@ fn a_spend_that_reached_the_chain_is_recorded_before_another_replaces_it() {
     }
 }
 
+#[test]
+fn a_replaced_intent_is_still_recorded_when_it_confirms() {
+    // AGP-085 (AGP-084's stated limit 2): a rollover errors, then a second spend errors too (the
+    // operator's close, or the client's next rollover) and takes the intent's place, then the first
+    // reaches the chain. The ledger held only the second: the first was never recorded, the channel
+    // stayed open on the books and the second was sent against a spent funding for good
+    for close in [false, true] {
+        let chain = MemChain::new();
+        let (prov, mut c, chan, first) = errored_spend(&chain, true);
+        chain.down(true);
+        let e = if close { prov.close_channel(&chan).unwrap_err() } else { c.rollover(O).unwrap_err() };
+        assert_eq!(e.code, "close_failed", "{e}");
+        chain.down(false);
+        let st = prov.channel_state(&chan).unwrap();
+        assert_ne!(st.extra["close_intent"]["txid"], first["txid"], "close {close}: a second spend was signed");
+        assert!(st.closed_txid.is_empty() && chain.sent().is_empty());
+        let txid = first["txid"].as_str().unwrap();
+        chain.send_raw_transaction(first["hex"].as_str().unwrap()).unwrap();
+        let due = prov.close_due().unwrap();
+        let st = prov.channel_state(&chan).unwrap();
+        assert_eq!(st.closed_txid, txid, "close {close}: the spend on the chain is the channel's close ({due:?}, {:?})", st.close_error);
+        assert_eq!(st.extra["rollover_to"], format!("{txid}:1"));
+        assert_eq!((due, chain.sent().len()), (vec![txid.to_string()], 1), "close {close}: nothing else was sent");
+    }
+}
+
+#[test]
+fn a_client_can_close_after_a_rollover_the_node_errored_on() {
+    // AGP-085: the rollover moved the payer's watermark to what it owed, but the signature the
+    // client keeps for a resend stayed at the state before, so its close carried a cum and a
+    // signature that did not match: `bad_sig`, and only the provider could end the channel
+    let chain = MemChain::new();
+    let (prov, mut c, chan, _) = errored_spend(&chain, true);
+    let owed = c.channels[O].payer.signed;
+    assert!(owed > c.channels[O].acked_cum, "the rollover signed above the last acknowledged state");
+    let r = c.close(O).unwrap_or_else(|e| panic!("the close after a failed rollover was refused: {e}"));
+    let st = prov.channel_state(&chan).unwrap();
+    assert_eq!((st.closed_txid.as_str(), st.best_cum), (r["txid"].as_str().unwrap(), owed));
+    // and every next channel the client signed for is still on its books (AGP-081), found by txid
+    assert_eq!(c.next_rolled[O].len(), 1);
+}
+
+#[test]
+fn unresolved_intents_are_bounded() {
+    // each failed rollover leaves one more signed spend to watch for: past the bound the provider
+    // signs no further one (the client closes, or waits for the node)
+    let chain = MemChain::new();
+    let (prov, mut c, chan, _) = errored_spend(&chain, true);
+    chain.down(true);
+    let mut codes = vec![];
+    for _ in 0..12 {
+        codes.push(c.rollover(O).unwrap_err().code);
+    }
+    chain.down(false);
+    assert_eq!(codes.last().unwrap(), "channel_closing", "{codes:?}");
+    let st = prov.channel_state(&chan).unwrap();
+    let kept = st.extra["close_intents"].as_array().unwrap().len();
+    assert_eq!((kept, codes.iter().filter(|c| *c == "close_failed").count()), (8, 8), "{codes:?}");
+    // the close still goes through, and is the channel's close
+    let r = prov.close_channel(&chan).unwrap();
+    assert_eq!(prov.channel_state(&chan).unwrap().closed_txid, r["txid"].as_str().unwrap());
+}
+
 
 // --- AGP-081: closure audit, transport and channel side paths (T4c, T2, C3) -------------------
 

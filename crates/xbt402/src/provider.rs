@@ -211,6 +211,30 @@ pub(crate) fn intent_open(st: &ChannelState) -> bool {
     st.closed_txid.is_empty() && truthy(st.extra.get("close_intent"))
 }
 
+/// Unresolved spends a channel keeps beside its latest intent (`close_intents`, AGP-085): a
+/// rollover past this is refused `channel_closing` before anything is signed.
+pub const MAX_KEPT_INTENTS: usize = 8;
+
+/// Write `intent` ahead as the channel's `close_intent`. AGP-085: an earlier one for another
+/// transaction is not forgotten. It is complete and signed and can still confirm, so it moves to
+/// `close_intents` and [`Provider::adopt_intent`] goes on looking for it.
+fn set_intent(st: &mut ChannelState, intent: Value) {
+    if let Some(old) = st.extra.get("close_intent").filter(|i| truthy(Some(i)) && i.get("txid") != intent.get("txid")).cloned() {
+        let mut kept: Vec<Value> = st.extra.get("close_intents").and_then(Value::as_array).cloned().unwrap_or_default();
+        kept.retain(|k| k.get("txid") != old.get("txid") && k.get("txid") != intent.get("txid"));
+        kept.push(old);
+        st.extra.insert("close_intents".into(), Value::Array(kept));
+    }
+    st.extra.insert("close_intent".into(), intent);
+}
+
+/// The spends written ahead for this channel and not recorded: the latest first, then the ones it
+/// replaced.
+fn intents(st: &ChannelState) -> Vec<Value> {
+    let kept = st.extra.get("close_intents").and_then(Value::as_array).into_iter().flatten().rev().cloned();
+    st.extra.get("close_intent").cloned().into_iter().chain(kept).filter(|i| truthy(Some(i))).collect()
+}
+
 /// The channel is closed, or a spend of it may be on its way (see [`intent_open`]).
 pub(crate) fn closing(st: &ChannelState) -> bool {
     !st.closed_txid.is_empty() || intent_open(st)
@@ -893,21 +917,24 @@ impl Provider {
     }
 
     /// A close this provider sent and never recorded (M8: the intent is written ahead): record it.
-    /// True when the channel is now closed by it.
+    /// True when the channel is now closed by it. AGP-085: every unresolved intent is looked for,
+    /// the latest first, not only the last one written.
     fn adopt_intent(&self, l: &mut Ledger, st: &mut ChannelState) -> Result<bool> {
-        let Some(intent) = st.extra.get("close_intent").cloned().filter(|i| truthy(Some(i))) else { return Ok(false) };
-        let hx = intent.get("hex").and_then(Value::as_str).unwrap_or("").to_string();
-        let txid = intent.get("txid").and_then(Value::as_str).unwrap_or("").to_string();
-        if !self.tx_known(&txid, &Tx::parse_hex(&hx)?) {
-            return Ok(false);
+        for intent in intents(st) {
+            let hx = intent.get("hex").and_then(Value::as_str).unwrap_or("").to_string();
+            let txid = intent.get("txid").and_then(Value::as_str).unwrap_or("").to_string();
+            if !self.tx_known(&txid, &Tx::parse_hex(&hx)?) {
+                continue;
+            }
+            self.closed(l, st, &hx, &txid, truthy(intent.get("cond")))?;
+            if let Some(next) = intent.get("next").filter(|n| truthy(Some(n))) {
+                // a rollover (AGP-084): the next channel is the one this tx funds
+                st.extra.insert("rollover_to".into(), next.clone());
+                self.save_state(l, st)?;
+            }
+            return Ok(true);
         }
-        self.closed(l, st, &hx, &txid, truthy(intent.get("cond")))?;
-        if let Some(next) = intent.get("next").filter(|n| truthy(Some(n))) {
-            // a rollover (AGP-084): the next channel is the one this tx funds
-            st.extra.insert("rollover_to".into(), next.clone());
-            self.save_state(l, st)?;
-        }
-        Ok(true)
+        Ok(false)
     }
 
     // hash-locked conditional state (M6) --------------------------------------------------
@@ -1002,7 +1029,7 @@ impl Provider {
             let (tx, conditional) = self.close_tx(st)?;
             let txid = tx.txid();
             // write-ahead (M8): a close the node took but we never recorded would never be claimed
-            st.extra.insert("close_intent".into(), json!({"hex": tx.to_hex(), "txid": txid, "cond": conditional}));
+            set_intent(st, json!({"hex": tx.to_hex(), "txid": txid, "cond": conditional}));
             self.save_state(l, st)?;
             if let Err(e) = self.chain.send_raw_transaction(&tx.to_hex()) {
                 // AGP-067 (C1): refused alone (below the mempool's floor), it goes in with a child
@@ -1495,7 +1522,11 @@ impl Provider {
             return fail("bad_amount", format!("a rollover pays at least the best state {}", st.best_cum));
         }
         let txid = tx.txid();
-        st.extra.insert("close_intent".into(), json!({"hex": tx.to_hex(), "txid": txid, "cond": false, "next": format!("{txid}:1")}));
+        if st.extra.get("close_intents").and_then(Value::as_array).is_some_and(|k| k.len() >= MAX_KEPT_INTENTS) {
+            // AGP-085: each one is kept until the chain settles it, and a client could ask without end
+            return fail("channel_closing", format!("{MAX_KEPT_INTENTS} earlier spends of this channel are unresolved: close it"));
+        }
+        set_intent(&mut st, json!({"hex": tx.to_hex(), "txid": txid, "cond": false, "next": format!("{txid}:1")}));
         self.save_state(&mut l, &st)?;
         if let Err(e) = self.chain.send_raw_transaction(&tx.to_hex()) {
             if !self.tx_known(&txid, &tx) {

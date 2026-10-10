@@ -1021,7 +1021,12 @@ fn v12_provider_refuses_an_early_rollover() {
     let oc = w.oc();
     assert!(oc.signed >= oc.params.min_amount());
     assert_eq!(w.hub.rollover(&oc).unwrap_err().code, "settle_early");
-    // near the provider's close margin a small rollover is accepted
+    // near the provider's close margin a small rollover is accepted. (Another world: after the
+    // refusal above the hub keeps that next ch2, AGP-085, and by this height its expiry is too
+    // close to ask under again, so there the hub would close.)
+    let w = world(1, PKw::default());
+    assert_eq!(w.pay.lock(w.sh()).unwrap().unwrap()["status"], "paid");
+    let oc = w.oc();
     w.chain.set_height(oc.params.expiry - 36 - 30);
     let ev = w.hub.rollover(&w.oc()).unwrap();
     assert_eq!(ev["event"], "ch2_rollover");

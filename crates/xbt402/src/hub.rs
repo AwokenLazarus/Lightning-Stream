@@ -131,14 +131,28 @@ const COUNTERS: [&str; 3] = ["routed_sat", "fee_units", "fee_paid"];
 /// The same counters in a lock's `after` and a hold's `hold`.
 const LOCK_COUNTERS: [&str; 3] = ["routed", "units", "paid"];
 
+/// What a lock adds to ch1's counters by itself (AGP-085): `d + f`, its fee units and `f`. None for
+/// a lock written before it recorded `unitsBy`.
+fn lock_deltas(lock: &Value) -> Option<[u128; 3]> {
+    let by = u128_of(lock.get("unitsBy"))?;
+    let (d, f) = (py_u64(lock.get("d")).unwrap_or(0) as u128, py_u64(lock.get("f")).unwrap_or(0) as u128);
+    Some([d + f, by, f])
+}
+
 /// AGP-064 (H2): a lock written off after its ch2 pre-signature left stays in ch1's base until that
-/// ch2 resolves. Raise the counters to the lock's `after` and record on it what was added (`hold`),
-/// so a release takes back exactly that, whatever came after.
+/// ch2 resolves. Add what the lock itself adds and record it on the lock (`hold`), so a release
+/// takes back exactly that, whatever came after. AGP-085: never the distance to the lock's `after`,
+/// which was fixed at admission: a hold released while the lock was in flight would be held again.
+/// (A lock from before `unitsBy` is raised to its `after`, as it was.)
 fn hold_in_base(ex: &mut Map<String, Value>, lock: &mut Value) {
     let mut hold = Map::new();
-    for (k, a) in COUNTERS.iter().zip(LOCK_COUNTERS) {
+    let by = lock_deltas(lock);
+    for (i, (k, a)) in COUNTERS.iter().zip(LOCK_COUNTERS).enumerate() {
         let cur = u128_of(ex.get(*k)).unwrap_or(0);
-        let to = cur.max(u128_of(lock.get("after").and_then(|x| x.get(a))).unwrap_or(0));
+        let to = match by {
+            Some(by) => cur + by[i],
+            None => cur.max(u128_of(lock.get("after").and_then(|x| x.get(a))).unwrap_or(0)),
+        };
         ex.insert((*k).into(), int_value(to));
         hold.insert(a.into(), int_value(to - cur));
     }
@@ -1345,7 +1359,8 @@ impl RouteHub {
         // cum passed check 3: the best state (floor) or need1
         let lock1 = json!({"lockId": lock_id, "cum": cum as u64, "floor": floor1,
                            "pre": pre1.as_ref().map(PreSig::to_json), "T": rt_point, "T1": pl.get("point").cloned().unwrap_or(Value::Null),
-                           "r": r.hex(), "d": d, "f": f, "units": int_value(units), "provider": provider, "at": round3(now_f()),
+                           "r": r.hex(), "d": d, "f": f, "units": int_value(units), "unitsBy": int_value(units - fee_units), "provider": provider,
+                           "at": round3(now_f()),
                            "session": rt.get("session").cloned().unwrap_or(Value::Null),
                            "after": {"routed": routed1 + d + f, "units": int_value(units), "paid": fee_paid + f}});
         st1.extra.insert("route_lock".into(), lock1.clone());
@@ -1683,7 +1698,13 @@ impl RouteHub {
             let f = py_u64(lock1.get("f")).unwrap_or(0);
             ex.insert("route_lock".into(), Value::Null);
             ex.insert("routed_sat".into(), (py_u64(ex.get("routed_sat")).unwrap_or(0) + d + f).into());
-            ex.insert("fee_units".into(), lock1.get("units").cloned().unwrap_or(Value::from(0)));
+            // AGP-085: by what the lock added, as the two others. `units` was fixed at admission: a
+            // hold released since is not in the base any more, and writing `units` would put it back
+            let units = match u128_of(lock1.get("unitsBy")) {
+                Some(by) => int_value(u128_of(ex.get("fee_units")).unwrap_or(0) + by),
+                None => lock1.get("units").cloned().unwrap_or(Value::from(0)),
+            };
+            ex.insert("fee_units".into(), units);
             ex.insert("fee_paid".into(), (py_u64(ex.get("fee_paid")).unwrap_or(0) + f).into());
             let mut done = ex.get("route_done").and_then(Value::as_object).cloned().unwrap_or_default();
             done.insert(lock_id.to_string(), ans.clone());
@@ -2301,6 +2322,15 @@ impl RouteHub {
     /// One tx pays the provider its balance and funds the next ch2 (rollover instead of close).
     /// The next ch2's key is written ahead (`next`), and its funding txid is known before the
     /// request leaves, so a lost answer is finished by the watcher when that tx spends the funding.
+    ///
+    /// AGP-085: the written-ahead next ch2 outlives every answer. The provider holds the request
+    /// signed whatever it answered, so a refusal (400, 401, 403) that came with a broadcast would
+    /// leave the next capacity in a script whose key the hub had dropped. A ch2 has ONE next key
+    /// while its funding is unspent: a later attempt asks under the same key and expiry, so
+    /// whichever attempt the provider broadcasts pays the one script the watcher looks for
+    /// ([`Self::next_funded`]). Once that expiry no longer clears the payer's floor the hub asks
+    /// for a close instead and still keeps `next`. It goes only when another spend of the funding
+    /// confirms ([`Self::reconcile`]).
     pub fn rollover(&self, oc: &OutChannel) -> Result<Value> {
         // AGP-064 (H2): a rollover spends the funding a written-off lock's pre-signature is on, and
         // its secret could no longer be read off a close
@@ -2325,7 +2355,24 @@ impl RouteHub {
             }
             return self.close_ch2(oc, true);
         }
-        let secret = adaptor::random_secret();
+        // the next ch2 an earlier attempt wrote ahead, as the book has it now (AGP-085)
+        let kept = match self.get(Loc::Live(&oc.origin)).filter(|c| c.params.payer_pub == p.payer_pub) {
+            Some(c) if !c.next.is_empty() => Some(OutChannel::from_json(&Value::Object(c.next))?),
+            Some(_) => None,
+            None => return fail("bad_state", "the hub's channel to that provider changed"),
+        };
+        let (secret, expiry) = match &kept {
+            Some(k) => {
+                let floor = crate::funding::open_expiry_floor(oc.term_u64("minExpiryBlocks").unwrap_or(0), oc.term_u64("minConf").unwrap_or(1),
+                                                              oc.term_u64("closeMarginBlocks").unwrap_or(0));
+                if (k.params.expiry as u64) < tip as u64 + floor {
+                    // too old to ask for again, and a second key would leave this one behind: close
+                    return self.close_ch2(oc, true);
+                }
+                (k.secret_key()?, k.params.expiry)
+            }
+            None => (adaptor::random_secret(), expiry),
+        };
         let nxt = ChannelParams::derive(&hex::decode(&oc.pay_to).unwrap_or_default(), &ecdsa::pubkey(&secret), expiry, p.close_fee, None,
                                         &self.network, p.close_fee_payer)?;
         let tx = p.rollover_tx(amount, &nxt.spk(), next_cap)?;
@@ -2348,10 +2395,7 @@ impl RouteHub {
         let (st, doc) = self.post_json(&format!("{}{ROLLOVER_PATH}", oc.origin), &req)
             .map_err(|e| ChannelError::new("provider_error", format!("rollover: {e}")))?;
         if st != 200 {
-            if [400, 401, 403].contains(&st) {
-                // refused: nothing was broadcast
-                self.upd(Loc::Live(&oc.origin), oc, |c| c.next = Map::new())?;
-            }
+            // refused, it says: `next` stays (AGP-085), the chain decides
             let code = doc.get("error").and_then(Value::as_str).filter(|c| safe_code(c)).unwrap_or("provider_error");
             return fail(code, doc.to_string().chars().take(200).collect::<String>());
         }
@@ -3052,8 +3096,9 @@ impl RouteHub {
         }
         let confirmed = self.chain.get_tx_out(&txid, vout, false)?.is_none();
         let locks = !oc.pending.is_empty() || !oc.stale.is_empty();
-        if oc.state == "closing" && !oc.close_txid.is_empty() && !locks && oc.refund_txid.is_empty() && confirmed {
-            // the provider's close as it told us, confirmed: done
+        if oc.state == "closing" && !oc.close_txid.is_empty() && !locks && oc.refund_txid.is_empty() && confirmed && oc.next.is_empty() {
+            // the provider's close as it told us, confirmed: done. (With a next ch2 written ahead the
+            // spender is read first, AGP-085: a rollover the provider held may be what confirmed.)
             self.upd(loc, &oc, |c| {
                 c.state = "closed".into();
                 c.final_ = true;
@@ -3088,8 +3133,19 @@ impl RouteHub {
             return Ok(out);
         };
         let spender = tx.txid();
-        if !oc.next.is_empty() && OutChannel::from_json(&Value::Object(oc.next.clone())).is_ok_and(|n| n.params.funding_txid() == spender) {
-            return Ok(vec![self.finish_rollover(loc, &oc, oc.signed)?]);
+        if let Some(amount) = self.next_funded(loc, &oc, &tx)? {
+            if locks {
+                // AGP-085: a rollover reveals no t. Its locks are unpaid once it confirms, not before (a
+                // close that shows t may still replace it in the mempool); a `rolled` ch2 is not
+                // reconciled again, so they are released here
+                if !confirmed {
+                    return Ok(out);
+                }
+                out.extend(self.release_rolled(loc, &oc, "rolled over")?);
+            }
+            let Some(cur) = self.get(loc).filter(|c| c.params.payer_pub == oc.params.payer_pub) else { return Ok(out) };
+            out.push(self.finish_rollover(loc, &cur, amount)?);
+            return Ok(out);
         }
         let prev_fee = oc.refund_prev.iter().find(|r| r.get("txid").and_then(Value::as_str) == Some(spender.as_str()))
             .map(|r| py_u64(r.get("fee")).unwrap_or(0));
@@ -3100,6 +3156,9 @@ impl RouteHub {
             self.upd(loc, &oc, |c| {
                 c.state = "refunded".into();
                 c.final_ = confirmed;
+                if confirmed {
+                    c.next = Map::new(); // the funding went to our refund: no rollover (AGP-085)
+                }
                 if confirmed && prev_fee.is_some() {
                     // an earlier version won: it is the refund (and the fee) that counts
                     c.refund_txid = sp;
@@ -3171,6 +3230,48 @@ impl RouteHub {
         Ok(out)
     }
 
+    /// The locks on a ch2 whose funding a confirmed rollover spent (AGP-085): the rollover revealed
+    /// no t, so a pending lock is written off (`why`) and every written-off lock is released.
+    fn release_rolled(&self, loc: Loc<'_>, oc: &OutChannel, why: &str) -> Result<Vec<Value>> {
+        self.upd(loc, oc, |c| {
+            if !c.pending.is_empty() {
+                let mut s = Value::Object(std::mem::take(&mut c.pending));
+                s["voided"] = round3(now_f());
+                s["why"] = why.into();
+                c.stale.push(s);
+            }
+        })?;
+        self.release_stale(loc, oc)
+    }
+
+    /// `tx`, which spent this ch2's funding, is a rollover into the next ch2 written ahead (`next`):
+    /// the amount it paid the provider, else None. It is the one last asked for, or (AGP-085) an
+    /// earlier attempt under the same key and expiry at another amount: only a transaction the hub
+    /// signed pays that script from this funding. The record then takes the outpoint and value that
+    /// transaction gave it and a refund for them, before it becomes the ch2.
+    fn next_funded(&self, loc: Loc<'_>, oc: &OutChannel, tx: &Tx) -> Result<Option<u64>> {
+        if oc.next.is_empty() {
+            return Ok(None);
+        }
+        let Ok(mut new) = OutChannel::from_json(&Value::Object(oc.next.clone())) else { return Ok(None) };
+        let spender = tx.txid();
+        if new.params.funding_txid() == spender {
+            return Ok(Some(oc.signed));
+        }
+        let cap = match tx.outputs.as_slice() {
+            [_, o] if o.script_pubkey == new.params.spk() => u64::try_from(o.value).unwrap_or(0),
+            _ => return Ok(None),
+        };
+        let p = new.params.clone().with_funding(&spender, 1, cap)?;
+        new.refund_hex = p.refund_tx(&new.secret_key()?, None, None)?.to_hex();
+        new.params = p;
+        let next = new.to_json().as_object().cloned().unwrap_or_default();
+        if self.upd(loc, oc, |c| c.next = next)?.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(oc.params.capacity.saturating_sub(oc.params.payer_fee()).saturating_sub(cap)))
+    }
+
     /// A rollover child's funding output is not in the UTXO set nor the mempool (AGP-053). The rollover
     /// tx exists (in the mempool, or its output confirmed): None, the usual reconcile (it was spent).
     /// The parent is unspent even counting the mempool: the rollover left the mempool (the provider,
@@ -3206,6 +3307,38 @@ impl RouteHub {
         let spender = tx.txid();
         if spender == txid {
             return Ok(None);
+        }
+        if matches!(tx.outputs.as_slice(), [_, o] if o.script_pubkey == p.spk()) {
+            // AGP-085: another attempt at the same rollover, into this ch2's script, took the place
+            // of the one adopted (one next key per ch2: the provider may hold several attempts). The
+            // coins are in this ch2 at another outpoint, and every state signed on the old one is
+            // void: it starts again as that transaction's child, and the watcher opens it. Locks out
+            // on the old outpoint are unpaid once the replacement confirms; until then it waits
+            let mut out = vec![];
+            if !oc.pending.is_empty() || !oc.stale.is_empty() {
+                if self.chain.get_tx_out(ptxid, pvout, false)?.is_some() {
+                    return Ok(Some(vec![]));
+                }
+                out.extend(self.release_rolled(loc, oc, "rollover replaced")?);
+            }
+            let cap = u64::try_from(tx.outputs[1].value).unwrap_or(0);
+            let np = p.clone().with_funding(&spender, 1, cap)?;
+            let refund = np.refund_tx(&oc.secret_key()?, None, None)?.to_hex();
+            let kept = np.channel_id();
+            self.upd(loc, oc, |c| {
+                c.params = np;
+                c.refund_hex = refund;
+                c.state = "funded".into();
+                c.zero_conf = Map::new();
+                c.fund_seen = true;
+                c.blocked = String::new();
+                (c.signed, c.routed, c.seq) = (0, 0, 0);
+            })?;
+            let ev = json!({"event": "ch2_rollover_replaced", "provider": oc.origin, "chan": p.channel_id(), "parent": oc.rolled_from,
+                            "spender": spender, "kept": kept});
+            self.event(ev.clone());
+            out.push(ev);
+            return Ok(Some(out));
         }
         let why = format!("the rollover was replaced by {spender}");
         self.upd(loc, oc, |c| {

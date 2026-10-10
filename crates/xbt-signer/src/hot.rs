@@ -709,13 +709,18 @@ impl HotWallet {
     }
 
     /// Send a prepared transaction. A failed send whose transaction the node already has counts
-    /// as sent; anything else fails and nothing is forgotten.
+    /// as sent; anything else fails and nothing is forgotten. AGP-085: the error is the node's own
+    /// refusal ([`crate::node::REFUSED`]) only when the node refused the send AND then answered
+    /// that it has no such output. A refusal whose lookup failed is of unknown fate (`rpc_error`),
+    /// as is every send that timed out or was cut: the node may have the transaction.
     pub fn broadcast(&self, prep: &Prep) -> Result<String> {
         match self.node.call("sendrawtransaction", json!([prep.hex])) {
             Ok(v) => Ok(v.as_str().map(str::to_string).unwrap_or_else(|| prep.txid.clone())),
             Err(e) => match gettxout(&*self.node, &prep.txid, 0) {
                 Ok(Some(_)) => Ok(prep.txid.clone()),
-                _ => Err(e),
+                Ok(None) => Err(e),
+                Err(g) if e.code == crate::node::REFUSED => Err(err("rpc_error", format!("{}; and the lookup after it failed: {}", e.msg, g.msg))),
+                Err(_) => Err(e),
             },
         }
     }

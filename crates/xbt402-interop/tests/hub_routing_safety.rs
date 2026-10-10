@@ -622,3 +622,87 @@ fn h2_a_void_whose_pre_signature_never_left_holds_nothing() {
     assert_eq!((w.routed(), w.pay.counters().0), (routed0, routed0));
     assert!(w.pay.close().is_ok(), "nothing unresolved keeps ch1 open");
 }
+
+// --- ch1's counters when a hold is released under a lock in flight (AGP-085) ---------------------------
+
+fn units(v: &Value) -> u128 {
+    v.as_u64().map(u128::from).or_else(|| v.as_str().and_then(|s| s.parse().ok())).unwrap_or(0)
+}
+
+/// ch1's counters as the hub holds them: (routed, fee units, fee paid).
+fn base1(w: &W) -> (u64, u128, u64) {
+    let ex = w.st1().extra;
+    let n = |k: &str| ex.get(k).cloned().unwrap_or(Value::Null);
+    (n("routed_sat").as_u64().unwrap_or(0), units(&n("fee_units")), n("fee_paid").as_u64().unwrap_or(0))
+}
+
+/// p0's lock is written off and held; p1's next lock is admitted and waits at p1 while p0's ch2 is
+/// refunded, which releases the hold. Returns the world, p1's lock thread, ch1's counters before the
+/// hold (routed, units, paid) and p1's lock as admitted.
+fn release_under_a_lock_in_flight() -> (W, std::thread::JoinHandle<Value>, (u64, u128, u64), Value) {
+    let w = W::with_ch2_blocks(&[None, Some(3_000)]);
+    let base = base1(&w);
+    w.net.set_drop(&w.provs[0].0, Some(Box::new(|_, p| p == ROUTE_LOCK_PATH)));
+    assert_eq!(w.lock(0)["error"], "route_failed");
+    assert!(w.stale1()[0]["hold"].is_object(), "held in the base");
+    let oc = w.hub.out_channels()[&w.provs[0].0].clone();
+    w.chain.set_height(oc.params.expiry + 10);
+    let t = w.lock_in_flight(1); // admitted above the hold
+    let lock = w.st1().extra["route_lock"].clone();
+    assert!(lock.is_object(), "p1's lock is in flight");
+    w.hub.watch_tick();
+    w.chain.confirm_all();
+    let acts = w.hub.watch_tick();
+    assert!(acts.iter().any(|a| a["event"] == "lock_released" && a["held"] == true), "{acts:?}");
+    (w, t, base, lock)
+}
+
+#[test]
+fn a_lock_admitted_before_a_release_completes_by_delta() {
+    // the lock's fee units were fixed at admission, above a hold that is released before the lock
+    // completes: written back as an absolute value they put the released units back, the client
+    // (which counts by delta) and the hub disagree for good and every later lock is `bad_amount`
+    let (w, t, base, lock) = release_under_a_lock_in_flight();
+    w.provs[1].1.open();
+    let r = t.join().unwrap();
+    assert_eq!(r["status"], "paid", "{r}");
+    let q = w.pay.quote().unwrap();
+    let (d, f) = (lock["d"].as_u64().unwrap(), lock["f"].as_u64().unwrap());
+    assert_eq!(base1(&w), (base.0 + d + f, base.1 + q.units(d), base.2 + f), "the released units are back in ch1's base");
+    // and the channel still routes
+    stream(&w.pay, &w.shards[1], 10);
+    let mut r = w.pay.lock(&w.shards[1]).unwrap().unwrap();
+    if r["status"] == "resynced" {
+        r = w.pay.lock(&w.shards[1]).unwrap().unwrap();
+    }
+    assert_eq!(r["status"], "paid", "{r}");
+    let c = w.pay.counters();
+    assert_eq!((c.0, c.1, c.2), base1(&w));
+}
+
+#[test]
+fn a_lock_admitted_before_a_release_and_written_off_holds_only_its_own() {
+    // the same order, but p1 keeps the pre-signature and answers 400: the lock is held in the base.
+    // Its hold is what the lock itself added, not the distance to counters fixed before the release
+    let (w, t, base, lock) = release_under_a_lock_in_flight();
+    w.provs[1].1.refuse.store(true, Ordering::SeqCst);
+    w.provs[1].1.open();
+    let r = t.join().unwrap();
+    assert_eq!(r["error"], "route_failed", "{r}");
+    let q = w.pay.quote().unwrap();
+    let (d, f) = (lock["d"].as_u64().unwrap(), lock["f"].as_u64().unwrap());
+    let hold = w.stale1()[0]["hold"].clone();
+    assert_eq!((hold["routed"].as_u64().unwrap(), units(&hold["units"]), hold["paid"].as_u64().unwrap()), (d + f, q.units(d), f), "{hold}");
+    assert_eq!(base1(&w), (base.0 + d + f, base.1 + q.units(d), base.2 + f));
+    // the view carries the release and the hold at once: the client adopts both
+    let c = w.pay.counters();
+    assert_eq!((c.0, c.1, c.2), base1(&w), "the client did not adopt a release and a hold in one view");
+    // p1 closes with t: the lock was paid, and the base counted it once
+    w.provs[1].1.refuse.store(false, Ordering::SeqCst);
+    let st2 = w.st2(1);
+    w.provs[1].1.inner.close_now(&st2.params.channel_id()).unwrap();
+    let acts = w.hub.watch_tick();
+    assert!(acts.iter().any(|a| a["event"] == "secret_from_close"), "{acts:?}");
+    assert_eq!(base1(&w).0, base.0 + d + f);
+    assert!(w.stale1().is_empty());
+}

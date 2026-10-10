@@ -1017,11 +1017,7 @@ impl Signer {
         let params = params.with_funding(&prep.txid, 0, funded as u64)?;
         // P1 write-ahead: this rail has no provider open, so the channel is open once the funding is sent
         self.book.add_pending(&dest, secret, &params, "", Some(cap), open_height, "", "", 0, &prep.hex)?;
-        if let Err(e) = self.hot.broadcast(&prep) {
-            self.book.drop_pending(&dest, &params.channel_id())?;
-            return Err(e);
-        }
-        self.hot.commit(&prep)?;
+        crate::session::send_funding(&self.hot, &self.book, &dest, &params.channel_id(), &prep)?;
         let rec = self.book.mark_open(&dest)?;
         self.mine_safe();
         Ok(with(json!({"verdict": "allow", "rail": "channel"}), with(rec.public(), json!({"funding_sighash": "0x21"}))))
@@ -1161,11 +1157,7 @@ impl Signer {
         let funded = params.with_funding(&prep.txid, 0, sats as u64)?;
         let secret = self.book.take_issued(&origin)?;
         self.book.add_pending(&dest, secret, &funded, &origin, None, self.height()?, "", &self.session.network()?, 0, &prep.hex)?;
-        if let Err(e) = self.hot.broadcast(&prep) {
-            self.book.drop_pending(&dest, &funded.channel_id())?;
-            return Err(e);
-        }
-        self.hot.commit(&prep)?;
+        crate::session::send_funding(&self.hot, &self.book, &dest, &funded.channel_id(), &prep)?;
         Ok(json!({"txid": prep.txid, "vout": 0, "sats": sats, "sighash": "0x21", "chan": funded.channel_id()}))
     }
 
@@ -1597,10 +1589,32 @@ impl Signer {
         if matches!(payload.get("kind").and_then(Value::as_str), Some("xbt402") | Some("ln")) {
             return self.grant_xbt402(&token, &payload);
         }
-        let Some(pay) = self.engine.consume_approval(&token)? else { return Ok(deny("approval", "unknown or expired approval token")) };
-        self.note_used(&token);
+        // AGP-085: the approval is held while the payment runs, not spent before it. On disk it is
+        // `used`, so a crash or a failure of unknown fate leaves it used for good (a later approve
+        // is `approval_replay`: never a second payment on one approval). It is spent by a payment
+        // (`allow`), and given back, valid until its own expiry, when nothing was paid and nothing
+        // is booked: the node's own refusal, or a verdict that is not `allow`.
         let _g = self.lock();
-        let mut settled = self.pay_locked(&json!({"to": pay.dest, "amount_sats": pay.amount_sats, "memo": pay.memo}), true)?;
+        let mut held = payload.clone();
+        held["used"] = true.into();
+        self.engine.store.put_approval(&token, held)?;
+        let pay = Payment { dest: str_or_empty(payload.get("dest")), amount_sats: py_int(payload.get("amount_sats")).unwrap_or(0),
+                            memo: str_or_empty(payload.get("memo")), ts: now };
+        let booked = |s: &Self| -> Result<i64> { Ok(s.engine.store.payments()?.iter().map(|e| e.amount_sats).sum()) };
+        let before = booked(self)?;
+        let r = self.pay_locked(&json!({"to": pay.dest, "amount_sats": pay.amount_sats, "memo": pay.memo}), true);
+        let unpaid = booked(self)? == before
+            && match &r {
+                Ok(v) => v["verdict"] != "allow",
+                Err(e) => e.code == node::REFUSED,
+            };
+        if unpaid {
+            self.engine.store.put_approval(&token, payload)?;
+            return r;
+        }
+        self.note_used(&token);
+        let mut settled = r?;
+        self.engine.store.pop_approval(&token)?;
         if settled["verdict"] == "allow" {
             settled["approved"] = true.into();
         }

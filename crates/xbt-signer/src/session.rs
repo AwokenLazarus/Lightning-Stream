@@ -160,6 +160,26 @@ pub struct Session {
     spend_check: Mutex<Option<SpendCheck>>,
 }
 
+/// Send a channel funding whose pending record (payer key, refund terms, the transaction itself) is
+/// already on disk. AGP-085: the record is forgotten only when the node itself refused the
+/// transaction ([`crate::node::REFUSED`]). Any other failure (a timeout on the send and on the
+/// lookup after it) leaves the funding's fate unknown: the node may have it, so the record and its
+/// key stay, the inputs count as spent, and the watcher sends the transaction again until the node
+/// shows it or refunds the channel at expiry. The error says so.
+pub(crate) fn send_funding(hot: &crate::hot::HotWallet, book: &ChannelBook, dest: &str, chan: &str, prep: &crate::hot::Prep) -> Result<()> {
+    match hot.broadcast(prep) {
+        Ok(_) => hot.commit(prep),
+        Err(e) if e.code == crate::node::REFUSED => {
+            book.drop_pending(dest, chan)?;
+            Err(e)
+        }
+        Err(e) => {
+            hot.commit(prep)?;
+            Err(err(&e.code, format!("{}; the node may have taken this funding, so its channel stays pending (sent again by the watcher, refunded at expiry)", e.msg)))
+        }
+    }
+}
+
 impl Session {
     #[allow(clippy::too_many_arguments)]
     pub fn new(book: Arc<ChannelBook>, hot: Arc<HotWallet>, node: Arc<dyn Node>, transport: Arc<dyn Transport>, chain: &str,
@@ -266,11 +286,8 @@ impl Session {
         // P1 write-ahead: the payer key is sealed on disk, with everything the refund needs, before
         // the funding exists anywhere but here
         self.book.add_pending(dest, secret, &params, dest, Some(cap), open_height, &open_url, &network, min_conf, &prep.hex)?;
-        if let Err(e) = self.hot.broadcast(&prep) {
-            self.book.drop_pending(dest, &params.channel_id())?;
-            return Err(rt(format!("funding broadcast failed: {}", e.msg.chars().take(200).collect::<String>())));
-        }
-        self.hot.commit(&prep)?;
+        send_funding(&self.hot, &self.book, dest, &params.channel_id(), &prep)
+            .map_err(|e| rt(format!("funding broadcast failed: {}", e.msg.chars().take(300).collect::<String>())))?;
         log_call("funding", json!({"dest": dest, "chan": params.channel_id(), "txid": prep.txid, "capacity": funded, "expiry": expiry,
                                    "min_conf": min_conf}));
         self.complete_open(dest, self.open_wait_s)
@@ -335,8 +352,21 @@ impl Session {
     /// Otherwise it stays pending, and the watcher retries or refunds it.
     pub fn complete_open(&self, dest: &str, wait_s: f64) -> Result<Value> {
         let Some(rec) = self.book.get(dest) else { return Ok(json!({})) };
-        if rec.state != "pending" || rec.open_url.is_empty() {
-            // no open_url: an external client's channel (signer `fund`); the client posts its open and attaches
+        if rec.state == "pending" && rec.open_url.is_empty() {
+            // no open_url: a channel with no provider open here. AGP-085: its funding may be of
+            // unknown fate (the send and the lookup both failed), so it is sent again while the
+            // node does not show it. An external client's channel (signer `fund`) then waits for
+            // the client's attach; the signer's own (`open_channel`) is open once it is sent
+            let mut seen = self.funding_confirmations(&rec)?.is_some();
+            if !seen && !rec.funding_hex.is_empty() {
+                seen = self.node.call("sendrawtransaction", json!([rec.funding_hex])).is_ok();
+            }
+            if seen && rec.origin.is_empty() {
+                return Ok(self.book.mark_open(dest)?.public());
+            }
+            return Ok(rec.public());
+        }
+        if rec.state != "pending" {
             return Ok(rec.public());
         }
         if origin_of(&rec.open_url).ok().as_deref() != Some(dest) {

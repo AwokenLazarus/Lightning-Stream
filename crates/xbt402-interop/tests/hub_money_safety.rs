@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use xbt402::adaptor::{self, Sc};
+use xbt402::adaptor::Sc;
 use xbt402::channel::{FeePayer, DUST};
 use xbt402::client::Wallet;
 use xbt402::error::{ChannelError, Result};
@@ -60,12 +60,17 @@ fn provider(chain: &Arc<MemChain>, net: &Arc<MemNet>, dir: &TempDir, origin: &st
     cfg.route_close_fee_payer = FeePayer::Payee;
     let name = origin.replace("http://", "").replace('.', "_");
     let ledger = Ledger::open(&dir.0.join(format!("prov-{name}.jsonl"))).unwrap();
-    let p = Provider::new(chain.clone(), adaptor::random_secret(), cfg, ledger, Box::new(|_, _| 1000),
+    let p = Provider::new(chain.clone(), prov_secret(origin), cfg, ledger, Box::new(|_, _| 1000),
                           Box::new(|_, _, _| HttpResponse::new(200, vec![("Content-Type".into(), "application/json".into())], b"{\"ok\":1}".to_vec()))).unwrap();
     p.offer_route(RouteOffer { window: 0.3, lock_wait: 0.6, invoice_ttl: 8.0, ..RouteOffer::new("/v1/chunk", 370 * 10u128.pow(18)) });
     let p = Arc::new(p);
     net.add(origin, p.clone());
     p
+}
+
+/// A provider's payTo key, known to the tests (one signs for a hostile provider: AGP-085).
+fn prov_secret(origin: &str) -> SecretKey {
+    sk(0x5000 + origin.bytes().map(u64::from).sum::<u64>())
 }
 
 fn hub_cfg() -> HubConfig {
@@ -376,6 +381,308 @@ fn wa_a_lost_rollover_answer_is_finished_by_the_watcher() {
     let new = w.oc(0);
     assert_eq!((new.secret.as_str(), new.params.funding_txid()), (nxt.secret.as_str(), nxt.params.funding_txid()));
     assert_eq!(w.hub.archived().last().unwrap()["state"], "rolled");
+}
+
+// --- 1b the rollover's next ch2 outlives a refusal (AGP-085) ----------------------------------------
+
+/// A provider that takes a rollover request, keeps it (signed by the hub) and answers 400.
+struct Keeps {
+    app: Arc<Provider>,
+    kept: Mutex<Vec<Vec<u8>>>,
+}
+
+impl HttpService for Keeps {
+    fn body_limit(&self, path: &str) -> usize {
+        HttpService::body_limit(&*self.app, path)
+    }
+
+    fn serve(&self, method: &str, path: &str, headers: &[(String, String)], body: &[u8], url: &str) -> HttpResponse {
+        if path != ROLLOVER_PATH {
+            return HttpService::serve(&*self.app, method, path, headers, body, url);
+        }
+        self.kept.lock().unwrap().push(body.to_vec());
+        HttpResponse::new(400, vec![("Content-Type".into(), "application/json".into())], br#"{"error":"bad_request","detail":"no"}"#.to_vec())
+    }
+}
+
+impl W {
+    /// p`i` keeps every rollover request and answers 400, until the returned handle is taken off.
+    fn keeps(&self, i: usize) -> Arc<Keeps> {
+        let k = Arc::new(Keeps { app: self.provs[i].1.clone(), kept: Mutex::new(vec![]) });
+        self.net.add(self.origin(i), k.clone());
+        k
+    }
+
+    fn honest(&self, i: usize) {
+        self.net.add(self.origin(i), self.provs[i].1.clone());
+    }
+
+    /// p`i` answers 400 to a rollover it did broadcast.
+    fn broadcasts_and_says_no(&self, i: usize) {
+        wrap(&self.net, self.origin(i), &self.provs[i].1, Box::new(|_, p, st, _| {
+            (p == ROLLOVER_PATH && st == 200).then(|| (400, br#"{"error":"bad_request","detail":"no"}"#.to_vec()))
+        }));
+    }
+
+    fn next(&self, i: usize) -> Option<OutChannel> {
+        let n = self.oc(i).next;
+        (!n.is_empty()).then(|| OutChannel::from_json(&Value::Object(n)).unwrap())
+    }
+
+    /// The provider broadcasts the rollover of request `req` (which the hub signed) itself.
+    fn provider_sends(&self, i: usize, parent: &OutChannel, req: &[u8]) -> String {
+        let req: Value = serde_json::from_slice(req).unwrap();
+        let p = &parent.params;
+        let n = &req["next"];
+        let expiry = n["expiry"].as_u64().unwrap() as u32;
+        let pay_to = hex::decode(&parent.pay_to).unwrap();
+        let nxt = xbt402::channel::ChannelParams::derive(&pay_to, &hex::decode(n["payerPub"].as_str().unwrap()).unwrap(), expiry, p.close_fee, None, NET,
+                                                         p.close_fee_payer).unwrap();
+        let amount = req["amount"].as_u64().unwrap();
+        let mut tx = p.rollover_tx(amount, &nxt.spk(), p.rollover_next_capacity(amount)).unwrap();
+        let digest = p.sighash(&tx).unwrap();
+        let payee = xbt402::channel::channel_payee_secret(NET, &prov_secret(self.origin(i)), &p.payer_pub, p.expiry).unwrap();
+        tx.inputs[0].witness = vec![hex::decode(req["sig"].as_str().unwrap()).unwrap(),
+                                    xbt402::channel::sign_with_type(&payee, &digest, xbt_primitives::sighash::SIGHASH_ALL_UNIFIED), vec![0x01], p.script()];
+        self.chain.send_raw_transaction(&tx.to_hex()).unwrap()
+    }
+}
+
+/// The refund the hub holds for `oc` spends `oc`'s funding outpoint.
+fn refund_spends_funding(oc: &OutChannel) -> bool {
+    let tx = Tx::parse_hex(&oc.refund_hex).unwrap();
+    (tx.inputs[0].prevout.txid_hex(), tx.inputs[0].prevout.vout) == (oc.params.funding_txid(), oc.params.funding_vout())
+}
+
+#[test]
+fn a_refused_rollover_keeps_the_next_channel() {
+    // far from the margin and under the settle threshold: the provider answers 400 `settle_early`
+    let w = W::new(1, true);
+    let oc = w.oc(0);
+    let e = w.hub.rollover(&oc).unwrap_err();
+    assert_eq!(e.code, "settle_early");
+    assert!(w.chain.spender(&oc.params.funding_txid(), oc.params.funding_vout()).is_none());
+    let nxt = w.next(0).expect("the next ch2 the hub signed for is still written ahead");
+    assert!(!nxt.secret.is_empty() && refund_spends_funding(&nxt));
+}
+
+#[test]
+fn a_rollover_broadcast_after_a_refusal_is_adopted_with_its_refund() {
+    let w = W::new(1, true);
+    let oc = w.oc(0);
+    w.chain.set_height(oc.params.expiry - 40);
+    w.broadcasts_and_says_no(0);
+    assert_eq!(w.hub.rollover(&oc).unwrap_err().code, "bad_request");
+    let spender = w.chain.spender(&oc.params.funding_txid(), oc.params.funding_vout()).expect("it did broadcast");
+    let acts = w.hub.watch_tick();
+    assert!(has(&acts, |a| a["event"] == "ch2_rollover" && a["txid"] == spender.as_str()), "{acts:?}");
+    let new = w.oc(0);
+    assert_eq!((new.params.funding_txid(), new.rolled_from.as_str()), (spender, oc.params.channel_id().as_str()));
+    assert!(!new.secret.is_empty() && refund_spends_funding(&new), "the hub holds the key and the refund of the ch2 its coins are in");
+    assert_eq!(w.hub.committed_sat(), new.params.capacity);
+}
+
+#[test]
+fn a_retried_rollover_asks_under_the_same_key() {
+    let w = W::new(1, true);
+    let oc = w.oc(0);
+    w.chain.set_height(oc.params.expiry - 40);
+    w.keeps(0);
+    assert!(w.hub.rollover(&oc).is_err());
+    w.honest(0);
+    let first = w.next(0).unwrap();
+    w.chain.mine(1);
+    let ev = w.hub.rollover(&w.oc(0)).unwrap();
+    assert_eq!(ev["event"], "ch2_rollover", "{ev}");
+    let new = w.oc(0);
+    assert_eq!((new.secret.as_str(), new.params.expiry), (first.secret.as_str(), first.params.expiry));
+    assert!(refund_spends_funding(&new));
+}
+
+#[test]
+fn a_rollover_at_an_earlier_amount_is_adopted_by_its_script() {
+    // the provider keeps the request for amount A1 and answers 400; the hub routes on and asks again
+    // at A2; the provider broadcasts the first one. The next ch2 is at another txid with another
+    // capacity than the record written for A2, in the same script
+    let w = W::new(1, true);
+    let oc = w.oc(0);
+    let k = w.keeps(0);
+    assert!(w.hub.rollover(&oc).is_err());
+    w.hub.with_out(|b| b.chans[0].signed += 1_000); // as locks routed since
+    let oc2 = w.oc(0);
+    let k2 = w.keeps(0);
+    assert!(w.hub.rollover(&oc2).is_err());
+    let (first, second) = (k.kept.lock().unwrap()[0].clone(), k2.kept.lock().unwrap()[0].clone());
+    let (r1, r2): (Value, Value) = (serde_json::from_slice(&first).unwrap(), serde_json::from_slice(&second).unwrap());
+    assert_eq!(r1["next"], r2["next"], "one next key and expiry per ch2");
+    assert!(r1["amount"].as_u64() < r2["amount"].as_u64());
+    let written = w.next(0).unwrap();
+    let txid = w.provider_sends(0, &oc2, &first);
+    assert_ne!(written.params.funding_txid(), txid);
+    let acts = w.hub.watch_tick();
+    assert!(has(&acts, |a| a["event"] == "ch2_rollover" && a["txid"] == txid.as_str() && a["amount"] == r1["amount"]), "{acts:?}");
+    let new = w.oc(0);
+    assert_eq!((new.params.funding_txid(), new.params.capacity), (txid, oc.params.rollover_next_capacity(r1["amount"].as_u64().unwrap())));
+    assert_eq!(new.secret, written.secret);
+    assert!(refund_spends_funding(&new));
+}
+
+#[test]
+fn a_next_channel_too_old_to_ask_again_is_kept_and_the_ch2_closed() {
+    // no second key while the first may still be paid into: once the kept next ch2's expiry is under
+    // the payer's floor the hub asks for a close, and the next ch2 stays written ahead
+    let w = W::new(1, true);
+    let oc = w.oc(0);
+    let k = w.keeps(0);
+    assert!(w.hub.rollover(&oc).is_err());
+    let kept = w.next(0).unwrap();
+    w.chain.set_height(kept.params.expiry - 500); // under minExpiry 500 + minConf 1 + closeMargin 36
+    let ev = w.hub.rollover(&w.oc(0)).unwrap();
+    assert_eq!(ev["event"], "ch2_close", "{ev}");
+    assert_eq!(k.kept.lock().unwrap().len(), 1, "no second rollover was signed");
+    let parent = w.hub.archived().into_iter().chain(w.hub.out_channels().values().map(OutChannel::to_json))
+        .find(|r| r["params"]["payer_pub"] == hex::encode(oc.params.payer_pub)).unwrap();
+    assert_eq!((parent["state"].as_str(), parent["next"]["secret"].as_str()), (Some("closing"), Some(kept.secret.as_str())), "{parent}");
+}
+
+#[test]
+fn a_rollover_into_a_closing_ch2s_next_channel_is_adopted() {
+    // the same, but what confirms is the rollover the provider kept and not the close it named: the
+    // ch2 was archived by the refill, and its next ch2 is still adopted, key and refund
+    let w = W::new(1, true);
+    let oc = w.oc(0);
+    let k = w.keeps(0);
+    assert!(w.hub.rollover(&oc).is_err());
+    let kept = w.next(0).unwrap();
+    let req = k.kept.lock().unwrap()[0].clone();
+    // it answers the close with a txid of its own invention and broadcasts nothing
+    let signed = oc.signed;
+    let (fee, net) = (oc.params.payee_fee(), signed - oc.params.payee_fee());
+    let app = w.provs[0].1.clone();
+    struct FakeClose(Arc<Provider>, Vec<u8>);
+    impl HttpService for FakeClose {
+        fn body_limit(&self, path: &str) -> usize {
+            HttpService::body_limit(&*self.0, path)
+        }
+        fn serve(&self, method: &str, path: &str, headers: &[(String, String)], body: &[u8], url: &str) -> HttpResponse {
+            if path.ends_with("/close") {
+                return HttpResponse::new(200, vec![("Content-Type".into(), "application/json".into())], self.1.clone());
+            }
+            HttpService::serve(&*self.0, method, path, headers, body, url)
+        }
+    }
+    let reply = json!({"txid": "ab".repeat(32), "cum": signed.to_string(), "payeeFee": fee, "payeeNet": net, "status": "closed"});
+    w.net.add(w.origin(0), Arc::new(FakeClose(app, serde_json::to_vec(&reply).unwrap())));
+    w.chain.set_height(kept.params.expiry - 500);
+    let ev = w.hub.rollover(&w.oc(0)).unwrap();
+    assert_eq!(ev["event"], "ch2_close", "{ev}");
+    assert_ne!(w.oc(0).params.payer_pub, oc.params.payer_pub, "the refill took the origin");
+    let txid = w.provider_sends(0, &oc, &req);
+    w.chain.mine(1);
+    let acts = w.hub.watch_tick();
+    assert!(has(&acts, |a| a["event"] == "ch2_rollover" && a["txid"] == txid.as_str()), "{acts:?}");
+    let arch: Vec<OutChannel> = w.hub.archived().iter().map(|r| OutChannel::from_json(r).unwrap()).collect();
+    let child = arch.iter().find(|c| c.params.funding_txid() == txid).expect("the next ch2 is on the books");
+    assert!(child.secret == kept.secret && refund_spends_funding(child) && xbt402::hub::watched(&child.to_json()));
+    assert_eq!(arch.iter().find(|c| c.params.payer_pub == oc.params.payer_pub).unwrap().state, "rolled");
+}
+
+#[test]
+fn a_kept_next_channel_is_dropped_once_another_spend_confirms() {
+    let w = W::new(1, true);
+    let oc = w.oc(0);
+    w.keeps(0);
+    assert!(w.hub.rollover(&oc).is_err());
+    w.honest(0);
+    let txid = w.provider_closes(0);
+    w.hub.watch_tick();
+    assert!(w.next(0).is_some(), "in the mempool the close may still be replaced: the next ch2 stays");
+    w.chain.mine(1);
+    let acts = w.hub.watch_tick();
+    assert!(has(&acts, |a| a["event"] == "ch2_closed" && a["txid"] == txid.as_str()), "{acts:?}");
+    assert!(w.next(0).is_none() && w.oc(0).final_);
+}
+
+#[test]
+fn a_rollover_refused_before_a_restart_is_adopted_after_it() {
+    let w = W::new(1, true);
+    let oc = w.oc(0);
+    w.chain.set_height(oc.params.expiry - 40);
+    w.broadcasts_and_says_no(0);
+    assert!(w.hub.rollover(&oc).is_err());
+    let kept = w.next(0).unwrap();
+    let spender = w.chain.spender(&oc.params.funding_txid(), oc.params.funding_vout()).unwrap();
+    // what a restart reads: the hub's files (the running hub holds the ledger's lock, so a copy)
+    let dir2 = TempDir::new();
+    for f in std::fs::read_dir(w._dir.0.join("hub")).unwrap().map(|f| f.unwrap()).filter(|f| !f.file_name().to_string_lossy().ends_with(".lock")) {
+        std::fs::create_dir_all(dir2.0.join("hub")).unwrap();
+        std::fs::copy(f.path(), dir2.0.join("hub").join(f.file_name())).unwrap();
+    }
+    let h2 = RouteHub::new(w.chain.clone(), w.chain.clone(), Box::new(ChainWallet(w.chain.clone())), Box::new(NetTransport(w.net.clone())), sk(0x4B4B), NET,
+                           Some(&dir2.0.join("hub")), hub_cfg()).unwrap();
+    let acts = h2.watch_tick();
+    assert!(has(&acts, |a| a["event"] == "ch2_rollover"), "{acts:?}");
+    let new = h2.out_channels()[w.origin(0)].clone();
+    assert_eq!((new.secret.as_str(), new.params.funding_txid()), (kept.secret.as_str(), spender));
+    assert!(refund_spends_funding(&new));
+}
+
+#[test]
+fn a_rollover_adopted_over_a_written_off_lock_releases_it_once_confirmed() {
+    // a rollover shows no t: a lock written off on the ch2 it spends was not paid. The hub waits for
+    // the rollover to confirm (a close that shows t could still replace it), then gives the hold back
+    let w = W::new(1, true);
+    let oc = w.oc(0);
+    let k = w.keeps(0);
+    assert!(w.hub.rollover(&oc).is_err());
+    let req = k.kept.lock().unwrap()[0].clone();
+    let ch1 = w.pay.chan().unwrap();
+    let routed = |w: &W| w.hub.ch1_state(&ch1).unwrap().extra.get("routed_sat").and_then(Value::as_u64).unwrap_or(0);
+    let stale1 = |w: &W| w.hub.ch1_state(&ch1).unwrap().extra.get("stale_locks").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
+    let routed0 = routed(&w);
+    w.net.set_drop(w.origin(0), Some(Box::new(|_, p| p == ROUTE_LOCK_PATH))); // the provider takes the lock; its answer is lost
+    stream(&w.pay, &w.shards[0], 10);
+    assert_eq!(w.pay.lock(&w.shards[0]).unwrap().unwrap()["error"], "route_failed");
+    w.net.set_drop(w.origin(0), None);
+    assert_eq!((w.oc(0).stale.len(), stale1(&w)), (1, 1));
+    assert!(routed(&w) > routed0, "held in ch1's base");
+    let txid = w.provider_sends(0, &oc, &req);
+    let acts = w.hub.watch_tick();
+    assert!(!has(&acts, |a| a["event"] == "ch2_rollover" || a["event"] == "lock_released"), "{acts:?}");
+    assert_eq!(stale1(&w), 1);
+    w.chain.mine(1);
+    let acts = w.hub.watch_tick();
+    assert!(has(&acts, |a| a["event"] == "ch2_rollover"), "{acts:?}");
+    assert!(has(&acts, |a| a["event"] == "lock_released" && a["held"] == true), "{acts:?}");
+    assert_eq!((stale1(&w), routed(&w)), (0, routed0));
+    let new = w.oc(0);
+    assert!(new.params.funding_txid() == txid && refund_spends_funding(&new));
+}
+
+#[test]
+fn a_rollover_replaced_by_another_attempt_into_the_same_script_keeps_the_coins() {
+    // the hub adopted the second attempt (in the mempool); the provider's first one confirms in its place
+    let w = W::new(1, true);
+    let oc = w.oc(0);
+    let k = w.keeps(0);
+    assert!(w.hub.rollover(&oc).is_err());
+    w.hub.with_out(|b| b.chans[0].signed += 1_000);
+    let oc2 = w.oc(0);
+    assert!(w.hub.rollover(&oc2).is_err());
+    let kept = k.kept.lock().unwrap().clone();
+    let (first, second) = (kept[0].clone(), kept[1].clone());
+    let tx2 = w.provider_sends(0, &oc2, &second);
+    w.hub.watch_tick();
+    let child = w.oc(0);
+    assert_eq!(child.params.funding_txid(), tx2);
+    w.chain.evict(&tx2);
+    let tx1 = w.provider_sends(0, &oc2, &first);
+    w.chain.mine(1);
+    let acts = w.hub.watch_tick();
+    assert!(has(&acts, |a| a["event"] == "ch2_rollover_replaced" && a["kept"].is_string()), "{acts:?}");
+    let now = w.oc(0);
+    assert_eq!((now.secret.as_str(), now.params.funding_txid(), now.final_, now.signed, now.routed), (child.secret.as_str(), tx1, false, 0, 0));
+    assert!(refund_spends_funding(&now));
 }
 
 // --- 2 reconcile every non-final ch2 --------------------------------------------------------------

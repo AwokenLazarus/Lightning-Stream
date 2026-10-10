@@ -297,11 +297,22 @@ fn a_routes_file_save_during_a_call_covers_it() {
     }));
     let w = b.p.routes().wal().unwrap().clone();
     let fs = w.fsyncs();
+    // AGP-085: the log's writer is held, so the reservation queued before the handler does not
+    // reach the disk while the call runs. The answer waits for nothing: the routes file the handler
+    // saved holds the session's meter with this call in it. (This test used to read the sync
+    // counter right after the call and expect the reservation's sync in it. That sync runs on the
+    // writer thread and nothing waits for it here, so under load the counter still read 0.)
+    w.hold_from.store(w.version() + 1, Ordering::SeqCst);
     assert_eq!(c.call(&b, b"x").status, 200);
-    assert_eq!(w.fsyncs() - fs, 1, "the reservation only");
+    assert_eq!(w.fsyncs() - fs, 0, "nothing was synced to the log for this call yet");
     *slot.lock().unwrap() = None;
+    // a crash here: the state that left is covered by the routes file alone
     b.restart();
     assert_eq!(b.meter(&c.session), (2, 2, 2 * PRICE));
+    // and without one, the log gets the reservation only: no second snapshot for the answer
+    w.hold_from.store(0, Ordering::SeqCst);
+    w.wait(w.version(), Duration::from_secs(10)).unwrap();
+    assert_eq!(w.fsyncs() - fs, 1, "the reservation only");
 }
 
 #[test]

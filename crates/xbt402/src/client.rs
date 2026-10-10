@@ -960,6 +960,12 @@ impl Client {
         // is the one that tx funds, never an outpoint the provider names (review C3)
         let txid = p.rollover_tx(owed, &next.spk(), next_cap)?.txid();
         let ch = self.channels.get_mut(origin).ok_or_else(|| ChannelError::code("no_channel"))?;
+        if owed > ch.payer.signed {
+            // AGP-085: the rollover moves the watermark to `owed`. The plain state for it is signed
+            // first and kept, so a close (or a call) after a rollover that failed carries a
+            // signature for the cum it names; it pays the provider what the rollover would
+            ch.last_sig = hex::encode(ch.payer.sign_state(owed)?);
+        }
         let sig = hex::encode(ch.payer.sign_rollover_next(owed, &next, next_cap)?);
         let (accepted, price) = (ch.accepted.clone(), ch.price);
         let body = json!({"chan": chan, "amount": owed, "next": {"payerPub": hex::encode(next.payer_pub), "expiry": expiry,

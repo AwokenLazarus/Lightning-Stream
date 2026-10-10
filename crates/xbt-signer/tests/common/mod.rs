@@ -50,6 +50,12 @@ fn rpc_err(m: &str) -> ChannelError {
     ChannelError::new("rpc_error", m.to_string())
 }
 
+/// The node's own JSON-RPC error (`xbt_signer::node::REFUSED`): it answered, and did not do it.
+/// A rejected broadcast is one (AGP-085: only that lets a funding forget its pending record).
+fn refused(m: &str) -> ChannelError {
+    ChannelError::new(xbt_signer::node::REFUSED, m.to_string())
+}
+
 impl FakeChain {
     pub fn new(chain: &str, height: u64) -> Arc<Self> {
         Arc::new(Self { st: Mutex::new(State { chain: chain.into(), height, ..Default::default() }), allow_generate: AtomicBool::new(false) })
@@ -137,19 +143,19 @@ impl FakeChain {
     fn send(&self, raw: &str) -> Result<String> {
         let mut s = self.st.lock().unwrap();
         if let Some(r) = s.reject.clone() {
-            return Err(rpc_err(&r));
+            return Err(refused(&r));
         }
-        let tx = Tx::parse_hex(raw).map_err(|_| rpc_err("TX decode failed"))?;
+        let tx = Tx::parse_hex(raw).map_err(|_| refused("TX decode failed"))?;
         let txid = tx.txid();
         if s.mempool.contains_key(&txid) || s.conf_height.contains_key(&txid) {
-            return Err(rpc_err("txn-already-known"));
+            return Err(refused("txn-already-known"));
         }
         if tx.locktime > 0 && tx.locktime < 500_000_000 && tx.locktime as u64 > s.height {
-            return Err(rpc_err("non-final"));
+            return Err(refused("non-final"));
         }
         for i in &tx.inputs {
             if !s.utxos.contains_key(&(i.prevout.txid_hex(), i.prevout.vout)) {
-                return Err(rpc_err("bad-txns-inputs-missingorspent"));
+                return Err(refused("bad-txns-inputs-missingorspent"));
             }
         }
         for i in &tx.inputs {

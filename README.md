@@ -1699,8 +1699,10 @@ Limits. After a failed close the channel routes and serves nothing until that cl
 that is the point of the fix, and it changes what a failed close means for the client (it could go
 on paying before). A replaced intent is forgotten: if the first spend errored, a second one errored
 too, and then the *first* confirms, the ledger has the second one's intent and the close is never
-recorded (the channel shows as suspended; no state sits above either spend). Found on the way and
-not fixed, both in the payer library (`client.rs`), not in the provider:
+recorded (the channel shows as suspended; no state sits above either spend). (AGP-085, below,
+keeps every replaced intent and closes the first of the two payer-library points; AGP-081 closed
+the second.) Found on the way and not fixed, both in the payer library (`client.rs`), not in the
+provider:
 
 - after a rollover the provider answered with an error, `Client::close` is refused `bad_sig`: the
   payer's watermark moved to the rollover's amount and its kept signature did not;
@@ -1917,6 +1919,135 @@ Tests, each failing on `main` and passing here unless marked:
   `backend::tests::the_transaction_cache_drops_the_oldest_at_its_cap`.
 
 New dependency: none (`cargo tree -d` is unchanged).
+
+## Fix wave 3: the hub's next ch2, counters by delta, funding and approvals, replaced intents (AGP-085)
+
+What fix wave 2 found and left open (AGP-081 "Decisions for the lead" item 1, AGP-084 "Found, not
+fixed" items 1 to 6 and its stated limit 2). B1 has the hub and provider items with the same test
+names (`tests/security/test_agp085_hub.py`), B2 the signer items (`tests/test_agp085_write_ahead.py`).
+
+| item | before | now | tests |
+|---|---|---|---|
+| 1 hub ch2 rollover answered 400, 401 or 403 | the next ch2 written ahead (key and refund) was cleared: a provider that answers 400 and broadcasts anyway left the hub's leftover in a script it had no key for | `next` outlives every answer; one next key per ch2; adopted by its script whatever amount the broadcast rollover paid; cleared only when another spend of the funding confirms | `hub_money_safety.rs`: `a_refused_rollover_keeps_the_next_channel`, `a_rollover_broadcast_after_a_refusal_is_adopted_with_its_refund`, `a_retried_rollover_asks_under_the_same_key`, `a_rollover_at_an_earlier_amount_is_adopted_by_its_script`, `a_next_channel_too_old_to_ask_again_is_kept_and_the_ch2_closed`, `a_rollover_into_a_closing_ch2s_next_channel_is_adopted`, `a_kept_next_channel_is_dropped_once_another_spend_confirms`, `a_rollover_refused_before_a_restart_is_adopted_after_it` |
+| 2 ch1's `fee_units` when a hold is released under a lock in flight | set to the absolute value fixed at admission: the released units came back, the client (which counts by delta) and the hub disagreed for good, every later lock was `bad_amount` | the lock records `unitsBy`; completion adds it; a hold is the lock's own three deltas | `hub_routing_safety.rs`: `a_lock_admitted_before_a_release_completes_by_delta`, `a_lock_admitted_before_a_release_and_written_off_holds_only_its_own` |
+| 3 library client after a rollover answered with an error | `Client::close` refused `bad_sig` | the plain state for the rollover's amount is signed and kept first | `lifecycle.rs::a_client_can_close_after_a_rollover_the_node_errored_on` |
+| 4 channel funding of unknown fate | the pending record and its payer key were forgotten on ANY broadcast failure | forgotten only on the node's own refusal; else kept, sent again by the watcher, refunded at expiry | `xbt-signer/tests/agp085_funding.rs`: `a_funding_of_unknown_fate_keeps_its_pending_record_and_key`, `a_funding_the_node_never_received_is_sent_again_by_the_watcher`, `a_refused_funding_the_node_cannot_be_asked_about_is_kept`, `a_funding_the_node_refused_is_forgotten` |
+| 6 `approve` (the Rust signer had B2's order) | the token was popped before the payment: a node refusal cost the human's approval and paid nothing | held (`used` on disk) while the payment runs; spent by a payment; given back on the node's refusal or a verdict that is not `allow` | same file: `an_approval_the_node_refused_to_pay_is_not_spent`, `an_approval_the_policy_denied_is_not_spent`, `an_approval_whose_payment_is_of_unknown_fate_stays_spent` |
+| 7 a replaced intent | forgotten: if it confirmed later the close was never recorded | every unresolved intent is kept (`close_intents`) and looked for; at most 8 beside the latest | `lifecycle.rs`: `a_replaced_intent_is_still_recorded_when_it_confirms`, `unresolved_intents_are_bounded` |
+| 8 `route_wal::a_routes_file_save_during_a_call_covers_it` | failed under load (sync count 0, not 1) | the test was wrong, not the log (below) | the test itself |
+
+(Item 5, `fund_treasury`, is B2 only: the Rust signer has no treasury.)
+
+**1. The next ch2.** `RouteHub::rollover` writes the next ch2 ahead and signs one transaction
+into it. The provider then holds that request signed whatever it answers. The rule now:
+
+- No answer clears `next`. A ch2 has one next key while its funding is unspent. A later attempt
+  asks under the kept key and expiry, so every rollover the hub ever signed from this funding pays
+  the same script; only the amount (and so the txid and the next capacity) differs.
+- `reconcile` adopts by script (`next_funded`): a spender of the funding with two outputs whose
+  second pays `next`'s script is a rollover the hub signed. `next` takes that transaction's
+  outpoint and value and a fresh refund, then becomes the ch2 (`ch2_rollover`, with the amount
+  that transaction paid). This holds for a live ch2 and for one already archived by a refill.
+- When the kept expiry no longer clears the payer's floor (`minExpiryBlocks + minConf +
+  closeMarginBlocks`), the hub does not make a second key, which would leave the first behind: it
+  asks for a close (and a refill) and keeps `next`. The cost: a ch2 whose rollover was refused
+  once, and that then lives to within that floor of the kept expiry, settles by a close and a new
+  funding where it would have rolled over (two tests that relied on the old clearing were
+  changed: `child_is_not_rolled_over_before_it_confirms`, `v12_provider_refuses_an_early_rollover`).
+- A `closing` ch2 with a `next` is not marked closed on the provider's word once its funding is
+  spent and confirmed: the spender is read first. A provider that names a close txid and
+  broadcasts the rollover it kept is adopted, not written off.
+- `next` goes when a spend of the funding that is not a rollover into it confirms.
+
+Paths that reach the same state, each covered: a refusal with nothing broadcast (kept, reused);
+a refusal with a broadcast; a lost answer (AGP-037's `wa_a_lost_rollover_answer_is_finished_by_the_watcher`,
+unchanged); a retry at another amount; a restart between the refusal and the adoption; a parent
+archived by close and refill (AGP-073) or by `promote` (AGP-057: same archive, same reconcile);
+the provider's own close winning. Limit: while the fate is unknown the hub goes on routing over
+the old ch2. If the provider then broadcasts the earlier rollover, the states signed since are
+void: the provider gave up what they paid it (its choice, as with closing on an old state).
+
+Three more paths beside these, found by the B1 review and closed in both languages:
+
+- **A rollover adopted over locks.** A rollover reveals no `t`. If the old ch2 has a pending or
+  written-off lock when the rollover is seen, it is adopted only once it confirms (a close that
+  shows `t` could still replace it); then the pending lock is written off, every written-off lock
+  is released (its hold leaves ch1's base) and the rollover is finished. Before, a `rolled` ch2 was
+  never reconciled again and the hold stayed for good; that was already so for a rollover whose
+  answer was lost (`a_rollover_adopted_over_a_written_off_lock_releases_it_once_confirmed`).
+- **Another attempt confirms in place of the adopted one.** The hub adopts attempt 2 from the
+  mempool and attempt 1 confirms. `rollover_gone` used to drop the child as "replaced", final,
+  with no refund. A spender of the parent whose second output pays the child's script is the same
+  ch2 at another outpoint: the child takes it, with a fresh refund, starts again as `funded` with
+  nothing signed (states on the old outpoint are void), and the watcher opens it. Locks out on
+  the old outpoint are released once the replacement confirms
+  (`a_rollover_replaced_by_another_attempt_into_the_same_script_keeps_the_coins`;
+  `ch2_rollover_replaced` then carries `kept`).
+- **Our own refund confirms:** `next` is cleared, as on the provider's confirmed close.
+
+**2. Counters by delta.** A lock's record gains `unitsBy` (what the lock adds to `fee_units`).
+`complete_ch1` adds it, as `routed_sat` and `fee_paid` were already added. `hold_in_base` (a lock
+written off while its pre-signature is out) adds the lock's own `d + f`, `unitsBy` and `f`; it
+used to raise the counters to the lock's `after`, fixed at admission, which held a released hold a
+second time in all three counters. A record without `unitsBy` (written before this change) keeps
+the old rule. Other writers checked and left: `release_unpaid` subtracts exactly the recorded
+hold; a legacy written-off lock with no hold is raised to its `after` only when it is the best
+state; the routed client's `commit` sets `fee_units` from its own pending lock, and nothing on the
+client changes its counters between building a lock and committing it (locks are serial, a
+resync happens only on a refused lock). The client's `resync` did need a change: with a hold by
+delta, the hub's view can carry a release and a hold (or a completion) of the lock in flight at
+once, which matched none of its three cases and left it on `bad_amount`. Each case is now also
+tried with the released holds taken out; the hold-plus-release case has a test (the second one
+above), the completion-plus-release case has none. Counts: `scripts/route_interop.sh` and B1's
+`demo_route.sh` looped (numbers in the task result).
+
+**3. The client after an errored rollover.** `sign_rollover` moves the payer's watermark to the
+amount owed; `last_sig` stayed at the state before, so the next close named a cum its signature
+did not match. The plain state for that amount is now signed first and kept. It pays the provider
+what the rollover would. The next channel's key: since AGP-081 every signed rollover's next
+channel stays in `next_rolled` until `adopt_rolled` takes it, whatever the POST answered; checked
+again here (the test above asserts it). The hub never moves its watermark in a rollover (it signs
+`signed`), and a signer-backed client goes through the same code.
+
+**4. Funding of unknown fate.** `session::send_funding` is now the one place a channel funding is
+broadcast (the session's open, the socket's `open_channel`, an external client's `fund`: every
+`prepare_fund` caller). `HotWallet::broadcast` answers `rpc_refused` only when the node refused
+the send and then said it has no such output; a refusal whose lookup failed, and every timeout,
+is `rpc_error`: unknown. On unknown the pending record and key stay, the inputs count as spent,
+and the caller's error says the channel stays pending. `complete_open` (the watcher) sends a
+pending funding with no open URL again until the node shows it; the signer's own channel is then
+open, an external client's waits for its attach. Limits: an open against a node that is merely
+unreachable leaves a pending channel that is funded when the node is back, although the caller
+got an error; a kept funding that can never confirm blocks its destination until the refund
+answers at expiry; the hot balance counts the change before the transaction is known to exist
+(`hot_reconcile` corrects it). Sweeps and the rotation have no key to forget and are unchanged.
+
+**6. Approvals.** The token is `used` on disk before the payment and through it. `allow` removes
+it; the node's own refusal, or any verdict that is not `allow`, with nothing booked, gives it
+back as it was (same expiry). Anything else, a crash included, leaves it used: a later approve is
+`approval_replay`. `xbt402` and `ln` grants are separate paths and unchanged.
+
+**7. Replaced intents.** `set_intent` moves an earlier unresolved intent for another transaction to
+`close_intents`; `adopt_intent` looks for the latest, then those, newest first, at every place it
+already ran (the watcher's tick, the start of `close` and `rollover`). A rollover is refused
+`channel_closing` once 8 are kept, before anything is signed (a client could otherwise grow the
+ledger while the node is down); a close is never refused. The hub's ch1 is a `Provider`, so it is
+the same code. Limit: once a spend is recorded as the close, a kept intent that displaces it (a
+reorg) is not looked for.
+
+**8. The flaky test.** The test saves the routes file inside the handler and then expected exactly
+one log sync "for the reservation" when the call returned. That save holds the session's meter
+with the call in it, so the answer waits for nothing; the reservation's sync runs on the writer
+thread and may finish after the call. With `sync_delay_ms` = 300 the old assertion reads 0 every
+time; under 96 busy loops on 16 cores it failed 23 runs of 200. The test now holds the writer,
+checks the call answers with nothing synced, crashes there (the routes file alone restores the
+meter) and then checks the log gets the reservation only: 100 of 100 under the same load. The
+log's code is unchanged.
+
+For embedders: `xbt402::provider::MAX_KEPT_INTENTS`; a channel's `extra` may hold `close_intents`;
+a hub lock record holds `unitsBy`; `HotWallet::broadcast` may answer `rpc_error` where it
+answered `rpc_refused`; `open_channel`, `fund` and `xbt402_pay` may leave a pending channel
+behind an error.
 
 ## Portability
 
