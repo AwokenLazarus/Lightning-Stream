@@ -218,6 +218,28 @@ pub fn safe_code(code: &str) -> bool {
         && code.bytes().any(|c| c.is_ascii_lowercase())
 }
 
+/// The URL a seller names for one of its own endpoints (`openUrl`, `chunkUrl`), held to `origin`
+/// (`scheme://host[:port]`, the allowlisted one). The seller chooses this string, so it is never
+/// just appended: `@evil.example/open` after the origin is another host. Accepted: a path that
+/// starts with exactly one `/`, or an absolute URL on `origin`; no backslash, whitespace or
+/// control character either way. Returns `origin` + path.
+pub fn seller_url(origin: &str, given: &str) -> Result<String> {
+    let refuse = |why: &str| Err(ChannelError::new("seller_url", format!("the seller's URL {why}; refused before any request")));
+    if given.chars().any(|c| c == '\\' || c.is_whitespace() || c.is_control()) {
+        return refuse("has a backslash, a space or a control character");
+    }
+    let origin = origin.trim_end_matches('/');
+    let path = match given.strip_prefix(origin) {
+        Some(rest) if given.contains("://") => rest,
+        _ if given.contains("://") => return refuse("is on another origin"),
+        _ => given,
+    };
+    if !path.starts_with('/') || path.starts_with("//") {
+        return refuse("is not a path on its own origin");
+    }
+    Ok(format!("{origin}{path}"))
+}
+
 /// PAYMENT-RESPONSE as an x402 v2 SettlementResponse around a signed receipt.
 pub fn settlement_response(receipt: &Value, network: &str, payer: &str, success: bool) -> Value {
     let mut extra = Map::new();
