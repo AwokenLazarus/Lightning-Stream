@@ -204,6 +204,9 @@ struct LnState {
     /// AGP-049: the wtclient's towers (`None`: no wtclient), the macaroon presented.
     towers: Option<Vec<Value>>,
     macaroon: Option<Vec<u8>>,
+    /// AGP-082: what a settled payment's record says: zero amounts, a preimage that is not the hash's.
+    zero_amounts: bool,
+    wrong_preimage: bool,
 }
 
 struct FakeLn {
@@ -217,7 +220,7 @@ impl FakeLn {
             network: "regtest".into(), feature_512: true, synced: true, wrong_chain: false,
             channels: vec![chan(&scid(6_100, 1), "ANCHORS", true), chan(&scid(6_101, 1), "SIMPLE_TAPROOT", false)],
             mode: Mode::Succeed, fee_msat: 1_500, sent: vec![], payments: vec![], preimages: vec![], decode_amount_bump: 0, utxos: vec![],
-            towers: None, macaroon: None }) })
+            towers: None, macaroon: None, zero_amounts: false, wrong_preimage: false }) })
     }
 
     fn sent(&self) -> usize {
@@ -278,15 +281,16 @@ impl LnBackend for FakeLn {
         }
         s.sent.push(r.clone());
         let hash = d.payment_hash_hex();
-        let pre = s.preimages.iter().find(|(h, _)| *h == hash).map(|(_, p)| p.clone()).unwrap_or_default();
+        let pre = if s.wrong_preimage { vec![0xee; 32] } else { s.preimages.iter().find(|(h, _)| *h == hash).map(|(_, p)| p.clone()).unwrap_or_default() };
+        let value_msat = if s.zero_amounts { 0 } else { d.amount_msat.unwrap_or(0) };
         let status = match s.mode {
             Mode::Succeed => "SUCCEEDED",
             Mode::Fail => "FAILED",
             _ => "IN_FLIGHT",
         };
         let htlcs = if status == "IN_FLIGHT" { json!([{"status": "IN_FLIGHT", "route": {"total_time_lock": self.chain.height() + 40}}]) } else { json!([]) };
-        let p = json!({"payment_hash": hash, "status": status, "value_msat": d.amount_msat.unwrap_or(0).to_string(), "htlcs": htlcs,
-                       "fee_msat": if status == "SUCCEEDED" { s.fee_msat.to_string() } else { "0".into() },
+        let p = json!({"payment_hash": hash, "status": status, "value_msat": value_msat.to_string(), "htlcs": htlcs,
+                       "fee_msat": if status == "SUCCEEDED" && !s.zero_amounts { s.fee_msat.to_string() } else { "0".into() },
                        "payment_preimage": if status == "SUCCEEDED" { hex::encode(&pre) } else { "00".repeat(32) },
                        "failure_reason": if status == "FAILED" { "FAILURE_REASON_NO_ROUTE" } else { "FAILURE_REASON_NONE" }});
         s.payments.push(p.clone());
@@ -1403,4 +1407,108 @@ fn l5_a_0x21_push_the_script_never_checks_proves_nothing() {
     let r = rig.pay(&inv, 1000);
     assert_eq!(r["verdict"], "allow", "{r}");
     assert_eq!(rig.ln.st.lock().unwrap().sent[0].outgoing_chan_ids, vec![scid(6_402, 1), scid(6_403, 1)]);
+}
+
+// --- AGP-082: the audit's two Lightning rail fixes (AGP-077, List 1 item 11) ---------------------------
+
+/// A loopback HTTP server that answers every request with `status` and these extra header lines, and
+/// records each request's head.
+fn http_stub(status: &'static str, extra: String, body: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", l.local_addr().unwrap());
+    let heads = Arc::new(Mutex::new(vec![]));
+    let seen = heads.clone();
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(mut s) = s else { break };
+            let mut head = vec![];
+            let mut b = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") && s.read(&mut b).unwrap_or(0) == 1 {
+                head.push(b[0]);
+            }
+            seen.lock().unwrap().push(String::from_utf8_lossy(&head).to_string());
+            let _ = s.write_all(format!("HTTP/1.1 {status}\r\n{extra}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                        body.len()).as_bytes());
+        }
+    });
+    (url, heads)
+}
+
+#[test]
+fn agp082_the_rest_client_follows_no_redirect_so_the_macaroon_goes_to_no_other_host() {
+    let dir = tempfile::tempdir().unwrap();
+    let mac = macaroon_file(dir.path());
+    // the other host: whatever reaches it is recorded
+    let (other, got) = http_stub("200 OK", String::new(), "{\"identity_pubkey\": \"02aa\", \"payments\": []}");
+    for status in ["301 Moved Permanently", "302 Found", "303 See Other", "307 Temporary Redirect", "308 Permanent Redirect"] {
+        let (node, asked) = http_stub(status, format!("Location: {other}/v1/getinfo\r\n"), "{}");
+        let ln = LndRest::new(&node, &mac, None).unwrap();
+        let e = ln.get_info().expect_err(status);
+        assert!(e.msg.contains("redirect"), "{status}: {}", e.msg);
+        // a redirect is never "the node has no such payment" (that would release a booking)
+        assert!(ln.lookup(&"ab".repeat(32)).is_err(), "{status}");
+        assert!(ln.channels().is_err(), "{status}");
+        let req = SendRequest { invoice: "lnbcrt1".into(), fee_limit_sats: 1, timeout_s: 1, cltv_limit: 10, outgoing_chan_ids: vec!["1".into()] };
+        assert!(ln.send(&req).is_err(), "{status}");
+        assert_eq!(asked.lock().unwrap().len(), 4, "{status}: each call reached the node once");
+    }
+    let got = got.lock().unwrap();
+    assert!(got.is_empty(), "the redirect was followed, and the macaroon header went with it: {got:?}");
+}
+
+#[test]
+fn agp082_a_settled_payment_is_booked_at_no_less_than_the_invoice_amount() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let rig = LnRig::new(json!({}));
+    // the node's record of a settled payment says it cost nothing
+    rig.ln.set(|s| s.zero_amounts = true);
+    let (inv, hash) = rig.invoice(400, 1, XBT);
+    let r = rig.pay(&inv, 500);
+    assert_eq!(r["verdict"], "allow", "{r}");
+    assert_eq!(r["status"], "SUCCEEDED");
+    assert_eq!(r["charged_sats"], 400, "the invoice was paid: at least its amount is spent, whatever the node reports: {r}");
+    assert_eq!(rig.ledger_net(), 400, "403 booked, 3 of fee limit released, never the invoice amount");
+    assert_eq!(rig.s.ln_book.get(&hash).unwrap()["spent_sats"], 400);
+    // a node that reports more than the invoice is believed (it can only cost the budget more)
+    rig.ln.set(|s| {
+        s.zero_amounts = false;
+        s.fee_msat = 2_500;
+    });
+    let (inv, _) = rig.invoice(300, 2, XBT);
+    assert_eq!(rig.pay(&inv, 400)["charged_sats"], 303);
+    assert_eq!(rig.ledger_net(), 703);
+}
+
+#[test]
+fn agp082_a_settled_payment_without_the_preimage_of_its_hash_keeps_its_whole_booking_and_halts_the_rail() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let rig = LnRig::new(json!({}));
+    // SUCCEEDED, with amounts, but the preimage is not the payment hash's: nothing proves it settled
+    rig.ln.set(|s| s.wrong_preimage = true);
+    let (inv, hash) = rig.invoice(400, 1, XBT);
+    let r = rig.pay(&inv, 500);
+    assert_eq!(r["rule"], "ln_preimage", "{r}");
+    assert_eq!(r["charged_sats"], 403, "the whole booking stays: {r}");
+    assert_eq!(rig.ledger_net(), 403);
+    assert!(r.get("preimage").is_none(), "an unproven preimage is not handed on: {r}");
+    let rec = rig.s.ln_book.get(&hash).unwrap();
+    assert_eq!((&rec["state"], &rec["preimage_ok"], &rec["spent_sats"]), (&json!("settled"), &json!(false), &json!(403)), "{rec}");
+    // no proof of payment in the signature log
+    let sigs = rig.call("signatures", json!({"limit": 100}));
+    assert!(sigs["signatures"].as_array().unwrap().iter().all(|s| s["kind"] != "ln_payment"), "{sigs}");
+    assert_eq!(rig.audit("ln_preimage_mismatch").len(), 1);
+    // the rail is halted until the human resumes it
+    let st = rig.call("ln_status", json!({}));
+    assert_eq!(st["ready"], false, "{st}");
+    assert!(st["halted"]["reason"].as_str().unwrap().contains("preimage"), "{st}");
+    rig.ln.set(|s| s.wrong_preimage = false);
+    let (inv2, _) = rig.invoice(100, 2, XBT);
+    assert_eq!(rig.pay(&inv2, 200)["rule"], "ln_halted");
+    assert_eq!(rig.ln.sent(), 1);
+    // an empty preimage is no proof either
+    let rig = LnRig::new(json!({}));
+    let (inv, hash, _) = make_invoice(T0, "lnbcrt4u", 9, XBT, Some("coffee"), 3600);
+    let r = rig.pay(&inv, 500);
+    assert_eq!(r["rule"], "ln_preimage", "the fake node knows no preimage for {hash}: {r}");
+    assert_eq!(rig.ledger_net(), 403);
 }
