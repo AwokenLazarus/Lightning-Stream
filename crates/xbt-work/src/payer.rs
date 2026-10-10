@@ -7,6 +7,20 @@
 //! Prime key, and presents it with a fresh `n` and the request-bound `auth`. Each PAYMENT-RESPONSE
 //! is checked: the invoice, the request digest, the charge within the quote, and `spentWork`
 //! growing by exactly `charged`.
+//!
+//! Limits of this rail against someone between payer and provider (AGP-081, the closure audit of
+//! review T2 and T4), where it is below the channel rail:
+//!
+//! * The request binding is taken over the bare target (as the published XBT-053 vectors are): it
+//!   holds the method, path, query and body, and no scheme, host or port. A header captured on its
+//!   way to one origin authenticates, once, at any other origin that holds this invoice's key.
+//! * The PAYMENT-RESPONSE is not signed and covers neither the answer's status nor its body. The
+//!   client requires one on every call paid with work (xbt402's `Client`), and it must name this
+//!   invoice and request and move `spentWork` by `charged`, but whoever can alter the answer can
+//!   alter it too. What was paid for is checked by the provider's balance, not by this receipt.
+//!
+//! Run this rail over TLS to the provider. Raising it to the channel rail's level is a change to
+//! the xbt-work spec (a signed receipt with status and bodyHash, an origin in the binding).
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};

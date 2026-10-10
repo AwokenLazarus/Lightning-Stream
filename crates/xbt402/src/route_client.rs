@@ -623,6 +623,7 @@ impl RoutePayer {
     /// invoice (the hub never touches either).
     /// With a ledger, a session it holds for `url` is resumed instead (no new 402).
     pub fn shard(&self, url: &str, method: &str) -> Result<Arc<Shard>> {
+        crate::wire::no_fragment(url)?;
         if let Some(sh) = lk(&self.shards).get(url).cloned() {
             if self.ledger.is_some() {
                 return Ok(sh);
@@ -988,6 +989,7 @@ impl RoutePayer {
         let mut pl = pl.clone();
         pl["seq"] = ch.seq.into();
         let chan = ch.params.channel_id();
+        crate::wire::no_fragment(&self.hub_url)?;
         pl["auth"] = self.signer.request_auth(&chan, Some(&pl["seq"]), Some(&pl["cum"]), None, &request_digest_v2("POST", &format!("{}{HUB_ROUTE_PATH}", self.hub_url), body.as_bytes()))?.into();
         Ok(pl)
     }

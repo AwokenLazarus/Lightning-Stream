@@ -1130,7 +1130,8 @@ terms it was given, so a server-side check of one would never fire.
   `tagged_hash("xbt402/req/v2", f(method) ‖ f(scheme) ‖ f(host) ‖ f(port) ‖ f(target) ‖ f(body))`
   with `f(x) = LE64(len(x)) ‖ x`. Scheme and host are lowercased, the port is decimal or the
   scheme's default, userinfo and fragment are dropped. A provider reached at another origin, or a
-  `|` moved between target and body, gives another digest. A bare target binds no origin.
+  `|` moved between target and body, gives another digest. A bare target binds no origin. Since
+  AGP-081 a URL or target with a `#` is refused by payer and provider before the digest is taken.
 - The client binds `origin + path`, and the server binds the URL it rebuilt from the request.
 - Receipts are `tagged_hash("xbt402/receipt/v2", …)` over the length-prefixed chan, seq, cum,
   charged, spentMsat, req, status and bodyHash (sha256 of the body sent). The client checks status
@@ -1146,7 +1147,7 @@ terms it was given, so a server-side check of one would never fire.
 **HTTP server (`http-server` feature).** It is now `std::net`:
 
 - header lines are capped at 8 KiB and the header block at 32 KiB (431);
-- at most 64 connections, then 503;
+- at most 64 connections, then 503 (since AGP-081 at most 48 of them from one client address);
 - the head must arrive within 10 s (408) and the body within 30 s, both as absolute deadlines;
 - only Content-Length bodies (Transfer-Encoding gives 501), and `Expect: 100-continue` is honoured;
 - `Connection: close` on every answer;
@@ -1385,7 +1386,7 @@ workspace (`Cargo.lock` loses it; `cargo tree -i tiny_http` finds nothing).
 
 **Limits** (`xbt_svc::http::Limits::default()`, the same as AGP-068): 8 KiB header line and 32 KiB
 head (431), the head within 10 s (408) and the body within 30 s, both absolute; at most 64
-connections (503); Content-Length bodies only, at most the handler's `body_limit` (413 before a
+connections, 48 from one client address since AGP-081 (503); Content-Length bodies only, at most the handler's `body_limit` (413 before a
 body byte is read; Transfer-Encoding is 501); `Expect: 100-continue`; `Connection: close`.
 
 **What changed in the server while moving it:**
@@ -1735,6 +1736,187 @@ Without `--max-unpaid-blocks` the loss to a Prime that never pays is what it was
 (1,000 calls with the shipped defaults), once. For embedders: `WorkConfig` gains
 `max_unpaid_blocks`; the state file gains an optional `unpaid` (version stays 3; older state loads
 with no run); the freeze rules are applied again when the state loads.
+
+## Transport, light-client and rollover closure fixes (AGP-081)
+
+The closure audit of the external review (AGP-077, list 1 items 8, 9 and 10) found these still open
+on `main` (`68d9650`). Each is the neighbour of a path an earlier fix closed. B1 `agp-081`
+(`7e28c87`) and B2 `agp-081` (`542d0ca`) carry the same changes where they have the code, with the
+same test names (`test_` prefixed): B1 `tests/security/test_agp081_closure_audit.py` (receipt,
+fragment, per-address cap, the ASGI path held to loopback and documented as needing a proxy, and
+payers opening at `minExpiryBlocks + minConf + closeMarginBlocks`), B2
+`tests/test_agp081_closure_audit.py` (the Electrum limits, where B2 had no line limit at all, and
+the fragment), with B2's own measurements from `tests/e1_attacks.py`.
+
+**A paid answer needs its receipt (T4c).** `Client::request` checked a PAYMENT-RESPONSE only when
+the header was there: with it stripped on the way, any body passed as the paid answer.
+* An answer below 400 to a request that carried a payment, with no PAYMENT-RESPONSE, is
+  `bad_receipt` ("paid call returned no receipt"). Nothing is adopted from it.
+* An answer of 400 or above may have none (the provider's own failures carry no receipt). It goes
+  back as it is; the caller must not read it as the answer it paid for.
+
+| paying path | receipt |
+|---|---|
+| `Client::request` / `request_with`, channel | required below 400 (this change) |
+| `Client::request_conditional` | required below 400 (this change); the hash lock stays pending, so `recover_conditional` still reads k from the provider's claim |
+| `Client` with a scheme payer (`with_payer`, xbt-work) | required below 400 (this change); what it proves on that rail is less, see below |
+| `xbt-signer` `pay_once` (the wallet) | a missing or bad receipt below 400 is reported as `receipt_error` with `charged_sats` 0; the signed state stays booked, and the body goes to the agent marked untrusted, as every provider body does (unchanged) |
+| the stream's chunk calls (`xbt-signer`) | no receipt needed: each chunk is checked against the manifest's Merkle root before the state paying for it is signed (unchanged) |
+| `RoutePayer` (routed calls) | none per call, by design: a ROUTE-STATE is a running meter (a stated limit) |
+| close, rollover, open | control requests: their answers are checked against the transaction we signed |
+
+**A `#` in a URL or target (T2).** The digest drops a fragment and the server routes on the target
+as it arrives, so a payment for `/a` also authenticated `/a#b`. The digest and its vectors are
+unchanged; a `#` is refused on both sides (`xbt402::wire::no_fragment`):
+* payer, `bad_request` before anything is sent, numbered or signed: `Client::request`,
+  `request_conditional`, every payload it authenticates (`Client::auth`), `RoutePayer::shard` and its
+  hub URL, the wallet (`origin_of`, `with_auth`), a seller's `openUrl` / `closeUrl` / `chunkUrl`
+  (`seller_url`), and the provider origin of a routed lock at the hub;
+* provider, HTTP 400 before anything is authenticated or routed: `Provider::serve` (paid, control,
+  `/lock`, facilitator and other-scheme paths alike), `RouteHub::serve`, and the shared server
+  itself (`xbt_svc::http`, so the MCP, the UI and the relay too).
+
+**One address cannot hold every connection (T1).** The cap was one global number. `Limits` has
+`per_address` (default 48 of the 64): a client address above it gets 503 while other addresses are
+still served. An address is an IPv4 address (an IPv4-mapped IPv6 address counts as its IPv4) or an
+IPv6 /64. `XBT_HTTP_MAX_PER_ADDRESS` sets it for a process (0: no cap per address, for a server
+whose only peer is its reverse proxy; anything but a whole number stops the server from starting).
+* Why 48: behind a reverse proxy every connection comes from the proxy's address, so a low default
+  would cut such a deployment to a fraction of its slots, and one address that sends 32 slow heads
+  must still be able to make a request (the AGP-068 slowloris checks). 48 leaves 16 slots that one
+  address cannot take.
+* The limit that remains: four addresses fill the server. A public listener still belongs behind a
+  proxy or firewall with its own per-client limits.
+
+**One Electrum server cannot stall or exhaust the light client (E1).**
+* *Line limit, before parsing.* Every request has an answer cap from its method
+  (`conn::answer_cap`): bytes and JSON values. A line, complete or still arriving, is held to the
+  sum of the caps of the requests waiting on that connection plus 16 KiB for notifications, and to
+  8 MiB in any case (`MAX_LINE`, down from 64 MiB). A server that sends more is dropped and flagged.
+  The values bound (`values_in`: commas and opening brackets, plus one) is there because a dense
+  line costs many times its size as a parsed tree.
+
+  | request | bytes | values |
+  |---|---|---|
+  | `blockchain.block.headers` (n headers) | 4,096 + 328 n (2016: 665,344) | 64 |
+  | `blockchain.transaction.get` | 2,001,024 (a transaction of 1,000,000 bytes) | 64 |
+  | `blockchain.scripthash.get_history`, `listunspent` | 1,604,096 (10,000 entries) | 60,016 |
+  | `blockchain.transaction.get_merkle` | 8,192 | 128 |
+  | everything else, and each notification | 16,384 | 64 |
+
+* *Sync.* One server's part of a round ends at `Config::sync_deadline` (default four times the
+  request timeout), each request inside it waiting no longer than what is left, or at the first
+  answer with fewer headers than asked (all below the tip the server itself claimed). Either way
+  the headers it proved are kept and it is flagged. A batch that fails no longer drops the headers
+  proven before it.
+* *History and cache.* A history or unspent list of more than `MAX_HISTORY` (10,000) entries is not
+  used and its server is flagged. Transactions are fetched 16 per batch (`TX_BATCH`), not one batch
+  of everything. The transaction cache holds 32 MiB of raw transactions (`TX_CACHE_BYTES`), oldest
+  out first, and a cached proof goes with its transaction. A history entry that neither pays the
+  script nor spends an output that pays it flags the server that listed it. A history or unspent
+  call that no server answered is an error; before, it was an empty list.
+
+Measured with `crates/xbt-electrum/examples/e1_attacks.rs` on a Ryzen 9 9950X3D, release build, the
+hostile server in a child process, wall time and the client's peak resident memory. "Before" is the
+same file built in a worktree of `main` (`68d9650`):
+
+```
+for a in trickle bigline history "history 20000"; do
+  cargo run -q --release --offline -p xbt-electrum --example e1_attacks -- $a
+done
+```
+
+| attack | before | after |
+|---|---|---|
+| trickle: 120 headers, one per answer, 400 ms each, an honest server beside it; the first `block_count()` | 48.45 s, 4.0 MiB, no flag | 0.40 s, 4.0 MiB, flagged `withheld headers` |
+| a 16 MiB line of `[[],[],…]` ahead of one small answer | 0.62 s, 403.6 MiB, parsed, no flag | 0.005 s, 3.9 MiB, dropped at 32,768 bytes and flagged; the call fails |
+| 8,000 invented history entries, each served | 11.75 s, 28.8 MiB, 8,001 fetches, no flag | 11.55 s, 17.4 MiB, 8,001 fetches, flagged |
+| 20,000 invented history entries | 138.85 s, 64.4 MiB, 40,001 fetches, no flag | 0.03 s, 5.1 MiB, 1 fetch, dropped at the line cap and flagged; the call fails |
+
+The 8,000-entry row is under the bound, so its fetches still happen: what changed is that they come
+in batches of 16, stay inside the cache, and are flagged. Most of its time is the simulator's.
+
+Limits, stated: a script with more than 10,000 history entries, or a transaction above 1,000,000
+bytes, is not answered by this backend (every standard transaction is at most 400,000 bytes). An
+invented transaction that pays the script cannot be told from an unconfirmed payment, so that flag
+catches only entries unrelated to the script. A server that trickles full-size answers just inside
+the timeout is cut at the deadline every round, and with no honest server beside it the tip still
+advances only as fast as that server allows (`status()["tip_age_s"]`, and on mainnet the stale-tip
+rule, show it). A server whose `blockchain.block.headers` maximum is below 2016 is treated as
+withholding.
+
+**A rollover keeps its next channel from before the request leaves (C3).** `rollover_inner`
+returned at a failed POST before the next key was bound or a refund produced, while the provider
+may have broadcast the one transaction we signed: a client with a local key then held no key and no
+refund for the next channel.
+* The next channel is recorded in `Client::next_rolled` and saved to the injected ledger (record
+  `next <origin>`) before the POST. With a local key its refund is produced and handed to
+  `on_refund` at that point too.
+* With a signer, the key was always the signer's (`new_key`), and the wallet's signer binds a next
+  channel only once its own node shows the rollover (AGP-080). The record therefore carries the
+  funded params; the bind (`attach`) and the refund follow the reply. Before, an `attach` refused
+  `rollover_unproven` after a good reply lost the next channel's params as well.
+* `Client::adopt_rolled(origin, txid)` makes a recorded next channel the live one when the reply
+  was lost or an error and the embedder sees the rollover transaction on chain; then `open_rolled`
+  as usual. A record stays until it is adopted; one whose transaction can no longer confirm (the old
+  channel was closed another way) is the embedder's to remove from `next_rolled`.
+
+| path that signs a rollover | next channel kept |
+|---|---|
+| `Client::rollover`, local key | key, refund and record before the POST (this change) |
+| `Client::rollover`, signer (`RemoteSigner`, `LocalSigner`) | record before the POST; bound and refunded after the reply or by `adopt_rolled` (this change) |
+| the hub's ch2 rollover (`RouteHub`) | already safe: the next ch2, its key and its refund are written to the hub's book before the request (`hub.rs`, "write-ahead"), and only a 400/401/403 answer clears them |
+| `xbt-signer` `xbt402_new_key` / `xbt402_sign_rollover` | already safe on the signer's side: the issued key is sealed to disk at once as `pending:<origin>/next`, and `next` is checked at signing |
+
+**The xbt-work rail, stated limits.** Its request binding is taken over the bare target (as the
+published XBT-053 vectors are): no scheme, host or port. Its PAYMENT-RESPONSE is unsigned and covers
+neither the status nor the body. The client now requires that response on every call paid with
+work, and a `#` is refused as on the channel rail; raising the rest to the channel rail's level is
+a change to the xbt-work spec and its vectors, not made here. The module docs of `xbt_work::payer`
+say the same. Run this rail over TLS to the provider.
+
+**For embedders (cmp).**
+* A paid call below 400 with no PAYMENT-RESPONSE is now `Err(bad_receipt)`, and a URL with a `#` is
+  `Err(bad_request)`.
+* `xbt_svc::http::Limits` has a new field, `per_address`; `Limits::default()` sets it.
+* `xbt_electrum::Config` has a new field, `sync_deadline` (`None`: four times `timeout`), and
+  `MAX_LINE` is 8 MiB. `history`-backed calls (`tx_out`, `spending_tx`, `unspent`) return an error
+  when no server answered, where they returned "nothing" before.
+* After a failed `Client::rollover`, look at `next_rolled`: the refund of each record is the way
+  back for that next channel if its rollover confirms.
+
+Found and not fixed here: the hub's ch2 rollover writes the next ch2 ahead, but clears it when the
+provider answers 400, 401 or 403 ("refused: nothing was broadcast"). A provider that answers so
+and broadcasts anyway leaves the hub without the next ch2's key. Same in B1; a B1-only change is
+parked on B1 branch `agp-081-hub-rollover`, not reviewed, for a hub task in both languages.
+
+Noticed and not changed: after one answer lost on the way, the next receipt shows two calls' growth
+in `spentMsat` and the client refuses it `bad_receipt` (`Client::receipt` has no slack for a lost
+answer; the 402 path has one call of slack).
+
+Tests, each failing on `main` and passing here unless marked:
+* `xbt402/tests/lifecycle.rs`: `a_paid_answer_without_a_receipt_is_refused`,
+  `a_conditional_answer_without_a_receipt_is_refused`,
+  `a_target_with_a_fragment_is_refused_by_the_payer`,
+  `a_target_with_a_fragment_is_refused_by_the_provider`,
+  `a_rollover_binds_the_next_channel_before_the_request_leaves`; and, using the new
+  `adopt_rolled` (so they do not build on `main`),
+  `a_signer_backed_rollover_keeps_its_next_channel_until_the_signer_binds_it`,
+  `a_rollover_whose_reply_was_lost_is_adopted_from_the_chain`;
+* `xbt-work/tests/rail.rs`: `a_paid_answer_without_a_receipt_is_refused`;
+* `xbt-svc/tests/http_server.rs`: `one_address_cannot_hold_every_connection` (two addresses over a
+  dual-stack listener; without IPv6 loopback only its same-address half runs),
+  `a_target_with_a_fragment_is_refused`; unit tests in `http.rs`
+  (`an_address_at_its_cap_is_refused_and_no_other_is`,
+  `one_address_is_an_ipv4_address_or_an_ipv6_slash_64`);
+* `xbt-electrum/tests/backend.rs`: `a_trickled_header_sync_is_cut_off_and_flagged`,
+  `an_oversized_line_is_dropped_before_it_is_parsed`, `an_invented_history_is_bounded_and_flagged`,
+  and `a_slow_header_sync_ends_at_its_deadline` (uses the new `sync_deadline`); unit tests
+  `conn::tests::answer_caps_fit_the_largest_legitimate_answer`,
+  `conn::tests::values_in_never_undercounts`,
+  `backend::tests::the_transaction_cache_drops_the_oldest_at_its_cap`.
+
+New dependency: none (`cargo tree -d` is unchanged).
 
 ## Portability
 
