@@ -192,7 +192,8 @@ pub struct Provider {
 
 /// A hub's ch1 holds a routed lock that its best state does not cover (AGP-064): the one in flight
 /// (`route_lock`), or one written off (`stale_locks`) above the best state, which the hub may still
-/// have to pay on its ch2. Closing ch1 now would close below it.
+/// have to pay on its ch2. Closing ch1 now would close below it, and so would rolling it over: both
+/// spend its funding (AGP-078).
 fn locks_open(st: &ChannelState) -> bool {
     truthy(st.extra.get("route_lock"))
         || st.extra.get("stale_locks").and_then(Value::as_array).is_some_and(|s| {
@@ -1392,7 +1393,8 @@ impl Provider {
     }
 
     /// POST /x402/xbt-channel/rollover: co-sign and broadcast the payer's rollover, one tx that
-    /// pays this provider `amount` (at least its best state) and funds the next channel.
+    /// pays this provider `amount` (at least its best state) and funds the next channel. Refused
+    /// `lock_pending`, as a close is, while a routed lock is open on the channel, whatever `amount`.
     pub fn rollover(&self, req: &Value) -> Result<Value> {
         let cid = self.channel_id_of(Some(field(req, "chan")?))?;
         {
@@ -1441,6 +1443,11 @@ impl Provider {
         let mut st = l.channels[&cid].clone();
         if !st.closed_txid.is_empty() {
             return fail("channel_closing", "already settled");
+        }
+        // AGP-078 (H1, H2): a rollover spends the funding as a close does. Checked here, under the
+        // ledger lock that is held until the rollover is sent: route() writes its lock under it too
+        if locks_open(&st) {
+            return fail("lock_pending", "a routed lock is open on this channel");
         }
         if amount < st.best_cum {
             return fail("bad_amount", format!("a rollover pays at least the best state {}", st.best_cum));
