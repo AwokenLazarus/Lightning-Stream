@@ -1486,6 +1486,10 @@ impl Provider {
         if body.len() > self.body_limit(path, max_body) {
             return HttpResponse::text(400, "bad request framing or body over MAX_BODY");
         }
+        if crate::wire::no_fragment(path).is_err() {
+            // before anything is authenticated or routed (AGP-081, review T2)
+            return HttpResponse::text(400, "request target with a # fragment");
+        }
         let pk = path_key(path);
         if [FACILITATOR_SUPPORTED, FACILITATOR_VERIFY, FACILITATOR_SETTLE].contains(&pk) {
             let parsed = || crate::json::parse_slice(body).map_err(|e| ChannelError::new("bad_request", e.to_string()));

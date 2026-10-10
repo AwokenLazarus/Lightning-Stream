@@ -1074,6 +1074,10 @@ impl RouteHub {
         if body.len() > self.body_limit(path, max_body) {
             return HttpResponse::new(400, vec![], b"bad request framing or body over MAX_BODY".to_vec());
         }
+        if crate::wire::no_fragment(path).is_err() {
+            // as the provider does (AGP-081, review T2)
+            return HttpResponse::new(400, vec![], b"request target with a # fragment".to_vec());
+        }
         if path.split('?').next() == Some(HUB_ROUTE_PATH) {
             let hdr = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("PAYMENT-SIGNATURE")).map(|(_, v)| v.as_str()).filter(|v| !v.is_empty());
             if let (true, Some(h)) = (method == "POST", hdr) {
@@ -1165,7 +1169,8 @@ impl RouteHub {
             }
             let (d, f) = (py_int(rt.get("amount"))?, py_int(rt.get("fee"))?);
             let lock_id = py_str(Some(rt.get("lockId")?));
-            let provider = canon_origin(&py_str(Some(rt.get("provider")?)));
+            // no `#`: the lock sent on is bound to `provider + /x402/xbt-channel/lock` (AGP-081, T2)
+            let provider = Some(canon_origin(&py_str(Some(rt.get("provider")?)))).filter(|p| crate::wire::no_fragment(p).is_ok())?;
             Some(RouteReq { pl, rt, d, f, lock_id, provider })
         })();
         let Some(req) = parsed else { return e400("bad_payload", "") };

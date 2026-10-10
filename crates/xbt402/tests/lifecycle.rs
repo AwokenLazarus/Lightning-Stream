@@ -859,3 +859,272 @@ fn an_altered_conditional_answer_keeps_the_hash_lock() {
     let claim = sent.iter().find(|t| t.inputs[0].prevout.txid_hex() == closed[0]).expect("claim");
     assert_eq!(c.recover_conditional(O, claim).unwrap(), b"deliverable");
 }
+
+// --- AGP-081: closure audit, transport and channel side paths (T4c, T2, C3) -------------------
+
+/// `Local`, as someone between payer and provider: an answer to `/strip...` loses its
+/// PAYMENT-RESPONSE and gets another body (a conditional answer keeps its key); a request to
+/// `/frag...` reaches the provider with `#junk` appended to its target; a request to `/down...` is
+/// answered 500 with no receipt and never reaches the provider. Counts the requests it carried.
+struct Meddle(Arc<Provider>, Arc<Mutex<u32>>);
+
+impl Transport for Meddle {
+    fn request(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)]) -> Result<HttpResponse> {
+        *self.1.lock().unwrap() += 1;
+        let path = split_url(url).1;
+        if path.starts_with("/frag") {
+            return Ok(self.0.serve(method, &format!("{path}#junk"), headers, body, &format!("{url}#junk"), None));
+        }
+        if path.starts_with("/down") {
+            return Ok(HttpResponse::new(500, vec![], b"upstream down".to_vec()));
+        }
+        let mut r = Local(self.0.clone()).request(method, url, body, headers)?;
+        if path.starts_with("/strip") && r.status == 200 {
+            r.headers.retain(|(k, _)| !k.eq_ignore_ascii_case("PAYMENT-RESPONSE"));
+            if serde_json::from_slice::<Value>(&r.body).map(|v| v.get("preimage").is_none()).unwrap_or(true) {
+                r.body = b"a forged answer".to_vec();
+            }
+        }
+        Ok(r)
+    }
+}
+
+fn meddled(chain: &Arc<MemChain>, prov: &Arc<Provider>) -> (Client, Arc<Mutex<u32>>) {
+    let n = Arc::new(Mutex::new(0));
+    let c = Client::new(ClientConfig::new(NET), Box::new(Meddle(prov.clone(), n.clone())), Box::new(MemWallet(chain.clone())), Box::new(|| Ok(1_000)));
+    (c, n)
+}
+
+#[test]
+fn a_paid_answer_without_a_receipt_is_refused() {
+    let chain = MemChain::new();
+    let prov = provider_with(chain.clone(), ProviderConfig::new(NET), Ledger::in_memory());
+    let (mut c, _) = meddled(&chain, &prov);
+    c.request("GET", &format!("{O}/v1/q"), b"").unwrap();
+    // an error answer may carry no receipt (the provider's own failures have none): it comes back
+    // as it is, and the channel still pays where the answer arrives whole
+    let r = c.request("GET", &format!("{O}/down/q"), b"").unwrap();
+    assert_eq!((r.status, c.channels[O].receipts.len()), (500, 1));
+    assert_eq!(c.request("GET", &format!("{O}/v1/q"), b"").unwrap().status, 200);
+    let before = c.channels[O].clone();
+    let e = c.request("GET", &format!("{O}/strip/q"), b"").expect_err("a forged body with no receipt was taken as the paid answer");
+    assert_eq!(e.code, "bad_receipt", "{e}");
+    let ch = &c.channels[O];
+    assert_eq!((ch.spent_msat, ch.receipts.len(), ch.acked_cum), (before.spent_msat, before.receipts.len(), before.acked_cum),
+               "nothing is adopted from an answer without a receipt");
+}
+
+#[test]
+fn a_conditional_answer_without_a_receipt_is_refused() {
+    let chain = MemChain::new();
+    let prov = provider_with(chain.clone(), ProviderConfig::new(NET), Ledger::in_memory());
+    prov.offer_conditional("/strip/report", 1_000, b"deliverable", None);
+    let (mut c, _) = meddled(&chain, &prov);
+    c.request("GET", &format!("{O}/v1/q"), b"").unwrap();
+    let e = c.request_conditional("GET", &format!("{O}/strip/report"), b"").expect_err("a hash-locked sale was folded with no receipt");
+    assert_eq!(e.code, "bad_receipt", "{e}");
+    assert!(c.channels[O].pending_cond.is_some(), "the hash lock stays pending: the provider's claim still reveals k");
+}
+
+#[test]
+fn a_target_with_a_fragment_is_refused_by_the_payer() {
+    let chain = MemChain::new();
+    let prov = provider_with(chain.clone(), ProviderConfig::new(NET), Ledger::in_memory());
+    prov.offer_conditional("/v1/report", 1_000, b"deliverable", None);
+    let (mut c, sent) = meddled(&chain, &prov);
+    c.request("GET", &format!("{O}/v1/q"), b"").unwrap();
+    let (n, seq, signed) = (*sent.lock().unwrap(), c.channels[O].seq, c.channels[O].payer.signed);
+    for url in [format!("{O}/v1/q#x"), format!("{O}/v1/q?a=1#x"), format!("{O}#x"), format!("{O}/v1/q#")] {
+        let e = c.request("GET", &url, b"").expect_err(&url);
+        assert_eq!(e.code, "bad_request", "{url}: {e}");
+    }
+    assert_eq!(c.request_conditional("GET", &format!("{O}/v1/report#x"), b"").unwrap_err().code, "bad_request");
+    assert_eq!((*sent.lock().unwrap(), c.channels[O].seq, c.channels[O].payer.signed), (n, seq, signed),
+               "nothing is sent, numbered or signed for a URL the binding does not cover whole");
+    // an origin that was never paid is not opened for one either
+    assert_eq!(c.request("GET", "https://other.example/v1/q#x", b"").unwrap_err().code, "bad_request");
+    assert!(!c.channels.contains_key("https://other.example"));
+}
+
+#[test]
+fn a_target_with_a_fragment_is_refused_by_the_provider() {
+    let chain = MemChain::new();
+    let served = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = served.clone();
+    let handler = move |_: &str, p: &str, _: &[u8]| {
+        seen.lock().unwrap().push(p.to_string());
+        HttpResponse::new(200, vec![], b"x".to_vec())
+    };
+    let prov = Arc::new(Provider::new(chain.clone(), secret("provider payTo"), ProviderConfig::new(NET), Ledger::in_memory(), Box::new(|_, _| 150),
+                                      Box::new(handler)).unwrap());
+    let (mut c, _) = meddled(&chain, &prov);
+    c.request("GET", &format!("{O}/v1/q"), b"").unwrap();
+    // the payer signs for /frag/q; on the way `#junk` is appended: the digest dropped it, the
+    // handler was routed on it
+    let r = c.request("GET", &format!("{O}/frag/q"), b"");
+    assert!(!served.lock().unwrap().iter().any(|p| p.contains('#')), "a payment was served on a target the payer never sent: {:?}", served.lock().unwrap());
+    assert!(r.is_err() || r.is_ok_and(|r| r.status == 400));
+    // refused before anything is looked at: unpaid, control and facilitator paths alike
+    for (m, p) in [("GET", "/v1/q#x"), ("POST", "/x402/xbt-channel/open#x"), ("POST", "/x402/xbt-channel/lock#x"), ("GET", "/x402/supported#x"),
+                   ("GET", "/#"), ("GET", "/v1/q?a=1#x")] {
+        let r = prov.serve(m, p, &[], b"{}", &format!("{O}{p}"), None);
+        assert_eq!(r.status, 400, "{m} {p}: {}", String::from_utf8_lossy(&r.body));
+    }
+}
+
+/// A transport whose rollover reaches the provider (which broadcasts) while the reply is lost.
+struct LostRollover(Arc<Provider>);
+
+impl Transport for LostRollover {
+    fn request(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)]) -> Result<HttpResponse> {
+        let r = Local(self.0.clone()).request(method, url, body, headers)?;
+        if split_url(url).1 == "/x402/xbt-channel/rollover" {
+            return Err(ChannelError::new("transport_error", "connection reset"));
+        }
+        Ok(r)
+    }
+}
+
+/// A [`ClientLedger`] the test can read back.
+#[derive(Clone, Default)]
+struct Book(Arc<xbt402::client::MemoryClientLedger>);
+
+impl xbt402::client::ClientLedger for Book {
+    fn load(&self) -> Result<Vec<(String, Value)>> {
+        self.0.load()
+    }
+    fn save(&self, records: &[(String, Value)]) -> Result<()> {
+        self.0.save(records)
+    }
+}
+
+#[test]
+fn a_rollover_binds_the_next_channel_before_the_request_leaves() {
+    use xbt402::client::ClientLedger;
+    let chain = MemChain::new();
+    let prov = provider_with(chain.clone(), ProviderConfig::new(NET), Ledger::in_memory());
+    let book = Book::default();
+    let refunds = Arc::new(Mutex::new(Vec::<(String, u32)>::new()));
+    let kept = refunds.clone();
+    let mut c = Client::new(ClientConfig::new(NET), Box::new(LostRollover(prov.clone())), Box::new(MemWallet(chain.clone())), Box::new(|| Ok(1_000)))
+        .with_ledger(Box::new(book.clone())).unwrap();
+    c.on_refund = Some(Box::new(move |hex, expiry| kept.lock().unwrap().push((hex.to_string(), expiry))));
+    for _ in 0..4 {
+        c.request("GET", &format!("{O}/v1/q"), b"").unwrap();
+    }
+    let old = c.channels[O].payer.params.clone();
+    assert_eq!(c.rollover(O).unwrap_err().code, "transport_error");
+    // the provider broadcast the one transaction we signed: its output 1 is the next channel
+    let roll = chain.sent().last().unwrap().clone();
+    assert_eq!(roll.inputs[0].prevout.txid_hex(), old.funding_txid());
+    let next_cap = roll.outputs[1].value as u64;
+    let refund = refunds.lock().unwrap().iter().map(|(h, e)| (Tx::parse_hex(h).unwrap(), *e))
+        .find(|(t, _)| t.inputs[0].prevout.txid_hex() == roll.txid() && t.inputs[0].prevout.vout == 1);
+    let (refund, expiry) = refund.expect("no refund was produced for the next channel: its capacity has no way back");
+    assert_eq!(refund.locktime, expiry);
+    // and the book on disk holds the next channel with its key, so a restart can still use or refund it
+    let rec = book.load().unwrap().into_iter().find(|(k, _)| k == &format!("next {O}")).expect("the next channel was not saved").1;
+    let rec = rec.as_array().and_then(|a| a.first()).cloned().expect("one signed rollover");
+    assert_eq!(rec["params"]["capacity"], json!(next_cap));
+    assert_eq!(rec["key"].as_str().map(str::len), Some(64), "the next channel's key");
+    assert_eq!(Tx::parse_hex(rec["refund_hex"].as_str().unwrap()).unwrap().txid(), refund.txid());
+}
+
+/// A signer that, like the wallet's, binds a rollover's next channel only once its node shows the
+/// rollover (the flag): until then `attach` of `<origin>/next` is refused.
+struct LateAttach(xbt402::signer::LocalSigner, std::sync::atomic::AtomicBool);
+
+impl xbt402::signer::StateSigner for LateAttach {
+    fn new_key(&self, origin: &str) -> Result<xbt_primitives::ecdsa::PubkeyBytes> {
+        self.0.new_key(origin)
+    }
+    fn attach(&self, origin: &str, params: &xbt402::channel::ChannelParams) -> Result<String> {
+        if origin.ends_with("/next") && !self.1.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ChannelError::new("rollover_unproven", "this node does not show the rollover"));
+        }
+        self.0.attach(origin, params)
+    }
+    fn sign_state(&self, chan: &str, amount: u64) -> Result<Vec<u8>> {
+        self.0.sign_state(chan, amount)
+    }
+    fn sign_state_a3(&self, chan: &str, amount: u64) -> Result<Vec<u8>> {
+        self.0.sign_state_a3(chan, amount)
+    }
+    fn sign_rollover(&self, chan: &str, amount: u64, next_spk: &[u8], next_capacity: u64) -> Result<Vec<u8>> {
+        self.0.sign_rollover(chan, amount, next_spk, next_capacity)
+    }
+    fn sign_close(&self, chan: &str) -> Result<Vec<u8>> {
+        self.0.sign_close(chan)
+    }
+    fn sign_refund(&self, chan: &str) -> Result<String> {
+        self.0.sign_refund(chan)
+    }
+    fn request_auth(&self, chan: &str, seq: Option<&Value>, cum: Option<&Value>, sig: Option<&str>, req: &str) -> Result<String> {
+        self.0.request_auth(chan, seq, cum, sig, req)
+    }
+    fn sign_conditional(&self, chan: &str, uncond: u64, cond: &xbt402::conditional::ConditionalParams) -> Result<Vec<u8>> {
+        self.0.sign_conditional(chan, uncond, cond)
+    }
+}
+
+#[test]
+fn a_signer_backed_rollover_keeps_its_next_channel_until_the_signer_binds_it() {
+    use xbt402::client::ClientLedger;
+    use xbt402::signer::StateSigner;
+    let chain = MemChain::new();
+    let prov = provider_with(chain.clone(), ProviderConfig::new(NET), Ledger::in_memory());
+    let signer = Arc::new(LateAttach(xbt402::signer::LocalSigner::new(), false.into()));
+    let book = Book::default();
+    let refunds = Arc::new(Mutex::new(Vec::<String>::new()));
+    let kept = refunds.clone();
+    let dyn_signer: Arc<dyn StateSigner> = signer.clone();
+    let mut c = client(&chain, &prov).with_signer(dyn_signer).with_ledger(Box::new(book.clone())).unwrap();
+    c.on_refund = Some(Box::new(move |hex, _| kept.lock().unwrap().push(hex.to_string())));
+    for _ in 0..3 {
+        c.request("GET", &format!("{O}/v1/q"), b"").unwrap();
+    }
+    let old = c.channels[O].payer.params.clone();
+    // the provider answers and broadcasts; the signer's node has not seen the transaction yet
+    assert_eq!(c.rollover(O).unwrap_err().code, "rollover_unproven");
+    let roll = chain.sent().last().unwrap().clone();
+    assert_eq!(roll.inputs[0].prevout.txid_hex(), old.funding_txid());
+    let rec = book.load().unwrap().into_iter().find(|(k, _)| k == &format!("next {O}")).expect("the next channel was not saved").1;
+    assert_eq!(rec[0]["key"], json!("signer"));
+    assert_eq!((&rec[0]["params"]["funding_txid"], &rec[0]["params"]["funding_vout"]), (&json!(roll.txid()), &json!(1)), "{rec}");
+    assert_eq!(c.channels[O].payer.params.channel_id(), old.channel_id(), "the live channel is still the old one");
+    // a restart later, the node shows it: the signer binds the key, the refund is handed out, the channel is used
+    drop(c);
+    let dyn_signer: Arc<dyn StateSigner> = signer.clone();
+    let mut c = client(&chain, &prov).with_signer(dyn_signer).with_ledger(Box::new(book.clone())).unwrap();
+    let kept = refunds.clone();
+    c.on_refund = Some(Box::new(move |hex, _| kept.lock().unwrap().push(hex.to_string())));
+    assert_eq!(c.adopt_rolled(O, &roll.txid()).unwrap_err().code, "rollover_unproven");
+    signer.1.store(true, std::sync::atomic::Ordering::SeqCst);
+    c.adopt_rolled(O, &roll.txid()).unwrap();
+    assert!(refunds.lock().unwrap().iter().any(|h| {
+        let t = Tx::parse_hex(h).unwrap();
+        t.inputs[0].prevout.txid_hex() == roll.txid() && t.inputs[0].prevout.vout == 1
+    }), "no refund for the next channel");
+    assert!(c.next_rolled.is_empty() && book.load().unwrap().iter().all(|(k, _)| !k.starts_with("next ")));
+    c.open_rolled(O).unwrap();
+    assert_eq!(c.request("GET", &format!("{O}/v1/q"), b"").unwrap().status, 200);
+    assert_eq!(c.channels[O].payer.params.funding_txid(), roll.txid());
+}
+
+#[test]
+fn a_rollover_whose_reply_was_lost_is_adopted_from_the_chain() {
+    let chain = MemChain::new();
+    let prov = provider_with(chain.clone(), ProviderConfig::new(NET), Ledger::in_memory());
+    let mut c = Client::new(ClientConfig::new(NET), Box::new(LostRollover(prov.clone())), Box::new(MemWallet(chain.clone())), Box::new(|| Ok(1_000)));
+    for _ in 0..4 {
+        c.request("GET", &format!("{O}/v1/q"), b"").unwrap();
+    }
+    assert_eq!(c.rollover(O).unwrap_err().code, "transport_error");
+    let roll = chain.sent().last().unwrap().txid();
+    assert_eq!(c.adopt_rolled(O, &"00".repeat(32)).unwrap_err().code, "no_channel", "only a rollover this client signed");
+    c.adopt_rolled(O, &roll).unwrap();
+    c.open_rolled(O).unwrap();
+    assert_eq!(c.request("GET", &format!("{O}/v1/q"), b"").unwrap().status, 200);
+    assert_eq!(c.channels[O].payer.params.funding_txid(), roll);
+    assert!(c.next_rolled.is_empty() && c.pending_rolled.is_empty());
+}

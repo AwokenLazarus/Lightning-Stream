@@ -113,6 +113,17 @@ pub fn request_url(url: &str) -> RequestUrl {
     RequestUrl { scheme, host: host.to_ascii_lowercase(), port, target }
 }
 
+/// Refuse a URL or request target that holds a `#` (AGP-081, review T2). [`request_url`] drops a
+/// fragment, so a payment for `/a` would authenticate `/a#b` too, and a server routes on the target
+/// as it arrives. Payer and provider both call this before anything is signed, sent or served; the
+/// digest and its published vectors are unchanged.
+pub fn no_fragment(url: &str) -> Result<()> {
+    if url.contains('#') {
+        return fail("bad_request", "a URL with a # fragment is outside the request binding: not paid and not served");
+    }
+    Ok(())
+}
+
 /// `scheme://authority` of an absolute URL, or `""` for a bare target.
 pub fn url_origin(url: &str) -> &str {
     match url.find("://") {
@@ -222,11 +233,11 @@ pub fn safe_code(code: &str) -> bool {
 /// (`scheme://host[:port]`, the allowlisted one). The seller chooses this string, so it is never
 /// just appended: `@evil.example/open` after the origin is another host. Accepted: a path that
 /// starts with exactly one `/`, or an absolute URL on `origin`; no backslash, whitespace or
-/// control character either way. Returns `origin` + path.
+/// control character either way, and no `#` ([`no_fragment`]). Returns `origin` + path.
 pub fn seller_url(origin: &str, given: &str) -> Result<String> {
     let refuse = |why: &str| Err(ChannelError::new("seller_url", format!("the seller's URL {why}; refused before any request")));
-    if given.chars().any(|c| c == '\\' || c.is_whitespace() || c.is_control()) {
-        return refuse("has a backslash, a space or a control character");
+    if given.chars().any(|c| c == '\\' || c == '#' || c.is_whitespace() || c.is_control()) {
+        return refuse("has a backslash, a #, a space or a control character");
     }
     let origin = origin.trim_end_matches('/');
     let path = match given.strip_prefix(origin) {

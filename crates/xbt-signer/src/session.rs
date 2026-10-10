@@ -43,8 +43,12 @@ fn rt(msg: impl Into<String>) -> crate::Error {
     err("xbt402", msg)
 }
 
-/// `scheme://netloc` of an absolute URL.
+/// `scheme://netloc` of an absolute URL. A URL with a `#` is refused (AGP-081, review T2: the
+/// request binding does not cover a fragment).
 pub fn origin_of(url: &str) -> Result<String> {
+    if url.contains('#') {
+        return Err(err("dest", "a URL with a # fragment is not paid: the fragment is outside the request binding"));
+    }
     let (scheme, rest) = url.split_once("://").ok_or_else(|| err("dest", "xbt402_pay needs an absolute URL"))?;
     let netloc = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
     if scheme.is_empty() || netloc.is_empty() || !scheme.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c)) {
@@ -420,6 +424,7 @@ impl Session {
 
     /// H3: bind this payload to (method, path, body). The ECDH key stays in the book.
     fn with_auth(&self, payload: &mut Value, method: &str, url: &str, body: &[u8]) -> Result<()> {
+        xbt402::wire::no_fragment(url)?;
         let req = request_digest_v2(method, url, body);
         let chan = py_str(payload.get("chan"));
         let sig = payload.get("sig").and_then(Value::as_str).map(str::to_string);
@@ -513,6 +518,8 @@ impl Session {
     }
 
     fn pay_once_inner(&self, url: &str, method: &str, body: &[u8], max_sats: i64, expiry_blocks: i64, cap_sats: i64) -> Result<Value> {
+        // AGP-081 (review T2): before the first request, so nothing is opened or signed for it
+        xbt402::wire::no_fragment(url)?;
         let dest = origin_of(url)?;
         let t0 = Instant::now();
         let cap = body_cap();

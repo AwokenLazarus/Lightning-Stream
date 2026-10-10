@@ -413,3 +413,37 @@ fn carry_that_keeps_growing_stops_credit() {
     // the next one (header up front) turns it into the payer's error
     assert_eq!(client.request("GET", &format!("{API}/v1/y"), b"").unwrap_err().code, "carry_growing");
 }
+
+/// `T`, as someone between payer and provider: an answer to `/strip...` loses its PAYMENT-RESPONSE
+/// and gets another body.
+struct Strip(T);
+
+impl Transport for Strip {
+    fn request(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)]) -> XResult<HttpResponse> {
+        let mut r = self.0.request(method, url, body, headers)?;
+        if url.contains("/strip") && r.status == 200 {
+            r.headers.retain(|(k, _)| !k.eq_ignore_ascii_case("PAYMENT-RESPONSE"));
+            r.body = b"a forged answer".to_vec();
+        }
+        Ok(r)
+    }
+}
+
+/// AGP-081 (closure audit, T4c): the client takes a call paid with work only with its
+/// PAYMENT-RESPONSE, as it does a channel call. What that response proves on this rail is less: see
+/// the limits in `xbt_work::payer`.
+#[test]
+fn a_paid_answer_without_a_receipt_is_refused() {
+    let w = World::new(None);
+    let payer = w.payer();
+    let inv = payer.prepare(&w.t, &format!("{API}/v1/pools")).unwrap().invoice_id().to_string();
+    w.credit(&inv, 5, 25, 101, 103);
+    let mut client = Client::new(ClientConfig::new(NET), Box::new(Strip(w.t.clone())), Box::new(NoWallet), Box::new(|| Ok(200))).with_payer(payer.clone());
+    assert_eq!(client.request("GET", &format!("{API}/v1/pools"), b"").unwrap().status, 200);
+    let spent = payer.session(API).unwrap().spent;
+    let e = client.request("GET", &format!("{API}/strip/q"), b"").expect_err("a forged body with no receipt was taken as the paid answer");
+    assert_eq!(e.code, "bad_receipt", "{e}");
+    assert_eq!(payer.session(API).unwrap().spent, spent, "nothing is adopted from an answer without a receipt");
+    // a fragment is refused before the payer builds a header for it
+    assert_eq!(client.request("GET", &format!("{API}/v1/pools#x"), b"").unwrap_err().code, "bad_request");
+}
