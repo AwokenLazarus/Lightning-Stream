@@ -11,7 +11,7 @@
 //!                   [--audit-depth K | off [--audit-from H]]   (audit every block K deep on its own)
 //!                   [--cap-invoice W | --cap-invoice-sats S | --cap-invoice-calls N | off]
 //!                   [--cap-total ... ]   (the same four forms)
-//!                   [--max-carry-sats S | off] [--carry-growth-blocks N]
+//!                   [--max-carry-sats S | off] [--carry-growth-blocks N] [--max-unpaid-blocks N]
 //!                   [--prime-window N] [--prime-window-min-work W] [--window-tolerance-bps N]
 //!                   [--prime-fee-bps N] [--prime-min-payout S]
 //!                   [--max-unfunded-per-client N] [--trust-forwarded]
@@ -47,13 +47,18 @@
 //! (default 500), `--prime-fee-bps` (default 0, the fee the provider prices with) and
 //! `--prime-min-payout` (default 546). Every flag also reads an env variable: `XBT_WORK_CAP_INVOICE`,
 //! `XBT_WORK_CAP_INVOICE_SATS`, `XBT_WORK_CAP_INVOICE_CALLS`, the same for `_TOTAL`,
-//! `XBT_WORK_MAX_CARRY_SATS`, `XBT_WORK_CARRY_GROWTH_BLOCKS`, `XBT_WORK_AUDIT_DEPTH`, `XBT_WORK_NTA=1`,
+//! `XBT_WORK_MAX_CARRY_SATS`, `XBT_WORK_CARRY_GROWTH_BLOCKS`, `XBT_WORK_MAX_UNPAID_BLOCKS`, `XBT_WORK_AUDIT_DEPTH`, `XBT_WORK_NTA=1`,
 //! `XBT_WORK_PRIME_WINDOW`, `XBT_WORK_PRIME_WINDOW_MIN_WORK`, `XBT_WORK_WINDOW_TOLERANCE_BPS`,
 //! `XBT_WORK_PRIME_FEE_BPS`, `XBT_WORK_PRIME_MIN_PAYOUT`, `XBT_WORK_MAX_UNFUNDED_PER_CLIENT`.
 //!
 //! The audit loop audits every block (review P4): a block that paid the identity with no statement,
 //! or with one the audit refuses, fails and distrusts the Prime; a Prime or node it cannot reach
-//! stops the pass, which resumes at that block. Before each
+//! stops the pass, which resumes at that block. A block that paid the identity nothing and has no
+//! statement has no verdict (it may be any pool's), but while credit is unpaid it is counted
+//! (AGP-084): the report's `unpaidBlocks` is the run of them since a coinbase last paid for credit.
+//! `--max-unpaid-blocks N` stops new credit once the run reaches N, until a coinbase pays; it is off
+//! unless set, because N depends on how often the Prime's pool finds a block. A statement the Prime
+//! signed for such a block and the audit refuses is a failed audit, as on a paid block. Before each
 //! pass it compares the audited blocks with the node and undoes the audit of any reorged one.
 //!
 //! Admin (only with --admin, only from a loopback peer): `POST /admin/xbt-work/audit` with
@@ -313,6 +318,7 @@ fn main() {
         wcfg.max_owed_carry_sats = m;
     }
     wcfg.carry_growth_blocks = num("--carry-growth-blocks", "XBT_WORK_CARRY_GROWTH_BLOCKS");
+    wcfg.max_unpaid_blocks = num("--max-unpaid-blocks", "XBT_WORK_MAX_UNPAID_BLOCKS");
     wcfg.max_unfunded_per_client = match num::<usize>("--max-unfunded-per-client", "XBT_WORK_MAX_UNFUNDED_PER_CLIENT") {
         Some(0) => None,
         Some(n) => Some(n),

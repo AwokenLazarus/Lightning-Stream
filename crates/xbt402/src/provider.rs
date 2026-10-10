@@ -201,6 +201,21 @@ fn locks_open(st: &ChannelState) -> bool {
         })
 }
 
+/// A close or rollover of this channel was signed and written ahead (`close_intent`, M8) and is not
+/// recorded as its close yet: the node answered the broadcast with an error, or we stopped before
+/// its answer. That transaction is complete and can still confirm, so the channel takes no state
+/// above it (AGP-084): no paid call, no routed lock. It ends when the node shows the spend
+/// ([`Provider::adopt_intent`]), when the watcher gets a close through, or when the client rolls
+/// over or closes again.
+pub(crate) fn intent_open(st: &ChannelState) -> bool {
+    st.closed_txid.is_empty() && truthy(st.extra.get("close_intent"))
+}
+
+/// The channel is closed, or a spend of it may be on its way (see [`intent_open`]).
+pub(crate) fn closing(st: &ChannelState) -> bool {
+    !st.closed_txid.is_empty() || intent_open(st)
+}
+
 /// A direct call between its reservation and its settlement (AGP-059). Dropped unsettled (the
 /// handler or the charge panicked), it refunds the reservation: nothing was charged.
 struct InCall<'a> {
@@ -813,6 +828,12 @@ impl Provider {
         if st.closed_txid.is_empty() && locks_open(&st) {
             return fail("lock_pending", "a routed lock is open on this channel");
         }
+        // AGP-084: an earlier spend the node has after all is this channel's close, before a new
+        // close replaces its intent
+        if let Err(e) = self.adopt_intent(&mut l, &mut st) {
+            l.channels.insert(cid.clone(), st);
+            return Err(e);
+        }
         if truthy(req.get("payload")) && st.closed_txid.is_empty() {
             let r = self.apply(&mut st, &req["payload"]);
             if let Err(e) = r {
@@ -881,6 +902,11 @@ impl Provider {
             return Ok(false);
         }
         self.closed(l, st, &hx, &txid, truthy(intent.get("cond")))?;
+        if let Some(next) = intent.get("next").filter(|n| truthy(Some(n))) {
+            // a rollover (AGP-084): the next channel is the one this tx funds
+            st.extra.insert("rollover_to".into(), next.clone());
+            self.save_state(l, st)?;
+        }
         Ok(true)
     }
 
@@ -1202,6 +1228,16 @@ impl Provider {
             }
             return Ok(());
         }
+        // AGP-084: a close the node answered with an error is sent again every tick. The channel
+        // takes no state until then, so it is the same close. Never a rollover: its client was
+        // told it failed and may no longer hold the next channel's key
+        if intent_open(st) && !truthy(st.extra.get("close_intent").and_then(|i| i.get("next"))) && !locks_open(st) {
+            out.push(self.close_locked(l, st)?);
+            if truthy(st.extra.get("cond_close")) {
+                self.claim(st)?;
+            }
+            return Ok(());
+        }
         let utxo = self.chain.get_tx_out(&p.funding_txid(), p.funding_vout(), false)?;
         st.suspended = utxo.map(|u| u.confirmations < self.cfg.policy.conf_for(p.capacity)).unwrap_or(true);
         if let Some(mut zc) = st.extra.get("zero_conf").filter(|z| z.is_object()).cloned() {
@@ -1357,7 +1393,7 @@ impl Provider {
                 st.best_sig = sig_hex.to_string();
                 self.save_state(&mut l, &st)?;
             }
-            if !st.closed_txid.is_empty() || height as i64 >= st.params.expiry as i64 - self.cfg.close_margin as i64 {
+            if closing(&st) || height as i64 >= st.params.expiry as i64 - self.cfg.close_margin as i64 {
                 return fail("channel_closing", "");
             }
             if st.suspended {
@@ -1441,6 +1477,12 @@ impl Provider {
         tx.inputs[0].witness = vec![sig, sign_with_type(&self.chan_secret(&p)?, &digest, SIGHASH_ALL_UNIFIED), vec![0x01], p.script()];
         let mut l = lock(&self.ledger);
         let mut st = l.channels[&cid].clone();
+        // AGP-084: an earlier spend the node has after all is this channel's close, before this
+        // rollover replaces its intent
+        if let Err(e) = self.adopt_intent(&mut l, &mut st) {
+            l.channels.insert(cid.clone(), st);
+            return Err(e);
+        }
         if !st.closed_txid.is_empty() {
             return fail("channel_closing", "already settled");
         }
@@ -1453,7 +1495,7 @@ impl Provider {
             return fail("bad_amount", format!("a rollover pays at least the best state {}", st.best_cum));
         }
         let txid = tx.txid();
-        st.extra.insert("close_intent".into(), json!({"hex": tx.to_hex(), "txid": txid, "cond": false}));
+        st.extra.insert("close_intent".into(), json!({"hex": tx.to_hex(), "txid": txid, "cond": false, "next": format!("{txid}:1")}));
         self.save_state(&mut l, &st)?;
         if let Err(e) = self.chain.send_raw_transaction(&tx.to_hex()) {
             if !self.tx_known(&txid, &tx) {
@@ -1603,7 +1645,7 @@ impl Provider {
                     return HttpResponse::json(500, &json!({"error": "node_error", "detail": e.to_string()}));
                 }
             };
-            if !st.closed_txid.is_empty() || height as i64 >= st.params.expiry as i64 - self.cfg.close_margin as i64 {
+            if closing(&st) || height as i64 >= st.params.expiry as i64 - self.cfg.close_margin as i64 {
                 return refuse(&mut l, &st, "channel_closing", price);
             }
             if st.suspended {

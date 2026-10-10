@@ -149,6 +149,12 @@ pub struct WorkConfig {
     /// §10.3: owed carry grew over each of the last N audited blocks: stop new credit (set it when the
     /// provider attests every tip, so growth means the Prime is not paying).
     pub carry_growth_blocks: Option<usize>,
+    /// AGP-084: stop new credit once this many blocks in a row, since a coinbase last paid for
+    /// credit, paid the identity nothing and had no statement while credit was unpaid
+    /// ([`WorkProvider::audit_chain`]); a block that pays for credit lifts it. None (the default):
+    /// never. Such blocks include every other pool's, so set it only from the rate at which the
+    /// Prime's pool finds blocks.
+    pub max_unpaid_blocks: Option<u32>,
     /// The chain enforces payee attestation (§13.8): the identity must be a key-path P2TR address.
     pub nta: bool,
     /// The Prime's published pool terms: every window statement is held to them (AGP-065).
@@ -169,7 +175,7 @@ impl WorkConfig {
         Self { network: network.into(), identity: canonical_identity(identity), prime_id, prime_pubkey_hex: prime_pubkey_hex.into(),
                receipt_url: receipt_url.into(), relay_url: None, amount: Amount::Fixed(1), invoice_price_sats: 0,
                invoice_ttl_secs: 3600, max_unfunded: 10_000, max_timeout_secs: 3600, state_path: None, caps: CreditCaps::default(),
-               max_owed_carry_sats: None, carry_growth_blocks: None, nta: false, terms: PrimeTerms::default(), invoice_grace_secs: 3600,
+               max_owed_carry_sats: None, carry_growth_blocks: None, max_unpaid_blocks: None, nta: false, terms: PrimeTerms::default(), invoice_grace_secs: 3600,
                max_unfunded_per_client: Some(16), trust_forwarded: false }
     }
 
@@ -209,7 +215,36 @@ struct State {
     /// Set once the Prime key equivocated or failed an audit: its receipts are no longer accepted
     /// (§9.1 step 7, §13.1).
     distrust: Option<(String, String)>,
+    /// AGP-084: the run of blocks, since a coinbase last paid for credit, that paid the identity
+    /// nothing and had no usable statement while credit was unpaid.
+    unpaid: Option<UnpaidRun>,
 }
+
+/// Blocks `from..=to` of which `count` paid the identity nothing with no statement the audit could
+/// run on (`refused` of them had one it refused). They carry no verdict: the provider cannot tell
+/// the Prime's block from another pool's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UnpaidRun {
+    from: u32,
+    to: u32,
+    count: u32,
+    refused: u32,
+}
+
+impl UnpaidRun {
+    fn to_json(self) -> Value {
+        obj([("from", self.from.into()), ("to", self.to.into()), ("count", self.count.into()), ("refused", self.refused.into())])
+    }
+
+    fn from_json(v: &Value) -> Option<Self> {
+        let n = |k: &str| v.get(k).and_then(Value::as_u64).and_then(|x| u32::try_from(x).ok());
+        Some(Self { from: n("from")?, to: n("to")?, count: n("count")?, refused: n("refused")? })
+    }
+}
+
+/// The refusals that come after the statement verified under the pinned Prime key, for this Prime
+/// and this block: the Prime itself says the block is its own (AGP-084).
+const SIGNED_FOR_THE_BLOCK: [&str; 2] = ["bad_window", "window_start_regressed"];
 
 /// The `xbt-work` rail of a provider.
 pub struct WorkProvider {
@@ -278,7 +313,7 @@ impl WorkProvider {
         let mut book = ReceiptBook::new(&cfg.identity, pubkey, cfg.prime_id);
         book.caps = cfg.caps;
         cfg.terms.bounds(&ChainBlock { height: 0, hash: String::new(), value_sats: 0, paid_sats: 0, bits: 0x1d00ffff, prev_bits: 0x1d00ffff })?;
-        let st = State { invoices: HashMap::new(), book, carry: CarryLedger::default(), audits: vec![], distrust: None };
+        let st = State { invoices: HashMap::new(), book, carry: CarryLedger::default(), audits: vec![], distrust: None, unpaid: None };
         let wp = Self { pubkey, rule: Mutex::new(cfg.amount.clone()), state: Mutex::new(st), generation: AtomicU64::new(0), writer: Mutex::new(0), cfg };
         wp.load()?;
         wp.carry_rules(&mut wp.lock());
@@ -291,6 +326,8 @@ impl WorkProvider {
             Some("carry_cap".into())
         } else if self.cfg.carry_growth_blocks.is_some_and(|n| st.carry.keeps_growing(n)) {
             Some("carry_growing".into())
+        } else if self.cfg.max_unpaid_blocks.is_some_and(|n| st.unpaid.is_some_and(|u| u.count >= n)) {
+            Some("unpaid_blocks".into())
         } else {
             None
         };
@@ -542,9 +579,13 @@ impl WorkProvider {
         if !o.ok && st.distrust.is_none() {
             st.distrust = Some(("wrong_prime".into(), format!("the Prime's coinbase at height {h} failed the audit")));
         }
-        self.carry_rules(&mut st);
         let paid_for = if o.ok { paid_for } else { 0 };
         let covered = st.book.pay(h, paid_for);
+        if paid_for > 0 {
+            // a coinbase paid for credit: the run of unpaid blocks ends here (AGP-084)
+            st.unpaid = None;
+        }
+        self.carry_rules(&mut st);
         st.book.release_held();
         let mut rec = obj([("height", h.into()), ("blockHash", block.hash.clone().into()), ("ok", o.ok.into()),
                            ("expectedSats", o.expected_sats.into()), ("paidSats", block.paid_sats.into()), ("deferredSats", o.deferred_sats.into()),
@@ -563,8 +604,12 @@ impl WorkProvider {
     /// garbage is never treated more gently than silence (AGP-079). With no statement, a coinbase
     /// that paid the identity fails the audit (the Prime paid as the pool but will not say for
     /// what) and distrusts the Prime; one that paid nothing has no verdict (the provider cannot
-    /// tell a pool block from another pool's), records nothing and covers nothing: its credit stays
-    /// unaudited, inside the caps, until some coinbase pays for it. Returns None for that case.
+    /// tell a pool block from another pool's) and covers nothing: its credit stays unaudited,
+    /// inside the caps, until some coinbase pays for it. Returns None for that case. While credit
+    /// is unpaid such a block is counted (AGP-084: the report's `unpaidBlocks`, and
+    /// [`WorkConfig::max_unpaid_blocks`]). The exception is a refused statement that verified
+    /// under the pinned key for this Prime and this block (`SIGNED_FOR_THE_BLOCK`): the Prime
+    /// says the block is its own, so it fails the audit and distrusts the Prime whatever it paid.
     pub fn audit_chain(&self, block: &ChainBlock, stmt: Statement<'_>) -> Result<Option<AuditOutcome>> {
         let refused = match stmt {
             Statement::Found(sw, deferred) => match self.audit(sw, deferred, block) {
@@ -574,7 +619,9 @@ impl WorkProvider {
             },
             Statement::Missing => None,
         };
-        if block.paid_sats == 0 {
+        let signed = refused.as_ref().is_some_and(|e| SIGNED_FOR_THE_BLOCK.contains(&e.code.as_str()));
+        if block.paid_sats == 0 && !signed {
+            self.unpaid_block(block.height, refused.is_some())?;
             return Ok(None);
         }
         let mut st = self.lock();
@@ -583,7 +630,8 @@ impl WorkProvider {
         let (code, why) = match &refused {
             Some(e) => {
                 rec["refusedStatement"] = e.to_string().into();
-                ("refused_statement", format!("the coinbase at height {} paid the identity under a window statement the audit refuses: {e}", block.height))
+                let paid = if block.paid_sats == 0 { "paid the identity nothing" } else { "paid the identity" };
+                ("refused_statement", format!("the coinbase at height {} {paid} under a window statement the audit refuses: {e}", block.height))
             }
             None => {
                 rec["missingStatement"] = true.into();
@@ -599,6 +647,30 @@ impl WorkProvider {
         self.record(&mut st, rec)?;
         Ok(Some(AuditOutcome { ok: false, expected_sats: 0, paid_sats: block.paid_sats, deferred_sats: 0, below_min_sats: 0, proven_work: 0,
                                window_work: 0, fee_bps: 0, min_payout: 0, bounded: false, proof: None }))
+    }
+
+    /// Count a block that paid the identity nothing and had no statement the audit could run on
+    /// (AGP-084). Only while credit is unpaid: with nothing owed it is nobody's debt. A height at
+    /// or below the run's last one was counted already (the audit walks a range again after a node
+    /// error, and the admin audit takes any range).
+    fn unpaid_block(&self, height: u32, refused: bool) -> Result<()> {
+        let mut st = self.lock();
+        if st.book.unaudited_work(None) == 0 {
+            if st.unpaid.take().is_some() {
+                self.carry_rules(&mut st);
+                st.book.release_held();
+                self.save(&st)?;
+            }
+            return Ok(());
+        }
+        let run = match st.unpaid {
+            Some(u) if height <= u.to => return Ok(()),
+            Some(u) => UnpaidRun { to: height, count: u.count.saturating_add(1), refused: u.refused.saturating_add(u32::from(refused)), ..u },
+            None => UnpaidRun { from: height, to: height, count: 1, refused: u32::from(refused) },
+        };
+        st.unpaid = Some(run);
+        self.carry_rules(&mut st);
+        self.save(&st)
     }
 
     fn record(&self, st: &mut MutexGuard<'_, State>, rec: Value) -> Result<()> {
@@ -668,6 +740,7 @@ impl WorkProvider {
                           ("maxOwedCarrySats", caps(self.cfg.max_owed_carry_sats)),
                           ("frozen", st.book.frozen.clone().map(Value::from).unwrap_or(Value::Null))]);
         obj([("audits", st.audits.clone().into()), ("carry", st.carry.to_json()), ("credit", credit),
+             ("unpaidBlocks", st.unpaid.map(UnpaidRun::to_json).unwrap_or(Value::Null)),
              ("distrust", st.distrust.as_ref().map(|(c, m)| obj([("code", c.clone().into()), ("why", m.clone().into())])).unwrap_or(Value::Null)),
              ("equivocations", st.book.fraud.iter().map(|e| e.to_json()).collect::<Vec<_>>().into()),
              ("intervals", st.book.to_json()["intervals"].clone())])
@@ -710,7 +783,8 @@ impl WorkProvider {
                        ("book", st.book.to_json()), ("audits", st.audits.clone().into()),
                        ("carry", obj([("deferred", st.carry.deferred_total.into()), ("released", st.carry.released_total.into()),
                                       ("blocks", st.carry.blocks.iter().map(|(h, e, p, d)| Value::from(vec![Value::from(*h), Value::from(*e), Value::from(*p), Value::from(*d)])).collect::<Vec<_>>().into())])),
-                       ("distrust", st.distrust.as_ref().map(|(c, m)| Value::from(vec![c.clone(), m.clone()])).unwrap_or(Value::Null))])
+                       ("distrust", st.distrust.as_ref().map(|(c, m)| Value::from(vec![c.clone(), m.clone()])).unwrap_or(Value::Null)),
+                       ("unpaid", st.unpaid.map(UnpaidRun::to_json).unwrap_or(Value::Null))])
     }
 
     fn load(&self) -> Result<()> {
@@ -755,6 +829,12 @@ impl WorkProvider {
             st.carry.blocks.push((f(0)? as u32, f(1)?, f(2)?, f(3)?));
         }
         st.distrust = v.get("distrust").and_then(Value::as_array).and_then(|a| Some((a.first()?.as_str()?.to_string(), a.get(1)?.as_str()?.to_string())));
+        // absent in state written before AGP-084: no run; present, it must read
+        st.unpaid = match v.get("unpaid") {
+            None | Some(Value::Null) => None,
+            Some(u) => Some(UnpaidRun::from_json(u).ok_or_else(|| bad("unpaid"))?),
+        };
+        self.carry_rules(&mut st);
         Ok(())
     }
 

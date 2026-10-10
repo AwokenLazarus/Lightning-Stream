@@ -1215,7 +1215,8 @@ impl RouteHub {
             Ok(h) => h,
             Err(e) => return Err(err(500, "node_error", &e.to_string(), json!({}))),
         };
-        if !st1.closed_txid.is_empty() || height as i64 >= st1.params.expiry as i64 - self.cfg.close_margin as i64 {
+        // AGP-084: a ch1 close or rollover the node errored on can still confirm: no lock above it
+        if crate::provider::closing(st1) || height as i64 >= st1.params.expiry as i64 - self.cfg.close_margin as i64 {
             return Err(e400("channel_closing", ""));
         }
         if st1.suspended {
@@ -1820,7 +1821,8 @@ impl RouteHub {
 
     /// Bound a provider's /terms before the hub funds anything (AGP-037): (capacity, blocks) or
     /// `bad_terms`. A provider must not be able to set a ch2 the hub can never use or get back: an
-    /// expiry decades away, a close fee that eats the capacity, a minConf never reached.
+    /// expiry decades away, a close fee that eats the capacity, a minConf never reached. `bad_config`
+    /// when `max_lock_sat` is more than half of the capacity it would be funded with (AGP-084).
     pub fn ch2_terms(&self, terms: &Value, capacity: Option<u64>, expiry_blocks: Option<u32>) -> Result<(u64, u32)> {
         let c = &self.cfg;
         let bad = |w: &str| ChannelError::new("bad_terms", format!("malformed /terms: {w}"));
@@ -1839,6 +1841,11 @@ impl RouteHub {
         let max_blocks = if c.ch2_max_expiry_blocks > 0 { c.ch2_max_expiry_blocks as u64 } else { 2 * c.ch2_expiry_blocks as u64 };
         let max_min_cap = if c.ch2_max_min_capacity > 0 { c.ch2_max_min_capacity } else { c.ch2_capacity };
         let cap = capacity.unwrap_or(c.ch2_capacity).max(min_cap);
+        // AGP-084: AGP-064's bound (a lock is at most half of a ch2) against the capacity this ch2
+        // is funded with, which the caller may have chosen below the configured one
+        if c.max_lock_sat.saturating_mul(2) > cap {
+            return fail("bad_config", format!("max_lock_sat {} must be at most half of this ch2's capacity {cap}", c.max_lock_sat));
+        }
         let why = if close_fee > c.ch2_max_close_fee_sat {
             format!("closeFeeSat {close_fee} > ch2_max_close_fee_sat {}", c.ch2_max_close_fee_sat)
         } else if close_fee.saturating_mul(c.ch2_close_fee_multiple) > cap {

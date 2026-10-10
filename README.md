@@ -1661,6 +1661,81 @@ Tests, each failing on `main` and passing here (B1: `tests/security/test_agp078_
   `t4b_a_seq_spent_on_a_refused_lock_survives_a_provider_restart`,
   `hub_bounds_max_lock_sat_however_its_config_was_built`.
 
+## Fix wave 2 leftovers: an errored ch1 spend, the lock bound per ch2, unpaid blocks (AGP-084)
+
+Three things AGP-078 and AGP-079 reported as found and not fixed. B1 has the two hub items with the
+same test names (`tests/security/test_agp084_hub_leftovers.py`); pay-with-work is Rust only.
+
+| item | before | now | tests |
+|---|---|---|---|
+| a ch1 close or rollover whose broadcast errored | the intent stayed, the channel went on taking states; if the tx confirmed later, a lock routed in between sat above it (the hub paid 3,000 on ch2 over a ch1 spent at 3,007) | a channel with an unresolved intent takes no state: paid call, `/lock` and `/route` answer `channel_closing` | `hub_routing_safety.rs::h1_no_lock_is_routed_above_a_ch1_spend_the_node_errored_on`, `h1_a_provider_takes_no_lock_on_a_ch2_whose_spend_its_node_errored_on`; `lifecycle.rs::a_channel_whose_spend_the_node_errored_on_serves_nothing_above_it` |
+| the same, resolving it | only the margin close, or the node showing the tx | the watcher sends an errored **close** again each tick; a close or rollover request first records an earlier spend the node has after all | `h1_a_ch1_close_the_node_errored_on_goes_through_at_the_next_tick`, `the_watcher_sends_a_close_the_node_errored_on_again`, `a_spend_that_reached_the_chain_is_recorded_before_another_replaces_it` |
+| `max_lock_sat` against a ch2 opened with another capacity | checked against the configured `ch2_capacity` only | `ch2_terms` (so `connect` and `connect_next`) refuses `bad_config` when `2 x max_lock_sat` is above the capacity it would fund, before anything is funded | `routing_checks.rs::hub_bounds_max_lock_sat_against_the_capacity_a_ch2_is_opened_with` |
+| an unpaid block with no statement | no verdict, nothing recorded | still no verdict; counted while credit is unpaid (`unpaidBlocks` in the report), with an optional stop | `agp084_unpaid_blocks.rs` (6) |
+
+**The errored spend.** `close` and `rollover` write `close_intent` and then send (M8). When the node
+answers with an error and does not know the tx, the answer is `close_failed` and the channel stays
+open. The tx is complete all the same, and the provider cannot know that it will never confirm: a
+node can take a tx and still answer with an error. So `provider::closing(st)` is true for a closed
+channel and for one with an open intent, and every path that takes a state asks it: the paid-call
+path, `/x402/verify`, the provider's `/x402/route/lock` and the hub's `/x402/route`. Nothing is
+signed or served above a spend that can still land. The intent ends in one of four ways:
+
+- the node shows the tx: `adopt_intent` records it (as before; now also at the start of `close` and
+  `rollover`, so a new intent never overwrites one that is already on the chain). A rollover's
+  intent carries `next`, so a rollover adopted later gets its `rollover_to`;
+- it is a close: the watcher sends it again every tick (`close_locked`, with the AGP-067 bump), and
+  the failure shows in `close_error` until it goes through;
+- the client rolls over again or closes: the new spend replaces the intent. No state was taken in
+  between, so whichever of the two confirms pays at least the best state;
+- the margin close, as before.
+
+The watcher never sends a **rollover** again. Its client was answered `close_failed`, and the
+library client then no longer holds the next channel's key (below): sent later, the rollover would
+fund a channel nobody can spend from before its refund.
+
+Limits. After a failed close the channel routes and serves nothing until that close is on the node;
+that is the point of the fix, and it changes what a failed close means for the client (it could go
+on paying before). A replaced intent is forgotten: if the first spend errored, a second one errored
+too, and then the *first* confirms, the ledger has the second one's intent and the close is never
+recorded (the channel shows as suspended; no state sits above either spend). Found on the way and
+not fixed, both in the payer library (`client.rs`), not in the provider:
+
+- after a rollover the provider answered with an error, `Client::close` is refused `bad_sig`: the
+  payer's watermark moved to the rollover's amount and its kept signature did not;
+- `Client::rollover` drops the next channel's key when the POST fails (an error answer or a lost
+  one). If the provider did broadcast, the leftover is in a channel the client cannot sign for.
+
+**The lock bound.** AGP-064's rule is that a lock is at most half of a ch2. A ch2 funded with an
+explicit capacity went around the check on the configured one. A rollover's child is not held to
+it: its capacity is what the parent left, and it is replaced when a lock no longer fits. The route
+demo's small ch2 (provider D) is 40,000 now, twice its `max_lock_sat`.
+
+**Unpaid blocks.** A block that paid the identity nothing, with no statement, may be the Prime's or
+any other pool's; the provider has nothing that tells them apart (no share-log commitment yet), and
+on a chain with other miners most blocks are of this kind. So the decision on "do N such blocks
+distrust the Prime" is no: distrust is a verdict and is never undone, and this is not evidence.
+What is done instead:
+
+- **Recorded.** While credit is unpaid, each such block extends a run kept in the state file and
+  shown in the report: `"unpaidBlocks": {"from", "to", "count", "refused"}` (`refused`: those that
+  came with a statement the audit refused). A block walked twice counts once. A coinbase that pays
+  for credit ends the run; with no unpaid credit nothing is counted.
+- **An operator's stop.** `--max-unpaid-blocks N` (`WorkConfig::max_unpaid_blocks`, off by default)
+  stops new credit (`frozen: "unpaid_blocks"`) once the run reaches N and lifts it when a coinbase
+  pays. It is a stop, not distrust. N has to come from how often the Prime's pool finds a block,
+  which the provider cannot measure; set too low it stops an honest Prime during a run of bad luck.
+- **Signed garbage is a failure.** A refused statement that did verify under the pinned key for
+  this Prime and this block (`bad_window`, `window_start_regressed`) is the Prime saying the block
+  is its own. On an unpaid block it had no verdict; now it fails the audit and distrusts the Prime
+  (`refused_statement`), as on a paid block. A statement that does not bind the Prime to the block
+  (`bad_window_sig`, `wrong_prime`, `wrong_block`) is counted in the run.
+
+Without `--max-unpaid-blocks` the loss to a Prime that never pays is what it was: the total cap
+(1,000 calls with the shipped defaults), once. For embedders: `WorkConfig` gains
+`max_unpaid_blocks`; the state file gains an optional `unpaid` (version stays 3; older state loads
+with no run); the freeze rules are applied again when the state loads.
+
 ## Portability
 
 No platform-specific dependencies: libsecp256k1 (C, via `secp256k1-sys`), pure-Rust hashes and JSON,

@@ -1056,7 +1056,8 @@ impl Provider {
             Ok(h) => h,
             Err(e) => return (err_json(500, "node_error", &e.to_string()), false),
         };
-        if !st.closed_txid.is_empty() || height as i64 >= st.params.expiry as i64 - self.cfg.close_margin as i64 {
+        // AGP-084: nor on a ch2 whose close or rollover the node errored on (it can still confirm)
+        if crate::provider::closing(st) || height as i64 >= st.params.expiry as i64 - self.cfg.close_margin as i64 {
             return (err_json(400, "channel_closing", ""), false);
         }
         if st.suspended {
