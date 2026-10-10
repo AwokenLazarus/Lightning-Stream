@@ -629,7 +629,7 @@ impl Client {
         let (pubk, secret, payer_spk) = self.fresh_key(origin)?;
         let p = ChannelParams::derive(&pay_to, &pubk, expiry, close_fee, payer_spk, &self.cfg.network, fee_payer)?;
         let addr = segwit_address(self.hrp(), &p.spk())?;
-        let open_url = format!("{origin}{}", ex.get("openUrl").and_then(Value::as_str).unwrap_or(OPEN_PATH));
+        let open_url = crate::wire::seller_url(origin, ex.get("openUrl").and_then(Value::as_str).unwrap_or(OPEN_PATH))?;
         let mut c = json!({"capacity": cap, "expiry": expiry, "payerPub": hex::encode(p.payer_pub),
                            "payerSpk": hex::encode(&p.payer_spk), "redeemScript": hex::encode(p.script())});
         if fee_payer != FeePayer::Payer {
@@ -895,7 +895,7 @@ impl Client {
         let ch = &self.channels[origin];
         let chan = ch.payer.params.channel_id();
         let sig = hex::encode(ch.payer.sign_close()?);
-        let url = format!("{origin}{}", ch.accepted.get("extra").and_then(|e| e.get("closeUrl")).and_then(Value::as_str).unwrap_or(CLOSE_PATH));
+        let url = crate::wire::seller_url(origin, ch.accepted.get("extra").and_then(|e| e.get("closeUrl")).and_then(Value::as_str).unwrap_or(CLOSE_PATH))?;
         self.post(&url, &json!({"chan": chan, "sig": sig, "payload": pl}))
     }
 
@@ -969,7 +969,7 @@ impl Client {
         if p.close_fee_payer != FeePayer::Payer {
             c["closeFeePayer"] = p.close_fee_payer.as_str().into();
         }
-        let url = format!("{origin}{}", ch.accepted.get("extra").and_then(|e| e.get("openUrl")).and_then(Value::as_str).unwrap_or(OPEN_PATH));
+        let url = crate::wire::seller_url(origin, ch.accepted.get("extra").and_then(|e| e.get("openUrl")).and_then(Value::as_str).unwrap_or(OPEN_PATH))?;
         let r = self.post(&url, &json!({"x402Version": 2, "network": self.cfg.network, "channel": c}))?;
         self.pending_rolled.remove(origin);
         Ok(r)

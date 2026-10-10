@@ -1041,7 +1041,8 @@ human's ed25519 signature.
   The dest must be allowlisted, and `cap_sats`, `expiry_blocks` and `close_fee` must stay inside the
   owner's bounds.
 - **`xbt402_attach`** of a funded channel must match the pending record `fund` wrote. A `/next`
-  channel passes the same checks as `fund`.
+  channel passes the same checks as `fund`, and is attached only once the signer's own node shows
+  the rollover that funds it (AGP-080; `deny/rollover_unproven` until then).
 - **`xbt402_sign_rollover`** needs `next`: the unfunded params of the channel's own next channel. Its
   script must be `next_spk`; it must have the same close fee and fee payer; its capacity must be
   exactly `rollover_next_capacity(amount)`; and it passes the `fund` checks for `<origin>/next`.

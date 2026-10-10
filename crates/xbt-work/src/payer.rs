@@ -163,7 +163,8 @@ impl WorkPayer {
                 return Ok(s.clone());
             }
         }
-        let url = format!("{origin}{}", acc.pointer("/extra/invoiceUrl").and_then(Value::as_str).unwrap_or(INVOICE_PATH));
+        // the seller names this URL: it stays on the seller's origin (AGP-080 X1)
+        let url = xbt402::wire::seller_url(origin, acc.pointer("/extra/invoiceUrl").and_then(Value::as_str).unwrap_or(INVOICE_PATH)).map_err(WorkError::from)?;
         let r = t.request("POST", &url, b"", &[])?;
         if r.status != 200 {
             return fail(if r.status == 429 { "too_many_invoices" } else { "provider_error" }, format!("invoice: HTTP {}", r.status));

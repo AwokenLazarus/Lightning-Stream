@@ -414,3 +414,45 @@ fn agp076_an_offer_without_close_margin_is_refused_before_funding() {
     assert_eq!(funded.load(Ordering::SeqCst), 0);
     assert!(prov.channel_ids().is_empty());
 }
+
+/// AGP-080 X1: every URL the client asks for, with the seller's `openUrl` rewritten on the way back.
+struct Pointing {
+    prov: Arc<Provider>,
+    open_url: String,
+    asked: Arc<Mutex<Vec<String>>>,
+}
+
+impl Transport for Pointing {
+    fn request(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)]) -> Result<HttpResponse> {
+        self.asked.lock().unwrap().push(url.to_string());
+        if !url.starts_with(&format!("{O}/")) {
+            return Err(ChannelError::new("transport_error", "another host"));
+        }
+        let (_, path) = split_url(url);
+        let mut r = self.prov.serve(method, &path, headers, body, url, None);
+        if let Some(h) = r.headers.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case("PAYMENT-REQUIRED")) {
+            let mut pr = xbt402::wire::unb64json(&h.1).unwrap();
+            pr["accepts"][0]["extra"]["openUrl"] = self.open_url.clone().into();
+            h.1 = xbt402::wire::b64json(&pr);
+        }
+        Ok(r)
+    }
+}
+
+/// The seller names `openUrl`. Appended to the origin, `@evil.example/open` is another host: the
+/// library client refuses it before any request and before funding (as the signer's session does).
+#[test]
+fn x1_a_seller_url_off_the_origin_is_refused() {
+    for bad in ["@evil.example/open", "//evil.example/open", ".evil.example/open", "https://evil.example/open", "/open\\@evil.example"] {
+        let chain = MemChain::new();
+        let funded = Arc::new(AtomicUsize::new(0));
+        let asked: Arc<Mutex<Vec<String>>> = Arc::default();
+        let prov = provider(&chain, secret("provider payTo"), Ledger::in_memory());
+        let mut c = client(&chain, Box::new(Pointing { prov, open_url: bad.into(), asked: asked.clone() }), &funded);
+        let e = c.request("GET", &format!("{O}/v1/q"), b"").unwrap_err();
+        assert_eq!(e.code, "seller_url", "{bad}: {e}");
+        let off: Vec<String> = asked.lock().unwrap().iter().filter(|u| !u.starts_with(&format!("{O}/"))).cloned().collect();
+        assert_eq!(off, Vec::<String>::new(), "{bad}: a request left the seller's origin");
+        assert_eq!(funded.load(Ordering::SeqCst), 0, "{bad}: nothing was funded");
+    }
+}

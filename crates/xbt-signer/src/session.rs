@@ -18,7 +18,7 @@ use xbt402::client::Transport;
 use xbt402::conditional::{encrypt, preimage_from_tx};
 use xbt402::json::{dumps, py_str};
 use xbt402::provider::HttpResponse;
-use xbt402::wire::{b64json, body_hash, facilitator_request, receipt_message, receipt_of, request_digest_v2, safe_code, scheme_accepted, unb64json, FACILITATOR_VERIFY};
+use xbt402::wire::{b64json, body_hash, facilitator_request, receipt_message, receipt_of, request_digest_v2, safe_code, scheme_accepted, seller_url, unb64json, FACILITATOR_VERIFY};
 use xbt_primitives::ecdsa;
 use xbt_primitives::hash::{sha256, tagged_hash};
 use xbt_primitives::tx::Tx;
@@ -127,6 +127,18 @@ pub type SpendCheck = Arc<dyn Fn(&str, i64, i64) -> Result<Option<Value>> + Send
 
 /// One stream chunk: `Ok((data, charged, chan))`, or `Err((reason, charged, chan))`.
 type ChunkStep = std::result::Result<(Vec<u8>, i64, String), (String, i64, String)>;
+
+/// What our own node says about a channel's funding output (AGP-080): the only thing that takes a
+/// channel away from the refund watcher.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FundingSpend {
+    /// Still in the UTXO set (mempool included): the channel is not closed.
+    Unspent,
+    /// Spent, by this transaction when the node could name it (else empty).
+    Spent(String),
+    /// The node has never shown this output: nothing is proven either way.
+    Unknown,
+}
 
 /// One signer-owned client session.
 pub struct Session {
@@ -242,7 +254,8 @@ impl Session {
         let params = xbt402::channel::ChannelParams::derive(&pay_to, &hex::decode(&payer_pub).unwrap_or_default(), expiry as u32,
                                                             close_fee as u64, Some(self.hot.spk()), &network, fp)?;
         let funded = cap + payer_fee;
-        let open_url = format!("{dest}{}", extra.get("openUrl").and_then(Value::as_str).unwrap_or(xbt402::wire::OPEN_PATH));
+        // AGP-080 X1: the seller names this URL; it must stay on the origin the policy allowed
+        let open_url = seller_url(dest, extra.get("openUrl").and_then(Value::as_str).unwrap_or(xbt402::wire::OPEN_PATH))?;
         self.preflight(&open_url, &network, &params, funded, &fee_payer)?;
         let prep = self.hot.prepare_fund(&params.spk(), funded, DEFAULT_FEE)?;
         let params = params.with_funding(&prep.txid, 0, funded as u64)?;
@@ -290,6 +303,23 @@ impl Session {
         Ok(())
     }
 
+    /// Ask our node whether `rec`'s funding output is spent. Without txindex the spender is looked
+    /// for in the mempool, then in the blocks from the funding's own (as the refund does, P6).
+    pub fn funding_spend(&self, rec: &ChannelRecord) -> Result<FundingSpend> {
+        let utxo = self.node.call("gettxout", json!([rec.funding_txid, rec.funding_vout, true]))?;
+        if !utxo.is_null() {
+            return Ok(FundingSpend::Unspent);
+        }
+        let start = if rec.funding_height != 0 { rec.funding_height } else { rec.open_height };
+        if let Some(sp) = node::find_spender(&*self.node, &rec.funding_txid, rec.funding_vout as u32, start.max(0) as u64, node::SPENDER_SCAN_MAX) {
+            return Ok(FundingSpend::Spent(sp));
+        }
+        if rec.funding_height != 0 || node::get_tx(&*self.node, &rec.funding_txid, "").is_some() {
+            return Ok(FundingSpend::Spent(String::new()));
+        }
+        Ok(FundingSpend::Unknown)
+    }
+
     /// Confirmations of a channel's funding output; `None` when the node does not have it at all.
     fn funding_confirmations(&self, rec: &ChannelRecord) -> Result<Option<i64>> {
         let r = self.node.call("gettxout", json!([rec.funding_txid, rec.funding_vout, true]))?;
@@ -304,6 +334,11 @@ impl Session {
         if rec.state != "pending" || rec.open_url.is_empty() {
             // no open_url: an external client's channel (signer `fund`); the client posts its open and attaches
             return Ok(rec.public());
+        }
+        if origin_of(&rec.open_url).ok().as_deref() != Some(dest) {
+            // a record from before AGP-080 may hold a seller URL that leaves the origin
+            self.book.note_pending(dest, Some("open URL is off the channel's origin; refunded at expiry"), None)?;
+            return Err(err("seller_url", "the recorded open URL is not on the channel's origin; the channel stays pending and is refunded at expiry"));
         }
         let mut confs = self.funding_confirmations(&rec)?;
         if confs.is_none() && !rec.funding_hex.is_empty() && self.node.call("sendrawtransaction", json!([rec.funding_hex])).is_ok() {
@@ -403,7 +438,7 @@ impl Session {
     /// Sats of this channel already in the policy ledger. `-1` means a pre-AGP-063 record:
     /// treat `used_sats` as already booked so an upgrade does not book history again.
     pub fn booked_through(rec: &ChannelRecord) -> i64 {
-        if rec.ledger_booked_sats < 0 { rec.used_sats } else { rec.ledger_booked_sats }
+        rec.booked_through()
     }
 
     /// Commit any signed amount the ledger does not yet hold, then remember that it does.
@@ -411,14 +446,24 @@ impl Session {
     /// books the same increase once. Returns the sats committed by this call.
     fn book_unbooked(&self, dest: &str) -> Result<i64> {
         let Some(rec) = self.book.get(dest) else { return Ok(0) };
-        let delta = rec.used_sats - Self::booked_through(&rec);
+        self.book_through(dest, rec.used_sats)
+    }
+
+    /// Raise what the ledger holds for this channel to `cum`: the amount a signature about to be
+    /// made, or about to leave, commits the channel to (a hash-locked state: its plain amount
+    /// plus the locked one). Nothing lowers it: a state the seller holds stays claimable until
+    /// the channel closes, and one close claims one state, so a later state inside `cum` rides on
+    /// this booking. Returns the sats committed by this call.
+    fn book_through(&self, dest: &str, cum: i64) -> Result<i64> {
+        let Some(rec) = self.book.get(dest) else { return Ok(0) };
+        let delta = cum - Self::booked_through(&rec);
         if delta <= 0 {
             return Ok(0);
         }
         let book = self.spend_book.lock().unwrap_or_else(|p| p.into_inner()).clone()
             .ok_or_else(|| err("xbt402", "signed increase has no ledger booking"))?;
-        book(dest, delta, &rec.chan, rec.used_sats)?;
-        self.book.mark_ledger_booked(dest, rec.used_sats)?;
+        book(dest, delta, &rec.chan, cum)?;
+        self.book.mark_ledger_booked(dest, cum)?;
         Ok(delta)
     }
 
@@ -611,10 +656,15 @@ impl Session {
                           "stream": {"ok": false, "refused": format!("result costs {n} x {price} sat more; max_sats leaves {budget}")}});
         }
         let chunk_url = doc.get("chunkUrl").and_then(Value::as_str).unwrap_or("");
+        // AGP-080 X1: every chunk is fetched from the origin that was allowed, wherever the seller points
+        let chunk_at = |i: i64| seller_url(dest, &chunk_url.replace("{i}", &i.to_string()));
+        if let Err(e) = chunk_at(0) {
+            return json!({"stream_charged": 0, "body": "", "stream": {"ok": false, "refused": format!("chunkUrl: {}", e.msg)}});
+        }
         let mid = m.get("id").cloned().unwrap_or(Value::Null);
         let (mut parts, mut spent) = (Vec::<u8>::new(), 0i64);
         for i in 0..n - 1 {
-            let url = format!("{dest}{}", chunk_url.replace("{i}", &i.to_string()));
+            let url = chunk_at(i).unwrap_or_default();
             let t = Instant::now();
             let step = || -> ChunkStep {
                 let rec = self.book.fresh_seq(dest).map_err(|e| (e.msg, 0, String::new()))?;
@@ -710,7 +760,7 @@ impl Session {
         let t = Instant::now();
         let n = py_int(m.get("n")).unwrap_or(0);
         let price = py_int(m.get("price")).unwrap_or(0);
-        let url = format!("{dest}{}", doc.get("chunkUrl").and_then(Value::as_str).unwrap_or("").replace("{i}", &(n - 1).to_string()));
+        let url = seller_url(dest, &doc.get("chunkUrl").and_then(Value::as_str).unwrap_or("").replace("{i}", &(n - 1).to_string())).map_err(|e| e.msg)?;
         let not_offered = || "last chunk is not offered under the manifest's hash lock".to_string();
         let r = self.http("GET", &url, b"", &[]).map_err(|e| e.msg)?;
         let Some(h) = r.header("PAYMENT-REQUIRED").filter(|_| r.status == 402) else { return Err(not_offered()) };
@@ -732,8 +782,13 @@ impl Session {
         let manifest: serde_json::Map<String, Value> = ["id", "n", "root", "lock", "finalCt", "lastProof"].iter()
             .map(|k| (k.to_string(), m.get(*k).cloned().unwrap_or(Value::Null))).collect();
         let pending = json!({"hash": hex::encode(hash), "cipher": hex::encode(&cipher), "manifest": manifest});
+        // AGP-080 W1: the hash-locked state pays the plain amount plus this chunk to whoever holds
+        // the key, so the ledger holds both before it is signed. The plain state that folds the
+        // lock in then books nothing more; a seller that keeps the signature and withholds the key
+        // releases nothing.
+        let uncond = self.book.get(dest).map(|r| r.used_sats).ok_or_else(|| "channel vanished".to_string())?;
+        self.book_through(dest, uncond + price).map_err(|e| e.msg)?;
         let (rec, sig) = self.book.sign_stream_final(dest, hash, price as u64, csv, pending).map_err(|e| e.msg)?;
-        self.book_unbooked(dest).map_err(|e| e.msg)?;
         let payload = json!({"chan": rec.chan, "seq": rec.seq, "cum": rec.used_sats.to_string(), "hashlock": hex::encode(hash), "sig": hex::encode(&sig)});
         let (r, _) = self.paid("GET", &url, b"", &acc, payload).map_err(|e| e.msg)?;
         if r.status != 200 {
@@ -827,12 +882,19 @@ impl Session {
         // block: learn the change now if we can, then mark the channel closed with the answer
         let change = self.learn_close_change(&rec, txid.as_deref().unwrap_or(""), h0, &close_hex);
         self.book.mark_closed(&dest, txid.as_deref().unwrap_or(""), Some(&change), &close_hex)?;
+        // AGP-080 W3: the reply is the provider's word. Only our node showing the funding spent
+        // proves the close; until then the record stays with the refund watcher.
+        let (proven, spender) = match self.funding_spend(&rec) {
+            Ok(FundingSpend::Spent(sp)) => (true, sp),
+            _ => (false, String::new()),
+        };
+        self.book.note_close_proof(&dest, proven, &spender)?;
         let hot_spk = self.hot.spk_hex();
         log_call("close", json!({"dest": dest, "chan": rec.chan, "txid": txid, "cum": rec.used_sats, "change_spk": rec.payer_spk,
                                  "hot_spk": hot_spk, "close_change": change["status"]}));
         Ok(json!({"verdict": "allow", "rail": "xbt402", "dest": dest, "txid": txid, "chan": rec.chan, "cum": rec.used_sats,
                   "change_spk": rec.payer_spk, "hot_spk": hot_spk, "change_to_hot": rec.payer_spk == hot_spk,
-                  "close_change": change["status"], "close_report": report,
+                  "close_change": change["status"], "close_proven": proven, "close_report": report,
                   UNTRUSTED_KEY: untrusted(&preview(&r.body, body_cap()), Value::Null)}))
     }
 

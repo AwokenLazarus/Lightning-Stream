@@ -2032,7 +2032,7 @@ impl RouteHub {
         }
         let body = json!({"x402Version": 2, "network": self.network, "preflight": true, "channel": c, "hub": {"payTo": self.pay_to}});
         let open_url = terms.get("extra").and_then(|e| e.get("openUrl")).and_then(Value::as_str).unwrap_or(OPEN_PATH);
-        let (st, doc) = self.post_json(&format!("{origin}{open_url}"), &body)?;
+        let (st, doc) = self.post_json(&crate::wire::seller_url(origin, open_url)?, &body)?;
         if st != 200 {
             let code = doc.get("error").and_then(Value::as_str).filter(|c| safe_code(c)).unwrap_or("provider_error");
             if code == "bad_request" {
@@ -2224,7 +2224,7 @@ impl RouteHub {
         let body = json!({"x402Version": 2, "network": self.network, "channel": c,
                           "hub": {"payTo": self.pay_to, "sig": hex::encode(ecdsa::sign(&self.secret, &hub_channel_message(&p.channel_id())))}});
         let open_url = oc.terms.get("extra").and_then(|e| e.get("openUrl")).and_then(Value::as_str).unwrap_or(OPEN_PATH);
-        let (st, doc) = self.post_json(&format!("{}{open_url}", oc.origin), &body)?;
+        let (st, doc) = self.post_json(&crate::wire::seller_url(&oc.origin, open_url)?, &body)?;
         if st != 200 {
             // said, not only returned (AGP-057): a refused open is why a ch2 stays `funded`
             let why: String = doc.to_string().chars().take(160).filter(|c| (' '..='~').contains(c)).collect();
@@ -2414,7 +2414,7 @@ impl RouteHub {
         }
         let req = json!({"chan": p.channel_id(), "sig": hex::encode(ecdsa::sign(&oc.secret_key()?, &close_message(&p.channel_id())))});
         let close_url = oc.terms.get("extra").and_then(|e| e.get("closeUrl")).and_then(Value::as_str).unwrap_or(CLOSE_PATH);
-        let (st, doc) = self.post_json(&format!("{}{close_url}", oc.origin), &req)
+        let (st, doc) = self.post_json(&crate::wire::seller_url(&oc.origin, close_url)?, &req)
             .map_err(|e| ChannelError::new("provider_error", format!("close: {e}")))?;
         if st != 200 {
             return fail("provider_error", doc.to_string().chars().take(200).collect::<String>());
