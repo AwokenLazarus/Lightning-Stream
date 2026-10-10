@@ -2398,6 +2398,137 @@ The L5 cache check adds one `getblockhash` RPC to the signer's own node per usab
 `ln_pay` and `ln_status`: a loopback round trip, not CPU. TrackPaymentV2 replaces a 1,000-payment
 listing with one record. The L1 parse runs once, at configuration.
 
+## Lightning rail pays BOLT 12 offers (AGP-082)
+
+`ln_pay` takes a BOLT 12 offer (`lno1...`) as well as a BOLT 11 invoice. The seller publishes one
+offer; each payment is an invoice the seller signs for it, which the wallet keeps. Nothing else is new:
+no bridge service, no channel-script change, no new 402 entry, and the wallet still only pays. Code:
+`crates/xbt-signer/src/bolt12.rs` (the reader) and `src/ln_offer.rs` (the payment); tests in
+`src/bolt12.rs` and `tests/ln_rail.rs` (`agp082_*`).
+
+**What is checked, and where.** The signer reads the offer and the invoice itself, as it does a BOLT 11
+invoice. It never asks the node to decode one, which would need `invoices:read`; the mainnet macaroon
+stays at `info:read offchain:read offchain:write onchain:read`. In order:
+
+1. **The offer** (`bolt12::check_offer`): feature bit 512, a chain this node is on, not expired, an
+   amount (its own, or `amount_sats` from the caller when it names none), the caller's `description` if
+   given, `max_sats`. Offers priced in a currency, sold by quantity, or carrying experimental-range
+   fields are refused (`ln_offer`).
+2. **The node and its channels**, as for BOLT 11: chain identity, macaroon, exposure cap, watchtowers,
+   funding proofs. One rule is stricter, see "Channels" below.
+3. **The policy**, on `ln-offer:<offer id>` and the amount plus the fee limit. Both are known before
+   any invoice exists, so a denied or over-threshold payment asks the issuer for nothing. The human's
+   approval is for that offer and that amount, once.
+4. **The invoice.** The node fetches it (`POST /v2/offers/fetchinvoice`, `offchain:read`). The signer
+   decodes the `lni1...`, verifies the BIP-340 signature over its Merkle root, and checks
+   (`bolt12::check_invoice`): bit 512; the chain; that it repeats this offer's fields byte for byte;
+   that the offer's issuer signed it (`offer_issuer_id`, or for an offer with none the last blinded
+   node of one of its paths); the amount asked; at least `ln.min_expiry_s` left; each payment path's
+   `cltv_expiry_delta` within `ln.max_cltv_blocks`. Then the node's own summary of the invoice
+   (`InvoiceInfo`) must agree with the decode field by field (`ln_decode_mismatch`).
+5. **The signer of the offer.** The key that signed an offer's first invoice is recorded in
+   `.run/ln_offers.json`. A later invoice for that offer signed by another key is refused
+   (`ln_offer_signer`), valid signature or not. An offer with several blinded paths may legitimately
+   be answered by a different blinded key each time; that is refused too, until the owner removes the
+   offer's entry from the file.
+
+The offer id is the SHA-256 of the offer's TLV bytes. That is Core Lightning's definition and what
+Lightning Fork reports as `offer_id`, so the allowlist entry can be read off either node.
+
+**The chain.** BOLT 12 reads an offer that names no chain as Bitcoin mainnet. XBT mainnet shares
+Bitcoin's genesis hash, so on mainnet a chain-less offer names this chain and SHA-256 Bitcoin alike,
+and most offers are chain-less. Bit 512 is what tells them apart: a chain-less offer with bit 512 is
+payable on mainnet, and without it is refused. Off mainnet a chain-less offer names another chain and
+is refused. The chain an offer must name is block 0 of the signer's own node. Lightning Fork's code at
+`v0.21.3-beta-blake2b.17` reads it the same way (its `docs/bolt12-offers.md` still says a chain-less
+offer "is reported as not for this chain"; the code and its tests say otherwise). The test
+`lightning_forks_own_offers_and_invoices` pins the fork's verdicts, so a drift on either side fails.
+
+**One invoice per attempt.** The fetched invoice is written to `ln_offers.json` before it is paid, and
+it is the invoice that is paid (`POST /v2/offers/pay` with `invoice`), never the offer. Paying the
+offer again would fetch a second invoice, and a retry that settled beside the first would pay twice.
+A later `ln_pay` of the same offer for the same amount pays the stored invoice while it is unpaid and
+not expiring; a new one is fetched only after that one settled. Invoices asked of one offer are
+limited by `ln.max_sends_per_hour`, paid or not.
+
+**Channels.** `PayOffer` takes neither a set of outgoing channels nor a CLTV limit, so the wallet
+cannot confine an offer's payment to the channels it has proven, as it does for BOLT 11
+(`outgoing_chan_ids`). Instead it refuses the payment (`ln_offer_unsafe_channel`) unless **every**
+channel of the node passes the guards and the funding proof, inactive ones included. A node with a
+taproot, non-unified, zero-conf or pre-split channel pays BOLT 11 invoices and no offers. The node's
+own `max-cltv-expiry` bounds the route's time lock; the wallet bounds the invoice's blinded paths.
+The fee limit sent is never 0, which the node reads as its default limit: it is at least 1 sat.
+
+**Not payer identity.** A BOLT 12 invoice names the key the request was signed with
+(`invreq_payer_id`). Lightning Fork draws a fresh key for every request, and `PayOffer` has no field
+for a caller's key, so two payments of one offer carry two payer ids. Each is recorded with its
+payment (`payer_id` in `ln_payments.json`, the signature log and the reply) and names that payment
+only. A stable payer id needs a change in the fork.
+
+**The audit's two Lightning findings** (the AGP-077 closure audit, list 1, item 11), fixed here because they are in
+the same file. Each has a test that failed before the fix (commit `db5d8cf` holds the tests alone):
+
+* **Redirects.** The REST client followed up to five redirects and kept the macaroon header, so a
+  node (or anything answering on its port) could send the macaroon to a host the loopback and
+  pinned-certificate checks refuse. Redirects are off, and a 3xx answer is an error, never "no such
+  payment". Test: `agp082_the_rest_client_follows_no_redirect_so_the_macaroon_goes_to_no_other_host`.
+* **The settle booking.** A settled payment was booked at the value and fee the node reported, with
+  no floor and no look at the preimage: a `SUCCEEDED` record with zero amounts took a 403 sat booking
+  to 0. The booking is now at least the invoice amount, and `SUCCEEDED` counts only with the 32-byte
+  preimage of the payment hash. Without it the whole worst-case booking stays, no proof of payment is
+  logged, and the rail halts until the human resumes it (the `ln_resume` approval of AGP-066). Tests:
+  `agp082_a_settled_payment_is_booked_at_no_less_than_the_invoice_amount`,
+  `agp082_a_settled_payment_without_the_preimage_of_its_hash_keeps_its_whole_booking_and_halts_the_rail`.
+
+**How the reader is tested.** No dependency was added; the reader and its checks are about 650 lines
+beside `bolt11.rs`. Every length and count from the wire is bounded before use (a string of at most 16,384
+characters, 64 records, 16 paths; a field's length is checked against the bytes left).
+
+* The specification's vectors (`tests/data/bolt12`, CC-BY 4.0): 12 string-format cases, 53 offers
+  (valid and malformed), 4 Merkle roots and the signed `invoice_request`.
+* Lightning Fork's own codec at `.17` as the reference implementation
+  (`tests/data/bolt12/lightning-fork-17.json`, generator `scripts/ln_rail/agp082vec.go`): 9 offers and
+  8 invoices it wrote, with its reader's verdict on regtest and on mainnet. This reader holds the same
+  fields, the same offer ids, verifies the fork's signatures, and reaches the same verdict on each.
+  No node ran for this; it is the fork's `bolt12` package alone.
+* A property test, `truncated_overlong_and_mutated_input_is_refused`: every truncation, every
+  single-bit flip of a signed invoice, every field's length replaced by six overlong encodings, counts
+  that promise more than is there, and 20,000 random mutations and random inputs. Nothing panics and
+  nothing but the signed invoice is accepted.
+
+**Not run for this change:** `scripts/ln_rail_regtest.sh`. Its lab pins Lightning Fork
+`v0.21.3-beta-blake2b.13`, below the `.17` this work reads, and it has no offer scenario. A scenario
+needs a payer node whose channels all pass the guards (the lab's `lf1` holds a taproot channel and a
+pre-split one by design). The signer has therefore not paid an offer through a running node.
+
+CPU (`crates/xbt-signer/examples/bolt12_cost.rs`; armv7 musl under `qemu-arm-static` as the Pi-class
+figure, x86_64 native beside it; pass line declared before measuring). One iteration decodes and
+checks an offer of 1,024 TLV bytes (1,643 characters, two blinded paths) and its invoice (2,420
+characters), signature included:
+
+| step | pass line (armv7) | armv7 median | armv7 slowest of 1,000 | x86_64 median |
+|---|---|---|---|---|
+| decode and check a 1 KB offer and its invoice | ≤ 20 ms | 0.93 to 1.00 ms | 4.06 ms | 0.085 ms |
+
+**For embedders (cmp and anyone linking `xbt-signer`).** Wire and behaviour changes:
+
+| change | before | now |
+|---|---|---|
+| `ln_pay` `invoice` | a BOLT 11 invoice | or a BOLT 12 offer (`lno1...`); an `lni1`/`lnr1` string is refused (`ln_invoice`) |
+| `ln_pay` `amount_sats` | | optional: the amount to pay an offer that names none; 0 or absent otherwise |
+| policy destination | `ln:<payee node id>` | or `ln-offer:<offer id>` for an offer |
+| `ln_pay` reply for an offer | | adds `offer_id`, `payer_id`, `invoice_reused` |
+| `ln_pay` rules | | adds `ln_offer`, `ln_offer_mismatch`, `ln_offer_signer`, `ln_offer_store`, `ln_offer_unsafe_channel`, `ln_fetch_invoice`, `ln_preimage` |
+| a settled payment | booked at the node's reported value + fee | booked at no less than the invoice amount; without the preimage of its hash: verdict `pending`, rule `ln_preimage`, status `SUCCEEDED_UNPROVEN`, the rail halted |
+| `B2_LN_REST` redirects | followed, macaroon header kept | never followed; a 3xx is an `ln_backend` error |
+| node RPCs | | `POST /v2/offers/fetchinvoice`, `POST /v2/offers/pay`: needs `offersrpc` on the node, and onion messages on |
+| `LnBackend` | | adds `fetch_invoice` and `pay_offer` (default: an error, so existing backends compile) |
+| audit log | | `ln_preimage_mismatch` |
+| `.run/` | | `ln_offers.json`; `ln_payments.json` records of offers gain `offer_id`, `offer`, `payer_id`, `node_id`; a record may hold `preimage_ok: false` |
+| `ln_status` | | unchanged in shape |
+
+New dependency: none (`cargo tree -d` is unchanged).
+
 ## Embedders on xbt402 v1.3 (AGP-074)
 
 AGP-068 changed the wire (derivation v3, request binding v2, receipt v2) and left the embedders on
