@@ -179,6 +179,26 @@ signature log whose `sig_sha256` is the payment hash (the log holds the SHA-256 
 The wallet never opens channels; `ln_status` lists the node's coins below the split, which must never
 fund one.
 
+**BOLT 12 offers (AGP-082).** `ln_pay {invoice: "lno1...", max_sats, amount_sats?, description?}`
+pays an offer: `dest` is `ln-offer:<offer id>` (the SHA-256 of the offer's fields, which Lightning Fork
+and Core Lightning report as the offer id). The signer decodes the offer itself (`src/bolt12.rs`: bit
+512, a chain this node is on, where an offer that names no chain is Bitcoin's genesis and so mainnet's
+only; expiry; amount), runs the policy on the offer and the amount plus the fee limit, and only then
+has the node fetch an invoice (`POST /v2/offers/fetchinvoice`). It decodes that `lni1...` too, verifies
+the issuer's signature, checks it against the offer and against the node's summary of it, writes it to
+`.run/ln_offers.json`, and has the node pay that invoice (`POST /v2/offers/pay` with `invoice`). A
+retry pays the stored invoice, so one attempt never has two invoices out. The key that signed an
+offer's first invoice is recorded, and a later invoice signed by another key is refused
+(`ln_offer_signer`). The node chooses the channels of such a payment, so it is refused
+(`ln_offer_unsafe_channel`) unless every channel of the node passes guards 4 and 5. Decoding on the
+node is never used: the macaroon needs nothing beyond the four permissions above. Each payment records
+the `invreq_payer_id` its request was signed with; Lightning Fork draws a new one per request, so it
+names one payment, not the payer.
+
+The node's word on a settled payment is checked (AGP-082): the booking is never below the invoice
+amount, and `SUCCEEDED` counts only with the preimage of the payment hash; without it the whole
+booking stays and the rail halts. The REST client follows no redirect.
+
 policy.json `ln`: `enabled` (default off), `max_fee_base_sats` (10), `max_fee_ppm` (5000),
 `min_expiry_s` (60), `max_cltv_blocks` (1008), `timeout_s` (60), `anchor_height`, `anchor_hash`,
 `split_height`, `max_tip_lead` (2), `require_description` (false), `exposure_cap_sats` (0: none, not

@@ -27,8 +27,9 @@
 //!
 //! The worst case (amount + the fee limit) is booked to the ledger before the payment is sent (a
 //! write-ahead record in `ln_payments.json`); when the payment settles the booking becomes what it
-//! cost, and when it fails the booking goes ([`crate::policy::PolicyStore::amend`]; the audit log
-//! keeps both). A payment left in flight by a crash or a timeout is reconciled from the node's
+//! cost (AGP-082: never less than the invoice amount, and only with the preimage of its hash; without
+//! it the whole booking stays and the rail halts), and when it fails the booking goes
+//! ([`crate::policy::PolicyStore::amend`]; the audit log keeps both). A payment left in flight by a crash or a timeout is reconciled from the node's
 //! record of it, looked up by payment hash (AGP-066), before any other LN payment. A settled payment
 //! is logged in the signature log with the preimage (its `sig_sha256` is the payment hash, which
 //! proves it). A payment the node records late is booked again; if that breaks the policy the rail

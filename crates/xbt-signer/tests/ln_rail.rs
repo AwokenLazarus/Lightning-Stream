@@ -2059,3 +2059,32 @@ fn agp082_the_rest_client_speaks_fetchinvoice_and_pay_as_lightning_fork_does() {
     assert!(e.msg.contains("HTTP 409") && e.msg.contains("payment failed: no route"), "{}", e.msg);
     assert!(ln.fetch_invoice("lno1abc", 0, 60).is_err());
 }
+
+/// Each FetchInvoice is something the node does for the caller, paid or not: limited like the sends.
+#[test]
+fn agp082_invoices_asked_of_an_offer_are_rate_limited() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let offer = xbt_offer("regtest", Some(300), &[512], "coffee");
+    let rig = offer_rig(&[&offer], json!({"ln": {"max_sends_per_hour": 3}}));
+    rig.ln.set(|s| s.tweak = Tweak::No512);
+    for _ in 0..3 {
+        assert_eq!(rig.pay(&offer, 400)["rule"], "ln_feature_512");
+    }
+    let r = rig.pay(&offer, 400);
+    assert_eq!(r["rule"], "ln_rate_limit", "{r}");
+    assert_eq!((rig.fetches(), rig.offers_paid().len()), (3, 0));
+    // an hour on, it may ask again, and an honest issuer is paid
+    rig.clock.fetch_add(3_601, Ordering::SeqCst);
+    rig.ln.set(|s| {
+        s.tweak = Tweak::None;
+        s.now += 3_601;
+    });
+    assert_eq!(rig.pay(&offer, 400)["verdict"], "allow");
+    assert_eq!(rig.fetches(), 4);
+    // the expiry of a booked invoice of either kind is read for the late-settle watch
+    let lni = rig.offers_paid()[0].invoice.clone();
+    assert_eq!(xbt_signer::ln::invoice_expires_at(&lni), Some((T0 + 3_601 - 5 + 3_600) as f64));
+    let (inv, _) = rig.invoice(100, 1, XBT);
+    assert_eq!(xbt_signer::ln::invoice_expires_at(&inv), Some((T0 + 3_601 - 10 + 3_600) as f64));
+    assert_eq!(xbt_signer::ln::invoice_expires_at("lni1qqqq"), None);
+}

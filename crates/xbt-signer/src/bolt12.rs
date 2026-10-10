@@ -1040,6 +1040,72 @@ mod tests {
         assert!(decode_invoice(&offer(vec![])).is_err());
     }
 
+    /// The reference implementation: offers and invoices written by Lightning Fork's own codec at
+    /// v0.21.3-beta-blake2b.17, with its reader's and its payer's verdicts (`scripts/ln_rail/agp082vec.go`).
+    /// This reader holds the same fields and reaches the same verdict on each, on regtest and on mainnet.
+    /// Pass line 2 is in here in the fork's own words: no chain and bit 512 is payable on mainnet, no
+    /// chain and no bit 512 is not.
+    #[test]
+    fn lightning_forks_own_offers_and_invoices() {
+        let v: Value = serde_json::from_str(include_str!("../tests/data/bolt12/lightning-fork-17.json")).unwrap();
+        let now = v["now"].as_f64().unwrap();
+        let genesis = |name: &str| <[u8; 32]>::try_from(hex::decode(v["chains"][name].as_str().unwrap()).unwrap()).unwrap();
+        assert_eq!((genesis("mainnet"), genesis("regtest")), (BITCOIN_GENESIS, REGTEST));
+        let mut offers = std::collections::HashMap::new();
+        for o in v["offers"].as_array().unwrap() {
+            let name = o["name"].as_str().unwrap();
+            let d = decode_offer(o["bolt12"].as_str().unwrap()).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(hex::encode(&d.tlv), o["tlv"].as_str().unwrap(), "{name}");
+            assert_eq!(d.id_hex(), o["offer_id"].as_str().unwrap(), "{name}: the offer id is the fork's");
+            assert_eq!(d.amount.unwrap_or(0), o["amount_msat"].as_u64().unwrap(), "{name}");
+            assert_eq!(d.description.as_deref(), o["description"].as_str(), "{name}");
+            assert_eq!(d.issuer_id.map(hex::encode), o["issuer_id"].as_str().map(str::to_string), "{name}");
+            assert_eq!(d.paths.len() as u64, o["num_paths"].as_u64().unwrap(), "{name}");
+            let named: Vec<String> = o["chains"].as_array().into_iter().flatten().map(|c| c.as_str().unwrap().to_string()).collect();
+            assert_eq!(d.chains.clone().unwrap_or_default().iter().map(hex::encode).collect::<Vec<_>>(), named, "{name}");
+            for chain in ["regtest", "mainnet"] {
+                let ours = check_offer(&d, &genesis(chain), now);
+                assert_eq!(ours.is_ok(), o["lightning_fork"][chain]["payable"].as_bool().unwrap(), "{name} on {chain}: {ours:?}");
+            }
+            offers.insert(name.to_string(), d);
+        }
+        assert_eq!(offers.len(), 9);
+        // the chain-less pair, by name
+        assert_eq!(check_offer(&offers["no chain (mainnet), option_blake2b"], &BITCOIN_GENESIS, now), Ok(()));
+        assert_eq!(check_offer(&offers["no chain, no option_blake2b"], &BITCOIN_GENESIS, now).unwrap_err().0, "ln_feature_512");
+        assert_eq!(check_offer(&offers["no chain (mainnet), option_blake2b"], &REGTEST, now).unwrap_err().0, "ln_network");
+        let mut payers = vec![];
+        for i in v["invoices"].as_array().unwrap() {
+            let (name, o) = (i["name"].as_str().unwrap(), &offers[i["offer"].as_str().unwrap()]);
+            let accepts = i["lightning_fork"]["payer_accepts"].as_bool().unwrap();
+            let terms = InvoiceTerms { amount_msat: i["amount_msat"].as_u64().unwrap(), genesis: &genesis(i["chain"].as_str().unwrap()), now,
+                                       min_expiry_s: 60, max_cltv_blocks: 1008 };
+            let d = match decode_invoice(i["bolt12"].as_str().unwrap()) {
+                Ok(d) => d,
+                Err(e) => {
+                    assert!(!accepts && e.contains("not signed"), "{name}: {e}");
+                    continue;
+                }
+            };
+            assert_eq!(hex::encode(d.offer_id), i["offer_id"].as_str().unwrap(), "{name}");
+            assert_eq!(d.payment_hash_hex(), i["payment_hash"].as_str().unwrap(), "{name}");
+            assert_eq!(hex::encode(Sha256::digest(hex::decode(i["preimage"].as_str().unwrap()).unwrap())), d.payment_hash_hex());
+            assert_eq!((d.amount_msat, d.created_at, d.relative_expiry),
+                       (i["amount_msat"].as_u64().unwrap(), i["created_at"].as_u64().unwrap(), i["relative_expiry"].as_u64().unwrap()), "{name}");
+            assert_eq!((hex::encode(d.node_id), hex::encode(d.payer_id)), (i["node_id"].as_str().unwrap().into(), i["payer_id"].as_str().unwrap().into()), "{name}");
+            assert_eq!((d.paths.len(), d.payinfo[0].cltv_expiry_delta, d.has_feature(17)), (1, 40, true), "{name}");
+            let ours = check_invoice(o, &d, &terms);
+            assert_eq!(ours.is_ok(), accepts, "{name}: {ours:?}");
+            if accepts && i["offer"] == "regtest, 250000 msat, issuer id" {
+                payers.push(d.payer_id);
+            }
+        }
+        // pass line 5: two invoices for one offer, two payer ids
+        assert_eq!(payers.len(), 2);
+        assert_ne!(payers[0], payers[1]);
+        assert_eq!(v["invoices"].as_array().unwrap().len(), 8);
+    }
+
     /// xorshift64: the same inputs every run.
     struct Rng(u64);
 

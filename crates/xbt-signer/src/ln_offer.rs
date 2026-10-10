@@ -22,6 +22,9 @@
 //! 6. the key that signed: recorded with the offer the first time (`ln_offers.json`), and an invoice
 //!    for that offer signed by another key is refused from then on.
 //!
+//! Invoices asked of one offer are limited per hour like the sends (`ln.max_sends_per_hour`): each
+//! request is an onion message the node sends, whether or not its invoice is then paid.
+//!
 //! The fetched invoice is written down before it is paid, and it is the invoice that is paid
 //! (`PayOffer` with `invoice`), never the offer: paying the offer again would fetch a second invoice,
 //! and a retry that settled beside the first would pay twice. A later `ln_pay` of the same offer for
@@ -246,6 +249,17 @@ impl Signer {
         let (lni, inv, fetched) = match self.ln_stored_invoice(&o, known.as_ref(), &terms) {
             Some((s, inv)) => (s, inv, false),
             None => {
+                // each FetchInvoice has the node send an onion message: bounded per offer, as the sends are
+                let mut asked: Vec<f64> = known.as_ref().and_then(|k| k.get("fetch_ts")).and_then(Value::as_array).into_iter().flatten()
+                    .filter_map(Value::as_f64).filter(|t| *t >= now - 3600.0).collect();
+                if pol.max_sends_per_hour > 0 && asked.len() as i64 >= pol.max_sends_per_hour {
+                    return self.ln_refuse("ln_rate_limit", &format!("already {} invoices asked for this offer in the last hour (ln.max_sends_per_hour)",
+                                                                    pol.max_sends_per_hour), &dest, "");
+                }
+                asked.push(now);
+                if let Err(e) = store.merge(&id, json!({"fetch_ts": asked})) {
+                    return self.ln_refuse("ln_offer_store", &e.msg, &dest, "");
+                }
                 // an offer with an amount is asked for that amount by leaving it out
                 let resp = match ln.fetch_invoice(offer, if o.amount.is_some() { 0 } else { amount_msat }, pol.timeout_s.max(1)) {
                     Ok(r) => r,
