@@ -537,9 +537,8 @@ impl RoutePayer {
         }
         let pubk = self.signer.new_key(&self.hub_url)?;
         let payer_spk = self.signer.payer_spk()?;
-        let lo = py_u64(ex.get("minExpiryBlocks")).unwrap_or(0) + 6;
-        let hi = py_u64(ex.get("maxExpiryBlocks")).unwrap_or(u64::MAX).saturating_sub(1);
-        let expiry = (self.height)()? + (self.cfg.expiry_blocks as u64).max(lo).min(hi) as u32;
+        let blocks = crate::funding::offer_expiry_blocks(&ex, self.cfg.expiry_blocks as u64)?;
+        let expiry = (self.height)()? + u32::try_from(blocks).map_err(|_| ChannelError::new("bad_offer", "expiry blocks"))?;
         let pay_to = hex::decode(py_str(acc.get("payTo"))).map_err(|_| ChannelError::new("bad_offer", "payTo"))?;
         let p = ChannelParams::derive(&pay_to, &pubk, expiry, py_u64(ex.get("closeFeeSat")).unwrap_or(0), payer_spk, &self.cfg.network, fee_payer)?;
         let hrp = if self.cfg.network == XBT_MAINNET { "bc" } else { "bcrt" };

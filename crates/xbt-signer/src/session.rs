@@ -219,9 +219,18 @@ impl Session {
         }
         let min_exp = or_int(extra.get("minExpiryBlocks"), 1)?;
         let max_exp = or_int(extra.get("maxExpiryBlocks"), 100_000)?;
-        // the provider's funding check also wants `left >= minExpiry + closeMargin`, and its policy
-        // default margin is 36, so a channel opened at exactly minExpiry is refused
-        let blocks = expiry_blocks.max(min_exp + 6).max(min_exp + 36).min(max_exp - 1);
+        let min_conf = match extra.get("minConf") {
+            None => 1,
+            Some(v) => py_int(Some(v)).map(|x| x.max(0)).unwrap_or(1),
+        };
+        // The provider checks `left >= minExpiryBlocks` at its tip when the funded open reaches it,
+        // after the funding's minConf confirmations and however long it waited for the first. The
+        // allowance for that is the offer's own (xbt402::funding::open_expiry_floor, AGP-076).
+        let margin = py_int(extra.get("closeMarginBlocks")).filter(|m| *m >= 0)
+            .ok_or_else(|| rt("offer closeMarginBlocks is missing or not a block count; refused before funding"))?;
+        let nn = |x: i64| x.max(0) as u64;
+        let blocks = xbt402::funding::open_expiry_blocks(nn(expiry_blocks), nn(min_exp), nn(max_exp), nn(min_conf), nn(margin));
+        let blocks = i64::try_from(blocks).map_err(|_| rt("offer expiry window is not a block count"))?;
         self.hot.check_channel_funding()?; // AGP-013: above the hot-balance cap, a human sweeps first
         let open_height = self.height()? as i64;
         let expiry = open_height + blocks;
@@ -233,10 +242,6 @@ impl Session {
         let params = xbt402::channel::ChannelParams::derive(&pay_to, &hex::decode(&payer_pub).unwrap_or_default(), expiry as u32,
                                                             close_fee as u64, Some(self.hot.spk()), &network, fp)?;
         let funded = cap + payer_fee;
-        let min_conf = match extra.get("minConf") {
-            None => 1,
-            Some(v) => py_int(Some(v)).map(|x| x.max(0)).unwrap_or(1),
-        };
         let open_url = format!("{dest}{}", extra.get("openUrl").and_then(Value::as_str).unwrap_or(xbt402::wire::OPEN_PATH));
         self.preflight(&open_url, &network, &params, funded, &fee_payer)?;
         let prep = self.hot.prepare_fund(&params.spk(), funded, DEFAULT_FEE)?;
