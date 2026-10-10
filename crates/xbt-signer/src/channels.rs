@@ -581,7 +581,7 @@ impl ChannelBook {
     pub fn issue_key(&self, origin: &str) -> Result<String> {
         let (s, pubk) = self.new_payer_key();
         let mut g = self.lock();
-        g.secrets.insert(format!("pending:{origin}"), s);
+        wipe(g.secrets.insert(format!("pending:{origin}"), s)); // an issued key never used is replaced
         self.persist(&g)?;
         Ok(pubk)
     }
