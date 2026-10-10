@@ -92,7 +92,8 @@ fn seller_pay_to() -> Vec<u8> {
 
 // --- W1: streams ------------------------------------------------------------------------------------
 
-const PRICE: i64 = 500;
+/// Above the dust floor: a hash lock for less is refused.
+const PRICE: i64 = 600;
 
 /// A two-chunk stream sold by the rig's provider key: chunk 0 in the clear, chunk 1 hash-locked.
 struct Stream {
@@ -117,8 +118,12 @@ fn stream(chunk_url: &str) -> Stream {
 
 /// The rig's provider, answering every paid call with `doc`.
 fn stream_provider(rig: &Rig, doc: Value) {
+    provider_with(rig, doc, 10_000);
+}
+
+fn provider_with(rig: &Rig, doc: Value, min_capacity: u64) {
     let mut cfg = ProviderConfig::new(&rig.chain.network());
-    cfg.policy.min_capacity = 10_000;
+    cfg.policy.min_capacity = min_capacity;
     cfg.policy.max_capacity = 10_000;
     cfg.policy.min_expiry_blocks = 1_008;
     cfg.policy.min_conf = 1;
@@ -197,13 +202,13 @@ fn w1_the_streams_hash_locked_last_chunk_is_booked_before_it_is_signed() {
     let r = buy_stream(&rig);
     assert_eq!(r["stream"]["ok"], false, "{r}");
     let rec = rig.s.book.get(PROVIDER).unwrap();
-    assert_eq!(rec.used_sats, 1_000, "the manifest call and chunk 0, as plain states");
+    assert_eq!(rec.used_sats, 1_200, "the manifest call and chunk 0, as plain states");
     let locked: Vec<_> = leaving.lock().unwrap().iter().filter(|(u, ..)| u.ends_with("/chunk/1")).cloned().collect();
     assert_eq!(locked.len(), 1, "one hash-locked state left: {locked:?}");
-    assert_eq!(locked[0].1, 1_500);
-    assert!(locked[0].2 >= 1_500, "the hash-locked state left with the ledger at {} of the {} it signs", locked[0].2, locked[0].1);
-    assert_eq!(ledger(&rig), 1_500, "the seller holds a signature for 1,500 sat; nothing releases it");
-    assert_eq!(r["booked_sats"], 1_500, "{r}");
+    assert_eq!(locked[0].1, 1_800);
+    assert!(locked[0].2 >= 1_800, "the hash-locked state left with the ledger at {} of the {} it signs", locked[0].2, locked[0].1);
+    assert_eq!(ledger(&rig), 1_800, "the seller holds a signature for 1,800 sat; nothing releases it");
+    assert_eq!(r["booked_sats"], 1_800, "{r}");
 }
 
 /// xbt402_pay, a stream's chunks and its last chunk: at every request that carries a signed
@@ -223,7 +228,7 @@ fn w1_every_state_the_session_sends_is_in_the_ledger_before_it_leaves() {
     for (url, signs, held) in &seen {
         assert!(held >= signs, "{url}: a state signing {signs} sat left with the ledger at {held}");
     }
-    assert_eq!((rig.s.book.get(PROVIDER).unwrap().used_sats, ledger(&rig)), (1_500, 1_500), "the folded lock is not booked twice");
+    assert_eq!((rig.s.book.get(PROVIDER).unwrap().used_sats, ledger(&rig)), (1_800, 1_800), "the folded lock is not booked twice");
 }
 
 // --- W1: the socket's signing methods -------------------------------------------------------------
@@ -261,8 +266,8 @@ fn w1_every_socket_signing_method_has_booked_what_it_signs_when_it_answers() {
     assert!(r["sig"].is_string() && ledger(&rig) == 1_000, "sign_state: {r}, ledger {}", ledger(&rig));
     let r = rig.call("xbt402_sign_state_a3", json!({"chan": chan, "amount": 1_500}));
     assert!(r["sig"].is_string() && ledger(&rig) == 1_500, "0xA3: {r}, ledger {}", ledger(&rig));
-    let r = rig.call("xbt402_sign_conditional", json!({"chan": chan, "uncond": 1_500, "amount": 400, "hash": "ab".repeat(32)}));
-    assert!(r["sig"].is_string() && ledger(&rig) == 1_900, "conditional: {r}, ledger {}", ledger(&rig));
+    let r = rig.call("xbt402_sign_conditional", json!({"chan": chan, "uncond": 1_500, "amount": 600, "hash": "ab".repeat(32)}));
+    assert!(r["sig"].is_string() && ledger(&rig) == 2_100, "conditional: {r}, ledger {}", ledger(&rig));
     let r = lock(&rig, &chan, 2_500, 994, &point(&secret("t")));
     assert!(r["adaptor"].is_object() && ledger(&rig) == 2_500, "adaptor: {r}, ledger {}", ledger(&rig));
     assert_eq!(rig.call("xbt402_void_lock", json!({"chan": chan}))["voided"], true);
@@ -346,7 +351,7 @@ fn w3_mark_closed_needs_the_close_on_chain() {
 #[test]
 fn w3_a_close_the_chain_never_saw_is_refunded_at_expiry() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
-    let mut rig = Rig::new(json!({}), false);
+    let mut rig = Rig::new(json!({"hot_balance_cap_sats": 100_000}), false);
     rig.fund_hot(1, 30_000);
     let t = hooked(&mut rig, Box::new(|_, url, _, _| {
         url.ends_with(CLOSE_PATH).then(|| Ok(HttpResponse::new(200, vec![], json!({"txid": "cd".repeat(32), "cum": "546", "unpaidMsat": "0"}).to_string().into_bytes())))
@@ -371,7 +376,7 @@ fn w3_a_close_the_chain_never_saw_is_refunded_at_expiry() {
 #[test]
 fn w3_a_close_on_chain_is_proven_and_the_channel_is_replaced() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
-    let rig = Rig::new(json!({}), false);
+    let rig = Rig::new(json!({"hot_balance_cap_sats": 100_000}), false);
     rig.fund_hot(1, 30_000);
     let chan = rig.open()["chan"].as_str().unwrap().to_string();
     let c = rig.call("close_channel", json!({"counterparty": PROVIDER}));
@@ -388,9 +393,12 @@ fn w3_a_close_on_chain_is_proven_and_the_channel_is_replaced() {
 #[test]
 fn w3_attach_next_needs_the_rollover_on_chain() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
-    let rig = Rig::new(json!({}), false);
+    let rig = Rig::new(json!({"max_per_tx_sats": 5000, "human_threshold_sats": 5000}), false);
+    provider_with(&rig, json!({"ok": true}), 5_000); // a rollover's next channel is smaller than the first
     rig.fund_hot(1, 12_000);
-    let chan = rig.open()["chan"].as_str().unwrap().to_string();
+    assert_eq!(rig.call("xbt402_pay", json!({"url": URL, "max_sats": 1_000}))["verdict"], "pending");
+    rig.chain.mine(1);
+    let chan = rig.call("xbt402_pay", json!({"url": URL, "max_sats": 1_000}))["chan"].as_str().unwrap().to_string();
     let rec = rig.s.book.get(PROVIDER).unwrap();
     let cur = rec.params().unwrap();
     let next = next_params(&rig, &cur, &rec.origin);

@@ -457,6 +457,31 @@ pub struct CloseResponse {
 
 #[cfg(test)]
 mod tests {
+    /// AGP-080 X1: whatever a seller writes, the URL built from it starts with the origin and a
+    /// `/`, so its host is the origin's.
+    #[test]
+    fn x1_a_seller_url_is_held_to_its_origin() {
+        let o = "https://api.example:8443";
+        for good in ["/x402/xbt-channel/open", "/c/{i}?a=b", "https://api.example:8443/x402/open", "/"] {
+            let u = seller_url(o, good).unwrap();
+            assert!(u.starts_with("https://api.example:8443/"), "{good} -> {u}");
+        }
+        assert_eq!(seller_url("https://api.example:8443/", "/open").unwrap(), "https://api.example:8443/open");
+        for bad in ["@evil.example/open", "//evil.example/open", ".evil.example/open", ":9/open", "open", "", "https://evil.example/open",
+                    "https://api.example:8443@evil.example/open", "https://api.example:8443.evil.example/open", "https://api.example:84430/open",
+                    "http://api.example:8443/open", "/open\\@evil.example", "/a b", "/a\tb", "/a\nHost: evil", "\\\\evil.example/open",
+                    "javascript://api.example/open", "https://api.example:8443"] {
+            let r = seller_url(o, bad);
+            assert_eq!(r.as_ref().err().map(|e| e.code.as_str()), Some("seller_url"), "{bad:?} -> {r:?}");
+        }
+        // every prefix an attacker can put after the origin: the result never leaves it
+        for lead in ["@", ".", ":", "-", "%2f", "\\", "?", "#", "x"] {
+            if let Ok(u) = seller_url(o, &format!("{lead}evil.example/open")) {
+                assert!(u.starts_with("https://api.example:8443/"), "{lead}: {u}");
+            }
+        }
+    }
+
     use super::*;
     use serde_json::json;
 
