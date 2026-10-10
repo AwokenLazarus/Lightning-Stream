@@ -2150,6 +2150,12 @@ within `room`; these reach it or the payments:
 - Fraud proofs still convict only for a checker who knows the Prime's terms; T2/T4 for the xbt-work
   rail are not part of this task.
 
+**Cost.** `cargo run --release -p xbt-work --example audit_cost` on x86_64, this branch against `main`
+(`0a84665`), 1,000 receipted increases over 100 invoices: credit room per paid call 0.02 µs (main
+1.8 µs), `audit_block` 71 µs (71 µs), `check_fraud_proof` 2.9 ms (2.9 ms). The AGP-065 pass lines are
+for armv7; armv7 was not rerun. The room is now one walk over the unpaid credit instead of over every
+span.
+
 **XBT-053.** The Python reference (`~/xbt-rnd/XBT-053`, `receipts.py`) implements the v1 draft audit:
 no bounds, no chain block, no missing-statement rule, no caps. The audit rules of AGP-065 and the cover
 rule above are specified by this crate, which is the reference for them until the spec (§10.2, §10.3,
