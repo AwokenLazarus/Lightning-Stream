@@ -529,8 +529,10 @@ fn hole_two_crashes_after_a_request_left_do_not_end_the_channel() {
         c = make(&w);
         after.push((0..4).map(|_| get(&mut c)).collect::<Vec<_>>());
     }
-    // the first call after a crash comes back 402 (its seq, then its amount, are one call behind)
-    assert_eq!(after[0], [Ok(402), Ok(200), Ok(200), Ok(200)], "one crash is covered by the channel's slack");
+    // AGP-096 changed this line, and no other in this file: the audit pinned the first call after
+    // a crash at 402 (its seq, then its amount, were one call behind, and the channel's slack
+    // covered that once). The request's count is now saved before it leaves, so the call pays.
+    assert_eq!(after[0], [Ok(200), Ok(200), Ok(200), Ok(200)], "a crash after a request left costs no later call");
     let chan = c.channels[O].payer.params.channel_id();
     assert!(after[1].contains(&Ok(200)), "after the second crash every call fails: {:?}; the provider has charged {} msat, the payer's book says {}",
             after[1], w.prov().channel_state(&chan).unwrap().spent_msat, c.channels[O].spent_msat);
@@ -572,7 +574,7 @@ fn hole_two_forged_refusals_do_not_end_the_channel() {
     let out: Vec<_> = (0..12).map(|_| get(&mut c)).collect();
     let charged = w.prov().channel_state(&chan).unwrap().spent_msat / (PRICE * 1000);
     let kept = c.channels[O].receipts.len();
-    assert!(out[1..].iter().any(|o| *o == Ok(200)), "after a second forged refusal no call succeeds: {out:?}; the provider charged {charged} calls, \
+    assert!(out[1..].contains(&Ok(200)), "after a second forged refusal no call succeeds: {out:?}; the provider charged {charged} calls, \
                                                       the payer kept {kept} answers");
 }
 
@@ -777,6 +779,7 @@ fn ok_no_number_from_a_payer_panics_the_provider() {
     let p = ch.payer.params.clone();
     let open = json!({"capacity": p.capacity, "expiry": p.expiry, "payerPub": hex::encode(p.payer_pub), "payerSpk": hex::encode(&p.payer_spk),
                       "redeemScript": hex::encode(p.script()), "txid": p.funding_txid(), "vout": 0});
+    #[allow(clippy::type_complexity)]
     let mut reqs: Vec<(String, &str, Value, Vec<(String, String)>)> = vec![];
     let mut seq = 1_000u64;
     for x in extreme_numbers() {

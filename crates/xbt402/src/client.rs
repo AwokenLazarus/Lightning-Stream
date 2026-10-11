@@ -186,6 +186,9 @@ pub struct PendingCond {
 pub enum Stage {
     /// It has a key and terms. Its funding has not left, or the call that sends it has not
     /// answered, or the funded channel is not bound to its key yet (`refund_hex` is empty).
+    /// While it has no outpoint a later call funds it only if the seller still offers its terms
+    /// and it is not too near its expiry; else it moves to [`Client::unfunded`] and a new one is
+    /// derived for the same key (AGP-096).
     Keyed,
     /// Funded and bound, the refund held (and handed to `on_refund`). The provider has not
     /// answered the funded open: the next request asks again, and nothing is funded again.
@@ -211,6 +214,9 @@ impl Stage {
 #[derive(Debug, Clone)]
 pub struct ClientChannel {
     pub payer: Payer,
+    /// The origin the channel was derived for: the name a signer issued its key under. The key of
+    /// [`Client::channels`] for every channel derived since AGP-096; a record from an older
+    /// ledger keeps the spelling it was written with.
     pub origin: String,
     /// The PaymentRequirements as received (echoed verbatim in PAYMENT-SIGNATURE).
     pub accepted: Value,
@@ -240,11 +246,18 @@ pub struct ClientChannel {
     /// In [`Client::next_rolled`]: the id of the channel whose rollover pays this one. Every
     /// attempt to roll that channel over pays the same key.
     pub rolled_from: Option<String>,
+    /// The wallet was asked to fund this channel (saved before it is asked, AGP-096): a `fund`
+    /// call can fail after it sent, so the channel may hold coins though no outpoint is known.
+    /// Only such a channel is kept in [`Client::unfunded`] when it is derived again; one the
+    /// wallet never heard of holds nothing and is dropped, so a seller that changes its offer on
+    /// every call fills nothing.
+    pub fund_tried: bool,
 }
 
 /// Most unresolved records kept per origin: next channels of one channel's rollover attempts
-/// ([`Client::next_rolled`]) and stale unfunded opens ([`Client::unfunded`]). Twice the signed
-/// spends a provider keeps per channel (AGP-085), so an honest provider's bound is met first.
+/// ([`Client::next_rolled`]) and earlier scripts of an open that was never funded
+/// ([`Client::unfunded`]). Twice the signed spends a provider keeps per channel (AGP-085), so an
+/// honest provider's bound is met first.
 pub const MAX_KEPT: usize = 16;
 
 /// Receipts kept per channel record in a [`ClientLedger`] (the newest; memory keeps them all).
@@ -264,7 +277,8 @@ impl ClientChannel {
                "accepted": self.accepted, "refund_hex": self.refund_hex, "auth_key": hex::encode(self.auth_key), "price": self.price,
                "slack_msat": self.slack_msat, "seq": self.seq, "spent_msat": self.spent_msat, "last_sig": self.last_sig,
                "pending_cond": pending, "acked_cum": self.acked_cum, "receipts": &self.receipts[from..],
-               "stage": self.stage.as_str(), "unanswered_msat": self.unanswered_msat, "rolled_from": self.rolled_from})
+               "stage": self.stage.as_str(), "unanswered_msat": self.unanswered_msat, "rolled_from": self.rolled_from,
+               "fund_tried": self.fund_tried})
     }
 
     /// Inverse of [`to_json`](Self::to_json). A `"signer"` record needs the signer that holds its
@@ -315,6 +329,11 @@ impl ClientChannel {
                 Some(n) => n.as_u64().ok_or_else(|| bad("unanswered_msat"))?,
             },
             rolled_from: v.get("rolled_from").and_then(Value::as_str).map(str::to_string),
+            // a keyed record from AGP-090 does not say: it stayed keyed because a fund call failed
+            fund_tried: match v.get("fund_tried") {
+                None => v.get("stage").and_then(Value::as_str) == Some("keyed"),
+                Some(b) => b.as_bool().ok_or_else(|| bad("fund_tried"))?,
+            },
         })
     }
 }
@@ -322,8 +341,9 @@ impl ClientChannel {
 /// Where a [`Client`] keeps its channel book (AGP-035). Records are JSON under string keys:
 /// `"book"` (the budget counters), `"chan <origin>"`, `"rolled <origin>"` (a channel replaced by
 /// a rollover, until its successor is opened), `"next <origin>"` (the next channels of rollovers
-/// this client signed) and `"unfunded <origin>"` (keys of opens whose funding call failed and that
-/// are too old to fund now); `null` removes a key. Implement it over any store;
+/// this client signed) and `"unfunded <origin>"` (channels derived for an open whose funding call
+/// failed and that were derived again since); `null` removes a key. `<origin>` is the origin as
+/// [`split_url`] reads it. Implement it over any store;
 /// [`FileClientLedger`] and [`MemoryClientLedger`] are provided.
 pub trait ClientLedger: Send + Sync {
     /// The latest record per key (no `null`s), in the order the keys were first saved.
@@ -505,9 +525,11 @@ pub struct Client {
     /// rollover (`refund_hex` is empty until then). [`adopt_rolled`](Self::adopt_rolled) makes one
     /// the live channel; one whose transaction can no longer confirm is the embedder's to remove.
     pub next_rolled: HashMap<String, Vec<ClientChannel>>,
-    /// Channels in [`Stage::Keyed`] whose funding call failed and whose expiry is now too near to
-    /// fund, per origin (AGP-090). A wallet's `fund` can fail after it broadcast, so their keys are
-    /// kept in case a funding to one of them shows up; at most [`MAX_KEPT`] per origin.
+    /// Channels in [`Stage::Keyed`] that a later call could not fund as they were (too near their
+    /// expiry, or on terms the seller no longer offered) and derived again, per origin (AGP-090,
+    /// AGP-096). A wallet's `fund` can fail after it broadcast, so their terms are kept in case a
+    /// funding to one of them shows up. They all pay one key, the key of the origin's next
+    /// channel, so past [`MAX_KEPT`] the oldest script is forgotten and its key is not.
     pub unfunded: HashMap<String, Vec<ClientChannel>>,
     /// AGP-027: where the payer keys live (B2's signer). `None`: this client holds them.
     signer: Option<Arc<dyn StateSigner>>,
@@ -525,8 +547,15 @@ fn random_secret() -> SecretKey {
     crate::signer::random_secret()
 }
 
-/// `("https://host:port", "/path?query")` of a URL, as the reference splits it.
+/// `("https://host:port", "/path?query")` of a URL. The origin of an absolute URL is the one the
+/// request binding reads ([`canonical_origin`](crate::wire::canonical_origin): lowercase, no
+/// userinfo, no default port), so every spelling of one seller is one key in a payer's book
+/// (AGP-096). Anything else is split at its third `/`, as the reference splits it.
 pub fn split_url(url: &str) -> (String, String) {
+    let origin = crate::wire::canonical_origin(url);
+    if !origin.is_empty() {
+        return (origin, crate::wire::request_url(url).target);
+    }
     let parts: Vec<&str> = url.split('/').collect();
     let origin = parts[..parts.len().min(3)].join("/");
     let path = format!("/{}", if parts.len() > 3 { parts[3..].join("/") } else { String::new() });
@@ -571,22 +600,75 @@ impl Client {
     /// each paid call, close and rollover touches. Call [`with_signer`](Self::with_signer) first
     /// when the payer keys live in a signer.
     pub fn with_ledger(mut self, ledger: Box<dyn ClientLedger>) -> Result<Self> {
-        for (k, v) in ledger.load()? {
+        // AGP-096: a record is kept under its origin as split_url reads it. A ledger from before
+        // may hold one under another spelling. It moves to the origin's own key; if another
+        // channel is there already (two spellings of one seller were funded), it stays under its
+        // spelling, where close and rollover by that spelling find it and no request reaches it.
+        // Its `origin` field is not rewritten: a signer knows the channel's key by that name.
+        let home = |o: &str| Some(crate::wire::canonical_origin(o)).filter(|c| !c.is_empty()).unwrap_or_else(|| o.to_string());
+        // records already under their origin's key first, and a channel before the lists that go with it
+        let mut loaded = ledger.load()?;
+        loaded.sort_by_key(|(k, _)| k.split_once(' ').map_or((false, false), |(kind, o)| (home(o) != o, kind != "chan")));
+        let mut moved: Vec<(String, Value)> = vec![];
+        let mut stays: Vec<String> = vec![];
+        for (k, v) in loaded {
             let n = |f: &str| v.get(f).and_then(Value::as_u64).unwrap_or(0);
             if k == "book" {
                 (self.opened_sats, self.day_spent, self.day_start) = (n("opened_sats"), n("day_spent"), n("day_start"));
-            } else if let Some(o) = k.strip_prefix("chan ") {
-                self.channels.insert(o.to_string(), ClientChannel::from_json(&v, self.signer.as_ref())?);
-            } else if let Some(o) = k.strip_prefix("rolled ") {
-                self.pending_rolled.insert(o.to_string(), ClientChannel::from_json(&v, self.signer.as_ref())?);
-            } else if let Some((next, o)) = k.strip_prefix("next ").map(|o| (true, o)).or_else(|| k.strip_prefix("unfunded ").map(|o| (false, o))) {
-                let list = v.as_array().ok_or_else(|| ChannelError::new("ledger_error", "client channel list record: not a list"))?;
-                let list = list.iter().map(|c| ClientChannel::from_json(c, self.signer.as_ref())).collect::<Result<Vec<_>>>()?;
-                if next { &mut self.next_rolled } else { &mut self.unfunded }.insert(o.to_string(), list);
+                continue;
             }
+            let Some((kind, o)) = k.split_once(' ').filter(|(kind, _)| matches!(*kind, "chan" | "rolled" | "next" | "unfunded")) else { continue };
+            let to = home(o);
+            let one = |v: &Value| ClientChannel::from_json(v, self.signer.as_ref());
+            // where the record goes: the origin's own key, or its spelling when that key is taken;
+            // None for a second copy of the channel already there (a move whose save was torn)
+            let at = if kind == "chan" || kind == "rolled" {
+                let ch = one(&v)?;
+                let book = if kind == "chan" { &mut self.channels } else { &mut self.pending_rolled };
+                let same = book.get(&to).map(|have| have.payer.params == ch.payer.params);
+                if to != o && same == Some(true) {
+                    None
+                } else if to != o && (same.is_some() || stays.iter().any(|s| s == o)) {
+                    stays.push(o.to_string());
+                    book.insert(o.to_string(), ch);
+                    Some(o)
+                } else {
+                    book.insert(to.clone(), ch);
+                    Some(to.as_str())
+                }
+            } else {
+                let list = v.as_array().ok_or_else(|| ChannelError::new("ledger_error", "client channel list record: not a list"))?;
+                let list = list.iter().map(one).collect::<Result<Vec<_>>>()?;
+                let book = if kind == "next" { &mut self.next_rolled } else { &mut self.unfunded };
+                if to != o && (book.contains_key(&to) || stays.iter().any(|s| s == o)) {
+                    book.insert(o.to_string(), list);
+                    Some(o)
+                } else {
+                    book.insert(to.clone(), list);
+                    Some(to.as_str())
+                }
+            };
+            if at != Some(o) {
+                if let Some(at) = at {
+                    moved.push((format!("{kind} {at}"), v.clone()));
+                }
+                moved.push((k.clone(), Value::Null));
+            }
+        }
+        if !moved.is_empty() {
+            ledger.save(&moved)?;
         }
         self.ledger = Some(ledger);
         Ok(self)
+    }
+
+    /// The key of `origin` in the book: the origin as [`split_url`] reads it, or `origin` as given
+    /// when a record is there under that spelling (a ledger from before AGP-096 that held two
+    /// spellings of one seller).
+    fn book_key(&self, origin: &str) -> String {
+        let has = |o: &str| self.channels.contains_key(o) || self.pending_rolled.contains_key(o) || self.next_rolled.contains_key(o) || self.unfunded.contains_key(o);
+        let canon = crate::wire::canonical_origin(origin);
+        if canon.is_empty() || has(origin) { origin.to_string() } else { canon }
     }
 
     /// Save the budget counters and `origin`'s channels (every channel when `None`) to the
@@ -597,7 +679,7 @@ impl Client {
         let mut recs = vec![("book".to_string(), json!({"opened_sats": self.opened_sats, "day_spent": self.day_spent, "day_start": self.day_start}))];
         let rec = |c: Option<&ClientChannel>| c.map(ClientChannel::to_json).unwrap_or(Value::Null);
         let list = |l: &Vec<ClientChannel>| Value::Array(l.iter().map(ClientChannel::to_json).collect());
-        match origin {
+        match origin.map(|o| self.book_key(o)).as_deref() {
             Some(o) => {
                 recs.push((format!("chan {o}"), rec(self.channels.get(o))));
                 recs.push((format!("rolled {o}"), rec(self.pending_rolled.get(o))));
@@ -647,6 +729,19 @@ impl Client {
                 let sk = random_secret();
                 Ok((ecdsa::pubkey(&sk).to_vec(), Some(sk), None))
             }
+        }
+    }
+
+    /// The payer key of a new channel to `origin` (AGP-096): the key of the channel last derived
+    /// for it and never funded, if there is one, else a new key. Every channel derived for an
+    /// origin until one is funded pays one key, so no retry of an open makes a key that could be
+    /// dropped: a signer answers the key it issued and has not bound ([`StateSigner::new_key`]),
+    /// and a local key is read back from [`unfunded`](Self::unfunded).
+    fn open_key(&self, origin: &str) -> Result<FreshKey> {
+        let kept = self.unfunded.get(origin).and_then(|l| l.last());
+        match (kept.and_then(|c| c.payer.secret()), kept) {
+            (Some(sk), Some(c)) if self.signer.is_none() => Ok((c.payer.params.payer_pub.to_vec(), Some(*sk), None)),
+            _ => self.fresh_key(origin),
         }
     }
 
@@ -733,11 +828,12 @@ impl Client {
     /// and no to the open (or an answer lost on the way) left the coins in a script whose only
     /// payer key had been dropped, and every later call funded another channel.
     fn ensure_open(&mut self, origin: &str, acc: &Value) -> Result<()> {
-        if !self.channels.contains_key(origin) {
+        let keyed_now = !self.channels.contains_key(origin);
+        if keyed_now {
             self.key_channel(origin, acc)?;
         }
         if self.channels[origin].stage == Stage::Keyed {
-            self.fund_keyed(origin)?;
+            self.fund_keyed(origin, acc, keyed_now)?;
         }
         if self.channels[origin].stage == Stage::Funded {
             self.post_open(origin)?;
@@ -760,7 +856,7 @@ impl Client {
         let pay_to = hex::decode(acc.get("payTo").and_then(Value::as_str).unwrap_or("")).map_err(|_| ChannelError::new("bad_offer", "payTo"))?;
         let close_fee = ex_u64(&ex, "closeFeeSat")?;
         let open_url = Self::open_url(origin, acc)?;
-        let (pubk, secret, payer_spk) = self.fresh_key(origin)?;
+        let (pubk, secret, payer_spk) = self.open_key(origin)?;
         let mut p = ChannelParams::derive(&pay_to, &pubk, expiry, close_fee, payer_spk, &self.cfg.network, fee_payer)?;
         p.capacity = cap;
         self.preflight(&open_url, &Self::open_terms(&p), fee_payer)?;
@@ -775,7 +871,7 @@ impl Client {
         let price = py_u64(acc.get("amount")).unwrap_or(0);
         self.channels.insert(origin.into(), ClientChannel { payer, origin: origin.into(), accepted: acc.clone(), refund_hex: String::new(), auth_key, price,
                                                             slack_msat: 0, seq: 0, spent_msat: 0, last_sig: String::new(), pending_cond: None, acked_cum: 0,
-                                                            receipts: vec![], stage: Stage::Keyed, unanswered_msat: 0, rolled_from: None });
+                                                            receipts: vec![], stage: Stage::Keyed, unanswered_msat: 0, rolled_from: None, fund_tried: false });
         self.persist(Some(origin))
     }
 
@@ -799,38 +895,50 @@ impl Client {
 
     /// Fund the [`Stage::Keyed`] channel of `origin` (unless an earlier call did), bind it to its
     /// key and hold its refund: [`Stage::Funded`], saved before the provider hears of the outpoint.
-    fn fund_keyed(&mut self, origin: &str) -> Result<()> {
+    /// `acc`: the offer of this call. `keyed_now`: this call derived the channel from it.
+    fn fund_keyed(&mut self, origin: &str, acc: &Value, keyed_now: bool) -> Result<()> {
         let no = || ChannelError::code("no_channel");
         if self.channels.get(origin).ok_or_else(no)?.payer.params.funding.is_none() {
-            let (p, ex) = {
-                let ch = &self.channels[origin];
-                (ch.payer.params.clone(), ch.accepted.get("extra").cloned().unwrap_or(Value::Null))
-            };
+            let p = self.channels[origin].payer.params.clone();
             let addr = segwit_address(self.hrp(), &p.spk())?;
             // an earlier fund call may have failed after it broadcast: the wallet's own record of
             // a send to this script is used before anything is sent again
             let (txid, vout) = match self.wallet_send_to(&addr, p.capacity)? {
                 Some(o) => o,
                 None => {
-                    if (p.expiry as u64) < ((self.height)()? as u64).saturating_add(crate::funding::offer_expiry_floor(&ex)?) {
-                        // too near its expiry to open now. The key stays in the ledger, in case that
-                        // earlier call did fund it, and the open starts again with a new key
-                        return self.shelve_keyed(origin);
+                    if !keyed_now && !self.still_offered(origin, acc)? {
+                        // set aside as too old: the same offer, a new expiry, funded by this call
+                        self.key_channel(origin, acc)?;
+                        return self.fund_keyed(origin, acc, true);
                     }
-                    self.wallet.fund_channel(origin, &p, &addr, p.capacity)?
+                    // The budget, on the day the coins leave (AGP-096): it was checked when the
+                    // channel was derived, and channels to other origins may have been funded
+                    // since (six origins derived while the wallet was empty were all funded later,
+                    // 1,200,000 sat under a budget of 1,000,000).
+                    if self.opened_sats.checked_add(p.capacity).is_none_or(|t| t > self.cfg.budget_sats) {
+                        return fail("budget", "channel capacity outside our budget");
+                    }
+                    // on the books that the wallet was asked, before it is asked
+                    let ch = self.channels.get_mut(origin).ok_or_else(no)?;
+                    if !ch.fund_tried {
+                        ch.fund_tried = true;
+                        self.persist(Some(origin))?;
+                    }
+                    self.wallet.fund_channel(&self.channels[origin].origin, &p, &addr, p.capacity)?
                 }
             };
-            let funded = p.with_funding(&txid, vout, self.channels[origin].payer.params.capacity)?;
+            let cap = p.capacity;
+            let funded = p.with_funding(&txid, vout, cap)?;
             self.opened_sats = self.opened_sats.saturating_add(funded.capacity);
             self.channels.get_mut(origin).ok_or_else(no)?.payer.params = funded;
             self.persist(Some(origin))?;
         }
-        let (p, secret) = {
+        let (p, secret, named) = {
             let ch = &self.channels[origin];
-            (ch.payer.params.clone(), ch.payer.secret().copied())
+            (ch.payer.params.clone(), ch.payer.secret().copied(), ch.origin.clone())
         };
         let expiry = p.expiry;
-        let (payer, refund_hex, auth_key) = self.bind_key(origin, p, secret)?;
+        let (payer, refund_hex, auth_key) = self.bind_key(&named, p, secret)?;
         if let Some(cb) = &self.on_refund {
             cb(&refund_hex, expiry);
         }
@@ -851,27 +959,91 @@ impl Client {
         Ok(None)
     }
 
-    /// Move `origin`'s stale [`Stage::Keyed`] channel to [`unfunded`](Self::unfunded) and report
-    /// the open as failed; the next call opens with a new key. A signer holds one issued key per
-    /// origin and a new one would replace this one, so with a signer the record stays where it is
-    /// until the embedder calls [`forget_unfunded`](Self::forget_unfunded).
-    fn shelve_keyed(&mut self, origin: &str) -> Result<()> {
-        let kept = self.unfunded.get(origin).map_or(0, Vec::len);
-        if self.signer.is_some() || kept >= MAX_KEPT {
-            return fail("open_unresolved", format!("an earlier open to {origin} never learned whether its funding was sent, and its channel is too near \
-                                                    expiry to fund now: once the wallet shows no send to it, call forget_unfunded"));
+    /// Whether the [`Stage::Keyed`] channel of `origin`, derived by an earlier call and not funded
+    /// since, is funded by this one: `acc`, the offer of this call, still describes it, the
+    /// provider answers yes to its terms again, and it has the blocks a funding needs.
+    ///
+    /// The rule (AGP-096, audit items 6 and 18): **a channel is funded only on terms the seller
+    /// offers and says yes to in the call that funds it, and a channel that holds no coins never
+    /// stands between its origin and the next one.** The preflight (review C2) was asked once, when
+    /// the channel was derived, so a later call funded it on the terms of that day: after a seller
+    /// changed its payTo key, 200,000 sat were locked until the expiry. And a channel too near its
+    /// expiry stayed on the books with a signer, or was refused for good after sixteen with a
+    /// local key, so one failed `fund` call could end a payer's business with a seller.
+    ///
+    /// A channel that fails one of the three is set aside ([`unfunded`](Self::unfunded)); every
+    /// channel derived after it pays the same key ([`open_key`](Self::open_key)).
+    /// - Too near its expiry ([`offer_retry_floor`](crate::funding::offer_retry_floor)), on an
+    ///   offer that is otherwise the same: `Ok(false)`, and the caller derives it again and funds
+    ///   that in this call, as a first call would.
+    /// - Terms the seller changed or now refuses: the channel is derived again from this call's
+    ///   offer and the call fails `open_unresolved` with nothing funded; the next call funds it,
+    ///   after this same check. The owner's coins do not leave in the call that found the seller
+    ///   changed its terms.
+    /// - An answer that never came says nothing about the terms: the error goes back and the
+    ///   channel stays for the next call.
+    fn still_offered(&mut self, origin: &str, acc: &Value) -> Result<bool> {
+        let ch = self.channels.get(origin).ok_or_else(|| ChannelError::code("no_channel"))?;
+        let p = &ch.payer.params;
+        let ex = acc.get("extra").cloned().unwrap_or(Value::Null);
+        let offered = || -> Result<bool> {
+            let fee_payer = FeePayer::parse(ex.get("closeFeePayer").and_then(Value::as_str).unwrap_or("payer"))?;
+            let pay_to = hex::decode(acc.get("payTo").and_then(Value::as_str).unwrap_or("")).map_err(|_| ChannelError::new("bad_offer", "payTo"))?;
+            let mut now = ChannelParams::derive(&pay_to, &p.payer_pub, p.expiry, ex_u64(&ex, "closeFeeSat")?, Some(p.payer_spk.clone()), &self.cfg.network, fee_payer)?;
+            now.capacity = p.capacity;
+            let caps = ex_u64(&ex, "minCapacity")?..=py_u64(ex.get("maxCapacity")).unwrap_or(u64::MAX);
+            // a price above the one pinned when the channel was derived would be refused on every
+            // call once it is open ("price raised mid-channel")
+            Ok(now == *p && caps.contains(&p.capacity) && py_u64(acc.get("amount")).unwrap_or(0) <= Self::quote(ch))
+        };
+        let why = if !offered()? {
+            "the seller no longer offers its terms".to_string()
+        } else if (p.expiry as u64) < ((self.height)()? as u64).saturating_add(crate::funding::offer_retry_floor(&ex)?) {
+            self.set_aside(origin)?;
+            return Ok(false);
+        } else {
+            match self.preflight(&Self::open_url(origin, acc)?, &Self::open_terms(p), p.close_fee_payer) {
+                Ok(()) => return Ok(true),
+                Err(e) if e.code == "transport_error" => return Err(e),
+                Err(e) => format!("the seller refused its terms ({})", e.code),
+            }
+        };
+        self.set_aside(origin)?;
+        // derived again now, so that the next call finds the channel it funds; a seller that
+        // refuses the new terms too answers that call itself
+        let _ = self.key_channel(origin, acc);
+        fail("open_unresolved", format!("an earlier open to {origin} was never funded and {why}: it is set aside, nothing was funded, and the next call opens a new channel"))
+    }
+
+    /// Take `origin`'s unfunded [`Stage::Keyed`] channel off the books. If the wallet was asked
+    /// to fund it, it moves to [`unfunded`](Self::unfunded): the `fund` call that failed may have
+    /// sent after all, so its terms are kept. If the wallet never heard of it, it is dropped.
+    fn set_aside(&mut self, origin: &str) -> Result<()> {
+        if let Some(ch) = self.channels.remove(origin).filter(|ch| ch.fund_tried) {
+            let signer = self.signer.is_some();
+            let kept = self.unfunded.entry(origin.to_string()).or_default();
+            if kept.len() >= MAX_KEPT {
+                // Every channel derived for an origin pays one key (open_key), so the oldest script
+                // goes and its key stays, in a newer record. A record with a key of its own (a
+                // ledger from AGP-090 kept one key per failed open) is not dropped; with a signer
+                // the keys are the signer's to keep, and the oldest goes.
+                let pays = |c: &ClientChannel, k: &ClientChannel| c.payer.params.payer_pub == k.payer.params.payer_pub;
+                let oldest = (0..kept.len()).find(|&i| kept[i + 1..].iter().any(|c| pays(c, &kept[i])) || pays(&ch, &kept[i]));
+                if let Some(i) = oldest.or(signer.then_some(0)) {
+                    kept.remove(i);
+                }
+            }
+            kept.push(ch);
         }
-        if let Some(ch) = self.channels.remove(origin) {
-            self.unfunded.entry(origin.to_string()).or_default().push(ch);
-        }
-        self.persist(Some(origin))?;
-        fail("open_unresolved", format!("an earlier open to {origin} was too old to fund; its key is kept, and the next call opens a new channel"))
+        self.persist(Some(origin))
     }
 
     /// Drop the channels of `origin` that were never funded: the one in [`Stage::Keyed`] without
     /// an outpoint, and those in [`unfunded`](Self::unfunded). Call it only when the wallet shows
-    /// no send to their scripts: their keys go with them. Returns how many were dropped.
+    /// no send to their scripts: their keys go with them. Returns how many were dropped. Nothing
+    /// needs it to go on paying (AGP-096): it only tidies the book.
     pub fn forget_unfunded(&mut self, origin: &str) -> Result<usize> {
+        let origin = &self.book_key(origin);
         let mut n = self.unfunded.remove(origin).map_or(0, |l| l.len());
         if self.channels.get(origin).is_some_and(|c| c.stage == Stage::Keyed && c.payer.params.funding.is_none()) {
             self.channels.remove(origin);
@@ -942,7 +1114,7 @@ impl Client {
             self.day_spent = 0;
             self.day_start = now();
         }
-        if self.cfg.daily_budget > 0 && self.day_spent + sats > self.cfg.daily_budget {
+        if self.cfg.daily_budget > 0 && self.day_spent.checked_add(sats).is_none_or(|t| t > self.cfg.daily_budget) {
             return fail("budget", "daily budget exhausted");
         }
         Ok(())
@@ -956,7 +1128,10 @@ impl Client {
             return fail("no_channel", "the channel is not open at the provider yet");
         }
         let billing = ch.accepted.get("extra").and_then(|e| e.get("billing")).and_then(Value::as_str).unwrap_or("postpay");
-        let need_msat = ch.spent_msat + if billing == "prepay" { price * 1000 } else { 0 };
+        // saturating (AGP-096): `price` is the seller's number, bounded only by the owner's
+        // `max_price`, which a wallet may take from its caller; an amount that does not fit is
+        // refused below as `exhausted`, never a panic
+        let need_msat = ch.spent_msat.saturating_add(if billing == "prepay" { price.saturating_mul(1000) } else { 0 });
         let mut cum = need_msat.div_ceil(1000).max(ch.payer.signed);
         let pmin = ch.payer.params.min_amount();
         if cum > 0 && cum < pmin {
@@ -977,14 +1152,14 @@ impl Client {
             // under the minimum state nothing is signed yet (c >= signed): never round the caller up
             cum = if c < pmin { 0 } else { c };
         }
-        let delta = cum - ch.payer.signed;
+        let delta = cum.saturating_sub(ch.payer.signed);
         self.check_daily(delta)?;
         let ch = self.channels.get_mut(origin).ok_or_else(|| ChannelError::code("no_channel"))?;
         let remaining = ch.payer.params.max_amount() as i128 - ch.payer.signed.max(ch.spent_msat / 1000) as i128;
         if remaining < price as i128 && ch.payer.signed > 0 {
             return fail("exhausted", "channel low: roll it over (Client::rollover) or close and reopen");
         }
-        ch.seq += 1;
+        ch.seq = ch.seq.checked_add(1).ok_or_else(|| ChannelError::new("exhausted", "the channel's request counter is used up: close and reopen"))?;
         if !path.is_empty() {
             // a call (a close charges nothing): the provider may serve it whether or not its
             // answer reaches us, so its quote counts until a receipt says what was charged
@@ -999,7 +1174,7 @@ impl Client {
             let sig = hex::encode(ch.payer.sign_state(cum)?);
             ch.last_sig = sig.clone();
             pl["sig"] = sig.into();
-            self.day_spent += delta;
+            self.day_spent = self.day_spent.saturating_add(delta);
         } else if cum == ch.payer.signed && ch.payer.signed > ch.acked_cum && !ch.last_sig.is_empty() {
             pl["sig"] = ch.last_sig.clone().into();       // signed but not yet seen to arrive
         }
@@ -1051,6 +1226,9 @@ impl Client {
         // a payment went with the request: its answer is taken only with its receipt
         let mut paid = !hdrs.is_empty();
         let on_channel = paid && used.is_none();
+        if on_channel {
+            self.sent(&origin)?;
+        }
         let mut r = self.transport.request(method, url, body, &with_extra(hdrs))?;
         if r.status == 402 {
             if on_channel {
@@ -1094,6 +1272,7 @@ impl Client {
                 ch.spent_msat = ch.spent_msat.max(claimed);
             }
             let hdrs = self.signature_header(&origin, method, &path, body, opts.cum)?;
+            self.sent(&origin)?;
             r = self.transport.request(method, url, body, &with_extra(hdrs))?;
             if r.status == 402 {
                 self.refused(&origin);
@@ -1108,6 +1287,18 @@ impl Client {
             }
         }
         Ok(r)
+    }
+
+    /// Save `origin`'s channel before the paid request just built for it leaves.
+    ///
+    /// The rule (AGP-096, audit item 18): **what a request may cost, its seq and the state it
+    /// carries are in the ledger before the request is on the wire.** They were saved when the
+    /// call returned, so a process that stopped in between came back one seq and one quote behind
+    /// a provider that had served the request; the channel's one call of slack covered that once,
+    /// and the second time every call was refused `bad_offer` for good. A request that then never
+    /// leaves is counted like one whose answer was lost.
+    fn sent(&self, origin: &str) -> Result<()> {
+        self.persist(Some(origin))
     }
 
     /// The provider answered the paid request just sent on `origin`'s channel with a 402: by its
@@ -1188,6 +1379,7 @@ impl Client {
     /// [`close`](Self::close) whose final state is the caller's cumulative amount (AGP-059), under
     /// the bounds of [`CallOpts`]. Its headers are not used: the close is a control request.
     pub fn close_with(&mut self, origin: &str, opts: &CallOpts<'_>) -> Result<Value> {
+        let origin = &self.book_key(origin);
         let r = self.close_inner(origin, opts.cum);
         self.saved(origin, r)
     }
@@ -1205,6 +1397,7 @@ impl Client {
     /// channel with the rest; the provider co-signs and broadcasts it. Returns the provider's
     /// answer (`nextChan`, `nextCapacity`); call [`Client::open_rolled`] once it confirms.
     pub fn rollover(&mut self, origin: &str) -> Result<Value> {
+        let origin = &self.book_key(origin);
         let r = self.rollover_inner(origin);
         self.saved(origin, r)
     }
@@ -1220,7 +1413,9 @@ impl Client {
         let mut owed = (ch.spent_msat / 1000).max(ch.payer.signed);
         owed = owed.max(ch.payer.params.min_amount());
         let pay_to = hex::decode(ch.accepted.get("payTo").and_then(Value::as_str).unwrap_or("")).map_err(|_| ChannelError::code("bad_offer"))?;
-        let next_origin = format!("{origin}/next");
+        // the name the signer knows this channel's key by (its own spelling in an older ledger)
+        let named = ch.origin.clone();
+        let next_origin = format!("{named}/next");
         // One next key per channel (AGP-090, review C3): the provider can broadcast any rollover of
         // this channel that we signed, whatever it answered, for as long as the channel is unspent.
         // So every attempt pays the key of the first. A new key per attempt made a signer, which
@@ -1268,9 +1463,9 @@ impl Client {
         if let (Some(cb), false) = (&self.on_refund, refund_hex.is_empty()) {
             cb(&refund_hex, expiry);
         }
-        let next_ch = ClientChannel { payer, origin: origin.into(), accepted, refund_hex, auth_key, price, slack_msat: 0, seq: 0,
+        let next_ch = ClientChannel { payer, origin: named, accepted, refund_hex, auth_key, price, slack_msat: 0, seq: 0,
                                       spent_msat: 0, last_sig: String::new(), pending_cond: None, acked_cum: 0, receipts: vec![],
-                                      stage: Stage::Open, unanswered_msat: 0, rolled_from: Some(chan.clone()) };
+                                      stage: Stage::Open, unanswered_msat: 0, rolled_from: Some(chan.clone()), fund_tried: false };
         let list = self.next_rolled.entry(origin.to_string()).or_default();
         // the same attempt again (same amount, same height) is the same transaction: one record
         if !list.iter().any(|n| n.payer.params.funding_txid() == txid) {
@@ -1298,7 +1493,7 @@ impl Client {
             let s = self.signer.as_ref().ok_or_else(|| ChannelError::new("bad_key", "the next channel has no refund and no signer"))?;
             let p = &list[i].payer.params;
             // a channel the signer bound before (the reply to that attach was lost) still signs its refund
-            let attached = s.attach(&format!("{origin}/next"), p);
+            let attached = s.attach(&format!("{}/next", list[i].origin), p);
             let refund = match s.sign_refund(&p.channel_id()) {
                 Ok(r) => r,
                 Err(e) => return Err(attached.err().unwrap_or(e)),
@@ -1322,18 +1517,20 @@ impl Client {
     /// lost or an error, once the embedder sees the rollover transaction `txid` on chain (AGP-081,
     /// review C3). Then [`open_rolled`](Self::open_rolled), as after a rollover that answered.
     pub fn adopt_rolled(&mut self, origin: &str, txid: &str) -> Result<()> {
+        let origin = &self.book_key(origin);
         let r = self.take_next(origin, &txid.to_ascii_lowercase());
         self.saved(origin, r)
     }
 
     /// Register the rolled-over channel with the provider (its funding must have confirmed).
     pub fn open_rolled(&mut self, origin: &str) -> Result<Value> {
+        let origin = &self.book_key(origin);
         let r = self.open_rolled_inner(origin);
         self.saved(origin, r)
     }
 
     fn open_rolled_inner(&mut self, origin: &str) -> Result<Value> {
-        let ch = &self.channels[origin];
+        let ch = self.channels.get(origin).ok_or_else(|| ChannelError::code("no_channel"))?;
         let p = &ch.payer.params;
         let c = json!({"txid": p.funding_txid(), "vout": p.funding_vout(), "capacity": p.capacity, "expiry": p.expiry,
                        "payerPub": hex::encode(p.payer_pub), "payerSpk": hex::encode(&p.payer_spk), "redeemScript": hex::encode(p.script())});
@@ -1395,19 +1592,29 @@ impl Client {
             return fail("bad_offer", "conditional amount below dust");
         }
         self.check_daily(cond_amt)?;
-        let csv = py_u64(extra.get("csvDelta")).unwrap_or(10) as u32;
+        // the seller's csvDelta: one that does not fit was cut to its low 32 bits (2^32 + 10 read
+        // as 10), a script the provider does not build
+        let csv = match extra.get("csvDelta") {
+            None => 10,
+            Some(v) => py_u64(Some(v)).and_then(|c| u32::try_from(c).ok()).ok_or_else(|| ChannelError::new("bad_offer", "csvDelta"))?,
+        };
         let ch = self.channels.get_mut(&origin).ok_or_else(|| ChannelError::code("no_channel"))?;
         let cp = ConditionalParams::new(ch.payer.params.clone(), h, cond_amt, csv)?;
         let uncond = ch.payer.signed;
+        // checked: the conditional amount is the seller's, under the owner's max_price only
+        let folded = uncond.checked_add(cond_amt).filter(|t| *t <= ch.payer.params.max_amount())
+            .ok_or_else(|| ChannelError::new("exhausted", "the conditional amount is above what the channel has left"))?;
         let sig = hex::encode(ch.payer.sign_conditional(uncond, &cp)?);
-        self.day_spent += cond_amt;
+        self.day_spent = self.day_spent.saturating_add(cond_amt);
         ch.pending_cond = Some(PendingCond { hash: h, cipher: cipher.clone(), amount: cond_amt });
-        ch.seq += 1;
+        ch.seq = ch.seq.checked_add(1).ok_or_else(|| ChannelError::new("exhausted", "the channel's request counter is used up: close and reopen"))?;
         ch.unanswered_msat = ch.unanswered_msat.saturating_add(cond_amt.saturating_mul(1000));
         let mut pl = json!({"chan": ch.payer.params.channel_id(), "seq": ch.seq, "cum": uncond.to_string(), "hashlock": hex::encode(h), "sig": sig});
         Self::auth(ch, &mut pl, method, &format!("{origin}{path}"), body)?;
         let hdrs = vec![("PAYMENT-SIGNATURE".to_string(), b64json(&payment_payload(&acc, &pl)))];
+        self.sent(&origin)?;
         let r = self.transport.request(method, url, body, &hdrs)?;
+        let ch = self.channels.get_mut(&origin).ok_or_else(|| ChannelError::code("no_channel"))?;
         if r.status == 402 {
             // refused: the provider did not keep the conditional state, and did not charge it
             ch.pending_cond = None;
@@ -1430,7 +1637,7 @@ impl Client {
         // upgrade: fold the increment into a plain state and hand it over now
         let ch = self.channels.get_mut(&origin).ok_or_else(|| ChannelError::code("no_channel"))?;
         ch.pending_cond = None;
-        let new_cum = (uncond + cond_amt).max(ch.payer.params.min_amount());
+        let new_cum = folded.max(ch.payer.params.min_amount());
         if new_cum > ch.payer.signed {
             ch.last_sig = hex::encode(ch.payer.sign_state(new_cum)?);
         }
@@ -1455,7 +1662,7 @@ impl Client {
     /// The deliverable of a signed hash lock whose paid response never arrived, from the
     /// provider's claim transaction (which reveals k on-chain).
     pub fn recover_conditional(&self, origin: &str, claim: &Tx) -> Result<Vec<u8>> {
-        let pc = self.channels.get(origin).and_then(|c| c.pending_cond.clone())
+        let pc = self.channels.get(&self.book_key(origin)).and_then(|c| c.pending_cond.clone())
             .ok_or_else(|| ChannelError::new("no_state", "no pending conditional call on this channel"))?;
         let k = preimage_from_tx(claim, &pc.hash).ok_or_else(|| ChannelError::new("bad_preimage", "this transaction does not reveal k"))?;
         Ok(decrypt(&pc.cipher, &k))

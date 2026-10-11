@@ -17,6 +17,16 @@ mod client {
     /// Responses above this are refused (a provider cannot make the payer buffer without bound).
     const MAX_RESPONSE: u64 = 64 << 20;
 
+    // A build check (AGP-096, audit item 21). `XBT_PATCH` exists only in the workspace's ureq
+    // (`vendor/ureq`), whose chunked decoder reports a body cut short (review T3). `[patch]` applies
+    // from the root manifest of a build only, so a crate outside this workspace that depends on
+    // xbt402 resolved the published ureq with no warning and took a cut chunked body for a whole
+    // one. If the build stops here, add to the manifest at the root of your build:
+    //     [patch.crates-io]
+    //     ureq = { git = "<this repository>", rev = "<the rev your xbt402 is at>" }
+    // (or `path = ".../vendor/ureq"`). See vendor/ureq/XBT-PATCH.md.
+    const _: &str = ureq::XBT_PATCH;
+
     pub struct UreqTransport {
         agent: ureq::Agent,
     }

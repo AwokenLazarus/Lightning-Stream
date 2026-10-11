@@ -146,6 +146,27 @@ pub fn url_origin(url: &str) -> &str {
     }
 }
 
+/// The origin of an absolute URL as [`request_url`] reads it: lowercase scheme and host, no
+/// userinfo, and no port when it is the scheme's default. `""` for a bare target.
+///
+/// The rule (AGP-096, audit item 18): **one seller is one origin, however a caller spells it.**
+/// The request binding has always read `HTTPS://API.example:443` and `https://u@api.example` as
+/// `https://api.example`, while a payer's channel book was keyed by the spelling, so one seller
+/// could be funded once per spelling. A payer keys its book by this string
+/// ([`split_url`](crate::client::split_url)).
+pub fn canonical_origin(url: &str) -> String {
+    let u = request_url(url);
+    if u.scheme.is_empty() {
+        return String::new();
+    }
+    let default = matches!((u.scheme.as_str(), u.port.as_str()), ("http", "80") | ("https", "443"));
+    if u.port.is_empty() || default {
+        format!("{}://{}", u.scheme, u.host)
+    } else {
+        format!("{}://{}:{}", u.scheme, u.host, u.port)
+    }
+}
+
 /// `LE64(len(x)) ‖ x`: every field of a v2 digest or receipt, so no two field lists hash alike.
 fn put_field(h: &mut Sha256, x: &[u8]) {
     h.update((x.len() as u64).to_le_bytes());
@@ -587,6 +608,38 @@ mod tests {
                 let (m, t, b) = (&s[..i], &s[i..j], &s[j..]);
                 let d = request_digest_v2(std::str::from_utf8(m).unwrap(), std::str::from_utf8(t).unwrap(), b);
                 assert!(seen.insert(d), "cut at {i},{j} collides");
+            }
+        }
+    }
+
+    /// AGP-096: every spelling the request binding reads as one origin is one origin, and
+    /// nothing else is.
+    #[test]
+    fn an_origin_has_one_spelling() {
+        for same in ["https://api.example", "HTTPS://API.Example", "https://api.example:443", "https://api.example:0443/x?y", "https://u:p@api.example/",
+                     "https://api.example?q=1", "https://api.example#f"] {
+            assert_eq!(canonical_origin(same), "https://api.example", "{same}");
+            // the binding agrees: the same request under each spelling has one digest
+            let u = request_url(same);
+            assert_eq!((u.scheme.as_str(), u.host.as_str(), u.port.as_str()), ("https", "api.example", "443"), "{same}");
+        }
+        for (url, origin) in [("http://api.example/x", "http://api.example"), ("http://api.example:80", "http://api.example"),
+                              ("https://api.example:80/x", "https://api.example:80"), ("http://api.example:443", "http://api.example:443"),
+                              ("https://api.example:8443/x", "https://api.example:8443"), ("https://api.example.evil.test", "https://api.example.evil.test"),
+                              ("https://api.example./x", "https://api.example."), ("http://[::1]:8080/x", "http://[::1]:8080"), ("http://[::1]/x", "http://[::1]"),
+                              ("coap+tcp://H:1/x", "coap+tcp://h:1"), ("ws://h", "ws://h"), ("https://api.example:x/y", "https://api.example:x"),
+                              ("https://evil.test/https://api.example", "https://evil.test")] {
+            assert_eq!(canonical_origin(url), origin, "{url}");
+        }
+        for bare in ["/a?next=http://h/x", "api.example/x", "", "://h/x"] {
+            assert_eq!(canonical_origin(bare), "", "{bare:?}");
+        }
+        // two URLs have one canonical origin exactly when the binding gives them one scheme, host and port
+        let urls = ["https://a.example", "https://A.example:443", "http://a.example", "https://a.example:444", "https://b.example", "https://u@a.example"];
+        for a in urls {
+            for b in urls {
+                let (x, y) = (request_url(a), request_url(b));
+                assert_eq!(canonical_origin(a) == canonical_origin(b), (x.scheme, x.host, x.port) == (y.scheme, y.host, y.port), "{a} {b}");
             }
         }
     }

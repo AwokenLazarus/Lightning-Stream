@@ -367,6 +367,11 @@
 //! [actix-web](https://crates.io/crates/actix-web), and [hyper](https://crates.io/crates/hyper).
 //!
 
+/// xbt-rs patch marker (not in upstream ureq): this is the workspace's copy of ureq 2.12.1, whose
+/// chunked decoder reports a body cut short (`XBT-PATCH.md`). `xbt402`'s transport names this
+/// constant, so a build that resolved the published crate stops instead of running unpatched.
+pub const XBT_PATCH: &str = "chunked-eof";
+
 /// Re-exported rustls crate
 ///
 /// Use this re-export to always get a compatible version of `ClientConfig`.
