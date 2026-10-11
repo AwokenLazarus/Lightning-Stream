@@ -93,7 +93,7 @@ use xbt_work::guard;
 use xbt_work::pricing::Pricing;
 use xbt_work::provider::{admin_request, admin_token, Amount, Cap, Caps, ServedStatement, Statement, WorkConfig, WorkProvider, WorkScheme, SETTLE_DEPTH,
                          SHIPPED_AUDIT_DEPTH, SHIPPED_HAIRCUT_BPS};
-use xbt_work::tools::{arg, block_count, block_hash, chain_block, flag, maturity, network, opt, prime_terms, rpc, tip_bits, window};
+use xbt_work::tools::{arg, block_count, block_hash, chain_block, epoch, flag, maturity, network, opt, prime_terms, rpc, window};
 use xbt_work::walk::{AuditSource, Walk};
 
 fn num<T: std::str::FromStr>(flag: &str, var: &str) -> Option<T> {
@@ -302,9 +302,12 @@ fn main() {
     let node = rpc(&arg("--rpc-port").expect("--rpc-port"), &arg("--cookie").expect("--cookie")).expect("cookie");
     let net = network(&node).expect("network");
     let price: u64 = arg("--price").map(|p| p.parse().expect("price")).unwrap_or(150);
-    let subsidy = node.call("getblockstats", json!([block_count(&node).expect("height"), ["subsidy"]])).ok()
-        .and_then(|s| s["subsidy"].as_u64()).unwrap_or(5_000_000_000);
-    let bits = tip_bits(&node).expect("bits");
+    // what the first price follows from is the node's answer or nothing (AGP-106, `tools::epoch`):
+    // before, a subsidy the node did not give was taken for the first block's
+    let (bits, subsidy) = epoch(&node).unwrap_or_else(|e| {
+        eprintln!("xbt-work-provider: the node's height, bits and subsidy are needed to price a call: {e}");
+        std::process::exit(2);
+    });
     let mut wcfg = WorkConfig::new(&net, &arg("--identity").expect("--identity"), arg("--prime-id").expect("--prime-id").parse().expect("prime id"),
                                    &arg("--prime-pubkey").expect("--prime-pubkey"), &arg("--receipt-url").expect("--receipt-url"));
     wcfg.terms = prime_terms().unwrap_or_else(|e| {
@@ -395,9 +398,9 @@ fn main() {
                         Err(e) => eprintln!("relay: invoice {inv}: {e}"),
                     }
                 }
-                if let Ok(b) = tip_bits(&n2) {
-                    let v = n2.call("getblockstats", json!([block_count(&n2).unwrap_or(0), ["subsidy"]])).ok()
-                        .and_then(|s| s["subsidy"].as_u64()).unwrap_or(subsidy);
+                // a round in which the node does not give all of it changes no price (AGP-106,
+                // `tools::epoch`): the epoch in force stays, and the next round asks again
+                if let Ok((b, v)) = epoch(&n2) {
                     if w2.set_epoch(b, v) {
                         refused = None;
                         eprintln!("epoch: bits {b:08x}, block value {v} sats: new 402s quote {} work units", w2.amount(price).unwrap_or(0));
@@ -444,7 +447,13 @@ fn main() {
         let s2 = svc.clone();
         // where the walk stopped (kept in the state), and at least the last 100 blocks again;
         // `--audit-from` overrides both
-        let back = block_count(&s2.rpc).unwrap_or(0).saturating_sub(depth.saturating_add(100)).max(1);
+        // a height the node does not give is no height (AGP-106): taken for 0 it started the
+        // walk at block 1 whatever position was kept
+        let tip = block_count(&s2.rpc).unwrap_or_else(|e| {
+            eprintln!("xbt-work-provider: the node's height is needed to start the audit: {e}");
+            std::process::exit(2);
+        });
+        let back = tip.saturating_sub(depth.saturating_add(100)).max(1);
         let start = num::<u32>("--audit-from", "XBT_WORK_AUDIT_FROM").unwrap_or_else(|| s2.work.audit_position().map_or(back, |p| p.min(back)).max(1));
         eprintln!("audit: starting at height {start}");
         let mut walk = Walk::new(start);

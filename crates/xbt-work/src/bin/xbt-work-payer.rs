@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
-use xbt402::client::{Client, ClientConfig, Transport, Wallet};
+use xbt402::client::{split_url, Client, ClientConfig, Transport, Wallet};
 use xbt402::error::{ChannelError, Result as XResult};
 use xbt402::http::UreqTransport;
 use xbt402::wire::unb64json;
@@ -119,7 +119,14 @@ fn pay(base: &str, calls: usize, secs: f64, state: &str) -> i32 {
     });
     let t = UreqTransport::default();
     let p = payer(state, &net);
-    let s = p.session(base).expect("session: run prepare first");
+    // the session is kept under the canonical origin (`split_url`), however BASE is spelled
+    // (AGP-106: before, `pay http://LOCALHOST:8080` looked under the spelling and panicked)
+    let origin = split_url(base).0;
+    let origin = origin.as_str();
+    let Some(s) = p.session(origin) else {
+        eprintln!("xbt-work-payer: no session for {origin} in {state}: run `prepare` for it first");
+        return 2;
+    };
     let (ident, inv) = (s.identity().to_string(), s.invoice_id().to_string());
     let amount = s.amount();
     let pk = pubkey_from_hex(s.accepted["extra"]["primePubkey"].as_str().unwrap_or("")).expect("prime key");
@@ -141,7 +148,7 @@ fn pay(base: &str, calls: usize, secs: f64, state: &str) -> i32 {
     };
     let mut warned = false;
     while t0.elapsed().as_secs_f64() < secs {
-        if let Ok(Some(r)) = p.refresh(&t, base) {
+        if let Ok(Some(r)) = p.refresh(&t, origin) {
             note(&r, &mut receipts);
             if r.receipt.cum_work >= need {
                 break;
@@ -169,7 +176,7 @@ fn pay(base: &str, calls: usize, secs: f64, state: &str) -> i32 {
         let t1 = Instant::now();
         while still.elapsed() < Duration::from_secs(12) && t1.elapsed() < Duration::from_secs(120) {
             std::thread::sleep(Duration::from_secs(3));
-            if let Ok(Some(r)) = p.refresh(&t, base) {
+            if let Ok(Some(r)) = p.refresh(&t, origin) {
                 note(&r, &mut receipts);
                 if r.receipt.seq != last {
                     (last, still) = (r.receipt.seq, Instant::now());
@@ -230,12 +237,12 @@ fn pay(base: &str, calls: usize, secs: f64, state: &str) -> i32 {
         }
     };
     let code = |v: &(u16, Value)| format!("{} {}", v.0, v.1["error"].as_str().unwrap_or(""));
-    let with = |doc: &Value, sig: &str, path: &str| p.header_with(base, doc, sig, "GET", path, b"").expect("header");
+    let with = |doc: &Value, sig: &str, path: &str| p.header_with(origin, doc, sig, "GET", path, b"").expect("header");
     let (doc, sig) = (last.receipt.to_doc(), hex::encode(last.sig));
     let h = with(&doc, &sig, CALLS[0]);
     let first = raw(&h, CALLS[0]);
     if first.0 == 200 {
-        let _ = p.check_response(base, &first.1, "GET", CALLS[0], b"");
+        let _ = p.check_response(origin, &first.1, "GET", CALLS[0], b"");
     }
     let again = raw(&h, CALLS[0]);
     c.check(again.0 == 402 && again.1["error"] == json!("bad_auth"), format!("captured PAYMENT-SIGNATURE header replayed -> {}", code(&again)));
@@ -269,7 +276,12 @@ fn pay(base: &str, calls: usize, secs: f64, state: &str) -> i32 {
     c.check(r.1["error"] == json!("bad_payload"), format!("receipt with a `|` smuggled into a numeric field -> {}", code(&r)));
 
     // on-chain: the payer's shares were pool blocks; their coinbases pay the provider's TIDES row
-    let (lo, hi) = (receipts[0].receipt.first_height, block_count(&node).unwrap_or(0));
+    // a height the node does not give is a failed check, not an empty range (AGP-106)
+    let hi = block_count(&node).unwrap_or_else(|e| {
+        c.check(false, format!("read the height of the payer's node: {e}"));
+        0
+    });
+    let lo = receipts[0].receipt.first_height;
     let mut paid_out: Vec<ChainBlock> = vec![];
     for h in lo..=hi {
         match chain_block(&node, h, &ident) {

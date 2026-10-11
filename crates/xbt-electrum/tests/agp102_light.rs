@@ -112,6 +112,7 @@ const TIMEOUT: Duration = Duration::from_millis(400);
 ///   * answers each of those requests 0.7 timeouts late (never a whole timeout: it is not hung
 ///     up on), so its part of every sync round ends at the sync deadline;
 ///   * claims the transaction asked about one block above the real tip.
+///
 /// It lies about nothing else and supplies whatever it lists.
 /// Returns (chain, the honest server, the hostile one, its proxy, the confirmed coin's txid).
 fn rig() -> (Arc<Mutex<SimChain>>, Arc<FakeElectrum>, Arc<FakeElectrum>, Proxy, String) {

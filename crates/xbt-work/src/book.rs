@@ -317,6 +317,16 @@ impl ReceiptBook {
         }).filter(|(_, g)| *g > 0).collect()
     }
 
+    /// Keep a fraud proof. The rule (AGP-106): **one pair of receipts is one proof**, however
+    /// often the second of them is offered (the relay pull offered it in every round, and each
+    /// round kept the pair again). A state file from before is read through here too, so the
+    /// copies it holds are dropped when it is loaded.
+    fn convict(&mut self, proof: Equivocation) {
+        if !self.fraud.contains(&proof) {
+            self.fraud.push(proof);
+        }
+    }
+
     /// Verify a receipt presented for `invoice`; return the newly credited work (0 for a replay).
     pub fn accept(&mut self, s: &Signed, invoice: &str) -> Result<u64> {
         let r = &s.receipt;
@@ -335,7 +345,7 @@ impl ReceiptBook {
         let key = (invoice.to_string(), r.seq);
         if let Some(twin) = self.by_seq.get(&key) {
             if twin.receipt != *r {
-                self.fraud.push(Equivocation { a: twin.clone(), b: s.clone(), why: "equivocation: two receipts, one seq".into() });
+                self.convict(Equivocation { a: twin.clone(), b: s.clone(), why: "equivocation: two receipts, one seq".into() });
                 return fail("equivocation", "two receipts with one seq");
             }
         }
@@ -344,11 +354,11 @@ impl ReceiptBook {
         if let Some(prev) = &prev {
             let p = &prev.receipt;
             if r.seq > p.seq && (r.cum_work < p.cum_work || r.shares < p.shares || r.last_height < p.last_height) {
-                self.fraud.push(Equivocation { a: prev.clone(), b: s.clone(), why: "cumulative state went backwards".into() });
+                self.convict(Equivocation { a: prev.clone(), b: s.clone(), why: "cumulative state went backwards".into() });
                 return fail("equivocation", "cumulative state went backwards");
             }
             if r.seq < p.seq && (r.cum_work > p.cum_work || r.shares > p.shares) {
-                self.fraud.push(Equivocation { a: s.clone(), b: prev.clone(), why: "cumulative state went backwards".into() });
+                self.convict(Equivocation { a: s.clone(), b: prev.clone(), why: "cumulative state went backwards".into() });
                 return fail("equivocation", "cumulative state went backwards");
             }
             if r.seq < p.seq {
@@ -391,6 +401,11 @@ impl ReceiptBook {
             out.push(last);
         }
         out
+    }
+
+    /// Whether this very receipt, signature and all, is held under its invoice and seq.
+    pub fn holds(&self, s: &Signed) -> bool {
+        self.by_seq.get(&(s.receipt.invoice.clone(), s.receipt.seq)) == Some(s)
     }
 
     /// The best receipt held for `invoice`.
@@ -497,7 +512,7 @@ impl ReceiptBook {
                 let r = WorkReceipt::parse_line(d.get("message").and_then(Value::as_str).unwrap_or("")).map_err(|e| bad(&e.0))?;
                 Ok(Signed { receipt: r, sig: sig64(d.get("sig")).map_err(|e| bad(&e.0))? })
             };
-            self.fraud.push(Equivocation { a: line("a")?, b: line("b")?, why: e.get("why").and_then(Value::as_str).unwrap_or("").into() });
+            self.convict(Equivocation { a: line("a")?, b: line("b")?, why: e.get("why").and_then(Value::as_str).unwrap_or("").into() });
         }
         Ok(())
     }

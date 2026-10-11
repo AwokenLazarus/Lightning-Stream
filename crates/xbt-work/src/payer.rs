@@ -403,17 +403,30 @@ impl WorkPayer {
         let Some(path) = &self.cfg.state_path else { return Ok(()) };
         let Ok(raw) = std::fs::read(path) else { return Ok(()) };
         let v = xbt402::json::parse_slice(&raw).map_err(|_| WorkError::new("bad_state", "not JSON"))?;
-        let mut m = self.lock();
+        // The rule (AGP-106): **a saved session is found under every spelling of its origin.**
+        // Sessions are asked for under the canonical origin (`split_url`: lowercase host, no
+        // default port); a file written before AGP-096 has them under the URL's own spelling, so
+        // each key is read as the origin it spells and written back that way at the next save.
+        // Two keys that spell one origin are two invoices for one seller, and only one can be the
+        // session: neither is dropped here, the file is refused as it is and the owner chooses.
+        let mut m = HashMap::new();
+        let mut spelled: HashMap<String, &String> = HashMap::new();
         for (o, s) in v.as_object().into_iter().flatten() {
+            let origin = split_url(o).0;
+            if let Some(other) = spelled.insert(origin.clone(), o) {
+                return fail("bad_state", format!("the saved sessions `{other}` and `{o}` are both for {origin}: keep one of them in {} \
+                                                  (the one with work left to spend) and start again", path.display()));
+            }
             let best = match s.get("best") {
                 Some(b) if !b.is_null() => Some(Signed::from_doc(b)?),
                 _ => None,
             };
-            m.insert(o.clone(), Session { accepted: s["accepted"].clone(), invoice: s["invoice"].clone(), n: py_u64(s.get("n")).unwrap_or(0),
+            m.insert(origin, Session { accepted: s["accepted"].clone(), invoice: s["invoice"].clone(), n: py_u64(s.get("n")).unwrap_or(0),
                                           best, spent: py_u64(s.get("spent")).unwrap_or(0), last_error: None,
                                           unanswered: s.get("unanswered").and_then(Value::as_array).into_iter().flatten()
                                               .filter_map(|e| Some((e.get(0)?.as_u64()?, e.get(1)?.as_u64()?))).collect() });
         }
+        *self.lock() = m;
         Ok(())
     }
 }

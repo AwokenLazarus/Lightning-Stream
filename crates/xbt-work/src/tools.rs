@@ -80,8 +80,15 @@ fn coinbase_outputs(blk: &Value) -> Result<(u64, Vec<(String, u64)>)> {
     let mut outs = vec![];
     for o in vout {
         let btc = o["value"].as_f64().ok_or_else(|| WorkError::new("node", "getblock: output value"))?;
-        let sats = (btc * 1e8).round() as u64;
-        total = total.saturating_add(sats);
+        // The rule (AGP-106): a number of the node's that does not fit, or a sum of them that
+        // does not, is the node's error and not a value. No block pays past u64 sats; a value
+        // the cast would clamp, or a saturated total, would be audited as if it were one.
+        let sats = (btc * 1e8).round();
+        if !(0.0..u64::MAX as f64).contains(&sats) {
+            return Err(WorkError::new("node", "getblock: an output value that is no amount"));
+        }
+        let sats = sats as u64;
+        total = total.checked_add(sats).ok_or_else(|| WorkError::new("node", "getblock: coinbase outputs sum past u64"))?;
         // an output with no address (OP_RETURN, the witness commitment) pays no identity
         outs.push((o["scriptPubKey"]["address"].as_str().unwrap_or("").to_string(), sats));
     }
@@ -110,10 +117,44 @@ pub fn maturity(rpc: &Rpc) -> Result<Maturity> {
     Ok(Maturity::from_deployments(&rpc.call("getdeploymentinfo", json!([]))?)?)
 }
 
-/// What a coinbase pays `identity` (bech32 compared lower-case).
+/// What a coinbase pays `identity` (bech32 compared lower-case). It never panics: outputs that
+/// sum past u64 give `u64::MAX` (AGP-106; before, `sum` panicked and the audit walk with it).
+/// Outputs read from a node never get that far: [`coinbase`] and [`chain_block`] refuse a
+/// coinbase whose whole value does not fit, which this is a part of.
 pub fn paid_to(outs: &[(String, u64)], identity: &str) -> u64 {
-    outs.iter().filter(|(a, _)| a.eq_ignore_ascii_case(identity)).map(|(_, s)| *s).sum()
+    outs.iter().filter(|(a, _)| a.eq_ignore_ascii_case(identity)).fold(0u64, |a, (_, s)| a.saturating_add(*s))
+}
+
+/// What the price follows at the tip, read from the node in one go: (`bits`, the block value in
+/// sats). The rule (AGP-106): **a price is worked out only from what the node answered.** If the
+/// height, the tip's `bits` or the subsidy cannot be read this is an error and the caller keeps
+/// the epoch in force; before, a height that could not be read was taken for 0 and calls were
+/// priced at the first block's subsidy, and a subsidy that could not be read for an older one.
+pub fn epoch(rpc: &Rpc) -> Result<(u32, u64)> {
+    let height = block_count(rpc)?;
+    let stats = rpc.call("getblockstats", json!([height, ["subsidy"]]))?;
+    let subsidy = stats["subsidy"].as_u64().ok_or_else(|| WorkError::new("node", "getblockstats: subsidy"))?;
+    Ok((tip_bits(rpc)?, subsidy))
 }
 
 /// The Prime's statement for a pool block: [`crate::provider::window_statement`].
 pub use crate::provider::window_statement as window;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A coinbase whose outputs sum past u64 is the node's error: no total, no payment, no panic.
+    #[test]
+    fn a_coinbase_whose_outputs_sum_past_u64_is_a_node_error() {
+        let blk = |vals: &[f64]| json!({"tx": [{"vout": vals.iter().map(|v| json!({"value": v, "scriptPubKey": {"address": "bcrt1qid"}})).collect::<Vec<_>>()}]});
+        let (total, outs) = coinbase_outputs(&blk(&[3.125, 0.0])).unwrap();
+        assert_eq!((total, paid_to(&outs, "BCRT1QID")), (312_500_000, 312_500_000), "control");
+        // a value no u64 of sats holds, a negative one, and two that fit but not together
+        for vals in [&[1e30][..], &[-1.0], &[f64::NAN], &[92_233_720_368.0; 3]] {
+            let e = coinbase_outputs(&blk(vals)).unwrap_err();
+            assert_eq!(e.code, "node", "{vals:?}: {e}");
+        }
+        assert_eq!(paid_to(&[("a".into(), u64::MAX), ("A".into(), 1)], "a"), u64::MAX, "no panic on its own either");
+    }
+}
