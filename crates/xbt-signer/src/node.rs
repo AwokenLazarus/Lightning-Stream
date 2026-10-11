@@ -229,7 +229,8 @@ pub fn block_of(node: &dyn Node, txid: &str, vout: u32) -> Option<(u64, String)>
         .and_then(|b| node.call("getblockheader", json!([b])).ok())
         .and_then(|h| h.get("height").and_then(u64_of))
         .or_else(|| height(node).ok())?;
-    let h = tip + 1 - confs;
+    // the owner's own node's numbers: more confirmations than the chain has blocks is no height
+    let h = tip.checked_add(1)?.checked_sub(confs)?;
     Some((h, block_hash(node, h).ok()?))
 }
 
@@ -239,19 +240,21 @@ fn spends(tx: &Value, txid: &str, vout: u32) -> bool {
     }))
 }
 
-/// The txid spending `(txid, vout)`: the mempool first (gettxspendingprevout), then the blocks
-/// from `from_height` on (at most `limit`, newest last). `None` if not found.
-pub fn find_spender(node: &dyn Node, txid: &str, vout: u32, from_height: u64, limit: u64) -> Option<String> {
-    if let Ok(r) = node.call("gettxspendingprevout", json!([[{"txid": txid, "vout": vout}]])) {
-        if let Some(sp) = r.get(0).and_then(|x| x.get("spendingtxid")).and_then(Value::as_str) {
-            return Some(sp.to_string());
-        }
-    }
+/// The mempool transaction spending `(txid, vout)` (gettxspendingprevout, which a node answers
+/// for mempool spends only). `None`: none there, or a node without the call.
+pub fn mempool_spender(node: &dyn Node, txid: &str, vout: u32) -> Option<String> {
+    let r = node.call("gettxspendingprevout", json!([[{"txid": txid, "vout": vout}]])).ok()?;
+    r.get(0).and_then(|x| x.get("spendingtxid")).and_then(Value::as_str).map(str::to_string)
+}
+
+/// The transaction that spent `(txid, vout)` in a block, from `from_height` on (at most `limit`
+/// blocks, newest last). `None` if not found.
+pub fn block_spender(node: &dyn Node, txid: &str, vout: u32, from_height: u64, limit: u64) -> Option<String> {
     if from_height == 0 {
         return None;
     }
     let tip = height(node).ok()?;
-    let start = from_height.max((tip + 1).saturating_sub(limit));
+    let start = from_height.max(tip.saturating_add(1).saturating_sub(limit));
     for h in start..=tip {
         let Ok(bh) = block_hash(node, h) else { continue };
         let Ok(blk) = node.call("getblock", json!([bh, 2])) else { continue };
@@ -262,6 +265,13 @@ pub fn find_spender(node: &dyn Node, txid: &str, vout: u32, from_height: u64, li
         }
     }
     None
+}
+
+/// The txid spending `(txid, vout)`: the mempool first, then the blocks from `from_height` on (at
+/// most `limit`, newest last). `None` if not found. A caller that must know the spend is in a
+/// block asks [`block_spender`].
+pub fn find_spender(node: &dyn Node, txid: &str, vout: u32, from_height: u64, limit: u64) -> Option<String> {
+    mempool_spender(node, txid, vout).or_else(|| block_spender(node, txid, vout, from_height, limit))
 }
 
 /// Whether `tx` (verbose) spends `(txid, vout)`.

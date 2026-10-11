@@ -632,7 +632,7 @@ pub fn verify_backend(ln: &dyn LnBackend, node: &dyn Node, chain: &str, pol: &Ln
     let ln_h = i64_of(info.get("block_height"));
     let ln_hash = str_or_empty(info.get("block_hash"));
     let our_h = node::height(node)? as i64;
-    if ln_h > our_h + pol.max_tip_lead {
+    if ln_h > our_h.saturating_add(pol.max_tip_lead) {
         return Err(err("ln_chain", format!("the LN node's tip {ln_h} is ahead of our node's {our_h}")));
     }
     if ln_h > our_h {
@@ -701,7 +701,7 @@ pub fn presplit_utxos(utxos: &[Value], tip: i64, split_height: i64) -> Vec<Value
         if conf <= 0 {
             return None;
         }
-        let h = tip - conf + 1;
+        let h = tip.saturating_sub(conf).saturating_add(1); // the node's numbers
         (h < split_height).then(|| json!({"outpoint": format!("{}:{}", str_or_empty(u.get("outpoint").and_then(|o| o.get("txid_str"))),
                                                                      u64_of(u.get("outpoint").and_then(|o| o.get("output_index")))),
                                            "amount_sats": i64_of(u.get("amount_sat")), "height": h}))
@@ -732,7 +732,7 @@ pub struct HtlcLocks {
 impl HtlcLocks {
     pub fn report(&self, tip: i64) -> Value {
         json!({"booked_sats": self.booked_sats, "unbooked_sats": self.unbooked_sats, "until_height": self.until_height,
-               "blocks_left": (self.until_height - tip).max(0), "htlcs": self.list})
+               "blocks_left": self.until_height.saturating_sub(tip).max(0), "htlcs": self.list})
     }
 }
 
@@ -750,10 +750,13 @@ pub fn htlc_locks(chans: &[Value], booked: &dyn Fn(&str) -> bool) -> HtlcLocks {
         if incoming.contains(&hash) {
             continue;
         }
-        let amt = i64_of(h.get("amount"));
+        // AGP-095 (audit item 13): the node's numbers. A sum that does not fit is the most there
+        // is (it then exceeds every budget, which refuses), never a panic in the watcher; a
+        // negative amount locks nothing.
+        let amt = i64_of(h.get("amount")).max(0);
         let exp = i64_of(h.get("expiration_height"));
         let ours = booked(&hash);
-        if ours { out.booked_sats += amt } else { out.unbooked_sats += amt }
+        if ours { out.booked_sats = out.booked_sats.saturating_add(amt) } else { out.unbooked_sats = out.unbooked_sats.saturating_add(amt) }
         out.until_height = out.until_height.max(exp);
         out.list.push(json!({"payment_hash": hash, "amount_sats": amt, "expiration_height": exp, "booked": ours,
                              "chan_id": u64_of(c.get("chan_id")).to_string()}));
@@ -867,8 +870,9 @@ pub fn preimage_proves(preimage: &[u8], payment_hash: &str) -> bool {
 
 /// What a final LND `Payment` cost, in msat: `(value, fee)`.
 pub fn paid_msat(p: &Value) -> (u64, u64) {
-    let v = u64_of(p.get("value_msat")).max(u64_of(p.get("value_sat")) * 1000);
-    let f = u64_of(p.get("fee_msat")).max(u64_of(p.get("fee_sat")) * 1000);
+    // the node's numbers (AGP-095): an amount past u64 msat is the most there is, never a panic
+    let v = u64_of(p.get("value_msat")).max(u64_of(p.get("value_sat")).saturating_mul(1000));
+    let f = u64_of(p.get("fee_msat")).max(u64_of(p.get("fee_sat")).saturating_mul(1000));
     (v, f)
 }
 
@@ -1169,10 +1173,10 @@ impl Signer {
     /// What the LN node holds (channel local balances, HTLCs in flight, on-chain coins) against
     /// `ln.exposure_cap_sats`: the report and, when over the cap (or no cap on mainnet), the refusal.
     pub(crate) fn ln_exposure(&self, pol: &LnPolicy, chans: &[Value], utxos: &[Value]) -> (Value, Option<String>) {
-        let local: i64 = chans.iter().map(|c| i64_of(c.get("local_balance"))).sum();
-        let htlc: i64 = chans.iter().map(|c| i64_of(c.get("unsettled_balance"))).sum();
-        let onchain: i64 = utxos.iter().map(|u| i64_of(u.get("amount_sat"))).sum();
-        let total = local + htlc + onchain;
+        // the node's numbers (AGP-095): a sum that does not fit is the most there is, over any cap
+        let sum = |vs: &[Value], k: &str| vs.iter().fold(0i64, |a, v| a.saturating_add(i64_of(v.get(k))));
+        let (local, htlc, onchain) = (sum(chans, "local_balance"), sum(chans, "unsettled_balance"), sum(utxos, "amount_sat"));
+        let total = local.saturating_add(htlc).saturating_add(onchain);
         let cap = pol.exposure_cap_sats;
         let refusal = if cap == 0 && self.chain == "main" {
             Some("mainnet needs ln.exposure_cap_sats: the LN node is trusted with everything it holds".to_string())
@@ -1324,7 +1328,7 @@ impl Signer {
             book.get(h).and_then(|r| r.get("state")).and_then(Value::as_str).is_some_and(|s| s == "sending" || s == "settled")
         });
         let room = d.residual_daily_sats.min(d.residual_weekly_sats);
-        if locks.unbooked_sats > 0 && total + locks.unbooked_sats > room {
+        if locks.unbooked_sats > 0 && total.saturating_add(locks.unbooked_sats) > room {
             return with(self.ln_refuse("ln_htlc_lock", &format!(
                 "{} sats are locked in HTLCs the wallet did not send (until height {}); with this payment's {total} that exceeds the {room} sats left \
                  in the budgets", locks.unbooked_sats, locks.until_height), &dest, &hash), json!({"htlc_locks": locks.list}));
@@ -1725,7 +1729,7 @@ impl Signer {
         });
         let in_flight: Vec<Value> = self.ln_book.in_flight().into_iter().map(|(h, r)| {
             let until = py_int(r.get("cltv_until")).unwrap_or(0);
-            json!({"payment_hash": h, "booked_sats": py_int(r.get("booked_sats")), "cltv_until": until, "blocks_left": (until - tip).max(0)})
+            json!({"payment_hash": h, "booked_sats": py_int(r.get("booked_sats")), "cltv_until": until, "blocks_left": until.saturating_sub(tip).max(0)})
         }).collect();
         let halt_refusal = (!out["halted"].is_null())
             .then(|| format!("the rail is halted until the human resumes it: {}", str_or_empty(out["halted"].get("reason"))));

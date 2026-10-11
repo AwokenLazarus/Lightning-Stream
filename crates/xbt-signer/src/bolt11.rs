@@ -164,11 +164,14 @@ fn parse_hrp(hrp: &str) -> Result<(String, Option<u64>), String> {
     }
     let n: u128 = digits.parse().map_err(|_| format!("bad invoice amount {amt:?}"))?;
     // 1 BTC = 10^11 msat
+    // AGP-095 (audit item 14): the digits are whoever wrote the invoice's; 28 of them times 10^11
+    // do not fit a u128, and an unchecked product is a panic in a release build
+    let times = |k: u128| n.checked_mul(k).ok_or_else(|| "invoice amount overflows".to_string());
     let msat: u128 = match mult {
-        None => n * 100_000_000_000,
-        Some(b'm') => n * 100_000_000,
-        Some(b'u') => n * 100_000,
-        Some(b'n') => n * 100,
+        None => times(100_000_000_000)?,
+        Some(b'm') => times(100_000_000)?,
+        Some(b'u') => times(100_000)?,
+        Some(b'n') => times(100)?,
         _ => {
             if !n.is_multiple_of(10) {
                 return Err("a pico amount must be a whole number of msat".into());

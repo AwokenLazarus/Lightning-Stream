@@ -234,7 +234,7 @@ impl Signer {
             book.get(h).and_then(|r| r.get("state")).and_then(Value::as_str).is_some_and(|s| s == "sending" || s == "settled")
         });
         let room = d.residual_daily_sats.min(d.residual_weekly_sats);
-        if locks.unbooked_sats > 0 && total + locks.unbooked_sats > room {
+        if locks.unbooked_sats > 0 && total.saturating_add(locks.unbooked_sats) > room {
             return with(self.ln_refuse("ln_htlc_lock", &format!(
                 "{} sats are locked in HTLCs the wallet did not send (until height {}); with this payment's {total} that exceeds the {room} sats left \
                  in the budgets", locks.unbooked_sats, locks.until_height), &dest, ""), json!({"htlc_locks": locks.list}));

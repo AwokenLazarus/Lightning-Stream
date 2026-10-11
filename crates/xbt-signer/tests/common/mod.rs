@@ -31,6 +31,9 @@ pub struct State {
     pub conf_height: HashMap<String, u64>,
     pub utxos: HashMap<(String, u32), (i64, String)>,
     pub spent_by: HashMap<(String, u32), String>,
+    /// What an outpoint held before a transaction spent it (AGP-095: `gettxout` without the
+    /// mempool still shows it while its spender is unconfirmed, and `evict` gives it back).
+    pub spent: HashMap<(String, u32), (i64, String)>,
     pub sent: Vec<String>,
     pub calls: Vec<String>,
     pub reject: Option<String>,
@@ -117,6 +120,21 @@ impl FakeChain {
         self.st.lock().unwrap().height
     }
 
+    /// A mempool transaction that is never mined leaves the mempool (expired, evicted, replaced by
+    /// nothing): its inputs are unspent again and its outputs never existed (AGP-095).
+    pub fn evict(&self, txid: &str) {
+        let mut s = self.st.lock().unwrap();
+        assert!(s.mempool.remove(txid).is_some(), "{txid} is not in the mempool");
+        let ins: Vec<(String, u32)> = s.spent_by.iter().filter(|(_, sp)| sp.as_str() == txid).map(|(op, _)| op.clone()).collect();
+        for op in ins {
+            s.spent_by.remove(&op);
+            if let Some(was) = s.spent.remove(&op) {
+                s.utxos.insert(op, was);
+            }
+        }
+        s.utxos.retain(|(t, _), _| t != txid);
+    }
+
     pub fn mine_to(&self, h: u64) {
         let cur = self.height();
         if h > cur {
@@ -160,7 +178,9 @@ impl FakeChain {
         }
         for i in &tx.inputs {
             let op = (i.prevout.txid_hex(), i.prevout.vout);
-            s.utxos.remove(&op);
+            if let Some(was) = s.utxos.remove(&op) {
+                s.spent.insert(op.clone(), was);
+            }
             s.spent_by.insert(op, txid.clone());
         }
         for (n, o) in tx.outputs.iter().enumerate() {
@@ -177,7 +197,11 @@ impl FakeChain {
 
     fn gettxout(&self, txid: &str, vout: u32, mem: bool) -> Value {
         let s = self.st.lock().unwrap();
-        let Some((v, spk)) = s.utxos.get(&(txid.into(), vout)).cloned() else { return Value::Null };
+        let op = (txid.to_string(), vout);
+        // as a node answers: without the mempool, an output only a mempool transaction spends is still there
+        let unspent = s.utxos.get(&op).cloned()
+            .or_else(|| s.spent.get(&op).filter(|_| !mem && s.spent_by.get(&op).is_some_and(|sp| s.mempool.contains_key(sp))).cloned());
+        let Some((v, spk)) = unspent else { return Value::Null };
         let confs = if s.mempool.contains_key(txid) {
             if !mem {
                 return Value::Null;

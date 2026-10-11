@@ -466,7 +466,7 @@ impl HotWallet {
         let conf = py_int(r.get("confirmations")).filter(|c| *c > 0)?;
         let best = r.get("bestblock").and_then(Value::as_str)?;
         let tip = py_int(self.node.call("getblockheader", json!([best, true])).ok()?.get("height"))?;
-        u32::try_from(tip - conf + 1).ok()
+        u32::try_from(tip.checked_sub(conf)?.checked_add(1)?).ok() // the node's numbers, checked
     }
 
     /// The block of a confirmed transaction from its verbose form (`height`, else its `blockhash`,
@@ -826,7 +826,7 @@ impl HotWallet {
         let (coins, held) = self.spendable(&coins);
         let total: i64 = coins.iter().map(|u| u.value).sum();
         let mut fee = fee.max(SWEEP_FEE_BASE + SWEEP_FEE_PER_INPUT * coins.len() as i64);
-        if amount_sats < DUST || amount_sats + fee > total {
+        if amount_sats < DUST || amount_sats.checked_add(fee).is_none_or(|need| need > total) {
             let immature = if held > 0 { format!(" (and {held} immature coinbase)") } else { String::new() };
             return Err(err("hot", format!("cannot sweep {amount_sats} sats from {total}{immature}")));
         }

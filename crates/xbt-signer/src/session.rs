@@ -33,6 +33,10 @@ use crate::{err, Result};
 pub const PREVIEW_CAP: usize = 2048;
 /// AGP-089: the longest a stream's last chunk may stay hash-locked on the seller's word (four weeks).
 pub const MAX_COND_CSV_BLOCKS: u32 = 4032;
+/// AGP-095: the shortest a channel funded on a seller's offer may last (a day of blocks), unless
+/// the owner's `channel_expiry_blocks` asks for less. Each funded channel costs a funding fee and a
+/// close or refund fee that no budget counts, so a seller's window does not get one per call.
+pub const MIN_OFFER_EXPIRY_BLOCKS: i64 = 144;
 const OPEN_POLL_S: f64 = 2.0;
 
 /// Inline preview cap (`B2_BODY_CAP`, default 12,000).
@@ -140,7 +144,10 @@ type ChunkStep = std::result::Result<(Vec<u8>, i64, String), (String, i64, Strin
 pub enum FundingSpend {
     /// Still in the UTXO set (mempool included): the channel is not closed.
     Unspent,
-    /// Spent, by this transaction when the node could name it (else empty).
+    /// Spent only by a transaction in the mempool (named when the node can): not closed yet. That
+    /// transaction may never be mined, and then the funding is the refund's again (AGP-095).
+    Mempool(String),
+    /// Spent in a block, by this transaction when the node could name it (else empty).
     Spent(String),
     /// The node has never shown this output: nothing is proven either way.
     Unknown,
@@ -308,6 +315,18 @@ impl Session {
         }
         let blocks = xbt402::funding::open_expiry_blocks(nn(expiry_blocks), nn(min_exp), nn(max_exp), nn(min_conf), nn(margin));
         let blocks = i64::try_from(blocks).ok().filter(|b| *b <= most).ok_or_else(|| rt("offer expiry window is not a block count this wallet accepts"))?;
+        // AGP-095 (audit item 4), the lower side of the same rule: **how long a channel lasts is
+        // the owner's number too.** The offer's `maxExpiryBlocks` caps the window from above, so a
+        // seller that offers a window of a block or two and answers the preflight yes got a channel
+        // funded that could never be opened and was refunded, on every call, for two fees no budget
+        // sees. A channel is funded only if it lasts at least the offer's own floor (below it the
+        // seller's own check refuses the open), longer than the refund margin (inside it this
+        // wallet never opens), and at least `MIN_OFFER_EXPIRY_BLOCKS` or what the owner asked for.
+        let least = i64::try_from(floor).unwrap_or(i64::MAX).max(self.refund_margin.saturating_add(1)).max(expiry_blocks.min(MIN_OFFER_EXPIRY_BLOCKS));
+        if blocks < least {
+            return Err(err("expiry", format!("the offer's window lets the channel last {blocks} blocks; this wallet funds one only for {least} or more \
+                                              (the offer's own floor, the refund margin, and a day or the policy's channel_expiry_blocks); refused before funding")));
+        }
         self.hot.check_channel_funding()?; // AGP-013: above the hot-balance cap, a human sweeps first
         let open_height = self.height()? as i64;
         let expiry = open_height.checked_add(blocks).and_then(|e| u32::try_from(e).ok()).ok_or_else(|| rt("the channel's expiry is not a block height"))?;
@@ -366,13 +385,25 @@ impl Session {
 
     /// Ask our node whether `rec`'s funding output is spent. Without txindex the spender is looked
     /// for in the mempool, then in the blocks from the funding's own (as the refund does, P6).
+    ///
+    /// AGP-095 (audit item 17), the rule: **a channel leaves the refund watch only when our node
+    /// shows its funding spent in a block.** A close that is only in the mempool is a close that
+    /// may never be mined (a fee too low, a conflict, an eviction): taken for "closed, proven" it
+    /// ended the watch, and the funding then sat unspent past its expiry with no refund.
     pub fn funding_spend(&self, rec: &ChannelRecord) -> Result<FundingSpend> {
+        let vout = rec.funding_vout as u32;
         let utxo = self.node.call("gettxout", json!([rec.funding_txid, rec.funding_vout, true]))?;
         if !utxo.is_null() {
             return Ok(FundingSpend::Unspent);
         }
+        // gone with the mempool counted, still there without it: only a mempool transaction spends it
+        let confirmed = self.node.call("gettxout", json!([rec.funding_txid, rec.funding_vout, false]))?;
+        let in_mempool = node::mempool_spender(&*self.node, &rec.funding_txid, vout);
+        if !confirmed.is_null() || in_mempool.is_some() {
+            return Ok(FundingSpend::Mempool(in_mempool.unwrap_or_default()));
+        }
         let start = if rec.funding_height != 0 { rec.funding_height } else { rec.open_height };
-        if let Some(sp) = node::find_spender(&*self.node, &rec.funding_txid, rec.funding_vout as u32, start.max(0) as u64, node::SPENDER_SCAN_MAX) {
+        if let Some(sp) = node::block_spender(&*self.node, &rec.funding_txid, vout, start.max(0) as u64, node::SPENDER_SCAN_MAX) {
             return Ok(FundingSpend::Spent(sp));
         }
         if rec.funding_height != 0 || node::get_tx(&*self.node, &rec.funding_txid, "").is_some() {
@@ -587,6 +618,45 @@ impl Session {
         Ok(charged)
     }
 
+    /// Sign the state that pays `price` for this call, inside what the policy approved for it.
+    /// `Ok(Err(deny))`: refused before anything was signed.
+    fn sign_next(&self, dest: &str, price: i64, max_sats: i64, ledger_before: i64) -> Result<std::result::Result<(ChannelRecord, Vec<u8>), Value>> {
+        let rec = self.book.get(dest).ok_or_else(|| rt("channel vanished"))?;
+        // The policy approved max_sats. Only a channel's first states may sign more, up to the dust
+        // floor every state pays; that floor is booked like the rest.
+        let next = self.book.next_cum(dest, price)?;
+        let floor = rec.params()?.min_amount() as i64;
+        let rise = next.checked_sub(ledger_before).ok_or_else(|| rt("the next state is not an amount"))?;
+        if rise > max_sats && next > floor {
+            return Ok(Err(json!({"verdict": "deny", "rule": "max_sats", "charged_sats": 0,
+                                 "reason": format!("the next state signs {next} sat, {rise} more than the ledger holds; max_sats is {max_sats}")})));
+        }
+        if rise > max_sats {
+            let check = self.spend_check.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            if let Some(d) = check.map(|c| c(dest, max_sats, rise)).transpose()?.flatten() {
+                return Ok(Err(d));
+            }
+        }
+        self.book.increment(dest, price).map(Ok)
+    }
+
+    /// The seller's 402 to a state sent again says, in its own (unsigned) words, that it holds
+    /// exactly that state, for exactly that request, and that the state does not pay for this call
+    /// (`insufficient_payment`). `rec` is the record as the request left with it. Any other refusal
+    /// (closing, unconfirmed, exhausted, a state it does not have) is no reason to sign more.
+    fn held_and_short(rec: &ChannelRecord, r: &HttpResponse) -> bool {
+        if r.status != 402 {
+            return false;
+        }
+        let Some(pr) = r.header("PAYMENT-REQUIRED").and_then(|h| unb64json(h).ok()) else { return false };
+        let ch = pr.get("channel");
+        let field = |k: &str| ch.and_then(|c| c.get(k));
+        pr.get("error").and_then(Value::as_str) == Some("insufficient_payment")
+            && field("chan").and_then(Value::as_str) == Some(rec.chan.as_str())
+            && py_int(field("cum")) == Some(rec.used_sats)
+            && py_int(field("seq")) == Some(rec.seq)
+    }
+
     /// One call. The provider's body and receipt come back only under `untrusted_provider_response`.
     pub fn pay_once(&self, url: &str, method: &str, body: &[u8], max_sats: i64, expiry_blocks: i64, cap_sats: i64) -> Result<Value> {
         let mut res = self.pay_once_inner(url, method, body, max_sats, expiry_blocks, cap_sats)?;
@@ -623,6 +693,11 @@ impl Session {
                              "reason": "the forward rail is not available in this signer (not ported to the Rust signer)"}));
         }
         let price = py_int(acc.get("amount")).ok_or_else(|| rt("offer amount is not an integer"))?;
+        if price < 0 {
+            // the seller's number, read signed: a negative one is neither above max_sats nor zero,
+            // so a free-only call (max_sats 0) went on to fund a channel (AGP-095, audit item 4)
+            return Err(rt("offer amount is negative; nothing was opened or signed"));
+        }
         if price > max_sats {
             return Ok(json!({"verdict": "deny", "rule": "max_sats", "reason": format!("quoted {price} > max_sats {max_sats}")}));
         }
@@ -660,33 +735,40 @@ impl Session {
         let rec = self.book.get(&dest).ok_or_else(|| rt("channel vanished"))?;
         let ledger_before = Self::booked_through(&rec);
         let resend = !rec.last_sig.is_empty() && rec.used_sats > rec.acked_sats;
-        // The policy approved max_sats. Only a channel's first states may sign more, up to the dust
-        // floor every state pays; that floor is booked like the rest.
-        let next = if resend { rec.used_sats } else { self.book.next_cum(&dest, price)? };
-        let floor = rec.params()?.min_amount() as i64;
-        if next - ledger_before > max_sats && next > floor {
-            return Ok(json!({"verdict": "deny", "rule": "max_sats", "charged_sats": 0,
-                             "reason": format!("the next state signs {next} sat, {} more than the ledger holds; max_sats is {max_sats}",
-                                               next - ledger_before)}));
-        }
-        if next - ledger_before > max_sats {
-            let check = self.spend_check.lock().unwrap_or_else(|p| p.into_inner()).clone();
-            if let Some(d) = check.map(|c| c(&dest, max_sats, next - ledger_before)).transpose()?.flatten() {
-                return Ok(d);
+        let payload = |rec: &ChannelRecord, sig: &[u8]| {
+            let mut pl = json!({"chan": rec.chan, "seq": rec.seq, "cum": rec.used_sats.to_string()});
+            if !sig.is_empty() {
+                pl["sig"] = hex::encode(sig).into();
             }
-        }
-        let (rec, sig) = if resend {
+            pl
+        };
+        let (mut rec, sig) = if resend {
             self.book.resend_state(&dest)? // same (cum, sig); do not sign a higher one (M3)
         } else {
-            self.book.increment(&dest, price)?
+            match self.sign_next(&dest, price, max_sats, ledger_before)? {
+                Ok(signed) => signed,
+                Err(deny) => return Ok(deny),
+            }
         };
         // AGP-063 W1: book the signed increase before the signature leaves. Never the seller's charged.
-        let booked = self.book_unbooked(&dest)?;
-        let mut payload = json!({"chan": rec.chan, "seq": rec.seq, "cum": rec.used_sats.to_string()});
-        if !sig.is_empty() {
-            payload["sig"] = hex::encode(&sig).into();
+        let mut booked = self.book_unbooked(&dest)?;
+        let (mut r2, mut receipt) = self.paid(method, url, body, &acc, payload(&rec, &sig))?;
+        // AGP-095 (audit item 3). The rule: **one call signs at most one new state, and signs it
+        // only when the seller holds the last one**: because a receipt acked it, or because the
+        // seller, sent that state again, answers that it has it and that it does not pay for this
+        // call. That is what a seller answers once it has served a call whose answer was lost: it
+        // charged the call, the wallet has no receipt, and a state that is only ever sent again
+        // never covers the next call, so the channel stopped for good. The call is paid once, by
+        // the one new state; the 402 is not a receipt and acks nothing.
+        if resend && Self::held_and_short(&rec, &r2) {
+            let (rec2, sig2) = match self.sign_next(&dest, price, max_sats, ledger_before)? {
+                Ok(signed) => signed,
+                Err(deny) => return Ok(deny),
+            };
+            booked += self.book_unbooked(&dest)?;
+            (r2, receipt) = self.paid(method, url, body, &acc, payload(&rec2, &sig2))?;
+            rec = rec2;
         }
-        let (r2, receipt) = self.paid(method, url, body, &acc, payload)?;
         // AGP-089 (review T4): the state counts as arrived only on the payee's signature over this
         // request's seq. Any other PAYMENT-RESPONSE (none, one for an earlier request, one someone
         // on the path made up) leaves it unacked, so the next call sends the same state again and
