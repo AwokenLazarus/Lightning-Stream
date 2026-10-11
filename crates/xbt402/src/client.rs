@@ -91,6 +91,10 @@ pub struct ClientConfig {
     pub network: String,
     pub capacity: u64,
     pub expiry_blocks: u32,
+    /// Most blocks to expiry this client funds, whatever an offer asks for (AGP-090, review C2:
+    /// [`offer_expiry_blocks`](crate::funding::offer_expiry_blocks)). An offer that needs more is
+    /// refused before funding.
+    pub max_expiry_blocks: u32,
     /// Most a call (or a conditional increment) may cost, in sats.
     pub max_price: u64,
     pub max_close_fee: u64,
@@ -102,7 +106,8 @@ pub struct ClientConfig {
 
 impl ClientConfig {
     pub fn new(network: &str) -> Self {
-        Self { network: network.into(), capacity: 200_000, expiry_blocks: 1_008, max_price: 1_000, max_close_fee: 2_000,
+        Self { network: network.into(), capacity: 200_000, expiry_blocks: 1_008,
+               max_expiry_blocks: crate::funding::OWNER_MAX_EXPIRY_BLOCKS as u32, max_price: 1_000, max_close_fee: 2_000,
                budget_sats: 1_000_000, daily_budget: 0 }
     }
 }
@@ -173,6 +178,35 @@ pub struct PendingCond {
     pub amount: u64,
 }
 
+/// How far a channel's open has got (AGP-090, review C2). A channel is on the books, and in the
+/// ledger, from the moment it has a key: the client used to keep it only once the provider had
+/// answered the funded open, so a refusal or a lost answer dropped the only copy of the payer key
+/// with the coins already in the channel's script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Stage {
+    /// It has a key and terms. Its funding has not left, or the call that sends it has not
+    /// answered, or the funded channel is not bound to its key yet (`refund_hex` is empty).
+    Keyed,
+    /// Funded and bound, the refund held (and handed to `on_refund`). The provider has not
+    /// answered the funded open: the next request asks again, and nothing is funded again.
+    /// A seller that never opens it leaves it here until its expiry: the embedder broadcasts
+    /// `refund_hex` then, and removes the record from [`Client::channels`].
+    Funded,
+    /// The provider opened it: the only stage a state is signed in.
+    #[default]
+    Open,
+}
+
+impl Stage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Stage::Keyed => "keyed",
+            Stage::Funded => "funded",
+            Stage::Open => "open",
+        }
+    }
+}
+
 /// One channel to one origin.
 #[derive(Debug, Clone)]
 pub struct ClientChannel {
@@ -184,7 +218,8 @@ pub struct ClientChannel {
     pub auth_key: [u8; 32],
     /// Sat per call agreed at open: a 402 may not raise it mid-channel.
     pub price: u64,
-    /// Charges adopted from a 402 without a receipt, over the channel's life.
+    /// Charges adopted over the channel's life that no request of ours accounts for: at most one
+    /// call (a request sent just before a crash, whose answer and count were both lost).
     pub slack_msat: u64,
     pub seq: u64,
     /// From the last verified receipt.
@@ -195,7 +230,22 @@ pub struct ClientChannel {
     /// The provider's best cum per its last receipt.
     pub acked_cum: u64,
     pub receipts: Vec<Value>,
+    pub stage: Stage,
+    /// What the paid requests the provider has not answered may have cost: one quote each, added
+    /// when a request leaves, taken off when the provider refuses it (a 402: not charged), cleared
+    /// by a verified receipt (AGP-090, review T4). An answer lost on the way, or one refused for its
+    /// receipt, leaves its request here: the provider may have served it, so its spent total may
+    /// be ahead of ours by this much (and by what is left of `slack_msat`'s one call).
+    pub unanswered_msat: u64,
+    /// In [`Client::next_rolled`]: the id of the channel whose rollover pays this one. Every
+    /// attempt to roll that channel over pays the same key.
+    pub rolled_from: Option<String>,
 }
+
+/// Most unresolved records kept per origin: next channels of one channel's rollover attempts
+/// ([`Client::next_rolled`]) and stale unfunded opens ([`Client::unfunded`]). Twice the signed
+/// spends a provider keeps per channel (AGP-085), so an honest provider's bound is met first.
+pub const MAX_KEPT: usize = 16;
 
 /// Receipts kept per channel record in a [`ClientLedger`] (the newest; memory keeps them all).
 pub const LEDGER_RECEIPTS: usize = 16;
@@ -213,7 +263,8 @@ impl ClientChannel {
         json!({"origin": self.origin, "params": self.payer.params.to_json(), "signed": self.payer.signed, "key": key,
                "accepted": self.accepted, "refund_hex": self.refund_hex, "auth_key": hex::encode(self.auth_key), "price": self.price,
                "slack_msat": self.slack_msat, "seq": self.seq, "spent_msat": self.spent_msat, "last_sig": self.last_sig,
-               "pending_cond": pending, "acked_cum": self.acked_cum, "receipts": &self.receipts[from..]})
+               "pending_cond": pending, "acked_cum": self.acked_cum, "receipts": &self.receipts[from..],
+               "stage": self.stage.as_str(), "unanswered_msat": self.unanswered_msat, "rolled_from": self.rolled_from})
     }
 
     /// Inverse of [`to_json`](Self::to_json). A `"signer"` record needs the signer that holds its
@@ -251,13 +302,28 @@ impl ClientChannel {
             pending_cond,
             acked_cum: n("acked_cum")?,
             receipts: v.get("receipts").and_then(Value::as_array).cloned().unwrap_or_default(),
+            // a record from before AGP-090 has none of the three: it was written only for a channel
+            // the provider had opened, after a receipt or a close, with no parent recorded
+            stage: match v.get("stage").map(|s| s.as_str()) {
+                None | Some(Some("open")) => Stage::Open,
+                Some(Some("funded")) => Stage::Funded,
+                Some(Some("keyed")) => Stage::Keyed,
+                Some(_) => return Err(bad("stage")),
+            },
+            unanswered_msat: match v.get("unanswered_msat") {
+                None => 0,
+                Some(n) => n.as_u64().ok_or_else(|| bad("unanswered_msat"))?,
+            },
+            rolled_from: v.get("rolled_from").and_then(Value::as_str).map(str::to_string),
         })
     }
 }
 
 /// Where a [`Client`] keeps its channel book (AGP-035). Records are JSON under string keys:
-/// `"book"` (the budget counters), `"chan <origin>"` and `"rolled <origin>"` (a channel replaced by
-/// a rollover, until its successor is opened); `null` removes a key. Implement it over any store;
+/// `"book"` (the budget counters), `"chan <origin>"`, `"rolled <origin>"` (a channel replaced by
+/// a rollover, until its successor is opened), `"next <origin>"` (the next channels of rollovers
+/// this client signed) and `"unfunded <origin>"` (keys of opens whose funding call failed and that
+/// are too old to fund now); `null` removes a key. Implement it over any store;
 /// [`FileClientLedger`] and [`MemoryClientLedger`] are provided.
 pub trait ClientLedger: Send + Sync {
     /// The latest record per key (no `null`s), in the order the keys were first saved.
@@ -439,6 +505,10 @@ pub struct Client {
     /// rollover (`refund_hex` is empty until then). [`adopt_rolled`](Self::adopt_rolled) makes one
     /// the live channel; one whose transaction can no longer confirm is the embedder's to remove.
     pub next_rolled: HashMap<String, Vec<ClientChannel>>,
+    /// Channels in [`Stage::Keyed`] whose funding call failed and whose expiry is now too near to
+    /// fund, per origin (AGP-090). A wallet's `fund` can fail after it broadcast, so their keys are
+    /// kept in case a funding to one of them shows up; at most [`MAX_KEPT`] per origin.
+    pub unfunded: HashMap<String, Vec<ClientChannel>>,
     /// AGP-027: where the payer keys live (B2's signer). `None`: this client holds them.
     signer: Option<Arc<dyn StateSigner>>,
     /// AGP-035: where the channel book is saved. `None`: memory only.
@@ -487,7 +557,7 @@ impl Client {
     pub fn new(cfg: ClientConfig, transport: Box<dyn Transport>, wallet: Box<dyn Wallet>,
                height: HeightFn) -> Self {
         Self { cfg, transport, wallet, height, channels: HashMap::new(), opened_sats: 0, day_spent: 0, day_start: now(), on_refund: None,
-               pending_rolled: HashMap::new(), next_rolled: HashMap::new(), signer: None, ledger: None, payers: vec![] }
+               pending_rolled: HashMap::new(), next_rolled: HashMap::new(), unfunded: HashMap::new(), signer: None, ledger: None, payers: vec![] }
     }
 
     /// Pay with another scheme (AGP-032, `xbt-work`) whenever a 402 offers it: it is preferred
@@ -509,10 +579,10 @@ impl Client {
                 self.channels.insert(o.to_string(), ClientChannel::from_json(&v, self.signer.as_ref())?);
             } else if let Some(o) = k.strip_prefix("rolled ") {
                 self.pending_rolled.insert(o.to_string(), ClientChannel::from_json(&v, self.signer.as_ref())?);
-            } else if let Some(o) = k.strip_prefix("next ") {
-                let list = v.as_array().ok_or_else(|| ChannelError::new("ledger_error", "client next-channel record: not a list"))?;
+            } else if let Some((next, o)) = k.strip_prefix("next ").map(|o| (true, o)).or_else(|| k.strip_prefix("unfunded ").map(|o| (false, o))) {
+                let list = v.as_array().ok_or_else(|| ChannelError::new("ledger_error", "client channel list record: not a list"))?;
                 let list = list.iter().map(|c| ClientChannel::from_json(c, self.signer.as_ref())).collect::<Result<Vec<_>>>()?;
-                self.next_rolled.insert(o.to_string(), list);
+                if next { &mut self.next_rolled } else { &mut self.unfunded }.insert(o.to_string(), list);
             }
         }
         self.ledger = Some(ledger);
@@ -532,11 +602,13 @@ impl Client {
                 recs.push((format!("chan {o}"), rec(self.channels.get(o))));
                 recs.push((format!("rolled {o}"), rec(self.pending_rolled.get(o))));
                 recs.push((format!("next {o}"), self.next_rolled.get(o).map(list).unwrap_or(Value::Null)));
+                recs.push((format!("unfunded {o}"), self.unfunded.get(o).map(list).unwrap_or(Value::Null)));
             }
             None => {
                 recs.extend(self.channels.iter().map(|(o, c)| (format!("chan {o}"), c.to_json())));
                 recs.extend(self.pending_rolled.iter().map(|(o, c)| (format!("rolled {o}"), c.to_json())));
                 recs.extend(self.next_rolled.iter().map(|(o, l)| (format!("next {o}"), list(l))));
+                recs.extend(self.unfunded.iter().map(|(o, l)| (format!("unfunded {o}"), list(l))));
             }
         }
         l.save(&recs)
@@ -637,48 +709,199 @@ impl Client {
     }
 
     fn expiry_blocks(&self, ex: &Value) -> Result<u32> {
-        let blocks = crate::funding::offer_expiry_blocks(ex, self.cfg.expiry_blocks as u64)?;
+        let blocks = crate::funding::offer_expiry_blocks(ex, self.cfg.expiry_blocks as u64, self.cfg.max_expiry_blocks as u64)?;
         u32::try_from(blocks).map_err(|_| ChannelError::new("bad_offer", "expiry blocks"))
     }
 
-    fn open(&mut self, origin: &str, acc: &Value) -> Result<ClientChannel> {
+    /// The height a channel opened now on `ex` expires at.
+    fn expiry_height(&self, ex: &Value) -> Result<u32> {
+        (self.height)()?.checked_add(self.expiry_blocks(ex)?).ok_or_else(|| ChannelError::new("bad_offer", "expiry height"))
+    }
+
+    /// What one call on `ch` may cost: the price pinned at open.
+    fn quote(ch: &ClientChannel) -> u64 {
+        if ch.price > 0 { ch.price } else { py_u64(ch.accepted.get("amount")).unwrap_or(0) }
+    }
+
+    /// Bring `origin`'s channel to [`Stage::Open`]. Every open goes through here (a plain call, a
+    /// conditional call, a retry after any failure, a restart).
+    ///
+    /// The rule (AGP-090, review C2): a channel's key is on the books and in the ledger before its
+    /// funding leaves, its refund before the provider is asked to open it, and an origin that has
+    /// a channel on the books is never funded a second time. The client used to keep a channel
+    /// only after the provider answered the funded open: a seller that said yes to the preflight
+    /// and no to the open (or an answer lost on the way) left the coins in a script whose only
+    /// payer key had been dropped, and every later call funded another channel.
+    fn ensure_open(&mut self, origin: &str, acc: &Value) -> Result<()> {
+        if !self.channels.contains_key(origin) {
+            self.key_channel(origin, acc)?;
+        }
+        if self.channels[origin].stage == Stage::Keyed {
+            self.fund_keyed(origin)?;
+        }
+        if self.channels[origin].stage == Stage::Funded {
+            self.post_open(origin)?;
+        }
+        Ok(())
+    }
+
+    /// Terms, a key and the preflight for a new channel to `origin`, saved before anything is
+    /// funded ([`Stage::Keyed`]).
+    fn key_channel(&mut self, origin: &str, acc: &Value) -> Result<()> {
         let ex = acc.get("extra").cloned().unwrap_or(Value::Null);
         let fee_payer = FeePayer::parse(ex.get("closeFeePayer").and_then(Value::as_str).unwrap_or("payer"))?;
         let cap = self.cfg.capacity.max(ex_u64(&ex, "minCapacity")?);
         let max_cap = py_u64(ex.get("maxCapacity")).unwrap_or(cap);
-        if cap > max_cap || self.opened_sats + cap > self.cfg.budget_sats {
+        // checked: minCapacity is the seller's number
+        if cap > max_cap || self.opened_sats.checked_add(cap).is_none_or(|t| t > self.cfg.budget_sats) {
             return fail("budget", "channel capacity outside provider range or our budget");
         }
-        let expiry = (self.height)()? + self.expiry_blocks(&ex)?;
+        let expiry = self.expiry_height(&ex)?;
         let pay_to = hex::decode(acc.get("payTo").and_then(Value::as_str).unwrap_or("")).map_err(|_| ChannelError::new("bad_offer", "payTo"))?;
         let close_fee = ex_u64(&ex, "closeFeeSat")?;
+        let open_url = Self::open_url(origin, acc)?;
         let (pubk, secret, payer_spk) = self.fresh_key(origin)?;
-        let p = ChannelParams::derive(&pay_to, &pubk, expiry, close_fee, payer_spk, &self.cfg.network, fee_payer)?;
-        let addr = segwit_address(self.hrp(), &p.spk())?;
-        let open_url = crate::wire::seller_url(origin, ex.get("openUrl").and_then(Value::as_str).unwrap_or(OPEN_PATH))?;
-        let mut c = json!({"capacity": cap, "expiry": expiry, "payerPub": hex::encode(p.payer_pub),
-                           "payerSpk": hex::encode(&p.payer_spk), "redeemScript": hex::encode(p.script())});
-        if fee_payer != FeePayer::Payer {
-            c["closeFeePayer"] = fee_payer.as_str().into();
-        }
-        self.preflight(&open_url, &c, fee_payer)?;
-        let (txid, vout) = self.wallet.fund_channel(origin, &p, &addr, cap)?;
-        let p = p.with_funding(&txid, vout, cap)?;
-        self.opened_sats += cap;
-        let (payer, refund_hex, auth_key) = self.bind_key(origin, p.clone(), secret)?;
+        let mut p = ChannelParams::derive(&pay_to, &pubk, expiry, close_fee, payer_spk, &self.cfg.network, fee_payer)?;
+        p.capacity = cap;
+        self.preflight(&open_url, &Self::open_terms(&p), fee_payer)?;
+        let (payer, auth_key) = match (&self.signer, secret) {
+            (Some(s), _) => (Payer::with_backend(p, s.clone()), [0u8; 32]),
+            (None, Some(sk)) => {
+                let auth_key = channel_auth_key(&sk, &p.payee_pub)?;
+                (Payer::new(p, sk)?, auth_key)
+            }
+            (None, None) => return fail("bad_key", "no payer key"),
+        };
         let price = py_u64(acc.get("amount")).unwrap_or(0);
+        self.channels.insert(origin.into(), ClientChannel { payer, origin: origin.into(), accepted: acc.clone(), refund_hex: String::new(), auth_key, price,
+                                                            slack_msat: 0, seq: 0, spent_msat: 0, last_sig: String::new(), pending_cond: None, acked_cum: 0,
+                                                            receipts: vec![], stage: Stage::Keyed, unanswered_msat: 0, rolled_from: None });
+        self.persist(Some(origin))
+    }
+
+    fn open_url(origin: &str, acc: &Value) -> Result<String> {
+        crate::wire::seller_url(origin, acc.get("extra").and_then(|e| e.get("openUrl")).and_then(Value::as_str).unwrap_or(OPEN_PATH))
+    }
+
+    /// The `channel` object of an open request (the outpoint too, once `p` is funded).
+    fn open_terms(p: &ChannelParams) -> Value {
+        let mut c = json!({"capacity": p.capacity, "expiry": p.expiry, "payerPub": hex::encode(p.payer_pub),
+                           "payerSpk": hex::encode(&p.payer_spk), "redeemScript": hex::encode(p.script())});
+        if p.close_fee_payer != FeePayer::Payer {
+            c["closeFeePayer"] = p.close_fee_payer.as_str().into();
+        }
+        if p.funding.is_some() {
+            c["txid"] = p.funding_txid().into();
+            c["vout"] = p.funding_vout().into();
+        }
+        c
+    }
+
+    /// Fund the [`Stage::Keyed`] channel of `origin` (unless an earlier call did), bind it to its
+    /// key and hold its refund: [`Stage::Funded`], saved before the provider hears of the outpoint.
+    fn fund_keyed(&mut self, origin: &str) -> Result<()> {
+        let no = || ChannelError::code("no_channel");
+        if self.channels.get(origin).ok_or_else(no)?.payer.params.funding.is_none() {
+            let (p, ex) = {
+                let ch = &self.channels[origin];
+                (ch.payer.params.clone(), ch.accepted.get("extra").cloned().unwrap_or(Value::Null))
+            };
+            let addr = segwit_address(self.hrp(), &p.spk())?;
+            // an earlier fund call may have failed after it broadcast: the wallet's own record of
+            // a send to this script is used before anything is sent again
+            let (txid, vout) = match self.wallet_send_to(&addr, p.capacity)? {
+                Some(o) => o,
+                None => {
+                    if (p.expiry as u64) < ((self.height)()? as u64).saturating_add(crate::funding::offer_expiry_floor(&ex)?) {
+                        // too near its expiry to open now. The key stays in the ledger, in case that
+                        // earlier call did fund it, and the open starts again with a new key
+                        return self.shelve_keyed(origin);
+                    }
+                    self.wallet.fund_channel(origin, &p, &addr, p.capacity)?
+                }
+            };
+            let funded = p.with_funding(&txid, vout, self.channels[origin].payer.params.capacity)?;
+            self.opened_sats = self.opened_sats.saturating_add(funded.capacity);
+            self.channels.get_mut(origin).ok_or_else(no)?.payer.params = funded;
+            self.persist(Some(origin))?;
+        }
+        let (p, secret) = {
+            let ch = &self.channels[origin];
+            (ch.payer.params.clone(), ch.payer.secret().copied())
+        };
+        let expiry = p.expiry;
+        let (payer, refund_hex, auth_key) = self.bind_key(origin, p, secret)?;
         if let Some(cb) = &self.on_refund {
             cb(&refund_hex, expiry);
         }
-        c["txid"] = txid.into();
-        c["vout"] = vout.into();
-        let r = self.post(&open_url, &json!({"x402Version": 2, "network": self.cfg.network, "channel": c}))?;
-        if r.get("closeFeePayer").and_then(Value::as_str).unwrap_or("payer") != fee_payer.as_str() {
-            // a provider that did not take our terms would refuse every state we sign
-            return fail("bad_fee_payer", "the provider opened the channel with another closeFeePayer");
+        let ch = self.channels.get_mut(origin).ok_or_else(no)?;
+        (ch.payer, ch.refund_hex, ch.auth_key, ch.stage) = (payer, refund_hex, auth_key, Stage::Funded);
+        self.persist(Some(origin))
+    }
+
+    /// The live send of `sats` this wallet made to `address`, if it knows one.
+    fn wallet_send_to(&self, address: &str, sats: u64) -> Result<Option<(String, u32)>> {
+        for txid in self.wallet.wallet_sends_to(address)? {
+            if let Some(w) = self.wallet.wallet_send(&txid, address)? {
+                if !w.failed() && w.sats == sats {
+                    return Ok(Some((w.txid, w.vout)));
+                }
+            }
         }
-        Ok(ClientChannel { payer, origin: origin.into(), accepted: acc.clone(), refund_hex, auth_key, price,
-                           slack_msat: 0, seq: 0, spent_msat: 0, last_sig: String::new(), pending_cond: None, acked_cum: 0, receipts: vec![] })
+        Ok(None)
+    }
+
+    /// Move `origin`'s stale [`Stage::Keyed`] channel to [`unfunded`](Self::unfunded) and report
+    /// the open as failed; the next call opens with a new key. A signer holds one issued key per
+    /// origin and a new one would replace this one, so with a signer the record stays where it is
+    /// until the embedder calls [`forget_unfunded`](Self::forget_unfunded).
+    fn shelve_keyed(&mut self, origin: &str) -> Result<()> {
+        let kept = self.unfunded.get(origin).map_or(0, Vec::len);
+        if self.signer.is_some() || kept >= MAX_KEPT {
+            return fail("open_unresolved", format!("an earlier open to {origin} never learned whether its funding was sent, and its channel is too near \
+                                                    expiry to fund now: once the wallet shows no send to it, call forget_unfunded"));
+        }
+        if let Some(ch) = self.channels.remove(origin) {
+            self.unfunded.entry(origin.to_string()).or_default().push(ch);
+        }
+        self.persist(Some(origin))?;
+        fail("open_unresolved", format!("an earlier open to {origin} was too old to fund; its key is kept, and the next call opens a new channel"))
+    }
+
+    /// Drop the channels of `origin` that were never funded: the one in [`Stage::Keyed`] without
+    /// an outpoint, and those in [`unfunded`](Self::unfunded). Call it only when the wallet shows
+    /// no send to their scripts: their keys go with them. Returns how many were dropped.
+    pub fn forget_unfunded(&mut self, origin: &str) -> Result<usize> {
+        let mut n = self.unfunded.remove(origin).map_or(0, |l| l.len());
+        if self.channels.get(origin).is_some_and(|c| c.stage == Stage::Keyed && c.payer.params.funding.is_none()) {
+            self.channels.remove(origin);
+            n += 1;
+        }
+        self.persist(Some(origin)).map(|_| n)
+    }
+
+    /// Ask the provider to open the [`Stage::Funded`] channel of `origin`. Asked again on every
+    /// call until it answers: a provider that already has the channel (its first answer was lost)
+    /// says `duplicate_channel`, which is the yes that never arrived.
+    fn post_open(&mut self, origin: &str) -> Result<()> {
+        let (url, req, fee_payer) = {
+            let ch = self.channels.get(origin).ok_or_else(|| ChannelError::code("no_channel"))?;
+            let p = &ch.payer.params;
+            (Self::open_url(origin, &ch.accepted)?, json!({"x402Version": 2, "network": self.cfg.network, "channel": Self::open_terms(p)}), p.close_fee_payer)
+        };
+        match self.post(&url, &req) {
+            Ok(r) if r.get("closeFeePayer").and_then(Value::as_str).unwrap_or("payer") != fee_payer.as_str() => {
+                // a provider that did not take our terms would refuse every state we sign
+                return fail("bad_fee_payer", "the provider opened the channel with another closeFeePayer");
+            }
+            Ok(_) => {}
+            Err(e) if e.code == "duplicate_channel" => {}
+            Err(e) => return Err(e),
+        }
+        if let Some(ch) = self.channels.get_mut(origin) {
+            ch.stage = Stage::Open;
+        }
+        self.persist(Some(origin))
     }
 
     /// Ask the provider whether it opens a channel on exactly these terms before anything is funded
@@ -728,6 +951,10 @@ impl Client {
     /// `chosen`: the caller's cumulative amount (AGP-059, [`CallOpts::cum`]), bounded here.
     fn payload(&mut self, origin: &str, price: u64, method: &str, path: &str, body: &[u8], chosen: Option<u64>) -> Result<Value> {
         let ch = self.channels.get(origin).ok_or_else(|| ChannelError::code("no_channel"))?;
+        if ch.stage != Stage::Open {
+            // one choke point for every signature of a state: none before the provider opened it
+            return fail("no_channel", "the channel is not open at the provider yet");
+        }
         let billing = ch.accepted.get("extra").and_then(|e| e.get("billing")).and_then(Value::as_str).unwrap_or("postpay");
         let need_msat = ch.spent_msat + if billing == "prepay" { price * 1000 } else { 0 };
         let mut cum = need_msat.div_ceil(1000).max(ch.payer.signed);
@@ -736,7 +963,7 @@ impl Client {
             cum = pmin;
         }
         if let Some(c) = chosen {
-            let quote = if ch.price > 0 { ch.price } else { py_u64(ch.accepted.get("amount")).unwrap_or(0) };
+            let quote = Self::quote(ch);
             if c < ch.payer.signed {
                 return fail("bad_amount", format!("cum {c} is below the last signed state {}", ch.payer.signed));
             }
@@ -758,6 +985,12 @@ impl Client {
             return fail("exhausted", "channel low: roll it over (Client::rollover) or close and reopen");
         }
         ch.seq += 1;
+        if !path.is_empty() {
+            // a call (a close charges nothing): the provider may serve it whether or not its
+            // answer reaches us, so its quote counts until a receipt says what was charged
+            let quote_msat = Self::quote(ch).saturating_mul(1000);
+            ch.unanswered_msat = ch.unanswered_msat.saturating_add(quote_msat);
+        }
         let mut pl = json!({"chan": ch.payer.params.channel_id(), "seq": ch.seq, "cum": cum.to_string()});
         if cum > ch.payer.signed {
             if cum > ch.payer.params.max_amount() {
@@ -812,13 +1045,17 @@ impl Client {
                 break;
             }
         }
-        if used.is_none() && self.channels.contains_key(&origin) {
+        if used.is_none() && self.channels.get(&origin).is_some_and(|c| c.stage == Stage::Open) {
             hdrs = self.signature_header(&origin, method, &path, body, opts.cum)?;
         }
         // a payment went with the request: its answer is taken only with its receipt
         let mut paid = !hdrs.is_empty();
+        let on_channel = paid && used.is_none();
         let mut r = self.transport.request(method, url, body, &with_extra(hdrs))?;
         if r.status == 402 {
+            if on_channel {
+                self.refused(&origin);
+            }
             let pr = unb64json(header(&r, "PAYMENT-REQUIRED").ok_or_else(|| ChannelError::new("bad_offer", "402 without PAYMENT-REQUIRED"))?)?;
             let offered = |sc: &str| pr.get("accepts").and_then(Value::as_array).into_iter().flatten()
                 .find(|a| a.get("scheme").and_then(Value::as_str) == Some(sc) && a.get("network").and_then(Value::as_str) == Some(&self.cfg.network))
@@ -833,10 +1070,7 @@ impl Client {
             }
             used = None;
             let acc = self.pick(&pr)?;
-            if !self.channels.contains_key(&origin) {
-                let ch = self.open(&origin, &acc)?;
-                self.channels.insert(origin.clone(), ch);
-            }
+            self.ensure_open(&origin, &acc)?;
             let ch = self.channels.get_mut(&origin).ok_or_else(|| ChannelError::code("no_channel"))?;
             let amount = py_u64(acc.get("amount")).unwrap_or(0);
             if ch.price > 0 && amount > ch.price {
@@ -844,17 +1078,26 @@ impl Client {
             }
             ch.accepted = acc.clone();
             if let Some(chv) = pr.get("channel") {
-                // the provider's view: at most one unreceipted call over the channel's life
+                // The provider's view of what it charged, unsigned. It may be ahead of our receipts
+                // by the requests it never answered, at one quote each (AGP-090, review T4), plus the
+                // one call of slack a channel has over its life. The slack alone was the bound, so
+                // a second lost answer ended the channel in bad_offer. A request it refused with a
+                // 402 is not among them: a provider that serves nothing can claim nothing.
                 let claimed = py_u64(chv.get("spentMsat")).unwrap_or(0);
                 let extra = claimed.saturating_sub(ch.spent_msat);
-                if extra > 0 && ch.slack_msat + extra > amount * 1000 {
+                let unproven = extra.saturating_sub(ch.unanswered_msat);
+                if unproven > 0 && ch.slack_msat.saturating_add(unproven) > amount.saturating_mul(1000) {
                     return fail("bad_offer", "provider claims charges we have no receipts for");
                 }
-                ch.slack_msat += extra;
+                ch.unanswered_msat -= extra - unproven;
+                ch.slack_msat += unproven;
                 ch.spent_msat = ch.spent_msat.max(claimed);
             }
             let hdrs = self.signature_header(&origin, method, &path, body, opts.cum)?;
             r = self.transport.request(method, url, body, &with_extra(hdrs))?;
+            if r.status == 402 {
+                self.refused(&origin);
+            }
             paid = true;
         }
         let resp = if paid { paid_response(&r)? } else { header(&r, "PAYMENT-RESPONSE").map(unb64json).transpose()? };
@@ -867,6 +1110,14 @@ impl Client {
         Ok(r)
     }
 
+    /// The provider answered the paid request just sent on `origin`'s channel with a 402: by its
+    /// own word it did not charge it.
+    fn refused(&mut self, origin: &str) {
+        if let Some(ch) = self.channels.get_mut(origin) {
+            ch.unanswered_msat = ch.unanswered_msat.saturating_sub(Self::quote(ch).saturating_mul(1000));
+        }
+    }
+
     /// Check a PAYMENT-RESPONSE against what we signed and were quoted, and against the answer it
     /// came with (`answer`: status and body), and adopt it. `quote`: what this call may cost (the
     /// price pinned at open, or a conditional amount).
@@ -875,7 +1126,8 @@ impl Client {
                quote: Option<u64>) -> Result<()> {
         let network = self.cfg.network.clone();
         let ch = self.channels.get_mut(origin).ok_or_else(|| ChannelError::code("no_channel"))?;
-        let quote = quote.filter(|q| *q > 0).unwrap_or(if ch.price > 0 { ch.price } else { py_u64(ch.accepted.get("amount")).unwrap_or(0) });
+        let pinned = Self::quote(ch);
+        let quote = quote.filter(|q| *q > 0).unwrap_or(pinned);
         let r = receipt_of(resp)?.clone();
         if resp.get("network").and_then(Value::as_str) != Some(network.as_str())
             || resp.get("payer").and_then(Value::as_str) != Some(hex::encode(ch.payer.params.payer_pub).as_str())
@@ -885,7 +1137,16 @@ impl Client {
         if py_str(r.get("req")) != request_digest_v2(method, &format!("{origin}{path}"), body) {
             return fail("bad_receipt", "receipt is for another request");
         }
-        if r.get("status").and_then(Value::as_u64) != Some(answer.0 as u64) || py_str(r.get("bodyHash")) != body_hash(answer.1) {
+        if py_int(r.get("seq")) != Some(ch.seq as i128) {
+            // The receipt of the request we just sent, and of no other (AGP-090, review T4): an
+            // identical earlier request has the same digest, so whoever sits between could answer
+            // this one with the earlier answer and its genuine receipt.
+            return fail("bad_receipt", format!("receipt is for seq {}, this call was seq {}", py_str(r.get("seq")), ch.seq));
+        }
+        // An answer that has no body by its framing (to a HEAD, or a 204 or 304) is checked on its
+        // status: the receipt's bodyHash is of the body the provider did not send (AGP-090).
+        let bodiless = answer.1.is_empty() && (method.eq_ignore_ascii_case("HEAD") || matches!(answer.0, 204 | 304));
+        if r.get("status").and_then(Value::as_u64) != Some(answer.0 as u64) || (!bodiless && py_str(r.get("bodyHash")) != body_hash(answer.1)) {
             // a truncated or altered answer is not the one the provider signed for
             return fail("bad_receipt", "receipt is for another answer (status or body differs)");
         }
@@ -900,10 +1161,20 @@ impl Client {
         if rcum > ch.payer.signed as i128 || charged > quote as i128 {
             return fail("bad_receipt", "provider claims more than we signed or were quoted");
         }
-        if spent - ch.spent_msat as i128 > quote as i128 * 1000 {
-            return fail("bad_receipt", "provider charged more than one call");
+        // The spent total may have grown, since the last receipt we verified, by one quote for each
+        // request the provider has not answered: this one and those whose answers were lost on the
+        // way (AGP-090, review T4), plus what is left of the channel's one call of slack. It was held
+        // to one call, so after one lost answer every later receipt was refused and the provider
+        // went on charging for answers the payer threw away. A lost answer is paid for once, like
+        // the call it answered; a request the provider refused is not paid for at all.
+        let unproven = spent - ch.spent_msat as i128 - ch.unanswered_msat as i128;
+        if unproven > 0 && ch.slack_msat as i128 + unproven > pinned as i128 * 1000 {
+            return fail("bad_receipt", "provider charged more than the calls we sent");
         }
-        ch.spent_msat = spent as u64;
+        let Ok(spent) = u64::try_from(spent) else { return fail("bad_receipt", "receipt amounts are out of range") };
+        ch.slack_msat += u64::try_from(unproven).unwrap_or(0);
+        ch.spent_msat = spent;
+        ch.unanswered_msat = 0;
         ch.acked_cum = ch.acked_cum.max(rcum as u64);
         ch.receipts.push(r);
         Ok(())
@@ -941,13 +1212,29 @@ impl Client {
     fn rollover_inner(&mut self, origin: &str) -> Result<Value> {
         let h = (self.height)()?;
         let ch = self.channels.get(origin).ok_or_else(|| ChannelError::code("no_channel"))?;
+        if ch.stage != Stage::Open {
+            return fail("no_channel", "the channel is not open at the provider yet");
+        }
         let ex = ch.accepted.get("extra").cloned().unwrap_or(Value::Null);
-        let expiry = h + self.expiry_blocks(&ex)?;
+        let expiry = h.checked_add(self.expiry_blocks(&ex)?).ok_or_else(|| ChannelError::new("bad_offer", "expiry height"))?;
         let mut owed = (ch.spent_msat / 1000).max(ch.payer.signed);
         owed = owed.max(ch.payer.params.min_amount());
         let pay_to = hex::decode(ch.accepted.get("payTo").and_then(Value::as_str).unwrap_or("")).map_err(|_| ChannelError::code("bad_offer"))?;
         let next_origin = format!("{origin}/next");
-        let (next_pub, secret, next_payer_spk) = self.fresh_key(&next_origin)?;
+        // One next key per channel (AGP-090, review C3): the provider can broadcast any rollover of
+        // this channel that we signed, whatever it answered, for as long as the channel is unspent.
+        // So every attempt pays the key of the first. A new key per attempt made a signer, which
+        // holds one issued key per origin, replace the key an earlier attempt's transaction pays:
+        // that next channel then had no key and no refund.
+        let chan = ch.payer.params.channel_id();
+        let earlier = self.next_rolled.get(origin).into_iter().flatten().filter(|n| n.rolled_from.as_deref() == Some(chan.as_str())).collect::<Vec<_>>();
+        let (next_pub, secret, next_payer_spk) = match earlier.first() {
+            Some(n) => (n.payer.params.payer_pub.to_vec(), n.payer.secret().copied(), Some(n.payer.params.payer_spk.clone())),
+            None => self.fresh_key(&next_origin)?,
+        };
+        if earlier.len() >= MAX_KEPT {
+            return fail("rollover_unresolved", format!("{MAX_KEPT} rollovers of this channel are signed and none is known to have confirmed: close it instead"));
+        }
         let ch = self.channels.get(origin).ok_or_else(|| ChannelError::code("no_channel"))?;
         let p = &ch.payer.params;
         let next = ChannelParams::derive(&pay_to, &next_pub, expiry, p.close_fee, next_payer_spk, &self.cfg.network, p.close_fee_payer)?;
@@ -955,7 +1242,6 @@ impl Client {
         if next_cap < ex_u64(&ex, "minCapacity")? {
             return fail("exhausted", "not enough leftover to roll into a new channel");
         }
-        let chan = p.channel_id();
         // the txid of the tx we sign (segwit: the witness is not in it), so the next channel we bind
         // is the one that tx funds, never an outpoint the provider names (review C3)
         let txid = p.rollover_tx(owed, &next.spk(), next_cap)?.txid();
@@ -983,8 +1269,13 @@ impl Client {
             cb(&refund_hex, expiry);
         }
         let next_ch = ClientChannel { payer, origin: origin.into(), accepted, refund_hex, auth_key, price, slack_msat: 0, seq: 0,
-                                      spent_msat: 0, last_sig: String::new(), pending_cond: None, acked_cum: 0, receipts: vec![] };
-        self.next_rolled.entry(origin.to_string()).or_default().push(next_ch);
+                                      spent_msat: 0, last_sig: String::new(), pending_cond: None, acked_cum: 0, receipts: vec![],
+                                      stage: Stage::Open, unanswered_msat: 0, rolled_from: Some(chan.clone()) };
+        let list = self.next_rolled.entry(origin.to_string()).or_default();
+        // the same attempt again (same amount, same height) is the same transaction: one record
+        if !list.iter().any(|n| n.payer.params.funding_txid() == txid) {
+            list.push(next_ch);
+        }
         self.persist(Some(origin))?;
         let r = self.post(&format!("{origin}{ROLLOVER_PATH}"), &body)?;
         if r.get("txid").and_then(Value::as_str).map(str::to_ascii_lowercase).as_deref() != Some(txid.as_str())
@@ -1078,10 +1369,7 @@ impl Client {
         }
         let cipher = extra.get("cipher").and_then(Value::as_str).and_then(|c| hex::decode(c).ok())
             .ok_or_else(|| ChannelError::new("bad_offer", "conditional offer carries no ciphertext"))?;
-        if !self.channels.contains_key(&origin) {
-            let ch = self.open(&origin, &acc)?;
-            self.channels.insert(origin.clone(), ch);
-        }
+        self.ensure_open(&origin, &acc)?;
         let amount = py_u64(acc.get("amount")).unwrap_or(0);
         {
             let ch = self.channels.get_mut(&origin).ok_or_else(|| ChannelError::code("no_channel"))?;
@@ -1115,13 +1403,15 @@ impl Client {
         self.day_spent += cond_amt;
         ch.pending_cond = Some(PendingCond { hash: h, cipher: cipher.clone(), amount: cond_amt });
         ch.seq += 1;
+        ch.unanswered_msat = ch.unanswered_msat.saturating_add(cond_amt.saturating_mul(1000));
         let mut pl = json!({"chan": ch.payer.params.channel_id(), "seq": ch.seq, "cum": uncond.to_string(), "hashlock": hex::encode(h), "sig": sig});
         Self::auth(ch, &mut pl, method, &format!("{origin}{path}"), body)?;
         let hdrs = vec![("PAYMENT-SIGNATURE".to_string(), b64json(&payment_payload(&acc, &pl)))];
         let r = self.transport.request(method, url, body, &hdrs)?;
         if r.status == 402 {
-            // refused: the provider did not keep the conditional state
+            // refused: the provider did not keep the conditional state, and did not charge it
             ch.pending_cond = None;
+            ch.unanswered_msat = ch.unanswered_msat.saturating_sub(cond_amt.saturating_mul(1000));
             let code = crate::json::parse_slice(&r.body).ok().and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_string))
                 .filter(|c| safe_code(c)).unwrap_or_else(|| "refused".into());
             return fail(&code, "conditional call refused");

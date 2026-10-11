@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["crates/xbt-primitives", "crates/xbt402", "crates/xbt402-interop", "crates/xbt-signer", "crates/xbt-electrum", "crates/xbt-wallet-mcp", "crates/xbt-svc", "crates/xbt-wallet-ui", "crates/xbt-work", "crates/xbt-work-relay"]
+# ureq 2.12.1 with one patch (a chunked body cut short is an error): see vendor/ureq/XBT-PATCH.md
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -52,3 +54,6 @@ lto = true
 codegen-units = 1
 strip = true
 panic = "abort"
+
+[patch.crates-io]
+ureq = { path = "vendor/ureq" }

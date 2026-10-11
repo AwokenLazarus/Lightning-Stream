@@ -41,9 +41,13 @@ mod client {
             let status = resp.status();
             let headers: Vec<(String, String)> = resp.headers_names().into_iter()
                 .filter_map(|n| resp.header(&n).map(|v| (n.to_ascii_uppercase(), v.to_string()))).collect();
-            // A body over the cap, or one cut short of its Content-Length, is an error. `take` used
-            // to stop at the cap and return Ok, so the payer booked a truncated answer as the one it
-            // paid for (review T3).
+            // A body over the cap, or one cut short, is an error. `take` used to stop at the cap and
+            // return Ok, so the payer booked a truncated answer as the one it paid for (review T3).
+            // Cut short means: fewer bytes than its Content-Length, or a chunked body whose
+            // connection ended before the last chunk (AGP-090: the decoder in vendor/ureq returns
+            // an error for it, where upstream returned the bytes it had). A body with neither
+            // framing ends when the connection does and cannot be told from a cut one here: on a
+            // paid call the receipt's bodyHash is what covers it.
             let declared = resp.header("Content-Length").and_then(|s| s.parse::<u64>().ok());
             if declared.is_some_and(|n| n > MAX_RESPONSE) {
                 return Err(ChannelError::new("response_too_large", format!("response is {} bytes; the cap is {MAX_RESPONSE}", declared.unwrap_or(0))));
@@ -53,7 +57,11 @@ mod client {
             if out.len() as u64 > MAX_RESPONSE {
                 return Err(ChannelError::new("response_too_large", format!("response exceeds {MAX_RESPONSE} bytes")));
             }
-            if declared.is_some_and(|n| out.len() as u64 != n) {
+            // an answer to a HEAD, and a 1xx, 204 or 304, has no body by its framing: its
+            // Content-Length is the length a GET would get, so there is nothing to compare (a paid
+            // HEAD used to fail here after the provider had charged for it)
+            let bodiless = method.eq_ignore_ascii_case("HEAD") || matches!(status, 100..=199 | 204 | 304);
+            if !bodiless && declared.is_some_and(|n| out.len() as u64 != n) {
                 return Err(ChannelError::new("response_truncated", format!("response body is {} of {} bytes", out.len(), declared.unwrap_or(0))));
             }
             Ok(HttpResponse::new(status, headers, out))

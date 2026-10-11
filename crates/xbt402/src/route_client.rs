@@ -537,7 +537,10 @@ impl RoutePayer {
         }
         let pubk = self.signer.new_key(&self.hub_url)?;
         let payer_spk = self.signer.payer_spk()?;
-        let blocks = crate::funding::offer_expiry_blocks(&ex, self.cfg.expiry_blocks as u64)?;
+        // held to the owner's bound (its own wish, or eight weeks): the hub's offer does not set how
+        // long ch1 locks the coins (AGP-090)
+        let want = self.cfg.expiry_blocks as u64;
+        let blocks = crate::funding::offer_expiry_blocks(&ex, want, want.max(crate::funding::OWNER_MAX_HUB_EXPIRY_BLOCKS))?;
         let expiry = (self.height)()? + u32::try_from(blocks).map_err(|_| ChannelError::new("bad_offer", "expiry blocks"))?;
         let pay_to = hex::decode(py_str(acc.get("payTo"))).map_err(|_| ChannelError::new("bad_offer", "payTo"))?;
         let p = ChannelParams::derive(&pay_to, &pubk, expiry, py_u64(ex.get("closeFeeSat")).unwrap_or(0), payer_spk, &self.cfg.network, fee_payer)?;

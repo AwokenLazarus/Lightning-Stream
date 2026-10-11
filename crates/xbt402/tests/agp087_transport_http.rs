@@ -87,7 +87,9 @@ impl Wallet for MemWallet {
 
 
 /// A real provider on a real listener, and what its handler was asked for.
-fn start() -> (Arc<MemChain>, Arc<Provider>, String, Arc<Mutex<Vec<String>>>) {
+type Started = (Arc<MemChain>, Arc<Provider>, String, Arc<Mutex<Vec<String>>>);
+
+fn start() -> Started {
     let chain = MemChain::new();
     let seen = Arc::new(Mutex::new(Vec::new()));
     let s2 = seen.clone();
@@ -154,7 +156,7 @@ fn t2_a_payment_reaches_the_handler_only_on_the_target_it_was_signed_for() {
         // absolute-form request target for another path than the one signed
         (format!("{o}/v1/q"), format!("GET {o}/v1/other HTTP/1.1"), vec![addr.clone()]),
         // two Host headers: the signed one second
-        (format!("http://other.example/v1/q"), "GET /v1/q HTTP/1.1".into(), vec![addr.clone(), "other.example".into()]),
+        ("http://other.example/v1/q".to_string(), "GET /v1/q HTTP/1.1".into(), vec![addr.clone(), "other.example".into()]),
         // percent-encoding, a doubled slash, a dot segment, a path parameter, a trailing dot on the host: other requests
         (format!("{o}/v1/q"), "GET /v1/%71 HTTP/1.1".into(), vec![addr.clone()]),
         (format!("{o}/v1/q"), "GET //v1/q HTTP/1.1".into(), vec![addr.clone()]),
