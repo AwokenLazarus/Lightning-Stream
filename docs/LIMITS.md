@@ -436,12 +436,16 @@ chain. Numbers are the shipped defaults unless a sentence says otherwise.
 
 The two Python references state the same rules where they have the code. What differs there, and
 the limits of the Python agent wallet and its forward rail, are in `docs/LIMITS.md` of each
-reference's own repository. The references are not published yet.
+reference's own repository:
+[Lightning-Stream-py-channel](https://github.com/AwokenLazarus/Lightning-Stream-py-channel) and
+[Lightning-Stream-py-wallet](https://github.com/AwokenLazarus/Lightning-Stream-py-wallet).
 
 ## Open items
 
 Not fixed. Each is marked in the code with the text in brackets, on a test that asserts the right
-behaviour; searching the trees for `open: AGP-102` finds exactly these.
+behaviour; searching the trees for `open: AGP-102` and `open: AGP-111` finds exactly these. The
+`AGP-111` ones are checks of `scripts/failure_interop.sh`, which runs the release binaries: the
+script prints them as `FAIL (open item)` with what it observed, and goes on.
 
 - **A streamed result cannot be bought on a postpay channel that is one call behind**
   (`open: AGP-102 list 1 item 13`; Rust wallet, two tests; Python wallet, one). A stream's last
@@ -456,6 +460,23 @@ behaviour; searching the trees for `open: AGP-102` finds exactly these.
   policy, up to the recovered lot's total, and the daily and weekly budgets do not fill; and a
   recovery from a close that is then never mined ends that channel's refund watch. It needs the
   rail turned on, an allowed market and the agent's own calls. Do not turn the forward rail on.
+
+- **On the signer's own pay rail, a call whose answer was lost is not paid at the close**
+  (`open: AGP-111 item 1`; `scripts/failure_interop.sh`, checks A1.2, A3.2 and D2.4). The wallet
+  signs each call's state before the call; when the answer is lost it sends that same state with
+  the next call, the shipped provider serves that call on credit, and from then on the wallet is
+  one call behind. Its cooperative close signs what it has signed so far, so the seller is short
+  one call's price and its close report says `debt`: measured, 900 sat paid for 7 calls of 150 sat
+  served, and the same after a signer killed with a signed request on the wire. Two answers lost
+  in a row leave the seller one call short as well, not two. The payer never pays twice, and the
+  library client (the wallet's `local` payer) pays every served call exactly once in the same
+  runs. This is what "the seller is owed one call per lost answer until the close" above comes
+  to: the close does not settle it. A seller should not extend credit it needs back.
+- **A signer policy that leaves out `per_counterparty_cap_sats` cannot pay the shipped provider**
+  (`open: AGP-111 item 2`; `scripts/failure_interop.sh`, check S1). The built-in cap is 30,000,000
+  sat and the wallet funds a channel of that capacity; the provider's built-in maximum is
+  10,000,000 sat, so the open is refused, before anything is funded. The example policy sets
+  100,000 sat and is not affected. Set the cap in your policy.
 
 ## Not reviewed by anyone
 
@@ -472,6 +493,11 @@ Neither the external review nor any of the project's four audits covered:
   outside a test rig was used, and every "blocks" figure was measured on regtest blocks mined at
   once.
 
-The cross-implementation scripts run the ordinary path. Only three failure paths have been run
-through the real binaries: a lost answer, a provider that stops answering, and the shipped default
-timeouts.
+The cross-implementation scripts run the ordinary path. `scripts/failure_interop.sh` runs these
+failure paths through the release binaries on regtest, and no others have been run that way: an
+answer lost on a direct channel (the signer's rail and the library client); a provider that stops
+answering, direct and behind a hub; one hostile Electrum server among two honest ones (silent,
+hiding the wallet's transactions, sending malformed numbers); a kill and restart of the provider,
+the signer and the hub in the middle of a payment; and a seller that refuses a funded open. Its
+faults are injected on loopback by a proxy and by signals: a slow or lossy network, a full disk,
+a clock that jumps and two faults at once were not tried.
