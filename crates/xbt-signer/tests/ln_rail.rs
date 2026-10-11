@@ -63,13 +63,15 @@ struct LnNode {
     /// AGP-066: blocks a reorg put in place of the fake chain's: height -> hash, hash -> (height, txids)
     reorged: Mutex<HashMap<u64, String>>,
     alt_blocks: Mutex<HashMap<String, (u64, Vec<String>)>>,
+    /// AGP-092: `getrawtransaction` calls so far.
+    lookups: AtomicU64,
 }
 
 impl LnNode {
     fn new(chain: &Arc<FakeChain>, name: &str) -> Arc<Self> {
         Arc::new(LnNode { chain: chain.clone(), name: name.into(), txs: Mutex::new(HashMap::new()), blocks: Mutex::new(HashMap::new()),
                           txindex: std::sync::atomic::AtomicBool::new(true), reorged: Mutex::new(HashMap::new()),
-                          alt_blocks: Mutex::new(HashMap::new()) })
+                          alt_blocks: Mutex::new(HashMap::new()), lookups: AtomicU64::new(0) })
     }
 
     fn height_of(&self, bh: &str) -> u64 {
@@ -97,7 +99,8 @@ impl LnNode {
     /// `prev_height`) with this witness and scriptSig; output 0 a P2WSH of 100,000 sats. The channel point.
     fn fund_with(&self, height: u64, pos: usize, prev_spk: Vec<u8>, witness: Vec<Vec<u8>>, script_sig: Vec<u8>, prev_height: u64) -> String {
         let capacity = 100_000;
-        let mut prev = Tx::new(2, vec![TxIn::new(OutPoint::new([height as u8 ^ 0x5a; 32], pos as u32), 0)],
+        // AGP-092: the coin is a coinbase (the proof asks what pins the funding's txid to XBT); the sequence tells two apart
+        let mut prev = Tx::new(2, vec![TxIn::new(OutPoint::new([0u8; 32], 0xffff_ffff), 0x5a00_0000 + pos as u32)],
                                vec![TxOut::new(capacity + 5_000, prev_spk)], height as u32);
         prev.inputs[0].witness = vec![der(0x21), vec![0x02; 33]];
         self.place(&prev, prev_height, 8);
@@ -123,7 +126,8 @@ impl LnNode {
     /// A funding transaction at (height, pos): one input spending a P2WPKH coin confirmed at
     /// `prev_height`, its witness signed `sighash`; output 0 a P2WSH of `capacity`. The channel point.
     fn fund(&self, height: u64, pos: usize, capacity: i64, sighash: u8, prev_height: u64) -> String {
-        let mut prev = Tx::new(2, vec![TxIn::new(OutPoint::new([height as u8; 32], pos as u32), 0)],
+        // AGP-092: the coin is a coinbase (the proof asks what pins the funding's txid to XBT); the sequence tells two apart
+        let mut prev = Tx::new(2, vec![TxIn::new(OutPoint::new([0u8; 32], 0xffff_ffff), pos as u32)],
                                vec![TxOut::new(capacity + 5_000, [vec![0u8, 0x14], vec![0x42; 20]].concat())], height as u32);
         prev.inputs[0].witness = vec![der(0x21), vec![0x02; 33]];
         self.place(&prev, prev_height, 7);
@@ -162,6 +166,7 @@ impl Node for LnNode {
                 }
             }
             "getrawtransaction" => {
+                self.lookups.fetch_add(1, Ordering::SeqCst);
                 let txid = p[0].as_str().unwrap_or("");
                 let by_block = p.get(2).and_then(Value::as_str).map(|b| self.height_of(b));
                 if let Some((hex, h)) = self.txs.lock().unwrap().get(txid).cloned() {
@@ -2087,4 +2092,240 @@ fn agp082_invoices_asked_of_an_offer_are_rate_limited() {
     let (inv, _) = rig.invoice(100, 1, XBT);
     assert_eq!(xbt_signer::ln::invoice_expires_at(&inv), Some((T0 + 3_601 - 10 + 3_600) as f64));
     assert_eq!(xbt_signer::ln::invoice_expires_at("lni1qqqq"), None);
+}
+
+// =====================================================================================================
+// AGP-092 (fix wave 4): the sides of the AGP-087 Lightning items its own tests do not take.
+// Each test fails on 5521674 unless it says it is evidence.
+// =====================================================================================================
+
+fn p2wpkh(tag: u8) -> Vec<u8> {
+    [vec![0u8, 0x14], vec![tag; 20]].concat()
+}
+
+fn p2pkh(tag: u8) -> Vec<u8> {
+    [vec![0x76, 0xa9, 0x14], vec![tag; 20], vec![0x88, 0xac]].concat()
+}
+
+/// A transaction spending `prev`:0 with a P2WPKH witness signed `sighash`, paying 100,000 to `spk`.
+fn segwit_spend(prev: &Tx, sighash: u8, spk: Vec<u8>) -> Tx {
+    let mut t = Tx::new(2, vec![TxIn::new(OutPoint::new(prev.txid_bytes(), 0), 0xffff_fffd)], vec![TxOut::new(100_000, spk)], 0);
+    t.inputs[0].witness = vec![der(sighash), vec![0x02; 33]];
+    t
+}
+
+fn funding_spk() -> Vec<u8> {
+    [vec![0u8, 0x20], vec![0x51; 32]].concat()
+}
+
+fn verdict(rig: &LnRig, f: &Tx, height: u64, pos: u64) -> xbt_signer::ln_funding::Funding {
+    xbt_signer::ln_funding::check(&*rig.node, &format!("{}:0", f.txid()), scid(height, pos).parse().unwrap(), 100_000, 6_000)
+}
+
+/// L5: every transaction behind the funding, back to the split, is a segwit spend. Nothing a txid
+/// commits to ties any of them to XBT, so the funding's txid may be valid on SHA-256 Bitcoin with
+/// other witnesses: refused (a final verdict, with the reason), not "our node could not say".
+#[test]
+fn agp092_l5_a_funding_with_only_witness_signed_ancestors_is_refused() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let rig = LnRig::new(json!({}));
+    // a pre-split coin, moved after the split with a 0x01 witness (valid on both chains), then twice more with 0x21
+    let old = Tx::new(2, vec![TxIn::new(OutPoint::new([0x31; 32], 0), 0)], vec![TxOut::new(100_000, p2wpkh(0x41))], 1);
+    rig.node.place(&old, 5_000, 2);
+    let moved = segwit_spend(&old, 0x01, p2wpkh(0x42));
+    rig.node.place(&moved, 6_100, 2);
+    let parent = segwit_spend(&moved, 0x21, p2wpkh(0x43));
+    rig.node.place(&parent, 6_350, 2);
+    let f = segwit_spend(&parent, 0x21, funding_spk());
+    rig.node.place(&f, 6_400, 2);
+    match verdict(&rig, &f, 6_400, 2) {
+        xbt_signer::ln_funding::Funding::Refused(why, ev) => {
+            assert!(why.contains("pins the funding to XBT"), "{why}");
+            assert_eq!(ev["inputs"][0]["sighash"][0], "0x21", "its own signatures were all 0x21: {ev}");
+        }
+        other => panic!("{other:?}"),
+    }
+    // and through the wallet: a channel on it carries no payment
+    rig.ln.set(|s| s.channels = vec![with_point(chan(&scid(6_400, 2), "ANCHORS", true), &format!("{}:0", f.txid()))]);
+    let (inv, _) = rig.invoice(100, 90, XBT);
+    let r = rig.pay(&inv, 1000);
+    assert_eq!(r["rule"], "ln_no_safe_channel", "{r}");
+    assert_eq!(rig.ln.sent(), 0);
+}
+
+/// L5: what does pin a funding. A coinbase at or above the split behind it (the rig's default channel),
+/// or a 0x21 signature in a scriptSig anywhere behind it, even on a pre-split coin: that signature is
+/// in the txid, and SHA-256 Bitcoin cannot verify it.
+#[test]
+fn agp092_l5_a_coinbase_or_a_script_sig_signature_pins_the_funding() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let rig = LnRig::new(json!({}));
+    let st = rig.call("ln_status", json!({}));
+    let pin = &st["channels"][0]["funding"]["evidence"]["xbt_only"];
+    assert_eq!((pin["pinned_by"].as_str(), pin["generations"].as_u64()), (Some("a coinbase at or above the split"), Some(1)), "{st}");
+    // a pre-split P2PKH coin spent after the split with a 0x21 signature in its scriptSig
+    let old = Tx::new(2, vec![TxIn::new(OutPoint::new([0x32; 32], 0), 0)], vec![TxOut::new(100_000, p2pkh(0x44))], 2);
+    rig.node.place(&old, 5_000, 3);
+    let sig = der(0x21);
+    let mut moved = Tx::new(2, vec![TxIn::new(OutPoint::new(old.txid_bytes(), 0), 0xffff_fffd)], vec![TxOut::new(100_000, p2wpkh(0x45))], 0);
+    moved.inputs[0].script_sig = [vec![sig.len() as u8], sig, vec![33], vec![0x02; 33]].concat();
+    rig.node.place(&moved, 6_100, 3);
+    let parent = segwit_spend(&moved, 0x21, p2wpkh(0x46));
+    rig.node.place(&parent, 6_350, 3);
+    let f = segwit_spend(&parent, 0x21, funding_spk());
+    rig.node.place(&f, 6_400, 3);
+    match verdict(&rig, &f, 6_400, 3) {
+        xbt_signer::ln_funding::Funding::Proven(ev) => {
+            assert_eq!(ev["xbt_only"]["pinned_by"], "a 0x21 signature in a scriptSig", "{ev}");
+            assert_eq!((ev["xbt_only"]["txid"].as_str(), ev["xbt_only"]["generations"].as_u64()), (Some(moved.txid().as_str()), Some(2)), "{ev}");
+        }
+        other => panic!("{other:?}"),
+    }
+    // the same scriptSig signed 0x01 pins nothing
+    let old2 = Tx::new(2, vec![TxIn::new(OutPoint::new([0x33; 32], 0), 0)], vec![TxOut::new(100_000, p2pkh(0x47))], 3);
+    rig.node.place(&old2, 5_000, 4);
+    let sig = der(0x01);
+    let mut moved2 = Tx::new(2, vec![TxIn::new(OutPoint::new(old2.txid_bytes(), 0), 0xffff_fffd)], vec![TxOut::new(100_000, p2wpkh(0x48))], 0);
+    moved2.inputs[0].script_sig = [vec![sig.len() as u8], sig, vec![33], vec![0x02; 33]].concat();
+    rig.node.place(&moved2, 6_100, 4);
+    let f2 = segwit_spend(&moved2, 0x21, funding_spk());
+    rig.node.place(&f2, 6_400, 4);
+    assert!(matches!(verdict(&rig, &f2, 6_400, 4), xbt_signer::ln_funding::Funding::Refused(..)));
+}
+
+/// L5: the search is bounded, and an ancestor our node cannot return decides nothing.
+#[test]
+fn agp092_l5_the_ancestry_search_is_bounded_and_a_missing_ancestor_is_unknown() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let rig = LnRig::new(json!({}));
+    // 300 segwit spends in a row above the split, a coinbase behind the last: out of reach
+    let cb = Tx::new(2, vec![TxIn::new(OutPoint::new([0u8; 32], 0xffff_ffff), 77)], vec![TxOut::new(100_000, p2wpkh(0x49))], 0);
+    rig.node.place(&cb, 6_050, 5);
+    let mut tip = cb;
+    for n in 0..300u64 {
+        tip = segwit_spend(&tip, 0x21, p2wpkh(0x4a));
+        rig.node.place(&tip, 6_051 + n, 5);
+    }
+    let f = segwit_spend(&tip, 0x21, funding_spk());
+    rig.node.place(&f, 6_400, 5);
+    let lookups = || rig.node.lookups.load(Ordering::SeqCst) as usize;
+    let before = lookups();
+    assert!(matches!(verdict(&rig, &f, 6_400, 5), xbt_signer::ln_funding::Funding::Refused(..)));
+    let n = lookups() - before;
+    assert!(n <= 2 * xbt_signer::ln_funding::ANCESTRY_LOOKUPS + 8, "{n} transaction lookups for one funding");
+    // an ancestor the node does not have (no txindex): nothing is concluded, so nothing is cached
+    let orphan = Tx::new(2, vec![TxIn::new(OutPoint::new([0x34; 32], 0), 0)], vec![TxOut::new(100_000, p2wpkh(0x4b))], 4);
+    rig.node.place(&orphan, 6_100, 6);
+    let parent = segwit_spend(&orphan, 0x21, p2wpkh(0x4c));
+    rig.node.place(&parent, 6_350, 6);
+    let f = segwit_spend(&parent, 0x21, funding_spk());
+    rig.node.place(&f, 6_400, 6);
+    assert!(matches!(verdict(&rig, &f, 6_400, 6), xbt_signer::ln_funding::Funding::Unknown(_)));
+}
+
+fn watch_height(rig: &LnRig, hash: &str) -> i64 {
+    rig.s.ln_book.get(hash).unwrap()["watch_until_height"].as_i64().unwrap()
+}
+
+/// L4: the watch of a booking released as never sent lasts as long as its HTLC can, on every path
+/// that releases one. BOLT 11: the limit the wallet sends with the payment. An offer: the node's own
+/// limit (`ln.node_max_cltv_blocks`), by the send path and by the reconcile after a crash.
+#[test]
+fn agp092_l4_every_release_is_watched_for_as_long_as_its_htlc_can_last() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let offer = xbt_offer("regtest", Some(300), &[512], "coffee");
+    let rig = offer_rig(&[&offer], json!({"ln": {"timeout_s": 5}}));
+    let tip = 6_720;
+    // BOLT 11, never sent: 1,008 + 144, and that is the limit the router was given
+    rig.ln.set(|s| s.mode = Mode::NotSent);
+    let (inv, hash11) = rig.invoice(100, 91, XBT);
+    assert_eq!(rig.pay(&inv, 1000)["rule"], "ln_payment_failed");
+    assert_eq!(watch_height(&rig, &hash11), tip + 1_008 + 144);
+    // an offer, never sent: the node's limit
+    assert_eq!(rig.pay(&offer, 400)["rule"], "ln_payment_failed");
+    let hash12 = rig.s.ln_book.all().keys().find(|h| **h != hash11).unwrap().clone();
+    assert_eq!(watch_height(&rig, &hash12), tip + 2_016 + 144, "PayOffer takes no limit of ours");
+    // an offer booked and never sent (a crash): the reconcile releases it with the same window
+    let rec = rig.s.ln_book.get(&hash12).unwrap();
+    let crashed = "c".repeat(64);
+    let mut again = rec.clone();
+    for k in ["unseen", "watch_until", "watch_until_height", "failure", "failed_ts"] {
+        again.as_object_mut().unwrap().remove(k);
+    }
+    again["state"] = "sending".into();
+    rig.s.ln_book.put(&crashed, again).unwrap();
+    rig.clock.fetch_add(70, Ordering::SeqCst);
+    rig.call("ln_status", json!({}));
+    assert_eq!(rig.s.ln_book.get(&crashed).unwrap()["unseen"], true);
+    assert_eq!(watch_height(&rig, &crashed), tip + 2_016 + 144);
+}
+
+/// L4: the owner who raised the node's `max-cltv-expiry` raises `ln.node_max_cltv_blocks`, and the watch
+/// follows; it is never below the wallet's own `max_cltv_blocks`.
+#[test]
+fn agp092_l4_the_offer_watch_follows_the_policy() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let offer = xbt_offer("regtest", Some(300), &[512], "coffee");
+    for (node_max, want) in [(4_032, 4_032), (500, 1_008)] {
+        let rig = offer_rig(&[&offer], json!({"ln": {"node_max_cltv_blocks": node_max}}));
+        rig.ln.set(|s| s.mode = Mode::NotSent);
+        assert_eq!(rig.pay(&offer, 400)["rule"], "ln_payment_failed");
+        let hash = rig.s.ln_book.all().keys().next().unwrap().clone();
+        assert_eq!(watch_height(&rig, &hash), 6_720 + want + 144);
+    }
+}
+
+/// The rate limit counts sends, on the offer path too: a retry pays the stored invoice, under the
+/// same payment hash, and used to replace the one record that was counted.
+#[test]
+fn agp092_retries_of_an_offers_invoice_are_rate_limited() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let offer = xbt_offer("regtest", Some(300), &[512], "coffee");
+    let rig = offer_rig(&[&offer], json!({"ln": {"max_sends_per_hour": 2}}));
+    rig.ln.set(|s| s.mode = Mode::Fail);
+    let rules: Vec<String> = (0..5).map(|_| rig.pay(&offer, 400)["rule"].as_str().unwrap_or("").to_string()).collect();
+    assert_eq!(rig.offers_paid().len(), 2, "{rules:?}");
+    assert_eq!(rules[2..], ["ln_rate_limit", "ln_rate_limit", "ln_rate_limit"]);
+    assert_eq!(rig.call("ln_status", json!({}))["rate_limit"]["sent_last_hour"], 2);
+    // an hour on, the count is of the last hour only
+    rig.clock.fetch_add(3_601, Ordering::SeqCst);
+    assert_eq!(rig.call("ln_status", json!({}))["rate_limit"]["sent_last_hour"], 0);
+}
+
+/// Evidence (passes before and after): a record written before AGP-092 has no `sends`; its `ts` counts.
+#[test]
+fn agp092_evidence_a_record_without_sends_counts_once() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let rig = LnRig::new(json!({"ln": {"max_sends_per_hour": 1}}));
+    let (inv, hash) = rig.invoice(300, 92, XBT);
+    let d = xbt_signer::bolt11::decode(&inv).unwrap();
+    let mut rec = xbt_signer::ln::sending_record(&d, &inv, &dest(), 303, 3, T0 as f64, None);
+    rec["state"] = "failed".into();
+    rig.s.ln_book.put(&hash, rec).unwrap();
+    assert_eq!(rig.s.ln_book.sends_since(T0 as f64 - 3600.0), 1);
+    let (other, _) = rig.invoice(100, 93, XBT);
+    assert_eq!(rig.pay(&other, 1000)["rule"], "ln_rate_limit");
+}
+
+/// `ln_halt.json` (and the payment book, and the offers file) used to be renamed into place with no
+/// fsync of the directory, and outside the counted durable steps: a power loss could drop a halt.
+/// Now each write is the four steps: the file's bytes, its fsync, the rename, the directory's fsync.
+#[test]
+fn agp092_ln_state_files_are_written_through_the_durable_steps() {
+    use xbt_signer::fsx::probe;
+    let dir = tempfile::tempdir().unwrap();
+    let book = xbt_signer::ln::LnBook::open(&dir.path().join("ln_payments.json")).unwrap();
+    probe::reset();
+    book.halt(&json!({"halt_id": "h1", "reason": "test"})).unwrap();
+    assert_eq!(probe::counts(), probe::Counts { steps: 4, writes: 1, syncs: 2, renames: 1 }, "the halt");
+    probe::reset();
+    book.put("ab", json!({"state": "sending"})).unwrap();
+    assert_eq!(probe::counts(), probe::Counts { steps: 4, writes: 1, syncs: 2, renames: 1 }, "the payment book");
+    // a crash at the last step (the directory's fsync) is a crash before the halt is durable: the
+    // caller is told nothing succeeded, and this process stays halted
+    probe::crash_at(3, false);
+    let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| book.halt(&json!({"halt_id": "h2", "reason": "second"}))));
+    probe::reset();
+    assert!(died.is_err_and(|e| e.is::<probe::Crash>()));
+    assert_eq!(book.halted().unwrap()["halt_id"], "h2");
 }

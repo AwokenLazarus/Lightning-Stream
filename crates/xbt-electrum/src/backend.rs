@@ -10,10 +10,23 @@
 //! [`Config::sync_deadline`] or at the first answer with fewer headers than asked, a history holds
 //! at most [`MAX_HISTORY`] entries, transactions are fetched [`TX_BATCH`] at a time, and the
 //! transaction cache holds at most [`TX_CACHE_BYTES`].
+//!
+//! Two rules every lookup keeps (AGP-092):
+//!
+//! * **Unknown is not absent.** A lookup says "not there" (no such transaction, no such output, not
+//!   in a block, no such coin) only when every server it asked answered. If one did not answer, the
+//!   call fails with [`Kind::Unreachable`]. "Spent" is said only for a confirmed spend with a proof.
+//!   The one place that does not wait for every server is the search for a spend: missing one there
+//!   answers "unspent", which a caller can only act on by broadcasting, and the network refuses it.
+//! * **A call has a deadline** ([`Config::call_deadline`]): every request made for it ends there, it
+//!   forces at most one header sync, and a server is asked only for the transactions it listed
+//!   itself, in parallel with the others. The first one it cannot supply, or that cannot belong to
+//!   the script, ends its part and flags it.
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -141,6 +154,9 @@ pub struct Config {
     /// One server's part of a sync round ends here: the headers it proved by then are kept and it is
     /// flagged. None: four times `timeout`.
     pub sync_deadline: Option<Duration>,
+    /// Every request one call makes ends here (the header sync before it has its own deadline).
+    /// None: four times `timeout`.
+    pub call_deadline: Option<Duration>,
 }
 
 impl std::fmt::Debug for Config {
@@ -150,7 +166,7 @@ impl std::fmt::Debug for Config {
             .field("min_servers", &self.min_servers).field("sync_interval", &self.sync_interval)
             .field("extra_ca", &self.extra_ca).field("plausibility", &self.plausibility)
             .field("tip_cap_spacing_s", &self.tip_cap_spacing_s).field("clock", &self.clock.as_ref().map(|_| "custom"))
-            .field("sync_deadline", &self.sync_deadline).finish()
+            .field("sync_deadline", &self.sync_deadline).field("call_deadline", &self.call_deadline).finish()
     }
 }
 
@@ -169,6 +185,7 @@ impl Config {
             tip_cap_spacing_s: None,
             clock: None,
             sync_deadline: None,
+            call_deadline: None,
         }
     }
 
@@ -373,6 +390,58 @@ impl Inner {
 /// (the server that claimed it, the height it claimed; 0 or less = its mempool)
 type Claims = Vec<(Arc<Connection>, i64)>;
 
+/// One call's budget: its requests end at `until`, and it forces one header sync at most.
+struct Call {
+    until: Instant,
+    synced: AtomicBool,
+}
+
+impl Call {
+    fn over(&self) -> bool {
+        Instant::now() >= self.until
+    }
+}
+
+/// The union of the servers' histories of one script.
+struct Hist {
+    claims: HashMap<String, Claims>,
+    /// Every server asked gave a usable answer. Without it "not listed" is not known.
+    complete: bool,
+}
+
+/// What the claims about one transaction came to.
+struct Proof {
+    status: Option<TxStatus>,
+    /// Every claim was checked. Without it "not confirmed" is not known: a server did not answer for
+    /// the height it claimed, or claims a block we do not hold.
+    checked: bool,
+}
+
+/// A transaction and where it is.
+struct Located {
+    tx: Option<Tx>,
+    status: Option<TxStatus>,
+    /// Nothing was left unanswered on the way: a status short of confirmed is the servers' answer.
+    complete: bool,
+}
+
+/// How one server's part of [`ElectrumBackend::supply`] ended.
+#[derive(PartialEq)]
+enum Supplied {
+    All,
+    /// It listed a transaction it does not supply, or one that cannot belong to the script (flagged).
+    Lied,
+    /// It stopped answering, or the call's deadline came first (flagged).
+    Silent,
+}
+
+/// A server's words for "I have no such transaction" (bitcoind's, electrs', ElectrumX's, Fulcrum's).
+/// Any other error is no answer: busy, rate-limited, or a wording not known here, which fails closed.
+fn says_no_such_tx(e: &ElectrumError) -> bool {
+    let m = e.msg.to_ascii_lowercase();
+    e.kind == Kind::Server && ["no such", "not found", "missing"].iter().any(|w| m.contains(w))
+}
+
 enum SyncFail {
     OffCheckpoint(String),
     Other(String),
@@ -405,6 +474,7 @@ pub struct ElectrumBackend {
     tip_cap_spacing_s: Option<u64>,
     clock: Clock,
     sync_deadline: Duration,
+    call_deadline: Duration,
     /// Held by the one sync in flight; callers with a verified chain do not wait for it.
     sync_gate: Mutex<()>,
     inner: Mutex<Inner>,
@@ -467,6 +537,7 @@ impl ElectrumBackend {
             tip_cap_spacing_s: cfg.tip_cap_spacing_s.or((chain == Chain::Main).then_some(TIP_CAP_SPACING_S)),
             clock,
             sync_deadline: cfg.sync_deadline.unwrap_or(cfg.timeout.saturating_mul(4)),
+            call_deadline: cfg.call_deadline.unwrap_or(cfg.timeout.saturating_mul(4)),
             sync_gate: Mutex::new(()),
             inner: Mutex::new(Inner {
                 headers,
@@ -502,15 +573,20 @@ impl ElectrumBackend {
         })
     }
 
-    /// The connected servers (connecting the others first); an error below `min_servers`.
-    fn live(&self) -> Result<Vec<Arc<Connection>>> {
+    fn budget(&self) -> Call {
+        Call { until: Instant::now() + self.call_deadline, synced: AtomicBool::new(false) }
+    }
+
+    /// The connected servers (connecting the others first, no later than `until`); an error below
+    /// `min_servers`.
+    fn live(&self, until: Option<Instant>) -> Result<Vec<Arc<Connection>>> {
         let down: Vec<Arc<Connection>> = self.conns.iter().filter(|c| !c.connected()).cloned().collect();
         if !down.is_empty() {
             let watched: Vec<(String, Value)> = self.st().watched.iter()
                 .map(|sh| ("blockchain.scripthash.subscribe".to_string(), json!([sh]))).collect();
             let results = Self::each(&down, |c| -> Result<()> {
-                c.connect()?;
-                for r in c.subscribe_many(&watched)? {
+                c.connect_until(until)?;
+                for r in c.subscribe_many(&watched, until)? {
                     r?;
                 }
                 Ok(())
@@ -572,7 +648,7 @@ impl ElectrumBackend {
 
     fn sync_now(&self) -> Result<()> {
         self.signal.tip_dirty.store(false, Ordering::SeqCst);
-        let live = self.live()?;
+        let live = self.live(Some(Instant::now() + self.sync_deadline))?;
         let results = Self::each(&live, |c| self.sync_from(c));
         let mut i = self.st();
         let mut off_chain = Vec::new();
@@ -791,58 +867,163 @@ impl ElectrumBackend {
         (tx.to_hex() == s.to_ascii_lowercase() && tx.txid() == txid).then_some(tx)
     }
 
-    fn fetch_tx(&self, txid: &str) -> Result<Option<Tx>> {
+    fn cached_tx(&self, txid: &str) -> Option<Tx> {
+        self.st().txs.get(txid).cloned()
+    }
+
+    /// The transaction, from the cache or the first server that supplies it (all are asked at once).
+    /// None only when every server asked said it has no such transaction; if one did not answer,
+    /// whether it exists is not known and the call fails.
+    fn fetch_tx(&self, call: &Call, txid: &str) -> Result<Option<Tx>> {
         let txid = txid.to_ascii_lowercase();
-        if let Some(t) = self.st().txs.get(&txid) {
-            return Ok(Some(t.clone()));
+        if let Some(t) = self.cached_tx(&txid) {
+            return Ok(Some(t));
         }
-        for c in self.live()? {
-            // "not found" is an answer, not a fault
-            let Ok(raw) = c.request("blockchain.transaction.get", json!([txid])) else { continue };
-            match Self::verify_raw(&txid, &raw) {
-                Some(tx) => {
-                    self.st().cache_tx(txid, tx.clone());
-                    return Ok(Some(tx));
-                }
-                None => self.flag(&c.url, format!("transaction.get {}: not the transaction asked for", &txid[..16.min(txid.len())])),
+        let live = self.live(Some(call.until))?;
+        // one slot per server: no sender ever waits, whether or not we still listen
+        let (send, answers) = sync_channel::<(Arc<Connection>, Result<Value>)>(live.len());
+        let mut silent: Vec<String> = Vec::new();
+        for c in &live {
+            let (conn, send, id, until) = (c.clone(), send.clone(), txid.clone(), call.until);
+            let asked = std::thread::Builder::new().name("electrum:get".into()).spawn(move || {
+                let a = conn.batch_until(&[("blockchain.transaction.get".to_string(), json!([id]))], Some(until))
+                    .and_then(|mut r| r.pop().expect("one answer per request"));
+                let _ = send.send((conn, a));
+            });
+            if asked.is_err() {
+                silent.push(c.url.clone());
             }
+        }
+        drop(send);
+        for (c, a) in answers {
+            match a {
+                Ok(raw) => match Self::verify_raw(&txid, &raw) {
+                    Some(tx) => {
+                        self.st().cache_tx(txid, tx.clone());
+                        return Ok(Some(tx));
+                    }
+                    // a lie is an answer: it shows that this server does not supply the transaction
+                    None => self.flag(&c.url, format!("transaction.get {}: not the transaction asked for", &txid[..16.min(txid.len())])),
+                },
+                Err(e) if says_no_such_tx(&e) => {}
+                Err(e) => {
+                    self.flag(&c.url, format!("transaction.get: {e}"));
+                    silent.push(c.url.clone());
+                }
+            }
+        }
+        if !silent.is_empty() {
+            return err(Kind::Unreachable, format!("whether transaction {}.. exists is not known: no answer from {}",
+                                                  &txid[..16.min(txid.len())], silent.join(", ")));
         }
         Ok(None)
     }
 
-    /// Several transactions: batches of [`TX_BATCH`] to the first live server, then one by one for
-    /// the rest (the caller's [`Self::fetch_tx`]).
-    fn fetch_txs(&self, txids: &[String]) -> Result<()> {
-        let missing: Vec<String> = {
+    /// Can `tx` not belong to the history of `spk` at all? It pays the script, or spends an output
+    /// that does, and then the paying transaction is in the history too. `None`: a possible funder
+    /// is listed and not held, so it cannot be told yet.
+    fn invented(tx: &Tx, spk: &[u8], hist: &HashMap<String, Claims>, held: &TxCache) -> Option<bool> {
+        if tx.outputs.iter().any(|o| o.script_pubkey == spk) {
+            return Some(false);
+        }
+        let mut open = false;
+        for inp in &tx.inputs {
+            let funder = inp.prevout.txid_hex();
+            if !hist.contains_key(&funder) {
+                continue;
+            }
+            match held.get(&funder) {
+                Some(f) if f.outputs.get(inp.prevout.vout as usize).is_some_and(|o| o.script_pubkey == spk) => return Some(false),
+                Some(_) => {}
+                None => open = true,
+            }
+        }
+        (!open).then_some(true)
+    }
+
+    /// Fetch the transactions of `listed` that are not held, each from the servers that listed it,
+    /// every server in parallel. A server's part ends at the first transaction it does not supply,
+    /// at the first that cannot belong to `spk` (when given), and at the call's deadline; each ends
+    /// with a flag. Returns the servers that went silent: what only they listed is not known.
+    ///
+    /// Why from the server that listed it: a transaction no server can supply used to be asked of
+    /// every server, on every call, one timeout each (AGP-087: 41 hours for one `gettxout`).
+    fn supply(&self, call: &Call, listed: &HashMap<String, Claims>, spk: Option<&[u8]>) -> Vec<String> {
+        let mut work: Vec<(Arc<Connection>, Vec<String>)> = Vec::new();
+        {
             let i = self.st();
-            txids.iter().filter(|t| !i.txs.contains(t)).cloned().collect()
-        };
-        if missing.len() > 1 {
-            if let Some(c) = self.live()?.first().cloned() {
-                for part in missing.chunks(TX_BATCH) {
-                    let reqs: Vec<(String, Value)> = part.iter().map(|t| ("blockchain.transaction.get".to_string(), json!([t]))).collect();
-                    let Ok(answers) = c.batch(&reqs) else { break };
-                    let mut i = self.st();
-                    for (t, a) in part.iter().zip(answers) {
-                        let Ok(raw) = a else { continue };
-                        match Self::verify_raw(t, &raw) {
-                            Some(tx) => i.cache_tx(t.clone(), tx),
-                            None => i.flag(&c.url, format!("transaction.get {}: not the transaction asked for", &t[..16])),
-                        }
+            let mut txids: Vec<&String> = listed.keys().filter(|t| !i.txs.contains(t)).collect();
+            txids.sort();
+            for t in txids {
+                for (c, _) in &listed[t] {
+                    match work.iter_mut().find(|(w, _)| Arc::ptr_eq(w, c)) {
+                        Some((_, list)) => list.push(t.clone()),
+                        None => work.push((c.clone(), vec![t.clone()])),
                     }
                 }
             }
         }
-        Ok(())
+        let conns: Vec<Arc<Connection>> = work.iter().map(|(c, _)| c.clone()).collect();
+        let ends = Self::each(&conns, |c| {
+            let list = work.iter().find(|(w, _)| std::ptr::eq(Arc::as_ptr(w), c)).map(|(_, l)| l.as_slice()).unwrap_or(&[]);
+            self.supply_from(call, c, list, listed, spk)
+        });
+        conns.iter().zip(ends).filter(|(_, e)| *e == Supplied::Silent).map(|(c, _)| c.url.clone()).collect()
+    }
+
+    fn supply_from(&self, call: &Call, c: &Connection, list: &[String], listed: &HashMap<String, Claims>, spk: Option<&[u8]>) -> Supplied {
+        // one transaction first: a server that invents its list is found out for one request
+        let (mut rest, mut size) = (list, 1);
+        while !rest.is_empty() {
+            let (part, tail) = rest.split_at(size.min(rest.len()));
+            (rest, size) = (tail, TX_BATCH);
+            let want: Vec<&String> = {
+                let i = self.st();
+                part.iter().filter(|t| !i.txs.contains(t)).collect()
+            };
+            if want.is_empty() {
+                continue;
+            }
+            if call.over() {
+                self.flag(&c.url, format!("transaction.get: {} of the transactions it listed were not supplied by the call deadline ({:?})",
+                                          want.len() + rest.len(), self.call_deadline));
+                return Supplied::Silent;
+            }
+            let reqs: Vec<(String, Value)> = want.iter().map(|t| ("blockchain.transaction.get".to_string(), json!([t]))).collect();
+            let answers = match c.batch_until(&reqs, Some(call.until)) {
+                Ok(a) => a,
+                Err(e) => {
+                    self.flag(&c.url, format!("transaction.get: {e}"));
+                    return Supplied::Silent;
+                }
+            };
+            let mut i = self.st();
+            for (t, a) in want.into_iter().zip(answers) {
+                let Some(tx) = a.ok().and_then(|raw| Self::verify_raw(t, &raw)) else {
+                    i.flag(&c.url, format!("lists a transaction it does not supply ({}..): the rest of its list is not asked for", &t[..16.min(t.len())]));
+                    return Supplied::Lied;
+                };
+                if spk.is_some_and(|spk| Self::invented(&tx, spk, listed, &i.txs) == Some(true)) {
+                    i.flag(&c.url, format!("get_history lists a transaction that neither pays nor spends the script ({}..): the rest of its list is not asked for",
+                                           &t[..16.min(t.len())]));
+                    return Supplied::Lied;
+                }
+                i.cache_tx(t.clone(), tx);
+            }
+        }
+        Supplied::All
     }
 
     /// txid -> [(server, claimed height)], the union over every live server that answered with at
-    /// most [`MAX_HISTORY`] entries. An error when none did: an empty history means the servers say
-    /// there is none.
-    fn history(&self, spk: &[u8]) -> Result<HashMap<String, Claims>> {
+    /// most [`MAX_HISTORY`] entries, one claim per server and transaction. An error when none did:
+    /// an empty history means the servers say there is none.
+    fn history(&self, call: &Call, spk: &[u8]) -> Result<Hist> {
         let sh = scripthash(spk);
-        let live = self.live()?;
-        let answers = Self::each(&live, |c| c.request("blockchain.scripthash.get_history", json!([sh])));
+        let live = self.live(Some(call.until))?;
+        let answers = Self::each(&live, |c| {
+            c.batch_until(&[("blockchain.scripthash.get_history".to_string(), json!([sh]))], Some(call.until))
+                .and_then(|mut r| r.pop().expect("one answer per request"))
+        });
         let mut out: HashMap<String, Claims> = HashMap::new();
         let mut answered = 0;
         let mut i = self.st();
@@ -859,39 +1040,41 @@ impl ElectrumBackend {
                 continue;
             };
             answered += 1;
+            let mut twice = false;
             for e in hist {
                 match (e.get("tx_hash").and_then(Value::as_str), e.get("height").and_then(Value::as_i64)) {
                     (Some(t), Some(h)) if t.len() == 64 && t.chars().all(|x| x.is_ascii_hexdigit()) => {
-                        out.entry(t.to_ascii_lowercase()).or_default().push((c.clone(), h));
+                        let claims = out.entry(t.to_ascii_lowercase()).or_default();
+                        // a history names a transaction once: a second height for it is not a claim
+                        // (each one used to cost a proof request, and a header sync when above our tip)
+                        if claims.iter().any(|(k, _)| Arc::ptr_eq(k, c)) {
+                            twice = true;
+                        } else {
+                            claims.push((c.clone(), h));
+                        }
                     }
                     _ => i.flag(&c.url, "get_history: malformed entry"),
                 }
+            }
+            if twice {
+                i.flag(&c.url, "get_history lists a transaction more than once: only its first entry is used");
             }
         }
         if answered == 0 {
             return err(Kind::Unreachable, "no server answered get_history");
         }
-        Ok(out)
+        Ok(Hist { claims: out, complete: answered == live.len() })
     }
 
-    /// Flag the servers behind history entries that were invented (AGP-081, review E1): a transaction
-    /// in a script's history pays the script, or spends an output that does, and then the paying
-    /// transaction is in the history too. Judged only from transactions we hold: an entry whose
-    /// possible funder could not be fetched is left alone.
+    /// Flag the servers behind history entries that were invented (AGP-081, review E1), judged from
+    /// the transactions we hold ([`Self::invented`]): an entry whose possible funder is not held is
+    /// left alone.
     fn flag_invented(&self, spk: &[u8], hist: &HashMap<String, Claims>) {
         let mut i = self.st();
         let mut liars: Vec<(String, String)> = Vec::new();
         for (t, claims) in hist {
             let Some(tx) = i.txs.get(t) else { continue };
-            if tx.outputs.iter().any(|o| o.script_pubkey == spk) {
-                continue;
-            }
-            let could_spend = tx.inputs.iter().any(|inp| {
-                let funder = inp.prevout.txid_hex();
-                hist.contains_key(&funder)
-                    && i.txs.get(&funder).is_none_or(|f| f.outputs.get(inp.prevout.vout as usize).is_some_and(|o| o.script_pubkey == spk))
-            });
-            if !could_spend {
+            if Self::invented(tx, spk, hist, &i.txs) == Some(true) {
                 liars.extend(claims.iter().map(|(c, _)| (c.url.clone(), t.clone())));
             }
         }
@@ -913,33 +1096,53 @@ impl ElectrumBackend {
         None
     }
 
-    /// Confirmed once a Merkle proof ties `txid` to our header at a claimed height; Mempool if
-    /// only mempool claims remain; None if no claim holds.
-    fn confirmed(&self, txid: &str, claims: &[(Arc<Connection>, i64)]) -> Result<Option<TxStatus>> {
+    /// Confirmed once a Merkle proof ties `txid` to our header at a claimed height; Mempool if only
+    /// mempool claims remain; no status if no claim holds. `checked` is false when a claim could not
+    /// be judged: its server did not answer for it, or it names a block we do not hold after the
+    /// call's one forced sync.
+    fn confirmed(&self, call: &Call, txid: &str, claims: &[(Arc<Connection>, i64)]) -> Result<Proof> {
         if let Some(st) = self.cached_conf(txid) {
-            return Ok(Some(st));
+            return Ok(Proof { status: Some(st), checked: true });
         }
         let txid_b = hex32(txid).map_err(|e| ElectrumError::new(Kind::BadRequest, e.to_string()))?;
-        let mut tried = BTreeSet::new();
-        let mut mempool = false;
+        let (mut mempool, mut checked) = (false, true);
         for (c, height) in claims {
             if *height <= 0 {
                 mempool = true;
                 continue;
             }
-            let Ok(height) = u32::try_from(*height) else { continue };
-            if !tried.insert((c.url.clone(), height)) {
+            let Ok(height) = u32::try_from(*height) else {
+                self.flag(&c.url, format!("get_history: a height of {height} for {}..", &txid[..16]));
                 continue;
-            }
+            };
             let mut hdr = self.st().headers.at(height).cloned();
-            if hdr.is_none() {
+            if hdr.is_none() && !call.synced.swap(true, Ordering::SeqCst) {
                 self.sync(true)?;
                 hdr = self.st().headers.at(height).cloned();
             }
-            let Some(hdr) = hdr else { continue }; // a height beyond our best chain: not proven
-            let m = match self.ask(c, "blockchain.transaction.get_merkle", json!([txid, height])) {
+            let Some(hdr) = hdr else {
+                // above its own tip it is a lie; at or below, a block we could not fetch: not known
+                let own_tip = self.st().servers.get(&c.url).and_then(|s| s.tip);
+                if own_tip.is_some_and(|t| height > t) {
+                    self.flag(&c.url, format!("get_history: {}.. at height {height}, above the tip it reports", &txid[..16]));
+                } else {
+                    checked = false;
+                }
+                continue;
+            };
+            if call.over() {
+                checked = false;
+                continue;
+            }
+            let asked = c.batch_until(&[("blockchain.transaction.get_merkle".to_string(), json!([txid, height]))], Some(call.until))
+                .and_then(|mut r| r.pop().expect("one answer per request"));
+            let m = match asked {
                 Ok(m) => m,
-                Err(_) => continue,
+                Err(e) => {
+                    self.flag(&c.url, format!("blockchain.transaction.get_merkle: {e}"));
+                    checked = false; // busy, gone or silent: its claim stands unjudged
+                    continue;
+                }
             };
             let branch: Option<Vec<[u8; 32]>> = m.get("merkle").and_then(Value::as_array).and_then(|a| {
                 a.iter().map(|x| x.as_str().and_then(|s| hex32(s).ok())).collect()
@@ -963,12 +1166,13 @@ impl ElectrumBackend {
             }
             let mut i = self.st();
             if !i.conf_holds(&(height, hdr.hash)) {
-                continue; // reorged out while we asked
+                checked = false; // reorged out while we asked
+                continue;
             }
             i.conf.insert(txid.to_string(), (height, hdr.hash));
-            return Ok(Some(TxStatus::Confirmed { height, block_hash: hdr.hash }));
+            return Ok(Proof { status: Some(TxStatus::Confirmed { height, block_hash: hdr.hash }), checked: true });
         }
-        Ok(mempool.then_some(TxStatus::Mempool))
+        Ok(Proof { status: mempool.then_some(TxStatus::Mempool), checked })
     }
 
     /// Scripts whose history lists this tx: its outputs (OP_RETURN has no history).
@@ -977,38 +1181,52 @@ impl ElectrumBackend {
             .take(2).map(|o| o.script_pubkey.clone()).collect()
     }
 
-    fn locate(&self, txid: &str) -> Result<(Option<Tx>, Option<TxStatus>)> {
+    fn locate(&self, call: &Call, txid: &str) -> Result<Located> {
         let txid = txid.to_ascii_lowercase();
-        let Some(tx) = self.fetch_tx(&txid)? else { return Ok((None, None)) };
+        let Some(tx) = self.fetch_tx(call, &txid)? else { return Ok(Located { tx: None, status: None, complete: true }) };
         if let Some(st) = self.cached_conf(&txid) {
-            return Ok((Some(tx), Some(st)));
+            return Ok(Located { tx: Some(tx), status: Some(st), complete: true });
         }
+        let mut complete = true;
         for spk in Self::index_spks(&tx) {
-            let hist = self.history(&spk)?;
-            if let Some(claims) = hist.get(&txid) {
-                let st = self.confirmed(&txid, claims)?;
-                return Ok((Some(tx), st));
+            let hist = self.history(call, &spk)?;
+            complete &= hist.complete;
+            if let Some(claims) = hist.claims.get(&txid) {
+                let p = self.confirmed(call, &txid, claims)?;
+                let proven = matches!(p.status, Some(TxStatus::Confirmed { .. }));
+                return Ok(Located { tx: Some(tx), status: p.status, complete: proven || (complete && p.checked) });
             }
         }
-        Ok((Some(tx), None))
+        Ok(Located { tx: Some(tx), status: None, complete })
+    }
+
+    /// The one error for "a server did not answer, so this is not known".
+    fn unknown<T>(txid: &str, what: &str) -> Result<T> {
+        err(Kind::Unreachable, format!("{what} {}.. is not known: a server did not answer for it (see the verification failures)",
+                                       &txid[..16.min(txid.len())]))
     }
 
     /// (spending txid, its status) from the union of the script's histories: the spend parsed
     /// from the spending transaction itself. A mempool spend is returned only with `mempool`.
-    fn spender(&self, txid: &str, vout: u32, spk: &[u8], mempool: bool) -> Result<Option<(String, TxStatus)>> {
-        let hist = self.history(spk)?;
-        let others: Vec<String> = hist.keys().filter(|t| t.as_str() != txid).cloned().collect();
-        self.fetch_txs(&others)?;
+    ///
+    /// This search does not wait for every server (see the module docs): a spend that only a silent
+    /// server lists, or whose proof went unanswered, is not reported. Were it an error, one server
+    /// could hold a refund back by listing a spend and never proving it.
+    fn spender(&self, call: &Call, txid: &str, vout: u32, spk: &[u8], mempool: bool) -> Result<Option<(String, TxStatus)>> {
+        let hist = self.history(call, spk)?.claims;
+        self.supply(call, &hist, Some(spk));
         self.flag_invented(spk, &hist);
+        let mut others: Vec<&String> = hist.keys().filter(|t| t.as_str() != txid).collect();
+        others.sort();
         let mut found = None;
         for t in others {
-            let Some(stx) = self.fetch_tx(&t)? else { continue };
+            let Some(stx) = self.cached_tx(t) else { continue }; // not supplied: its server is flagged
             if !stx.inputs.iter().any(|i| i.prevout.txid_hex() == txid && i.prevout.vout == vout) {
                 continue;
             }
-            match self.confirmed(&t, &hist[&t])? {
-                Some(st @ TxStatus::Confirmed { .. }) => return Ok(Some((t, st))),
-                Some(TxStatus::Mempool) if mempool => found = Some((t, TxStatus::Mempool)),
+            match self.confirmed(call, t, &hist[t])?.status {
+                Some(st @ TxStatus::Confirmed { .. }) => return Ok(Some((t.clone(), st))),
+                Some(TxStatus::Mempool) if mempool => found = Some((t.clone(), TxStatus::Mempool)),
                 _ => {}
             }
         }
@@ -1029,26 +1247,38 @@ impl ElectrumBackend {
         })
     }
 
-    /// The transaction and where it is. None if no server shows it (or no claim about it holds).
+    /// The transaction and where it is. None if every server asked says it has no such transaction,
+    /// or none lists it in a block or a mempool. An error if one of them did not answer.
     pub fn transaction(&self, txid: &str) -> Result<Option<(Tx, TxStatus)>> {
         self.sync(false)?;
-        Ok(match self.locate(txid)? {
-            (Some(tx), Some(st)) => Some((tx, st)),
-            _ => None,
-        })
+        let l = self.locate(&self.budget(), txid)?;
+        match (l.tx, l.status) {
+            (Some(tx), Some(st)) => Ok(Some((tx, st))),
+            (Some(_), None) if !l.complete => Self::unknown(txid, "where transaction"),
+            _ => Ok(None),
+        }
     }
 
     /// `gettxout`. An output counts as spent only when a confirmed spend is proven: a spend seen
     /// only in a mempool never hides it (so a lying server cannot talk a payer out of a refund).
+    ///
+    /// None means one of: a confirmed spend is proven; the transaction has no such output; every
+    /// server asked says there is no such transaction, or none lists it; it is unconfirmed and
+    /// `include_mempool` is off. When a server did not answer, the last three are not known and the
+    /// call fails instead (AGP-092: None used to cover "nobody answered", which callers read as spent).
     pub fn tx_out(&self, txid: &str, vout: u32, include_mempool: bool) -> Result<Option<TxOutInfo>> {
         let txid = txid.to_ascii_lowercase();
         self.sync(false)?;
-        let (Some(tx), Some(st)) = self.locate(&txid)? else { return Ok(None) };
+        let call = self.budget();
+        let l = self.locate(&call, &txid)?;
+        let Some(tx) = l.tx else { return Ok(None) };
         let Some(out) = tx.outputs.get(vout as usize).cloned() else { return Ok(None) };
-        if st == TxStatus::Mempool && !include_mempool {
-            return Ok(None);
-        }
-        if self.spender(&txid, vout, &out.script_pubkey, false)?.is_some() {
+        let st = match l.status {
+            Some(st) if st != TxStatus::Mempool || include_mempool => st,
+            _ if !l.complete => return Self::unknown(&txid, "whether a block holds transaction"),
+            _ => return Ok(None),
+        };
+        if self.spender(&call, &txid, vout, &out.script_pubkey, false)?.is_some() {
             return Ok(None);
         }
         let i = self.st();
@@ -1071,17 +1301,18 @@ impl ElectrumBackend {
     pub fn spending_tx(&self, txid: &str, vout: u32) -> Result<Option<(String, TxStatus)>> {
         let txid = txid.to_ascii_lowercase();
         self.sync(false)?;
-        let Some(tx) = self.fetch_tx(&txid)? else { return Ok(None) };
+        let call = self.budget();
+        let Some(tx) = self.fetch_tx(&call, &txid)? else { return Ok(None) };
         let Some(out) = tx.outputs.get(vout as usize) else { return Ok(None) };
         let spk = out.script_pubkey.clone();
-        self.spender(&txid, vout, &spk, true)
+        self.spender(&call, &txid, vout, &spk, true)
     }
 
     /// Broadcast to every live server. Ok once one accepts it (and answers with its txid).
     pub fn broadcast(&self, hex_tx: &str) -> Result<String> {
         let tx = Tx::parse_hex(hex_tx).map_err(|e| ElectrumError::new(Kind::BadRequest, format!("TX decode failed: {e}")))?;
         let txid = tx.txid();
-        let live = self.live()?;
+        let live = self.live(Some(self.budget().until))?;
         let answers = Self::each(&live, |c| c.request("blockchain.transaction.broadcast", json!([hex_tx])));
         let (mut errors, mut accepted) = (Vec::new(), false);
         let mut i = self.st();
@@ -1101,12 +1332,19 @@ impl ElectrumBackend {
     }
 
     /// `scantxoutset raw(spk)`: the script's confirmed, proven, unspent coins, from the union of
-    /// every server's unspent list.
+    /// every server's unspent list. A coin a server lists is left out only on an answer: the server
+    /// does not supply its transaction, the output does not pay the script, the claims about it were
+    /// checked and none is a proof, or a confirmed spend is proven. If the server went silent
+    /// instead, the call fails: a shorter list would read as "no such coin".
     pub fn unspent(&self, spk: &[u8]) -> Result<Vec<Utxo>> {
         self.sync(false)?;
+        let call = self.budget();
         let sh = scripthash(spk);
-        let live = self.live()?;
-        let answers = Self::each(&live, |c| c.request("blockchain.scripthash.listunspent", json!([sh])));
+        let live = self.live(Some(call.until))?;
+        let answers = Self::each(&live, |c| {
+            c.batch_until(&[("blockchain.scripthash.listunspent".to_string(), json!([sh]))], Some(call.until))
+                .and_then(|mut r| r.pop().expect("one answer per request"))
+        });
         let mut claims: HashMap<(String, u32), Claims> = HashMap::new();
         {
             let mut answered = 0;
@@ -1127,7 +1365,10 @@ impl ElectrumBackend {
                 for u in list {
                     match (u.get("tx_hash").and_then(Value::as_str), u.get("tx_pos").and_then(Value::as_u64), u.get("height").and_then(Value::as_i64)) {
                         (Some(t), Some(n), Some(h)) if t.len() == 64 && n <= u32::MAX as u64 => {
-                            claims.entry((t.to_ascii_lowercase(), n as u32)).or_default().push((c.clone(), h));
+                            let cl = claims.entry((t.to_ascii_lowercase(), n as u32)).or_default();
+                            if !cl.iter().any(|(k, _)| Arc::ptr_eq(k, c)) {
+                                cl.push((c.clone(), h));
+                            }
                         }
                         _ => i.flag(&c.url, "listunspent: malformed entry"),
                     }
@@ -1140,19 +1381,44 @@ impl ElectrumBackend {
         }
         let mut keys: Vec<(String, u32)> = claims.keys().cloned().collect();
         keys.sort();
-        let txids: Vec<String> = keys.iter().map(|k| k.0.clone()).collect();
-        self.fetch_txs(&txids)?;
+        // who listed each transaction (whatever the output), for `supply`
+        let mut listed: HashMap<String, Claims> = HashMap::new();
+        for ((t, _), cl) in &claims {
+            let all = listed.entry(t.clone()).or_default();
+            for (c, h) in cl {
+                if !all.iter().any(|(k, _)| Arc::ptr_eq(k, c)) {
+                    all.push((c.clone(), *h));
+                }
+            }
+        }
+        let silent = self.supply(&call, &listed, None);
         let mut out = Vec::new();
         for (txid, n) in keys {
-            let Some(tx) = self.fetch_tx(&txid)? else { continue };
+            let cl = &claims[&(txid.clone(), n)];
+            let Some(tx) = self.cached_tx(&txid) else {
+                if listed[&txid].iter().any(|(c, _)| silent.contains(&c.url)) {
+                    return Self::unknown(&txid, "whether the script holds a coin of transaction");
+                }
+                continue; // every server that listed it was asked and did not supply it (flagged)
+            };
             match tx.outputs.get(n as usize) {
                 Some(o) if o.script_pubkey == spk => {}
-                _ => continue,
+                _ => {
+                    let mut i = self.st();
+                    for (c, _) in cl {
+                        i.flag(&c.url, "listunspent lists an output that does not pay the script");
+                    }
+                    continue;
+                }
             }
-            let Some(TxStatus::Confirmed { height, block_hash }) = self.confirmed(&txid, &claims[&(txid.clone(), n)])? else {
+            let p = self.confirmed(&call, &txid, cl)?;
+            let Some(TxStatus::Confirmed { height, block_hash }) = p.status else {
+                if !p.checked {
+                    return Self::unknown(&txid, "whether a block holds transaction");
+                }
                 continue; // the UTXO set holds confirmed coins only
             };
-            if self.spender(&txid, n, spk, false)?.is_some() {
+            if self.spender(&call, &txid, n, spk, false)?.is_some() {
                 continue;
             }
             out.push(Utxo { txid, vout: n, value: tx.outputs[n as usize].value.max(0) as u64, script_pubkey: spk.to_vec(), height,
@@ -1163,7 +1429,7 @@ impl ElectrumBackend {
 
     /// Unverifiable: the median of the servers' answers.
     pub fn estimate_fee(&self, blocks: u32) -> Result<FeeEstimate> {
-        let live = self.live()?;
+        let live = self.live(Some(self.budget().until))?;
         let answers = Self::each(&live, |c| c.request("blockchain.estimatefee", json!([blocks])));
         let mut fees = Vec::new();
         let mut any = false;
@@ -1203,8 +1469,9 @@ impl ElectrumBackend {
         };
         if !new.is_empty() {
             let reqs: Vec<(String, Value)> = new.iter().map(|sh| ("blockchain.scripthash.subscribe".to_string(), json!([sh]))).collect();
-            let live = self.live()?;
-            let answers = Self::each(&live, |c| c.subscribe_many(&reqs));
+            let until = Some(self.budget().until);
+            let live = self.live(until)?;
+            let answers = Self::each(&live, |c| c.subscribe_many(&reqs, until));
             let mut i = self.st();
             for (c, a) in live.iter().zip(answers) {
                 match a {

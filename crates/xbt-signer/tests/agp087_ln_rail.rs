@@ -100,7 +100,8 @@ impl LnNode {
     /// `prev_height`) with this witness and scriptSig; output 0 a P2WSH of 100,000 sats. The channel point.
     fn fund_with(&self, height: u64, pos: usize, prev_spk: Vec<u8>, witness: Vec<Vec<u8>>, script_sig: Vec<u8>, prev_height: u64) -> String {
         let capacity = 100_000;
-        let mut prev = Tx::new(2, vec![TxIn::new(OutPoint::new([height as u8 ^ 0x5a; 32], pos as u32), 0)],
+        // AGP-092: the coin is a coinbase (the proof asks what pins the funding's txid to XBT); the sequence tells two apart
+        let mut prev = Tx::new(2, vec![TxIn::new(OutPoint::new([0u8; 32], 0xffff_ffff), 0x5a00_0000 + pos as u32)],
                                vec![TxOut::new(capacity + 5_000, prev_spk)], height as u32);
         prev.inputs[0].witness = vec![der(0x21), vec![0x02; 33]];
         self.place(&prev, prev_height, 8);
@@ -126,7 +127,8 @@ impl LnNode {
     /// A funding transaction at (height, pos): one input spending a P2WPKH coin confirmed at
     /// `prev_height`, its witness signed `sighash`; output 0 a P2WSH of `capacity`. The channel point.
     fn fund(&self, height: u64, pos: usize, capacity: i64, sighash: u8, prev_height: u64) -> String {
-        let mut prev = Tx::new(2, vec![TxIn::new(OutPoint::new([height as u8; 32], pos as u32), 0)],
+        // AGP-092: the coin is a coinbase (the proof asks what pins the funding's txid to XBT); the sequence tells two apart
+        let mut prev = Tx::new(2, vec![TxIn::new(OutPoint::new([0u8; 32], 0xffff_ffff), pos as u32)],
                                vec![TxOut::new(capacity + 5_000, [vec![0u8, 0x14], vec![0x42; 20]].concat())], height as u32);
         prev.inputs[0].witness = vec![der(0x21), vec![0x02; 33]];
         self.place(&prev, prev_height, 7);

@@ -335,6 +335,8 @@ pub struct Knobs {
     pub headers_per_answer: Option<u32>,
     /// Before answering this method, send this raw line (no newline needed) as it is.
     pub line_before: Option<(String, Arc<Vec<u8>>)>,
+    /// method -> the JSON-RPC error it is answered with (a busy or rate-limiting server).
+    pub fail: HashMap<String, String>,
 }
 
 enum SLink {
@@ -587,6 +589,9 @@ impl FakeElectrum {
     fn dispatch(&self, method: &str, p: &[Value], subs: &mut BTreeMap<String, Option<String>>, tip_sub: &mut Option<u32>) -> Result<Value, String> {
         let s = |i: usize| p.get(i).and_then(Value::as_str).unwrap_or("").to_string();
         let u = |i: usize| p.get(i).and_then(Value::as_u64).unwrap_or(0) as u32;
+        if let Some(e) = self.knobs().fail.get(method) {
+            return Err(e.clone());
+        }
         match method {
             "server.version" => Ok(json!(["FakeElectrum 0.1", "1.8"])),
             "server.ping" => Ok(Value::Null),

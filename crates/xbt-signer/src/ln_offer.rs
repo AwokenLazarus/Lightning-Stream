@@ -308,7 +308,7 @@ impl Signer {
         // write-ahead: the worst case is booked before the node is asked to pay
         let rec = json!({"state": "sending", "dest": dest, "invoice": lni, "amount_msat": amount_msat, "fee_limit_sats": fee_limit, "booked_sats": total,
                          "ts": ts_value(now), "approval_token": grant, "offer_id": id, "offer": offer, "payer_id": payer, "node_id": signer});
-        if let Err(e) = self.ln_book.put(&hash, rec) {
+        if let Err(e) = self.ln_book.put_sending(&hash, rec, now) {
             return deny("ln", e.msg);
         }
         if let Err(e) = self.engine.commit(&pay, &format!("ln:{hash}")) {
