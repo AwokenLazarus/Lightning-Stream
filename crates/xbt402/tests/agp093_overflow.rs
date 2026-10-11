@@ -157,6 +157,8 @@ fn hostile() -> Vec<Value> {
 
 /// A PAYMENT-SIGNATURE that authenticates (the channel HMAC is the payer's own), with the given
 /// `seq`, `cum` and `sig`, and any more payload fields.
+// (AGP-094: a lint the audit's file carried; allowed here so that `clippy -D warnings` passes)
+#[allow(clippy::too_many_arguments)]
 fn header(ch: &ClientChannel, seq: &Value, cum: &Value, sig: Option<&str>, more: &Value, method: &str, url: &str, body: &[u8]) -> String {
     let chan = ch.payer.params.channel_id();
     let mut pl = json!({"chan": chan, "seq": seq, "cum": cum});

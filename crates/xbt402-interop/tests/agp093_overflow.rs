@@ -350,6 +350,8 @@ fn tick(w: &W) -> std::result::Result<(), String> {
 /// panic, whatever the client puts in the amount, the fee, the state, the seq, the fee quote or
 /// the invoice. Then the hub's and the provider's watcher ticks run, the same hub routes another
 /// client's lock, and the largest fee a client can pay (its whole channel) is booked to the sat.
+// (AGP-094: a lint the audit's file carried; allowed here so that `clippy -D warnings` passes)
+#[allow(clippy::type_complexity)]
 #[test]
 fn hostile_numbers_on_the_hub_route_are_refusals_and_never_a_panic() {
     let w = world();

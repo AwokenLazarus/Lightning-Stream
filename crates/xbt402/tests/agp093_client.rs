@@ -542,6 +542,8 @@ fn hole_two_crashes_after_a_request_left_do_not_end_the_channel() {
 /// answers the payer with a bare 402 instead: the charge is real and the payer has taken its
 /// quote off the books. The channel's one call of slack absorbs that once (the payer pays for an
 /// answer it never saw); the second time every call is `bad_offer`, for good.
+// (AGP-094: a lint the audit's file carried; allowed here so that `clippy -D warnings` passes)
+#[allow(clippy::manual_contains)]
 #[test]
 fn hole_two_forged_refusals_do_not_end_the_channel() {
     let w = world("forged-402");
@@ -766,6 +768,8 @@ fn extreme_numbers() -> Vec<Value> {
 /// overflow checks (a panic; an abort under `release-small`), and this test build has them too.
 /// Every endpoint a payer reaches, every numeric field, the values above; the paid call is sent
 /// with a valid request MAC so that it reaches the state checks.
+// (AGP-094: a lint the audit's file carried; allowed here so that `clippy -D warnings` passes)
+#[allow(clippy::type_complexity)]
 #[test]
 fn ok_no_number_from_a_payer_panics_the_provider() {
     let w = world("fuzz-provider");
