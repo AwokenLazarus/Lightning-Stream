@@ -1028,10 +1028,13 @@ fn unresolved_intents_are_bounded() {
     assert_eq!(codes.last().unwrap(), "channel_closing", "{codes:?}");
     let st = prov.channel_state(&chan).unwrap();
     let kept = st.extra["close_intents"].as_array().unwrap().len();
-    assert_eq!((kept, codes.iter().filter(|c| *c == "close_failed").count()), (8, 8), "{codes:?}");
-    // the close still goes through, and is the channel's close
+    // AGP-088: one slot short of the bound, kept for the payee's own close
+    assert_eq!((kept, codes.iter().filter(|c| *c == "close_failed").count()), (7, 7), "{codes:?}");
+    // the close still goes through, and is the channel's close: the bound holds with it
     let r = prov.close_channel(&chan).unwrap();
-    assert_eq!(prov.channel_state(&chan).unwrap().closed_txid, r["txid"].as_str().unwrap());
+    let st = prov.channel_state(&chan).unwrap();
+    assert_eq!(st.closed_txid, r["txid"].as_str().unwrap());
+    assert_eq!(st.extra["close_intents"].as_array().unwrap().len(), xbt402::provider::MAX_KEPT_INTENTS);
 }
 
 

@@ -49,7 +49,9 @@ struct WalletTx {
 /// spend is refused unless it replaces a mempool spend by BIP125: the old one signals, the new one
 /// pays its fee + 1 sat/vB more; a tx not final at the tip is refused too) and create unconfirmed
 /// outputs; `confirm_all` confirms everything paying the block min feerate. `gettxout` without the
-/// mempool still shows an output spent only in the mempool, as a node does. It is also the fund
+/// mempool still shows an output spent only in the mempool, and shows nothing for an output of an
+/// unconfirmed transaction, as a node does (AGP-088: it answered that one with 0 confirmations,
+/// and the hub's reading of "nothing" as "spent in a block" went untested). It is also the fund
 /// wallet (AGP-045): every `fund` is a wallet send (`wallet_sends_to`, `wallet_send`), remembered
 /// after it leaves the mempool; `abandon` / `conflict` mark one that can never confirm.
 pub struct MemChain {
@@ -209,7 +211,8 @@ impl ChainBackend for MemChain {
         if st.spent.contains_key(&k) && (mempool || st.mined.contains(&k)) {
             return Ok(None);
         }
-        Ok(st.utxos.get(&k).cloned())
+        // without the mempool a node reads its confirmed UTXO set: nothing for an unconfirmed output
+        Ok(st.utxos.get(&k).filter(|u| mempool || u.confirmations > 0).cloned())
     }
 
     fn send_raw_transaction(&self, hex: &str) -> Result<String> {
@@ -261,6 +264,11 @@ impl SpendScan for MemChain {
     fn find_spend(&self, txid: &str, vout: u32, _from: u32) -> Result<Option<Tx>> {
         let st = self.st();
         Ok(st.spent.get(&(txid.to_string(), vout)).and_then(|s| st.raw.get(s)).and_then(|h| Tx::parse_hex(h).ok()))
+    }
+
+    fn find_spend_at(&self, txid: &str, vout: u32, from: u32) -> Result<Option<(Tx, Option<u32>)>> {
+        let depth = u32::from(self.st().mined.contains(&(txid.to_string(), vout)));
+        Ok(self.find_spend(txid, vout, from)?.map(|tx| (tx, Some(depth))))
     }
 
     fn scan_spk(&self, spk: &[u8]) -> Result<Vec<(String, u32, u64)>> {
@@ -352,6 +360,10 @@ impl ChainBackend for LagChain {
 impl SpendScan for LagChain {
     fn find_spend(&self, txid: &str, vout: u32, from: u32) -> Result<Option<Tx>> {
         Ok(self.chain.find_spend(txid, vout, from)?.filter(|t| !self.hidden(&t.txid())))
+    }
+
+    fn find_spend_at(&self, txid: &str, vout: u32, from: u32) -> Result<Option<(Tx, Option<u32>)>> {
+        Ok(self.chain.find_spend_at(txid, vout, from)?.filter(|(t, _)| !self.hidden(&t.txid())))
     }
 
     fn scan_spk(&self, spk: &[u8]) -> Result<Vec<(String, u32, u64)>> {

@@ -43,6 +43,10 @@ pub const AMSAT_PER_MSAT: u128 = 1_000_000_000_000_000_000;
 pub const FEE_UNITS_PER_SAT: u128 = 1_000_000_000;
 pub use crate::wire::{LOCK_PATH as ROUTE_LOCK_PATH, ROLLOVER_PATH, TERMS_PATH};
 pub const HUB_ROUTE_PATH: &str = "/x402/route";
+/// `POST` with a PAYMENT-SIGNATURE on ch1 (`{chan, seq, cum, auth}`, an empty body): the hub's view
+/// of that ch1, the one its refusals carry (AGP-088). A client at its cap on held locks asks here
+/// instead of pre-signing another lock.
+pub const HUB_VIEW_PATH: &str = "/x402/route/view";
 pub const ROUTE_ERRORS: [&str; 11] = ["bad_auth", "bad_point", "bad_amount", "bad_adaptor", "route_fee", "route_expiry",
                                       "lock_outstanding", "bad_secret", "route_failed", "route_blocked", "bad_invoice"];
 
@@ -435,6 +439,14 @@ pub fn lock_auth(key: &[u8; 32], session: &str, lock_id: &str, amount: i128, poi
 pub trait SpendScan: Send + Sync {
     fn find_spend(&self, txid: &str, vout: u32, from_height: u32) -> Result<Option<Tx>>;
 
+    /// [`find_spend`](Self::find_spend) with where the spender is (AGP-088): `Some(0)` in the
+    /// mempool, `Some(n)` n blocks deep, `None` when this scan cannot tell (the default). The hub
+    /// never reads "in a block" off `gettxout` answering nothing: a node answers nothing for every
+    /// output of an unconfirmed transaction too.
+    fn find_spend_at(&self, txid: &str, vout: u32, from_height: u32) -> Result<Option<(Tx, Option<u32>)>> {
+        Ok(self.find_spend(txid, vout, from_height)?.map(|tx| (tx, None)))
+    }
+
     /// Confirmed unspent outputs paying `spk` as (display txid, vout, sats) (`scantxoutset`, no
     /// wallet or txindex needed): how the hub finds a funding its wallet call lost (AGP-037).
     fn scan_spk(&self, _spk: &[u8]) -> Result<Vec<(String, u32, u64)>> {
@@ -455,11 +467,17 @@ pub trait SpendScan: Send + Sync {
 #[cfg(feature = "rpc")]
 impl SpendScan for crate::rpc::Rpc {
     fn find_spend(&self, txid: &str, vout: u32, from_height: u32) -> Result<Option<Tx>> {
+        Ok(self.find_spend_at(txid, vout, from_height)?.map(|(tx, _)| tx))
+    }
+
+    /// `gettxspendingprevout` sees the mempool only, so a spender it names is unconfirmed; one
+    /// found by reading blocks is as deep as its block.
+    fn find_spend_at(&self, txid: &str, vout: u32, from_height: u32) -> Result<Option<(Tx, Option<u32>)>> {
         use crate::funding::ChainBackend;
         if let Ok(r) = self.call("gettxspendingprevout", json!([[{"txid": txid, "vout": vout}]])) {
             if let Some(sp) = r.get(0).and_then(|e| e.get("spendingtxid")).and_then(Value::as_str) {
                 let raw = self.call("getrawtransaction", json!([sp, false]))?;
-                return Ok(Some(Tx::parse_hex(raw.as_str().unwrap_or(""))?));
+                return Ok(Some((Tx::parse_hex(raw.as_str().unwrap_or(""))?, Some(0))));
             }
         }
         let tip = self.block_count()?;
@@ -470,7 +488,7 @@ impl SpendScan for crate::rpc::Rpc {
                 let spends = tx.get("vin").and_then(Value::as_array).into_iter().flatten()
                     .any(|i| i.get("txid").and_then(Value::as_str) == Some(txid) && i.get("vout").and_then(Value::as_u64) == Some(vout as u64));
                 if spends {
-                    return Ok(Some(Tx::parse_hex(tx.get("hex").and_then(Value::as_str).unwrap_or(""))?));
+                    return Ok(Some((Tx::parse_hex(tx.get("hex").and_then(Value::as_str).unwrap_or(""))?, Some(tip - h + 1))));
                 }
             }
         }

@@ -21,6 +21,16 @@
 //! * gives a lock up when the hub refuses it, or when its invoice expires unanswered: the lock can
 //!   then cost at most its own amount (one window of one provider), and a later state dominates it.
 //!
+//! What the client believes of its hub (AGP-088). A hub that says one of our given-up locks was
+//! COMPLETED proves it: the view carries the t + r that opens that lock's own point, which only
+//! its completion yields. A hub that says a given-up lock is HELD (its ch2 pre-signature is out,
+//! so it stays in ch1's base) cannot prove it, and each hold we adopt raises what our next lock
+//! signs by that lock. So at most `max_held_locks` are adopted at a time (default 2), and at that
+//! many nothing more is pre-signed until one resolves: the client only asks the hub for its view.
+//! The trust that remains: a hub that lies about holds gets us to sign `max_held_locks - 1` locks
+//! (each at most `max_lock_sat` plus its fee) above what we owe; with `max_held_locks: 1`, none,
+//! and one refusing provider then pauses our payments to the others until its ch2 resolves.
+//!
 //! Keys stay behind [`RouteSigner`] (the [`crate::signer::StateSigner`] seam plus the adaptor lock
 //! methods): [`crate::signer::LocalSigner`] in process, or `xbt-signer`'s `RemoteSigner` (the B2
 //! signer and its routing policy, keys never in the client). ch1 is funded by a [`Wallet`].
@@ -109,12 +119,18 @@ pub struct RoutePayerConfig {
     /// With a ledger: save a shard's meters every this many answered calls (1: every call; the
     /// calls in doubt after a crash grow with it).
     pub persist_every: u64,
+    /// AGP-088: the given-up locks the hub may hold in ch1's base at one time, on its word (see the
+    /// module doc). At this many the client pre-signs nothing more until one resolves. 0: none is
+    /// ever adopted.
+    pub max_held_locks: usize,
+    /// Seconds between two requests for the hub's view while at `max_held_locks`.
+    pub held_probe_secs: f64,
 }
 
 impl RoutePayerConfig {
     pub fn new(network: &str) -> Self {
         Self { network: network.into(), capacity: 200_000, expiry_blocks: 8_000, max_fee_ppm: 10_000, max_fee_base_msat: 10_000,
-               max_lock_sat: 50_000, max_close_fee: 2_000, void_grace: 1.0, persist_every: 1 }
+               max_lock_sat: 50_000, max_close_fee: 2_000, void_grace: 1.0, persist_every: 1, max_held_locks: 2, held_probe_secs: 5.0 }
     }
 }
 
@@ -251,6 +267,9 @@ struct GivenUp {
     floor: bool,
     /// The hub holds it in ch1's base until its ch2 resolves (AGP-064): our counters are `after`.
     held: bool,
+    /// The lock's own point T1 = T + r·G (hex; "" for a floor lock, or one given up before
+    /// AGP-088): what a hub's claim that it completed this lock must open.
+    t1: String,
 }
 
 fn counters_json(c: (u64, u128, u64)) -> Value {
@@ -265,14 +284,14 @@ fn counters_of(v: Option<&Value>) -> Option<(u64, u128, u64)> {
 impl GivenUp {
     fn to_json(&self) -> Value {
         json!({"cum": self.cum, "lockId": self.lock_id, "before": counters_json(self.before), "after": counters_json(self.after),
-               "floor": self.floor, "held": self.held})
+               "floor": self.floor, "held": self.held, "T1": self.t1})
     }
 
     fn from_json(v: &Value) -> Option<Self> {
         let after = counters_of(v.get("after"))?;
         let flag = |k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(false);
         Some(Self { cum: py_u64(v.get("cum"))?, lock_id: py_str(v.get("lockId")), before: counters_of(v.get("before")).unwrap_or(after), after,
-                    floor: flag("floor"), held: flag("held") })
+                    floor: flag("floor"), held: flag("held"), t1: py_str(v.get("T1")) })
     }
 }
 
@@ -306,6 +325,8 @@ struct PState {
     pending: Option<Pending>,
     given_up: Vec<GivenUp>,
     stats: PayerStats,
+    /// When the hub may next be asked for its view (at `max_held_locks`).
+    probe_at: f64,
 }
 
 /// The routed-payment client.
@@ -834,7 +855,7 @@ impl RoutePayer {
         }
         let before = (st.routed, st.fee_units, st.fee_paid);
         let after = (st.routed + p.d + p.f, p.units, st.fee_paid + p.f);
-        st.given_up.push(GivenUp { cum: p.cum, lock_id: p.lock_id.clone(), before, after, floor: p.floor, held: false });
+        st.given_up.push(GivenUp { cum: p.cum, lock_id: p.lock_id.clone(), before, after, floor: p.floor, held: false, t1: p.t1.clone() });
         if st.given_up.len() > 16 {
             // a held lock is kept until its release or completion: without it a release could not be adopted
             let i = st.given_up.iter().position(|g| !g.held).unwrap_or(0);
@@ -853,6 +874,9 @@ impl RoutePayer {
     ///   quoted below our signed state (the dust floor) until what we paid ahead for it is used.
     ///
     /// AGP-085: a release may come in the same view as a completion or a hold (`gone` below).
+    ///
+    /// AGP-088: a completion is adopted only with its proof (the view's `secret` opens that
+    /// lock's T1), and a hold only while fewer than `max_held_locks` are held (see the module doc).
     fn resync(&self, st: &mut PState, doc: &Value) -> bool {
         let (Some(best), Some(r), Some(u), Some(pd)) = (py_u64(doc.get("bestCum")), py_u64(doc.get("routedSat")), u128_of(doc.get("feeUnits")),
                                                         py_u64(doc.get("feePaid"))) else { return false };
@@ -883,6 +907,12 @@ impl RoutePayer {
             for gi in 0..st.given_up.len() {
                 let g = &st.given_up[gi];
                 if g.floor || g.cum != best {
+                    continue;
+                }
+                // only the lock's completion gives the hub t + r (a lock from before has no point kept)
+                let opens = || Sc::from_hex_mod_n(&py_str(doc.get("secret"))).and_then(|y| y.secret())
+                    .is_some_and(|y| hex::encode(adaptor::enc(&adaptor::point_of(&y))) == g.t1.to_lowercase());
+                if !g.t1.is_empty() && !opens() {
                     continue;
                 }
                 let mut rel: Vec<usize> = gone.iter().copied().filter(|&i| i != gi).collect();
@@ -938,6 +968,12 @@ impl RoutePayer {
             },
             None => return false,
         };
+        // the hub's word is all there is for a hold: no more than `max_held_locks` at a time
+        if st.given_up.iter().enumerate().filter(|(i, g)| g.held && !rel.contains(i)).count() >= self.cfg.max_held_locks {
+            self.event(json!({"event": "hold_not_adopted", "lockId": st.given_up[gi].lock_id, "max": self.cfg.max_held_locks}));
+            return false;
+        }
+        st.probe_at = 0.0;
         let g = &mut st.given_up[gi];
         if !rel.is_empty() {
             // as if the release had been adopted first: the lock was given up on the base without them
@@ -961,6 +997,16 @@ impl RoutePayer {
         self.check_pending(None);
         if let Some(r) = self.resend_pending()? {
             return Ok(Some(r));
+        }
+        let at_cap = {
+            let st = lk(&self.st);
+            let held = st.given_up.iter().filter(|g| g.held).count();
+            st.pending.is_none() && st.ch.is_some() && self.cfg.max_held_locks > 0 && held >= self.cfg.max_held_locks
+        };
+        if at_cap {
+            // AGP-088: nothing more is pre-signed above that many holds; a release or a completion
+            // of one of them is learnt from the hub's view
+            return Ok(self.probe_view()?.then(|| json!({"status": "resynced"})));
         }
         let (id, pl, body, accepted, d, f, floor) = {
             let mut st = lk(&self.st);
@@ -1040,15 +1086,51 @@ impl RoutePayer {
         self.send_lock(id, &pl, &body, &accepted, d, f, floor)
     }
 
+    /// AGP-088: ask the hub for its view of ch1 (`POST /x402/route/view`) and adopt it, without
+    /// signing a state. True if the view was adopted (a release, or a completion with its proof).
+    /// At most once every `held_probe_secs`, the first right after a hold was adopted.
+    fn probe_view(&self) -> Result<bool> {
+        let (pl, accepted) = {
+            let mut st = lk(&self.st);
+            if now_f() < st.probe_at {
+                return Ok(false);
+            }
+            st.probe_at = now_f() + self.cfg.held_probe_secs;
+            let Some(ch) = st.ch.as_ref() else { return Ok(false) };
+            let (chan, accepted) = (ch.params.channel_id(), ch.accepted.clone());
+            let signed = st.signed.to_string();
+            let pl = self.signed_request(&mut st, &json!({"chan": chan, "seq": 0, "cum": signed}), "", HUB_VIEW_PATH)?;
+            // write-ahead: the seq this request spends
+            self.persist(&[("ch1".to_string(), self.ch1_json(&st))])?;
+            (pl, accepted)
+        };
+        let r = self.http.request("POST", &format!("{}{HUB_VIEW_PATH}", self.hub_url), b"",
+                                  &[("PAYMENT-SIGNATURE".into(), b64json(&json!({"x402Version": 2, "accepted": accepted, "payload": pl})))]);
+        let Ok(r) = r else { return Ok(false) };
+        let doc: Value = crate::json::parse_slice(&r.body).unwrap_or(Value::Null);
+        let mut st = lk(&self.st);
+        if r.status != 200 || st.pending.is_some() || !self.resync(&mut st, &doc) {
+            return Ok(false);
+        }
+        self.event(json!({"event": "view_adopted", "routedSat": st.routed, "signed": st.signed}));
+        self.persist_lock_state(&st, None);
+        Ok(true)
+    }
+
     /// `pl` with a fresh ch1 seq and its auth.
     fn signed_payload(&self, st: &mut PState, pl: &Value, body: &str) -> Result<Value> {
+        self.signed_request(st, pl, body, HUB_ROUTE_PATH)
+    }
+
+    /// `pl` with a fresh ch1 seq and its auth, for a POST of `body` to the hub's `path`.
+    fn signed_request(&self, st: &mut PState, pl: &Value, body: &str, path: &str) -> Result<Value> {
         let ch = st.ch.as_mut().ok_or_else(|| ChannelError::code("no_channel"))?;
         ch.seq += 1;
         let mut pl = pl.clone();
         pl["seq"] = ch.seq.into();
         let chan = ch.params.channel_id();
         crate::wire::no_fragment(&self.hub_url)?;
-        pl["auth"] = self.signer.request_auth(&chan, Some(&pl["seq"]), Some(&pl["cum"]), None, &request_digest_v2("POST", &format!("{}{HUB_ROUTE_PATH}", self.hub_url), body.as_bytes()))?.into();
+        pl["auth"] = self.signer.request_auth(&chan, Some(&pl["seq"]), Some(&pl["cum"]), None, &request_digest_v2("POST", &format!("{}{path}", self.hub_url), body.as_bytes()))?.into();
         Ok(pl)
     }
 
