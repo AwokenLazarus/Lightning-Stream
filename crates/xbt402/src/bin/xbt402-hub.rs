@@ -28,12 +28,28 @@
 //! and synced. AGP-042: `/readyz` also reports the node wallet named `hub` (created and loaded on
 //! start), a stable receive address, its balance, and an Umbrel Tor onion when `XBT_HUB_ONION` /
 //! `APP_HIDDEN_SERVICE` is set.
+//!
+//! AGP-104:
+//! * Start-up: the hub refuses a node that is not on XBT ([`xbt402::node_check`]: mainnet's block
+//!   961,640 by its pinned hash, any other chain by the form of a block), waiting while the node
+//!   is below that block, and refuses a configured `network` that is not the node's.
+//! * Returns: every coin the hub gets back is paid to a fresh address of the node wallet (the
+//!   remainder of a ch2, a refund, the sweep of a closed ch1).
+//! * Funding states its fee rate: `node.fee_rate` / `XBT_HUB_FEE_RATE` (sat/vB), else the node's
+//!   estimate for `node.fee_conf_target` blocks (default 6). With neither, nothing is funded and
+//!   the error says so.
+//! * `/readyz` is not ready while the wallet does not answer.
+//! * `GET /status`: where the hub's coins are, as JSON; `GET /`: the same as a page.
+//!   `XBT_HUB_STATUS=off` serves neither (they are on the hub's public port).
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
 use xbt402::adaptor::Sc;
+use xbt402::client::{Wallet, WalletSend};
+use xbt402::error::ChannelError;
+use xbt402::funding::ChainBackend;
 use xbt402::http::{serve_service, HttpService, UreqTransport};
 use xbt402::hub::{HubConfig, RouteHub};
 use xbt402::hub_keys::{WrapKey, WRAP_KEY_FILE};
@@ -72,6 +88,10 @@ fn load_config(args: &[String], data: Option<&DataDir>) -> Value {
         if let Some(v) = env(k) {
             conf["node"][slot] = v.into();
         }
+    }
+    if let Some(v) = env("XBT_HUB_FEE_RATE") {
+        conf["node"]["fee_rate"] = v.parse::<f64>().ok().filter(|r| r.is_finite() && *r > 0.0).map(Value::from)
+            .unwrap_or_else(|| die(format!("XBT_HUB_FEE_RATE={v}: a fee rate in sat/vB")));
     }
     if let Some(v) = env("XBT_NODE_RPC_PORT") {
         conf["node"]["rpcport"] = v.parse::<u64>().map(Value::from).unwrap_or_else(|_| die(format!("XBT_NODE_RPC_PORT={v}")));
@@ -158,19 +178,59 @@ fn node_rpc(conf: &Value, secrets: &Secrets) -> Rpc {
     Rpc::new(&url, u, p)
 }
 
-/// The network id: the config's, else from the node's anchor block (mainnet 961,640, regtest 101).
+/// The network id: from the node's anchor block (mainnet 961,640, regtest 101). A configured one
+/// must be that (AGP-104: a hub would otherwise sign quotes for one network and fund channels on
+/// another); on a chain with no anchor block the configured one is all there is.
 fn network(conf: &Value, rpc: &Rpc) -> String {
-    if let Some(n) = conf.get("network").and_then(Value::as_str) {
-        return n.to_string();
-    }
+    let set = conf.get("network").and_then(Value::as_str);
     let chain = rpc.call("getblockchaininfo", json!([])).unwrap_or_else(|e| die(format!("node: {e}")))["chain"].as_str().unwrap_or("").to_string();
-    let height = match chain.as_str() {
-        "main" => 961_640,
-        "regtest" => 101,
-        c => die(format!("chain {c:?}: set XBT_HUB_NETWORK")),
+    let height = match (chain.as_str(), set) {
+        ("main", _) => 961_640,
+        ("regtest", _) => 101,
+        (_, Some(n)) => return n.to_string(),
+        (c, None) => die(format!("chain {c:?}: set XBT_HUB_NETWORK")),
     };
     let hash = rpc.call("getblockhash", json!([height])).unwrap_or_else(|e| die(format!("node: anchor block {height}: {e}")));
-    xbt_primitives::network::network_id(hash.as_str().unwrap_or(""))
+    let id = xbt_primitives::network::network_id(hash.as_str().unwrap_or(""));
+    match network_choice(set, &id) {
+        Ok(n) => n,
+        Err(e) => die(e),
+    }
+}
+
+/// The node's network id, unless another one is configured.
+fn network_choice(set: Option<&str>, node: &str) -> Result<String, String> {
+    match set {
+        Some(n) if n != node => Err(format!("network {n} is configured, and the node is on {node}: point the hub at the right node or remove the setting")),
+        _ => Ok(node.to_string()),
+    }
+}
+
+/// AGP-104: refuse a node that is not on XBT, before anything is served or funded
+/// ([`xbt402::node_check`]). While the node is below the block the check needs (a node still
+/// syncing), wait and say so: the hub has nothing to serve until then.
+fn check_node_chain(rpc: &Rpc) {
+    let mut said = 0u64;
+    loop {
+        let info = rpc.call("getblockchaininfo", json!([])).unwrap_or_else(|e| die(format!("node: {e}")));
+        let (chain, blocks) = (info["chain"].as_str().unwrap_or("").to_string(), info["blocks"].as_u64().unwrap_or(0));
+        let height = xbt402::node_check::check_height(&chain).map(u64::from).unwrap_or(blocks);
+        if blocks < height {
+            if said.is_multiple_of(20) {
+                eprintln!("xbt402-hub: the node is at block {blocks}; waiting for block {height} to check that it is on XBT");
+            }
+            said += 1;
+            std::thread::sleep(Duration::from_secs(15));
+            continue;
+        }
+        let hash = rpc.call("getblockhash", json!([height])).unwrap_or_else(|e| die(format!("node: block {height}: {e}")));
+        let hash = hash.as_str().unwrap_or("").to_string();
+        let header = if chain == "main" { Value::Null } else { rpc.call("getblockheader", json!([hash, false])).unwrap_or_else(|e| die(format!("node: header {height}: {e}"))) };
+        if let Err(e) = xbt402::node_check::check_chain(&chain, height as u32, &hash, header.as_str().unwrap_or("")) {
+            die(format!("wrong chain: {e}"));
+        }
+        return;
+    }
 }
 
 /// Whether `name` is already in `listwallets`.
@@ -178,25 +238,27 @@ fn wallet_is_loaded(loaded: &Value, name: &str) -> bool {
     loaded.as_array().is_some_and(|a| a.iter().any(|w| w.as_str() == Some(name)))
 }
 
-/// Create or load the node's wallet named `name` (the hub funds routes from it).
+/// Create or load the node's wallet named `name` (the hub funds routes from it). AGP-104: with
+/// `load_on_startup`, so a node that restarts loads it again (a wallet made over RPC is otherwise
+/// left unloaded, and the hub would fund nothing until someone loaded it).
 fn ensure_named_wallet(rpc: &Rpc, name: &str) -> Result<(), String> {
     let loaded = rpc.call("listwallets", json!([])).map_err(|e| e.to_string())?;
     if wallet_is_loaded(&loaded, name) {
         return Ok(());
     }
-    match rpc.call("loadwallet", json!([name])) {
+    match rpc.call("loadwallet", json!([name, true])) {
         Ok(_) => Ok(()),
         Err(e) => {
             let load_err = e.to_string();
             if load_err.contains("already loaded") {
                 return Ok(());
             }
-            match rpc.call("createwallet", json!([name])) {
+            match rpc.call("createwallet", json!({"wallet_name": name, "load_on_startup": true})) {
                 Ok(_) => Ok(()),
                 Err(ce) => {
                     let create_err = ce.to_string();
                     if create_err.contains("already exists") {
-                        rpc.call("loadwallet", json!([name])).map(|_| ()).map_err(|e| e.to_string())
+                        rpc.call("loadwallet", json!([name, true])).map(|_| ()).map_err(|e| e.to_string())
                     } else {
                         Err(format!("loadwallet: {load_err}; createwallet: {create_err}"))
                     }
@@ -227,10 +289,65 @@ fn persist_receive_address(path: &std::path::Path, new_addr: impl FnOnce() -> Re
     Ok(a)
 }
 
+/// AGP-104: `loaded` is the wallet answering now. (It was also true whenever a receive address
+/// was on file, so a wallet the node no longer had loaded still read as ready.)
 fn wallet_status(wallet: &Rpc, name: &str, receive: Option<&str>) -> Value {
-    let bal = wallet.call("getbalance", json!([])).ok().and_then(|v| v.as_f64())
-        .and_then(|btc| xbt_primitives::amount::Amount::from_btc_f64(btc).ok()).map(|a| a.to_sat());
-    json!({"name": name, "loaded": receive.is_some() || bal.is_some(), "receive_address": receive, "balance_sats": bal})
+    let bal = wallet.call("getbalance", json!([])).map_err(|e| e.to_string())
+        .and_then(|v| v.as_f64().and_then(|btc| xbt_primitives::amount::Amount::from_btc_f64(btc).ok()).map(|a| a.to_sat()).ok_or_else(|| "getbalance: not an amount".to_string()));
+    json!({"name": name, "loaded": bal.is_ok(), "receive_address": receive, "balance_sats": bal.as_ref().ok(), "error": bal.as_ref().err()})
+}
+
+/// What the wallet holds, in sats: `getbalances`' trusted and pending coins of its own (a return
+/// from a close is pending until it confirms, and is the hub's all the same).
+fn wallet_sats(wallet: &Rpc) -> Result<u64, String> {
+    let b = wallet.call("getbalances", json!([])).map_err(|e| e.to_string())?;
+    let coin = |k: &str| b["mine"][k].as_f64().and_then(|v| xbt_primitives::amount::Amount::from_btc_f64(v).ok()).map(|a| a.to_sat());
+    match (coin("trusted"), coin("untrusted_pending")) {
+        (Some(t), p) => Ok(t.saturating_add(p.unwrap_or(0))),
+        _ => Err("getbalances: no mine.trusted".into()),
+    }
+}
+
+/// The node wallet as the hub's fund hook, with the fee rate stated on every funding (AGP-104).
+/// Rule: a funding never leaves the rate to the wallet. `fee_rate` (sat/vB) when the operator set
+/// one, else the node's estimate for `conf_target` blocks; with neither, nothing is funded.
+struct NodeWallet {
+    wallet: Rpc,
+    fee_rate: Option<f64>,
+    conf_target: u32,
+}
+
+impl NodeWallet {
+    fn rate(&self) -> xbt402::Result<f64> {
+        if let Some(r) = self.fee_rate {
+            return Ok(r);
+        }
+        self.wallet.estimate_fee_rate(self.conf_target)?.ok_or_else(|| {
+            ChannelError::new("no_fee_rate", format!("the node has no fee estimate for {} blocks (estimatesmartfee): set node.fee_rate or XBT_HUB_FEE_RATE (sat/vB), or wait until the node has seen enough blocks", self.conf_target))
+        })
+    }
+}
+
+impl Wallet for NodeWallet {
+    fn fund(&self, address: &str, sats: u64) -> xbt402::Result<(String, u32)> {
+        self.wallet.fund_at(address, sats, self.rate()?)
+    }
+
+    fn preflight(&self) -> xbt402::Result<()> {
+        self.rate().map(|_| ())
+    }
+
+    fn wallet_sends_to(&self, address: &str) -> xbt402::Result<Vec<String>> {
+        self.wallet.wallet_sends_to(address)
+    }
+
+    fn wallet_send(&self, txid: &str, address: &str) -> xbt402::Result<Option<WalletSend>> {
+        self.wallet.wallet_send(txid, address)
+    }
+
+    fn send_fee(&self, txid: &str) -> xbt402::Result<Option<u64>> {
+        self.wallet.send_fee(txid)
+    }
 }
 
 /// The hub behind a reverse proxy: health endpoints, the base path, the public URL.
@@ -244,6 +361,21 @@ struct Front {
     base: String,
     public: Option<String>,
     trust_forwarded: bool,
+    /// `/status` and the page at `/` are served (AGP-104; `XBT_HUB_STATUS=off` turns them off).
+    status: bool,
+}
+
+impl Front {
+    /// [`RouteHub::status`] with what this service knows beside it: the wallet, the hub's address.
+    fn status_doc(&self) -> Value {
+        let held = wallet_sats(&self.wallet);
+        let mut v = self.hub.status(held.as_ref().ok().copied());
+        v["wallet"] = json!({"name": self.wallet_name, "receiveAddress": self.receive_address, "error": held.err()});
+        v["url"] = self.public.clone().into();
+        v["tor"] = self.onion.clone().into();
+        v["experimental"] = true.into();
+        v
+    }
 }
 
 fn json_resp(status: u16, v: Value) -> HttpResponse {
@@ -267,11 +399,18 @@ impl HttpService for Front {
             }
             ("GET" | "HEAD", "/readyz") => {
                 let node = health::node_status(self.rpc.call("getblockchaininfo", json!([])).map_err(|e| e.to_string()));
-                let ok = node["reachable"] == true && node["synced"] == true;
+                let wallet = wallet_status(&self.wallet, &self.wallet_name, self.receive_address.as_deref());
+                let ok = ready(&node, &wallet);
                 json_resp(if ok { 200 } else { 503 }, json!({"ok": ok, "service": "xbt402-hub", "node": node,
                                                              "pay_to": self.hub.pay_to(), "providers": self.hub.out_channels().len(),
-                                                             "wallet": wallet_status(&self.wallet, &self.wallet_name, self.receive_address.as_deref()),
-                                                             "tor": self.onion}))
+                                                             "wallet": wallet, "tor": self.onion}))
+            }
+            ("GET" | "HEAD", "/status") if self.status => json_resp(200, self.status_doc()),
+            ("GET" | "HEAD", "/" | "") if self.status => {
+                HttpResponse::new(200, vec![("Content-Type".into(), "text/html; charset=utf-8".into()), ("Cache-Control".into(), "no-store".into()),
+                                            ("Content-Security-Policy".into(), "default-src 'none'; style-src 'unsafe-inline'".into()),
+                                            ("X-Frame-Options".into(), "DENY".into())],
+                                  xbt402::status_page::render(&self.status_doc()).into_bytes())
             }
             _ => {
                 let url = proxy::public_url(headers, path, &self.base, self.public.as_deref(), self.trust_forwarded);
@@ -279,6 +418,12 @@ impl HttpService for Front {
             }
         }
     }
+}
+
+/// Ready: the node is reachable and synced, and the wallet the hub funds from answers (AGP-104:
+/// without it the hub can quote and route over what it has, and can fund and return nothing).
+fn ready(node: &Value, wallet: &Value) -> bool {
+    node["reachable"] == true && node["synced"] == true && wallet["loaded"] == true
 }
 
 fn main() {
@@ -300,12 +445,22 @@ fn main() {
     let mode = Mode::from_env().unwrap_or_else(|e| die(e));
     let secrets = Secrets::for_component(data.as_ref(), xbt_svc::HUB, mode);
     let rpc = node_rpc(&conf, &secrets);
+    check_node_chain(&rpc);
     let wallet_name = conf["node"].get("wallet").and_then(Value::as_str).unwrap_or("hub").to_string();
     if let Err(e) = ensure_named_wallet(&rpc, &wallet_name) {
-        eprintln!("xbt402-hub: wallet {wallet_name}: {e} (status and quotes still work; funding needs this wallet)");
+        eprintln!("xbt402-hub: wallet {wallet_name}: {e} (quotes and routing still work; funding and returns need this wallet, and /readyz says not ready)");
     }
     let wallet = rpc.wallet(&wallet_name);
-    let refunds = wallet.clone();
+    let returns = wallet.clone();
+    let fee_rate = conf["node"].get("fee_rate").filter(|v| !v.is_null())
+        .map(|v| v.as_f64().filter(|r| r.is_finite() && *r > 0.0).unwrap_or_else(|| die("node.fee_rate: a fee rate in sat/vB".into())));
+    let conf_target = conf["node"].get("fee_conf_target").filter(|v| !v.is_null())
+        .map(|v| v.as_u64().filter(|t| (1..=1008).contains(t)).unwrap_or_else(|| die("node.fee_conf_target: 1 to 1008 blocks".into())) as u32).unwrap_or(6);
+    let fund = NodeWallet { wallet: wallet.clone(), fee_rate, conf_target };
+    match fund.rate() {
+        Ok(r) => eprintln!("xbt402-hub: fundings pay {r} sat/vB{}", if fee_rate.is_some() { " (set)" } else { " now (the node's estimate)" }),
+        Err(e) => eprintln!("xbt402-hub: {e}: nothing is funded until then"),
+    }
     let key = match conf.get("pay_to_key_file").and_then(Value::as_str) {
         Some(f) => std::fs::read_to_string(expand(f)).unwrap_or_else(|e| die(format!("pay_to_key_file: {e}"))),
         None => {
@@ -336,14 +491,16 @@ fn main() {
     }
     let wrap = wrap_key(&conf, &secrets, data.is_some(), &datadir);
     let rpc = Arc::new(rpc);
-    let hub = RouteHub::new_with_wrap_key(rpc.clone(), rpc.clone(), Box::new(wallet.clone()), Box::new(UreqTransport::default()), secret, &network,
+    let hub = RouteHub::new_with_wrap_key(rpc.clone(), rpc.clone(), Box::new(fund), Box::new(UreqTransport::default()), secret, &network,
                                           Some(&datadir), cfg, Some(wrap))
         .unwrap_or_else(|e| die(format!("{e}")));
-    // ch2 refunds pay the hub's wallet, not the per-channel payer key (AGP-037); bech32, whatever the
-    // wallet's default address type (a legacy default made every refund fail, AGP-044)
-    hub.set_refund_to(Some(Box::new(move || {
-        refunds.call("getnewaddress", json!(["", "bech32"]))?.as_str().map(str::to_string)
-            .ok_or_else(|| xbt402::error::ChannelError::new("rpc_error", "getnewaddress"))
+    // AGP-104: every coin the hub gets back is paid to the hub's wallet: a ch2's remainder and its
+    // refund (AGP-037), the sweep of a closed ch1. THE one place that names where returns go: a
+    // later link to a Lightning wallet changes this hook. bech32, whatever the wallet's default
+    // address type (a legacy default made every refund fail, AGP-044)
+    hub.set_return_to(Some(Box::new(move || {
+        returns.call("getnewaddress", json!(["", "bech32"]))?.as_str().map(str::to_string)
+            .ok_or_else(|| ChannelError::new("rpc_error", "getnewaddress"))
     })));
     if args.iter().any(|a| a == "--close-all") {
         let mut closes = vec![];
@@ -378,7 +535,8 @@ fn main() {
     }).filter(|h| h.contains('.'));
     let wallet = Arc::new(wallet);
     let front = Arc::new(Front { hub: hub.clone(), rpc: rpc.clone(), wallet, wallet_name, receive_address, onion,
-                                 base, public: env("XBT_PUBLIC_URL"), trust_forwarded: env_bool("XBT_TRUST_FORWARDED", false) });
+                                 base, public: env("XBT_PUBLIC_URL"), trust_forwarded: env_bool("XBT_TRUST_FORWARDED", false),
+                                 status: env("XBT_HUB_STATUS").is_none_or(|v| !["off", "0", "false", "no"].contains(&v.trim().to_ascii_lowercase().as_str())) });
     let handles = serve_service(front, &bind, threads).unwrap_or_else(|e| die(format!("bind {bind}: {e}")));
     eprintln!("xbt402 hub {} on {bind} ({network})", hub.pay_to());
     eprintln!("xbt402 hub: EXPERIMENTAL - routing is not production-ready; do not route funds you cannot lose");
@@ -412,10 +570,40 @@ mod tests {
         let again = persist_receive_address(&p, || Ok("bcrt1qsecond".into())).unwrap();
         assert_eq!((first.as_str(), again.as_str()), ("bcrt1qfirst", "bcrt1qfirst"));
         assert_eq!(std::fs::read_to_string(&p).unwrap().trim(), "bcrt1qfirst");
+        // AGP-104: a wallet that does not answer is not loaded, whatever address is on file
         let st = wallet_status(&Rpc::new("http://127.0.0.1:1", "u", "p"), "hub", Some("bcrt1qfirst"));
         assert_eq!(st["name"], "hub");
         assert_eq!(st["receive_address"], "bcrt1qfirst");
-        assert_eq!(st["loaded"], true);
+        assert_eq!(st["loaded"], false);
+        assert!(st["error"].is_string() && st["balance_sats"].is_null(), "{st}");
         let _ = std::fs::remove_dir_all(&t);
+    }
+
+    #[test]
+    fn ready_needs_the_node_and_the_wallet() {
+        let node = json!({"reachable": true, "synced": true});
+        assert!(ready(&node, &json!({"loaded": true})));
+        assert!(!ready(&node, &json!({"loaded": false, "receive_address": "bcrt1qfirst"})), "the wallet is missing");
+        assert!(!ready(&json!({"reachable": true, "synced": false}), &json!({"loaded": true})));
+        assert!(!ready(&json!({"reachable": false}), &json!({"loaded": true})));
+    }
+
+    #[test]
+    fn a_funding_states_its_fee_rate_or_says_why_not() {
+        // no node behind it: the estimate fails, and a set rate needs no node
+        let w = Rpc::new("http://127.0.0.1:1", "u", "p");
+        let set = NodeWallet { wallet: w.clone(), fee_rate: Some(2.5), conf_target: 6 };
+        assert_eq!(set.rate().unwrap(), 2.5);
+        assert!(set.preflight().is_ok());
+        let unset = NodeWallet { wallet: w, fee_rate: None, conf_target: 6 };
+        assert!(unset.preflight().is_err() && unset.fund("bcrt1qx", 1_000).is_err());
+    }
+
+    #[test]
+    fn a_configured_network_must_be_the_nodes() {
+        assert_eq!(network_choice(None, "bip122:aa").unwrap(), "bip122:aa");
+        assert_eq!(network_choice(Some("bip122:aa"), "bip122:aa").unwrap(), "bip122:aa");
+        let e = network_choice(Some("bip122:bb"), "bip122:aa").unwrap_err();
+        assert!(e.contains("bip122:bb") && e.contains("bip122:aa"), "{e}");
     }
 }

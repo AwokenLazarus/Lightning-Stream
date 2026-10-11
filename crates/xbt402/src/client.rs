@@ -80,6 +80,19 @@ pub trait Wallet: Send + Sync {
     fn knows_its_sends(&self) -> bool {
         false
     }
+
+    /// Can this wallet fund now? Asked before a hub writes a ch2's record (AGP-104): a wallet that
+    /// knows it cannot (its node has no fee estimate and no rate is set) says why here, and
+    /// nothing is written or sent. Default: yes.
+    fn preflight(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// What this wallet paid a miner for its send `txid`, in sats (`gettransaction`'s fee): a hub
+    /// counts it among what the chain cost (AGP-104). Default: not known.
+    fn send_fee(&self, _txid: &str) -> Result<Option<u64>> {
+        Ok(None)
+    }
 }
 
 /// A send the wallet knows (AGP-045): its output to the address and whether it can still confirm.

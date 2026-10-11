@@ -1391,8 +1391,44 @@ impl Provider {
         Ok(out)
     }
 
+    /// AGP-104: where this closed channel's payout is now, `(txid, vout, sats)`: the close's payee
+    /// output, or the output of the CPFP child that moved it to the same key (AGP-067). None: the
+    /// channel has no recorded close, or its close pays nothing to the payee key.
+    pub fn payee_output(&self, chan: &str) -> Result<Option<(String, u32, u64)>> {
+        let cid = canonical_chan(chan)?;
+        let st = lock(&self.ledger).channels.get(&cid).cloned().ok_or_else(|| ChannelError::code("unknown_channel"))?;
+        let Some(close_hex) = st.extra.get("close_hex").and_then(Value::as_str).filter(|_| !st.closed_txid.is_empty()) else { return Ok(None) };
+        let close = Tx::parse_hex(close_hex)?;
+        let Some(vout) = close.outputs.iter().position(|o| o.script_pubkey == st.params.payee_spk) else { return Ok(None) };
+        Ok(Some(self.payee_found(&st, &close, vout)?))
+    }
+
+    /// The close's payee output `vout`, or the CPFP child's (the latest, or one it replaced)
+    /// that this node shows.
+    fn payee_found(&self, st: &ChannelState, close: &Tx, vout: usize) -> Result<(String, u32, u64)> {
+        // AGP-067: a CPFP child (the latest, or one it replaced) moved the output to the same key
+        let base = close.outputs[vout].value as u64;
+        let mut found = (st.closed_txid.clone(), vout as u32, base);
+        if let Some(b) = st.extra.get("close_bump").filter(|b| py_u64(b.get("fee")).unwrap_or(0) > 0) {
+            let mut kids = vec![(py_str(b.get("txid")), py_u64(b.get("fee")).unwrap_or(0))];
+            for r in b.get("replaced").and_then(Value::as_array).into_iter().flatten() {
+                kids.push((py_str(r.get(0)), py_u64(r.get(1)).unwrap_or(0)));
+            }
+            for (txid, kfee) in kids.into_iter().rev().filter(|(t, _)| !t.is_empty()) {
+                if self.chain.get_tx_out(&txid, 0, true)?.is_some() {
+                    found = (txid, 0, base.saturating_sub(kfee));
+                }
+            }
+        }
+        Ok(found)
+    }
+
     /// Move this channel's payee close output to `dest_spk` (witness v0), signed 0x21 with the
     /// channel secret, which is never returned. Idempotent.
+    ///
+    /// AGP-104 rule: one signed sweep per output. A sweep written ahead (`payee_sweep_intent`)
+    /// whose send failed is the one sent again, with the destination and fee it was signed
+    /// for, whatever this call names: signing another would spend the same output twice.
     pub fn sweep_payee(&self, chan: &str, dest_spk: &[u8], fee: u64) -> Result<Value> {
         if !((dest_spk.len() == 22 || dest_spk.len() == 34) && dest_spk[0] == 0 && dest_spk[1] as usize == dest_spk.len() - 2) {
             return fail("bad_dest", "sweep destination must be a witness v0 script (P2WPKH or P2WSH)");
@@ -1412,22 +1448,25 @@ impl Provider {
         let close = Tx::parse_hex(&close_hex)?;
         let vout = close.outputs.iter().position(|o| o.script_pubkey == st.params.payee_spk)
             .ok_or_else(|| ChannelError::new("no_payee_output", "the close pays nothing to the payee key"))?;
-        // AGP-067: a CPFP child (the latest, or one it replaced) moved the output to the same key
-        let base = close.outputs[vout].value as u64;
-        let mut found = (st.closed_txid.clone(), vout as u32, base);
-        if let Some(b) = st.extra.get("close_bump").filter(|b| py_u64(b.get("fee")).unwrap_or(0) > 0) {
-            let mut kids = vec![(py_str(b.get("txid")), py_u64(b.get("fee")).unwrap_or(0))];
-            for r in b.get("replaced").and_then(Value::as_array).into_iter().flatten() {
-                kids.push((py_str(r.get(0)), py_u64(r.get(1)).unwrap_or(0)));
-            }
-            for (txid, kfee) in kids.into_iter().rev().filter(|(t, _)| !t.is_empty()) {
-                if self.chain.get_tx_out(&txid, 0, true)?.is_some() {
-                    found = (txid, 0, base.saturating_sub(kfee));
+        let (from_txid, vout, value) = self.payee_found(&st, &close, vout)?;
+        if let Some(i) = st.extra.get("payee_sweep_intent").filter(|i| py_str(i.get("outpoint")) == format!("{from_txid}:{vout}")).cloned() {
+            if let Some(hex_) = i.get("hex").and_then(Value::as_str) {
+                let tx = Tx::parse_hex(hex_)?;
+                if let Err(e) = self.chain.send_raw_transaction(hex_) {
+                    if !self.tx_known(&tx.txid(), &tx) {
+                        return fail("sweep_failed", e.to_string());
+                    }
                 }
+                let mut rec = i.clone();
+                if let Some(o) = rec.as_object_mut() {
+                    o.remove("hex");
+                }
+                st.extra.insert("payee_sweep".into(), rec.clone());
+                self.save_state(&mut l, &st)?;
+                return Ok(rec);
             }
         }
-        let (from_txid, vout, value) = found;
-        if value < fee + DUST {
+        if value < fee.saturating_add(DUST) {
             return fail("bad_amount", format!("fee {fee} leaves dust from {value}"));
         }
         if self.chain.get_tx_out(&from_txid, vout, true)?.is_none() {

@@ -18,6 +18,8 @@
 //! * [`funding`]: funding checks against a [`funding::ChainBackend`].
 //! * [`maturity`]: coinbase maturity as the node reports it (`getdeploymentinfo`).
 //! * [`scheme`]: the seam for a second x402 scheme beside the channel binding (`xbt-work`, AGP-032).
+//! * [`node_check`]: is the node a service was pointed at on XBT (AGP-104).
+//! * [`status_page`]: the hub's status as one HTML page (AGP-104).
 //!
 //! Optional features: `http-client` (ureq transport), `http-server` (std::net around the
 //! provider), `rpc` (bitcoind JSON-RPC backend and wallet).
@@ -33,12 +35,14 @@ pub mod hub_keys;
 pub mod json;
 pub mod ledger;
 pub mod maturity;
+pub mod node_check;
 pub mod provider;
 pub mod route;
 pub mod route_client;
 pub mod route_seller;
 pub mod scheme;
 pub mod signer;
+pub mod status_page;
 pub mod wire;
 #[cfg(feature = "rpc")]
 pub mod rpc;

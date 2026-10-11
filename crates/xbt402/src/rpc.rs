@@ -42,6 +42,29 @@ impl Rpc {
         Self { url: format!("{base}/wallet/{name}"), auth: self.auth.clone(), agent: self.agent.clone() }
     }
 
+    /// `sendtoaddress` with `params` (positional, or named), then the wallet's own view of the tx
+    /// for the output that pays `address`.
+    fn sent(&self, address: &str, params: Value) -> Result<(String, u32)> {
+        let txid = self.call("sendtoaddress", params)?.as_str().map(str::to_string).ok_or_else(|| ChannelError::new("rpc_error", "sendtoaddress"))?;
+        let tx = self.call("gettransaction", json!([txid, true, true]))?;
+        let vout = tx.get("decoded").and_then(|d| d.get("vout")).and_then(Value::as_array).and_then(|outs| {
+            outs.iter().find(|o| o.get("scriptPubKey").and_then(|s| s.get("address")).and_then(Value::as_str) == Some(address))
+                .and_then(|o| o.get("n")).and_then(Value::as_u64)
+        }).ok_or_else(|| ChannelError::new("rpc_error", "funding output not found"))?;
+        Ok((txid, vout as u32))
+    }
+
+    /// [`Wallet::fund`] at `sat_per_vb`, stated in the call (AGP-104): the wallet neither picks a
+    /// rate nor fails for lack of an estimate. Rounded up to the three decimals the node takes.
+    pub fn fund_at(&self, address: &str, sats: u64, sat_per_vb: f64) -> Result<(String, u32)> {
+        let amt = Amount::from_sat(sats).map_err(|e| ChannelError::new("bad_amount", e.to_string()))?;
+        if !(sat_per_vb.is_finite() && sat_per_vb > 0.0) {
+            return fail("bad_fee_rate", format!("fee rate {sat_per_vb} sat/vB"));
+        }
+        let rate = (sat_per_vb * 1000.0).ceil() / 1000.0;
+        self.sent(address, json!({"address": address, "amount": amt.to_btc_string().parse::<f64>().unwrap_or(0.0), "fee_rate": rate}))
+    }
+
     /// Call `method`; an RPC error becomes `rpc_error` with the node's message.
     pub fn call(&self, method: &str, params: Value) -> Result<Value> {
         let body = json!({"jsonrpc": "1.0", "id": "xbt402", "method": method, "params": params});
@@ -119,14 +142,7 @@ impl Wallet for Rpc {
     /// `sendtoaddress`, then the wallet's own view of the tx for the vout (no txindex needed).
     fn fund(&self, address: &str, sats: u64) -> Result<(String, u32)> {
         let amt = Amount::from_sat(sats).map_err(|e| ChannelError::new("bad_amount", e.to_string()))?;
-        let txid = self.call("sendtoaddress", json!([address, amt.to_btc_string().parse::<f64>().unwrap_or(0.0)]))?
-            .as_str().map(str::to_string).ok_or_else(|| ChannelError::new("rpc_error", "sendtoaddress"))?;
-        let tx = self.call("gettransaction", json!([txid, true, true]))?;
-        let vout = tx.get("decoded").and_then(|d| d.get("vout")).and_then(Value::as_array).and_then(|outs| {
-            outs.iter().find(|o| o.get("scriptPubKey").and_then(|s| s.get("address")).and_then(Value::as_str) == Some(address))
-                .and_then(|o| o.get("n")).and_then(Value::as_u64)
-        }).ok_or_else(|| ChannelError::new("rpc_error", "funding output not found"))?;
-        Ok((txid, vout as u32))
+        self.sent(address, json!([address, amt.to_btc_string().parse::<f64>().unwrap_or(0.0)]))
     }
 
     /// `listtransactions` is this wallet's record of what it sent.
@@ -145,6 +161,12 @@ impl Wallet for Rpc {
             }
         }
         Ok(out)
+    }
+
+    fn send_fee(&self, txid: &str) -> Result<Option<u64>> {
+        let Ok(tx) = self.call("gettransaction", json!([txid])) else { return Ok(None) };
+        // a send's fee is negative, in coins
+        Ok(tx.get("fee").and_then(Value::as_f64).and_then(|f| Amount::from_btc_f64(f.abs()).ok()).map(|a| a.to_sat()))
     }
 
     fn wallet_send(&self, txid: &str, address: &str) -> Result<Option<WalletSend>> {

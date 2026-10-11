@@ -212,7 +212,8 @@ def run_mcp():
 
 
 def run_hub():
-    docker("run", "-d", "--name", f"{P}-hub", *COMMON, *ENV_NODE, "-e", "XBT_BASE_PATH=/hub", "-e", "XBT_TRUST_FORWARDED=1",
+    # (AGP-104: a regtest node has no fee estimate, so the hub is given its funding fee rate)
+    docker("run", "-d", "--name", f"{P}-hub", *COMMON, *ENV_NODE, "-e", "XBT_BASE_PATH=/hub", "-e", "XBT_TRUST_FORWARDED=1", "-e", "XBT_HUB_FEE_RATE=2",
            "-p", f"127.0.0.1:{HUB_PORT}:9480", "-v", f"{vol('hub')}:/data/hub",
            "xbt402-hub:agp038")
 
