@@ -23,6 +23,9 @@ fn num(args: &[String], name: &str, d: u64) -> u64 {
 }
 
 /// The signer's `fund`, then a wait for the funding's confirmations (the provider needs minConf).
+/// A wait that gives up loses nothing (AGP-101): the signer has the channel on record, and the
+/// client's next open, in this process or the next, asks it (`StateSigner::funded`) and goes on
+/// with that channel. With ten-minute blocks most first waits give up.
 struct Funding {
     remote: RemoteSigner,
     min_conf: u64,

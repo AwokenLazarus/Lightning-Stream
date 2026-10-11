@@ -175,6 +175,21 @@ pub fn offer_retry_floor(extra: &Value) -> Result<u64> {
     Ok(open_expiry_floor(min_expiry, min_conf, close_margin - close_margin / 2))
 }
 
+/// The fewest blocks to expiry at which a channel whose funding is already sent can still be
+/// opened on an offer: `minExpiryBlocks + minConf`. The provider opens with `minExpiryBlocks` left
+/// ([`check_funding`]); `minConf` more are for a funding that still waits for its confirmations.
+/// The close margin is not in it: that was the allowance for the funding to be made.
+///
+/// AGP-101: a payer that learns of a funding only now (its signer made it and the answer was
+/// lost) takes the channel up only above this number. Below it the provider refuses the open
+/// `bad_expiry` on every call until the expiry, and a channel taken onto the books then stands
+/// in the way of its origin after the refund too; left alone, the signer refunds it and the next
+/// open funds a new one.
+pub fn offer_open_floor(extra: &Value) -> Result<u64> {
+    let (min_expiry, _, min_conf, _) = offer_terms(extra)?;
+    Ok(open_expiry_floor(min_expiry, min_conf, 0))
+}
+
 /// The most blocks to expiry a payer funds on an offer unless its owner sets another bound: four
 /// weeks, the bound the signer socket's `open_channel` has had since AGP-063.
 pub const OWNER_MAX_EXPIRY_BLOCKS: u64 = 4_032;

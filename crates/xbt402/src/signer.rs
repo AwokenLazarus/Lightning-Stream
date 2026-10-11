@@ -55,6 +55,24 @@ pub trait StateSigner: Send + Sync {
     fn payer_spk(&self) -> Result<Option<Vec<u8>>> {
         Ok(None)
     }
+    /// The channel this signer itself funded for the key it issued for `origin` and that is not
+    /// attached yet (funded params), if it is a signer that funds (`xbt-signer`'s `fund`).
+    ///
+    /// The rule (AGP-101): **a funding a signer carried out is always learnable by the client that
+    /// asked for it, and a retry adopts it and never funds twice.** Such a signer records the
+    /// channel before it broadcasts and funds one channel per issued key, so a client whose `fund`
+    /// call got no answer must ask here before it asks for anything to be funded:
+    /// [`crate::client::Client`] and [`crate::route_client::RoutePayer`] do, on every open. The
+    /// question goes to the signer and not to the [`crate::client::Wallet`], because a wallet is
+    /// often a wrapper that waits for a confirmation (and so is what loses the answer), and by
+    /// origin and not by script, because a client that restarts without a ledger knows no script.
+    ///
+    /// Default `None`: a signer that funds nothing ([`LocalSigner`]; the wallet funds, and is asked
+    /// for its sends). An implementation that funds must answer, and must fail when it cannot
+    /// tell: `None` is taken as "nothing is funded", and the caller funds.
+    fn funded(&self, _origin: &str) -> Result<Option<ChannelParams>> {
+        Ok(None)
+    }
     /// The 0x21 state for cumulative `amount` (never lower than one already signed).
     fn sign_state(&self, chan: &str, amount: u64) -> Result<Vec<u8>>;
     /// The 0xA3 fee-input state.

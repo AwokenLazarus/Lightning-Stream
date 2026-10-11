@@ -3554,7 +3554,7 @@ later attempt and broadcast an earlier one, the next channel on chain had no key
 the audit's run). `LocalSigner` now keeps every key it issued for as long as it lives and binds one
 key to each channel that pays it; `StateSigner`'s documentation states the rule for any signer.
 The real signer was already right (it keeps the key under the next channel's script and binds a
-next channel only when its node shows the rollover): `xbt-signer/tests/agp096_rollover_signer.rs`
+next channel only when its node shows the rollover): `xbt-signer/tests/agp096_signer_client.rs`
 runs the case through the signer's socket.
 
 **Arithmetic (item 14, the client's part).** The audit's sweep ran with the default `max_price`
@@ -3598,8 +3598,110 @@ key again; a channel too old
 to fund no longer answers `open_unresolved` (a changed offer does, once).
 
 Tests: `xbt402/tests/agp096_client.rs` (20), the audit's `agp093_client.rs` (one control line
-changed: see the file), `xbt-signer/tests/agp096_rollover_signer.rs`, unit tests in `funding.rs`,
+changed: see the file), `xbt-signer/tests/agp096_signer_client.rs`, unit tests in `funding.rs`,
 `signer.rs` and `wire.rs`; B1 `tests/security/test_agp096_client.py` (13).
+
+## Fix wave 5 leftover: a funding the signer made that the client never heard of (AGP-101)
+
+The one Medium that fix wave 5 found and left (AGP-096, "found, not fixed" 1), and two small ones.
+
+**The rule: a funding the signer carried out is always learnable by the client that asked for it,
+and a retry adopts it and never funds twice.** `xbt-signer`'s `fund` records the channel and moves
+the issued key to it before it broadcasts (write-ahead, AGP-063), and funds one channel to an
+origin. A client whose `fund` call got no answer knew no outpoint and could only ask again:
+`bad_key` (the key had left its slot), then `channel_pending` once the client had derived the
+channel again, until the signer's refund at expiry (1,153 blocks with the shipped provider). No
+coin was lost and no seller could be paid. It was the usual case, not a rare one: the two shipped
+signer-backed payers (`xbt-signer-payer`, `xbt-wallet-mcp` with `XBT_MCP_PAYER=local`) wait 180 s
+for a confirmation and answer `funding_unconfirmed`, and with ten-minute blocks about three waits
+in four end that way (e^-0.3).
+
+- **The signer answers.** Socket method `xbt402_funded {origin}`, read-only: `{"funded": {"origin",
+  "chan", "params"}}` for the channel `fund` recorded for that origin and no client has attached
+  (`params`: the funded `ChannelParams`), else `{"funded": null}`. Only a client's channel, and
+  only while it is pending: once attached it may carry signed states, which a client that lost its
+  book cannot take over.
+- **The client asks first.** `StateSigner::funded` (default `None`: a signer that funds nothing),
+  answered by `RemoteSigner`. `Client::ensure_open` asks it on every open that has no outpoint
+  yet, before a key is asked for or a wallet is called (`Client::adopt_funded`), and
+  `RoutePayer` does the same for ch1. The channel on the books takes the outpoint; a client with
+  no record of the channel (a process without a ledger: `xbt-signer-payer` ends at the first
+  error) takes the signer's channel whole, if this call's offer still derives it.
+- **Why the signer and not the wallet.** The client already asked its `Wallet` for a send to the
+  script (`wallet_sends_to`, AGP-045), and `RemoteSigner` could have answered that. But the wallet
+  a payer hands the client is a wrapper that waits for the confirmation, and the wrapper is what
+  loses the answer; a wrapper that forgets to pass two more methods on reopens the hole without a
+  sound. And a client that restarts without a ledger knows no script to ask about. The signer seam
+  is not wrapped, and the question is by origin.
+- **`xbt402_attach` is answered again.** An attach whose answer was lost found the record open
+  and was refused `unknown_channel` for good. The same channel, same params, is answered the same.
+
+Every place:
+
+| place | holds | test |
+|---|---|---|
+| `fund` answered | yes, as before | `control_an_answered_funding_is_opened_as_before` |
+| the payer's wait gave up, retry in the same process, 0, 1, 100 and 144 blocks later | yes | audit `agp096_signer_client.rs::hole_a_funding_the_signer_made_but_the_caller_never_heard_of_is_adopted_by_the_retry` (unchanged); `a_retry_adopts_the_funding_the_signer_made_and_never_funds_twice` |
+| the socket call to `fund` timed out, same retries | yes | same test, `signer_unreachable` |
+| retry before the funding has a confirmation | adopted and bound, refund held; opened by the call after the block | `a_retry_before_the_funding_confirms_holds_the_refund_and_opens_after_the_block` |
+| restart with a ledger (`xbt-wallet-mcp`) | yes | `a_restarted_payer_adopts_the_funding_with_and_without_a_ledger` |
+| restart without a ledger (`xbt-signer-payer`, `XBT_MCP_LEDGER=-`) | yes | same test |
+| a ledger the code before left in the hole (funded channel set aside, another derived) | the funded one is taken back | `a_ledger_from_before_that_had_derived_the_channel_again_goes_on_with_the_funded_one` |
+| `attach` answered, answer lost | yes | `an_attach_whose_answer_was_lost_is_answered_again` |
+| the payer comes back 145 blocks or more after the funding (shipped terms) | not taken up: `open_unresolved`, nothing more funded; a new channel after the signer's refund | `a_funding_found_too_late_for_the_seller_to_open_is_left_to_the_signers_refund` |
+| the seller changed its key after the funding, payer without its record | `open_unresolved`, nothing more funded, refund at expiry | `a_funded_channel_the_seller_no_longer_offers_is_not_adopted_and_nothing_more_is_funded` |
+| the signer does not answer `xbt402_funded` (down, or a signer from before) | the open fails, nothing funded | `a_signer_that_does_not_answer_what_it_funded_funds_nothing` |
+| a second `fund` for the origin on the socket | refused (`bad_key`), one funding | `the_signer_answers_the_channel_it_funded_until_it_is_attached` |
+| the signer's own pay rail (`xbt402_pay`, the MCP tool in signer mode) | already held: the call answers `pending` with the channel, and the next call finishes its open | `control_the_signers_own_pending_channel_is_not_answered_as_a_clients`; `common::Rig::open` in every pay-rail test |
+| routed client, ch1: retry, and a payer without its books | yes | `xbt402/tests/agp093_client.rs::agp101_a_ch1_the_signer_funded_is_adopted_by_the_next_open_and_by_a_payer_without_its_books` (a signer double that funds as `xbt-signer` does; the real signer has no hub rig) |
+| `LocalSigner`, B1 `ChannelSigner` | fund nothing themselves: the wallet does, and is asked for its sends (AGP-045) | not applicable |
+
+(The tests without a path are in `xbt-signer/tests/agp101_funded.rs`.)
+
+Limits:
+- **A funding is taken up only while the seller would still open it.** The provider opens a channel
+  with `minExpiryBlocks` left, and the payer derives it with `closeMarginBlocks` more: with the
+  shipped terms (1,153 against 1,008) a payer that comes back within 144 blocks of the funding,
+  about a day, goes on with it. Later than that the seller refuses the open (`bad_expiry`) whatever
+  the payer does, so the channel is not taken onto the books (`funding::offer_open_floor`): the
+  call fails `open_unresolved`, and the seller can be paid through this signer again once it has
+  refunded the channel at its expiry. That part of the hole cannot be closed from the payer's
+  side; a longer expiry (`--expiry-blocks`, `XBT_MCP_EXPIRY_BLOCKS`, within the signer's policy)
+  widens the day.
+- **A payer that has lost its record of a channel that is already attached cannot take it over.**
+  `xbt402_funded` answers a channel only until it is attached; after that a process without a
+  ledger is refused `channel_open`, as before, until the owner closes the channel
+  (`close_channel`) or it is refunded at expiry. A payer that must survive a restart keeps a
+  ledger.
+- **Payer and signer are upgraded together.** A payer of this version asks `xbt402_funded` on
+  every open; a signer from before answers `unknown method`, and the open fails with nothing
+  funded. It does not fall back to "nothing was funded".
+- A funded channel whose seller changed its key stays locked until its expiry (AGP-090's limit;
+  the call now says so instead of `channel_pending`).
+- Two payers on one signer and one origin were never supported (they are given the same key); the
+  second now adopts the first one's pending channel instead of being refused `channel_pending`.
+
+**The second forged refusal is a limit (the audit's `hole_two_forged_refusals_do_not_end_the_channel`).**
+The test is now `limit_two_forged_refusals_end_the_channel` and asserts what happens: after the
+second charge hidden behind a forged 402 every call is `bad_offer` (nine calls served, seven answers
+held), and the payer closes at what it signed. For the channel to go on the payer must take the
+hidden charge onto its books on an unsigned word. The one small rule that does it (a refused
+request stays among the unanswered ones, at one quote) was run: that test passes and AGP-090's
+`a_provider_that_refuses_every_call_cannot_claim_them` (review M3) fails, because a seller that
+serves nothing and answers every paid request with a 402 is then owed a quote for each. Telling
+the two apart needs a signed refusal, which is a change of the protocol. Whoever can forge an
+answer can also drop every answer, so no rule gives a payer a channel that works through them.
+
+**The routing-fee limit saturates.** `LnPolicy::fee_limit_sats` is the owner's base plus ppm of the
+amount, neither bounded: a product past `i64` was cast to a negative limit, and the sum with the
+base or the amount could panic. Both saturate, and the payment is refused `max_sats`.
+
+Not changed: `Wallet::wallet_sends_to` still answers an empty list both for "no send" and for
+"this wallet cannot list its sends". The fix does not need the two told apart, since the question
+that matters now goes to the signer, which answers or fails.
+
+API for embedders: `StateSigner::funded` (a default method); `funding::offer_open_floor`; the signer
+socket's `xbt402_funded`; `xbt402_attach` of a channel already attached answers the channel.
 
 ## Lightning rail pays BOLT 12 offers (AGP-082)
 

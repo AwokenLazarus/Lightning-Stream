@@ -828,6 +828,7 @@ impl Client {
     /// and no to the open (or an answer lost on the way) left the coins in a script whose only
     /// payer key had been dropped, and every later call funded another channel.
     fn ensure_open(&mut self, origin: &str, acc: &Value) -> Result<()> {
+        self.adopt_funded(origin, acc)?;
         let keyed_now = !self.channels.contains_key(origin);
         if keyed_now {
             self.key_channel(origin, acc)?;
@@ -839,6 +840,77 @@ impl Client {
             self.post_open(origin)?;
         }
         Ok(())
+    }
+
+    /// Before anything is derived or funded for `origin`: the channel the signer itself funded
+    /// for it and no client has attached, if there is one, becomes the origin's channel, with its
+    /// outpoint ([`StateSigner::funded`]). [`fund_keyed`](Self::fund_keyed) then binds it.
+    ///
+    /// The rule (AGP-101): **a funding the signer carried out is always learnable by the client
+    /// that asked for it, and a retry adopts it and never funds twice.** `xbt-signer` records a
+    /// channel and moves its issued key before it broadcasts. A `fund` call that then got no
+    /// answer (the shipped payers wait 180 s for a confirmation and give up, which with ten-minute
+    /// blocks is the usual case; or the socket timed out) left the channel here with no outpoint,
+    /// and the retry asked the signer to fund it again: `bad_key`, then `channel_pending` once it
+    /// was derived again, until the refund at expiry. So the signer is asked first, on every open
+    /// that has no outpoint yet:
+    /// - the channel on the books: it takes the outpoint;
+    /// - another script of this origin (the book was lost with a process that had no ledger, or a
+    ///   ledger from before this rule had already derived the channel again): the signer's channel
+    ///   replaces it, if this call's offer still derives it. If it does not (the seller changed
+    ///   its key since), the call fails `open_unresolved` and nothing is funded: the signer funds
+    ///   no second channel to an origin, and refunds this one at its expiry.
+    ///
+    /// - too near its expiry for the seller to open
+    ///   ([`offer_open_floor`](crate::funding::offer_open_floor); the payer came back more than
+    ///   `closeMarginBlocks` after the funding): not taken up, `open_unresolved`, until the signer
+    ///   has refunded it. The call after that funds a new channel.
+    ///
+    /// The coins left on an earlier day, so the budget counts them and refuses nothing here.
+    fn adopt_funded(&mut self, origin: &str, acc: &Value) -> Result<()> {
+        let Some(signer) = self.signer.clone() else { return Ok(()) };
+        let have = self.channels.get(origin);
+        if have.is_some_and(|c| c.stage != Stage::Keyed || c.payer.params.funding.is_some()) {
+            return Ok(());
+        }
+        let named = have.map_or(origin, |c| c.origin.as_str()).to_string();
+        let Some(f) = signer.funded(&named)? else { return Ok(()) };
+        let (txid, vout, cap) = (f.funding_txid(), f.funding_vout(), f.capacity);
+        let ex = acc.get("extra").cloned().unwrap_or(Value::Null);
+        if (f.expiry as u64) < ((self.height)()? as u64).saturating_add(crate::funding::offer_open_floor(&ex)?) {
+            // not taken up: the seller would refuse its open on every call, and on the books it
+            // would stand in the way after the refund too
+            return fail("open_unresolved", format!("the signer funded channel {} to {origin} and it is too near its expiry ({}) for the seller to open: nothing more \
+                                                    is funded until the signer has refunded it, and the next call after that opens a new channel", f.channel_id(), f.expiry));
+        }
+        if have.is_some_and(|c| c.payer.params.clone().with_funding(&txid, vout, cap).is_ok_and(|p| p == f)) {
+            let ch = self.channels.get_mut(origin).ok_or_else(|| ChannelError::code("no_channel"))?;
+            (ch.payer.params, ch.fund_tried) = (f, true);
+        } else {
+            let offered = || -> Result<bool> {
+                let fee_payer = FeePayer::parse(ex.get("closeFeePayer").and_then(Value::as_str).unwrap_or("payer"))?;
+                let pay_to = hex::decode(acc.get("payTo").and_then(Value::as_str).unwrap_or("")).map_err(|_| ChannelError::new("bad_offer", "payTo"))?;
+                let now = ChannelParams::derive(&pay_to, &f.payer_pub, f.expiry, ex_u64(&ex, "closeFeeSat")?, Some(f.payer_spk.clone()), &self.cfg.network, fee_payer)?;
+                let caps = ex_u64(&ex, "minCapacity")?..=py_u64(ex.get("maxCapacity")).unwrap_or(u64::MAX);
+                Ok(now.with_funding(&txid, vout, cap)? == f && caps.contains(&cap))
+            };
+            if !offered()? {
+                return fail("open_unresolved", format!("the signer funded channel {} to {origin} and the seller no longer offers its terms: nothing more is funded, \
+                                                        and the signer refunds it at its expiry ({})", f.channel_id(), f.expiry));
+            }
+            // a channel derived since holds no coins (the signer funds one channel to an origin)
+            self.set_aside(origin)?;
+            if let Some(kept) = self.unfunded.get_mut(origin) {
+                kept.retain(|c| c.payer.params.spk() != f.spk());
+            }
+            let price = py_u64(acc.get("amount")).unwrap_or(0);
+            self.channels.insert(origin.into(), ClientChannel { payer: Payer::with_backend(f, signer), origin: named, accepted: acc.clone(), refund_hex: String::new(),
+                                                                auth_key: [0u8; 32], price, slack_msat: 0, seq: 0, spent_msat: 0, last_sig: String::new(),
+                                                                pending_cond: None, acked_cum: 0, receipts: vec![], stage: Stage::Keyed, unanswered_msat: 0,
+                                                                rolled_from: None, fund_tried: true });
+        }
+        self.opened_sats = self.opened_sats.saturating_add(cap);
+        self.persist(Some(origin))
     }
 
     /// Terms, a key and the preflight for a new channel to `origin`, saved before anything is

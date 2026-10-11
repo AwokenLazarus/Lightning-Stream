@@ -538,16 +538,28 @@ fn hole_two_crashes_after_a_request_left_do_not_end_the_channel() {
             after[1], w.prov().channel_state(&chan).unwrap().spent_msat, c.channels[O].spent_msat);
 }
 
-/// HOLE (Low, the remainder of the audit's item 9 for someone between payer and provider). A 402
-/// is unsigned, and the client takes one as the provider's word that the request was not charged
-/// (`refused`, `client.rs:1115`). Whoever sits between lets the provider serve a paid request and
-/// answers the payer with a bare 402 instead: the charge is real and the payer has taken its
-/// quote off the books. The channel's one call of slack absorbs that once (the payer pays for an
-/// answer it never saw); the second time every call is `bad_offer`, for good.
+/// LIMIT (Low; the audit wrote it as `hole_two_forged_refusals_do_not_end_the_channel`, AGP-096
+/// judged it a limit, and AGP-101 decided so: the name and the last assertion are turned round,
+/// nothing else is changed). A 402 is unsigned, and the client takes one as the provider's word
+/// that the request was not charged (`Client::refused`). Whoever sits between lets the provider
+/// serve a paid request and answers the payer with a bare 402 instead: the charge is real and the
+/// payer has taken its quote off the books. The channel's one call of slack absorbs that once
+/// (the payer pays for an answer it never saw); the second time every call is `bad_offer`, and
+/// the payer closes the channel at what it signed
+/// (`agp096_client.rs::limit_after_a_second_forged_refusal_the_channel_is_closed_at_what_the_payer_signed`).
+///
+/// Why no rule fixes it. For the channel to go on, the payer must take the hidden charge onto its
+/// books on an unsigned word. The one small rule that does it (a refused request stays among the
+/// unanswered ones, at one quote) was run: this test then passes, and AGP-090's
+/// `a_provider_that_refuses_every_call_cannot_claim_them` (review M3) fails, because a seller that
+/// serves nothing and answers every paid request with a 402 is then owed a quote for each. The
+/// payer cannot tell that seller from the one this test wrongs. Telling them apart needs a signed
+/// refusal, which is a change of the protocol. And whoever can forge an answer can also drop
+/// every answer, so no rule here gives a payer a channel that works through them.
 // (AGP-094: a lint the audit's file carried; allowed here so that `clippy -D warnings` passes)
 #[allow(clippy::manual_contains)]
 #[test]
-fn hole_two_forged_refusals_do_not_end_the_channel() {
+fn limit_two_forged_refusals_end_the_channel() {
     let w = world("forged-402");
     let forge = Arc::new(AtomicUsize::new(0));
     let f2 = forge.clone();
@@ -576,8 +588,9 @@ fn hole_two_forged_refusals_do_not_end_the_channel() {
     let out: Vec<_> = (0..12).map(|_| get(&mut c)).collect();
     let charged = w.prov().channel_state(&chan).unwrap().spent_msat / (PRICE * 1000);
     let kept = c.channels[O].receipts.len();
-    assert!(out[1..].contains(&Ok(200)), "after a second forged refusal no call succeeds: {out:?}; the provider charged {charged} calls, \
-                                                      the payer kept {kept} answers");
+    assert!(out[1..].iter().all(|o| *o == Err("bad_offer".into())), "after a second forged refusal a call got another answer: {out:?}; the provider charged \
+                                                                       {charged} calls, the payer kept {kept} answers");
+    assert_eq!((charged, kept), (9, 7), "the provider served nine calls and the payer holds seven answers: one unseen call each time");
 }
 
 // --- Part B: one next key per rollover ---------------------------------------------------------
@@ -1142,4 +1155,112 @@ fn agp094_a_keyed_ch1_too_old_to_fund_is_refused_until_it_is_forgotten() {
     *r.w.chain.tip.lock().unwrap() -= 8_000 - 400;
     pay.open().unwrap();
     assert_eq!(r.w.funded(), 1);
+}
+
+// --- AGP-101: a ch1 funding the signer made and the payer never heard of ----------------------------------------
+
+/// A signer that funds, as `xbt-signer` does over its socket (the real one is run with the
+/// library client in `xbt-signer/tests/agp101_funded.rs`; it has no hub rig). Keys and signatures
+/// are a `LocalSigner`'s. Its `fund_channel` records the channel before it sends, funds one channel
+/// to an origin (`channel_pending` for a second) and answers that channel by origin until it is
+/// attached. `lose`: the next funding is sent and its answer is lost.
+struct Funds {
+    keys: LocalSigner,
+    wallet: Shared,
+    pending: Mutex<HashMap<String, xbt402::channel::ChannelParams>>,
+    lose: AtomicBool,
+}
+
+impl Wallet for Funds {
+    fn fund(&self, _: &str, _: u64) -> Result<(String, u32)> {
+        Err(ChannelError::new("fund_unbound", "this signer funds only a channel for a key it issued"))
+    }
+    fn fund_channel(&self, origin: &str, params: &xbt402::channel::ChannelParams, address: &str, sats: u64) -> Result<(String, u32)> {
+        if self.pending.lock().unwrap().contains_key(origin) {
+            return Err(ChannelError::new("channel_pending", format!("{origin} already has a pending channel")));
+        }
+        let (txid, vout) = self.wallet.fund(address, sats)?;
+        self.pending.lock().unwrap().insert(origin.into(), params.clone().with_funding(&txid, vout, sats)?);
+        if self.lose.swap(false, Ordering::SeqCst) {
+            return Err(ChannelError::new("funding_unconfirmed", "the funding did not confirm in time"));
+        }
+        Ok((txid, vout))
+    }
+}
+
+impl xbt402::signer::StateSigner for Funds {
+    fn new_key(&self, o: &str) -> Result<xbt_primitives::ecdsa::PubkeyBytes> {
+        self.keys.new_key(o)
+    }
+    fn attach(&self, o: &str, p: &xbt402::channel::ChannelParams) -> Result<String> {
+        let chan = self.keys.attach(o, p)?;
+        self.pending.lock().unwrap().remove(o);
+        Ok(chan)
+    }
+    fn funded(&self, o: &str) -> Result<Option<xbt402::channel::ChannelParams>> {
+        Ok(self.pending.lock().unwrap().get(o).cloned())
+    }
+    fn sign_state(&self, c: &str, a: u64) -> Result<Vec<u8>> {
+        self.keys.sign_state(c, a)
+    }
+    fn sign_state_a3(&self, c: &str, a: u64) -> Result<Vec<u8>> {
+        self.keys.sign_state_a3(c, a)
+    }
+    fn sign_rollover(&self, c: &str, a: u64, n: &[u8], cap: u64) -> Result<Vec<u8>> {
+        self.keys.sign_rollover(c, a, n, cap)
+    }
+    fn sign_close(&self, c: &str) -> Result<Vec<u8>> {
+        self.keys.sign_close(c)
+    }
+    fn sign_refund(&self, c: &str) -> Result<String> {
+        self.keys.sign_refund(c)
+    }
+    fn request_auth(&self, c: &str, seq: Option<&Value>, cum: Option<&Value>, sig: Option<&str>, req: &str) -> Result<String> {
+        self.keys.request_auth(c, seq, cum, sig, req)
+    }
+    fn sign_conditional(&self, c: &str, u: u64, cond: &xbt402::conditional::ConditionalParams) -> Result<Vec<u8>> {
+        self.keys.sign_conditional(c, u, cond)
+    }
+}
+
+impl RouteSigner for Funds {
+    fn sign_state_adaptor(&self, c: &str, cum: u64, point: &xbt_primitives::ecdsa::PubkeyBytes, route: &Value) -> Result<xbt402::signer::AdaptorLock> {
+        self.keys.sign_state_adaptor(c, cum, point, route)
+    }
+    fn resolve_lock(&self, c: &str, s: &[u8; 32]) -> Result<[u8; 32]> {
+        self.keys.resolve_lock(c, s)
+    }
+    fn void_lock(&self, c: &str) -> Result<bool> {
+        self.keys.void_lock(c)
+    }
+    fn adopt_lock(&self, c: &str, cum: u64) -> Result<()> {
+        self.keys.adopt_lock(c, cum)
+    }
+    fn recover_lock(&self, c: &str, close: &Tx) -> Result<[u8; 32]> {
+        self.keys.recover_lock(c, close)
+    }
+}
+
+/// The routed client's side of AGP-101's rule: a funding the signer carried out is learnable by
+/// the payer that asked for it, and the next `open` adopts it and funds nothing more. The answer
+/// to ch1's funding is lost; the same payer opens again, and so does a new process that has no
+/// ledger and so no record of ch1 at all. Both were refused `channel_pending` until the refund.
+#[test]
+fn agp101_a_ch1_the_signer_funded_is_adopted_by_the_next_open_and_by_a_payer_without_its_books() {
+    for restart in [false, true] {
+        let r = routed(if restart { "route-signer-funded-r" } else { "route-signer-funded" });
+        let signer = Arc::new(Funds { keys: LocalSigner::new(), wallet: Shared(r.w.wallet.clone()), pending: Mutex::new(HashMap::new()), lose: AtomicBool::new(true) });
+        let mut pay = r.payer_with(signer.clone(), signer.clone());
+        assert_eq!(pay.open().unwrap_err().code, "funding_unconfirmed");
+        let funded = signer.pending.lock().unwrap()[HUB].clone();
+        assert_eq!((r.w.funded(), pay.chan()), (1, None), "control: the signer funded ch1 and the payer knows no outpoint");
+        if restart {
+            pay = r.payer_with(signer.clone(), signer.clone());
+        }
+        let out = pay.open().unwrap_or_else(|e| panic!("restart {restart}: {} {}", e.code, e.msg));
+        assert_eq!((r.w.funded(), out["chan"].as_str(), pay.chan()), (1, Some(funded.channel_id().as_str()), Some(funded.channel_id())), "restart {restart}");
+        assert!(signer.pending.lock().unwrap().is_empty(), "attached");
+        pay.open().unwrap();
+        assert_eq!(r.w.funded(), 1);
+    }
 }

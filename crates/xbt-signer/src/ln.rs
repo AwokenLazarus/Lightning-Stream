@@ -155,9 +155,12 @@ impl LnPolicy {
         }
     }
 
-    /// The routing-fee limit for an amount: base + ppm, rounded up.
+    /// The routing-fee limit for an amount: base + ppm, rounded up. Saturating (AGP-101): both
+    /// numbers are the owner's, and a limit that does not fit is the largest one, which the
+    /// caller's sum with the amount then refuses. (It wrapped to a negative limit, or panicked.)
     pub fn fee_limit_sats(&self, amount_sats: i64) -> i64 {
-        self.max_fee_base_sats.max(0) + ((amount_sats.max(0) as u128 * self.max_fee_ppm.max(0) as u128).div_ceil(1_000_000)) as i64
+        let ppm = (amount_sats.max(0) as u128 * self.max_fee_ppm.max(0) as u128).div_ceil(1_000_000);
+        self.max_fee_base_sats.max(0).saturating_add(i64::try_from(ppm).unwrap_or(i64::MAX))
     }
 
     /// `(anchor height, pinned hash)` on this chain. Mainnet always pins 961,640; elsewhere the policy
@@ -1271,7 +1274,8 @@ impl Signer {
         }
         let amount = inv.amount_sats_ceil().unwrap_or(0) as i64;
         let fee_limit = pol.fee_limit_sats(amount);
-        let total = amount + fee_limit;
+        // saturating, as the offer rail's: the fee limit is the owner's base and ppm, unbounded (AGP-101)
+        let total = amount.saturating_add(fee_limit);
         if total > max_sats {
             return self.ln_refuse("max_sats", &format!("invoice {amount} + fee limit {fee_limit} = {total} sats is above max_sats {max_sats}"),
                                   &dest, &hash);

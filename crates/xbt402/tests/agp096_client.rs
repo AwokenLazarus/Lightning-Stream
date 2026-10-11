@@ -714,7 +714,8 @@ fn a_csv_delta_that_does_not_fit_is_refused_before_anything_is_signed() {
 
 // --- item 18, written down: a refusal is unsigned ----------------------------------------------------
 
-/// LIMIT (the audit's `hole_two_forged_refusals_do_not_end_the_channel`, which still fails). A 402
+/// LIMIT (the audit's `hole_two_forged_refusals_do_not_end_the_channel`, since AGP-101
+/// `limit_two_forged_refusals_end_the_channel` in `agp093_client.rs`, with the reason). A 402
 /// is not signed, so the payer cannot tell a refusal the provider sent from one that whoever sits
 /// between put in place of an answer the provider served and charged. It gives the provider one
 /// call of doubt in a channel's life; at the second, every call fails `bad_offer`. The numbers:

@@ -502,6 +502,8 @@ impl Signer {
                 let _g = self.lock();
                 sanitize(self.attach(p))
             }
+            // read-only: what `fund` did for this origin, for the client that asked and never heard
+            "xbt402_funded" => sanitize(self.funded(p)?),
             "xbt402_sign_close" => match self.book.find_dest(&s("chan")) {
                 None => deny("unknown_channel", format!("no channel for {}", s("chan"))),
                 Some(d) => {
@@ -1321,6 +1323,31 @@ impl Signer {
         Ok(json!({"txid": prep.txid, "vout": 0, "sats": sats, "sighash": "0x21", "chan": funded.channel_id()}))
     }
 
+    /// `xbt402_funded` (AGP-101): the channel [`fund`](Self::fund_client_channel) funded for the key
+    /// issued for `origin` and that no client has attached yet, with its outpoint, or null.
+    ///
+    /// The rule: **a funding this signer carried out is always learnable by the client that asked
+    /// for it.** `fund` records the channel and moves the issued key to it before it broadcasts, so
+    /// from that write on the signer answers no second `fund` for the origin (`bad_key`, then
+    /// `channel_pending`). A client whose `fund` call got no answer (the socket timed out, or its
+    /// own wait for a confirmation gave up) knew no outpoint and could only ask again: the seller
+    /// could not be paid through this signer until the refund at expiry. The answer is by origin,
+    /// not by script, so a client that has lost its own record of the channel can ask too.
+    ///
+    /// Only a client's channel still pending: once attached it may carry signed states, which a
+    /// client that lost its book cannot take over.
+    fn funded(&self, p: &Value) -> Result<Value> {
+        let origin = str_or_empty(p.get("origin"));
+        if origin.is_empty() {
+            return Ok(deny("dest", "origin required"));
+        }
+        let rec = self.book.get(&normalize_dest(&origin)).filter(|r| r.state == "pending" && r.open_url.is_empty() && !r.origin.is_empty());
+        Ok(match rec {
+            Some(r) => json!({"funded": {"origin": r.origin, "chan": r.chan, "params": r.params()?.to_json()}}),
+            None => json!({"funded": null}),
+        })
+    }
+
     /// B2's error → deny mapping for `xbt402_pay`.
     fn pay_deny(&self, e: &crate::Error) -> Value {
         match e.code.as_str() {
@@ -1580,7 +1607,9 @@ impl Signer {
         let base = origin.strip_suffix("/next").unwrap_or(&origin).to_string();
         let dest = normalize_dest(&base);
         if base == origin {
-            let Some(rec) = self.book.get(&dest).filter(|r| r.state == "pending" && r.chan == params.channel_id()) else {
+            // AGP-101: an attach whose answer was lost is asked again, and answered the same (the
+            // record is open by then; it was refused `unknown_channel`, for good)
+            let Some(rec) = self.book.get(&dest).filter(|r| (r.state == "pending" || r.state == "open") && r.chan == params.channel_id()) else {
                 return deny("unknown_channel", "attach only a channel this signer funded (fund) or rolled over (xbt402_sign_rollover)");
             };
             if rec.params().ok().as_ref() != Some(&params) {

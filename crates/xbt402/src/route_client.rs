@@ -578,18 +578,38 @@ impl RoutePayer {
         if cap > py_u64(ex.get("maxCapacity")).unwrap_or(cap) {
             return fail("budget", "channel capacity outside the hub's range");
         }
-        let pubk = self.signer.new_key(&self.hub_url)?;
-        let payer_spk = self.signer.payer_spk()?;
-        // held to the owner's bound (its own wish, or eight weeks): the hub's offer does not set how
-        // long ch1 locks the coins (AGP-090)
-        let want = self.cfg.expiry_blocks as u64;
-        let blocks = crate::funding::offer_expiry_blocks(&ex, want, want.max(crate::funding::OWNER_MAX_HUB_EXPIRY_BLOCKS))?;
-        let expiry = (self.height)()?.checked_add(u32::try_from(blocks).map_err(|_| ChannelError::new("bad_offer", "expiry blocks"))?)
-            .ok_or_else(|| ChannelError::new("bad_offer", "expiry blocks"))?;
         let pay_to = hex::decode(py_str(acc.get("payTo"))).map_err(|_| ChannelError::new("bad_offer", "payTo"))?;
-        let mut p = ChannelParams::derive(&pay_to, &pubk, expiry, py_u64(ex.get("closeFeeSat")).unwrap_or(0), payer_spk, &self.cfg.network, fee_payer)?;
-        p.capacity = cap;
-        self.preflight(&p, &acc)?;
+        let close_fee = py_u64(ex.get("closeFeeSat")).unwrap_or(0);
+        // AGP-101 ([`StateSigner::funded`](crate::signer::StateSigner::funded)): a ch1 the signer
+        // funded for this hub and nobody attached (an earlier `fund` call that got no answer, in a
+        // process whose books are gone) is this payer's ch1, if the hub's offer still derives it.
+        // The signer funds no second channel to an origin, so nothing else could be opened.
+        let p = match self.signer.funded(&self.hub_url)? {
+            Some(f) => {
+                let now = ChannelParams::derive(&pay_to, &f.payer_pub, f.expiry, close_fee, Some(f.payer_spk.clone()), &self.cfg.network, fee_payer)?
+                    .with_funding(&f.funding_txid(), f.funding_vout(), f.capacity)?;
+                if now != f || f.capacity > py_u64(ex.get("maxCapacity")).unwrap_or(f.capacity) || f.capacity < py_u64(ex.get("minCapacity")).unwrap_or(0) {
+                    return fail("open_unresolved", format!("the signer funded channel {} to this hub and the hub no longer offers its terms: nothing more is \
+                                                            funded, and the signer refunds it at its expiry ({})", f.channel_id(), f.expiry));
+                }
+                self.openable(&f, &ex)?;
+                f
+            }
+            None => {
+                let pubk = self.signer.new_key(&self.hub_url)?;
+                let payer_spk = self.signer.payer_spk()?;
+                // held to the owner's bound (its own wish, or eight weeks): the hub's offer does not
+                // set how long ch1 locks the coins (AGP-090)
+                let want = self.cfg.expiry_blocks as u64;
+                let blocks = crate::funding::offer_expiry_blocks(&ex, want, want.max(crate::funding::OWNER_MAX_HUB_EXPIRY_BLOCKS))?;
+                let expiry = (self.height)()?.checked_add(u32::try_from(blocks).map_err(|_| ChannelError::new("bad_offer", "expiry blocks"))?)
+                    .ok_or_else(|| ChannelError::new("bad_offer", "expiry blocks"))?;
+                let mut p = ChannelParams::derive(&pay_to, &pubk, expiry, close_fee, payer_spk, &self.cfg.network, fee_payer)?;
+                p.capacity = cap;
+                self.preflight(&p, &acc)?;
+                p
+            }
+        };
         let recs = {
             let mut st = lk(&self.st);
             st.ch = Some(Ch1 { params: p, accepted: acc, seq: 0, opened: false, attached: false });
@@ -614,9 +634,19 @@ impl RoutePayer {
         if p.funding.is_none() {
             let hrp = if self.cfg.network == XBT_MAINNET { "bc" } else { "bcrt" };
             let addr = segwit_address(hrp, &p.spk())?;
-            // an earlier fund call may have failed after it broadcast: the wallet's own record of a
-            // send to this script is used before anything is sent again
-            let (txid, vout) = match self.wallet_send_to(&addr, p.capacity)? {
+            // An earlier fund call may have failed after it broadcast: the signer's own record of
+            // the channel it funded for this hub (AGP-101), else the wallet's record of a send to
+            // this script, is used before anything is sent again.
+            let by_signer = self.signer.funded(&self.hub_url)?.filter(|f| p.clone().with_funding(&f.funding_txid(), f.funding_vout(), p.capacity).is_ok_and(|w| w == *f));
+            if let Some(f) = &by_signer {
+                self.openable(f, acc.get("extra").unwrap_or(&Value::Null))?;
+            }
+            let by_signer = by_signer.map(|f| (f.funding_txid(), f.funding_vout()));
+            let known = match by_signer {
+                Some(o) => Some(o),
+                None => self.wallet_send_to(&addr, p.capacity)?,
+            };
+            let (txid, vout) = match known {
                 Some(o) => o,
                 None => {
                     let ex = acc.get("extra").cloned().unwrap_or(Value::Null);
@@ -666,6 +696,17 @@ impl RoutePayer {
             }
         }
         Ok(None)
+    }
+
+    /// A ch1 the signer funded (`f`) is taken up only while the hub would still open it
+    /// ([`offer_open_floor`](crate::funding::offer_open_floor), AGP-101). Nearer its expiry it is
+    /// left to the signer's refund: on the books it would be refused on every open.
+    fn openable(&self, f: &ChannelParams, ex: &Value) -> Result<()> {
+        if (f.expiry as u64) < ((self.height)()? as u64).saturating_add(crate::funding::offer_open_floor(ex)?) {
+            return fail("open_unresolved", format!("the signer funded channel {} to this hub and it is too near its expiry ({}) for the hub to open: nothing more \
+                                                    is funded until the signer has refunded it", f.channel_id(), f.expiry));
+        }
+        Ok(())
     }
 
     /// Drop a ch1 that was recorded and never funded (its key goes with it). Call it only when

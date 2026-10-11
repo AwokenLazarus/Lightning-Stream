@@ -100,6 +100,23 @@ impl StateSigner for RemoteSigner {
         Ok(Some(hex_field(&self.call("hot_address", json!({}))?, "hot_spk")?))
     }
 
+    /// The signer's `xbt402_funded`. An answer that does not say (an older signer has no such
+    /// method) is an error, never "nothing funded": the caller would fund again.
+    fn funded(&self, origin: &str) -> xbt402::Result<Option<ChannelParams>> {
+        let v = self.call("xbt402_funded", json!({"origin": origin}))?;
+        match v.get("funded") {
+            Some(Value::Null) => Ok(None),
+            Some(f) => {
+                let p = ChannelParams::from_json(f.get("params").unwrap_or(&Value::Null))?;
+                if p.funding.is_none() {
+                    return Err(err("signer_error", "the signer's funded channel has no outpoint"));
+                }
+                Ok(Some(p))
+            }
+            None => Err(err("signer_error", "no funded in the signer's answer")),
+        }
+    }
+
     fn sign_state(&self, chan: &str, amount: u64) -> xbt402::Result<Vec<u8>> {
         hex_field(&self.call("xbt402_sign_state", json!({"chan": chan, "cum": amount}))?, "sig")
     }
