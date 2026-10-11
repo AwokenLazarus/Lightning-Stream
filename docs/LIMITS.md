@@ -477,6 +477,14 @@ script prints them as `FAIL (open item)` with what it observed, and goes on.
   sat and the wallet funds a channel of that capacity; the provider's built-in maximum is
   10,000,000 sat, so the open is refused, before anything is funded. The example policy sets
   100,000 sat and is not affected. Set the cap in your policy.
+- **With the wallet MCP's `local` payer, a seller's refusal text reaches the agent as the wallet's
+  own `reason`** (`open: AGP-111 item 3`; `scripts/failure_interop.sh`, check E2.4). When a seller
+  refuses an open (or any request the library client posts) with an error and a `detail`, the
+  tool result is `{"verdict": "deny", "rule": <the seller's code, if it is a plain one>, "reason":
+  <the seller's detail, verbatim>}`: text the seller chose, outside
+  `untrusted_provider_response`, where an agent reads it as its wallet speaking. The signer's own
+  rail (the default payer) reports its own words there and no seller text. Use the default payer
+  where the agent must not be steered by a seller.
 
 ## Not reviewed by anyone
 
