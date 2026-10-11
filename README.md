@@ -994,8 +994,10 @@ signed, and a `charged` that is neither negative nor above the quote. A bad rece
 what is booked. Since AGP-089 the receipt must also carry the `seq` of this request, an answer below
 400 without a good receipt is refused (`deny/bad_receipt`, its body is not handed on), and a state
 counts as arrived only on such a receipt (anything else leaves it unacked: the next call sends the same
-state again). An error answer's bad receipt is still reported as `receipt_error`. The answer also
-carries `booked_sats`.
+state again). Since AGP-095 that next call signs one new state when the seller answers the state sent
+again with a 402 that names it (`insufficient_payment`, this channel, this `cum`, this `seq`): see
+"Fix wave 5, agent wallets" below. An error answer's bad receipt is still reported as
+`receipt_error`. The answer also carries `booked_sats`.
 - **When it books.** The `pay` channel rail, `sign_state`, `xbt402_sign_state_a3`, the rollover and
   `xbt402_sign_conditional` book before they sign, and take the row out again if signing fails.
   `xbt402_pay` books after the state is persisted and before it is sent; a crash in between is
@@ -1228,6 +1230,55 @@ AGP-068 tests in `lifecycle.rs` (`a_payment_is_bound_to_one_request_and_one_orig
 `concurrent_calls_get_the_numbers_of_their_own_reservation`,
   `a_seq_spent_on_a_refusal_survives_a_restart`, `the_receipt_covers_the_response`,
 `an_altered_conditional_answer_keeps_the_hash_lock`).
+
+## Fix wave 5, agent wallets (AGP-095)
+
+The third closure audit (AGP-093) left eight items in the wallets. Each is one rule; the tests are
+`crates/xbt-signer/tests/agp093_wallet_rs.rs`, `agp093_ln.rs` (the audit's) and `agp095_wallet.rs`,
+and B2's `tests/test_agp093_wallet_b2.py` and `test_agp095_wallet_b2.py`.
+
+- **One call signs at most one new state, and only when the seller holds the last one** (`pay_once`).
+  A state without a receipt is sent again and nothing higher is signed. A seller that served a call
+  whose answer was lost has charged it, so the state sent again no longer pays for the next call and
+  the channel stopped for good. Now, when the seller answers that state with a 402 naming it
+  (`insufficient_payment`, this channel, this `cum`, this `seq`), the call signs one new state of
+  the quoted price, inside its `max_sats` and booked before it leaves, and sends the request once
+  more. The 402 is not a receipt and acks nothing. Limit: the 402 is unsigned, so whoever sits
+  between the wallet and the seller can write one; what it buys is one state of one price per
+  `xbt402_pay` the agent makes, which the budgets count.
+- **How long a channel lasts is the owner's number at both ends** (`open_from_offer`). An offer's
+  window is refused before funding when it lets the channel last less than the offer's own floor
+  (`minExpiryBlocks + minConf + closeMarginBlocks`), no longer than `refund_margin_blocks`, or less
+  than 144 blocks (or the policy's `channel_expiry_blocks` when that is lower). A negative price is
+  refused as an offer. The socket's `open_channel`, `fund` and `xbt402_sign_rollover` already
+  refused an expiry inside the refund margin.
+- **A next-channel slot is taken by a signature, never by a request** (`xbt402_sign_rollover`). The
+  key and terms of a rollover's next channel are stored by the signing itself, after the policy and
+  the book have decided, in the write that precedes the signature.
+- **A channel this signer's signature funded gets a record and the refund at its expiry.** The
+  watcher adopts the next channel of a signed rollover once that rollover is in a block, whoever
+  broadcast it (`rollover_adopted`), with the terms checked when it was signed. `xbt402_attach`
+  afterwards answers the same channel.
+- **A channel leaves the refund watch only when our node shows its funding spent in a block**
+  (`funding_spend`). A close seen only in the mempool is closed but not proven (`close_proven:
+  false`): the record stays with the watcher, is not replaced by a new channel, is proven by the
+  block, and is refunded at expiry if that transaction leaves the mempool unmined. The refund
+  itself answers `close_unconfirmed` while such a close is in the mempool. Limit: `xbt402_attach`
+  still takes a rollover that is only in the mempool (a client attaches as soon as the seller
+  answers); if that rollover is then never mined, the channel it would have spent is no longer
+  watched and its refund is a manual one with the key the signer still holds.
+- **A used human signature stays used by the highest clock its file has seen.** `human_sigs.json`
+  carries `clock`; an entry leaves only when its expiry is behind it, and a message whose expiry is
+  behind it is refused (`expired`), used or not. Limit: a missing file is an empty one, because
+  whoever can delete it can write an empty one.
+- **A panic in one step of a watcher tick ends that step of that tick.** Each step is guarded and
+  reported (`watcher_panic`), the later steps run, and the thread ends only when the signer stops.
+  Under `panic = "abort"` (`release-small`) no panic can be caught: the process ends and its
+  supervisor restarts it.
+- Checked arithmetic on the socket's `open_channel` (`cap_sats + close_fee`, the expiry height),
+  `xbt402_sign_conditional`'s `csv_delta`, a BOLT 11 amount, and the Lightning node's amounts
+  (`paid_msat`, `htlc_locks`, the exposure sum): a number that does not fit is refused or counts as
+  the most there is, never a panic.
 
 ## Channel findings C1–C5 (AGP-067, external review)
 

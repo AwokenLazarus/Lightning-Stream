@@ -373,6 +373,9 @@ fn w3_a_close_the_chain_never_saw_is_refunded_at_expiry() {
 
 /// The honest case: the provider's close is on our node, so the channel is closed and proven, and
 /// the next call opens a new channel.
+///
+/// AGP-095 changed what this asserts: the close was called proven while it was only in our node's
+/// mempool (the third audit's item 17). It is proven once it is in a block, one tick later.
 #[test]
 fn w3_a_close_on_chain_is_proven_and_the_channel_is_replaced() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
@@ -380,9 +383,10 @@ fn w3_a_close_on_chain_is_proven_and_the_channel_is_replaced() {
     rig.fund_hot(1, 30_000);
     let chan = rig.open()["chan"].as_str().unwrap().to_string();
     let c = rig.call("close_channel", json!({"counterparty": PROVIDER}));
-    assert_eq!((c["verdict"].as_str(), c["close_proven"].as_bool()), (Some("allow"), Some(true)), "{c}");
+    assert_eq!((c["verdict"].as_str(), c["close_proven"].as_bool()), (Some("allow"), Some(false)), "in the mempool only: {c}");
     rig.chain.mine(1);
-    rig.s.watch_tick();
+    let acts = rig.s.watch_tick();
+    assert!(acts.iter().any(|a| a.get("close_proven").is_some()), "proven by the block: {acts:?}");
     let r = rig.pay();
     assert_eq!(r["verdict"], "pending", "a new channel is funded: {r}");
     assert_ne!(r["chan"].as_str(), Some(chan.as_str()));

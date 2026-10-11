@@ -42,9 +42,19 @@ pub const USED_SIGS_FILE: &str = "human_sigs.json";
 /// Every message the human signs carries an expiry and no nonce, so until now whoever held a
 /// signature could run its operation again until it expired (a second sweep, a second export). The
 /// message's hash is written here, fsynced, before its operation runs, and a message found here is
-/// refused. Entries leave when their expiry has passed (the expiry check refuses them from then
-/// on). Keyed by the message, not the signature bytes, so another encoding of a signature is the
-/// same entry. A file that cannot be read refuses the operation: it is never taken for empty.
+/// refused. Keyed by the message, not the signature bytes, so another encoding of a signature is
+/// the same entry. A file that cannot be read refuses the operation: it is never taken for empty.
+///
+/// AGP-095 (audit item 16): **an entry leaves only when its expiry is behind the highest clock
+/// this file has seen, and a message whose expiry is behind that clock is refused.** Entries were
+/// dropped by the wall clock alone, so after a step back (a wrong RTC at boot, an NTP correction)
+/// a used and pruned signature was inside its window again and ran a second time. The highest
+/// clock is written with every use (`clock`), in the same write that prunes.
+///
+/// Limit, not fixed: a file that is missing is an empty one. Whoever can delete it can also write
+/// an empty one, so refusing a missing file would only stop an accident (a run directory restored
+/// from before a signature was used), and the note that "this wallet has used signatures" would
+/// have to live in that same directory.
 pub struct UsedSigs {
     path: std::path::PathBuf,
     lock: std::sync::Mutex<()>,
@@ -55,22 +65,35 @@ impl UsedSigs {
         Self { path: path.into(), lock: std::sync::Mutex::new(()) }
     }
 
-    /// Record `msg` as used. `false`: it was used before.
+    /// Record `msg` as used. `false`: it was used before. An error with code `expired`: its expiry
+    /// is behind the highest clock this file has seen (it may be a used entry that was pruned).
     pub fn spend(&self, msg: &[u8], expiry: i64, now: i64) -> Result<bool> {
         let _g = self.lock.lock().unwrap_or_else(|p| p.into_inner());
-        let mut used: Map<String, Value> = match std::fs::read_to_string(&self.path) {
-            Ok(t) => serde_json::from_str::<Value>(&t).ok().and_then(|v| v.get("used").and_then(Value::as_object).cloned())
-                .ok_or_else(|| err("human_sig", format!("{}: unreadable, so no human-signed operation runs", self.path.display())))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Map::new(),
+        let unreadable = || err("human_sig", format!("{}: unreadable, so no human-signed operation runs", self.path.display()));
+        let (mut used, seen): (Map<String, Value>, i64) = match std::fs::read_to_string(&self.path) {
+            Ok(t) => {
+                let doc = serde_json::from_str::<Value>(&t).map_err(|_| unreadable())?;
+                // a file from before AGP-095 has no `clock`: it starts at this call's
+                let seen = match doc.get("clock") {
+                    None => 0,
+                    Some(c) => c.as_i64().ok_or_else(unreadable)?,
+                };
+                (doc.get("used").and_then(Value::as_object).cloned().ok_or_else(unreadable)?, seen)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Map::new(), 0),
             Err(e) => return Err(err("io", format!("{}: {e}", self.path.display()))),
         };
         let key = sha256_hex(msg);
         if used.contains_key(&key) {
             return Ok(false);
         }
-        used.retain(|_, exp| exp.as_i64().is_some_and(|e| e >= now));
+        let clock = seen.max(now);
+        if expiry < clock {
+            return Err(err("expired", "the signature expired by the latest time this signer has seen (its clock has gone back since)"));
+        }
+        used.retain(|_, exp| exp.as_i64().is_some_and(|e| e >= clock));
         used.insert(key, expiry.into());
-        write_private(&self.path, &dumps_indent(&json!({"used": used}), 2, true))?;
+        write_private(&self.path, &dumps_indent(&json!({"used": used, "clock": clock}), 2, true))?;
         Ok(true)
     }
 }
@@ -201,6 +224,7 @@ impl Signer {
         match self.used_sigs.spend(msg, expiry, self.now_i()) {
             Ok(true) => None,
             Ok(false) => Some(deny("human_sig_replay", "this signature was already used: one signature authorises one operation")),
+            Err(e) if e.code == "expired" => Some(deny("expired", e.msg)),
             Err(e) => Some(deny("human_sig", e.msg)),
         }
     }

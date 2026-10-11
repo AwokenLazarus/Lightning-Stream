@@ -622,24 +622,54 @@ impl ChannelBook {
     /// channel's key (the one issued for `key_origin`) under that channel's own script, and its
     /// terms in the record of the channel being rolled. Whatever happens to the issued slot
     /// afterwards, the key of a script our signature may fund stays until that channel is attached.
-    pub fn keep_rollover_key(&self, old: &str, key_origin: &str, next: &ChannelParams) -> Result<()> {
-        let mut g = self.lock();
-        let k = Self::key_of(&g, old)?;
+    /// This only decides: `(key name, key, the slot to add if the script has none yet)`, or the
+    /// refusal. [`sign_rollover_next`](Self::sign_rollover_next) stores them with the signature.
+    fn rollover_slot(g: &Inner, k: &str, key_origin: &str, next: &ChannelParams) -> Result<(String, SecretKey, Option<Value>)> {
         let spk = next.spk();
         let secret = g.secrets.get(&format!("pending:{key_origin}")).copied().filter(|s| ecdsa::pubkey(s) == next.payer_pub)
             .ok_or_else(|| err("bad_key", "the next channel's payer key is not the one issued for this origin"))?;
-        let name = rolled_name(&g.records[&k].chan, &spk);
+        let rec = g.records.get(k).ok_or_else(|| err("unknown_channel", k.to_string()))?;
         let spk_hex = hex::encode(&spk);
-        let rec = g.records.get_mut(&k).unwrap();
-        if !rec.rolled_next.iter().any(|r| r.get("spk").and_then(Value::as_str) == Some(spk_hex.as_str())) {
-            if rec.rolled_next.len() >= MAX_ROLLED_NEXT {
-                return Err(err("rollover_pending", format!("{MAX_ROLLED_NEXT} rollovers of this channel into different next channels are signed and none is attached: \
-                                                            attach the one on chain, or close the channel")));
-            }
-            rec.rolled_next.push(json!({"spk": spk_hex, "next": next.to_json()}));
+        if rec.rolled_next.iter().any(|r| r.get("spk").and_then(Value::as_str) == Some(spk_hex.as_str())) {
+            return Ok((rolled_name(&rec.chan, &spk), secret, None));
         }
+        if rec.rolled_next.len() >= MAX_ROLLED_NEXT {
+            return Err(err("rollover_pending", format!("{MAX_ROLLED_NEXT} rollovers of this channel into different next channels are signed and none is attached: \
+                                                        attach the one on chain, or close the channel")));
+        }
+        Ok((rolled_name(&rec.chan, &spk), secret, Some(json!({"spk": spk_hex, "next": next.to_json()}))))
+    }
+
+    /// [`sign_rollover`](Self::sign_rollover) into the next channel `next` (unfunded), whose key
+    /// was issued for `key_origin`. AGP-095 (audit item 15), the rule: **a next-channel slot is
+    /// taken by a signature, never by a request.** The caller's policy has decided before this
+    /// runs, every check here that can refuse comes first, and the key, the slot and the signed
+    /// amount are stored in one write before the signature is handed out. (The slot was stored
+    /// before the policy decided, so eight refused requests used up a channel's eight slots.)
+    pub fn sign_rollover_next(&self, chan: &str, amount: i64, key_origin: &str, next: &ChannelParams, next_capacity: u64) -> Result<Vec<u8>> {
+        let mut g = self.lock();
+        let k = Self::key_of(&g, chan)?;
+        let rec = g.records[&k].clone();
+        if amount < rec.used_sats {
+            return Err(err("stale_amount", format!("have {}, got {amount}", rec.used_sats)));
+        }
+        if amount > rec.cap_sats {
+            return Err(cap_error(rec.used_sats, amount.saturating_sub(rec.used_sats), rec.cap_sats));
+        }
+        let next_spk = next.spk();
+        let mut payer = self.payer_locked(&g, &rec)?;
+        let (name, secret, slot) = Self::rollover_slot(&g, &k, key_origin, next)?;
+        let sig = payer.sign_rollover(amount as u64, &next_spk, next_capacity)?;
+        audit_rec(&self.audit, "channel_rollover", &sig, &rec.chan, &rec.dest,
+                  json!({"cum": amount, "sighash": "0x21", "next_spk": hex::encode(&next_spk), "next_capacity": next_capacity}))?;
         g.secrets.insert(name, secret);
-        self.persist(&g)
+        let r = g.records.get_mut(&k).ok_or_else(|| err("unknown_channel", chan.to_string()))?;
+        r.rolled_next.extend(slot);
+        r.used_sats = r.used_sats.max(amount);
+        r.spent_sats = r.spent().max(amount);
+        r.seq += 1;
+        self.persist(&g)?;
+        Ok(sig)
     }
 
     /// Every record of `dest`, the live one first, then the archived ones, newest first.
@@ -783,7 +813,7 @@ impl ChannelBook {
     }
 
     /// AGP-089: the next channel a rollover of `old_chan` funded (`p`, funded), open at once. Its
-    /// key is the one [`keep_rollover_key`](Self::keep_rollover_key) kept under its script (or,
+    /// key is the one [`sign_rollover_next`](Self::sign_rollover_next) kept under its script (or,
     /// for a rollover signed before that existed, the one still issued for `key_origin`). The key
     /// moves to the channel in the one write that records it, after every check that can refuse.
     /// Attaching the channel already recorded answers it again.
@@ -1108,6 +1138,11 @@ impl ChannelBook {
 
     pub fn open_records(&self) -> Vec<ChannelRecord> {
         self.filtered(|r| r.state == "open")
+    }
+
+    /// Live records with a signed rollover whose next channel is not attached (AGP-095).
+    pub fn rolled_records(&self) -> Vec<ChannelRecord> {
+        self.filtered(|r| !r.rolled_next.is_empty() && r.state != "refunded")
     }
 
     /// Open and pending channels: their funding output may still be ours to refund (P1).

@@ -673,10 +673,22 @@ impl Signer {
             Err(e) => return Ok(deny("refund_rpc", trunc(&e.msg, 200))),
         };
         if utxo.is_null() {
-            // P6: no txindex. The spend is found in the mempool or by scanning blocks from the funding's
-            // block; the funding counts as known once seen confirmed or in the mempool.
+            // AGP-095: a spend that is only in the mempool closes nothing. The record stays open
+            // and with the watcher, which asks again every tick: closed once the spend is in a
+            // block, refunded if that transaction leaves the mempool unmined.
+            match self.session.funding_spend(&rec) {
+                Ok(FundingSpend::Mempool(sp)) => {
+                    return Ok(with(with(deny("close_unconfirmed", "the funding output is spent by a transaction that is not in a block yet: \
+                                                                   the channel stays with the refund watcher until it is"), base),
+                                   json!({"spender": if sp.is_empty() { Value::Null } else { sp.into() }})));
+                }
+                Ok(_) => {}
+                Err(e) => return Ok(deny("refund_rpc", trunc(&e.msg, 200))),
+            }
+            // P6: no txindex. The spend is found by scanning blocks from the funding's block; the
+            // funding counts as known once seen confirmed or in the mempool.
             let start = if rec.funding_height != 0 { rec.funding_height } else { rec.open_height };
-            let spender = node::find_spender(&*self.node, &rec.funding_txid, rec.funding_vout as u32, start.max(0) as u64, node::SPENDER_SCAN_MAX);
+            let spender = node::block_spender(&*self.node, &rec.funding_txid, rec.funding_vout as u32, start.max(0) as u64, node::SPENDER_SCAN_MAX);
             let known = spender.is_some() || rec.funding_height != 0 || node::get_tx(&*self.node, &rec.funding_txid, "").is_some();
             if known {
                 // AGP-022: the change first, then the state: a reader that sees "closed" sees the change
@@ -730,7 +742,8 @@ impl Signer {
             if !self.node.call("gettxout", json!([t, v, false])).ok()?.is_null() {
                 return None;
             }
-            let by = node::find_spender(&*self.node, &t, v, start.max(1) as u64, node::SPENDER_SCAN_MAX)?;
+            // in a block: a mempool spender of an input that never confirmed proves nothing (AGP-095)
+            let by = node::block_spender(&*self.node, &t, v, start.max(1) as u64, node::SPENDER_SCAN_MAX)?;
             (by != rec.funding_txid).then(|| format!("{t}:{v} (spent by {by})"))
         })
     }
@@ -746,6 +759,9 @@ impl Signer {
                 self.notice_close_change(dest);
             }
         } else if spend == Ok(FundingSpend::Unspent) && self.height().is_ok_and(|h| h >= rec.expiry) && self.book.reopen_unproven(dest).is_ok() {
+            // AGP-095: a close that was in the mempool and left it unmined had its change counted;
+            // that coin never existed, so the stored coins are checked against the node again
+            self.hot.reconcile(false);
             self.engine.audit.append(json!({"type": "close_unproven", "dest": dest, "chan": rec.chan, "reported_txid": rec.closed_txid,
                                             "ts": ts_value(self.now())}));
         }
@@ -759,6 +775,55 @@ impl Signer {
         self.book.mark_closed(dest, txid, Some(&change), "")?;
         self.close_claims.lock().unwrap_or_else(|p| p.into_inner()).remove(dest);
         Ok(())
+    }
+
+    /// AGP-095 (audit item 15), the rule: **a channel this signer's signature funded gets a record,
+    /// and with it the refund at its expiry, whoever broadcast the transaction and whatever the
+    /// seller answered.** A seller that answers a signed rollover with an error and then broadcasts
+    /// it left the next channel's coins with a key and terms on file (AGP-089) and nothing acting on
+    /// them. So the watcher looks at what spent a channel with signed rollovers: when that
+    /// transaction, in a block, pays one of the next channels the record names, that channel
+    /// becomes the record at this origin, as `xbt402_attach` would make it. The terms are the ones
+    /// checked when the rollover was signed, so nothing is asked of the seller or the caller here.
+    /// The caller holds the spend lock.
+    fn adopt_rolled(&self, rec: &ChannelRecord) -> Option<Value> {
+        let vout = rec.funding_vout as u32;
+        let spender = match rec.state.as_str() {
+            "closed" if !rec.close_unproven => rec.closed_txid.clone(),
+            _ => match self.session.funding_spend(rec) {
+                Ok(FundingSpend::Spent(sp)) => sp,
+                _ => return None, // unspent, or spent only in the mempool: nothing to adopt yet
+            },
+        };
+        if spender.is_empty() {
+            return None;
+        }
+        // a rollover pays the next channel at output 1 (`ChannelParams::rollover_tx`)
+        let out = self.node.call("gettxout", json!([spender, 1, false])).ok().filter(|o| !o.is_null())?;
+        let script = out.get("scriptPubKey").and_then(|s| s.get("hex")).and_then(Value::as_str)?;
+        let slot = rec.rolled_next.iter().find(|s| s.get("spk").and_then(Value::as_str) == Some(script))?;
+        let capacity = u64::try_from(node::sats(out.get("value"))).ok().filter(|v| *v > 0)?;
+        // the transaction is the one that spent this channel's funding, by our node's own block
+        let (_, block) = node::block_of(&*self.node, &spender, 1)?;
+        if !node::get_tx(&*self.node, &spender, &block).is_some_and(|tx| node::tx_spends(&tx, &rec.funding_txid, vout)) {
+            return None;
+        }
+        let next = ChannelParams::from_json(slot.get("next")?).ok()?.with_funding(&spender, 1, capacity).ok()?;
+        let settled = match rec.state.as_str() {
+            "open" | "pending" => self.close_by_chain(&rec.dest, rec, &spender, "", 0),
+            "closed" if rec.close_unproven => self.book.note_close_proof(&rec.dest, true, &spender),
+            _ => Ok(()),
+        };
+        let origin = if rec.origin.is_empty() { rec.dest.clone() } else { rec.origin.clone() };
+        let adopted = settled.and_then(|_| self.book.add_rolled(&rec.dest, &rec.chan, &format!("{origin}/next"), &next, &origin, self.height_safe()));
+        match adopted {
+            Ok(new) => {
+                self.engine.audit.append(json!({"type": "rollover_adopted", "dest": rec.dest, "chan": rec.chan, "next_chan": new.chan, "txid": spender,
+                                                "sats": capacity, "ts": ts_value(self.now())}));
+                Some(json!({"dest": rec.dest, "chan": rec.chan, "rollover_adopted": new.chan, "txid": spender, "sats": capacity, "expiry": new.expiry}))
+            }
+            Err(e) => Some(json!({"dest": rec.dest, "chan": rec.chan, "rollover_adopted": Value::Null, "error": trunc(&e.msg, 160)})),
+        }
     }
 
     /// AGP-016/022: learn a closed channel's still-unspent change once; a final answer is never
@@ -804,122 +869,166 @@ impl Signer {
 
     /// One watcher pass: finish pending opens, refund every open channel at or past its expiry,
     /// retry pending close changes, sweep coins that reached a retired key, anchor when due.
+    ///
+    /// AGP-095 (audit item 13), the rule: **a panic in one step of a tick ends that step of that
+    /// tick, and nothing else.** Release builds check arithmetic (AGP-089), so a number that does
+    /// not fit is a panic, and this is the one thread that refunds a channel at its expiry: it was
+    /// started once and nothing restarted it, while the socket went on answering. Each step runs
+    /// on its own, a step that panics is reported (`watcher_panic`) and tried again at the next
+    /// tick, and the steps after it still run. (A build with `panic = "abort"`, the
+    /// `release-small` profile, cannot catch a panic: there the process ends and whatever
+    /// supervises it starts it again.)
     pub fn watch_tick(&self) -> Vec<Value> {
         let mut actions = vec![];
         let Ok(h) = self.height() else { return actions };
-        for rec in self.book.pending_records() {
-            // P1/P2: finish opens a crash or a wait left behind
-            if h >= rec.expiry - self.config().refund_margin_blocks {
-                continue;
-            }
-            {
-                let mut tried = self.open_tried.lock().unwrap_or_else(|p| p.into_inner());
-                if now_f64() - tried.get(&rec.dest).copied().unwrap_or(0.0) < self.config().open_retry_s as f64 {
+        self.watch_step("open_retry", &mut actions, |actions| {
+            for rec in self.book.pending_records() {
+                // P1/P2: finish opens a crash or a wait left behind
+                if h >= rec.expiry - self.config().refund_margin_blocks {
                     continue;
                 }
-                tried.insert(rec.dest.clone(), now_f64());
-            }
-            let act = {
-                let _g = self.lock();
-                let _c = sigaudit::context(Some("watcher"), Some("watcher:open_retry"));
-                match self.session.complete_open(&rec.dest, 0.0) {
-                    Ok(r) => json!({"state": r.get("state"), "confirmations": r.get("confirmations")}),
-                    Err(e) => json!({"state": "pending", "error": trunc(&e.msg, 160)}),
+                {
+                    let mut tried = self.open_tried.lock().unwrap_or_else(|p| p.into_inner());
+                    if now_f64() - tried.get(&rec.dest).copied().unwrap_or(0.0) < self.config().open_retry_s as f64 {
+                        continue;
+                    }
+                    tried.insert(rec.dest.clone(), now_f64());
                 }
-            };
-            if act["state"] == "open" || act.get("error").is_some() {
-                actions.push(json!({"dest": rec.dest, "chan": rec.chan, "height": h, "open_retry": act}));
+                let act = {
+                    let _g = self.lock();
+                    let _c = sigaudit::context(Some("watcher"), Some("watcher:open_retry"));
+                    match self.session.complete_open(&rec.dest, 0.0) {
+                        Ok(r) => json!({"state": r.get("state"), "confirmations": r.get("confirmations")}),
+                        Err(e) => json!({"state": "pending", "error": trunc(&e.msg, 160)}),
+                    }
+                };
+                if act["state"] == "open" || act.get("error").is_some() {
+                    actions.push(json!({"dest": rec.dest, "chan": rec.chan, "height": h, "open_retry": act}));
+                }
             }
-        }
-        // AGP-080 W3: closes the chain has not shown. Proven ones are settled; one still unspent at
-        // expiry is open again here and refunded by the loop below.
-        for rec in self.book.unproven_close_records() {
-            let _g = self.lock();
-            let _c = sigaudit::context(Some("watcher"), None);
-            self.settle_unproven(&rec.dest);
-            match self.book.get(&rec.dest) {
-                Some(r) if r.state == "closed" && !r.close_unproven => actions.push(json!({"dest": rec.dest, "chan": rec.chan, "height": h, "close_proven": r.closed_txid,
-                                                                                            "close_change": r.close_change, "closed_txid": r.closed_txid})),
-                Some(r) if r.state == "open" => actions.push(json!({"dest": rec.dest, "chan": rec.chan, "height": h, "close_unproven": "the funding is unspent at expiry: refunding"})),
-                _ => {}
+        });
+        self.watch_step("close_proof", &mut actions, |actions| {
+            // AGP-080 W3: closes the chain has not shown. Proven ones are settled; one still unspent at
+            // expiry is open again here and refunded by the loop below.
+            for rec in self.book.unproven_close_records() {
+                let _g = self.lock();
+                let _c = sigaudit::context(Some("watcher"), None);
+                self.settle_unproven(&rec.dest);
+                match self.book.get(&rec.dest) {
+                    Some(r) if r.state == "closed" && !r.close_unproven => actions.push(json!({"dest": rec.dest, "chan": rec.chan, "height": h, "close_proven": r.closed_txid,
+                                                                                                "close_change": r.close_change, "closed_txid": r.closed_txid})),
+                    Some(r) if r.state == "open" => actions.push(json!({"dest": rec.dest, "chan": rec.chan, "height": h, "close_unproven": "the funding is unspent at expiry: refunding"})),
+                    _ => {}
+                }
             }
-        }
-        let claims: Vec<String> = self.close_claims.lock().unwrap_or_else(|p| p.into_inner()).iter().cloned().collect();
-        for dest in claims {
-            let _g = self.lock();
-            let _c = sigaudit::context(Some("watcher"), None);
-            let rec = self.book.get(&dest).filter(|r| r.state == "open" || r.state == "pending");
-            let spend = rec.as_ref().map(|r| self.session.funding_spend(r));
-            match (rec, spend) {
-                (Some(r), Some(Ok(FundingSpend::Spent(sp)))) => {
-                    if self.close_by_chain(&dest, &r, &sp, "", 0).is_ok() {
-                        actions.push(json!({"dest": dest, "chan": r.chan, "height": h, "close_proven": sp}));
+        });
+        self.watch_step("close_claims", &mut actions, |actions| {
+            let claims: Vec<String> = self.close_claims.lock().unwrap_or_else(|p| p.into_inner()).iter().cloned().collect();
+            for dest in claims {
+                let _g = self.lock();
+                let _c = sigaudit::context(Some("watcher"), None);
+                let rec = self.book.get(&dest).filter(|r| r.state == "open" || r.state == "pending");
+                let spend = rec.as_ref().map(|r| self.session.funding_spend(r));
+                match (rec, spend) {
+                    (Some(r), Some(Ok(FundingSpend::Spent(sp)))) => {
+                        if self.close_by_chain(&dest, &r, &sp, "", 0).is_ok() {
+                            actions.push(json!({"dest": dest, "chan": r.chan, "height": h, "close_proven": sp}));
+                        }
+                    }
+                    (Some(r), _) if h < r.expiry => {} // not on our node yet
+                    _ => {
+                        self.close_claims.lock().unwrap_or_else(|p| p.into_inner()).remove(&dest);
                     }
                 }
-                (Some(r), _) if h < r.expiry => {} // not on our node yet
-                _ => {
-                    self.close_claims.lock().unwrap_or_else(|p| p.into_inner()).remove(&dest);
+            }
+        });
+        self.watch_step("rollover_adopt", &mut actions, |actions| {
+            // AGP-095: a signed rollover's next channel that is on chain and that nobody attached
+            for rec in self.book.rolled_records() {
+                let _g = self.lock();
+                let _c = sigaudit::context(Some("watcher"), Some("watcher:rollover_adopt"));
+                let Some(now) = self.book.get(&rec.dest).filter(|r| r.chan == rec.chan) else { continue };
+                if let Some(a) = self.adopt_rolled(&now) {
+                    actions.push(with(a, json!({"height": h})));
                 }
             }
-        }
-        for rec in self.book.unsettled_records() {
-            if h >= rec.expiry {
-                let r = {
-                    let _g = self.lock();
-                    let _c = sigaudit::context(Some("watcher"), None);
-                    self.refund_locked(&rec.dest, true).unwrap_or_else(|e| deny("refund_error", e.msg))
-                };
-                let mut a = json!({"dest": rec.dest, "chan": rec.chan, "height": h});
-                for k in ["verdict", "rule", "txid", "sats", "reason"] {
-                    a[k] = r.get(k).cloned().unwrap_or(Value::Null);
+        });
+        self.watch_step("refund", &mut actions, |actions| {
+            for rec in self.book.unsettled_records() {
+                if h >= rec.expiry {
+                    let r = {
+                        let _g = self.lock();
+                        let _c = sigaudit::context(Some("watcher"), None);
+                        self.refund_locked(&rec.dest, true).unwrap_or_else(|e| deny("refund_error", e.msg))
+                    };
+                    let mut a = json!({"dest": rec.dest, "chan": rec.chan, "height": h});
+                    for k in ["verdict", "rule", "txid", "sats", "reason"] {
+                        a[k] = r.get(k).cloned().unwrap_or(Value::Null);
+                    }
+                    actions.push(a);
                 }
-                actions.push(a);
             }
-        }
-        if !self.book.pending_close_records().is_empty() {
-            // AGP-022: a close's change not yet counted
-            let _g = self.lock();
-            let _c = sigaudit::context(Some("watcher"), None);
-            for a in self.settle_close_changes() {
-                actions.push(with(a, json!({"height": h})));
-            }
-        }
-        let sw = {
-            let _g = self.lock();
-            let _c = sigaudit::context(Some("watcher"), Some("watcher:retired_sweep"));
-            match self.hot.sweep_retired() {
-                Ok(v) => v,
-                Err(e) => Some(json!({"error": trunc(&e.msg, 200)})),
-            }
-        };
-        if let Some(sw) = sw {
-            let swept = sw.get("txid").is_some();
-            actions.push(json!({"retired_sweep": sw}));
-            if swept {
-                self.anchor_after("retired_sweep");
-            }
-        }
-        if self.anchor.due() {
-            let r = self.anchor.anchor("periodic");
-            if r.get("ok") != Some(&Value::Bool(true)) || !truthy(r.get("unchanged")) {
-                let mut a = json!({});
-                for k in ["ok", "n", "seq", "alert", "reason"] {
-                    a[k] = r.get(k).cloned().unwrap_or(Value::Null);
+        });
+        self.watch_step("close_change", &mut actions, |actions| {
+            if !self.book.pending_close_records().is_empty() {
+                // AGP-022: a close's change not yet counted
+                let _g = self.lock();
+                let _c = sigaudit::context(Some("watcher"), None);
+                for a in self.settle_close_changes() {
+                    actions.push(with(a, json!({"height": h})));
                 }
-                actions.push(json!({"anchor": a}));
             }
-        }
-        // AGP-048: a Lightning payment a crash or a timeout left in flight (AGP-049: or one released as
-        // never sent, which the node may still record late)
-        if self.ln.is_some() && (!self.ln_book.in_flight().is_empty() || !self.ln_book.watched(self.engine.now(), self.height_safe()).is_empty()
-                                 || self.ln_book.halted().is_some()) {
-            let _g = self.lock();
-            let _c = sigaudit::context(Some("watcher"), Some("watcher:ln_reconcile"));
-            for r in self.ln_reconcile_locked() {
-                actions.push(json!({"ln_reconcile": r}));
+        });
+        self.watch_step("retired_sweep", &mut actions, |actions| {
+            let sw = {
+                let _g = self.lock();
+                let _c = sigaudit::context(Some("watcher"), Some("watcher:retired_sweep"));
+                match self.hot.sweep_retired() {
+                    Ok(v) => v,
+                    Err(e) => Some(json!({"error": trunc(&e.msg, 200)})),
+                }
+            };
+            if let Some(sw) = sw {
+                let swept = sw.get("txid").is_some();
+                actions.push(json!({"retired_sweep": sw}));
+                if swept {
+                    self.anchor_after("retired_sweep");
+                }
             }
-        }
+        });
+        self.watch_step("anchor", &mut actions, |actions| {
+            if self.anchor.due() {
+                let r = self.anchor.anchor("periodic");
+                if r.get("ok") != Some(&Value::Bool(true)) || !truthy(r.get("unchanged")) {
+                    let mut a = json!({});
+                    for k in ["ok", "n", "seq", "alert", "reason"] {
+                        a[k] = r.get(k).cloned().unwrap_or(Value::Null);
+                    }
+                    actions.push(json!({"anchor": a}));
+                }
+            }
+        });
+        self.watch_step("ln_reconcile", &mut actions, |actions| {
+            // AGP-048: a Lightning payment a crash or a timeout left in flight (AGP-049: or one released as
+            // never sent, which the node may still record late)
+            if self.ln.is_some() && (!self.ln_book.in_flight().is_empty() || !self.ln_book.watched(self.engine.now(), self.height_safe()).is_empty()
+                                     || self.ln_book.halted().is_some()) {
+                let _g = self.lock();
+                let _c = sigaudit::context(Some("watcher"), Some("watcher:ln_reconcile"));
+                for r in self.ln_reconcile_locked() {
+                    actions.push(json!({"ln_reconcile": r}));
+                }
+            }
+        });
         actions
+    }
+
+    /// One step of a watcher tick, on its own: a panic in it is caught and reported.
+    fn watch_step(&self, name: &str, actions: &mut Vec<Value>, step: impl FnOnce(&mut Vec<Value>)) {
+        if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| step(&mut *actions))) {
+            let why = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
+            actions.push(json!({"watcher_panic": name, "detail": trunc(&why, 200)}));
+        }
     }
 
     fn sweep_hot_signed(&self, p: &Value) -> Value {
@@ -1051,11 +1160,15 @@ impl Signer {
         }
         let (secret, payer_pub) = self.book.new_payer_key();
         let open_height = self.height()?;
-        let expiry = open_height + expiry_blocks;
+        // AGP-095 (audit item 14): the caller's numbers, added checked. With `close_fee_max_sats: 0`
+        // nothing else bounds the fee, and a sum that does not fit is a panic in a release build.
+        let expiry = open_height.checked_add(expiry_blocks).and_then(|e| u32::try_from(e).ok())
+            .ok_or_else(|| err("expiry", "the channel's expiry is not a block height"))?;
+        let funded = cap.checked_add(close_fee).filter(|f| *f > 0 && cap > 0 && close_fee >= 0)
+            .ok_or_else(|| err("channel_cap", "cap_sats and close_fee do not add up to an amount"))?;
         let params = xbt402::channel::ChannelParams::derive(&hex::decode(&pay_to).map_err(|_| err("pay_to", "payTo is not hex"))?,
-                                                            &hex::decode(&payer_pub).unwrap_or_default(), expiry as u32, close_fee as u64,
+                                                            &hex::decode(&payer_pub).unwrap_or_default(), expiry, close_fee as u64,
                                                             Some(self.hot.spk()), &self.session.network()?, xbt402::channel::FeePayer::Payer)?;
-        let funded = cap + close_fee;
         let prep = self.hot.prepare_fund(&params.spk(), funded, DEFAULT_FEE)?;
         let params = params.with_funding(&prep.txid, 0, funded as u64)?;
         // P1 write-ahead: this rail has no provider open, so the channel is open once the funding is sent
@@ -1420,11 +1533,10 @@ impl Signer {
             return deny(&e.code, e.msg);
         }
         // AGP-089: this signature may fund `next`. Its key and terms are kept under its own script
-        // before the signature exists, so no later `xbt402_new_key`, retry or refusal can lose them.
-        if let Err(e) = self.book.keep_rollover_key(&dest, &key_origin, &next) {
-            return deny(&e.code, e.msg);
-        }
-        match self.booked_increase(&dest, amount, "xbt402 rollover", || self.book.sign_rollover(&dest, amount, &next_spk, next_cap)) {
+        // before the signature leaves the book, so no later `xbt402_new_key`, retry or refusal can
+        // lose them. AGP-095: kept by the signing itself, after the policy has decided, so a
+        // request that is refused takes none of the channel's next-channel slots.
+        match self.booked_increase(&dest, amount, "xbt402 rollover", || self.book.sign_rollover_next(&dest, amount, &key_origin, &next, next_cap)) {
             Ok(Ok(sig)) => json!({"sig": hex::encode(sig)}),
             Ok(Err(d)) => d,
             Err(e) => deny(&e.code, e.msg),
@@ -1436,7 +1548,8 @@ impl Signer {
         let Some(dest) = self.book.find_dest(&chan) else { return deny("unknown_channel", format!("no channel for {chan}")) };
         let uncond = py_int(p.get("uncond")).unwrap_or(0);
         let amount = py_int(p.get("amount")).unwrap_or(0);
-        let csv = py_int(p.get("csv_delta")).unwrap_or(10).max(0) as u32;
+        // the caller's number: one past u32 was cut to its low bits by the cast (AGP-095)
+        let Ok(csv) = u32::try_from(py_int(p.get("csv_delta")).unwrap_or(10).max(0)) else { return deny("bad_request", "csv_delta is not a block count") };
         let Some(hash) = x2b(&str_or_empty(p.get("hash"))).and_then(|v| <[u8; 32]>::try_from(v).ok()) else {
             return deny("bad_request", "hash must be 32 bytes of hex");
         };
@@ -1534,7 +1647,11 @@ impl Signer {
                 return Ok(None);
             }
             for c in candidates {
-                if self.session.funding_spend(c)? == FundingSpend::Spent(txid.clone()) {
+                // The rollover itself may still be in the mempool: a client attaches its next
+                // channel as soon as the seller answers. (Limit, AGP-095: if that transaction is
+                // then never mined, the channel it would have spent is no longer watched.)
+                let spend = self.session.funding_spend(c)?;
+                if spend == FundingSpend::Spent(txid.clone()) || spend == FundingSpend::Mempool(txid.clone()) {
                     return Ok(Some(c.clone()));
                 }
             }
@@ -1579,6 +1696,11 @@ impl Signer {
         if rec.state == "open" || rec.state == "pending" {
             let done = match self.session.funding_spend(&rec) {
                 Ok(FundingSpend::Spent(sp)) => self.close_by_chain(&dest, &rec, &sp, &txid, scan_from),
+                // AGP-095: in the mempool only. Closed for the caller, with its change, but not
+                // proven: the record stays with the watcher (and is not replaced) until the spend
+                // is in a block, and is open again for the refund if it never is.
+                Ok(FundingSpend::Mempool(sp)) => self.close_by_chain(&dest, &rec, &sp, &txid, scan_from)
+                    .and_then(|_| self.book.note_close_proof(&dest, false, "")),
                 Ok(_) => {
                     self.close_claims.lock().unwrap_or_else(|p| p.into_inner()).insert(dest.clone());
                     return with(deny("close_unproven", "this node does not show the channel's funding spent: the channel stays refundable, and is marked \
@@ -1755,7 +1877,10 @@ impl Signer {
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            for a in self.watch_tick() {
+            // every step of a tick is guarded (`watch_step`); this guards what is left around them,
+            // so the thread ends only when the signer stops (AGP-095)
+            let tick = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.watch_tick()));
+            for a in tick.unwrap_or_else(|_| vec![json!({"watcher_panic": "tick"})]) {
                 println!("watcher: {}", crate::pyjson::dumps_sorted_compact(&a));
             }
         }
