@@ -934,14 +934,19 @@ fn the_watcher_sends_a_close_the_node_errored_on_again() {
 
 #[test]
 fn the_watcher_does_not_send_a_rollover_the_client_was_told_failed() {
-    // the client was answered close_failed and may have dropped the next channel's key: sent now,
-    // the rollover would fund a channel nobody can spend from. The client rolls over again or closes
+    // the client was answered close_failed: the watcher leaves the rollover to the client, which
+    // rolls over again or closes. AGP-090: a retry pays the key of the first attempt (one next key
+    // per channel), so at the same height and amount it is the same transaction, and the client
+    // holds the key and the refund of whichever attempt lands
     let chain = MemChain::new();
     let (prov, mut c, chan, intent) = errored_spend(&chain, true);
     assert!(prov.close_due().unwrap().is_empty() && chain.sent().is_empty());
     assert!(prov.channel_state(&chan).unwrap().closed_txid.is_empty());
+    let first_key = c.next_rolled[O][0].payer.params.payer_pub;
     let r = c.rollover(O).unwrap();
-    assert_ne!(r["txid"], intent["txid"], "a new rollover, to a key the client holds");
+    assert_eq!(r["txid"], intent["txid"], "the retry is the rollover the provider already holds");
+    assert_eq!(c.channels[O].payer.params.payer_pub, first_key, "to the key the client kept");
+    assert!(!c.channels[O].refund_hex.is_empty() && !c.next_rolled.contains_key(O));
     assert_eq!(prov.channel_state(&chan).unwrap().closed_txid, r["txid"].as_str().unwrap());
     assert_eq!(c.open_rolled(O).unwrap()["chan"], r["nextChan"]);
     assert_eq!(c.request("GET", &format!("{O}/v1/q"), b"").unwrap().status, 200);
@@ -981,6 +986,8 @@ fn a_replaced_intent_is_still_recorded_when_it_confirms() {
         let chain = MemChain::new();
         let (prov, mut c, chan, first) = errored_spend(&chain, true);
         chain.down(true);
+        // a block later the client's rollover has another expiry: another transaction (to the same key)
+        *chain.tip.lock().unwrap() += 1;
         let e = if close { prov.close_channel(&chan).unwrap_err() } else { c.rollover(O).unwrap_err() };
         assert_eq!(e.code, "close_failed", "{e}");
         chain.down(false);
@@ -1022,6 +1029,8 @@ fn unresolved_intents_are_bounded() {
     chain.down(true);
     let mut codes = vec![];
     for _ in 0..12 {
+        // each a block later, so each is another transaction (AGP-090: all of them to one key)
+        *chain.tip.lock().unwrap() += 1;
         codes.push(c.rollover(O).unwrap_err().code);
     }
     chain.down(false);

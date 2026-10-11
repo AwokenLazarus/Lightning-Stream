@@ -146,12 +146,45 @@ pub fn open_expiry_blocks(want: u64, min_expiry: u64, max_expiry: u64, min_conf:
     want.max(open_expiry_floor(min_expiry, min_conf, close_margin)).min(max_expiry.saturating_sub(1))
 }
 
-/// [`open_expiry_blocks`] for an offer's `extra`. `minConf` absent is 1, as everywhere on this
-/// wire; the three others have no default, so an offer without one is refused `bad_offer`.
-pub fn offer_expiry_blocks(extra: &Value, want: u64) -> Result<u64> {
+/// An offer's `minExpiryBlocks`, `maxExpiryBlocks`, `minConf` and `closeMarginBlocks`.
+fn offer_terms(extra: &Value) -> Result<(u64, u64, u64, u64)> {
     let need = |k: &str| py_u64(extra.get(k)).ok_or_else(|| ChannelError::new("bad_offer", format!("extra.{k} missing")));
     let min_conf = if extra.get("minConf").is_some() { need("minConf")? } else { 1 };
-    Ok(open_expiry_blocks(want, need("minExpiryBlocks")?, need("maxExpiryBlocks")?, min_conf, need("closeMarginBlocks")?))
+    Ok((need("minExpiryBlocks")?, need("maxExpiryBlocks")?, min_conf, need("closeMarginBlocks")?))
+}
+
+/// [`open_expiry_floor`] for an offer's `extra`.
+pub fn offer_expiry_floor(extra: &Value) -> Result<u64> {
+    let (min_expiry, _, min_conf, close_margin) = offer_terms(extra)?;
+    Ok(open_expiry_floor(min_expiry, min_conf, close_margin))
+}
+
+/// The most blocks to expiry a payer funds on an offer unless its owner sets another bound: four
+/// weeks, the bound the signer socket's `open_channel` has had since AGP-063.
+pub const OWNER_MAX_EXPIRY_BLOCKS: u64 = 4_032;
+
+/// The same for a channel to a routing hub: twice as long, as the signer socket allows a hub
+/// channel (a route's locks need the room).
+pub const OWNER_MAX_HUB_EXPIRY_BLOCKS: u64 = 2 * OWNER_MAX_EXPIRY_BLOCKS;
+
+/// [`open_expiry_blocks`] for an offer's `extra`, held to the owner's bound. `minConf` absent is 1,
+/// as everywhere on this wire; the three others have no default, so an offer without one is
+/// refused `bad_offer`.
+///
+/// The rule (AGP-090, review C2): how long a payer's coins are locked is the owner's number, never
+/// only the seller's. Every term of [`open_expiry_floor`] comes from the offer, and so did the only
+/// cap (`maxExpiryBlocks`): an offer with `minExpiryBlocks` 2,000,000 got a channel that refunds in
+/// 38 years. So the payer asks for at most `owner_max` blocks, and an offer whose floor is above
+/// that is refused `bad_offer` here, before a key is made or anything is funded. Every payer that
+/// opens on an offer (the library client's open and rollover, the routed client's ch1) comes
+/// through this function.
+pub fn offer_expiry_blocks(extra: &Value, want: u64, owner_max: u64) -> Result<u64> {
+    let (min_expiry, max_expiry, min_conf, close_margin) = offer_terms(extra)?;
+    let blocks = open_expiry_blocks(want.min(owner_max), min_expiry, max_expiry, min_conf, close_margin);
+    if blocks > owner_max {
+        return fail("bad_offer", format!("the offer needs {blocks} blocks to expiry and this payer locks its coins for at most {owner_max}"));
+    }
+    Ok(blocks)
 }
 
 #[cfg(test)]
@@ -181,20 +214,37 @@ mod tests {
     #[test]
     fn offer_fields_have_no_default_but_min_conf() {
         let ex = json!({"minExpiryBlocks": 1_008, "maxExpiryBlocks": 8_640, "closeMarginBlocks": 144, "minConf": 3});
-        assert_eq!(offer_expiry_blocks(&ex, 1_008).unwrap(), 1_155);
+        assert_eq!(offer_expiry_blocks(&ex, 1_008, OWNER_MAX_EXPIRY_BLOCKS).unwrap(), 1_155);
         let mut no_conf = ex.clone();
         no_conf.as_object_mut().unwrap().remove("minConf");
-        assert_eq!(offer_expiry_blocks(&no_conf, 1_008).unwrap(), 1_153);
+        assert_eq!(offer_expiry_blocks(&no_conf, 1_008, OWNER_MAX_EXPIRY_BLOCKS).unwrap(), 1_153);
         for k in ["minExpiryBlocks", "maxExpiryBlocks", "closeMarginBlocks"] {
             let mut e = ex.clone();
             e.as_object_mut().unwrap().remove(k);
-            let err = offer_expiry_blocks(&e, 1_008).unwrap_err();
+            let err = offer_expiry_blocks(&e, 1_008, OWNER_MAX_EXPIRY_BLOCKS).unwrap_err();
             assert_eq!(err.code, "bad_offer", "{k}");
             e[k] = json!(-1);
-            assert_eq!(offer_expiry_blocks(&e, 1_008).unwrap_err().code, "bad_offer", "{k} negative");
+            assert_eq!(offer_expiry_blocks(&e, 1_008, OWNER_MAX_EXPIRY_BLOCKS).unwrap_err().code, "bad_offer", "{k} negative");
         }
         let mut e = ex.clone();
         e["minConf"] = json!("x");
-        assert_eq!(offer_expiry_blocks(&e, 1_008).unwrap_err().code, "bad_offer");
+        assert_eq!(offer_expiry_blocks(&e, 1_008, OWNER_MAX_EXPIRY_BLOCKS).unwrap_err().code, "bad_offer");
+    }
+
+    #[test]
+    fn the_owners_bound_holds_whatever_the_offer_says() {
+        let ex = |min: u64, max: u64| json!({"minExpiryBlocks": min, "maxExpiryBlocks": max, "closeMarginBlocks": 144});
+        // inside the bound: as before
+        assert_eq!(offer_expiry_blocks(&ex(1_008, 8_640), 1_008, 4_032).unwrap(), 1_153);
+        assert_eq!(offer_expiry_blocks(&ex(3_887, 8_640), 1_008, 4_032).unwrap(), 4_032);
+        // a floor one block above it, and the audit's 38 years: refused, not clamped (a clamped
+        // channel would be funded and then refused bad_expiry by the provider)
+        for min in [3_888, 2_000_000, u64::MAX] {
+            assert_eq!(offer_expiry_blocks(&ex(min, u64::MAX), 1_008, 4_032).unwrap_err().code, "bad_offer", "{min}");
+        }
+        // the owner's own wish is held to the bound too
+        assert_eq!(offer_expiry_blocks(&ex(144, 100_000), 50_000, 4_032).unwrap(), 4_032);
+        // and a bound the owner raised is the owner's
+        assert_eq!(offer_expiry_blocks(&ex(2_000_000, 3_000_000), 1_008, 2_100_000).unwrap(), 2_000_145);
     }
 }

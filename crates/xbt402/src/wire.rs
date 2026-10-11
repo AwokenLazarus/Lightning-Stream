@@ -87,10 +87,24 @@ pub struct RequestUrl {
     pub target: String,
 }
 
-/// Split `scheme://host[:port]target` (userinfo and a fragment are dropped). Anything without
-/// `://` is a bare target: it binds no origin, which only matches a payer that bound none either.
+/// `(scheme, rest)` of an absolute URL `scheme://rest`. The scheme is the whole string before the
+/// first `://` and is spelled as RFC 3986 spells one (a letter, then letters, digits, `+`, `-`,
+/// `.`). Anything else is a bare target, whatever its query holds (AGP-090, review T2): the split
+/// used to be at the first `://` anywhere, so `/a?next=http://h/x` was read as scheme `/a?next=http`
+/// and host `h`, both lowercased, and shared a digest with `/A?next=HTTP://H/x`. One function for
+/// [`request_url`], [`url_origin`] and [`seller_url`], so the three agree on what is absolute.
+fn split_scheme(url: &str) -> Option<(&str, &str)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let mut b = scheme.bytes();
+    let spelled = b.next().is_some_and(|c| c.is_ascii_alphabetic()) && b.all(|c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'.'));
+    spelled.then_some((scheme, rest))
+}
+
+/// Split `scheme://host[:port]target` (userinfo and a fragment are dropped). Anything else is a
+/// bare target, bound byte for byte: it binds no origin, which only matches a payer that bound
+/// none either.
 pub fn request_url(url: &str) -> RequestUrl {
-    let Some((scheme, rest)) = url.split_once("://") else {
+    let Some((scheme, rest)) = split_scheme(url) else {
         return RequestUrl { scheme: String::new(), host: String::new(), port: String::new(), target: url.to_string() };
     };
     let rest = rest.split('#').next().unwrap_or("");
@@ -126,8 +140,8 @@ pub fn no_fragment(url: &str) -> Result<()> {
 
 /// `scheme://authority` of an absolute URL, or `""` for a bare target.
 pub fn url_origin(url: &str) -> &str {
-    match url.find("://") {
-        Some(i) => &url[..i + 3 + url[i + 3..].find(['/', '?', '#']).unwrap_or(url.len() - i - 3)],
+    match split_scheme(url) {
+        Some((scheme, rest)) => &url[..scheme.len() + 3 + rest.find(['/', '?', '#']).unwrap_or(rest.len())],
         None => "",
     }
 }
@@ -241,8 +255,8 @@ pub fn seller_url(origin: &str, given: &str) -> Result<String> {
     }
     let origin = origin.trim_end_matches('/');
     let path = match given.strip_prefix(origin) {
-        Some(rest) if given.contains("://") => rest,
-        _ if given.contains("://") => return refuse("is on another origin"),
+        Some(rest) if split_scheme(given).is_some() => rest,
+        _ if split_scheme(given).is_some() => return refuse("is on another origin"),
         _ => given,
     };
     if !path.starts_with('/') || path.starts_with("//") {
@@ -575,5 +589,52 @@ mod tests {
                 assert!(seen.insert(d), "cut at {i},{j} collides");
             }
         }
+    }
+
+    #[test]
+    fn a_bare_target_is_bound_byte_for_byte() {
+        // AGP-090 (review T2): the pairs the audit found under one digest
+        for (a, b) in [("/A?next=http://h/x", "/a?next=http://h/x"), ("/a?next=http://H/x", "/a?next=http://h/x"),
+                       ("/a?next=http://user@h/x", "/a?next=http://h/x"), ("/a?next=http://h:080/x", "/a?next=http://h:80/x")] {
+            assert_ne!(request_digest_v2("GET", a, b""), request_digest_v2("GET", b, b""), "{a} {b}");
+        }
+        let u = request_url("/a?next=http://H:080/x");
+        assert_eq!((u.scheme.as_str(), u.host.as_str(), u.port.as_str(), u.target.as_str()), ("", "", "", "/a?next=http://H:080/x"));
+        for bare in ["/a?next=http://h/x", "?x=a://b", "://h/x", "1a://h/x", "a b://h/x", ""] {
+            assert_eq!(url_origin(bare), "", "{bare:?}");
+        }
+        // an absolute URL is split as before, a `://` in its query included
+        let u = request_url("HTTP://Api.Example:080/a?next=http://H/x");
+        assert_eq!((u.scheme.as_str(), u.host.as_str(), u.port.as_str(), u.target.as_str()), ("http", "api.example", "80", "/a?next=http://H/x"));
+        assert_eq!(url_origin("coap+tcp://h:1/x?y=z://w"), "coap+tcp://h:1");
+        // a seller's path whose query holds a URL is a path on its own origin; another scheme is not
+        assert_eq!(seller_url("https://a.example", "/open?next=http://h/x").unwrap(), "https://a.example/open?next=http://h/x");
+        assert!(seller_url("https://a.example", "x+y://evil.example/open").is_err());
+    }
+
+    #[test]
+    fn no_two_bare_targets_are_split_alike() {
+        // every string of up to 6 of these characters that starts with `/`: the digest's fields are
+        // length-prefixed, so two targets share a digest exactly when they split into the same fields
+        let alphabet = ['/', ':', 'a', 'A', '?', '@', '0'];
+        let mut all = vec![String::from("/")];
+        let mut from = 0;
+        for _ in 0..5 {
+            let end = all.len();
+            for i in from..end {
+                for c in alphabet {
+                    let mut t = all[i].clone();
+                    t.push(c);
+                    all.push(t);
+                }
+            }
+            from = end;
+        }
+        let split: std::collections::HashSet<_> = all.iter().map(|t| {
+            let u = request_url(t);
+            (u.scheme, u.host, u.port, u.target)
+        }).collect();
+        assert_eq!(split.len(), all.len());
+        assert!(all.iter().any(|t| t.contains("://")));
     }
 }

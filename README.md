@@ -1895,6 +1895,7 @@ parked on B1 branch `agp-081-hub-rollover`, not reviewed, for a hub task in both
 Noticed and not changed: after one answer lost on the way, the next receipt shows two calls' growth
 in `spentMsat` and the client refuses it `bad_receipt` (`Client::receipt` has no slack for a lost
 answer; the 402 path has one call of slack).
+(Changed in AGP-090: see "Fix wave 4, channel client and transport".)
 
 Tests, each failing on `main` and passing here unless marked:
 * `xbt402/tests/lifecycle.rs`: `a_paid_answer_without_a_receipt_is_refused`,
@@ -2785,6 +2786,79 @@ Pi-class figure, x86_64 native beside it; pass line declared before measuring):
 The L5 cache check adds one `getblockhash` RPC to the signer's own node per usable channel on each
 `ln_pay` and `ln_status`: a loopback round trip, not CPU. TrackPaymentV2 replaces a 1,000-payment
 listing with one record. The L1 parse runs once, at configuration.
+
+## Fix wave 4, channel client and transport (AGP-090)
+
+Five items of the second closure audit (AGP-087, list 1: 4, 5, 6, 9 and 17), in the library client
+(`xbt402::client`), `funding.rs`, `wire.rs` and the HTTP transport. Each is fixed at one function
+that every path goes through. The same rules are in B1 (`xbt402/x402_channel.py`, `funding.py`).
+
+**A funded channel is never forgotten (C2).** A channel is on the books and in the ledger from the
+moment it has a key, with a stage: `Keyed` (key and terms; saved before the wallet is asked to
+fund), `Funded` (outpoint known, key bound, refund held and handed to `on_refund`; saved before the
+provider hears of the outpoint) and `Open` (the provider answered). `Client::ensure_open` is the
+only way to `Open`, for a plain call, a conditional call, a retry and a restart. A seller that says
+yes to the preflight and no to the funded open, or whose answer is lost, leaves a `Funded` channel:
+the next call asks the provider again and funds nothing (`duplicate_channel` from a provider that
+did open it is taken as the yes that was lost). No state, close or rollover is signed before `Open`.
+A `fund` call that errors may have sent: the retry first asks the wallet (`wallet_sends_to`,
+`wallet_send`) and otherwise funds the same script under the same key. A keyed channel that has
+become too old to fund is moved to `Client::unfunded` with its key (with a signer it stays, and the
+open stops with `open_unresolved`, because a signer's new key would replace the old one);
+`Client::forget_unfunded` drops such records once the wallet shows no send to them.
+Still true: a channel a seller refuses to open locks its capacity until its expiry, when the kept
+refund spends it. The embedder broadcasts that refund and then removes the record from `channels`.
+
+**The owner bounds the expiry (C2).** `funding::offer_expiry_blocks(extra, want, owner_max)`: the
+payer asks for at most `owner_max` blocks, and an offer whose floor (`minExpiryBlocks + minConf +
+closeMarginBlocks`) is above it is refused `bad_offer` before a key is made. `ClientConfig::
+max_expiry_blocks` is 4,032 by default (`OWNER_MAX_EXPIRY_BLOCKS`, the bound of the signer socket's
+`open_channel`); the routed client uses its own `expiry_blocks` or 8,064
+(`OWNER_MAX_HUB_EXPIRY_BLOCKS`), whichever is larger. The seller's `minCapacity` is added to the
+budget with a checked sum. `funding::open_expiry_blocks` itself is unchanged (xbt-signer's session
+calls it directly and bounds it in its own task).
+
+**One next key per channel (C3).** Every attempt to roll one channel over pays the key of the first
+attempt (`ClientChannel::rolled_from` ties a `next_rolled` record to its parent), with a local key
+and with a signer, so a signer's one issued key per origin is never replaced while a signed
+rollover can still be broadcast. A retry at the same height and amount is the same transaction.
+Past `MAX_KEPT` (16) unresolved rollovers of one channel the client signs no more
+(`rollover_unresolved`).
+
+**Receipts (T4).** A receipt must be for the seq of the request just sent, so an earlier answer
+replayed with its genuine receipt is `bad_receipt`. The spent total a receipt (signed) or a 402
+(unsigned) names may be ahead of the last verified receipt by one quote for each paid request the
+provider has not answered (`ClientChannel::unanswered_msat`: added when a request leaves, taken off
+when the provider answers 402, cleared by a verified receipt), plus the one call of slack a channel
+has over its life (`slack_msat`). So after lost answers the channel goes on, and each call the
+provider served is paid once. Stated limit: an answer lost or damaged on the way is paid for, and
+a provider is believed for one quote per request it left unanswered; a provider that answers 402
+to everything can claim one call over the channel's life, as before.
+
+**Transport (T2, T3).**
+- A bare request target is bound byte for byte: `wire::split_scheme` takes a string as absolute
+  only when everything before its first `://` is spelled as a URL scheme, and `request_url`,
+  `url_origin` and `seller_url` all use it. `/a?next=http://h/x` and `/A?next=HTTP://H/x` no longer
+  share a digest. The digest of every absolute URL, and every published vector, is unchanged.
+- A chunked body whose connection ends inside a chunk is `transport_error`. ureq 2.12.1 returns
+  the bytes it has as a whole body and shows a caller nothing else, so the workspace builds ureq
+  from `vendor/ureq` (`[patch.crates-io]`): the published source with a two-line patch in
+  `src/chunked/decoder.rs`, described in `vendor/ureq/XBT-PATCH.md`. A body with neither
+  Content-Length nor chunking still ends when the connection does (stated limit: the receipt's
+  `bodyHash` covers it on a direct paid call; routed and work-rail calls have no such cover).
+- A paid HEAD works: an answer to a HEAD, and a 1xx, 204 or 304, has no body by its framing, so the
+  transport does not compare its Content-Length and the client checks its receipt on the status. A
+  body that does arrive is checked, and a GET cut to nothing is not taken for a HEAD.
+
+API changes for embedders: `ClientConfig::max_expiry_blocks`; `ClientChannel::{stage,
+unanswered_msat, rolled_from}`; `Client::{unfunded, forget_unfunded}`; `funding::
+offer_expiry_blocks` takes the owner's bound; a ledger record without the new fields reads as an
+open channel with nothing unanswered. A channel in `channels` may now be `Keyed` or `Funded`.
+
+Tests: the audit's `xbt402/tests/agp087_hub_b_client.rs`, `agp087_transport.rs` and
+`agp087_transport_http.rs` pass; `xbt402/tests/agp090_client.rs` (15) covers the neighbouring paths;
+unit tests in `funding.rs` and `wire.rs`. Three tests in `lifecycle.rs` assumed a retried rollover
+is a new transaction to a new key and were changed to the one-key rule.
 
 ## Lightning rail pays BOLT 12 offers (AGP-082)
 
