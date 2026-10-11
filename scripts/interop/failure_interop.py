@@ -90,7 +90,7 @@ def check(cid, what, ok, observed=""):
     ok = bool(ok)
     known = KNOWN_OPEN.get(cid)
     results.append({"id": cid, "check": what, "ok": ok, "observed": str(observed), "open_item": known})
-    tag = "PASS" if ok else (f"FAIL (open item: {known})" if known else "FAIL")
+    tag = "PASS" if ok else (f"FAIL ({known}, an open item)" if known else "FAIL")
     if ok and known:
         tag = "PASS (listed as open: take it off KNOWN_OPEN)"
     say(f"{tag}  {cid}  {what}" + (f"\n        observed: {observed}" if observed != "" else ""))
