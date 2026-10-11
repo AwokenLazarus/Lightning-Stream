@@ -18,7 +18,7 @@
 #      again; the hub is killed and started again and has the same link; the seller's close pays the hub's
 #      wallet; GET /status reconciles to the sat at each stage.
 # Ports (loopback, below the ephemeral range): the lab's node 17581 and lf1's REST 17591
-# (HUB_LINK_NODE_PORT, HUB_LINK_LN_PORT), the hub and seller from LINK_PB (default 22600): +10, +11,
+# (HUB_LINK_NODE_PORT, HUB_LINK_LN_PORT), the hub and seller from LINK_PB (default 22800): +10, +11,
 # +40..+47. Its own compose project (agp109ln), so it runs beside ln_rail_regtest.sh. Starts NO miners.
 # The lab's containers and volumes and every process are removed on exit (HUB_LINK_KEEP=1 keeps the lab).
 # Soak rules: container CPU caps, CPUQuota 200%, 4G, nice 19. Report: run/hub_ln_link_results.json.

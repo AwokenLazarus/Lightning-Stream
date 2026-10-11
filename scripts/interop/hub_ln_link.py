@@ -17,7 +17,7 @@ import urllib.error
 import urllib.request
 
 LAB, RS, RUN = (os.environ[k] for k in ("LAB", "RS_BIN", "LINK_RUN"))
-PB = int(os.environ.get("LINK_PB", "22600"))
+PB = int(os.environ.get("LINK_PB", "22800"))
 NODE_PORT = int(os.environ.get("HUB_LINK_NODE_PORT", "17581"))
 LN_PORT = int(os.environ.get("HUB_LINK_LN_PORT", "17591"))
 ONLY = [x for x in os.environ.get("LINK_ONLY", "").split(",") if x]
