@@ -16,9 +16,10 @@ compared, and the ones that differ are listed at the end.
               node the buyer's own secret; a wrong secret and an unpaid ticket cannot be settled
   fees        10 locked, 5 settled, 5 cancelled: a routing fee on the settled ones only
   dust        which ticket sizes get an output of their own in the commitment transaction
+  smallest    the smallest ticket a hop forwards, and what it costs
   direct      tickets over one channel (lf2 buys from lf3): no fee
   two_hops    tickets over three channels (lf4 buys from lf3): two routing fees
-  latency     seconds to lock 1, 8, 10 and 100 tickets; per paid request, the seller's check, its
+  latency     seconds to lock 1 to 400 tickets; per paid request, the seller's check, its
               settle call, and the buyer's node seeing SUCCEEDED; seconds for a stop to free funds
   macaroons   the wallet rail's four permissions pay a ticket; invoices:read and invoices:write
               make, look up, settle and cancel one, and cannot send coins or pay
@@ -267,6 +268,40 @@ def dust() -> None:
     measured("weight_units_per_ticket_output", added["1000"][0], 172)
 
 
+def smallest() -> None:
+    def buy(buyer: str, msat: int) -> lab.Payment:
+        """Offer one ticket of `msat`; settle it if it locks. The payment as the buyer's node ends it."""
+        ticket = lab.issue(SELLER, [os.urandom(32)], msat=msat)[0]
+        lab.pay(buyer, [ticket], timeout_s=5)
+        lab.wait(
+            "the ticket locked or failed",
+            30,
+            lambda: lab.state(SELLER, ticket) == "ACCEPTED" or lab.payment(buyer, ticket).status == "FAILED",
+            every=0.1,
+        )
+        if lab.state(SELLER, ticket) == "ACCEPTED":
+            lab.settle(SELLER, ticket)
+        else:
+            lab.cancel(SELLER, ticket)
+        return lab.payment(buyer, ticket, final=True)
+
+    clear()
+    hop_999, hop_1000 = buy(BUYER, 999), buy(BUYER, 1000)
+    direct_999, direct_1000 = buy(HOP, 999), buy(HOP, 1000)
+    clear()
+    check(
+        "smallest: a ticket of 1 sat locks and settles, through a hop (at a fee as large as the ticket) and on one channel; one of 999 msat does not",
+        [p.status for p in (hop_999, hop_1000, direct_999, direct_1000)] == ["FAILED", "SUCCEEDED", "FAILED", "SUCCEEDED"]
+        and hop_1000.fee_msat >= 1000,
+        {
+            "through_a_hop": {"999_msat": lab.tally([hop_999]), "1_sat": lab.tally([hop_1000]), "1_sat_fee_msat": hop_1000.fee_msat},
+            "one_channel": {"999_msat": lab.tally([direct_999]), "1_sat": lab.tally([direct_1000]), "1_sat_fee_msat": direct_1000.fee_msat},
+        },
+    )
+    measured("smallest_ticket_msat_through_a_hop", 1000 if hop_999.status == "FAILED" else 999, 1000)
+    measured("fee_msat_on_a_1_sat_ticket", hop_1000.fee_msat, 1000)
+
+
 def direct() -> None:
     clear()
     s0 = int(lab.channel(SELLER, HOP)["local_balance"])
@@ -331,7 +366,7 @@ def seen_final(ticket: Ticket) -> tuple[lab.Payment, float]:
 def latency() -> None:
     clear()
     locks: dict[str, float] = {}
-    for count in (1, 8, 10, 100):
+    for count in (1, 8, 10, 50, 100, 200, 400):
         tickets, secs = lab.lock(BUYER, SELLER, count)
         locks[str(count)] = round(secs, 3)
         if count == 8:
@@ -341,7 +376,7 @@ def latency() -> None:
         else:
             lab.cancel_all(SELLER, tickets)
         clear()
-    measured("lock_s_one_hop", locks, {"1": 0.27, "10": 0.59, "100": 3.0}, exact=False)
+    measured("lock_s_one_hop", locks, {"1": 0.27, "10": 0.59, "50": 1.9, "100": 3.0, "200": 5.0, "400": 9.6}, exact=False)
     measured("stop_8_tickets_freed_s", round(freed, 3))
     tickets, _ = lab.lock(BUYER, SELLER, 30)
     verify, settle_call, buyer_sees = [], [], []
@@ -769,6 +804,7 @@ CHECKS: dict[str, Callable[[], None]] = {
     "accept": accept,
     "fees": fees,
     "dust": dust,
+    "smallest": smallest,
     "direct": direct,
     "two_hops": two_hops,
     "latency": latency,

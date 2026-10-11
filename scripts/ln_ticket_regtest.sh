@@ -9,8 +9,9 @@
 #     far     buyer     hop     seller
 #
 # It prints PASS or FAIL for each check with what it saw: tickets ACCEPTED through the hop for hashes
-# only the buyer knows; settle returns the buyer's secret; a fee on settled tickets only; tickets on
-# one channel and over two hops; lock and per-request latencies; what each side's macaroon can and
+# only the buyer knows; settle returns the buyer's secret; a fee on settled tickets only; the smallest
+# ticket and the smallest with an output on chain; tickets on one channel and over two hops; lock
+# and per-request latencies; what each side's macaroon can and
 # cannot do; the smallest final CLTV delta; 483 of 520 in flight; settle after a restart of each
 # node and with the hop down; the seller's node cancelling 18 blocks before expiry; the seller's
 # claim on chain when the hop stays down; a seller offline past expiry with 3 and with 100 tickets.
