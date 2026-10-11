@@ -234,11 +234,20 @@ impl Connection {
         ElectrumError::new(Kind::Unreachable, format!("{}: {what}", self.url))
     }
 
-    fn open_socket(&self) -> Result<TcpStream> {
+    /// How long is left until `deadline`; an error once it has passed.
+    fn left(&self, deadline: Instant, what: &str) -> Result<Duration> {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(self.unreachable(format!("{what}: not finished by its deadline")));
+        }
+        Ok(left)
+    }
+
+    fn open_socket(&self, deadline: Instant) -> Result<TcpStream> {
         let addrs = (self.addr.host.as_str(), self.addr.port).to_socket_addrs().map_err(|e| self.unreachable(e))?;
         let mut last = None;
         for a in addrs {
-            match TcpStream::connect_timeout(&a, self.timeout) {
+            match TcpStream::connect_timeout(&a, self.left(deadline, "connect")?) {
                 Ok(s) => return Ok(s),
                 Err(e) => last = Some(e),
             }
@@ -246,29 +255,58 @@ impl Connection {
         Err(self.unreachable(last.map(|e| e.to_string()).unwrap_or_else(|| "no address".into())))
     }
 
+    /// The TLS handshake, read by read against one deadline. (`complete_io` would wait a full read
+    /// timeout for every byte: a server that trickles a record holds it for hours, AGP-092.)
+    fn handshake(&self, c: &mut rustls::ClientConnection, s: &mut TcpStream, deadline: Instant) -> Result<()> {
+        let tls = |e: &dyn std::fmt::Display| self.unreachable(format!("TLS: {e}"));
+        while c.is_handshaking() || c.wants_write() {
+            let left = self.left(deadline, "TLS handshake")?;
+            s.set_read_timeout(Some(left)).and_then(|_| s.set_write_timeout(Some(left))).map_err(|e| self.unreachable(e))?;
+            if c.wants_write() {
+                c.write_tls(s).map_err(|e| tls(&e))?;
+                continue;
+            }
+            match c.read_tls(s) {
+                Ok(0) => return Err(tls(&"the server hung up during the handshake")),
+                Ok(_) => {
+                    c.process_new_packets().map_err(|e| tls(&e))?;
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(tls(&e)),
+            }
+        }
+        Ok(())
+    }
+
     /// Connect (if not connected), negotiate the protocol, and re-send the subscriptions.
     pub fn connect(&self) -> Result<()> {
+        self.connect_until(None)
+    }
+
+    /// [`connect`](Self::connect) that gives up at `until`. Rule (AGP-092): reaching a server costs
+    /// at most one timeout for the TCP connect and the TLS handshake together, then one for
+    /// `server.version` and one for the subscriptions, whatever the server sends and however slowly.
+    pub fn connect_until(&self, until: Option<Instant>) -> Result<()> {
         let _g = lock(&self.connecting);
         if self.connected() {
             return Ok(());
         }
         self.close(); // a link the server hung up on
-        let sock = self.open_socket()?;
+        let deadline = Instant::now() + self.timeout;
+        let deadline = until.map_or(deadline, |u| u.min(deadline));
+        let sock = self.open_socket(deadline)?;
         let _ = sock.set_nodelay(true);
-        sock.set_write_timeout(Some(self.timeout)).map_err(|e| self.unreachable(e))?;
         let link = if self.addr.tls {
             let cfg = self.tls.clone().expect("checked in new");
             let name = ServerName::try_from(self.addr.host.clone()).map_err(|e| ElectrumError::new(Kind::BadRequest, e.to_string()))?;
             let mut c = rustls::ClientConnection::new(cfg, name).map_err(|e| self.unreachable(e))?;
-            sock.set_read_timeout(Some(self.timeout)).map_err(|e| self.unreachable(e))?;
             let mut s = sock;
-            while c.is_handshaking() {
-                c.complete_io(&mut s).map_err(|e| self.unreachable(format!("TLS: {e}")))?;
-            }
+            self.handshake(&mut c, &mut s, deadline)?;
             Link::Tls(s, Box::new(c))
         } else {
             Link::Plain(sock)
         };
+        link.sock().set_write_timeout(Some(self.timeout)).map_err(|e| self.unreachable(e))?;
         link.sock().set_read_timeout(None).map_err(|e| self.unreachable(e))?;
         let reader = link.sock().try_clone().map_err(|e| self.unreachable(e))?;
         let link = Arc::new(Mutex::new(link));
@@ -291,13 +329,13 @@ impl Connection {
         }
         *lock(&self.live) = Some(Live { link, pending, alive, fault });
         let hello = (|| -> Result<()> {
-            // exchange() never reconnects: we hold `connecting`
-            let v = self.exchange(&[("server.version".to_string(), json!([CLIENT_NAME, PROTOCOL]))])?.pop().expect("one")?;
+            // exchange_until() never reconnects: we hold `connecting`
+            let v = self.exchange_until(&[("server.version".to_string(), json!([CLIENT_NAME, PROTOCOL]))], until)?.pop().expect("one")?;
             let a = v.as_array().filter(|a| a.len() == 2).ok_or_else(|| self.unreachable("server.version: malformed answer"))?;
             *lock(&self.info) = (a[0].as_str().unwrap_or("").to_string(), a[1].as_str().unwrap_or("").to_string());
             let subs = lock(&self.subs).clone();
             if !subs.is_empty() {
-                for r in self.exchange(&subs)? {
+                for r in self.exchange_until(&subs, until)? {
                     r?;
                 }
             }
@@ -337,13 +375,9 @@ impl Connection {
             return Ok(Vec::new());
         }
         if !self.connected() {
-            self.connect()?;
+            self.connect_until(until)?;
         }
         self.exchange_until(reqs, until)
-    }
-
-    fn exchange(&self, reqs: &[(String, Value)]) -> Result<Vec<Result<Value>>> {
-        self.exchange_until(reqs, None)
     }
 
     fn exchange_until(&self, reqs: &[(String, Value)], until: Option<Instant>) -> Result<Vec<Result<Value>>> {
@@ -408,14 +442,14 @@ impl Connection {
     }
 
     /// Subscribe to those of `reqs` this connection is not subscribed to yet, in one batch.
-    pub fn subscribe_many(&self, reqs: &[(String, Value)]) -> Result<Vec<Result<Value>>> {
+    pub fn subscribe_many(&self, reqs: &[(String, Value)], until: Option<Instant>) -> Result<Vec<Result<Value>>> {
         let new: Vec<(String, Value)> = {
             let mut s = lock(&self.subs);
             let new: Vec<_> = reqs.iter().filter(|r| !s.contains(r)).cloned().collect();
             s.extend(new.iter().cloned());
             new
         };
-        self.batch(&new)
+        self.batch_until(&new, until)
     }
 }
 

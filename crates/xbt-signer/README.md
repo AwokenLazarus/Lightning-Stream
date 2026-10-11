@@ -140,7 +140,13 @@ Before anything reaches the router (`src/ln.rs`, `src/bolt11.rs`):
    their **funding transaction is proven on the signer's own node** (AGP-049, `src/ln_funding.rs`): the
    transaction at the short channel id's block position is the channel point's, its output is the
    channel's P2WSH of its capacity, every signature each input's script checks carries sighash
-   **0x21**, and every input's coin was confirmed at or above the split. Only spends whose sole
+   **0x21**, every input's coin was confirmed at or above the split, and (AGP-092) something its txid
+   commits to pins it to XBT: the funding, or a transaction it descends from above the split, is a
+   coinbase or carries a 0x21 signature in a scriptSig (`ln_funding::xbt_only`, at most 256
+   transactions looked up; witness signatures are outside the txid, so on their own they prove
+   nothing about the same txid on SHA-256 Bitcoin). A node whose coins have no such ancestor in reach
+   is refused: fund it from mined coins, or from coins that went through a P2PKH address after the
+   split. Only spends whose sole
    condition is signatures are read (P2WPKH, P2SH-P2WPKH, P2PKH, `<key> CHECKSIG` or
    `m <keys> n CHECKMULTISIG` P2WSH, a taproot key path; AGP-066). LND's `unified_sigs` flag is not
    trusted for this. A verdict holds while the funding block is on the node's best chain: after a reorg
@@ -169,7 +175,9 @@ payment's booking becomes what it cost, a failed one's goes (the audit log keeps
 left in flight is reconciled from the node's record of it, looked up by payment hash (TrackPaymentV2;
 by `ln_status`, the next `ln_pay`, the watcher), and blocks new LN payments until then. A booking
 released because the node had no record of it (a crash before the send, or a send that errored) is
-watched for as long as its HTLC could be out: `ln.max_cltv_blocks` + 144 blocks, in blocks and in time.
+watched for as long as its HTLC could be out: `ln.max_cltv_blocks` + 144 blocks, in blocks and in time
+(for a BOLT 12 payment `ln.node_max_cltv_blocks` + 144: `PayOffer` takes no limit of ours, so the
+node's own `max-cltv-expiry` is the bound; AGP-092).
 If the node records it late, it is booked again and settled or kept in flight (AGP-048 risk 7); one
 whose HTLC is on a channel is not released at all. If that late booking breaks the policy, the rail
 **halts** (AGP-066): every `ln_pay` is refused `ln_halted`, `ln_status` shows `halted`, and an approval
@@ -202,7 +210,9 @@ booking stays and the rail halts. The REST client follows no redirect.
 policy.json `ln`: `enabled` (default off), `max_fee_base_sats` (10), `max_fee_ppm` (5000),
 `min_expiry_s` (60), `max_cltv_blocks` (1008), `timeout_s` (60), `anchor_height`, `anchor_hash`,
 `split_height`, `max_tip_lead` (2), `require_description` (false), `exposure_cap_sats` (0: none, not
-allowed on mainnet), `max_sends_per_hour` (60; 0: none), `tower_policy` (`warn` / `refuse`; default
+allowed on mainnet), `max_sends_per_hour` (60; 0: none; every send counts, retries of one invoice
+included), `node_max_cltv_blocks` (2016: the LN node's `max-cltv-expiry`; raise it if the node's was
+raised), `tower_policy` (`warn` / `refuse`; default
 `refuse` on mainnet), `trusted_towers` (tower public keys, hex). Environment: `B2_LN_REST`
 (`https://host:port`; plain http only to 127.0.0.0/8 or `::1`, not to a name), `B2_LN_MACAROON`, `B2_LN_TLS_CERT` (LND's
 `tls.cert`: the connection is pinned to exactly that certificate). A bad LN configuration shuts the

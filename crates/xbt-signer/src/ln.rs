@@ -97,6 +97,11 @@ pub struct LnPolicy {
     /// At most this many payments sent to the LN node's router per hour, failed ones included
     /// (AGP-049; LND has no per-macaroon rate limit). 0: no limit.
     pub max_sends_per_hour: i64,
+    /// The LN node's own limit on an outgoing HTLC's time lock, in blocks (LND's `max-cltv-expiry`,
+    /// 2016 by default). The wallet cannot read it from the node and cannot set a limit on a BOLT 12
+    /// payment (`PayOffer` takes none), so this is how long an offer's HTLC is taken to last
+    /// ([`LnPolicy::htlc_blocks`]). An owner who raised the node's limit raises this with it.
+    pub node_max_cltv_blocks: i64,
     /// Watchtowers whose chain is not verified: `warn` (the default off mainnet) or `refuse` (mainnet).
     pub tower_policy: Option<String>,
     /// Tower public keys (hex) the operator has verified run on XBT (e.g. their own Lightning Fork tower).
@@ -107,12 +112,12 @@ impl Default for LnPolicy {
     fn default() -> Self {
         Self { enabled: false, max_fee_base_sats: 10, max_fee_ppm: 5_000, min_expiry_s: 60, max_cltv_blocks: 1_008, timeout_s: 60,
                anchor_height: None, anchor_hash: None, split_height: None, max_tip_lead: 2, require_description: false, exposure_cap_sats: 0,
-               max_sends_per_hour: 60, tower_policy: None, trusted_towers: vec![] }
+               max_sends_per_hour: 60, node_max_cltv_blocks: 2_016, tower_policy: None, trusted_towers: vec![] }
     }
 }
 
-pub const LN_INT_KEYS: [&str; 10] = ["max_fee_base_sats", "max_fee_ppm", "min_expiry_s", "max_cltv_blocks", "timeout_s", "anchor_height",
-                                     "split_height", "max_tip_lead", "exposure_cap_sats", "max_sends_per_hour"];
+pub const LN_INT_KEYS: [&str; 11] = ["max_fee_base_sats", "max_fee_ppm", "min_expiry_s", "max_cltv_blocks", "timeout_s", "anchor_height",
+                                     "split_height", "max_tip_lead", "exposure_cap_sats", "max_sends_per_hour", "node_max_cltv_blocks"];
 
 impl LnPolicy {
     pub fn from_map(m: &Map<String, Value>) -> Self {
@@ -126,9 +131,19 @@ impl LnPolicy {
                split_height: o("split_height"), max_tip_lead: i("max_tip_lead", d.max_tip_lead),
                require_description: crate::pyjson::truthy(m.get("require_description")), exposure_cap_sats: i("exposure_cap_sats", 0),
                max_sends_per_hour: i("max_sends_per_hour", d.max_sends_per_hour),
+               node_max_cltv_blocks: i("node_max_cltv_blocks", d.node_max_cltv_blocks),
                tower_policy: m.get("tower_policy").and_then(Value::as_str).map(|s| s.trim().to_lowercase()),
                trusted_towers: m.get("trusted_towers").and_then(Value::as_array).into_iter().flatten()
                    .filter_map(|t| t.as_str().map(|s| s.trim().to_lowercase())).collect() }
+    }
+
+    /// The most blocks an HTLC of a payment can stay out, counted from its send (AGP-092). A BOLT 11
+    /// payment is sent with `cltv_limit = max_cltv_blocks`. An offer's payment has no such limit to
+    /// send, so the node's own bounds it: `node_max_cltv_blocks`, never taken below `max_cltv_blocks`.
+    /// One function, so the watch of a released booking and the limit sent cannot drift apart.
+    pub fn htlc_blocks(&self, offer: bool) -> i64 {
+        let ours = self.max_cltv_blocks.max(0);
+        if offer { ours.max(self.node_max_cltv_blocks) } else { ours }
     }
 
     /// Whether a watchtower of unverified chain refuses payments (mainnet's default) or only warns.
@@ -869,9 +884,9 @@ pub struct LnBook {
     halt: Mutex<Option<Value>>,
 }
 
-/// Blocks past `max_cltv_blocks` a payment released as never sent stays watched: the first hop's HTLC
-/// expires within `max_cltv_blocks` of the send, and its on-chain timeout can take a while to confirm,
-/// during which the next hop may still claim it with the preimage.
+/// Blocks past [`LnPolicy::htlc_blocks`] a payment released as never sent stays watched: the first
+/// hop's HTLC expires within that many blocks of the send, and its on-chain timeout can take a while
+/// to confirm, during which the next hop may still claim it with the preimage.
 pub const REBOOK_WATCH_MARGIN_BLOCKS: i64 = 144;
 
 impl LnBook {
@@ -928,6 +943,8 @@ impl LnBook {
         self.read().get(hash).cloned()
     }
 
+    /// Write a record as it is. Not for a payment about to be sent: that goes through
+    /// [`Self::put_sending`], which is what the rate limit counts.
     pub fn put(&self, hash: &str, rec: Value) -> Result<()> {
         let _g = self.lock.lock();
         let mut m = self.read();
@@ -966,9 +983,23 @@ impl LnBook {
         }).collect()
     }
 
-    /// Payments handed to the node's router since `t` (every booking is one), failed ones included.
+    /// Book a payment about to be sent (the write-ahead record), at `now`. Every booking is a send
+    /// and goes through here: the record keeps the times of the sends of its payment hash in the last
+    /// hour (`sends`), so a retry, which replaces the record, is still counted (AGP-092).
+    pub fn put_sending(&self, hash: &str, mut rec: Value, now: f64) -> Result<()> {
+        let _g = self.lock.lock();
+        let mut m = self.read();
+        let mut sends: Vec<Value> = m.get(hash).map(send_times).unwrap_or_default().into_iter()
+            .filter(|t| *t >= now - 3600.0).map(ts_value).collect();
+        sends.push(ts_value(now));
+        rec["sends"] = sends.into();
+        m.insert(hash.into(), rec);
+        self.write(&m)
+    }
+
+    /// Payments handed to the node's router since `t`, failed ones and retries of one invoice included.
     pub fn sends_since(&self, t: f64) -> usize {
-        self.all().values().filter(|r| r.get("ts").and_then(Value::as_f64).is_some_and(|ts| ts >= t)).count()
+        self.all().values().map(|r| send_times(r).into_iter().filter(|ts| *ts >= t).count()).sum()
     }
 
     /// The newest `n` records, newest first.
@@ -986,17 +1017,31 @@ impl LnBook {
     }
 }
 
-/// Write `v` to `path` atomically (a synced temporary file renamed over it), mode 600.
+/// When a record's payment was handed to the router: its `sends`, or `ts` alone for a record written
+/// before AGP-092.
+fn send_times(rec: &Value) -> Vec<f64> {
+    match rec.get("sends").and_then(Value::as_array) {
+        Some(a) => a.iter().filter_map(Value::as_f64).collect(),
+        None => rec.get("ts").and_then(Value::as_f64).into_iter().collect(),
+    }
+}
+
+/// Write `v` to `path` atomically and durably, mode 600: a synced temporary file renamed over it,
+/// then the directory synced, so the new file is still there after a power loss (AGP-092: without the
+/// last step a halt of the rail could be lost). Every LN state file is written here, through the
+/// counted steps of [`crate::fsx`].
 pub(crate) fn write_json(path: &Path, v: &Value) -> Result<()> {
+    use crate::fsx;
+    let io = |e: std::io::Error| err("io", e.to_string());
     let tmp = path.with_extension("tmp");
     let text = dumps_indent(v, 2, true);
     {
-        use std::io::Write;
-        let mut f = crate::fsx::create_truncate(&tmp, 0o600).map_err(|e| err("io", e.to_string()))?;
-        f.write_all(text.as_bytes()).map_err(|e| err("io", e.to_string()))?;
-        f.sync_all().map_err(|e| err("io", e.to_string()))?;
+        let mut f = fsx::create_truncate(&tmp, 0o600).map_err(io)?;
+        fsx::write_all(&mut f, text.as_bytes()).map_err(io)?;
+        fsx::sync(&f).map_err(io)?;
     }
-    std::fs::rename(&tmp, path).map_err(|e| err("io", e.to_string()))
+    fsx::rename(&tmp, path).map_err(io)?;
+    fsx::sync_dir(fsx::parent_of(path)).map_err(io)
 }
 
 /// When a booked invoice (BOLT 11, or AGP-082 a BOLT 12 `lni1...`) stops being payable; `None` when
@@ -1286,7 +1331,7 @@ impl Signer {
         }
         sigaudit::set_rule(&if grant.is_some() { "human:approval_signature".to_string() } else { format!("policy:{}", d.rule) });
         // write-ahead: the worst case is booked before the router sees the invoice
-        if let Err(e) = self.ln_book.put(&hash, sending_record(&inv, &invoice, &dest, total, fee_limit, now, grant.as_deref())) {
+        if let Err(e) = self.ln_book.put_sending(&hash, sending_record(&inv, &invoice, &dest, total, fee_limit, now, grant.as_deref()), now) {
             return deny("ln", e.msg);
         }
         if let Err(e) = self.engine.commit(&pay, &format!("ln:{hash}")) {
@@ -1294,7 +1339,7 @@ impl Signer {
             return deny("ln", e.msg);
         }
         let req = SendRequest { invoice: invoice.clone(), fee_limit_sats: fee_limit, timeout_s: pol.timeout_s.max(1),
-                                cltv_limit: pol.max_cltv_blocks, outgoing_chan_ids: ids };
+                                cltv_limit: pol.htlc_blocks(false), outgoing_chan_ids: ids };
         let sent = ln.send(&req);
         self.ln_sent(&*ln, &hash, sent, LnSent { decision: d.as_value(), grant, total, warnings,
                                                  facts: json!({"chain_check": chain_ok, "fee_limit_sats": fee_limit, "invoice_sats": amount,
@@ -1404,12 +1449,28 @@ impl Signer {
                 let until = cltv_until(pmt);
                 if until > 0 && py_int(rec.get("cltv_until")) != Some(until) {
                     let _ = self.ln_book.update(hash, json!({"cltv_until": until}));
+                    self.ln_cltv_beyond(hash, rec, until);
                 }
                 json!({"verdict": "pending", "rail": "ln", "status": st, "payment_hash": hash, "charged_sats": py_int(rec.get("booked_sats")),
                        "cltv_until": until,
                        "note": "in flight: the booked amount stays against the budgets until the node settles or fails it (at the latest, \
                                 until its HTLCs' CLTV expiry)"})
             }
+        }
+    }
+
+    /// AGP-092: the watch of a released booking rests on [`LnPolicy::htlc_blocks`], which for an offer
+    /// is the owner's word about the node (`ln.node_max_cltv_blocks`). An HTLC seen out past it shows
+    /// that word is wrong: said in the audit log, so the owner can raise it. Nothing is unbooked.
+    fn ln_cltv_beyond(&self, hash: &str, rec: &Value, until: i64) {
+        let offer = rec.get("offer_id").is_some_and(|v| !v.is_null());
+        let limit = LnPolicy::from_map(&self.config().ln).htlc_blocks(offer);
+        let Ok(tip) = node::height(&*self.node) else { return };
+        if until - tip as i64 > limit {
+            self.engine.audit.append(json!({"type": "ln_cltv_beyond_policy", "payment_hash": hash, "cltv_until": until, "tip": tip,
+                                            "policy_blocks": limit, "offer": offer, "ts": ts_value(self.engine.now()),
+                                            "note": "the LN node locked an HTLC for longer than the policy takes it to: raise \
+                                                     ln.node_max_cltv_blocks to the node's max-cltv-expiry"}));
         }
     }
 
@@ -1460,9 +1521,10 @@ impl Signer {
 
     /// The booking goes. `unseen`: the node had no record of the payment, so it is watched for as long as
     /// an HTLC of it could still settle: until its invoice expires (+10 min), and (AGP-066) until
-    /// `max_cltv_blocks` + [`REBOOK_WATCH_MARGIN_BLOCKS`] blocks have passed, counted both in blocks from
-    /// our tip and in time at 10 min a block. A node that records it late gets it booked again
-    /// ([`Self::ln_rebook`]).
+    /// [`LnPolicy::htlc_blocks`] + [`REBOOK_WATCH_MARGIN_BLOCKS`] blocks have passed, counted both in
+    /// blocks from our tip and in time at 10 min a block. A node that records it late gets it booked
+    /// again ([`Self::ln_rebook`]). AGP-092: an offer's payment is watched for the node's own limit, not
+    /// ours, since no limit of ours went with it.
     pub(crate) fn ln_release(&self, hash: &str, rec: &Value, why: &str, unseen: bool) -> Value {
         let dest = str_or_empty(rec.get("dest"));
         let booked = py_int(rec.get("booked_sats")).unwrap_or(0);
@@ -1477,7 +1539,8 @@ impl Signer {
         let mut fields = json!({"state": "failed", "failure": why, "failed_ts": ts_value(now)});
         if unseen {
             let exp = invoice_expires_at(&str_or_empty(rec.get("invoice"))).unwrap_or(now);
-            let blocks = LnPolicy::from_map(&self.config().ln).max_cltv_blocks.max(0) + REBOOK_WATCH_MARGIN_BLOCKS;
+            let offer = rec.get("offer_id").is_some_and(|v| !v.is_null());
+            let blocks = LnPolicy::from_map(&self.config().ln).htlc_blocks(offer) + REBOOK_WATCH_MARGIN_BLOCKS;
             fields["unseen"] = true.into();
             fields["watch_until"] = ts_value((exp.max(now) + 600.0).max(now + blocks as f64 * 600.0));
             // our tip unknown: the time bound alone

@@ -100,6 +100,23 @@ def mine(n):
     return int(b2b("getblockcount"))
 
 
+def send_pinned(addr, btc):
+    """AGP-092: pay `addr` from a P2PKH coin of the lab wallet made after the split. The paying
+    transaction then carries a 0x21 signature in its scriptSig, which its txid commits to: that is
+    what pins a channel funded from this coin to XBT (ln_funding::xbt_only). A plain sendtoaddress
+    spends coinbases mined below the split with witness signatures, which pin nothing."""
+    legacy = b2b("-rpcwallet=lab", "getnewaddress", "", "legacy")
+    txid = b2b("-rpcwallet=lab", "sendtoaddress", legacy, f"{float(btc) + 0.001:.8f}")
+    mine(1)
+    tx = json.loads(b2b("-rpcwallet=lab", "gettransaction", txid, "true", "true"))["decoded"]
+    vout = next(o["n"] for o in tx["vout"] if o["scriptPubKey"].get("address") == legacy)
+    sent = json.loads(b2b("-rpcwallet=lab", "send", json.dumps({addr: float(btc)}), "null", "unset", "2",
+                          json.dumps({"inputs": [{"txid": txid, "vout": vout}], "add_inputs": False})))
+    if not sent.get("complete"):
+        raise RuntimeError(f"send from the P2PKH coin: {sent}")
+    return sent["txid"]
+
+
 def wait(what, secs, fn):
     end = time.time() + secs
     while time.time() < end:
@@ -264,7 +281,7 @@ def main():
     hA = mine(1)
     mine(130 - hA)
     addr = ln("lf1", "newaddress", "p2wkh")["address"]
-    b2b("-rpcwallet=lab", "sendtoaddress", addr, "1.0")
+    send_pinned(addr, "1.0")
     hB = mine(1)
     tip = mine(1)
     wait("lf1 sees both coins", 60, lambda: synced("lf1", tip) and len(ln("lf1", "listunspent", "--min_confs=1")["utxos"]) >= 3)
@@ -528,6 +545,9 @@ def run_049(mcp, sock, human_pub, lf2_pub, coinA2, procs, ln_env):
     ins = f.get("evidence", {}).get("inputs", [])
     check("S10 the unified channel's funding is proven on our node: every input 0x21, confirmed at or above the split",
           f.get("proven") is True and ins and all(i["sighash"] == ["0x21"] and i["height"] >= SPLIT for i in ins), f)
+    pin = f.get("evidence", {}).get("xbt_only", {})
+    check("S10 (AGP-092) its txid is pinned to XBT: a 0x21 signature in a scriptSig one transaction behind it",
+          pin.get("pinned_by") == "a 0x21 signature in a scriptSig" and pin.get("generations") == 1, pin)
     ftx = json.loads(b2b("getrawtransaction", f.get("evidence", {}).get("txid", "00"), "true")) if f.get("evidence") else {}
     wit = [v.get("txinwitness", [""])[0][-2:] for v in ftx.get("vin", [])]
     REPORT["scenarios"]["S10_knots_witness_sighash"] = wit
@@ -788,7 +808,7 @@ def run_083(mcp, human_pub, lf2_pub, procs):
             ln("lf1", "payinvoice", "--force", "--json", f"--outgoing_chan_id={c.get('scid', c['chan_id'])}", fund["payment_request"])
     lf1_pub = ln("lf1", "getinfo")["identity_pubkey"]
     ln("lf3", "connect", f"{lf1_pub}@lf1:9735")
-    b2b("-rpcwallet=lab", "sendtoaddress", ln("lf3", "newaddress", "p2wkh")["address"], "0.05")
+    send_pinned(ln("lf3", "newaddress", "p2wkh")["address"], "0.05")
     h_coin = mine(1)
     tip = mine(1)
     wait("lf3 sees its coin", 60, lambda: synced("lf3", tip) and len(ln("lf3", "listunspent", "--min_confs=1")["utxos"]) == 1)

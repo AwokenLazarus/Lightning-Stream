@@ -28,14 +28,30 @@
 //!
 //! **What the height does not prove.** A coin confirmed at or above the split is not thereby XBT-only:
 //! a transaction valid on both chains (a 0x01 spend of pre-split coins, broadcast on both) has the same
-//! txid on each, so its outputs exist on SHA-256 Bitcoin too, however high it confirmed here. The
-//! signatures are the proof. Every input's coin must still be confirmed at or above the split height,
-//! as an extra, conservative rule (a channel opened after the split never needs older coins).
+//! txid on each, so its outputs exist on SHA-256 Bitcoin too, however high it confirmed here. Every
+//! input's coin must still be confirmed at or above the split height, as an extra, conservative rule
+//! (a channel opened after the split never needs older coins).
+//!
+//! **What a witness signature does not prove (AGP-092).** A segwit or taproot input's signatures are
+//! in the witness, and the witness is not part of the txid. So the same funding txid is a valid
+//! transaction on SHA-256 Bitcoin, with other signatures in its witnesses, whenever every coin it
+//! spends exists there; the 0x21 bytes we read on XBT say nothing about that twin. The rule the proof
+//! keeps: **a funding is proven only when its txid cannot be a valid transaction on SHA-256
+//! Bitcoin.** That holds when the transaction, or one it descends from through at least one input, is
+//! pinned to XBT by something its txid commits to ([`xbt_only`]): it is a coinbase at or above the
+//! split, or one of its inputs carries a 0x21 signature in its scriptSig (a P2PKH spend). One pinned
+//! input is enough, since a transaction is invalid where one of its coins does not exist. The search
+//! goes back through coins confirmed at or above the split (below it every transaction is on both
+//! chains) and looks up at most [`ANCESTRY_LOOKUPS`] transactions. A funding with no such ancestor in
+//! reach is refused: the owner funds the channel from mined coins, or from coins that passed through
+//! a P2PKH address after the split.
 //!
 //! The funding transaction's checks: the channel's txid, output, amount and P2WSH. Inputs are looked up
 //! with `getrawtransaction` (the signer's node needs `txindex=1`); a lookup that fails leaves the
 //! channel unproven, and an unproven channel carries no payment. The verdict carries the funding block's
 //! hash, which the signer's cache is keyed on, so a reorg proves the channel again.
+use std::collections::{HashSet, VecDeque};
+
 use serde_json::{json, Value};
 use xbt_primitives::script::{classify, SpkKind};
 use xbt_primitives::tx::{Tx, TxIn};
@@ -44,11 +60,15 @@ use crate::node::{self, Node};
 
 /// SIGHASH_ALL | SIGHASH_UNIFIED (0x20).
 pub const SIGHASH_UNIFIED_ALL: u8 = 0x21;
+/// Transactions [`xbt_only`] looks up before it gives up (one verdict per channel and funding block:
+/// the signer caches it).
+pub const ANCESTRY_LOOKUPS: usize = 256;
 
 /// The verdict on one channel's funding.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Funding {
-    /// Every input signed 0x21 and confirmed at or above the split: the evidence.
+    /// Every input signed 0x21 and confirmed at or above the split, and the txid pinned to XBT by an
+    /// ancestor ([`xbt_only`]): the evidence.
     Proven(Value),
     /// The transaction says the channel is unsafe (or is not the channel's): why, and the evidence.
     Refused(String, Value),
@@ -213,6 +233,65 @@ fn tx_hex(v: &Value) -> Option<String> {
     v.as_str().map(str::to_string).or_else(|| v.get("hex").and_then(Value::as_str).map(str::to_string))
 }
 
+fn is_coinbase(tx: &Tx) -> bool {
+    tx.inputs.len() == 1 && tx.inputs[0].prevout.txid == [0u8; 32] && tx.inputs[0].prevout.vout == 0xFFFF_FFFF
+}
+
+/// A confirmed transaction on our node: itself and its height. `Err`: the node cannot say.
+fn confirmed_tx(node: &dyn Node, txid: &str) -> Result<(Tx, i64), String> {
+    let v = node::get_tx(node, txid, "").ok_or_else(|| format!("our node cannot find transaction {txid} (the signer's node needs txindex=1)"))?;
+    let tx = v.get("hex").and_then(Value::as_str).and_then(|h| Tx::parse_hex(h).ok()).filter(|t| t.txid() == txid)
+        .ok_or_else(|| format!("our node's transaction {txid} does not parse to that txid"))?;
+    let h = v.get("blockhash").and_then(Value::as_str).and_then(|b| height_of_block(node, b))
+        .ok_or_else(|| format!("transaction {txid} has no confirmed block on our node"))?;
+    Ok((tx, h))
+}
+
+/// Is `inp` a P2PKH spend whose one signature is 0x21? Then the signature is in the scriptSig, which
+/// the txid commits to, and SHA-256 Bitcoin cannot verify it: no transaction with this txid is valid there.
+fn pinned_by_script_sig(inp: &TxIn, prev_spk: &[u8]) -> bool {
+    let p2pkh = prev_spk.len() == 25 && prev_spk[..3] == [0x76, 0xa9, 0x14] && prev_spk[23..] == [0x88, OP_CHECKSIG];
+    p2pkh && inp.witness.is_empty() && checked_sighashes(inp, prev_spk).is_ok_and(|s| s == [SIGHASH_UNIFIED_ALL])
+}
+
+/// What pins `funding`'s txid to XBT (the module documentation's rule), searched breadth first from
+/// its inputs: `Ok(Some(evidence))`, `Ok(None)` when [`ANCESTRY_LOOKUPS`] transactions held no pin, and
+/// `Err` when our node could not return an ancestor (then nothing is concluded).
+pub fn xbt_only(node: &dyn Node, funding: &Tx, split_height: i64) -> Result<Option<Value>, String> {
+    let mut seen: HashSet<String> = HashSet::from([funding.txid()]);
+    let mut queue: VecDeque<(Tx, u32)> = VecDeque::from([(funding.clone(), 0)]);
+    let mut looked_up = 0usize;
+    while let Some((tx, depth)) = queue.pop_front() {
+        for (i, inp) in tx.inputs.iter().enumerate() {
+            let prev_txid = inp.prevout.txid_hex();
+            if looked_up == ANCESTRY_LOOKUPS {
+                return Ok(None);
+            }
+            looked_up += 1;
+            let (prev, h) = confirmed_tx(node, &prev_txid)?;
+            let Some(coin) = prev.outputs.get(inp.prevout.vout as usize) else {
+                return Err(format!("our node's copy of {prev_txid} has no output {}", inp.prevout.vout));
+            };
+            // whatever the coin's age: the signature is in this transaction's txid
+            if pinned_by_script_sig(inp, &coin.script_pubkey) {
+                return Ok(Some(json!({"pinned_by": "a 0x21 signature in a scriptSig", "txid": tx.txid(), "input": i, "generations": depth,
+                                      "looked_up": looked_up})));
+            }
+            if h < split_height {
+                continue; // below the split every transaction is on both chains: nothing behind it helps
+            }
+            if is_coinbase(&prev) {
+                return Ok(Some(json!({"pinned_by": "a coinbase at or above the split", "txid": prev_txid, "height": h, "generations": depth + 1,
+                                      "looked_up": looked_up})));
+            }
+            if seen.insert(prev_txid) {
+                queue.push_back((prev, depth + 1));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Prove (or refuse) one channel's funding: `channel_point` is LND's `txid:vout`, `scid` its short
 /// channel id, `capacity` its size in sats.
 pub fn check(node: &dyn Node, channel_point: &str, scid: u64, capacity: i64, split_height: i64) -> Funding {
@@ -301,8 +380,22 @@ pub fn check(node: &dyn Node, channel_point: &str, scid: u64, capacity: i64, spl
         }
         inputs.push(json!({"outpoint": format!("{prev_txid}:{pv}"), "height": h, "sighash": shown}));
     }
-    let evidence = ev(json!({"inputs": inputs, "source": "the signer's own node"}));
-    if bad.is_empty() { Funding::Proven(evidence) } else { Funding::Refused(bad.join("; "), evidence) }
+    let mut evidence = ev(json!({"inputs": inputs, "source": "the signer's own node"}));
+    if !bad.is_empty() {
+        return Funding::Refused(bad.join("; "), evidence);
+    }
+    match xbt_only(node, &tx, split_height) {
+        Ok(Some(pin)) => {
+            evidence["xbt_only"] = pin;
+            Funding::Proven(evidence)
+        }
+        Ok(None) => Funding::Refused(format!(
+            "nothing its txid commits to pins the funding to XBT: its inputs' signatures are in witnesses, which are not part of the txid, and \
+             no transaction behind it (back to the split {split_height}, at most {ANCESTRY_LOOKUPS} looked up) is a coinbase or carries a 0x21 \
+             signature in a scriptSig. The same txid may be valid on SHA-256 Bitcoin with other signatures: fund the channel from mined coins, or \
+             from coins that passed through a P2PKH address after the split"), evidence),
+        Err(why) => Funding::Unknown(why),
+    }
 }
 
 #[cfg(test)]
