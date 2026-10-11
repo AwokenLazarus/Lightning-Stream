@@ -229,7 +229,7 @@ fn a_slow_list_of_payments_ends_at_the_call_deadline() {
     assert!(b.flags().iter().any(|fl| fl.server == slow.url() && fl.reason.contains("transaction.get")), "{:?}", b.flags());
 }
 
-/// A history names a transaction once. A second entry for it is flagged and not used.
+/// One claim per server and transaction: a second block height for it is flagged and not used.
 #[test]
 fn a_transaction_listed_twice_is_one_claim() {
     let chain = sim(200);
@@ -241,7 +241,29 @@ fn a_transaction_listed_twice_is_one_claim() {
     let merkle = |s: &Arc<FakeElectrum>| s.calls.lock().unwrap().iter().filter(|m| *m == "blockchain.transaction.get_merkle").count();
     assert_eq!(b.tx_out(&f, 0, false).unwrap().unwrap().confirmations, 1);
     assert!(merkle(&liar) <= 2, "{} proof requests for one transaction", merkle(&liar));
-    assert!(flagged(&b, &liar, "more than once"), "{:?}", b.flags());
+    assert!(flagged(&b, &liar, "at two heights"), "{:?}", b.flags());
+}
+
+/// Found by the regtest interop run: electrs lists a transaction twice while a block arrives (once
+/// from its mempool, once from the block). That is not a lie: no flag, and the block height is the
+/// claim, whichever entry comes first.
+#[test]
+fn evidence_a_mempool_and_a_block_entry_for_one_transaction_are_one_honest_claim() {
+    let chain = sim(200);
+    let fund = spk(0x5b);
+    let f = chain.lock().unwrap().credit(0, 70_000, &fund, true);
+    for first in [true, false] {
+        let s = FakeElectrum::start(chain.clone(), false);
+        if first {
+            s.knobs().claim_height.insert(f.clone(), 0);
+            s.knobs().extra_history.insert(scripthash(&fund), vec![(f.clone(), 201), (f.clone(), 201)]);
+        } else {
+            s.knobs().extra_history.insert(scripthash(&fund), vec![(f.clone(), 0), (f.clone(), 201)]);
+        }
+        let b = backend(&chain, &[s.url()]);
+        assert_eq!(b.tx_out(&f, 0, false).unwrap().unwrap().confirmations, 1);
+        assert!(b.flags().is_empty(), "{:?}", b.flags());
+    }
 }
 
 /// Evidence (passes before and after): a spend that only an unanswered proof would confirm does not
@@ -276,4 +298,22 @@ fn evidence_every_server_hiding_reads_as_absent() {
     let b = backend(&chain, &[s.url()]);
     assert_eq!(b.tx_out(&f, 0, true).unwrap(), None);
     assert_eq!(b.spending_tx(&f, 0).unwrap(), None, "and no spend is claimed for it");
+}
+
+/// Found by the regtest interop run: electrs negotiates protocol 1.4 until it has indexed a v2
+/// header, and refuses headers on that connection from then on. A client that connected early kept
+/// the connection and never synced. A refused tip now ends the connection; the next round connects
+/// and negotiates again.
+#[test]
+fn a_server_that_refuses_its_tip_is_reconnected_to() {
+    let chain = sim(200);
+    let s = FakeElectrum::start(chain.clone(), false);
+    s.knobs().fail.insert("blockchain.headers.subscribe".into(), "refusing block headers to a client at protocol 1.4".into());
+    let b = backend(&chain, &[s.url()]);
+    assert!(b.block_count().is_err());
+    let versions = |s: &Arc<FakeElectrum>| s.calls.lock().unwrap().iter().filter(|m| *m == "server.version").count();
+    assert_eq!(versions(&s), 1);
+    s.knobs().fail.clear();
+    assert_eq!(b.block_count().unwrap(), 200);
+    assert_eq!(versions(&s), 2, "it negotiated again on a new connection");
 }

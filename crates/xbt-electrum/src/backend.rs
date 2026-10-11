@@ -435,11 +435,15 @@ enum Supplied {
     Silent,
 }
 
-/// A server's words for "I have no such transaction" (bitcoind's, electrs', ElectrumX's, Fulcrum's).
-/// Any other error is no answer: busy, rate-limited, or a wording not known here, which fails closed.
-fn says_no_such_tx(e: &ElectrumError) -> bool {
+/// A server's words for "I have no such transaction" and, asked for a proof, "it is not in that
+/// block" (bitcoind's, electrs', ElectrumX's, Fulcrum's).
+pub const NOT_THERE: [&str; 6] = ["no such", "not found", "not in block", "not confirmed", "no transaction", "missing"];
+
+/// Did the server say, in its own words, that it has no such transaction (or no such proof)? Any
+/// other error is no answer: busy, rate-limited, or a wording not known here, which fails closed.
+fn says_not_there(e: &ElectrumError) -> bool {
     let m = e.msg.to_ascii_lowercase();
-    e.kind == Kind::Server && ["no such", "not found", "missing"].iter().any(|w| m.contains(w))
+    e.kind == Kind::Server && NOT_THERE.iter().any(|w| m.contains(w))
 }
 
 enum SyncFail {
@@ -735,7 +739,15 @@ impl ElectrumBackend {
         // this server's part of the round ends here, whatever it is still sending (AGP-081, review E1)
         let until = Instant::now() + self.sync_deadline;
         let late = |at: u32| SyncFail::Other(format!("sync deadline ({:?}) reached at height {at}: the headers it proved are kept", self.sync_deadline));
-        let tip = c.subscribe("blockchain.headers.subscribe", json!([])).map_err(|e| SyncFail::Other(e.msg))?;
+        let tip = c.subscribe("blockchain.headers.subscribe", json!([])).map_err(|e| {
+            // A server that refuses its tip is of no use on this connection, and the refusal can be
+            // the connection's: electrs negotiates protocol 1.4 until it has indexed a v2 header and
+            // then refuses headers to that client for good. Hang up; the next round negotiates again.
+            if e.kind == Kind::Server {
+                c.close();
+            }
+            SyncFail::Other(e.msg)
+        })?;
         let th = tip.get("height").and_then(Value::as_u64).and_then(|h| u32::try_from(h).ok())
             .ok_or_else(|| SyncFail::Other("headers.subscribe: no height".into()))?;
         let tip_raw = hex::decode(tip.get("hex").and_then(Value::as_str).unwrap_or(""))
@@ -905,7 +917,7 @@ impl ElectrumBackend {
                     // a lie is an answer: it shows that this server does not supply the transaction
                     None => self.flag(&c.url, format!("transaction.get {}: not the transaction asked for", &txid[..16.min(txid.len())])),
                 },
-                Err(e) if says_no_such_tx(&e) => {}
+                Err(e) if says_not_there(&e) => {}
                 Err(e) => {
                     self.flag(&c.url, format!("transaction.get: {e}"));
                     silent.push(c.url.clone());
@@ -1040,24 +1052,28 @@ impl ElectrumBackend {
                 continue;
             };
             answered += 1;
-            let mut twice = false;
+            let mut two_heights = false;
             for e in hist {
                 match (e.get("tx_hash").and_then(Value::as_str), e.get("height").and_then(Value::as_i64)) {
                     (Some(t), Some(h)) if t.len() == 64 && t.chars().all(|x| x.is_ascii_hexdigit()) => {
                         let claims = out.entry(t.to_ascii_lowercase()).or_default();
-                        // a history names a transaction once: a second height for it is not a claim
-                        // (each one used to cost a proof request, and a header sync when above our tip)
-                        if claims.iter().any(|(k, _)| Arc::ptr_eq(k, c)) {
-                            twice = true;
-                        } else {
-                            claims.push((c.clone(), h));
+                        // One claim per server and transaction. An honest server can list one twice (in
+                        // its mempool and in a block, as a block arrives: electrs does), so a block
+                        // height replaces a mempool entry and a repeat is dropped. A second block
+                        // height is not a claim: each one used to cost a proof request, and a header
+                        // sync when above our tip.
+                        match claims.iter_mut().find(|(k, _)| Arc::ptr_eq(k, c)) {
+                            None => claims.push((c.clone(), h)),
+                            Some((_, had)) if *had <= 0 && h > 0 => *had = h,
+                            Some((_, had)) if h > 0 && *had != h => two_heights = true,
+                            Some(_) => {}
                         }
                     }
                     _ => i.flag(&c.url, "get_history: malformed entry"),
                 }
             }
-            if twice {
-                i.flag(&c.url, "get_history lists a transaction more than once: only its first entry is used");
+            if two_heights {
+                i.flag(&c.url, "get_history lists a transaction at two heights: only the first is used");
             }
         }
         if answered == 0 {
@@ -1140,7 +1156,9 @@ impl ElectrumBackend {
                 Ok(m) => m,
                 Err(e) => {
                     self.flag(&c.url, format!("blockchain.transaction.get_merkle: {e}"));
-                    checked = false; // busy, gone or silent: its claim stands unjudged
+                    // "not in that block", in its own words, withdraws its claim; busy, gone or silent
+                    // leaves the claim unjudged
+                    checked &= says_not_there(&e);
                     continue;
                 }
             };

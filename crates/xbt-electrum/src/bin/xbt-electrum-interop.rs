@@ -19,7 +19,7 @@ use xbt402::client::{Client, ClientConfig, Wallet};
 use xbt402::http::UreqTransport;
 use xbt402::rpc::Rpc;
 use xbt402::{ChannelError, Result};
-use xbt_electrum::{Config, ElectrumBackend, TxStatus};
+use xbt_electrum::{tls_config, Config, Connection, ElectrumBackend, TxStatus};
 use xbt_primitives::address::segwit_address;
 use xbt_primitives::ecdsa;
 use xbt_primitives::hash::sha256;
@@ -124,9 +124,38 @@ impl LightWallet {
     }
 }
 
+/// `n` blocks, at most 100 a call: on a busy host one call for the 1,008 of the refund scenario
+/// outlasts the RPC client's 60 s.
 fn mine(node: &Rpc, n: u32) -> Result<()> {
     let addr = node.call("getnewaddress", json!([]))?;
-    node.call("generatetoaddress", json!([n, addr]))?;
+    let mut left = n;
+    while left > 0 {
+        let k = left.min(100);
+        node.call("generatetoaddress", json!([k, addr]))?;
+        left -= k;
+    }
+    Ok(())
+}
+
+/// Wait until every server serves its tip. electrs negotiates protocol 1.4, and refuses headers,
+/// until it has indexed a v2 header: a backend built before that would count the server's start-up
+/// among its verification failures.
+fn wait_ready(cfg: &Config) -> Result<()> {
+    let ca: Vec<&std::path::Path> = cfg.extra_ca.iter().map(std::path::PathBuf::as_path).collect();
+    let tls = tls_config(&ca)?;
+    let t0 = Instant::now();
+    for url in &cfg.servers {
+        loop {
+            let c = Connection::new(url, cfg.timeout, Some(tls.clone()), None)?;
+            let ready = c.request("blockchain.headers.subscribe", json!([]));
+            c.close();
+            match ready {
+                Ok(_) => break,
+                Err(err) if t0.elapsed() > Duration::from_secs(180) => return Err(e(format!("{url} does not serve its tip: {err}"))),
+                Err(_) => std::thread::sleep(Duration::from_millis(250)),
+            }
+        }
+    }
     Ok(())
 }
 
@@ -175,6 +204,7 @@ fn rig() -> Result<Rig> {
     cfg.min_servers = arg("--min-servers").map(|m| m.parse().expect("min-servers"));
     cfg.extra_ca = arg("--ca").into_iter().map(Into::into).collect();
     cfg.timeout = Duration::from_secs(20);
+    wait_ready(&cfg)?;
     let light = Arc::new(ElectrumBackend::new(cfg)?);
     // electrs must have indexed the node's chain
     let want = node.call("getblockcount", json!([]))?.as_u64().unwrap_or(0) as u32;

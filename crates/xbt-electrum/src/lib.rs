@@ -56,8 +56,8 @@
 //!   Both are flagged in `status()["verification_failures"]`; the cure is to remove the server.
 //! * An invented transaction that pays the script cannot be told from an unconfirmed payment.
 //!
-//! "No such transaction" is read from the server's words (`no such`, `not found`, `missing`); an
-//! error worded otherwise counts as no answer. A script with a history longer than
+//! "No such transaction" and "not in that block" are read from the server's words
+//! ([`backend::NOT_THERE`]); an error worded otherwise counts as no answer. A script with a history longer than
 //! [`conn::MAX_HISTORY`], or a transaction above [`conn::MAX_TX_BYTES`], is not answered by this
 //! backend.
 pub mod backend;

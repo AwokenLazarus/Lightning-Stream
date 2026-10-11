@@ -943,6 +943,8 @@ impl LnBook {
         self.read().get(hash).cloned()
     }
 
+    /// Write a record as it is. Not for a payment about to be sent: that goes through
+    /// [`Self::put_sending`], which is what the rate limit counts.
     pub fn put(&self, hash: &str, rec: Value) -> Result<()> {
         let _g = self.lock.lock();
         let mut m = self.read();

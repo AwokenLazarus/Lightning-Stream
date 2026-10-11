@@ -2049,6 +2049,108 @@ a hub lock record holds `unitsBy`; `HotWallet::broadcast` may answer `rpc_error`
 answered `rpc_refused`; `open_channel`, `fund` and `xbt402_pay` may leave a pending channel
 behind an error.
 
+## Fix wave 4: light client and Lightning (AGP-092)
+
+The second closure audit (AGP-087) found each earlier fix had a neighbour left open. For this area
+that was list 1 items 14 and 18. Each fix below states the rule the code keeps and goes through one
+function; the tests named `agp087_*` are the audit's, those named `agp092_*` are the other sides.
+B2 `agentwallet/electrum.py`, `chain.py`, `signer.py` and `xbt402.py` on `agp-092` do the same for
+the light client, with the same test names.
+
+### The light client (`xbt-electrum`)
+
+**Rule 1: unknown is not absent.** A lookup says "not there" (no such transaction, no such output,
+not in a block, no such coin) only when every server it asked answered. If one did not answer, the
+call fails with `Kind::Unreachable`. `tx_out` says "spent" only for a confirmed spend with a proof.
+
+| place | before | now |
+|---|---|---|
+| `fetch_tx` (the transaction asked for) | every server failed `transaction.get`: `None` | every server is asked at once, the first that supplies it wins; `None` only if each said it has no such transaction (`NOT_THERE`), else an error |
+| `locate` (is it in a block or a mempool) | one server answered the history without it, the others failed: no status | `Hist::complete`: an error unless every server answered |
+| `confirmed` (the Merkle proof) | the server that listed a height failed the proof request: "unconfirmed" | `Proof::checked`: an error unless a proof was found or every claim was answered |
+| `unspent` (`scantxoutset`) | a coin whose transaction or proof went unanswered was left out | the scan fails |
+| `transaction`, `has_transaction`, `tx_out`, `call("gettxout")`, `call("getrawtransaction")` | as above | all go through `locate` |
+| `spender` (the search for a spend) | a spend only a failing server lists is not found | **unchanged, on purpose**: "unspent" can only be acted on by a broadcast, which the network refuses if it is wrong. Were this an error, one server could hold a refund back by listing a spend and never proving it (`evidence_an_unproven_spend_does_not_hold_the_refund_back`) |
+
+**Rule 2: a call has a deadline.** Every request one call makes ends at `Config::call_deadline`
+(four timeouts unless set), counted from the end of its header sync. A call forces one header sync
+at most. A server is asked only for the transactions it listed itself (`supply`), in parallel with
+the others: one first, then `TX_BATCH` at a time. Its list ends, with a flag, at the first it does
+not supply, at the first that neither pays the script nor can spend an output that does
+(`invented`), and at the deadline. A server has one claim per transaction: a block height replaces
+a mempool entry for it (electrs lists both while a block arrives), and a second block height is
+flagged and is not a claim. A server that refuses its tip is hung up on, so the next round
+negotiates the protocol again (electrs answers 1.4 until it has indexed a v2 header). Connecting costs one timeout for the TCP connect and the TLS handshake together
+(`Connection::connect_until`; `complete_io` waited a full read timeout for every byte), then one
+for `server.version` and one for the subscriptions.
+
+Measured in the tests, debug build, loopback: the audit's 40 entries at 250 ms each, 13.2 s before,
+now one request to the server that listed them (`hole_one_slow_server_holds_gettxout_for_entries_times_delay`
+passes its 4 s line); 50 invented entries, 150 `transaction.get` on the second call before, 1 now;
+200 claims above the tip, 202 sync rounds before, at most 2 now; a TLS handshake trickled at one
+byte per 100 ms under a 300 ms timeout, 4.0 s before, 0.3 s now. Rerun:
+`cargo test -p xbt-electrum --test agp087_light --test agp092_light -- --nocapture`.
+
+**What a server can still do.**
+
+* If every configured server hides a transaction, it reads as absent
+  (`evidence_every_server_hiding_reads_as_absent`). A caller that would book a loss on that must
+  ask for the proven spend (`spending_tx` with a confirmed status), as B2's refund and
+  `funding_spent` now do (`chain.spend_is_evidence`).
+* By not answering, a server turns every "not there" into an error for as long as it is
+  configured. By listing transactions that pay the script (which cannot be told from unconfirmed
+  payments) and supplying them slowly, it holds each call that reads that script up to
+  `call_deadline`. Both are flagged; the cure is to remove the server.
+* "No such transaction" and "not in that block" are read from the server's words
+  (`backend::NOT_THERE`). An error worded otherwise counts as no answer, which fails closed.
+* The worst case of one call is its header sync (`sync_deadline` for the caller that holds the sync
+  gate), then `call_deadline`, then one forced sync.
+
+### The Lightning rail (`xbt-signer`)
+
+**A booking released as never sent is watched for as long as its HTLC can last** (L4).
+`LnPolicy::htlc_blocks` is the one function both the limit sent to the router and the watch read.
+A BOLT 11 payment goes out with `cltv_limit = ln.max_cltv_blocks`. `PayOffer` takes no limit, so an
+offer's HTLC is bounded by the node's own `max-cltv-expiry`, which the wallet cannot read: the new
+policy field `ln.node_max_cltv_blocks` (2016, LND's default) says what it is, and an offer's
+released booking is watched that long plus 144 blocks, by the send path and by the reconcile after
+a crash. An HTLC seen in flight past the policy's figure is written to the audit log
+(`ln_cltv_beyond_policy`). Tests: `agp087_ln_l4_an_offers_htlc_can_outlive_the_rebook_watch`,
+`agp092_l4_every_release_is_watched_for_as_long_as_its_htlc_can_last`,
+`agp092_l4_the_offer_watch_follows_the_policy`. Limit: an owner who raised the node's
+`max-cltv-expiry` above 2016 and did not raise the policy field has a watch shorter than the HTLC.
+
+**A funding is proven only when its txid cannot be a valid transaction on SHA-256 Bitcoin** (L5).
+The signatures of a segwit or taproot input are in the witness, which the txid does not commit to,
+so the 0x21 bytes read on XBT say nothing about the same txid with other witnesses on the other
+chain. `ln_funding::xbt_only` now asks what pins the txid: the funding, or a transaction it
+descends from, is a coinbase at or above the split or carries a 0x21 signature in a scriptSig (a
+P2PKH spend). The search is breadth first through coins confirmed at or above the split and looks
+up at most `ANCESTRY_LOOKUPS` (256) transactions; the verdict is cached per funding block as
+before. A funding with no pin in reach is refused, and the refusal says how to fund one that
+passes (mined coins, or coins that went through a P2PKH address after the split). Tests:
+`agp087_ln_l5_a_funding_whose_replayed_parent_is_signed_0x01_is_not_proven`, `agp092_l5_*` (3).
+The test rig's channels are now funded from a coinbase, as a mined coin is; no assertion changed.
+**This changes which channels carry payments**: a node funded from coins with a long history of
+segwit spends is refused until it is funded as above. The signatures are still not verified in the
+signer (the node that accepted the block did).
+
+**The rate limit counts sends.** `LnBook::put_sending` is the one place a payment is booked before
+it is sent, for an invoice and for an offer; it keeps the times of the sends of that payment hash
+in the last hour, and `sends_since` adds them up. Tests:
+`agp087_ln_side_retries_of_one_invoice_are_not_rate_limited`,
+`agp092_retries_of_an_offers_invoice_are_rate_limited`.
+
+**LN state files are durable.** `ln::write_json` (the payment book, `ln_halt.json`,
+`ln_offers.json`) now writes through the counted steps of `fsx` and fsyncs the directory after the
+rename, so a halt survives a power loss. Test:
+`agp092_ln_state_files_are_written_through_the_durable_steps`.
+
+**For embedders.** `xbt_electrum::Config` has a new field `call_deadline`; `Connection` has
+`connect_until`, and `subscribe_many` takes a deadline. Calls that answered `None` or an empty list
+when a server was silent now return `Kind::Unreachable`. `LnPolicy` has `node_max_cltv_blocks`.
+`ln_funding::Funding::Proven` evidence has an `xbt_only` object.
+
 ## Portability
 
 No platform-specific dependencies: libsecp256k1 (C, via `secp256k1-sys`), pure-Rust hashes and JSON,
@@ -2066,8 +2168,10 @@ reference should report the gross `cum` is for the lead (AGP-023 follow-up), not
 
 ## The light backend: xbt-electrum (AGP-028)
 
-A client with no node: the xbt402 payer (and later the wallet) reads the chain from Electrum servers
-and trusts only what it can check. A port of B2's `agentwallet/electrum.py` (AGP-024) with the same
+A client with no node: the xbt402 payer (and later the wallet) reads the chain from Electrum servers.
+What it is told about headers, transactions, confirmations and confirmed spends it checks; that a
+transaction or a spend does *not* exist it cannot check, and takes only as the answer of every
+server it asked (see "Fix wave 4" below for the rule and its limits). A port of B2's `agentwallet/electrum.py` (AGP-024) with the same
 trust rules; the threat model is in B2 `docs/B2_CHAIN_BACKEND.md` and the crate docs.
 
 ```rust
@@ -2116,8 +2220,9 @@ fee estimate is the median over servers (the Python took the first answer).
 ## Light client and consensus edges (AGP-069, review E1–E3, S1, M1)
 
 The light backend now checks headers as Knots does from the first header above the checkpoint. It
-withholds answers while its chain is not believable, and a lying server can neither stall callers
-nor get a cheap fork believed. The hot wallet waits for the coinbase maturity the node reports. B2
+withholds answers while its chain is not believable, and a lying server cannot get a cheap fork
+believed or stall the header sync. (What one server can cost any other call is bounded since
+AGP-092: "Fix wave 4" below.) The hot wallet waits for the coinbase maturity the node reports. B2
 `agentwallet/headers.py`, `electrum.py`, `maturity.py` and `hot.py` on `agp-069` (`21db571`) and B1
 `xbt402/tx.py` on `agp-069` (`efd5770`) do the same, with the same test names (`test_` prefixed in
 Python). Knots line numbers below are v29.4.2.
@@ -2697,7 +2802,8 @@ Two design notes stand as before, and nothing below changes them:
 
   A halt file that cannot be read counts as a halt. The watch lasted until the invoice's expiry plus
   10 minutes, far shorter than an HTLC can stay out. It now lasts `ln.max_cltv_blocks` + 144 blocks
-  (`REBOOK_WATCH_MARGIN_BLOCKS`), counted both in blocks from the tip at release
+  (`REBOOK_WATCH_MARGIN_BLOCKS`; for a BOLT 12 payment `ln.node_max_cltv_blocks` + 144, AGP-092),
+  counted both in blocks from the tip at release
   (`watch_until_height`) and in time at 600 s a block. Tests:
   `l4_a_late_rebook_that_breaks_the_policy_halts_the_rail_until_the_human_resumes_it` and
   `l4_the_rebook_watch_lasts_as_long_as_the_htlc_can`. The AGP-048 test
@@ -2837,14 +2943,17 @@ it is the invoice that is paid (`POST /v2/offers/pay` with `invoice`), never the
 offer again would fetch a second invoice, and a retry that settled beside the first would pay twice.
 A later `ln_pay` of the same offer for the same amount pays the stored invoice while it is unpaid and
 not expiring; a new one is fetched only after that one settled. Invoices asked of one offer are
-limited by `ln.max_sends_per_hour`, paid or not.
+limited by `ln.max_sends_per_hour`, paid or not, and so is every send of one invoice (AGP-092: a
+retry used to replace the one record that was counted).
 
 **Channels.** `PayOffer` takes neither a set of outgoing channels nor a CLTV limit, so the wallet
 cannot confine an offer's payment to the channels it has proven, as it does for BOLT 11
 (`outgoing_chan_ids`). Instead it refuses the payment (`ln_offer_unsafe_channel`) unless **every**
 channel of the node passes the guards and the funding proof, inactive ones included. A node with a
 taproot, non-unified, zero-conf or pre-split channel pays BOLT 11 invoices and no offers. The node's
-own `max-cltv-expiry` bounds the route's time lock; the wallet bounds the invoice's blinded paths.
+own `max-cltv-expiry` bounds the route's time lock; the wallet bounds the invoice's blinded paths,
+and watches a released booking for `ln.node_max_cltv_blocks` (2016, that setting's default) + 144
+blocks (AGP-092).
 The fee limit sent is never 0, which the node reads as its default limit: it is at least 1 sat.
 
 **Not payer identity.** A BOLT 12 invoice names the key the request was signed with
