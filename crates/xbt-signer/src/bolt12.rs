@@ -9,7 +9,7 @@
 //! nothing here writes an invoice request (the node does that).
 //!
 //! XBT Lightning keeps Bitcoin's genesis chain hash, and BOLT 12 reads an offer that names no chain as
-//! Bitcoin mainnet, so on mainnet a chain-less offer names this chain and SHA-256 Bitcoin alike. What
+//! Bitcoin mainnet, so on mainnet a chain-less offer names this chain and the SHA-256 chain alike. What
 //! separates the two is the compulsory feature bit 512 (`option_blake2b`), as on BOLT 11
 //! ([`crate::bolt11::FEATURE_BLAKE2B`]): [`check_offer`] and [`check_invoice`] refuse without it.
 //!

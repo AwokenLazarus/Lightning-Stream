@@ -2282,7 +2282,7 @@ a crash. An HTLC seen in flight past the policy's figure is written to the audit
 `agp092_l4_the_offer_watch_follows_the_policy`. Limit: an owner who raised the node's
 `max-cltv-expiry` above 2016 and did not raise the policy field has a watch shorter than the HTLC.
 
-**A funding is proven only when its txid cannot be a valid transaction on SHA-256 Bitcoin** (L5).
+**A funding is proven only when its txid cannot be a valid transaction on the SHA-256 chain** (L5).
 The signatures of a segwit or taproot input are in the witness, which the txid does not commit to,
 so the 0x21 bytes read on XBT say nothing about the same txid with other witnesses on the other
 chain. `ln_funding::xbt_only` now asks what pins the txid: the funding, or a transaction it
@@ -2398,11 +2398,11 @@ checked sum and refuses a total past 2^64-1 (it was a panic; the typed `unspent`
   nothing that names the chain: the txid is the double SHA-256 of the same bytes on both chains,
   and consensus asks a post-fork coinbase for the height (BIP 34), a value within subsidy plus
   fees, and the fork headline in the fork block only. The coinbase of XBT's block H is therefore a
-  valid coinbase for SHA-256 Bitcoin's block H, and for no other block there. It is XBT-only when
+  valid coinbase for the SHA-256 chain's block H, and for no other block there. It is XBT-only when
   the other chain already has another block at that height and does not reorganise below it; where
   it has not, whoever mines that block can mine the same coinbase, which pays the same keys. That
   takes one party a block on each chain at one height, or a miner giving its reward to the other
-  coinbase's payees. The signer has no SHA-256 Bitcoin node to compare heights with. The 0x21
+  coinbase's payees. The signer has no the SHA-256 chain node to compare heights with. The 0x21
   scriptSig pin does not have this limit. Mike, 2026-10-11: the proof stays strict, so the rule is
   unchanged and this is its stated limit (`ln_funding.rs`, module documentation).
 * **One channel that fails the funding proof stops every BOLT 12 payment** (decided: it stays).
@@ -3269,7 +3269,7 @@ Two design notes stand as before, and nothing below changes them:
   is trusted with everything it holds.
 * **Everything rests on the Lightning Fork's behaviour.** Its unified signatures (`option_unified_sigs`,
   sighash 0x21) and its feature bit 512 (`option_blake2b`) are what keep a channel's transactions and
-  invoices off SHA-256 Bitcoin. The signer checks that they are in use (L5 below tightens the funding
+  invoices off the SHA-256 chain. The signer checks that they are in use (L5 below tightens the funding
   proof) but cannot make the fork implement them correctly.
 
 * **L1: plain http only to a loopback address.** `LndRest::new` cut the URL's host at the first `:`,
@@ -3351,10 +3351,10 @@ Two design notes stand as before, and nothing below changes them:
 
 **The replay-safety reasoning, corrected** (`ln_funding.rs` module documentation):
 
-* A channel's transactions can replay on SHA-256 Bitcoin only if its funding transaction is valid
-  there too. One input with a signature that its script checks, and that SHA-256 Bitcoin cannot verify,
+* A channel's transactions can replay on the SHA-256 chain only if its funding transaction is valid
+  there too. One input with a signature that its script checks, and that the SHA-256 chain cannot verify,
   makes the transaction invalid there. The proof asks for that of every signature of every input.
-* The earlier comment said SHA-256 Bitcoin rejects a 0x21 signature. It does not: its consensus accepts
+* The earlier comment said the SHA-256 chain rejects a 0x21 signature. It does not: its consensus accepts
   hash type 0x21 on legacy and segwit v0 inputs (the byte is only non-standard there; taproot does
   reject it). The protection is the digest. An XBT signer signs 0x21 over the unified message
   (`unified_sighash`: BIP341-shaped, committing to every input's amount and scriptPubKey). SHA-256
@@ -3370,7 +3370,7 @@ Two design notes stand as before, and nothing below changes them:
   the template restriction above.
 * **The height proves nothing on its own.** A coin confirmed at or above the split is not thereby
   XBT-only. A transaction valid on both chains (a 0x01 spend of pre-split coins, broadcast on both) has
-  the same txid on each, so its outputs exist on SHA-256 Bitcoin too, however high it confirmed here.
+  the same txid on each, so its outputs exist on the SHA-256 chain too, however high it confirmed here.
   The signatures are the proof. The rule that every input's coin is confirmed at or above the split
   stays, as an extra, conservative rule: a channel opened after the split never needs older coins.
 
@@ -3741,7 +3741,7 @@ The offer id is the SHA-256 of the offer's TLV bytes. That is Core Lightning's d
 Lightning Fork reports as `offer_id`, so the allowlist entry can be read off either node.
 
 **The chain.** BOLT 12 reads an offer that names no chain as Bitcoin mainnet. XBT mainnet shares
-Bitcoin's genesis hash, so on mainnet a chain-less offer names this chain and SHA-256 Bitcoin alike,
+Bitcoin's genesis hash, so on mainnet a chain-less offer names this chain and the SHA-256 chain alike,
 and most offers are chain-less. Bit 512 is what tells them apart: a chain-less offer with bit 512 is
 payable on mainnet, and without it is refused. Off mainnet a chain-less offer names another chain and
 is refused. The chain an offer must name is block 0 of the signer's own node. Lightning Fork's code at

@@ -1879,7 +1879,7 @@ fn agp082_a_chainless_offer_on_mainnet_pays_with_bit_512_under_the_four_permissi
         s.towers = Some(vec![]);
         s.macaroon = Some(lnd_macaroon(RAIL_OPS, &[]));
     });
-    // without bit 512 it is SHA-256 Bitcoin's offer: the chain hash cannot tell them apart
+    // without bit 512 it is the SHA-256 chain's offer: the chain hash cannot tell them apart
     let r = rig.pay(&sha, 400);
     assert_eq!(r["rule"], "ln_feature_512", "{r}");
     assert_eq!(rig.fetches(), 0);
@@ -2102,13 +2102,13 @@ fn agp082_invoices_asked_of_an_offer_are_rate_limited() {
 /// prove an XBT-only coin, because a replayed parent has the same txid". The funding's only input is a
 /// segwit (P2WPKH) spend signed 0x21. Its parent is a 0x01 spend, valid on both chains, confirmed here
 /// above the split. A segwit witness is not part of the txid, so the holder of that key can publish
-/// the same funding txid on SHA-256 Bitcoin with a 0x01 witness: the funding outpoint exists on both
+/// the same funding txid on the SHA-256 chain with a 0x01 witness: the funding outpoint exists on both
 /// chains, and the proof calls it proven. EXPECTED TO FAIL on f0554d0.
 #[test]
 fn agp087_ln_l5_a_funding_whose_replayed_parent_is_signed_0x01_is_not_proven() {
     let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let rig = LnRig::new(json!({}));
-    // the parent: a 0x01 spend (valid on SHA-256 Bitcoin too), confirmed at 6,350, above the split (6,000)
+    // the parent: a 0x01 spend (valid on the SHA-256 chain too), confirmed at 6,350, above the split (6,000)
     let mut parent = Tx::new(2, vec![TxIn::new(OutPoint::new([0x77; 32], 0), 0)],
                              vec![TxOut::new(105_000, [vec![0u8, 0x14], vec![0x42; 20]].concat())], 0);
     parent.inputs[0].witness = vec![der(0x01), vec![0x02; 33]];
@@ -2119,7 +2119,7 @@ fn agp087_ln_l5_a_funding_whose_replayed_parent_is_signed_0x01_is_not_proven() {
     f.inputs[0].witness = vec![der(0x21), vec![0x02; 33]];
     rig.node.place(&f, 6_400, 1);
     let cp = format!("{}:0", f.txid());
-    // the same txid with a 0x01 witness is what SHA-256 Bitcoin would hold: the witness is outside the txid
+    // the same txid with a 0x01 witness is what the SHA-256 chain would hold: the witness is outside the txid
     let mut twin = f.clone();
     twin.inputs[0].witness = vec![der(0x01), vec![0x02; 33]];
     assert_eq!(twin.txid(), f.txid(), "the witness is not in the txid");

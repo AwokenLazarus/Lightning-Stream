@@ -1879,7 +1879,7 @@ fn agp082_a_chainless_offer_on_mainnet_pays_with_bit_512_under_the_four_permissi
         s.towers = Some(vec![]);
         s.macaroon = Some(lnd_macaroon(RAIL_OPS, &[]));
     });
-    // without bit 512 it is SHA-256 Bitcoin's offer: the chain hash cannot tell them apart
+    // without bit 512 it is the SHA-256 chain's offer: the chain hash cannot tell them apart
     let r = rig.pay(&sha, 400);
     assert_eq!(r["rule"], "ln_feature_512", "{r}");
     assert_eq!(rig.fetches(), 0);
@@ -2123,7 +2123,7 @@ fn verdict(rig: &LnRig, f: &Tx, height: u64, pos: u64) -> xbt_signer::ln_funding
 }
 
 /// L5: every transaction behind the funding, back to the split, is a segwit spend. Nothing a txid
-/// commits to ties any of them to XBT, so the funding's txid may be valid on SHA-256 Bitcoin with
+/// commits to ties any of them to XBT, so the funding's txid may be valid on the SHA-256 chain with
 /// other witnesses: refused (a final verdict, with the reason), not "our node could not say".
 #[test]
 fn agp092_l5_a_funding_with_only_witness_signed_ancestors_is_refused() {
@@ -2155,7 +2155,7 @@ fn agp092_l5_a_funding_with_only_witness_signed_ancestors_is_refused() {
 
 /// L5: what does pin a funding. A coinbase at or above the split behind it (the rig's default channel),
 /// or a 0x21 signature in a scriptSig anywhere behind it, even on a pre-split coin: that signature is
-/// in the txid, and SHA-256 Bitcoin cannot verify it.
+/// in the txid, and the SHA-256 chain cannot verify it.
 #[test]
 fn agp092_l5_a_coinbase_or_a_script_sig_signature_pins_the_funding() {
     let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());

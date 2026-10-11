@@ -3,16 +3,16 @@
 //! narrowed what counts as a signature.
 //!
 //! **What must hold.** A channel's commitment, HTLC and close transactions spend its funding output, so
-//! they can replay on SHA-256 Bitcoin only if the funding transaction is valid there too (AGP-047 §4.2).
+//! they can replay on the SHA-256 chain only if the funding transaction is valid there too (AGP-047 §4.2).
 //! A transaction is invalid if any one input is, so it is enough that an input carries a signature its
-//! script checks and SHA-256 Bitcoin cannot verify. This module asks for more: every input, and every
+//! script checks and the SHA-256 chain cannot verify. This module asks for more: every input, and every
 //! signature each input's script checks, must be such a signature.
 //!
-//! **Why 0x21 is such a signature.** Not because SHA-256 Bitcoin rejects the byte: its consensus
+//! **Why 0x21 is such a signature.** Not because the SHA-256 chain rejects the byte: its consensus
 //! accepts hash type 0x21 on legacy and segwit v0 inputs (the byte is only non-standard there; taproot
 //! does reject it). The protection is the digest. An XBT signer signs a 0x21 signature over the
 //! unified message ([`xbt_primitives::sighash::unified_sighash`]: BIP341-shaped, committing to every
-//! input's amount and scriptPubKey), while SHA-256 Bitcoin checks the same bytes against its own
+//! input's amount and scriptPubKey), while the SHA-256 chain checks the same bytes against its own
 //! message (legacy or BIP143 with hash type 0x21). One ECDSA signature valid for two messages under one
 //! key would need the two digests to be equal modulo the group order.
 //!
@@ -28,13 +28,13 @@
 //!
 //! **What the height does not prove.** A coin confirmed at or above the split is not thereby XBT-only:
 //! a transaction valid on both chains (a 0x01 spend of pre-split coins, broadcast on both) has the same
-//! txid on each, so its outputs exist on SHA-256 Bitcoin too, however high it confirmed here. Every
+//! txid on each, so its outputs exist on the SHA-256 chain too, however high it confirmed here. Every
 //! input's coin must still be confirmed at or above the split height, as an extra, conservative rule
 //! (a channel opened after the split never needs older coins).
 //!
 //! **What a witness signature does not prove (AGP-092).** A segwit or taproot input's signatures are
 //! in the witness, and the witness is not part of the txid. So the same funding txid is a valid
-//! transaction on SHA-256 Bitcoin, with other signatures in its witnesses, whenever every coin it
+//! transaction on the SHA-256 chain, with other signatures in its witnesses, whenever every coin it
 //! spends exists there; the 0x21 bytes we read on XBT say nothing about that twin. The rule the proof
 //! keeps: **a funding is proven only when its txid cannot be a valid transaction on SHA-256
 //! Bitcoin.** That holds when the transaction, or one it descends from through at least one input, is
@@ -47,20 +47,20 @@
 //! a P2PKH address after the split.
 //!
 //! **What the coinbase pin rests on (AGP-097, read from XBT's consensus code, Knots `61b07b8`).**
-//! The scriptSig pin holds by itself: the txid commits to a signature SHA-256 Bitcoin cannot
+//! The scriptSig pin holds by itself: the txid commits to a signature the SHA-256 chain cannot
 //! verify. The coinbase pin does not. A coinbase's txid commits to nothing that names the chain: it
 //! is the double SHA-256 of the same bytes on both chains (`primitives/transaction.cpp:81-84`), and
 //! what consensus asks of a coinbase after the fork is the block's height at the start of its
 //! scriptSig (BIP 34, `validation.cpp:4933-4939`), a value of at most subsidy plus fees
 //! (`validation.cpp:3107-3110`, the same subsidy schedule) and, at the fork block only, the fork's
 //! headline in the scriptSig (`validation.cpp:4576-4583`); payee attestation, where it is active,
-//! constrains outputs SHA-256 Bitcoin accepts as they are. So the coinbase of XBT's block H is a
-//! valid coinbase for SHA-256 Bitcoin's block H and for no other block there (the height is in
+//! constrains outputs the SHA-256 chain accepts as they are. So the coinbase of XBT's block H is a
+//! valid coinbase for the SHA-256 chain's block H and for no other block there (the height is in
 //! it): it is XBT-only exactly when the other chain already has another block at height H and does
 //! not reorganise below it. Where it does not yet, whoever mines that block there can mine the same
 //! coinbase, which pays the same keys. That takes a block on each chain at one height from one
 //! party, or a miner who gives its block's reward to the other coinbase's payees. The signer has
-//! no SHA-256 Bitcoin node to compare heights with, so it cannot check this; the rule is kept as
+//! no the SHA-256 chain node to compare heights with, so it cannot check this; the rule is kept as
 //! the owner decided it (2026-10-11) and this is its stated limit.
 //!
 //! The funding transaction's checks: the channel's txid, output, amount and P2WSH. Inputs are looked up
@@ -265,7 +265,7 @@ fn confirmed_tx(node: &dyn Node, txid: &str) -> Result<(Tx, i64), String> {
 }
 
 /// Is `inp` a P2PKH spend whose one signature is 0x21? Then the signature is in the scriptSig, which
-/// the txid commits to, and SHA-256 Bitcoin cannot verify it: no transaction with this txid is valid there.
+/// the txid commits to, and the SHA-256 chain cannot verify it: no transaction with this txid is valid there.
 fn pinned_by_script_sig(inp: &TxIn, prev_spk: &[u8]) -> bool {
     let p2pkh = prev_spk.len() == 25 && prev_spk[..3] == [0x76, 0xa9, 0x14] && prev_spk[23..] == [0x88, OP_CHECKSIG];
     p2pkh && inp.witness.is_empty() && checked_sighashes(inp, prev_spk).is_ok_and(|s| s == [SIGHASH_UNIFIED_ALL])
@@ -387,7 +387,7 @@ pub fn check(node: &dyn Node, channel_point: &str, scid: u64, capacity: i64, spl
             Err(why) => bad.push(format!("input {i} ({prev_txid}:{pv}): {why}")),
             Ok(s) if s.is_empty() => bad.push(format!("input {i} ({prev_txid}:{pv}) carries no signature we can read")),
             Ok(s) if s.iter().any(|b| *b != SIGHASH_UNIFIED_ALL) => {
-                bad.push(format!("input {i} ({prev_txid}:{pv}) is signed {}, not 0x21: SHA-256 Bitcoin may verify it, so the funding \
+                bad.push(format!("input {i} ({prev_txid}:{pv}) is signed {}, not 0x21: the SHA-256 chain may verify it, so the funding \
                                   may replay there", shown.join("/")));
             }
             Ok(_) => {}
@@ -409,7 +409,7 @@ pub fn check(node: &dyn Node, channel_point: &str, scid: u64, capacity: i64, spl
         Ok(None) => Funding::Refused(format!(
             "nothing its txid commits to pins the funding to XBT: its inputs' signatures are in witnesses, which are not part of the txid, and \
              no transaction behind it (back to the split {split_height}, at most {ANCESTRY_LOOKUPS} looked up) is a coinbase or carries a 0x21 \
-             signature in a scriptSig. The same txid may be valid on SHA-256 Bitcoin with other signatures: fund the channel from mined coins, or \
+             signature in a scriptSig. The same txid may be valid on the SHA-256 chain with other signatures: fund the channel from mined coins, or \
              from coins that passed through a P2PKH address after the split"), evidence),
         Err(why) => Funding::Unknown(why),
     }

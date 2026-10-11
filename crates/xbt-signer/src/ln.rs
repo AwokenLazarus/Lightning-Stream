@@ -57,7 +57,7 @@ use crate::{err, Result};
 
 /// The block whose hash identifies the XBT chain (AGP-047 §4.3, LF `chainreg/blake2b_check.go`).
 pub const MAIN_ANCHOR_HASH: &str = "0000000000000050c1e5f69672f459293be14f46e5a494e7a8c8541396f18eeb";
-/// The chain split: coins confirmed below it exist on SHA-256 Bitcoin too.
+/// The chain split: coins confirmed below it exist on the SHA-256 chain too.
 pub const MAIN_SPLIT_HEIGHT: i64 = 961_632;
 /// The node-reported text the model sees is labelled with this.
 pub const UNTRUSTED_LN_KEY: &str = "untrusted_ln_data";
@@ -696,7 +696,7 @@ pub fn usable_channels(chans: &[Value], split_height: i64) -> (Vec<String>, Vec<
     (ok, report)
 }
 
-/// The node's coins confirmed below `split_height` (they exist on SHA-256 Bitcoin too): they must never
+/// The node's coins confirmed below `split_height` (they exist on the SHA-256 chain too): they must never
 /// fund an LN channel, or its 0x01 commitments replay there (AGP-047 §4.2).
 pub fn presplit_utxos(utxos: &[Value], tip: i64, split_height: i64) -> Vec<Value> {
     utxos.iter().filter_map(|u| {
@@ -779,7 +779,7 @@ pub fn cltv_until(p: &Value) -> i64 {
 }
 
 /// The node's wtclient towers with the verdict on each: LF's wtclient identifies a tower's chain only
-/// by the genesis hash, which XBT shares with SHA-256 Bitcoin, and no tower advertises a chain feature
+/// by the genesis hash, which XBT shares with the SHA-256 chain, and no tower advertises a chain feature
 /// (wtwire features 0-5 in LF .13), so a SHA-256 tower would accept sessions and watch the wrong chain
 /// (AGP-047 §4.3). A tower is verified only when the operator lists it in `ln.trusted_towers`.
 pub fn tower_report(towers: &[Value], trusted: &[String]) -> Vec<Value> {
@@ -794,7 +794,7 @@ pub fn tower_report(towers: &[Value], trusted: &[String]) -> Vec<Value> {
         json!({"pubkey": pk, "addresses": t.get("addresses").cloned().unwrap_or(json!([])), "sessions": sessions, "active": active,
                "chain_verified": verified,
                "chain_note": if verified { "listed in ln.trusted_towers by the operator" } else {
-                   "chain not verified: LF's wtclient checks only the genesis hash, which SHA-256 Bitcoin shares; a SHA-256 tower would watch the wrong chain" }})
+                   "chain not verified: LF's wtclient checks only the genesis hash, which the SHA-256 chain shares; a SHA-256 tower would watch the wrong chain" }})
     }).collect()
 }
 
@@ -1204,7 +1204,7 @@ impl Signer {
                 let bad: Vec<String> = rep.iter().filter(|t| t["chain_verified"] != true).map(|t| str_or_empty(t.get("pubkey"))).collect();
                 let msg = (!bad.is_empty()).then(|| format!(
                     "WARNING: {} watchtower(s) of unverified chain ({}): LF's wtclient checks a tower's chain only by the genesis hash, \
-                     which SHA-256 Bitcoin shares, so a SHA-256 tower would take sessions and watch the wrong chain; verify each and list \
+                     which the SHA-256 chain shares, so a SHA-256 tower would take sessions and watch the wrong chain; verify each and list \
                      it in ln.trusted_towers, or remove it (lncli wtclient remove)", bad.len(), bad.join(", ")));
                 let v = json!({"wtclient": "active", "policy": mode, "towers": rep, "unverified": bad.len()});
                 match msg {
@@ -1761,7 +1761,7 @@ impl Signer {
             "channel_opens": "never: this wallet pays through the node's existing channels",
         }));
         if !presplit.is_empty() {
-            warnings.insert(0, "the LN node holds coins confirmed below the split height: never fund a channel from them (their 0x01 commitments replay on SHA-256 Bitcoin)".into());
+            warnings.insert(0, "the LN node holds coins confirmed below the split height: never fund a channel from them (their 0x01 commitments replay on the SHA-256 chain)".into());
         }
         if locks.unbooked_sats > 0 {
             warnings.push(format!("the LN node has {} sats in HTLCs the wallet did not send, locked until height {}: they count against the budgets",

@@ -144,7 +144,7 @@ Before anything reaches the router (`src/ln.rs`, `src/bolt11.rs`):
    commits to pins it to XBT: the funding, or a transaction it descends from above the split, is a
    coinbase or carries a 0x21 signature in a scriptSig (`ln_funding::xbt_only`, at most 256
    transactions looked up; witness signatures are outside the txid, so on their own they prove
-   nothing about the same txid on SHA-256 Bitcoin). A node whose coins have no such ancestor in reach
+   nothing about the same txid on the SHA-256 chain). A node whose coins have no such ancestor in reach
    is refused: fund it from mined coins, or from coins that went through a P2PKH address after the
    split. Only spends whose sole
    condition is signatures are read (P2WPKH, P2SH-P2WPKH, P2PKH, `<key> CHECKSIG` or
@@ -157,7 +157,7 @@ Before anything reaches the router (`src/ln.rs`, `src/bolt11.rs`):
 6. the send rate: at most `ln.max_sends_per_hour` payments reach the router per hour, failed ones
    included (`ln_rate_limit`; LND has no per-macaroon rate limit);
 7. the watchtowers (`GET /v2/watchtower/client`): Lightning Fork's wtclient identifies a tower's chain
-   only by the genesis hash, which SHA-256 Bitcoin shares, and no tower advertises a chain feature, so
+   only by the genesis hash, which the SHA-256 chain shares, and no tower advertises a chain feature, so
    every tower is unverified unless listed in `ln.trusted_towers`. `ln.tower_policy` `warn` (the default
    off mainnet: a loud warning in `ln_status` and `ln_pay`) or `refuse` (mainnet's default:
    `ln_tower_chain`);
