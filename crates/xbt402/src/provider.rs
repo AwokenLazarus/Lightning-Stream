@@ -186,6 +186,8 @@ pub struct Provider {
     schemes: Vec<Arc<dyn crate::scheme::ProviderScheme>>,
     /// AGP-059: direct calls between their reservation and their settlement, per channel.
     in_call: Mutex<HashMap<String, u32>>,
+    /// AGP-094: the watcher's ticks ([`Provider::close_due`]) and the ones that panicked.
+    watch_health: WatchHealth,
     /// AGP-059: (channel, msat) of the reservations refunded when this provider started.
     recovered: Vec<(String, u64)>,
 }
@@ -295,6 +297,49 @@ impl Drop for InCall<'_> {
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// AGP-094 rule: a watcher tick that panics ends that tick, never the watcher. The thread that
+/// closes channels at their margin, refunds and reconciles runs each tick through [`Self::run`]:
+/// a panic is caught, counted and said, and the next tick runs. What `/healthz` shows of it is
+/// [`Self::to_json`]: `ok` is false from a tick that panicked until one that did not.
+#[derive(Debug, Default)]
+pub struct WatchHealth {
+    ticks: std::sync::atomic::AtomicU64,
+    panics: std::sync::atomic::AtomicU64,
+    /// (when the last tick ended, the last panic's message, the last tick panicked).
+    last: Mutex<(f64, String, bool)>,
+}
+
+impl WatchHealth {
+    /// Run one tick. `Err`: it panicked (the message, at most 200 characters).
+    pub fn run<R>(&self, f: impl FnOnce() -> R) -> std::result::Result<R, String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        self.ticks.fetch_add(1, Relaxed);
+        let mut last = lock(&self.last);
+        last.0 = crate::route::now_f();
+        match r {
+            Ok(r) => {
+                last.2 = false;
+                Ok(r)
+            }
+            Err(p) => {
+                self.panics.fetch_add(1, Relaxed);
+                let msg: String = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "panic".into()).chars().take(200).collect();
+                (last.1, last.2) = (msg.clone(), true);
+                Err(msg)
+            }
+        }
+    }
+
+    /// `{ok, ticks, panics, lastTickAt, lastPanic}`.
+    pub fn to_json(&self) -> Value {
+        use std::sync::atomic::Ordering::Relaxed;
+        let last = lock(&self.last);
+        json!({"ok": !last.2, "ticks": self.ticks.load(Relaxed), "panics": self.panics.load(Relaxed), "lastTickAt": last.0, "lastPanic": last.1})
+    }
 }
 
 fn path_key(path: &str) -> &str {
@@ -412,6 +457,7 @@ impl Provider {
             routes,
             schemes: vec![],
             in_call: Mutex::new(HashMap::new()),
+            watch_health: WatchHealth::default(),
             recovered,
         })
     }
@@ -1309,7 +1355,26 @@ impl Provider {
     /// rest: suspend channels whose funding left the chain, close channels at expiry -
     /// closeMarginBlocks, rebroadcast closes that fell out of the mempool, claim hash locks.
     /// Returns the txids of closes made this tick.
+    ///
+    /// AGP-094: a panic under it is this tick's error (`watcher_panic`), not the end of the
+    /// caller's loop: every watcher (the provider binaries' loops, the hub's tick) calls this, so
+    /// the catch is here. [`Self::watch_health`] counts it.
     pub fn close_due(&self) -> Result<Vec<String>> {
+        match self.watch_health.run(|| self.close_due_tick()) {
+            Ok(r) => r,
+            Err(msg) => {
+                eprintln!("watcher: a tick panicked ({msg}); the next tick runs");
+                fail("watcher_panic", msg)
+            }
+        }
+    }
+
+    /// The watcher's ticks and the ones that panicked, for `/healthz`.
+    pub fn watch_health(&self) -> Value {
+        self.watch_health.to_json()
+    }
+
+    fn close_due_tick(&self) -> Result<Vec<String>> {
         let h = self.chain.block_count()?;
         let mut out = Vec::new();
         let mut l = lock(&self.ledger);

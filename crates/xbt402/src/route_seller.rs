@@ -103,6 +103,10 @@ pub struct RouteSession {
     /// `{lockId, amount, secret}`: the client's receipt.
     pub last_lock: Value,
     pub locks: u64,
+    /// AGP-094: the channel (a hub's ch2) that asked whether this window's invoice would be taken
+    /// (a `check`). Until the window ends the invoice is paid over that channel and no other, and
+    /// a call does not end the window before `valid_until`. "" : nobody asked.
+    pub bound: String,
 }
 
 impl RouteSession {
@@ -114,7 +118,7 @@ impl RouteSession {
         json!({"session": self.session, "client_pub": self.client_pub, "path": self.path, "created": self.created,
                "seq": self.seq, "accrued_amsat": int_value(self.accrued_amsat), "paid_sat": self.paid_sat, "calls": self.calls,
                "unpaid_since": self.unpaid_since, "lock_id": self.lock_id, "t": self.t, "point": self.point,
-               "valid_until": self.valid_until, "last_lock": self.last_lock, "locks": self.locks})
+               "valid_until": self.valid_until, "last_lock": self.last_lock, "locks": self.locks, "bound": self.bound})
     }
 
     fn from_json(v: &Value) -> Option<Self> {
@@ -124,7 +128,7 @@ impl RouteSession {
         Some(Self { session: s("session"), client_pub: s("client_pub"), path: s("path"), created: f("created"), seq: n("seq"),
                     accrued_amsat: u128_of(v.get("accrued_amsat")).unwrap_or(0), paid_sat: n("paid_sat"), calls: n("calls"),
                     unpaid_since: f("unpaid_since"), lock_id: s("lock_id"), t: s("t"), point: s("point"),
-                    valid_until: f("valid_until"), last_lock: v.get("last_lock").cloned().unwrap_or(json!({})), locks: n("locks") })
+                    valid_until: f("valid_until"), last_lock: v.get("last_lock").cloned().unwrap_or(json!({})), locks: n("locks"), bound: s("bound") })
     }
 }
 
@@ -659,6 +663,7 @@ impl RouteSeller {
         s.point = hex::encode(adaptor::enc(&adaptor::point_of(&t)));
         s.lock_id = token_hex(12);
         s.valid_until = now_f() + ttl;
+        s.bound = String::new();
     }
 
     /// The window's signed invoice. It only changes with the window (and ECDSA signing is
@@ -684,7 +689,7 @@ impl RouteSeller {
         let ttl = st.offers.get(path).map(|o| o.invoice_ttl).unwrap_or(15.0);
         let mut s = RouteSession { session: token_hex(16), client_pub: hex::encode(&pubk), path: path.into(), created: now_f(), seq: 0,
                                    accrued_amsat: 0, paid_sat: 0, calls: 0, unpaid_since: 0.0, lock_id: String::new(), t: String::new(),
-                                   point: String::new(), valid_until: 0.0, last_lock: json!({}), locks: 0 };
+                                   point: String::new(), valid_until: 0.0, last_lock: json!({}), locks: 0, bound: String::new() };
         Self::new_window(&mut s, ttl);
         let sid = s.session.clone();
         st.sessions.insert(sid.clone(), s);
@@ -735,8 +740,10 @@ impl RouteSeller {
         };
         let ttl = st.sessions.get(sid).and_then(|s| st.offers.get(&s.path)).map(|o| o.invoice_ttl).unwrap_or(15.0);
         let s = st.sessions.get_mut(sid).ok_or_else(|| ChannelError::code("unknown_session"))?;
-        if now_f() > s.valid_until - 1.0 {
-            // an expired invoice: nobody can complete it now, issue a fresh T
+        if now_f() > s.valid_until - if s.bound.is_empty() { 1.0 } else { 0.0 } {
+            // an expired invoice: nobody can complete it now, issue a fresh T. (AGP-094: one a hub
+            // was told would be taken lives to its `valid_until`: a call of the client's does not
+            // end it under the lock that hub then sends)
             Self::new_window(s, ttl);
         }
         let s = st.sessions[sid].clone();
@@ -927,6 +934,8 @@ impl Provider {
         let auth = route.get("lockAuth").map(|v| py_str(Some(v))).ok_or_else(|| bad("'lockAuth'"))?;
         let hub = route.get("hub").map(|v| py_str(Some(v))).ok_or_else(|| bad("'hub'"))?;
         let cum = py_int(pl.get("cum")).ok_or_else(|| bad("'cum'"))?;
+        // AGP-094: `check` asks whether this lock would be taken, before the hub pre-signs it
+        let check = crate::json::truthy(route.get("check"));
         let chan = st.params.channel_id();
         let mut locks = st.extra.get("route_locks").and_then(Value::as_object).cloned().unwrap_or_default();
         let routes = &self.routes;
@@ -935,6 +944,9 @@ impl Provider {
             // idempotent: the same answer again
             if py_str(done.get("session")) != sid || py_int(done.get("amount")) != Some(amount) {
                 return fail("bad_invoice", "lockId already completed with other terms");
+            }
+            if check {
+                return fail("bad_invoice", "this invoice is paid");
             }
             let routed = py_u64(st.extra.get("routed_sat")).unwrap_or(0);
             self.save_state(l, st)?;                              // the seq this answer spent (AGP-078)
@@ -963,6 +975,28 @@ impl Provider {
             return fail("bad_amount", "lock amount must be >= 1 sat");
         }
         let amount = u64::try_from(amount).map_err(|_| ChannelError::new("bad_amount", "lock amount out of range"))?;
+        // AGP-094 rule: once a hub was told this invoice would be taken, nothing a client does
+        // makes this provider refuse that hub's lock. So the invoice is then paid over that
+        // hub's channel alone: the same invoice sent through another hub is refused here, to
+        // the one that asks second, before it pre-signs
+        if !s.bound.is_empty() && s.bound != chan {
+            return fail("lock_outstanding", "this invoice is being paid over another channel");
+        }
+        if check {
+            let routed = py_u64(st.extra.get("routed_sat")).unwrap_or(0);
+            let need = next_cum(routed, amount, st.params.min_amount());
+            if need > st.best_cum && cum != need as i128 {
+                return fail("bad_amount", format!("lock pays {cum}, expected {need}"));
+            }
+            if need > st.best_cum && need > st.params.max_amount() {
+                return fail("channel_exhausted", "");
+            }
+            if let Some(sess) = rs.sessions.get_mut(&sid) {
+                sess.bound = chan.clone();
+            }
+            self.save_state(l, st)?;                              // the seq this answer spent (AGP-078)
+            return Ok(json!({"check": lock_id}));
+        }
         if rs.no_reveal {
             rs.held.push(json!({"lockId": lock_id, "cum": cum.to_string().parse::<u64>().ok(), "pre": pl.get("adaptor"), "chan": chan}));
             self.save_state(l, st)?;
@@ -1180,7 +1214,7 @@ mod tests {
     fn session_json_round_trip() {
         let mut s = RouteSession { session: "s".into(), client_pub: "02".into(), path: "/p".into(), created: 1.5, seq: 3,
                                    accrued_amsat: 813_000_000_000_123_456_789 * 1000, paid_sat: 9, calls: 4, unpaid_since: 0.0,
-                                   lock_id: "l".into(), t: "00".into(), point: "02".into(), valid_until: 7.25, last_lock: json!({}), locks: 1 };
+                                   lock_id: "l".into(), t: "00".into(), point: "02".into(), valid_until: 7.25, last_lock: json!({}), locks: 1, bound: "ab".into() };
         let v: Value = crate::json::parse(&dumps(&s.to_json())).unwrap();
         assert_eq!(RouteSession::from_json(&v).unwrap(), s);
         s.paid_sat = 10_000_000_000;

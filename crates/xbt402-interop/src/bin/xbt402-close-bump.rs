@@ -235,7 +235,7 @@ fn main() {
         p.offer_route(RouteOffer { window: 1.0, lock_wait: 3.0, invoice_ttl: 8.0, ..RouteOffer::new("/v1/chunk", ROUTE_PRICE_SAT * AMSAT_PER_SAT) });
         route_provs.push((name, bump, p, format!("http://127.0.0.1:{port}")));
     }
-    let hcfg = HubConfig::from_json(&json!({"fee_base_msat": 100, "fee_ppm": 2000, "max_lock_sat": 20_000, "max_unguarded_lock_sat": 20_000,
+    let hcfg = HubConfig::from_json(&json!({"spend_final_depth": 1, "fee_base_msat": 100, "fee_ppm": 2000, "max_lock_sat": 20_000, "max_unguarded_lock_sat": 20_000,
         "delta": 10, "reveal_timeout": 2.0, "ch2_capacity": 60_000, "ch2_expiry_blocks": 70, "close_margin": MARGIN, "rollover_margin": 2,
         "settle_lock_multiple": 0, "refill_ahead_locks": 0, "refund_min_feerate": REFUND_SAT_VB, "refund_grace_blocks": 0,
         "policy": {"min_expiry_blocks": 30, "max_expiry_blocks": 8_640}})).expect("hub config");

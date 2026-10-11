@@ -178,7 +178,7 @@ fn no_rollover(hub: Value) -> Kw {
 
 fn hub_cfg(extra: &Value) -> HubConfig {
     // the settle floor and the ahead refill are off unless a test asks
-    let mut c = json!({"fee_base_msat": 100, "fee_ppm": 2000, "max_lock_sat": 20000, "max_unguarded_lock_sat": 500, "delta": 36,
+    let mut c = json!({"spend_final_depth": 1, "fee_base_msat": 100, "fee_ppm": 2000, "max_lock_sat": 20000, "max_unguarded_lock_sat": 500, "delta": 36,
                        "reveal_timeout": 1.0, "ch2_capacity": 100000, "ch2_expiry_blocks": 1000, "close_margin": 36, "settle_lock_multiple": 0,
                        "refill_ahead_locks": 0, "policy": {"min_capacity": 20000, "min_expiry_blocks": 500, "max_expiry_blocks": 8640}});
     for (k, v) in extra.as_object().unwrap() {
@@ -423,8 +423,11 @@ fn a_child_the_providers_watcher_left_suspended_is_looked_at_before_a_lock_is_re
     w.prov.with_state(&chan, |st| st.suspended = true).unwrap(); // as the racing watcher tick leaves it
     let r = w.lock(); // still unconfirmed: refused, as it must be
     assert_eq!(refusal(&r), ("refused", "route_failed", "provider refused the lock: unconfirmed"), "{r}");
-    // the provider holds that lock's pre-signature, so this ch2 takes no more routes (AGP-064 H2)
-    assert_eq!(refusal(&w.lock()).1, "route_blocked");
+    // AGP-094: the provider refuses at the hub's check, before anything is pre-signed (this line
+    // asserted `route_blocked`: the provider held that lock's pre-signature, AGP-064 H2). Nothing
+    // is written off, and the next lock is put to the provider again
+    assert!(w.live().stale.is_empty() && w.live().blocked.is_empty());
+    assert_eq!(refusal(&w.lock()).1, "route_failed");
     let w = capped(None);
     let chan = w.live().params.channel_id();
     w.prov.with_state(&chan, |st| st.suspended = true).unwrap();

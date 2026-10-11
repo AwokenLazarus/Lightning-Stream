@@ -21,6 +21,9 @@ struct ChainState {
     spent: HashMap<(String, u32), String>,
     /// Spends that are in a block (the rest are in the mempool).
     mined: HashSet<(String, u32)>,
+    /// AGP-094: the height at which each of `mined` was first confirmed (the depth of its spender,
+    /// as bitcoind gives it: tip - height + 1).
+    mined_at: HashMap<(String, u32), u32>,
     raw: HashMap<String, String>,
     /// `estimatesmartfee`, sat/vB (None: no estimate).
     fee_rate: Option<f64>,
@@ -85,6 +88,10 @@ impl MemChain {
             }
         }
         let spent: Vec<_> = st.spent.iter().filter(|(_, s)| !held.contains(*s)).map(|(k, _)| k.clone()).collect();
+        let h = st.height;
+        for k in &spent {
+            st.mined_at.entry(k.clone()).or_insert(h);
+        }
         st.mined.extend(spent);
     }
 
@@ -129,6 +136,7 @@ impl MemChain {
         let spends: Vec<_> = st.spent.iter().filter(|(_, s)| *s == txid).map(|(k, _)| k.clone()).collect();
         for k in spends {
             st.mined.remove(&k);
+            st.mined_at.remove(&k);
         }
     }
 
@@ -267,7 +275,13 @@ impl SpendScan for MemChain {
     }
 
     fn find_spend_at(&self, txid: &str, vout: u32, from: u32) -> Result<Option<(Tx, Option<u32>)>> {
-        let depth = u32::from(self.st().mined.contains(&(txid.to_string(), vout)));
+        // as a node answers: 0 in the mempool, else tip - the spender's height + 1 (AGP-094: it
+        // answered 1 for every confirmed spender, however deep)
+        let depth = {
+            let st = self.st();
+            let k = (txid.to_string(), vout);
+            if st.mined.contains(&k) { st.height.saturating_sub(st.mined_at.get(&k).copied().unwrap_or(st.height)) + 1 } else { 0 }
+        };
         Ok(self.find_spend(txid, vout, from)?.map(|tx| (tx, Some(depth))))
     }
 
@@ -430,6 +444,11 @@ impl MemNet {
     }
 }
 
+/// The request is a hub's check of a lock (AGP-094): the lock endpoint, `route.check` true.
+pub fn is_lock_check(path: &str, body: &[u8]) -> bool {
+    path == xbt402::route::ROUTE_LOCK_PATH && serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|b| b["route"]["check"] == true)
+}
+
 /// A [`Transport`] over a [`MemNet`].
 pub struct NetTransport(pub Arc<MemNet>);
 
@@ -437,9 +456,13 @@ impl Transport for NetTransport {
     fn request(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)]) -> Result<HttpResponse> {
         let (origin, path) = xbt402::client::split_url(url);
         let app = self.0.apps.lock().unwrap().get(&origin).cloned().ok_or_else(|| ChannelError::new("transport_error", format!("connection refused: {origin}")))?;
-        self.0.calls.lock().unwrap().push((method.into(), origin.clone(), path.clone()));
+        // AGP-094: a hub asks a provider to check a lock before it pre-signs it, on the lock's own
+        // path. The tests that count lock requests, or lose a lock's answer, mean the lock: a check
+        // is recorded under `<path>?check`, and its answer is never dropped
+        let check = is_lock_check(&path, body);
+        self.0.calls.lock().unwrap().push((method.into(), origin.clone(), if check { format!("{path}?check") } else { path.clone() }));
         let r = app.serve(method, &path, headers, body, url);
-        if self.0.drops.lock().unwrap().get(&origin).is_some_and(|d| d(method, &path)) {
+        if !check && self.0.drops.lock().unwrap().get(&origin).is_some_and(|d| d(method, &path)) {
             return Err(ChannelError::new("transport_error", "answer lost"));
         }
         let headers = r.headers.into_iter().map(|(k, v)| (k.to_ascii_uppercase(), v)).collect();

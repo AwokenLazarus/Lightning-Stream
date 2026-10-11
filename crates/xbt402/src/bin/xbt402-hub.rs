@@ -259,7 +259,12 @@ impl HttpService for Front {
         // with the base path (a proxy that keeps it) or without (one that strips it)
         let inner = proxy::strip_base(path, &self.base).unwrap_or_else(|| path.to_string());
         match (method, inner.split('?').next().unwrap_or("")) {
-            ("GET" | "HEAD", "/healthz") => json_resp(200, json!({"ok": true, "service": "xbt402-hub"})),
+            ("GET" | "HEAD", "/healthz") => {
+                // AGP-094: the process answers, and its watcher's last tick did not panic
+                let watcher = self.hub.watch_health();
+                let ok = watcher["ok"] == true;
+                json_resp(if ok { 200 } else { 503 }, json!({"ok": ok, "service": "xbt402-hub", "watcher": watcher}))
+            }
             ("GET" | "HEAD", "/readyz") => {
                 let node = health::node_status(self.rpc.call("getblockchaininfo", json!([])).map_err(|e| e.to_string()));
                 let ok = node["reachable"] == true && node["synced"] == true;

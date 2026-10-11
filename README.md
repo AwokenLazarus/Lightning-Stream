@@ -1563,15 +1563,20 @@ with a written-off lock until the ch2 closes or is refunded, which could be its 
 watcher now asks the provider to close that ch2 at once, once a block until it does, with the best
 state (`ch2_close`, `why: "written_off"`). A close that shows t pays the held lock on ch1; one that
 confirms without t releases the hold (AGP-064).
-* After a **refusal** (the provider answered 400 after taking the pre-signature), the hub refills: its
+* After a **refusal** (the provider answered 400 after taking the pre-signature; since AGP-094 that
+  is a provider that said yes to the hub's check and then refused the lock), the hub refills: its
   next ch2, if one was funded ahead and is open, takes over at once (`ch2_switch`, `why:
   "written_off"`) and the old one is closed as retired (AGP-057); otherwise a new ch2 is funded after
   the close.
 * After a **timeout** (no reveal in time), the hub stopped routing to that provider (AGP-064), so it
   closes the ch2 and does not fund a new one.
-* A ch2 with nothing signed but a written-off lock is closed too (before, a ch2 with nothing signed
-  was "idle" and left to its refund). A failed close request is reported
-  (`ch2_written_off_close_failed`) and asked again next block.
+* A ch2 with nothing signed but a written-off lock is asked to close too (before, a ch2 with nothing
+  signed was "idle"). An honest provider has no state to close it with and answers `no_state`, on
+  every block: the failed request is reported (`ch2_written_off_close_failed`), no new ch2 is funded,
+  and the hub routes nothing to that provider until its own refund at the ch2's expiry. (Corrected by
+  AGP-094: this said such a ch2 "is closed". Until AGP-094 any client could bring this about with one
+  lock the provider refuses, a bad `lockAuth`; now only the provider can, by refusing a lock it had
+  agreed to take. See fix wave 5.)
 
 **Orphan ch1 locks are swept by the watcher.** A ch1 lock that no route is forwarding and that sits on
 no ch2 (the hub stopped between its two write-aheads) was dropped only when the client asked to
@@ -2133,8 +2138,10 @@ On the wire: a refusal `lock_held` (400, with the view); `secret` in the hub's v
 
 **Stated limits.**
 - *What a routed client trusts its hub for.* A hold cannot be proved (the client cannot see a ch2).
-  A hub that lies about holds gets the client to sign `max_held_locks - 1` locks, each at most
-  `max_lock_sat` plus its fee, above what it owes: one lock by default. With `max_held_locks: 1`
+  A hub that lies about holds gets the client to sign `max_held_locks - 1` locks above what it
+  owes, each at most the client's own `RoutePayerConfig.max_lock_sat` (50,000 sat by default; a
+  hub's quoted `maxLockSat` can only lower it, 20,000 at a default hub) plus its fee: one lock by
+  default, at most 50,510 sat with the default client settings. With `max_held_locks: 1`
   that is nothing, and one refusing provider then pauses the client's payments to its other
   providers until that provider's ch2 resolves (at the latest its refund).
 - *A given-up lock recorded before this version* has no point kept: a completion of it is adopted
@@ -2145,6 +2152,8 @@ On the wire: a refusal `lock_held` (400, with the view); `secret` in the hub's v
   when the close reaches it (the next tick), not at the provider's answer; a provider that never
   closes gets no new ch2, and the operator's `connect` is refused past the cap while the old one
   is unspent.
+- *"In a block" was one block deep.* Since AGP-094 (fix wave 5) it is `spend_final_depth` blocks, 6
+  by default.
 - *"In a block" without a depth.* A custom `SpendScan` that only has `find_spend` leaves the hub
   with the spender's outputs and `fund_confirmed`: a close of a ch2 never seen confirmed, whose
   outputs are all spent again in the same block, stays `closing` (nothing is released early; it is
@@ -2152,6 +2161,48 @@ On the wire: a refusal `lock_held` (400, with the view); `secret` in the hub's v
   a reorg that unconfirms a funding between two ticks is seen at the next one.
 - *One slot short.* A rollover is refused once 7 earlier spends are unresolved (it was 8), and with
   the kept intents full a close takes no higher final state: it reports what it closed at.
+
+New dependency: none (`cargo tree -d` is unchanged).
+
+## Fix wave 5, the hub and the routed client (AGP-094)
+
+The third closure audit (AGP-093) found no High item left and 23 smaller ones. These are its items
+for the hub and the routed client. Each row is one rule, kept in one place. The tests named
+`agp093_*` are the audit's; `agp094_*` are the neighbours. B1 `xbt402/hub.py`, `route.py` and
+`route_client.py` on `agp-094` do the same, with the same test names.
+
+| item | the rule | what broke it | now | tests |
+|---|---|---|---|---|
+| 1 one client request stopped the hub routing to a provider | no request of a client's stops the hub routing to a provider, or costs the hub or the provider a transaction | a lock carries what only the client and the provider can check (`lockAuth`, the session, the amount). The hub pre-signed its ch2, the provider refused, and the lock was written off: the ch2 was blocked and closed, and one with nothing signed could not be closed at all (`no_state`) and stayed blocked until its refund | the hub asks the provider first: the lock's own request, marked `check`, without the pre-signature. A refusal there leaves nothing written off, held or blocked (`502 route_failed`, `providerError`). Once it said yes the provider pays that invoice over that hub's channel alone, and does not end its window early, so nothing a client does afterwards makes it refuse. A lock the ch2's floor covers needs no pre-signature: refused, it is dropped. The hub counts a lock only if the provider counted it (`routedSat`), so an invoice sent again from another ch1 does not put the two out of step | `agp093_overflow.rs::one_client_request_does_not_stop_the_hub_routing_to_a_provider`, `::agp094_a_refused_lock_the_floor_covers_is_dropped_and_blocks_nothing`, `::agp094_an_invoice_sent_again_from_another_ch1_does_not_put_the_ch2_out_of_step`, `::agp094_an_invoice_one_hub_checked_is_refused_to_another_channel_at_its_check` |
+| 2 a hold released on a close one block deep | what is done on a spend "for good" (a hold given back, a record made final, a refund fee taken back) is done when the spend is `spend_final_depth` blocks deep | one block was final: the block was replaced by one with the provider's other close, the one with `t`, after the client had closed ch1 below the lock | `HubConfig.spend_final_depth`, 6 by default (the depth the hub already asks before it trusts a funding, `ch2_max_min_conf`; the wait costs only time, and it is the client's own coins that wait). Until then a spend in a block is treated as one in the mempool: its secrets are read, nothing is released | `agp093_hub.rs::hole_a_lock_released_on_a_close_one_block_deep_is_lost_when_that_block_is_reorged`, `::agp094_a_hold_is_released_when_the_close_is_spend_final_depth_deep` |
+| 5, 18 the routed client funded a refusing hub on every `open` | ch1 is funded once: its key is on the books before the wallet is asked, its outpoint before the hub hears of it | ch1 was recorded only with a ledger and only after the funding; without one every `open` asked for a new key and funded again. `duplicate_channel` was not taken as the yes that was lost | `open` goes on from the stage the last call reached, with a ledger or without (then for the life of the `RoutePayer`): a failed funding call is looked for in the wallet before anything is sent again, a funded ch1 is put to the hub again, `duplicate_channel` finishes it | `agp093_client.rs::hole_the_routed_client_funds_a_refusing_hub_once`, `::hole_the_routed_client_finishes_an_open_whose_answer_was_lost`, `::agp094_a_ch1_funding_that_failed_after_it_was_sent_is_adopted_under_the_same_key`, `::agp094_a_keyed_ch1_is_funded_once_by_the_next_open_with_and_without_a_ledger`, `::agp094_a_keyed_ch1_too_old_to_fund_is_refused_until_it_is_forgotten` |
+| 12 locks from a ledger before AGP-088 | a ch1 lock is the lock of one ch2 | such a lock was matched by its provider's origin, and one origin can have two ch2s | each is given its ch2 when the hub starts and on every tick (the record of its origin that holds a lock of that ch1 with its lockId and point; of two, the earlier lock is the earlier record's) | `agp093_hub.rs::hole_two_locks_from_a_ledger_before_agp088_to_one_provider_are_released_together`, `::agp094_two_locks_of_one_invoice_from_a_ledger_before_agp088_are_each_given_their_ch2` |
+| 12 a held lock completed below ch1's best state | a client stops counting a lock as held when the hub proves it was completed or lists it released | it was in no list of the hub's view, so it counted against `max_held_locks` for the life of ch1 | the view lists the last 16 completed written-off locks with the `t + r` that completed each (`completed`); the client drops one whose secret opens that lock's own point | `agp093_hub.rs::hole_a_held_lock_completed_below_the_best_state_still_counts_against_max_held_locks` |
+| 12 a ch2 replaced for a changed payTo | coins count against `liquidity_cap_sat` until this node shows them leaving | the cap check took the replaced ch2 off although it stays counted in the archive | nothing is taken off; the replaced ch2 is `retired`, so the watcher has the provider close it | `agp093_hub.rs::hole_a_ch2_replaced_because_its_pay_to_changed_is_funded_past_the_liquidity_cap`, `::agp094_a_ch2_replaced_for_a_changed_pay_to_is_retired_and_counted_until_it_is_spent` |
+| 12 from reading | a lock leaves a ch2 record after ch1 took its completion; a close and the refill it owes are one write; a pending lock is written off wherever its ch2 record is | a failed ch1 write still cleared the ch2 record; a stop between the close's write and `refill_owed` lost the refill; a ch2 archived while open (a ledger before AGP-088) kept its lock pending | the lock stays on the ch2 record for the next tick; `refill_owed` is written with the close and cleared after the refill; the archived one is written off and closed as retired | `agp093_hub.rs::agp094_a_completion_ch1_did_not_take_keeps_the_lock_on_the_ch2_record`, `::agp094_a_stop_after_the_close_is_written_does_not_lose_the_refill`, `::agp094_a_lock_pending_on_a_ch2_archived_while_open_is_written_off` |
+| 13 a watcher tick that panics | it ends that tick, never the watcher | nothing caught it: the thread ended and the service went on answering | `RouteHub::watch` and `Provider::close_due` (every provider binary's loop calls it) catch a panic, say it and count it. `xbt402-hub`'s `/healthz` carries `watcher` (`ticks`, `panics`, `lastPanic`, `ch1`) and answers 503 from a tick that panicked until one that did not | `agp093_overflow.rs::a_panic_in_one_tick_does_not_end_the_hub_watcher`, `xbt402/tests/agp093_overflow.rs::a_panic_in_one_watcher_tick_does_not_end_the_provider_watcher`, `agp093_overflow.rs::agp094_the_watchers_health_counts_a_tick_that_panicked` |
+
+On the wire: a lock request with `route.check: true` and no `adaptor` is answered `{"check": lockId}`
+or refused as the lock would be (a provider from before the check stops at the missing
+pre-signature, `bad_adaptor`, which the hub takes for its yes); `completed` in the hub's view of
+ch1; `lock_outstanding` from a provider for an invoice another channel was told it could pay.
+`HubConfig` has `spend_final_depth`. `RoutePayer` has `forget_unfunded`.
+
+**Stated limits.**
+- *A provider can still stop its own ch2.* A provider that says yes to the check and then refuses
+  the lock, or does not reveal in time, is written off as before: that ch2 takes no lock, the hub
+  asks for its close, and one with nothing signed waits for the hub's refund at its expiry.
+- *One more round trip.* A lock that needs a pre-signature is two requests to the provider, not one.
+- *A lock must outlive the hub's wait.* The hub refuses an invoice with less than
+  `revealTimeoutSec` left (it was half a second); the client already keeps one second more.
+- *Six blocks.* A hold is released, and a ch2 leaves the watcher, `spend_final_depth` blocks after
+  the spend, not one. With a scan that gives no depth the count starts at the block where the
+  watcher first saw the funding spent, and a reorg between two ticks that it does not see is not
+  noticed (the shipped binaries scan with bitcoind, which gives the depth).
+- *A held lock completed below the best state is proved by one of the last 16 completions.* A
+  client that asks after 16 later ones goes on counting it as held, until ch1 is replaced.
+- *A ch1 recorded and never funded* is funded by the next `open` for as long as the hub would still
+  open it, then refused `open_unresolved` until the owner calls `forget_unfunded`.
 
 New dependency: none (`cargo tree -d` is unchanged).
 

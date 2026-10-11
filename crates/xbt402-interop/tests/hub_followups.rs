@@ -82,7 +82,7 @@ impl HttpService for Svc {
             return json_400(r#"{"error":"bad_expiry","detail":"the policy changed"}"#);
         }
         let r = self.inner.serve(method, path, headers, body, url);
-        if path == ROUTE_LOCK_PATH && self.refuse_lock.load(Ordering::SeqCst) && r.status == 200 {
+        if path == ROUTE_LOCK_PATH && !xbt402_interop::memnet::is_lock_check(path, body) && self.refuse_lock.load(Ordering::SeqCst) && r.status == 200 {
             return json_400(r#"{"error":"refused","detail":"no"}"#);
         }
         r
@@ -149,7 +149,7 @@ fn sk(n: u64) -> SecretKey {
 }
 
 fn hub_cfg() -> HubConfig {
-    HubConfig::from_json(&json!({"fee_base_msat": 100, "fee_ppm": 2000, "max_lock_sat": 20000, "max_unguarded_lock_sat": 500, "delta": 36,
+    HubConfig::from_json(&json!({"spend_final_depth": 1, "fee_base_msat": 100, "fee_ppm": 2000, "max_lock_sat": 20000, "max_unguarded_lock_sat": 500, "delta": 36,
                                  "reveal_timeout": 0.3, "ch2_capacity": 100000, "ch2_expiry_blocks": 1000, "settle_lock_multiple": 0, "refill_ahead_locks": 0,
                                  "close_margin": 36, "policy": {"min_capacity": 20000, "min_expiry_blocks": 500, "max_expiry_blocks": 8640}})).unwrap()
 }
