@@ -82,7 +82,7 @@ impl HttpService for Svc {
             return json_400(r#"{"error":"bad_expiry","detail":"the policy changed"}"#);
         }
         let r = self.inner.serve(method, path, headers, body, url);
-        if path == ROUTE_LOCK_PATH && self.refuse_lock.load(Ordering::SeqCst) && r.status == 200 {
+        if path == ROUTE_LOCK_PATH && !xbt402_interop::memnet::is_lock_check(path, body) && self.refuse_lock.load(Ordering::SeqCst) && r.status == 200 {
             return json_400(r#"{"error":"refused","detail":"no"}"#);
         }
         r

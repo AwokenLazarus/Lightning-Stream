@@ -116,7 +116,8 @@ struct BoomNet {
 
 impl Transport for BoomNet {
     fn request(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)]) -> Result<HttpResponse> {
-        if url.ends_with(ROUTE_LOCK_PATH) && self.boom.load(Ordering::SeqCst) > 0 {
+        // (AGP-094: the lock itself, not the check the hub now sends before it pre-signs)
+        if url.ends_with(ROUTE_LOCK_PATH) && !xbt402_interop::memnet::is_lock_check(ROUTE_LOCK_PATH, body) && self.boom.load(Ordering::SeqCst) > 0 {
             self.boom.fetch_sub(1, Ordering::SeqCst);
             panic!("agp093: injected panic while a lock is forwarded");
         }
@@ -451,7 +452,11 @@ fn measured_one_refused_lock_on_a_used_ch2_costs_a_close_and_a_new_funding() {
     eprintln!("agp093_overflow: one refused lock on a used ch2: routing back after {blocks} block(s) (paid {paid}), ch2 {} -> {}, hub events {names:?}",
               &chan_before[..8], &w.oc().params.channel_id()[..8]);
     assert!(paid, "routing to the provider did not come back in 20 blocks");
-    assert_ne!(w.oc().params.channel_id(), chan_before, "control: the refused lock cost the hub this ch2");
+    // AGP-094: this line asserted the cost the audit measured (`assert_ne`: the refused lock cost
+    // the hub this ch2, a close and a new funding). The provider now refuses such a lock at the
+    // hub's check, before anything is pre-signed: it costs the hub nothing, and the ch2 stays
+    assert_eq!(w.oc().params.channel_id(), chan_before, "the refused lock cost the hub this ch2");
+    assert_eq!(blocks, 1, "routing never stopped: the first lock after the refusal is paid");
 }
 
 /// The sums of the hub's ch1 counters at their bound: a client pays its whole channel as one

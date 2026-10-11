@@ -87,7 +87,7 @@ impl HttpService for Wrapped {
             }
         }
         let r = HttpService::serve(&*self.inner, method, path, headers, body, url);
-        if path == ROUTE_LOCK_PATH {
+        if path == ROUTE_LOCK_PATH && !xbt402_interop::memnet::is_lock_check(path, body) {
             let mut g = self.gate.lock().unwrap();
             if g.0 {
                 g.1 = true;
@@ -96,7 +96,7 @@ impl HttpService for Wrapped {
                 g.0 = false;
             }
         }
-        if path == ROUTE_LOCK_PATH && self.refuse.load(Ordering::SeqCst) && r.status == 200 {
+        if path == ROUTE_LOCK_PATH && !xbt402_interop::memnet::is_lock_check(path, body) && self.refuse.load(Ordering::SeqCst) && r.status == 200 {
             return HttpResponse::new(400, vec![("Content-Type".into(), "application/json".into())], br#"{"error":"refused","detail":"no"}"#.to_vec());
         }
         r

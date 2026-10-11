@@ -430,6 +430,11 @@ impl MemNet {
     }
 }
 
+/// The request is a hub's check of a lock (AGP-094): the lock endpoint, `route.check` true.
+pub fn is_lock_check(path: &str, body: &[u8]) -> bool {
+    path == xbt402::route::ROUTE_LOCK_PATH && serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|b| b["route"]["check"] == true)
+}
+
 /// A [`Transport`] over a [`MemNet`].
 pub struct NetTransport(pub Arc<MemNet>);
 
@@ -437,9 +442,13 @@ impl Transport for NetTransport {
     fn request(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)]) -> Result<HttpResponse> {
         let (origin, path) = xbt402::client::split_url(url);
         let app = self.0.apps.lock().unwrap().get(&origin).cloned().ok_or_else(|| ChannelError::new("transport_error", format!("connection refused: {origin}")))?;
-        self.0.calls.lock().unwrap().push((method.into(), origin.clone(), path.clone()));
+        // AGP-094: a hub asks a provider to check a lock before it pre-signs it, on the lock's own
+        // path. The tests that count lock requests, or lose a lock's answer, mean the lock: a check
+        // is recorded under `<path>?check`, and its answer is never dropped
+        let check = is_lock_check(&path, body);
+        self.0.calls.lock().unwrap().push((method.into(), origin.clone(), if check { format!("{path}?check") } else { path.clone() }));
         let r = app.serve(method, &path, headers, body, url);
-        if self.0.drops.lock().unwrap().get(&origin).is_some_and(|d| d(method, &path)) {
+        if !check && self.0.drops.lock().unwrap().get(&origin).is_some_and(|d| d(method, &path)) {
             return Err(ChannelError::new("transport_error", "answer lost"));
         }
         let headers = r.headers.into_iter().map(|(k, v)| (k.to_ascii_uppercase(), v)).collect();
