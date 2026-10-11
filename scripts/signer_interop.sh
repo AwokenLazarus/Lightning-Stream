@@ -49,11 +49,12 @@ rm -rf "${RUN:?}"
 mkdir -p "$RUN/src/b1" "$RUN/src/b2" "$OUT"
 # The pins are xbt-063's rehearsal/PINS (AGP-074: the merged B1 and B2 masters, which read the
 # append-only payments log and bind request digest v2). SIGNER_INTEROP_B1_PIN and
-# SIGNER_INTEROP_B2_PIN override them.
+# SIGNER_INTEROP_B2_PIN override them; XBT402_B1 and XBT402_B2 name the repositories the pins are
+# read from (as in conformance.sh), ~/xbt-rnd/b1 and ~/xbt-rnd/b2 by default.
 export REHEARSAL_B1_PIN=${SIGNER_INTEROP_B1_PIN:-$(awk '$1=="b1"{print $2}' "$XBT063/rehearsal/PINS")}
 export REHEARSAL_B2_PIN=${SIGNER_INTEROP_B2_PIN:-$(awk '$1=="b2"{print $2}' "$XBT063/rehearsal/PINS")}
-git -C "$HOME/xbt-rnd/b1" archive "$REHEARSAL_B1_PIN" xbt402 scripts | tar -x -C "$RUN/src/b1"
-git -C "$HOME/xbt-rnd/b2" archive "$REHEARSAL_B2_PIN" agentwallet agentwallet-approve | tar -x -C "$RUN/src/b2"
+git -C "${XBT402_B1:-$HOME/xbt-rnd/b1}" archive "$REHEARSAL_B1_PIN" xbt402 scripts | tar -x -C "$RUN/src/b1"
+git -C "${XBT402_B2:-$HOME/xbt-rnd/b2}" archive "$REHEARSAL_B2_PIN" agentwallet agentwallet-approve | tar -x -C "$RUN/src/b2"
 echo "== AGP-027 signer interop on regtest: ports $REHEARSAL_PORT_BASE-$((REHEARSAL_PORT_BASE + 99)), b1 $REHEARSAL_B1_PIN, b2 $REHEARSAL_B2_PIN, signer $XBT_SIGNER_BIN"
 set +e
 "$PY" "$ROOT/scripts/interop/signer_runbook.py" "$OUT" 2>&1 | tee "$OUT/signer_interop.log"

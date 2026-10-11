@@ -8,3 +8,6 @@
 /dist/startos
 __pycache__/
 /dist/umbrel
+# run evidence of work_interop.sh and work_nta.sh: local output, not for the repository
+/docs/work-interop-*
+/docs/work-nta-*
