@@ -42,6 +42,18 @@ pub const AMSAT_PER_MSAT: u128 = 1_000_000_000_000_000_000;
 /// The fee carry unit: 1e-6 msat (feePpm × msat, exact).
 pub const FEE_UNITS_PER_SAT: u128 = 1_000_000_000;
 pub use crate::wire::{LOCK_PATH as ROUTE_LOCK_PATH, ROLLOVER_PATH, TERMS_PATH};
+
+/// AGP-105 (fourth audit item 10): can a lock for an invoice that lives `invoice_ttl` seconds
+/// ever be sent through a hub that waits `reveal_timeout_sec` for the provider? A client sends a
+/// lock only with `1 + revealTimeoutSec` of its invoice left ([`RoutePayer::lock`](crate::route_client::RoutePayer::lock)),
+/// and the hub admits one only with `revealTimeoutSec` left, so a shorter invoice is never paid:
+/// the provider's credit runs out and it stops serving, with no error anywhere. The shipped
+/// defaults are 15 s against 10 s. One function for the client's check when it starts a session
+/// and for a provider's at start.
+pub fn invoice_can_route(invoice_ttl: f64, reveal_timeout_sec: f64) -> bool {
+    invoice_ttl >= 1.0 + reveal_timeout_sec
+}
+
 pub const HUB_ROUTE_PATH: &str = "/x402/route";
 /// `POST` with a PAYMENT-SIGNATURE on ch1 (`{chan, seq, cum, auth}`, an empty body): the hub's view
 /// of that ch1, the one its refusals carry (AGP-088). A client at its cap on held locks asks here

@@ -95,6 +95,12 @@ impl Wallet for Shared {
         sends.push((txid.clone(), address.to_string(), sats));
         Ok((txid, 0))
     }
+    // AGP-105: this double either refuses or returns its outpoint, so its "none" is "sent
+    // nothing"; a wallet that does not say so is no longer asked again after a failed `fund`
+    // (`agp102_route_client.rs`, `agp105_route_client.rs`)
+    fn knows_its_sends(&self) -> bool {
+        true
+    }
     fn wallet_sends_to(&self, _address: &str) -> Result<Vec<String>> {
         Ok(vec![])
     }

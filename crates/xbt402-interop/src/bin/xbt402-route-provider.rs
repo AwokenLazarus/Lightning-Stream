@@ -60,8 +60,18 @@ fn main() {
         HttpResponse::new(200, vec![("Content-Type".into(), "application/json".into())], json!({"shard": "rust", "chunk": n}).to_string())
     })).expect("provider");
     let amsat: u128 = arg("--amsat").expect("--amsat").parse().expect("amsat");
-    prov.offer_route(RouteOffer { window: f("--window", 1.0), lock_wait: f("--lock-wait", 3.0), invoice_ttl: f("--ttl", 8.0),
-                                  ..RouteOffer::new("/v1/chunk", amsat) });
+    // AGP-105: `--ttl` defaults to the library's invoice TTL (it was 8 s, under the 10 s a hub
+    // waits by default: nothing routed). An invoice too short for the hub's wait is refused here:
+    // `--hub-reveal-timeout` is the `reveal_timeout` of the hubs this provider is routed through,
+    // by default the shipped hub's
+    let base = RouteOffer::new("/v1/chunk", amsat);
+    let (ttl, reveal) = (f("--ttl", base.invoice_ttl), f("--hub-reveal-timeout", xbt402::hub::HubConfig::default().reveal_timeout));
+    if !xbt402::route::invoice_can_route(ttl, reveal) {
+        eprintln!("xbt402-route-provider: --ttl {ttl} s is below 1 + {reveal} s (a hub's revealTimeoutSec, --hub-reveal-timeout): no lock for an invoice of this \
+                   provider would ever be sent or admitted, so nothing would be paid. Refusing to start.");
+        std::process::exit(2);
+    }
+    prov.offer_route(RouteOffer { window: f("--window", 1.0), lock_wait: f("--lock-wait", 3.0), invoice_ttl: ttl, ..base });
     let prov = Arc::new(prov);
     let hs = xbt402::http::serve_http(prov.clone(), &format!("127.0.0.1:{port}"), 8).expect("bind");
     eprintln!("rust route provider {} on {port} ready", prov.pay_to());

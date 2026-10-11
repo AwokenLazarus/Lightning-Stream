@@ -306,6 +306,10 @@ impl Wallet for MemChain {
         self.fund_with(address, sats, 6)
     }
 
+    fn knows_its_sends(&self) -> bool {
+        true
+    }
+
     fn wallet_sends_to(&self, address: &str) -> Result<Vec<String>> {
         Ok(self.st().wallet.iter().filter(|w| w.address == address).map(|w| w.txid.clone()).collect())
     }
@@ -399,6 +403,10 @@ pub struct ChainWallet(pub Arc<MemChain>);
 impl Wallet for ChainWallet {
     fn fund(&self, address: &str, sats: u64) -> Result<(String, u32)> {
         self.0.fund(address, sats)
+    }
+
+    fn knows_its_sends(&self) -> bool {
+        true
     }
 
     fn wallet_sends_to(&self, address: &str) -> Result<Vec<String>> {

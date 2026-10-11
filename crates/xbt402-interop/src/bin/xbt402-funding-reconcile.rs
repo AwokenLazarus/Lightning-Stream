@@ -54,6 +54,10 @@ impl Wallet for FailAfterSend {
         Err(ChannelError::new("rpc_error", "gettransaction: timeout"))
     }
 
+    fn knows_its_sends(&self) -> bool {
+        true
+    }
+
     fn wallet_sends_to(&self, address: &str) -> xbt402::Result<Vec<String>> {
         self.w.wallet_sends_to(address)
     }

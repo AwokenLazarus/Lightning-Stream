@@ -2,7 +2,7 @@
 //! `RemoteSigner` over the B2 socket. Pays `--calls` requests to `--url`, optionally closes, and
 //! prints a JSON report.
 //!   xbt-signer-payer --sock SOCK --url URL --network NET [--calls 10] [--capacity 10000]
-//!                    [--max-price 1000] [--expiry-blocks 1008] [--min-conf 1] [--close]
+//!                    [--max-price 1000] [--expiry-blocks 2016] [--min-conf 1] [--close]
 //! The funding goes through the signer's `fund`; the payer then waits (up to 180 s) until the
 //! signer's node shows `--min-conf` confirmations before it posts the open (B2's P2).
 use std::path::PathBuf;
@@ -66,7 +66,8 @@ fn main() {
     let mut cfg = ClientConfig::new(&arg(&args, "--network").expect("--network"));
     cfg.capacity = num(&args, "--capacity", 10_000);
     cfg.max_price = num(&args, "--max-price", 1_000);
-    cfg.expiry_blocks = num(&args, "--expiry-blocks", 1_008) as u32;
+    // AGP-105: two weeks, so a payer has about a week to come back for a funded channel (it was 1,008: one day)
+    cfg.expiry_blocks = num(&args, "--expiry-blocks", xbt402::client::SHIPPED_PAYER_EXPIRY_BLOCKS as u64) as u32;
     cfg.budget_sats = num(&args, "--budget", 1_000_000);
     let remote = RemoteSigner::new(&sock);
     let h = remote.clone();

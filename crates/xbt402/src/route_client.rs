@@ -314,6 +314,9 @@ struct Ch1 {
     /// AGP-094: the signer has bound ch1 to its key (`attach`) and signed its refund. Recorded,
     /// so a later `open` neither skips the attach nor asks for it twice.
     attached: bool,
+    /// AGP-105: the wallet was asked to fund this ch1 (written before the call). With no outpoint
+    /// on the books it means a `fund` call that never said whether it sent.
+    fund_asked: bool,
 }
 
 #[derive(Default)]
@@ -380,7 +383,9 @@ impl RoutePayer {
                                    accepted: c.get("accepted").cloned().unwrap_or(Value::Null), seq: py_u64(c.get("seq")).ok_or_else(|| bad("seq"))?,
                                    opened: c.get("opened").and_then(Value::as_bool).unwrap_or(false),
                                    // (a record from before the field was written after the attach)
-                                   attached: c.get("attached").and_then(Value::as_bool).unwrap_or(true) });
+                                   attached: c.get("attached").and_then(Value::as_bool).unwrap_or(true),
+                                   // (a record from before the field: as if never asked, the rule before it)
+                                   fund_asked: c.get("fund_asked").and_then(Value::as_bool).unwrap_or(false) });
                 st.hub_pay_to = py_str(c.get("hub_pay_to"));
             }
             if let Some(b) = recs.get("book") {
@@ -442,7 +447,7 @@ impl RoutePayer {
 
     fn ch1_json(&self, st: &PState) -> Value {
         st.ch.as_ref().map(|c| json!({"hub_url": self.hub_url, "params": c.params.to_json(), "accepted": c.accepted, "seq": c.seq,
-                                     "opened": c.opened, "attached": c.attached, "hub_pay_to": st.hub_pay_to})).unwrap_or(Value::Null)
+                                     "opened": c.opened, "attached": c.attached, "fund_asked": c.fund_asked, "hub_pay_to": st.hub_pay_to})).unwrap_or(Value::Null)
     }
 
     fn persist(&self, recs: &[(String, Value)]) -> Result<()> {
@@ -612,7 +617,7 @@ impl RoutePayer {
         };
         let recs = {
             let mut st = lk(&self.st);
-            st.ch = Some(Ch1 { params: p, accepted: acc, seq: 0, opened: false, attached: false });
+            st.ch = Some(Ch1 { params: p, accepted: acc, seq: 0, opened: false, attached: false, fund_asked: false });
             [("ch1".to_string(), self.ch1_json(&st)), ("book".to_string(), Self::book_json(&st))]
         };
         if let Err(e) = self.persist(&recs) {
@@ -625,11 +630,20 @@ impl RoutePayer {
 
     /// Stage 2: fund the recorded ch1 (unless an earlier call did), record its outpoint, and bind
     /// it to its key in the signer. Returns ch1's funded terms.
+    ///
+    /// AGP-105 rule (fourth audit item 6): **after a `fund` call that did not return an outpoint,
+    /// ch1 is funded again only when the wallet says it sent nothing.** That the wallet was asked
+    /// is on the books before the call (`fund_asked`). On the next `open` a wallet that keeps a
+    /// record of its sends ([`Wallet::knows_its_sends`]) is believed: its send is taken up, or
+    /// with none it is asked again. A wallet that cannot say used to be read as "sent nothing",
+    /// and every `open` sent ch1's capacity again to the same script; now the open is refused
+    /// `open_unresolved` and nothing is sent until the owner has looked
+    /// ([`forget_unfunded`](Self::forget_unfunded)).
     fn fund_ch1(&self) -> Result<ChannelParams> {
-        let (mut p, acc) = {
+        let (mut p, acc, asked) = {
             let st = lk(&self.st);
             let c = st.ch.as_ref().ok_or_else(|| ChannelError::code("no_channel"))?;
-            (c.params.clone(), c.accepted.clone())
+            (c.params.clone(), c.accepted.clone(), c.fund_asked)
         };
         if p.funding.is_none() {
             let hrp = if self.cfg.network == XBT_MAINNET { "bc" } else { "bcrt" };
@@ -656,6 +670,20 @@ impl RoutePayer {
                         return fail("open_unresolved", "an earlier open never learned whether its funding was sent, and ch1 is too near its expiry to fund \
                                                         now: once the wallet shows no send to it, call forget_unfunded");
                     }
+                    if asked && !self.wallet.knows_its_sends() {
+                        return fail("open_unresolved", format!("an earlier open asked the wallet to fund ch1 and never learned whether it sent, and this wallet cannot \
+                                                                say what it sent: nothing more is funded. Look for a send of {} sat to {addr}: if there is none, \
+                                                                call forget_unfunded and open again", p.capacity));
+                    }
+                    // on the books before the wallet is asked: a call that never answers is then known
+                    let rec = {
+                        let mut st = lk(&self.st);
+                        if let Some(c) = st.ch.as_mut() {
+                            c.fund_asked = true;
+                        }
+                        self.ch1_json(&st)
+                    };
+                    self.persist(&[("ch1".into(), rec)])?;
                     self.wallet.fund_channel(&self.hub_url, &p, &addr, p.capacity)?
                 }
             };
@@ -711,7 +739,8 @@ impl RoutePayer {
 
     /// Drop a ch1 that was recorded and never funded (its key goes with it). Call it only when
     /// the wallet shows no send to its script: [`open`](Self::open) refuses `open_unresolved`
-    /// when such a ch1 is too near its expiry to fund. True if one was dropped.
+    /// when such a ch1 is too near its expiry to fund, or (AGP-105) when the wallet was asked to
+    /// fund it, did not answer with an outpoint and cannot say what it sent. True if one was dropped.
     pub fn forget_unfunded(&self) -> Result<bool> {
         let mut st = lk(&self.st);
         if !st.ch.as_ref().is_some_and(|c| c.params.funding.is_none()) {
@@ -784,7 +813,8 @@ impl RoutePayer {
     /// invoice (the hub never touches either).
     /// With a ledger, a session it holds for `url` is resumed instead (no new 402).
     pub fn shard(&self, url: &str, method: &str) -> Result<Arc<Shard>> {
-        crate::wire::no_fragment(url)?;
+        // AGP-105: the session is opened at, keyed by and paid at the URL the one parser read
+        let url = &crate::wire::sendable_url(url)?;
         if let Some(sh) = lk(&self.shards).get(url).cloned() {
             if self.ledger.is_some() {
                 return Ok(sh);
@@ -807,9 +837,19 @@ impl RoutePayer {
         if inv.pay_to != pay_to || inv.session != session || !inv.verify() {
             return fail("bad_invoice", "invoice not signed by the provider's payTo");
         }
-        let hub = lk(&self.st).hub_pay_to.clone();
+        let (hub, rts) = {
+            let st = lk(&self.st);
+            (st.hub_pay_to.clone(), st.quote.as_ref().map(|q| q.reveal_timeout_sec))
+        };
         if !inv.accepts_hub(&hub) {
             return fail("route_blocked", "the provider does not take locks from our hub");
+        }
+        // AGP-105: a session no lock could ever pay is refused when it starts, with the two numbers
+        if let (Some(ttl), Some(rts)) = (rt.get("invoiceTtl").and_then(Value::as_f64), rts) {
+            if !crate::route::invoice_can_route(ttl, rts as f64) {
+                return fail("route_blocked", format!("the provider's invoices live {ttl} s and our hub needs 1 + revealTimeoutSec = {} s of one left to route a lock: \
+                                                      nothing could be paid (the provider must offer a longer invoiceTtl, or the hub a shorter reveal_timeout)", 1 + rts));
+            }
         }
         let (origin, path) = split_url(url);
         let key = session_key(&c, &hex::decode(&pay_to).unwrap_or_default())?;

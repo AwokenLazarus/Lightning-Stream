@@ -167,6 +167,75 @@ pub fn canonical_origin(url: &str) -> String {
     }
 }
 
+/// The URL a payer hands its transport for `url`, built from what [`request_url`] read.
+///
+/// The rule (AGP-105, fourth audit item 1): **the host a payer keys its book by, checks an
+/// allowlist on and binds a payment to is the host the request is sent to.** [`request_url`]
+/// decides the host; a transport parses the string again with its own parser (ureq uses the `url`
+/// crate), and `http://a.example\@b.example/x` is host `b.example` to the first and `a.example`
+/// to the second: B's channel paid and A was sent the payment. So no transport is given the
+/// caller's string. It gets `scheme://[userinfo@]host[:port]target` put together from the parsed
+/// parts, and a URL is refused when those parts are not spelled in the one way every parser reads
+/// alike:
+///
+/// - not `scheme://...` (a bare target names no host; `http:\\h` and `http:/h` name one to a WHATWG parser);
+/// - a backslash, a `#`, whitespace or a control character anywhere (a WHATWG parser reads `\`
+///   as `/`, and drops tabs and newlines before it parses);
+/// - a second `@`, or userinfo with a character outside RFC 3986's set for it;
+/// - an empty host, or a host with a character other than a letter, digit, `.`, `-` or `_` (so no
+///   percent-encoding and no non-ASCII name: a parser decodes or maps those);
+/// - a host whose last label is a number and that is not a dotted quad as `Ipv4Addr` prints it
+///   (`127.1`, `2130706433` and `0x7f.0.0.1` are 127.0.0.1 to a transport);
+/// - a bracketed host that is not an IPv6 address as `Ipv6Addr` prints it;
+/// - a port that is not a decimal number below 65536.
+///
+/// Case, a default port, a port's leading zeros and a trailing dot are not refused: both readings
+/// agree on them. [`crate::http::UreqTransport`] calls this on every request, and the payers call
+/// it before anything is signed, funded or probed.
+pub fn sendable_url(url: &str) -> Result<String> {
+    let refuse = |why: &str| Err(ChannelError::new("bad_request", format!("the URL {why}: its host could be read two ways, so nothing is paid or sent")));
+    if url.chars().any(|c| c == '\\' || c == '#' || c.is_whitespace() || c.is_control()) {
+        return refuse("has a backslash, a #, a space or a control character");
+    }
+    let Some((_, rest)) = split_scheme(url) else {
+        return refuse("is not scheme://host");
+    };
+    let authority = &rest[..rest.find(['/', '?']).unwrap_or(rest.len())];
+    let (userinfo, hostport) = match authority.split_once('@') {
+        Some((_, h)) if h.contains('@') => return refuse("has a second @"),
+        Some((u, _)) if !u.bytes().all(|c| c.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:%".contains(&c)) => return refuse("has userinfo outside RFC 3986"),
+        Some((u, h)) => (format!("{u}@"), h),
+        None => (String::new(), authority),
+    };
+    let u = request_url(url);
+    // `request_url` takes a bracketed host up to its `]` and a port only after `]:`
+    if hostport.starts_with('[') && !hostport.split_once(']').is_some_and(|(_, after)| after.is_empty() || after.starts_with(':')) {
+        return refuse("has something other than a port after a bracketed host");
+    }
+    if !host_spelled_one_way(&u.host) {
+        return refuse("has a host that is not a plain name or an address in its usual form");
+    }
+    if !(u.port.is_empty() || u.port.bytes().all(|c| c.is_ascii_digit()) && u.port.parse::<u16>().is_ok()) {
+        return refuse("has a port that is not a number below 65536");
+    }
+    let origin = canonical_origin(url);
+    Ok(format!("{}://{userinfo}{}{}", u.scheme, &origin[u.scheme.len() + 3..], u.target))
+}
+
+/// A host as [`request_url`] returns it that every URL parser reads as written: see [`sendable_url`].
+fn host_spelled_one_way(host: &str) -> bool {
+    if let Some(v6) = host.strip_prefix('[') {
+        return v6.strip_suffix(']').is_some_and(|a| a.parse::<std::net::Ipv6Addr>().is_ok_and(|ip| ip.to_string() == a));
+    }
+    if host.is_empty() || !host.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'.' | b'-' | b'_')) {
+        return false;
+    }
+    // the WHATWG rule for "this host is an IPv4 address": its last label is a number
+    let last = host.strip_suffix('.').unwrap_or(host).rsplit('.').next().unwrap_or("");
+    let number = !last.is_empty() && last.bytes().all(|c| c.is_ascii_digit()) || last.strip_prefix("0x").is_some_and(|h| h.bytes().all(|c| c.is_ascii_hexdigit()));
+    !number || host.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| ip.to_string() == host)
+}
+
 /// `LE64(len(x)) ‖ x`: every field of a v2 digest or receipt, so no two field lists hash alike.
 fn put_field(h: &mut Sha256, x: &[u8]) {
     h.update((x.len() as u64).to_le_bytes());
@@ -642,6 +711,76 @@ mod tests {
                 assert_eq!(canonical_origin(a) == canonical_origin(b), (x.scheme, x.host, x.port) == (y.scheme, y.host, y.port), "{a} {b}");
             }
         }
+    }
+
+    /// What the transport's parser (the `url` crate, as ureq uses it) reads as the origin.
+    fn transport_origin(u: &str) -> Option<String> {
+        let p = url::Url::parse(u).ok()?;
+        let host = p.host_str()?;
+        Some(p.port().map_or(format!("{}://{host}", p.scheme()), |port| format!("{}://{host}:{port}", p.scheme())))
+    }
+
+    #[test]
+    fn a_sendable_url_is_the_parsed_one_and_the_rest_is_refused() {
+        // AGP-105 (fourth audit item 1): accepted spellings, and what the transport is given
+        for (url, sent) in [("http://b.example/x", "http://b.example/x"), ("HTTP://B.Example:80/x?y=1", "http://b.example/x?y=1"),
+                            ("https://api.example:0443", "https://api.example/"), ("https://api.example:/x", "https://api.example/x"),
+                            ("https://u:p@api.example:8443/x", "https://u:p@api.example:8443/x"), ("http://b.example?q", "http://b.example/?q"),
+                            ("http://b.example./x", "http://b.example./x"), ("http://my_host-1.test:8402/x", "http://my_host-1.test:8402/x"),
+                            ("http://127.0.0.1:22000/x", "http://127.0.0.1:22000/x"), ("http://[::1]:8080/x", "http://[::1]:8080/x"),
+                            ("http://[::ffff:10.0.0.5]/x", "http://[::ffff:10.0.0.5]/x"), ("http://x.onion/a/@b", "http://x.onion/a/@b")] {
+            assert_eq!(sendable_url(url).as_deref(), Ok(sent), "{url}");
+            assert_eq!(canonical_origin(sent), canonical_origin(url), "{url}");
+        }
+        // refused: every spelling the audit and the task name, and the forms a WHATWG parser reads as absolute
+        for url in ["http://a.example\\@b.example/x", "http://a.example\\.b.example/x", "http://b.example/x\\y", "http:\\\\b.example/x", "http:/b.example/x",
+                    "http:b.example/x", "/x", "b.example/x", "", " http://b.example/x", "http://b.example/x y", "http://b.example/\tx", "http://a.example\t@b.example/x",
+                    "http://b.example\n/x", "http://b.example/x\u{0}", "http://b.example/x\u{a0}y", "http://a.example@b.example@c.example/x", "http://a.example#@b.example/x",
+                    "http://b.example/x#f", "http://u<@b.example/x", "http:///b.example/x", "http://@/x", "http://%62.example/x", "http://b.exa%6dple/x",
+                    "http://\u{ff42}.example/x", "http://b\u{e9}.example/x", "http://b.example:x/x", "http://b.example:65536/x", "http://b.example:80:80/x",
+                    "http://b.example:-1/x", "http://127.1/x", "http://2130706433/x", "http://0x7f.0.0.1/x", "http://0x7f000001/x", "http://017700000001/x",
+                    "http://127.0.0.01/x", "http://127.0.0.1./x", "http://1.2.3.4.5/x", "http://a.0x/x", "http://[0:0:0:0:0:0:0:1]/x", "http://[::1]x/x",
+                    "http://[::1%25eth0]/x", "http://[::FFFF:1.2.3.4]:x/", "http://[b.example]/x", "http://[::1/x", "http://b.example]/x", "http://b,example/x",
+                    "http://b.example|/x", "http://b^example/x", "http://b example/x"] {
+            let r = sendable_url(url);
+            assert_eq!(r.as_ref().map_err(|e| e.code.as_str()), Err("bad_request"), "{url:?}");
+        }
+    }
+
+    #[test]
+    fn the_transports_parser_reads_every_sendable_url_as_the_book_does() {
+        // every authority of up to 5 of these characters, and each inside a longer URL: when the
+        // URL is accepted, the `url` crate reads the string the transport is given as the same
+        // scheme, host and port as `canonical_origin` (the book key and the allowlist) reads the
+        // caller's string. 2 * (7^1 + ... + 7^5) * ... cases; the alphabet holds every character
+        // class the rule names.
+        let alphabet = ["a", "B", "1", ".", ":", "@", "\\", "%61", "[", "]", "?", "/", "0x", "-", "_", "\t", "#", "80", "::"];
+        let mut all = vec![String::new()];
+        let mut from = 0;
+        for _ in 0..4 {
+            let to = all.len();
+            for i in from..to {
+                for a in alphabet {
+                    all.push(format!("{}{a}", all[i]));
+                }
+            }
+            from = to;
+        }
+        let (mut accepted, mut refused) = (0, 0);
+        for mid in &all {
+            for url in [format!("http://{mid}"), format!("http://{mid}/p?q"), format!("HTTPS://h.test{mid}/p"), format!("http://{mid}b.example:8080/x"), format!("http://[::1]{mid}")] {
+                match sendable_url(&url) {
+                    Ok(sent) => {
+                        accepted += 1;
+                        assert_eq!(transport_origin(&sent), Some(canonical_origin(&url)), "{url:?} is sent as {sent:?}");
+                        assert_eq!(request_digest_v2("GET", &sent, b""), request_digest_v2("GET", &url, b""), "{url:?}: the binding is of what is sent");
+                        assert_eq!(sendable_url(&sent).as_deref(), Ok(sent.as_str()), "{url:?}: what is sent is itself sendable, unchanged");
+                    }
+                    Err(_) => refused += 1,
+                }
+            }
+        }
+        assert!(accepted > 1_000 && refused > 100_000, "{accepted} accepted, {refused} refused");
     }
 
     #[test]

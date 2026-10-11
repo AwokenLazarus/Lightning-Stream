@@ -552,7 +552,9 @@ fn control_with_a_scan_that_gives_the_depth_the_same_reorg_releases_nothing() {
 /// rig sets 0.3 or 1, so no test runs the two defaults together.
 #[test]
 fn a_lock_is_routed_at_the_shipped_defaults_of_the_hub_and_the_route_provider() {
-    TTL.with(|t| t.set(8.0)); // xbt402-route-provider --ttl default
+    // AGP-105: the fixture follows the shipped default (it was `--ttl 8.0`, the hole; the route
+    // provider now takes the library's). What is asserted below is unchanged
+    TTL.with(|t| t.set(xbt402::route_seller::RouteOffer::new("/v1/chunk", 1).invoice_ttl)); // xbt402-route-provider --ttl default
     let w = W::build(1, 20, 300, HubConfig { reveal_timeout: HubConfig::default().reveal_timeout, ..hub_cfg() }, true);
     assert_eq!(HubConfig::default().reveal_timeout, 10.0);
     stream(&w.pay, &w.shards[0], 10);
