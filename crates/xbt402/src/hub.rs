@@ -3333,6 +3333,17 @@ impl RouteHub {
                 return Ok(out);
             }
         }
+        if oc.state == "rolled" && !oc.close_txid.is_empty() {
+            // the rollover this ch2 was rolled on, in a block by one of its own two outputs: nothing
+            // left to watch, and no block is read for it (a rollover whose outputs are both spent
+            // again already is found by the scan below)
+            for n in 0..2 {
+                if self.chain.get_tx_out(&oc.close_txid, n, false)?.is_some_and(|u| u.confirmations >= 1) {
+                    self.upd(loc, &oc, |c| (c.final_, c.spend_seen) = (true, true))?;
+                    return Ok(out);
+                }
+            }
+        }
         let locks = !oc.pending.is_empty() || !oc.stale.is_empty();
         if oc.state == "closing" && !oc.close_txid.is_empty() && !locks && oc.refund_txid.is_empty() && oc.next.is_empty()
             && self.spent_in_block(&oc, None)?
