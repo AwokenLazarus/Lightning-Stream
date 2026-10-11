@@ -1,5 +1,5 @@
 //! Offline self-test for the build matrix (scripts/work_matrix.sh): on the target itself, rebuild
-//! XBT-053's xbt-work vector file with this crate (byte-identical to the published copy embedded
+//! XBT-053's xbt-work vector file with this crate (byte-identical to the pinned copy embedded
 //! here) and run every conformance check over it. No network, no files.
 use xbt_work::vectors::{check, generate, to_file};
 

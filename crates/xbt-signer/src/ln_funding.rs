@@ -60,7 +60,7 @@
 //! not reorganise below it. Where it does not yet, whoever mines that block there can mine the same
 //! coinbase, which pays the same keys. That takes a block on each chain at one height from one
 //! party, or a miner who gives its block's reward to the other coinbase's payees. The signer has
-//! no the SHA-256 chain node to compare heights with, so it cannot check this; the rule is kept as
+//! no node of the SHA-256 chain to compare heights with, so it cannot check this; the rule is kept as
 //! the owner decided it (2026-10-11) and this is its stated limit.
 //!
 //! The funding transaction's checks: the channel's txid, output, amount and P2WSH. Inputs are looked up

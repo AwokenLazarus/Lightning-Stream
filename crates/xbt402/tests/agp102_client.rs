@@ -1,8 +1,16 @@
 //! AGP-102 fourth closure audit, CLIENT area (the channel library client and its transport): tests
 //! written by the auditor against fix wave 5 (AGP-096, AGP-101). No fix is in this file.
 //!
-//! `hole_*` tests fail today and state the rule that should hold. `control_*` tests are the honest
-//! path in the same rig and `limit_*` tests pin a number a reader must be told; both pass.
+//! `hole_*` tests failed when the audit wrote them and state the rule that should hold.
+//! `control_*` tests are the honest path in the same rig and `limit_*` tests pin a number a reader
+//! must be told; both pass.
+//!
+//! AGP-107 (close-out): every test here passes or is marked. A test that was still red after fix
+//! wave 6 is either a `limit_*` test now (its comment names the item and the sentence of
+//! `docs/LIMITS.md` it pins; it passes while the limit holds and fails when someone lifts it) or
+//! is ignored with a reason that starts `open:` and names the audit's item; those are listed under
+//! "Open items" there.
+//!
 //! The socket tests need `--features http-client,http-server` and bind 127.0.0.1:27750-27759.
 //!
 //!   CARGO_TARGET_DIR=$PWD/target cargo test --offline -p xbt402 --test agp102_client \
@@ -206,15 +214,22 @@ fn forger(forge: Arc<AtomicUsize>) -> Rewrite {
     })
 }
 
-/// HOLE (Low, a public sentence that is not true of the library; left from before, the sentence is
-/// new in wave 5). AGP-101's sentence for the summary says that at the second forged refusal the
-/// payer "closes the channel at what it signed and opens another". The library does neither by
-/// itself: every call is `bad_offer` until the embedder calls `close`, and `close` leaves the
-/// closed channel on the book as `Stage::Open`, so after it every call is still refused: nothing
-/// "opens another" until the embedder also removes the record (`xbt-wallet-mcp`'s close tool does;
-/// `Client::close` does not, and no document says the embedder must).
+/// LIMIT (AGP-107; the fourth audit's list 1 item 15, first bullet: "correct the sentence"). The
+/// audit wrote this as `hole_..._the_next_call_opens_a_new_channel` (Low, a public sentence that
+/// was not true of the library; the sentence was new in wave 5). AGP-101's sentence for the
+/// summary said that at the second forged refusal the payer "closes the channel at what it signed
+/// and opens another". The library does neither by itself: every call is `bad_offer` until the
+/// embedder calls `close`, and `close` leaves the closed channel on the book as `Stage::Open`, so
+/// after it every call is still refused: nothing "opens another" until the embedder also removes
+/// the record (`xbt-wallet-mcp`'s close tool does; `Client::close` does not).
+///
+/// The sentence is corrected and this is what it now says (`docs/LIMITS.md`, channel and
+/// transport): "after the second, every call on that channel is refused until its owner closes it
+/// and removes its record". The last assertion is turned round: it fails when `close` removes the
+/// record or the client opens another channel by itself; then restore the audit's assertion (a
+/// 200 after the close).
 #[test]
-fn hole_after_the_close_that_follows_two_forged_refusals_the_next_call_opens_a_new_channel() {
+fn limit_after_the_close_that_follows_two_forged_refusals_every_call_is_refused_until_the_record_is_removed() {
     let w = world("forged-close-next");
     let forge = Arc::new(AtomicUsize::new(0));
     let mut c = w.bare_client(forger(forge.clone()));
@@ -230,8 +245,8 @@ fn hole_after_the_close_that_follows_two_forged_refusals_the_next_call_opens_a_n
     c.close(O).expect("the embedder's close");
     let after: Vec<_> = (0..3).map(|_| get(&mut c)).collect();
     let now = c.channels.get(O).map(|ch| (ch.payer.params.channel_id(), ch.stage));
-    assert!(after.contains(&Ok(200)), "after the close every call is still refused: {after:?}; the book still holds {now:?} (the closed channel was {chan}), \
-                                       and {} channel(s) were funded", w.funded());
+    assert_eq!((after, now, w.funded()), (vec![Err("bad_offer".to_string()); 3], Some((chan, Stage::Open)), 1),
+               "the limit is lifted: after the close a call was served, the record is gone or a second channel was funded");
 }
 
 /// CONTROL for the hole above: with the closed record removed by the embedder (what
@@ -514,31 +529,47 @@ mod sockets {
         }
     }
 
-    /// HOLE (Low, left from before; AGP-096 fixed it for the five spellings the audit named). "One
-    /// seller is one origin, however a caller spells it" holds for case, the default port and
-    /// userinfo. The shipped transport reaches the same server through other spellings of its
-    /// host that the book keys apart: the number forms of an IPv4 address, percent-encoding, and
-    /// (for a name) a trailing dot. A seller that refuses every funded open and gets its URLs
-    /// called in those spellings (links in its own answers, which an agent follows) is still funded
-    /// once per spelling, up to `budget_sats`. A payer behind a signer with an allowlist is not
-    /// affected: each spelling needs its own allowlist entry.
+    /// LIMIT (AGP-107; the fourth audit's list 1 item 15, second bullet). The audit wrote this as
+    /// `hole_a_refusing_seller_is_funded_once_however_its_host_is_spelled` (Low, left from before):
+    /// the shipped transport reached one server through spellings of its host that the book keyed
+    /// apart (the number forms of an IPv4 address, percent-encoding, a trailing dot on a name), so
+    /// a seller that refuses every funded open and gets its URLs called in those spellings was
+    /// funded once per spelling: five channels, 1,000,000 sat.
+    ///
+    /// AGP-105's `wire::sendable_url` refuses the number forms and percent-encoding before
+    /// anything is asked or funded, so the audit's fixture (its control wanted two of those
+    /// spellings to reach the server) could not pass or fail on the rule any more. The first half
+    /// below runs the audit's five spellings through the shipped transport and pins that only the
+    /// plain one is funded. The second half is the limit that is left (`docs/LIMITS.md`, channel
+    /// and transport): "a trailing dot on a name is a separate origin, so a seller reached under
+    /// both spellings can be funded once per spelling, up to the payer's budget". Its assertion
+    /// fails when the book reads the dotted name as the same origin: then make it 1. A payer
+    /// behind a signer with an allowlist is not affected: each spelling needs its own entry.
     #[test]
-    fn hole_a_refusing_seller_is_funded_once_however_its_host_is_spelled() {
+    fn limit_a_refusing_seller_is_funded_once_for_each_spelling_that_is_not_refused() {
         let port = 27_752u16;
         let w = http_world("host-spellings", port);
         let mut c = ureq_client(&w, Box::new(Refusing(UreqTransport::default())));
         let spellings = [format!("http://127.0.0.1:{port}"), format!("http://127.1:{port}"), format!("http://2130706433:{port}"), format!("http://0x7f.0.0.1:{port}"),
-                         format!("http://%31%32%37.0.0.1:{port}")];
-        let mut reached = vec![];
-        for o in &spellings {
-            let r = c.request("GET", &format!("{o}/v1/q"), b"").map(|r| r.status).map_err(|e| e.code);
-            // `bad_funding` is the seller's own refusal of a funded open: the spelling reached it
-            if r == Err("bad_funding".into()) {
-                reached.push(o.clone());
+                         format!("http://%31%32%37.0.0.1:{port}"), format!("http://127.0.0.1.:{port}")];
+        let got: Vec<_> = spellings.iter().map(|o| c.request("GET", &format!("{o}/v1/q"), b"").map(|r| r.status).map_err(|e| e.code)).collect();
+        // `bad_funding` is the seller's own refusal of a funded open: the spelling reached it
+        let mut want = vec![Err("bad_request".to_string()); spellings.len()];
+        want[0] = Err("bad_funding".into());
+        assert_eq!(got, want, "only the address in its usual form reaches the seller");
+        assert_eq!((w.funded(), c.channels.keys().collect::<Vec<_>>()), (1, vec![&spellings[0]]), "the other spellings are refused before anything is funded");
+
+        // the limit that is left: a trailing dot on a name (in process: no resolver is asked)
+        let w = world("host-dot");
+        let mut c = w.bare_client(Box::new(|path, req, _, r| {
+            if path == OPEN_PATH && req.get("preflight") != Some(&Value::Bool(true)) {
+                return Ok(HttpResponse::new(400, vec![], json!({"error": "bad_funding", "detail": "no"}).to_string().into_bytes()));
             }
+            Ok(r)
+        }));
+        for o in [O.to_string(), format!("{O}.")] {
+            assert_eq!(c.request("GET", &format!("{o}/v1/q"), b"").map(|r| r.status).map_err(|e| e.code), Err("bad_funding".into()), "{o}");
         }
-        assert!(reached.len() >= 2, "control: at least two spellings reach the one server: {reached:?}");
-        assert_eq!(w.funded(), 1, "one seller (one listener on port {port}), {} channels funded, {} sat locked until expiry, under the keys {:?}",
-                   w.funded(), c.opened_sats, c.channels.keys().collect::<Vec<_>>());
+        assert_eq!(w.funded(), 2, "the limit is lifted: one name, one channel (the book holds {:?})", c.channels.keys().collect::<Vec<_>>());
     }
 }

@@ -18,7 +18,7 @@ socket path.
 | `pay` | `to`, `amount_xbt`, `memo=""` | a policy-checked payment; over the human threshold it returns `needs_human` and an approval token |
 | `history` | `limit=20` | the append-only policy audit log |
 | `channels` | | the Spillman channels: dest, cap, used, expiry |
-| `xbt402_pay` | `url`, `method="GET"`, `body=""`, `max_sats=1000` | pays an xbt-channel 402, including streamed (Merkle) results |
+| `xbt402_pay` | `url`, `method="GET"`, `body=""`, `max_sats=1000` | pays an xbt-channel 402, including streamed (Merkle) results (on a postpay channel a streamed result can be bought once per channel and not after a lost answer: an open item, see `docs/LIMITS.md`) |
 | `close_channel` | `counterparty` | cooperative close |
 | `xbt402_refund` | `counterparty` | the CLTV refund after expiry, always to the wallet's own hot key |
 | `forward_status` | | the forward-market rail: limits, spend, lots |
@@ -226,7 +226,7 @@ token is refused at start.
     memory only).
 
   `local` needs `XBT_MCP_NETWORK` (the xbt402 network id). Optional: `XBT_MCP_CAPACITY`,
-  `XBT_MCP_EXPIRY_BLOCKS`, `XBT_MCP_BUDGET_SATS`, `XBT_MCP_MIN_CONF`.
+  `XBT_MCP_EXPIRY_BLOCKS` (default 2,016), `XBT_MCP_BUDGET_SATS`, `XBT_MCP_MIN_CONF`.
   - Answers carry `payer: "xbt-wallet-mcp: xbt402 Client, keys in the signer"`, plus `owed_sats` and
     `billing`. In postpay, `cum` is the state covering the calls before this one.
   - Streamed results come back as the manifest with a note; buy those in `signer` mode.

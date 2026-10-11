@@ -1,0 +1,477 @@
+# Limits
+
+What this software does not do, or does only up to a point. Read this before you rely on any part
+of it.
+
+Status: test networks only. An external review in October 2026 found critical and high-severity
+issues. Six rounds of fixes followed, and four audits of those fixes by the project itself. Nobody
+outside the project has reviewed the fixes. The history, with counts, is in the review summary; the
+reasoning behind each rule is in the engineering notes (`docs/ENGINEERING.md` in the published
+tree).
+
+This file has three parts:
+
+- **Stated limits**: behaviour we know about and have decided to state instead of change. One
+  sentence each, grouped by area. A limit that an audit test pins is marked *(test)*: that test is
+  named `limit_...`, passes while the limit holds and fails when someone lifts it.
+- **Open items**: defects we have not fixed. Each has a test that still asserts the right
+  behaviour and is marked `open:` in the code.
+- **Not reviewed by anyone**: parts of the tree no review or audit has covered.
+
+"The hub", "the provider" and "the seller" are servers; "the payer", "the client" and "the wallet"
+are the paying side. XBT is Bitcoin on BLAKE2b proof of work; "the SHA-256 chain" is the other
+chain. Numbers are the shipped defaults unless a sentence says otherwise.
+
+## Stated limits
+
+### Hub (experimental)
+
+- The hub's routing is experimental; do not route funds you cannot lose.
+- The hub treats a spend six blocks deep as final (`spend_final_depth`): if a deeper
+  reorganisation brings in a provider's other close, the hub has released a lock it then pays, at
+  most one lock (20,000 sat) per provider channel.
+- With a chain scan that does not say how deep a spend is, a close that is mined, reorganised out
+  and mined again is counted from its first block, so a hold can be released one block deep; the
+  shipped binaries scan with a node that gives the depth. *(test)*
+- A completion that the hub's own ledger did not take is released as unpaid by the same watcher
+  tick when the provider's close is already six blocks deep: the hub has paid that lock and
+  collects nothing for it, at most one lock. *(test)*
+- A routed lock that needs the hub's signature is two requests to the provider. One the provider
+  refuses at the first costs the client nothing, is not rate-limited, and costs the hub and the
+  provider a few disk writes each.
+- A provider that agrees to a lock and then refuses it, or does not reveal in time, has that
+  channel set aside until it closes it or the hub refunds it at its expiry; a client cannot cause
+  this.
+- A provider that does not answer the hub's question about a lock within the reveal timeout (10
+  seconds) is set aside until it answers the hub's watcher, which asks one such provider per tick.
+  A provider that takes the lock itself and then stops answering is waited for once, for the
+  network timeout of 30 seconds, and then set aside; the hub's open, close and rollover requests
+  to a provider also wait up to 30 seconds each.
+- The hub admits an invoice only with its reveal timeout left: with the default invoice life of
+  15 seconds a provider is paid through a hub in the first 5 seconds of each invoice, and a
+  provider whose invoices live no longer than the hub's timeout is never paid through it. The
+  client refuses such a session when it starts; the hub cannot know its providers' invoice life
+  when it starts and only counts the locks it refused.
+- An invoice a hub has asked a provider about is paid through that hub's channel only, until it
+  expires.
+- A client whose lock a provider did not answer in time carries that lock in its channel until the
+  hub's channel to that provider is closed or refunded, and pays twice if it buys the same service
+  elsewhere meanwhile.
+- A client cannot check its hub's claim that a lock it gave up is still held, so it believes at
+  most two such claims at a time: a hub that lies can make it sign one lock above what it owes, at
+  most 50,510 sat with the default client settings (20,041 sat at a default hub). A claim that a
+  lock was completed must come with the secret that proves it.
+- With two given-up locks held, a client signs nothing more through that hub until one resolves.
+  A held lock completed late is proved by one of the hub's last 16 completions for that channel; a
+  client that asks after 16 later ones goes on counting it until its hub channel is replaced.
+- A client cannot close or roll over its hub channel cooperatively while a written-off lock above
+  its best state is unresolved; that lasts until the spend that resolves it is six blocks deep.
+- At its close margin the hub closes a client channel even below a written-off lock, and locks of
+  500 sat or less are not guarded.
+- A lock small enough to be covered by a channel's pre-paid floor is not collected from the client
+  if the provider refuses it or the channel closes while it is unanswered.
+- The hub fronts up to 600 sat for each provider channel: a provider that closes after one small
+  payment has been signed its close fee by the hub before any client paid for it.
+- A lock is at most half of a hub-to-provider channel's configured capacity; a rolled-over channel
+  can be smaller than that.
+- After a close or rollover that the node answered with an error, the channel serves nothing until
+  a spend is on the node; once seven such spends are unresolved a rollover is refused and a close
+  takes no higher final state.
+- The hub keeps one next key per provider channel, and its default channel life equals a default
+  provider's floor, so a refused rollover becomes a close and a new funding one block later.
+- A new hub-to-provider channel is funded only when the hub's own node shows the old one being
+  spent; a refill the provider's terms or the cap refuse is reported once and not tried again.
+- `liquidity_cap_sat` counts a channel until the hub's node shows a spender in its mempool; a close
+  that later leaves the mempool leaves one channel's capacity above the cap until that channel's
+  refund.
+- A hub-to-provider channel that falls out of step with its provider for any other reason is
+  refused at every check and is not replaced until its rollover or expiry.
+- A watcher step that fails or panics at one channel is caught and the other channels are still
+  served; `/healthz` answers 503 while the last tick panicked. It does not show a watcher that
+  hangs, the provider binaries have no `/healthz`, and a build with `panic = "abort"` ends the
+  process.
+- The hub's coins come back to its node wallet, which other applications on the same node can
+  spend; one address is taken from that wallet per funded channel and per sweep, so a wallet
+  restored from its seed must look past addresses that were never paid.
+- A sweep of returned coins is signed once and sent again each block; if its fee proves too low it
+  is not bumped. A payout under 656 sat stays on its channel's key. When fees are high the hub's
+  close of a client channel is bumped by spending the payout, so less is left to sweep. The claim
+  of a hash-locked payment pays the channel's own key from a second transaction, which the sweep
+  does not take.
+- The hub funds nothing without a fee rate: on a node that has no estimate the operator must set
+  one. While a mainnet node is below block 961,640 the hub waits and serves nothing, its health
+  endpoint included.
+- The status page and `/status` are on the hub's public port: they list its providers and stuck
+  payments, no client's channel, and can be turned off. A stuck payment's "resolves by" block
+  assumes the refund confirms in the first block after it is due. The status reads every archived
+  record on each request.
+- The hub's event list is kept in memory and is never trimmed.
+- A provider channel rolled over by a hub older than the fourth fix round is not watched, and a
+  new client against such a hub cannot adopt a completed lock: upgrade the hub first.
+- Hub and provider need a full node; a hub on a node without `gettxspendingprevout` sees a
+  provider's close only when it is in a block.
+- The hub's channel book and the seller's routes file are renamed into place without a directory
+  sync, so a power loss can undo the last save.
+- A routed call has no per-call receipt, and a routed session's call counter survives a provider
+  restart only with the write-ahead log, which is off by default.
+- A hub operator's `fee_ppm` must stay below about 1.8e16 divided by `max_lock_sat`; above it every
+  route request fails.
+
+### Routed client
+
+- A routed client's hub channel is funded once. If the funding call fails without saying whether
+  it sent, a wallet that keeps a record of its sends is asked what it sent; a wallet that cannot
+  say is not asked again, also when its first call only refused, and nothing is opened until the
+  owner has looked for the send and removed the record (`forget_unfunded`).
+- A hub channel that was recorded and never funded is retried until it is too near its expiry
+  (about 48 days); the client then refuses to open until its owner removes the record.
+- A hub that refuses a funded channel keeps its coins locked until the channel's expiry.
+- How long a routed client's coins are locked in its hub channel is at most 8,064 blocks or the
+  owner's own wish if that is larger; it cannot be set lower than 8,064.
+- `xbt402-route-payer` is a test tool: without `--signer-sock` its channel key lives in the process
+  only.
+
+### Channel and transport (library client)
+
+- The open preflight is the seller's word: a seller that says yes and then refuses the funded open
+  locks the buyer's capacity until the channel's expiry, at most 4,032 blocks, and the client can
+  sign no close for such a channel.
+- A funded channel the seller refuses to open blocks that seller until its record is removed, also
+  after the refund; the MCP wallet has no tool for that. *(test)*
+- A payer's book has one channel per seller origin. It reads as one origin every spelling that
+  differs only in letter case, a default port or a user name. A URL whose host two URL parsers
+  could read differently is refused before anything is paid or sent: a backslash, a host with
+  percent-encoding or non-ASCII letters, the short, decimal and hexadecimal forms of an IP
+  address. A trailing dot on a name is a separate origin, so a seller reached under both
+  spellings can be funded once per spelling, up to the payer's budget. *(test)*
+- With the shipped payers a payer has 1,007 blocks, about a week, to come back for a channel its
+  signer funded and whose confirmation it did not wait for; a payer built on the library's default
+  of 1,008 blocks has 144, about a day. After that the coins wait for the refund at the expiry, up
+  to 1,009 blocks, and that seller cannot be paid through that signer meanwhile. *(test)*
+- A payer that keeps no ledger (`xbt-signer-payer`) can take up a channel its signer funded only
+  until it is attached; after that it must keep a ledger, or the owner closes the channel through
+  the signer, which works only once a state has been signed on it.
+- One signer serves one payer per seller: a second payer started while the first one's funding is
+  unconfirmed takes that channel and the first is refused from then on; two that both hold it
+  break each other's calls. No coin can be taken. *(test)*
+- Payer and signer are upgraded together: a payer of this version asks the signer what it funded
+  on every open, and an older signer answers `unknown method`, so the open fails with nothing
+  funded. A third-party signer that funds channels must answer that question too.
+- A payer that takes up a channel its signer funded does not apply its own budget, capacity or
+  expiry settings to it: the signer's policy approved that funding. *(test)*
+- With a wallet whose funding call can fail after it sent and that cannot list its sends, every
+  retry pays the channel again, the client holds a refund for one output only, and its budget
+  counts one; neither wallet shipped here is such a wallet. *(test)*
+- A paid request that gets no receipt is paid for if the provider later says it charged it: the
+  provider is believed for one call's price for every such request, on an unsigned message. So a
+  provider that answers errors, anyone who can alter answers on the way, or a payer process that
+  stopped after a request left, can make the payer pay for each such request; measured, 1,650 sat
+  signed for 150 sat of service. A caller that retries on errors should set a daily budget.
+  *(test)*
+- A refusal is not signed: whoever can answer in a provider's place can hide a served answer
+  behind a forged refusal. The payer absorbs one such charge in a channel's life; after the
+  second, every call on that channel is refused until its owner closes it and removes its record.
+  *(test)*
+- The library client does not watch the chain; after a rollover answered with an error the
+  embedder must find the rollover and adopt it.
+- Records of rollover attempts that were never adopted stay in the client's book and ledger until
+  the embedder removes them; at 16 for one channel the client signs no further rollover of it.
+- Earlier scripts of an open that was never funded are kept, 16 per seller; past that the oldest
+  script's terms are forgotten and its key is kept.
+- How long a channel lasts is at least the seller's own floor and at least 144 blocks (or the
+  owner's wish if smaller), and at most 4,032 blocks unless the owner raises it; an offer outside
+  that is refused before anything is funded.
+- A program that uses these crates' HTTP client from another workspace does not compile until it
+  adds the patched `ureq` to its own manifest, and `cargo deny` reports no advisory for the patched
+  copy; advisories for `ureq` are looked up by hand.
+- `LocalSigner` keeps its keys in memory: a process that restarts with one has lost them.
+- A close is bumped by a child that spends only the provider's own output of that close, up to
+  10,000 sat, so fees above about 37 sat/vB for the whole 144-block margin, or a provider output
+  too small to pay, still let the buyer's refund win; no shipped binary has a setting for the bump
+  ceiling.
+- A receipt covers the request, the answer's status and its body, not its headers; a body sent
+  with neither Content-Length nor chunking ends when the connection does, so only the receipt's
+  body hash shows it was cut.
+- A payment is bound to the method, scheme, host, port, target and body as the request states
+  them, so a TLS proxy that does not set `X-Forwarded-Proto` makes every payment fail.
+- A server takes 64 connections in all and 48 from one address; a public listener needs a reverse
+  proxy with its own limits.
+- The ledger lock is on the path as given; a symlink or hard link to the ledger file is a second,
+  unlocked way in.
+
+### Agent wallet (`xbt-signer`)
+
+- Channel funding is not a budget item: up to the per-channel cap plus the close fee can sit in
+  one channel per allowlisted seller, and on-chain fees are outside every budget.
+- A seller's terms can lock a channel's coins for up to `max(channel_expiry_blocks, 4032)` blocks,
+  twice that for a routing hub the owner listed. The 144-block floor on a channel's life holds for
+  channels the pay tool opens on a seller's offer; the socket's `open_channel`, `fund` and rollover
+  refuse only an expiry inside the refund margin (6 blocks).
+- After an answer is lost the wallet pays the next call with one new state on the seller's
+  unsigned word that it holds the last one. A seller that serves nothing, or anyone who can answer
+  in its place, can so be signed one call's price for every call the agent makes, inside the call's
+  `max_sats` and the budgets; those calls report a charge of 0. A request lost before the seller
+  saw it is paid for as well when the next call costs more. *(test)*
+- On a postpay channel the seller is owed one call per lost answer until the close. (Buying a
+  streamed result on such a channel is an open item, below.)
+- After a close the wallet opens no new channel to that seller until the close is in a block; if
+  the close is never mined, not until the old channel's expiry. "In a block" means one
+  confirmation; a reorganisation that removes a close or a refund is not followed.
+- If a rollover the wallet attached from the mempool is never mined, the channel it would have
+  spent is no longer watched and no wallet method refunds it; its key is kept, and the owner must
+  restore the record by hand. No new channel to that seller can be opened meanwhile. *(test)*
+- A channel's rollovers may be signed into at most eight different next channels while none is
+  attached; after that it must be closed.
+- The next channel of a rollover the seller broadcast after refusing it is refunded by the watcher
+  only while the rolled channel is still the wallet's record for that seller; if the rolled
+  channel was marked closed and a new one funded first, the next channel's coins stay in its
+  script past its expiry, with its key kept. *(test)*
+- A human-signed operation runs once, as long as the file of used signatures is neither deleted
+  nor restored from before the signature was used; a missing file is read as an empty one. A
+  human-signed operation run while the host clock is far ahead fixes that time in the wallet:
+  later signatures that expire before it are refused, policy changes included, until the owner
+  resets the file, which also forgets every used signature. *(test)*
+- Every socket-level finding needs a process that can open the signer socket; an agent held to the
+  MCP tool list cannot reach those methods. A process on the socket can ask for payer keys without
+  limit, and can ask which channel the signer funded for any seller.
+- The one-time enrolment code protects the first approval key only when the socket and the
+  signer's directory belong to different users, as in the container layout.
+- A payment or funding whose fate the node did not report stays counted and is kept; if it can
+  never confirm, its seller stays blocked until the node can name, in a block, another transaction
+  that spent one of the funding's inputs within the last 4,032 blocks, and otherwise until an
+  operator removes the record.
+- A crash between holding an approval and paying costs the approval with nothing paid; the same
+  holds for a human signature, which is used up when its operation starts.
+- The backup export's signature does not name the passphrase the backup is sealed under; an
+  expired approval can be dismissed without a signature; a key blob without a recorded cost opens
+  at scrypt 2^15 and is re-sealed only when its file is next written.
+- A voided routed lock keeps its budget. Key wiping covers long-lived copies in the Rust signer
+  only.
+- Stream chunks are paid without a signed receipt; each is bound by a Merkle proof or a hash lock.
+  An answer of 400 or above is handed to the agent without a receipt.
+- One payment at a time: the wallet holds one lock for a whole `xbt402_pay`, the seller's answers
+  included, so a slow seller delays every other payment, approval and refund for as long as it
+  answers.
+- A watcher step that panics is reported and skipped, and the next tick tries again; in a
+  `release-small` build a panic ends the signer process, and whatever supervises it restarts it.
+
+### Pay with work
+
+- The pay-with-work specification (XBT-053), its Python reference and its vectors are not
+  published; the Rust crate is the reference, and the Python reference has none of the audit rules
+  below.
+- Credit is released only by sats that reach the provider's address in a coinbase under a
+  statement that passes the audit, valued at the provider's own price from its own node; a
+  Prime's signatures decide only whether it is distrusted.
+- A Prime that gives no statement for a block is never failed for it, whatever the block paid; a
+  Prime that never pays costs the provider the cap on unpaid credit, once: 900 calls at exact
+  pricing, 1,000 under a fixed amount per call.
+- Balances are kept in work units, so credit taken and held unspent buys more calls if the
+  difficulty then falls, in proportion: twice the cap's calls after a halving, four times after
+  two. *(test)*
+- Credit that is unpaid when a provider is upgraded to this version is counted at the difficulty
+  of the first start after the upgrade; if the difficulty rose while it was unpaid, part of the
+  cap is served once more (half of it after a doubling). *(test)*
+- What the caps count is rounded up for each grant, so credit granted in very small pieces can
+  fill the cap early after the price moves. *(test)*
+- Work a payer mines after the provider's caps are full is held and cannot be spent until the
+  Prime pays; if the Prime never pays, the payer has lost it.
+- Cover is shared across payers, oldest credit first: honest payers' work is paid for at about 11%
+  more than their credit costs, and that surplus pays off older credit nobody mined, about one
+  call for every nine honest calls. *(test)*
+- The provider's library has no caps unless `WorkConfig::shipped` or a cap rule is set; the binary
+  sets them.
+- A block that pays the provider nothing and has no statement leaves no verdict, because the
+  provider cannot tell the Prime's block from another pool's; the optional stop after N such
+  blocks lifts only at a block that pays its share of a window holding all the unpaid credit.
+- Every coinbase output to the provider's address counts as payment, so the address must be used
+  by one provider, with one Prime, for nothing else.
+- Fraud proofs convict only for a checker who already knows the Prime's terms; distrust of a Prime
+  is permanent, and nothing in the software clears it. *(test)*
+- `audit_chain` without a node never fails a Prime for a window start that goes backwards, and
+  such a statement removes the earlier audit together with the carry the Prime signed for it;
+  `xbt-work-provider` uses the form that asks its node. *(test)*
+- The audit believes the provider's own node: a node that is behind makes the provider undo audits
+  above its tip and do them again when it catches up, and payers can be refused at the caps in
+  between; a block the node reports with impossible values is not audited, and no later block is,
+  until the node answers correctly.
+- A payout counts as paid at 6 confirmations although the coins are locked for the coinbase
+  maturity, and a reorganisation deeper than 144 blocks is not undone.
+- The provider carries the pool's luck: when the pool finds few blocks, credit waits at the caps.
+- An invoice with no work on it ends at its expiry; work on an invoice of this provider is
+  credited whenever its payer first presents it.
+- The provider keeps a record for every invoice the Prime ever signed work for, for as long as it
+  keeps its state: about 650 bytes each, and one audit entry per pool block with a statement.
+  Nothing prunes them, and the whole state is written on every paid call and whenever a receipt
+  changes it; an older receipt still on the relay can cause one write per invoice after each
+  audited block. The provider never answers 429. *(test)*
+- The provider's relay pull asks for every invoice with a record and the 64 newest every 3
+  seconds; the relay as shipped answers one client 10 requests a second, so past about 30 invoices
+  the same ones are not pulled, and their work is credited only when their payer calls. *(test)*
+- An invoice identifier shows when the invoice expires; its 4-byte check only tells this
+  provider's identifiers from others'.
+- Losing the provider's state file loses every balance and every invoice not yet used; two
+  providers started from copies of one state file both honour the same balances. *(test)*
+- A state write whose directory sync fails is reported as failed although the new file is in
+  place: the paid call answers an error and the debit is written again.
+- A loop of the work provider that panics in every round is reported in its log and the service
+  goes on answering, but that loop does nothing more: if it is the audit, no later block is
+  audited and credit stops at the caps until an operator restarts it past that block. The health
+  endpoint does not show it; a `release-small` build ends the process instead.
+- The provider reads the block value and difficulty from its own node every few seconds and
+  believes them. While the node cannot be read, calls stay priced at the last values it gave; the
+  provider does not start without a first answer.
+- The admin endpoints need a bearer token kept in a file in the data directory; the provider
+  refuses a token file that group or others can read, but does not check who owns it or who can
+  write the directory.
+- A lost answer costs the payer that answer; the payer's check of what it has spent is
+  bookkeeping, because the provider's payment response is unsigned.
+- The payer fetches receipts only from its own relay or receipt URL or the provider's own origin.
+- A work payer whose session file holds two sessions for one seller under different spellings of
+  its address does not start until its owner removes one; neither is dropped.
+- The pay-with-work rail binds a payment to no host; run it over TLS.
+
+### Light client and consensus
+
+- The light client believes a chain only once it reaches Knots' block 964264 and Knots' minimum
+  chain work; above that block, a client all of whose servers lie can be shown a fake confirmation
+  for the cost of one real-difficulty block each.
+- Setting `B2_ELECTRUM_CHECKPOINT` at or above the pinned height replaces the pin and the minimum
+  work with the operator's own block.
+- A script with more than 10,000 history entries, or a transaction above 1,000,000 bytes, is not
+  answered by the light backend, and anyone can push a script over that bound by paying dust to
+  it; for a channel's funding script that also stops the light wallet's refund of that channel.
+- If every Electrum server you configured hides a transaction, or one hides it while the others
+  have not seen it yet, the light client reads it as absent; it never books a channel as closed
+  on that, only on a proven spend, and coins it cannot see come back when a server shows them.
+- A "not there" answer needs every configured server to answer, so one server that is down or
+  silent makes those answers, and scans of your coins, fail until you remove it; what the wallet
+  proves keeps working. The wallet never drops a server by itself.
+- One slow server can hold a lookup for the call deadline (four request timeouts, one minute)
+  plus a header sync before it and one inside it (up to a minute each).
+- A server that sends a number no integer or float holds is hung up on for that line, so its
+  other answers in that call are lost with it: a "not there" answer then fails as it does beside
+  any server that did not answer.
+- In a scan, a server that lists a coin and answers "busy" for its transaction fails the scan.
+- The search for a spend does not wait for every server: when the honest server misses a scan's
+  one history request, coins that only a lying server lists as unspent are listed, and the scan
+  still says every server answered. Such a coin fails at broadcast. *(test)*
+- A first scan of an address with N coins asks each server for N proofs, 16 at a time; a server
+  that needs more than one timeout for 16 answers is dropped for that call and the other servers
+  decide.
+- A lookup made while a header sync is in flight and a block has just arrived can fail with "not
+  known" for that block's transactions, for at most one sync round.
+- A request given up at a call's deadline is forgotten once 16 newer ones are kept on the same
+  connection; a late, large answer to a forgotten one closes that connection.
+- `min-servers` counts servers the wallet is connected to, not servers that answered: a server
+  that accepts the connection and answers nothing else counts.
+- The light client recognises "no such transaction" from the server's own words (bitcoind's,
+  electrs', ElectrumX's and Fulcrum's, tested against electrs and simulators); another wording
+  counts as no answer.
+- Nothing the light client proved is kept across a restart: every proof is asked for again.
+- A light wallet's coin scan says whether every server answered, but the wallet does not read
+  that: a coin only the missing server shows is counted at a later reconcile.
+- On the light backend a funding that can never confirm holds its destination for good.
+- The provider and the hub need a full node: on the light backend "not shown" would read as
+  "spent".
+- A light hot wallet cannot spend coinbase coins. The light client supports mainnet and regtest
+  only. A server that keeps refusing to give its tip is connected to again on every header sync,
+  with no back-off.
+- On the light backend the fee estimate shown in a quote is the first answering server's word,
+  unverified; the wallet's own transactions use fixed fees. A wake-up for a watched script can be
+  late by one polling interval (10 seconds).
+- The annex and codeseparator sighash vectors were generated with Knots' Python and not executed
+  against its C++; the retarget vectors are recorded from the project's own Python. Funding sent
+  through the node wallet is replay-protected only if that node does not run `-walletoldsigs`.
+
+### Lightning rail
+
+- The rail's policy binds only what goes through the wallet: anyone holding a broader macaroon for
+  the node bypasses it.
+- The rail trusts its own Lightning node for everything but the proof of a settled payment: its
+  fee figure, its "failed" and its "no such payment" are taken as given; a payment the node
+  reports failed and later settled is not booked.
+- The macaroon allowlist applies on mainnet only, at payment time, after the node has been shown
+  the macaroon.
+- A booking released as never sent that settles late is detected and halts the rail; it is not
+  prevented.
+- For a BOLT 12 payment the Lightning node, not the wallet, limits how long funds can be locked;
+  the wallet watches for the node's default limit (2016 blocks) plus a day, and an owner who
+  raised the node's limit must raise `ln.node_max_cltv_blocks` too.
+- A channel's funding proof reads signature types from the owner's own node and does not verify
+  signatures.
+- A channel is used only if its funding descends, within 256 transactions searched breadth first,
+  from a coin taken to exist on XBT alone: a coinbase mined after the split, or a coin spent from
+  a legacy (P2PKH) address with an XBT signature. Channels funded from coins that only moved
+  between segwit addresses since the split are refused and must be closed and reopened.
+- The coinbase half of that rule is not guaranteed by XBT's consensus: a coinbase names its height
+  and nothing else that tells the chains apart, so until the SHA-256 chain has passed that height
+  a miner with a block on each chain can make the same coinbase exist on both. The wallet has no
+  node of the SHA-256 chain to check this with.
+- A BOLT 12 payment is refused while any open channel of the node fails the funding proof, because
+  the node, not the wallet, chooses the channels it leaves through. Anyone who can open a channel
+  to the node can cause that; the cure is the owner's (close it, or have the node refuse inbound
+  channels). A channel that opens while a payment is in flight is not checked. BOLT 11 payments
+  are confined to the proven channels and go on.
+- Chain separation between XBT and SHA-256 chain Lightning rests on feature bit 512 and on the
+  Lightning Fork's unified signatures; the funding proof is a second line behind them.
+
+### Build
+
+- Release builds check every integer addition, subtraction and multiplication in every crate; a
+  missed overflow stops the request it is in with a `500`, and nothing of that request is kept.
+- A panic in one watcher tick or loop round is caught and the next one runs, in the hub, the
+  provider binaries, the signer and the work provider; what a panic that repeats every round does
+  is in each area above.
+- A binary built with the `release-small` profile aborts the whole process on any panic; the
+  shipped images are not built with it, and it must not be used for a server.
+- The wallet MCP over stdio ends on a panic in a quick tool and has to be started again by its
+  client.
+- A payer that sends a request `seq` of 2^64 - 1 has spent every later request on that channel; it
+  can still close it.
+- The images and size tables under `dist/` were built before overflow checks were turned on.
+  `presign_with_nonces` is behind a cargo feature, not `cfg(test)`.
+
+### Python references
+
+The two Python references state the same rules where they have the code. What differs there, and
+the limits of the Python agent wallet and its forward rail, are in `docs/LIMITS.md` of each
+reference's own repository. The references are not published yet.
+
+## Open items
+
+Not fixed. Each is marked in the code with the text in brackets, on a test that asserts the right
+behaviour; searching the trees for `open: AGP-102` finds exactly these.
+
+- **A streamed result cannot be bought on a postpay channel that is one call behind**
+  (`open: AGP-102 list 1 item 13`; Rust wallet, two tests; Python wallet, one). A stream's last
+  state gets no receipt, so after the first stream on a channel, or after one lost answer, the
+  wallet is one call behind for the life of that channel; every later stream ends at its first
+  chunk, and the wallet has paid for the manifest and got no data. Nothing is signed past the
+  call's `max_sats` or a budget. No seller in these trees sells streams. Do not rely on buying
+  streams on a postpay channel.
+- **Forward rail of the Python wallet (off by default): a lot recovered after its channel was
+  replaced** (`open: AGP-102 list 1 item 5`; Python wallet, three tests). After such a recovery the
+  next channel to that market signs states that are not booked and not checked against the
+  policy, up to the recovered lot's total, and the daily and weekly budgets do not fill; and a
+  recovery from a close that is then never mined ends that channel's refund watch. It needs the
+  rail turned on, an allowed market and the agent's own calls. Do not turn the forward rail on.
+
+## Not reviewed by anyone
+
+Neither the external review nor any of the project's four audits covered:
+
+- the packaging and the container images: everything under `packaging/` (the StartOS and Umbrel
+  packages), the image definitions and `dist/`;
+- the wallet's web interface (`xbt-wallet-ui`);
+- the anchor witness and the vault code;
+- `xbt-svc` and `xbt-init`, and the scripts under `tools/`;
+- any server built with the `release-small` profile, and any hostile input against a release
+  build: the audits attacked debug builds, and release builds ran the ordinary paths only;
+- anything on a real network: no mainnet node, no public Electrum server and no Lightning node
+  outside a test rig was used, and every "blocks" figure was measured on regtest blocks mined at
+  once.
+
+The cross-implementation scripts run the ordinary path. Only three failure paths have been run
+through the real binaries: a lost answer, a provider that stops answering, and the shipped default
+timeouts.

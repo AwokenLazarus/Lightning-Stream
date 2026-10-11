@@ -69,8 +69,10 @@ def fund(address, sats):
 
 
 def hub(**cfg):
-    opts = dict(ch2_capacity=50_000, ch2_expiry_blocks=20, close_margin=5, rollover_margin=2, refund_min_feerate=1.0,
-                refund_bump_blocks=2, refund_max_fee_sat=5_000)
+    # spend_final_depth 1 (AGP-107): the checks look one block after a refund confirms; the default is 6
+    # since AGP-094 (as xbt402-refund-bump.rs)
+    opts = dict(spend_final_depth=1, ch2_capacity=50_000, ch2_expiry_blocks=20, close_margin=5, rollover_margin=2,
+                refund_min_feerate=1.0, refund_bump_blocks=2, refund_max_fee_sat=5_000)
     opts.update(cfg)
     return RouteHub(node, int.from_bytes(os.urandom(31), "big") + 1, NET, tempfile.mkdtemp(prefix="pyhub-"), fund,
                     refund_to=lambda: W.getnewaddress("", "bech32"), **opts)

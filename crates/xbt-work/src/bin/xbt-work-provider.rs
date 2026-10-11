@@ -29,7 +29,7 @@
 //! `--work-units N` a cap in calls is that many calls at N units, and a cap in sats is turned into
 //! calls at `--price`. Owed carry above `--max-carry-sats`, or growing over `--carry-growth-blocks` audited
 //! blocks, stops new credit. AGP-065 (review P5): with no cap flag the provider caps unaudited
-//! credit at 100 calls per invoice and 1000 calls in total.
+//! credit at 100 calls per invoice and 1000 calls in total (900 served since AGP-079's 10% haircut).
 //!
 //! AGP-079, the shipped defaults (`WorkConfig::shipped`; no flag needed for any of them):
 //! * Credit stops being unaudited only as far as the audited coinbases paid for it, at this

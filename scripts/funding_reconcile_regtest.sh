@@ -11,7 +11,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
-B1=${XBT402_B1:-$HOME/xbt-rnd/b1-agp-045}
+B1=${XBT402_B1:-$HOME/xbt-rnd/b1}
 PB=${XBT_RS_FUNDREC_PORT_BASE:-34540}
 R=${XBT_RS_RUN:-$ROOT/run}/fundrec-$$
 BIN=${CARGO_TARGET_DIR:-$ROOT/target}/release

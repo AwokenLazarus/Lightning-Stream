@@ -51,7 +51,9 @@ Every B2 method listed below behaves as in B2:
 - `routing_status`, `close_channel`, `xbt402_refund` (alias `refund_channel`), `watch_tick`;
 - `rotate_hot_key`, `sweep_hot`, `signatures`, `anchor_now`, `anchor_status`, `hot_reconcile`.
 
-`xbt402_pay` includes streamed results (`xbt402-merkle-v1`).
+`xbt402_pay` includes streamed results (`xbt402-merkle-v1`). Limit: on a postpay channel a streamed
+result can be bought once per channel and not after a lost answer (each further try pays for the
+manifest and gets no data); an open item, see `docs/LIMITS.md`.
 
 ### New for an external payer
 
@@ -60,7 +62,7 @@ policy-checked where it raises the signed amount.
 
 | method | params | result |
 |---|---|---|
-| `xbt402_new_key` | `origin` | `{pub}`: a fresh payer key, sealed on disk at once as `pending:<origin>` |
+| `xbt402_new_key` | `origin` | `{pub}`: the payer key issued for that origin and not yet bound to a channel (a new one only when none is pending), sealed on disk at once as `pending:<origin>` |
 | `xbt402_attach` | `origin`, `params` (ChannelParams `to_dict`) | `{chan, dest}`: binds the issued key to the funded channel (open at once); `<origin>/next` is a rollover's successor, attached only once this signer's node shows the rollover (else `deny/rollover_unproven`) |
 | `xbt402_sign_state` (= `sign_state`) | `chan` or `dest`, `cum` | policy on `cum - used`, then `{verdict, chan, cum, sig}` |
 | `xbt402_sign_rollover` | `chan`, `amount`, `next_spk`, `next_capacity` | policy on the increase, then `{sig}` (audit kind `channel_rollover`) |

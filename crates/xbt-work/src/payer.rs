@@ -6,7 +6,7 @@
 //! relay (or the Prime's direct query), verifies it under the advertised (and optionally pinned)
 //! Prime key, and presents it with a fresh `n` and the request-bound `auth`. Each PAYMENT-RESPONSE
 //! is checked: the invoice, the request digest, the charge within the quote, and `spentWork`
-//! growing by exactly `charged`.
+//! growing by `charged` and by no more than the quotes of earlier calls still unanswered (AGP-091).
 //!
 //! Limits of this rail against someone between payer and provider (AGP-081, the closure audit of
 //! review T2 and T4), where it is below the channel rail:

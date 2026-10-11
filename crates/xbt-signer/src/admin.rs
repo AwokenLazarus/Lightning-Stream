@@ -38,12 +38,14 @@ pub const ENROLL_CODE_TRIES: u32 = 5;
 /// The file under `.run` that remembers which human-signed messages were used.
 pub const USED_SIGS_FILE: &str = "human_sigs.json";
 
-/// AGP-089: the rule for human signatures: **one signed message authorises one operation, once.**
+/// AGP-089: the rule for human signatures: **one signed message authorises one operation, once**
+/// (for as long as this file is neither deleted nor restored from before the signature was used)**.**
 /// Every message the human signs carries an expiry and no nonce, so until now whoever held a
 /// signature could run its operation again until it expired (a second sweep, a second export). The
 /// message's hash is written here, fsynced, before its operation runs, and a message found here is
 /// refused. Keyed by the message, not the signature bytes, so another encoding of a signature is
-/// the same entry. A file that cannot be read refuses the operation: it is never taken for empty.
+/// the same entry. A file that cannot be read refuses the operation: it is never taken for empty
+/// (a missing file is an empty one: whoever can delete it can write an empty one).
 ///
 /// AGP-095 (audit item 16): **an entry leaves only when its expiry is behind the highest clock
 /// this file has seen, and a message whose expiry is behind that clock is refused.** Entries were

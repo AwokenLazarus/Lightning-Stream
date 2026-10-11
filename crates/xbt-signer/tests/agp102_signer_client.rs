@@ -3,8 +3,10 @@
 //! file. The rig is `agp101_funded.rs`'s: xbt402's `Client` with a `RemoteSigner`, the signer's
 //! own code behind the socket, on the test suite's fake node.
 //!
-//! `hole_*` tests fail today and state the rule that should hold. `control_*` tests are the honest
-//! path in the same rig and `limit_*` tests pin what a reader must be told; both pass.
+//! `hole_*` tests failed when the audit wrote them and state the rule that should hold.
+//! `control_*` tests are the honest path in the same rig and `limit_*` tests pin what a reader
+//! must be told; all pass since fix wave 6 and AGP-107 (which made one fixture follow the shipped
+//! payers: see `hole_a_payer_that_comes_back_two_days_...`).
 //! One test binds 127.0.0.1:27755.
 //!
 //!   CARGO_TARGET_DIR=$PWD/target cargo test --offline -p xbt-signer --test agp102_signer_client -- --nocapture
@@ -458,12 +460,19 @@ fn limit_a_funded_channel_the_seller_refuses_blocks_its_origin_after_the_signers
 /// funded, and its coins and its business with that seller wait a week for the refund. Nobody
 /// attacks and nothing failed but a 180 s wait. The rule a reader expects: a funded channel can
 /// be opened for as long as the owner was willing to lock the coins, not for one day of it.
+///
+/// AGP-107: the fixture follows the shipped payers. AGP-105 gave `xbt-signer-payer` and
+/// `xbt-wallet-mcp` `SHIPPED_PAYER_EXPIRY_BLOCKS` (2,016); this test pinned the library's default
+/// (1,008) under the words "the shipped payers' default", which no shipped payer uses any more.
+/// What is asserted after it is unchanged. A payer built on the library's default still has the
+/// one day: `limit_a_payer_away_for_145_blocks_cannot_pay_the_seller_through_this_signer_for_a_week`.
 #[test]
 fn hole_a_payer_that_comes_back_two_days_after_a_lost_funding_answer_can_still_pay_the_seller() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let s = sock();
     let mut c = s.payer(s.remote(), 1);
-    assert_eq!(c.cfg.expiry_blocks, 1_008, "the shipped payers' default");
+    c.cfg.expiry_blocks = xbt402::client::SHIPPED_PAYER_EXPIRY_BLOCKS;
+    assert_eq!(c.cfg.expiry_blocks, 2_016, "the shipped payers' default");
     assert_eq!(get(&mut c), Err("funding_unconfirmed".into()));
     let f = s.remote.funded(PROVIDER).unwrap().unwrap();
     s.rig.chain.mine(288);

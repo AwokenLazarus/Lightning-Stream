@@ -4,8 +4,8 @@
 //! [`generate`] is XBT-053 `check_work_vectors.py` `build()` step for step, computed by the Rust
 //! implementation (receipts, the provider book, pricing, auth, the audit and its fraud proofs, NTA,
 //! the relay), and [`to_file`] writes it exactly as Python's `json.dump(v, f, indent=1)` does, so
-//! the Rust-emitted file is byte-identical to the published one and XBT-053's own checker can
-//! check it. [`check`] recomputes every section of a published file, compares byte for byte, and
+//! the Rust-emitted file is byte-identical to XBT-053's own and XBT-053's checker can
+//! check it. [`check`] recomputes every section of such a file, compares byte for byte, and
 //! re-runs the generator-independent checks (signatures, grammars, the exact pricing bound, the
 //! fraud proofs, BIP86/BIP341 published values, BIP340, the relay).
 use hmac::{Hmac, Mac};
@@ -370,7 +370,7 @@ pub struct Row {
     pub failures: Vec<String>,
 }
 
-/// Check a published vector file: every section recomputed byte for byte, then the checks that do
+/// Check an XBT-053 vector file: every section recomputed byte for byte, then the checks that do
 /// not trust any generator. Returns one row per section.
 pub fn check(stored: &Value) -> Vec<Row> {
     let fresh = generate();

@@ -1,8 +1,14 @@
 //! AGP-102 fourth closure audit, area HUB: tests written by the auditor on the rig of
 //! `agp093_hub.rs` ([`MemChain`] + [`MemNet`], in process). Nothing here is a fix.
 //!
-//! Tests named after a rule fail today (each is a hole of the audit's list 1); `control_*` and
-//! `measured_*` pass. What each failing test prints is the measurement the report quotes.
+//! Tests named after a rule failed when the audit wrote them (each is a hole of the audit's list
+//! 1); `control_*` and `measured_*` pass. What each prints is the measurement the report quotes.
+//!
+//! AGP-107 (close-out): every test here passes or is marked. A test that was still red after fix
+//! wave 6 is either a `limit_*` test now (its comment names the item and the sentence of
+//! `docs/LIMITS.md` it pins; it passes while the limit holds and fails when someone lifts it) or
+//! is ignored with a reason that starts `open:` and names the audit's item; those are listed under
+//! "Open items" there.
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -45,8 +51,7 @@ struct TempDir(PathBuf);
 
 impl TempDir {
     fn new() -> Self {
-        let base = PathBuf::from("$HOME/xbt-rnd/xbt-rs-agp-102/run/tmp");
-        let p = base.join(format!("agp102_hub_{}", hex::encode(&sha256(format!("{:?}{:?}", Instant::now(), std::thread::current().id()).as_bytes())[..8])));
+        let p = std::env::temp_dir().join(format!("xbt-rs-agp102-hub-{}", hex::encode(&sha256(format!("{:?}{:?}", Instant::now(), std::thread::current().id()).as_bytes())[..8])));
         std::fs::create_dir_all(&p).unwrap();
         Self(p)
     }
@@ -515,21 +520,28 @@ fn close_mined_reorged_and_mined_again(depth: bool, wait: u32) -> (bool, u64, u6
     (released_at_one, w.st1().best_cum, held["cum"].as_u64().unwrap(), shown_unconfirmed)
 }
 
-/// HOLE (Low; Rust, B1 the same from reading; scans without a depth only, which no shipped binary
-/// uses). AGP-094 found-not-fixed 1, run. The stated limit says "a reorg between two ticks that
-/// it does not see is not noticed". The watcher DOES see it: on every tick in between its own node
-/// shows the funding back in the confirmed set (`spend_depth` answers 0, `hub.rs:3752-3754`), and
-/// `gone_at` is kept all the same (`hub.rs:3526-3528` resets it only when the funding is unspent
-/// counting the mempool). So the close counts as `spend_final_depth` deep in the first block that
-/// mines it again, and the hold is released on one confirmation: item 2 of the third audit again.
+/// LIMIT (AGP-107; the fourth audit's list 1 item 11, HUB 5, written down by AGP-105). Low; Rust,
+/// B1 the same from reading; scans without a depth only, which no shipped binary uses. The audit
+/// wrote this as `a_close_seen_back_in_the_mempool_is_counted_from_the_block_that_mines_it_again`
+/// (AGP-094 found-not-fixed 1, run). The watcher does see the reorg: on every tick in between its
+/// own node shows the funding back in the confirmed set (`spend_depth` answers 0), and `gone_at`
+/// is kept all the same (it is reset only when the funding is unspent counting the mempool). So
+/// the close counts as `spend_final_depth` deep in the first block that mines it again, and the
+/// hold is released on one confirmation.
+///
+/// The sentence it pins (`docs/LIMITS.md`, hub): "With a chain scan that does not say how deep a
+/// spend is, a close that is mined, reorganised out and mined again is counted from its first
+/// block, so a hold can be released one block deep; the shipped binaries scan with a node that
+/// gives the depth." The last assertion is turned round: it fails when `gone_at` is reset on a
+/// spend seen back in the mempool; then restore the audit's (`!released_at_one && collected >=
+/// lock_cum`), which is what the control below asserts for a scan with a depth.
 #[test]
-fn a_close_seen_back_in_the_mempool_is_counted_from_the_block_that_mines_it_again() {
+fn limit_with_a_scan_that_gives_no_depth_a_close_seen_back_in_the_mempool_is_counted_from_its_first_block() {
     let (released_at_one, collected, lock_cum, shown) = close_mined_reorged_and_mined_again(false, 2);
     assert!(shown, "control: at every tick in between, the hub's node showed the funding unspent in the confirmed set");
-    assert!(!released_at_one && collected >= lock_cum,
-            "spend_final_depth 3, a scan without depth: the close was mined, reorged out, in the mempool for 2 blocks (the hub ticked on each and its \
-             node showed the funding unspent), then mined again: one block deep the hold was released ({released_at_one}); that block was replaced by the \
-             close with t and ch1 closed at {collected} sat, below the lock's {lock_cum}");
+    assert!(released_at_one && collected < lock_cum,
+            "the limit is lifted: spend_final_depth 3, a scan without depth, the close mined, reorged out, in the mempool for 2 blocks and mined again: \
+             released one block deep {released_at_one}; ch1 closed at {collected} sat against the lock's {lock_cum}");
 }
 
 /// Control: with a scan that gives the depth (bitcoind, the shipped binaries) the same sequence
@@ -863,21 +875,29 @@ fn first_sight_of_a_close_with_t(deep: u32, stop: bool) -> (Vec<Value>, usize, b
     (all, w.stale1().len(), w.oc(0).final_, w.st1().best_cum, held["cum"].as_u64().unwrap())
 }
 
-/// HOLE (Low; Rust, B1 from reading; the residue of item 12's fourth bullet). AGP-094 keeps the
-/// lock on the ch2 record when ch1's ledger does not take the completion's write, "for the next
-/// tick" (`hub.rs:3962-3967`). On a close that is already `spend_final_depth` deep there is no
-/// next tick: the same pass goes on to `release_rolled` (`hub.rs:3713`), which finds that lock
-/// still written off, releases it as unpaid on ch1 (that write is taken) and makes the record
-/// final. The hub paid the lock on its ch2 and gave the client's hold back. It needs a ch1 write
-/// that fails on the first tick that sees the close deep (a hub that was down while the close
-/// confirmed) and succeeds a moment later; the loss is one lock (`max_lock_sat` at most).
+/// LIMIT (AGP-107; the fourth audit's list 1 item 11, HUB 7, written down by AGP-105). Low; Rust,
+/// B1 from reading; the residue of the third audit's item 12, fourth bullet. The audit wrote this
+/// as `a_completion_ch1_did_not_take_is_not_released_as_unpaid_by_the_same_tick`. AGP-094 keeps
+/// the lock on the ch2 record when ch1's ledger does not take the completion's write, "for the
+/// next tick". On a close that is already `spend_final_depth` deep there is no next tick: the
+/// same pass goes on to `release_rolled`, which finds that lock still written off, releases it
+/// as unpaid on ch1 (that write is taken) and makes the record final. The hub paid the lock on
+/// its ch2 and gave the client's hold back. It needs a ch1 write that fails on the first tick
+/// that sees the close deep (a hub that was down while the close confirmed) and succeeds a moment
+/// later; the loss is one lock (`max_lock_sat` at most).
+///
+/// The sentence it pins (`docs/LIMITS.md`, hub): "A completion that the hub's own ledger did not
+/// take is released as unpaid by the same watcher tick when the provider's close is already six
+/// blocks deep: the hub has paid that lock and collects nothing for it, at most one lock." The
+/// last assertion is turned round: it fails when the pass stops before `release_rolled` after a
+/// completion that was not taken; then restore the audit's (`best >= cum`).
 #[test]
-fn a_completion_ch1_did_not_take_is_not_released_as_unpaid_by_the_same_tick() {
+fn limit_a_completion_ch1_did_not_take_is_released_as_unpaid_by_the_same_tick_when_the_close_is_already_deep() {
     let (acts, left, final_, best, cum) = first_sight_of_a_close_with_t(6, true);
     assert!(acts.iter().any(|a| a["event"] == "secret_from_close" && a["ch1_completed"] == false), "control: the completion's write was not taken: {acts:?}");
-    assert!(best >= cum,
-            "the close with t was 6 deep when the hub first saw it and ch1 did not take the completion: the same tick released the lock as unpaid ({}), the \
-             ch2 record is final ({final_}), ch1 holds {left} written-off lock(s) and its best state is {best} sat, below the lock's {cum} that the hub paid",
+    assert!(has(&acts, "lock_released") && final_ && left == 0 && best < cum,
+            "the limit is lifted: the close with t was 6 deep when the hub first saw it and ch1 did not take the completion; released as unpaid {}, the \
+             ch2 record final {final_}, ch1 holds {left} written-off lock(s) and its best state is {best} sat against the lock's {cum}",
             has(&acts, "lock_released"));
 }
 

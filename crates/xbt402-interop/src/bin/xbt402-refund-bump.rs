@@ -108,8 +108,11 @@ fn provider(rpc: &Rpc, net: &str, port: u16, dir: &std::path::Path) -> Arc<Provi
 }
 
 fn hub(node: &Node, net: &str, dir: &std::path::Path, extra: Value) -> Arc<RouteHub> {
-    let mut c = json!({"ch2_capacity": 50_000, "ch2_expiry_blocks": 20, "close_margin": 5, "rollover_margin": 2, "refund_min_feerate": 1.0,
-                       "refund_bump_blocks": 2, "refund_max_fee_sat": 5_000});
+    // spend_final_depth 1 (AGP-107): the checks below look one block after a refund confirms, and
+    // since AGP-094 a refund is final only `spend_final_depth` deep, 6 by default. xbt402-close-bump
+    // and xbt402-route-demo were given the same line then; this tool was not run and was missed
+    let mut c = json!({"spend_final_depth": 1, "ch2_capacity": 50_000, "ch2_expiry_blocks": 20, "close_margin": 5, "rollover_margin": 2,
+                       "refund_min_feerate": 1.0, "refund_bump_blocks": 2, "refund_max_fee_sat": 5_000});
     for (k, v) in extra.as_object().unwrap() {
         c[k] = v.clone();
     }

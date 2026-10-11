@@ -1,7 +1,7 @@
 //! The provider rail (spec §4.5, §7, §9): an `xbt-work` offer beside `xbt-channel` in the xbt402
 //! [`Provider`](xbt402::provider::Provider) ([`Provider::with_scheme`](xbt402::provider::Provider::with_scheme)).
 //!
-//! * `POST /x402/xbt-work/invoice` issues invoices (128-bit base32 id, a fresh `authKey`, both
+//! * `POST` or `GET /x402/xbt-work/invoice` issues invoices (128-bit base32 id, a fresh `authKey`, both
 //!   usernames), expiring while unfunded. Issuing stores nothing (AGP-091, `Issued`): the
 //!   identifier carries its expiry and a MAC, and the `authKey` is derived from it again.
 //! * A PAYMENT-SIGNATURE naming `xbt-work` is checked in the §9.1 order (scheme/network/payTo,

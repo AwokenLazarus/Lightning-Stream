@@ -10,7 +10,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
-B1=${XBT402_B1:-$HOME/xbt-rnd/b1-agp-067}
+B1=${XBT402_B1:-$HOME/xbt-rnd/b1}
 PB=${XBT_RS_CLOSE_BUMP_PORT_BASE:-24860}
 R=${XBT_RS_RUN:-$ROOT/run}/close-bump-$$
 BIN=${CARGO_TARGET_DIR:-$ROOT/target}/release

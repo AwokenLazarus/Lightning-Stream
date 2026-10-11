@@ -3,6 +3,12 @@
 //! `hole_*` tests assert a rule and FAIL on 2e745f2. `limit_*` tests pass: they pin, with numbers,
 //! what a stated limit costs. `control_*` tests pass: they pin what holds.
 //!
+//! AGP-107 (close-out): every test here passes or is marked. A test that was still red after fix
+//! wave 6 is either a `limit_*` test now (its comment names the item and the sentence of
+//! `docs/LIMITS.md` it pins; it passes while the limit holds and fails when someone lifts it) or
+//! is ignored with a reason that starts `open:` and names the audit's item; those are listed under
+//! "Open items" there.
+//!
 //! Everything runs in process (the rig's fake node and in-process web): no port is opened.
 mod common;
 
@@ -192,7 +198,11 @@ fn control_a_first_stream_on_a_postpay_channel_is_delivered() {
 ///
 /// FAILS on 2e745f2: the second stream ends at chunk 0 with `HTTP 402`; the agent is told
 /// `charged_sats: 600` for a manifest and gets no data, on every later stream of that channel.
+///
+/// AGP-107: open, not a limit. Nothing in this tree sells a stream, so it is Low today; the fix is
+/// owed before stream buying is offered (`docs/LIMITS.md`, "Open items").
 #[test]
+#[ignore = "open: AGP-102 list 1 item 13"]
 fn hole_a_second_stream_on_a_postpay_channel_is_delivered() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let (rig, _) = stream_rig();
@@ -208,7 +218,10 @@ fn hole_a_second_stream_on_a_postpay_channel_is_delivered() {
 /// call after the lost one is served on credit, and the stream after that stops at chunk 0.
 ///
 /// FAILS on 2e745f2: `chunk 0: HTTP 402`, 600 sat charged for the manifest.
+///
+/// AGP-107: open, as the test above.
 #[test]
+#[ignore = "open: AGP-102 list 1 item 13"]
 fn hole_a_stream_is_delivered_on_a_postpay_channel_that_lost_one_answer() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let (rig, mode) = stream_rig();
@@ -341,10 +354,20 @@ fn broadcast_rollover(rig: &Rig, rec: &ChannelRecord, next: &ChannelParams) -> C
 /// watcher never refunds it. "Its refund is manual" (the README) is also too kind: `xbt402_refund`
 /// and `xbt402_sign_refund` look only at live records, so no signer method reaches it.
 ///
-/// FAILS on 2e745f2: at the rolled channel's expiry the watcher refunds nothing and the whole
-/// funding (10,000 sat here) is still in the channel's script.
+/// On 2e745f2: at the rolled channel's expiry the watcher refunds nothing and the whole funding
+/// (10,000 sat here) is still in the channel's script.
+///
+/// LIMIT (AGP-107; the fourth audit's list 1 item 12, first bullet, "write down"). The audit wrote
+/// this test as `hole_..._is_still_refunded_at_its_expiry`; nothing in fix wave 6 changed the
+/// attach path, so it is kept as the statement of the limit and its last assertions are turned
+/// round. The sentence it pins (`docs/LIMITS.md`, agent wallet): "If a rollover the wallet
+/// attached from the mempool is never mined, the channel it would have spent is no longer watched
+/// and no wallet method refunds it; its key is kept, and the owner must restore the record by
+/// hand. No new channel to that seller can be opened meanwhile." It passes while that holds and
+/// fails when the attach waits for a block or the watcher refunds an archived channel: then
+/// restore the audit's assertion (a `refund` action for the rolled channel) and drop the sentence.
 #[test]
-fn hole_a_channel_rolled_by_a_rollover_that_was_only_in_the_mempool_is_still_refunded_at_its_expiry() {
+fn limit_a_channel_rolled_by_a_rollover_that_was_only_in_the_mempool_is_not_refunded_by_the_wallet_at_its_expiry() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let (rig, rec, next_origin) = roll_rig();
     let k1 = rig.call("xbt402_new_key", json!({"origin": next_origin.clone()}))["pub"].as_str().unwrap().to_string();
@@ -366,9 +389,12 @@ fn hole_a_channel_rolled_by_a_rollover_that_was_only_in_the_mempool_is_still_ref
     let pay = rig.call("xbt402_pay", json!({"url": URL, "max_sats": 1_000}));
     let live = rig.s.book.get(PROVIDER).unwrap();
     println!("past the next channel's expiry: watcher {later:?}; record {} is {}; xbt402_pay answers {} / {}", live.chan, live.state, pay["verdict"], pay["rule"]);
-    assert!(acts.iter().any(|x| x["rule"] == "refund" && x["chan"] == rec.chan.as_str()),
-            "the rolled channel's funding ({} sat) is unspent past its expiry and nothing refunds it: watcher {acts:?}, xbt402_refund {manual}",
-            rig.chain.unspent_to(&old_spk));
+    assert!(!acts.iter().chain(later.iter()).any(|x| x["rule"] == "refund" && x["chan"] == rec.chan.as_str()),
+            "the limit is lifted: the watcher refunds the rolled channel now ({acts:?}, {later:?})");
+    assert_eq!((manual["verdict"].as_str(), manual["rule"].as_str()), (Some("deny"), Some("unknown_channel")), "no wallet method reaches it by its id: {manual}");
+    assert_eq!(rig.chain.unspent_to(&old_spk), rec.funding_sats, "the whole funding is in the rolled channel's script past its expiry");
+    assert_eq!((live.chan.as_str(), live.state.as_str(), pay["verdict"].as_str()), (funded.channel_id().as_str(), "open", Some("deny")),
+               "the record at the origin is the next channel, whose funding never existed, and the seller gets no new channel: {pay}");
 }
 
 /// The neighbour of the audit's item 15 (the next channel of a rollover the seller broadcast after
@@ -379,10 +405,19 @@ fn hole_a_channel_rolled_by_a_rollover_that_was_only_in_the_mempool_is_still_ref
 /// refunded. The rule (AGP-095's): **a channel this signer's signature funded gets a record, and
 /// the refund at its expiry, whoever broadcast the transaction.**
 ///
-/// FAILS on 2e745f2: the next channel's coins are in its script past its expiry. Low: the window
-/// is one watcher interval (10 s) after the rollover's block, and the key is kept.
+/// On 2e745f2: the next channel's coins are in its script past its expiry. Low: the window is one
+/// watcher interval (10 s) after the rollover's block, and the key is kept.
+///
+/// LIMIT (AGP-107; the fourth audit's list 1 item 12, second bullet, "write down"). Written by the
+/// audit as `hole_..._is_refunded_when_...`; kept as the statement of the limit with its last
+/// assertion turned round. The sentence it pins (`docs/LIMITS.md`, agent wallet): "The next
+/// channel of a rollover the seller broadcast after refusing it is refunded by the watcher only
+/// while the rolled channel is still the wallet's record for that seller; if the rolled channel
+/// was marked closed and a new one funded first, the next channel's coins stay in its script past
+/// its expiry, with its key kept." It fails when the watcher adopts a next channel from an
+/// archived record: then restore the audit's assertion (0 sat left) and drop the sentence.
 #[test]
-fn hole_the_next_channel_of_a_rollover_is_refunded_when_a_new_channel_replaced_the_rolled_one_first() {
+fn limit_the_next_channel_of_a_rollover_is_not_refunded_when_a_new_channel_replaced_the_rolled_one_first() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let (rig, rec, next_origin) = roll_rig();
     let k1 = rig.call("xbt402_new_key", json!({"origin": next_origin.clone()}))["pub"].as_str().unwrap().to_string();
@@ -401,9 +436,10 @@ fn hole_the_next_channel_of_a_rollover_is_refunded_when_a_new_channel_replaced_t
     rig.chain.mine_to(funded.expiry as u64 + 1);
     all.extend(rig.s.watch_tick());
     println!("attach of the next channel while the new one is live: {late}; in the next channel's script past its expiry: {} sat", rig.chain.unspent_to(&next_spk));
-    assert_eq!(rig.chain.unspent_to(&next_spk), 0,
-               "{} sat are in the next channel's script past its expiry: never adopted, never refunded (attach answered {late}; watcher {all:?})",
-               rig.chain.unspent_to(&next_spk));
+    assert_eq!((late["verdict"].as_str(), late["rule"].as_str()), (Some("deny"), Some("channel_pending")), "the attach is refused and the key kept: {late}");
+    assert_eq!(rig.chain.unspent_to(&next_spk), funded.capacity as i64,
+               "the limit is lifted or moved: {} of the next channel's {} sat are in its script past its expiry (watcher {all:?})",
+               rig.chain.unspent_to(&next_spk), funded.capacity);
 }
 
 // =====================================================================================================

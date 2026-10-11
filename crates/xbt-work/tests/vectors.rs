@@ -1,4 +1,4 @@
-//! Conformance with XBT-053's published vectors (agp-011, pinned in `vectors/xbt_work_vectors.json`):
+//! Conformance with XBT-053's vectors (not published: XBT-053 has no public repository; agp-011, pinned in `vectors/xbt_work_vectors.json`):
 //! the Rust emitter rebuilds the file byte for byte, and every section and independent check
 //! passes; an altered vector is caught.
 use xbt_work::vectors::{check, generate, to_file};
@@ -9,7 +9,7 @@ fn pinned() -> String {
 
 #[test]
 fn rust_emits_the_published_file_byte_for_byte() {
-    assert!(to_file(&generate()) == pinned(), "Rust-emitted vectors differ from the published file");
+    assert!(to_file(&generate()) == pinned(), "Rust-emitted vectors differ from the pinned XBT-053 file");
 }
 
 #[test]

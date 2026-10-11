@@ -144,7 +144,7 @@ struct Routed {
 }
 
 fn routed(name: &str, lists: bool, fail: usize) -> Routed {
-    let dir = PathBuf::from(format!("$HOME/xbt-rnd/xbt-rs-agp-102/run/tmp/agp102_route_client_{name}_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("xbt-rs-agp102-route-client-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let chain = Arc::new(MemChain::default());
