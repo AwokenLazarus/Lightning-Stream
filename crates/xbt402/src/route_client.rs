@@ -369,7 +369,7 @@ impl RoutePayer {
         let bad = |k: &str| ChannelError::new("ledger_error", format!("route ledger: {k}"));
         {
             let mut st = lk(&self.st);
-            if let Some(c) = recs.get("ch1") {
+            if let Some(c) = recs.get("ch1").filter(|c| !c.is_null()) {
                 if c.get("hub_url").and_then(Value::as_str) != Some(self.hub_url.as_str()) {
                     return fail("ledger_error", "the route ledger belongs to another hub");
                 }
@@ -473,7 +473,7 @@ impl RoutePayer {
 
     /// The ch1 channel id.
     pub fn chan(&self) -> Option<String> {
-        lk(&self.st).ch.as_ref().map(|c| c.params.channel_id())
+        lk(&self.st).ch.as_ref().filter(|c| c.params.funding.is_some()).map(|c| c.params.channel_id())
     }
 
     fn pick(&self, pr: &Value) -> Result<Value> {
@@ -526,24 +526,41 @@ impl RoutePayer {
     }
 
     /// Open ch1 to the hub from its 402 (x402 v2, xbt-channel, `extra.routing`). Returns
-    /// `{chan, capacity, expiry}`.
+    /// `{chan, capacity, expiry}` (and `resumed` when ch1 was on the books already).
+    ///
+    /// AGP-094 rule (the library client's, AGP-090): ch1 is funded once. Its key is on the books
+    /// before the wallet is asked, its outpoint before the hub hears of it, and every `open` goes
+    /// on from the stage the last one reached: no second key is asked for and no second funding
+    /// sent while the first is unresolved, whatever the hub or the wallet answered. With a ledger
+    /// the books are the ledger; without one they are this `RoutePayer`.
     pub fn open(&self) -> Result<Value> {
-        let resumed = {
-            let st = lk(&self.st);
-            st.ch.as_ref().map(|c| (c.opened, c.params.clone(), c.accepted.clone()))
-        };
-        if let Some((opened, p, acc)) = resumed {
-            if !opened {
-                // funded and attached before a restart, the hub's answer to our open not seen
-                self.post_open(&p, &acc)?;
-                if let Some(c) = lk(&self.st).ch.as_mut() {
+        let resumed = lk(&self.st).ch.is_some();
+        if !resumed {
+            self.key_ch1()?;
+        }
+        let p = self.fund_ch1()?;
+        if !lk(&self.st).ch.as_ref().is_some_and(|c| c.opened) {
+            let acc = lk(&self.st).ch.as_ref().map(|c| c.accepted.clone()).unwrap_or(Value::Null);
+            self.post_open(&p, &acc)?;
+            let rec = {
+                let mut st = lk(&self.st);
+                if let Some(c) = st.ch.as_mut() {
                     c.opened = true;
                 }
-                let rec = self.ch1_json(&lk(&self.st));
-                self.persist(&[("ch1".into(), rec)])?;
-            }
-            return Ok(json!({"chan": p.channel_id(), "capacity": p.capacity, "expiry": p.expiry, "resumed": true}));
+                self.ch1_json(&st)
+            };
+            self.persist(&[("ch1".into(), rec)])?;
         }
+        let mut out = json!({"chan": p.channel_id(), "capacity": p.capacity, "expiry": p.expiry});
+        if resumed {
+            out["resumed"] = true.into();
+        }
+        Ok(out)
+    }
+
+    /// Stage 1 of [`open`](Self::open): the hub's offer, a key from the signer and ch1's terms,
+    /// put to the hub (the preflight) and then recorded, unfunded, before the wallet is asked.
+    fn key_ch1(&self) -> Result<()> {
         let acc = self.hub_offer()?;
         {
             let mut st = lk(&self.st);
@@ -562,34 +579,95 @@ impl RoutePayer {
         // long ch1 locks the coins (AGP-090)
         let want = self.cfg.expiry_blocks as u64;
         let blocks = crate::funding::offer_expiry_blocks(&ex, want, want.max(crate::funding::OWNER_MAX_HUB_EXPIRY_BLOCKS))?;
-        let expiry = (self.height)()? + u32::try_from(blocks).map_err(|_| ChannelError::new("bad_offer", "expiry blocks"))?;
+        let expiry = (self.height)()?.checked_add(u32::try_from(blocks).map_err(|_| ChannelError::new("bad_offer", "expiry blocks"))?)
+            .ok_or_else(|| ChannelError::new("bad_offer", "expiry blocks"))?;
         let pay_to = hex::decode(py_str(acc.get("payTo"))).map_err(|_| ChannelError::new("bad_offer", "payTo"))?;
-        let p = ChannelParams::derive(&pay_to, &pubk, expiry, py_u64(ex.get("closeFeeSat")).unwrap_or(0), payer_spk, &self.cfg.network, fee_payer)?;
-        let hrp = if self.cfg.network == XBT_MAINNET { "bc" } else { "bcrt" };
-        let mut p = p;
+        let mut p = ChannelParams::derive(&pay_to, &pubk, expiry, py_u64(ex.get("closeFeeSat")).unwrap_or(0), payer_spk, &self.cfg.network, fee_payer)?;
         p.capacity = cap;
         self.preflight(&p, &acc)?;
-        let (txid, vout) = self.wallet.fund_channel(&self.hub_url, &p, &segwit_address(hrp, &p.spk())?, cap)?;
-        let p = p.with_funding(&txid, vout, cap)?;
-        self.signer.attach(&self.hub_url, &p)?;
-        self.signer.sign_refund(&p.channel_id())?;
-        if self.ledger.is_some() {
-            // write-ahead: a restart finds the funded ch1 (and posts the open again)
+        let recs = {
             let mut st = lk(&self.st);
-            st.ch = Some(Ch1 { params: p.clone(), accepted: acc.clone(), seq: 0, opened: false });
-            let recs = [("ch1".to_string(), self.ch1_json(&st)), ("book".to_string(), Self::book_json(&st))];
-            drop(st);
+            st.ch = Some(Ch1 { params: p, accepted: acc, seq: 0, opened: false });
+            [("ch1".to_string(), self.ch1_json(&st)), ("book".to_string(), Self::book_json(&st))]
+        };
+        if let Err(e) = self.persist(&recs) {
+            // not on the books: nothing is funded on it
+            lk(&self.st).ch = None;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Stage 2: fund the recorded ch1 (unless an earlier call did), record its outpoint, and bind
+    /// it to its key in the signer. Returns ch1's funded terms.
+    fn fund_ch1(&self) -> Result<ChannelParams> {
+        let (mut p, acc) = {
+            let st = lk(&self.st);
+            let c = st.ch.as_ref().ok_or_else(|| ChannelError::code("no_channel"))?;
+            (c.params.clone(), c.accepted.clone())
+        };
+        if p.funding.is_none() {
+            let hrp = if self.cfg.network == XBT_MAINNET { "bc" } else { "bcrt" };
+            let addr = segwit_address(hrp, &p.spk())?;
+            // an earlier fund call may have failed after it broadcast: the wallet's own record of a
+            // send to this script is used before anything is sent again
+            let (txid, vout) = match self.wallet_send_to(&addr, p.capacity)? {
+                Some(o) => o,
+                None => {
+                    let ex = acc.get("extra").cloned().unwrap_or(Value::Null);
+                    if (p.expiry as u64) < ((self.height)()? as u64).saturating_add(crate::funding::offer_expiry_floor(&ex)?) {
+                        // too near its expiry for the hub to open now. The key stays on the books,
+                        // in case that earlier call did fund it
+                        return fail("open_unresolved", "an earlier open never learned whether its funding was sent, and ch1 is too near its expiry to fund \
+                                                        now: once the wallet shows no send to it, call forget_unfunded");
+                    }
+                    self.wallet.fund_channel(&self.hub_url, &p, &addr, p.capacity)?
+                }
+            };
+            let cap = p.capacity;
+            p = p.with_funding(&txid, vout, cap)?;
+            // the outpoint is on the books before the hub hears of it
+            let recs = {
+                let mut st = lk(&self.st);
+                if let Some(c) = st.ch.as_mut() {
+                    c.params = p.clone();
+                }
+                [("ch1".to_string(), self.ch1_json(&st)), ("book".to_string(), Self::book_json(&st))]
+            };
             self.persist(&recs)?;
         }
-        self.post_open(&p, &acc)?;
-        let out = json!({"chan": p.channel_id(), "capacity": p.capacity, "expiry": p.expiry});
+        if self.signer.sign_refund(&p.channel_id()).is_err() {
+            // not bound yet (a signer that has the channel signs its refund)
+            self.signer.attach(&self.hub_url, &p)?;
+            self.signer.sign_refund(&p.channel_id())?;
+        }
+        Ok(p)
+    }
+
+    /// The live send of `sats` this wallet made to `address`, if it knows one.
+    fn wallet_send_to(&self, address: &str, sats: u64) -> Result<Option<(String, u32)>> {
+        for txid in self.wallet.wallet_sends_to(address)? {
+            if let Some(w) = self.wallet.wallet_send(&txid, address)? {
+                if !w.failed() && w.sats == sats {
+                    return Ok(Some((w.txid, w.vout)));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Drop a ch1 that was recorded and never funded (its key goes with it). Call it only when
+    /// the wallet shows no send to its script: [`open`](Self::open) refuses `open_unresolved`
+    /// when such a ch1 is too near its expiry to fund. True if one was dropped.
+    pub fn forget_unfunded(&self) -> Result<bool> {
         let mut st = lk(&self.st);
-        let seq = st.ch.as_ref().map(|c| c.seq).unwrap_or(0);
-        st.ch = Some(Ch1 { params: p, accepted: acc, seq, opened: true });
-        let rec = self.ch1_json(&st);
+        if !st.ch.as_ref().is_some_and(|c| c.params.funding.is_none()) {
+            return Ok(false);
+        }
+        st.ch = None;
         drop(st);
-        self.persist(&[("ch1".into(), rec)])?;
-        Ok(out)
+        self.persist(&[("ch1".into(), Value::Null)])?;
+        Ok(true)
     }
 
     /// ch1's `/open` channel object (no outpoint before the funding) and the hub's open URL.
@@ -624,9 +702,15 @@ impl RoutePayer {
         }
     }
 
+    /// Asked again on every [`open`](Self::open) until the hub answers. AGP-094: a hub that has
+    /// the channel already (its first answer was lost) says `duplicate_channel`, which is the yes
+    /// that never arrived (as [`crate::client::Client`] takes a provider's).
     fn post_open(&self, p: &ChannelParams, acc: &Value) -> Result<()> {
         let (c, open_url) = self.open_req(p, acc)?;
-        let r = self.post(&open_url, &json!({"x402Version": 2, "network": self.cfg.network, "channel": c}))?;
+        let r = match self.post(&open_url, &json!({"x402Version": 2, "network": self.cfg.network, "channel": c})) {
+            Err(e) if e.code == "duplicate_channel" => return Ok(()),
+            r => r?,
+        };
         if r.get("closeFeePayer").and_then(Value::as_str).unwrap_or("payer") != p.close_fee_payer.as_str() {
             return fail("bad_fee_payer", "the hub opened the channel with another closeFeePayer");
         }
@@ -880,7 +964,38 @@ impl RoutePayer {
     ///
     /// AGP-088: a completion is adopted only with its proof (the view's `secret` opens that
     /// lock's T1), and a hold only while fewer than `max_held_locks` are held (see the module doc).
+    ///
+    /// AGP-094: a held lock the hub completed BELOW its best state is in none of those lists. The
+    /// view names it under `completed` with the `t + r` that completed it: with that proof (it
+    /// opens the lock's own T1, as for a completion at the best state) the lock stops counting as
+    /// held. Nothing else moves: its amount was in both bases since the hold. Without the proof it
+    /// stays held, so a hub cannot empty the client's `max_held_locks` by its word.
     fn resync(&self, st: &mut PState, doc: &Value) -> bool {
+        let done = self.drop_completed(st, doc);
+        self.resync_view(st, doc) || done
+    }
+
+    fn drop_completed(&self, st: &mut PState, doc: &Value) -> bool {
+        let Some(best) = py_u64(doc.get("bestCum")) else { return false };
+        let empty = vec![];
+        let done = doc.get("completed").and_then(Value::as_array).unwrap_or(&empty);
+        let held_now = |id: &str| doc.get("held").and_then(Value::as_array).is_some_and(|a| a.iter().any(|x| x.as_str() == Some(id)));
+        let proved = |g: &GivenUp| done.iter().any(|x| x.get("lockId").and_then(Value::as_str) == Some(g.lock_id.as_str())
+            && Sc::from_hex_mod_n(&py_str(x.get("secret"))).and_then(|y| y.secret())
+                .is_some_and(|y| hex::encode(adaptor::enc(&adaptor::point_of(&y))) == g.t1.to_lowercase()));
+        // (one completed AT the best state above ours is adopted below, with the state itself)
+        let ids: Vec<String> = st.given_up.iter().filter(|g| g.held && !g.floor && !g.t1.is_empty() && !(g.cum == best && best > st.signed)
+                                                         && !held_now(&g.lock_id) && proved(g)).map(|g| g.lock_id.clone()).collect();
+        if ids.is_empty() {
+            return false;
+        }
+        st.given_up.retain(|g| !(g.held && ids.contains(&g.lock_id)));
+        st.probe_at = 0.0;
+        self.event(json!({"event": "resync_completed", "lockIds": ids}));
+        true
+    }
+
+    fn resync_view(&self, st: &mut PState, doc: &Value) -> bool {
         let (Some(best), Some(r), Some(u), Some(pd)) = (py_u64(doc.get("bestCum")), py_u64(doc.get("routedSat")), u128_of(doc.get("feeUnits")),
                                                         py_u64(doc.get("feePaid"))) else { return false };
         let hub = (r, u, pd);
@@ -1004,7 +1119,7 @@ impl RoutePayer {
         let at_cap = {
             let st = lk(&self.st);
             let held = st.given_up.iter().filter(|g| g.held).count();
-            st.pending.is_none() && st.ch.is_some() && self.cfg.max_held_locks > 0 && held >= self.cfg.max_held_locks
+            st.pending.is_none() && st.ch.as_ref().is_some_and(|c| c.opened) && self.cfg.max_held_locks > 0 && held >= self.cfg.max_held_locks
         };
         if at_cap {
             // AGP-088: nothing more is pre-signed above that many holds; a release or a completion
@@ -1013,7 +1128,8 @@ impl RoutePayer {
         }
         let (id, pl, body, accepted, d, f, floor) = {
             let mut st = lk(&self.st);
-            if st.pending.is_some() || st.ch.is_none() {
+            if st.pending.is_some() || !st.ch.as_ref().is_some_and(|c| c.opened) {
+                // (AGP-094: a ch1 the hub has not opened yet signs nothing)
                 return Ok(None);
             }
             let due = sh.due_sat();
