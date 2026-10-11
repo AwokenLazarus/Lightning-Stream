@@ -376,7 +376,7 @@ def scenario(i, name, j=0):
             f.write(f"{secrets.randbelow(2 ** 255) + 1:064x}")
         os.chmod(key, 0o600)
         hub_dir = os.path.join(d, "hub")
-        conf = {"node": {"rpcport": int(RPCPORT), "cookie": COOKIE, "wallet": "w"}, "network": NET, "port": hub_port,
+        conf = {"node": {"rpcport": int(RPCPORT), "cookie": COOKIE, "wallet": "w", "fee_rate": 2}, "network": NET, "port": hub_port,
                 "datadir": hub_dir, "pay_to_key_file": key, "connect": [url], "watch_interval": watch_s,
                 "hub": {"fee_base_msat": 100, "fee_ppm": 2000, "max_lock_sat": 20000, "max_unguarded_lock_sat": 500,
                         "delta": 144, "reveal_timeout": 2.0, "ch2_capacity": 100000, "ch2_expiry_blocks": 1100,

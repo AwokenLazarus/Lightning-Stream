@@ -24,6 +24,9 @@ struct ChainState {
     /// AGP-094: the height at which each of `mined` was first confirmed (the depth of its spender,
     /// as bitcoind gives it: tip - height + 1).
     mined_at: HashMap<(String, u32), u32>,
+    /// AGP-104: the height at which an output broadcast here was first in a block, so `gettxout`
+    /// answers its real depth (it answered 1 for every confirmed output, however deep).
+    conf_at: HashMap<(String, u32), u32>,
     raw: HashMap<String, String>,
     /// `estimatesmartfee`, sat/vB (None: no estimate).
     fee_rate: Option<f64>,
@@ -82,13 +85,15 @@ impl MemChain {
         let mut st = self.st();
         let min = st.block_min_feerate;
         let held: HashSet<String> = st.fees.iter().filter(|(_, (f, v))| (*f as f64) < min * *v as f64).map(|(t, _)| t.clone()).collect();
-        for (k, u) in st.utxos.iter_mut() {
-            if !held.contains(&k.0) {
-                u.confirmations = u.confirmations.max(1);
+        let h = st.height;
+        let fresh: Vec<_> = st.utxos.iter().filter(|(k, u)| !held.contains(&k.0) && u.confirmations == 0).map(|(k, _)| k.clone()).collect();
+        for k in fresh {
+            st.conf_at.insert(k.clone(), h);
+            if let Some(u) = st.utxos.get_mut(&k) {
+                u.confirmations = 1;
             }
         }
         let spent: Vec<_> = st.spent.iter().filter(|(_, s)| !held.contains(*s)).map(|(k, _)| k.clone()).collect();
-        let h = st.height;
         for k in &spent {
             st.mined_at.entry(k.clone()).or_insert(h);
         }
@@ -121,6 +126,7 @@ impl MemChain {
         let mut st = self.st();
         st.spent.retain(|_, s| s != txid);
         st.utxos.retain(|k, _| k.0 != txid);
+        st.conf_at.retain(|k, _| k.0 != txid);
         st.raw.remove(txid);
     }
 
@@ -133,6 +139,7 @@ impl MemChain {
                 u.confirmations = 0;
             }
         }
+        st.conf_at.retain(|k, _| k.0 != txid);
         let spends: Vec<_> = st.spent.iter().filter(|(_, s)| *s == txid).map(|(k, _)| k.clone()).collect();
         for k in spends {
             st.mined.remove(&k);
@@ -147,6 +154,13 @@ impl MemChain {
 
     pub fn set_fee_rate(&self, sat_per_vb: Option<f64>) {
         self.st().fee_rate = sat_per_vb;
+    }
+
+    /// AGP-104: the sats in unspent outputs paying `spk`, the mempool's included (and an output a
+    /// mempool tx spends left out): what a wallet or a key holds as this chain shows it.
+    pub fn unspent_to(&self, spk: &[u8]) -> u64 {
+        let st = self.st();
+        st.utxos.iter().filter(|(k, u)| u.script_pubkey == spk && !st.spent.contains_key(*k)).map(|(_, u)| u.value).sum()
     }
 
     pub fn raw(&self, txid: &str) -> Option<Tx> {
@@ -220,7 +234,13 @@ impl ChainBackend for MemChain {
             return Ok(None);
         }
         // without the mempool a node reads its confirmed UTXO set: nothing for an unconfirmed output
-        Ok(st.utxos.get(&k).filter(|u| mempool || u.confirmations > 0).cloned())
+        Ok(st.utxos.get(&k).filter(|u| mempool || u.confirmations > 0).cloned().map(|mut u| {
+            // as a node answers: tip - the output's height + 1
+            if let Some(at) = st.conf_at.get(&k).filter(|_| u.confirmations > 0) {
+                u.confirmations = u.confirmations.max(st.height.saturating_sub(*at) + 1);
+            }
+            u
+        }))
     }
 
     fn send_raw_transaction(&self, hex: &str) -> Result<String> {

@@ -574,7 +574,9 @@ fn ok_decision_1_the_default_numbers_leave_no_headroom_above_the_floor() {
                        "settleMultiple": pc.settle_multiple}});
     let (cap, blocks) = h.ch2_terms(&terms, None, None).unwrap();
     let floor = xbt402::funding::open_expiry_floor(pc.policy.min_expiry_blocks as u64, pc.policy.min_conf as u64, pc.close_margin as u64);
-    assert_eq!((cap, blocks as u64, floor, h.cfg.ch2_expiry_blocks), (100_000, 1_153, 1_153, 1_100));
+    // (AGP-104: the shipped `ch2_expiry_blocks` is that floor now, 1,153, where it was 1,100 and was
+    // raised to it for every default seller. What is asked did not change, and neither did this)
+    assert_eq!((cap, blocks as u64, floor, h.cfg.ch2_expiry_blocks), (100_000, 1_153, 1_153, 1_153));
     assert_eq!(floor - pc.policy.min_expiry_blocks as u64, 145);
 }
 

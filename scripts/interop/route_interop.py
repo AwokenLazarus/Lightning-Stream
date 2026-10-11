@@ -190,7 +190,7 @@ def scenario(i, client, hub_impl, prov_impl):
         with open(key, "w") as f:
             f.write(f"{secrets.randbelow(2 ** 255) + 1:064x}")
         os.chmod(key, 0o600)
-        conf = {"node": {"rpcport": int(RPCPORT), "cookie": COOKIE, "wallet": "w"}, "network": NET, "port": hub_port,
+        conf = {"node": {"rpcport": int(RPCPORT), "cookie": COOKIE, "wallet": "w", "fee_rate": 2}, "network": NET, "port": hub_port,
                 "datadir": os.path.join(d, "hub"), "pay_to_key_file": key, "connect": urls, "watch_interval": 0.5,
                 "hub": {"fee_base_msat": 100, "fee_ppm": 2000, "max_lock_sat": 20000, "max_unguarded_lock_sat": 500,
                         "delta": 144, "reveal_timeout": 2.0, "ch2_capacity": 50000, "ch2_expiry_blocks": 1100,

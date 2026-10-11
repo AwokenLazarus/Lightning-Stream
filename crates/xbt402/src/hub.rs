@@ -110,6 +110,22 @@
 //!   provider's 200 is watched, and refunded at its expiry, until that rollover is in a block;
 //! * a refill is funded when this node shows the funding spent, and a ch2 counts against
 //!   `liquidity_cap_sat` until then ([`committed`]).
+//!
+//! Returns (AGP-104). Rule R1: no coin of the hub's rests on a key only its state files know.
+//! With a return address set ([`RouteHub::set_return_to`]; `xbt402-hub` sets its wallet's):
+//! * every ch2 the hub funds, and every rollover's next ch2, names a return address as its
+//!   `payerSpk`, so a provider's close pays the hub's remainder there and a refund does too;
+//! * a closed ch1's payout, which a close pays to that channel's own payee key, is swept there;
+//! * a ch2 from a ledger written before this (its `payerSpk` is its own payer key) is refunded
+//!   there, and what a provider's close left on that key is swept there.
+//!
+//! Rule R2: one signed sweep per output. A sweep is written to the ledger before it is sent, the
+//! same bytes are sent again each tick until the chain has them, and it is never signed again at
+//! another fee or to another address. Nothing is swept before the spend it depends on is
+//! `spend_final_depth` blocks deep, and a sweep is `final` only at that depth itself.
+//!
+//! Status (AGP-104): [`RouteHub::status`] is where the hub's coins are, in four numbers that add
+//! up to what was sent in, plus the fees earned, less what the chain cost.
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -120,12 +136,13 @@ use indexmap::IndexMap;
 use serde_json::{json, Map, Value};
 use xbt_primitives::address::{address_to_spk, segwit_address};
 use xbt_primitives::ecdsa;
+use xbt_primitives::script::p2wpkh_spk;
 use xbt_primitives::secp256k1::SecretKey;
 use xbt_primitives::sighash::SIGHASH_ALL_UNIFIED;
-use xbt_primitives::tx::Tx;
+use xbt_primitives::tx::{OutPoint, Tx, TxIn, TxOut};
 
 use crate::adaptor::{self, PreSig, Sc};
-use crate::channel::{canonical_chan, channel_auth_key, settle_due, sign_with_type, ChannelParams, FeePayer, DUST, RBF_SEQUENCE};
+use crate::channel::{canonical_chan, channel_auth_key, settle_due, sign_p2wpkh, sign_with_type, ChannelParams, FeePayer, DUST, RBF_SEQUENCE};
 use crate::client::{Transport, Wallet, WalletSend};
 use crate::error::{fail, ChannelError, Result};
 use crate::funding::{ChainBackend, FundingPolicy};
@@ -331,29 +348,34 @@ pub struct HubConfig {
     /// it trusts a funding (`ch2_max_min_conf`), and waiting costs only time (a hold is at most
     /// one lock, and it is the client's own coins that wait).
     pub spend_final_depth: u32,
+    /// AGP-104: the operator's one number (0: unset). It is the liquidity cap (set it or
+    /// `liquidity_cap_sat`, not two different values), and with funding ahead on
+    /// (`refill_ahead_locks` > 0) a seller is admitted only while its ch2 and one spare
+    /// `ch2_capacity` fit under it, so one seller's next ch2 can always be funded ahead.
+    pub capital_sat: u64,
 }
 
 impl Default for HubConfig {
     fn default() -> Self {
         Self { fee_base_msat: 1_000, fee_ppm: 2_000, fee_strategy: json!({"kind": "flat"}), quote_ttl: 600, max_lock_sat: 20_000,
-               max_unguarded_lock_sat: 500, delta: 144, reveal_timeout: 10.0, ch2_capacity: 100_000, ch2_expiry_blocks: 1_100,
+               max_unguarded_lock_sat: 500, delta: 144, reveal_timeout: 10.0, ch2_capacity: 100_000, ch2_expiry_blocks: 1_153,
                liquidity_cap_sat: 0, close_fee: 600, ch1_close_fee_payer: FeePayer::Payer, ch2_close_fee_payer: FeePayer::Payee,
                close_margin: 144, rollover_margin: 36, hrp: "bcrt".into(), policy: json!({"min_expiry_blocks": 1_008, "max_expiry_blocks": 8_640}),
                ch2_max_expiry_blocks: 0, ch2_max_close_fee_sat: 5_000, ch2_close_fee_multiple: 20, ch2_max_min_conf: 6, ch2_max_min_capacity: 0,
                ch2_max_settle_multiple: 100, refund_grace_blocks: 6, refund_conf_target: 6, refund_min_feerate: 1.0, funding_timeout_blocks: 6,
                refund_bump_blocks: 3, refund_max_fee_sat: 5_000, zero_conf_rollover: true, ch2_max_per_pay_to: 8, settle_lock_multiple: 4,
-               settle_idle: 600.0, rollover_relay_grace: 60.0, refill_ahead_locks: 4, spend_final_depth: 6 }
+               settle_idle: 600.0, rollover_relay_grace: 60.0, refill_ahead_locks: 4, spend_final_depth: 6, capital_sat: 0 }
     }
 }
 
-const HUB_KEYS: [&str; 38] = ["fee_base_msat", "fee_ppm", "fee_strategy", "quote_ttl", "max_lock_sat", "max_unguarded_lock_sat", "delta",
+const HUB_KEYS: [&str; 39] = ["fee_base_msat", "fee_ppm", "fee_strategy", "quote_ttl", "max_lock_sat", "max_unguarded_lock_sat", "delta",
                               "reveal_timeout", "ch2_capacity", "ch2_expiry_blocks", "liquidity_cap_sat", "close_fee",
                               "ch1_close_fee_payer", "ch2_close_fee_payer", "close_margin", "rollover_margin", "hrp", "policy", "_comment",
                               "ch2_max_expiry_blocks", "ch2_max_close_fee_sat", "ch2_close_fee_multiple", "ch2_max_min_conf",
                               "ch2_max_min_capacity", "ch2_max_settle_multiple", "refund_grace_blocks", "refund_conf_target",
                               "refund_min_feerate", "funding_timeout_blocks", "refund_bump_blocks", "refund_max_fee_sat",
                               "zero_conf_rollover", "ch2_max_per_pay_to", "settle_lock_multiple", "settle_idle", "rollover_relay_grace",
-                              "refill_ahead_locks", "spend_final_depth"];
+                              "refill_ahead_locks", "spend_final_depth", "capital_sat"];
 
 impl HubConfig {
     /// From the operator's JSON (B1 `HubConfig.from_dict`): unknown keys are refused.
@@ -428,6 +450,7 @@ impl HubConfig {
         c.settle_lock_multiple = u("settle_lock_multiple", c.settle_lock_multiple)?;
         c.refill_ahead_locks = u("refill_ahead_locks", c.refill_ahead_locks)?;
         c.spend_final_depth = u32_("spend_final_depth", c.spend_final_depth)?;
+        c.capital_sat = u("capital_sat", c.capital_sat)?;
         for (k, slot) in [("settle_idle", &mut c.settle_idle), ("rollover_relay_grace", &mut c.rollover_relay_grace)] {
             if let Some(v) = m.get(k) {
                 *slot = v.as_f64().filter(|x| *x >= 0.0).ok_or_else(|| bad(format!("{k} must be a number")))?;
@@ -450,7 +473,28 @@ impl HubConfig {
             // AGP-094: 0 would call a spend in the mempool final
             return fail("bad_config", "spend_final_depth must be at least 1");
         }
+        if self.capital_sat > 0 {
+            if self.liquidity_cap_sat > 0 && self.liquidity_cap_sat != self.capital_sat {
+                return fail("bad_config", format!("capital_sat {} and liquidity_cap_sat {} differ: set one", self.capital_sat, self.liquidity_cap_sat));
+            }
+            let need = self.ch2_capacity.saturating_add(self.spare_sat());
+            if self.capital_sat < need {
+                return fail("bad_config", format!("capital_sat {} holds no seller: one ch2 ({}) and the spare for funding ahead ({}) need {need}",
+                                                  self.capital_sat, self.ch2_capacity, self.spare_sat()));
+            }
+        }
         Ok(())
+    }
+
+    /// The hub's own coins in ch2s never pass this (0: no cap): `capital_sat`, else `liquidity_cap_sat`.
+    pub fn liquidity_cap(&self) -> u64 {
+        if self.capital_sat > 0 { self.capital_sat } else { self.liquidity_cap_sat }
+    }
+
+    /// AGP-104: the room `capital_sat` keeps free of first fundings, so a next ch2 can be funded
+    /// ahead: one `ch2_capacity` (0 without `capital_sat`, or with funding ahead off).
+    pub fn spare_sat(&self) -> u64 {
+        if self.capital_sat > 0 && self.refill_ahead_locks > 0 { self.ch2_capacity } else { 0 }
     }
 
     /// ch1's funding policy: `close_margin` plus the `policy` overrides.
@@ -551,6 +595,22 @@ pub struct OutChannel {
     /// AGP-094: the tip when the watcher first saw this funding spent in a block, for a scan that
     /// does not say how deep the spender is (0: not seen so, or the funding is unspent again).
     pub gone_at: u32,
+    /// AGP-104: the sweep of what a close or refund left on this ch2's own payer key (a ch2 from
+    /// before it named a return address): `{txid, hex, outpoint, value, fee, swept, dest_spk, at,
+    /// gone_at, final, skipped}` (empty: none yet). See [`RouteHub::sweep_tick`].
+    pub sweep: Map<String, Value>,
+    /// AGP-104: what the spend of this ch2's funding paid its `payer_spk`, read off that
+    /// transaction (None: not read).
+    pub returned: Option<u64>,
+    /// AGP-104: the cumulative amount the provider said it closed with (None: no checked reply).
+    pub close_cum: Option<u64>,
+    /// AGP-104: what the wallet paid a miner for this ch2's funding (None: the wallet did not say).
+    pub fund_fee: Option<u64>,
+}
+
+/// AGP-104: this ch2 pays its remainder to its own payer key (it named no return address).
+pub fn own_key(p: &ChannelParams) -> bool {
+    p.payer_spk == p2wpkh_spk(&p.payer_pub)
 }
 
 /// States in which the hub's coins are committed.
@@ -583,10 +643,21 @@ impl OutChannel {
                refund_txid: String::new(), refund_fee: 0, final_: false, next: Map::new(), fund_error: String::new(),
                refund_at: 0, refund_prev: vec![], close_prev: String::new(), fund_txid: String::new(), fund_vout: 0,
                rolled_from: String::new(), zero_conf: Map::new(), max_lock: 0, last_lock_at: 0.0, rolled_at: 0.0, fund_seen: false,
-               retired: false, fund_confirmed: false, spend_seen: false, refill_owed: false, gone_at: 0 }
+               retired: false, fund_confirmed: false, spend_seen: false, refill_owed: false, gone_at: 0, sweep: Map::new(),
+               returned: None, close_cum: None, fund_fee: None }
     }
 
     pub fn to_json(&self) -> Value {
+        let mut v = self.to_json_base();
+        // AGP-104 (set here: the macro above is at its recursion limit)
+        v["sweep"] = Value::Object(self.sweep.clone());
+        v["returned"] = self.returned.into();
+        v["close_cum"] = self.close_cum.into();
+        v["fund_fee"] = self.fund_fee.into();
+        v
+    }
+
+    fn to_json_base(&self) -> Value {
         json!({"origin": self.origin, "pay_to": self.pay_to, "params": self.params.to_json(), "secret": self.secret, "state": self.state,
                "signed": self.signed, "routed": self.routed, "seq": self.seq, "pending": self.pending, "stale": self.stale,
                "settle_multiple": self.settle_multiple, "terms": self.terms, "refund_hex": self.refund_hex, "blocked": self.blocked,
@@ -618,7 +689,9 @@ impl OutChannel {
                   retired: v.get("retired").and_then(Value::as_bool).unwrap_or(false),
                   fund_confirmed: v.get("fund_confirmed").and_then(Value::as_bool).unwrap_or(false),
                   spend_seen: v.get("spend_seen").and_then(Value::as_bool).unwrap_or(false),
-                  refill_owed: v.get("refill_owed").and_then(Value::as_bool).unwrap_or(false), gone_at: n("gone_at") as u32 })
+                  refill_owed: v.get("refill_owed").and_then(Value::as_bool).unwrap_or(false), gone_at: n("gone_at") as u32,
+                  sweep: v.get("sweep").and_then(Value::as_object).cloned().unwrap_or_default(),
+                  returned: py_u64(v.get("returned")), close_cum: py_u64(v.get("close_cum")), fund_fee: py_u64(v.get("fund_fee")) })
     }
 
     fn secret_key(&self) -> Result<SecretKey> {
@@ -861,6 +934,9 @@ type SharedRefill = Arc<dyn Fn(&RouteHub, &str) -> Result<()> + Send + Sync>;
 /// `refund_to()`: the address a ch2 refund pays (default: the ch2's payer key).
 pub type RefundToFn = Box<dyn Fn() -> Result<String> + Send + Sync>;
 
+/// `return_to()`: an address the operator controls, for a coin the hub gets back (AGP-104).
+pub type ReturnToFn = RefundToFn;
+
 /// Where a ch2 record lives: the live book (by origin), the origin's next ch2 (AGP-057), or the
 /// archive (by index).
 #[derive(Clone, Copy, Debug)]
@@ -913,6 +989,9 @@ pub struct RouteHub {
     fee_strategy: Option<FeeStrategyFn>,
     refill: Mutex<Option<SharedRefill>>,
     refund_to: Mutex<Option<RefundToFn>>,
+    return_to: Mutex<Option<ReturnToFn>>,
+    /// The tip of the last sweep pass (AGP-104): sweeps are looked at once a block.
+    sweep_tip: Mutex<Option<u32>>,
     /// Tests/demo: "" | "receipt" (keep t + r from the client) | "all" (forward nothing).
     pub withhold: Mutex<String>,
     pub events: Mutex<Vec<Value>>,
@@ -956,6 +1035,38 @@ fn committed(b: &OutBook) -> u64 {
 fn exhausted(oc: &OutChannel, d: u64) -> bool {
     let need2 = next_cum(oc.routed, d, oc.params.min_amount());
     need2 > oc.signed && need2 > oc.params.max_amount()
+}
+
+/// AGP-104: what `tx`, the spend of this ch2's funding, pays the ch2's `payer_spk`.
+fn returned_by(tx: &Tx, p: &ChannelParams) -> u64 {
+    tx.outputs.iter().filter(|o| o.script_pubkey == p.payer_spk).map(|o| u64::try_from(o.value).unwrap_or(0)).fold(0, u64::saturating_add)
+}
+
+/// The vsize of a sweep: one P2WPKH input, one output (the size of the close's CPFP child).
+pub const SWEEP_VSIZE: u64 = crate::provider::CPFP_CHILD_VSIZE;
+/// A closed ch1 whose payout is not on the chain this many blocks past its expiry is not looked
+/// at again: its close never confirmed (the payer's refund took the funding).
+pub const SWEEP_GIVE_UP_BLOCKS: u32 = 144;
+
+/// What the chain shows of a sweep written ahead (rule R2).
+enum Look {
+    /// `spend_final_depth` deep: nothing left to watch.
+    Final,
+    /// In the mempool or a recent block.
+    Wait,
+    /// Its input is unspent and this node does not have it: the same bytes go out again.
+    Resend,
+}
+
+/// A record's sweep is over: `spend_final_depth` deep, or there was nothing to sweep.
+fn sweep_done(sw: Option<&Value>) -> bool {
+    truthy(sw.and_then(|s| s.get("final")))
+}
+
+/// AGP-104: a ch2 record that may hold coins on its own payer key: its funding's spend is final,
+/// it was closed by the provider or refunded, and it named no return address.
+fn sweepable(c: &OutChannel) -> bool {
+    c.final_ && ["closed", "refunded"].contains(&c.state.as_str()) && c.params.funding.is_some() && own_key(&c.params) && !truthy(c.sweep.get("final"))
 }
 
 fn err(status: u16, code: &str, detail: &str, extra: Value) -> HttpResponse {
@@ -1022,7 +1133,8 @@ impl RouteHub {
         let hub = Self { pay_to: hex::encode(ecdsa::pubkey(&pay_to_secret)), cfg, chain, scan, wallet, http, secret: pay_to_secret,
                   network: network.into(), inbound, out: Mutex::new(out), busy: Mutex::new(HashSet::new()), quote: Mutex::new(None),
                   quote_seq: Mutex::new(now_i()), reveal_timeout_bits: AtomicU64::new(0), fee_strategy: None,
-                  refill: Mutex::new(None), refund_to: Mutex::new(None), withhold: Mutex::new(String::new()), events: Mutex::new(events),
+                  refill: Mutex::new(None), refund_to: Mutex::new(None), return_to: Mutex::new(None),
+                  sweep_tip: Mutex::new(None), withhold: Mutex::new(String::new()), events: Mutex::new(events),
                   stats: Mutex::new(HubStats::default()), zc_tried: Mutex::new(HashSet::new()), refill_ahead: Mutex::new(None),
                   ahead_tried: Mutex::new(HashSet::new()), retire_tried: Mutex::new(HashSet::new()),
                   stale_tried: Mutex::new(HashSet::new()), stop_at: Mutex::new(String::new()),
@@ -1068,9 +1180,35 @@ impl RouteHub {
         *lk(&self.refill_ahead) = f.map(SharedRefill::from);
     }
 
-    /// Pay ch2 refunds to this hook's address (default: the ch2's payer key).
+    /// Pay ch2 refunds to this hook's address (default: the ch2's `payerSpk`, which is a return
+    /// address when [`set_return_to`](Self::set_return_to) is set, else the ch2's payer key).
     pub fn set_refund_to(&self, f: Option<RefundToFn>) {
         *lk(&self.refund_to) = f;
+    }
+
+    /// AGP-104 (rule R1): the hook that names an address the operator controls. With it, every
+    /// ch2 funded from now on pays its remainder there, and the watcher sweeps there what closes
+    /// left on per-channel keys ([`Self::sweep_tick`]). None (the library's default): as before,
+    /// a provider's close pays the ch2's own payer key, a ch1's payout stays on its payee key,
+    /// and nothing is swept.
+    pub fn set_return_to(&self, f: Option<ReturnToFn>) {
+        *lk(&self.return_to) = f;
+    }
+
+    /// AGP-104: THE address a coin the hub gets back is paid to, as a script (None: no return
+    /// hook). Every return goes through here: a ch2's `payerSpk` at funding and at rollover, a
+    /// refund of a ch2 that names its own key, and both sweeps. A later task that returns coins
+    /// to a Lightning wallet changes this function's hook and nothing else. Witness v0 only
+    /// (P2WPKH or P2WSH): what every provider takes as a `payerSpk` and what a sweep can pay.
+    fn return_spk(&self) -> Result<Option<Vec<u8>>> {
+        let g = lk(&self.return_to);
+        let Some(f) = g.as_ref() else { return Ok(None) };
+        let addr = f().map_err(|e| ChannelError::new("return_address", format!("no return address: {e}")))?;
+        let spk = address_to_spk(&addr, Some(&self.cfg.hrp)).map_err(|e| ChannelError::new("return_address", format!("return address: {e}")))?;
+        if !((spk.len() == 22 || spk.len() == 34) && spk[0] == 0 && spk[1] as usize == spk.len() - 2) {
+            return fail("return_address", "the return address must be a witness v0 address (bech32 P2WPKH or P2WSH)");
+        }
+        Ok(Some(spk))
     }
 
     /// Replace the configured fee strategy with a callable.
@@ -1155,7 +1293,7 @@ impl RouteHub {
         match kind {
             "flat" => Ok((self.cfg.fee_base_msat, self.cfg.fee_ppm)),
             "utilization" => {
-                let cap = self.cfg.liquidity_cap_sat;
+                let cap = self.cfg.liquidity_cap();
                 let uu = if cap > 0 { (self.committed_sat() as f64 / cap as f64).min(1.0) } else { 0.0 };
                 let lo = py_u64(st.get("ppm_min")).unwrap_or(self.cfg.fee_ppm);
                 let hi = py_u64(st.get("ppm_max")).unwrap_or(self.cfg.fee_ppm);
@@ -2278,10 +2416,16 @@ impl RouteHub {
         let pay_to = terms.get("payTo").and_then(Value::as_str).ok_or_else(|| ChannelError::new("bad_offer", "payTo"))?.to_string();
         let ex = terms.get("extra").cloned().unwrap_or(Value::Null);
         let close_fee = py_u64(ex.get("closeFeeSat")).ok_or_else(|| ChannelError::new("bad_offer", "closeFeeSat"))?;
+        // AGP-104 (R1): the remainder of this ch2 returns to an address the operator controls. A
+        // hook that fails funds nothing: a ch2 is never funded on its own key because the wallet
+        // was away
+        let ret = self.return_spk()?;
         let mut p = ChannelParams::derive(&hex::decode(&pay_to).map_err(|_| ChannelError::new("bad_offer", "payTo"))?, &ecdsa::pubkey(&secret),
-                                          expiry, close_fee, None, &self.network, self.cfg.ch2_close_fee_payer)?;
+                                          expiry, close_fee, ret, &self.network, self.cfg.ch2_close_fee_payer)?;
         p.capacity = cap;
         let address = segwit_address(&self.cfg.hrp, &p.spk())?;
+        // AGP-104: a wallet that cannot fund now (no fee rate) says so before a record exists
+        self.wallet.preflight()?;
         self.preflight_ch2(origin, terms, &p)?;
         let tip = self.chain.block_count()?;
         let oc = OutChannel::fresh(origin, &pay_to, p, &secret, "funding", py_u64(ex.get("settleMultiple")).unwrap_or(20), terms, tip);
@@ -2314,13 +2458,18 @@ impl RouteHub {
                 return fail("pay_to_limit", format!("payTo {}... has {} live ch2s ({}): ch2_max_per_pay_to {limit}",
                                                     pay_to.get(..16).unwrap_or(&pay_to), others.len(), some.join(", ")));
             }
-            if self.cfg.liquidity_cap_sat > 0 {
+            let limit_sat = self.cfg.liquidity_cap();
+            if limit_sat > 0 {
                 // AGP-094: nothing is taken off for the ch2 this replaces (its /terms now name
                 // another payTo). It goes to the archive unspent and `committed` goes on counting
                 // it there, so taking it off here funded one ch2 past the cap
                 let c = committed(&b);
-                if c.saturating_add(cap) > self.cfg.liquidity_cap_sat {
-                    return fail("liquidity_cap", format!("{c} + {cap} sat > liquidity_cap_sat {}", self.cfg.liquidity_cap_sat));
+                // AGP-104: a first funding leaves `capital_sat`'s spare free; one funded ahead uses it
+                let spare = if ahead { 0 } else { self.cfg.spare_sat() };
+                if c.saturating_add(cap).saturating_add(spare) > limit_sat {
+                    let what = if self.cfg.capital_sat > 0 { "capital_sat" } else { "liquidity_cap_sat" };
+                    let kept = if spare > 0 { format!(" + {spare} kept for funding ahead") } else { String::new() };
+                    return fail("liquidity_cap", format!("{c} + {cap} sat{kept} > {what} {limit_sat}"));
                 }
             }
             if ahead {
@@ -2423,12 +2572,15 @@ impl RouteHub {
     fn funded(&self, loc: Loc<'_>, oc: &OutChannel, txid: &str, vout: u32, cap: u64) -> Result<()> {
         let p = oc.params.clone().with_funding(txid, vout, cap)?;
         let refund = p.refund_tx(&oc.secret_key()?, None, None)?.to_hex(); // fallback; the watcher refunds at its own fee
+        // AGP-104: what the wallet paid for it, for the status's sum (None: the wallet does not say)
+        let fee = self.wallet.send_fee(txid).ok().flatten();
         self.upd(loc, oc, |c| {
             c.params = p;
             c.state = "funded".into();
             c.refund_hex = refund;
             c.fund_txid = txid.to_string();
             c.fund_vout = vout;
+            c.fund_fee = fee.or(c.fund_fee);
         })?;
         Ok(())
     }
@@ -2669,6 +2821,14 @@ impl RouteHub {
             Some(_) => None,
             None => return fail("bad_state", "the hub's channel to that provider changed"),
         };
+        // AGP-104 (R1): the next ch2 returns where this one does. One written ahead keeps the script
+        // every earlier attempt named (the provider may hold any of them); a ch2 on its own key
+        // (from before AGP-104) takes a return address for its next one
+        let ret = match &kept {
+            Some(k) => Some(k.params.payer_spk.clone()),
+            None if own_key(p) => self.return_spk()?,
+            None => Some(p.payer_spk.clone()),
+        };
         let (secret, expiry) = match &kept {
             Some(k) => {
                 let floor = crate::funding::open_expiry_floor(oc.term_u64("minExpiryBlocks").unwrap_or(0), oc.term_u64("minConf").unwrap_or(1),
@@ -2681,7 +2841,7 @@ impl RouteHub {
             }
             None => (adaptor::random_secret(), expiry),
         };
-        let nxt = ChannelParams::derive(&hex::decode(&oc.pay_to).unwrap_or_default(), &ecdsa::pubkey(&secret), expiry, p.close_fee, None,
+        let nxt = ChannelParams::derive(&hex::decode(&oc.pay_to).unwrap_or_default(), &ecdsa::pubkey(&secret), expiry, p.close_fee, ret,
                                         &self.network, p.close_fee_payer)?;
         let tx = p.rollover_tx(amount, &nxt.spk(), next_cap)?;
         let txid = tx.txid();
@@ -2790,6 +2950,7 @@ impl RouteHub {
         self.upd(loc, oc, |c| {
             c.close_prev = std::mem::replace(&mut c.state, "closing".into());
             c.close_txid = txid.clone();
+            c.close_cum = Some(cum);
             c.spend_seen = shown;
             // AGP-094: the refill this close owes is in the same write as the close. Written
             // after it, a stop in between left a provider with no ch2 and nothing owed
@@ -2967,8 +3128,15 @@ impl RouteHub {
                 // the same destination as the version it replaces (a refund_to hook may hand out a new address)
                 Some(Tx::parse_hex(&oc.refund_hex)?.outputs.first().map(|o| o.script_pubkey.clone()).ok_or_else(|| ChannelError::new("bad_state", "refund tx"))?)
             } else {
-                match lk(&self.refund_to).as_ref() {
+                let hooked = match lk(&self.refund_to).as_ref() {
                     Some(f) => Some(address_to_spk(&f()?, Some(&self.cfg.hrp)).map_err(|e| ChannelError::new("bad_address", e.to_string()))?),
+                    None => None,
+                };
+                match hooked {
+                    Some(d) => Some(d),
+                    // AGP-104 (R1): a ch2 that names its own key (from before it named a return
+                    // address) is refunded to one; any other refund pays its `payerSpk`
+                    None if own_key(p) => self.return_spk()?,
                     None => None,
                 }
             };
@@ -3178,6 +3346,8 @@ impl RouteHub {
             Ok(txs) => acts.extend(txs.into_iter().map(|t| json!({"event": "ch1_close", "txid": t}))),
             Err(e) => eprintln!("hub watcher ch1: {e}"),
         }
+        // AGP-104 (R1): what closes left on per-channel keys goes to the return address
+        acts.extend(self.sweep_tick(tip));
         acts
     }
 
@@ -3688,17 +3858,23 @@ impl RouteHub {
             // in the mempool: it may still be replaced or expire, so the ch2 is only closing and a
             // refund fee stays booked until it confirms
             if oc.state == "closing" && oc.close_txid == spender {
+                if oc.returned.is_none() {
+                    let back = returned_by(&tx, &oc.params);
+                    self.upd(loc, &oc, |c| c.returned = Some(back))?;
+                }
                 out.extend(self.refill_if_owed(loc, &oc));
                 return Ok(out);
             }
             let sp = spender.clone();
             let at_risk = refund_booked(&oc.state, &oc.close_prev);
+            let back = returned_by(&tx, &oc.params);
             self.upd(loc, &oc, |c| {
                 if c.state != "closing" {
                     c.close_prev = std::mem::take(&mut c.state);
                 }
                 c.state = "closing".into();
                 c.close_txid = sp;
+                c.returned = Some(back);
             })?;
             let mut ev = json!({"event": "ch2_closing", "provider": oc.origin, "chan": chan, "txid": spender, "by": "provider"});
             if at_risk {
@@ -3713,9 +3889,11 @@ impl RouteHub {
         let released = self.release_rolled(loc, &oc, "closed")?;
         let lost = if oc.refund_txid.is_empty() { 0 } else { oc.refund_fee };
         let sp = spender.clone();
+        let back = returned_by(&tx, &oc.params);
         self.upd(loc, &oc, |c| {
             c.state = "closed".into();
             c.close_txid = sp;
+            c.returned = Some(back);
             c.final_ = true;
             c.next = Map::new();
             if lost > 0 {
@@ -3978,6 +4156,446 @@ impl RouteHub {
             out.push(json!({"event": "secret_from_close", "provider": oc.origin, "lockId": lid, "close": tx.txid(), "ch1_completed": res.is_some()}));
         }
         out
+    }
+
+
+    // --- returns (AGP-104) -----------------------------------------------------------------------
+
+    /// The fee of a sweep now, and the least a sweep ever costs: a refund's rate (the node's
+    /// estimate for `refund_conf_target`, at least `refund_min_feerate`) or this node's mempool
+    /// floor if higher, on [`SWEEP_VSIZE`], never above `refund_max_fee_sat`.
+    fn sweep_fee(&self) -> (u64, u64) {
+        let floor = (self.cfg.refund_min_feerate * SWEEP_VSIZE as f64).ceil() as u64;
+        let mut rate = self.cfg.refund_min_feerate;
+        if let Ok(Some(r)) = self.scan.fee_rate(self.cfg.refund_conf_target) {
+            rate = rate.max(r);
+        }
+        if let Ok(Some(r)) = self.chain.mempool_min_fee() {
+            rate = rate.max(r);
+        }
+        (((rate * SWEEP_VSIZE as f64).ceil() as u64).min(self.cfg.refund_max_fee_sat.max(floor)), floor)
+    }
+
+    /// Rule R2: what the chain shows of the sweep `txid` of `outpoint` (`txid:vout`), which was
+    /// written ahead. `funding`: the channel funding whose spend put the coin on `outpoint`.
+    /// `gone_at` (kept by the caller): the tip when the sweep's own output was first seen spent
+    /// again, for a wallet that spends what it was paid before the sweep is deep.
+    fn sweep_look(&self, txid: &str, outpoint: &str, funding: (&str, u32), gone_at: &mut u32, tip: u32) -> Result<Look> {
+        let depth = self.cfg.spend_final_depth.max(1);
+        if self.chain.get_tx_out(txid, 0, false)?.is_some_and(|u| u.confirmations >= depth) {
+            return Ok(Look::Final);
+        }
+        if self.chain.get_tx_out(txid, 0, true)?.is_some() {
+            *gone_at = 0;
+            return Ok(Look::Wait);
+        }
+        let (stx, svout) = outpoint.rsplit_once(':').and_then(|(t, n)| Some((t, n.parse::<u32>().ok()?))).ok_or_else(|| ChannelError::new("bad_state", "sweep outpoint"))?;
+        if self.chain.get_tx_out(stx, svout, true)?.is_some() {
+            // the coin is still where the sweep takes it from: the sweep left the mempool
+            *gone_at = 0;
+            return Ok(Look::Resend);
+        }
+        if self.chain.get_tx_out(funding.0, funding.1, true)?.is_some() {
+            // the spend the coin came from left the chain (a reorg): it comes back first
+            *gone_at = 0;
+            return Ok(Look::Wait);
+        }
+        // the coin left `outpoint` and the sweep's output is not there: only this sweep was ever
+        // signed for it, so it confirmed and what it paid was spent on. Counted from here
+        if *gone_at == 0 {
+            *gone_at = tip;
+        }
+        Ok(if tip.saturating_sub(*gone_at).saturating_add(1) >= depth { Look::Final } else { Look::Wait })
+    }
+
+    /// Change ch1's sweep note (`extra.sweep`: `{gone_at, final, skipped}`) and save it.
+    fn ch1_sweep_note(&self, ch1: &str, f: impl FnOnce(&mut Map<String, Value>)) -> Result<()> {
+        let mut l = self.inbound.ledger_lock();
+        let Some(mut st) = l.channels.get(ch1).cloned() else { return Ok(()) };
+        let mut sw = st.extra.get("sweep").and_then(Value::as_object).cloned().unwrap_or_default();
+        f(&mut sw);
+        st.extra.insert("sweep".into(), Value::Object(sw));
+        self.inbound.save_state(&mut l, &st)
+    }
+
+    /// AGP-104 (R1): one closed ch1. Its close paid the hub on that channel's own payee key; once
+    /// that output is `spend_final_depth` deep it is swept to the return address
+    /// ([`Provider::sweep_payee`]: written ahead, then sent), and the sweep is watched until it is
+    /// that deep itself. An output under the least a sweep costs plus dust is left (`skipped`).
+    fn sweep_ch1(&self, ch1: &str, tip: u32) -> Result<Vec<Value>> {
+        let Some(st) = self.ch1_state(ch1) else { return Ok(vec![]) };
+        if st.closed_txid.is_empty() || sweep_done(st.extra.get("sweep")) {
+            return Ok(vec![]);
+        }
+        let p = &st.params;
+        let ev = |e: Value| {
+            self.event(e.clone());
+            Ok(vec![e])
+        };
+        let skip = |why: &str, value: u64| -> Result<Vec<Value>> {
+            self.ch1_sweep_note(ch1, |sw| {
+                sw.insert("final".into(), true.into());
+                sw.insert("skipped".into(), why.into());
+            })?;
+            ev(json!({"event": "ch1_sweep_skipped", "chan": ch1, "value": value, "why": why}))
+        };
+        if let Some(i) = st.extra.get("payee_sweep_intent").filter(|i| i.get("hex").and_then(Value::as_str).is_some()) {
+            let was = py_u64(st.extra.get("sweep").and_then(|s| s.get("gone_at"))).unwrap_or(0) as u32;
+            let mut gone = was;
+            let (txid, hex_) = (py_str(i.get("txid")), py_str(i.get("hex")));
+            let look = self.sweep_look(&txid, &py_str(i.get("outpoint")), (&p.funding_txid(), p.funding_vout()), &mut gone, tip)?;
+            if gone != was {
+                self.ch1_sweep_note(ch1, |sw| {
+                    sw.insert("gone_at".into(), gone.into());
+                })?;
+            }
+            return match look {
+                Look::Wait => Ok(vec![]),
+                Look::Final => {
+                    self.ch1_sweep_note(ch1, |sw| {
+                        sw.insert("final".into(), true.into());
+                    })?;
+                    ev(json!({"event": "ch1_swept", "chan": ch1, "txid": txid, "swept": i.get("swept"), "fee": i.get("fee")}))
+                }
+                Look::Resend => match self.chain.send_raw_transaction(&hex_) {
+                    Ok(_) => ev(json!({"event": "ch1_sweep_resent", "chan": ch1, "txid": txid})),
+                    Err(e) => ev(json!({"event": "ch1_sweep_failed", "chan": ch1, "txid": txid, "error": e.to_string().chars().take(200).collect::<String>()})),
+                },
+            };
+        }
+        if st.extra.contains_key("payee_sweep") {
+            // swept by an operator's tool before the hub swept (no bytes kept to send again)
+            self.ch1_sweep_note(ch1, |sw| {
+                sw.insert("final".into(), true.into());
+            })?;
+            return Ok(vec![]);
+        }
+        let Some((txid, vout, value)) = self.inbound.payee_output(ch1)? else {
+            return skip("the close pays nothing to this channel's key", 0);
+        };
+        let depth = self.cfg.spend_final_depth.max(1);
+        if !self.chain.get_tx_out(&txid, vout, false)?.is_some_and(|u| u.confirmations >= depth) {
+            // not six deep yet. Given up only when this node shows no such output at all, long
+            // after the payer's refund became valid: one that is there and shallow is waited for
+            if tip > p.expiry.saturating_add(SWEEP_GIVE_UP_BLOCKS) && self.chain.get_tx_out(&txid, vout, true)?.is_none() {
+                return skip("its close is not on the chain", value);
+            }
+            return Ok(vec![]);
+        }
+        let (fee, floor) = self.sweep_fee();
+        if value < floor.saturating_add(DUST) {
+            return skip("under the cost of a sweep plus dust", value);
+        }
+        if value < fee.saturating_add(DUST) {
+            return Ok(vec![]); // the fee is above what this output bears now: looked at again next block
+        }
+        let Some(dest) = self.return_spk()? else { return Ok(vec![]) };
+        let rec = self.inbound.sweep_payee(ch1, &dest, fee)?;
+        ev(json!({"event": "ch1_sweep", "chan": ch1, "txid": rec.get("txid"), "value": value, "fee": fee, "swept": rec.get("swept")}))
+    }
+
+    /// AGP-104 (R1): one ch2 record whose close or refund is final and which named no return
+    /// address (a ledger from before AGP-104, or a hub that ran without the hook): what that
+    /// spend left on the ch2's own payer key is swept to the return address, written ahead and
+    /// watched as a ch1's sweep is.
+    fn sweep_ch2(&self, loc: Loc<'_>, tip: u32) -> Result<Vec<Value>> {
+        let Some(oc) = self.get(loc).filter(sweepable) else { return Ok(vec![]) };
+        let p = &oc.params;
+        let chan = p.channel_id();
+        let ev = |e: Value| {
+            self.event(e.clone());
+            Ok(vec![e])
+        };
+        let skip = |why: &str| -> Result<Vec<Value>> {
+            self.upd(loc, &oc, |c| {
+                c.sweep.insert("final".into(), true.into());
+                c.sweep.insert("skipped".into(), why.into());
+            })?;
+            Ok(vec![])
+        };
+        if let Some(hex_) = oc.sweep.get("hex").and_then(Value::as_str) {
+            let was = py_u64(oc.sweep.get("gone_at")).unwrap_or(0) as u32;
+            let mut gone = was;
+            let txid = py_str(oc.sweep.get("txid"));
+            let look = self.sweep_look(&txid, &py_str(oc.sweep.get("outpoint")), (&p.funding_txid(), p.funding_vout()), &mut gone, tip)?;
+            if gone != was {
+                self.upd(loc, &oc, |c| {
+                    c.sweep.insert("gone_at".into(), gone.into());
+                })?;
+            }
+            return match look {
+                Look::Wait => Ok(vec![]),
+                Look::Final => {
+                    self.upd(loc, &oc, |c| {
+                        c.sweep.insert("final".into(), true.into());
+                    })?;
+                    ev(json!({"event": "ch2_swept", "provider": oc.origin, "chan": chan, "txid": txid, "swept": oc.sweep.get("swept"), "fee": oc.sweep.get("fee")}))
+                }
+                Look::Resend => match self.chain.send_raw_transaction(hex_) {
+                    Ok(_) => ev(json!({"event": "ch2_sweep_resent", "provider": oc.origin, "chan": chan, "txid": txid})),
+                    Err(e) => ev(json!({"event": "ch2_sweep_failed", "provider": oc.origin, "chan": chan, "txid": txid,
+                                        "error": e.to_string().chars().take(200).collect::<String>()})),
+                },
+            };
+        }
+        // what is on its key: an output of the spend the record names
+        let depth = self.cfg.spend_final_depth.max(1);
+        let mut src: Option<(String, u32, u64)> = None;
+        let spenders: Vec<&String> = [&oc.close_txid, &oc.refund_txid].into_iter().filter(|t| !t.is_empty()).collect();
+        for t in &spenders {
+            for n in 0..3u32 {
+                if let Some(u) = self.chain.get_tx_out(t, n, false)?.filter(|u| u.script_pubkey == p.payer_spk && u.confirmations >= depth) {
+                    src = Some(((*t).clone(), n, u.value));
+                }
+            }
+        }
+        if src.is_none() && oc.state == "closed" && oc.close_txid.is_empty() {
+            // closed by a spend this node never showed: one look at the UTXO set for this key
+            src = self.scan.scan_spk(&p.payer_spk)?.into_iter().next();
+        }
+        let Some((stx, svout, value)) = src else { return skip("nothing on its own key") };
+        let (fee, floor) = self.sweep_fee();
+        if value < floor.saturating_add(DUST) {
+            return skip("under the cost of a sweep plus dust");
+        }
+        if value < fee.saturating_add(DUST) {
+            return Ok(vec![]);
+        }
+        let Some(dest) = self.return_spk()? else { return Ok(vec![]) };
+        let op = OutPoint::from_display(&stx, svout).map_err(|_| ChannelError::new("bad_state", "sweep outpoint"))?;
+        let mut tx = Tx::new(2, vec![TxIn::new(op, 0xFFFF_FFFD)], vec![TxOut::new((value - fee) as i64, dest.clone())], 0);
+        sign_p2wpkh(&oc.secret_key()?, &mut tx, &[TxOut::new(value as i64, p.payer_spk.clone())], 0)?;
+        let (txid, hex_) = (tx.txid(), tx.to_hex());
+        let rec = json!({"txid": txid, "hex": hex_, "outpoint": format!("{stx}:{svout}"), "value": value, "fee": fee, "swept": value - fee,
+                         "dest_spk": hex::encode(&dest), "at": tip});
+        // write-ahead (R2): the one sweep of this output, before it is sent
+        if self.upd(loc, &oc, |c| c.sweep = rec.as_object().cloned().unwrap_or_default())?.is_none() {
+            return Ok(vec![]);
+        }
+        self.stop("sweep")?;
+        if let Err(e) = self.chain.send_raw_transaction(&hex_) {
+            return ev(json!({"event": "ch2_sweep_failed", "provider": oc.origin, "chan": chan, "txid": txid,
+                             "error": e.to_string().chars().take(200).collect::<String>()}));
+        }
+        ev(json!({"event": "ch2_sweep", "provider": oc.origin, "chan": chan, "txid": txid, "value": value, "fee": fee, "swept": value - fee}))
+    }
+
+    /// AGP-104 (rule R1): sweep what closes left on per-channel keys to the return address, and
+    /// watch the sweeps already out (rule R2). Once a block, and only with a return hook set.
+    /// Every closed ch1 not yet swept for good, then every ch2 record that named no return
+    /// address. Errors are per channel (`sweep_error`) and are tried again next block.
+    pub fn sweep_tick(&self, tip: u32) -> Vec<Value> {
+        if lk(&self.return_to).is_none() || lk(&self.sweep_tip).replace(tip) == Some(tip) {
+            return vec![];
+        }
+        let mut acts = vec![];
+        let ch1s: Vec<String> = self.inbound.ledger_lock().channels.iter()
+            .filter(|(_, s)| !s.closed_txid.is_empty() && !sweep_done(s.extra.get("sweep"))).map(|(c, _)| c.clone()).collect();
+        for ch1 in ch1s {
+            match self.sweep_ch1(&ch1, tip) {
+                Ok(mut a) => acts.append(&mut a),
+                Err(e) => self.sweep_error("ch1", &ch1, &e),
+            }
+        }
+        let (live, old): (Vec<String>, Vec<usize>) = {
+            let b = lk(&self.out);
+            (b.chans.iter().filter(|(_, c)| sweepable(c)).map(|(o, _)| o.clone()).collect(),
+             b.archived.iter().enumerate().filter(|(_, r)| OutChannel::from_json(r).is_ok_and(|c| sweepable(&c))).map(|(i, _)| i).collect())
+        };
+        let locs = live.iter().map(|o| Loc::Live(o)).chain(old.into_iter().map(Loc::Archived));
+        for loc in locs {
+            if let Err(e) = self.sweep_ch2(loc, tip).map(|mut a| acts.append(&mut a)) {
+                self.sweep_error("ch2", &self.get(loc).map(|c| c.params.channel_id()).unwrap_or_default(), &e);
+            }
+        }
+        acts
+    }
+
+    fn sweep_error(&self, what: &str, chan: &str, e: &ChannelError) {
+        let msg: String = e.to_string().chars().take(200).collect();
+        eprintln!("hub watcher sweep {what} {chan}: {msg}");
+        self.event(json!({"event": "sweep_error", "what": what, "chan": chan, "error": msg}));
+    }
+
+    // --- status (AGP-104) ------------------------------------------------------------------------
+
+    /// Where the hub's coins are, for its operator. `wallet_sat`: what the hub's wallet holds
+    /// (None: not known; the sums that need it are null).
+    ///
+    /// Four numbers, each coin in exactly one:
+    /// * `capitalSat`: free, in the wallet;
+    /// * `inChannelsSat`: the hub's side of its ch2s (the capacity less what it signed to the
+    ///   provider), and what a close or refund left on a ch2's own key until its sweep is out;
+    /// * `earnedSat`: signed to the hub by clients and not in the wallet yet (open ch1s, and
+    ///   closed ones until their sweep is out);
+    /// * `stuckSat`: the part of a ch2 a lock without an answer may still take (held, written
+    ///   off), each listed in `stuck` with the block by which it resolves.
+    ///
+    /// Rule: `capitalSat + inChannelsSat + earnedSat + stuckSat = depositsSat + feesEarnedSat −
+    /// chainFeesSat − dustSat`, to the sat, between two watcher ticks with nothing in flight.
+    /// `feesEarnedSat` is what clients signed to the hub less what the hub signed to providers
+    /// (negative while a provider's dust floor is above what its client paid). `chainFeesSat`:
+    /// the fundings', refunds' and sweeps' miner fees and the close fees the hub pays.
+    /// `dustSat`: left on a channel key because a sweep would cost more than it moves.
+    /// `depositsSat` is derived from the others: what the operator sent in, less what was taken
+    /// out. `estimated`: a term was not read off the chain or the wallet (a ledger from before
+    /// AGP-104, a wallet that does not report fees). `unsettled`: a funding is being reconciled.
+    pub fn status(&self, wallet_sat: Option<u64>) -> Value {
+        let tip = self.chain.block_count().ok();
+        let depth = self.cfg.spend_final_depth.max(1);
+        let late = |l: &Map<String, Value>| !l.is_empty() && now_f() - l.get("at").and_then(Value::as_f64).unwrap_or(0.0) >= self.reveal_timeout();
+        let (recs, sellers, committed_sat) = {
+            let b = lk(&self.out);
+            let mut recs: Vec<OutChannel> = b.chans.values().chain(b.next_chans.values()).cloned().collect();
+            recs.extend(b.archived.iter().filter_map(|r| OutChannel::from_json(r).ok()));
+            let sellers: Vec<Value> = b.chans.iter().map(|(o, c)| {
+                let one = |c: &OutChannel| json!({"state": c.state, "chan": c.params.channel_id(), "capacitySat": c.params.capacity, "paidSat": c.signed,
+                                                  "roomSat": c.params.max_amount().saturating_sub(c.signed), "expiry": c.params.expiry, "blocked": c.blocked});
+                let mut v = one(c);
+                v["origin"] = o.as_str().into();
+                v["payTo"] = c.pay_to.as_str().into();
+                v["next"] = b.next_chans.get(o).map(one).unwrap_or(Value::Null);
+                v
+            }).collect();
+            (recs, sellers, committed(&b))
+        };
+        // a ch2's coins that a rollover carried into its child
+        let carried: HashMap<String, u64> = recs.iter().filter(|c| !c.rolled_from.is_empty() && c.state != "dropped" && c.params.funding.is_some())
+            .map(|c| (c.rolled_from.clone(), c.params.capacity)).collect();
+        let (mut in_ch, mut stuck_sat, mut out, mut chain, mut dust) = (0u64, 0u64, 0u64, 0u64, 0u64);
+        let (mut estimated, mut unsettled, mut sweeps) = (false, false, 0u64);
+        let mut stuck: Vec<Value> = vec![];
+        // (ch1, lockId) of every lock a ch2 record still holds
+        let mut on_ch2: HashSet<(String, String)> = HashSet::new();
+        for c in &recs {
+            let p = &c.params;
+            if !c.final_ {
+                let mut locks: Vec<(&Map<String, Value>, &str)> = c.stale.iter().filter_map(Value::as_object).map(|l| (l, "written off")).collect();
+                if !c.pending.is_empty() {
+                    on_ch2.insert((py_str(c.pending.get("ch1")), py_str(c.pending.get("lockId"))));
+                    if late(&c.pending) {
+                        locks.push((&c.pending, "no answer"));
+                    }
+                }
+                let grace = if c.signed >= p.min_amount() { self.cfg.refund_grace_blocks } else { 0 };
+                let by = if c.gone_at > 0 { c.gone_at.saturating_add(depth - 1) } else { p.expiry.saturating_add(grace).saturating_add(depth) };
+                for (l, kind) in locks {
+                    on_ch2.insert((py_str(l.get("ch1")), py_str(l.get("lockId"))));
+                    stuck.push(json!({"lockId": l.get("lockId"), "seller": c.origin, "amountSat": py_u64(l.get("d")).unwrap_or(0), "kind": kind,
+                                      "hubSat": py_u64(l.get("cum")).unwrap_or(0).saturating_sub(c.signed), "resolvesBy": by}));
+                }
+            }
+            if c.state == "funding" || (c.state == "dropped" && !c.final_) {
+                unsettled = true; // the wallet may have paid for it: the watcher is finding out
+                continue;
+            }
+            if p.funding.is_none() || c.state == "dropped" {
+                continue;
+            }
+            let (cap, pf) = (p.capacity, p.payer_fee());
+            if c.rolled_from.is_empty() {
+                match c.fund_fee {
+                    Some(f) => chain = chain.saturating_add(f),
+                    None => estimated = true,
+                }
+            }
+            if !c.final_ && (["funded", "open"].contains(&c.state.as_str()) || (c.state == "closing" && !c.spend_seen)) {
+                // the highest state a lock without an answer could still close this ch2 with
+                let waiting = if late(&c.pending) { py_u64(c.pending.get("cum")).unwrap_or(0) } else { 0 };
+                let top = c.stale.iter().map(|l| py_u64(l.get("cum")).unwrap_or(0)).fold(waiting, u64::max);
+                let mine = cap.saturating_sub(c.signed);
+                let held = top.saturating_sub(c.signed).min(mine);
+                (stuck_sat, in_ch, out) = (stuck_sat + held, in_ch + (mine - held), out + c.signed);
+                continue;
+            }
+            if let Some(child) = carried.get(&p.channel_id()).filter(|_| ["rolled", "closed", "closing"].contains(&c.state.as_str())) {
+                (out, chain) = (out + cap.saturating_sub(*child).saturating_sub(pf), chain + pf);
+                continue;
+            }
+            let (back, on_key) = if refund_booked(&c.state, &c.close_prev) {
+                chain += c.refund_fee;
+                let dest = Tx::parse_hex(&c.refund_hex).ok().and_then(|t| t.outputs.first().map(|o| o.script_pubkey.clone()));
+                (cap.saturating_sub(c.refund_fee), own_key(p) && dest.is_some_and(|d| d == p.payer_spk))
+            } else {
+                let back = match (c.returned, c.close_cum) {
+                    (Some(r), _) => r.min(cap),
+                    (None, Some(cum)) => cap.saturating_sub(pf).saturating_sub(cum),
+                    (None, None) => {
+                        estimated = true;
+                        cap.saturating_sub(pf).saturating_sub(c.signed)
+                    }
+                };
+                (out, chain) = (out + cap.saturating_sub(back).saturating_sub(pf), chain + pf);
+                (back, own_key(p))
+            };
+            if on_key && back > 0 {
+                if c.sweep.get("txid").is_some_and(Value::is_string) {
+                    chain += py_u64(c.sweep.get("fee")).unwrap_or(0);
+                } else if truthy(c.sweep.get("final")) {
+                    dust += back;
+                } else {
+                    in_ch += back;
+                }
+                if !truthy(c.sweep.get("final")) {
+                    sweeps += 1;
+                }
+            }
+        }
+        let (mut earned, mut inn) = (0u64, 0u64);
+        {
+            let l = self.inbound.ledger_lock();
+            for (ch1, st) in l.channels.iter() {
+                let ex = &st.extra;
+                // locks on ch1 that no ch2 record holds: an orphan the next tick drops, or a hold nothing releases before ch1 closes
+                let lone = |x: &Value| truthy(Some(x)) && !on_ch2.contains(&(ch1.clone(), py_str(x.get("lockId"))));
+                if let Some(rl) = ex.get("route_lock").filter(|x| lone(x) && x.as_object().is_some_and(late)) {
+                    stuck.push(json!({"lockId": rl.get("lockId"), "seller": rl.get("provider"), "amountSat": py_u64(rl.get("d")).unwrap_or(0), "kind": "orphaned",
+                                      "hubSat": 0, "resolvesBy": tip}));
+                }
+                for s in ex.get("stale_locks").and_then(Value::as_array).into_iter().flatten().filter(|x| lone(x)) {
+                    stuck.push(json!({"lockId": s.get("lockId"), "seller": s.get("provider"), "amountSat": py_u64(s.get("d")).unwrap_or(0), "kind": "held",
+                                      "hubSat": 0, "resolvesBy": st.params.expiry}));
+                }
+                if st.closed_txid.is_empty() {
+                    (earned, inn) = (earned + st.best_cum, inn + st.best_cum);
+                    if st.best_cum > 0 && tip.is_some_and(|t| t > st.params.expiry) {
+                        unsettled = true; // past its expiry and not closed: the payer may have refunded it
+                    }
+                    continue;
+                }
+                let fee = st.params.payee_fee();
+                let v = match ex.get("close_paid").and_then(Value::as_u64) {
+                    Some(v) => v,
+                    None => {
+                        estimated = true;
+                        st.params.payee_value(st.best_cum)
+                    }
+                };
+                (inn, chain) = (inn + v + fee, chain + fee);
+                let kid = py_u64(ex.get("close_bump").and_then(|b| b.get("fee"))).unwrap_or(0).min(v);
+                let done = sweep_done(ex.get("sweep"));
+                if let Some(i) = ex.get("payee_sweep_intent").or(ex.get("payee_sweep")) {
+                    chain += v.saturating_sub(py_u64(i.get("swept")).unwrap_or(0));
+                } else if done {
+                    (dust, chain) = (dust + (v - kid), chain + kid);
+                } else {
+                    (earned, chain) = (earned + (v - kid), chain + kid);
+                }
+                if !done {
+                    sweeps += 1;
+                }
+            }
+        }
+        let fees = inn as i128 - out as i128;
+        let total = wallet_sat.map(|w| w as i128 + in_ch as i128 + earned as i128 + stuck_sat as i128);
+        let deposits = total.map(|t| t - fees + chain as i128 + dust as i128);
+        let i = |v: i128| Value::from(v as i64);
+        json!({"capitalSat": wallet_sat, "inChannelsSat": in_ch, "earnedSat": earned, "stuckSat": stuck_sat, "totalSat": total.map(i),
+               "feesEarnedSat": i(fees), "routedInSat": inn, "routedOutSat": out, "chainFeesSat": chain, "dustSat": dust,
+               "depositsSat": deposits.map(i), "estimated": estimated, "unsettled": unsettled, "sweepsPending": sweeps,
+               "capitalSetting": Some(self.cfg.capital_sat).filter(|c| *c > 0), "liquidityCapSat": self.cfg.liquidity_cap(), "committedSat": committed_sat,
+               "tip": tip, "spendFinalDepth": depth, "stuck": stuck, "sellers": sellers, "payTo": self.pay_to, "network": self.network,
+               "returns": lk(&self.return_to).is_some()})
     }
 
     /// Run [`RouteHub::watch_tick`] every `interval` on a thread until the returned flag is set.

@@ -34,6 +34,7 @@ cargo build -j2 --release --target aarch64-unknown-linux-gnu -p xbt402
 ./scripts/conformance.sh           # N/N byte-identical, both directions
 ./scripts/regtest_interop.sh       # Rust <-> Python on a private Knots 29.4.2 regtest node
 ./scripts/signer_interop.sh        # AGP-027: the AGP-017 runbook with the Rust signer behind B2's MCP, + a Rust payer
+./scripts/hub_returns_regtest.sh    # AGP-104: the hub's full cycle on regtest (Rust and Python hub), no coin left on a per-channel key, /status to the sat, start-up checks
 ./scripts/route_interop.sh         # routed: every client x hub x provider (Rust/Python), the all-Rust demo, + a Rust payer on the Rust signer
 cargo run --release -p xbt402 --example adaptor_bench
 ./scripts/build_matrix.sh          # every AGP-031 target; writes dist/MATRIX.md
@@ -2205,6 +2206,87 @@ ch1; `lock_outstanding` from a provider for an invoice another channel was told 
   open it, then refused `open_unresolved` until the owner calls `forget_unfunded`.
 
 New dependency: none (`cargo tree -d` is unchanged).
+
+## The hub's returns, status and start-up checks (AGP-104)
+
+Step 2 of the hub beside Lightning. Before it, two kinds of coin the hub got back stayed on keys only
+its state files know: the hub's remainder when a provider closed a ch2 (paid to that ch2's own payer
+key), and what clients paid, when a ch1 closed (paid to that ch1's own payee key). `sweep_payee`
+existed and nothing called it. On a 100,000 sat ch2 and one small payment that was 98,854 sat and 546
+sat with no tool to move either (`agp104_returns.rs::without_a_return_address_nothing_is_swept` is
+that state, kept as the library's default).
+
+**Rule R1: no coin of the hub's rests on a key only its state files know.** With a return address
+set (`RouteHub::set_return_to`; `xbt402-hub` sets a fresh bech32 address of its node wallet):
+
+| Where a coin comes back | What happens |
+|---|---|
+| a ch2 is funded (`connect`, a refill, a ch2 funded ahead) | its `payerSpk` is a return address, so the provider's close pays the remainder there. A hook that fails funds nothing (`return_address`) |
+| a ch2 rolls over | the next ch2 names the same return address. One written ahead keeps the script every earlier attempt named. A ch2 on its own key takes a return address for its next one |
+| a ch2 is refunded | to its `payerSpk`; a ch2 on its own key is refunded to a return address |
+| a ch1 closes (the client's close, its rollover, the margin close) | the watcher sweeps the payout once the close is `spend_final_depth` deep |
+| a ledger from before (ch2s on their own keys) | after the upgrade the watcher sweeps what a final close or refund left on each key |
+
+`return_spk()` in `hub.rs` is the one function every return goes through. A later link to a
+Lightning wallet changes its hook and nothing else.
+
+**Rule R2: one signed sweep per output.** A sweep is written to the ledger before it is sent
+(`payee_sweep_intent` on a ch1, `sweep` on a ch2 record). The same bytes are sent again each block
+until the chain has them. It is never signed again at another fee or to another address, by the hub
+or by `Provider::sweep_payee` called by hand. A sweep is `final` when it is `spend_final_depth` deep.
+
+| What can break R2 | What the code does | Test (`agp104_returns.rs`) |
+|---|---|---|
+| the close is in a block that is replaced | nothing is signed before the close's output is six deep | `nothing_is_swept_before_the_close_is_final` |
+| the send fails | the written sweep is sent again next block; fees and addresses that changed since are ignored | `a_failed_sweep_is_sent_again_with_the_same_bytes_and_never_signed_again` |
+| the hub stops between the write and the send | the next start sends the written sweep | `a_stop_between_the_write_and_the_send_leaves_one_sweep_that_the_next_start_sends` |
+| the sweep leaves the mempool, or its block is replaced | sent again; final only six deep | `a_sweep_that_leaves_the_mempool_goes_out_again` |
+| the wallet spends the swept coin before it is six deep | counted from the block the watcher first saw it gone | `a_wallet_that_spends_the_swept_coin_at_once_does_not_leave_the_sweep_open` |
+| the operator runs `sweep_payee` by hand | it gets the written sweep back | the second test above |
+
+Stated limits, one sentence each:
+
+- A sweep signed at a fee that later proves too low is not bumped: it waits in the mempool and is sent again each block.
+- A payout under 110 sat plus dust (656 sat at 1 sat/vB) is left on its ch1's key and counted as `dustSat`; one the current fee is too high for waits for a lower fee.
+- When fees are high the hub's close of a ch1 is bumped by a child that spends the payout (AGP-067), so less of it, or dust, is left to sweep.
+- The hook's address is asked for once per funded ch2 and once per sweep: a wallet restored from seed must look past addresses that were handed out and never paid.
+- The return address is an address of the node wallet, which every app on the same node can spend on Paul's Umbrel package: moving the float to the hub's own key is the next task.
+- Without a return hook (a library user that sets none) nothing changes: closes pay per-channel keys and nothing is swept.
+
+**Status.** `RouteHub::status(wallet_sat)`, served by `xbt402-hub` as `GET /status` (JSON) and as a
+page at `/` (`XBT_HUB_STATUS=off` serves neither; both are on the hub's public port and show no
+client's channel). Four numbers, each coin in exactly one:
+
+| Number | What it is |
+|---|---|
+| `capitalSat` | free, in the hub's wallet |
+| `inChannelsSat` | the hub's side of its ch2s, and what a close left on a ch2's own key until its sweep is out |
+| `earnedSat` | signed to the hub by clients and not in the wallet yet |
+| `stuckSat` | the part of a ch2 a lock without an answer may still take; each is in `stuck` with `resolvesBy`, the block of its ch2's refund six deep |
+
+`capitalSat + inChannelsSat + earnedSat + stuckSat = depositsSat + feesEarnedSat − chainFeesSat − dustSat`,
+to the sat, between two watcher ticks. `feesEarnedSat` is what clients signed to the hub less what
+the hub signed to providers; it is negative while a provider's dust floor (546 + its close fee) is
+above what its client has paid. `depositsSat` is derived from the others, so a test or an operator
+who knows what was sent in can check the rest. `estimated` is set when a term was not read off the
+chain or the wallet (a ledger from before, a wallet hook that reports no fee), `unsettled` while a
+funding is being reconciled.
+
+`capital_sat` is the operator's one setting: it is the liquidity cap, and with funding ahead on a
+seller is admitted only while its ch2 and one spare `ch2_capacity` fit under it. `ch2_expiry_blocks`
+ships as 1,153, a default seller's floor (it was 1,100 and was raised to 1,153 on every such open, so
+what is asked is unchanged).
+
+**Start-up checks (`xbt402-hub`).**
+
+- The node must be on XBT (`node_check.rs`): on mainnet block 961,640 has the pinned hash; on any other chain the checked block (101 on regtest, else the tip) has a 164-byte BLAKE2b header that commits its height and hashes to what the node says. While the node is below that block the hub waits. A configured `network` that is not the node's is refused.
+- Every funding states its fee rate: `node.fee_rate` or `XBT_HUB_FEE_RATE` (sat/vB), else the node's estimate for `node.fee_conf_target` blocks. With neither, `connect` answers `no_fee_rate` and writes no record.
+- `/readyz` is not ready while the wallet does not answer, and the hub's wallet is created with `load_on_startup`.
+
+Tests: `crates/xbt402-interop/tests/agp104_returns.rs` (20), `node_check.rs` and `status_page.rs`
+(unit), four in `xbt402-hub.rs`; B1 `tests/security/test_agp104_returns.py` (18, the same names; B1
+has the returns, the sweeps, `capital_sat` and the default, not the status page or the start-up
+checks). On regtest, through the real binaries: `./scripts/hub_returns_regtest.sh`.
 
 ## Fix wave 4: light client and Lightning (AGP-092)
 
