@@ -211,9 +211,22 @@ pub(crate) fn intent_open(st: &ChannelState) -> bool {
     st.closed_txid.is_empty() && truthy(st.extra.get("close_intent"))
 }
 
-/// Unresolved spends a channel keeps beside its latest intent (`close_intents`, AGP-085): a
-/// rollover past this is refused `channel_closing` before anything is signed.
+/// Unresolved spends a channel keeps beside its latest intent (`close_intents`, AGP-085).
+///
+/// AGP-088 rule: a channel never keeps more than this many, whatever its payer asks. Each spend
+/// written ahead is a signed transaction that can still confirm, so none is forgotten; the bound
+/// is kept by making no new one. A new spend comes only from a rollover (another next channel or
+/// amount) or from a close at another state. So once one slot is left ([`intents_full`]) a
+/// rollover is refused `channel_closing` and the channel's state no longer moves (a close's
+/// payload and `/x402/verify` raise nothing): every close is then the same transaction, and the
+/// last slot stays for the payee's own close, which is never refused.
 pub const MAX_KEPT_INTENTS: usize = 8;
+
+/// A spend of this channel is unresolved and one slot is left among the kept ones: no request
+/// makes another (see [`MAX_KEPT_INTENTS`]).
+pub(crate) fn intents_full(st: &ChannelState) -> bool {
+    intent_open(st) && st.extra.get("close_intents").and_then(Value::as_array).map_or(0, Vec::len) + 1 >= MAX_KEPT_INTENTS
+}
 
 /// Write `intent` ahead as the channel's `close_intent`. AGP-085: an earlier one for another
 /// transaction is not forgotten. It is complete and signed and can still confirm, so it moves to
@@ -858,7 +871,9 @@ impl Provider {
             l.channels.insert(cid.clone(), st);
             return Err(e);
         }
-        if truthy(req.get("payload")) && st.closed_txid.is_empty() {
+        // AGP-088: with the kept intents full the state stays where it is, so this close is the one
+        // already written ahead and makes no new one
+        if truthy(req.get("payload")) && st.closed_txid.is_empty() && !intents_full(&st) {
             let r = self.apply(&mut st, &req["payload"]);
             if let Err(e) = r {
                 return Err(if e.code == "bad_payload" { ChannelError::new("bad_request", e.msg) } else { e });
@@ -1415,7 +1430,9 @@ impl Provider {
             let height = self.height()?;
             let mut l = lock(&self.ledger);
             let mut st = l.channels[&cid].clone();
-            if cum > st.best_cum && st.closed_txid.is_empty() {
+            // (AGP-088: not once the kept intents are full: a higher state would make the watcher's
+            // next close another transaction)
+            if cum > st.best_cum && st.closed_txid.is_empty() && !intents_full(&st) {
                 st.best_cum = cum;
                 st.best_sig = sig_hex.to_string();
                 self.save_state(&mut l, &st)?;
@@ -1522,9 +1539,10 @@ impl Provider {
             return fail("bad_amount", format!("a rollover pays at least the best state {}", st.best_cum));
         }
         let txid = tx.txid();
-        if st.extra.get("close_intents").and_then(Value::as_array).is_some_and(|k| k.len() >= MAX_KEPT_INTENTS) {
-            // AGP-085: each one is kept until the chain settles it, and a client could ask without end
-            return fail("channel_closing", format!("{MAX_KEPT_INTENTS} earlier spends of this channel are unresolved: close it"));
+        if intents_full(&st) {
+            // AGP-085: each one is kept until the chain settles it, and a client could ask without end.
+            // AGP-088: one slot short of the bound, which the payee's own close may still need
+            return fail("channel_closing", format!("{} earlier spends of this channel are unresolved: close it", MAX_KEPT_INTENTS - 1));
         }
         set_intent(&mut st, json!({"hex": tx.to_hex(), "txid": txid, "cond": false, "next": format!("{txid}:1")}));
         self.save_state(&mut l, &st)?;

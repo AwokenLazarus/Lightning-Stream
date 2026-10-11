@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use xbt402::adaptor;
@@ -227,17 +227,6 @@ impl W {
         let r = self.lock(i);
         assert_eq!(r["status"], "paid", "{r}");
     }
-
-    /// p`i` (a colluding provider) names `lock_id` in its next invoice. The lockId of an invoice is
-    /// the provider's to choose; the hub takes it as it comes.
-    fn invoice_lock_id(&self, i: usize, lock_id: &str) {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
-        let mut st = self.provs[i].1.inner.routes().lock();
-        for s in st.sessions.values_mut() {
-            s.lock_id = lock_id.to_string();
-            s.valid_until = now + 8.0;
-        }
-    }
 }
 
 fn stream(pay: &RoutePayer, sh: &Arc<Shard>, n: usize) {
@@ -266,6 +255,12 @@ fn base1(w: &W) -> (u64, u128, u64) {
 
 /// Two written-off locks on one ch1 that carry the same lockId, each over its own ch2, both held in
 /// ch1's base. p1 keeps its pre-signature and refuses the hub's close request.
+///
+/// AGP-088: the hub no longer lets the second lock in under that lockId (`lock_held`:
+/// `agp088_hub.rs::a_lock_under_a_lock_id_ch1_holds_written_off_is_refused`), so the audit's way of
+/// making the pair (p1 names p0's lockId in its invoice) now ends at that refusal. The pair is put
+/// in the ledgers as a hub from before left it: p1's lock is written off under its own lockId and
+/// then carries p0's, on ch1 and on p1's ch2. The controls and everything after are the audit's.
 fn two_written_off_locks_under_one_lock_id(blocks: &[Option<u32>]) -> (W, String) {
     let w = W::with_ch2_blocks(blocks);
     w.paid(1); // ch1 has a state to close with
@@ -273,12 +268,13 @@ fn two_written_off_locks_under_one_lock_id(blocks: &[Option<u32>]) -> (W, String
     let r = w.lock(0);
     assert_eq!((r["status"].as_str(), r["error"].as_str()), (Some("refused"), Some("route_failed")), "{r}");
     let lid = w.stale1()[0]["lockId"].as_str().unwrap().to_string();
-    // the second provider names the same lockId in its invoice (its own T, its own ch2)
-    w.invoice_lock_id(1, &lid);
     w.provs[1].1.refuse.store(true, Ordering::SeqCst);
     w.provs[1].1.deaf.store(true, Ordering::SeqCst);
     let r = w.lock(1);
     assert_eq!((r["status"].as_str(), r["error"].as_str()), (Some("refused"), Some("route_failed")), "{r}");
+    // the second lock under the first one's lockId (its own T, its own ch2)
+    w.hub.inbound.with_state(&w.pay.chan().unwrap(), |st| st.extra["stale_locks"][1]["lockId"] = lid.as_str().into()).unwrap();
+    w.hub.with_out(|b| b.chans[w.provs[1].0.as_str()].stale[0]["lockId"] = lid.as_str().into());
     let stale = w.stale1();
     assert_eq!(stale.len(), 2, "control: both locks are written off and kept on ch1: {stale:?}");
     assert!(stale.iter().all(|s| s["lockId"] == lid.as_str() && s["hold"].is_object()), "control: one lockId, both held: {stale:?}");

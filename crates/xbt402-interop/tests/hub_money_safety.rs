@@ -576,6 +576,9 @@ fn a_rollover_into_a_closing_ch2s_next_channel_is_adopted() {
     w.chain.set_height(kept.params.expiry - 500);
     let ev = w.hub.rollover(&w.oc(0)).unwrap();
     assert_eq!(ev["event"], "ch2_close", "{ev}");
+    // AGP-088: the hub funds no refill on a close this node does not show; here the operator does
+    assert!(ev["refillError"].as_str().is_some_and(|e| e.starts_with("deferred")) && w.oc(0).params.payer_pub == oc.params.payer_pub, "{ev}");
+    w.hub.connect(w.origin(0), None, None).unwrap();
     assert_ne!(w.oc(0).params.payer_pub, oc.params.payer_pub, "the refill took the origin");
     let txid = w.provider_sends(0, &oc, &req);
     w.chain.mine(1);
@@ -585,6 +588,9 @@ fn a_rollover_into_a_closing_ch2s_next_channel_is_adopted() {
     let child = arch.iter().find(|c| c.params.funding_txid() == txid).expect("the next ch2 is on the books");
     assert!(child.secret == kept.secret && refund_spends_funding(child) && xbt402::hub::watched(&child.to_json()));
     assert_eq!(arch.iter().find(|c| c.params.payer_pub == oc.params.payer_pub).unwrap().state, "rolled");
+    // AGP-088: the adopted next ch2 is never opened, and its coins are the hub's until its refund:
+    // in the archive it counts against the cap like the live one
+    assert_eq!(w.hub.committed_sat(), w.oc(0).params.capacity + child.params.capacity);
 }
 
 #[test]
@@ -657,6 +663,34 @@ fn a_rollover_adopted_over_a_written_off_lock_releases_it_once_confirmed() {
     assert_eq!((stale1(&w), routed(&w)), (0, routed0));
     let new = w.oc(0);
     assert!(new.params.funding_txid() == txid && refund_spends_funding(&new));
+}
+
+#[test]
+fn an_earlier_attempt_adopted_over_a_written_off_lock_reports_what_it_paid() {
+    // AGP-088 (a nit of the AGP-085 review): an earlier-amount attempt is adopted by its script on
+    // one watcher pass (the record takes its outpoint), and with a lock written off the rollover is
+    // finished on a later pass, once it confirmed. That pass found the record at the spender's txid
+    // and reported the amount LAST asked for; the event now carries what this transaction paid
+    let w = W::new(1, true);
+    let oc = w.oc(0);
+    let k = w.keeps(0);
+    assert!(w.hub.rollover(&oc).is_err());
+    w.hub.with_out(|b| b.chans[0].signed += 1_000); // as locks routed since
+    let oc2 = w.oc(0);
+    assert!(w.hub.rollover(&oc2).is_err());
+    let kept = k.kept.lock().unwrap().clone();
+    let (first, second) = (kept[0].clone(), kept[1].clone());
+    let (r1, r2): (Value, Value) = (serde_json::from_slice(&first).unwrap(), serde_json::from_slice(&second).unwrap());
+    assert!(r1["amount"].as_u64() < r2["amount"].as_u64());
+    w.hub.with_out(|b| b.chans[0].stale.push(json!({"lockId": "gone", "ch1": "none", "cum": oc2.signed, "T": "", "pre": null})));
+    let txid = w.provider_sends(0, &oc2, &first);
+    let acts = w.hub.watch_tick();
+    assert!(!has(&acts, |a| a["event"] == "ch2_rollover"), "it waits for the rollover to confirm: {acts:?}");
+    assert_eq!(w.next(0).unwrap().params.funding_txid(), txid, "control: adopted by its script on the first pass");
+    w.chain.mine(1);
+    let acts = w.hub.watch_tick();
+    let ev = acts.iter().find(|a| a["event"] == "ch2_rollover").unwrap_or_else(|| panic!("{acts:?}"));
+    assert_eq!((ev["txid"].as_str(), &ev["amount"]), (Some(txid.as_str()), &r1["amount"]), "the amount last asked for was {}", r2["amount"]);
 }
 
 #[test]

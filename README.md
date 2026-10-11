@@ -2054,6 +2054,52 @@ a hub lock record holds `unitsBy`; `HotWallet::broadcast` may answer `rpc_error`
 answered `rpc_refused`; `open_channel`, `fund` and `xbt402_pay` may leave a pending channel
 behind an error.
 
+## Fix wave 4, the hub: one lock per ch2, "in a block", the watcher and the cap, what the client believes (AGP-088)
+
+The hub items of the second closure audit (AGP-087, list 1 items 1, 2, 12, 13 and the hub parts
+of 19). B1 has the same fixes and tests (`tests/security/test_agp088_hub.py`). Each fix keeps one
+rule, stated where the code keeps it.
+
+| item | the rule | before | now | tests |
+|---|---|---|---|---|
+| 1 two written-off locks under one lockId | a lock on ch1 is the lock of ONE ch2, and only that ch2's fate moves it (`hub::is_lock`) | a written-off lock was found, completed and released by its lockId, which is the provider's choice: when one of two completed or was released the other left ch1 with it, ch1 then closed below it, and its provider's later close was paid for nothing | every ch1 lock records the ch2 it went over (`ch2`, that ch2's payer key) and is matched by lockId and ch2; a completion also needs the `t` that opens the lock's own `T`; and a ch2 does not take a lock under a lockId ch1 still holds written off (`lock_held`, with the hub's view) | `agp087_hub_a.rs` `hole_h2_a_written_off_lock_is_dropped_*` (2), `agp088_hub.rs::a_lock_under_a_lock_id_ch1_holds_written_off_is_refused` |
+| 2 a hold released on a mempool-only close of an unconfirmed rollover child | a funding is spent for good only when the spend is in a block (`RouteHub::spent_in_block`) | "confirmed" was `gettxout(funding, false) == None`, which a node also answers for every output of an unconfirmed transaction: any spend of an unconfirmed child counted as confirmed, the ch2 became final and its hold left ch1 | "in a block" is the depth the scan found the spender at (`SpendScan::find_spend_at`: bitcoind's `gettxspendingprevout` is the mempool, a block read is a block), or without a depth an output of the spender in the confirmed set, or a funding the watcher saw confirmed while unspent (`fund_confirmed`). `MemChain` now answers `gettxout` without the mempool as a node does | `hole_h2_a_hold_is_released_on_an_unconfirmed_close_of_an_unconfirmed_rollover_child`, `agp088_hub.rs::a_hold_on_an_unconfirmed_child_is_released_once_its_close_is_in_a_block`, `::the_same_with_a_scan_that_does_not_say_how_deep_a_spender_is` |
+| 12a a rollover answered 200 and never broadcast | a ch2 leaves the watcher only on a spend in a block; no answer does that | the parent became `rolled`, which the watcher did not reconcile: its coins stayed in it past its expiry | `rolled` is watched until its rollover is in a block, and refunded at expiry like any ch2 if the rollover never comes | `agp087_hub_b.rs::hole_a_rollover_answered_200_*`, `agp088_hub.rs::a_rolled_ch2_is_watched_until_its_rollover_is_in_a_block` |
+| 12b the refill funded on the provider's word, outside the cap | coins count against `liquidity_cap_sat` until this node shows them leaving, and a refill is funded when it does | a close reply started the refill at once, and a `closing` ch2 no longer counted: a provider that named closes it never sent had the hub fund one more ch2 per cycle | the refill follows the close only when this node shows a spender of the funding (at once on the provider's own node; else `refillError: deferred` and the watcher funds it when it sees the close); `committed_sat` counts every record until then, archived ones too | `hole_a_close_the_provider_names_and_never_sends_stays_within_the_liquidity_cap`, `agp088_hub.rs::the_refill_follows_a_close_once_this_node_shows_it` |
+| 13 the routed client adopts a hub's claims without bound or proof | a completion is proved, a hold is bounded | each hold the hub claimed raised the client's next pre-signed state by one lock, and so did each completion it claimed | a completion is adopted only with the `t + r` that opens that lock's own point (the view's `secret`); at most `max_held_locks` (2) holds are adopted, and at that many the client pre-signs nothing and asks for the hub's view (`POST /x402/route/view`) | `hole_a_hub_that_lies_about_holds_*`, `agp088_hub.rs::a_completion_the_hub_claims_is_adopted_only_with_the_secret_that_opens_the_lock`, `::at_max_held_locks_nothing_more_is_signed_until_the_view_shows_a_hold_resolved`, `::the_view_is_answered_to_ch1s_own_auth_and_spends_its_seq` |
+| 19 kept intents | a channel never keeps more than `MAX_KEPT_INTENTS` unresolved spends | only a rollover was refused at the bound: closes one sat apart kept one each | once one slot is left a rollover is refused and the state no longer moves (a close's payload and `/x402/verify` raise nothing), so every close is the same transaction and the last slot is the payee's own close | `hole_unresolved_close_intents_are_not_bounded_*`, `agp088_hub.rs::once_the_kept_intents_are_full_no_request_moves_the_state`, `lifecycle.rs::unresolved_intents_are_bounded` |
+| 19 release order | the locks a confirmed spend did not pay leave ch1 before the ch2 record is final | the ch2 record was cleared and made final first: a stop before the ch1 write left a held lock nothing would release | ch1 first, then the record; the next tick finishes a stop in between and nothing is given back twice | `agp088_hub.rs::a_stop_between_the_ch1_release_and_the_ch2_record_is_finished_by_the_next_tick` |
+| 19 a lock pending on a ch2 that is not open | a pending lock is completed or written off wherever its ch2 record is | the watcher asked again (and wrote off) only on an open ch2: after a restart with the provider's close in the mempool, ch1 kept its lock in flight until its margin and the ch2 ended final with it pending | written off after `reveal_timeout` on any non-final record, held on ch1, released when the spend confirms without `t`; a ch2 with a pending lock is not replaced (`connect`: `lock_pending`) and its next ch2 does not take over until the lock is written off | `agp088_hub.rs::a_lock_pending_on_a_ch2_that_is_closing_is_written_off_and_resolved`, `::a_ch2_with_a_lock_pending_is_not_replaced_when_its_pay_to_changes`, `::a_next_ch2_does_not_take_over_from_under_a_pending_lock` |
+| nit: an adopted earlier attempt's event | | carried the amount last asked for on its second pass | the amount that transaction paid | `hub_money_safety.rs::an_earlier_attempt_adopted_over_a_written_off_lock_reports_what_it_paid` |
+
+On the wire: a refusal `lock_held` (400, with the view); `secret` in the hub's view of ch1; `POST
+/x402/route/view` (ch1's PAYMENT-SIGNATURE, an empty body) answers that view. `RoutePayerConfig` has
+`max_held_locks` and `held_probe_secs`.
+
+**Stated limits.**
+- *What a routed client trusts its hub for.* A hold cannot be proved (the client cannot see a ch2).
+  A hub that lies about holds gets the client to sign `max_held_locks - 1` locks, each at most
+  `max_lock_sat` plus its fee, above what it owes: one lock by default. With `max_held_locks: 1`
+  that is nothing, and one refusing provider then pauses the client's payments to its other
+  providers until that provider's ch2 resolves (at the latest its refund).
+- *A given-up lock recorded before this version* has no point kept: a completion of it is adopted
+  as before, on the hub's word (at most the 16 the client keeps).
+- *A ch2 rolled before this version* stays as it was (final, not watched): only ch2s rolled since
+  are refunded when their rollover never comes.
+- *A refill waits for the hub's own node.* A hub whose node lags the provider's funds the refill
+  when the close reaches it (the next tick), not at the provider's answer; a provider that never
+  closes gets no new ch2, and the operator's `connect` is refused past the cap while the old one
+  is unspent.
+- *"In a block" without a depth.* A custom `SpendScan` that only has `find_spend` leaves the hub
+  with the spender's outputs and `fund_confirmed`: a close of a ch2 never seen confirmed, whose
+  outputs are all spent again in the same block, stays `closing` (nothing is released early; it is
+  refunded or read again once the scan gives a depth). `fund_confirmed` is the watcher's last look:
+  a reorg that unconfirms a funding between two ticks is seen at the next one.
+- *One slot short.* A rollover is refused once 7 earlier spends are unresolved (it was 8), and with
+  the kept intents full a close takes no higher final state: it reports what it closed at.
+
+New dependency: none (`cargo tree -d` is unchanged).
+
 ## Portability
 
 No platform-specific dependencies: libsecp256k1 (C, via `secp256k1-sys`), pure-Rust hashes and JSON,

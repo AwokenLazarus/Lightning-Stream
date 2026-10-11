@@ -500,7 +500,8 @@ fn close_an_unrefunded_ch2_whose_close_vanished_stays_closing_and_is_refunded_at
     let acts = w.hub.watch_tick();
     assert_eq!(find(&acts, "ch2_close_vanished")["state"], "closing");
     assert_eq!((w.oc().state.as_str(), w.oc().close_txid.as_str()), ("closing", ""));
-    assert_eq!(w.hub.committed_sat(), 0); // never routed or rolled over again
+    // AGP-088: its coins are in that ch2 again and count until this node sees them leave (the refund)
+    assert_eq!(w.hub.committed_sat(), w.oc().params.capacity);
     w.hub.watch_tick();
     assert_eq!(w.events("ch2_close_vanished").len(), 1);
     w.chain.set_height(w.oc().params.expiry + w.hub.cfg.refund_grace_blocks);
