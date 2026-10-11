@@ -41,8 +41,7 @@ pub trait Transport: Send + Sync {
     /// [`request`](Self::request), given up with an error when no whole answer came `within` that
     /// long (AGP-105: the hub's check of a lock is bounded by its `revealTimeoutSec`, not by the
     /// transport's own timeout). The default has no bound but the transport's own, so a caller
-    /// that needs the bound also measures the time; [`UreqTransport`](crate::http::UreqTransport)
-    /// keeps it.
+    /// that needs the bound also measures the time; `http::UreqTransport` keeps it.
     fn request_within(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)], _within: std::time::Duration) -> Result<HttpResponse> {
         self.request(method, url, body, headers)
     }

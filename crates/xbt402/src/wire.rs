@@ -190,7 +190,7 @@ pub fn canonical_origin(url: &str) -> String {
 /// - a port that is not a decimal number below 65536.
 ///
 /// Case, a default port, a port's leading zeros and a trailing dot are not refused: both readings
-/// agree on them. [`crate::http::UreqTransport`] calls this on every request, and the payers call
+/// agree on them. `http::UreqTransport` calls this on every request, and the payers call
 /// it before anything is signed, funded or probed.
 pub fn sendable_url(url: &str) -> Result<String> {
     let refuse = |why: &str| Err(ChannelError::new("bad_request", format!("the URL {why}: its host could be read two ways, so nothing is paid or sent")));
