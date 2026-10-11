@@ -285,7 +285,7 @@ fn route_payer_pays_two_providers_through_one_hub_channel() {
         net.provider(&origin, &p);
         provs.push((origin, p));
     }
-    let hub_cfg = HubConfig::from_json(&json!({"fee_base_msat": 100, "fee_ppm": 2000, "max_lock_sat": 20000, "max_unguarded_lock_sat": 500,
+    let hub_cfg = HubConfig::from_json(&json!({"spend_final_depth": 1, "fee_base_msat": 100, "fee_ppm": 2000, "max_lock_sat": 20000, "max_unguarded_lock_sat": 500,
                                                "delta": 36, "reveal_timeout": 1.0, "ch2_capacity": 100000, "ch2_expiry_blocks": 1000,
                                                "close_margin": 36, "policy": {"min_capacity": 20000, "min_expiry_blocks": 500, "max_expiry_blocks": 8640}})).unwrap();
     let hub = Arc::new(RouteHub::new(chain.clone(), chain.clone(), Box::new(CmpWallet(chain.clone())), Box::new(net.clone()), secret("hub"), NET,

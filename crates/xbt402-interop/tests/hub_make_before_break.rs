@@ -62,7 +62,7 @@ struct W {
 /// zero_conf_rollover), a payer with ch1 open.
 fn world(zc_max: Option<u64>, zc: bool) -> W {
     let (chain, net, dir) = (MemChain::new(1000), MemNet::new(), TempDir::new());
-    let mut hc = HubConfig::from_json(&json!({"fee_base_msat": 100, "fee_ppm": 2000, "max_lock_sat": 20000, "max_unguarded_lock_sat": 500,
+    let mut hc = HubConfig::from_json(&json!({"spend_final_depth": 1, "fee_base_msat": 100, "fee_ppm": 2000, "max_lock_sat": 20000, "max_unguarded_lock_sat": 500,
                                               "delta": 36, "reveal_timeout": 1.0, "ch2_capacity": 100000, "ch2_expiry_blocks": 1000, "settle_lock_multiple": 0, "refill_ahead_locks": 0,
                                               "close_margin": 36,
                                               "policy": {"min_capacity": 20000, "min_expiry_blocks": 500, "max_expiry_blocks": 8640}})).unwrap();
@@ -204,8 +204,11 @@ fn provider_enforces_its_cap_and_margin_itself() {
     let r = w.lock(70);
     assert_eq!(r["error"], "route_failed", "{r}");
     assert_eq!(w.hub_refused("zero_conf_cap"), 1);
-    // the provider holds the refused lock's pre-signature: the child is not routed over again
-    assert_eq!(w.lock(1)["error"], "route_blocked");
+    // AGP-094: the provider refuses at the hub's check, before anything is pre-signed (this line
+    // asserted `route_blocked`: the provider held the refused lock's pre-signature). Nothing is
+    // written off and the child is not blocked: the next lock is put to the provider again
+    assert!(w.hub.out_channels().values().all(|c| c.stale.is_empty() && c.blocked.is_empty()));
+    assert_eq!(w.lock(1)["error"], "route_failed");
     // at the parent's close margin the provider takes nothing more on the unconfirmed child (here
     // parent and child expire together, so the margin is moved rather than the tip)
     let w = world(None, true);

@@ -182,7 +182,7 @@ fn sk(n: u64) -> SecretKey {
 }
 
 fn hub_cfg() -> HubConfig {
-    HubConfig::from_json(&json!({"fee_base_msat": 100, "fee_ppm": 2000, "max_lock_sat": 20000, "max_unguarded_lock_sat": 500, "delta": 36,
+    HubConfig::from_json(&json!({"spend_final_depth": 1, "fee_base_msat": 100, "fee_ppm": 2000, "max_lock_sat": 20000, "max_unguarded_lock_sat": 500, "delta": 36,
                                  "reveal_timeout": 0.3, "ch2_capacity": 100000, "ch2_expiry_blocks": 1000, "settle_lock_multiple": 0, "refill_ahead_locks": 0,
                                  "close_margin": 36, "policy": {"min_capacity": 20000, "min_expiry_blocks": 500, "max_expiry_blocks": 8640}})).unwrap()
 }
@@ -503,7 +503,9 @@ fn hole_a_lock_released_on_a_close_one_block_deep_is_lost_when_that_block_is_reo
     // The provider's close of its ch2 at the state before a written-off lock is one block deep: the
     // hub releases the hold, makes the ch2 record final and never looks at that funding again. The
     // block is replaced by one that carries the provider's other close, with the pre-signature and t.
-    let w = W::new(1);
+    // AGP-094: at the shipped `spend_final_depth` (the other tests of this file run at 1, the
+    // depth they were written for).
+    let w = W::build_with(&[None], 20, 300, HubConfig { spend_final_depth: HubConfig::default().spend_final_depth, ..hub_cfg() }, |_| {});
     w.paid(0);
     let (prov, chan2) = (&w.provs[0].1.inner, w.oc(0).params.channel_id());
     let s0 = prov.channel_state(&chan2).unwrap();
@@ -520,7 +522,11 @@ fn hole_a_lock_released_on_a_close_one_block_deep_is_lost_when_that_block_is_reo
     let mut acts = w.hub.watch_tick();
     acts.extend(w.hub.watch_tick());
     let oc = w.oc(0);
-    assert!(has(&acts, "lock_released") && oc.final_ && oc.state == "closed", "control: one block deep, released and final: {acts:?}");
+    // AGP-094: this control asserted the hole's own precondition ("one block deep, released and
+    // final": `has(&acts, "lock_released") && oc.final_ && oc.state == "closed"`). No fix leaves
+    // it true: once the hold is released the client may close ch1 below the lock, as the next
+    // line does. One block deep nothing is released and the record is still watched
+    assert!(!has(&acts, "lock_released") && !oc.final_ && w.stale1().len() == 1, "one block deep: nothing released, not final: {acts:?}");
     let closed = w.pay.close();
     // the reorg: c0's block is gone, the new block has the close with t
     w.chain.unconfirm(&c0);

@@ -163,7 +163,7 @@ fn main() {
              format!("{}...", &provs["A"].pay_to()[..18]));
 
     // --- hub -------------------------------------------------------------------------------------
-    let cfg = HubConfig::from_json(&json!({"fee_base_msat": 100, "fee_ppm": 2000, "max_lock_sat": 20000, "max_unguarded_lock_sat": 500,
+    let cfg = HubConfig::from_json(&json!({"spend_final_depth": 1, "fee_base_msat": 100, "fee_ppm": 2000, "max_lock_sat": 20000, "max_unguarded_lock_sat": 500,
         "delta": 144, "reveal_timeout": REVEAL_TIMEOUT, "ch2_capacity": 150000, "ch2_expiry_blocks": 1100, "close_margin": 144})).unwrap();
     let rpc_a = Arc::new(rpc.clone());
     let hub = Arc::new(RouteHub::new(rpc_a.clone(), rpc_a, Box::new(DemoWallet(chain.clone())), Box::new(UreqTransport::default()), sk(0x4B4B),

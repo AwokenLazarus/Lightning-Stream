@@ -71,7 +71,7 @@ fn provider_settling(chain: &Arc<MemChain>, net: &Arc<MemNet>, dir: &TempDir, or
 }
 
 fn hub_cfg(extra: Value) -> HubConfig {
-    let mut c = json!({"fee_base_msat": 100, "fee_ppm": 2000, "max_lock_sat": 20000, "max_unguarded_lock_sat": 500, "delta": 36,
+    let mut c = json!({"spend_final_depth": 1, "fee_base_msat": 100, "fee_ppm": 2000, "max_lock_sat": 20000, "max_unguarded_lock_sat": 500, "delta": 36,
                        "reveal_timeout": 1.0, "ch2_capacity": 100000, "ch2_expiry_blocks": 1000, "close_margin": 36,
                        "policy": {"min_capacity": 20000, "min_expiry_blocks": 500, "max_expiry_blocks": 8640}});
     for (k, v) in extra.as_object().unwrap() {

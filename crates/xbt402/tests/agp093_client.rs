@@ -692,7 +692,7 @@ struct Routed {
 
 fn routed(name: &str) -> Routed {
     let w = world(name);
-    let hub_cfg = HubConfig::from_json(&json!({"fee_base_msat": 100, "fee_ppm": 2000, "max_lock_sat": 20000, "max_unguarded_lock_sat": 500,
+    let hub_cfg = HubConfig::from_json(&json!({"spend_final_depth": 1, "fee_base_msat": 100, "fee_ppm": 2000, "max_lock_sat": 20000, "max_unguarded_lock_sat": 500,
                                                "delta": 36, "reveal_timeout": 1.0, "ch2_capacity": 100000, "ch2_expiry_blocks": 1000,
                                                "close_margin": 36, "policy": {"min_capacity": 20000, "min_expiry_blocks": 500, "max_expiry_blocks": 8640}})).unwrap();
     let hub = Arc::new(RouteHub::new(w.chain.clone(), w.chain.clone(), Box::new(Shared(Arc::new(TestWallet { chain: w.chain.clone(), ..TestWallet::default() }))),
