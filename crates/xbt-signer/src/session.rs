@@ -31,6 +31,8 @@ use crate::sanitize::{untrusted, UNTRUSTED_KEY};
 use crate::{err, Result};
 
 pub const PREVIEW_CAP: usize = 2048;
+/// AGP-089: the longest a stream's last chunk may stay hash-locked on the seller's word (four weeks).
+pub const MAX_COND_CSV_BLOCKS: u32 = 4032;
 const OPEN_POLL_S: f64 = 2.0;
 
 /// Inline preview cap (`B2_BODY_CAP`, default 12,000).
@@ -144,6 +146,31 @@ pub enum FundingSpend {
     Unknown,
 }
 
+/// The longest a channel's coins may be locked, in blocks from now (AGP-063 W3, AGP-089): the
+/// policy's `channel_expiry_blocks`, but at least four weeks so a provider's minimum fits. A routed
+/// ch1 must outlive the hub's ch2 to a provider, so a routing hub gets twice that. Every path that
+/// funds or rolls a channel holds the expiry to this, whoever named it (a seller's offer too).
+pub fn max_expiry_blocks(channel_expiry_blocks: i64, hub: bool) -> i64 {
+    channel_expiry_blocks.max(4032).saturating_mul(if hub { 2 } else { 1 })
+}
+
+/// What one `xbt402_pay` may sign (AGP-089, review W1). The rule: a call never raises what its
+/// channel's ledger holds by more than the `max_sats` the policy approved for it, whatever the
+/// seller's numbers are. `start` is the ledger when the call began. Every state after the call's
+/// first is checked here before it is signed, with checked arithmetic.
+#[derive(Debug, Clone, Copy)]
+struct CallBudget {
+    start: i64,
+    max_sats: i64,
+}
+
+impl CallBudget {
+    /// `cum` may be signed: it is at most `max_sats` above where the call found the ledger.
+    fn fits(&self, cum: i64) -> bool {
+        cum.checked_sub(self.start).is_some_and(|d| d <= self.max_sats)
+    }
+}
+
 /// One signer-owned client session.
 pub struct Session {
     pub book: Arc<ChannelBook>,
@@ -231,6 +258,9 @@ impl Session {
             return Err(rt(format!("provider channel binding (extra.derivation) is not {DERIVATION:?}; refused before funding")));
         }
         let close_fee = or_int(extra.get("closeFeeSat"), 600)?;
+        if close_fee < 0 {
+            return Err(rt("offer closeFeeSat is negative; refused before funding"));
+        }
         if self.close_fee_max > 0 && close_fee > self.close_fee_max {
             return Err(rt(format!("offer closeFeeSat {close_fee} is above this wallet's cap {}; refused before funding", self.close_fee_max)));
         }
@@ -241,17 +271,19 @@ impl Session {
         // payer-pays: we fund our close fee on top of the cap; payee-pays: the payee's output carries it
         let payer_fee = if fee_payer == "payer" { close_fee } else { 0 };
         // min/maxCapacity bound the funding output (cap + our close fee), as B1 checks it (AGP-017)
+        // AGP-089: the fee is the seller's number; with `close_fee_max_sats: 0` nothing else bounds it
+        let funded = cap_sats.checked_add(payer_fee).filter(|f| *f > 0 && cap_sats > 0)
+            .ok_or_else(|| rt("the channel's capacity and the offer's closeFeeSat do not add up to an amount; refused before funding"))?;
         let min_cap = or_int(extra.get("minCapacity"), 0)?;
-        let max_cap = or_int(extra.get("maxCapacity"), cap_sats + payer_fee)?;
+        let max_cap = or_int(extra.get("maxCapacity"), funded)?;
         // AGP-063 W2: the seller's minCapacity must not raise the owner's per-channel cap.
         // minCapacity bounds the funding output (cap + the payer's close fee).
-        let owner_funded = cap_sats.saturating_add(payer_fee);
-        if min_cap > owner_funded {
-            return Err(err("min_capacity", format!("offer minCapacity {min_cap} exceeds this wallet's per-channel cap {owner_funded}")));
+        if min_cap > funded {
+            return Err(err("min_capacity", format!("offer minCapacity {min_cap} exceeds this wallet's per-channel cap {funded}")));
         }
         let cap = cap_sats;
-        if cap + payer_fee > max_cap {
-            return Err(rt(format!("channel capacity {} above provider max {max_cap}", cap + payer_fee)));
+        if funded > max_cap {
+            return Err(rt(format!("channel capacity {funded} above provider max {max_cap}")));
         }
         let min_exp = or_int(extra.get("minExpiryBlocks"), 1)?;
         let max_exp = or_int(extra.get("maxExpiryBlocks"), 100_000)?;
@@ -265,19 +297,27 @@ impl Session {
         let margin = py_int(extra.get("closeMarginBlocks")).filter(|m| *m >= 0)
             .ok_or_else(|| rt("offer closeMarginBlocks is missing or not a block count; refused before funding"))?;
         let nn = |x: i64| x.max(0) as u64;
+        // AGP-089 (review C2): these three are the seller's numbers and they decide how long the
+        // owner's coins are locked if the seller then never opens or closes the channel. The
+        // owner's bound holds here as on the socket's open paths; refused before the preflight.
+        let most = max_expiry_blocks(expiry_blocks, false);
+        let floor = xbt402::funding::open_expiry_floor(nn(min_exp), nn(min_conf), nn(margin));
+        if floor > nn(most) {
+            return Err(err("expiry", format!("the offer needs the channel locked for {floor} blocks (minExpiryBlocks + minConf + closeMarginBlocks); \
+                                              this wallet locks a channel for at most {most}; refused before funding")));
+        }
         let blocks = xbt402::funding::open_expiry_blocks(nn(expiry_blocks), nn(min_exp), nn(max_exp), nn(min_conf), nn(margin));
-        let blocks = i64::try_from(blocks).map_err(|_| rt("offer expiry window is not a block count"))?;
+        let blocks = i64::try_from(blocks).ok().filter(|b| *b <= most).ok_or_else(|| rt("offer expiry window is not a block count this wallet accepts"))?;
         self.hot.check_channel_funding()?; // AGP-013: above the hot-balance cap, a human sweeps first
         let open_height = self.height()? as i64;
-        let expiry = open_height + blocks;
+        let expiry = open_height.checked_add(blocks).and_then(|e| u32::try_from(e).ok()).ok_or_else(|| rt("the channel's expiry is not a block height"))?;
         let (secret, payer_pub) = self.book.new_payer_key();
         // change at close returns to the signer's hot key, not the per-channel payer key
         let pay_to = hex::decode(acc.get("payTo").and_then(Value::as_str).unwrap_or("")).map_err(|_| rt("offer payTo is not hex"))?;
         let network = acc.get("network").and_then(Value::as_str).unwrap_or("").to_string();
         let fp = xbt402::channel::FeePayer::parse(&fee_payer)?;
-        let params = xbt402::channel::ChannelParams::derive(&pay_to, &hex::decode(&payer_pub).unwrap_or_default(), expiry as u32,
+        let params = xbt402::channel::ChannelParams::derive(&pay_to, &hex::decode(&payer_pub).unwrap_or_default(), expiry,
                                                             close_fee as u64, Some(self.hot.spk()), &network, fp)?;
-        let funded = cap + payer_fee;
         // AGP-080 X1: the seller names this URL; it must stay on the origin the policy allowed
         let open_url = seller_url(dest, extra.get("openUrl").and_then(Value::as_str).unwrap_or(xbt402::wire::OPEN_PATH))?;
         self.preflight(&open_url, &network, &params, funded, &fee_payer)?;
@@ -502,18 +542,18 @@ impl Session {
         Ok(delta)
     }
 
-    /// The seller's receipt: signature and request binding, and a `charged` that is not
-    /// negative and not above the quote. The number itself is never what the wallet books.
-    pub fn check_seller_receipt(rec: &ChannelRecord, resp: &Value, method: &str, url: &str, body: &[u8], answer: (u16, &[u8]), quote: i64) -> Result<i64> {
+    /// The payee's own word that it has the state `rec` was just sent with (AGP-089, review T4): a
+    /// receipt it signed, for this channel and for the seq of this request, with a `cum` no higher
+    /// than the one signed. `rec` is the record as the request left with it. A receipt for an
+    /// earlier seq is an earlier answer played again: the seller never saw this request. Returns
+    /// the receipt and its `cum`.
+    fn receipt_for_state<'a>(rec: &ChannelRecord, resp: &'a Value) -> Result<(&'a Value, i64)> {
         let r = receipt_of(resp).map_err(|e| err("bad_receipt", e.to_string()))?;
-        if py_str(r.get("req")) != request_digest_v2(method, url, body) {
-            return Err(err("bad_receipt", "receipt is for another request"));
-        }
-        if r.get("status").and_then(Value::as_u64) != Some(answer.0 as u64) || py_str(r.get("bodyHash")) != body_hash(answer.1) {
-            return Err(err("bad_receipt", "receipt is for another answer (status or body differs)"));
-        }
         if py_str(r.get("chan")) != rec.chan {
             return Err(err("bad_receipt", "receipt is for another channel"));
+        }
+        if py_int(r.get("seq")) != Some(rec.seq) {
+            return Err(err("bad_receipt", "receipt is for another request of this channel (its seq is not this call's)"));
         }
         let cum = py_int(r.get("cum")).ok_or_else(|| err("bad_receipt", "receipt cum is not an integer"))?;
         if cum < 0 || cum > rec.used_sats {
@@ -523,6 +563,19 @@ impl Session {
         let payee = hex::decode(&rec.payee_pub).map_err(|_| err("bad_receipt", "channel payee_pub is not hex"))?;
         if !ecdsa::verify(&payee, &receipt_message(r), &sig) {
             return Err(err("bad_receipt", "receipt not signed by the channel payee key"));
+        }
+        Ok((r, cum))
+    }
+
+    /// The seller's receipt: signature, seq and request binding, and a `charged` that is not
+    /// negative and not above the quote. The number itself is never what the wallet books.
+    pub fn check_seller_receipt(rec: &ChannelRecord, resp: &Value, method: &str, url: &str, body: &[u8], answer: (u16, &[u8]), quote: i64) -> Result<i64> {
+        let (r, _) = Self::receipt_for_state(rec, resp)?;
+        if py_str(r.get("req")) != request_digest_v2(method, url, body) {
+            return Err(err("bad_receipt", "receipt is for another request"));
+        }
+        if r.get("status").and_then(Value::as_u64) != Some(answer.0 as u64) || py_str(r.get("bodyHash")) != body_hash(answer.1) {
+            return Err(err("bad_receipt", "receipt is for another answer (status or body differs)"));
         }
         let charged = py_int(r.get("charged")).ok_or_else(|| err("bad_receipt", "charged is not an integer"))?;
         if charged < 0 {
@@ -634,20 +687,37 @@ impl Session {
             payload["sig"] = hex::encode(&sig).into();
         }
         let (r2, receipt) = self.paid(method, url, body, &acc, payload)?;
-        if receipt.is_some() {
-            self.book.ack_state(&dest, Some(rec.used_sats))?;
+        // AGP-089 (review T4): the state counts as arrived only on the payee's signature over this
+        // request's seq. Any other PAYMENT-RESPONSE (none, one for an earlier request, one someone
+        // on the path made up) leaves it unacked, so the next call sends the same state again and
+        // signs nothing higher.
+        if let Some((_, cum)) = receipt.as_ref().and_then(|resp| Self::receipt_for_state(&rec, resp).ok()) {
+            self.book.ack_state(&dest, Some(cum))?;
         }
-        // The state is paid and booked whatever the receipt says; a bad receipt is reported, not booked.
+        // The state is paid and booked whatever the receipt says.
+        let checked = receipt.as_ref().ok_or_else(|| err("bad_receipt", "paid call returned no receipt"))
+            .and_then(|resp| Self::check_seller_receipt(&rec, resp, method, url, body, (r2.status, &r2.body), price));
         let mut receipt_error = None;
-        let charged = if r2.status < 400 {
-            let checked = receipt.as_ref().ok_or_else(|| err("bad_receipt", "paid call returned no receipt"))
-                .and_then(|resp| Self::check_seller_receipt(&rec, resp, method, url, body, (r2.status, &r2.body), price));
-            checked.unwrap_or_else(|e| {
-                receipt_error = Some(e.msg);
+        let charged = match checked {
+            Ok(c) if r2.status < 400 => c,
+            Ok(_) => 0,
+            Err(e) if r2.status < 400 => {
+                // An answer below 400 is the seller's only with the receipt that covers its status
+                // and body: without one, anyone on the path can put any body under a paid call. It
+                // is refused and its body is not handed on (as the library client and B2 do).
+                log_call("call", json!({"url": url, "status": r2.status, "ms": ms_since(t0), "chargedSat": 0, "chan": rec.chan,
+                                        "cum": rec.used_sats, "opened": !opened.is_null(), "refused": "bad_receipt"}));
+                return Ok(json!({"verdict": "deny", "rule": "bad_receipt", "status": r2.status, "charged_sats": 0, "booked_sats": booked, "chan": rec.chan,
+                                 "cum": rec.used_sats, "opened": opened,
+                                 "reason": format!("{}; the answer is not handed on. The state this call signed stays booked and is sent again by the next call",
+                                                   e.msg)}));
+            }
+            Err(e) => {
+                if receipt.is_some() {
+                    receipt_error = Some(e.msg); // an error answer needs no receipt; a bad one is reported
+                }
                 0
-            })
-        } else {
-            0
+            }
         };
         log_call("call", json!({"url": url, "status": r2.status, "ms": ms_since(t0), "chargedSat": charged, "chan": rec.chan,
                                 "cum": rec.used_sats, "opened": !opened.is_null()}));
@@ -661,7 +731,7 @@ impl Session {
         let Ok(doc) = serde_json::from_slice::<Value>(&r2.body) else { return Ok(res) };
         if r2.status == 200 && doc.get("stream").and_then(Value::as_str) == Some("xbt402-merkle-v1") {
             res["receipt_scope"] = "manifest call only; chunk payments are in stream.paid_sats".into();
-            let s = self.stream(&dest, &acc, &doc, max_sats - booked);
+            let s = self.stream(&dest, &acc, &doc, CallBudget { start: ledger_before, max_sats });
             let sc = s.get("stream_charged").and_then(Value::as_i64).unwrap_or(0);
             merge(&mut res, s);
             if let Value::Object(m) = &mut res {
@@ -676,7 +746,10 @@ impl Session {
 
     // --- streams (stream.py) -------------------------------------------------------------------------
 
-    fn stream(&self, dest: &str, acc: &Value, doc: &Value, budget: i64) -> Value {
+    /// Buy a stream inside what this call may still sign (`budget`). The manifest's `n` and
+    /// `price` are the seller's numbers: their product is checked arithmetic, and each chunk's
+    /// state is held to the budget again before it is signed (AGP-089, review W1).
+    fn stream(&self, dest: &str, acc: &Value, doc: &Value, budget: CallBudget) -> Value {
         let m = doc.get("manifest").cloned().unwrap_or(json!({}));
         let t0 = Instant::now();
         let pay_to = acc.get("payTo").and_then(Value::as_str).unwrap_or("");
@@ -688,9 +761,13 @@ impl Session {
         if n < 1 || price < 0 {
             return json!({"stream_charged": 0, "stream": {"ok": false, "refused": "manifest has no chunks"}});
         }
-        if n * price > budget {
+        let signed = self.book.get(dest).map(|r| r.used_sats.max(Self::booked_through(&r))).unwrap_or(i64::MAX);
+        let left = budget.max_sats.saturating_sub(signed.saturating_sub(budget.start));
+        // the last state of the stream is `signed + n * price`; a product or sum that does not fit is refused
+        let fits = n.checked_mul(price).and_then(|cost| signed.checked_add(cost)).is_some_and(|end| budget.fits(end));
+        if !fits {
             return json!({"stream_charged": 0, "body": "",
-                          "stream": {"ok": false, "refused": format!("result costs {n} x {price} sat more; max_sats leaves {budget}")}});
+                          "stream": {"ok": false, "refused": format!("result costs {n} x {price} sat more; max_sats leaves {left}")}});
         }
         let chunk_url = doc.get("chunkUrl").and_then(Value::as_str).unwrap_or("");
         // AGP-080 X1: every chunk is fetched from the origin that was allowed, wherever the seller points
@@ -725,6 +802,11 @@ impl Session {
                 }
                 Ok((data, _, _)) => {
                     parts.extend(data);
+                    if let Err(e) = self.within(dest, &budget, price) {
+                        // refused before signing: nothing was paid for this chunk
+                        return json!({"stream_charged": spent, "body": "",
+                                      "stream": {"ok": false, "id": mid, "refused_chunk": i, "reason": e.msg, "verified_chunks": i, "paid_sats": spent}});
+                    }
                     let paid = self.book.increment(dest, price).and_then(|(rec, sig)| {
                         self.book_unbooked(dest)?;
                         self.verify_post(dest, acc, json!({"chan": rec.chan, "cum": rec.used_sats.to_string(), "sig": hex::encode(sig)}))?;
@@ -744,7 +826,7 @@ impl Session {
                 }
             }
         }
-        let (pt, final_ms) = match self.final_chunk(dest, doc, &m) {
+        let (pt, final_ms) = match self.final_chunk(dest, doc, &m, &budget) {
             Ok(x) => x,
             Err(e) => {
                 let chan = self.book.get(dest).map(|r| r.chan).unwrap_or_default();
@@ -782,6 +864,16 @@ impl Session {
         out
     }
 
+    /// AGP-089: the state a charge of `price` would sign is inside this call's budget. Called
+    /// before every state a stream signs, so no arithmetic on the seller's numbers decides alone.
+    fn within(&self, dest: &str, budget: &CallBudget, price: i64) -> Result<()> {
+        let next = self.book.next_cum(dest, price)?;
+        if !budget.fits(next) {
+            return Err(err("max_sats", format!("the next state signs {next} sat; max_sats {} from {} does not cover it", budget.max_sats, budget.start)));
+        }
+        Ok(())
+    }
+
     /// Hand the provider a signed state through /x402/verify.
     fn verify_post(&self, dest: &str, acc: &Value, payload: Value) -> Result<()> {
         let r = self.http("POST", &format!("{dest}{FACILITATOR_VERIFY}"), dumps(&facilitator_request(acc, &payload)).as_bytes(),
@@ -793,11 +885,12 @@ impl Session {
         Ok(())
     }
 
-    fn final_chunk(&self, dest: &str, doc: &Value, m: &Value) -> std::result::Result<(Vec<u8>, f64), String> {
+    fn final_chunk(&self, dest: &str, doc: &Value, m: &Value, budget: &CallBudget) -> std::result::Result<(Vec<u8>, f64), String> {
         let t = Instant::now();
         let n = py_int(m.get("n")).unwrap_or(0);
         let price = py_int(m.get("price")).unwrap_or(0);
-        let url = seller_url(dest, &doc.get("chunkUrl").and_then(Value::as_str).unwrap_or("").replace("{i}", &(n - 1).to_string())).map_err(|e| e.msg)?;
+        let last = n.checked_sub(1).filter(|l| *l >= 0).ok_or_else(|| "manifest has no chunks".to_string())?;
+        let url = seller_url(dest, &doc.get("chunkUrl").and_then(Value::as_str).unwrap_or("").replace("{i}", &last.to_string())).map_err(|e| e.msg)?;
         let not_offered = || "last chunk is not offered under the manifest's hash lock".to_string();
         let r = self.http("GET", &url, b"", &[]).map_err(|e| e.msg)?;
         let Some(h) = r.header("PAYMENT-REQUIRED").filter(|_| r.status == 402) else { return Err(not_offered()) };
@@ -815,7 +908,9 @@ impl Session {
         }
         let hash: [u8; 32] = cond.get("hash").and_then(Value::as_str).and_then(|x| hex::decode(x).ok()).and_then(|v| v.try_into().ok())
             .ok_or_else(not_offered)?;
-        let csv = py_int(cond.get("csvDelta")).unwrap_or(10) as u32;
+        // the seller's number: how long the chunk's price stays locked if the key never comes
+        let csv = u32::try_from(py_int(cond.get("csvDelta")).unwrap_or(10)).ok().filter(|c| *c <= MAX_COND_CSV_BLOCKS)
+            .ok_or_else(|| format!("last chunk offer's csvDelta is not a block count up to {MAX_COND_CSV_BLOCKS}; refused before signing"))?;
         let manifest: serde_json::Map<String, Value> = ["id", "n", "root", "lock", "finalCt", "lastProof"].iter()
             .map(|k| (k.to_string(), m.get(*k).cloned().unwrap_or(Value::Null))).collect();
         let pending = json!({"hash": hex::encode(hash), "cipher": hex::encode(&cipher), "manifest": manifest});
@@ -824,7 +919,9 @@ impl Session {
         // lock in then books nothing more; a seller that keeps the signature and withholds the key
         // releases nothing.
         let uncond = self.book.get(dest).map(|r| r.used_sats).ok_or_else(|| "channel vanished".to_string())?;
-        self.book_through(dest, uncond + price).map_err(|e| e.msg)?;
+        let locked = uncond.checked_add(price).filter(|c| price > 0 && budget.fits(*c))
+            .ok_or_else(|| "the last chunk's hash-locked state is above what max_sats leaves; refused before signing".to_string())?;
+        self.book_through(dest, locked).map_err(|e| e.msg)?;
         let (rec, sig) = self.book.sign_stream_final(dest, hash, price as u64, csv, pending).map_err(|e| e.msg)?;
         let payload = json!({"chan": rec.chan, "seq": rec.seq, "cum": rec.used_sats.to_string(), "hashlock": hex::encode(hash), "sig": hex::encode(&sig)});
         let (r, _) = self.paid("GET", &url, b"", &acc, payload).map_err(|e| e.msg)?;
@@ -840,7 +937,7 @@ impl Session {
         self.book_unbooked(dest).map_err(|e| e.msg)?;
         self.verify_post(dest, &acc, json!({"chan": rec.chan, "cum": rec.used_sats.to_string(), "sig": hex::encode(sig2)})).map_err(|e| e.msg)?;
         let ms = ms_since(t);
-        log_call("chunk", json!({"i": n - 1, "ms": ms, "chargedSat": price, "chan": rec.chan, "cum": rec.used_sats, "hashlock": hex::encode(hash)}));
+        log_call("chunk", json!({"i": last, "ms": ms, "chargedSat": price, "chan": rec.chan, "cum": rec.used_sats, "hashlock": hex::encode(hash)}));
         Ok((pt, ms))
     }
 
@@ -1022,7 +1119,7 @@ pub fn check_chunk(m: &Value, c: &Value) -> std::result::Result<Vec<u8>, String>
     let i = py_int(c.get("i")).ok_or("chunk has no index")?;
     let n = py_int(m.get("n")).unwrap_or(0);
     if truthy(c.get("encrypted")) {
-        if i != n - 1 {
+        if Some(i) != n.checked_sub(1) {
             return Err(format!("chunk {i}: only the last chunk may be encrypted"));
         }
         let ct = c.get("ct").and_then(Value::as_str).and_then(|x| hex::decode(x).ok()).ok_or(format!("chunk {i}: ct"))?;
@@ -1046,7 +1143,7 @@ pub fn open_final(m: &Value, ct: &[u8], key: &[u8]) -> std::result::Result<Vec<u
         return Err("revealed key does not match the hash lock".into());
     }
     let pt = encrypt(ct, key);
-    if !verify_proof(m.get("root").and_then(Value::as_str).unwrap_or(""), py_int(m.get("n")).unwrap_or(0) - 1, &pt,
+    if !verify_proof(m.get("root").and_then(Value::as_str).unwrap_or(""), py_int(m.get("n")).unwrap_or(0).saturating_sub(1), &pt,
                      m.get("lastProof").unwrap_or(&Value::Null)) {
         return Err("decrypted last chunk fails the Merkle proof (provably bad commitment)".into());
     }

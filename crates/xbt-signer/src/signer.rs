@@ -164,11 +164,10 @@ pub(crate) fn with(mut v: Value, extra: Value) -> Value {
     v
 }
 
-/// The longest channel an external client may open or roll into, in blocks from now (AGP-063 W3):
-/// the policy's `channel_expiry_blocks`, but at least four weeks so a provider's minimum fits. A
-/// routed ch1 must outlive the hub's ch2 to a provider, so a routing hub gets twice that.
+/// The longest channel any path may open or roll into, in blocks from now (AGP-063 W3, AGP-089):
+/// [`crate::session::max_expiry_blocks`] of the policy in force.
 fn max_expiry_blocks(cfg: &PolicyConfig, hub: bool) -> i64 {
-    cfg.channel_expiry_blocks.max(4032) * if hub { 2 } else { 1 }
+    crate::session::max_expiry_blocks(cfg.channel_expiry_blocks, hub)
 }
 
 fn trunc(s: &str, n: usize) -> String {
@@ -243,6 +242,8 @@ pub struct Signer {
     pub(crate) ln_funding: Mutex<HashMap<String, (String, crate::ln_funding::Funding)>>,
     /// AGP-063 W4: the one-time code that enrols the first human key.
     pub(crate) enroll: Mutex<crate::admin::EnrollCode>,
+    /// AGP-089: the human-signed messages already used (one signature, one operation).
+    pub(crate) used_sigs: crate::admin::UsedSigs,
 }
 
 impl Signer {
@@ -327,7 +328,8 @@ impl Signer {
         let s = Arc::new(Self { root: root.into(), run, config: RwLock::new(config), engine, node, chain, hrp, mining, sock_path,
                                 human_pubkey: RwLock::new(human_pubkey), spend: Mutex::new(()), approval_outcomes: Mutex::new(HashMap::new()), boot_policy: raw,
                                 keystore, sigaudit, anchor, hot, book, session, routing, open_tried: Mutex::new(HashMap::new()), close_claims: Mutex::new(HashSet::new()), watch_interval,
-                                ln, ln_error, ln_book, ln_funding: Mutex::new(HashMap::new()), enroll: Mutex::new(Default::default()) });
+                                ln, ln_error, ln_book, ln_funding: Mutex::new(HashMap::new()), enroll: Mutex::new(Default::default()),
+                                used_sigs: crate::admin::UsedSigs::new(&root.join(".run").join(crate::admin::USED_SIGS_FILE)) });
         if s.human_key().is_empty() {
             s.issue_enroll_code()?;
         } else {
@@ -685,6 +687,20 @@ impl Signer {
                 return Ok(with(with(deny("channel_closed", "the funding output is already spent (the provider closed)"), base),
                                json!({"closed_txid": closed})));
             }
+            // AGP-089: a funding of unknown fate that can never confirm must not hold its destination
+            // for good. It is dead when our node shows one of its inputs spent in a block by
+            // another transaction; the scan above went back to the block the channel was made in,
+            // so the funding itself is in no block. The record is then closed (its key stays in
+            // the keys file, as every archived channel's does) and a new channel may be opened.
+            if let Some(input) = self.funding_dead(&rec, start) {
+                self.book.note_pending(&dest, Some(&format!("the funding can never confirm: input {input}")), None)?;
+                self.book.mark_closed(&dest, "", Some(&json!({"status": "none"})), "")?;
+                self.hot.reconcile(true); // the hot wallet counted this funding's change, which will never exist
+                self.engine.audit.append(json!({"type": "funding_dead", "dest": dest, "chan": rec.chan, "funding_txid": rec.funding_txid, "input": input,
+                                                "ts": ts_value(self.now())}));
+                return Ok(with(deny("funding_dead", format!("the funding can never confirm (input {input}): \
+                                                             nothing is locked, and the destination is free for a new channel")), base));
+            }
             return Ok(with(deny("funding_unknown", "the funding output is not on this node"), base));
         }
         sigaudit::set_rule(if auto { "watcher:auto_refund" } else { "policy:refund_enabled" });
@@ -700,6 +716,23 @@ impl Signer {
                                         "ts": ts_value(self.now())}));
         self.anchor_after("refund");
         Ok(with(json!({"verdict": "allow", "rule": "refund"}), with(base, json!({"txid": txid, "sats": sats, "to": self.hot.address(), "auto": auto}))))
+    }
+
+    /// AGP-089: `rec`'s funding (not in the UTXO set, not known to the node, no spender found) can
+    /// never confirm: our node shows one of its inputs gone from the confirmed UTXO set and names
+    /// the transaction that spent it, in a block, which is not the funding. An input is spent once,
+    /// so the funding is in no block and never will be. Returns that input and its spender.
+    /// Anything less proves nothing, and the record stays pending.
+    fn funding_dead(&self, rec: &ChannelRecord, start: i64) -> Option<String> {
+        let tx = Tx::parse_hex(&rec.funding_hex).ok().filter(|t| t.txid() == rec.funding_txid)?;
+        tx.inputs.iter().find_map(|i| {
+            let (t, v) = (i.prevout.txid_hex(), i.prevout.vout);
+            if !self.node.call("gettxout", json!([t, v, false])).ok()?.is_null() {
+                return None;
+            }
+            let by = node::find_spender(&*self.node, &t, v, start.max(1) as u64, node::SPENDER_SCAN_MAX)?;
+            (by != rec.funding_txid).then(|| format!("{t}:{v} (spent by {by})"))
+        })
     }
 
     /// AGP-080 W3: a channel marked closed on its provider's word. Our node decides: the funding is
@@ -895,15 +928,25 @@ impl Signer {
                                                         x2b(&str_or_empty(p.get("signature")))) else {
             return json!({"ok": false, "reason": "bad amount, expiry or signature"});
         };
-        if self.human_key().is_empty() || sig.is_empty() || !verify(&self.human_key(), &sweep_message(&self.hot.address(), &to, amount, expiry), &sig) {
+        let msg = sweep_message(&self.hot.address(), &to, amount, expiry);
+        if self.human_key().is_empty() || sig.is_empty() || !verify(&self.human_key(), &msg, &sig) {
             return json!({"ok": false, "reason": "sweep_hot requires a valid human signature"});
         }
         if (expiry as f64) < self.now() {
             return json!({"ok": false, "reason": "sweep signature expired"});
         }
+        let spk = match address_to_spk(&to, &self.hrp) {
+            Ok(s) => s,
+            Err(e) => return json!({"ok": false, "reason": trunc(&e.msg, 200)}),
+        };
+        // AGP-089: one signature sweeps once (it carried an expiry and no nonce: until its expiry
+        // any holder could sweep again, whatever had arrived at the hot key since)
+        if let Some(d) = self.check_sig(&msg, p, expiry) {
+            return json!({"ok": false, "reason": d["reason"], "rule": d["rule"]});
+        }
         sigaudit::set_rule("human:sweep_signature");
         self.settle_close_changes(); // AGP-022: a pending close change is counted before the sweep
-        let out = match address_to_spk(&to, &self.hrp).and_then(|spk| self.hot.sweep_to(&spk, amount, DEFAULT_FEE)) {
+        let out = match self.hot.sweep_to(&spk, amount, DEFAULT_FEE) {
             Ok(o) => o,
             Err(e) => return json!({"ok": false, "reason": trunc(&e.msg, 200)}),
         };
@@ -1081,9 +1124,14 @@ impl Signer {
     /// for a rollover's next channel), against what this signer trusts: its own issued key, the payee
     /// derived from the verified payTo, change and refunds to the hot key, the close-fee cap, and an
     /// expiry the refund can reach in time.
-    fn check_client_channel(&self, key_origin: &str, p: &ChannelParams) -> Result<()> {
+    ///
+    /// `attaching`: the channel is already on chain, paid by a rollover this signer signed after
+    /// these same checks (AGP-089). Its key is then the one kept for its script (the book checks
+    /// it), and an expiry that has come near since is no reason to refuse: refusing would leave
+    /// the coins with no record and no refund.
+    fn check_client_channel(&self, key_origin: &str, p: &ChannelParams, attaching: bool) -> Result<()> {
         let origin = key_origin.strip_suffix("/next").unwrap_or(key_origin);
-        if self.book.issued_pub(key_origin)? != p.payer_pub {
+        if !attaching && self.book.issued_pub(key_origin)? != p.payer_pub {
             return Err(err("bad_key", "the channel's payer key is not the one issued for this origin"));
         }
         let pay_to = self.verified_pay_to(origin)?;
@@ -1102,7 +1150,7 @@ impl Signer {
         let rel = p.expiry as i64 - h;
         let hub = crate::routing::RoutePolicy::from_value(&cfg.routing).hubs.iter().any(|(d, _, _)| *d == normalize_dest(origin));
         let most = max_expiry_blocks(&cfg, hub);
-        if rel <= cfg.refund_margin_blocks || rel > most {
+        if (!attaching && rel <= cfg.refund_margin_blocks) || rel > most {
             return Err(err("expiry", format!("expiry {} is {rel} blocks away, outside ({}, {most}]", p.expiry, cfg.refund_margin_blocks)));
         }
         Ok(())
@@ -1130,7 +1178,7 @@ impl Signer {
             Ok(_) => return Ok(deny("bad_params", "fund takes the channel's unfunded params")),
             Err(e) => return Ok(deny("bad_params", e.msg)),
         };
-        if let Err(e) = self.check_client_channel(&origin, &params) {
+        if let Err(e) = self.check_client_channel(&origin, &params, false) {
             return Ok(deny(&e.code, e.msg));
         }
         let sats = py_int(p.get("sats")).filter(|v| *v != 0).or_else(|| py_int(p.get("amount_sats"))).unwrap_or(0);
@@ -1155,8 +1203,7 @@ impl Signer {
         }
         let prep = self.hot.prepare_fund(&params.spk(), sats, DEFAULT_FEE)?;
         let funded = params.with_funding(&prep.txid, 0, sats as u64)?;
-        let secret = self.book.take_issued(&origin)?;
-        self.book.add_pending(&dest, secret, &funded, &origin, None, self.height()?, "", &self.session.network()?, 0, &prep.hex)?;
+        self.book.add_pending_issued(&origin, &dest, &funded, self.height()?, &self.session.network()?, &prep.hex)?;
         crate::session::send_funding(&self.hot, &self.book, &dest, &funded.channel_id(), &prep)?;
         Ok(json!({"txid": prep.txid, "vout": 0, "sats": sats, "sighash": "0x21", "chan": funded.channel_id()}))
     }
@@ -1228,11 +1275,37 @@ impl Signer {
             return d.as_value();
         }
         sigaudit::set_rule(&if grant.is_some() { "human:approval_signature".to_string() } else { format!("policy:{}", d.rule) });
-        let result = match self.session.pay_once(&url, &method, &raw, max_sats, exp, cap) {
+        // AGP-089: a grant is held (`used` on disk) while its call runs, as `approve` holds its
+        // token: a crash after a state was signed leaves it used, never good for a second call. It
+        // is given back only when the call signed nothing (a refusal, a funding still unconfirmed).
+        let signed_on = |s: &Self| s.book.get(&dest).map(|r| (r.chan.clone(), Session::booked_through(&r).max(r.used_sats)));
+        let before = signed_on(self);
+        if let Some(t) = &grant {
+            if let Err(e) = self.engine.store.update_approval(t, &json!({"used": true})) {
+                return deny("xbt402", e.msg);
+            }
+        }
+        let result = self.session.pay_once(&url, &method, &raw, max_sats, exp, cap);
+        // what this call signed: the rise on the channel it found, or all of a channel it opened
+        let signed_sats = match (&before, signed_on(self)) {
+            (Some((c0, a0)), Some((c1, a1))) if *c0 == c1 => a1 - a0,
+            (_, Some((_, a1))) => a1,
+            (_, None) => 0,
+        };
+        let signed = signed_sats > 0;
+        let refused = result.as_ref().map_or(true, |r| r["verdict"] == "deny" || r["verdict"] == "pending");
+        if let Some(t) = grant.as_ref().filter(|_| refused) {
+            if signed {
+                self.use_xbt402_grant(t, signed_sats);
+            } else {
+                let _ = self.engine.store.update_approval(t, &json!({"used": false}));
+            }
+        }
+        let result = match result {
             Ok(r) => r,
             Err(e) => return self.pay_deny(&e),
         };
-        if result["verdict"] == "deny" || result["verdict"] == "pending" {
+        if refused {
             return result;
         }
         // The signed delta was committed inside the session, before the signature left (AGP-063).
@@ -1268,7 +1341,7 @@ impl Signer {
         let origin = rec.as_ref().map(|r| if r.origin.is_empty() { dest.to_string() } else { r.origin.clone() }).unwrap_or_else(|| dest.into());
         let booked = rec.as_ref().map(Session::booked_through).unwrap_or(0);
         let txid = format!("xbt402:{}:{cum}", rec.as_ref().map(|r| r.chan.as_str()).unwrap_or(""));
-        let increase = cum - booked;
+        let Some(increase) = cum.checked_sub(booked) else { return Ok(Err(deny("amount", "cum is not an amount"))) };
         if let Some(r) = rec.as_ref().filter(|r| cum < r.used_sats) {
             return Ok(Err(deny("amount", format!("never sign a lower cumulative amount: have {}, got {cum}", r.used_sats))));
         }
@@ -1342,7 +1415,13 @@ impl Signer {
             return deny("bad_rollover", format!("next_capacity {next_cap} is not what the rollover leaves ({})", cur.rollover_next_capacity(amount as u64)));
         }
         let origin = if rec.origin.is_empty() { dest.clone() } else { rec.origin.clone() };
-        if let Err(e) = self.check_client_channel(&format!("{origin}/next"), &next) {
+        let key_origin = format!("{origin}/next");
+        if let Err(e) = self.check_client_channel(&key_origin, &next, false) {
+            return deny(&e.code, e.msg);
+        }
+        // AGP-089: this signature may fund `next`. Its key and terms are kept under its own script
+        // before the signature exists, so no later `xbt402_new_key`, retry or refusal can lose them.
+        if let Err(e) = self.book.keep_rollover_key(&dest, &key_origin, &next) {
             return deny(&e.code, e.msg);
         }
         match self.booked_increase(&dest, amount, "xbt402 rollover", || self.book.sign_rollover(&dest, amount, &next_spk, next_cap)) {
@@ -1364,7 +1443,8 @@ impl Signer {
         if amount < 0 {
             return deny("bad_amount", "the conditional amount must not be negative");
         }
-        match self.booked_increase(&dest, uncond + amount, "xbt402 conditional state",
+        let Some(total) = uncond.checked_add(amount) else { return deny("bad_amount", "uncond + amount is not an amount") };
+        match self.booked_increase(&dest, total, "xbt402 conditional state",
                                    || self.book.sign_conditional(&dest, uncond, hash, amount as u64, csv, None)) {
             Ok(Ok((_, sig))) => json!({"sig": hex::encode(sig)}),
             Ok(Err(d)) => d,
@@ -1398,57 +1478,76 @@ impl Signer {
                 Err(e) => deny(&e.code, e.msg),
             };
         }
-        // AGP-080 W3: the next channel replaces the live one only when our node shows the rollover:
-        // the live channel's funding spent by the transaction that pays this next channel's script.
-        // (Such a transaction needs this signer's `xbt402_sign_rollover`, which checked `next`.)
-        let Some(old) = self.book.get(&dest) else { return deny("unknown_channel", format!("no channel for {dest} to roll over")) };
-        if let Err(e) = self.rollover_on_chain(&old, &params) {
-            return deny(&e.code, e.msg);
+        // AGP-080 W3: the next channel replaces the one it spends only when our node shows the
+        // rollover: that channel's funding spent by the transaction that pays this next channel's
+        // script. (Such a transaction needs this signer's `xbt402_sign_rollover`, which checked
+        // `next` and kept its key, AGP-089.) The channel it spends is the record at this dest, or
+        // one a later channel has replaced since.
+        let txid = params.funding_txid();
+        let records: Vec<ChannelRecord> = self.book.records_of(&dest).into_iter()
+            .filter(|r| r.state != "refunded" && (r.close_unproven || r.closed_txid.is_empty() || r.closed_txid == txid)).take(5).collect();
+        if records.is_empty() {
+            return deny("unknown_channel", format!("no channel for {dest} to roll over"));
         }
-        if let Err(e) = self.check_client_channel(&origin, &params) {
+        if let Some(have) = records.first().filter(|r| r.chan == params.channel_id() && r.state == "open") {
+            return json!({"chan": have.chan, "dest": dest}); // attached already (a retry, or the watcher)
+        }
+        let old = match self.rollover_on_chain(&records, &params) {
+            Ok(o) => o,
+            Err(e) => return deny(&e.code, e.msg),
+        };
+        if let Err(e) = self.check_client_channel(&origin, &params, true) {
             return deny(&e.code, e.msg);
         }
         if params.capacity as i64 > self.channel_funding_cap(&params) {
             return deny("channel_cap", "the next channel holds more than this wallet's per-channel cap");
         }
-        let secret = match self.book.take_issued(&origin) {
-            Ok(s) => s,
-            Err(e) => return deny(&e.code, e.msg),
+        // AGP-089: every step that can refuse comes before the key moves, and the key moves in the
+        // write that records the channel (`add_rolled`). The spent channel is settled first: our
+        // node has just shown its funding spent by this rollover, which also proves a close that
+        // was only the provider's word.
+        let live = records.first().filter(|r| r.chan == old.chan);
+        let settled = match live {
+            Some(r) if r.state == "open" || r.state == "pending" => self.close_by_chain(&dest, r, &params.funding_txid(), "", 0),
+            Some(r) if r.state == "closed" && r.close_unproven => self.book.note_close_proof(&dest, true, &params.funding_txid()),
+            _ => Ok(()),
         };
-        let open_height = self.height_safe();
-        if old.state == "open" || old.state == "pending" {
-            // the rollover closed it: archived by add_funded, with its change looked for first
-            if let Err(e) = self.close_by_chain(&dest, &old, &params.funding_txid(), "", 0) {
-                return deny(&e.code, e.msg);
-            }
+        if let Err(e) = settled {
+            return deny(&e.code, e.msg);
         }
-        match self.book.add_funded(&dest, secret, &params, &base, Some(params.max_amount() as i64), open_height) {
+        match self.book.add_rolled(&dest, &old.chan, &origin, &params, &base, self.height_safe()) {
             Ok(rec) => json!({"chan": rec.chan, "dest": dest}),
             Err(e) => deny(&e.code, e.msg),
         }
     }
 
-    /// `next` (funded) is what a rollover of `old` created, by our own node: its funding output is
-    /// there with the next channel's script and capacity, and the transaction it is in is the one
-    /// that spent `old`'s funding. Waits up to the policy's `open_wait_s` for the node to see it.
-    fn rollover_on_chain(&self, old: &ChannelRecord, next: &ChannelParams) -> Result<()> {
+    /// `next` (funded) is what a rollover of one of `candidates` created, by our own node: its
+    /// funding output is there with the next channel's script and capacity, and the transaction it
+    /// is in is the one that spent that candidate's funding. Returns the candidate. Waits up to
+    /// the policy's `open_wait_s` for the node to see it.
+    fn rollover_on_chain(&self, candidates: &[ChannelRecord], next: &ChannelParams) -> Result<ChannelRecord> {
         let (txid, vout) = (next.funding_txid(), next.funding_vout());
-        let seen = || -> Result<bool> {
+        let seen = || -> Result<Option<ChannelRecord>> {
             let out = self.node.call("gettxout", json!([txid, vout, true]))?;
             let script = out.get("scriptPubKey").and_then(|s| s.get("hex")).and_then(Value::as_str).unwrap_or("");
             if out.is_null() || script != hex::encode(next.spk()) || node::sats(out.get("value")) != next.capacity as i64 {
-                return Ok(false);
+                return Ok(None);
             }
-            Ok(self.session.funding_spend(old)? == FundingSpend::Spent(txid.clone()))
+            for c in candidates {
+                if self.session.funding_spend(c)? == FundingSpend::Spent(txid.clone()) {
+                    return Ok(Some(c.clone()));
+                }
+            }
+            Ok(None)
         };
         let deadline = Instant::now() + Duration::from_secs_f64((self.config().open_wait_s as f64).clamp(0.0, 30.0));
         loop {
-            if seen()? {
-                return Ok(());
+            if let Some(c) = seen()? {
+                return Ok(c);
             }
             if Instant::now() >= deadline {
-                return Err(err("rollover_unproven", "this node does not show a rollover of the live channel that funds this next channel; \
-                                                     attach again once it does (the issued key and the live channel are kept)"));
+                return Err(err("rollover_unproven", "this node does not show a rollover of this origin's channel that funds this next channel; \
+                                                     attach again once it does (the next channel's key and the live channel are kept)"));
             }
             std::thread::sleep(Duration::from_millis(500));
         }
@@ -1564,6 +1663,11 @@ impl Signer {
                                             "dest": dest, "amount_sats": amount, "ts": ts_value(now)}));
             return Ok(deny("approval_sig", "missing or invalid human signature over (token, dest, amount, expiry)"));
         }
+        // AGP-089: one approval pays once. The token is read, held and paid under the spend lock,
+        // the one lock every payment takes: a second `approve` of the same token (a double click, a
+        // retry) waits here and then finds the token held or gone. Reading it before the lock let
+        // two calls that waited on another payment both pass the `used` check.
+        let g = self.lock();
         let Some(payload) = self.engine.store.get_approval(&token)? else {
             self.engine.audit.append(json!({"type": "approval_miss", "token": token, "ts": ts_value(now)}));
             return Ok(deny("approval", "unknown or already-used approval token"));
@@ -1584,6 +1688,7 @@ impl Signer {
             return Ok(deny("approval_bind", "signature fields do not match the pending approval"));
         }
         if payload.get("kind").and_then(Value::as_str) == Some("ln_resume") {
+            drop(g); // it takes the spend lock itself, and moves no funds
             return self.ln_resume(&token, &payload);
         }
         if matches!(payload.get("kind").and_then(Value::as_str), Some("xbt402") | Some("ln")) {
@@ -1594,7 +1699,7 @@ impl Signer {
         // is `approval_replay`: never a second payment on one approval). It is spent by a payment
         // (`allow`), and given back, valid until its own expiry, when nothing was paid and nothing
         // is booked: the node's own refusal, or a verdict that is not `allow`.
-        let _g = self.lock();
+        let _g = g;
         let mut held = payload.clone();
         held["used"] = true.into();
         self.engine.store.put_approval(&token, held)?;

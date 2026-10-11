@@ -79,8 +79,9 @@ impl RoutePolicy {
     /// 1 sat for the carried remainder.
     pub fn fee_cap_sat(&self, hub: &str, amount: i64) -> i64 {
         let (ppm, base) = self.hub(hub).unwrap_or((0, 0));
-        let exact_msat = base + amount * 1000 * ppm / 1_000_000;
-        (exact_msat + 999).div_euclid(1000) + 1
+        // 128-bit: `amount` comes from a hub's invoice, and a product that wraps is no cap at all
+        let exact_msat = base as i128 + amount as i128 * 1000 * ppm as i128 / 1_000_000;
+        i64::try_from((exact_msat + 999).div_euclid(1000) + 1).unwrap_or(i64::MAX)
     }
 }
 
@@ -223,7 +224,7 @@ pub fn check_route(policy: &RoutePolicy, spend: &RouteSpend, hub: &str, amount: 
         return Some(deny("route_lock_max", format!("lock {increase} sat > max_lock_sats {}", policy.max_lock_sats)));
     }
     let spent = spend.since(now - DAY_S);
-    if spent + pending + increase > policy.daily_budget_sats {
+    if spent.saturating_add(pending).saturating_add(increase) > policy.daily_budget_sats {
         return Some(deny("route_daily_budget", format!("routed spend {spent} + {increase} > daily_budget_sats {}", policy.daily_budget_sats)));
     }
     None
@@ -331,8 +332,8 @@ impl RouteSigner {
         let rec = self.book.get(&dest).ok_or_else(|| err("unknown_channel", chan.to_string()))?;
         let hub = route.get("hub").and_then(Value::as_str).filter(|h| !h.is_empty()).map(str::to_string)
             .unwrap_or_else(|| if rec.origin.is_empty() { dest.clone() } else { rec.origin.clone() });
-        let increase = cum - rec.used_sats;
-        let delta = (cum - rec.used_sats.max(rec.booked_through())).clamp(0, increase.max(0));
+        let increase = cum.checked_sub(rec.used_sats).ok_or_else(|| err("route_amount", "cum is not an amount"))?;
+        let delta = cum.saturating_sub(rec.used_sats.max(rec.booked_through())).clamp(0, increase.max(0));
         // the budget counts what this lock adds: `increase - delta` of it is booked already
         let mut denied = check_route(&self.policy(), &self.spend, &hub, py_int(route.get("amount")).unwrap_or(0),
                                      py_int(route.get("fee")).unwrap_or(0), increase, self.pending_sats() - (increase - delta), now_f64());

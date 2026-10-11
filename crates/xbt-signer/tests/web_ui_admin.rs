@@ -154,8 +154,9 @@ fn a_policy_change_needs_the_human_key_is_validated_like_the_engine_and_applies_
     assert_eq!(q["verdict"], "allow", "{q}");
     assert_eq!(rig.call("hot_address", json!({}))["hot_cap_sats"], 20_000);
     assert_eq!(rig.s.config().human_threshold_sats, 5000);
-    // the same signed change cannot be replayed (the previous hash moved)
-    assert_eq!(rig.call("policy_set", set)["rule"], "policy_stale");
+    // the same signed change cannot be replayed: a human signature is used once (AGP-089; before
+    // that the refusal was `policy_stale`, since the previous hash had moved)
+    assert_eq!(rig.call("policy_set", set)["rule"], "human_sig_replay");
     // the file on disk is the signed text, and the old one is kept
     let text = std::fs::read_to_string(rig.root.join("policy.json")).unwrap();
     assert_eq!(text, prep["text"].as_str().unwrap());

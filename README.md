@@ -989,7 +989,11 @@ signed after the call, minus what the policy ledger already holds for that chann
 (`ledger_booked_sats`). It never books `charged` from the seller's PAYMENT-RESPONSE. The receipt is
 still checked: the payee's signature, the request digest and channel, a `cum` no higher than the one
 signed, and a `charged` that is neither negative nor above the quote. A bad receipt does not change
-what is booked; the answer reports it as `receipt_error`. The answer also carries `booked_sats`.
+what is booked. Since AGP-089 the receipt must also carry the `seq` of this request, an answer below
+400 without a good receipt is refused (`deny/bad_receipt`, its body is not handed on), and a state
+counts as arrived only on such a receipt (anything else leaves it unacked: the next call sends the same
+state again). An error answer's bad receipt is still reported as `receipt_error`. The answer also
+carries `booked_sats`.
 - **When it books.** The `pay` channel rail, `sign_state`, `xbt402_sign_state_a3`, the rollover and
   `xbt402_sign_conditional` book before they sign, and take the row out again if signing fails.
   `xbt402_pay` books after the state is persisted and before it is sent; a crash in between is
@@ -1762,7 +1766,7 @@ the header was there: with it stripped on the way, any body passed as the paid a
 | `Client::request` / `request_with`, channel | required below 400 (this change) |
 | `Client::request_conditional` | required below 400 (this change); the hash lock stays pending, so `recover_conditional` still reads k from the provider's claim |
 | `Client` with a scheme payer (`with_payer`, xbt-work) | required below 400 (this change); what it proves on that rail is less, see below |
-| `xbt-signer` `pay_once` (the wallet) | a missing or bad receipt below 400 is reported as `receipt_error` with `charged_sats` 0; the signed state stays booked, and the body goes to the agent marked untrusted, as every provider body does (unchanged) |
+| `xbt-signer` `pay_once` (the wallet) | a missing or bad receipt below 400 is refused: `deny/bad_receipt`, `charged_sats` 0, the body is not handed on; the signed state stays booked and is sent again by the next call (AGP-089; before that it was reported as `receipt_error` and the body went to the agent) |
 | the stream's chunk calls (`xbt-signer`) | no receipt needed: each chunk is checked against the manifest's Merkle root before the state paying for it is signed (unchanged) |
 | `RoutePayer` (routed calls) | none per call, by design: a ROUTE-STATE is a running meter (a stated limit) |
 | close, rollover, open | control requests: their answers are checked against the transaction we signed |

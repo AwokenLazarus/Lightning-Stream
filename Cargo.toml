@@ -46,6 +46,14 @@ lto = "thin"
 codegen-units = 4
 strip = "debuginfo"
 
+# AGP-089 (review W1): the wallet's arithmetic on a counterparty's numbers is checked where it is
+# written; these two crates also keep overflow checks in release builds, so a sum or product that
+# was missed stops the request (a panic in its thread) and is never signed as a wrapped amount.
+[profile.release.package.xbt-signer]
+overflow-checks = true
+[profile.release.package.xbt-wallet-mcp]
+overflow-checks = true
+
 # Size-optimised release: fat LTO, opt-level z. scripts/build_matrix.sh reports both.
 [profile.release-small]
 inherits = "release"
