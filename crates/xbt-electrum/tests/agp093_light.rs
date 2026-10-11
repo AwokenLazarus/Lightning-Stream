@@ -117,6 +117,7 @@ const COINS: usize = 20;
 
 /// Twenty confirmed coins on one script, an honest server, and a second honest server behind a
 /// proxy that holds each `get_history` for `hold_ms`.
+#[allow(clippy::type_complexity)] // AGP-097: clippy's only complaint about the audit's file; nothing else in it is changed
 fn many_coins(hold_ms: u64) -> (Arc<Mutex<SimChain>>, Vec<u8>, Arc<FakeElectrum>, Arc<FakeElectrum>, Proxy) {
     let chain = sim(200);
     let a = spk(0x61);

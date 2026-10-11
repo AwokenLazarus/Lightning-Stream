@@ -26,6 +26,12 @@ pub trait AuditSource {
     /// The Prime's statement for the block at `height`: None when the Prime answers that it has
     /// none; an error for every other answer that is not a statement.
     fn statement(&self, height: u32) -> Result<Option<ServedStatement>>;
+    /// The hash of the block the node has at `height` now, None when it has none there: what an
+    /// audit on record is checked against before a statement is held to it
+    /// ([`WorkProvider::audit_chain_on`]).
+    fn hash_at(&self, height: u32) -> Result<Option<String>> {
+        self.block(height).map(|b| Some(b.hash))
+    }
 }
 
 /// The most passes between two fetches of one statement the Prime keeps failing to serve, as a
@@ -100,7 +106,7 @@ impl Walk {
             (None, None) => Statement::Missing,
             (None, Some(_)) => Statement::Unavailable,
         };
-        match (wp.audit_chain(&block, stmt), why) {
+        match (wp.audit_chain_on(&block, stmt, &|h| src.hash_at(h)), why) {
             (Err(e), _) => Step::Stop(e.to_string()),
             (Ok(_), Some(why)) => Step::Unavailable(why),
             (Ok(o), None) => Step::Done(o.map(|o| o.ok)),
@@ -111,6 +117,10 @@ impl Walk {
     pub fn pass(&mut self, wp: &WorkProvider, src: &dyn AuditSource, to: u32) -> Pass {
         self.pass += 1;
         let mut out = Pass::default();
+        // an audit undone because its block left the chain: over that height again
+        if let Some(low) = wp.undone() {
+            self.rewind(low);
+        }
         // deeper than any reorg the walk expects: it stays a block with no statement
         self.waiting.retain(|h, _| h.saturating_add(SETTLE_DEPTH) > to);
         let due: Vec<u32> = self.waiting.iter().filter(|(_, w)| w.due <= self.pass).map(|(h, _)| *h).collect();

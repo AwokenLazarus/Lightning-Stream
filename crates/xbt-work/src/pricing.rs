@@ -25,7 +25,13 @@ pub fn bits_to_target(bits: u32) -> Result<U512> {
         return fail("bad_bits", "target above 2^256");
     }
     let m = U512::from(mant);
-    Ok(if exp <= 3 { m >> (8 * (3 - exp) as usize) } else { m << (8 * (exp - 3) as usize) })
+    let t = if exp <= 3 { m >> (8 * (3 - exp) as usize) } else { m << (8 * (exp - 3) as usize) };
+    // a mantissa shifted out by a small exponent (`0x01000001`) is a zero target too, and every
+    // price, cap and window bound divides by the target (AGP-097)
+    if t.is_zero() {
+        return fail("bad_bits", "negative or zero target");
+    }
+    Ok(t)
 }
 
 pub fn diff1_target() -> U512 {
@@ -48,6 +54,18 @@ pub fn work_units_for_price(price_sats: u64, bits: u32, block_value_sats: u64, f
     let den = bits_to_target(bits)? * U512::from(block_value_sats) * check_bps("feeBps", fee_bps)? * check_bps("haircutBps", haircut_bps)?;
     let q = num.div_ceil(den);
     u64::try_from(q.max(U512::from(1u64))).or_else(|_| fail("bad_pricing", "amount above 2^64-1"))
+}
+
+/// Work units one sat buys at this epoch before fee and haircut, times 2^64 (rounded up, and at
+/// most `u128::MAX`): how the receipt book compares credit granted at one epoch with a cap worked
+/// out at another ([`ReceiptBook::rate`](crate::book::ReceiptBook::rate)). Never 0.
+pub fn work_rate(bits: u32, block_value_sats: u64) -> Result<u128> {
+    if block_value_sats == 0 {
+        return fail("bad_pricing", "block value is zero");
+    }
+    let num: U512 = (diff1_target() * U512::from(100_000_000u64)) << 64usize;
+    let q = num.div_ceil(bits_to_target(bits)? * U512::from(block_value_sats));
+    Ok(u128::try_from(q).unwrap_or(u128::MAX))
 }
 
 /// §6.1: expected sats of `work` credited at `bits` on a path with `fee_bps` (floor).
@@ -100,6 +118,9 @@ mod tests {
         assert_eq!(format!("{:.6}", difficulty(DIFF1_BITS).unwrap()), "1.000000");
         assert!(bits_to_target(0x0180_0000).is_err());
         assert!(bits_to_target(0x2100_0001).is_err());
+        // a non-zero mantissa that the exponent shifts out
+        assert!(bits_to_target(0x0100_0001).is_err() && bits_to_target(0x0200_00ff).is_err());
+        assert_eq!(bits_to_target(0x0200_0100).unwrap(), U512::from(1u64));
         assert!(work_units_for_price(1, DIFF1_BITS, 1, 10_000, 0).is_err());
         assert_eq!(value_sats(1823, 0x1901_41C5, 312_500_000, 0).unwrap(), 166);
     }

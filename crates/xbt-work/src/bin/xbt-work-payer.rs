@@ -34,7 +34,7 @@ use xbt402::client::{Client, ClientConfig, Transport, Wallet};
 use xbt402::error::{ChannelError, Result as XResult};
 use xbt402::http::UreqTransport;
 use xbt402::wire::unb64json;
-use xbt_work::audit::{audit_block, check_fraud_proof, deferred_sats, expected_sats, receipts_bound, TOLERANCE};
+use xbt_work::audit::{audit_block, check_fraud_proof, covers, deferred_sats, expected_sats, receipts_bound};
 use xbt_work::auth::request_digest;
 use xbt_work::book::ReceiptBook;
 use xbt_work::chain::ChainBlock;
@@ -279,7 +279,7 @@ fn pay(base: &str, calls: usize, secs: f64, state: &str) -> i32 {
         }
     }
     c.check(!paid_out.is_empty(), format!("coinbases of the payer's blocks paid the provider identity on-chain: {} sat in {} coinbase output(s)",
-                                         paid_out.iter().map(|b| b.paid_sats).sum::<u64>(), paid_out.len()));
+                                         paid_out.iter().fold(0u64, |a, b| a.saturating_add(b.paid_sats)), paid_out.len()));
     // payer-side audit: the third-party bound (§10.4) from the receipts it holds and the signed
     // statements, each held to the Prime's published terms (AGP-065)
     let mut audits = vec![];
@@ -297,7 +297,8 @@ fn pay(base: &str, calls: usize, secs: f64, state: &str) -> i32 {
                 let l = receipts_bound(receipts.iter().map(|r| &r.receipt), &sw.stmt);
                 let exp = expected_sats(b.value_sats, fee, l, ww).unwrap_or(u64::MAX);
                 let (owed, _) = deferred_sats(&pk, &sw.stmt, &ident, &def);
-                let ok = exp < mp || b.paid_sats + owed + TOLERANCE >= exp;
+                // `owed` is what the Prime's deferral lines say: the audit's own sum, which cannot wrap (AGP-097)
+                let ok = exp < mp || covers(b.paid_sats, owed, exp);
                 json!({"height": b.height, "ok": ok, "expectedSats": exp, "paidSats": b.paid_sats, "deferredSats": owed, "provenWork": l,
                        "windowStart": sw.stmt.window_start, "windowWork": ww, "bounded": bounded, "statement": sw.line_doc()})
             }

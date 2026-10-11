@@ -105,7 +105,9 @@ fn p4_a_statement_the_prime_signed_for_an_unpaid_block_and_the_audit_refuses_is_
             "window_work 0" => k.sign_window(&stmt(110, 104, 0)).unwrap(),
             _ => k.sign_window(&stmt(110, 100, 8000)).unwrap(),
         };
-        let o = wp.audit_chain(&block(110, 0), Statement::Found(&sw, &[])).unwrap();
+        // AGP-097: a window start is held against an audit on record only while that block is in
+        // the chain, so the audit is told what the node has (here: every block is still there)
+        let o = wp.audit_chain_on(&block(110, 0), Statement::Found(&sw, &[]), &|h| Ok(Some(hash(h)))).unwrap();
         let r = wp.report();
         assert!(o.is_some_and(|o| !o.ok), "{why}: no verdict for a block the Prime signed a refused statement for");
         assert_eq!(r["distrust"]["code"], json!("refused_statement"), "{why}: {r}");

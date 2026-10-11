@@ -89,6 +89,7 @@ use xbt402::provider::{load_or_create_secret, HttpResponse, Provider, ProviderCo
 use xbt402::rpc::Rpc;
 use xbt_work::audit::{audit_block, check_fraud_proof};
 use xbt_work::chain::ChainBlock;
+use xbt_work::guard;
 use xbt_work::pricing::Pricing;
 use xbt_work::provider::{admin_request, admin_token, Amount, Cap, Caps, ServedStatement, Statement, WorkConfig, WorkProvider, WorkScheme, SETTLE_DEPTH,
                          SHIPPED_AUDIT_DEPTH, SHIPPED_HAIRCUT_BPS};
@@ -140,6 +141,10 @@ impl AuditSource for Source<'_> {
     fn statement(&self, height: u32) -> xbt_work::Result<Option<ServedStatement>> {
         window(self.t, self.window_url, height)
     }
+
+    fn hash_at(&self, height: u32) -> xbt_work::Result<Option<String>> {
+        self.svc.hash_at(height)
+    }
 }
 
 impl Service {
@@ -147,10 +152,22 @@ impl Service {
         &self.work.cfg.identity
     }
 
+    /// The hash of the block the node has at `height` now; None above its tip.
+    fn hash_at(&self, height: u32) -> xbt_work::Result<Option<String>> {
+        if height > block_count(&self.rpc)? {
+            return Ok(None);
+        }
+        block_hash(&self.rpc, height).map(Some)
+    }
+
     fn audit(&self, req: &Value) -> xbt_work::Result<Value> {
         let t = UreqTransport::default();
         let wurl = self.window_url.as_deref().ok_or_else(|| xbt_work::WorkError::new("no_window_url", ""))?;
         let tip = block_count(&self.rpc)?;
+        // as the walk does before a pass: the audits of blocks that left the chain are undone
+        // first (AGP-097; this audit takes any range, the tip included). A reorg after this check
+        // is caught where it matters, in `audit_chain_on`.
+        self.reorgs(tip)?;
         let h32 = |v: &Value| v.as_u64().and_then(|x| u32::try_from(x).ok());
         let from = h32(&req["from"]).unwrap_or(1);
         let to = h32(&req["to"]).unwrap_or(tip).min(tip);
@@ -164,7 +181,7 @@ impl Service {
                 Some((sw, def, _)) => Statement::Found(sw, def),
                 None => Statement::Missing,
             };
-            match self.work.audit_chain(&block, found) {
+            match self.work.audit_chain_on(&block, found, &|h| self.hash_at(h)) {
                 Ok(None) => {}
                 Ok(Some(o)) => {
                     let mut r = json!({"height": h, "ok": o.ok, "blockHash": block.hash, "coinbaseValueSats": block.value_sats,
@@ -348,13 +365,18 @@ fn main() {
                                       Box::new(move |_, p| if p.starts_with("/v1/") { price } else { 0 }),
                                       Box::new(|_, p, _| answer(p))).unwrap_or_else(|e| die(e))
         .with_scheme(Arc::new(WorkScheme(work.clone()))));
+    // Each of the three loops below runs its rounds through `guard::round` (AGP-097): a panic ends
+    // the round, is reported, and the loop goes on.
     let (w, every) = (prov.clone(), num::<u64>("--watch-secs", "XBT_WORK_WATCH_SECS").unwrap_or(5).max(1));
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(every));
-        match w.close_due() {
+        let round = guard::round(|| match w.close_due() {
             Ok(closed) if !closed.is_empty() => eprintln!("watcher: closed {closed:?}"),
             Ok(_) => {}
             Err(e) => eprintln!("watcher: {e}"),
+        });
+        if let Err(why) = round {
+            eprintln!("watcher: a round panicked ({why}); the watcher goes on");
         }
     });
     // pull receipts through the relay, and follow the epoch (§6.3: re-price new 402s)
@@ -362,24 +384,35 @@ fn main() {
     let pull_secs: u64 = arg("--pull-secs").map(|p| p.parse().expect("pull secs")).unwrap_or(3);
     std::thread::spawn(move || {
         let t = UreqTransport::default();
+        // an epoch the node reports and no price follows from: said once, not every round
+        let mut refused: Option<(u32, u64)> = None;
         loop {
-            for (inv, r) in if pull_secs > 0 { w2.refresh(&t) } else { vec![] } {
-                match r {
-                    Ok(0) => {}
-                    Ok(d) => eprintln!("relay: invoice {inv}: +{d} work units credited (verified under the Prime key)"),
-                    Err(e) => eprintln!("relay: invoice {inv}: {e}"),
-                }
-            }
-            if let Ok(b) = tip_bits(&n2) {
-                let v = n2.call("getblockstats", json!([block_count(&n2).unwrap_or(0), ["subsidy"]])).ok()
-                    .and_then(|s| s["subsidy"].as_u64()).unwrap_or(subsidy);
-                if w2.set_epoch(b, v) {
-                    eprintln!("epoch: bits {b:08x}, block value {v} sats: new 402s quote {} work units", w2.amount(price).unwrap_or(0));
-                    if caps.invoice.priced() || caps.total.priced() {
-                        let c = w2.caps();
-                        eprintln!("caps: per invoice {:?}, total {:?} work units at this epoch", c.per_invoice, c.total);
+            let round = guard::round(|| {
+                for (inv, r) in if pull_secs > 0 { w2.refresh(&t) } else { vec![] } {
+                    match r {
+                        Ok(0) => {}
+                        Ok(d) => eprintln!("relay: invoice {inv}: +{d} work units credited (verified under the Prime key)"),
+                        Err(e) => eprintln!("relay: invoice {inv}: {e}"),
                     }
                 }
+                if let Ok(b) = tip_bits(&n2) {
+                    let v = n2.call("getblockstats", json!([block_count(&n2).unwrap_or(0), ["subsidy"]])).ok()
+                        .and_then(|s| s["subsidy"].as_u64()).unwrap_or(subsidy);
+                    if w2.set_epoch(b, v) {
+                        refused = None;
+                        eprintln!("epoch: bits {b:08x}, block value {v} sats: new 402s quote {} work units", w2.amount(price).unwrap_or(0));
+                        if caps.invoice.priced() || caps.total.priced() {
+                            let c = w2.caps();
+                            eprintln!("caps: per invoice {:?}, total {:?} work units at this epoch", c.per_invoice, c.total);
+                        }
+                    } else if let (Some(e), true) = (w2.epoch_error(b, v), refused != Some((b, v))) {
+                        refused = Some((b, v));
+                        eprintln!("epoch: the node reports bits {b:08x}, block value {v} sats, which no price follows from ({e}): the epoch in force stays");
+                    }
+                }
+            });
+            if let Err(why) = round {
+                eprintln!("relay pull: a round panicked ({why}); the pull goes on");
             }
             std::thread::sleep(Duration::from_secs(pull_secs.clamp(1, 3)));
         }
@@ -419,11 +452,16 @@ fn main() {
             let t = UreqTransport::default();
             let src = Source { svc: &s2, t: &t, window_url: &wurl };
             loop {
-                if let Ok(tip) = block_count(&s2.rpc) {
+                let round = guard::round(|| {
+                    let Ok(tip) = block_count(&s2.rpc) else { return };
                     match s2.reorgs(tip) {
                         Ok(Some(low)) => walk.rewind(low),
                         Ok(None) => {}
                         Err(e) => eprintln!("audit: reorg check: {e}"),
+                    }
+                    // an audit the admin audit undid (its block had left the chain): over it again
+                    if let Some(low) = s2.work.undone() {
+                        walk.rewind(low);
                     }
                     let to = tip.saturating_sub(depth);
                     if to >= walk.next() || !walk.waiting().is_empty() {
@@ -441,6 +479,9 @@ fn main() {
                             eprintln!("audit: height {h}: {why}; retrying");
                         }
                     }
+                });
+                if let Err(why) = round {
+                    eprintln!("audit: a round panicked ({why}); the walk goes on from height {}", walk.next());
                 }
                 std::thread::sleep(Duration::from_secs(2));
             }

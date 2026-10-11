@@ -1362,6 +1362,15 @@ impl Signer {
     /// (AGP-082, a BOLT 12 payment, whose outgoing channels the node chooses): refused unless every
     /// channel of the node passes the guards and the funding proof, an inactive one included, since it
     /// may be active again by the time the node routes.
+    ///
+    /// Why every channel and not only those a payment "can use" (AGP-097, decided: it stays). Which
+    /// channels a BOLT 12 payment can use is the node's choice, made after this check and in parts:
+    /// a channel with nothing on our side now has a balance as soon as an HTLC towards us settles,
+    /// and an inactive one reconnects. A rule read from balances here would be checked at one moment
+    /// and used at another. The only confinement that holds is `outgoing_chan_ids`, which `PayOffer`
+    /// does not take. The cost is stated: one channel that fails the proof, an inbound one from an
+    /// ordinary peer included, stops every BOLT 12 payment until the owner closes it; BOLT 11
+    /// payments go on, confined to the proven channels.
     pub(crate) fn ln_route_checks(&self, ln: &dyn LnBackend, pol: &LnPolicy, dest: &str, hash: &str, every: bool) -> std::result::Result<LnRoutes, Value> {
         let chans = ln.channels().map_err(|e| self.ln_refuse("ln_backend", &e.msg, dest, hash))?;
         let utxos = if pol.exposure_cap_sats > 0 || self.chain == "main" {

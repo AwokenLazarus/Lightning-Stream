@@ -426,8 +426,10 @@ fn w3_a_caller_with_no_work_cannot_make_the_provider_keep_anything() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The expiry is read from the identifier, to the same effect as the record it replaced: a first
-/// receipt past the TTL is taken inside the grace when it shows work, and refused past it.
+/// The expiry is read from the identifier: it ends an invoice with no work, and a first receipt
+/// that shows work is taken past the TTL. AGP-097 changed the last assertion: such a receipt was
+/// refused past the grace (`unknown_invoice`), which stranded work mined in time whenever the relay
+/// pull had not asked for the invoice; it is now taken whenever it comes.
 #[test]
 fn w3_expiry_is_read_from_the_identifier() {
     let k = key();
@@ -438,7 +440,8 @@ fn w3_expiry_is_read_from_the_identifier() {
     let (ig, ix) = (dg["invoice"].as_str().unwrap(), dx["invoice"].as_str().unwrap());
     assert_eq!(call(&grace, &payment(&dg, &k, &WorkReceipt::zero(70, PROV, ig), 1, "/v1/a"), "/v1/a"), Err("unknown_invoice".into()), "expired, no work");
     assert_eq!(call(&grace, &payment(&dg, &k, &receipt(ig, 1, 50, 101, 102), 2, "/v1/a"), "/v1/a"), Ok(()), "expired, work, inside the grace");
-    assert_eq!(call(&gone, &payment(&dx, &k, &receipt(ix, 1, 50, 101, 102), 1, "/v1/a"), "/v1/a"), Err("unknown_invoice".into()), "past the grace");
+    assert_eq!(call(&gone, &payment(&dx, &k, &WorkReceipt::zero(70, PROV, ix), 1, "/v1/a"), "/v1/a"), Err("unknown_invoice".into()), "past the grace, no work");
+    assert_eq!(call(&gone, &payment(&dx, &k, &receipt(ix, 1, 50, 101, 102), 2, "/v1/a"), "/v1/a"), Ok(()), "past the grace, work (AGP-097)");
     // a retired invoice that was never seen is remembered as retired
     let live = Arc::new(WorkProvider::new(config(&k)).unwrap());
     let d = live.issue_invoice().unwrap();

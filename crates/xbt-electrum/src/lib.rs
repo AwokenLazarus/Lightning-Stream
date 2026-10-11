@@ -42,6 +42,14 @@
 //!   handshake together. Every request of one call ends at [`Config::call_deadline`], and a call
 //!   forces one header sync at most. A server is asked only for the transactions it listed itself:
 //!   the first it does not supply, or that cannot belong to the script, ends its list and flags it.
+//! * **What the deadline does not cost an honest server** (AGP-097). A scan asks each server for
+//!   the script's history once and for the coins' proofs in one batch, however many coins the
+//!   script holds. A request is written by one deadline. A request the call's deadline cuts short,
+//!   or leaves no time for, fails with [`Kind::Deadline`] and hangs up on nobody and flags nobody:
+//!   the deadline is shared by every server, so only a request that goes a whole timeout
+//!   unanswered is the server's own. A claim above a server's tip is a lie only against a tip it
+//!   reported in the sync the call itself forced, and an error about the method ("Method not
+//!   found", JSON-RPC -32601) is never "no such transaction".
 //!
 //! What a malicious server can still do:
 //!

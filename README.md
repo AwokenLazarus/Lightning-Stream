@@ -2186,7 +2186,8 @@ descends from, is a coinbase at or above the split or carries a 0x21 signature i
 P2PKH spend). The search is breadth first through coins confirmed at or above the split and looks
 up at most `ANCESTRY_LOOKUPS` (256) transactions; the verdict is cached per funding block as
 before. A funding with no pin in reach is refused, and the refusal says how to fund one that
-passes (mined coins, or coins that went through a P2PKH address after the split). Tests:
+passes (mined coins, or coins that went through a P2PKH address after the split). (AGP-097: the
+coinbase pin is weaker than the sentence in bold; see the limits of fix wave 5 below.) Tests:
 `agp087_ln_l5_a_funding_whose_replayed_parent_is_signed_0x01_is_not_proven`, `agp092_l5_*` (3), and
 on real nodes `scripts/ln_rail_regtest.sh` (Lightning Fork `.17`): 87/87, with the lab's proven
 channels now funded from a P2PKH coin (`drive.py::send_pinned`) and S10 checking the pin
@@ -2212,6 +2213,101 @@ rename, so a halt survives a power loss. Test:
 out when a server was silent or down now return `Kind::Unreachable`; `unspent_marked` and the
 `complete` field of a `scantxoutset` answer say whether every configured server answered. `LnPolicy` has `node_max_cltv_blocks`.
 `ln_funding::Funding::Proven` evidence has an `xbt_only` object.
+
+## Fix wave 5: light client and Lightning (AGP-097)
+
+The third closure audit (AGP-093) found no High item left and, in this area, list 1 items 10, 11,
+14 (one part), 20 and 22: half of them inside the rules wave 4 added. Each fix states the rule in
+the code and has a test that failed first; the audit's tests are `agp093_light.rs` (10, all pass)
+and B2 `tests/test_agp093_light.py` (10, all pass), the other sides are `agp097_light.rs` (7) and
+B2 `tests/test_agp097_light.py` (12). B2 `agentwallet/electrum.py` on `agp-097` keeps the same
+rules.
+
+**What a scan asks a server for does not grow with the number of coins beyond what each coin
+needs once** (`ElectrumBackend::unspent_marked`; B2 `_rpc_scantxoutset`). The call's deadline
+covers the whole scan, and anyone can add coins to an address by paying it dust. The scan asked
+every server for the script's whole history once per coin, and proved the coins one request at a
+time, each from the first server that claimed it: with 20 coins, one honest server a quarter of
+the timeout late made every scan fail at the deadline, for as long as it was configured. The
+history is now asked for once a scan (`spends`), and the proofs in one batch per server, all
+servers at once (`prove_ahead`; a proof that does not hold is asked for again and judged by the
+request that follows, as before). Measured: 20 coins beside a server 250 ms late on each history
+request, timeout 1 s: an error at 4.0 s before (the audit's run), 20 coins now; a cold scan beside
+a server 250 ms late on each proof request, where one request a coin is 5 s against a deadline of
+4 s: 20 coins in 0.46 s (`cargo test -p xbt-electrum --all-features --test agp093_light --test
+agp097_light -- --nocapture` prints both).
+
+**Every entry that makes requests runs under one call budget** (B2 only: `ElectrumBackend._budget`).
+`call()` set the budget; `proven_spend`, which the refund's evidence calls on its own
+(`chain.spend_is_evidence`), did not, so each of its steps had a deadline of its own and each
+height a server claimed forced a header sync of its own: 20 claims were 20 sync rounds, and 30
+took 12 s against a bound of 6 s. One sync round and 0.41 s now. The Rust backend takes its
+budget in each typed call and was not affected.
+
+**A server is hung up on only for a request that went a whole timeout unanswered**
+(`Connection::batch_until`, `Kind::Deadline`; B2 `request_by`, `Late`). A call's deadline is shared
+by every server it asks. A request it leaves no time for is no longer sent, and one it cuts short
+is given up without closing the connection and without a flag; before, both ended as a timeout,
+and the honest server that answered at once was dropped and flagged because another had used the
+time up. A server whose list of transactions runs into the deadline is flagged only if it was
+asked for any of them. A server's part of a header sync has its own deadline and still ends with
+a hang-up.
+
+**A claim is a lie only against a tip the server reported after it made the claim**
+(`ElectrumBackend::confirmed`, `Call::round`). A claim above our chain forces one header sync. When
+that sync found another in flight it ran nothing, and the claim was then judged against the tip
+the server had reported earlier: a block that arrived in between made two honest servers liars,
+and the lookup answered "no such output" for a confirmed coin. It is judged now only against a tip
+the server reported in the round the call itself ran (or a later one); otherwise it is unknown and
+the call fails.
+
+**An error about the method is not "not there"** (`backend::says_not_there`). "Method not found"
+contains two of the words "not there" is read from. An error that names the method is no answer,
+and the connection puts JSON-RPC's code -32601 into those words when the server's own leave the
+method out.
+
+**A request is written by one deadline** (`Link::send`; B2 `ElectrumConnection._write`). B2 wrote
+with `sendall` on a socket with no timeout: a server that stopped reading held a 2.6 MB broadcast
+for good, under the signer's lock. The Rust write had a timeout per write, which a server that
+reads a little at a time never trips: 3.3 s for a 10 MB line at a 500 ms timeout in a run made
+before the change, 0.8 s now (`a_server_that_reads_a_little_at_a_time_does_not_hold_a_broadcast`
+prints it). Each write gets what is left of one deadline.
+
+**Sums of what servers supply are checked.** `scantxoutset` adds the proven coins' values with a
+checked sum and refuses a total past 2^64-1 (it was a panic; the typed `unspent` adds nothing up).
+
+**For embedders.** `Kind` has a new variant `Deadline`. `ElectrumBackend`'s API is unchanged.
+
+**Limits, stated.**
+
+* A cold scan of N coins still asks each server that lists them for N transactions and N proofs,
+  16 to a batch. A server that takes longer than one timeout to answer a batch is dropped for that
+  call; the other servers' answers decide, and what was proven is kept for the next call.
+* A call that finds another sync in flight just as a block arrives fails with "not known" for that
+  block's transactions until a sync that began after the block has ended. It no longer answers
+  "not there".
+* A request given up at the call's deadline stays pending on its connection until its answer comes
+  or the connection ends, so a late answer is within what the connection allows. A server that
+  never answers is still dropped by the first request that waits a whole timeout for it.
+* **The Lightning funding proof takes a coinbase as XBT-only, and XBT's consensus does not make it
+  so** (read from Knots `61b07b8`, not fixed). A coinbase's txid commits to its height and to
+  nothing that names the chain: the txid is the double SHA-256 of the same bytes on both chains,
+  and consensus asks a post-fork coinbase for the height (BIP 34), a value within subsidy plus
+  fees, and the fork headline in the fork block only. The coinbase of XBT's block H is therefore a
+  valid coinbase for SHA-256 Bitcoin's block H, and for no other block there. It is XBT-only when
+  the other chain already has another block at that height and does not reorganise below it; where
+  it has not, whoever mines that block can mine the same coinbase, which pays the same keys. That
+  takes one party a block on each chain at one height, or a miner giving its reward to the other
+  coinbase's payees. The signer has no SHA-256 Bitcoin node to compare heights with. The 0x21
+  scriptSig pin does not have this limit. Mike, 2026-10-11: the proof stays strict, so the rule is
+  unchanged and this is its stated limit (`ln_funding.rs`, module documentation).
+* **One channel that fails the funding proof stops every BOLT 12 payment** (decided: it stays).
+  The node chooses the channels an offer's payment leaves through, after the wallet's check and in
+  parts, and `PayOffer` takes no `outgoing_chan_ids`. Which channels "can" carry the payment
+  changes between the check and the send (an HTLC towards us settles, a peer reconnects), so a rule
+  read from balances would be checked at one moment and used at another. An inbound channel from
+  an ordinary peer whose coins have no pinned ancestor therefore stops offers until the owner
+  closes it; BOLT 11 payments go on, confined to the proven channels.
 
 ## Portability
 
@@ -2858,12 +2954,14 @@ when an invoice is issued, and the record (`n`, `spent`) is made by the first re
 signed that shows work. Before, each unfunded invoice was a row in a table of 10,000, rationed per
 client by the TCP peer. The binary listens on loopback, so every client behind a proxy was one
 peer: 16 requests an hour from anyone stopped invoices for everyone, and with `--trust-forwarded`
-625 addresses filled the table and pushed slow payers' invoices out, stranding their work. There is
-nothing left to fill, ration or evict, and no `fsync` an anonymous request can cause. Expiry is as
-it was (TTL, then the grace for a first receipt with work). `429 too_many_invoices` is never sent.
-The relay pull still asks for the newest 64 invoices not yet seen in a receipt (`PULL_NEW`, in
-memory); an invoice that is not among them is credited when its payer presents a receipt, which a
-payer does with every call.
+625 addresses filled the table and pushed slow payers' invoices out, stranding their work. No
+durable state is left to fill, ration or evict, and no `fsync` an anonymous request can cause.
+`429 too_many_invoices` is never sent. The relay pull asks for the newest 64 invoices not yet seen
+in a receipt (`PULL_NEW`, in memory), and 64 invoice requests push an invoice out of that list; an
+invoice that is not in it is credited when its payer presents a receipt, which a payer does with
+every call. As AGP-091 shipped, that receipt was refused once TTL and grace had passed, so 64
+requests stranded the work of a payer whose first call came later: AGP-097 takes a first receipt
+with work whenever it comes (below), and `expiresAt` ends only an invoice with no work.
 
 **6. An admin request carries the admin token** (`provider::admin_request`). `--admin` makes
 `DIR/admin.token` (0600) and every admin request needs `Authorization: Bearer <token>` and a
@@ -2941,6 +3039,113 @@ audit's branch), `agp091_walk.rs` (10: items 2, 3, 6), `agp091_payer.rs` (7: ite
 - The payer's check of `spentWork` is bookkeeping, not proof: the PAYMENT-RESPONSE is not signed
   (stated in AGP-081). After a call the provider refused, its quote stays in the slack until the
   next answer, so a provider could over-report by that much without being noticed.
+
+## Pay-with-work, fix wave 5: what the third audit left (AGP-097)
+
+The third closure audit (AGP-093) found, in this area, list 1 items 8, 13, 14 and 19: one Medium
+(WORK 1) and five smaller ones, three of them inside rules wave 4 added. One rule each, written at
+the function that keeps it. Tests: `crates/xbt-work/tests/agp093_work.rs` (the audit's 9, all
+pass), `agp097_work.rs` (14, the other paths), and unit tests in `book.rs`, `pricing.rs` and
+`guard.rs`. There is no pay-with-work code in B1 or B2 (the Python reference is XBT-053's).
+
+**1. Work the Prime signed for an invoice of this provider is credited whenever its payer first
+presents it** (`provider::Invoice`). Issuing is stateless, so an invoice gets a record only when
+the relay pull or its payer's first call presents work, and the pull asks for the newest 64 issued
+only. A first receipt was refused past TTL and grace: 64 anonymous invoice requests pushed a
+payer's invoice out of the pull, and a payer that mined in time and called two hours later had
+paid the provider and could not spend (`unknown_invoice`). The provider cannot tell when work was
+mined (a receipt carries heights and no time), and it has been paid for it whenever that was, so a
+first receipt that shows work makes the record at any time. `expiresAt` ends an invoice with no
+work, as §4.5 says ("bounds only an invoice that has received no work"). Nothing an anonymous
+caller sends makes the provider keep anything: the record still needs the Prime's signature on
+work. `invoice_grace_secs` now only says how long an unfunded invoice past its TTL stays in the
+relay pull.
+
+**2. Unpaid credit counts against a cap that follows the price at the price it was granted at**
+(`book::Rate`, `ReceiptBook::counted`). A cap in calls or sats is turned into work units at each
+epoch, and credit is kept in work units. When a call came to cost twice the work, the cap doubled
+and the same unpaid units filled half of it: a Prime that never paid was served 450 more calls,
+1,350 against a cap of 900. Each grant now remembers what a call and a sat cost in work when it
+was made, and the caps count its unpaid part at today's rate: 900 unpaid calls are 900 calls of
+the cap at any difficulty, and a coinbase that pays for half of them frees 450. Balances are not
+revalued (§6.3); only what the caps count is. A cap set in work units counts work units, as
+before.
+
+**3. A window start is held only against audits of blocks still in the chain**
+(`WorkProvider::audit_chain_on`). `window_start_regressed` distrusts the Prime for good, and it
+was judged against every audit on record without asking whether that block was still there. An
+operator's audit near the tip (`POST /admin/xbt-work/audit` takes any range) and a reorg left a
+record of a block that no longer existed, and the honest statement for the new branch went against
+it. Before the refusal counts, the node is asked for the block at the record's height: still
+there, and the Prime signed both for one chain and is failed; gone, and that audit is undone as a
+reorged one is, the statement is audited without it, and the walk goes over the height again
+(`WorkProvider::undone`). The admin audit also runs the walk's reorg check before it starts.
+
+**4. An epoch the price cannot be worked out at never replaces one it can**
+(`WorkProvider::set_epoch`, `pricing::bits_to_target`). A compact target whose mantissa the
+exponent shifts out (`0x01000001`) is zero; it was returned as a target, and every price, cap and
+window bound then divided by it. It is refused as a zero target, and an epoch whose `bits` or
+block value no price follows from leaves the epoch in force as it is (the binary says so once).
+
+**5. A panic in one round of a loop the provider depends on ends that round, not the loop**
+(`guard::round`). The channel watcher, the relay pull (which also follows the epoch) and the audit
+walk each ran in a thread that a panic ended for good while the service went on answering. Every
+release build has overflow checks on, so that is what a missed overflow means. Each round now runs
+under `catch_unwind`; the panic is logged and the loop goes on. Under `release-small`
+(`panic = "abort"`) the process ends instead and its supervisor starts it again.
+
+**6. The admin token is in a file only the operator's account can read, or it is not used**
+(`provider::admin_token`, `fsx::write_private`). The 0600 mode applied only when the temporary file
+was created by that call: one already in the directory was written into and renamed into place
+with its own mode. The temporary file is now removed and made anew, exclusively (so a link in its
+place is not followed either), and that holds for the state file, which holds the invoice secret.
+A token file that is already there and that group or others can read or write is refused at
+start, as `ssh` refuses such a key: the operator deletes it (a new token is made) or runs
+`chmod 600`.
+
+**7. Sums of numbers from outside saturate.** `xbt-work-payer` added a Prime's deferral amount to
+the coinbase payment with a plain `+`; it uses the audit's own sum now (`audit::covers`).
+
+**What operators and embedders see.**
+
+| | before | now |
+|---|---|---|
+| a first receipt with work, past TTL and grace | `unknown_invoice` | credited |
+| unpaid credit after the difficulty rises | fills less of a cap in calls or sats | fills as much as when it was granted |
+| `window_start_regressed` against a record whose block left the chain | Prime distrusted | that audit undone, the statement audited |
+| a `bits` value with a zero target from the node | pricing panics from then on | refused; the epoch in force stays |
+| a panic in the watcher, the pull or the audit walk | the thread ends | logged, the loop goes on |
+| an `admin.token` others can read | used | refused at start (`bad_config`) |
+| `WorkProvider` | | adds `audit_chain_on`, `undone`, `epoch_error` |
+| `walk::AuditSource` | | adds `hash_at` (defaults to the hash of `block`) |
+| `ReceiptBook` | `credits: (invoice, work)` | `credits: (invoice, work, Rate)`; adds `rate`, `follows`, `counted` |
+| state file (version 3) | | each credit carries its rate; older state loads |
+
+**Limits, stated.**
+
+- **A record is kept for every invoice that ever had one share, for good** (not changed; the
+  audit's WORK 4). It is about 620 bytes of state, the whole state is written on every paid call,
+  and every such invoice is asked for in every relay pull. Rule 1 rests on it: `n` and `spent` are
+  what keep a spent invoice spent, and an identifier can make its record again only while it has
+  none, so a record must not be dropped while its identifier is still accepted. Pruning needs a
+  retention after which an identifier is refused, which is an operator's setting to add. The
+  audit log (one entry per audited block that had a statement) is not pruned either.
+- **Credit held unspent buys more calls when the difficulty falls** (§6.3: balances are in work
+  units and are not revalued). The caps bound the credit a Prime that never pays is given; what it
+  buys is decided when it is spent. A pair that takes the whole cap as credit and spends none of
+  it until the difficulty has halved is served 1,800 calls against a cap of 900
+  (`limit_credit_held_unspent_buys_more_calls_when_the_difficulty_falls`); a fall by a factor f
+  gives f times the cap at most, and it needs the difficulty to fall while the credit is held.
+- Credit that was unpaid when a provider is upgraded has no rate in its state file. It is taken as
+  granted at the epoch of the first start after the upgrade, which is right unless the epoch moved
+  while it was unpaid.
+- `WorkProvider::audit_chain`, the form with no node to ask, cannot tell a window start that went
+  backwards on one chain from two statements for two branches. It never blames the Prime for it:
+  the audit on record is undone and the statement audited without it. `xbt-work-provider` uses
+  `audit_chain_on` in the walk and in the admin audit; an embedder that wants the Prime failed for
+  a window start that goes backwards must use it too.
+- An invoice identifier is accepted for as long as the provider keeps its secret. A payer that
+  mines on an invoice long after `expiresAt` is credited; the provider was paid for that work.
 
 ## Lightning rail hardening (AGP-066, review L1–L5)
 

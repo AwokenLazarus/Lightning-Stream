@@ -36,6 +36,7 @@ pub mod book;
 pub mod chain;
 pub mod error;
 mod fsx;
+pub mod guard;
 pub mod grammar;
 pub mod nta;
 pub mod payer;
