@@ -436,7 +436,9 @@ chain. Numbers are the shipped defaults unless a sentence says otherwise.
 
 The two Python references state the same rules where they have the code. What differs there, and
 the limits of the Python agent wallet and its forward rail, are in `docs/LIMITS.md` of each
-reference's own repository. The references are not published yet.
+reference's own repository. The references are public:
+[Lightning-Stream-py-channel](https://github.com/AwokenLazarus/Lightning-Stream-py-channel) and
+[Lightning-Stream-py-wallet](https://github.com/AwokenLazarus/Lightning-Stream-py-wallet).
 
 ## Open items
 
