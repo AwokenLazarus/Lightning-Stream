@@ -299,10 +299,14 @@ fn nothing_is_signed_for_a_channel_that_is_not_open() {
     assert_eq!((ch.payer.signed, ch.seq, ch.last_sig.as_str()), (0, 0, ""));
 }
 
-/// A keyed channel whose funding call failed and that is now too near its expiry: its key is
-/// kept (the call may have sent), and the next call opens with a new key.
+/// A keyed channel whose funding call failed and that is now too near its expiry: its terms are
+/// kept (the call may have sent), and the same call derives it again and funds that.
+///
+/// AGP-096 rewrote this test and the next (the third audit's item 6). AGP-090 failed this call
+/// `open_unresolved`, opened the next with a new key, and refused the origin for good at sixteen
+/// kept keys; with a signer it refused every call until the embedder called `forget_unfunded`.
 #[test]
-fn a_stale_unfunded_channel_keeps_its_key_and_the_next_call_opens_anew() {
+fn a_stale_unfunded_channel_keeps_its_terms_and_the_call_opens_anew() {
     let w = world("stale", false);
     w.wallet.refuses.store(true, Ordering::SeqCst);
     let mut c = w.client(honest());
@@ -310,34 +314,35 @@ fn a_stale_unfunded_channel_keeps_its_key_and_the_next_call_opens_anew() {
     let old = c.channels[O].payer.params.clone();
     w.wallet.refuses.store(false, Ordering::SeqCst);
     *w.chain.tip.lock().unwrap() += 900; // 1,008 blocks asked; the offer's floor is 144 + 1 + 36
-    assert_eq!(get(&mut c), Err("open_unresolved".into()));
-    assert_eq!((w.funded(), c.unfunded[O].len(), c.unfunded[O][0].payer.params.payer_pub), (0, 1, old.payer_pub));
-    assert!(w.on_disk().contains(&hex::encode(old.payer_pub)), "the old key is still in the ledger");
     assert_eq!(get(&mut c), Ok(200));
-    assert_ne!(c.channels[O].payer.params.payer_pub, old.payer_pub);
-    assert_eq!(w.funded(), 1);
-    // the embedder drops the kept key once its wallet shows no send to it
+    assert_eq!((w.funded(), c.unfunded[O].len(), &c.unfunded[O][0].payer.params), (1, 1, &old));
+    let now = &c.channels[O].payer.params;
+    assert_eq!((now.payer_pub, now.expiry), (old.payer_pub, old.expiry + 900), "one key for the origin, a new expiry");
+    assert!(w.on_disk().contains(&old.expiry.to_string()), "the old terms are still in the ledger");
+    // the embedder drops the kept record once its wallet shows no send to it
     assert_eq!(c.forget_unfunded(O).unwrap(), 1);
     assert!(c.unfunded.is_empty() && c.channels[O].stage == Stage::Open);
 }
 
-/// With a signer the stale key cannot be set aside (a new key would replace it in the signer): the
-/// open stops until the embedder says the key is not needed.
+/// The same with a signer, which answers the key it issued for the origin again: nothing waits
+/// for the embedder, and the signer can still bind the script that was set aside.
 #[test]
-fn a_stale_unfunded_channel_with_a_signer_waits_for_the_embedder() {
+fn a_stale_unfunded_channel_with_a_signer_is_opened_anew_for_the_issued_key() {
     let w = world("stale-signer", false);
     w.wallet.refuses.store(true, Ordering::SeqCst);
-    let mut c = w.bare_client(honest()).with_signer(Arc::new(LocalSigner::new()));
+    let signer = Arc::new(LocalSigner::new());
+    let mut c = w.bare_client(honest()).with_signer(signer.clone());
     assert_eq!(get(&mut c), Err("wallet_error".into()));
-    let key = c.channels[O].payer.params.payer_pub;
+    let old = c.channels[O].payer.params.clone();
     w.wallet.refuses.store(false, Ordering::SeqCst);
     *w.chain.tip.lock().unwrap() += 900;
-    for _ in 0..3 {
-        assert_eq!(get(&mut c), Err("open_unresolved".into()));
-    }
-    assert_eq!((w.funded(), c.channels[O].payer.params.payer_pub), (0, key), "the signer's issued key was not replaced");
-    assert_eq!(c.forget_unfunded(O).unwrap(), 1);
     assert_eq!(get(&mut c), Ok(200));
+    assert_eq!((w.funded(), c.channels[O].payer.params.payer_pub), (1, old.payer_pub), "the signer's issued key was not replaced");
+    // had the failed call sent after all, the signer still signs that script's refund
+    use xbt402::signer::StateSigner;
+    let sent = old.clone().with_funding(&"ab".repeat(32), 0, 200_000).unwrap();
+    let chan = signer.attach(O, &sent).unwrap();
+    assert_eq!(Tx::parse_hex(&signer.sign_refund(&chan).unwrap()).unwrap().locktime, old.expiry);
 }
 
 /// A seller's `minCapacity` is its own number: the budget check does not wrap.

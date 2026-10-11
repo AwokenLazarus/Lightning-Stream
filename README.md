@@ -28,6 +28,7 @@ References (read-only): B1 `agp-050` (`~/xbt-rnd/b1-agp-050`, from agp-054 `0eeb
 ```bash
 cargo test -j2 --workspace
 cargo deny check                   # AGP-075: licences (deny.toml), advisories, crates.io only
+                                   # (it cannot see advisories for the vendored ureq: vendor/ureq/XBT-PATCH.md)
 cargo clippy --workspace --all-targets --all-features -- -D warnings   # AGP-075: clean on main
 cargo build -j2 --release --target aarch64-unknown-linux-gnu -p xbt402
 ./scripts/conformance.sh           # N/N byte-identical, both directions
@@ -65,7 +66,8 @@ binfmt/qemu).
 Dependencies: `secp256k1` 0.29 (libsecp256k1, the global context), `sha2`, `ripemd`, `blake2`,
 `hmac`, `ruint` (256-bit targets and work), `serde_json` with `preserve_order` (never
 `arbitrary_precision`, AGP-035), `base64`, `thiserror`,
-`getrandom`, `indexmap`. Optional: `ureq` (features `http-client`, `rpc`). The `http-server` feature is std only (AGP-068).
+`getrandom`, `indexmap`. Optional: `ureq` (features `http-client`, `rpc`), built from `vendor/ureq`: a build
+outside this workspace needs the same `[patch.crates-io]` (`vendor/ureq/XBT-PATCH.md`, AGP-096). The `http-server` feature is std only (AGP-068).
 std only; no_std isn't a goal.
 
 ## API overview
@@ -3118,9 +3120,8 @@ the next call asks the provider again and funds nothing (`duplicate_channel` fro
 did open it is taken as the yes that was lost). No state, close or rollover is signed before `Open`.
 A `fund` call that errors may have sent: the retry first asks the wallet (`wallet_sends_to`,
 `wallet_send`) and otherwise funds the same script under the same key. A keyed channel that has
-become too old to fund is moved to `Client::unfunded` with its key (with a signer it stays, and the
-open stops with `open_unresolved`, because a signer's new key would replace the old one);
-`Client::forget_unfunded` drops such records once the wallet shows no send to them.
+become too old to fund is moved to `Client::unfunded` and derived again (changed by AGP-096, below:
+AGP-090 stopped the open with `open_unresolved` there, for good with a signer or after sixteen).
 Still true: a channel a seller refuses to open locks its capacity until its expiry, when the kept
 refund spends it. The embedder broadcasts that refund and then removes the record from `channels`.
 
@@ -3147,8 +3148,10 @@ provider has not answered (`ClientChannel::unanswered_msat`: added when a reques
 when the provider answers 402, cleared by a verified receipt), plus the one call of slack a channel
 has over its life (`slack_msat`). So after lost answers the channel goes on, and each call the
 provider served is paid once. Stated limit: an answer lost or damaged on the way is paid for, and
-a provider is believed for one quote per request it left unanswered; a provider that answers 402
-to everything can claim one call over the channel's life, as before.
+a provider is believed for one quote for every paid request that got no receipt, whether the answer
+was lost or the provider answered an error without one. Only a 402 takes a request off that count:
+a provider that answers 402 to everything can claim one call over the channel's life, as before.
+The numbers are under AGP-096 below.
 
 **Transport (T2, T3).**
 - A bare request target is bound byte for byte: `wire::split_scheme` takes a string as absolute
@@ -3158,7 +3161,9 @@ to everything can claim one call over the channel's life, as before.
 - A chunked body whose connection ends inside a chunk is `transport_error`. ureq 2.12.1 returns
   the bytes it has as a whole body and shows a caller nothing else, so the workspace builds ureq
   from `vendor/ureq` (`[patch.crates-io]`): the published source with a two-line patch in
-  `src/chunked/decoder.rs`, described in `vendor/ureq/XBT-PATCH.md`. A body with neither
+  `src/chunked/decoder.rs`, described in `vendor/ureq/XBT-PATCH.md`. This holds for builds whose
+  root manifest carries that `[patch]`; since AGP-096 any other build of the transport stops with
+  a compile error instead of running the published decoder. A body with neither
   Content-Length nor chunking still ends when the connection does (stated limit: the receipt's
   `bodyHash` covers it on a direct paid call; routed and work-rail calls have no such cover).
 - A paid HEAD works: an answer to a HEAD, and a 1xx, 204 or 304, has no body by its framing, so the
@@ -3174,6 +3179,120 @@ Tests: the audit's `xbt402/tests/agp087_hub_b_client.rs`, `agp087_transport.rs` 
 `agp087_transport_http.rs` pass; `xbt402/tests/agp090_client.rs` (15) covers the neighbouring paths;
 unit tests in `funding.rs` and `wire.rs`. Three tests in `lifecycle.rs` assumed a retried rollover
 is a new transaction to a new key and were changed to the one-key rule.
+
+## Fix wave 5, the library client (AGP-096)
+
+Items 4 (the library's side), 6, 7, 14 (the client's part), 18 and 21 of the third closure audit
+(AGP-093, list 1), in `xbt402::client`, `funding.rs`, `wire.rs`, `signer.rs` (`LocalSigner`) and
+`http.rs`. The same rules are in B1 (`xbt402/x402_channel.py`, `funding.py`, `signer.py`) where B1
+has the code.
+
+**A channel that holds no coins never stands in the way (item 6).** With the shipped provider
+(floor 1,008 + 1 + 144 = 1,153 blocks) and the shipped payer (1,008) a keyed channel was "too old
+to fund" one block after it was derived, and a too-old record was never set aside with a signer,
+or refused the origin for good after sixteen with a local key. So one failed `fund` call (an empty
+wallet, a policy refusal, a timeout) ended a payer's business with a seller. Now:
+- A keyed channel whose `fund` call failed is retried as it is while it still has
+  `funding::offer_retry_floor` blocks: `minExpiryBlocks + minConf` plus the larger half of
+  `closeMarginBlocks` (1,081 against the shipped provider, so 72 blocks of retries; the other half
+  of the margin is left for the funding to confirm).
+- Past that it moves to `Client::unfunded` and the same call derives it again from its own offer
+  and funds that. No call fails for it and nothing waits for the embedder.
+- Only a channel the wallet was asked to fund is kept there (`ClientChannel::fund_tried`, saved
+  before the wallet is asked): its `fund` call may have sent. One the wallet never heard of holds
+  nothing and is dropped, so only the owner's own wallet failing fills `unfunded`.
+- Every channel derived for an origin until one is funded pays one key: a signer answers the key
+  it issued and has not bound (`StateSigner::new_key`, the rule `xbt-signer` has had since
+  AGP-089, now also `LocalSigner`'s), and a local key is read back from `unfunded`. So past
+  `MAX_KEPT` (16) the oldest script is forgotten and its key is not. A record with a key of its own
+  (a ledger written by AGP-090) is never dropped.
+- `Client::forget_unfunded` is still there and nothing needs it.
+
+**Funded only on terms the seller offers that day (item 18).** The preflight was asked once, when
+the channel was derived; a later call funded it on those terms (after a seller rotated its payTo
+key: 200,000 sat locked until the expiry). Before a keyed channel of an earlier call is funded,
+the offer of this call must still describe it (payee, close fee and its payer, capacity range, a
+price not above the pinned one) and the provider must answer yes to its terms again. If not, the
+channel is set aside, derived again from the new offer, and the call fails `open_unresolved` with
+nothing funded; the next call funds the new one after the same check. A preflight that gets no
+answer changes nothing. The budget (`budget_sats`) is also checked when the coins leave, not only
+when the channel is derived: six origins keyed while the wallet was empty were all funded later,
+1,200,000 sat under a budget of 1,000,000.
+
+**One seller, one origin (item 18).** `client::split_url` returns the origin as the request binding
+reads it (`wire::canonical_origin`: lowercase scheme and host, no userinfo, no default port), and
+every payer that keys a book by `split_url` gets it. Five spellings of one refusing seller were
+five funded channels. A client ledger that holds a channel under another spelling moves it to the
+origin's own key when it is opened; if both spellings were funded, the second stays under its
+spelling, where `close` and `rollover` by that spelling find it and no request reaches it.
+Not unified: a host with a trailing dot, percent-encoding and IDN forms are other origins, as they
+are to the request binding.
+
+**A request is counted before it leaves (item 18).** The seq, the state and the quote of a paid
+request are saved to the client ledger before the request is on the wire (one more ledger save per
+paid request). They were saved when the call returned, so a process that stopped in between came
+back one call behind the provider; the channel's one call of slack covered that once, and the
+second time every call was `bad_offer` for good.
+
+**The expiry has a lower bound too (item 4, the library's side).** `funding::offer_expiry_blocks`
+refuses (`bad_offer`, before a key is made) an offer whose window lets the channel last less than
+the offer's own floor, or less than `OWNER_MIN_EXPIRY_BLOCKS` (144) or the owner's own wish if that
+is smaller. An offer with `maxExpiryBlocks: 2` and a yes to the preflight got a channel funded
+that expired one block later. The library client's open and rollover and the routed client's ch1
+come through this function; `xbt-signer` holds the same bound in its own check (AGP-095).
+
+**An earlier rollover that confirms after a later yes (item 7).** Every attempt pays one next key.
+`LocalSigner` took that key out of its slot at the first `attach`, so when the seller said yes to a
+later attempt and broadcast an earlier one, the next channel on chain had no key (198,200 sat in
+the audit's run). `LocalSigner` now keeps every key it issued for as long as it lives and binds one
+key to each channel that pays it; `StateSigner`'s documentation states the rule for any signer.
+The real signer was already right (it keeps the key under the next channel's script and binds a
+next channel only when its node shows the rollover): `xbt-signer/tests/agp096_rollover_signer.rs`
+runs the case through the signer's socket.
+
+**Arithmetic (item 14, the client's part).** The audit's sweep ran with the default `max_price`
+(1,000 sat), which refuses a large amount before any sum. `xbt-wallet-mcp` sets `max_price` from
+its caller's `max_sats`, and then a seller's amount reached `price * 1000` and `uncond + amount`
+unchecked: a panic in a release build. Those sums, the daily budget's, and the request counter are
+checked or saturating now, and a conditional offer's `csvDelta` that does not fit 32 bits is
+refused (it was cut to its low bits and signed for).
+
+**The vendored ureq (item 21).** See `vendor/ureq/XBT-PATCH.md`: the patch reaches only builds
+whose root manifest carries the `[patch]`; any other build of the transport is now a compile error
+(`ureq::XBT_PATCH`), not a silent return to the published decoder; `cargo deny` cannot see an
+advisory for a path crate, so advisories for ureq are looked up by hand.
+
+Stated limits:
+- **A refusal is not signed.** A 402 is the provider's word that a request was not charged, and
+  whoever sits between payer and provider can put one in place of an answer the provider served.
+  The payer gives the provider one call of doubt in a channel's life; at the second such charge
+  every call fails `bad_offer`. The payer then closes the channel at what it signed (one call less
+  than the provider served, in the test) and the next call opens another. Signing refusals would
+  be a protocol change.
+- **A provider is believed for one quote per paid request that got no receipt.** Measured: one
+  honest call, ten paid requests answered `503` and never served, then one unsigned 402 naming
+  eleven calls, and the client signed 1,650 sat for 150 sat of service. Nothing in the client
+  bounds it; the caller's retries, the channel's capacity and `daily_budget` do. A caller that
+  retries on errors should set `daily_budget`.
+- **A key set aside is the signer's to keep.** With a signer that makes a new key on every
+  `new_key` and forgets the one before (against `StateSigner`'s documented rule), a `fund` call
+  that failed after it sent, followed by a new derivation, leaves coins under a key that signer
+  dropped. `LocalSigner`, B1's `ChannelSigner` and `xbt-signer` do not.
+- **A wallet that cannot list its sends may fund two scripts of one open**: a `fund` call that
+  failed after it sent, then a retry past the retry floor. Both pay the same key; the client holds
+  a refund for the channel it opened and the terms of the other in `unfunded`.
+- A `Funded` channel a seller refuses to open still locks its capacity until its expiry and
+  blocks its origin until the embedder removes the record (AGP-090's limit, unchanged).
+
+API changes for embedders: `client::split_url` returns the canonical origin (the key of
+`Client::channels`); `funding::{offer_retry_floor, OWNER_MIN_EXPIRY_BLOCKS}`;
+`wire::canonical_origin`; `ClientChannel::fund_tried`; `LocalSigner::new_key` answers the unbound
+key again; a channel too old
+to fund no longer answers `open_unresolved` (a changed offer does, once).
+
+Tests: `xbt402/tests/agp096_client.rs` (20), the audit's `agp093_client.rs` (one control line
+changed: see the file), `xbt-signer/tests/agp096_rollover_signer.rs`, unit tests in `funding.rs`,
+`signer.rs` and `wire.rs`; B1 `tests/security/test_agp096_client.py` (13).
 
 ## Lightning rail pays BOLT 12 offers (AGP-082)
 

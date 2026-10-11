@@ -159,6 +159,22 @@ pub fn offer_expiry_floor(extra: &Value) -> Result<u64> {
     Ok(open_expiry_floor(min_expiry, min_conf, close_margin))
 }
 
+/// The fewest blocks to expiry at which a payer still sends the funding of a channel it derived
+/// earlier (a retry after a `fund` call that failed, or after a restart): `minExpiryBlocks +
+/// minConf`, plus the larger half of `closeMarginBlocks`.
+///
+/// The rule (AGP-096, audit item 6): a retry may use up to half of the time the offer allows a
+/// funding to confirm, and the other half stays for the funding itself. The test used to be the
+/// whole of [`open_expiry_floor`], which is the very number a payer opens at when its own wish is
+/// below it (1,153 against 1,008 with the shipped provider), so a channel was too old to fund one
+/// block after it was derived. Below this number the channel is derived again, never funded late:
+/// a funding the provider meets with fewer than `minExpiryBlocks` left is refused `bad_expiry` on
+/// every retry, with the coins locked until the refund (AGP-076).
+pub fn offer_retry_floor(extra: &Value) -> Result<u64> {
+    let (min_expiry, _, min_conf, close_margin) = offer_terms(extra)?;
+    Ok(open_expiry_floor(min_expiry, min_conf, close_margin - close_margin / 2))
+}
+
 /// The most blocks to expiry a payer funds on an offer unless its owner sets another bound: four
 /// weeks, the bound the signer socket's `open_channel` has had since AGP-063.
 pub const OWNER_MAX_EXPIRY_BLOCKS: u64 = 4_032;
@@ -167,22 +183,35 @@ pub const OWNER_MAX_EXPIRY_BLOCKS: u64 = 4_032;
 /// channel (a route's locks need the room).
 pub const OWNER_MAX_HUB_EXPIRY_BLOCKS: u64 = 2 * OWNER_MAX_EXPIRY_BLOCKS;
 
-/// [`open_expiry_blocks`] for an offer's `extra`, held to the owner's bound. `minConf` absent is 1,
-/// as everywhere on this wire; the three others have no default, so an offer without one is
+/// The fewest blocks to expiry a payer funds on an offer, unless its owner asks for fewer: a day.
+/// The signer's `open_from_offer` holds the same number (AGP-095).
+pub const OWNER_MIN_EXPIRY_BLOCKS: u64 = 144;
+
+/// [`open_expiry_blocks`] for an offer's `extra`, held to the owner's bounds. `minConf` absent is
+/// 1, as everywhere on this wire; the three others have no default, so an offer without one is
 /// refused `bad_offer`.
 ///
-/// The rule (AGP-090, review C2): how long a payer's coins are locked is the owner's number, never
-/// only the seller's. Every term of [`open_expiry_floor`] comes from the offer, and so did the only
-/// cap (`maxExpiryBlocks`): an offer with `minExpiryBlocks` 2,000,000 got a channel that refunds in
-/// 38 years. So the payer asks for at most `owner_max` blocks, and an offer whose floor is above
-/// that is refused `bad_offer` here, before a key is made or anything is funded. Every payer that
-/// opens on an offer (the library client's open and rollover, the routed client's ch1) comes
-/// through this function.
+/// The rule (AGP-090, review C2; the lower side AGP-096, audit item 4): how long a payer's coins
+/// are locked, and how long the channel they pay for lasts, are the owner's numbers, never only
+/// the seller's. Every term of [`open_expiry_floor`] comes from the offer, and so did the only cap
+/// (`maxExpiryBlocks`). From above: an offer with `minExpiryBlocks` 2,000,000 got a channel that
+/// refunds in 38 years, so the payer asks for at most `owner_max` blocks, and an offer whose floor
+/// is above that is refused. From below: an offer with `maxExpiryBlocks` 2 got a channel that
+/// expires in one block, which no provider opens and which costs a funding fee and a refund fee,
+/// so the payer funds nothing that lasts less than the offer's own floor (below it the provider's
+/// own check refuses the open) or less than [`OWNER_MIN_EXPIRY_BLOCKS`] (or the owner's `want`, if
+/// that is smaller). Both are refused `bad_offer` here, before a key is made or anything is
+/// funded, and neither is clamped. Every payer that opens on an offer (the library client's open
+/// and rollover, the routed client's ch1) comes through this function.
 pub fn offer_expiry_blocks(extra: &Value, want: u64, owner_max: u64) -> Result<u64> {
     let (min_expiry, max_expiry, min_conf, close_margin) = offer_terms(extra)?;
     let blocks = open_expiry_blocks(want.min(owner_max), min_expiry, max_expiry, min_conf, close_margin);
     if blocks > owner_max {
         return fail("bad_offer", format!("the offer needs {blocks} blocks to expiry and this payer locks its coins for at most {owner_max}"));
+    }
+    let least = open_expiry_floor(min_expiry, min_conf, close_margin).max(want.min(OWNER_MIN_EXPIRY_BLOCKS));
+    if blocks < least {
+        return fail("bad_offer", format!("the offer's window lets the channel last {blocks} blocks and this payer funds one only for {least} or more"));
     }
     Ok(blocks)
 }
@@ -246,5 +275,36 @@ mod tests {
         assert_eq!(offer_expiry_blocks(&ex(144, 100_000), 50_000, 4_032).unwrap(), 4_032);
         // and a bound the owner raised is the owner's
         assert_eq!(offer_expiry_blocks(&ex(2_000_000, 3_000_000), 1_008, 2_100_000).unwrap(), 2_000_145);
+    }
+
+    #[test]
+    fn the_owners_floor_holds_whatever_the_offer_says() {
+        let ex = |min: u64, max: u64, margin: u64| json!({"minExpiryBlocks": min, "maxExpiryBlocks": max, "closeMarginBlocks": margin});
+        // the audit's seller: a window of one block, no floor of its own
+        for max in [0, 1, 2, 144] {
+            assert_eq!(offer_expiry_blocks(&ex(1, max, 0), 1_008, 4_032).unwrap_err().code, "bad_offer", "maxExpiryBlocks {max}");
+        }
+        assert_eq!(offer_expiry_blocks(&ex(1, 145, 0), 1_008, 4_032).unwrap(), 144);
+        // a window below the offer's own floor: the provider's check would refuse the open
+        assert_eq!(offer_expiry_blocks(&ex(1_008, 1_100, 144), 1_008, 4_032).unwrap_err().code, "bad_offer");
+        assert_eq!(offer_expiry_blocks(&ex(1_008, 1_154, 144), 1_008, 4_032).unwrap(), 1_153);
+        // an owner who asks for less than a day gets it, down to the offer's floor
+        assert_eq!(offer_expiry_blocks(&ex(1, 30, 0), 20, 4_032).unwrap(), 20);
+        assert_eq!(offer_expiry_blocks(&ex(1, 30, 0), 0, 4_032).unwrap(), 2);
+        assert_eq!(offer_expiry_blocks(&ex(1, 15, 0), 20, 4_032).unwrap_err().code, "bad_offer");
+        for x in [0, 1, u64::MAX - 1, u64::MAX] {
+            let _ = offer_expiry_blocks(&ex(x, x, x), x, x);
+            let _ = offer_retry_floor(&ex(x, x, x));
+        }
+    }
+
+    #[test]
+    fn a_retry_keeps_the_larger_half_of_the_margin_for_the_funding() {
+        let ex = |margin: u64| json!({"minExpiryBlocks": 1_008, "maxExpiryBlocks": 8_640, "closeMarginBlocks": margin});
+        assert_eq!((offer_expiry_floor(&ex(144)).unwrap(), offer_retry_floor(&ex(144)).unwrap()), (1_153, 1_081));
+        assert_eq!(offer_retry_floor(&ex(36)).unwrap(), 1_027);
+        assert_eq!(offer_retry_floor(&ex(5)).unwrap(), 1_012);
+        assert_eq!(offer_retry_floor(&ex(1)).unwrap(), 1_010);
+        assert_eq!(offer_retry_floor(&ex(0)).unwrap(), 1_009);
     }
 }

@@ -12,7 +12,8 @@
 #    `-p xbt-wallet-mcp`; every
 #    binary must be a static ELF of the right machine;
 # 4. a cmp-shaped consumer outside the repo: xbt402 + xbt-signer as git dependencies at REF's commit,
-#    default-features = false, its own serde_json (no features), built for aarch64 musl.
+#    default-features = false, its own serde_json (no features) and the ureq patch (AGP-096), built
+#    for aarch64 musl.
 #
 # Env: XBT_ZIGBUILD (default ~/xbt-rnd/tools/zigbuild/bin/cargo-zigbuild, installed with
 #   cargo install --locked cargo-zigbuild@0.23.4 --root ~/xbt-rnd/tools/zigbuild),
@@ -115,6 +116,11 @@ publish = false
 xbt402 = { git = "file://$W/xbt-rs", rev = "$REV", default-features = false }
 xbt-signer = { git = "file://$W/xbt-rs", rev = "$REV", default-features = false }
 serde_json = "1"
+
+# AGP-096: [patch] applies from the root of a build only. Without this the consumer resolves the
+# published ureq, and xbt402 does not compile against it (vendor/ureq/XBT-PATCH.md).
+[patch.crates-io]
+ureq = { git = "file://$W/xbt-rs", rev = "$REV" }
 EOF
 cat > "$C/src/main.rs" <<'EOF'
 // Links the cmp surface: provider, client (+ signer seam, client ledger), routing payer, the signer
