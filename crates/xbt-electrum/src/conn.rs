@@ -149,12 +149,40 @@ impl Link {
         }
     }
 
-    fn send(&mut self, line: &[u8]) -> io::Result<()> {
+    /// Write `line`, all of it, by `deadline`.
+    ///
+    /// The rule (AGP-097): **a request is written by one deadline, however slowly the server
+    /// reads.** The socket's write timeout is per write, and a write that moved one byte is a
+    /// success: a server that reads a little at a time held a large line (a broadcast) for one
+    /// timeout per write, with the connection's lock taken, so nothing was read from it either.
+    /// Each write here gets what is left of the deadline. An error leaves a line half written:
+    /// the caller hangs up.
+    fn send(&mut self, line: &[u8], deadline: Instant) -> io::Result<()> {
+        fn left(s: &TcpStream, deadline: Instant) -> io::Result<()> {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "the request was not written by its deadline"));
+            }
+            s.set_write_timeout(Some(left))
+        }
         match self {
-            Link::Plain(s) => s.write_all(line),
+            Link::Plain(s) => {
+                let mut rest = line;
+                while !rest.is_empty() {
+                    left(s, deadline)?;
+                    match s.write(rest) {
+                        Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                        Ok(n) => rest = &rest[n..],
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                Ok(())
+            }
             Link::Tls(s, c) => {
                 c.writer().write_all(line)?;
                 while c.wants_write() {
+                    left(s, deadline)?;
                     c.write_tls(s)?;
                 }
                 Ok(())
@@ -389,6 +417,15 @@ impl Connection {
             let l = g.as_ref().ok_or_else(|| self.unreachable("not connected"))?;
             (l.link.clone(), l.pending.clone(), l.fault.clone())
         };
+        // The rule (AGP-097): a server is hung up on only for a request that went a whole timeout
+        // unanswered. A request the caller's deadline leaves no time for is not sent, and one the
+        // deadline cuts short is given up without closing: the time was used up elsewhere (by
+        // another server, as a rule), and hanging up would fail every other request on this
+        // connection and cost a reconnect. Before, both ended as a timeout: the honest server was
+        // dropped and flagged.
+        if until.is_some_and(|u| Instant::now() >= u) {
+            return err(Kind::Deadline, format!("{}: the call's deadline came before {} was sent", self.url, reqs[0].0));
+        }
         let mut waits: Vec<(u64, Receiver<Value>)> = Vec::with_capacity(reqs.len());
         let mut msgs = Vec::with_capacity(reqs.len());
         {
@@ -403,18 +440,24 @@ impl Connection {
         }
         let mut line = if msgs.len() == 1 { msgs.pop().unwrap().to_string() } else { Value::Array(msgs).to_string() };
         line.push('\n');
-        let sent = lock(&link).send(line.as_bytes()); // the guard must be gone before close()
+        let own = Instant::now() + self.timeout;
+        let deadline = until.map_or(own, |u| u.min(own));
+        let sent = lock(&link).send(line.as_bytes(), deadline); // the guard must be gone before close()
         if let Err(e) = sent {
             self.close();
             return Err(self.unreachable(e));
         }
-        let deadline = Instant::now() + self.timeout;
-        let deadline = until.map_or(deadline, |u| u.min(deadline));
         let mut out = Vec::with_capacity(waits.len());
         for (id, rx) in waits {
             let left = deadline.saturating_duration_since(Instant::now());
             match rx.recv_timeout(left) {
                 Ok(msg) => out.push(answer(&msg)),
+                Err(RecvTimeoutError::Timeout) if deadline < own => {
+                    // Cut short by the caller's deadline, not by the timeout. The requests stay
+                    // pending, so an answer that still comes is within what the connection allows
+                    // and is dropped unread; they go when the connection does.
+                    return err(Kind::Deadline, format!("{}: the call's deadline came before the answer to {}", self.url, reqs[out.len()].0));
+                }
                 Err(RecvTimeoutError::Timeout) => {
                     lock(&pending).remove(&id);
                     self.close();
@@ -459,9 +502,19 @@ impl Drop for Connection {
     }
 }
 
+/// JSON-RPC 2.0: the server has no such method.
+const METHOD_NOT_FOUND: i64 = -32601;
+
 fn answer(msg: &Value) -> Result<Value> {
     if let Some(e) = msg.get("error").filter(|e| !e.is_null()) {
-        let m = e.get("message").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| e.to_string());
+        let mut m = e.get("message").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| e.to_string());
+        // An error about the method says nothing about what was asked for. The backend reads "not
+        // there" from the words of an error and skips any that names the method
+        // (`backend::says_not_there`), so the code's meaning is put in words when the server's
+        // own leave it out (AGP-097).
+        if e.get("code").and_then(Value::as_i64) == Some(METHOD_NOT_FOUND) && !m.to_ascii_lowercase().contains("method") {
+            m = format!("method not found: {m}");
+        }
         return err(Kind::Server, m);
     }
     Ok(msg.get("result").cloned().unwrap_or(Value::Null))
@@ -567,6 +620,20 @@ fn read_loop(mut sock: TcpStream, link: Arc<Mutex<Link>>, pending: Pending, noti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AGP-097: JSON-RPC's "no such method" is told by its code whatever the server's words, so
+    /// that the backend never reads it as "no such transaction".
+    #[test]
+    fn a_method_not_found_error_says_so_whatever_its_words() {
+        let e = |code: i64, m: &str| answer(&json!({"id": 1, "error": {"code": code, "message": m}})).unwrap_err();
+        for words in ["not found", "missing", "unknown request", ""] {
+            let got = e(-32601, words);
+            assert!(got.kind == Kind::Server && got.msg.to_ascii_lowercase().contains("method"), "{words:?} -> {:?}", got.msg);
+        }
+        assert_eq!(e(-32601, "Method not found").msg, "Method not found");
+        // any other code: the server's own words, untouched
+        assert_eq!(e(2, "No such mempool or blockchain transaction").msg, "No such mempool or blockchain transaction");
+    }
 
     #[test]
     fn answer_caps_fit_the_largest_legitimate_answer() {

@@ -46,6 +46,23 @@
 //! reach is refused: the owner funds the channel from mined coins, or from coins that passed through
 //! a P2PKH address after the split.
 //!
+//! **What the coinbase pin rests on (AGP-097, read from XBT's consensus code, Knots `61b07b8`).**
+//! The scriptSig pin holds by itself: the txid commits to a signature SHA-256 Bitcoin cannot
+//! verify. The coinbase pin does not. A coinbase's txid commits to nothing that names the chain: it
+//! is the double SHA-256 of the same bytes on both chains (`primitives/transaction.cpp:81-84`), and
+//! what consensus asks of a coinbase after the fork is the block's height at the start of its
+//! scriptSig (BIP 34, `validation.cpp:4933-4939`), a value of at most subsidy plus fees
+//! (`validation.cpp:3107-3110`, the same subsidy schedule) and, at the fork block only, the fork's
+//! headline in the scriptSig (`validation.cpp:4576-4583`); payee attestation, where it is active,
+//! constrains outputs SHA-256 Bitcoin accepts as they are. So the coinbase of XBT's block H is a
+//! valid coinbase for SHA-256 Bitcoin's block H and for no other block there (the height is in
+//! it): it is XBT-only exactly when the other chain already has another block at height H and does
+//! not reorganise below it. Where it does not yet, whoever mines that block there can mine the same
+//! coinbase, which pays the same keys. That takes a block on each chain at one height from one
+//! party, or a miner who gives its block's reward to the other coinbase's payees. The signer has
+//! no SHA-256 Bitcoin node to compare heights with, so it cannot check this; the rule is kept as
+//! the owner decided it (2026-10-11) and this is its stated limit.
+//!
 //! The funding transaction's checks: the channel's txid, output, amount and P2WSH. Inputs are looked up
 //! with `getrawtransaction` (the signer's node needs `txindex=1`); a lookup that fails leaves the
 //! channel unproven, and an unproven channel carries no payment. The verdict carries the funding block's

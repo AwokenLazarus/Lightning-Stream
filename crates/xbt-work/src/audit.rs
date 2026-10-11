@@ -317,6 +317,13 @@ pub struct AuditOutcome {
     pub proof: Option<Value>,
 }
 
+/// Whether a coinbase that paid `paid` sats, with `owed` deferred by signed lines, covers
+/// `expected` within [`TOLERANCE`]. All three come from outside (the node, the Prime's lines, the
+/// Prime's statement), each up to 2^64-1: the sums saturate.
+pub fn covers(paid: u64, owed: u64, expected: u64) -> bool {
+    paid.saturating_add(owed).saturating_add(TOLERANCE) >= expected
+}
+
 /// §10.3 for the provider holding `book`: the coinbase of `block` (from the provider's own node),
 /// with the statement `sw` and the deferral lines it published, under `bounds`. The statement must
 /// verify under the pinned key (`bad_window_sig`) and name `block`'s height and hash (`wrong_block`).
@@ -337,7 +344,7 @@ pub fn audit_block(book: &ReceiptBook, sw: &SignedWindow, block: &ChainBlock, bo
     let expected = expected_sats(value, fee, l, ww)?;
     let (owed, lines) = deferred_sats(&book.prime_pubkey, w, &book.identity, deferred);
     let covered = paid.saturating_add(owed).saturating_add(TOLERANCE);
-    let ok = expected < mp || covered >= expected;
+    let ok = expected < mp || covers(paid, owed, expected);
     let proof = (!ok).then(|| {
         let mut p = obj([("kind", FRAUD_KIND.into()), ("identity", book.identity.clone().into()), ("height", w.height.into()),
                          ("blockHash", w.block_hash.clone().into()), ("coinbaseValueSats", value.into()),

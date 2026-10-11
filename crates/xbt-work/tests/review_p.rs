@@ -189,8 +189,11 @@ fn p6_a_reorg_rolls_back_released_credit() {
     assert_eq!(wp.orphaned(110).unwrap(), None);
 }
 
-/// P6: an unfunded invoice past its TTL stays dormant for the grace: work mined on it just before
-/// expiry is still accepted and credited. Past the grace it is gone.
+/// P6: an unfunded invoice past its TTL stays in the relay pull for the grace: work mined on it
+/// just before expiry is still pulled and credited. Past the grace it is no longer pulled, and a
+/// receipt with no work is refused. AGP-097 changed the last assertion: a receipt that shows work
+/// was refused past the grace too (`unknown_invoice`), which stranded work mined in time; it is
+/// credited whenever it is presented.
 #[test]
 fn p6_an_invoice_with_work_outlives_its_ttl() {
     let k = PrimeKey::from_seed(70, &[9u8; 32]);
@@ -204,9 +207,9 @@ fn p6_an_invoice_with_work_outlives_its_ttl() {
     std::thread::sleep(std::time::Duration::from_millis(1100));
     gone.issue_invoice().unwrap();
     assert!(!gone.invoices().contains(&inv));
-    // AGP-091 adds: past TTL and grace its work is refused (before, once a later issuance had dropped it)
+    assert_eq!(gone.accept(&k.sign(&WorkReceipt::zero(70, PROV, &inv)).unwrap()).unwrap_err().code, "unknown_invoice", "no work: gone");
     let r = WorkReceipt { seq: 4, cum_work: 1000, shares: 4, first_height: 101, last_height: 103, difficulty: 1, ..WorkReceipt::zero(70, PROV, &inv) };
-    assert_eq!(gone.accept(&k.sign(&r).unwrap()).unwrap_err().code, "unknown_invoice");
+    assert_eq!(gone.accept(&k.sign(&r).unwrap()).unwrap(), 1000, "work on it is credited whenever it is presented (AGP-097)");
 }
 
 /// P6: no client can take the unfunded invoice slots, because there are none (AGP-091). This test

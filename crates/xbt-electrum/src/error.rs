@@ -8,6 +8,9 @@ pub enum Kind {
     Unreachable,
     /// A server answered with a JSON-RPC error (its own words, e.g. a broadcast refused).
     Server,
+    /// The call's own deadline came before the request was sent, or before its answer. This says
+    /// nothing about the server: it is not flagged or hung up on for it (AGP-097).
+    Deadline,
     /// Too few servers answered (`min_servers`).
     TooFewServers,
     /// Servers answered, but none is on the pinned checkpoint: the wrong chain (or the wrong checkpoint).

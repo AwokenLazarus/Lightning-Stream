@@ -19,10 +19,20 @@
 //! takes the block's payment out again ([`ReceiptBook::uncover`]). This replaces the AGP-065 spans
 //! (`Open`, `Covered`, `Skipped`), under which one passing audit released everything its bound
 //! counted, whatever the coinbase paid.
+//!
+//! AGP-097 (third closure audit, WORK 2). The rule: **unpaid credit counts against a cap that
+//! follows the price at the price it was granted at.** A cap in calls or sats is turned into work
+//! units at each epoch, and credit is kept in work units; when a call comes to cost twice the work
+//! the cap doubles, and the same unpaid units used to fill only half of it, so a Prime that never
+//! paid was served half the cap again at every doubling. Each grant now remembers what a call and
+//! a sat cost in work when it was made ([`Rate`]), and the caps count its unpaid part at today's
+//! rate ([`ReceiptBook::counted`]): 900 unpaid calls are 900 calls of the cap at any difficulty.
+//! Balances are not revalued (§6.3): only what the caps count is.
 use std::collections::HashMap;
 
 use ed25519_dalek::VerifyingKey;
 use indexmap::IndexMap;
+use ruint::aliases::U256;
 use serde_json::Value;
 use xbt402::json::obj;
 
@@ -74,6 +84,27 @@ impl CreditCaps {
     }
 }
 
+/// What a cap that follows the price is worked out from at one epoch, in the two forms an operator
+/// sets one (0: not known, and nothing is converted).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Rate {
+    /// Work units one call costs before the haircut: what a cap in calls multiplies.
+    pub call: u64,
+    /// Work units a sat buys, times 2^64 ([`work_rate`](crate::pricing::work_rate)): what a cap in
+    /// sats multiplies.
+    pub sat: u128,
+}
+
+/// How a cap follows the price: not at all (it was set in work units, or there is none), or as a
+/// number of calls or of sats turned into work units at each epoch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Follows {
+    #[default]
+    No,
+    Calls,
+    Sats,
+}
+
 /// The receipts a provider holds for one identity under one Prime key.
 #[derive(Debug, Clone)]
 pub struct ReceiptBook {
@@ -88,8 +119,8 @@ pub struct ReceiptBook {
     pub intervals: Vec<Interval>,
     pub fraud: Vec<Equivocation>,
     /// Credit not yet settled ([`ReceiptBook::settle`]), in the order it was granted: (invoice,
-    /// work). Paid-for work covers the oldest first.
-    pub credits: Vec<(String, u64)>,
+    /// work, the [`ReceiptBook::rate`] it was granted at). Paid-for work covers the oldest first.
+    pub credits: Vec<(String, u64, Rate)>,
     /// Work the coinbase of each audited block paid for, (height, work), lowest height first.
     pub cover: Vec<(u32, u64)>,
     /// Paid-for work of settled blocks that no credit has used yet.
@@ -99,6 +130,12 @@ pub struct ReceiptBook {
     pub settled_through: u32,
     /// The caps in force (configuration, not state).
     pub caps: CreditCaps,
+    /// What a call and a sat cost in work at the epoch in force; nothing (the default) when the
+    /// price does not move (a fixed amount per call). Configuration, set with the caps.
+    pub rate: Rate,
+    /// How each cap follows the price: (per invoice, total). Only a cap that does counts unpaid
+    /// credit at today's rate; a cap in work units counts work units.
+    pub follows: (Follows, Follows),
     /// Set: no new credit at all (the carry rules of §10.3/§13.1), with the reason's short code.
     pub frozen: Option<String>,
 }
@@ -107,7 +144,7 @@ impl ReceiptBook {
     pub fn new(identity: &str, prime_pubkey: VerifyingKey, prime_id: u32) -> Self {
         Self { identity: identity.into(), prime_pubkey, prime_id, last: IndexMap::new(), by_seq: HashMap::new(),
                credited: HashMap::new(), intervals: vec![], fraud: vec![], credits: vec![], cover: vec![], cover_settled: 0, settled_through: 0,
-               caps: CreditCaps::default(), frozen: None }
+               caps: CreditCaps::default(), rate: Rate::default(), follows: (Follows::No, Follows::No), frozen: None }
     }
 
     /// Work the audited coinbases paid for.
@@ -116,7 +153,41 @@ impl ReceiptBook {
     }
 
     fn granted(&self) -> u128 {
-        self.credits.iter().fold(0u128, |a, (_, w)| a + u128::from(*w))
+        self.credits.iter().fold(0u128, |a, (_, w, _)| a + u128::from(*w))
+    }
+
+    /// `work` units granted at rate `at`, as a cap that follows the price counts them now: the
+    /// work the same calls, or the same sats, cost today (rounded up). Unchanged for a cap that
+    /// does not follow the price, and when either rate is not known.
+    fn at_todays_rate(&self, work: u64, at: Rate, follows: Follows) -> u64 {
+        let (now, then) = match follows {
+            Follows::No => return work,
+            Follows::Calls => (u128::from(self.rate.call), u128::from(at.call)),
+            Follows::Sats => (self.rate.sat, at.sat),
+        };
+        if now == 0 || then == 0 || now == then {
+            return work;
+        }
+        let w = (U256::from(work) * U256::from(now)).div_ceil(U256::from(then));
+        u64::try_from(w).unwrap_or(u64::MAX)
+    }
+
+    /// Unpaid credit as a cap counts it: of `invoice`, or across all invoices (None). For a cap
+    /// that follows the price each grant's unpaid part is taken at today's rate; for any other it
+    /// is [`ReceiptBook::unaudited_work`], as it is whenever the rate never moved.
+    pub fn counted(&self, invoice: Option<&str>, follows: Follows) -> u64 {
+        let (mut left, mut sum) = (self.unaudited_work(None), 0u64);
+        for (inv, w, at) in self.credits.iter().rev() {
+            if left == 0 {
+                break;
+            }
+            let part = (*w).min(left);
+            left -= part;
+            if invoice.is_none_or(|i| i == inv) {
+                sum = sum.saturating_add(self.at_todays_rate(part, *at, follows));
+            }
+        }
+        sum
     }
 
     /// Credit no coinbase has paid for yet: of `invoice`, or across all invoices (None). Payments
@@ -125,7 +196,7 @@ impl ReceiptBook {
         let unpaid = u64::try_from(self.granted().saturating_sub(self.paid_work())).unwrap_or(u64::MAX);
         let Some(invoice) = invoice else { return unpaid };
         let (mut left, mut mine) = (unpaid, 0u64);
-        for (inv, w) in self.credits.iter().rev() {
+        for (inv, w, _) in self.credits.iter().rev() {
             if left == 0 {
                 break;
             }
@@ -161,8 +232,8 @@ impl ReceiptBook {
             return 0;
         }
         let surplus = u64::try_from(self.paid_work().saturating_sub(self.granted())).unwrap_or(u64::MAX);
-        let per_invoice = self.caps.per_invoice.map_or(u64::MAX, |c| c.saturating_sub(self.unaudited_work(Some(invoice))));
-        let total = self.caps.total.map_or(u64::MAX, |c| c.saturating_sub(self.unaudited_work(None)));
+        let per_invoice = self.caps.per_invoice.map_or(u64::MAX, |c| c.saturating_sub(self.counted(Some(invoice), self.follows.0)));
+        let total = self.caps.total.map_or(u64::MAX, |c| c.saturating_sub(self.counted(None, self.follows.1)));
         surplus.saturating_add(per_invoice.min(total))
     }
 
@@ -205,7 +276,7 @@ impl ReceiptBook {
             !settled
         });
         let mut done = 0;
-        for (_, w) in self.credits.iter_mut() {
+        for (_, w, _) in self.credits.iter_mut() {
             let part = u128::from(*w).min(deep);
             deep -= part;
             // part <= *w, a u64
@@ -229,8 +300,8 @@ impl ReceiptBook {
             return 0;
         }
         match self.credits.last_mut() {
-            Some((inv, w)) if inv == invoice => *w = w.saturating_add(granted),
-            _ => self.credits.push((invoice.to_string(), granted)),
+            Some((inv, w, at)) if inv == invoice && *at == self.rate => *w = w.saturating_add(granted),
+            _ => self.credits.push((invoice.to_string(), granted, self.rate)),
         }
         let c = self.credited.entry(invoice.to_string()).or_insert(0);
         *c = c.saturating_add(granted);
@@ -332,7 +403,9 @@ impl ReceiptBook {
         let last: Vec<Value> = self.last.values().map(Signed::to_doc).collect();
         let iv: Vec<Value> = self.intervals.iter().map(|(lo, hi, w)| Value::from(vec![Value::from(*lo), Value::from(*hi), Value::from(*w)])).collect();
         let cr: serde_json::Map<String, Value> = self.last.keys().map(|k| (k.clone(), self.credited.get(k).copied().unwrap_or(0).into())).collect();
-        let credits: Vec<Value> = self.credits.iter().map(|(inv, w)| Value::from(vec![Value::from(inv.clone()), Value::from(*w)])).collect();
+        // the sat rate is a u128: a decimal string (JSON numbers hold 64 bits here)
+        let credits: Vec<Value> = self.credits.iter()
+            .map(|(inv, w, at)| Value::from(vec![Value::from(inv.clone()), Value::from(*w), Value::from(at.call), Value::from(at.sat.to_string())])).collect();
         let cover: Vec<Value> = self.cover.iter().map(|(h, w)| Value::from(vec![Value::from(*h), Value::from(*w)])).collect();
         let mut held: Vec<&Signed> = self.by_seq.values().filter(|s| self.last.get(&s.receipt.invoice).is_none_or(|l| l.receipt.seq != s.receipt.seq)).collect();
         held.sort_by(|a, b| (&a.receipt.invoice, a.receipt.seq).cmp(&(&b.receipt.invoice, b.receipt.seq)));
@@ -373,7 +446,15 @@ impl ReceiptBook {
         if let Some(credits) = v.get("credits") {
             for c in credits.as_array().ok_or_else(|| bad("credits"))? {
                 let inv = c.get(0).and_then(Value::as_str).ok_or_else(|| bad("credit"))?;
-                self.credits.push((inv.to_string(), c.get(1).and_then(Value::as_u64).ok_or_else(|| bad("credit"))?));
+                // absent in state written before AGP-097: taken as granted at the rate in force now
+                // (right unless the epoch moved while the credit was unpaid); present, it must read
+                let at = match (c.get(2), c.get(3)) {
+                    (None, None) => self.rate,
+                    (Some(call), Some(sat)) => Rate { call: call.as_u64().ok_or_else(|| bad("credit rate"))?,
+                                                      sat: sat.as_str().and_then(|r| r.parse().ok()).ok_or_else(|| bad("credit rate"))? },
+                    _ => return Err(bad("credit rate")),
+                };
+                self.credits.push((inv.to_string(), c.get(1).and_then(Value::as_u64).ok_or_else(|| bad("credit"))?, at));
             }
             for c in v.get("cover").and_then(Value::as_array).ok_or_else(|| bad("cover"))? {
                 let f = |j: usize| c.get(j).and_then(Value::as_u64).ok_or_else(|| bad("cover"));
@@ -387,14 +468,14 @@ impl ReceiptBook {
             // skipped credit (none of it forgiven any more) is unpaid, the settled skipped first
             let settled = v.get("settledSkipped").and_then(Value::as_u64).ok_or_else(|| bad("settledSkipped"))?;
             if settled > 0 {
-                self.credits.push((String::new(), settled));
+                self.credits.push((String::new(), settled, self.rate));
             }
             for s in spans.as_array().ok_or_else(|| bad("spans"))? {
                 let invoice = s.get(0).and_then(Value::as_str).ok_or_else(|| bad("span"))?;
                 let credited = s.get(4).and_then(Value::as_u64).ok_or_else(|| bad("span"))?;
                 match s.get(5).and_then(Value::as_str) {
                     Some("covered") => {}
-                    Some("open" | "skipped") if credited > 0 => self.credits.push((invoice.to_string(), credited)),
+                    Some("open" | "skipped") if credited > 0 => self.credits.push((invoice.to_string(), credited, self.rate)),
                     Some("open" | "skipped") => {}
                     _ => return Err(bad("span")),
                 }
@@ -406,7 +487,7 @@ impl ReceiptBook {
                 let w = u.get(2).and_then(Value::as_u64).ok_or_else(|| bad("unaudited"))?;
                 let w = w.min(self.credited.get(inv).copied().unwrap_or(0));
                 if w > 0 {
-                    self.credits.push((inv.to_string(), w));
+                    self.credits.push((inv.to_string(), w, self.rate));
                 }
             }
         }
@@ -454,6 +535,44 @@ mod tests {
         c.load(&b.to_json()).unwrap();
         assert_eq!((c.intervals.clone(), c.credited.clone(), c.fraud.len()), (b.intervals.clone(), b.credited.clone(), 2));
         assert_eq!(c.accept(&k.sign(&r(8, 30, 101, 105)).unwrap(), I).unwrap(), 2);
+    }
+
+    /// AGP-097: against a cap that follows the price, unpaid credit counts at today's rate, a
+    /// payment takes the oldest out of the count, and a cap in work units counts work units.
+    #[test]
+    fn a_cap_that_follows_the_price_counts_unpaid_credit_at_todays_rate() {
+        let k = PrimeKey::from_seed(70, &[1u8; 32]);
+        let mut b = ReceiptBook::new(P, k.pubkey(), 70);
+        // 100 calls of 10 units; the cap follows the price in calls
+        (b.caps.total, b.rate, b.follows) = (Some(1000), Rate { call: 10, sat: 1 << 40 }, (Follows::No, Follows::Calls));
+        assert_eq!(b.accept(&k.sign(&r(1, 600, 101, 102)).unwrap(), I).unwrap(), 600);
+        assert_eq!((b.counted(None, Follows::Calls), b.room(I)), (600, 400));
+        // a call costs 25 units now: the cap is 2,500, and the 60 unpaid calls are 1,500 of it
+        (b.caps.total, b.rate) = (Some(2500), Rate { call: 25, sat: 5 << 39 });
+        assert_eq!((b.counted(None, Follows::Calls), b.counted(None, Follows::Sats), b.counted(None, Follows::No)), (1500, 1500, 600));
+        assert_eq!((b.unaudited_work(None), b.room(I)), (600, 1000), "40 calls left, at 25 units");
+        // a coinbase pays for 240 units, the oldest: 36 calls stay unpaid
+        b.pay(105, 240);
+        assert_eq!((b.unaudited_work(None), b.counted(None, Follows::Calls), b.room(I)), (360, 900, 1600));
+        // credit granted now is counted as it is, beside the older credit at its own rate
+        assert_eq!(b.accept(&k.sign(&r(2, 1000, 101, 104)).unwrap(), I).unwrap(), 400);
+        assert_eq!(b.credits, vec![(I.to_string(), 600, Rate { call: 10, sat: 1 << 40 }), (I.to_string(), 400, Rate { call: 25, sat: 5 << 39 })]);
+        assert_eq!((b.counted(None, Follows::Calls), b.counted(Some(I), Follows::Calls), b.room(I)), (1300, 1300, 1200));
+        // the price falls back: the same unpaid calls, fewer units of a smaller cap
+        (b.caps.total, b.rate) = (Some(1000), Rate { call: 10, sat: 1 << 40 });
+        assert_eq!((b.counted(None, Follows::Calls), b.room(I)), (360 + 160, 480));
+        // the rates survive a reload, and a cap in work units counts work units throughout
+        let mut c = ReceiptBook::new(P, k.pubkey(), 70);
+        c.load(&b.to_json()).unwrap();
+        assert_eq!(c.credits, b.credits);
+        b.follows = (Follows::No, Follows::No);
+        assert_eq!(b.room(I), 1000 - 760);
+        // rounding is against the credit: 1 unit at 3 a call is a whole unit of 2 a call
+        let mut d = ReceiptBook::new(P, k.pubkey(), 70);
+        (d.rate, d.follows) = (Rate { call: 3, sat: 3 }, (Follows::Calls, Follows::Calls));
+        d.accept(&k.sign(&r(1, 1, 101, 102)).unwrap(), I).unwrap();
+        d.rate = Rate { call: 2, sat: 2 };
+        assert_eq!(d.counted(None, Follows::Calls), 1);
     }
 
     const J: &str = "vfer2e5e75t4tv7in42lakx6i5";
@@ -524,7 +643,7 @@ mod tests {
         assert_eq!((b.pay(108, 40), b.unaudited_work(None), b.room(I)), (25, 0, 115));
         // settling 107 forgets its payment and the 25 units of credit it covered, nothing unpaid
         b.settle(107, 103);
-        assert_eq!((b.credits.clone(), b.cover.clone(), b.intervals.len()), (vec![(I.to_string(), 25)], vec![(108, 40)], 0));
+        assert_eq!((b.credits.clone(), b.cover.clone(), b.intervals.len()), (vec![(I.to_string(), 25, Rate::default())], vec![(108, 40)], 0));
         b.uncover(108);
         assert_eq!(b.unaudited_work(None), 25, "settled credit a reorg left unpaid is still counted");
         b.pay(108, 40);
