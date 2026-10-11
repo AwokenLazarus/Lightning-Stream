@@ -57,7 +57,7 @@ if [ $CARGO = 1 ]; then
       "${SOAK[@]}" cargo build -q -j2 --release --target "$t" -p xbt-signer --bin xbt-signer --bin xbt-anchor-witness
     fi
     if want xbt-wallet-mcp; then "${SOAK[@]}" cargo build -q -j2 --release --target "$t" -p xbt-wallet-mcp; fi
-    if want xbt402-hub; then "${SOAK[@]}" cargo build -q -j2 --release --target "$t" -p xbt402 --features rpc,http-client,http-server --bin xbt402-hub; fi
+    if want xbt402-hub; then "${SOAK[@]}" cargo build -q -j2 --release --target "$t" -p xbt402 --features rpc,http-client,http-server,ln-wallet --bin xbt402-hub; fi
     if want xbt-wallet-ui || want xbt-init; then
       "${SOAK[@]}" cargo build -q -j2 --release --target "$t" -p xbt-wallet-ui -p xbt-svc --bin xbt-wallet-ui --bin xbt-init
     fi

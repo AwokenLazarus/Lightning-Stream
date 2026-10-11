@@ -18,13 +18,13 @@ cd "$(dirname "$0")/.."
 step() { echo; echo "== $*"; }
 step "1. xbt-svc + xbt-wallet-ui suites, xbt402-hub env numbers"
 cargo test -q -j2 -p xbt-svc -p xbt-wallet-ui 2>&1 | grep -E "test result|FAILED|panicked" | grep -v " 0 passed"
-cargo test -q -j2 -p xbt402 --features rpc,http-client,http-server --bin xbt402-hub 2>&1 | grep -E "test result|FAILED|panicked"
+cargo test -q -j2 -p xbt402 --features rpc,http-client,http-server,ln-wallet --bin xbt402-hub 2>&1 | grep -E "test result|FAILED|panicked"
 step "2. workspace"
 cargo test -q -j2 --workspace 2>&1 | grep -E "test result|FAILED" | awk '{p+=$4; f+=$6} END {print "workspace: " p " passed, " f " failed"; exit f>0}'
 step "3. clippy (xbt-svc, xbt-wallet-ui, xbt402-hub.rs)"
 # (warnings elsewhere in the workspace predate AGP-040)
 n=$(cargo clippy -q -j2 -p xbt-svc -p xbt-wallet-ui --all-targets 2>&1 | grep -cE "^ *--> crates/(xbt-svc|xbt-wallet-ui)/" || true)
-m=$(cargo clippy -q -j2 -p xbt402 --features rpc,http-client,http-server --bin xbt402-hub 2>&1 | grep -cE "^ *--> crates/xbt402/src/bin/xbt402-hub.rs" || true)
+m=$(cargo clippy -q -j2 -p xbt402 --features rpc,http-client,http-server,ln-wallet --bin xbt402-hub 2>&1 | grep -cE "^ *--> crates/xbt402/src/bin/xbt402-hub.rs" || true)
 echo "clippy warnings: xbt-svc + xbt-wallet-ui $n, xbt402-hub.rs $m"; [ "$n" = 0 ] && [ "$m" = 0 ]
 step "4. images (6 x 3 platforms)"
 mkdir -p run/verify-agp040

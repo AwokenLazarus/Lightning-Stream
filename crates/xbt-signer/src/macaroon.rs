@@ -12,6 +12,9 @@
 //! (`scripts/ln_rail_regtest.sh`, S12).
 use serde_json::{json, Value};
 
+/// The reader is shared with the hub's Lightning link (AGP-109): one parser of the format.
+pub use xbt402::macaroon::{parse, Macaroon};
+
 /// What `rail=ln` needs, and nothing else (the README's baked macaroon).
 pub const NEEDED_OPS: [&str; 4] = ["info:read", "offchain:read", "offchain:write", "onchain:read"];
 
@@ -19,151 +22,30 @@ pub const NEEDED_OPS: [&str; 4] = ["info:read", "offchain:read", "offchain:write
 /// `ln_status`. Mainnet refuses every permission outside [`NEEDED_OPS`], not only these (AGP-066).
 pub const DANGEROUS_OPS: [&str; 4] = ["onchain:write", "macaroon:generate", "macaroon:write", "signer:generate"];
 
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Macaroon {
-    pub location: String,
-    pub identifier: Vec<u8>,
-    /// First-party caveat conditions (`ipaddr 1.2.3.4`, `time-before 2026-…`, `lnd-custom …`).
-    pub caveats: Vec<String>,
-    /// `entity:action`, from LND's identifier (empty if the identifier is not LND's).
-    pub ops: Vec<String>,
+/// What the rail asks of a macaroon (the reader itself is `xbt402::macaroon`).
+pub trait RailMacaroon {
+    fn excess_ops(&self) -> Vec<String>;
+    fn dangerous_ops(&self) -> Vec<String>;
+    fn beyond_needed(&self) -> Option<String>;
+    fn report(&self) -> Value;
 }
 
-fn uvarint(b: &[u8], pos: &mut usize) -> Option<u64> {
-    let mut v = 0u64;
-    for shift in (0..64).step_by(7) {
-        let c = *b.get(*pos)?;
-        *pos += 1;
-        v |= ((c & 0x7f) as u64) << shift;
-        if c & 0x80 == 0 {
-            return Some(v);
-        }
-    }
-    None
-}
-
-/// One v2 field: `(type, data)`, or `None` at the end-of-section marker (a zero byte).
-fn field<'a>(b: &'a [u8], pos: &mut usize) -> Result<Option<(u64, &'a [u8])>, String> {
-    let t = uvarint(b, pos).ok_or("truncated field type")?;
-    if t == 0 {
-        return Ok(None);
-    }
-    let n = uvarint(b, pos).ok_or("truncated field length")? as usize;
-    let end = pos.checked_add(n).filter(|e| *e <= b.len()).ok_or("field past the end")?;
-    let d = &b[*pos..end];
-    *pos = end;
-    Ok(Some((t, d)))
-}
-
-/// A protobuf length-delimited walk: `(field number, bytes)` for every wire-type-2 field; other wire
-/// types are skipped.
-fn proto_fields(b: &[u8]) -> Vec<(u64, &[u8])> {
-    let mut out = vec![];
-    let mut pos = 0;
-    while pos < b.len() {
-        let Some(key) = uvarint(b, &mut pos) else { break };
-        match key & 7 {
-            0 => {
-                if uvarint(b, &mut pos).is_none() {
-                    break;
-                }
-            }
-            1 => pos += 8,
-            5 => pos += 4,
-            2 => {
-                let Some(n) = uvarint(b, &mut pos) else { break };
-                let Some(end) = pos.checked_add(n as usize).filter(|e| *e <= b.len()) else { break };
-                out.push((key >> 3, &b[pos..end]));
-                pos = end;
-            }
-            _ => break,
-        }
-    }
-    out
-}
-
-/// LND's identifier: a version byte (3), then `MacaroonId { nonce = 1; storageId = 2; repeated Op ops = 3 }`
-/// with `Op { entity = 1; repeated actions = 2 }`.
-fn lnd_ops(id: &[u8]) -> Vec<String> {
-    if id.first() != Some(&3) {
-        return vec![];
-    }
-    let mut ops = vec![];
-    for (f, op) in proto_fields(&id[1..]) {
-        if f != 3 {
-            continue;
-        }
-        let parts = proto_fields(op);
-        let entity = parts.iter().find(|(n, _)| *n == 1).map(|(_, e)| String::from_utf8_lossy(e).to_string()).unwrap_or_default();
-        for (_, a) in parts.iter().filter(|(n, _)| *n == 2) {
-            ops.push(format!("{entity}:{}", String::from_utf8_lossy(a)));
-        }
-    }
-    ops.sort();
-    ops.dedup();
-    ops
-}
-
-/// Parse a v2 binary macaroon (what LND writes to `*.macaroon`).
-pub fn parse(b: &[u8]) -> Result<Macaroon, String> {
-    if b.first() != Some(&2) {
-        return Err("not a v2 binary macaroon".into());
-    }
-    let mut pos = 1;
-    let mut m = Macaroon::default();
-    while let Some((t, d)) = field(b, &mut pos)? {
-        match t {
-            1 => m.location = String::from_utf8_lossy(d).into(),
-            2 => m.identifier = d.to_vec(),
-            _ => {}
-        }
-    }
-    loop {
-        if b.get(pos) == Some(&0) {
-            pos += 1;
-            break;
-        }
-        if pos >= b.len() {
-            return Err("truncated caveats".into());
-        }
-        let (mut id, mut third_party) = (Vec::new(), false);
-        while let Some((t, d)) = field(b, &mut pos)? {
-            match t {
-                2 => id = d.to_vec(),
-                4 => third_party = true,
-                _ => {}
-            }
-        }
-        m.caveats.push(if third_party { format!("third-party {}", hex::encode(&id)) } else { String::from_utf8_lossy(&id).into() });
-    }
-    match field(b, &mut pos)? {
-        Some((6, _)) => {}
-        _ => return Err("no signature".into()),
-    }
-    m.ops = lnd_ops(&m.identifier);
-    Ok(m)
-}
-
-impl Macaroon {
-    /// The caveat's argument for a condition name (`ipaddr`, `iprange`, `time-before`).
-    pub fn caveat(&self, cond: &str) -> Option<String> {
-        self.caveats.iter().find_map(|c| c.strip_prefix(cond).and_then(|r| r.strip_prefix(' ')).map(str::to_string))
-    }
-
-    pub fn excess_ops(&self) -> Vec<String> {
+impl RailMacaroon for Macaroon {
+    fn excess_ops(&self) -> Vec<String> {
         self.ops.iter().filter(|o| !NEEDED_OPS.contains(&o.as_str())).cloned().collect()
     }
 
-    pub fn dangerous_ops(&self) -> Vec<String> {
+    fn dangerous_ops(&self) -> Vec<String> {
         self.ops.iter().filter(|o| DANGEROUS_OPS.contains(&o.as_str()) || o.ends_with(":*")).cloned().collect()
     }
 
     /// AGP-066 (review L2): why this macaroon is more than `rail=ln` needs, if it is. An allowlist: any
     /// permission outside [`NEEDED_OPS`] (a `uri:` one such as `uri:/lnrpc.Lightning/SendCoins` included),
     /// or permissions that cannot be read from the identifier.
-    pub fn beyond_needed(&self) -> Option<String> {
+    fn beyond_needed(&self) -> Option<String> {
         let need = NEEDED_OPS.join(" ");
-        if self.ops.is_empty() {
+        // AGP-109: an identifier that does not read to its end may hold more than was read
+        if !self.readable() {
             return Some(format!("the LN macaroon's permissions cannot be read (not an LND identifier): bake one with only {need}"));
         }
         let excess = self.excess_ops();
@@ -171,7 +53,7 @@ impl Macaroon {
     }
 
     /// For `ln_status`: the permissions and caveats, with what each means for a REST client.
-    pub fn report(&self) -> Value {
+    fn report(&self) -> Value {
         let ip = self.caveat("ipaddr").or_else(|| self.caveat("iprange"));
         let ip_note = match &ip {
             None => "no IP caveat: the macaroon works from any address that reaches the REST listener".to_string(),
@@ -191,42 +73,7 @@ impl Macaroon {
 mod tests {
     use super::*;
 
-    fn put(out: &mut Vec<u8>, t: u8, d: &[u8]) {
-        out.push(t);
-        out.push(d.len() as u8);
-        out.extend_from_slice(d);
-    }
-
-    fn proto(field: u8, d: &[u8]) -> Vec<u8> {
-        let mut v = vec![(field << 3) | 2, d.len() as u8];
-        v.extend_from_slice(d);
-        v
-    }
-
-    /// A macaroon as LND bakes it: v2, identifier version 3 + MacaroonId, first-party caveats.
-    pub fn lnd_macaroon(ops: &[(&str, &[&str])], caveats: &[&str]) -> Vec<u8> {
-        let mut id = vec![3u8];
-        id.extend(proto(1, &[7; 16]));
-        id.extend(proto(2, b"0"));
-        for (e, acts) in ops {
-            let mut op = proto(1, e.as_bytes());
-            for a in *acts {
-                op.extend(proto(2, a.as_bytes()));
-            }
-            id.extend(proto(3, &op));
-        }
-        let mut m = vec![2u8];
-        put(&mut m, 1, b"lnd");
-        put(&mut m, 2, &id);
-        m.push(0);
-        for c in caveats {
-            put(&mut m, 2, c.as_bytes());
-            m.push(0);
-        }
-        m.push(0);
-        put(&mut m, 6, &[9; 32]);
-        m
-    }
+    use xbt402::macaroon::lnd_macaroon_for_tests as lnd_macaroon;
 
     #[test]
     fn reads_lnd_ops_and_caveats() {

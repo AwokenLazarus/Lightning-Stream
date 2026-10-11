@@ -2256,8 +2256,8 @@ set (`RouteHub::set_return_to`; `xbt402-hub` sets a fresh bech32 address of its 
 | a ch1 closes (the client's close, its rollover, the margin close) | the watcher sweeps the payout once the close is `spend_final_depth` deep |
 | a ledger from before (ch2s on their own keys) | after the upgrade the watcher sweeps what a final close or refund left on each key |
 
-`return_spk()` in `hub.rs` is the one function every return goes through. A later link to a
-Lightning wallet changes its hook and nothing else.
+`return_spk()` in `hub.rs` is the one function every return goes through. The link to a Lightning
+wallet (AGP-109, below) sits behind it: a second hook, asked first for a return of a known amount.
 
 **Rule R2: one signed sweep per output.** A sweep is written to the ledger before it is sent
 (`payee_sweep_intent` on a ch1, `sweep` on a ch2 record). The same bytes are sent again each block
@@ -2316,6 +2316,120 @@ Tests: `crates/xbt402-interop/tests/agp104_returns.rs` (20), `node_check.rs` and
 (unit), four in `xbt402-hub.rs`; B1 `tests/security/test_agp104_returns.py` (18, the same names; B1
 has the returns, the sweeps, `capital_sat` and the default, not the status page or the start-up
 checks). On regtest, through the real binaries: `./scripts/hub_returns_regtest.sh`.
+
+## The hub beside a Lightning node: wallet link and node-signed identity (AGP-109)
+
+A hub's operator usually runs a Lightning node on the same machine. The hub links to it in two
+places and no more: coins above the hub's capital return to the node's on-chain wallet, and the
+node signs a statement that names the hub. The link is two calls, `NewAddress` and `SignMessage`.
+No key is shared, no call can spend from the node, and no Lightning payment is part of a Stream
+payment. Without the three settings the hub runs as before and its 402 is byte for byte what it
+was.
+
+Files: `crates/xbt402/src/ln_wallet.rs` (the link), `hub_identity.rs` (the statement and its
+check), `macaroon.rs` (the reader, moved here from `xbt-signer` and shared with the wallet's
+Lightning rail), `hub.rs` (`return_spk`, `set_return_above`, `set_lightning`, `returns_paid`),
+`bin/xbt402-hub.rs` (settings, the link's thread, `/status`), `route_client.rs` (the payer's
+check), `status_page.rs`.
+
+**Settings.** `ln.rest` / `XBT_HUB_LN_REST`, `ln.tls_cert` / `XBT_HUB_LN_TLS_CERT`,
+`ln.macaroon` / `XBT_HUB_LN_MACAROON` (a file's path; else the secret `hub-ln-macaroon`). The
+macaroon is a credential and is never a plain setting. The operator makes it on the node, with
+`lncli bakemacaroon --save_to=hub.macaroon uri:/lnrpc.Lightning/NewAddress uri:/lnrpc.Lightning/SignMessage`
+or the same two permissions in the node's interface, and gives the hub the file or its hex. A link that cannot be set up (no macaroon,
+one too wide on mainnet, no certificate for https) is said at start and on `/status`, and the hub
+runs without it: the macaroon is then sent nowhere.
+
+**Rule M1: on mainnet the hub uses a macaroon only if every permission in it is one of the two
+calls.** An allowlist read from the macaroon itself: `uri:/lnrpc.Lightning/NewAddress`,
+`uri:/lnrpc.Lightning/SignMessage`, and the entity pairs `address:write`, `message:write`, which at
+Lightning Fork 0.21.3-beta-blake2b.17 are required by those two calls and by no other (read from
+its permission tables: 179 methods, two hits). An identifier that is not LND's, or that does not
+parse to its last byte, allows nothing: a reader that stops at a field it does not know has not
+seen the whole list. The mainnet rule also applies when the node did not say which chain it is on,
+and with `XBT_HUB_LN_STRICT=1`.
+
+**Rule L1: a coin goes to the Lightning wallet only at an address the linked node gave, that the
+hub wrote to disk before handing it out, and only until the chain shows that address used.** The
+address is kept in `<datadir>/ln-link.json` with every address used before it. "Used" is a sweep or
+refund in the hub's own books that pays that script and that the hub's node shows in a block
+(`RouteHub::returns_paid`); the next address is then asked for. An answer that is not a witness v0
+address of this network, or that the node gave before, is not taken. A file that does not parse
+stops the link at start; it is never read as empty. A changed certificate setting holds the
+address on file back until the node has signed, and a signature from another key retires it: it
+was another node's.
+
+**Rule L2: a return goes to the Lightning wallet only when the hub still holds its capital
+without it.** `return_spk(known)` takes what the return pays when that is known as its address is
+named (a sweep, a refund) and offers it to the link's hook first; everything the hook does not take
+goes to the hub's own wallet as before, through the hook AGP-104 set. A seller channel's remainder
+is named at funding, when its amount is not known, so it is never offered. What is above capital
+is `status().totalSat - capital_sat`, looked at once a block by the link's thread; each return
+takes its amount off that, and a return handed out just before a look stays counted for one more
+look (`Budget`), because the look may have read the books before the return was written to them.
+Unknown (the wallet does not answer, a funding is being reconciled) is zero. No `capital_sat` is
+zero.
+
+An output is not split, so this is coarse on purpose: a payout larger than what is above capital
+refills the hub's wallet whole. Returning exactly what is above capital needs a send from the
+hub's own wallet; `LnLink::address()` is there for that.
+
+**Rule L3: the link never stands between the hub and the chain.** `LnLink::return_above` reads
+memory. The node is asked only from the link's own thread (`ln-link`), with no lock held that a
+route or a return takes, after a failure no sooner than 30 seconds later. With the node down the
+address on file is still the node's and is paid; once it is used, returns refill the hub's wallet.
+
+**Rule I1: a payer treats a hub as the hub of node N only on a statement that N's key signed, that
+names the payTo key and the network of the offer in front of it, and that has not run out and runs
+at most 31 days ahead.** The statement:
+
+```
+xbt-stream-hub v1
+network=<network id>
+payto=<the hub's payTo key, hex>
+until=<unix time>
+```
+
+signed as any Lightning signed message (double SHA-256 of `Lightning Signed Message:` and the
+text; 65 bytes in zbase32, the first carrying the recovery id). The hub asks for 30 days, asks
+again after 7, checks the answer with the payer's own code before it serves it, and stops serving
+it the second it runs out. It is `extra.routing.lightning` of the 402: `{nodeId, statement,
+signature}`. The chain of keys is node key, hub key (the statement), fee quotes and the channel
+(the hub key, as before). The 31-day bound is the payer's: without it, whoever holds the hub's
+macaroon could sign one statement for years.
+
+A hub's address is `<node id>@host:port`. `RoutePayer::new` takes it in place of a URL
+(`http://host:port`; a full URL after the `@` is used as it is) and then checks every offer it
+reads in `hub_offer`, before a quote is taken or a key asked for. Named by URL, a hub that shows no
+statement is paid as before, and one that shows a statement must show a good one.
+
+**What a platform package must pass** (the StartOS and Umbrel packages are later work):
+
+| Setting | Umbrel | StartOS |
+|---|---|---|
+| the node's REST address | Lightning Fork's app address, port 8080 (its certificate lists that address) | the Lightning Fork container's own address. Not the OS bridge address: there the OS proxy answers with its own certificate, which is not the node's `tls.cert`, and the pin fails |
+| the certificate | `tls.cert` from the node's data directory, mounted read-only, that file and nothing else | the same file; or, if the package can only reach the bridge address, the certificate that address presents, which changes when the OS renews it |
+| the macaroon | pasted by the operator into the hub's setup and stored as the secret `hub-ln-macaroon`; never `admin.macaroon` read from the node's directory | the same, through an action |
+
+The name in the certificate is not checked (the certificate is pinned), so any address that
+reaches the node's own listener works. Not run on either platform.
+
+**New state, and who can fill it.**
+
+| State | Who fills it | At its bound | A slow or failing peer | A ledger from before | Shipped default |
+|---|---|---|---|---|---|
+| `ln-link.json`: the address in use, the addresses used, the statement | the hub, from the node's answers; one address per return the chain showed | unbounded list, one line per used address | the node down: nothing is added | no file: a new link; the hub's older sweeps paid its own wallet and are not the link's | no link: no file |
+| what is above capital (`Budget`, in memory) | the link's thread, from the status | zero when unknown | a hub whose wallet does not answer returns nothing to Lightning | an estimated status sum is used as it is | `capital_sat` 0: always zero |
+| `extra.routing.lightning` | the link's thread | absent when run out | the node down for 30 days: absent, the hub is paid by URL only | absent | absent |
+| `hub_node` in the payer | whoever constructs the payer | - | a hub that shows nothing: refused | a payer resumed from a ledger checks the same way at its next offer | by URL: none |
+
+Tests: `ln_wallet.rs` (13), `hub_identity.rs` (5), `macaroon.rs` (3) and `status_page.rs` (2 new)
+unit; `crates/xbt402/tests/hub_identity_vectors.rs` (3) on `vectors/hub_identity.json`, whose cases
+`scripts/hub_identity_vectors.py` writes and checks with code of its own, and which holds a
+statement signed by a real Lightning Fork node and six macaroons that node baked;
+`crates/xbt402-interop/tests/agp109_ln_link.rs` (11), a real hub, sellers and buyers in memory;
+two in `xbt402-hub.rs`. On regtest, through the real binaries beside a real Lightning Fork node:
+`./scripts/hub_ln_link_regtest.sh`.
 
 ## Fix wave 4: light client and Lightning (AGP-092)
 

@@ -43,6 +43,58 @@ fn text(v: &Value) -> String {
     }
 }
 
+/// A unix time as a UTC date, `2026-10-11` (`-` when it is not a time).
+fn date(v: &Value) -> String {
+    let Some(t) = v.as_u64().filter(|t| *t < 253_402_300_800) else { return "-".into() };
+    // days since 1970-01-01 to a civil date (the proleptic Gregorian calendar, by eras of 400 years)
+    let z = (t / 86_400) as i64 + 719_468;
+    let (era, doe) = (z.div_euclid(146_097), z.rem_euclid(146_097));
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let (d, m) = (doy - (153 * mp + 2) / 5 + 1, if mp < 10 { mp + 3 } else { mp - 9 });
+    format!("{:04}-{m:02}-{d:02}", yoe + era * 400 + i64::from(m <= 2))
+}
+
+/// The Lightning link (AGP-109): `v` is the status JSON's `lightning`. Nothing when there is no
+/// link and none was asked for.
+fn lightning(v: &Value) -> String {
+    if v.is_null() {
+        return String::new();
+    }
+    let mut h = String::from("<h2>Lightning node</h2>");
+    if v["linked"] != true {
+        h.push_str(&format!("<div class=warn>The Lightning link is not set up: {}. Returns go to the hub's own wallet, and the hub is named by its address only.</div>", text(&v["error"])));
+        return h;
+    }
+    for (key, msg) in [("statementError", "The Lightning node did not sign the hub's statement"), ("addressError", "The Lightning node gave no address"),
+                       ("returnedError", "What was returned could not be summed")] {
+        if let Some(e) = v[key].as_str() {
+            h.push_str(&format!("<div class=warn>{msg}: {}</div>", esc(e)));
+        }
+    }
+    if v["waitingForNode"] == true {
+        h.push_str("<div class=warn>The node's certificate changed: nothing is returned to the Lightning wallet until the node has signed again.</div>");
+    }
+    if v["macaroon"]["onlyTheTwoCalls"] == false {
+        h.push_str(&format!("<div class=warn>The macaroon allows more than a new address and a signed message ({}). On mainnet it would not be used.</div>", text(&v["macaroon"]["ops"])));
+    }
+    if v["nodeId"].is_string() && v["statementServed"] != true {
+        h.push_str("<div class=warn>The node's statement naming this hub has run out: buyers who know the hub by its node are refused until the node signs again.</div>");
+    }
+    h.push_str("<div class=scroll><table>");
+    h.push_str(&format!("<tr><td>Returned to the Lightning wallet</td><td class=n>{}</td></tr>", sats(&v["returnedSat"])));
+    h.push_str(&format!("<tr><td>Above capital now</td><td class=n>{}</td></tr>", sats(&v["aboveCapitalSat"])));
+    for (name, val) in [("Hub address", text(&v["hubAddress"])), ("Node", text(&v["nodeId"])), ("Returns go to", text(&v["returnAddress"])),
+                        ("Statement runs to", date(&v["statementUntil"])), ("Note", text(&v["note"]))] {
+        if val != "-" {
+            h.push_str(&format!("<tr><td>{name}</td><td><code>{val}</code></td></tr>"));
+        }
+    }
+    h.push_str("</table></div><div class=note>The Lightning wallet's coins and the hub's capital are two amounts, at risk in two ways: the hub holds no key of the Lightning node and can spend nothing of it.</div>");
+    h
+}
+
 /// The page. `v`: the status JSON.
 pub fn render(v: &Value) -> String {
     let card = |name: &str, key: &str, note: &str| {
@@ -114,6 +166,7 @@ pub fn render(v: &Value) -> String {
             h.push_str("</table></div>");
         }
     }
+    h.push_str(&lightning(&v["lightning"]));
     h.push_str("<h2>This hub</h2><div class=scroll><table>");
     for (name, val) in [("Address", &v["url"]), ("Tor", &v["tor"]), ("Key", &v["payTo"]), ("Network", &v["network"]),
                         ("Send capital to", &v["wallet"]["receiveAddress"]), ("Block", &v["tip"]), ("A spend is final after blocks", &v["spendFinalDepth"])] {
@@ -148,6 +201,37 @@ mod tests {
         // a status without the wallet's number
         let h = render(&json!({"capitalSat": null, "stuck": [], "sellers": [], "returns": false, "wallet": {"error": "no <wallet>"}}));
         assert!(h.contains("No return address") && h.contains("no &lt;wallet&gt;") && h.contains("None yet."));
+    }
+
+    #[test]
+    fn the_lightning_link_is_on_the_page_when_there_is_one() {
+        let base = json!({"capitalSat": 1, "stuck": [], "sellers": [], "returns": true, "wallet": {}});
+        assert!(!render(&base).contains("Lightning node"), "no link, no section");
+        let mut v = base.clone();
+        v["lightning"] = json!({"linked": true, "nodeId": "02ab", "hubAddress": "02ab@hub.example:9480", "returnedSat": 10_417, "aboveCapitalSat": 89_430,
+                                "returnAddress": "bcrt1qln", "statementUntil": 1_791_590_400u64, "statementServed": true, "macaroon": {"onlyTheTwoCalls": true}});
+        let h = render(&v);
+        for want in ["Lightning node", "02ab@hub.example:9480", "10,417", "89,430", "bcrt1qln", "2026-10-10", "two amounts"] {
+            assert!(h.contains(want), "{want} not in the page");
+        }
+        assert!(!h.contains("class=warn"), "{h}");
+        // what an operator must see: no link, a node that does not answer, a wide macaroon, a statement run out
+        v["lightning"] = json!({"linked": false, "error": "the Lightning macaroon grants <onchain:write>"});
+        let h = render(&v);
+        assert!(h.contains("not set up") && h.contains("&lt;onchain:write&gt;") && !h.contains("<onchain"));
+        v["lightning"] = json!({"linked": true, "nodeId": "02ab", "statementServed": false, "statementError": "not reachable", "addressError": "no <address>",
+                                "waitingForNode": true, "macaroon": {"onlyTheTwoCalls": false, "ops": ["onchain:write"]}, "note": "no capital is set"});
+        let h = render(&v);
+        for want in ["did not sign", "not reachable", "no &lt;address&gt;", "certificate changed", "allows more than", "has run out", "no capital is set"] {
+            assert!(h.contains(want), "{want} not in the page");
+        }
+    }
+
+    #[test]
+    fn dates() {
+        assert_eq!((date(&json!(0)), date(&json!(951_782_400)), date(&json!(1_709_164_800)), date(&json!(1_791_590_399u64))),
+                   ("1970-01-01".into(), "2000-02-29".into(), "2024-02-29".into(), "2026-10-09".into()));
+        assert_eq!((date(&json!(null)), date(&json!(-5)), date(&json!(u64::MAX))), ("-".to_string(), "-".to_string(), "-".to_string()));
     }
 
     #[test]

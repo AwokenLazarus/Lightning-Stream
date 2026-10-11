@@ -337,7 +337,13 @@ struct PState {
 
 /// The routed-payment client.
 pub struct RoutePayer {
+    /// Where the hub is asked. For a hub named `<node id>@host:port` this is `http://host:port`,
+    /// and it is the name the signer and the ledger know the hub by.
     pub hub_url: String,
+    /// AGP-109: the Lightning node this hub was named by (`None`: by URL), or why the name given
+    /// is no hub address. With a node id, nothing is signed to a hub that does not show that
+    /// node's statement ([`crate::hub_identity`], rule I1).
+    hub_node: Option<Result<String>>,
     pub cfg: RoutePayerConfig,
     signer: Arc<dyn RouteSigner>,
     wallet: Arc<dyn Wallet>,
@@ -359,7 +365,13 @@ fn hdr_json(r: &HttpResponse, name: &str) -> Option<Value> {
 impl RoutePayer {
     pub fn new(hub_url: &str, cfg: RoutePayerConfig, signer: Arc<dyn RouteSigner>, wallet: Arc<dyn Wallet>, http: Box<dyn Transport>,
                height: HeightFn) -> Self {
-        Self { hub_url: hub_url.trim_end_matches('/').to_string(), cfg, signer, wallet, http, height, st: Mutex::new(PState::default()),
+        // AGP-109: `<node id>@host:port` names the hub by its Lightning node; anything else is a URL
+        let (hub_url, hub_node) = match crate::hub_identity::HubAddress::parse(hub_url) {
+            Some(Ok(a)) => (a.url, Some(Ok(a.node_id))),
+            Some(Err(e)) => (hub_url.to_string(), Some(Err(e))),
+            None => (hub_url.to_string(), None),
+        };
+        Self { hub_url: hub_url.trim_end_matches('/').to_string(), hub_node, cfg, signer, wallet, http, height, st: Mutex::new(PState::default()),
                shards: Mutex::new(IndexMap::new()), ledger: None, stop: Arc::new(AtomicBool::new(false)), thread: Mutex::new(None),
                ids: AtomicU64::new(1), events: Mutex::new(vec![]) }
     }
@@ -517,12 +529,29 @@ impl RoutePayer {
         Ok(())
     }
 
+    /// The Lightning node this hub was named by, if it was.
+    pub fn hub_node(&self) -> Option<&str> {
+        self.hub_node.as_ref().and_then(|n| n.as_deref().ok())
+    }
+
+    /// The hub's offer, read from its 402. AGP-109 (rule I1): every offer is checked here, so no
+    /// quote is taken and nothing is opened or signed on one that fails. A hub named by a node id
+    /// must show that node's statement for the offer's payTo key and network; a statement a hub
+    /// shows is checked whoever named it; a hub named by URL that shows none is paid as before.
     fn hub_offer(&self) -> Result<Value> {
+        let node = match &self.hub_node {
+            Some(Err(e)) => return Err(e.clone()),
+            Some(Ok(n)) => Some(n.as_str()),
+            None => None,
+        };
         let r = self.http.request("GET", &format!("{}{HUB_ROUTE_PATH}", self.hub_url), b"", &[])?;
         if r.status != 402 {
             return fail("bad_offer", format!("hub answered {}, expected 402", r.status));
         }
-        self.pick(&hdr_json(&r, "PAYMENT-REQUIRED").ok_or_else(|| ChannelError::new("bad_offer", "402 without PAYMENT-REQUIRED"))?)
+        let acc = self.pick(&hdr_json(&r, "PAYMENT-REQUIRED").ok_or_else(|| ChannelError::new("bad_offer", "402 without PAYMENT-REQUIRED"))?)?;
+        let shown = acc.get("extra").and_then(|e| e.get("routing")).and_then(|r| r.get("lightning"));
+        crate::hub_identity::check_extra(shown, node, &self.cfg.network, &py_str(acc.get("payTo")), now_f().max(0.0) as u64)?;
+        Ok(acc)
     }
 
     fn post(&self, url: &str, v: &Value) -> Result<Value> {

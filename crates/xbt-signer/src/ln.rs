@@ -1229,6 +1229,7 @@ impl Signer {
         let Some(b) = ln.macaroon() else { return (Value::Null, None) };
         match macaroon::parse(&b) {
             Ok(m) => {
+                use macaroon::RailMacaroon;
                 let refusal = if self.chain == "main" { m.beyond_needed() } else { None };
                 (m.report(), refusal)
             }

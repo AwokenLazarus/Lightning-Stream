@@ -19,10 +19,10 @@ cd "$(dirname "$0")/.."
 step() { echo; echo "== $*"; }
 step "1. xbt-svc + xbt-wallet-ui + xbt-wallet-mcp + xbt402-hub"
 cargo test -q -j2 -p xbt-svc -p xbt-wallet-ui -p xbt-wallet-mcp --all-targets 2>&1 | grep -E "test result|FAILED|panicked" | grep -v " 0 passed"
-cargo test -q -j2 -p xbt402 --features rpc,http-client,http-server --bin xbt402-hub 2>&1 | grep -E "test result|FAILED|panicked"
+cargo test -q -j2 -p xbt402 --features rpc,http-client,http-server,ln-wallet --bin xbt402-hub 2>&1 | grep -E "test result|FAILED|panicked"
 step "2. clippy (xbt-svc, xbt-wallet-ui, xbt-wallet-mcp, xbt402-hub.rs)"
 n=$(cargo clippy -q -j2 -p xbt-svc -p xbt-wallet-ui -p xbt-wallet-mcp --all-targets 2>&1 | grep -cE "^ *--> crates/(xbt-svc|xbt-wallet-ui|xbt-wallet-mcp)/" || true)
-m=$(cargo clippy -q -j2 -p xbt402 --features rpc,http-client,http-server --bin xbt402-hub 2>&1 | grep -cE "^ *--> crates/xbt402/src/bin/xbt402-hub.rs" || true)
+m=$(cargo clippy -q -j2 -p xbt402 --features rpc,http-client,http-server,ln-wallet --bin xbt402-hub 2>&1 | grep -cE "^ *--> crates/xbt402/src/bin/xbt402-hub.rs" || true)
 echo "clippy warnings: crates $n, xbt402-hub.rs $m"; [ "$n" = 0 ] && [ "$m" = 0 ]
 step "3. Umbrel lint"
 python3 packaging/umbrel/lint.py packaging/umbrel

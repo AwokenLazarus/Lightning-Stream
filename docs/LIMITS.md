@@ -117,7 +117,65 @@ chain. Numbers are the shipped defaults unless a sentence says otherwise.
 - A hub operator's `fee_ppm` must stay below about 1.8e16 divided by `max_lock_sat`; above it every
   route request fails.
 
+### Hub beside a Lightning node
+
+- The hub's link to its operator's Lightning node makes two calls, a new address and a signed
+  message: it cannot send from the node's wallet, so capital reaches the hub only by the
+  operator's own send.
+- A return goes to the Lightning wallet only whole, only when its amount is known as its address
+  is named, and only when the hub still holds its capital (`capital_sat`) without it. A seller
+  channel's remainder always returns to the hub's own wallet. With no `capital_sat` set, which is
+  the shipped default, nothing returns to the Lightning wallet.
+- What is above capital therefore stays in the hub's wallet until a payout no larger than it
+  comes in: a hub whose capital is all that was sent in returns a buyer channel's payout only once
+  the fees it has earned exceed that whole payout.
+- What the hub holds is looked at once a block and at least every 30 seconds. Coins the operator
+  takes out of the hub's wallet between two looks can leave the hub under its capital by the
+  returns handed out before the next look. A sum the status marks as estimated is used as it is.
+- One Lightning address takes every return until the hub's node shows a return to it in a block,
+  so several returns can pay one address, and each stop of the hub between the node's answer and
+  the hub's write leaves one address of the node's wallet that is never paid.
+- With the Lightning node unreachable the hub goes on paying the address it has. Once the chain
+  shows that one used, returns refill the hub's own wallet until the node answers; it is asked
+  every 30 seconds.
+- On mainnet the hub does not use a macaroon with any permission beyond the two calls. The
+  per-entity form (`address:write`, `message:write`) is taken because at Lightning Fork
+  0.21.3-beta-blake2b.17 each covers exactly one call; a later node version that puts another call
+  under either would widen such a macaroon unseen. The per-call form cannot widen. Off mainnet a
+  wider macaroon is used and named in the log.
+- The hub reads what a macaroon says it allows, once at start. It does not check that the node
+  honours it, and a `time-before` caveat that passes shows only as the node refusing.
+- A macaroon for the signed message alone names the hub and returns nothing. One for the address
+  alone does neither: the hub pays no address of a node that has not signed.
+- Whoever holds the hub's macaroon can have the node sign any text, and so a statement naming
+  another key as that node's hub. A payer takes no statement that runs more than 31 days ahead,
+  and nothing takes back a signed statement before it runs out.
+- The statement says which hub key belongs to which node. It says nothing about the node's
+  channels or coins: no Lightning payment and no Lightning key is part of a Stream payment.
+- The link is REST over TLS with the node's certificate pinned and the name not checked. When the
+  node makes a new certificate the link fails until the operator gives the hub the new one, and
+  the address on file is then not paid until the node has signed again.
+- Plain http to the node is taken only to a loopback address, and the macaroon goes to whatever
+  answers there.
+- A hub whose clock is more than a day ahead gets statements that payers refuse.
+- The link's file keeps every Lightning address the hub has paid and is never trimmed. A hub
+  restored from an older copy of its data directory can pay an address that was used since.
+- The status page shows the node id, the hub's address and the address returns go to, on the
+  hub's public port.
+- Nothing here was run on mainnet or on a StartOS or Umbrel box: on regtest, beside one Lightning
+  Fork node in a container.
+
 ### Routed client
+
+- A client given a hub as `<node id>@host:port` asks it over plain http (a full URL after the `@`
+  is used as it is), and takes no quote and opens nothing unless the hub shows that node's
+  statement for the key it is paid on. The statement is checked at each offer the client reads,
+  not between them: one that runs out stops the client at its next fee quote.
+- A hub that shows a statement must show a good one, whoever named it: a hub whose statement has
+  run out or is wrong is refused by URL too. A hub that shows none is paid by URL as before.
+- The client's own clock decides whether a statement has run out.
+- The signer and the wallet's policy know a hub by the address it is asked at, so a hub that
+  moves needs a new approval; the node id is not a policy entry yet.
 
 - A routed client's hub channel is funded once. If the funding call fails without saying whether
   it sent, a wallet that keeps a record of its sends is asked what it sent; a wallet that cannot
@@ -440,6 +498,9 @@ reference's own repository. The references are public:
 [Lightning-Stream-py-channel](https://github.com/AwokenLazarus/Lightning-Stream-py-channel) and
 [Lightning-Stream-py-wallet](https://github.com/AwokenLazarus/Lightning-Stream-py-wallet).
 
+- The Python hub has no link to a Lightning node and shows no statement. The Python routed client
+  does not read a statement and does not take `<node id>@host:port`.
+
 ## Open items
 
 Not fixed. Each is marked in the code with the text in brackets, on a test that asserts the right
@@ -470,6 +531,8 @@ Neither the external review nor any of the project's four audits covered:
 - `xbt-svc` and `xbt-init`, and the scripts under `tools/`;
 - any server built with the `release-small` profile, and any hostile input against a release
   build: the audits attacked debug builds, and release builds ran the ordinary paths only;
+- the hub's link to a Lightning node and the node-signed statement (`ln_wallet.rs`,
+  `hub_identity.rs`, the shared macaroon reader): written after the last audit;
 - anything on a real network: no mainnet node, no public Electrum server and no Lightning node
   outside a test rig was used, and every "blocks" figure was measured on regtest blocks mined at
   once.
