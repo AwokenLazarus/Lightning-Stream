@@ -1,0 +1,9 @@
+# The same app and image on the test chain. Paul's app follows mainnet only (its settings offer no other chain),
+# so here its bitcoind is started directly on regtest with the conf the test driver derives from the one the
+# app itself generated (hub_shared_node.py: the chain and the network stanza change, nothing about RPC or the
+# wallet does).
+services:
+  app:
+    entrypoint: ["bitcoind"]
+    # allowignoredconf: the app's own /data/bitcoin.conf (mainnet) is deliberately not the one read here
+    command: ["-datadir=/data", "-conf=/data/agp100-regtest.conf", "-allowignoredconf=1"]

@@ -1,6 +1,14 @@
 # xbt402 Hub (AGP-040), optional. Unpublished: side-load only, images loaded locally (never pulled).
 # `init` (xbt-init: root, no network, three capabilities) gives ${APP_DATA_DIR}/data/hub to the hub's uid and
 # writes the node credentials; the hub generates its payTo key there on first run.
+#
+# The node (AGP-100): the app depends on the `bitcoin` slot, the one Lightning Fork depends on, so on a box
+# that runs Lightning Fork the hub uses the node Lightning Fork uses and no second node is installed. The
+# owner must select an XBT (BLAKE2b) node for that slot, as for Lightning Fork. umbrelOS sets APP_BITCOIN_*
+# from the selected node app (Paul's `paulscode-knots-blake2b`: NODE_IP, RPC_PORT, RPC_USER, RPC_PASS). A node
+# app that exports only our own names (`lazarus-xbt-knots`, later xbt-compute's CMP-098) is the fallback:
+# each value is APP_BITCOIN_* when set, else APP_XBT_KNOTS_*. With neither, the values are empty, init writes
+# no credentials and the hub exits saying so; it never falls back to a default node.
 version: "3.7"
 
 services:
@@ -25,8 +33,8 @@ services:
       - no-new-privileges:true
     environment:
       XBT_INIT_COMPONENTS: hub
-      XBT_INIT_NODE_RPC_USER: ${APP_XBT_KNOTS_RPC_USER}
-      XBT_INIT_NODE_RPC_PASS: ${APP_XBT_KNOTS_RPC_PASS}
+      XBT_INIT_NODE_RPC_USER: ${APP_BITCOIN_RPC_USER:-${APP_XBT_KNOTS_RPC_USER}}
+      XBT_INIT_NODE_RPC_PASS: ${APP_BITCOIN_RPC_PASS:-${APP_XBT_KNOTS_RPC_PASS}}
     volumes:
       - ${APP_DATA_DIR}/data:/data
 
@@ -45,8 +53,8 @@ services:
       init:
         condition: service_completed_successfully
     environment:
-      XBT_NODE_RPC_HOST: ${APP_XBT_KNOTS_NODE_HOST}
-      XBT_NODE_RPC_PORT: ${APP_XBT_KNOTS_RPC_PORT}
+      XBT_NODE_RPC_HOST: ${APP_BITCOIN_NODE_IP:-${APP_XBT_KNOTS_NODE_HOST}}
+      XBT_NODE_RPC_PORT: ${APP_BITCOIN_RPC_PORT:-${APP_XBT_KNOTS_RPC_PORT}}
       # the 402's resource.url follows the address a client used (LAN, Tor, app_proxy)
       XBT_TRUST_FORWARDED: "1"
       # umbrelOS gives every app, including this second one, a hidden service via app_proxy

@@ -2,11 +2,13 @@
 """AGP-040: lint the local Umbrel store (SOV-005's lint-manifest.py, extended for the agentpay apps).
 
 Manifest: the keys umbrelOS reads, manifestVersion 1/1.1, a known category, the id prefixed with the store id,
-gallery files present, dependencies in this store, unique ports, `deterministicPassword` when ${APP_PASSWORD}
-is used.
+gallery files present, dependencies in this store or a node slot (`bitcoin`) an app here implements, unique
+ports, `deterministicPassword` when ${APP_PASSWORD} is used.
 Compose: app_proxy's APP_HOST is `<app-id>_<service>_1` of a real service; every volume is under
 ${APP_DATA_DIR}; every image is a local one (no registry, nothing pulled); every ${VAR} is provided by umbrelOS,
-this app's exports or a dependency's exports; `docker compose config` accepts the file with those values.
+this app's exports or a dependency's exports; a slot's variable (APP_BITCOIN_*, set by whichever node app the
+owner selects) is only used as `${APP_BITCOIN_X:-${FALLBACK}}` with a fallback this store's implementing app
+exports; `docker compose config` accepts the file with those values, and with the slot's values alone.
 Hardening (docs/CONTAINER.md): the agentpay services run read-only, cap_drop ALL, no-new-privileges, as their
 image's non-root user, and mount only their own sub-dir plus the socket dirs they need (a peer's read-only);
 `init` (xbt-init) is the only root container: no network, at most CHOWN/FOWNER/DAC_OVERRIDE.
@@ -40,6 +42,10 @@ AGENTPAY = {
     "xbt402-hub": ("hub", None, set()),
 }
 INIT_CAPS = {"CHOWN", "FOWNER", "DAC_OVERRIDE"}
+# AGP-100: a dependency slot another store's app may fill (umbrelOS `implements`), and what the selected app
+# sets for the dependent (Paul's paulscode-knots-blake2b exports.sh; the names Lightning Fork reads).
+SLOTS = {"bitcoin": {"APP_BITCOIN_NODE_IP": "10.21.21.62", "APP_BITCOIN_RPC_PORT": "18443", "APP_BITCOIN_RPC_USER": "umbrel",
+                     "APP_BITCOIN_RPC_PASS": "stub"}}
 
 problems: list[str] = []
 warnings: list[str] = []
@@ -86,8 +92,14 @@ def main() -> int:
             if not (mp.parent / g).is_file():
                 bad(f"{folder}: gallery file {g} missing")
         for d in m["dependencies"] or []:
-            if d not in apps:
+            if d in SLOTS:
+                if not any(d in (am.get("implements") or []) for _, am in apps.values()):
+                    bad(f"{folder}: no app in this store implements the slot {d} (the fallback node)")
+            elif d not in apps:
                 bad(f"{folder}: dependency {d} is not in this store")
+        for i in m.get("implements") or []:
+            if i not in SLOTS:
+                bad(f"{folder}: implements {i!r}, not a known slot")
         if m["submission"] != "unpublished-local":
             bad(f"{folder}: submission must stay unpublished-local (store submission needs Mike)")
         compose_p = mp.parent / "docker-compose.yml"
@@ -109,8 +121,19 @@ def main() -> int:
             ports[p] = folder
         # --- variables
         own = exports_vars(mp.parent / "exports.sh")
-        dep = {k: v for d in m["dependencies"] or [] if d in apps for k, v in exports_vars(apps[d][0].parent / "exports.sh").items()}
-        used = set(re.findall(r"\$\{([A-Z0-9_]+)\}", text))
+        # a slot is filled by the app the owner selects: here, the apps of this store that implement it
+        providers = [a for d in m["dependencies"] or [] for a, (_, am) in apps.items() if a == d or d in (am.get("implements") or [])]
+        dep = {k: v for a in providers for k, v in exports_vars(apps[a][0].parent / "exports.sh").items()}
+        slot = {k: v for d in m["dependencies"] or [] for k, v in SLOTS.get(d, {}).items()}
+        text_nc = re.sub(r"(?m)^\s*#.*$", "", text)
+        used = set(re.findall(r"\$\{([A-Z0-9_]+)\}", text_nc))
+        for v, fallback in re.findall(r"\$\{([A-Z0-9_]+):-\$\{([A-Z0-9_]+)\}\}", text_nc):
+            if v not in slot:
+                bad(f"{folder}: ${{{v}:-...}}: only a slot's variable takes a fallback")
+            used.discard(v)
+        for v in sorted(set(re.findall(r"\$\{?([A-Z0-9_]+)", text_nc)) & set(slot)):
+            if not re.search(r"\$\{" + v + r":-\$\{[A-Z0-9_]+\}\}", text_nc) or re.search(r"\$\{?" + v + r"(?!:-\$\{)\b", text_nc):
+                bad(f"{folder}: ${{{v}}} (slot) must be used as ${{{v}:-${{FALLBACK}}}}")
         for v in sorted(used - UMBREL_VARS - set(own) - set(dep)):
             bad(f"{folder}: ${{{v}}} is not set by umbrelOS, this app's exports or a dependency's")
         if "APP_PASSWORD" in used and not m.get("deterministicPassword"):
@@ -161,6 +184,13 @@ def main() -> int:
                                env={**os.environ, **envs}, cwd=mp.parent)
             if r.returncode != 0:
                 bad(f"{folder}: docker compose config: {r.stderr.strip()[-400:]}")
+            if slot:
+                # the slot's node alone (no app of this store installed): the slot's values reach the services
+                base = {k: v for k, v in envs.items() if k not in dep}
+                r = subprocess.run(["docker", "compose", "-f", str(compose_p), "-f", str(ov), "config"], capture_output=True, text=True,
+                                   env={**{k: v for k, v in os.environ.items() if not k.startswith("APP_")}, **base, **slot}, cwd=mp.parent)
+                if r.returncode != 0 or not all(v in r.stdout for v in slot.values()):
+                    bad(f"{folder}: with only the slot's node, compose does not get its values: {r.stderr.strip()[-300:]}")
         print(f"  manifest + compose checked ({len(svcs)} services)")
     for w in warnings:
         print(f"  warn {w}")

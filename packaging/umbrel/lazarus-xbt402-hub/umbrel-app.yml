@@ -13,7 +13,9 @@ description: >-
   (umbrelOS gives every app, including this one, a hidden service).
 
 
-  Needs the XBT Node app. Unpublished and side-load only; the images stay on this box.
+  Needs an XBT (BLAKE2b) node app in the Bitcoin node slot: the one Lightning Fork uses (Knots (BLAKE2b)
+  Companion), so a box that runs Lightning Fork needs no second node. Select that node when installing; a
+  node on the SHA256d chain is the wrong chain. Unpublished and side-load only; the images stay on this box.
 developer: Lazarus
 website: https://lazarus-xbt.xyz
 repo: https://github.com/AwokenLazarus/Bitcoin
@@ -23,9 +25,10 @@ path: "/readyz"
 gallery: []
 releaseNotes: >-
   0.1.0: first local package of xbt402-hub (AGP-040). AGP-042: creates wallet hub, receive
-  address in the wallet UI, Tor onion from APP_HIDDEN_SERVICE.
+  address in the wallet UI, Tor onion from APP_HIDDEN_SERVICE. AGP-100: depends on the Bitcoin node
+  slot (the node Lightning Fork uses) instead of a second node.
 dependencies:
-  - lazarus-xbt-knots
+  - bitcoin
 defaultUsername: ""
 defaultPassword: ""
 submitter: Lazarus
