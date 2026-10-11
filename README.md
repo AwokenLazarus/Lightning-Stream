@@ -1723,7 +1723,9 @@ What is done instead:
 - **Recorded.** While credit is unpaid, each such block extends a run kept in the state file and
   shown in the report: `"unpaidBlocks": {"from", "to", "count", "refused"}` (`refused`: those that
   came with a statement the audit refused). A block walked twice counts once. A coinbase that pays
-  for credit ends the run; with no unpaid credit nothing is counted.
+  for credit ends the run; with no unpaid credit nothing is counted. (AGP-091: "pays for credit"
+  is now "pays its share of all the unpaid credit, in a block above the run"; 1 sat did it. See
+  the AGP-091 section.)
 - **An operator's stop.** `--max-unpaid-blocks N` (`WorkConfig::max_unpaid_blocks`, off by default)
   stops new credit (`frozen: "unpaid_blocks"`) once the run reaches N and lifts it when a coinbase
   pays. It is a stop, not distrust. N has to come from how often the Prime's pool finds a block,
@@ -2403,7 +2405,9 @@ first run against `main` and failed there.
   (`chain::ChainBlock { height, hash, value_sats, paid_sats, bits, prev_bits }`). A statement for another
   height or hash fails with `wrong_block` (`p3_statement_height_must_be_the_blocks`: `height = u32::MAX`
   and `height = window_start + 1`).
-* **P4: a missing statement is never skipped.** `provider::window_statement` (`tools::window`): 200 is a statement, 404 (primed's
+* **P4: a missing statement is never skipped.** (AGP-091 changed two things said here: a coinbase
+  that paid the identity with no statement no longer fails the audit, and a Prime error no longer
+  stops the loop. See the AGP-091 section.) `provider::window_statement` (`tools::window`): 200 is a statement, 404 (primed's
   "no window statement", `stats.rs` 434) is `Statement::Missing`, and anything else is an error.
   `WorkProvider::audit_chain`: a missing statement for a coinbase that paid the identity fails the
   audit and distrusts the Prime (`missing_statement`); for one that paid nothing it records nothing and
@@ -2417,7 +2421,9 @@ first run against `main` and failed there.
   * An unfunded invoice past its TTL stays dormant for `invoice_grace_secs` (default 3600 s): its
     receipts are still pulled and a receipt with work still spends on it. Only a newer invoice that
     needs the room evicts it, oldest first (`p6_an_invoice_with_work_outlives_its_ttl`).
-  * Issuance is limited per client (`max_unfunded_per_client`, default 16, `429 too_many_invoices`). The
+  * (AGP-091: there is no limit any more, because issuing an invoice stores nothing; `max_unfunded`,
+    `max_unfunded_per_client` and `issue_invoice_for` are gone. See the AGP-091 section.)
+    Issuance is limited per client (`max_unfunded_per_client`, default 16, `429 too_many_invoices`). The
     client is the TCP peer, which the xbt402 HTTP server now passes in `X-Xbt402-Peer`
     (`xbt402::provider::PEER_HEADER`; a client-sent copy is dropped). Behind a reverse proxy,
     `--trust-forwarded` takes the last `X-Forwarded-For` hop instead (`p6_issuance_is_limited_per_client`).
@@ -2529,7 +2535,8 @@ is not paid for twice (`settled_through`). Work paid for beyond the credit grant
 
 So a Prime gets credit released only by paying the provider, in coinbases of real blocks, the price of
 the calls. What it has not paid for stays inside the caps: 1,000 calls in total with the shipped
-defaults, once, not per block.
+defaults, once, not per block. (The second audit found the count wrong under `--work-units` and
+"once" too strong; both are in the AGP-091 section, the first fixed, the second stated.)
 
 | route (closure audit, list 1 item 2 and 4) | before | now | test |
 |---|---|---|---|
@@ -2593,9 +2600,15 @@ within `room`; these reach it or the payments:
 - Every coinbase output to the identity counts as payment, whatever it was for. Use an identity that
   receives nothing but this Prime's pay-with-work payouts.
 - A locked coinbase payout still counts as paid (M1).
-- Exact pricing rounds up to one work unit, so a passing block that paid 1 sat pays for 1 unit
-  (0.09 sat of work on mainnet). On regtest a call costs one unit and each paying block pays for one.
-- A statement for a stale block served during a reorg, on a block that pays the identity, distrusts
+- Exact pricing rounds up to one work unit, so a passing block that paid 1 sat pays for 1 unit.
+  At this repo's mainnet numbers (`1a00f0b5`, 3.125 XBT) a unit is 17.5 sat of work and a 150-sat
+  call is 10 units, so that 1 sat pays for a tenth of a call: free cover of under one unit, about
+  15 sat of calls, per block the Prime pays in. (This line said "0.09 sat of work on mainnet";
+  that is the figure for `190141c5`, a difficulty about 190 times lower. Corrected by AGP-091 from
+  the second audit; test `limit_one_sat_pays_for_a_tenth_of_a_call_at_mainnet_numbers`.) On
+  regtest a call costs one unit and each paying block pays for one.
+- (No longer so since AGP-091: such a statement is the block having no statement, with no verdict.)
+  A statement for a stale block served during a reorg, on a block that pays the identity, distrusts
   the Prime like a missing one does. The shipped audit depth of 6 keeps the loop away from the tip.
 - State migrated from AGP-065 cannot reopen a block audited before the upgrade if it is reorged after.
 - Fraud proofs still convict only for a checker who knows the Prime's terms; T2/T4 for the xbt-work
@@ -2626,6 +2639,143 @@ rule above are specified by this crate, which is the reference for them until th
 | provider state file | version 2 | version 3 (`credits`, `cover`, `coverSettled`); versions 1 and 2 load |
 | `xbt-work-provider` | see the defaults table | |
 | `Amount::Fixed` providers | | set `invoice_price_sats`, or payments are valued at the work's §6.1 value |
+
+## Pay-with-work, fix wave 4: what the second audit left (AGP-091)
+
+The second closure audit (AGP-087, list 1 items 9, 10, 11 and 17) found the neighbours of the P1,
+P4 and P6 fixes open on `main` (`f0554d0`). The cover rule of AGP-079 held against everything the
+audit tried and is unchanged: no unit of credit leaves the caps without sats in a coinbase output to
+the provider's address, read from the provider's node, under a statement that passes. Each item
+below is one rule, kept in one place, with the paths that could break it.
+
+**1. The Prime is failed only on what the Prime signed for this block** (`WorkProvider::audit_chain`).
+A block with no statement the Prime signed for it has no verdict and covers nothing, whatever its
+coinbase paid the identity. Before, a block that paid the identity with no statement failed the
+audit and distrusted the Prime for good. The identity is the `payTo` of every 402, and whoever
+mines a block chooses its coinbase outputs: one sat from a competing miner ended an honest Prime's
+service to every payer. "No statement" is all of: a 404, a statement for another block or height
+(the Prime's own, for a block that lost a race), one under another key, and an answer that is no
+statement at all. What still fails: a statement that verifies under the pinned key for this Prime
+and this block and that the audit cannot run on (`refused_statement`), a statement whose block
+underpaid (`wrong_prime`, with a fraud proof), and an equivocation. A Prime gains nothing from the
+change: a block it pays in without a statement covers nothing, which is less than the same block
+with one. Such blocks are counted in `unpaidBlocks` (now with `paidSats`, what they paid in all).
+The code `missing_statement` is gone. An audit recorded at a height for a block the chain no longer
+has is undone when that height is audited again with no statement (the admin audit does not look
+for reorgs first).
+
+**2. A cap in calls is that many calls at what a call costs** (`Cap::units_under`,
+`WorkConfig::cap_rule`). The provider derives its caps from the rule in force, when it starts and
+at each epoch. Before, the binary computed them at exact pricing and then `--work-units N` changed
+what a call costs: "1,000 calls" was 9,000 calls with `--work-units 1` at `1a00f0b5`. With exact
+pricing the number is as it was: 1,000 calls' worth of work before the haircut, which is 900 calls
+at the shipped 10%.
+
+**3. No answer of the Prime's stops the audit walk** (`walk::Walk`, the loop the binary runs, now in
+the library and tested). The provider's own node is the only thing it waits for. A statement fetch
+that fails (500, a body that is no statement, no connection) leaves the block as one with no
+statement, the walk goes on, and the block is asked for again: on each of the next passes at
+first, then at most once in 64 passes, until it lies 144 blocks below the walk. Before, the loop
+stopped at that block and tried it every 2 s for ever, so a Prime that answered 500 for one height
+was never audited again. The walk's position is kept in the state file (`auditNext`): a provider
+that was down for more than 106 blocks used to skip the blocks in between.
+
+**4. The unpaid-blocks stop lifts when the Prime pays in full** (`--max-unpaid-blocks`). The run
+ends when no credit is unpaid, or at a block above the run that passed on what its coinbase itself
+paid (no deferral line, no `min_payout` clause) under a window that holds all the unpaid credit, so
+that `expected` was the block's share of all of it. Before, any payment ended it: 1 sat under a
+window moved past the credit, with 799 of 800 units unpaid.
+
+**5. Issuing an invoice costs the provider no state** (`provider::Issued`). The 16 bytes of an
+invoice identifier (§4.1) are its expiry (4), a nonce (8) and a 4-byte MAC under a secret in the
+state file; the `authKey` is an HMAC of the identifier under the same secret. Nothing is written
+when an invoice is issued, and the record (`n`, `spent`) is made by the first receipt the Prime
+signed that shows work. Before, each unfunded invoice was a row in a table of 10,000, rationed per
+client by the TCP peer. The binary listens on loopback, so every client behind a proxy was one
+peer: 16 requests an hour from anyone stopped invoices for everyone, and with `--trust-forwarded`
+625 addresses filled the table and pushed slow payers' invoices out, stranding their work. There is
+nothing left to fill, ration or evict, and no `fsync` an anonymous request can cause. Expiry is as
+it was (TTL, then the grace for a first receipt with work). `429 too_many_invoices` is never sent.
+The relay pull still asks for the newest 64 invoices not yet seen in a receipt (`PULL_NEW`, in
+memory); an invoice that is not among them is credited when its payer presents a receipt, which a
+payer does with every call.
+
+**6. An admin request carries the admin token** (`provider::admin_request`). `--admin` makes
+`DIR/admin.token` (0600) and every admin request needs `Authorization: Bearer <token>` and a
+loopback peer. Before, the loopback peer was the whole check, and behind a proxy on the same host
+that is every client on the internet: anyone could read the report and run audits.
+
+**7. A lost answer costs that answer and no other** (`WorkPayer::check_response`). The provider
+debits before it answers, so after a lost answer its `spentWork` is ahead of the payer's. A
+PAYMENT-RESPONSE names the `n` of its call; `spentWork` must grow by `charged` and by no more than
+the quotes of the earlier calls still unanswered (`Session::unanswered`, kept with the session).
+Before, it had to grow by exactly `charged`: after one lost answer every later call was debited and
+its answer thrown away. An answer whose `n` is not an open call (an earlier answer played again) is
+refused.
+
+**8. The payer fetches a receipt only where it said it would, or at the provider's own origin**
+(`WorkPayer::provider_named`). The provider writes `receiptUrl` and `relayUrl` into the invoice.
+The payer's own `relay_url` and `receipt_url` come first (the invoice's relay used to win). A URL
+only the invoice names is fetched on the provider's origin or on one of `allow_origins`, and is
+refused with `provider_url` before any request otherwise. Before, the payer sent a GET to whatever
+URL the invoice named, before every paid call.
+
+Tests: `crates/xbt-work/tests/agp087_work.rs` and `agp087_transport.rs` (the audit's; its six
+failing tests pass), `agp091_work.rs` (17: items 1, 4, 5 on their other paths; 12 fail on the
+audit's branch), `agp091_walk.rs` (10: items 2, 3, 6), `agp091_payer.rs` (7: items 7, 8).
+
+**What operators and embedders see.**
+
+| | before | now |
+|---|---|---|
+| a block that paid the identity, no statement | failed audit, Prime distrusted (`missing_statement`) | no verdict; counted in `unpaidBlocks` (`paidSats`) |
+| `--work-units N` with no cap flag | caps of 1,000 priced calls' worth of units | caps of 100 and 1,000 calls at N units |
+| a Prime answering 5xx for a block | the audit loop stops there | the walk goes on; the block is asked for again |
+| `--max-unpaid-blocks` lifts | on any payment | on a full payment for all unpaid credit, above the run |
+| `--trust-forwarded`, `--max-unfunded-per-client` | per-client invoice limit | accepted and ignored with a notice |
+| `--admin` | loopback peer | loopback peer and `Authorization: Bearer` with `DIR/admin.token` |
+| `xbt-work-payer` | fetches where the invoice says | `--relay-url` / `--receipt-url` / `--allow-origin`; `--provider-admin-token FILE` |
+| `WorkConfig` | `max_unfunded`, `max_unfunded_per_client` | removed; `cap_rule` added; `trust_forwarded` kept, unused |
+| `WorkProvider` | `issue_invoice_for(client)` | removed (`issue_invoice`); adds `caps()`, `audit_position()`, `set_audit_position()` |
+| `Statement` | `Found`, `Missing` | adds `Unavailable` |
+| `PayerConfig` | | adds `receipt_url`, `allow_origins`; `relay_url` now comes before the invoice's |
+| state file (version 3) | | adds `invoiceSecret`, `auditNext`, `unpaid.paidSats`; older state loads and keeps its invoices |
+
+**Limits, stated.**
+
+- A Prime that never gives a statement for a block (404, 5xx or garbage) is never failed for that
+  block, paid or not. The provider cannot tell the Prime's block from another pool's without the
+  share-log commitment (`docs/xbt-work-share-log-commitment.md`, not implemented). The loss is the
+  credit inside the caps, as before.
+- "Once" is not once. Cover is one pool across payers, oldest credit first. An honest payer's work
+  is paid for at its §6.1 value, which at the 10% haircut is 11% more than its credit costs, and
+  the surplus covers whatever credit is older, mined or not. A Prime colluding with a payer gets
+  its unmined credit covered by honest payers' coinbases at about one call per nine honest calls,
+  and can then take that much again. The provider is still paid, in coinbases, for every unit it
+  releases; what it loses is the haircut it priced in as its margin on those units. Not changed:
+  a coinbase output cannot be attributed to an invoice (test
+  `limit_an_honest_payers_overpayment_covers_older_unmined_credit`).
+- With exact pricing a cap in calls is in calls' worth of work before the haircut: 900 calls, not
+  1,000, at the shipped 10%. It errs towards the provider.
+- The blocks whose statement the walk still asks for are kept in memory. After a restart those
+  deeper than the walk's start (its kept position, and at least 100 blocks below the audit depth)
+  stay blocks with no statement: their payments cover nothing. It errs against the payer and is
+  the Prime's to avoid.
+- The 4-byte MAC in an invoice identifier only tells this provider's identifiers from others'
+  (`unknown_invoice` rather than `bad_auth`); one guess in 2^32 gets `bad_auth`. What authenticates
+  a call is the 256-bit `authKey`. The identifier shows when the invoice expires.
+- A provider that loses its state file loses the secret, and with it every invoice no receipt was
+  presented for yet (as it lost them before). `--state off` keeps the secret in memory only.
+- The spec (§4.5) says a provider MUST bound outstanding unfunded invoices and answer `429
+  too_many_invoices` beyond the bound. This provider holds none, so the bound is met by having
+  nothing to bound; the wording is XBT-053's to change.
+- The admin token is a bearer secret on loopback, in a file. Whoever can read the provider's data
+  directory can use it, as they can read the work book.
+- A payer that sets no relay and no receipt URL of its own, facing a provider that names them on
+  another origin, gets `provider_url` and has to configure one. That is the intended cost.
+- The payer's check of `spentWork` is bookkeeping, not proof: the PAYMENT-RESPONSE is not signed
+  (stated in AGP-081). After a call the provider refused, its quote stays in the slack until the
+  next answer, so a provider could over-report by that much without being noticed.
 
 ## Lightning rail hardening (AGP-066, review L1–L5)
 

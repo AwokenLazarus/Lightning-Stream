@@ -18,6 +18,14 @@
 //! xbt-work-payer call BASE PATH --state FILE
 //!     one paid call with the Rust Client (AGP-043: the live cap refusals); prints
 //!     `{"status", "error", "code", "balanceWork", "heldWork"}` and exits 0 on HTTP 200, 1 otherwise.
+//!
+//! Where receipts are fetched (AGP-091; `pay` and `call`): `--relay-url URL` (`XBT_WORK_RELAY_URL`,
+//! the blinded relay this payer uses) or `--receipt-url URL` (`XBT_WORK_RECEIPT_URL`, the Prime's
+//! receipt query) come first. Without them the invoice's `relayUrl` or `receiptUrl` is used only on
+//! the provider's own origin or on an origin named with `--allow-origin ORIGIN[,ORIGIN]`
+//! (`XBT_WORK_ALLOW_ORIGINS`); otherwise the fetch is refused (`provider_url`): the provider writes
+//! those two URLs, and the payer does not send requests wherever a provider says.
+//! `--provider-admin` needs `--provider-admin-token FILE`: the provider's `DIR/admin.token`.
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -32,7 +40,7 @@ use xbt_work::book::ReceiptBook;
 use xbt_work::chain::ChainBlock;
 use xbt_work::payer::{check_gateway_config, PayerConfig, WorkPayer};
 use xbt_work::receipt::{pubkey_from_hex, Signed};
-use xbt_work::tools::{arg, block_count, chain_block, flag, network, prime_terms, rpc, window};
+use xbt_work::tools::{arg, block_count, chain_block, flag, network, opt, prime_terms, rpc, window};
 
 const CALLS: [&str; 4] = ["/v1/share-change?window=7d", "/v1/pools?window=7d", "/v1/pool/lazarus", "/v1/pools?window=1d"];
 
@@ -53,7 +61,10 @@ fn meta_path(state: &str) -> String {
 }
 
 fn payer(state: &str, net: &str) -> Arc<WorkPayer> {
-    Arc::new(WorkPayer::new(PayerConfig { network: net.into(), max_amount: 1_000_000, state_path: Some(state.into()), ..Default::default() }).expect("payer"))
+    let allow_origins = opt("--allow-origin", "XBT_WORK_ALLOW_ORIGINS").map(|o| o.split(',').map(|o| o.trim().to_string()).filter(|o| !o.is_empty()).collect()).unwrap_or_default();
+    Arc::new(WorkPayer::new(PayerConfig { network: net.into(), max_amount: 1_000_000, state_path: Some(state.into()),
+                                          relay_url: opt("--relay-url", "XBT_WORK_RELAY_URL"), receipt_url: opt("--receipt-url", "XBT_WORK_RECEIPT_URL"),
+                                          allow_origins, ..Default::default() }).expect("payer"))
 }
 
 fn prepare(base: &str, state: &str) {
@@ -145,7 +156,8 @@ fn pay(base: &str, calls: usize, secs: f64, state: &str) -> i32 {
     }
     let cum = receipts.last().map(|r| r.receipt.cum_work).unwrap_or(0);
     c.check(cum >= need, format!("Prime receipted {cum} work units for {inv} (needed {need}) in {} s", (now() - prepared).round()));
-    c.check(s.invoice.get("relayUrl").is_some(), "payer fetched receipts through the blinded relay (the lookup reveals neither identity nor invoice)".into());
+    c.check(p.cfg.relay_url.is_some() || s.invoice.get("relayUrl").is_some(),
+            "payer fetched receipts through the blinded relay (the lookup reveals neither identity nor invoice)".into());
     if receipts.is_empty() {
         println!("{}", json!({"ok": false, "checks": c.list}));
         return 1;
@@ -323,7 +335,9 @@ fn pay(base: &str, calls: usize, secs: f64, state: &str) -> i32 {
     let mut provider_audit = Value::Null;
     if flag("--provider-admin") {
         let req = json!({"from": lo, "to": hi, "underpayHeight": underpay["height"]});
-        let r = t.request("POST", &format!("{base}/admin/xbt-work/audit"), xbt402::json::dumps(&req).as_bytes(), &[]).expect("admin");
+        let token = std::fs::read_to_string(arg("--provider-admin-token").expect("--provider-admin needs --provider-admin-token FILE")).expect("admin token file");
+        let r = t.request("POST", &format!("{base}/admin/xbt-work/audit"), xbt402::json::dumps(&req).as_bytes(),
+                          &[("Authorization".into(), format!("Bearer {}", token.trim()))]).expect("admin");
         provider_audit = xbt402::json::parse_slice(&r.body).unwrap_or(Value::Null);
         let res = provider_audit["results"].as_array().cloned().unwrap_or_default();
         c.check(provider_audit["ok"] == json!(true),

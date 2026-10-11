@@ -11,7 +11,7 @@
 //! Limits of this rail against someone between payer and provider (AGP-081, the closure audit of
 //! review T2 and T4), where it is below the channel rail:
 //!
-//! * The request binding is taken over the bare target (as the published XBT-053 vectors are): it
+//! * The request binding is taken over the bare target (as the XBT-053 vectors are): it
 //!   holds the method, path, query and body, and no scheme, host or port. A header captured on its
 //!   way to one origin authenticates, once, at any other origin that holds this invoice's key.
 //! * The PAYMENT-RESPONSE is not signed and covers neither the answer's status nor its body. The
@@ -21,6 +21,22 @@
 //!
 //! Run this rail over TLS to the provider. Raising it to the channel rail's level is a change to
 //! the xbt-work spec (a signed receipt with status and bodyHash, an origin in the binding).
+//!
+//! AGP-091, two rules of this payer:
+//!
+//! * **A lost answer costs that answer and no other.** The provider debits a call before it
+//!   answers, so after an answer is lost its `spentWork` is ahead of what this payer last saw.
+//!   Each PAYMENT-RESPONSE names the `n` of the call it answers; `spentWork` must have grown by
+//!   `charged` and by no more than the quotes of the earlier calls that are still unanswered
+//!   ([`Session::unanswered`]). Before, it had to grow by exactly `charged`, and after one lost
+//!   answer every later call was debited and its answer thrown away. An answer whose `n` is not
+//!   an open call of this payer (an earlier answer played again) is refused.
+//! * **The payer fetches a receipt only where it said it would, or at the provider's own origin.**
+//!   The provider writes `receiptUrl` and `relayUrl` into the invoice. The payer's own
+//!   [`PayerConfig::relay_url`] and [`PayerConfig::receipt_url`] come first; a URL only the invoice
+//!   names is used when it is on the provider's origin or on one of
+//!   [`PayerConfig::allow_origins`], and refused (`provider_url`) before any request otherwise.
+//!   Before, the payer sent a GET to whatever URL the invoice named.
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
@@ -52,7 +68,14 @@ pub struct Session {
     pub spent: u64,
     /// Refusal of the last paid call, if any.
     pub last_error: Option<String>,
+    /// Calls sent and not answered yet: (`n`, the quote in work units), lowest `n` first. The
+    /// provider may have debited any of them.
+    pub unanswered: Vec<(u64, u64)>,
 }
+
+/// The most unanswered calls a session lists one by one; older ones are folded into the oldest
+/// entry kept (their quotes still count, their `n` no longer answers).
+const MAX_UNANSWERED: usize = 256;
 
 impl Session {
     pub fn invoice_id(&self) -> &str {
@@ -90,8 +113,15 @@ pub struct PayerConfig {
     pub max_amount: u64,
     /// The Prime key this payer's own gateway pins (§7: SHOULD check `primePubkey` against it).
     pub pinned_prime: Option<String>,
-    /// A relay to use when the invoice names none.
+    /// The blinded relay this payer fetches receipts from. It comes before anything the invoice
+    /// names.
     pub relay_url: Option<String>,
+    /// The Prime's receipt query this payer uses when it has no relay (as the provider's
+    /// `receipt_url`: the payer adds `?identity=…&invoice=…`). It comes before the invoice's.
+    pub receipt_url: Option<String>,
+    /// Origins (`scheme://host[:port]`) besides the provider's own on which a `relayUrl` or
+    /// `receiptUrl` named only by the invoice is fetched.
+    pub allow_origins: Vec<String>,
     /// Where sessions are kept (they hold each invoice's `authKey`). None: memory only.
     pub state_path: Option<PathBuf>,
 }
@@ -191,7 +221,7 @@ impl WorkPayer {
         if !ok {
             return fail("bad_offer", "invoice does not match the offer (identity, key or Prime)");
         }
-        let s = Session { accepted: acc.clone(), invoice: inv, n: 0, best: None, spent: 0, last_error: None };
+        let s = Session { accepted: acc.clone(), invoice: inv, n: 0, best: None, spent: 0, last_error: None, unanswered: vec![] };
         self.lock().insert(origin.to_string(), s.clone());
         self.save()?;
         Ok(s)
@@ -211,17 +241,45 @@ impl WorkPayer {
         self.open(t, &origin, &acc)
     }
 
-    /// Fetch the latest receipt for `origin`'s invoice (relay first, else the Prime's direct query),
-    /// verify it and keep it if it is newer. Returns the best receipt held.
+    /// A URL only the invoice names, held to where this payer fetches (AGP-091): `http(s)`, no
+    /// userinfo, backslash, `#`, whitespace or control character, and on the provider's own origin
+    /// or one of [`PayerConfig::allow_origins`].
+    fn provider_named(&self, origin: &str, what: &str, url: &str) -> Result<String> {
+        let refuse = |why: String| fail("provider_url", format!("the invoice's {what} {why}; refused before any request"));
+        if url.chars().any(|c| c == '\\' || c == '#' || c == '@' || c.is_whitespace() || c.is_control()) {
+            return refuse("has a backslash, a #, an @, a space or a control character".into());
+        }
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return refuse("is not an http(s) URL".into());
+        }
+        let (its, _) = split_url(url);
+        // the origin ends at the first `/`, `?` or `#`: a query straight after the host is not part of it
+        let its = its.split('?').next().unwrap_or("").to_string();
+        let same = |o: &str| o.trim_end_matches('/').eq_ignore_ascii_case(&its);
+        if same(origin) || self.cfg.allow_origins.iter().any(|o| same(o)) {
+            return Ok(url.to_string());
+        }
+        refuse(format!("is on {its}, which is neither the provider's origin nor one this payer allows (set this payer's own relay or receipt URL, or allow that origin)"))
+    }
+
+    /// Fetch the latest receipt for `origin`'s invoice, verify it and keep it if it is newer.
+    /// Returns the best receipt held. Where from: this payer's own relay, else its own receipt
+    /// query, else the invoice's `relayUrl`, else the invoice's `receiptUrl`, the last two only
+    /// through `WorkPayer::provider_named`.
     pub fn refresh(&self, t: &dyn Transport, origin: &str) -> Result<Option<Signed>> {
         let s = self.session(origin).ok_or_else(|| WorkError::new("no_session", origin.to_string()))?;
         let (ident, inv) = (s.identity().to_string(), s.invoice_id().to_string());
-        let relay = s.invoice.get("relayUrl").and_then(Value::as_str).map(str::to_string).or_else(|| self.cfg.relay_url.clone());
-        let doc = match relay {
-            Some(r) => crate::relay::fetch(t, &r, &ident, &inv)?,
-            None => {
-                let url = s.invoice.get("receiptUrl").and_then(Value::as_str).unwrap_or("");
-                let r = t.request("GET", url, b"", &[])?;
+        let named = |k: &str| s.invoice.get(k).and_then(Value::as_str).map(str::to_string);
+        let (relay, query) = match (&self.cfg.relay_url, &self.cfg.receipt_url, named("relayUrl")) {
+            (Some(r), _, _) => (Some(r.clone()), None),
+            (None, Some(q), _) => (None, Some(format!("{q}?identity={ident}&invoice={inv}"))),
+            (None, None, Some(r)) => (Some(self.provider_named(origin, "relayUrl", &r)?), None),
+            (None, None, None) => (None, Some(self.provider_named(origin, "receiptUrl", &named("receiptUrl").unwrap_or_default())?)),
+        };
+        let doc = match (relay, query) {
+            (Some(r), _) => crate::relay::fetch(t, &r, &ident, &inv)?,
+            (None, url) => {
+                let r = t.request("GET", &url.unwrap_or_default(), b"", &[])?;
                 if r.status != 200 {
                     return fail("prime_error", format!("receipt query: HTTP {}", r.status));
                 }
@@ -255,6 +313,12 @@ impl WorkPayer {
         let mut m = self.lock();
         let s = m.get_mut(origin).ok_or_else(|| WorkError::new("no_session", origin.to_string()))?;
         s.n += 1;
+        // sent from here on, answered or not: the provider may debit it
+        s.unanswered.push((s.n, s.amount()));
+        if s.unanswered.len() > MAX_UNANSWERED {
+            let (_, oldest) = s.unanswered.remove(0);
+            s.unanswered[0].1 = s.unanswered[0].1.saturating_add(oldest);
+        }
         let rr = receipt_doc.get("receipt");
         let num = |k: &str| rr.and_then(|r| r.get(k)).and_then(|v| py_u64(Some(v))).unwrap_or(0);
         let invoice = py_str(receipt_doc.get("invoice"));
@@ -302,10 +366,22 @@ impl WorkPayer {
         if charged > s.amount() {
             return bad("charged more than the quote");
         }
-        if spent != s.spent + charged {
-            return bad("spentWork did not grow by exactly charged");
+        // the call this answers (a provider that names none answers the last one sent)
+        let n = match r.get("n") {
+            None => s.n,
+            Some(n) => n.as_u64().ok_or_else(|| WorkError::new("bad_receipt", "receipt n is not an integer"))?,
+        };
+        if !s.unanswered.iter().any(|(open, _)| *open == n) {
+            return bad("receipt answers no call of ours that is still open");
+        }
+        // calls sent before this one whose answers never came: the provider debited them or not
+        let lost = s.unanswered.iter().filter(|(open, _)| *open < n).fold(0u64, |a, (_, q)| a.saturating_add(*q));
+        let Some(least) = s.spent.checked_add(charged) else { return bad("spentWork overflows") };
+        if spent < least || spent > least.saturating_add(lost) {
+            return bad("spentWork did not grow by charged (and by no more than the calls still unanswered)");
         }
         s.spent = spent;
+        s.unanswered.retain(|(open, _)| *open > n);
         drop(m);
         self.save()
     }
@@ -317,7 +393,8 @@ impl WorkPayer {
         let m = self.lock();
         let doc: serde_json::Map<String, Value> = m.iter().map(|(o, s)| {
             (o.clone(), obj([("accepted", s.accepted.clone()), ("invoice", s.invoice.clone()), ("n", s.n.into()),
-                             ("best", s.best.as_ref().map(Signed::to_doc).unwrap_or(Value::Null)), ("spent", s.spent.into())]))
+                             ("best", s.best.as_ref().map(Signed::to_doc).unwrap_or(Value::Null)), ("spent", s.spent.into()),
+                             ("unanswered", s.unanswered.iter().map(|(n, q)| Value::from(vec![*n, *q])).collect::<Vec<_>>().into())]))
         }).collect();
         crate::fsx::write_private(path, dumps(&Value::Object(doc)).as_bytes()).map_err(|e| WorkError::new("state_io", e.to_string()))
     }
@@ -333,7 +410,9 @@ impl WorkPayer {
                 _ => None,
             };
             m.insert(o.clone(), Session { accepted: s["accepted"].clone(), invoice: s["invoice"].clone(), n: py_u64(s.get("n")).unwrap_or(0),
-                                          best, spent: py_u64(s.get("spent")).unwrap_or(0), last_error: None });
+                                          best, spent: py_u64(s.get("spent")).unwrap_or(0), last_error: None,
+                                          unanswered: s.get("unanswered").and_then(Value::as_array).into_iter().flatten()
+                                              .filter_map(|e| Some((e.get(0)?.as_u64()?, e.get(1)?.as_u64()?))).collect() });
         }
         Ok(())
     }
@@ -362,6 +441,8 @@ impl SchemePayer for WorkPayer {
             if let Some(sp) = w.get("spentWork").and_then(|v| py_u64(Some(v))) {
                 if let Some(sess) = self.lock().get_mut(origin) {
                     sess.spent = sess.spent.max(sp);
+                    // the provider's own count: every call sent before this refusal is settled in it
+                    sess.unanswered.clear();
                 }
             }
         }

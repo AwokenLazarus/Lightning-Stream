@@ -166,9 +166,9 @@ def _body(b, raw):
         return {"text": b.decode(errors="replace")}
 
 
-def http(url, body=None, method=None, timeout=15, raw=False):
+def http(url, body=None, method=None, timeout=15, raw=False, headers=None):
     data = body if isinstance(body, (bytes, type(None))) else json.dumps(body).encode()
-    req = urllib.request.Request(url, data, {"Content-Type": "application/json"} if data else {}, method=method)
+    req = urllib.request.Request(url, data, {**({"Content-Type": "application/json"} if data else {}), **(headers or {})}, method=method)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, _body(r.read(), raw), dict(r.headers)
@@ -312,18 +312,27 @@ def kill_group(p):
 
 
 # ------------------------------------------------------------------ the provider, the payer
+def admin_token_file():
+    return os.path.join(RUN, f"provider-data-{API}", "admin.token")
+
+
+def admin_auth():
+    # AGP-091: the admin endpoints need the token the provider keeps in its data dir
+    return {"Authorization": "Bearer " + open(admin_token_file()).read().strip()}
+
+
 def report():
-    return http(f"{API_URL}/admin/xbt-work/report")[1]
+    return http(f"{API_URL}/admin/xbt-work/report", headers=admin_auth())[1]
 
 
 def admin_audit(h, **extra):
-    st, v, _ = http(f"{API_URL}/admin/xbt-work/audit", {"from": h, "to": h, **extra}, timeout=60)
+    st, v, _ = http(f"{API_URL}/admin/xbt-work/audit", {"from": h, "to": h, **extra}, timeout=60, headers=admin_auth())
     res = next((r for r in v.get("results", []) if r.get("height") == h), {})
     return res, v
 
 
 def payer_call(path):
-    p = subprocess.run([B["payer"], "call", API_URL, path, "--state", PAYER_STATE], capture_output=True, text=True, timeout=120)
+    p = subprocess.run([B["payer"], "call", API_URL, path, "--state", PAYER_STATE, "--relay-url", RELAY_URL], capture_output=True, text=True, timeout=120)
     try:
         return json.loads(p.stdout.strip().splitlines()[-1])
     except (ValueError, IndexError):
@@ -651,7 +660,8 @@ def run():
     calls = max(1, rc["cum_work"] - spent)
     log(f"== pay: {calls} calls with the invoice's remaining receipted work")
     p = subprocess.run([B["payer"], "pay", API_URL, str(calls), "120", "--state", PAYER_STATE, "--rpc-port", str(RPC["a"]),
-                        "--cookie", cookie("a"), "--window-url", f"{STATS_URL}/window", "--provider-admin"] + prime_terms(),
+                        "--cookie", cookie("a"), "--window-url", f"{STATS_URL}/window", "--relay-url", RELAY_URL,
+                        "--provider-admin", "--provider-admin-token", admin_token_file()] + prime_terms(),
                        capture_output=True, text=True, timeout=600)
     sys.stdout.write(p.stderr)
     open(os.path.join(OUT, "payer.json"), "w").write(p.stdout)

@@ -133,7 +133,9 @@ impl World {
     }
 
     fn payer(&self) -> Arc<WorkPayer> {
-        Arc::new(WorkPayer::new(PayerConfig { network: NET.into(), max_amount: 100, pinned_prime: Some(self.prime.pubkey_hex()), ..Default::default() }).unwrap())
+        Arc::new(WorkPayer::new(PayerConfig { network: NET.into(), max_amount: 100, pinned_prime: Some(self.prime.pubkey_hex()),
+                                              // AGP-091: the payer names its relay; one only the invoice names, on another origin, is refused
+                                              relay_url: Some(RELAY.into()), ..Default::default() }).unwrap())
     }
 
     fn raw(&self, path: &str, hdr: &str) -> (u16, Value) {

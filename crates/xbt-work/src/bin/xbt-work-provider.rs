@@ -1,7 +1,7 @@
 //! The Rust provider for the pay-with-work regtest run: a paid JSON API (`/v1/*`, 150 sat) behind
 //! the xbt402 Provider, offering `xbt-channel` and `xbt-work` in one 402. The work rail pulls
 //! receipts through the blinded relay every few seconds, re-prices on every new epoch (§6.3) and,
-//! with `--admin`, audits pool coinbases on request (loopback only).
+//! with `--admin`, audits pool coinbases on request (loopback only, with the admin token).
 //!
 //! xbt-work-provider --port P --rpc-port R --cookie PATH --identity ADDR --prime-pubkey HEX
 //!                   --prime-id N --receipt-url URL [--relay-url URL] [--window-url URL]
@@ -14,7 +14,7 @@
 //!                   [--max-carry-sats S | off] [--carry-growth-blocks N] [--max-unpaid-blocks N]
 //!                   [--prime-window N] [--prime-window-min-work W] [--window-tolerance-bps N]
 //!                   [--prime-fee-bps N] [--prime-min-payout S]
-//!                   [--max-unfunded-per-client N] [--trust-forwarded]
+//!                   (`--max-unfunded-per-client` and `--trust-forwarded` are accepted and ignored: AGP-091)
 //!                   [--data-dir DIR] [--watch-secs N]
 //!
 //! AGP-067 (review C4): the channel side keeps its payTo key (`DIR/payto.key`, created 0600 on first
@@ -25,7 +25,9 @@
 //!
 //! §13.1 caps (AGP-043): unaudited credit per invoice and in total, in work units, in sats converted
 //! at each epoch's price (without the haircut), or in calls at the `--price` (sats); `off` removes
-//! a cap. Owed carry above `--max-carry-sats`, or growing over `--carry-growth-blocks` audited
+//! a cap. The provider turns them into work units under the pricing rule in force (AGP-091): with
+//! `--work-units N` a cap in calls is that many calls at N units, and a cap in sats is turned into
+//! calls at `--price`. Owed carry above `--max-carry-sats`, or growing over `--carry-growth-blocks` audited
 //! blocks, stops new credit. AGP-065 (review P5): with no cap flag the provider caps unaudited
 //! credit at 100 calls per invoice and 1000 calls in total.
 //!
@@ -51,17 +53,23 @@
 //! `XBT_WORK_PRIME_WINDOW`, `XBT_WORK_PRIME_WINDOW_MIN_WORK`, `XBT_WORK_WINDOW_TOLERANCE_BPS`,
 //! `XBT_WORK_PRIME_FEE_BPS`, `XBT_WORK_PRIME_MIN_PAYOUT`, `XBT_WORK_MAX_UNFUNDED_PER_CLIENT`.
 //!
-//! The audit loop audits every block (review P4): a block that paid the identity with no statement,
-//! or with one the audit refuses, fails and distrusts the Prime; a Prime or node it cannot reach
-//! stops the pass, which resumes at that block. A block that paid the identity nothing and has no
-//! statement has no verdict (it may be any pool's), but while credit is unpaid it is counted
-//! (AGP-084): the report's `unpaidBlocks` is the run of them since a coinbase last paid for credit.
-//! `--max-unpaid-blocks N` stops new credit once the run reaches N, until a coinbase pays; it is off
-//! unless set, because N depends on how often the Prime's pool finds a block. A statement the Prime
-//! signed for such a block and the audit refuses is a failed audit, as on a paid block. Before each
+//! The audit walk audits every block (review P4; `xbt_work::walk`). Only a statement the Prime signed
+//! for a block gives it a verdict: one the audit runs on, or one it then refuses, which fails and
+//! distrusts the Prime whatever the coinbase paid. A block with no such statement (a 404, another
+//! block's, another key's, an answer that is no statement) has no verdict and covers nothing,
+//! whatever its coinbase paid the identity: anyone who mines a block can pay an address (AGP-091).
+//! While credit is unpaid it is counted (AGP-084): the report's `unpaidBlocks` is the run of them.
+//! `--max-unpaid-blocks N` stops new credit once the run reaches N, until a block above the run pays
+//! the Prime's share of all the unpaid credit, or none is unpaid; it is off unless set, because N
+//! depends on how often the Prime's pool finds a block. Only the node stops the walk: a statement
+//! the Prime fails to serve leaves the block as one with no statement, the walk goes on, and it asks
+//! again (at most once in 64 passes after the first few) until the block is 144 deep. The walk's
+//! position is kept in the state, so a provider that was down goes on where it stopped. Before each
 //! pass it compares the audited blocks with the node and undoes the audit of any reorged one.
 //!
-//! Admin (only with --admin, only from a loopback peer): `POST /admin/xbt-work/audit` with
+//! Admin (only with --admin; every request needs `Authorization: Bearer <token>`, the token in
+//! `DIR/admin.token`, made 0600 on first start, and a loopback peer; the peer alone proves nothing
+//! behind a proxy on the same host, AGP-091): `POST /admin/xbt-work/audit` with
 //! `{"from": H0, "to": H1, "underpayHeight": H?}` audits every coinbase in [H0, H1] that pays the
 //! identity against its signed window statement and returns the verdicts, the carry ledger and,
 //! for `underpayHeight`, the fraud proof of the same block audited as if it paid 1 sat. Blocks that pay
@@ -82,8 +90,10 @@ use xbt402::rpc::Rpc;
 use xbt_work::audit::{audit_block, check_fraud_proof};
 use xbt_work::chain::ChainBlock;
 use xbt_work::pricing::Pricing;
-use xbt_work::provider::{Amount, Cap, Caps, Statement, WorkConfig, WorkProvider, WorkScheme, SETTLE_DEPTH, SHIPPED_AUDIT_DEPTH, SHIPPED_HAIRCUT_BPS};
+use xbt_work::provider::{admin_request, admin_token, Amount, Cap, Caps, ServedStatement, Statement, WorkConfig, WorkProvider, WorkScheme, SETTLE_DEPTH,
+                         SHIPPED_AUDIT_DEPTH, SHIPPED_HAIRCUT_BPS};
 use xbt_work::tools::{arg, block_count, block_hash, chain_block, flag, maturity, network, opt, prime_terms, rpc, tip_bits, window};
+use xbt_work::walk::{AuditSource, Walk};
 
 fn num<T: std::str::FromStr>(flag: &str, var: &str) -> Option<T> {
     opt(flag, var).map(|v| v.parse().unwrap_or_else(|_| panic!("{flag} / {var}: not a number: {v}")))
@@ -111,7 +121,25 @@ struct Service {
     work: Arc<WorkProvider>,
     rpc: Rpc,
     window_url: Option<String>,
-    admin: bool,
+    /// The admin token (`--admin`): None, and the admin endpoints do not exist.
+    admin: Option<String>,
+}
+
+/// The audit walk's view of the chain and the Prime: this provider's node and `--window-url`.
+struct Source<'a> {
+    svc: &'a Service,
+    t: &'a UreqTransport,
+    window_url: &'a str,
+}
+
+impl AuditSource for Source<'_> {
+    fn block(&self, height: u32) -> xbt_work::Result<ChainBlock> {
+        chain_block(&self.svc.rpc, height, self.svc.identity())
+    }
+
+    fn statement(&self, height: u32) -> xbt_work::Result<Option<ServedStatement>> {
+        window(self.t, self.window_url, height)
+    }
 }
 
 impl Service {
@@ -194,44 +222,6 @@ impl Service {
         Ok(low)
     }
 
-    /// Audit every block in [from, to] (the auto-audit loop, review P4): the verdicts, and the next
-    /// height to audit. A node or Prime it cannot reach stops the pass there (retried next time);
-    /// a statement it refuses (another block, a window start that went backwards) is the block
-    /// having no statement: a failed audit when the coinbase paid the identity.
-    fn audit_range(&self, t: &UreqTransport, from: u32, to: u32) -> (Vec<(u32, bool)>, u32) {
-        let Some(wurl) = self.window_url.as_deref() else { return (vec![], from) };
-        let mut out = vec![];
-        for h in from..=to {
-            let block = match chain_block(&self.rpc, h, self.identity()) {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!("audit: height {h}: node: {e}; retrying");
-                    return (out, h);
-                }
-            };
-            let stmt = match window(t, wurl, h) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("audit: height {h}: {e}; credit held, retrying");
-                    return (out, h);
-                }
-            };
-            let found = match &stmt {
-                Some((sw, def, _)) => Statement::Found(sw, def),
-                None => Statement::Missing,
-            };
-            match self.work.audit_chain(&block, found) {
-                Ok(Some(o)) => out.push((h, o.ok)),
-                Ok(None) => {}
-                Err(e) => {
-                    eprintln!("audit: height {h}: {e}; retrying");
-                    return (out, h);
-                }
-            }
-        }
-        (out, to.saturating_add(1))
-    }
-
     fn report(&self) -> Value {
         let (unaudited, held) = self.work.exposure();
         let mut v = self.work.report();
@@ -257,13 +247,14 @@ impl HttpService for Service {
     fn serve(&self, method: &str, path: &str, headers: &[(String, String)], body: &[u8], url: &str) -> HttpResponse {
         if path.starts_with("/admin/") {
             // the peer address the server set (Host is the client's to choose)
-            let local = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(PEER_HEADER))
-                .and_then(|(_, v)| v.parse::<std::net::IpAddr>().ok()).is_some_and(|ip| ip.is_loopback());
-            if self.admin && local && method == "GET" && path == "/admin/xbt-work/report" {
+            let peer = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(PEER_HEADER)).map(|(_, v)| v.as_str());
+            // the token, not the peer address: behind a same-host proxy every client is loopback (AGP-091)
+            let allowed = self.admin.as_deref().is_some_and(|token| admin_request(headers, peer, token));
+            if allowed && method == "GET" && path == "/admin/xbt-work/report" {
                 let v = self.report();
                 return HttpResponse::new(200, vec![("Content-Type".into(), "application/json".into())], xbt402::json::dumps(&v).into_bytes());
             }
-            if !self.admin || !local || method != "POST" || path != "/admin/xbt-work/audit" {
+            if !allowed || method != "POST" || path != "/admin/xbt-work/audit" {
                 return HttpResponse::new(404, vec![], b"not found".to_vec());
             }
             let req = xbt402::json::parse_slice(body).unwrap_or(json!({}));
@@ -307,8 +298,10 @@ fn main() {
     let mut wcfg = wcfg.shipped(bits, subsidy, price);
     wcfg.relay_url = arg("--relay-url");
     wcfg.nta = flag("--nta") || std::env::var("XBT_WORK_NTA").is_ok_and(|v| v == "1");
+    // the caps as set; the provider turns them into work units under the pricing rule in force
+    // (`--work-units` included), now and at every epoch (AGP-091)
     let caps = Caps { invoice: cap_from_args("invoice", Caps::SHIPPED.invoice), total: cap_from_args("total", Caps::SHIPPED.total) };
-    wcfg.caps = caps.at(bits, subsidy, price);
+    wcfg.cap_rule = Some(caps);
     if ["--cap-skipped", "--cap-skipped-sats", "--cap-skipped-calls"].iter().any(|f| arg(f).is_some())
         || ["XBT_WORK_CAP_SKIPPED", "XBT_WORK_CAP_SKIPPED_SATS", "XBT_WORK_CAP_SKIPPED_CALLS"].iter().any(|v| std::env::var(v).is_ok())
     {
@@ -319,14 +312,9 @@ fn main() {
     }
     wcfg.carry_growth_blocks = num("--carry-growth-blocks", "XBT_WORK_CARRY_GROWTH_BLOCKS");
     wcfg.max_unpaid_blocks = num("--max-unpaid-blocks", "XBT_WORK_MAX_UNPAID_BLOCKS");
-    wcfg.max_unfunded_per_client = match num::<usize>("--max-unfunded-per-client", "XBT_WORK_MAX_UNFUNDED_PER_CLIENT") {
-        Some(0) => None,
-        Some(n) => Some(n),
-        None => wcfg.max_unfunded_per_client,
-    };
-    wcfg.trust_forwarded = flag("--trust-forwarded");
-    eprintln!("caps: {:?} -> {:?} work units at this epoch, owed carry at most {:?} sats; Prime terms {:?}",
-              (caps.invoice, caps.total), wcfg.caps, wcfg.max_owed_carry_sats, wcfg.terms);
+    if flag("--trust-forwarded") || opt("--max-unfunded-per-client", "XBT_WORK_MAX_UNFUNDED_PER_CLIENT").is_some() {
+        eprintln!("invoices: --trust-forwarded and --max-unfunded-per-client are no longer used (AGP-091): issuing an invoice stores nothing, so there is no limit to set");
+    }
     wcfg.amount = match arg("--work-units") {
         Some(n) => Amount::Fixed(n.parse().expect("work units")),
         None => Amount::Priced(Pricing { price_sats: price, bits, block_value_sats: subsidy, fee_bps: wcfg.terms.fee_bps,
@@ -348,10 +336,13 @@ fn main() {
         Some(s) => Some(s.into()),
         None => Some(data.join("work.json")),
     };
+    let max_carry = wcfg.max_owed_carry_sats;
     let work = Arc::new(WorkProvider::new(wcfg).unwrap_or_else(|e| {
         eprintln!("xbt-work-provider: {e}");
         std::process::exit(2);
     }));
+    eprintln!("caps: {:?} -> {:?} work units at this epoch ({} a call), owed carry at most {max_carry:?} sats; Prime terms {:?}",
+              (caps.invoice, caps.total), work.caps(), work.amount(price).unwrap_or(0), work.cfg.terms);
     let chain: Arc<dyn ChainBackend> = Arc::new(node.clone());
     let prov = Arc::new(Provider::new(chain, sk, ProviderConfig::new(&net), ledger,
                                       Box::new(move |_, p| if p.starts_with("/v1/") { price } else { 0 }),
@@ -385,18 +376,24 @@ fn main() {
                 if w2.set_epoch(b, v) {
                     eprintln!("epoch: bits {b:08x}, block value {v} sats: new 402s quote {} work units", w2.amount(price).unwrap_or(0));
                     if caps.invoice.priced() || caps.total.priced() {
-                        let c = caps.at(b, v, price);
+                        let c = w2.caps();
                         eprintln!("caps: per invoice {:?}, total {:?} work units at this epoch", c.per_invoice, c.total);
-                        if let Err(e) = w2.set_caps(c) {
-                            eprintln!("caps: {e}");
-                        }
                     }
                 }
             }
             std::thread::sleep(Duration::from_secs(pull_secs.clamp(1, 3)));
         }
     });
-    let svc = Arc::new(Service { prov: prov.clone(), work: work.clone(), rpc: node, window_url: arg("--window-url"), admin: flag("--admin") });
+    let admin = flag("--admin").then(|| {
+        let path = data.join("admin.token");
+        let token = admin_token(&path).unwrap_or_else(|e| {
+            eprintln!("xbt-work-provider: {e}");
+            std::process::exit(2);
+        });
+        eprintln!("admin: on; every request needs `Authorization: Bearer <the token in {}>` and a loopback peer", path.display());
+        token
+    });
+    let svc = Arc::new(Service { prov: prov.clone(), work: work.clone(), rpc: node, window_url: arg("--window-url"), admin });
     // audit every pool block `depth` deep on its own (§10.3: RECOMMENDED k = 6), unless told not to;
     // what a passing block's coinbase paid for covers credit, and held credit follows
     let depth = match (num_or_off::<u32>("--audit-depth", "XBT_WORK_AUDIT_DEPTH"), svc.window_url.is_some()) {
@@ -410,29 +407,39 @@ fn main() {
         (None, true) => eprintln!("audit: off (--audit-depth off): only POST /admin/xbt-work/audit audits; credit stops at the total cap until it does"),
         (None, false) => eprintln!("audit: no --window-url: NO AUDIT RUNS; credit stops for good at the total cap"),
     }
-    if let Some(depth) = depth.filter(|_| svc.window_url.is_some()) {
+    if let (Some(depth), Some(wurl)) = (depth, svc.window_url.clone()) {
         let s2 = svc.clone();
-        let mut next = num::<u32>("--audit-from", "XBT_WORK_AUDIT_FROM")
-            .unwrap_or_else(|| block_count(&s2.rpc).unwrap_or(0).saturating_sub(depth + 100).max(1));
+        // where the walk stopped (kept in the state), and at least the last 100 blocks again;
+        // `--audit-from` overrides both
+        let back = block_count(&s2.rpc).unwrap_or(0).saturating_sub(depth.saturating_add(100)).max(1);
+        let start = num::<u32>("--audit-from", "XBT_WORK_AUDIT_FROM").unwrap_or_else(|| s2.work.audit_position().map_or(back, |p| p.min(back)).max(1));
+        eprintln!("audit: starting at height {start}");
+        let mut walk = Walk::new(start);
         std::thread::spawn(move || {
             let t = UreqTransport::default();
+            let src = Source { svc: &s2, t: &t, window_url: &wurl };
             loop {
                 if let Ok(tip) = block_count(&s2.rpc) {
                     match s2.reorgs(tip) {
-                        Ok(Some(low)) => next = next.min(low),
+                        Ok(Some(low)) => walk.rewind(low),
                         Ok(None) => {}
                         Err(e) => eprintln!("audit: reorg check: {e}"),
                     }
                     let to = tip.saturating_sub(depth);
-                    if to >= next {
+                    if to >= walk.next() || !walk.waiting().is_empty() {
                         let _ = s2.work.refresh(&t);
-                        let (verdicts, n) = s2.audit_range(&t, next, to);
-                        for (h, ok) in verdicts {
+                        let pass = walk.pass(&s2.work, &src, to);
+                        for (h, ok) in pass.verdicts {
                             let (u, held) = s2.work.exposure();
                             eprintln!("audit: block {h}: {} (unaudited {u}, held {held} work units, owed carry {} sats)",
                                       if ok { "PASS" } else { "FAIL" }, s2.work.carry().owed());
                         }
-                        next = n;
+                        for (h, why) in pass.unavailable {
+                            eprintln!("audit: height {h}: {why}; no statement for now (it covers nothing), asking again");
+                        }
+                        if let Some((h, why)) = pass.stopped {
+                            eprintln!("audit: height {h}: {why}; retrying");
+                        }
                     }
                 }
                 std::thread::sleep(Duration::from_secs(2));
