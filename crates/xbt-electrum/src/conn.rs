@@ -10,7 +10,7 @@
 //! and the JSON values in it. A line is checked against what the pending requests allow before it
 //! is parsed, complete or not, and a server that sends more is dropped (AGP-081, review E1: a line
 //! used to be parsed whatever its id, and a dense one costs many times its size as a tree).
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::path::Path;
@@ -180,16 +180,30 @@ impl Link {
                 Ok(())
             }
             Link::Tls(s, c) => {
-                c.writer().write_all(line)?;
-                while c.wants_write() {
-                    left(s, deadline)?;
-                    c.write_tls(s)?;
+                // rustls takes plaintext only while its buffer of unsent records has room (64 kB),
+                // so a line is handed over in pieces, each sent before the next (AGP-106: handed
+                // over whole, a line above the buffer was refused before a byte was sent, and no
+                // transaction above about 32 kB could be broadcast over TLS).
+                let mut rest = line;
+                while !rest.is_empty() {
+                    let n = c.writer().write(rest)?;
+                    rest = &rest[n..];
+                    if n == 0 && !c.wants_write() {
+                        return Err(io::ErrorKind::WriteZero.into());
+                    }
+                    while c.wants_write() {
+                        left(s, deadline)?;
+                        c.write_tls(s)?;
+                    }
                 }
                 Ok(())
             }
         }
     }
 }
+
+/// Requests given up at a call's deadline that one connection keeps a slot for.
+pub const MAX_GIVEN_UP: usize = 16;
 
 type Pending = Arc<Mutex<HashMap<u64, (SyncSender<Value>, Cap)>>>;
 
@@ -201,9 +215,30 @@ fn allowance(pending: &Pending) -> Cap {
     Cap { bytes: sum.bytes.min(MAX_LINE), values: sum.values }
 }
 
+/// The rule (AGP-106): **a connection keeps a slot for at most [`MAX_GIVEN_UP`] requests nobody
+/// waits for.** Each slot adds its answer's cap to what the next line may hold ([`allowance`]), and
+/// a server that answers what it is given a whole timeout for, and never the requests of a call's
+/// last moments, kept one more per call without end. `ids` are given up now; past the bound the
+/// oldest is forgotten. Its answer, if it still comes, is held to what the other requests allow: a
+/// small one is dropped unread as before, a large one drops the server like any line nobody asked
+/// for.
+fn give_up(pending: &Pending, given_up: &Mutex<VecDeque<u64>>, ids: impl Iterator<Item = u64>) {
+    let mut p = lock(pending);
+    let mut g = lock(given_up);
+    g.extend(ids);
+    g.retain(|id| p.contains_key(id)); // answered meanwhile: its slot is gone already
+    while g.len() > MAX_GIVEN_UP {
+        if let Some(old) = g.pop_front() {
+            p.remove(&old);
+        }
+    }
+}
+
 struct Live {
     link: Arc<Mutex<Link>>,
     pending: Pending,
+    /// The requests in `pending` whose caller stopped waiting at a deadline, oldest first.
+    given_up: Arc<Mutex<VecDeque<u64>>>,
     /// Cleared by the reader when the server hangs up.
     alive: Arc<AtomicBool>,
     /// Why the reader dropped the server, when it was for what the server sent.
@@ -355,7 +390,7 @@ impl Connection {
                 })
                 .map_err(|e| self.unreachable(e))?;
         }
-        *lock(&self.live) = Some(Live { link, pending, alive, fault });
+        *lock(&self.live) = Some(Live { link, pending, given_up: Arc::new(Mutex::new(VecDeque::new())), alive, fault });
         let hello = (|| -> Result<()> {
             // exchange_until() never reconnects: we hold `connecting`
             let v = self.exchange_until(&[("server.version".to_string(), json!([CLIENT_NAME, PROTOCOL]))], until)?.pop().expect("one")?;
@@ -412,10 +447,10 @@ impl Connection {
         if reqs.is_empty() {
             return Ok(Vec::new());
         }
-        let (link, pending, fault) = {
+        let (link, pending, given_up, fault) = {
             let g = lock(&self.live);
             let l = g.as_ref().ok_or_else(|| self.unreachable("not connected"))?;
-            (l.link.clone(), l.pending.clone(), l.fault.clone())
+            (l.link.clone(), l.pending.clone(), l.given_up.clone(), l.fault.clone())
         };
         // The rule (AGP-097): a server is hung up on only for a request that went a whole timeout
         // unanswered. A request the caller's deadline leaves no time for is not sent, and one the
@@ -448,14 +483,17 @@ impl Connection {
             return Err(self.unreachable(e));
         }
         let mut out = Vec::with_capacity(waits.len());
-        for (id, rx) in waits {
+        let mut waits = waits.into_iter();
+        while let Some((id, rx)) = waits.next() {
             let left = deadline.saturating_duration_since(Instant::now());
             match rx.recv_timeout(left) {
                 Ok(msg) => out.push(answer(&msg)),
                 Err(RecvTimeoutError::Timeout) if deadline < own => {
                     // Cut short by the caller's deadline, not by the timeout. The requests stay
                     // pending, so an answer that still comes is within what the connection allows
-                    // and is dropped unread; they go when the connection does.
+                    // and is dropped unread; they go when the connection does, or when
+                    // MAX_GIVEN_UP newer ones are kept.
+                    give_up(&pending, &given_up, std::iter::once(id).chain(waits.map(|(id, _)| id)));
                     return err(Kind::Deadline, format!("{}: the call's deadline came before the answer to {}", self.url, reqs[out.len()].0));
                 }
                 Err(RecvTimeoutError::Timeout) => {
@@ -633,6 +671,48 @@ mod tests {
         assert_eq!(e(-32601, "Method not found").msg, "Method not found");
         // any other code: the server's own words, untouched
         assert_eq!(e(2, "No such mempool or blockchain transaction").msg, "No such mempool or blockchain transaction");
+    }
+
+    /// AGP-106 (the fourth audit's LIGHT 6): requests given up at a call's deadline keep a slot so
+    /// that a late answer is within what the connection allows. A server that answers what it is
+    /// given a whole timeout for, and never the requests it sees at the end of a call, kept one
+    /// more per call without end, and each adds a history's worth of JSON values to what its next
+    /// line may hold.
+    #[test]
+    fn requests_given_up_at_the_deadline_do_not_add_up_without_bound() {
+        use std::io::{BufRead, BufReader};
+        use std::net::TcpListener;
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut c, _) = l.accept().unwrap();
+            for line in BufReader::new(c.try_clone().unwrap()).lines() {
+                let Ok(line) = line else { break };
+                let req: Value = serde_json::from_str(&line).unwrap();
+                let result = match req["method"].as_str() {
+                    Some("server.version") => json!(["never", "1.4"]),
+                    Some("server.ping") => Value::Null,
+                    _ => continue, // get_history: never answered
+                };
+                let _ = c.write_all(format!("{}\n", json!({"id": req["id"], "result": result})).as_bytes());
+            }
+        });
+        let c = Connection::new(&format!("tcp://{addr}"), Duration::from_secs(2), None, None).unwrap();
+        c.connect().unwrap();
+        let ask = [("blockchain.scripthash.get_history".to_string(), json!(["00".repeat(32)]))];
+        for _ in 0..60 {
+            let cut = c.batch_until(&ask, Some(Instant::now() + Duration::from_millis(5))).unwrap_err();
+            assert_eq!(cut.kind, Kind::Deadline);
+            assert_eq!(c.request("server.ping", json!([])).unwrap(), Value::Null, "the connection answers and stays");
+        }
+        let pending = lock(&c.live).as_ref().unwrap().pending.clone();
+        let one = answer_cap("blockchain.scripthash.get_history", &json!(["00"]));
+        let kept = lock(&pending).len();
+        let allow = allowance(&pending);
+        println!("AGP-106 measure: after 60 calls cut short on one connection: {kept} requests pending, a line may hold {} JSON values", allow.values);
+        assert!(c.connected());
+        assert!(kept <= MAX_GIVEN_UP, "{kept} pending requests nobody waits for");
+        assert!(allow.values <= IDLE.values + MAX_GIVEN_UP * one.values);
     }
 
     #[test]

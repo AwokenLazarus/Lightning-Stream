@@ -19,7 +19,8 @@
 //!   The one place that does not wait for every server is the search for a spend: missing one there
 //!   answers "unspent", which a caller can only act on by broadcasting, and the network refuses it.
 //! * **A call has a deadline** ([`Config::call_deadline`]): every request made for it ends there, it
-//!   forces at most one header sync, and a server is asked only for the transactions it listed
+//!   forces at most one header sync, whose time is not taken from the call's (AGP-106: the sync
+//!   has its own deadline), and a server is asked only for the transactions it listed
 //!   itself, in parallel with the others. The first one it cannot supply, or that cannot belong to
 //!   the script, ends its part and flags it.
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -154,7 +155,8 @@ pub struct Config {
     /// One server's part of a sync round ends here: the headers it proved by then are kept and it is
     /// flagged. None: four times `timeout`.
     pub sync_deadline: Option<Duration>,
-    /// Every request one call makes ends here (the header sync before it has its own deadline).
+    /// Every request one call makes ends here. The header sync before it, and the one sync a call
+    /// may force, have their own deadline and are not counted in it.
     /// None: four times `timeout`.
     pub call_deadline: Option<Duration>,
 }
@@ -397,10 +399,11 @@ type Claims = Vec<(Arc<Connection>, i64)>;
 /// A proof to ask a server for: (txid, the height it claimed, our header there).
 type ProofAsk = (String, u32, header::Header);
 
-/// One call's budget: its requests end at `until`, it forces one header sync at most, and it tries
-/// once to reach a server that is down.
+/// One call's budget: its requests end at `until()`, it forces one header sync at most, and it
+/// tries once to reach a server that is down.
 struct Call {
-    until: Instant,
+    /// Where the call's requests end. Moved only by [`Call::give_back`].
+    until: Mutex<Instant>,
     synced: AtomicBool,
     /// The sync round this call itself ran when it forced one (0: none, or it found another sync
     /// in flight and ran nothing). Only against a tip a server reported in that round, or a later
@@ -413,11 +416,26 @@ struct Call {
 
 impl Call {
     fn new(until: Instant) -> Self {
-        Self { until, synced: AtomicBool::new(false), round: AtomicU64::new(0), gone: Mutex::new(Vec::new()) }
+        Self { until: Mutex::new(until), synced: AtomicBool::new(false), round: AtomicU64::new(0), gone: Mutex::new(Vec::new()) }
+    }
+
+    fn until(&self) -> Instant {
+        *lock(&self.until)
     }
 
     fn over(&self) -> bool {
-        Instant::now() >= self.until
+        Instant::now() >= self.until()
+    }
+
+    /// The rule (AGP-106): **the header sync a call forces is not paid for out of the call's
+    /// time.** The sync has its own deadline (`sync_deadline`, per server), as long as the call's
+    /// at the defaults, so a server that held its part of the sync to that deadline ended the call
+    /// with it: the claims of the honest servers were then "not judged" and a lookup of a confirmed
+    /// coin failed on every call. A call forces one sync at most ([`Call::synced`]), so this moves
+    /// the deadline once, by no more than one sync round takes.
+    fn give_back(&self, spent: Duration) {
+        let mut u = lock(&self.until);
+        *u += spent;
     }
 }
 
@@ -619,7 +637,7 @@ impl ElectrumBackend {
     /// the call's deadline); an error below `min_servers`. `min_servers` is the floor for what is
     /// proven. "Not there" needs more: every configured server ([`Self::all_answer`]).
     fn live(&self, call: &Call) -> Result<Vec<Arc<Connection>>> {
-        let until = Some(call.until);
+        let until = Some(call.until());
         // a call whose time is over reaches for nobody: a server that is down would only be
         // flagged for a connect it was given no time for
         let down: Vec<Arc<Connection>> = if call.over() {
@@ -969,7 +987,7 @@ impl ElectrumBackend {
         let (send, answers) = sync_channel::<(Arc<Connection>, Result<Value>)>(live.len());
         let mut silent: Vec<String> = Vec::new();
         for c in &live {
-            let (conn, send, id, until) = (c.clone(), send.clone(), txid.clone(), call.until);
+            let (conn, send, id, until) = (c.clone(), send.clone(), txid.clone(), call.until());
             let asked = std::thread::Builder::new().name("electrum:get".into()).spawn(move || {
                 let a = conn.batch_until(&[("blockchain.transaction.get".to_string(), json!([id]))], Some(until))
                     .and_then(|mut r| r.pop().expect("one answer per request"));
@@ -1087,7 +1105,7 @@ impl ElectrumBackend {
             }
             asked = true;
             let reqs: Vec<(String, Value)> = want.iter().map(|t| ("blockchain.transaction.get".to_string(), json!([t]))).collect();
-            let answers = match c.batch_until(&reqs, Some(call.until)) {
+            let answers = match c.batch_until(&reqs, Some(call.until())) {
                 Ok(a) => a,
                 Err(e) if e.kind == Kind::Deadline => return late(want.len() + rest.len()),
                 Err(e) => {
@@ -1097,7 +1115,19 @@ impl ElectrumBackend {
             };
             let mut i = self.st();
             for (t, a) in want.into_iter().zip(answers) {
-                let Some(tx) = a.ok().and_then(|raw| Self::verify_raw(t, &raw)) else {
+                // The rule (AGP-092, kept here since AGP-106): only "I have no such transaction",
+                // in the server's words, is an answer. Busy, rate-limited or a wording not known
+                // here is no answer: the server went silent for what it listed, and a scan that
+                // needs it fails instead of leaving the coin out.
+                let raw = match a {
+                    Ok(raw) => Some(raw),
+                    Err(e) if says_not_there(&e) => None,
+                    Err(e) => {
+                        i.flag(&c.url, format!("transaction.get: {e}"));
+                        return Supplied::Silent;
+                    }
+                };
+                let Some(tx) = raw.and_then(|raw| Self::verify_raw(t, &raw)) else {
                     i.flag(&c.url, format!("lists a transaction it does not supply ({}..): the rest of its list is not asked for", &t[..16.min(t.len())]));
                     return Supplied::Lied;
                 };
@@ -1119,7 +1149,7 @@ impl ElectrumBackend {
         let sh = scripthash(spk);
         let live = self.live(call)?;
         let answers = Self::each(&live, |c| {
-            c.batch_until(&[("blockchain.scripthash.get_history".to_string(), json!([sh]))], Some(call.until))
+            c.batch_until(&[("blockchain.scripthash.get_history".to_string(), json!([sh]))], Some(call.until()))
                 .and_then(|mut r| r.pop().expect("one answer per request"))
         });
         let mut out: HashMap<String, Claims> = HashMap::new();
@@ -1256,7 +1286,7 @@ impl ElectrumBackend {
                     return;
                 }
                 let reqs: Vec<(String, Value)> = want.iter().map(|(t, h, _)| ("blockchain.transaction.get_merkle".to_string(), json!([t, h]))).collect();
-                let Ok(answers) = c.batch_until(&reqs, Some(call.until)) else { return };
+                let Ok(answers) = c.batch_until(&reqs, Some(call.until())) else { return };
                 let mut i = self.st();
                 for ((t, h, hdr), a) in want.into_iter().zip(answers) {
                     let held = hex32(t).ok().zip(a.ok()).is_some_and(|(id, m)| Self::proves(&id, hdr, *h, &m).is_ok());
@@ -1290,7 +1320,10 @@ impl ElectrumBackend {
             };
             let mut hdr = self.st().headers.at(height).cloned();
             if hdr.is_none() && !call.synced.swap(true, Ordering::SeqCst) {
-                let ran = self.sync_round(true)?;
+                let began = Instant::now();
+                let ran = self.sync_round(true);
+                call.give_back(began.elapsed());
+                let ran = ran?;
                 self.believable()?;
                 call.round.store(ran.unwrap_or(0), Ordering::SeqCst);
                 hdr = self.st().headers.at(height).cloned();
@@ -1322,7 +1355,7 @@ impl ElectrumBackend {
                 checked = false;
                 continue;
             }
-            let asked = c.batch_until(&[("blockchain.transaction.get_merkle".to_string(), json!([txid, height]))], Some(call.until))
+            let asked = c.batch_until(&[("blockchain.transaction.get_merkle".to_string(), json!([txid, height]))], Some(call.until()))
                 .and_then(|mut r| r.pop().expect("one answer per request"));
             let m = match asked {
                 Ok(m) => m,
@@ -1545,7 +1578,7 @@ impl ElectrumBackend {
         let sh = scripthash(spk);
         let live = self.live(&call)?;
         let answers = Self::each(&live, |c| {
-            c.batch_until(&[("blockchain.scripthash.listunspent".to_string(), json!([sh]))], Some(call.until))
+            c.batch_until(&[("blockchain.scripthash.listunspent".to_string(), json!([sh]))], Some(call.until()))
                 .and_then(|mut r| r.pop().expect("one answer per request"))
         });
         let mut claims: HashMap<(String, u32), Claims> = HashMap::new();
@@ -1690,7 +1723,7 @@ impl ElectrumBackend {
         if !new.is_empty() {
             let reqs: Vec<(String, Value)> = new.iter().map(|sh| ("blockchain.scripthash.subscribe".to_string(), json!([sh]))).collect();
             let call = self.budget();
-            let until = Some(call.until);
+            let until = Some(call.until());
             let live = self.live(&call)?;
             let answers = Self::each(&live, |c| c.subscribe_many(&reqs, until));
             let mut i = self.st();

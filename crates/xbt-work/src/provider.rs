@@ -760,8 +760,25 @@ impl WorkProvider {
     }
 
     /// Offer a receipt to the book (from the relay, the Prime, or a payer): the newly credited work.
+    ///
+    /// AGP-106 (fourth closure audit, WORK 1, 2, 5). The relay pull offers the latest receipt of
+    /// every invoice here in every round, so this keeps the rules a call keeps:
+    ///
+    /// * **A distrusted Prime's receipt makes no record and no credit, on any path.** It is
+    ///   refused with the distrust before the book sees it, as a call refuses it.
+    /// * **An equivocation distrusts the Prime wherever it is found.** Before, only a call set it.
+    /// * **The state is written when it changed, and only then.** Before, every offer wrote the
+    ///   whole state, also a receipt already held: once per invoice per pull round, for nothing.
+    ///   What an offer can change: the book takes a receipt it did not hold, credits work, keeps
+    ///   a fraud proof; the invoice gets its record; the Prime is distrusted. A refusal that is
+    ///   no equivocation (`bad_sig`, another identity, Prime or invoice) is made before the book
+    ///   keeps anything, and a receipt the book holds that credits nothing leaves it as it was
+    ///   (`agp106_work::a_receipt_the_book_holds_and_credits_nothing_for_leaves_the_book_unchanged`).
     pub fn accept(&self, s: &Signed) -> Result<u64> {
         let mut st = self.lock();
+        if let Some((code, why)) = &st.distrust {
+            return Err(WorkError::new(code, why.clone()));
+        }
         let invoice = s.receipt.invoice.clone();
         let issued = match st.invoices.contains_key(&invoice) {
             true => None,
@@ -775,11 +792,25 @@ impl WorkProvider {
             // no work yet: nothing to credit and nothing to keep
             return if s.verify(&self.pubkey) { Ok(0) } else { fail("bad_sig", "not signed by the pinned Prime key") };
         }
+        let held = st.book.holds(s);
         let r = st.book.accept(s, &invoice);
+        let mut changed = match &r {
+            Ok(credited) => *credited > 0 || !held,
+            Err(e) => e.code == "equivocation",
+        };
+        if let Err(e) = &r {
+            if e.code == "equivocation" {
+                st.distrust = Some(("equivocation".into(), e.msg.clone()));
+            }
+        }
         if let (Some(issued), Ok(_)) = (issued, &r) {
             // the Prime signed work for it: from here on the invoice has a record
             st.new.retain(|(k, _)| *k != invoice);
             st.invoices.insert(invoice, issued.record());
+            changed = true;
+        }
+        if !changed {
+            return r;
         }
         let snap = self.snapshot(&st);
         drop(st);
