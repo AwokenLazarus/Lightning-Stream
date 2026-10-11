@@ -8,9 +8,9 @@ umbrelOS, simulated on plain Docker (no Umbrel dev environment runs rootless her
   * every app is on one shared network (umbrel_main_network), the environment has ${APP_DATA_DIR},
     ${APP_SEED}, ${APP_PASSWORD} and ${DEVICE_DOMAIN_NAME}, and each installed app's exports.sh is sourced
     with a derive_entropy() like umbrelOS's;
-  * app_proxy is this driver's reverse proxy on 127.0.0.1:34080 (X-Forwarded-*), not a container;
+  * app_proxy is this driver's reverse proxy on 127.0.0.1:24080 (X-Forwarded-*), not a container;
   * a test overlay (regtest/*.yml) puts the node on the AGP-017 regtest chain (and its exported chain is
-    "regtest"), and publishes the test ports on loopback (34000-34099). Nothing else in the apps changes.
+    "regtest"), and publishes the test ports on loopback (24000-24099). Nothing else in the apps changes.
 
 Checks (results.json): I install and layout, S hardening, U the UI (no terminal: password, key, policy, token),
 P an agent's xbt402 payment, R restart persistence, H the hub app, G /readyz gating, X uninstall.
@@ -37,11 +37,11 @@ PID = os.getpid()
 NET = f"agp040-umbrel-{PID}"
 APPS_DIR = os.path.join(OUT, "app-data")
 SEED = os.urandom(32).hex()
-P_MCP = int(os.environ.get("UMBREL_TEST_MCP_PORT", "34010"))
-P_HUB = int(os.environ.get("UMBREL_TEST_HUB_PORT", "34020"))
-P_UI = int(os.environ.get("UMBREL_TEST_UI_PORT", "34030"))
-P_PROXY = int(os.environ.get("UMBREL_TEST_PROXY_PORT", "34080"))
-P_PROV = int(os.environ.get("UMBREL_TEST_PROV_PORT", "34040"))
+P_MCP = int(os.environ.get("UMBREL_TEST_MCP_PORT", "24010"))
+P_HUB = int(os.environ.get("UMBREL_TEST_HUB_PORT", "24020"))
+P_UI = int(os.environ.get("UMBREL_TEST_UI_PORT", "24030"))
+P_PROXY = int(os.environ.get("UMBREL_TEST_PROXY_PORT", "24080"))
+P_PROV = int(os.environ.get("UMBREL_TEST_PROV_PORT", "24040"))
 HUB_ONION = os.environ.get("UMBREL_TEST_HUB_ONION", "http://agp042-hub.onion")
 SIGN_BIN = os.path.join(ROOT, "dist/oci/ctx/bin/amd64/xbt-wallet-ui")
 KNOTS, WALLET, HUB = "lazarus-xbt-knots", "lazarus-xbt-agent-wallet", "lazarus-xbt402-hub"

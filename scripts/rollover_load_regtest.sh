@@ -12,9 +12,9 @@
 # AGP-057 adds cmp's prices (16,515-sat locks on a 1M ch2: the zero-conf cap of a rollover child, with the
 # refusals classified) and exhaustion under load (the ch2 line runs out several times: make-before-break
 # refill, zero refusals; and the refill-after-close baseline).
-# Ports 34900-34999 (AGP-053) by default: inside the kernel's default ephemeral range, and usable here because
-# this host reserves 30000-34999 (/proc/sys/net/ipv4/ip_local_reserved_ports); on a host that does not, set
-# XBT_RS_LOAD_PORT_BASE below 32768. The Rust binaries are built from this tree into CARGO_TARGET_DIR
+# Ports 24900-24999 (AGP-053) by default, below the kernel's ephemeral range (32768-60999 by default: a port
+# in it can be taken by any outgoing connection between a check and a bind); keep XBT_RS_LOAD_PORT_BASE below
+# it too. The Rust binaries are built from this tree into CARGO_TARGET_DIR
 # (default ./target) and run from there; B1 is XBT402_B1 (default ~/xbt-rnd/b1). The run prints both trees. Node and processes wiped on exit. Soak rules: CPUQuota 200%, 4G, nice 19.
 # Env: XBT402_B1, LOAD_ONLY, LOAD_SECONDS, LOAD_RATE, LOAD_BLOCK_S, LOAD_STUCK_S, LOAD_REORG_S, LOAD_REPORT.
 # XBT_RS_LOAD_PORT_BASE / XBT_RS_LOAD_PORT_SPAN (default 100): with a span under 100 the selected runs
@@ -26,7 +26,7 @@ ROOT=$PWD
 # AGP-105: the default B1 was ~/xbt-rnd/b1-agp-057, a worktree from before wave 4: run without XBT402_B1 the
 # script tested an old Python hub
 B1=${XBT402_B1:-$HOME/xbt-rnd/b1}
-PB=${XBT_RS_LOAD_PORT_BASE:-34900}
+PB=${XBT_RS_LOAD_PORT_BASE:-24900}
 SPAN=${XBT_RS_LOAD_PORT_SPAN:-100}
 R=${XBT_RS_RUN:-$ROOT/run}/load-$$
 export XBT402_B1=$B1
@@ -49,7 +49,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
 
-python3 "$HOME/xbt-rnd/xbt-063/tools/portcheck.py" wait $(seq $((PB + 1)) $((PB + 2))) $(seq $((PB + (SPAN < 100 ? 4 : 10))) $((PB + SPAN - 1)))
+python3 "$ROOT/scripts/portcheck.py" wait $(seq $((PB + 1)) $((PB + 2))) $(seq $((PB + (SPAN < 100 ? 4 : 10))) $((PB + SPAN - 1)))
 "${SOAK[@]}" cargo build -q -j2 --release -p xbt402-interop --bins
 "${SOAK[@]}" cargo build -q -j2 --release -p xbt402 --all-features --bin xbt402-hub
 "$B1/scripts/node.sh" wipe >/dev/null 2>&1 || true

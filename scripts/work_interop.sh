@@ -15,7 +15,7 @@
 # from 101), primed built from ~/Bitcoin.worktrees/rnd-agp-011 (no source change), the stock C
 # datum_gateway and stratum-grind from xbt-063/build (2 cores, under timeout: no miner outlives the run),
 # the XBT-053 agp-011 relay (a dumb blob store; the Rust side is the relay client, as the spec's payer and
-# provider are). Miner on cores WORK_CPUS (default 14,15). Ports WORK_PORT_BASE..+99 (default 34100), datadirs under run/work-<base>/. Evidence:
+# provider are). Miner on cores WORK_CPUS (default 14,15). Ports WORK_PORT_BASE..+99 (default 24100), datadirs under run/work-<base>/. Evidence:
 # the payer's JSON in docs/ (WORK_EVIDENCE), logs in run/work-<base>/.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -26,7 +26,7 @@ PRIMED=${PRIMED:-$HOME/Bitcoin.worktrees/rnd-agp-011/prime/target/release/primed
 PAYER=${PAYER:-rust}
 PROVIDER=${PROVIDER:-rust}
 RELAY_IMPL=${RELAY:-rust}
-export FLAGSHIP_PORT_BASE=${WORK_PORT_BASE:-34100}
+export FLAGSHIP_PORT_BASE=${WORK_PORT_BASE:-24100}
 BASE=$FLAGSHIP_PORT_BASE
 export XBT063_RUN=${WORK_RUN:-$ROOT/run/work-$BASE}
 RUN=$XBT063_RUN
@@ -68,7 +68,7 @@ echo "== build the Rust tools (release, -j2)"
 nice -n 10 cargo build -q -j2 --release -p xbt-work --features tools --bins -p xbt-work-relay
 cleanup
 rm -rf "${RUN:?}"; mkdir -p "$RUN/prime"
-python3 "$X063/tools/portcheck.py" wait --timeout 75 "${PORTS[@]}" || { echo "work_interop: ports busy" >&2; exit 1; }
+python3 "$ROOT/scripts/portcheck.py" wait --timeout 75 "${PORTS[@]}" || { echo "work_interop: ports busy" >&2; exit 1; }
 
 echo "== node (short chain: 110 blocks), ports ${BASE}+ ; payer=$PAYER provider=$PROVIDER"
 echo "   xbt-rs $ROOT @ $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null), binaries $T"
@@ -157,7 +157,7 @@ for attempt in 1 2 3; do
   done
   [ -n "$ready" ] && break
   kill -0 "$GW_PID" 2>/dev/null && { echo "work_interop: gateway up but not ready (primed: $(stat_line))" >&2; exit 1; }
-  python3 "$X063/tools/portcheck.py" wait --timeout 75 "$STRATUM" "$GWAPI" || exit 1
+  python3 "$ROOT/scripts/portcheck.py" wait --timeout 75 "$STRATUM" "$GWAPI" || exit 1
 done
 [ -n "$ready" ] || { echo "work_interop: gateway failed to start 3 times" >&2; exit 1; }
 

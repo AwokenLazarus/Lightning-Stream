@@ -6,14 +6,14 @@
 #   * a blob sealed by the Python reference client (XBT-053 receipts.py) is served back byte for byte with
 #     Cache-Control: no-store, opens, and GET / lists nothing;
 #   * the image's own healthcheck (liveness and --ready) passes; blobs survive a container restart.
-# Needs dist/oci/ctx from `scripts/oci_build.sh --only xbt-work-relay`. Ports 34340-34341. Prints RESULT PASS|FAIL.
+# Needs dist/oci/ctx from `scripts/oci_build.sh --only xbt-work-relay`. Ports 24340-24341. Prints RESULT PASS|FAIL.
 set -euo pipefail
 lazvault hold check --project xbt-agentpay || exit 75   # IMP-030: heavy entry point, refuses during a host hold
 cd "$(dirname "$0")/.."
 ROOT=$PWD
 X053=${XBT053:-$HOME/xbt-rnd/XBT-053}
 CTX=$ROOT/dist/oci/ctx
-PUB=${RELAY_TEST_PORT:-34340}; PUSH=$((PUB + 1))
+PUB=${RELAY_TEST_PORT:-24340}; PUSH=$((PUB + 1))
 TAG=xbt-work-relay:agp043
 NAME=agp043-relay-$$
 VOL=agp043-relay-vol-$$
@@ -25,7 +25,7 @@ cleanup() { docker rm -f "$NAME" "$NAME-open" >/dev/null 2>&1 || true; docker vo
 trap cleanup EXIT
 
 [ -f "$CTX/Dockerfile" ] && [ -x "$CTX/bin/amd64/xbt-work-relay" ] || { echo "run scripts/oci_build.sh --only xbt-work-relay first" >&2; exit 1; }
-python3 "$HOME/xbt-rnd/xbt-063/tools/portcheck.py" wait --timeout 30 "$PUB" "$PUSH"
+python3 "$ROOT/scripts/portcheck.py" wait --timeout 30 "$PUB" "$PUSH"
 docker buildx build -q --platform linux/amd64 --target xbt-work-relay -t "$TAG" --load "$CTX" >/dev/null
 echo "== $TAG ($(docker image inspect "$TAG" --format '{{.Id}}' | cut -c1-19), user $(docker image inspect "$TAG" --format '{{.Config.User}}'))"
 docker volume create "$VOL" >/dev/null

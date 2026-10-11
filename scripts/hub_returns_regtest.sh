@@ -40,7 +40,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
 
-python3 "$HOME/xbt-rnd/xbt-063/tools/portcheck.py" wait $(seq $((PB + 1)) $((PB + 4))) $(seq $((PB + 10)) $((PB + 39)))
+python3 "$ROOT/scripts/portcheck.py" wait $(seq $((PB + 1)) $((PB + 4))) $(seq $((PB + 10)) $((PB + 39)))
 "${SOAK[@]}" cargo build -q -j2 --release -p xbt402-interop --bins
 "${SOAK[@]}" cargo build -q -j2 --release -p xbt402 --all-features --bin xbt402-hub
 "$B1/scripts/node.sh" wipe >/dev/null 2>&1 || true

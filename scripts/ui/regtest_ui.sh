@@ -7,7 +7,7 @@
 #   covered by tests/browser.rs) and submits it in the UI; the MCP call returns paid; the channel is
 #   closed and the close is confirmed on chain; the UI shows the channel, its close report and an
 #   intact, anchored signature log.
-# Ports 33800-33899 (AGP-039): node RPC 33801, P2P 33802, provider 33810, MCP 33820, UI 33830.
+# Ports 23800-23899 (AGP-039): node RPC 23801, P2P 23802, provider 23810, MCP 23820, UI 23830.
 # Soak rules: CPUQuota 200%, MemoryMax 4G, nice 19, cargo -j2. Starts no miners (blocks from
 # generatetoaddress / the signer's regtest-only mining). Evidence: run/ui-regtest/<stamp>/.
 set -euo pipefail
@@ -23,8 +23,8 @@ STAMP=$(date +%Y%m%d-%H%M%S)
 R=$ROOT/run/ui-regtest/$STAMP
 mkdir -p "$R"
 export XBT_BIN=${XBT_BIN:-$HOME/lazarus-regtest/b1-xbt402/knots-29.4.2}
-export XBT402_DATADIR=$R/node XBT402_RPCPORT=33801 XBT402_P2PPORT=33802 XBT402_MATURITY_PAD=6800
-P_PROV=33810 P_MCP=33820 P_UI=33830
+export XBT402_DATADIR=$R/node XBT402_RPCPORT=23801 XBT402_P2PPORT=23802 XBT402_MATURITY_PAD=6800
+P_PROV=23810 P_MCP=23820 P_UI=23830
 PIDS=()
 cleanup() {
   for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
@@ -35,7 +35,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
 
-python3 "$HOME/xbt-rnd/xbt-063/tools/portcheck.py" wait --timeout 60 33801 33802 $P_PROV $P_MCP $P_UI
+python3 "$ROOT/scripts/portcheck.py" wait --timeout 60 23801 23802 $P_PROV $P_MCP $P_UI
 echo "== build (release, -j2)"
 cargo build -q -j2 --release -p xbt-signer -p xbt-wallet-mcp -p xbt-wallet-ui -p xbt402-interop --bins
 BIN=$ROOT/target/release

@@ -4,7 +4,7 @@ Python MCP SDK (`mcp` 2.2.0, the SDK B2 itself runs on): the same ClientSession 
 server over streamable HTTP and to B2's server over stdio, in front of the same mock signer, and every
 answer (tools/list and a set of tool calls, including errors) must be equal.
 
-usage: http_sdk_check.py --py PYTHON_WITH_MCP --b2 B2_TREE --rust XBT_WALLET_MCP [--port 33594]
+usage: http_sdk_check.py --py PYTHON_WITH_MCP --b2 B2_TREE --rust XBT_WALLET_MCP [--port 23594]
 (re-executes itself under PYTHON_WITH_MCP)"""
 import argparse
 import asyncio
@@ -42,7 +42,7 @@ def main():
     ap.add_argument("--py", required=True)
     ap.add_argument("--b2", required=True)
     ap.add_argument("--rust", required=True)
-    ap.add_argument("--port", type=int, default=33594)
+    ap.add_argument("--port", type=int, default=23594)
     ap.add_argument("--inner", action="store_true")
     a = ap.parse_args()
     if not a.inner:

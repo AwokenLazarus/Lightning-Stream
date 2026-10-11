@@ -11,15 +11,15 @@
 #   2. the all-Rust AGP-021 demo (xbt402-route-demo): 4 providers (two provider processes under one payTo), rollover,
 #      a provider that never reveals, a hub that withholds receipts then everything; cmp-lead's
 #      constraints 1-7 and exact amounts on chain.
-# Ports 33100-33299 (AGP-026/034/044): node 33101/33102, matrix 33110-33182, demo 33190-33194, signer runs
-# 33200-33232 (RSS j = 0, 1; RSSR j = 2, 3; sequential, before signer_interop.sh's 33200-33299 in the verify). Starts NO
+# Ports 23100-23299 (AGP-026/034/044): node 23101/23102, matrix 23110-23182, demo 23190-23194, signer runs
+# 23200-23232 (RSS j = 0, 1; RSSR j = 2, 3; sequential, before signer_interop.sh's 23200-23299 in the verify). Starts NO
 # miners (blocks come from generatetoaddress). The node and every process are stopped and wiped on
 # exit. Soak rules: CPUQuota 200%, 4G, nice 19.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
 B1=${XBT402_B1:-$HOME/xbt-rnd/b1}
-PB=${XBT_RS_ROUTE_PORT_BASE:-33100}
+PB=${XBT_RS_ROUTE_PORT_BASE:-23100}
 # the RSS and RSSR runs sit at PB+RSS+10*j (j = 0..3); ROUTE_RSS_OFFSET=3 keeps every port below PB+100
 RSS=${ROUTE_RSS_OFFSET:-100}
 R=${XBT_RS_RUN:-$ROOT/run}/route-$$
@@ -44,7 +44,7 @@ trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
 
 ports=$(seq $((PB + 1)) $((PB + 2)); seq $((PB + 10)) $((PB + 94)); for j in 0 1 2 3; do seq $((PB + RSS + 10 * j)) $((PB + RSS + 10 * j + 2)); done)
-python3 "$HOME/xbt-rnd/xbt-063/tools/portcheck.py" wait $ports
+python3 "$ROOT/scripts/portcheck.py" wait $ports
 "${SOAK[@]}" cargo build -q -j2 --release -p xbt402-interop --bins
 "${SOAK[@]}" cargo build -q -j2 --release -p xbt402 --all-features --bin xbt402-hub
 "${SOAK[@]}" cargo build -q -j2 --release -p xbt-signer --bin xbt-signer

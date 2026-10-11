@@ -9,7 +9,7 @@
 #   E1  pay     -> Python provider (v1.1 payer-pays)  10 calls, close, the close change counted late
 #   E2  pay     -> Python provider (v1.2 payee-pays)  10 calls, close, the close change counted late
 #   E3  refund  -> Python provider                    3 calls, the provider vanishes, refund at expiry
-# Ports 33300-33399 (AGP-028). Starts NO miners (blocks from generatetoaddress). Never contacts
+# Ports 23300-23399 (AGP-028). Starts NO miners (blocks from generatetoaddress). Never contacts
 # production Electrum servers: every server here is 127.0.0.1. Everything is stopped and wiped on
 # exit. Soak rules: CPUQuota 200%, 4G, nice 19.
 set -euo pipefail
@@ -17,7 +17,7 @@ cd "$(dirname "$0")/.."
 ROOT=$PWD
 B1=${XBT402_B1:-$HOME/xbt-rnd/b1}
 R=${XBT_RS_RUN:-$ROOT/run}/electrum
-PB=${XBT_ELECTRUM_PORT_BASE:-33300}
+PB=${XBT_ELECTRUM_PORT_BASE:-23300}
 ELECTRS_DIR=${XBT_ELECTRS_DIR:-$HOME/xbt-rnd/electrs-agp-024}
 ELECTRS=${XBT_ELECTRS:-$ELECTRS_DIR/src/target/release/electrs}
 export XBT402_B1=$B1
@@ -55,7 +55,7 @@ if [ ! -x "$ELECTRS" ]; then
 fi
 echo "electrs: $("$ELECTRS" --version 2>&1 | head -1) ($ELECTRS)"
 
-python3 "$HOME/xbt-rnd/xbt-063/tools/portcheck.py" wait "$XBT402_RPCPORT" "$XBT402_P2PPORT" "$E1" "$M1" "$E2" "$M2" "$TLS" "$P_PAYER" "$P_PAYEE" "$P_REFUND"
+python3 "$ROOT/scripts/portcheck.py" wait "$XBT402_RPCPORT" "$XBT402_P2PPORT" "$E1" "$M1" "$E2" "$M2" "$TLS" "$P_PAYER" "$P_PAYEE" "$P_REFUND"
 "${SOAK[@]}" cargo build -q -j2 --release -p xbt-electrum --features interop --bins
 BIN=./target/release/xbt-electrum-interop
 "$B1/scripts/node.sh" wipe >/dev/null 2>&1 || true

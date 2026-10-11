@@ -10,7 +10,7 @@
 # datum_gateway (xbt-063-agp-011 run/cgw), XBT-053 nta.py/receipts.py (keys, and the Python relay client as a
 # cross-check). The Rust side: xbt-work-provider, xbt-work-payer, xbt-work-relay from this tree.
 #
-# Ports WORK_NTA_BASE..+49 (default 34300; it uses +1..+25), preflighted; the leftover-miner sweep covers only these. Datadirs under run/work-nta-<base>/. Every exit, pass or
+# Ports WORK_NTA_BASE..+49 (default 24300; it uses +1..+25), preflighted; the leftover-miner sweep covers only these. Datadirs under run/work-nta-<base>/. Every exit, pass or
 # fail, copies every log into docs/work-nta-agp043-<stamp>/ (WORK_NTA_OUT to override). The whole run is one
 # systemd-run --user scope (CPUQuota=200%, MemoryMax=4G, nice 19); cargo -j2; the miner 2 threads under `timeout`.
 set -euo pipefail
@@ -20,7 +20,7 @@ if [ -z "${WORK_NTA_SCOPED:-}" ]; then
   exec env WORK_NTA_SCOPED=1 systemd-run --user --scope -q -p CPUQuota=200% -p MemoryMax=4G \
     nice -n 19 bash "$ROOT/scripts/$(basename "$0")" "$@"
 fi
-BASE=${WORK_NTA_BASE:-34300}
+BASE=${WORK_NTA_BASE:-24300}
 END=$((BASE + 49))   # its own ports only (BASE..+25): a run beside it at +50 keeps its miner
 RUN=$ROOT/run/work-nta-$BASE
 STAMP=$(date +%Y%m%d-%H%M%S)
@@ -30,7 +30,7 @@ PRIME_T=${PRIME_TARGET:-$HOME/xbt-rnd/XBT-053/run/prime-target}
 KNOTS=${KNOTS:-$HOME/xbt-rnd/xbt-071/knots}
 CGW=${CGW:-$HOME/xbt-rnd/xbt-063-agp-011/run/cgw/datum_gateway}
 X053=${XBT053:-$HOME/xbt-rnd/XBT-053}
-PORTCHECK=${PORTCHECK:-$HOME/xbt-rnd/xbt-063/tools/portcheck.py}
+PORTCHECK=${PORTCHECK:-$ROOT/scripts/portcheck.py}
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$HOME/xbt-rnd/xbt-rs-target}
 T=$CARGO_TARGET_DIR/release
 DRIVER_PID=""; EVIDENCE=""

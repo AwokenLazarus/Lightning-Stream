@@ -5,13 +5,13 @@
 #   2. the Python hub (B1 agp-044, scripts/interop/py_refund_bump.py) against the same Rust provider:
 #      the same two runs, the same checks.
 # A refund is kept out of blocks with `generateblock ADDR []` (blocks that leave it out, as a fee market does).
-# Ports 34440-34449 (AGP-044 has 34400-34499). Starts NO miners. Node and processes wiped on exit.
+# Ports 24440-24449 (AGP-044 has 24400-24499). Starts NO miners. Node and processes wiped on exit.
 # Soak rules: CPUQuota 200%, 4G, nice 19.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
 B1=${XBT402_B1:-$HOME/xbt-rnd/b1}
-PB=${XBT_RS_BUMP_PORT_BASE:-34440}
+PB=${XBT_RS_BUMP_PORT_BASE:-24440}
 R=${XBT_RS_RUN:-$ROOT/run}/bump-$$
 BIN=${CARGO_TARGET_DIR:-$ROOT/target}/release
 export XBT402_B1=$B1
@@ -35,7 +35,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
 
-python3 "$HOME/xbt-rnd/xbt-063/tools/portcheck.py" wait $((PB + 1)) $((PB + 2)) $((PB + 3)) $((PB + 4))
+python3 "$ROOT/scripts/portcheck.py" wait $((PB + 1)) $((PB + 2)) $((PB + 3)) $((PB + 4))
 "${SOAK[@]}" cargo build -q -j2 --release -p xbt402-interop --bin xbt402-refund-bump
 "$B1/scripts/node.sh" wipe >/dev/null 2>&1 || true
 "$B1/scripts/node.sh" up

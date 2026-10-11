@@ -6,7 +6,7 @@
 #   3. clippy: no warning in the new crate
 #   4. the JS crypto vectors (node)
 #   5. static musl builds of xbt-wallet-ui for x86_64, aarch64, armv7 (sizes)
-#   6. regtest end to end (scripts/ui/regtest_ui.sh, ports 33800-33899)
+#   6. regtest end to end (scripts/ui/regtest_ui.sh, ports 23800-23899)
 set -euo pipefail
 if [ -z "${VERIFY_SCOPED:-}" ] && command -v systemd-run >/dev/null; then
   export VERIFY_SCOPED=1

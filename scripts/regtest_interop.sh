@@ -9,14 +9,14 @@
 #   B2  Python payer -> Rust provider    10 calls, close                                   (v1.2 payee-pays)
 #   C1  Rust payer   -> Rust provider    10 calls, close                                   (v1.1, same node)
 # Every close is mined and its outputs checked exactly (payee, payer change, fee).
-# Ports 33030-33049 (AGP-025 has 33000-33099). Starts NO miners (blocks come from generatetoaddress).
+# Ports 23030-23049 (AGP-025 has 23000-23099). Starts NO miners (blocks come from generatetoaddress).
 # The node and the providers are stopped and wiped on exit. Soak rules: CPUQuota 200%, 4G, nice 19.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
 B1=${XBT402_B1:-$HOME/xbt-rnd/b1}
 R=${XBT_RS_RUN:-$ROOT/run}
-PB=${XBT_RS_PORT_BASE:-33000}
+PB=${XBT_RS_PORT_BASE:-23000}
 export XBT402_B1=$B1
 export XBT_BIN=${XBT_BIN:-$HOME/lazarus-regtest/b1-xbt402/knots-29.4.2}
 export XBT402_DATADIR=$R/interop-node
@@ -40,7 +40,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
 
-python3 "$HOME/xbt-rnd/xbt-063/tools/portcheck.py" wait "$XBT402_RPCPORT" "$XBT402_P2PPORT" "$P_PY" "$P_PY_PAYEE" "$P_RS" "$P_RS_PAYEE"
+python3 "$ROOT/scripts/portcheck.py" wait "$XBT402_RPCPORT" "$XBT402_P2PPORT" "$P_PY" "$P_PY_PAYEE" "$P_RS" "$P_RS_PAYEE"
 "${SOAK[@]}" cargo build -q -j2 --release -p xbt402-interop --bins
 "$B1/scripts/node.sh" wipe >/dev/null 2>&1 || true
 "$B1/scripts/node.sh" up

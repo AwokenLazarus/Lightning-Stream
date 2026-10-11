@@ -3,7 +3,7 @@
 #   scripts/mcp/verify_agp030.sh            (add CLAUDE=0 to skip the two real-Claude flagships, ~$0.25 each)
 # Needs: ~/xbt-rnd/xbt-063 (xbt-063 master, the AGP-030 flagship on the merged B1/B2
 # pins) with its .venv (mcp 2.2.0), ~/xbt-rnd/b2 at master, hermes on PATH, claude on PATH. Ports
-# 33500-33599. Soak rules: CPUQuota 200%, 4G, nice 19, -j2. The two REAL CLAUDE steps need Claude
+# 23500-23599. Soak rules: CPUQuota 200%, 4G, nice 19, -j2. The two REAL CLAUDE steps need Claude
 # credit; CLAUDE=0 skips them.
 set -uo pipefail
 cd "$(dirname "$0")/../.."
@@ -24,7 +24,7 @@ step() {   # label, command...
 }
 flagship() {   # label, env...
   local label=$1; shift
-  (cd "$X63" && env FLAGSHIP_PORT_BASE=33500 "$@" XBT_WALLET_MCP="$ROOT/target/release/xbt-wallet-mcp" XBT_SIGNER="$ROOT/target/release/xbt-signer" \
+  (cd "$X63" && env FLAGSHIP_PORT_BASE=23500 "$@" XBT_WALLET_MCP="$ROOT/target/release/xbt-wallet-mcp" XBT_SIGNER="$ROOT/target/release/xbt-signer" \
      "${SOAK[@]}" ./flagship.sh) >"$ROOT/run/verify-$label.log" 2>&1
   local rc=$?
   grep -E "^\s+FAIL|^flagship:|^evidence:|agent:|Tools discovered|model probe|MCP_IMPL=|XBT_MCP_PAYER" "$ROOT/run/verify-$label.log"
@@ -45,7 +45,7 @@ if [ "${CLAUDE:-1}" != 0 ]; then
   step "REAL CLAUDE flagship, Rust MCP + Rust signer" flagship claude-rust-rust MCP_IMPL=rust SIGNER_IMPL=rust FLAGSHIP_MAX_USD=3
 fi
 step "cmp_clean_build (clean clone, cargo-zigbuild, 3 musl targets)" scripts/cmp_clean_build.sh "$(git rev-parse HEAD)"
-step "no scoped miners left on 33500-33599" python3 "$HOME/xbt-rnd/tools/miners_left.py" 33500-33599
+step "no scoped miners left on 23500-23599" python3 "$HOME/xbt-rnd/tools/miners_left.py" 23500-23599
 echo
 echo "==== summary"
 printf '%s\n' "${RES[@]}"
