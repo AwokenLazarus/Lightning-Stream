@@ -943,6 +943,23 @@ pub type RefundToFn = Box<dyn Fn() -> Result<String> + Send + Sync>;
 /// `return_to()`: an address the operator controls, for a coin the hub gets back (AGP-104).
 pub type ReturnToFn = RefundToFn;
 
+/// `return_above(sat)`: asked first for a return whose amount is known when its address is named
+/// (AGP-109). `Some(address)`: the return goes there (the operator's Lightning wallet, for what
+/// the hub holds above its capital). `None`: it goes where [`ReturnToFn`] says.
+pub type ReturnAboveFn = Arc<dyn Fn(u64) -> Option<String> + Send + Sync>;
+
+/// A return the hub's books name (AGP-109): a sweep, or the refund of a ch2 from before AGP-104.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReturnPaid {
+    pub txid: String,
+    /// The script it pays.
+    pub dest_spk: Vec<u8>,
+    /// What it pays there.
+    pub sat: u64,
+    /// The chain shows it: in a block now, or final, or its output spent again.
+    pub seen: bool,
+}
+
 /// Where a ch2 record lives: the live book (by origin), the origin's next ch2 (AGP-057), or the
 /// archive (by index).
 #[derive(Clone, Copy, Debug)]
@@ -998,6 +1015,9 @@ pub struct RouteHub {
     refill: Mutex<Option<SharedRefill>>,
     refund_to: Mutex<Option<RefundToFn>>,
     return_to: Mutex<Option<ReturnToFn>>,
+    return_above: Mutex<Option<ReturnAboveFn>>,
+    /// `extra.routing.lightning` of the 402 (AGP-109): the statement a Lightning node signed.
+    lightning: Mutex<Option<Value>>,
     /// The tip of the last sweep pass (AGP-104): sweeps are looked at once a block.
     sweep_tip: Mutex<Option<u32>>,
     /// Tests/demo: "" | "receipt" (keep t + r from the client) | "all" (forward nothing).
@@ -1153,6 +1173,7 @@ impl RouteHub {
                   network: network.into(), inbound, out: Mutex::new(out), busy: Mutex::new(HashSet::new()), quote: Mutex::new(None),
                   quote_seq: Mutex::new(now_i()), reveal_timeout_bits: AtomicU64::new(0), ask_turn: AtomicU64::new(0), fee_strategy: None,
                   refill: Mutex::new(None), refund_to: Mutex::new(None), return_to: Mutex::new(None),
+                  return_above: Mutex::new(None), lightning: Mutex::new(None),
                   sweep_tip: Mutex::new(None), withhold: Mutex::new(String::new()), events: Mutex::new(events),
                   stats: Mutex::new(HubStats::default()), zc_tried: Mutex::new(HashSet::new()), refill_ahead: Mutex::new(None),
                   ahead_tried: Mutex::new(HashSet::new()), retire_tried: Mutex::new(HashSet::new()),
@@ -1214,20 +1235,94 @@ impl RouteHub {
         *lk(&self.return_to) = f;
     }
 
+    /// AGP-109: the hook asked first for a return of a known amount (`None`: off). It names where
+    /// coins above the hub's capital go; whatever it does not take goes to
+    /// [`set_return_to`](Self::set_return_to)'s address. It has a say only while that hook is set.
+    pub fn set_return_above(&self, f: Option<ReturnAboveFn>) {
+        *lk(&self.return_above) = f;
+    }
+
+    /// AGP-109: the statement a Lightning node signed for this hub, served as
+    /// `extra.routing.lightning` of the 402 (`None`: none is served). The caller hands over one
+    /// that verifies and takes it back when it runs out ([`crate::ln_wallet::LnLink`]).
+    pub fn set_lightning(&self, v: Option<Value>) {
+        *lk(&self.lightning) = v;
+    }
+
     /// AGP-104: THE address a coin the hub gets back is paid to, as a script (None: no return
     /// hook). Every return goes through here: a ch2's `payerSpk` at funding and at rollover, a
-    /// refund of a ch2 that names its own key, and both sweeps. A later task that returns coins
-    /// to a Lightning wallet changes this function's hook and nothing else. Witness v0 only
-    /// (P2WPKH or P2WSH): what every provider takes as a `payerSpk` and what a sweep can pay.
-    fn return_spk(&self) -> Result<Option<Vec<u8>>> {
-        let g = lk(&self.return_to);
-        let Some(f) = g.as_ref() else { return Ok(None) };
-        let addr = f().map_err(|e| ChannelError::new("return_address", format!("no return address: {e}")))?;
-        let spk = address_to_spk(&addr, Some(&self.cfg.hrp)).map_err(|e| ChannelError::new("return_address", format!("return address: {e}")))?;
+    /// refund of a ch2 that names its own key, and both sweeps. Witness v0 only (P2WPKH or
+    /// P2WSH): what every provider takes as a `payerSpk` and what a sweep can pay.
+    ///
+    /// AGP-109: `known` is what the return pays when that is known as its address is named (a
+    /// sweep, a refund), `None` when it is not (a ch2's remainder, named at funding). A known
+    /// amount is offered to the [`ReturnAboveFn`] hook first. That hook is called with no lock of
+    /// this hub held, and an address it gives is checked as the other hook's is; one that fails
+    /// the check is passed over (the return then goes where it went before, and never waits on
+    /// that hook).
+    fn return_spk(&self, known: Option<u64>) -> Result<Option<Vec<u8>>> {
+        if lk(&self.return_to).is_none() {
+            return Ok(None);
+        }
+        let above = known.and_then(|sat| lk(&self.return_above).clone().and_then(|f| f(sat)));
+        if let Some(spk) = above.and_then(|a| self.return_script(&a).ok()) {
+            return Ok(Some(spk));
+        }
+        let addr = {
+            let g = lk(&self.return_to);
+            let Some(f) = g.as_ref() else { return Ok(None) };
+            f().map_err(|e| ChannelError::new("return_address", format!("no return address: {e}")))?
+        };
+        self.return_script(&addr).map(Some)
+    }
+
+    /// A return address as a script: of this network, witness v0.
+    fn return_script(&self, addr: &str) -> Result<Vec<u8>> {
+        let spk = address_to_spk(addr, Some(&self.cfg.hrp)).map_err(|e| ChannelError::new("return_address", format!("return address: {e}")))?;
         if !((spk.len() == 22 || spk.len() == 34) && spk[0] == 0 && spk[1] as usize == spk.len() - 2) {
             return fail("return_address", "the return address must be a witness v0 address (bech32 P2WPKH or P2WSH)");
         }
-        Ok(Some(spk))
+        Ok(spk)
+    }
+
+    /// AGP-109: every return the books name, with whether the chain shows it. A sweep of a closed
+    /// ch1, a sweep of what a ch2 left on its own key, and the refund of a ch2 that named its own
+    /// key. (A ch2's remainder is no entry: it is an output of the provider's close.) Read by the
+    /// Lightning link to retire an address the chain shows used and to sum what went to it.
+    pub fn returns_paid(&self) -> Result<Vec<ReturnPaid>> {
+        let mut found: Vec<(String, Vec<u8>, u64, bool)> = vec![];
+        {
+            let l = self.inbound.ledger_lock();
+            for st in l.channels.values() {
+                let Some(i) = st.extra.get("payee_sweep_intent").or(st.extra.get("payee_sweep")) else { continue };
+                let (Some(txid), Ok(dest)) = (i.get("txid").and_then(Value::as_str), hex::decode(py_str(i.get("dest_spk")))) else { continue };
+                let sw = st.extra.get("sweep");
+                let shown = sweep_done(sw) && sw.and_then(|s| s.get("skipped")).is_none() || py_u64(sw.and_then(|s| s.get("gone_at"))).unwrap_or(0) > 0;
+                found.push((txid.to_string(), dest, py_u64(i.get("swept")).unwrap_or(0), shown));
+            }
+        }
+        {
+            let b = lk(&self.out);
+            let recs = b.chans.values().chain(b.next_chans.values()).cloned().chain(b.archived.iter().filter_map(|r| OutChannel::from_json(r).ok()));
+            for c in recs {
+                if let (Some(txid), Ok(dest)) = (c.sweep.get("txid").and_then(Value::as_str), hex::decode(py_str(c.sweep.get("dest_spk")))) {
+                    let shown = truthy(c.sweep.get("final")) || py_u64(c.sweep.get("gone_at")).unwrap_or(0) > 0;
+                    found.push((txid.to_string(), dest, py_u64(c.sweep.get("swept")).unwrap_or(0), shown));
+                }
+                if refund_booked(&c.state, &c.close_prev) && own_key(&c.params) {
+                    if let Some(o) = Tx::parse_hex(&c.refund_hex).ok().and_then(|t| t.outputs.first().cloned()) {
+                        if o.script_pubkey != c.params.payer_spk && !c.refund_txid.is_empty() {
+                            found.push((c.refund_txid.clone(), o.script_pubkey, u64::try_from(o.value).unwrap_or(0), c.final_));
+                        }
+                    }
+                }
+            }
+        }
+        found.into_iter().map(|(txid, dest_spk, sat, shown)| {
+            // not known from the books: one look at the chain (its output, in a block)
+            let seen = shown || self.chain.get_tx_out(&txid, 0, false)?.is_some_and(|u| u.confirmations >= 1);
+            Ok(ReturnPaid { txid, dest_spk, sat, seen })
+        }).collect()
     }
 
     /// Replace the configured fee strategy with a callable.
@@ -1363,11 +1458,17 @@ impl RouteHub {
             v.sort();
             v
         };
-        Ok(json!({"feeBaseMsat": q.fee_base_msat, "feePpm": q.fee_ppm, "maxLockSat": q.max_lock_sat,
-                  "maxUnguardedLockSat": q.max_unguarded_lock_sat, "minInExpiryDelta": q.min_in_expiry_delta,
-                  "revealTimeoutSec": q.reveal_timeout_sec, "routeUrl": HUB_ROUTE_PATH, "quote": q.to_json(),
-                  "ch1CloseFeePayer": self.cfg.ch1_close_fee_payer.as_str(), "ch2CloseFeePayer": self.cfg.ch2_close_fee_payer.as_str(),
-                  "providers": providers}))
+        let mut r = json!({"feeBaseMsat": q.fee_base_msat, "feePpm": q.fee_ppm, "maxLockSat": q.max_lock_sat,
+                           "maxUnguardedLockSat": q.max_unguarded_lock_sat, "minInExpiryDelta": q.min_in_expiry_delta,
+                           "revealTimeoutSec": q.reveal_timeout_sec, "routeUrl": HUB_ROUTE_PATH, "quote": q.to_json(),
+                           "ch1CloseFeePayer": self.cfg.ch1_close_fee_payer.as_str(), "ch2CloseFeePayer": self.cfg.ch2_close_fee_payer.as_str(),
+                           "providers": providers});
+        // AGP-109: the statement of the Lightning node this hub belongs to, when it has one. A hub
+        // without one writes no key (the 402 is byte for byte what it was)
+        if let Some(l) = lk(&self.lightning).clone() {
+            r["lightning"] = l;
+        }
+        Ok(r)
     }
 
     pub fn body_limit(&self, path: &str, max_body: Option<usize>) -> usize {
@@ -2525,8 +2626,9 @@ impl RouteHub {
         let close_fee = py_u64(ex.get("closeFeeSat")).ok_or_else(|| ChannelError::new("bad_offer", "closeFeeSat"))?;
         // AGP-104 (R1): the remainder of this ch2 returns to an address the operator controls. A
         // hook that fails funds nothing: a ch2 is never funded on its own key because the wallet
-        // was away
-        let ret = self.return_spk()?;
+        // was away. (AGP-109: what it will pay is not known now, so it is never offered to the
+        // Lightning wallet's hook: a ch2's remainder refills the hub's float)
+        let ret = self.return_spk(None)?;
         let mut p = ChannelParams::derive(&hex::decode(&pay_to).map_err(|_| ChannelError::new("bad_offer", "payTo"))?, &ecdsa::pubkey(&secret),
                                           expiry, close_fee, ret, &self.network, self.cfg.ch2_close_fee_payer)?;
         p.capacity = cap;
@@ -2933,7 +3035,7 @@ impl RouteHub {
         // (from before AGP-104) takes a return address for its next one
         let ret = match &kept {
             Some(k) => Some(k.params.payer_spk.clone()),
-            None if own_key(p) => self.return_spk()?,
+            None if own_key(p) => self.return_spk(None)?,
             None => Some(p.payer_spk.clone()),
         };
         let (secret, expiry) = match &kept {
@@ -3243,7 +3345,8 @@ impl RouteHub {
                     Some(d) => Some(d),
                     // AGP-104 (R1): a ch2 that names its own key (from before it named a return
                     // address) is refunded to one; any other refund pays its `payerSpk`
-                    None if own_key(p) => self.return_spk()?,
+                    // (AGP-109: it pays the capacity less its fee, so the capacity bounds it)
+                    None if own_key(p) => self.return_spk(Some(p.capacity))?,
                     None => None,
                 }
             };
@@ -4444,7 +4547,7 @@ impl RouteHub {
         if value < fee.saturating_add(DUST) {
             return Ok(vec![]); // the fee is above what this output bears now: looked at again next block
         }
-        let Some(dest) = self.return_spk()? else { return Ok(vec![]) };
+        let Some(dest) = self.return_spk(Some(value - fee))? else { return Ok(vec![]) };
         let rec = self.inbound.sweep_payee(ch1, &dest, fee)?;
         ev(json!({"event": "ch1_sweep", "chan": ch1, "txid": rec.get("txid"), "value": value, "fee": fee, "swept": rec.get("swept")}))
     }
@@ -4516,7 +4619,7 @@ impl RouteHub {
         if value < fee.saturating_add(DUST) {
             return Ok(vec![]);
         }
-        let Some(dest) = self.return_spk()? else { return Ok(vec![]) };
+        let Some(dest) = self.return_spk(Some(value - fee))? else { return Ok(vec![]) };
         let op = OutPoint::from_display(&stx, svout).map_err(|_| ChannelError::new("bad_state", "sweep outpoint"))?;
         let mut tx = Tx::new(2, vec![TxIn::new(op, 0xFFFF_FFFD)], vec![TxOut::new((value - fee) as i64, dest.clone())], 0);
         sign_p2wpkh(&oc.secret_key()?, &mut tx, &[TxOut::new(value as i64, p.payer_spk.clone())], 0)?;

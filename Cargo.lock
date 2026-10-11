@@ -2633,6 +2633,8 @@ dependencies = [
  "hex",
  "hmac",
  "indexmap 2.14.2",
+ "rustls",
+ "secp256k1",
  "serde",
  "serde_json",
  "sha2",

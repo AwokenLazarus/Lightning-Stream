@@ -15,6 +15,8 @@ http-client = ["dep:ureq"]
 http-server = ["dep:xbt-svc"]
 # bitcoind JSON-RPC ChainBackend and Wallet (ureq)
 rpc = ["dep:ureq"]
+# the hub's link to a Lightning node (AGP-109): REST with the node's certificate pinned
+ln-wallet = ["dep:ureq", "dep:rustls", "dep:url"]
 # fixed-nonce adaptor pre-sign, for the vector emitter only (nonce reuse leaks the key)
 vector-emitter = []
 
@@ -33,6 +35,13 @@ indexmap = "2"
 aes-gcm = "0.10.3"
 zeroize = "1"
 ureq = { workspace = true, optional = true }
+# AGP-109: a Lightning node's signed message is checked by recovering its key (in the tree already:
+# xbt-primitives' secp256k1, and the recovery feature xbt-signer turns on for invoices)
+secp256k1 = { workspace = true, features = ["recovery"] }
+# AGP-109: the pinned certificate of the Lightning node's REST listener, and its URL as ureq parses
+# it (the versions xbt-signer's Lightning client already uses)
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+url = { version = "2.5", optional = true }
 # container plumbing for the xbt402-hub binary (AGP-038): data dir, secrets, health, proxy URLs
 xbt-svc = { workspace = true, optional = true }
 
@@ -43,7 +52,7 @@ url = "2.5"
 
 [[bin]]
 name = "xbt402-hub"
-required-features = ["rpc", "http-client", "http-server"]
+required-features = ["rpc", "http-client", "http-server", "ln-wallet"]
 
 [[test]]
 name = "http_limits"

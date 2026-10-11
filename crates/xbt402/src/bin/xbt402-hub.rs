@@ -41,6 +41,24 @@
 //! * `/readyz` is not ready while the wallet does not answer.
 //! * `GET /status`: where the hub's coins are, as JSON; `GET /`: the same as a page.
 //!   `XBT_HUB_STATUS=off` serves neither (they are on the hub's public port).
+//!
+//! AGP-109, the link to the operator's Lightning node ([`xbt402::ln_wallet`]). Three settings, in the
+//! config file under `ln` or by env; with none the hub runs as before:
+//! * `ln.rest` / `XBT_HUB_LN_REST`: the node's REST address, `https://host:port`. A setting, because
+//!   what a hub dials differs by platform; the certificate is pinned, so the name is not checked.
+//! * `ln.tls_cert` / `XBT_HUB_LN_TLS_CERT`: the node's `tls.cert`, as a path or as the PEM text.
+//! * `ln.macaroon` / `XBT_HUB_LN_MACAROON`: the path of a file holding a macaroon for `NewAddress`
+//!   and `SignMessage` (the `.macaroon` file itself, or its hex or base64 as text, which is what an
+//!   operator pastes); else the secret `hub-ln-macaroon`. Never the macaroon itself in a setting: it
+//!   is a credential, and comes as the hub's other secrets do. On mainnet one that allows anything
+//!   more is not used (rule M1, [`xbt402::macaroon`]); `XBT_HUB_LN_STRICT=1` applies that on every
+//!   network.
+//!
+//! With the link: a return whose amount is known and which leaves the hub its capital (`capital_sat`)
+//! is paid to an address of the Lightning node's on-chain wallet, and the 402 carries the node's
+//! signed statement naming this hub (`extra.routing.lightning`), so the hub's address is
+//! `<node id>@host:port`. A link that cannot be set up is said at start and on `/status`, and the hub
+//! runs without it: nothing the hub routes or returns waits for the Lightning node.
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,6 +71,7 @@ use xbt402::funding::ChainBackend;
 use xbt402::http::{serve_service, HttpService, UreqTransport};
 use xbt402::hub::{HubConfig, RouteHub};
 use xbt402::hub_keys::{WrapKey, WRAP_KEY_FILE};
+use xbt402::ln_wallet::{cert_fingerprint, macaroon_bytes, LinkConfig, LnLink, LndRestNode, Look};
 use xbt402::provider::HttpResponse;
 use xbt402::rpc::Rpc;
 use xbt_svc::{env, env_bool, health, probe, proxy, DataDir, Mode, Secrets};
@@ -99,6 +118,14 @@ fn load_config(args: &[String], data: Option<&DataDir>) -> Value {
     for (k, slot) in [("XBT_HUB_NETWORK", "network"), ("XBT_HUB_BIND", "bind"), ("XBT_HUB_DATADIR", "datadir")] {
         if let Some(v) = env(k) {
             conf[slot] = v.into();
+        }
+    }
+    if !conf.get("ln").is_some_and(Value::is_object) {
+        conf["ln"] = json!({});
+    }
+    for (k, slot) in [("XBT_HUB_LN_REST", "rest"), ("XBT_HUB_LN_TLS_CERT", "tls_cert"), ("XBT_HUB_LN_MACAROON", "macaroon")] {
+        if let Some(v) = env(k) {
+            conf["ln"][slot] = v.into();
         }
     }
     for (k, slot) in [("XBT_HUB_PORT", "port"), ("XBT_HUB_WATCH_INTERVAL", "watch_interval"), ("XBT_HUB_THREADS", "threads")] {
@@ -196,6 +223,11 @@ fn network(conf: &Value, rpc: &Rpc) -> String {
         Ok(n) => n,
         Err(e) => die(e),
     }
+}
+
+/// The node's chain name (`main`, `regtest`, ...); empty when it does not answer.
+fn chain_name(rpc: &Rpc) -> String {
+    rpc.call("getblockchaininfo", json!([])).ok().and_then(|v| v["chain"].as_str().map(str::to_string)).unwrap_or_default()
 }
 
 /// The node's network id, unless another one is configured.
@@ -350,6 +382,122 @@ impl Wallet for NodeWallet {
     }
 }
 
+/// A setting that is a file's path or the content itself: the file when one is there.
+fn path_or_text(v: &str) -> Result<Vec<u8>, String> {
+    let p = expand(v.trim());
+    match std::fs::read(&p) {
+        Ok(b) => Ok(b),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound || e.kind() == std::io::ErrorKind::InvalidInput || e.kind() == std::io::ErrorKind::InvalidFilename => Ok(v.as_bytes().to_vec()),
+        Err(e) => Err(format!("{}: {e}", p.display())),
+    }
+}
+
+/// The Lightning link (AGP-109) as the service holds it: the link, or why there is none.
+struct Ln {
+    link: Option<Arc<LnLink>>,
+    /// Why the settings gave no link (said at start and on `/status`).
+    error: Option<String>,
+    /// The macaroon's permissions, for `/status`.
+    macaroon: Value,
+    rest: Option<String>,
+}
+
+impl Ln {
+    fn none() -> Self {
+        Self { link: None, error: None, macaroon: Value::Null, rest: None }
+    }
+}
+
+/// The link from the three settings. `strict`: rule M1 applies (mainnet, or `XBT_HUB_LN_STRICT`).
+/// `Ok(None)`: no `ln.rest`, no link. An error is the operator's to read: the hub runs without
+/// the link, and the macaroon was sent nowhere.
+fn ln_link(conf: &Value, secrets: &Secrets, strict: bool, cfg: LinkConfig, datadir: &std::path::Path) -> Result<Option<(LnLink, Value, String)>, String> {
+    let ln = &conf["ln"];
+    let set = |k: &str| ln.get(k).and_then(Value::as_str).map(str::trim).filter(|v| !v.is_empty());
+    let Some(rest) = set("rest") else {
+        return if set("macaroon").is_some() || set("tls_cert").is_some() {
+            Err("a macaroon or a certificate is set and the node's address is not: set XBT_HUB_LN_REST (ln.rest)".into())
+        } else {
+            Ok(None)
+        };
+    };
+    let pasted = match set("macaroon") {
+        Some(m) => std::fs::read(expand(m)).map_err(|e| format!("the macaroon file {m}: {e}"))?,
+        None => secrets.get("hub-ln-macaroon")?.map(|s| s.bytes)
+            .ok_or("no macaroon: set XBT_HUB_LN_MACAROON (ln.macaroon) to its file, or the secret hub-ln-macaroon")?,
+    };
+    let mac = macaroon_bytes(&pasted).map_err(|e| e.msg)?;
+    let parsed = xbt402::macaroon::parse(&mac)?;
+    let report = parsed.hub_report();
+    if let Some(why) = parsed.beyond_hub() {
+        if strict {
+            return Err(format!("{why}. It is not used"));
+        }
+        eprintln!("xbt402-hub: lightning: {why}. It is used here because this is not mainnet (XBT_HUB_LN_STRICT=1 refuses it here too)");
+    }
+    let pem = match set("tls_cert") {
+        Some(c) => Some(String::from_utf8(path_or_text(c)?).map_err(|_| "the certificate is not PEM text".to_string())?),
+        None => None,
+    };
+    let node = LndRestNode::new(rest, &mac, pem.as_deref()).map_err(|e| e.msg)?;
+    let cert = pem.as_deref().map(cert_fingerprint).transpose().map_err(|e| e.msg)?.unwrap_or_default();
+    let link = LnLink::open(Box::new(node), LinkConfig { cert, ..cfg }, Some(datadir)).map_err(|e| e.msg)?;
+    Ok(Some((link, report, rest.to_string())))
+}
+
+/// Whether rule M1 applies: on every chain that is not known to be a test chain (mainnet, and a
+/// node that did not say), and wherever the operator asked for it.
+fn ln_strict(chain: &str, forced: bool) -> bool {
+    forced || !matches!(chain, "regtest" | "test" | "testnet4" | "signet")
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Every coin the hub counts as its own, for the link's look at what is above capital: the
+/// status sum, when the wallet answers and no funding is being reconciled. Never a guess.
+fn held_sat(hub: &RouteHub, wallet: &Rpc) -> Result<u64, String> {
+    let st = hub.status(Some(wallet_sats(wallet).map_err(|e| format!("the hub's wallet: {e}"))?));
+    if st["unsettled"] == true {
+        return Err("a funding is being checked against the chain".into());
+    }
+    st["totalSat"].as_u64().ok_or_else(|| "the status sum is not known".into())
+}
+
+/// The link's own thread (rule L3: the node is asked here and nowhere else). One round at start,
+/// then at each new block and at least every 30 seconds; the statement the hub serves is put in
+/// place, and taken away when it runs out, after each.
+fn ln_watch(link: Arc<LnLink>, hub: Arc<RouteHub>, rpc: Arc<Rpc>, wallet: Arc<Rpc>, capital: u64, interval: Duration) {
+    let spawned = std::thread::Builder::new().name("ln-link".into()).spawn(move || {
+        let (mut last_tip, mut last_run) = (None, None::<std::time::Instant>);
+        loop {
+            let tip = rpc.block_count().ok();
+            if tip != last_tip || last_run.is_none_or(|t| t.elapsed() >= Duration::from_secs(30)) {
+                (last_tip, last_run) = (tip, Some(std::time::Instant::now()));
+                let paid = hub.returns_paid();
+                let said = link.tick(&Look {
+                    now: unix_now(), capital,
+                    held: &|| held_sat(&hub, &wallet),
+                    seen: &|spk| match &paid {
+                        Ok(p) => Ok(p.iter().any(|r| r.seen && r.dest_spk == spk)),
+                        Err(e) => Err(e.clone()),
+                    },
+                });
+                for m in said {
+                    eprintln!("xbt402-hub: lightning: {m}");
+                }
+            }
+            hub.set_lightning(link.lightning_extra(unix_now()));
+            std::thread::sleep(interval.clamp(Duration::from_secs(1), Duration::from_secs(30)));
+        }
+    });
+    if let Err(e) = spawned {
+        // without its thread the link asks the node nothing and hands out nothing: the hub runs as if unlinked
+        eprintln!("xbt402-hub: lightning: the link's thread did not start ({e}): returns go to the hub's own wallet");
+    }
+}
+
 /// The hub behind a reverse proxy: health endpoints, the base path, the public URL.
 struct Front {
     hub: Arc<RouteHub>,
@@ -363,6 +511,7 @@ struct Front {
     trust_forwarded: bool,
     /// `/status` and the page at `/` are served (AGP-104; `XBT_HUB_STATUS=off` turns them off).
     status: bool,
+    ln: Ln,
 }
 
 impl Front {
@@ -374,7 +523,25 @@ impl Front {
         v["url"] = self.public.clone().into();
         v["tor"] = self.onion.clone().into();
         v["experimental"] = true.into();
+        v["lightning"] = self.lightning_doc();
         v
+    }
+
+    /// AGP-109: the Lightning link for `/status` (null: none is set up). `returnedSat`: what the
+    /// hub's sweeps and refunds paid to the link's addresses.
+    fn lightning_doc(&self) -> Value {
+        let Some(link) = &self.ln.link else {
+            return self.ln.error.as_ref().map(|e| json!({"linked": false, "error": e})).unwrap_or(Value::Null);
+        };
+        let mut l = link.report(unix_now(), self.public.as_deref().or(self.onion.as_deref()));
+        let scripts = link.scripts();
+        let paid = self.hub.returns_paid().map(|p| p.iter().filter(|r| scripts.contains(&r.dest_spk)).fold(0u64, |a, r| a.saturating_add(r.sat)));
+        l["linked"] = true.into();
+        l["returnedSat"] = paid.as_ref().ok().copied().into();
+        l["returnedError"] = paid.err().map(|e| e.to_string()).into();
+        l["macaroon"] = self.ln.macaroon.clone();
+        l["rest"] = self.ln.rest.clone().into();
+        l
     }
 }
 
@@ -518,6 +685,27 @@ fn main() {
         println!("{}", json!({"closes": closes, "events": *hub.events.lock().unwrap()}));
         return;
     }
+    // AGP-109: the Lightning link, wrapped around the return address above and not in place of
+    // it: a return of a known amount that leaves the hub its capital is offered to the link
+    // first, and everything it does not take goes to the hub's wallet as before
+    let capital = hub.cfg.capital_sat;
+    let link_cfg = LinkConfig { hrp: hub.cfg.hrp.clone(), network: network.clone(), pay_to: hub.pay_to().to_string(), cert: String::new() };
+    let strict = ln_strict(&chain_name(&rpc), env_bool("XBT_HUB_LN_STRICT", false));
+    let ln = match ln_link(&conf, &secrets, strict, link_cfg, &datadir) {
+        Ok(None) => Ln::none(),
+        Ok(Some((link, macaroon, rest))) => {
+            eprintln!("xbt402-hub: lightning: linked to the node at {rest} (new address, sign message){}",
+                      if capital == 0 { "; no capital_sat is set, so every return refills the hub's wallet" } else { "" });
+            Ln { link: Some(Arc::new(link)), error: None, macaroon, rest: Some(rest) }
+        }
+        Err(e) => {
+            eprintln!("xbt402-hub: lightning: NOT LINKED: {e}. The hub runs without the Lightning link: returns go to its own wallet and it is named by its URL only");
+            Ln { error: Some(e), ..Ln::none() }
+        }
+    };
+    if let Some(link) = ln.link.clone() {
+        hub.set_return_above(Some(Arc::new(move |sat| link.return_above(sat))));
+    }
     let hub = Arc::new(hub);
     for origin in conf.get("connect").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
         if !hub.out_channels().contains_key(origin.trim_end_matches('/')) {
@@ -534,9 +722,12 @@ fn main() {
         if h.starts_with("http://") || h.starts_with("https://") { h.to_string() } else { format!("http://{h}") }
     }).filter(|h| h.contains('.'));
     let wallet = Arc::new(wallet);
+    if let Some(link) = ln.link.clone() {
+        ln_watch(link, hub.clone(), rpc.clone(), wallet.clone(), capital, Duration::from_secs_f64(conf.get("watch_interval").and_then(Value::as_f64).unwrap_or(5.0).clamp(1.0, 30.0)));
+    }
     let front = Arc::new(Front { hub: hub.clone(), rpc: rpc.clone(), wallet, wallet_name, receive_address, onion,
                                  base, public: env("XBT_PUBLIC_URL"), trust_forwarded: env_bool("XBT_TRUST_FORWARDED", false),
-                                 status: env("XBT_HUB_STATUS").is_none_or(|v| !["off", "0", "false", "no"].contains(&v.trim().to_ascii_lowercase().as_str())) });
+                                 status: env("XBT_HUB_STATUS").is_none_or(|v| !["off", "0", "false", "no"].contains(&v.trim().to_ascii_lowercase().as_str())), ln });
     let handles = serve_service(front, &bind, threads).unwrap_or_else(|e| die(format!("bind {bind}: {e}")));
     eprintln!("xbt402 hub {} on {bind} ({network})", hub.pay_to());
     eprintln!("xbt402 hub: EXPERIMENTAL - routing is not production-ready; do not route funds you cannot lose");
@@ -597,6 +788,65 @@ mod tests {
         assert!(set.preflight().is_ok());
         let unset = NodeWallet { wallet: w, fee_rate: None, conf_target: 6 };
         assert!(unset.preflight().is_err() && unset.fund("bcrt1qx", 1_000).is_err());
+    }
+
+    /// AGP-109, rule M1 through the service's own set-up: on mainnet a macaroon for more than the
+    /// two calls gives no link, whatever form it is pasted in, and the hub is told why.
+    #[test]
+    fn a_macaroon_wider_than_the_two_calls_gives_no_link_on_mainnet() {
+        use xbt402::macaroon::lnd_macaroon_for_tests as mac;
+        let t = std::env::temp_dir().join(format!("agp109-hub-ln-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(&t).unwrap();
+        let secrets = Secrets::for_component(None, xbt_svc::HUB, Mode::from_env().unwrap());
+        let pay_to = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let cfg = || LinkConfig { hrp: "bcrt".into(), network: "bip122:x".into(), pay_to: pay_to.into(), cert: String::new() };
+        let file = |name: &str, bytes: &[u8]| {
+            std::fs::write(t.join(name), bytes).unwrap();
+            t.join(name).to_string_lossy().to_string()
+        };
+        let link = |m: &[u8], strict: bool| ln_link(&json!({"ln": {"rest": "http://127.0.0.1:1", "macaroon": file("m", m)}}), &secrets, strict, cfg(), &t);
+        let narrow = mac(&[("uri", &["/lnrpc.Lightning/NewAddress", "/lnrpc.Lightning/SignMessage"])], &[]);
+        let pairs = mac(&[("address", &["write"]), ("message", &["write"])], &[]);
+        let admin = mac(&[("address", &["read", "write"]), ("message", &["read", "write"]), ("onchain", &["read", "write"]), ("macaroon", &["generate"])], &[]);
+        let one_more = mac(&[("address", &["write"]), ("message", &["write"]), ("info", &["read"])], &[]);
+        for m in [&narrow, &pairs] {
+            let (_, report, rest) = link(m, true).unwrap().unwrap();
+            assert_eq!((report["onlyTheTwoCalls"].clone(), rest.as_str()), (json!(true), "http://127.0.0.1:1"));
+        }
+        for m in [&admin, &one_more] {
+            let e = link(m, true).err().unwrap();
+            assert!(e.contains("grants") && e.contains("It is not used"), "{e}");
+            assert!(link(m, false).unwrap().is_some(), "off mainnet it is used, and named in the log");
+        }
+        assert!(link(&admin, true).err().unwrap().contains("onchain:write"));
+        assert!(link(&one_more, true).err().unwrap().contains("info:read"));
+        // pasted as hex or base64 text, it is the same macaroon
+        assert!(link(hex::encode(&admin).as_bytes(), true).err().unwrap().contains("onchain:write"));
+        assert!(link(format!("{}\n", hex::encode(&narrow)).as_bytes(), true).unwrap().is_some());
+        // what is no macaroon gives no link on any network; no address gives none either
+        let good = file("good", &narrow);
+        for (conf, what) in [(json!({"ln": {"rest": "http://127.0.0.1:1", "macaroon": file("bad", b"zz")}}), "not hex or base64"),
+                             (json!({"ln": {"rest": "http://127.0.0.1:1", "macaroon": t.join("none").to_string_lossy()}}), "the macaroon file"),
+                             (json!({"ln": {"rest": "http://127.0.0.1:1", "macaroon": hex::encode(&narrow)}}), "the macaroon file"),
+                             (json!({"ln": {"rest": "http://127.0.0.1:1"}}), "no macaroon"),
+                             (json!({"ln": {"macaroon": good}}), "XBT_HUB_LN_REST"),
+                             (json!({"ln": {"rest": "http://10.0.0.9:8080", "macaroon": good}}), "must be https"),
+                             (json!({"ln": {"rest": "https://10.0.0.9:8080", "macaroon": good}}), "certificate")] {
+            let e = ln_link(&conf, &secrets, false, cfg(), &t).err().unwrap_or_else(|| panic!("{conf} gave a link"));
+            assert!(e.contains(what), "{e}");
+        }
+        assert!(ln_link(&json!({"ln": {}}), &secrets, true, cfg(), &t).unwrap().is_none(), "no settings, no link");
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    #[test]
+    fn the_mainnet_rule_applies_unless_the_chain_is_known_to_be_a_test_chain() {
+        assert!(ln_strict("main", false));
+        assert!(ln_strict("", false), "a node that did not say");
+        assert!(ln_strict("mainnet", false) && ln_strict("other", false));
+        assert!(!ln_strict("regtest", false) && !ln_strict("signet", false) && !ln_strict("test", false));
+        assert!(ln_strict("regtest", true));
     }
 
     #[test]
