@@ -1,5 +1,9 @@
 manifestVersion: 1.1
 id: lazarus-xbt-knots
+# AGP-100: selectable for an app's `bitcoin` dependency (the xbt402 Hub's). It exports only APP_XBT_KNOTS_*,
+# not APP_BITCOIN_*, so only an app that reads those names can use it; it is on the XBT (BLAKE2b) chain.
+implements:
+  - bitcoin
 category: bitcoin
 name: XBT Node (stand-in)
 version: "29.4.2-agp040.1"

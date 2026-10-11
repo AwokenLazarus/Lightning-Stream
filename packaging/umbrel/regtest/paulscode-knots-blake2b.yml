@@ -1,0 +1,13 @@
+# Paul's node app (paulscode-knots-blake2b, the app Lightning Fork's `bitcoin` dependency resolves to) in the
+# AGP-100 test: its own compose file and image, with only what the test box lacks taken out. Tor and I2P are
+# not run, and no port is published on the host: the node is reached on the box network at its static IP, as a
+# dependent app reaches it.
+services:
+  app:
+    restart: "no"
+    stop_grace_period: 30s
+    ports: !reset []
+  tor:
+    profiles: ["umbrel-only"]
+  i2pd_daemon:
+    profiles: ["umbrel-only"]

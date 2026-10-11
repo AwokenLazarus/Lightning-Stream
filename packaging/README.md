@@ -14,8 +14,9 @@ packaging/
     lazarus-xbt402-hub/       the optional hub, its own app
     lazarus-xbt-knots/        a stand-in XBT node (pruned Knots 29.4.2) until xbt-compute's node-host app (CMP-098)
     lint.py                   manifest + compose + hardening lint
-    regtest/                  the off-Umbrel overlays and the driver (umbrel_regtest.py)
+    regtest/                  the off-Umbrel overlays and the drivers (umbrel_regtest.py, hub_shared_node.py)
     test-umbrel-apps.sh       verify: lint, then install from cold on regtest, twice
+    test-umbrel-hub-node.sh   verify (AGP-100): the hub beside the node app Lightning Fork uses, and the fallback
     bundle.sh                 side-load bundle: the store + docker-saved images (dist/umbrel/)
   startos/
     xbt-agent-wallet/         the StartOS package (start-sdk 2.0.9, TypeScript); startos/spec.ts is its containers as data
@@ -30,6 +31,7 @@ packaging/
 ```bash
 scripts/oci_build.sh --load                # the six images for amd64, arm64, arm/v7, loaded as <image>:0.1.0
 packaging/umbrel/test-umbrel-apps.sh       # RESULT PASS: lint + 2 cold regtest runs (ports 34000-34099)
+packaging/umbrel/test-umbrel-hub-node.sh   # RESULT PASS: the hub beside Paul's node app, our stand-in, and no node (port 24020)
 packaging/startos/test-startos.sh          # RESULT PASS: build + inspect + regtest run (ports 34100-34199)
 scripts/verify_agp040.sh                   # all of it, plus the unit tests and AGP-038's container test
 ```
@@ -99,7 +101,32 @@ sharing the uid table with the services, `FROM scratch`, on all three architectu
 | bundle a node in the wallet app | no | a second node on a box that runs cmp's |
 | an Electrum fallback | not possible yet | the Rust signer has no Electrum backend (AGP-028); B2's Python signer has one, but it is not the shipping signer |
 
-The export contract is five variables: host, RPC port, chain, user, password. cmp's node-host app
+**The hub's node (AGP-100).** The hub app depends on umbrelOS's `bitcoin` slot, which is what Lightning Fork
+depends on, so on a box that runs Lightning Fork the hub uses that node and installs no second one.
+
+| option | chosen? | why |
+|---|---|---|
+| depend on the `bitcoin` slot; read `APP_BITCOIN_*`, else `APP_XBT_KNOTS_*` | yes | the node Lightning Fork already uses (Paul's `paulscode-knots-blake2b`); no second sync; arm64 boxes get a node (his image is amd64 and arm64, our stand-in amd64 only) |
+| depend on `paulscode-knots-blake2b` by id | no | ties the hub to one store's app; the slot also takes our stand-in and CMP-098's app |
+| keep depending on `lazarus-xbt-knots` | no | a second node beside Lightning Fork's |
+
+- Paul's node app exports `APP_BITCOIN_NODE_IP`, `_RPC_PORT` (18443), `_RPC_USER`, `_RPC_PASS`, and the hub's
+  compose reads each as `${APP_BITCOIN_X:-${APP_XBT_KNOTS_Y}}`.
+- `lazarus-xbt-knots` now declares `implements: [bitcoin]`, so the owner can select it for the hub. It still
+  exports only `APP_XBT_KNOTS_*`: that is the fallback path, and the one CMP-098's app will take.
+- The owner must select an XBT (BLAKE2b) node for the slot. umbrelOS offers the official Bitcoin apps too,
+  and they follow the SHA256d chain. The hub does not refuse such a node today: it would start and advertise
+  that chain's network id, which no XBT wallet accepts.
+- With no node app, the hub's node address is empty and the hub exits with the reason. It never reports ready.
+- The wallet app still depends on `lazarus-xbt-knots` (it also needs the exported chain name); that is
+  unchanged here.
+
+`test-umbrel-hub-node.sh` runs the hub beside Paul's app (his store at a pinned commit, his image by digest):
+first his app as shipped, on a network with no route out, to call the wallet RPCs a dependent needs; then
+the same image on regtest with the conf his app generated, where the hub reaches `/readyz` and funds from its
+node wallet. Paul's app has no regtest setting, so that second step starts his `bitcoind` directly.
+
+The stand-in's export contract is five variables: host, RPC port, chain, user, password. cmp's node-host app
 (CMP-098) must export the same names. Until then `lazarus-xbt-knots` is a stand-in, reusing A3's
 `xbt-a3-knots:29.4.2`, which is **amd64-only**. A Pi or other arm64/armv7 box has no stand-in node:
 install CMP-098's real `knots-xbt` app when it exists (same `APP_XBT_KNOTS_*` names). Building Knots
@@ -158,7 +185,8 @@ applied there.
 - No install on a real Umbrel or StartOS box (needs Mike). The StartOS build targets StartOS 0.4
   (`osVersion` 0.4.0-beta.10 in the manifest, start-sdk 2.0.9).
 - The XBT node:
-  - on Umbrel, a stand-in, **amd64-only**, until CMP-098 (documented dependency: same `APP_XBT_KNOTS_*`);
+  - on Umbrel, the hub uses the `bitcoin` slot's node (AGP-100). The wallet still needs the stand-in,
+    **amd64-only**, until CMP-098 (documented dependency: same `APP_XBT_KNOTS_*`);
   - on StartOS, an external connection until CMP-099;
   - no Electrum fallback (AGP-028).
 - The hub creates the node wallet named `hub` on start and shows a receive address on the wallet UI Hub
