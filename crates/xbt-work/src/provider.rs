@@ -2,7 +2,8 @@
 //! [`Provider`](xbt402::provider::Provider) ([`Provider::with_scheme`](xbt402::provider::Provider::with_scheme)).
 //!
 //! * `POST /x402/xbt-work/invoice` issues invoices (128-bit base32 id, a fresh `authKey`, both
-//!   usernames), bounded and expiring while unfunded.
+//!   usernames), expiring while unfunded. Issuing stores nothing (AGP-091, `Issued`): the
+//!   identifier carries its expiry and a MAC, and the `authKey` is derived from it again.
 //! * A PAYMENT-SIGNATURE naming `xbt-work` is checked in the §9.1 order (scheme/network/payTo,
 //!   grammar, identity and Prime, invoice, `auth` and a fresh `n`, the Ed25519 signature,
 //!   equivocation, delta credit, balance), debited and recorded durably before the handler runs,
@@ -29,28 +30,37 @@
 //!   a reorg undoes what an orphaned audit covered ([`WorkProvider::orphaned`]); payouts are split
 //!   into liquid and locked by the node's coinbase maturity ([`WorkProvider::payouts`]). An unfunded
 //!   invoice past its TTL stays dormant for [`WorkConfig::invoice_grace_secs`] (work mined just
-//!   before expiry is still pulled and credited), issuance is limited per client, and state is
-//!   written outside the state lock, newest snapshot wins.
-use std::collections::HashMap;
+//!   before expiry is still pulled and credited), and state is written outside the state lock,
+//!   newest snapshot wins.
+//! * AGP-091 (second closure audit, WORK 1 to 7), one rule each, kept in one place: the Prime is
+//!   failed only on what it signed for the block, never on what a coinbase paid
+//!   ([`WorkProvider::audit_chain`]); a cap in calls is in calls under the pricing rule in force
+//!   ([`Cap::units_under`], [`WorkConfig::cap_rule`]); no answer of the Prime's stops the audit
+//!   walk ([`crate::walk`]); the unpaid-blocks stop lifts only on a full payment
+//!   ([`WorkProvider::audit`]); issuing an invoice costs no state; an admin request carries the
+//!   admin token ([`admin_request`]).
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::VerifyingKey;
+use hmac::{Hmac, Mac};
 use serde_json::Value;
+use sha2::Sha256;
 use xbt402::client::Transport;
 use xbt402::json::{dumps, obj};
-use xbt402::provider::{HttpResponse, PEER_HEADER};
+use xbt402::provider::HttpResponse;
 use xbt402::scheme::{ProviderScheme, SchemeCharge};
 use xbt402::wire::settlement_response;
 
-use crate::audit::{audit_block, window_from_doc, AuditBounds, AuditOutcome, CarryLedger, PrimeTerms, SignedDeferral, SignedWindow};
+use crate::audit::{audit_block, window_from_doc, AuditBounds, AuditOutcome, CarryLedger, PrimeTerms, SignedDeferral, SignedWindow, TOLERANCE};
 use crate::auth::{auth_tag, request_digest, tag_eq};
 use crate::book::{CreditCaps, ReceiptBook};
 use crate::chain::{ChainBlock, Maturity};
 use crate::error::{fail, Result, WorkError};
-use crate::grammar::{canonical_identity, random_invoice, uint, valid_identity, U64};
+use crate::grammar::{canonical_identity, new_invoice, uint, valid_identity, U64};
 use crate::pricing::{work_units_for_price, Pricing};
 use crate::receipt::{pubkey_from_hex, sig64, Signed, WorkReceipt};
 use crate::{ASSET, INVOICE_PATH, SCHEME};
@@ -90,6 +100,25 @@ impl Cap {
     pub fn priced(self) -> bool {
         matches!(self, Cap::Sats(_) | Cap::Calls(_))
     }
+
+    /// The cap in work units under the pricing rule in force (AGP-091): a cap in calls is that
+    /// many calls at what one call costs under `rule`, never at a price the rule does not charge.
+    /// With exact pricing it is [`Cap::units`] at the rule's epoch. With a fixed amount per call a
+    /// cap in calls is `calls * amount`, and a cap in sats is turned into calls at
+    /// `invoice_price_sats` (rounded down), or at the work's §6.1 value when no sats price is set.
+    pub fn units_under(self, rule: &Amount, invoice_price_sats: u64) -> Result<Option<u64>> {
+        Ok(Some(match (self, rule) {
+            (Cap::Off, _) => return Ok(None),
+            (Cap::Work(w), _) => w,
+            (c, Amount::Priced(p)) => return c.units(p.bits, p.block_value_sats, p.price_sats),
+            (Cap::Calls(n), Amount::Fixed(a)) => n.saturating_mul((*a).max(1)),
+            (Cap::Sats(s), Amount::Fixed(a)) if invoice_price_sats > 0 => {
+                let w = u128::from(s) * u128::from((*a).max(1)) / u128::from(invoice_price_sats);
+                u64::try_from(w).unwrap_or(u64::MAX)
+            }
+            (Cap::Sats(_), Amount::Fixed(_)) => return fail("bad_pricing", "a cap in sats needs a sats price: none is set with a fixed amount per call"),
+        }))
+    }
 }
 
 /// The two §13.1 caps as an operator sets them.
@@ -108,6 +137,13 @@ impl Caps {
     /// everything) rather than lifting the cap.
     pub fn at(&self, bits: u32, block_value_sats: u64, price_sats: u64) -> CreditCaps {
         let units = |c: Cap| c.units(bits, block_value_sats, price_sats).unwrap_or(Some(0));
+        CreditCaps { per_invoice: units(self.invoice), total: units(self.total) }
+    }
+
+    /// The caps in work units under the pricing rule in force ([`Cap::units_under`]). A cap that
+    /// cannot be converted caps at 0 (holds everything) rather than lifting the cap.
+    pub fn under(&self, rule: &Amount, invoice_price_sats: u64) -> CreditCaps {
+        let units = |c: Cap| c.units_under(rule, invoice_price_sats).unwrap_or(Some(0));
         CreditCaps { per_invoice: units(self.invoice), total: units(self.total) }
     }
 }
@@ -138,12 +174,16 @@ pub struct WorkConfig {
     /// the price coinbase payments are turned into paid-for work at ([`WorkProvider::paid_work`]).
     pub invoice_price_sats: u64,
     pub invoice_ttl_secs: u64,
-    pub max_unfunded: usize,
     pub max_timeout_secs: u64,
     /// Where the book is kept (recorded before each handler runs). None: memory only.
     pub state_path: Option<PathBuf>,
-    /// §13.1: caps on unaudited credit, in work units (about one window's value each).
+    /// §13.1: caps on unaudited credit, in work units (about one window's value each). Replaced
+    /// by what [`WorkConfig::cap_rule`] gives when that is set.
     pub caps: CreditCaps,
+    /// The caps as the operator sets them (calls, sats or work units). When set, the provider
+    /// derives `caps` from it under the pricing rule in force, when it starts and at every epoch
+    /// ([`Caps::under`]): a cap in calls is in calls whatever `amount` says a call costs (AGP-091).
+    pub cap_rule: Option<Caps>,
     /// §10.3/§13.1: owed carry above this (sats) stops new credit until carry is released.
     pub max_owed_carry_sats: Option<u64>,
     /// §10.3: owed carry grew over each of the last N audited blocks: stop new credit (set it when the
@@ -159,14 +199,11 @@ pub struct WorkConfig {
     pub nta: bool,
     /// The Prime's published pool terms: every window statement is held to them (AGP-065).
     pub terms: PrimeTerms,
-    /// An unfunded invoice past its TTL stays dormant this long: receipts for it are still pulled
-    /// and accepted, but no new 402 names it and it never counts against `max_unfunded` once a
-    /// newer invoice needs the room (the oldest dormant one goes first).
+    /// An unfunded invoice past its TTL stays dormant this long: a first receipt that shows work
+    /// on it is still accepted.
     pub invoice_grace_secs: u64,
-    /// Unfunded live invoices one client may hold (the TCP peer, or with `trust_forwarded` the
-    /// last `X-Forwarded-For` hop). None: no per-client limit.
-    pub max_unfunded_per_client: Option<usize>,
-    /// Take the client from the last `X-Forwarded-For` hop (behind a reverse proxy that sets it).
+    /// Not used since AGP-091: issuing an invoice stores nothing, so there is no per-client limit
+    /// and no client to tell apart. Kept so configurations that set it still build.
     pub trust_forwarded: bool,
 }
 
@@ -174,9 +211,9 @@ impl WorkConfig {
     pub fn new(network: &str, identity: &str, prime_id: u32, prime_pubkey_hex: &str, receipt_url: &str) -> Self {
         Self { network: network.into(), identity: canonical_identity(identity), prime_id, prime_pubkey_hex: prime_pubkey_hex.into(),
                receipt_url: receipt_url.into(), relay_url: None, amount: Amount::Fixed(1), invoice_price_sats: 0,
-               invoice_ttl_secs: 3600, max_unfunded: 10_000, max_timeout_secs: 3600, state_path: None, caps: CreditCaps::default(),
+               invoice_ttl_secs: 3600, max_timeout_secs: 3600, state_path: None, caps: CreditCaps::default(), cap_rule: None,
                max_owed_carry_sats: None, carry_growth_blocks: None, max_unpaid_blocks: None, nta: false, terms: PrimeTerms::default(), invoice_grace_secs: 3600,
-               max_unfunded_per_client: Some(16), trust_forwarded: false }
+               trust_forwarded: false }
     }
 
     /// The settings `xbt-work-provider` runs with when no flag is set, at the node's tip (`bits`,
@@ -187,6 +224,7 @@ impl WorkConfig {
         self.invoice_price_sats = price_sats;
         self.amount = Amount::Priced(Pricing { price_sats, bits, block_value_sats, fee_bps: self.terms.fee_bps, haircut_bps: SHIPPED_HAIRCUT_BPS });
         self.caps = Caps::SHIPPED.at(bits, block_value_sats, price_sats);
+        self.cap_rule = Some(Caps::SHIPPED);
         self.max_owed_carry_sats = Some(price_sats.saturating_mul(SHIPPED_MAX_CARRY_CALLS));
         self
     }
@@ -195,6 +233,8 @@ impl WorkConfig {
 /// Audited blocks deeper than this below the newest one are settled ([`ReceiptBook::settle`]).
 pub const SETTLE_DEPTH: u32 = 144;
 
+/// What the provider keeps for an invoice. A record exists only once the book has seen a receipt
+/// the Prime signed for the invoice (or the operator retired it): issuing one stores nothing.
 #[derive(Debug, Clone)]
 struct Invoice {
     key: [u8; 32],
@@ -203,12 +243,95 @@ struct Invoice {
     spent: u64,
     expires_at: u64,
     retired: bool,
-    /// Who asked for it (the per-client limit; not persisted).
-    client: Option<String>,
+}
+
+/// An invoice identifier this provider issued, read back from the identifier alone (AGP-091).
+///
+/// The rule: **issuing an invoice costs the provider no state**, so no number of requests, from
+/// one address or from many, can use up issuance or push another payer's invoice out. The 16 bytes
+/// of §4.1 are `expires_at` (4, big-endian seconds), a random nonce (8) and a tag (4):
+/// `HMAC-SHA256(secret, "xbt-work/invoice-id|" expires_at nonce)[..4]`. The invoice's `authKey` is
+/// `HMAC-SHA256(secret, "xbt-work/invoice-key|" invoice)`. The secret never leaves the provider's
+/// state. The tag only tells an identifier of this provider from a stranger's (`unknown_invoice`
+/// before `bad_auth`); what authenticates a call is the `authKey`.
+struct Issued {
+    expires_at: u64,
+    key: [u8; 32],
+}
+
+/// How many invoices not yet seen in a receipt the relay pull asks for.
+pub const PULL_NEW: usize = 64;
+
+const B32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+
+/// The 16 bytes behind a §4.1 identifier in the form [`crate::grammar::new_invoice`] writes.
+fn invoice_bytes(invoice: &str) -> Option<[u8; 16]> {
+    if invoice.len() != 26 {
+        return None;
+    }
+    let (mut out, mut acc, mut bits, mut at) = ([0u8; 16], 0u32, 0u32, 0usize);
+    for c in invoice.bytes() {
+        acc = (acc << 5) | u32::try_from(B32.iter().position(|&x| x == c)?).ok()?;
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            *out.get_mut(at)? = (acc >> bits) as u8;
+            at += 1;
+            acc &= (1 << bits) - 1;
+        }
+    }
+    // 26 characters carry 130 bits: the last two are padding and must be zero (one spelling per id)
+    (at == 16 && acc == 0).then_some(out)
+}
+
+fn hmac32(secret: &[u8; 32], label: &str, data: &[u8]) -> [u8; 32] {
+    let mut m = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC takes any key length");
+    m.update(label.as_bytes());
+    m.update(data);
+    m.finalize().into_bytes().into()
+}
+
+impl Issued {
+    const ID: &'static str = "xbt-work/invoice-id|";
+    const KEY: &'static str = "xbt-work/invoice-key|";
+
+    /// A fresh identifier that expires at `expires_at`, and its `authKey`.
+    fn new(secret: &[u8; 32], expires_at: u64) -> (String, Self) {
+        let mut b = [0u8; 16];
+        // the identifier holds 32 bits of seconds: later than 2106 is written as 2106
+        b[..4].copy_from_slice(&u32::try_from(expires_at).unwrap_or(u32::MAX).to_be_bytes());
+        getrandom::getrandom(&mut b[4..12]).expect("OS randomness");
+        let tag = hmac32(secret, Self::ID, &b[..12]);
+        b[12..].copy_from_slice(&tag[..4]);
+        let id = new_invoice(&b);
+        let key = hmac32(secret, Self::KEY, id.as_bytes());
+        (id, Self { expires_at: u64::from(u32::from_be_bytes([b[0], b[1], b[2], b[3]])), key })
+    }
+
+    /// Read an identifier back: None when this provider's secret did not issue it.
+    fn read(secret: &[u8; 32], invoice: &str) -> Option<Self> {
+        let b = invoice_bytes(invoice)?;
+        let tag = hmac32(secret, Self::ID, &b[..12]);
+        if !tag_eq(&hex::encode(&tag[..4]), &hex::encode(&b[12..])) {
+            return None;
+        }
+        Some(Self { expires_at: u64::from(u32::from_be_bytes([b[0], b[1], b[2], b[3]])), key: hmac32(secret, Self::KEY, invoice.as_bytes()) })
+    }
+
+    fn record(&self) -> Invoice {
+        Invoice { key: self.key, n: 0, spent: 0, expires_at: self.expires_at, retired: false }
+    }
 }
 
 struct State {
+    /// The secret invoices are issued under (`Issued`); kept in the state file.
+    secret: [u8; 32],
     invoices: HashMap<String, Invoice>,
+    /// The newest invoices issued and not seen in a receipt yet, (invoice, expires_at): the relay
+    /// pull asks for them too. At most [`PULL_NEW`], in memory only, the oldest dropped first. No
+    /// invoice depends on being here: one that is dropped is credited when its payer presents a
+    /// receipt, as it would be after a restart.
+    new: VecDeque<(String, u64)>,
     book: ReceiptBook,
     carry: CarryLedger,
     audits: Vec<Value>,
@@ -218,27 +341,41 @@ struct State {
     /// AGP-084: the run of blocks, since a coinbase last paid for credit, that paid the identity
     /// nothing and had no usable statement while credit was unpaid.
     unpaid: Option<UnpaidRun>,
+    /// The next height the audit walk ([`crate::walk::Walk`]) has not passed yet: kept so a
+    /// provider that was down does not skip the blocks in between.
+    audit_next: Option<u32>,
 }
 
-/// Blocks `from..=to` of which `count` paid the identity nothing with no statement the audit could
-/// run on (`refused` of them had one it refused). They carry no verdict: the provider cannot tell
-/// the Prime's block from another pool's.
+/// Blocks `from..=to` of which `count` had no statement the Prime signed for them that the audit
+/// could run on (`refused` of them had one it refused), so nothing they paid covered credit. They
+/// carry no verdict: the provider cannot tell the Prime's block from another pool's, whatever the
+/// coinbase paid the identity (`paid_sats` in all: anyone can pay an address).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct UnpaidRun {
     from: u32,
     to: u32,
     count: u32,
     refused: u32,
+    paid_sats: u64,
 }
 
 impl UnpaidRun {
     fn to_json(self) -> Value {
-        obj([("from", self.from.into()), ("to", self.to.into()), ("count", self.count.into()), ("refused", self.refused.into())])
+        let mut v = obj([("from", self.from.into()), ("to", self.to.into()), ("count", self.count.into()), ("refused", self.refused.into())]);
+        if self.paid_sats > 0 {
+            v["paidSats"] = self.paid_sats.into();
+        }
+        v
     }
 
     fn from_json(v: &Value) -> Option<Self> {
         let n = |k: &str| v.get(k).and_then(Value::as_u64).and_then(|x| u32::try_from(x).ok());
-        Some(Self { from: n("from")?, to: n("to")?, count: n("count")?, refused: n("refused")? })
+        // absent in state written before AGP-091 (such a block then failed the audit): none
+        let paid_sats = match v.get("paidSats") {
+            None => 0,
+            Some(p) => p.as_u64()?,
+        };
+        Some(Self { from: n("from")?, to: n("to")?, count: n("count")?, refused: n("refused")?, paid_sats })
     }
 }
 
@@ -259,10 +396,15 @@ pub struct WorkProvider {
     writer: Mutex<u64>,
 }
 
-/// A window statement for a block, or the Prime's answer that it has none.
+/// A window statement for a block, the Prime's answer that it has none, or no usable answer.
 pub enum Statement<'a> {
     Found(&'a SignedWindow, &'a [SignedDeferral]),
+    /// The Prime answered that it has no statement for the block (404).
     Missing,
+    /// The Prime gave no answer a statement could be read from (an error status, a body that is
+    /// no statement, no connection). For the audit it is a block with no statement; the audit walk
+    /// asks again ([`crate::walk::Walk`]).
+    Unavailable,
 }
 
 /// The codes [`WorkProvider::audit`] refuses a statement with (the statement is at fault, not the
@@ -287,6 +429,40 @@ pub fn window_statement(t: &dyn Transport, window_url: &str, height: u32) -> Res
     Ok(Some((w, d, doc)))
 }
 
+/// The admin token kept in `path`: read, or made (32 random bytes in hex, mode 0600) when the
+/// file does not exist. A file that is there and holds no token is an error, never a new token.
+pub fn admin_token(path: &std::path::Path) -> Result<String> {
+    let io = |e: std::io::Error| WorkError::new("state_io", format!("{}: {e}", path.display()));
+    match std::fs::read_to_string(path) {
+        Ok(t) if t.trim().len() >= 32 && t.trim().bytes().all(|b| b.is_ascii_graphic()) => Ok(t.trim().to_string()),
+        Ok(_) => fail("bad_config", format!("{}: not an admin token (at least 32 printable characters)", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let t = hex::encode(random32());
+            crate::fsx::write_private(path, format!("{t}\n").as_bytes()).map_err(io)?;
+            Ok(t)
+        }
+        Err(e) => Err(io(e)),
+    }
+}
+
+/// Whether a request may use the admin endpoints (AGP-091).
+///
+/// The rule: **an admin request proves it comes from the operator by carrying the admin token**
+/// (`Authorization: Bearer <token>`, the token a file only the operator's account reads). Where
+/// the request came from proves nothing: `xbt-work-provider` listens on loopback, so behind a
+/// proxy on the same host every client on the internet is a loopback peer, and that was the only
+/// check. The peer must still be loopback as well (`peer` is the address the server saw).
+pub fn admin_request(headers: &[(String, String)], peer: Option<&str>, token: &str) -> bool {
+    let local = peer.and_then(|p| p.parse::<std::net::IpAddr>().ok()).is_some_and(|ip| ip.is_loopback());
+    let given: Vec<&str> = headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case("Authorization")).map(|(_, v)| v.as_str()).collect();
+    // exactly one Authorization header, and it is ours
+    let bearer = match given.as_slice() {
+        [one] => one.strip_prefix("Bearer ").unwrap_or(""),
+        _ => "",
+    };
+    local && token.len() >= 32 && tag_eq(bearer, token)
+}
+
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -298,7 +474,7 @@ fn random32() -> [u8; 32] {
 }
 
 impl WorkProvider {
-    pub fn new(cfg: WorkConfig) -> Result<Self> {
+    pub fn new(mut cfg: WorkConfig) -> Result<Self> {
         if !valid_identity(&cfg.identity) {
             return fail("bad_config", "identity outside the grammar (§4.2)");
         }
@@ -313,9 +489,18 @@ impl WorkProvider {
         let mut book = ReceiptBook::new(&cfg.identity, pubkey, cfg.prime_id);
         book.caps = cfg.caps;
         cfg.terms.bounds(&ChainBlock { height: 0, hash: String::new(), value_sats: 0, paid_sats: 0, bits: 0x1d00ffff, prev_bits: 0x1d00ffff })?;
-        let st = State { invoices: HashMap::new(), book, carry: CarryLedger::default(), audits: vec![], distrust: None, unpaid: None };
+        if let Some(rule) = &cfg.cap_rule {
+            cfg.caps = rule.under(&cfg.amount, cfg.invoice_price_sats);
+            book.caps = cfg.caps;
+        }
+        let st = State { secret: random32(), invoices: HashMap::new(), new: VecDeque::new(), book, carry: CarryLedger::default(), audits: vec![], distrust: None, unpaid: None,
+                         audit_next: None };
         let wp = Self { pubkey, rule: Mutex::new(cfg.amount.clone()), state: Mutex::new(st), generation: AtomicU64::new(0), writer: Mutex::new(0), cfg };
-        wp.load()?;
+        // a state file that holds no secret yet (none, or one from before AGP-091) gets this one
+        // now: an invoice issued before the first save must still be known after a restart
+        if !wp.load()? {
+            wp.save(&wp.lock())?;
+        }
         wp.carry_rules(&mut wp.lock());
         Ok(wp)
     }
@@ -365,15 +550,32 @@ impl WorkProvider {
     /// A new epoch (§6.3): re-price new 402s at `bits` and `block_value_sats`. Balances are kept
     /// in work units and never revalued. Returns whether the price inputs changed.
     pub fn set_epoch(&self, bits: u32, block_value_sats: u64) -> bool {
-        let mut r = self.rule.lock().unwrap_or_else(|p| p.into_inner());
-        match &mut *r {
-            Amount::Priced(p) if (p.bits, p.block_value_sats) != (bits, block_value_sats) => {
-                p.bits = bits;
-                p.block_value_sats = block_value_sats;
-                true
+        let rule = {
+            let mut r = self.rule.lock().unwrap_or_else(|p| p.into_inner());
+            match &mut *r {
+                Amount::Priced(p) if (p.bits, p.block_value_sats) != (bits, block_value_sats) => {
+                    p.bits = bits;
+                    p.block_value_sats = block_value_sats;
+                    r.clone()
+                }
+                _ => return false,
             }
-            _ => false,
+        };
+        // caps set in calls or sats follow the price (AGP-091: derived here, from the rule in force)
+        if let Some(caps) = &self.cfg.cap_rule {
+            let mut st = self.lock();
+            st.book.caps = caps.under(&rule, self.cfg.invoice_price_sats);
+            st.book.release_held();
+            // caps are configuration, derived again at the next start; held work the new caps
+            // admit is credited again then if this write fails
+            let _ = self.save(&st);
         }
+        true
+    }
+
+    /// The caps on unaudited credit in force, in work units.
+    pub fn caps(&self) -> CreditCaps {
+        self.lock().book.caps
     }
 
     /// The pricing rule in force.
@@ -411,47 +613,20 @@ impl WorkProvider {
         v
     }
 
-    /// §4.5: issue an invoice. `too_many_invoices` beyond the bound of unfunded ones.
+    /// §4.5: issue an invoice. Nothing is written and no record is kept (`Issued`): the
+    /// identifier carries its expiry and the provider derives the `authKey` again when a call
+    /// presents it, so issuance cannot be used up and no invoice is ever pushed out for another
+    /// (AGP-091). The newest [`PULL_NEW`] are remembered for the relay pull, nothing more.
     pub fn issue_invoice(&self) -> Result<Value> {
-        self.issue_invoice_for(None)
-    }
-
-    /// Issue an invoice to `client` (see [`WorkConfig::max_unfunded_per_client`]).
-    pub fn issue_invoice_for(&self, client: Option<&str>) -> Result<Value> {
         let amount = self.amount(self.cfg.invoice_price_sats)?;
-        let (inv, key, exp) = {
-            let mut st = self.lock();
-            let t = now();
-            let grace = self.cfg.invoice_grace_secs;
-            let State { invoices, book, .. } = &mut *st;
-            invoices.retain(|k, v| book.funded(k) || v.expires_at.saturating_add(grace) >= t);
-            let mut unfunded: Vec<(u64, String)> = invoices.iter().filter(|(k, _)| !book.funded(k)).map(|(k, v)| (v.expires_at, k.clone())).collect();
-            if unfunded.len() >= self.cfg.max_unfunded {
-                // make room from the dormant ones, oldest first; live ones are never evicted
-                unfunded.sort();
-                let excess = unfunded.len() + 1 - self.cfg.max_unfunded.max(1);
-                let dormant: Vec<String> = unfunded.iter().take_while(|(e, _)| *e < t).take(excess).map(|(_, k)| k.clone()).collect();
-                if dormant.len() < excess {
-                    return fail("too_many_invoices", "");
-                }
-                for k in dormant {
-                    invoices.remove(&k);
-                }
-            }
-            if let (Some(c), Some(max)) = (client, self.cfg.max_unfunded_per_client) {
-                let mine = invoices.iter().filter(|(k, v)| v.client.as_deref() == Some(c) && v.expires_at >= t && !book.funded(k)).count();
-                if mine >= max {
-                    return fail("too_many_invoices", "this client holds its limit of unfunded invoices");
-                }
-            }
-            let inv = random_invoice();
-            let (key, exp) = (random32(), t + self.cfg.invoice_ttl_secs);
-            invoices.insert(inv.clone(), Invoice { key, n: 0, spent: 0, expires_at: exp, retired: false, client: client.map(str::to_string) });
-            let snap = self.snapshot(&st);
-            drop(st);
-            self.write(snap)?;
-            (inv, key, exp)
-        };
+        let mut st = self.lock();
+        let (inv, issued) = Issued::new(&st.secret, now().saturating_add(self.cfg.invoice_ttl_secs));
+        if st.new.len() >= PULL_NEW {
+            st.new.pop_front();
+        }
+        st.new.push_back((inv.clone(), issued.expires_at));
+        drop(st);
+        let (key, exp) = (issued.key, issued.expires_at);
         let id = &self.cfg.identity;
         let mut doc = obj([("invoice", inv.clone().into()), ("identity", id.clone().into()), ("network", self.cfg.network.clone().into()),
                            ("username", format!("{id}.pw-{inv}.<worker>").into()), ("usernameAlt", format!("{id}~{inv}.<worker>").into()),
@@ -467,6 +642,11 @@ impl WorkProvider {
     /// Retire an invoice: its balance can no longer be spent (§9.1 step 4).
     pub fn retire(&self, invoice: &str) -> Result<()> {
         let mut st = self.lock();
+        if !st.invoices.contains_key(invoice) {
+            // issued and not seen yet: the record is what remembers that it is retired
+            let Some(issued) = Issued::read(&st.secret, invoice) else { return Ok(()) };
+            st.invoices.insert(invoice.to_string(), issued.record());
+        }
         if let Some(i) = st.invoices.get_mut(invoice) {
             i.retired = true;
         }
@@ -480,14 +660,18 @@ impl WorkProvider {
         Some((st.book.credited.get(invoice).copied().unwrap_or(0), i.spent))
     }
 
-    /// The invoices receipts are pulled for: funded, or unfunded and not past TTL plus grace.
+    /// The invoices receipts are pulled for: those with a record (funded, or unfunded and not
+    /// past TTL plus grace), and the newest [`PULL_NEW`] issued that no receipt was seen for yet.
+    /// An invoice in neither set is credited when its payer presents a receipt.
     pub fn invoices(&self) -> Vec<String> {
         let st = self.lock();
         let t = now();
         let grace = self.cfg.invoice_grace_secs;
         let mut v: Vec<String> = st.invoices.iter()
             .filter(|(k, i)| !i.retired && (st.book.credited.contains_key(*k) || st.book.funded(k) || i.expires_at.saturating_add(grace) >= t))
-            .map(|(k, _)| k.clone()).collect();
+            .map(|(k, _)| k.clone())
+            .chain(st.new.iter().filter(|(k, e)| !st.invoices.contains_key(k) && e.saturating_add(grace) >= t).map(|(k, _)| k.clone()))
+            .collect();
         v.sort();
         v
     }
@@ -500,10 +684,23 @@ impl WorkProvider {
     /// Offer a receipt to the book (from the relay, the Prime, or a payer): the newly credited work.
     pub fn accept(&self, s: &Signed) -> Result<u64> {
         let mut st = self.lock();
-        if !st.invoices.contains_key(&s.receipt.invoice) {
-            return fail("unknown_invoice", "not an invoice this provider issued");
+        let invoice = s.receipt.invoice.clone();
+        let issued = match st.invoices.contains_key(&invoice) {
+            true => None,
+            // issued here and not yet seen: as at a call, not past its TTL and grace
+            false => Some(Issued::read(&st.secret, &invoice).filter(|i| i.expires_at.saturating_add(self.cfg.invoice_grace_secs) >= now())
+                              .ok_or_else(|| WorkError::new("unknown_invoice", "not an invoice this provider issued, or one that expired with no work on it"))?),
+        };
+        if issued.is_some() && s.receipt.cum_work == 0 {
+            // no work yet: nothing to credit and nothing to keep
+            return if s.verify(&self.pubkey) { Ok(0) } else { fail("bad_sig", "not signed by the pinned Prime key") };
         }
-        let r = st.book.accept(s, &s.receipt.invoice.clone());
+        let r = st.book.accept(s, &invoice);
+        if let (Some(issued), Ok(_)) = (issued, &r) {
+            // the Prime signed work for it: from here on the invoice has a record
+            st.new.retain(|(k, _)| *k != invoice);
+            st.invoices.insert(invoice, issued.record());
+        }
         let snap = self.snapshot(&st);
         drop(st);
         self.write(snap)?;
@@ -581,8 +778,18 @@ impl WorkProvider {
         }
         let paid_for = if o.ok { paid_for } else { 0 };
         let covered = st.book.pay(h, paid_for);
-        if paid_for > 0 {
-            // a coinbase paid for credit: the run of unpaid blocks ends here (AGP-084)
+        // The run of unpaid blocks (AGP-084) ends when no credit is unpaid, or at a block the Prime
+        // paid in full for all of it: the audit passed on what the coinbase itself paid (no
+        // deferral line, no `min_payout` clause), and the statement's window holds at least the
+        // credit still unpaid, so `expected` was the block's share of all of it. A passing block
+        // that paid 1 sat under a window moved past the credit is not "the Prime pays again": it
+        // leaves the run, and the stop it set, as they were (AGP-091).
+        let left = st.book.unaudited_work(None);
+        let paid_in_full = o.ok && o.expected_sats > 0 && block.paid_sats.saturating_add(TOLERANCE) >= o.expected_sats;
+        // and only a block above the run ends it: an older block audited again (a restart walks
+        // the last blocks again) paid before the run began
+        let after_run = st.unpaid.is_none_or(|u| h > u.to);
+        if left == 0 || (paid_in_full && after_run && o.proven_work >= left) {
             st.unpaid = None;
         }
         self.carry_rules(&mut st);
@@ -599,17 +806,25 @@ impl WorkProvider {
         Ok(o)
     }
 
-    /// Audit `block` whether or not the Prime published a usable statement for it (review P4). A
-    /// statement the audit refuses ([`STATEMENT_REFUSALS`]) is the block having no statement, so
-    /// garbage is never treated more gently than silence (AGP-079). With no statement, a coinbase
-    /// that paid the identity fails the audit (the Prime paid as the pool but will not say for
-    /// what) and distrusts the Prime; one that paid nothing has no verdict (the provider cannot
-    /// tell a pool block from another pool's) and covers nothing: its credit stays unaudited,
-    /// inside the caps, until some coinbase pays for it. Returns None for that case. While credit
-    /// is unpaid such a block is counted (AGP-084: the report's `unpaidBlocks`, and
-    /// [`WorkConfig::max_unpaid_blocks`]). The exception is a refused statement that verified
-    /// under the pinned key for this Prime and this block (`SIGNED_FOR_THE_BLOCK`): the Prime
-    /// says the block is its own, so it fails the audit and distrusts the Prime whatever it paid.
+    /// Audit `block` whether or not the Prime published a usable statement for it (review P4).
+    ///
+    /// The rule (AGP-091): **the Prime is failed only on what the Prime signed for this block.**
+    /// A verdict needs a statement that verifies under the pinned key for this Prime and names
+    /// this block and height: one the audit runs on ([`WorkProvider::audit`]), or one it then
+    /// refuses (`SIGNED_FOR_THE_BLOCK`), which fails and distrusts the Prime whatever the coinbase
+    /// paid. Everything else is the block having no statement: none at all, one for another block
+    /// or height, one under another key, an answer that is no statement
+    /// ([`Statement::Unavailable`]). Such a block has no verdict and covers nothing, **whatever its
+    /// coinbase paid the identity**: the identity is public (`payTo` of every 402) and anyone who
+    /// mines a block can put an output to it in their own coinbase, so a payment says nothing
+    /// about whose block it is. Before, a paid block with no statement failed the audit, and one
+    /// sat in a stranger's coinbase distrusted an honest Prime for good.
+    ///
+    /// A Prime gains nothing by it: a block it pays in and gives no statement for covers nothing,
+    /// which is less than the same block with an honest statement, and the credit stays unaudited,
+    /// inside the caps, until some coinbase pays for it under a statement. Returns None for the
+    /// block with no verdict. While credit is unpaid such a block is counted (AGP-084: the
+    /// report's `unpaidBlocks`, and [`WorkConfig::max_unpaid_blocks`]).
     pub fn audit_chain(&self, block: &ChainBlock, stmt: Statement<'_>) -> Result<Option<AuditOutcome>> {
         let refused = match stmt {
             Statement::Found(sw, deferred) => match self.audit(sw, deferred, block) {
@@ -617,29 +832,20 @@ impl WorkProvider {
                 Err(e) if STATEMENT_REFUSALS.contains(&e.code.as_str()) => Some(e),
                 Err(e) => return Err(e),
             },
-            Statement::Missing => None,
+            Statement::Missing | Statement::Unavailable => None,
         };
-        let signed = refused.as_ref().is_some_and(|e| SIGNED_FOR_THE_BLOCK.contains(&e.code.as_str()));
-        if block.paid_sats == 0 && !signed {
-            self.unpaid_block(block.height, refused.is_some())?;
+        let Some(e) = refused.as_ref().filter(|e| SIGNED_FOR_THE_BLOCK.contains(&e.code.as_str())) else {
+            self.unstated_block(block, refused.is_some())?;
             return Ok(None);
-        }
+        };
         let mut st = self.lock();
         let mut rec = obj([("height", block.height.into()), ("blockHash", block.hash.clone().into()), ("ok", false.into()),
                            ("paidSats", block.paid_sats.into())]);
-        let (code, why) = match &refused {
-            Some(e) => {
-                rec["refusedStatement"] = e.to_string().into();
-                let paid = if block.paid_sats == 0 { "paid the identity nothing" } else { "paid the identity" };
-                ("refused_statement", format!("the coinbase at height {} {paid} under a window statement the audit refuses: {e}", block.height))
-            }
-            None => {
-                rec["missingStatement"] = true.into();
-                ("missing_statement", format!("the coinbase at height {} paid the identity with no window statement", block.height))
-            }
-        };
+        rec["refusedStatement"] = e.to_string().into();
+        let paid = if block.paid_sats == 0 { "paid the identity nothing" } else { "paid the identity" };
         if st.distrust.is_none() {
-            st.distrust = Some((code.into(), why));
+            st.distrust = Some(("refused_statement".into(),
+                                format!("the coinbase at height {} {paid} under a window statement the Prime signed for it and the audit refuses: {e}", block.height)));
         }
         st.carry.forget(block.height);
         st.book.pay(block.height, 0);
@@ -649,14 +855,25 @@ impl WorkProvider {
                                window_work: 0, fee_bps: 0, min_payout: 0, bounded: false, proof: None }))
     }
 
-    /// Count a block that paid the identity nothing and had no statement the audit could run on
-    /// (AGP-084). Only while credit is unpaid: with nothing owed it is nobody's debt. A height at
-    /// or below the run's last one was counted already (the audit walks a range again after a node
-    /// error, and the admin audit takes any range).
-    fn unpaid_block(&self, height: u32, refused: bool) -> Result<()> {
+    /// A block with no statement the Prime signed for it: no verdict, and nothing it paid covers
+    /// credit. An audit recorded at that height for another block (the chain moved under it) is
+    /// undone; one recorded for this block stands (the Prime signed it and the audit ran on it).
+    /// Counted (AGP-084) only while credit is unpaid: with nothing owed it is nobody's debt. A
+    /// height at or below the run's last one was counted already (the audit walks a range again
+    /// after a node error, asks again for a statement it could not get, and the admin audit takes
+    /// any range).
+    fn unstated_block(&self, block: &ChainBlock, refused: bool) -> Result<()> {
         let mut st = self.lock();
+        let height = block.height;
+        let stale = st.audits.iter().any(|a| a.get("height").and_then(Value::as_u64) == Some(u64::from(height))
+                                         && a.get("blockHash").and_then(Value::as_str) != Some(block.hash.as_str()));
+        if stale {
+            st.audits.retain(|a| a.get("height").and_then(Value::as_u64) != Some(u64::from(height)));
+            st.carry.forget(height);
+            st.book.uncover(height);
+        }
         if st.book.unaudited_work(None) == 0 {
-            if st.unpaid.take().is_some() {
+            if st.unpaid.take().is_some() || stale {
                 self.carry_rules(&mut st);
                 st.book.release_held();
                 self.save(&st)?;
@@ -664,9 +881,16 @@ impl WorkProvider {
             return Ok(());
         }
         let run = match st.unpaid {
-            Some(u) if height <= u.to => return Ok(()),
-            Some(u) => UnpaidRun { to: height, count: u.count.saturating_add(1), refused: u.refused.saturating_add(u32::from(refused)), ..u },
-            None => UnpaidRun { from: height, to: height, count: 1, refused: u32::from(refused) },
+            Some(u) if height <= u.to => {
+                if stale {
+                    self.carry_rules(&mut st);
+                    self.save(&st)?;
+                }
+                return Ok(());
+            }
+            Some(u) => UnpaidRun { to: height, count: u.count.saturating_add(1), refused: u.refused.saturating_add(u32::from(refused)),
+                                   paid_sats: u.paid_sats.saturating_add(block.paid_sats), ..u },
+            None => UnpaidRun { from: height, to: height, count: 1, refused: u32::from(refused), paid_sats: block.paid_sats },
         };
         st.unpaid = Some(run);
         self.carry_rules(&mut st);
@@ -784,14 +1008,18 @@ impl WorkProvider {
                        ("carry", obj([("deferred", st.carry.deferred_total.into()), ("released", st.carry.released_total.into()),
                                       ("blocks", st.carry.blocks.iter().map(|(h, e, p, d)| Value::from(vec![Value::from(*h), Value::from(*e), Value::from(*p), Value::from(*d)])).collect::<Vec<_>>().into())])),
                        ("distrust", st.distrust.as_ref().map(|(c, m)| Value::from(vec![c.clone(), m.clone()])).unwrap_or(Value::Null)),
-                       ("unpaid", st.unpaid.map(UnpaidRun::to_json).unwrap_or(Value::Null))])
+                       ("unpaid", st.unpaid.map(UnpaidRun::to_json).unwrap_or(Value::Null)),
+                       ("invoiceSecret", hex::encode(st.secret).into()),
+                       ("auditNext", st.audit_next.map(Value::from).unwrap_or(Value::Null))])
     }
 
-    fn load(&self) -> Result<()> {
-        let Some(path) = &self.cfg.state_path else { return Ok(()) };
+    /// Read the state file. Returns whether it held the invoice secret (false: no file, or one
+    /// written before AGP-091, and the secret made at start has to be written).
+    fn load(&self) -> Result<bool> {
+        let Some(path) = &self.cfg.state_path else { return Ok(true) };
         let raw = match std::fs::read(path) {
             Ok(raw) => raw,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(WorkError::new("state_io", e.to_string())),
         };
         let bad = |w: &str| WorkError::new("bad_state", w.to_string());
@@ -810,8 +1038,20 @@ impl WorkProvider {
                 .ok_or_else(|| bad("invoice key"))?;
             let u = |f: &str| i.get(f).and_then(Value::as_u64).ok_or_else(|| bad(f));
             st.invoices.insert(k.clone(), Invoice { key, n: u("n")?, spent: u("spent")?, expires_at: u("expiresAt")?,
-                                                   retired: i.get("retired").and_then(Value::as_bool).unwrap_or(false), client: None });
+                                                   retired: i.get("retired").and_then(Value::as_bool).unwrap_or(false) });
         }
+        // absent in state written before AGP-091: the secret made at start; present, it must read
+        let secret = match v.get("invoiceSecret") {
+            None => None,
+            Some(h) => Some(h.as_str().and_then(|h| hex::decode(h).ok()).and_then(|b| <[u8; 32]>::try_from(b).ok()).ok_or_else(|| bad("invoiceSecret"))?),
+        };
+        if let Some(k) = secret {
+            st.secret = k;
+        }
+        st.audit_next = match v.get("auditNext") {
+            None | Some(Value::Null) => None,
+            Some(n) => Some(n.as_u64().and_then(|n| u32::try_from(n).ok()).ok_or_else(|| bad("auditNext"))?),
+        };
         if let Some(b) = v.get("book") {
             st.book.load(b)?;
         }
@@ -834,8 +1074,28 @@ impl WorkProvider {
             None | Some(Value::Null) => None,
             Some(u) => Some(UnpaidRun::from_json(u).ok_or_else(|| bad("unpaid"))?),
         };
+        // invoices kept before AGP-091 that never saw work and are past TTL and grace: gone, as
+        // an issuance would have dropped them
+        let (t, grace) = (now(), self.cfg.invoice_grace_secs);
+        let State { invoices, book, .. } = &mut *st;
+        invoices.retain(|k, i| i.retired || book.funded(k) || book.last.contains_key(k) || i.expires_at.saturating_add(grace) >= t);
         self.carry_rules(&mut st);
-        Ok(())
+        Ok(secret.is_some())
+    }
+
+    /// Where the audit walk stands: the next height it has not passed, if it ever ran.
+    pub fn audit_position(&self) -> Option<u32> {
+        self.lock().audit_next
+    }
+
+    /// Keep the audit walk's position (written with the state).
+    pub fn set_audit_position(&self, next: u32) -> Result<()> {
+        let mut st = self.lock();
+        if st.audit_next == Some(next) {
+            return Ok(());
+        }
+        st.audit_next = Some(next);
+        self.save(&st)
     }
 
     // --- §9.1 ----------------------------------------------------------------------------------
@@ -869,28 +1129,58 @@ impl WorkProvider {
         }
         let mut st = self.lock();
         let t = now();
-        let State { invoices, book, .. } = &mut *st;
         // 4. issued here, not expired (unfunded), not retired; a dormant invoice (past TTL, within
-        // the grace) is live again once a receipt shows work on it
-        let funded = book.funded(&r.invoice) || r.cum_work > 0;
+        // the grace) is live again once a receipt shows work on it. An invoice with no record yet
+        // is read back from its identifier (AGP-091): nothing was stored when it was issued.
+        let had_work = st.book.funded(&r.invoice);
+        let funded = had_work || r.cum_work > 0;
         let grace = self.cfg.invoice_grace_secs;
-        let Some(inv) = invoices.get_mut(&r.invoice).filter(|i| !i.retired && (i.expires_at >= t || (funded && i.expires_at.saturating_add(grace) >= t)
-                                                                                    || book.funded(&r.invoice))) else {
+        let fresh = match st.invoices.contains_key(&r.invoice) {
+            true => None,
+            false => Some(Issued::read(&st.secret, &r.invoice).ok_or_else(|| ("unknown_invoice".to_string(), None))?.record()),
+        };
+        let live = |i: &&Invoice| !i.retired && (i.expires_at >= t || (funded && i.expires_at.saturating_add(grace) >= t) || had_work);
+        let Some((key, last_n)) = fresh.as_ref().or_else(|| st.invoices.get(&r.invoice)).filter(live).map(|i| (i.key, i.n)) else {
             return refuse("unknown_invoice");
         };
         // 5. auth over this request and receipt state, n fresh; n is consumed from here on
         let req = request_digest(method, path, body);
-        let want = auth_tag(&inv.key, &r.invoice, n, r.seq, r.cum_work, &req).unwrap_or_default();
-        if !tag_eq(&want, &auth) || n <= inv.n {
+        let want = auth_tag(&key, &r.invoice, n, r.seq, r.cum_work, &req).unwrap_or_default();
+        if !tag_eq(&want, &auth) || n <= last_n {
             return refuse("bad_auth");
         }
-        inv.n = n;
+        if let Some(fresh) = fresh {
+            // The record is made only by a receipt the Prime signed that shows work: an anonymous
+            // caller cannot make the provider keep anything. Until then nothing can be debited, so
+            // an `n` that is not remembered buys no replay.
+            if st.distrust.is_none() {
+                if !(Signed { receipt: r.clone(), sig }).verify(&self.pubkey) {
+                    return refuse("bad_sig");
+                }
+                if r.cum_work == 0 {
+                    let work = obj([("invoice", r.invoice.clone().into()), ("creditedWork", "0".into()), ("spentWork", "0".into())]);
+                    return Err(("insufficient_work".into(), Some(work)));
+                }
+                st.new.retain(|(k, _)| *k != r.invoice);
+                st.invoices.insert(r.invoice.clone(), fresh);
+            }
+        }
+        let known = match st.invoices.get_mut(&r.invoice) {
+            Some(inv) => {
+                inv.n = n;
+                true
+            }
+            None => false,
+        };
         // a Prime key that equivocated or failed an audit is no longer trusted
         if let Some((code, _)) = &st.distrust {
             let code = code.clone();
-            let snap = self.snapshot(&st);
-            drop(st);
-            let _ = self.write(snap);
+            // an invoice with no record changed nothing: nothing to write
+            if known {
+                let snap = self.snapshot(&st);
+                drop(st);
+                let _ = self.write(snap);
+            }
             return Err((code, None));
         }
         let State { invoices, book, distrust, .. } = &mut *st;
@@ -1014,7 +1304,7 @@ impl ProviderScheme for WorkScheme {
         self.0.amount(price_sats).ok().map(|a| self.0.requirements_for(a, price_sats))
     }
 
-    fn control(&self, method: &str, path: &str, headers: &[(String, String)], _body: &[u8]) -> Option<HttpResponse> {
+    fn control(&self, method: &str, path: &str, _headers: &[(String, String)], _body: &[u8]) -> Option<HttpResponse> {
         if path.split('?').next() != Some(INVOICE_PATH) {
             return None;
         }
@@ -1023,12 +1313,9 @@ impl ProviderScheme for WorkScheme {
         if method != "POST" && method != "GET" {
             return Some(HttpResponse::new(405, vec![], b"method not allowed".to_vec()));
         }
-        let header = |name: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str());
-        let forwarded = header("X-Forwarded-For").and_then(|v| v.rsplit(',').next()).map(str::trim).filter(|v| !v.is_empty());
-        let client = if self.0.cfg.trust_forwarded { forwarded.or(header(PEER_HEADER)) } else { header(PEER_HEADER) };
-        Some(match self.0.issue_invoice_for(client) {
+        // no client is told from another: issuing stores nothing, so there is nothing to ration
+        Some(match self.0.issue_invoice() {
             Ok(doc) => json(200, &doc),
-            Err(e) if e.code == "too_many_invoices" => json(429, &obj([("error", "too_many_invoices".into())])),
             Err(e) => json(500, &obj([("error", e.code.into())])),
         })
     }

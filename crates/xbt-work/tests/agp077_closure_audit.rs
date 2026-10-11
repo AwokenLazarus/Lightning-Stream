@@ -108,9 +108,12 @@ fn p4_a_refused_statement_on_an_underpaid_block_is_a_failed_audit() {
     let sw = k.sign_window(&stmt(110, 100, 0)).unwrap(); // window_work 0: refused as bad_window
     let _ = wp.audit_chain(&block(110, 5), Statement::Found(&sw, &[]));
     assert!(!wp.report()["distrust"].is_null(), "a block that paid 5 sats with a refused statement left no failed audit and no distrust");
-    // control: the same block with no statement does fail
+    // control. AGP-091 changed it: it was "the same block with no statement does fail"
+    // (`!audit_chain(.., Missing).unwrap().unwrap().ok`). With no statement the Prime signed for
+    // the block there is no verdict now, whatever the coinbase paid (the second audit's WORK 1)
     let (_k2, wp2) = world();
-    assert!(!wp2.audit_chain(&block(110, 5), Statement::Missing).unwrap().unwrap().ok);
+    assert!(wp2.audit_chain(&block(110, 5), Statement::Missing).unwrap().is_none());
+    assert!(wp2.report()["distrust"].is_null());
     // and the refused one is a failed audit that covers nothing
     assert_eq!(wp.report()["distrust"]["code"], json!("refused_statement"));
     assert_eq!(wp.exposure().0, 100);
@@ -149,6 +152,17 @@ fn p4_every_refused_statement_on_a_paid_block_distrusts_the_prime() {
             _ => other.sign_window(&stmt(110, 104, 8000)).unwrap(),
         };
         let _ = wp.audit_chain(&block(110, 5), Statement::Found(&sw, &[]));
+        // AGP-091 changed what this asserts for two of the four kinds. It was distrust and a failed
+        // audit for all four. A statement for another block, or under another key, does not bind
+        // the Prime to this block, and the 5 sat do not either (anyone who mines a block can pay
+        // the identity: the second audit's WORK 1): no verdict, counted, nothing covered.
+        if matches!(why, "another block" | "wrong key") {
+            assert!(wp.report()["distrust"].is_null(), "{why}: a statement that does not bind the Prime to the block distrusted it");
+            assert!(!wp.report()["audits"].as_array().unwrap().iter().any(|a| a["height"] == json!(110)), "{why}: a verdict was recorded");
+            assert_eq!(wp.report()["unpaidBlocks"], json!({"from": 110, "to": 110, "count": 1, "refused": 1, "paidSats": 5}), "{why}");
+            assert_eq!(wp.exposure().0, 100, "{why}: it covered credit");
+            continue;
+        }
         assert!(!wp.report()["distrust"].is_null(), "{why}: a paid block with a refused statement left no distrust");
         assert!(wp.report()["audits"].as_array().unwrap().iter().any(|a| a["height"] == json!(110) && a["ok"] == json!(false)), "{why}: no failed audit recorded");
     }

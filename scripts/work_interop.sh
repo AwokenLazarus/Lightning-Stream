@@ -192,7 +192,10 @@ PAUSE=$RUN/pause-miner
 if [ "$PAYER" = rust ]; then
   PAYER_ARGS=(--state "$RUN/payer-work.json" --rpc-port "$RPC_A" --cookie "$COOKIE_A" --window-url "http://127.0.0.1:${STATS}/window" --pause-file "$PAUSE"
               "${PRIME_TERMS[@]}")
-  [ "$PROVIDER" = rust ] && PAYER_ARGS+=(--provider-admin)
+  # AGP-091: the payer names its relay itself (a relayUrl only the invoice names, on another origin, is
+  # refused), and the provider's admin endpoints need the token in its data dir
+  PAYER_ARGS+=(--relay-url "http://127.0.0.1:${RELAY}")
+  [ "$PROVIDER" = rust ] && PAYER_ARGS+=(--provider-admin --provider-admin-token "$RUN/provider-data/admin.token")
   "$T/xbt-work-payer" pay "$BASEURL" "$CALLS" "$((MINER_MAX_SECS - 60))" "${PAYER_ARGS[@]}" >"$RUN/evidence.json" 2>"$RUN/payer.log" & PAYER_PID=$!
 else
   export PWW_RELAY_URL="http://127.0.0.1:${RELAY}" PWW_WINDOW_URL="http://127.0.0.1:${STATS}/window"

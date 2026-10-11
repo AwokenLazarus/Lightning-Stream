@@ -6,9 +6,11 @@
 //! with each request. The provider credits only the increase over the best receipt it holds, and
 //! audits each pool coinbase against the receipts, turning any shortfall into a fraud proof.
 //!
-//! A port of the Python reference (XBT-053 `receipts.py`, `nta.py`, `relay/`, and the xbt-070
-//! coinbase audit), byte-identical to it: the conformance suite rebuilds all of XBT-053's
-//! `vectors.json` and XBT-053's own `check_work_vectors.py` checks the Rust-emitted file.
+//! It began as a port of the Python reference (XBT-053 `receipts.py`, `nta.py`, `relay/`, and the
+//! xbt-070 coinbase audit) and is byte-identical to it on the vectors: the conformance suite
+//! rebuilds all of XBT-053's `vectors.json` and XBT-053's own `check_work_vectors.py` checks the
+//! Rust-emitted file. The provider's rules since (AGP-065, 079, 084, 091: the audit bounds, cover
+//! by coinbase payments, the caps, invoices issued without state) are this crate's only.
 //!
 //! * [`grammar`]: field grammars, invoices (§4.1), identities (§4.2), usernames (§4.3).
 //! * [`receipt`]: the signed receipt line and document (§5), the Prime key.
@@ -23,6 +25,7 @@
 //! * [`provider`]: the `xbt-work` offer beside `xbt-channel` in the xbt402 Provider (§7, §9).
 //! * [`payer`]: the `xbt-work` payer for the xbt402 Client (§8, §9.3).
 //! * [`vectors`]: the vector emitter and conformance checks.
+//! * [`walk`]: the audit walk over every block, which no answer of the Prime's stops (AGP-091).
 //!
 //! Portable: pure Rust (ed25519-dalek, chacha20poly1305) plus libsecp256k1 through
 //! xbt-primitives; no platform-specific dependencies.
@@ -43,6 +46,7 @@ pub mod relay;
 #[cfg(feature = "tools")]
 pub mod tools;
 pub mod vectors;
+pub mod walk;
 
 pub use error::{GrammarError, Result, WorkError};
 

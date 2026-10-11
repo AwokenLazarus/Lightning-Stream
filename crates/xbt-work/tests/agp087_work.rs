@@ -4,6 +4,11 @@
 //! Tests named `holds_*` pass and are evidence that a path is closed. Tests named `limit_*` pass and
 //! pin down a behaviour a reader has to be told about. Tests named `hole_*` state the outcome the
 //! review asked for and FAIL on main f0554d0: each is a finding of this audit. Nothing here is a fix.
+//!
+//! AGP-091 fixed the holes; every `hole_*` test passes unchanged. Two tests here asserted the hole
+//! itself on a neighbouring path and were changed, each with a comment at the changed lines:
+//! `holds_no_answer_to_the_statement_fetch_releases_credit` (its last match arm) and
+//! `limit_distrust_is_for_good` (how the Prime gets distrusted).
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -180,8 +185,13 @@ fn holds_no_answer_to_the_statement_fetch_releases_credit() {
                     assert_eq!(wp.exposure().0, 100 - w, "{why}, paid {paid}");
                 }
                 ("window_work 0", _) => assert!(!o.unwrap().ok && distrusted && wp.exposure().0 == 100, "{why}, paid {paid}"),
-                (_, 0) => assert!(o.is_none() && !distrusted && wp.exposure().0 == 100, "{why}, paid {paid}"),
-                _ => assert!(!o.unwrap().ok && distrusted && wp.exposure().0 == 100, "{why}, paid {paid}"),
+                // AGP-091 changed this arm. It was `(_, 0) =>` with a last arm for a paid block
+                // that asserted `!o.unwrap().ok && distrusted`: no statement, another block's,
+                // another height's or another key's failed the audit when the coinbase paid the
+                // identity. That is this file's own `hole_a_third_partys_coinbase_dust_...` at 50
+                // million sat instead of 1: the amount is the attacker's to choose. What the test
+                // is for holds on both: none of them covers credit.
+                _ => assert!(o.is_none() && !distrusted && wp.exposure().0 == 100, "{why}, paid {paid}"),
             }
         }
     }
@@ -287,13 +297,17 @@ fn limit_distrust_is_for_good() {
     let k = PrimeKey::from_seed(70, &[9u8; 32]);
     let cfg = WorkConfig { state_path: Some(path.clone()), ..config(&k) };
     let wp = WorkProvider::new(cfg.clone()).unwrap();
-    assert!(!wp.audit_chain(&block(110, 600), Statement::Missing).unwrap().unwrap().ok);
+    // AGP-091 changed how this test gets a distrusted Prime, not what it asserts about distrust.
+    // It was `audit_chain(&block(110, 600), Missing)` and the code `missing_statement`; that no
+    // longer distrusts (WORK 1). A statement the Prime signed for the block and the audit refuses does.
+    let garbage = k.sign_window(&stmt(110, 100, 0)).unwrap();
+    assert!(!wp.audit_chain(&block(110, 600), Statement::Found(&garbage, &[])).unwrap().unwrap().ok);
     assert_eq!(wp.orphaned(110).unwrap(), Some(0));
-    assert_eq!(wp.report()["distrust"]["code"], json!("missing_statement"));
+    assert_eq!(wp.report()["distrust"]["code"], json!("refused_statement"));
     assert!(wp.audit(&k.sign_window(&stmt(111, 110, 8400)).unwrap(), &[], &block(111, V / 8)).unwrap().ok);
     drop(wp);
     let again = WorkProvider::new(cfg).unwrap();
-    assert_eq!(again.report()["distrust"]["code"], json!("missing_statement"));
+    assert_eq!(again.report()["distrust"]["code"], json!("refused_statement"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

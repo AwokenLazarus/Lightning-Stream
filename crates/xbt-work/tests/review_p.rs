@@ -133,18 +133,23 @@ fn p4_a_statement_error_is_not_a_missing_statement() {
     assert!(window_statement(&Down(404), "http://prime.test/window", 110).unwrap().is_none());
 }
 
-/// P4: a missing statement is audited too: a coinbase that paid the identity with no statement
-/// fails (and distrusts the Prime); one that paid nothing records nothing and covers nothing.
+/// P4: a missing statement is audited too: the block records no verdict and covers nothing,
+/// whatever its coinbase paid the identity.
+///
+/// AGP-091 changed what this asserts. It was "a coinbase that paid the identity with no statement
+/// fails (and distrusts the Prime)": `audit_chain(&block(111, 600), Missing)` returned a failed
+/// outcome and `distrust.code == "missing_statement"`. That was the second audit's WORK 1: anyone
+/// who mines a block can pay the identity, so the payment does not say the block is the Prime's.
 #[test]
 fn p4_a_missing_statement_fails_or_holds() {
     let (k, wp, inv) = world();
     credit(&k, &wp, &inv, 4, 1000, 101, 103);
     assert!(wp.audit_chain(&block(110, 0), Statement::Missing).unwrap().is_none());
     assert_eq!(wp.exposure().0, 1000);
-    let o = wp.audit_chain(&block(111, 600), Statement::Missing).unwrap().unwrap();
-    assert!(!o.ok);
-    assert_eq!(wp.report()["distrust"]["code"], json!("missing_statement"));
-    assert_eq!(wp.exposure().0, 1000);
+    assert!(wp.audit_chain(&block(111, 600), Statement::Missing).unwrap().is_none());
+    assert!(wp.report()["distrust"].is_null());
+    assert_eq!(wp.exposure().0, 1000, "a payment with no statement covers nothing");
+    assert_eq!(wp.report()["unpaidBlocks"], json!({"from": 110, "to": 111, "count": 2, "refused": 0, "paidSats": 600}));
 }
 
 /// P3: a statement with the real block's hash but another height. height = u32::MAX with
@@ -199,21 +204,25 @@ fn p6_an_invoice_with_work_outlives_its_ttl() {
     std::thread::sleep(std::time::Duration::from_millis(1100));
     gone.issue_invoice().unwrap();
     assert!(!gone.invoices().contains(&inv));
+    // AGP-091 adds: past TTL and grace its work is refused (before, once a later issuance had dropped it)
+    let r = WorkReceipt { seq: 4, cum_work: 1000, shares: 4, first_height: 101, last_height: 103, difficulty: 1, ..WorkReceipt::zero(70, PROV, &inv) };
+    assert_eq!(gone.accept(&k.sign(&r).unwrap()).unwrap_err().code, "unknown_invoice");
 }
 
-/// P6: one client cannot take every unfunded invoice slot; dormant invoices give way to new ones.
+/// P6: no client can take the unfunded invoice slots, because there are none (AGP-091). This test
+/// was `p6_issuance_is_limited_per_client` and asserted `too_many_invoices` for one client's third
+/// invoice under `max_unfunded_per_client: 2`, and that a dormant invoice gave way under
+/// `max_unfunded: 1`. Both limits rationed a table that issuing no longer writes to; see
+/// `agp091_work.rs` for the rule that replaced them.
 #[test]
-fn p6_issuance_is_limited_per_client() {
+fn p6_issuance_is_not_limited_because_it_keeps_nothing() {
     let k = PrimeKey::from_seed(70, &[9u8; 32]);
-    let wp = WorkProvider::new(WorkConfig { max_unfunded_per_client: Some(2), ..config(&k) }).unwrap();
-    wp.issue_invoice_for(Some("10.0.0.1")).unwrap();
-    wp.issue_invoice_for(Some("10.0.0.1")).unwrap();
-    assert_eq!(wp.issue_invoice_for(Some("10.0.0.1")).unwrap_err().code, "too_many_invoices");
-    wp.issue_invoice_for(Some("10.0.0.2")).unwrap();
-    let full = WorkProvider::new(WorkConfig { max_unfunded: 1, invoice_ttl_secs: 0, ..config(&k) }).unwrap();
-    full.issue_invoice().unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(1100));
-    full.issue_invoice().expect("the dormant invoice gives way");
+    let wp = WorkProvider::new(config(&k)).unwrap();
+    for _ in 0..xbt_work::provider::PULL_NEW + 10 {
+        wp.issue_invoice().unwrap();
+    }
+    // nothing but the short list the relay pull asks for
+    assert_eq!(wp.invoices().len(), xbt_work::provider::PULL_NEW);
 }
 
 /// P6: state is written outside the state lock; concurrent writers never leave an older snapshot
@@ -228,7 +237,13 @@ fn p6_concurrent_writes_keep_the_newest_state() {
     let wp = Arc::new(WorkProvider::new(WorkConfig { state_path: Some(path.clone()), ..config(&k) }).unwrap());
     let hs: Vec<_> = (0..8).map(|_| {
         let wp = wp.clone();
-        std::thread::spawn(move || (0..20).map(|_| wp.issue_invoice().unwrap()["invoice"].as_str().unwrap().to_string()).collect::<Vec<_>>())
+        // AGP-091: issuing writes nothing, so each invoice also takes a receipt (the write under test)
+        std::thread::spawn(move || (0..20).map(|_| {
+            let inv = wp.issue_invoice().unwrap()["invoice"].as_str().unwrap().to_string();
+            let r = WorkReceipt { seq: 1, cum_work: 1, shares: 1, first_height: 101, last_height: 102, difficulty: 1, ..WorkReceipt::zero(70, PROV, &inv) };
+            wp.accept(&PrimeKey::from_seed(70, &[9u8; 32]).sign(&r).unwrap()).unwrap();
+            inv
+        }).collect::<Vec<_>>())
     }).collect();
     let issued: Vec<String> = hs.into_iter().flat_map(|h| h.join().unwrap()).collect();
     let again = WorkProvider::new(WorkConfig { state_path: Some(path.clone()), ..config(&k) }).unwrap();
