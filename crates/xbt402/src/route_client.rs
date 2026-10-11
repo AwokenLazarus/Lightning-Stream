@@ -311,6 +311,9 @@ struct Ch1 {
     seq: u64,
     /// The hub answered our open (false: funded and attached, the open not confirmed yet).
     opened: bool,
+    /// AGP-094: the signer has bound ch1 to its key (`attach`) and signed its refund. Recorded,
+    /// so a later `open` neither skips the attach nor asks for it twice.
+    attached: bool,
 }
 
 #[derive(Default)]
@@ -375,7 +378,9 @@ impl RoutePayer {
                 }
                 st.ch = Some(Ch1 { params: ChannelParams::from_json(c.get("params").ok_or_else(|| bad("params"))?)?,
                                    accepted: c.get("accepted").cloned().unwrap_or(Value::Null), seq: py_u64(c.get("seq")).ok_or_else(|| bad("seq"))?,
-                                   opened: c.get("opened").and_then(Value::as_bool).unwrap_or(false) });
+                                   opened: c.get("opened").and_then(Value::as_bool).unwrap_or(false),
+                                   // (a record from before the field was written after the attach)
+                                   attached: c.get("attached").and_then(Value::as_bool).unwrap_or(true) });
                 st.hub_pay_to = py_str(c.get("hub_pay_to"));
             }
             if let Some(b) = recs.get("book") {
@@ -437,7 +442,7 @@ impl RoutePayer {
 
     fn ch1_json(&self, st: &PState) -> Value {
         st.ch.as_ref().map(|c| json!({"hub_url": self.hub_url, "params": c.params.to_json(), "accepted": c.accepted, "seq": c.seq,
-                                     "opened": c.opened, "hub_pay_to": st.hub_pay_to})).unwrap_or(Value::Null)
+                                     "opened": c.opened, "attached": c.attached, "hub_pay_to": st.hub_pay_to})).unwrap_or(Value::Null)
     }
 
     fn persist(&self, recs: &[(String, Value)]) -> Result<()> {
@@ -587,7 +592,7 @@ impl RoutePayer {
         self.preflight(&p, &acc)?;
         let recs = {
             let mut st = lk(&self.st);
-            st.ch = Some(Ch1 { params: p, accepted: acc, seq: 0, opened: false });
+            st.ch = Some(Ch1 { params: p, accepted: acc, seq: 0, opened: false, attached: false });
             [("ch1".to_string(), self.ch1_json(&st)), ("book".to_string(), Self::book_json(&st))]
         };
         if let Err(e) = self.persist(&recs) {
@@ -636,10 +641,17 @@ impl RoutePayer {
             };
             self.persist(&recs)?;
         }
-        if self.signer.sign_refund(&p.channel_id()).is_err() {
-            // not bound yet (a signer that has the channel signs its refund)
+        if !lk(&self.st).ch.as_ref().is_some_and(|c| c.attached) {
             self.signer.attach(&self.hub_url, &p)?;
             self.signer.sign_refund(&p.channel_id())?;
+            let rec = {
+                let mut st = lk(&self.st);
+                if let Some(c) = st.ch.as_mut() {
+                    c.attached = true;
+                }
+                self.ch1_json(&st)
+            };
+            self.persist(&[("ch1".into(), rec)])?;
         }
         Ok(p)
     }
