@@ -30,6 +30,7 @@ defect (docs/LIMITS.md, "Open items") and does not fail the run; any other FAIL 
 Env: XBT402_B1, XBT402_DATADIR, XBT402_RPCPORT, RS_BIN, FAIL_PB, FAIL_RUN; FAIL_ONLY (e.g. "A1,C2,D");
 ELECTRS (the electrs binary, for C; without it C is reported as not run).
 """
+import base64
 import json
 import os
 import secrets
@@ -47,10 +48,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 B1 = os.environ["XBT402_B1"]
 sys.path.insert(0, B1)
 sys.path.insert(0, HERE)
-from xbt402.rpc import RPC  # noqa: E402
-from xbt402.x402_channel import network_id  # noqa: E402
-
-from faults import ElectrumFaultProxy, HttpFaultProxy  # noqa: E402
+from faults import ElectrumFaultProxy, HttpFaultProxy
+from xbt402.rpc import RPC
+from xbt402.x402_channel import network_id
 
 RS = os.environ["RS_BIN"]
 PB = int(os.environ["FAIL_PB"])
@@ -76,7 +76,7 @@ node = RPC.from_env()
 W = node.wallet("w")
 ADDR = W.getnewaddress()
 NET = network_id(node.getblockhash(101))
-LOG = open(os.path.join(RUN, "failure_interop.log"), "a")
+LOG = open(os.path.join(RUN, "failure_interop.log"), "a")  # noqa: SIM115 (open for the life of the run: every child writes to it)
 results, procs, proxies = [], [], []
 group = {"id": ""}
 
@@ -89,7 +89,7 @@ def check(cid, what, ok, observed=""):
     ok = bool(ok)
     known = KNOWN_OPEN.get(cid)
     results.append({"id": cid, "check": what, "ok": ok, "observed": str(observed), "open_item": known})
-    tag = "PASS" if ok else ("FAIL (open item: %s)" % known if known else "FAIL")
+    tag = "PASS" if ok else (f"FAIL (open item: {known})" if known else "FAIL")
     if ok and known:
         tag = "PASS (listed as open: take it off KNOWN_OPEN)"
     say(f"{tag}  {cid}  {what}" + (f"\n        observed: {observed}" if observed != "" else ""))
@@ -135,9 +135,12 @@ class Mining:
         self.thread.join(10)
 
 
+NICE = ["nice", "-n", "19"]      # nice execs the program: the pid we signal is the binary's own
+
+
 def spawn(cmd, env=None, cwd=None, stdin=None, stdout=None):
     LOG.flush()
-    p = subprocess.Popen(cmd, stdout=stdout or LOG, stderr=LOG, stdin=stdin, env=env, cwd=cwd, preexec_fn=lambda: os.nice(19))
+    p = subprocess.Popen(NICE + cmd, stdout=stdout or LOG, stderr=LOG, stdin=stdin, env=env, cwd=cwd)
     procs.append(p)
     return p
 
@@ -471,7 +474,6 @@ def group_a():
 
 def wire_cum(req):
     """The cumulative amount the paid request `req` carried (PAYMENT-SIGNATURE), or None."""
-    import base64
     try:
         raw = req["headers"]["payment-signature"]
         pl = json.loads(base64.b64decode(raw + "=" * (-len(raw) % 4)))["payload"]
@@ -658,8 +660,7 @@ def refuses_open(cid, rail):
     payer = s if rail == "signer" else WalletMcp(s, "mcp-payer")
     with Mining():
         outs = [payer.pay(f"{proxy.url}/v1/infer?i={k}") for k in range(3)]
-    for k, r in enumerate(outs):
-        LOG.write(f"{cid} call {k}: {json.dumps(r)[:600]}\n")
+    LOG.writelines(f"{cid} call {k}: {json.dumps(r)[:600]}\n" for k, r in enumerate(outs))
     sigs, _ = s.signatures()
     fundings = [x for x in sigs if x.get("kind") == "funding"]
     states = [x for x in sigs if x.get("kind") in ("state", "adaptor_presig")]
@@ -669,7 +670,7 @@ def refuses_open(cid, rail):
           f"3 calls: {[brief(r) for r in outs]}; funded opens refused: {len(refused)}; state signatures: {len(states)}")
     check(f"{cid}.2", "funded once: three calls against the refusing seller fund one channel, and every refused open names that one funding",
           len(fundings) == 1 and len(set(refused)) == 1 and rec.get("funding_txid") == refused[0],
-          f"funding signatures in the signer's log: {len(fundings)}; outpoints the seller was asked to open: {sorted(set(x[:16] for x in refused))}; "
+          f"funding signatures in the signer's log: {len(fundings)}; outpoints the seller was asked to open: {sorted({x[:16] for x in refused})}; "
           f"signer record state {rec.get('state')}, open_error {rec.get('open_error')}")
     if not refused:
         return
@@ -734,9 +735,8 @@ def hub_run(cid, base, seconds, rate, disturb):
         out["opened"] = [seller(hub_status(hub_url), u).get("state") for u in urls]
         shard_urls = ",".join(u + "/v1/chunk" for u in urls)
         ctx["t0"] = time.time()
-        payer = subprocess.Popen([f"{RS}/xbt402-route-payer", "--hub", hub_url, "--shards", shard_urls, "--rpc-port", RPCPORT, "--cookie", COOKIE,
-                                  "--seconds", str(seconds), "--rate", str(rate)], stdout=subprocess.PIPE, stderr=LOG, text=True,
-                                 preexec_fn=lambda: os.nice(19))
+        payer = subprocess.Popen([*NICE, f"{RS}/xbt402-route-payer", "--hub", hub_url, "--shards", shard_urls, "--rpc-port", RPCPORT,
+                                  "--cookie", COOKIE, "--seconds", str(seconds), "--rate", str(rate)], stdout=subprocess.PIPE, stderr=LOG, text=True)
         procs.append(payer)
         try:
             disturb(ctx)
@@ -755,7 +755,7 @@ def hub_run(cid, base, seconds, rate, disturb):
     LOG.write(f"{cid} buyer: {json.dumps({k: res.get(k) for k in ('summary', 'close', 'okCalls', 'seconds', 'events', 'error')})}\n")
     LOG.write(f"{cid} hub status at the end: {json.dumps(out['status_end'])}\n")
     stop(ctx["hub"])
-    tp = subprocess.run([f"{RS}/xbt402-hub", "--config", cpath, "--close-all"], capture_output=True, text=True, timeout=180)
+    tp = subprocess.run([f"{RS}/xbt402-hub", "--config", cpath, "--close-all"], capture_output=True, text=True, timeout=180, check=False)
     LOG.write(tp.stderr)
     try:
         out["closed"] = json.loads(tp.stdout.strip().splitlines()[-1])
@@ -909,7 +909,7 @@ def hostile_electrum(cid, mode, what, honest, hostile_port, provider_port):
     try:
         cp = subprocess.run([f"{RS}/xbt-electrum-interop", "refund", "--rpc-port", RPCPORT, "--cookie", COOKIE, "--servers", servers,
                              "--min-servers", "2", "--ca", TEST_CA, "--url", f"http://127.0.0.1:{provider_port}", "--kill-pid", str(prov.pid)],
-                            capture_output=True, text=True, timeout=1500)
+                            capture_output=True, text=True, timeout=1500, check=False)
         LOG.write(cp.stderr[-4000:])
         r = json.loads(cp.stdout.strip().splitlines()[-1])
     except (subprocess.TimeoutExpired, IndexError, ValueError) as e:
@@ -938,7 +938,7 @@ def hostile_electrum(cid, mode, what, honest, hostile_port, provider_port):
     check(f"{cid}.2", "no wrong answer got through, and no honest server is blamed",
           ck.get("every_answer_matches_node") is True and not wrong and ck.get("calls_200") is True,
           f"{r.get('comparisons')} answers compared with the node, mismatches {len(r.get('mismatches') or [])}; servers flagged: "
-          f"{sorted(set(f.split(': ')[0] for f in flags)) or 'none'}" + (f"; e.g. {flags[0][:160]}" if flags else ""))
+          f"{sorted({f.split(': ')[0] for f in flags}) or 'none'}" + (f"; e.g. {flags[0][:160]}" if flags else ""))
     stop(prov)
     proxy.stop()
 
@@ -952,11 +952,11 @@ def group_c():
     e1, m1, e2, m2, tls = (PB + 50 + k for k in range(5))
     dd = os.environ["XBT402_DATADIR"]
     for port, mon, db in ((e1, m1, "db1"), (e2, m2, "db2")):
-        log = open(os.path.join(RUN, f"electrs-{db}.log"), "a")
-        procs.append(subprocess.Popen([ELECTRS, "--skip-default-conf-files", "--network", "regtest", "--db-dir", os.path.join(RUN, db), "--daemon-dir", dd,
+        log = open(os.path.join(RUN, f"electrs-{db}.log"), "a")  # noqa: SIM115 (the child's log, for its life)
+        procs.append(subprocess.Popen([*NICE, ELECTRS, "--skip-default-conf-files", "--network", "regtest", "--db-dir", os.path.join(RUN, db), "--daemon-dir", dd,
                                        "--cookie-file", COOKIE, "--daemon-rpc-addr", f"127.0.0.1:{RPCPORT}",
                                        "--daemon-p2p-addr", f"127.0.0.1:{os.environ['XBT402_P2PPORT']}", "--electrum-rpc-addr", f"127.0.0.1:{port}",
-                                       "--monitoring-addr", f"127.0.0.1:{mon}"], stdout=log, stderr=log, preexec_fn=lambda: os.nice(19)))
+                                       "--monitoring-addr", f"127.0.0.1:{mon}"], stdout=log, stderr=log))
     spawn([f"{RS}/xbt-electrum-interop", "tls-proxy", "--listen", f"127.0.0.1:{tls}", "--upstream", f"127.0.0.1:{e2}"])
     honest = {"e1": e1, "tls": tls}
     modes = (("C1", "hold", "holds every answer from the moment the channel's funding is broadcast"),

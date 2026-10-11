@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Fault injection between real processes, for scripts/interop/failure_interop.py (stdlib only).
 
 Two proxies that sit on the wire between two of the binaries and misbehave on purpose. The binaries

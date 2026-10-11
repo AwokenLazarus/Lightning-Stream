@@ -11,9 +11,11 @@
 # Each check prints PASS or FAIL and what it observed. A FAIL that the driver lists as a known open
 # item (docs/LIMITS.md, "Open items") is printed as such and does not fail the run.
 #
-# Needs: the Python reference checkout for its node script and RPC helper (XBT402_B1, default
-# ../b1 beside this checkout), a Knots 29.4.2 build (XBT_BIN: the directory of bitcoind and
-# bitcoin-cli), and for C a patched electrs (XBT_ELECTRS; without one C is reported as not run).
+# Needs, with the same defaults as the other scripts here: the Python reference checkout for its
+# node script and RPC helper (XBT402_B1), a Knots 29.4.2 build (XBT_BIN: the directory of bitcoind
+# and bitcoin-cli), and for C the patched electrs of electrum_interop.sh (XBT_ELECTRS, or
+# XBT_ELECTRS_DIR/src/target/release/electrs). Without an electrs C is reported as not run and the
+# script exits 1: it did not run every check.
 # Ports: FAIL_PORT_BASE (default 26400) .. +99, all below the kernel's ephemeral range and checked
 # free before anything starts. FAIL_ONLY="A1,C,D2" runs a subset; FAIL_KEEP=1 keeps the run directory
 # (ledgers, configs) for a look afterwards. Starts no miner but its own
@@ -22,7 +24,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
-B1=${XBT402_B1:-$(dirname "$ROOT")/b1}
+B1=${XBT402_B1:-$HOME/xbt-rnd/b1}
 PB=${FAIL_PORT_BASE:-26400}
 R=${XBT_RS_RUN:-$ROOT/run}/failure-$$
 export XBT402_B1=$B1
@@ -33,8 +35,8 @@ export XBT402_MATURITY_PAD=6800
 PY=${XBT402_PYTHON:-$B1/.venv/bin/python}
 [ -x "$PY" ] || PY=python3
 export RS_BIN=${CARGO_TARGET_DIR:-$ROOT/target}/release FAIL_PB=$PB FAIL_RUN=$R
-ELECTRS_DEFAULT=$(dirname "$ROOT")/electrs-agp-024/src/target/release/electrs
-export ELECTRS=${XBT_ELECTRS:-$ELECTRS_DEFAULT}
+ELECTRS_DIR=${XBT_ELECTRS_DIR:-$HOME/xbt-rnd/electrs-agp-024}
+export ELECTRS=${XBT_ELECTRS:-$ELECTRS_DIR/src/target/release/electrs}
 [ -f "$B1/scripts/node.sh" ] || { echo "no Python reference checkout at $B1 (set XBT402_B1)" >&2; exit 2; }
 [ -x "$XBT_BIN/bitcoind" ] || { echo "no bitcoind in $XBT_BIN (set XBT_BIN)" >&2; exit 2; }
 mkdir -p "$R"
@@ -43,7 +45,7 @@ cleanup() {
   "$B1/scripts/node.sh" wipe >/dev/null 2>&1 || true
   mkdir -p "$ROOT/run"
   cp "$R"/failure_interop_results.json "$R"/failure_interop.log "$ROOT/run/" 2>/dev/null || true
-  [ -n "${FAIL_KEEP:-}" ] && { rm -rf "$R/node"; echo "kept: $R"; } || rm -rf "$R"
+  if [ -n "${FAIL_KEEP:-}" ]; then rm -rf "$R/node"; echo "kept: $R"; else rm -rf "$R"; fi
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP

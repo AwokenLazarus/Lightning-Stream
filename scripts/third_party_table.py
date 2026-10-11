@@ -32,7 +32,7 @@ def version_key(v):
 
 
 def rows():
-    out = subprocess.run(TREE, cwd=ROOT, capture_output=True, text=True)
+    out = subprocess.run(TREE, cwd=ROOT, capture_output=True, text=True, check=False)
     if out.returncode != 0:
         sys.exit(f"cargo tree failed:\n{out.stderr}")
     seen = {}
