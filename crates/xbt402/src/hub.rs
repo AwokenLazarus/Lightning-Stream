@@ -3369,6 +3369,9 @@ impl RouteHub {
                     c.close_txid = String::new();
                 }
                 c.state = st.into();
+                // a funding this node showed confirmed and no longer shows unspent, even counting
+                // the mempool, is being spent: its coins no longer count (AGP-088)
+                c.spend_seen = c.fund_confirmed;
                 c.close_txid.clone()
             })?;
             let ev = json!({"event": format!("ch2_{st}"), "provider": oc.origin, "chan": chan, "txid": r.unwrap_or_default(), "by": "unknown"});
