@@ -2423,7 +2423,7 @@ reaches the node's own listener works. Not run on either platform.
 | `extra.routing.lightning` | the link's thread | absent when run out | the node down for 30 days: absent, the hub is paid by URL only | absent | absent |
 | `hub_node` in the payer | whoever constructs the payer | - | a hub that shows nothing: refused | a payer resumed from a ledger checks the same way at its next offer | by URL: none |
 
-Tests: `ln_wallet.rs` (13), `hub_identity.rs` (5), `macaroon.rs` (3) and `status_page.rs` (2 new)
+Tests: `ln_wallet.rs` (12), `hub_identity.rs` (5), `macaroon.rs` (3) and `status_page.rs` (2 new)
 unit; `crates/xbt402/tests/hub_identity_vectors.rs` (3) on `vectors/hub_identity.json`, whose cases
 `scripts/hub_identity_vectors.py` writes and checks with code of its own, and which holds a
 statement signed by a real Lightning Fork node and six macaroons that node baked;
