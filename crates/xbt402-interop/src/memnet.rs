@@ -21,6 +21,9 @@ struct ChainState {
     spent: HashMap<(String, u32), String>,
     /// Spends that are in a block (the rest are in the mempool).
     mined: HashSet<(String, u32)>,
+    /// AGP-094: the height at which each of `mined` was first confirmed (the depth of its spender,
+    /// as bitcoind gives it: tip - height + 1).
+    mined_at: HashMap<(String, u32), u32>,
     raw: HashMap<String, String>,
     /// `estimatesmartfee`, sat/vB (None: no estimate).
     fee_rate: Option<f64>,
@@ -85,6 +88,10 @@ impl MemChain {
             }
         }
         let spent: Vec<_> = st.spent.iter().filter(|(_, s)| !held.contains(*s)).map(|(k, _)| k.clone()).collect();
+        let h = st.height;
+        for k in &spent {
+            st.mined_at.entry(k.clone()).or_insert(h);
+        }
         st.mined.extend(spent);
     }
 
@@ -129,6 +136,7 @@ impl MemChain {
         let spends: Vec<_> = st.spent.iter().filter(|(_, s)| *s == txid).map(|(k, _)| k.clone()).collect();
         for k in spends {
             st.mined.remove(&k);
+            st.mined_at.remove(&k);
         }
     }
 
@@ -267,7 +275,13 @@ impl SpendScan for MemChain {
     }
 
     fn find_spend_at(&self, txid: &str, vout: u32, from: u32) -> Result<Option<(Tx, Option<u32>)>> {
-        let depth = u32::from(self.st().mined.contains(&(txid.to_string(), vout)));
+        // as a node answers: 0 in the mempool, else tip - the spender's height + 1 (AGP-094: it
+        // answered 1 for every confirmed spender, however deep)
+        let depth = {
+            let st = self.st();
+            let k = (txid.to_string(), vout);
+            if st.mined.contains(&k) { st.height.saturating_sub(st.mined_at.get(&k).copied().unwrap_or(st.height)) + 1 } else { 0 }
+        };
         Ok(self.find_spend(txid, vout, from)?.map(|tx| (tx, Some(depth))))
     }
 

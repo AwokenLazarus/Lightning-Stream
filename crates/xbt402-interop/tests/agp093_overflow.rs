@@ -602,3 +602,123 @@ fn a_panic_in_one_tick_does_not_end_the_hub_watcher() {
     assert!(ticks > 0, "the hub's watcher made no tick in 500 ms after one tick panicked: no ch2 is reconciled or refunded and no ch1 is closed at its \
                         margin any more, and the hub still routes (a lock was paid after the panic)");
 }
+
+// --- AGP-094 (fix wave 5): the neighbours of the two holes above ------------------------------------------------
+
+/// The rule of item 1 on the path the check does not cover: a lock the ch2's floor covers needs no
+/// pre-signature, so nothing is asked first. A client's bad `lockAuth` on such a lock is refused by
+/// the provider with nothing of the hub's out: the lock is dropped (not written off, not held) and
+/// the ch2 takes the next lock.
+#[test]
+fn agp094_a_refused_lock_the_floor_covers_is_dropped_and_blocks_nothing() {
+    let w = world();
+    assert_eq!(w.pay.lock(&w.sh).unwrap().unwrap()["status"], "paid");
+    let (bad, bad_sh) = fresh_client(&w);
+    calls(&bad, &bad_sh, 1);
+    let oc = w.oc();
+    let d = bad_sh.due_sat().max(1) as u64;
+    assert!(next_cum(oc.routed, d, oc.params.min_amount()) <= oc.signed, "control: the ch2's floor covers this lock (routed {}, signed {}, d {d})", oc.routed, oc.signed);
+    let (hdr, body) = route_built_for(&bad, &bad_sh, &|_, rt| rt["lockAuth"] = "00".repeat(32).into(), None, None);
+    let r = hub_serve(&w, &hdr, &body).unwrap();
+    assert_eq!((r.0, r.1["providerError"].as_str()), (502, Some("bad_auth")), "{}", r.1);
+    assert!(w.oc().stale.is_empty() && w.oc().pending.is_empty() && w.oc().blocked.is_empty(), "nothing written off on the ch2");
+    let st1 = w.hub.ch1_state(&bad.chan().unwrap()).unwrap();
+    assert!(!truthy(st1.extra.get("route_lock")) && st1.extra.get("stale_locks").and_then(Value::as_array).is_none_or(|s| s.is_empty()), "nothing held on ch1");
+    stream(&w, 1);
+    assert_eq!(w.pay.lock(&w.sh).unwrap().unwrap()["status"], "paid");
+}
+
+/// The same invoice sent again from another ch1 of the same client, after it was paid. The
+/// provider answered a lock it had completed before with the same `t`, the hub counted it as a
+/// new one, and every later lock on that ch2 was then one lock above what the provider expected
+/// (`bad_amount`, after the pre-signature left: written off, ch2 blocked). Now the provider
+/// refuses it at the check when a pre-signature is needed, and where the floor covers it the hub
+/// counts what the provider counted.
+#[test]
+fn agp094_an_invoice_sent_again_from_another_ch1_does_not_put_the_ch2_out_of_step() {
+    let mut seen = vec![];
+    for past_floor in [false, true] {
+        let w = world();
+        if past_floor {
+            // a ch2 that has routed its floor (as after some hundred of this rig's locks): from
+            // there every lock needs a pre-signature
+            assert_eq!(w.pay.lock(&w.sh).unwrap().unwrap()["status"], "paid");
+            let oc = w.oc();
+            w.hub.with_out(|b| b.chans[P0].routed = oc.signed);
+            w.prov.with_state(&oc.params.channel_id(), |st| { st.extra.insert("routed_sat".into(), oc.signed.into()); }).unwrap();
+            stream(&w, 10);
+        }
+        let (bad, _) = fresh_client(&w);
+        // the second ch1's request for the invoice of the first one's session, built before it is paid
+        let (hdr, body) = route_built_for(&bad, &w.sh, &|_, _| {}, None, None);
+        let d = w.sh.due_sat().max(1) as u64;
+        assert_eq!(w.pay.lock(&w.sh).unwrap().unwrap()["status"], "paid");
+        let oc = w.oc();
+        let floor = next_cum(oc.routed, d, oc.params.min_amount()) <= oc.signed;
+        seen.push(floor);
+        let r = hub_serve(&w, &hdr, &body).unwrap();
+        // refused at the check when a pre-signature would be needed; answered again where the floor covers it
+        assert_eq!((r.0 == 200, r.1["providerError"] == "bad_invoice"), (floor, !floor), "floor {floor}: {}", r.1);
+        let chan2 = w.oc().params.channel_id();
+        let theirs = w.prov.channel_state(&chan2).and_then(|s| py_int(s.extra.get("routed_sat"))).unwrap_or(0) as u64;
+        assert_eq!(w.oc().routed, theirs, "floor {floor}: the hub's routed total left the provider's");
+        assert!(w.oc().stale.is_empty() && w.oc().blocked.is_empty());
+        stream(&w, 2);
+        assert_eq!(w.pay.lock(&w.sh).unwrap().unwrap()["status"], "paid", "floor {floor}: the next lock on that ch2");
+    }
+    assert_eq!(seen, [true, false], "control: once where the ch2's floor covers the second lock, once where it needs a pre-signature");
+}
+
+/// An invoice a hub was told would be taken is paid over that hub's channel alone until its
+/// window ends: sent through another channel it is refused, and at a hub's check, so before that
+/// hub pre-signs. (Without it a client with channels at two hubs had one hub's lock refused after
+/// its pre-signature left, by paying the same invoice through the other at that moment.)
+#[test]
+fn agp094_an_invoice_one_hub_checked_is_refused_to_another_channel_at_its_check() {
+    let w = world();
+    // the check is answered and the lock itself never arrives (the hub's thread dies there)
+    let (hdr, body) = route_built(&w, &|_, _| {}, None, None);
+    w.net_boom.store(1, Ordering::SeqCst);
+    assert!(hub_serve(&w, &hdr, &body).is_err(), "control: the handler panicked at the lock");
+    let chan2 = w.oc().params.channel_id();
+    let bound: Vec<String> = w.prov.routes().lock().sessions.values().map(|s| s.bound.clone()).collect();
+    assert!(bound.contains(&chan2), "the check bound the session's invoice to the hub's ch2: {bound:?}");
+    assert!(w.hub.watch_tick().iter().any(|a| a["event"] == "lock_settled_late"), "that hub's lock is still taken");
+    // as another hub's channel would find it: the next invoice bound to a channel that is not ours
+    let (pay, sh) = fresh_client(&w);
+    calls(&pay, &sh, 3);
+    for s in w.prov.routes().lock().sessions.values_mut() {
+        s.bound = "ab".repeat(32);
+    }
+    let r = pay.lock(&sh).unwrap().unwrap();
+    assert_eq!((r["status"].as_str(), r["error"].as_str()), (Some("refused"), Some("route_failed")), "{r}");
+    assert_eq!(*w.hub.stats.lock().unwrap().refused.get("lock_outstanding").unwrap_or(&0), 1);
+    assert!(w.oc().stale.is_empty() && w.oc().blocked.is_empty(), "refused before anything was pre-signed");
+}
+
+/// What `/healthz` shows of the watcher: a tick that panicked is counted and named, `ok` is false
+/// until a tick that did not panic, for the hub's own tick and for ch1's closes inside it.
+#[test]
+fn agp094_the_watchers_health_counts_a_tick_that_panicked() {
+    let w = world();
+    let stop = w.hub.watch(Duration::from_millis(20));
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!((w.hub.watch_health()["ok"].clone(), w.hub.watch_health()["panics"].clone()), (json!(true), json!(0)));
+    w.boom.boom.store(1, Ordering::SeqCst);
+    let t0 = Instant::now();
+    while w.hub.watch_health()["panics"] == 0 && t0.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let h = w.hub.watch_health();
+    assert!(h["panics"] == 1 && h["lastPanic"].as_str().is_some_and(|m| !m.is_empty()), "{h}");
+    std::thread::sleep(Duration::from_millis(200));
+    stop.store(true, Ordering::SeqCst);
+    let h = w.hub.watch_health();
+    assert!(h["ok"] == true && h["panics"] == 1 && h["ticks"].as_u64().unwrap() > 3, "healthy again after a tick that did not panic: {h}");
+    // a provider's own watcher (the binaries' loop calls close_due): the panic is that tick's error
+    w.boom.boom.store(1, Ordering::SeqCst);
+    assert_eq!(w.hub.inbound.close_due().unwrap_err().code, "watcher_panic");
+    assert!(w.hub.watch_health()["ok"] == false && w.hub.watch_health()["ch1"]["panics"] == 1);
+    w.hub.inbound.close_due().unwrap();
+    assert!(w.hub.watch_health()["ok"] == true);
+}

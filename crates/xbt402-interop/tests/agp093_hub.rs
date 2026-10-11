@@ -653,3 +653,143 @@ fn a_mempool_close_of_an_unconfirmed_child_replaced_by_the_close_with_t_is_colle
     assert!(acts.iter().any(|a| a["event"] == "secret_from_close" && a["ch1_completed"] == true), "{acts:?}");
     assert_eq!((w.st1().best_cum, w.stale1().len()), (held["cum"].as_u64().unwrap(), 0), "the hub collected the lock it paid");
 }
+
+// --- AGP-094 (fix wave 5): tests for the fixes of the holes above, and for the items the audit had from reading ----
+
+/// Item 2, the rule itself: a hold is released, and the ch2 record made final, when the close
+/// that did not pay it is `spend_final_depth` blocks deep, with a scan that says how deep a
+/// spender is and with one that does not (the depth is then counted from the block at which the
+/// watcher first saw the funding spent).
+#[test]
+fn agp094_a_hold_is_released_when_the_close_is_spend_final_depth_deep() {
+    assert_eq!(HubConfig::default().spend_final_depth, 6);
+    assert_eq!(HubConfig::from_json(&json!({"spend_final_depth": 0})).unwrap_err().code, "bad_config");
+    assert_eq!(HubConfig { spend_final_depth: 0, ..hub_cfg() }.validate().unwrap_err().code, "bad_config");
+    for depth in [true, false] {
+        let w = W::build_full(&[None], 20, 300, HubConfig { spend_final_depth: 3, ..hub_cfg() }, |_| {}, depth);
+        w.paid(0);
+        let (prov, chan2) = (&w.provs[0].1.inner, w.oc(0).params.channel_id());
+        let s0 = prov.channel_state(&chan2).unwrap();
+        w.keeps_locks(0);
+        refused(&w.lock(0));
+        prov.with_state(&chan2, |st| *st = s0.clone()).unwrap();
+        prov.close_now(&chan2).unwrap();
+        w.hub.watch_tick();
+        for deep in 1..=3 {
+            w.chain.mine(1);
+            let mut acts = w.hub.watch_tick();
+            acts.extend(w.hub.watch_tick());
+            let oc = w.oc(0);
+            assert_eq!((has(&acts, "lock_released"), oc.final_, w.stale1().len()), (deep == 3, deep == 3, if deep == 3 { 0 } else { 1 }),
+                       "scan depth {depth}, {deep} block(s) deep: ch2 {} {acts:?}", oc.state);
+            if deep < 3 {
+                assert_eq!(w.pay.close().unwrap_err().code, "lock_pending", "ch1 does not close below the held lock");
+            }
+        }
+        assert_eq!(w.oc(0).state, "closed");
+    }
+}
+
+/// Item 12, first bullet, the case the audit's test stands for: the SAME invoice sent twice, as a
+/// hub before AGP-088 admitted it, so the two written-off locks share their lockId and their
+/// point, on two ch2s of one provider. Each is given the ch2 it went over, the earlier lock the
+/// earlier ch2.
+#[test]
+fn agp094_two_locks_of_one_invoice_from_a_ledger_before_agp088_are_each_given_their_ch2() {
+    let (w, a, _, _) = two_held_locks_on_two_ch2s_of_one_provider(true);
+    let origin = w.origin(0).to_string();
+    let t = w.stale1()[0]["T"].clone();
+    w.hub.inbound.with_state(&w.pay.chan().unwrap(), |st| st.extra["stale_locks"][1]["T"] = t.clone()).unwrap();
+    w.hub.with_out(|bk| bk.chans[origin.as_str()].stale[0]["T"] = t.clone());
+    let acts = w.hub.name_legacy_locks();
+    assert!(acts.iter().any(|x| x["event"] == "legacy_locks_named" && x["locks"] == 2), "{acts:?}");
+    let named: Vec<String> = w.stale1().iter().map(|s| s["ch2"].as_str().unwrap_or("").to_string()).collect();
+    assert_eq!(named, [hex::encode(a.params.payer_pub), hex::encode(w.oc(0).params.payer_pub)]);
+    assert!(w.hub.name_legacy_locks().is_empty(), "nothing left to name");
+}
+
+/// Item 12, third bullet, the other side: with room under the cap the ch2 a changed payTo
+/// replaces is funded, and the replaced one is `retired`, so the watcher has the provider close it.
+#[test]
+fn agp094_a_ch2_replaced_for_a_changed_pay_to_is_retired_and_counted_until_it_is_spent() {
+    let mut cfg = hub_cfg();
+    cfg.liquidity_cap_sat = 200_000;
+    let w = W::build_with(&[None], 20, 300, cfg, |_| {});
+    w.paid(0);
+    let old = w.oc(0);
+    *w.provs[0].1.pay_to.lock().unwrap() = Some(hex::encode(xbt_primitives::ecdsa::pubkey(&sk(0x7777))));
+    w.hub.connect(w.origin(0), None, None).unwrap();
+    assert_eq!(w.hub.committed_sat(), 200_000, "both count while the first is unspent");
+    let rec = w.hub.archived().into_iter().find(|r| r["params"]["payer_pub"] == hex::encode(old.params.payer_pub)).unwrap();
+    assert_eq!(rec["retired"], true);
+    let asked = w.net.count(CLOSE_PATH);
+    w.hub.watch_tick();
+    assert_eq!(w.net.count(CLOSE_PATH), asked + 1, "the watcher asked the provider to close the replaced ch2");
+}
+
+/// Item 12, from reading (now run): ch1's ledger does not take the write of a completion read off
+/// a ch2 close. The lock stays on the ch2 record, and the next tick completes it.
+#[test]
+fn agp094_a_completion_ch1_did_not_take_keeps_the_lock_on_the_ch2_record() {
+    let w = W::new(1);
+    w.paid(0);
+    w.keeps_locks(0);
+    refused(&w.lock(0));
+    let cum = w.stale1()[0]["cum"].as_u64().unwrap();
+    w.provider_closes(0);
+    w.hub.set_stop("complete_ch1");
+    let acts = w.hub.watch_tick();
+    assert!(acts.iter().any(|a| a["event"] == "secret_from_close" && a["ch1_completed"] == false), "{acts:?}");
+    assert_eq!((w.stale1().len(), w.oc(0).stale.len()), (1, 1), "the lock is still on ch1 and still on the ch2 record");
+    w.hub.set_stop("");
+    let acts = w.hub.watch_tick();
+    assert!(acts.iter().any(|a| a["event"] == "secret_from_close" && a["ch1_completed"] == true), "{acts:?}");
+    assert!(w.stale1().is_empty() && w.oc(0).stale.is_empty() && w.st1().best_cum >= cum);
+}
+
+/// Item 12, from reading (now run): the hub stops right after it wrote the close. The refill that
+/// close owes is in that same write, and the next tick funds it.
+#[test]
+fn agp094_a_stop_after_the_close_is_written_does_not_lose_the_refill() {
+    let w = W::new(1);
+    w.paid(0);
+    let old = w.oc(0);
+    w.hub.set_stop("closing");
+    assert_eq!(w.hub.close_ch2(&old, true).unwrap_err().code, "test_stop");
+    let oc = w.oc(0);
+    assert!(oc.state == "closing" && oc.refill_owed && oc.params.payer_pub == old.params.payer_pub, "closing, the refill owed: {} {}", oc.state, oc.refill_owed);
+    w.hub.set_stop("");
+    let acts = w.hub.watch_tick();
+    assert!(has(&acts, "ch2_refill"), "{acts:?}");
+    let new = w.oc(0);
+    assert!(new.params.payer_pub != old.params.payer_pub && ["funding", "funded", "open"].contains(&new.state.as_str()), "a new ch2 is funded: {}", new.state);
+    let n = w.hub.committed_sat();
+    w.hub.watch_tick();
+    assert_eq!(w.hub.committed_sat(), n, "funded once");
+}
+
+/// Item 12, from reading (now run): a ch2 archived while open with its lock pending, as a ledger
+/// from before AGP-088 can hold one. It is written off like any pending lock nobody will answer,
+/// held on ch1 (which is free for the next lock), and the ch2 is closed like a retired one.
+#[test]
+fn agp094_a_lock_pending_on_a_ch2_archived_while_open_is_written_off() {
+    let w = W::new(2);
+    w.paid(0);
+    let held = w.held_lock(0);
+    w.back_in_flight(0, &held);
+    let origin = w.origin(0).to_string();
+    w.hub.with_out(|b| {
+        let c = b.chans.shift_remove(origin.as_str()).unwrap();
+        b.archived.push(c.to_json());
+    });
+    std::thread::sleep(Duration::from_millis(1100)); // reveal_timeout
+    let acts = w.hub.watch_tick();
+    assert!(has(&acts, "lock_written_off"), "{acts:?}");
+    assert_eq!(w.pending_anywhere(), 0);
+    let st1 = w.st1();
+    assert!(!xbt402::json::truthy(st1.extra.get("route_lock")) && w.stale1().len() == 1 && w.stale1()[0]["hold"].is_object(), "held on ch1, which takes a lock again");
+    let rec = w.hub.archived().into_iter().find(|r| r["origin"] == origin.as_str() && r["stale"].as_array().is_some_and(|s| !s.is_empty())).unwrap();
+    assert_eq!(rec["retired"], true, "and the watcher has the provider close it: {}", rec["state"]);
+    let r = w.pay_until_paid(1);
+    assert_eq!(r.as_ref().map(|r| r["status"].clone()), Some(json!("paid")), "{r:?}");
+}
