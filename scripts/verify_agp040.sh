@@ -5,8 +5,8 @@
 #   3. clippy: no warning in xbt-svc, xbt-wallet-ui or xbt402-hub.rs
 #   4. the six images for amd64, arm64, arm/v7 (scripts/oci_build.sh --load; oci_inspect)
 #   5. AGP-038's container test on the new images (the base layer changed: the UI's user and data dir)
-#   6. the Umbrel apps: lint + two cold regtest installs (packaging/umbrel/test-umbrel-apps.sh, ports 34000-34099)
-#   7. the StartOS package: build, inspect both .s9pk, the StartOS-shaped regtest run (ports 34100-34199)
+#   6. the Umbrel apps: lint + two cold regtest installs (packaging/umbrel/test-umbrel-apps.sh, ports 24000-24099)
+#   7. the StartOS package: build, inspect both .s9pk, the StartOS-shaped regtest run (ports 24100-24199)
 #   8. the Umbrel side-load bundle (packaging/umbrel/bundle.sh; dist/umbrel, git-ignored)
 set -euo pipefail
 if [ -z "${VERIFY_SCOPED:-}" ] && command -v systemd-run >/dev/null; then

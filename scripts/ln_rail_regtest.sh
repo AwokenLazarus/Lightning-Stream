@@ -52,7 +52,7 @@ docker image inspect knots-blake2b:final-zmq >/dev/null 2>&1 || \
 
 # a lab an earlier LN_RAIL_KEEP=1 run left holds the ports: it goes before they are checked
 (cd "$LAB" && docker compose down -v >/dev/null 2>&1 || true)
-python3 "$HOME/xbt-rnd/xbt-063/tools/portcheck.py" wait 17481 17491 17493 17495
+python3 "$ROOT/scripts/portcheck.py" wait 17481 17491 17493 17495
 nice -n 19 cargo build -q -j4 --release -p xbt-signer --bin xbt-signer -p xbt-wallet-mcp --bin xbt-wallet-mcp
 BIN=${CARGO_TARGET_DIR:-$ROOT/target}/release
 

@@ -82,7 +82,7 @@ from xbt402.x402_channel import network_id, unb64json  # noqa: E402
 HERE = os.path.dirname(os.path.abspath(__file__))
 RS = os.environ["RS_BIN"]
 PY = os.environ.get("PY", sys.executable)
-PB = int(os.environ.get("LOAD_PB", "34900"))
+PB = int(os.environ.get("LOAD_PB", "24900"))
 SPAN = int(os.environ.get("LOAD_SPAN", "100"))
 RUN = os.environ["LOAD_RUN"]
 SECONDS = float(os.environ.get("LOAD_SECONDS", "45"))

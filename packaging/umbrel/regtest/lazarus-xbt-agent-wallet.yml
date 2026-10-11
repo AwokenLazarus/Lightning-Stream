@@ -1,4 +1,4 @@
-# Test ports on loopback only (34000-34099): MCP 34010, UI 34030 (the driver's app_proxy stand-in is 34080).
+# Test ports on loopback only (24000-24099): MCP 24010, UI 24030 (the driver's app_proxy stand-in is 24080).
 # Faster readiness and watch intervals for the test; nothing else differs from the app.
 services:
   signer:

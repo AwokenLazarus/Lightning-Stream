@@ -6,13 +6,13 @@
 #   1. the Rust hub (xbt402-funding-reconcile): run A (slow: in the mempool past funding_timeout_blocks ->
 #      recovered, opened once confirmed) and run B (conflicted: dropped but watched, then failed and final);
 #   2. the Python hub (B1 agp-045, scripts/interop/py_funding_reconcile.py): the same runs, the same checks.
-# Ports 34540-34549 (AGP-045 has 34500-34599). Starts NO miners. Node and processes wiped on exit.
+# Ports 24560-24569 (AGP-045 has 24500-24599). Starts NO miners. Node and processes wiped on exit.
 # Soak rules: CPUQuota 200%, 4G, nice 19.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
 B1=${XBT402_B1:-$HOME/xbt-rnd/b1}
-PB=${XBT_RS_FUNDREC_PORT_BASE:-34540}
+PB=${XBT_RS_FUNDREC_PORT_BASE:-24560}
 R=${XBT_RS_RUN:-$ROOT/run}/fundrec-$$
 BIN=${CARGO_TARGET_DIR:-$ROOT/target}/release
 export XBT402_B1=$B1
@@ -36,7 +36,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
 
-python3 "$HOME/xbt-rnd/xbt-063/tools/portcheck.py" wait $((PB + 1)) $((PB + 2)) $((PB + 3))
+python3 "$ROOT/scripts/portcheck.py" wait $((PB + 1)) $((PB + 2)) $((PB + 3))
 "${SOAK[@]}" cargo build -q -j2 --release -p xbt402-interop --bin xbt402-refund-bump --bin xbt402-funding-reconcile
 "$B1/scripts/node.sh" wipe >/dev/null 2>&1 || true
 "$B1/scripts/node.sh" up

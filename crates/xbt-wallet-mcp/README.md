@@ -241,6 +241,6 @@ python3 scripts/mcp/mcp_conformance.py --py ~/xbt-rnd/xbt-063/.venv/bin/python -
   --rust target/debug/xbt-wallet-mcp    # protocol level vs B2's server, recording mock signer, 0 diffs
 python3 scripts/mcp/http_sdk_check.py --py ~/xbt-rnd/xbt-063/.venv/bin/python --b2 ~/xbt-rnd/b2 \
   --rust target/release/xbt-wallet-mcp  # the official Python SDK over streamable HTTP vs B2 over stdio
-scripts/mcp/regtest_conformance.sh      # regtest, both signers (xbt-063 agp-030, ports 33500-33599)
+scripts/mcp/regtest_conformance.sh      # regtest, both signers (xbt-063 agp-030, ports 23500-23599)
 scripts/mcp/build_targets.sh            # every AGP-031 target -> dist/MCP_TARGETS.md
 ```

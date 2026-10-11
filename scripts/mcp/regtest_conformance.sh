@@ -8,7 +8,7 @@
 # runs step by step after normalizing txids, keys, addresses and times. The flagship's own checks
 # (settlement, custody, restart) run too and their verdict is reported.
 #
-# Ports 33500-33599 (FLAGSHIP_PORT_BASE=33500, sequential runs). Soak rules: CPUQuota 200%,
+# Ports 23500-23599 (FLAGSHIP_PORT_BASE=23500, sequential runs). Soak rules: CPUQuota 200%,
 # MemoryMax 4G, nice 19, cargo -j2. PYTHONHASHSEED=0 keeps the demo provider's tie order fixed, so
 # two runs sell the same bytes. Evidence: run/mcp-regtest/<stamp>/ (a JSON table per signer).
 #   scripts/mcp/regtest_conformance.sh [py|rust ...]   (default: py rust)
@@ -27,7 +27,7 @@ flagship() {   # $1 label, rest: env
   local label=$1; shift
   echo "== flagship $label ($*)"
   set +e
-  (cd "$XBT063" && env FLAGSHIP_PORT_BASE=33500 FLAGSHIP_AGENT=script MCP_CONFORMANCE=1 PYTHONHASHSEED=0 "$@" \
+  (cd "$XBT063" && env FLAGSHIP_PORT_BASE=23500 FLAGSHIP_AGENT=script MCP_CONFORMANCE=1 PYTHONHASHSEED=0 "$@" \
       systemd-run --user --scope -q -p CPUQuota=200% -p MemoryMax=4G nice -n 19 ./flagship.sh) >"$OUT/$label.log" 2>&1
   local rc=$?
   set -e

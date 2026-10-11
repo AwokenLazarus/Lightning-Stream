@@ -2,13 +2,13 @@
 """AGP-038 container test: the amd64 images on regtest, configured only by env and a data dir.
 
 Stack on a private Docker network (`agp038-net-<pid>`; nothing but the MCP, the hub and the provider is
-published, and only on 127.0.0.1, ports 33700-33799):
+published, and only on 127.0.0.1, ports 23700-23799):
   knots      Knots 29.4.2 regtest (a test-only image: debian:bookworm-slim + the binary), rpcuser auth
   provider   xbt402-rust-provider (a test-only FROM scratch image), 150 sat per call
   witness    xbt-anchor-witness:agp038   data volume `witness`, socket volume `run-anchor`
   signer     xbt-signer:agp038           data volume `signer`, socket volumes `run-signer` (rw), `run-anchor` (ro)
-  mcp        xbt-wallet-mcp:agp038       data volume `mcp`, `run-signer` (ro); HTTP on 127.0.0.1:33710
-  hub        xbt402-hub:agp038           data volume `hub`; HTTP on 127.0.0.1:33720
+  mcp        xbt-wallet-mcp:agp038       data volume `mcp`, `run-signer` (ro); HTTP on 127.0.0.1:23710
+  hub        xbt402-hub:agp038           data volume `hub`; HTTP on 127.0.0.1:23720
 Every image container runs read-only, non-root, with /tmp a tmpfs. The data dir is a set of named volumes
 that take their owners from the images' /data skeleton. The one provisioning step is the operator's: it
 writes the node's RPC credentials into signer/secrets and hub/secrets (a root helper container, as an app
@@ -40,7 +40,7 @@ KNOTS_BIN = os.environ.get("XBT_BIN", os.path.expanduser("~/lazarus-regtest/b1-x
 PID = os.getpid()
 P = f"agp038-{PID}"            # container/volume prefix
 NET = f"agp038-net-{PID}"
-MCP_PORT, HUB_PORT, PROV_PORT = 33710, 33720, 33730
+MCP_PORT, HUB_PORT, PROV_PORT = 23710, 23720, 23730
 RPC_PW = os.urandom(16).hex()
 PROVIDER = f"http://{P}-provider:9500"
 RESULTS = []

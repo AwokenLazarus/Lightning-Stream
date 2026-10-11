@@ -3,7 +3,7 @@
 # for x86_64 and aarch64), check both .s9pk files (manifest, images per arch, static ELF of the right arch,
 # image users), then run the package's own container spec on regtest the way StartOS does
 # (test/startos_regtest.py). No StartOS VM runs here (no KVM for this user); a real-box test needs Mike.
-# Ports 34100-34199 on 127.0.0.1 only (STARTOS_TEST_PORTS=LO-HI and STARTOS_TEST_{MCP,HUB,UI,PROV}_PORT move them). Soak rules: CPUQuota 200%, MemoryMax 4G, nice 19. Never publishes.
+# Ports 24100-24199 on 127.0.0.1 only (STARTOS_TEST_PORTS=LO-HI and STARTOS_TEST_{MCP,HUB,UI,PROV}_PORT move them). Soak rules: CPUQuota 200%, MemoryMax 4G, nice 19. Never publishes.
 # Evidence: run/startos-test/<stamp>/.
 set -euo pipefail
 if [ -z "${STARTOS_TEST_SCOPED:-}" ] && command -v systemd-run >/dev/null; then
@@ -15,7 +15,7 @@ ROOT=$PWD
 STAMP=$(date +%Y%m%d-%H%M%S)
 OUT=$ROOT/run/startos-test/$STAMP
 mkdir -p "$OUT"
-PORTS=${STARTOS_TEST_PORTS:-34100-34199}
+PORTS=${STARTOS_TEST_PORTS:-24100-24199}
 busy=$(ss -ltnH | awk '{print $4}' | sed 's/.*://' | awk -v lo="${PORTS%-*}" -v hi="${PORTS#*-}" '$1>=lo && $1<=hi' | sort -u | tr '\n' ' ')
 [ -z "$busy" ] || { echo "test-startos: ports busy in $PORTS: $busy" >&2; exit 1; }
 START_CLI=${START_CLI:-$HOME/.local/opt/start-cli/start-cli}

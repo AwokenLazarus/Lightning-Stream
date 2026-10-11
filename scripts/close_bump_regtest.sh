@@ -30,7 +30,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
 
-python3 "$HOME/xbt-rnd/xbt-063/tools/portcheck.py" wait $(seq "$PB" $((PB + 9)))
+python3 "$ROOT/scripts/portcheck.py" wait $(seq "$PB" $((PB + 9)))
 "${SOAK[@]}" cargo build -q -j2 --release -p xbt402-interop --bin xbt402-close-bump
 "$B1/scripts/node.sh" wipe >/dev/null 2>&1 || true
 mkdir -p "$XBT402_DATADIR"

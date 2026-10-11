@@ -7,7 +7,7 @@
 #   2. a Rust payer (xbt402 Client + RemoteSigner) on the Rust signer against the same Python provider;
 #   3. B2's Python classes open the Rust signer's sealed files; B2's anchor CLI checks its log.
 # Exact amounts on chain. One pruned Knots 29.4.2 regtest node without txindex, loopback only, no miner
-# processes (blocks from generatetodescriptor). Ports 33200-33299 (AGP-027): node RPC 33201, provider 33210.
+# processes (blocks from generatetodescriptor). Ports 23200-23299 (AGP-027): node RPC 23201, provider 23210.
 # B1/B2 are git-archived at xbt-063's rehearsal/PINS (b1 f105ccc, b2 04c3f56) so later edits cannot change
 # a run. Soak rules: CPUQuota 200%, MemoryMax 4G, nice 19, cargo -j2. Evidence: run/signer-interop-results/.
 set -euo pipefail
@@ -19,7 +19,7 @@ fi
 ROOT=$PWD
 XBT063=${XBT063:-$HOME/xbt-rnd/xbt-063}
 export XBT063
-export REHEARSAL_PORT_BASE=${SIGNER_INTEROP_PORT_BASE:-33200}
+export REHEARSAL_PORT_BASE=${SIGNER_INTEROP_PORT_BASE:-23200}
 export REHEARSAL_RUN=${REHEARSAL_RUN:-$ROOT/run/signer-interop}
 export XBT_BIN=${XBT_BIN:-$HOME/lazarus-regtest/b1-xbt402/knots-29.4.2}
 PY=${SIGNER_INTEROP_PYTHON:-$XBT063/.venv/bin/python}
@@ -43,7 +43,7 @@ echo "== build (release, -j2)"
 cargo build -q -j2 --release -p xbt-signer --bins
 export XBT_SIGNER_BIN=$ROOT/target/release/xbt-signer XBT_SIGNER_PAYER_BIN=$ROOT/target/release/xbt-signer-payer
 cleanup
-python3 "$XBT063/tools/portcheck.py" wait --timeout 75 $((REHEARSAL_PORT_BASE + 1)) $((REHEARSAL_PORT_BASE + 10)) \
+python3 "$ROOT/scripts/portcheck.py" wait --timeout 75 $((REHEARSAL_PORT_BASE + 1)) $((REHEARSAL_PORT_BASE + 10)) \
   || { echo "signer_interop: ports busy" >&2; exit 1; }
 rm -rf "${RUN:?}"
 mkdir -p "$RUN/src/b1" "$RUN/src/b2" "$OUT"

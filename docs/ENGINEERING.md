@@ -43,6 +43,9 @@ cargo build -j2 --release --target aarch64-unknown-linux-gnu -p xbt402
 cargo run --release -p xbt402 --example adaptor_bench
 ./scripts/build_matrix.sh          # every AGP-031 target; writes dist/MATRIX.md
 ./scripts/electrum_interop.sh      # the light Rust payer on real electrs (tcp + TLS) vs the Python provider
+./scripts/failure_interop.sh       # AGP-111: failure paths through the release binaries (lost answers, a silent provider, a hostile Electrum
+                                   # server, kills mid-payment, a refused funded open); each check PASS or FAIL with what it observed
+scripts/third_party_table.py --check   # the dependency table of THIRD_PARTY_NOTICES.md is what cargo tree gives
 cargo test -j2 -p xbt402 --no-default-features --test cmp_surface   # AGP-035: what cmp links, no features
 ./scripts/cmp_clean_build.sh [REF] # AGP-035: clean clone, no .cargo, cargo-zigbuild, x86_64/aarch64/armv7 musl
 scripts/cmp_keys_ecdsa.py          # AGP-035: xbt_primitives::ecdsa vs cmp/keys.py, byte for byte
@@ -190,7 +193,7 @@ v2 headers, more than 4,000 compact targets, and merkle roots. The mainnet retar
 ## Cross-implementation on regtest
 
 `scripts/regtest_interop.sh` runs on a private Knots 29.4.2 node (RDTS on, #419
-`-testcoinbasematuritylong=200:200:6680`, `-testactivationheight=blake2b@101`), on ports 33030–33043.
+`-testcoinbasematuritylong=200:200:6680`, `-testactivationheight=blake2b@101`), on ports 23030–23043.
 It starts no miners. Each close is mined, then its outputs are checked exactly.
 
 | | payer | provider | fee payer | what | result |
@@ -276,7 +279,7 @@ backends); the Rust emitter reproduces it byte for byte; Rust re-verifies it (79
 re-verifies the Rust file. It covers 5 adaptor cases, quotes (an amsat price above 2^64), invoices,
 ROUTE-STATE, auths, `route_ok`/`next_cum` tables and one two-hop lock end to end.
 
-**Routed cross-implementation** (`route_interop.sh`, ports 33100–33212; `XBT_RS_ROUTE_PORT_BASE=B
+**Routed cross-implementation** (`route_interop.sh`, ports 23100–23232; `XBT_RS_ROUTE_PORT_BASE=B
 ROUTE_RSS_OFFSET=3` keeps every port in B..B+99): all 8 combinations of
 client × hub × provider in Rust or Python, 2 providers each, exact amounts on chain for every ch1
 and ch2 close; then `xbt402-route-demo`, the AGP-021 demo in Rust (4 providers, rollover, a
@@ -490,7 +493,7 @@ Tests: `crates/xbt402-interop/tests/hub_make_before_break.rs` (13), and B1
 `tests/security/test_agp053_make_before_break.py` (15). `routing_checks` c5 now expects the next
 ch2 to be open at once.
 
-On regtest, `scripts/rollover_load_regtest.sh` (ports 34900–34999; driver
+On regtest, `scripts/rollover_load_regtest.sh` (ports 24900–24999; driver
 `scripts/interop/rollover_load.py`, client bin `xbt402-rollover-load`) runs one lock after every call
 at 15/s, one block every 3 s, for 45 s. It covers every hub × provider pair of Rust and B1. The runs:
 * 7–8 rollovers per run, with zero refused locks, every call 200, max gap between paid locks
@@ -872,7 +875,7 @@ Reports: `docs/rollover-load-agp057-a-2026-10-03.json` and `...-b-...` (two batc
 **The driver in a small port grant.** `XBT_RS_LOAD_PORT_SPAN` under 100 packs the selected runs two
 ports each from base + 4 (8 runs in 20 ports). Such a grant (42000-42019 here) lies in the kernel's
 ephemeral range (`ip_local_port_range` 32768-60999) and outside `ip_local_reserved_ports`
-(30000-34999 on this host, where the default base 349xx is): any local connection can hold one of
+(30000-34999 on that host, where the default base was 349xx at the time; the default is 24900 now, below the ephemeral range): any local connection can hold one of
 its ports as its source port for a moment, a poll of that very port included, and a hub or provider
 then cannot bind it (`Address already in use`; it cost three runs their start today). The driver
 therefore waits for a process's "ready" line before it polls its port, and starts one that exited
@@ -2577,7 +2580,7 @@ a hidden tx, withheld headers and a stale tip, a lying fee, the wrong chain, a w
 (reorging) chain, three kinds of bad proof, a substituted tx, wrong heights, an invented spend that
 tries to stop a refund, and broadcasts answered with another txid.
 
-`scripts/electrum_interop.sh` (ports 33300-33399) runs a light Rust payer (its own hot key; every read
+`scripts/electrum_interop.sh` (ports 23300-23399) runs a light Rust payer (its own hot key; every read
 and broadcast through Electrum) against two patched electrs 0.11.1 (AGP-024), one behind TLS, both
 required, on a Knots 29.4.2 regtest node, against the Python B1 provider. The node is only the faucet,
 the miner, and the oracle every answer is compared with.
@@ -2795,7 +2798,7 @@ byte for byte (`cmp`). The Rust checks pass 91/91 over XBT-053's file (16 sectio
 75 independent checks). XBT-053's own `check_work_vectors.py` passes 124/124 over the Rust-emitted
 file.
 
-Regtest (`scripts/work_interop.sh`, ports 34100–34199) uses primed (branch `rnd/agp-011`, not public), the stock DATUM
+Regtest (`scripts/work_interop.sh`, ports 24100–24199) uses primed (branch `rnd/agp-011`, not public), the stock DATUM
 gateway, stratum-grind and the XBT-053 relay. Results on 2026-09-29 (evidence in
 `docs/work-interop-agp032-*.json`):
 
@@ -2832,7 +2835,7 @@ through `xbt-primitives` (NTA BIP340).
   per client) and a separate push listener for the Prime (optional bearer token `relay-push-token`); one file
   per lookup on disk, bounded by count and age. `scripts/work_interop.sh` now uses it by default (`RELAY=py` for
   the XBT-053 relay); `scripts/relay_container_test.sh` tests the image.
-* **The live NTA leg.** `scripts/work_nta.sh` (ports 34300–34349, ~20 min): AGP-011's NTA regtest stack with the
+* **The live NTA leg.** `scripts/work_nta.sh` (ports 24300–24349, ~20 min): AGP-011's NTA regtest stack with the
   Rust provider (`--nta`, caps 1/1, carry cap 10 XBT), the Rust payer and the Rust relay. A: paid, the cap holds
   the new share (`credit_cap` live), the audit releases it. B: signer stopped, a signed `unattested` deferral
   line, the Rust audit passes on it (a fraud proof without it), carry freezes new credit (`carry_cap` live). C:

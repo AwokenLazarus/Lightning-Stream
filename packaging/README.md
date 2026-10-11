@@ -30,9 +30,9 @@ packaging/
 
 ```bash
 scripts/oci_build.sh --load                # the six images for amd64, arm64, arm/v7, loaded as <image>:0.1.0
-packaging/umbrel/test-umbrel-apps.sh       # RESULT PASS: lint + 2 cold regtest runs (ports 34000-34099)
+packaging/umbrel/test-umbrel-apps.sh       # RESULT PASS: lint + 2 cold regtest runs (ports 24000-24099)
 packaging/umbrel/test-umbrel-hub-node.sh   # RESULT PASS: the hub beside Paul's node app, our stand-in, and no node (port 24020)
-packaging/startos/test-startos.sh          # RESULT PASS: build + inspect + regtest run (ports 34100-34199)
+packaging/startos/test-startos.sh          # RESULT PASS: build + inspect + regtest run (ports 24100-24199)
 scripts/verify_agp040.sh                   # all of it, plus the unit tests and AGP-038's container test
 ```
 

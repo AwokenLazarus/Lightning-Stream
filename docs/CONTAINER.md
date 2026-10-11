@@ -256,7 +256,7 @@ volumes). The test:
 3. checks that `/readyz` follows the witness and the node;
 4. checks the hub behind a proxy.
 
-Ports 33700–33799. Evidence is written to `run/container-test/<stamp>/`.
+Ports 23700–23799. Evidence is written to `run/container-test/<stamp>/`.
 
 ## 8. Bind mounts and `xbt-init` (AGP-040)
 
