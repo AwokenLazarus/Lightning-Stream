@@ -14,8 +14,8 @@
 //! Two rules every lookup keeps (AGP-092):
 //!
 //! * **Unknown is not absent.** A lookup says "not there" (no such transaction, no such output, not
-//!   in a block, no such coin) only when every server it asked answered. If one did not answer, the
-//!   call fails with [`Kind::Unreachable`]. "Spent" is said only for a confirmed spend with a proof.
+//!   in a block, no such coin) only when every configured server answered. If one did not answer,
+//!   or is down, the call fails with [`Kind::Unreachable`]. "Spent" is said only for a confirmed spend with a proof.
 //!   The one place that does not wait for every server is the search for a spend: missing one there
 //!   answers "unspent", which a caller can only act on by broadcasting, and the network refuses it.
 //! * **A call has a deadline** ([`Config::call_deadline`]): every request made for it ends there, it
@@ -390,13 +390,21 @@ impl Inner {
 /// (the server that claimed it, the height it claimed; 0 or less = its mempool)
 type Claims = Vec<(Arc<Connection>, i64)>;
 
-/// One call's budget: its requests end at `until`, and it forces one header sync at most.
+/// One call's budget: its requests end at `until`, it forces one header sync at most, and it tries
+/// once to reach a server that is down.
 struct Call {
     until: Instant,
     synced: AtomicBool,
+    /// Servers this call could not reach: not tried again in it (a dead server used to cost every
+    /// step of a call one timeout).
+    gone: Mutex<Vec<String>>,
 }
 
 impl Call {
+    fn new(until: Instant) -> Self {
+        Self { until, synced: AtomicBool::new(false), gone: Mutex::new(Vec::new()) }
+    }
+
     fn over(&self) -> bool {
         Instant::now() >= self.until
     }
@@ -405,7 +413,7 @@ impl Call {
 /// The union of the servers' histories of one script.
 struct Hist {
     claims: HashMap<String, Claims>,
-    /// Every server asked gave a usable answer. Without it "not listed" is not known.
+    /// Every configured server gave a usable answer. Without it "not listed" is not known.
     complete: bool,
 }
 
@@ -577,14 +585,27 @@ impl ElectrumBackend {
         })
     }
 
-    fn budget(&self) -> Call {
-        Call { until: Instant::now() + self.call_deadline, synced: AtomicBool::new(false) }
+    /// Did every configured server answer (`answered` of them did)? Only then is "none of them shows
+    /// it" an answer. A server that is down has not said so, whether it was down before the call or
+    /// dropped in the middle of it: with it left out, one lying server and one failing honest one
+    /// would read as "not there".
+    fn all_answer(&self, answered: usize) -> bool {
+        answered == self.conns.len()
     }
 
-    /// The connected servers (connecting the others first, no later than `until`); an error below
-    /// `min_servers`.
-    fn live(&self, until: Option<Instant>) -> Result<Vec<Arc<Connection>>> {
-        let down: Vec<Arc<Connection>> = self.conns.iter().filter(|c| !c.connected()).cloned().collect();
+    fn budget(&self) -> Call {
+        Call::new(Instant::now() + self.call_deadline)
+    }
+
+    /// The connected servers, after one try per call to connect those that are down (no later than
+    /// the call's deadline); an error below `min_servers`. `min_servers` is the floor for what is
+    /// proven. "Not there" needs more: every configured server ([`Self::all_answer`]).
+    fn live(&self, call: &Call) -> Result<Vec<Arc<Connection>>> {
+        let until = Some(call.until);
+        let down: Vec<Arc<Connection>> = {
+            let gone = lock(&call.gone);
+            self.conns.iter().filter(|c| !c.connected() && !gone.contains(&c.url)).cloned().collect()
+        };
         if !down.is_empty() {
             let watched: Vec<(String, Value)> = self.st().watched.iter()
                 .map(|sh| ("blockchain.scripthash.subscribe".to_string(), json!([sh]))).collect();
@@ -604,7 +625,10 @@ impl ElectrumBackend {
                         st.server = server;
                         st.proto = proto;
                     }
-                    Err(e) => i.flag(&c.url, format!("unreachable: {e}")),
+                    Err(e) => {
+                        i.flag(&c.url, format!("unreachable: {e}"));
+                        lock(&call.gone).push(c.url.clone());
+                    }
                 }
             }
         }
@@ -652,7 +676,7 @@ impl ElectrumBackend {
 
     fn sync_now(&self) -> Result<()> {
         self.signal.tip_dirty.store(false, Ordering::SeqCst);
-        let live = self.live(Some(Instant::now() + self.sync_deadline))?;
+        let live = self.live(&Call::new(Instant::now() + self.sync_deadline))?;
         let results = Self::each(&live, |c| self.sync_from(c));
         let mut i = self.st();
         let mut off_chain = Vec::new();
@@ -891,7 +915,7 @@ impl ElectrumBackend {
         if let Some(t) = self.cached_tx(&txid) {
             return Ok(Some(t));
         }
-        let live = self.live(Some(call.until))?;
+        let live = self.live(call)?;
         // one slot per server: no sender ever waits, whether or not we still listen
         let (send, answers) = sync_channel::<(Arc<Connection>, Result<Value>)>(live.len());
         let mut silent: Vec<String> = Vec::new();
@@ -924,7 +948,9 @@ impl ElectrumBackend {
                 }
             }
         }
-        if !silent.is_empty() {
+        if !silent.is_empty() || !self.all_answer(live.len()) {
+            let down = self.conns.iter().filter(|c| !live.iter().any(|l| Arc::ptr_eq(l, c))).map(|c| c.url.clone());
+            silent.extend(down);
             return err(Kind::Unreachable, format!("whether transaction {}.. exists is not known: no answer from {}",
                                                   &txid[..16.min(txid.len())], silent.join(", ")));
         }
@@ -1031,7 +1057,7 @@ impl ElectrumBackend {
     /// an empty history means the servers say there is none.
     fn history(&self, call: &Call, spk: &[u8]) -> Result<Hist> {
         let sh = scripthash(spk);
-        let live = self.live(Some(call.until))?;
+        let live = self.live(call)?;
         let answers = Self::each(&live, |c| {
             c.batch_until(&[("blockchain.scripthash.get_history".to_string(), json!([sh]))], Some(call.until))
                 .and_then(|mut r| r.pop().expect("one answer per request"))
@@ -1079,7 +1105,7 @@ impl ElectrumBackend {
         if answered == 0 {
             return err(Kind::Unreachable, "no server answered get_history");
         }
-        Ok(Hist { claims: out, complete: answered == live.len() })
+        Ok(Hist { claims: out, complete: self.all_answer(answered) })
     }
 
     /// Flag the servers behind history entries that were invented (AGP-081, review E1), judged from
@@ -1330,7 +1356,7 @@ impl ElectrumBackend {
     pub fn broadcast(&self, hex_tx: &str) -> Result<String> {
         let tx = Tx::parse_hex(hex_tx).map_err(|e| ElectrumError::new(Kind::BadRequest, format!("TX decode failed: {e}")))?;
         let txid = tx.txid();
-        let live = self.live(Some(self.budget().until))?;
+        let live = self.live(&self.budget())?;
         let answers = Self::each(&live, |c| c.request("blockchain.transaction.broadcast", json!([hex_tx])));
         let (mut errors, mut accepted) = (Vec::new(), false);
         let mut i = self.st();
@@ -1355,15 +1381,24 @@ impl ElectrumBackend {
     /// checked and none is a proof, or a confirmed spend is proven. If the server went silent
     /// instead, the call fails: a shorter list would read as "no such coin".
     pub fn unspent(&self, spk: &[u8]) -> Result<Vec<Utxo>> {
+        Ok(self.unspent_marked(spk)?.0)
+    }
+
+    /// [`Self::unspent`], and whether every configured server answered the listing. Every coin
+    /// listed is proven either way; without it a coin that is not listed may be one only the missing
+    /// server shows. (The shorter list is marked rather than refused: a scan that failed whenever
+    /// one server was down would leave a wallet without its coins.)
+    pub fn unspent_marked(&self, spk: &[u8]) -> Result<(Vec<Utxo>, bool)> {
         self.sync(false)?;
         let call = self.budget();
         let sh = scripthash(spk);
-        let live = self.live(Some(call.until))?;
+        let live = self.live(&call)?;
         let answers = Self::each(&live, |c| {
             c.batch_until(&[("blockchain.scripthash.listunspent".to_string(), json!([sh]))], Some(call.until))
                 .and_then(|mut r| r.pop().expect("one answer per request"))
         });
         let mut claims: HashMap<(String, u32), Claims> = HashMap::new();
+        let complete;
         {
             let mut answered = 0;
             let mut i = self.st();
@@ -1396,6 +1431,7 @@ impl ElectrumBackend {
                 // an empty list means the servers say the script holds nothing
                 return err(Kind::Unreachable, "no server answered listunspent");
             }
+            complete = self.all_answer(answered);
         }
         let mut keys: Vec<(String, u32)> = claims.keys().cloned().collect();
         keys.sort();
@@ -1442,12 +1478,12 @@ impl ElectrumBackend {
             out.push(Utxo { txid, vout: n, value: tx.outputs[n as usize].value.max(0) as u64, script_pubkey: spk.to_vec(), height,
                            block_hash: hex::encode(block_hash), coinbase: is_coinbase(&tx) });
         }
-        Ok(out)
+        Ok((out, complete))
     }
 
     /// Unverifiable: the median of the servers' answers.
     pub fn estimate_fee(&self, blocks: u32) -> Result<FeeEstimate> {
-        let live = self.live(Some(self.budget().until))?;
+        let live = self.live(&self.budget())?;
         let answers = Self::each(&live, |c| c.request("blockchain.estimatefee", json!([blocks])));
         let mut fees = Vec::new();
         let mut any = false;
@@ -1487,8 +1523,9 @@ impl ElectrumBackend {
         };
         if !new.is_empty() {
             let reqs: Vec<(String, Value)> = new.iter().map(|sh| ("blockchain.scripthash.subscribe".to_string(), json!([sh]))).collect();
-            let until = Some(self.budget().until);
-            let live = self.live(until)?;
+            let call = self.budget();
+            let until = Some(call.until);
+            let live = self.live(&call)?;
             let answers = Self::each(&live, |c| c.subscribe_many(&reqs, until));
             let mut i = self.st();
             for (c, a) in live.iter().zip(answers) {
@@ -1688,13 +1725,15 @@ impl ElectrumBackend {
                     return Err(bad("only 'start'"));
                 }
                 let mut unspents = Vec::new();
-                let mut total = 0u64;
+                let (mut total, mut complete) = (0u64, true);
                 for desc in arg(1).as_array().cloned().unwrap_or_default() {
                     let d = desc.as_str().map(str::to_string)
                         .or_else(|| desc.get("desc").and_then(Value::as_str).map(str::to_string)).unwrap_or_default();
                     let spk = d.strip_prefix("raw(").and_then(|r| r.strip_suffix(')')).and_then(|h| hex::decode(h).ok())
                         .ok_or_else(|| bad(&format!("the light backend takes raw(<script>) descriptors, not {d:?}")))?;
-                    for u in self.unspent(&spk)? {
+                    let (coins, every) = self.unspent_marked(&spk)?;
+                    complete &= every;
+                    for u in coins {
                         total += u.value;
                         unspents.push(json!({"txid": u.txid, "vout": u.vout, "scriptPubKey": hex::encode(&u.script_pubkey), "desc": d,
                                              "amount": u.value as f64 / SATS, "coinbase": u.coinbase, "height": u.height,
@@ -1703,7 +1742,7 @@ impl ElectrumBackend {
                 }
                 let i = self.st();
                 Ok(json!({"success": true, "height": i.tip_height(), "bestblock": i.headers.tip().map(|h| h.hash_hex()),
-                          "unspents": unspents, "total_amount": total as f64 / SATS}))
+                          "unspents": unspents, "total_amount": total as f64 / SATS, "complete": complete}))
             }
             "estimatesmartfee" => {
                 let blocks = arg(0).as_u64().unwrap_or(1).clamp(1, 1008) as u32;

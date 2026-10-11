@@ -2060,15 +2060,18 @@ the light client, with the same test names.
 ### The light client (`xbt-electrum`)
 
 **Rule 1: unknown is not absent.** A lookup says "not there" (no such transaction, no such output,
-not in a block, no such coin) only when every server it asked answered. If one did not answer, the
-call fails with `Kind::Unreachable`. `tx_out` says "spent" only for a confirmed spend with a proof.
+not in a block, no such coin) only when every configured server answered (`all_answer`). If one did
+not answer, or is down, the call fails with `Kind::Unreachable`; `min_servers` is the floor for what
+is proven, not for this. `tx_out` says "spent" only for a confirmed spend with a proof.
 
 | place | before | now |
 |---|---|---|
 | `fetch_tx` (the transaction asked for) | every server failed `transaction.get`: `None` | every server is asked at once, the first that supplies it wins; `None` only if each said it has no such transaction (`NOT_THERE`), else an error |
-| `locate` (is it in a block or a mempool) | one server answered the history without it, the others failed: no status | `Hist::complete`: an error unless every server answered |
+| `locate` (is it in a block or a mempool) | one server answered the history without it, the others failed or were down: no status | `Hist::complete`: an error unless every configured server answered |
+| a server that is down, or drops in the middle of a call | left out of what is asked, so the rest decided | it has not answered: "not there" is an error (`a_server_lost_in_the_middle_of_a_call_is_not_forgotten`) |
 | `confirmed` (the Merkle proof) | the server that listed a height failed the proof request: "unconfirmed" | `Proof::checked`: an error unless a proof was found or every claim was answered |
 | `unspent` (`scantxoutset`) | a coin whose transaction or proof went unanswered was left out | the scan fails |
+| `unspent`, a server that did not answer the listing at all | a shorter list | still returned, since every coin in it is proven, and marked: `unspent_marked`, `"complete": false` in the `scantxoutset` answer |
 | `transaction`, `has_transaction`, `tx_out`, `call("gettxout")`, `call("getrawtransaction")` | as above | all go through `locate` |
 | `spender` (the search for a spend) | a spend only a failing server lists is not found | **unchanged, on purpose**: "unspent" can only be acted on by a broadcast, which the network refuses if it is wrong. Were this an error, one server could hold a refund back by listing a spend and never proving it (`evidence_an_unproven_spend_does_not_hold_the_refund_back`) |
 
@@ -2082,14 +2085,16 @@ a mempool entry for it (electrs lists both while a block arrives), and a second 
 flagged and is not a claim. A server that refuses its tip is hung up on, so the next round
 negotiates the protocol again (electrs answers 1.4 until it has indexed a v2 header). Connecting costs one timeout for the TCP connect and the TLS handshake together
 (`Connection::connect_until`; `complete_io` waited a full read timeout for every byte), then one
-for `server.version` and one for the subscriptions.
+for `server.version` and one for the subscriptions. A server that is down is tried once per call
+(four times per `gettxout` before).
 
-Measured in the tests, debug build, loopback: the audit's 40 entries at 250 ms each, 13.2 s before,
-now one request to the server that listed them (`hole_one_slow_server_holds_gettxout_for_entries_times_delay`
-passes its 4 s line); 50 invented entries, 150 `transaction.get` on the second call before, 1 now;
-200 claims above the tip, 202 sync rounds before, at most 2 now; a TLS handshake trickled at one
-byte per 100 ms under a 300 ms timeout, 4.0 s before, 0.3 s now. Rerun:
-`cargo test -p xbt-electrum --test agp087_light --test agp092_light -- --nocapture`.
+Measured by the audit's tests (their `AGP-087 measure` lines), debug build, loopback, one run: the
+40 entries at 250 ms each held `gettxout` 13.2 s before and 0.97 s now (one request to the server
+that listed them); 50 invented entries cost 150 `transaction.get` on the second call before and 1
+now; 200 claims above the tip forced 202 sync rounds before and 2 now; a TLS handshake trickled at
+one byte per 100 ms under a 300 ms timeout held `connect` 4.0 s before and 0.30 s now. Rerun:
+`cargo test -p xbt-electrum --test agp087_light -- --nocapture --test-threads=1`. On regtest against
+electrs 0.11.1: `XBT_ELECTRUM_PORT_BASE=26000 scripts/electrum_interop.sh`, 3/3 scenarios.
 
 **What a server can still do.**
 
@@ -2097,8 +2102,8 @@ byte per 100 ms under a 300 ms timeout, 4.0 s before, 0.3 s now. Rerun:
   (`evidence_every_server_hiding_reads_as_absent`). A caller that would book a loss on that must
   ask for the proven spend (`spending_tx` with a confirmed status), as B2's refund and
   `funding_spent` now do (`chain.spend_is_evidence`).
-* By not answering, a server turns every "not there" into an error for as long as it is
-  configured. By listing transactions that pay the script (which cannot be told from unconfirmed
+* By not answering, or by being down, a server turns every "not there" into an error for as long
+  as it is configured. By listing transactions that pay the script (which cannot be told from unconfirmed
   payments) and supplying them slowly, it holds each call that reads that script up to
   `call_deadline`. Both are flagged; the cure is to remove the server.
 * "No such transaction" and "not in that block" are read from the server's words
@@ -2129,7 +2134,10 @@ P2PKH spend). The search is breadth first through coins confirmed at or above th
 up at most `ANCESTRY_LOOKUPS` (256) transactions; the verdict is cached per funding block as
 before. A funding with no pin in reach is refused, and the refusal says how to fund one that
 passes (mined coins, or coins that went through a P2PKH address after the split). Tests:
-`agp087_ln_l5_a_funding_whose_replayed_parent_is_signed_0x01_is_not_proven`, `agp092_l5_*` (3).
+`agp087_ln_l5_a_funding_whose_replayed_parent_is_signed_0x01_is_not_proven`, `agp092_l5_*` (3), and
+on real nodes `scripts/ln_rail_regtest.sh` (Lightning Fork `.17`): 87/87, with the lab's proven
+channels now funded from a P2PKH coin (`drive.py::send_pinned`) and S10 checking the pin
+(`docs/agp092_ln_rail_regtest.json`).
 The test rig's channels are now funded from a coinbase, as a mined coin is; no assertion changed.
 **This changes which channels carry payments**: a node funded from coins with a long history of
 segwit spends is refused until it is funded as above. The signatures are still not verified in the
@@ -2147,8 +2155,9 @@ rename, so a halt survives a power loss. Test:
 `agp092_ln_state_files_are_written_through_the_durable_steps`.
 
 **For embedders.** `xbt_electrum::Config` has a new field `call_deadline`; `Connection` has
-`connect_until`, and `subscribe_many` takes a deadline. Calls that answered `None` or an empty list
-when a server was silent now return `Kind::Unreachable`. `LnPolicy` has `node_max_cltv_blocks`.
+`connect_until`, and `subscribe_many` takes a deadline. Calls that answered `None` or left a coin
+out when a server was silent or down now return `Kind::Unreachable`; `unspent_marked` and the
+`complete` field of a `scantxoutset` answer say whether every configured server answered. `LnPolicy` has `node_max_cltv_blocks`.
 `ln_funding::Funding::Proven` evidence has an `xbt_only` object.
 
 ## Portability

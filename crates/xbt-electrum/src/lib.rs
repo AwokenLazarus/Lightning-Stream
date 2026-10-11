@@ -30,8 +30,8 @@
 //! * **Mempool facts cannot be proven.** A spend seen only in a mempool never makes an output count
 //!   as spent, so a lying server cannot talk the wallet out of a refund.
 //! * **Unknown is not absent** (AGP-092). A lookup says "not there" (no such transaction or output,
-//!   not in a block, no such coin) only when every server it asked answered; if one did not, the call
-//!   fails with [`Kind::Unreachable`]. `tx_out` says "spent" only for a confirmed spend with a proof.
+//!   not in a block, no such coin) only when every configured server answered; if one did not, or is
+//!   down, the call fails with [`Kind::Unreachable`]. (`min_servers` is the floor for what is proven.) `tx_out` says "spent" only for a confirmed spend with a proof.
 //!
 //! * **What one server can cost is bounded.** A line is held, before it is parsed, to the bytes and
 //!   JSON values the requests waiting on that connection allow ([`conn::answer_cap`], at most
@@ -50,8 +50,8 @@
 //!   ([`ElectrumBackend::spending_tx`] with a confirmed status), not for an empty `tx_out`.
 //! * Withhold new blocks (the tip lags: `status()["tip_age_s"]`), lie about fees (unverifiable,
 //!   reported as such), and learn which scripts we watch.
-//! * Make calls fail or slow, never answer wrongly: by not answering it turns a "not there" into an
-//!   error for as long as it is configured, and by listing transactions that pay the script and
+//! * Make calls fail or slow, never answer wrongly: by not answering, or by being down, it turns a
+//!   "not there" into an error for as long as it is configured, and by listing transactions that pay the script and
 //!   supplying them slowly it holds each call that reads that script up to [`Config::call_deadline`].
 //!   Both are flagged in `status()["verification_failures"]`; the cure is to remove the server.
 //! * An invented transaction that pays the script cannot be told from an unconfirmed payment.

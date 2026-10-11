@@ -317,3 +317,134 @@ fn a_server_that_refuses_its_tip_is_reconnected_to() {
     assert_eq!(b.block_count().unwrap(), 200);
     assert_eq!(versions(&s), 2, "it negotiated again on a new connection");
 }
+
+/// A TCP proxy that, once `cut` is set, hangs up on any request line containing `needle` and on every
+/// new connection: a server that drops in the middle of a call and cannot be reached again.
+struct CutProxy {
+    addr: SocketAddr,
+    cut: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl CutProxy {
+    fn start(upstream: SocketAddr, needle: &'static str) -> Self {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let cut = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = cut.clone();
+        std::thread::spawn(move || {
+            for c in l.incoming() {
+                let Ok(client) = c else { break };
+                if flag.load(Ordering::SeqCst) {
+                    continue; // dropped: the client sees the connection close
+                }
+                let Ok(up) = TcpStream::connect(upstream) else { continue };
+                let (mut up_r, mut client_w) = (up.try_clone().unwrap(), client.try_clone().unwrap());
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 1 << 16];
+                    while let Ok(n) = up_r.read(&mut buf) {
+                        if n == 0 || client_w.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                    let _ = client_w.shutdown(std::net::Shutdown::Both);
+                });
+                let flag = flag.clone();
+                std::thread::spawn(move || {
+                    let mut up = up;
+                    let hang_up = client.try_clone().unwrap();
+                    for line in BufReader::new(client).lines() {
+                        let Ok(line) = line else { break };
+                        if flag.load(Ordering::SeqCst) && line.contains(needle) {
+                            break;
+                        }
+                        if up.write_all(line.as_bytes()).and_then(|_| up.write_all(b"\n")).is_err() {
+                            break;
+                        }
+                    }
+                    let _ = up.shutdown(std::net::Shutdown::Both);
+                    let _ = hang_up.shutdown(std::net::Shutdown::Both);
+                });
+            }
+        });
+        Self { addr, cut }
+    }
+
+    fn url(&self) -> String {
+        format!("tcp://{}", self.addr)
+    }
+}
+
+/// One step on from the busy honest server: the honest server drops in the middle of the call and
+/// cannot be reached again, so the later steps ask the liar alone. It supplies the transaction and
+/// leaves it out of the history. "Every server asked answered" must not shrink to the liar.
+#[test]
+fn a_server_lost_in_the_middle_of_a_call_is_not_forgotten() {
+    let chain = sim(200);
+    let fund = spk(0x5c);
+    let f = chain.lock().unwrap().credit(0, 70_000, &fund, true);
+    let (liar, honest) = (FakeElectrum::start(chain.clone(), false), FakeElectrum::start(chain.clone(), false));
+    liar.knobs().unlisted.insert(f.clone());
+    let cut = CutProxy::start(honest.addr, "blockchain.transaction.get");
+    let b = backend(&chain, &[liar.url(), cut.url()]);
+    assert_eq!(b.block_count().unwrap(), 201);
+    cut.cut.store(true, Ordering::SeqCst);
+    for include_mempool in [true, false] {
+        let out = b.tx_out(&f, 0, include_mempool);
+        assert!(out.is_err(), "the honest server dropped mid-call and the liar's history decided: {out:?}");
+    }
+    assert!(ChainBackend::has_transaction(&b, &f).is_err());
+    // it is back: the funding is there
+    cut.cut.store(false, Ordering::SeqCst);
+    assert_eq!(b.tx_out(&f, 0, true).unwrap().unwrap().confirmations, 1);
+}
+
+/// A server that is down costs a call one try to reach it, not one per step (four per `gettxout`
+/// before, which is the whole of the call's deadline).
+#[test]
+fn a_dead_server_is_tried_once_per_call() {
+    let chain = sim(200);
+    let fund = spk(0x5d);
+    let f = chain.lock().unwrap().credit(0, 70_000, &fund, true);
+    let honest = FakeElectrum::start(chain.clone(), false);
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead = format!("tcp://{}", l.local_addr().unwrap());
+    let accepted = Arc::new(Mutex::new(Vec::new()));
+    let held = accepted.clone();
+    std::thread::spawn(move || {
+        for c in l.incoming().flatten() {
+            held.lock().unwrap().push(c); // accepted, never answered
+        }
+    });
+    let timeout = Duration::from_millis(300);
+    let b = ElectrumBackend::new(cfg(&chain, &[dead, honest.url()], timeout)).unwrap();
+    assert_eq!(b.block_count().unwrap(), 201);
+    let before = accepted.lock().unwrap().len();
+    let t = Instant::now();
+    assert!(b.tx_out(&f, 0, false).unwrap().is_some());
+    let (took, tries) = (t.elapsed(), accepted.lock().unwrap().len() - before);
+    // one for the call's header sync, one for the call
+    assert!(tries <= 2, "{tries} connections to the dead server in one gettxout");
+    assert!(took < timeout * 3, "{took:?}");
+    // and it does not use up a scan of several coins
+    for k in 0..6u8 {
+        chain.lock().unwrap().credit(0, 1_000 + k as u64, &fund, true);
+    }
+    assert_eq!(b.unspent(&fund).unwrap().len(), 7);
+}
+
+/// The unspent list is the union over the servers that answer. With one missing it is still returned
+/// (its coins are proven), and marked: a coin not in it may be one only the missing server shows.
+#[test]
+fn a_scan_with_a_server_missing_is_marked() {
+    let chain = sim(200);
+    let a = spk(0x5e);
+    chain.lock().unwrap().credit(0, 70_000, &a, true);
+    let (s1, s2) = (FakeElectrum::start(chain.clone(), false), FakeElectrum::start(chain.clone(), false));
+    let b = backend(&chain, &[s1.url(), s2.url()]);
+    let scan = |b: &ElectrumBackend| b.call("scantxoutset", &serde_json::json!(["start", [format!("raw({})", hex::encode(&a))]])).unwrap();
+    assert_eq!((scan(&b)["unspents"].as_array().unwrap().len(), &scan(&b)["complete"]), (1, &serde_json::json!(true)));
+    s2.knobs().fail.insert("blockchain.scripthash.listunspent".into(), BUSY.into());
+    let (coins, complete) = b.unspent_marked(&a).unwrap();
+    assert_eq!((coins.len(), complete), (1, false));
+    assert_eq!(scan(&b)["complete"], false);
+}
