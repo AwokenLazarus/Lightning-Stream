@@ -1035,3 +1035,104 @@ mod sockets {
         assert!(r.is_err(), "{r:?}");
     }
 }
+
+// --- AGP-094 (fix wave 5): the routed client's open, stage by stage --------------------------------------------
+
+/// A wallet that knows its own sends, and whose next `fund` errors after it sent.
+struct Flaky {
+    inner: Shared,
+    fail_after_send: AtomicBool,
+}
+
+impl Wallet for Flaky {
+    fn fund(&self, address: &str, sats: u64) -> Result<(String, u32)> {
+        let r = self.inner.fund(address, sats)?;
+        if self.fail_after_send.swap(false, Ordering::SeqCst) {
+            return Err(ChannelError::new("wallet_error", "timed out after the send"));
+        }
+        Ok(r)
+    }
+    fn wallet_sends_to(&self, address: &str) -> Result<Vec<String>> {
+        Ok(self.inner.0.sends.lock().unwrap().iter().filter(|s| s.1 == address).map(|s| s.0.clone()).collect())
+    }
+    fn wallet_send(&self, txid: &str, address: &str) -> Result<Option<WalletSend>> {
+        Ok(self.inner.0.sends.lock().unwrap().iter().find(|s| s.0 == txid && s.1 == address)
+            .map(|s| WalletSend { txid: s.0.clone(), vout: 0, sats: s.2, confirmations: 6, abandoned: false }))
+    }
+}
+
+impl Routed {
+    fn payer_with(&self, signer: Arc<dyn RouteSigner>, wallet: Arc<dyn Wallet>) -> RoutePayer {
+        let c = self.w.chain.clone();
+        RoutePayer::new(HUB, RoutePayerConfig::new(NET), signer, wallet,
+                        Box::new(HubNet { hub: self.hub.clone(), refuse: self.refuse.clone(), lose: self.lose.clone() }), Box::new(move || c.block_count()))
+    }
+}
+
+/// The audit's "from reading" beside item 5: `fund_channel` errors after it broadcast. The next
+/// `open` finds the wallet's own send to ch1's script and goes on with it, under the key the
+/// first call was given (a second `new_key` would replace it in a `LocalSigner`, and the funded
+/// channel could then not be bound: `attach` checks the key).
+#[test]
+fn agp094_a_ch1_funding_that_failed_after_it_was_sent_is_adopted_under_the_same_key() {
+    let r = routed("route-flaky");
+    let wallet = Arc::new(Flaky { inner: Shared(r.w.wallet.clone()), fail_after_send: AtomicBool::new(true) });
+    let pay = r.payer_with(Arc::new(LocalSigner::new()), wallet);
+    assert_eq!(pay.open().unwrap_err().code, "wallet_error");
+    assert_eq!(r.w.funded(), 1, "control: the funding was sent");
+    assert!(pay.chan().is_none(), "no outpoint on the books yet");
+    let out = pay.open().unwrap();
+    assert_eq!((r.w.funded(), out["resumed"].clone()), (1, json!(true)), "the send is adopted, nothing is funded twice");
+    assert_eq!(pay.chan(), out["chan"].as_str().map(str::to_string));
+}
+
+/// ch1's key is on the books before the wallet is asked: a wallet that refuses (nothing sent)
+/// leaves a ch1 recorded without an outpoint, and the next `open` funds that one, once. With a
+/// ledger a restarted payer reads it back and does the same.
+#[test]
+fn agp094_a_keyed_ch1_is_funded_once_by_the_next_open_with_and_without_a_ledger() {
+    for with_ledger in [false, true] {
+        let r = routed(if with_ledger { "route-keyed-l" } else { "route-keyed" });
+        let signer: Arc<dyn RouteSigner> = Arc::new(LocalSigner::new());
+        let path = r.w.dir.join("route.jsonl");
+        let make = || {
+            let p = r.payer_with(signer.clone(), Arc::new(Shared(r.w.wallet.clone())));
+            if with_ledger { p.with_ledger(Box::new(FileClientLedger::open(&path).unwrap())).unwrap() } else { p }
+        };
+        let mut pay = make();
+        r.w.wallet.refuses.store(true, Ordering::SeqCst);
+        for _ in 0..3 {
+            assert_eq!(pay.open().unwrap_err().code, "wallet_error");
+        }
+        assert_eq!(r.w.funded(), 0);
+        r.w.wallet.refuses.store(false, Ordering::SeqCst);
+        if with_ledger {
+            drop(pay);
+            pay = make(); // a restart: the keyed ch1 is read back
+        }
+        pay.open().unwrap();
+        pay.open().unwrap();
+        assert_eq!(r.w.funded(), 1, "ledger {with_ledger}");
+    }
+}
+
+/// The bound of the new record: a ch1 recorded, never funded, and now too near its expiry for
+/// the hub to open is not funded and not replaced (an earlier call may have sent its funding):
+/// `open_unresolved`, until the owner says the wallet shows no send to it (`forget_unfunded`).
+#[test]
+fn agp094_a_keyed_ch1_too_old_to_fund_is_refused_until_it_is_forgotten() {
+    let r = routed("route-stale");
+    let pay = r.payer();
+    r.w.wallet.refuses.store(true, Ordering::SeqCst);
+    assert_eq!(pay.open().unwrap_err().code, "wallet_error");
+    r.w.wallet.refuses.store(false, Ordering::SeqCst);
+    // RoutePayerConfig's 8,000 blocks against the hub's floor (500 + minConf + 36 here)
+    *r.w.chain.tip.lock().unwrap() += 8_000 - 400;
+    assert_eq!(pay.open().unwrap_err().code, "open_unresolved");
+    assert_eq!(r.w.funded(), 0);
+    assert!(pay.forget_unfunded().unwrap() && !pay.forget_unfunded().unwrap());
+    // (back at the height the rig's hub still has cached) a new ch1, a new key, funded once
+    *r.w.chain.tip.lock().unwrap() -= 8_000 - 400;
+    pay.open().unwrap();
+    assert_eq!(r.w.funded(), 1);
+}
