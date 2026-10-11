@@ -42,6 +42,20 @@ impl Wallet for MiningWallet {
         self.0.call("generatetoaddress", json!([1, self.1]))?;
         Ok(r)
     }
+
+    // AGP-105: the node wallet's own record of its sends. With `fund` alone this wrapper was a
+    // wallet that "cannot say", and a funding call that failed after it sent was sent again
+    fn knows_its_sends(&self) -> bool {
+        self.0.wallet("w").knows_its_sends()
+    }
+
+    fn wallet_sends_to(&self, address: &str) -> xbt402::Result<Vec<String>> {
+        self.0.wallet("w").wallet_sends_to(address)
+    }
+
+    fn wallet_send(&self, txid: &str, address: &str) -> xbt402::Result<Option<xbt402::client::WalletSend>> {
+        self.0.wallet("w").wallet_send(txid, address)
+    }
 }
 
 /// The signer's hot key funds; a block is mined for the hub's minConf 1 (regtest harness only).
@@ -58,6 +72,11 @@ impl Wallet for SignerMiningWallet {
         let r = self.0.fund_channel(origin, params, address, sats)?;
         self.1.call("generatetoaddress", json!([1, self.2]))?;
         Ok(r)
+    }
+
+    // AGP-105: the signer keeps the channel it funded (`xbt402_funded`)
+    fn knows_its_sends(&self) -> bool {
+        self.0.knows_its_sends()
     }
 }
 

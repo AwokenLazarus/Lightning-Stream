@@ -37,6 +37,14 @@ use crate::wire::*;
 /// How the client talks HTTP. Header names in the response may be any case.
 pub trait Transport: Send + Sync {
     fn request(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)]) -> Result<HttpResponse>;
+
+    /// [`request`](Self::request), given up with an error when no whole answer came `within` that
+    /// long (AGP-105: the hub's check of a lock is bounded by its `revealTimeoutSec`, not by the
+    /// transport's own timeout). The default has no bound but the transport's own, so a caller
+    /// that needs the bound also measures the time; `http::UreqTransport` keeps it.
+    fn request_within(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)], _within: std::time::Duration) -> Result<HttpResponse> {
+        self.request(method, url, body, headers)
+    }
 }
 
 /// The only wallet hook: fund `address` with `sats`, return the funding outpoint (display txid,
@@ -62,6 +70,16 @@ pub trait Wallet: Send + Sync {
     fn wallet_send(&self, _txid: &str, _address: &str) -> Result<Option<WalletSend>> {
         Ok(None)
     }
+
+    /// Whether "none known" from this wallet means it sent nothing (AGP-105, fourth audit item 6).
+    /// True for a wallet that lists its sends ([`wallet_sends_to`](Self::wallet_sends_to): `Rpc`)
+    /// or whose signer keeps the record ([`RouteSigner::funded`](crate::signer::RouteSigner::funded):
+    /// the signer's own wallet). False, the default, is "cannot say": after a `fund` call that
+    /// did not return an outpoint, [`RoutePayer`](crate::route_client::RoutePayer) funds nothing
+    /// more through such a wallet until its owner has looked.
+    fn knows_its_sends(&self) -> bool {
+        false
+    }
 }
 
 /// A send the wallet knows (AGP-045): its output to the address and whether it can still confirm.
@@ -84,6 +102,22 @@ impl WalletSend {
 
 /// A new payer key: its pubkey, the local secret if the client holds it, the payer change spk.
 type FreshKey = (Vec<u8>, Option<SecretKey>, Option<Vec<u8>>);
+
+/// The blocks to expiry the shipped payers ask for (`xbt-signer-payer --expiry-blocks`,
+/// `xbt-wallet-mcp`'s `XBT_MCP_EXPIRY_BLOCKS`): two weeks.
+///
+/// AGP-105 (fourth audit item 7). They asked for 1,008, which is below the shipped provider's
+/// floor (`minExpiryBlocks` 1,008 + `minConf` 1 + `closeMarginBlocks` 144 = 1,153), so every
+/// channel was derived with exactly the floor. A channel whose funding is sent can be opened
+/// while it has `minExpiryBlocks + minConf` (1,009) left
+/// ([`offer_open_floor`](crate::funding::offer_open_floor)): 144 blocks, one day, after which a
+/// payer that had lost the funding's answer was refused `open_unresolved` and its coins and that
+/// seller waited about a week for the signer's refund. With 2,016 the window is 1,007 blocks,
+/// about a week, and the coins are locked for up to two weeks in place of eight days. The
+/// window does not go away: a payer away for longer still waits for the refund, 1,009 blocks.
+/// [`ClientConfig::new`] keeps 1,008 (an embedder sets its own); the numbers are pinned in
+/// `tests/agp105_client.rs`.
+pub const SHIPPED_PAYER_EXPIRY_BLOCKS: u32 = 2_016;
 
 /// Client settings (the reference's constructor keywords).
 #[derive(Debug, Clone)]
@@ -1276,7 +1310,8 @@ impl Client {
     }
 
     fn request_inner(&mut self, method: &str, url: &str, body: &[u8], opts: &CallOpts<'_>) -> Result<HttpResponse> {
-        crate::wire::no_fragment(url)?;
+        // AGP-105: before anything is signed or sent, and whatever the transport
+        let url = &crate::wire::sendable_url(url)?;
         let (origin, path) = split_url(url);
         let extra = opts.checked_headers()?;
         let with_extra = |mut h: Vec<(String, String)>| {
@@ -1624,7 +1659,7 @@ impl Client {
     }
 
     fn request_conditional_inner(&mut self, method: &str, url: &str, body: &[u8]) -> Result<(HttpResponse, Vec<u8>)> {
-        crate::wire::no_fragment(url)?;
+        let url = &crate::wire::sendable_url(url)?;
         let (origin, path) = split_url(url);
         let r = self.transport.request(method, url, body, &[])?;
         if r.status != 402 {

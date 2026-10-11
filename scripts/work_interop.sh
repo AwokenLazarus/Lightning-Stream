@@ -30,7 +30,10 @@ export FLAGSHIP_PORT_BASE=${WORK_PORT_BASE:-34100}
 BASE=$FLAGSHIP_PORT_BASE
 export XBT063_RUN=${WORK_RUN:-$ROOT/run/work-$BASE}
 RUN=$XBT063_RUN
-T=${CARGO_TARGET_DIR:-$HOME/xbt-rnd/xbt-rs-target}/release
+# AGP-105: the binaries this script builds (cargo build below writes to CARGO_TARGET_DIR, by default
+# ./target). It ran them from ~/xbt-rnd/xbt-rs-target, a shared directory it had not built into, so it
+# tested whatever another tree last built there
+T=${CARGO_TARGET_DIR:-$ROOT/target}/release
 CALLS=${WORK_CALLS:-2}
 MINER_MAX_SECS=${WORK_MAX_SECS:-1500}
 RPC_A=$((BASE + 1)); RPC_B=$((BASE + 3))
@@ -68,6 +71,7 @@ rm -rf "${RUN:?}"; mkdir -p "$RUN/prime"
 python3 "$X063/tools/portcheck.py" wait --timeout 75 "${PORTS[@]}" || { echo "work_interop: ports busy" >&2; exit 1; }
 
 echo "== node (short chain: 110 blocks), ports ${BASE}+ ; payer=$PAYER provider=$PROVIDER"
+echo "   xbt-rs $ROOT @ $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null), binaries $T"
 node up
 cli createwallet faucet >/dev/null
 cli generatetoaddress 110 "$(cli -rpcwallet=faucet getnewaddress)" >/dev/null

@@ -379,7 +379,8 @@ def scenario(i, name, j=0):
         conf = {"node": {"rpcport": int(RPCPORT), "cookie": COOKIE, "wallet": "w"}, "network": NET, "port": hub_port,
                 "datadir": hub_dir, "pay_to_key_file": key, "connect": [url], "watch_interval": watch_s,
                 "hub": {"fee_base_msat": 100, "fee_ppm": 2000, "max_lock_sat": 20000, "max_unguarded_lock_sat": 500,
-                        "delta": 144, "reveal_timeout": 2.0, "ch2_capacity": 100000, "ch2_expiry_blocks": 1100,
+                        # (AGP-105: reveal_timeout at the hub's default, as route_interop.py)
+                        "delta": 144, "ch2_capacity": 100000, "ch2_expiry_blocks": 1100,
                         "close_margin": 144, "policy": {"min_expiry_blocks": 1008, "max_expiry_blocks": 8640}}}
         if is_high:                       # room for the whole run on one ch2 line (a rollover adds no coins)
             conf["hub"].update(ch2_capacity=1_000_000, settle_lock_multiple=floor_k)

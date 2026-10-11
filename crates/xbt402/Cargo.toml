@@ -37,6 +37,10 @@ ureq = { workspace = true, optional = true }
 xbt-svc = { workspace = true, optional = true }
 
 # the hub service (B1 `python -m xbt402.hub --config hub.json`); the library needs none of these
+[dev-dependencies]
+# AGP-105: the parser ureq hands a URL to, to test `wire::sendable_url` against (already in the tree)
+url = "2.5"
+
 [[bin]]
 name = "xbt402-hub"
 required-features = ["rpc", "http-client", "http-server"]

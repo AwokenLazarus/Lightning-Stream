@@ -129,6 +129,11 @@ impl Wallet for Rpc {
         Ok((txid, vout as u32))
     }
 
+    /// `listtransactions` is this wallet's record of what it sent.
+    fn knows_its_sends(&self) -> bool {
+        true
+    }
+
     fn wallet_sends_to(&self, address: &str) -> Result<Vec<String>> {
         let r = self.call("listtransactions", json!(["*", 1000, 0, true]))?;
         let mut out: Vec<String> = vec![];

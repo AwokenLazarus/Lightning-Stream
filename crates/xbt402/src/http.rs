@@ -39,7 +39,24 @@ mod client {
 
     impl Transport for UreqTransport {
         fn request(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)]) -> Result<HttpResponse> {
+            self.send(method, url, body, headers, None)
+        }
+
+        fn request_within(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)], within: Duration) -> Result<HttpResponse> {
+            self.send(method, url, body, headers, Some(within))
+        }
+    }
+
+    impl UreqTransport {
+        /// `within`: this request's own deadline, from connect to the last byte of the answer, in
+        /// place of the agent's 30 s.
+        fn send(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)], within: Option<Duration>) -> Result<HttpResponse> {
+            // AGP-105: ureq parses the string again, so it is given only what `request_url` read
+            let url = &crate::wire::sendable_url(url)?;
             let mut req = self.agent.request(method, url);
+            if let Some(d) = within {
+                req = req.timeout(d);
+            }
             for (k, v) in headers {
                 req = req.set(k, v);
             }

@@ -52,6 +52,7 @@ python3 "$HOME/xbt-rnd/xbt-063/tools/portcheck.py" wait $ports
 "$B1/scripts/node.sh" up
 FAIL=0
 echo "== 1. client x hub x provider, Rust (RS), Python B1 (PY), Rust payer on the Rust signer (RSS); exact amounts on chain"
+echo "   xbt-rs $ROOT @ $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null) (binaries $RS_BIN); B1 $B1 @ $(git -C "$B1" rev-parse --short HEAD 2>/dev/null); ports $PB+; hub and providers at their shipped defaults"
 "$PY" scripts/interop/route_interop.py || FAIL=1
 if [ -z "${ROUTE_SKIP_DEMO:-}" ]; then
   echo "== 2. the all-Rust AGP-021 demo scenarios"

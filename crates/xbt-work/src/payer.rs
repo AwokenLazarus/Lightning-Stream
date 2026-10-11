@@ -229,6 +229,8 @@ impl WorkPayer {
 
     /// GET `url`, and on a 402 that offers xbt-work take an invoice: the session to mine for.
     pub fn prepare(&self, t: &dyn Transport, url: &str) -> Result<Session> {
+        // AGP-105: the session is keyed by the host the request is sent to (`wire::sendable_url`)
+        let url = &xbt402::wire::sendable_url(url).map_err(WorkError::from)?;
         let (origin, _) = split_url(url);
         let r = t.request("GET", url, b"", &[])?;
         if r.status != 402 {

@@ -5,7 +5,7 @@
 Env: XBT402_B1, XBT402_DATADIR, XBT402_RPCPORT (B1's RPC.from_env); XBT402_ROUTE_WAL (AGP-054: a RouteWal path);
 XBT402_SETTLE_LOCK_MULTIPLE (AGP-056: the default zero-conf cap is at least 2 x this x the largest lock; 0: the AGP-053 cap)."""
 import json, os, sys, tempfile
-sys.path.insert(0, os.environ.get("XBT402_B1", os.path.expanduser("~/xbt-rnd/b1-agp-023")))
+sys.path.insert(0, os.environ.get("XBT402_B1", os.path.expanduser("~/xbt-rnd/b1")))
 from xbt402.funding import FundingPolicy  # noqa: E402
 from xbt402.rpc import RPC  # noqa: E402
 from xbt402.x402_channel import XbtChannelProvider, network_id  # noqa: E402
@@ -31,7 +31,8 @@ prov = XbtChannelProvider(node, secret, net, f"{tmp}/ledger.sqlite", lambda m, p
                           **({"route_wal": os.environ["XBT402_ROUTE_WAL"]} if os.environ.get("XBT402_ROUTE_WAL") else {}),
                           **({"settle_lock_multiple": int(os.environ["XBT402_SETTLE_LOCK_MULTIPLE"])}
                              if os.environ.get("XBT402_SETTLE_LOCK_MULTIPLE") else {}))
-prov.offer_route("/v1/chunk", window=1.0, lock_wait=3.0, invoice_ttl=8.0, amsat_per_call=amsat)
+# (AGP-105: the invoice TTL is B1's default, 15 s; the 8 s set here is never routed by a hub at its default)
+prov.offer_route("/v1/chunk", window=1.0, lock_wait=3.0, amsat_per_call=amsat)
 prov.watch(interval=watch_s)
 srv = prov.http_server(port)
 print(f"py route provider {prov.pay_to} on {port} ready", file=sys.stderr, flush=True)

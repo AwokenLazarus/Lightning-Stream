@@ -5,7 +5,7 @@ on-chain amounts are checked exactly. Prints one JSON line; exit 0 only if every
     py_payer.py URL [CALLS] [CONDITIONAL_PATH]
 Env: XBT402_B1, XBT402_DATADIR, XBT402_RPCPORT."""
 import json, os, sys
-sys.path.insert(0, os.environ.get("XBT402_B1", os.path.expanduser("~/xbt-rnd/b1-agp-050")))
+sys.path.insert(0, os.environ.get("XBT402_B1", os.path.expanduser("~/xbt-rnd/b1")))
 from xbt402.rpc import RPC  # noqa: E402
 from xbt402.tx import Tx  # noqa: E402
 from xbt402.x402_channel import XbtChannelClient, network_id  # noqa: E402

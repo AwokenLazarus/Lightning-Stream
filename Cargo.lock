@@ -2638,6 +2638,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "ureq",
+ "url",
  "xbt-primitives",
  "xbt-svc",
  "zeroize",

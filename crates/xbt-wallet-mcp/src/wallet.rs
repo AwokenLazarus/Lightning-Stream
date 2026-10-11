@@ -210,7 +210,9 @@ impl LocalConfig {
             Ok(p) => Some(PathBuf::from(p)),
             Err(_) => Some(std::env::var("B2_ROOT").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(".")).join(".run").join("mcp-payer.jsonl")),
         };
-        Ok(Self { network, capacity: n("XBT_MCP_CAPACITY", 10_000), expiry_blocks: n("XBT_MCP_EXPIRY_BLOCKS", 1_008) as u32,
+        // AGP-105: the expiry asked for is two weeks (it was 1,008 blocks): about a week to come back for a funded channel
+        Ok(Self { network, capacity: n("XBT_MCP_CAPACITY", 10_000),
+                  expiry_blocks: n("XBT_MCP_EXPIRY_BLOCKS", xbt402::client::SHIPPED_PAYER_EXPIRY_BLOCKS as u64) as u32,
                   budget_sats: n("XBT_MCP_BUDGET_SATS", 1_000_000), min_conf: n("XBT_MCP_MIN_CONF", 1), ledger })
     }
 }
@@ -305,6 +307,11 @@ impl LocalPayer {
     /// One paid call through xbt402's `Client`. The provider's body and receipt only come back under
     /// `untrusted_provider_response`, as the signer's own `xbt402_pay` returns them.
     fn pay(&mut self, url: &str, method: &str, body: &str, max_sats: u64) -> Value {
+        // AGP-105: the allowlist is checked on the host the probe and the payment are sent to
+        let url = &match xbt402::wire::sendable_url(url) {
+            Ok(u) => u,
+            Err(e) => return deny(e),
+        };
         let (origin, _) = split_url(url);
         let cap = xbt_signer::session::body_cap();
         // AGP-063 X1: the owner's allowlist before any request, so the probe reaches no other host

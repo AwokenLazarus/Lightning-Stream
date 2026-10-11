@@ -551,6 +551,9 @@ pub struct OutChannel {
     /// AGP-094: the tip when the watcher first saw this funding spent in a block, for a scan that
     /// does not say how deep the spender is (0: not seen so, or the funding is unspent again).
     pub gone_at: u32,
+    /// AGP-105: the height at (or just below) which the scan last found this funding's spender in
+    /// a block (0: not found in one). See [`RouteHub::find_funding_spend`].
+    pub spend_at: u32,
 }
 
 /// States in which the hub's coins are committed.
@@ -583,7 +586,7 @@ impl OutChannel {
                refund_txid: String::new(), refund_fee: 0, final_: false, next: Map::new(), fund_error: String::new(),
                refund_at: 0, refund_prev: vec![], close_prev: String::new(), fund_txid: String::new(), fund_vout: 0,
                rolled_from: String::new(), zero_conf: Map::new(), max_lock: 0, last_lock_at: 0.0, rolled_at: 0.0, fund_seen: false,
-               retired: false, fund_confirmed: false, spend_seen: false, refill_owed: false, gone_at: 0 }
+               retired: false, fund_confirmed: false, spend_seen: false, refill_owed: false, gone_at: 0, spend_at: 0 }
     }
 
     pub fn to_json(&self) -> Value {
@@ -595,7 +598,7 @@ impl OutChannel {
                "refund_at": self.refund_at, "refund_prev": self.refund_prev, "close_prev": self.close_prev, "fund_txid": self.fund_txid,
                "fund_vout": self.fund_vout, "rolled_from": self.rolled_from, "zero_conf": self.zero_conf, "max_lock": self.max_lock,
                "last_lock_at": self.last_lock_at, "rolled_at": self.rolled_at, "fund_seen": self.fund_seen, "retired": self.retired,
-               "fund_confirmed": self.fund_confirmed, "spend_seen": self.spend_seen, "refill_owed": self.refill_owed, "gone_at": self.gone_at})
+               "fund_confirmed": self.fund_confirmed, "spend_seen": self.spend_seen, "refill_owed": self.refill_owed, "gone_at": self.gone_at, "spend_at": self.spend_at})
     }
 
     pub fn from_json(v: &Value) -> Result<Self> {
@@ -618,7 +621,7 @@ impl OutChannel {
                   retired: v.get("retired").and_then(Value::as_bool).unwrap_or(false),
                   fund_confirmed: v.get("fund_confirmed").and_then(Value::as_bool).unwrap_or(false),
                   spend_seen: v.get("spend_seen").and_then(Value::as_bool).unwrap_or(false),
-                  refill_owed: v.get("refill_owed").and_then(Value::as_bool).unwrap_or(false), gone_at: n("gone_at") as u32 })
+                  refill_owed: v.get("refill_owed").and_then(Value::as_bool).unwrap_or(false), gone_at: n("gone_at") as u32, spend_at: n("spend_at") as u32 })
     }
 
     fn secret_key(&self) -> Result<SecretKey> {
@@ -840,6 +843,9 @@ pub struct HubStats {
     pub routed: u64,
     pub floor: u64,
     pub refused: HashMap<String, u64>,
+    /// AGP-105: locks the hub itself refused before it asked the provider, by error code
+    /// ([`RouteHub::not_admitted`]).
+    pub not_admitted: HashMap<String, u64>,
     pub lock_ms: Vec<f64>,
     /// ch1 channels holding a lock at each forward (constraint 3: always 1, the forwarded one).
     pub ch1_locks_at_forward: Vec<usize>,
@@ -910,6 +916,8 @@ pub struct RouteHub {
     quote: Mutex<Option<FeeQuote>>,
     quote_seq: Mutex<i64>,
     reveal_timeout_bits: AtomicU64,
+    /// Whose turn it is among the providers set aside for an unanswered check ([`CHECK_UNANSWERED`]).
+    ask_turn: AtomicU64,
     fee_strategy: Option<FeeStrategyFn>,
     refill: Mutex<Option<SharedRefill>>,
     refund_to: Mutex<Option<RefundToFn>>,
@@ -935,6 +943,17 @@ pub struct RouteHub {
 }
 
 /// How long a watcher tick waits for one busy provider's flag, and for all of them (AGP-053).
+/// Why a ch2 is blocked after its provider did not answer the hub's check of a lock (AGP-105).
+///
+/// The rule (fourth audit item 2): **a provider that did not answer the hub within
+/// `revealTimeoutSec` is not waited for again by a client's lock until it has answered the hub.**
+/// The check is one request bounded by `revealTimeoutSec`. When that time passed with no answer
+/// the ch2 gets this block: nothing was pre-signed, so nothing is written off or held, and later
+/// locks for that provider are refused at once (`route_blocked`), as an unanswered lock made them
+/// before the check existed. The watcher asks one such provider per tick with a check that names
+/// no lock ([`RouteHub::ask_again`]) and lifts the block when it answers. A check that failed
+/// sooner (a refused connection, a lost answer) cost no waiting and blocks nothing.
+const CHECK_UNANSWERED: &str = "the provider did not answer a lock check within revealTimeoutSec";
 const WATCH_WAIT_ONE: Duration = Duration::from_millis(250);
 const WATCH_WAIT_BUDGET: Duration = Duration::from_secs(1);
 
@@ -1021,7 +1040,7 @@ impl RouteHub {
         }
         let hub = Self { pay_to: hex::encode(ecdsa::pubkey(&pay_to_secret)), cfg, chain, scan, wallet, http, secret: pay_to_secret,
                   network: network.into(), inbound, out: Mutex::new(out), busy: Mutex::new(HashSet::new()), quote: Mutex::new(None),
-                  quote_seq: Mutex::new(now_i()), reveal_timeout_bits: AtomicU64::new(0), fee_strategy: None,
+                  quote_seq: Mutex::new(now_i()), reveal_timeout_bits: AtomicU64::new(0), ask_turn: AtomicU64::new(0), fee_strategy: None,
                   refill: Mutex::new(None), refund_to: Mutex::new(None), withhold: Mutex::new(String::new()), events: Mutex::new(events),
                   stats: Mutex::new(HubStats::default()), zc_tried: Mutex::new(HashSet::new()), refill_ahead: Mutex::new(None),
                   ahead_tried: Mutex::new(HashSet::new()), retire_tried: Mutex::new(HashSet::new()),
@@ -1363,17 +1382,37 @@ impl RouteHub {
         }
         st1.seq = py_u64(pl.get("seq")).unwrap_or(st1.seq);
         l.channels.insert(cid.clone(), st1.clone());
-        let (oc, lock1, busy) = match self.admit(&mut l, &mut st1, &req) {
-            Ok(a) => a,
-            Err(refusal) => {
-                // AGP-078 (review T4): the seq this request spent is durable before its refusal
-                // leaves. Kept only in memory it came back after a restart, and the refused header
-                // authenticated again
-                if let Err(e) = self.inbound.save_state(&mut l, &st1) {
-                    return err(500, &e.code, &e.to_string(), json!({}));
+        // AGP-105 (HUB 8): the provider's busy flag is waited for with ch1's ledger free. The wait
+        // (up to 500 ms, for another client's lock on that ch2 to finish) used to be inside the
+        // ledger lock, which every request of every client needs, so one hung provider held up
+        // locks to all the others. Admission then runs again from the top, on ch1 as it is now
+        let (mut flag, mut waited) = (None, false);
+        let (oc, lock1, busy) = loop {
+            let mut taken = false;
+            let refusal = match self.admit(&mut l, &mut st1, &req, flag.take(), &mut taken) {
+                Ok(a) => break a,
+                Err(refusal) => refusal,
+            };
+            if taken && !waited {
+                waited = true;
+                drop(l);
+                flag = self.acquire(&req.provider, Duration::from_millis(500));
+                l = self.inbound.ledger_lock();
+                let Some(now1) = l.channels.get(&cid).cloned() else { return e400("unknown_channel", "") };
+                st1 = now1;
+                if flag.is_some() {
+                    continue;
                 }
-                return refusal;
             }
+            // AGP-078 (review T4): the seq this request spent is durable before its refusal
+            // leaves. Kept only in memory it came back after a restart, and the refused header
+            // authenticated again
+            if let Err(e) = self.inbound.save_state(&mut l, &st1) {
+                return err(500, &e.code, &e.to_string(), json!({}));
+            }
+            drop(l);
+            self.not_admitted(&req.provider, &refusal);
+            return refusal;
         };
         let n = l.channels.values().filter(|c| truthy(c.extra.get("route_lock"))).count();
         lk(&self.stats).ch1_locks_at_forward.push(n);
@@ -1383,11 +1422,36 @@ impl RouteHub {
         r
     }
 
+    /// AGP-105 (fourth audit item 10): a lock the hub refused is counted by its code and said on
+    /// stderr. A hub that refused every lock (an invoice shorter than `revealTimeoutSec`, a
+    /// blocked ch2) used to look healthy and say nothing. Authenticated requests only, and a
+    /// line for the 1st, 2nd, 4th, 8th... refusal of a code, so a client cannot fill the log.
+    fn not_admitted(&self, provider: &str, refusal: &HttpResponse) {
+        if refusal.status < 400 {
+            return;
+        }
+        let doc = crate::json::parse_slice(&refusal.body).unwrap_or(Value::Null);
+        let code = doc.get("error").and_then(Value::as_str).unwrap_or("error").to_string();
+        let n = {
+            let mut st = lk(&self.stats);
+            let n = st.not_admitted.entry(code.clone()).or_insert(0);
+            *n += 1;
+            *n
+        };
+        if n.is_power_of_two() {
+            let provider: String = provider.chars().filter(|c| c.is_ascii_graphic()).take(80).collect();
+            eprintln!("hub: lock refused: {code} ({}); provider {provider}; {n} so far with this code", py_str(doc.get("detail")));
+        }
+    }
+
     /// Checks 2 to 7 of a `/x402/route` whose auth passed, and the ch1 write-ahead of its lock (the
     /// ledger lock is the caller's). `Ok`: the ch2 the lock goes over, the lock as written on ch1,
     /// and that provider's busy flag. `Err`: the answer to send instead (a refusal, or a completed
-    /// lock's answer again); nothing was written.
-    fn admit(&self, l: &mut Ledger, st1: &mut ChannelState, req: &RouteReq) -> std::result::Result<(OutChannel, Value, Busy<'_>), HttpResponse> {
+    /// lock's answer again); nothing was written. `flag`: the provider's busy flag when the caller
+    /// holds it already; without it the flag is taken only if it is free, and `taken` says that
+    /// it was not (the refusal is then `lock_outstanding`, and the caller may wait and ask again).
+    fn admit<'a>(&'a self, l: &mut Ledger, st1: &mut ChannelState, req: &RouteReq, flag: Option<Busy<'a>>, taken: &mut bool)
+                 -> std::result::Result<(OutChannel, Value, Busy<'a>), HttpResponse> {
         let RouteReq { pl, rt, d, f, lock_id, provider } = req;
         let (d, f) = (*d, *f);
         if let Some(done) = st1.extra.get("route_done").and_then(|d| d.get(lock_id)) {
@@ -1500,7 +1564,8 @@ impl RouteHub {
         if truthy(ex1.get("route_lock")) {
             return Err(e400("lock_outstanding", "a lock on this ch1 is pending"));
         }
-        let Some(busy) = self.acquire(&key, Duration::from_millis(500)) else {
+        let Some(busy) = flag.or_else(|| self.acquire(&key, Duration::ZERO)) else {
+            *taken = true;
             return Err(e400("lock_outstanding", "a lock on this provider's ch2 is pending"));
         };
         // re-read under the busy flag: the watcher may have rolled this ch2 over meanwhile (AGP-053), so
@@ -1683,8 +1748,11 @@ impl RouteHub {
             // amount the client authorised), and a refusal after the pre-signature left writes the
             // lock off and blocks this ch2 (AGP-064). So the provider is asked first, with nothing
             // of the hub's out: what it refuses here costs nothing and leaves the ch2 as it was
+            let (asked, within) = (Instant::now(), self.check_wait());
             if let Err((code, det)) = self.check_lock(oc, &lock1["lockId"], d, need2, &t_hex, rt) {
-                self.void(Loc::Live(&oc.origin), oc, ch1, &lock1["lockId"], &format!("provider refused the check: {code}"), "");
+                // AGP-105: no answer in revealTimeoutSec sets the provider aside ([`CHECK_UNANSWERED`])
+                let block = if code == "no_answer" && asked.elapsed() >= within { CHECK_UNANSWERED } else { "" };
+                self.void(Loc::Live(&oc.origin), oc, ch1, &lock1["lockId"], &format!("provider refused the check: {code}"), block);
                 *lk(&self.stats).refused.entry(code.clone()).or_insert(0) += 1;
                 let shown = if safe_code(&code) { code.as_str() } else { "provider_error" };
                 let detail = if det.is_empty() { format!("provider refused the lock: {shown}") } else { format!("provider refused the lock: {shown} ({det})") };
@@ -1773,7 +1841,7 @@ impl RouteHub {
         if truthy(pend.get("pre")) {
             pl["adaptor"] = pend["pre"].clone();
         }
-        let (status, doc) = self.post_lock(&oc, pl, pend.get("route").unwrap_or(&Value::Null))?;
+        let (status, doc) = self.post_lock(&oc, pl, pend.get("route").unwrap_or(&Value::Null), None)?;
         if status == 200 && doc.is_object() && truthy(doc.get("secret")) {
             return Some(doc);
         }
@@ -1782,14 +1850,18 @@ impl RouteHub {
 
     /// POST `pl` (a ch2 payload with its seq; the auth is added here) and the route terms to the
     /// provider's lock endpoint: the status and the JSON answer, None when there is none.
-    fn post_lock(&self, oc: &OutChannel, mut pl: Value, route: &Value) -> Option<(u16, Value)> {
+    /// `within`: give up after that long (the check); None waits as long as the transport does.
+    fn post_lock(&self, oc: &OutChannel, mut pl: Value, route: &Value, within: Option<Duration>) -> Option<(u16, Value)> {
         let (p2, url) = (&oc.params, format!("{}{ROUTE_LOCK_PATH}", oc.origin));
         let body = dumps(&json!({"route": route}));
         let key = channel_auth_key(&oc.secret_key().ok()?, &p2.payee_pub).ok()?;
         pl["auth"] = request_auth(&key, &p2.channel_id(), pl.get("seq"), pl.get("cum"), None, &request_digest_v2("POST", &url, body.as_bytes())).into();
         let hdrs = vec![("PAYMENT-SIGNATURE".to_string(), b64json(&json!({"x402Version": 2, "accepted": oc.terms, "payload": pl}))),
                         ("Content-Type".to_string(), "application/json".to_string())];
-        let r = self.http.request("POST", &url, body.as_bytes(), &hdrs).ok()?;
+        let r = match within {
+            Some(d) => self.http.request_within("POST", &url, body.as_bytes(), &hdrs, d),
+            None => self.http.request("POST", &url, body.as_bytes(), &hdrs),
+        }.ok()?;
         Some((r.status, crate::json::parse_slice(&r.body).ok()?))
     }
 
@@ -1813,7 +1885,8 @@ impl RouteHub {
     /// `check` and without the pre-signature. `Err((code, detail))`: it refused, or did not
     /// answer (`no_answer`). A provider from before the check runs the request as a lock and stops
     /// at the missing pre-signature (`bad_adaptor`), after every check a client's fields can fail:
-    /// that is its yes.
+    /// that is its yes. The request is given up after `revealTimeoutSec` (AGP-105; it used to
+    /// wait the transport's 30 s).
     fn check_lock(&self, oc: &OutChannel, lock_id: &Value, d: u64, need2: u64, t_hex: &str, rt: &Value) -> std::result::Result<(), (String, String)> {
         let none = || ("no_answer".to_string(), "the provider did not answer the check".to_string());
         let seq = {
@@ -1827,7 +1900,7 @@ impl RouteHub {
         let route = json!({"session": rt.get("session").cloned().unwrap_or(Value::Null), "lockId": lock_id, "amount": d,
                            "lockAuth": rt.get("lockAuth").map(|v| py_str(Some(v))).unwrap_or_default(), "hub": self.pay_to, "check": true});
         let pl = json!({"chan": oc.params.channel_id(), "seq": seq, "cum": need2.to_string(), "point": t_hex});
-        let (status, doc) = self.post_lock(oc, pl, &route).ok_or_else(none)?;
+        let (status, doc) = self.post_lock(oc, pl, &route, Some(self.check_wait())).ok_or_else(none)?;
         if status == 200 && doc.get("check") == Some(lock_id) {
             return Ok(());
         }
@@ -1835,6 +1908,40 @@ impl RouteHub {
             Some(r) if r["error"] == "bad_adaptor" => Ok(()),
             Some(r) => Err((py_str(r.get("error")), py_str(r.get("detail")))),
             None => Err(none()),
+        }
+    }
+
+    /// How long a check of a lock waits for the provider: `revealTimeoutSec`.
+    fn check_wait(&self) -> Duration {
+        Duration::try_from_secs_f64(self.reveal_timeout()).unwrap_or(Duration::from_secs(10)).max(Duration::from_millis(1))
+    }
+
+    /// AGP-105: ask one provider that is set aside for an unanswered check ([`CHECK_UNANSWERED`])
+    /// whether it answers again, with a check that names no lock (the provider refuses it, after
+    /// the hub's channel auth: `unknown_session`). Any answer a check can have lifts the block. One
+    /// provider per tick, in turn, each waited for no longer than a check: providers that stay
+    /// dark lengthen a watcher tick by at most `revealTimeoutSec`, however many they are.
+    fn ask_again(&self) -> Vec<Value> {
+        let aside: Vec<OutChannel> = lk(&self.out).chans.values().filter(|c| c.blocked == CHECK_UNANSWERED && c.state == "open").cloned().collect();
+        if aside.is_empty() {
+            return vec![];
+        }
+        let oc = &aside[(self.ask_turn.fetch_add(1, Ordering::Relaxed) % aside.len() as u64) as usize];
+        if matches!(self.check_lock(oc, &json!(""), 0, oc.signed, "", &json!({})), Err((code, _)) if code == "no_answer") {
+            return vec![];
+        }
+        // only this block is lifted, and only on the ch2 that was asked
+        match self.upd(Loc::Live(&oc.origin), oc, |c| c.blocked == CHECK_UNANSWERED && { c.blocked = String::new(); true }) {
+            Ok(Some(true)) => {
+                let ev = json!({"event": "ch2_answers_again", "provider": oc.origin, "chan": oc.params.channel_id()});
+                self.event(ev.clone());
+                vec![ev]
+            }
+            Ok(_) => vec![],
+            Err(e) => {
+                self.watch_error(&oc.origin, "ask_again", &e);
+                vec![]
+            }
         }
     }
 
@@ -3098,10 +3205,31 @@ impl RouteHub {
         out
     }
 
+    /// One step of a watcher tick for one channel: its error is reported and its panic caught.
+    ///
+    /// AGP-105 rule (fourth audit item 11): **one channel's failure, a panic included, does not
+    /// stop the tick for the others.** The catch used to be around the whole tick, so a ch2 whose
+    /// reconcile panicked on every tick ended each tick there: every ch2 behind it, the archive
+    /// and ch1's margin closes never ran. The first panic is kept and raised again when the tick
+    /// is done ([`watch_tick`](Self::watch_tick)), so the watcher's own catch still counts it
+    /// and `/healthz` still says 503.
+    fn step(&self, origin: &str, what: &str, acts: &mut Vec<Value>, panicked: &mut Option<Box<dyn std::any::Any + Send>>, f: impl FnOnce() -> Result<Vec<Value>>) {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+            Ok(Ok(mut a)) => acts.append(&mut a),
+            Ok(Err(e)) => self.watch_error(origin, what, &e),
+            Err(p) => {
+                self.watch_error(origin, what, &ChannelError::new("panic", "this step panicked; the rest of the tick runs"));
+                panicked.get_or_insert(p);
+            }
+        }
+    }
+
     /// One watcher pass over every ch2 (then the replaced ones still unsettled in the archive), then
-    /// ch1's closes. Errors are per channel and never stop the rest. Returns what it did.
+    /// ch1's closes. Errors and panics are per channel and never stop the rest ([`step`](Self::step));
+    /// a panic is raised again at the end. Returns what it did.
     pub fn watch_tick(&self) -> Vec<Value> {
         let mut acts = vec![];
+        let mut panicked = None;
         let tip = match self.chain.block_count() {
             Ok(t) => t,
             Err(e) => {
@@ -3118,10 +3246,7 @@ impl RouteHub {
                 skipped.push(origin);
                 continue;
             };
-            match self.watch_out(&origin, tip) {
-                Ok(mut a) => acts.append(&mut a),
-                Err(e) => self.watch_error(&origin, "watch", &e),
-            }
+            self.step(&origin, "watch", &mut acts, &mut panicked, || self.watch_out(&origin, tip));
             drop(busy);
         }
         // a provider streaming locks holds its flag most of the time, and a tick in step with its locks
@@ -3131,52 +3256,49 @@ impl RouteHub {
         for origin in skipped {
             let left = until.saturating_duration_since(Instant::now());
             let Some(busy) = self.acquire(&origin, left.min(WATCH_WAIT_ONE)) else { continue };
-            match self.watch_out(&origin, tip) {
-                Ok(mut a) => acts.append(&mut a),
-                Err(e) => self.watch_error(&origin, "watch", &e),
-            }
+            self.step(&origin, "watch", &mut acts, &mut panicked, || self.watch_out(&origin, tip));
             drop(busy);
         }
+        // AGP-105: one provider set aside for an unanswered check is asked whether it answers again
+        self.step("", "ask_again", &mut acts, &mut panicked, || Ok(self.ask_again()));
         // AGP-057: every origin's next ch2 (reconciled, opened at minConf, taking over from a live one
         // that is gone or idle), then the ones due to be funded ahead. Neither needs the origin's busy
         // flag until a switch: a next ch2 takes no lock before it
         let nexts: Vec<String> = lk(&self.out).next_chans.keys().cloned().collect();
         for origin in nexts {
-            match self.watch_next(&origin, tip) {
-                Ok(mut a) => acts.append(&mut a),
-                Err(e) => self.watch_error(&origin, "next", &e),
-            }
+            self.step(&origin, "next", &mut acts, &mut panicked, || self.watch_next(&origin, tip));
         }
         let origins: Vec<String> = lk(&self.out).chans.keys().cloned().collect();
         for origin in origins {
-            match self.refill_ahead_due(&origin, tip) {
-                Ok(mut a) => acts.append(&mut a),
-                Err(e) => self.watch_error(&origin, "refill_ahead", &e),
-            }
+            self.step(&origin, "refill_ahead", &mut acts, &mut panicked, || self.refill_ahead_due(&origin, tip));
         }
         let archived: Vec<(usize, String, bool)> = lk(&self.out).archived.iter().enumerate()
             .filter(|(_, r)| watched(r))
             .map(|(i, r)| (i, py_str(r.get("origin")), r.get("state").and_then(Value::as_str) == Some("dropped"))).collect();
         for (i, origin, dropped) in archived {
             // replaced ch2s are still the hub's coins, and so is a dropped funding that may confirm late
-            let r = if dropped { self.reconcile_dropped(i) } else { self.reconcile(Loc::Archived(i), tip) };
-            match r {
-                Ok(mut a) => acts.append(&mut a),
-                Err(e) => self.watch_error(&origin, "archived", &e),
-            }
+            self.step(&origin, "archived", &mut acts, &mut panicked, || if dropped { self.reconcile_dropped(i) } else { self.reconcile(Loc::Archived(i), tip) });
             if let Some(oc) = self.get(Loc::Archived(i)).filter(|c| c.retired) {
-                acts.extend(self.close_retired(i, &oc, tip));
+                self.step(&origin, "close_retired", &mut acts, &mut panicked, || Ok(self.close_retired(i, &oc, tip)));
             }
         }
         // AGP-073: the ch1 locks a stop left (before a margin close, so one held is in that close)
         let locked: Vec<String> = self.inbound.ledger_lock().channels.iter()
             .filter(|(_, s)| s.closed_txid.is_empty() && truthy(s.extra.get("route_lock"))).map(|(c, _)| c.clone()).collect();
         for ch1 in locked {
-            acts.extend(self.sweep_orphan_lock(&ch1));
+            self.step(&ch1, "orphan_lock", &mut acts, &mut panicked, || Ok(self.sweep_orphan_lock(&ch1).into_iter().collect()));
         }
-        match self.inbound.close_due() {
-            Ok(txs) => acts.extend(txs.into_iter().map(|t| json!({"event": "ch1_close", "txid": t}))),
-            Err(e) => eprintln!("hub watcher ch1: {e}"),
+        self.step("ch1", "close_due", &mut acts, &mut panicked, || {
+            match self.inbound.close_due() {
+                Ok(txs) => Ok(txs.into_iter().map(|t| json!({"event": "ch1_close", "txid": t})).collect()),
+                Err(e) => {
+                    eprintln!("hub watcher ch1: {e}");
+                    Ok(vec![])
+                }
+            }
+        });
+        if let Some(p) = panicked {
+            std::panic::resume_unwind(p);
         }
         acts
     }
@@ -3585,7 +3707,7 @@ impl RouteHub {
             out.extend(self.refill_if_owed(loc, &oc));
             return Ok(out);
         }
-        let found = self.scan.find_spend_at(&txid, vout, oc.scanned_to)?;
+        let found = self.find_funding_spend(loc, &mut oc, tip)?;
         // AGP-094: `confirmed` is "spent for good" (`spend_final_depth` deep): what it gates below
         // (the release of unpaid locks, `final`, a refund fee taken back) is not undone, so none of
         // it happens on a spend a short reorg can replace. Until then a spend in a block is treated
@@ -3765,6 +3887,38 @@ impl RouteHub {
             oc.gone_at = tip;
         }
         Ok(tip.saturating_sub(oc.gone_at).saturating_add(1))
+    }
+
+    /// The spender of `oc`'s funding, with its depth when the scan gives one.
+    ///
+    /// AGP-105 rule (fourth audit item 11): **a spend the watcher found in a block is looked for
+    /// in that block, not from the ch2's first block again, on every tick it waits for depth.**
+    /// bitcoind's scan reads every block from the height it is given up to the spender's, and
+    /// since AGP-094 a record waits `spend_final_depth` blocks after its spend: about 600 ticks at
+    /// the shipped tick, each a pass over the ch2's whole life. The record keeps the height the
+    /// spender was found at (`spend_at`), and the scan starts there. `spend_at` is only where to
+    /// look first: when nothing is found from it (a reorg moved the spend to a lower block, or
+    /// out), the scan runs from `scanned_to` as before, so no answer depends on it. A scan that
+    /// gives no depth leaves it 0.
+    fn find_funding_spend(&self, loc: Loc<'_>, oc: &mut OutChannel, tip: u32) -> Result<Option<(Tx, Option<u32>)>> {
+        let (txid, vout) = (oc.params.funding_txid(), oc.params.funding_vout());
+        let mut found = None;
+        if oc.spend_at > oc.scanned_to {
+            found = self.scan.find_spend_at(&txid, vout, oc.spend_at)?;
+        }
+        if found.is_none() {
+            found = self.scan.find_spend_at(&txid, vout, oc.scanned_to)?;
+        }
+        // the scan's tip is ours or later, so this is the spender's height or below it: never past it
+        let at = match &found {
+            Some((_, Some(depth))) if *depth >= 1 => tip.saturating_add(1).saturating_sub(*depth).max(oc.scanned_to),
+            _ => 0,
+        };
+        if at != oc.spend_at {
+            self.upd(loc, oc, |c| c.spend_at = at)?;
+            oc.spend_at = at;
+        }
+        Ok(found)
     }
 
     /// `tx` is `need` blocks deep: by the depth the scan gave, else by one of its outputs having

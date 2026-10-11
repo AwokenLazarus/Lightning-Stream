@@ -197,4 +197,10 @@ impl Wallet for RemoteSigner {
         let v = self.call("fund", json!({"origin": origin, "params": params.to_json(), "address": address, "sats": sats}))?;
         Ok((v.get("txid").and_then(Value::as_str).unwrap_or("").to_string(), v.get("vout").and_then(Value::as_u64).unwrap_or(0) as u32))
     }
+
+    /// AGP-105: the signer keeps the channel it funded for an origin (`xbt402_funded`, AGP-101),
+    /// which a payer asks before it funds: no record there is "nothing was sent".
+    fn knows_its_sends(&self) -> bool {
+        true
+    }
 }
