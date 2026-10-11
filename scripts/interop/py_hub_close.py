@@ -4,7 +4,7 @@ RouteHub on its datadir, ask every provider with an open ch2 to close it, print 
     py_hub_close.py CONFIG.json
 Env: XBT402_B1."""
 import json, os, sys
-sys.path.insert(0, os.environ.get("XBT402_B1", os.path.expanduser("~/xbt-rnd/b1-agp-023")))
+sys.path.insert(0, os.environ.get("XBT402_B1", os.path.expanduser("~/xbt-rnd/b1")))
 from xbt402.hub import HubConfig, RouteHub  # noqa: E402
 from xbt402.rpc import RPC  # noqa: E402
 

@@ -1085,7 +1085,8 @@ code (`XXXX-XXXX-XXXX`, 60 bits) to stderr and writes it to `.run/enroll-code` (
   one of `XBT_MCP_ALLOWED_ORIGINS` (comma-separated). There is no same-origin exception, because a
   DNS-rebound page has Origin equal to Host.
 - **Local payer mode** checks the signer's allowlist before any request to a URL, so a refused origin
-  is never probed.
+  is never probed. Since AGP-105 the host the allowlist is checked on is the host the request is sent
+  to: a URL whose host two parsers could read differently is refused first (`wire::sendable_url`).
 
 **K1: key storage.**
 - **scrypt cost.** A passphrase blob is sealed at scrypt N=2^17 (r=8, p=1, 128 MiB) and records
@@ -2174,7 +2175,7 @@ for the hub and the routed client. Each row is one rule, kept in one place. The 
 | item | the rule | what broke it | now | tests |
 |---|---|---|---|---|
 | 1 one client request stopped the hub routing to a provider | no request of a client's stops the hub routing to a provider, or costs the hub or the provider a transaction | a lock carries what only the client and the provider can check (`lockAuth`, the session, the amount). The hub pre-signed its ch2, the provider refused, and the lock was written off: the ch2 was blocked and closed, and one with nothing signed could not be closed at all (`no_state`) and stayed blocked until its refund | the hub asks the provider first: the lock's own request, marked `check`, without the pre-signature. A refusal there leaves nothing written off, held or blocked (`502 route_failed`, `providerError`). Once it said yes the provider pays that invoice over that hub's channel alone, and does not end its window early, so nothing a client does afterwards makes it refuse. A lock the ch2's floor covers needs no pre-signature: refused, it is dropped. The hub counts a lock only if the provider counted it (`routedSat`), so an invoice sent again from another ch1 does not put the two out of step | `agp093_overflow.rs::one_client_request_does_not_stop_the_hub_routing_to_a_provider`, `::agp094_a_refused_lock_the_floor_covers_is_dropped_and_blocks_nothing`, `::agp094_an_invoice_sent_again_from_another_ch1_does_not_put_the_ch2_out_of_step`, `::agp094_an_invoice_one_hub_checked_is_refused_to_another_channel_at_its_check` |
-| 2 a hold released on a close one block deep | what is done on a spend "for good" (a hold given back, a record made final, a refund fee taken back) is done when the spend is `spend_final_depth` blocks deep | one block was final: the block was replaced by one with the provider's other close, the one with `t`, after the client had closed ch1 below the lock | `HubConfig.spend_final_depth`, 6 by default (the depth the hub already asks before it trusts a funding, `ch2_max_min_conf`; the wait costs only time, and it is the client's own coins that wait). Until then a spend in a block is treated as one in the mempool: its secrets are read, nothing is released | `agp093_hub.rs::hole_a_lock_released_on_a_close_one_block_deep_is_lost_when_that_block_is_reorged`, `::agp094_a_hold_is_released_when_the_close_is_spend_final_depth_deep` |
+| 2 a hold released on a close one block deep | what is done on a spend "for good" (a hold given back, a record made final, a refund fee taken back) is done when the spend is `spend_final_depth` blocks deep | one block was final: the block was replaced by one with the provider's other close, the one with `t`, after the client had closed ch1 below the lock | `HubConfig.spend_final_depth`, 6 by default (the depth the hub already asks before it trusts a funding, `ch2_max_min_conf`; the wait costs time, and it is the client's own coins that wait; since AGP-105 the watcher looks for the spend in the block it found it in, not from the ch2's first block on every tick). Until then a spend in a block is treated as one in the mempool: its secrets are read, nothing is released | `agp093_hub.rs::hole_a_lock_released_on_a_close_one_block_deep_is_lost_when_that_block_is_reorged`, `::agp094_a_hold_is_released_when_the_close_is_spend_final_depth_deep` |
 | 5, 18 the routed client funded a refusing hub on every `open` | ch1 is funded once: its key is on the books before the wallet is asked, its outpoint before the hub hears of it | ch1 was recorded only with a ledger and only after the funding; without one every `open` asked for a new key and funded again. `duplicate_channel` was not taken as the yes that was lost | `open` goes on from the stage the last call reached, with a ledger or without (then for the life of the `RoutePayer`): a failed funding call is looked for in the wallet before anything is sent again, a funded ch1 is put to the hub again, `duplicate_channel` finishes it | `agp093_client.rs::hole_the_routed_client_funds_a_refusing_hub_once`, `::hole_the_routed_client_finishes_an_open_whose_answer_was_lost`, `::agp094_a_ch1_funding_that_failed_after_it_was_sent_is_adopted_under_the_same_key`, `::agp094_a_keyed_ch1_is_funded_once_by_the_next_open_with_and_without_a_ledger`, `::agp094_a_keyed_ch1_too_old_to_fund_is_refused_until_it_is_forgotten` |
 | 12 locks from a ledger before AGP-088 | a ch1 lock is the lock of one ch2 | such a lock was matched by its provider's origin, and one origin can have two ch2s | each is given its ch2 when the hub starts and on every tick (the record of its origin that holds a lock of that ch1 with its lockId and point; of two, the earlier lock is the earlier record's) | `agp093_hub.rs::hole_two_locks_from_a_ledger_before_agp088_to_one_provider_are_released_together`, `::agp094_two_locks_of_one_invoice_from_a_ledger_before_agp088_are_each_given_their_ch2` |
 | 12 a held lock completed below ch1's best state | a client stops counting a lock as held when the hub proves it was completed or lists it released | it was in no list of the hub's view, so it counted against `max_held_locks` for the life of ch1 | the view lists the last 16 completed written-off locks with the `t + r` that completed each (`completed`); the client drops one whose secret opens that lock's own point | `agp093_hub.rs::hole_a_held_lock_completed_below_the_best_state_still_counts_against_max_held_locks` |
@@ -3667,7 +3668,8 @@ Limits:
   call fails `open_unresolved`, and the seller can be paid through this signer again once it has
   refunded the channel at its expiry. That part of the hole cannot be closed from the payer's
   side; a longer expiry (`--expiry-blocks`, `XBT_MCP_EXPIRY_BLOCKS`, within the signer's policy)
-  widens the day.
+  widens the day. Since AGP-105 the two shipped payers ask for 2,016 blocks, so the window is 1,007
+  blocks, about a week; a payer built on `ClientConfig::new` still asks for 1,008 and has the day.
 - **A payer that has lost its record of a channel that is already attached cannot take it over.**
   `xbt402_funded` answers a channel only until it is attached; after that a process without a
   ledger is refused `channel_open`, as before, until the owner closes the channel
@@ -3702,6 +3704,78 @@ that matters now goes to the signer, which answers or fails.
 
 API for embedders: `StateSigner::funded` (a default method); `funding::offer_open_floor`; the signer
 socket's `xbt402_funded`; `xbt402_attach` of a channel already attached answers the channel.
+
+## Fix wave 6: one URL parser, a provider that does not answer, defaults that route (AGP-105)
+
+The fourth closure audit (AGP-102) found no High item. This section is the library client, the hub
+and the shipped defaults: its items 1, 2, 6, 7, 10 and the two fixes of 11. Each row is one rule,
+kept in one place. The audit's tests are `agp102_*`; `agp105_*` are the neighbours. B1 `xbt402/hub.py`
+on `agp-105` has items 2 and 11 with the same test names (`tests/security/test_agp105_hub.py`).
+
+| item | the rule | what broke it | now | tests |
+|---|---|---|---|---|
+| 1 a URL paid as one host and sent to another | the host a payer keys its book by, checks an allowlist on and binds a payment to is the host the request is sent to | `request_url` decided the host for the book and the binding, and the transport parsed the caller's string again with the `url` crate: `http://A\@B/x` is B to the first and A to the second, so B's channel paid and A got the payment | no transport is given the caller's string: it gets `scheme://[userinfo@]host[:port]target` put together from what `request_url` read (`wire::sendable_url`), and a URL whose parts are not spelled in the one way every parser reads alike is refused `bad_request` before anything is signed, funded or probed | `agp102_client.rs::sockets::hole_a_paid_request_is_sent_only_to_the_host_its_origin_names`, `xbt-signer/tests/agp102_signer_client.rs::hole_a_url_that_passes_the_allowlist_is_sent_to_the_allowlisted_host`, `wire.rs::a_sendable_url_is_the_parsed_one_and_the_rest_is_refused`, `::the_transports_parser_reads_every_sendable_url_as_the_book_does`, `agp105_client.rs::the_client_gives_a_transport_only_the_url_its_own_parser_read` |
+| 2 a provider that does not answer was waited for on every lock | a provider that did not answer the hub within `revealTimeoutSec` is not waited for again by a client's lock until it has answered the hub | the check before the pre-signature was one request with the transport's 30 s, and no answer wrote nothing off and blocked nothing, so the next lock waited again | the check is given up after `revealTimeoutSec` (`Transport::request_within`). When that time passed with no answer the ch2 is blocked with nothing written off or held, and later locks are refused at once (`route_blocked`). The watcher asks one such provider per tick with a check that names no lock and lifts the block when it answers (`ch2_answers_again`). A check that failed sooner blocks nothing | `agp102_hub.rs::a_provider_that_does_not_answer_the_check_is_not_waited_for_on_every_lock`, `agp105_hub.rs::a_provider_set_aside_is_refused_at_once_and_comes_back_when_it_answers`, `::providers_that_stay_dark_cost_a_tick_one_wait_and_are_asked_in_turn`, `::a_late_answer_is_an_answer`, `agp105_client.rs::sockets::the_shipped_transport_keeps_a_requests_own_deadline` |
+| 2 (HUB 8) one busy provider held up every request | nothing waits for a provider inside ch1's ledger lock | a lock that found the provider's busy flag taken waited up to 500 ms for it with the ledger lock held, which every route, view, open and close needs | the flag is taken only if it is free; otherwise the ledger lock is released, the flag waited for, and admission run again from the top on ch1 as it is then | `agp102_hub.rs::a_provider_that_does_not_answer_does_not_hold_up_a_lock_to_another_provider`, `agp105_hub.rs::a_lock_that_waited_for_the_providers_flag_is_paid_when_it_is_free` |
+| 6 a ch1 funding that failed after it sent was sent again | after a `fund` call that did not return an outpoint, ch1 is funded again only when the wallet says it sent nothing | "none known" from a wallet that cannot list its sends was read as "nothing was sent" | that the wallet was asked is on the books before the call. A wallet says whether its "none" means none (`Wallet::knows_its_sends`: `Rpc` and the signer's wallet do); one that cannot say is not asked again: `open_unresolved`, with the amount and the address to look for, until `forget_unfunded`. `xbt402-route-payer`'s wallet wrappers now pass the node wallet's list on | `agp102_route_client.rs::a_ch1_funding_that_failed_after_it_was_sent_is_not_sent_again_by_a_wallet_that_cannot_list`, `agp105_hub.rs::a_wallet_that_cannot_say_is_not_asked_twice_whatever_its_first_call_did`, `::that_the_wallet_was_asked_survives_a_restart` |
+| 7 one day to come back for a funded channel | a shipped payer asks for more blocks than the shipped provider's floor, with room to come back | both asked for 1,008 against a floor of 1,153, so the window was the 144-block close margin | `xbt-signer-payer` and `xbt-wallet-mcp` ask for 2,016 (`client::SHIPPED_PAYER_EXPIRY_BLOCKS`): 1,007 blocks to come back, and the coins locked for up to two weeks in place of eight days | `agp105_client.rs::the_shipped_payers_have_a_week_to_come_back_for_a_funded_channel` |
+| 10 the shipped hub and route provider routed nothing | binaries at their own defaults route, and a session nothing could pay is refused when it starts | `xbt402-route-provider` issued 8 s invoices and a hub admits one only with `revealTimeoutSec` (10 s) left; the interop script set 2 s | `--ttl` defaults to the library's 15 s; the provider refuses to start when `--ttl` is under `1 + --hub-reveal-timeout` (default: the hub's); the client refuses a session whose `invoiceTtl` is under `1 + revealTimeoutSec` (`route_blocked`, with both numbers); the hub counts every lock it refuses by code (`HubStats::not_admitted`) and says the 1st, 2nd, 4th... on stderr | `agp102_hub.rs::a_lock_is_routed_at_the_shipped_defaults_of_the_hub_and_the_route_provider`, `agp105_hub.rs::a_session_no_lock_could_pay_is_refused_when_it_starts` |
+| 11 the watcher read the chain again on every tick | a spend the watcher found in a block is looked for in that block, not from the ch2's first block, while it waits for depth | `find_spend_at` was asked from the funding height on each of the about 600 ticks a close waits | the record keeps the height the spender was found at (`spend_at`); the scan starts there and runs from the first block again only when nothing is found from it | `agp102_hub.rs::the_watcher_reads_the_chain_once_for_a_spend_that_waits_for_depth`, `::..._for_a_rollover_...`, `agp105_hub.rs::the_remembered_height_is_only_where_the_scan_starts` |
+| 11 the watcher's catch was per tick | one channel's failure, a panic included, does not stop the tick for the others | a ch2 whose reconcile panicked ended every tick there | each channel's step is caught (`RouteHub::step`); the first panic is raised again when the tick is done, so `/healthz` still says 503 | `agp102_hub.rs::a_ch2_whose_reconcile_panics_on_every_tick_does_not_stop_the_watcher_for_the_others` |
+
+**What `sendable_url` refuses.** Not `scheme://...` (so `http:\\h` and `http:/h`, which a WHATWG
+parser reads as absolute); a backslash, a `#`, whitespace or a control character anywhere; a second
+`@`, or userinfo outside RFC 3986's set; an empty host; a host with a character other than a
+letter, digit, `.`, `-` or `_` (so no percent-encoding and no non-ASCII name); a host whose last
+label is a number and that is not a dotted quad as `Ipv4Addr` prints it (`127.1`, `2130706433`,
+`0x7f.0.0.1`); a bracketed host that is not an IPv6 address as `Ipv6Addr` prints it, or with
+anything but a port after it; a port that is not a number below 65536. Not refused, because both
+readings agree: upper case, a default port, a port's leading zeros, an empty port, a trailing dot,
+userinfo. `canonical_origin` and `split_url` are unchanged.
+
+| place | before | now |
+|---|---|---|
+| `http::UreqTransport` (every request of the shipped binaries: client, routed client, work payer, the MCP wallet's probe, hub to provider) | parsed the caller's string | `sendable_url`, then sends what it returns |
+| `Client::request_with`, `request_conditional` | `no_fragment` | `sendable_url` before anything is signed, for any transport |
+| `RoutePayer::shard` | `no_fragment`; session keyed by the caller's string | `sendable_url`; the session is opened at, keyed by and paid at what it returns |
+| `xbt-work` `WorkPayer::prepare` | `split_url` | `sendable_url` first |
+| `xbt-wallet-mcp` local payer | allowlist on `split_url`, probe of the caller's string | `sendable_url` before the allowlist |
+| `xbt-signer`'s own pay rail | refuses such a URL (`session::origin_of` keeps the spelling) | unchanged |
+| URLs a seller or hub names (`wire::seller_url`) | a path on the canonical origin, no backslash, whitespace or `#` | unchanged |
+| the hub, for the provider a client names | looks up its own ch2 by the canonical origin and sends to the origin the operator connected | unchanged |
+| B1 | urllib refuses a URL with userinfo and resolves the others as one name | unchanged |
+
+**New state, and what fills it.**
+
+| state | who fills it | at its bound | an honest slow or failing peer | a ledger from before | shipped defaults |
+|---|---|---|---|---|---|
+| a ch2 blocked for an unanswered check | a provider the hub has a ch2 to, by not answering one check for `revealTimeoutSec`. A client cannot: its fields are refused in an answer | one per ch2; it stops routing and refill to that provider and nothing else | a provider that answers a check later than `revealTimeoutSec` is set aside until a tick's ask is answered: at most `providers × watch_interval` plus one check wait | none: `blocked` is the field older blocks use. A binary from before reads this text as a block it never lifts | 10 s check, 5 s tick |
+| the watcher's ask | the hub, one provider per tick in turn | a tick is longer by at most `revealTimeoutSec` however many providers are dark; each ask spends one ch2 seq and one write at the hub and the provider | asked again next turn | none (the turn is in memory) | as above |
+| `HubStats::not_admitted` | an authenticated client request the hub refuses | one counter per error code; stderr gets a line at each power of two | none | none (memory) | on |
+| `spend_at` on a ch2 record | the watcher, from its own node's scan | one number per record | a reorg that moves the spend lower costs one full scan | absent is 0: the full scan, once | on |
+| `fund_asked` on the routed client's ch1 | the client, before it asks its wallet | one flag per ch1 | a wallet that fails or refuses and cannot say what it sent stops the open until its owner calls `forget_unfunded` | absent is false: asked once more, the rule before | `xbt402-route-payer`'s wallets say |
+| `Transport::request_within`, `Wallet::knows_its_sends` | an embedder's implementation | defaults: no bound but the transport's own, and "cannot say" | | | |
+
+Limits:
+- **A provider set aside is found again by the watcher only.** With the watcher stopped it stays
+  blocked. The ask proves the provider answers a check, not that it will reveal: one that answers
+  checks and holds locks is written off as before (`revealTimeoutSec`, then the ch2 is blocked for good).
+- **The lock itself still waits the transport's 30 s** when the provider takes it and does not
+  answer; that happens once, after which the ch2 is blocked as it always was. The hub's open, close
+  and rollover requests to a provider also wait up to 30 s each.
+- **An embedder's transport keeps the bound only if it implements `request_within`.** Without it the
+  check waits as long as that transport does; the hub still sets the provider aside afterwards.
+- **A wallet that cannot say what it sent is not asked twice**, also when its first call only
+  refused: the owner looks and calls `forget_unfunded`. A wallet that lists its sends must say so
+  (`knows_its_sends`), or it is treated as one that cannot. B1's `fund` is a bare callable and cannot
+  say: there a retry after a `fund` that raised still pays the same script again.
+- **The window to come back for a funded channel is 1,007 blocks with the shipped payers**, and 144
+  for a payer that keeps `ClientConfig::new`'s 1,008. After it the coins wait for the signer's refund
+  at the expiry, up to 1,009 blocks, and that seller cannot be paid through that signer meanwhile.
+- **One seller can still be several origins**: a trailing dot, and an IDN against its punycode (the
+  non-ASCII spelling is refused, so only one of the two can be paid). The number forms of an IPv4
+  address and percent-encoding are now refused.
+- **With a scan that gives no depth, `spend_at` stays 0** and the watcher scans as before.
 
 ## Lightning rail pays BOLT 12 offers (AGP-082)
 

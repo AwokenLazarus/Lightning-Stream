@@ -4,7 +4,7 @@ the keys; the same flow and JSON summary as xbt402-route-payer.
     py_route_payer.py HUB_URL SHARD_URL,SHARD_URL [SECONDS] [RATE]
 Env: XBT402_B1, XBT402_DATADIR, XBT402_RPCPORT."""
 import json, os, statistics, sys, threading, time
-sys.path.insert(0, os.environ.get("XBT402_B1", os.path.expanduser("~/xbt-rnd/b1-agp-023")))
+sys.path.insert(0, os.environ.get("XBT402_B1", os.path.expanduser("~/xbt-rnd/b1")))
 from xbt402.route_client import RoutePayer  # noqa: E402
 from xbt402.rpc import RPC  # noqa: E402
 from xbt402.signer import ChannelSigner  # noqa: E402

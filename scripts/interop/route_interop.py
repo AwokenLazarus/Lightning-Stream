@@ -37,7 +37,7 @@ import threading
 import time
 import urllib.request
 
-B1 = os.environ.get("XBT402_B1", os.path.expanduser("~/xbt-rnd/b1-agp-023"))
+B1 = os.environ.get("XBT402_B1", os.path.expanduser("~/xbt-rnd/b1"))
 sys.path.insert(0, B1)
 from xbt402.rpc import RPC  # noqa: E402
 from xbt402.x402_channel import network_id, unb64json  # noqa: E402
@@ -193,7 +193,9 @@ def scenario(i, client, hub_impl, prov_impl):
         conf = {"node": {"rpcport": int(RPCPORT), "cookie": COOKIE, "wallet": "w"}, "network": NET, "port": hub_port,
                 "datadir": os.path.join(d, "hub"), "pay_to_key_file": key, "connect": urls, "watch_interval": 0.5,
                 "hub": {"fee_base_msat": 100, "fee_ppm": 2000, "max_lock_sat": 20000, "max_unguarded_lock_sat": 500,
-                        "delta": 144, "reveal_timeout": 2.0, "ch2_capacity": 50000, "ch2_expiry_blocks": 1100,
+                        # (AGP-105: no reveal_timeout here. The script set 2 s, which hid that the shipped
+                        # 10 s routed nothing to the shipped provider's 8 s invoices; both run at their defaults)
+                        "delta": 144, "ch2_capacity": 50000, "ch2_expiry_blocks": 1100,
                         "close_margin": 144, "policy": {"min_expiry_blocks": 1008, "max_expiry_blocks": 8640}}}
         cpath = os.path.join(d, "hub.json")
         with open(cpath, "w") as f:

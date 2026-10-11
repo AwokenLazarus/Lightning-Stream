@@ -12,7 +12,10 @@
 # AGP-057 adds cmp's prices (16,515-sat locks on a 1M ch2: the zero-conf cap of a rollover child, with the
 # refusals classified) and exhaustion under load (the ch2 line runs out several times: make-before-break
 # refill, zero refusals; and the refill-after-close baseline).
-# Ports 34900-34999 (AGP-053). Node and processes wiped on exit. Soak rules: CPUQuota 200%, 4G, nice 19.
+# Ports 34900-34999 (AGP-053) by default: inside the kernel's default ephemeral range, and usable here because
+# this host reserves 30000-34999 (/proc/sys/net/ipv4/ip_local_reserved_ports); on a host that does not, set
+# XBT_RS_LOAD_PORT_BASE below 32768. The Rust binaries are built from this tree into CARGO_TARGET_DIR
+# (default ./target) and run from there; B1 is XBT402_B1 (default ~/xbt-rnd/b1). The run prints both trees. Node and processes wiped on exit. Soak rules: CPUQuota 200%, 4G, nice 19.
 # Env: XBT402_B1, LOAD_ONLY, LOAD_SECONDS, LOAD_RATE, LOAD_BLOCK_S, LOAD_STUCK_S, LOAD_REORG_S, LOAD_REPORT.
 # XBT_RS_LOAD_PORT_BASE / XBT_RS_LOAD_PORT_SPAN (default 100): with a span under 100 the selected runs
 # (LOAD_ONLY) are packed two ports each from base + 4 (a worker's 20-port grant holds 8 runs).
@@ -20,7 +23,9 @@ set -euo pipefail
 lazvault hold check --project xbt-agentpay || exit 75   # IMP-030: heavy entry point, refuses during a host hold
 cd "$(dirname "$0")/.."
 ROOT=$PWD
-B1=${XBT402_B1:-$HOME/xbt-rnd/b1-agp-057}
+# AGP-105: the default B1 was ~/xbt-rnd/b1-agp-057, a worktree from before wave 4: run without XBT402_B1 the
+# script tested an old Python hub
+B1=${XBT402_B1:-$HOME/xbt-rnd/b1}
 PB=${XBT_RS_LOAD_PORT_BASE:-34900}
 SPAN=${XBT_RS_LOAD_PORT_SPAN:-100}
 R=${XBT_RS_RUN:-$ROOT/run}/load-$$
@@ -50,4 +55,5 @@ python3 "$HOME/xbt-rnd/xbt-063/tools/portcheck.py" wait $(seq $((PB + 1)) $((PB 
 "$B1/scripts/node.sh" wipe >/dev/null 2>&1 || true
 "$B1/scripts/node.sh" up
 echo "== rollover under load (hub-provider[-kind]); rate ${LOAD_RATE:-15}/s, a block every ${LOAD_BLOCK_S:-3} s"
+echo "   xbt-rs $ROOT @ $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null) (binaries $RS_BIN); B1 $B1 @ $(git -C "$B1" rev-parse --short HEAD 2>/dev/null); ports $PB+"
 if "$PY" scripts/interop/rollover_load.py; then echo "rollover_load_regtest: OK"; else echo "rollover_load_regtest: FAIL (run/rollover_load.log)"; exit 1; fi
