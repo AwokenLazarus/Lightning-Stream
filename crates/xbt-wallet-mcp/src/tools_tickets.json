@@ -1,0 +1,60 @@
+[
+ {
+  "description": "Stream tickets (small Lightning payments locked ahead of use, each released by a secret the wallet's signer keeps until it is spent): the wallet's book after it has been compared with its Lightning node. Shows the sessions that are open or stopping, tickets by state, sats and tickets locked against the owner's exposure caps, sats booked as spent and not yet settled, whether the node's payments in flight are the book's, and whether Lightning payments are halted. With session, that session's tickets one by one. Read-only: it locks nothing, releases nothing and returns no secret.",
+  "inputSchema": {
+   "properties": {
+    "session": {
+     "default": "",
+     "title": "Session",
+     "type": "string"
+    }
+   },
+   "type": "object",
+   "title": "ticket_statusArguments"
+  },
+  "name": "ticket_status",
+  "outputSchema": {
+   "properties": {
+    "result": {
+     "title": "Result",
+     "type": "string"
+    }
+   },
+   "required": [
+    "result"
+   ],
+   "type": "object",
+   "title": "ticket_statusOutput"
+  }
+ },
+ {
+  "description": "Stop a stream-ticket session: the wallet locks and releases nothing more for it. Returns the payment hashes of its tickets that are still locked and unreleased (cancel), which only the seller can cancel; until the seller does, or the tickets expire, their sats stay locked. Stopping spends nothing and cannot be undone: a new session is opened by the next paid stream. It cannot release a ticket, pay anything, or free funds by itself.",
+  "inputSchema": {
+   "properties": {
+    "session": {
+     "title": "Session",
+     "type": "string"
+    }
+   },
+   "required": [
+    "session"
+   ],
+   "type": "object",
+   "title": "ticket_stopArguments"
+  },
+  "name": "ticket_stop",
+  "outputSchema": {
+   "properties": {
+    "result": {
+     "title": "Result",
+     "type": "string"
+    }
+   },
+   "required": [
+    "result"
+   ],
+   "type": "object",
+   "title": "ticket_stopOutput"
+  }
+ }
+]

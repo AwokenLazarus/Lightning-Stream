@@ -43,6 +43,8 @@ pub fn spec(tool: &str) -> Option<&'static [Arg]> {
     // AGP-082: amount_sats, for a BOLT 12 offer that names no amount (0: not given)
     static LN_PAY: [Arg; 4] = [req("invoice", Ty::Str), req("max_sats", Ty::Int), opt("description", Ty::Str, empty),
                                opt("amount_sats", Ty::Int, || Value::from(0))];
+    static TICKET_STATUS: [Arg; 1] = [opt("session", Ty::Str, empty)];
+    static TICKET_STOP: [Arg; 1] = [req("session", Ty::Str)];
     Some(match tool {
         "balance" | "channels" | "forward_status" => &[],
         "quote_payment" | "pay" => &PAYMENT,
@@ -53,6 +55,9 @@ pub fn spec(tool: &str) -> Option<&'static [Arg]> {
         // AGP-048 (not B2's)
         "ln_pay" => &LN_PAY,
         "ln_status" => &[],
+        // stream tickets (not B2's)
+        "ticket_status" => &TICKET_STATUS,
+        "ticket_stop" => &TICKET_STOP,
         _ => return None,
     })
 }

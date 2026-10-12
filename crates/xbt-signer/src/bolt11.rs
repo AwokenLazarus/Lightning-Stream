@@ -330,6 +330,11 @@ pub mod encode {
     }
 
     pub fn invoice(spec: &Spec, key: &SecretKey) -> String {
+        invoice_cltv(spec, key, None)
+    }
+
+    /// As [`invoice`], with a `c` field (the final CLTV delta) when one is given.
+    pub fn invoice_cltv(spec: &Spec, key: &SecretKey, min_final_cltv: Option<u64>) -> String {
         let mut body = int_words(spec.timestamp, 7);
         body.extend(field(1, from_bytes(&spec.payment_hash)));
         body.extend(field(16, from_bytes(&[7u8; 32])));
@@ -341,6 +346,9 @@ pub mod encode {
         }
         if let Some(x) = spec.expiry_s {
             body.extend(field(6, int_words(x, 1)));
+        }
+        if let Some(c) = min_final_cltv {
+            body.extend(field(24, int_words(c, 1)));
         }
         if !spec.features.is_empty() {
             let top = spec.features.iter().max().copied().unwrap_or(0);

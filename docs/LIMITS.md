@@ -10,8 +10,8 @@ reasoning behind each rule is in the engineering notes (`docs/ENGINEERING.md` in
 tree).
 
 Direction, decided on 2026-10-11: Lightning Stream is being rebuilt on Lightning. It adds stream
-tickets to ordinary XBT Lightning channels (the seller's gateway is built and has run on regtest;
-the wallet's side is not built). The hub was retired on that
+tickets to ordinary XBT Lightning channels (the wallet's ticket book and the seller's gateway are
+built and have run on regtest; the binding of the wallet to paid HTTP requests is not). The hub was retired on that
 day and its code removed. The on-chain one-way channel is **frozen**: kept in the tree and
 tested, off the main path, with no new work. Sections about it are marked "frozen" below.
 
@@ -49,13 +49,13 @@ does what the hub did. The code and those limits are in the git history, last at
   `xbt402_void_lock`, `xbt402_adopt_lock`, `xbt402_recover_lock` or `routing_status`; the Python
   wallet reference still has them.
 
-### Stream tickets (in design)
+### Stream tickets (the design's measurements)
 
-A ticket is a small Lightning payment locked along a route to a hash whose secret only the buyer
-knows (a hold invoice on the seller's node); the buyer releases it by putting the secret in a
-paid request. Each sentence below comes from the design's lab measurements: three Lightning Fork
-nodes on regtest, buyer and seller one routing node apart, default node settings. No wallet
-built on tickets exists yet; the seller's side is the gateway of the next section.
+The sentences of this section are about tickets as such, whoever builds on them. A ticket is a small Lightning payment locked along a
+route to a hash whose secret only the buyer knows (a hold invoice on the seller's node); the
+buyer releases it by putting the secret in a paid request. Each sentence below comes from the
+design's lab measurements: three Lightning Fork nodes on regtest, buyer and seller one routing
+node apart, default node settings. The wallet's ticket book and the seller's gateway have their own sections below.
 
 - Money moves a ticket at a time (1,000 sat by default, 1 sat at the least). Pieces inside a
   ticket are metered, and the unused part of the ticket in use is trusted to the seller.
@@ -222,6 +222,85 @@ Regtest only. The gateway has run against Lightning Fork nodes on one host
   `public_url` set to the origin buyers use, or every payment fails its request binding.
 - Not run: more than one routing hop, real network latency, mainnet, IPv6, a seller with several
   channels, and the Core Lightning fork.
+
+### Stream tickets: the wallet's ticket book
+
+The buyer's side, in the signer (`ticket.rs`, `ticket_rail.rs`): secrets, tickets locked through
+the owner's node, and the booking. It is reached through six socket methods; the binding to
+`xbt402_pay` and paid HTTP requests, the check of a seller's receipts, verify-before-release for
+checkable content, prepaid tickets (`settle: on-arrival`), lottery tickets and admission by
+content hash are not built. Run on regtest only (`scripts/ticket_book_regtest.sh`).
+
+- Tickets are off until the owner's policy turns them on (`tickets.enabled`) and names at least
+  one task with a budget (`tickets.tasks`); with tickets on and no task, every session is refused.
+- A secret that has left the signer is spent, also when the reply that carried it was lost on the
+  way to the caller: it is not returned a second time. That costs at most one ticket, which is
+  booked until the seller cancels it or it expires.
+- Every start of the signer treats the tickets it finds locked as released: they are booked
+  against the budgets at their worst case and never released, and every session is stopped. A
+  restart therefore costs the use of the tickets that were locked (their sats stay locked until
+  the seller cancels them or they expire, about 25 blocks for a 40-block ticket) and holds their
+  worst case against the budgets for as long. The signer does this because it cannot tell a
+  restart from a restore of an older copy of its files, after which a ticket its book shows locked
+  may have been released. *(test)*
+- After a restore the wallet finds the tickets its book lacks by a tag on each ticket payment in
+  its node's payment list. It finds only what the node still lists: payments the owner deleted
+  from the node, and a node whose own database was restored or lost, hide tickets from it, and
+  what it cannot see it does not count. A ticket the node no longer lists after having shown it
+  locked stays booked.
+- The wallet locks and releases nothing between a start and the first complete read of its node's
+  payment list (`ticket_sync`); with the node down that is until the node is back.
+- The seller's node receives a 32-byte tag with every ticket (a random nonce and a MAC). It tells
+  the seller nothing about the wallet beyond what the payment hash already does.
+- The ticket rail trusts its own Lightning node as the Lightning rail does: a ticket the node
+  reports failed is no longer counted as spent, and a fee the node reports is the fee booked. A
+  settle is believed only with the preimage of the ticket's hash, and is never booked below the
+  ticket's size.
+- A ticket that settles although this wallet's book never released its secret halts all Lightning
+  payments until the human resumes them; it is booked, not prevented.
+- The exposure caps (`max_locked_sats` and the per-seller and per-task ones) count a ticket at its
+  face value. The routing fee of a locked ticket is locked on top of it, up to the rail's fee limit
+  (10 sat and 0.5%: 15 sat on a 1,000-sat ticket).
+- Nothing is locked that the budgets could not also release at that moment, but locked tickets
+  are not booked: another payment of the wallet can use the budget meanwhile, and the tickets are
+  then not released and stay locked until the seller cancels them or they expire.
+- A release is one payment under every rule of the wallet. With the shipped `velocity_max` of 8
+  an hour a wallet releases at most 8 tickets an hour, across all rails; an owner who streams
+  raises it. Releases to one seller inside `split_window_s` add up against `max_per_tx_sats` and
+  the human threshold as any split payment does.
+- No release can wait for a human: a session whose one ticket, with its fee limit, would reach
+  `human_threshold_sats` is refused when it opens.
+- The owner names a ticket seller by its node id: `ln:<node id>` on the allowlist, or an
+  allowlisted origin whose `counterparties` entry gives the node id (`ln_node`). An origin alone
+  names nobody: the caller says which origin a session is for, and until the wallet itself
+  fetches a seller's terms that is the caller's word.
+- A seller the owner has not named is paid only under a task that admits any seller, and by
+  default at most 2 tickets locked and 4 tickets' worth paid in the task's window. The cap is per
+  node id, and node ids are free to make: what bounds a seller that takes a ticket and serves
+  nothing, under as many node ids as it likes, is the task's budget.
+- A task's budget is read over a rolling window of at most a week (a day by default), from the
+  wallet's own ledger. Tickets found on the node after a restore count against the daily and
+  weekly budgets and their seller's cap, and against no task's budget.
+- One session per seller at a time; a session with no lock or release for 10 minutes is stopped,
+  and no session survives a start of the signer.
+- The signer does not talk to sellers. It says how many hashes a pool wants (below half of the
+  pool: back to the pool's size) and the caller fetches the invoices; a refill happens when the
+  caller asks. Stopping a session only names the tickets to cancel: the seller cancels, or does
+  not.
+- A release does not ask the node whether the ticket is still locked. It relies on the last
+  reconcile (every watcher tick, 10 s by default) and on the ticket's expiry height: a ticket the
+  seller cancelled in between is released, booked, refused by the seller and un-booked at the
+  next tick.
+- A ticket with 25 blocks or fewer before its expiry at the seller is not released; it stays
+  locked until the seller's node cancels it.
+- One HTLC per ticket (`max_parts` 1): a ticket that would need two routes is not locked.
+- A hash the seller sends no invoice for within 2 minutes is dropped; at most 64 hashes are
+  offered or locked in one call; 5,000 payments of the node's list are read in one reconcile.
+- A plain Lightning payment (`ln_pay`) holds the wallet's spend lock while the node routes it, up
+  to its timeout: a ticket release waits for it. A ticket lock round holds no lock while the node
+  routes.
+- Tickets and sessions that ended more than a day ago leave the book. The wallet's backup holds
+  the book and the sealed ticket seed while each is under the backup's 8 MiB limit a file.
 
 ### Channel and transport (library client) (frozen)
 
@@ -597,6 +676,8 @@ Neither the external review nor any of the project's four audits covered:
 - the macaroon reader the Lightning rail uses (`xbt402::macaroon`): written after the last audit;
 - the seller gateway (`xbt-gateway`), the ticket wire module (`xbt402::ticket`) and the streamed
   answers of the shared HTTP server (`xbt_svc::http`): written after the last audit;
+- the ticket book (`ticket.rs`, `ticket_rail.rs`, the held send and the payment list of the
+  Lightning backend): written after the last audit, tested by the project only;
 - the removal of the hub itself (2026-10-11): what was cut from the provider, the client library
   and the signer, and how records of the removed features are treated;
 - anything on a real network: no mainnet node, no public Electrum server and no Lightning node

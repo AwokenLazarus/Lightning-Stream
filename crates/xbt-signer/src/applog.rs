@@ -144,6 +144,19 @@ impl AppendLog {
         Ok(())
     }
 
+    /// Several rows in one write and one fsync. Not all-or-nothing: a crash mid-write keeps the
+    /// rows whose lines were complete, so the caller's rows must each stand alone.
+    pub fn append_all(&mut self, rows: &[Value]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let body: Vec<u8> = rows.iter().flat_map(line).collect();
+        fsx::write_all(&mut self.file, &body).map_err(|e| io(&self.path, e))?;
+        fsx::sync(&self.file).map_err(|e| io(&self.path, e))?;
+        self.file_rows += rows.len();
+        Ok(())
+    }
+
     /// Replace the log's rows with `rows`, atomically.
     pub fn compact(&mut self, rows: &[Value]) -> Result<()> {
         replace_log(&self.path, &self.kind, rows)?;

@@ -1,13 +1,17 @@
 # Stream tickets: the wire, draft v0
 
-**Draft v0.** The seller's side is implemented by `xbt-gateway` (`crates/xbt-gateway`), and
-`scripts/gateway_regtest.sh` runs that binary against Lightning Fork nodes with a test buyer that
-speaks this wire. No wallet implements the buyer's side yet. The numbers were measured on regtest
-by `scripts/ln_ticket_regtest.sh` (four Lightning Fork nodes, default settings, one host, loopback)
-and, where a sentence names the gateway, by `scripts/gateway_regtest.sh`; anyone can rerun both.
-The few that come from reading the node's source say so. Nothing here has run on mainnet.
-Section 10 lists what building the gateway changed in this draft. XBT is Bitcoin on BLAKE2b proof
-of work; "the SHA-256 chain" is the other chain.
+**Draft v0.** It was written down before any wallet or seller code so that it could be argued
+with. Both sides are now built and run on regtest: the seller's side by `xbt-gateway`
+(`crates/xbt-gateway`, run by `scripts/gateway_regtest.sh` against Lightning Fork nodes with a test
+buyer that speaks this wire), and the buyer's side of sections 2 to 4 by the ticket book in the
+wallet's signer (`crates/xbt-signer/src/ticket.rs` and `ticket_rail.rs`, run by
+`scripts/ticket_book_regtest.sh`). The wallet's HTTP binding of section 3 is not built, so no
+wallet pays a gateway yet. The numbers were measured on regtest by `scripts/ln_ticket_regtest.sh`
+(four Lightning Fork nodes, default settings, one host, loopback) and, where a sentence names the
+gateway, by `scripts/gateway_regtest.sh`; anyone can rerun them. The few that come from reading
+the node's source say so. Nothing here has run on mainnet. Section 10 lists what building the
+gateway changed in this draft. XBT is Bitcoin on BLAKE2b proof of work; "the SHA-256 chain" is the
+other chain.
 
 A **ticket** is a small Lightning payment that is locked along an ordinary route and not yet
 released. The buyer picks a 32-byte secret and gives the seller its SHA-256 hash. The seller's node
@@ -49,7 +53,8 @@ A seller that takes tickets adds one entry to `accepts` in its `402` (`PAYMENT-R
 | `amount` | The price of this request before its body, in msat: `price.requestMsat`. | Pieces are metered below one sat; money moves a ticket at a time (section 3). |
 | `price` | The whole price rule: `requestMsat` once per request, `byteMsat` for every `perBytes` bytes of the response body (rounded up over the whole body), `secondMsat` for every started second the response is open. | A body priced by its size or its duration has no price before it is sent (section 4). |
 | `payTo` | The node every ticket invoice must name as payee. | The 402 came over TLS from the seller. An invoice naming another node pays a stranger. |
-| `ticketMsat` | The size of one ticket. | One fixed size, so that an invoice has one right amount. |
+| `ticketMsat` | The size of one ticket. | One size per session, so that an invoice has one right amount. |
+| `minTicketMsat` | Optional. The smallest ticket the seller issues when a buyer asks for a smaller one (section 2). Absent: `ticketMsat` is the only size. | A buyer that pays many sellers a little each sizes its tickets to what a seller will earn, down to 64 sat by its own choice; without this a seller cannot say how small it will go. |
 | `maxTickets` | The most tickets the seller holds unreleased for one session. | Each held ticket takes one of the 483 HTLC slots of every channel on the route and the seller's inbound capacity. |
 | `ticketBlocks` | The final CLTV delta of every ticket invoice: how long a ticket lives. | It bounds how long the buyer's money can be locked (section 6). |
 | `release` | `with-request`: the secret comes with the request. `after-verify`: section 5. | Who goes first, and so who risks one piece. |
@@ -57,13 +62,16 @@ A seller that takes tickets adds one entry to `accepts` in its `402` (`PAYMENT-R
 | `receiptKey` | The key that signs the seller's receipts. | With tickets the payment preimage proves nothing: the buyer always knew it. The signed receipt is the proof of what was paid for. |
 | `session` | Path of the session endpoints on the seller's origin. | |
 
-A buyer MUST refuse an entry whose `ticketMsat`, `maxTickets` or `ticketBlocks` is above what its
-owner allows, or it locks more, or for longer, than the owner agreed to.
+A buyer MUST refuse an entry whose `ticketBlocks` is above what its owner allows, and one whose
+`ticketMsat` is above it unless `minTicketMsat` lets it ask for a size its owner does allow, or it
+locks more, or for longer, than the owner agreed to. `maxTickets` is the most the seller will hold:
+a buyer whose owner allows fewer locks fewer.
 
 ## 2. Lock
 
 ```text
-POST <session>/lock    {"version": "ticket/0", "session": "<id, absent the first time>", "hashes": ["<h1>", "<h2>", ...]}
+POST <session>/lock    {"version": "ticket/0", "session": "<id, absent the first time>", "hashes": ["<h1>", "<h2>", ...],
+                        "ticketMsat": "<the size asked for, optional>"}
 200                    {"session": "<id>", "key": "<32 bytes, the first time only>",
                         "tickets": [{"hash": "<h1>", "invoice": "<BOLT 11>"}, ...],
                         "refused": [{"hash": "<h>", "error": "hash_refused"}, ...]}
@@ -81,7 +89,11 @@ seller registers a hold invoice per hash (`AddHoldInvoice`: the hash, `ticketMsa
 delta of `ticketBlocks`, a time expiry of 60 seconds) and returns the invoices, for as many of the
 hashes as its cap allows, in order. `key` is a session key for authenticating requests (section 3);
 it travels once, over TLS. A secret is for one invoice. The buyer MUST NOT send a hash twice, even
-after a payment that failed: an HTLC for it may still be somewhere on a route.
+after a payment that failed: an HTLC for it may still be somewhere on a route. `ticketMsat` in the
+request is the size the buyer wants for this session, between the terms' `minTicketMsat` and
+`ticketMsat`; a seller whose terms have no `minTicketMsat` ignores it and issues its one size, and
+the buyer, which knows that from the terms, does not ask. A buyer drops a hash it got no invoice
+for after two minutes: an invoice that arrives later is not paid.
 
 Before paying each invoice the buyer MUST check all of these. They are the whole of the buyer's
 safety, since a paid ticket cannot be recalled:
@@ -90,10 +102,11 @@ safety, since a paid ticket cannot be recalled:
 |---|---|
 | The payee is `payTo`. | The ticket pays another node. |
 | The payment hash is one of the hashes just sent, and none is used twice. | An invoice for any other hash is an ordinary invoice: whoever knows its preimage takes the money on arrival. |
-| The amount is exactly `ticketMsat`. | The buyer locks more than the terms said. |
+| The amount is exactly the session's ticket size: `ticketMsat`, or the size the buyer asked for. | The buyer locks more than the terms said. |
 | Feature bit 512 is set and required; the prefix is XBT's. | The wallet pays on the SHA-256 chain's Lightning network. |
 | The final CLTV delta is `ticketBlocks`, and within the owner's bound. | Funds can stay locked for as long as the seller wrote (the node's ceiling for a route is 2,016 blocks, from its source). |
 | With this ticket, unreleased tickets for this seller are at most `maxTickets`, and their sum is within the owner's cap on locked funds. | A seller that asks for more locks more. |
+| The invoice is payable for no longer than the owner allows (an hour by default), has not expired, and has a payment secret. | An invoice that stays payable is one the buyer's node could still pay long after the buyer gave the hash up. |
 
 The buyer's node then pays each invoice, under all the checks the wallet's Lightning rail already
 makes of its own node and channels, with a fee limit and a limit on the route's total time lock
@@ -102,8 +115,22 @@ HTLC (80 blocks per hop at the forks' default): a 40-block ticket through one ho
 expires 123 blocks after it was locked. Without the limit, a long route decides how long the
 buyer's funds can be stuck behind a hop that has gone away.
 
+**The buyer's tag.** A ticket payment MAY carry one custom record to the seller's node: type
+1953063787 (odd, so a node that does not know it ignores it), 32 bytes, a nonce and a MAC under a
+key only the buyer's wallet has. It says nothing to the seller, which ignores it. The buyer's own
+node keeps it with the payment, and that is its use: a wallet whose records are older than its
+node's (a restore from a backup) reads its node's payment list and knows which payments are its
+tickets. On the lab the record reached the seller's hold invoice and stayed in the buyer node's
+record of the payment while it was in flight and after it settled; a failed payment's record no
+longer lists it.
+
 A ticket is **locked** when the seller's node shows its invoice as `ACCEPTED`. The buyer's node shows
-the payment as `IN_FLIGHT` and stays that way until the ticket is settled or cancelled. Locked funds
+the payment as `IN_FLIGHT` and stays that way until the ticket is settled or cancelled. The buyer
+sees `IN_FLIGHT` first, by about one commitment exchange per channel on the route (0.1 s each on
+the lab), and cannot see `ACCEPTED` at all. A buyer that releases a ticket in that moment gets
+`ticket_not_locked` (section 3); the seller has not used the ticket, and the buyer sends the same
+secret again. On the lab a buyer that paid as soon as its own node showed 8 tickets in flight was
+answered so and served on the retry. Locked funds
 are not spent. They count against a cap on locked funds, not against a budget.
 
 The seller MUST cap sessions as well as tickets per session, and SHOULD let an unpaid invoice lapse
@@ -190,6 +217,10 @@ no fresh height: the secret was not taken, and the same request with the next `s
 A refusal of an authenticated request is signed like any answer: its receipt has `charged` 0 and
 the session's totals, so a buyer can tell a refusal from the seller from one made up on the way.
 
+The buyer does not release a ticket with 25 blocks or fewer before the expiry of the HTLC at the
+seller, as its own node reports it: the seller would refuse it at 24 (step 2), and a secret sent
+with a refused request has left all the same.
+
 The buyer MUST record a ticket as spent, on disk, before its secret leaves the signer, whatever the
 reply turns out to be. A secret that has left can be collected at any time until the ticket
 expires, so a wallet that books on the reply under-counts what it spent after a crash or a refusal.
@@ -197,6 +228,12 @@ The buyer books what it released plus the routing fee its own node reports, neve
 seller sends. It checks each receipt against its own count, and stops if `spentMsat` exceeds what it
 asked for or `releasedMsat` differs from what it released. The requests MUST go over TLS (or
 loopback): on a plain connection a listener learns the session key.
+
+A buyer that starts cannot tell a restart from a restore of older records, in which a ticket shown
+as locked may have been released since. It MUST treat every ticket that was locked before the start
+as released: counted as spent, never released by it, until its own node shows the payment settled
+or failed. A seller therefore sees a buyer that has restarted stop its session and ask for its
+tickets to be cancelled.
 
 On the lab a paid request cost the seller about 1 ms to hash the secret and look the ticket up on
 its node, and about 4 ms in all until the settle call returned. The buyer's node showed the payment
@@ -217,7 +254,13 @@ background, up to `maxTickets`. Locking 8 tickets took 0.3 s through one hop, 0.
 channel and 0.5 s through two hops (100 tickets: 2 s through one hop), so a refill mark of half of
 `maxTickets` covers any buyer that spends fewer than four tickets in that time. A ticket with 24 blocks or fewer left can no longer be
 used (section 3, step 2): the buyer SHOULD ask for it to be cancelled and lock a fresh one. A
-40-block ticket is usable for 19 blocks.
+40-block ticket is usable for 19 blocks by the seller's rule, and for 18 by a buyer that stops
+one block earlier.
+
+A buyer with many sellers in one task locks fewer and smaller tickets with each: the wallet's
+default is 8 tickets of the seller's size up to 8 sellers, and beyond that 2 tickets a seller,
+each half of what the seller is expected to earn and at least 64 sat, where the seller's terms
+let it choose a size.
 
 **An answer priced as it goes.** A body priced per byte or per second (section 1, `price`) is paid
 for while it is sent: the seller takes the price of each piece of the body from the balance before
@@ -312,6 +355,11 @@ channel.
 ## 8. Open in this draft
 
 - The scheme name and the `lightning:` network id are ours. Nothing upstream defines them.
+- What `auth` covers in a second `lock` and in a `cancel` is not written down: section 3 defines it
+  for a paid request only.
+- A lock is not idempotent. If the answer to a lock is lost, the seller holds invoices the buyer
+  never pays; they lapse, and the buyer's next lock sends new hashes.
+- The custom record type of the buyer's tag is ours, as the scheme name is.
 - Receipts are signed by a key the 402 names. Nothing ties that key to the node id but the TLS
   origin that served both.
 - BOLT 11 only. The fork's BOLT 12 offer code issues each invoice with its own preimage and has no

@@ -56,13 +56,19 @@ the full list, with a link for each, is [`docs/REFERENCES.md`](docs/REFERENCES.m
   never holds a key. The owner sets a signed policy: budgets, per-seller caps, an allowlist, a
   threshold above which a human approves. Every signature goes into a tamper-evident log.
 - **The Lightning rail.** The wallet pays XBT Lightning invoices (BOLT 11) and offers (BOLT 12)
-  through the owner's Lightning node, under the same policy. This rail is what tickets will be
+  through the owner's Lightning node, under the same policy. This rail is what tickets are
   built on.
 - **The seller gateway (regtest only).** `xbt-gateway` runs beside a seller's Lightning node in
   front of any HTTP service: it offers ticket terms in a 402, registers hold invoices for a
   buyer's hashes, settles a ticket when its secret arrives, meters the answer per request, per
   byte or per second, and signs a receipt. `scripts/gateway_regtest.sh` runs it on three
   Lightning Fork nodes with a test buyer; no wallet pays it yet.
+- **The ticket book in the wallet's signer.** The buyer's side of stream tickets: secrets derived
+  in the signer from a sealed seed, many tickets locked at once through the owner's node, each
+  release written to disk as spent before its secret leaves, under an owner's policy with a
+  budget for each task, an exposure cap, and small caps for sellers the owner has not named.
+  `scripts/ticket_book_regtest.sh` runs it against Lightning Fork nodes on regtest. It is reached
+  through the signer's socket; paying an HTTP request with it is not built yet.
 - **The on-chain one-way channel (frozen).** A direct channel anchored on the chain, for paying
   one seller piece by piece: the buyer signs a slightly larger running total for each piece and
   the seller settles once. It is kept in the tree and tested, off the main path, with no new
@@ -76,10 +82,9 @@ the full list, with a link for each, is [`docs/REFERENCES.md`](docs/REFERENCES.m
 
 ## What is being built
 
-Stream tickets, in this order: the ticket book in the wallet's signer (secrets derived in the
-signer, many tickets in flight, each booked when it is locked and when its secret leaves); the
-seller gateway beside a Lightning node (built: see above); and the wallet's side of the HTTP 402
-entry, which pays a gateway.
+Stream tickets. The ticket book in the wallet's signer and the seller gateway beside a Lightning
+node are both built (above) and run on regtest. Next: the wallet's side of the HTTP 402 entry, so
+that `xbt402_pay` pays a gateway; then the lottery for amounts smaller than a ticket.
 The wire is written down as a draft in [`docs/TICKETS.md`](docs/TICKETS.md), and
 `scripts/ln_ticket_regtest.sh` reproduces its measurements on four Lightning Fork nodes (31 checks).
 Defaults in the design: 1,000-sat tickets, 8 in flight, a life of about 40 blocks. The buyer goes
@@ -87,8 +92,8 @@ first and can lose at most one ticket; for content that can be checked, the buye
 before releasing its ticket.
 
 A seller will need a Lightning node with inbound capacity, and a buyer a Lightning node with a
-channel. `docs/LIMITS.md` states what the design gives up (section "Stream tickets (in design)")
-and what the gateway does not do (section "Seller gateway").
+channel. `docs/LIMITS.md` states what the design gives up, what the wallet's ticket book does not
+do and what the gateway does not do (the "Stream tickets" sections and "Seller gateway").
 
 ### Lottery tickets (in design)
 
