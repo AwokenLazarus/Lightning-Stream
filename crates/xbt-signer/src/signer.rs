@@ -197,6 +197,8 @@ pub struct SignerOptions {
     pub keystore: Option<Arc<KeyStore>>,
     /// AGP-048: the LN node `rail=ln` pays through (default: `B2_LN_REST` / `B2_LN_MACAROON` / `B2_LN_TLS_CERT`).
     pub ln: Option<Arc<dyn LnBackend>>,
+    /// How the ticket payer talks HTTP to sellers (default: [`crate::ticket_pay::UreqWire`]).
+    pub ticket_wire: Option<Arc<dyn crate::ticket_pay::TicketWire>>,
 }
 
 pub struct Signer {
@@ -243,6 +245,13 @@ pub struct Signer {
     pub(crate) ticket_error: Mutex<Option<String>>,
     pub(crate) ticket_seed: Mutex<Option<Arc<crate::ticket::Seed>>>,
     pub(crate) ticket_synced: std::sync::atomic::AtomicBool,
+    /// Stream tickets over HTTP ([`crate::ticket_pay`]): the transport, one place per seller origin
+    /// for its session, the sessions of an earlier run whose cancel was asked for, and this signer
+    /// itself (for the thread that refills a pool behind a call).
+    pub(crate) ticket_wire: Arc<dyn crate::ticket_pay::TicketWire>,
+    pub(crate) ticket_http: Mutex<HashMap<String, Arc<crate::ticket_pay::Slot>>>,
+    pub(crate) ticket_cancel_tried: Mutex<HashSet<String>>,
+    pub(crate) me: std::sync::OnceLock<std::sync::Weak<Signer>>,
     /// AGP-063 W4: the one-time code that enrols the first human key.
     pub(crate) enroll: Mutex<crate::admin::EnrollCode>,
     /// AGP-089: the human-signed messages already used (one signature, one operation).
@@ -331,8 +340,11 @@ impl Signer {
                                 human_pubkey: RwLock::new(human_pubkey), spend: Mutex::new(()), approval_outcomes: Mutex::new(HashMap::new()), boot_policy: raw,
                                 keystore, sigaudit, anchor, hot, book, session, open_tried: Mutex::new(HashMap::new()), close_claims: Mutex::new(HashSet::new()), watch_interval,
                                 ln, ln_error, ln_book, ln_funding: Mutex::new(HashMap::new()), tickets: Mutex::new(None),
-                                ticket_error: Mutex::new(None), ticket_seed: Mutex::new(None), ticket_synced: std::sync::atomic::AtomicBool::new(false), enroll: Mutex::new(Default::default()),
+                                ticket_error: Mutex::new(None), ticket_seed: Mutex::new(None), ticket_synced: std::sync::atomic::AtomicBool::new(false),
+                                ticket_wire: opts.ticket_wire.clone().unwrap_or_else(|| Arc::new(crate::ticket_pay::UreqWire::default())),
+                                ticket_http: Mutex::new(HashMap::new()), ticket_cancel_tried: Mutex::new(HashSet::new()), me: std::sync::OnceLock::new(), enroll: Mutex::new(Default::default()),
                                 used_sigs: crate::admin::UsedSigs::new(&root.join(".run").join(crate::admin::USED_SIGS_FILE)) });
+        let _ = s.me.set(Arc::downgrade(&s));
         // before any request: what the book holds locked is retired (a start may be a restore)
         s.ticket_start();
         if s.human_key().is_empty() {
@@ -461,7 +473,15 @@ impl Signer {
                 json!({"confirmations": if r.is_null() { Value::Null } else { r.get("confirmations").cloned().unwrap_or(0.into()) },
                        "height": self.height_safe()})
             }
-            "channels" => sanitize(json!({"channels": self.book.list_public(), "height": self.height_safe()})),
+            "channels" => {
+                let mut out = json!({"channels": self.book.list_public(), "height": self.height_safe()});
+                // a wallet with a ticket book also shows its tickets: in flight, locked sats, what was released
+                let tickets = self.ticket_summary();
+                if !tickets.is_null() {
+                    out["tickets"] = with(tickets, json!({"paying": self.ticket_http_public()}));
+                }
+                sanitize(out)
+            }
             "hot_address" => sanitize(self.hot_status(false)),
             "notice_hot_txid" => {
                 let n = self.hot.scan_from_txid(&s("txid"), false, "")?;
@@ -476,10 +496,9 @@ impl Signer {
                 sanitize(self.open_channel_checked(p)?)
             }
             "sign_state" | "xbt402_sign_state" => sanitize(self.sign_state(p)?),
-            "xbt402_pay" => {
-                let _g = self.lock();
-                sanitize(self.xbt402_pay_locked(p))
-            }
+            // takes the spend lock itself: for the whole call on the frozen channel path, as before, and only
+            // for each lock and release on the ticket rail, where an answer may be long (crate::ticket_pay)
+            "xbt402_pay" => sanitize(self.xbt402_pay(p)),
             "xbt402_request_auth" => {
                 let chan = s("chan");
                 let sig = p.get("sig").and_then(Value::as_str).filter(|x| !x.is_empty());
@@ -553,10 +572,8 @@ impl Signer {
                 let _g = self.lock();
                 self.ticket_release_locked(p)
             }
-            "ticket_stop" => {
-                let _g = self.lock();
-                sanitize(self.ticket_stop_locked(p))
-            }
+            // takes the spend lock itself, and not while the seller is asked to cancel
+            "ticket_stop" => sanitize(self.ticket_stop(p)),
             "ticket_status" => {
                 let _g = self.lock();
                 sanitize(self.ticket_status_locked(p))
@@ -1016,7 +1033,14 @@ impl Signer {
                 }
             }
         });
-        self.watch_step("ticket_reconcile", &mut actions, |actions| {
+        self.watch_step("ticket_sessions", &mut actions, |actions| {
+            // sessions paid over HTTP: the idle ones stopped, and the cancel asked for what an earlier run left locked
+            if self.ln.is_some() && self.run.join(crate::ticket_rail::BOOK_FILE).exists() {
+                let _c = sigaudit::context(Some("watcher"), Some("watcher:ticket_sessions"));
+                actions.extend(self.ticket_http_tick());
+            }
+        });
+                self.watch_step("ticket_reconcile", &mut actions, |actions| {
             // stream tickets: the book is brought to the node's payment records, and the node's list is read for tickets the book lacks
             if self.ln.is_some() && self.run.join(crate::ticket_rail::BOOK_FILE).exists() {
                 let _g = self.lock();
@@ -1361,7 +1385,7 @@ impl Signer {
         }
     }
 
-    fn xbt402_pay_locked(&self, p: &Value) -> Value {
+    pub(crate) fn xbt402_pay_locked(&self, p: &Value) -> Value {
         let url = str_or_empty(p.get("url"));
         let method = { let m = str_or_empty(p.get("method")).to_uppercase(); if m.is_empty() { "GET".to_string() } else { m } };
         let raw: Vec<u8> = match p.get("body") {

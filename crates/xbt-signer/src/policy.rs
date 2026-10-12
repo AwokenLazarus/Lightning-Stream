@@ -145,6 +145,10 @@ pub struct PolicyConfig {
     pub open_wait_s: i64,
     pub open_retry_s: i64,
     pub close_fee_max_sats: i64,
+    /// Whether `xbt402_pay` may still pay a seller's on-chain channel entry (the frozen rail).
+    /// `true` unless the owner sets `channel_rail: false`: then no new channel is funded and no
+    /// state is signed by `xbt402_pay`; closing and refunding a channel that exists still work.
+    pub channel_rail: bool,
 }
 
 impl Default for PolicyConfig {
@@ -154,7 +158,7 @@ impl Default for PolicyConfig {
                split_window_s: 600, approval_ttl_s: 900, channel_expiry_blocks: 1008, treasury_csv: 4320, counterparties: Map::new(),
                refund_enabled: true, refund_margin_blocks: 6, hot_balance_cap_sats: 0, forward: Map::new(), ln: Map::new(), tickets: Map::new(),
                anchor_interval_s: 60, anchor_required: false, regtest_mine: None, open_wait_s: 1800, open_retry_s: 60,
-               close_fee_max_sats: 2000 }
+               close_fee_max_sats: 2000, channel_rail: true }
     }
 }
 
@@ -195,6 +199,9 @@ impl PolicyConfig {
         if let Some(v) = raw.get("anchor_required") {
             c.anchor_required = py_bool(v);
         }
+        if let Some(v) = raw.get("channel_rail").filter(|v| !v.is_null()) {
+            c.channel_rail = py_bool(v);
+        }
         if let Some(v) = raw.get("regtest_mine").filter(|v| !v.is_null()) {
             c.regtest_mine = Some(py_bool(v));
         }
@@ -231,11 +238,11 @@ impl PolicyConfig {
 }
 
 /// Every key policy.json may hold (B2's `PolicyConfig` plus `human_pubkey`, `recovery_address`).
-pub const POLICY_KEYS: [&str; 29] = ["allowlist", "max_per_tx_sats", "daily_budget_sats", "weekly_budget_sats", "per_counterparty_cap_sats",
+pub const POLICY_KEYS: [&str; 30] = ["allowlist", "max_per_tx_sats", "daily_budget_sats", "weekly_budget_sats", "per_counterparty_cap_sats",
     "velocity_max", "velocity_window_s", "human_threshold_sats", "split_window_s", "approval_ttl_s", "channel_expiry_blocks", "treasury_csv",
     "counterparties", "refund_enabled", "refund_margin_blocks", "hot_balance_cap_sats", "forward", "anchor_interval_s",
     "anchor_required", "regtest_mine", "open_wait_s", "open_retry_s", "close_fee_max_sats", "human_pubkey", "recovery_address",
-    "vault", "treasury", "ln", "tickets"];
+    "vault", "treasury", "ln", "tickets", "channel_rail"];
 
 /// Fields a running signer reads only at start: a `policy_set` records them and they apply on the next start.
 pub const RESTART_KEYS: [&str; 8] = ["anchor_interval_s", "anchor_required", "regtest_mine", "open_wait_s", "refund_margin_blocks",
@@ -693,8 +700,21 @@ impl PolicyEngine {
         Ok(n)
     }
 
-    fn count(ledger: &[LedgerEntry], window_s: f64, now: f64) -> i64 {
-        ledger.iter().filter(|p| now - p.ts <= window_s).count() as i64
+    /// Payments inside the velocity window, as `velocity_max` counts them. The rule for stream
+    /// tickets is the owner's (`tickets.velocity`, [`crate::ticket::Velocity`]): by default every
+    /// release is a payment, as every row of every other rail is; under `"session"` the releases of
+    /// one session are one payment, and `own` (the session of the payment being decided) is not
+    /// counted against itself.
+    fn count(ledger: &[LedgerEntry], window_s: f64, now: f64, mode: crate::ticket::Velocity, own: Option<&str>) -> i64 {
+        crate::ticket::velocity_count(ledger.iter().filter(|p| now - p.ts <= window_s).map(|p| p.memo.as_str()), mode, own)
+    }
+
+    /// How many payments the velocity window holds now for a payment with this memo (a ticket
+    /// session about to open asks before it locks anything).
+    pub fn velocity_used(&self, memo: &str) -> Result<i64> {
+        let cfg = self.config();
+        let mode = crate::ticket::TicketPolicy::from_map(&cfg.tickets).velocity;
+        Ok(Self::count(&self.store.payments()?, cfg.velocity_window_s as f64, self.now(), mode, crate::ticket::memo_session(memo)))
     }
 
     pub fn evaluate(&self, payment: &Payment, human: bool) -> Result<Decision> {
@@ -770,7 +790,8 @@ impl PolicyEngine {
         if cpty_sum > cfg.per_counterparty_cap_sats {
             return Ok(decide(Deny, "per_counterparty", format!("counterparty spend {cpty_sum} exceeds cap {}", cfg.per_counterparty_cap_sats), None, None));
         }
-        if Self::count(&ledger, cfg.velocity_window_s as f64, now) >= cfg.velocity_max {
+        let velocity = crate::ticket::TicketPolicy::from_map(&cfg.tickets).velocity;
+        if Self::count(&ledger, cfg.velocity_window_s as f64, now, velocity, crate::ticket::memo_session(&p.memo)) >= cfg.velocity_max {
             return Ok(decide(Deny, "velocity", format!("already {} payments in the last {}s", cfg.velocity_max, cfg.velocity_window_s), None, None));
         }
         if !human && p.amount_sats >= cfg.human_threshold_sats {

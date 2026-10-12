@@ -33,4 +33,6 @@ url = "2.5"
 
 [dev-dependencies]
 tempfile = "3"
+# the ticket payer is tested against the real seller gateway, in process (tests/ticket_pay.rs)
+xbt-gateway = { path = "../xbt-gateway" }
 xbt402 = { workspace = true, features = ["http-client", "http-server"] }

@@ -153,13 +153,13 @@ impl Signer {
         self.run.join(BOOK_FILE)
     }
 
-    fn ticket_policy(&self) -> TicketPolicy {
+    pub(crate) fn ticket_policy(&self) -> TicketPolicy {
         TicketPolicy::from_map(&self.config().tickets)
     }
 
     /// The book, opened (and created) when first needed. An error keeps the ticket rail shut and
     /// nothing else.
-    fn ticket_store(&self) -> Result<MutexGuard<'_, Option<TicketStore>>> {
+    pub(crate) fn ticket_store(&self) -> Result<MutexGuard<'_, Option<TicketStore>>> {
         let mut g = self.tickets.lock().unwrap_or_else(|p| p.into_inner());
         if g.is_none() {
             *g = Some(TicketStore::open(&self.ticket_path())?);
@@ -251,7 +251,7 @@ impl Signer {
         Ok(tp)
     }
 
-    fn ticket_audit(&self, kind: &str, fields: Value) {
+    pub(crate) fn ticket_audit(&self, kind: &str, fields: Value) {
         self.engine.audit.append(with(json!({"type": kind, "ts": ts_value(self.engine.now())}), fields));
     }
 
@@ -309,7 +309,7 @@ impl Signer {
             return Ok(());
         }
         let task = if ticket::task_name_ok(&t.task) { t.task.as_str() } else { RECOVERED_TASK };
-        self.engine.commit(&Payment { dest: format!("ln:{}", t.payee), amount_sats: sats, memo: ticket::memo(task), ts }, &id)
+        self.engine.commit(&Payment { dest: format!("ln:{}", t.payee), amount_sats: sats, memo: ticket::memo(task, &t.session), ts }, &id)
     }
 
     /// A ticket whose secret may have left without this book knowing: booked as released, never
@@ -448,9 +448,16 @@ impl Signer {
                 return Ok(refusal("ticket_size", format!("one ticket with its fee limit is {one} sats: at or above human_threshold_sats {} or above \
                                                           max_per_tx_sats {}", cfg.human_threshold_sats, cfg.max_per_tx_sats)));
             }
-            let s = Session { id: crate::policy::token_urlsafe(), payee: terms.payee.clone(), origin: origin.chars().take(200).collect(), task: task_name.clone(),
+            // `tickets.velocity: "session"`: the session is the payment `velocity_max` counts, so one that
+            // could never release is refused before it locks anything
+            let id = crate::policy::token_urlsafe();
+            if tp.velocity == ticket::Velocity::Session && self.engine.velocity_used(&ticket::memo(&task_name, &id))? >= cfg.velocity_max {
+                return Ok(refusal("velocity", format!("already {} payments in the last {}s (a ticket session is one payment: tickets.velocity)",
+                                                      cfg.velocity_max, cfg.velocity_window_s)));
+            }
+            let s = Session { id, payee: terms.payee.clone(), origin: origin.chars().take(200).collect(), task: task_name.clone(),
                               listed, ticket_msat: size.ticket_msat, pool: size.pool, max_tickets: terms.max_tickets, ticket_blocks: terms.ticket_blocks,
-                              max_sats, state: SState::Open, opened_ts: now, active_ts: now, stopped_ts: 0.0, closed_ts: 0.0, why: String::new() };
+                              max_sats, state: SState::Open, opened_ts: now, active_ts: now, stopped_ts: 0.0, closed_ts: 0.0, why: String::new(), http: None };
             st.commit(&[s.row()])?;
             self.ticket_audit("ticket_open", json!({"session": s.id, "dest": format!("ln:{}", s.payee), "task": s.task, "listed": listed,
                                                     "ticket_msat": s.ticket_msat.to_string(), "pool": s.pool}));
@@ -781,7 +788,10 @@ impl Signer {
             if !listed && task.admit != Admit::Any {
                 return Ok(refusal("ticket_admission", format!("the owner no longer names the seller {} and task {:?} pays only named sellers", s.payee, s.task)));
             }
-            let Some(mut t) = st.book.usable(&sid, tip).cloned() else {
+            // `hash`: release this ticket and no other (the wallet's own payer names the one the seller has shown locked)
+            let named = str_or_empty(p.get("hash"));
+            let next = st.book.usable(&sid, tip).filter(|t| named.is_empty() || t.hash == named).cloned();
+            let Some(mut t) = next else {
                 return Ok(with(refusal("ticket_none", "no locked ticket of this session can be released now: lock more (ticket_offer), and ask the \
                                                        seller to cancel the stale ones"),
                                json!({"session": sid, "stale": st.book.stale(&sid, tip), "want": st.book.want(&s, now)})));
@@ -798,7 +808,7 @@ impl Signer {
                 return Ok(refusal(rule, format!("with this ticket's {sats} sats, {have} would be above {name} ({cap})")));
             }
             // the wallet's own rules: per payment, daily and weekly budgets, the counterparty cap, velocity, the human threshold
-            let pay = Payment::new(&dest, sats, &ticket::memo(&s.task));
+            let pay = Payment::new(&dest, sats, &ticket::memo(&s.task, &s.id));
             let d = self.engine.evaluate_admitted(&pay, sats)?;
             if !d.allowed() {
                 if let Some(tok) = &d.approval_token {
@@ -1059,6 +1069,103 @@ impl Signer {
         self.ticket_apply(st, hash, p)
     }
 
+    // --- what the wallet's own payer reads and writes ([`crate::ticket_pay`]) -----------------------
+
+    /// What a lock round checks of the wallet's own side before it looks at an invoice: the rail
+    /// is on, the book is whole, and the Lightning node answers, is on this chain and has a
+    /// channel a payment may leave through. The payer asks this before it offers a hash to a
+    /// seller: a hash that is offered and then cannot be paid keeps its place in the pool until it
+    /// lapses, so none is offered while the wallet's own node could not pay it.
+    pub(crate) fn ticket_can_lock(&self, payee: &str) -> std::result::Result<(), Value> {
+        let (ln, lp) = {
+            let _g = self.lock();
+            self.ticket_synced()?;
+            self.ln_ready().map_err(|d| with(d, json!({"rail": "ticket", "charged_sats": 0})))?
+        };
+        let dest = format!("ln:{payee}");
+        self.ln_node_checks(&*ln, &lp, &dest, "").map_err(|d| with(d, json!({"rail": "ticket"})))?;
+        self.ln_route_checks(&*ln, &lp, &dest, "", false).map_err(|d| with(d, json!({"rail": "ticket"})))?;
+        Ok(())
+    }
+
+    /// A session of the book, as it is now.
+    pub(crate) fn ticket_session(&self, sid: &str) -> Option<Session> {
+        self.ticket_store().ok()?.as_ref()?.book.sessions.get(sid).cloned()
+    }
+
+    /// The hash the session's next release would take at the present height, and how many tickets
+    /// of the session are locked and unreleased.
+    pub(crate) fn ticket_next(&self, sid: &str) -> (Option<String>, usize) {
+        let tip = self.height_safe();
+        match self.ticket_store() {
+            Ok(g) => match g.as_ref() {
+                Some(st) => (st.book.usable(sid, tip).map(|t| t.hash.clone()), st.book.of_session(sid).iter().filter(|t| t.state.unreleased()).count()),
+                None => (None, 0),
+            },
+            Err(_) => (None, 0),
+        }
+    }
+
+    /// Write the seller's side of a session into the book: its id, its key and its endpoints. On
+    /// disk when this returns, and before any ticket of the session is paid, so that a wallet that
+    /// starts again can still ask the seller to cancel what it locked.
+    pub(crate) fn ticket_set_http(&self, sid: &str, http: ticket::SellerSession) -> Result<()> {
+        let mut g = self.ticket_store()?;
+        let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
+        let mut s = st.book.sessions.get(sid).cloned().ok_or_else(|| err("ticket_session", "no such session"))?;
+        s.http = Some(http);
+        st.commit(&[s.row()])
+    }
+
+    /// Sessions that are stopping, have a seller side on record and still hold tickets that are
+    /// not final: what a wallet that started again asks its sellers to cancel.
+    pub(crate) fn ticket_stopping_with_seller(&self) -> Vec<Session> {
+        let Ok(g) = self.ticket_store() else { return vec![] };
+        let Some(st) = g.as_ref() else { return vec![] };
+        st.book.sessions.values().filter(|s| s.state == SState::Stopping && s.http.is_some())
+            .filter(|s| st.book.of_session(&s.id).iter().any(|t| t.state.in_flight() && t.state != TState::Released)).cloned().collect()
+    }
+
+    /// The tickets of a session by state, and what they have in the ledger: what a paid call and
+    /// `channels` report.
+    pub(crate) fn ticket_session_counts(&self, sid: &str) -> Value {
+        let Ok(g) = self.ticket_store() else { return Value::Null };
+        let Some(st) = g.as_ref() else { return Value::Null };
+        let ts = st.book.of_session(sid);
+        let n = |f: &dyn Fn(TState) -> bool| ts.iter().filter(|t| f(t.state)).count();
+        let locked = st.book.locked(|t| t.session == sid);
+        json!({"locked": locked.tickets, "locked_sats": locked.sats, "released": n(&|s| s == TState::Released), "retired": n(&|s| s == TState::Retired),
+               "settled": n(&|s| s == TState::Settled), "failed": n(&|s| s == TState::Failed),
+               "booked_sats": ts.iter().fold(0i64, |a, t| a.saturating_add(t.booked_sats))})
+    }
+
+    /// Tickets for `channels` and `balance`: what is locked, what is booked and not yet settled,
+    /// and the open sessions. `Null` when the wallet has no ticket book.
+    pub(crate) fn ticket_summary(&self) -> Value {
+        if !self.ticket_path().exists() {
+            return Value::Null;
+        }
+        let Ok(g) = self.ticket_store() else { return json!({"error": "the ticket book could not be read"}) };
+        let Some(st) = g.as_ref() else { return Value::Null };
+        let locked = st.book.locked(|_| true);
+        let (mut in_flight, mut booked, mut settled_sats) = (0i64, 0i64, 0i64);
+        for t in st.book.tickets.values() {
+            if t.state.in_flight() {
+                in_flight += 1;
+            }
+            if t.state.booked() {
+                booked = booked.saturating_add(t.booked_sats);
+            }
+            if t.state == TState::Settled {
+                settled_sats = settled_sats.saturating_add(t.booked_sats);
+            }
+        }
+        let mut sessions: Vec<&Session> = st.book.sessions.values().filter(|s| s.state != SState::Closed).collect();
+        sessions.sort_by(|a, b| a.opened_ts.total_cmp(&b.opened_ts));
+        json!({"in_flight": in_flight, "locked_tickets": locked.tickets, "locked_sats": locked.sats, "released_unsettled_sats": booked,
+               "settled_sats": settled_sats, "sessions": sessions.iter().map(|s| s.public()).collect::<Vec<_>>()})
+    }
+
     // --- stop, status -------------------------------------------------------------------------------
 
     /// `ticket_stop`: no more offers, locks or releases for the session. Returns the hashes of its
@@ -1078,7 +1185,7 @@ impl Signer {
             if s.state == SState::Open {
                 s.state = SState::Stopping;
                 s.stopped_ts = now;
-                s.why = "stopped by the caller".into();
+                s.why = Some(str_or_empty(p.get("why"))).filter(|w| !w.is_empty()).unwrap_or_else(|| "stopped by the caller".into()).chars().take(200).collect();
                 rows.extend(st.book.of_session(&sid).into_iter().filter(|t| t.state == TState::Offered).map(|t| dropped(t, now)));
                 rows.push(s.row());
                 st.commit(&rows)?;
@@ -1124,6 +1231,8 @@ impl Signer {
             if !sid.is_empty() {
                 v["session_tickets"] = st.book.of_session(&sid).into_iter().map(Ticket::public).collect();
             }
+            // sessions this wallet pays over HTTP: its own count of what each seller holds
+            v["paying"] = json!(self.ticket_http_public());
             // the node's own HTLCs against the book: a ticket the node showed locked has one, and every HTLC of the node is in a book
             match &chans {
                 Some(Ok(cs)) => {
