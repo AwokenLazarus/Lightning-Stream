@@ -642,12 +642,13 @@ its first release, and bounds its releases by the budgets, the caps on locked fu
 
 Measured on the lab (`scripts/ticket_e2e_regtest.sh`; one hop, loopback, the release binaries, an
 agent calling the MCP tool): a first request on a new session (the unpaid request, 8 tickets locked through the hop, the
-seller's word that they are locked, one release, the paid request) took 0.37 to 0.42 s in 25
-tries over five runs, median 0.38 s. A paid page from the balance took 1.7 to 1.9 ms and a free
-page 1.4 to 1.5 ms, both through the MCP server, the signer and the gateway (medians of 200): paying
+seller's word that they are locked, one release, the paid request) took 0.37 to 0.42 s in 50
+tries over ten runs, median 0.38 s. A paid page from the balance took 1.7 to 1.9 ms and a free
+page 1.3 to 1.5 ms, both through the MCP server, the signer and the gateway (medians of 200): paying
 added 0.30 to 0.38 ms. A 100 MB file at 200,000 msat per MiB came through whole in 1.7 to 1.9 s
-with 20 tickets released one at a time; under a call that allowed half its price it stopped at
-50,002,048 to 50,004,032 bytes. After the agent's stop the unused tickets were back on both nodes
+with 20 tickets released one at a time; under a call that allowed half its price (9,536 sat,
+which pays for 49,996,103 bytes) it stopped at 49,996,224 to 50,004,032 bytes, the end of the
+read that reached the limit. After the agent's stop the unused tickets were back on both nodes
 in 2.1 to 3.1 s. What the buyer's node paid, what the seller's node received, what the wallet's
 book holds as settled and what the seller's receipts say was released were one number to the
 millisat (37,000,000 or 38,000,000 msat, by how far the stopped answer had come), and the ledger

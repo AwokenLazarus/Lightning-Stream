@@ -451,6 +451,7 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
 - The MCP's in-process payer (`XBT_MCP_PAYER=local`) pays channels only.
 - Not run: more than one hop, real network latency, TLS to a seller, mainnet, the Core Lightning
   fork, more than one seller at once through this path, and a seller other than `xbt-gateway`.
+  An answer priced by the second was run against the gateway in process, not on the lab.
 
 ### Channel and transport (library client) (frozen)
 
