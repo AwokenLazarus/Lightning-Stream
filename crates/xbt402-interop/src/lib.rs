@@ -8,8 +8,6 @@
 //! * `bin/`: `xbt-conformance` (the N/N table), `xbt402-vectors` (the emitter), and the regtest
 //!   cross-implementation tools `xbt402-rust-provider` and `xbt402-rust-payer`.
 pub mod conformance;
-pub mod memnet;
-pub mod route_vectors;
 pub mod stub;
 pub mod vectors;
 

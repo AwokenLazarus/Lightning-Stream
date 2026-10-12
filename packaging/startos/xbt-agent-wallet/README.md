@@ -7,7 +7,7 @@ and the choices are in `../../README.md` and the container standard in `docs/CON
 
 `startos/spec.ts` lists them as data; `startos/main.ts` turns that into StartOS daemons, and
 `../test/startos_regtest.py` runs the same spec on Docker. Volume `main` is the data dir (docs/CONTAINER.md §1);
-volume `startos` holds `store.json` (the node connection, the hub switch) and is mounted by nothing.
+volume `startos` holds `store.json` (the node connection) and is mounted by nothing.
 
 | daemon | image | user | mounts of `main` | ready |
 |---|---|---|---|---|
@@ -16,14 +16,13 @@ volume `startos` holds `store.json` (the node connection, the hub switch) and is
 | signer | xbt-signer | xbt-signer | signer, run/signer, run/anchor (ro) | `xbt-signer healthcheck` |
 | mcp | xbt-wallet-mcp | xbt-wallet-mcp | mcp, run/signer (ro), run/ui (ro) | port 33510 |
 | ui | xbt-wallet-ui | xbt-wallet-ui | ui, run/signer (ro), run/ui | port 8480 |
-| hub (if enabled) | xbt402-hub | xbt402-hub | hub | port 9480 |
 
 Health check `wallet-ready`: the MCP's `/readyz` (200: synced and unlocked; 503: loading, with the reason).
 
 ## Interfaces
 
-`ui` (web UI, port 8480, external 80), `mcp` (API, 33510, path `/mcp`, masked), `hub` (API, 9480, only when
-enabled). StartOS terminates TLS and adds X-Forwarded-Proto, so the UI's cookie is `Secure` over https.
+`ui` (web UI, port 8480, external 80), `mcp` (API, 33510, path `/mcp`, masked).
+StartOS terminates TLS and adds X-Forwarded-Proto, so the UI's cookie is `Secure` over https.
 
 ## Actions
 
@@ -33,7 +32,6 @@ enabled). StartOS terminates TLS and adds X-Forwarded-Proto, so the UI's cookie 
 | ui-setup-code | the UI's one-time setup code (`main/ui/setup-code`), while no password is set |
 | agent-connection | the MCP addresses and the bearer token (`main/run/ui/mcp-http-token`) |
 | rotate-agent-token | delete the MCP token and restart: xbt-init makes a new one. The web UI Agents page rotates it with no restart (the UI owns the token; the MCP only reads it). |
-| hub-toggle | enable or disable the xbt402 hub |
 | reset-ui-password | delete `main/ui/password.scrypt` and restart |
 
 ## Build

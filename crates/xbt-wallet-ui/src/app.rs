@@ -82,8 +82,7 @@ pub fn starter_policy() -> Value {
     json!({"allowlist": [], "counterparties": {}, "max_per_tx_sats": 100000, "daily_budget_sats": 200000, "weekly_budget_sats": 500000,
            "per_counterparty_cap_sats": 100000, "velocity_max": 60, "velocity_window_s": 3600, "human_threshold_sats": 50000,
            "split_window_s": 600, "approval_ttl_s": 900, "channel_expiry_blocks": 1008, "refund_enabled": true, "refund_margin_blocks": 6,
-           "hot_balance_cap_sats": 1500000, "anchor_interval_s": 300, "open_wait_s": 45, "open_retry_s": 60, "close_fee_max_sats": 2000,
-           "routing": {}})
+           "hot_balance_cap_sats": 1500000, "anchor_interval_s": 300, "open_wait_s": 45, "open_retry_s": 60, "close_fee_max_sats": 2000})
 }
 
 fn state_of(c: &Value) -> &'static str {
@@ -201,7 +200,6 @@ impl App {
             "/signatures" => self.signatures(&ctx),
             "/keys" => self.keys(&ctx),
             "/agents" => self.agents(&ctx),
-            "/hub" => self.hub(&ctx),
             "/setup" => self.setup(&ctx),
             "/api/pending" => Resp::json(200, &json!({"pending": self.pending_count()})),
             _ => Resp::html(404, self.render("Not found", &ctx, "<p>No such page. <a href=\"./\">Overview</a></p>")),
@@ -564,18 +562,12 @@ impl App {
         }
         let allow = p.get("allowlist").and_then(Value::as_array).map(|a| a.iter().map(|x| txt(Some(x))).collect::<Vec<_>>().join("\n")).unwrap_or_default();
         let cps = p.get("counterparties").and_then(Value::as_object).map(|m| m.iter().map(|(k, v)| format!("{k} {}", txt(v.get("pay_to")))).collect::<Vec<_>>().join("\n")).unwrap_or_default();
-        let routing = p.get("routing").cloned().unwrap_or(json!({}));
-        let hubs = routing.get("hubs").and_then(Value::as_object).map(|m| m.iter().map(|(k, v)| format!("{k} {} {}", int(v.get("max_fee_ppm")), int(v.get("max_fee_base_msat")))).collect::<Vec<_>>().join("\n")).unwrap_or_default();
         b.push_str(&format!("<fieldset><legend>Destinations</legend>\
             <label>Allowlist: the only destinations the agent may pay (one per line: an xbt402 origin such as <code>https://api.example.net</code>, or an address)\
             <textarea name=\"f_allowlist\" rows=\"4\">{}</textarea></label>\
             <label>Counterparties for direct channel payments (one per line: <code>origin payTo-pubkey-hex</code>)<textarea name=\"f_counterparties\" rows=\"3\">{}</textarea></label></fieldset>\
-            <fieldset><legend>Routing through hubs</legend>\
-            <label>Hubs (one per line: <code>origin max_fee_ppm max_fee_base_msat</code>)<textarea name=\"f_hubs\" rows=\"2\">{}</textarea></label>\
-            <label>Largest routed lock (sats)<input name=\"f_route_max_lock_sats\" value=\"{}\" inputmode=\"numeric\"></label>\
-            <label>Routed budget per 24 h (sats)<input name=\"f_route_daily_budget_sats\" value=\"{}\" inputmode=\"numeric\"></label></fieldset>\
             <p><button>Review the change</button> <a href=\"./policy?template=starter\">Start from the conservative template</a></p></form>",
-            esc(&allow), esc(&cps), esc(&hubs), escv(routing.get("max_lock_sats")), escv(routing.get("daily_budget_sats"))));
+            esc(&allow), esc(&cps)));
         b.push_str(&format!("<details><summary>Edit policy.json directly</summary><form method=\"post\" action=\"./policy\">{}\
             <input type=\"hidden\" name=\"mode\" value=\"json\"><textarea name=\"json\" rows=\"20\" class=\"mono\">{}</textarea>\
             <button>Review the change</button></form></details>", Self::csrf_input(ctx), esc(&serde_json::to_string_pretty(p).unwrap_or_default())));
@@ -598,12 +590,12 @@ impl App {
         if template {
             let keep = p.clone();
             p = starter_policy();
-            for k in ["allowlist", "counterparties", "routing", "human_pubkey"] {
+            for k in ["allowlist", "counterparties", "human_pubkey"] {
                 if let Some(v) = keep.get(k) {
                     p[k] = v.clone();
                 }
             }
-            b.push_str("<div class=\"flash ok\">The conservative template is filled in below (your allowlist, counterparties and routing are kept). Review, then sign.</div>");
+            b.push_str("<div class=\"flash ok\">The conservative template is filled in below (your allowlist and counterparties are kept). Review, then sign.</div>");
         }
         let errs: Vec<String> = cur["errors"].as_array().map(|a| a.iter().map(|x| txt(Some(x))).collect()).unwrap_or_default();
         let warns: Vec<String> = cur["warnings"].as_array().map(|a| a.iter().map(|x| txt(Some(x))).collect()).unwrap_or_default();
@@ -635,25 +627,8 @@ impl App {
             cps.insert(origin.into(), Value::Object(e));
         }
         p.insert("counterparties".into(), Value::Object(cps));
-        let mut routing = cur.get("routing").and_then(Value::as_object).cloned().unwrap_or_default();
-        let mut hubs = Map::new();
-        for l in lines("f_hubs") {
-            let parts: Vec<&str> = l.split_whitespace().collect();
-            if let Some(h) = parts.first() {
-                hubs.insert(h.to_string(), json!({"max_fee_ppm": num(parts.get(1).unwrap_or(&"0")), "max_fee_base_msat": num(parts.get(2).unwrap_or(&"0"))}));
-            }
-        }
-        routing.insert("hubs".into(), Value::Object(hubs));
-        for (fk, k) in [("f_route_max_lock_sats", "max_lock_sats"), ("f_route_daily_budget_sats", "daily_budget_sats")] {
-            match f.get(fk).map(|v| v.trim()) {
-                Some("") | None => { routing.remove(k); }
-                Some(v) => { routing.insert(k.into(), num(v)); }
-            }
-        }
-        if routing.get("hubs").and_then(Value::as_object).is_some_and(|h| h.is_empty()) && routing.len() == 1 {
-            routing.clear();
-        }
-        p.insert("routing".into(), Value::Object(routing));
+        // the section of the retired hub routing: the signer ignores it, so the form leaves it out
+        p.remove("routing");
         Value::Object(p)
     }
 
@@ -898,7 +873,7 @@ impl App {
         self.page("Keys", ctx, b)
     }
 
-    // --- hub and setup ------------------------------------------------------------------------------
+    // --- setup ------------------------------------------------------------------------------
 
     /// How an agent connects: the MCP endpoint and its bearer token (AGP-040). A box has no terminal, so
     /// this page is where the owner gets them. The token lets an agent pay allowlisted services within the
@@ -953,74 +928,7 @@ impl App {
         xbt_svc::replace_secret_file(p, format!("{new}\n").as_bytes(), mode | 0o600).map_err(|e| format!("{}: {e}", p.display()))
     }
 
-    fn hub(&self, ctx: &Ctx) -> Resp {
-        let mut b = String::new();
-        match self.call("routing_status", json!({})) {
-            Err(e) => b.push_str(&Self::error_box(&e)),
-            Ok(r) => {
-                let pol = &r["policy"];
-                b.push_str("<section class=\"card\"><h2>Paying through hubs</h2>");
-                b.push_str(&kv(&[("Routing", if pol["enabled"] == true { "<span class=\"tag ok\">on</span>".into() } else { "off (no hubs in the policy)".into() }),
-                                 ("Adaptor", escv(r.get("adaptor"))), ("Routed in the last 24 h", sats(int(r.get("spent_24h_sats")))),
-                                 ("24 h routed budget", sats(int(pol.get("daily_budget_sats")))), ("Largest lock", sats(int(pol.get("max_lock_sats"))))]));
-                if let Some(h) = pol.get("hubs").and_then(Value::as_object) {
-                    b.push_str("<ul>");
-                    for (k, v) in h {
-                        b.push_str(&format!("<li><code>{}</code>: at most {} ppm + {} msat</li>", esc(k), escv(v.get("max_fee_ppm")), escv(v.get("max_fee_base_msat"))));
-                    }
-                    b.push_str("</ul>");
-                }
-                let pend = r["pending"].as_array().cloned().unwrap_or_default();
-                b.push_str(&format!("<p>Pending locks: {}</p>", pend.len()));
-                if !pend.is_empty() {
-                    b.push_str(&json_block(&Value::Array(pend)));
-                }
-                b.push_str("</section>");
-            }
-        }
-        if let Some(t) = self.cmp_tile() {
-            b.push_str(&t);
-        }
-        b.push_str("<section class=\"card\"><h2>This box's hub</h2>");
-        match &self.cfg.hub_url {
-            None => b.push_str("<p>No hub is configured for this box (<code>XBT_UI_HUB_URL</code>).</p>"),
-            Some(u) => {
-                let probe = |path: &str| http_get(&format!("{u}{path}"));
-                b.push_str(&format!("<p><code>{}</code></p>", esc(u)));
-                match probe("/readyz") {
-                    Ok((st, body)) => {
-                        if let Ok(v) = serde_json::from_str::<Value>(&body) {
-                            if let Some(addr) = v.pointer("/wallet/receive_address").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-                                let bal = v.pointer("/wallet/balance_sats").and_then(Value::as_u64).unwrap_or(0);
-                                b.push_str(&format!("<section class=\"card\" id=\"hub-funding\"><h3>Fund the hub</h3>\
-                                    <p>Send XBT to this address. The hub created the node wallet named <code>{}</code> for you; no terminal.</p>\
-                                    <p>Receive address: <code id=\"hub-receive\">{}</code></p><p>Balance: {}</p>",
-                                    esc(v.pointer("/wallet/name").and_then(Value::as_str).unwrap_or("hub")), esc(addr), sats(bal as i64)));
-                                if let Some(onion) = v.get("tor").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-                                    b.push_str(&format!("<p>Tor: <code id=\"hub-tor\">{}</code></p>", esc(onion)));
-                                }
-                                b.push_str("</section>");
-                            }
-                        }
-                        b.push_str(&format!("<p><span class=\"tag {}\">{st}</span> <code>/readyz</code></p><pre class=\"json\">{}</pre>",
-                                            if st == 200 { "ok" } else { "bad" }, esc(&short(&body, 2000))));
-                    }
-                    Err(e) => b.push_str(&format!("<p><span class=\"tag bad\">unreachable</span> <code>/readyz</code>: {}</p>", esc(&e))),
-                }
-                for path in ["/healthz", "/x402/supported"] {
-                    match probe(path) {
-                        Ok((st, body)) => b.push_str(&format!("<p><span class=\"tag {}\">{st}</span> <code>{path}</code></p><pre class=\"json\">{}</pre>",
-                                                              if st == 200 { "ok" } else { "bad" }, esc(&short(&body, 2000)))),
-                        Err(e) => b.push_str(&format!("<p><span class=\"tag bad\">unreachable</span> <code>{path}</code>: {}</p>", esc(&e))),
-                    }
-                }
-            }
-        }
-        b.push_str("</section>");
-        self.page("Hub", ctx, b)
-    }
-
-    /// xbt-compute's node/hub (cmp-lead): a link to its status page and, when a status URL is set, a
+    /// xbt-compute's node: a link to its status page and, when a status URL is set, a
     /// compact tile from its JSON (CONTRACT §U: `/healthz`, `/readyz`, JSON status with node sync %).
     /// The JSON has no fixed schema yet, so the tile shows the common fields and folds the rest.
     fn cmp_tile(&self) -> Option<String> {
@@ -1038,7 +946,7 @@ impl App {
                     if let Some(m) = v.as_object() {
                         for (k, x) in m {
                             let kl = k.to_ascii_lowercase();
-                            if (kl.contains("sync") || ["role", "version", "chain", "height", "ready", "ok", "mode", "hub"].contains(&kl.as_str())) && !x.is_object() && !x.is_array() {
+                            if (kl.contains("sync") || ["role", "version", "chain", "height", "ready", "ok", "mode"].contains(&kl.as_str())) && !x.is_object() && !x.is_array() {
                                 extra.push((k.clone(), esc(&short(&txt(Some(x)), 80))));
                             }
                         }
@@ -1056,7 +964,7 @@ impl App {
             }
         }
         if let Some(l) = &self.cfg.cmp_url {
-            b.push_str(&format!("<p><a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">Node and hub status →</a></p>", esc(l)));
+            b.push_str(&format!("<p><a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">Node status →</a></p>", esc(l)));
         }
         b.push_str("</div>");
         Some(b)
@@ -1110,10 +1018,10 @@ fn mode_bits(_: &std::fs::Metadata) -> u32 {
     0o600
 }
 
-/// A plain-HTTP GET with a short timeout (the hub is on the box's own network).
+/// A plain-HTTP GET with a short timeout (the status page is on the box's own network).
 pub fn http_get(url: &str) -> Result<(u16, String), String> {
     use std::io::{Read, Write};
-    let rest = url.strip_prefix("http://").ok_or("only http:// hub URLs are probed")?;
+    let rest = url.strip_prefix("http://").ok_or("only http:// URLs are probed")?;
     let (hostport, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),

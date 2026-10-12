@@ -14,7 +14,7 @@ export const main = sdk.setupMain(async ({ effects }) => {
     .find((i) => i.id === 'mcp')
   const mcpUrls = (mcpIface?.addressInfo?.nonLocal.format('urlstring') ?? []).map((u) => u.replace(/\/$/, '') + '/mcp')
 
-  const specs = services({ node: store.node, hubEnabled: store.hubEnabled, mcpUrls })
+  const specs = services({ node: store.node, mcpUrls })
   const spec = (id: ServiceSpec['id']) => specs.find((s) => s.id === id) as ServiceSpec
 
   const sub = (s: ServiceSpec) => {
@@ -94,12 +94,5 @@ export const main = sdk.setupMain(async ({ effects }) => {
       requires: ['mcp'],
     })
 
-  if (!store.hubEnabled) return daemons
-  const hub = spec('hub')
-  return daemons.addDaemon('hub', {
-    subcontainer: sub(hub),
-    exec: exec(hub),
-    ready: { display: i18n('xbt402 hub'), fn: portReady(hub), gracePeriod: 30_000 },
-    requires: ['init'],
-  })
+  return daemons
 })

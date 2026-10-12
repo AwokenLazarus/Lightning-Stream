@@ -16,7 +16,7 @@ fn arg(args: &[String], name: &str) -> Option<String> {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "-h" || a == "--help") {
-        println!("usage: xbt-init [init|check] [--data DIR] [--components signer,witness,mcp,ui,hub]");
+        println!("usage: xbt-init [init|check] [--data DIR] [--components signer,witness,mcp,ui,relay]");
         return;
     }
     let root = arg(&args, "--data").or_else(|| xbt_svc::env("XBT_DATA_DIR")).unwrap_or_else(|| "/data".into());

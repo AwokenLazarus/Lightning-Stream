@@ -1,4 +1,4 @@
-//! AGP-087 (second closure audit, area HUB-B): the library client around a FUNDED open that the
+//! AGP-087 (second closure audit): the library client around a FUNDED open that the
 //! seller answers with an error, and its rollover neighbours.
 //!
 //! review C2 was closed with a preflight. The preflight is the seller's word; this file asks what the

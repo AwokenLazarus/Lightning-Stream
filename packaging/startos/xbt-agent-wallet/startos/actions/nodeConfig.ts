@@ -48,7 +48,7 @@ export const nodeConfig = sdk.Action.withInput(
   'node-config',
   {
     name: i18n('Node connection'),
-    description: i18n('The XBT node the signer (and the hub) use: host, RPC port, credentials and chain'),
+    description: i18n('The XBT node the signer uses: host, RPC port, credentials and chain'),
     warning: null,
     allowedStatuses: 'any',
     group: null,

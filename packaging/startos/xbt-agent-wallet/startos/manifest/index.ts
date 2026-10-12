@@ -22,7 +22,6 @@ export const manifest = setupManifest({
     witness: { source: { dockerTag: IMAGES.witness }, arch: ['x86_64', 'aarch64'] },
     mcp: { source: { dockerTag: IMAGES.mcp }, arch: ['x86_64', 'aarch64'] },
     ui: { source: { dockerTag: IMAGES.ui }, arch: ['x86_64', 'aarch64'] },
-    hub: { source: { dockerTag: IMAGES.hub }, arch: ['x86_64', 'aarch64'] },
   },
   hardwareRequirements: {
     ram: 512 * 1024 ** 2, // 512 MiB: every service is a small static binary

@@ -2,13 +2,13 @@
 
 The agent wallet's web UI, for a box with no terminal (Umbrel, StartOS), from AGP-039. It lets the owner:
 
-- set and review the policy: budgets, per-counterparty caps, the allowlist, the human threshold, routing limits and the hot-key cap;
+- set and review the policy: budgets, per-counterparty caps, the allowlist, the human threshold and the hot-key cap;
 - approve or deny payments above the threshold (replacing `agentwallet-approve`);
 - see balances and the hot-key cap status;
 - see channels (open, pending, closed, refunded), with the close report (including `payeeFee`) and the refund ETA;
 - see the signature log and its anchor verification;
 - sweep and rotate the hot key, signed by the human;
-- see the hub's status and the xbt-compute node/hub status, and fund this box's hub (receive address, no terminal);
+- see the xbt-compute node's status, when one is configured;
 - rotate the agent MCP token from the Agents page (no terminal, no restart);
 - run a first-time setup wizard (the approval key, the policy template, the wrapping key and backup).
 
@@ -38,8 +38,7 @@ Without a password source, the first start prints a one-time setup code and writ
 | `XBT_UI_ALLOW_IPS` | all | peers allowed to connect (IPs or prefixes such as `10.21.0.`), e.g. only the box's app proxy |
 | `XBT_UI_ALLOWED_HOSTS` | | AGP-063 W4: extra host names the UI answers to, comma-separated (`wallet.example.com`; `*`: any). Always allowed: IP literals, single-label names (`localhost`, a container name), `*.local`, `*.localhost`, `*.onion`. Another Host is 421 (DNS rebinding); a POST whose `Origin` names another host is 403 (`Origin: null`, which Chrome sends under `no-referrer`, is accepted) |
 | `XBT_UI_SETUP_OPEN` | 0 | `1`: the first-run password setup needs no code (the platform proxy already authenticated the owner) |
-| `XBT_UI_HUB_URL` | | this box's xbt402 hub; its `/healthz`, `/readyz` and `/x402/supported` are shown on the Hub page |
-| `XBT_UI_CMP_URL` | | xbt-compute's node/hub status page, linked from Overview and Hub |
+| `XBT_UI_CMP_URL` | | xbt-compute's node status page, linked from Overview |
 | `XBT_UI_CMP_STATUS_URL` | | xbt-compute's status JSON (e.g. its `/readyz`, CONTRACT §U), shown as a compact tile |
 | `XBT_UI_MCP_URL` | | MCP endpoint(s) shown on the Agents page |
 | `XBT_UI_MCP_TOKEN_FILE` | `$XBT_DATA_DIR/run/ui/mcp-http-token`, else `<data dir>/secrets/mcp-http-token` | the bearer token shown on Agents. The UI owns it and rotates it there (atomic replace, mode kept, never world-readable); the MCP only reads it (AGP-042) |

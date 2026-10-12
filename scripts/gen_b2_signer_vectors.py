@@ -7,8 +7,7 @@
                            sats_from_xbt, the ed25519 approval messages and sanitize
   vectors/b2_custody.json  files made by B2's own code under a known wrapping key file and a known
                            passphrase: sealed blobs, hot.json (current + retired), hot_utxos.json,
-                           channel_keys.json + channels.json, a signature log and its witness store,
-                           and (AGP-055) a routed wallet: spend log, ledger + payments log, records.
+                           channel_keys.json + channels.json, a signature log and its witness store.
                            The Rust signer must open all of them (tests/custody_compat.rs)
 
     B2=~/xbt-rnd/b2 B1_ROOT=~/xbt-rnd/b1 python scripts/gen_b2_signer_vectors.py
@@ -139,61 +138,6 @@ def main():
     custody()
 
 
-def routed(ks):
-    """AGP-055: a wallet directory after routed locks, written by B2's own code: lock L1 resolved and
-    booked (spend row, ledger row), L2 resolved in the record but not booked (the crash window between
-    the two: the next start books it), L3 pending (written ahead). The Rust signer must open it, book
-    L2 once, and resolve L3 (tests/custody_compat.rs). Times are fixed in 2100 so that the rows stay
-    inside the 7 day spend window however old this file gets."""
-    import time
-    from agentwallet.channels import ChannelBook
-    from agentwallet.policy import AuditLog, PolicyConfig, PolicyEngine, PolicyStore
-    from agentwallet.routing import RoutePolicy, RouteSigner, adaptor_mod
-    from xbt402.channel import ChannelParams
-    from xbt402 import ecc
-    from xbt402.x402_channel import network_id
-    A = adaptor_mod()
-    hub = "http://127.0.0.1:33211"
-    clock, real = [4_102_444_800.0], time.time
-    time.time = lambda: clock[0]
-    try:
-        with tempfile.TemporaryDirectory() as d:
-            d = Path(d)
-            book = ChannelBook(d / "channels.json", d / "channel_keys.json", keystore=ks)
-            p = ChannelParams.derive(ecc.pubkey(778).hex(), ecc.pubkey(4343).hex(), 7734, 600, "0014" + "ab" * 20,
-                                     network=network_id("%064x" % 101))
-            p.funding_txid, p.funding_vout, p.capacity = "44" * 32, 0, 100_600
-            book.add_funded(hub, secret=4343, params=p, origin=hub, cap_sats=p.max_amount)
-            cfg = PolicyConfig(allowlist=frozenset({hub}), velocity_max=100)
-            engine = PolicyEngine(cfg, PolicyStore(d / "ledger.json"), AuditLog(d / "audit.jsonl"), clock=lambda: clock[0])
-            policy = {"hubs": {hub: {"max_fee_ppm": 5000, "max_fee_base_msat": 2000}}, "max_lock_sats": 20_000,
-                      "daily_budget_sats": 50_000}
-            rs = RouteSigner(book, RoutePolicy.from_dict(policy), state_path=d / "routing.json", engine=engine)
-
-            def lock(cum, t, lock_id):
-                clock[0] += 1
-                o = rs.sign_state_adaptor(p.channel_id, cum, A.enc(A.point_of(t)).hex(),
-                                          {"hub": hub, "amount": cum - book.get(hub).used_sats - 1, "fee": 1, "lockId": lock_id})
-                clock[0] += 1
-                return o, "%064x" % ((t + int(o["tweak"], 16)) % A.N)
-            _, y1 = lock(1_000, 1111, "L1")
-            rs.resolve_lock(p.channel_id, y1)
-            _, y2 = lock(1_500, 2222, "L2")
-            book.resolve_lock(hub, y2)                    # on disk, and the process dies before its rows
-            o3, y3 = lock(1_800, 3333, "L3")
-            return {"hub": hub, "chan": p.channel_id, "payer_pub": p.payer_pub, "routing_policy": policy,
-                    "channels.json": json.loads((d / "channels.json").read_text()),
-                    "channel_keys.json": json.loads((d / "channel_keys.json").read_text()),
-                    "routing.json": (d / "routing.json").read_text(),
-                    "ledger.json": json.loads((d / "ledger.json").read_text()),
-                    "ledger.payments.jsonl": (d / "ledger.payments.jsonl").read_text(),
-                    "booked": {"key": "lock:%s:1000" % p.channel_id, "amount": 1000},
-                    "unbooked": {"key": "lock:%s:1500" % p.channel_id, "amount": 500},
-                    "pending": {"cum": 1800, "amount": 300, "adaptor": o3["adaptor"], "secret": y3, "t": "%064x" % 3333}}
-    finally:
-        time.time = real
-
-
 def custody():
     """Files B2 wrote, under a known key file (32 x 0x42) and passphrase."""
     from agentwallet import anchor, keystore, sigaudit
@@ -245,7 +189,6 @@ def custody():
         log.record("close_auth", sig=b"\x32" * 70, chan=p.channel_id, dest="http://127.0.0.1:33210", cum=546)
         out["log"] = {"signatures.jsonl": (d / "signatures.jsonl").read_text(), "anchors.jsonl": (d / "anchor" / "anchors.jsonl").read_text(),
                       "submit": r}
-    out["routed"] = routed(ks)
     out["keyfile_hex"] = key.hex()
     out["passphrase"] = "b2 passphrase"
     (OUT / "b2_custody.json").write_text(json.dumps(out, indent=1, sort_keys=True) + "\n")

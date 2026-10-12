@@ -1,6 +1,6 @@
 #!/bin/bash
 # AGP-038: multi-arch OCI images of the agentpay services, saved locally (never pushed).
-#   xbt-signer, xbt-anchor-witness, xbt-wallet-mcp, xbt402-hub; AGP-040: xbt-wallet-ui, xbt-init; AGP-043: xbt-work-relay
+#   xbt-signer, xbt-anchor-witness, xbt-wallet-mcp; AGP-040: xbt-wallet-ui, xbt-init; AGP-043: xbt-work-relay
 #   platforms linux/amd64, linux/arm64, linux/arm/v7, FROM scratch, static musl (zig), docs/CONTAINER.md
 #
 # Steps: build the static musl binaries for the three targets (release profile, cargo -j2 under the soak
@@ -31,7 +31,7 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-IMAGES=(xbt-signer xbt-anchor-witness xbt-wallet-mcp xbt402-hub xbt-wallet-ui xbt-init xbt-work-relay)
+IMAGES=(xbt-signer xbt-anchor-witness xbt-wallet-mcp xbt-wallet-ui xbt-init xbt-work-relay)
 [ -n "$ONLY" ] && IMAGES=(${ONLY//,/ })
 TGT=${CARGO_TARGET_DIR:-target}
 want() { [[ " ${IMAGES[*]} " == *" $1 "* ]]; }
@@ -57,7 +57,6 @@ if [ $CARGO = 1 ]; then
       "${SOAK[@]}" cargo build -q -j2 --release --target "$t" -p xbt-signer --bin xbt-signer --bin xbt-anchor-witness
     fi
     if want xbt-wallet-mcp; then "${SOAK[@]}" cargo build -q -j2 --release --target "$t" -p xbt-wallet-mcp; fi
-    if want xbt402-hub; then "${SOAK[@]}" cargo build -q -j2 --release --target "$t" -p xbt402 --features rpc,http-client,http-server,ln-wallet --bin xbt402-hub; fi
     if want xbt-wallet-ui || want xbt-init; then
       "${SOAK[@]}" cargo build -q -j2 --release --target "$t" -p xbt-wallet-ui -p xbt-svc --bin xbt-wallet-ui --bin xbt-init
     fi

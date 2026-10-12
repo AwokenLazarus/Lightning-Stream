@@ -3,11 +3,15 @@
 Umbrel and StartOS (Start9) run our services as containers. This page is the **shared standard** for
 xbt-agentpay and xbt-compute (cmp CONTRACT §U). cmp has no layout yet, so it adopts this one. Its
 components already have their places here. agentpay implements it in `xbt-signer`,
-`xbt-anchor-witness`, `xbt-wallet-mcp`, `xbt402-hub` and the wallet UI `xbt-wallet-ui` (AGP-039). The code is
+`xbt-anchor-witness`, `xbt-wallet-mcp` and the wallet UI `xbt-wallet-ui` (AGP-039). The code is
 in the `xbt-svc` crate. `scripts/container_test.sh` tests it on regtest. The Umbrel apps and the StartOS
 package built on it (AGP-040) are in `packaging/` (README there).
 
 Status: **proposal, pending cmp-lead's OK** (forwarded by agp-lead, 2026-09-28).
+
+The hub was retired on 2026-10-11: payments between parties route over ordinary Lightning instead. Its
+code is in the git history (last at commit a548fb0). Its image, user and data dir are gone from this
+page; uid 10004 and port 9480 were its and are not reused.
 
 ## 1. One data dir, one sub-dir per component
 
@@ -19,10 +23,9 @@ tmpfs `/tmp`.
 ```
 /data/
   signer/          agp  uid 10001  0700  policy.json, .run/ (B2 state: ledger, audit, sealed hot/channel keys,
-                                         channels, routing, signatures.jsonl), secrets/
+                                         channels, signatures.jsonl), secrets/
   witness/         agp  uid 10002  0700  anchors.jsonl, alerts.jsonl       (XBT_WITNESS_DIR: own mount, own owner)
   mcp/             agp  uid 10003  0700  secrets/, mcp-payer.jsonl (local payer mode)
-  hub/             agp  uid 10004  0700  hub.json (optional), state/, secrets/
   ui/              agp  uid 10005  0700  password.scrypt (the login hash), setup-code (first run only), secrets/
   relay/           agp  uid 10006  0700  blobs/ (the xbt-work receipt relay's sealed blobs, one file each), secrets/
   cmp-node/        cmp  uid 10011  0700  operator key, operator service, merchant ledgers and meters, secrets/
@@ -72,7 +75,7 @@ UID table (the images' `USER`; the cmp rows are reserved):
 | 10001 | xbt-signer | xbt-signer |
 | 10002 | xbt-anchor-witness | xbt-anchor-witness |
 | 10003 | xbt-wallet-mcp | xbt-wallet-mcp |
-| 10004 | xbt402-hub | xbt402-hub |
+| 10004 | (not used; was the retired hub's) | |
 | 10005 | xbt-wallet-ui | xbt-wallet-ui |
 | 10006 | xbt-work-relay | xbt-work-relay (AGP-043) |
 | 0 | root | xbt-init (a one-shot that exits; §8) |
@@ -90,7 +93,7 @@ the data dir, and in the env variable (upper-cased, `-` → `_`). Lookup order (
    secrets written to files use this, and so do compose and Docker secrets.
 2. `$CREDENTIALS_DIRECTORY/<name>`: systemd `LoadCredential=`. cmp.keys already reads this.
 3. `/data/<component>/secrets/<name>`: the file must be 0600 in a 0700 directory. Production refuses a
-   secret readable by group or others. Wrapping keys, tokens and hub keys are **generated here on first
+   secret readable by group or others. Wrapping keys and tokens are **generated here on first
    run**: created exclusively, 0600, fsynced, never overwritten.
 4. `XBT_SECRET_<NAME>`, a plain env value: **dev mode only**. Production refuses it at start, and so do
    the older env secrets `B2_HOT_PASSPHRASE`, `XBT_MCP_HTTP_TOKEN` and `B2_HOT_ALLOW_PLAINTEXT`.
@@ -103,10 +106,9 @@ the data dir, and in the env variable (upper-cased, `-` → `_`). Lookup order (
 |---|---|---|---|
 | `signer-wrap-key` | signer | 32-byte AES-256-GCM wrapping key for the sealed hot and channel keys (raw or 64 hex) | generated |
 | `signer-passphrase` | signer | instead of the wrap key: scrypt passphrase (B2 format) | never generated |
-| `node-rpc-auth` | signer, hub (cmp: any node client) | `user:password` in cookie format (a node's `.cookie` works as is) | provisioned by the installer |
+| `node-rpc-auth` | signer (cmp: any node client) | `user:password` in cookie format (a node's `.cookie` works as is) | provisioned by the installer |
 | `mcp-http-token` | mcp (ui on a box) | bearer token for MCP over HTTP (64 hex) | generated when listening off loopback. On a box with the UI, `xbt-init` makes it `run/ui/mcp-http-token` instead: owned by the UI, 0640, the MCP reads it by group on every request and never writes it (AGP-042, §8) |
 | `xbt-ui-password` | ui | the UI login password, when the platform sets it (Umbrel `${APP_PASSWORD}`, via `xbt-init`); otherwise the UI's own first-run setup code | never generated |
-| `hub-payto-key` | hub | payTo secret (hex scalar) | generated |
 | `relay-push-token` | relay | bearer token the Prime's pushes must carry (any string) | never generated: set it, or `XBT_RELAY_PUSH_ALLOW_OPEN=1` for a push port only the Prime reaches |
 | `operator-passphrase` | cmp-node | cmp operator key passphrase (cmp.keys) | cmp's rule |
 | `client-passphrase` | cmp-client | cmp client identity passphrase (cmp.keys) | cmp's rule |
@@ -123,14 +125,13 @@ Every HTTP service serves these without auth (probes cannot send tokens). The bo
 - `GET /readyz`: ready for work. Returns `200` or `503`, with JSON status in the body. The status always
   includes the node's `reachable`, `synced` and `sync_pct` (from `verificationprogress`), the same
   `xbt_svc::health::node_status` everywhere. The body *is* the service's status JSON, so a UI (the
-  signer UI, AGP-039, linking to cmp's node/hub status page) reads `/readyz` and gets a 200 or 503
+  signer UI, AGP-039, linking to cmp's node status page) reads `/readyz` and gets a 200 or 503
   plus the details. cmp may add `GET /status` returning the same document, always 200.
 - Both are also served under the base path (`<base>/healthz`).
 
 | service | /readyz is 200 when |
 |---|---|
 | `xbt-wallet-mcp` | the signer answers `health` on its socket, **and** the signer's readiness file is fresh and `ok` |
-| `xbt402-hub` | the node is reachable and synced, and the node wallet named `hub` (created on start, loaded when the node starts) answers (AGP-104); the body also gives `pay_to`, the provider count, that wallet's stable receive address and balance, and `tor` when `XBT_HUB_ONION` / `APP_HIDDEN_SERVICE` is set. `GET /status` is where the hub's coins are (JSON) and `GET /` the same as a page |
 | `xbt-signer` (socket only) | readiness **file** `run/signer/ready.json`, rewritten every `XBT_READY_INTERVAL` s (default 5), `ok` when all of these hold: node reachable and synced, keys unlocked, the witness answering `latest` (when anchoring is on), the signer's own socket answering `health` |
 | `xbt-anchor-witness` (socket only) | `xbt-anchor-witness healthcheck`: the witness answers `latest` |
 | `xbt-work-relay` | its blob store is writable (no node: the relay only stores what the Prime pushes) |
@@ -142,7 +143,7 @@ through the shared `run/signer/` mount (group-readable, 0640). A stale file mean
 wedged (the heartbeat stops), which a socket probe alone would not show before a timeout.
 
 **Image HEALTHCHECK = liveness.** It runs the binary's own `healthcheck` subcommand: signer file fresh,
-witness answering, MCP/hub `GET /healthz`. The binary is used because the images have no shell or curl.
+witness answering, MCP `GET /healthz`. The binary is used because the images have no shell or curl.
 `--ready` switches the subcommand to readiness, for StartOS health checks, or for compose
 `depends_on: condition: service_healthy` when a stack should wait for sync. With readiness as the
 default, a node doing hours of IBD would mark every service unhealthy.
@@ -150,17 +151,16 @@ default, a node doing hours of IBD would mark every service unhealthy.
 ## 4. Networking and reverse proxies
 
 - **Bind addresses come from config.** In the images:
-  - MCP: `XBT_MCP_HTTP=0.0.0.0:33510`;
-  - hub: `XBT_HUB_BIND=0.0.0.0`, `XBT_HUB_PORT=9480`.
+  - MCP: `XBT_MCP_HTTP=0.0.0.0:33510`.
 
   Bare metal defaults to loopback.
 - **Auth off loopback:** the MCP refuses a non-loopback listener without a bearer token. In data-dir mode
-  it generates `mcp-http-token`. The signer has no HTTP API. The hub is a paid public service, so its
-  auth is the payment.
+  it generates `mcp-http-token`. The signer has no HTTP API.
 - **Base path:** `XBT_BASE_PATH=/x`. Every endpoint answers both at `/x/...` (a proxy that keeps the
   prefix) and at `/...` (one that strips it).
-- **Public URL:** used for the hub's 402 `resource.url`. Tor `.onion` and StartOS LAN/Tor interfaces work
-  without configuration. In order:
+- **Public URL:** the URL a service names itself by (`xbt_svc::proxy::public_url`). No shipped
+  image calls it since the hub was retired; the rule is kept for a service that returns a 402.
+  Tor `.onion` and StartOS LAN/Tor interfaces work without configuration. In order:
   1. `XBT_PUBLIC_URL`;
   2. with `XBT_TRUST_FORWARDED=1`: `X-Forwarded-Proto` / `X-Forwarded-Host` / `X-Forwarded-Prefix`;
   3. otherwise the request's `Host`.
@@ -178,14 +178,13 @@ Every setting has an env variable. Files are optional.
 | witness | `XBT_WITNESS_DIR`, `XBT_ANCHOR_SOCK` (defaults under `/data`) |
 | MCP | `XBT_MCP_HTTP`, `XBT_MCP_PATH`, `XBT_BASE_PATH`, `XBT_MCP_HTTP_ALLOW_REMOTE`, the existing `XBT_MCP_*` payer settings, and `B2_SIGNER_SOCK` (default `/data/run/signer/signer.sock`). `XBT_MCP_HTTP_TOKEN_FILE` (default `run/ui/mcp-http-token` when it exists): the UI-owned token, read on every request, fail closed. The MCP has no rotation endpoint (AGP-042). |
 | relay | `XBT_RELAY_BIND` (image `0.0.0.0:9490`, public, GET only), `XBT_RELAY_PUSH_BIND` (image `0.0.0.0:9491`, the Prime's pushes; `off`), `XBT_RELAY_STORE` (default `/data/relay/blobs`), `XBT_RELAY_RATE`/`_BURST` (GETs per second per client, default 10/40), `XBT_RELAY_MAX_ENTRIES` (1,000,000), `XBT_RELAY_TTL_DAYS` (30), `XBT_RELAY_THREADS`, `XBT_RELAY_PUSH_ALLOW_OPEN`, `XBT_BASE_PATH`, `XBT_TRUST_FORWARDED` (count clients by the proxy's `X-Forwarded-For` hop) |
-| hub | `hub.json` (`--config`, `XBT_HUB_CONFIG`, or `/data/hub/hub.json`), each field overridable: `XBT_NODE_RPC_HOST`, `XBT_NODE_RPC_PORT`, `XBT_HUB_WALLET`, `XBT_HUB_NETWORK` (default: derived from the node's anchor block), `XBT_HUB_BIND`, `XBT_HUB_PORT`, `XBT_HUB_DATADIR`, `XBT_HUB_CONNECT`, `XBT_HUB_JSON`, `XBT_HUB_WATCH_INTERVAL`, `XBT_HUB_THREADS`, `XBT_PUBLIC_URL`, `XBT_TRUST_FORWARDED`, `XBT_HUB_ONION` (or `APP_HIDDEN_SERVICE`: umbrelOS gives every app, including a second app, a hidden service), `XBT_HUB_FEE_RATE` (sat/vB for fundings; default: the node's estimate, and nothing is funded without one), `XBT_HUB_STATUS=off` (no `/status` and no page at `/`). The link to a Lightning node: `XBT_HUB_LN_REST` (the node's REST address), `XBT_HUB_LN_TLS_CERT` (its `tls.cert`: a path, or the PEM text), `XBT_HUB_LN_MACAROON` (the path of a macaroon for new address and sign message; else the secret `hub-ln-macaroon`), `XBT_HUB_LN_STRICT=1` (the mainnet macaroon rule on a test chain). The hub refuses a node that is not on XBT, and waits while the node is below the block it checks |
 
 None of these binaries depends on systemd. `$CREDENTIALS_DIRECTORY` is just one secret source.
 
 ## 6. Images
 
 `scripts/oci_build.sh` builds one image per binary for **linux/amd64, linux/arm64 and linux/arm/v7**:
-`xbt-signer`, `xbt-anchor-witness`, `xbt-wallet-mcp`, `xbt402-hub`, `xbt-wallet-ui`, `xbt-init` and (AGP-043)
+`xbt-signer`, `xbt-anchor-witness`, `xbt-wallet-mcp`, `xbt-wallet-ui`, `xbt-init` and (AGP-043)
 `xbt-work-relay` (`--only IMAGE,...` builds a subset; the binaries come from `$CARGO_TARGET_DIR`). Each
 is `FROM scratch` with the static musl binary (built with zig). There is no `RUN`, so no emulator or
 binfmt is needed. The images are saved as OCI archives in `dist/oci/*.tar` (never pushed), with digests
@@ -253,8 +252,7 @@ Docker network with a Knots regtest node. They are configured only by env and th
 volumes). The test:
 1. pays an xbt402 call through the MCP over HTTP, behind a base path and with the bearer token;
 2. kills and restarts the containers and checks that everything persists;
-3. checks that `/readyz` follows the witness and the node;
-4. checks the hub behind a proxy.
+3. checks that `/readyz` follows the witness and the node.
 
 Ports 23700–23799. Evidence is written to `run/container-test/<stamp>/`.
 
@@ -268,7 +266,7 @@ Ports 23700–23799. Evidence is written to `run/container-test/<stamp>/`.
   into symlinks); on a second start nothing changes;
 - provisions the secrets an installer holds, from `XBT_INIT_*` (plain env values are fine here: it is the
   installer's step and exits before any service starts; the services still read files only):
-  `XBT_INIT_NODE_RPC_AUTH[_FILE]` or `XBT_INIT_NODE_RPC_USER` + `_PASS` → `signer/` and `hub/secrets/node-rpc-auth`;
+  `XBT_INIT_NODE_RPC_AUTH[_FILE]` or `XBT_INIT_NODE_RPC_USER` + `_PASS` → `signer/secrets/node-rpc-auth`;
   `XBT_INIT_UI_PASSWORD[_FILE]` → `ui/secrets/xbt-ui-password`; the MCP token, generated once: with the UI,
   `run/ui/mcp-http-token` (uid 10005, 0640; an AGP-040 token in `mcp/secrets/` is moved there and the old
   copies removed, so agents keep working), without it `mcp/secrets/mcp-http-token`. A secret is rewritten only when its value changes, through an exclusively created temp

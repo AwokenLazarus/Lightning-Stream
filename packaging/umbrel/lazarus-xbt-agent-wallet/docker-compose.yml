@@ -94,7 +94,6 @@ services:
       XBT_UI_PASSWORD_FILE: /data/ui/secrets/xbt-ui-password
       XBT_UI_SIGNER_SOCK: /data/run/signer/signer.sock
       XBT_UI_MCP_URL: http://${DEVICE_DOMAIN_NAME}:33510/mcp
-      XBT_UI_HUB_URL: http://lazarus-xbt402-hub_hub_1:9480
     volumes:
       - ${APP_DATA_DIR}/data/ui:/data/ui
       - ${APP_DATA_DIR}/data/run/signer:/data/run/signer:ro

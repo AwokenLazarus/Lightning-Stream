@@ -3,11 +3,9 @@
 //!
 //! xbt402-close-bump --rpc-port R --cookie PATH --port-base PB [--report FILE]
 //!
-//! Four Rust providers on the node, each with a 20-block close margin: a direct provider with the
-//! close bump on (`close_bump_max_fee` 10,000) and one with it off (main's behaviour), and two route
-//! providers paid through a Rust hub's ch2, the same two ways. A Rust client opens a direct channel
-//! to each direct provider and pays 20 calls; a Rust route payer opens ch1 to the hub and pays each
-//! route provider over its ch2. All at the 1 sat/vB floor. Then, before any close margin, the fee
+//! Two Rust providers on the node, each with a 20-block close margin: one with the close bump on
+//! (`close_bump_max_fee` 10,000) and one with it off. A Rust client opens a channel to each and
+//! pays 20 calls, all at the 1 sat/vB floor. Then, before any close margin, the fee
 //! spike: the node's mempool (`maxmempool=5`, the script's bitcoin.conf) is filled with
 //! transactions paying 9.5 sat/vB until its floor (`mempoolminfee`) is about 10 sat/vB, and blocks
 //! take only packages paying `MARKET` (10) sat/vB or more (`generateblock` with the txids a miner would
@@ -15,29 +13,23 @@
 //! A spike moves the dynamic floor, not `minrelaytxfee`: package relay lets a parent below
 //! `mempoolminfee` in on its child's fee, never one below `minrelaytxfee`. Each block from the
 //! margin to expiry every provider's watcher runs once (`close_due`):
-//! * bump on, direct and ch2: the close goes in with a CPFP child from the provider's own output
+//! * bump on: the close goes in with a CPFP child from the provider's own output
 //!   (`submitpackage`) and confirms in the first block after the margin, well before expiry;
-//! * bump off, direct and ch2: the close is refused every block; at expiry the funding is unspent
+//! * bump off: the close is refused every block; at expiry the funding is unspent
 //!   and the payer's refund, re-signed at the spike's rate, takes the whole channel back.
 //!
 //! Exit 0 iff every check passes.
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{json, Value};
-use xbt402::adaptor::Sc;
 use xbt402::client::{Client, ClientConfig, Wallet};
 use xbt402::funding::{ChainBackend, FundingPolicy};
-use xbt402::http::{serve_http, serve_service, UreqTransport};
-use xbt402::hub::{HubConfig, RouteHub};
+use xbt402::http::{serve_http, UreqTransport};
 use xbt402::ledger::Ledger;
 use xbt402::provider::{HttpResponse, Provider, ProviderConfig, CPFP_CHILD_VSIZE};
-use xbt402::route::AMSAT_PER_SAT;
-use xbt402::route_client::{RoutePayer, RoutePayerConfig};
-use xbt402::route_seller::RouteOffer;
 use xbt402::rpc::Rpc;
-use xbt402::signer::LocalSigner;
 use xbt_primitives::address::segwit_address;
 use xbt_primitives::hash::sha256;
 use xbt_primitives::network::network_id;
@@ -49,8 +41,6 @@ const MARGIN: u32 = 20;
 const FILL_SAT_VB: f64 = 9.5;
 const MARKET: f64 = 10.0;
 const REFUND_SAT_VB: f64 = 12.0;
-const ROUTE_PRICE_SAT: u128 = 200;
-const ROUTE_CALLS: usize = 30;
 
 fn arg(name: &str) -> String {
     let a: Vec<String> = std::env::args().collect();
@@ -63,7 +53,9 @@ fn opt(name: &str) -> Option<String> {
 }
 
 fn sk(n: u64) -> SecretKey {
-    Sc::from_u64(n).secret().unwrap()
+    let mut b = [0u8; 32];
+    b[24..].copy_from_slice(&n.to_be_bytes());
+    SecretKey::from_slice(&b).expect("a small non-zero number is a key")
 }
 
 struct Checks(Vec<Value>);
@@ -227,61 +219,6 @@ fn main() {
         clients.push((origin, c));
     }
 
-    // --- hub ch2s -------------------------------------------------------------------------------------
-    let routed = [("hub ch2, bump on", true, 0xE1u64, pb + 3), ("hub ch2, bump off", false, 0xE2, pb + 4)];
-    let mut route_provs = vec![];
-    for (name, bump, key, port) in routed {
-        let p = provider(&rpc, provider_cfg(&net, bump), key, port, &run.join(format!("route-{key:x}.jsonl")));
-        p.offer_route(RouteOffer { window: 1.0, lock_wait: 3.0, invoice_ttl: 8.0, ..RouteOffer::new("/v1/chunk", ROUTE_PRICE_SAT * AMSAT_PER_SAT) });
-        route_provs.push((name, bump, p, format!("http://127.0.0.1:{port}")));
-    }
-    let hcfg = HubConfig::from_json(&json!({"spend_final_depth": 1, "fee_base_msat": 100, "fee_ppm": 2000, "max_lock_sat": 20_000, "max_unguarded_lock_sat": 20_000,
-        "delta": 10, "reveal_timeout": 2.0, "ch2_capacity": 60_000, "ch2_expiry_blocks": 70, "close_margin": MARGIN, "rollover_margin": 2,
-        "settle_lock_multiple": 0, "refill_ahead_locks": 0, "refund_min_feerate": REFUND_SAT_VB, "refund_grace_blocks": 0,
-        "policy": {"min_expiry_blocks": 30, "max_expiry_blocks": 8_640}})).expect("hub config");
-    let ra = Arc::new(rpc.clone());
-    let hub = Arc::new(RouteHub::new(ra.clone(), ra, Box::new(MiningWallet(rpc.clone(), addr.clone())), Box::new(UreqTransport::default()),
-                                     sk(0x4B4B), &net, Some(&run.join("hub")), hcfg).expect("hub"));
-    serve_service(hub.clone(), &format!("127.0.0.1:{pb}"), 8).expect("bind hub");
-    for (_, _, _, u) in &route_provs {
-        hub.connect(u, Some(60_000), None).expect("connect");
-    }
-    hub.watch_tick();
-    let mut pcfg = RoutePayerConfig::new(&net);
-    pcfg.capacity = 100_000;
-    pcfg.expiry_blocks = 200;
-    let n = rpc.clone();
-    let payer = Arc::new(RoutePayer::new(&format!("http://127.0.0.1:{pb}"), pcfg, Arc::new(LocalSigner::new()),
-                                         Arc::new(MiningWallet(rpc.clone(), addr.clone())), Box::new(UreqTransport::default()),
-                                         Box::new(move || n.block_count())));
-    payer.open().expect("open ch1");
-    let hub_stop = hub.watch(Duration::from_millis(300));
-    payer.start(Duration::from_millis(500));
-    let shards: Vec<_> = route_provs.iter().map(|(_, _, _, u)| payer.shard(&format!("{u}/v1/chunk"), "POST").expect("shard")).collect();
-    for _ in 0..ROUTE_CALLS {
-        for sh in &shards {
-            let _ = payer.call(sh, "POST", b"{}");
-        }
-        std::thread::sleep(Duration::from_millis(60));
-    }
-    let want = ROUTE_PRICE_SAT as u64 * ROUTE_CALLS as u64;
-    let t = Instant::now();
-    let routed_of = |p: &Provider| p.channel_ids().iter().filter_map(|c| p.channel_state(c)).map(|s| s.best_cum).max().unwrap_or(0);
-    while route_provs.iter().any(|(_, _, p, _)| routed_of(p) < want) && t.elapsed() < Duration::from_secs(20) {
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    payer.stop();
-    hub_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    std::thread::sleep(Duration::from_millis(400));
-    for (name, bump, p, u) in &route_provs {
-        let oc = hub.ch2_for(u).expect("ch2");
-        let chan = oc.params.channel_id();
-        let best = p.channel_state(&chan).map(|s| s.best_cum).unwrap_or(0);
-        ck.check(&format!("{name}: hub-funded ch2 (payee-pays) paid through the hub"), best >= want && oc.params.close_fee_payer == xbt402::channel::FeePayer::Payee,
-                 format!("{} capacity {}, expiry {}, best {best}", &chan[..16], oc.params.capacity, oc.params.expiry));
-        legs.push(Leg { name, prov: p.clone(), chan, expiry: oc.params.expiry, bump: *bump });
-    }
-
     // --- the spike ------------------------------------------------------------------------------------
     let first_margin = legs.iter().map(|l| l.expiry - MARGIN).min().unwrap();
     node.mine_to(first_margin - 1);
@@ -351,23 +288,6 @@ fn main() {
     ck.check("direct, bump off: at expiry the payer's refund, re-signed at the spike's rate, takes the whole channel back",
              sent.is_ok() && node.confs(&refund.txid()) >= 1 && paid == ch.payer.params.capacity - fee && !node.funding_unspent(&ctl_direct.chan),
              format!("refund {} pays the payer {paid} = {} - {fee}", &refund.txid()[..12], ch.payer.params.capacity));
-    let ctl_hub = legs.iter().find(|l| !l.bump && l.name.starts_with("hub")).unwrap();
-    let mut hub_refund = Value::Null;
-    for _ in 0..6 {
-        for a in hub.watch_tick() {
-            if a["event"] == "ch2_refund" || a["event"] == "ch2_refund_confirmed" {
-                hub_refund = a;
-            }
-        }
-        if !node.funding_unspent(&ctl_hub.chan) {
-            break;
-        }
-        node.mine_market(MARKET);
-    }
-    ck.check("hub ch2, bump off: the hub's refund takes ch2 back; the provider is paid nothing on-chain",
-             !node.funding_unspent(&ctl_hub.chan) && ctl_hub.prov.channel_state(&ctl_hub.chan).map(|s| node.height_of(&s.closed_txid).is_none()).unwrap_or(false),
-             format!("{hub_refund}"));
-
     let ok = ck.0.iter().all(|c| c["ok"] == true);
     if let Some(p) = opt("--report") {
         let rep = json!({"network": net, "mempool_floor_sat_vb": floor, "fillers": fillers, "market_sat_vb": MARKET, "close_margin": MARGIN, "legs": report_legs, "checks": ck.0});

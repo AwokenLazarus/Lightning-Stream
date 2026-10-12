@@ -22,7 +22,6 @@ use crate::keystore::{random_bytes, write_private};
 use crate::keystore::KeyStore;
 use crate::policy::{validate_policy, PolicyConfig, RESTART_KEYS};
 use crate::pyjson::{dumps, dumps_indent, py_int, str_or_empty, ts_value};
-use crate::routing::RoutePolicy;
 use crate::sanitize::sanitize;
 use crate::signer::{deny, Signer};
 use crate::{err, Result};
@@ -194,7 +193,6 @@ impl Signer {
         }
         std::fs::rename(&tmp, &path).map_err(|e| err("io", e.to_string()))?;
         self.engine.set_config(cfg.clone());
-        self.routing.set_policy(RoutePolicy::from_value(&cfg.routing));
         self.hot.set_cap_sats(cfg.hot_balance_cap_sats);
         self.set_config_live(cfg.clone());
         Ok(cfg)
@@ -305,7 +303,7 @@ impl Signer {
         let (errors, warnings) = validate_policy(&raw);
         Ok(json!({"policy": raw, "text": text, "sha256": sha256_hex(text.as_bytes()), "human_key": hex::encode(self.human_key()),
                   "restart_keys": RESTART_KEYS, "pending_restart": self.pending_restart(&raw), "errors": errors, "warnings": warnings,
-                  "routing": self.routing.policy().public(), "hot_cap_sats": self.hot.cap_sats(), "effective": effective(&self.config())}))
+                  "hot_cap_sats": self.hot.cap_sats(), "effective": effective(&self.config())}))
     }
 
     /// Validate a proposed policy and return the exact text and message the human signs.

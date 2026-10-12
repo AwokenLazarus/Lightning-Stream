@@ -21,13 +21,13 @@ use zeroize::Zeroizing;
 use xbt402::channel::{channel_auth_key, sign_with_type, ChannelParams, Payer};
 use xbt402::conditional::ConditionalParams;
 use xbt_primitives::ecdsa;
-use xbt_primitives::secp256k1::{PublicKey, Scalar, SecretKey, SECP256K1};
+use xbt_primitives::secp256k1::SecretKey;
 use xbt_primitives::sighash::SIGHASH_ALL_UNIFIED;
 use xbt_primitives::tx::Tx;
 
 use crate::keystore::{write_private, KeyStore};
 use crate::policy::normalize_dest;
-use crate::pyjson::{dumps_indent, now_f64, ts_value};
+use crate::pyjson::dumps_indent;
 use crate::sigaudit::SigAudit;
 use crate::{err, Result};
 
@@ -73,12 +73,14 @@ pub struct ChannelRecord {
     /// is committed before the signature is sent.
     #[serde(skip_serializing_if = "ledger_booked_is_legacy")]
     pub ledger_booked_sats: i64,
+    /// A pre-signed state above `used_sats` that an earlier version's routed signing (retired
+    /// with the hub) left pending. Nothing writes one any more. It is still read, so such a
+    /// record keeps its bytes and a plain state below the pre-signed amount is still refused
+    /// ([`ChannelBook`]'s `plain_over_lock`).
     pub pending_lock: Value,
+    /// As `pending_lock`: locks an earlier version gave up, kept as that version wrote them.
     pub given_up: Vec<Value>,
-    /// AGP-055: the last resolved (or adopted) locks `{key, amount, hub, lockId, at}`, written with
-    /// the resolve itself. The route signer books each one (spend row, ledger row) under its key,
-    /// and at start books any that a crash left unbooked. `key` is `lock:<chan>:<cum>`: the
-    /// signer's own id for a lock, never the caller's.
+    /// As `pending_lock`: the bookings an earlier version kept of its resolved locks.
     pub resolved: Vec<Value>,
     pub close_change: String,
     pub close_scan_from: i64,
@@ -119,11 +121,6 @@ fn is_false(v: &bool) -> bool {
 
 fn has_lock(v: &Value) -> bool {
     v.as_object().is_some_and(|m| !m.is_empty())
-}
-
-/// A lock (pending or given up) that was booked when it was pre-signed (AGP-080).
-pub fn lock_booked(lk: &Value) -> bool {
-    crate::pyjson::truthy(lk.get("booked"))
 }
 
 fn lk_int(lk: &Value, k: &str) -> i64 {
@@ -192,16 +189,6 @@ pub fn cap_error(used: i64, amount: i64, cap: i64) -> crate::Error {
     err("channel_cap", format!("channel used {used} + {amount} exceeds cap {cap}"))
 }
 
-/// The ECDSA adaptor scheme behind routed (adaptor-locked) states: B1's `xbt402/adaptor.py`, which
-/// AGP-026 ports to Rust. The book needs only these two operations; the point arithmetic is here.
-pub trait AdaptorScheme: Send + Sync {
-    /// Pre-sign digest `z` with `secret` under point `t1`; the pre-signature's wire JSON
-    /// (`{"R", "R1", "s1", "c", "z"}`).
-    fn presign(&self, secret: &SecretKey, z: &[u8; 32], t1: &PublicKey) -> Result<Value>;
-    /// The secret `y` (with `y·G = t1`) from a completed signature, or `None`.
-    fn extract(&self, pre: &Value, sig: &[u8], t1: &PublicKey) -> Option<[u8; 32]>;
-}
-
 pub type HeightFn = Arc<dyn Fn() -> Result<u64> + Send + Sync>;
 
 struct Inner {
@@ -260,22 +247,6 @@ fn rolled_name(old_chan: &str, next_spk: &[u8]) -> String {
     format!("rolled:{old_chan}:{}", hex::encode(next_spk))
 }
 
-/// Resolved locks a record remembers (the newest ones).
-pub const RESOLVED_KEPT: usize = 16;
-
-/// Record a resolved lock in its channel record (the caller persists): what there is to book.
-fn note_resolved(rec: &mut ChannelRecord, cum: i64, amount: i64, route: &Value) -> Value {
-    let s = |k: &str| route.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-    let booking = json!({"key": format!("lock:{}:{cum}", rec.chan), "amount": amount, "hub": s("hub"), "lockId": s("lockId"),
-                         "at": crate::pyjson::now_ts()});
-    rec.resolved.push(booking.clone());
-    if rec.resolved.len() > RESOLVED_KEPT {
-        let cut = rec.resolved.len() - RESOLVED_KEPT;
-        rec.resolved.drain(..cut);
-    }
-    booking
-}
-
 fn secret_hex(s: &SecretKey) -> String {
     hex::encode(s.secret_bytes())
 }
@@ -295,11 +266,6 @@ fn audit_rec(a: &Option<Arc<SigAudit>>, kind: &str, sig: &[u8], chan: &str, dest
         a.record(kind, sig, chan, dest, extra)?;
     }
     Ok(())
-}
-
-/// `y·G` for a 32-byte scalar.
-pub fn point_of(y: &[u8; 32]) -> Option<PublicKey> {
-    SecretKey::from_slice(y).ok().map(|s| PublicKey::from_secret_key(SECP256K1, &s))
 }
 
 impl ChannelBook {
@@ -390,26 +356,6 @@ impl ChannelBook {
             body["archived"] = g.archived.clone().into();
         }
         write_private(&self.records_path, &dumps_indent(&body, 2, true))
-    }
-
-    /// `(chan, key, sats, hub, lockId, at)` for every lock a record holds (pending or given up)
-    /// that was pre-signed as booked (AGP-080): what the ledgers must hold for it.
-    pub fn presigned_bookings(&self) -> Vec<(String, Value)> {
-        let g = self.lock();
-        let mut out = vec![];
-        for r in g.records.values() {
-            for lk in std::iter::once(&r.pending_lock).chain(r.given_up.iter()).filter(|lk| lock_booked(lk) && lk_int(lk, "booked_sats") > 0) {
-                let s = |k: &str| lk.get("route").and_then(|x| x.get(k)).and_then(Value::as_str).unwrap_or("").to_string();
-                out.push((r.chan.clone(), json!({"key": format!("lock:{}:{}", r.chan, lk_int(lk, "cum")), "amount": lk_int(lk, "booked_sats"),
-                                                 "hub": s("hub"), "lockId": s("lockId"), "at": lk.get("at").cloned().unwrap_or(Value::Null)})));
-            }
-        }
-        out
-    }
-
-    /// `(chan, booking)` for the resolved locks every record still remembers, whatever its state.
-    pub fn resolved_bookings(&self) -> Vec<(String, Value)> {
-        self.lock().records.values().flat_map(|r| r.resolved.iter().map(|b| (r.chan.clone(), b.clone()))).collect()
     }
 
     pub fn list_public(&self) -> Vec<Value> {
@@ -793,7 +739,7 @@ impl ChannelBook {
         Ok(())
     }
 
-    /// A channel funded and opened elsewhere (the external client and routing paths): open at once.
+    /// A channel funded and opened elsewhere (the external client path): open at once.
     pub fn add_funded(&self, dest: &str, secret: SecretKey, p: &ChannelParams, origin: &str, cap_sats: Option<i64>, open_height: i64) -> Result<ChannelRecord> {
         let rec = Self::record_of(dest, p, origin, cap_sats, open_height);
         let mut g = self.lock();
@@ -844,8 +790,9 @@ impl ChannelBook {
         Ok(rec)
     }
 
-    /// A plain state under a pending lock would sit below it (refused); one at or above it
-    /// dominates the lock, which is then no longer pending.
+    /// A plain state under a pending lock (one an earlier version's routed signing left in the
+    /// record) would sit below it (refused); one at or above it dominates the lock, which is then
+    /// no longer pending.
     fn plain_over_lock(rec: &mut ChannelRecord, cum: i64) -> Result<()> {
         if rec.has_pending_lock() {
             let lc = lk_int(&rec.pending_lock, "cum");
@@ -950,160 +897,6 @@ impl ChannelBook {
         g.records.insert(k, rec);
         self.persist(&g)?;
         Ok(sig)
-    }
-
-    // --- AGP-021: adaptor-locked states (routed payments) -----------------------------------------
-
-    /// Pre-sign state(cum) under `T1 = T + r·G` (`point` = T, the provider's invoice point; r fresh
-    /// here). One pending lock per channel; (lock, r, T) are persisted before this returns.
-    /// `booked` (AGP-080): the sats the caller books for this lock before the pre-signature
-    /// leaves it (`Some(0)`: all of it is booked already). They are written with the lock, so a
-    /// start after a crash books a lock the record holds and the ledgers do not, and resolving a
-    /// lock so marked books nothing more. `None`: booked when it resolves (the pre-AGP-080 way).
-    pub fn sign_state_adaptor(&self, dest: &str, cum: i64, point: &str, route: Value, a: &dyn AdaptorScheme, booked: Option<i64>) -> Result<Value> {
-        let mut g = self.lock();
-        let k = Self::key_of(&g, dest)?;
-        let mut rec = g.records[&k].clone();
-        if rec.has_pending_lock() {
-            return Err(err("lock_outstanding", "one adaptor lock per channel at a time"));
-        }
-        if cum <= rec.used_sats {
-            return Err(err("stale_amount", format!("a lock must raise the signed amount {}", rec.used_sats)));
-        }
-        if cum > rec.cap_sats {
-            return Err(cap_error(rec.used_sats, cum - rec.used_sats, rec.cap_sats));
-        }
-        let payer = self.payer_locked(&g, &rec)?;
-        if cum as u64 > payer.params.max_amount() {
-            return Err(cap_error(rec.used_sats, cum - rec.used_sats, payer.params.max_amount() as i64));
-        }
-        let t = PublicKey::from_slice(&hex::decode(point).map_err(|_| err("bad_point", "point is not hex"))?)
-            .map_err(|_| err("bad_point", "point is not on the curve"))?;
-        let r = xbt402::signer::random_secret();
-        let t1 = t.combine(&PublicKey::from_secret_key(SECP256K1, &r)).map_err(|_| err("bad_point", "T + rG is infinity"))?;
-        let z = payer.params.sighash(&payer.params.state_tx(cum as u64)?)?;
-        let secret = Self::secret_of(&g, &rec.chan)?;
-        let pre = a.presign(&secret, &z, &t1)?;
-        let t1_hex = hex::encode(t1.serialize());
-        rec.pending_lock = json!({"cum": cum, "pre": pre, "r": secret_hex(&r), "T": point.to_lowercase(), "T1": t1_hex,
-                                  "route": route, "prev_used": rec.used_sats, "at": ts_value((now_f64() * 1000.0).round() / 1000.0)});
-        if let Some(sats) = booked {
-            rec.pending_lock["booked"] = true.into();
-            rec.pending_lock["booked_sats"] = sats.into();
-            rec.ledger_booked_sats = rec.ledger_booked_sats.max(cum);
-        }
-        let mut pre_bytes = hex::decode(pre.get("R").and_then(Value::as_str).unwrap_or("")).unwrap_or_default();
-        pre_bytes.extend(hex::decode(pre.get("s1").and_then(Value::as_str).unwrap_or("")).unwrap_or_default());
-        audit_rec(&self.audit, "adaptor_presig", &pre_bytes, &rec.chan, &rec.dest,
-                  json!({"cum": cum, "sighash": "0x21", "point": t1_hex, "route": rec.pending_lock["route"]}))?;
-        g.records.insert(k, rec);
-        self.persist(&g)?; // write-ahead: before the pre-signature leaves
-        Ok(json!({"adaptor": pre, "point": t1_hex, "tweak": secret_hex(&r), "cum": cum}))
-    }
-
-    /// The lock was paid: `secret` is t + r (the hub's answer) or t (the provider's receipt). It
-    /// must open T1 or T. The locked amount becomes the signed (and spent) amount.
-    pub fn resolve_lock(&self, dest: &str, secret: &str) -> Result<Value> {
-        let mut g = self.lock();
-        let k = Self::key_of(&g, dest)?;
-        let rec = g.records.get_mut(&k).unwrap();
-        if !rec.has_pending_lock() {
-            return Err(err("no_state", "no pending lock on this channel"));
-        }
-        let lk = rec.pending_lock.clone();
-        let y: [u8; 32] = hex::decode(secret.trim()).ok().and_then(|b| {
-            let mut p = [0u8; 32];
-            (b.len() <= 32).then(|| { p[32 - b.len()..].copy_from_slice(&b); p })
-        }).ok_or_else(|| err("bad_secret", "secret is not a 32-byte hex scalar"))?;
-        let r = parse_secret(lk["r"].as_str().unwrap_or(""))?;
-        let yp = point_of(&y);
-        let pt = |k: &str| hex::decode(lk[k].as_str().unwrap_or("")).ok().and_then(|b| PublicKey::from_slice(&b).ok());
-        let t = if yp.is_some() && yp == pt("T1") {
-            // t = y - r
-            let ys = SecretKey::from_slice(&y).map_err(|_| err("bad_secret", "zero"))?;
-            let neg_r = r.negate();
-            ys.add_tweak(&Scalar::from(neg_r)).map(|s| s.secret_bytes()).unwrap_or([0u8; 32])
-        } else if yp.is_some() && yp == pt("T") {
-            y
-        } else {
-            return Err(err("bad_secret", "the secret opens neither T1 nor T"));
-        };
-        let cum = lk_int(&lk, "cum");
-        rec.used_sats = rec.used_sats.max(cum);
-        rec.spent_sats = rec.spent().max(cum);
-        rec.acked_sats = rec.used_sats; // the hub holds the completed state
-        rec.last_sig.clear();
-        rec.pending_lock = json!({});
-        let route = lk.get("route").cloned().unwrap_or(json!({}));
-        // a lock booked when it was pre-signed has nothing left to book (AGP-080)
-        let booking = if lock_booked(&lk) { Value::Null } else { note_resolved(rec, cum, cum - lk_int(&lk, "prev_used"), &route) };
-        self.persist(&g)?;
-        Ok(json!({"t": hex::encode(t), "cum": cum, "amount": cum - lk_int(&lk, "prev_used"), "route": route, "booking": booking}))
-    }
-
-    /// Give the pending lock up (the hub refused it, or its invoice expired unanswered).
-    pub fn void_lock(&self, dest: &str) -> Result<Value> {
-        let mut g = self.lock();
-        let k = Self::key_of(&g, dest)?;
-        let rec = g.records.get_mut(&k).unwrap();
-        let lk = std::mem::replace(&mut rec.pending_lock, json!({}));
-        if has_lock(&lk) {
-            let mut gu = json!({"cum": lk_int(&lk, "cum"), "prev_used": lk_int(&lk, "prev_used"),
-                                "route": lk.get("route").cloned().unwrap_or(json!({})), "at": ts_value((now_f64() * 1000.0).round() / 1000.0)});
-            if lock_booked(&lk) {
-                // the booking stays: the hub still holds the pre-signature
-                gu["booked"] = true.into();
-                gu["booked_sats"] = lk_int(&lk, "booked_sats").into();
-            }
-            rec.given_up.push(gu);
-            let n = rec.given_up.len();
-            if n > 16 {
-                rec.given_up.drain(..n - 16);
-            }
-            self.persist(&g)?;
-        }
-        Ok(lk)
-    }
-
-    /// A lock we gave up was completed after all: its amount is now signed and spent. Only the cum
-    /// of a lock this book pre-signed is accepted.
-    pub fn adopt_lock(&self, dest: &str, cum: i64) -> Result<Value> {
-        let mut g = self.lock();
-        let k = Self::key_of(&g, dest)?;
-        let rec = g.records.get_mut(&k).unwrap();
-        let i = rec.given_up.iter().position(|x| lk_int(x, "cum") == cum).ok_or_else(|| err("bad_amount", "not a lock this wallet pre-signed"))?;
-        if rec.has_pending_lock() {
-            return Err(err("lock_outstanding", "resolve or void the pending lock first"));
-        }
-        let gu = rec.given_up.remove(i);
-        let amount = (cum - rec.used_sats).max(0);
-        rec.used_sats = rec.used_sats.max(cum);
-        rec.spent_sats = rec.spent().max(cum);
-        rec.acked_sats = rec.used_sats;
-        let route = gu.get("route").cloned().unwrap_or(json!({}));
-        let booking = if amount != 0 && !lock_booked(&gu) { note_resolved(rec, cum, amount, &route) } else { Value::Null };
-        self.persist(&g)?;
-        Ok(json!({"cum": cum, "amount": amount, "route": route, "booking": booking}))
-    }
-
-    /// After a restart: the hub closed ch1 with our completed pre-signature; t + r is in it.
-    pub fn recover_lock(&self, dest: &str, witness: &[Vec<u8>], a: &dyn AdaptorScheme) -> Result<Value> {
-        let lk = {
-            let g = self.lock();
-            let k = Self::key_of(&g, dest)?;
-            g.records[&k].pending_lock.clone()
-        };
-        if !has_lock(&lk) {
-            return Err(err("no_state", "no pending lock on this channel"));
-        }
-        let t1 = hex::decode(lk["T1"].as_str().unwrap_or("")).ok().and_then(|b| PublicKey::from_slice(&b).ok())
-            .ok_or_else(|| err("bad_point", "stored T1"))?;
-        for item in witness {
-            if let Some(y) = a.extract(&lk["pre"], item, &t1) {
-                return self.resolve_lock(dest, &hex::encode(y));
-            }
-        }
-        Err(err("bad_secret", "this close does not carry our lock"))
     }
 
     /// Re-hand the last signed-but-unacknowledged state (same cum, same sig, fresh seq).

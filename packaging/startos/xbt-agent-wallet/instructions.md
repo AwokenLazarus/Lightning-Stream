@@ -24,11 +24,6 @@ the services your policy allows, within its budgets, and anything above your thr
 - The token lets an agent pay what your policy allows. If it leaks, open the **Agents** page and rotate it
   there (no restart), or run the *Rotate the agent token* action. Give your agents the new one.
 
-## Optional: the xbt402 hub
-
-*Enable the xbt402 hub* runs a routing hub other wallets pay through. The hub creates a node wallet named
-`hub` and shows a receive address on the web UI **Hub** page. Send XBT there; no terminal.
-
 ## Password
 
 *Reset the web UI password* forgets the password; the service restarts and *Web UI setup code* gives a new code.

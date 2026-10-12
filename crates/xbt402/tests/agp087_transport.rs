@@ -279,58 +279,6 @@ fn t2_an_offer_for_an_older_binding_is_refused_before_funding() {
     }
 }
 
-/// AGP-078 stated limit 5, as it is: without a RouteWal (the default) a routed session's seq is
-/// written only when a lock completes, so after a provider restart a ROUTE-AUTH header it already
-/// served authenticates again and is served and metered again. This test passes while the limit
-/// stands; it is here so the limit is measured, not to hold it in place.
-#[test]
-fn t4_limit_a_routed_call_header_is_served_again_after_a_restart_without_a_route_wal() {
-    use xbt402::route::{call_auth, session_key};
-    use xbt402::route_seller::RouteOffer;
-    use xbt_primitives::ecdsa;
-    const PATH: &str = "/v1/chunk";
-    let dir = std::env::temp_dir().join(format!("xbt402-agp087-routed-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let chain = MemChain::new();
-    let served = Arc::new(Mutex::new(0u64));
-    let make = |chain: &Arc<MemChain>, served: &Arc<Mutex<u64>>| {
-        let s = served.clone();
-        let p = Provider::new(chain.clone(), secret("provider payTo"), ProviderConfig::new(NET), Ledger::open(&dir.join("prov.jsonl")).unwrap(),
-                              Box::new(|_, _| 1000),
-                              Box::new(move |_, _, _| {
-                                  *s.lock().unwrap() += 1;
-                                  HttpResponse::new(200, vec![], b"{\"ok\":1}".to_vec())
-                              })).unwrap();
-        p.offer_route(RouteOffer { window: 30.0, lock_wait: 30.0, ..RouteOffer::new(PATH, 1_000_000) });
-        p
-    };
-    let p = make(&chain, &served);
-    assert!(p.cfg.route_wal.is_none(), "the default has no RouteWal");
-    let c = secret("routed client");
-    let r = p.serve("POST", PATH, &[("ROUTE-CLIENT".into(), hex::encode(ecdsa::pubkey(&c)))], b"", "", None);
-    assert_eq!(r.status, 402);
-    let pr = unb64json(r.header("PAYMENT-REQUIRED").unwrap()).unwrap();
-    let session = pr["accepts"][0]["extra"]["route"]["session"].as_str().unwrap().to_string();
-    let key = session_key(&c, &hex::decode(p.pay_to()).unwrap()).unwrap();
-    let hdr = |seq: u64| {
-        let auth = call_auth(&key, &session, seq, &request_digest_v2("POST", PATH, b"x"));
-        vec![("ROUTE-AUTH".to_string(), b64json(&json!({"session": session, "seq": seq, "auth": auth})))]
-    };
-    for seq in 1..=3 {
-        assert_eq!(p.serve("POST", PATH, &hdr(seq), b"x", "", None).status, 200);
-    }
-    assert_eq!(p.serve("POST", PATH, &hdr(3), b"x", "", None).status, 402, "control: a used seq is refused by the running provider");
-    assert_eq!(*served.lock().unwrap(), 3);
-    drop(p);
-    let p = make(&chain, &served);
-    let again: Vec<u16> = (1..=3).map(|seq| p.serve("POST", PATH, &hdr(seq), b"x", "", None).status).collect();
-    let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(again, [200, 200, 200], "without a RouteWal the three served headers are served again after a restart (stated limit); \
-                                        if this now fails the limit is gone and the audit row should say so");
-    assert_eq!(*served.lock().unwrap(), 6);
-}
-
 /// T2, injectivity of the v2 digest over a bare target (what a server binds when it is given no
 /// origin: an embedder calling `Provider::serve` with an empty `url`, as the in-process transports
 /// do). `request_url` splits at the first "://" wherever it is, so a "://" inside the query makes

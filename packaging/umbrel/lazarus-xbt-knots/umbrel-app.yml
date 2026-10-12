@@ -1,16 +1,12 @@
 manifestVersion: 1.1
 id: lazarus-xbt-knots
-# AGP-100: selectable for an app's `bitcoin` dependency (the xbt402 Hub's). It exports only APP_XBT_KNOTS_*,
-# not APP_BITCOIN_*, so only an app that reads those names can use it; it is on the XBT (BLAKE2b) chain.
-implements:
-  - bitcoin
 category: bitcoin
 name: XBT Node (stand-in)
 version: "29.4.2-agp040.1"
 tagline: A pruned XBT (BLAKE2b) Knots node for the XBT apps on this box
 description: >-
   A pruned Bitcoin Knots 29.4.2 node on the XBT (BLAKE2b) chain, with exclusive BLAKE2b peers. The XBT
-  Agent Wallet and the xbt402 Hub use it through their dependency on this app.
+  Agent Wallet uses it through its dependency on this app.
 
 
   This is a stand-in until xbt-compute's node-host app (CMP-098, image knots-xbt) exists. That app will

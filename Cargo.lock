@@ -2627,14 +2627,11 @@ dependencies = [
 name = "xbt402"
 version = "0.1.0"
 dependencies = [
- "aes-gcm",
  "base64 0.22.1",
  "getrandom 0.2.17",
  "hex",
  "hmac",
  "indexmap 2.14.2",
- "rustls",
- "secp256k1",
  "serde",
  "serde_json",
  "sha2",
@@ -2643,7 +2640,6 @@ dependencies = [
  "url",
  "xbt-primitives",
  "xbt-svc",
- "zeroize",
 ]
 
 [[package]]
@@ -2653,7 +2649,6 @@ dependencies = [
  "hex",
  "serde_json",
  "xbt-primitives",
- "xbt-signer",
  "xbt402",
 ]
 

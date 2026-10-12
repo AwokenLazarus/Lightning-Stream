@@ -2,8 +2,7 @@
 //! application handler. A port of B1 `XbtChannelProvider` (v1.1 + v1.2): the 402 challenge, open,
 //! paid calls with request auth and signed receipts, postpay/prepay billing, metered charges,
 //! hash-locked conditional sales, cooperative close, rollover, the facilitator endpoints and the
-//! expiry watcher. Hub routing (route offers, routed sessions, `/x402/xbt-channel/lock`) lives in
-//! [`crate::route_seller`] (AGP-026).
+//! expiry watcher.
 //!
 //! [`Provider::serve`] is transport-independent: give it the method, path, headers and body of a
 //! request and send back what it returns. The `http-server` feature serves it on std::net.
@@ -83,28 +82,14 @@ pub struct ProviderConfig {
     /// Sats the hash-lock claim pays out of condAmount.
     pub claim_fee: u64,
     pub max_body: usize,
+    /// Request-body bound of one path (the path without its query), in place of `max_body`.
     pub route_max_body: HashMap<String, usize>,
     /// Settle once the net payout is at least this many close fees.
     pub settle_multiple: u64,
-    /// Plain channels (v1.1 default: payer).
+    /// Who pays the close fee (v1.1 default: payer; v1.2 adds payee).
     pub close_fee_payer: FeePayer,
-    /// Hub-funded channels (v1.2 default: payee).
-    pub route_close_fee_payer: FeePayer,
     /// Blocks before the close margin a rollover is due anyway.
     pub rollover_grace: u32,
-    /// AGP-053 make-before-break: a hub-bound channel's rollover child is taken unconfirmed (its parent
-    /// is our own confirmed channel, and only we can sign a conflicting spend of it before its expiry),
-    /// up to this cum while it stays unconfirmed. None: two settlements' worth (2 × settle_multiple ×
-    /// close_fee); 0: never (the hub opens it at minConf).
-    pub rollover_zero_conf_max: Option<u64>,
-    /// AGP-056: a hub rolls a ch2 over at `settle_lock_multiple` × the largest lock when that is above
-    /// our threshold (locks larger than settle_multiple × close_fee), so the default zero-conf cap
-    /// follows it: at least 2 × this × the largest lock the parent's line took. An explicit
-    /// `rollover_zero_conf_max` is used as it is.
-    pub settle_lock_multiple: u64,
-    /// AGP-054: a path makes each routed session's meter (seq, calls, accrued) durable before its
-    /// ROUTE-STATE leaves, written ahead while the handler runs (`RouteOffer::precharge`). None: off.
-    pub route_wal: Option<std::path::PathBuf>,
     /// AGP-067 (review C1): most sats a CPFP child of one close may pay. The watcher bumps a close
     /// still unconfirmed before expiry with a child spending this provider's own close output (never
     /// more than that output less dust). 0: never bump.
@@ -131,30 +116,10 @@ impl ProviderConfig {
             route_max_body: HashMap::new(),
             settle_multiple: 20,
             close_fee_payer: FeePayer::Payer,
-            route_close_fee_payer: FeePayer::Payee,
             rollover_grace: 36,
-            rollover_zero_conf_max: None,
-            settle_lock_multiple: 4,
-            route_wal: None,
             close_bump_max_fee: 10_000,
             close_min_feerate: 1.0,
             close_bump_blocks: 3,
-        }
-    }
-
-    /// The effective zero-conf rollover cap (AGP-053), whatever the locks.
-    pub fn zero_conf_max(&self) -> u64 {
-        self.rollover_zero_conf_max.unwrap_or_else(|| self.settle_multiple.saturating_mul(2).saturating_mul(self.close_fee))
-    }
-
-    /// The most a rollover child takes while unconfirmed when the largest lock its parent's line took
-    /// is `max_lock`: `rollover_zero_conf_max`, and by default (AGP-056) at least 2 ×
-    /// `settle_lock_multiple` × that lock, so a provider paid in locks larger than its settle
-    /// threshold is not capped below one lock.
-    pub fn zero_conf_max_for(&self, max_lock: u64) -> u64 {
-        match self.rollover_zero_conf_max {
-            Some(m) => m,
-            None => self.zero_conf_max().max(self.settle_lock_multiple.saturating_mul(2).saturating_mul(max_lock)),
         }
     }
 }
@@ -181,7 +146,6 @@ pub struct Provider {
     pub(crate) price: PriceFn,
     pub(crate) handler: Handler,
     charge: Option<ChargeFn>,
-    pub(crate) routes: crate::route_seller::RouteSeller,
     /// AGP-032: other schemes offered beside the channel binding (xbt-work).
     schemes: Vec<Arc<dyn crate::scheme::ProviderScheme>>,
     /// AGP-059: direct calls between their reservation and their settlement, per channel.
@@ -192,21 +156,15 @@ pub struct Provider {
     recovered: Vec<(String, u64)>,
 }
 
-/// A hub's ch1 holds a routed lock that its best state does not cover (AGP-064): the one in flight
-/// (`route_lock`), or one written off (`stale_locks`) above the best state, which the hub may still
-/// have to pay on its ch2. Closing ch1 now would close below it, and so would rolling it over: both
-/// spend its funding (AGP-078).
-fn locks_open(st: &ChannelState) -> bool {
-    truthy(st.extra.get("route_lock"))
-        || st.extra.get("stale_locks").and_then(Value::as_array).is_some_and(|s| {
-            s.iter().any(|x| py_u64(x.get("cum")).is_none_or(|c| c > st.best_cum))
-        })
+/// Seconds since the epoch.
+fn now_f() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
 }
 
 /// A close or rollover of this channel was signed and written ahead (`close_intent`, M8) and is not
 /// recorded as its close yet: the node answered the broadcast with an error, or we stopped before
 /// its answer. That transaction is complete and can still confirm, so the channel takes no state
-/// above it (AGP-084): no paid call, no routed lock. It ends when the node shows the spend
+/// above it (AGP-084): no paid call. It ends when the node shows the spend
 /// ([`Provider::adopt_intent`]), when the watcher gets a close through, or when the client rolls
 /// over or closes again.
 pub(crate) fn intent_open(st: &ChannelState) -> bool {
@@ -318,7 +276,7 @@ impl WatchHealth {
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         self.ticks.fetch_add(1, Relaxed);
         let mut last = lock(&self.last);
-        last.0 = crate::route::now_f();
+        last.0 = now_f();
         match r {
             Ok(r) => {
                 last.2 = false;
@@ -439,8 +397,6 @@ impl Provider {
             let ids: Vec<&str> = recovered.iter().map(|(c, _)| c.as_str()).collect();
             ledger.save(&ids)?;
         }
-        let routes = crate::route_seller::RouteSeller::new(&ledger, pay_to_secret, &cfg.network, cfg.settle_multiple,
-                                                           cfg.route_wal.as_deref());
         Ok(Self {
             pay_to: hex::encode(ecdsa::pubkey(&pay_to_secret)),
             cfg,
@@ -454,7 +410,6 @@ impl Provider {
             price,
             handler,
             charge: None,
-            routes,
             schemes: vec![],
             in_call: Mutex::new(HashMap::new()),
             watch_health: WatchHealth::default(),
@@ -485,11 +440,6 @@ impl Provider {
     /// calls that were in flight when the last process stopped. They were never charged.
     pub fn recovered_reservations(&self) -> &[(String, u64)] {
         &self.recovered
-    }
-
-    /// The ledger, locked (the hub's ch1 book and the routing endpoints work under it).
-    pub(crate) fn ledger_lock(&self) -> MutexGuard<'_, Ledger> {
-        lock(&self.ledger)
     }
 
     /// A snapshot of one channel's state.
@@ -558,14 +508,14 @@ impl Provider {
         req
     }
 
-    /// GET /x402/xbt-channel/terms: what a hub needs to open a hub-funded channel here.
+    /// GET /x402/xbt-channel/terms: this provider's channel terms without a price (a wallet reads
+    /// the payTo and the network from it before it funds a channel).
     pub fn terms(&self) -> Value {
         let mut req = self.requirements(0);
         let ex = &mut req["extra"];
         ex["settleMultiple"] = self.cfg.settle_multiple.into();
-        ex["closeFeePayer"] = self.cfg.route_close_fee_payer.as_str().into();
+        ex["closeFeePayer"] = self.cfg.close_fee_payer.as_str().into();
         ex["rolloverGraceBlocks"] = self.cfg.rollover_grace.into();
-        ex["routes"] = json!(self.routes.offer_paths());
         req
     }
 
@@ -680,12 +630,12 @@ impl Provider {
     /// whether it would open a channel on exactly these terms, before the payer funds it: every
     /// check that does not need the funding output, nothing recorded.
     pub fn open(&self, req: &Value) -> Result<Value> {
-        let (p, hub_req) = self.open_terms(req)?;
+        let p = self.open_terms(req)?;
         let c = field(req, "channel")?;
         if truthy(req.get("preflight")) {
             return self.open_preflight(p, c);
         }
-        self.open_funded(p, hub_req, c)
+        self.open_funded(p, c)
     }
 
     /// The preflight's checks past [`open_terms`](Self::open_terms): the capacity and the blocks to
@@ -710,7 +660,7 @@ impl Provider {
 
     /// The channel terms of an open request (no outpoint yet), checked: the network, the keys, the
     /// close-fee payer and the redeem script this provider would derive.
-    fn open_terms<'a>(&self, req: &'a Value) -> Result<(ChannelParams, Option<&'a Value>)> {
+    fn open_terms(&self, req: &Value) -> Result<ChannelParams> {
         if req.get("network").and_then(Value::as_str) != Some(self.cfg.network.as_str()) {
             return fail("wrong_network", format!("this provider is on {}", self.cfg.network));
         }
@@ -726,9 +676,7 @@ impl Provider {
             Some(v) => FeePayer::parse(v.as_str().unwrap_or(""))
                 .map_err(|_| ChannelError::new("bad_fee_payer", format!("closeFeePayer {v} not offered for this channel")))?,
         };
-        let hub_req = req.get("hub").filter(|h| truthy(Some(h)));
-        let offered = if hub_req.is_some() { self.cfg.route_close_fee_payer } else { self.cfg.close_fee_payer };
-        if fee_payer != FeePayer::Payer && fee_payer != offered {
+        if fee_payer != FeePayer::Payer && fee_payer != self.cfg.close_fee_payer {
             return fail("bad_fee_payer", format!("closeFeePayer {:?} not offered for this channel", fee_payer.as_str()));
         }
         let expiry = py_u64(c.get("expiry")).and_then(|e| u32::try_from(e).ok())
@@ -739,142 +687,33 @@ impl Provider {
         if redeem.to_ascii_lowercase() != hex::encode(p.script()) {
             return fail("bad_funding", "redeemScript does not match payTo/payerPub/expiry");
         }
-        Ok((p, hub_req))
+        Ok(p)
     }
 
-    fn open_funded(&self, mut p: ChannelParams, hub_req: Option<&Value>, c: &Value) -> Result<Value> {
+    fn open_funded(&self, mut p: ChannelParams, c: &Value) -> Result<Value> {
         let vout = py_u64(c.get("vout")).ok_or_else(|| ChannelError::new("bad_request", "vout"))?;
         let txid = field(c, "txid")?.as_str().ok_or_else(|| ChannelError::new("unknown_channel", "chan must be txid:vout"))?;
         let chan = canonical_chan(&format!("{txid}:{vout}"))?;
         let vout = u32::try_from(vout).map_err(|_| ChannelError::new("unknown_channel", "vout out of range"))?;
         let capacity = py_u64(c.get("capacity")).ok_or_else(|| ChannelError::new("bad_request", "capacity"))?;
         p = p.with_funding(chan.split(':').next().unwrap_or(""), vout, capacity)?;
-        let mut hub = String::new();
-        if let Some(h) = hub_req {
-            hub = h.get("payTo").map(|v| py_str(Some(v))).unwrap_or_default();
-            let hub_pub = hex::decode(&hub).map_err(|_| ChannelError::new("bad_request", "hub payTo is not hex"))?;
-            let sig = hexs(h.get("sig"))?;
-            if !ecdsa::verify(&hub_pub, &hub_channel_message(&p.channel_id()), &sig) {
-                return fail("bad_sig", "hub binding not signed by the hub's payTo");
-            }
-        }
         let cid = p.channel_id();
-        let (confs, zc) = {
+        let confs = {
             let mut l = lock(&self.ledger);
             if l.channels.contains_key(&cid) {
                 return fail("duplicate_channel", "");
             }
-            let (confs, zc) = match check_funding(self.chain.as_ref(), &p, &self.cfg.policy) {
-                Ok(c) => (c, None),
-                Err(e) if e.code == "unconfirmed" => match self.zero_conf_child(&l, &p, &hub)? {
-                    Some(zc) => {
-                        let pol = FundingPolicy { zero_conf_max: p.capacity, ..self.cfg.policy.clone() };
-                        (check_funding(self.chain.as_ref(), &p, &pol)?, Some(zc))
-                    }
-                    // AGP-057: not a child we take unconfirmed. A block that came while we looked makes
-                    // it neither: the funding read above had no confirmation yet, and the parent is now
-                    // spent in that block. Look at the funding once more (still unconfirmed: the same refusal)
-                    None if !hub.is_empty() => (check_funding(self.chain.as_ref(), &p, &self.cfg.policy)?, None),
-                    None => return Err(e),
-                },
-                Err(e) => return Err(e),
-            };
-            let mut st = ChannelState::new(p.clone());
-            if !hub.is_empty() {
-                st.extra.insert("hub".into(), hub.as_str().into());
-                // a rollover child carries its line's largest lock on (AGP-056: the next child's cap)
-                let big = l.channels.values()
-                    .filter(|s| s.extra.get("rollover_to").and_then(Value::as_str) == Some(cid.as_str())
-                            && s.extra.get("hub").and_then(Value::as_str) == Some(hub.as_str()))
-                    .map(|s| py_u64(s.extra.get("max_lock")).unwrap_or(0)).max().unwrap_or(0);
-                if big > 0 {
-                    st.extra.insert("max_lock".into(), big.into());
-                }
-            }
-            if let Some(zc) = &zc {
-                st.extra.insert("zero_conf".into(), zc.clone());
-            }
-            l.channels.insert(cid.clone(), st);
+            let confs = check_funding(self.chain.as_ref(), &p, &self.cfg.policy)?;
+            l.channels.insert(cid.clone(), ChannelState::new(p.clone()));
             l.save(&[&cid])?;
-            (confs, zc)
+            confs
         };
         let mut out = json!({"chan": cid, "expiry": p.expiry, "maxCum": p.max_amount().to_string(), "confirmations": confs});
         if p.close_fee_payer != FeePayer::Payer {
             out["closeFeePayer"] = p.close_fee_payer.as_str().into();
             out["minCum"] = p.min_amount().to_string().into();
         }
-        if let Some(zc) = zc {
-            out["zeroConf"] = json!({"parent": zc["parent"], "maxCum": py_u64(zc.get("maxCum")).unwrap_or(0).to_string(), "until": zc["until"]});
-        }
         Ok(out)
-    }
-
-    /// AGP-053: the unconfirmed channel `p` is the rollover child of one of our hub-bound channels (the
-    /// tx we co-signed and broadcast, `rollover_to`), bound to the same hub, whose own funding is
-    /// confirmed (conf_for) and which is before its close margin: take it now, bounded (`zero_conf` on
-    /// the child). Before the parent's expiry only this provider can sign a spend of the parent other
-    /// than that rollover, so the child exists unless we replace it ourselves, or the rollover is still
-    /// unconfirmed at the parent's expiry (the payer's refund): locks are taken until `until` only.
-    fn zero_conf_child(&self, l: &Ledger, p: &ChannelParams, hub: &str) -> Result<Option<Value>> {
-        let cap = self.cfg.zero_conf_max();
-        if hub.is_empty() || cap == 0 {
-            return Ok(None);
-        }
-        let cid = p.channel_id();
-        let parent = l.channels.values().find(|s| {
-            s.extra.get("rollover_to").and_then(Value::as_str) == Some(cid.as_str()) && s.extra.get("hub").and_then(Value::as_str) == Some(hub)
-        });
-        let Some(parent) = parent else { return Ok(None) };
-        let pp = &parent.params;
-        let need = self.cfg.policy.conf_for(pp.capacity);
-        let until = pp.expiry.saturating_sub(self.cfg.close_margin);
-        if self.height()? >= until || !self.confirmed(&pp.funding_txid(), pp.funding_vout(), need)? {
-            return Ok(None);
-        }
-        if self.chain.get_tx_out(&p.funding_txid(), p.funding_vout(), true)?.is_none() {
-            return Ok(None);
-        }
-        let cap = self.cfg.zero_conf_max_for(py_u64(parent.extra.get("max_lock")).unwrap_or(0));
-        Ok(Some(json!({"parent": pp.channel_id(), "need": need, "maxCum": cap, "until": until, "confirmed": false})))
-    }
-
-    /// The output is in a block with `need` confirmations (spent in the mempool or not).
-    fn confirmed(&self, txid: &str, vout: u32, need: u32) -> Result<bool> {
-        Ok(self.chain.get_tx_out(txid, vout, false)?.is_some_and(|u| u.confirmations >= need))
-    }
-
-    /// An unconfirmed rollover child (AGP-053) is served while it is in the mempool, its parent still
-    /// has its confirmations (a reorg of the parent ends it), and before the parent's margin.
-    fn zero_conf_ok(&self, st: &ChannelState, h: u32) -> Result<bool> {
-        let Some(zc) = st.extra.get("zero_conf").filter(|z| z.is_object()) else { return Ok(false) };
-        if h as u64 >= py_u64(zc.get("until")).unwrap_or(0) {
-            return Ok(false);
-        }
-        let p = &st.params;
-        if self.chain.get_tx_out(&p.funding_txid(), p.funding_vout(), true)?.is_none() {
-            return Ok(false);
-        }
-        let parent = zc.get("parent").and_then(Value::as_str).unwrap_or("");
-        let Some((ptxid, pvout)) = parent.split_once(':') else { return Ok(false) };
-        let need = py_u64(zc.get("need")).unwrap_or(1) as u32;
-        self.confirmed(ptxid, pvout.parse().unwrap_or(u32::MAX), need)
-    }
-
-    /// Not an unconfirmed rollover child (AGP-053): a plain channel, or a child that confirmed (as the
-    /// watcher last saw it, or `live` from the node now, recorded in `st`).
-    pub(crate) fn zc_confirmed(&self, st: &mut ChannelState, live: bool) -> Result<bool> {
-        let Some(zc) = st.extra.get("zero_conf").filter(|z| z.is_object()).cloned() else { return Ok(true) };
-        if truthy(zc.get("confirmed")) {
-            return Ok(true);
-        }
-        let p = &st.params;
-        if live && self.confirmed(&p.funding_txid(), p.funding_vout(), self.cfg.policy.conf_for(p.capacity))? {
-            let mut z = zc;
-            z["confirmed"] = true.into();
-            st.extra.insert("zero_conf".into(), z);
-            return Ok(true);
-        }
-        Ok(false)
     }
 
     /// This provider's settlement policy: the net payout is at least settle_multiple × closeFee,
@@ -906,11 +745,6 @@ impl Provider {
         }
         let mut l = lock(&self.ledger);
         let mut st = l.channels[&cid].clone();
-        // AGP-064 (H1): route() writes its lock and lets go of the ledger before it forwards, so a
-        // close here could otherwise land between the two
-        if st.closed_txid.is_empty() && locks_open(&st) {
-            return fail("lock_pending", "a routed lock is open on this channel");
-        }
         // AGP-084: an earlier spend the node has after all is this channel's close, before a new
         // close replaces its intent
         if let Err(e) = self.adopt_intent(&mut l, &mut st) {
@@ -941,21 +775,14 @@ impl Provider {
     /// and `payeeFee`/`payeeNet` under payee-pays).
     ///
     /// Refused, with nothing changed: `unknown_channel`; `channel_closed` (already closed or rolled
-    /// over); `lock_pending` (a routed lock is open on it); `hub_channel` (a hub-funded ch2: its hub
-    /// rolls it over or closes it, and the margin close still protects it); `call_in_flight` (a paid
-    /// call is being served: the best state does not cover it yet); `no_state` (nothing signed).
+    /// over); `call_in_flight` (a paid call is being served: the best state does not cover it yet);
+    /// `no_state` (nothing signed).
     pub fn close_channel(&self, chan: &str) -> Result<Value> {
         let cid = canonical_chan(chan)?;
         let mut l = lock(&self.ledger);
         let mut st = l.channels.get(&cid).cloned().ok_or_else(|| ChannelError::code("unknown_channel"))?;
         if !st.closed_txid.is_empty() {
             return fail("channel_closed", format!("closed by {}", st.closed_txid));
-        }
-        if locks_open(&st) {
-            return fail("lock_pending", "a routed lock is open on this channel");
-        }
-        if st.extra.get("hub").is_some_and(|h| truthy(Some(h))) {
-            return fail("hub_channel", "a hub-funded channel is rolled over or closed by its hub");
         }
         if lock(&self.in_call).get(&cid).copied().unwrap_or(0) > 0 {
             return fail("call_in_flight", "a paid call is being served on this channel");
@@ -1319,7 +1146,7 @@ impl Provider {
         // AGP-084: a close the node answered with an error is sent again every tick. The channel
         // takes no state until then, so it is the same close. Never a rollover: its client was
         // told it failed and may no longer hold the next channel's key
-        if intent_open(st) && !truthy(st.extra.get("close_intent").and_then(|i| i.get("next"))) && !locks_open(st) {
+        if intent_open(st) && !truthy(st.extra.get("close_intent").and_then(|i| i.get("next"))) {
             out.push(self.close_locked(l, st)?);
             if truthy(st.extra.get("cond_close")) {
                 self.claim(st)?;
@@ -1328,21 +1155,7 @@ impl Provider {
         }
         let utxo = self.chain.get_tx_out(&p.funding_txid(), p.funding_vout(), false)?;
         st.suspended = utxo.map(|u| u.confirmations < self.cfg.policy.conf_for(p.capacity)).unwrap_or(true);
-        if let Some(mut zc) = st.extra.get("zero_conf").filter(|z| z.is_object()).cloned() {
-            // AGP-053: confirmed (again, after a reorg) or not; unconfirmed, it is served under its rules
-            zc["confirmed"] = (!st.suspended).into();
-            st.extra.insert("zero_conf".into(), zc);
-            if st.suspended && self.zero_conf_ok(st, h)? {
-                st.suspended = false;
-            }
-        }
         if (!st.best_sig.is_empty() || !st.cond_sig.is_empty()) && h as i64 >= p.expiry as i64 - self.cfg.close_margin as i64 {
-            // AGP-064: a lock in flight (seconds: the hub's revealTimeout) is let finish, in the first
-            // half of the margin only. Never for a written-off lock: a skipped margin close lets the
-            // payer refund the whole channel at expiry.
-            if truthy(st.extra.get("route_lock")) && (h as i64) < p.expiry as i64 - (self.cfg.close_margin as i64 + 1) / 2 {
-                return Ok(());
-            }
             out.push(self.close_locked(l, st)?);
             if truthy(st.extra.get("cond_close")) {
                 self.claim(st)?;
@@ -1357,7 +1170,7 @@ impl Provider {
     /// Returns the txids of closes made this tick.
     ///
     /// AGP-094: a panic under it is this tick's error (`watcher_panic`), not the end of the
-    /// caller's loop: every watcher (the provider binaries' loops, the hub's tick) calls this, so
+    /// caller's loop: every watcher (the provider binaries' loops, another scheme's tick) calls this, so
     /// the catch is here. [`Self::watch_health`] counts it.
     pub fn close_due(&self) -> Result<Vec<String>> {
         match self.watch_health.run(|| self.close_due_tick()) {
@@ -1577,20 +1390,9 @@ impl Provider {
     }
 
     /// POST /x402/xbt-channel/rollover: co-sign and broadcast the payer's rollover, one tx that
-    /// pays this provider `amount` (at least its best state) and funds the next channel. Refused
-    /// `lock_pending`, as a close is, while a routed lock is open on the channel, whatever `amount`.
+    /// pays this provider `amount` (at least its best state) and funds the next channel.
     pub fn rollover(&self, req: &Value) -> Result<Value> {
         let cid = self.channel_id_of(Some(field(req, "chan")?))?;
-        {
-            let mut l = lock(&self.ledger);
-            let mut st = l.channels[&cid].clone();
-            if !self.zc_confirmed(&mut st, true)? {
-                return fail("unconfirmed", "the channel's funding (a rollover) is not confirmed yet");
-            }
-            if st.extra != l.channels[&cid].extra {
-                self.save_state(&mut l, &st)?;
-            }
-        }
         let p = lock(&self.ledger).channels[&cid].params.clone();
         let amount = py_u64(req.get("amount")).ok_or_else(|| ChannelError::new("bad_request", "amount"))?;
         let nxt = field(req, "next")?;
@@ -1633,11 +1435,6 @@ impl Provider {
         }
         if !st.closed_txid.is_empty() {
             return fail("channel_closing", "already settled");
-        }
-        // AGP-078 (H1, H2): a rollover spends the funding as a close does. Checked here, under the
-        // ledger lock that is held until the rollover is sent: route() writes its lock under it too
-        if locks_open(&st) {
-            return fail("lock_pending", "a routed lock is open on this channel");
         }
         if amount < st.best_cum {
             return fail("bad_amount", format!("a rollover pays at least the best state {}", st.best_cum));
@@ -1700,12 +1497,6 @@ impl Provider {
             };
         }
         let bind = binding_url(url, path);
-        if path == LOCK_PATH {
-            if method != "POST" {
-                return HttpResponse::text(405, "method not allowed");
-            }
-            return self.route_lock(method, &bind, headers, body);
-        }
         if path == TERMS_PATH && method == "GET" {
             return HttpResponse::json(200, &self.terms());
         }
@@ -1730,14 +1521,6 @@ impl Provider {
         }
         let url = if url.is_empty() { path } else { url };
         let hdr = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("PAYMENT-SIGNATURE")).map(|(_, v)| v.clone());
-        let hval = |name: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str()).filter(|v| !v.is_empty());
-        let routed = self.routes.has_offer(pk);
-        if routed && !hdr.as_deref().is_some_and(|h| !h.is_empty()) {
-            if let Some(ra) = hval("ROUTE-AUTH") {
-                return self.routed_call(method, path, pk, ra, body, url);
-            }
-            return self.route_offer_402(method, path, pk, hval("ROUTE-CLIENT").unwrap_or(""), url);
-        }
         let price = (self.price)(method, path);
         let Some(hdr) = hdr else {
             let cond = lock(&self.cond);

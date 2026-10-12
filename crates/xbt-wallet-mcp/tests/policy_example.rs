@@ -6,5 +6,4 @@ fn example_policy_parses_in_the_signer() {
     assert_eq!(p.daily_budget_sats, 200_000);
     assert_eq!(p.human_threshold_sats, 150_000);
     assert!(p.anchor_required);
-    assert!(p.routing.get("hubs").is_some_and(|h| h.is_object()));
 }

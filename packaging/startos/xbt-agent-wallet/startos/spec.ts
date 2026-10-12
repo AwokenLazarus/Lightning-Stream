@@ -8,10 +8,10 @@
  * so the `init` oneshot (xbt-init, as root) gives each component's sub-dir to its uid first. Every daemon
  * then runs as its image's own non-root user and mounts only its sub-dir and the socket dirs it needs.
  */
-export const PORTS = { ui: 8480, mcp: 33510, hub: 9480 } as const
+export const PORTS = { ui: 8480, mcp: 33510 } as const
 
-export type ImageKey = 'init' | 'signer' | 'witness' | 'mcp' | 'ui' | 'hub'
-export type DaemonId = 'init' | 'witness' | 'signer' | 'mcp' | 'ui' | 'hub'
+export type ImageKey = 'init' | 'signer' | 'witness' | 'mcp' | 'ui'
+export type DaemonId = 'init' | 'witness' | 'signer' | 'mcp' | 'ui'
 
 export type MountSpec = { subpath: string | null; mountpoint: string; readonly: boolean }
 
@@ -40,7 +40,6 @@ export type NodeConfig = {
 
 export type Config = {
   node: NodeConfig
-  hubEnabled: boolean
   /** shown on the UI's Agents page: the MCP interface's addresses */
   mcpUrls: string[]
 }
@@ -52,7 +51,6 @@ export const IMAGES: Record<ImageKey, string> = {
   witness: 'xbt-anchor-witness:0.1.0',
   mcp: 'xbt-wallet-mcp:0.1.0',
   ui: 'xbt-wallet-ui:0.1.0',
-  hub: 'xbt402-hub:0.1.0',
 }
 
 const vol = (subpath: string | null, mountpoint: string, readonly = false): MountSpec => ({ subpath, mountpoint, readonly })
@@ -63,8 +61,8 @@ export function services(cfg: Config): ServiceSpec[] {
     XBT_NODE_RPC_PORT: String(cfg.node.port),
     XBT_CHAIN: cfg.node.chain,
   }
-  const components = ['signer', 'witness', 'mcp', 'ui', ...(cfg.hubEnabled ? ['hub'] : [])]
-  const out: ServiceSpec[] = [
+  const components = ['signer', 'witness', 'mcp', 'ui']
+  return [
     {
       id: 'init',
       image: 'init',
@@ -114,7 +112,6 @@ export function services(cfg: Config): ServiceSpec[] {
         XBT_UI_BIND: `0.0.0.0:${PORTS.ui}`,
         XBT_UI_SIGNER_SOCK: '/data/run/signer/signer.sock',
         XBT_UI_MCP_URL: cfg.mcpUrls.join(','),
-        ...(cfg.hubEnabled ? { XBT_UI_HUB_URL: `http://127.0.0.1:${PORTS.hub}` } : {}),
       },
       // the UI owns the MCP token and rotates it on its Agents page (AGP-042)
       mounts: [vol('ui', '/data/ui'), vol('run/signer', '/data/run/signer', true), vol('run/ui', '/data/run/ui')],
@@ -122,17 +119,4 @@ export function services(cfg: Config): ServiceSpec[] {
       port: PORTS.ui,
     },
   ]
-  if (cfg.hubEnabled) {
-    out.push({
-      id: 'hub',
-      image: 'hub',
-      command: ['/usr/bin/xbt402-hub'],
-      // the 402's resource.url follows the address the client used (LAN, .local, onion)
-      env: { ...node, XBT_HUB_BIND: '0.0.0.0', XBT_HUB_PORT: String(PORTS.hub), XBT_TRUST_FORWARDED: '1' },
-      mounts: [vol('hub', '/data/hub')],
-      requires: ['init'],
-      port: PORTS.hub,
-    })
-  }
-  return out
 }

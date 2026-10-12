@@ -29,7 +29,7 @@ fn hot_key_channel_keys_and_coins_are_sealed_at_rest() {
         assert!(!text.contains("\"secret\""), "{f} names no plaintext secret");
     }
     // nothing the signer returns carries key material
-    for m in ["balance", "channels", "hot_address", "signatures", "routing_status", "anchor_status"] {
+    for m in ["balance", "channels", "hot_address", "signatures", "anchor_status"] {
         assert!(xbt_signer::sanitize::assert_no_key_material(&rig.call(m, json!({}))).is_ok(), "{m}");
     }
     assert!(xbt_signer::sanitize::assert_no_key_material(&r).is_ok());

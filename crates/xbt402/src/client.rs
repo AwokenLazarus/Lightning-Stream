@@ -39,8 +39,7 @@ pub trait Transport: Send + Sync {
     fn request(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)]) -> Result<HttpResponse>;
 
     /// [`request`](Self::request), given up with an error when no whole answer came `within` that
-    /// long (AGP-105: the hub's check of a lock is bounded by its `revealTimeoutSec`, not by the
-    /// transport's own timeout). The default has no bound but the transport's own, so a caller
+    /// long, for a caller whose wait has its own bound (AGP-105). The default has no bound but the transport's own, so a caller
     /// that needs the bound also measures the time; `http::UreqTransport` keeps it.
     fn request_within(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)], _within: std::time::Duration) -> Result<HttpResponse> {
         self.request(method, url, body, headers)
@@ -59,8 +58,8 @@ pub trait Wallet: Send + Sync {
         self.fund(address, sats)
     }
 
-    /// Txids of the sends this wallet made to `address` (`listtransactions`): how a hub finds a
-    /// funding whose `fund` call failed after it broadcast (AGP-045). Default: none known.
+    /// Txids of the sends this wallet made to `address` (`listtransactions`): how a funding whose
+    /// `fund` call failed after it broadcast is found again (AGP-045). Default: none known.
     fn wallet_sends_to(&self, _address: &str) -> Result<Vec<String>> {
         Ok(vec![])
     }
@@ -71,28 +70,6 @@ pub trait Wallet: Send + Sync {
         Ok(None)
     }
 
-    /// Whether "none known" from this wallet means it sent nothing (AGP-105, fourth audit item 6).
-    /// True for a wallet that lists its sends ([`wallet_sends_to`](Self::wallet_sends_to): `Rpc`)
-    /// or whose signer keeps the record ([`RouteSigner::funded`](crate::signer::RouteSigner::funded):
-    /// the signer's own wallet). False, the default, is "cannot say": after a `fund` call that
-    /// did not return an outpoint, [`RoutePayer`](crate::route_client::RoutePayer) funds nothing
-    /// more through such a wallet until its owner has looked.
-    fn knows_its_sends(&self) -> bool {
-        false
-    }
-
-    /// Can this wallet fund now? Asked before a hub writes a ch2's record (AGP-104): a wallet that
-    /// knows it cannot (its node has no fee estimate and no rate is set) says why here, and
-    /// nothing is written or sent. Default: yes.
-    fn preflight(&self) -> Result<()> {
-        Ok(())
-    }
-
-    /// What this wallet paid a miner for its send `txid`, in sats (`gettransaction`'s fee): a hub
-    /// counts it among what the chain cost (AGP-104). Default: not known.
-    fn send_fee(&self, _txid: &str) -> Result<Option<u64>> {
-        Ok(None)
-    }
 }
 
 /// A send the wallet knows (AGP-045): its output to the address and whether it can still confirm.
@@ -424,7 +401,7 @@ impl ClientLedger for MemoryClientLedger {
 /// A [`ClientLedger`] file: JSON lines `{"k": key, "v": record}`, appended and fsynced per save,
 /// replayed and compacted on open (like the provider's [`Ledger`](crate::ledger::Ledger)), and
 /// compacted again (a fsynced rewrite, then an atomic rename) once the appended lines outgrow the
-/// live records (AGP-044: a [`RoutePayer`](crate::route_client::RoutePayer) saves its meters per
+/// live records (AGP-044: a payer may save its meters per
 /// call). Created mode 0600 on Unix: records of channels whose keys this client holds carry the
 /// payer secret. Locked like the provider's ledger (review C5): a second opener of the same file
 /// gets `ledger_locked`.

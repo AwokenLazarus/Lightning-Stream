@@ -1,4 +1,4 @@
-# The Lightning Fork regtest lab, as scripts/ln_rail_regtest.sh and scripts/hub_ln_link_regtest.sh use
+# The Lightning Fork regtest lab, as scripts/ln_rail_regtest.sh uses
 # it (sourced; needs ROOT, and COMPOSE_PROJECT_NAME / COMPOSE_FILE set by the caller for the image
 # build). Lab: paulscode/lightning-fork-lab a5cadc5 (Knots v29.4.1 BLAKE2b regtest); Lightning Fork
 # cebc10fe, v0.21.3-beta-blake2b.17. Both are cloned under run/ (ignored) and never changed. The node

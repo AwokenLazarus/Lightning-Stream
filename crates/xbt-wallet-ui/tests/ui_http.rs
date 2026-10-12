@@ -4,7 +4,7 @@
 //! Auth (first run, login, throttle, sessions, logout), CSRF, the security headers, proxy base paths,
 //! and every action: approve (xbt402 grant and pay), deny, the policy editor (the signer's errors, a
 //! signed change applied live, JSON mode), human-key enrolment and rotation, sweep, rotation, backup,
-//! anchor, close and refund, the pages, the hub probe, and an over-threshold `xbt402_pay` through the
+//! anchor, close and refund, the pages, and an over-threshold `xbt402_pay` through the
 //! MCP that waits, is approved in the UI and is paid.
 #[path = "../../xbt-signer/tests/common/mod.rs"]
 mod common;
@@ -224,7 +224,7 @@ fn a_platform_password_sessions_expire_and_csrf_is_required() {
         assert!(page.headers.get(k).is_some_and(|v| v.contains(want)), "{k}: {:?}", page.headers.get(k));
     }
     // no absolute URLs and nothing from elsewhere
-    for p in ["/", "/approvals", "/policy", "/channels", "/signatures", "/keys", "/hub", "/setup"] {
+    for p in ["/", "/approvals", "/policy", "/channels", "/signatures", "/keys", "/setup"] {
         let html = br.get(p).body;
         for bad in ["href=\"/", "src=\"/", "action=\"/", "http://", "https://"] {
             if bad.starts_with("http") {
@@ -426,9 +426,6 @@ fn the_policy_editor_shows_the_signer_s_errors_and_applies_a_signed_change_live(
     // a valid change: preview (diff + the exact text), sign what is shown, apply
     let mut good = form.clone();
     good.iter_mut().find(|(k, _)| k == "f_human_threshold_sats").unwrap().1 = "5000".into();
-    good.push(("f_hubs".into(), "http://127.0.0.1:33899 5000 1000".into()));
-    good.push(("f_route_max_lock_sats".into(), "2000".into()));
-    good.push(("f_route_daily_budget_sats".into(), "3000".into()));
     let prev = post(&mut br, &good).body;
     assert!(prev.contains("<code>human_threshold_sats</code>") && prev.contains("Sign and apply"), "{prev}");
     let text = field(&prev, "text");
@@ -442,7 +439,6 @@ fn the_policy_editor_shows_the_signer_s_errors_and_applies_a_signed_change_live(
     let r = br.post("/policy-apply", &[("csrf", &csrf), ("text", &text), ("prev_sha256", &sha), ("expiry", &exp), ("signature", &sig(&m))]);
     assert_eq!(br.flash_after(&r), "Policy applied; it is in force now.");
     assert_eq!(bx.rig.s.config().human_threshold_sats, 5000);
-    assert_eq!(bx.rig.call("routing_status", json!({}))["policy"]["enabled"], true, "routing is live too");
     // JSON mode, with a restart-only key
     let cur = bx.rig.call("policy_get", json!({}));
     let mut p = cur["policy"].clone();
@@ -557,24 +553,6 @@ fn mock_http(answer: fn(&str) -> (u16, &'static str)) -> std::net::SocketAddr {
 }
 
 #[test]
-fn the_hub_page_probes_this_box_s_hub() {
-    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
-    let hub_addr = mock_http(|path| match path {
-        "/healthz" => (200, "{\"ok\":true,\"role\":\"hub\"}"),
-        "/readyz" => (200, "{\"ok\":true,\"wallet\":{\"name\":\"hub\",\"loaded\":true,\"receive_address\":\"bcrt1qhubrecv\",\"balance_sats\":0},\"tor\":\"http://hubtest.onion\"}"),
-        _ => (404, "no"),
-    });
-    let bx = start(json!({"routing": {"hubs": {PROVIDER: {"max_fee_ppm": 5000, "max_fee_base_msat": 2000}}, "max_lock_sats": 2000,
-                                      "daily_budget_sats": 3000}}), false, |c| c.hub_url = Some(format!("http://{hub_addr}")));
-    let mut br = logged_in(&bx);
-    let page = br.get("/hub").body;
-    assert!(page.contains("<span class=\"tag ok\">on</span>") && page.contains("5000 ppm"), "{page}");
-    assert!(page.contains("&quot;role&quot;:&quot;hub&quot;"), "the hub's /healthz is shown");
-    assert!(page.contains("id=\"hub-receive\">bcrt1qhubrecv") && page.contains("id=\"hub-tor\">http://hubtest.onion"), "{page}");
-    assert!(!page.contains("XBT Compute"), "no cmp tile unless configured");
-}
-
-#[test]
 fn the_agents_page_shows_the_mcp_endpoint_and_token_only_after_login() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let tdir = tempfile::tempdir().unwrap();
@@ -647,17 +625,15 @@ fn regex_token(page: &str) -> String {
 #[test]
 fn xbt_compute_status_tile_and_link_when_configured() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
-    let cmp_addr = mock_http(|_| (200, "{\"ok\":true,\"role\":\"node-host\",\"node_sync_pct\":99.7,\"services\":{\"hub\":\"up\"}}"));
+    let cmp_addr = mock_http(|_| (200, "{\"ok\":true,\"role\":\"node-host\",\"node_sync_pct\":99.7}"));
     let bx = start(json!({}), false, |c| {
         c.cmp_status_url = Some(format!("http://{cmp_addr}/readyz"));
         c.cmp_url = Some("http://umbrel.local:3900/".into());
     });
     let mut br = logged_in(&bx);
-    for p in ["/", "/hub"] {
-        let page = br.get(p).body;
-        assert!(page.contains("id=\"cmp-status\"") && page.contains(">up</span>") && page.contains("node_sync_pct") && page.contains("99.7"), "{p}: {page}");
-        assert!(page.contains("href=\"http://umbrel.local:3900/\" target=\"_blank\" rel=\"noopener noreferrer\""));
-    }
+    let page = br.get("/").body;
+    assert!(page.contains("id=\"cmp-status\"") && page.contains(">up</span>") && page.contains("node_sync_pct") && page.contains("99.7"), "{page}");
+    assert!(page.contains("href=\"http://umbrel.local:3900/\" target=\"_blank\" rel=\"noopener noreferrer\""));
     drop(bx);
     let bx = start(json!({}), false, |c| c.cmp_status_url = Some("http://127.0.0.1:1/readyz".into()));
     let mut br = logged_in(&bx);

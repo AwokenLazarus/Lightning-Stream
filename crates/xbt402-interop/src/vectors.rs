@@ -43,10 +43,6 @@ pub fn payer_secret(i: u32) -> SecretKey {
     test_secret(format!("xbt402 test vector: payer secret {i}").as_bytes())
 }
 
-pub fn hub_secret() -> SecretKey {
-    test_secret(b"xbt402 test vector: hub payTo secret")
-}
-
 pub fn cond_k() -> [u8; 32] {
     sha256(b"xbt402 test vector: conditional k")
 }
@@ -187,7 +183,12 @@ pub fn gen_states() -> Value {
 }
 
 fn provider(node: Arc<StubNode>, handler_body: &'static [u8], ctype: bool) -> Provider {
-    let cfg = ProviderConfig::new(NETWORK);
+    provider_with(node, handler_body, ctype, FeePayer::Payer)
+}
+
+fn provider_with(node: Arc<StubNode>, handler_body: &'static [u8], ctype: bool, close_fee_payer: FeePayer) -> Provider {
+    let mut cfg = ProviderConfig::new(NETWORK);
+    cfg.close_fee_payer = close_fee_payer;
     Provider::new(node, payto_secret(), cfg, Ledger::in_memory(), Box::new(|_, _| PRICE),
                   Box::new(move |_, _, _| {
                       let h = if ctype { vec![("Content-Type".to_string(), "application/json".to_string())] } else { vec![] };
@@ -389,11 +390,10 @@ pub fn gen_payee_pays() -> Value {
     let v11 = Payer::new(params(&a, EXPIRY, CAPACITY, 0, FeePayer::Payer), a).expect("payer").sign_state(150_000).expect("sig");
     let sign21 = |d: [u8; 32]| { let mut s = ecdsa::sign(&a, &d); s.push(SIGHASH_ALL_UNIFIED); hex::encode(s) };
     let node = Arc::new(StubNode::new(p.clone(), TIP));
-    let prov = provider(node.clone(), b"{}", false);
+    let prov = provider_with(node.clone(), b"{}", false, FeePayer::Payee);
     let terms = prov.terms();
     let mut req = open_request(&p);
     req["channel"]["closeFeePayer"] = "payee".into();
-    req["hub"] = json!({"payTo": pubhex(&hub_secret()), "sig": hex::encode(ecdsa::sign(&hub_secret(), &hub_channel_message(&p.channel_id())))});
     let open_url = terms["extra"]["openUrl"].as_str().unwrap_or("").to_string();
     let r = prov.serve("POST", &open_url, &[], xbt402::json::dumps(&req).as_bytes(), "", None);
     let close_section = payee_pays_close(&prov, &node, &p, &a);

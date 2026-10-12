@@ -1,8 +1,8 @@
 #!/bin/bash
 # AGP-040: every check result.md reports. Soak rules (CPUQuota 200%, MemoryMax 4G, nice 19, cargo -j2).
-#   1. xbt-svc (layout, xbt-init) + xbt-wallet-ui (the Agents page) suites, the hub's env-number test
+#   1. xbt-svc (layout, xbt-init) + xbt-wallet-ui (the Agents page) suites
 #   2. the whole workspace
-#   3. clippy: no warning in xbt-svc, xbt-wallet-ui or xbt402-hub.rs
+#   3. clippy: no warning in xbt-svc or xbt-wallet-ui
 #   4. the six images for amd64, arm64, arm/v7 (scripts/oci_build.sh --load; oci_inspect)
 #   5. AGP-038's container test on the new images (the base layer changed: the UI's user and data dir)
 #   6. the Umbrel apps: lint + two cold regtest installs (packaging/umbrel/test-umbrel-apps.sh, ports 24000-24099)
@@ -16,16 +16,14 @@ if [ -z "${VERIFY_SCOPED:-}" ] && command -v systemd-run >/dev/null; then
 fi
 cd "$(dirname "$0")/.."
 step() { echo; echo "== $*"; }
-step "1. xbt-svc + xbt-wallet-ui suites, xbt402-hub env numbers"
+step "1. xbt-svc + xbt-wallet-ui suites"
 cargo test -q -j2 -p xbt-svc -p xbt-wallet-ui 2>&1 | grep -E "test result|FAILED|panicked" | grep -v " 0 passed"
-cargo test -q -j2 -p xbt402 --features rpc,http-client,http-server,ln-wallet --bin xbt402-hub 2>&1 | grep -E "test result|FAILED|panicked"
 step "2. workspace"
 cargo test -q -j2 --workspace 2>&1 | grep -E "test result|FAILED" | awk '{p+=$4; f+=$6} END {print "workspace: " p " passed, " f " failed"; exit f>0}'
-step "3. clippy (xbt-svc, xbt-wallet-ui, xbt402-hub.rs)"
+step "3. clippy (xbt-svc, xbt-wallet-ui)"
 # (warnings elsewhere in the workspace predate AGP-040)
 n=$(cargo clippy -q -j2 -p xbt-svc -p xbt-wallet-ui --all-targets 2>&1 | grep -cE "^ *--> crates/(xbt-svc|xbt-wallet-ui)/" || true)
-m=$(cargo clippy -q -j2 -p xbt402 --features rpc,http-client,http-server,ln-wallet --bin xbt402-hub 2>&1 | grep -cE "^ *--> crates/xbt402/src/bin/xbt402-hub.rs" || true)
-echo "clippy warnings: xbt-svc + xbt-wallet-ui $n, xbt402-hub.rs $m"; [ "$n" = 0 ] && [ "$m" = 0 ]
+echo "clippy warnings: xbt-svc + xbt-wallet-ui $n"; [ "$n" = 0 ]
 step "4. images (6 x 3 platforms)"
 mkdir -p run/verify-agp040
 scripts/oci_build.sh --load >run/verify-agp040/oci_build.log 2>&1

@@ -228,7 +228,7 @@ sigs = ui.get("/signatures")
 check("the UI shows the signature log intact and anchored", "chain intact, matches the anchor" in sigs and "human:approval_signature" in sigs)
 ov = ui.get("/")
 check("the overview renders with the real node", "Recent activity" in ov and "regtest" in ov)
-for p in ["approvals", "channels", "signatures", "keys", "policy", "hub", "setup"]:
+for p in ["approvals", "channels", "signatures", "keys", "policy", "setup"]:
     open(f"{a.out}/{p}.html", "w").write(ui.get("/" + p))
 open(f"{a.out}/overview.html", "w").write(ov)
 

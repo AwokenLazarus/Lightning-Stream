@@ -10,7 +10,7 @@
 //!   and `run/anchor/` (0750), owned by each component's uid (the same uid as its group);
 //! * when a component dir had another owner (a fresh bind mount, or a box that ran everything as 1000),
 //!   gives it and everything under it to the component. It never follows a symlink (`lchown`, no descent);
-//! * provisions the secrets a box's installer holds: `node-rpc-auth` into `signer/` and `hub/`, the UI
+//! * provisions the secrets a box's installer holds: `node-rpc-auth` into `signer/`, the UI
 //!   password into `ui/`, and the MCP bearer token, generated once. With the UI (a box), the token is
 //!   `run/ui/mcp-http-token`: owned by the UI (uid 10005), 0640, in `run/ui/` (0750), and the MCP reads it
 //!   through the `xbt-wallet-ui` group. Only the UI can replace it (the Agents page rotates it); the MCP
@@ -31,12 +31,12 @@ pub struct Component {
     pub uid: u32,
 }
 
-/// agentpay's components (the cmp rows of the table are cmp's to create).
+/// agentpay's components (the cmp rows of the table are cmp's to create). uid 10004 was the
+/// retired hub's and is not given to another component.
 pub const COMPONENTS: &[Component] = &[
     Component { name: crate::SIGNER, user: "xbt-signer", uid: 10001 },
     Component { name: crate::WITNESS, user: "xbt-anchor-witness", uid: 10002 },
     Component { name: crate::MCP, user: "xbt-wallet-mcp", uid: 10003 },
-    Component { name: crate::HUB, user: "xbt402-hub", uid: 10004 },
     Component { name: crate::UI, user: "xbt-wallet-ui", uid: 10005 },
     Component { name: crate::RELAY, user: "xbt-work-relay", uid: 10006 },
 ];
@@ -297,10 +297,8 @@ fn init_with(root: &Path, names: &[String], prov: &Provision, uid_of: &dyn Fn(&C
         Ok(())
     };
     if let Some(a) = &prov.node_rpc_auth {
-        for comp in [crate::SIGNER, crate::HUB] {
-            if has(comp) {
-                put(comp, "node-rpc-auth", a.as_bytes())?;
-            }
+        if has(crate::SIGNER) {
+            put(crate::SIGNER, "node-rpc-auth", a.as_bytes())?;
         }
     }
     if has(crate::UI) {
@@ -386,7 +384,7 @@ mod tests {
     #[test]
     fn table_matches_container_md() {
         let t: Vec<_> = COMPONENTS.iter().map(|c| (c.name, c.uid)).collect();
-        assert_eq!(t, vec![("signer", 10001), ("witness", 10002), ("mcp", 10003), ("hub", 10004), ("ui", 10005), ("relay", 10006)]);
+        assert_eq!(t, vec![("signer", 10001), ("witness", 10002), ("mcp", 10003), ("ui", 10005), ("relay", 10006)]);
     }
 
     #[test]
@@ -425,7 +423,7 @@ mod tests {
         assert_eq!(std::fs::metadata(root.join("run/ui/mcp-http-token")).unwrap().mode() & 0o777, 0o640);
         assert_eq!(std::fs::metadata(root.join("run/ui")).unwrap().mode() & 0o777, 0o750);
         assert_eq!(std::fs::read_to_string(root.join("signer/secrets/node-rpc-auth")).unwrap(), "xbt:pw");
-        assert!(!root.join("hub").exists(), "only the listed components");
+        assert!(!root.join("witness").exists(), "only the listed components");
         for p in ["signer/secrets/node-rpc-auth", "ui/secrets/xbt-ui-password"] {
             assert_eq!(std::fs::metadata(root.join(p)).unwrap().mode() & 0o777, 0o600, "{p}");
         }

@@ -13,7 +13,10 @@ umbrelOS, simulated on plain Docker (no Umbrel dev environment runs rootless her
     "regtest"), and publishes the test ports on loopback (24000-24099). Nothing else in the apps changes.
 
 Checks (results.json): I install and layout, S hardening, U the UI (no terminal: password, key, policy, token),
-P an agent's xbt402 payment, R restart persistence, H the hub app, G /readyz gating, X uninstall.
+P an agent's xbt402 payment, R restart persistence, G /readyz gating, X uninstall.
+(The H checks installed the hub app and are retired with it; the other letters are unchanged. The hub was
+retired on 2026-10-11: payments between parties route over ordinary Lightning instead. Its code is in the
+git history, last at commit a548fb0.)
     umbrel_regtest.py OUT RUN_INDEX
 """
 import hashlib
@@ -38,13 +41,11 @@ NET = f"agp040-umbrel-{PID}"
 APPS_DIR = os.path.join(OUT, "app-data")
 SEED = os.urandom(32).hex()
 P_MCP = int(os.environ.get("UMBREL_TEST_MCP_PORT", "24010"))
-P_HUB = int(os.environ.get("UMBREL_TEST_HUB_PORT", "24020"))
 P_UI = int(os.environ.get("UMBREL_TEST_UI_PORT", "24030"))
 P_PROXY = int(os.environ.get("UMBREL_TEST_PROXY_PORT", "24080"))
 P_PROV = int(os.environ.get("UMBREL_TEST_PROV_PORT", "24040"))
-HUB_ONION = os.environ.get("UMBREL_TEST_HUB_ONION", "http://agp042-hub.onion")
 SIGN_BIN = os.path.join(ROOT, "dist/oci/ctx/bin/amd64/xbt-wallet-ui")
-KNOTS, WALLET, HUB = "lazarus-xbt-knots", "lazarus-xbt-agent-wallet", "lazarus-xbt402-hub"
+KNOTS, WALLET = "lazarus-xbt-knots", "lazarus-xbt-agent-wallet"
 PROVIDER = "http://agp040-provider-%d:9500" % PID
 open_log(os.path.join(OUT, "umbrel_regtest.log"))
 
@@ -76,9 +77,8 @@ def compose(app, *args, check_rc=True):
     # the node app's regtest profile: its exports say the chain is regtest (the only exported value the test changes)
     env = {**os.environ, **exports_env(INSTALLED), "APP_XBT_KNOTS_CHAIN": "regtest", "APP_DATA_DIR": data, "APP_SEED": derive(f"app-{app}-seed"),
            "APP_PASSWORD": app_password(app), "DEVICE_DOMAIN_NAME": "127.0.0.1", "DEVICE_HOSTNAME": "umbrel",
-           "APP_HIDDEN_SERVICE": HUB_ONION if app == HUB else "",
-           "UMBREL_TEST_NET": NET, "UMBREL_TEST_CONF": HERE, "UMBREL_TEST_MCP_PORT": str(P_MCP), "UMBREL_TEST_UI_PORT": str(P_UI),
-           "UMBREL_TEST_HUB_PORT": str(P_HUB)}
+           "APP_HIDDEN_SERVICE": "",
+           "UMBREL_TEST_NET": NET, "UMBREL_TEST_CONF": HERE, "UMBREL_TEST_MCP_PORT": str(P_MCP), "UMBREL_TEST_UI_PORT": str(P_UI)}
     return sh("docker", "compose", "--compatibility", "-p", app, "--project-directory", data,
               "-f", os.path.join(data, "docker-compose.yml"), "-f", os.path.join(HERE, "common.yml"), "-f", os.path.join(HERE, f"{app}.yml"),
               *args, env=env, check_rc=check_rc, timeout=900)
@@ -295,47 +295,20 @@ def main():
                 "xbt-anchor-witness:0.1.0", "check", "--store", "/data/witness", "--log", "/data/signer/.run/signatures.jsonl", check_rc=False)
     check("R", "auditor: the witness's check of the signer's signature log passes", wc.returncode == 0, wc.stdout + wc.stderr)
 
-    # --- H: the optional hub app ------------------------------------------------------------------------------
-    log("== H: install lazarus-xbt402-hub")
-    install(HUB)
-    wait_until(lambda: status(f"http://127.0.0.1:{P_HUB}/readyz") == 200, 120, "hub /readyz")
-    hub1 = json.loads(http("GET", f"http://127.0.0.1:{P_HUB}/readyz")[2])
-    hk = root_helper(os.path.join(APPS_DIR, HUB, "data"), "stat -c '%u:%g %a %n' /d/hub /d/hub/secrets/hub-payto-key /d/hub/secrets/node-rpc-auth").stdout
-    check("H", "hub app: init gave data/hub to uid 10004; /readyz 200 (node synced); payTo key generated 0600",
-          hub1["ok"] and "10004:10004 700 /d/hub" in hk and "10004:10004 600 /d/hub/secrets/hub-payto-key" in hk, {"readyz": hub1, "stat": hk})
-    w1 = hub1.get("wallet") or {}
-    addr = w1.get("receive_address") or ""
-    check("H", "hub created the node wallet named hub and persisted a receive address (no terminal)",
-          w1.get("name") == "hub" and addr.startswith("bcrt1"), w1)
-    check("H", "hub /readyz reports the Umbrel Tor onion (APP_HIDDEN_SERVICE on a second app)",
-          hub1.get("tor") == HUB_ONION, hub1.get("tor"))
-    hp = ui2.get("/hub")  # the session from after the app restart
-    check("H", "the wallet UI's Hub page reaches the hub app at lazarus-xbt402-hub_hub_1:9480 (the box network)",
-          '<span class="tag ok">200</span> <code>/readyz</code>' in hp, hp[-800:])
-    check("H", "the Hub page shows the receive address and Tor onion (fund, no terminal)",
-          f'id="hub-receive">{addr}' in hp and f'id="hub-tor">{HUB_ONION}' in hp, hp[-800:])
-    compose(HUB, "stop")
-    compose(HUB, "up", "-d")
-    wait_until(lambda: status(f"http://127.0.0.1:{P_HUB}/readyz") == 200, 120, "hub /readyz after restart")
-    hub2 = json.loads(http("GET", f"http://127.0.0.1:{P_HUB}/readyz")[2])
-    check("H", "hub app restart: the same payTo and the same receive address",
-          hub1["pay_to"] == hub2["pay_to"] and (hub2.get("wallet") or {}).get("receive_address") == addr,
-          [hub1["pay_to"], hub2["pay_to"], addr, (hub2.get("wallet") or {}).get("receive_address")])
-
     # --- G: readiness follows the node ------------------------------------------------------------------------
     log("== G: /readyz follows the node app")
     compose(KNOTS, "stop")
-    wait_until(lambda: status(f"http://127.0.0.1:{P_MCP}/readyz") == 503 and status(f"http://127.0.0.1:{P_HUB}/readyz") == 503, 90,
+    wait_until(lambda: status(f"http://127.0.0.1:{P_MCP}/readyz") == 503, 90,
                "readyz 503 with the node stopped")
-    check("G", "node app stopped: MCP and hub /readyz 503, /healthz 200",
-          status(f"http://127.0.0.1:{P_MCP}/healthz") == 200 and status(f"http://127.0.0.1:{P_HUB}/healthz") == 200)
+    check("G", "node app stopped: MCP /readyz 503, /healthz 200",
+          status(f"http://127.0.0.1:{P_MCP}/healthz") == 200)
     compose(KNOTS, "up", "-d")
-    wait_until(lambda: status(f"http://127.0.0.1:{P_MCP}/readyz") == 200 and status(f"http://127.0.0.1:{P_HUB}/readyz") == 200, 120,
+    wait_until(lambda: status(f"http://127.0.0.1:{P_MCP}/readyz") == 200, 120,
                "readyz 200 with the node back")
-    check("G", "node app back: MCP and hub /readyz 200", True)
+    check("G", "node app back: MCP /readyz 200", True)
     proxy.shutdown()
     with open(os.path.join(OUT, "facts.json"), "w") as f:
-        json.dump({"run": RUN, "t_wallet_ready_s": t_ready, "t_total_s": time.time() - t_install, "r1": r1, "r2": r2, "hub": hub2,
+        json.dump({"run": RUN, "t_wallet_ready_s": t_ready, "t_total_s": time.time() - t_install, "r1": r1, "r2": r2,
                    "init_first": rep, "init_restart": rep2}, f, indent=1, default=str)
 
 
@@ -351,7 +324,7 @@ def teardown():
         # uninstall: umbrelOS deletes app-data/<id>; the files belong to the service uids, so as root
         root_helper(OUT, "rm -rf /d/app-data /d/provider", ro=False)
         check("X", "uninstall: every container, the network and the app data removed",
-              not docker("ps", "-aq", "--filter", f"name=^{WALLET}_", "--filter", f"name=^{HUB}_").stdout.strip()
+              not docker("ps", "-aq", "--filter", f"name=^{WALLET}_").stdout.strip()
               and not os.path.exists(APPS_DIR))
 
 
