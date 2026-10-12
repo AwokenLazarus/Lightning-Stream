@@ -37,18 +37,19 @@ LAB=$ROOT/run/lightning-fork-lab
 export COMPOSE_PROJECT_NAME=lnticket
 export COMPOSE_FILE=$LAB/docker-compose.yml:$ROOT/scripts/ln_ticket/compose.yml
 export ACTIVATION_HEIGHT=20
-mkdir -p "$ROOT/run"
-R=$(mktemp -d "$ROOT/run/ln-ticket-XXXXXX")
+R=
 
 cleanup() {
-  if [ "${LN_TICKET_KEEP:-0}" != 1 ]; then
+  if [ "${LN_TICKET_KEEP:-0}" != 1 ] && [ -d "$LAB" ]; then
     # unchecked: on the way out there is nobody to tell, and the next run removes what is left
     (cd "$LAB" && docker compose down -v >/dev/null 2>&1) || true
   fi
-  rm -rf "$R"
+  if [ -n "$R" ]; then rm -rf "$R"; fi
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
+mkdir -p "$ROOT/run"
+R=$(mktemp -d "$ROOT/run/ln-ticket-XXXXXX")
 
 # the lab and the node binaries: cloned and built when missing
 # shellcheck source=scripts/ln_rail/lab.sh
