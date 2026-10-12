@@ -162,7 +162,7 @@ fn a_close_fee_above_the_wallet_cap_is_refused_before_funding() {
 #[test]
 fn p3_p4_p5_mainnet_never_mines_uses_961640_and_bc_addresses() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
-    let rig = Rig::build(json!({"regtest_mine": null}), false, "main", None);
+    let rig = Rig::build(json!({"regtest_mine": null}), false, "main");
     let h = rig.call("health", json!({}));
     assert_eq!((h["chain"].as_str(), h["hrp"].as_str(), h["mining"].as_bool()), (Some("main"), Some("bc"), Some(false)));
     assert!(rig.call("hot_address", json!({}))["hot_address"].as_str().unwrap().starts_with("bc1q"));

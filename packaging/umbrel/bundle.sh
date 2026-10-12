@@ -1,7 +1,7 @@
 #!/bin/bash
 # AGP-040: a side-load bundle of the local Umbrel store, for a pilot on a box Mike chooses (never a store
 # submission, never a registry). Writes dist/umbrel/:
-#   lazarus-store/            the store folder to copy to the box (umbrel-app-store.yml + the three apps)
+#   lazarus-store/            the store folder to copy to the box (umbrel-app-store.yml + the two apps)
 #   images-amd64.tar          `docker save` of the images for an x86_64 box (Umbrel Home, a PC)
 #   images-arm64.tar          the same for a Raspberry Pi 4/5 (no XBT node stand-in: its image is amd64-only)
 #   SHA256SUMS, IMAGES.txt    checksums; each image's id per platform (compare after `docker load`)
@@ -12,10 +12,10 @@ OUT=dist/umbrel
 rm -rf "$OUT"
 mkdir -p "$OUT/lazarus-store"
 cp packaging/umbrel/umbrel-app-store.yml "$OUT/lazarus-store/"
-for app in lazarus-xbt-knots lazarus-xbt-agent-wallet lazarus-xbt402-hub; do
+for app in lazarus-xbt-knots lazarus-xbt-agent-wallet; do
   cp -r "packaging/umbrel/$app" "$OUT/lazarus-store/"
 done
-IMGS=(xbt-init:0.1.0 xbt-signer:0.1.0 xbt-anchor-witness:0.1.0 xbt-wallet-mcp:0.1.0 xbt-wallet-ui:0.1.0 xbt402-hub:0.1.0)
+IMGS=(xbt-init:0.1.0 xbt-signer:0.1.0 xbt-anchor-witness:0.1.0 xbt-wallet-mcp:0.1.0 xbt-wallet-ui:0.1.0)
 : >"$OUT/IMAGES.txt"
 for plat in amd64 arm64; do
   extra=()
@@ -36,7 +36,7 @@ On the box (ssh umbrel@umbrel.local):
   3. mkdir -p ~/umbrel/app-stores/lazarus-local && cp -r lazarus-store/. ~/umbrel/app-stores/lazarus-local/
   4. umbrelOS adds community app stores by git URL: put lazarus-store/ in a private git repo the box can
      reach (a bare repo on the LAN), add it under App Store -> Community App Stores, then install
-     "XBT Node (stand-in)", then "XBT Agent Wallet" (and "xbt402 Hub" if wanted). This step is unverified
+     "XBT Node (stand-in)", then "XBT Agent Wallet". This step is unverified
      until the pilot box: umbrelOS dev tooling does not run rootless on the build host.
   5. Open XBT Agent Wallet; log in with the password the dashboard shows for it; Setup: enrol your approval
      key, sign a policy; Agents: copy the MCP endpoint and token into your agent.

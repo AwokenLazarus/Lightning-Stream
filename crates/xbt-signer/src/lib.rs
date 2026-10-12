@@ -14,7 +14,6 @@
 //! * [`hot`]: the hot key, its sealed UTXO set, rotation, the balance cap, sweeps.
 //! * [`channels`]: the channel book (per-counterparty Spillman channels as the budget).
 //! * [`session`]: `xbt402_pay` inside the signer (open, minConf wait, paid calls, close).
-//! * [`routing`]: the routing policy and adaptor-lock book operations (AGP-021).
 //! * [`bolt11`], [`ln`]: `rail=ln` (AGP-048): XBT Lightning invoices paid through an LND node under the
 //!   same policy, with the chain-identity, bit-512, taproot and pre-split guards.
 //! * [`signer`]: the request handler and the watcher; [`server`]: the socket.
@@ -44,7 +43,6 @@ pub mod sanitize;
 pub mod server;
 pub mod session;
 pub mod signer;
-pub mod routing;
 pub mod sigaudit;
 
 pub use xbt402::{ChannelError as Error, Result};

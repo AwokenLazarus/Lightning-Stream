@@ -47,7 +47,6 @@ pub const OPEN_PATH: &str = "/x402/xbt-channel/open";
 pub const CLOSE_PATH: &str = "/x402/xbt-channel/close";
 pub const ROLLOVER_PATH: &str = "/x402/xbt-channel/rollover";
 pub const TERMS_PATH: &str = "/x402/xbt-channel/terms";
-pub const LOCK_PATH: &str = "/x402/xbt-channel/lock";
 pub use xbt_primitives::network::{network_id, XBT_MAINNET};
 
 /// `base64(json.dumps(obj, separators=(",", ":")))`.
@@ -305,11 +304,6 @@ pub fn body_hash(body: &[u8]) -> String {
 /// What the payer signs to close: `tagged_hash("xbt402/close", chan)`.
 pub fn close_message(chan: &str) -> [u8; 32] {
     tagged_hash("xbt402/close", chan.as_bytes())
-}
-
-/// What a hub's payTo signs to bind a hub-funded channel to itself at open (AGP-021).
-pub fn hub_channel_message(chan: &str) -> [u8; 32] {
-    tagged_hash("xbt402/route/hub-channel", chan.as_bytes())
 }
 
 /// x402 facilitator reasons for the protocol's own codes.

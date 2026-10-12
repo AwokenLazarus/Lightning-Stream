@@ -3,7 +3,7 @@
 # for x86_64 and aarch64), check both .s9pk files (manifest, images per arch, static ELF of the right arch,
 # image users), then run the package's own container spec on regtest the way StartOS does
 # (test/startos_regtest.py). No StartOS VM runs here (no KVM for this user); a real-box test needs Mike.
-# Ports 24100-24199 on 127.0.0.1 only (STARTOS_TEST_PORTS=LO-HI and STARTOS_TEST_{MCP,HUB,UI,PROV}_PORT move them). Soak rules: CPUQuota 200%, MemoryMax 4G, nice 19. Never publishes.
+# Ports 24100-24199 on 127.0.0.1 only (STARTOS_TEST_PORTS=LO-HI and STARTOS_TEST_{MCP,UI,PROV}_PORT move them). Soak rules: CPUQuota 200%, MemoryMax 4G, nice 19. Never publishes.
 # Evidence: run/startos-test/<stamp>/.
 set -euo pipefail
 if [ -z "${STARTOS_TEST_SCOPED:-}" ] && command -v systemd-run >/dev/null; then
@@ -30,7 +30,7 @@ import json, os, subprocess, sys, tempfile
 cli, d, out = sys.argv[1:4]
 ELF = {"x86_64": 0x3E, "aarch64": 0xB7}
 IMAGES = {"init": ("xbt-init", "0:0"), "signer": ("xbt-signer", "xbt-signer"), "witness": ("xbt-anchor-witness", "xbt-anchor-witness"),
-          "mcp": ("xbt-wallet-mcp", "xbt-wallet-mcp"), "ui": ("xbt-wallet-ui", "xbt-wallet-ui"), "hub": ("xbt402-hub", "xbt402-hub")}
+          "mcp": ("xbt-wallet-mcp", "xbt-wallet-mcp"), "ui": ("xbt-wallet-ui", "xbt-wallet-ui")}
 probs, rep = [], {}
 for arch in ("x86_64", "aarch64"):
     f = os.path.join(d, f"xbt-agent-wallet_{arch}.s9pk")

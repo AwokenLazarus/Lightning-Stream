@@ -150,7 +150,7 @@ try {
   await sleep(300);
   check("text shown != text signed is refused", (await ev("document.querySelector('form[data-sign=policy] .sign-msg').textContent")).includes("refused"));
   // 6. every page renders, with no script errors, on a desktop and a phone
-  for (const [p, name] of [["/", "06-overview"], ["/channels", "07-channels"], ["/signatures", "08-signatures"], ["/keys", "09-keys"], ["/hub", "10-hub"], ["/setup", "11-setup"]]) {
+  for (const [p, name] of [["/", "06-overview"], ["/channels", "07-channels"], ["/signatures", "08-signatures"], ["/keys", "09-keys"], ["/setup", "11-setup"]]) {
     await go(p);
     await shot(name, 1100);
     await shot(name + "-phone", 390);

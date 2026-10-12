@@ -23,12 +23,9 @@ use xbt402::funding::{ChainBackend, UtxoInfo};
 use xbt402::http::{serve_listener, UreqTransport};
 use xbt402::ledger::Ledger;
 use xbt402::provider::{HttpResponse, Provider, ProviderConfig};
-use xbt402::route::{call_auth, session_key};
-use xbt402::route_seller::RouteOffer;
 use xbt402::wire::*;
 use xbt402::{ChannelError, Result};
 use xbt_primitives::address::address_to_spk;
-use xbt_primitives::ecdsa;
 use xbt_primitives::hash::sha256;
 use xbt_primitives::secp256k1::SecretKey;
 use xbt_primitives::tx::Tx;
@@ -107,7 +104,6 @@ fn start(port: u16) -> (Arc<MemChain>, Arc<Provider>, String) {
     cfg.height_ttl = Duration::ZERO; // every request asks the chain for the height
     let prov = Arc::new(Provider::new(chain.clone(), prov_secret(), cfg, Ledger::in_memory(), Box::new(|_, _| 150),
                                       Box::new(|_, p, _| HttpResponse::new(200, vec![], json!({"answer": p}).to_string().into_bytes()))).unwrap());
-    prov.offer_route(RouteOffer::new("/r/x", 370 * 10u128.pow(18)));
     let l = TcpListener::bind(("127.0.0.1", port)).unwrap();
     let addr = l.local_addr().unwrap().to_string();
     serve_listener(prov.clone(), l, 4).unwrap();
@@ -247,10 +243,6 @@ fn hostile_numbers_on_every_provider_endpoint_are_refusals_and_never_a_panic() {
             }
             note(format!("open {field}={n} preflight={preflight}"), post(&addr, OPEN_PATH, &[], &body.to_string()));
             sent += 1;
-            // the same as a hub's ch2 (the hub binding is checked after the numbers are read)
-            body["hub"] = json!({"payTo": hex::encode(p.payer_pub), "sig": "3006020101020101"});
-            note(format!("open(hub) {field}={n}"), post(&addr, OPEN_PATH, &[], &body.to_string()));
-            sent += 1;
         }
     }
     // --- rollover: amount, the next expiry ---------------------------------------------------------
@@ -273,34 +265,6 @@ fn hostile_numbers_on_every_provider_endpoint_are_refusals_and_never_a_panic() {
             sent += 1;
         }
     }
-    // --- a hub's lock on a channel that is not a hub's: amount, cum --------------------------------
-    for n in hostile() {
-        seq += 1;
-        let body = json!({"route": {"session": "s", "lockId": "l", "amount": n, "lockAuth": "00", "hub": "00"}}).to_string();
-        let h = header(&ch, &json!(seq), &n, None, &json!({"point": "02"}), "POST", &format!("{o}{LOCK_PATH}"), body.as_bytes());
-        note(format!("lock amount=cum={n}"), post(&addr, LOCK_PATH, &[("PAYMENT-SIGNATURE", h)], &body));
-        sent += 1;
-    }
-    // --- a routed call (ROUTE-AUTH): seq -----------------------------------------------------------
-    let ck = SecretKey::from_slice(&sha256(b"agp093 route client")).unwrap();
-    let r = get(&addr, "/r/x", &[("ROUTE-CLIENT", hex::encode(ecdsa::pubkey(&ck)))]);
-    let doc: Value = serde_json::from_str(r.split("\r\n\r\n").nth(1).unwrap_or("")).unwrap_or(Value::Null);
-    let sid = doc["accepts"][0]["extra"]["route"]["session"].as_str().expect("a route session").to_string();
-    let key = session_key(&ck, &pay_to).unwrap();
-    let rurl = format!("{o}/r/x");
-    let mut last_ok = 0u64;
-    for n in hostile() {
-        // authenticated where the seq is a u64 (the MAC is over its decimal), a bare claim otherwise
-        let auth = n.as_u64().or_else(|| n.as_str().and_then(|s| s.trim().parse().ok())).map(|s| call_auth(&key, &sid, s, &request_digest_v2("GET", &rurl, b"")));
-        let h = b64json(&json!({"session": sid, "seq": n, "auth": auth.unwrap_or_default()}));
-        let r = get(&addr, "/r/x", &[("ROUTE-AUTH", h)]);
-        if status(&r) == 200 {
-            last_ok = n.as_u64().or_else(|| n.as_str().and_then(|s| s.trim().parse().ok())).unwrap_or(0);
-        }
-        note(format!("route call seq={n}"), r);
-        sent += 1;
-    }
-    assert!(last_ok > 0, "control: no routed call was served, so its metering was not reached");
     // --- the seq of a paid call, last: the largest one is spent for good on this channel ------------
     for s in hostile() {
         let h = header(&ch, &s, &json!(1_000), Some(&good_sig), &json!({}), "GET", &url, b"");

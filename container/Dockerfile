@@ -40,15 +40,6 @@ USER xbt-wallet-mcp
 ENTRYPOINT ["/usr/bin/xbt-wallet-mcp"]
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 CMD ["/usr/bin/xbt-wallet-mcp", "--healthcheck"]
 
-FROM base AS xbt402-hub
-ARG TARGETARCH
-ARG TARGETVARIANT
-COPY --chmod=0555 bin/${TARGETARCH}${TARGETVARIANT}/xbt402-hub /usr/bin/xbt402-hub
-EXPOSE 9480
-USER xbt402-hub
-ENTRYPOINT ["/usr/bin/xbt402-hub"]
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 CMD ["/usr/bin/xbt402-hub", "healthcheck"]
-
 FROM base AS xbt-wallet-ui
 ARG TARGETARCH
 ARG TARGETVARIANT

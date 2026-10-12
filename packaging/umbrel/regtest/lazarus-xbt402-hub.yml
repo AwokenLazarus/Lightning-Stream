@@ -1,8 +1,0 @@
-services:
-  hub:
-    restart: "no"
-    # AGP-104: a regtest node has no fee estimate, so the hub is given its funding fee rate
-    environment:
-      XBT_HUB_FEE_RATE: "2"
-    ports: !override
-      - "127.0.0.1:${UMBREL_TEST_HUB_PORT}:9480"

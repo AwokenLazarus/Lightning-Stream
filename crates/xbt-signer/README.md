@@ -15,7 +15,7 @@ It uses B2's socket protocol (`b2/docs/B2_SIGNER_API.md`) and B2's on-disk forma
 runs behind either client and opens the other's files.
 
 Reference: B2 `agp-next2` `04c3f56` (`agentwallet/signer.py`, `channels.py`, `hot.py`, `keystore.py`,
-`sigaudit.py`, `anchor.py`, `policy.py`, `routing.py`, `xbt402.py`, `stream.py`, `netparams.py`).
+`sigaudit.py`, `anchor.py`, `policy.py`, `xbt402.py`, `stream.py`, `netparams.py`).
 
 ## Run
 
@@ -47,8 +47,7 @@ Every B2 method listed below behaves as in B2:
 - `health`, `chain_backend`, `channels`, `hot_address`, `notice_hot_txid`, `fund`;
 - `open_channel`, `sign_state`, `xbt402_pay`;
 - `xbt402_request_auth`, `xbt402_sign_state_a3`;
-- `xbt402_sign_state_adaptor`, `xbt402_resolve_lock`, `xbt402_void_lock`, `xbt402_adopt_lock`, `xbt402_recover_lock` (below);
-- `routing_status`, `close_channel`, `xbt402_refund` (alias `refund_channel`), `watch_tick`;
+- `close_channel`, `xbt402_refund` (alias `refund_channel`), `watch_tick`;
 - `rotate_hot_key`, `sweep_hot`, `signatures`, `anchor_now`, `anchor_status`, `hot_reconcile`.
 
 `xbt402_pay` includes streamed results (`xbt402-merkle-v1`). Limit: on a postpay channel a streamed
@@ -75,23 +74,15 @@ policy-checked where it raises the signed amount.
 `client::RemoteSigner` implements `xbt402::signer::StateSigner` and `xbt402::client::Wallet` over
 these methods: `Client::new(..).with_signer(Arc::new(RemoteSigner::new(sock)))`.
 
-### Routed payments (AGP-034)
+### Routed payments (retired)
 
-`client::RemoteSigner` also implements `xbt402::signer::RouteSigner` over B2's lock methods, so
-`xbt402::route_client::RoutePayer::new(hub, cfg, Arc::new(remote.clone()), Arc::new(remote), ..)` routes
-with every key in the signer. Before each pre-signature the signer applies the routing policy (hub
-allowlist, fee cap with carry, `max_lock_sats`, the 24 h routed budget over resolved plus pending
-locks) and then the policy engine on the increase. The crypto is `routing::Xbt402Adaptor`, xbt402's
-ECDSA adaptor (AGP-026, wire-compatible with B1 `adaptor.py`), the default `channels::AdaptorScheme`.
-
-| method | params | result |
-|---|---|---|
-| `xbt402_sign_state_adaptor` | `chan`, `cum`, `point` (T), `route` (`hub`, `amount`, `fee`, `lockId`) | routing policy, engine, then `{verdict, adaptor, point (T1), tweak (r), cum}`; the lock is written ahead |
-| `xbt402_resolve_lock` | `chan`, `secret` (t + r or t) | `{t}` |
-| `xbt402_void_lock` | `chan` | `{voided}`; the lock's booking stays (AGP-080) |
-| `xbt402_adopt_lock` | `chan`, `cum` | `{adopted}` (only a given-up lock's own cum, with no lock pending) |
-| `xbt402_recover_lock` | `chan`, `txid`, `blockhash`, or `hex` (new: the raw close) | `{t}`; only a secret opening the stored T1 counts |
-| `routing_status` | | policy, 24 h spend, pending locks, `adaptor: available` |
+The hub was retired on 2026-10-11: payments between parties route over ordinary Lightning instead.
+The signer no longer has a routing policy and no longer answers B2's lock methods
+(`xbt402_sign_state_adaptor`, `xbt402_resolve_lock`, `xbt402_void_lock`, `xbt402_adopt_lock`,
+`xbt402_recover_lock`, `routing_status`); B2 still has them. A `routing` section in `policy.json`
+is ignored, with a warning. A channel record that an earlier version left with a pending lock
+keeps it: no plain state below the locked amount is signed, and the channel is refunded at its
+expiry. The code is in the git history (last at commit `a548fb0`).
 
 ### For the web UI (AGP-039)
 
@@ -250,13 +241,6 @@ the first `human_key_enroll` needs the one-time code. Passphrase blobs use scryp
   amount plus the chunk to whoever holds the key. The ledger holds both before that state is
   signed. The plain state that folds the lock in books nothing more, and a seller that keeps the
   signature and withholds the key releases nothing.
-- **Adaptor pre-signatures.** A routed lock is in the routing budget and the policy ledger
-  (`lock:<chan>:<cum>`) before its pre-signature leaves, not when it resolves. What is booked is
-  the amount by which the lock raises the most the channel is already booked for
-  (`ledger_booked_sats`): one close claims one state, so a lock inside an earlier, given-up lock's
-  amount rides on that booking. `xbt402_void_lock` gives the lock up locally and releases nothing;
-  no socket method releases a booking. A lock from before this change (no `booked` in its record)
-  is booked when it resolves, as before.
 - **Closed means spent on our node.** `xbt402_mark_closed` marks a channel closed only when this
   signer's node shows its funding output spent (`deny/close_unproven` otherwise; the claim is kept
   in memory and the watcher marks the channel closed when the spend arrives). `close_channel`
@@ -281,33 +265,22 @@ the first `human_key_enroll` needs the one-time code. Passphrase blobs use scryp
 ## Files and durability (AGP-055)
 
 One process owns a wallet directory. The files are B2's, byte format included: a directory written
-by either signer opens in the other (`tests/custody_compat.rs`, `vectors/rust_routed_wallet.json`).
+by either signer opens in the other (`tests/custody_compat.rs`), except B2's routed-spend log
+(`.run/routing.json`), which this signer no longer reads or writes.
 
-Per routed lock (pre-sign + resolve) the signer writes `channels.json` twice (temp file, fsync,
-rename, fsync of the directory: the lock is durable before its pre-signature leaves) and appends one
-line each to `.run/signatures.jsonl`, `.run/routing.json` and `.run/ledger.payments.jsonl`, and two
-to `.run/audit.jsonl`: 9 fsyncs and 2 renames. `channel_keys.json` is rewritten only when a key is
-added or dropped.
-
-- `.run/routing.json` (routed spend, the 24 h routing budget) and `.run/ledger.payments.jsonl` (the
-  policy ledger's payments) are append-only logs (`src/applog.rs`): a header line
+- `.run/ledger.payments.jsonl` (the policy ledger's payments) is an append-only log (`src/applog.rs`): a header line
   `{"kind":...,"v":1}`, then one JSON object per line, each fsynced. A last line without its newline
   is a crash mid-append and is cut at start; any other line that does not parse stops the signer
   from starting (it never reads as a shorter log). A log is compacted (temp file, fsync, rename)
-  once it holds over twice the rows still in use plus 1,024: spend rows are in use for 7 days,
-  payments for the policy's longest window plus a day. `.run/audit.jsonl` keeps every commit.
+  once it holds over twice the rows still in use plus 1,024: payments are in use for the policy's
+  longest window plus a day. `.run/audit.jsonl` keeps every commit.
 - `.run/ledger.json` holds the pending approvals and `"payments_log": "ledger.payments.jsonl"`; it
   has no `payments` key. A settled or failed Lightning booking is a line
   `{"amend": txid, "amount_sats": n | null}` in the payments log. Files from before AGP-055 are
   converted at the first start.
-- A lock is written to its channel record with what it books (`pending_lock.booked`,
-  `booked_sats`), then booked once under `lock:<chan>:<cum>` in both logs, then its pre-signature
-  leaves; a start books any lock a crash left written and unbooked. A lock from before AGP-080 is
-  remembered at its resolve (`resolved`, the last 16) and booked then, with the same recovery. In
-  the ledger a routed lock's `txid` is that key.
 - `src/fsx.rs` has the durable steps (write, fsync, rename, truncate, directory fsync) every file
   goes through, and `fsx::probe`, which counts them per thread and lets a test make any one the last
-  thing the process does (`tests/lock_persist.rs`). Nothing in the signer arms it.
+  thing the process does. Nothing in the signer arms it.
 
 ## Not ported
 

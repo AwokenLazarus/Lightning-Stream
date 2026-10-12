@@ -1,5 +1,5 @@
 //! AGP-035: the surface xbt-compute (cmp) links, with default features off and only cmp-style
-//! stand-ins for [`Transport`], [`Wallet`], [`ChainBackend`] (+ the hub's [`SpendScan`]) and the
+//! stand-ins for [`Transport`], [`Wallet`], [`ChainBackend`] and the
 //! signer. Run it exactly as cmp builds the crate:
 //!
 //!     cargo test -p xbt402 --no-default-features --test cmp_surface
@@ -9,22 +9,17 @@
 //!   side; the client restarts from its ledger and keeps paying on the same channel.
 //! * A local-key client restarts from its ledger too; a signer-held record refuses to load without
 //!   the signer.
-//! * [`RoutePayer`] pays two providers through one [`RouteHub`] channel, amsat prices above u64.
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde_json::json;
 use xbt402::client::{split_url, Client, ClientConfig, ClientLedger, FileClientLedger, MemoryClientLedger, Transport, Wallet};
-use xbt402::funding::{ChainBackend, FundingPolicy, UtxoInfo};
-use xbt402::hub::{HubConfig, RouteHub};
+use xbt402::funding::{ChainBackend, UtxoInfo};
 use xbt402::ledger::Ledger;
 use xbt402::provider::{HttpResponse, Provider, ProviderConfig};
-use xbt402::route::SpendScan;
-use xbt402::route_client::{RoutePayer, RoutePayerConfig};
-use xbt402::route_seller::RouteOffer;
-use xbt402::signer::{LocalSigner, RouteSigner, StateSigner};
+use xbt402::signer::{LocalSigner, StateSigner};
 use xbt402::{ChannelError, Result};
 use xbt_primitives::address::address_to_spk;
 use xbt_primitives::hash::sha256;
@@ -32,12 +27,11 @@ use xbt_primitives::secp256k1::SecretKey;
 use xbt_primitives::tx::Tx;
 
 const NET: &str = "bip122:11111111111111111111111111111111";
-const HUB: &str = "http://hub.test";
 
 // --- cmp-style stand-ins ------------------------------------------------------------------------
 
 /// cmp's chain backend (a node or an Electrum light client in cmp): a fake that confirms fundings
-/// at once and tracks spends, so the hub's watcher can read adaptor secrets back.
+/// at once and tracks spends.
 #[derive(Default)]
 struct Chain {
     height: Mutex<u32>,
@@ -52,11 +46,6 @@ impl Chain {
         let c = Self::default();
         *c.height.lock().unwrap() = 1_000;
         Arc::new(c)
-    }
-    fn confirm_all(&self) {
-        for u in self.utxos.lock().unwrap().values_mut() {
-            u.confirmations = u.confirmations.max(1);
-        }
     }
 }
 
@@ -98,13 +87,6 @@ impl ChainBackend for Chain {
     }
 }
 
-impl SpendScan for Chain {
-    fn find_spend(&self, txid: &str, vout: u32, _from: u32) -> Result<Option<Tx>> {
-        let s = self.spent.lock().unwrap().get(&(txid.to_string(), vout)).cloned();
-        Ok(s.and_then(|s| self.raw.lock().unwrap().get(&s).cloned()).and_then(|h| Tx::parse_hex(&h).ok()))
-    }
-}
-
 /// cmp's wallet: funds a channel address, returns the outpoint.
 struct CmpWallet(Arc<Chain>);
 
@@ -129,10 +111,6 @@ impl Net {
     fn provider(&self, origin: &str, p: &Arc<Provider>) {
         let p = p.clone();
         self.0.lock().unwrap().insert(origin.into(), Arc::new(move |m, path, h, b, url| p.serve(m, path, h, b, url, None)));
-    }
-    fn hub(&self, origin: &str, hub: &Arc<RouteHub>) {
-        let hub = hub.clone();
-        self.0.lock().unwrap().insert(origin.into(), Arc::new(move |m, path, h, b, url| hub.serve(m, path, h, b, url, None)));
     }
 }
 
@@ -265,55 +243,4 @@ fn a_local_key_client_restarts_from_any_client_ledger() {
     let r = c.close("http://vendor.test").unwrap();
     assert_eq!(r["cum"], "600");
     assert_eq!(store.load().unwrap().iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), ["book", "chan http://vendor.test"]);
-}
-
-#[test]
-fn route_payer_pays_two_providers_through_one_hub_channel() {
-    let dir = TempDir::new("route");
-    let (chain, net) = (Chain::new(), Net::default());
-    let mut provs = vec![];
-    for (i, amsat) in [(0, 370 * 10u128.pow(18)), (1, 813 * 10u128.pow(18) + 123_456_789)] {
-        let mut cfg = ProviderConfig::new(NET);
-        cfg.close_margin = 36;
-        cfg.policy = FundingPolicy { min_capacity: 20_000, min_expiry_blocks: 500, max_expiry_blocks: 8_640, close_margin: 36, ..FundingPolicy::default() };
-        cfg.height_ttl = Duration::ZERO;
-        let p = Provider::new(chain.clone(), secret(&format!("routed vendor {i}")), cfg, Ledger::open(&dir.0.join(format!("p{i}.jsonl"))).unwrap(),
-                              Box::new(|_, _| 1000), Box::new(|_, _, _| HttpResponse::new(200, vec![], b"{\"ok\":1}".to_vec()))).unwrap();
-        p.offer_route(RouteOffer { window: 0.3, lock_wait: 0.6, invoice_ttl: 8.0, ..RouteOffer::new("/v1/chunk", amsat) });
-        let p = Arc::new(p);
-        let origin = format!("http://p{i}.test");
-        net.provider(&origin, &p);
-        provs.push((origin, p));
-    }
-    let hub_cfg = HubConfig::from_json(&json!({"spend_final_depth": 1, "fee_base_msat": 100, "fee_ppm": 2000, "max_lock_sat": 20000, "max_unguarded_lock_sat": 500,
-                                               "delta": 36, "reveal_timeout": 1.0, "ch2_capacity": 100000, "ch2_expiry_blocks": 1000,
-                                               "close_margin": 36, "policy": {"min_capacity": 20000, "min_expiry_blocks": 500, "max_expiry_blocks": 8640}})).unwrap();
-    let hub = Arc::new(RouteHub::new(chain.clone(), chain.clone(), Box::new(CmpWallet(chain.clone())), Box::new(net.clone()), secret("hub"), NET,
-                                     Some(&dir.0.join("hub")), hub_cfg).unwrap());
-    net.hub(HUB, &hub);
-    for (o, _) in &provs {
-        hub.connect(o, None, None).unwrap();
-    }
-    chain.confirm_all();
-    hub.watch_tick();
-    let mut cfg = RoutePayerConfig::new(NET);
-    cfg.expiry_blocks = 8_000;
-    let c = chain.clone();
-    let signer: Arc<dyn RouteSigner> = Arc::new(LocalSigner::new());
-    let pay = RoutePayer::new(HUB, cfg, signer, Arc::new(CmpWallet(chain.clone())), Box::new(net.clone()), Box::new(move || c.block_count()));
-    pay.open().unwrap();
-    let shards: Vec<_> = provs.iter().map(|(o, _)| pay.shard(&format!("{o}/v1/chunk"), "POST").unwrap()).collect();
-    for _ in 0..12 {
-        for sh in &shards {
-            let r = pay.call(sh, "POST", br#"{"tokens":1}"#).unwrap();
-            assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
-        }
-    }
-    // one ch1 for both vendors; each meter is exact in amsat (the second price is above u64)
-    assert!(pay.chan().is_some());
-    for (sh, amsat) in shards.iter().zip([370 * 10u128.pow(18), 813 * 10u128.pow(18) + 123_456_789]) {
-        let s = sh.snapshot();
-        assert_eq!(s.accrued_amsat, 12 * amsat, "{}", sh.origin);
-    }
-    assert!(813 * 10u128.pow(18) + 123_456_789 > u64::MAX as u128);
 }

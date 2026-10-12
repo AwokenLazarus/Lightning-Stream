@@ -1,6 +1,6 @@
 //! Append-only JSON-lines log with one fsync per row (AGP-055; B2 `applog.py`, same files).
 //!
-//! The routed-spend rows and the payment ledger used to be rewritten whole on every lock. Here a
+//! The payment ledger used to be rewritten whole on every payment. Here a
 //! row is one line appended to an open file and fsynced: the cost of a row no longer depends on
 //! how many rows came before it.
 //!

@@ -24,14 +24,13 @@ use xbt_primitives::tx::Tx;
 
 use crate::anchor::{AnchorClient, Anchorer};
 use crate::approval::{recover_message, sweep_message, verify, verify_approval, x2b};
-use crate::channels::{AdaptorScheme, ChannelBook, ChannelRecord};
+use crate::channels::{ChannelBook, ChannelRecord};
 use crate::hot::{HotWallet, DEFAULT_FEE};
 use crate::keystore::KeyStore;
 use crate::ln::{LnBackend, LnBook, LndRest};
 use crate::node::{self, KnotsRpc, Node};
 use crate::policy::{normalize_dest, AuditLog, Clock, Payment, PolicyConfig, PolicyEngine, PolicyStore};
 use crate::pyjson::{now_f64, py_int, str_or_empty, truthy, ts_value};
-use crate::routing::{RoutePolicy, RouteSigner};
 use crate::sanitize::sanitize;
 use crate::session::{origin_of, FundingSpend, MineFn, Session};
 use crate::sigaudit::{self, check_chain, SigAudit};
@@ -166,8 +165,8 @@ pub(crate) fn with(mut v: Value, extra: Value) -> Value {
 
 /// The longest channel any path may open or roll into, in blocks from now (AGP-063 W3, AGP-089):
 /// [`crate::session::max_expiry_blocks`] of the policy in force.
-fn max_expiry_blocks(cfg: &PolicyConfig, hub: bool) -> i64 {
-    crate::session::max_expiry_blocks(cfg.channel_expiry_blocks, hub)
+fn max_expiry_blocks(cfg: &PolicyConfig) -> i64 {
+    crate::session::max_expiry_blocks(cfg.channel_expiry_blocks)
 }
 
 fn trunc(s: &str, n: usize) -> String {
@@ -186,14 +185,12 @@ pub fn address_to_spk(addr: &str, hrp: &str) -> Result<Vec<u8>> {
     Ok(spk)
 }
 
-/// How to build a signer (tests inject a node, a transport, a clock, an adaptor scheme; the default
-/// scheme is [`crate::routing::Xbt402Adaptor`]).
+/// How to build a signer (tests inject a node, a transport, a clock).
 #[derive(Default)]
 pub struct SignerOptions {
     pub node: Option<Arc<dyn Node>>,
     pub transport: Option<Arc<dyn Transport>>,
     pub clock: Option<Clock>,
-    pub adaptor: Option<Arc<dyn AdaptorScheme>>,
     /// Overrides `B2_ANCHOR_SOCK`.
     pub anchor: Option<AnchorClient>,
     /// Overrides `B2_HOT_KEYFILE` / `B2_HOT_PASSPHRASE` (the container entry point's secret source, AGP-038).
@@ -225,7 +222,6 @@ pub struct Signer {
     pub hot: Arc<HotWallet>,
     pub book: Arc<ChannelBook>,
     pub session: Session,
-    pub routing: RouteSigner,
     open_tried: Mutex<HashMap<String, f64>>,
     /// AGP-080: channels a socket client said it closed before our node showed the spend. The
     /// watcher marks each closed once the chain does (memory only: at expiry the refund finds a
@@ -313,8 +309,7 @@ impl Signer {
         }));
         let engine_check = engine.clone();
         session.set_spend_check(Arc::new(move |dest, asked, delta| floor_check(&engine_check, dest, asked, delta, false)));
-        let routing = RouteSigner::new(book.clone(), RoutePolicy::from_value(&config.routing), Some(&run.join("routing.json")),
-                                       Some(engine.clone()), Some(opts.adaptor.clone().unwrap_or_else(|| Arc::new(crate::routing::Xbt402Adaptor))))?;
+
         let watch_interval = std::env::var("B2_WATCH_INTERVAL").ok().and_then(|v| v.parse().ok()).unwrap_or(10.0);
         // an LN misconfiguration shuts only the LN rail (every ln_pay is refused with it)
         let (ln, ln_error) = match opts.ln.clone() {
@@ -327,7 +322,7 @@ impl Signer {
         let ln_book = LnBook::open(&run.join("ln_payments.json"))?;
         let s = Arc::new(Self { root: root.into(), run, config: RwLock::new(config), engine, node, chain, hrp, mining, sock_path,
                                 human_pubkey: RwLock::new(human_pubkey), spend: Mutex::new(()), approval_outcomes: Mutex::new(HashMap::new()), boot_policy: raw,
-                                keystore, sigaudit, anchor, hot, book, session, routing, open_tried: Mutex::new(HashMap::new()), close_claims: Mutex::new(HashSet::new()), watch_interval,
+                                keystore, sigaudit, anchor, hot, book, session, open_tried: Mutex::new(HashMap::new()), close_claims: Mutex::new(HashSet::new()), watch_interval,
                                 ln, ln_error, ln_book, ln_funding: Mutex::new(HashMap::new()), enroll: Mutex::new(Default::default()),
                                 used_sigs: crate::admin::UsedSigs::new(&root.join(".run").join(crate::admin::USED_SIGS_FILE)) });
         if s.human_key().is_empty() {
@@ -523,41 +518,6 @@ impl Signer {
                 let _g = self.lock();
                 sanitize(self.mark_closed(p))
             }
-            "xbt402_sign_state_adaptor" => {
-                let _g = self.lock();
-                sigaudit::set_rule("policy:routing");
-                let route = p.get("route").filter(|r| r.is_object()).cloned().unwrap_or(json!({}));
-                match self.routing.sign_state_adaptor(&s("chan"), py_int(p.get("cum")).unwrap_or(0), &s("point"), route) {
-                    Ok(out) => sanitize(with(json!({"verdict": "allow"}), out)),
-                    Err(e) => deny(&e.code, e.msg),
-                }
-            }
-            "xbt402_resolve_lock" => {
-                let _g = self.lock();
-                match self.routing.resolve_lock(&s("chan"), &s("secret")) {
-                    Ok(t) => json!({"t": t}),
-                    Err(e) => deny(&e.code, e.msg),
-                }
-            }
-            "xbt402_void_lock" => {
-                let _g = self.lock();
-                match self.routing.void_lock(&s("chan")) {
-                    Ok(v) => json!({"voided": truthy(Some(&v))}),
-                    Err(e) => deny(&e.code, e.msg),
-                }
-            }
-            "xbt402_adopt_lock" => {
-                let _g = self.lock();
-                match self.routing.adopt_lock(&s("chan"), py_int(p.get("cum")).unwrap_or(0)) {
-                    Ok(()) => json!({"adopted": true}),
-                    Err(e) => deny(&e.code, e.msg),
-                }
-            }
-            "xbt402_recover_lock" => {
-                let _g = self.lock();
-                sanitize(self.recover_lock(p))
-            }
-            "routing_status" => sanitize(self.routing.status()),
             // AGP-048 rail=ln
             "ln_pay" => {
                 let _g = self.lock();
@@ -1199,8 +1159,8 @@ impl Signer {
             return Ok(deny("channel_cap", format!("cap_sats {cap} is above per_counterparty_cap_sats {}", cfg.per_counterparty_cap_sats)));
         }
         let blocks = py_int(p.get("expiry_blocks")).unwrap_or(0);
-        if blocks != 0 && (blocks <= cfg.refund_margin_blocks || blocks > max_expiry_blocks(&cfg, false)) {
-            return Ok(deny("expiry", format!("expiry_blocks {blocks} outside ({}, {}]", cfg.refund_margin_blocks, max_expiry_blocks(&cfg, false))));
+        if blocks != 0 && (blocks <= cfg.refund_margin_blocks || blocks > max_expiry_blocks(&cfg)) {
+            return Ok(deny("expiry", format!("expiry_blocks {blocks} outside ({}, {}]", cfg.refund_margin_blocks, max_expiry_blocks(&cfg))));
         }
         let close_fee = py_int(p.get("close_fee")).unwrap_or(0);
         if close_fee < 0 || (cfg.close_fee_max_sats > 0 && close_fee > cfg.close_fee_max_sats) {
@@ -1211,11 +1171,10 @@ impl Signer {
 
     /// AGP-063 W3: the payTo of `origin` this signer trusts: the owner's `counterparties[origin].pay_to`,
     /// else the seller's terms, fetched by the signer itself (`GET <origin>/x402/xbt-channel/terms`).
-    /// Never a caller's. Only for an allowlisted origin or routing hub, so it is no request to anywhere.
+    /// Never a caller's. Only for an allowlisted origin, so it is no request to anywhere.
     fn verified_pay_to(&self, origin: &str) -> Result<Vec<u8>> {
         let dest = normalize_dest(origin);
-        let hub = crate::routing::RoutePolicy::from_value(&self.config().routing).hubs.iter().any(|(h, _, _)| *h == dest);
-        if !hub && !self.engine.allowlist().contains(&dest) {
+        if !self.engine.allowlist().contains(&dest) {
             return Err(err("allowlist", format!("destination not on allowlist: {dest}")));
         }
         let mut pay_to = self.config().pay_to_for(&dest);
@@ -1263,8 +1222,7 @@ impl Signer {
         }
         let h = self.height()?;
         let rel = p.expiry as i64 - h;
-        let hub = crate::routing::RoutePolicy::from_value(&cfg.routing).hubs.iter().any(|(d, _, _)| *d == normalize_dest(origin));
-        let most = max_expiry_blocks(&cfg, hub);
+        let most = max_expiry_blocks(&cfg);
         if (!attaching && rel <= cfg.refund_margin_blocks) || rel > most {
             return Err(err("expiry", format!("expiry {} is {rel} blocks away, outside ({}, {most}]", p.expiry, cfg.refund_margin_blocks)));
         }
@@ -1749,26 +1707,6 @@ impl Signer {
         }
         self.anchor_after("close");
         with(self.book.get(&dest).map(|r| r.public()).unwrap_or(json!({})), json!({"verdict": "allow"}))
-    }
-
-    /// t + r off the hub's ch1 close: by txid (blockhash on a pruned node), as B2. Extension: the
-    /// caller may pass the raw close as `hex` (a payer that already holds it, and a node without the
-    /// tx); only its witness is read, and a secret counts only if it opens the stored T1.
-    fn recover_lock(&self, p: &Value) -> Value {
-        let given = str_or_empty(p.get("hex"));
-        let raw = if !given.is_empty() {
-            Some(given)
-        } else {
-            node::get_tx(&*self.node, &str_or_empty(p.get("txid")), &str_or_empty(p.get("blockhash")))
-                .and_then(|v| v.get("hex").and_then(Value::as_str).map(str::to_string))
-        };
-        let Some(raw) = raw else { return deny("unknown_tx", "close transaction not found") };
-        let Ok(tx) = Tx::parse_hex(&raw) else { return deny("unknown_tx", "close transaction does not parse") };
-        let wit = tx.inputs.first().map(|i| i.witness.clone()).unwrap_or_default();
-        match self.routing.recover_lock(&str_or_empty(p.get("chan")), &wit) {
-            Ok(t) => json!({"t": t}),
-            Err(e) => deny(&e.code, e.msg),
-        }
     }
 
     fn close_channel_locked(&self, p: &Value) -> Value {

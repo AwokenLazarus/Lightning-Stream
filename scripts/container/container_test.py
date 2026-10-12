@@ -1,28 +1,28 @@
 #!/usr/bin/env python3
 """AGP-038 container test: the amd64 images on regtest, configured only by env and a data dir.
 
-Stack on a private Docker network (`agp038-net-<pid>`; nothing but the MCP, the hub and the provider is
+Stack on a private Docker network (`agp038-net-<pid>`; nothing but the MCP and the provider is
 published, and only on 127.0.0.1, ports 23700-23799):
   knots      Knots 29.4.2 regtest (a test-only image: debian:bookworm-slim + the binary), rpcuser auth
   provider   xbt402-rust-provider (a test-only FROM scratch image), 150 sat per call
   witness    xbt-anchor-witness:agp038   data volume `witness`, socket volume `run-anchor`
   signer     xbt-signer:agp038           data volume `signer`, socket volumes `run-signer` (rw), `run-anchor` (ro)
   mcp        xbt-wallet-mcp:agp038       data volume `mcp`, `run-signer` (ro); HTTP on 127.0.0.1:23710
-  hub        xbt402-hub:agp038           data volume `hub`; HTTP on 127.0.0.1:23720
 Every image container runs read-only, non-root, with /tmp a tmpfs. The data dir is a set of named volumes
 that take their owners from the images' /data skeleton. The one provisioning step is the operator's: it
-writes the node's RPC credentials into signer/secrets and hub/secrets (a root helper container, as an app
-installer would). Everything else (the wrapping key, the MCP token, the hub's payTo key) is generated on
-first run.
+writes the node's RPC credentials into signer/secrets (a root helper container, as an app
+installer would). Everything else (the wrapping key, the MCP token) is generated on first run.
 
 Checks (each is PASS/FAIL in results.json):
   S  static: non-root users, read-only root filesystems, HEALTHCHECK passing, generated secrets 0600
   G  /readyz gating: the MCP is up before the signer (healthz 200, readyz 503), then ready; the witness
-     stopped / the node stopped make readyz 503 and ready again once they are back; the hub the same
+     stopped / the node stopped make readyz 503 and ready again once they are back
   P  one xbt402 call paid through the MCP over HTTP (bearer token), exact amounts
   R  docker kill + start of witness, signer and MCP: the channel, cum, keys, token and anchors persist;
      a second paid call reuses the channel; the witness's check of the signature log passes
-  H  the hub: healthz/readyz, and its payTo key persists across a restart
+(The H checks ran the hub and are retired with it; the other letters are unchanged. The hub was retired
+on 2026-10-11: payments between parties route over ordinary Lightning instead. Its code is in the git
+history, last at commit a548fb0.)
     scripts/container_test.sh   (builds the images, then runs this)
 """
 import json
@@ -40,7 +40,7 @@ KNOTS_BIN = os.environ.get("XBT_BIN", os.path.expanduser("~/lazarus-regtest/b1-x
 PID = os.getpid()
 P = f"agp038-{PID}"            # container/volume prefix
 NET = f"agp038-net-{PID}"
-MCP_PORT, HUB_PORT, PROV_PORT = 23710, 23720, 23730
+MCP_PORT, PROV_PORT = 23710, 23730
 RPC_PW = os.urandom(16).hex()
 PROVIDER = f"http://{P}-provider:9500"
 RESULTS = []
@@ -211,13 +211,6 @@ def run_mcp():
            "xbt-wallet-mcp:agp038")
 
 
-def run_hub():
-    # (AGP-104: a regtest node has no fee estimate, so the hub is given its funding fee rate)
-    docker("run", "-d", "--name", f"{P}-hub", *COMMON, *ENV_NODE, "-e", "XBT_BASE_PATH=/hub", "-e", "XBT_TRUST_FORWARDED=1", "-e", "XBT_HUB_FEE_RATE=2",
-           "-p", f"127.0.0.1:{HUB_PORT}:9480", "-v", f"{vol('hub')}:/data/hub",
-           "xbt402-hub:agp038")
-
-
 def health(name):
     return docker("inspect", "-f", "{{.State.Health.Status}}", f"{P}-{name}", check_rc=False).stdout.strip()
 
@@ -235,10 +228,6 @@ def signer_call(method, params=None):
 
 def mcp_ready():
     return status(f"http://127.0.0.1:{MCP_PORT}/readyz")
-
-
-def hub_ready():
-    return status(f"http://127.0.0.1:{HUB_PORT}/readyz")
 
 
 def build_test_images():
@@ -259,7 +248,7 @@ def build_test_images():
 
 def teardown():
     names = docker("ps", "-aq", "--filter", f"name=^{P}-", check_rc=False).stdout.split()
-    for n in ("mcp", "hub", "signer", "witness", "provider", "knots"):
+    for n in ("mcp", "signer", "witness", "provider", "knots"):
         with open(os.path.join(OUT, f"{n}.log"), "w") as f:
             r = docker("logs", f"{P}-{n}", check_rc=False)
             f.write(r.stdout + r.stderr)
@@ -282,7 +271,7 @@ def main():
     log(f"== AGP-038 container test, prefix {P}, network {NET}, evidence {OUT}")
     build_test_images()
     docker("network", "create", NET)
-    for v in ("node", "witness", "signer", "mcp", "hub", "run-signer", "run-anchor", "provider"):
+    for v in ("node", "witness", "signer", "mcp", "run-signer", "run-anchor", "provider"):
         docker("volume", "create", vol(v))
 
     # --- the node and the provider ---------------------------------------------------------------------------
@@ -310,7 +299,7 @@ def main():
     wait_until(lambda: status(f"http://127.0.0.1:{PROV_PORT}/x402/supported") == 200, 60, "the provider")
 
     # --- provisioning: the node credentials only ---------------------------------------------------------------
-    for v, uid in (("signer", 10001), ("hub", 10004)):
+    for v, uid in (("signer", 10001),):
         # the helper mounts the volume first, so Docker does not copy the image's /data/<component> owner into it: set it here
         helper(v, f"umask 077 && mkdir -p /d/secrets && printf 'xbt:{RPC_PW}' > /d/secrets/node-rpc-auth && chown -R {uid}:{uid} /d && chmod 700 /d")
 
@@ -354,8 +343,7 @@ def main():
           and any(s.startswith("640 10001:10001 /s/ready.json") for s in socks), socks)
 
     ref = []
-    for img, env in (("xbt-wallet-mcp:agp038", "XBT_MCP_HTTP_TOKEN=plain"), ("xbt-signer:agp038", "B2_HOT_PASSPHRASE=plain"),
-                     ("xbt402-hub:agp038", "XBT_SECRET_NODE_RPC_AUTH=xbt:plain")):
+    for img, env in (("xbt-wallet-mcp:agp038", "XBT_MCP_HTTP_TOKEN=plain"), ("xbt-signer:agp038", "B2_HOT_PASSPHRASE=plain")):
         r = docker("run", "--rm", "--network", "none", "--read-only", "-e", env, img, check_rc=False)
         ref.append((img, r.returncode, (r.stdout + r.stderr).strip()[-200:]))
     check("S", "production mode (the images' default): a secret as a plain env value is refused at start",
@@ -426,41 +414,20 @@ def main():
     docker("start", f"{P}-witness")
     wait_until(lambda: mcp_ready() == 200, 60, "MCP /readyz 200 with the witness back")
     check("G", "witness back: MCP /readyz 200", True)
-    run_hub()
-    wait_until(lambda: hub_ready() == 200, 60, "hub /readyz")
-    hub1 = json.loads(http("GET", f"http://127.0.0.1:{HUB_PORT}/readyz")[2])
-    check("H", "hub: /healthz 200, /readyz 200 (node synced), configured by env + data dir only",
-          status(f"http://127.0.0.1:{HUB_PORT}/healthz") == 200 and hub1["ok"], hub1)
-    # behind a proxy (Umbrel app_proxy / StartOS / Tor): the base path, and the 402's resource.url from X-Forwarded-*
-    fwd = {"X-Forwarded-Proto": "https", "X-Forwarded-Host": "abcdefghij234567.onion"}
-    c1, h1, b1 = http("GET", f"http://127.0.0.1:{HUB_PORT}/hub/x402/route", headers=fwd)
-    c2, _, b2 = http("GET", f"http://127.0.0.1:{HUB_PORT}/x402/route", headers={**fwd, "X-Forwarded-Prefix": "/hub"})
-    c3 = status(f"http://127.0.0.1:{HUB_PORT}/hub/healthz")
-    u1 = json.loads(b1)["resource"]["url"] if c1 == 402 else b1
-    u2 = json.loads(b2)["resource"]["url"] if c2 == 402 else b2
-    check("H", "hub behind a proxy: /hub/healthz 200; the 402's resource.url is the client's https .onion URL (prefix kept or stripped)",
-          c3 == 200 and u1 == u2 == "https://abcdefghij234567.onion/hub/x402/route", {"kept": [c1, u1], "stripped": [c2, u2], "healthz": c3})
     docker("stop", f"{P}-knots")
-    wait_until(lambda: mcp_ready() == 503 and hub_ready() == 503, 60, "readyz 503 with the node stopped")
+    wait_until(lambda: mcp_ready() == 503, 60, "readyz 503 with the node stopped")
     rz = json.loads(http("GET", f"http://127.0.0.1:{MCP_PORT}/readyz")[2])
-    hz = json.loads(http("GET", f"http://127.0.0.1:{HUB_PORT}/readyz")[2])
-    check("G", "node stopped: MCP /readyz 503 (signer: node unreachable) and hub /readyz 503; both /healthz 200",
-          rz["signer_ready"]["node"]["reachable"] is False and hz["node"]["reachable"] is False
-          and status(f"http://127.0.0.1:{MCP_PORT}/healthz") == 200 and status(f"http://127.0.0.1:{HUB_PORT}/healthz") == 200, {"mcp": rz, "hub": hz})
+    check("G", "node stopped: MCP /readyz 503 (signer: node unreachable); /healthz 200",
+          rz["signer_ready"]["node"]["reachable"] is False
+          and status(f"http://127.0.0.1:{MCP_PORT}/healthz") == 200, {"mcp": rz})
     docker("start", f"{P}-knots")
-    wait_until(lambda: mcp_ready() == 200 and hub_ready() == 200, 90, "readyz 200 with the node back")
-    check("G", "node back: MCP and hub /readyz 200", True)
-    docker("restart", f"{P}-hub")
-    wait_until(lambda: hub_ready() == 200, 60, "hub /readyz after restart")
-    hub2 = json.loads(http("GET", f"http://127.0.0.1:{HUB_PORT}/readyz")[2])
-    hk = helper("hub", "stat -c '%a %u %n' /d/secrets/hub-payto-key", ro=True).stdout.strip()
-    check("H", "hub restart: the same payTo (key generated once, 0600)", hub1["pay_to"] == hub2["pay_to"] and hk.startswith("600 10004"),
-          {"before": hub1["pay_to"], "after": hub2["pay_to"], "key": hk})
-    for n in ("witness", "signer", "mcp", "hub"):
+    wait_until(lambda: mcp_ready() == 200, 90, "readyz 200 with the node back")
+    check("G", "node back: MCP /readyz 200", True)
+    for n in ("witness", "signer", "mcp"):
         wait_until(lambda: health(n) == "healthy", 120, f"{n} healthy at the end", every=3)
     check("S", "every service HEALTHCHECK healthy at the end", True)
     with open(os.path.join(OUT, "facts.json"), "w") as f:
-        json.dump({"r1": r1, "r2": r2, "channels_before": chans1, "channels_after_restart": chans2, "channels_after_r2": chans3, "hub": hub2, "provider_ledger": prov_ledger[-2000:]},
+        json.dump({"r1": r1, "r2": r2, "channels_before": chans1, "channels_after_restart": chans2, "channels_after_r2": chans3, "provider_ledger": prov_ledger[-2000:]},
                   f, indent=1, default=str)
 
 

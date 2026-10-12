@@ -1,5 +1,20 @@
 # Engineering notes (xbt-rs)
 
+> **Read this first (2026-10-11).** The direction changed on this day. Lightning Stream is now
+> built on Lightning: it adds stream tickets to ordinary XBT Lightning channels, and that work is
+> in design, not built. The hub was retired and its code removed: the `xbt402-hub` binary, hub
+> routing with adaptor signatures, the hub's link to a Lightning node, the routed client, the
+> route providers, the wallet's routing policy and lock methods, their tests, scripts, vectors and
+> packages. The on-chain one-way channel is frozen: kept and tested, off the main path, no new
+> work.
+>
+> Everything below this note is the history of the on-chain channel and the hub, left as it was
+> written. Sections about the hub, routing, adaptor locks and the routed client describe code
+> that is no longer in the tree; it is in the git history, last at commit `a548fb0`. Commands,
+> scripts, crate rows, test counts and vector counts below that name removed parts no longer run
+> or no longer match. What runs today is in `README.md`; what is and is not covered is in
+> `docs/LIMITS.md`.
+
 Rust rails for XBT (Bitcoin with BLAKE2b proof of work): a shared chain-primitives crate and the
 xbt402 payment-channel crate (the x402 v2 XBT binding of `batch-settlement`,
 `extra.assetTransferMethod: "channel"`; `xbt-channel` accepted as an alias; spec v1.1 plus the v1.2

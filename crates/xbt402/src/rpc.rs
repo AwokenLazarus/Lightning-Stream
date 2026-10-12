@@ -145,11 +145,6 @@ impl Wallet for Rpc {
         self.sent(address, json!([address, amt.to_btc_string().parse::<f64>().unwrap_or(0.0)]))
     }
 
-    /// `listtransactions` is this wallet's record of what it sent.
-    fn knows_its_sends(&self) -> bool {
-        true
-    }
-
     fn wallet_sends_to(&self, address: &str) -> Result<Vec<String>> {
         let r = self.call("listtransactions", json!(["*", 1000, 0, true]))?;
         let mut out: Vec<String> = vec![];
@@ -161,12 +156,6 @@ impl Wallet for Rpc {
             }
         }
         Ok(out)
-    }
-
-    fn send_fee(&self, txid: &str) -> Result<Option<u64>> {
-        let Ok(tx) = self.call("gettransaction", json!([txid])) else { return Ok(None) };
-        // a send's fee is negative, in coins
-        Ok(tx.get("fee").and_then(Value::as_f64).and_then(|f| Amount::from_btc_f64(f.abs()).ok()).map(|a| a.to_sat()))
     }
 
     fn wallet_send(&self, txid: &str, address: &str) -> Result<Option<WalletSend>> {

@@ -12,7 +12,7 @@
 //! (`scripts/ln_rail_regtest.sh`, S12).
 use serde_json::{json, Value};
 
-/// The reader is shared with the hub's Lightning link (AGP-109): one parser of the format.
+/// The reader lives in `xbt402::macaroon`: one parser of the format.
 pub use xbt402::macaroon::{parse, Macaroon};
 
 /// What `rail=ln` needs, and nothing else (the README's baked macaroon).

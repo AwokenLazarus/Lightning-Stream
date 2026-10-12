@@ -3,8 +3,12 @@ import { sdk } from '../sdk'
 
 /**
  * StartOS-side settings (the `startos` volume, which no container mounts): the XBT node connection the owner
- * enters in the "Node connection" action, and whether the optional xbt402 hub runs. xbt-init copies the node
- * credentials into the signer's (and the hub's) secrets on the `main` volume on every start.
+ * enters in the "Node connection" action. xbt-init copies the node credentials into the signer's secrets on
+ * the `main` volume on every start.
+ *
+ * A store.json written before the hub was retired also holds `hubEnabled`. It still loads: `z.object` drops
+ * the keys it does not name, so the field is ignored on read and gone from the file at the next write
+ * (init merges into the file on every start).
  */
 const nodeShape = z.object({
   host: z.string().catch(''),
@@ -16,7 +20,6 @@ const nodeShape = z.object({
 
 const shape = z.object({
   node: nodeShape.catch(() => nodeShape.parse({})),
-  hubEnabled: z.boolean().catch(false),
 })
 
 export const storeJson = FileHelper.json({ base: sdk.volumes.startos, subpath: 'store.json' }, shape)

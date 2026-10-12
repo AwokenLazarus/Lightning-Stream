@@ -1,18 +1,21 @@
 # Lightning Stream
 
 Pay for a service piece by piece, as it arrives, over XBT (Bitcoin on BLAKE2b proof of work).
-Lock coins once in a payment channel. For each piece delivered, the buyer signs a slightly larger
-running total. The seller settles once, for the last total. Stop at any moment and nothing more is owed.
+Stop at any moment and nothing more is owed.
 
-Lightning Stream works beside Lightning, not inside it. A Stream channel is a direct, one-way
-channel anchored on the chain, for paying one seller piece by piece; it is not a Lightning channel
-and Lightning nodes do not route it. The two meet in two places. The agent wallet here pays over
-both under one owner policy: XBT Lightning invoices (BOLT 11) and offers (BOLT 12) through the
-owner's Lightning node, and Stream channels. And a hub, the way one channel reaches many sellers,
-is meant to run beside a Lightning node (planned; hubs are experimental). A Stream channel is not
-opened, funded or closed over Lightning and does not pay Lightning invoices: carrying it over
-Lightning would give up paying per piece or "stop any time and the rest is never paid". The
-whitepaper's section "Beside Lightning" has the reasons.
+**Lightning Stream is a streaming upgrade to Lightning.** It is built on ordinary XBT Lightning
+channels, not beside them, and adds one thing: the **stream ticket**. A ticket is a small
+Lightning payment that is locked along the route but not yet released. The buyer picks a secret
+and gives the seller only its hash; the seller's node issues a hold invoice for that hash and the
+buyer's node pays it. Nobody can take the money, because only the buyer knows the secret. To pay
+for a request, the buyer puts the secret in the request; the seller checks it, serves, and
+collects. A few tickets are locked before the service starts and topped up in the background, so
+no request waits for a payment. Lightning's own routing carries tickets to any seller the
+network reaches, with no change to the node software.
+
+This direction was decided on 2026-10-11. **Tickets are in design, not built**: the design was
+measured on a three-node Lightning Fork regtest, and none of it is in the wallet or in a seller
+yet. The sections below say what exists today, what is being built, and what was retired.
 
 Whitepaper: **<https://lazarus-xbt.xyz/stream/>**
 
@@ -23,9 +26,12 @@ Whitepaper: **<https://lazarus-xbt.xyz/stream/>**
 > this tree. Four follow-up audits of our own checked them: the first found 14 items (3 high), the
 > second 20 (6 high), the third 23 (none high, 11 medium), the fourth 18 (none high, 9 medium).
 > After the sixth round every finding is fixed or ends as a stated limit, and two items are open.
+> A later run of failure paths through the release binaries found three more open items, all on
+> the frozen on-chain channel. The hub has since been removed, and that removal has not been
+> reviewed by anyone.
 > **`docs/LIMITS.md` lists every stated limit, the open items, and what nobody has reviewed.**
 > None of the fixes has been re-reviewed by anyone outside the project; an independent audit is
-> planned. Hub routing (`xbt402-hub`) is experimental.
+> planned.
 >
 > Conformance results in `docs/ENGINEERING.md` are measured against our own Python references:
 > [Lightning-Stream-py-channel](https://github.com/AwokenLazarus/Lightning-Stream-py-channel) and
@@ -34,32 +40,74 @@ Whitepaper: **<https://lazarus-xbt.xyz/stream/>**
 > uses the x402 `batch-settlement` name with our own binding to XBT; upstream x402 clients cannot
 > pay it.
 
-## What is here
+## What exists today
 
-A Rust workspace: the channel protocol, an agent wallet that AI agents use over MCP, and the services
-and packages around them.
+- **The agent wallet and its policy engine.** An AI agent pays through the wallet over MCP and
+  never holds a key. The owner sets a signed policy: budgets, per-seller caps, an allowlist, a
+  threshold above which a human approves. Every signature goes into a tamper-evident log.
+- **The Lightning rail.** The wallet pays XBT Lightning invoices (BOLT 11) and offers (BOLT 12)
+  through the owner's Lightning node, under the same policy. This rail is what tickets will be
+  built on.
+- **The on-chain one-way channel (frozen).** A direct channel anchored on the chain, for paying
+  one seller piece by piece: the buyer signs a slightly larger running total for each piece and
+  the seller settles once. It is kept in the tree and tested, off the main path, with no new
+  work. Its remaining case is a seller that cannot run a Lightning node. Whether it stays is
+  decided after tickets run end to end.
+- **Pay with work.** A miner pays for a service with pool shares, settled in the coinbase and
+  checked by an audit.
+- **Fair exchange.** Content that can be checked piece by piece is paid for only as it checks
+  out: each chunk is bound by a Merkle proof, and the last one by a hash lock. Today this runs on
+  the frozen channel.
+
+## What is being built
+
+Stream tickets, in this order: the ticket book in the wallet's signer (secrets derived in the
+signer, many tickets in flight, each booked when it is locked and when its secret leaves); the
+seller component beside a Lightning node (registers the buyer's hashes, serves on a good secret,
+settles on use, cancels what is left); and the HTTP 402 entry that offers tickets to a buyer.
+Defaults in the design: 1,000-sat tickets, 8 in flight, a life of about 40 blocks. The buyer goes
+first and can lose at most one ticket; for content that can be checked, the buyer checks a piece
+before releasing its ticket.
+
+A seller will need a Lightning node with inbound capacity, and a buyer a Lightning node with a
+channel. `docs/LIMITS.md`, section "Stream tickets (in design)", states what the design gives up.
+
+## What was retired
+
+**The hub**, on 2026-10-11: the `xbt402-hub` service, routing between channels with adaptor
+signatures, the hub's link to a Lightning node, and the routed client. It was this project's own
+way for one channel to reach many sellers. Lightning's routing already does that, on a network
+that exists, so the hub rebuilt part of Lightning beside it. The external review also found the
+hub the weakest part of the tree. Its code, tests, scripts, vectors and packages are removed;
+they are in the git history, last at commit `a548fb0`.
+
+## What is in the tree
+
+A Rust workspace: the agent wallet that AI agents use over MCP, its Lightning rail, the frozen
+on-chain channel, pay with work, and the services and packages around them.
 
 | crate | what |
 |---|---|
 | `xbt-primitives` | XBT transactions, scripts, addresses, UnifiedSighash (0x21), strict ECDSA, BLAKE2b headers and proof of work |
-| `xbt402` | the Stream channel: funding, signed states, close, rollover, refund, the HTTP 402 wire (x402 v2 `batch-settlement`), receipts, provider and payer, hub routing with adaptor signatures (`xbt402-hub`) |
-| `xbt-signer` | the agent wallet's signer: keys never reach the agent (the owner can export a sealed backup); the owner's signed policy (budgets, per-seller caps, allowlist, human approval); a tamper-evident signature log; an optional Lightning rail |
+| `xbt402` | the frozen on-chain channel: funding, signed states, close, rollover, refund, the HTTP 402 wire (x402 v2 `batch-settlement`), receipts, provider and payer |
+| `xbt-signer` | the agent wallet's signer: keys never reach the agent (the owner can export a sealed backup); the owner's signed policy (budgets, per-seller caps, allowlist, human approval); a tamper-evident signature log; the Lightning rail (BOLT 11 and BOLT 12) |
 | `xbt-wallet-mcp` | the wallet's MCP server, over stdio and streamable HTTP, so an AI agent can quote and pay without holding a key |
 | `xbt-wallet-ui` | the owner's web UI: approvals, policy, channels, signature log |
-| `xbt-electrum` | a light chain backend for the buyer's wallet: it checks headers, proof of work and Merkle proofs itself; "not there" is answered only when every configured server answered, and servers that all hide a transaction make it read as absent |
+| `xbt-electrum` | a light chain backend for the buyer's wallet (it watches the frozen channel): it checks headers, proof of work and Merkle proofs itself; "not there" is answered only when every configured server answered, and servers that all hide a transaction make it read as absent |
 | `xbt-work`, `xbt-work-relay` | pay with work: a miner pays with pool shares, settled in the coinbase and checked by an audit |
 | `xbt-svc` | container plumbing: data dir, secrets, readiness |
 | `xbt402-interop` | conformance vectors and cross-implementation tools |
 
-`packaging/` holds the Umbrel and StartOS apps. `container/` and `docs/CONTAINER.md` cover the
-images. `docs/ENGINEERING.md` has the detailed design notes, conformance results and measurements.
-`docs/LIMITS.md` has the stated limits and open items.
+`packaging/` holds the Umbrel and StartOS apps of the wallet. `container/` and `docs/CONTAINER.md`
+cover the images. `docs/ENGINEERING.md` has the design notes, conformance results and measurements
+of the on-chain channel and the hub, as history. `docs/LIMITS.md` has the stated limits and open
+items.
 
 ## Build
 
 ```bash
 cargo test -j2 --workspace
-cargo build --release -p xbt-signer -p xbt-wallet-mcp -p xbt402
+cargo build --release -p xbt-signer -p xbt-wallet-mcp -p xbt-wallet-ui
 ```
 
 Rust stable; libsecp256k1 is built from source. Cross builds (Linux x86_64, aarch64, armv7, riscv64,

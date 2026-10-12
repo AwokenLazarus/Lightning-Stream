@@ -13,12 +13,12 @@ already exports (`exports.sh`):
 |---|---|
 | `APP_XBT_KNOTS_NODE_HOST` | container name of the node (`<app-id>_node_1`) |
 | `APP_XBT_KNOTS_RPC_PORT` | RPC port (8332) |
-| `APP_XBT_KNOTS_CHAIN` | `main` on a box; the wallet/hub apps read this |
+| `APP_XBT_KNOTS_CHAIN` | `main` on a box; the wallet app reads this |
 | `APP_XBT_KNOTS_RPC_USER` | RPC user |
 | `APP_XBT_KNOTS_RPC_PASS` | RPC password (`derive_entropy` on Umbrel) |
 
-The wallet (`lazarus-xbt-agent-wallet`) and hub (`lazarus-xbt402-hub`) depend on these names only.
-When CMP-098's app is installed, they do not change. Until then, an arm box needs an external
+The wallet (`lazarus-xbt-agent-wallet`) depends on these names only.
+When CMP-098's app is installed, it does not change. Until then, an arm box needs an external
 XBT (BLAKE2b) node and cannot use this stand-in.
 
 ## Why this image is not rebuilt here
@@ -30,4 +30,4 @@ infeasible on the build host. CMP-098 owns the shipping multi-arch node.
 ## Side-load
 
 `packaging/umbrel/bundle.sh` writes `images-amd64.tar` (includes this node) and `images-arm64.tar`
-(wallet, hub, init only — **no** stand-in node).
+(wallet, init only — **no** stand-in node).

@@ -1,7 +1,7 @@
 #!/bin/bash
 # AGP-067 (review C1) on regtest: a fee spike through the close margin. A private Knots 29.4.2 node
-# (B1's scripts/node.sh flags, maxmempool=5 in its bitcoin.conf), then xbt402-close-bump: a direct
-# channel and a hub ch2, each with the provider's close bump on and off. Before the close margin the
+# (B1's scripts/node.sh flags, maxmempool=5 in its bitcoin.conf), then xbt402-close-bump: two direct
+# channels, one with the provider's close bump on and one with it off. Before the close margin the
 # mempool is filled until its floor is about 10 sat/vB, and blocks take only packages paying 10
 # sat/vB or more. With the bump the provider's close (with a CPFP child) confirms right after the
 # margin; without it the close is refused to expiry and the payer's refund takes the channel back.

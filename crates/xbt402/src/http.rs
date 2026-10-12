@@ -104,10 +104,9 @@ mod server {
 
     use xbt_svc::http::{Handler, Request, Response};
 
-    use crate::hub::RouteHub;
     use crate::provider::{HttpResponse, Provider, PEER_HEADER};
 
-    /// Anything served over HTTP by [`serve_service`]: a provider, or a routing hub.
+    /// Anything served over HTTP by [`serve_service`]: a provider, or another scheme's server.
     pub trait HttpService: Send + Sync {
         fn body_limit(&self, path: &str) -> usize;
         fn serve(&self, method: &str, path: &str, headers: &[(String, String)], body: &[u8], url: &str) -> HttpResponse;
@@ -120,16 +119,6 @@ mod server {
 
         fn serve(&self, method: &str, path: &str, headers: &[(String, String)], body: &[u8], url: &str) -> HttpResponse {
             Provider::serve(self, method, path, headers, body, url, None)
-        }
-    }
-
-    impl HttpService for RouteHub {
-        fn body_limit(&self, path: &str) -> usize {
-            RouteHub::body_limit(self, path, None)
-        }
-
-        fn serve(&self, method: &str, path: &str, headers: &[(String, String)], body: &[u8], url: &str) -> HttpResponse {
-            RouteHub::serve(self, method, path, headers, body, url, None)
         }
     }
 
@@ -173,8 +162,7 @@ mod server {
         serve_service(provider, addr, threads)
     }
 
-    /// Serve any [`HttpService`] (a [`RouteHub`] holds a handler slot while it waits for a provider's
-    /// reveal, so give a hub a few more threads than it has concurrent clients).
+    /// Serve any [`HttpService`].
     pub fn serve_service(provider: Arc<dyn HttpService>, addr: &str, threads: usize) -> std::io::Result<Vec<JoinHandle<()>>> {
         serve_listener(provider, TcpListener::bind(addr)?, threads)
     }

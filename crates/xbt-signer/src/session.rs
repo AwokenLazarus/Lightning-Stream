@@ -154,11 +154,10 @@ pub enum FundingSpend {
 }
 
 /// The longest a channel's coins may be locked, in blocks from now (AGP-063 W3, AGP-089): the
-/// policy's `channel_expiry_blocks`, but at least four weeks so a provider's minimum fits. A routed
-/// ch1 must outlive the hub's ch2 to a provider, so a routing hub gets twice that. Every path that
+/// policy's `channel_expiry_blocks`, but at least four weeks so a provider's minimum fits. Every path that
 /// funds or rolls a channel holds the expiry to this, whoever named it (a seller's offer too).
-pub fn max_expiry_blocks(channel_expiry_blocks: i64, hub: bool) -> i64 {
-    channel_expiry_blocks.max(4032).saturating_mul(if hub { 2 } else { 1 })
+pub fn max_expiry_blocks(channel_expiry_blocks: i64) -> i64 {
+    channel_expiry_blocks.max(4032)
 }
 
 /// What one `xbt402_pay` may sign (AGP-089, review W1). The rule: a call never raises what its
@@ -307,7 +306,7 @@ impl Session {
         // AGP-089 (review C2): these three are the seller's numbers and they decide how long the
         // owner's coins are locked if the seller then never opens or closes the channel. The
         // owner's bound holds here as on the socket's open paths; refused before the preflight.
-        let most = max_expiry_blocks(expiry_blocks, false);
+        let most = max_expiry_blocks(expiry_blocks);
         let floor = xbt402::funding::open_expiry_floor(nn(min_exp), nn(min_conf), nn(margin));
         if floor > nn(most) {
             return Err(err("expiry", format!("the offer needs the channel locked for {floor} blocks (minExpiryBlocks + minConf + closeMarginBlocks); \

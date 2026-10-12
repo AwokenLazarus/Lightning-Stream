@@ -1,5 +1,5 @@
 //! AGP-090 (fix wave 4, channel client and transport): the neighbours of the paths the second
-//! closure audit named. `agp087_hub_b_client.rs` and `agp087_transport*.rs` hold the audit's own
+//! closure audit named. `agp087_funded_open.rs` and `agp087_transport*.rs` hold the audit's own
 //! tests; each test here is another way to the same state, and failed before the fix it names.
 //!
 //! The rules:

@@ -1236,10 +1236,9 @@
     "billing": "postpay",
     "derivation": "v3",
     "assetTransferMethod": "channel",
-    "settleMultiple": 20,
     "closeFeePayer": "payee",
-    "rolloverGraceBlocks": 36,
-    "routes": []
+    "settleMultiple": 20,
+    "rolloverGraceBlocks": 36
    }
   },
   "open": {
@@ -1255,10 +1254,6 @@
      "payerSpk": "0014ed3aef46c951f2db84d5672d34002b471c0f8765",
      "redeemScript": "632103c71471249f74aa0663dffabd5a60a7cccf3eda8101917719b86208c4986fc9efad6702de07b1756821033d9897ea5a2e67f0f2396bb2e515932a4844be53f0cbdc75b6f95ec9222c6bfeac",
      "closeFeePayer": "payee"
-    },
-    "hub": {
-     "payTo": "034bc624d9423e0781a9ea8309a0a781a9574468d72b7f831bd3616d0d030d5f0b",
-     "sig": "3045022100f3c919c72e888d087040fffd23f16367aad7b6ff6196c45a0a3ef397e56404a2022069cef946d79e553101fbf4906a95fd31879263f1183aff8658f283f0619dfd90"
     }
    },
    "status": 200,
@@ -1318,7 +1313,8 @@
         "closeUrl": "/x402/xbt-channel/close",
         "billing": "postpay",
         "derivation": "v3",
-        "assetTransferMethod": "channel"
+        "assetTransferMethod": "channel",
+        "closeFeePayer": "payee"
        }
       },
       "payload": {
@@ -1350,7 +1346,8 @@
        "closeUrl": "/x402/xbt-channel/close",
        "billing": "postpay",
        "derivation": "v3",
-       "assetTransferMethod": "channel"
+       "assetTransferMethod": "channel",
+       "closeFeePayer": "payee"
       }
      }
     },

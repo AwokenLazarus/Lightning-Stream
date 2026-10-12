@@ -14,7 +14,7 @@ ROOT=$(cd "$HERE/../.." && pwd)
 PKG=$HERE/xbt-agent-wallet
 START_CLI=${START_CLI:-$HOME/.local/opt/start-cli/start-cli}
 [ -x "$START_CLI" ] || { echo "build: start-cli missing at $START_CLI (github.com/Start9Labs/start-technologies releases, start-cli/v2.1.0)" >&2; exit 1; }
-for i in xbt-init xbt-signer xbt-anchor-witness xbt-wallet-mcp xbt-wallet-ui xbt402-hub; do
+for i in xbt-init xbt-signer xbt-anchor-witness xbt-wallet-mcp xbt-wallet-ui; do
   for p in linux/amd64 linux/arm64; do
     docker image inspect --platform "$p" "$i:0.1.0" >/dev/null 2>&1 || { echo "build: $i:0.1.0 ($p) not loaded (scripts/oci_build.sh --load)" >&2; exit 1; }
   done

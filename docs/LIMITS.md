@@ -9,6 +9,11 @@ outside the project has reviewed the fixes. The history, with counts, is in the 
 reasoning behind each rule is in the engineering notes (`docs/ENGINEERING.md` in the published
 tree).
 
+Direction, decided on 2026-10-11: Lightning Stream is being rebuilt on Lightning. It adds stream
+tickets to ordinary XBT Lightning channels (in design, not built). The hub was retired on that
+day and its code removed. The on-chain one-way channel is **frozen**: kept in the tree and
+tested, off the main path, with no new work. Sections about it are marked "frozen" below.
+
 This file has three parts:
 
 - **Stated limits**: behaviour we know about and have decided to state instead of change. One
@@ -18,178 +23,63 @@ This file has three parts:
   behaviour and is marked `open:` in the code.
 - **Not reviewed by anyone**: parts of the tree no review or audit has covered.
 
-"The hub", "the provider" and "the seller" are servers; "the payer", "the client" and "the wallet"
+"The provider" and "the seller" are servers; "the payer", "the client" and "the wallet"
 are the paying side. XBT is Bitcoin on BLAKE2b proof of work; "the SHA-256 chain" is the other
 chain. Numbers are the shipped defaults unless a sentence says otherwise.
 
 ## Stated limits
 
-### Hub (experimental)
+### Retired with the hub
 
-- The hub's routing is experimental; do not route funds you cannot lose.
-- The hub treats a spend six blocks deep as final (`spend_final_depth`): if a deeper
-  reorganisation brings in a provider's other close, the hub has released a lock it then pays, at
-  most one lock (20,000 sat) per provider channel.
-- With a chain scan that does not say how deep a spend is, a close that is mined, reorganised out
-  and mined again is counted from its first block, so a hold can be released one block deep; the
-  shipped binaries scan with a node that gives the depth. *(test)*
-- A completion that the hub's own ledger did not take is released as unpaid by the same watcher
-  tick when the provider's close is already six blocks deep: the hub has paid that lock and
-  collects nothing for it, at most one lock. *(test)*
-- A routed lock that needs the hub's signature is two requests to the provider. One the provider
-  refuses at the first costs the client nothing, is not rate-limited, and costs the hub and the
-  provider a few disk writes each.
-- A provider that agrees to a lock and then refuses it, or does not reveal in time, has that
-  channel set aside until it closes it or the hub refunds it at its expiry; a client cannot cause
-  this.
-- A provider that does not answer the hub's question about a lock within the reveal timeout (10
-  seconds) is set aside until it answers the hub's watcher, which asks one such provider per tick.
-  A provider that takes the lock itself and then stops answering is waited for once, for the
-  network timeout of 30 seconds, and then set aside; the hub's open, close and rollover requests
-  to a provider also wait up to 30 seconds each.
-- The hub admits an invoice only with its reveal timeout left: with the default invoice life of
-  15 seconds a provider is paid through a hub in the first 5 seconds of each invoice, and a
-  provider whose invoices live no longer than the hub's timeout is never paid through it. The
-  client refuses such a session when it starts; the hub cannot know its providers' invoice life
-  when it starts and only counts the locks it refused.
-- An invoice a hub has asked a provider about is paid through that hub's channel only, until it
-  expires.
-- A client whose lock a provider did not answer in time carries that lock in its channel until the
-  hub's channel to that provider is closed or refunded, and pays twice if it buys the same service
-  elsewhere meanwhile.
-- A client cannot check its hub's claim that a lock it gave up is still held, so it believes at
-  most two such claims at a time: a hub that lies can make it sign one lock above what it owes, at
-  most 50,510 sat with the default client settings (20,041 sat at a default hub). A claim that a
-  lock was completed must come with the secret that proves it.
-- With two given-up locks held, a client signs nothing more through that hub until one resolves.
-  A held lock completed late is proved by one of the hub's last 16 completions for that channel; a
-  client that asks after 16 later ones goes on counting it until its hub channel is replaced.
-- A client cannot close or roll over its hub channel cooperatively while a written-off lock above
-  its best state is unresolved; that lasts until the spend that resolves it is six blocks deep.
-- At its close margin the hub closes a client channel even below a written-off lock, and locks of
-  500 sat or less are not guarded.
-- A lock small enough to be covered by a channel's pre-paid floor is not collected from the client
-  if the provider refuses it or the channel closes while it is unanswered.
-- The hub fronts up to 600 sat for each provider channel: a provider that closes after one small
-  payment has been signed its close fee by the hub before any client paid for it.
-- A lock is at most half of a hub-to-provider channel's configured capacity; a rolled-over channel
-  can be smaller than that.
-- After a close or rollover that the node answered with an error, the channel serves nothing until
-  a spend is on the node; once seven such spends are unresolved a rollover is refused and a close
-  takes no higher final state.
-- The hub keeps one next key per provider channel, and its default channel life equals a default
-  provider's floor, so a refused rollover becomes a close and a new funding one block later.
-- A new hub-to-provider channel is funded only when the hub's own node shows the old one being
-  spent; a refill the provider's terms or the cap refuse is reported once and not tried again.
-- `liquidity_cap_sat` counts a channel until the hub's node shows a spender in its mempool; a close
-  that later leaves the mempool leaves one channel's capacity above the cap until that channel's
-  refund.
-- A hub-to-provider channel that falls out of step with its provider for any other reason is
-  refused at every check and is not replaced until its rollover or expiry.
-- A watcher step that fails or panics at one channel is caught and the other channels are still
-  served; `/healthz` answers 503 while the last tick panicked. It does not show a watcher that
-  hangs, the provider binaries have no `/healthz`, and a build with `panic = "abort"` ends the
-  process.
-- The hub's coins come back to its node wallet, which other applications on the same node can
-  spend; one address is taken from that wallet per funded channel and per sweep, so a wallet
-  restored from its seed must look past addresses that were never paid.
-- A sweep of returned coins is signed once and sent again each block; if its fee proves too low it
-  is not bumped. A payout under 656 sat stays on its channel's key. When fees are high the hub's
-  close of a client channel is bumped by spending the payout, so less is left to sweep. The claim
-  of a hash-locked payment pays the channel's own key from a second transaction, which the sweep
-  does not take.
-- The hub funds nothing without a fee rate: on a node that has no estimate the operator must set
-  one. While a mainnet node is below block 961,640 the hub waits and serves nothing, its health
-  endpoint included.
-- The status page and `/status` are on the hub's public port: they list its providers and stuck
-  payments, no client's channel, and can be turned off. A stuck payment's "resolves by" block
-  assumes the refund confirms in the first block after it is due. The status reads every archived
-  record on each request.
-- The hub's event list is kept in memory and is never trimmed.
-- A provider channel rolled over by a hub older than the fourth fix round is not watched, and a
-  new client against such a hub cannot adopt a completed lock: upgrade the hub first.
-- Hub and provider need a full node; a hub on a node without `gettxspendingprevout` sees a
-  provider's close only when it is in a block.
-- The hub's channel book and the seller's routes file are renamed into place without a directory
-  sync, so a power loss can undo the last save.
-- A routed call has no per-call receipt, and a routed session's call counter survives a provider
-  restart only with the write-ahead log, which is off by default.
-- A hub operator's `fee_ppm` must stay below about 1.8e16 divided by `max_lock_sat`; above it every
-  route request fails.
+The hub, the hub beside a Lightning node and the routed client were retired on 2026-10-11 and
+their code removed; the 59 limits stated for them here went with them. Lightning's own routing
+does what the hub did. The code and those limits are in the git history, last at commit
+`a548fb0`. What the removal leaves behind:
 
-### Hub beside a Lightning node
+- A wallet policy that still has a `routing` section loads; the signer ignores the section and
+  says so in a warning.
+- A wallet channel record that an earlier version left with a pending routed lock keeps it: the
+  signer signs no plain state below the locked amount, and has no method left to complete or give
+  up the lock. The channel is refunded at its expiry.
+- A provider ledger that still holds a channel a hub funded treats it as an ordinary channel: it
+  is closed at the close margin with the best signed state, and a routed lock recorded on it is
+  not waited for.
+- The signer socket no longer answers `xbt402_sign_state_adaptor`, `xbt402_resolve_lock`,
+  `xbt402_void_lock`, `xbt402_adopt_lock`, `xbt402_recover_lock` or `routing_status`; the Python
+  wallet reference still has them.
 
-- The hub's link to its operator's Lightning node makes two calls, a new address and a signed
-  message: it cannot send from the node's wallet, so capital reaches the hub only by the
-  operator's own send.
-- A return goes to the Lightning wallet only whole, only when its amount is known as its address
-  is named, and only when the hub still holds its capital (`capital_sat`) without it. A seller
-  channel's remainder always returns to the hub's own wallet. With no `capital_sat` set, which is
-  the shipped default, nothing returns to the Lightning wallet.
-- What is above capital therefore stays in the hub's wallet until a payout no larger than it
-  comes in: a hub whose capital is all that was sent in returns a buyer channel's payout only once
-  the fees it has earned exceed that whole payout.
-- What the hub holds is looked at once a block and at least every 30 seconds. Coins the operator
-  takes out of the hub's wallet between two looks can leave the hub under its capital by the
-  returns handed out before the next look. A sum the status marks as estimated is used as it is.
-- One Lightning address takes every return until the hub's node shows a return to it in a block,
-  so several returns can pay one address, and each stop of the hub between the node's answer and
-  the hub's write leaves one address of the node's wallet that is never paid.
-- With the Lightning node unreachable the hub goes on paying the address it has. Once the chain
-  shows that one used, returns refill the hub's own wallet until the node answers; it is asked
-  every 30 seconds.
-- On mainnet the hub does not use a macaroon with any permission beyond the two calls. The
-  per-entity form (`address:write`, `message:write`) is taken because at Lightning Fork
-  0.21.3-beta-blake2b.17 each covers exactly one call; a later node version that puts another call
-  under either would widen such a macaroon unseen. The per-call form cannot widen. Off mainnet a
-  wider macaroon is used and named in the log.
-- The hub reads what a macaroon says it allows, once at start. It does not check that the node
-  honours it, and a `time-before` caveat that passes shows only as the node refusing.
-- A macaroon for the signed message alone names the hub and returns nothing. One for the address
-  alone does neither: the hub pays no address of a node that has not signed.
-- Whoever holds the hub's macaroon can have the node sign any text, and so a statement naming
-  another key as that node's hub. A payer takes no statement that runs more than 31 days ahead,
-  and nothing takes back a signed statement before it runs out.
-- The statement says which hub key belongs to which node. It says nothing about the node's
-  channels or coins: no Lightning payment and no Lightning key is part of a Stream payment.
-- The link is REST over TLS with the node's certificate pinned and the name not checked. When the
-  node makes a new certificate the link fails until the operator gives the hub the new one, and
-  the address on file is then not paid until the node has signed again.
-- Plain http to the node is taken only to a loopback address, and the macaroon goes to whatever
-  answers there.
-- A hub whose clock is more than a day ahead gets statements that payers refuse.
-- The link's file keeps every Lightning address the hub has paid and is never trimmed. A hub
-  restored from an older copy of its data directory can pay an address that was used since.
-- The status page shows the node id, the hub's address and the address returns go to, on the
-  hub's public port.
-- Nothing here was run on mainnet or on a StartOS or Umbrel box: on regtest, beside one Lightning
-  Fork node in a container.
+### Stream tickets (in design)
 
-### Routed client
+Nothing in this section is shipped code. A ticket is a small Lightning payment locked along a
+route to a hash whose secret only the buyer knows (a hold invoice on the seller's node); the
+buyer releases it by putting the secret in a paid request. Each sentence below comes from the
+design's lab measurements: three Lightning Fork nodes on regtest, buyer and seller one routing
+node apart, default node settings. None comes from a wallet or a seller built on tickets.
 
-- A client given a hub as `<node id>@host:port` asks it over plain http (a full URL after the `@`
-  is used as it is), and takes no quote and opens nothing unless the hub shows that node's
-  statement for the key it is paid on. The statement is checked at each offer the client reads,
-  not between them: one that runs out stops the client at its next fee quote.
-- A hub that shows a statement must show a good one, whoever named it: a hub whose statement has
-  run out or is wrong is refused by URL too. A hub that shows none is paid by URL as before.
-- The client's own clock decides whether a statement has run out.
-- The signer and the wallet's policy know a hub by the address it is asked at, so a hub that
-  moves needs a new approval; the node id is not a policy entry yet.
+- Money moves a ticket at a time (1,000 sat by default, 1 sat at the least). Pieces inside a
+  ticket are metered, and the unused part of the ticket in use is trusted to the seller.
+- The buyer can lose one ticket: a secret is spent when it leaves the wallet, and a seller can
+  take it and serve nothing.
+- Unused tickets stay locked until the seller cancels them or they expire. Measured with 40-block
+  tickets: 25 blocks with a seller that neither settles nor cancels, 51 blocks through one hop
+  with a seller that went offline.
+- The seller needs a Lightning node with inbound capacity, and must stay online while tickets are
+  locked: a seller offline when locked tickets expire had its channel force-closed (measured), and
+  a ticket not settled 18 blocks before its expiry is cancelled by the seller's own node.
+- Tickets are held payments. A cancelled ticket pays routing nodes nothing for the capacity and
+  the slot it held, which is the behaviour Lightning's jamming defences are designed against; so
+  tickets have to stay few, small and short-lived.
+- BOLT 11 hold invoices only. The Lightning Fork's BOLT 12 offers have no hold path.
+- One hop was measured, on one host. Two or more hops, real network latency, mainnet routes and
+  fees, a direct channel, and a force close with many tickets were not.
+- The Core Lightning fork is untested, as a seller, a buyer or a hop. It has no hold-invoice call
+  of its own.
+- Every hop sees the same hash, so hops that collude can link a ticket along its route, and a
+  ticket cannot be partly released.
 
-- A routed client's hub channel is funded once. If the funding call fails without saying whether
-  it sent, a wallet that keeps a record of its sends is asked what it sent; a wallet that cannot
-  say is not asked again, also when its first call only refused, and nothing is opened until the
-  owner has looked for the send and removed the record (`forget_unfunded`).
-- A hub channel that was recorded and never funded is retried until it is too near its expiry
-  (about 48 days); the client then refuses to open until its owner removes the record.
-- A hub that refuses a funded channel keeps its coins locked until the channel's expiry.
-- How long a routed client's coins are locked in its hub channel is at most 8,064 blocks or the
-  owner's own wish if that is larger; it cannot be set lower than 8,064.
-- `xbt402-route-payer` is a test tool: without `--signer-sock` its channel key lives in the process
-  only.
+### Channel and transport (library client) (frozen)
 
-### Channel and transport (library client)
+The on-chain one-way channel. Frozen: these limits stand as written and get no new work.
 
 - The open preflight is the seller's word: a seller that says yes and then refuses the funded open
   locks the buyer's capacity until the channel's expiry, at most 4,032 blocks, and the client can
@@ -259,11 +149,13 @@ chain. Numbers are the shipped defaults unless a sentence says otherwise.
 
 ### Agent wallet (`xbt-signer`)
 
+The sentences here about channels, rollovers, closes and refunds are about the frozen on-chain
+channel; the rest (policy, approvals, keys, the socket) holds for every rail.
+
 - Channel funding is not a budget item: up to the per-channel cap plus the close fee can sit in
   one channel per allowlisted seller, and on-chain fees are outside every budget.
 - A seller's terms can lock a channel's coins for up to `max(channel_expiry_blocks, 4032)` blocks,
-  twice that for a routing hub the owner listed. The 144-block floor on a channel's life holds for
-  channels the pay tool opens on a seller's offer; the socket's `open_channel`, `fund` and rollover
+  whoever names it. The 144-block floor on a channel's life holds for channels the pay tool opens on a seller's offer; the socket's `open_channel`, `fund` and rollover
   refuse only an expiry inside the refund margin (6 blocks).
 - After an answer is lost the wallet pays the next call with one new state on the seller's
   unsigned word that it holds the last one. A seller that serves nothing, or anyone who can answer
@@ -303,8 +195,7 @@ chain. Numbers are the shipped defaults unless a sentence says otherwise.
 - The backup export's signature does not name the passphrase the backup is sealed under; an
   expired approval can be dismissed without a signature; a key blob without a recorded cost opens
   at scrypt 2^15 and is re-sealed only when its file is next written.
-- A voided routed lock keeps its budget. Key wiping covers long-lived copies in the Rust signer
-  only.
+- Key wiping covers long-lived copies in the Rust signer only.
 - Stream chunks are paid without a signed receipt; each is bound by a Merkle proof or a hash lock.
   An answer of 400 or above is handed to the agent without a receipt.
 - One payment at a time: the wallet holds one lock for a whole `xbt402_pay`, the seller's answers
@@ -430,7 +321,7 @@ chain. Numbers are the shipped defaults unless a sentence says otherwise.
 - A light wallet's coin scan says whether every server answered, but the wallet does not read
   that: a coin only the missing server shows is counted at a later reconcile.
 - On the light backend a funding that can never confirm holds its destination for good.
-- The provider and the hub need a full node: on the light backend "not shown" would read as
+- The provider needs a full node: on the light backend "not shown" would read as
   "spent".
 - A light hot wallet cannot spend coinbase coins. The light client supports mainnet and regtest
   only. A server that keeps refusing to give its tip is connected to again on every header sync,
@@ -478,7 +369,7 @@ chain. Numbers are the shipped defaults unless a sentence says otherwise.
 
 - Release builds check every integer addition, subtraction and multiplication in every crate; a
   missed overflow stops the request it is in with a `500`, and nothing of that request is kept.
-- A panic in one watcher tick or loop round is caught and the next one runs, in the hub, the
+- A panic in one watcher tick or loop round is caught and the next one runs, in the
   provider binaries, the signer and the work provider; what a panic that repeats every round does
   is in each area above.
 - A binary built with the `release-small` profile aborts the whole process on any panic; the
@@ -488,7 +379,6 @@ chain. Numbers are the shipped defaults unless a sentence says otherwise.
 - A payer that sends a request `seq` of 2^64 - 1 has spent every later request on that channel; it
   can still close it.
 - The images and size tables under `dist/` were built before overflow checks were turned on.
-  `presign_with_nonces` is behind a cargo feature, not `cfg(test)`.
 
 ### Python references
 
@@ -498,15 +388,15 @@ reference's own repository:
 [Lightning-Stream-py-channel](https://github.com/AwokenLazarus/Lightning-Stream-py-channel) and
 [Lightning-Stream-py-wallet](https://github.com/AwokenLazarus/Lightning-Stream-py-wallet).
 
-- The Python hub has no link to a Lightning node and shows no statement. The Python routed client
-  does not read a statement and does not take `<node id>@host:port`.
-
 ## Open items
 
 Not fixed. Each is marked in the code with the text in brackets, on a test that asserts the right
 behaviour; searching the trees for `open: AGP-102` and `open: AGP-111` finds exactly these. The
 `AGP-111` ones are checks of `scripts/failure_interop.sh`, which runs the release binaries: the
 script prints them as `FAIL (open item)` with what it observed, and goes on.
+
+The three `AGP-111` items are all on the frozen on-chain channel's pay rail. They stay listed
+and get no fix unless the channel is kept.
 
 - **A streamed result cannot be bought on a postpay channel that is one call behind**
   (`open: AGP-102 list 1 item 13`; Rust wallet, two tests; Python wallet, one). A stream's last
@@ -558,8 +448,9 @@ Neither the external review nor any of the project's four audits covered:
 - `xbt-svc` and `xbt-init`, and the scripts under `tools/`;
 - any server built with the `release-small` profile, and any hostile input against a release
   build: the audits attacked debug builds, and release builds ran the ordinary paths only;
-- the hub's link to a Lightning node and the node-signed statement (`ln_wallet.rs`,
-  `hub_identity.rs`, the shared macaroon reader): written after the last audit;
+- the macaroon reader the Lightning rail uses (`xbt402::macaroon`): written after the last audit;
+- the removal of the hub itself (2026-10-11): what was cut from the provider, the client library
+  and the signer, and how records of the removed features are treated;
 - anything on a real network: no mainnet node, no public Electrum server and no Lightning node
   outside a test rig was used, and every "blocks" figure was measured on regtest blocks mined at
   once.
@@ -567,8 +458,8 @@ Neither the external review nor any of the project's four audits covered:
 The cross-implementation scripts run the ordinary path. `scripts/failure_interop.sh` runs these
 failure paths through the release binaries on regtest, and no others have been run that way: an
 answer lost on a direct channel (the signer's rail and the library client); a provider that stops
-answering, direct and behind a hub; one hostile Electrum server among two honest ones (silent,
-hiding the wallet's transactions, sending malformed numbers); a kill and restart of the provider,
-the signer and the hub in the middle of a payment; and a seller that refuses a funded open. Its
+answering; one hostile Electrum server among two honest ones (silent,
+hiding the wallet's transactions, sending malformed numbers); a kill and restart of the provider
+and the signer in the middle of a payment; and a seller that refuses a funded open. Its
 faults are injected on loopback by a proxy and by signals: a slow or lossy network, a full disk,
 a clock that jumps and two faults at once were not tried.

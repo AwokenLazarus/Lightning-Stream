@@ -13,12 +13,9 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 use xbt402::client::{split_url, Client, ClientConfig, FileClientLedger, MemoryClientLedger, Stage, Transport, Wallet, WalletSend};
 use xbt402::funding::{ChainBackend, FundingPolicy, UtxoInfo};
-use xbt402::hub::{HubConfig, RouteHub};
 use xbt402::ledger::Ledger;
 use xbt402::provider::{HttpResponse, Provider, ProviderConfig};
-use xbt402::route::SpendScan;
-use xbt402::route_client::{RoutePayer, RoutePayerConfig};
-use xbt402::signer::{LocalSigner, RouteSigner};
+use xbt402::signer::LocalSigner;
 use xbt402::wire::{b64json, payment_payload, request_auth, request_digest_v2, unb64json, CLOSE_PATH, FACILITATOR_VERIFY, OPEN_PATH, ROLLOVER_PATH};
 use xbt402::{ChannelError, Result};
 use xbt_primitives::address::address_to_spk;
@@ -28,7 +25,6 @@ use xbt_primitives::tx::Tx;
 
 const NET: &str = "bip122:11111111111111111111111111111111";
 const O: &str = "https://api.example";
-const HUB: &str = "http://hub.test";
 const PRICE: u64 = 150;
 
 // --- the rig of agp090_client.rs ---------------------------------------------------------------
@@ -66,12 +62,6 @@ impl ChainBackend for MemChain {
     }
 }
 
-impl SpendScan for MemChain {
-    fn find_spend(&self, _txid: &str, _vout: u32, _from: u32) -> Result<Option<Tx>> {
-        Ok(None)
-    }
-}
-
 #[derive(Default)]
 struct TestWallet {
     chain: Arc<MemChain>,
@@ -94,12 +84,6 @@ impl Wallet for Shared {
         self.0.chain.utxos.lock().unwrap().insert((txid.clone(), 0), UtxoInfo { confirmations: 6, value: sats, script_pubkey: spk, coinbase: false });
         sends.push((txid.clone(), address.to_string(), sats));
         Ok((txid, 0))
-    }
-    // AGP-105: this double either refuses or returns its outpoint, so its "none" is "sent
-    // nothing"; a wallet that does not say so is no longer asked again after a failed `fund`
-    // (`agp102_route_client.rs`, `agp105_route_client.rs`)
-    fn knows_its_sends(&self) -> bool {
-        true
     }
     fn wallet_sends_to(&self, _address: &str) -> Result<Vec<String>> {
         Ok(vec![])
@@ -670,112 +654,6 @@ fn hole_signer_backed_an_earlier_rollover_that_confirms_after_a_later_yes_is_ado
             next.capacity, &on_chain[..16], r.unwrap_err());
 }
 
-// --- Part C, found-not-fixed 1 and its neighbours: the routed client's ch1 ----------------------
-
-/// The hub as the routed client reaches it. `refuse`: funded opens are answered `bad_funding`
-/// (the hub never hears of them). `lose`: the hub opens the channel and the answer is lost.
-struct HubNet {
-    hub: Arc<RouteHub>,
-    refuse: Arc<AtomicBool>,
-    lose: Arc<AtomicUsize>,
-}
-
-impl Transport for HubNet {
-    fn request(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)]) -> Result<HttpResponse> {
-        let (_, path) = split_url(url);
-        let req: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
-        let funded_open = path == OPEN_PATH && req.get("preflight") != Some(&Value::Bool(true));
-        if funded_open && self.refuse.load(Ordering::SeqCst) {
-            return Ok(HttpResponse::new(400, vec![], json!({"error": "bad_funding", "detail": "no"}).to_string().into_bytes()));
-        }
-        let r = self.hub.serve(method, &path, headers, body, url, None);
-        if funded_open && self.lose.load(Ordering::SeqCst) > 0 {
-            assert_eq!(r.status, 200, "the hub opened ch1: {}", String::from_utf8_lossy(&r.body));
-            self.lose.fetch_sub(1, Ordering::SeqCst);
-            return Err(ChannelError::new("transport_error", "timed out reading the answer"));
-        }
-        Ok(HttpResponse::new(r.status, r.headers.into_iter().map(|(k, v)| (k.to_ascii_uppercase(), v)).collect(), r.body))
-    }
-}
-
-struct NoNet;
-
-impl Transport for NoNet {
-    fn request(&self, _: &str, url: &str, _: &[u8], _: &[(String, String)]) -> Result<HttpResponse> {
-        Err(ChannelError::new("transport_error", format!("refused: {url}")))
-    }
-}
-
-struct Routed {
-    w: World,
-    refuse: Arc<AtomicBool>,
-    lose: Arc<AtomicUsize>,
-    hub: Arc<RouteHub>,
-}
-
-fn routed(name: &str) -> Routed {
-    let w = world(name);
-    let hub_cfg = HubConfig::from_json(&json!({"spend_final_depth": 1, "fee_base_msat": 100, "fee_ppm": 2000, "max_lock_sat": 20000, "max_unguarded_lock_sat": 500,
-                                               "delta": 36, "reveal_timeout": 1.0, "ch2_capacity": 100000, "ch2_expiry_blocks": 1000,
-                                               "close_margin": 36, "policy": {"min_capacity": 20000, "min_expiry_blocks": 500, "max_expiry_blocks": 8640}})).unwrap();
-    let hub = Arc::new(RouteHub::new(w.chain.clone(), w.chain.clone(), Box::new(Shared(Arc::new(TestWallet { chain: w.chain.clone(), ..TestWallet::default() }))),
-                                     Box::new(NoNet), SecretKey::from_slice(&sha256(b"hub")).unwrap(), NET, Some(&w.dir.join("hub")), hub_cfg).unwrap());
-    Routed { w, refuse: Arc::new(AtomicBool::new(false)), lose: Arc::new(AtomicUsize::new(0)), hub }
-}
-
-impl Routed {
-    fn payer(&self) -> RoutePayer {
-        let c = self.w.chain.clone();
-        let signer: Arc<dyn RouteSigner> = Arc::new(LocalSigner::new());
-        RoutePayer::new(HUB, RoutePayerConfig::new(NET), signer, Arc::new(Shared(self.w.wallet.clone())),
-                        Box::new(HubNet { hub: self.hub.clone(), refuse: self.refuse.clone(), lose: self.lose.clone() }), Box::new(move || c.block_count()))
-    }
-}
-
-/// Control: the routed client opens ch1 once at an honest hub, and a second `open` funds nothing.
-#[test]
-fn ok_the_routed_client_opens_ch1_once() {
-    let r = routed("route-ok");
-    let pay = r.payer();
-    pay.open().unwrap();
-    pay.open().unwrap();
-    assert_eq!(r.w.funded(), 1);
-}
-
-/// HOLE (Medium, left from before: the routed variant of the audit's item 4, which named the
-/// library client only). A hub that answers the preflight yes and the funded open no. The Rust
-/// routed client records ch1 only when it has a ledger, and then only after `fund_channel` and
-/// `attach` returned (`route_client.rs:575-585`); without a ledger a refused open leaves nothing
-/// on the books, and every `open` funds another ch1. The routed client has no budget
-/// (`budget_sats` is the library client's), so the hub's `minCapacity` is the amount, each time.
-#[test]
-fn hole_the_routed_client_funds_a_refusing_hub_once() {
-    let r = routed("route-refuse");
-    r.refuse.store(true, Ordering::SeqCst);
-    let pay = r.payer();
-    for _ in 0..4 {
-        assert_eq!(pay.open().unwrap_err().code, "bad_funding");
-    }
-    let sent: u64 = r.w.wallet.sends.lock().unwrap().iter().map(|s| s.2).sum();
-    assert_eq!(r.w.funded(), 1, "four calls to open funded {} ch1s, {sent} sat in all, at a hub that opened none", r.w.funded());
-}
-
-/// HOLE (Low, left from before; the "lost answer" side of the same open). With a ledger the
-/// routed client posts the open again and funds nothing, but it does not take the hub's
-/// `duplicate_channel` for the yes that was lost (the library client does, `client.rs:898`): after
-/// one lost answer `open` fails on every call and after every restart, with ch1 funded and open
-/// at the hub.
-#[test]
-fn hole_the_routed_client_finishes_an_open_whose_answer_was_lost() {
-    let r = routed("route-lost");
-    r.lose.store(1, Ordering::SeqCst);
-    let pay = r.payer().with_ledger(Box::new(MemoryClientLedger::default())).unwrap();
-    assert_eq!(pay.open().unwrap_err().code, "transport_error");
-    let again = pay.open();
-    assert_eq!(r.w.funded(), 1, "nothing is funded twice");
-    assert!(again.is_ok(), "the hub has ch1 open and the client can never finish its open: {:?}", again.unwrap_err());
-}
-
 // --- Part C item 4: overflow checks are on in release; a counterparty's number must not panic ---
 
 fn extreme_numbers() -> Vec<Value> {
@@ -1059,214 +937,5 @@ mod sockets {
         server(27_380, vec![both]);
         let r = get(&UreqTransport::default(), 27_380);
         assert!(r.is_err(), "{r:?}");
-    }
-}
-
-// --- AGP-094 (fix wave 5): the routed client's open, stage by stage --------------------------------------------
-
-/// A wallet that knows its own sends, and whose next `fund` errors after it sent.
-struct Flaky {
-    inner: Shared,
-    fail_after_send: AtomicBool,
-}
-
-impl Wallet for Flaky {
-    fn fund(&self, address: &str, sats: u64) -> Result<(String, u32)> {
-        let r = self.inner.fund(address, sats)?;
-        if self.fail_after_send.swap(false, Ordering::SeqCst) {
-            return Err(ChannelError::new("wallet_error", "timed out after the send"));
-        }
-        Ok(r)
-    }
-    fn wallet_sends_to(&self, address: &str) -> Result<Vec<String>> {
-        Ok(self.inner.0.sends.lock().unwrap().iter().filter(|s| s.1 == address).map(|s| s.0.clone()).collect())
-    }
-    fn wallet_send(&self, txid: &str, address: &str) -> Result<Option<WalletSend>> {
-        Ok(self.inner.0.sends.lock().unwrap().iter().find(|s| s.0 == txid && s.1 == address)
-            .map(|s| WalletSend { txid: s.0.clone(), vout: 0, sats: s.2, confirmations: 6, abandoned: false }))
-    }
-}
-
-impl Routed {
-    fn payer_with(&self, signer: Arc<dyn RouteSigner>, wallet: Arc<dyn Wallet>) -> RoutePayer {
-        let c = self.w.chain.clone();
-        RoutePayer::new(HUB, RoutePayerConfig::new(NET), signer, wallet,
-                        Box::new(HubNet { hub: self.hub.clone(), refuse: self.refuse.clone(), lose: self.lose.clone() }), Box::new(move || c.block_count()))
-    }
-}
-
-/// The audit's "from reading" beside item 5: `fund_channel` errors after it broadcast. The next
-/// `open` finds the wallet's own send to ch1's script and goes on with it, under the key the
-/// first call was given (a second `new_key` would replace it in a `LocalSigner`, and the funded
-/// channel could then not be bound: `attach` checks the key).
-#[test]
-fn agp094_a_ch1_funding_that_failed_after_it_was_sent_is_adopted_under_the_same_key() {
-    let r = routed("route-flaky");
-    let wallet = Arc::new(Flaky { inner: Shared(r.w.wallet.clone()), fail_after_send: AtomicBool::new(true) });
-    let pay = r.payer_with(Arc::new(LocalSigner::new()), wallet);
-    assert_eq!(pay.open().unwrap_err().code, "wallet_error");
-    assert_eq!(r.w.funded(), 1, "control: the funding was sent");
-    assert!(pay.chan().is_none(), "no outpoint on the books yet");
-    let out = pay.open().unwrap();
-    assert_eq!((r.w.funded(), out["resumed"].clone()), (1, json!(true)), "the send is adopted, nothing is funded twice");
-    assert_eq!(pay.chan(), out["chan"].as_str().map(str::to_string));
-}
-
-/// ch1's key is on the books before the wallet is asked: a wallet that refuses (nothing sent)
-/// leaves a ch1 recorded without an outpoint, and the next `open` funds that one, once. With a
-/// ledger a restarted payer reads it back and does the same.
-#[test]
-fn agp094_a_keyed_ch1_is_funded_once_by_the_next_open_with_and_without_a_ledger() {
-    for with_ledger in [false, true] {
-        let r = routed(if with_ledger { "route-keyed-l" } else { "route-keyed" });
-        let signer: Arc<dyn RouteSigner> = Arc::new(LocalSigner::new());
-        let path = r.w.dir.join("route.jsonl");
-        let make = || {
-            let p = r.payer_with(signer.clone(), Arc::new(Shared(r.w.wallet.clone())));
-            if with_ledger { p.with_ledger(Box::new(FileClientLedger::open(&path).unwrap())).unwrap() } else { p }
-        };
-        let mut pay = make();
-        r.w.wallet.refuses.store(true, Ordering::SeqCst);
-        for _ in 0..3 {
-            assert_eq!(pay.open().unwrap_err().code, "wallet_error");
-        }
-        assert_eq!(r.w.funded(), 0);
-        r.w.wallet.refuses.store(false, Ordering::SeqCst);
-        if with_ledger {
-            drop(pay);
-            pay = make(); // a restart: the keyed ch1 is read back
-        }
-        pay.open().unwrap();
-        pay.open().unwrap();
-        assert_eq!(r.w.funded(), 1, "ledger {with_ledger}");
-    }
-}
-
-/// The bound of the new record: a ch1 recorded, never funded, and now too near its expiry for
-/// the hub to open is not funded and not replaced (an earlier call may have sent its funding):
-/// `open_unresolved`, until the owner says the wallet shows no send to it (`forget_unfunded`).
-#[test]
-fn agp094_a_keyed_ch1_too_old_to_fund_is_refused_until_it_is_forgotten() {
-    let r = routed("route-stale");
-    let pay = r.payer();
-    r.w.wallet.refuses.store(true, Ordering::SeqCst);
-    assert_eq!(pay.open().unwrap_err().code, "wallet_error");
-    r.w.wallet.refuses.store(false, Ordering::SeqCst);
-    // RoutePayerConfig's 8,000 blocks against the hub's floor (500 + minConf + 36 here)
-    *r.w.chain.tip.lock().unwrap() += 8_000 - 400;
-    assert_eq!(pay.open().unwrap_err().code, "open_unresolved");
-    assert_eq!(r.w.funded(), 0);
-    assert!(pay.forget_unfunded().unwrap() && !pay.forget_unfunded().unwrap());
-    // (back at the height the rig's hub still has cached) a new ch1, a new key, funded once
-    *r.w.chain.tip.lock().unwrap() -= 8_000 - 400;
-    pay.open().unwrap();
-    assert_eq!(r.w.funded(), 1);
-}
-
-// --- AGP-101: a ch1 funding the signer made and the payer never heard of ----------------------------------------
-
-/// A signer that funds, as `xbt-signer` does over its socket (the real one is run with the
-/// library client in `xbt-signer/tests/agp101_funded.rs`; it has no hub rig). Keys and signatures
-/// are a `LocalSigner`'s. Its `fund_channel` records the channel before it sends, funds one channel
-/// to an origin (`channel_pending` for a second) and answers that channel by origin until it is
-/// attached. `lose`: the next funding is sent and its answer is lost.
-struct Funds {
-    keys: LocalSigner,
-    wallet: Shared,
-    pending: Mutex<HashMap<String, xbt402::channel::ChannelParams>>,
-    lose: AtomicBool,
-}
-
-impl Wallet for Funds {
-    fn fund(&self, _: &str, _: u64) -> Result<(String, u32)> {
-        Err(ChannelError::new("fund_unbound", "this signer funds only a channel for a key it issued"))
-    }
-    fn fund_channel(&self, origin: &str, params: &xbt402::channel::ChannelParams, address: &str, sats: u64) -> Result<(String, u32)> {
-        if self.pending.lock().unwrap().contains_key(origin) {
-            return Err(ChannelError::new("channel_pending", format!("{origin} already has a pending channel")));
-        }
-        let (txid, vout) = self.wallet.fund(address, sats)?;
-        self.pending.lock().unwrap().insert(origin.into(), params.clone().with_funding(&txid, vout, sats)?);
-        if self.lose.swap(false, Ordering::SeqCst) {
-            return Err(ChannelError::new("funding_unconfirmed", "the funding did not confirm in time"));
-        }
-        Ok((txid, vout))
-    }
-}
-
-impl xbt402::signer::StateSigner for Funds {
-    fn new_key(&self, o: &str) -> Result<xbt_primitives::ecdsa::PubkeyBytes> {
-        self.keys.new_key(o)
-    }
-    fn attach(&self, o: &str, p: &xbt402::channel::ChannelParams) -> Result<String> {
-        let chan = self.keys.attach(o, p)?;
-        self.pending.lock().unwrap().remove(o);
-        Ok(chan)
-    }
-    fn funded(&self, o: &str) -> Result<Option<xbt402::channel::ChannelParams>> {
-        Ok(self.pending.lock().unwrap().get(o).cloned())
-    }
-    fn sign_state(&self, c: &str, a: u64) -> Result<Vec<u8>> {
-        self.keys.sign_state(c, a)
-    }
-    fn sign_state_a3(&self, c: &str, a: u64) -> Result<Vec<u8>> {
-        self.keys.sign_state_a3(c, a)
-    }
-    fn sign_rollover(&self, c: &str, a: u64, n: &[u8], cap: u64) -> Result<Vec<u8>> {
-        self.keys.sign_rollover(c, a, n, cap)
-    }
-    fn sign_close(&self, c: &str) -> Result<Vec<u8>> {
-        self.keys.sign_close(c)
-    }
-    fn sign_refund(&self, c: &str) -> Result<String> {
-        self.keys.sign_refund(c)
-    }
-    fn request_auth(&self, c: &str, seq: Option<&Value>, cum: Option<&Value>, sig: Option<&str>, req: &str) -> Result<String> {
-        self.keys.request_auth(c, seq, cum, sig, req)
-    }
-    fn sign_conditional(&self, c: &str, u: u64, cond: &xbt402::conditional::ConditionalParams) -> Result<Vec<u8>> {
-        self.keys.sign_conditional(c, u, cond)
-    }
-}
-
-impl RouteSigner for Funds {
-    fn sign_state_adaptor(&self, c: &str, cum: u64, point: &xbt_primitives::ecdsa::PubkeyBytes, route: &Value) -> Result<xbt402::signer::AdaptorLock> {
-        self.keys.sign_state_adaptor(c, cum, point, route)
-    }
-    fn resolve_lock(&self, c: &str, s: &[u8; 32]) -> Result<[u8; 32]> {
-        self.keys.resolve_lock(c, s)
-    }
-    fn void_lock(&self, c: &str) -> Result<bool> {
-        self.keys.void_lock(c)
-    }
-    fn adopt_lock(&self, c: &str, cum: u64) -> Result<()> {
-        self.keys.adopt_lock(c, cum)
-    }
-    fn recover_lock(&self, c: &str, close: &Tx) -> Result<[u8; 32]> {
-        self.keys.recover_lock(c, close)
-    }
-}
-
-/// The routed client's side of AGP-101's rule: a funding the signer carried out is learnable by
-/// the payer that asked for it, and the next `open` adopts it and funds nothing more. The answer
-/// to ch1's funding is lost; the same payer opens again, and so does a new process that has no
-/// ledger and so no record of ch1 at all. Both were refused `channel_pending` until the refund.
-#[test]
-fn agp101_a_ch1_the_signer_funded_is_adopted_by_the_next_open_and_by_a_payer_without_its_books() {
-    for restart in [false, true] {
-        let r = routed(if restart { "route-signer-funded-r" } else { "route-signer-funded" });
-        let signer = Arc::new(Funds { keys: LocalSigner::new(), wallet: Shared(r.w.wallet.clone()), pending: Mutex::new(HashMap::new()), lose: AtomicBool::new(true) });
-        let mut pay = r.payer_with(signer.clone(), signer.clone());
-        assert_eq!(pay.open().unwrap_err().code, "funding_unconfirmed");
-        let funded = signer.pending.lock().unwrap()[HUB].clone();
-        assert_eq!((r.w.funded(), pay.chan()), (1, None), "control: the signer funded ch1 and the payer knows no outpoint");
-        if restart {
-            pay = r.payer_with(signer.clone(), signer.clone());
-        }
-        let out = pay.open().unwrap_or_else(|e| panic!("restart {restart}: {} {}", e.code, e.msg));
-        assert_eq!((r.w.funded(), out["chan"].as_str(), pay.chan()), (1, Some(funded.channel_id().as_str()), Some(funded.channel_id())), "restart {restart}");
-        assert!(signer.pending.lock().unwrap().is_empty(), "attached");
-        pay.open().unwrap();
-        assert_eq!(r.w.funded(), 1);
     }
 }

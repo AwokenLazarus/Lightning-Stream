@@ -84,14 +84,6 @@
       "ok": true
     },
     {
-      "name": "/hub renders",
-      "ok": true
-    },
-    {
-      "name": "/hub has no horizontal page scroll on a phone",
-      "ok": true
-    },
-    {
       "name": "/setup renders",
       "ok": true
     },

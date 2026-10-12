@@ -14,8 +14,7 @@
 //! | `XBT_UI_ALLOW_IPS` | (all) | comma-separated peer IPs or prefixes (`10.21.0.`) allowed to connect, e.g. only the box's app proxy |
 //! | `XBT_UI_ALLOWED_HOSTS` | | extra host names the UI answers to, comma-separated (`wallet.example.com`; `*`: any). Always allowed: IP literals, single-label names (`localhost`, a container name), `*.local`, `*.localhost`, `*.onion` (AGP-063 W4: a DNS rebinding of the box's address is refused) |
 //! | `XBT_UI_SETUP_OPEN` | `0` | `1`: the first-run password setup needs no setup code (a proxy already authenticated the owner) |
-//! | `XBT_UI_HUB_URL` | | this box's own xbt402 hub, shown on the Hub page |
-//! | `XBT_UI_CMP_URL` | | xbt-compute's node/hub status page: a link on the Overview and Hub pages (one dashboard for an operator) |
+//! | `XBT_UI_CMP_URL` | | xbt-compute's node status page: a link on the Overview page (one dashboard for an operator) |
 //! | `XBT_UI_CMP_STATUS_URL` | | xbt-compute's status JSON (`http://…/readyz`, CONTRACT §U), read server-side for a compact tile |
 //! | `XBT_UI_MCP_URL` | | the MCP endpoint(s) agents connect to, comma-separated (`http://umbrel.local:33510/mcp`), shown on the Agents page |
 //! | `XBT_UI_MCP_TOKEN_FILE` | `$XBT_DATA_DIR/run/ui/mcp-http-token` when `XBT_DATA_DIR` is set, else `<data dir>/secrets/mcp-http-token` | the MCP bearer token, shown to the logged-in owner on the Agents page and rotated there (AGP-042). The UI owns it; the MCP only reads it (`xbt-init` makes it 0640, group `xbt-wallet-ui`). |
@@ -36,7 +35,6 @@ pub struct Config {
     pub allow_ips: Vec<String>,
     pub allowed_hosts: Vec<String>,
     pub setup_open: bool,
-    pub hub_url: Option<String>,
     pub cmp_url: Option<String>,
     pub cmp_status_url: Option<String>,
     pub mcp_urls: Vec<String>,
@@ -100,7 +98,6 @@ impl Config {
             allow_ips: env("XBT_UI_ALLOW_IPS").map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default(),
             allowed_hosts: env("XBT_UI_ALLOWED_HOSTS").map(|v| v.split(',').map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty()).collect()).unwrap_or_default(),
             setup_open: env("XBT_UI_SETUP_OPEN").as_deref() == Some("1"),
-            hub_url: env("XBT_UI_HUB_URL").map(|u| u.trim_end_matches('/').to_string()),
             cmp_url: env("XBT_UI_CMP_URL").filter(|u| u.starts_with("http://") || u.starts_with("https://") || u.starts_with('/')),
             cmp_status_url: env("XBT_UI_CMP_STATUS_URL"),
             mcp_urls: env("XBT_UI_MCP_URL").map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default(),
@@ -115,7 +112,7 @@ impl Config {
     /// A test or embedding configuration.
     pub fn for_test(signer_sock: PathBuf, data_dir: PathBuf, bind: &str) -> Self {
         Self { bind: bind.into(), signer_sock, data_dir, password: None, base_path: "/".into(), session_idle: Duration::from_secs(900),
-               session_max: Duration::from_secs(28_800), secure_cookie: None, allow_ips: vec![], allowed_hosts: vec![], setup_open: false, hub_url: None, cmp_url: None,
+               session_max: Duration::from_secs(28_800), secure_cookie: None, allow_ips: vec![], allowed_hosts: vec![], setup_open: false, cmp_url: None,
                cmp_status_url: None, mcp_urls: vec![], mcp_token_file: PathBuf::from("/nonexistent/mcp-http-token"), threads: 4 }
     }
 }

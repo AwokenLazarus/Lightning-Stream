@@ -134,7 +134,6 @@ pub struct PolicyConfig {
     pub refund_margin_blocks: i64,
     pub hot_balance_cap_sats: i64,
     pub forward: Map<String, Value>,
-    pub routing: Map<String, Value>,
     /// AGP-048 `rail=ln`: the Lightning rail's settings ([`crate::ln::LnPolicy`]).
     pub ln: Map<String, Value>,
     pub anchor_interval_s: i64,
@@ -151,7 +150,7 @@ impl Default for PolicyConfig {
         Self { allowlist: vec![], max_per_tx_sats: 10_000_000, daily_budget_sats: 50_000_000, weekly_budget_sats: 200_000_000,
                per_counterparty_cap_sats: 30_000_000, velocity_max: 8, velocity_window_s: 3600, human_threshold_sats: 10_000_000,
                split_window_s: 600, approval_ttl_s: 900, channel_expiry_blocks: 1008, treasury_csv: 4320, counterparties: Map::new(),
-               refund_enabled: true, refund_margin_blocks: 6, hot_balance_cap_sats: 0, forward: Map::new(), routing: Map::new(), ln: Map::new(),
+               refund_enabled: true, refund_margin_blocks: 6, hot_balance_cap_sats: 0, forward: Map::new(), ln: Map::new(),
                anchor_interval_s: 60, anchor_required: false, regtest_mine: None, open_wait_s: 1800, open_retry_s: 60,
                close_fee_max_sats: 2000 }
     }
@@ -200,9 +199,6 @@ impl PolicyConfig {
         if let Some(Value::Object(m)) = raw.get("forward") {
             c.forward = m.clone();
         }
-        if let Some(Value::Object(m)) = raw.get("routing") {
-            c.routing = m.clone();
-        }
         if let Some(Value::Object(m)) = raw.get("ln") {
             c.ln = m.clone();
         }
@@ -230,9 +226,9 @@ impl PolicyConfig {
 }
 
 /// Every key policy.json may hold (B2's `PolicyConfig` plus `human_pubkey`, `recovery_address`).
-pub const POLICY_KEYS: [&str; 29] = ["allowlist", "max_per_tx_sats", "daily_budget_sats", "weekly_budget_sats", "per_counterparty_cap_sats",
+pub const POLICY_KEYS: [&str; 28] = ["allowlist", "max_per_tx_sats", "daily_budget_sats", "weekly_budget_sats", "per_counterparty_cap_sats",
     "velocity_max", "velocity_window_s", "human_threshold_sats", "split_window_s", "approval_ttl_s", "channel_expiry_blocks", "treasury_csv",
-    "counterparties", "refund_enabled", "refund_margin_blocks", "hot_balance_cap_sats", "forward", "routing", "anchor_interval_s",
+    "counterparties", "refund_enabled", "refund_margin_blocks", "hot_balance_cap_sats", "forward", "anchor_interval_s",
     "anchor_required", "regtest_mine", "open_wait_s", "open_retry_s", "close_fee_max_sats", "human_pubkey", "recovery_address",
     "vault", "treasury", "ln"];
 
@@ -251,7 +247,10 @@ pub fn validate_policy(raw: &Value) -> (Vec<String>, Vec<String>) {
         Err(e) => return (vec![e.msg], warnings),
     };
     for k in obj.keys() {
-        if !POLICY_KEYS.contains(&k.as_str()) {
+        if k == "routing" {
+            // a section of the retired hub routing: a policy that still carries it loads, and says so
+            warnings.push("policy.json routing: payments through a hub were retired; the signer ignores this section and it can be removed".into());
+        } else if !POLICY_KEYS.contains(&k.as_str()) {
             warnings.push(format!("policy.json {k}: unknown key (the signer ignores it)"));
         }
     }
@@ -324,38 +323,6 @@ pub fn validate_policy(raw: &Value) -> (Vec<String>, Vec<String>) {
         if !ok {
             errors.push("policy.json human_pubkey: must be 64 hex characters (an ed25519 public key)".into());
         }
-    }
-    match obj.get("routing") {
-        None => {}
-        Some(Value::Object(r)) => {
-            for k in ["max_lock_sats", "daily_budget_sats"] {
-                if let Some(v) = r.get(k) {
-                    match py_int(Some(v)) {
-                        None => errors.push(format!("policy.json routing.{k}: not an integer")),
-                        Some(n) if n < 0 => errors.push(format!("policy.json routing.{k}: must be >= 0 (got {n})")),
-                        _ => {}
-                    }
-                }
-            }
-            match r.get("hubs") {
-                None | Some(Value::Object(_)) => {}
-                Some(_) => errors.push("policy.json routing.hubs: must be an object".into()),
-            }
-            for (h, v) in r.get("hubs").and_then(Value::as_object).into_iter().flatten() {
-                if !(h.starts_with("http://") || h.starts_with("https://")) || normalize_dest(h).is_empty() {
-                    errors.push(format!("policy.json routing.hubs[{h}]: must be an http(s) origin"));
-                }
-                for k in ["max_fee_ppm", "max_fee_base_msat"] {
-                    match v.get(k).map(|x| py_int(Some(x))) {
-                        None => {}
-                        Some(None) => errors.push(format!("policy.json routing.hubs[{h}].{k}: not an integer")),
-                        Some(Some(n)) if n < 0 => errors.push(format!("policy.json routing.hubs[{h}].{k}: must be >= 0 (got {n})")),
-                        _ => {}
-                    }
-                }
-            }
-        }
-        Some(_) => errors.push("policy.json routing: must be an object".into()),
     }
     if let Some(l) = obj.get("ln") {
         crate::ln::validate(l, &mut errors);

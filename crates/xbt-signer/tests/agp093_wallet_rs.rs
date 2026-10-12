@@ -46,7 +46,7 @@ impl Transport for Hooked {
 
 fn hooked(rig: &mut Rig, hook: Hook) {
     let t = Arc::new(Hooked { web: rig.web.clone(), hook });
-    rig.s = Signer::new(&rig.root, SignerOptions { node: Some(rig.chain.clone()), transport: Some(t), adaptor: rig.adaptor.clone(), ..Default::default() }).unwrap();
+    rig.s = Signer::new(&rig.root, SignerOptions { node: Some(rig.chain.clone()), transport: Some(t), ..Default::default() }).unwrap();
 }
 
 fn paid(headers: &[(String, String)]) -> bool {

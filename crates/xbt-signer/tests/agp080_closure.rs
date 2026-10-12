@@ -1,5 +1,5 @@
 //! AGP-080 (closure audit, wallet): no signature leaves unbooked (the stream's hash-locked last
-//! chunk, adaptor pre-signatures; W1), a channel leaves the refund watcher only when the chain
+//! chunk; W1), a channel leaves the refund watcher only when the chain
 //! shows its funding spent (`xbt402_mark_closed`, `xbt402_attach` of `<origin>/next`, a provider's
 //! close; W3), a seller's URL stays on its origin (X1), and the on-chain `pay` rail books before
 //! it sends (K1).
@@ -44,7 +44,7 @@ impl Transport for Hooked {
 /// The rig's signer again, on the same root and chain, behind `hook`.
 fn hooked(rig: &mut Rig, hook: Hook) -> Arc<Hooked> {
     let t = Arc::new(Hooked { web: rig.web.clone(), hook, seen: Mutex::new(vec![]) });
-    rig.s = Signer::new(&rig.root, SignerOptions { node: Some(rig.chain.clone()), transport: Some(t.clone()), adaptor: rig.adaptor.clone(),
+    rig.s = Signer::new(&rig.root, SignerOptions { node: Some(rig.chain.clone()), transport: Some(t.clone()),
                                                    ..Default::default() }).unwrap();
     t
 }
@@ -233,32 +233,18 @@ fn w1_every_state_the_session_sends_is_in_the_ledger_before_it_leaves() {
 
 // --- W1: the socket's signing methods -------------------------------------------------------------
 
-fn point(t: &xbt_primitives::secp256k1::SecretKey) -> String {
-    hex::encode(xbt_primitives::secp256k1::PublicKey::from_secret_key(xbt_primitives::secp256k1::SECP256K1, t).serialize())
-}
-
-fn routing(daily: i64) -> Value {
-    json!({"routing": {"hubs": {PROVIDER: {"max_fee_ppm": 5000, "max_fee_base_msat": 2000}}, "max_lock_sats": 2000, "daily_budget_sats": daily},
-           "max_per_tx_sats": 5000, "human_threshold_sats": 5000})
-}
-
-fn lock(rig: &Rig, chan: &str, cum: i64, amount: i64, t: &str) -> Value {
-    rig.call("xbt402_sign_state_adaptor", json!({"chan": chan, "cum": cum, "point": t,
-                                                 "route": {"hub": PROVIDER, "amount": amount, "fee": 6, "lockId": format!("L{cum}")}}))
-}
-
 fn next_params(rig: &Rig, cur: &ChannelParams, origin: &str) -> ChannelParams {
     let key = hex::decode(rig.call("xbt402_new_key", json!({"origin": format!("{origin}/next")}))["pub"].as_str().unwrap()).unwrap();
     ChannelParams::derive(&seller_pay_to(), &key, (rig.chain.height() + 1_014) as u32, cur.close_fee, Some(hex::decode(rig.hot_spk()).unwrap()),
                           &rig.chain.network(), cur.close_fee_payer).unwrap()
 }
 
-/// sign_state, 0xA3, conditional, rollover and adaptor: when the method answers with a signature,
+/// sign_state, 0xA3, conditional and rollover: when the method answers with a signature,
 /// the ledger holds the amount that signature commits the channel to.
 #[test]
 fn w1_every_socket_signing_method_has_booked_what_it_signs_when_it_answers() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
-    let rig = Rig::build(routing(3_000), false, "regtest", Some(Arc::new(TestAdaptor)));
+    let rig = Rig::new(json!({"max_per_tx_sats": 5000, "human_threshold_sats": 5000}), false);
     rig.fund_hot(1, 12_000);
     let chan = rig.open()["chan"].as_str().unwrap().to_string();
     assert_eq!(ledger(&rig), 546);
@@ -268,49 +254,12 @@ fn w1_every_socket_signing_method_has_booked_what_it_signs_when_it_answers() {
     assert!(r["sig"].is_string() && ledger(&rig) == 1_500, "0xA3: {r}, ledger {}", ledger(&rig));
     let r = rig.call("xbt402_sign_conditional", json!({"chan": chan, "uncond": 1_500, "amount": 600, "hash": "ab".repeat(32)}));
     assert!(r["sig"].is_string() && ledger(&rig) == 2_100, "conditional: {r}, ledger {}", ledger(&rig));
-    let r = lock(&rig, &chan, 2_500, 994, &point(&secret("t")));
-    assert!(r["adaptor"].is_object() && ledger(&rig) == 2_500, "adaptor: {r}, ledger {}", ledger(&rig));
-    assert_eq!(rig.call("xbt402_void_lock", json!({"chan": chan}))["voided"], true);
     let rec = rig.s.book.get(PROVIDER).unwrap();
     let cur = rec.params().unwrap();
     let next = next_params(&rig, &cur, &rec.origin);
     let r = rig.call("xbt402_sign_rollover", json!({"chan": chan, "amount": 2_700, "next_spk": hex::encode(next.spk()),
                                                     "next_capacity": cur.rollover_next_capacity(2_700), "next": next.to_json()}));
     assert!(r["sig"].is_string() && ledger(&rig) == 2_700, "rollover: {r}, ledger {}", ledger(&rig));
-}
-
-/// A hub that refuses every lock keeps each pre-signature (it completes one whenever it learns t).
-/// Each must be booked when it leaves; giving the lock up releases nothing; a later lock up to the
-/// same amount rides on that booking, since one close can claim only one state.
-#[test]
-fn w1_an_adaptor_pre_signature_is_booked_before_it_leaves_and_a_void_does_not_release_it() {
-    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
-    let rig = Rig::build(routing(1_500), false, "regtest", Some(Arc::new(TestAdaptor)));
-    rig.fund_hot(1, 12_000);
-    let chan = rig.open()["chan"].as_str().unwrap().to_string();
-    let t = secret("t");
-    let void = || assert_eq!(rig.call("xbt402_void_lock", json!({"chan": chan}))["voided"], true);
-    let r = lock(&rig, &chan, 1_146, 594, &point(&t));
-    assert_eq!(r["verdict"], "allow", "{r}");
-    assert_eq!(ledger(&rig), 1_146, "the pre-signature is in the ledger when it leaves");
-    assert_eq!(rig.call("routing_status", json!({}))["spent_24h_sats"], 600, "and in the routing budget");
-    void();
-    assert_eq!(ledger(&rig), 1_146, "a void releases nothing: the hub still holds the pre-signature");
-    let r = lock(&rig, &chan, 1_746, 1_194, &point(&t));
-    assert_eq!(r["verdict"], "allow", "{r}");
-    assert_eq!(ledger(&rig), 1_746);
-    void();
-    let r = lock(&rig, &chan, 2_346, 1_794, &point(&t));
-    assert_eq!(rule(&r), "route_daily_budget", "the third pre-signature is past the routing budget of 1,500: {r}");
-    assert_eq!(ledger(&rig), 1_746, "and nothing was booked for it");
-    // a lock inside what is already booked books nothing more, and resolving it does not book it again
-    let r = lock(&rig, &chan, 1_746, 1_194, &point(&t));
-    assert_eq!(r["verdict"], "allow", "a re-lock at a voided amount rides on its booking: {r}");
-    assert_eq!(ledger(&rig), 1_746);
-    let r = rig.call("xbt402_resolve_lock", json!({"chan": chan, "secret": hex::encode(t.secret_bytes())}));
-    assert_eq!(r["t"], hex::encode(t.secret_bytes()), "{r}");
-    assert_eq!((rig.s.book.get(PROVIDER).unwrap().used_sats, ledger(&rig)), (1_746, 1_746));
-    assert_eq!(rig.call("routing_status", json!({}))["spent_24h_sats"], 1_200);
 }
 
 // --- W3: a channel leaves the refund watcher only by the chain ---------------------------------------

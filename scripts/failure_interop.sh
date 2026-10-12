@@ -3,13 +3,16 @@
 # happy path; this one breaks something on purpose (scripts/interop/failure_interop.py has the list)
 # and reports, check by check, what the release binaries do at their shipped defaults:
 #   A  an answer lost on a direct channel (the signer's pay rail and the library client)
-#   B  a provider that stops answering, direct and behind a hub
+#   B  a provider that stops answering
 #   C  one hostile Electrum server among honest ones (holds its answers, hides a transaction, sends
 #      malformed numbers): the light wallet still refunds at expiry
-#   D  SIGKILL and restart of the provider, the signer and the hub in the middle of a payment
+#   D  SIGKILL and restart of the provider and the signer in the middle of a payment
 #   E  a seller that refuses the funded open
 # Each check prints PASS or FAIL and what it observed. A FAIL that the driver lists as a known open
 # item (docs/LIMITS.md, "Open items") is printed as such and does not fail the run.
+# Check ids B2.* and D3.* ran a hub and are retired with it; the other ids are unchanged. The hub was
+# retired on 2026-10-11: payments between parties route over ordinary Lightning instead. Its code is
+# in the git history (last at commit a548fb0).
 #
 # Needs, with the same defaults as the other scripts here: the Python reference checkout for its
 # node script and RPC helper (XBT402_B1), a Knots 29.4.2 build (XBT_BIN: the directory of bitcoind
@@ -67,7 +70,6 @@ if busy:
     sys.exit(f"ports in use: {busy} (set FAIL_PORT_BASE)")
 EOF
 nice -n 19 cargo build -q -j2 --release -p xbt402-interop --bins
-nice -n 19 cargo build -q -j2 --release -p xbt402 --all-features --bin xbt402-hub
 nice -n 19 cargo build -q -j2 --release -p xbt-signer --bin xbt-signer
 nice -n 19 cargo build -q -j2 --release -p xbt-wallet-mcp --bin xbt-wallet-mcp
 nice -n 19 cargo build -q -j2 --release -p xbt-electrum --features interop --bins

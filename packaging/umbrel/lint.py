@@ -31,7 +31,7 @@ CATEGORIES = {"bitcoin", "lightning", "finance", "networking", "social", "media"
 # what umbrelOS sets for every app's compose
 UMBREL_VARS = {"APP_DATA_DIR", "APP_SEED", "APP_PASSWORD", "DEVICE_DOMAIN_NAME", "DEVICE_HOSTNAME", "TOR_PROXY_IP", "TOR_PROXY_PORT",
                "APP_HIDDEN_SERVICE"}
-LOCAL_IMAGES = re.compile(r"^(xbt-signer|xbt-anchor-witness|xbt-wallet-mcp|xbt402-hub|xbt-wallet-ui|xbt-init):\d+\.\d+\.\d+$|^xbt-a3-knots:29\.4\.2$")
+LOCAL_IMAGES = re.compile(r"^(xbt-signer|xbt-anchor-witness|xbt-wallet-mcp|xbt-wallet-ui|xbt-init):\d+\.\d+\.\d+$|^xbt-a3-knots:29\.4\.2$")
 # image -> (component sub-dir, own socket dir, peer socket dirs it may mount read-only)
 AGENTPAY = {
     "xbt-signer": ("signer", "signer", {"anchor"}),
@@ -39,7 +39,6 @@ AGENTPAY = {
     # AGP-042: run/ui holds the UI-owned MCP token; the MCP may only read it
     "xbt-wallet-mcp": ("mcp", None, {"signer", "ui"}),
     "xbt-wallet-ui": ("ui", "ui", {"signer"}),
-    "xbt402-hub": ("hub", None, set()),
 }
 INIT_CAPS = {"CHOWN", "FOWNER", "DAC_OVERRIDE"}
 # AGP-100: a dependency slot another store's app may fill (umbrelOS `implements`), and what the selected app

@@ -2,7 +2,7 @@
 //! built here is byte-identical to the reference implementation's, plus the loose readers the
 //! reference's `int(...)`/`str(...)` conversions amount to.
 //!
-//! Integers beyond i64/u64 (routed amsat prices and meters, which B1 writes as Python ints) are
+//! Integers beyond i64/u64 (amsat prices and meters, which B1 writes as Python ints) are
 //! kept exactly without serde_json's `arbitrary_precision` feature, which Cargo feature
 //! unification would force on every crate linked with this one (AGP-035). [`parse`] reads them into
 //! a reserved one-key object `{"$xbt402::int": "<decimal>"}` ([`big_int`]), and the writers here

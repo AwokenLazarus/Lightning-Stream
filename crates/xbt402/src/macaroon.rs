@@ -1,33 +1,8 @@
 //! A Lightning node's macaroon, read: its permissions and caveats from the macaroon itself (the v2
-//! binary format and LND's identifier). Shared by the agent wallet's Lightning rail (`xbt-signer`,
-//! AGP-049) and the hub's Lightning link (AGP-109), each with its own list of what it needs.
+//! binary format and LND's identifier). The agent wallet's Lightning rail (`xbt-signer`, AGP-049)
+//! holds the list of what it needs and the rule built on it.
 //! Nothing here verifies the macaroon's HMAC: that is the node's job, and no reader holds the
 //! root key.
-//!
-//! Rule M1 (the hub's, AGP-109): **on mainnet the hub uses a macaroon only if every permission
-//! in it is one of the two calls the link makes, `NewAddress` and `SignMessage`.** An allowlist,
-//! so a permission this code has never heard of is refused with the rest:
-//!
-//! | Macaroon | Mainnet |
-//! |---|---|
-//! | `uri:/lnrpc.Lightning/NewAddress` and `uri:/lnrpc.Lightning/SignMessage` (per call) | used |
-//! | `address:write` and `message:write` (per entity: at Lightning Fork 0.21.3-beta-blake2b.17 each covers that one call and no other) | used |
-//! | one of the two alone | used: with the signature alone the hub is named and returns nothing; with the address alone neither (no address of a node that has not signed is paid) |
-//! | `admin.macaroon`, `readonly.macaroon`, the wallet rail's, or any one permission more | refused |
-//! | an identifier that is not LND's, or that does not parse to its end | refused |
-//! | not a macaroon | refused on every network |
-//!
-//! Off mainnet a wider macaroon is used and named in the log, as the rail does; with
-//! `XBT_HUB_LN_STRICT=1` the mainnet rule applies on every network.
-use serde_json::{json, Value};
-
-/// The two calls of the hub's Lightning link, as per-call permissions.
-pub const HUB_CALLS: [&str; 2] = ["uri:/lnrpc.Lightning/NewAddress", "uri:/lnrpc.Lightning/SignMessage"];
-/// The same two calls as entity permissions (what `lncli bakemacaroon address:write message:write`
-/// gives). Read from Lightning Fork's permission table: `address:write` is required by `NewAddress`
-/// only and `message:write` by `SignMessage` only.
-pub const HUB_PAIRS: [&str; 2] = ["address:write", "message:write"];
-
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Macaroon {
     pub location: String,
@@ -176,22 +151,6 @@ impl Macaroon {
         self.exact && !self.ops.is_empty()
     }
 
-    /// Rule M1: why this macaroon is more than the hub's link needs, if it is.
-    pub fn beyond_hub(&self) -> Option<String> {
-        const BAKE: &str = "bake one with only uri:/lnrpc.Lightning/NewAddress and uri:/lnrpc.Lightning/SignMessage \
-                            (lncli bakemacaroon uri:/lnrpc.Lightning/NewAddress uri:/lnrpc.Lightning/SignMessage)";
-        if !self.readable() {
-            return Some(format!("the Lightning macaroon's permissions cannot be read: {BAKE}"));
-        }
-        let allowed: Vec<&str> = HUB_CALLS.iter().chain(HUB_PAIRS.iter()).copied().collect();
-        let excess = self.outside(&allowed);
-        (!excess.is_empty()).then(|| format!("the Lightning macaroon grants {}: {BAKE}", excess.join(", ")))
-    }
-
-    /// For the hub's status: the permissions and caveats, and whether they are the two calls only.
-    pub fn hub_report(&self) -> Value {
-        json!({"ops": self.ops, "onlyTheTwoCalls": self.beyond_hub().is_none(), "caveats": self.caveats, "timeBefore": self.caveat("time-before")})
-    }
 }
 
 /// Test support: a macaroon as LND bakes it (v2; identifier version 3 + MacaroonId; first-party
@@ -247,36 +206,6 @@ mod tests {
     const SIGN: (&str, &[&str]) = ("uri", &["/lnrpc.Lightning/SignMessage"]);
 
     #[test]
-    fn rule_m1_the_two_calls_and_nothing_more() {
-        let ok = |ops: &[(&str, &[&str])]| parse(&mac(ops, &[])).unwrap().beyond_hub();
-        assert_eq!(ok(&[NEW, SIGN]), None);
-        assert_eq!(ok(&[("uri", &["/lnrpc.Lightning/NewAddress", "/lnrpc.Lightning/SignMessage"])]), None);
-        assert_eq!(ok(&[("address", &["write"]), ("message", &["write"])]), None);
-        assert_eq!(ok(&[NEW]), None, "one call alone is no wider");
-        assert_eq!(parse(&mac(&[NEW, SIGN], &["time-before 2030-01-01T00:00:00Z"])).unwrap().beyond_hub(), None, "a caveat only narrows");
-        // one permission more, of every kind: refused, and named
-        let more: [(&str, &[&str]); 12] = [("uri", &["/lnrpc.Lightning/SendCoins"]), ("uri", &["/lnrpc.Lightning/NewAddress2"]), ("onchain", &["write"]),
-                                           ("onchain", &["read"]), ("address", &["read"]), ("message", &["read"]), ("info", &["read"]), ("offchain", &["write"]),
-                                           ("macaroon", &["generate"]), ("signer", &["generate"]), ("uri", &["/walletrpc.WalletKit/SendOutputs"]), ("address", &["*"])];
-        for extra in more {
-            let why = ok(&[NEW, SIGN, extra]).unwrap_or_else(|| panic!("{extra:?} was taken"));
-            assert!(why.contains(&format!("{}:{}", extra.0, extra.1[0])) && why.contains("bake one with only"), "{why}");
-        }
-        // the node's own files
-        let admin: &[(&str, &[&str])] = &[("address", &["read", "write"]), ("info", &["read", "write"]), ("invoices", &["read", "write"]), ("macaroon", &["generate", "read", "write"]),
-                                          ("message", &["read", "write"]), ("offchain", &["read", "write"]), ("onchain", &["read", "write"]), ("peers", &["read", "write"]),
-                                          ("signer", &["generate", "read"])];
-        assert!(ok(admin).unwrap().contains("onchain:write"));
-        assert!(ok(&[("info", &["read"]), ("offchain", &["read", "write"]), ("onchain", &["read"])]).unwrap().contains("info:read"), "the wallet rail's macaroon");
-        // nothing readable is nothing allowed
-        assert!(ok(&[]).unwrap().contains("cannot be read"));
-        let mut other_id = mac(&[NEW, SIGN], &[]);
-        let at = other_id.iter().position(|b| *b == 3).unwrap();
-        other_id[at] = 4; // the identifier's version byte
-        assert!(parse(&other_id).unwrap().beyond_hub().unwrap().contains("cannot be read"));
-    }
-
-    #[test]
     fn an_identifier_that_does_not_read_to_its_end_allows_nothing() {
         // a field of a wire type this reader stops at (a group), then one more permission: a
         // reader that skips the group sees `onchain:write`, so what this one saw is not the list
@@ -300,7 +229,6 @@ mod tests {
         let p = parse(&m).unwrap();
         assert_eq!(p.ops, vec!["uri:/lnrpc.Lightning/NewAddress"]);
         assert!(!p.exact && !p.readable());
-        assert!(p.beyond_hub().unwrap().contains("cannot be read"));
         // cut inside a permission
         let mut cut = vec![3u8];
         cut.extend(op("uri", "/lnrpc.Lightning/NewAddress"));

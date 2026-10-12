@@ -11,18 +11,21 @@ regtest node that is faucet, miner and oracle.
        A2 the library client (xbt-wallet-mcp, XBT_MCP_PAYER=local, keys in the signer)
        A3 two answers lost in a row, on the signer's rail
   B  a provider that stops answering (SIGSTOP: the connection opens, nothing comes back)
-       B1 direct: the call ends, nothing more is signed, the channel is refunded at its expiry
-       B2 behind a hub: the hub sets that provider aside, the other provider keeps being paid, and
-          the first is routed to again once it answers
+       B1 the call ends, nothing more is signed, the channel is refunded at its expiry
   C  one hostile Electrum server among two honest ones; the light wallet still refunds at expiry
        C1 it holds its answers   C2 it hides the wallet's transactions   C3 it sends malformed numbers
   D  SIGKILL and restart in the middle of a payment: nothing signed unbooked, nothing lost
-       D1 the provider   D2 the signer, with its signed request on the wire   D3 the hub
+       D1 the provider   D2 the signer, with its signed request on the wire
   E  a seller that says yes to the open's preflight and refuses the funded open: funded once,
      refunded at expiry
        E1 the signer's rail   E2 the library client
 
   S  the shipped defaults against each other: a signer policy that is the default plus an allowlist
+
+Check ids are kept as they were. B2 (B2.1 to B2.4: a provider behind a hub stops answering) and D3
+(D3.1 to D3.3: the hub is killed) are retired and their numbers are not reused. The hub was retired
+on 2026-10-11: payments between parties route over ordinary Lightning instead. Its code is in the
+git history (last at commit a548fb0).
 
 Each check prints PASS or FAIL with what it observed. A FAIL listed in KNOWN_OPEN is a recorded
 defect (docs/LIMITS.md, "Open items") and does not fail the run; any other FAIL does.
@@ -173,11 +176,6 @@ def wait_http(url, timeout=30):
         except OSError:
             time.sleep(0.2)
     return False
-
-
-def http_json(url, timeout=5):
-    with urllib.request.urlopen(url, timeout=timeout) as r:
-        return json.loads(r.read())
 
 
 def tx_outputs(txid):
@@ -516,7 +514,7 @@ def refund_at_expiry(cid, n, s, origin, funding_txid, what):
                  f"state {rec2.get('state')}")
 
 
-# --- B1: a provider that stops answering, direct -----------------------------------------------------
+# --- B1: a provider that stops answering -------------------------------------------------------------
 
 def stops_answering_direct():
     port = PB + 20
@@ -676,7 +674,7 @@ def refuses_open(cid, rail):
     LOG.writelines(f"{cid} call {k}: {json.dumps(r)[:600]}\n" for k, r in enumerate(outs))
     sigs, _ = s.signatures()
     fundings = [x for x in sigs if x.get("kind") == "funding"]
-    states = [x for x in sigs if x.get("kind") in ("state", "adaptor_presig")]
+    states = [x for x in sigs if x.get("kind") == "state"]
     rec = s.channel(proxy.url) or {}
     check(f"{cid}.1", "the seller accepts the preflight and refuses the funded open: no call is paid, no state is signed",
           len(refused) >= 1 and all(r.get("status") != 200 for r in outs) and not states and rec.get("used_sats", 0) == 0,
@@ -691,220 +689,6 @@ def refuses_open(cid, rail):
     leaked = [t for r in outs for t in outside_untrusted(r) if "seller-says-7f3a" in t]
     check(f"{cid}.4", "the seller's own words in its refusal reach the agent only as untrusted provider text, never as the wallet's",
           not leaked, f"the seller's refusal text in the tool result, outside `untrusted_provider_response`: {leaked[:1] or 'nowhere'}")
-
-
-# --- the hub: B2 (a provider stops answering) and D3 (the hub is killed) ------------------------------
-
-ROUTE_PRICES = [37 * 10 ** 21, 81 * 10 ** 21 + 300_000_000_000_123_456_789]   # amsat per call: 37 sat; 81.3.. sat
-
-
-def hub_status(hub_url):
-    try:
-        return http_json(hub_url + "/status", timeout=15)
-    except (OSError, ValueError):
-        return None
-
-
-def seller(status, origin):
-    return next((x for x in (status or {}).get("sellers", []) if x.get("origin") == origin), {})
-
-
-def hub_run(cid, base, seconds, rate, disturb):
-    """One buyer, one hub, two sellers, all release binaries at their defaults: `seconds` of paid
-    calls to both sellers through the hub while `disturb(ctx)` does its damage, then the buyer closes
-    its channel, the hub is stopped, its operator tool closes the sellers' channels, and every close
-    is read off the chain. Returns what the checks need."""
-    d = os.path.join(RUN, cid)
-    os.makedirs(d, exist_ok=True)
-    hub_port, ports = base, [base + 1, base + 2]
-    urls = [f"http://127.0.0.1:{p}" for p in ports]
-    provs = []
-    for j, (port, price) in enumerate(zip(ports, ROUTE_PRICES)):
-        provs.append(spawn([f"{RS}/xbt402-route-provider", "--port", str(port), "--rpc-port", RPCPORT, "--cookie", COOKIE,
-                            "--amsat", str(price), "--data-dir", os.path.join(d, f"seller{j}")]))
-    for u in urls:
-        assert wait_http(u + "/x402/supported"), f"seller {u} did not come up"
-    key = os.path.join(d, "hub.key")
-    with open(key, "w") as f:
-        f.write(f"{secrets.randbelow(2 ** 255) + 1:064x}")
-    os.chmod(key, 0o600)
-    # what a hub's operator must write, and nothing else: no reveal_timeout, no watch_interval, no spend_final_depth
-    conf = {"node": {"rpcport": int(RPCPORT), "cookie": COOKIE, "wallet": "w", "fee_rate": 2}, "network": NET, "port": hub_port,
-            "datadir": os.path.join(d, "hub"), "pay_to_key_file": key, "connect": urls,
-            "hub": {"fee_base_msat": 100, "fee_ppm": 2000, "max_lock_sat": 20000, "max_unguarded_lock_sat": 500, "delta": 144,
-                    "ch2_capacity": 50000, "ch2_expiry_blocks": 1100, "close_margin": 144,
-                    "policy": {"min_expiry_blocks": 1008, "max_expiry_blocks": 8640}}}
-    cpath = os.path.join(d, "hub.json")
-    with open(cpath, "w") as f:
-        json.dump(conf, f)
-    hub_cmd = [f"{RS}/xbt402-hub", "--config", cpath]
-    hub_url = f"http://127.0.0.1:{hub_port}"
-    ctx = {"hub": spawn(hub_cmd), "hub_cmd": hub_cmd, "hub_url": hub_url, "urls": urls, "provs": provs, "t0": None, "seen": {}}
-    out = {"ctx": ctx, "urls": urls, "start_height": node.getblockcount()}
-    with Mining():
-        end = time.time() + 120
-        while time.time() < end and len((hub_status(hub_url) or {}).get("sellers", [])) < 2:
-            time.sleep(0.5)
-        end = time.time() + 120
-        while time.time() < end and not all(seller(hub_status(hub_url), u).get("state") == "open" for u in urls):
-            time.sleep(0.5)
-        out["opened"] = [seller(hub_status(hub_url), u).get("state") for u in urls]
-        shard_urls = ",".join(u + "/v1/chunk" for u in urls)
-        ctx["t0"] = time.time()
-        payer = subprocess.Popen([*NICE, f"{RS}/xbt402-route-payer", "--hub", hub_url, "--shards", shard_urls, "--rpc-port", RPCPORT,
-                                  "--cookie", COOKIE, "--seconds", str(seconds), "--rate", str(rate)], stdout=subprocess.PIPE, stderr=LOG, text=True)
-        procs.append(payer)
-        try:
-            disturb(ctx)
-        finally:
-            try:
-                stdout, _ = payer.communicate(timeout=seconds + 240)
-            except subprocess.TimeoutExpired:
-                payer.kill()
-                stdout, _ = payer.communicate()
-        out["status_end"] = hub_status(hub_url)
-    try:
-        res = json.loads(stdout.strip().splitlines()[-1])
-    except (IndexError, ValueError):
-        res = {"error": f"the buyer printed no result (exit {payer.returncode}): {stdout[-300:]!r}"}
-    out["res"] = res
-    LOG.write(f"{cid} buyer: {json.dumps({k: res.get(k) for k in ('summary', 'close', 'okCalls', 'seconds', 'events', 'error')})}\n")
-    LOG.write(f"{cid} hub status at the end: {json.dumps(out['status_end'])}\n")
-    stop(ctx["hub"])
-    tp = subprocess.run([f"{RS}/xbt402-hub", "--config", cpath, "--close-all"], capture_output=True, text=True, timeout=180, check=False)
-    LOG.write(tp.stderr)
-    try:
-        out["closed"] = json.loads(tp.stdout.strip().splitlines()[-1])
-    except (IndexError, ValueError):
-        out["closed"] = {"closes": [], "error": tp.stdout[-300:]}
-    LOG.write(f"{cid} hub --close-all: {json.dumps(out['closed'])}\n")
-    mine()
-    return out
-
-
-def seller_received(chan, close_txid, payee_spk):
-    """What the chain paid a seller on its channel `chan` ("txid:vout") and on the channels that
-    one was rolled over from: [sats], the close first. A rollover is one transaction that spends the
-    old channel, pays the seller what it is owed there and funds the next channel."""
-    got = [tx_outputs(close_txid)[1].get(payee_spk, 0)]
-    txid, vout = chan.split(":")[0], int(chan.split(":")[1])
-    for _ in range(16):
-        fund = node.getrawtransaction(txid, True)
-        prev = fund["vin"][0]
-        if "txid" not in prev:
-            break
-        parent = node.getrawtransaction(prev["txid"], True)["vout"][prev["vout"]]
-        if parent["scriptPubKey"].get("type") != "witness_v0_scripthash" or len(fund["vin"]) != 1:
-            break               # funded from a wallet: the first channel
-        got.append(sum(round(o["value"] * SAT) for o in fund["vout"] if o["n"] != vout))
-        txid, vout = prev["txid"], prev["vout"]
-    return got
-
-
-def hub_money(cid, n, out, what):
-    """Every coin where the signed states say, read off the chain. The buyer's channel: the hub's
-    output is the buyer's last signed state, the buyer's change the rest less the close fee. Each
-    seller: what the chain paid it, plus the close fee it paid on each of its channels (payee-pays;
-    a hub rolls a seller's channel over when it needs to, so there may be more than one), is what
-    the buyer's locks to it add up to. And the hub's own books: out = in - fees, nothing stuck."""
-    res, closed, st = out["res"], out["closed"], out.get("status_end") or {}
-    if "summary" not in res or "txid" not in (res.get("close") or {}):
-        return check(f"{cid}.{n}", what, False, f"the buyer did not close its channel: {json.dumps(res)[:400]}")
-    s, p1, c1 = res["summary"], res["ch1Params"], res["close"]
-    cum1 = s["signed"]
-    conf1, outs1 = tx_outputs(c1["txid"])
-    change1 = p1["capacity"] - p1["close_fee"] - cum1
-    ok1 = conf1 >= 1 and outs1.get(p1["payee_spk"]) == cum1 == max(s["routed_sat"], DUST) and outs1.get(p1["payer_spk"], 0) == (change1 if change1 >= DUST else 0)
-    locks = {u.rsplit("/v1/chunk", 1)[0]: sh["locked_sat"] for u, sh in s["shards"].items()}
-    ok2, rows = len(closed.get("closes", [])) == 2 and all("txid" in (c.get("close") or {}) for c in closed["closes"]), []
-    for c in closed.get("closes", []):
-        ch2 = c["ch2"]
-        p2 = ch2["params"]
-        got = seller_received(ch2["chan"], (c.get("close") or {}).get("txid"), p2["payee_spk"]) if "txid" in (c.get("close") or {}) else []
-        fees = p2["close_fee"] * len(got)
-        good = sum(got) + fees == locks.get(ch2["origin"]) and p2.get("close_fee_payer") == "payee"
-        ok2 = ok2 and good
-        rows.append(f"seller {ch2['origin'].split(':')[-1]}: the chain paid it {' + '.join(map(str, got))} sat ({len(got)} channel(s)"
-                    f"{', the hub rolled one over' if len(got) > 1 else ''}) + {fees} sat of close fees = {sum(got) + fees}; the buyer's locks "
-                    f"to it {locks.get(ch2['origin'])}")
-    ok3 = (st.get("routedOutSat") == sum(locks.values()) == s["routed_sat"] - s["fee_paid_sat"] and st.get("routedInSat") == s["routed_sat"]
-           and st.get("feesEarnedSat") == s["fee_paid_sat"] and st.get("stuckSat") == 0)
-    return check(f"{cid}.{n}", what, ok1 and ok2 and ok3,
-                 f"buyer's channel: the hub got {outs1.get(p1['payee_spk'])} sat = the buyer's signed state {cum1} (of it fees {s['fee_paid_sat']}), "
-                 f"buyer's change {outs1.get(p1['payer_spk'])}; " + "; ".join(rows) + f"; hub's books: in {st.get('routedInSat')}, out "
-                 f"{st.get('routedOutSat')}, fees {st.get('feesEarnedSat')}, stuck {st.get('stuckSat')}; buyer: {s['locks']} locks, {s['voided']} voided")
-
-
-def stops_answering_hub():
-    cid, seen = "B2", {}
-
-    def disturb(ctx):
-        hub_url, u1 = ctx["hub_url"], ctx["urls"][1]
-        time.sleep(6)
-        seen["before"] = hub_status(hub_url)
-        ctx["provs"][1].send_signal(signal.SIGSTOP)
-        t_stop = time.time()
-        end = t_stop + 60
-        while time.time() < end and not seller(hub_status(hub_url), u1).get("blocked"):
-            time.sleep(0.5)
-        seen["aside"] = hub_status(hub_url)
-        seen["aside_after_s"] = round(time.time() - t_stop, 1)
-        time.sleep(8)                                 # the other seller goes on being paid meanwhile
-        seen["during"] = hub_status(hub_url)
-        ctx["provs"][1].send_signal(signal.SIGCONT)
-        t_cont = time.time()
-        end = t_cont + 60
-        while time.time() < end and seller(hub_status(hub_url), u1).get("blocked"):
-            time.sleep(0.5)
-        seen["back"] = hub_status(hub_url)
-        seen["back_after_s"] = round(time.time() - t_cont, 1)
-
-    out = hub_run(cid, PB + 40, 85, 4, disturb)
-    u0, u1 = out["urls"]
-    aside = seller(seen.get("aside"), u1)
-    check("B2.1", "a seller behind the hub stops answering: the hub sets it aside",
-          bool(aside.get("blocked")) and aside.get("state") == "open",
-          f"{seen.get('aside_after_s')} s after the seller stopped, GET /status shows it blocked: {aside.get('blocked')!r}")
-    p0 = [seller(seen.get(k), u0).get("paidSat") for k in ("before", "aside", "during")]
-    p1 = [seller(seen.get(k), u1).get("paidSat") for k in ("aside", "during")]
-    check("B2.2", "the other seller keeps being paid while the first is set aside, and nothing more is signed to the silent one",
-          None not in p0 and p0[2] > p0[1] >= p0[0] and p1[0] == p1[1],
-          f"hub's signed total to the answering seller: {p0[0]} sat before, {p0[1]} when the other was set aside, {p0[2]} eight seconds later; "
-          f"to the silent seller: {p1[0]} then {p1[1]}")
-    back = seller(seen.get("back"), u1)
-    end1 = ((out["res"].get("summary") or {}).get("shards") or {}).get(u1 + "/v1/chunk", {}).get("locked_sat")
-    check("B2.3", "the seller answers again: the hub lifts the block by itself and routes to it again",
-          back.get("blocked") == "" and end1 is not None and p1[1] is not None and end1 > p1[1],
-          f"{seen.get('back_after_s')} s after the seller came back the block was gone; routed to it: {p1[1]} sat while it was silent, {end1} sat by the end")
-    hub_money(cid, 4, out, "every coin is where the signed states say: the buyer paid the hub what it signed, each seller got what the buyer's locks to it add up to")
-
-
-def kill_hub():
-    cid, seen = "D3", {}
-
-    def disturb(ctx):
-        time.sleep(8)
-        seen["before"] = hub_status(ctx["hub_url"])
-        kill9(ctx["hub"])                      # mid-stream: locks are in flight on both channels
-        ctx["hub"] = spawn(ctx["hub_cmd"])     # the same config, key and data directory
-        seen["up"] = wait_http(ctx["hub_url"] + "/x402/supported", 60)
-        time.sleep(3)
-        seen["after"] = hub_status(ctx["hub_url"])
-
-    out = hub_run(cid, PB + 44, 30, 4, disturb)
-    u0, u1 = out["urls"]
-    b = [seller(seen.get("before"), u).get("paidSat") for u in (u0, u1)]
-    a = [seller(seen.get("after"), u).get("paidSat") for u in (u0, u1)]
-    e = [seller(out.get("status_end"), u).get("paidSat") for u in (u0, u1)]
-    chans = [[seller(seen.get(k), u).get("chan") for u in (u0, u1)] for k in ("before", "after")]
-    check("D3.1", "the hub is SIGKILLed mid-stream and restarted: it comes back with the same channels and what it had signed on them",
-          seen.get("up") and None not in b + a and all(x >= y for x, y in zip(a, b)) and chans[0] == chans[1],
-          f"signed to the two sellers before the kill {b}, after the restart {a}; same channels: {chans[0] == chans[1]}")
-    check("D3.2", "routing goes on after the restart: both sellers are paid more",
-          None not in a + e and all(x > y for x, y in zip(e, a)),
-          f"signed to the two sellers after the restart {a}, at the end {e}")
-    hub_money(cid, 3, out, "nothing lost and nothing signed unbooked: the buyer paid the hub what it signed, each seller got what the buyer's locks to it add up to")
-
 
 
 # --- C: one hostile Electrum server among honest ones ------------------------------------------------
@@ -986,14 +770,14 @@ def group_c():
 
 def group_b():
     """a provider that stops answering"""
-    for cid, fn in (("B1", stops_answering_direct), ("B2", stops_answering_hub)):
+    for cid, fn in (("B1", stops_answering_direct),):
         if selected(cid):
             fn()
 
 
 def group_d():
     """SIGKILL and restart in the middle of a payment"""
-    for cid, fn in (("D1", kill_provider), ("D2", kill_signer), ("D3", kill_hub)):
+    for cid, fn in (("D1", kill_provider), ("D2", kill_signer)):
         if selected(cid):
             fn()
 

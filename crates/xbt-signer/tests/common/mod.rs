@@ -442,16 +442,15 @@ pub struct Rig {
     pub prov: Arc<Provider>,
     pub s: Arc<Signer>,
     pub witness: Option<xbt_signer::anchor::Witness>,
-    pub adaptor: Option<Arc<dyn xbt_signer::channels::AdaptorScheme>>,
 }
 
 impl Rig {
     /// Hold `ENV` for the whole test (the signer reads its environment).
     pub fn new(policy_extra: Value, with_witness: bool) -> Self {
-        Self::build(policy_extra, with_witness, "regtest", None)
+        Self::build(policy_extra, with_witness, "regtest")
     }
 
-    pub fn build(policy_extra: Value, with_witness: bool, chain_name: &str, adaptor: Option<Arc<dyn xbt_signer::channels::AdaptorScheme>>) -> Self {
+    pub fn build(policy_extra: Value, with_witness: bool, chain_name: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         env_for(dir.path());
         let chain = FakeChain::new(chain_name, if chain_name == "main" { 962_000 } else { 6_720 });
@@ -461,16 +460,16 @@ impl Rig {
         let witness = with_witness.then(|| xbt_signer::anchor::serve_witness(&dir.path().join("anchor"), &dir.path().join("anchor/w.sock"), 0o600).unwrap());
         let root = root_with(dir.path(), &runbook_policy(policy_extra));
         let ac = witness.as_ref().map(|w| xbt_signer::anchor::AnchorClient::new(&w.sock_path));
-        let s = Signer::new(&root, SignerOptions { node: Some(chain.clone()), transport: Some(web.clone()), anchor: ac, adaptor: adaptor.clone(),
+        let s = Signer::new(&root, SignerOptions { node: Some(chain.clone()), transport: Some(web.clone()), anchor: ac,
                                                    ..Default::default() }).unwrap();
-        Self { dir, root, chain, web, prov, s, witness, adaptor }
+        Self { dir, root, chain, web, prov, s, witness }
     }
 
     /// A fresh signer process on the same root (a restart).
     pub fn restart(&mut self) -> xbt402::Result<()> {
         let ac = self.witness.as_ref().map(|w| xbt_signer::anchor::AnchorClient::new(&w.sock_path));
         self.s = Signer::new(&self.root, SignerOptions { node: Some(self.chain.clone()), transport: Some(self.web.clone()), anchor: ac,
-                                                         adaptor: self.adaptor.clone(), ..Default::default() })?;
+                                                         ..Default::default() })?;
         Ok(())
     }
 
@@ -521,21 +520,5 @@ impl Rig {
 
     pub fn sigs(&self) -> Vec<Value> {
         self.call("signatures", json!({"limit": 1000}))["signatures"].as_array().unwrap().clone()
-    }
-}
-
-/// A TEST DOUBLE of the ECDSA adaptor scheme (the real one is B1 adaptor.py, ported by AGP-026):
-/// the "pre-signature" commits to T1, and a "completed signature" is the 32-byte secret y itself,
-/// so extract works exactly when y·G = T1. It exercises the book's write-ahead, recovery and the
-/// routing policy, not the cryptography.
-pub struct TestAdaptor;
-
-impl xbt_signer::channels::AdaptorScheme for TestAdaptor {
-    fn presign(&self, _secret: &SecretKey, z: &[u8; 32], t1: &xbt_primitives::secp256k1::PublicKey) -> Result<Value> {
-        Ok(json!({"R": hex::encode(t1.serialize()), "R1": hex::encode(t1.serialize()), "s1": hex::encode(z), "c": "00".repeat(32), "z": "00".repeat(32)}))
-    }
-    fn extract(&self, _pre: &Value, sig: &[u8], t1: &xbt_primitives::secp256k1::PublicKey) -> Option<[u8; 32]> {
-        let y: [u8; 32] = sig.try_into().ok()?;
-        (xbt_signer::channels::point_of(&y).as_ref() == Some(t1)).then_some(y)
     }
 }

@@ -194,10 +194,6 @@ pub fn offer_open_floor(extra: &Value) -> Result<u64> {
 /// weeks, the bound the signer socket's `open_channel` has had since AGP-063.
 pub const OWNER_MAX_EXPIRY_BLOCKS: u64 = 4_032;
 
-/// The same for a channel to a routing hub: twice as long, as the signer socket allows a hub
-/// channel (a route's locks need the room).
-pub const OWNER_MAX_HUB_EXPIRY_BLOCKS: u64 = 2 * OWNER_MAX_EXPIRY_BLOCKS;
-
 /// The fewest blocks to expiry a payer funds on an offer, unless its owner asks for fewer: a day.
 /// The signer's `open_from_offer` holds the same number (AGP-095).
 pub const OWNER_MIN_EXPIRY_BLOCKS: u64 = 144;
@@ -217,7 +213,7 @@ pub const OWNER_MIN_EXPIRY_BLOCKS: u64 = 144;
 /// own check refuses the open) or less than [`OWNER_MIN_EXPIRY_BLOCKS`] (or the owner's `want`, if
 /// that is smaller). Both are refused `bad_offer` here, before a key is made or anything is
 /// funded, and neither is clamped. Every payer that opens on an offer (the library client's open
-/// and rollover, the routed client's ch1) comes through this function.
+/// and rollover) comes through this function.
 pub fn offer_expiry_blocks(extra: &Value, want: u64, owner_max: u64) -> Result<u64> {
     let (min_expiry, max_expiry, min_conf, close_margin) = offer_terms(extra)?;
     let blocks = open_expiry_blocks(want.min(owner_max), min_expiry, max_expiry, min_conf, close_margin);

@@ -1,5 +1,5 @@
 //! xbt-svc: what makes an XBT service binary container-ready (AGP-038, cmp CONTRACT §U), shared by
-//! `xbt-signer`, `xbt-anchor-witness`, `xbt-wallet-mcp` and `xbt402-hub`. std only, no async runtime.
+//! `xbt-signer`, `xbt-anchor-witness`, `xbt-wallet-mcp`, `xbt-wallet-ui` and `xbt-work-relay`. std only, no async runtime.
 //!
 //! * [`DataDir`]: one relocatable data dir (`XBT_DATA_DIR`), one sub-dir per component, sockets under
 //!   `run/<component>/`, the witness store on its own mount (`XBT_WITNESS_DIR`). See `docs/CONTAINER.md`.
@@ -63,7 +63,6 @@ impl Mode {
 pub const SIGNER: &str = "signer";
 pub const WITNESS: &str = "witness";
 pub const MCP: &str = "mcp";
-pub const HUB: &str = "hub";
 /// The wallet's web UI (AGP-039): its login hash, setup code and secrets.
 pub const UI: &str = "ui";
 /// The xbt-work blinded receipt relay (AGP-043): its blob store and push token.
@@ -637,9 +636,9 @@ mod tests {
         assert_eq!(strip_base("/mcp", ""), Some("/mcp".into()));
         let h = |v: &[(&str, &str)]| v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect::<Vec<_>>();
         let onion = h(&[("Host", "abc.onion"), ("X-Forwarded-Proto", "https, http"), ("X-Forwarded-Host", "pay.example"),
-                        ("X-Forwarded-Prefix", "/hub/")]);
+                        ("X-Forwarded-Prefix", "/pay/")]);
         assert_eq!(proxy::public_url(&onion, "/v1/x?q", "", None, false), "http://abc.onion/v1/x?q");
-        assert_eq!(proxy::public_url(&onion, "/v1/x?q", "", None, true), "https://pay.example/hub/v1/x?q");
+        assert_eq!(proxy::public_url(&onion, "/v1/x?q", "", None, true), "https://pay.example/pay/v1/x?q");
         assert_eq!(proxy::public_url(&onion, "/b/v1/x", "/b", Some("http://x.onion/"), true), "http://x.onion/v1/x");
         assert_eq!(proxy::public_url(&h(&[("Host", "evil host/")]), "/p", "", None, false), "http://localhost/p");
     }

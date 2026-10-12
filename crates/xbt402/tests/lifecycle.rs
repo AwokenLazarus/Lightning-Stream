@@ -327,11 +327,9 @@ fn refusals() {
     // a lowered state is stale; a relabelled signature is refused
     let v = prov.facilitator_verify(&facilitator_request(&acc, &json!({"chan": chan, "cum": "547", "sig": sig546})));
     assert_eq!(v["invalidReason"], "invalid_batch_settlement_xbt_signature");
-    // body over the limit; the routing lock endpoint (AGP-026) refuses a request without a payment as B1 does
+    // body over the limit; the lock endpoint of the retired hub routing is no longer served
     assert_eq!(prov.serve("POST", "/v1/q", &[], &vec![0u8; MAX_BODY + 1], "", None).status, 400);
-    let r = prov.serve("POST", LOCK_PATH, &[], b"{}", "", None);
-    assert_eq!((r.status, xbt402::json::parse_slice(&r.body).unwrap()["error"].clone()), (400, json!("bad_payload")));
-    assert_eq!(prov.serve("GET", LOCK_PATH, &[], b"", "", None).status, 405);
+    assert_eq!(prov.serve("POST", "/x402/xbt-channel/lock", &[], b"{}", "", None).status, 404);
     // a close not signed by the payer
     let r = prov.serve("POST", CLOSE_PATH, &[], json!({"chan": chan, "sig": "3006020101020101"}).to_string().as_bytes(), "", None);
     assert_eq!(xbt402::json::parse_slice(&r.body).unwrap()["error"], "bad_sig");
@@ -652,15 +650,6 @@ fn close_channel_closes_one_channel_with_the_best_state() {
     let chan2 = c.channels[o2].payer.params.channel_id();
     assert_eq!(prov.close_channel(&chan2).unwrap_err().code, "no_state");
     assert_eq!(prov.close_channel(&format!("{}:0", "00".repeat(32))).unwrap_err().code, "unknown_channel");
-    // a routed lock open on it; a hub-funded ch2
-    prov.with_state(&chan, |st| st.extra.insert("route_lock".into(), json!({"lockId": "l1"}))).unwrap();
-    assert_eq!(prov.close_channel(&chan).unwrap_err().code, "lock_pending");
-    prov.with_state(&chan, |st| {
-        st.extra.insert("route_lock".into(), Value::Null);
-        st.extra.insert("hub".into(), "02ab".into())
-    }).unwrap();
-    assert_eq!(prov.close_channel(&chan).unwrap_err().code, "hub_channel");
-    prov.with_state(&chan, |st| st.extra.remove("hub")).unwrap();
     assert!(prov.channel_state(&chan).unwrap().closed_txid.is_empty() && chain.sent().is_empty(), "a refusal changes nothing");
     // the close pays the provider the best signed state, by the margin close's path
     let r = prov.close_channel(&chan).unwrap();
@@ -1044,6 +1033,63 @@ fn unresolved_intents_are_bounded() {
     let st = prov.channel_state(&chan).unwrap();
     assert_eq!(st.closed_txid, r["txid"].as_str().unwrap());
     assert_eq!(st.extra["close_intents"].as_array().unwrap().len(), xbt402::provider::MAX_KEPT_INTENTS);
+}
+
+/// A payer's close at `cum` (one sat above the last, so each is another transaction), posted as
+/// the client posts it. Returns the provider's error code.
+fn close_at(prov: &Provider, c: &mut Client, chan: &str, cum: u64) -> String {
+    let ch = c.channels.get_mut(O).unwrap();
+    let sig = hex::encode(ch.payer.sign_state(cum).unwrap());
+    let body = json!({"chan": chan, "sig": hex::encode(ch.payer.sign_close().unwrap()), "payload": {"chan": chan, "cum": cum.to_string(), "sig": sig}});
+    let r = prov.serve("POST", CLOSE_PATH, &[], body.to_string().as_bytes(), &format!("{O}{CLOSE_PATH}"), None);
+    xbt402::json::parse_slice(&r.body).unwrap()["error"].as_str().unwrap_or("").to_string()
+}
+
+#[test]
+fn unresolved_intents_are_bounded_for_closes_at_rising_amounts() {
+    // AGP-085 bounds the kept intents by refusing the 9th rollover. A close is never refused, and
+    // a close whose payload raises the state by one sat is another transaction: each one the node
+    // errors on would be kept, so a payer could grow the ledger (and the watcher's work per tick)
+    // by one signed transaction per sat while the node refuses broadcasts. (This ran on a hub's
+    // inbound provider until the hub was retired; the bound is the provider's.)
+    let chain = MemChain::new();
+    let (prov, mut c, chan, _) = errored_spend(&chain, false);
+    chain.down(true);
+    let codes: Vec<String> = (0..12).map(|_| close_at(&prov, &mut c, &chan, prov.channel_state(&chan).unwrap().best_cum + 1)).collect();
+    let st = prov.channel_state(&chan).unwrap();
+    let kept = st.extra.get("close_intents").and_then(Value::as_array).map_or(0, Vec::len);
+    assert!(st.closed_txid.is_empty() && chain.sent().is_empty(), "control: the node took nothing");
+    assert!(codes.iter().all(|c| c == "close_failed" || c == "channel_closing"), "control: {codes:?}");
+    assert!(kept <= xbt402::provider::MAX_KEPT_INTENTS, "{kept} unresolved spends are kept beside the latest after 12 closes one sat apart");
+}
+
+#[test]
+fn once_the_kept_intents_are_full_no_request_moves_the_state() {
+    // closes one sat apart, then the two other ways the state could rise while the node refuses
+    // broadcasts: /x402/verify, and the watcher's own close after it
+    let chain = MemChain::new();
+    let (prov, mut c, chan, _) = errored_spend(&chain, false);
+    chain.down(true);
+    for _ in 0..12 {
+        close_at(&prov, &mut c, &chan, prov.channel_state(&chan).unwrap().best_cum + 1);
+    }
+    let kept = |st: &xbt402::ledger::ChannelState| st.extra.get("close_intents").and_then(Value::as_array).map_or(0, Vec::len);
+    let st = prov.channel_state(&chan).unwrap();
+    assert_eq!(kept(&st), xbt402::provider::MAX_KEPT_INTENTS - 1, "one slot is left for the payee's own close");
+    let (best, latest) = (st.best_cum, st.extra["close_intent"]["txid"].as_str().unwrap().to_string());
+    let acc = prov.requirements(150);
+    let sig = hex::encode(c.channels.get_mut(O).unwrap().payer.sign_state(best + 5).unwrap());
+    prov.facilitator_verify(&facilitator_request(&acc, &json!({"chan": chan, "cum": (best + 5).to_string(), "sig": sig})));
+    assert_eq!(prov.channel_state(&chan).unwrap().best_cum, best, "/x402/verify raised the state under a full set of unresolved closes");
+    for _ in 0..3 {
+        let _ = prov.close_due();
+    }
+    assert_eq!(kept(&prov.channel_state(&chan).unwrap()), xbt402::provider::MAX_KEPT_INTENTS - 1, "the watcher's close made another");
+    // the node is back: the watcher's close is the one written ahead last
+    chain.down(false);
+    assert_eq!(prov.close_due().unwrap(), vec![latest.clone()]);
+    let st = prov.channel_state(&chan).unwrap();
+    assert_eq!((st.closed_txid, st.best_cum), (latest, best));
 }
 
 

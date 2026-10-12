@@ -123,15 +123,14 @@ serde_json = "1"
 ureq = { git = "file://$W/xbt-rs", rev = "$REV" }
 EOF
 cat > "$C/src/main.rs" <<'EOF'
-// Links the cmp surface: provider, client (+ signer seam, client ledger), routing payer, the signer
+// Links the cmp surface: provider, client (+ signer seam, client ledger), the signer
 // client, and a big amsat integer through xbt402's JSON.
 use xbt402::client::{Client, ClientLedger};
 use xbt402::provider::Provider;
-use xbt402::route_client::RoutePayer;
 fn main() {
     let v = xbt402::json::parse(r#"{"amsatPerCall": 813000000000123456789}"#).unwrap();
     assert_eq!(xbt402::json::dumps_compact(&v), r#"{"amsatPerCall":813000000000123456789}"#);
-    let _ = (std::mem::size_of::<Provider>(), std::mem::size_of::<Client>(), std::mem::size_of::<RoutePayer>());
+    let _ = (std::mem::size_of::<Provider>(), std::mem::size_of::<Client>());
     let _: Option<&dyn ClientLedger> = None;
     let _ = xbt_signer::client::SignerClient::new;
     println!("ok");

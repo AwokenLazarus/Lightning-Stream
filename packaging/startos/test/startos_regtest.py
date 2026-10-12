@@ -14,7 +14,10 @@ Docker, with what StartOS does around it:
 Checks (results.json): I install and layout, U the owner in the UI (setup code, password, key, policy, token),
 P an agent's payment, G readiness (the fields the package's wallet-ready health check reads), R a restart
 after the whole volume came back root-owned (StartOS remounts, or a restore), B backup and restore of
-`main` into a new install (sealed keys, channels, the UI login), W the reset-password flow, H the hub.
+`main` into a new install (sealed keys, channels, the UI login), W the reset-password flow.
+(The H checks ran the hub and are retired with it; the other letters are unchanged. The hub was retired
+on 2026-10-11: payments between parties route over ordinary Lightning instead. Its code is in the git
+history, last at commit a548fb0.)
     startos_regtest.py OUT
 """
 import json
@@ -35,7 +38,6 @@ PID = os.getpid()
 P = f"agp040-s9-{PID}"
 NET = f"{P}-net"
 P_MCP = int(os.environ.get("STARTOS_TEST_MCP_PORT", "24110"))
-P_HUB = int(os.environ.get("STARTOS_TEST_HUB_PORT", "24120"))
 P_UI = int(os.environ.get("STARTOS_TEST_UI_PORT", "24130"))
 P_PROV = int(os.environ.get("STARTOS_TEST_PROV_PORT", "24140"))
 SIGN_BIN = os.path.join(ROOT, "dist/oci/ctx/bin/amd64/xbt-wallet-ui")
@@ -44,9 +46,9 @@ PROVIDER = f"http://{P}-provider:9500"
 open_log(os.path.join(OUT, "startos_regtest.log"))
 
 
-def spec(hub=True):
+def spec():
     cfg = {"node": {"host": f"{P}-knots", "port": 8332, "user": RPC_USER, "password": RPC_PASS, "chain": "regtest"},
-           "hubEnabled": hub, "mcpUrls": [f"http://127.0.0.1:{P_MCP}/mcp"]}
+           "mcpUrls": [f"http://127.0.0.1:{P_MCP}/mcp"]}
     r = subprocess.run(["node", "--experimental-strip-types", "--no-warnings", "test/spec-json.mjs", json.dumps(cfg)], cwd=PKG,
                        capture_output=True, text=True, check=True)
     return json.loads(r.stdout)
@@ -77,7 +79,7 @@ def start_all(sp, vol, only=None):
     run_service(by["init"], sp["images"], vol)
     code = int(docker("wait", f"{P}-init").stdout.strip())
     rep = docker("logs", f"{P}-init").stdout.strip().splitlines()
-    for sid in ["witness", "signer", "mcp", "ui", "hub"]:
+    for sid in ["witness", "signer", "mcp", "ui"]:
         if sid in by and (only is None or sid in only):
             docker("rm", "-f", f"{P}-{sid}", check_rc=False)
             run_service(by[sid], sp["images"], vol)
@@ -91,7 +93,7 @@ def start_all(sp, vol, only=None):
 
 
 def stop_all():
-    for sid in ["hub", "ui", "mcp", "signer", "witness", "init"]:
+    for sid in ["ui", "mcp", "signer", "witness", "init"]:
         docker("rm", "-f", f"{P}-{sid}", check_rc=False)
 
 
@@ -103,10 +105,10 @@ def vol_sh(vol, script, ro=True):
 def main():
     ensure_provider_image()
     docker("network", "create", NET)
-    sp = spec(hub=True)
+    sp = spec()
     by = {s["id"]: s for s in sp["services"]}
     check("I", "the package spec: init runs as root; every daemon as its image's user; each mounts only its own sub-paths",
-          by["init"].get("user") == "root" and all(not by[i].get("user") for i in ("witness", "signer", "mcp", "ui", "hub"))
+          by["init"].get("user") == "root" and all(not by[i].get("user") for i in ("witness", "signer", "mcp", "ui"))
           and [m["subpath"] for m in by["mcp"]["mounts"]] == ["mcp", "run/signer", "run/ui"]
           and by["mcp"]["mounts"][1]["readonly"] and by["mcp"]["mounts"][2]["readonly"]
           and [(m["subpath"], m["readonly"]) for m in by["ui"]["mounts"]] == [("ui", False), ("run/signer", True), ("run/ui", False)]
@@ -132,28 +134,28 @@ def main():
     vol = f"{P}-main"
     docker("volume", "create", vol)
     docker("run", "-d", "--name", f"{P}-ns", "--network", NET, "-p", f"127.0.0.1:{P_UI}:8480", "-p", f"127.0.0.1:{P_MCP}:33510",
-           "-p", f"127.0.0.1:{P_HUB}:9480", "debian:bookworm-slim", "sleep", "infinity")
+           "debian:bookworm-slim", "sleep", "infinity")
     before = vol_sh(vol, "stat -c '%u:%g %a' /v; ls -A /v | wc -l").stdout.split()
     t0 = time.time()
     code, rep = start_all(sp, vol)
     check("I", "init on the root-owned empty volume exits 0; its own layout check passes",
           before[:3] == ["0:0", "755", "0"] and code == 0 and rep.get("ok"), {"before": before, "report": rep})
-    ls = vol_sh(vol, "stat -c '%u:%g %a %n' /v/signer /v/witness /v/mcp /v/ui /v/hub /v/run/signer /v/run/anchor /v/signer/secrets/node-rpc-auth "
-                     "/v/hub/secrets/node-rpc-auth /v/run/ui /v/run/ui/mcp-http-token; ls /v/ui/secrets /v/mcp/secrets").stdout.split("\n")
-    check("I", "each component's sub-path owned by its uid (0700; sockets 0750); node credentials for signer and hub; the MCP token "
+    ls = vol_sh(vol, "stat -c '%u:%g %a %n' /v/signer /v/witness /v/mcp /v/ui /v/run/signer /v/run/anchor /v/signer/secrets/node-rpc-auth "
+                     "/v/run/ui /v/run/ui/mcp-http-token; ls /v/ui/secrets /v/mcp/secrets").stdout.split("\n")
+    check("I", "each component's sub-path owned by its uid (0700; sockets 0750); node credentials for the signer; the MCP token "
                "is the UI's run/ui/mcp-http-token (0640, the MCP reads it by group), with no other copy; "
                "no UI password file (StartOS uses the UI's own setup code)",
-          ls[:11] == ["10001:10001 700 /v/signer", "10002:10002 700 /v/witness", "10003:10003 700 /v/mcp", "10005:10005 700 /v/ui",
-                      "10004:10004 700 /v/hub", "10001:10001 750 /v/run/signer", "10002:10002 750 /v/run/anchor",
-                      "10001:10001 600 /v/signer/secrets/node-rpc-auth", "10004:10004 600 /v/hub/secrets/node-rpc-auth",
-                      "10005:10005 750 /v/run/ui", "10005:10005 640 /v/run/ui/mcp-http-token"]
-          and "xbt-ui-password" not in ls and "mcp-http-token" not in ls[11:], ls)
-    wait_until(lambda: status(f"http://127.0.0.1:{P_MCP}/readyz") == 200 and status(f"http://127.0.0.1:{P_UI}/readyz") == 200
-               and status(f"http://127.0.0.1:{P_HUB}/readyz") == 200, 180, "MCP, UI and hub /readyz 200")
-    check("I", f"MCP, UI and hub ready {time.time() - t0:.1f} s after install (the ports the package's readiness checks watch)", True)
-    ids = {s: docker("inspect", "-f", "{{.Config.User}}", f"{P}-{s}").stdout.strip() for s in ("witness", "signer", "mcp", "ui", "hub")}
-    check("I", "the daemons run as the image users (xbt-anchor-witness, xbt-signer, xbt-wallet-mcp, xbt-wallet-ui, xbt402-hub)",
-          ids == {"witness": "xbt-anchor-witness", "signer": "xbt-signer", "mcp": "xbt-wallet-mcp", "ui": "xbt-wallet-ui", "hub": "xbt402-hub"}, ids)
+          ls[:9] == ["10001:10001 700 /v/signer", "10002:10002 700 /v/witness", "10003:10003 700 /v/mcp", "10005:10005 700 /v/ui",
+                     "10001:10001 750 /v/run/signer", "10002:10002 750 /v/run/anchor",
+                     "10001:10001 600 /v/signer/secrets/node-rpc-auth",
+                     "10005:10005 750 /v/run/ui", "10005:10005 640 /v/run/ui/mcp-http-token"]
+          and "xbt-ui-password" not in ls and "mcp-http-token" not in ls[9:], ls)
+    wait_until(lambda: status(f"http://127.0.0.1:{P_MCP}/readyz") == 200 and status(f"http://127.0.0.1:{P_UI}/readyz") == 200,
+               180, "MCP and UI /readyz 200")
+    check("I", f"MCP and UI ready {time.time() - t0:.1f} s after install (the ports the package's readiness checks watch)", True)
+    ids = {s: docker("inspect", "-f", "{{.Config.User}}", f"{P}-{s}").stdout.strip() for s in ("witness", "signer", "mcp", "ui")}
+    check("I", "the daemons run as the image users (xbt-anchor-witness, xbt-signer, xbt-wallet-mcp, xbt-wallet-ui)",
+          ids == {"witness": "xbt-anchor-witness", "signer": "xbt-signer", "mcp": "xbt-wallet-mcp", "ui": "xbt-wallet-ui"}, ids)
 
     # --- U: the owner, through the setup code (the Web UI setup code action reads ui/setup-code) ------------------------
     log("== U: the owner's first run: the setup code, a password, the key, the policy, the token")
@@ -313,26 +315,12 @@ def main():
     st_new_tok = Mcp(f"http://127.0.0.1:{P_MCP}", new_tok).start()[0]
     check("W", "after Rotate the agent token: a new token in the UI's file; the old one gets 401, the new one works",
           len(new_tok) == 64 and new_tok != token and st_old_tok == 401 and st_new_tok == 200, [st_old_tok, st_new_tok])
-    new_code = vol_sh(vol2, "cat /v/ui/setup-code").stdout.strip()  # still waiting: no password was set since the reset
-
-    # --- H: the hub ------------------------------------------------------------------------------------------------
-    hub = json.loads(http("GET", f"http://127.0.0.1:{P_HUB}/readyz")[2])
-    ui = Ui(f"http://127.0.0.1:{P_UI}")
-    ui.req("POST", "/setup-password", {"code": new_code, "password": pw, "password2": pw})
-    ui.login(pw)
-    hp = ui.get("/hub")
-    w = hub.get("wallet") or {}
-    addr = w.get("receive_address") or ""
-    check("H", "hub enabled: /readyz 200 with its payTo; the UI's Hub page reaches it on 127.0.0.1:9480 (the shared namespace)",
-          hub.get("ok") and '<span class="tag ok">200</span> <code>/readyz</code>' in hp, hub)
-    check("H", "hub created wallet hub and the Hub page shows the receive address (no terminal)",
-          w.get("name") == "hub" and addr.startswith("bcrt1") and f'id="hub-receive">{addr}' in hp, w)
     with open(os.path.join(OUT, "facts.json"), "w") as f:
         json.dump({"r1": r1, "r2": r2, "r3": r3, "init_install": rep, "init_after_root_chown": rep2, "init_after_restore": rep3}, f, indent=1, default=str)
 
 
 def teardown():
-    for sid in ["init", "witness", "signer", "mcp", "ui", "hub", "knots", "provider"]:
+    for sid in ["init", "witness", "signer", "mcp", "ui", "knots", "provider"]:
         with open(os.path.join(OUT, f"{sid}.log"), "w") as f:
             r = docker("logs", f"{P}-{sid}", check_rc=False)
             f.write(r.stdout + r.stderr)
