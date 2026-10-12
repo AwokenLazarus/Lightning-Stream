@@ -2514,6 +2514,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "xbt-gateway"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "hex",
+ "rustls",
+ "secp256k1",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "ureq",
+ "xbt-primitives",
+ "xbt-svc",
+ "xbt402",
+]
+
+[[package]]
 name = "xbt-primitives"
 version = "0.1.0"
 dependencies = [

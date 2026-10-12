@@ -18,9 +18,10 @@ collects. A few tickets are locked before the service starts and topped up in th
 no request waits for a payment. Lightning's own routing carries tickets to any seller the
 network reaches, with no change to the node software.
 
-This direction was decided on 2026-10-11. **Tickets are in design, not built**: the design was
-measured on a three-node Lightning Fork regtest, and none of it is in the wallet or in a seller
-yet. The sections below say what exists today, what is being built, and what was retired.
+This direction was decided on 2026-10-11. **Tickets are half built**: the design was measured on
+a three-node Lightning Fork regtest, and the seller's side (the gateway) is built and runs on
+that regtest. The wallet's side is not built, so nothing can be bought with tickets yet. The
+sections below say what exists today, what is being built, and what was retired.
 
 Whitepaper: **<https://lazarus-xbt.xyz/stream/>**
 
@@ -57,6 +58,11 @@ the full list, with a link for each, is [`docs/REFERENCES.md`](docs/REFERENCES.m
 - **The Lightning rail.** The wallet pays XBT Lightning invoices (BOLT 11) and offers (BOLT 12)
   through the owner's Lightning node, under the same policy. This rail is what tickets will be
   built on.
+- **The seller gateway (regtest only).** `xbt-gateway` runs beside a seller's Lightning node in
+  front of any HTTP service: it offers ticket terms in a 402, registers hold invoices for a
+  buyer's hashes, settles a ticket when its secret arrives, meters the answer per request, per
+  byte or per second, and signs a receipt. `scripts/gateway_regtest.sh` runs it on three
+  Lightning Fork nodes with a test buyer; no wallet pays it yet.
 - **The on-chain one-way channel (frozen).** A direct channel anchored on the chain, for paying
   one seller piece by piece: the buyer signs a slightly larger running total for each piece and
   the seller settles once. It is kept in the tree and tested, off the main path, with no new
@@ -72,8 +78,8 @@ the full list, with a link for each, is [`docs/REFERENCES.md`](docs/REFERENCES.m
 
 Stream tickets, in this order: the ticket book in the wallet's signer (secrets derived in the
 signer, many tickets in flight, each booked when it is locked and when its secret leaves); the
-seller component beside a Lightning node (registers the buyer's hashes, serves on a good secret,
-settles on use, cancels what is left); and the HTTP 402 entry that offers tickets to a buyer.
+seller gateway beside a Lightning node (built: see above); and the wallet's side of the HTTP 402
+entry, which pays a gateway.
 The wire is written down as a draft in [`docs/TICKETS.md`](docs/TICKETS.md), and
 `scripts/ln_ticket_regtest.sh` reproduces its measurements on four Lightning Fork nodes (31 checks).
 Defaults in the design: 1,000-sat tickets, 8 in flight, a life of about 40 blocks. The buyer goes
@@ -81,7 +87,8 @@ first and can lose at most one ticket; for content that can be checked, the buye
 before releasing its ticket.
 
 A seller will need a Lightning node with inbound capacity, and a buyer a Lightning node with a
-channel. `docs/LIMITS.md`, section "Stream tickets (in design)", states what the design gives up.
+channel. `docs/LIMITS.md` states what the design gives up (section "Stream tickets (in design)")
+and what the gateway does not do (section "Seller gateway").
 
 ### Lottery tickets (in design)
 
@@ -178,7 +185,8 @@ on-chain channel, pay with work, and the services and packages around them.
 | `xbt-wallet-ui` | the owner's web UI: approvals, policy, channels, signature log |
 | `xbt-electrum` | a light chain backend for the buyer's wallet (it watches the frozen channel): it checks headers, proof of work and Merkle proofs itself; "not there" is answered only when every configured server answered, and servers that all hide a transaction make it read as absent |
 | `xbt-work`, `xbt-work-relay` | pay with work: a miner pays with pool shares, settled in the coinbase and checked by an audit |
-| `xbt-svc` | container plumbing: data dir, secrets, readiness |
+| `xbt-gateway` | the stream-ticket seller gateway: a reverse proxy beside a Lightning node that puts a price per piece on any HTTP service (regtest only) |
+| `xbt-svc` | container plumbing: data dir, secrets, readiness, the bounded HTTP server |
 | `xbt402-interop` | conformance vectors and cross-implementation tools |
 
 `packaging/` holds the Umbrel and StartOS apps of the wallet. `container/` and `docs/CONTAINER.md`

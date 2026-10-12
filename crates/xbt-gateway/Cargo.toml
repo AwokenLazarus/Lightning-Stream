@@ -1,0 +1,26 @@
+[package]
+name = "xbt-gateway"
+description = "The stream-ticket seller gateway: a reverse proxy beside a Lightning node that puts a price per piece on any HTTP service (docs/TICKETS.md, draft v0)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+xbt-primitives.workspace = true
+xbt402.workspace = true
+xbt-svc.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+# the node's REST interface and the upstream service: blocking, no async runtime
+ureq.workspace = true
+# TLS to the node, pinned to its own certificate (as the wallet's Lightning rail pins it)
+secp256k1.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+
+[dev-dependencies]
+tempfile = "3"

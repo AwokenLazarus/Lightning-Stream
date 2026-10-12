@@ -1,0 +1,197 @@
+//! The stream-ticket wire, draft v0 (`docs/TICKETS.md`): the names, the request authentication and
+//! the signed receipt that a seller and a buyer must compute alike. No state and no IO: the seller
+//! gateway (`xbt-gateway`) and a wallet both build on this.
+//!
+//! ```text
+//! auth    = HMAC-SHA256(key, "ticket/auth|" session "|" seq "|" secret "|" ticket "|" request_digest_v2)
+//! receipt = tagged_hash("xbt402/ticket-receipt/v0", f(scheme) ‖ f(session) ‖ … ‖ f(bodyHash)),  f(x) = LE64(len(x)) ‖ x
+//! ```
+use hmac::{Hmac, Mac};
+use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
+
+use crate::json::py_str;
+use crate::wire::{put_field, tagged};
+
+pub const SCHEME: &str = "ticket";
+pub const VERSION: &str = "ticket/0";
+pub const ASSET: &str = "XBT:msat";
+/// Every ticket invoice carries this feature bit, required: it is what makes an invoice XBT's.
+pub const FEATURE_BLAKE2B: u64 = 512;
+/// Where the session endpoints live on the seller's origin unless its terms say otherwise.
+pub const SESSION_PATH: &str = "/x402/ticket";
+pub const RECEIPT_TAG: &str = "xbt402/ticket-receipt/v0";
+/// A ticket is used only while more than this many blocks are left before its HTLC expires: the
+/// seller's node cancels a held invoice 18 blocks before expiry, and 6 more are for a settle that
+/// has to go on chain.
+pub const SETTLE_MARGIN_BLOCKS: u32 = 24;
+/// The node takes no hold invoice with a final CLTV delta of this or less.
+pub const MIN_TICKET_BLOCKS: u32 = 24;
+/// How long an unpaid ticket invoice may wait to be paid, in seconds.
+pub const INVOICE_EXPIRY_S: u32 = 60;
+
+/// `lightning:` and the 32 hex characters of the chain's `bip122` id: a Lightning network is not
+/// the chain, and XBT shares its genesis block with the SHA-256 chain.
+pub fn network_id(bip122: &str) -> Option<String> {
+    let id = bip122.strip_prefix("bip122:")?;
+    (id.len() == 32 && id.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))).then(|| format!("lightning:{id}"))
+}
+
+/// The message `payload.auth` MACs. A field that is absent is empty.
+pub fn auth_message(session: &str, seq: u64, secret: &str, ticket: &str, req: &str) -> String {
+    ["ticket/auth", session, &seq.to_string(), secret, ticket, req].join("|")
+}
+
+/// `payload.auth`, hex: binds one request to the session, a fresh `seq`, the secret it releases and
+/// the ticket it pledges.
+pub fn request_auth(key: &[u8; 32], session: &str, seq: u64, secret: &str, ticket: &str, req: &str) -> String {
+    let mut m = Hmac::<Sha256>::new_from_slice(key).expect("HMAC takes any key length");
+    m.update(auth_message(session, seq, secret, ticket, req).as_bytes());
+    hex::encode(m.finalize().into_bytes())
+}
+
+/// The fields a ticket receipt signs, in order.
+pub const RECEIPT_FIELDS: [&str; 9] = ["scheme", "session", "seq", "releasedMsat", "spentMsat", "charged", "req", "status", "bodyHash"];
+
+/// What `receiptKey` signs: each of [`RECEIPT_FIELDS`] formatted as the channel wire formats its
+/// own (a JSON number and its decimal string sign alike), length-prefixed, under [`RECEIPT_TAG`].
+pub fn receipt_message(r: &Value) -> [u8; 32] {
+    let mut h = tagged(RECEIPT_TAG);
+    for k in RECEIPT_FIELDS {
+        put_field(&mut h, py_str(r.get(k)).as_bytes());
+    }
+    h.finalize().into()
+}
+
+/// The hash a secret names: the ticket's payment hash.
+pub fn ticket_hash(secret: &[u8; 32]) -> [u8; 32] {
+    Sha256::digest(secret).into()
+}
+
+/// 32 bytes from 64 lower-case hex characters, and nothing else (an upper-case spelling would be a
+/// second name for one ticket).
+pub fn hex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 || !s.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    hex::decode_to_slice(s, &mut out).ok()?;
+    Some(out)
+}
+
+/// What a seller's terms say about tickets: the `extra` of its `accepts` entry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Terms {
+    /// `lightning:<32 hex>`.
+    pub network: String,
+    /// The seller's Lightning node id, 33 bytes hex: the payee of every ticket invoice.
+    pub pay_to: String,
+    pub ticket_msat: u64,
+    pub max_tickets: u32,
+    pub ticket_blocks: u32,
+    /// The key that signs receipts, 33 bytes hex.
+    pub receipt_key: String,
+    /// Path of the session endpoints.
+    pub session: String,
+}
+
+impl Terms {
+    /// The `accepts` entry for a request priced at `amount_msat`, released `release`
+    /// (`with-request` or `after-verify`), with the route's price rule as the seller states it.
+    pub fn accepts(&self, amount_msat: u64, release: &str, price: &Value) -> Value {
+        let mut extra = Map::new();
+        extra.insert("version".into(), VERSION.into());
+        extra.insert("features".into(), Value::Array(vec![FEATURE_BLAKE2B.into()]));
+        extra.insert("ticketMsat".into(), self.ticket_msat.to_string().into());
+        extra.insert("maxTickets".into(), self.max_tickets.into());
+        extra.insert("ticketBlocks".into(), self.ticket_blocks.into());
+        extra.insert("release".into(), release.into());
+        extra.insert("settle".into(), "on-use".into());
+        extra.insert("receiptKey".into(), self.receipt_key.clone().into());
+        extra.insert("session".into(), self.session.clone().into());
+        extra.insert("price".into(), price.clone());
+        let mut m = Map::new();
+        m.insert("scheme".into(), SCHEME.into());
+        m.insert("network".into(), self.network.clone().into());
+        m.insert("asset".into(), ASSET.into());
+        m.insert("amount".into(), amount_msat.to_string().into());
+        m.insert("payTo".into(), self.pay_to.clone().into());
+        m.insert("extra".into(), Value::Object(extra));
+        Value::Object(m)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn the_network_id_is_the_chain_id_under_another_prefix() {
+        assert_eq!(network_id(xbt_primitives::network::XBT_MAINNET).as_deref(), Some("lightning:0000000000000050c1e5f69672f45929"));
+        for bad in ["", "bip122:", "bip122:00", "lightning:0000000000000050c1e5f69672f45929", "bip122:0000000000000050C1E5F69672F45929", "bip122:0000000000000050c1e5f69672f459299"] {
+            assert_eq!(network_id(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn auth_binds_every_field_and_an_absent_one_is_empty() {
+        let key = [7u8; 32];
+        assert_eq!(auth_message("s", 3, "", "", "d"), "ticket/auth|s|3|||d");
+        let base = request_auth(&key, "s", 3, "aa", "bb", "d");
+        assert_eq!(base.len(), 64);
+        for other in [
+            request_auth(&[8u8; 32], "s", 3, "aa", "bb", "d"),
+            request_auth(&key, "t", 3, "aa", "bb", "d"),
+            request_auth(&key, "s", 4, "aa", "bb", "d"),
+            request_auth(&key, "s", 3, "ab", "bb", "d"),
+            request_auth(&key, "s", 3, "aa", "bc", "d"),
+            request_auth(&key, "s", 3, "aa", "bb", "e"),
+            // a secret is not a ticket: the two fields do not run together
+            request_auth(&key, "s", 3, "", "aabb", "d"),
+        ] {
+            assert_ne!(base, other);
+        }
+    }
+
+    #[test]
+    fn a_receipt_signs_its_nine_fields_and_a_number_as_its_decimal_string() {
+        let r = json!({"scheme": "ticket", "session": "ab", "seq": 2, "releasedMsat": "1000000", "spentMsat": "2500", "charged": "2500",
+                       "req": "00", "status": 200, "bodyHash": "ff", "sig": "ignored"});
+        let m = receipt_message(&r);
+        let mut same = r.clone();
+        same["seq"] = "2".into();
+        same["status"] = "200".into();
+        same["sig"] = "other".into();
+        assert_eq!(m, receipt_message(&same));
+        for k in RECEIPT_FIELDS {
+            let mut other = r.clone();
+            other[k] = "x".into();
+            assert_ne!(m, receipt_message(&other), "{k}");
+        }
+        // not the channel receipt's message: another tag
+        assert_ne!(m, crate::wire::receipt_message(&r));
+    }
+
+    #[test]
+    fn a_hash_is_64_lower_case_hex_characters() {
+        let h = hex::encode(ticket_hash(&[1u8; 32]));
+        assert_eq!(hex32(&h), Some(ticket_hash(&[1u8; 32])));
+        for bad in [h.to_uppercase(), h[..62].to_string(), format!("{h}00"), format!("0x{}", &h[2..]), format!("{} ", &h[1..]), "g".repeat(64)] {
+            assert_eq!(hex32(&bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_accepts_entry_is_the_one_the_draft_shows() {
+        let t = Terms { network: "lightning:0000000000000050c1e5f69672f45929".into(), pay_to: "02".repeat(33), ticket_msat: 1_000_000, max_tickets: 8, ticket_blocks: 40,
+                        receipt_key: "03".repeat(33), session: SESSION_PATH.into() };
+        let a = t.accepts(2500, "with-request", &json!({"requestMsat": "2500"}));
+        assert_eq!(a["scheme"], "ticket");
+        assert_eq!(a["amount"], "2500");
+        assert_eq!(a["extra"]["ticketMsat"], "1000000");
+        assert_eq!(a["extra"]["features"], json!([512]));
+        assert_eq!(a["extra"]["settle"], "on-use");
+        assert_eq!(a["extra"]["session"], "/x402/ticket");
+    }
+}

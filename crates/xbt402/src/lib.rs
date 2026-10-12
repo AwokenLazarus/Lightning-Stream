@@ -19,6 +19,7 @@
 //! * [`maturity`]: coinbase maturity as the node reports it (`getdeploymentinfo`).
 //! * [`scheme`]: the seam for a second x402 scheme beside the channel binding (`xbt-work`, AGP-032).
 //! * [`macaroon`]: a Lightning node's macaroon, read (shared with `xbt-signer`'s Lightning rail).
+//! * [`ticket`]: the stream-ticket wire, draft v0 (`docs/TICKETS.md`): request auth and the signed receipt.
 //!
 //! Optional features: `http-client` (ureq transport), `http-server` (std::net around the
 //! provider), `rpc` (bitcoind JSON-RPC backend and wallet).
@@ -35,6 +36,7 @@ pub mod maturity;
 pub mod provider;
 pub mod scheme;
 pub mod signer;
+pub mod ticket;
 pub mod wire;
 #[cfg(feature = "rpc")]
 pub mod rpc;
