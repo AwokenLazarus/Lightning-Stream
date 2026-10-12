@@ -56,9 +56,41 @@ route to a hash whose secret only the buyer knows (a hold invoice on the seller'
 buyer releases it by putting the secret in a paid request. Each sentence below comes from the
 design's lab measurements: three Lightning Fork nodes on regtest, buyer and seller one routing
 node apart, default node settings. The wallet's ticket book and the seller's gateway have their own sections below.
+A sentence marked *(with Core Lightning)* comes from a later lab run with three nodes of the XBT
+Core Lightning fork (v26.06.9-blake2b.7, the released binaries) beside three Lightning Fork
+nodes, two of the Core Lightning nodes started with the values that binary has by default on
+mainnet; its driver is not in this tree. `docs/TICKETS.md`, section 11, has the table.
 
-- Money moves a ticket at a time (1,000 sat by default, 1 sat at the least). Pieces inside a
-  ticket are metered, and the unused part of the ticket in use is trusted to the seller.
+- Money moves a ticket at a time (1,000 sat by default; a ticket that is held is at least 546
+  sat by the design's rule, and a node carries nothing below 1 sat). Pieces inside a ticket are
+  metered, and the unused part of the ticket in use is trusted to the seller.
+- A held ticket takes one HTLC slot of every channel on its route, and a channel's slots are
+  shared by everyone who uses it. A channel carries 483 each way between Lightning Fork nodes
+  and 30 where either end is a Core Lightning node at its default. *(with Core Lightning)* Of 40
+  tickets offered to a Core Lightning seller on one channel 30 locked and 10 failed, and an
+  ordinary payment over that channel then failed too; two buyers through one Core Lightning hop
+  held 20 and 10 between them.
+- At a full channel a Lightning Fork buyer is told `INSUFFICIENT_BALANCE`, not that the slots
+  are gone, and a full remote hop answers as a hop short of balance does. A buyer cannot know a
+  remote channel's slot count before it fails against it.
+- The design's defaults are therefore 2 tickets a session and at most half of a channel's slots
+  in held tickets (15 of 30). One buyer holds tickets with 7 sellers at 2 each, or 15 at 1 each,
+  from one 30-slot channel. The earlier figure of 200 sellers from one channel (400 tickets) was
+  measured on 483-slot channels and holds only where every channel on the way has 483.
+- A ticket below a channel's dust limit has no output in that side's transaction: 354 sat on a
+  Lightning Fork node, 546 sat on a Core Lightning node. *(with Core Lightning)* With tickets of
+  400, 600 and 1,000 sat held, a Core Lightning node's force close had outputs for 600 and 1,000
+  only. Such a ticket cannot be claimed on chain and goes to the miners if that channel is
+  force-closed while it is held. On a channel without anchors the limit also rises with the fee
+  rate (computed, not run: the forks open anchor channels by default).
+- A node caps the dust it carries per channel: Core Lightning at 50,000 sat, Lightning Fork at
+  500,000 sat with the channel's fee. *(with Core Lightning)* On a Core Lightning channel opened
+  with 483 slots, 100 tickets of 500 sat locked and the next 30 failed; the buyer's node then
+  found no route to that seller for a 1,000-sat ticket either. Lightning Fork's cap was not
+  reached with 483 tickets of 300 sat.
+- Above the dust limit is not the same as worth claiming: a seller's claim of 3 tickets on
+  chain cost 900 to 1,700 sat at 1 sat/vB, so at higher fee rates a single 1,000-sat ticket
+  costs more to claim than it is worth.
 - The buyer can lose one ticket: a secret is spent when it leaves the wallet, and a seller can
   take it and serve nothing.
 - Unused tickets stay locked until the seller cancels them or they expire. Measured with 40-block
@@ -73,8 +105,16 @@ node apart, default node settings. The wallet's ticket book and the seller's gat
 - BOLT 11 hold invoices only. The Lightning Fork's BOLT 12 offers have no hold path.
 - One hop was measured, on one host. Two or more hops, real network latency, mainnet routes and
   fees, a direct channel, and a force close with many tickets were not.
-- The Core Lightning fork is untested, as a seller, a buyer or a hop. It has no hold-invoice call
-  of its own.
+- *(with Core Lightning)* A Core Lightning node needs nothing special as a buyer's node or as a
+  hop (the buyer was the node's own `pay`; the wallet has no Core Lightning rail). As a seller it
+  has no hold-invoice call. A ticket was held through its `htlc_accepted` hook by a lab plugin
+  only: of the two published hold plugins, one makes invoices without feature bit 512, which a
+  Lightning Fork buyer refuses, and the other keeps the secret on the seller's node. Locking and
+  settling took the same time as with a Lightning Fork seller.
+- *(with Core Lightning)* Nothing on a Core Lightning node cancels a held ticket before it
+  expires. With a seller that neither settled nor cancelled, the buyer's own node force-closed
+  its channel to the seller at the tickets' expiry.
+- What XBT's mainnet nodes are set to (slots, channel types, fee rates) was not measured.
 - Every hop sees the same hash, so hops that collude can link a ticket along its route, and a
   ticket cannot be partly released.
 
@@ -128,9 +168,16 @@ marked *(simulated)* involved no node.
   extension of oblivious transfers), which is safe only against a seller that follows the
   protocol; a product needs the hardened form, which was not built or measured.
 - The win that pays itself holds one ticket and one channel slot per seller, with every limit of
-  a ticket above. A locked ticket below the channel's dust limit (354 sat on the lab) cannot be
-  claimed on chain, so a win is lost if the seller's own channel peer stays away until the
-  ticket expires (reasoned, not run).
+  a ticket above: on a 30-slot channel a buyer holds such tickets with 15 sellers within the
+  design's half rule. A locked ticket below a channel's dust limit (354 sat on a Lightning Fork
+  node, 546 sat on a Core Lightning node) cannot be claimed on chain, so a win is lost if the
+  seller's own channel peer stays away until the ticket expires (reasoned, not run). By the
+  design's rule the locked ticket, and so the win, is at least 546 sat, which makes a small
+  seller's income more uneven than the 64-sat examples above.
+- Pay after a win holds no slot, but each win is a payment in flight for about a quarter of a
+  second and wins of 16 or 64 sat are below the dust limits while in flight. Of 200 payments of
+  64 sat sent 64 at a time over a 30-slot channel to a Core Lightning node, 139 failed; sent 8 at
+  a time all 200 succeeded, 28 a second. A wallet has to pace them.
 - The fairness of the roll treats SHA-256 as a random function. Nobody outside the project has
   reviewed that argument either.
 - A win is not proof to a third party, in either form.
@@ -154,6 +201,15 @@ Regtest only. The gateway has run against Lightning Fork nodes on one host
   a request is answered 503 and the secret is good again later.
 - The 24-block margin is checked against the height the node last reported, which is asked for
   twice a second: a block that arrived since is not counted.
+- The gateway's defaults were sized for channels of 483 slots and it does not look at its
+  node's channels. On a channel with a Core Lightning node at the other end, which carries 30,
+  four buyers at the default of 8 tickets fill it, the 31st ticket's payment fails at the buyer
+  with `INSUFFICIENT_BALANCE`, and nobody can pay the seller over that channel until tickets are
+  released or cancelled (measured on the lab with a Core Lightning seller, not with the
+  gateway). A runner whose node has such a channel sets `tickets.max_tickets` to 2 and
+  `caps.max_held_tickets` to 15 for each 30-slot inbound channel. The gateway accepts a ticket
+  size below the dust limits (from 1 sat), does not answer `slots_short`, and does not offer
+  tickets settled on arrival (`docs/TICKETS.md`, section 11).
 - With the default caps buyers can hold 240 tickets, 240,000 sat of the seller's inbound capacity
   and 240 of one channel's 483 HTLC slots, at no fee: for 1 minute by a session that never
   releases a secret, for 5 minutes after a session's last paid request, and again as soon as
@@ -230,6 +286,16 @@ the owner's node, and the booking. It is reached through six socket methods; the
 `xbt402_pay` and paid HTTP requests, the check of a seller's receipts, verify-before-release for
 checkable content, prepaid tickets (`settle: on-arrival`), lottery tickets and admission by
 content hash are not built. Run on regtest only (`scripts/ticket_book_regtest.sh`).
+
+- The ticket book's defaults were sized for channels of 483 slots: a pool of 8 tickets with each
+  of up to 8 sellers and 2 beyond that, 64 held tickets in all, and a smallest ticket of 64 sat
+  where it chooses the size. It does not read its channels' slot counts or dust limits before a
+  lock, and a lock that fails for lack of a slot is recorded on the ticket and nothing more. On
+  a channel that carries 30 (any channel with a Core Lightning node at its default) the 31st
+  held ticket fails, and a 64-sat ticket has no output in any channel's transaction. An owner
+  can cap both in the policy, with `tickets.seller_max_tickets` at 2 and
+  `tickets.max_locked_tickets` at 15; the 64-sat floor is compiled in (`docs/TICKETS.md`,
+  section 11).
 
 - Tickets are off until the owner's policy turns them on (`tickets.enabled`) and names at least
   one task with a budget (`tickets.tasks`); with tickets on and no task, every session is refused.

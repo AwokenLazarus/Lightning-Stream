@@ -87,9 +87,22 @@ node are both built (above) and run on regtest. Next: the wallet's side of the H
 that `xbt402_pay` pays a gateway; then the lottery for amounts smaller than a ticket.
 The wire is written down as a draft in [`docs/TICKETS.md`](docs/TICKETS.md), and
 `scripts/ln_ticket_regtest.sh` reproduces its measurements on four Lightning Fork nodes (31 checks).
-Defaults in the design: 1,000-sat tickets, 8 in flight, a life of about 40 blocks. The buyer goes
+Defaults in the design: 1,000-sat tickets, 2 in flight, a life of about 40 blocks. The buyer goes
 first and can lose at most one ticket; for content that can be checked, the buyer checks a piece
 before releasing its ticket.
+
+**Two limits shape those defaults** (set on 2026-10-12, after a Lightning developer pointed them
+out). A held ticket takes one of a channel's slots for pending payments on every channel of its
+route, and those slots are shared by everyone using the channel: 483 between Lightning Fork
+nodes, 30 where either end is a Core Lightning node at its default. So a session holds 2 tickets,
+not 8, and held tickets take at most half of a channel's slots: from one 30-slot channel a buyer
+holds tickets with 7 sellers at once, or 15 at one ticket each. And a ticket below a channel's
+dust limit (354 sat on Lightning Fork, 546 sat on Core Lightning) cannot be claimed on chain, so
+a held ticket is never below 546 sat. Paying many sellers at once, as in a swarm, is therefore
+the lottery's job (below): a win is paid at once and holds nothing. This was measured with the
+XBT Core Lightning fork in the lab ([`docs/TICKETS.md`](docs/TICKETS.md), section 11). **The
+wallet's ticket book and the gateway still have the earlier defaults** (8 tickets, sized for 483
+slots); `docs/LIMITS.md` says what that means on a 30-slot channel.
 
 A seller will need a Lightning node with inbound capacity, and a buyer a Lightning node with a
 channel. `docs/LIMITS.md` states what the design gives up, what the wallet's ticket book does not
@@ -142,7 +155,10 @@ they are in the git history, last at commit `a548fb0`.
   `v0.21.3-beta-blake2b.17`), in the regtest lab the same author publishes
   ([paulscode/lightning-fork-lab](https://github.com/paulscode/lightning-fork-lab), commit `a5cadc5`).
   The other XBT Lightning implementation is the **Core Lightning fork** by PrivKey
-  ([privkeyio/lightning](https://github.com/privkeyio/lightning)); we have not tested it.
+  ([privkeyio/lightning](https://github.com/privkeyio/lightning)). We ran its release
+  `v26.06.9-blake2b.7` in the lab as buyer, hop and seller to measure its limits
+  ([`docs/TICKETS.md`](docs/TICKETS.md), section 11); the wallet and the gateway speak to
+  Lightning Fork nodes only.
 - **electrs** by Roman Zeyde, the Electrum server the light chain backend talks to, and
   **libsecp256k1**, where all signing and verification runs.
 - **x402** (created by Coinbase, kept by the x402 Foundation) for the HTTP 402 wire, and the
