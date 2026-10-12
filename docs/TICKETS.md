@@ -146,8 +146,8 @@ loopback): on a plain connection a listener learns the session key.
 
 On the lab a paid request cost the seller about 1 ms to hash the secret and look the ticket up on
 its node, and about 4 ms in all until the settle call returned. The buyer's node showed the payment
-`SUCCEEDED`, with the buyer's own secret as the preimage, about 14 ms after the request (medians of
-30, one hop, loopback; three runs gave 0.9 to 1.2, 3.3 to 4.0 and 12 to 14.5).
+`SUCCEEDED`, with the buyer's own secret as the preimage, about 13 ms after the request (medians of
+30, one hop, loopback). On a shared host the runs gave 0.9 to 1.2 ms, 3.3 to 5.4 ms and 12 to 34 ms.
 
 ## 4. Refill, stop, cancel
 
@@ -199,7 +199,7 @@ Lightning invoice whose preimage is that key: paying it reveals it, across any n
 | Buyer | **Funds locked, not lost: a hop that has gone.** | Until the buyer's own HTLC expires: 123 blocks through one hop at the default, which is what `cltv_limit` bounds. Then the buyer's node closes that channel on chain. Not run here. |
 | Seller | **Nothing**, if it serves only after a successful settle of a locked ticket. | Settle returned in 4 ms with the hop stopped, and the buyer's node had the secret as soon as the hop was back. After a restart of the seller, the hop or the buyer the tickets were still `ACCEPTED` and settled. |
 | Seller | **A ticket it served and did not settle** in time. | Its own node cancels it 18 blocks before expiry. So: settle first, then serve. |
-| Seller | **An on-chain claim**, when it settled and the hop then stays away. | Its node closed the channel 16 blocks before the tickets' expiry and had the secrets on chain 12 blocks before it. It kept the 3 tickets (3,000 sat), paid 1,400 to 1,700 sat in fees at 1 sat/vB, and waited about 650 blocks for its funds, its whole channel balance with them. The buyer's node learned the secrets from the chain when the hop returned. |
+| Seller | **An on-chain claim**, when it settled and the hop then stays away. | Its node closed the channel 16 blocks before the tickets' expiry and had the secrets on chain 12 blocks before it. It kept the 3 tickets (3,000 sat), paid 900 to 1,700 sat in fees at 1 sat/vB (five runs), and waited about 650 blocks for its funds, its whole channel balance with them. The buyer's node learned the secrets from the chain when the hop returned. |
 | Seller | **A closed channel**, if its node is offline when locked tickets expire. | As in the fourth row: the hop closes it. The seller's balance comes back on chain. |
 | Routing hop | **Slots and capacity held for no fee.** A cancelled ticket pays nothing: 10 locked and 5 settled cost the buyer 5,005 sat for 5,000 delivered. | `maxTickets` and `ticketBlocks`. This is Lightning's known jamming exposure. Tickets use it on purpose, which is why the defaults are small. |
 | Routing hop | **The cost of a force close** when a seller vanishes with tickets locked, if the hop opened that channel. | With 100 tickets: a commitment transaction of 18,313 weight units and 104 outputs, 4,635 sat in fee, and about 29,000 sat in all to get its funds back at 1 sat/vB, which is 29% of the tickets' value. With 3 tickets it was 1,530 sat. |
