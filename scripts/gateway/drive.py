@@ -1,0 +1,856 @@
+#!/usr/bin/env python3
+"""The seller gateway on a Lightning Fork regtest: the shipped binary, an unchanged file server
+behind it, and a test buyer that speaks the wire draft (docs/TICKETS.md) through a routing hop.
+
+Run by scripts/gateway_regtest.sh, which brings up the chain node and builds the binary.
+
+    lf1 ---- lf2 ---- lf3 ==== xbt-gateway ---- python3 -m http.server
+    buyer    hop     seller    (on the host)    (a 100 MB file, a small one)
+
+Channels lf1->lf2 and lf2->lf3 of 5,000,000 sat (1,000,000 pushed). The gateway holds two baked
+macaroons of lf3: invoices:read + invoices:write, and info:read. Tickets are 1,000 sat with a final
+CLTV delta of 40. The big file costs 200,000 msat per MiB (about 19 tickets); the small one 2,500
+msat per request. Every check prints PASS or FAIL and what it saw.
+
+  terms       the 402 names lf3, the ticket size, count and life, the price rule and the session path
+  macaroons   the two macaroons cannot send coins, pay, open a channel or bake; --check refuses a
+              wider one on mainnet and takes the two narrow ones
+  fetch       the big file priced per byte: tickets locked through the hop and released as the body
+              arrives; the buyer stops releasing half way: what came back is what was paid for, to
+              the byte, the rest of its tickets are cancelled and its node shows them failed
+  whole       a 10 MB file end to end: the bytes are the file's, the last receipt has their hash
+  latency     the same small request direct, through a free route, paid from the balance, and paid
+              with a secret (a settle on the node); medians and the difference
+  locked      a secret for an unpaid ticket, a replayed request, a replayed secret, another buyer's
+              secret: none is served, and the other buyer's ticket stays locked
+  margin      a ticket is used with 25 blocks left and refused with 24; nothing is settled inside 24
+  flood       2,000 lock requests: sessions and unpaid invoices stop at the caps; a buyer that locks
+              and never releases has its tickets cancelled, and its node shows them failed
+  upstream    the file server stopped: 502, nothing charged; back: served
+  restart     the gateway restarted, then the seller's node restarted, with tickets locked: the
+              tickets are still good, and a request while the node is away is 503 and not served
+
+Usage: drive.py [--no-setup] [check ...]   (all checks, in the order above, when none is named)
+Environment: LAB, RUN (see scripts/ln_ticket/lab.py), OUT (where gateway_regtest.json goes), GATEWAY_BIN,
+GATEWAY_PORT (17834), GATEWAY_UPSTREAM_PORT (17835).
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import http.client
+import json
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+from functools import partial
+from typing import Any, NamedTuple
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ln_ticket"))
+import lab
+from lab import LabError, Ticket
+
+BUYER, HOP, SELLER = "lf1", "lf2", "lf3"
+NODES = (BUYER, HOP, SELLER)
+RUN = os.environ["RUN"]
+BIN = os.environ["GATEWAY_BIN"]
+PORT = int(os.environ.get("GATEWAY_PORT", "17834"))
+UP_PORT = int(os.environ.get("GATEWAY_UPSTREAM_PORT", "17835"))
+ORIGIN = f"http://127.0.0.1:{PORT}"
+TICKET_MSAT = 1_000_000
+CLTV = 40
+MARGIN = 24
+BIG = 100_000_000
+MID = 10_000_000
+BYTE_MSAT, PER_BYTES = 200_000, 1_048_576
+REQUEST_MSAT = 2_500
+FIRST_USE_S = 15
+REPORT: dict[str, Any] = {"checks": [], "measured": {}}
+FAILED: list[str] = []
+PROCS: dict[str, subprocess.Popen[bytes]] = {}
+MAC: dict[str, str] = {}
+NETWORK = ""
+
+
+def check(name: str, ok: bool, saw: Any) -> None:
+    print(("PASS " if ok else "FAIL ") + name + ": " + json.dumps(saw, default=str)[:600], flush=True)
+    REPORT["checks"].append({"check": name, "ok": bool(ok), "saw": saw})
+    if not ok:
+        FAILED.append(name)
+
+
+def measured(key: str, value: Any) -> None:
+    REPORT["measured"][key] = value
+    print(f"  {key} = {json.dumps(value)}", flush=True)
+
+
+# --- the wire, as a buyer computes it -------------------------------------------------------------
+
+
+def tagged(tag: str) -> Any:
+    t = hashlib.sha256(tag.encode()).digest()
+    h = hashlib.sha256()
+    h.update(t + t)
+    return h
+
+
+def put(h: Any, x: bytes) -> None:
+    h.update(len(x).to_bytes(8, "little") + x)
+
+
+def request_digest(method: str, target: str, body: bytes) -> str:
+    h = tagged("xbt402/req/v2")
+    for f in (method.encode(), b"http", b"127.0.0.1", str(PORT).encode(), target.encode(), body):
+        put(h, f)
+    return h.hexdigest()
+
+
+RECEIPT_FIELDS = ("scheme", "session", "seq", "releasedMsat", "spentMsat", "charged", "req", "status", "bodyHash")
+P = 2**256 - 2**32 - 977
+N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+G = (0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798, 0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8)
+
+
+def _add(a: tuple[int, int] | None, b: tuple[int, int] | None) -> tuple[int, int] | None:
+    if a is None or b is None:
+        return a or b
+    if a[0] == b[0] and (a[1] + b[1]) % P == 0:
+        return None
+    m = (3 * a[0] * a[0] * pow(2 * a[1], -1, P) if a == b else (b[1] - a[1]) * pow(b[0] - a[0], -1, P)) % P
+    x = (m * m - a[0] - b[0]) % P
+    return x, (m * (a[0] - x) - a[1]) % P
+
+
+def _mul(k: int, pt: tuple[int, int] | None) -> tuple[int, int] | None:
+    out = None
+    while k:
+        if k & 1:
+            out = _add(out, pt)
+        pt = _add(pt, pt)
+        k >>= 1
+    return out
+
+
+def ecdsa_ok(pub_hex: str, msg32: bytes, der: bytes) -> bool:
+    """ECDSA over secp256k1, to check a receipt's signature against the receipt key of the terms."""
+    pub = bytes.fromhex(pub_hex)
+    x = int.from_bytes(pub[1:], "big")
+    y = pow(x**3 + 7, (P + 1) // 4, P)
+    if (y & 1) != (pub[0] & 1):
+        y = P - y
+    if der[0] != 0x30 or der[2] != 0x02:
+        return False
+    rl = der[3]
+    r = int.from_bytes(der[4 : 4 + rl], "big")
+    s = int.from_bytes(der[6 + rl : 6 + rl + der[5 + rl]], "big")
+    if not (0 < r < N and 0 < s < N):
+        return False
+    w = pow(s, -1, N)
+    pt = _add(_mul(int.from_bytes(msg32, "big") * w % N, G), _mul(r * w % N, (x, y)))
+    return pt is not None and pt[0] % N == r
+
+
+def receipt_ok(r: dict[str, Any], key: str) -> bool:
+    h = tagged("xbt402/ticket-receipt/v0")
+    for k in RECEIPT_FIELDS:
+        put(h, str(r[k]).encode())
+    return ecdsa_ok(key, h.digest(), bytes.fromhex(r["sig"]))
+
+
+class Answer:
+    def __init__(self, status: int, headers: dict[str, str], body: bytes) -> None:
+        self.status, self.headers, self.body = status, headers, body
+
+    def json(self) -> dict[str, Any]:
+        return json.loads(self.body)
+
+    def error(self) -> str:
+        try:
+            return str(self.json().get("error", ""))
+        except ValueError:
+            return ""
+
+    def receipt(self) -> dict[str, Any] | None:
+        raw = self.headers.get("payment-response")
+        return json.loads(base64.b64decode(raw))["extra"]["receipt"] if raw else None
+
+
+def send(method: str, target: str, headers: dict[str, str] | None = None, body: bytes = b"", port: int = PORT) -> Answer:
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+    try:
+        conn.request(method, target, body=body or None, headers=headers or {})
+        r = conn.getresponse()
+        try:
+            data = r.read()
+        except http.client.IncompleteRead as e:
+            data = e.partial
+        return Answer(r.status, {k.lower(): v for k, v in r.getheaders()}, data)
+    finally:
+        conn.close()
+
+
+class Buyer:
+    """A test buyer: secrets of its own, every invoice checked before it is paid, every receipt checked."""
+
+    def __init__(self) -> None:
+        self.session = ""
+        self.key = b""
+        self.seq = 0
+        self.terms: dict[str, Any] = {}
+        self.secrets: dict[str, bytes] = {}  # hash -> secret, unreleased
+        self.released = 0
+        self.tickets: dict[str, Ticket] = {}
+        self.bad_receipts = 0
+
+    def learn(self, target: str) -> dict[str, Any]:
+        a = send("GET", target)
+        pr = json.loads(base64.b64decode(a.headers["payment-required"]))
+        self.terms = pr["accepts"][0]
+        return {"status": a.status, "required": pr}
+
+    def header(self, method: str, target: str, body: bytes, secret: bytes | None = None, seq: int | None = None) -> str:
+        n = self.seq if seq is None else seq
+        s = secret.hex() if secret else ""
+        msg = "|".join(["ticket/auth", self.session, str(n), s, "", request_digest(method, target, body)])
+        payload: dict[str, Any] = {"session": self.session, "seq": n, "auth": hmac.new(self.key, msg.encode(), hashlib.sha256).hexdigest()}
+        if secret:
+            payload["secret"] = s
+        if seq is None:
+            self.seq += 1
+        accepted = {"scheme": "ticket", "network": NETWORK}
+        return base64.b64encode(json.dumps({"x402Version": 2, "accepted": accepted, "payload": payload}).encode()).decode()
+
+    def took(self, a: Answer, secret: bytes | None) -> Answer:
+        """Book an answer: a request that was not authenticated used up no seq; a receipt is checked."""
+        r = a.receipt()
+        if r is None:
+            # not authenticated: the seq is still to be used; a seller that says which one it expects is believed
+            self.seq = a.json()["nextSeq"] if a.error() == "bad_seq" else self.seq - 1
+            return a
+        said = int(r["releasedMsat"])
+        if secret is not None and said == (self.released + 1) * TICKET_MSAT:
+            self.released += 1
+            self.secrets.pop(hashlib.sha256(secret).hexdigest(), None)
+        # the released sum is the buyer's own count, never the seller's
+        if not receipt_ok(r, self.terms["extra"]["receiptKey"]) or said != self.released * TICKET_MSAT:
+            self.bad_receipts += 1
+        return a
+
+    def call(self, what: str, body: dict[str, Any], releasing: bytes | None = None) -> Answer:
+        raw = json.dumps(body).encode()
+        target = f"/x402/ticket/{what}"
+        return self.took(send("POST", target, {"PAYMENT-SIGNATURE": self.header("POST", target, raw), "Content-Type": "application/json"}, raw), releasing)
+
+    def status(self) -> dict[str, Any]:
+        return self.call("status", {}).json()
+
+    def balance(self) -> int:
+        return int(self.status()["session"]["balanceMsat"])
+
+    def get(self, target: str, secret: bytes | None = None) -> Answer:
+        return self.took(self.get_only(target, secret), secret)
+
+    def get_only(self, target: str, secret: bytes | None = None) -> Answer:
+        """The request alone, for timing: its answer still has to go through `took`."""
+        return send("GET", target, {"PAYMENT-SIGNATURE": self.header("GET", target, b"", secret)})
+
+    def release(self, secret: bytes) -> Answer:
+        return self.call("release", {"secrets": [secret.hex()]}, secret)
+
+    def ask(self, count: int) -> tuple[Answer, list[bytes]]:
+        """The lock request alone: hashes out, invoices back. Nothing is paid."""
+        secrets = [os.urandom(32) for _ in range(count)]
+        body: dict[str, Any] = {"version": "ticket/0", "hashes": [hashlib.sha256(s).hexdigest() for s in secrets]}
+        headers = {"Content-Type": "application/json"}
+        if self.session:
+            body["session"] = self.session
+            raw = json.dumps(body).encode()
+            headers["PAYMENT-SIGNATURE"] = self.header("POST", "/x402/ticket/lock", raw)
+            a = self.took(send("POST", "/x402/ticket/lock", headers, raw), None)
+        else:
+            raw = json.dumps(body).encode()
+            a = send("POST", "/x402/ticket/lock", headers, raw)
+            if a.status == 200 and a.json().get("session"):
+                self.session, self.key = a.json()["session"], bytes.fromhex(a.json()["key"])
+        return a, secrets
+
+    def lock(self, count: int) -> list[bytes]:
+        """Lock `count` tickets: every invoice is checked against the terms before the buyer's node pays it."""
+        a, secrets = self.ask(count)
+        if a.status != 200:
+            raise LabError(f"lock: HTTP {a.status} {a.body[:200]!r}")
+        by_hash = {hashlib.sha256(s).hexdigest(): s for s in secrets}
+        tickets = []
+        for t in a.json()["tickets"]:
+            d = lab.get(BUYER, "/v1/payreq/" + t["invoice"], MAC["buyer"])
+            x = self.terms["extra"]
+            good = (
+                t["hash"] in by_hash
+                and d["destination"] == self.terms["payTo"]
+                and d["payment_hash"] == t["hash"]
+                and int(d["num_msat"]) == int(x["ticketMsat"])
+                and int(d["cltv_expiry"]) == int(x["ticketBlocks"])
+                and d["features"].get("512", {}).get("is_required") is True
+            )
+            if not good:
+                raise LabError(f"an invoice that does not match the terms: {json.dumps(d)[:300]}")
+            tickets.append(Ticket(by_hash[t["hash"]], t["invoice"]))
+        first = lab.pay(BUYER, tickets, MAC["buyer"])
+        if any(u.get("status") != "IN_FLIGHT" for u in first):
+            raise LabError(f"a ticket payment did not start: {json.dumps(first)[:300]}")
+        for t in tickets:
+            self.secrets[t.hash.hex()] = t.secret
+            self.tickets[t.hash.hex()] = t
+        want = {t.hash.hex() for t in tickets}
+        lab.wait("the gateway to see the tickets ACCEPTED", 30, lambda: want <= {t["hash"] for t in self.status()["tickets"] if t["state"] == "ACCEPTED"}, every=0.02)
+        return [t.secret for t in tickets]
+
+    def payments(self) -> dict[str, int]:
+        return lab.tally(lab.payments(BUYER, list(self.tickets.values())))
+
+
+# --- the processes on the host --------------------------------------------------------------------
+
+
+def start_upstream() -> None:
+    with open(f"{RUN}/upstream.log", "ab") as log:
+        PROCS["upstream"] = subprocess.Popen([sys.executable, "-m", "http.server", str(UP_PORT), "--bind", "127.0.0.1", "--directory", f"{RUN}/www"], stdout=log, stderr=log)
+    lab.wait("the file server", 20, lambda: send("GET", "/small.txt", port=UP_PORT).status == 200, every=0.1)
+
+
+def upstream_requests(path: str) -> int:
+    """How often the file server was asked for `path`. Counted per path: on a shared host other
+    programs may ask a freshly opened port for `/`, and they are neither the buyer nor the gateway."""
+    want = (f'"GET {path} '.encode(), f'"HEAD {path} '.encode())
+    with open(f"{RUN}/upstream.log", "rb") as f:
+        return sum(1 for line in f if any(w in line for w in want))
+
+
+def start_gateway() -> float:
+    t0 = time.monotonic()
+    with open(f"{RUN}/gateway.log", "ab") as log:
+        PROCS["gateway"] = subprocess.Popen([BIN, f"{RUN}/gateway.json"], stdout=log, stderr=log)
+    lab.wait("the gateway", 60, lambda: health()["height"] is not None, every=0.05)
+    return time.monotonic() - t0
+
+
+def stop(name: str) -> None:
+    p = PROCS.pop(name, None)
+    if p is not None:
+        p.send_signal(signal.SIGTERM)
+        p.wait(20)
+
+
+def health() -> dict[str, Any]:
+    return send("GET", "/x402/ticket/health").json()
+
+
+def gateway_at(height: int) -> None:
+    lab.wait(f"the gateway at height {height}", 30, lambda: health()["height"] == height, every=0.05)
+
+
+def seller_state(secret: bytes) -> str:
+    return lab.state(SELLER, Ticket(secret, ""))
+
+
+def write_config(path: str, chain: str, macaroon: str, info_macaroon: str) -> None:
+    cfg: dict[str, Any] = {
+        "listen": f"127.0.0.1:{PORT}",
+        "public_url": ORIGIN,
+        "upstream": f"http://127.0.0.1:{UP_PORT}",
+        "state_dir": f"{RUN}/state",
+        "node": {"rest": f"https://127.0.0.1:{lab.PORT[SELLER]}", "tls_cert": f"{RUN}/{SELLER}.tls.cert", "macaroon": macaroon, "info_macaroon": info_macaroon},
+        # shorter than the defaults (30 sessions, 60 s to first use), so that the caps are reached and
+        # an unused session is closed within the run; every buyer here comes from one address
+        "caps": {"max_sessions": 6, "sessions_per_address": 0, "first_use_secs": FIRST_USE_S},
+        "times": {"height_max_age_secs": 5},
+        "routes": [
+            {"path": "/big.bin", "price": {"byte_msat": BYTE_MSAT, "per_bytes": PER_BYTES}},
+            {"path": "/mid.bin", "price": {"byte_msat": BYTE_MSAT, "per_bytes": PER_BYTES}},
+            {"path": "/small.txt", "price": {"request_msat": REQUEST_MSAT}},
+            {"path": "/free/", "free": True},
+        ],
+    }
+    if chain != "main":
+        cfg["chain"], cfg["network"] = chain, NETWORK
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=1)
+
+
+# --- setup ------------------------------------------------------------------------------------------
+
+
+def active(node: str, count: int) -> bool:
+    return sum(1 for c in lab.channels(node) if c["active"]) == count
+
+
+def connect() -> None:
+    def ready(node: str) -> bool:
+        lab.load_credentials(node)
+        return lab.synced(node)
+
+    for node in NODES:
+        lab.wait(f"{node} answering with its macaroon and certificate, and synced", 120, partial(ready, node))
+
+
+def setup() -> None:
+    lab.wait("the chain node", 120, lambda: lab.chain("getblockchaininfo"))
+    lab.chain("createwallet", "lab")
+    lab.wallet("generatetoaddress", "130", lab.wallet("getnewaddress"))
+    lab.dc("up", "-d", *NODES)
+    connect()
+    for node, btc in ((BUYER, "1"), (HOP, "2"), (SELLER, "0.1")):
+        lab.fund(node, btc)
+    lab.mine(6, NODES)
+    for node in NODES:
+        lab.wait(f"{node}'s coins", 60, partial(lab.wallet_sat, node))
+    lab.open_channel(BUYER, HOP, 5_000_000, 1_000_000)
+    lab.open_channel(HOP, SELLER, 5_000_000, 1_000_000)
+    lab.mine(8, NODES)
+    for node, count in ((BUYER, 1), (HOP, 2), (SELLER, 1)):
+        lab.wait(f"{node}'s channels active", 120, partial(active, node, count))
+
+    def probe() -> bool:
+        tickets, _ = lab.lock(BUYER, SELLER, 1, secs=10)
+        lab.cancel_all(SELLER, tickets)
+        return True
+
+    lab.wait("a route from the buyer to the seller", 240, probe, every=2)
+
+
+def prepare() -> None:
+    """Macaroons, files, the config; then the file server and the gateway."""
+    global NETWORK
+    NETWORK = "lightning:" + lab.chain("getblockhash", "101")[:32]
+    MAC["buyer"] = lab.bake(BUYER, lab.BUYER_PERMISSIONS)
+    MAC["invoices"] = lab.bake(SELLER, lab.SELLER_PERMISSIONS)
+    MAC["info"] = lab.bake(SELLER, ("info:read",))
+    MAC["wide"] = lab.bake(SELLER, (*lab.SELLER_PERMISSIONS, "onchain:write"))
+    for name in ("invoices", "info", "wide"):
+        with open(f"{RUN}/{name}.macaroon", "wb") as f:
+            f.write(bytes.fromhex(MAC[name]))
+    os.makedirs(f"{RUN}/www/free", exist_ok=True)
+    block = os.urandom(1 << 20)
+    for name, size in (("big.bin", BIG), ("mid.bin", MID)):
+        with open(f"{RUN}/www/{name}", "wb") as f:
+            # every MiB differs, so a body that repeats or skips one has another hash
+            f.writelines((hashlib.sha256(block[:64] + i.to_bytes(8, "big")).digest() + block)[: min(len(block), size - i)] for i in range(0, size, len(block)))
+    for name in ("small.txt", "free/small.txt"):
+        with open(f"{RUN}/www/{name}", "w") as f:
+            f.write("a small file\n" * 20)
+    write_config(f"{RUN}/gateway.json", "regtest", f"{RUN}/invoices.macaroon", f"{RUN}/info.macaroon")
+    start_upstream()
+    measured("gateway_start_s", round(start_gateway(), 2))
+
+
+# --- the checks -------------------------------------------------------------------------------------
+
+
+def terms() -> None:
+    b = Buyer()
+    saw = b.learn("/big.bin")
+    a, x = b.terms, b.terms["extra"]
+    ok = (
+        saw["status"] == 402
+        and a["scheme"] == "ticket"
+        and a["network"] == NETWORK
+        and a["payTo"] == lab.pubkey(SELLER)
+        and (x["ticketMsat"], x["maxTickets"], x["ticketBlocks"], x["release"], x["settle"], x["session"]) == ("1000000", 8, 40, "with-request", "on-use", "/x402/ticket")
+        and x["price"] == {"requestMsat": "0", "byteMsat": str(BYTE_MSAT), "perBytes": str(PER_BYTES), "secondMsat": "0"}
+        and len(x["receiptKey"]) == 66
+    )
+    check("terms: the 402 names the seller's node, the ticket terms and the price rule", ok, a)
+    services = send("GET", "/services").json()
+    check("terms: /services lists the routes, unsigned", services["signed"] is False and len(services["routes"]) == 4 and services["payTo"] == a["payTo"], services)
+    nothing = send("GET", "/elsewhere")
+    check("terms: a path with no route is 404 from the gateway", nothing.status == 404 and nothing.error() == "no_route", nothing.status)
+
+
+class Checked(NamedTuple):
+    """How `xbt-gateway --check` ended: its exit code and the last line it wrote."""
+
+    code: int
+    said: str
+
+
+def macaroons() -> None:
+    cannot = {}
+    address = lab.wallet("getnewaddress")
+    invoice = lab.issue(HOP, [os.urandom(32)])[0]
+    for name in ("invoices", "info"):
+        m = MAC[name]
+        tries = {
+            "send coins": lab.ask(SELLER, "POST", "/v1/transactions", {"addr": address, "amount": "1000"}, m),
+            "pay": lab.stream(SELLER, "POST", "/v2/router/send", {"payment_request": invoice.invoice, "timeout_seconds": 5}, lambda u: True, m),
+            "open a channel": lab.ask(SELLER, "POST", "/v1/channels", {"node_pubkey_string": lab.pubkey(HOP), "local_funding_amount": "20000"}, m),
+            "bake a macaroon": lab.ask(SELLER, "POST", "/v1/macaroon", {"permissions": [{"entity": "onchain", "action": "write"}]}, m),
+            "read the wallet": lab.ask(SELLER, "GET", "/v1/balance/blockchain", None, m),
+        }
+        cannot[name] = {k: lab.refused(v) for k, v in tries.items()}
+    cross = {"invoices cannot read the height": lab.refused(lab.ask(SELLER, "GET", "/v1/getinfo", None, MAC["invoices"])), "info cannot make an invoice": lab.refused(lab.ask(SELLER, "POST", "/v2/invoices/hodl", {"hash": lab.b64(os.urandom(32)), "value_msat": "1000"}, MAC["info"]))}
+    lab.cancel(HOP, invoice)
+    check("macaroons: neither of the gateway's two can send coins, pay, open a channel, bake or read the wallet", all(all(v.values()) for v in cannot.values()) and all(cross.values()), {**cannot, **cross})
+
+    def run_check(config: str) -> Checked:
+        r = subprocess.run([BIN, "--check", config], capture_output=True, text=True, check=False)
+        return Checked(r.returncode, r.stderr.strip().splitlines()[-1][:300] if r.stderr.strip() else "")
+
+    write_config(f"{RUN}/main-wide.json", "main", f"{RUN}/wide.macaroon", f"{RUN}/info.macaroon")
+    write_config(f"{RUN}/main-wide-info.json", "main", f"{RUN}/invoices.macaroon", f"{RUN}/wide.macaroon")
+    write_config(f"{RUN}/main-narrow.json", "main", f"{RUN}/invoices.macaroon", f"{RUN}/info.macaroon")
+    write_config(f"{RUN}/regtest-wide.json", "regtest", f"{RUN}/wide.macaroon", f"{RUN}/info.macaroon")
+    wide, wide_info, narrow, off_main = (run_check(f"{RUN}/{n}.json") for n in ("main-wide", "main-wide-info", "main-narrow", "regtest-wide"))
+    ok = wide.code != 0 and "refused on mainnet" in wide.said and "onchain:write" in wide.said and wide_info.code != 0 and narrow.code == 0 and off_main.code == 0
+    check("macaroons: a wider macaroon is refused on mainnet, in either place; the two narrow ones are taken", ok, {"wide": wide, "wide as the height macaroon": wide_info, "narrow": narrow, "wide off mainnet": off_main})
+
+
+def fetch() -> None:
+    b = Buyer()
+    b.learn("/big.bin")
+    with open(f"{RUN}/www/big.bin", "rb") as f:
+        whole = f.read()
+    requests_before = upstream_requests("/big.bin")
+    pool = b.lock(8)
+    stop_at = 10  # tickets: about half of the 19.07 the whole file costs
+    target = "/big.bin"
+    conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=60)
+    t0 = time.monotonic()
+    first = pool.pop(0)
+    conn.request("GET", target, headers={"PAYMENT-SIGNATURE": b.header("GET", target, b"", first)})
+    r = conn.getresponse()
+    head = json.loads(base64.b64decode(r.getheader("PAYMENT-RESPONSE")))
+    b.took(Answer(r.status, {"payment-response": r.getheader("PAYMENT-RESPONSE")}, b""), first)
+    got = bytearray()
+    done = threading.Event()
+
+    def read() -> None:
+        try:
+            while chunk := r.read(1 << 16):
+                got.extend(chunk)
+        except (http.client.IncompleteRead, OSError) as e:
+            got.extend(getattr(e, "partial", b""))
+        done.set()
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    locks = 1
+    # release one ticket when the last is used up (the body waits for it), lock more when none is left; stop at ten
+    while not done.is_set() and b.released < stop_at:
+        if b.balance() == 0:
+            if not pool:
+                pool = b.lock(4)
+                locks += 1
+            b.release(pool.pop(0))
+        else:
+            time.sleep(0.002)
+    stopped = time.monotonic()
+    done.wait(30)
+    ended_after = time.monotonic() - stopped
+    conn.close()
+    lab.wait("the last receipt", 10, lambda: b.status()["responses"], every=0.05)
+    st = b.status()
+    last = st["responses"][-1]
+    paid = b.released * TICKET_MSAT
+    want_bytes = paid * PER_BYTES // BYTE_MSAT
+    measured("fetch", {"tickets_released": b.released, "locks": locks, "bytes": len(got), "seconds": round(stopped - t0, 2), "ended_after_last_release_s": round(ended_after, 2), "spent_msat": int(st["session"]["spentMsat"])})
+    check("fetch: the head's receipt is signed and says the body is a stream", head["extra"].get("stream") is True and receipt_ok(head["extra"]["receipt"], b.terms["extra"]["receiptKey"]), head["extra"]["receipt"])
+    check("fetch: what came back is what ten tickets pay for, to the byte, and is the file's", len(got) == want_bytes and bytes(got) == whole[:want_bytes], {"bytes": len(got), "paid_for": want_bytes})
+    ok = receipt_ok(last, b.terms["extra"]["receiptKey"]) and int(last["charged"]) == paid and last["bytes"] == want_bytes and last["complete"] is False and last["bodyHash"] == hashlib.sha256(bytes(got)).hexdigest()
+    check("fetch: the last receipt is signed, and has the bytes sent, their hash and their price", ok, last)
+    check("fetch: nothing was served beyond what was released (spent equals released, balance 0)", (int(st["session"]["releasedMsat"]), int(st["session"]["spentMsat"]), int(st["session"]["balanceMsat"])) == (paid, paid, 0), st["session"])
+    check("fetch: the body stopped within the refill wait of the buyer's last release", ended_after < 5, round(ended_after, 2))
+    left = len(b.secrets)
+    cancelled = b.call("cancel", {"hashes": "all"}).json()["cancelled"]
+    finals = lab.tally(lab.POOL.map(lambda t: lab.payment(BUYER, t, final=True), list(b.tickets.values())))
+    fees = sum(p.fee_msat for p in lab.payments(BUYER, list(b.tickets.values())) if p.status == "SUCCEEDED")
+    ok = len(cancelled) == left and finals == {"FAILED:INCORRECT_PAYMENT_DETAILS": left, "SUCCEEDED": b.released}
+    check("fetch: the tickets it did not release were cancelled and its node shows them failed; the released ones succeeded", ok, {"unreleased": left, "cancelled": len(cancelled), "buyer_node": finals})
+    measured("fetch_routing_fee_msat", fees)
+    check("fetch: every receipt the buyer got was signed and agreed with its own count of what it released", b.bad_receipts == 0, b.bad_receipts)
+    check("fetch: the file server was asked once", upstream_requests("/big.bin") == requests_before + 1, upstream_requests("/big.bin") - requests_before)
+
+
+def whole() -> None:
+    b = Buyer()
+    b.learn("/mid.bin")
+    with open(f"{RUN}/www/mid.bin", "rb") as f:
+        data = f.read()
+    pool = b.lock(4)
+    target = "/mid.bin"
+    conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=60)
+    first = pool.pop(0)
+    conn.request("GET", target, headers={"PAYMENT-SIGNATURE": b.header("GET", target, b"", first)})
+    r = conn.getresponse()
+    b.took(Answer(r.status, {"payment-response": r.getheader("PAYMENT-RESPONSE")}, b""), first)
+    got = bytearray()
+    done = threading.Event()
+
+    def read() -> None:
+        try:
+            while chunk := r.read(1 << 16):
+                got.extend(chunk)
+        except (http.client.IncompleteRead, OSError) as e:
+            got.extend(getattr(e, "partial", b""))
+        done.set()
+
+    threading.Thread(target=read, daemon=True).start()
+    while not done.is_set():
+        if pool and b.balance() == 0:
+            b.release(pool.pop(0))
+        else:
+            time.sleep(0.002)
+    conn.close()
+    lab.wait("the last receipt", 10, lambda: b.status()["responses"], every=0.05)
+    st = b.status()
+    last = st["responses"][-1]
+    price = -(-MID * BYTE_MSAT // PER_BYTES)
+    ok = bytes(got) == data and last["complete"] is True and int(last["charged"]) == price and last["bodyHash"] == hashlib.sha256(data).hexdigest() and receipt_ok(last, b.terms["extra"]["receiptKey"])
+    check("whole: 10 MB end to end: the file's bytes, and a signed last receipt with their hash and price", ok, {"bytes": len(got), "price_msat": price, "receipt": last})
+    check("whole: the buyer released two tickets for 1,907,349 msat and keeps the rest as balance; every receipt agreed with its own count", (b.released, int(st["session"]["balanceMsat"]), b.bad_receipts) == (2, 2 * TICKET_MSAT - price, 0), {"released": b.released, "session": st["session"], "bad_receipts": b.bad_receipts})
+    b.call("cancel", {"hashes": "all"})
+
+
+def timed(fn: Any, n: int) -> list[float]:
+    out = []
+    for _ in range(n):
+        t0 = time.perf_counter()
+        fn()
+        out.append(time.perf_counter() - t0)
+    return out
+
+
+def latency() -> None:
+    b = Buyer()
+    b.learn("/small.txt")
+    secrets = b.lock(8)
+    if b.get("/small.txt", secrets[0]).status != 200:
+        raise LabError("the first paid request was not served")
+    n = 300
+
+    def expect(a: Answer) -> None:
+        if a.status != 200:
+            raise LabError(f"HTTP {a.status} in the latency run")
+
+    # Interleaved, so that the host's other load falls on all alike. Only the request is timed:
+    # the buyer's own work on the answer (checking the receipt's signature) is done after the clock stops.
+    direct: list[float] = []
+    free: list[float] = []
+    paid: list[float] = []
+    for _ in range(n):
+        direct += timed(lambda: expect(send("GET", "/small.txt", port=UP_PORT)), 1)
+        free += timed(lambda: expect(send("GET", "/free/small.txt")), 1)
+        t0 = time.perf_counter()
+        a = b.get_only("/small.txt")
+        paid.append(time.perf_counter() - t0)
+        expect(b.took(a, None))
+    settle: list[float] = []
+    more = secrets[1:] + b.lock(1)
+    for round_ in range(4):
+        for s in more:
+            t0 = time.perf_counter()
+            a = b.get_only("/small.txt", s)
+            settle.append(time.perf_counter() - t0)
+            expect(b.took(a, s))
+        b.call("cancel", {"hashes": "all"})
+        more = b.lock(8) if round_ < 3 else []
+    spreads = {"direct": lab.spread(direct), "through_a_free_route": lab.spread(free), "paid_from_the_balance": lab.spread(paid), "paid_with_a_secret": lab.spread(settle)}
+    measured("latency_ms", spreads)
+    per_ticket = TICKET_MSAT // REQUEST_MSAT
+    added = round(spreads["paid_from_the_balance"]["p50_ms"] - spreads["through_a_free_route"]["p50_ms"], 2)
+    added_settle = round(spreads["paid_with_a_secret"]["p50_ms"] - spreads["through_a_free_route"]["p50_ms"], 2)
+    measured("paid_minus_unpaid_p50_ms", added)
+    measured("paid_with_a_secret_minus_unpaid_p50_ms", added_settle)
+    check(f"latency: a paid request adds at most 5 ms at the median over the same request unpaid ({per_ticket - 1} of {per_ticket} requests at this price carry no secret)", added <= 5, {"added_ms": added})
+    # measured, not a pass line of its own: the settle call is the node's, and one request in a ticket's worth makes it
+    measured("note_secret", f"one request in {per_ticket} carries a secret and waits for the node's settle call: {added_settle} ms more than unpaid at the median")
+    check("latency: no secret was refused and no receipt disagreed", b.bad_receipts == 0 and b.released == 1 + len(settle), {"released": b.released, "with_a_secret": len(settle), "bad_receipts": b.bad_receipts})
+    h = health()
+    measured("settle_max_ms", round(h["settleMaxUs"] / 1000, 2))
+    check("latency: every used ticket was settled within 1 s of its secret arriving (the gateway's own worst case so far)", h["settleMaxUs"] < 1_000_000, {"settled": h["settled"], "worst_ms": round(h["settleMaxUs"] / 1000, 2)})
+    b.call("cancel", {"hashes": "all"})
+
+
+def locked() -> None:
+    a, b = Buyer(), Buyer()
+    a.learn("/small.txt")
+    b.learn("/small.txt")
+    served = upstream_requests("/small.txt")
+    # issued, never paid
+    _, unpaid = a.ask(2)
+    got = a.get("/small.txt", unpaid[0])
+    check("locked: a secret for a ticket that was never paid buys nothing", (got.status, got.error()) == (402, "ticket_not_locked") and seller_state(unpaid[0]) == "OPEN", {"http": got.status, "error": got.error(), "node": seller_state(unpaid[0])})
+    sa, sb = a.lock(2), b.lock(2)
+    ok1 = a.get("/small.txt", sa[0]).status == 200
+    # the same request again, byte for byte
+    header = a.header("GET", "/small.txt", b"")
+    first = send("GET", "/small.txt", {"PAYMENT-SIGNATURE": header})
+    again = send("GET", "/small.txt", {"PAYMENT-SIGNATURE": header})
+    check("locked: a replayed request is refused", ok1 and first.status == 200 and (again.status, again.error()) == (402, "bad_seq"), {"first": first.status, "again": again.error()})
+    used = a.get("/small.txt", sa[0])
+    check("locked: a replayed secret is refused", (used.status, used.error()) == (402, "ticket_used"), used.error())
+    other = a.get("/small.txt", sb[0])
+    check("locked: another buyer's secret is refused, and that buyer's ticket is still locked", (other.status, other.error()) == (402, "ticket_unknown") and seller_state(sb[0]) == "ACCEPTED", {"error": other.error(), "node": seller_state(sb[0])})
+    moved = send("GET", "/small.txt?x=1", {"PAYMENT-SIGNATURE": a.header("GET", "/small.txt", b"", seq=a.seq)})
+    check("locked: a payment made for one target does not pay another", (moved.status, moved.error()) == (401, "bad_auth"), moved.error())
+    check("locked: the file server saw the two paid requests and nothing else", upstream_requests("/small.txt") == served + 2, upstream_requests("/small.txt") - served)
+    check("locked: the buyer was charged for what it was served and no more", a.balance() == TICKET_MSAT - 2 * REQUEST_MSAT, a.balance())
+    for x in (a, b):
+        x.call("cancel", {"hashes": "all"})
+
+
+def margin() -> None:
+    b = Buyer()
+    b.learn("/small.txt")
+    secrets = b.lock(3)
+    inv = lab.invoice(SELLER, Ticket(secrets[0], ""))
+    expiry = int(inv["htlcs"][0]["expiry_height"])
+    h = lab.height()
+    measured("margin", {"locked_at": h, "htlc_expiry": expiry})
+    lab.mine(expiry - (MARGIN + 1) - h, NODES)
+    gateway_at(expiry - MARGIN - 1)
+    early = b.get("/small.txt", secrets[0])
+    check("margin: a ticket with 25 blocks left is settled and served", early.status == 200 and seller_state(secrets[0]) == "SETTLED", {"http": early.status, "blocks_left": expiry - lab.height()})
+    lab.mine(1, NODES)
+    gateway_at(expiry - MARGIN)
+    late = b.get("/small.txt", secrets[1])
+    time.sleep(1.5)
+    states = [seller_state(s) for s in secrets[1:]]
+    ok = late.status == 402 and late.error() in ("ticket_expiring", "ticket_unknown") and states == ["CANCELED", "CANCELED"]
+    check("margin: with 24 blocks left a secret is refused, nothing is settled, and the gateway gives the tickets back", ok, {"http": late.status, "error": late.error(), "blocks_left": expiry - lab.height(), "node": states})
+    final = lab.tally(lab.POOL.map(lambda t: lab.payment(BUYER, t, final=True), list(b.tickets.values())))
+    check("margin: the buyer's node shows one ticket paid and two failed, 6 blocks before the node's own cancel", final == {"FAILED:INCORRECT_PAYMENT_DETAILS": 2, "SUCCEEDED": 1}, final)
+
+
+def flood() -> None:
+    before = health()
+    pending_before = len(lab.get(SELLER, "/v1/invoices?pending_only=true&num_max_invoices=5000")["invoices"])
+    tallies: dict[str, int] = {}
+    t0 = time.monotonic()
+    for _ in range(2000):
+        a, _ = Buyer().ask(8)
+        key = f"{a.status} {a.error()}".strip()
+        tallies[key] = tallies.get(key, 0) + 1
+    took = time.monotonic() - t0
+    h = health()
+    pending = len(lab.get(SELLER, "/v1/invoices?pending_only=true&num_max_invoices=5000")["invoices"]) - pending_before
+    measured("flood", {"requests": 2000, "seconds": round(took, 1), "answers": tallies, "active_sessions": h["activeSessions"], "held_tickets": h["heldTickets"], "held_msat": h["heldMsat"], "unpaid_invoices_on_the_node": pending})
+    free = 6 - before["activeSessions"]
+    ok = tallies.get("200", 0) == free and tallies.get("402 too_many_sessions", 0) == 2000 - free and h["activeSessions"] == 6 and pending == free * 8
+    check("flood: of 2,000 lock requests six sessions' worth were issued, and the node was asked for nothing more", ok, {"answers": tallies, "active_sessions": h["activeSessions"], "unpaid_invoices": pending})
+    lab.wait("the unused sessions to be closed and forgotten", FIRST_USE_S + 20, lambda: health()["activeSessions"] == 0 and health()["sessions"] <= before["sessions"], every=0.5)
+    gone = len(lab.get(SELLER, "/v1/invoices?pending_only=true&num_max_invoices=5000")["invoices"]) - pending_before
+    after = health()
+    # (sessions of earlier checks that had used up their balance are forgotten in the same sweep)
+    ok = gone <= 0 and after["heldTickets"] == 0 and after["sessions"] <= before["sessions"]
+    check(f"flood: sessions that never paid were closed after {FIRST_USE_S} s, their invoices cancelled on the node, and nothing of them is kept", ok, {"unpaid_invoices_left": gone, "sessions_before": before["sessions"], "sessions_after": after["sessions"]})
+    # a buyer that pays for its tickets and never releases one
+    b = Buyer()
+    b.learn("/small.txt")
+    t0 = time.monotonic()
+    idle = lab.pending_htlcs(SELLER)
+    b.lock(8)
+    held = lab.pending_htlcs(SELLER) - idle
+    lab.wait("the silent buyer's tickets to be cancelled", FIRST_USE_S + 20, lambda: lab.pending_htlcs(SELLER) == idle, every=0.2)
+    secs = time.monotonic() - t0
+    final = lab.tally(lab.POOL.map(lambda t: lab.payment(BUYER, t, final=True), list(b.tickets.values())))
+    measured("silent_buyer_locked_s", round(secs, 1))
+    check("flood: a buyer that locks 8 tickets and releases none held 8,000 sat of the seller's inbound capacity until the gateway cancelled them; its node shows them failed", held == 8 and final == {"FAILED:INCORRECT_PAYMENT_DETAILS": 8}, {"held_htlcs": held, "seconds": round(secs, 1), "buyer_node": final})
+    served = upstream_requests("/small.txt")
+    got = b.get("/small.txt")
+    check("flood: and it was served nothing", got.status == 402 and upstream_requests("/small.txt") == served, {"http": got.status, "error": got.error()})
+
+
+def upstream() -> None:
+    b = Buyer()
+    b.learn("/small.txt")
+    s = b.lock(2)
+    ok = b.get("/small.txt", s[0]).status == 200
+    spent = int(b.status()["session"]["spentMsat"])
+    stop("upstream")
+    down = b.get("/small.txt")
+    r = down.receipt()
+    after = int(b.status()["session"]["spentMsat"])
+    check("upstream: with the file server stopped a paid request is 502 and nothing is charged", ok and (down.status, down.error()) == (502, "upstream_unavailable") and r is not None and r["charged"] == "0" and after == spent, {"http": down.status, "charged": r and r["charged"], "spent_before": spent, "spent_after": after})
+    start_upstream()
+    back = b.get("/small.txt")
+    check("upstream: with the file server back the same session is served", back.status == 200, back.status)
+    b.call("cancel", {"hashes": "all"})
+
+
+def restart() -> None:
+    b = Buyer()
+    b.learn("/small.txt")
+    s = b.lock(4)
+    if b.get("/small.txt", s[0]).status != 200:
+        raise LabError("the first paid request was not served")
+    before = b.status()["session"]
+    stop("gateway")
+    secs = start_gateway()
+    after = b.status()
+    kept = (after["session"]["releasedMsat"], after["session"]["spentMsat"]) == (before["releasedMsat"], before["spentMsat"]) and len(after["tickets"]) == 3
+    lab.wait("the tickets ACCEPTED again", 30, lambda: all(t["state"] == "ACCEPTED" for t in b.status()["tickets"]), every=0.05)
+    got = b.get("/small.txt", s[1])
+    check("restart: after the gateway restarts, the session, its balance and its locked tickets are there and a ticket is used", kept and got.status == 200 and seller_state(s[1]) == "SETTLED", {"restart_s": round(secs, 2), "before": before, "after": after["session"], "http": got.status})
+    old = b.get("/small.txt", s[0])
+    check("restart: a secret used before the restart is not good again", old.status == 402 and old.error() in ("ticket_used", "ticket_unknown"), old.error())
+
+    lab.stop(SELLER)
+    served = upstream_requests("/small.txt")
+    away = b.get("/small.txt", s[2])
+    paid = b.get("/small.txt")
+    check("restart: with the seller's node stopped a secret is not taken (503) and the balance still pays", (away.status, away.error()) == (503, "node_unavailable") and paid.status == 200 and upstream_requests("/small.txt") == served + 1, {"secret": away.status, "balance": paid.status})
+    secs = lab.start(SELLER)
+    lab.wait("the gateway to have the node's height again", 60, lambda: health()["height"] is not None, every=0.1)
+    lab.wait("the hop to reach the seller again", 60, lambda: active(SELLER, 1), every=0.2)
+    again = b.get("/small.txt", s[2])
+    last = b.get("/small.txt", s[3])
+    states = [seller_state(x) for x in s[2:]]
+    check("restart: after the seller's node restarts, tickets locked before it are settled and served", (again.status, last.status) == (200, 200) and states == ["SETTLED", "SETTLED"], {"node_restart_s": round(secs, 1), "http": [again.status, last.status], "node": states})
+    final = lab.tally(lab.POOL.map(lambda t: lab.payment(BUYER, t, final=True), list(b.tickets.values())))
+    check("restart: the buyer's node shows all four tickets paid", final == {"SUCCEEDED": 4}, final)
+    check("restart: every receipt was signed by the same key, before and after", b.bad_receipts == 0, b.bad_receipts)
+
+
+CHECKS = {"terms": terms, "macaroons": macaroons, "fetch": fetch, "whole": whole, "latency": latency, "locked": locked, "margin": margin, "flood": flood, "upstream": upstream, "restart": restart}
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    no_setup = "--no-setup" in args
+    names = [a for a in args if a != "--no-setup"] or list(CHECKS)
+    unknown = [n for n in names if n not in CHECKS]
+    if unknown:
+        print(f"unknown checks: {', '.join(unknown)} (known: {', '.join(CHECKS)})", file=sys.stderr)
+        return 2
+    try:
+        if no_setup:
+            connect()
+        else:
+            setup()
+        prepare()
+        for n in names:
+            print(f"--- {n}", flush=True)
+            CHECKS[n]()
+    except (LabError, OSError, http.client.HTTPException, KeyError, ValueError, subprocess.SubprocessError) as e:
+        check("the run finished", False, f"{type(e).__name__}: {e}")
+    finally:
+        for name in list(PROCS):
+            try:
+                stop(name)
+            except (OSError, subprocess.SubprocessError) as e:
+                print(f"note: {name} did not stop cleanly: {e}", file=sys.stderr)
+    REPORT["failed"] = FAILED
+    with open(os.path.join(os.environ.get("OUT", RUN), "gateway_regtest.json"), "w") as f:
+        json.dump(REPORT, f, indent=1, default=str)
+    passed = sum(1 for c in REPORT["checks"] if c["ok"])
+    print(f"gateway: {passed} passed, {len(FAILED)} failed" + ("" if not FAILED else ": " + "; ".join(FAILED)), flush=True)
+    return 1 if FAILED else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

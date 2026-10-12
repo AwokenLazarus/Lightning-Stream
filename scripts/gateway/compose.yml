@@ -1,0 +1,50 @@
+# The seller gateway's overlay on lightning-fork-lab (a5cadc5): three Lightning Fork nodes on one
+# Knots BLAKE2b regtest, each with its REST interface published on loopback and a CPU cap. Its own
+# compose project and its own ports, so it runs beside the other regtest scripts. Ports are below
+# the kernel's ephemeral range (32768-60999).
+#   lf1 REST  127.0.0.1:${GATEWAY_PORT_LF1:-17831}   the buyer
+#   lf2 REST  127.0.0.1:${GATEWAY_PORT_LF2:-17832}   the routing hop
+#   lf3 REST  127.0.0.1:${GATEWAY_PORT_LF3:-17833}   the seller: the gateway runs beside it, on the host
+# lf1 and lf2 keep the lab's own command lines (default node settings). lf3 is the same image with
+# the same settings; the lab defines only two nodes on this chain.
+services:
+  knots-b2b:
+    cpus: 2
+  lf1:
+    cpus: 2
+    ports: ["127.0.0.1:${GATEWAY_PORT_LF1:-17831}:8080"]
+  lf2:
+    cpus: 2
+    ports: ["127.0.0.1:${GATEWAY_PORT_LF2:-17832}:8080"]
+  lf3:
+    image: lightning-fork:dev
+    restart: "no"
+    networks: [lab]
+    depends_on:
+      knots-b2b:
+        condition: service_healthy
+    cpus: 2
+    ports: ["127.0.0.1:${GATEWAY_PORT_LF3:-17833}:8080"]
+    command:
+      - --noseedbackup
+      - --bitcoin.regtest
+      - --bitcoin.node=bitcoind
+      - --bitcoin.blake2b-activation-height=${ACTIVATION_HEIGHT:-20}
+      - --fee.url=http://fees:8080/fees.json
+      - --bitcoind.rpchost=knots-b2b:18443
+      - --bitcoind.rpcuser=lab
+      - --bitcoind.rpcpass=lab
+      - --bitcoind.zmqpubrawblock=tcp://knots-b2b:28332
+      - --bitcoind.zmqpubrawtx=tcp://knots-b2b:28333
+      - --rpclisten=0.0.0.0:10009
+      - --restlisten=0.0.0.0:8080
+      - --listen=0.0.0.0:9735
+      - --externalip=lf3:9735
+      - --tlsextradomain=lf3
+      - --alias=lf3
+      - --debuglevel=info
+    volumes:
+      - lf3-data:/root/.lnd
+
+volumes:
+  lf3-data:

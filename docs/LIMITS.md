@@ -10,7 +10,8 @@ reasoning behind each rule is in the engineering notes (`docs/ENGINEERING.md` in
 tree).
 
 Direction, decided on 2026-10-11: Lightning Stream is being rebuilt on Lightning. It adds stream
-tickets to ordinary XBT Lightning channels (in design, not built). The hub was retired on that
+tickets to ordinary XBT Lightning channels (the seller's gateway is built and has run on regtest;
+the wallet's side is not built). The hub was retired on that
 day and its code removed. The on-chain one-way channel is **frozen**: kept in the tree and
 tested, off the main path, with no new work. Sections about it are marked "frozen" below.
 
@@ -50,11 +51,11 @@ does what the hub did. The code and those limits are in the git history, last at
 
 ### Stream tickets (in design)
 
-Nothing in this section is shipped code. A ticket is a small Lightning payment locked along a
-route to a hash whose secret only the buyer knows (a hold invoice on the seller's node); the
-buyer releases it by putting the secret in a paid request. Each sentence below comes from the
-design's lab measurements: three Lightning Fork nodes on regtest, buyer and seller one routing
-node apart, default node settings. None comes from a wallet or a seller built on tickets.
+A ticket is a small Lightning payment locked along a route to a hash whose secret only the buyer
+knows (a hold invoice on the seller's node); the buyer releases it by putting the secret in a
+paid request. Each sentence below comes from the design's lab measurements: three Lightning Fork
+nodes on regtest, buyer and seller one routing node apart, default node settings. No wallet
+built on tickets exists yet; the seller's side is the gateway of the next section.
 
 - Money moves a ticket at a time (1,000 sat by default, 1 sat at the least). Pieces inside a
   ticket are metered, and the unused part of the ticket in use is trusted to the seller.
@@ -139,6 +140,88 @@ marked *(simulated)* involved no node.
 - One hop was measured, on one host, with requests as calls inside one program. Separate seller
   machines, two or more hops, real network latency, requests over HTTP, mainnet fees and a
   buyer that does not pay, on real nodes, were not.
+
+### Seller gateway (`xbt-gateway`)
+
+Regtest only. The gateway has run against Lightning Fork nodes on one host
+(`scripts/gateway_regtest.sh`) and against a stand-in node in its tests; no wallet pays it yet.
+
+- It needs two macaroons of the seller's node: one with `invoices:read` and `invoices:write`,
+  and one with `info:read`, because the first cannot read the block height. Each is refused on
+  mainnet when it grants anything else; the check reads the macaroon and does not verify it, and
+  on any other chain a wider one is taken with a warning.
+- No secret is taken without a block height from the node that is at most 10 seconds old; such
+  a request is answered 503 and the secret is good again later.
+- The 24-block margin is checked against the height the node last reported, which is asked for
+  twice a second: a block that arrived since is not counted.
+- With the default caps buyers can hold 240 tickets, 240,000 sat of the seller's inbound capacity
+  and 240 of one channel's 483 HTLC slots, at no fee: for 1 minute by a session that never
+  releases a secret, for 5 minutes after a session's last paid request, and again as soon as
+  they are cancelled. One address can hold 4 sessions, 32,000 sat. Measured on the lab: a buyer
+  that locked 8 tickets and released none held 8,000 sat for 16 s with the limit set to 15 s.
+- The cap per address counts the socket's address: behind a reverse proxy every buyer has the
+  proxy's, so the runner sets `sessions_per_address` to 0 and caps in the proxy.
+- Whoever can reach the gateway from enough addresses can take every session place with locks
+  it never pays, at no cost, a minute at a time: new buyers are refused meanwhile
+  (`too_many_sessions`). Sessions that already hold tickets keep them and their balance, and can
+  refill up to their own 8; a session with nothing locked at that moment waits for a place.
+- Every lock makes invoices on the node, up to 240 at once with the default caps and each given
+  up within 75 seconds if unpaid; the node keeps cancelled invoices in its database until it is
+  set to collect them (`gc-canceled-invoices-on-the-fly`).
+- One thread and one connection to the node per unreleased ticket: 240 with the default caps.
+- A buyer's balance, the part of its released tickets it has not used, is trusted to the seller:
+  it is kept for 24 hours after the session's last paid request and then forgotten.
+- The gateway takes 64 connections in all and 48 from one address, one request per connection,
+  and an answer that is being sent holds its connection: 64 answers at once. A client that takes
+  no byte for 30 seconds is cut, and no answer stays open for more than 6 hours.
+- A body priced per byte is charged when the gateway hands the bytes to the operating system,
+  not when the buyer has them: a buyer that disappears in the middle paid for what was in the
+  socket's buffers, at most its balance. A buyer that releases one ticket at a time is never more
+  than one ticket ahead.
+- A body priced per second is charged for every second it is open, also while the service says
+  nothing (at most 10 seconds, then the answer ends) or the buyer reads slowly.
+- A request is charged when the service answers with a status below 400. An error from the
+  service is passed on (64 KiB of it) and not charged, so a buyer whose balance covers one
+  request can make the service work on any number of requests that end in errors.
+- The service is reached over plain HTTP only, must start its answer within 10 seconds, and is
+  never followed through a redirect; a service that itself answers 402 is reported as 502.
+- A request body is read whole before it is passed on (64 MiB at most, per route 0 unless the
+  runner sets it); request bodies with chunked encoding are refused.
+- Routes are matched on the decoded path, byte for byte. A service that reads two spellings as
+  one resource (another letter case, a `;` parameter, a trailing dot, its own rewriting) can be
+  reached under a spelling the runner did not price if another route covers that spelling; a path
+  with no route is not passed on at all. A query string is passed on unchanged and takes no part
+  in the match.
+- A target with a backslash, a byte outside visible ASCII, an escaped `/`, `\`, `.` or `%`, or
+  an empty, `.` or `..` segment is refused with 400, so a service whose paths need one of these
+  cannot be sold.
+- Of a buyer's headers only `Accept`, `Accept-Language`, `Content-Type`, `Range`, `If-Range`,
+  `If-None-Match` and `If-Modified-Since` reach the service unless the runner lists more; a
+  buyer's `Authorization` or cookie does not. The gateway adds `Via: 1.1 xbt-gateway`, asks for
+  an unencoded body, and sets `Host` to the service's own address.
+- Session counters are written to the journal with every answer and put on disk twice a second.
+  A gateway that is killed loses at most half a second of the charges of answers still being
+  sent. A power cut loses half a second of all counters: what was served in that time can be
+  served again, and a buyer's next request is told which `seq` is expected.
+- A state directory restored from a backup has the backup's counters: what a session spent since
+  is not counted, sessions made since are unknown, and their locked tickets stay locked until the
+  node cancels them 18 blocks before their expiry. What a session released is read from the node
+  again and is right. A lost state directory loses every session, key and balance.
+- The last receipt of an answer that was sent as it arrived is kept in memory, the last 8 per
+  session, and is gone after a restart; the buyer then has the receipt of the answer's head and
+  its own count of the bytes.
+- A receipt covers the request, the answer's status and its body, not its headers. Nothing ties
+  the receipt key to the node's id but the origin that served both.
+- On a route marked `after-verify` the seller serves up to one ticket's worth before the secret
+  arrives, and loses it when the buyer never sends the secret: once per session, 30,000 sat with
+  the default caps and tickets. The gateway does not know what "checks out" means for the content.
+- The list at `/services` is not signed. The operator's `health` view is given to loopback
+  callers, which behind a reverse proxy on the same host is every caller; it shows counts and no
+  secret.
+- The gateway speaks plain HTTP: a public seller needs a TLS reverse proxy in front, and
+  `public_url` set to the origin buyers use, or every payment fails its request binding.
+- Not run: more than one routing hop, real network latency, mainnet, IPv6, a seller with several
+  channels, and the Core Lightning fork.
 
 ### Channel and transport (library client) (frozen)
 
@@ -512,6 +595,8 @@ Neither the external review nor any of the project's four audits covered:
 - any server built with the `release-small` profile, and any hostile input against a release
   build: the audits attacked debug builds, and release builds ran the ordinary paths only;
 - the macaroon reader the Lightning rail uses (`xbt402::macaroon`): written after the last audit;
+- the seller gateway (`xbt-gateway`), the ticket wire module (`xbt402::ticket`) and the streamed
+  answers of the shared HTTP server (`xbt_svc::http`): written after the last audit;
 - the removal of the hub itself (2026-10-11): what was cut from the provider, the client library
   and the signer, and how records of the removed features are treated;
 - anything on a real network: no mainnet node, no public Electrum server and no Lightning node

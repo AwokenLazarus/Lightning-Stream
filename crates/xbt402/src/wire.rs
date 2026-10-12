@@ -236,12 +236,12 @@ fn host_spelled_one_way(host: &str) -> bool {
 }
 
 /// `LE64(len(x)) ‖ x`: every field of a v2 digest or receipt, so no two field lists hash alike.
-fn put_field(h: &mut Sha256, x: &[u8]) {
+pub(crate) fn put_field(h: &mut Sha256, x: &[u8]) {
     h.update((x.len() as u64).to_le_bytes());
     h.update(x);
 }
 
-fn tagged(tag: &str) -> Sha256 {
+pub(crate) fn tagged(tag: &str) -> Sha256 {
     let t = Sha256::digest(tag.as_bytes());
     let mut h = Sha256::new();
     h.update(t);

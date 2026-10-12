@@ -7,6 +7,9 @@
 //! own deadline. Only then does it wait for one of `threads` handler slots to run
 //! [`Handler::handle`], so a slow or endless client holds a connection slot until its deadline, and
 //! never a handler slot. One request per connection (`Connection: close`); chunked request bodies are 501.
+//! A handler may answer with a [`Streamed`] body ([`Handler::reply`]): its head is built in the handler
+//! slot and its body is produced on the connection thread, so a long answer holds a connection slot
+//! and never a handler slot, and each of its writes has a deadline ([`Limits::stream_write`]).
 //! A public deployment still belongs behind a reverse proxy that terminates TLS.
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
@@ -33,6 +36,8 @@ pub struct Limits {
     /// (AGP-081, review T1: with only the global cap one address held every slot). 0: no cap per
     /// address, for a server whose only peer is its reverse proxy.
     pub per_address: usize,
+    /// One write of a [`Streamed`] body: a client that takes nothing for this long ends the stream.
+    pub stream_write: Duration,
 }
 
 /// Sets [`Limits::per_address`] for the servers a process starts with [`serve`].
@@ -47,6 +52,7 @@ impl Default for Limits {
             body_deadline: Duration::from_secs(30),
             connections: 64,
             per_address: 48,
+            stream_write: Duration::from_secs(30),
         }
     }
 }
@@ -131,12 +137,46 @@ impl Response {
     }
 }
 
+/// Where a [`Streamed`] body goes: the client's connection, one write at a time.
+pub trait BodyWriter {
+    /// Send `bytes` now. An error means the client is gone or took nothing within
+    /// [`Limits::stream_write`]: the body stops there.
+    fn send(&mut self, bytes: &[u8]) -> io::Result<()>;
+}
+
+/// The body of a [`Streamed`] answer. `Ok` is the whole body; an error is a body cut short, which
+/// the client can tell from a complete one (a short `Content-Length` body, or a chunked body with
+/// no last chunk).
+pub type Body = Box<dyn FnOnce(&mut dyn BodyWriter) -> io::Result<()> + Send>;
+
+/// An answer whose body is produced while it is sent.
+pub struct Streamed {
+    pub status: u16,
+    /// As [`Response::headers`].
+    pub headers: Vec<(String, String)>,
+    /// The body's length when it is known before the first byte: sent as `Content-Length`, and no
+    /// more than this is sent. `None`: chunked.
+    pub length: Option<u64>,
+    /// Runs on the connection thread after the head is sent; not run for `HEAD`.
+    pub body: Body,
+}
+
+/// What a handler answers with.
+pub enum Reply {
+    Whole(Response),
+    Stream(Streamed),
+}
+
 /// What a server serves.
 pub trait Handler: Send + Sync {
     /// The largest body accepted for this request line. A larger Content-Length is 413 before any
     /// body byte is read.
     fn body_limit(&self, method: &str, target: &str) -> usize;
     fn handle(&self, req: Request) -> Response;
+    /// [`Handler::handle`] for a handler that streams some of its answers.
+    fn reply(&self, req: Request) -> Reply {
+        Reply::Whole(self.handle(req))
+    }
 }
 
 /// Stops a server: no new connections; the open ones are served to the end.
@@ -478,10 +518,14 @@ fn connection(mut sock: TcpStream, handler: &dyn Handler, gate: &Gate, limits: &
     let r = {
         let _pass = gate.enter();
         // a panicking handler costs its request, and its slot is given back
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler.handle(req)))
-            .unwrap_or_else(|_| Response::text(500, "text/plain", "handler panicked"))
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler.reply(req)))
+            .unwrap_or_else(|_| Reply::Whole(Response::text(500, "text/plain", "handler panicked")))
     };
-    write_response(&mut sock, &r, head_only);
+    match r {
+        Reply::Whole(r) => write_response(&mut sock, &r, head_only),
+        // outside the handler slot: a slow reader of a long body holds this connection only
+        Reply::Stream(s) => write_stream(&mut sock, s, head_only, limits.stream_write),
+    }
 }
 
 enum Fail {
@@ -670,9 +714,10 @@ fn write_all(sock: &mut TcpStream, bytes: &[u8]) -> bool {
     sock.write_all(bytes).is_ok()
 }
 
-fn write_response(sock: &mut TcpStream, r: &Response, head_only: bool) {
-    let mut head = format!("HTTP/1.1 {} {}\r\n", r.status, reason(r.status));
-    for (k, v) in &r.headers {
+/// The status line and the handler's headers, without the three the server writes itself.
+fn head_of(status: u16, headers: &[(String, String)]) -> String {
+    let mut head = format!("HTTP/1.1 {} {}\r\n", status, reason(status));
+    for (k, v) in headers {
         if ["content-length", "connection", "transfer-encoding"]
             .iter()
             .any(|h| k.eq_ignore_ascii_case(h))
@@ -688,6 +733,73 @@ fn write_response(sock: &mut TcpStream, r: &Response, head_only: bool) {
         head.push_str(v);
         head.push_str("\r\n");
     }
+    head
+}
+
+/// A [`Streamed`] body on its way out: `Content-Length` framing up to `left`, or chunks.
+struct StreamOut<'a> {
+    sock: &'a mut TcpStream,
+    /// `Some`: the bytes still allowed under the announced `Content-Length`.
+    left: Option<u64>,
+}
+
+impl BodyWriter for StreamOut<'_> {
+    fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        match &mut self.left {
+            Some(left) => {
+                let n = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                if n > *left {
+                    // more than was announced: sending it would run into the next message
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "body longer than its Content-Length",
+                    ));
+                }
+                self.sock.write_all(bytes)?;
+                *left -= n;
+                Ok(())
+            }
+            None => {
+                self.sock
+                    .write_all(format!("{:x}\r\n", bytes.len()).as_bytes())?;
+                self.sock.write_all(bytes)?;
+                self.sock.write_all(b"\r\n")
+            }
+        }
+    }
+}
+
+fn write_stream(sock: &mut TcpStream, s: Streamed, head_only: bool, stall: Duration) {
+    let mut head = head_of(s.status, &s.headers);
+    let bodiless = matches!(s.status, 100..=199 | 204 | 304);
+    if !bodiless {
+        match s.length {
+            Some(n) => head.push_str(&format!("Content-Length: {n}\r\n")),
+            None => head.push_str("Transfer-Encoding: chunked\r\n"),
+        }
+    }
+    head.push_str("Connection: close\r\n\r\n");
+    let _ = sock.set_write_timeout(Some(stall));
+    if sock.write_all(head.as_bytes()).is_ok() && !bodiless && !head_only {
+        let mut out = StreamOut {
+            sock,
+            left: s.length,
+        };
+        let body = s.body;
+        // a panicking body ends its own answer, cut short
+        let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&mut out)));
+        if matches!(done, Ok(Ok(()))) && out.left.is_none() {
+            let _ = out.sock.write_all(b"0\r\n\r\n");
+        }
+    }
+    let _ = sock.shutdown(Shutdown::Both);
+}
+
+fn write_response(sock: &mut TcpStream, r: &Response, head_only: bool) {
+    let mut head = head_of(r.status, &r.headers);
     let bodiless = matches!(r.status, 100..=199 | 204 | 304);
     if !bodiless {
         head.push_str(&format!("Content-Length: {}\r\n", r.body.len()));
