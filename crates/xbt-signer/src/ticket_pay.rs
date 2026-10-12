@@ -17,6 +17,7 @@
 //! | A secret that has left is spent, whatever comes back. | The book booked it before it existed here ([`Signer::ticket_release_locked`]); this module never asks for it again. It keeps the secret in memory only to send the same one again, never another. |
 //! | Nothing a seller says is booked. | The ledger rows are the book's. A seller's totals only move the wallet's count of the balance, and only where [`crate::ticket_http::Account::absorb`] finds them inside the wallet's own. |
 //! | A ticket is released for an answer only when the balance does not cover its next piece. | [`Stream::due_bytes`] and [`Stream::due_time`], on the bytes and seconds this module counted itself. |
+//! | No ticket is released into a session whose last answer the seller has not closed. | [`Signer::ticket_release_one`] waits for the answer's last receipt in the seller's signed `status` (5 s a call, the session given up after 30 s). A seller waiting for a refill of an answer the wallet stopped reading would take the next ticket for bytes nobody reads. |
 //! | A call uses at most `max_sats`, by the wallet's own count, and ends within the owner's `max_answer_s`. | [`Signer::ticket_request`] refuses a head price above it; [`Stream::over`] cuts the body where its price reaches it or its time is up. |
 //!
 //! Locks: a session's `busy` (one paid request at a time), then `paying` (one secret at a time),
@@ -48,6 +49,10 @@ use crate::{err, Result};
 const SMALL_BODY: u64 = 1 << 20;
 /// How long the wallet looks for the last receipt of an answer that was sent as it arrived.
 const FINAL_WAIT: Duration = Duration::from_secs(2);
+/// How long a release waits for the seller to close an answer the wallet stopped reading, and how
+/// long after that stop the session is given up if the seller never closes it.
+const TAIL_WAIT: Duration = Duration::from_secs(5);
+const TAIL_GIVE_UP: Duration = Duration::from_secs(30);
 /// How long a stop waits for the wallet's own node to show the cancelled tickets failed.
 pub const CANCEL_WAIT: Duration = Duration::from_secs(5);
 /// Refusals of `ticket_open` that mean "not this rail": the next entry of the 402 is tried.
@@ -212,6 +217,18 @@ struct Money {
     pending: Option<(String, Zeroizing<String>)>,
     /// Why this session releases nothing more.
     fault: Option<String>,
+    /// An answer priced as it goes that ended here and that the seller has not closed yet (its
+    /// last receipt is not in `status`): the seller may still be waiting to send more of it, and
+    /// would on the next ticket. Nothing is released into the session until it is closed.
+    tail: Option<Tail>,
+}
+
+/// An answer the seller has not closed: which request it answered, and when the wallet stopped reading.
+struct Tail {
+    seq: u64,
+    digest: String,
+    status: u16,
+    since: Instant,
 }
 
 /// A ticket session the wallet pays over HTTP. In memory only: a signer that starts again stops
@@ -257,7 +274,7 @@ impl HttpSession {
         let m = lock(&self.money);
         json!({"session": self.sid, "origin": self.origin, "released_msat": m.acct.sent_msat.to_string(), "credited_msat": m.acct.acked_msat.to_string(),
                "spent_msat": m.acct.spent_msat.to_string(), "balance_msat": m.acct.balance().to_string(), "unconfirmed_release": m.pending.as_ref().map(|p| p.0.clone()),
-               "fault": m.fault, "answer_open": self.streaming.load(Ordering::SeqCst)})
+               "fault": m.fault, "answer_open": self.streaming.load(Ordering::SeqCst), "answer_unclosed": m.tail.is_some()})
     }
 }
 
@@ -773,7 +790,7 @@ impl Signer {
             }
             if let (true, Ok(r)) = (absorb, &receipt) {
                 let mut m = lock(&hs.money);
-                let due = if hs.streaming.load(Ordering::SeqCst) { Due::Balance } else { Due::AtMost(0) };
+                let due = if hs.streaming.load(Ordering::SeqCst) || m.tail.is_some() { Due::Balance } else { Due::AtMost(0) };
                 let outstanding = m.pending.is_some();
                 if let Err(why) = m.acct.absorb(r, 0, due, outstanding) {
                     m.fault.get_or_insert(why);
@@ -797,6 +814,15 @@ impl Signer {
                         m.ready.remove(&hash);
                     }
                 }
+                // the seller has closed the answer the wallet stopped reading: its last receipt is listed
+                let closed = m.tail.as_ref().is_some_and(|t| {
+                    let sid = lock(&hs.link).seller_sid.clone();
+                    v.get("responses").and_then(Value::as_array).into_iter().flatten().filter_map(|r| Receipt::verify(r, &hs.terms.receipt_key, &sid).ok())
+                        .any(|r| r.for_request(t.seq, &t.digest, t.status).is_ok() && !r.body_hash.is_empty())
+                });
+                if closed {
+                    m.tail = None;
+                }
                 Ok(v)
             }
             Ok((status, _, Ok(_))) => Err(format!("the seller answered status with HTTP {status}")),
@@ -808,7 +834,9 @@ impl Signer {
     /// Mark the session faulty and stop it: nothing more is released to this seller in it.
     fn ticket_fault(&self, hs: &HttpSession, why: &str) -> Value {
         lock(&hs.money).fault.get_or_insert_with(|| why.to_string());
-        self.ticket_audit("ticket_seller_fault", json!({"session": hs.sid, "origin": hs.origin, "dest": format!("ln:{}", hs.terms.terms.payee), "reason": why}));
+        // with the wallet's count as it stood, for the owner who has to judge the seller
+        self.ticket_audit("ticket_seller_fault", json!({"session": hs.sid, "origin": hs.origin, "dest": format!("ln:{}", hs.terms.terms.payee), "reason": why,
+                                                        "account": hs.public()}));
         let stopped = self.ticket_http_stop(hs, &format!("seller fault: {why}"), Duration::ZERO);
         with(refusal("ticket_seller_fault", format!("the session with this seller was stopped: {why}")), json!({"session": hs.sid, "stopped": stopped}))
     }
@@ -828,6 +856,33 @@ impl Signer {
         // the owner's list as it is now: no ticket is booked for a seller no request may reach any more
         if !self.ticket_may_reach(&hs.origin, &hs.task) {
             return Err(refusal("allowlist", format!("destination not on allowlist: {}", hs.origin)));
+        }
+        // an answer the wallet stopped reading and the seller has not closed: a ticket released now would wake it, and
+        // the seller would charge for bytes nobody reads. Its last receipt in `status` is the seller's word that it is closed
+        let open_since = lock(&hs.money).tail.as_ref().map(|t| t.since);
+        if let Some(since) = open_since {
+            let deadline = Instant::now() + TAIL_WAIT;
+            loop {
+                if let Err(why) = self.ticket_status_of(hs, true) {
+                    return Err(refusal("ticket_seller", format!("{why}: no secret was released")));
+                }
+                if lock(&hs.money).tail.is_none() {
+                    break;
+                }
+                if since.elapsed() >= TAIL_GIVE_UP {
+                    let stopped = self.ticket_http_stop(hs, "the seller never closed the answer the wallet stopped reading", Duration::ZERO);
+                    return Err(with(refusal("ticket_answer_open", "the seller never closed the answer the wallet stopped reading: the session was stopped and no \
+                                                                   secret was released; call again"), json!({"session": hs.sid, "stopped": stopped})));
+                }
+                if Instant::now() >= deadline {
+                    return Err(with(refusal("ticket_answer_open", "the seller has not yet closed the answer the wallet stopped reading: no secret was released \
+                                                                   into it; call again"), json!({"session": hs.sid})));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if let Some(why) = hs.fault() {
+                return Err(self.ticket_fault(hs, &why));
+            }
         }
         // a secret that has left and was not confirmed goes first, the same one: that is this release
         if lock(&hs.money).pending.is_some() {
@@ -1041,6 +1096,8 @@ impl Signer {
             };
             {
                 let mut m = lock(&hs.money);
+                // an earlier answer the seller has not closed can still be charged or given back beside this one
+                let due = if m.tail.is_some() { Due::Balance } else { due };
                 if let Err(why) = m.acct.absorb(&head, charged_max, due, false) {
                     m.fault.get_or_insert(why);
                 }
@@ -1242,6 +1299,9 @@ impl Signer {
                 }
             }
             std::thread::sleep(Duration::from_millis(40));
+        }
+        if last.is_none() {
+            lock(&hs.money).tail = Some(Tail { seq, digest: digest.to_string(), status: c_status(head), since: Instant::now() });
         }
         hs.streaming.store(false, Ordering::SeqCst);
         let mut fault = hs.fault();

@@ -216,10 +216,14 @@ fn receipt_secret() -> SecretKey {
     SecretKey::from_slice(&[9u8; 32]).unwrap()
 }
 
+/// How long the next shop waits for a refill before it ends an answer (the gateway's own default is 3 s).
+static REFILL_WAIT_MS: AtomicU64 = AtomicU64::new(400);
+
 fn shop_config(origin: &str, upstream: &str, state: &std::path::Path, network: &str) -> Value {
     json!({"listen": "127.0.0.1:0", "public_url": origin, "upstream": upstream, "state_dir": state, "chain": "regtest",
            "network": network, "node": {"rest": "http://127.0.0.1:1", "macaroon": "unused", "info_macaroon": "unused"},
-           "caps": {"sessions_per_address": 0}, "times": {"refill_wait_ms": 400, "upstream_wait_secs": 2, "tick_ms": 50}, "routes": routes()})
+           "caps": {"sessions_per_address": 0}, "times": {"refill_wait_ms": REFILL_WAIT_MS.load(Ordering::SeqCst), "upstream_wait_secs": 2, "tick_ms": 50},
+           "routes": routes()})
 }
 
 fn start_gateway(cfg: &Value, node: &Arc<SellerNode>, clock: &Arc<AtomicU64>, listener: TcpListener) -> (Arc<Gateway>, Running) {
@@ -1431,6 +1435,35 @@ fn while_the_wallets_own_node_is_away_no_hash_is_offered_and_the_next_call_pays_
     r.ln.st.lock().unwrap().down = false;
     let v = r.pay("/page/10", 10);
     assert_eq!(v["status"].as_u64(), Some(200), "{v}");
+    r.assert_booked();
+}
+
+#[test]
+fn no_ticket_is_released_into_an_answer_the_seller_is_still_waiting_to_go_on_with() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    // a seller that waits 3 s for a refill before it ends an answer, as the gateway does by default
+    REFILL_WAIT_MS.store(3_000, Ordering::SeqCst);
+    let r = Rig::new(json!({"tickets": {"enabled": true, "pool": 2, "tasks": {"film": {"budget_sats": 40_000}}}}));
+    REFILL_WAIT_MS.store(400, Ordering::SeqCst);
+    assert_eq!(r.pay("/page/10", 10)["status"].as_u64(), Some(200));
+    // the wallet's node goes away in the middle of a file: the answer ends when the pool is used up, and the seller,
+    // which has sent everything that was paid for, goes on waiting for the next ticket
+    r.ln.st.lock().unwrap().down = true;
+    let v = r.pay(&format!("/files/{}", 30 * MIB), 20_000);
+    assert_eq!((v["complete"].as_bool(), v["receipt"]["signed"].as_bool()), (Some(false), Some(false)), "the seller had not closed the answer when the call ended: {v}");
+    assert_eq!(r.status()["paying"][0]["answer_unclosed"], true);
+    // the node is back and the agent calls again at once. A ticket released now would wake the old answer, and the
+    // seller would charge it for bytes nobody reads; the wallet waits for the seller to close it first
+    r.ln.st.lock().unwrap().down = false;
+    let t = Instant::now();
+    let v = r.pay("/page/10", 10);
+    assert_eq!((v["verdict"].as_str(), v["status"].as_u64(), v["price_msat"].as_str()), (Some("allow"), Some(200), Some("2500")), "{v}");
+    assert!(t.elapsed() >= Duration::from_millis(300), "it waited for the seller's last receipt of the old answer");
+    assert!(r.audit("ticket_seller_fault").is_empty(), "and an honest seller was not called a liar");
+    assert_eq!(r.status()["paying"][0]["answer_unclosed"], false);
+    // every msat the seller says it spent is the file's bytes and the page
+    let spent: u64 = v["untrusted_provider_response"]["receipt"]["spentMsat"].as_str().unwrap().parse().unwrap();
+    assert_eq!(spent, 2 * TICKET + 2500, "the first page and the file used two tickets to the msat, then this page: {v}");
     r.assert_booked();
 }
 

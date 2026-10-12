@@ -423,6 +423,10 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
 - An answer priced by the second is paid up to a fifth of a second early, and the wallet counts
   its seconds from before it sent the request, so it can pay for one second the seller did not
   charge.
+- After an answer that the wallet stopped reading because its pool ran out, the next call to
+  that seller waits until the seller has closed the answer: 3 s with the gateway's default wait
+  for a refill, at most 5 s a call (`ticket_answer_open`, nothing released), and after 30 s the
+  session is stopped and the next call opens another.
 - The last receipt of a long answer is asked for during 2 s. A seller that has not finished with
   the answer by then, or a gateway that restarted, leaves the wallet with its own count and the
   receipt of the answer's head. `bytes` and `complete` beside that receipt are not signed.

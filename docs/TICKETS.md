@@ -584,7 +584,11 @@ is on the allowlist, or the call's task pays any seller, before the first byte i
 3. While the seller's balance does not cover what it wants before it serves (the request's price,
    the first second, the first byte): one ticket. The seller's signed `status` must list the
    ticket `ACCEPTED`; the book books it and gives the secret; the secret goes to `release`; the
-   seller's signed answer must credit it. One secret at a time.
+   seller's signed answer must credit it. One secret at a time. No ticket is released while the
+   seller has not closed an earlier answer of the session that the wallet stopped reading: a
+   seller that is waiting for a refill of that answer would take the ticket for it. The answer's
+   last receipt in `status` is the seller's word that it is closed; the wallet waits 5 s a call
+   for it and gives the session up after 30 s.
 4. The request, authenticated, with no secret. Its answer must carry a receipt signed by the
    terms' `receiptKey` for this session, this `seq`, this request digest and this status.
 5. The body. An answer paid at its head is read and hashed against the receipt's `bodyHash`. An
@@ -624,6 +628,7 @@ the last ticket.
 | A receipt's totals or charge contradict the wallet's count (inflated metering). | The session is stopped as faulty. | At most the ticket in use. |
 | The body is not the one the receipt signs. | The body is handed on marked as such, and the session is stopped. | At most the ticket in use. |
 | The answer stops in the middle. | The call reports how far it came, and the last receipt if there is one. No ticket is released after the last byte. | The part of the last released ticket that paid for nothing. |
+| The wallet stopped reading an answer when its pool ran out, and pays that seller again at once. | It waits until the seller has closed the old answer (the gateway does so after its 3 s wait for a refill), then releases. | Up to 3 s of waiting. Before this rule a ticket released in that time was charged for bytes of the old answer that nobody read, and the wallet took the honest seller's receipt for a lie. |
 | The seller stops answering. | The call reports it. An unconfirmed secret is sent again by the next call before anything else. The idle rule stops the session. | At most one ticket, and the pool locked until the seller cancels it or it expires (section 6). |
 | The seller never shows a ticket `ACCEPTED`. | `ticket_not_ready` after `tickets.ready_wait_ms`. | Nothing: no secret was released. |
 | The wallet's signer is killed. | On its next start every locked ticket is booked as if released and never released, and the sellers on record are asked to cancel. | The balance; and the pool's worst case held against the budgets until the node shows the tickets failed. |
@@ -659,6 +664,7 @@ Each of these was found by building `xbt402_pay` over tickets against this draft
 | 3 | `releasedMsat` and `spentMsat` "both only rise". | `spentMsat` falls by what the gateway charged ahead and did not send. A buyer that treats a fall as a lie stops honest sellers; a fall is in its favour, so it is taken. |
 | 3 | A refusal of an authenticated request is signed. | `bad_seq` and `session_unknown` cannot be: the first is answered before authentication, and a seller that has forgotten a session has no totals to sign. The wallet adopts the first and treats the second as the end of the session. |
 | 4 | "The receipt for the whole answer ... is in the answer to `status`." | It appears there when the seller has finished with the answer, which for one the buyer stopped reading is when the seller's next write fails or its wait for a refill ends. The wallet asks for 2 s and otherwise keeps its own count. |
+| 4 | A buyer that stops paying for a long answer lets it end. | The seller goes on waiting for a refill for a few seconds, and a ticket released to the session in that time continues the old answer, which the buyer no longer reads. A buyer MUST NOT release into a session until `status` lists the last receipt of every answer it stopped reading. Found on the lab when the buyer's node was killed in the middle of a file and the next call came 2 s later. |
 | 4 | Stop and cancel need the session's key. | A wallet that starts again has lost its sessions but kept each seller's session id and key in its book, written before any ticket of the session was paid. Its first `cancel` uses `seq` 0 and adopts the `nextSeq` the seller answers. |
 | 1 | The terms came "over TLS from the seller". | The wallet refuses the ticket entry of an origin that is neither https nor on its own machine: the session key travels in the first lock answer. |
 | 7, 11 | The pool and the smallest ticket were numbers in the wallet's code. | They are the owner's settings (`tickets.pool`, `pool_many`, `many_sellers`, `floor_ticket_sats`), each with its default in one place. The defaults are still the earlier ones (8, then 2 beyond 8 sellers, 64 sat): section 11's rules change those defaults and add the checks of a channel's slots and dust limit, which the wallet does not make yet. |

@@ -262,6 +262,12 @@ def pay(url: str, max_sats: int = 10, who: Mcp | None = None) -> dict[str, Any]:
     return r
 
 
+def call_paid(r: dict[str, Any]) -> bool:
+    """The call was allowed and the seller answered 200. (A refusal can carry the status of the
+    answer it refused.)"""
+    return r.get("verdict") == "allow" and r.get("status") == 200
+
+
 def body_of(r: dict[str, Any]) -> str:
     return str((r.get("untrusted_provider_response") or {}).get("body", ""))
 
@@ -712,7 +718,7 @@ def page() -> None:
         t0 = time.monotonic()
         r = pay(f"{ORIGIN}/small.txt")
         firsts.append(round(time.monotonic() - t0, 3))
-        if r.get("status") != 200 or r.get("tickets_released") != 1:
+        if not call_paid(r) or r.get("tickets_released") != 1:
             raise LabError(f"a first request: {brief(r)}")
     measured("first_request_s", firsts)
     check("page: a first request, with the pool of 8 tickets locked through one hop, completes in 1 s (median of 5 new sessions, timed around the MCP tool call)",
@@ -721,7 +727,7 @@ def page() -> None:
 
 def latency() -> None:
     r = pay(f"{ORIGIN}/small.txt")
-    if r.get("status") != 200:
+    if not call_paid(r):
         raise LabError(f"latency: {brief(r)}")
     n = 200
     before = len(buyer_payments())
@@ -732,7 +738,7 @@ def latency() -> None:
             t0 = time.perf_counter()
             r = pay(url)
             out.append((time.perf_counter() - t0) * 1000)
-            if r.get("status") != 200:
+            if not call_paid(r):
                 raise LabError(f"latency: {brief(r)}")
         return out
 
@@ -771,7 +777,7 @@ def stream() -> None:
     t0 = time.monotonic()
     r = pay(f"{ORIGIN}/big.bin", max_sats=25_000)
     took = time.monotonic() - t0
-    ok = (r.get("status") == 200 and r.get("complete") is True and r.get("bytes") == BIG and r.get("body_digest") == digest_of_prefix(BIG) and r.get("price_msat") == str(price_msat)
+    ok = (call_paid(r) and r.get("complete") is True and r.get("bytes") == BIG and r.get("body_digest") == digest_of_prefix(BIG) and r.get("price_msat") == str(price_msat)
           and r.get("tickets_released") == 20 and r["receipt"].get("body") == "as signed" and r["receipt"]["last"]["charged"] == str(price_msat))
     stored = r.get("saved_to", "")
     same_file = bool(stored) and os.path.getsize(stored) == BIG and hashlib.sha256(open(stored, "rb").read()).hexdigest() == r.get("body_digest")
@@ -785,7 +791,7 @@ def stream() -> None:
     r = pay(f"{ORIGIN}/big.bin", max_sats=half)
     got = int(r.get("bytes", 0))
     by_count = -(-got * BYTE_MSAT // PER_BYTES)
-    ok = (r.get("status") == 200 and r.get("complete") is False and str(r.get("ended", "")).startswith("stopped by the wallet: max_sats") and r.get("body_digest") == digest_of_prefix(got)
+    ok = (call_paid(r) and r.get("complete") is False and str(r.get("ended", "")).startswith("stopped by the wallet: max_sats") and r.get("body_digest") == digest_of_prefix(got)
           and half * 1000 <= by_count <= half * 1000 + (64 << 10) * BYTE_MSAT // PER_BYTES + 1 and got < BIG * 0.52)
     check("stream: the same file under a call that allows half its price stops half way, at the byte the call's max_sats pays for by the wallet's own count",
           ok, {**brief(r), "receipt": {"body": r["receipt"].get("body")}, "bytes": got, "max_sats": half, "price_of_bytes_msat": by_count})
@@ -854,7 +860,7 @@ def liar() -> None:
     def after_one_good(mode: str) -> Any:
         def act() -> dict[str, Any]:
             first = pay(page_url)
-            if first.get("status") != 200:
+            if not call_paid(first):
                 raise LabError(f"the honest first page: {brief(first)}")
             Lies.mode = mode
             return pay(page_url)
@@ -869,7 +875,7 @@ def liar() -> None:
         return act
 
     through = pay(page_url)
-    check("liar: with the proxy passing everything on, the second gateway is paid as the first is", through.get("status") == 200 and through.get("tickets_released") == 1, brief(through))
+    check("liar: with the proxy passing everything on, the second gateway is paid as the first is", call_paid(through) and through.get("tickets_released") == 1, brief(through))
     lie("other_node", "terms that name another node id than the one the owner tied to this origin: nothing is locked and nothing paid",
         from_the_start("other_node"), lambda r: r.get("rule") == "no_rail" and "ticket_admission" in json.dumps(r.get("rails_passed_over")), 0)
     lie("other_payee", "tickets for another payee (hold invoices of another node for the buyer's hashes): no payment leaves the buyer's node",
@@ -903,7 +909,7 @@ def next_call_pays(what: str) -> dict[str, Any]:
             said.append(str(e)[:120])
             time.sleep(2)
             continue
-        if r.get("status") == 200:
+        if call_paid(r):
             return {"calls": len(said) + 1, "said_first": said}
         said.append(f"{r.get('rule')}: {str(r.get('reason'))[:100]}")
         time.sleep(2)
@@ -939,7 +945,7 @@ def kill() -> None:
         # with a pool locked, between two calls
         stop_sessions()
         r = pay(f"{ORIGIN}/small.txt")
-        if r.get("status") != 200:
+        if not call_paid(r):
             raise LabError(f"kill {victim}: the page before: {brief(r)}")
         killed(victim, "a pool locked")
         resumed = next_call_pays(f"kill {victim} with a pool locked")
