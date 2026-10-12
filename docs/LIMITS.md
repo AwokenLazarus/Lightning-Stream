@@ -319,6 +319,8 @@ built. Run on regtest only (`scripts/ticket_book_regtest.sh`).
   locked stays booked.
 - The wallet locks and releases nothing between a start and the first complete read of its node's
   payment list (`ticket_sync`); with the node down that is until the node is back.
+- For a moment after a ticket settles, `ticket_status` can show the node and the book as not
+  agreeing: the node reports the payment settled before it has taken the HTLC off its channel.
 - The seller's node receives a 32-byte tag with every ticket (a random nonce and a MAC). It tells
   the seller nothing about the wallet beyond what the payment hash already does.
 - The ticket rail trusts its own Lightning node as the Lightning rail does: a ticket the node

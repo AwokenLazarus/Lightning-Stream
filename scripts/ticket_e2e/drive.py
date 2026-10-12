@@ -695,6 +695,12 @@ def page() -> None:
           and r.get("price_msat") == str(REQUEST_MSAT) and r.get("balance_msat") == str(TICKET_MSAT - REQUEST_MSAT) and r["receipt"] == {"signed": True, "body": "as signed"})
     check("page: one xbt402_pay call fetched a priced page behind the gateway, through the hop: one ticket of the pool released, 2,500 msat used, the seller's receipt signs the body",
           ok, brief(r))
+    # the node reports a payment settled a moment before it takes the HTLC off its channel: the book and the channel are
+    # compared once that has happened
+    try:
+        lab.wait("the book and the node to agree", 10, lambda: status()["node"]["agree"] is True, every=0.2)
+    except LabError:
+        pass
     st = status()
     check("page: seven tickets stay locked and unreleased, and the wallet's book is its node's payments in flight",
           st["locked"] == {"tickets": 7, "sats": 7000} and st["node"]["agree"] is True and in_flight() == 7 and held() == 7,

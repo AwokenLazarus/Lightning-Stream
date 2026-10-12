@@ -1307,20 +1307,21 @@ impl Signer {
     }
 
     /// Reconcile with the wallet's node until no ticket of the session is locked and unreleased, or
-    /// `wait` has passed. Returns the hashes still locked.
-    fn ticket_wait_cancelled(&self, sid: &str, wait: Duration) -> Vec<String> {
+    /// `wait` has passed. Returns the hashes still locked; `Null` when the book could not be read,
+    /// which is not "none".
+    fn ticket_wait_cancelled(&self, sid: &str, wait: Duration) -> Value {
         let deadline = Instant::now() + wait;
         loop {
             {
                 let _g = self.lock();
                 self.ticket_reconcile_locked();
             }
-            let left: Vec<String> = match self.ticket_store() {
-                Ok(g) => g.as_ref().map(|st| st.book.of_session(sid).into_iter().filter(|t| t.state.unreleased()).map(|t| t.hash.clone()).collect()).unwrap_or_default(),
-                Err(_) => vec![],
+            let left: Option<Vec<String>> = match self.ticket_store() {
+                Ok(g) => g.as_ref().map(|st| st.book.of_session(sid).into_iter().filter(|t| t.state.unreleased()).map(|t| t.hash.clone()).collect()),
+                Err(_) => None,
             };
-            if left.is_empty() || Instant::now() >= deadline {
-                return left;
+            if left.as_ref().is_none_or(Vec::is_empty) || Instant::now() >= deadline {
+                return left.map_or(Value::Null, |l| json!(l));
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -1390,7 +1391,7 @@ impl Signer {
             }
         }
         let still = self.ticket_wait_cancelled(&s.id, if sent { wait } else { Duration::ZERO });
-        self.ticket_audit("ticket_cancel_asked", json!({"session": s.id, "dest": format!("ln:{}", s.payee), "sent": sent, "still_locked": still.len()}));
+        self.ticket_audit("ticket_cancel_asked", json!({"session": s.id, "dest": format!("ln:{}", s.payee), "sent": sent, "still_locked": still.as_array().map(Vec::len)}));
         json!({"session": s.id, "cancel_sent": sent, "still_locked": still})
     }
 
