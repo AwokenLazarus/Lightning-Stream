@@ -31,6 +31,17 @@ socket path.
 | `ln_pay` | `invoice`, `max_sats`, `description=""`, `amount_sats=0` | pays an XBT Lightning invoice (BOLT 11) or, AGP-082, an offer (BOLT 12, `lno1...`) through the signer's LN node, under the same policy (`dest` is `ln:<payee node id>`, or `ln-offer:<offer id>` for an offer). `max_sats` caps the amount plus the routing-fee limit; `amount_sats` is the amount to pay an offer that names none. Refused: no feature bit 512, an offer for another chain, an LN node not verified on the XBT chain, expired or amountless invoices, no safe channel (for an offer: any unsafe channel on the node). Over the human threshold: `needs_human`; after the human's approval the same call pays |
 | `ln_status` | | the LN node's chain check, its channels with the guard verdicts, coins below the split, exposure, recent payments |
 
+**Stream tickets, with `XBT_MCP_TICKETS=1` only:**
+
+| tool | arguments | what it does |
+|---|---|---|
+| `ticket_status` | `session=""` | the signer's ticket book after it has been compared with its Lightning node: sessions, tickets by state, sats locked against the exposure caps, sats booked and not yet settled, whether the node's payments in flight are the book's. Read-only, and never a secret |
+| `ticket_stop` | `session` | stops a session: nothing more is locked or released for it; returns the hashes of its unreleased tickets, which only the seller can cancel |
+
+Locking and releasing tickets are not tools. `ticket_open`, `ticket_offer`, `ticket_lock` and
+`ticket_release` are methods of the signer's socket for the wallet's own payer: a released secret is
+spent money, and the model does not hold one.
+
 Without `XBT_MCP_LN` the list is B2's exact ten (the Python conformance check depends on it). The
 LN node's REST URL, macaroon and TLS certificate are the signer's (`B2_LN_*`), never this process's.
 Node and invoice text (aliases, descriptions, failure reasons) comes back under `untrusted_ln_data`.

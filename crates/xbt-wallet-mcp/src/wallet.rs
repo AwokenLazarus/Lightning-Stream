@@ -419,6 +419,8 @@ pub struct Wallet {
     pub approval_wait: Duration,
     /// AGP-048 `XBT_MCP_LN=1`: offer `ln_pay` and `ln_status` (the signer must have an LN node).
     pub ln_tools: bool,
+    /// `XBT_MCP_TICKETS=1`: offer `ticket_status` and `ticket_stop` (the signer's policy must turn tickets on).
+    pub ticket_tools: bool,
     local: Mutex<Option<LocalPayer>>,
 }
 
@@ -426,7 +428,9 @@ impl Wallet {
     pub fn new(sock: PathBuf, mode: PayerMode) -> Self {
         let wait = std::env::var("XBT_MCP_APPROVAL_WAIT_S").ok().and_then(|v| v.parse::<f64>().ok()).filter(|w| w.is_finite() && *w > 0.0).unwrap_or(0.0);
         let ln_tools = std::env::var("XBT_MCP_LN").is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
-        Self { sock, timeout: default_timeout(), mode, local: Mutex::new(None), approval_wait: Duration::from_secs_f64(wait.min(86_400.0)), ln_tools }
+        let ticket_tools = std::env::var("XBT_MCP_TICKETS").is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
+        Self { sock, timeout: default_timeout(), mode, local: Mutex::new(None), approval_wait: Duration::from_secs_f64(wait.min(86_400.0)), ln_tools,
+               ticket_tools }
     }
 
     /// B2's environment: `B2_SIGNER_SOCK` / `B2_ROOT`, `B2_SIGNER_TIMEOUT`, plus `XBT_MCP_PAYER`.
