@@ -191,7 +191,8 @@ marked *(simulated)* involved no node.
 ### Seller gateway (`xbt-gateway`)
 
 Regtest only. The gateway has run against Lightning Fork nodes on one host
-(`scripts/gateway_regtest.sh`) and against a stand-in node in its tests; no wallet pays it yet.
+(`scripts/gateway_regtest.sh`, with a test buyer; `scripts/ticket_e2e_regtest.sh`, paid by the
+wallet) and against a stand-in node in its tests.
 
 - It needs two macaroons of the seller's node: one with `invoices:read` and `invoices:write`,
   and one with `info:read`, because the first cannot read the block height. Each is refused on
@@ -282,20 +283,22 @@ Regtest only. The gateway has run against Lightning Fork nodes on one host
 ### Stream tickets: the wallet's ticket book
 
 The buyer's side, in the signer (`ticket.rs`, `ticket_rail.rs`): secrets, tickets locked through
-the owner's node, and the booking. It is reached through six socket methods; the binding to
-`xbt402_pay` and paid HTTP requests, the check of a seller's receipts, verify-before-release for
-checkable content, prepaid tickets (`settle: on-arrival`), lottery tickets and admission by
-content hash are not built. Run on regtest only (`scripts/ticket_book_regtest.sh`).
+the owner's node, and the booking. It is reached through six socket methods, and by the wallet's
+own payer under `xbt402_pay` (the next section). Verify-before-release for checkable content,
+prepaid tickets (`settle: on-arrival`), lottery tickets and admission by content hash are not
+built. Run on regtest only (`scripts/ticket_book_regtest.sh`).
 
 - The ticket book's defaults were sized for channels of 483 slots: a pool of 8 tickets with each
   of up to 8 sellers and 2 beyond that, 64 held tickets in all, and a smallest ticket of 64 sat
   where it chooses the size. It does not read its channels' slot counts or dust limits before a
   lock, and a lock that fails for lack of a slot is recorded on the ticket and nothing more. On
   a channel that carries 30 (any channel with a Core Lightning node at its default) the 31st
-  held ticket fails, and a 64-sat ticket has no output in any channel's transaction. An owner
-  can cap both in the policy, with `tickets.seller_max_tickets` at 2 and
-  `tickets.max_locked_tickets` at 15; the 64-sat floor is compiled in (`docs/TICKETS.md`,
-  section 11).
+  held ticket fails, and a 64-sat ticket has no output in any channel's transaction. These are
+  the owner's settings, with the earlier numbers as their defaults: `tickets.pool` (8) and
+  `tickets.pool_many` (2) for the pool, `tickets.max_locked_tickets` (64) for all sessions, and
+  `tickets.floor_ticket_sats` (64) for the smallest ticket the wallet chooses. An owner whose
+  channels carry 30 sets the pool to 2, `max_locked_tickets` to 15 and the floor to 546
+  (`docs/TICKETS.md`, section 11); nothing in the wallet does it for them.
 
 - Tickets are off until the owner's policy turns them on (`tickets.enabled`) and names at least
   one task with a budget (`tickets.tasks`); with tickets on and no task, every session is refused.
@@ -331,15 +334,22 @@ content hash are not built. Run on regtest only (`scripts/ticket_book_regtest.sh
   are not booked: another payment of the wallet can use the budget meanwhile, and the tickets are
   then not released and stay locked until the seller cancels them or they expire.
 - A release is one payment under every rule of the wallet. With the shipped `velocity_max` of 8
-  an hour a wallet releases at most 8 tickets an hour, across all rails; an owner who streams
-  raises it. Releases to one seller inside `split_window_s` add up against `max_per_tx_sats` and
-  the human threshold as any split payment does.
+  an hour and no `tickets.velocity` in the policy, a wallet releases at most 8 tickets an hour,
+  across all rails: an answer priced as it goes stops at the eighth ticket (8,000 sat with the
+  default ticket). An owner who streams sets `tickets.velocity` to `"session"`: a session is then
+  one payment for `velocity_max`, counted from its first release for as long as one of its
+  releases is inside the window, and its releases are bounded by the budgets, the caps on locked
+  funds and `max_sends_per_hour` (1,200). Under `"session"` the ninth session of an hour is
+  refused when it opens. Releases to one seller inside `split_window_s` add up against
+  `max_per_tx_sats` and the human threshold as any split payment does, under either setting.
+- A ticket released before this version has no session in its ledger row and counts as one
+  payment under either setting.
 - No release can wait for a human: a session whose one ticket, with its fee limit, would reach
   `human_threshold_sats` is refused when it opens.
 - The owner names a ticket seller by its node id: `ln:<node id>` on the allowlist, or an
   allowlisted origin whose `counterparties` entry gives the node id (`ln_node`). An origin alone
-  names nobody: the caller says which origin a session is for, and until the wallet itself
-  fetches a seller's terms that is the caller's word.
+  names nobody. Under `xbt402_pay` the origin is the one the signer itself fetched the terms
+  from; on the socket's `ticket_open` it is the caller's word.
 - A seller the owner has not named is paid only under a task that admits any seller, and by
   default at most 2 tickets locked and 4 tickets' worth paid in the task's window. The cap is per
   node id, and node ids are free to make: what bounds a seller that takes a ticket and serves
@@ -349,10 +359,12 @@ content hash are not built. Run on regtest only (`scripts/ticket_book_regtest.sh
   weekly budgets and their seller's cap, and against no task's budget.
 - One session per seller at a time; a session with no lock or release for 10 minutes is stopped,
   and no session survives a start of the signer.
-- The signer does not talk to sellers. It says how many hashes a pool wants (below half of the
-  pool: back to the pool's size) and the caller fetches the invoices; a refill happens when the
-  caller asks. Stopping a session only names the tickets to cancel: the seller cancels, or does
-  not.
+- On the six socket methods the signer does not talk to sellers. It says how many hashes a pool
+  wants (below half of the pool: back to the pool's size) and the caller fetches the invoices; a
+  refill happens when the caller asks, and stopping a session only names the tickets to cancel.
+  Under `xbt402_pay` the signer does all of this itself (the next section).
+- A hash whose invoice the book refused (a cap was reached) keeps its place in the pool for 2
+  minutes: the pool asks for no other hash in its place until then.
 - A release does not ask the node whether the ticket is still locked. It relies on the last
   reconcile (every watcher tick, 10 s by default) and on the ticket's expiry height: a ticket the
   seller cancelled in between is released, booked, refused by the seller and un-booked at the
@@ -367,6 +379,69 @@ content hash are not built. Run on regtest only (`scripts/ticket_book_regtest.sh
   routes.
 - Tickets and sessions that ended more than a day ago leave the book. The wallet's backup holds
   the book and the sealed ticket seed while each is under the backup's 8 MiB limit a file.
+
+### Stream tickets: the wallet pays a gateway (`xbt402_pay`)
+
+The signer's own payer (`ticket_http.rs`, `ticket_pay.rs`): the rail choice, the session with a
+seller over HTTP, the receipts. Run on regtest only: against the gateway in process
+(`crates/xbt-signer/tests/ticket_pay.rs`) and against Lightning Fork nodes through one hop with the
+release binaries (`scripts/ticket_e2e_regtest.sh`).
+
+- The ticket rail exists only where the owner's policy turns tickets on, and an agent reaches it
+  only where the operator starts the MCP server with `XBT_MCP_TICKETS=1`. With tickets off,
+  `xbt402_pay` is the channel path as it was. With tickets on, a seller that answers without a
+  402 is answered from the wallet's one unpaid request (`rule: free`, `rail: none`), and a seller
+  paid by channel is asked twice without payment before it is paid.
+- `max_sats` bounds what a call uses, by the wallet's own count of the bytes and seconds it
+  received. It does not bound what the call books: a ticket is released whole, so a call that
+  uses 3 sat can book one ticket and its fee limit (1,015 sat with the defaults). The rest is a
+  balance with that seller, trusted to it.
+- An answer the wallet stops at `max_sats` can be charged for what the seller had already sent:
+  up to the balance, so less than one ticket more than the call's limit.
+- The balance is given up whenever a session ends: `ticket_stop`, 120 s without a paid request, a
+  seller fault, changed terms, a restart of the signer. Each costs less than one ticket.
+- A seller can take one ticket and serve nothing; the wallet then stops the session. Node ids and
+  origins are free to make, so under a task that pays any seller what bounds this is the task's
+  budget and its cap per unnamed seller.
+- The wallet sends a secret only in `release`. A seller that takes a secret only with the request
+  it pays for cannot be paid; the gateway takes both.
+- An entry that releases `after-verify` or settles `on-arrival` is not paid: the wallet passes it
+  over and tries the next rail.
+- No ticket is released until the seller's signed `status` shows it locked. A seller that never
+  shows it is not paid (`ticket_not_ready` after 3 s), and its tickets stay locked until it
+  cancels them or they expire.
+- One paid request per seller at a time: a long answer delays every other call to that seller,
+  and one session per seller node, so two origins of one node cannot be paid at once.
+- The ticket rail needs https, or http to the wallet's own machine. The wallet does not pin a
+  seller's certificate: it trusts the system's roots, as its HTTP client does.
+- An answer priced as it goes is cut by the wallet after 50 s (`tickets.max_answer_s`), because
+  whoever calls the signer's socket waits 60 s by default. An owner who streams longer raises
+  both; if the caller's wait ends first, the caller sees an error while the signer goes on paying
+  for the answer until `max_sats` or `max_answer_s`.
+- An answer priced by the second is paid up to a fifth of a second early, and the wallet counts
+  its seconds from before it sent the request, so it can pay for one second the seller did not
+  charge.
+- The last receipt of a long answer is asked for during 2 s. A seller that has not finished with
+  the answer by then, or a gateway that restarted, leaves the wallet with its own count and the
+  receipt of the answer's head. `bytes` and `complete` beside that receipt are not signed.
+- An answer nobody signed ends the session unless it is a 5xx: whoever can answer in a seller's
+  place can make the wallet give up a balance, once per session, and release nothing.
+- An unsigned `bad_seq` is believed, twice per request.
+- A wallet that starts again asks each seller on record to cancel, once. If the seller is
+  unreachable then, those tickets stay locked, and booked against the budgets at their worst
+  case, until the seller cancels them itself or they expire.
+- The seller's session id and key are in the ticket book in the clear, as the book is. Whoever
+  reads the book can spend a session's balance at the seller and cancel its tickets; no secret
+  of a ticket can be had from it.
+- A body longer than the preview is stored only when `B2_BODY_DIR` is set; otherwise the wallet
+  hands on its first 12,000 bytes, its length and its hash. Stored files are never removed by
+  the wallet.
+- The single Lightning payment of a 402 (`scheme: "exact"`) pays first: an invoice that is paid
+  and then not honoured is lost, once. No seller in this tree offers the entry and it was not run
+  on the lab.
+- The MCP's in-process payer (`XBT_MCP_PAYER=local`) pays channels only.
+- Not run: more than one hop, real network latency, TLS to a seller, mainnet, the Core Lightning
+  fork, more than one seller at once through this path, and a seller other than `xbt-gateway`.
 
 ### Channel and transport (library client) (frozen)
 
@@ -489,9 +564,10 @@ channel; the rest (policy, approvals, keys, the socket) holds for every rail.
 - Key wiping covers long-lived copies in the Rust signer only.
 - Stream chunks are paid without a signed receipt; each is bound by a Merkle proof or a hash lock.
   An answer of 400 or above is handed to the agent without a receipt.
-- One payment at a time: the wallet holds one lock for a whole `xbt402_pay`, the seller's answers
-  included, so a slow seller delays every other payment, approval and refund for as long as it
-  answers.
+- One payment at a time on the channel: the wallet holds one lock for a whole `xbt402_pay` on
+  that rail, the seller's answers included, so a slow seller delays every other payment, approval
+  and refund for as long as it answers. On the ticket rail the lock is held for each lock round's
+  bookkeeping and each release, not while a seller answers.
 - A watcher step that panics is reported and skipped, and the next tick tries again; in a
   `release-small` build a panic ends the signer process, and whatever supervises it restarts it.
 

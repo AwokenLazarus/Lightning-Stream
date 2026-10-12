@@ -1,4 +1,4 @@
-//! Stream tickets, the wallet pays a seller (`docs/TICKETS.md` sections 1 to 4 and 11): the signer's
+//! Stream tickets, the wallet pays a seller (`docs/TICKETS.md` sections 1 to 4 and 12): the signer's
 //! `xbt402_pay` against the real seller gateway (`xbt-gateway`), in one process, over real sockets.
 //!
 //! What is real here: the signer, its ticket book and ledger, the gateway, its journal and its

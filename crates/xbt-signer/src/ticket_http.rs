@@ -149,7 +149,7 @@ impl PayTerms {
     }
 }
 
-/// What a 402 offers, in the order the wallet takes them (`docs/TICKETS.md` section 11).
+/// What a 402 offers, in the order the wallet takes them (`docs/TICKETS.md` section 12).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Offer {
     /// `scheme: "ticket"` on this Lightning network.

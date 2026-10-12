@@ -1,4 +1,4 @@
-//! Stream tickets, the wallet pays a seller over HTTP (`docs/TICKETS.md` sections 1 to 4 and 11):
+//! Stream tickets, the wallet pays a seller over HTTP (`docs/TICKETS.md` sections 1 to 4 and 12):
 //! `xbt402_pay` chooses the rail, and for a ticket entry the signer itself fetches the seller's
 //! terms, opens a session, locks a pool, releases a ticket when the balance with that seller runs
 //! out, reads the answer as it arrives, checks every receipt, refills and stops.

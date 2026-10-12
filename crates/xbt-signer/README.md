@@ -249,17 +249,39 @@ policy.json `tickets` (all optional but `enabled` and one task): `enabled` (fals
 `max_locked_tickets`, `max_sellers` (each the rail's by default), `admit` (`"listed"`, the default: only
 sellers the owner named; `"any"`: any seller inside the caps that follow), `unlisted_max_tickets` (2),
 `unlisted_max_locked_sats` (two tickets), `unlisted_max_spend_sats` (four tickets, in the task's
-window). The owner names a seller with `ln:<node id>` on the allowlist, or with an allowlisted origin
-whose `counterparties` entry has `ln_node`. The wallet's own rules (the daily and weekly budgets, the
-per-counterparty cap, velocity, the split window) apply to every release; a ticket that would reach
-the human threshold is refused when the session opens.
+window). The pool: `pool` (8 unreleased tickets with a seller), `pool_many` (2, with each seller of a
+task that has more than `many_sellers`, 8), `floor_ticket_sats` (64, the smallest ticket the wallet
+chooses by itself). `velocity` (`"release"`, the default: every release is one payment for
+`velocity_max`; `"session"`: a session is one). For the payer under `xbt402_pay`: `http_idle_s` (120),
+`ready_wait_ms` (3000), `read_timeout_s` (30), `max_answer_s` (50). The owner names a seller with
+`ln:<node id>` on the allowlist, or with an allowlisted origin whose `counterparties` entry has
+`ln_node`. The wallet's own rules (the daily and weekly budgets, the per-counterparty cap, velocity,
+the split window) apply to every release; a ticket that would reach the human threshold is refused
+when the session opens. Top-level `channel_rail` (true): whether `xbt402_pay` may still pay the
+on-chain channel.
+
+### Stream tickets: `xbt402_pay` pays a seller
+
+`src/ticket_http.rs` (a seller's messages read strictly, the wallet's count of a session: no IO) and
+`src/ticket_pay.rs` (the rail choice, the session over HTTP, the answer read as it arrives). With
+tickets on, `xbt402_pay` takes one more argument, `task`, and asks the seller once without paying; the
+402 it gets back decides the rail (`docs/TICKETS.md`, section 12): a ticket entry, a single Lightning
+invoice, the on-chain channel, or `no_rail` with what each entry would need. The reply of a call paid
+with tickets has `rail: "ticket"`, `status`, `charged_sats` (what the book put in the ledger for the
+tickets this call released), `tickets_released`, `price_msat` (what the call used, by the wallet's own
+count), `balance_msat` (what is left with the seller), `complete` and `ended`, `bytes`, `body_digest`
+(and `saved_to` under `B2_BODY_DIR`), `receipt` and `tickets`. `ticket_stop` then also asks the seller
+to cancel and waits for the wallet's node to show the tickets back; `ticket_status` and `channels`
+show, under `paying`, the wallet's count for each seller. `tests/ticket_pay.rs` runs this against the
+real `xbt-gateway` in process (a seller that lies, lost and forged answers, a kill at every write step);
+`scripts/ticket_e2e_regtest.sh` runs it against Lightning Fork nodes.
 
 What is booked, and when:
 
 - **Locked** tickets are counted against the exposure caps and booked nowhere. Nothing is locked that
   the budgets could not release.
 - **A release** books the ticket and its routing-fee limit in the ledger (`ticket:<payment hash>`,
-  memo `ticket task=<task>`) before the secret is returned. When the node shows the payment settled,
+  memo `ticket task=<task> session=<id>`) before the secret is returned. When the node shows the payment settled,
   with the preimage, the row becomes the ticket plus the fee the node paid; when it shows it failed
   with no HTLC out (the seller cancelled, or the ticket expired), the row goes.
 - **At every start** each ticket the book holds locked is retired: booked as if released, never
