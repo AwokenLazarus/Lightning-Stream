@@ -223,6 +223,62 @@ REST listener itself: bind `restlisten` to a private interface or loopback (with
 tunnel) and firewall it to the signer's host. The signer's own `max_sends_per_hour` is the rate limit;
 LND has none per macaroon.
 
+### Stream tickets: the ticket book
+
+The buyer's side of `docs/TICKETS.md` (`src/ticket.rs`: the rules, no IO; `src/ticket_rail.rs`: the
+book on disk, the node, the methods). A ticket is a hold invoice of the seller's node for a hash
+whose secret only this signer can derive; the caller speaks HTTP to the seller, the signer decides
+and books. Tickets are paid through the same node as `ln_pay`, with the same macaroon, after the
+same checks of the node and its channels.
+
+| method | params | what it does |
+|---|---|---|
+| `ticket_open` | `terms` (the `accepts` entry of the seller's 402), `task`, `origin?`, `expect_sats?`, `max_sats?` | a session with one seller under one of the owner's tasks; answers the ticket size and the pool. Refused: terms above the owner's bounds, a seller the task does not admit, a task the policy does not name. Pays and locks nothing |
+| `ticket_offer` | `session` | the payment hashes the pool wants locked now (none above the refill mark); the secrets stay in the signer |
+| `ticket_lock` | `session`, `tickets: [{hash, invoice}]` | checks each invoice (payee, hash, amount, bit 512, final CLTV delta, expiry, the caps) and pays those that pass; each is written to the book before the node sees it |
+| `ticket_release` | `session` | the secret of one locked ticket, after its spend is in the ledger, the ticket is `released` in the book and the release is in the signature log. The only method that returns a secret, and it returns each once |
+| `ticket_stop` | `session` | no more offers, locks or releases; answers the hashes to ask the seller to cancel |
+| `ticket_status` | `session?` | the book after a reconcile with the node, and whether the node's HTLCs are the book's |
+
+policy.json `tickets` (all optional but `enabled` and one task): `enabled` (false), `max_ticket_sats`
+(1000), `max_ticket_blocks` (40), `max_htlc_blocks` (204: the `cltv_limit` of a ticket's route),
+`max_invoice_expiry_s` (3600), `max_locked_sats` (16000) and `max_locked_tickets` (64): the exposure cap;
+`seller_max_tickets` (8) and `seller_max_locked_sats` (8000): one named seller; `max_sellers` (32),
+`max_new_sellers_per_min` (30), `max_sends_per_hour` (1200); and `tasks`, by name (`a-z`, `0-9`, `-`,
+`_`): `budget_sats` (required), `window_s` (86400, at most a week), `max_locked_sats`,
+`max_locked_tickets`, `max_sellers` (each the rail's by default), `admit` (`"listed"`, the default: only
+sellers the owner named; `"any"`: any seller inside the caps that follow), `unlisted_max_tickets` (2),
+`unlisted_max_locked_sats` (two tickets), `unlisted_max_spend_sats` (four tickets, in the task's
+window). The owner names a seller with `ln:<node id>` on the allowlist, or with an allowlisted origin
+whose `counterparties` entry has `ln_node`. The wallet's own rules (the daily and weekly budgets, the
+per-counterparty cap, velocity, the split window) apply to every release; a ticket that would reach
+the human threshold is refused when the session opens.
+
+What is booked, and when:
+
+- **Locked** tickets are counted against the exposure caps and booked nowhere. Nothing is locked that
+  the budgets could not release.
+- **A release** books the ticket and its routing-fee limit in the ledger (`ticket:<payment hash>`,
+  memo `ticket task=<task>`) before the secret is returned. When the node shows the payment settled,
+  with the preimage, the row becomes the ticket plus the fee the node paid; when it shows it failed
+  with no HTLC out (the seller cancelled, or the ticket expired), the row goes.
+- **At every start** each ticket the book holds locked is retired: booked as if released, never
+  released by this process, until the node shows it settled or failed; sessions are stopped. A start
+  cannot be told from a restore of an older book, in which such a ticket may have been released.
+- **After a restore** the node's payment list is read from the book's cursor. A payment that carries
+  this wallet's tag (custom record 1953063787: a nonce and a MAC under the ticket seed) and is not in
+  the book is retired the same way. Nothing is locked or released until that list has been read to its
+  end once (`ticket_sync`).
+- A ticket that settles without a release by this book, or that the node reports settled without the
+  preimage, halts Lightning payments as the rail's own halts do (`ln_halted`, resumed by the human).
+
+Files: `.run/tickets.jsonl` (the book: an append-only log of whole sessions and tickets, compacted
+when it has doubled), `.run/ticket_seed.json` (32 bytes, sealed by the wallet's keystore; a secret is
+`HMAC-SHA256(seed, "xbt/ticket/secret/v0" || nonce)` and is never stored). A wallet that never opens a
+ticket session has neither. `scripts/ticket_book_regtest.sh` runs all of this through the release
+binaries against Lightning Fork nodes; `tests/ticket_book.rs` against a fake node, with a kill at every
+write step of a release, a lock, a settle and a start. `docs/LIMITS.md` states what the book does not do.
+
 ## Budget integrity and privileged methods (AGP-063)
 
 Every signature that raises the signed amount is booked as the signed delta (`xbt402:<chan>:<cum>`)

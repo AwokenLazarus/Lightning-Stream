@@ -2536,6 +2536,7 @@ dependencies = [
  "ed25519-dalek",
  "getrandom 0.2.17",
  "hex",
+ "hmac",
  "indexmap 2.14.2",
  "rustls",
  "scrypt",

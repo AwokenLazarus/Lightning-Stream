@@ -16,6 +16,8 @@
 //! * [`session`]: `xbt402_pay` inside the signer (open, minConf wait, paid calls, close).
 //! * [`bolt11`], [`ln`]: `rail=ln` (AGP-048): XBT Lightning invoices paid through an LND node under the
 //!   same policy, with the chain-identity, bit-512, taproot and pre-split guards.
+//! * [`ticket`], [`ticket_rail`]: stream tickets, the buyer's book (`docs/TICKETS.md`): secrets derived from a
+//!   sealed seed, many payments locked at once through the same LND node, booked before a secret leaves.
 //! * [`signer`]: the request handler and the watcher; [`server`]: the socket.
 //! * [`admin`]: the web UI's methods (AGP-039): the approval queue, human-signed policy changes, key
 //!   enrolment and rotation, backups.
@@ -44,6 +46,8 @@ pub mod server;
 pub mod session;
 pub mod signer;
 pub mod sigaudit;
+pub mod ticket;
+pub mod ticket_rail;
 
 pub use xbt402::{ChannelError as Error, Result};
 

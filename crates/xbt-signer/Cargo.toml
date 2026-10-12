@@ -11,6 +11,8 @@ publish.workspace = true
 xbt-primitives.workspace = true
 xbt402 = { workspace = true, features = ["http-client"] }
 sha2.workspace = true
+# stream tickets: a ticket's secret and tag are HMAC-SHA256 of the sealed seed (already in the tree through xbt402)
+hmac.workspace = true
 hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true

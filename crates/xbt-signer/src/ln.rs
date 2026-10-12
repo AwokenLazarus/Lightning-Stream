@@ -244,6 +244,22 @@ pub struct OfferPayRequest {
     pub timeout_s: i64,
 }
 
+/// A stream ticket's payment ([`crate::ticket_rail`]): a hold invoice the node locks and does not
+/// see settle until the buyer releases the secret.
+#[derive(Debug, Clone)]
+pub struct HeldSend {
+    pub invoice: String,
+    /// Never 0: the node reads 0 as its own default limit.
+    pub fee_limit_msat: u64,
+    /// How long the node may look for a route.
+    pub timeout_s: i64,
+    pub cltv_limit: i64,
+    /// The only channels the payment may leave through (never empty).
+    pub outgoing_chan_ids: Vec<String>,
+    /// The wallet's tag for the payment's last hop ([`crate::ticket::TAG_RECORD`]).
+    pub tag: Vec<u8>,
+}
+
 /// The LN node, as LND's REST API shapes its answers (uint64 fields may be strings).
 pub trait LnBackend: Send + Sync {
     /// `GET /v1/getinfo`.
@@ -262,6 +278,18 @@ pub trait LnBackend: Send + Sync {
     fn lookup(&self, payment_hash: &str) -> Result<Option<Value>>;
     /// `GET /v1/utxos`: the node's on-chain coins.
     fn utxos(&self) -> Result<Vec<Value>>;
+    /// Stream tickets, `POST /v2/router/send` for a hold invoice: the `Payment` as soon as it is
+    /// locked (IN_FLIGHT with an HTLC out) or over (FAILED, SUCCEEDED). The payment goes on in the
+    /// node after this returns; an error means its fate is not known ([`Self::lookup`] then says).
+    fn send_held(&self, _req: &HeldSend) -> Result<Value> {
+        Err(err("ln_backend", "this backend does not send held payments"))
+    }
+    /// Stream tickets, `GET /v1/payments` (`offchain:read`): the node's payments with a payment
+    /// index above `after`, in index order, at most `max`, those not complete included. An error
+    /// when the node cannot answer: never an empty list in place of one it could not give.
+    fn payments_after(&self, _after: u64, _max: u64) -> Result<Vec<Value>> {
+        Err(err("ln_backend", "this backend does not list payments"))
+    }
     /// AGP-082, `POST /v2/offers/fetchinvoice` (`offchain:read`): the node asks the offer's issuer for an
     /// invoice of `amount_msat` (0: the offer's own amount) and answers `{bolt12, invoice, offer_id}`.
     /// Nothing is paid.
@@ -558,6 +586,40 @@ impl LnBackend for LndRest {
 
     fn utxos(&self) -> Result<Vec<Value>> {
         Ok(self.get("/v1/utxos?min_confs=0&max_confs=2147483647")?.get("utxos").and_then(Value::as_array).cloned().unwrap_or_default())
+    }
+
+    fn send_held(&self, r: &HeldSend) -> Result<Value> {
+        let mut records = Map::new();
+        records.insert(crate::ticket::TAG_RECORD.to_string(), B64.encode(&r.tag).into());
+        // one part: a ticket takes one HTLC slot on every channel of its route
+        let body = json!({"payment_request": r.invoice, "timeout_seconds": r.timeout_s.max(1), "fee_limit_msat": r.fee_limit_msat.max(1).to_string(),
+                          "cltv_limit": r.cltv_limit, "outgoing_chan_ids": r.outgoing_chan_ids, "no_inflight_updates": false,
+                          "allow_self_payment": false, "amp": false, "max_parts": 1, "dest_custom_records": records});
+        let resp = self.req("POST", "/v2/router/send").timeout(Duration::from_secs(r.timeout_s.max(1) as u64 + 30))
+            .set("Content-Type", "application/json").send_string(&body.to_string());
+        let resp = match Self::sent(resp)? {
+            Ok(x) => x,
+            Err(e) => return Self::answer(Err(e)),
+        };
+        // a stream of {"result": Payment} / {"error": ...} lines: the first that shows the payment locked or over
+        for line in BufReader::new(resp.into_reader().take(8 << 20)).lines() {
+            let line = line.map_err(|e| err("ln_send", format!("the LN node's payment stream broke: {e}")))?;
+            let Ok(v) = serde_json::from_str::<Value>(line.trim()) else { continue };
+            if let Some(e) = v.get("error").filter(|e| !e.is_null()) {
+                return Err(err("ln_send", str_or_empty(e.get("message")).chars().take(300).collect::<String>()));
+            }
+            let p = v.get("result").cloned().unwrap_or(v);
+            let st = str_or_empty(p.get("status"));
+            if st == "SUCCEEDED" || st == "FAILED" || (st == "IN_FLIGHT" && htlcs_in_flight(&p)) {
+                return Ok(p);
+            }
+        }
+        Err(err("ln_send", "the LN node's payment stream ended before the payment was locked"))
+    }
+
+    fn payments_after(&self, after: u64, max: u64) -> Result<Vec<Value>> {
+        let v = self.get(&format!("/v1/payments?include_incomplete=true&index_offset={after}&max_payments={}", max.max(1)))?;
+        v.get("payments").and_then(Value::as_array).cloned().ok_or_else(|| err("ln_backend", "ListPayments: the answer has no payments list"))
     }
 
     fn fetch_invoice(&self, offer: &str, amount_msat: u64, timeout_s: i64) -> Result<Value> {
@@ -1329,8 +1391,10 @@ impl Signer {
         // HTLCs the node has out that the wallet never booked hold funds until their CLTV expiry: they
         // count against what is left of the budgets
         let book = self.ln_book.all();
+        // a ticket's HTLC is the wallet's own: its book counts it against the exposure cap
+        let tickets = self.ticket_hashes();
         let locks = htlc_locks(&chans, &|h: &str| {
-            book.get(h).and_then(|r| r.get("state")).and_then(Value::as_str).is_some_and(|s| s == "sending" || s == "settled")
+            tickets.contains(h) || book.get(h).and_then(|r| r.get("state")).and_then(Value::as_str).is_some_and(|s| s == "sending" || s == "settled")
         });
         let room = d.residual_daily_sats.min(d.residual_weekly_sats);
         if locks.unbooked_sats > 0 && total.saturating_add(locks.unbooked_sats) > room {
@@ -1614,7 +1678,7 @@ impl Signer {
 
     /// AGP-066 (review L4): stop every LN payment until the human resumes the rail with a signed approval
     /// of the request this puts in their queue (`approve`, kind `ln_resume`).
-    fn ln_halt(&self, hash: &str, dest: &str, booked: i64, why: &str) {
+    pub(crate) fn ln_halt(&self, hash: &str, dest: &str, booked: i64, why: &str) {
         let now = self.engine.now();
         let rec = json!({"halt_id": crate::policy::token_urlsafe(), "reason": why, "payment_hash": hash, "dest": dest, "booked_sats": booked,
                          "ts": ts_value(now)});
@@ -1738,8 +1802,10 @@ impl Signer {
         let (towers, tower_refusal, mut warnings) = self.ln_towers(&*ln, &pol);
         let (mac, mac_refusal) = self.ln_macaroon(&*ln);
         let book = self.ln_book.all();
+        // a ticket's HTLC is the wallet's own: its book counts it against the exposure cap
+        let tickets = self.ticket_hashes();
         let locks = htlc_locks(&chans, &|h: &str| {
-            book.get(h).and_then(|r| r.get("state")).and_then(Value::as_str).is_some_and(|s| s == "sending" || s == "settled")
+            tickets.contains(h) || book.get(h).and_then(|r| r.get("state")).and_then(Value::as_str).is_some_and(|s| s == "sending" || s == "settled")
         });
         let in_flight: Vec<Value> = self.ln_book.in_flight().into_iter().map(|(h, r)| {
             let until = py_int(r.get("cltv_until")).unwrap_or(0);
