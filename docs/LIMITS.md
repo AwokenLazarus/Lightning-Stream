@@ -77,6 +77,63 @@ node apart, default node settings. None comes from a wallet or a seller built on
 - Every hop sees the same hash, so hops that collude can link a ticket along its route, and a
   ticket cannot be partly released.
 
+### Lottery tickets (in design)
+
+Nothing in this section is shipped code, and no script in this tree reproduces its numbers. A
+lottery ticket pays for a piece worth less than a ticket by a fair roll: a piece wins a payment
+of one fixed size (64 sat in the examples) with probability price ÷ that size, so the average
+paid is the price. There are two forms. In **pay after a win** nothing is locked ahead and the
+buyer pays an ordinary invoice for each win. In **the win that pays itself** the buyer locks one
+ticket with the seller and each roll gives the seller a small chance of obtaining its secret.
+Each sentence below comes from the design's measurements: Lightning Fork nodes on regtest (five
+for pay after a win, three for the win that pays itself), one routing node between buyer and
+seller, one host; up to 200 sellers were sessions spread over three seller nodes. A sentence
+marked *(simulated)* involved no node.
+
+- Income is uneven. A seller earning 4,096 sat in a day with 64-sat wins is paid 80% to 120% of
+  it nine days in ten, and 96% to 104% over a month; a seller earning 1,000 sat a day, 58% to
+  141% on a day and 92% to 108% over a month; a seller earning 100 sat a day gets no win on 21%
+  of days. *(simulated)*
+- A smaller win is steadier and costs more in fees: a routing node charged 1 sat for each win,
+  which is 6.25% of a 16-sat win, 1.6% of 64, 0.4% of 250 and 0.1% of 1,000, per hop, at the
+  forks' default policy.
+- A buyer's cost is uneven. A download priced at 1,638 sat (16,384 pieces at 0.1 sat, 64-sat
+  wins) costs 1,152 to 2,176 sat nine times in ten, and its owner must allow 2,795 sat, fees
+  included, for it to stall on an unlucky run no more than once in a thousand. *(simulated)*
+- In pay after a win the seller goes first by about one win's worth. A buyer that does not pay
+  is served one win's worth on average before the seller sees an unpaid win and stops, and about
+  three times that one time in twenty. *(simulated)* Where a seller earns less than one win from
+  a buyer, a buyer that never pays gets everything free. Nothing in the design makes that buyer
+  pay; it is a way for buyers who mean to pay to do so, not enforcement.
+- A seller a buyer touches only briefly cannot be forced to be paid: the win that pays itself
+  needs a ticket locked with that seller first, which is too much for a few pieces, so such
+  sellers are paid after a win.
+- The win that pays itself is not reviewed and not built. It rests on an argument of this
+  project's own (that a cheating buyer fails the seller's check on at least half of its rolls;
+  measured at 49.9% to 50.2% over 200,000 rolls) that no cryptographer has reviewed. It will not
+  be built before such a review.
+- On hash locks the win that pays itself also needs one proof per locked ticket that the hash
+  and the rolls hide the same secret. The one measured (254 ms to make, 1.35 ms to check, 192
+  bytes, one host) needs a setup that must not be trusted to one party; a proof without one was
+  not measured, and nothing was measured on a small board. Point locks would remove the proof;
+  neither XBT Lightning fork has them.
+- The prototype of the win that pays itself uses the simple form of one building block (the
+  extension of oblivious transfers), which is safe only against a seller that follows the
+  protocol; a product needs the hardened form, which was not built or measured.
+- The win that pays itself holds one ticket and one channel slot per seller, with every limit of
+  a ticket above. A locked ticket below the channel's dust limit (354 sat on the lab) cannot be
+  claimed on chain, so a win is lost if the seller's own channel peer stays away until the
+  ticket expires (reasoned, not run).
+- The fairness of the roll treats SHA-256 as a random function. Nobody outside the project has
+  reviewed that argument either.
+- A win is not proof to a third party, in either form.
+- Sellers cannot pool wins as miners pool blocks: a piece served is not proof of work, so a
+  seller and a buyer it controls can invent pieces at no cost. *(simulated)* The protocol has no
+  pool.
+- One hop was measured, on one host, with requests as calls inside one program. Separate seller
+  machines, two or more hops, real network latency, requests over HTTP, mainnet fees and a
+  buyer that does not pay, on real nodes, were not.
+
 ### Channel and transport (library client) (frozen)
 
 The on-chain one-way channel. Frozen: these limits stand as written and get no new work.

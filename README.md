@@ -3,6 +3,11 @@
 Pay for a service piece by piece, as it arrives, over XBT (Bitcoin on BLAKE2b proof of work).
 Stop at any moment and nothing more is owed.
 
+The aim: people who run Lightning nodes connect any service they want to offer to the network
+(a file or media server, AI compute, storage, software of their own) and anyone pays them piece
+by piece. That can be one buyer and one seller, as with a streamed film, or many sellers at
+once, as in a torrent swarm or people lending hardware for AI.
+
 **Lightning Stream is a streaming upgrade to Lightning.** It is built on ordinary XBT Lightning
 channels, not beside them, and adds one thing: the **stream ticket**. A ticket is a small
 Lightning payment that is locked along the route but not yet released. The buyer picks a secret
@@ -73,6 +78,26 @@ before releasing its ticket.
 
 A seller will need a Lightning node with inbound capacity, and a buyer a Lightning node with a
 channel. `docs/LIMITS.md`, section "Stream tickets (in design)", states what the design gives up.
+
+### Lottery tickets (in design)
+
+Some pieces are worth less than the smallest payment worth sending: a routing node charges about
+1 sat to carry any payment, and a piece of a shared file may be worth a tenth of a sat. For those,
+buyer and seller roll a fair die for every piece. Most rolls pay nothing, a win pays a
+normal-sized amount, and the odds are set so that the average is the exact price: at a tenth of
+a sat a piece and a win of 64 sat, 1 roll in 640 wins. Neither side can steer a roll, because the
+seller fixes its half before the session and the buyer sends its half after the piece arrived.
+Income and cost are uneven in the short run and exact in the long run, as a miner's income is.
+
+There are two forms. In the first the buyer pays an ordinary invoice after a win: it is simple,
+nothing is locked ahead, and a buyer that does not pay gets about one win's worth of service
+free before the seller stops. In the second a win pays itself: the buyer locks one ticket with
+the seller, each roll gives the seller a small chance of drawing its secret, and the buyer
+cannot refuse. **Both forms are designed and were measured on a regtest lab. Neither is built
+into the wallet or a seller.** The second rests on an argument that no cryptographer has
+reviewed, and it will not be built until one has. `docs/LIMITS.md`, section "Lottery tickets
+(in design)", states the limits; `docs/TICKETS.md` reserves a place for it on the wire and does
+not specify it.
 
 ## What was retired
 

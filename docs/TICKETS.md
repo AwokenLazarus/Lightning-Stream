@@ -235,3 +235,20 @@ channel.
 - A hop that has gone, and real network latency, were not run. Fees are the forks' defaults, not
   what XBT's nodes charge.
 - A fee for a held payment does not exist on this network. If one is adopted, tickets pay it.
+
+## 9. Reserved: lottery
+
+Not specified here, and nothing implements it. A request priced below one ticket is to be paid
+by a fair roll that wins a payment of one fixed size with probability price ÷ that size
+(`docs/LIMITS.md`, "Lottery tickets (in design)"). This draft leaves room for it and no more:
+
+- A seller will offer it as a further entry of `accepts`, with a scheme name of its own, beside
+  `ticket`. A `ticket/0` client that does not know the entry skips it.
+- Its terms will carry the size of a win and, with `amount`, the odds, so that the buyer's
+  owner can cap both before anything is paid.
+- Its requests will carry the buyer's part of the draw, and its responses the seller's part and
+  any win. The buyer's wallet checks every win itself before it pays one.
+- Where a win is paid from a locked ticket, that ticket is locked and cancelled as in sections 2
+  and 4.
+
+Field names, the draw and its checks are left to a later draft.
