@@ -161,8 +161,9 @@ Nothing in a stream ticket is a new mechanism. Each line names whose it is;
 - **The held payments tickets rely on** are what the channel-jamming defences proposed for
   Lightning (unconditional fees, hold fees, endorsement) are meant to price or limit.
 
-An external review of the earlier design (October 2026) is why this is built on Lightning. The
-reviewer is not named in this tree.
+Chris Guida's external review of the earlier design (October 2026) is why this is built on
+Lightning: he found what we had missed, and said the hub was rebuilding Lightning beside it. The
+credit for that is his; the mistakes that remain are ours.
 
 ## What is in the tree
 
