@@ -188,10 +188,10 @@ def accept() -> None:
         and all(p.status == "IN_FLIGHT" and not int(p.preimage or "0", 16) for p in before),
         {"seller": lab.tally_states(states), "buyer": lab.tally(before), "htlcs_on_hop": lab.pending_htlcs(HOP), "lock_s": round(secs, 3)},
     )
-    wrong = lab.post(SELLER, "/v2/invoices/settle", {"preimage": lab.b64(os.urandom(32))})
+    wrong = lab.ask(SELLER, "POST", "/v2/invoices/settle", {"preimage": lab.b64(os.urandom(32))})
     check("accept: the seller's node refuses to settle with a secret that is not a ticket's", "message" in wrong, wrong.get("message"))
     unpaid = lab.issue(SELLER, [os.urandom(32)])[0]
-    early = lab.settle(SELLER, unpaid)
+    early = lab.ask(SELLER, "POST", "/v2/invoices/settle", {"preimage": lab.b64(unpaid.secret)})
     check(
         "accept: a ticket that is not locked (OPEN) cannot be settled",
         "message" in early and lab.state(SELLER, unpaid) == "OPEN",
@@ -386,7 +386,7 @@ def latency() -> None:
         time.sleep(0.05)  # the buyer's node is being watched before the request "arrives"
         t0 = time.perf_counter()
         # a request arrives with a secret: the seller hashes it and asks its node for that ticket
-        looked = lab.get(SELLER, "/v2/invoices/lookup?payment_hash=" + lab.url64(hashlib.sha256(t.secret).digest())).get("state")
+        looked = lab.get(SELLER, "/v2/invoices/lookup?payment_hash=" + lab.url64(hashlib.sha256(t.secret).digest()))["state"]
         t1 = time.perf_counter()
         lab.settle(SELLER, t)
         t2 = time.perf_counter()
@@ -432,13 +432,15 @@ def macaroons() -> None:
     address = lab.wallet("getnewaddress")
     invoice = lab.issue(HOP, [os.urandom(32)])[0]
     seller_tries = {
-        "send coins": lab.post(SELLER, "/v1/transactions", {"addr": address, "amount": "1000"}, seller_mac),
+        "send coins": lab.ask(SELLER, "POST", "/v1/transactions", {"addr": address, "amount": "1000"}, seller_mac),
         "pay an invoice": lab.stream(
             SELLER, "POST", "/v2/router/send", {"payment_request": invoice.invoice, "timeout_seconds": 5}, lambda u: True, seller_mac
         ),
-        "open a channel": lab.post(SELLER, "/v1/channels", {"node_pubkey_string": lab.pubkey(BUYER), "local_funding_amount": "100000"}, seller_mac),
-        "read the on-chain balance": lab.get(SELLER, "/v1/balance/blockchain", seller_mac),
-        "bake a macaroon": lab.post(SELLER, "/v1/macaroon", {"permissions": [{"entity": "onchain", "action": "write"}]}, seller_mac),
+        "open a channel": lab.ask(
+            SELLER, "POST", "/v1/channels", {"node_pubkey_string": lab.pubkey(BUYER), "local_funding_amount": "100000"}, seller_mac
+        ),
+        "read the on-chain balance": lab.ask(SELLER, "GET", "/v1/balance/blockchain", None, seller_mac),
+        "bake a macaroon": lab.ask(SELLER, "POST", "/v1/macaroon", {"permissions": [{"entity": "onchain", "action": "write"}]}, seller_mac),
     }
     check(
         "macaroons: the seller's macaroon cannot send coins, pay, open a channel, read the wallet or bake a macaroon",
@@ -446,9 +448,9 @@ def macaroons() -> None:
         {k: r.get("message", r) for k, r in seller_tries.items()},
     )
     buyer_tries = {
-        "send coins": lab.post(BUYER, "/v1/transactions", {"addr": address, "amount": "1000"}, buyer_mac),
-        "make a hold invoice": lab.post(BUYER, "/v2/invoices/hodl", {"hash": lab.b64(os.urandom(32)), "value_msat": "1000"}, buyer_mac),
-        "bake a macaroon": lab.post(BUYER, "/v1/macaroon", {"permissions": [{"entity": "onchain", "action": "write"}]}, buyer_mac),
+        "send coins": lab.ask(BUYER, "POST", "/v1/transactions", {"addr": address, "amount": "1000"}, buyer_mac),
+        "make a hold invoice": lab.ask(BUYER, "POST", "/v2/invoices/hodl", {"hash": lab.b64(os.urandom(32)), "value_msat": "1000"}, buyer_mac),
+        "bake a macaroon": lab.ask(BUYER, "POST", "/v1/macaroon", {"permissions": [{"entity": "onchain", "action": "write"}]}, buyer_mac),
     }
     check(
         "macaroons: the buyer's macaroon cannot send coins on chain, make invoices or bake a macaroon",
@@ -635,7 +637,7 @@ def on_chain(secrets: list[str], block_height: int) -> list[str]:
 
 def closing(node: str, point: str, kind: str) -> list[dict[str, Any]]:
     """`node`'s pending-close entries of `kind` for the channel whose funding outpoint is `point`."""
-    return [c for c in lab.pending_channels(node).get(kind, []) if c["channel"]["channel_point"] == point]
+    return [c for c in lab.pending_channels(node)[kind] if c["channel"]["channel_point"] == point]
 
 
 def close_heights(node: str, point: str, until: Callable[[int], bool], limit: int) -> dict[str, int]:
@@ -659,8 +661,7 @@ def swept(nodes: tuple[str, ...]) -> None:
 
     def busy() -> bool:
         return any(
-            int(lab.pending_channels(n).get("total_limbo_balance", "0")) > 0 or lab.pending_channels(n).get("pending_force_closing_channels")
-            for n in nodes
+            int(lab.pending_channels(n)["total_limbo_balance"]) > 0 or lab.pending_channels(n)["pending_force_closing_channels"] for n in nodes
         )
 
     for _ in range(50):

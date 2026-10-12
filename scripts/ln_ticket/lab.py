@@ -36,8 +36,8 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any
 
-LAB = os.environ.get("LAB", "")
-RUN = os.environ.get("RUN", "")
+LAB = os.environ["LAB"]
+RUN = os.environ["RUN"]
 NODES = ("lf1", "lf2", "lf3", "lf4")
 PORT = {n: int(os.environ.get(f"LN_TICKET_PORT_{n.upper()}", 17790 + i)) for i, n in enumerate(NODES, start=1)}
 MACAROON_PATH = "/root/.lnd/data/chain/bitcoin/regtest/admin.macaroon"
@@ -134,8 +134,8 @@ def _kept(node: str) -> tuple[http.client.HTTPSConnection, bool]:
     return _local.conns[node], fresh
 
 
-def rest(node: str, method: str, path: str, body: dict[str, Any] | None = None, macaroon: str | None = None) -> dict[str, Any]:
-    """One REST call on a kept-open connection. lnd's errors come back as {"code", "message"}.
+def ask(node: str, method: str, path: str, body: dict[str, Any] | None = None, macaroon: str | None = None) -> dict[str, Any]:
+    """One REST call on a kept-open connection; the node's answer, which for a refusal is {"code", "message"}.
     A kept connection the node has closed is opened again once; a new one that fails is an error."""
     data = None if body is None else json.dumps(body)
     headers = {"Grpc-Metadata-macaroon": macaroon or _admin[node]}
@@ -153,12 +153,20 @@ def rest(node: str, method: str, path: str, body: dict[str, Any] | None = None, 
     raise LabError(f"{node} {method} {path}: the connection failed twice")
 
 
+def answer(node: str, method: str, path: str, body: dict[str, Any] | None, macaroon: str | None) -> dict[str, Any]:
+    """`ask`, for a call that must succeed: a refusal is an error here, never an empty result."""
+    reply = ask(node, method, path, body, macaroon)
+    if "code" in reply and "message" in reply:
+        raise LabError(f"{node} {method} {path.split('?')[0]}: {reply['message']}")
+    return reply
+
+
 def get(node: str, path: str, macaroon: str | None = None) -> dict[str, Any]:
-    return rest(node, "GET", path, None, macaroon)
+    return answer(node, "GET", path, None, macaroon)
 
 
 def post(node: str, path: str, body: dict[str, Any], macaroon: str | None = None) -> dict[str, Any]:
-    return rest(node, "POST", path, body, macaroon)
+    return answer(node, "POST", path, body, macaroon)
 
 
 def stream(
@@ -230,7 +238,7 @@ def mine(blocks: int, nodes: Iterable[str]) -> int:
 
 
 def channels(node: str) -> list[dict[str, Any]]:
-    return get(node, "/v1/channels").get("channels", [])
+    return get(node, "/v1/channels")["channels"]
 
 
 def channel(node: str, peer: str) -> dict[str, Any]:
@@ -243,7 +251,7 @@ def channel(node: str, peer: str) -> dict[str, Any]:
 
 
 def pending_htlcs(node: str) -> int:
-    return sum(len(c.get("pending_htlcs", [])) for c in channels(node))
+    return sum(len(c["pending_htlcs"]) for c in channels(node))
 
 
 def wallet_sat(node: str) -> int:
@@ -266,7 +274,7 @@ def open_channel(opener: str, peer: str, sats: int, push: int) -> None:
     pk = pubkey(peer)
     # unchecked: "already connected" is as good as connected, and the wait below fails if neither holds
     dc("exec", "-T", opener, "lncli", "--network=regtest", "--rpcserver=127.0.0.1:10009", "connect", f"{pk}@{peer}:9735", check=False)
-    wait(f"{opener} connected to {peer}", 30, lambda: any(p["pub_key"] == pk for p in get(opener, "/v1/peers").get("peers", [])))
+    wait(f"{opener} connected to {peer}", 30, lambda: any(p["pub_key"] == pk for p in get(opener, "/v1/peers")["peers"]))
     lncli(opener, "openchannel", f"--node_key={pk}", f"--local_amt={sats}", f"--push_amt={push}")
 
 
@@ -308,15 +316,8 @@ def issue(seller: str, secrets: list[bytes], msat: int = 1_000_000, cltv: int = 
     `life_s` is how long the invoice may wait to be paid."""
 
     def one(secret: bytes) -> Ticket:
-        j = post(
-            seller,
-            "/v2/invoices/hodl",
-            {"hash": b64(hashlib.sha256(secret).digest()), "value_msat": str(msat), "cltv_expiry": str(cltv), "expiry": str(life_s)},
-            macaroon,
-        )
-        if "payment_request" not in j:
-            raise LabError(f"{seller} refused a hold invoice: {j}")
-        return Ticket(secret, j["payment_request"])
+        body = {"hash": b64(hashlib.sha256(secret).digest()), "value_msat": str(msat), "cltv_expiry": str(cltv), "expiry": str(life_s)}
+        return Ticket(secret, post(seller, "/v2/invoices/hodl", body, macaroon)["payment_request"])
 
     return list(POOL.map(one, secrets))
 
@@ -341,7 +342,7 @@ def pay(buyer: str, tickets: list[Ticket], macaroon: str | None = None, timeout_
 
 
 def state(seller: str, ticket: Ticket, macaroon: str | None = None) -> str:
-    return get(seller, "/v2/invoices/lookup?payment_hash=" + url64(ticket.hash), macaroon).get("state", "NONE")
+    return get(seller, "/v2/invoices/lookup?payment_hash=" + url64(ticket.hash), macaroon)["state"]
 
 
 def invoice(seller: str, ticket: Ticket) -> dict[str, Any]:
@@ -351,7 +352,7 @@ def invoice(seller: str, ticket: Ticket) -> dict[str, Any]:
 def accepted(seller: str, tickets: list[Ticket], macaroon: str | None = None) -> int:
     """How many of `tickets` the seller's node holds as ACCEPTED (one listing call)."""
     ours = {b64(t.hash) for t in tickets}
-    listing = get(seller, "/v1/invoices?pending_only=true&num_max_invoices=5000", macaroon).get("invoices", [])
+    listing = get(seller, "/v1/invoices?pending_only=true&num_max_invoices=5000", macaroon)["invoices"]
     return sum(1 for i in listing if i["state"] == "ACCEPTED" and i["r_hash"] in ours)
 
 
