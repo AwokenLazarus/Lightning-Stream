@@ -65,6 +65,8 @@ Stream tickets, in this order: the ticket book in the wallet's signer (secrets d
 signer, many tickets in flight, each booked when it is locked and when its secret leaves); the
 seller component beside a Lightning node (registers the buyer's hashes, serves on a good secret,
 settles on use, cancels what is left); and the HTTP 402 entry that offers tickets to a buyer.
+The wire is written down as a draft in [`docs/TICKETS.md`](docs/TICKETS.md), and
+`scripts/ln_ticket_regtest.sh` reproduces its measurements on four Lightning Fork nodes (31 checks).
 Defaults in the design: 1,000-sat tickets, 8 in flight, a life of about 40 blocks. The buyer goes
 first and can lose at most one ticket; for content that can be checked, the buyer checks a piece
 before releasing its ticket.
