@@ -46,8 +46,14 @@ Whitepaper: **<https://lazarus-xbt.xyz/stream/>**
   never holds a key. The owner sets a signed policy: budgets, per-seller caps, an allowlist, a
   threshold above which a human approves. Every signature goes into a tamper-evident log.
 - **The Lightning rail.** The wallet pays XBT Lightning invoices (BOLT 11) and offers (BOLT 12)
-  through the owner's Lightning node, under the same policy. This rail is what tickets will be
+  through the owner's Lightning node, under the same policy. This rail is what tickets are
   built on.
+- **The ticket book in the wallet's signer.** The buyer's side of stream tickets: secrets derived
+  in the signer from a sealed seed, many tickets locked at once through the owner's node, each
+  release written to disk as spent before its secret leaves, under an owner's policy with a
+  budget for each task, an exposure cap, and small caps for sellers the owner has not named.
+  `scripts/ticket_book_regtest.sh` runs it against Lightning Fork nodes on regtest. It is reached
+  through the signer's socket; paying an HTTP request with it is not built yet.
 - **The on-chain one-way channel (frozen).** A direct channel anchored on the chain, for paying
   one seller piece by piece: the buyer signs a slightly larger running total for each piece and
   the seller settles once. It is kept in the tree and tested, off the main path, with no new
@@ -61,8 +67,7 @@ Whitepaper: **<https://lazarus-xbt.xyz/stream/>**
 
 ## What is being built
 
-Stream tickets, in this order: the ticket book in the wallet's signer (secrets derived in the
-signer, many tickets in flight, each booked when it is locked and when its secret leaves); the
+Stream tickets, in this order: the ticket book in the wallet's signer (built, above); the
 seller component beside a Lightning node (registers the buyer's hashes, serves on a good secret,
 settles on use, cancels what is left); and the HTTP 402 entry that offers tickets to a buyer.
 The wire is written down as a draft in [`docs/TICKETS.md`](docs/TICKETS.md), and
@@ -72,7 +77,9 @@ first and can lose at most one ticket; for content that can be checked, the buye
 before releasing its ticket.
 
 A seller will need a Lightning node with inbound capacity, and a buyer a Lightning node with a
-channel. `docs/LIMITS.md`, section "Stream tickets (in design)", states what the design gives up.
+channel. `docs/LIMITS.md` states what the design gives up (section "Stream tickets (the design's
+measurements)") and what the ticket book does not do (section "Stream tickets: the wallet's
+ticket book").
 
 ## What was retired
 
