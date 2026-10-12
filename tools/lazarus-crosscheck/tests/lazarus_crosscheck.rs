@@ -1,5 +1,5 @@
 //! Cross-check of xbt-primitives' header/PoW code against the pool's own Rust, `lazarus-protocol`
-//! (~/Bitcoin/lazarus/protocol, a read-only path dev-dependency of this standalone crate, outside the
+//! (`lazarus/protocol` in <https://github.com/AwokenLazarus/Bitcoin>, MIT; a read-only path dev-dependency of this standalone crate, outside the
 //! workspace so a clean checkout never needs it). lazarus-protocol implements the
 //! ASIC profile 0 the pool mines; every profile-0 header, random or captured from Knots, must hash
 //! the same, and compact targets and merkle roots must agree.

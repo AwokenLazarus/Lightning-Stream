@@ -1,4 +1,5 @@
-# The header/PoW cross-check against the pool's own Rust (lazarus-protocol, ~/Bitcoin/lazarus/protocol).
+# The header/PoW cross-check against the pool's own Rust (lazarus-protocol: lazarus/protocol in
+# https://github.com/AwokenLazarus/Bitcoin, MIT, expected in a checkout beside this one).
 # A standalone crate, not a workspace member (AGP-035): its path dependency outside this repo would
 # otherwise stop a clean checkout (and every crate that depends on xbt-rs by git) from loading the
 # workspace at all. Run: cargo test -j2 --manifest-path tools/lazarus-crosscheck/Cargo.toml

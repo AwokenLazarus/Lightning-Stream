@@ -24,6 +24,10 @@ yet. The sections below say what exists today, what is being built, and what was
 
 Whitepaper: **<https://lazarus-xbt.xyz/stream/>**
 
+Lightning Stream adds little of its own to a great deal of other people's work. What it is
+built on and what came before it are under [Built on](#built-on) and [Prior art](#prior-art);
+the full list, with a link for each, is [`docs/REFERENCES.md`](docs/REFERENCES.md).
+
 > **Status: test networks only.** Everything here runs on XBT regtest. Do not use it with mainnet
 > funds. It has had an internal security review and one external review, not an independent audit.
 > The external review (October 2026) found critical and high-severity issues in the agent wallet's
@@ -88,12 +92,17 @@ normal-sized amount, and the odds are set so that the average is the exact price
 a sat a piece and a win of 64 sat, 1 roll in 640 wins. Neither side can steer a roll, because the
 seller fixes its half before the session and the buyer sends its half after the piece arrived.
 Income and cost are uneven in the short run and exact in the long run, as a miner's income is.
+Paying by lottery is an old idea and not ours: David Wheeler (1996) and Ronald Rivest (1997).
 
 There are two forms. In the first the buyer pays an ordinary invoice after a win: it is simple,
 nothing is locked ahead, and a buyer that does not pay gets about one win's worth of service
 free before the seller stops. In the second a win pays itself: the buyer locks one ticket with
 the seller, each roll gives the seller a small chance of drawing its secret, and the buyer
-cannot refuse. **Both forms are designed and were measured on a regtest lab. Neither is built
+cannot refuse. The aim of a win that enforces itself over Lightning is Paul Gerhart's, Jay
+Taylor's and Sri Aravinda Krishnan Thyagarajan's ("Probabilistic Atomic Swaps for Bitcoin and
+Friends", [arXiv:2605.04975](https://arxiv.org/abs/2605.04975), May 2026), who set it out and
+built it first; our construction differs from theirs and, unlike theirs, has no formal
+treatment. **Both forms are designed and were measured on a regtest lab. Neither is built
 into the wallet or a seller.** The second rests on an argument that no cryptographer has
 reviewed, and it will not be built until one has. `docs/LIMITS.md`, section "Lottery tickets
 (in design)", states the limits; `docs/TICKETS.md` reserves a place for it on the wire and does
@@ -107,6 +116,53 @@ way for one channel to reach many sellers. Lightning's routing already does that
 that exists, so the hub rebuilt part of Lightning beside it. The external review also found the
 hub the weakest part of the tree. Its code, tests, scripts, vectors and packages are removed;
 they are in the git history, last at commit `a548fb0`.
+
+## Built on
+
+- **Bitcoin Knots**, maintained by Luke Dashjr: XBT's node, and the source of the consensus
+  rules this code follows. The BLAKE2b proof of work is Luke Dashjr's and the unified signature
+  hash (`SIGHASH_UNIFIED`, flag 0x20) is Kyle Santiago's, both released in Knots 29.4.1. The
+  signature-hash and retarget code here are ports of Knots' rules, and some vectors are copied
+  from its tree (`THIRD_PARTY_NOTICES.md`).
+- **Lightning Fork** by Paul Lamb ([paulscode/lightning-fork](https://github.com/paulscode/lightning-fork)),
+  the fork of Lightning Labs' **lnd** that runs on XBT. The wallet's Lightning rail pays through
+  it, and every ticket and lottery number in this tree was measured on it (tag
+  `v0.21.3-beta-blake2b.17`), in the regtest lab the same author publishes
+  ([paulscode/lightning-fork-lab](https://github.com/paulscode/lightning-fork-lab), commit `a5cadc5`).
+  The other XBT Lightning implementation is the **Core Lightning fork** by PrivKey
+  ([privkeyio/lightning](https://github.com/privkeyio/lightning)); we have not tested it.
+- **electrs** by Roman Zeyde, the Electrum server the light chain backend talks to, and
+  **libsecp256k1**, where all signing and verification runs.
+- **x402** (created by Coinbase, kept by the x402 Foundation) for the HTTP 402 wire, and the
+  **Model Context Protocol** (Anthropic; now the Agentic AI Foundation) for the agent's tools.
+- **OCEAN's DATUM and TIDES**, which pay with work is built around.
+- The Rust libraries in `THIRD_PARTY_NOTICES.md`, among them a vendored and patched **ureq**
+  (Martin Algesten and Jacob Hoffman-Andrews).
+
+## Prior art
+
+Nothing in a stream ticket is a new mechanism. Each line names whose it is;
+[`docs/REFERENCES.md`](docs/REFERENCES.md) has the references.
+
+- **The ticket** is a hold invoice (Joost Jager, lnd, 2019) on a hash the buyer chose. Releasing
+  a payment in a second step, by a key the payer holds back, is Hiroki Gondo's "stuckless
+  payments" proposal of 2019, which uses point locks.
+- **The on-chain channel** is Jeremy Spilman's one-way channel of 2013, in the
+  `CHECKLOCKTIMEVERIFY` form BIP 65 describes. **Lightning** is Joseph Poon's and Tadge Dryja's.
+- **The retired hub** used adaptor signatures (Andrew Poelstra's scriptless scripts; ECDSA
+  adaptor signatures after Lloyd Fournier) in the shape of TumbleBit and A2L.
+- **Paying over HTTP 402**: x402, and Lightning Labs' L402, which a seller that settles each
+  ticket on arrival reproduces in ticket-sized units.
+- **A wallet an app may spend from within limits**: Nostr Wallet Connect (NIP-47).
+- **Paying by lottery**: Wheeler and Rivest; Micali and Rivest; Pass and shelat; Orchid and
+  Livepeer on a chain; on Bitcoin, Dryja's 2016 slides and Kurbatov's "Emulating OP_RAND". **A
+  win that enforces itself over Lightning**: Gerhart, Taylor and Thyagarajan, May 2026.
+- **The first-piece credit** for content that can be checked is BitTorrent's optimistic unchoke.
+- **The held payments tickets rely on** are what the channel-jamming defences proposed for
+  Lightning (unconditional fees, hold fees, endorsement) are meant to price or limit.
+
+An external review of the earlier design (October 2026) is why this is built on Lightning. The
+reviewer is not named in this tree.
 
 ## What is in the tree
 
@@ -155,4 +211,5 @@ at your option. Unless you explicitly state otherwise, any contribution intentio
 for inclusion in this work, as defined in the Apache-2.0 license, shall be dual licensed as above,
 without any additional terms or conditions.
 
-Code, data and libraries from others, with their licences: `THIRD_PARTY_NOTICES.md`.
+Code, data and libraries from others, with their licences: `THIRD_PARTY_NOTICES.md`. Ideas,
+designs and prior work: `docs/REFERENCES.md`.

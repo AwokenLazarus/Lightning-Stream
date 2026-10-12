@@ -1,6 +1,8 @@
 //! BLAKE2b block headers (v2, 164 bytes), proof of work, the Knots retarget and a most-work
 //! header chain from a pinned checkpoint. A port of B2 `agentwallet/headers.py` (AGP-024), which
-//! ports electrs' `headerv2.rs`.
+//! ports `headerv2.rs` of this project's own header-v2 patch to electrs 0.11.1 (electrs is Roman
+//! Zeyde's). The difficulty rules are ports of Bitcoin Knots' `src/pow.cpp` (MIT); the BLAKE2b
+//! proof of work is Luke Dashjr's. See `THIRD_PARTY_NOTICES.md`.
 //!
 //! A header is accepted by [`HeaderChain`] only when:
 //! * it is a v2 header (164 bytes, bit 31 of the version set) whose committed height is its height;

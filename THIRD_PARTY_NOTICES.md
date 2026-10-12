@@ -36,21 +36,70 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
+`vectors/unified_sighash_ext.json` (annex and codeseparator cases) is our own selection of
+cases, whose expected hashes were computed by Knots' Python implementation
+(`test/functional/test_framework/script.py`, `UnifiedSignatureHash`) through
+`scripts/gen_unified_sighash_ext.py`. That script imports Knots' test framework from a Knots
+checkout and copies none of it.
+
 `vectors/blake2b_regtest.json` holds block headers captured from a Bitcoin Knots BLAKE2b regtest node
-(v29.4.1.knots20260508rc2): recorded chain data, used to test the header code.
+(v29.4.1.knots20260508rc2), and `vectors/mainnet_headers_961630.json` holds XBT mainnet headers
+961630 to 961700 read from a Knots v29.4.2 node: recorded chain data, used to test the header code.
+
+### Bitcoin Knots: rules and constants ported into the Rust
+
+These files are our own Rust, written to give the same results as Knots' C++ (MIT, the notice
+above). They follow its code closely enough that the credit and the notice belong here:
+
+* `crates/xbt-primitives/src/sighash.rs`: the unified opt-in signature hash (`SIGHASH_UNIFIED`,
+  flag 0x20; 0x21 is `SIGHASH_ALL` with it). The rule is by Kyle Santiago (Knots pull request
+  357, branch `hf-sighash-opt-in`, released in Knots 29.4.1) and is specified in Knots'
+  `doc/unified-sighash.md`. The port came by way of our Python reference (`xbt402/tx.py`).
+* `crates/xbt-primitives/src/header.rs`: the difficulty rules of Knots' `src/pow.cpp`
+  (`GetNextWorkRequired`, `CalculateNextWorkRequired`, `PermittedDifficultyTransition`), the
+  header checks named in that file's comments, and three mainnet constants taken from Knots'
+  chain parameters: the fork height 961,640, the assumed-valid block 964,264 and the minimum
+  chain work. The BLAKE2b proof of work itself is by Luke Dashjr (Knots pull requests 359 and
+  385, released in Knots 29.4.1).
+* `crates/xbt402/src/maturity.rs` and `crates/xbt-primitives/src/script.rs` restate Knots'
+  coinbase-maturity relay rule and the output and push limits of BIP 110 (Dathon Ohm), which
+  Knots enforces on XBT.
 
 ### electrs: BLAKE2b header v2
 
-The BLAKE2b header code (`crates/xbt-primitives/src/header.rs`) was written for this project. It
-follows the header-v2 support we wrote as a patch to electrs (<https://github.com/romanz/electrs>,
-MIT licence, Copyright (C) 2018, Roman Zeyde), by way of our Python reference implementation.
-`crates/xbt-electrum` speaks the Electrum protocol that electrs serves.
+The BLAKE2b header code (`crates/xbt-primitives/src/header.rs`: the 164-byte v2 header and its
+staged hash) was written for this project. It is a port of `headerv2.rs`, a file of our own
+header-v2 patch to electrs 0.11.1 (`patches/electrs-0.11.1-header-v2.patch` in
+<https://github.com/AwokenLazarus/Bitcoin>, MIT), by way of our Python reference implementation.
+electrs itself (<https://github.com/romanz/electrs>, MIT licence, Copyright (C) 2018, Roman
+Zeyde) is not copied here. `crates/xbt-electrum` speaks the Electrum protocol that electrs
+serves.
+
+### ureq (vendored, with one patch)
+
+`vendor/ureq` is the source of ureq 2.12.1 (<https://github.com/algesten/ureq>) as published on
+crates.io, by Martin Algesten and Jacob Hoffman-Andrews, under MIT or Apache-2.0. Its licence
+files are kept beside it (`vendor/ureq/LICENSE-MIT`, Copyright (c) 2019 Martin Algesten;
+`vendor/ureq/LICENSE-APACHE`). It is not ours. We changed three things, each marked in the file
+and listed in `vendor/ureq/XBT-PATCH.md`: `src/chunked/decoder.rs` reports a chunked body cut
+short as an error (nine added lines), `src/lib.rs` gains one constant that marks this copy, and
+`Cargo.toml` drops the example and test targets whose files are not vendored. The workspace uses
+this copy through `[patch.crates-io]`.
 
 ### libsecp256k1
 
 All secp256k1 signing and verification runs in libsecp256k1 (<https://github.com/bitcoin-core/secp256k1>,
 MIT licence, Copyright (c) 2013 Pieter Wuille), which the `secp256k1-sys` crate bundles and builds
 from source.
+
+### Lightning Fork lab: node command lines
+
+`scripts/ln_rail/compose.ln_rail.yml` repeats, for the nodes `lf1` and `lf2`, the node command
+lines of the Lightning Fork regtest lab (<https://github.com/paulscode/lightning-fork-lab>, by
+Paul Lamb, commit `a5cadc5`) and adds flags to them; `scripts/ln_ticket/compose.yml` adds two
+nodes with the same settings. The lab itself is cloned when a regtest script runs and is not in
+this tree. At that commit the lab repository carries no licence file, so no licence covers those
+lines. They are a list of lnd options, kept to what the overlay needs, and are credited here.
 
 ## Rust libraries
 
@@ -190,7 +239,7 @@ scripts/third_party_table.py --check   # exit 1 if it is stale
 ## StartOS package build tools
 
 `packaging/startos/xbt-agent-wallet` is built with Start9's `@start9labs/start-sdk` (MIT,
-<https://github.com/Start9Labs/start-sdk>). Its `Makefile` includes the SDK's `s9pk.mk`. These npm
+Copyright (c) 2023 Start9 Labs, Inc.; now in <https://github.com/Start9Labs/start-technologies>). Its `Makefile` includes the SDK's `s9pk.mk`. These npm
 packages are used to build the package and are not included in this repository:
 
 | package | version | licence |
@@ -229,25 +278,38 @@ packages are used to build the package and are not included in this repository:
 ## Standards and prior work
 
 These are not code in this repository, but the design depends on them, and the credit is theirs.
+`docs/REFERENCES.md` gives a reference for each and for the prior art of the designs (stream
+tickets, the lottery, the sealed draw).
 
-* **Payment channels.** One-way channels in the style of Jeremy Spilman's 2013 proposal to the
-  bitcoin-development list.
-* **x402** (<https://github.com/coinbase/x402>), the HTTP 402 payment protocol by Coinbase. Stream is
-  an XBT binding of its `batch-settlement` scheme.
+* **Payment channels.** One-way channels in the style of Jeremy Spilman's proposal to the
+  bitcoin-development list (20 April 2013), in the `CHECKLOCKTIMEVERIFY` form of BIP 65.
+* **x402** (<https://github.com/x402-foundation/x402>, Apache-2.0), the HTTP 402 payment protocol
+  created by Coinbase and kept since April 2026 by the x402 Foundation. The frozen channel is
+  carried under the name of its `batch-settlement` scheme, with a binding to XBT that is our own
+  and that upstream does not define.
 * **Model Context Protocol** (<https://modelcontextprotocol.io>), the protocol the wallet's MCP
   server speaks.
-* **Bitcoin Knots** (<https://github.com/bitcoinknots/bitcoin>): the BLAKE2b proof of work, the
-  UnifiedSighash (0x21) replay protection, and the consensus rules this code follows.
-* **Bitcoin Improvement Proposals:** BIP32, BIP39, BIP66, BIP86, BIP125, BIP143, BIP144, BIP173,
-  BIP340, BIP341 and BIP350.
+* **Bitcoin Knots** (<https://github.com/bitcoinknots/bitcoin>, maintained by Luke Dashjr): the
+  BLAKE2b proof of work (Luke Dashjr), the unified opt-in signature hash that protects against
+  replay (Kyle Santiago), and the consensus rules this code follows. What was ported or copied
+  is listed under "Included in this repository".
+* **Bitcoin Improvement Proposals:** BIP32, BIP39, BIP65, BIP66, BIP86, BIP110, BIP122, BIP125,
+  BIP143, BIP144, BIP173, BIP340, BIP341 and BIP350.
 * **RFCs:** RFC 6979 (deterministic ECDSA), RFC 8032 (Ed25519), RFC 4648 (base encodings), RFC 8259 (JSON).
-* **ECDSA adaptor signatures** with a DLEQ proof, from the published literature on scriptless scripts
-  and adaptor signatures, also implemented in libsecp256k1-zkp's `ecdsa_adaptor` module
-  (<https://github.com/BlockstreamResearch/secp256k1-zkp>).
-* **Lightning:** BOLT 11 invoices (<https://github.com/lightning/bolts>), and LND's macaroon and REST
-  formats as used by Lightning Fork (<https://github.com/paulscode/lightning-fork>), which the
-  optional Lightning rail pays through.
-* **Pay with work:** DATUM and TIDES (OCEAN), the mining and payout schemes the `xbt-work` receipts
-  and coinbase audit are built around.
+* **ECDSA adaptor signatures** with a DLEQ proof (the retired hub; the code is in the git
+  history): Andrew Poelstra's scriptless scripts, and Lloyd Fournier's "One-Time Verifiably
+  Encrypted Signatures A.K.A. Adaptor Signatures", which libsecp256k1-zkp's `ecdsa_adaptor`
+  module (<https://github.com/BlockstreamResearch/secp256k1-zkp>) implements.
+* **Lightning:** BOLT 11 invoices and BOLT 12 offers (<https://github.com/lightning/bolts>), and
+  lnd's macaroon and REST formats (<https://github.com/lightningnetwork/lnd>, Lightning Labs,
+  MIT) as used by Lightning Fork (<https://github.com/paulscode/lightning-fork>, Paul Lamb, MIT),
+  which the Lightning rail pays through. Hold invoices, which stream tickets are made of, are
+  lnd's (Joost Jager, 2019).
+* **Pay with work:** DATUM and TIDES (OCEAN; DATUM Gateway is MIT, Copyright (c) 2024-2025
+  Bitcoin Ocean, LLC, Jason Hughes, and individual contributors), the mining and payout schemes
+  the `xbt-work` receipts and coinbase audit are built around. No DATUM code is in this tree.
 * **Packaging:** umbrelOS (<https://github.com/getumbrel/umbrel>) and StartOS
-  (<https://github.com/Start9Labs/start-os>) app formats.
+  (<https://github.com/Start9Labs/start-technologies>) app formats. The app files under
+  `packaging/` were written for this project and follow those formats. umbrelOS itself is under
+  the PolyForm Noncommercial License 1.0.0, which is not an open-source licence, and its app
+  repository carries no licence file; we know of no file here that is copied from either.

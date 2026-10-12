@@ -16,6 +16,13 @@ and serves. Tickets are locked a few at a time, ahead of use, so no request wait
 This needs no change to the Lightning node: it is `AddHoldInvoice`, `SettleInvoice` and
 `CancelInvoice`, as nodes ship them.
 
+None of the parts is ours. Hold invoices are lnd's (Joost Jager, 2019). A payment that the payer
+releases in a second step was proposed for Lightning by Hiroki Gondo in 2019 as "stuckless
+payments", with point locks. The 402 shape is x402's. The lab is Paul Lamb's
+`lightning-fork-lab` (commit `a5cadc5`), and the nodes are his Lightning Fork at
+`v0.21.3-beta-blake2b.17`, a fork of lnd, on a Bitcoin Knots BLAKE2b regtest. References:
+[`REFERENCES.md`](REFERENCES.md).
+
 Words: MUST and SHOULD are followed by what goes wrong otherwise. Amounts are millisatoshi (msat)
 as decimal strings; hashes, secrets and keys are lower-case hex.
 
@@ -240,7 +247,10 @@ channel.
 
 Not specified here, and nothing implements it. A request priced below one ticket is to be paid
 by a fair roll that wins a payment of one fixed size with probability price ÷ that size
-(`docs/LIMITS.md`, "Lottery tickets (in design)"). This draft leaves room for it and no more:
+(`docs/LIMITS.md`, "Lottery tickets (in design)"). Paying by lottery is Wheeler's and Rivest's
+idea, and a win that pays itself over Lightning was first set out by Gerhart, Taylor and
+Thyagarajan in 2026 ([`REFERENCES.md`](REFERENCES.md), 33, 34 and 44). This draft leaves room for
+it and no more:
 
 - A seller will offer it as a further entry of `accepts`, with a scheme name of its own, beside
   `ticket`. A `ticket/0` client that does not know the entry skips it.

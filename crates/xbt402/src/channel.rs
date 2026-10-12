@@ -1,4 +1,4 @@
-//! Spillman-style unidirectional channels: the funding script, state (commitment) txs, the payee's
+//! Spilman-style unidirectional channels: the funding script, state (commitment) txs, the payee's
 //! close and the payer's refund. Every channel signature is SIGHASH_ALL|UNIFIED (0x21), except the
 //! 0xA3 fee-input state variant. A port of B1 `xbt402/channel.py`.
 //!

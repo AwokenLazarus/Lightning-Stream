@@ -108,6 +108,12 @@ marked *(simulated)* involved no node.
 - A seller a buyer touches only briefly cannot be forced to be paid: the win that pays itself
   needs a ticket locked with that seller first, which is too much for a few pieces, so such
   sellers are paid after a win.
+- The win that pays itself is not this project's idea: a win that enforces itself over
+  Lightning was set out and built first by Gerhart, Taylor and Thyagarajan ("Probabilistic
+  Atomic Swaps for Bitcoin and Friends", arXiv:2605.04975, May 2026), with a formal treatment.
+  The construction here differs from theirs, and its parts (oblivious transfer and its
+  extension, Gilboa's multiplication, a Groth16 proof) are other people's too;
+  `docs/REFERENCES.md` lists them (44, 46 to 59).
 - The win that pays itself is not reviewed and not built. It rests on an argument of this
   project's own (that a cheating buyer fails the seller's check on at least half of its rolls;
   measured at 49.9% to 50.2% over 200,000 rolls) that no cryptographer has reviewed. It will not

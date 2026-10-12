@@ -1,5 +1,7 @@
-//! The XBT unified signature hash (Knots hf-sighash-opt-in `UnifiedSighash`), and BIP143 for
-//! comparison.
+//! The XBT unified signature hash, and BIP143 for comparison. The rule is Bitcoin Knots' unified
+//! opt-in signature hash (`SIGHASH_UNIFIED`, by Kyle Santiago: Knots pull request 357, branch
+//! `hf-sighash-opt-in`, in Knots from 29.4.1; specified in Knots' `doc/unified-sighash.md`). This
+//! file is a port of it (Knots is MIT: `THIRD_PARTY_NOTICES.md`).
 //!
 //! A unified hash type carries the 0x20 opt-in bit. It commits to every input's amount and
 //! scriptPubKey (like BIP341) for every script type, and SHA-256d Bitcoin verifies a different
@@ -62,7 +64,7 @@ impl Default for SpendExt<'_> {
     }
 }
 
-/// Port of Knots `UnifiedSighash` (B1 `tx.unified_sighash`): the 32-byte message a unified
+/// Port of Knots' unified signature hash (by way of B1 `tx.unified_sighash`): the 32-byte message a unified
 /// signature on input `index` signs, for a spend with no annex and no OP_CODESEPARATOR executed
 /// (see [`unified_sighash_ext`]). `script_code` is ignored for taproot key/script paths; `leaf_hash`
 /// is required for tapscript.

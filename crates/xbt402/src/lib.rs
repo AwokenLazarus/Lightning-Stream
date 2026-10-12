@@ -1,4 +1,4 @@
-//! xbt402: HTTP 402 payments over XBT Spillman channels, the x402 v2 XBT binding of
+//! xbt402: HTTP 402 payments over XBT Spilman channels, the x402 v2 XBT binding of
 //! `batch-settlement` (`extra.assetTransferMethod: "channel"`; `xbt-channel` accepted as an alias)
 //! (spec v1.1 + the v1.2 `closeFeePayer` additions), in Rust.
 //!
