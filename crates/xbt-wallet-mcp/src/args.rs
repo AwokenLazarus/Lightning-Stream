@@ -32,6 +32,17 @@ fn empty() -> Value {
     Value::String(String::new())
 }
 
+/// [`spec`] for a wallet whose operator turned stream tickets on (`tickets`): `xbt402_pay` then
+/// also takes `task`, the owner's task the call is paid under. With tickets off it is B2's.
+pub fn spec_for(tool: &str, tickets: bool) -> Option<&'static [Arg]> {
+    static XBT402_PAY_TICKETS: [Arg; 5] = [req("url", Ty::Str), opt("method", Ty::Str, || Value::from("GET")), opt("body", Ty::Str, empty),
+                                           opt("max_sats", Ty::Int, || Value::from(1000)), opt("task", Ty::Str, empty)];
+    match tool {
+        "xbt402_pay" if tickets => Some(&XBT402_PAY_TICKETS),
+        _ => spec(tool),
+    }
+}
+
 /// The arguments of each tool, in B2's order (`mcp_server.py` at b2 `04c3f56`).
 pub fn spec(tool: &str) -> Option<&'static [Arg]> {
     static PAYMENT: [Arg; 3] = [req("to", Ty::Str), req("amount_xbt", Ty::Float), opt("memo", Ty::Str, empty)];
@@ -186,7 +197,12 @@ fn coerce(ty: Ty, v: &Value) -> Result<Value, (&'static str, &'static str)> {
 /// argument present with its default filled in; extra keys are ignored, as pydantic ignores them.
 /// Err: pydantic's `ValidationError` text.
 pub fn validate(tool: &str, args: &Map<String, Value>) -> Result<Map<String, Value>, String> {
-    let spec = spec(tool).unwrap_or(&[]);
+    validate_for(tool, args, false)
+}
+
+/// [`validate`] against [`spec_for`].
+pub fn validate_for(tool: &str, args: &Map<String, Value>, tickets: bool) -> Result<Map<String, Value>, String> {
+    let spec = spec_for(tool, tickets).unwrap_or(&[]);
     let mut out = Map::new();
     let mut issues = vec![];
     for a in spec {
@@ -238,6 +254,12 @@ mod tests {
         assert_eq!(v("quote_payment", json!({"to": "x", "amount_xbt": "1_0"})).unwrap(), json!({"to": "x", "amount_xbt": 10.0, "memo": ""}));
         assert_eq!(v("quote_payment", json!({"to": "x", "amount_xbt": " 1e3 ", "zz": 1})).unwrap(), json!({"to": "x", "amount_xbt": 1000.0, "memo": ""}));
         assert_eq!(v("xbt402_pay", json!({"url": "u", "max_sats": 5.0})).unwrap(), json!({"url": "u", "method": "GET", "body": "", "max_sats": 5}));
+        // `task` exists only for a wallet with tickets on; without them it is an extra key, ignored as pydantic ignores one
+        assert_eq!(v("xbt402_pay", json!({"url": "u", "task": "film"})).unwrap(), json!({"url": "u", "method": "GET", "body": "", "max_sats": 1000}));
+        let with = |a: Value| validate_for("xbt402_pay", a.as_object().unwrap(), true).map(Value::Object);
+        assert_eq!(with(json!({"url": "u", "task": "film"})).unwrap(), json!({"url": "u", "method": "GET", "body": "", "max_sats": 1000, "task": "film"}));
+        assert_eq!(with(json!({"url": "u"})).unwrap()["task"], "");
+        assert!(with(json!({"url": "u", "task": 7})).unwrap_err().contains("task"));
         let big = xbt402::json::parse(r#"{"limit": "100000000000000000000000"}"#).unwrap();
         assert_eq!(xbt402::json::dumps(&v("history", big).unwrap()), r#"{"limit": 100000000000000000000000}"#);
     }

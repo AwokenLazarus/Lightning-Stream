@@ -36,11 +36,15 @@ socket path.
 | tool | arguments | what it does |
 |---|---|---|
 | `ticket_status` | `session=""` | the signer's ticket book after it has been compared with its Lightning node: sessions, tickets by state, sats locked against the exposure caps, sats booked and not yet settled, whether the node's payments in flight are the book's. Read-only, and never a secret |
-| `ticket_stop` | `session` | stops a session: nothing more is locked or released for it; returns the hashes of its unreleased tickets, which only the seller can cancel |
+| `ticket_stop` | `session` | stops a session: nothing more is locked or released for it, and an answer that is being paid for ends within one ticket. Where the wallet is paying that seller itself, it asks the seller to cancel the unreleased tickets and waits up to 5 s for its node to show them back; otherwise it returns their hashes, which only the seller can cancel |
+| `xbt402_pay` | `url`, `method="GET"`, `body=""`, `max_sats=1000`, `task=""` | the same tool, described anew: the wallet reads the seller's 402 and pays with stream tickets, a single Lightning invoice or the on-chain channel, in that order, whichever the seller offers and the owner's policy allows first. `task` is the owner's task (policy `tickets.tasks`). The description says what an agent can and cannot cause |
+| `channels` | | the same tool, described anew: it also shows the tickets in flight, the sats locked, and what was released |
 
 Locking and releasing tickets are not tools. `ticket_open`, `ticket_offer`, `ticket_lock` and
-`ticket_release` are methods of the signer's socket for the wallet's own payer: a released secret is
-spent money, and the model does not hold one.
+`ticket_release` are methods of the signer's socket: a released secret is spent money, and the
+model does not hold one. An agent causes a release only through `xbt402_pay`, where the signer
+itself sends the secret to the seller it locked the ticket with. With `XBT_MCP_PAYER=local` the
+in-process payer pays channels only.
 
 Without `XBT_MCP_LN` the list is B2's exact ten (the Python conformance check depends on it). The
 LN node's REST URL, macaroon and TLS certificate are the signer's (`B2_LN_*`), never this process's.
