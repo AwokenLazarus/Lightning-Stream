@@ -1106,6 +1106,26 @@ impl Signer {
         }
     }
 
+    /// Give up hashes of a session that were offered and whose lock round never came to an invoice
+    /// being judged: the seller sent none, or the wallet's own node could not be asked. They can
+    /// take no invoice from now on, and their places in the pool are free at once. (A hash whose
+    /// invoice the book refused keeps its place until it lapses: asking again would only make the
+    /// seller issue again what a cap refuses.)
+    pub(crate) fn ticket_unoffer(&self, sid: &str, hashes: &[String], why: &str) -> Result<()> {
+        let _g = self.lock();
+        let now = self.engine.now();
+        let mut g = self.ticket_store()?;
+        let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
+        let rows: Vec<Value> = hashes.iter().filter_map(|h| st.book.tickets.get(h)).filter(|t| t.session == sid && t.state == TState::Offered).map(|t| {
+            let mut t = t.clone();
+            t.state = TState::Failed;
+            t.done_ts = now;
+            t.note = why.chars().take(80).collect();
+            t.row()
+        }).collect();
+        st.commit(&rows)
+    }
+
     /// Write the seller's side of a session into the book: its id, its key and its endpoints. On
     /// disk when this returns, and before any ticket of the session is paid, so that a wallet that
     /// starts again can still ask the seller to cancel what it locked.

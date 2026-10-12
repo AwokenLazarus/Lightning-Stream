@@ -366,7 +366,10 @@ built. Run on regtest only (`scripts/ticket_book_regtest.sh`).
   refill happens when the caller asks, and stopping a session only names the tickets to cancel.
   Under `xbt402_pay` the signer does all of this itself (the next section).
 - A hash whose invoice the book refused (a cap was reached) keeps its place in the pool for 2
-  minutes: the pool asks for no other hash in its place until then.
+  minutes: the pool asks for no other hash in its place until then. Under `xbt402_pay` a round
+  that never came to an invoice being judged (the seller's lock answer was lost or refused, or
+  the wallet's own node could not be asked) gives its hashes up at once; on the socket's methods
+  such hashes also wait their 2 minutes.
 - A release does not ask the node whether the ticket is still locked. It relies on the last
   reconcile (every watcher tick, 10 s by default) and on the ticket's expiry height: a ticket the
   seller cancelled in between is released, booked, refused by the seller and un-booked at the

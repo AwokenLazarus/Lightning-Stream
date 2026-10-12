@@ -665,6 +665,12 @@ impl Signer {
         if hashes.is_empty() {
             return Ok(0);
         }
+        // a round that ends before any invoice was judged gives its hashes up, so that the next round can offer new ones
+        let offered: Vec<String> = hashes.iter().filter_map(|h| h.as_str().map(str::to_string)).collect();
+        let unoffer = |why: &str| {
+            // unchecked: a hash that stays offered only lapses later, and the round's own refusal is what the caller is told
+            let _ = self.ticket_unoffer(&hs.sid, &offered, why);
+        };
         let mut body = json!({"version": xbt402::ticket::VERSION, "hashes": hashes});
         // a size of the wallet's choosing is asked for only where the terms let it choose
         let size = self.ticket_session(&hs.sid).map(|s| s.ticket_msat).unwrap_or(hs.terms.terms.ticket_msat);
@@ -681,9 +687,13 @@ impl Signer {
             let sent = self.ticket_wire.send("POST", &url, &raw, &[("Content-Type".into(), "application/json".into())], Self::ticket_read_timeout(&self.ticket_policy()));
             let (status, v) = match sent.and_then(|a| Ok((a.status, a.read_small(SMALL_BODY)?))) {
                 Ok((status, raw)) => (status, serde_json::from_slice::<Value>(&raw).unwrap_or(Value::Null)),
-                Err(e) => return Err(refusal("ticket_seller", format!("the seller gave no answer to the first lock: {}", e.msg))),
+                Err(e) => {
+                    unoffer("the seller gave no answer to the lock");
+                    return Err(refusal("ticket_seller", format!("the seller gave no answer to the first lock: {}", e.msg)));
+                }
             };
             if status != 200 {
+                unoffer("the seller refused the lock");
                 let code = Some(str_or_empty(v.get("error"))).filter(|c| safe_code(c)).unwrap_or_default();
                 return Err(refusal("ticket_seller", format!("the seller refused the first lock: HTTP {status} {code}")));
             }
@@ -705,15 +715,20 @@ impl Signer {
             match self.ticket_call(hs, "lock", &body, true) {
                 Ok((200, v, _)) => v,
                 Ok((status, v, _)) => {
+                    unoffer("the seller refused the lock");
                     let code = Some(str_or_empty(v.get("error"))).filter(|c| safe_code(c)).unwrap_or_default();
                     return Err(refusal("ticket_seller", format!("the seller refused the lock: HTTP {status} {code}")));
                 }
-                Err(e) => return Err(refusal("ticket_seller", format!("the seller gave no answer to the lock: {}", e.msg))),
+                Err(e) => {
+                    unoffer("the seller gave no answer to the lock");
+                    return Err(refusal("ticket_seller", format!("the seller gave no answer to the lock: {}", e.msg)));
+                }
             }
         };
         // the invoices are the seller's word: every check of them is the book's (`ticket_lock`)
         let tickets: Vec<Value> = answer.get("tickets").and_then(Value::as_array).cloned().unwrap_or_default();
         if tickets.is_empty() {
+            unoffer("the seller issued no invoice");
             return Ok(0);
         }
         let locked = self.ticket_lock(&json!({"session": hs.sid, "tickets": tickets}));
@@ -725,11 +740,19 @@ impl Signer {
                  json!({"session": hs.sid, "refused": locked["refused"].as_array().map(Vec::len)}))
         });
         *lock(&hs.unfilled) = why_not.clone();
+        // an invoice the wallet's own node could not be asked about was not judged either: its hash is given up now
+        let unasked: Vec<String> = locked.get("refused").and_then(Value::as_array).into_iter().flatten().filter(|r| r.get("rule").and_then(Value::as_str) == Some("ln_backend"))
+            .filter_map(|r| r.get("hash").and_then(Value::as_str).map(str::to_string)).collect();
+        if !unasked.is_empty() {
+            let _ = self.ticket_unoffer(&hs.sid, &unasked, "the wallet's node could not be asked about its invoice");
+        }
         if n == 0 {
             if let Some(d) = why_not {
                 return Err(d);
             }
             if locked["verdict"] == "deny" && locked.get("rule").is_some_and(|r| r != "ticket_refused") {
+                // the round was refused as a whole, before any invoice was judged (the wallet's own node, most often)
+                unoffer("the lock round was refused before its invoices were judged");
                 return Err(locked);
             }
         }

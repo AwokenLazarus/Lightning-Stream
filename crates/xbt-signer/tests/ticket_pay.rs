@@ -1439,6 +1439,34 @@ fn while_the_wallets_own_node_is_away_no_hash_is_offered_and_the_next_call_pays_
 }
 
 #[test]
+fn a_lock_round_that_never_reached_an_invoice_frees_its_places_in_the_pool_at_once() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let r = Rig::new(json!({"tickets": {"enabled": true, "pool": 2, "tasks": {"film": {"budget_sats": 40_000}}}}));
+    assert_eq!(r.pay("/page/10", 10)["status"].as_u64(), Some(200));
+    // the answer to the next lock is lost: its hashes were offered and no invoice came for them
+    let n = Arc::new(AtomicUsize::new(0));
+    let n1 = n.clone();
+    r.tap.set(Box::new(move |seen, real| {
+        if seen.path == "/x402/ticket/lock" && n1.fetch_add(1, Ordering::SeqCst) == 0 {
+            let _ = real();
+            return Some(Err(xbt402::ChannelError::new("transport_error", "connection reset")));
+        }
+        None
+    }));
+    // the file goes on all the same: the next round offers new hashes, where it used to find the pool "full" for 2 minutes
+    let v = r.pay(&format!("/files/{}", 12 * MIB), 5_000);
+    r.tap.clear();
+    assert_eq!((v["complete"].as_bool(), v["bytes"].as_u64()), (Some(true), Some(12 * MIB as u64)), "{v}");
+    let locks = r.tap.seen("/x402/ticket/lock");
+    let hashes = |i: usize| serde_json::from_str::<Value>(&locks[i].body).unwrap()["hashes"].clone();
+    assert!(locks.len() >= 3 && hashes(1) != hashes(2), "new hashes, never the same again: {}", locks.len());
+    // the invoices of the lost round were never paid
+    let lost: Vec<String> = hashes(1).as_array().unwrap().iter().map(|h| h.as_str().unwrap().to_string()).collect();
+    assert!(r.ln.state().payments.iter().all(|p| !lost.contains(&p["payment_hash"].as_str().unwrap().to_string())));
+    r.assert_booked();
+}
+
+#[test]
 fn no_ticket_is_released_into_an_answer_the_seller_is_still_waiting_to_go_on_with() {
     let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
     // a seller that waits 3 s for a refill before it ends an answer, as the gateway does by default
