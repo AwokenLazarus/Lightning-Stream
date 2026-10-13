@@ -710,7 +710,9 @@ above three times is not asked for another: the session ends as faulty.
 An answer that did not arrive whole (the wallet stopped reading it, or it was cut) can leave
 pieces open with the seller: it marks a piece when its last bytes leave. The buyer SHOULD name as
 `void` every piece of such an answer that will get no value, or they fill the seller's window
-for the session's next request.
+for the session's next request. The same goes for the end of any answer priced by the second:
+the seller counts its seconds on its own clock, which started a moment before the buyer's, and
+may have begun one second more than the buyer gave a value for.
 
 ### 9.6 The window and the grace: when the seller stops
 
