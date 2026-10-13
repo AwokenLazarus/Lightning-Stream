@@ -1,6 +1,10 @@
 #!/bin/bash
-# AGP-035: build xbt-rs the way xbt-compute (cmp) builds it - from a clean checkout, with no .cargo
-# config, cross-compiled with cargo-zigbuild 0.23.4 and zig 0.16.0.
+# AGP-035: build this workspace the way an embedder builds it - from a clean checkout, with no
+# .cargo config, cross-compiled with cargo-zigbuild 0.23.4 and zig 0.16.0.
+#
+# The embedder this was written for (xbt-compute, "cmp") linked the on-chain channel's provider and
+# client from xbt402. That channel was removed in 2026-10: an embedder that still needs it pins
+# revision 2a31170, the last with it. What is built and linked here is what the crates offer now.
 #
 #   scripts/cmp_clean_build.sh [REF]          (REF: branch, tag or commit of this repo; default main)
 #
@@ -11,7 +15,7 @@
 #    armv7-unknown-linux-musleabihf: `-p xbt402 --no-default-features`, `-p xbt-signer` and (AGP-030)
 #    `-p xbt-wallet-mcp`; every
 #    binary must be a static ELF of the right machine;
-# 4. a cmp-shaped consumer outside the repo: xbt402 + xbt-signer as git dependencies at REF's commit,
+# 4. an embedder-shaped consumer outside the repo: xbt402 + xbt-signer as git dependencies at REF's commit,
 #    default-features = false, its own serde_json (no features) and the ureq patch (AGP-096), built
 #    for aarch64 musl.
 #
@@ -95,7 +99,7 @@ for t in "${TARGETS[@]}"; do
     fi
   done
   [ -f "$W/target/$t/release/libxbt402.rlib" ] && echo "  ok    $t libxbt402.rlib" || bad "$t: no libxbt402.rlib"
-  for b in xbt-signer xbt-anchor-witness xbt-signer-payer xbt-wallet-mcp; do
+  for b in xbt-signer xbt-anchor-witness xbt-wallet-mcp; do
     [ -f "$W/target/$t/release/$b" ] && check_bin "$t" "$W/target/$t/release/$b" || bad "$t: no $b"
   done
 done
@@ -123,15 +127,17 @@ serde_json = "1"
 ureq = { git = "file://$W/xbt-rs", rev = "$REV" }
 EOF
 cat > "$C/src/main.rs" <<'EOF'
-// Links the cmp surface: provider, client (+ signer seam, client ledger), the signer
-// client, and a big amsat integer through xbt402's JSON.
-use xbt402::client::{Client, ClientLedger};
+// Links what an embedder can use: the scheme server and payer, the ticket and lottery wires, the
+// signer's socket client, and a big amsat integer through xbt402's JSON.
+use xbt402::client::Client;
 use xbt402::provider::Provider;
 fn main() {
     let v = xbt402::json::parse(r#"{"amsatPerCall": 813000000000123456789}"#).unwrap();
     assert_eq!(xbt402::json::dumps_compact(&v), r#"{"amsatPerCall":813000000000123456789}"#);
     let _ = (std::mem::size_of::<Provider>(), std::mem::size_of::<Client>());
-    let _: Option<&dyn ClientLedger> = None;
+    let _: Option<&dyn xbt402::scheme::SchemePayer> = None;
+    assert_eq!(xbt402::ticket::ticket_hash(&[0u8; 32]).len(), 32);
+    assert!(xbt402::lottery::Odds::new(100_000, 1_000_000).is_ok());
     let _ = xbt_signer::client::SignerClient::new;
     println!("ok");
 }

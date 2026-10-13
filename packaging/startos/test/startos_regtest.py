@@ -12,9 +12,11 @@ Docker, with what StartOS does around it:
   * the node is an external XBT Knots on the AGP-017 regtest chain (the Node connection action's values).
 
 Checks (results.json): I install and layout, U the owner in the UI (setup code, password, key, policy, token),
-P an agent's payment, G readiness (the fields the package's wallet-ready health check reads), R a restart
+P the agent's MCP surface and custody of the hot key, G readiness (the fields the package's wallet-ready health check reads), R a restart
 after the whole volume came back root-owned (StartOS remounts, or a restore), B backup and restore of
-`main` into a new install (sealed keys, channels, the UI login), W the reset-password flow.
+`main` into a new install (sealed keys, the hot key's coins, the UI login), W the reset-password flow.
+(P was an agent's payment over the on-chain channel until 2026-10. That channel was removed, and the
+package wires no Lightning node into the wallet yet, so the packaged wallet pays no seller: see regtest_lib.py.)
 (The H checks ran the hub and are retired with it; the other letters are unchanged. The hub was retired
 on 2026-10-11: payments between parties route over ordinary Lightning instead. Its code is in the git
 history, last at commit a548fb0.)
@@ -30,7 +32,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 PKG = os.path.join(os.path.dirname(HERE), "xbt-agent-wallet")
 sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
-from regtest_lib import (agent_rotation_attempts, leaks, POLICY_BASE, ROOT, Chain, Mcp, Miner, Ui, check, docker, ensure_provider_image, field, http, log, open_log,  # noqa: E402
+from regtest_lib import (agent_and_custody, agent_rotation_attempts, leaks, POLICY_BASE, ROOT, Chain, Mcp, Ui, check, docker, field, http, log, open_log,  # noqa: E402
                          owner_setup, sh, status, wait_until, write_results)
 
 OUT = sys.argv[1]
@@ -39,10 +41,8 @@ P = f"agp040-s9-{PID}"
 NET = f"{P}-net"
 P_MCP = int(os.environ.get("STARTOS_TEST_MCP_PORT", "24110"))
 P_UI = int(os.environ.get("STARTOS_TEST_UI_PORT", "24130"))
-P_PROV = int(os.environ.get("STARTOS_TEST_PROV_PORT", "24140"))
 SIGN_BIN = os.path.join(ROOT, "dist/oci/ctx/bin/amd64/xbt-wallet-ui")
 RPC_USER, RPC_PASS = "xbt", os.urandom(16).hex()
-PROVIDER = f"http://{P}-provider:9500"
 open_log(os.path.join(OUT, "startos_regtest.log"))
 
 
@@ -103,7 +103,6 @@ def vol_sh(vol, script, ro=True):
 
 
 def main():
-    ensure_provider_image()
     docker("network", "create", NET)
     sp = spec()
     by = {s["id"]: s for s in sp["services"]}
@@ -114,8 +113,8 @@ def main():
           and [(m["subpath"], m["readonly"]) for m in by["ui"]["mounts"]] == [("ui", False), ("run/signer", True), ("run/ui", False)]
           and [m["subpath"] for m in by["witness"]["mounts"]] == ["witness", "run/anchor"], sp["services"])
 
-    # --- the external node (the Node connection action's values) and the provider -------------------------------
-    log("== node (regtest) and provider")
+    # --- the external node (the Node connection action's values) -------------------------------
+    log("== node (regtest)")
     docker("volume", "create", f"{P}-node")
     vol_sh(f"{P}-node", "chown 1000:1000 /v", ro=False)
     docker("run", "-d", "--name", f"{P}-knots", "--network", NET, "--user", "1000:1000", "-v", f"{P}-node:/data",
@@ -124,10 +123,6 @@ def main():
     chain = Chain(f"{P}-knots", RPC_USER, RPC_PASS)
     wait_until(lambda: chain.cli("getblockcount") is not None, 90, "node RPC")
     chain.bootstrap()
-    docker("volume", "create", f"{P}-prov")
-    vol_sh(f"{P}-prov", f"printf '{RPC_USER}:{RPC_PASS}' > /v/rpc-auth && chown -R 10009:10009 /v && chmod 600 /v/rpc-auth", ro=False)
-    docker("run", "-d", "--name", f"{P}-provider", "--network", NET, "-v", f"{P}-prov:/p", "agp038-test-provider:1", "--port", "9500", "--bind", "0.0.0.0",
-           "--rpc-host", f"{P}-knots", "--rpc-port", "8332", "--cookie", "/p/rpc-auth", "--ledger", "/p/ledger.jsonl")
 
     # --- install: an empty, root-owned `main` ----------------------------------------------------------------------
     log("== install: main volume root-owned and empty; init, then the daemons")
@@ -175,8 +170,8 @@ def main():
     with open(key, "w") as f:
         f.write(os.urandom(32).hex())
     os.chmod(key, 0o600)
-    _, f1, f2 = owner_setup(ui, SIGN_BIN, key, dict(POLICY_BASE, allowlist=[PROVIDER]))
-    check("U", "the owner enrols an approval key and signs a policy (allowlist: the provider)", "enrolled" in f1.lower() and "applied" in f2.lower(), [f1, f2])
+    _, f1, f2 = owner_setup(ui, SIGN_BIN, key, dict(POLICY_BASE, allowlist=[chain.faucet]))
+    check("U", "the owner enrols an approval key and signs a policy (allowlist: one address)", "enrolled" in f1.lower() and "applied" in f2.lower(), [f1, f2])
     if "restarts" in f2:
         docker("restart", f"{P}-signer")
         wait_until(lambda: status(f"http://127.0.0.1:{P_MCP}/readyz") == 200, 120, "MCP ready after the signer restart")
@@ -187,19 +182,12 @@ def main():
     check("U", "the UI's Agents page (and the Agent connection action, which reads the same file) gives the MCP URL and token",
           token == disk and f"http://127.0.0.1:{P_MCP}/mcp" in page, {"token_ok": token == disk})
 
-    # --- P: an agent pays ----------------------------------------------------------------------------------------
-    log("== P: an agent pays")
+    # --- P: the agent's surface and custody of the hot key ---------------------------------------------------------
+    log("== P: the agent's MCP; the hot key funded, counted and swept by the owner")
     sc = lambda meth, p=None: json.loads(docker("exec", f"{P}-signer", "/usr/bin/xbt-signer", "call", meth, json.dumps(p or {})).stdout)  # noqa: E731
-    ha = sc("hot_address")
-    txid = chain.cli("sendtoaddress", ha["hot_address"], "0.0005", wallet="faucet")
-    chain.mine(1)
-    sc("notice_hot_txid", {"txid": txid})
     agent = Mcp(f"http://127.0.0.1:{P_MCP}", token)
     agent.start()
-    with Miner(chain, 2.0):
-        r1 = agent.tool("xbt402_pay", url=f"{PROVIDER}/v1/agp040", max_sats=1000)
-    check("P", "xbt402_pay through the MCP: 200, 150 sat, a channel", r1.get("status") == 200 and r1.get("charged_sats") == 150 and r1.get("chan"), r1)
-    chans1 = agent.tool("channels")
+    before = agent_and_custody("P", agent, ui, SIGN_BIN, key, chain, sc)
 
     # --- G: what the wallet-ready health check reads ----------------------------------------------------------------
     log("== G: readiness")
@@ -224,11 +212,10 @@ def main():
           and any(d["chowned"] > 1 for d in rep2["dirs"]), rep2)
     agent = Mcp(f"http://127.0.0.1:{P_MCP}", token)
     agent.start()
-    chans2 = agent.tool("channels")
-    r2 = agent.tool("xbt402_pay", url=f"{PROVIDER}/v1/agp040", max_sats=1000)
-    check("R", "the same token, hot address and channels; a second paid call reuses the channel",
-          sc("hot_address")["hot_address"] == ha["hot_address"] and chans2.get("channels") == chans1.get("channels")
-          and r2.get("status") == 200 and r2.get("chan") == r1.get("chan") and not r2.get("opened"), {"r2": r2, "before": chans1, "after": chans2})
+    ha2 = sc("hot_address")
+    check("R", "the same token and hot address, and the hot key's coins as they were left",
+          ha2["hot_address"] == before["hot_address"] and ha2.get("hot_sats") == before["hot_sats"]
+          and agent.tool("balance").get("hot", {}).get("hot_sats") == before["hot_sats"], {"before": before, "after": ha2})
 
     # --- B: backup `main`, restore it into a new install ---------------------------------------------------------------
     log("== B: backup and restore of main")
@@ -250,13 +237,11 @@ def main():
     st, _ = ui.login(pw)
     agent = Mcp(f"http://127.0.0.1:{P_MCP}", token)
     agent.start()
-    chans3 = agent.tool("channels")
-    check("B", "restored into a new install: the sealed keys open (same hot address), the channels, the MCP token and the UI password are back",
-          code == 0 and sc("hot_address")["hot_address"] == ha["hot_address"] and chans3.get("channels")
-          and [c.get("chan") for c in chans3["channels"]] == [c.get("chan") for c in chans1["channels"]] and st == 303,
-          {"init": rep3.get("ok"), "login": st, "channels": chans3})
-    r3 = agent.tool("xbt402_pay", url=f"{PROVIDER}/v1/agp040", max_sats=1000)
-    check("B", "after the restore the agent pays again over the same channel", r3.get("status") == 200 and r3.get("chan") == r1.get("chan"), r3)
+    ha3 = sc("hot_address")
+    check("B", "restored into a new install: the sealed keys open (same hot address), the hot key's coins, the MCP token and the UI password are back",
+          code == 0 and ha3["hot_address"] == before["hot_address"] and ha3.get("hot_sats") == before["hot_sats"] and st == 303
+          and agent.tool("balance").get("hot", {}).get("hot_sats") == before["hot_sats"],
+          {"init": rep3.get("ok"), "login": st, "before": before, "after": ha3})
     mcp_base = f"http://127.0.0.1:{P_MCP}"
     tries = agent_rotation_attempts(mcp_base, [token])
     check("W", "an agent holding the token (and the old owner header) cannot rotate it: the MCP has no rotation endpoint",
@@ -316,11 +301,11 @@ def main():
     check("W", "after Rotate the agent token: a new token in the UI's file; the old one gets 401, the new one works",
           len(new_tok) == 64 and new_tok != token and st_old_tok == 401 and st_new_tok == 200, [st_old_tok, st_new_tok])
     with open(os.path.join(OUT, "facts.json"), "w") as f:
-        json.dump({"r1": r1, "r2": r2, "r3": r3, "init_install": rep, "init_after_root_chown": rep2, "init_after_restore": rep3}, f, indent=1, default=str)
+        json.dump({"custody": before, "init_install": rep, "init_after_root_chown": rep2, "init_after_restore": rep3}, f, indent=1, default=str)
 
 
 def teardown():
-    for sid in ["init", "witness", "signer", "mcp", "ui", "knots", "provider"]:
+    for sid in ["init", "witness", "signer", "mcp", "ui", "knots"]:
         with open(os.path.join(OUT, f"{sid}.log"), "w") as f:
             r = docker("logs", f"{P}-{sid}", check_rc=False)
             f.write(r.stdout + r.stderr)

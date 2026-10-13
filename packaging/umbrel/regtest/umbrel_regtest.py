@@ -13,7 +13,9 @@ umbrelOS, simulated on plain Docker (no Umbrel dev environment runs rootless her
     "regtest"), and publishes the test ports on loopback (24000-24099). Nothing else in the apps changes.
 
 Checks (results.json): I install and layout, S hardening, U the UI (no terminal: password, key, policy, token),
-P an agent's xbt402 payment, R restart persistence, G /readyz gating, X uninstall.
+P the agent's MCP surface and custody of the hot key, R restart persistence, G /readyz gating, X uninstall.
+(P was an agent's payment over the on-chain channel until 2026-10. That channel was removed, and the app
+wires no Lightning node into the wallet yet, so the packaged wallet pays no seller: see regtest_lib.py.)
 (The H checks installed the hub app and are retired with it; the other letters are unchanged. The hub was
 retired on 2026-10-11: payments between parties route over ordinary Lightning instead. Its code is in the
 git history, last at commit a548fb0.)
@@ -29,7 +31,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from regtest_lib import (agent_rotation_attempts, leaks, POLICY_BASE, Chain, Mcp, Miner, Ui, check, docker, ensure_provider_image, field, http, log, open_log,  # noqa: E402
+from regtest_lib import (agent_and_custody, agent_rotation_attempts, leaks, POLICY_BASE, Chain, Mcp, Ui, check, docker, field, http, log, open_log,  # noqa: E402
                          owner_setup, root_helper, sh, start_proxy, status, wait_until, write_results)
 
 OUT, RUN = sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "1"
@@ -43,10 +45,8 @@ SEED = os.urandom(32).hex()
 P_MCP = int(os.environ.get("UMBREL_TEST_MCP_PORT", "24010"))
 P_UI = int(os.environ.get("UMBREL_TEST_UI_PORT", "24030"))
 P_PROXY = int(os.environ.get("UMBREL_TEST_PROXY_PORT", "24080"))
-P_PROV = int(os.environ.get("UMBREL_TEST_PROV_PORT", "24040"))
 SIGN_BIN = os.path.join(ROOT, "dist/oci/ctx/bin/amd64/xbt-wallet-ui")
 KNOTS, WALLET = "lazarus-xbt-knots", "lazarus-xbt-agent-wallet"
-PROVIDER = "http://agp040-provider-%d:9500" % PID
 open_log(os.path.join(OUT, "umbrel_regtest.log"))
 
 
@@ -112,7 +112,6 @@ def main():
     t_install = time.time()
     os.makedirs(APPS_DIR, exist_ok=True)
     docker("network", "create", NET)
-    ensure_provider_image()
 
     # --- the node app (the dependency) ---------------------------------------------------------------------
     log("== install lazarus-xbt-knots (the node dependency), regtest")
@@ -128,15 +127,6 @@ def main():
                   check_rc=False).stdout
     check("I", "node app: the app_proxy page (/rest/chaininfo.json) is the chain status, no credentials needed",
           '"chain":"regtest"' in rest.replace(" ", "") and '"pruned":true' in rest.replace(" ", ""), rest[-300:])
-
-    log("== provider (test fixture, 150 sat per call)")
-    pv = os.path.join(OUT, "provider")
-    os.makedirs(pv, exist_ok=True)
-    root_helper(pv, f"printf '{chain.u}:{chain.p}' > /d/rpc-auth && chown -R 10009:10009 /d && chmod 600 /d/rpc-auth", ro=False)
-    docker("run", "-d", "--name", f"agp040-provider-{PID}", "--network", NET, "--read-only", "-p", f"127.0.0.1:{P_PROV}:9500", "-v", f"{pv}:/p",
-           "agp038-test-provider:1", "--port", "9500", "--bind", "0.0.0.0", "--rpc-host", cname(KNOTS, "node"), "--rpc-port", "8332",
-           "--cookie", "/p/rpc-auth", "--ledger", "/p/ledger.jsonl")
-    wait_until(lambda: status(f"http://127.0.0.1:{P_PROV}/x402/supported") == 200, 60, "the provider")
 
     # --- the wallet app ---------------------------------------------------------------------------------------
     log("== install lazarus-xbt-agent-wallet")
@@ -203,9 +193,9 @@ def main():
     with open(key, "w") as f:
         f.write(os.urandom(32).hex())
     os.chmod(key, 0o600)
-    policy = dict(POLICY_BASE, allowlist=[PROVIDER])
+    policy = dict(POLICY_BASE, allowlist=[chain.faucet])
     pub, f_enrol, f_apply = owner_setup(ui, SIGN_BIN, key, policy)
-    check("U", "the owner enrols an approval key and signs a policy in the UI (allowlist: the provider)",
+    check("U", "the owner enrols an approval key and signs a policy in the UI (allowlist: one address)",
           "enrolled" in f_enrol.lower() and "applied" in f_apply.lower(), [f_enrol, f_apply])
     if "restarts" in f_apply:
         log("   the policy asks for a signer restart: restart the app's signer (Umbrel: restart the app)")
@@ -216,23 +206,15 @@ def main():
     check("U", "the Agents page gives the owner the MCP endpoint and the token the MCP server uses",
           token == disk_token and "http://127.0.0.1:33510/mcp" in agents, {"page_has_token": bool(token)})
 
-    # --- P: an agent pays ----------------------------------------------------------------------------------
-    log("== P: an agent pays one xbt402 call with the token from the Agents page")
+    # --- P: the agent's surface and custody of the hot key ---------------------------------------------------
+    log("== P: the agent's MCP with the token from the Agents page; the hot key funded, counted and swept by the owner")
     sc = lambda m, p=None: json.loads(docker("exec", cname(WALLET, "signer"), "/usr/bin/xbt-signer", "call", m, json.dumps(p or {})).stdout)  # noqa: E731
-    ha = sc("hot_address")
-    txid = chain.cli("sendtoaddress", ha["hot_address"], "0.0005", wallet="faucet")
-    chain.mine(1)
-    sc("notice_hot_txid", {"txid": txid})
     agent = Mcp(f"http://127.0.0.1:{P_MCP}", token)
     code, init = agent.start()
     check("P", "MCP initialize over HTTP with the token", code == 200 and isinstance(init, dict) and init.get("result", {}).get("serverInfo"), init)
-    with Miner(chain, 2.0):
-        r1 = agent.tool("xbt402_pay", url=f"{PROVIDER}/v1/agp040", max_sats=1000)
-    check("P", "xbt402_pay: HTTP 200 from the provider, 150 sat charged, over a new channel",
-          r1.get("status") == 200 and r1.get("charged_sats") == 150 and r1.get("chan"), r1)
-    chans1 = agent.tool("channels")
+    before = agent_and_custody("P", agent, ui, SIGN_BIN, key, chain, sc)
     page = ui.get("/channels")
-    check("P", "the UI's Channels page shows the agent's channel", str(r1.get("chan", "?"))[:16] in page or PROVIDER in page, page[-400:])
+    check("P", "the UI's Channels page says the wallet has no on-chain channel", "No channels." in page, page[-400:])
 
     # --- R: restart the app (umbrelOS: stop + start, or a reboot) -----------------------------------------------
     log("== R: restart the app")
@@ -248,14 +230,11 @@ def main():
     token2, _ = mcp_token_from_ui(ui2)
     agent = Mcp(f"http://127.0.0.1:{P_MCP}", token2)
     agent.start()
-    chans2 = agent.tool("channels")
     ha2 = sc("hot_address")
-    check("R", "after the restart: the same token, hot address and channels (id, cum)",
-          token2 == token and ha2["hot_address"] == ha["hot_address"] and chans2.get("channels") == chans1.get("channels"),
-          {"token": token2 == token, "hot": [ha["hot_address"], ha2["hot_address"]], "before": chans1, "after": chans2})
-    r2 = agent.tool("xbt402_pay", url=f"{PROVIDER}/v1/agp040", max_sats=1000)
-    check("R", "a second paid call reuses the channel (no new open), 150 sat",
-          r2.get("status") == 200 and r2.get("chan") == r1.get("chan") and not r2.get("opened") and r2.get("charged_sats") == 150, r2)
+    check("R", "after the restart: the same token and hot address, and the hot key's coins as they were left",
+          token2 == token and ha2["hot_address"] == before["hot_address"] and ha2.get("hot_sats") == before["hot_sats"]
+          and agent.tool("balance").get("hot", {}).get("hot_sats") == before["hot_sats"],
+          {"token": token2 == token, "hot": [before, ha2]})
     log("== W: rotate the agent token in the UI (no restart); an agent cannot rotate it")
     mcp_base = f"http://127.0.0.1:{P_MCP}"
     tries = agent_rotation_attempts(mcp_base, [token])
@@ -308,7 +287,7 @@ def main():
     check("G", "node app back: MCP /readyz 200", True)
     proxy.shutdown()
     with open(os.path.join(OUT, "facts.json"), "w") as f:
-        json.dump({"run": RUN, "t_wallet_ready_s": t_ready, "t_total_s": time.time() - t_install, "r1": r1, "r2": r2,
+        json.dump({"run": RUN, "t_wallet_ready_s": t_ready, "t_total_s": time.time() - t_install, "custody": before,
                    "init_first": rep, "init_restart": rep2}, f, indent=1, default=str)
 
 
@@ -318,11 +297,10 @@ def teardown():
             r = compose(app, "logs", "--no-color", "--timestamps", check_rc=False)
             f.write(r.stdout + r.stderr)
         compose(app, "down", "--volumes", "--timeout", "10", check_rc=False)
-    docker("rm", "-f", f"agp040-provider-{PID}", check_rc=False)
     docker("network", "rm", NET, check_rc=False)
     if not os.environ.get("UMBREL_TEST_KEEP"):
         # uninstall: umbrelOS deletes app-data/<id>; the files belong to the service uids, so as root
-        root_helper(OUT, "rm -rf /d/app-data /d/provider", ro=False)
+        root_helper(OUT, "rm -rf /d/app-data", ro=False)
         check("X", "uninstall: every container, the network and the app data removed",
               not docker("ps", "-aq", "--filter", f"name=^{WALLET}_").stdout.strip()
               and not os.path.exists(APPS_DIR))

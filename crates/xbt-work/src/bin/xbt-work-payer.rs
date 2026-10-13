@@ -123,7 +123,8 @@ fn pay(base: &str, calls: usize, secs: f64, state: &str) -> i32 {
     let pk = pubkey_from_hex(s.accepted["extra"]["primePubkey"].as_str().unwrap_or("")).expect("prime key");
     let mut c = Checks { list: vec![], ok: true };
     c.check(network(&node).ok().as_deref() == Some(net.as_str()), format!("the payer's node is on the offer's network {net}"));
-    c.check(meta["schemes"] == json!(["xbt-work"]), format!("the 402 offers pay with work, and nothing else: {}", meta["schemes"]));
+    // a seller may offer other rails beside it (the Python provider still offers its on-chain channel)
+    c.check(meta["schemes"].as_array().is_some_and(|a| a.contains(&json!("xbt-work"))), format!("the 402 offers pay with work: {}", meta["schemes"]));
 
     // receipts: poll the relay until they cover the calls
     let need = calls as u64 * amount;

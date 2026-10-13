@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""AGP-030 conformance, protocol level: B2's Python MCP (`python -m agentwallet.mcp_server`) and the
-Rust `xbt-wallet-mcp` get the same MCP messages over stdio, in front of the same recording signer, and
-their answers must be equal after parsing (JSON key order aside). Covered:
+"""AGP-030 conformance, protocol level: the Python wallet's MCP (`python -m agentwallet.mcp_server`) and
+the Rust `xbt-wallet-mcp` get the same MCP messages over stdio, in front of the same recording signer,
+and their answers must be equal after parsing (JSON key order aside).
+
+The two no longer have the same tools: the Rust wallet has no on-chain channel, so it lacks
+`close_channel`, `xbt402_refund`, `forward_status` and `forward_recover`, and describes `channels` and
+`xbt402_pay` for what they do without one. What is compared is the protocol, and every tool both
+have: a `tools/list` reply is compared on the tools whose published entry is the same in both
+(`SAME_ENTRY`), and the Rust list must name exactly `RUST_TOOLS`. Covered:
 
 * the handshake: every protocol version, bad initialize params, requests before initialize, ping;
 * tools/list, resources/list, resources/templates/list, prompts/list, unknown methods, bad messages;
-* every tool: defaults, every argument, pydantic's coercions and every validation error type;
+* every tool both have: defaults, every argument, pydantic's coercions and every validation error type;
 * the forbidden tools (answered as unknown), a signer error, an unreachable signer, key material
   (key-named fields dropped, key-shaped strings redacted, the untrusted subtree kept, a leak refused);
 * the signer requests each server sent (method and params) must be the same too.
@@ -23,6 +29,11 @@ import sys
 import tempfile
 import threading
 import time
+
+# tools of both wallets whose tools/list entry (description, schemas) is the same, byte for byte
+SAME_ENTRY = ("balance", "quote_payment", "pay", "history")
+# what the Rust wallet lists with no rail's own tools turned on
+RUST_TOOLS = ["balance", "quote_payment", "pay", "history", "channels", "xbt402_pay"]
 
 WIF = "KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU73sVHnoWn"
 XPRV = "xprv" + "9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi"
@@ -117,7 +128,7 @@ def tool_cases():
     bad_int = [5.5, "x", "5.5", "1e3", "0x10", "", None, [1, 2], {"a": 1}, 1e20, -1e19, long, "٣", "1__0"]
     ok_int = [5, "7", " 12 ", "1_000", "5.0", "-3", True, False, 1e3, -0.0, 9223372036854775808, 10 ** 24, "000123", "+4"]
     out = []
-    for t in ("balance", "channels", "forward_status"):
+    for t in ("balance", "channels"):
         out += [(t, {}), (t, None), (t, {"extra": 1}), (t, "OMIT")]
     for t in ("quote_payment", "pay"):
         out += [(t, {"to": "bc1qexample", "amount_xbt": 0.001}), (t, {"to": "x", "amount_xbt": 1, "memo": "m"}), (t, {}), (t, None),
@@ -134,14 +145,9 @@ def tool_cases():
             ("xbt402_pay", {"url": "u", "body": {"k": 1}}), ("xbt402_pay", {"url": "u", "method": None}),
             ("xbt402_pay", {"url": "MARK:error"}), ("xbt402_pay", {"url": "u", "max_sats": -1})]
     out += [("xbt402_pay", {"url": "u", "max_sats": v}) for v in bad_int + ok_int]
-    for t in ("close_channel", "xbt402_refund"):
-        out += [(t, {"counterparty": "http://127.0.0.1:1"}), (t, {}), (t, {"counterparty": None}), (t, {"counterparty": 7}),
-                (t, {"counterparty": "MARK:error"})]
-    out += [("forward_recover", {"txid": "ab" * 32}), ("forward_recover", {}), ("forward_recover", {"txid": None}),
-            ("forward_recover", {"txid": "MARK:error"})]
     # the result shapes the sanitizer must handle the same way
-    out += [("forward_recover", {"txid": "MARK:leak"}), ("forward_recover", {"txid": "MARK:list"}),
-            ("forward_recover", {"txid": "MARK:null"}), ("forward_recover", {"txid": "MARK:garbage"})]
+    out += [("pay", {"to": "MARK:leak", "amount_xbt": 1}), ("pay", {"to": "MARK:list", "amount_xbt": 1}),
+            ("pay", {"to": "MARK:null", "amount_xbt": 1}), ("pay", {"to": "MARK:garbage", "amount_xbt": 1})]
     # never tools, and names that are not tools
     out += [(t, {}) for t in ("approve", "recover_vault", "recover_treasury", "sweep_hot", "rotate_hot_key", "fund", "health",
                               "sign_state", "", "BALANCE")]
@@ -221,6 +227,19 @@ def run(cmd, env, messages, timeout=30.0):
     return replies
 
 
+def comparable(reply):
+    """A reply as both servers must give it: a tools/list result keeps the entries that are the same in both."""
+    tools = (reply or {}).get("result", {}).get("tools") if isinstance((reply or {}).get("result"), dict) else None
+    if not isinstance(tools, list):
+        return reply
+    return dict(reply, result=dict(reply["result"], tools=[t for t in tools if t.get("name") in SAME_ENTRY]))
+
+
+def rust_tool_names(reply):
+    tools = (reply or {}).get("result", {}).get("tools") if isinstance((reply or {}).get("result"), dict) else None
+    return [t.get("name") for t in tools] if isinstance(tools, list) else None
+
+
 def normalize_calls(calls):
     return sorted(json.dumps(c, sort_keys=True) for c in calls)
 
@@ -251,7 +270,9 @@ def main():
             calls[k] = normalize_calls(signer.take())
         ids = sorted(set(out["b2"]) | set(out["rust"]))
         diffs = [{"session": label, "id": i, "b2": out["b2"].get(i), "rust": out["rust"].get(i)}
-                 for i in ids if out["b2"].get(i) != out["rust"].get(i)]
+                 for i in ids if comparable(out["b2"].get(i)) != comparable(out["rust"].get(i))]
+        diffs += [{"session": label, "id": i, "rust_tools": names, "expected": RUST_TOOLS}
+                  for i in ids for names in [rust_tool_names(out["rust"].get(i))] if names is not None and names != RUST_TOOLS]
         if calls["b2"] != calls["rust"]:
             diffs.append({"session": label, "signer_requests": {"b2": calls["b2"], "rust": calls["rust"]}})
         n_tool = sum(1 for m in messages if isinstance(m, dict) and m.get("method") == "tools/call")

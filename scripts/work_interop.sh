@@ -1,7 +1,7 @@
 #!/bin/bash
 # AGP-032: pay-with-work (xbt-work v1) on regtest with the Rust side: the xbt-063 flagship-pww scenario
 # with the Rust payer (xbt402 Client + xbt-work payer) mining via `.pw-` through its own DATUM gateway into
-# primed rnd/agp-011, and the Rust provider (xbt402 Provider with xbt-channel + xbt-work) verifying the
+# primed rnd/agp-011, and the Rust provider (xbt402 Provider selling for xbt-work) verifying the
 # receipts it pulls through the blinded relay and auditing the pool coinbases against the Prime's signed
 # window statements and deferral lines.
 #
@@ -161,7 +161,7 @@ for attempt in 1 2 3; do
 done
 [ -n "$ready" ] || { echo "work_interop: gateway failed to start 3 times" >&2; exit 1; }
 
-echo "== provider ($PROVIDER): pool-analytics :${API} with xbt-channel + xbt-work (identity $PROVIDER_ID)"
+echo "== provider ($PROVIDER): pool-analytics :${API} selling for xbt-work (identity $PROVIDER_ID)"
 if [ "$PROVIDER" = rust ]; then
   "$T/xbt-work-provider" --port "$API" --rpc-port "$RPC_B" --cookie "$COOKIE_B" --identity "$PROVIDER_ID" --prime-pubkey "$PRIME_PUB" \
       --prime-id 70 --receipt-url "http://127.0.0.1:${STATS}/receipt" --relay-url "http://127.0.0.1:${RELAY}" \
