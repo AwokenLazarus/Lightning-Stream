@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::{Map, Value};
-use xbt402::ticket::{MIN_TICKET_BLOCKS, SESSION_PATH, SETTLE_MARGIN_BLOCKS};
+use xbt402::ticket::{
+    held_budget, DEFAULT_CHANNEL_SLOTS, MAX_CHANNEL_SLOTS, MIN_HELD_TICKET_MSAT, MIN_TICKET_BLOCKS,
+    SESSION_PATH, SETTLE_MARGIN_BLOCKS, SETTLE_ON_ARRIVAL, SETTLE_ON_USE,
+};
 
 use crate::book::Caps;
 use crate::price::Price;
@@ -13,9 +16,7 @@ use crate::Error;
 
 /// The node adds this many blocks to a ticket's final CLTV delta when it pays.
 pub const PAYER_PAD_BLOCKS: u32 = 3;
-/// The most HTLCs one channel holds: a seller with one channel can hold no more tickets than this.
-pub const CHANNEL_SLOTS: u32 = 483;
-/// The most unreleased tickets any config may allow: each has a thread and a connection to the node.
+/// The most held tickets any config may allow: each has a thread and a connection to the node.
 pub const MAX_HELD: u32 = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +94,10 @@ pub struct NodeConfig {
     pub macaroon: PathBuf,
     /// `info:read`: the block height.
     pub info_macaroon: PathBuf,
+    /// `offchain:read`, optional: with it the gateway reads its node's channels and sizes the cap
+    /// on held tickets itself. Not the default: the permission also shows the node's balances,
+    /// its payments and what it forwarded.
+    pub channels_macaroon: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +114,15 @@ pub struct Config {
     pub network: String,
     pub node: NodeConfig,
     pub ticket_blocks: u32,
+    /// The terms offer held tickets (`settle: "on-use"`), tickets settled on arrival
+    /// (`settle: "on-arrival"`), or both: at least one.
+    pub held: bool,
+    pub prepaid: bool,
+    /// The pending payments the seller's smallest inbound channel carries: the runner's word, or
+    /// the default of 30. Held tickets take at most half of it unless the runner said more.
+    pub inbound_slots: u32,
+    /// The runner wrote `caps.max_held_tickets`: a gateway that reads its channels keeps to it.
+    pub held_set: bool,
     pub caps: Caps,
     pub routes: Vec<Route>,
     pub http: Http,
@@ -223,13 +237,20 @@ impl Config {
         let n = obj(
             top.get("node").ok_or("node is missing")?,
             "node",
-            &["rest", "tls_cert", "macaroon", "info_macaroon"],
+            &[
+                "rest",
+                "tls_cert",
+                "macaroon",
+                "info_macaroon",
+                "channels_macaroon",
+            ],
         )?;
         let node = NodeConfig {
             rest: req_str(n, "rest")?.to_string(),
             tls_cert: opt_str(n, "tls_cert")?.map(PathBuf::from),
             macaroon: PathBuf::from(req_str(n, "macaroon")?),
             info_macaroon: PathBuf::from(req_str(n, "info_macaroon")?),
+            channels_macaroon: opt_str(n, "channels_macaroon")?.map(PathBuf::from),
         };
 
         let empty = Map::new();
@@ -237,18 +258,35 @@ impl Config {
             Some(t) => obj(
                 t,
                 "tickets",
-                &["ticket_msat", "max_tickets", "ticket_blocks"],
+                &["ticket_msat", "max_tickets", "ticket_blocks", "settle"],
             )?,
             None => &empty,
         };
         let ticket_msat = num(t, "ticket_msat", 1_000_000)?;
-        let max_tickets = num32(t, "max_tickets", 8)?;
+        let max_tickets = num32(t, "max_tickets", 2)?;
         let ticket_blocks = num32(t, "ticket_blocks", 40)?;
+        // held tickets are the default way; tickets settled on arrival are offered beside them
+        let (held, prepaid) = match t.get("settle") {
+            None => (true, true),
+            Some(Value::Array(a)) if !a.is_empty() => {
+                let has = |w: &str| a.iter().any(|x| x.as_str() == Some(w));
+                let known = a
+                    .iter()
+                    .all(|x| matches!(x.as_str(), Some(SETTLE_ON_USE | SETTLE_ON_ARRIVAL)));
+                if !known || a.len() != usize::from(has(SETTLE_ON_USE)) + usize::from(has(SETTLE_ON_ARRIVAL)) {
+                    return Err(format!("tickets.settle is a list of \"{SETTLE_ON_USE}\" (held tickets) and \"{SETTLE_ON_ARRIVAL}\" (prepaid tickets), each at most once"));
+                }
+                (has(SETTLE_ON_USE), has(SETTLE_ON_ARRIVAL))
+            }
+            Some(_) => {
+                return Err(format!("tickets.settle is a list of \"{SETTLE_ON_USE}\" (held tickets) and \"{SETTLE_ON_ARRIVAL}\" (prepaid tickets), with at least one"))
+            }
+        };
         if !(1000..=100_000_000_000).contains(&ticket_msat) {
             return Err("tickets.ticket_msat is from 1000 (a node takes nothing below 1 sat) to 100000000000".into());
         }
-        if !(1..=CHANNEL_SLOTS).contains(&max_tickets) {
-            return Err(format!("tickets.max_tickets is from 1 to {CHANNEL_SLOTS}"));
+        if held && ticket_msat < MIN_HELD_TICKET_MSAT {
+            return Err(format!("tickets.ticket_msat is at least {MIN_HELD_TICKET_MSAT} (546 sat) where held tickets are offered: a held payment below a channel's dust limit has no output in that channel's transaction, and is lost to the miners if the channel is force-closed while it is held. For smaller tickets offer only prepaid ones: tickets.settle [\"{SETTLE_ON_ARRIVAL}\"]"));
         }
         // usable blocks: the delta, plus what the payer's node adds, less the margin
         let floor = (SETTLE_MARGIN_BLOCKS + 2)
@@ -267,6 +305,9 @@ impl Config {
                     "sessions_per_address",
                     "max_kept_sessions",
                     "max_held_tickets",
+                    "inbound_slots",
+                    "held_over_half",
+                    "slots_retry_secs",
                     "unpaid_secs",
                     "first_use_secs",
                     "idle_secs",
@@ -279,19 +320,41 @@ impl Config {
         if max_sessions == 0 {
             return Err("caps.max_sessions is at least 1".into());
         }
-        let all = max_sessions
-            .checked_mul(max_tickets)
-            .ok_or("caps.max_sessions times tickets.max_tickets does not fit")?;
-        let max_held = num32(c, "max_held_tickets", all)?;
-        if max_held == 0 || max_held > all {
+        // a held ticket takes one of the pending payments ("slots") of the channel it arrives on, and
+        // a channel has between 30 (Core Lightning's default) and 483 of them, for everyone who pays
+        // over it. The buyer's node chooses the channel, so the seller's own cap is the only bound
+        let inbound_slots = num32(c, "inbound_slots", DEFAULT_CHANNEL_SLOTS)?;
+        if !(2..=MAX_CHANNEL_SLOTS).contains(&inbound_slots) {
+            return Err(format!("caps.inbound_slots is from 2 to {MAX_CHANNEL_SLOTS}: the pending payments the smallest inbound channel of the node carries (30 on a channel with a Core Lightning node, which is the default here)"));
+        }
+        let half = held_budget(inbound_slots);
+        let over_half = match c.get("held_over_half") {
+            None => false,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => return Err("caps.held_over_half is true or false".into()),
+        };
+        let held_set = c.contains_key("max_held_tickets");
+        let max_held = num32(c, "max_held_tickets", half)?;
+        if max_held == 0 {
+            return Err("caps.max_held_tickets is at least 1".into());
+        }
+        if max_held > half && !over_half {
             return Err(format!(
-                "caps.max_held_tickets is from 1 to max_sessions times max_tickets ({all})"
+                "caps.max_held_tickets {max_held} is more than half of caps.inbound_slots ({inbound_slots}): held tickets beyond half of a channel's pending payments leave no room for ordinary payments, and a full channel can be paid by nobody. Raise caps.inbound_slots if every inbound channel carries more, or say \"held_over_half\": true for a node with several inbound channels"
             ));
         }
         if max_held > MAX_HELD {
             return Err(format!(
-                "caps.max_held_tickets is at most {MAX_HELD} (it is max_sessions times max_tickets unless set): the gateway follows each unreleased ticket on its own connection to the node"
+                "caps.max_held_tickets is at most {MAX_HELD}: the gateway follows each held ticket on its own connection to the node"
             ));
+        }
+        let most = if held { max_held } else { MAX_CHANNEL_SLOTS };
+        if !(1..=most).contains(&max_tickets) {
+            return Err(format!("tickets.max_tickets is from 1 to {most}: one session holds no more than caps.max_held_tickets allows for all of them"));
+        }
+        let slots_retry_secs = num(c, "slots_retry_secs", 30)?;
+        if !(1..=3600).contains(&slots_retry_secs) {
+            return Err("caps.slots_retry_secs is from 1 to 3600".into());
         }
         ticket_msat
             .checked_mul(u64::from(max_held))
@@ -300,9 +363,10 @@ impl Config {
             ticket_msat,
             max_tickets,
             max_sessions,
-            sessions_per_address: num32(c, "sessions_per_address", 4)?,
+            sessions_per_address: num32(c, "sessions_per_address", 2)?,
             max_kept_sessions: num32(c, "max_kept_sessions", 10_000)?.max(max_sessions),
             max_held,
+            slots_retry_secs,
             margin_blocks: SETTLE_MARGIN_BLOCKS,
             unpaid_secs: num(c, "unpaid_secs", 75)?,
             first_use_secs: num(c, "first_use_secs", 60)?,
@@ -389,6 +453,10 @@ impl Config {
             network,
             node,
             ticket_blocks,
+            held,
+            prepaid,
+            inbound_slots,
+            held_set,
             caps,
             routes,
             http,
@@ -575,7 +643,22 @@ mod tests {
                 c.ticket_blocks,
                 c.caps.margin_blocks
             ),
-            (1_000_000, 8, 40, 24)
+            (1_000_000, 2, 40, 24)
+        );
+        assert_eq!(
+            (
+                c.held,
+                c.prepaid,
+                c.inbound_slots,
+                c.held_set,
+                c.caps.slots_retry_secs
+            ),
+            (true, true, 30, false, 30),
+            "held tickets and prepaid ones; a 30-slot channel assumed"
+        );
+        assert_eq!(
+            c.node.channels_macaroon, None,
+            "the gateway does not read channels unless asked"
         );
         assert_eq!(
             (
@@ -584,7 +667,7 @@ mod tests {
                 c.caps.max_kept_sessions,
                 c.caps.max_held
             ),
-            (30, 4, 10_000, 240)
+            (30, 2, 10_000, 15)
         );
         assert_eq!(
             (
@@ -606,6 +689,42 @@ mod tests {
         let m = Config::from_json(&main).unwrap();
         assert!(m.mainnet());
         assert_eq!(m.network, "lightning:0000000000000050c1e5f69672f45929");
+    }
+
+    #[test]
+    fn the_runner_can_raise_the_held_cap_and_only_by_saying_so() {
+        let with = |f: &dyn Fn(&mut Value)| {
+            let mut v = base();
+            f(&mut v);
+            Config::from_json(&v)
+        };
+        // a node whose every inbound channel carries 483: half of that, with nothing more to say
+        let c = with(&|v| v["caps"] = json!({"inbound_slots": 483})).unwrap();
+        assert_eq!((c.caps.max_held, c.held_set), (241, false));
+        // a lower cap is always the runner's to set
+        let c = with(&|v| v["caps"] = json!({"max_held_tickets": 4})).unwrap();
+        assert_eq!((c.caps.max_held, c.held_set), (4, true));
+        // above half only with the explicit word
+        let c =
+            with(&|v| v["caps"] = json!({"max_held_tickets": 60, "held_over_half": true})).unwrap();
+        assert_eq!(c.caps.max_held, 60);
+        let c = with(&|v| {
+            v["caps"] = json!({"max_held_tickets": 60, "held_over_half": true});
+            v["tickets"] = json!({"max_tickets": 8});
+        })
+        .unwrap();
+        assert_eq!(c.caps.max_tickets, 8);
+        // prepaid only: no held ticket, so a small ticket is no dust and no slot is asked for
+        let c = with(&|v| v["tickets"] = json!({"ticket_msat": 64_000, "settle": ["on-arrival"]}))
+            .unwrap();
+        assert_eq!(
+            (c.held, c.prepaid, c.caps.ticket_msat),
+            (false, true, 64_000)
+        );
+        let c = with(&|v| v["tickets"] = json!({"settle": ["on-use"]})).unwrap();
+        assert_eq!((c.held, c.prepaid), (true, false));
+        let c = with(&|v| v["node"]["channels_macaroon"] = json!("c")).unwrap();
+        assert_eq!(c.node.channels_macaroon, Some(PathBuf::from("c")));
     }
 
     #[test]
@@ -677,12 +796,60 @@ mod tests {
                 Box::new(|v| v["tickets"] = json!({"ticket_blocks": 2017})),
             ),
             (
-                "max_tickets",
-                Box::new(|v| v["tickets"] = json!({"max_tickets": 484})),
+                "546 sat",
+                Box::new(|v| v["tickets"] = json!({"ticket_msat": 545_999})),
             ),
             (
-                "max_held_tickets",
-                Box::new(|v| v["caps"] = json!({"max_held_tickets": 241})),
+                "tickets.settle",
+                Box::new(|v| v["tickets"] = json!({"settle": []})),
+            ),
+            (
+                "tickets.settle",
+                Box::new(|v| v["tickets"] = json!({"settle": ["on-use", "later"]})),
+            ),
+            (
+                "tickets.settle",
+                Box::new(|v| v["tickets"] = json!({"settle": ["on-use", "on-use"]})),
+            ),
+            (
+                "tickets.settle",
+                Box::new(|v| v["tickets"] = json!({"settle": "on-use"})),
+            ),
+            (
+                "max_tickets",
+                Box::new(|v| v["tickets"] = json!({"max_tickets": 16})),
+            ),
+            (
+                "max_tickets",
+                Box::new(|v| v["tickets"] = json!({"max_tickets": 484, "settle": ["on-arrival"]})),
+            ),
+            (
+                "more than half",
+                Box::new(|v| v["caps"] = json!({"max_held_tickets": 16})),
+            ),
+            (
+                "more than half",
+                Box::new(|v| v["caps"] = json!({"max_held_tickets": 242, "inbound_slots": 483})),
+            ),
+            (
+                "max_held_tickets is at least 1",
+                Box::new(|v| v["caps"] = json!({"max_held_tickets": 0})),
+            ),
+            (
+                "inbound_slots",
+                Box::new(|v| v["caps"] = json!({"inbound_slots": 484})),
+            ),
+            (
+                "inbound_slots",
+                Box::new(|v| v["caps"] = json!({"inbound_slots": 1})),
+            ),
+            (
+                "held_over_half",
+                Box::new(|v| v["caps"] = json!({"held_over_half": 1})),
+            ),
+            (
+                "slots_retry_secs",
+                Box::new(|v| v["caps"] = json!({"slots_retry_secs": 0})),
             ),
             (
                 "unpaid_secs",
@@ -698,7 +865,7 @@ mod tests {
             ),
             (
                 "at most 4096",
-                Box::new(|v| v["caps"] = json!({"max_sessions": 513})),
+                Box::new(|v| v["caps"] = json!({"max_held_tickets": 4097, "held_over_half": true})),
             ),
             (
                 "not both",

@@ -11,7 +11,7 @@ use std::sync::{Condvar, Mutex, MutexGuard};
 
 use sha2::{Digest, Sha256};
 
-use crate::node::{Hash, Info, Invoice, InvoiceState, Node, NodeError};
+use crate::node::{Channel, Hash, Info, Invoice, InvoiceState, Node, NodeError};
 
 /// The node cancels a held invoice this many blocks before its HTLC expires.
 pub const HOLD_EXPIRY_DELTA: u32 = 18;
@@ -21,6 +21,8 @@ struct Held {
     inv: Invoice,
     msat: u64,
     cltv: u32,
+    /// An ordinary invoice: a payment that arrives settles it at once, and no HTLC stays pending.
+    ordinary: bool,
 }
 
 /// One settle call the stand-in answered with success.
@@ -50,6 +52,10 @@ struct State {
     streams_held: bool,
     pubkey: String,
     networks: Vec<String>,
+    /// What `channels` answers (`None`: the node was given no channels macaroon).
+    channels: Option<Vec<Channel>>,
+    /// The preimages of the ordinary invoices: what a payer learns when its payment settles.
+    preimages: HashMap<Hash, [u8; 32]>,
 }
 
 #[derive(Debug)]
@@ -109,13 +115,32 @@ impl StandIn {
             return false;
         };
         h.inv = Invoice {
-            state: InvoiceState::Accepted,
+            state: if h.ordinary {
+                InvoiceState::Settled
+            } else {
+                InvoiceState::Accepted
+            },
             paid_msat: msat.unwrap_or(h.msat),
             expiry_height: Some(height + h.cltv + 3),
             accept_height: Some(height),
         };
         self.touch(&mut s);
         true
+    }
+
+    /// The preimage a payer of an ordinary invoice holds once its payment has settled.
+    pub fn paid_preimage(&self, hash: &Hash) -> Option<[u8; 32]> {
+        let s = self.lock();
+        let settled = s
+            .invoices
+            .get(hash)
+            .is_some_and(|h| h.ordinary && h.inv.state == InvoiceState::Settled);
+        settled.then(|| s.preimages.get(hash).copied()).flatten()
+    }
+
+    /// What the node's channel list says from now on (`None`: no channels macaroon).
+    pub fn set_channels(&self, channels: Option<Vec<Channel>>) {
+        self.lock().channels = channels;
     }
 
     /// A new tip: held invoices with 18 blocks or fewer left are cancelled, as the node does.
@@ -232,10 +257,52 @@ impl Node for StandIn {
                 inv,
                 msat,
                 cltv: cltv_blocks,
+                ordinary: false,
             },
         );
         self.touch(&mut s);
         Ok(format!("lnbcrt-standin-{}", hex::encode(hash)))
+    }
+
+    fn add_invoice(
+        &self,
+        preimage: &[u8; 32],
+        msat: u64,
+        cltv_blocks: u32,
+        _expiry_s: u32,
+    ) -> Result<String, NodeError> {
+        let mut s = self.call("add_invoice")?;
+        let hash: Hash = Sha256::digest(preimage).into();
+        if s.invoices.contains_key(&hash) {
+            return Err(NodeError::Refused(
+                "invoice with payment hash already exists".into(),
+            ));
+        }
+        let inv = Invoice {
+            state: InvoiceState::Open,
+            paid_msat: 0,
+            expiry_height: None,
+            accept_height: None,
+        };
+        s.invoices.insert(
+            hash,
+            Held {
+                inv,
+                msat,
+                cltv: cltv_blocks,
+                ordinary: true,
+            },
+        );
+        s.preimages.insert(hash, *preimage);
+        self.touch(&mut s);
+        Ok(format!("lnbcrt-standin-{}", hex::encode(hash)))
+    }
+
+    fn channels(&self) -> Result<Vec<Channel>, NodeError> {
+        let s = self.call("channels")?;
+        s.channels
+            .clone()
+            .ok_or_else(|| NodeError::Refused("this node was given no channels macaroon".into()))
     }
 
     fn settle(&self, preimage: &[u8; 32]) -> Result<(), NodeError> {

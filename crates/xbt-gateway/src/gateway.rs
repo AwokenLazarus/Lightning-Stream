@@ -18,6 +18,16 @@
 //!    redirect is followed, and nothing the service says is read for money: a body is charged by
 //!    the bytes the gateway itself sent and the seconds it itself counted.
 //! 6. **Receipt**: every answer to an authenticated request carries one, signed by the receipt key.
+//!
+//! Two more rules, kept at a lock:
+//!
+//! - **Half the slots** ([`Book::lock`], [`Gateway::slot_room`]): held tickets, all sessions
+//!   together, never pass the cap, and with a channels macaroon none is issued while an inbound
+//!   channel of the node is half full of pending payments. A buyer that meets either is told
+//!   `slots_short` and when to come back, before any invoice exists.
+//! - **Prepaid is the node's word** ([`Gateway::take_prepaid`]): a ticket settled on arrival is
+//!   an ordinary invoice whose preimage the gateway makes and forgets; it is credited once, when
+//!   the node shows that invoice settled for the full amount, whoever asks.
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read};
 use std::net::{SocketAddr, TcpListener};
@@ -28,7 +38,9 @@ use std::time::{Duration, Instant};
 use secp256k1::SecretKey;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use xbt402::ticket::{self, hex32, Terms, INVOICE_EXPIRY_S};
+use xbt402::ticket::{
+    self, held_budget, hex32, Terms, INVOICE_EXPIRY_S, SETTLE_ON_ARRIVAL, SETTLE_ON_USE,
+};
 use xbt402::wire::{
     auth_eq, b64json, body_hash, request_digest_v2, settlement_response, unb64json, X402_VERSION,
 };
@@ -78,6 +90,10 @@ pub struct Stats {
     /// Sessions with a ticket locked or a response open.
     pub active_sessions: usize,
     pub held_tickets: usize,
+    /// Tickets settled on arrival that are issued and not yet credited: they hold no slot.
+    pub prepaid_tickets: usize,
+    /// The cap on held tickets as it is now (a gateway that reads its channels moves it).
+    pub max_held: u32,
     pub settled: u64,
     /// The longest time from a secret's arrival to the node's yes, in microseconds.
     pub settle_max_us: u64,
@@ -206,6 +222,17 @@ impl Gateway {
         let (mut store, recs) =
             Store::open(&cfg.state_dir).map_err(|e| Error::Journal(e.to_string()))?;
         let mut book = Book::restore(cfg.caps.clone(), &recs, clock())?;
+        // a runner who gave a channels macaroon wants the cap read from the node: a macaroon that
+        // does not work is a config that does not, and nothing starts on it
+        if cfg.node.channels_macaroon.is_some() {
+            let channels = node.channels().map_err(|e| {
+                Error::Start(format!(
+                    "node.channels_macaroon is set and the node's channels could not be read: {e}"
+                ))
+            })?;
+            let (cap, _) = Self::sized(&cfg, &channels);
+            book.set_max_held(cap);
+        }
         // what the node says of every ticket the journal left unfinished, before anything is served
         for hash in book.unfinished() {
             let rec = match node
@@ -220,7 +247,12 @@ impl Gateway {
         store
             .compact(&book.snapshot())
             .map_err(|e| Error::Journal(e.to_string()))?;
-        let unfinished = book.unfinished();
+        // a ticket settled on arrival is not followed: the node's word is asked for when it is presented
+        let unfinished: Vec<Hash> = book
+            .unfinished()
+            .into_iter()
+            .filter(|h| book.ticket(h).is_some_and(|t| !t.prepaid))
+            .collect();
         let upstream = Upstream::new(&cfg.upstream, cfg.times.upstream_wait);
         let gw = Arc::new(Self {
             terms,
@@ -297,6 +329,8 @@ impl Gateway {
             sessions: st.book.sessions(),
             active_sessions: st.book.active_sessions(),
             held_tickets: st.book.held(),
+            prepaid_tickets: st.book.prepaid_open(),
+            max_held: st.book.caps().max_held,
             settled: self.settled.load(Ordering::SeqCst),
             settle_max_us: self.settle_max_us.load(Ordering::SeqCst),
             height: self.known_height(),
@@ -483,8 +517,79 @@ impl Gateway {
         }
     }
 
+    /// The cap on held tickets and whether a channel is half full, from the node's channel list:
+    /// half of the smallest channel's pending payments unless the runner set the cap, and no
+    /// channels, no held tickets.
+    fn sized(cfg: &Config, channels: &[crate::node::Channel]) -> (u32, bool) {
+        let smallest = channels.iter().map(|c| c.slots).min().unwrap_or(0);
+        let cap = if cfg.held_set {
+            cfg.caps.max_held
+        } else {
+            held_budget(smallest).min(crate::config::MAX_HELD)
+        };
+        let half_full = channels
+            .iter()
+            .any(|c| c.pending_in >= held_budget(c.slots));
+        (if channels.is_empty() { 0 } else { cap }, half_full)
+    }
+
+    /// Before a held ticket is issued, for a gateway that reads its node's channels: the cap is
+    /// brought to what the channels carry now, and nothing is issued while one of them is half
+    /// full of pending payments (the buyer's node chooses the channel a ticket arrives on, so the
+    /// fullest one counts). A list that cannot be read moves nothing and widens nothing: the cap
+    /// falls back to the config's own.
+    fn slot_room(&self) -> Result<(), Refusal> {
+        if self.cfg.node.channels_macaroon.is_none() {
+            return Ok(());
+        }
+        match self.node.channels() {
+            Ok(channels) => {
+                let (cap, half_full) = Self::sized(&self.cfg, &channels);
+                self.lock().book.set_max_held(cap);
+                if half_full {
+                    return Err(Refusal::SlotsShort(self.cfg.caps.slots_retry_secs));
+                }
+            }
+            Err(e) => {
+                eprintln!("xbt-gateway: the node's channels could not be read ({e}): the cap on held tickets is the config's until they can");
+                self.lock().book.set_max_held(self.cfg.caps.max_held);
+            }
+        }
+        Ok(())
+    }
+
+    /// A preimage presented for a ticket settled on arrival: the node says whether that invoice
+    /// was paid, and a paid one is credited once. No settle call is made: there is nothing held.
+    fn take_prepaid(&self, secret: &[u8; 32]) -> Result<Hash, Refusal> {
+        let hash = ticket::ticket_hash(secret);
+        match self.node.lookup(&hash) {
+            Ok(Some(inv)) => {
+                let paid = inv.state == InvoiceState::Settled
+                    && inv.paid_msat >= self.cfg.caps.ticket_msat;
+                self.apply(&hash, &inv);
+                match inv.state {
+                    _ if paid => Ok(hash),
+                    InvoiceState::Open | InvoiceState::Accepted => Err(Refusal::TicketNotLocked),
+                    InvoiceState::Settled | InvoiceState::Canceled => Err(Refusal::TicketUnknown),
+                }
+            }
+            Ok(None) => {
+                let mut st = self.lock();
+                if let Some(rec) = st.book.node_has_none(&hash) {
+                    self.journal(&mut st, &[rec]);
+                }
+                Err(Refusal::TicketUnknown)
+            }
+            Err(NodeError::Refused(_)) => Err(Refusal::TicketNotLocked),
+            Err(NodeError::Unreachable(_)) => Err(Refusal::HeightUnknown),
+        }
+    }
+
     /// Steps 2 and 3 of a paid request for one secret: find its ticket, settle it at once, credit it.
     fn take_secret(&self, session: &str, secret: &[u8; 32]) -> Result<Hash, Refusal> {
+        if self.lock().book.presented_kind(session, secret) == Ok(true) {
+            return self.take_prepaid(secret);
+        }
         let arrived = Instant::now();
         let height = self.known_height();
         let presented = self.lock().book.present(session, secret, height);
@@ -560,23 +665,38 @@ impl Gateway {
         &self,
         target: &str,
         route: Option<&Route>,
-        code: Option<&str>,
+        why: Option<Refusal>,
         session: Option<Value>,
     ) -> (Value, String) {
         let mut m = Map::new();
         m.insert("x402Version".into(), X402_VERSION.into());
-        if let Some(c) = code {
-            m.insert("error".into(), c.into());
+        if let Some(w) = why {
+            m.insert("error".into(), w.code().into());
+            if let Refusal::SlotsShort(secs) = w {
+                m.insert("retryAfter".into(), secs.into());
+            }
         }
         m.insert("resource".into(), json!({"url": self.url(target)}));
-        let accepts = route.map(|r| {
-            self.terms
-                .accepts(r.price.request_msat, r.release.name(), &r.price.terms())
-        });
-        m.insert(
-            "accepts".into(),
-            Value::Array(accepts.into_iter().collect()),
-        );
+        // one entry per way of settling the runner offers, the held one first: a buyer takes the
+        // first it can use
+        let ways = [
+            (self.cfg.held, SETTLE_ON_USE),
+            (self.cfg.prepaid, SETTLE_ON_ARRIVAL),
+        ];
+        let accepts: Vec<Value> = route
+            .into_iter()
+            .flat_map(|r| {
+                ways.iter().filter(|(on, _)| *on).map(|(_, settle)| {
+                    self.terms.accepts(
+                        r.price.request_msat,
+                        r.release.name(),
+                        settle,
+                        &r.price.terms(),
+                    )
+                })
+            })
+            .collect();
+        m.insert("accepts".into(), Value::Array(accepts));
         if let Some(s) = session {
             m.insert("session".into(), s);
         }
@@ -655,7 +775,7 @@ impl Gateway {
         let (body, header) = self.required(
             target,
             route,
-            Some(why.code()),
+            Some(why),
             Some(self.session_view(&a.session)),
         );
         let mut r = json_response(status, &body);
@@ -765,7 +885,7 @@ impl Gateway {
                 ))
             }
             Err(why) => {
-                let (body, header) = self.required(&req.target, route, Some(why.code()), None);
+                let (body, header) = self.required(&req.target, route, Some(why), None);
                 let mut r = json_response(402, &body);
                 r.headers.push(("PAYMENT-REQUIRED".into(), header));
                 return Err(r);
@@ -825,9 +945,53 @@ impl Gateway {
         if body.get("version").and_then(Value::as_str) != Some(ticket::VERSION) {
             return error(400, "bad_request", "version is ticket/0");
         }
-        let hashes = match Self::hashes(body.get("hashes"), self.cfg.caps.max_tickets as usize) {
-            Ok(h) => h,
-            Err(r) => return r,
+        // `settle` in a lock says which kind of ticket is asked for; without it, a held one
+        let prepaid = match body.get("settle").map(Value::as_str) {
+            None => false,
+            Some(Some(SETTLE_ON_USE)) => false,
+            Some(Some(SETTLE_ON_ARRIVAL)) => true,
+            Some(_) => return error(400, "bad_request", "settle is on-use or on-arrival"),
+        };
+        if (prepaid && !self.cfg.prepaid) || (!prepaid && !self.cfg.held) {
+            return error(
+                400,
+                "bad_request",
+                "this seller's terms do not offer tickets settled that way",
+            );
+        }
+        // for a ticket settled on arrival the buyer sends a count and the hashes are the seller's:
+        // the preimage of each is made here, given to the node with the invoice, and not kept
+        let most = self.cfg.caps.max_tickets as usize;
+        let mut preimages: HashMap<Hash, [u8; 32]> = HashMap::new();
+        let hashes = if prepaid {
+            let count = body
+                .get("count")
+                .and_then(Value::as_u64)
+                .filter(|n| (1..=most as u64).contains(n));
+            let Some(count) = count else {
+                return error(400, "bad_request", &format!("count is from 1 to {most}"));
+            };
+            if body.contains_key("hashes") {
+                return error(
+                    400,
+                    "bad_request",
+                    "a lock for tickets settled on arrival names a count, no hashes",
+                );
+            }
+            (0..count)
+                .map(|_| {
+                    let mut p = [0u8; 32];
+                    p.copy_from_slice(&xbt_svc::random_bytes(32));
+                    let h = ticket::ticket_hash(&p);
+                    preimages.insert(h, p);
+                    h
+                })
+                .collect()
+        } else {
+            match Self::hashes(body.get("hashes"), most) {
+                Ok(h) => h,
+                Err(r) => return r,
+            }
         };
         // a lock for a session that exists is a request of that session, authenticated as one
         let authed = match (&pay, body.get("session")) {
@@ -840,12 +1004,15 @@ impl Gateway {
         };
         let mut entropy = [0u8; 48];
         entropy.copy_from_slice(&xbt_svc::random_bytes(48));
-        let granted = {
+        // a held ticket takes a slot of the channel it arrives on: the node's channels first
+        let room = if prepaid { Ok(()) } else { self.slot_room() };
+        let granted = room.and_then(|()| {
             let mut st = self.lock();
             let granted = st.book.lock(
                 &addr_name(req.peer),
                 authed.as_ref().map(|a| a.session.as_str()),
                 &hashes,
+                prepaid,
                 &entropy,
                 self.now(),
             );
@@ -853,7 +1020,7 @@ impl Gateway {
                 let written = self.journal(&mut st, &g.recs);
                 (g, written, st.store.handle())
             })
-        };
+        });
         // on disk before the node is asked: a ticket the node holds is never one the journal forgot
         let granted = match granted {
             Ok((g, written, file)) if written && self.sync(&file) => Ok(g),
@@ -870,25 +1037,38 @@ impl Gateway {
         let g = match (granted, &authed) {
             (Ok(g), _) => g,
             (Err(why), Some(a)) => return self.refused(a, &req.target, None, why),
+            (Err(Refusal::SlotsShort(secs)), None) => {
+                return json_response(
+                    402,
+                    &json!({"error": Refusal::SlotsShort(secs).code(), "retryAfter": secs}),
+                )
+            }
             (Err(why), None) => return json_response(402, &json!({"error": why.code()})),
         };
         let (mut tickets, mut refused, mut down) = (vec![], vec![], false);
         for h in &g.issue {
-            let made = if down {
-                Err(NodeError::Unreachable(String::new()))
-            } else {
-                self.node.add_hold(
-                    h,
+            let made = match (down, preimages.get(h)) {
+                (true, _) => Err(NodeError::Unreachable(String::new())),
+                (false, Some(preimage)) => self.node.add_invoice(
+                    preimage,
                     self.cfg.caps.ticket_msat,
                     self.cfg.ticket_blocks,
                     INVOICE_EXPIRY_S,
-                )
+                ),
+                (false, None) => self
+                    .node
+                    .add_hold(
+                        h,
+                        self.cfg.caps.ticket_msat,
+                        self.cfg.ticket_blocks,
+                        INVOICE_EXPIRY_S,
+                    )
+                    .and_then(|inv| {
+                        self.watch(*h)
+                            .map(|()| inv)
+                            .map_err(|e| NodeError::Unreachable(e.to_string()))
+                    }),
             };
-            let made = made.and_then(|inv| {
-                self.watch(*h)
-                    .map(|()| inv)
-                    .map_err(|e| NodeError::Unreachable(e.to_string()))
-            });
             match made {
                 Ok(invoice) => tickets.push(json!({"hash": hex::encode(h), "invoice": invoice})),
                 Err(e) => {
@@ -979,7 +1159,8 @@ impl Gateway {
                     .book
                     .tickets_of(&a.session)
                     .iter()
-                    .map(|(h, t)| json!({"hash": hex::encode(h), "state": format!("{:?}", t.state).to_uppercase(), "expiryHeight": t.expiry_height}))
+                    .map(|(h, t)| json!({"hash": hex::encode(h), "state": format!("{:?}", t.state).to_uppercase(), "expiryHeight": t.expiry_height,
+                                         "settle": if t.prepaid { SETTLE_ON_ARRIVAL } else { SETTLE_ON_USE }}))
                     .collect();
                 let finals: Vec<Value> = st
                     .finals
@@ -1003,11 +1184,19 @@ impl Gateway {
             .iter()
             .map(|r| json!({"path": r.path, "methods": r.methods, "free": r.free, "price": r.price.terms(), "release": r.release.name()}))
             .collect();
+        let settle: Vec<&str> = [
+            (self.cfg.held, SETTLE_ON_USE),
+            (self.cfg.prepaid, SETTLE_ON_ARRIVAL),
+        ]
+        .iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, s)| *s)
+        .collect();
         json_response(
             200,
             &json!({"version": "services/0", "signed": false, "scheme": ticket::SCHEME, "network": self.terms.network, "payTo": self.terms.pay_to,
                     "receiptKey": self.terms.receipt_key, "session": self.terms.session, "ticketMsat": self.terms.ticket_msat.to_string(),
-                    "maxTickets": self.terms.max_tickets, "ticketBlocks": self.terms.ticket_blocks, "routes": routes}),
+                    "maxTickets": self.terms.max_tickets, "ticketBlocks": self.terms.ticket_blocks, "settle": settle, "routes": routes}),
         )
     }
 

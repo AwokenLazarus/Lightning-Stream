@@ -174,12 +174,15 @@ pub fn routes() -> Value {
     ])
 }
 
-/// A config for tests: `edit` changes it before it is read.
+/// A config for tests: `edit` changes it before it is read. The tests of the gateway's mechanisms
+/// run a seller whose inbound channels all carry 483 pending payments and who lets a session hold
+/// 8 tickets; the shipped defaults (2 a session, 15 in all) have tests of their own.
 pub fn config(state: &Path, upstream: &str, edit: &dyn Fn(&mut Value)) -> Value {
     let mut v = json!({"listen": "127.0.0.1:0", "public_url": "http://gateway.test:8402", "upstream": upstream, "state_dir": state,
         "chain": "regtest", "network": NET,
         "node": {"rest": "http://127.0.0.1:1", "macaroon": "unused", "info_macaroon": "unused"},
-        "caps": {"sessions_per_address": 0},
+        "tickets": {"max_tickets": 8},
+        "caps": {"sessions_per_address": 0, "inbound_slots": 483},
         "times": {"refill_wait_ms": 300, "upstream_wait_secs": 2, "tick_ms": 50},
         "routes": routes()});
     edit(&mut v);
@@ -537,6 +540,45 @@ impl Buyer {
             self.used(&got);
         }
         if got.status == 200 && self.session.is_empty() && got.json()["session"].is_string() {
+            let j = got.json();
+            self.session = j["session"].as_str().unwrap().to_string();
+            self.key = ticket::hex32(j["key"].as_str().unwrap()).unwrap();
+        }
+        got
+    }
+
+    /// Ask for `count` tickets settled on arrival (the seller chooses their hashes).
+    pub fn lock_prepaid(&mut self, count: u64) -> Got {
+        let first = self.session.is_empty();
+        let mut body = json!({"version": "ticket/0", "settle": "on-arrival", "count": count});
+        let mut headers = vec![];
+        if !first {
+            body["session"] = self.session.clone().into();
+            let sig = self.sign(
+                "POST",
+                "/x402/ticket/lock",
+                body.to_string().as_bytes(),
+                None,
+                None,
+            );
+            headers.push(("PAYMENT-SIGNATURE".to_string(), sig));
+        }
+        let hs: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let got = http(
+            &self.addr,
+            "POST",
+            "/x402/ticket/lock",
+            &hs,
+            body.to_string().as_bytes(),
+            None,
+        );
+        if !first {
+            self.used(&got);
+        }
+        if got.status == 200 && first && got.json()["session"].is_string() {
             let j = got.json();
             self.session = j["session"].as_str().unwrap().to_string();
             self.key = ticket::hex32(j["key"].as_str().unwrap()).unwrap();

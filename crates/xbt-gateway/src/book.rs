@@ -13,6 +13,11 @@
 //!   the runner marked checkable, from one pledged ticket as well).
 //! - **Bounded.** Sessions, sessions per address and unreleased tickets are capped, and what a cap
 //!   refuses is refused before anything is asked of the node.
+//! - **Half the slots.** Held tickets, all sessions together, are at most [`Caps::max_held`]: half
+//!   of the pending payments one inbound channel carries unless the runner said more. A lock beyond
+//!   it is refused as `slots_short` with a time to wait, and makes no session.
+//! - **Prepaid is paid, then credited once.** A ticket settled on arrival holds no slot and is not
+//!   counted as held; it is credited when the node shows its invoice settled, and only then.
 //!
 //! What the node shows is the record of money: a ticket's state here is the last one the node
 //! reported, and a restart reads every unfinished ticket from the node again before it is used.
@@ -36,8 +41,10 @@ pub struct Caps {
     pub sessions_per_address: u32,
     /// Sessions in all, those that only keep a paid balance included.
     pub max_kept_sessions: u32,
-    /// Unreleased tickets in all.
+    /// Held tickets in all (tickets settled on arrival hold nothing and are not counted).
     pub max_held: u32,
+    /// What a buyer refused for lack of a slot is told to wait, in seconds.
+    pub slots_retry_secs: u64,
     pub margin_blocks: u32,
     /// An unpaid ticket is given up this many seconds after it was issued.
     pub unpaid_secs: u64,
@@ -63,6 +70,8 @@ pub enum Refusal {
     BalanceShort,
     TooManyTickets,
     TooManySessions,
+    /// The cap on held tickets, all sessions together, is reached; the seconds to wait.
+    SlotsShort(u64),
     /// The block height is not known, so no ticket's margin can be shown.
     HeightUnknown,
     /// A ticket is already pledged, or the session owes for a piece it was served.
@@ -82,6 +91,7 @@ impl Refusal {
             Self::BalanceShort => "balance_short",
             Self::TooManyTickets => "too_many_tickets",
             Self::TooManySessions => "too_many_sessions",
+            Self::SlotsShort(_) => "slots_short",
             Self::HeightUnknown => "node_unavailable",
             Self::PledgeOutstanding => "pledge_outstanding",
         }
@@ -105,6 +115,9 @@ pub struct Ticket {
     pub paid_msat: u64,
     pub expiry_height: Option<u32>,
     pub issued_at: u64,
+    /// Settled on arrival: an ordinary invoice, which holds no slot. It stays `Open` until the
+    /// node shows it settled, and is then credited and gone.
+    pub prepaid: bool,
 }
 
 /// How many used hashes a session remembers, to answer `ticket_used` instead of `ticket_unknown`.
@@ -156,6 +169,8 @@ pub enum Rec {
     Ticket {
         hash: Hash,
         session: String,
+        /// Settled on arrival. Written only when true, so a journal from before reads as held.
+        prepaid: bool,
     },
     /// The ticket is finished and paid nothing.
     Gone {
@@ -184,8 +199,16 @@ impl Rec {
             Self::Session { id, key, addr } => {
                 json!({"t": "session", "id": id, "key": hex::encode(key), "addr": addr})
             }
-            Self::Ticket { hash, session } => {
-                json!({"t": "ticket", "hash": hex::encode(hash), "session": session})
+            Self::Ticket {
+                hash,
+                session,
+                prepaid,
+            } => {
+                let mut v = json!({"t": "ticket", "hash": hex::encode(hash), "session": session});
+                if *prepaid {
+                    v["prepaid"] = true.into();
+                }
+                v
             }
             Self::Gone { hash } => json!({"t": "gone", "hash": hex::encode(hash)}),
             Self::Released { hash, msat } => {
@@ -217,6 +240,11 @@ impl Rec {
             "ticket" => Self::Ticket {
                 hash: h("hash")?,
                 session: s("session")?.to_string(),
+                prepaid: match v.get("prepaid") {
+                    None => false,
+                    Some(Value::Bool(b)) => *b,
+                    Some(_) => return None,
+                },
             },
             "gone" => Self::Gone { hash: h("hash")? },
             "released" => Self::Released {
@@ -304,9 +332,21 @@ impl Book {
             .count()
     }
 
-    /// Unreleased tickets in all, unpaid ones included.
+    /// Held tickets in all, unpaid ones included: what the cap on held tickets counts. A ticket
+    /// settled on arrival is not one.
     pub fn held(&self) -> usize {
-        self.tickets.len()
+        self.tickets.values().filter(|t| !t.prepaid).count()
+    }
+
+    /// Tickets settled on arrival that are issued and not yet credited.
+    pub fn prepaid_open(&self) -> usize {
+        self.tickets.values().filter(|t| t.prepaid).count()
+    }
+
+    /// Set the cap on held tickets (a gateway that reads its node's channels sizes itself). What is
+    /// held already stays; nothing more is issued above the cap.
+    pub fn set_max_held(&mut self, max_held: u32) {
+        self.caps.max_held = max_held;
     }
 
     /// The tickets of one session, in hash order.
@@ -332,12 +372,16 @@ impl Book {
 
     /// A lock request: `session` None makes a session (its id and key from `entropy`), else the
     /// caller has authenticated it. Grants as many of `hashes` as the caps allow, in order; a hash
-    /// already in the book is skipped. Bounded: nothing here asks the node.
+    /// already in the book is skipped. `prepaid`: the tickets are settled on arrival, hold no slot
+    /// and are bounded by the session's own cap only. A held lock that the cap on held tickets
+    /// leaves no room for is `slots_short`, checked before a session is made. Bounded: nothing
+    /// here asks the node.
     pub fn lock(
         &mut self,
         addr: &str,
         session: Option<&str>,
         hashes: &[Hash],
+        prepaid: bool,
         entropy: &[u8; 48],
         now: u64,
     ) -> Result<Granted, Refusal> {
@@ -379,7 +423,15 @@ impl Book {
         };
         let live = self.sessions.get(&id).map_or(0, |s| s.live);
         let room_session = self.caps.max_tickets.saturating_sub(live) as usize;
-        let room_total = (self.caps.max_held as usize).saturating_sub(self.tickets.len());
+        let room_total = if prepaid {
+            usize::MAX
+        } else {
+            (self.caps.max_held as usize).saturating_sub(self.held())
+        };
+        // the session's own cap first: a buyer at it gains nothing by waiting for another's slots
+        if room_session > 0 && room_total == 0 {
+            return Err(Refusal::SlotsShort(self.caps.slots_retry_secs));
+        }
         let mut issue: Vec<Hash> = vec![];
         for h in hashes {
             if issue.len() >= room_session.min(room_total) {
@@ -424,11 +476,13 @@ impl Book {
                     paid_msat: 0,
                     expiry_height: None,
                     issued_at: now,
+                    prepaid,
                 },
             );
             recs.push(Rec::Ticket {
                 hash: *h,
                 session: id.clone(),
+                prepaid,
             });
         }
         if let Some(s) = self.sessions.get_mut(&id) {
@@ -511,6 +565,10 @@ impl Book {
             _ if used => return Err(Refusal::TicketUsed),
             _ => return Err(Refusal::TicketUnknown),
         };
+        // a ticket settled on arrival is never settled by a secret: the node's word credits it
+        if t.prepaid {
+            return Err(Refusal::TicketNotLocked);
+        }
         match t.state {
             TicketState::Open => return Err(Refusal::TicketNotLocked),
             TicketState::Settling => return Err(Refusal::TicketUsed),
@@ -522,6 +580,19 @@ impl Book {
         Self::outside_margin(caps, t, height)?;
         t.state = TicketState::Settling;
         Ok(hash)
+    }
+
+    /// What a presented preimage names in `session`: `Ok(true)` a ticket settled on arrival that is
+    /// not credited yet (the node is then asked whether it was paid), `Ok(false)` a held ticket.
+    /// `Err`: none of this session's, or one credited before.
+    pub fn presented_kind(&self, session: &str, secret: &[u8; 32]) -> Result<bool, Refusal> {
+        let hash = ticket_hash(secret);
+        let s = self.sessions.get(session).ok_or(Refusal::SessionUnknown)?;
+        match self.tickets.get(&hash) {
+            Some(t) if t.session == session => Ok(t.prepaid),
+            _ if s.used.contains(&hash) => Err(Refusal::TicketUsed),
+            _ => Err(Refusal::TicketUnknown),
+        }
     }
 
     fn outside_margin(caps: &Caps, t: &Ticket, height: Option<u32>) -> Result<(), Refusal> {
@@ -538,6 +609,13 @@ impl Book {
     pub fn settled(&mut self, hash: &Hash, paid_msat: Option<u64>) -> Option<Rec> {
         let t = self.tickets.get(hash)?;
         let msat = paid_msat.unwrap_or(t.paid_msat).min(self.caps.ticket_msat);
+        // a ticket settled on arrival that arrived short is no ticket: the session is not
+        // credited a part, and the invoice is finished on the node either way
+        if t.prepaid && msat < self.caps.ticket_msat {
+            return self
+                .remove(hash, false)
+                .then_some(Rec::Gone { hash: *hash });
+        }
         let session = t.session.clone();
         self.remove(hash, true);
         let s = self.sessions.get_mut(&session)?;
@@ -567,6 +645,8 @@ impl Book {
                 }
                 None
             }
+            // an ordinary invoice is never held: a moment between arrival and settle changes nothing
+            InvoiceState::Accepted if t.prepaid => None,
             InvoiceState::Accepted => {
                 t.paid_msat = inv.paid_msat;
                 t.expiry_height = inv.expiry_height;
@@ -807,6 +887,7 @@ impl Book {
                 out.push(Rec::Ticket {
                     hash: carry_hash(id),
                     session: id.clone(),
+                    prepaid: false,
                 });
                 out.push(Rec::Released {
                     hash: carry_hash(id),
@@ -818,6 +899,7 @@ impl Book {
             out.push(Rec::Ticket {
                 hash: h,
                 session: self.tickets[&h].session.clone(),
+                prepaid: self.tickets[&h].prepaid,
             });
         }
         for id in self.sessions.keys() {
@@ -853,7 +935,11 @@ impl Book {
                         },
                     );
                 }
-                Rec::Ticket { hash, session } => {
+                Rec::Ticket {
+                    hash,
+                    session,
+                    prepaid,
+                } => {
                     let s = b
                         .sessions
                         .get_mut(session)
@@ -867,6 +953,7 @@ impl Book {
                                 paid_msat: 0,
                                 expiry_height: None,
                                 issued_at: now,
+                                prepaid: *prepaid,
                             },
                         )
                         .is_none()
@@ -935,6 +1022,7 @@ mod tests {
             sessions_per_address: 2,
             max_kept_sessions: 6,
             max_held: 20,
+            slots_retry_secs: 30,
             margin_blocks: 24,
             unpaid_secs: 75,
             first_use_secs: 60,
@@ -967,7 +1055,7 @@ mod tests {
     /// A session with tickets `ns` locked at expiry 200.
     fn open(b: &mut Book, e: u8, ns: &[u8]) -> String {
         let hashes: Vec<Hash> = ns.iter().map(|n| hash(*n)).collect();
-        let g = b.lock("a", None, &hashes, &ent(e), 0).unwrap();
+        let g = b.lock("a", None, &hashes, false, &ent(e), 0).unwrap();
         for h in &g.issue {
             assert_eq!(b.issued(h, true), None);
             b.node_update(h, &held(200));
@@ -978,7 +1066,9 @@ mod tests {
     #[test]
     fn a_secret_is_taken_only_for_a_ticket_seen_accepted_in_its_own_session() {
         let mut b = Book::new(caps());
-        let g = b.lock("a", None, &[hash(1), hash(2)], &ent(1), 0).unwrap();
+        let g = b
+            .lock("a", None, &[hash(1), hash(2)], false, &ent(1), 0)
+            .unwrap();
         let s = g.session.clone();
         assert_eq!(g.key, Some([1u8; 32]));
         assert_eq!(g.issue, vec![hash(1), hash(2)]);
@@ -1241,7 +1331,9 @@ mod tests {
         let sess = b.session(&s).unwrap();
         assert_eq!((sess.pledge, sess.owed_msat()), (None, 900_000));
         assert_eq!(b.charge(&s, 1, true, 5), Err(Refusal::BalanceShort));
-        let g = b.lock("a", Some(&s), &[hash(3)], &ent(0), 0).unwrap();
+        let g = b
+            .lock("a", Some(&s), &[hash(3)], false, &ent(0), 0)
+            .unwrap();
         b.node_update(&g.issue[0], &held(200));
         assert_eq!(
             b.pledge(&s, &hash(3), Some(100)),
@@ -1273,15 +1365,15 @@ mod tests {
         let mut b = Book::new(caps());
         let many: Vec<Hash> = (1..=20).map(hash).collect();
         // per session: 8 of 20, in order
-        let g = b.lock("a", None, &many, &ent(1), 0).unwrap();
+        let g = b.lock("a", None, &many, false, &ent(1), 0).unwrap();
         assert_eq!(g.issue, many[..8].to_vec());
         assert_eq!(
-            b.lock("a", Some(&g.session), &many[8..], &ent(0), 0),
+            b.lock("a", Some(&g.session), &many[8..], false, &ent(0), 0),
             Err(Refusal::TooManyTickets)
         );
         // a hash already in the book is skipped, in any session
         assert_eq!(
-            b.lock("a", None, &many[..8], &ent(2), 0),
+            b.lock("a", None, &many[..8], false, &ent(2), 0),
             Err(Refusal::TooManyTickets)
         );
         assert_eq!(
@@ -1300,14 +1392,28 @@ mod tests {
             },
         );
         assert_eq!(
-            b.lock("a", Some(&g.session), &[hash(30), hash(31)], &ent(0), 0)
-                .unwrap()
-                .issue,
+            b.lock(
+                "a",
+                Some(&g.session),
+                &[hash(30), hash(31)],
+                false,
+                &ent(0),
+                0
+            )
+            .unwrap()
+            .issue,
             vec![hash(30)]
         );
         // per address: 2 sessions
         let g2 = b
-            .lock("a", None, &[hash(40), hash(40), hash(41)], &ent(2), 0)
+            .lock(
+                "a",
+                None,
+                &[hash(40), hash(40), hash(41)],
+                false,
+                &ent(2),
+                0,
+            )
             .unwrap();
         assert_eq!(
             g2.issue,
@@ -1315,7 +1421,7 @@ mod tests {
             "a hash named twice is one ticket"
         );
         assert_eq!(
-            b.lock("a", None, &[hash(50)], &ent(3), 0),
+            b.lock("a", None, &[hash(50)], false, &ent(3), 0),
             Err(Refusal::TooManySessions)
         );
         // in all: 20 held (8 + 2 so far)
@@ -1324,6 +1430,7 @@ mod tests {
                 "b",
                 None,
                 &(60..80).map(hash).collect::<Vec<_>>(),
+                false,
                 &ent(3),
                 0,
             )
@@ -1334,6 +1441,7 @@ mod tests {
                 "b",
                 None,
                 &(80..100).map(hash).collect::<Vec<_>>(),
+                false,
                 &ent(4),
                 0,
             )
@@ -1342,16 +1450,21 @@ mod tests {
         assert_eq!(b.held(), 20);
         // sessions in all: 4
         assert_eq!(
-            b.lock("c", None, &[hash(100)], &ent(5), 0),
+            b.lock("c", None, &[hash(100)], false, &ent(5), 0),
             Err(Refusal::TooManySessions)
         );
-        // a refill of an existing session at the total cap
+        // a refill of an existing session at the total cap: a wait, not a fault of the session
         assert_eq!(
-            b.lock("b", Some(&g4.session), &[hash(101)], &ent(0), 0),
+            b.lock("b", Some(&g4.session), &[hash(101)], false, &ent(0), 0),
+            Err(Refusal::SlotsShort(30))
+        );
+        // a session at its own cap is told that, whatever the total is
+        assert_eq!(
+            b.lock("b", Some(&g3.session), &[hash(101)], false, &ent(0), 0),
             Err(Refusal::TooManyTickets)
         );
         assert_eq!(
-            b.lock("b", Some("nobody"), &[hash(101)], &ent(0), 0),
+            b.lock("b", Some("nobody"), &[hash(101)], false, &ent(0), 0),
             Err(Refusal::SessionUnknown)
         );
         // a ticket the node would not issue leaves the book, and a session left with none was never made
@@ -1379,14 +1492,17 @@ mod tests {
         });
         let first = open(&mut k, 1, &[1]);
         assert_eq!(
-            k.lock("a", None, &[hash(2)], &ent(2), 0),
+            k.lock("a", None, &[hash(2)], false, &ent(2), 0),
             Err(Refusal::TooManySessions)
         );
         k.present(&first, &secret(1), Some(100)).unwrap();
         k.settled(&hash(1), None);
-        let second = k.lock("a", None, &[hash(2)], &ent(2), 0).unwrap().session;
+        let second = k
+            .lock("a", None, &[hash(2)], false, &ent(2), 0)
+            .unwrap()
+            .session;
         assert_eq!(
-            k.lock("a", Some(&first), &[hash(3)], &ent(0), 0),
+            k.lock("a", Some(&first), &[hash(3)], false, &ent(0), 0),
             Err(Refusal::TooManySessions),
             "the place is taken now"
         );
@@ -1400,13 +1516,13 @@ mod tests {
             },
         );
         assert_eq!(
-            k.lock("a", Some(&first), &[hash(3)], &ent(0), 0)
+            k.lock("a", Some(&first), &[hash(3)], false, &ent(0), 0)
                 .unwrap()
                 .issue,
             vec![hash(3)]
         );
         assert_eq!(
-            k.lock("a", Some(&second), &[hash(4)], &ent(0), 0),
+            k.lock("a", Some(&second), &[hash(4)], false, &ent(0), 0),
             Err(Refusal::TooManySessions)
         );
         // and sessions in all are bounded too
@@ -1422,7 +1538,7 @@ mod tests {
             all.settled(&hash(n), None);
         }
         assert_eq!(
-            all.lock("a", None, &[hash(9)], &ent(9), 0),
+            all.lock("a", None, &[hash(9)], false, &ent(9), 0),
             Err(Refusal::TooManySessions)
         );
         // no cap per address when it is 0
@@ -1432,7 +1548,7 @@ mod tests {
         });
         for n in 0..4 {
             open_house
-                .lock("a", None, &[hash(n)], &ent(n + 1), 0)
+                .lock("a", None, &[hash(n)], false, &ent(n + 1), 0)
                 .unwrap();
         }
     }
@@ -1451,7 +1567,9 @@ mod tests {
         b.present(&s, &secret(1), Some(100)).unwrap();
         b.settled(&hash(1), None);
         b.charge(&s, 1, false, 5).unwrap();
-        let g = b.lock("a", Some(&s), &[hash(3)], &ent(0), 10).unwrap();
+        let g = b
+            .lock("a", Some(&s), &[hash(3)], false, &ent(0), 10)
+            .unwrap();
         assert_eq!(g.issue, vec![hash(3)]);
         assert_eq!(b.sweep(20, Some(100)), Sweep::default());
         // unpaid for longer than the invoice lives
@@ -1467,7 +1585,7 @@ mod tests {
             "an unknown height cancels nothing on its own"
         );
         // t never releases anything: its tickets are given back after first_use_secs
-        let g = b.lock("b", None, &[hash(7)], &ent(2), 100).unwrap();
+        let g = b.lock("b", None, &[hash(7)], false, &ent(2), 100).unwrap();
         let t = g.session;
         b.node_update(&hash(7), &held(200));
         assert_eq!(b.sweep(160, Some(100)).cancel, Vec::<Hash>::new());
@@ -1505,7 +1623,7 @@ mod tests {
         let mut b = Book::new(caps());
         let mut journal: Vec<Rec> = vec![];
         let g = b
-            .lock("a", None, &[hash(1), hash(2), hash(3)], &ent(1), 0)
+            .lock("a", None, &[hash(1), hash(2), hash(3)], false, &ent(1), 0)
             .unwrap();
         journal.extend(g.recs.clone());
         let s = g.session;
@@ -1562,7 +1680,9 @@ mod tests {
                 .is_some());
             assert_eq!(r.session(&s).unwrap().released_msat, 2_000_000, "{label}");
             // the node has no such invoice: finished, nothing paid
-            let g = r.lock("a", Some(&s), &[hash(8)], &ent(0), 0).unwrap();
+            let g = r
+                .lock("a", Some(&s), &[hash(8)], false, &ent(0), 0)
+                .unwrap();
             assert_eq!(
                 r.node_has_none(&g.issue[0]),
                 Some(Rec::Gone { hash: hash(8) }),
@@ -1590,7 +1710,8 @@ mod tests {
             caps(),
             &[Rec::Ticket {
                 hash: hash(1),
-                session: "nobody".into()
+                session: "nobody".into(),
+                prepaid: false,
             }],
             0
         )
@@ -1600,5 +1721,177 @@ mod tests {
             Rec::from_json(&json!({"t": "mark", "session": "s", "seq": 1, "spent": "2"})),
             None
         );
+    }
+
+    fn node_says(state: InvoiceState, paid_msat: u64) -> Invoice {
+        Invoice {
+            state,
+            paid_msat,
+            expiry_height: None,
+            accept_height: None,
+        }
+    }
+
+    #[test]
+    fn held_tickets_stop_at_the_cap_and_the_next_buyer_is_told_to_wait() {
+        // the shipped shape: 2 a session, 15 in all (half of a 30-slot channel)
+        let mut b = Book::new(Caps {
+            max_tickets: 2,
+            max_sessions: 30,
+            sessions_per_address: 0,
+            max_kept_sessions: 100,
+            max_held: 15,
+            ..caps()
+        });
+        let mut n = 0u8;
+        let mut two = || {
+            n += 2;
+            [hash(n - 1), hash(n)]
+        };
+        let mut sessions = vec![];
+        for e in 1..=7u8 {
+            let g = b.lock("a", None, &two(), false, &ent(e), 0).unwrap();
+            assert_eq!(g.issue.len(), 2);
+            sessions.push(g.session);
+        }
+        assert_eq!(b.held(), 14, "7 buyers at 2 each");
+        // the eighth gets the one place that is left, the ninth none and no session
+        let g8 = b.lock("a", None, &two(), false, &ent(8), 0).unwrap();
+        assert_eq!((g8.issue.len(), b.held()), (1, 15));
+        assert_eq!(
+            b.lock("a", None, &two(), false, &ent(9), 0),
+            Err(Refusal::SlotsShort(30))
+        );
+        assert_eq!(b.sessions(), 8, "a buyer told to wait has no session");
+        assert_eq!(Refusal::SlotsShort(30).code(), "slots_short");
+        // a ticket that is released or cancelled frees its place
+        b.node_update(&hash(1), &node_says(InvoiceState::Canceled, 0));
+        assert_eq!(
+            b.lock("a", None, &two(), false, &ent(9), 0)
+                .unwrap()
+                .issue
+                .len(),
+            1
+        );
+        // the cap can be moved while the gateway runs: what is held stays, nothing more is issued
+        b.set_max_held(4);
+        assert_eq!(b.held(), 15);
+        assert_eq!(
+            b.lock("a", Some(&sessions[0]), &two(), false, &ent(0), 0),
+            Err(Refusal::SlotsShort(30))
+        );
+    }
+
+    #[test]
+    fn a_prepaid_ticket_holds_no_slot_and_is_credited_once_when_the_node_shows_it_paid() {
+        let mut b = Book::new(Caps {
+            max_tickets: 2,
+            max_held: 1,
+            ..caps()
+        });
+        // the one held place is taken
+        let held_session = open(&mut b, 1, &[1]);
+        assert_eq!(
+            b.lock("b", None, &[hash(2)], false, &ent(2), 0),
+            Err(Refusal::SlotsShort(30))
+        );
+        // a prepaid ticket is issued all the same, and is not counted as held
+        let g = b.lock("b", None, &[hash(2)], true, &ent(2), 0).unwrap();
+        assert_eq!(
+            g.recs.last(),
+            Some(&Rec::Ticket {
+                hash: hash(2),
+                session: g.session.clone(),
+                prepaid: true
+            })
+        );
+        assert_eq!((b.held(), b.prepaid_open()), (1, 1));
+        assert_eq!(b.presented_kind(&g.session, &secret(2)), Ok(true));
+        assert_eq!(b.presented_kind(&held_session, &secret(1)), Ok(false));
+        assert_eq!(
+            b.presented_kind(&held_session, &secret(2)),
+            Err(Refusal::TicketUnknown),
+            "another session's ticket"
+        );
+        // a preimage is no settle order for it: only the node's word credits
+        assert_eq!(
+            b.present(&g.session, &secret(2), Some(100)),
+            Err(Refusal::TicketNotLocked)
+        );
+        // unpaid, or in the moment between arrival and settle: nothing
+        assert_eq!(
+            b.node_update(&hash(2), &node_says(InvoiceState::Open, 0)),
+            None
+        );
+        assert_eq!(
+            b.node_update(&hash(2), &node_says(InvoiceState::Accepted, 1_000_000)),
+            None
+        );
+        assert_eq!(b.session(&g.session).unwrap().released_msat, 0);
+        assert_eq!(b.ticket(&hash(2)).unwrap().state, TicketState::Open);
+        // paid: credited, and gone from the book
+        assert_eq!(
+            b.node_update(&hash(2), &node_says(InvoiceState::Settled, 1_000_000)),
+            Some(Rec::Released {
+                hash: hash(2),
+                msat: 1_000_000
+            })
+        );
+        assert_eq!(b.session(&g.session).unwrap().balance_msat(), 1_000_000);
+        assert_eq!(
+            b.node_update(&hash(2), &node_says(InvoiceState::Settled, 1_000_000)),
+            None,
+            "once"
+        );
+        assert_eq!(
+            b.presented_kind(&g.session, &secret(2)),
+            Err(Refusal::TicketUsed)
+        );
+        // the session's own cap bounds what it can have issued and not paid
+        let g2 = b
+            .lock(
+                "b",
+                Some(&g.session),
+                &[hash(3), hash(4), hash(5)],
+                true,
+                &ent(0),
+                0,
+            )
+            .unwrap();
+        assert_eq!(g2.issue.len(), 2);
+        assert_eq!(
+            b.lock("b", Some(&g.session), &[hash(6)], true, &ent(0), 0),
+            Err(Refusal::TooManyTickets)
+        );
+        // one that arrived short is no ticket and credits nothing
+        assert_eq!(
+            b.node_update(&hash(3), &node_says(InvoiceState::Settled, 999_999)),
+            Some(Rec::Gone { hash: hash(3) })
+        );
+        assert_eq!(b.session(&g.session).unwrap().released_msat, 1_000_000);
+        // an unpaid one is given up by the janitor like any unpaid ticket
+        let sweep = b.sweep(76, Some(100));
+        assert!(sweep.cancel.contains(&hash(4)));
+        // a restart keeps which tickets are prepaid, and a journal from before reads as held
+        let r = Book::restore(b.caps().clone(), &b.snapshot(), 0).unwrap();
+        assert!(r.ticket(&hash(4)).unwrap().prepaid && !r.ticket(&hash(1)).unwrap().prepaid);
+        let old = json!({"t": "ticket", "hash": hex::encode(hash(9)), "session": "s"});
+        assert_eq!(
+            Rec::from_json(&old),
+            Some(Rec::Ticket {
+                hash: hash(9),
+                session: "s".into(),
+                prepaid: false
+            })
+        );
+        let rec = Rec::Ticket {
+            hash: hash(9),
+            session: "s".into(),
+            prepaid: true,
+        };
+        assert_eq!(Rec::from_json(&rec.to_json()), Some(rec));
+        let mut bent = old.clone();
+        bent["prepaid"] = "yes".into();
+        assert_eq!(Rec::from_json(&bent), None);
     }
 }
