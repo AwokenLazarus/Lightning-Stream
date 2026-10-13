@@ -391,6 +391,13 @@ impl Book {
         None
     }
 
+    /// How long the session's oldest unpaid win may still be waited for, in seconds: what is left
+    /// of `grace_seconds` since it was drawn. 0: none is unpaid, or the time is up.
+    pub fn grace_left(&self, session: &str, now: u64) -> u64 {
+        let Some(s) = self.sessions.get(session) else { return 0 };
+        s.unpaid.iter().map(|w| w.drawn_at).min().map_or(0, |at| (at + u64::from(self.cfg.grace_seconds)).saturating_sub(now))
+    }
+
     /// A piece has left for the buyer. A piece with no price is not a piece.
     pub fn serve(&mut self, session: &str, piece: Piece) -> Result<(), Refusal> {
         let s = self.sessions.get_mut(session).ok_or(Refusal::SessionUnknown)?;
@@ -684,6 +691,7 @@ mod tests {
         assert_eq!(b.blocked(&id, 2000), None, "served on while the payment is on its way");
         assert_eq!(b.blocked(&id, 2010), None);
         assert_eq!(b.blocked(&id, 2011), Some(Refusal::WinUnpaid), "grace_seconds");
+        assert_eq!((b.grace_left(&id, 2000), b.grace_left(&id, 2004), b.grace_left(&id, 2010), b.grace_left(&id, 2999), b.grace_left("nobody", 0)), (10, 6, 0, 0, 0));
         // by pieces, on a fresh session: four more may be served and drawn for, the fifth is not
         let mut b = Book::new(cfg());
         let id = open(&mut b, 1, "a").unwrap();

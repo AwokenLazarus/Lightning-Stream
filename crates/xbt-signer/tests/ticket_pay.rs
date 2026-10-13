@@ -1640,6 +1640,45 @@ fn a_kill_of_the_signer_at_every_write_of_a_paid_call_never_undercounts_and_the_
     assert!(survived.is_some_and(|s| s > 5), "the call was killed at every write step up to its end: {survived:?}");
 }
 
+/// An ordinary payment (a prepaid ticket here; a win of the lottery is booked by the same function)
+/// is booked before it is sent. A signer killed between any two of its writes must leave nothing
+/// in the ledger that the node did not pay.
+///
+/// FAILS before the book's row was written ahead of the ledger's: killed between the two, the
+/// ledger held a ticket the book had never heard of, and nothing ever took it out again. Seen on
+/// the lab, with a win, when the signer was killed in the middle of a download.
+#[test]
+fn a_kill_of_the_signer_at_every_write_of_an_ordinary_payment_leaves_nothing_booked_that_was_not_paid() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let mut survived = None;
+    for step in 0..400 {
+        // a seller that offers only prepaid tickets: the page is paid by one ordinary payment
+        let mut r = Rig::shipped(json!({}), 30, json!({"tickets": {"settle": ["on-arrival"]}, "caps": {"sessions_per_address": 0}}));
+        let done = crashing(step, || r.pay("/page/10", 10));
+        if let Some(v) = &done {
+            assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "step {step}: {v}");
+            survived = Some(step);
+        }
+        r.restart();
+        // a payment that was written ahead and never reached the node is given up once it can no longer be on its way
+        r.clock.fetch_add(200, Ordering::SeqCst);
+        r.tick();
+        wait_for("the payment of the dead call to be final", || {
+            r.tick();
+            r.ln.by_status("IN_FLIGHT").is_empty()
+        });
+        r.tick();
+        let (paid, taken, book, ledger) = r.money();
+        assert_eq!((taken, book), (paid, paid), "step {step}");
+        assert_eq!(ledger, (paid / TICKET) as i64 * SETTLED, "step {step}: the ledger holds what the node paid and nothing else: {:?}", r.ledger());
+        assert!(paid <= TICKET, "step {step}: at most the one ticket of the call");
+        if done.is_some() {
+            break;
+        }
+    }
+    assert!(survived.is_some_and(|s| s > 5), "the call was killed at every write step up to its end: {survived:?}");
+}
+
 #[test]
 fn a_restart_of_the_gateway_or_of_the_signer_in_the_middle_of_a_session_resumes_or_says_so() {
     let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
@@ -2305,9 +2344,10 @@ const WIN: u64 = 64_000;
 const WIN_SETTLED: i64 = 66;
 const PIECE: usize = 65_536;
 
-/// The gateway as it ships, with the lottery on: wins of 64 sat (16 at the least), pieces of 64 KiB.
+/// The gateway with the lottery on: wins of 64 sat (16 at the least), pieces of 64 KiB.
 fn draws_shop() -> Value {
-    json!({"tickets": {}, "caps": {"sessions_per_address": 0}, "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0}})
+    // (a grace of 2 s where the gateway ships 30: an answer whose win stays unpaid stands still for that long)
+    json!({"tickets": {}, "caps": {"sessions_per_address": 0}, "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 2}})
 }
 
 /// The wallet as it ships on a 30-slot channel, paying a seller that offers the lottery.
@@ -2476,8 +2516,7 @@ fn a_seller_that_lies_about_a_win_or_its_invoice_is_paid_nothing_for_the_lie() {
         assert!(v["wins_unpaid"].as_array().unwrap().iter().all(|w| w["rule"] == rule), "{v}");
         assert!(r.ledger().is_empty() && r.ln.state().payments.is_empty(), "nothing was booked and nothing reached the node");
         assert!(r.audit("ticket_refused").iter().all(|a| a["rule"] == rule && a["win"].as_u64().unwrap() > 0));
-        // the seller, unpaid, stopped serving: the wallet got the grace and no more
-        assert_eq!(v["complete"], false, "{v}");
+        // (the seller, unpaid, stops serving when its grace is over: whether this file ends first is the draws' luck)
     }
     // a win claimed for a draw that lost: the wallet works every draw out itself
     let r = draws_rig(json!({}));

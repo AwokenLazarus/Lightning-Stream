@@ -844,8 +844,9 @@ def settle_down() -> None:
     node never had (the wallet gives those up 90 s after they were sent)."""
     def final() -> bool:
         st = status()
-        open_in_book = {t["hash"] for sid in SESSIONS for t in status(sid).get("session_tickets", []) if t["state"] in ("sending", "locked", "released", "retired")}
-        return lab.pending_htlcs(BUYER) == 0 and st.get("synced") is True and open_in_book <= orphans()
+        # every payment the book holds that is not final is one the node left in flight with nothing on its channel
+        open_in_book = sum(int(st.get("tickets", {}).get(k, 0)) for k in ("sending", "locked", "released", "retired"))
+        return lab.pending_htlcs(BUYER) == 0 and st.get("synced") is True and open_in_book <= len(orphans())
 
     lab.wait("every booked payment final", 300, final, every=2)
 

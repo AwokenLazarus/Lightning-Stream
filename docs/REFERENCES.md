@@ -35,8 +35,11 @@ and code and data copied into this tree, are in [`THIRD_PARTY_NOTICES.md`](../TH
 
 What is ours: the binding of these to one another (a hold invoice on a hash the buyer chose,
 released inside an HTTP request, under an owner's signed policy), the policy wallet, the wire in
-[`TICKETS.md`](TICKETS.md), the XBT binding of x402, and the way the sealed draw's parts are put
-together. The last of these is unreviewed. An external review of the earlier design, by
+[`TICKETS.md`](TICKETS.md), the XBT binding of x402, the lottery as it is built (Rivest's hash
+chain on the seller's side and a value of the buyer's after each piece, with a win paid by an
+ordinary Lightning invoice and nobody holding money for the winner: [`TICKETS.md`](TICKETS.md),
+section 9), and the way the sealed draw's parts are put together. The argument that the built
+lottery's draw is fair, and the sealed draw, are unreviewed. An external review of the earlier design, by
 Chris Guida, found serious issues (see the README) and is the reason this is built on Lightning.
 
 ## Payment channels and Lightning

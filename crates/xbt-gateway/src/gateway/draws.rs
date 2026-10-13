@@ -311,19 +311,25 @@ impl Gateway {
         }
     }
 
-    /// Wait until the session may be served another piece: until a value or a payment has come,
-    /// for as long as an answer waits for a refill. False: it may not.
+    /// Wait until the session may be served another piece: for a value, as long as an answer
+    /// waits for a refill; for a win's payment, until that win's grace has run out (a wallet that
+    /// pays many sellers queues its wins, and an answer that waits holds nothing but a
+    /// connection). False: it may not.
     fn lottery_wait_clear(&self, l: &Lottery, session: &str) -> bool {
-        let deadline = Instant::now() + self.cfg.times.refill_wait;
+        let started = Instant::now();
+        // how long this answer stands still at the most, from when it first did
+        let mut budget = Duration::ZERO;
         loop {
             self.lottery_refresh(l, session);
             let b = l.lock();
-            match b.blocked(session, self.now()) {
+            let now = self.now();
+            budget = budget.max(match b.blocked(session, now) {
                 None => return true,
-                Some(Refused::WinUnpaid | Refused::ValueMissing) => {}
+                Some(Refused::ValueMissing) => self.cfg.times.refill_wait,
+                Some(Refused::WinUnpaid) => self.cfg.times.refill_wait.max(Duration::from_secs(b.grace_left(session, now))),
                 Some(_) => return false,
-            }
-            let left = deadline.saturating_duration_since(Instant::now());
+            });
+            let left = budget.saturating_sub(started.elapsed());
             if left.is_zero() || self.stop.load(Ordering::SeqCst) {
                 return false;
             }

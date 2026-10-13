@@ -22,7 +22,9 @@
 //! | Held tickets take at most half of a channel's slots. | [`Signer::ticket_book_sends`], on a channel listing read in that lock round: the book's held tickets against half of the smallest channel, and the payments pending on each channel (whoever's) against half of that channel. A listing that cannot be read is an error and locks nothing. |
 //! | A lock that fails for lack of a slot makes the wallet hold less. | [`Signer::ticket_lock`] gives every round's outcome to [`crate::ticket::Session::lock_round`]; [`crate::ticket::Book::want`] offers nothing during the wait. |
 //! | At most 8 ticket payments are with the router at once. | [`Pace`]: every send of a ticket, held or prepaid, enters it. |
-//! | A prepaid ticket is spent when it is paid, and bought one at a time. | [`Signer::ticket_prepay`]: every rule of a release, the ledger row and the book row (`released`) before the payment is sent; none while an earlier one of the session is not final. |
+//! | A prepaid ticket is spent when it is paid, and bought one at a time. | [`Signer::ticket_prepay`]: every rule of a release, the book row (`released`) and then the ledger row, both before the payment is sent; none while an earlier one of the session is not final. |
+//! | A win of the lottery is paid only for a draw the wallet worked out, once, as a prepaid ticket is paid. | [`Signer::lottery_pay_win`] takes a [`xbt402::lottery::Win`], which only the wallet's own check of a seller's reveal makes; [`Signer::ticket_book_prepay`] pays it only in the session it was drawn in, at that session's win size, and refuses a win that has a payment in the book that has not failed ([`crate::ticket::Book::win_payment`]). |
+//! | An ordinary payment is on the channel until it settles, so it stays inside the gate until then. | [`Signer::ticket_pay_ordinary`] holds its place in [`Pace`] until the node shows the payment over. |
 //!
 //! Locks: the wallet's spend lock, then the book's. No lock is held while the node routes a
 //! ticket, so a release never waits for a lock round.
@@ -1448,9 +1450,10 @@ impl Signer {
         }
     }
 
-    /// The rules and the two rows of a prepaid ticket (the caller holds the spend lock): what
-    /// [`Self::ticket_release_locked`] checks of a held ticket's release, then the ledger row, then
-    /// the book row, then the signature log. Returns the send; an `Err` inside is the refusal.
+    /// The rules and the two rows of a prepaid ticket, or of a win (the caller holds the spend
+    /// lock): what [`Self::ticket_release_locked`] checks of a held ticket's release, then the
+    /// book row, then the ledger row, then the signature log. Returns the send; an `Err` inside is
+    /// the refusal.
     #[allow(clippy::too_many_arguments)]
     fn ticket_book_prepay(&self, sid: &str, hash: &str, invoice: &str, inv: &Invoice, lp: &LnPolicy, ids: &[String], win: Option<&xbt402::lottery::Win>)
                           -> Result<std::result::Result<HeldSend, Value>> {
@@ -1538,17 +1541,22 @@ impl Signer {
         let seed = self.ticket_seed(&st.book)?;
         let nonce = random_bytes::<16>();
         sigaudit::set_rule(&format!("policy:{}", d.rule));
-        // 1. the spend, in the ledger: a prepaid ticket is spent when it is paid, used or not
-        if !self.engine.commit_once(&pay, &ledger_id(hash))? {
-            self.engine.store.amend(&ledger_id(hash), Some(sats))?;
-        }
-        // 2. the ticket in the book, booked, before the node sees its invoice
+        // 1. the ticket in the book, booked. The book first: this ticket has no row yet, and a ledger row
+        // that the book has never heard of would be looked after by nobody. (Killed between the two writes
+        // the other way round, a wallet kept such a row for good: found on the lab.) The payment is sent
+        // only after both, so the book is never ahead of money that has left
         let win_draw = win.map_or(0, xbt402::lottery::Win::draw);
         let t = Ticket { win: win_draw, hash: hash.to_string(), nonce, session: sid.to_string(), payee: s.payee.clone(), task: s.task.clone(), msat: s.prepaid_msat, fee_limit_msat,
                          state: TState::Released, ts: now, sent_ts: now, invoice_expires: inv.expires_at() as f64, released_ts: now, booked_sats: sats,
                          cltv_until: 0, final_expiry: 0, fee_msat: 0, done_ts: 0.0, note: String::new(), prepaid: true };
         s.active_ts = now;
         st.commit(&[t.row(), s.row()])?;
+        // 2. the spend, in the ledger, before the node sees the invoice: a prepaid ticket is spent when it is
+        // paid, used or not. Killed before this, the ticket above is given up when no payment of its age can
+        // still be on its way, and was never sent
+        if !self.engine.commit_once(&pay, &ledger_id(hash))? {
+            self.engine.store.amend(&ledger_id(hash), Some(sats))?;
+        }
         // 3. the signature log, which the anchor witness covers
         let kind = if win.is_some() { "lottery_win_pay" } else { "ticket_prepay" };
         self.sigaudit.record(kind, &[], "", &dest, json!({"payment_hash": hash, "session": sid, "booked_sats": sats, "win": win_draw}))?;

@@ -123,34 +123,105 @@ mainnet; its driver is not in this tree. `docs/TICKETS.md`, section 11, has the 
 - Every hop sees the same hash, so hops that collude can link a ticket along its route, and a
   ticket cannot be partly released.
 
-### Lottery tickets (in design)
+### The lottery: pay after a win
 
-Nothing in this section is shipped code, and no script in this tree reproduces its numbers. A
-lottery ticket pays for a piece worth less than a ticket by a fair roll: a piece wins a payment
-of one fixed size (64 sat in the examples) with probability price ÷ that size, so the average
-paid is the price. There are two forms. In **pay after a win** nothing is locked ahead and the
-buyer pays an ordinary invoice for each win. In **the win that pays itself** the buyer locks one
-ticket with the seller and each roll gives the seller a small chance of obtaining its secret.
-Each sentence below comes from the design's measurements: Lightning Fork nodes on regtest (five
-for pay after a win, three for the win that pays itself), one routing node between buyer and
-seller, one host; up to 200 sellers were sessions spread over three seller nodes. A sentence
-marked *(simulated)* involved no node.
+A piece that costs less than a ticket is paid by a fair draw: it wins a payment of one fixed
+size (64 sat as shipped) with probability price ÷ that size, so the average paid is the price.
+Nothing is locked ahead; the buyer pays an ordinary invoice for each win. The gateway and the
+wallet build it (`docs/TICKETS.md`, section 9). Regtest only: `scripts/lottery_regtest.sh` runs
+the shipped binaries on Lightning Fork nodes whose channels carry 30 pending payments, one
+routing node between buyer and seller, one host, loopback. Its 100 sellers are 100 gateways
+beside one seller node. A sentence marked *(simulated)* comes from the design's simulation and
+involved no node.
 
+- **The fairness of the draw rests on an argument of this project's own that nobody else has
+  reviewed.** It treats SHA-256 as a random function: the seller commits to a hash chain before
+  the session, the buyer gives a random value after the piece, and a hash of both decides. The
+  draw has tests that neither side can steer it by its choice of seed, of value or of piece, and
+  a second implementation agrees with it on every draw the lab made; neither is a proof.
+- The seller goes first, and nothing makes a buyer pay. A buyer that gives values and never pays
+  a win is served up to its first win and the seller's grace, and is then refused until the
+  seller's node shows the wins paid. Measured with a buyer that never pays: with pieces of a
+  quarter of a sat it was served @@CHEAP@@ wins' worth on average (ten sessions; 64 sat a win).
+  With pieces of a quarter of a win it was served @@HOT@@ wins' worth (twenty sessions): the
+  gateway bears two unpaid wins and serves 8 pieces ahead of the buyer's values.
+- Where a seller earns less than one win from a buyer, a buyer that never pays has had
+  everything free. A download split over 40 sellers at a tenth of a sat a piece is 41 sat a
+  seller, which is less than a 64-sat win. *(simulated)* The lottery is a way for buyers who
+  mean to pay to do so cheaply. It is not enforcement.
+- A buyer that sends no values is served the seller's window (8 pieces) in every session it is
+  given. The gateway caps sessions (64 in all, 4 from one address) and forgets one that never
+  gave a value after a minute, so one address gets 32 pieces a minute at the most.
 - Income is uneven. A seller earning 4,096 sat in a day with 64-sat wins is paid 80% to 120% of
   it nine days in ten, and 96% to 104% over a month; a seller earning 1,000 sat a day, 58% to
-  141% on a day and 92% to 108% over a month; a seller earning 100 sat a day gets no win on 21%
-  of days. *(simulated)*
+  141% on a day; a seller earning 100 sat a day gets no win on 21% of days. *(simulated)* A
+  seller that earns less than one win from a buyer is usually paid nothing by it.
+- A buyer's cost is uneven. Measured: a file priced at 381.5 sat, bought five times, cost
+  @@FILEPAID@@ sat with routing fees. A download priced at 1,638 sat on 64-sat wins costs 1,152
+  to 2,176 sat nine times in ten. *(simulated)* `max_sats` bounds what a call uses by the
+  wallet's own count of the pieces, not what it pays: a call stops asking for pieces when its
+  wins come to more than its luck cap (for 1,000 sat on 64-sat wins, 1,848 sat), and only the
+  task's budget holds whatever the draws do.
+- A task budget below one win and its fee pays nothing by draws at all. The wallet refuses to
+  open such a session and says so.
 - A smaller win is steadier and costs more in fees: a routing node charged 1 sat for each win,
-  which is 6.25% of a 16-sat win, 1.6% of 64, 0.4% of 250 and 0.1% of 1,000, per hop, at the
-  forks' default policy.
-- A buyer's cost is uneven. A download priced at 1,638 sat (16,384 pieces at 0.1 sat, 64-sat
-  wins) costs 1,152 to 2,176 sat nine times in ten, and its owner must allow 2,795 sat, fees
-  included, for it to stall on an unlucky run no more than once in a thousand. *(simulated)*
-- In pay after a win the seller goes first by about one win's worth. A buyer that does not pay
-  is served one win's worth on average before the seller sees an unpaid win and stops, and about
-  three times that one time in twenty. *(simulated)* Where a seller earns less than one win from
-  a buyer, a buyer that never pays gets everything free. Nothing in the design makes that buyer
-  pay; it is a way for buyers who mean to pay to do so, not enforcement.
+  which is 1.6% of a 64-sat win and 6% of a 16-sat one, per hop, at the forks' default policy.
+  The wallet cannot know what a route will charge before it pays: it knows whether the seller's
+  node is its direct peer, and the fee limit it gives its node. Its floor for a win (64 sat
+  through a routing node, 4 sat over a direct channel) is a rule, not a measurement, and no
+  direct channel and no second hop were run.
+- A win is an ordinary payment, pending on every channel of its route until it settles
+  (@@INFLIGHT@@ on the lab), and wins of 64 sat are below both dust limits while they are
+  pending: one that is pending when a channel on its route is force-closed has no output there
+  (reasoned, not run). The wallet keeps at most 8 payments on its way at once, tickets and wins
+  together, in the order they were found. On one 30-slot channel that paid the wins of 100
+  sellers of one buyer at @@RATE@@ wins a second, with no payment failed; a buyer whose wins come
+  faster than that keeps its sellers waiting, and a seller waits 30 s (its grace) before it stops
+  serving. Before the wallet kept a win inside that limit until it had settled, 24 payments were
+  pending on the channel at once and 47 of 313 failed: found on the lab, and what the limit is
+  for.
+- A win whose payment fails (no route, a fee above the owner's limit) is not paid with the same
+  invoice again. It is paid with the seller's next invoice for it, which the gateway makes when
+  the first has lapsed (60 s); a seller whose grace is shorter has stopped serving by then, and
+  serves again when it is paid.
+- A wallet that starts again pays no win it found before the start: it cannot tell a start from
+  a restore of older records, in which that win may be paid already. A gateway that starts again
+  has forgotten its lottery sessions, their unpaid wins with them; the wallet opens another
+  session. In both cases the seller has lost the wins that were unpaid at that moment (at most
+  the 2 it bears). A session of draws holds nothing, so there is nothing to recover.
+- A buyer's node that is killed as it sends a win's payment can go on calling that payment in
+  flight with nothing on its channel (the same behaviour as for a ticket, below). The wallet
+  keeps that win booked as spent and does not pay it again, the seller is not paid for it, and
+  the session with that seller ends; the next call opens another. Seen once in three runs of the
+  lab's kill check.
+- For a seller the owner has not named, the wallet pays wins of 250 sat at the most and 32 wins
+  in a task's window, beside the task's caps on what any one seller is paid. A seller that sets
+  a high price can take that much before the caps stop it; nothing checks that a price is fair.
+- The wallet checks the draw, not the delivery. It gives a value for every piece that arrived,
+  and checks a piece's content only where its caller gave the piece's hash; that argument
+  (`piece_sha256`) is the signer's and is not in the MCP tool, so an agent cannot pass it yet.
+  A route's `release: "after-verify"` tells a buyer its pieces can be checked; the gateway does
+  nothing different for it.
+- Not built: the renewal of a session's chain (a session ends after 65,536 draws and the wallet
+  opens another), several wins in one invoice, a seller-held ticket for content that cannot be
+  checked, and a win that pays itself (next section). The wallet keeps a session's values in
+  memory only.
+- A win is not proof to a third party: the session key that authenticates a value is the
+  seller's too.
+- One hop, one host, loopback. Separate seller machines and nodes, two or more hops, real
+  network latency, a Core Lightning node, and mainnet fees were not run. The 100 sellers shared
+  one node: the buyer's channel, the hop and the seller's inbound channel carried what 100
+  sellers' wins would, and the seller side was one node's worth of work.
+
+### The win that pays itself (in design)
+
+Nothing in this section is shipped code, and no script in this tree reproduces its numbers. In
+this second form of the lottery the buyer locks one ticket with the seller and each draw gives
+the seller a small chance of obtaining its secret, so that a win cannot be refused. Each
+sentence below comes from the design's measurements: three Lightning Fork nodes on regtest, one
+routing node between buyer and seller, one host. A sentence marked *(simulated)* involved no
+node.
+
 - A seller a buyer touches only briefly cannot be forced to be paid: the win that pays itself
   needs a ticket locked with that seller first, which is too much for a few pieces, so such
   sellers are paid after a win.
@@ -179,19 +250,9 @@ marked *(simulated)* involved no node.
   seller's own channel peer stays away until the ticket expires (reasoned, not run). By the
   design's rule the locked ticket, and so the win, is at least 546 sat, which makes a small
   seller's income more uneven than the 64-sat examples above.
-- Pay after a win holds no slot, but each win is a payment in flight for about a quarter of a
-  second and wins of 16 or 64 sat are below the dust limits while in flight. Of 200 payments of
-  64 sat sent 64 at a time over a 30-slot channel to a Core Lightning node, 139 failed; sent 8 at
-  a time all 200 succeeded, 28 a second. A wallet has to pace them.
-- The fairness of the roll treats SHA-256 as a random function. Nobody outside the project has
-  reviewed that argument either.
-- A win is not proof to a third party, in either form.
 - Sellers cannot pool wins as miners pool blocks: a piece served is not proof of work, so a
   seller and a buyer it controls can invent pieces at no cost. *(simulated)* The protocol has no
   pool.
-- One hop was measured, on one host, with requests as calls inside one program. Separate seller
-  machines, two or more hops, real network latency, requests over HTTP, mainnet fees and a
-  buyer that does not pay, on real nodes, were not.
 
 ### Seller gateway (`xbt-gateway`)
 
@@ -322,8 +383,8 @@ wallet) and against a stand-in node in its tests.
 
 The buyer's side, in the signer (`ticket.rs`, `ticket_rail.rs`): secrets, tickets locked through
 the owner's node, and the booking. It is reached through six socket methods, and by the wallet's
-own payer under `xbt402_pay` (the next section). Verify-before-release for checkable content,
-lottery tickets and admission by content hash are not built. Prepaid tickets are bought by the
+own payer under `xbt402_pay` (the next section). Verify-before-release for checkable content
+and admission by content hash are not built; the lottery is its own section above. Prepaid tickets are bought by the
 payer only: no socket method buys one. Run on regtest only (`scripts/ticket_book_regtest.sh`).
 
 - The defaults are sized for a channel that carries 30 pending payments: a pool of 2 tickets
@@ -988,6 +1049,9 @@ Neither the external review nor any of the project's four audits covered:
   answers of the shared HTTP server (`xbt_svc::http`): written after the last audit;
 - the ticket book (`ticket.rs`, `ticket_rail.rs`, the held send and the payment list of the
   Lightning backend): written after the last audit, tested by the project only;
+- the lottery: the draw and its fairness argument (`xbt402::lottery`), the gateway's sessions of
+  draws and the wallet's payer for them: written after the last audit, tested by the project
+  only, and the argument read by nobody outside it;
 - the removal of the hub itself (2026-10-11): what was cut from the provider, the client library
   and the signer, and how records of the removed features are treated;
 - anything on a real network: no mainnet node, no public Electrum server and no Lightning node
