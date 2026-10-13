@@ -100,8 +100,7 @@ Defaults in the design: 1,000-sat tickets, 2 in flight, a life of about 40 block
 first and can lose at most one ticket; for content that can be checked, the buyer checks a piece
 before releasing its ticket.
 
-**Two limits shape those defaults** (set on 2026-10-12, after a Lightning developer pointed them
-out). A held ticket takes one of a channel's slots for pending payments on every channel of its
+**Two limits shape those defaults** (set on 2026-10-12, after Kyle Santiago pointed them out). A held ticket takes one of a channel's slots for pending payments on every channel of its
 route, and those slots are shared by everyone using the channel: 483 between Lightning Fork
 nodes, 30 where either end is a Core Lightning node at its default. So a session holds 2 tickets,
 not 8, and held tickets take at most half of a channel's slots: from one 30-slot channel a buyer

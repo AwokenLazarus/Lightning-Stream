@@ -474,7 +474,7 @@ Each of these was found by building `xbt-gateway` against this draft and running
 
 ## 11. Slots and dust (2026-10-12)
 
-A Lightning developer who read this draft said: design around Core Lightning's limit of 30 HTLCs
+Kyle Santiago, who read this draft, said: design around Core Lightning's limit of 30 HTLCs
 and around the dust limits. Sections 1 to 9 were measured on Lightning Fork nodes only, where a
 channel carries 483. This section states the two limits, what was measured with the XBT Core
 Lightning fork in the lab, and the rules that follow. The rules are in sections 1, 2, 4 and 7
