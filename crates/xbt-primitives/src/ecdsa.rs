@@ -1,6 +1,5 @@
-//! secp256k1 through libsecp256k1: RFC 6979 low-S ECDSA with BIP66 strict-DER checking, ECDH,
-//! and the additive key tweaks xbt402's per-channel keys use.
-use secp256k1::{ecdh, ecdsa::Signature, Message, PublicKey, Scalar, SecretKey, SECP256K1};
+//! secp256k1 through libsecp256k1: RFC 6979 low-S ECDSA with BIP66 strict-DER checking.
+use secp256k1::{ecdsa::Signature, Message, PublicKey, SecretKey, SECP256K1};
 
 use crate::error::{Error, Result};
 
@@ -11,8 +10,8 @@ pub const CURVE_ORDER: [u8; 32] = secp256k1::constants::CURVE_ORDER;
 pub type PubkeyBytes = [u8; 33];
 
 /// BIP66 strict DER (Bitcoin Core `IsValidSignatureEncoding`) for a signature *without* its
-/// hash-type byte. Segwit v0 consensus refuses any other encoding, so a state that only parses
-/// loosely is one the payee can never close with.
+/// hash-type byte. Segwit v0 consensus refuses any other encoding, so a signature that only
+/// parses loosely is one no transaction can carry.
 pub fn is_strict_der(der: &[u8]) -> bool {
     let n = der.len();
     if !(8..=72).contains(&n) || der[0] != 0x30 || der[1] as usize != n - 2 || der[2] != 0x02 {
@@ -64,40 +63,6 @@ pub fn verify(pubkey: &[u8], msg32: &[u8; 32], der: &[u8]) -> bool {
     SECP256K1.verify_ecdsa(&Message::from_digest(*msg32), &sig, &pk).is_ok()
 }
 
-/// x coordinate of `sk * pubkey` (32 bytes): a secret both channel parties can compute.
-pub fn ecdh_x(sk: &SecretKey, pubkey: &PublicKey) -> [u8; 32] {
-    let pt = ecdh::shared_secret_point(pubkey, sk);
-    let mut x = [0u8; 32];
-    x.copy_from_slice(&pt[..32]);
-    x
-}
-
-/// `h mod n` as a scalar, for a 32-byte hash read big-endian (h < 2^256 < 2n, so at most one
-/// subtraction).
-pub fn scalar_mod_n(h: &[u8; 32]) -> Scalar {
-    let mut v = *h;
-    if v >= CURVE_ORDER {
-        let mut borrow = 0i16;
-        for i in (0..32).rev() {
-            let d = v[i] as i16 - CURVE_ORDER[i] as i16 - borrow;
-            borrow = if d < 0 { 1 } else { 0 };
-            v[i] = (d + 256 * borrow) as u8;
-        }
-    }
-    // cannot fail: v < n now
-    Scalar::from_be_bytes(v).unwrap_or(Scalar::ZERO)
-}
-
-/// `P + t·G`.
-pub fn tweak_add_pub(p: &PublicKey, t: &Scalar) -> Result<PublicKey> {
-    p.add_exp_tweak(SECP256K1, t).map_err(|_| Error::BadKey("tweaked key is the point at infinity"))
-}
-
-/// `(s + t) mod n`.
-pub fn tweak_add_secret(s: &SecretKey, t: &Scalar) -> Result<SecretKey> {
-    s.add_tweak(t).map_err(|_| Error::BadKey("tweaked secret is zero"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,14 +92,5 @@ mod tests {
         s[32..].copy_from_slice(&hs);
         let high = Signature::from_compact(&s).unwrap().serialize_der();
         assert!(!verify(&pk, &msg, &high));
-    }
-
-    #[test]
-    fn scalar_reduction() {
-        let big = [0xFF; 32];
-        let s = scalar_mod_n(&big);
-        // 2^256 - 1 - n
-        let want = hex::decode("000000000000000000000000000000014551231950b75fc4402da1732fc9bebe").unwrap();
-        assert_eq!(s.to_be_bytes().to_vec(), want);
     }
 }

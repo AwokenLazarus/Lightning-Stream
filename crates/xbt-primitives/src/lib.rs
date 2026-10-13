@@ -10,7 +10,6 @@
 //! Nothing here panics on untrusted bytes: parsers return [`Error`].
 
 pub mod address;
-pub mod amount;
 pub mod ecdsa;
 pub mod encode;
 pub mod error;
