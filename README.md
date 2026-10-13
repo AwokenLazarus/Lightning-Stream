@@ -154,8 +154,8 @@ paying one that is not. On regtest, with the shipped binaries on channels of 30 
 draws, and what the buyer's node paid was the wins the wallet booked, to the millisat; 100
 sellers were paid at once from one channel with no payment failed, at most 8 payments on their
 way at a time. **What it does not do**: it does not make a buyer pay. A buyer that never pays
-was served about one win's worth before the seller stopped it (measured: 1.4 wins' worth on
-average at a quarter of a sat a piece), and a seller that earns less than one win from a buyer
+was served about one win's worth before the seller stopped it (measured: 0.8 to 1.4 wins' worth
+on average at a quarter of a sat a piece), and a seller that earns less than one win from a buyer
 can be paid nothing by a cheat. **The argument that the draw is fair is our own and nobody else
 has reviewed it.** `docs/TICKETS.md`, section 9, is the wire; `docs/LIMITS.md`, "The lottery",
 states the limits.

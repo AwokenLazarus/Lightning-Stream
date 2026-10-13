@@ -142,8 +142,9 @@ involved no node.
 - The seller goes first, and nothing makes a buyer pay. A buyer that gives values and never pays
   a win is served up to its first win and the seller's grace, and is then refused until the
   seller's node shows the wins paid. Measured with a buyer that never pays: with pieces of a
-  quarter of a sat it was served @@CHEAP@@ wins' worth on average (ten sessions; 64 sat a win).
-  With pieces of a quarter of a win it was served @@HOT@@ wins' worth (twenty sessions): the
+  quarter of a sat it was served 1.4 wins' worth on average (ten sessions; 64 sat a win; 0.8 to
+  1.4 on average in four runs, 3.3 at the most in one session).
+  With pieces of a quarter of a win it was served 3.9 wins' worth (ten sessions; 3.9 to 4.9 on average in four runs): the
   gateway bears two unpaid wins and serves 8 pieces ahead of the buyer's values.
 - Where a seller earns less than one win from a buyer, a buyer that never pays has had
   everything free. A download split over 40 sellers at a tenth of a sat a piece is 41 sat a
@@ -157,7 +158,7 @@ involved no node.
   141% on a day; a seller earning 100 sat a day gets no win on 21% of days. *(simulated)* A
   seller that earns less than one win from a buyer is usually paid nothing by it.
 - A buyer's cost is uneven. Measured: a file priced at 381.5 sat, bought five times, cost
-  @@FILEPAID@@ sat with routing fees. A download priced at 1,638 sat on 64-sat wins costs 1,152
+  520, 780, 390, 260 and 325 sat with routing fees. A download priced at 1,638 sat on 64-sat wins costs 1,152
   to 2,176 sat nine times in ten. *(simulated)* `max_sats` bounds what a call uses by the
   wallet's own count of the pieces, not what it pays: a call stops asking for pieces when its
   wins come to more than its luck cap (for 1,000 sat on 64-sat wins, 1,848 sat), and only the
@@ -171,15 +172,20 @@ involved no node.
   through a routing node, 4 sat over a direct channel) is a rule, not a measurement, and no
   direct channel and no second hop were run.
 - A win is an ordinary payment, pending on every channel of its route until it settles
-  (@@INFLIGHT@@ on the lab), and wins of 64 sat are below both dust limits while they are
+  (0.22 s at the median on the lab, 0.44 s with 8 on their way), and wins of 64 sat are below both dust limits while they are
   pending: one that is pending when a channel on its route is force-closed has no output there
   (reasoned, not run). The wallet keeps at most 8 payments on its way at once, tickets and wins
   together, in the order they were found. On one 30-slot channel that paid the wins of 100
-  sellers of one buyer at @@RATE@@ wins a second, with no payment failed; a buyer whose wins come
-  faster than that keeps its sellers waiting, and a seller waits 30 s (its grace) before it stops
-  serving. Before the wallet kept a win inside that limit until it had settled, 24 payments were
+  sellers of one buyer at 14 wins a second, with no payment failed; a buyer whose wins come
+  faster than that keeps its sellers waiting: a seller serves on for its grace of 30 s, and an
+  answer it is sending stands still for a payment for 10 s at the most before it is cut. Before the wallet kept a win inside that limit until it had settled, 24 payments were
   pending on the channel at once and 47 of 313 failed: found on the lab, and what the limit is
   for.
+- An answer the wallet stops reading (its `max_sats`, the owner's `max_answer_s`, a piece that
+  does not match) leaves up to the seller's window of pieces that it was sent and gives no value
+  for: it names them as void. A seller takes so many voids a session (16 at the gateway); after
+  that the wallet's next call opens another session. A buyer that voids pieces it did receive
+  has had them free, 16 a session.
 - A win whose payment fails (no route, a fee above the owner's limit) is not paid with the same
   invoice again. It is paid with the seller's next invoice for it, which the gateway makes when
   the first has lapsed (60 s); a seller whose grace is shorter has stopped serving by then, and
@@ -192,8 +198,9 @@ involved no node.
 - A buyer's node that is killed as it sends a win's payment can go on calling that payment in
   flight with nothing on its channel (the same behaviour as for a ticket, below). The wallet
   keeps that win booked as spent and does not pay it again, the seller is not paid for it, and
-  the session with that seller ends; the next call opens another. Seen once in three runs of the
-  lab's kill check.
+  the session with that seller ends; the next call opens another. Seen in each of the five
+  runs of the lab's kill check that killed the buyer's node in the middle of a download, with one
+  to three payments.
 - For a seller the owner has not named, the wallet pays wins of 250 sat at the most and 32 wins
   in a task's window, beside the task's caps on what any one seller is paid. A seller that sets
   a high price can take that much before the caps stop it; nothing checks that a price is fair.

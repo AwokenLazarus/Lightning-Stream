@@ -136,9 +136,10 @@ What it costs you, and what bounds it:
 
 Measured on regtest with the wallet of this tree and a buyer that never pays
 (`scripts/lottery_regtest.sh`, `cheat`): with pieces of a quarter of a sat and wins of 64 sat it
-was served 1.4 wins' worth on average before the gateway stopped it (ten sessions, 0.4 to 4.0).
-With pieces of a quarter of a win it was served 4.9 wins' worth (twenty sessions): the gateway
-bears two unpaid wins and serves 8 pieces ahead of the buyer's values. Where your buyers each
+was served 1.4 wins' worth on average before the gateway stopped it (ten sessions; 0.8 to 1.4 in
+four runs, 3.3 at the most in one session). With pieces of a quarter of a win it was served 3.9
+wins' worth (ten sessions; 3.9 to 4.9 in four runs): the gateway bears two unpaid wins and
+serves 8 pieces ahead of the buyer's values. Where your buyers each
 earn you less than one win, a buyer that never pays has had everything free, and nothing on
 today's Lightning makes it pay. Your income is uneven too: a buyer that owes you less than a win
 usually pays you nothing, and sometimes a whole win.

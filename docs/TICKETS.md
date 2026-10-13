@@ -528,7 +528,7 @@ knows only tickets skips an entry it cannot read.
 | `pay` | `on-win`: a win is paid by an invoice the seller sends after it. | Who can walk away from a win, and so who goes first. No other value is defined. |
 | `release` | `after-answer`: a value follows any piece. `after-verify`: the route's pieces can be checked one by one, and a buyer that holds their hashes gives a value only for a piece that matched. | Whether a draw depends on the content. The seller does the same in both cases; the word tells the buyer what it can check. |
 | `window` | How many pieces the seller serves beyond the last one it holds a value or a void for. | It bounds what a buyer that sends no values is served. |
-| `graceSeconds`, `gracePieces`, `maxUnpaidWins` | How long, how many pieces and how many wins the seller serves on while a win is unpaid. | The payment of a win takes a quarter of a second through a hop, and longer when many are sent at once. |
+| `graceSeconds`, `gracePieces`, `maxUnpaidWins` | How long, how many pieces and how many wins the seller serves on while a win is unpaid. | The payment of a win takes a quarter of a second through a hop, and a wallet that pays many sellers sends 8 at a time: with 100 sellers a win waited up to 13 s for its turn (section 9.12). |
 | `chainDraws` | The draws one session's chain covers. | A session ends when its chain does; the buyer opens another. |
 | `pieceBytes` | The bytes of an answer that make one piece. | Both sides must cut an answer at the same places. |
 
@@ -703,7 +703,14 @@ when the node shows the first cancelled (it lapsed unpaid).
 
 A payment that fails (no route, a fee limit) is not a spent one. The wallet does not send that
 invoice again: the win stays owed until the seller sends another invoice for it, which the
-gateway does when the first has lapsed (60 s).
+gateway does when the first has lapsed (60 s). A payment the wallet could not begin (its own node
+gave no answer) is tried again with the same invoice. A seller whose invoices fail the checks
+above three times is not asked for another: the session ends as faulty.
+
+An answer that did not arrive whole (the wallet stopped reading it, or it was cut) can leave
+pieces open with the seller: it marks a piece when its last bytes leave. The buyer SHOULD name as
+`void` every piece of such an answer that will get no value, or they fill the seller's window
+for the session's next request.
 
 ### 9.6 The window and the grace: when the seller stops
 
@@ -716,8 +723,9 @@ The seller goes first, and these are what bound it:
 - **The grace.** While a win is unpaid the seller serves on: for `graceSeconds`, for
   `gracePieces` pieces after that win, and with at most `maxUnpaidWins` wins unpaid. Beyond any
   of the three a request is refused `win_unpaid`, with the unpaid wins and their invoices, and
-  an answer that is being sent waits and is then cut short. Service goes on when the seller's
-  node shows the wins paid.
+  an answer that is being sent stands still for the payment (10 s at the gateway, and never
+  beyond the grace) and is then cut short. Service goes on when the seller's node shows the wins
+  paid.
 
 A buyer that gives values and never pays is therefore served up to its first win, and the grace.
 Nothing on today's Lightning makes it pay: the lottery is a cheap way for buyers who mean to pay
@@ -830,7 +838,48 @@ Each line below was found by building both sides and running them.
 | The seller serves on for `graceSeconds`. | And for `gracePieces`, and with `maxUnpaidWins` at most: a fast seller gives away more in ten seconds than a win. |
 | A win's invoice was not specified. | An ordinary invoice of the win size with the terms' `winBlocks`, payable for 60 s, one at a time for a win. Found by a test: two answers of one session each asked the node for the same win's invoice, the wallet paid the first, and the gateway knew only the second; the gateway now lets one request at a time ask. |
 
-@@MEASURED@@
+### 9.12 Measured
+
+On regtest on 2026-10-13, by `scripts/lottery_regtest.sh` (30 checks): the release binaries of
+this tree (the wallet's signer, its MCP server, the gateway), a stock file server, three
+Lightning Fork nodes (buyer, one routing hop, seller) on one host over loopback, the buyer's
+channel and the seller's inbound channel opened with 30 slots. The wallet's lottery policy and
+the gateway's lottery terms as they ship, with pieces of 64 KiB. No Core Lightning node. The
+numbers are one run's; a draw is random, so the wins differ from run to run.
+
+| What | Measured | Check |
+|---|---|---|
+| A 100 MB file at a quarter of a sat a piece (1,526 pieces, 381.5 sat), bought five times by an agent's `xbt402_pay` | Whole each time, in 1.2 to 2.3 s. 8, 12, 6, 4 and 5 wins (6 expected each): 520, 780, 390, 260 and 325 sat paid, fees included; the luck cap of those calls was 1,565 sat | `file` |
+| What the buyer's node paid, what the seller's node received, the wins in the wallet's book, and its ledger | 2,240,000 msat on both nodes: 35 wins of 64,000 msat, each paid once. The ledger: 2,275 sat, each win and its fee of 1 sat | `file` |
+| A win, from its payment's start on the buyer's node to its settle, one at a time | 221 ms at the median, 267 ms at the longest (35 payments, one hop) | `file` |
+| What was pending on the buyer's channel during the downloads, asked every 20 ms | Nothing in 47% of the samples, never more than 3 payments, and every one of them a win on its way; nothing when the downloads were over, and nothing held on the seller's node | `file` |
+| A page priced at 2.5 sat a request, 200 times | One draw each, 7 wins (7.8 expected). 3.0 ms a call against 1.5 ms for a free page through the same wallet (medians): a draw is one more request | `page` |
+| 20 sellers paid at once, three files of 64 one-sat pieces from each | 3,840 draws, 68 wins (60 expected), every file whole, no payment failed, 4.8 s. At most 8 wins on the channel at once; an ordinary 5,000-sat payment of someone else's over the same channel succeeded meanwhile in 0.5 s | `swarm` |
+| 100 sellers paid at once, the same | 19,200 draws, 288 wins (300 expected), every file whole, no payment failed, 20 s: 14 wins a second. At most 8 wins on the channel at once; the ordinary payment succeeded in 0.5 s. A win was on its way for 0.44 s at the median with 8 at a time, 1.2 s at the longest | `swarm` |
+| A buyer that sends no values | 8 pieces (the window), then its answer is cut and its next request is refused `value_missing` | `cheat` |
+| A buyer that gives values and never pays, pieces of a quarter of a sat | Served 1.4 wins' worth on average before it was stopped (ten sessions; 1.2 at the median, 3.3 at the most; 0.8 to 1.4 on average in four runs) | `cheat` |
+| The same, pieces of a quarter of a win | 3.9 wins' worth on average (ten sessions; 3.9 to 4.9 in four runs): the gateway bears two unpaid wins and serves 8 pieces ahead of the buyer's values | `cheat` |
+| A second implementation of the draw (`scripts/lottery/draw.py`) as that buyer | The seller's wins were exactly the ones it worked out, in every session | `cheat` |
+| A seller that claims a win for a draw that lost, with a real invoice of its own node | Refused by the wallet's own draw, nothing paid, the session ended | `liar` |
+| A seller that sends, for a real win, an invoice that pays another node, or one for one sat more | Refused by the checks every invoice passes (5 and 6 invoices), nothing paid, the session ended after the third | `liar` |
+| A seller that sends two invoices for every win | 64 wins, each paid once; none of the 64 second invoices paid | `liar` |
+| The signer, the gateway, the buyer's node and the seller's node each killed between two calls and again in the middle of a download with wins being paid | In all eight cases: no win paid twice, nothing in the ledger that the node did not pay, nothing paid that is not in the ledger, and the next call was served (after the buyer's node was killed in a download, on the second call) | `kill` |
+
+**Found by running it**, and changed since the first run:
+
+- The gate that lets 8 payments through at a time let a win out when its send returned, as it
+  does a held ticket. With 100 sellers, 24 wins were pending on the 30-slot channel at once and
+  47 of 313 payments failed. A win now stays inside the gate, with the checks before it, until
+  the node shows it over, and wins go through in the order they were found.
+- The gateway's grace of 10 s was sized for wins that are not paced. Paced 8 at a time, the last
+  of 100 sellers' wins waited 13 s. The default is 30 s, and an answer that is being sent stands
+  still for a payment for 10 s at the most.
+- A wallet killed between the two writes that book a win kept a ledger row for a payment that
+  was never sent. The book's row is now written first. The same was true of a prepaid ticket.
+- A wallet that stopped reading an answer left pieces open with the seller, and the session's
+  next request was refused `value_missing`. The wallet now names them as void.
+- A win whose payment could not begin, or was not final when the wallet stopped waiting, was not
+  looked at again. It is owed again, and the wallet asks the seller for its list while one is.
 
 ## 10. What building the seller changed in this draft
 
