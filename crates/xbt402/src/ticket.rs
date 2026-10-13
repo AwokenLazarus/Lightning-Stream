@@ -121,6 +121,21 @@ impl Terms {
     }
 }
 
+/// The error codes of the ticket scheme: what a gateway answers a payer with.
+pub const PROTOCOL_CODES: [&str; 19] = [
+    "bad_auth", "bad_payment", "bad_request", "bad_seq", "bad_target", "balance_short", "hash_refused", "journal", "no_route", "node_unavailable",
+    "pledge_outstanding", "session_unknown", "ticket_expiring", "ticket_not_locked", "ticket_unknown", "ticket_used", "too_many_sessions",
+    "too_many_tickets", "upstream_unavailable",
+];
+
+/// The seller's error code as one of the scheme's own ([`PROTOCOL_CODES`]), or `""`. The string
+/// returned is this crate's, never the seller's bytes: a payer names a seller's code only through
+/// this, so a seller picks from the list and writes nothing.
+pub fn protocol_code(code: Option<&Value>) -> &'static str {
+    let code = code.and_then(Value::as_str).unwrap_or("");
+    PROTOCOL_CODES.iter().copied().find(|c| *c == code).unwrap_or("")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

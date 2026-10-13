@@ -321,10 +321,28 @@ pub fn upstream_code(code: &str) -> String {
     }
 }
 
-/// A short snake_case identifier: the only provider-chosen string an error code may be.
+/// A short snake_case identifier: the shape of an error code. A provider can put any words in
+/// this shape, so a payer never repeats one for its shape alone: see [`protocol_code`].
 pub fn safe_code(code: &str) -> bool {
     !code.is_empty() && code.len() <= 40 && code.bytes().all(|c| c == b'_' || c.is_ascii_lowercase())
         && code.bytes().any(|c| c.is_ascii_lowercase())
+}
+
+/// The error codes of this protocol: what [`crate::provider`] answers a payer with.
+pub const PROTOCOL_CODES: [&str; 40] = [
+    "bad_amount", "bad_auth", "bad_capacity", "bad_dest", "bad_expiry", "bad_fee_payer", "bad_funding", "bad_hashlock", "bad_key", "bad_offer",
+    "bad_params", "bad_payer_spk", "bad_payload", "bad_preimage", "bad_receipt", "bad_request", "bad_sig", "bad_sighash", "bad_state",
+    "call_in_flight", "channel_closed", "channel_closing", "channel_exhausted", "close_failed", "coinbase_funding", "duplicate_channel",
+    "insufficient_payment", "no_funding", "no_state", "node_error", "not_closed", "payee_spent", "payment_required", "settle_early",
+    "stale_amount", "unconfirmed", "unknown_channel", "unknown_funding", "unsupported_scheme_or_network", "wrong_network",
+];
+
+/// The seller's error code as one of this protocol's own ([`PROTOCOL_CODES`]), or `None`. The
+/// string returned is this crate's, never the seller's bytes: a seller picks from the list and
+/// writes nothing. A payer's errors and results name a seller's code only through this.
+pub fn protocol_code(code: Option<&str>) -> Option<&'static str> {
+    let code = code?;
+    PROTOCOL_CODES.iter().copied().find(|c| *c == code)
 }
 
 /// The URL a seller names for one of its own endpoints (`openUrl`, `chunkUrl`), held to `origin`

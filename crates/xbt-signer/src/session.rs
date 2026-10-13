@@ -18,7 +18,7 @@ use xbt402::client::Transport;
 use xbt402::conditional::{encrypt, preimage_from_tx};
 use xbt402::json::{dumps, py_str};
 use xbt402::provider::HttpResponse;
-use xbt402::wire::{b64json, body_hash, facilitator_request, receipt_message, receipt_of, request_digest_v2, safe_code, scheme_accepted, seller_url, unb64json, FACILITATOR_VERIFY};
+use xbt402::wire::{b64json, body_hash, facilitator_request, receipt_message, receipt_of, request_digest_v2, protocol_code, scheme_accepted, seller_url, unb64json, FACILITATOR_VERIFY};
 use xbt_primitives::ecdsa;
 use xbt_primitives::hash::{sha256, tagged_hash};
 use xbt_primitives::tx::Tx;
@@ -365,7 +365,8 @@ impl Session {
             .map_err(|_| rt("open preflight failed: provider unreachable; nothing was funded"))?;
         let reply: Option<Value> = serde_json::from_slice(&resp.body).ok();
         if resp.status != 200 {
-            let code = reply.as_ref().and_then(|r| r.get("error")).and_then(Value::as_str).filter(|c| safe_code(c)).unwrap_or("");
+            // one of the protocol's own codes or nothing: no provider text in the wallet's errors (L12)
+            let code = protocol_code(reply.as_ref().and_then(|r| r.get("error")).and_then(Value::as_str)).unwrap_or("");
             if code == "bad_request" {
                 return Ok(());
             }
@@ -495,13 +496,8 @@ impl Session {
         };
         let st = resp.status;
         let reply: Option<Value> = serde_json::from_slice(&resp.body).ok();
-        let mut code = String::new();
-        if st != 200 {
-            code = reply.as_ref().and_then(|r| r.get("error")).and_then(Value::as_str).unwrap_or("").to_string();
-            if !safe_code(&code) {
-                code.clear(); // no provider text in the wallet's errors (L12)
-            }
-        }
+        // one of the protocol's own codes or nothing: no provider text in the wallet's errors (L12)
+        let code = if st != 200 { protocol_code(reply.as_ref().and_then(|r| r.get("error")).and_then(Value::as_str)).unwrap_or("") } else { "" };
         if st == 200 {
             let echoed = reply.as_ref().map(|r| r.get("closeFeePayer").cloned().unwrap_or_else(|| "payer".into()));
             if echoed.as_ref().and_then(Value::as_str) != Some(rec.close_fee_payer.as_str()) {
@@ -856,7 +852,12 @@ impl Session {
         if let Err(e) = chunk_at(0) {
             return json!({"stream_charged": 0, "body": "", "stream": {"ok": false, "refused": format!("chunkUrl: {}", e.msg)}});
         }
-        let mid = m.get("id").cloned().unwrap_or(Value::Null);
+        // The manifest's id is the seller's string: it is named in this wallet's result, log and file
+        // name only when it is hex (an id, not words); else the stream goes by its digest alone.
+        let stream_id: Option<String> = m.get("id").and_then(Value::as_str).filter(|s| !s.is_empty() && s.len() <= 64 && s.bytes().all(|c| c.is_ascii_hexdigit()))
+            .map(str::to_string);
+        let mid: Value = stream_id.clone().into();
+        let root: Value = m.get("root").and_then(Value::as_str).filter(|s| s.len() == 64 && s.bytes().all(|c| c.is_ascii_hexdigit())).into();
         let (mut parts, mut spent) = (Vec::<u8>::new(), 0i64);
         for i in 0..n - 1 {
             let url = chunk_at(i).unwrap_or_default();
@@ -919,7 +920,7 @@ impl Session {
         spent += price;
         parts.extend(pt);
         let report = parts;
-        let mut stored = store_body(&report, &py_str(m.get("id")));
+        let mut stored = store_body(&report, stream_id.as_deref().unwrap_or(""));
         let mut path = stored.get("saved_to").and_then(Value::as_str).map(str::to_string);
         if let Some(p) = path.clone().filter(|p| p.ends_with(".bin")) {
             let md = format!("{}.md", &p[..p.len() - 4]);
@@ -929,14 +930,14 @@ impl Session {
             }
         }
         let chan = self.book.get(dest).map(|r| r.chan).unwrap_or_default();
-        log_call("stream", json!({"id": mid, "n": n, "bytes": report.len(), "sats": spent, "root": m.get("root"), "ms": ms_since(t0),
+        log_call("stream", json!({"id": mid, "n": n, "bytes": report.len(), "sats": spent, "root": root, "ms": ms_since(t0),
                                   "final_ms": final_ms, "chan": chan}));
         let text = String::from_utf8_lossy(&report).into_owned();
         let pv: String = text.chars().take(PREVIEW_CAP).collect();
         let digest = stored["body_digest"].as_str().unwrap_or("").to_string();
         let more = format!("\n\u{2026} [{} bytes, sha256 {digest}{}]", report.len(), path.as_ref().map(|p| format!(", saved to {p}")).unwrap_or_default());
         let mut out = json!({"stream_charged": spent, "body": if text.chars().count() > PREVIEW_CAP { format!("{pv}{more}") } else { pv },
-                             "stream": {"ok": true, "id": mid, "chunks": n, "bytes": report.len(), "merkle_root": m.get("root"), "paid_sats": spent,
+                             "stream": {"ok": true, "id": mid, "chunks": n, "bytes": report.len(), "merkle_root": root, "paid_sats": spent,
                                         "all_chunks_verified": true, "last_chunk": "hash-locked, key checked", "body_digest": digest}});
         if let Some(p) = path {
             out["stream"]["saved_to"] = p.into();

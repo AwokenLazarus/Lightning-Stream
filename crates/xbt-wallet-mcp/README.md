@@ -63,6 +63,19 @@ model can't approve its own payments or move the hot key. Humans use the out-of-
   returned verbatim under `untrusted_provider_response` (`trust: "untrusted"`, with a note). They are
   data from the provider, never instructions, and not filtered, because the provider never holds a
   wallet key.
+- **Nothing a seller wrote is anywhere else in a result.** Every other string of a result is the
+  wallet's own: its `rule` and `reason` above all. That holds for a refusal too. When a seller
+  refuses, the wallet says so in its words (`the provider refused the request (HTTP 400)`) and
+  the seller's answer is under `untrusted_provider_response`; a seller's error code is named only
+  when it is one of the protocol's own (`xbt402::wire::PROTOCOL_CODES`, `xbt402::ticket::PROTOCOL_CODES`),
+  since a code is a place for words too; an invoice, an offer or a 402's terms that the wallet
+  refuses is described and never quoted; a stream's id is named only when it is hex; the last
+  receipt of a streamed answer is given as its numbers, and the seller's own object as
+  `untrusted_provider_response.last_receipt`. On the Lightning rail the node's own messages can
+  repeat a payee's, so they come back under `untrusted_ln_data` (`node_message`, `failure`), in
+  `ln_pay` and in `ln_status`. Numbers, and hashes, keys and ids of a fixed hex shape, are not
+  words and are given as they are. `docs/LIMITS.md` ("What a seller wrote") has the table by
+  payer and rail, and what is outside this rule.
 - **Arguments are checked as B2 checks them** (pydantic 2, lax mode). `"7"` and `7.0` are the integer
   7, and `"1_000"` is 1000. A bad argument gets pydantic's own message, word for word, and never
   reaches the signer.

@@ -1,7 +1,7 @@
 //! HTTP transports: a blocking client for the payer (feature `http-client`, ureq) and a small
 //! threaded server around [`Provider::serve`] (feature `http-server`, std::net).
 #[cfg(feature = "http-client")]
-pub use client::UreqTransport;
+pub use client::{transport_words, UreqTransport};
 #[cfg(feature = "http-server")]
 pub use server::{serve_http, serve_listener, serve_service, HttpService};
 
@@ -47,6 +47,31 @@ mod client {
         }
     }
 
+    /// A request that got no answer, in this crate's words. ureq's own message is not used: it can
+    /// quote what the other side sent (a status that is not a number, a redirect's target), and a
+    /// payer hands its errors to an agent as the wallet's words.
+    fn transport_error(e: &ureq::Error) -> ChannelError {
+        ChannelError::new("transport_error", transport_words(e))
+    }
+
+    /// Why a request got no answer, from a fixed list (see [`transport_error`]).
+    pub fn transport_words(e: &ureq::Error) -> &'static str {
+        use ureq::ErrorKind as K;
+        match e.kind() {
+            K::InvalidUrl => "the URL is not valid",
+            K::UnknownScheme => "the URL's scheme is not http or https",
+            K::Dns => "the host name did not resolve",
+            K::InsecureRequestHttpsOnly => "an http request where only https is allowed",
+            K::ConnectionFailed => "the connection failed",
+            K::TooManyRedirects => "a redirect, which is not followed",
+            K::BadStatus => "the answer's status line is malformed",
+            K::BadHeader => "the answer has a malformed header",
+            K::Io => "the connection failed or timed out",
+            K::InvalidProxyUrl | K::ProxyConnect | K::ProxyUnauthorized => "the proxy failed",
+            K::HTTP => "an HTTP error status",
+        }
+    }
+
     impl UreqTransport {
         /// `within`: this request's own deadline, from connect to the last byte of the answer, in
         /// place of the agent's 30 s.
@@ -63,7 +88,7 @@ mod client {
             let resp = match if body.is_empty() && method == "GET" { req.call() } else { req.send_bytes(body) } {
                 Ok(r) => r,
                 Err(ureq::Error::Status(_, r)) => r,
-                Err(e) => return Err(ChannelError::new("transport_error", e.to_string())),
+                Err(e) => return Err(transport_error(&e)),
             };
             let status = resp.status();
             let headers: Vec<(String, String)> = resp.headers_names().into_iter()
@@ -80,7 +105,9 @@ mod client {
                 return Err(ChannelError::new("response_too_large", format!("response is {} bytes; the cap is {MAX_RESPONSE}", declared.unwrap_or(0))));
             }
             let mut out = Vec::new();
-            resp.into_reader().take(MAX_RESPONSE + 1).read_to_end(&mut out).map_err(|e| ChannelError::new("transport_error", e.to_string()))?;
+            // the kind only: the text of a read error can quote the bytes that were read
+            resp.into_reader().take(MAX_RESPONSE + 1).read_to_end(&mut out)
+                .map_err(|e| ChannelError::new("transport_error", format!("the answer could not be read ({:?})", e.kind())))?;
             if out.len() as u64 > MAX_RESPONSE {
                 return Err(ChannelError::new("response_too_large", format!("response exceeds {MAX_RESPONSE} bytes")));
             }

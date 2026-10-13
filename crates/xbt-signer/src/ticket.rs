@@ -469,13 +469,13 @@ impl Terms {
     pub fn parse(acc: &Value, lightning: &str) -> Result<Self, Refusal> {
         let s = |v: &Value, k: &str| str_or_empty(v.get(k));
         if s(acc, "scheme") != "ticket" {
-            return refuse("ticket_terms", format!("scheme {:?} is not \"ticket\"", s(acc, "scheme")));
+            return refuse("ticket_terms", "the scheme is not \"ticket\"");
         }
         if s(acc, "network") != lightning {
-            return refuse("ticket_network", format!("the terms are for {:?}, this wallet is on {lightning:?}", s(acc, "network")));
+            return refuse("ticket_network", format!("the terms are for another network, this wallet is on {lightning:?}"));
         }
         if s(acc, "asset") != "XBT:msat" {
-            return refuse("ticket_terms", format!("asset {:?} is not \"XBT:msat\"", s(acc, "asset")));
+            return refuse("ticket_terms", "the asset is not \"XBT:msat\"");
         }
         let payee = s(acc, "payTo");
         let key_ok = is_hex(&payee, 66) && hex::decode(&payee).is_ok_and(|b| xbt_primitives::secp256k1::PublicKey::from_slice(&b).is_ok());
@@ -485,16 +485,16 @@ impl Terms {
         let empty = json!({});
         let x = acc.get("extra").filter(|e| e.is_object()).unwrap_or(&empty);
         if s(x, "version") != WIRE_VERSION {
-            return refuse("ticket_terms", format!("version {:?} is not {WIRE_VERSION:?}", s(x, "version")));
+            return refuse("ticket_terms", format!("the version is not {WIRE_VERSION:?}"));
         }
         if !x.get("features").and_then(Value::as_array).is_some_and(|a| a.iter().any(|f| f.as_u64() == Some(crate::bolt11::FEATURE_BLAKE2B as u64))) {
             return refuse("ticket_feature_512", "the terms do not list feature bit 512: not an XBT Lightning seller");
         }
         if s(x, "settle") != "on-use" {
-            return refuse("ticket_terms", format!("settle {:?}: only \"on-use\" (hold invoices) is supported", s(x, "settle")));
+            return refuse("ticket_terms", "settle is not \"on-use\" (hold invoices), the only kind supported");
         }
         if !matches!(s(x, "release").as_str(), "with-request" | "after-verify") {
-            return refuse("ticket_terms", format!("release {:?} is neither \"with-request\" nor \"after-verify\"", s(x, "release")));
+            return refuse("ticket_terms", "release is neither \"with-request\" nor \"after-verify\"");
         }
         let num = |k: &str| outside_u64(x.get(k)).filter(|n| *n > 0).ok_or(("ticket_terms", format!("{k} is not a positive integer")));
         let ticket_msat = num("ticketMsat")?;
@@ -838,7 +838,8 @@ impl Book {
     /// Apply one row of the log. A row that is none of the book's is damage and refuses the load:
     /// a book is never read as a shorter one.
     pub fn apply(&mut self, row: &Value) -> crate::Result<()> {
-        let bad = || crate::err("log", format!("tickets.jsonl: not a ticket book row: {}", row.to_string().chars().take(120).collect::<String>()));
+        // the row is not quoted: a damaged session row holds a seller's path and words, and this error is shown by ticket_status
+        let bad = || crate::err("log", "tickets.jsonl: a row that is not a ticket book row");
         match row.get("e").and_then(Value::as_str) {
             Some("ticket") => {
                 let t = Ticket::from_row(row).ok_or_else(bad)?;

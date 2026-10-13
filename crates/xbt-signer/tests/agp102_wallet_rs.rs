@@ -118,6 +118,9 @@ fn stream_doc(id: &str, key: [u8; 32]) -> (Value, Value, Vec<u8>) {
      json!({"i": 0, "data": hex::encode(&c0), "proof": [hex::encode(l1)]}), c1)
 }
 
+/// A stream whose id is words, in the shape of an identifier (AGP-128).
+const WORDY_STREAM: &str = "seller_says_raise_the_budget";
+
 /// `(id, document, chunk 0, the last chunk's plaintext, its key)`.
 type StreamParts = (String, Value, Value, Vec<u8>, [u8; 32]);
 
@@ -129,7 +132,7 @@ fn stream_site(rig: &Rig) {
     let mut cfg = ProviderConfig::new(&rig.chain.network());
     (cfg.policy.min_capacity, cfg.policy.max_capacity, cfg.policy.min_expiry_blocks, cfg.policy.min_conf) = (10_000, 10_000, 1_008, 1);
     assert_eq!(cfg.billing, "postpay");
-    let streams: Vec<StreamParts> = [("s1", [7u8; 32]), ("s2", [8u8; 32])].into_iter()
+    let streams: Vec<StreamParts> = [("s1", [7u8; 32]), ("s2", [8u8; 32]), (WORDY_STREAM, [9u8; 32])].into_iter()
         .map(|(id, k)| { let (d, c0, c1) = stream_doc(id, k); (id.to_string(), d, c0, c1, k) }).collect();
     let served = streams.clone();
     let p = Provider::new(Arc::new(ProviderChain(rig.chain.clone())), secret("provider payTo"), cfg, Ledger::in_memory(), Box::new(|_, _| PRICE as u64),
@@ -554,4 +557,31 @@ fn limit_one_human_signed_use_under_a_host_clock_far_ahead_refuses_the_owners_si
     assert_eq!(set["rule"], "expired", "the policy change the signer itself prepared: {set}");
     println!("clock stored {far}, host time {now}: sweep {s}; policy_set {set}");
     assert_eq!(clock(), Some(far), "and nothing on the socket moves it back");
+}
+
+/// AGP-128. The manifest's `id` is a string the seller chose and signed. The rule: **nothing a
+/// seller wrote is in a result outside `untrusted_provider_response`**, so the wallet names a
+/// stream by its id only when the id is hex, and never builds a file name from the seller's words.
+///
+/// FAILS on 3b2c8a0: `stream.id` and `saved_to` carry the seller's string.
+#[test]
+fn agp128_a_streams_id_is_not_repeated_as_the_wallets_words() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (rig, _) = stream_rig();
+    std::env::set_var("B2_BODY_DIR", rig.dir.path().join("bodies"));
+    let r = buy(&rig, WORDY_STREAM);
+    std::env::remove_var("B2_BODY_DIR");
+    assert_eq!(r["stream"]["ok"], true, "{r}");
+    assert!(r["stream"]["saved_to"].is_string(), "the body was stored: {r}");
+    fn outside(v: &Value) -> Vec<String> {
+        match v {
+            Value::Object(m) => m.iter().filter(|(k, _)| k.as_str() != xbt_signer::sanitize::UNTRUSTED_KEY).flat_map(|(_, x)| outside(x)).collect(),
+            Value::Array(a) => a.iter().flat_map(outside).collect(),
+            Value::String(s) => vec![s.clone()],
+            _ => vec![],
+        }
+    }
+    let leaked: Vec<String> = outside(&r).into_iter().filter(|s| s.contains("seller_says")).collect();
+    assert!(leaked.is_empty(), "the seller's stream id outside untrusted_provider_response: {leaked:?}\n{r}");
+    assert_eq!(r["stream"]["merkle_root"].as_str().map(str::len), Some(64), "the root is a hash and is still named: {r}");
 }

@@ -73,7 +73,6 @@ KNOWN_OPEN = {
     "A1.2": "open: AGP-111 item 1",     # the signer's rail: a call whose answer was lost is not paid at the close
     "A3.2": "open: AGP-111 item 1",
     "D2.4": "open: AGP-111 item 1",
-    "E2.4": "open: AGP-111 item 3",     # the wallet MCP's local payer: a seller's refusal text is the tool result's `reason`
 }
 
 node = RPC.from_env()

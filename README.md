@@ -38,7 +38,7 @@ the full list, with a link for each, is [`docs/REFERENCES.md`](docs/REFERENCES.m
 > second 20 (6 high), the third 23 (none high, 11 medium), the fourth 18 (none high, 9 medium).
 > After the sixth round every finding is fixed or ends as a stated limit, and two items are open.
 > A later run of failure paths through the release binaries found three more open items, all on
-> the frozen on-chain channel. The hub has since been removed, and that removal has not been
+> the frozen on-chain channel; the one an agent could be steered by is fixed and two stay open. The hub has since been removed, and that removal has not been
 > reviewed by anyone.
 > **`docs/LIMITS.md` lists every stated limit, the open items, and what nobody has reviewed.**
 > None of the fixes has been re-reviewed by anyone outside the project; an independent audit is
