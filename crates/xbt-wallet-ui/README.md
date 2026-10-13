@@ -5,7 +5,7 @@ The agent wallet's web UI, for a box with no terminal (Umbrel, StartOS), from AG
 - set and review the policy: budgets, per-counterparty caps, the allowlist, the human threshold and the hot-key cap;
 - approve or deny payments above the threshold (replacing `agentwallet-approve`);
 - see balances and the hot-key cap status;
-- see channels (open, pending, closed, refunded), with the close report (including `payeeFee`) and the refund ETA;
+- see, read-only, the on-chain channel records an earlier version of the wallet left, with their close reports and what to do about one that is not settled (this wallet has no on-chain channel: it was removed in October 2026);
 - see the signature log and its anchor verification;
 - sweep and rotate the hot key, signed by the human;
 - see the xbt-compute node's status, when one is configured;
@@ -71,7 +71,7 @@ but they add proc-macro dependencies for about 15 pages. Everything user-control
 ## Security model
 
 - **Who can do what.** The UI login (scrypt, N=2^15; throttled at 5 failures a minute) lets someone
-  see the wallet, close channels and ask for refunds. Denying a live request also needs the human
+  see the wallet. Denying a live request also needs the human
   signature (AGP-063).
 
   Anything that raises what the wallet may spend, or moves or exports keys, also needs the human's
@@ -138,18 +138,17 @@ but they add proc-macro dependencies for about 15 pages. Everything user-control
   On a box, bind it to the app proxy's network and set `XBT_UI_ALLOW_IPS` to the proxy. An agent
   that can reach the port still needs the password, and nothing it can do there spends without the
   human's key.
-- **An xbt402 approval is a one-time grant.** The human signs (token, origin, max_sats, expiry). The
-  signer marks the token approved. The agent's next `xbt402_pay` of the same URL, method and
-  `max_sats` pays under it once, as B2's `approve` does (`human = true`), and the grant survives a
-  "pending" first call while a channel's funding confirms. A deny or revoke drops it.
+- **The approval of a Lightning payment is a one-time grant.** The human signs (token, payee,
+  amount, expiry). The signer marks the token approved. The agent's next `ln_pay` of the same
+  invoice pays under it once. A deny or revoke drops it.
 
-  Other tokens keep B2's `approve`, which pays at once.
+  The approval of an on-chain `pay` keeps B2's `approve`, which pays at once.
 
 ## Tests
 
 ```bash
 cargo test -p xbt-wallet-ui          # ui_http (auth, CSRF, headers, proxies, every action), crypto_js, browser (headless Chrome)
 node crates/xbt-wallet-ui/tests/js/crypto_test.mjs
-scripts/ui/regtest_ui.sh             # real regtest: MCP waits, the UI approves, paid, closed on chain
+scripts/ui/regtest_ui.sh             # real regtest: the agent asks, the UI approves, paid and confirmed on chain; a deny; a sweep
 scripts/ui/verify_agp039.sh          # all of the above plus the signer and MCP suites
 ```

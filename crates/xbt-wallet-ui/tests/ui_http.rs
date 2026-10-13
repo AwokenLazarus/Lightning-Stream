@@ -1,11 +1,11 @@
 //! AGP-039: the web UI over real HTTP against a regtest signer (the signer suite's rig: the Rust
-//! signer on a fake pruned regtest node with the Rust xbt402 provider in process, served on its socket).
+//! signer on a fake pruned regtest node, served on its socket).
 //!
 //! Auth (first run, login, throttle, sessions, logout), CSRF, the security headers, proxy base paths,
-//! and every action: approve (xbt402 grant and pay), deny, the policy editor (the signer's errors, a
-//! signed change applied live, JSON mode), human-key enrolment and rotation, sweep, rotation, backup,
-//! anchor, close and refund, the pages, and an over-threshold `xbt402_pay` through the
-//! MCP that waits, is approved in the UI and is paid.
+//! and every action: approve (a payment, and the grant of a Lightning payment), deny, the policy
+//! editor (the signer's errors, a signed change applied live, JSON mode), human-key enrolment and
+//! rotation, sweep, rotation, backup, anchor, and the pages, among them the read-only list of what
+//! an earlier version's on-chain channels left.
 #[path = "../../xbt-signer/tests/common/mod.rs"]
 mod common;
 
@@ -23,14 +23,18 @@ use xbt_wallet_ui::config::Config;
 struct Box_ {
     rig: Rig,
     _sock: xbt_signer::server::Running,
-    app: Arc<App>,
+    _app: Arc<App>,
     _srv: xbt_wallet_ui::server::Running,
     base: String,
     data: tempfile::TempDir,
 }
 
 fn start(policy_extra: Value, witness: bool, tweak: impl FnOnce(&mut Config)) -> Box_ {
-    let rig = Rig::new(policy_extra, witness);
+    start_on(Rig::new(policy_extra, witness), tweak)
+}
+
+/// The UI in front of this rig's signer.
+fn start_on(rig: Rig, tweak: impl FnOnce(&mut Config)) -> Box_ {
     let sock_path = rig.dir.path().join("signer.sock");
     let sock = xbt_signer::server::spawn(rig.s.clone(), &sock_path, false).unwrap();
     let data = tempfile::tempdir().unwrap();
@@ -39,7 +43,7 @@ fn start(policy_extra: Value, witness: bool, tweak: impl FnOnce(&mut Config)) ->
     let app = App::new(cfg).unwrap();
     let srv = xbt_wallet_ui::server::spawn(app.clone()).unwrap();
     let base = format!("http://{}", srv.addr);
-    Box_ { rig, _sock: sock, app, _srv: srv, base, data }
+    Box_ { rig, _sock: sock, _app: app, _srv: srv, base, data }
 }
 
 struct R {
@@ -313,19 +317,18 @@ fn w4_a_rebound_host_and_a_foreign_origin_are_refused() {
 // --- actions against the signer -----------------------------------------------------------------------
 
 #[test]
-fn approve_an_xbt402_call_in_the_ui_and_the_agent_s_retry_pays_and_deny_drops_one() {
+fn approve_a_payment_in_the_ui_with_a_signature_from_another_device_and_deny_drops_one() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let bx = start(json!({}), false, |_| {});
-    bx.rig.fund_hot(1, 12_000);
     let mut br = logged_in(&bx);
-    let r = bx.rig.call("xbt402_pay", json!({"url": URL, "method": "GET", "body": "", "max_sats": 1000}));
+    let r = bx.rig.call("pay", json!({"to": ADDR, "amount_sats": 1000, "memo": "invoice 7"}));
     assert_eq!(r["verdict"], "needs_human");
     assert_eq!(br.get("/api/pending").body, "{\"pending\":1}");
     let page = br.get("/approvals").body;
-    assert!(page.contains(URL) && page.contains("1,000 sats"), "the queue shows the call and amount");
+    assert!(page.contains(ADDR) && page.contains("1,000 sats"), "the queue shows the payee and amount");
     let token = field(&page, "token");
     let (dest, amount, exp) = (field(&page, "dest"), field(&page, "amount_sats"), field(&page, "expiry"));
-    assert_eq!((dest.as_str(), amount.as_str()), (PROVIDER, "1000"));
+    assert_eq!((dest.as_str(), amount.as_str()), (ADDR, "1000"));
     // the message shown for another device is exactly the signer's
     let m = canonical_message(&token, &dest, 1000, exp.parse().unwrap());
     assert!(page.contains(&hex::encode(&m)));
@@ -336,16 +339,11 @@ fn approve_an_xbt402_call_in_the_ui_and_the_agent_s_retry_pays_and_deny_drops_on
     let r = br.act("/approvals", "/approve", &[("token", &token), ("dest", &dest), ("amount_sats", "1000"), ("expiry", &exp),
                                                ("signature", ""), ("signature_ext", &sig(&m))]);
     let f = br.flash_after(&r);
-    assert!(f.starts_with("Approved. The agent's call to"), "{f}");
-    assert!(br.get("/approvals").body.contains("Approved: paid when the agent"));
-    // the agent's same call pays under the grant (a block for the new channel first)
-    assert_eq!(bx.rig.call("xbt402_pay", json!({"url": URL, "method": "GET", "body": "", "max_sats": 1000}))["verdict"], "pending");
-    bx.rig.chain.mine(1);
-    let paid = bx.rig.call("xbt402_pay", json!({"url": URL, "method": "GET", "body": "", "max_sats": 1000}));
-    assert_eq!((paid["verdict"].as_str(), paid["approved"].as_bool()), (Some("allow"), Some(true)), "{paid}");
-    assert!(!br.get("/approvals").body.contains(&token));
+    assert!(f.starts_with("Approved and paid: 1000 sats to"), "{f}");
+    assert!(!br.get("/approvals").body.contains(&format!("value=\"{token}\"")), "nothing left to sign for it");
+    assert_eq!(bx.rig.s.engine.store.payments().unwrap().iter().map(|e| e.amount_sats).sum::<i64>(), 1000, "paid once");
     // deny another
-    let r2 = bx.rig.call("xbt402_pay", json!({"url": URL, "method": "GET", "body": "", "max_sats": 1000}));
+    let r2 = bx.rig.call("pay", json!({"to": ADDR, "amount_sats": 1000, "memo": "invoice 8"}));
     let t2 = r2["approval_token"].as_str().unwrap();
     let r = br.act("/approvals", "/deny", &[("token", t2), ("reason", "too much")]);
     assert!(br.flash_after(&r).contains("human_sig"), "AGP-063 W3: a deny is signed like an approval");
@@ -358,21 +356,41 @@ fn approve_an_xbt402_call_in_the_ui_and_the_agent_s_retry_pays_and_deny_drops_on
     assert!(hist.contains("too much"));
 }
 
+/// A Lightning payment over the threshold is granted, not paid, when the human approves: the page
+/// says so, and says that it is paid when the agent asks again.
+#[test]
+fn approving_a_lightning_payment_grants_it_and_the_page_says_when_it_is_paid() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let bx = start(json!({}), false, |_| {});
+    let mut br = logged_in(&bx);
+    let r = bx.rig.call("pay", json!({"to": ADDR, "amount_sats": 1000, "memo": "m"}));
+    let token = r["approval_token"].as_str().unwrap().to_string();
+    // as `ln_pay` leaves a request that waits for the human
+    bx.rig.s.engine.store.update_approval(&token, &json!({"kind": "ln", "payment_hash": "ab".repeat(32)})).unwrap();
+    let page = br.get("/approvals").body;
+    assert!(page.contains("Lightning payment (paid when the agent asks again"), "{page}");
+    let exp = field(&page, "expiry");
+    let m = canonical_message(&token, ADDR, 1000, exp.parse().unwrap());
+    let r = br.act("/approvals", "/approve", &[("token", &token), ("dest", ADDR), ("amount_sats", "1000"), ("expiry", &exp), ("signature", &sig(&m))]);
+    let f = br.flash_after(&r);
+    assert!(f.starts_with("Approved. The agent's Lightning payment to"), "{f}");
+    assert!(br.get("/approvals").body.contains("Approved: paid when the agent"));
+    assert!(bx.rig.s.engine.store.payments().unwrap().is_empty(), "nothing is paid by the approval itself");
+}
+
 #[test]
 fn approve_a_pay_token_pays_at_once() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
-    let payto = hex::encode(xbt_primitives::ecdsa::pubkey(&secret("provider payTo")));
-    let bx = start(json!({"counterparties": {PROVIDER: {"pay_to": payto}}}), false, |_| {});
-    bx.rig.fund_hot(1, 12_000);
+    let bx = start(json!({}), false, |_| {});
     let mut br = logged_in(&bx);
-    let r = bx.rig.call("pay", json!({"to": PROVIDER, "amount_sats": 1000, "memo": "invoice 7"}));
+    let r = bx.rig.call("pay", json!({"to": ADDR, "amount_sats": 1000, "memo": "invoice 7"}));
     let page = br.get("/approvals").body;
     assert!(page.contains("invoice 7") && page.contains("paid as soon as you approve"));
-    let m = canonical_message(r["approval_token"].as_str().unwrap(), PROVIDER, 1000, r["approval_expires"].as_i64().unwrap());
-    let r = br.act("/approvals", "/approve", &[("token", r["approval_token"].as_str().unwrap()), ("dest", PROVIDER), ("amount_sats", "1000"),
+    let m = canonical_message(r["approval_token"].as_str().unwrap(), ADDR, 1000, r["approval_expires"].as_i64().unwrap());
+    let r = br.act("/approvals", "/approve", &[("token", r["approval_token"].as_str().unwrap()), ("dest", ADDR), ("amount_sats", "1000"),
                                                ("expiry", &r["approval_expires"].to_string()), ("signature", &sig(&m))]);
     let f = br.flash_after(&r);
-    assert!(f.starts_with("Approved and paid: 1000 sats to") && f.contains("channel"), "{f}");
+    assert!(f.starts_with("Approved and paid: 1000 sats to") && f.contains("onchain"), "{f}");
 }
 
 #[test]
@@ -404,12 +422,10 @@ fn the_policy_editor_shows_the_signer_s_errors_and_applies_a_signed_change_live(
     let csrf = field(&page, "csrf");
     let mut form: Vec<(String, String)> = vec![("csrf".into(), csrf.clone()), ("mode".into(), "form".into())];
     for k in ["max_per_tx_sats", "daily_budget_sats", "weekly_budget_sats", "per_counterparty_cap_sats", "human_threshold_sats", "approval_ttl_s",
-              "split_window_s", "velocity_max", "velocity_window_s", "channel_expiry_blocks", "refund_margin_blocks", "close_fee_max_sats",
-              "open_wait_s", "open_retry_s", "hot_balance_cap_sats", "anchor_interval_s", "treasury_csv"] {
+              "split_window_s", "velocity_max", "velocity_window_s", "hot_balance_cap_sats", "anchor_interval_s", "treasury_csv"] {
         let v = field(&page, &format!("f_{k}"));
         form.push((format!("f_{k}"), v));
     }
-    form.push(("f_refund_enabled".into(), "1".into()));
     form.push(("f_allowlist".into(), PROVIDER.into()));
     let post = |br: &mut B, f: &[(String, String)]| br.post("/policy", &f.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect::<Vec<_>>());
     let mut bad = form.clone();
@@ -442,14 +458,14 @@ fn the_policy_editor_shows_the_signer_s_errors_and_applies_a_signed_change_live(
     // JSON mode, with a restart-only key
     let cur = bx.rig.call("policy_get", json!({}));
     let mut p = cur["policy"].clone();
-    p["open_wait_s"] = 30.into();
+    p["anchor_interval_s"] = 30.into();
     let prev = br.post("/policy", &[("csrf", &csrf), ("mode", "json"), ("json", &p.to_string())]).body;
     assert!(prev.contains("after restart"));
     let (text, sha, exp) = (field(&prev, "text"), field(&prev, "prev_sha256"), field(&prev, "expiry"));
     let r = br.post("/policy-apply", &[("csrf", &csrf), ("text", &text), ("prev_sha256", &sha), ("expiry", &exp),
                                         ("signature", &sig(&policy_message(&sha, exp.parse().unwrap(), &text)))]);
-    assert!(br.flash_after(&r).contains("take effect when the signer restarts: open_wait_s"));
-    assert!(br.get("/policy").body.contains("waiting for a signer restart: open_wait_s"));
+    assert!(br.flash_after(&r).contains("take effect when the signer restarts: anchor_interval_s"));
+    assert!(br.get("/policy").body.contains("waiting for a signer restart: anchor_interval_s"));
     assert!(br.post("/policy", &[("csrf", &csrf), ("mode", "json"), ("json", "{nope")]).body.contains("policy.json: key must be a string"));
     // the template
     assert!(br.get("/policy?template=starter").body.contains("name=\"f_max_per_tx_sats\" value=\"100000\""));
@@ -514,26 +530,38 @@ fn enrol_and_replace_the_human_key_then_sweep_rotate_backup_and_anchor() {
     assert!(s.contains("human:sweep_signature") && s.contains("human:rotate_signature"));
 }
 
+/// A wallet upgraded with an on-chain channel still open: the page lists it with the close reports
+/// the earlier version kept and says what to do, and offers no action. The wallet has no such rail.
 #[test]
-fn channels_show_the_close_report_and_refund_eta_and_close_and_refund_act() {
+fn channels_of_an_earlier_version_are_listed_read_only_with_what_to_do() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
-    let bx = start(json!({}), false, |_| {});
-    bx.rig.fund_hot(1, 12_000);
-    let chan = bx.rig.open()["chan"].as_str().unwrap().to_string();
+    let mut rig = Rig::new(json!({}), false);
+    let run = rig.root.join(".run");
+    let book = r#"{"channels": {"http://127.0.0.1:33210": {"state": "open", "dest": "http://127.0.0.1:33210", "origin": "http://127.0.0.1:33210", "chan": "c1", "cap_sats": 9400, "used_sats": 546, "expiry": 7728},
+                                 "http://b": {"state": "closed", "dest": "http://b", "chan": "c0", "cap_sats": 9400, "used_sats": 546, "expiry": 7000, "closed_txid": "ab"}}, "archived": []}"#;
+    std::fs::write(run.join("channels.json"), book).unwrap();
+    std::fs::write(run.join("close_reports.json"), r#"{"c0": {"report": {"status": "ok", "cum": 546, "unpaid_msat": 0}}}"#).unwrap();
+    rig.restart().unwrap();
+    let bx = start_on(rig, |_| {});
     let mut br = logged_in(&bx);
     let page = br.get("/channels").body;
-    assert!(page.contains(&chan) && page.contains(">open<") && page.contains("if not closed"), "refund ETA shown");
-    // refund before expiry: the signer refuses
-    let r = br.act("/channels", "/channel-refund", &[("counterparty", PROVIDER)]);
-    let f = br.flash_after(&r);
-    assert!(!f.starts_with("Refund broadcast"), "{f}");
-    let r = br.act("/channels", "/channel-close", &[("counterparty", PROVIDER)]);
-    let f = br.flash_after(&r);
-    assert!(f.starts_with("Closed: txid") && f.ends_with("close report ok."), "{f}");
-    let page = br.get("/channels").body;
-    assert!(page.contains(">closed<") && page.contains("Close report") && page.contains("provider cum"), "{page}");
+    assert!(page.contains("c1") && page.contains(">open<") && page.contains(">closed<"), "{page}");
+    assert!(page.contains("cannot close or refund") && page.contains(xbt_signer::legacy::LAST_WITH_CHANNEL), "the owner is told what to do: {page}");
+    assert!(page.contains("Close report") && page.contains("provider cum 546"), "{page}");
+    assert!(!page.contains("channel-close") && !page.contains("channel-refund") && !page.contains("<button>Close"), "no action is offered");
+    for gone in ["/channel-close", "/channel-refund"] {
+        let r = br.act("/channels", gone, &[("counterparty", PROVIDER)]);
+        assert_eq!(r.status, 404, "{gone}");
+    }
     let ov = br.get("/").body;
-    assert!(ov.contains("Recent activity") && ov.contains("Closed</dt><dd>1"));
+    assert!(ov.contains("Channels of an earlier version") && ov.contains("Open</dt><dd>1") && ov.contains("Closed</dt><dd>1"), "{ov}");
+    assert_eq!(std::fs::read_to_string(bx.rig.root.join(".run/channels.json")).unwrap(), book, "the book is left as it was");
+    // a wallet that never had a channel shows no such card
+    drop(bx);
+    let fresh = start(json!({}), false, |_| {});
+    let mut br = logged_in(&fresh);
+    assert!(!br.get("/").body.contains("Channels of an earlier version"));
+    assert!(br.get("/channels").body.contains("No channels."));
 }
 
 /// A stand-in HTTP service on a port the OS picks: `answer(path)` is the status and body.
@@ -573,8 +601,7 @@ fn the_agents_page_shows_the_mcp_endpoint_and_token_only_after_login() {
     assert!(page.contains(&"ab".repeat(32)) && page.contains("Bearer ") && page.contains("<details>"), "{page}");
     assert!(page.contains("aria-current=\"page\">Agents") && page.contains("Rotate the token"), "{page}");
     // AGP-042: the real MCP HTTP transport, reading the same file (the UI never calls it to rotate)
-    let wallet = std::sync::Arc::new(xbt_wallet_mcp::wallet::Wallet::new(tdir.path().join("no-signer.sock"),
-                                                                          xbt_wallet_mcp::wallet::PayerMode::Signer));
+    let wallet = std::sync::Arc::new(xbt_wallet_mcp::wallet::Wallet::new(tdir.path().join("no-signer.sock")));
     let mut cfg = xbt_wallet_mcp::transport::HttpConfig::new("127.0.0.1:34202");
     cfg.token_file = Some(tok.clone());
     let server = std::sync::Arc::new(xbt_wallet_mcp::mcp::Server::new(wallet));
@@ -638,84 +665,4 @@ fn xbt_compute_status_tile_and_link_when_configured() {
     let bx = start(json!({}), false, |c| c.cmp_status_url = Some("http://127.0.0.1:1/readyz".into()));
     let mut br = logged_in(&bx);
     assert!(br.get("/").body.contains("unreachable"), "a down cmp shows as unreachable, the page still renders");
-}
-
-// --- the MCP waits, the UI approves, the call is paid ---------------------------------------------------
-
-#[test]
-fn an_over_threshold_xbt402_pay_through_the_mcp_waits_for_the_ui_approval_then_is_paid() {
-    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
-    let bx = start(json!({}), false, |_| {});
-    bx.rig.fund_hot(1, 12_000);
-    let sock = bx.app.cfg.signer_sock.clone();
-    let mut wallet = xbt_wallet_mcp::wallet::Wallet::new(sock, xbt_wallet_mcp::wallet::PayerMode::Signer);
-    wallet.approval_wait = Duration::from_secs(30);
-    let agent = std::thread::spawn(move || {
-        let mut args = serde_json::Map::new();
-        args.insert("url".into(), URL.into());
-        args.insert("method".into(), "GET".into());
-        args.insert("body".into(), "".into());
-        args.insert("max_sats".into(), 1000.into());
-        wallet.call_tool("xbt402_pay", args)
-    });
-    // the human sees it in the UI and approves it there
-    let mut br = logged_in(&bx);
-    let mut page = String::new();
-    for _ in 0..50 {
-        page = br.get("/approvals").body;
-        if page.contains("name=\"token\"") {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let (token, exp) = (field(&page, "token"), field(&page, "expiry"));
-    let m = canonical_message(&token, PROVIDER, 1000, exp.parse().unwrap());
-    let r = br.act("/approvals", "/approve", &[("token", &token), ("dest", PROVIDER), ("amount_sats", "1000"), ("expiry", &exp), ("signature", &sig(&m))]);
-    assert!(br.flash_after(&r).starts_with("Approved."));
-    // the new channel's funding needs a block (regtest)
-    std::thread::sleep(Duration::from_millis(1500));
-    bx.rig.chain.mine(1);
-    let out = agent.join().unwrap().expect("the tool call");
-    let v: Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(v["verdict"], "allow", "{v}");
-    assert_eq!(v["approved"], true);
-    assert_eq!(v["waited_for_human"], true);
-    assert!(v["charged_sats"].as_i64().unwrap() > 0);
-    assert_eq!(bx.rig.call("approval_status", json!({"token": token}))["state"], "used");
-}
-
-#[test]
-fn without_a_wait_the_mcp_answers_needs_human_at_once_and_a_deny_ends_a_wait() {
-    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
-    let bx = start(json!({}), false, |_| {});
-    let sock = bx.app.cfg.signer_sock.clone();
-    let args = || {
-        let mut a = serde_json::Map::new();
-        a.insert("url".into(), URL.into());
-        a.insert("max_sats".into(), 1000.into());
-        a
-    };
-    let w0 = xbt_wallet_mcp::wallet::Wallet::new(sock.clone(), xbt_wallet_mcp::wallet::PayerMode::Signer);
-    let v: Value = serde_json::from_str(&w0.call_tool("xbt402_pay", args()).unwrap()).unwrap();
-    assert_eq!(v["verdict"], "needs_human");
-    assert!(v.get("approval_state").is_none(), "B2's answer, unchanged");
-    let mut w = xbt_wallet_mcp::wallet::Wallet::new(sock, xbt_wallet_mcp::wallet::PayerMode::Signer);
-    w.approval_wait = Duration::from_secs(30);
-    let t = std::thread::spawn(move || w.call_tool("xbt402_pay", args()));
-    let mut br = logged_in(&bx);
-    let mut tokens = vec![];
-    for _ in 0..50 {
-        let q = bx.rig.call("approvals", json!({}));
-        tokens = q["approvals"].as_array().unwrap().iter().filter(|a| a["state"] == "pending").map(|a| a["token"].as_str().unwrap().to_string()).collect();
-        if tokens.len() == 2 {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let dexp = xbt_wallet_ui::now() + 300;
-    for t in &tokens {
-        br.act("/approvals", "/deny", &[("token", t), ("expiry", &dexp.to_string()), ("signature", &sig(&deny_message(t, dexp)))]);
-    }
-    let v: Value = serde_json::from_str(&t.join().unwrap().unwrap()).unwrap();
-    assert_eq!((v["verdict"].as_str(), v["approval_state"].as_str()), (Some("needs_human"), Some("denied")), "{v}");
 }

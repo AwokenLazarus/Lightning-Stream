@@ -23,8 +23,6 @@ pub enum Error {
     Sighash(&'static str),
     #[error("header: {0}")]
     Header(String),
-    #[error("amount: {0}")]
-    Amount(&'static str),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

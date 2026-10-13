@@ -753,7 +753,7 @@ impl Rig {
 
     fn start(root: &std::path::Path, node: &Arc<FundNode>, ln: &Arc<PayLn>, tap: &Arc<Tap>, clock: &Arc<AtomicU64>) -> Arc<Signer> {
         let c = clock.clone();
-        Signer::new(root, SignerOptions { node: Some(node.clone()), transport: Some(Arc::new(Web::default())), ln: Some(ln.clone()), ticket_wire: Some(tap.clone()),
+        Signer::new(root, SignerOptions { node: Some(node.clone()), ln: Some(ln.clone()), ticket_wire: Some(tap.clone()),
                                           clock: Some(Arc::new(move || c.load(Ordering::SeqCst) as f64)), ..Default::default() }).unwrap()
     }
 
@@ -1083,7 +1083,7 @@ fn required(accepts: Value) -> WireAnswer {
 }
 
 #[test]
-fn xbt402_pay_takes_the_ticket_entry_then_a_lightning_invoice_then_the_channel_and_says_what_is_missing() {
+fn xbt402_pay_takes_the_ticket_entry_then_a_lightning_invoice_and_says_what_is_missing() {
     let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let r = Rig::new(json!({}));
     let net = r.shop.network.clone();
@@ -1101,7 +1101,7 @@ fn xbt402_pay_takes_the_ticket_entry_then_a_lightning_invoice_then_the_channel_a
     assert_eq!((v["verdict"].as_str(), v["rule"].as_str(), v["charged_sats"].as_i64()), (Some("deny"), Some("no_rail"), Some(0)), "{v}");
     assert_eq!(v["rails_passed_over"][0]["rail"], "ticket");
     assert!(v["rails_passed_over"][0]["why"].as_str().unwrap().contains("after-verify"), "{v}");
-    // a ticket entry above the owner's bounds and the channel entry: the channel pays (here it finds no such host, and says so as the channel path does)
+    // a ticket entry above the owner's bounds and an on-chain channel entry: the channel is no rail of this wallet, and it says so
     let t2 = ticket.clone();
     r.tap.set(Box::new(move |_, _| {
         let mut big = t2("with-request");
@@ -1109,9 +1109,12 @@ fn xbt402_pay_takes_the_ticket_entry_then_a_lightning_invoice_then_the_channel_a
         Some(Ok(required(json!([c1, big]))))
     }));
     let v = r.pay("/page/10", 10);
-    assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("xbt402")), "the frozen path answered: {v}");
+    assert_eq!((v["verdict"].as_str(), v["rule"].as_str(), v["charged_sats"].as_i64()), (Some("deny"), Some("no_rail"), Some(0)), "{v}");
     assert_eq!(v["rails_passed_over"][0]["rail"], "ticket");
     assert!(v["rails_passed_over"][0]["why"].as_str().unwrap().contains("ticket_blocks"), "{v}");
+    assert_eq!(v["rails_passed_over"][1]["rail"], "channel");
+    assert!(v["rails_passed_over"][1]["why"].as_str().unwrap().contains("no longer has"), "{v}");
+    assert_eq!(v["offered"][0], json!({"scheme": "batch-settlement", "network": "this wallet's chain"}), "{v}");
     // a single Lightning payment: the invoice is paid as ln_pay pays one, and the request goes again with the preimage
     let seller = SecretKey::from_slice(&[0x33; 32]).unwrap();
     let preimage = [0x5a; 32];
@@ -1130,23 +1133,30 @@ fn xbt402_pay_takes_the_ticket_entry_then_a_lightning_invoice_then_the_channel_a
     // the invoice's payee must be on the owner's allowlist, as for ln_pay: it is not yet
     let v = r.pay("/page/10", 5_000);
     assert_eq!(v["rails_passed_over"][0]["rail"], "ln", "not allowlisted for the Lightning rail, so the next rail was tried: {v}");
-    // with tickets off in the policy the call is the channel path's from its first byte: the ticket wire sees nothing
-    let off = Rig::new(json!({"tickets": {"enabled": false}}));
-    let v = off.pay("/page/10", 10);
-    assert_eq!(v["verdict"], "deny", "{v}");
-    assert!(off.tap.log.lock().unwrap().is_empty(), "the frozen path uses its own transport");
-    // and the owner can turn the channel off
-    let none = Rig::new(json!({"tickets": {"enabled": false}, "channel_rail": false}));
-    let v = none.pay("/page/10", 10);
-    assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("channel_rail")), "{v}");
-    let t3 = ticket.clone();
-    let c3 = channel.clone();
-    let both_off = Rig::new(json!({"channel_rail": false}));
-    both_off.tap.set(Box::new(move |_, _| Some(Ok(required(json!([c3, t3("after-verify")]))))));
-    let v = both_off.pay("/page/10", 10);
-    assert_eq!(v["rule"], "no_rail", "{v}");
-    let why: Vec<&str> = v["rails_passed_over"].as_array().unwrap().iter().map(|x| x["rail"].as_str().unwrap()).collect();
-    assert_eq!(why, ["ticket", "xbt402"], "{v}");
+    // with tickets off in the policy the wallet still reads the 402, and says that the ticket entry needs tickets on. A
+    // policy that still carries the removed channel's switch loads, and the switch changes nothing
+    for policy in [json!({"tickets": {"enabled": false}}), json!({"tickets": {"enabled": false}, "channel_rail": false})] {
+        let off = Rig::new(policy);
+        let t3 = ticket.clone();
+        let c3 = channel.clone();
+        off.tap.set(Box::new(move |_, _| Some(Ok(required(json!([c3, t3("with-request")]))))));
+        let v = off.pay("/page/10", 10);
+        assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("no_rail")), "{v}");
+        let why: Vec<(&str, &str)> = v["rails_passed_over"].as_array().unwrap().iter().map(|x| (x["rail"].as_str().unwrap(), x["why"].as_str().unwrap())).collect();
+        assert_eq!(why.iter().map(|w| w.0).collect::<Vec<_>>(), ["ticket", "channel"], "{v}");
+        assert!(why[0].1.contains("tickets.enabled"), "{v}");
+        assert_eq!(off.tap.log.lock().unwrap().len(), 1, "one unpaid request, nothing more");
+    }
+    // a call that may spend nothing (max_sats 0) hands back an answer that asks for nothing, and refuses a 402
+    let free = Rig::new(json!({}));
+    free.tap.set(Box::new(|_, _| Some(Ok(answer(200, vec![], b"free".to_vec())))));
+    let v = free.pay("/page/10", 0);
+    assert_eq!((v["verdict"].as_str(), v["rule"].as_str(), v["charged_sats"].as_i64(), v["status"].as_i64()), (Some("allow"), Some("free"), Some(0), Some(200)), "{v}");
+    let t4 = ticket.clone();
+    free.tap.set(Box::new(move |_, _| Some(Ok(required(json!([t4("with-request")]))))));
+    let v = free.pay("/page/10", 0);
+    assert_eq!((v["verdict"].as_str(), v["rule"].as_str(), v["charged_sats"].as_i64()), (Some("deny"), Some("max_sats"), Some(0)), "{v}");
+    assert!(free.call("ticket_status", json!({}))["sessions"].as_array().is_none_or(|a| a.is_empty()), "no session was opened");
 }
 
 #[test]

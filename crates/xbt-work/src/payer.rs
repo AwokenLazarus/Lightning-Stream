@@ -9,7 +9,7 @@
 //! growing by `charged` and by no more than the quotes of earlier calls still unanswered (AGP-091).
 //!
 //! Limits of this rail against someone between payer and provider (AGP-081, the closure audit of
-//! review T2 and T4), where it is below the channel rail:
+//! review T2 and T4), where it is below the ticket rail (`docs/TICKETS.md`, section 3):
 //!
 //! * The request binding is taken over the bare target (as the XBT-053 vectors are): it
 //!   holds the method, path, query and body, and no scheme, host or port. A header captured on its
@@ -19,7 +19,7 @@
 //!   invoice and request and move `spentWork` by `charged`, but whoever can alter the answer can
 //!   alter it too. What was paid for is checked by the provider's balance, not by this receipt.
 //!
-//! Run this rail over TLS to the provider. Raising it to the channel rail's level is a change to
+//! Run this rail over TLS to the provider. Raising it to the ticket rail's level is a change to
 //! the xbt-work spec (a signed receipt with status and bodyHash, an origin in the binding).
 //!
 //! AGP-091, two rules of this payer:

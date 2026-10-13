@@ -5,12 +5,11 @@
 //!   xbt-wallet-mcp --stdio              stdio even when XBT_MCP_HTTP is set
 //!   xbt-wallet-mcp --check              ask the signer for `health`, print it, exit 0 if reachable
 //!   xbt-wallet-mcp --healthcheck [--ready]   GET our own /healthz (/readyz): the image's HEALTHCHECK
-//!   xbt-wallet-mcp --list-tools         print the tool list (JSON) and exit
+//!   xbt-wallet-mcp --list-tools         print the tool list (JSON) for this environment (XBT_MCP_LN, XBT_MCP_TICKETS) and exit
 //!
 //! Environment (B2's): `B2_SIGNER_SOCK` (a socket path or `tcp://127.0.0.1:PORT`) or `B2_ROOT`
-//! (socket `$B2_ROOT/.run/signer.sock`), `B2_SIGNER_TIMEOUT`, `B2_BODY_CAP`. Ours: `XBT_MCP_PAYER`
-//! (`signer`, the default, or `local`; see the README), `XBT_MCP_NETWORK` and the other `XBT_MCP_*`
-//! payer settings, `XBT_MCP_HTTP_TOKEN` (a bearer token for HTTP; dev mode only when `XBT_MODE` is
+//! (socket `$B2_ROOT/.run/signer.sock`), `B2_SIGNER_TIMEOUT`. Ours: `XBT_MCP_LN` and
+//! `XBT_MCP_TICKETS` (the tools of those rails), `XBT_MCP_APPROVAL_WAIT_S`, `XBT_MCP_HTTP_TOKEN` (a bearer token for HTTP; dev mode only when `XBT_MODE` is
 //! production, which reads the secret `mcp-http-token` instead).
 //!
 //! Container-ready (AGP-038, `docs/CONTAINER.md`): `XBT_MCP_HTTP` (= `--http`), `XBT_MCP_PATH`,
@@ -28,7 +27,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use xbt_svc::{env, env_bool, health, probe, DataDir, Mode, Secrets};
-use xbt_wallet_mcp::mcp::{tools, Server};
+use xbt_wallet_mcp::mcp::{tools_with, Server};
 use xbt_wallet_mcp::transport::{read_token_file, serve_http, serve_stdio, HttpConfig, ReadyFn};
 use xbt_wallet_mcp::wallet::Wallet;
 
@@ -98,7 +97,9 @@ fn main() {
         return;
     }
     if args.iter().any(|a| a == "--list-tools") {
-        println!("{}", serde_json::to_string_pretty(&tools()).unwrap_or_default());
+        // the list a server started with this environment would give
+        let on = |v: &str| std::env::var(v).is_ok_and(|x| matches!(x.trim(), "1" | "true" | "yes"));
+        println!("{}", serde_json::to_string_pretty(&tools_with(on("XBT_MCP_LN"), on("XBT_MCP_TICKETS"))).unwrap_or_default());
         return;
     }
     let addr = if args.iter().any(|a| a == "--stdio") { None } else { arg(&args, "--http").or_else(|| env("XBT_MCP_HTTP")) };

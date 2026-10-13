@@ -49,9 +49,8 @@ if [ "${PACKAGING:-}" = 1 ]; then
   done
   echo "images: this branch's MCP (token file, no rotate endpoint) for amd64, arm64, armv7"
   export UMBREL_TEST_PORTS=24210-24250 UMBREL_TEST_MCP_PORT=24210 UMBREL_TEST_UI_PORT=24230
-  export UMBREL_TEST_PROV_PORT=24240 UMBREL_TEST_PROXY_PORT=24250
+  export UMBREL_TEST_PROXY_PORT=24250
   export STARTOS_TEST_PORTS=24260-24290 STARTOS_TEST_MCP_PORT=24260 STARTOS_TEST_UI_PORT=24280
-  export STARTOS_TEST_PROV_PORT=24290
   RUNS=1 packaging/umbrel/test-umbrel-apps.sh 2>&1 | grep -E "lint (PASS|FAIL)|refused|RESULT|run [0-9]:|FAIL|evidence"
   packaging/startos/test-startos.sh 2>&1 | grep -E "\"ok\"|bytes|checks passed|RESULT|FAIL|evidence"
 fi

@@ -15,7 +15,7 @@ export const setInterfaces = sdk.setupInterfaces(async ({ effects }) => {
       sdk.createInterface(effects, {
         name: i18n('Web interface'),
         id: 'ui',
-        description: i18n('Set the policy, approve payments, and see balances, channels and the signature log'),
+        description: i18n('Set the policy, approve payments, and see balances, keys and the signature log'),
         type: 'ui',
         masked: false,
         schemeOverride: null,

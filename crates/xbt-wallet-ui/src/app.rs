@@ -57,22 +57,17 @@ struct Ctx {
     flash: Option<(bool, String)>,
 }
 
-const INT_KEYS: [(&str, &str, &str); 17] = [
+const INT_KEYS: [(&str, &str, &str); 12] = [
     ("max_per_tx_sats", "Largest single payment (sats)", "budgets"),
     ("daily_budget_sats", "Daily budget (sats, rolling 24 h)", "budgets"),
     ("weekly_budget_sats", "Weekly budget (sats, rolling 7 days)", "budgets"),
-    ("per_counterparty_cap_sats", "Per-counterparty cap (sats per 7 days; also a new channel's size)", "budgets"),
+    ("per_counterparty_cap_sats", "Per-counterparty cap (sats per 7 days)", "budgets"),
     ("human_threshold_sats", "Human approval at or above (sats)", "human"),
     ("approval_ttl_s", "An approval request expires after (s)", "human"),
     ("split_window_s", "Split-payment window (s): smaller payments to one destination that add up are counted together", "human"),
     ("velocity_max", "At most this many payments…", "velocity"),
     ("velocity_window_s", "…per this many seconds", "velocity"),
-    ("channel_expiry_blocks", "Channel expiry (blocks)", "channels"),
-    ("refund_margin_blocks", "Refund this many blocks before expiry (restart)", "channels"),
-    ("close_fee_max_sats", "Refuse a provider's close fee above (sats, restart)", "channels"),
-    ("open_wait_s", "Wait for a new channel's funding (s, restart)", "channels"),
-    ("open_retry_s", "Retry a pending open every (s)", "channels"),
-    ("hot_balance_cap_sats", "Hot key balance cap (sats; 0 = none; above it, a human sweep)", "hot"),
+    ("hot_balance_cap_sats", "Hot key balance cap (sats; 0 = none; above it, the overview asks for a sweep)", "hot"),
     ("anchor_interval_s", "Anchor the signature log every (s, restart)", "anchor"),
     ("treasury_csv", "Treasury CSV (blocks; B2 field, unused by the Rust signer)", "anchor"),
 ];
@@ -81,8 +76,7 @@ const INT_KEYS: [(&str, &str, &str); 17] = [
 pub fn starter_policy() -> Value {
     json!({"allowlist": [], "counterparties": {}, "max_per_tx_sats": 100000, "daily_budget_sats": 200000, "weekly_budget_sats": 500000,
            "per_counterparty_cap_sats": 100000, "velocity_max": 60, "velocity_window_s": 3600, "human_threshold_sats": 50000,
-           "split_window_s": 600, "approval_ttl_s": 900, "channel_expiry_blocks": 1008, "refund_enabled": true, "refund_margin_blocks": 6,
-           "hot_balance_cap_sats": 1500000, "anchor_interval_s": 300, "open_wait_s": 45, "open_retry_s": 60, "close_fee_max_sats": 2000})
+           "split_window_s": 600, "approval_ttl_s": 900, "hot_balance_cap_sats": 1500000, "anchor_interval_s": 300})
 }
 
 fn state_of(c: &Value) -> &'static str {
@@ -333,8 +327,8 @@ impl App {
             "/approve" => back("./approvals", self.call("approve", json!({"token": g("token"), "dest": g("dest"), "amount_sats": i("amount_sats"),
                                                                           "expiry": i("expiry"), "signature": sig()})), &|v| {
                 if v["granted"] == true {
-                    format!("Approved. The agent's call to {} will be paid (at most {} sats) when it arrives; approvals expire at {}.",
-                            txt(v.get("url")), int(v.get("amount_sats")), utc(int(v.get("expires"))))
+                    format!("Approved. The agent's Lightning payment to {} will be paid (at most {} sats) when it arrives; approvals expire at {}.",
+                            txt(v.get("dest")), int(v.get("amount_sats")), utc(int(v.get("expires"))))
                 } else if v["resumed"] == true {
                     "Resumed: the agent may pay over Lightning again, within the policy.".into()
                 } else {
@@ -370,10 +364,6 @@ impl App {
                 Resp::redirect("./agents")
             }
             "/anchor-now" => back("./signatures", self.call("anchor_now", json!({"reason": "operator:ui"})), &|_| "Anchored.".into()),
-            "/channel-close" => back("./channels", self.call("close_channel", json!({"counterparty": g("counterparty")})),
-                                     &|v| format!("Closed: txid {}, close report {}.", txt(v.get("txid")), txt(v.pointer("/close_report/status")))),
-            "/channel-refund" => back("./channels", self.call("xbt402_refund", json!({"counterparty": g("counterparty")})),
-                                      &|v| format!("Refund broadcast: {}.", txt(v.get("txid").or(v.get("refund_txid"))))),
             "/backup" => {
                 if f.get("backup_pass") != f.get("backup_pass2") {
                     self.flash(ctx, false, "the backup passphrases differ");
@@ -410,7 +400,7 @@ impl App {
             b.push_str("<div class=\"flash warn\">No approval key is enrolled yet: <a href=\"./setup\">finish the setup</a>.</div>");
         }
         if hot["hot_over_cap"] == true {
-            b.push_str("<div class=\"flash warn\">The hot key is over its balance cap: new channels are refused until you <a href=\"./keys\">sweep</a> the excess.</div>");
+            b.push_str("<div class=\"flash warn\">The hot key is over its balance cap: <a href=\"./keys\">sweep</a> the excess.</div>");
         }
         b.push_str("<section class=\"grid\"><div class=\"card\"><h2>Balances</h2>");
         b.push_str(&kv(&[("Node wallet (confirmed)", sats(int(bal.get("trusted_sats")))), ("Node wallet (pending)", sats(int(bal.get("untrusted_pending_sats")))),
@@ -419,17 +409,18 @@ impl App {
                          ("Hot key status", if hot["hot_over_cap"] == true { "<span class=\"tag bad\">over cap</span>".into() } else { "<span class=\"tag ok\">within cap</span>".into() }),
                          ("Keys encrypted at rest", if hot["hot_encrypted"] == true { "yes".into() } else { "<span class=\"tag bad\">no</span>".into() })]));
         b.push_str("</div>");
+        // on-chain channels are no rail of this wallet; a wallet upgraded with some is shown what they hold
         let chans = bal.get("channels").and_then(Value::as_array).cloned().unwrap_or_default();
-        let mut counts: HashMap<&str, usize> = HashMap::new();
-        for c in &chans {
-            *counts.entry(state_of(c)).or_default() += 1;
+        if !chans.is_empty() {
+            let mut counts: HashMap<&str, usize> = HashMap::new();
+            for c in &chans {
+                *counts.entry(state_of(c)).or_default() += 1;
+            }
+            b.push_str("<div class=\"card\"><h2>Channels of an earlier version</h2>");
+            b.push_str(&kv(&[("Open", counts.get("open").copied().unwrap_or(0).to_string()), ("Pending", counts.get("pending").copied().unwrap_or(0).to_string()),
+                             ("Closed", counts.get("closed").copied().unwrap_or(0).to_string()), ("Refunded", counts.get("refunded").copied().unwrap_or(0).to_string())]));
+            b.push_str("<p><a href=\"./channels\">Channels →</a></p></div>");
         }
-        let locked: i64 = chans.iter().filter(|c| state_of(c) == "open").map(|c| int(c.get("residual_sats"))).sum();
-        b.push_str("<div class=\"card\"><h2>Channels</h2>");
-        b.push_str(&kv(&[("Open", counts.get("open").copied().unwrap_or(0).to_string()), ("Pending", counts.get("pending").copied().unwrap_or(0).to_string()),
-                         ("Closed", counts.get("closed").copied().unwrap_or(0).to_string()), ("Refunded", counts.get("refunded").copied().unwrap_or(0).to_string()),
-                         ("Unspent in open channels", sats(locked))]));
-        b.push_str("<p><a href=\"./channels\">Channels →</a></p></div>");
         let anchor = self.call("anchor_status", json!({})).unwrap_or(json!({}));
         b.push_str("<div class=\"card\"><h2>Signature log</h2>");
         b.push_str(&kv(&[("Anchor witness", if anchor["enabled"] == true { "enabled".into() } else { "<span class=\"tag warn\">not configured</span>".into() }),
@@ -484,8 +475,10 @@ impl App {
             let state = txt(a.get("state"));
             b.push_str(&format!("<article class=\"card approval {}\"><h2>{}</h2>", esc(&state), sats(amount)));
             let mut rows = vec![("To", format!("<code>{}</code>", esc(&dest)))];
-            if kind == "xbt402" {
-                rows.push(("Paid call", format!("{} <code>{}</code> (at most this amount)", escv(a.get("method")), escv(a.get("url")))));
+            if kind == "ln" {
+                rows.push(("Kind", "Lightning payment (paid when the agent asks again for this invoice, at most this amount)".into()));
+            } else if kind == "xbt402" {
+                rows.push(("Kind", "a call over the on-chain channel, which this wallet no longer has: approving it drops it".into()));
             } else if kind == "ln_resume" {
                 rows.push(("Kind", "resume Lightning payments: they are halted because a payment the node recorded late (this amount) \
                                     broke the policy when it was booked. Nothing is paid when you approve; the agent may pay over \
@@ -540,19 +533,13 @@ impl App {
             b.push_str("</ul></div>");
         }
         b.push_str(&format!("<form method=\"post\" action=\"./policy\" class=\"policy\">{}<input type=\"hidden\" name=\"mode\" value=\"form\">", Self::csrf_input(ctx)));
-        let groups = [("budgets", "Budgets"), ("human", "Human approval"), ("velocity", "Velocity"), ("channels", "Channels and refunds"),
-                      ("hot", "Hot key"), ("anchor", "Signature log")];
+        let groups = [("budgets", "Budgets"), ("human", "Human approval"), ("velocity", "Velocity"), ("hot", "Hot key"), ("anchor", "Signature log")];
         for (g, title) in groups {
             b.push_str(&format!("<fieldset><legend>{title}</legend>"));
             for (k, label, grp) in INT_KEYS {
                 if grp == g {
                     b.push_str(&format!("<label>{}<input name=\"f_{k}\" value=\"{}\" inputmode=\"numeric\"></label>", esc(label), escv(p.get(k).or(eff.get(k)))));
                 }
-            }
-            if g == "channels" {
-                let on = p.get("refund_enabled").or(eff.get("refund_enabled")).map(|v| v != &Value::Bool(false)).unwrap_or(true);
-                b.push_str(&format!("<label class=\"check\"><input type=\"checkbox\" name=\"f_refund_enabled\" value=\"1\"{}> Refund expired channels to the hot key automatically</label>",
-                                    if on { " checked" } else { "" }));
             }
             if g == "anchor" {
                 b.push_str(&format!("<label class=\"check\"><input type=\"checkbox\" name=\"f_anchor_required\" value=\"1\"{}> Refuse to start without the anchor witness (restart)</label>",
@@ -561,11 +548,11 @@ impl App {
             b.push_str("</fieldset>");
         }
         let allow = p.get("allowlist").and_then(Value::as_array).map(|a| a.iter().map(|x| txt(Some(x))).collect::<Vec<_>>().join("\n")).unwrap_or_default();
-        let cps = p.get("counterparties").and_then(Value::as_object).map(|m| m.iter().map(|(k, v)| format!("{k} {}", txt(v.get("pay_to")))).collect::<Vec<_>>().join("\n")).unwrap_or_default();
+        let cps = p.get("counterparties").and_then(Value::as_object).map(|m| m.iter().map(|(k, v)| format!("{k} {}", txt(v.get("ln_node")))).collect::<Vec<_>>().join("\n")).unwrap_or_default();
         b.push_str(&format!("<fieldset><legend>Destinations</legend>\
             <label>Allowlist: the only destinations the agent may pay (one per line: an xbt402 origin such as <code>https://api.example.net</code>, or an address)\
             <textarea name=\"f_allowlist\" rows=\"4\">{}</textarea></label>\
-            <label>Counterparties for direct channel payments (one per line: <code>origin payTo-pubkey-hex</code>)<textarea name=\"f_counterparties\" rows=\"3\">{}</textarea></label></fieldset>\
+            <label>Sellers tied to a Lightning node, for stream tickets (one per line: <code>origin node-id-hex</code>)<textarea name=\"f_counterparties\" rows=\"3\">{}</textarea></label></fieldset>\
             <p><button>Review the change</button> <a href=\"./policy?template=starter\">Start from the conservative template</a></p></form>",
             esc(&allow), esc(&cps)));
         b.push_str(&format!("<details><summary>Edit policy.json directly</summary><form method=\"post\" action=\"./policy\">{}\
@@ -613,7 +600,6 @@ impl App {
                 p.insert(k.into(), num(v));
             }
         }
-        p.insert("refund_enabled".into(), Value::Bool(f.contains_key("f_refund_enabled")));
         p.insert("anchor_required".into(), Value::Bool(f.contains_key("f_anchor_required")));
         let lines = |k: &str| -> Vec<String> { f.get(k).map(|v| v.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()).unwrap_or_default() };
         p.insert("allowlist".into(), Value::from(lines("f_allowlist")));
@@ -621,14 +607,23 @@ impl App {
         let mut cps = Map::new();
         for l in lines("f_counterparties") {
             let mut it = l.split_whitespace();
-            let (Some(origin), pay_to) = (it.next(), it.next().unwrap_or("")) else { continue };
+            let (Some(origin), node) = (it.next(), it.next().unwrap_or("")) else { continue };
             let mut e = old_cp.get(origin).and_then(Value::as_object).cloned().unwrap_or_default();
-            e.insert("pay_to".into(), pay_to.into());
+            // the payTo key of an on-chain channel: that rail was removed and the signer ignores the key
+            e.remove("pay_to");
+            if node.is_empty() {
+                e.remove("ln_node");
+            } else {
+                e.insert("ln_node".into(), node.into());
+            }
             cps.insert(origin.into(), Value::Object(e));
         }
         p.insert("counterparties".into(), Value::Object(cps));
-        // the section of the retired hub routing: the signer ignores it, so the form leaves it out
-        p.remove("routing");
+        // the section of the retired hub routing and the settings of the removed on-chain channel: the
+        // signer ignores them, so the form leaves them out
+        for k in ["routing", "channel_expiry_blocks", "refund_enabled", "refund_margin_blocks", "open_wait_s", "open_retry_s", "close_fee_max_sats", "channel_rail"] {
+            p.remove(k);
+        }
         Value::Object(p)
     }
 
@@ -695,6 +690,8 @@ impl App {
 
     // --- channels -----------------------------------------------------------------------------------
 
+    /// What an earlier version's on-chain channels left: read-only. This wallet opens, pays, closes
+    /// and refunds none.
     fn channels(&self, ctx: &Ctx) -> Resp {
         let ch = match self.call("channels", json!({})) {
             Ok(v) => v,
@@ -702,38 +699,27 @@ impl App {
         };
         let reps = self.call("channel_reports", json!({})).unwrap_or(json!({}));
         let height = int(ch.get("height"));
-        let margin = int(reps.get("refund_margin_blocks"));
-        let mut b = format!("<p>Spillman channels the wallet paid through. Tip height {height}. An open channel the provider never closes \
-                             is refunded to the hot key {margin} blocks before its expiry (about 10 minutes a block).</p>");
+        let mut b = format!("<p>This wallet pays over Lightning and no longer has an on-chain channel: it opens, pays, closes and refunds none. \
+                             This page lists what an earlier version of the wallet left. Tip height {height}.</p>");
+        if let Some(todo) = ch.pointer("/legacy_channels/what_to_do").and_then(Value::as_str) {
+            b.push_str(&format!("<div class=\"flash warn\">{}</div>", esc(todo)));
+        }
         let list = ch["channels"].as_array().cloned().unwrap_or_default();
         if list.is_empty() {
-            b.push_str("<p class=\"empty\">No channels yet.</p>");
+            b.push_str("<p class=\"empty\">No channels.</p>");
         }
         for c in list.iter().rev() {
             let st = state_of(c);
             let chan = txt(c.get("chan"));
             let dest = txt(c.get("dest"));
-            let expiry = int(c.get("expiry"));
-            b.push_str(&format!("<article class=\"card chan\"><h2><span class=\"tag {}\">{st}</span> {}</h2>", if st == "open" { "ok" } else { "" },
+            b.push_str(&format!("<article class=\"card chan\"><h2><span class=\"tag {}\">{st}</span> {}</h2>", if st == "open" || st == "pending" { "warn" } else { "" },
                                 esc(&txt(c.get("origin")).chars().next().map(|_| txt(c.get("origin"))).unwrap_or(dest.clone()))));
             let mut rows = vec![("Channel", format!("<code>{}</code>", esc(&chan))), ("Capacity", sats(int(c.get("cap_sats")))),
-                                ("Paid (signed state)", sats(int(c.get("used_sats")))), ("Unspent", sats(int(c.get("residual_sats")))),
-                                ("Expiry", format!("block {expiry}"))];
-            if st == "open" || st == "pending" {
-                let left = expiry - margin - height;
-                rows.push(("Refund", if left > 0 { format!("in {left} blocks (≈ {} h) if not closed", (left * 10 + 59) / 60) }
-                                     else { "due now (the watcher refunds it)".into() }));
-            }
-            for (k, label) in [("funding_txid", "Funding"), ("closed_txid", "Close"), ("refund_txid", "Refund tx")] {
+                                ("Paid (signed state)", sats(int(c.get("used_sats")))), ("Expiry", format!("block {}", int(c.get("expiry"))))];
+            for (k, label) in [("funding_txid", "Funding"), ("closed_txid", "Close")] {
                 if let Some(t) = c.get(k).and_then(Value::as_str) {
                     rows.push((label, format!("<code>{}</code>", esc(t))));
                 }
-            }
-            if let Some(e) = c.get("open_error").and_then(Value::as_str) {
-                rows.push(("Open", esc(e)));
-            }
-            if let Some(cc) = c.get("close_change").and_then(Value::as_str) {
-                rows.push(("Close change", esc(cc)));
             }
             if let Some(r) = reps.pointer(&format!("/reports/{}", chan.replace('~', "~0").replace('/', "~1"))) {
                 let rep = &r["report"];
@@ -745,13 +731,6 @@ impl App {
                 rows.push(("Close report", t));
             }
             b.push_str(&kv(&rows));
-            if st == "open" {
-                let key = if txt(c.get("origin")).is_empty() { dest.clone() } else { txt(c.get("origin")) };
-                b.push_str(&format!("<div class=\"row\"><form method=\"post\" action=\"./channel-close\">{}<input type=\"hidden\" name=\"counterparty\" value=\"{}\">\
-                    <button>Close cooperatively</button></form><form method=\"post\" action=\"./channel-refund\">{}<input type=\"hidden\" name=\"counterparty\" value=\"{}\">\
-                    <button class=\"danger\"{}>Refund (after expiry)</button></form></div>", Self::csrf_input(ctx), esc(&key), Self::csrf_input(ctx), esc(&key),
-                    if height >= expiry { "" } else { " disabled" }));
-            }
             b.push_str("</article>");
         }
         self.page("Channels", ctx, b)

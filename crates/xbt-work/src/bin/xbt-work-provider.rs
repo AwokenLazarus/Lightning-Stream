@@ -1,5 +1,5 @@
 //! The Rust provider for the pay-with-work regtest run: a paid JSON API (`/v1/*`, 150 sat) behind
-//! the xbt402 Provider, offering `xbt-channel` and `xbt-work` in one 402. The work rail pulls
+//! the xbt402 Provider, offering `xbt-work` in its 402. The work rail pulls
 //! receipts through the blinded relay every few seconds, re-prices on every new epoch (§6.3) and,
 //! with `--admin`, audits pool coinbases on request (loopback only, with the admin token).
 //!
@@ -15,13 +15,13 @@
 //!                   [--prime-window N] [--prime-window-min-work W] [--window-tolerance-bps N]
 //!                   [--prime-fee-bps N] [--prime-min-payout S]
 //!                   (`--max-unfunded-per-client` and `--trust-forwarded` are accepted and ignored: AGP-091)
-//!                   [--data-dir DIR] [--watch-secs N]
+//!                   [--data-dir DIR]
 //!
-//! AGP-067 (review C4): the channel side keeps its payTo key (`DIR/payto.key`, created 0600 on first
-//! start) and its channel ledger (`DIR/channels.jsonl`, locked to one process) in `--data-dir`
-//! (`XBT_WORK_DATA_DIR`, default `./xbt-work-provider-data`), and a watcher runs `close_due` every
-//! `--watch-secs` (default 5): it closes each channel before its expiry and bumps a stuck close. A
-//! restart keeps every channel; before, a new random key and an empty ledger let each buyer refund.
+//! `--data-dir` (`XBT_WORK_DATA_DIR`, default `./xbt-work-provider-data`) holds the work book and the
+//! admin token, and is locked to one process (`DIR/channels.jsonl.lock`: the name an earlier
+//! version locked, when this provider also sold over an on-chain channel, so that an old and a new
+//! process on one directory still exclude each other). `--watch-secs` is accepted and ignored:
+//! it was the interval of the channel watcher.
 //!
 //! §13.1 caps (AGP-043): unaudited credit per invoice and in total, in work units, in sats converted
 //! at each epoch's price (without the haircut), or in calls at the `--price` (sats); `off` removes
@@ -82,10 +82,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use xbt402::funding::ChainBackend;
 use xbt402::http::{serve_service, HttpService, UreqTransport};
-use xbt402::ledger::Ledger;
-use xbt402::provider::{load_or_create_secret, HttpResponse, Provider, ProviderConfig, PEER_HEADER};
+use xbt402::provider::{HttpResponse, Provider, ProviderConfig, PEER_HEADER};
 use xbt402::rpc::Rpc;
 use xbt_work::audit::{audit_block, check_fraud_proof};
 use xbt_work::chain::ChainBlock;
@@ -279,11 +277,33 @@ impl HttpService for Service {
             return HttpResponse::new(200, vec![("Content-Type".into(), "application/json".into())], xbt402::json::dumps(&v).into_bytes());
         }
         if path == "/" || path == "/health" {
-            let v = json!({"server": "xbt-work-provider (rust)", "payTo": self.prov.pay_to(), "workIdentity": self.work.cfg.identity,
-                           "network": self.prov.cfg.network, "invoices": self.work.invoices().len()});
+            let v = json!({"server": "xbt-work-provider (rust)", "workIdentity": self.work.cfg.identity,
+                           "network": self.work.cfg.network, "invoices": self.work.invoices().len()});
             return HttpResponse::new(200, vec![("Content-Type".into(), "application/json".into())], xbt402::json::dumps(&v).into_bytes());
         }
         self.prov.serve(method, path, headers, body, url, None)
+    }
+}
+
+/// Lock `dir` for this process, for as long as the returned file lives, or fail naming the holder.
+fn lock_data_dir(dir: &std::path::Path) -> Result<std::fs::File, xbt402::ChannelError> {
+    use std::io::{Read as _, Seek as _, Write as _};
+    let io = |e: std::io::Error| xbt402::ChannelError::new("data_dir", format!("{}: {e}", dir.display()));
+    std::fs::create_dir_all(dir).map_err(io)?;
+    let path = dir.join("channels.jsonl.lock");
+    let mut f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path).map_err(io)?;
+    match f.try_lock() {
+        Ok(()) => {
+            f.set_len(0).and_then(|_| f.rewind()).and_then(|_| writeln!(f, "{}", std::process::id())).map_err(io)?;
+            Ok(f)
+        }
+        Err(std::fs::TryLockError::WouldBlock) => {
+            let mut holder = String::new();
+            let _ = f.read_to_string(&mut holder);
+            let who = if holder.trim().is_empty() { "another process".to_string() } else { format!("pid {}", holder.trim()) };
+            Err(xbt402::ChannelError::new("data_dir_locked", format!("{} is in use by {who} (lock {}): one provider per data dir", dir.display(), path.display())))
+        }
+        Err(std::fs::TryLockError::Error(e)) => Err(io(e)),
     }
 }
 
@@ -345,9 +365,8 @@ fn main() {
         eprintln!("xbt-work-provider: {e}");
         std::process::exit(2);
     };
-    // the ledger first: its lock keeps a second process off this data dir, key file and work book included
-    let ledger = Ledger::open(&data.join("channels.jsonl")).unwrap_or_else(|e| die(e));
-    let sk = load_or_create_secret(&data.join("payto.key")).unwrap_or_else(|e| die(e));
+    // the lock first: it keeps a second process off this data dir, the work book included
+    let _lock = lock_data_dir(&data).unwrap_or_else(|e| die(e));
     wcfg.state_path = match arg("--state") {
         Some(s) if s == "off" => {
             eprintln!("state: --state off: the work book is in memory only, every balance is lost on restart");
@@ -363,25 +382,14 @@ fn main() {
     }));
     eprintln!("caps: {:?} -> {:?} work units at this epoch ({} a call), owed carry at most {max_carry:?} sats; Prime terms {:?}",
               (caps.invoice, caps.total), work.caps(), work.amount(price).unwrap_or(0), work.cfg.terms);
-    let chain: Arc<dyn ChainBackend> = Arc::new(node.clone());
-    let prov = Arc::new(Provider::new(chain, sk, ProviderConfig::new(&net), ledger,
-                                      Box::new(move |_, p| if p.starts_with("/v1/") { price } else { 0 }),
-                                      Box::new(|_, p, _| answer(p))).unwrap_or_else(|e| die(e))
+    let prov = Arc::new(Provider::new(ProviderConfig::default(), Box::new(move |_, p| if p.starts_with("/v1/") { price } else { 0 }),
+                                      Box::new(|_, p, _| answer(p)))
         .with_scheme(Arc::new(WorkScheme(work.clone()))));
-    // Each of the three loops below runs its rounds through `guard::round` (AGP-097): a panic ends
+    if opt("--watch-secs", "XBT_WORK_WATCH_SECS").is_some() {
+        eprintln!("watcher: --watch-secs is no longer used: it was the interval of the on-chain channel's watcher, and this provider sells for work only");
+    }
+    // Each of the two loops below runs its rounds through `guard::round` (AGP-097): a panic ends
     // the round, is reported, and the loop goes on.
-    let (w, every) = (prov.clone(), num::<u64>("--watch-secs", "XBT_WORK_WATCH_SECS").unwrap_or(5).max(1));
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(every));
-        let round = guard::round(|| match w.close_due() {
-            Ok(closed) if !closed.is_empty() => eprintln!("watcher: closed {closed:?}"),
-            Ok(_) => {}
-            Err(e) => eprintln!("watcher: {e}"),
-        });
-        if let Err(why) = round {
-            eprintln!("watcher: a round panicked ({why}); the watcher goes on");
-        }
-    });
     // pull receipts through the relay, and follow the epoch (§6.3: re-price new 402s)
     let (w2, n2) = (work.clone(), node.clone());
     let pull_secs: u64 = arg("--pull-secs").map(|p| p.parse().expect("pull secs")).unwrap_or(3);
@@ -497,8 +505,8 @@ fn main() {
         });
     }
     let hs = serve_service(svc, &format!("127.0.0.1:{port}"), 4).expect("bind");
-    println!("xbt-work-provider ready on 127.0.0.1:{port} network {net} channel payTo {} work payTo {} amount {} work units / {price} sat",
-             prov.pay_to(), work.cfg.identity, work.amount(price).unwrap_or(0));
+    println!("xbt-work-provider ready on 127.0.0.1:{port} network {net} work payTo {} amount {} work units / {price} sat",
+             work.cfg.identity, work.amount(price).unwrap_or(0));
     for h in hs {
         let _ = h.join();
     }

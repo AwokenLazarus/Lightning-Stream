@@ -255,26 +255,45 @@ def start_proxy(listen_port, upstream_port, forwarded):
     return srv
 
 
-def ensure_provider_image():
-    """The AGP-038 test provider (xbt402-rust-provider, 150 sat per call) as a FROM scratch image."""
-    if docker("image", "inspect", "agp038-test-provider:1", check_rc=False).returncode == 0:
-        return
-    b = os.path.join(ROOT, "target/x86_64-unknown-linux-musl/release/xbt402-rust-provider")
-    if not os.path.exists(b):
-        sh("nice", "-n", "19", "cargo", "build", "-q", "-j2", "--release", "--target", "x86_64-unknown-linux-musl", "-p", "xbt402-interop",
-           "--bin", "xbt402-rust-provider", cwd=ROOT)
-    import tempfile
-    with tempfile.TemporaryDirectory() as ctx:
-        sh("cp", b, ctx)
-        open(os.path.join(ctx, "Dockerfile"), "w").write(
-            "FROM scratch\nCOPY xbt402-rust-provider /xbt402-rust-provider\nUSER 10009:10009\nENTRYPOINT [\"/xbt402-rust-provider\"]\n")
-        docker("build", "-q", "-t", "agp038-test-provider:1", ctx)
-
-
 POLICY_BASE = {"max_per_tx_sats": 1000, "daily_budget_sats": 20000, "weekly_budget_sats": 50000, "per_counterparty_cap_sats": 9400,
-               "velocity_max": 50, "velocity_window_s": 3600, "human_threshold_sats": 5000, "channel_expiry_blocks": 1008,
-               "refund_enabled": True, "refund_margin_blocks": 6, "hot_balance_cap_sats": 100000, "split_window_s": 0, "regtest_mine": False,
-               "anchor_required": True, "anchor_interval_s": 5, "open_wait_s": 90, "open_retry_s": 5}
+               "velocity_max": 50, "velocity_window_s": 3600, "human_threshold_sats": 5000, "hot_balance_cap_sats": 100000, "split_window_s": 0,
+               "regtest_mine": False, "anchor_required": True, "anchor_interval_s": 5}
+
+# what the wallet's MCP lists with no rail's own tools turned on
+BASE_TOOLS = ["balance", "quote_payment", "pay", "history", "channels", "xbt402_pay"]
+
+
+def agent_and_custody(group, agent, ui, sign_bin, key_file, chain, sc):
+    """What a packaged wallet can show of itself today, through the agent's MCP and the owner's UI.
+
+    The packages wire no Lightning node into the wallet yet, and the on-chain channel the wallet
+    once paid over was removed, so no payment to a seller is made here (an agent paying a seller
+    through the MCP is proven on Lightning by scripts/ticket_e2e_regtest.sh). What is checked: the
+    agent's surface (the tool list, the balance, a payment quoted under the owner's policy), and
+    custody of the hot key (coins received and counted, then swept out by the owner with a
+    signature made on another device). `sc(method, params)` calls the signer's socket. Returns the
+    facts a later restart or restore is compared with."""
+    ha = sc("hot_address")
+    txid = chain.cli("sendtoaddress", ha["hot_address"], "0.0005", wallet="faucet")
+    chain.mine(1)
+    sc("notice_hot_txid", {"txid": txid})
+    check(group, "the hot key received 50,000 sat and the wallet counts them", sc("hot_address").get("hot_sats") == 50000, sc("hot_address"))
+    code, listed = agent.post({"jsonrpc": "2.0", "id": 9000, "method": "tools/list"})
+    names = [t.get("name") for t in listed.get("result", {}).get("tools", [])] if isinstance(listed, dict) else listed
+    check(group, "the agent's tools: the six every wallet has, and none of the removed on-chain channel", names == BASE_TOOLS, names)
+    bal = agent.tool("balance")
+    check(group, "the agent reads the balance: the hot key's coins, no channel", bal.get("hot", {}).get("hot_sats") == 50000 and bal.get("channels") == []
+          and not bal.get("legacy_channels"), bal)
+    q = agent.tool("quote_payment", to=chain.faucet, amount_xbt=0.00001)
+    check(group, "a payment the agent asks about is judged by the owner's policy (allowed: on the allowlist, under every limit)", q.get("verdict") == "allow", q)
+    exp = str(int(time.time()) + 600)
+    msg = "\n".join(["xbt-agentwallet-hot-sweep-v1", ha["hot_address"], chain.faucet, "20000", exp]).encode().hex()
+    st, loc, _ = ui.post("/keys", "/sweep", {"to": chain.faucet, "amount_sats": "20000", "expiry": exp, "signature": "", "signature_ext": sign(sign_bin, key_file, msg)})
+    f = ui.flash(loc.lstrip(".")) if loc else ""
+    chain.mine(1)
+    left = sc("hot_address").get("hot_sats")
+    check(group, "the owner sweeps 20,000 sat of the hot key in the UI, signed on another device", f.startswith("Swept 20000 sats to") and 29000 <= left < 30000, [f, left])
+    return {"hot_address": ha["hot_address"], "hot_sats": left, "channels": agent.tool("channels").get("channels")}
 
 
 class Chain:
@@ -304,30 +323,6 @@ class Chain:
         desc = self.cli("getdescriptorinfo", "raw(51)")["descriptor"]
         while self.cli("getblockcount") < 6720:
             self.cli("generatetodescriptor", min(1000, 6720 - self.cli("getblockcount")), desc)
-
-
-class Miner:
-    """A block every `every` seconds while a paid call waits for its funding's confirmation."""
-
-    def __init__(self, chain, every=2.0):
-        self.chain, self.every = chain, every
-        self.stop = threading.Event()
-        self.t = threading.Thread(target=self.run, daemon=True)
-
-    def run(self):
-        while not self.stop.wait(self.every):
-            try:
-                self.chain.mine(1)
-            except Exception as e:  # noqa: BLE001
-                log("miner:", e)
-
-    def __enter__(self):
-        self.t.start()
-        return self
-
-    def __exit__(self, *a):
-        self.stop.set()
-        self.t.join()
 
 
 def write_results(out):

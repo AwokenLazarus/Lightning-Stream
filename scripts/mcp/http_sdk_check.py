@@ -2,7 +2,9 @@
 """AGP-030: the Rust server's streamable HTTP transport under an independent client, the official
 Python MCP SDK (`mcp` 2.2.0, the SDK B2 itself runs on): the same ClientSession talks to the Rust
 server over streamable HTTP and to B2's server over stdio, in front of the same mock signer, and every
-answer (tools/list and a set of tool calls, including errors) must be equal.
+answer (a set of tool calls, including errors, and the tools/list entries that are the same in both
+wallets) must be equal. The Rust wallet has no on-chain channel and so lists fewer tools: see
+mcp_conformance.py.
 
 usage: http_sdk_check.py --py PYTHON_WITH_MCP --b2 B2_TREE --rust XBT_WALLET_MCP [--port 23594]
 (re-executes itself under PYTHON_WITH_MCP)"""
@@ -19,7 +21,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 CALLS = [("balance", {}), ("history", {"limit": "3"}), ("quote_payment", {"to": "x", "amount_xbt": 0.5}),
          ("xbt402_pay", {"url": "http://127.0.0.1:1/x", "max_sats": 5}), ("pay", {"to": "MARK:error", "amount_xbt": 1}),
-         ("history", {"limit": 5.5}), ("approve", {}), ("forward_recover", {"txid": "MARK:list"})]
+         ("history", {"limit": 5.5}), ("approve", {}), ("pay", {"to": "MARK:list", "amount_xbt": 1})]
 
 
 async def session_run(transport_cm):
@@ -48,7 +50,7 @@ def main():
     if not a.inner:
         os.execv(a.py, [a.py, os.path.abspath(__file__), "--inner"] + sys.argv[1:])
     sys.path.insert(0, HERE)
-    from mcp_conformance import MockSigner
+    from mcp_conformance import RUST_TOOLS, SAME_ENTRY, MockSigner
     from mcp.client.stdio import StdioServerParameters, stdio_client
     from mcp.client.streamable_http import streamable_http_client
 
@@ -78,7 +80,12 @@ def main():
     finally:
         srv.terminate()
         srv.wait(5)
-    diffs = [k for k in ("server", "protocol", "tools") if rust[k] != b2[k]]
+    same = lambda side: [t for t in side["tools"] if t["name"] in SAME_ENTRY]
+    diffs = [k for k in ("server", "protocol") if rust[k] != b2[k]]
+    if same(rust) != same(b2):
+        diffs.append("tools (the entries both wallets share)")
+    if [t["name"] for t in rust["tools"]] != RUST_TOOLS:
+        diffs.append(f"the Rust tool list is {[t['name'] for t in rust['tools']]}")
     diffs += [f"call {CALLS[i][0]} {json.dumps(CALLS[i][1])}" for i, (x, y) in enumerate(zip(rust["calls"], b2["calls"])) if x != y]
     for d in diffs:
         print("DIFF", d)

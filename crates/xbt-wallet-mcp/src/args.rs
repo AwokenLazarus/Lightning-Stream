@@ -1,4 +1,4 @@
-//! The ten tools' arguments, validated as B2's MCP (pydantic 2 in lax mode, through the Python SDK's
+//! The tools' arguments, validated as B2's MCP (pydantic 2 in lax mode, through the Python SDK's
 //! `MCPServer`) validates them: the same coercions (`"7"` and `7.0` are the integer 7, `true` is 1,
 //! `"1_000"` is 1000, `"inf"` is a float), the same refusals, and pydantic's error text word for word.
 use serde_json::{Map, Value};
@@ -49,20 +49,16 @@ pub fn spec(tool: &str) -> Option<&'static [Arg]> {
     static HISTORY: [Arg; 1] = [opt("limit", Ty::Int, || Value::from(20))];
     static XBT402_PAY: [Arg; 4] = [req("url", Ty::Str), opt("method", Ty::Str, || Value::from("GET")), opt("body", Ty::Str, empty),
                                    opt("max_sats", Ty::Int, || Value::from(1000))];
-    static COUNTERPARTY: [Arg; 1] = [req("counterparty", Ty::Str)];
-    static TXID: [Arg; 1] = [req("txid", Ty::Str)];
     // AGP-082: amount_sats, for a BOLT 12 offer that names no amount (0: not given)
     static LN_PAY: [Arg; 4] = [req("invoice", Ty::Str), req("max_sats", Ty::Int), opt("description", Ty::Str, empty),
                                opt("amount_sats", Ty::Int, || Value::from(0))];
     static TICKET_STATUS: [Arg; 1] = [opt("session", Ty::Str, empty)];
     static TICKET_STOP: [Arg; 1] = [req("session", Ty::Str)];
     Some(match tool {
-        "balance" | "channels" | "forward_status" => &[],
+        "balance" | "channels" => &[],
         "quote_payment" | "pay" => &PAYMENT,
         "history" => &HISTORY,
         "xbt402_pay" => &XBT402_PAY,
-        "close_channel" | "xbt402_refund" => &COUNTERPARTY,
-        "forward_recover" => &TXID,
         // AGP-048 (not B2's)
         "ln_pay" => &LN_PAY,
         "ln_status" => &[],

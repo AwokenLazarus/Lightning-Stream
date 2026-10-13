@@ -127,11 +127,8 @@ pub struct PolicyConfig {
     pub human_threshold_sats: i64,
     pub split_window_s: i64,
     pub approval_ttl_s: i64,
-    pub channel_expiry_blocks: i64,
     pub treasury_csv: i64,
     pub counterparties: Map<String, Value>,
-    pub refund_enabled: bool,
-    pub refund_margin_blocks: i64,
     pub hot_balance_cap_sats: i64,
     pub forward: Map<String, Value>,
     /// AGP-048 `rail=ln`: the Lightning rail's settings ([`crate::ln::LnPolicy`]).
@@ -142,23 +139,15 @@ pub struct PolicyConfig {
     pub anchor_required: bool,
     /// `None`: mine on regtest only.
     pub regtest_mine: Option<bool>,
-    pub open_wait_s: i64,
-    pub open_retry_s: i64,
-    pub close_fee_max_sats: i64,
-    /// Whether `xbt402_pay` may still pay a seller's on-chain channel entry (the frozen rail).
-    /// `true` unless the owner sets `channel_rail: false`: then no new channel is funded and no
-    /// state is signed by `xbt402_pay`; closing and refunding a channel that exists still work.
-    pub channel_rail: bool,
 }
 
 impl Default for PolicyConfig {
     fn default() -> Self {
         Self { allowlist: vec![], max_per_tx_sats: 10_000_000, daily_budget_sats: 50_000_000, weekly_budget_sats: 200_000_000,
                per_counterparty_cap_sats: 30_000_000, velocity_max: 8, velocity_window_s: 3600, human_threshold_sats: 10_000_000,
-               split_window_s: 600, approval_ttl_s: 900, channel_expiry_blocks: 1008, treasury_csv: 4320, counterparties: Map::new(),
-               refund_enabled: true, refund_margin_blocks: 6, hot_balance_cap_sats: 0, forward: Map::new(), ln: Map::new(), tickets: Map::new(),
-               anchor_interval_s: 60, anchor_required: false, regtest_mine: None, open_wait_s: 1800, open_retry_s: 60,
-               close_fee_max_sats: 2000, channel_rail: true }
+               split_window_s: 600, approval_ttl_s: 900, treasury_csv: 4320, counterparties: Map::new(),
+               hot_balance_cap_sats: 0, forward: Map::new(), ln: Map::new(), tickets: Map::new(),
+               anchor_interval_s: 60, anchor_required: false, regtest_mine: None }
     }
 }
 
@@ -185,22 +174,11 @@ impl PolicyConfig {
         int("human_threshold_sats", &mut c.human_threshold_sats)?;
         int("split_window_s", &mut c.split_window_s)?;
         int("approval_ttl_s", &mut c.approval_ttl_s)?;
-        int("channel_expiry_blocks", &mut c.channel_expiry_blocks)?;
         int("treasury_csv", &mut c.treasury_csv)?;
-        int("refund_margin_blocks", &mut c.refund_margin_blocks)?;
         int("hot_balance_cap_sats", &mut c.hot_balance_cap_sats)?;
         int("anchor_interval_s", &mut c.anchor_interval_s)?;
-        int("open_wait_s", &mut c.open_wait_s)?;
-        int("open_retry_s", &mut c.open_retry_s)?;
-        int("close_fee_max_sats", &mut c.close_fee_max_sats)?;
-        if let Some(v) = raw.get("refund_enabled") {
-            c.refund_enabled = py_bool(v);
-        }
         if let Some(v) = raw.get("anchor_required") {
             c.anchor_required = py_bool(v);
-        }
-        if let Some(v) = raw.get("channel_rail").filter(|v| !v.is_null()) {
-            c.channel_rail = py_bool(v);
         }
         if let Some(v) = raw.get("regtest_mine").filter(|v| !v.is_null()) {
             c.regtest_mine = Some(py_bool(v));
@@ -230,23 +208,24 @@ impl PolicyConfig {
         v
     }
 
-    /// The registered payTo pubkey for `dest` (policy `counterparties`).
-    pub fn pay_to_for(&self, dest: &str) -> String {
-        self.counterparties.get(&normalize_dest(dest)).and_then(|i| i.get("pay_to")).and_then(Value::as_str)
-            .map(|s| s.trim().to_string()).unwrap_or_default()
-    }
 }
 
 /// Every key policy.json may hold (B2's `PolicyConfig` plus `human_pubkey`, `recovery_address`).
-pub const POLICY_KEYS: [&str; 30] = ["allowlist", "max_per_tx_sats", "daily_budget_sats", "weekly_budget_sats", "per_counterparty_cap_sats",
-    "velocity_max", "velocity_window_s", "human_threshold_sats", "split_window_s", "approval_ttl_s", "channel_expiry_blocks", "treasury_csv",
-    "counterparties", "refund_enabled", "refund_margin_blocks", "hot_balance_cap_sats", "forward", "anchor_interval_s",
-    "anchor_required", "regtest_mine", "open_wait_s", "open_retry_s", "close_fee_max_sats", "human_pubkey", "recovery_address",
-    "vault", "treasury", "ln", "tickets", "channel_rail"];
+pub const POLICY_KEYS: [&str; 23] = ["allowlist", "max_per_tx_sats", "daily_budget_sats", "weekly_budget_sats", "per_counterparty_cap_sats",
+    "velocity_max", "velocity_window_s", "human_threshold_sats", "split_window_s", "approval_ttl_s", "treasury_csv",
+    "counterparties", "hot_balance_cap_sats", "forward", "anchor_interval_s",
+    "anchor_required", "regtest_mine", "human_pubkey", "recovery_address",
+    "vault", "treasury", "ln", "tickets"];
+
+/// Settings of the on-chain channel, which was removed: how long a channel lived, when it was
+/// refunded, how long an open waited, the close fee the wallet accepted, and the switch that turned
+/// the rail off. A policy that still carries them loads; the signer says so and ignores them (a
+/// value that is not even a number is ignored too). Nothing else in a policy changed its meaning.
+pub const CHANNEL_KEYS: [&str; 7] = ["channel_expiry_blocks", "refund_enabled", "refund_margin_blocks", "open_wait_s", "open_retry_s",
+    "close_fee_max_sats", "channel_rail"];
 
 /// Fields a running signer reads only at start: a `policy_set` records them and they apply on the next start.
-pub const RESTART_KEYS: [&str; 8] = ["anchor_interval_s", "anchor_required", "regtest_mine", "open_wait_s", "refund_margin_blocks",
-    "close_fee_max_sats", "treasury_csv", "forward"];
+pub const RESTART_KEYS: [&str; 5] = ["anchor_interval_s", "anchor_required", "regtest_mine", "treasury_csv", "forward"];
 
 /// AGP-039: the checks a new policy.json must pass before a signer accepts it (the web UI's editor
 /// shows exactly these). `errors` refuse it: the engine's own parse errors first (`PolicyConfig::from_value`),
@@ -262,21 +241,22 @@ pub fn validate_policy(raw: &Value) -> (Vec<String>, Vec<String>) {
         if k == "routing" {
             // a section of the retired hub routing: a policy that still carries it loads, and says so
             warnings.push("policy.json routing: payments through a hub were retired; the signer ignores this section and it can be removed".into());
+        } else if CHANNEL_KEYS.contains(&k.as_str()) {
+            warnings.push(format!("policy.json {k}: a setting of the on-chain channel, which was removed; the signer ignores it and it can be removed"));
         } else if !POLICY_KEYS.contains(&k.as_str()) {
             warnings.push(format!("policy.json {k}: unknown key (the signer ignores it)"));
         }
     }
     let nonneg = [("max_per_tx_sats", c.max_per_tx_sats), ("daily_budget_sats", c.daily_budget_sats), ("weekly_budget_sats", c.weekly_budget_sats),
                   ("per_counterparty_cap_sats", c.per_counterparty_cap_sats), ("velocity_max", c.velocity_max), ("human_threshold_sats", c.human_threshold_sats),
-                  ("split_window_s", c.split_window_s), ("hot_balance_cap_sats", c.hot_balance_cap_sats), ("refund_margin_blocks", c.refund_margin_blocks),
-                  ("anchor_interval_s", c.anchor_interval_s), ("open_wait_s", c.open_wait_s), ("open_retry_s", c.open_retry_s),
-                  ("close_fee_max_sats", c.close_fee_max_sats), ("treasury_csv", c.treasury_csv)];
+                  ("split_window_s", c.split_window_s), ("hot_balance_cap_sats", c.hot_balance_cap_sats),
+                  ("anchor_interval_s", c.anchor_interval_s), ("treasury_csv", c.treasury_csv)];
     for (k, v) in nonneg {
         if v < 0 {
             errors.push(format!("policy.json {k}: must be >= 0 (got {v})"));
         }
     }
-    let positive = [("velocity_window_s", c.velocity_window_s), ("approval_ttl_s", c.approval_ttl_s), ("channel_expiry_blocks", c.channel_expiry_blocks)];
+    let positive = [("velocity_window_s", c.velocity_window_s), ("approval_ttl_s", c.approval_ttl_s)];
     for (k, v) in positive {
         if v <= 0 {
             errors.push(format!("policy.json {k}: must be > 0 (got {v})"));
@@ -284,9 +264,6 @@ pub fn validate_policy(raw: &Value) -> (Vec<String>, Vec<String>) {
     }
     if c.approval_ttl_s > 7 * 86_400 {
         errors.push(format!("policy.json approval_ttl_s: at most 604800 s (got {})", c.approval_ttl_s));
-    }
-    if c.channel_expiry_blocks > 0 && c.refund_margin_blocks >= c.channel_expiry_blocks {
-        errors.push(format!("policy.json refund_margin_blocks {} must be below channel_expiry_blocks {}", c.refund_margin_blocks, c.channel_expiry_blocks));
     }
     if c.daily_budget_sats > c.weekly_budget_sats {
         warnings.push(format!("daily_budget_sats {} is above weekly_budget_sats {}: the weekly budget binds first", c.daily_budget_sats, c.weekly_budget_sats));
@@ -322,12 +299,8 @@ pub fn validate_policy(raw: &Value) -> (Vec<String>, Vec<String>) {
             errors.push(format!("policy.json counterparties[{k}]: must be an object"));
             continue;
         };
-        if let Some(pt) = m.get("pay_to") {
-            let ok = pt.as_str().map(str::trim).and_then(|h| hex::decode(h).ok())
-                .is_some_and(|b| b.len() == 33 && (b[0] == 2 || b[0] == 3) && xbt_primitives::secp256k1::PublicKey::from_slice(&b).is_ok());
-            if !ok {
-                errors.push(format!("policy.json counterparties[{k}].pay_to: not a compressed secp256k1 public key (66 hex)"));
-            }
+        if m.contains_key("pay_to") {
+            warnings.push(format!("policy.json counterparties[{k}].pay_to: the payTo key of an on-chain channel, which was removed; the signer ignores it and it can be removed"));
         }
         // stream tickets: the Lightning node the owner ties this origin to
         if let Some(n) = m.get("ln_node") {

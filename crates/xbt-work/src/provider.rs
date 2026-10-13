@@ -1,4 +1,4 @@
-//! The provider rail (spec §4.5, §7, §9): an `xbt-work` offer beside `xbt-channel` in the xbt402
+//! The provider rail (spec §4.5, §7, §9): the `xbt-work` offer in the xbt402
 //! [`Provider`](xbt402::provider::Provider) ([`Provider::with_scheme`](xbt402::provider::Provider::with_scheme)).
 //!
 //! * `POST` or `GET /x402/xbt-work/invoice` issues invoices (128-bit base32 id, a fresh `authKey`, both
@@ -165,7 +165,7 @@ pub const SHIPPED_HAIRCUT_BPS: u32 = 1000;
 /// Provider settings.
 #[derive(Debug, Clone)]
 pub struct WorkConfig {
-    /// CAIP-2 network id, as the xbt-channel offer.
+    /// CAIP-2 network id (`bip122:...`).
     pub network: String,
     /// The payout identity (canonicalised here), `payTo`.
     pub identity: String,

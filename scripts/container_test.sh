@@ -2,10 +2,10 @@
 # AGP-038: the container test. Builds the multi-arch images (scripts/oci_build.sh --load: all three platforms
 # into dist/oci/*.tar, the amd64 ones loaded as <image>:agp038), checks the arm64 and arm/v7 images with
 # scripts/oci_inspect.py, then runs scripts/container/container_test.py: signer + witness + MCP
-# composed with a Knots 29.4.2 regtest node, configured only by env and a data dir; one xbt402 call paid
-# through the MCP over HTTP; kill/restart persistence; /readyz gating. Ports 23700-23799 (published on
-# 127.0.0.1 only: MCP 23710, provider 23730). Soak rules: cargo under CPUQuota 200%,
-# MemoryMax 4G, nice 19, -j2. Evidence: run/container-test/<stamp>/.
+# composed with a Knots 29.4.2 regtest node, configured only by env and a data dir; the agent's MCP over
+# HTTP and the hot key's custody; kill/restart persistence; /readyz gating. Ports 23700-23799 (published
+# on 127.0.0.1 only: MCP 23710). Soak rules: cargo under CPUQuota 200%, MemoryMax 4G, nice 19, -j2.
+# Evidence: run/container-test/<stamp>/.
 #   scripts/container_test.sh [--skip-build]      CONTAINER_TEST_KEEP=1 keeps the volumes
 set -euo pipefail
 lazvault hold check --project xbt-agentpay || exit 75   # IMP-030: heavy entry point, refuses during a host hold
@@ -20,10 +20,6 @@ if [ "${1:-}" != "--skip-build" ]; then
   echo "== images (scripts/oci_build.sh --load)"
   ./scripts/oci_build.sh --load | tee "$OUT/oci_build.log"
 fi
-echo "== test provider binary (x86_64 musl)"
-SOAK=(nice -n 19)
-command -v systemd-run >/dev/null && SOAK=(systemd-run --user --scope -q -p CPUQuota=200% -p MemoryMax=4G nice -n 19)
-"${SOAK[@]}" cargo build -q -j2 --release --target x86_64-unknown-linux-musl -p xbt402-interop --bin xbt402-rust-provider
 echo "== inspect: every image, every platform (arm64 and arm/v7 included)"
 set +e
 python3 scripts/oci_inspect.py dist/oci xbt-signer xbt-anchor-witness xbt-wallet-mcp >"$OUT/oci_inspect.json"

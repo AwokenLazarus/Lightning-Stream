@@ -19,8 +19,10 @@ the services your policy allows, within its budgets, and anything above your thr
 ## Everyday use
 
 - Payments above your threshold appear under **Approvals**; approve or deny them there, signed with your key.
-- **Channels** shows the agent's payment channels, their close reports and refunds; **Signatures** the
-  signature log and its anchors.
+- **Signatures** shows the signature log and its anchors; **Keys** the hot key, its sweep and its
+  rotation. **Channels** lists only what an earlier version of the wallet left: this wallet pays
+  over Lightning and has no on-chain channel. The package does not connect the wallet to a
+  Lightning node yet, so for now no service is paid.
 - The token lets an agent pay what your policy allows. If it leaks, open the **Agents** page and rotate it
   there (no restart), or run the *Rotate the agent token* action. Give your agents the new one.
 
@@ -31,6 +33,6 @@ Your approval key and your funds are not affected.
 
 ## Backups
 
-StartOS backups include the wallet's sealed keys, their wrapping key, the channels and the signature anchors.
+StartOS backups include the wallet's sealed keys, their wrapping key, the ledgers and the signature anchors.
 Keep the StartOS backup safe as you would the wallet. The encrypted backup on the web UI's Keys page is the
 portable one.

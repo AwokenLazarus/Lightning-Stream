@@ -445,7 +445,6 @@ struct LnRig {
     _dir: tempfile::TempDir,
     root: std::path::PathBuf,
     node: Arc<LnNode>,
-    web: Arc<Web>,
     ln: Arc<FakeLn>,
     clock: Arc<AtomicU64>,
     s: Arc<Signer>,
@@ -462,7 +461,6 @@ impl LnRig {
         env_for(dir.path());
         std::env::remove_var("B2_LN_REST");
         let chain = FakeChain::new(name, height);
-        let web = Arc::new(Web::default());
         let mut pol = json!({"allowlist": [PROVIDER, dest()], "max_per_tx_sats": 5000, "daily_budget_sats": 6000, "weekly_budget_sats": 20000,
                              "per_counterparty_cap_sats": 20000, "human_threshold_sats": 1000,
                              "ln": {"enabled": true, "split_height": 6000, "max_fee_base_sats": 2, "max_fee_ppm": 1000}});
@@ -485,18 +483,18 @@ impl LnRig {
         let tap = node.fund(h2, 1, 100_000, 0x00, base + 50);
         ln.set(|s| s.channels = vec![with_point(chan(&scid(h1, 1), "ANCHORS", true), &good), with_point(chan(&scid(h2, 1), "SIMPLE_TAPROOT", false), &tap)]);
         let clock = Arc::new(AtomicU64::new(T0));
-        let s = Self::start(&root, &node, &web, &ln, &clock);
-        Self { _dir: dir, root, node, web, ln, clock, s }
+        let s = Self::start(&root, &node, &ln, &clock);
+        Self { _dir: dir, root, node, ln, clock, s }
     }
 
-    fn start(root: &std::path::Path, node: &Arc<LnNode>, web: &Arc<Web>, ln: &Arc<FakeLn>, clock: &Arc<AtomicU64>) -> Arc<Signer> {
+    fn start(root: &std::path::Path, node: &Arc<LnNode>, ln: &Arc<FakeLn>, clock: &Arc<AtomicU64>) -> Arc<Signer> {
         let c = clock.clone();
-        Signer::new(root, SignerOptions { node: Some(node.clone()), transport: Some(web.clone()), ln: Some(ln.clone()),
+        Signer::new(root, SignerOptions { node: Some(node.clone()), ln: Some(ln.clone()),
                                           clock: Some(Arc::new(move || c.load(Ordering::SeqCst) as f64)), ..Default::default() }).unwrap()
     }
 
     fn restart(&mut self) {
-        self.s = Self::start(&self.root, &self.node, &self.web, &self.ln, &self.clock);
+        self.s = Self::start(&self.root, &self.node, &self.ln, &self.clock);
     }
 
     /// A channel at (height, pos) whose funding (signed `sighash`, from a coin at `prev_height`) is on our node.
@@ -879,12 +877,12 @@ fn the_rail_is_off_unless_the_policy_and_a_node_say_so() {
     std::env::remove_var("B2_LN_REST");
     let root = root_with(dir.path(), &runbook_policy(json!({"ln": {"enabled": true}})));
     let chain = FakeChain::new("regtest", 6_720);
-    let s = Signer::new(&root, SignerOptions { node: Some(chain.clone()), transport: Some(Arc::new(Web::default())), ..Default::default() }).unwrap();
+    let s = Signer::new(&root, SignerOptions { node: Some(chain.clone()), ..Default::default() }).unwrap();
     assert_eq!(call(&s, "ln_pay", json!({"invoice": inv, "max_sats": 1000}))["rule"], "ln_unavailable");
     // a broken configuration shuts the rail, not the signer
     std::env::set_var("B2_LN_REST", "https://127.0.0.1:34611");
     std::env::set_var("B2_LN_MACAROON", dir.path().join("missing.macaroon"));
-    let s = Signer::new(&root, SignerOptions { node: Some(chain), transport: Some(Arc::new(Web::default())), ..Default::default() }).unwrap();
+    let s = Signer::new(&root, SignerOptions { node: Some(chain), ..Default::default() }).unwrap();
     let r = call(&s, "ln_pay", json!({"invoice": inv, "max_sats": 1000}));
     assert_eq!(r["rule"], "ln_config", "{r}");
     std::env::remove_var("B2_LN_REST");
@@ -1393,7 +1391,7 @@ fn l3_reconcile_does_not_release_a_settled_payment_on_a_busy_node() {
     let ln: Arc<dyn LnBackend> = Arc::new(LndRest::new(&fake.url, &macaroon_file(dir.path()), None).unwrap());
     let clock = Arc::new(AtomicU64::new(T0));
     let c = clock.clone();
-    let s = Signer::new(&root, SignerOptions { node: Some(FakeChain::new("regtest", 6_720)), transport: Some(Arc::new(Web::default())), ln: Some(ln),
+    let s = Signer::new(&root, SignerOptions { node: Some(FakeChain::new("regtest", 6_720)), ln: Some(ln),
                                                clock: Some(Arc::new(move || c.load(Ordering::SeqCst) as f64)), ..Default::default() }).unwrap();
     // a timeout left it booked as sending
     let d = xbt_signer::bolt11::decode(&inv).unwrap();

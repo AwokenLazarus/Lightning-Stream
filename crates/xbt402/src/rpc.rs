@@ -1,16 +1,12 @@
-//! bitcoind JSON-RPC (feature `rpc`): a [`ChainBackend`] for the provider and a [`Wallet`] for the
-//! payer, over blocking HTTP with basic auth (user/password or the node's `.cookie`).
+//! bitcoind JSON-RPC (feature `rpc`) over blocking HTTP with basic auth (user/password or the
+//! node's `.cookie`): what a tool that reads the chain from its own node needs.
 use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use serde_json::{json, Value};
-use xbt_primitives::amount::Amount;
 
-use crate::client::{Wallet, WalletSend};
 use crate::error::{fail, ChannelError, Result};
-use crate::funding::{ChainBackend, UtxoInfo};
-use crate::json::py_str;
 
 /// A JSON-RPC connection to one node (optionally one of its wallets).
 #[derive(Clone)]
@@ -42,29 +38,6 @@ impl Rpc {
         Self { url: format!("{base}/wallet/{name}"), auth: self.auth.clone(), agent: self.agent.clone() }
     }
 
-    /// `sendtoaddress` with `params` (positional, or named), then the wallet's own view of the tx
-    /// for the output that pays `address`.
-    fn sent(&self, address: &str, params: Value) -> Result<(String, u32)> {
-        let txid = self.call("sendtoaddress", params)?.as_str().map(str::to_string).ok_or_else(|| ChannelError::new("rpc_error", "sendtoaddress"))?;
-        let tx = self.call("gettransaction", json!([txid, true, true]))?;
-        let vout = tx.get("decoded").and_then(|d| d.get("vout")).and_then(Value::as_array).and_then(|outs| {
-            outs.iter().find(|o| o.get("scriptPubKey").and_then(|s| s.get("address")).and_then(Value::as_str) == Some(address))
-                .and_then(|o| o.get("n")).and_then(Value::as_u64)
-        }).ok_or_else(|| ChannelError::new("rpc_error", "funding output not found"))?;
-        Ok((txid, vout as u32))
-    }
-
-    /// [`Wallet::fund`] at `sat_per_vb`, stated in the call (AGP-104): the wallet neither picks a
-    /// rate nor fails for lack of an estimate. Rounded up to the three decimals the node takes.
-    pub fn fund_at(&self, address: &str, sats: u64, sat_per_vb: f64) -> Result<(String, u32)> {
-        let amt = Amount::from_sat(sats).map_err(|e| ChannelError::new("bad_amount", e.to_string()))?;
-        if !(sat_per_vb.is_finite() && sat_per_vb > 0.0) {
-            return fail("bad_fee_rate", format!("fee rate {sat_per_vb} sat/vB"));
-        }
-        let rate = (sat_per_vb * 1000.0).ceil() / 1000.0;
-        self.sent(address, json!({"address": address, "amount": amt.to_btc_string().parse::<f64>().unwrap_or(0.0), "fee_rate": rate}))
-    }
-
     /// Call `method`; an RPC error becomes `rpc_error` with the node's message.
     pub fn call(&self, method: &str, params: Value) -> Result<Value> {
         let body = json!({"jsonrpc": "1.0", "id": "xbt402", "method": method, "params": params});
@@ -81,97 +54,5 @@ impl Rpc {
             return fail("rpc_error", err.get("message").and_then(Value::as_str).unwrap_or("error").to_string());
         }
         Ok(v.get("result").cloned().unwrap_or(Value::Null))
-    }
-}
-
-impl ChainBackend for Rpc {
-    fn block_count(&self) -> Result<u32> {
-        self.call("getblockcount", json!([]))?.as_u64().and_then(|n| u32::try_from(n).ok())
-            .ok_or_else(|| ChannelError::new("rpc_error", "getblockcount"))
-    }
-
-    fn get_tx_out(&self, txid: &str, vout: u32, include_mempool: bool) -> Result<Option<UtxoInfo>> {
-        let v = self.call("gettxout", json!([txid, vout, include_mempool]))?;
-        if v.is_null() {
-            return Ok(None);
-        }
-        let value = Amount::from_btc_f64(v.get("value").and_then(Value::as_f64).unwrap_or(-1.0))
-            .map_err(|e| ChannelError::new("rpc_error", e.to_string()))?;
-        let spk = v.get("scriptPubKey").and_then(|s| s.get("hex")).and_then(Value::as_str).unwrap_or("");
-        Ok(Some(UtxoInfo {
-            confirmations: v.get("confirmations").and_then(Value::as_u64).unwrap_or(0) as u32,
-            value: value.to_sat(),
-            script_pubkey: hex::decode(spk).map_err(|_| ChannelError::new("rpc_error", "scriptPubKey hex"))?,
-            coinbase: v.get("coinbase").and_then(Value::as_bool).unwrap_or(false),
-        }))
-    }
-
-    fn send_raw_transaction(&self, hex: &str) -> Result<String> {
-        self.call("sendrawtransaction", json!([hex]))?.as_str().map(str::to_string)
-            .ok_or_else(|| ChannelError::new("rpc_error", "sendrawtransaction"))
-    }
-
-    fn has_transaction(&self, txid: &str) -> Result<bool> {
-        Ok(self.call("getrawtransaction", json!([txid])).map(|v| !v.is_null()).unwrap_or(false))
-    }
-
-    fn estimate_fee_rate(&self, target: u32) -> Result<Option<f64>> {
-        let r = self.call("estimatesmartfee", json!([target]))?;
-        Ok(r.get("feerate").and_then(Value::as_f64).filter(|f| *f > 0.0).map(|f| f * 1e8 / 1000.0))
-    }
-
-    fn mempool_min_fee(&self) -> Result<Option<f64>> {
-        let r = self.call("getmempoolinfo", json!([]))?;
-        let rate = |k: &str| r.get(k).and_then(Value::as_f64).unwrap_or(0.0) * 1e8 / 1000.0;
-        Ok(Some(rate("mempoolminfee").max(rate("minrelaytxfee"))).filter(|f| *f > 0.0))
-    }
-
-    /// `submitpackage`: Ok when every tx of the package is in the mempool (or was already).
-    fn submit_package(&self, hexes: &[String]) -> Result<()> {
-        let r = self.call("submitpackage", json!([hexes]))?;
-        if r.get("package_msg").and_then(Value::as_str) == Some("success") {
-            return Ok(());
-        }
-        let errs: Vec<String> = r.get("tx-results").and_then(Value::as_object).into_iter().flatten()
-            .filter_map(|(_, t)| t.get("error").and_then(Value::as_str).map(str::to_string)).collect();
-        fail("rpc_error", format!("submitpackage: {} {}", py_str(r.get("package_msg")), errs.join("; ")))
-    }
-}
-
-impl Wallet for Rpc {
-    /// `sendtoaddress`, then the wallet's own view of the tx for the vout (no txindex needed).
-    fn fund(&self, address: &str, sats: u64) -> Result<(String, u32)> {
-        let amt = Amount::from_sat(sats).map_err(|e| ChannelError::new("bad_amount", e.to_string()))?;
-        self.sent(address, json!([address, amt.to_btc_string().parse::<f64>().unwrap_or(0.0)]))
-    }
-
-    fn wallet_sends_to(&self, address: &str) -> Result<Vec<String>> {
-        let r = self.call("listtransactions", json!(["*", 1000, 0, true]))?;
-        let mut out: Vec<String> = vec![];
-        for t in r.as_array().into_iter().flatten() {
-            if t.get("category").and_then(Value::as_str) == Some("send") && t.get("address").and_then(Value::as_str) == Some(address) {
-                if let Some(id) = t.get("txid").and_then(Value::as_str).filter(|id| !out.iter().any(|o| o == id)) {
-                    out.push(id.to_string());
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    fn wallet_send(&self, txid: &str, address: &str) -> Result<Option<WalletSend>> {
-        let Ok(tx) = self.call("gettransaction", json!([txid, true, true])) else { return Ok(None) };
-        let out = tx.get("decoded").and_then(|d| d.get("vout")).and_then(Value::as_array).and_then(|outs| {
-            outs.iter().find(|o| o.get("scriptPubKey").and_then(|s| s.get("address")).and_then(Value::as_str) == Some(address))
-        });
-        let Some(o) = out else { return Ok(None) };
-        let sats = o.get("value").and_then(Value::as_f64).and_then(|v| Amount::from_btc_f64(v).ok()).map(|a| a.to_sat()).unwrap_or(0);
-        Ok(Some(WalletSend {
-            txid: txid.to_string(),
-            vout: o.get("n").and_then(Value::as_u64).unwrap_or(0) as u32,
-            sats,
-            confirmations: tx.get("confirmations").and_then(Value::as_i64).unwrap_or(0),
-            abandoned: tx.get("details").and_then(Value::as_array).into_iter().flatten()
-                .any(|d| d.get("abandoned").and_then(Value::as_bool).unwrap_or(false)),
-        }))
     }
 }

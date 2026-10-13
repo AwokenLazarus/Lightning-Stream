@@ -22,7 +22,7 @@
 //! * [`chain`]: what the provider's own node says about a block, and coinbase maturity.
 //! * [`relay`]: the blinded relay client, ChaCha20-Poly1305 (§11.1).
 //! * [`nta`]: payee attestation (XBT-NTA v1, §13.8).
-//! * [`provider`]: the `xbt-work` offer beside `xbt-channel` in the xbt402 Provider (§7, §9).
+//! * [`provider`]: the `xbt-work` offer in the xbt402 Provider (§7, §9).
 //! * [`payer`]: the `xbt-work` payer for the xbt402 Client (§8, §9.3).
 //! * [`vectors`]: the vector emitter and conformance checks.
 //! * [`walk`]: the audit walk over every block, which no answer of the Prime's stops (AGP-091).

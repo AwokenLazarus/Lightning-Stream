@@ -1,16 +1,14 @@
-//! Chain primitives for XBT (Bitcoin with BLAKE2b proof of work), shared by the xbt402 rails and
-//! any other project that needs them.
+//! Chain primitives for XBT (Bitcoin with BLAKE2b proof of work), shared by the wallet, the paid-HTTP
+//! schemes and any other project that needs them.
 //!
 //! Everything here is byte-identical to the Python references it ports: B1 `xbt402/tx.py` and
 //! `xbt402/ecc.py` (transactions, scripts, bech32, the Knots `UnifiedSighash`, strict-DER low-S
 //! ECDSA) and B2 `agentwallet/headers.py` (BLAKE2b v2 headers, proof of work, the Knots retarget,
-//! most-work header chains). The conformance suite in this workspace checks that against the
-//! published vectors.
+//! most-work header chains). This crate's tests check that against the vectors under `vectors/`.
 //!
 //! Nothing here panics on untrusted bytes: parsers return [`Error`].
 
 pub mod address;
-pub mod amount;
 pub mod ecdsa;
 pub mod encode;
 pub mod error;

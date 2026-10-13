@@ -72,8 +72,8 @@ staged hash) was written for this project. It is a port of `headerv2.rs`, a file
 header-v2 patch to electrs 0.11.1 (`patches/electrs-0.11.1-header-v2.patch` in
 <https://github.com/AwokenLazarus/Bitcoin>, MIT), by way of our Python reference implementation.
 electrs itself (<https://github.com/romanz/electrs>, MIT licence, Copyright (C) 2018, Roman
-Zeyde) is not copied here. `crates/xbt-electrum` speaks the Electrum protocol that electrs
-serves.
+Zeyde) is not copied here. (The light client that spoke electrs' Electrum protocol,
+`crates/xbt-electrum`, was removed from this tree in October 2026.)
 
 ### ureq (vendored, with one patch)
 
@@ -281,12 +281,15 @@ These are not code in this repository, but the design depends on them, and the c
 `docs/REFERENCES.md` gives a reference for each and for the prior art of the designs (stream
 tickets, the lottery, the sealed draw).
 
-* **Payment channels.** One-way channels in the style of Jeremy Spilman's proposal to the
-  bitcoin-development list (20 April 2013), in the `CHECKLOCKTIMEVERIFY` form of BIP 65.
+* **Payment channels.** The on-chain channel this project had until October 2026 was a one-way
+  channel in the style of Jeremy Spilman's proposal to the bitcoin-development list (20 April
+  2013), in the `CHECKLOCKTIMEVERIFY` form of BIP 65. Its code is no longer in this tree (it is
+  in the git history); the credit stays with the history of the project.
 * **x402** (<https://github.com/x402-foundation/x402>, Apache-2.0), the HTTP 402 payment protocol
-  created by Coinbase and kept since April 2026 by the x402 Foundation. The frozen channel is
-  carried under the name of its `batch-settlement` scheme, with a binding to XBT that is our own
-  and that upstream does not define.
+  created by Coinbase and kept since April 2026 by the x402 Foundation. The ticket, lottery and
+  pay-with-work entries of a 402 use its message shapes with schemes of our own, which upstream
+  does not define. (The removed on-chain channel was carried under the name of its
+  `batch-settlement` scheme.)
 * **Model Context Protocol** (<https://modelcontextprotocol.io>), the protocol the wallet's MCP
   server speaks.
 * **Bitcoin Knots** (<https://github.com/bitcoinknots/bitcoin>, maintained by Luke Dashjr): the

@@ -1,28 +1,27 @@
 # xbt-wallet-mcp
 
-The agent wallet's MCP server as one static Rust binary (AGP-030). It replaces B2's Python
-`agentwallet/mcp_server.py` (b2 `agp-next2` `04c3f56`) with the same ten tools, argument schemas,
-validation messages, result JSON and errors. It serves them over **stdio** (Claude Code, Hermes,
-OpenClaw) and **streamable HTTP**.
+The agent wallet's MCP server as one static Rust binary (AGP-030). It began as a replacement for
+B2's Python `agentwallet/mcp_server.py` (b2 `agp-next2` `04c3f56`) and keeps its argument
+validation, validation messages, result JSON and errors. It serves its tools over **stdio**
+(Claude Code, Hermes, OpenClaw) and **streamable HTTP**.
 
-It talks only to B2's signer socket, so it works in front of the Rust `xbt-signer` or B2's Python
-signer. It never holds a key: the signer holds every key, and the model-facing process gets only the
-socket path.
+Six of B2's ten tools are here. The other four (`close_channel`, `xbt402_refund`,
+`forward_status`, `forward_recover`) worked the on-chain channel, which this wallet no longer has
+(removed in October 2026; the code is in the git history, last at commit `2a31170`).
+
+It talks only to the signer's socket and never holds a key: the signer holds every key, and the
+model-facing process gets only the socket path.
 
 ## Tools
 
 | tool | arguments | what it does |
 |---|---|---|
-| `balance` | | trusted / pending / immature balance, hot key, channels (no keys) |
+| `balance` | | trusted / pending / immature balance, the hot key (no keys) |
 | `quote_payment` | `to`, `amount_xbt`, `memo=""` | dry-runs a payment through the policy engine: allow, deny or needs_human |
-| `pay` | `to`, `amount_xbt`, `memo=""` | a policy-checked payment; over the human threshold it returns `needs_human` and an approval token |
+| `pay` | `to`, `amount_xbt`, `memo=""` | a policy-checked payment on chain, to an address; over the human threshold it returns `needs_human` and an approval token |
 | `history` | `limit=20` | the append-only policy audit log |
-| `channels` | | the Spillman channels: dest, cap, used, expiry |
-| `xbt402_pay` | `url`, `method="GET"`, `body=""`, `max_sats=1000` | pays an xbt-channel 402, including streamed (Merkle) results (on a postpay channel a streamed result can be bought once per channel and not after a lost answer: an open item, see `docs/LIMITS.md`) |
-| `close_channel` | `counterparty` | cooperative close |
-| `xbt402_refund` | `counterparty` | the CLTV refund after expiry, always to the wallet's own hot key |
-| `forward_status` | | the forward-market rail: limits, spend, lots |
-| `forward_recover` | `txid` | rebuilds a forward transfer from a close's witness |
+| `channels` | | what the wallet has committed and not settled: the tickets in flight, and any on-chain channel record an earlier version left (read-only) |
+| `xbt402_pay` | `url`, `method="GET"`, `body=""`, `max_sats=1000` | pays for an HTTP request to a seller that answers 402: the wallet reads the 402 and pays with stream tickets or the lottery (where the owner turned tickets on), then with a single Lightning invoice (where the Lightning rail is on); otherwise it pays nothing and says what each entry would need |
 
 **Lightning (AGP-048), with `XBT_MCP_LN=1` only:**
 
@@ -37,16 +36,15 @@ socket path.
 |---|---|---|
 | `ticket_status` | `session=""` | the signer's ticket book after it has been compared with its Lightning node: sessions, tickets by state, sats locked against the exposure caps, sats booked and not yet settled, whether the node's payments in flight are the book's. Read-only, and never a secret |
 | `ticket_stop` | `session` | stops a session: nothing more is locked or released for it, and an answer that is being paid for ends within one ticket. Where the wallet is paying that seller itself, it asks the seller to cancel the unreleased tickets and waits up to 5 s for its node to show them back; otherwise it returns their hashes, which only the seller can cancel |
-| `xbt402_pay` | `url`, `method="GET"`, `body=""`, `max_sats=1000`, `task=""` | the same tool, described anew: the wallet reads the seller's 402 and pays with stream tickets, a single Lightning invoice or the on-chain channel, in that order, whichever the seller offers and the owner's policy allows first. `task` is the owner's task (policy `tickets.tasks`). The description says what an agent can and cannot cause |
+| `xbt402_pay` | `url`, `method="GET"`, `body=""`, `max_sats=1000`, `task=""` | the same tool, described with what tickets add: the wallet reads the seller's 402 and pays with stream tickets or by draws, then a single Lightning invoice, whichever the seller offers and the owner's policy allows first. `task` is the owner's task (policy `tickets.tasks`). The description says what an agent can and cannot cause |
 | `channels` | | the same tool, described anew: it also shows the tickets in flight, the sats locked, and what was released |
 
 Locking and releasing tickets are not tools. `ticket_open`, `ticket_offer`, `ticket_lock` and
 `ticket_release` are methods of the signer's socket: a released secret is spent money, and the
 model does not hold one. An agent causes a release only through `xbt402_pay`, where the signer
-itself sends the secret to the seller it locked the ticket with. With `XBT_MCP_PAYER=local` the
-in-process payer pays channels only.
+itself sends the secret to the seller it locked the ticket with.
 
-Without `XBT_MCP_LN` the list is B2's exact ten (the Python conformance check depends on it). The
+Without `XBT_MCP_LN` and `XBT_MCP_TICKETS` the list is the six tools above. The
 LN node's REST URL, macaroon and TLS certificate are the signer's (`B2_LN_*`), never this process's.
 Node and invoice text (aliases, descriptions, failure reasons) comes back under `untrusted_ln_data`.
 
@@ -67,9 +65,9 @@ model can't approve its own payments or move the hot key. Humans use the out-of-
   wallet's own: its `rule` and `reason` above all. That holds for a refusal too. When a seller
   refuses, the wallet says so in its words (`the provider refused the request (HTTP 400)`) and
   the seller's answer is under `untrusted_provider_response`; a seller's error code is named only
-  when it is one of the protocol's own (`xbt402::wire::PROTOCOL_CODES`, `xbt402::ticket::PROTOCOL_CODES`),
+  when it is one of the protocol's own (`xbt402::ticket::PROTOCOL_CODES`),
   since a code is a place for words too; an invoice, an offer or a 402's terms that the wallet
-  refuses is described and never quoted; a stream's id is named only when it is hex; the last
+  refuses is described and never quoted; the last
   receipt of a streamed answer is given as its numbers, and the seller's own object as
   `untrusted_provider_response.last_receipt`. On the Lightning rail the node's own messages can
   repeat a payee's, so they come back under `untrusted_ln_data` (`node_message`, `failure`), in
@@ -117,13 +115,12 @@ xbt-wallet-mcp --list-tools                                       # the tool lis
 |---|---|
 | `B2_SIGNER_SOCK` | the signer socket: a path, or `tcp://127.0.0.1:PORT` (Windows) |
 | `B2_ROOT` | if `B2_SIGNER_SOCK` is unset, the socket is `$B2_ROOT/.run/signer.sock` |
-| `B2_SIGNER_TIMEOUT` | seconds per signer call (default 60; a first paid call can wait for a confirmation) |
-| `B2_BODY_CAP` | the provider body preview in local-payer answers (default 12000 chars) |
-| `XBT_MCP_PAYER` | `signer` (the default) or `local` (see below) |
+| `B2_SIGNER_TIMEOUT` | seconds per signer call (default 60; a paid call can take as long as its answer) |
+| `XBT_MCP_LN`, `XBT_MCP_TICKETS` | `1`: list the Lightning tools, the ticket tools (see Tools) |
 | `XBT_MCP_HTTP_TOKEN` | the bearer token that HTTP requests must carry. AGP-063 X1: HTTP always needs a token. Without this, a token file or a data dir, one is generated on first run in `<signer socket dir>/mcp-http-token` (0600) and read from there on restart |
 | `XBT_MCP_ALLOWED_ORIGINS` | AGP-063 X1: browser origins allowed besides loopback, comma-separated (`https://wallet.example.com`). Checked with or without `--http-allow-remote` |
 | `XBT_MCP_HTTP_TOKEN_FILE` | AGP-042: the bearer token as a file someone else owns (default `$XBT_DATA_DIR/run/ui/mcp-http-token` when it exists: the web UI's). Read on every request and never written, so the owner's rotation in the UI cuts the old token off at once; unreadable, empty or world-readable refuses every request. There is no rotation endpoint. |
-| `XBT_MCP_APPROVAL_WAIT_S` | AGP-039: seconds an over-threshold `xbt402_pay` waits for the human to approve it in the wallet's web UI (`xbt-wallet-ui`); approved, the same call is paid and the answer has `waited_for_human: true`. 0 (the default): answer `needs_human` at once, as B2 does; the agent may then repeat the identical call after the approval. Signer payer mode only. |
+| `XBT_MCP_APPROVAL_WAIT_S` | AGP-039: seconds an over-threshold `ln_pay` waits for the human to approve it in the wallet's web UI (`xbt-wallet-ui`); approved, the same call is paid and the answer has `waited_for_human: true`. 0 (the default): answer `needs_human` at once, as B2 does; the agent may then repeat the identical call after the approval. Signer payer mode only. |
 
 Give the MCP process nothing else. It must **not** get `B2_HOT_KEYFILE`, `B2_HOT_PASSPHRASE`, node
 credentials or the human device key.
@@ -148,8 +145,7 @@ credentials or the human device key.
 claude mcp add xbt-agent-wallet --env B2_SIGNER_SOCK=$HOME/wallet/.run/signer.sock -- ~/.local/bin/xbt-wallet-mcp
 # headless, wallet tools only (the xbt-063 flagship does this):
 claude -p "$TASK" --mcp-config .mcp.json --strict-mcp-config --tools "" \
-  --allowedTools mcp__xbt-agent-wallet__balance mcp__xbt-agent-wallet__xbt402_pay mcp__xbt-agent-wallet__channels \
-                 mcp__xbt-agent-wallet__close_channel
+  --allowedTools mcp__xbt-agent-wallet__balance mcp__xbt-agent-wallet__xbt402_pay mcp__xbt-agent-wallet__channels
 ```
 
 Over HTTP: `"xbt-agent-wallet": {"type": "http", "url": "http://127.0.0.1:33510/mcp", "headers": {"Authorization": "Bearer ${XBT_MCP_HTTP_TOKEN}"}}`.
@@ -167,7 +163,7 @@ mcp_servers:
     args: []
     env:
       B2_SIGNER_SOCK: /home/you/wallet/.run/signer.sock
-    timeout: 300            # a first paid call can wait for its funding to confirm
+    timeout: 300            # a paid call can take as long as its answer
     connect_timeout: 60
     tools:
       resources: false      # the server advertises resources/prompts (as B2 does) but has none;
@@ -175,7 +171,7 @@ mcp_servers:
 ```
 
 Check it with `hermes mcp test xbt-agent-wallet`, which should show `Connected` and
-`Tools discovered: 10`.
+`Tools discovered: 6`.
 
 Hermes also needs a model (`model:` in the same file, plus a provider key or login). A tool-using
 model is enough, for example:
@@ -202,8 +198,7 @@ OpenClaw keeps MCP servers under `mcp.servers` in `openclaw.json`:
         "args": [],
         "env": { "B2_SIGNER_SOCK": "/home/you/wallet/.run/signer.sock" },
         "requestTimeoutMs": 300000,
-        "toolFilter": { "include": ["balance", "quote_payment", "pay", "history", "channels", "xbt402_pay",
-                                    "close_channel", "xbt402_refund", "forward_status", "forward_recover"] }
+        "toolFilter": { "include": ["balance", "quote_payment", "pay", "history", "channels", "xbt402_pay"] }
       }
     }
   }
@@ -214,7 +209,7 @@ The same with OpenClaw's CLI:
 
 ```bash
 openclaw mcp add xbt-agent-wallet --command /home/you/.local/bin/xbt-wallet-mcp --env B2_SIGNER_SOCK=/home/you/wallet/.run/signer.sock
-openclaw mcp probe xbt-agent-wallet --json     # 10 tools
+openclaw mcp probe xbt-agent-wallet --json     # 6 tools
 ```
 
 Over HTTP: `{"url": "http://127.0.0.1:33510/mcp", "transport": "streamable-http"}`.
@@ -242,35 +237,21 @@ The endpoint takes one JSON-RPC message per POST.
 The server listens on loopback only. `--http-allow-remote` lifts that; a non-loopback listener with no
 token is refused at start.
 
-## Who pays: `XBT_MCP_PAYER`
+## Who pays
 
-- **`signer`** (the default). `xbt402_pay` and `close_channel` are the signer's own methods, as in B2.
-  This supports streamed (Merkle) results, the pending-funding verdict and the forward rail, and works
-  with either signer. The regtest conformance runs in this mode.
-- **`local`** (Rust signer only). `xbt402_pay` runs xbt402's own payer SDK (`xbt402::client::Client`)
-  inside this process, with the signer as its `StateSigner` and `Wallet` (`xbt_signer::client::RemoteSigner`):
-  - the channel key is created, sealed and used only in the signer;
-  - the signer's policy engine checks every state;
-  - `max_sats` is enforced per call from the offer (an unpaid first request, as the signer does);
-  - the channel book is kept in `XBT_MCP_LEDGER` (default `$B2_ROOT/.run/mcp-payer.jsonl`; `-` for
-    memory only).
-
-  `local` needs `XBT_MCP_NETWORK` (the xbt402 network id). Optional: `XBT_MCP_CAPACITY`,
-  `XBT_MCP_EXPIRY_BLOCKS` (default 2,016), `XBT_MCP_BUDGET_SATS`, `XBT_MCP_MIN_CONF`.
-  - Answers carry `payer: "xbt-wallet-mcp: xbt402 Client, keys in the signer"`, plus `owed_sats` and
-    `billing`. In postpay, `cum` is the state covering the calls before this one.
-  - Streamed results come back as the manifest with a note; buy those in `signer` mode.
-  - B2's Python signer has no external-payer methods (`xbt402_new_key`, `xbt402_attach`, …), so with it
-    the first paid call in `local` mode is denied with the signer's error and nothing is funded.
+The signer does: `xbt402_pay`, `pay` and `ln_pay` are forwarded to its socket, and every key, every
+policy check and every booking is there. `XBT_MCP_PAYER=signer` (or unset) says the same. The other
+value it took, `local`, ran the on-chain channel's payer inside this process; it went with the
+channel, and a start that still sets it is refused with the reason.
 
 ## Tests and conformance
 
 ```bash
 cargo test -j2 -p xbt-wallet-mcp        # validation, JSON, sanitizer, both transports, the example policy
-python3 scripts/mcp/mcp_conformance.py --py ~/xbt-rnd/xbt-063/.venv/bin/python --b2 ~/xbt-rnd/b2 \
-  --rust target/debug/xbt-wallet-mcp    # protocol level vs B2's server, recording mock signer, 0 diffs
-python3 scripts/mcp/http_sdk_check.py --py ~/xbt-rnd/xbt-063/.venv/bin/python --b2 ~/xbt-rnd/b2 \
+python3 scripts/mcp/mcp_conformance.py --py PYTHON_WITH_MCP_SDK --b2 PY_WALLET_CHECKOUT \
+  --rust target/debug/xbt-wallet-mcp    # the protocol and every tool both wallets have vs B2's server, 0 diffs
+python3 scripts/mcp/http_sdk_check.py --py PYTHON_WITH_MCP_SDK --b2 PY_WALLET_CHECKOUT \
   --rust target/release/xbt-wallet-mcp  # the official Python SDK over streamable HTTP vs B2 over stdio
-scripts/mcp/regtest_conformance.sh      # regtest, both signers (xbt-063 agp-030, ports 23500-23599)
+scripts/mcp/verify_agp030.sh            # all of it, then an agent's xbt402_pay over tickets on regtest
 scripts/mcp/build_targets.sh            # every AGP-031 target -> dist/MCP_TARGETS.md
 ```

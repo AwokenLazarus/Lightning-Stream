@@ -5,5 +5,5 @@ export const short = {
 
 export const long = {
   en_US:
-    "Your AI agents pay for services over xbt402 (payment channels on the XBT chain) through this wallet's MCP server. They can only pay the services your policy allows, within its budgets; anything above your threshold waits for your approval, signed with a key that stays in your browser. The keys stay in the signer, sealed on this server; an anchor witness keeps a tamper record of every signature. Needs an XBT (BLAKE2b) node.",
+    "Your AI agents reach this wallet through its MCP server. They can only pay what your policy allows, within its budgets; anything above your threshold waits for your approval, signed with a key that stays in your browser. The wallet pays services over XBT Lightning (stream tickets); this package does not connect it to a Lightning node yet, and until it does no service is paid. The keys stay in the signer, sealed on this server; an anchor witness keeps a tamper record of every signature. Needs an XBT (BLAKE2b) node.",
 }

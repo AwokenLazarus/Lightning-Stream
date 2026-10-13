@@ -10,7 +10,7 @@ and code and data copied into this tree, are in [`THIRD_PARTY_NOTICES.md`](../TH
 
 | What | Whose | Ref |
 |---|---|---|
-| One-way payment channels (the frozen on-chain channel) | Jeremy Spilman, 2013; the `CHECKLOCKTIMEVERIFY` form is one of BIP 65's examples | 1, 2 |
+| One-way payment channels (the on-chain channel this project had until October 2026; removed, in the git history) | Jeremy Spilman, 2013; the `CHECKLOCKTIMEVERIFY` form is one of BIP 65's examples | 1, 2 |
 | Lightning, its channels and its routing | Joseph Poon and Tadge Dryja; the BOLTs | 3, 4 |
 | Hold invoices, which a stream ticket is made of | Joost Jager, in lnd, 2019 | 5 |
 | A payment the payer releases in a second step | Hiroki Gondo, "stuckless payments", 2019 (with point locks; tickets get a similar effect from hold invoices) | 6 |
@@ -18,20 +18,20 @@ and code and data copied into this tree, are in [`THIRD_PARTY_NOTICES.md`](../TH
 | Channel jamming and the defences proposed against it: unconditional fees, hold fees, endorsement | Shikhelman and Tikhomirov; Jager; Kirk-Cohen | 10 to 13 |
 | Point locks | Poelstra's scriptless scripts; Malavolta and others | 14, 15, 16 |
 | Adaptor signatures and payment hubs that cannot take the money (the retired hub) | Poelstra; Aumayr and others; Fournier; TumbleBit; A2L | 16 to 20 |
-| HTTP 402, and the shape of a paid request | RFC 2068; x402 (created by Coinbase, kept by the x402 Foundation), whose `batch-settlement` name the frozen channel is carried under; L402 | 21, 22, 23 |
+| HTTP 402, and the shape of a paid request | RFC 2068; x402 (created by Coinbase, kept by the x402 Foundation), whose `batch-settlement` name the removed on-chain channel was carried under; L402 | 21, 22, 23 |
 | Network names | CAIP-2 and the `bip122` namespace | 24 |
 | A wallet that an app may spend from within limits | Nostr Wallet Connect | 25 |
 | The agent's tool protocol | Model Context Protocol (Anthropic; now the Agentic AI Foundation) | 26 |
 | Paying per request with ecash; one operator for many users | Cashu, Routstr; Ark | 27, 28, 29 |
 | Serving a stranger one piece before it has paid | BitTorrent's optimistic unchoke (Bram Cohen) | 30 |
-| Selling a key through a hash lock; Merkle proofs | Gregory Maxwell; Ralph Merkle | 31, 32 |
+| Selling a key through a hash lock; Merkle proofs (the fair exchange on the removed channel; the ticket wire's `after-verify`) | Gregory Maxwell; Ralph Merkle | 31, 32 |
 | Paying small amounts by lottery | David Wheeler, 1996, and Ronald Rivest, 1997; then Micali and Rivest, Pass and shelat, Chiesa and others, Mitani and Otsuka, Orchid, Livepeer; on Bitcoin, Caldwell, Dryja, Kurbatov | 33 to 43 |
 | **A win that enforces itself over Lightning** | **Paul Gerhart, Jay Taylor and Sri Aravinda Krishnan Thyagarajan, May 2026. The aim is theirs first, and so is the proof that ties a hash lock to a key. Our construction differs (one locked ticket and oblivious transfer, where theirs is a paid exchange per roll built on adaptor signatures and an oblivious pseudorandom function) and, unlike theirs, has no formal treatment and no review.** | 44 |
 | How pools even out a miner's income | Meni Rosenfeld | 45 |
 | The parts of the sealed draw: oblivious transfer, its extension, multiplication from transfers, the proof and its curves | Chou and Orlandi; Ishai, Kilian, Nissim, Petrank; Keller, Orsini, Scholl; Roy; Gilboa; Doerner, Kondi, Lee, shelat; Groth; Electric Coin Company and Zcash; arkworks | 46 to 59 |
 | XBT's consensus rules: BLAKE2b proof of work, the unified signature hash, the reduced-data rules | Bitcoin Knots: Luke Dashjr; Kyle Santiago; BIP 110 | 60 |
 | Lightning on XBT, and the lab every ticket number was measured in | Lightning Fork and `lightning-fork-lab` by Paul Lamb, on lnd by Lightning Labs; the Core Lightning fork by PrivKey (not tested by us) | 61, 62, 63 |
-| The Electrum server the light backend talks to; signing; pay with work | electrs (Roman Zeyde); libsecp256k1; OCEAN's DATUM and TIDES | 64, 65, 66 |
+| The Electrum server the removed light backend talked to; signing; pay with work | electrs (Roman Zeyde); libsecp256k1; OCEAN's DATUM and TIDES | 64, 65, 66 |
 
 What is ours: the binding of these to one another (a hold invoice on a hash the buyer chose,
 released inside an HTTP request, under an owner's signed policy), the policy wallet, the wire in

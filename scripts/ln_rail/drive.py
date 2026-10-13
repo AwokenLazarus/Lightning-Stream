@@ -11,7 +11,7 @@ stock lnd on a SHA-256 regtest). Run by scripts/ln_rail_regtest.sh, which brings
   S6  a stock lnd invoice (no feature bit 512) -> refused
   S7  a second signer whose LN node is the stock lnd on the SHA-256 chain -> refused (ln_chain)
   S8  the signature log and the audit log hold every payment and refusal; the ledger is exact
-  S9  the MCP surface: 12 tools with XBT_MCP_LN=1, approve is not a tool
+  S9  the MCP surface: 8 tools with XBT_MCP_LN=1, approve is not a tool
   AGP-049:
   S10 funding proven from the transaction on our Knots node: the unified channel's input is 0x21 and
       post-split; a channel LF opens from the pre-split coin A2 (0x21, LND says unified) is refused
@@ -462,12 +462,12 @@ def run(mcp, sock, human, lf2_pub, sha_pub, coinB, procs):
     # S9: the MCP surface
     names = [t["name"] for t in mcp.req("tools/list", {})["result"]["tools"]]
     REPORT["scenarios"]["S9_tools"] = names
-    check("S9 12 tools with XBT_MCP_LN=1 (B2's 10 + ln_pay, ln_status)", len(names) == 12 and names[-2:] == ["ln_pay", "ln_status"], names)
+    check("S9 8 tools with XBT_MCP_LN=1 (the six every wallet has + ln_pay, ln_status)", len(names) == 8 and names[-2:] == ["ln_pay", "ln_status"], names)
     mcp_plain = Mcp({k: v for k, v in os.environ.items() if not k.startswith(("B2_LN", "XBT_MCP_LN"))} | {"B2_SIGNER_SOCK": sock})
     plain = [t["name"] for t in mcp_plain.req("tools/list", {})["result"]["tools"]]
     hidden = mcp_plain.tool("ln_pay", {"invoice": "x", "max_sats": 1})
     mcp_plain.close()
-    check("S9 without XBT_MCP_LN: B2's exact 10, ln_pay unknown", len(plain) == 10 and hidden.get("isError"), {"tools": plain, "ln_pay": hidden})
+    check("S9 without XBT_MCP_LN: the six tools every wallet has, ln_pay unknown", len(plain) == 6 and hidden.get("isError"), {"tools": plain, "ln_pay": hidden})
 
 
 # --- AGP-049 ------------------------------------------------------------------------------------------

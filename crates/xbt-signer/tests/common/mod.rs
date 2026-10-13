@@ -1,6 +1,5 @@
 //! Test rig: a fake pruned node (B2 `tests/_agp017.py` `PrunedChain`: blocks, confirmations, no
-//! txindex) that is both the signer's `Node` and the Rust provider's `ChainBackend`, an in-process
-//! transport to `xbt402::provider::Provider`, and a signer root builder.
+//! txindex) as the signer's `Node`, and a signer root builder.
 #![allow(dead_code)]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -9,13 +8,8 @@ use std::sync::{Arc, Mutex};
 
 use ed25519_dalek::{Signer as _, SigningKey};
 use serde_json::{json, Value};
-use xbt402::client::{split_url, Transport};
-use xbt402::funding::{ChainBackend, UtxoInfo};
-use xbt402::ledger::Ledger;
-use xbt402::provider::{HttpResponse, Provider, ProviderConfig};
 use xbt402::{ChannelError, Result};
 use xbt_primitives::hash::sha256;
-use xbt_primitives::secp256k1::SecretKey;
 use xbt_primitives::tx::Tx;
 use xbt_signer::node::Node;
 use xbt_signer::signer::{Signer, SignerOptions};
@@ -299,6 +293,8 @@ impl Node for FakeChain {
                 d.ok_or_else(|| rpc_err("Method not found"))?
             }
             "estimatesmartfee" => json!({"feerate": 0.00001}),
+            // the node wallet's own send (the `pay` rail): a txid that names the call
+            "sendtoaddress" => json!(hex::encode(sha256(Value::from(p.clone()).to_string().as_bytes()))),
             other => panic!("FakeChain: unexpected {other} {p:?}"),
         })
     }
@@ -312,73 +308,10 @@ impl Node for FakeChain {
     }
 }
 
-/// The provider's view of the same node.
-pub struct ProviderChain(pub Arc<FakeChain>);
-
-impl ChainBackend for ProviderChain {
-    fn block_count(&self) -> Result<u32> {
-        Ok(self.0.height() as u32)
-    }
-    fn get_tx_out(&self, txid: &str, vout: u32, mem: bool) -> Result<Option<UtxoInfo>> {
-        let v = self.0.gettxout(txid, vout, mem);
-        if v.is_null() {
-            return Ok(None);
-        }
-        Ok(Some(UtxoInfo { confirmations: v["confirmations"].as_u64().unwrap_or(0) as u32, value: (v["value"].as_f64().unwrap() * 1e8).round() as u64,
-                           script_pubkey: hex::decode(v["scriptPubKey"]["hex"].as_str().unwrap()).unwrap(), coinbase: false }))
-    }
-    fn send_raw_transaction(&self, hex: &str) -> Result<String> {
-        self.0.send(hex)
-    }
-    fn has_transaction(&self, txid: &str) -> Result<bool> {
-        let s = self.0.st.lock().unwrap();
-        Ok(s.mempool.contains_key(txid) || s.conf_height.contains_key(txid))
-    }
-}
-
-/// In-process HTTP to one or more providers keyed by origin; `down` makes it unreachable.
-#[derive(Default)]
-pub struct Web {
-    pub sites: Mutex<HashMap<String, Arc<Provider>>>,
-    pub down: AtomicBool,
-    /// Fail paid requests (with PAYMENT-SIGNATURE) before the provider sees them.
-    pub fail_paid: AtomicBool,
-    pub requests: Mutex<Vec<(String, String)>>,
-}
-
-impl Transport for Web {
-    fn request(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)]) -> Result<HttpResponse> {
-        if self.down.load(Ordering::SeqCst) {
-            return Err(ChannelError::new("transport_error", "connection refused"));
-        }
-        if self.fail_paid.load(Ordering::SeqCst) && headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("PAYMENT-SIGNATURE")) {
-            return Err(ChannelError::new("transport_error", "connection reset"));
-        }
-        let (origin, path) = split_url(url);
-        self.requests.lock().unwrap().push((method.into(), url.into()));
-        let p = self.sites.lock().unwrap().get(&origin).cloned().ok_or_else(|| ChannelError::new("transport_error", "no such host"))?;
-        Ok(p.serve(method, &path, headers, body, url, None))
-    }
-}
-
+/// A seller's origin on the rig's allowlist.
 pub const PROVIDER: &str = "http://127.0.0.1:33210";
-pub const URL: &str = "http://127.0.0.1:33210/agp015/echo";
-
-pub fn secret(label: &str) -> SecretKey {
-    SecretKey::from_slice(&sha256(label.as_bytes())).unwrap()
-}
-
-/// The runbook's provider: 500 sat per call, 10,000 sat funding only, closeFee 600, 1,008 blocks.
-pub fn runbook_provider(chain: &Arc<FakeChain>, ledger: Ledger) -> Arc<Provider> {
-    let mut cfg = ProviderConfig::new(&chain.network());
-    cfg.policy.min_capacity = 10_000;
-    cfg.policy.max_capacity = 10_000;
-    cfg.policy.min_expiry_blocks = 1_008;
-    cfg.policy.min_conf = 1;
-    Arc::new(Provider::new(Arc::new(ProviderChain(chain.clone())), secret("provider payTo"), cfg, ledger, Box::new(|_, _| 500),
-                           Box::new(|_, p, _| HttpResponse::new(200, vec![("Content-Type".into(), "application/json".into())],
-                                                                  json!({"echo": p}).to_string().into_bytes()))).unwrap())
-}
+/// An address on the rig's allowlist, for the on-chain `pay` rail.
+pub const ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 
 /// The human's device key.
 pub fn human() -> SigningKey {
@@ -389,13 +322,13 @@ pub fn sign_human(msg: &[u8]) -> String {
     hex::encode(human().sign(msg).to_bytes())
 }
 
-/// The runbook's policy (AGP-017 rehearsal G1).
+/// The rig's policy (the numbers of the AGP-017 rehearsal, G1).
 pub fn runbook_policy(extra: Value) -> Value {
-    let mut p = json!({"allowlist": [PROVIDER], "max_per_tx_sats": 1000, "daily_budget_sats": 6000, "weekly_budget_sats": 6000,
+    let mut p = json!({"allowlist": [PROVIDER, ADDR], "max_per_tx_sats": 1000, "daily_budget_sats": 6000, "weekly_budget_sats": 6000,
                        "per_counterparty_cap_sats": 9400, "velocity_max": 20, "velocity_window_s": 3600, "human_threshold_sats": 1000,
-                       "channel_expiry_blocks": 1008, "refund_enabled": true, "refund_margin_blocks": 6, "hot_balance_cap_sats": 15000,
+                       "hot_balance_cap_sats": 15000,
                        "human_pubkey": hex::encode(human().verifying_key().to_bytes()), "split_window_s": 0, "regtest_mine": false,
-                       "anchor_interval_s": 5, "open_wait_s": 0, "open_retry_s": 0});
+                       "anchor_interval_s": 5});
     if let (Value::Object(a), Value::Object(b)) = (&mut p, extra) {
         for (k, v) in b {
             a.insert(k, v);
@@ -425,21 +358,19 @@ pub fn env_for(dir: &Path) {
     std::env::set_var("B2_WATCH_INTERVAL", "0");
 }
 
-pub fn signer(root: &Path, chain: &Arc<FakeChain>, web: &Arc<Web>, anchor: Option<xbt_signer::anchor::AnchorClient>) -> xbt402::Result<Arc<Signer>> {
-    Signer::new(root, SignerOptions { node: Some(chain.clone()), transport: Some(web.clone()), anchor, ..Default::default() })
+pub fn signer(root: &Path, chain: &Arc<FakeChain>, anchor: Option<xbt_signer::anchor::AnchorClient>) -> xbt402::Result<Arc<Signer>> {
+    Signer::new(root, SignerOptions { node: Some(chain.clone()), anchor, ..Default::default() })
 }
 
 pub fn call(s: &Signer, m: &str, p: Value) -> Value {
     s.handle(m, &p).unwrap_or_else(|e| panic!("{m}: {}: {}", e.code, e.msg))
 }
 
-/// One signer with the runbook provider on a fake pruned node.
+/// One signer on a fake pruned node.
 pub struct Rig {
     pub dir: tempfile::TempDir,
     pub root: PathBuf,
     pub chain: Arc<FakeChain>,
-    pub web: Arc<Web>,
-    pub prov: Arc<Provider>,
     pub s: Arc<Signer>,
     pub witness: Option<xbt_signer::anchor::Witness>,
 }
@@ -454,21 +385,18 @@ impl Rig {
         let dir = tempfile::tempdir().unwrap();
         env_for(dir.path());
         let chain = FakeChain::new(chain_name, if chain_name == "main" { 962_000 } else { 6_720 });
-        let web = Arc::new(Web::default());
-        let prov = runbook_provider(&chain, Ledger::in_memory());
-        web.sites.lock().unwrap().insert(PROVIDER.into(), prov.clone());
         let witness = with_witness.then(|| xbt_signer::anchor::serve_witness(&dir.path().join("anchor"), &dir.path().join("anchor/w.sock"), 0o600).unwrap());
         let root = root_with(dir.path(), &runbook_policy(policy_extra));
         let ac = witness.as_ref().map(|w| xbt_signer::anchor::AnchorClient::new(&w.sock_path));
-        let s = Signer::new(&root, SignerOptions { node: Some(chain.clone()), transport: Some(web.clone()), anchor: ac,
+        let s = Signer::new(&root, SignerOptions { node: Some(chain.clone()), anchor: ac,
                                                    ..Default::default() }).unwrap();
-        Self { dir, root, chain, web, prov, s, witness }
+        Self { dir, root, chain, s, witness }
     }
 
     /// A fresh signer process on the same root (a restart).
     pub fn restart(&mut self) -> xbt402::Result<()> {
         let ac = self.witness.as_ref().map(|w| xbt_signer::anchor::AnchorClient::new(&w.sock_path));
-        self.s = Signer::new(&self.root, SignerOptions { node: Some(self.chain.clone()), transport: Some(self.web.clone()), anchor: ac,
+        self.s = Signer::new(&self.root, SignerOptions { node: Some(self.chain.clone()), anchor: ac,
                                                          ..Default::default() })?;
         Ok(())
     }
@@ -498,24 +426,6 @@ impl Rig {
         self.chain.credit(&txid, 0, sats, &self.hot_spk(), true);
         self.call("notice_hot_txid", json!({"txid": txid}));
         txid
-    }
-
-    pub fn pay(&self) -> Value {
-        self.call("xbt402_pay", json!({"url": URL, "method": "GET", "body": "", "max_sats": 500}))
-    }
-
-    /// Fund, confirm, open and pay the first call.
-    pub fn open(&self) -> Value {
-        let r = self.pay();
-        assert_eq!(r["verdict"], "pending", "{r}");
-        self.chain.mine(1);
-        let r = self.pay();
-        assert_eq!(r["verdict"], "allow", "{r}");
-        r
-    }
-
-    pub fn channel(&self, chan: &str) -> Value {
-        self.call("channels", json!({}))["channels"].as_array().unwrap().iter().find(|c| c["chan"] == chan).cloned().unwrap()
     }
 
     pub fn sigs(&self) -> Vec<Value> {

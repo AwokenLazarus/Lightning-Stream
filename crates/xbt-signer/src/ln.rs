@@ -1561,7 +1561,7 @@ impl Signer {
         };
         if let Some(t) = &s.grant {
             if out["verdict"] != "deny" {
-                self.use_xbt402_grant(t, py_int(out.get("charged_sats")).unwrap_or(s.total));
+                self.use_grant(t, py_int(out.get("charged_sats")).unwrap_or(s.total));
             }
         }
         let mut out = with(with(s.decision, out), s.facts);
