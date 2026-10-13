@@ -1,0 +1,46 @@
+# The overlay of scripts/demo_film.sh on lightning-fork-lab (a5cadc5) and on
+# scripts/ticket_e2e/compose.yml, which it is read after: one node more, lf4, so that a second
+# seller is two routing hops from the buyer.
+#
+#     lf1 ---- lf2 ---- lf3 ---- lf4
+#     buyer    hop      seller   a seller one channel further away
+#
+#   lf4 REST  127.0.0.1:${LN_TICKET_PORT_LF4:-18308}   below the kernel's ephemeral range (32768-60999)
+#
+# lf4 has the settings scripts/ticket_e2e/compose.yml gives lf3, --default-remote-max-htlcs=30
+# among them: it accepts 30 pending payments from a peer, the slot count of a channel with a Core
+# Lightning node at its default. A stand-in for that number only: no Core Lightning node is here.
+services:
+  lf4:
+    image: lightning-fork:dev
+    restart: "no"
+    networks: [lab]
+    depends_on:
+      knots-b2b:
+        condition: service_healthy
+    cpus: 2
+    ports: ["127.0.0.1:${LN_TICKET_PORT_LF4:-18308}:8080"]
+    command:
+      - --noseedbackup
+      - --bitcoin.regtest
+      - --bitcoin.node=bitcoind
+      - --bitcoin.blake2b-activation-height=${ACTIVATION_HEIGHT:-20}
+      - --fee.url=http://fees:8080/fees.json
+      - --bitcoind.rpchost=knots-b2b:18443
+      - --bitcoind.rpcuser=lab
+      - --bitcoind.rpcpass=lab
+      - --bitcoind.zmqpubrawblock=tcp://knots-b2b:28332
+      - --bitcoind.zmqpubrawtx=tcp://knots-b2b:28333
+      - --rpclisten=0.0.0.0:10009
+      - --restlisten=0.0.0.0:8080
+      - --listen=0.0.0.0:9735
+      - --externalip=lf4:9735
+      - --tlsextradomain=lf4
+      - --alias=lf4
+      - --default-remote-max-htlcs=30
+      - --debuglevel=info
+    volumes:
+      - lf4-data:/root/.lnd
+
+volumes:
+  lf4-data:
