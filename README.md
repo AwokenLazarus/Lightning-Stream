@@ -86,6 +86,12 @@ the full list, with a link for each, is [`docs/REFERENCES.md`](docs/REFERENCES.m
   binaries on channels of 30 slots: a 100 MB file bought by draws, 100 sellers paid at once, a
   buyer that never pays, a seller that lies about wins, and a kill of each part. The argument
   that the draw is fair is our own and unreviewed.
+- **A demo: a film paid for as it plays (regtest only).** A stock Jellyfin behind the gateway,
+  and a film bought piece by piece through the wallet while an ordinary player plays it: first
+  frame in half a second, nothing paid while paused, the held tickets back when the viewer stops.
+  The same file is then bought in 1,054 pieces from 20 gateways at once, paid by draws.
+  `scripts/demo_film.sh` runs it; [`docs/DEMO.md`](docs/DEMO.md) is the guide for a node runner,
+  with the numbers and what the demo does not show.
 - **The on-chain one-way channel (frozen).** A direct channel anchored on the chain, for paying
   one seller piece by piece: the buyer signs a slightly larger running total for each piece and
   the seller settles once. It is kept in the tree and tested, off the main path, with no new
