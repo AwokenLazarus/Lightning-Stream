@@ -63,9 +63,12 @@ const LIST_PAGES: usize = 50;
 pub const SEND_PARALLEL: usize = 8;
 
 /// The gate every ticket payment passes on its way to the node's router: at most
-/// [`SEND_PARALLEL`] are inside at once. Who waits here: the threads of lock rounds and of prepaid
-/// purchases, of which the owner's `tickets.max_sellers` bounds the number; each leaves when its
-/// send returns, which the Lightning rail's `timeout_s` bounds.
+/// [`SEND_PARALLEL`] are inside at once. A held ticket leaves when its send returns (it is locked,
+/// and what is locked is bounded by the slot budget); an ordinary payment (a prepaid ticket, a
+/// win of the lottery) stays inside until it is over, since it is pending on the channel until
+/// then. Who waits here: the threads of lock rounds, of prepaid purchases and of wins, of which
+/// the owner's `tickets.max_sellers` and each seller's unpaid wins bound the number; each leaves
+/// within what the Lightning rail's `timeout_s` bounds.
 #[derive(Default)]
 pub struct Pace {
     inside: Mutex<usize>,
@@ -1371,17 +1374,26 @@ impl Signer {
             Err(e) => return refusal("ticket", e.msg),
         };
         // the node routes it; no lock is held. An ordinary payment is over in a moment, and its end is waited for
-        let sent = {
+        // inside the gate: such a payment is pending on the wallet's channel until it has settled, so the gate is
+        // what keeps at most 8 of them there at once. (Leaving when the send returned, as a held ticket does, let 24
+        // wins of 100 sellers be pending on a 30-slot channel at once, and 47 of 313 payments failed: seen on the lab.)
+        let mut pmt = {
             let _inside = self.ticket_pace.enter();
-            ln.send_held(&send)
+            let mut pmt = match ln.send_held(&send) {
+                Ok(p) => Some(p),
+                Err(_) => ln.lookup(&hash).ok().flatten(),
+            };
+            let deadline = Instant::now() + Duration::from_secs(lp.timeout_s.clamp(1, 600) as u64 + 5);
+            while pmt.as_ref().is_none_or(|p| !payment_over(p)) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+                if let Ok(Some(p)) = ln.lookup(&hash) {
+                    pmt = Some(p);
+                }
+            }
+            pmt
         };
-        let mut pmt = match sent {
-            Ok(p) => Some(p),
-            Err(_) => ln.lookup(&hash).ok().flatten(),
-        };
-        let deadline = Instant::now() + Duration::from_secs(lp.timeout_s.clamp(1, 600) as u64 + 5);
-        while pmt.as_ref().is_none_or(|p| !payment_over(p)) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(50));
+        // once more outside the gate, for a payment whose end the node had not shown inside the wait
+        if pmt.as_ref().is_none_or(|p| !payment_over(p)) {
             if let Ok(Some(p)) = ln.lookup(&hash) {
                 pmt = Some(p);
             }
@@ -1775,6 +1787,13 @@ impl Signer {
         let committed = st.book.pools_open();
         let to_fill = committed.saturating_sub(st.book.locked(|_| true).tickets).max(0);
         limits.room(committed, to_fill).min(tp.max_locked_tickets.saturating_sub(committed)).min(t.max_locked_tickets.saturating_sub(st.book.pools_open_in(Some(task)))) >= 1
+    }
+
+    /// Whether a win of a session has a payment in the book that has not failed: one that is paid,
+    /// or may still be.
+    pub(crate) fn lottery_win_live(&self, sid: &str, draw: u64) -> bool {
+        // a book that cannot be read is no licence to pay again
+        self.ticket_store().map_or(true, |g| g.as_ref().is_none_or(|st| st.book.win_payment(sid, draw).is_some()))
     }
 
     /// Whether the open session with this seller at `origin`, if there is one, pays by draws.

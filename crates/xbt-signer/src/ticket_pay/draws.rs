@@ -23,8 +23,6 @@
 //!
 //! Locks: a session's `busy` (one paid request at a time), then `link` (one HTTP exchange at a
 //! time, in `seq` order), then `state`. The wallet's spend lock is taken with none of them held.
-use std::collections::HashSet;
-
 use xbt402::lottery::{self, Buyer, DrawError, Kind, Piece, PieceId, Win};
 
 use super::*;
@@ -94,8 +92,10 @@ struct State {
     buyer: Option<Buyer>,
     /// Wins the wallet found that no payer has taken yet (the seller sent no invoice for them).
     owed: Vec<Win>,
-    /// Draws whose win was handed to the payer: none is handed twice while its payment may still go through.
-    handed: HashSet<u64>,
+    /// Wins that were handed to the payer, by their draw, and whether the payer came back with a payment that
+    /// was not final yet. None is handed again while its payment is being made, or is in the book and has not
+    /// failed.
+    handed: HashMap<u64, (Win, bool)>,
     /// Invoices the payer has been given, by their text: one is looked at once, whatever became of it.
     tried: HashSet<String>,
     draws: u64,
@@ -450,7 +450,20 @@ impl Signer {
             Some(code) => return Err(self.draw_fault(ds, &format!("the seller refused a value the wallet gave for a piece it received: {code}"))),
         };
         // the seller's list of unpaid wins: an invoice counts only for a draw the wallet itself found won
+        // a win that was handed to the payer and whose payment the book now shows failed (a payment that was not
+        // final when the payer stopped waiting, and that the wallet's node then failed or never had) is owed again
+        let listed: Vec<u64> = v.get("wins").and_then(Value::as_array).into_iter().flatten().filter_map(|w| w.get("draw").and_then(Value::as_u64)).take(64).collect();
+        let lapsed: Vec<u64> = {
+            let s = lock(&ds.state);
+            listed.iter().copied().filter(|d| s.handed.get(d).is_some_and(|(_, not_final)| *not_final)).collect()
+        };
+        let lapsed: Vec<u64> = lapsed.into_iter().filter(|d| !self.lottery_win_live(&ds.sid, *d)).collect();
         let mut s = lock(&ds.state);
+        for d in lapsed {
+            if let Some((w, _)) = s.handed.remove(&d) {
+                s.owed.push(w);
+            }
+        }
         s.wins += found.len() as u64;
         lock(counted).wins += found.len() as u64;
         s.owed.extend(found);
@@ -459,7 +472,7 @@ impl Signer {
         for w in v.get("wins").and_then(Value::as_array).into_iter().flatten().take(64) {
             let (Some(draw), invoice) = (w.get("draw").and_then(Value::as_u64), w.get("invoice").and_then(Value::as_str)) else { continue };
             let mine = s.owed.iter().any(|o| o.draw() == draw);
-            if !mine && !s.handed.contains(&draw) {
+            if !mine && !s.handed.contains_key(&draw) {
                 lied.get_or_insert(format!("the seller lists draw {draw} as a win: by the wallet's own draw it is not one"));
                 continue;
             }
@@ -481,7 +494,7 @@ impl Signer {
         for w in owed {
             match invoices.iter().find(|(d, _)| *d == w.draw()) {
                 Some((d, inv)) => {
-                    s.handed.insert(*d);
+                    s.handed.insert(*d, (w.clone(), false));
                     s.tried.insert(inv.clone());
                     wins.push((w, Some(inv.clone())));
                 }
@@ -520,12 +533,18 @@ impl Signer {
                 c.paid_sats = c.paid_sats.saturating_add(charged);
                 c.fee_msat = c.fee_msat.saturating_add(crate::ticket::outside_u64(out.get("fee_msat")).unwrap_or(0));
             }
-            // booked, and the node's word decides later: counted as paid for what it booked
+            // booked, and the node's word decides later: counted as paid for what it booked. Should the node then
+            // show it failed, the win is owed again ([`Signer::draw_round`] asks the book)
             Some("pending") => {
                 s.paid_sats = s.paid_sats.saturating_add(charged);
                 c.paid_sats = c.paid_sats.saturating_add(charged);
                 c.unpaid.push(json!({"draw": win.draw(), "rule": rule, "booked_sats": charged}));
+                if let Some(h) = s.handed.get_mut(&win.draw()) {
+                    h.1 = true;
+                }
             }
+            // the book has a payment for this win already: it is paid, or being paid, and this invoice is not
+            _ if rule == "lottery_win_paid" => {}
             _ => {
                 // not paid. An invoice the checks refused, or a payment that failed, leaves the win open for the seller's
                 // next invoice; anything else is the owner's bound, and the call asks for no more pieces
@@ -534,8 +553,9 @@ impl Signer {
                 c.unpaid.push(json!({"draw": win.draw(), "rule": rule}));
                 if retry {
                     // owed again: another invoice of the seller's for it is looked at, never this one
-                    s.handed.remove(&win.draw());
-                    s.owed.push(win.clone());
+                    if let Some((w, _)) = s.handed.remove(&win.draw()) {
+                        s.owed.push(w);
+                    }
                 } else {
                     c.stop.get_or_insert(format!("{rule}: a win could not be paid inside the owner's bounds"));
                     c.halt = true;

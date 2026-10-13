@@ -14,8 +14,10 @@ and 14 list what building each side changed in this draft. Section 11 (2026-10-1
 defaults again for channels that carry 30 pending payments, which is Core Lightning's default,
 and for the dust limits; it was measured with the XBT Core Lightning fork in the lab. Since
 2026-10-13 the wallet and the gateway in this tree have those defaults and keep those rules, and
-both build the prepaid tickets of section 5 (section 14). XBT is Bitcoin on BLAKE2b proof of work;
-"the SHA-256 chain" is the other chain.
+both build the prepaid tickets of section 5 (section 14). Section 9 is the lottery: pieces priced
+below a ticket, paid by draws with nothing held; both sides build its first form, in which the
+buyer pays after a win, and `scripts/lottery_regtest.sh` runs it. XBT is Bitcoin on BLAKE2b proof
+of work; "the SHA-256 chain" is the other chain.
 
 A **ticket** is a small Lightning payment that is locked along an ordinary route and not yet
 released. The buyer picks a 32-byte secret and gives the seller its SHA-256 hash. The seller's node
@@ -425,7 +427,8 @@ Lightning node, and each node caps the total of such HTLCs per channel (section 
 | Tickets in flight per channel | 30 on a Core Lightning channel, 483 at most | 483 is the protocol's limit and Lightning Fork's default; 30 is Core Lightning's default, each way, set when the channel opens. Between Lightning Fork nodes, of 520 offered at once 483 locked in 8 s and 37 failed on the buyer's node (`INSUFFICIENT_BALANCE`) with nothing held; to a Core Lightning node, of 40 offered 30 locked and 10 failed the same way. 483 tickets take a commitment transaction from 1,116 to 84,200 weight units. |
 | Macaroons | Buyer: `info:read`, `offchain:read`, `offchain:write`, `onchain:read`. Seller: one with `invoices:read`, `invoices:write`, and one with `info:read`. | The buyer's was enough for its side. The seller's invoice macaroon makes, follows, settles and cancels tickets and cannot read the block height; the second one reads it. Neither could send coins, pay, open a channel, read the wallet or bake another. |
 | Seller's caps (the gateway's defaults in this tree) | 15 held tickets for all sessions together, 2 a session, 30 sessions, 2 from one address | What buyers can hold of the seller's inbound capacity at no cost to them: 15,000 sat and half of one 30-slot channel. A runner whose inbound channels all carry more says so (`caps.inbound_slots`), and one with several channels may raise the cap past half of one (`caps.held_over_half`). Until 2026-10-13 the defaults were 8 a session and 240 in all. |
-| Ticket payments with the buyer's router at once | 8 | On a 30-slot channel, 200 small payments sent 8 at a time all succeeded, and 139 of 200 sent 64 at a time failed (section 11). |
+| Ticket payments with the buyer's router at once | 8 | On a 30-slot channel, 200 small payments sent 8 at a time all succeeded, and 139 of 200 sent 64 at a time failed (section 11). A win of the lottery is one of them. |
+| A win of the lottery (section 9) | 64 sat, 16 at the least | A hop's base fee of 1 sat is 1.6% of 64 sat and 6% of 16. A win is paid at once and never held, so the dust limits and the slot budget do not apply to it. |
 
 ## 8. Open in this draft
 
@@ -470,27 +473,364 @@ Lightning node, and each node caps the total of such HTLCs per channel (section 
   stated by a gateway that sees bytes and seconds. The response header `Ticket-Units` is kept for
   such a count; this draft reads no price from it.
 
-## 9. Reserved: lottery
+## 9. The lottery: pay after a win
 
-Not specified here, and nothing implements it. A request priced below one ticket is to be paid
-by a fair roll that wins a payment of one fixed size with probability price ÷ that size
-(`docs/LIMITS.md`, "Lottery tickets (in design)"). Paying by lottery is Wheeler's and Rivest's
-idea, and a win that pays itself over Lightning was first set out by Gerhart, Taylor and
-Thyagarajan in 2026 ([`REFERENCES.md`](REFERENCES.md), 33, 34 and 44). This draft leaves room for
-it and no more:
+A request, or a piece of an answer, priced below one payment is paid by a fair draw: it wins a
+payment of one fixed size (a **win**, 64 sat unless the terms say otherwise) with probability
+price ÷ that size, so what is paid is the price on average. Most draws pay nothing. A win is paid
+at once by an ordinary Lightning payment, in flight for a fraction of a second, and nothing is
+locked with the seller at any time: no hold invoice, no slot of any channel between wins. This is
+how the wallet pays amounts below a ticket, and how it pays more sellers at once than tickets can
+be held with (section 11).
 
-- A seller will offer it as a further entry of `accepts`, with a scheme name of its own, beside
-  `ticket`. A `ticket/0` client that does not know the entry skips it.
-- Its terms will carry the size of a win and, with `amount`, the odds, so that the buyer's
-  owner can cap both before anything is paid.
-- Its requests will carry the buyer's part of the draw, and its responses the seller's part and
-  any win. The buyer's wallet checks every win itself before it pays one.
-- Where a win is paid from a locked ticket, that ticket is locked and cancelled as in sections 2
-  and 4, and is at least 546 sat like any held ticket (section 11). A win that is paid at once,
-  by an ordinary payment, may be smaller, and the buyer sends at most 8 such payments at a time
-  on one channel.
+Both sides are built: the draw is `xbt402::lottery` (`crates/xbt402/src/lottery.rs`, no IO, used
+by both), the seller's side is in `xbt-gateway` (`lottery.rs`, `gateway/draws.rs`), and the
+buyer's side is in the wallet's signer (`lottery.rs`, `ticket_pay/draws.rs`, and the ticket rail's
+payment of an ordinary invoice). `scripts/lottery/draw.py` is the same draw written a second
+time; both read `vectors/lottery_vectors.json`. `scripts/lottery_regtest.sh` runs it on
+Lightning Fork nodes; the numbers of this section are that script's.
 
-Field names, the draw and its checks are left to a later draft.
+Paying by lottery is Wheeler's and Rivest's idea. The seller's hash chain is Rivest's, the
+shape (a commitment by the receiver, a value of the payer's, a hash of both under a threshold)
+is the one Orchid and Livepeer use against a contract, and a win that pays itself over Lightning
+was first set out by Gerhart, Taylor and Thyagarajan in 2026 ([`REFERENCES.md`](REFERENCES.md),
+33 to 44). What is ours is the binding to a metered HTTP answer and to an ordinary Lightning
+invoice with nobody holding money for the winner.
+
+**The fairness argument is this project's own and nobody else has reviewed it.** It takes
+SHA-256 as a random function and is stated in section 9.3. What is built is the form in which
+the buyer pays after a win. The form in which a win pays itself (a sealed draw from a locked
+ticket) is not specified here and not built; `pay` in the terms is where it would be named.
+
+### 9.1 Terms
+
+A seller that takes draws adds one entry to `accepts`, after its ticket entries: a client that
+knows only tickets skips an entry it cannot read.
+
+```json
+{"scheme": "lottery", "network": "lightning:0000000000000050c1e5f69672f45929",
+ "asset": "XBT:msat", "amount": "0", "payTo": "<the seller's Lightning node id, 33 bytes>",
+ "extra": {"version": "lottery/0", "features": [512],
+           "winMsat": "64000", "minWinMsat": "16000", "winBlocks": 40,
+           "pay": "on-win", "release": "after-answer",
+           "window": 8, "graceSeconds": 10, "gracePieces": 64, "maxUnpaidWins": 2,
+           "chainDraws": 65536, "pieceBytes": "262144",
+           "receiptKey": "<33-byte public key>", "session": "/x402/lottery",
+           "price": {"requestMsat": "0", "byteMsat": "100", "perBytes": "262144", "secondMsat": "0"}}}
+```
+
+| Field | Meaning | Why |
+|---|---|---|
+| `amount`, `price` | As for a ticket (section 1): the price rule of the route. | With the win size it fixes the odds of every piece. Both come from the entry the buyer's request repeats, so a seller cannot change the odds after the fact. |
+| `winMsat` | What one win pays unless the buyer asks for less. | One size per session, so that an invoice has one right amount. |
+| `minWinMsat` | The smallest win a buyer may ask for when it opens a session. | A buyer sizes its win to the session (section 9.7). A smaller win is steadier and pays more in routing fees. |
+| `winBlocks` | The final CLTV delta of a win's invoice. | It bounds how long the payment of a win can lock the buyer's funds on its way. |
+| `pay` | `on-win`: a win is paid by an invoice the seller sends after it. | Who can walk away from a win, and so who goes first. No other value is defined. |
+| `release` | `after-answer`: a value follows any piece. `after-verify`: the route's pieces can be checked one by one, and a buyer that holds their hashes gives a value only for a piece that matched. | Whether a draw depends on the content. The seller does the same in both cases; the word tells the buyer what it can check. |
+| `window` | How many pieces the seller serves beyond the last one it holds a value or a void for. | It bounds what a buyer that sends no values is served. |
+| `graceSeconds`, `gracePieces`, `maxUnpaidWins` | How long, how many pieces and how many wins the seller serves on while a win is unpaid. | The payment of a win takes a quarter of a second through a hop, and longer when many are sent at once. |
+| `chainDraws` | The draws one session's chain covers. | A session ends when its chain does; the buyer opens another. |
+| `pieceBytes` | The bytes of an answer that make one piece. | Both sides must cut an answer at the same places. |
+
+An entry is offered only for a route whose every piece (its request, one second, one full piece
+of bytes) costs less than `winMsat`. A buyer MUST refuse an entry whose win is outside what its
+owner allows, or whose pieces would win more often than its owner allows, or it pays larger
+amounts, or more often, than the owner agreed to. It MUST refuse an entry it cannot read whole,
+and one whose `pay` it does not build: a draw the two sides would work out differently is a win
+one of them does not see.
+
+### 9.2 Open
+
+```text
+POST <session>/open    {"version": "lottery/0", "winMsat": "<the size asked for, optional>"}
+200                    {"session": "<id>", "key": "<32 bytes>", "anchor": "<c[0], 32 bytes>",
+                        "winMsat": "<the session's win size>", "chainDraws": <n>}
+```
+
+Opening a session asks the seller's node for nothing and costs the buyer nothing. The seller
+makes a chain for the session: a random 32-byte seed `c[n]`, hashed down, `c[i-1] = SHA256(c[i])`,
+and sends its end `c[0]`, the **anchor**. `key` authenticates the session's requests as a
+ticket session's does (section 3), under another label:
+
+```text
+auth = HMAC-SHA256(key, "lottery/auth|" session "|" seq "|" request_digest_v2)
+PAYMENT-SIGNATURE: base64({"x402Version": 2, "accepted": <the lottery entry>,
+                           "payload": {"session": "<id>", "seq": <n>, "auth": "<HMAC>"}})
+```
+
+- The seller MUST make a new chain for every session, from fresh random bytes, and send its
+  anchor before it has any value of the buyer's. A chain used for two sessions lets their
+  buyers know values ahead and lose on purpose. The gateway keeps a session and its chain in
+  memory only, so a restart cannot bring a chain back.
+- The seller MUST cap sessions, in all and from one address, and forget a quiet one. A session
+  costs `chainDraws` hashes to make and 32 bytes for every 1,024 of them to keep, and anyone can
+  ask for one.
+- The buyer MUST refuse an anchor it has been given before, and an answer that names another win
+  size or chain length than it asked for.
+- The requests MUST go over TLS (or loopback): the session key travels in this answer.
+
+### 9.3 Pieces and the draw
+
+What is paid for is cut into **pieces**. A request has at most one piece of kind `request`
+(`price.requestMsat`, when it is above nothing and the answer's status is below 400). The body of
+an answer priced by its size has one piece of kind `bytes` for every `pieceBytes` bytes, numbered
+from 0, and a last, shorter one when the body ends; the price of a piece is the price of the body
+up to its end less the price up to its start, so that the pieces of a body add up to the price of
+the body with no rounding left over. An answer priced by the second has one piece of kind
+`second` for every second that starts while it is open, numbered from 0. A piece with no price is
+not a piece.
+
+```text
+piece = SHA256("lottery/0/piece" ‖ seq:8 ‖ req:32 ‖ kind:1 ‖ k:8 ‖ amount_msat:8 ‖ win_msat:8)
+d     = SHA256("lottery/0/draw" ‖ len(session):1 ‖ session ‖ i:8 ‖ c[i]:32 ‖ b:32 ‖ piece:32)
+win   = uint64(d[0..8]) < floor(2^64 × amount_msat / win_msat)
+```
+
+Integers are big-endian; `kind` is 0 for `request`, 1 for `bytes`, 2 for `second`; `seq` is the
+request's own, `req` its `request_digest_v2`, `k` the piece's number among its kind in that
+request. `i` is the number of the draw in its session, from 1. `b` is the buyer's value, 32
+random bytes. The odds are the two integers `amount_msat` and `win_msat`, never a rounded "1 in
+N", and the floor drops less than one part in 2^64 of a draw.
+
+Draws are numbered by the buyer, in the order it gives values, with no gaps: the value for draw
+`i` names the piece it is for. The seller takes a value only as the next draw of the session and
+reveals `c[i]` only in the answer to the request that brought the value of draw `i`.
+
+**Why neither side can steer a draw** (the argument that is ours and unreviewed):
+
+- The seller fixed `c[i]` with the anchor before it saw any value of the buyer's. To reveal
+  another value that hashes down to the anchor it would need a second preimage. The buyer's value
+  is 256 random bits the seller has not seen, so to the seller `d` is uniform whatever seed it
+  chose. Its other move is not to reveal, which gives up its own win.
+- The buyer picks `b` holding `c[i-1]` at most, and `c[i]` is a preimage of that. Whatever it
+  picks, `d` is uniform. It cannot wait: the seller reveals `c[i]` only with the value of draw
+  `i` in hand, and takes no second value for a draw.
+- The seller learns no result before it has served: the value follows the piece. A seller that
+  held the value first could serve only winners.
+- A win is for one piece: its request, its place in the answer, its price and the win size are
+  all inside `d`. Neither side can use a draw for a cheaper or a dearer piece.
+- Either side can walk away at any time, and neither knows anything of the draws to come, so no
+  rule for stopping moves what is paid on average.
+
+What the draw does not do is make the buyer pay: section 9.6.
+
+### 9.4 A request, its values and the reveal
+
+A request for a resource is sent as a ticket session's is, with the header of section 9.2, one
+request of a session after another. The seller, in this order: checks `auth` and `seq`; refuses
+a session that is outside its window or its grace (section 9.6); refuses a route with a piece
+that costs the session's win or more (`amount_not_below_win`: such a piece is paid with
+tickets); asks the service; and for an answer below 400 serves, with a receipt signed by
+`receiptKey` over, in this order, `scheme`, `session`, `seq`, `drawn`, `servedMsat`, `wonMsat`,
+`paidMsat`, `charged`, `req`, `status`, `bodyHash`, under the tag `xbt402/lottery-receipt/v0`.
+An answer that is sent as it arrives carries a first receipt at its head (`bodyHash` empty,
+`"stream": true` beside it) and its last receipt in `status`, as in section 4.
+
+Values travel one way only, in a request of their own:
+
+```text
+POST <session>/draw   {"values": [{"draw": <i>, "seq": <n>, "kind": "bytes", "k": <k>,
+                                   "amountMsat": "<the piece's price>", "value": "<32 bytes>"}, ...],
+                       "void": [{"seq": <n>, "kind": "bytes", "k": <k>}, ...]}
+200                   {"drawn": <i>, "reveal": "<c[i]>", "refused": {"draw": <i>, "error": "<code>"} or null,
+                       "wins": [{"draw": <w>, "invoice": "<BOLT 11>"}, ...], "session": {...}}
+```
+
+`drawn` is the last draw the seller has taken and `reveal` its chain value. `wins` lists every
+win of the session that is not paid, each with the invoice that pays it. `POST <session>/status
+{}` answers the same without taking a value, with the last receipts of the session's answers;
+`POST <session>/close {}` ends the session.
+
+The buyer:
+
+- MUST make each value from its own random source, never from the session key or anything else
+  the seller has seen. A seller that can predict values can try seeds until its chain wins.
+- MUST give the value for a piece only when all of the piece has arrived, and under
+  `after-verify`, where it holds the piece's hash, only when the piece matched. A seller that
+  holds the value before it has served knows the result.
+- MUST give one value for a draw, ever, and send the same one again when its request got no
+  answer. Two values for one draw is choosing the result.
+- MUST check that `reveal` hashes down to the last chain value it holds in exactly `drawn` less
+  the last checked draw steps, at most 4,096, and MUST work out every draw up to `drawn` itself.
+  A value that is not on the chain is not a reveal, and a win the buyer cannot reproduce is not a
+  win.
+- SHOULD give no more than a few values (8 in the wallet built here) beyond the last reveal it
+  checked. A seller that takes values and reveals nothing is told nothing more.
+- MAY list a piece under `void` in place of a value: it never arrived, or failed its check. The
+  buyer knows no result when it says so.
+
+The seller:
+
+- MUST take a value only as the next draw of the session (`draw_out_of_order`), only for a
+  piece it served that has neither a value nor a void (`piece_unknown`), and only at that piece's
+  own price (`amount_mismatch`). A value for an earlier draw is answered as it was the first
+  time when it is the same value, and refused when it is another (`value_conflict`): a buyer
+  that has seen `c[i]` must not get to pick again. A value the session has used before is
+  refused (`value_reused`).
+- MUST NOT reveal `c[i]` before it holds the value of draw `i`. A reveal discloses every chain
+  value below it.
+- MUST mark a piece as served no earlier than when its last bytes leave. The gateway marks a
+  piece just before its last write, so that a buyer that has all of it never names a piece the
+  seller does not know; the last, short piece of a body of unknown length is marked when the body
+  has ended, and a buyer whose value for it is refused `piece_unknown` sends the same value again.
+- SHOULD stop a session with more voids than it allows (`too_many_voids`, 16 at the gateway).
+
+### 9.5 Paying a win
+
+Before it pays a win the buyer's signer MUST check all of these; a paid invoice cannot be
+recalled.
+
+| Check | What goes wrong without it |
+|---|---|
+| The draw is one the signer worked out itself, on the chain value it checked, and found won. | The wallet pays what a seller, or an agent, says was won. |
+| The invoice's payee is `payTo`. | The win pays another node. |
+| The amount is exactly the session's win size. | The buyer pays more than the odds were worked out for. |
+| Feature bit 512 is set and required; the prefix is XBT's. | The wallet pays on the SHA-256 chain's Lightning network. |
+| The final CLTV delta is `winBlocks`, and within the owner's bound; the invoice is not expired and stays payable for no longer than the owner allows; it has a payment secret. | As for a ticket (section 2). |
+| The win has no payment in the wallet's book that has not failed, and the invoice's hash has never been paid. | A seller that sends two invoices for one win is paid twice. |
+| The win and its fee limit are inside the task's budget, the cap for this seller, the wallet's own budgets, and, for a seller the owner has not named, the wins it may be paid in the task's window. | A seller that sets bad terms is paid without bound. |
+
+The buyer MUST write the spend down, on disk, before the payment leaves, and take it back only
+when its own node shows the payment failed with nothing in flight. It books what its node paid
+and the fee its node reports, never an expected value and never a number in a receipt. The
+wallet sends at most 8 payments to its node's router at once, tickets and wins together (section
+7).
+
+The seller treats a win as paid when its own node shows that invoice settled for the full
+amount, never on the buyer's word. The gateway makes the preimage of each invoice itself, gives
+it to the node and keeps no copy, makes one invoice for a win at a time, and makes another only
+when the node shows the first cancelled (it lapsed unpaid).
+
+A payment that fails (no route, a fee limit) is not a spent one. The wallet does not send that
+invoice again: the win stays owed until the seller sends another invoice for it, which the
+gateway does when the first has lapsed (60 s).
+
+### 9.6 The window and the grace: when the seller stops
+
+The seller goes first, and these are what bound it:
+
+- **The window.** No more than `window` pieces are open (served, with neither a value nor a
+  void) at once. A request beyond that is refused `value_missing`; an answer that is being sent
+  waits for a value for as long as it would wait for a ticket (3 s at the gateway) and is then
+  cut short.
+- **The grace.** While a win is unpaid the seller serves on: for `graceSeconds`, for
+  `gracePieces` pieces after that win, and with at most `maxUnpaidWins` wins unpaid. Beyond any
+  of the three a request is refused `win_unpaid`, with the unpaid wins and their invoices, and
+  an answer that is being sent waits and is then cut short. Service goes on when the seller's
+  node shows the wins paid.
+
+A buyer that gives values and never pays is therefore served up to its first win, and the grace.
+Nothing on today's Lightning makes it pay: the lottery is a cheap way for buyers who mean to pay
+to do so, with a bounded loss to each one that does not. Where a seller earns less than one win
+from a buyer, a buyer that never pays has had everything free.
+
+### 9.7 Which is used, and how large a win is
+
+One function in the wallet decides, when a seller's 402 has a ticket entry and a lottery entry
+(`crate::lottery::choose`); the other is tried after it where the first cannot be used.
+
+| Case | Paid by |
+|---|---|
+| A session with this seller is open | what that session pays by |
+| The seller offers one of the two, the owner turned the lottery off (`tickets.lottery.enabled`), or the task says (`meter`: `tickets` or `draws`) | that one |
+| A piece of the route costs one ticket or more | tickets |
+| The call may use four tickets' worth or more with this seller (`max_sats`), and a held ticket fits (the slot budget of section 11 and the owner's caps have room) | tickets |
+| Anything smaller, and whenever no held ticket fits | draws |
+| Draws were chosen and no win size fits the owner's bounds | tickets, and with them the prepaid ticket of section 5 where none can be held |
+
+The win size is fixed when the session opens: one sixteenth of what the call may use, in whole
+sats, so that a session expects about 16 wins; never above the seller's `winMsat` or the owner's
+cap; never below the seller's `minWinMsat`, the owner's smallest win, four times the route's
+dearest piece (so that no piece wins more than one time in four, the owner's `max_odds_den`), or
+the **fee floor** of the way to the seller. That floor is 64 sat when the payment goes through a
+routing node and 4 sat over a channel of the wallet's own to the seller's node.
+
+What a wallet can know of a route's fee before it pays is little. It knows its own channels,
+and so whether the seller's node is its direct peer, where no hop is paid. It knows the fee
+limit it gives its node, which is the most a payment can cost. It does not know the route its
+node will choose or what the hops on it charge until the payment has settled and its node
+reports the fee. So the floor is a rule and not a measurement: a routing node at the forks'
+default policy charges a base fee of 1 sat for any payment, which is 1.6% of a 64-sat win for
+each hop and 6% of a 16-sat one.
+
+### 9.8 The owner's policy
+
+`tickets.lottery` in the owner's policy, each with its default:
+
+| Field | Default | What it bounds |
+|---|---|---|
+| `enabled` | on wherever tickets are | Whether anything is paid by draws |
+| `max_win_sats`, `unlisted_max_win_sats` | 1,000 and 250 | The size of one payment, and of the spread, for a seller the owner named and for one it did not |
+| `min_win_sats` | 16 | A seller cannot make the wallet pay wins so small that the fee is most of them |
+| `max_odds_den` | 4 | No piece wins more often than 1 time in this many: a piece nearer a whole win is paid with tickets |
+| `expected_wins` | 16 | The wins a session is sized to expect |
+| `luck_tenths` | 31 | How far above its price a call may pay before the wallet asks for no more pieces: 3.1 standard deviations, which about one honest call in 1,000 reaches |
+| `ahead` | 8 | Values given beyond the last reveal the wallet checked |
+| `unlisted_max_wins` | 32 | Wins paid to one seller the owner has not named, in a task's window |
+| `routed_floor_sats`, `direct_floor_sats` | 64 and 4 | The fee floor of section 9.7 |
+| `stay_tickets` | 4 | The tickets' worth above which a seller is one the buyer stays with |
+
+and, for a task, `meter` (`auto`, `tickets` or `draws`). Everything else is what bounds a ticket:
+the task's `budget_sats`, the cap on sats paid to one seller, the wallet's daily and weekly
+budgets, `max_sellers`, `max_new_sellers_per_min`, `max_sends_per_hour`.
+
+- **Spend is what the node paid.** A win and its routing fee, booked before the payment leaves.
+  Never an expected value.
+- **`max_sats` bounds what a call uses**, by the wallet's own count of the pieces it gave values
+  for. What the call pays is uneven: nothing, or several wins. The wallet asks for no more pieces
+  when the wins of a call come to more than `max_sats`, plus 3.1 times the square root of
+  `max_sats` times the win, plus one win. For a call of 1,000 sat on 64-sat wins that is 1,848
+  sat. The task's budget is the bound that holds whatever the draws do.
+- **A budget below one win and its fee pays nothing at all.** The wallet says so when the session
+  would open, before it asks the seller for anything.
+- **A session counts once** for `velocity_max` (`tickets.velocity: "session"`, the default),
+  however many wins it pays; with `"release"` every win is a payment.
+- **The wallet checks the draw, not the delivery.** It gives a value for a piece that arrived,
+  and for a piece that matched where the caller gave the piece's hash (`piece_sha256` of the
+  signer's `xbt402_pay`). For anything else it is the caller that judges what arrived.
+
+### 9.9 What each side can lose
+
+| Who | Worst case | Bound |
+|---|---|---|
+| Seller | The service given to a buyer that gives values and never pays: up to its first unpaid win, and the grace. | `winMsat` (a smaller win for a buyer it does not know), `graceSeconds`, `gracePieces`, `maxUnpaidWins`. Measured in section 9.12. |
+| Seller | `window` pieces to a buyer that sends no values, for every session it is given. | `window`; the caps on sessions and on sessions from one address; a session that never drew is forgotten after a minute. |
+| Seller | A win it never invoices or whose invoice lapses. | Its own node and gateway. A session, with its unpaid wins, does not outlive the gateway's process. |
+| Seller | Uneven income: a seller that earns less than a win from a buyer is usually paid nothing by it, and sometimes a whole win. | The number of wins: pay is within 20% after about 68 wins. |
+| Buyer | Nothing beyond wins it worked out itself. An unlucky run costs more than the price, a lucky one less. | The owner's caps on a win, on the odds and on wins to an unnamed seller; the luck cap of a call; the task's budget. |
+| Buyer | A win it could not pay (its node away, no route, a cap reached): the seller stops serving it. | The grace. A signer that starts again pays no win it found before: it cannot tell a start from a restore of older records, in which that win may be paid already. |
+| Buyer | A seller whose prices are a lie, or whose content is worthless. | As for a ticket: the caps per seller and the task's budget. |
+| Routing hop | Nothing. It carries ordinary payments and is paid for each. | |
+
+### 9.10 Errors
+
+Beside those of section 3 that apply (`bad_auth`, `bad_seq`, `session_unknown`,
+`too_many_sessions`, `upstream_unavailable`): `value_missing`, `win_unpaid`, `too_many_voids`,
+`amount_not_below_win`, `win_size` (the size asked for at `open` is outside the terms),
+`chain_spent`, and, for a value in a `draw` request, `draw_out_of_order`, `draw_used` (a draw
+taken too long ago to answer again), `piece_unknown`, `amount_mismatch`, `value_conflict`,
+`value_reused`. A gateway that restarts has forgotten its sessions and answers
+`session_unknown`, unsigned; the wallet ends its session and opens another.
+
+### 9.11 What building it changed in the design
+
+The design this was built from numbered draws by request and let values arrive in any order.
+Each line below was found by building both sides and running them.
+
+| The design | Now, and why |
+|---|---|
+| One draw per request, numbered by the request's `seq`. | A draw per piece, and draws numbered by the buyer in the order of its values. An answer priced by its size or its time has many pieces and one `seq`; and with draws in order the seller never holds a gap, so a reveal never discloses a value that is still open and no list of holes is needed. |
+| A value rides in the next request. | Every value travels in `draw`. One path for a value and one answer to it, as the wallet does with a ticket's secret (section 12); and a long answer needs its values while it is still arriving. |
+| The draw binds the request's digest. | It binds the piece: the request, the kind, the number, the price and the win size. Two pieces of one request must not share a draw, and both sides must have drawn at the same odds or got different results. |
+| "A reveal more than 4,096 steps past the last is refused." | Kept, and a buyer gives at most 8 values beyond the last reveal, so in practice a reveal is checked in a few hashes. |
+| The buyer MUST write a value down before it leaves. | The wallet keeps values in memory. A session of draws does not outlive the signer's process, so after a restart there is nothing to send again; what is on disk is every payment of a win, before it is sent. |
+| The seller's chain is renewed by a `nextAnchor` in a receipt. | Not built. A session ends with its chain (65,536 draws) and the buyer opens another. |
+| Several wins in one invoice. | Not built: one invoice a win. |
+| A seller-held ticket for content that cannot be checked. | Not built. Every route is paid after a win, and the buyer checks what it can. |
+| The seller serves on for `graceSeconds`. | And for `gracePieces`, and with `maxUnpaidWins` at most: a fast seller gives away more in ten seconds than a win. |
+| A win's invoice was not specified. | An ordinary invoice of the win size with the terms' `winBlocks`, payable for 60 s, one at a time for a win. Found by a test: two answers of one session each asked the node for the same win's invoice, the wallet paid the first, and the gateway knew only the second; the gateway now lets one request at a time ask. |
+
+@@MEASURED@@
 
 ## 10. What building the seller changed in this draft
 
@@ -601,11 +941,13 @@ paying, reads the 402 itself, and chooses the rail. Who the seller is therefore 
 the signer fetched from the URL's own origin, never from its caller.
 
 **The rail.** One function, in this order; the first entry the seller offers and the owner's
-policy allows is paid.
+policy allows is paid. Where a seller's 402 has a ticket entry and a lottery entry, the rule of
+section 9.7 says which of the two is tried first, and the other is tried after it.
 
 | | Entry of the 402 | Paid when | Otherwise |
 |---|---|---|---|
-| 1 | `scheme: "ticket"` on the wallet's Lightning network | Tickets are on (`tickets.enabled`); the call names one of the owner's tasks, or the owner has one task, or one named `default`; the seller is admitted (its origin is on the allowlist and tied to its node id, or the task pays any seller); the terms are inside the owner's bounds; `release` is `with-request`; the origin is https, or http on this machine. | The next entry, with the reason. |
+| 1a | `scheme: "ticket"` on the wallet's Lightning network | Tickets are on (`tickets.enabled`); the call names one of the owner's tasks, or the owner has one task, or one named `default`; the seller is admitted (its origin is on the allowlist and tied to its node id, or the task pays any seller); the terms are inside the owner's bounds; `release` is `with-request`; the origin is https, or http on this machine. | The next entry, with the reason. |
+| 1b | `scheme: "lottery"` on the wallet's Lightning network (section 9) | The lottery is on (`tickets.lottery.enabled`); the task and the seller are admitted as for a ticket; a win size fits the seller's terms and the owner's bounds (section 9.7); the task's budget covers one win and its fee; the origin is https, or http on this machine. | The next entry, with the reason. |
 | 2 | `scheme: "exact"` on the wallet's Lightning network, with a BOLT 11 invoice in `extra.invoice` | The Lightning rail is on; the origin is on the allowlist; the invoice pays the entry's `payTo` its `amount`; and `ln_pay` would pay that invoice (every rule of that rail, the payee on the allowlist among them). The wallet pays it and sends the request again with `{"preimage"}` as the payload of `PAYMENT-SIGNATURE`. | The next entry, with the reason. |
 | 3 | `batch-settlement` (alias `xbt-channel`) on the chain: the frozen on-chain channel | The origin is on the allowlist and the owner has not set `channel_rail: false`. This path is unchanged. | The report below. |
 | | None of them | Nothing is paid. The reply is `no_rail` and lists each entry that was passed over and why. | |

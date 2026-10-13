@@ -2579,6 +2579,31 @@ fn a_win_whose_payment_fails_is_owed_until_the_sellers_next_invoice_and_never_pa
     once.sort_unstable();
     once.dedup();
     assert_eq!((paid_draws.len() as u64, once.len() as u64), (wins, wins), "every win paid, each once: {rows:?}");
+    // a payment whose end the node could not tell (its router went away as the payment was sent): booked for as
+    // long as it may still go through, and the win is not paid a second time meanwhile
+    let r = draws_rig(json!({"ln": {"timeout_s": 1}, "tickets": {"lottery": {"max_odds_den": 2}}}));
+    r.ln.st.lock().unwrap().router_down = true;
+    let v = r.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
+    r.ln.st.lock().unwrap().router_down = false;
+    let pending: Vec<u64> = v["wins_unpaid"].as_array().unwrap().iter().filter(|w| w["rule"] == "lottery_win_pending").map(|w| w["draw"].as_u64().unwrap()).collect();
+    assert!(!pending.is_empty() && v["wins_paid"] == 0, "{v}");
+    let sid = v["session"].as_str().unwrap().to_string();
+    assert_eq!(r.ledger_sum(), pending.len() as i64 * 67, "each booked at a win and its fee limit");
+    // the node answers again and never had them; once no payment of that age can still arrive, the book gives them
+    // up, and the seller's next invoices (the first ones lapsed) pay each of those wins, once. (70 s: past the
+    // wait for a payment that was sent, and short of the two minutes after which an idle session is stopped)
+    r.clock.fetch_add(70, Ordering::SeqCst);
+    r.tick();
+    assert_eq!(r.ledger_sum(), 0, "booked back: {:?}", r.ledger());
+    for t in r.session(&sid)["session_tickets"].as_array().unwrap() {
+        r.shop.standin.expire_unpaid(&hex::decode(t["hash"].as_str().unwrap()).unwrap().try_into().unwrap());
+    }
+    let again = r.pay("/tiny/10", 5);
+    assert_eq!((again["status"].as_u64(), again["session"].as_str()), (Some(200), Some(sid.as_str())), "{again}");
+    assert_eq!(again["wins_paid"].as_u64().unwrap(), pending.len() as u64 + again["wins"].as_u64().unwrap(), "the wins that were owed are paid in this call: {again}");
+    assert_wins(&r, again["wins_paid"].as_u64().unwrap());
+    let settled: Vec<u64> = win_tickets(&r, &sid).iter().filter(|t| t["state"] == "settled").map(|t| t["win"].as_u64().unwrap()).collect();
+    assert!(pending.iter().all(|d| settled.iter().filter(|s| *s == d).count() == 1), "each win that was owed has one payment that settled: {settled:?}");
 }
 
 #[test]

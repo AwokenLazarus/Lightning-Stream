@@ -501,7 +501,7 @@ def swarm_of(n: int) -> None:
         wins = sum(r.get("wins", 0) for r in results)
         bad = [b for r in results for b in r.get("bad", ["no result"])]
         s = sampler.report()
-        paid_msat = m["buyer_node_paid_msat"] - before["buyer_node_paid_msat"] - (5_000_000 if ordinary.get("paid") else 0)
+        paid_msat = m["buyer_node_paid_msat"] - before["buyer_node_paid_msat"]
         sessions = sum(1 for x in status().get("sessions", []) if x["state"] == "open" and x.get("draws"))
         check(f"swarm: {n} sellers paid at once by draws from one 30-slot channel, {rounds} files of 64 pieces from each: every file whole, every win paid, no payment failed",
               not bad and m["failed_payments"] == before["failed_payments"] and sum(r.get("wins_paid", 0) for r in results) == wins and paid_msat == wins * WIN_MSAT
@@ -511,7 +511,7 @@ def swarm_of(n: int) -> None:
         check(f"swarm: with {n} sellers the wallet never had more than 8 payments on its channel at once (30 slots), held nothing between wins, and an ordinary payment over that channel succeeded meanwhile",
               s["most_pending"] <= 9 and not s["not_a_win_in_flight"] and ordinary.get("paid") is True and lab.pending_htlcs(BUYER) == 0 and e2e.held() == 0,
               {**s, "ordinary_payment": ordinary})
-        check(f"swarm: after {n} sellers the buyer's node, the seller's node, the wallet's book and its ledger agree to the millisat", agrees(m) and m["buyer_node_paid_msat"] - before["buyer_node_paid_msat"] == wins * WIN_MSAT + 5_000_000, m)
+        check(f"swarm: after {n} sellers the buyer's node, the seller's node, the wallet's book and its ledger agree to the millisat", agrees(m) and paid_msat == wins * WIN_MSAT, m)
         measured(f"swarm{n}_seconds", round(secs, 1))
         measured(f"swarm{n}_wins", wins)
         measured(f"swarm{n}_pending_on_buyer_channel", s)
