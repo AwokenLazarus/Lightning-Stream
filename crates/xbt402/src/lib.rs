@@ -20,6 +20,7 @@
 //! * [`scheme`]: the seam for a second x402 scheme beside the channel binding (`xbt-work`, AGP-032).
 //! * [`macaroon`]: a Lightning node's macaroon, read (shared with `xbt-signer`'s Lightning rail).
 //! * [`ticket`]: the stream-ticket wire, draft v0 (`docs/TICKETS.md`): request auth and the signed receipt.
+//! * [`lottery`]: the lottery, pay after a win (`docs/TICKETS.md`, section 9): the draw and both sides' bookkeeping of it.
 //!
 //! Optional features: `http-client` (ureq transport), `http-server` (std::net around the
 //! provider), `rpc` (bitcoind JSON-RPC backend and wallet).
@@ -31,6 +32,7 @@ pub mod error;
 pub mod funding;
 pub mod json;
 pub mod ledger;
+pub mod lottery;
 pub mod macaroon;
 pub mod maturity;
 pub mod provider;
