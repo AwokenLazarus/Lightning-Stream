@@ -34,7 +34,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use xbt402::wire::{b64json, payment_payload, request_digest_v2, safe_code, seller_url, sendable_url, unb64json};
+use xbt402::ticket::protocol_code;
+use xbt402::wire::{b64json, payment_payload, request_digest_v2, seller_url, sendable_url, unb64json};
 use zeroize::Zeroizing;
 
 use crate::ln::LnPolicy;
@@ -90,7 +91,7 @@ impl WireAnswer {
     /// The whole body when it is at most `cap` bytes. `Err`: longer, or cut short.
     fn read_small(self, cap: u64) -> Result<Vec<u8>> {
         let mut out = vec![];
-        self.body.take(cap + 1).read_to_end(&mut out).map_err(|e| err("transport_error", e.to_string()))?;
+        self.body.take(cap + 1).read_to_end(&mut out).map_err(|e| err("transport_error", format!("the answer could not be read ({:?})", e.kind())))?;
         if out.len() as u64 > cap {
             return Err(err("response_too_large", format!("an answer above {cap} bytes where a short one was expected")));
         }
@@ -130,7 +131,8 @@ impl TicketWire for UreqWire {
         let resp = match if body.is_empty() && matches!(method, "GET" | "HEAD") { req.call() } else { req.send_bytes(body) } {
             Ok(r) => r,
             Err(ureq::Error::Status(_, r)) => r,
-            Err(e) => return Err(err("transport_error", e.to_string())),
+            // a fixed wording: ureq's own quotes the URL (the seller's session path) and a malformed status
+            Err(e) => return Err(err("transport_error", xbt402::http::transport_words(&e))),
         };
         let status = resp.status();
         let headers: Vec<(String, String)> = resp.headers_names().into_iter().filter_map(|n| resp.header(&n).map(|v| (n.to_ascii_uppercase(), v.to_string()))).collect();
@@ -484,9 +486,19 @@ impl Signer {
                 Tried::Next(why) => passed.push(json!({"rail": rail, "why": why})),
             }
         }
+        // what the 402 offers, in the wallet's words: a scheme it knows by name, and whether the network is one of its own
         let offered: Vec<Value> = pr.get("accepts").and_then(Value::as_array).into_iter().flatten()
-            .map(|a| json!({"scheme": str_or_empty(a.get("scheme")).chars().take(40).collect::<String>(),
-                            "network": str_or_empty(a.get("network")).chars().take(80).collect::<String>()})).take(16).collect();
+            .map(|a| {
+                let scheme = a.get("scheme").and_then(Value::as_str);
+                let scheme = if scheme == Some(xbt402::ticket::SCHEME) { xbt402::ticket::SCHEME } else if scheme == Some("exact") { "exact" }
+                             else if xbt402::wire::scheme_accepted(scheme) { xbt402::wire::SCHEME } else { "other" };
+                let network = match a.get("network").and_then(Value::as_str) {
+                    Some(n) if n == lightning => "this wallet's Lightning network",
+                    Some(n) if n == chain => "this wallet's chain",
+                    _ => "other",
+                };
+                json!({"scheme": scheme, "network": network})
+            }).take(16).collect();
         with(deny("no_rail", "the seller's 402 offers no way to pay that this wallet's policy allows: see rails_passed_over for what each entry needs"),
              json!({"charged_sats": 0, "rails_passed_over": passed, "offered": offered,
                     "wallet": {"lightning": lightning, "chain": chain, "tickets": tp.enabled, "ln": LnPolicy::from_map(&cfg.ln).enabled, "channel_rail": cfg.channel_rail}}))
@@ -767,7 +779,7 @@ impl Signer {
             return Err(deny("allowlist", format!("destination not on allowlist: {}", hs.origin)));
         }
         let refused = |status: u16, v: &Value| {
-            let code = Some(str_or_empty(v.get("error"))).filter(|c| safe_code(c)).unwrap_or_default();
+            let code = protocol_code(v.get("error"));
             if status == 402 && code == "slots_short" {
                 let wait = v.get("retryAfter").and_then(Value::as_u64).unwrap_or(crate::ticket::SLOT_WAIT_S as u64).clamp(1, crate::ticket::SLOT_WAIT_MAX_S as u64);
                 // unchecked: without the wait in the book the next round asks again and is told the same
@@ -1139,8 +1151,8 @@ impl Signer {
                         Some(true)
                     } else {
                         let code = v.get("refused").and_then(Value::as_array).into_iter().flatten().find(|x| x.get("hash").and_then(Value::as_str) == Some(hash.as_str()))
-                            .map(|x| str_or_empty(x.get("error"))).filter(|c| safe_code(c)).unwrap_or_default();
-                        match code.as_str() {
+                            .map(|x| protocol_code(x.get("error"))).unwrap_or_default();
+                        match code {
                             // the seller's node does not show it held at this instant: the same secret again
                             "ticket_not_locked" | "node_unavailable" => None,
                             // taken before (an answer of ours was lost): the totals say whether it was credited
@@ -1245,7 +1257,7 @@ impl Signer {
                         }
                     }
                     drop(link);
-                    let code = Some(str_or_empty(v.get("error"))).filter(|c| safe_code(c)).unwrap_or_default();
+                    let code = protocol_code(v.get("error"));
                     // an answer nobody signed. A server error may be a proxy's; anything else is the seller serving or
                     // refusing without a receipt, or someone answering in its place: the session ends, and nothing was
                     // released on that answer's word
@@ -1281,7 +1293,7 @@ impl Signer {
             if matches!(ans.status, 402 | 503) {
                 let status = ans.status;
                 let v: Value = ans.read_small(SMALL_BODY).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
-                let code = Some(str_or_empty(v.get("error"))).filter(|c| safe_code(c)).unwrap_or_default();
+                let code = protocol_code(v.get("error"));
                 // signed by the seller: its balance is what it says, and the loop releases one ticket more if that is short
                 if code == "balance_short" && short < 2 && hs.balance() < reserve {
                     short += 1;
@@ -1295,6 +1307,7 @@ impl Signer {
         let status = ans.status;
         let mut out = json!({"verdict": "allow", "rule": "ok", "status": status});
         let mut sink = Sink::new();
+        let mut seller_last = Value::Null;
         let (price_msat, receipt_note) = if !hs.streaming.load(Ordering::SeqCst) {
             // a whole answer: paid for at its head, its body hashed against the receipt
             let length = ans.length;
@@ -1313,7 +1326,8 @@ impl Signer {
             out = with(out, json!({"complete": complete, "ended": ended}));
             (head.charged, note)
         } else {
-            let (m, note) = self.ticket_stream(hs, price, &head, seq, &digest, ans, started, max_msat, &mut sink, &mut spent);
+            let (m, note, last) = self.ticket_stream(hs, price, &head, seq, &digest, ans, started, max_msat, &mut sink, &mut spent);
+            seller_last = last;
             out = with(out, m);
             let price_msat = out.get("price_msat").and_then(|v| crate::ticket::outside_u64(Some(v))).unwrap_or(0);
             (price_msat, note)
@@ -1325,6 +1339,9 @@ impl Signer {
         out["released"] = json!(spent.hashes);
         out["ms"] = json!((started.elapsed().as_secs_f64() * 10_000.0).round() / 10.0);
         out[UNTRUSTED_KEY] = untrusted(&text, head.raw);
+        if !seller_last.is_null() {
+            out[UNTRUSTED_KEY]["last_receipt"] = seller_last;
+        }
         *lock(&hs.used) = self.engine.now();
         out
     }
@@ -1336,7 +1353,7 @@ impl Signer {
     /// and what the receipt check found.
     #[allow(clippy::too_many_arguments)]
     fn ticket_stream(&self, hs: &Arc<HttpSession>, price: &Price, head: &Receipt, seq: u64, digest: &str, ans: WireAnswer, started: Instant, max_msat: u64,
-                     sink: &mut Sink, spent: &mut Spent) -> (Value, Value) {
+                     sink: &mut Sink, spent: &mut Spent) -> (Value, Value, Value) {
         let base_spent = lock(&hs.money).acct.spent_msat.saturating_sub(head.charged);
         let st = Stream { price: *price, base_spent, started, max_msat, max_open: Duration::from_secs(self.ticket_policy().max_answer_s.clamp(1, 86_400) as u64) };
         let length = ans.length;
@@ -1393,7 +1410,7 @@ impl Signer {
                     Ok(0) => break,
                     Ok(n) => n,
                     Err(e) => {
-                        read_error = Some(e.to_string());
+                        read_error = Some(format!("{:?}", e.kind()));
                         break;
                     }
                 };
@@ -1474,6 +1491,7 @@ impl Signer {
         }
         hs.streaming.store(false, Ordering::SeqCst);
         let mut fault = hs.fault();
+        let mut seller_last = Value::Null;
         let note = match &last {
             None => json!({"signed": false, "last": Value::Null, "why": why_none}),
             Some(r) => {
@@ -1483,7 +1501,11 @@ impl Signer {
                 if complete && r.charged > own_cost {
                     fault.get_or_insert(format!("the last receipt charges {} msat for an answer that costs {own_cost} by the seller's terms", r.charged));
                 }
-                json!({"signed": true, "last": r.raw, "body": if !complete { "cut short" } else if r.body_hash == own_digest { "as signed" } else { "differs from the receipt" }})
+                // the receipt as the wallet read it: its numbers. The seller's own object is under the untrusted field.
+                seller_last = r.raw.clone();
+                json!({"signed": true, "last": {"seq": r.seq, "releasedMsat": r.released_msat.to_string(), "spentMsat": r.spent_msat.to_string(),
+                                                "charged": r.charged.to_string(), "status": r.status},
+                       "body": if !complete { "cut short" } else if r.body_hash == own_digest { "as signed" } else { "differs from the receipt" }})
             }
         };
         // the price of the answer: the seller's signed charge where it stands inside the wallet's own count, else that count
@@ -1492,7 +1514,7 @@ impl Signer {
         if let Some(why) = fault {
             m["seller_fault"] = self.ticket_fault(hs, &why)["reason"].clone();
         }
-        (m, note)
+        (m, note, seller_last)
     }
 
     // --- stop ---------------------------------------------------------------------------------------
@@ -1679,7 +1701,7 @@ fn read_all(ans: WireAnswer, sink: &mut Sink) -> Option<String> {
         match body.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => sink.put(&buf[..n]),
-            Err(e) => return Some(format!("cut short: {e}")),
+            Err(e) => return Some(format!("cut short: {:?}", e.kind())),
         }
     }
     length.filter(|l| *l != sink.bytes).map(|l| format!("cut short: {} of {l} bytes", sink.bytes))

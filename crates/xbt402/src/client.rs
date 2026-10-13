@@ -794,11 +794,15 @@ impl Client {
     fn post(&self, url: &str, obj: &Value) -> Result<Value> {
         let r = self.transport.request("POST", url, crate::json::dumps(obj).as_bytes(),
                                        &[("Content-Type".into(), "application/json".into())])?;
-        let data: Value = crate::json::parse_slice(&r.body).map_err(|_| ChannelError::new("provider_error", format!("HTTP {} non-JSON", r.status)))?;
+        let data: Value = crate::json::parse_slice(&r.body)
+            .map_err(|_| ChannelError::new("provider_error", format!("HTTP {} non-JSON", r.status)).with_seller(&String::from_utf8_lossy(&r.body)))?;
         if r.status != 200 {
-            // the provider's words go in the message, never in the code an agent reports (L12)
-            let code = data.get("error").and_then(Value::as_str).filter(|c| safe_code(c)).unwrap_or("provider_error");
-            return fail(code, py_str(data.get("detail")));
+            // Nothing the provider wrote is in the code or the message: the code is one of the
+            // protocol's own or `provider_error`, the message is ours, and the provider's answer
+            // travels apart in `seller` (untrusted text for whoever shows this error to an agent).
+            let code = protocol_code(data.get("error").and_then(Value::as_str)).unwrap_or("provider_error");
+            let said: String = String::from_utf8_lossy(&r.body).into_owned();
+            return Err(ChannelError::new(code, format!("the provider refused the request (HTTP {})", r.status)).with_seller(&said));
         }
         Ok(data)
     }
@@ -819,7 +823,7 @@ impl Client {
                 }
                 if ex.get("derivation").and_then(Value::as_str) != Some(DERIVATION) {
                     // before funding: never strand coins
-                    return fail("bad_offer", format!("channel binding {}, this client speaks {DERIVATION:?} (payee key v2, request binding v2)", py_str(ex.get("derivation"))));
+                    return fail("bad_offer", format!("the offer's channel binding (extra.derivation) is not {DERIVATION:?}, the one this client speaks (payee key v2, request binding v2)"));
                 }
                 return Ok(acc.clone());
             }
@@ -1429,7 +1433,7 @@ impl Client {
             // The receipt of the request we just sent, and of no other (AGP-090, review T4): an
             // identical earlier request has the same digest, so whoever sits between could answer
             // this one with the earlier answer and its genuine receipt.
-            return fail("bad_receipt", format!("receipt is for seq {}, this call was seq {}", py_str(r.get("seq")), ch.seq));
+            return fail("bad_receipt", format!("receipt is for another request of this channel (its seq is not this call's, {})", ch.seq));
         }
         // An answer that has no body by its framing (to a HEAD, or a 204 or 304) is checked on its
         // status: the receipt's bodyHash is of the body the provider did not send (AGP-090).
@@ -1716,9 +1720,8 @@ impl Client {
             // refused: the provider did not keep the conditional state, and did not charge it
             ch.pending_cond = None;
             ch.unanswered_msat = ch.unanswered_msat.saturating_sub(cond_amt.saturating_mul(1000));
-            let code = crate::json::parse_slice(&r.body).ok().and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_string))
-                .filter(|c| safe_code(c)).unwrap_or_else(|| "refused".into());
-            return fail(&code, "conditional call refused");
+            let code = crate::json::parse_slice(&r.body).ok().and_then(|v| protocol_code(v.get("error").and_then(Value::as_str))).unwrap_or("refused");
+            return Err(ChannelError::new(code, "conditional call refused").with_seller(&String::from_utf8_lossy(&r.body)));
         }
         let k = crate::json::parse_slice(&r.body).ok().and_then(|v| v.get("preimage").and_then(Value::as_str).and_then(|k| hex::decode(k).ok()))
             .ok_or_else(|| ChannelError::new("no_preimage", format!("HTTP {} without k: recover_conditional reads k from the provider's claim", r.status)))?;

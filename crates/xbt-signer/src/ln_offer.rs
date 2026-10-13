@@ -263,7 +263,7 @@ impl Signer {
                 // an offer with an amount is asked for that amount by leaving it out
                 let resp = match ln.fetch_invoice(offer, if o.amount.is_some() { 0 } else { amount_msat }, pol.timeout_s.max(1)) {
                     Ok(r) => r,
-                    Err(e) => return self.ln_refuse("ln_fetch_invoice", &format!("no invoice for the offer: {}", e.msg), &dest, ""),
+                    Err(e) => return crate::ln::node_said(self.ln_refuse("ln_fetch_invoice", &format!("no invoice for the offer: {}", e.msg), &dest, ""), &e),
                 };
                 let s = str_or_empty(resp.get("bolt12")).trim().to_string();
                 let inv = match bolt12::decode_invoice(&s) {

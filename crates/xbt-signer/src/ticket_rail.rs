@@ -681,7 +681,9 @@ impl Signer {
         };
         let mut read: Vec<(String, String, Invoice)> = vec![];
         for it in &items {
-            let named = str_or_empty(it.get("hash"));
+            // the hash an invoice was returned for is the seller's string: compared as it came, recorded only when it is a hash
+            let said = str_or_empty(it.get("hash"));
+            let named = Some(said.clone()).filter(|h| h.len() == 64 && h.bytes().all(|c| c.is_ascii_hexdigit())).unwrap_or_default();
             let invoice = str_or_empty(it.get("invoice")).trim().to_string();
             let inv = match bolt11::decode(&invoice) {
                 Ok(i) => i,
@@ -691,7 +693,7 @@ impl Signer {
                 }
             };
             let hash = inv.payment_hash_hex();
-            if !named.is_empty() && named != hash {
+            if !said.is_empty() && said != hash {
                 refuse(&named, "ticket_hash", "the invoice is for another payment hash than the one it was returned for".into());
                 continue;
             }

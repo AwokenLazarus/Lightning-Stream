@@ -108,7 +108,7 @@ pub fn bech32_decode(s: &str) -> Result<(String, Vec<u8>), String> {
     }
     let mut data = Vec::with_capacity(s.len() - pos - 1);
     for c in s[pos + 1..].bytes() {
-        let v = CHARSET.iter().position(|x| *x == c).ok_or_else(|| format!("bad bech32 character {:?}", c as char))?;
+        let v = CHARSET.iter().position(|x| *x == c).ok_or("a character that is not bech32")?;
         data.push(v as u8);
     }
     let mut chk = hrp_expand(hrp.as_bytes());
@@ -150,7 +150,7 @@ fn parse_hrp(hrp: &str) -> Result<(String, Option<u64>), String> {
     let rest = hrp.strip_prefix("ln").ok_or("not a Lightning invoice (no ln prefix)")?;
     // longest first: bcrt before bc, tbs before tb
     let currency = ["bcrt", "bc", "tbs", "tb"].into_iter().find(|c| rest.starts_with(c))
-        .ok_or_else(|| format!("unknown invoice currency in {hrp:?}"))?;
+        .ok_or("unknown invoice currency in the prefix")?;
     let amt = &rest[currency.len()..];
     if amt.is_empty() {
         return Ok((currency.into(), None));
@@ -160,9 +160,9 @@ fn parse_hrp(hrp: &str) -> Result<(String, Option<u64>), String> {
         _ => (amt, None),
     };
     if digits.is_empty() || !digits.bytes().all(|c| c.is_ascii_digit()) || (digits.len() > 1 && digits.starts_with('0')) {
-        return Err(format!("bad invoice amount {amt:?}"));
+        return Err("bad invoice amount in the prefix".into());
     }
-    let n: u128 = digits.parse().map_err(|_| format!("bad invoice amount {amt:?}"))?;
+    let n: u128 = digits.parse().map_err(|_| "bad invoice amount in the prefix")?;
     // 1 BTC = 10^11 msat
     // AGP-095 (audit item 14): the digits are whoever wrote the invoice's; 28 of them times 10^11
     // do not fit a u128, and an unchecked product is a panic in a release build

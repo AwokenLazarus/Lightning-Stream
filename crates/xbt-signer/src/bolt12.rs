@@ -195,7 +195,7 @@ pub fn bech32_decode(s: &str) -> Result<(String, Vec<u8>), String> {
     let hrp = std::str::from_utf8(&clean[..pos]).map_err(|_| "bad prefix".to_string())?.to_string();
     let (mut acc, mut bits, mut out) = (0u32, 0u32, Vec::with_capacity((clean.len() - pos) * 5 / 8));
     for c in &clean[pos + 1..] {
-        let v = CHARSET.iter().position(|x| x == c).ok_or_else(|| format!("bad bech32 character {:?}", *c as char))?;
+        let v = CHARSET.iter().position(|x| x == c).ok_or("a character that is not bech32")?;
         acc = (acc << 5) | v as u32;
         bits += 5;
         if bits >= 8 {
@@ -395,7 +395,7 @@ const EXPERIMENTAL: u64 = 1_000_000_000;
 pub fn decode_offer(offer: &str) -> Result<Offer, String> {
     let (hrp, data) = bech32_decode(offer.trim())?;
     if hrp != "lno" {
-        return Err(format!("not an offer (prefix {hrp:?}, not lno)"));
+        return Err("not an offer (its prefix is not lno)".into());
     }
     offer_from_tlv(&data)
 }
@@ -470,8 +470,8 @@ pub fn check_offer(o: &Offer, genesis: &[u8; 32], now: f64) -> Result<(), Refusa
     if o.experimental {
         return e("ln_offer", "the offer carries experimental-range fields: refused, implementations disagree on such an offer's id".into());
     }
-    if let Some(c) = &o.currency {
-        return e("ln_offer", format!("the offer is priced in {c:?}, not in this chain's coin: refused"));
+    if o.currency.is_some() {
+        return e("ln_offer", "the offer is priced in a currency, not in this chain's coin: refused".into());
     }
     if o.quantity_max.is_some() {
         return e("ln_offer", "the offer sells by quantity, which this wallet does not ask for: refused".into());
@@ -548,7 +548,7 @@ fn verify(recs: &[Record<'_>], name: &str, sig: &[u8], key: &[u8; 33]) -> Result
 pub fn decode_invoice(invoice: &str) -> Result<Invoice, String> {
     let (hrp, data) = bech32_decode(invoice.trim())?;
     if hrp != "lni" {
-        return Err(format!("not an invoice (prefix {hrp:?}, not lni)"));
+        return Err("not an invoice (its prefix is not lni)".into());
     }
     invoice_from_tlv(&data)
 }

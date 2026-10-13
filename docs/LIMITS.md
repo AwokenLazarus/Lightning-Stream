@@ -46,8 +46,8 @@ does what the hub did. The code and those limits are in the git history, last at
   is closed at the close margin with the best signed state, and a routed lock recorded on it is
   not waited for.
 - The signer socket no longer answers `xbt402_sign_state_adaptor`, `xbt402_resolve_lock`,
-  `xbt402_void_lock`, `xbt402_adopt_lock`, `xbt402_recover_lock` or `routing_status`; the Python
-  wallet reference still has them.
+  `xbt402_void_lock`, `xbt402_adopt_lock`, `xbt402_recover_lock` or `routing_status`; nor does
+  the Python wallet reference, which had them removed after this one.
 
 ### Stream tickets (the design's measurements)
 
@@ -702,6 +702,49 @@ channel; the rest (policy, approvals, keys, the socket) holds for every rail.
 - A watcher step that panics is reported and skipped, and the next tick tries again; in a
   `release-small` build a panic ends the signer process, and whatever supervises it restarts it.
 
+### What a seller wrote (tool results)
+
+The rule: **nothing a seller wrote is in a tool result outside the field marked untrusted**, on
+any payer and any rail. `untrusted_provider_response` holds a seller's answer and receipt; on the
+Lightning rail `untrusted_ln_data` holds the node's and the invoice's text. Every other string of
+a result is the wallet's own: its `rule` and its `reason` above all, which an agent reads as its
+wallet speaking. A seller that refuses is reported in the wallet's words, and its answer is in the
+untrusted field.
+
+| payer and rail | where a seller's words reached the wallet's own fields | now |
+|---|---|---|
+| wallet MCP, `XBT_MCP_PAYER=local` (xbt402's `Client`, frozen channel) | `rule` was the seller's error code and `reason` its `detail`, verbatim (the open item that was here); `billing` was the offer's string; a refused offer's `derivation` and a receipt's `seq` were quoted in `bad_offer` and `bad_receipt` | `rule` is one of the protocol's codes or `provider_error`, `reason` is the client's sentence, and the seller's answer is under `untrusted_provider_response`; `billing` is `prepay` or `postpay`; neither string is quoted |
+| the signer's own channel rail (`xbt402_pay`, `close_channel`, `channels`; frozen) | the seller's error code, let through by its shape, ended the open's `reason` and the channel's stored `open_error`; a stream's `id` was in `stream.id` and in the stored file's name, and its `root` in `stream.merkle_root` unchecked | a code is named only when it is the protocol's; a stream's id and root are named only when they are hex |
+| Lightning (`ln_pay`, `ln_status`) | a refused invoice's or offer's prefix (free text, under a checksum its writer computes) and an offer's currency were quoted in `reason`; the node's error message, which can repeat a payee's or an issuer's, was the `reason` of `ln_backend` and `ln_fetch_invoice`; `ln_status.recent[].failure` was the bare text | a refused string is described and not quoted; the node's message is under `untrusted_ln_data` (`node_message`), and so is each listed `failure` |
+| stream tickets (`xbt402_pay`, `ticket_status`, `ticket_stop`) | refused terms were quoted in `rails_passed_over`; `offered` listed each entry's scheme and network; the seller's error code, by its shape, was in `reason`, `seller_code`, `seller_fault`, `ended` and a stopped session's `why`; a refused invoice's prefix was in `reason`; the last receipt of a streamed answer was the seller's whole object | terms are described; `offered` says `ticket`, `exact`, `batch-settlement` or `other`, on this wallet's network or `other`; a code is named only when it is the scheme's; the receipt is given as its numbers, and the seller's object as `untrusted_provider_response.last_receipt` |
+| every rail's HTTP | the transport's error text went into `reason`: it quotes a status that is not a number (three characters) and, on the ticket rail, the URL with the seller's session path | a fixed sentence per kind of failure |
+
+- A seller's error code is its words unless it is one of the protocol's own
+  (`xbt402::wire::PROTOCOL_CODES`, `xbt402::ticket::PROTOCOL_CODES`). A code the shipped provider
+  or gateway adds later is not named by an older wallet: it reads as no code.
+- Numbers are not words, and nor are hashes, keys, ids and signatures of a fixed hex shape: a
+  result gives them as they are (`chan`, `payment_hash`, `funding_txid`, a hex stream id, a
+  receipt's amounts).
+- One character can still come through: a field that should be hex and is not is reported by the
+  hex reader as `Invalid character 'x' at position n`, and where that is a seller's field the
+  character is the seller's.
+- What the agent itself passed is given back in the wallet's sentences: the origin of its URL
+  (`destination not on allowlist: ...`), its task name. An invoice or offer the agent passes is
+  the payee's string and is never quoted.
+- The wallet's own Lightning node is trusted for what it reports as fields: a channel's
+  `remote_pubkey`, `commitment_type` and `channel_point`, the watchtowers' addresses, its
+  `identity_pubkey`. Its alias, its version and its error messages are under `untrusted_ln_data`.
+- Records written before this change are read back as they were written: a channel's
+  `open_error`, a stopped ticket session's `why`, and the audit log that `history` returns can
+  still hold a seller's error code that an earlier version let through by its shape.
+- The files an operator reads are outside the rule: the call log (`B2_CALLS_JSONL`) and the
+  processes' own logs.
+- The rule is held by reading the code and by tests that plant a marker in the strings a seller
+  controls (`agp128` in the test names of `xbt402`, `xbt-signer` and `xbt-wallet-mcp`; check E2.4
+  of `scripts/failure_interop.sh` for the local payer end to end). It is not held by the type
+  system: a new result field that copies a seller's string would break it, and only a test with
+  that string would show it.
+
 ### Pay with work
 
 - The pay-with-work specification (XBT-053), its Python reference and its vectors are not
@@ -893,8 +936,10 @@ behaviour; searching the trees for `open: AGP-102` and `open: AGP-111` finds exa
 `AGP-111` ones are checks of `scripts/failure_interop.sh`, which runs the release binaries: the
 script prints them as `FAIL (open item)` with what it observed, and goes on.
 
-The three `AGP-111` items are all on the frozen on-chain channel's pay rail. They stay listed
-and get no fix unless the channel is kept.
+The two `AGP-111` items are both on the frozen on-chain channel's pay rail. They stay listed
+and get no fix unless the channel is kept. (There were three: the third, a seller's refusal text
+reaching the agent as the wallet's own `reason`, was the one an agent could be steered by, and is
+fixed: check E2.4 of that script, and "What a seller wrote" below.)
 
 - **A streamed result cannot be bought on a postpay channel that is one call behind**
   (`open: AGP-102 list 1 item 13`; Rust wallet, two tests; Python wallet, one). A stream's last
@@ -926,14 +971,6 @@ and get no fix unless the channel is kept.
   sat and the wallet funds a channel of that capacity; the provider's built-in maximum is
   10,000,000 sat, so the open is refused, before anything is funded. The example policy sets
   100,000 sat and is not affected. Set the cap in your policy.
-- **With the wallet MCP's `local` payer, a seller's refusal text reaches the agent as the wallet's
-  own `reason`** (`open: AGP-111 item 3`; `scripts/failure_interop.sh`, check E2.4). When a seller
-  refuses an open (or any request the library client posts) with an error and a `detail`, the
-  tool result is `{"verdict": "deny", "rule": <the seller's code, if it is a plain one>, "reason":
-  <the seller's detail, verbatim>}`: text the seller chose, outside
-  `untrusted_provider_response`, where an agent reads it as its wallet speaking. The signer's own
-  rail (the default payer) reports its own words there and no seller text. Use the default payer
-  where the agent must not be steered by a seller.
 
 ## Not reviewed by anyone
 
