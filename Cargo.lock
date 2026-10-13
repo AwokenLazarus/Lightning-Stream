@@ -2499,21 +2499,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "xbt-electrum"
-version = "0.1.0"
-dependencies = [
- "hex",
- "rustls",
- "rustls-pki-types",
- "serde_json",
- "thiserror",
- "webpki-roots 0.26.11",
- "xbt-electrum",
- "xbt-primitives",
- "xbt402",
-]
-
-[[package]]
 name = "xbt-gateway"
 version = "0.1.0"
 dependencies = [

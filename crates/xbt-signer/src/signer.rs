@@ -10,8 +10,9 @@
 //! no mining off regtest, per-chain hrp, pruned-node lookups, refund custody at expiry (the
 //! watcher), the pending close-change retry, rotation, the balance cap and the human sweep.
 //!
-//! Not ported (see the crate README): the forward rail, the treasury, the presigned vault and the
-//! Electrum light backend; their methods answer that they are unavailable.
+//! Not ported (see the crate README): the forward rail, the treasury and the presigned vault; their
+//! methods answer that they are unavailable. There is no light backend: the chain is read from the
+//! signer's own node.
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
@@ -275,7 +276,7 @@ impl Signer {
                                                 AuditLog::open(&run.join("audit.jsonl"))?, opts.clock.clone()));
         let backend = std::env::var("B2_CHAIN_BACKEND").unwrap_or_default().trim().to_lowercase();
         if backend == "electrum" && opts.node.is_none() {
-            return Err(err("chain", "B2_CHAIN_BACKEND=electrum: the Electrum light backend is not ported to the Rust signer (AGP-028); use the node RPC"));
+            return Err(err("chain", "B2_CHAIN_BACKEND=electrum: this signer has no light backend; it reads the chain from its own node (the node RPC)"));
         }
         let datadir = std::env::var("B2_DATADIR").map(PathBuf::from).unwrap_or_else(|_| root.join(".regtest"));
         let wallet = std::env::var("B2_WALLET").unwrap_or_else(|_| "agent".into());
