@@ -105,7 +105,7 @@ impl Handler for Service {
             let _ = n;
             Reply::Stream(Streamed { status: 200, headers: vec![("Content-Type".into(), "application/octet-stream".into())], length, body: b })
         };
-        if let Some(n) = sized("/files/").or_else(|| sized("/page/")).or_else(|| sized("/free/")) {
+        if let Some(n) = sized("/files/").or_else(|| sized("/page/")).or_else(|| sized("/free/")).or_else(|| sized("/pieces/")).or_else(|| sized("/tiny/")) {
             return stream(n, Some(n as u64), body(n, 64 << 10, Duration::ZERO));
         }
         if let Some(n) = sized("/slow/") {
@@ -131,6 +131,9 @@ fn routes() -> Value {
         {"path": "/files/", "price": {"byte_msat": 200_000, "per_bytes": 1_048_576}},
         {"path": "/slow/", "price": {"byte_msat": 200_000, "per_bytes": 1_048_576}},
         {"path": "/timed/", "price": {"second_msat": 400_000}},
+        // priced below a ticket: 2 sat for a piece of 64 KiB, half a sat for a request
+        {"path": "/pieces/", "price": {"byte_msat": 2000, "per_bytes": 65_536}},
+        {"path": "/tiny/", "price": {"request_msat": 500}},
         {"path": "/free/", "free": true}
     ])
 }
@@ -252,7 +255,7 @@ static REFILL_WAIT_MS: AtomicU64 = AtomicU64::new(400);
 fn shop_config(origin: &str, upstream: &str, state: &std::path::Path, network: &str, conf: &Value) -> Value {
     json!({"listen": "127.0.0.1:0", "public_url": origin, "upstream": upstream, "state_dir": state, "chain": "regtest",
            "network": network, "node": {"rest": "http://127.0.0.1:1", "macaroon": "unused", "info_macaroon": "unused"},
-           "tickets": conf["tickets"], "caps": conf["caps"],
+           "tickets": conf["tickets"], "caps": conf["caps"], "lottery": conf["lottery"],
            "times": {"refill_wait_ms": REFILL_WAIT_MS.load(Ordering::SeqCst), "upstream_wait_secs": 2, "tick_ms": 50},
            "routes": routes()})
 }
@@ -2293,4 +2296,349 @@ fn agp128_a_lock_answer_that_names_words_for_a_hash_is_refused_and_not_recorded(
     assert!(history.to_string().contains("ticket_hash"), "the refusal is in the audit log: {history}");
     assert_no_seller_words("history", &history);
     assert_no_seller_words("ticket_status", &r.status());
+}
+
+// --- the lottery: pieces priced below a ticket, paid by draws (`docs/TICKETS.md`, section 9) ----------
+
+/// A win of 64 sat and its routing fee, once the node shows it paid: 64,000 + 1,001 msat, in whole sats.
+const WIN: u64 = 64_000;
+const WIN_SETTLED: i64 = 66;
+const PIECE: usize = 65_536;
+
+/// The gateway as it ships, with the lottery on: wins of 64 sat (16 at the least), pieces of 64 KiB.
+fn draws_shop() -> Value {
+    json!({"tickets": {}, "caps": {"sessions_per_address": 0}, "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0}})
+}
+
+/// The wallet as it ships on a 30-slot channel, paying a seller that offers the lottery.
+fn draws_rig(extra: Value) -> Rig {
+    Rig::shipped(extra, 30, draws_shop())
+}
+
+/// The wins of a call, by the book: the payments that pay a win, each with its state.
+fn win_tickets(r: &Rig, sid: &str) -> Vec<Value> {
+    r.session(sid)["session_tickets"].as_array().cloned().unwrap_or_default().into_iter().filter(|t| t["win"].as_u64().unwrap_or(0) > 0).collect()
+}
+
+/// The node, the seller, the book and the ledger hold one number: `wins` wins of 64 sat, and nothing else.
+fn assert_wins(r: &Rig, wins: u64) {
+    r.tick();
+    assert_eq!(r.ln.paid_msat(), wins * WIN, "what the buyer's node paid");
+    assert_eq!(r.shop.settled() as u64, wins, "what the seller's node took");
+    assert_eq!(r.ledger_sum(), wins as i64 * WIN_SETTLED, "what the ledger holds: each win and its fee");
+    assert_eq!((r.shop.held(), r.ln.by_status("IN_FLIGHT").len()), (0, 0), "nothing is held, and nothing is in flight between wins");
+    let st = r.status();
+    assert_eq!((st["locked"]["tickets"].as_i64(), st["node"]["agree"].as_bool()), (Some(0), Some(true)), "{st}");
+}
+
+#[test]
+fn a_file_of_small_pieces_is_bought_by_draws_and_what_the_node_paid_is_the_wins_booked() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let r = draws_rig(json!({}));
+    // 256 pieces of 2 sat: 512 sat, on wins of 64 sat (1 in 32): 8 wins expected
+    let size = 256 * PIECE;
+    let v = r.pay(&format!("/pieces/{size}"), 1_000);
+    assert_eq!((v["verdict"].as_str(), v["rail"].as_str(), v["status"].as_u64(), v["complete"].as_bool()), (Some("allow"), Some("lottery"), Some(200), Some(true)), "{v}");
+    assert_eq!((v["bytes"].as_u64(), v["body_digest"].as_str()), (Some(size as u64), Some(pattern_digest(size).as_str())), "the file, whole");
+    // every piece had its draw, and the price is the pieces' own: no number of the seller's
+    assert_eq!((v["draws"].as_u64(), v["price_msat"].as_str(), v["win_msat"].as_str()), (Some(256), Some("512000"), Some("64000")), "{v}");
+    let wins = v["wins"].as_u64().unwrap();
+    assert_eq!((v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(wins), Some(0)), "every win is paid before the call returns: {v}");
+    assert_eq!((v["charged_sats"].as_i64(), v["fee_msat"].as_str()), (Some(wins as i64 * WIN_SETTLED), Some((wins * FEE_MSAT).to_string().as_str())), "{v}");
+    // the band: 8 wins expected; the luck cap of a call of 1,000 sat is 28
+    assert!((1..=28).contains(&wins), "{wins} wins");
+    assert_wins(&r, wins);
+    // nothing was locked, no ticket endpoint was asked, and at most 8 payments were with the router at once
+    assert!(r.tap.seen("/x402/ticket/").is_empty(), "a session of draws asks for no ticket");
+    assert!(r.ln.state().peak <= 8, "{} payments at once", r.ln.state().peak);
+    // the wire: the unpaid request, the open (no payment header), the paid request, then values
+    let log = r.tap.log.lock().unwrap().clone();
+    let steps: Vec<(&str, bool)> = log.iter().map(|s| (s.path.as_str(), s.paid)).collect();
+    assert_eq!(&steps[..3], &[(v["untrusted_provider_response"]["receipt"]["req"].as_str().map(|_| log[0].path.as_str()).unwrap(), false), ("/x402/lottery/open", false),
+                              (log[0].path.as_str(), true)], "{:?}", &steps[..4]);
+    assert!(steps[3..].iter().all(|s| *s == ("/x402/lottery/draw", true)), "{steps:?}");
+    // a value is 32 bytes of the wallet's own, given once: no two alike in the whole session
+    let mut values: Vec<String> = r.tap.seen("/x402/lottery/draw").iter().flat_map(|s| {
+        serde_json::from_str::<Value>(&s.body).unwrap()["values"].as_array().unwrap().iter().map(|x| format!("{}:{}", x["draw"], x["value"].as_str().unwrap())).collect::<Vec<_>>()
+    }).collect();
+    values.sort();
+    values.dedup();
+    assert_eq!(values.len(), 256, "one value per draw, the same one when a round was sent again");
+    // the book: a session that holds nothing, and one payment per win, each marked with its draw
+    let sid = v["session"].as_str().unwrap().to_string();
+    let rows = win_tickets(&r, &sid);
+    assert_eq!(rows.len() as u64, wins);
+    assert!(rows.iter().all(|t| t["state"] == "settled" && t["prepaid"] == true && t["msat"] == "64000" && t["booked_sats"] == WIN_SETTLED), "{rows:?}");
+    let mut draws: Vec<u64> = rows.iter().map(|t| t["win"].as_u64().unwrap()).collect();
+    draws.sort_unstable();
+    draws.dedup();
+    assert_eq!(draws.len() as u64, wins, "no win has two payments");
+    assert_eq!((r.audit("lottery_open").len(), r.audit("lottery_win_pay").len() as u64, r.audit("lottery_win_paid").len() as u64), (1, wins, wins));
+    // a second call goes on in the same session; a request priced at half a sat is one draw
+    let tiny = r.pay("/tiny/100", 5);
+    assert_eq!((tiny["rail"].as_str(), tiny["status"].as_u64(), tiny["draws"].as_u64(), tiny["price_msat"].as_str(), tiny["session"].as_str()),
+               (Some("lottery"), Some(200), Some(1), Some("500"), Some(sid.as_str())), "{tiny}");
+    assert_eq!(tiny["receipt"], json!({"signed": true, "body": "as signed"}));
+    let wins = wins + tiny["wins"].as_u64().unwrap();
+    assert_wins(&r, wins);
+    // stop: nothing to cancel, the seller is told, and the session is closed
+    let stop = r.call("ticket_stop", json!({"session": sid}));
+    assert_eq!((stop["http"]["seller_told"].as_bool(), stop["cancel"].as_array().map(Vec::len)), (Some(true), Some(0)), "{stop}");
+    assert_eq!(r.tap.seen("/x402/lottery/close").len(), 1);
+    assert_eq!(r.session(&sid)["sessions"][0]["state"], "closed");
+    assert_wins(&r, wins);
+}
+
+#[test]
+fn tickets_for_a_seller_one_stays_with_draws_for_a_small_call_and_the_owner_can_say_which() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    // a call that may use four tickets' worth with this seller: tickets, as before the lottery
+    let r = draws_rig(json!({}));
+    let v = r.pay(&format!("/pieces/{}", 4 * PIECE), 4_000);
+    assert_eq!((v["rail"].as_str(), v["status"].as_u64(), v["tickets_released"].as_u64()), (Some("ticket"), Some(200), Some(1)), "{v}");
+    // and the session that is open keeps its way, however small the next call
+    let next = r.pay(&format!("/pieces/{PIECE}"), 10);
+    assert_eq!((next["rail"].as_str(), next["session"].as_str()), (Some("ticket"), v["session"].as_str()), "{next}");
+    assert!(r.tap.seen("/x402/lottery/").is_empty());
+    // a small call: draws
+    let r = draws_rig(json!({}));
+    let v = r.pay(&format!("/pieces/{}", 4 * PIECE), 3_999);
+    assert_eq!((v["rail"].as_str(), v["draws"].as_u64()), (Some("lottery"), Some(4)), "{v}");
+    assert!(r.tap.seen("/x402/ticket/").is_empty());
+    // the owner turned the lottery off: tickets, and no lottery endpoint is asked
+    let r = draws_rig(json!({"tickets": {"lottery": {"enabled": false}}}));
+    let v = r.pay(&format!("/pieces/{}", 4 * PIECE), 100);
+    assert_eq!(v["rail"], "ticket", "{v}");
+    assert!(r.tap.seen("/x402/lottery/").is_empty());
+    // a task that says tickets, and one that says draws whatever the call may use
+    let r = draws_rig(json!({"tickets": {"tasks": {"film": {"budget_sats": 40_000, "meter": "tickets"}, "swarm": {"budget_sats": 5_000, "admit": "any", "meter": "draws"}}}}));
+    assert_eq!(r.pay(&format!("/pieces/{PIECE}"), 100)["rail"], "ticket");
+    let r = draws_rig(json!({"tickets": {"tasks": {"film": {"budget_sats": 40_000, "meter": "draws"}}}}));
+    assert_eq!(r.pay(&format!("/pieces/{PIECE}"), 30_000)["rail"], "lottery");
+    // a piece that would win more than one time in four is paid with tickets: a 64 KiB piece of /files/ is 12.5 sat,
+    // and the seller's largest win is 64
+    let r = draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 8}}}));
+    let v = r.pay(&format!("/files/{PIECE}"), 100);
+    assert_eq!((v["rail"].as_str(), v["rails_passed_over"][0]["rail"].as_str()), (Some("ticket"), Some("lottery")), "{v}");
+    assert!(v["rails_passed_over"][0]["why"].as_str().unwrap().starts_with("lottery_win_size"), "{v}");
+    // a seller that does not offer the lottery is paid with tickets as before
+    let r = Rig::shipped(json!({}), 30, shipped_shop());
+    assert_eq!(r.pay(&format!("/pieces/{PIECE}"), 100)["rail"], "ticket");
+}
+
+#[test]
+fn the_owners_bounds_hold_for_draws_and_spend_is_what_the_node_paid() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    // a budget below one win and its fee can pay nothing at all: said before anything is asked of the seller's session
+    let r = draws_rig(json!({"tickets": {"tasks": {"film": {"budget_sats": 60}}}}));
+    let v = r.pay(&format!("/pieces/{PIECE}"), 50);
+    assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("ticket_task_budget")), "{v}");
+    assert!(r.tap.seen("/x402/lottery/").is_empty() && r.ledger().is_empty());
+    // a call's max_sats bounds what it uses by the wallet's own count: 10 sat is 5 pieces, and the wallet reads no
+    // further than the read that reached it
+    let r = draws_rig(json!({}));
+    let v = r.pay(&format!("/pieces/{}", 64 * PIECE), 10);
+    let used: u64 = v["price_msat"].as_str().unwrap().parse().unwrap();
+    assert!(v["complete"] == false && v["ended"].as_str().unwrap().contains("max_sats"), "{v}");
+    assert!((8_000..=12_000).contains(&used), "{used} msat used of 10 sat: {v}");
+    assert_wins(&r, v["wins_paid"].as_u64().unwrap());
+    // velocity: a session of draws is one payment, however many wins it pays
+    let r = draws_rig(json!({"velocity_max": 1, "tickets": {"lottery": {"max_odds_den": 2}}}));
+    let mut wins = 0;
+    for _ in 0..6 {
+        let v = r.pay(&format!("/pieces/{}", 64 * PIECE), 500);
+        assert_eq!((v["verdict"].as_str(), v["complete"].as_bool()), (Some("allow"), Some(true)), "{v}");
+        wins += v["wins_paid"].as_u64().unwrap();
+    }
+    assert!(wins >= 2, "384 draws at 1 in 32: {wins} wins");
+    assert_wins(&r, wins);
+    // a seller the owner has not named: a win of 250 sat at most, and so many wins a window
+    let r = Rig::with(json!({"tickets": {"lottery": {"unlisted_max_wins": 1, "unlisted_max_win_sats": 32, "routed_floor_sats": 16}}}), false, true, 30, draws_shop());
+    let pay = |path: &str, max: i64| r.call("xbt402_pay", json!({"url": r.shop.url(path), "max_sats": max, "task": "swarm"}));
+    let v = pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
+    assert_eq!((v["rail"].as_str(), v["win_msat"].as_str()), (Some("lottery"), Some("32000")), "the owner's cap for a seller it has not named: {v}");
+    // 256 draws at 1 in 16: the first win is paid, the second is over the cap and stops the call
+    assert_eq!((v["wins_paid"].as_u64(), v["wins_unpaid"][0]["rule"].as_str(), v["complete"].as_bool()), (Some(1), Some("lottery_wins_cap"), Some(false)), "{v}");
+    assert!(v["ended"].as_str().unwrap().contains("lottery_wins_cap"), "{v}");
+    assert_eq!((r.ln.paid_msat(), r.shop.settled()), (32_000, 1));
+}
+
+#[test]
+fn a_seller_that_lies_about_a_win_or_its_invoice_is_paid_nothing_for_the_lie() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    // an invoice for another payee, and one for another amount: refused by the checks every invoice passes, nothing booked
+    for (lie, rule) in [(Lie::OtherPayee, "ticket_payee"), (Lie::OtherAmount, "ticket_amount")] {
+        let r = draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
+        *r.shop.node.lie.lock().unwrap() = lie;
+        let v = r.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
+        assert_eq!(v["rail"], "lottery", "{v}");
+        assert!(v["wins"].as_u64().unwrap() >= 1 && v["wins_paid"] == 0, "{v}");
+        assert!(v["wins_unpaid"].as_array().unwrap().iter().all(|w| w["rule"] == rule), "{v}");
+        assert!(r.ledger().is_empty() && r.ln.state().payments.is_empty(), "nothing was booked and nothing reached the node");
+        assert!(r.audit("ticket_refused").iter().all(|a| a["rule"] == rule && a["win"].as_u64().unwrap() > 0));
+        // the seller, unpaid, stopped serving: the wallet got the grace and no more
+        assert_eq!(v["complete"], false, "{v}");
+    }
+    // a win claimed for a draw that lost: the wallet works every draw out itself
+    let r = draws_rig(json!({}));
+    let claimed = Arc::new(AtomicU64::new(0));
+    let c = claimed.clone();
+    r.tap.set(Box::new(move |seen, real| {
+        if !seen.path.starts_with("/x402/lottery/draw") {
+            return None;
+        }
+        let (status, headers, body) = whole(real().unwrap());
+        let mut v: Value = serde_json::from_slice(&body).unwrap();
+        if v["wins"].as_array().is_some_and(Vec::is_empty) && c.load(Ordering::SeqCst) == 0 {
+            let draw = v["drawn"].as_u64().unwrap();
+            c.store(draw, Ordering::SeqCst);
+            v["wins"] = json!([{"draw": draw, "invoice": "lnbcrt640n1forged"}]);
+        }
+        let headers: Vec<(String, String)> = headers.into_iter().filter(|(k, _)| !k.eq_ignore_ascii_case("content-length")).collect();
+        Some(Ok(answer(status, headers, serde_json::to_vec(&v).unwrap())))
+    }));
+    let v = r.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
+    assert!(claimed.load(Ordering::SeqCst) > 0, "the hook claimed a win");
+    assert!(v["ended"].as_str().unwrap().contains("lottery_seller_fault"), "{v}");
+    let refused = r.audit("lottery_win_refused");
+    assert_eq!((refused.len(), refused[0]["rule"].as_str()), (1, Some("lottery_win")), "{refused:?}");
+    assert_eq!(r.audit("lottery_seller_fault").len(), 1);
+    // what was honestly won before the lie is paid, the lie is not, and the session is over
+    assert_wins(&r, v["wins_paid"].as_u64().unwrap());
+    assert_eq!(r.session(v["session"].as_str().unwrap())["sessions"][0]["state"], "closed");
+    assert!(!v.to_string().contains("forged") || v["untrusted_provider_response"].to_string().contains("forged"), "the seller's invoice text is in no field of the wallet's own");
+    // two invoices for one win: the first is paid, the second is not looked at, now or in a later answer
+    let r = draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
+    let node = r.shop.node.clone();
+    let extra: Arc<Mutex<HashMap<u64, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    let e = extra.clone();
+    r.tap.set(Box::new(move |seen, real| {
+        if !seen.path.starts_with("/x402/lottery/draw") {
+            return None;
+        }
+        let (status, headers, body) = whole(real().unwrap());
+        let mut v: Value = serde_json::from_slice(&body).unwrap();
+        let mut more = vec![];
+        for w in v["wins"].as_array().into_iter().flatten() {
+            let draw = w["draw"].as_u64().unwrap();
+            // a second, real invoice of the seller's node for the same win, in this answer and in every later one
+            let second = e.lock().unwrap().entry(draw).or_insert_with(|| {
+                let mut pre = [0u8; 32];
+                pre[..8].copy_from_slice(&draw.to_be_bytes());
+                pre[31] = 0x77;
+                node.add_invoice(&pre, WIN, 40, 60).unwrap()
+            }).clone();
+            more.push(json!({"draw": draw, "invoice": second}));
+        }
+        // and for wins that are paid by now: the seller lists its second invoice again
+        for (draw, inv) in e.lock().unwrap().iter() {
+            if !more.iter().any(|m: &Value| m["draw"] == *draw) {
+                more.push(json!({"draw": draw, "invoice": inv}));
+            }
+        }
+        v["wins"].as_array_mut().unwrap().extend(more);
+        let headers: Vec<(String, String)> = headers.into_iter().filter(|(k, _)| !k.eq_ignore_ascii_case("content-length")).collect();
+        Some(Ok(answer(status, headers, serde_json::to_vec(&v).unwrap())))
+    }));
+    let v = r.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
+    let wins = v["wins"].as_u64().unwrap();
+    assert!(wins >= 1 && v["wins_paid"] == wins && v["complete"] == true, "{v}");
+    assert_eq!(extra.lock().unwrap().len() as u64, wins, "the seller sent a second invoice for every win");
+    // one payment per win: the node paid the wins and not one msat more
+    assert_wins(&r, wins);
+    let rows = win_tickets(&r, v["session"].as_str().unwrap());
+    assert_eq!(rows.len() as u64, wins, "{rows:?}");
+}
+
+#[test]
+fn a_win_whose_payment_fails_is_owed_until_the_sellers_next_invoice_and_never_paid_twice() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let r = draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
+    // the first payment finds no route: nothing is spent, and the win stays owed
+    r.ln.st.lock().unwrap().fail_next = 1;
+    let v = r.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
+    // (the seller serves on for its grace of 64 pieces and then stops this buyer: the file may be cut short)
+    let wins = v["wins"].as_u64().unwrap();
+    assert!(wins >= 1, "{v}");
+    assert_eq!(v["wins_unpaid"][0]["rule"], "lottery_win_failed", "{v}");
+    assert_eq!(v["wins_paid"].as_u64().unwrap(), wins - 1, "{v}");
+    assert_wins(&r, wins - 1);
+    let sid = v["session"].as_str().unwrap().to_string();
+    let failed: Vec<Value> = r.session(&sid)["session_tickets"].as_array().unwrap().iter().filter(|t| t["state"] == "failed").cloned().collect();
+    assert_eq!((failed.len(), failed[0]["booked_sats"].as_i64()), (1, Some(0)), "the failed payment is booked back: {failed:?}");
+    // the seller's invoice for that win lapses; its next answer carries another, and the wallet pays that one
+    let old: Hash = hex::decode(failed[0]["hash"].as_str().unwrap()).unwrap().try_into().unwrap();
+    r.shop.standin.expire_unpaid(&old);
+    let again = r.pay("/tiny/10", 5);
+    assert_eq!((again["status"].as_u64(), again["session"].as_str()), (Some(200), Some(sid.as_str())), "{again}");
+    let wins = wins + again["wins"].as_u64().unwrap();
+    assert_wins(&r, wins);
+    let rows = win_tickets(&r, &sid);
+    let paid_draws: Vec<u64> = rows.iter().filter(|t| t["state"] == "settled").map(|t| t["win"].as_u64().unwrap()).collect();
+    let mut once = paid_draws.clone();
+    once.sort_unstable();
+    once.dedup();
+    assert_eq!((paid_draws.len() as u64, once.len() as u64), (wins, wins), "every win paid, each once: {rows:?}");
+}
+
+#[test]
+fn a_killed_signer_or_gateway_ends_a_session_of_draws_plainly_and_pays_no_win_twice() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let mut r = draws_rig(json!({"ln": {"timeout_s": 1}, "tickets": {"lottery": {"max_odds_den": 2}}}));
+    let v = r.pay(&format!("/pieces/{}", 128 * PIECE), 1_000);
+    let (sid, mut wins) = (v["session"].as_str().unwrap().to_string(), v["wins_paid"].as_u64().unwrap());
+    assert_eq!(v["complete"], true, "{v}");
+    // the signer is killed and started again: its session is stopped, nothing is retired (nothing was held), and the
+    // next call opens a new session on a new chain
+    r.restart();
+    assert_eq!(r.session(&sid)["sessions"][0]["state"], "closed", "{}", r.session(&sid));
+    assert_wins(&r, wins);
+    let v2 = r.pay(&format!("/pieces/{}", 128 * PIECE), 1_000);
+    assert!(v2["rail"] == "lottery" && v2["complete"] == true && v2["session"] != v["session"], "{v2}");
+    wins += v2["wins_paid"].as_u64().unwrap();
+    assert_wins(&r, wins);
+    let anchors: Vec<String> = r.tap.seen("/x402/lottery/open").iter().map(|s| s.body.clone()).collect();
+    assert_eq!(anchors.len(), 2);
+    // the gateway is killed and started again: it has forgotten the session; the wallet's call says so by opening
+    // another, and the request is served on that one
+    r.shop.restart();
+    let v3 = r.pay(&format!("/pieces/{}", 128 * PIECE), 1_000);
+    assert!(v3["rail"] == "lottery" && v3["complete"] == true && v3["session"] != v2["session"], "{v3}");
+    wins += v3["wins_paid"].as_u64().unwrap();
+    assert_wins(&r, wins);
+    assert_eq!(r.session(v2["session"].as_str().unwrap())["sessions"][0]["why"], "the seller has forgotten the session");
+    // the signer is killed while a win's payment is with the node: the payment is booked, and the node's word settles
+    // it after the start; the win is not paid again
+    r.ln.st.lock().unwrap().router_down = true;
+    let v4 = r.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
+    assert!(v4["wins"].as_u64().unwrap() >= 1 && v4["wins_paid"] == 0, "{v4}");
+    // booked, each at a win and its fee limit, for as long as the node cannot say what became of them
+    let unknown = v4["wins"].as_u64().unwrap().min(v4["wins_unpaid"].as_array().unwrap().iter().filter(|w| w["rule"] == "lottery_win_pending").count() as u64);
+    assert!(unknown >= 1 && r.ledger_sum() == wins as i64 * WIN_SETTLED + unknown as i64 * 67, "{v4} {}", r.ledger_sum());
+    r.ln.st.lock().unwrap().router_down = false;
+    r.restart();
+    // the node answers again and never had them: once no payment of that age can still arrive, they are booked back
+    r.clock.fetch_add(300, Ordering::SeqCst);
+    assert_wins(&r, wins);
+    assert_eq!(r.ledger_sum(), wins as i64 * WIN_SETTLED, "a payment that never reached the node is booked back");
+}
+
+#[test]
+fn a_piece_whose_hash_the_caller_named_gets_its_value_only_if_it_matches() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let r = draws_rig(json!({}));
+    let size = 8 * PIECE + 100;
+    let all: Vec<u8> = (0..size).map(pattern).collect();
+    let mut hashes: Vec<String> = all.chunks(PIECE).map(|c| hex::encode(Sha256::digest(c))).collect();
+    let pay = |hashes: &[String]| r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/pieces/{size}")), "max_sats": 100, "task": "film", "piece_sha256": hashes}));
+    let v = pay(&hashes);
+    assert_eq!((v["complete"].as_bool(), v["draws"].as_u64(), v["piece_mismatch"].clone()), (Some(true), Some(9), Value::Null), "{v}");
+    // piece 3 is not the one the caller expects: no value is given for it or for anything after it, and the wallet stops
+    hashes[3] = "00".repeat(32);
+    let v = pay(&hashes);
+    assert_eq!((v["complete"].as_bool(), v["piece_mismatch"].as_u64(), v["draws"].as_u64()), (Some(false), Some(3), Some(3)), "{v}");
+    assert!(v["ended"].as_str().unwrap().contains("piece 3"), "{v}");
+    let voids: Vec<Value> = r.tap.seen("/x402/lottery/draw").iter().flat_map(|s| serde_json::from_str::<Value>(&s.body).unwrap()["void"].as_array().cloned().unwrap_or_default()).collect();
+    assert_eq!(voids.len(), 1, "{voids:?}");
+    assert_eq!((voids[0]["kind"].as_str(), voids[0]["k"].as_u64()), (Some("bytes"), Some(3)));
 }

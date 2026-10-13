@@ -156,6 +156,10 @@ pub enum Offer {
     /// tickets, `settle: "on-use"`, where the seller offers them), and beside a held entry the
     /// seller's entry for prepaid tickets (`settle: "on-arrival"`) if it lists one.
     Ticket(Value, Option<Value>),
+    /// `scheme: "lottery"` on this Lightning network: pieces paid by draws, nothing held
+    /// (`docs/TICKETS.md`, section 9). Listed after the ticket entry; [`crate::lottery::choose`]
+    /// says which of the two is tried first.
+    Lottery(Value),
     /// `scheme: "exact"` on this Lightning network, with a BOLT 11 invoice: one payment, then the
     /// request again with the preimage.
     Lightning(Value),
@@ -167,6 +171,7 @@ impl Offer {
     pub fn rail(&self) -> &'static str {
         match self {
             Offer::Ticket(..) => "ticket",
+            Offer::Lottery(_) => "lottery",
             Offer::Lightning(_) => "ln",
             Offer::Channel(_) => "xbt402",
         }
@@ -192,6 +197,7 @@ pub fn offers(pr: &Value, lightning: &str, chain: &str) -> Vec<Offer> {
         (None, None) => entries.iter().find(|a| on(a, xbt402::ticket::SCHEME, lightning)).map(|a| Offer::Ticket((*a).clone(), None)),
     };
     out.extend(ticket);
+    out.extend(entries.iter().find(|a| on(a, xbt402::lottery::SCHEME, lightning)).map(|a| Offer::Lottery((*a).clone())));
     out.extend(entries.iter().find(|a| on(a, LN_SCHEME, lightning)).map(|a| Offer::Lightning((*a).clone())));
     out.extend(entries.iter().find(|a| xbt402::wire::scheme_accepted(a.get("scheme").and_then(Value::as_str)) && a.get("network").and_then(Value::as_str) == Some(chain))
         .map(|a| Offer::Channel((*a).clone())));

@@ -37,6 +37,7 @@ pub mod keystore;
 pub mod ln;
 pub mod ln_funding;
 pub mod ln_offer;
+pub mod lottery;
 pub mod macaroon;
 pub mod node;
 pub mod policy;

@@ -302,6 +302,8 @@ pub struct TaskPolicy {
     pub unlisted_max_spend_sats: i64,
     pub unlisted_max_tickets: i64,
     pub unlisted_max_locked_sats: i64,
+    /// How this task's sellers are paid where their terms offer both tickets and the lottery.
+    pub meter: crate::lottery::Meter,
 }
 
 /// policy.json `tickets`: the ticket rail's own settings. The allowlist, the daily and weekly
@@ -343,6 +345,8 @@ pub struct TicketPolicy {
     pub read_timeout_s: i64,
     /// The longest an answer that is paid for as it arrives stays open, in seconds.
     pub max_answer_s: i64,
+    /// Paying by draws ([`crate::lottery`]): on wherever tickets are, unless the owner says otherwise.
+    pub lottery: crate::lottery::LotteryPolicy,
     pub tasks: BTreeMap<String, TaskPolicy>,
 }
 
@@ -358,7 +362,7 @@ impl Default for TicketPolicy {
                max_new_sellers_per_min: 30, max_sends_per_hour: 1_200, pool: POOL_FEW as i64, pool_many: POOL_MANY as i64,
                many_sellers: MANY_SELLERS as i64, floor_ticket_sats: (FLOOR_MSAT / 1000) as i64, velocity: Velocity::Session,
                http_idle_s: HTTP_IDLE_S, ready_wait_ms: READY_WAIT_MS, read_timeout_s: READ_TIMEOUT_S, max_answer_s: MAX_ANSWER_S,
-               tasks: BTreeMap::new() }
+               lottery: crate::lottery::LotteryPolicy::default(), tasks: BTreeMap::new() }
     }
 }
 
@@ -399,6 +403,12 @@ impl TicketPolicy {
                            },
                            http_idle_s: i(m, "http_idle_s", d.http_idle_s), ready_wait_ms: i(m, "ready_wait_ms", d.ready_wait_ms),
                            read_timeout_s: i(m, "read_timeout_s", d.read_timeout_s), max_answer_s: i(m, "max_answer_s", d.max_answer_s),
+                           // an entry that is not an object is no permission: the lottery is off
+                           lottery: match m.get("lottery").filter(|v| !v.is_null()) {
+                               None => d.lottery,
+                               Some(Value::Object(l)) => crate::lottery::LotteryPolicy::from_map(Some(l)),
+                               Some(_) => crate::lottery::LotteryPolicy { enabled: false, ..d.lottery },
+                           },
                            tasks: BTreeMap::new() };
         for (name, t) in m.get("tasks").and_then(Value::as_object).into_iter().flatten() {
             let Some(t) = t.as_object() else { continue };
@@ -415,7 +425,7 @@ impl TicketPolicy {
                 max_sellers: i(t, "max_sellers", p.max_sellers),
                 admit: if t.get("admit").and_then(Value::as_str) == Some("any") { Admit::Any } else { Admit::Listed },
                 unlisted_max_spend_sats: i(t, "unlisted_max_spend_sats", two.saturating_mul(2)), unlisted_max_tickets: i(t, "unlisted_max_tickets", p.pool_many),
-                unlisted_max_locked_sats: i(t, "unlisted_max_locked_sats", two) });
+                unlisted_max_locked_sats: i(t, "unlisted_max_locked_sats", two), meter: crate::lottery::Meter::parse(t.get("meter")) });
         }
         p.max_ticket_sats = p.max_ticket_sats.min(i64::MAX / 1000);
         p
@@ -444,7 +454,7 @@ pub fn validate(raw: &Value, errors: &mut Vec<String>, warnings: &mut Vec<String
     };
     ints(m, &TICKET_INT_KEYS, "tickets", errors);
     for k in m.keys() {
-        if k != "enabled" && k != "tasks" && k != "velocity" && !TICKET_INT_KEYS.contains(&k.as_str()) {
+        if k != "enabled" && k != "tasks" && k != "velocity" && k != "lottery" && !TICKET_INT_KEYS.contains(&k.as_str()) {
             warnings.push(format!("policy.json tickets.{k}: unknown key (the signer ignores it)"));
         }
     }
@@ -452,6 +462,9 @@ pub fn validate(raw: &Value, errors: &mut Vec<String>, warnings: &mut Vec<String
         if !matches!(v.as_str(), Some("release" | "session")) {
             errors.push("policy.json tickets.velocity: must be \"session\" (a ticket session is one payment for velocity_max: the default) or \"release\" (every release is one)".into());
         }
+    }
+    if let Some(l) = m.get("lottery").filter(|v| !v.is_null()) {
+        crate::lottery::validate(l, errors, warnings);
     }
     let p = TicketPolicy::from_map(m);
     if p.pool == 0 || p.pool_many == 0 {
@@ -490,8 +503,13 @@ pub fn validate(raw: &Value, errors: &mut Vec<String>, warnings: &mut Vec<String
                         errors.push(format!("policy.json {at}.admit: must be \"listed\" or \"any\""));
                     }
                 }
+                if let Some(a) = t.get("meter").filter(|v| !v.is_null()) {
+                    if !matches!(a.as_str(), Some("auto" | "tickets" | "draws")) {
+                        errors.push(format!("policy.json {at}.meter: must be \"auto\" (the wallet's rule), \"tickets\" or \"draws\""));
+                    }
+                }
                 for k in t.keys() {
-                    if k != "admit" && !TASK_INT_KEYS.contains(&k.as_str()) {
+                    if k != "admit" && k != "meter" && !TASK_INT_KEYS.contains(&k.as_str()) {
                         warnings.push(format!("policy.json {at}.{k}: unknown key (the signer ignores it)"));
                     }
                 }
@@ -860,6 +878,10 @@ pub struct Ticket {
     /// Booked (`released`) before the payment is sent and never `locked`: no secret of this
     /// wallet's releases it, and its nonce only makes the payment's tag.
     pub prepaid: bool,
+    /// The draw this payment pays the win of, in its session (0: it pays no win). A win is paid as
+    /// a prepaid ticket is, by an ordinary payment booked before it is sent, and once: no second
+    /// payment is made for a draw while one for it is in the book and has not failed.
+    pub win: u64,
 }
 
 impl Ticket {
@@ -872,6 +894,9 @@ impl Ticket {
         // written only when set: a row from before prepaid tickets reads as a held one
         if self.prepaid {
             r["prepaid"] = true.into();
+        }
+        if self.win > 0 {
+            r["win"] = self.win.into();
         }
         r
     }
@@ -892,6 +917,10 @@ impl Ticket {
                     prepaid: match r.get("prepaid") {
                         None => false,
                         Some(v) => v.as_bool()?,
+                    },
+                    win: match r.get("win") {
+                        None => 0,
+                        Some(v) => v.as_u64().filter(|n| *n > 0)?,
                     } })
     }
 
@@ -900,7 +929,7 @@ impl Ticket {
         json!({"hash": self.hash, "state": self.state.as_str(), "msat": self.msat.to_string(), "booked_sats": self.booked_sats,
                "fee_msat": self.fee_msat.to_string(), "cltv_until": self.cltv_until, "final_expiry": self.final_expiry,
                "sent_ts": ts_value(self.sent_ts), "released_ts": ts_value(self.released_ts), "done_ts": ts_value(self.done_ts), "note": self.note,
-               "prepaid": self.prepaid})
+               "prepaid": self.prepaid, "win": self.win})
     }
 }
 
@@ -957,6 +986,18 @@ pub struct Session {
     /// Nothing is locked for this session before this time (0: no wait), and why.
     pub hold_until: f64,
     pub hold_why: String,
+    /// A session that pays by draws ([`crate::ticket_pay`]). It holds no ticket: `pool` is 0, and
+    /// `prepaid_msat` is the size of a win. `None`: a ticket session.
+    pub draws: Option<Draws>,
+}
+
+/// The seller's side of a session that pays by draws: the seller's own name for the session, which
+/// every draw of it binds, and the anchor of the chain the seller committed to, hex. Both are
+/// empty until the seller has answered the open.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Draws {
+    pub seller: String,
+    pub anchor: String,
 }
 
 /// The seller's side of a session the wallet pays over HTTP: the id and the key the seller gave in
@@ -990,6 +1031,9 @@ impl Session {
         }
         if self.slot_fails > 0 || self.hold_until > 0.0 || !self.hold_why.is_empty() {
             r["hold"] = json!({"fails": self.slot_fails, "until": ts_value(self.hold_until), "why": self.hold_why});
+        }
+        if let Some(d) = &self.draws {
+            r["draws"] = json!({"seller": d.seller, "anchor": d.anchor});
         }
         r
     }
@@ -1066,7 +1110,13 @@ impl Session {
                         None => 0.0,
                         Some(h) => h.get("until").and_then(Value::as_f64)?,
                     },
-                    hold_why: r.get("hold").map(|h| str_or_empty(h.get("why"))).unwrap_or_default() })
+                    hold_why: r.get("hold").map(|h| str_or_empty(h.get("why"))).unwrap_or_default(),
+                    draws: match r.get("draws") {
+                        None => None,
+                        // a row that says it pays by draws says all of it, or the row is damage
+                        Some(v) => Some(Draws { seller: v.get("seller")?.as_str()?.to_string(),
+                                                anchor: v.get("anchor")?.as_str().filter(|a| a.is_empty() || is_hex(a, 64))?.to_string() }),
+                    } })
     }
 
     pub fn public(&self) -> Value {
@@ -1074,7 +1124,7 @@ impl Session {
                "ticket_msat": self.ticket_msat.to_string(), "pool": self.pool, "state": self.state.as_str(), "opened_ts": ts_value(self.opened_ts),
                "stopped_ts": ts_value(self.stopped_ts), "closed_ts": ts_value(self.closed_ts), "why": self.why, "http": self.http.is_some(),
                "prepaid_msat": self.prepaid_msat.to_string(), "hold_until": ts_value(self.hold_until), "hold_why": self.hold_why,
-               "slot_fails": self.slot_fails})
+               "slot_fails": self.slot_fails, "draws": self.draws.is_some()})
     }
 }
 
@@ -1166,9 +1216,35 @@ impl Book {
         l
     }
 
-    /// The open session with this seller, if there is one.
+    /// The open ticket session with this seller, if there is one. A session that pays by draws
+    /// holds nothing with the seller's node and is found by [`Self::draws_open_with`].
     pub fn open_with(&self, payee: &str) -> Option<&Session> {
-        self.sessions.values().find(|s| s.state == SState::Open && s.payee == payee)
+        self.sessions.values().find(|s| s.state == SState::Open && s.payee == payee && s.draws.is_none())
+    }
+
+    /// The open session that pays this seller's node by draws at `origin`, if there is one. One
+    /// node may sell at several origins (a node that runs several services), and each is a
+    /// session of its own.
+    pub fn draws_open_with(&self, payee: &str, origin: &str) -> Option<&Session> {
+        self.sessions.values().find(|s| s.state == SState::Open && s.payee == payee && s.origin == origin && s.draws.is_some())
+    }
+
+    /// The payment of a win of a session that is in the book and has not failed: a win with one is
+    /// paid, or being paid, and gets no other.
+    pub fn win_payment(&self, session: &str, draw: u64) -> Option<&Ticket> {
+        self.tickets.values().find(|t| t.session == session && t.win == draw && draw > 0 && t.state != TState::Failed)
+    }
+
+    /// Wins paid, or being paid, to a seller's node under a task since `t`.
+    pub fn wins_since(&self, payee: &str, task: &str, t: f64) -> usize {
+        self.tickets.values().filter(|x| x.win > 0 && x.payee == payee && x.task == task && x.state != TState::Failed && x.ts >= t).count()
+    }
+
+    /// Whether a session of this book was opened on this chain anchor: a seller that gives one
+    /// anchor to two sessions lets their buyers know its values ahead, and a wallet that meets its
+    /// own anchor again is being shown a chain whose values it has seen.
+    pub fn anchor_seen(&self, anchor: &str) -> bool {
+        !anchor.is_empty() && self.sessions.values().any(|s| s.draws.as_ref().is_some_and(|d| d.anchor == anchor))
     }
 
     pub fn open_sessions(&self, task: Option<&str>) -> usize {
@@ -1215,7 +1291,7 @@ impl Book {
 
     /// A prepaid ticket of the session whose payment is not final: the next is bought only after it.
     pub fn prepaid_pending(&self, session: &str) -> Option<&Ticket> {
-        self.tickets.values().find(|t| t.session == session && t.prepaid && !t.state.terminal())
+        self.tickets.values().find(|t| t.session == session && t.prepaid && t.win == 0 && !t.state.terminal())
     }
 
     /// Held tickets that the node's channel list does not show yet (`on_node`: the payment
@@ -1645,13 +1721,13 @@ mod tests {
     }
 
     fn ticket(hash: u8, session: &str, state: TState, ts: f64) -> Ticket {
-        Ticket { hash: hex::encode([hash; 32]), nonce: [hash; 16], session: session.into(), payee: "p".into(), task: "t".into(), msat: 1_000_000,
+        Ticket { win: 0, hash: hex::encode([hash; 32]), nonce: [hash; 16], session: session.into(), payee: "p".into(), task: "t".into(), msat: 1_000_000,
                  fee_limit_msat: 15_000, state, ts, sent_ts: 0.0, invoice_expires: 0.0, released_ts: 0.0, booked_sats: 0, cltv_until: 0,
                  final_expiry: 300, fee_msat: 0, done_ts: 0.0, note: String::new(), prepaid: false }
     }
 
     fn session(id: &str, pool: u32) -> Session {
-        Session { id: id.into(), payee: "p".into(), origin: String::new(), task: "t".into(), listed: true, ticket_msat: 1_000_000, pool, max_tickets: 8,
+        Session { draws: None, id: id.into(), payee: "p".into(), origin: String::new(), task: "t".into(), listed: true, ticket_msat: 1_000_000, pool, max_tickets: 8,
                   ticket_blocks: 40, max_sats: 0, state: SState::Open, opened_ts: 1.0, active_ts: 1.0, stopped_ts: 0.0, closed_ts: 0.0, why: String::new(),
                   http: None, prepaid_msat: 0, slot_fails: 0, hold_until: 0.0, hold_why: String::new() }
     }
