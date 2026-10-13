@@ -654,6 +654,13 @@ impl Signer {
                         Err(d) => return fail(ds, d),
                     }
                 }
+                // the seller takes no more voids in this session (pieces of answers this wallet stopped reading): the
+                // session is over, and the call is made once more on a new one
+                if code == "too_many_voids" {
+                    self.draw_stop(ds, "the seller takes no more voids in this session", true);
+                    return fail(ds, with(refused("lottery_session_ended", "the seller ended this session: too many of its pieces were given no value; nothing was served \
+                                                                           for this request"), json!({"status": status, "seller_code": code})));
+                }
                 // the seller waits for wins this wallet will not pay again: each has a payment in its book that has not
                 // failed (its node cannot say what became of it). Such a session cannot go on. It ends, and the next
                 // call opens another; the payment stays booked until the node says
@@ -901,6 +908,27 @@ impl Signer {
         }
         let stop = lock(counted).stop.clone();
         let complete = stop.is_none() && mismatch.is_none() && read_error.is_none() && length.is_none_or(|l| l == sink.bytes);
+        // an answer that did not arrive whole: the seller may hold pieces of it open that will get no value (it
+        // marks a piece when its last bytes leave, and they did not arrive; or the wallet stopped giving values).
+        // They are named as void, so that they do not fill the seller's window for the session's next request
+        if !complete && ds.fault().is_none() {
+            let ahead = u64::from(ds.terms.window).min(1024) + 1;
+            let secs = if price.second_msat > 0 { head_at.elapsed().as_secs() + 1 } else { 0 };
+            let mut ids: Vec<PieceId> = vec![PieceId { seq, kind: Kind::Request, k: 0 }];
+            if by_bytes {
+                ids.extend((0..sink.bytes / piece_bytes + ahead).map(|k| PieceId { seq, kind: Kind::Bytes, k }));
+            }
+            ids.extend((0..secs + if secs > 0 { ahead } else { 0 }).map(|k| PieceId { seq, kind: Kind::Second, k }));
+            let open: Vec<PieceId> = {
+                let st = lock(&ds.state);
+                ids.into_iter().filter(|id| st.buyer.as_ref().is_some_and(|b| !b.knows(*id))).collect()
+            };
+            for chunk in open.chunks(64) {
+                if self.draw_round(ds, &[], chunk, false, counted).is_err() {
+                    break;
+                }
+            }
+        }
         let ended = match (&stop, mismatch, &read_error) {
             (_, Some(k), _) => Some(format!("stopped by the wallet: piece {k} is not the one whose hash the caller named; no value was given for it")),
             (Some(why), _, _) => Some(format!("stopped by the wallet: {why}")),

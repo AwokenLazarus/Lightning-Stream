@@ -2482,6 +2482,23 @@ fn the_owners_bounds_hold_for_draws_and_spend_is_what_the_node_paid() {
     assert!(v["complete"] == false && v["ended"].as_str().unwrap().contains("max_sats"), "{v}");
     assert!((8_000..=12_000).contains(&used), "{used} msat used of 10 sat: {v}");
     assert_wins(&r, v["wins_paid"].as_u64().unwrap());
+    // an answer the wallet stopped reading leaves pieces with the seller that will get no value: the wallet names
+    // them as void, so the session's next request is served. (Before it did, they filled the seller's window and
+    // every later request of the session was refused value_missing: seen on the lab after a node was killed in the
+    // middle of a download.) A seller takes so many voids a session; after that the wallet's call opens another
+    let mut wins = v["wins_paid"].as_u64().unwrap();
+    let mut sessions = std::collections::HashSet::new();
+    for n in 0..8 {
+        let next = r.pay("/tiny/10", 5);
+        assert_eq!((next["status"].as_u64(), next["rail"].as_str()), (Some(200), Some("lottery")), "after {n} stopped answers: {next}");
+        let cut = r.pay(&format!("/pieces/{}", 64 * PIECE), 10);
+        assert!(cut["status"] == 200 && cut["complete"] == false, "{cut}");
+        wins += next["wins_paid"].as_u64().unwrap() + cut["wins_paid"].as_u64().unwrap();
+        sessions.insert(cut["session"].as_str().unwrap().to_string());
+    }
+    assert!(!r.tap.seen("/x402/lottery/draw").iter().all(|s| serde_json::from_str::<Value>(&s.body).unwrap()["void"].as_array().is_none_or(Vec::is_empty)), "voids were sent");
+    assert!(sessions.len() <= 8, "{sessions:?}");
+    assert_wins(&r, wins);
     // velocity: a session of draws is one payment, however many wins it pays
     let r = draws_rig(json!({"velocity_max": 1, "tickets": {"lottery": {"max_odds_den": 2}}}));
     let mut wins = 0;

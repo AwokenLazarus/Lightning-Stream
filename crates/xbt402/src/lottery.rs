@@ -596,6 +596,11 @@ impl Buyer {
         self.pieces.insert(id)
     }
 
+    /// Whether this piece has had a value or a void.
+    pub fn knows(&self, id: PieceId) -> bool {
+        self.pieces.contains(&id)
+    }
+
     /// Check the seller's reveal of `c[drawn]` and work out every draw it covers. An error
     /// changes nothing. A reveal of the draw already checked, with the value already held, is
     /// the answer to a repeated message and covers nothing new.
@@ -1056,7 +1061,8 @@ mod tests {
         buyer.issue(p1, v1, 4).unwrap();
         assert_eq!(buyer.issue(p1, v2, 4).unwrap_err(), DrawError::PieceRepeated);
         assert_eq!(buyer.issue(p2, v1, 4).unwrap_err(), DrawError::ValueReused);
-        assert!(buyer.void(p3.id) && !buyer.void(p3.id) && !buyer.void(p1.id));
+        assert!(!buyer.knows(p3.id) && buyer.knows(p1.id));
+        assert!(buyer.void(p3.id) && !buyer.void(p3.id) && !buyer.void(p1.id) && buyer.knows(p3.id));
         assert_eq!(buyer.issue(p3, v2, 4).unwrap_err(), DrawError::PieceRepeated, "a voided piece gets no value");
     }
 
