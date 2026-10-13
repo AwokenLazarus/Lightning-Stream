@@ -8,7 +8,7 @@
 #
 # The file server is stock and unchanged; the signer, the MCP server and the gateways are the
 # release binaries of this tree, with the wallet's lottery policy and the gateway's lottery terms
-# as they ship (wins of 64 sat, a window of 8 pieces, a grace of 10 s and 64 pieces, 2 unpaid
+# as they ship (wins of 64 sat, a window of 8 pieces, a grace of 30 s and 64 pieces, 2 unpaid
 # wins); the nodes are Lightning Fork nodes, the hop and the seller started with
 # --default-remote-max-htlcs=30, so that the buyer's channel and the seller's inbound channel carry
 # 30 pending payments each: the slot count of a channel with a Core Lightning node at its default.

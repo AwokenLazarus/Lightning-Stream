@@ -646,6 +646,22 @@ impl Signer {
                         Err(d) => return fail(ds, d),
                     }
                 }
+                // the seller waits for wins this wallet will not pay again: each has a payment in its book that has not
+                // failed (its node cannot say what became of it). Such a session cannot go on. It ends, and the next
+                // call opens another; the payment stays booked until the node says
+                if code == "win_unpaid" {
+                    let listed: Vec<u64> = v.get("session").and_then(|x| x.get("wins")).and_then(Value::as_array).into_iter().flatten()
+                        .filter_map(|w| w.get("draw").and_then(Value::as_u64)).take(64).collect();
+                    let handed: Vec<u64> = {
+                        let st = lock(&ds.state);
+                        listed.iter().copied().filter(|d| st.handed.contains_key(d)).collect()
+                    };
+                    if !listed.is_empty() && handed.len() == listed.len() && handed.iter().all(|d| self.lottery_win_live(&ds.sid, *d)) {
+                        let stopped = self.draw_stop(ds, "a win's payment is not final on the wallet's node", true);
+                        return fail(ds, with(refused("lottery_win_in_doubt", "the seller waits for a win whose payment this wallet has booked and its node has neither                                                                               completed nor failed: it is not paid a second time. The session was ended; call again"),
+                                             json!({"status": status, "seller_code": code, "stopped": stopped})));
+                    }
+                }
                 return fail(ds, with(refused("lottery_refused", format!("the seller refused the request: HTTP {status} {code}; no piece was served for it")),
                                      json!({"status": status, "seller_code": code})));
             }

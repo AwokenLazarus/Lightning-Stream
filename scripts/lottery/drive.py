@@ -274,12 +274,24 @@ def money() -> dict[str, Any]:
     }
 
 
+def orphans() -> set[str]:
+    """Payments the buyer's node calls in flight with nothing on its channel. A node that is killed
+    in the instant it sends a payment can go on saying so, also after a restart (docs/LIMITS.md):
+    such a payment moved no money and holds no slot, and the wallet keeps it booked until its node
+    drops it."""
+    on_channel = {base64.b64decode(h["hash_lock"]).hex() for c in lab.channels(BUYER) for h in c["pending_htlcs"]}
+    return {h for h, p in e2e.buyer_payments().items() if p["status"] == "IN_FLIGHT" and h not in on_channel and h not in FOREIGN}
+
+
 def agrees(m: dict[str, Any]) -> bool:
     """To the millisat: the buyer's node paid what the seller's node received; every payment is a
     settled win in the wallet's book; and the ledger is each payment's amount and fee, with nothing
-    booked that the node has not paid."""
+    booked that the node has not paid, but for a payment the node itself left in flight with
+    nothing on its channel."""
+    left = orphans()
     return (m["buyer_node_paid_msat"] == m["seller_node_received_msat"] and m["wallet_book_settled"] == m["payments"]
-            and m["wallet_ledger_sats"] == m["buyer_node_cost_sats"] and m["booked_not_settled_sats"] == 0 and m["in_flight"] == 0)
+            and m["wallet_ledger_sats"] == m["buyer_node_cost_sats"] + m["booked_not_settled_sats"] and m["in_flight"] == len(left)
+            and (m["booked_not_settled_sats"] == 0) == (not left) and m["booked_not_settled_sats"] <= 80 * len(left))
 
 
 def once() -> dict[str, Any]:
@@ -295,7 +307,8 @@ def once() -> dict[str, Any]:
         if len(wins) != len(set(wins)):
             twice.append(sid)
     return {"settled_on_seller": len(settled), "paid_on_buyer": len(paid), "same_hashes": settled == paid, "paid_not_booked": sorted(h for h in paid if f"ticket:{h}" not in rows)[:3],
-            "booked_not_paid": sorted(t for t in rows if t.startswith("ticket:") and t[7:] not in paid)[:3], "a_win_paid_twice": twice}
+            "booked_not_paid": sorted(t for t in rows if t.startswith("ticket:") and t[7:] not in paid and t[7:] not in orphans())[:3], "a_win_paid_twice": twice,
+            "payments_the_node_left_in_flight_with_nothing_on_its_channel": len(orphans())}
 
 
 def stop_sessions() -> None:
@@ -372,10 +385,10 @@ def terms() -> None:
     schemes = [a["scheme"] for a in pr["accepts"]]
     entry = pr["accepts"][-1]
     x = entry.get("extra", {})
-    check("terms: the 402 lists held tickets, prepaid tickets and, last, the lottery: a win of 64 sat (16 at the least), paid after it by an invoice, the window, the grace and the piece size",
+    check("terms: the 402 lists held tickets, prepaid tickets and, last, the lottery: a win of 64 sat (16 at the least), paid after it by an invoice, the window of 8, the grace of 30 s and 64 pieces, and the piece size",
           status_code == 402 and schemes == ["ticket", "ticket", "lottery"] and entry["payTo"] == lab.pubkey(SELLER)
           and (x.get("winMsat"), x.get("minWinMsat"), x.get("pay"), x.get("window"), x.get("graceSeconds"), x.get("gracePieces"), x.get("maxUnpaidWins"), x.get("pieceBytes"))
-          == ("64000", "16000", "on-win", 8, 10, 64, 2, str(PIECE)),
+          == ("64000", "16000", "on-win", 8, 30, 64, 2, str(PIECE)),
           {"schemes": schemes, "lottery": {k: x.get(k) for k in ("winMsat", "minWinMsat", "pay", "release", "window", "graceSeconds", "gracePieces", "maxUnpaidWins", "chainDraws", "pieceBytes")}})
     tools = {t["name"]: t for t in agent().tools()}
     desc = tools["xbt402_pay"]["description"]
@@ -786,9 +799,11 @@ def liar() -> None:
 
 
 def next_call_pays(what: str) -> dict[str, Any]:
-    """After a kill and a restart: the next call is served by draws, or says plainly why not and a later one is."""
+    """After a kill and a restart: the next call is served by draws, or says plainly why not and a
+    later one is. (A win whose payment failed as a node died is paid with the seller's next invoice,
+    which comes when the first has lapsed, a minute at the gateway's default.)"""
     said = []
-    end = time.time() + 180
+    end = time.time() + 300
     while time.time() < end:
         try:
             r = pay(f"{ORIGIN}/small.txt", 10)
@@ -797,9 +812,9 @@ def next_call_pays(what: str) -> dict[str, Any]:
             time.sleep(2)
             continue
         if ok_draws(r):
-            return {"calls": len(said) + 1, "said_first": said[:3]}
+            return {"calls": len(said) + 1, "said_first": sorted(set(x.split(":")[0] for x in said))}
         said.append(f"{r.get('rule')}: {str(r.get('reason'))[:100]}")
-        time.sleep(2)
+        time.sleep(5)
     raise LabError(f"{what}: no call was served after the restart: {said[-3:]}")
 
 
@@ -827,7 +842,12 @@ def killed(victim: str) -> None:
 def settle_down() -> None:
     """After a kill: wait until every payment the wallet booked is final on its node, or is one the
     node never had (the wallet gives those up 90 s after they were sent)."""
-    lab.wait("every booked payment final", 240, lambda: int(status().get("booked_sats") or 0) == 0 and lab.pending_htlcs(BUYER) == 0, every=1)
+    def final() -> bool:
+        st = status()
+        open_in_book = {t["hash"] for sid in SESSIONS for t in status(sid).get("session_tickets", []) if t["state"] in ("sending", "locked", "released", "retired")}
+        return lab.pending_htlcs(BUYER) == 0 and st.get("synced") is True and open_in_book <= orphans()
+
+    lab.wait("every booked payment final", 300, final, every=2)
 
 
 def kill() -> None:

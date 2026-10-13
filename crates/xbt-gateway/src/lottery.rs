@@ -11,7 +11,7 @@
 //! | A piece is served only inside the window. | [`Book::blocked`]: no more than `window` pieces are open (served, with neither a value nor a void). | A buyer that sends no values: `window` pieces a session. |
 //! | A win is paid within the grace or the buyer is served nothing more. | [`Book::blocked`]: no win unpaid for more than `grace_seconds`, or once `grace_pieces` pieces were served since it was drawn, and at most `max_unpaid_wins` unpaid at once. Paid is the node's word ([`Book::win_paid`]), never the buyer's. | A buyer that never pays: what it was served up to its first win, and the grace. |
 //! | A piece is voided by a buyer that knows no result, and not without end. | [`Book::draw`]: more than `max_voids` voids stop the session. | A buyer that voids every piece: `max_voids` pieces a session. |
-//! | Sessions are capped in all and per address, and a quiet one is forgotten. | [`Book::open`], [`Book::sweep`]. A session costs its chain: `chain_draws` hashes to make and 32 bytes for every 1,024 of them to keep. | Anyone, since opening a session needs no payment: `max_sessions` chains. |
+//! | Sessions are capped in all and per address, and a quiet one is forgotten. | [`Book::open`], [`Book::sweep`]. A session costs its chain: `chain_draws` hashes to make, and one value in every 1,024 and the block last read to keep (34 KiB at the default length). | Anyone, since opening a session needs no payment: `max_sessions` chains. |
 //! | A chain is for one session. | [`Book::open`] makes each chain from fresh random bytes it is given and keeps it nowhere else. A session does not outlive the gateway's process: a restart forgets the chain with the values it revealed for. | Nobody. |
 use std::collections::{HashMap, VecDeque};
 
@@ -119,7 +119,9 @@ impl LotteryConfig {
             min_win_msat: num(m, "min_win_msat", win_msat.min(16_000))?,
             win_blocks: num32(m, "win_blocks", ticket_blocks)?,
             window: num32(m, "window", 8)?,
-            grace_seconds: num32(m, "grace_seconds", 10)?,
+            // a wallet pays 8 wins at a time (a channel may carry 30 pending payments): with 100 sellers of one
+            // buyer winning at once the last of them waited 13 s on the lab, and 10 s cut that seller's answer
+            grace_seconds: num32(m, "grace_seconds", 30)?,
             grace_pieces: num32(m, "grace_pieces", 64)?,
             max_unpaid_wins: num32(m, "max_unpaid_wins", 2)?,
             chain_draws: num32(m, "chain_draws", DEFAULT_CHAIN_DRAWS)?,
@@ -561,7 +563,7 @@ mod tests {
     fn the_defaults_are_the_drafts_numbers_and_a_wrong_file_is_refused() {
         let c = LotteryConfig::parse(&json!({}), 40).unwrap();
         assert_eq!((c.win_msat, c.min_win_msat, c.win_blocks, c.window), (64_000, 16_000, 40, 8));
-        assert_eq!((c.grace_seconds, c.grace_pieces, c.max_unpaid_wins, c.chain_draws), (10, 64, 2, 65_536));
+        assert_eq!((c.grace_seconds, c.grace_pieces, c.max_unpaid_wins, c.chain_draws), (30, 64, 2, 65_536));
         assert_eq!((c.piece_bytes, c.max_sessions, c.sessions_per_address, c.max_voids), (262_144, 64, 4, 16));
         assert_eq!((c.idle_secs, c.first_use_secs, c.invoice_secs), (300, 60, 60));
         assert_eq!(LotteryConfig::parse(&json!({"win_msat": 8000}), 40).unwrap().min_win_msat, 8000);

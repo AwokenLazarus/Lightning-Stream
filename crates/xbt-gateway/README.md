@@ -7,7 +7,9 @@ do is in `docs/LIMITS.md`, section "Seller gateway".
 
 Status: regtest only. It has run against Lightning Fork nodes on one host
 (`scripts/gateway_regtest.sh`) and against a stand-in node in its tests. Nobody outside the
-project has reviewed it. No wallet pays it yet: the buyer in the regtest script is a test buyer.
+project has reviewed it. The wallet of this tree pays it (`scripts/ticket_e2e_regtest.sh` with
+tickets, `scripts/lottery_regtest.sh` by draws); the buyer in `scripts/gateway_regtest.sh` is a
+test buyer.
 
 ## What it does with a request
 
@@ -100,6 +102,59 @@ model produced.
 - **Prepaid** (`"on-arrival"`): an ordinary invoice, paid in full when it arrives and never given
   back. It holds no slot. Buyers use it when no slot is free, and it is the only kind a config
   with `"settle": ["on-arrival"]` offers.
+
+## The lottery: pieces that cost less than a ticket
+
+Add a `lottery` section to the config and the gateway offers, beside tickets, to be paid by
+draws (`docs/TICKETS.md`, section 9). It is off unless you write the section: with it you serve
+first.
+
+```json
+"lottery": {"win_msat": 64000, "min_win_msat": 16000, "window": 8, "grace_seconds": 30,
+            "grace_pieces": 64, "max_unpaid_wins": 2, "piece_bytes": 262144}
+```
+
+A buyer in a lottery session locks nothing with your node. Each request, each `piece_bytes` of
+an answer priced by its size and each second of an answer priced by its time is a piece. After
+the piece the buyer sends a random value; the gateway reveals the next value of a chain it
+committed to when the session opened, and the two together decide whether the piece won. Most
+pieces win nothing. A piece that wins gets an ordinary invoice of `win_msat` from your node, and
+the buyer pays it at once. The odds are the piece's price over the win, so what you are paid is
+your price on average: a piece of a tenth of a sat wins a 64-sat payment one time in 640.
+
+A route is offered this way only if its dearest piece (its request, one second, or `piece_bytes`
+of its body) costs less than `win_msat`. `GET /services` says which routes are.
+
+What it costs you, and what bounds it:
+
+| What a buyer can do | What it gets | The setting |
+|---|---|---|
+| Send no values | `window` pieces a session, then `value_missing` | `window` (8); `max_sessions` (64) and `sessions_per_address` (4); a session that never sent a value is forgotten after `first_use_secs` (60) |
+| Send values and never pay a win | What it was served up to its first win, then the grace: `grace_pieces` more pieces, `grace_seconds`, or until more than `max_unpaid_wins` are unpaid, whichever comes first. Then `win_unpaid` until your node shows the wins paid | `win_msat` and the three grace settings |
+| Say a piece never arrived (`void`) | `max_voids` pieces a session (16) | `max_voids` |
+| Open sessions | A chain each: `chain_draws` hashes to make (65,536) and about 34 KiB to keep (one chain value in every 1,024, the block of 1,024 last read, and 8 bytes for every draw taken) | `max_sessions`, `idle_secs` (300) |
+
+Measured on regtest with the wallet of this tree and a buyer that never pays
+(`scripts/lottery_regtest.sh`, `cheat`): with pieces of a quarter of a sat and wins of 64 sat it
+was served 1.4 wins' worth on average before the gateway stopped it (ten sessions, 0.4 to 4.0).
+With pieces of a quarter of a win it was served 4.9 wins' worth (twenty sessions): the gateway
+bears two unpaid wins and serves 8 pieces ahead of the buyer's values. Where your buyers each
+earn you less than one win, a buyer that never pays has had everything free, and nothing on
+today's Lightning makes it pay. Your income is uneven too: a buyer that owes you less than a win
+usually pays you nothing, and sometimes a whole win.
+
+The rules it keeps, beside those of the table above:
+
+| Rule | Where |
+|---|---|
+| A chain is made for one session from fresh random bytes, and its anchor is sent before any value of the buyer's. A session lives in the process only: a restart forgets the chain with the values it revealed for. | `lottery.rs`, `Book::open`; `gateway/draws.rs`, `lottery_open` |
+| A piece waits for its value only once it has left. | `Gateway::lottery_route`, `lottery_pump` |
+| A value is taken only as the next draw, for a piece that was served, at its price, once. The chain value of a draw leaves only in the answer to the request that brought its value. | `xbt402::lottery::Seller::take`, `Book::draw` |
+| A win is paid when the node shows its invoice settled for the full amount, never on a buyer's word. One invoice for a win at a time; another only when the node has cancelled the first. | `Gateway::lottery_refresh`, `Book::claim_invoice` |
+| No piece is served outside the window or the grace. | `Book::blocked` |
+
+The fairness of the draw rests on an argument of this project's own that nobody else has
+reviewed (`docs/LIMITS.md`, "The lottery").
 
 ## What the defaults cost you
 

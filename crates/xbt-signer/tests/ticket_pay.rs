@@ -2604,6 +2604,21 @@ fn a_win_whose_payment_fails_is_owed_until_the_sellers_next_invoice_and_never_pa
     assert_wins(&r, again["wins_paid"].as_u64().unwrap());
     let settled: Vec<u64> = win_tickets(&r, &sid).iter().filter(|t| t["state"] == "settled").map(|t| t["win"].as_u64().unwrap()).collect();
     assert!(pending.iter().all(|d| settled.iter().filter(|s| *s == d).count() == 1), "each win that was owed has one payment that settled: {settled:?}");
+    // a payment the node can say nothing about for good (a node killed as it sent it can go on calling it in flight):
+    // the wallet does not pay that win again, the seller waits for it, and the session cannot go on. It ends plainly,
+    // the payment stays booked, and the next call is served in a new session
+    let r = draws_rig(json!({"ln": {"timeout_s": 1}, "tickets": {"lottery": {"max_odds_den": 2}}}));
+    r.ln.st.lock().unwrap().router_down = true;
+    let v = r.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
+    let in_doubt = v["wins_unpaid"].as_array().unwrap().iter().filter(|w| w["rule"] == "lottery_win_pending").count() as i64;
+    assert!(in_doubt >= 1, "{v}");
+    r.clock.fetch_add(31, Ordering::SeqCst);
+    let stuck = r.pay("/tiny/10", 5);
+    assert_eq!((stuck["verdict"].as_str(), stuck["rule"].as_str(), stuck["seller_code"].as_str()), (Some("deny"), Some("lottery_win_in_doubt"), Some("win_unpaid")), "{stuck}");
+    assert_eq!(r.session(v["session"].as_str().unwrap())["sessions"][0]["why"], "a win's payment is not final on the wallet's node");
+    let next = r.pay("/tiny/10", 5);
+    assert!(next["status"] == 200 && next["rail"] == "lottery" && next["session"] != v["session"], "{next}");
+    assert_eq!((r.ledger_sum(), r.ln.paid_msat(), r.shop.settled()), (in_doubt * 67, 0, 0), "booked for as long as the node cannot say, and nothing paid twice");
 }
 
 #[test]

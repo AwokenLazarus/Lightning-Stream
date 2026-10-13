@@ -513,7 +513,7 @@ knows only tickets skips an entry it cannot read.
  "extra": {"version": "lottery/0", "features": [512],
            "winMsat": "64000", "minWinMsat": "16000", "winBlocks": 40,
            "pay": "on-win", "release": "after-answer",
-           "window": 8, "graceSeconds": 10, "gracePieces": 64, "maxUnpaidWins": 2,
+           "window": 8, "graceSeconds": 30, "gracePieces": 64, "maxUnpaidWins": 2,
            "chainDraws": 65536, "pieceBytes": "262144",
            "receiptKey": "<33-byte public key>", "session": "/x402/lottery",
            "price": {"requestMsat": "0", "byteMsat": "100", "perBytes": "262144", "secondMsat": "0"}}}
@@ -563,8 +563,8 @@ PAYMENT-SIGNATURE: base64({"x402Version": 2, "accepted": <the lottery entry>,
   buyers know values ahead and lose on purpose. The gateway keeps a session and its chain in
   memory only, so a restart cannot bring a chain back.
 - The seller MUST cap sessions, in all and from one address, and forget a quiet one. A session
-  costs `chainDraws` hashes to make and 32 bytes for every 1,024 of them to keep, and anyone can
-  ask for one.
+  costs `chainDraws` hashes to make and about 34 KiB to keep at the default length (one chain value
+  in every 1,024 and the block last read), and anyone can ask for one.
 - The buyer MUST refuse an anchor it has been given before, and an answer that names another win
   size or chain length than it asked for.
 - The requests MUST go over TLS (or loopback): the session key travels in this answer.

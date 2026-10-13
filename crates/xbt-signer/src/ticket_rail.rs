@@ -69,9 +69,13 @@ pub const SEND_PARALLEL: usize = 8;
 /// then. Who waits here: the threads of lock rounds, of prepaid purchases and of wins, of which
 /// the owner's `tickets.max_sellers` and each seller's unpaid wins bound the number; each leaves
 /// within what the Lightning rail's `timeout_s` bounds.
+///
+/// In order of arrival: with a hundred sellers' wins waiting, whoever came first goes first, so
+/// that no seller's win waits behind a later one's until that seller's grace has run out.
 #[derive(Default)]
 pub struct Pace {
-    inside: Mutex<usize>,
+    /// `(inside, the next number to hand out, the number that goes in next)`.
+    state: Mutex<(usize, u64, u64)>,
     left: Condvar,
 }
 
@@ -79,25 +83,36 @@ pub struct PaceGuard<'a>(&'a Pace);
 
 impl Pace {
     pub fn enter(&self) -> PaceGuard<'_> {
-        let mut n = self.inside.lock().unwrap_or_else(|p| p.into_inner());
-        while *n >= SEND_PARALLEL {
-            n = self.left.wait(n).unwrap_or_else(|p| p.into_inner());
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let mine = s.1;
+        s.1 += 1;
+        while s.0 >= SEND_PARALLEL || s.2 != mine {
+            s = self.left.wait(s).unwrap_or_else(|p| p.into_inner());
         }
-        *n += 1;
+        s.0 += 1;
+        s.2 += 1;
+        // the one behind may go in too, if there is room
+        self.left.notify_all();
         PaceGuard(self)
     }
 
     /// How many are inside now.
     pub fn inside(&self) -> usize {
-        *self.inside.lock().unwrap_or_else(|p| p.into_inner())
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).0
+    }
+
+    /// How many wait to go in.
+    pub fn waiting(&self) -> u64 {
+        let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        s.1 - s.2
     }
 }
 
 impl Drop for PaceGuard<'_> {
     fn drop(&mut self) {
-        let mut n = self.0.inside.lock().unwrap_or_else(|p| p.into_inner());
-        *n = n.saturating_sub(1);
-        self.0.left.notify_one();
+        let mut s = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        s.0 = s.0.saturating_sub(1);
+        self.0.left.notify_all();
     }
 }
 
@@ -1977,6 +1992,34 @@ mod tests {
             panic!("the send died");
         }).join());
         assert!(died.is_err() && pace.inside() == 0);
+    }
+
+    #[test]
+    fn payments_go_through_the_gate_in_the_order_they_came() {
+        // 8 hold the gate; 40 more arrive one after another and wait; when the gate opens they go in as they came
+        let pace = Pace::default();
+        let order = Mutex::new(vec![]);
+        std::thread::scope(|sc| {
+            let holders: Vec<PaceGuard<'_>> = (0..SEND_PARALLEL).map(|_| pace.enter()).collect();
+            for i in 0..40u64 {
+                let (pace, order) = (&pace, &order);
+                sc.spawn(move || {
+                    let _inside = pace.enter();
+                    order.lock().unwrap().push(i);
+                    std::thread::sleep(Duration::from_millis(2));
+                });
+                // the next comes when this one is in the queue
+                while pace.waiting() <= i {
+                    std::thread::yield_now();
+                }
+            }
+            assert_eq!((pace.waiting(), pace.inside()), (40, SEND_PARALLEL));
+            drop(holders);
+        });
+        let order = order.into_inner().unwrap();
+        // 8 are inside at once, so neighbours may write in either order; nobody is overtaken by more than those beside it
+        assert!(order.iter().enumerate().all(|(at, i)| (at as i64 - *i as i64).unsigned_abs() < SEND_PARALLEL as u64), "{order:?}");
+        assert_eq!((pace.waiting(), pace.inside()), (0, 0));
     }
 
     #[test]
