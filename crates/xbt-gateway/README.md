@@ -130,7 +130,7 @@ What it costs you, and what bounds it:
 | What a buyer can do | What it gets | The setting |
 |---|---|---|
 | Send no values | `window` pieces a session, then `value_missing` | `window` (8); `max_sessions` (64) and `sessions_per_address` (4); a session that never sent a value is forgotten after `first_use_secs` (60) |
-| Send values and never pay a win | What it was served up to its first win, then the grace: `grace_pieces` more pieces, `grace_seconds`, or until more than `max_unpaid_wins` are unpaid, whichever comes first. Then `win_unpaid` until your node shows the wins paid | `win_msat` and the three grace settings |
+| Send values and never pay a win | What it was served up to its first win, then the grace: `grace_pieces` more pieces, `grace_seconds`, or until more than `max_unpaid_wins` are unpaid, whichever comes first. Then `win_unpaid` until your node shows the wins paid. An answer that is being sent stands still for the payment for `pay_wait_secs` (10) at the most, holding its connection and one of the server's threads, and is then cut short | `win_msat`, the three grace settings and `pay_wait_secs` |
 | Say a piece never arrived (`void`) | `max_voids` pieces a session (16) | `max_voids` |
 | Open sessions | A chain each: `chain_draws` hashes to make (65,536) and about 34 KiB to keep (one chain value in every 1,024, the block of 1,024 last read, and 8 bytes for every draw taken) | `max_sessions`, `idle_secs` (300) |
 

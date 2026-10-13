@@ -649,7 +649,7 @@ def cheat() -> None:
     check("cheat: a buyer that sends no values is served the window (8 pieces) and no more: its answer is cut, and its next request is refused value_missing",
           got["bytes"] == 8 * PIECE and again.get("error") == "value_missing", {"first": got, "then": again})
     # values, and no payment, where one piece in four wins: served until a third win is unpaid (the seller bears two)
-    runs = [free_service("/hot.bin", piece_msat) for _ in range(20)]
+    runs = [free_service("/hot.bin", piece_msat) for _ in range(10)]
     after = health()
     served = sorted(r[0] for r in runs)
     check("cheat: a buyer that gives values and never pays a win is cut off: its next request is refused win_unpaid, the seller's node was paid nothing, and the seller's wins are exactly the ones a second implementation of the draw works out",

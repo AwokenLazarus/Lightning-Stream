@@ -41,6 +41,10 @@ pub struct LotteryConfig {
     pub grace_seconds: u32,
     pub grace_pieces: u32,
     pub max_unpaid_wins: u32,
+    /// How long an answer that is being sent stands still for a win's payment before it is cut
+    /// short, in seconds, and never beyond that win's grace. An answer that stands still holds a
+    /// connection and one of the server's threads.
+    pub pay_wait_secs: u32,
     pub chain_draws: u32,
     /// The bytes of an answer that make one piece.
     pub piece_bytes: u64,
@@ -71,6 +75,7 @@ impl LotteryConfig {
                 "grace_seconds",
                 "grace_pieces",
                 "max_unpaid_wins",
+                "pay_wait_secs",
                 "chain_draws",
                 "piece_bytes",
                 "max_sessions",
@@ -124,6 +129,7 @@ impl LotteryConfig {
             grace_seconds: num32(m, "grace_seconds", 30)?,
             grace_pieces: num32(m, "grace_pieces", 64)?,
             max_unpaid_wins: num32(m, "max_unpaid_wins", 2)?,
+            pay_wait_secs: num32(m, "pay_wait_secs", 10)?,
             chain_draws: num32(m, "chain_draws", DEFAULT_CHAIN_DRAWS)?,
             piece_bytes: num(m, "piece_bytes", 262_144)?,
             max_sessions: num32(m, "max_sessions", 64)?,
@@ -391,11 +397,13 @@ impl Book {
         None
     }
 
-    /// How long the session's oldest unpaid win may still be waited for, in seconds: what is left
-    /// of `grace_seconds` since it was drawn. 0: none is unpaid, or the time is up.
+    /// How long an answer that is being sent may stand still for the session's oldest unpaid win,
+    /// in seconds: what is left of `grace_seconds` since it was drawn, and `pay_wait_secs` at the
+    /// most. 0: none is unpaid, or the time is up.
     pub fn grace_left(&self, session: &str, now: u64) -> u64 {
         let Some(s) = self.sessions.get(session) else { return 0 };
-        s.unpaid.iter().map(|w| w.drawn_at).min().map_or(0, |at| (at + u64::from(self.cfg.grace_seconds)).saturating_sub(now))
+        let left = s.unpaid.iter().map(|w| w.drawn_at).min().map_or(0, |at| (at + u64::from(self.cfg.grace_seconds)).saturating_sub(now));
+        left.min(u64::from(self.cfg.pay_wait_secs))
     }
 
     /// A piece has left for the buyer. A piece with no price is not a piece.
@@ -572,7 +580,7 @@ mod tests {
         assert_eq!((c.win_msat, c.min_win_msat, c.win_blocks, c.window), (64_000, 16_000, 40, 8));
         assert_eq!((c.grace_seconds, c.grace_pieces, c.max_unpaid_wins, c.chain_draws), (30, 64, 2, 65_536));
         assert_eq!((c.piece_bytes, c.max_sessions, c.sessions_per_address, c.max_voids), (262_144, 64, 4, 16));
-        assert_eq!((c.idle_secs, c.first_use_secs, c.invoice_secs), (300, 60, 60));
+        assert_eq!((c.idle_secs, c.first_use_secs, c.invoice_secs, c.pay_wait_secs), (300, 60, 60, 10));
         assert_eq!(LotteryConfig::parse(&json!({"win_msat": 8000}), 40).unwrap().min_win_msat, 8000);
         for bad in [
             json!({"win_msat": 999}),
@@ -692,6 +700,11 @@ mod tests {
         assert_eq!(b.blocked(&id, 2010), None);
         assert_eq!(b.blocked(&id, 2011), Some(Refusal::WinUnpaid), "grace_seconds");
         assert_eq!((b.grace_left(&id, 2000), b.grace_left(&id, 2004), b.grace_left(&id, 2010), b.grace_left(&id, 2999), b.grace_left("nobody", 0)), (10, 6, 0, 0, 0));
+        // an answer stands still for pay_wait_secs at the most, however long the grace
+        let mut patient = Book::new(LotteryConfig::parse(&json!({"grace_seconds": 300, "pay_wait_secs": 7, "chain_draws": 4096}), 40).unwrap());
+        let pid = open(&mut patient, 1, "a").unwrap();
+        until_win(&mut patient, &pid, 1, 48_000, 2000);
+        assert_eq!((patient.grace_left(&pid, 2000), patient.grace_left(&pid, 2296), patient.grace_left(&pid, 2300)), (7, 4, 0));
         // by pieces, on a fresh session: four more may be served and drawn for, the fifth is not
         let mut b = Book::new(cfg());
         let id = open(&mut b, 1, "a").unwrap();
