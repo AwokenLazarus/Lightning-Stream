@@ -953,15 +953,17 @@ impl Signer {
         let complete = stop.is_none() && mismatch.is_none() && read_error.is_none() && length.is_none_or(|l| l == sink.bytes);
         // an answer that did not arrive whole: the seller may hold pieces of it open that will get no value (it
         // marks a piece when its last bytes leave, and they did not arrive; or the wallet stopped giving values).
-        // They are named as void, so that they do not fill the seller's window for the session's next request
-        if !complete && ds.fault().is_none() {
+        // They are named as void, so that they do not fill the seller's window for the session's next request.
+        // And of any answer priced by the second: the seller counts its seconds on its own clock, which started a
+        // moment before the wallet's, so it may have begun one second more than the wallet gave a value for
+        if (!complete || price.second_msat > 0) && ds.fault().is_none() {
             let ahead = u64::from(ds.terms.window).min(1024) + 1;
             let secs = if price.second_msat > 0 { head_at.elapsed().as_secs() + 1 } else { 0 };
             let mut ids: Vec<PieceId> = vec![];
-            if price.request_msat > 0 {
+            if !complete && price.request_msat > 0 {
                 ids.push(PieceId { seq, kind: Kind::Request, k: 0 });
             }
-            if by_bytes {
+            if !complete && by_bytes {
                 ids.extend((0..sink.bytes / piece_bytes + ahead).map(|k| PieceId { seq, kind: Kind::Bytes, k }));
             }
             ids.extend((0..secs + if secs > 0 { ahead } else { 0 }).map(|k| PieceId { seq, kind: Kind::Second, k }));

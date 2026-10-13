@@ -111,7 +111,7 @@ impl Handler for Service {
         if let Some(n) = sized("/slow/") {
             return stream(n, Some(n as u64), body(n, 64 << 10, Duration::from_millis(15)));
         }
-        if let Some(n) = sized("/timed/") {
+        if let Some(n) = sized("/timed/").or_else(|| sized("/tick/")) {
             // n bytes, 1 KiB every 100 ms, with no length stated
             return stream(n, None, body(n, 1 << 10, Duration::from_millis(100)));
         }
@@ -134,6 +134,7 @@ fn routes() -> Value {
         // priced below a ticket: 2 sat for a piece of 64 KiB, half a sat for a request
         {"path": "/pieces/", "price": {"byte_msat": 2000, "per_bytes": 65_536}},
         {"path": "/tiny/", "price": {"request_msat": 500}},
+        {"path": "/tick/", "price": {"second_msat": 1000}},
         {"path": "/free/", "free": true}
     ])
 }
@@ -2765,6 +2766,31 @@ fn a_killed_signer_or_gateway_ends_a_session_of_draws_plainly_and_pays_no_win_tw
     r.clock.fetch_add(300, Ordering::SeqCst);
     assert_wins(&r, wins);
     assert_eq!(r.ledger_sum(), wins as i64 * WIN_SETTLED, "a payment that never reached the node is booked back");
+}
+
+#[test]
+fn an_answer_priced_by_the_second_is_a_draw_for_every_second_it_was_open() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let r = draws_rig(json!({}));
+    // 1 KiB every 100 ms with no length stated: 25 KiB is open for two and a half seconds, at 1 sat a second
+    let mut sid = String::new();
+    for n in 0..6 {
+        let t = Instant::now();
+        let v = r.pay("/tick/25600", 10);
+        let open = t.elapsed().as_secs();
+        assert_eq!((v["rail"].as_str(), v["status"].as_u64(), v["complete"].as_bool(), v["bytes"].as_u64()), (Some("lottery"), Some(200), Some(true), Some(25_600)), "{v}");
+        // a draw for each second that started while it was open, by the wallet's own clock
+        let draws = v["draws"].as_u64().unwrap();
+        assert!((open.max(2)..=open + 1).contains(&draws), "call {n}: {draws} draws for an answer open {open} s: {v}");
+        assert_eq!(v["price_msat"], (draws * 1000).to_string());
+        if n == 0 {
+            sid = v["session"].as_str().unwrap().to_string();
+        }
+        // the seller's clock started a moment earlier, so it may have begun a second the wallet gave no value for:
+        // the wallet names it as void, and six such answers in a row do not fill the seller's window of 8
+        assert_eq!(v["session"].as_str(), Some(sid.as_str()), "call {n} is served in the same session: {v}");
+    }
+    assert!(r.tap.seen("/x402/lottery/draw").iter().all(|s| !s.body.contains("\"bytes\"")), "no piece of bytes on a route priced by the second");
 }
 
 #[test]
