@@ -242,17 +242,29 @@ same checks of the node and its channels.
 
 policy.json `tickets` (all optional but `enabled` and one task): `enabled` (false), `max_ticket_sats`
 (1000), `max_ticket_blocks` (40), `max_htlc_blocks` (204: the `cltv_limit` of a ticket's route),
-`max_invoice_expiry_s` (3600), `max_locked_sats` (16000) and `max_locked_tickets` (64): the exposure cap;
-`seller_max_tickets` (8) and `seller_max_locked_sats` (8000): one named seller; `max_sellers` (32),
+`max_invoice_expiry_s` (3600), `max_locked_sats` (15000) and `max_locked_tickets` (15): the exposure cap,
+half of a channel that carries 30 pending payments; `seller_max_tickets` (2) and `seller_max_locked_sats`
+(2000): one named seller; `max_sellers` (15),
 `max_new_sellers_per_min` (30), `max_sends_per_hour` (1200); and `tasks`, by name (`a-z`, `0-9`, `-`,
 `_`): `budget_sats` (required), `window_s` (86400, at most a week), `max_locked_sats`,
 `max_locked_tickets`, `max_sellers` (each the rail's by default), `admit` (`"listed"`, the default: only
-sellers the owner named; `"any"`: any seller inside the caps that follow), `unlisted_max_tickets` (2),
+sellers the owner named; `"any"`: any seller inside the caps that follow), `unlisted_max_tickets` (1),
 `unlisted_max_locked_sats` (two tickets), `unlisted_max_spend_sats` (four tickets, in the task's
-window). The pool: `pool` (8 unreleased tickets with a seller), `pool_many` (2, with each seller of a
-task that has more than `many_sellers`, 8), `floor_ticket_sats` (64, the smallest ticket the wallet
-chooses by itself). `velocity` (`"release"`, the default: every release is one payment for
-`velocity_max`; `"session"`: a session is one). For the payer under `xbt402_pay`: `http_idle_s` (120),
+window). The pool: `pool` (2 unreleased tickets with a seller; the next is locked when half of a pool or
+fewer are left), `pool_many` (1, with each seller of a task that has more than `many_sellers`, 4),
+`floor_ticket_sats` (546: no ticket is held below it, and a lower number does not lower it). `velocity`
+(`"session"`, the default: a ticket session is one payment for `velocity_max`; `"release"`: every
+release is one). These defaults changed on 2026-10-13 (they were 8, 2, 8, 64 and `"release"`, with 64
+tickets and 16,000 sat locked in all): a policy that sets none of them now means the new ones.
+
+Whatever the policy says, before every lock the signer reads its node's channel list and holds a ticket
+only if it is not below the dust limit of a channel it may leave on (`ticket_dust`) and if, with it, the
+payments pending on such a channel stay within half of the slots the channel carries (`ticket_slots`;
+30 slots where the listing does not say). A lock that fails as a full channel does makes the session
+hold less and wait (`held_less` in the reply of `ticket_lock`; `hold_until`, `hold_why`, `slot_fails`
+and `pool` in a session of `ticket_status`). Prepaid tickets (`settle: "on-arrival"` in a seller's
+terms) are bought by the payer under `xbt402_pay` only; `ticket_open` takes the seller's entry for them
+as `prepaid_terms` and answers `prepaid_msat`, and no socket method buys one. For the payer under `xbt402_pay`: `http_idle_s` (120),
 `ready_wait_ms` (3000), `read_timeout_s` (30), `max_answer_s` (50). The owner names a seller with
 `ln:<node id>` on the allowlist, or with an allowlisted origin whose `counterparties` entry has
 `ln_node`. The wallet's own rules (the daily and weekly budgets, the per-counterparty cap, velocity,

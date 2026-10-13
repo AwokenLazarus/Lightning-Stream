@@ -7,8 +7,11 @@ Run by scripts/ticket_e2e_regtest.sh, which brings up the chain node and builds 
                                                   buyer     hop     seller
 
 What is real: the signer, the MCP server and the gateway (the release binaries of this tree), three
-Lightning Fork nodes with default settings, and a stock `python3 -m http.server` behind the gateway
-that knows nothing of payments. What this file plays:
+Lightning Fork nodes, and a stock `python3 -m http.server` behind the gateway that knows nothing of
+payments. The wallet's policy sets no pool and the gateway's config no cap on held tickets: both as
+they ship (2 tickets a session; 15 held in all). The hop and the seller accept 30 pending payments
+from a peer, so the buyer's channel and the seller's inbound channel carry 30: the slot count of a
+channel with a Core Lightning node at its default. What this file plays:
 
   the agent   `Mcp`: an MCP client on the wallet's stdio server. Every payment in every check is one
               `xbt402_pay` tool call with a URL; the wallet does the rest.
@@ -26,6 +29,9 @@ funding proof), lf2->lf3 of 5,000,000 sat. A ticket is 1,000 sat for 40 blocks; 
             four counts of money
   liar      seven lies, each at most one ticket and booked exactly
   kill      five things killed at two points of a session each
+  slots     the 30-slot channel: with half of the buyer's channel taken by others the wallet holds
+            nothing and buys prepaid tickets; a seller at its cap says slots_short and is paid the
+            same way; a lock that finds no slot on the way makes the session hold less and wait
 
 Usage: drive.py [check ...]   (all, in this order, when none is named)
 Environment: LAB, RUN, OUT, BIN, TICKET_E2E_PORT_BASE (see the shell script).
@@ -138,8 +144,9 @@ class Wallet:
             "regtest_mine": False,
             "anchor_interval_s": 3600,
             "ln": {"enabled": True, "split_height": SPLIT},
-            # a session is one payment for velocity_max: a 100 MB file is twenty releases
-            "tickets": {"enabled": True, "velocity": "session", "max_new_sellers_per_min": 200, "max_sends_per_hour": 100_000, "max_answer_s": 120,
+            # as shipped a session is one payment for velocity_max (a 100 MB file is twenty releases), a session holds
+            # 2 tickets and the wallet 15 in all: none of that is set here
+            "tickets": {"enabled": True, "max_new_sellers_per_min": 200, "max_sends_per_hour": 100_000, "max_answer_s": 120,
                         "tasks": {"film": {"budget_sats": 3_000_000}}},
         }
 
@@ -707,9 +714,14 @@ def page() -> None:
         lab.wait("the book and the node to agree", 10, lambda: status()["node"]["agree"] is True, every=0.2)
     except LabError:
         pass
+    # one of the two was released, so the next was locked behind the call
+    try:
+        lab.wait("the refill behind the call", 15, lambda: status()["locked"]["tickets"] == 2 and status()["node"]["agree"] is True, every=0.1)
+    except LabError:
+        pass
     st = status()
-    check("page: seven tickets stay locked and unreleased, and the wallet's book is its node's payments in flight",
-          st["locked"] == {"tickets": 7, "sats": 7000} and st["node"]["agree"] is True and in_flight() == 7 and held() == 7,
+    check("page: one ticket was left and the next was locked behind the call: two are locked and unreleased again, and the wallet's book is its node's payments in flight",
+          st["locked"] == {"tickets": 2, "sats": 2000} and st["node"]["agree"] is True and in_flight() == 2 and held() == 2,
           {"locked": st["locked"], "node": st["node"], "buyer_in_flight": in_flight(), "seller_held": held()})
     # a first request on a new session: the unpaid request, the pool locked through the hop, the seller's word, one release, the paid request
     firsts = [round(first, 3)]
@@ -721,7 +733,7 @@ def page() -> None:
         if not call_paid(r) or r.get("tickets_released") != 1:
             raise LabError(f"a first request: {brief(r)}")
     measured("first_request_s", firsts)
-    check("page: a first request, with the pool of 8 tickets locked through one hop, completes in 1 s (median of 5 new sessions, timed around the MCP tool call)",
+    check("page: a first request, with the pool of 2 tickets locked through one hop, completes in 1 s (median of 5 new sessions, timed around the MCP tool call)",
           statistics.median(firsts) <= 1.0, {"median_s": statistics.median(firsts), "each_s": firsts})
 
 
@@ -902,7 +914,8 @@ def liar() -> None:
 def next_call_pays(what: str) -> dict[str, Any]:
     """After a kill and a restart: the next call pays, or says plainly why not and the one after pays."""
     said = []
-    for _ in range(6):
+    end = time.time() + 150
+    while time.time() < end:
         try:
             r = pay(f"{ORIGIN}/small.txt")
         except LabError as e:
@@ -910,9 +923,10 @@ def next_call_pays(what: str) -> dict[str, Any]:
             time.sleep(2)
             continue
         if call_paid(r):
-            return {"calls": len(said) + 1, "said_first": said}
+            return {"calls": len(said) + 1, "said_first": said, "prepaid": r.get("tickets_prepaid")}
         said.append(f"{r.get('rule')}: {str(r.get('reason'))[:100]}")
-        time.sleep(2)
+        # a lock that failed while a node was coming back makes the wallet wait before it locks again, and says how long
+        time.sleep(min(max(float(r.get("retry_after_s") or 2), 2), 35))
     raise LabError(f"{what}: no call paid after the restart: {said}")
 
 
@@ -985,7 +999,113 @@ def kill() -> None:
               {"the_call_ended": str(how)[:160], "bytes": result.get("bytes"), "next": resumed, **inv, "ledger_sats": m["wallet_ledger_sats"], "node_cost_sats": m["buyer_node_cost_sats"]})
 
 
-CHECKS = {"page": page, "latency": latency, "stream": stream, "liar": liar, "kill": kill}
+def session_of(r: dict[str, Any]) -> dict[str, Any]:
+    return next((x for x in status().get("sessions", []) if x.get("session") == r.get("session")), {})
+
+
+def events(kind: str, session: str = "") -> list[dict[str, Any]]:
+    return [e for e in signer("history", {"limit": 5000})["events"] if e.get("type") == kind and (not session or e.get("session") == session)]
+
+
+def gateway_health() -> dict[str, Any]:
+    return json.loads(send("GET", "/x402/ticket/health", GW_PORT)[2])
+
+
+def wallet_in_flight(others: int) -> int:
+    """Payments pending on the buyer's channel beyond the `others` the lab put there."""
+    return sum(len(c["pending_htlcs"]) for c in lab.channels(BUYER)) - others
+
+
+def slots() -> None:
+    stop_sessions()
+    chan = lab.channels(BUYER)[0]
+    listed = {k: chan[k]["max_accepted_htlcs"] for k in ("local_constraints", "remote_constraints")}
+    measured("buyer_channel", dict(listed, commitment_type=chan.get("commitment_type"), dust_limit_sat={k: chan[k]["dust_limit_sat"] for k in ("local_constraints", "remote_constraints")}))
+    # 1. as shipped, with the channel empty
+    r = pay(f"{ORIGIN}/small.txt")
+    opened = events("ticket_open", str(r.get("session")))
+    h = gateway_health()
+    check("slots: on a channel that carries 30 the wallet holds 2 tickets with the seller, and the gateway holds at most 15 for all buyers",
+          call_paid(r) and session_of(r).get("pool") == 2 and bool(opened) and opened[0].get("slots") == 30 and min(int(v) for v in listed.values()) == 30 and h["maxHeld"] == 15,
+          {"pool": session_of(r).get("pool"), "slots_read_by_the_wallet": opened[0].get("slots") if opened else None, "node_lists": listed, "gateway_max_held": h["maxHeld"]})
+    stop_sessions()
+    # 2. half of the buyer's channel is taken by payments that are no ticket of the wallet's
+    others, _ = lab.lock(BUYER, SELLER, 15, secs=60)
+    t0 = time.monotonic()
+    r = pay(f"{ORIGIN}/small.txt")
+    first = time.monotonic() - t0
+    st = status()
+    check("slots: with 15 payments of others pending on its channel, half of the 30, the wallet holds no ticket and buys a prepaid one: the page is paid and nothing of the wallet's stays pending",
+          call_paid(r) and r.get("tickets_prepaid") == 1 and r.get("tickets_released") == 1 and st["locked"]["tickets"] == 0 and wallet_in_flight(15) == 0
+          and session_of(r).get("pool") == 0 and session_of(r).get("hold_why") == "ticket_slots",
+          {**brief(r), "session": {k: session_of(r).get(k) for k in ("pool", "hold_why", "prepaid_msat")}, "pending_on_the_channel": wallet_in_flight(0)})
+    measured("slots_first_request_prepaid_s", round(first, 3))
+    peak = [0]
+    done = threading.Event()
+
+    def watch() -> None:
+        while not done.is_set():
+            peak[0] = max(peak[0], wallet_in_flight(15))
+            time.sleep(0.02)
+
+    watcher = threading.Thread(target=watch, daemon=True)
+    watcher.start()
+    t0 = time.monotonic()
+    r2 = pay(f"{ORIGIN}/big.bin", max_sats=5_000)
+    took = time.monotonic() - t0
+    done.set()
+    watcher.join(5)
+    n = int(r2.get("tickets_released") or 0)
+    check("slots: a file is paid for with prepaid tickets bought one at a time as the balance runs out: never more than one payment of the wallet's is pending beside the 15, and never more than half the channel plus one",
+          r2.get("verdict") == "allow" and str(r2.get("ended", "")).startswith("stopped by the wallet: max_sats") and n >= 4 and r2.get("tickets_prepaid") == n and peak[0] <= 1,
+          {**brief(r2), "most_pending_of_the_wallets": peak[0], "seconds": round(took, 2)})
+    if n:
+        measured("slots_prepaid_stream_s_per_ticket", round(took / n, 3))
+    if r2.get("saved_to"):
+        os.remove(r2["saved_to"])
+    lab.cancel_all(SELLER, others)
+    stop_sessions()
+    # 3. the seller holds as many tickets as it will: other buyers have asked for its 15 places and not paid
+    crowd = 0
+    while gateway_health()["heldTickets"] < 15:
+        body = json.dumps({"version": "ticket/0", "hashes": [secrets.token_bytes(32).hex() for _ in range(2)]}).encode()
+        code, _, raw = send("POST", "/x402/ticket/lock", GW_PORT, {"Content-Type": "application/json"}, body)
+        if code != 200:
+            raise LabError(f"a lock of the lab's own: {code} {raw[:200]!r}")
+        crowd += 1
+    r = pay(f"{ORIGIN}/small.txt")
+    held_by = events("ticket_hold", str(r.get("session")))
+    check("slots: a seller at its cap of 15 held tickets says slots_short before it issues anything: the wallet waits the 30 s it names before it asks for a held ticket again, and pays this page with a prepaid one",
+          call_paid(r) and r.get("tickets_prepaid") == 1 and session_of(r).get("hold_why") == "ticket_slots_short" and len(held_by) == 1 and in_flight() == 0,
+          {**brief(r), "sessions_of_other_buyers": crowd, "session": {k: session_of(r).get(k) for k in ("pool", "hold_why")}})
+    lab.wait("the other buyers' unpaid tickets to lapse", 120, lambda: gateway_health()["heldTickets"] == 0, every=1)
+    stop_sessions()
+    # 4. a channel on the way with one slot left: 29 of the seller's 30 are taken by payments from the hop itself
+    blockers, _ = lab.lock(HOP, SELLER, 29, secs=120)
+    r = pay(f"{ORIGIN}/small.txt")
+    failures = events("ticket_slot_failure", str(r.get("session")))
+    reasons = sorted({p.get("failure_reason", "") for p in buyer_payments().values() if p["status"] == "FAILED"} - {"FAILURE_REASON_INCORRECT_PAYMENT_DETAILS"})
+    s1 = session_of(r)
+    check("slots: with one slot left on the seller's channel one of the wallet's two tickets locks and the other fails on the wallet's node as a full channel does: the page is paid, and the session holds one ticket from now on and waits before it locks again",
+          call_paid(r) and len(failures) == 1 and failures[0].get("slot_failed") == 1 and failures[0].get("pool") == 1 and s1.get("pool") == 1 and s1.get("hold_why") == "ticket_slots",
+          {**brief(r), "failure": failures[:1], "the_node_said": reasons, "session": {k: s1.get(k) for k in ("pool", "hold_why", "slot_fails")}})
+    measured("slots_full_channel_failure_reasons", reasons)
+    # what the wallet does next is the node's to allow: a payment through a channel that just failed can be refused by
+    # the node's own routing for a while. Either a prepaid ticket pays, or the call says why not; nothing is lost
+    r2 = pay(f"{ORIGIN}/big.bin", max_sats=3_000)
+    measured("slots_after_a_failed_lock", {"verdict": r2.get("verdict"), "rule": r2.get("rule"), "tickets_released": r2.get("tickets_released"), "tickets_prepaid": r2.get("tickets_prepaid"),
+                                          "ended": str(r2.get("ended"))[:160], "reason": str(r2.get("reason"))[:200]})
+    if r2.get("saved_to"):
+        os.remove(r2["saved_to"])
+    lab.cancel_all(SELLER, blockers)
+    stop_sessions()
+    quiet()
+    m = money()
+    check("slots: after all of it, what the buyer's node paid, what the seller's node received, what the wallet's book holds as settled and what the seller's receipts say are one number, and the ledger is each ticket and its fee",
+          agrees(m), m)
+
+
+CHECKS = {"page": page, "latency": latency, "stream": stream, "slots": slots, "liar": liar, "kill": kill}
 
 
 def main() -> int:

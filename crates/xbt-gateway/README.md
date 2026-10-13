@@ -35,6 +35,19 @@ The first makes, follows, settles and cancels invoices. The second reads the blo
 the first cannot, and which the gateway needs to keep a ticket's last 24 blocks unused. Neither
 can send coins, pay, open a channel or bake a macaroon.
 
+A third is your choice, and the gateway does not ask for it:
+
+```bash
+lncli bakemacaroon offchain:read --save_to channels.macaroon   # node.channels_macaroon
+```
+
+With it the gateway reads your node's channel list before it issues a held ticket: its cap on
+held tickets becomes half of what your smallest active channel carries, and it issues none while
+any channel is half full of pending payments. Know what you hand over: `offchain:read` also
+shows your channel balances, your node's payments and what it forwarded, to whoever has the
+gateway's files. Without it the gateway keeps to the numbers in its config, which assume a
+channel that carries 30 pending payments.
+
 ```bash
 cargo build --release -p xbt-gateway
 target/release/xbt-gateway --check gateway.json   # reads the config and the macaroons, says what the caps cost
@@ -72,15 +85,39 @@ model produced.
 | Without a block height from the node that is at most 10 seconds old, no secret is taken. | `Gateway::known_height` |
 | A charge comes out of what was released and not spent; an answer the service did not give is not charged. | `Book::charge`, `Gateway::route` |
 | Sessions, sessions per address and unreleased tickets are capped before the node is asked for anything. | `Book::lock` |
+| Held tickets, all sessions together, stop at half of the pending payments one inbound channel carries (15 of 30); a buyer beyond that is told `slots_short` and when to come back, and has no session. | `Book::lock`, `Gateway::slot_room` |
+| A held ticket is at least 546 sat: below a channel's dust limit it could not be claimed on chain. | `config.rs` |
+| A prepaid ticket is credited once, when the node shows its invoice settled in full: on the buyer's preimage, or by the sweep. | `Gateway::take_prepaid`, `Book::settled` |
 | Only the headers and methods you allowed reach your service; nothing it answers is read for money. | `upstream.rs` |
+
+## Two kinds of ticket
+
+`tickets.settle` lists what your terms offer; the default is both.
+
+- **Held** (`"on-use"`): a hold invoice for the buyer's hash, settled when the buyer uses it and
+  given back when it does not. A session holds 2 (`tickets.max_tickets`). Each takes one of the
+  pending payments ("slots") of the channel it arrives on until it is used or cancelled.
+- **Prepaid** (`"on-arrival"`): an ordinary invoice, paid in full when it arrives and never given
+  back. It holds no slot. Buyers use it when no slot is free, and it is the only kind a config
+  with `"settle": ["on-arrival"]` offers.
 
 ## What the defaults cost you
 
-Buyers can hold up to 30 sessions of 8 tickets of 1,000 sat: 240,000 sat of your node's inbound
-capacity and 240 of a channel's 483 HTLC slots, at no fee to them, until they use the tickets or
-the gateway cancels them (1 minute for a session that never released a secret, 5 minutes after a
-session's last paid request, and when a ticket reaches its last 24 blocks). `--check` prints the
-figure for your config. Lower `caps.max_sessions` if your node has less inbound capacity.
+A channel carries a fixed number of pending payments each way, for everyone who pays over it:
+483 between Lightning Fork nodes, 30 where either end is a Core Lightning node at its default.
+When they are all taken, nobody can pay you over that channel. So buyers can hold up to 15
+tickets of 1,000 sat between them (`caps.max_held_tickets`, half of `caps.inbound_slots`, which
+is 30 unless you say more): 15,000 sat of your node's inbound capacity and 15 slots, at no fee to
+them, until they use the tickets or the gateway cancels them (1 minute for a session that never
+released a secret, 5 minutes after a session's last paid request, and when a ticket reaches its
+last 24 blocks). The sixteenth ticket is not issued: its buyer is told `slots_short` and to come
+back in 30 seconds, or buys a prepaid ticket. `--check` prints the figures for your config.
+
+If every inbound channel of your node carries more, set `caps.inbound_slots` to what the smallest
+carries (483 for Lightning Fork peers) and the cap follows. A cap above half of that is refused
+unless you also write `"held_over_half": true`, which is for a node with several inbound
+channels: the buyer's node chooses the channel a ticket arrives on, so the gateway cannot spread
+tickets over your channels, and a cap sized for several can fill one.
 
 ## Measured
 
@@ -94,6 +131,6 @@ minutes, 40 checks); the report is `run/gateway_regtest.json`. From five runs:
 | A paid request that carries a secret (one settle on the node), median of 32 | 3.4 to 6.0 ms more | `latency` |
 | The longest a secret waited for its settle | 19 ms | `latency` |
 | A 100 MB file at 200,000 msat per MiB, the buyer releasing one ticket at a time and stopping after ten | 52,428,800 bytes: what ten tickets pay for, to the byte; 10,010 msat in routing fees | `fetch` |
-| 2,000 lock requests against a cap of 6 sessions | 6 served, 1,994 refused, 48 invoices on the node | `flood` |
-| A buyer that locks 8 tickets and releases none, limit set to 15 s | its tickets cancelled after 16 s | `flood` |
+| 2,000 lock requests against a cap of 6 sessions of 8 tickets (the caps before 2026-10-13) | 6 served, 1,994 refused, 48 invoices on the node | `flood` |
+| A buyer that locks 8 tickets and releases none, limit set to 15 s (before 2026-10-13) | its tickets cancelled after 16 s | `flood` |
 | A restart of the gateway with tickets locked | back in 0.05 s, the tickets still good | `restart` |

@@ -6,8 +6,12 @@
 #   lf1 REST       127.0.0.1:${LN_TICKET_PORT_LF1:-17962}    the buyer: the wallet's Lightning node
 #   lf2 REST       127.0.0.1:${LN_TICKET_PORT_LF2:-17963}    the routing hop
 #   lf3 REST       127.0.0.1:${LN_TICKET_PORT_LF3:-17964}    the seller: the gateway runs beside it, on the host
-# lf1 and lf2 keep the lab's own command lines (default node settings). lf3 is the same image with
-# the same settings; the lab defines only two nodes on this chain.
+# lf1 keeps the lab's own command line (default node settings). lf2 has the lab's command line and
+# lf3 the same settings (the lab defines only two nodes on this chain), each with one setting more:
+# --default-remote-max-htlcs=30. The hop and the seller then accept 30 pending payments from a
+# peer, so the buyer's channel and the seller's inbound channel carry 30 each: the slot count of a
+# channel with a Core Lightning node at its default. A stand-in for that number only: no Core
+# Lightning node is in this lab (one also limits what it sends, and its dust limit is 546 sat).
 services:
   knots-b2b:
     cpus: 2
@@ -18,6 +22,29 @@ services:
   lf2:
     cpus: 2
     ports: ["127.0.0.1:${LN_TICKET_PORT_LF2:-17963}:8080"]
+    # the lab's own list (lightning-fork-lab a5cadc5, docker-compose.yml) and the last line
+    command:
+      - --noseedbackup
+      - --bitcoin.regtest
+      - --bitcoin.node=bitcoind
+      - --bitcoin.blake2b-activation-height=${ACTIVATION_HEIGHT:-20}
+      - --fee.url=http://fees:8080/fees.json
+      - --bitcoind.rpchost=knots-b2b:18443
+      - --bitcoind.rpcuser=lab
+      - --bitcoind.rpcpass=lab
+      - --bitcoind.rpcpolling
+      - --bitcoind.blockpollinginterval=2s
+      - --bitcoind.txpollinginterval=2s
+      - --rpclisten=0.0.0.0:10009
+      - --restlisten=0.0.0.0:8080
+      - --listen=0.0.0.0:9735
+      - --externalip=lf2:9735
+      - --tlsextradomain=lf2
+      - --alias=lf2
+      - --debuglevel=info,PEER=debug,FNDG=debug
+      - --protocol.simple-taproot-chans
+      - --accept-keysend
+      - --default-remote-max-htlcs=30
   lf3:
     image: lightning-fork:dev
     restart: "no"
@@ -44,6 +71,7 @@ services:
       - --externalip=lf3:9735
       - --tlsextradomain=lf3
       - --alias=lf3
+      - --default-remote-max-htlcs=30
       - --debuglevel=info
     volumes:
       - lf3-data:/root/.lnd

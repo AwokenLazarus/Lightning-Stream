@@ -1855,7 +1855,11 @@ mod tests {
         );
         // held tickets of the session do not use up its prepaid ones, nor the other way round
         let mixed = b.lock("b", Some(&g.session), &[hash(20)], false, &ent(0), 0);
-        assert_eq!(mixed, Err(Refusal::SlotsShort(30)), "the one held place is another session's");
+        assert_eq!(
+            mixed,
+            Err(Refusal::SlotsShort(30)),
+            "the one held place is another session's"
+        );
         // the session's own cap bounds what it can have issued and not paid
         let g2 = b
             .lock(

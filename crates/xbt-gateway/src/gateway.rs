@@ -1205,6 +1205,7 @@ impl Gateway {
         json_response(
             200,
             &json!({"height": s.height, "sessions": s.sessions, "activeSessions": s.active_sessions, "heldTickets": s.held_tickets,
+                    "maxHeld": s.max_held, "prepaidTickets": s.prepaid_tickets,
                     "heldMsat": (s.held_tickets as u64).saturating_mul(self.cfg.caps.ticket_msat).to_string(), "settled": s.settled, "settleMaxUs": s.settle_max_us}),
         )
     }

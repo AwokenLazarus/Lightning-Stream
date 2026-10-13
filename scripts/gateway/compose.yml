@@ -5,8 +5,11 @@
 #   lf1 REST  127.0.0.1:${GATEWAY_PORT_LF1:-17831}   the buyer
 #   lf2 REST  127.0.0.1:${GATEWAY_PORT_LF2:-17832}   the routing hop
 #   lf3 REST  127.0.0.1:${GATEWAY_PORT_LF3:-17833}   the seller: the gateway runs beside it, on the host
-# lf1 and lf2 keep the lab's own command lines (default node settings). lf3 is the same image with
-# the same settings; the lab defines only two nodes on this chain.
+# lf1 and lf2 keep the lab's own command lines (default node settings). lf3 is the same image (the
+# lab defines only two nodes on this chain) with one setting more: --default-remote-max-htlcs=30,
+# so that the seller's inbound channel carries 30 pending payments, the slot count of a channel
+# with a Core Lightning node at its default. A stand-in for that number only: no Core Lightning
+# node is in this lab.
 services:
   knots-b2b:
     cpus: 2
@@ -42,6 +45,7 @@ services:
       - --externalip=lf3:9735
       - --tlsextradomain=lf3
       - --alias=lf3
+      - --default-remote-max-htlcs=30
       - --debuglevel=info
     volumes:
       - lf3-data:/root/.lnd

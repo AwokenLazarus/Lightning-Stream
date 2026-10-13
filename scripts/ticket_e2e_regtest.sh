@@ -7,15 +7,23 @@
 #     (the driver)   (MCP, stdio)    (the wallet)   buyer     hop     seller                 (python3 -m http.server)
 #
 # The file server is stock and unchanged; the signer, the MCP server and the gateway are the release
-# binaries of this tree; the nodes are Lightning Fork nodes with default settings. It prints PASS or
-# FAIL for each check with what it saw:
-#   page     a small priced page; a first request, the pool of tickets locked through the hop
+# binaries of this tree, with the wallet's policy and the gateway's caps as they ship (2 tickets a
+# session, 15 held in all); the nodes are Lightning Fork nodes, the hop and the seller started with
+# --default-remote-max-htlcs=30, so that the buyer's channel and the seller's inbound channel carry
+# 30 pending payments each: the slot count of a channel with a Core Lightning node at its default.
+# A stand-in for that number only: no Core Lightning node is in this lab. It prints PASS or FAIL
+# for each check with what it saw:
+#   page     a small priced page; a first request, the pool of 2 tickets locked through the hop
 #            included, in 1 s (median of 5 new sessions)
 #   latency  what a paid request adds over an unpaid one through the same wallet (medians of 200)
 #   stream   a 100 MB file priced per byte, whole; again and stopped half way by the call's
 #            max_sats; again and stopped by the agent; the unused tickets cancelled within 5 s; what
 #            the buyer's node paid, what the seller's node received, what the wallet booked and what
 #            the receipts say, to the millisat
+#   slots    half of the buyer's channel taken by payments of others: the wallet holds nothing and
+#            pays with prepaid tickets, one at a time; a seller at its cap of 15 says slots_short and
+#            is paid with a prepaid ticket; a lock that finds no slot on the way: the session holds
+#            less and waits
 #   liar     a seller that lies, played by a proxy in front of a second gateway: another node id,
 #            tickets for another payee, terms that change, inflated metering signed by the seller's
 #            own key, no receipt, a receipt for another request, an answer that stops in the
@@ -34,7 +42,7 @@
 # (BASE+5), the second gateway (BASE+6) and the lying proxy in front of it (BASE+7). Its own compose
 # project (tickete2e), so it runs beside the other regtest scripts. Each container is capped at 2
 # CPUs; host builds run at nice 19 with -j4. The lab's containers and volumes are removed on exit
-# (TICKET_E2E_KEEP=1 keeps them and the scratch directory). About 20 minutes.
+# (TICKET_E2E_KEEP=1 keeps them and the scratch directory). About 25 minutes.
 # Report: run/ticket_e2e_regtest.json and run/ticket_e2e_regtest.log.
 #
 #   scripts/ticket_e2e_regtest.sh               every check

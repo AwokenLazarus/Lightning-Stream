@@ -591,6 +591,20 @@ def setup() -> None:
     os.chmod(f"{RUN}/rail.macaroon", 0o600)
     for s in SELLERS:
         SHOPS[s] = Seller(s)
+
+    # the buyer's node learns of a channel by gossip, some time after it opens. Until it knows a route to a seller a
+    # payment fails with "no route", which is also what a channel out of slots answers, and the wallet holds less
+    # after it either way. So a route to every seller is waited for with the node's own payments, before the wallet
+    # is asked to pay anyone
+    def probe(seller: str) -> bool:
+        tickets, _ = lab.lock(BUYER, seller, 1, secs=10)
+        lab.cancel_all(seller, tickets)
+        return True
+
+    t0 = time.time()
+    list(POOL.map(lambda s: lab.wait(f"a route from the buyer to {s}", 300, partial(probe, s), every=3), SELLERS))
+    lab.wait("the probes to be off the buyer's channel", 60, lambda: not buyer_in_flight(), every=0.5)
+    REPORT["measured"]["routes_known_after_s"] = round(time.time() - t0)
     server = ThreadingHTTPServer(("127.0.0.1", SHOP), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     WALLET_PROC.write_policy()
@@ -638,11 +652,11 @@ def one() -> None:
     check(f"one: the wallet reads its channel's slots from its node: {SLOTS}, the smaller of the two numbers the node lists",
           bool(seen) and seen[0].get("slots") == SLOTS and min(int(v["max_accepted_htlcs"]) for v in limits.values()) == SLOTS, {"wallet": seen[0].get("slots") if seen else None, "node": limits})
     spent0 = WALLET_PROC.spent()
-    lab.wait("a route to the seller", 240, lambda: b.lock()["locked"] > 0 or len(b.hashes) > 0, every=3)
     t0 = time.perf_counter()
-    while len(b.hashes) < HELD:
-        b.lock()
+    out = b.lock()
     REPORT["measured"][f"one_lock_{HELD}_s"] = round(time.perf_counter() - t0, 3)
+    if len(b.hashes) < HELD:
+        raise LabError(f"the first lock round locked {len(b.hashes)} of {HELD}: {json.dumps(out)[:600]}")
     first = list(b.hashes)
     st = agree(HELD)
     check(f"one: {HELD} tickets locked through the hop: ACCEPTED on the seller's node, in flight on the buyer's, nothing spent",

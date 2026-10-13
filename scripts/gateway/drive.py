@@ -7,7 +7,10 @@ Run by scripts/gateway_regtest.sh, which brings up the chain node and builds the
     lf1 ---- lf2 ---- lf3 ==== xbt-gateway ---- python3 -m http.server
     buyer    hop     seller    (on the host)    (a 100 MB file, a small one)
 
-Channels lf1->lf2 and lf2->lf3 of 5,000,000 sat (1,000,000 pushed). The gateway holds two baked
+Channels lf1->lf2 and lf2->lf3 of 5,000,000 sat (1,000,000 pushed). The seller's node accepts 30
+pending payments from a peer, so its inbound channel carries 30: the slot count of a channel with a
+Core Lightning node at its default. The gateway runs with its shipped ticket terms and caps (2
+tickets a session, 15 held for all sessions together, held and prepaid tickets) and holds two baked
 macaroons of lf3: invoices:read + invoices:write, and info:read. Tickets are 1,000 sat with a final
 CLTV delta of 40. The big file costs 200,000 msat per MiB (about 19 tickets); the small one 2,500
 msat per request. Every check prints PASS or FAIL and what it saw.
@@ -24,8 +27,13 @@ msat per request. Every check prints PASS or FAIL and what it saw.
   locked      a secret for an unpaid ticket, a replayed request, a replayed secret, another buyer's
               secret: none is served, and the other buyer's ticket stays locked
   margin      a ticket is used with 25 blocks left and refused with 24; nothing is settled inside 24
-  flood       2,000 lock requests: sessions and unpaid invoices stop at the caps; a buyer that locks
-              and never releases has its tickets cancelled, and its node shows them failed
+  flood       2,000 lock requests: 15 tickets are issued, half of the channel's 30 slots, and every
+              other buyer is told slots_short and when to come back; a buyer that locks and never
+              releases has its tickets cancelled, and its node shows them failed
+  prepaid     a ticket settled on arrival: an ordinary invoice, paid, credited once when its
+              preimage is presented, with nothing held on any channel; bought while the held cap is full
+  slots       the gateway given a third macaroon (offchain:read) reads its node's channels: half of
+              the smallest is its cap, and it issues no held ticket while a channel is half full
   upstream    the file server stopped: 502, nothing charged; back: served
   restart     the gateway restarted, then the seller's node restarted, with tickets locked: the
               tickets are still good, and a request while the node is away is 503 and not served
@@ -70,6 +78,9 @@ MID = 10_000_000
 BYTE_MSAT, PER_BYTES = 200_000, 1_048_576
 REQUEST_MSAT = 2_500
 FIRST_USE_S = 15
+POOL = 2  # tickets a session holds, as the gateway ships
+SLOTS = 30  # pending payments the seller's inbound channel carries
+HELD_CAP = SLOTS // 2  # held tickets for all sessions together: half of them
 REPORT: dict[str, Any] = {"checks": [], "measured": {}}
 FAILED: list[str] = []
 PROCS: dict[str, subprocess.Popen[bytes]] = {}
@@ -206,11 +217,13 @@ class Buyer:
         self.released = 0
         self.tickets: dict[str, Ticket] = {}
         self.bad_receipts = 0
+        self.offers: list[dict[str, Any]] = []
 
     def learn(self, target: str) -> dict[str, Any]:
         a = send("GET", target)
         pr = json.loads(base64.b64decode(a.headers["payment-required"]))
         self.terms = pr["accepts"][0]
+        self.offers = pr["accepts"]
         return {"status": a.status, "required": pr}
 
     def header(self, method: str, target: str, body: bytes, secret: bytes | None = None, seq: int | None = None) -> str:
@@ -279,6 +292,44 @@ class Buyer:
                 self.session, self.key = a.json()["session"], bytes.fromhex(a.json()["key"])
         return a, secrets
 
+    def ask_prepaid(self, count: int = 1) -> Answer:
+        """The lock request for tickets settled on arrival: a count out, the seller's invoices back."""
+        body: dict[str, Any] = {"version": "ticket/0", "settle": "on-arrival", "count": count}
+        headers = {"Content-Type": "application/json"}
+        if self.session:
+            body["session"] = self.session
+            raw = json.dumps(body).encode()
+            headers["PAYMENT-SIGNATURE"] = self.header("POST", "/x402/ticket/lock", raw)
+            return self.took(send("POST", "/x402/ticket/lock", headers, raw), None)
+        a = send("POST", "/x402/ticket/lock", headers, json.dumps(body).encode())
+        if a.status == 200 and a.json().get("session"):
+            self.session, self.key = a.json()["session"], bytes.fromhex(a.json()["key"])
+        return a
+
+    def buy_prepaid(self) -> tuple[bytes, float]:
+        """Buy one prepaid ticket: the invoice checked against the terms, paid by the buyer's node,
+        and its preimage, which that node has once the payment succeeded. The seconds it took."""
+        t0 = time.perf_counter()
+        a = self.ask_prepaid(1)
+        if a.status != 200 or len(a.json()["tickets"]) != 1:
+            raise LabError(f"prepaid lock: HTTP {a.status} {a.body[:200]!r}")
+        t = a.json()["tickets"][0]
+        d = lab.get(BUYER, "/v1/payreq/" + t["invoice"], MAC["buyer"])
+        x = next(o for o in self.offers if o["extra"]["settle"] == "on-arrival")["extra"]
+        good = (d["destination"] == self.terms["payTo"] and d["payment_hash"] == t["hash"] and int(d["num_msat"]) == int(x["ticketMsat"])
+                and int(d["cltv_expiry"]) == int(x["ticketBlocks"]) and d["features"].get("512", {}).get("is_required") is True)
+        if not good:
+            raise LabError(f"a prepaid invoice that does not match the terms: {json.dumps(d)[:300]}")
+        body = {"timeout_seconds": 30, "fee_limit_msat": "100000", "payment_request": t["invoice"]}
+        final = lab.stream(BUYER, "POST", "/v2/router/send", body, lambda u: u["status"] in ("SUCCEEDED", "FAILED"), MAC["buyer"])
+        if final.get("status") != "SUCCEEDED":
+            raise LabError(f"the prepaid ticket's payment did not succeed: {json.dumps(final)[:300]}")
+        preimage = bytes.fromhex(final["payment_preimage"])
+        if hashlib.sha256(preimage).hexdigest() != t["hash"]:
+            raise LabError("the node's preimage is not the invoice's")
+        self.tickets[t["hash"]] = Ticket(preimage, t["invoice"])
+        return preimage, time.perf_counter() - t0
+
     def lock(self, count: int) -> list[bytes]:
         """Lock `count` tickets: every invoice is checked against the terms before the buyer's node pays it."""
         a, secrets = self.ask(count)
@@ -331,10 +382,10 @@ def upstream_requests(path: str) -> int:
         return sum(1 for line in f if any(w in line for w in want))
 
 
-def start_gateway() -> float:
+def start_gateway(config: str = "gateway.json") -> float:
     t0 = time.monotonic()
     with open(f"{RUN}/gateway.log", "ab") as log:
-        PROCS["gateway"] = subprocess.Popen([BIN, f"{RUN}/gateway.json"], stdout=log, stderr=log)
+        PROCS["gateway"] = subprocess.Popen([BIN, f"{RUN}/{config}"], stdout=log, stderr=log)
     lab.wait("the gateway", 60, lambda: health()["height"] is not None, every=0.05)
     return time.monotonic() - t0
 
@@ -358,16 +409,17 @@ def seller_state(secret: bytes) -> str:
     return lab.state(SELLER, Ticket(secret, ""))
 
 
-def write_config(path: str, chain: str, macaroon: str, info_macaroon: str) -> None:
+def write_config(path: str, chain: str, macaroon: str, info_macaroon: str, channels_macaroon: str = "", caps: dict[str, Any] | None = None) -> None:
     cfg: dict[str, Any] = {
         "listen": f"127.0.0.1:{PORT}",
         "public_url": ORIGIN,
         "upstream": f"http://127.0.0.1:{UP_PORT}",
         "state_dir": f"{RUN}/state",
         "node": {"rest": f"https://127.0.0.1:{lab.PORT[SELLER]}", "tls_cert": f"{RUN}/{SELLER}.tls.cert", "macaroon": macaroon, "info_macaroon": info_macaroon},
-        # shorter than the defaults (30 sessions, 60 s to first use), so that the caps are reached and
-        # an unused session is closed within the run; every buyer here comes from one address
-        "caps": {"max_sessions": 6, "sessions_per_address": 0, "first_use_secs": FIRST_USE_S},
+        # the shipped ticket terms and the shipped cap on held tickets (15: half of a 30-slot channel). A shorter
+        # time to first use than the default 60 s, so that an unused session is closed within the run; every
+        # buyer here comes from one address
+        "caps": {"sessions_per_address": 0, "first_use_secs": FIRST_USE_S},
         "times": {"height_max_age_secs": 5},
         "routes": [
             {"path": "/big.bin", "price": {"byte_msat": BYTE_MSAT, "per_bytes": PER_BYTES}},
@@ -378,6 +430,9 @@ def write_config(path: str, chain: str, macaroon: str, info_macaroon: str) -> No
     }
     if chain != "main":
         cfg["chain"], cfg["network"] = chain, NETWORK
+    if channels_macaroon:
+        cfg["node"]["channels_macaroon"] = channels_macaroon
+    cfg["caps"].update(caps or {})
     with open(path, "w") as f:
         json.dump(cfg, f, indent=1)
 
@@ -431,7 +486,9 @@ def prepare() -> None:
     MAC["invoices"] = lab.bake(SELLER, lab.SELLER_PERMISSIONS)
     MAC["info"] = lab.bake(SELLER, ("info:read",))
     MAC["wide"] = lab.bake(SELLER, (*lab.SELLER_PERMISSIONS, "onchain:write"))
-    for name in ("invoices", "info", "wide"):
+    MAC["channels"] = lab.bake(SELLER, ("offchain:read",))
+    MAC["wide_channels"] = lab.bake(SELLER, ("offchain:read", "offchain:write"))
+    for name in ("invoices", "info", "wide", "channels", "wide_channels"):
         with open(f"{RUN}/{name}.macaroon", "wb") as f:
             f.write(bytes.fromhex(MAC[name]))
     os.makedirs(f"{RUN}/www/free", exist_ok=True)
@@ -460,11 +517,12 @@ def terms() -> None:
         and a["scheme"] == "ticket"
         and a["network"] == NETWORK
         and a["payTo"] == lab.pubkey(SELLER)
-        and (x["ticketMsat"], x["maxTickets"], x["ticketBlocks"], x["release"], x["settle"], x["session"]) == ("1000000", 8, 40, "with-request", "on-use", "/x402/ticket")
+        and (x["ticketMsat"], x["maxTickets"], x["ticketBlocks"], x["release"], x["settle"], x["session"]) == ("1000000", POOL, 40, "with-request", "on-use", "/x402/ticket")
+        and [o["extra"]["settle"] for o in b.offers] == ["on-use", "on-arrival"]
         and x["price"] == {"requestMsat": "0", "byteMsat": str(BYTE_MSAT), "perBytes": str(PER_BYTES), "secondMsat": "0"}
         and len(x["receiptKey"]) == 66
     )
-    check("terms: the 402 names the seller's node, the ticket terms and the price rule", ok, a)
+    check("terms: the 402 names the seller's node, the ticket terms (2 a session; held tickets first, prepaid ones second) and the price rule", ok, b.offers)
     services = send("GET", "/services").json()
     check("terms: /services lists the routes, unsigned", services["signed"] is False and len(services["routes"]) == 4 and services["payTo"] == a["payTo"], services)
     nothing = send("GET", "/elsewhere")
@@ -507,6 +565,31 @@ def macaroons() -> None:
     wide, wide_info, narrow, off_main = (run_check(f"{RUN}/{n}.json") for n in ("main-wide", "main-wide-info", "main-narrow", "regtest-wide"))
     ok = wide.code != 0 and "refused on mainnet" in wide.said and "onchain:write" in wide.said and wide_info.code != 0 and narrow.code == 0 and off_main.code == 0
     check("macaroons: a wider macaroon is refused on mainnet, in either place; the two narrow ones are taken", ok, {"wide": wide, "wide as the height macaroon": wide_info, "narrow": narrow, "wide off mainnet": off_main})
+    # the third macaroon is optional: offchain:read and nothing more
+    m = MAC["channels"]
+    third = {
+        "pay": lab.refused(lab.stream(SELLER, "POST", "/v2/router/send", {"payment_request": invoice.invoice, "timeout_seconds": 5}, lambda u: True, m)),
+        "open a channel": lab.refused(lab.ask(SELLER, "POST", "/v1/channels", {"node_pubkey_string": lab.pubkey(HOP), "local_funding_amount": "20000"}, m)),
+        "make an invoice": lab.refused(lab.ask(SELLER, "POST", "/v2/invoices/hodl", {"hash": lab.b64(os.urandom(32)), "value_msat": "1000"}, m)),
+        "read the on-chain wallet": lab.refused(lab.ask(SELLER, "GET", "/v1/balance/blockchain", None, m)),
+    }
+    # what it does show beside the channel list: stated in the gateway's README and in docs/LIMITS.md
+    shows = {"the channel balances": "local_balance" in lab.ask(SELLER, "GET", "/v1/balance/channels", None, m),
+             "the node's payments": "payments" in lab.ask(SELLER, "GET", "/v1/payments", None, m),
+             "the channel list": "channels" in lab.ask(SELLER, "GET", "/v1/channels", None, m)}
+    write_config(f"{RUN}/main-channels.json", "main", f"{RUN}/invoices.macaroon", f"{RUN}/info.macaroon", f"{RUN}/channels.macaroon")
+    write_config(f"{RUN}/main-wide-channels.json", "main", f"{RUN}/invoices.macaroon", f"{RUN}/info.macaroon", f"{RUN}/wide_channels.macaroon")
+    write_config(f"{RUN}/main-dust.json", "main", f"{RUN}/invoices.macaroon", f"{RUN}/info.macaroon")
+    with open(f"{RUN}/main-dust.json") as f:
+        dusty = json.load(f)
+    dusty["tickets"] = {"ticket_msat": 500_000}
+    with open(f"{RUN}/main-dust.json", "w") as f:
+        json.dump(dusty, f)
+    with_channels, wide_channels, dust = (run_check(f"{RUN}/{n}.json") for n in ("main-channels", "main-wide-channels", "main-dust"))
+    ok = all(third.values()) and all(shows.values()) and with_channels.code == 0 and wide_channels.code != 0 and "offchain:write" in wide_channels.said
+    check("macaroons: the optional channels macaroon (offchain:read) cannot pay, open a channel, make an invoice or read the wallet; it does show balances and payments; a wider one is refused on mainnet",
+          ok, {"cannot": third, "shows": shows, "narrow": with_channels, "wide": wide_channels})
+    check("macaroons: a config that offers held tickets of 500 sat is refused: below 546 sat a held ticket is dust", dust.code != 0 and "546" in dust.said, dust)
 
 
 def fetch() -> None:
@@ -515,7 +598,7 @@ def fetch() -> None:
     with open(f"{RUN}/www/big.bin", "rb") as f:
         whole = f.read()
     requests_before = upstream_requests("/big.bin")
-    pool = b.lock(8)
+    pool = b.lock(POOL)
     stop_at = 10  # tickets: about half of the 19.07 the whole file costs
     target = "/big.bin"
     conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=60)
@@ -539,13 +622,14 @@ def fetch() -> None:
     reader = threading.Thread(target=read, daemon=True)
     reader.start()
     locks = 1
-    # release one ticket when the last is used up (the body waits for it), lock more when none is left; stop at ten
+    # release one ticket when the last is used up (the body waits for it); with one left, lock the next behind
+    # it, so that two are never both gone; stop at ten
     while not done.is_set() and b.released < stop_at:
         if b.balance() == 0:
-            if not pool:
-                pool = b.lock(4)
-                locks += 1
             b.release(pool.pop(0))
+            if len(pool) < POOL and b.released + len(pool) < stop_at:
+                pool += b.lock(1)
+                locks += 1
         else:
             time.sleep(0.002)
     stopped = time.monotonic()
@@ -580,7 +664,7 @@ def whole() -> None:
     b.learn("/mid.bin")
     with open(f"{RUN}/www/mid.bin", "rb") as f:
         data = f.read()
-    pool = b.lock(4)
+    pool = b.lock(POOL)
     target = "/mid.bin"
     conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=60)
     first = pool.pop(0)
@@ -627,7 +711,7 @@ def timed(fn: Any, n: int) -> list[float]:
 def latency() -> None:
     b = Buyer()
     b.learn("/small.txt")
-    secrets = b.lock(8)
+    secrets = b.lock(POOL)
     if b.get("/small.txt", secrets[0]).status != 200:
         raise LabError("the first paid request was not served")
     n = 300
@@ -650,14 +734,14 @@ def latency() -> None:
         expect(b.took(a, None))
     settle: list[float] = []
     more = secrets[1:] + b.lock(1)
-    for round_ in range(4):
+    for round_ in range(16):
         for s in more:
             t0 = time.perf_counter()
             a = b.get_only("/small.txt", s)
             settle.append(time.perf_counter() - t0)
             expect(b.took(a, s))
         b.call("cancel", {"hashes": "all"})
-        more = b.lock(8) if round_ < 3 else []
+        more = b.lock(POOL) if round_ < 15 else []
     spreads = {"direct": lab.spread(direct), "through_a_free_route": lab.spread(free), "paid_from_the_balance": lab.spread(paid), "paid_with_a_secret": lab.spread(settle)}
     measured("latency_ms", spreads)
     per_ticket = TICKET_MSAT // REQUEST_MSAT
@@ -706,7 +790,7 @@ def locked() -> None:
 def margin() -> None:
     b = Buyer()
     b.learn("/small.txt")
-    secrets = b.lock(3)
+    secrets = b.lock(POOL)
     inv = lab.invoice(SELLER, Ticket(secrets[0], ""))
     expiry = int(inv["htlcs"][0]["expiry_height"])
     h = lab.height()
@@ -720,28 +804,35 @@ def margin() -> None:
     late = b.get("/small.txt", secrets[1])
     time.sleep(1.5)
     states = [seller_state(s) for s in secrets[1:]]
-    ok = late.status == 402 and late.error() in ("ticket_expiring", "ticket_unknown") and states == ["CANCELED", "CANCELED"]
-    check("margin: with 24 blocks left a secret is refused, nothing is settled, and the gateway gives the tickets back", ok, {"http": late.status, "error": late.error(), "blocks_left": expiry - lab.height(), "node": states})
+    ok = late.status == 402 and late.error() in ("ticket_expiring", "ticket_unknown") and states == ["CANCELED"]
+    check("margin: with 24 blocks left a secret is refused, nothing is settled, and the gateway gives the ticket back", ok, {"http": late.status, "error": late.error(), "blocks_left": expiry - lab.height(), "node": states})
     final = lab.tally(lab.POOL.map(lambda t: lab.payment(BUYER, t, final=True), list(b.tickets.values())))
-    check("margin: the buyer's node shows one ticket paid and two failed, 6 blocks before the node's own cancel", final == {"FAILED:INCORRECT_PAYMENT_DETAILS": 2, "SUCCEEDED": 1}, final)
+    check("margin: the buyer's node shows one ticket paid and one failed, 6 blocks before the node's own cancel", final == {"FAILED:INCORRECT_PAYMENT_DETAILS": 1, "SUCCEEDED": 1}, final)
 
 
 def flood() -> None:
     before = health()
     pending_before = len(lab.get(SELLER, "/v1/invoices?pending_only=true&num_max_invoices=5000")["invoices"])
     tallies: dict[str, int] = {}
+    retry: set[Any] = set()
     t0 = time.monotonic()
     for _ in range(2000):
-        a, _ = Buyer().ask(8)
+        a, _ = Buyer().ask(POOL)
         key = f"{a.status} {a.error()}".strip()
         tallies[key] = tallies.get(key, 0) + 1
+        if a.error() == "slots_short":
+            retry.add(a.json().get("retryAfter"))
     took = time.monotonic() - t0
     h = health()
     pending = len(lab.get(SELLER, "/v1/invoices?pending_only=true&num_max_invoices=5000")["invoices"]) - pending_before
-    measured("flood", {"requests": 2000, "seconds": round(took, 1), "answers": tallies, "active_sessions": h["activeSessions"], "held_tickets": h["heldTickets"], "held_msat": h["heldMsat"], "unpaid_invoices_on_the_node": pending})
-    free = 6 - before["activeSessions"]
-    ok = tallies.get("200", 0) == free and tallies.get("402 too_many_sessions", 0) == 2000 - free and h["activeSessions"] == 6 and pending == free * 8
-    check("flood: of 2,000 lock requests six sessions' worth were issued, and the node was asked for nothing more", ok, {"answers": tallies, "active_sessions": h["activeSessions"], "unpaid_invoices": pending})
+    measured("flood", {"requests": 2000, "seconds": round(took, 1), "answers": tallies, "active_sessions": h["activeSessions"], "held_tickets": h["heldTickets"], "max_held": h["maxHeld"],
+                       "held_msat": h["heldMsat"], "unpaid_invoices_on_the_node": pending, "retry_after": sorted(retry)})
+    room = HELD_CAP - before["heldTickets"]
+    served = -(-room // POOL)  # the last session to be served gets the one place that is left
+    ok = (tallies.get("200", 0) == served and tallies.get("402 slots_short", 0) == 2000 - served and h["heldTickets"] == HELD_CAP == h["maxHeld"] and pending == room
+          and retry == {30})
+    check(f"flood: of 2,000 lock requests {HELD_CAP} tickets were issued, half of the channel's {SLOTS} slots; every other buyer was told slots_short and to come back in 30 s, has no session, and the node was asked for nothing more",
+          ok, {"answers": tallies, "held_tickets": h["heldTickets"], "unpaid_invoices": pending, "sessions_made": h["sessions"] - before["sessions"], "retry_after": sorted(retry)})
     lab.wait("the unused sessions to be closed and forgotten", FIRST_USE_S + 20, lambda: health()["activeSessions"] == 0 and health()["sessions"] <= before["sessions"], every=0.5)
     gone = len(lab.get(SELLER, "/v1/invoices?pending_only=true&num_max_invoices=5000")["invoices"]) - pending_before
     after = health()
@@ -753,13 +844,13 @@ def flood() -> None:
     b.learn("/small.txt")
     t0 = time.monotonic()
     idle = lab.pending_htlcs(SELLER)
-    b.lock(8)
+    b.lock(POOL)
     held = lab.pending_htlcs(SELLER) - idle
     lab.wait("the silent buyer's tickets to be cancelled", FIRST_USE_S + 20, lambda: lab.pending_htlcs(SELLER) == idle, every=0.2)
     secs = time.monotonic() - t0
     final = lab.tally(lab.POOL.map(lambda t: lab.payment(BUYER, t, final=True), list(b.tickets.values())))
     measured("silent_buyer_locked_s", round(secs, 1))
-    check("flood: a buyer that locks 8 tickets and releases none held 8,000 sat of the seller's inbound capacity until the gateway cancelled them; its node shows them failed", held == 8 and final == {"FAILED:INCORRECT_PAYMENT_DETAILS": 8}, {"held_htlcs": held, "seconds": round(secs, 1), "buyer_node": final})
+    check("flood: a buyer that locks 2 tickets and releases none held 2,000 sat of the seller's inbound capacity until the gateway cancelled them; its node shows them failed", held == POOL and final == {"FAILED:INCORRECT_PAYMENT_DETAILS": POOL}, {"held_htlcs": held, "seconds": round(secs, 1), "buyer_node": final})
     served = upstream_requests("/small.txt")
     got = b.get("/small.txt")
     check("flood: and it was served nothing", got.status == 402 and upstream_requests("/small.txt") == served, {"http": got.status, "error": got.error()})
@@ -785,20 +876,21 @@ def upstream() -> None:
 def restart() -> None:
     b = Buyer()
     b.learn("/small.txt")
-    s = b.lock(4)
+    s = b.lock(POOL)
     if b.get("/small.txt", s[0]).status != 200:
         raise LabError("the first paid request was not served")
     before = b.status()["session"]
     stop("gateway")
     secs = start_gateway()
     after = b.status()
-    kept = (after["session"]["releasedMsat"], after["session"]["spentMsat"]) == (before["releasedMsat"], before["spentMsat"]) and len(after["tickets"]) == 3
+    kept = (after["session"]["releasedMsat"], after["session"]["spentMsat"]) == (before["releasedMsat"], before["spentMsat"]) and len(after["tickets"]) == POOL - 1
     lab.wait("the tickets ACCEPTED again", 30, lambda: all(t["state"] == "ACCEPTED" for t in b.status()["tickets"]), every=0.05)
     got = b.get("/small.txt", s[1])
-    check("restart: after the gateway restarts, the session, its balance and its locked tickets are there and a ticket is used", kept and got.status == 200 and seller_state(s[1]) == "SETTLED", {"restart_s": round(secs, 2), "before": before, "after": after["session"], "http": got.status})
+    check("restart: after the gateway restarts, the session, its balance and its locked ticket are there and the ticket is used", kept and got.status == 200 and seller_state(s[1]) == "SETTLED", {"restart_s": round(secs, 2), "before": before, "after": after["session"], "http": got.status})
     old = b.get("/small.txt", s[0])
     check("restart: a secret used before the restart is not good again", old.status == 402 and old.error() in ("ticket_used", "ticket_unknown"), old.error())
 
+    s += b.lock(POOL)
     lab.stop(SELLER)
     served = upstream_requests("/small.txt")
     away = b.get("/small.txt", s[2])
@@ -816,7 +908,92 @@ def restart() -> None:
     check("restart: every receipt was signed by the same key, before and after", b.bad_receipts == 0, b.bad_receipts)
 
 
-CHECKS = {"terms": terms, "macaroons": macaroons, "fetch": fetch, "whole": whole, "latency": latency, "locked": locked, "margin": margin, "flood": flood, "upstream": upstream, "restart": restart}
+def prepaid() -> None:
+    idle = lab.pending_htlcs(SELLER)
+    # the held cap is full of other buyers' unpaid tickets: a held ticket is refused, a prepaid one is not
+    crowd = []
+    while health()["heldTickets"] < HELD_CAP:
+        c = Buyer()
+        c.ask(POOL)
+        crowd.append(c)
+    b = Buyer()
+    b.learn("/small.txt")
+    refused, _ = b.ask(POOL)
+    served = upstream_requests("/small.txt")
+    secret, secs = b.buy_prepaid()
+    h = health()
+    check("prepaid: with the held cap full a held ticket is refused (slots_short) and a prepaid one is issued and paid; nothing is pending on the seller's channel",
+          (refused.status, refused.error()) == (402, "slots_short") and h["heldTickets"] == HELD_CAP and h["prepaidTickets"] == 1 and lab.pending_htlcs(SELLER) == idle and seller_state(secret) == "SETTLED",
+          {"held_lock": refused.error(), "held": h["heldTickets"], "prepaid_open": h["prepaidTickets"], "pending_htlcs": lab.pending_htlcs(SELLER) - idle, "node": seller_state(secret)})
+    unpaid = b.get("/small.txt")
+    wrong = b.release(os.urandom(32))
+    t0 = time.perf_counter()
+    took = b.release(secret)
+    credit_s = time.perf_counter() - t0
+    again = b.release(secret)
+    st = b.status()
+    ok = ((unpaid.status, unpaid.error()) == (402, "balance_short") and wrong.json()["refused"][0]["error"] == "ticket_unknown" and took.json()["released"] == [hashlib.sha256(secret).hexdigest()]
+          and again.json()["refused"][0]["error"] == "ticket_used" and st["session"]["releasedMsat"] == str(TICKET_MSAT) and b.bad_receipts == 0)
+    check("prepaid: nothing is credited before the preimage is presented; the node's own preimage credits one ticket, once; a made-up one credits nothing",
+          ok, {"before": unpaid.error(), "made_up": wrong.json()["refused"], "released": took.json(), "again": again.json()["refused"], "session": st["session"]})
+    got = b.get("/small.txt")
+    check("prepaid: the balance pays requests like any released ticket's", got.status == 200 and upstream_requests("/small.txt") == served + 1 and b.balance() == TICKET_MSAT - REQUEST_MSAT, {"http": got.status, "balance": b.balance()})
+    times = [secs + credit_s]
+    for _ in range(9):
+        s2, t2 = b.buy_prepaid()
+        t0 = time.perf_counter()
+        if b.release(s2).json()["released"] != [hashlib.sha256(s2).hexdigest()]:
+            raise LabError("a paid prepaid ticket was not credited")
+        times.append(t2 + time.perf_counter() - t0)
+    measured("prepaid_ticket_ms", lab.spread(times))
+    fees = sum(p.fee_msat for p in lab.payments(BUYER, list(b.tickets.values())) if p.status == "SUCCEEDED")
+    check("prepaid: ten prepaid tickets bought one at a time through the hop: each from the lock request to the seller's signed credit, all credited, none held",
+          int(b.status()["session"]["releasedMsat"]) == 10 * TICKET_MSAT and b.bad_receipts == 0 and lab.pending_htlcs(SELLER) == idle,
+          {"per_ticket_ms": lab.spread(times), "routing_fee_msat": fees})
+    # one that is paid and never presented is credited all the same when the gateway's sweep finds it
+    c = Buyer()
+    c.learn("/small.txt")
+    c.buy_prepaid()
+    lab.wait("the gateway's sweep to credit the paid ticket nobody presented", 120, lambda: c.status()["session"]["releasedMsat"] == str(TICKET_MSAT), every=1)
+    check("prepaid: a paid ticket whose preimage was never presented is credited by the gateway's own sweep", c.balance() == TICKET_MSAT, c.balance())
+    lab.wait("the crowd's unpaid tickets to lapse", FIRST_USE_S + 100, lambda: health()["heldTickets"] == 0, every=1)
+
+
+def slots() -> None:
+    # a config that assumes every inbound channel carries 483 (a cap of 241), and the channels macaroon: the gateway
+    # reads its node and finds 30
+    stop("gateway")
+    write_config(f"{RUN}/sized.json", "regtest", f"{RUN}/invoices.macaroon", f"{RUN}/info.macaroon", f"{RUN}/channels.macaroon", {"inbound_slots": 483})
+    start_gateway("sized.json")
+    chan = lab.channels(SELLER)[0]
+    listed = {k: chan[k]["max_accepted_htlcs"] for k in ("local_constraints", "remote_constraints")}
+    measured("seller_channel", dict(listed, commitment_type=chan.get("commitment_type"), dust_limit_sat={k: chan[k]["dust_limit_sat"] for k in ("local_constraints", "remote_constraints")}))
+    h = health()
+    check(f"slots: a gateway given the channels macaroon takes half of its smallest channel as its cap: {HELD_CAP} of {SLOTS}, whatever its config assumed",
+          h["maxHeld"] == HELD_CAP and min(int(v) for v in listed.values()) == SLOTS, {"max_held": h["maxHeld"], "node_lists": listed})
+    # 15 payments that are no ticket of the gateway's are pending towards the seller (another program's invoices on
+    # the same node): the channel is half full, and no held ticket is issued
+    idle = lab.pending_htlcs(SELLER)
+    others, _ = lab.lock(BUYER, SELLER, HELD_CAP, secs=60)
+    b = Buyer()
+    b.learn("/small.txt")
+    refused, _ = b.ask(POOL)
+    check("slots: with its inbound channel half full of payments it did not issue, the gateway issues no held ticket and says slots_short",
+          (refused.status, refused.error()) == (402, "slots_short") and health()["heldTickets"] == 0 and lab.pending_htlcs(SELLER) - idle == HELD_CAP,
+          {"http": refused.status, "error": refused.error(), "pending_towards_the_seller": lab.pending_htlcs(SELLER) - idle, "held_by_the_gateway": health()["heldTickets"]})
+    secret, _ = b.buy_prepaid()
+    check("slots: a prepaid ticket is sold all the same", b.release(secret).json()["released"] == [hashlib.sha256(secret).hexdigest()], b.status()["session"])
+    lab.cancel_all(SELLER, others)
+    lab.wait("the seller's channel to empty", 60, lambda: lab.pending_htlcs(SELLER) == idle, every=0.2)
+    s = b.lock(POOL)
+    check("slots: once the channel has room the same buyer holds its two tickets", len(s) == POOL and health()["heldTickets"] == POOL, health())
+    b.call("cancel", {"hashes": "all"})
+    stop("gateway")
+    start_gateway()
+
+
+CHECKS = {"terms": terms, "macaroons": macaroons, "fetch": fetch, "whole": whole, "latency": latency, "locked": locked, "margin": margin, "flood": flood, "prepaid": prepaid,
+          "slots": slots, "upstream": upstream, "restart": restart}
 
 
 def main() -> int:
