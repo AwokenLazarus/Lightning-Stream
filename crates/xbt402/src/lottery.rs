@@ -663,8 +663,8 @@ pub fn request_auth(key: &[u8; 32], session: &str, seq: u64, req: &str) -> Strin
 /// seller's node shows paid of them.
 pub const RECEIPT_FIELDS: [&str; 11] = ["scheme", "session", "seq", "drawn", "servedMsat", "wonMsat", "paidMsat", "charged", "req", "status", "bodyHash"];
 
-/// What `receiptKey` signs: each of [`RECEIPT_FIELDS`] formatted as the channel wire formats its
-/// own, length-prefixed, under [`RECEIPT_TAG`].
+/// What `receiptKey` signs: each of [`RECEIPT_FIELDS`] formatted as a ticket receipt's are
+/// ([`crate::ticket::receipt_message`]), length-prefixed, under [`RECEIPT_TAG`].
 pub fn receipt_message(r: &Value) -> [u8; 32] {
     let mut h = tagged(RECEIPT_TAG);
     for k in RECEIPT_FIELDS {

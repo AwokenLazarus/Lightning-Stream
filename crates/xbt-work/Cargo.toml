@@ -1,6 +1,6 @@
 [package]
 name = "xbt-work"
-description = "xbt-work: pay-with-work (x402 v2 scheme xbt-work v1 draft) - receipts, invoices and pricing, the provider rail beside xbt-channel, the payer, the blinded relay client, coinbase audit with window statements and NTA deferral lines"
+description = "xbt-work: pay-with-work (x402 v2 scheme xbt-work v1 draft) - receipts, invoices and pricing, the provider rail, the payer, the blinded relay client, coinbase audit with window statements and NTA deferral lines"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

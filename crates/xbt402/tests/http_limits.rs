@@ -243,3 +243,45 @@ fn agp128_a_malformed_answer_is_not_quoted_in_the_transport_error() {
     assert_eq!((e.code.as_str(), e.msg.as_str()), ("transport_error", "the answer's status line is malformed"), "{e}");
     assert!(e.seller.is_none());
 }
+
+// --- the transport and a body cut short (AGP-087, T3) -------------------------------------------------
+
+/// A raw server answering every connection with `bytes`, then closing.
+fn answering(bytes: Vec<u8>) -> String {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(mut s) = s else { continue };
+            let bytes = bytes.clone();
+            std::thread::spawn(move || {
+                let mut req = [0u8; 4096];
+                let _ = s.read(&mut req);
+                let _ = s.write_all(&bytes);
+            });
+        }
+    });
+    addr
+}
+
+/// T3 one step to the side: a chunked answer cut before its last chunk is an error too.
+#[test]
+fn t3_a_chunked_body_cut_short_is_an_error() {
+    let addr = answering(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n5\r\nwor".to_vec());
+    let r = UreqTransport::default().request("GET", &format!("http://{addr}/c"), b"", &[]);
+    assert!(r.is_err(), "a cut chunked body came back as Ok: {:?}", r.map(|r| String::from_utf8_lossy(&r.body).to_string()));
+    // cut on a chunk boundary, with no terminating chunk
+    let addr = answering(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n".to_vec());
+    let r = UreqTransport::default().request("GET", &format!("http://{addr}/c"), b"", &[]);
+    assert!(r.is_err(), "a chunked body with no last chunk came back as Ok: {:?}", r.map(|r| String::from_utf8_lossy(&r.body).to_string()));
+}
+
+/// T3: an answer with neither Content-Length nor chunking ends when the connection does, so the
+/// transport cannot tell a cut one from a whole one. Recorded as it is: on a paid call the
+/// receipt's bodyHash is what catches it.
+#[test]
+fn t3_a_close_delimited_body_cut_short_is_not_seen_by_the_transport() {
+    let addr = answering(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nhalf of the ans".to_vec());
+    let r = UreqTransport::default().request("GET", &format!("http://{addr}/c"), b"", &[]).unwrap();
+    assert_eq!(r.body, b"half of the ans");
+}

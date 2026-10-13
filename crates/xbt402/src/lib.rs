@@ -1,43 +1,35 @@
-//! xbt402: HTTP 402 payments over XBT Spilman channels, the x402 v2 XBT binding of
-//! `batch-settlement` (`extra.assetTransferMethod: "channel"`; `xbt-channel` accepted as an alias)
-//! (spec v1.1 + the v1.2 `closeFeePayer` additions), in Rust.
+//! xbt402: what the paid-HTTP schemes of this workspace share, in Rust.
 //!
-//! A port of the Python reference (B1 `xbt402/`), byte-identical to it: the conformance suite in
-//! this workspace checks every published vector (`docs/x402/vectors.json`) and the Python checker
-//! verifies this crate's own output.
+//! Lightning Stream sells HTTP answers for payments on XBT's Lightning network (stream tickets and
+//! the lottery, `docs/TICKETS.md`) and for mined work (`xbt-work`). This crate holds the parts
+//! they have in common and the ticket and lottery wires themselves:
 //!
-//! * [`channel`]: channel parameters, the payee key tweak v2, funding script, 0x21/0xA3 states,
-//!   close, rollover, refund, [`channel::Payer`] and [`channel::Payee`].
-//! * [`conditional`]: hash-locked conditional states and claims (M6/M7).
-//! * [`wire`]: the 402 / PAYMENT-SIGNATURE / PAYMENT-RESPONSE messages, request auth, receipts,
-//!   facilitator bodies.
-//! * [`provider`]: the resource-server verifier ([`provider::Provider::serve`]).
-//! * [`client`]: the payer SDK ([`client::Client`]), transport-agnostic.
-//! * [`signer`]: the [`signer::StateSigner`] seam, so the payer's keys can live in another
-//!   process (B2's signer, `xbt-signer`); [`signer::LocalSigner`] keeps them in memory.
-//! * [`funding`]: funding checks against a [`funding::ChainBackend`].
-//! * [`maturity`]: coinbase maturity as the node reports it (`getdeploymentinfo`).
-//! * [`scheme`]: the seam for a second x402 scheme beside the channel binding (`xbt-work`, AGP-032).
-//! * [`macaroon`]: a Lightning node's macaroon, read (shared with `xbt-signer`'s Lightning rail).
+//! * [`wire`]: the x402 v2 headers, the request digest, URL reading.
 //! * [`ticket`]: the stream-ticket wire, draft v0 (`docs/TICKETS.md`): request auth and the signed receipt.
 //! * [`lottery`]: the lottery, pay after a win (`docs/TICKETS.md`, section 9): the draw and both sides' bookkeeping of it.
+//! * [`scheme`]: the two traits a scheme implements to be sold and paid: [`scheme::ProviderScheme`], [`scheme::SchemePayer`].
+//! * [`provider`]: a resource server that sells through its schemes ([`provider::Provider::serve`]).
+//! * [`client`]: the payer for those schemes ([`client::Client`]), and [`client::Transport`].
+//! * [`maturity`]: coinbase maturity as the node reports it (`getdeploymentinfo`).
+//! * [`macaroon`]: a Lightning node's macaroon, read (shared with `xbt-signer`'s Lightning rail).
+//! * [`json`]: JSON written as the Python references write it, and integers above 2^64.
+//!
+//! The crate began as the Rust port of the on-chain one-way channel (the x402 `batch-settlement`
+//! scheme on XBT: funding, signed states, close, rollover, refund). That channel was frozen on
+//! 2026-10-11 and removed in 2026-10; its code is in the repository's history, last at revision
+//! `2a31170`.
 //!
 //! Optional features: `http-client` (ureq transport), `http-server` (std::net around the
-//! provider), `rpc` (bitcoind JSON-RPC backend and wallet).
+//! provider), `rpc` (a bitcoind JSON-RPC client).
 
-pub mod channel;
 pub mod client;
-pub mod conditional;
 pub mod error;
-pub mod funding;
 pub mod json;
-pub mod ledger;
 pub mod lottery;
 pub mod macaroon;
 pub mod maturity;
 pub mod provider;
 pub mod scheme;
-pub mod signer;
 pub mod ticket;
 pub mod wire;
 #[cfg(feature = "rpc")]

@@ -74,8 +74,8 @@ pub fn request_auth(key: &[u8; 32], session: &str, seq: u64, secret: &str, ticke
 /// The fields a ticket receipt signs, in order.
 pub const RECEIPT_FIELDS: [&str; 9] = ["scheme", "session", "seq", "releasedMsat", "spentMsat", "charged", "req", "status", "bodyHash"];
 
-/// What `receiptKey` signs: each of [`RECEIPT_FIELDS`] formatted as the channel wire formats its
-/// own (a JSON number and its decimal string sign alike), length-prefixed, under [`RECEIPT_TAG`].
+/// What `receiptKey` signs: each of [`RECEIPT_FIELDS`] formatted as Python's `str()` formats it
+/// (a JSON number and its decimal string sign alike), length-prefixed, under [`RECEIPT_TAG`].
 pub fn receipt_message(r: &Value) -> [u8; 32] {
     let mut h = tagged(RECEIPT_TAG);
     for k in RECEIPT_FIELDS {
@@ -209,8 +209,13 @@ mod tests {
             other[k] = "x".into();
             assert_ne!(m, receipt_message(&other), "{k}");
         }
-        // not the channel receipt's message: another tag
-        assert_ne!(m, crate::wire::receipt_message(&r));
+        // the tag is part of the message: the same fields under another tag are another message
+        let mut h = crate::wire::tagged("xbt402/receipt/v2");
+        for k in RECEIPT_FIELDS {
+            crate::wire::put_field(&mut h, py_str(r.get(k)).as_bytes());
+        }
+        let other: [u8; 32] = sha2::Digest::finalize(h).into();
+        assert_ne!(m, other);
     }
 
     #[test]

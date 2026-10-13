@@ -30,8 +30,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
-use xbt402::client::{split_url, Client, ClientConfig, Transport, Wallet};
-use xbt402::error::{ChannelError, Result as XResult};
+use xbt402::client::{split_url, Client, ClientConfig, Transport};
 use xbt402::http::UreqTransport;
 use xbt402::wire::unb64json;
 use xbt_work::audit::{audit_block, check_fraud_proof, covers, deferred_sats, expected_sats, receipts_bound};
@@ -43,14 +42,6 @@ use xbt_work::receipt::{pubkey_from_hex, Signed};
 use xbt_work::tools::{arg, block_count, chain_block, flag, network, opt, prime_terms, rpc, window};
 
 const CALLS: [&str; 4] = ["/v1/share-change?window=7d", "/v1/pools?window=7d", "/v1/pool/lazarus", "/v1/pools?window=1d"];
-
-struct NoWallet;
-
-impl Wallet for NoWallet {
-    fn fund(&self, _: &str, _: u64) -> XResult<(String, u32)> {
-        Err(ChannelError::new("no_wallet", "the work payer never funds a channel"))
-    }
-}
 
 fn now() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
@@ -132,7 +123,7 @@ fn pay(base: &str, calls: usize, secs: f64, state: &str) -> i32 {
     let pk = pubkey_from_hex(s.accepted["extra"]["primePubkey"].as_str().unwrap_or("")).expect("prime key");
     let mut c = Checks { list: vec![], ok: true };
     c.check(network(&node).ok().as_deref() == Some(net.as_str()), format!("the payer's node is on the offer's network {net}"));
-    c.check(meta["schemes"] == json!(["batch-settlement", "xbt-work"]), format!("402 offers both rails: {}", meta["schemes"]));
+    c.check(meta["schemes"] == json!(["xbt-work"]), format!("the 402 offers pay with work, and nothing else: {}", meta["schemes"]));
 
     // receipts: poll the relay until they cover the calls
     let need = calls as u64 * amount;
@@ -187,10 +178,7 @@ fn pay(base: &str, calls: usize, secs: f64, state: &str) -> i32 {
     let last = receipts.last().cloned().expect("a receipt");
 
     // the paid calls, through the Rust xbt402 Client with the xbt-work payer
-    let hn = node.clone();
-    let mut client = Client::new(ClientConfig::new(&net), Box::new(UreqTransport::default()), Box::new(NoWallet),
-                                 Box::new(move || block_count(&hn).map_err(|e| ChannelError::new(&e.code, e.msg))))
-        .with_payer(p.clone());
+    let mut client = Client::new(ClientConfig::new(&net), Box::new(UreqTransport::default())).with_payer(p.clone());
     let (mut calls_out, mut bal, mut answer) = (vec![], 0u64, Value::Null);
     for (i, path) in CALLS.iter().take(calls).enumerate() {
         let t = Instant::now();
@@ -376,7 +364,7 @@ fn call(base: &str, path: &str, state: &str) -> i32 {
     let meta = xbt402::json::parse(&std::fs::read_to_string(meta_path(state)).expect("prepare first")).expect("meta");
     let net = meta["network"].as_str().expect("network").to_string();
     let p = payer(state, &net);
-    let mut client = Client::new(ClientConfig::new(&net), Box::new(UreqTransport::default()), Box::new(NoWallet), Box::new(|| Ok(0)))
+    let mut client = Client::new(ClientConfig::new(&net), Box::new(UreqTransport::default()))
         .with_payer(p.clone());
     let out = match client.request("GET", &format!("{base}{path}"), b"") {
         Ok(r) => {

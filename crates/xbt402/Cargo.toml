@@ -1,6 +1,6 @@
 [package]
 name = "xbt402"
-description = "xbt402: HTTP 402 payments over XBT Spillman channels (x402 v2 batch-settlement XBT binding; xbt-channel alias), v1.1 + v1.2"
+description = "xbt402: the shared wire of paid HTTP on XBT (x402 v2 headers, request binding), the stream-ticket and lottery wires, and the scheme seam pay with work plugs into"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,9 +11,9 @@ publish.workspace = true
 default = []
 # blocking HTTP client transport (ureq) for the payer
 http-client = ["dep:ureq"]
-# std::net server around Provider::serve (header cap, read deadlines, connection limit)
+# std::net server around a service (header cap, read deadlines, connection limit)
 http-server = ["dep:xbt-svc"]
-# bitcoind JSON-RPC ChainBackend and Wallet (ureq)
+# bitcoind JSON-RPC client (ureq)
 rpc = ["dep:ureq"]
 
 [dependencies]
@@ -26,7 +26,6 @@ serde.workspace = true
 serde_json.workspace = true
 base64.workspace = true
 getrandom = "0.2"
-indexmap = "2"
 ureq = { workspace = true, optional = true }
 xbt-svc = { workspace = true, optional = true }
 

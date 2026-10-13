@@ -5,13 +5,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
-use xbt402::client::{Client, ClientConfig, Transport, Wallet};
+use xbt402::client::{Client, ClientConfig, Transport};
 use xbt402::error::{ChannelError, Result as XResult};
-use xbt402::funding::{ChainBackend, UtxoInfo};
-use xbt402::ledger::Ledger;
 use xbt402::provider::{HttpResponse, Provider, ProviderConfig};
 use xbt402::wire::{b64json, unb64json};
-use xbt_primitives::secp256k1::SecretKey;
 use xbt_work::audit::{check_fraud_proof, AuditBounds, Deferral, PrimeTerms, SignedWindow, WindowStatement};
 use xbt_work::book::CreditCaps;
 use xbt_work::chain::ChainBlock;
@@ -34,31 +31,6 @@ fn blk(sw: &SignedWindow, value_sats: u64, paid_sats: u64) -> ChainBlock {
 
 fn bounds(sw: &SignedWindow) -> AuditBounds {
     TERMS.bounds(&blk(sw, 0, 0)).unwrap()
-}
-
-struct Chain;
-
-impl ChainBackend for Chain {
-    fn block_count(&self) -> XResult<u32> {
-        Ok(200)
-    }
-    fn get_tx_out(&self, _: &str, _: u32, _: bool) -> XResult<Option<UtxoInfo>> {
-        Ok(None)
-    }
-    fn send_raw_transaction(&self, _: &str) -> XResult<String> {
-        Err(ChannelError::code("no"))
-    }
-    fn has_transaction(&self, _: &str) -> XResult<bool> {
-        Ok(false)
-    }
-}
-
-struct NoWallet;
-
-impl Wallet for NoWallet {
-    fn fund(&self, _: &str, _: u64) -> XResult<(String, u32)> {
-        Err(ChannelError::new("no_wallet", "this payer mines, it never funds a channel"))
-    }
 }
 
 /// The in-process network: the API origin and the relay.
@@ -111,11 +83,11 @@ impl World {
     }
 
     fn install(&self) {
-        let prov = Provider::new(Arc::new(Chain), SecretKey::from_slice(&[5u8; 32]).unwrap(), ProviderConfig::new(NET), Ledger::in_memory(),
+        let prov = Provider::new(ProviderConfig::default(),
                                  Box::new(|_, _| 150),
                                  Box::new(|_, p, _| if p == "/v1/fail" { HttpResponse::new(503, vec![], b"down".to_vec()) }
                                           else { HttpResponse::new(200, vec![], format!("{{\"answer\": \"{p}\"}}").into_bytes()) }))
-            .unwrap().with_scheme(Arc::new(WorkScheme(self.work.clone())));
+            .with_scheme(Arc::new(WorkScheme(self.work.clone())));
         *self.t.0.api.lock().unwrap() = Some(Arc::new(prov));
     }
 
@@ -129,7 +101,7 @@ impl World {
     }
 
     fn client(&self, payer: Arc<WorkPayer>) -> Client {
-        Client::new(ClientConfig::new(NET), Box::new(self.t.clone()), Box::new(NoWallet), Box::new(|| Ok(200))).with_payer(payer)
+        Client::new(ClientConfig::new(NET), Box::new(self.t.clone())).with_payer(payer)
     }
 
     fn payer(&self) -> Arc<WorkPayer> {
@@ -173,7 +145,7 @@ fn t4_one_lost_answer_does_not_cost_the_answers_after_it() {
     let payer = w.payer();
     let inv = payer.prepare(&w.t, &format!("{API}/v1/pools")).unwrap().invoice_id().to_string();
     w.credit(&inv, 5, 200, 101, 103);
-    let mut client = Client::new(ClientConfig::new(NET), Box::new(Lose(w.t.clone(), Mutex::new(0), 2)), Box::new(NoWallet), Box::new(|| Ok(200))).with_payer(payer.clone());
+    let mut client = Client::new(ClientConfig::new(NET), Box::new(Lose(w.t.clone(), Mutex::new(0), 2))).with_payer(payer.clone());
     assert_eq!(client.request("GET", &format!("{API}/v1/pools"), b"").unwrap().status, 200);
     assert_eq!(client.request("GET", &format!("{API}/v1/pools"), b"").unwrap_err().code, "transport_error");
     let mut out = vec![];

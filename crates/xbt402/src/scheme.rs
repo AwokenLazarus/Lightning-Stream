@@ -1,21 +1,21 @@
-//! Other x402 schemes beside `xbt-channel` (AGP-032). A [`Provider`](crate::provider::Provider)
-//! can offer a second scheme in the same 402 and serve calls paid with it
+//! The seam an x402 scheme plugs into (AGP-032). A [`Provider`](crate::provider::Provider) offers
+//! each scheme it was given in its 402 and serves calls paid with it
 //! ([`Provider::with_scheme`](crate::provider::Provider::with_scheme)); a
-//! [`Client`](crate::client::Client) can pay with one when a 402 offers it
-//! ([`Client::with_payer`](crate::client::Client::with_payer)). The two schemes are independent:
-//! a payload of one never touches the other's state. The `xbt-work` crate implements both sides.
+//! [`Client`](crate::client::Client) pays with one when a 402 offers it
+//! ([`Client::with_payer`](crate::client::Client::with_payer)). Schemes are independent: a payload
+//! of one never touches another's state. The `xbt-work` crate implements both sides.
 use serde_json::Value;
 
 use crate::client::Transport;
 use crate::error::Result;
 use crate::provider::HttpResponse;
 
-/// The provider side of another scheme.
+/// The provider side of a scheme.
 pub trait ProviderScheme: Send + Sync {
     /// The `scheme` string of its PaymentRequirements.
     fn scheme(&self) -> &str;
-    /// Its PaymentRequirements for a call the provider prices at `price_sats`, listed after the
-    /// `xbt-channel` offer in an unpaid 402; None: not offered for this call.
+    /// Its PaymentRequirements for a call the provider prices at `price_sats`, listed in an unpaid
+    /// 402; None: not offered for this call.
     fn requirements(&self, method: &str, path: &str, price_sats: u64) -> Option<Value>;
     /// Its own control endpoints (for `xbt-work`, invoice issuance): Some(response) when `path` is one.
     fn control(&self, method: &str, path: &str, headers: &[(String, String)], body: &[u8]) -> Option<HttpResponse>;
@@ -32,7 +32,7 @@ pub trait SchemeCharge: Send {
     fn settle(self: Box<Self>, status: u16) -> Value;
 }
 
-/// The payer side of another scheme. Preferred over `xbt-channel` whenever a 402 offers it.
+/// The payer side of a scheme.
 pub trait SchemePayer: Send + Sync {
     fn scheme(&self) -> &str;
     /// PAYMENT-SIGNATURE headers for a call to `origin` sent before any 402, when this payer has

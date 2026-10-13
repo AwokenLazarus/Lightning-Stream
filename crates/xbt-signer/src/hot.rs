@@ -151,7 +151,13 @@ pub struct HotWallet {
 }
 
 fn new_secret() -> SecretKey {
-    xbt402::signer::random_secret()
+    loop {
+        let mut b = [0u8; 32];
+        getrandom::getrandom(&mut b).expect("OS randomness");
+        if let Ok(sk) = SecretKey::from_slice(&b) {
+            return sk;
+        }
+    }
 }
 
 fn gettxout(node: &dyn Node, txid: &str, n: u32) -> Result<Option<Value>> {
@@ -588,7 +594,9 @@ impl HotWallet {
         let mut sigs = vec![];
         for (i, k) in keys.iter().enumerate() {
             let digest = unified_sighash(&tx, &prevouts, i, ScriptType::WitnessV0, &p2wpkh_script_code(&k.pubkey), SIGHASH_ALL_UNIFIED, None)?;
-            let sig = xbt402::channel::sign_with_type(&k.secret, &digest, SIGHASH_ALL_UNIFIED);
+            // DER || hash type
+            let mut sig = ecdsa::sign(&k.secret, &digest);
+            sig.push(SIGHASH_ALL_UNIFIED);
             if sig.last() != Some(&SIGHASH_ALL_UNIFIED) {
                 return Err(err("hot", "hot signature is not 0x21"));
             }
