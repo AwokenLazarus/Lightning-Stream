@@ -1342,6 +1342,12 @@ impl Signer {
             (ln, lp, session)
         };
         let dest = format!("ln:{}", session.payee);
+        // through the gate, from its checks to its end: at most 8 ordinary payments are being made at once. The
+        // checks ask the wallet's two nodes several questions each, and a hundred sellers' wins asking at once got
+        // no answer from the chain node for 3 of 309 (seen on the lab). And such a payment is pending on the wallet's
+        // channel until it has settled, so the gate is also what keeps at most 8 of them there. (Leaving when the
+        // send returned, as a held ticket does, let 24 wins be pending on a 30-slot channel, and 47 of 313 failed.)
+        let _inside = self.ticket_pace.enter();
         if let Err(d) = self.ln_node_checks(&*ln, &lp, &dest, "") {
             return with(d, json!({"rail": "ticket"}));
         }
@@ -1390,12 +1396,9 @@ impl Signer {
             Ok(Err(d)) => return d,
             Err(e) => return refusal("ticket", e.msg),
         };
-        // the node routes it; no lock is held. An ordinary payment is over in a moment, and its end is waited for
-        // inside the gate: such a payment is pending on the wallet's channel until it has settled, so the gate is
-        // what keeps at most 8 of them there at once. (Leaving when the send returned, as a held ticket does, let 24
-        // wins of 100 sellers be pending on a 30-slot channel at once, and 47 of 313 payments failed: seen on the lab.)
+        // the node routes it; no lock is held. An ordinary payment is over in a moment, and its end is waited for,
+        // still inside the gate
         let mut pmt = {
-            let _inside = self.ticket_pace.enter();
             let mut pmt = match ln.send_held(&send) {
                 Ok(p) => Some(p),
                 Err(_) => ln.lookup(&hash).ok().flatten(),
@@ -1409,6 +1412,7 @@ impl Signer {
             }
             pmt
         };
+        drop(_inside);
         // once more outside the gate, for a payment whose end the node had not shown inside the wait
         if pmt.as_ref().is_none_or(|p| !payment_over(p)) {
             if let Ok(Some(p)) = ln.lookup(&hash) {

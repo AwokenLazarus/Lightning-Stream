@@ -531,6 +531,8 @@ impl Signer {
                 s.paid_sats = s.paid_sats.saturating_add(charged);
                 c.wins_paid += 1;
                 c.paid_sats = c.paid_sats.saturating_add(charged);
+                // an earlier try of this win that came to nothing is no longer news
+                c.unpaid.retain(|u| u.get("draw").and_then(Value::as_u64) != Some(win.draw()));
                 c.fee_msat = c.fee_msat.saturating_add(crate::ticket::outside_u64(out.get("fee_msat")).unwrap_or(0));
             }
             // booked, and the node's word decides later: counted as paid for what it booked. Should the node then
@@ -550,9 +552,15 @@ impl Signer {
                 // next invoice; anything else is the owner's bound, and the call asks for no more pieces
                 let retry = rule == "lottery_win_failed" || rule.starts_with("ticket_") && !matches!(rule.as_str(), "ticket_task_budget" | "ticket_seller_cap" | "ticket_task"
                     | "ticket_admission" | "ticket_rate_limit" | "ticket_sync" | "ticket_book" | "ticket_disabled");
+                // the wallet's own nodes gave no answer for a moment: nothing was booked and nothing was sent, so
+                // the same invoice is good the next time the seller lists it
+                let not_now = matches!(rule.as_str(), "ln_backend" | "ln_no_safe_channel" | "ln_unavailable");
                 c.unpaid.push(json!({"draw": win.draw(), "rule": rule}));
-                if retry {
-                    // owed again: another invoice of the seller's for it is looked at, never this one
+                if not_now {
+                    s.tried.remove(invoice);
+                }
+                if retry || not_now {
+                    // owed again: another invoice of the seller's for it is looked at, never one that was booked
                     if let Some((w, _)) = s.handed.remove(&win.draw()) {
                         s.owed.push(w);
                     }
