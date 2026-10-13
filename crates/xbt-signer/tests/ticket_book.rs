@@ -119,6 +119,8 @@ struct HeldState {
     decode_bump: u64,
     list_down: bool,
     lookup_down: bool,
+    /// The node's channel list cannot be read.
+    channels_down: bool,
 }
 
 /// A fake LND that holds payments.
@@ -224,6 +226,9 @@ impl LnBackend for HeldLn {
     /// The node's one channel, with an outgoing HTLC for every payment in flight.
     fn channels(&self) -> xbt402::Result<Vec<Value>> {
         let s = self.st.lock().unwrap();
+        if s.channels_down {
+            return Err(node_err("LN node unreachable"));
+        }
         let mut c = s.channel.clone();
         let mut htlcs: Vec<Value> = s.payments.iter().filter(|p| p["status"] == "IN_FLIGHT").map(|p| {
             json!({"incoming": false, "amount": (p["value_msat"].as_str().unwrap().parse::<u64>().unwrap() / 1000).to_string(), "hash_lock": p["payment_hash"],
@@ -332,6 +337,16 @@ impl Rig {
     /// A wallet whose policy names the default seller and two tasks: `work` pays named sellers,
     /// `swarm` pays anyone inside its caps. `extra` is merged over the policy, one level deep.
     fn new(extra: Value) -> Self {
+        Self::with(extra, false, 483)
+    }
+
+    /// The wallet as it ships (no pool or cap set by the owner), on a channel that carries `slots`
+    /// pending payments each way.
+    fn shipped(extra: Value, slots: u64) -> Self {
+        Self::with(extra, true, slots)
+    }
+
+    fn with(extra: Value, shipped: bool, slots: u64) -> Self {
         let dir = tempfile::tempdir().unwrap();
         env_for(dir.path());
         std::env::remove_var("B2_LN_REST");
@@ -341,6 +356,14 @@ impl Rig {
                              "per_counterparty_cap_sats": 30_000, "human_threshold_sats": 40_000, "velocity_max": 1_000,
                              "ln": {"enabled": true, "split_height": 6000, "max_fee_base_sats": 2, "max_fee_ppm": 1000},
                              "tickets": {"enabled": true, "tasks": {"work": {"budget_sats": 10_000}, "swarm": {"budget_sats": 5_000, "admit": "any"}}}});
+        // the tests of the book's mechanisms run an owner whose channel carries 483 pending payments and who
+        // set the pools that were shipped before 2026-10-12 (8 a seller, 2 beyond 8 sellers, 64 held in all,
+        // every release a payment); `Rig::shipped` is the wallet as it ships
+        if !shipped {
+            pol["tickets"].as_object_mut().unwrap().extend(json!({"pool": 8, "pool_many": 2, "many_sellers": 8, "seller_max_tickets": 8, "seller_max_locked_sats": 8_000,
+                                                                  "max_locked_tickets": 64, "max_locked_sats": 16_000, "max_sellers": 32, "velocity": "release"})
+                .as_object().unwrap().clone());
+        }
         for (k, v) in extra.as_object().unwrap() {
             match (pol.get_mut(k).and_then(Value::as_object_mut), v.as_object()) {
                 (Some(have), Some(more)) => have.extend(more.clone()),
@@ -353,7 +376,9 @@ impl Rig {
         let ln = Arc::new(HeldLn { chain: chain.clone(), st: Mutex::new(HeldState::default()), mode: Mutex::new(Send::Lock) });
         ln.st.lock().unwrap().channel = json!({"chan_id": ((6_100u64 << 40) | (1 << 16)).to_string(), "active": true, "remote_pubkey": "02".to_string() + &"aa".repeat(32),
                                                "commitment_type": "ANCHORS", "unified_sigs": true, "capacity": "100000", "local_balance": "90000",
-                                               "zero_conf": false, "channel_point": point});
+                                               "zero_conf": false, "channel_point": point, "fee_per_kw": "253",
+                                               "local_constraints": {"max_accepted_htlcs": slots, "dust_limit_sat": "354"},
+                                               "remote_constraints": {"max_accepted_htlcs": slots, "dust_limit_sat": "354"}});
         let clock = Arc::new(AtomicU64::new(T0));
         let s = Self::start(&root, &node, &ln, &clock);
         Self { _dir: dir, root, chain, node, ln, clock, s, seller }
@@ -531,7 +556,7 @@ fn eight_locked_five_released_three_cancelled_and_the_book_is_the_node() {
         wants.push(rel["want"].as_i64().unwrap());
     }
     assert_eq!(secrets.iter().collect::<HashSet<_>>().len(), 5, "five different secrets");
-    assert_eq!(wants, [0, 0, 0, 0, 5], "the pool asks for a refill once fewer than half are left");
+    assert_eq!(wants, [0, 0, 0, 4, 5], "the pool asks for a refill once half of it or fewer are left");
     // stop: the seller is asked to cancel the three that are left
     let stop = r.call("ticket_stop", json!({"session": sid}));
     let cancel: Vec<String> = stop["cancel"].as_array().unwrap().iter().map(|h| h.as_str().unwrap().to_string()).collect();
@@ -792,7 +817,8 @@ fn terms_above_the_owners_bounds_refuse_the_seller() {
     assert_eq!(open(&|t| t["extra"]["ticketBlocks"] = 2016.into()), deny("ticket_blocks"));
     assert_eq!(open(&|t| t["network"] = "lightning:000000000019d6689c085ae165831e93".into()), deny("ticket_network"), "the SHA-256 chain's id");
     assert_eq!(open(&|t| t["extra"]["features"] = json!([])), deny("ticket_feature_512"));
-    assert_eq!(open(&|t| t["extra"]["settle"] = "on-arrival".into()), deny("ticket_terms"), "a prepaid balance is not a ticket");
+    assert_eq!(open(&|t| t["extra"]["settle"] = "whenever".into()), deny("ticket_terms"), "neither a held ticket nor a prepaid one");
+    assert_eq!(open(&|t| t["extra"]["ticketMsat"] = "545999".into()), deny("ticket_dust"), "a held ticket below 546 sat");
     assert_eq!(open(&|t| t["payTo"] = "not a key".into()), deny("ticket_terms"));
     // a seller that asks for a thousand tickets gets the owner's eight, and a session with it stays open
     assert_eq!(open(&|t| t["extra"]["maxTickets"] = 1000.into()), ("allow".to_string(), String::new(), 8));
@@ -948,17 +974,17 @@ fn a_task_has_a_budget_a_limit_on_sellers_and_two_tickets_a_seller_when_there_ar
         sids.push(o["session"].as_str().unwrap().to_string());
     }
     assert!(pools[..8].iter().all(|p| *p == (8, "1000000".to_string())), "{pools:?}");
-    assert!(pools[8..].iter().all(|p| *p == (2, "150000".to_string())), "the ninth seller and after: {pools:?}");
+    assert!(pools[8..].iter().all(|p| *p == (2, "546000".to_string())), "the ninth seller and after, never below 546 sat: {pools:?}");
     let ninth = Seller::new(0x79);
     let sid = sids[8].clone();
     let hashes = r.offer(&sid);
     assert_eq!(hashes.len(), 2);
     // the seller must issue the size the session chose: its own default is refused
     assert_eq!(r.lock(&sid, vec![(hashes[0].clone(), ninth.invoice(r.now(), &hashes[0], &Inv::default()))])["refused"][0]["rule"], "ticket_amount");
-    let small = Inv { msat: 150_000, ..Inv::default() };
+    let small = Inv { msat: 546_000, ..Inv::default() };
     assert_eq!(r.lock(&sid, hashes.iter().map(|h| (h.clone(), ninth.invoice(r.now(), h, &small))).collect())["locked"], 2);
-    // 150 sat and a fee limit of 2 sat + 0.1%: booked as 153
-    assert_eq!(r.release(&sid)["charged_sats"], 153);
+    // 546 sat and a fee limit of 2 sat + 0.1%: booked as 549
+    assert_eq!(r.release(&sid)["charged_sats"], 549);
 }
 
 #[test]
@@ -1259,4 +1285,142 @@ fn ln_pay_does_not_take_a_tickets_htlc_for_one_it_did_not_send() {
     let out = r.call("ln_pay", json!({"invoice": inv, "max_sats": 2_000}));
     assert_ne!(out["rule"], "ln_htlc_lock", "{out}");
     assert_eq!(out["payment_hash"], hash, "{out}");
+}
+
+// --- the shipped defaults: slots and dust (docs/TICKETS.md section 11) -----------------------------
+
+/// Sellers the owner names, and a task with room for all of them.
+fn many_sellers(n: u8) -> (Vec<Seller>, Value) {
+    let sellers: Vec<Seller> = (1..=n).map(|i| Seller::new(0x80 + i)).collect();
+    let policy = json!({"allowlist": sellers.iter().map(Seller::dest).collect::<Vec<_>>(), "daily_budget_sats": 60_000, "weekly_budget_sats": 90_000,
+                        "tickets": {"enabled": true, "tasks": {"work": {"budget_sats": 50_000}}}});
+    (sellers, policy)
+}
+
+#[test]
+fn as_shipped_one_30_slot_channel_holds_tickets_with_eleven_sellers_and_no_more_than_fifteen_in_all() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (sellers, policy) = many_sellers(13);
+    let r = Rig::shipped(policy, 30);
+    // one seller: 2 tickets, and the next is locked when one is left
+    let first = r.open_with(&sellers[0], "work");
+    assert_eq!((first["verdict"].as_str(), first["pool"].as_i64()), (Some("allow"), Some(2)), "{first}");
+    let sid = first["session"].as_str().unwrap().to_string();
+    assert_eq!(r.fill_with(&sid, &sellers[0]).len(), 2);
+    assert!(r.offer(&sid).is_empty(), "two of two: nothing more is wanted");
+    let rel = r.release(&sid);
+    assert_eq!(rel["want"], 1, "one left: the refill mark");
+    assert_eq!(r.fill_with(&sid, &sellers[0]).len(), 1);
+    // until the seller settles, the released ticket's payment is still pending on the channel, and takes its slot
+    assert!(r.ln.settle(rel["ticket_secret"].as_str().unwrap()));
+    r.call("watch_tick", json!({}));
+    // up to 4 sellers in a task: 2 each. From the fifth: 1 each, for as long as the slot budget has room
+    let mut pools = vec![2];
+    let mut sids = vec![sid];
+    for s in &sellers[1..11] {
+        let o = r.open_with(s, "work");
+        assert_eq!(o["verdict"], "allow", "{o}");
+        pools.push(o["pool"].as_i64().unwrap());
+        let sid = o["session"].as_str().unwrap().to_string();
+        assert_eq!(r.fill_with(&sid, s).len() as i64, o["pool"].as_i64().unwrap());
+        sids.push(sid);
+    }
+    assert_eq!(pools, [2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1], "8 held with four sellers and 7 with seven more: 15, half of the channel's 30");
+    let st = r.status();
+    assert_eq!((st["locked"]["tickets"].as_i64(), st["node"]["htlcs"].as_i64()), (Some(15), Some(15)), "{st}");
+    // the twelfth seller: no held ticket, and the reason
+    let o = r.open_with(&sellers[11], "work");
+    assert_eq!((o["verdict"].as_str(), o["rule"].as_str(), o["held_budget"].as_i64(), o["slots"].as_i64()), (Some("deny"), Some("ticket_slots"), Some(15), Some(30)), "{o}");
+    // the same seller with prepaid tickets on offer: a session that holds nothing
+    let mut prepaid = r.terms(&sellers[11]);
+    prepaid["extra"]["settle"] = "on-arrival".into();
+    let o = r.call("ticket_open", json!({"terms": r.terms(&sellers[11]), "prepaid_terms": prepaid, "task": "work"}));
+    assert_eq!((o["verdict"].as_str(), o["pool"].as_i64(), o["prepaid_msat"].as_str(), o["hold_why"].as_str()), (Some("allow"), Some(0), Some("1000000"), Some("ticket_slots")), "{o}");
+    assert!(r.offer(o["session"].as_str().unwrap()).is_empty(), "a session that holds nothing offers no hash");
+    // a session that stops gives its places back
+    let stop = r.call("ticket_stop", json!({"session": sids[0]}));
+    for h in stop["cancel"].as_array().unwrap() {
+        r.ln.cancel(h.as_str().unwrap());
+    }
+    r.call("watch_tick", json!({}));
+    let o = r.open_with(&sellers[12], "work");
+    assert_eq!((o["verdict"].as_str(), o["pool"].as_i64()), (Some("allow"), Some(1)), "many sellers: one ticket, of the two places that came free: {o}");
+}
+
+#[test]
+fn every_lock_reads_the_channel_again_and_stays_within_half_of_what_it_carries() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (sellers, policy) = many_sellers(3);
+    // payments of the node that are no ticket of the wallet's (1 sat each) take slots like any other
+    let r = Rig::shipped(policy.clone(), 30);
+    let sid = r.open_with(&sellers[0], "work")["session"].as_str().unwrap().to_string();
+    r.ln.st.lock().unwrap().foreign = (0..14).map(|i| (format!("{:064x}", 0xabc0 + i), 1)).collect();
+    let hashes = r.offer(&sid);
+    let locked = r.lock(&sid, hashes.iter().map(|h| (h.clone(), sellers[0].invoice(r.now(), h, &Inv::default()))).collect());
+    assert_eq!((locked["locked"].as_i64(), locked["refused"][0]["rule"].as_str()), (Some(1), Some("ticket_slots")), "14 pending and one ticket: half of 30. {locked}");
+    assert_eq!(r.ln.sends(), 1, "the second was never sent to the node");
+    let s = r.status()["sessions"][0].clone();
+    assert_eq!((s["hold_why"].as_str(), s["pool"].as_i64(), s["slot_fails"].as_i64()), (Some("ticket_slots"), Some(2), Some(0)), "a wait, not a failure: {s}");
+    assert!(r.offer(&sid).is_empty(), "nothing is offered for 30 s");
+    r.pass(31);
+    r.ln.st.lock().unwrap().foreign.clear();
+    assert_eq!(r.fill_with(&sid, &sellers[0]).len(), 1, "the slots came free");
+    // a channel listing that cannot be read locks nothing: never "483"
+    let r = Rig::shipped(policy.clone(), 30);
+    let sid = r.open_with(&sellers[0], "work")["session"].as_str().unwrap().to_string();
+    let hashes = r.offer(&sid);
+    r.ln.st.lock().unwrap().channels_down = true;
+    let locked = r.lock(&sid, hashes.iter().map(|h| (h.clone(), sellers[0].invoice(r.now(), h, &Inv::default()))).collect());
+    assert_eq!((locked["verdict"].as_str(), locked["rule"].as_str(), r.ln.sends()), (Some("deny"), Some("ln_backend"), 0), "{locked}");
+    // the dust limit of the channel, read at the lock: a ticket sized under an anchor channel is not held on one without
+    let r = Rig::shipped(policy.clone(), 30);
+    let sid = r.open_with(&sellers[0], "work")["session"].as_str().unwrap().to_string();
+    let hashes = r.offer(&sid);
+    r.ln.st.lock().unwrap().channel["commitment_type"] = "STATIC_REMOTE_KEY".into();
+    let locked = r.lock(&sid, hashes.iter().map(|h| (h.clone(), sellers[0].invoice(r.now(), h, &Inv::default()))).collect());
+    assert_eq!((locked["verdict"].as_str(), locked["refused"].as_array().map(Vec::len), locked["refused"][0]["rule"].as_str(), r.ln.sends()),
+               (Some("deny"), Some(2), Some("ticket_dust"), 0), "1,000 sat is below 354 + 712 sat there: {locked}");
+    let s = r.status()["sessions"][0].clone();
+    assert_eq!((s["pool"].as_i64(), s["hold_why"].as_str()), (Some(0), Some("ticket_dust")), "{s}");
+    // and at the opening: 546 sat is the least on any channel, 1,066 on this one
+    let o = r.open_with(&sellers[1], "work");
+    assert_eq!((o["verdict"].as_str(), o["rule"].as_str()), (Some("deny"), Some("ticket_dust")), "{o}");
+    // a lock that fails as a full channel does: one ticket, a wait that doubles, and after the third round none
+    let r = Rig::shipped(policy, 30);
+    let sid = r.open_with(&sellers[0], "work")["session"].as_str().unwrap().to_string();
+    r.ln.set_mode(Send::Fail);
+    let mut seen = vec![];
+    for wait in [31, 61, 121] {
+        let hashes = r.offer(&sid);
+        let locked = r.lock(&sid, hashes.iter().map(|h| (h.clone(), sellers[0].invoice(r.now(), h, &Inv::default()))).collect());
+        let s = r.status()["sessions"][0].clone();
+        seen.push((hashes.len(), locked["held_less"]["slot_failed"].as_i64().unwrap(), s["pool"].as_i64().unwrap(), s["slot_fails"].as_i64().unwrap(),
+                   s["hold_why"].as_str().unwrap().to_string()));
+        assert!(r.offer(&sid).is_empty(), "nothing is offered during the wait");
+        r.pass(wait - 2);
+        assert!(r.offer(&sid).is_empty(), "the wait is {} s", wait - 1);
+        r.pass(2);
+    }
+    assert_eq!(seen, [(2, 2, 1, 1, "ticket_slots".to_string()), (1, 1, 1, 2, "ticket_slots".to_string()), (1, 1, 0, 3, "ticket_route_full".to_string())]);
+    assert_eq!((r.ln.sends(), r.ledger_sum(), r.status()["locked"]["tickets"].as_i64()), (4, 0, Some(0)), "four payments failed, and nothing is locked or booked");
+    // a new session with that seller inside the ten minutes holds nothing either
+    r.call("ticket_stop", json!({"session": sid}));
+    let o = r.open_with(&sellers[0], "work");
+    assert_eq!((o["verdict"].as_str(), o["rule"].as_str()), (Some("deny"), Some("ticket_route_full")), "{o}");
+    assert_eq!(r.open_with(&sellers[2], "work")["verdict"], "allow", "another seller is another route");
+    r.pass(600);
+    let o = r.open_with(&sellers[0], "work");
+    assert_eq!((o["pool"].as_i64(), o["slot_fails"].as_i64()), (Some(1), Some(2)), "it starts again with one ticket, and one more failed round is ten more minutes: {o}");
+    let sid = o["session"].as_str().unwrap().to_string();
+    let hashes = r.offer(&sid);
+    r.lock(&sid, hashes.iter().map(|h| (h.clone(), sellers[0].invoice(r.now(), h, &Inv::default()))).collect());
+    let s = r.status()["sessions"].as_array().unwrap().iter().find(|s| s["session"] == sid.as_str()).cloned().unwrap();
+    assert_eq!((s["pool"].as_i64(), s["hold_why"].as_str()), (Some(0), Some("ticket_route_full")), "{s}");
+    // and a round that locks ends it
+    r.pass(601);
+    r.call("ticket_stop", json!({"session": sid}));
+    r.ln.set_mode(Send::Lock);
+    let sid = r.open_with(&sellers[0], "work")["session"].as_str().unwrap().to_string();
+    assert_eq!(r.fill_with(&sid, &sellers[0]).len(), 1);
+    assert_eq!(r.status()["sessions"].as_array().unwrap().iter().find(|s| s["session"] == sid.as_str()).unwrap()["slot_fails"], 0);
 }

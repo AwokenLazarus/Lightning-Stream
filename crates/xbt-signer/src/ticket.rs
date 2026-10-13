@@ -16,6 +16,17 @@
 //! * **The owner's numbers bound the seller's**: a term above the owner's bound refuses the seller
 //!   ([`Terms::parse`], [`sizing`]), and every cap is checked on the book's own counts
 //!   ([`Book::locked`]), never on a number a seller or a caller sends.
+//! * **A held ticket is never dust**: it is at least 546 sat, and at least the dust limit of either
+//!   side of every channel it may leave on ([`sizing`], [`channel_limits`]). A ticket below a
+//!   channel's dust limit has no output there and is lost to the miners in a force close.
+//! * **Held tickets take at most half of a channel's slots**: with the tickets to lock, the
+//!   payments pending on a channel they may leave on stay within half of what it carries, and the
+//!   book's held tickets within half of the smallest such channel; a channel that does not say
+//!   carries 30 ([`channel_limits`], [`Limits::room`]).
+//! * **A lock that fails for lack of a slot makes the wallet hold less**: one ticket fewer, a
+//!   wait, and after three rounds none ([`Session::lock_round`]).
+//! * **A prepaid ticket is spent when it is paid**: booked before its payment is sent, bought one
+//!   at a time, and never counted as held ([`Ticket::prepaid`]).
 //!
 //! Amounts from outside are parsed into `u64` millisatoshi and converted with checked arithmetic;
 //! a sum that does not fit is the largest amount, which every cap then refuses.
@@ -37,12 +48,32 @@ pub const TAG_LEN: usize = 32;
 pub const WIRE_VERSION: &str = "ticket/0";
 /// The defaults of the pool settings ([`TicketPolicy`] `many_sellers`, `pool`, `pool_many` and
 /// `floor_ticket_sats`): this is the one place they live. More sellers than `MANY_SELLERS` in one
-/// task: `POOL_MANY` tickets a seller instead of `POOL_FEW`; `FLOOR_MSAT` is the smallest ticket
-/// the wallet chooses by itself (64 sat).
-pub const MANY_SELLERS: usize = 8;
-pub const POOL_FEW: u32 = 8;
-pub const POOL_MANY: u32 = 2;
-pub const FLOOR_MSAT: u64 = 64_000;
+/// task: `POOL_MANY` tickets a seller instead of `POOL_FEW`. They are sized for a channel that
+/// carries 30 pending payments for everyone who uses it (Core Lightning's default): 2 tickets
+/// held with a seller, 1 with each of more than 4. `FLOOR_MSAT` is the smallest ticket that is
+/// ever held, whatever the owner's setting says: 546 sat, the larger of the dust limits of the two
+/// node implementations on this network.
+pub const MANY_SELLERS: usize = 4;
+pub const POOL_FEW: u32 = 2;
+pub const POOL_MANY: u32 = 1;
+pub const FLOOR_MSAT: u64 = xbt402::ticket::MIN_HELD_TICKET_MSAT;
+/// The weight of the transaction that claims a received HTLC on a channel without anchors
+/// (BOLT 3): there, an HTLC has an output only above the dust limit plus this transaction's fee.
+pub const HTLC_SUCCESS_WEIGHT: u64 = 703;
+/// The fee rate that fee is taken at, as a multiple of the channel's present one: a ticket must
+/// stay above dust while it is held, and the rate can rise meanwhile.
+pub const DUST_FEE_MARGIN: u64 = 4;
+/// After a lock that failed for lack of a slot the wallet locks nothing with that seller for this
+/// long, doubling with each failed round in a row up to [`SLOT_WAIT_MAX_S`].
+pub const SLOT_WAIT_S: f64 = 30.0;
+pub const SLOT_WAIT_MAX_S: f64 = 600.0;
+/// Failed rounds in a row after which the wallet holds no ticket with that seller.
+pub const SLOT_FAILS_MAX: u32 = 3;
+/// Why a session holds nothing ([`Session::hold_why`]): its route had no slot three rounds in a row.
+pub const ROUTE_FULL: &str = "ticket_route_full";
+/// Refusals of a held ticket that are no fault of the seller's terms or the owner's budgets, and
+/// leave prepaid tickets, or another rail, as the way to pay: no slot, dust, a full route.
+pub const HOLD_SHORT: [&str; 4] = ["ticket_slots", "ticket_dust", ROUTE_FULL, "ticket_slots_short"];
 /// The default of `tickets.http_idle_s`: a session the wallet pays over HTTP is stopped, and its
 /// unused tickets cancelled, after this long without a paid request. Below the gateway's own five
 /// minutes, so that the wallet cancels before the seller does.
@@ -115,6 +146,22 @@ impl Seed {
         out[..16].copy_from_slice(nonce);
         out[16..].copy_from_slice(&mac[..16]);
         out
+    }
+
+    /// What the payment of a prepaid ticket carries in [`TAG_RECORD`]. Its hash is the seller's, so
+    /// no nonce derives it: the tag is a random nonce and a MAC over both under another label.
+    pub fn prepaid_tag(&self, nonce: &[u8; 16], hash: &[u8; 32]) -> [u8; TAG_LEN] {
+        let mac = hmac(&*self.0, &[b"xbt/ticket/prepaid-tag/v0", nonce, hash]);
+        let mut out = [0u8; TAG_LEN];
+        out[..16].copy_from_slice(nonce);
+        out[16..].copy_from_slice(&mac[..16]);
+        out
+    }
+
+    /// The nonce in `tag`, if this seed made it as the tag of a prepaid ticket's payment for this hash.
+    pub fn read_prepaid_tag(&self, tag: &[u8], hash: &[u8; 32]) -> Option<[u8; 16]> {
+        let nonce: [u8; 16] = tag.get(..16)?.try_into().ok()?;
+        (tag.len() == TAG_LEN && self.prepaid_tag(&nonce, hash)[..] == *tag).then_some(nonce)
     }
 
     /// The nonce in `tag`, if this seed made the tag for this hash and the nonce derives the hash.
@@ -190,12 +237,12 @@ pub fn session_name_ok(s: &str) -> bool {
 /// What `velocity_max` counts of ticket payments (policy.json `tickets.velocity`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Velocity {
-    /// Every release is one payment: the reading that pays least, and the default. With the
-    /// shipped `velocity_max` of 8 an hour a wallet releases at most 8 tickets an hour.
+    /// Every release is one payment: the reading that pays least. With the shipped
+    /// `velocity_max` of 8 an hour a wallet releases at most 8 tickets an hour.
     Release,
     /// A session is one payment, counted from its first release for as long as one of its
-    /// releases is inside the window. What bounds the releases of a session is then the budgets,
-    /// the caps on locked funds and `max_sends_per_hour`.
+    /// releases is inside the window: the default. What bounds the releases of a session is then
+    /// the budgets, the caps on locked funds and `max_sends_per_hour`.
     Session,
 }
 
@@ -301,12 +348,15 @@ pub struct TicketPolicy {
 
 impl Default for TicketPolicy {
     fn default() -> Self {
-        // one seller at the wire's defaults fits (8 tickets of 1,000 sat for 40 blocks, through two
-        // hops of 80 blocks and the node's 3), and nothing is paid until the owner names a task
+        // one seller at the wire's defaults fits (2 tickets of 1,000 sat for 40 blocks, through two
+        // hops of 80 blocks and the node's 3), and nothing is paid until the owner names a task.
+        // In all, 15 held tickets: half of a channel that carries 30 pending payments
+        let half = i64::from(xbt402::ticket::held_budget(xbt402::ticket::DEFAULT_CHANNEL_SLOTS));
         Self { enabled: false, max_ticket_sats: 1_000, max_ticket_blocks: 40, max_htlc_blocks: 204, max_invoice_expiry_s: 3_600,
-               max_locked_sats: 16_000, max_locked_tickets: 64, seller_max_tickets: 8, seller_max_locked_sats: 8_000, max_sellers: 32,
+               max_locked_sats: half * 1_000, max_locked_tickets: half, seller_max_tickets: POOL_FEW as i64,
+               seller_max_locked_sats: POOL_FEW as i64 * 1_000, max_sellers: half,
                max_new_sellers_per_min: 30, max_sends_per_hour: 1_200, pool: POOL_FEW as i64, pool_many: POOL_MANY as i64,
-               many_sellers: MANY_SELLERS as i64, floor_ticket_sats: (FLOOR_MSAT / 1000) as i64, velocity: Velocity::Release,
+               many_sellers: MANY_SELLERS as i64, floor_ticket_sats: (FLOOR_MSAT / 1000) as i64, velocity: Velocity::Session,
                http_idle_s: HTTP_IDLE_S, ready_wait_ms: READY_WAIT_MS, read_timeout_s: READ_TIMEOUT_S, max_answer_s: MAX_ANSWER_S,
                tasks: BTreeMap::new() }
     }
@@ -340,8 +390,13 @@ impl TicketPolicy {
                            max_sends_per_hour: i(m, "max_sends_per_hour", d.max_sends_per_hour), pool: i(m, "pool", d.pool),
                            pool_many: i(m, "pool_many", d.pool_many), many_sellers: i(m, "many_sellers", d.many_sellers),
                            floor_ticket_sats: i(m, "floor_ticket_sats", d.floor_ticket_sats),
-                           // anything but the word "session" is the default: a misspelling never widens
-                           velocity: if m.get("velocity").and_then(Value::as_str) == Some("session") { Velocity::Session } else { Velocity::Release },
+                           // left out: the default, a session is one payment. Anything that is not the word
+                           // "session" counts every release: a misspelling never widens
+                           velocity: match m.get("velocity").filter(|v| !v.is_null()) {
+                               None => d.velocity,
+                               Some(v) if v.as_str() == Some("session") => Velocity::Session,
+                               Some(_) => Velocity::Release,
+                           },
                            http_idle_s: i(m, "http_idle_s", d.http_idle_s), ready_wait_ms: i(m, "ready_wait_ms", d.ready_wait_ms),
                            read_timeout_s: i(m, "read_timeout_s", d.read_timeout_s), max_answer_s: i(m, "max_answer_s", d.max_answer_s),
                            tasks: BTreeMap::new() };
@@ -350,8 +405,9 @@ impl TicketPolicy {
             if !task_name_ok(name) {
                 continue;
             }
-            // a task's own caps default to the rail's; for a seller the owner has not named, to two
-            // tickets locked and four tickets' worth paid in the task's window
+            // a task's own caps default to the rail's; for a seller the owner has not named, to the
+            // smaller pool held (`pool_many`), two tickets' worth locked and four tickets' worth
+            // paid in the task's window
             let two = p.max_ticket_sats.saturating_mul(2);
             p.tasks.insert(name.clone(), TaskPolicy {
                 budget_sats: i(t, "budget_sats", 0), window_s: i(t, "window_s", 86_400).clamp(1, MAX_TASK_WINDOW_S),
@@ -394,12 +450,21 @@ pub fn validate(raw: &Value, errors: &mut Vec<String>, warnings: &mut Vec<String
     }
     if let Some(v) = m.get("velocity").filter(|v| !v.is_null()) {
         if !matches!(v.as_str(), Some("release" | "session")) {
-            errors.push("policy.json tickets.velocity: must be \"release\" (every release is one payment for velocity_max) or \"session\" (a session is one)".into());
+            errors.push("policy.json tickets.velocity: must be \"session\" (a ticket session is one payment for velocity_max: the default) or \"release\" (every release is one)".into());
         }
     }
     let p = TicketPolicy::from_map(m);
     if p.pool == 0 || p.pool_many == 0 {
-        warnings.push("policy.json tickets.pool or pool_many is 0: no ticket is locked".into());
+        warnings.push("policy.json tickets.pool or pool_many is 0: no ticket is held".into());
+    }
+    if p.floor_ticket_sats < (FLOOR_MSAT / 1000) as i64 {
+        warnings.push(format!("policy.json tickets.floor_ticket_sats {} is below {} sat: a held ticket is never smaller than that, whatever this says (below a \
+                               channel's dust limit it could not be claimed on chain)", p.floor_ticket_sats, FLOOR_MSAT / 1000));
+    }
+    let half = i64::from(xbt402::ticket::held_budget(xbt402::ticket::DEFAULT_CHANNEL_SLOTS));
+    if p.max_locked_tickets > half {
+        warnings.push(format!("policy.json tickets.max_locked_tickets {} is above {half}: on a channel that carries 30 pending payments (a channel with a Core \
+                               Lightning node) the wallet holds at most {half} whatever this says, half of what the channel carries", p.max_locked_tickets));
     }
     match m.get("tasks") {
         None | Some(Value::Null) => {}
@@ -455,6 +520,17 @@ pub struct Terms {
     pub min_ticket_msat: Option<u64>,
     pub max_tickets: u32,
     pub ticket_blocks: u32,
+    pub settle: Settle,
+}
+
+/// How a seller's tickets are settled (`settle` in its terms).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Settle {
+    /// A held payment, settled when its secret is used: it can be had back, and takes a slot.
+    OnUse,
+    /// An ordinary payment, settled when it arrives (a prepaid ticket): spent when it is paid,
+    /// and it holds nothing.
+    OnArrival,
 }
 
 pub type Refusal = (&'static str, String);
@@ -490,9 +566,11 @@ impl Terms {
         if !x.get("features").and_then(Value::as_array).is_some_and(|a| a.iter().any(|f| f.as_u64() == Some(crate::bolt11::FEATURE_BLAKE2B as u64))) {
             return refuse("ticket_feature_512", "the terms do not list feature bit 512: not an XBT Lightning seller");
         }
-        if s(x, "settle") != "on-use" {
-            return refuse("ticket_terms", format!("settle {:?}: only \"on-use\" (hold invoices) is supported", s(x, "settle")));
-        }
+        let settle = match s(x, "settle").as_str() {
+            xbt402::ticket::SETTLE_ON_USE => Settle::OnUse,
+            xbt402::ticket::SETTLE_ON_ARRIVAL => Settle::OnArrival,
+            other => return refuse("ticket_terms", format!("settle {other:?} is neither \"on-use\" (held tickets) nor \"on-arrival\" (prepaid tickets)")),
+        };
         if !matches!(s(x, "release").as_str(), "with-request" | "after-verify") {
             return refuse("ticket_terms", format!("release {:?} is neither \"with-request\" nor \"after-verify\"", s(x, "release")));
         }
@@ -506,26 +584,106 @@ impl Terms {
             return refuse("ticket_terms", "minTicketMsat is above ticketMsat");
         }
         let small = |k: &str| num(k).and_then(|n| u32::try_from(n).map_err(|_| ("ticket_terms", format!("{k} is too large"))));
-        Ok(Self { payee, ticket_msat, min_ticket_msat, max_tickets: small("maxTickets")?, ticket_blocks: small("ticketBlocks")? })
+        Ok(Self { payee, ticket_msat, min_ticket_msat, max_tickets: small("maxTickets")?, ticket_blocks: small("ticketBlocks")?, settle })
     }
+}
+
+/// What the wallet's own channels allow of held tickets ([`channel_limits`]): the two limits a
+/// ticket meets on the first channel of its route. Nobody can know a remote channel's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// The pending payments the smallest of the channels a ticket may leave on carries each way.
+    pub slots: u32,
+    /// How many more payments may be pending on the fullest of those channels before it is past
+    /// half of what it carries. Not above 0 when one already is.
+    pub room: i64,
+    /// The smallest ticket that has an output on every one of those channels, whichever side
+    /// closes it, in msat. Never below [`FLOOR_MSAT`].
+    pub dust_msat: u64,
+}
+
+impl Limits {
+    /// What is assumed of channels that cannot be seen: 30 slots, of which none is known to be
+    /// taken, and the larger of the two dust limits.
+    pub fn unseen() -> Self {
+        let slots = xbt402::ticket::DEFAULT_CHANNEL_SLOTS;
+        Self { slots, room: i64::from(xbt402::ticket::held_budget(slots)), dust_msat: FLOOR_MSAT }
+    }
+
+    /// The held tickets the wallet may have in all: half of the smallest channel's slots.
+    pub fn budget(&self) -> i64 {
+        i64::from(xbt402::ticket::held_budget(self.slots))
+    }
+
+    /// How many more tickets may be locked now: what is left of the budget after the `held`
+    /// tickets the book already has, and what is left of half the fullest channel after the
+    /// payments pending on it and the `unseen` tickets on their way to the node.
+    pub fn room(&self, held: i64, unseen: i64) -> i64 {
+        self.budget().saturating_sub(held).min(self.room.saturating_sub(unseen)).max(0)
+    }
+}
+
+/// The limits of the channels `ids` among the node's channel list `chans` (`GET /v1/channels`).
+/// A channel's slots are the smaller of the two `max_accepted_htlcs` its node reports for it (a
+/// Core Lightning node also sends no more than it accepts); its dust limit the larger of the two
+/// `dust_limit_sat`, and on a channel that is not an anchor channel the fee of
+/// [`HTLC_SUCCESS_WEIGHT`] at [`DUST_FEE_MARGIN`] times its fee rate on top. A number the listing
+/// does not give is the cautious one (30 slots, 546 sat), never a large one. No channel named:
+/// [`Limits::unseen`].
+pub fn channel_limits(chans: &[Value], ids: &[String]) -> Limits {
+    let num = |v: Option<&Value>| outside_u64(v);
+    let mut out: Option<Limits> = None;
+    for c in chans.iter().filter(|c| num(c.get("chan_id")).is_some_and(|id| ids.iter().any(|i| *i == id.to_string()))) {
+        let side = |s: &str, k: &str| num(c.get(s).and_then(|x| x.get(k)));
+        let slots = match (side("local_constraints", "max_accepted_htlcs"), side("remote_constraints", "max_accepted_htlcs")) {
+            (Some(a), Some(b)) if a > 0 && b > 0 => u32::try_from(a.min(b)).unwrap_or(u32::MAX).min(xbt402::ticket::MAX_CHANNEL_SLOTS),
+            _ => xbt402::ticket::DEFAULT_CHANNEL_SLOTS,
+        };
+        let pending = c.get("pending_htlcs").and_then(Value::as_array).map_or(0, |a| a.iter().filter(|h| h.get("incoming") != Some(&Value::Bool(true))).count());
+        let room = i64::from(xbt402::ticket::held_budget(slots)).saturating_sub(i64::try_from(pending).unwrap_or(i64::MAX));
+        let dust_sat = match (side("local_constraints", "dust_limit_sat"), side("remote_constraints", "dust_limit_sat")) {
+            (Some(a), Some(b)) => a.max(b),
+            _ => FLOOR_MSAT / 1000,
+        };
+        // anchors, and the channel types built on them, have HTLC transactions that pay no fee: the dust
+        // limit is the threshold at any fee rate. Any other type the listing names has the fee on top
+        let kind = c.get("commitment_type").and_then(Value::as_str).map(str::to_ascii_uppercase);
+        let anchors = kind.as_deref().is_none_or(|k| k.contains("ANCHOR") || k.contains("SCRIPT_ENFORCED_LEASE") || k.contains("TAPROOT"));
+        let fee_sat = if anchors {
+            0
+        } else {
+            num(c.get("fee_per_kw")).unwrap_or(0).saturating_mul(DUST_FEE_MARGIN).saturating_mul(HTLC_SUCCESS_WEIGHT).div_ceil(1000)
+        };
+        let dust_msat = dust_sat.saturating_add(fee_sat).saturating_mul(1000).max(FLOOR_MSAT);
+        out = Some(match out {
+            None => Limits { slots, room, dust_msat },
+            Some(l) => Limits { slots: l.slots.min(slots), room: l.room.min(room), dust_msat: l.dust_msat.max(dust_msat) },
+        });
+    }
+    out.unwrap_or_else(Limits::unseen)
 }
 
 /// A session's pool, decided when it opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sizing {
     pub ticket_msat: u64,
-    /// Unreleased tickets the pool is filled to; a refill starts below half of it.
+    /// Unreleased tickets the pool is filled to; a refill starts when half of it or fewer are left.
     pub pool: u32,
 }
 
-/// The ticket size and pool for a seller: 8 tickets of the seller's size for a task with a few
-/// sellers; 2 tickets sized to half of what the seller is expected to earn, with a floor of 64 sat,
-/// for a task with more than [`MANY_SELLERS`]. The seller's terms and the owner's caps bound both.
-/// `cap_tickets` and `cap_locked_sats` are the owner's caps for this seller.
-pub fn sizing(terms: &Terms, pol: &TicketPolicy, sellers_in_task: usize, expect_msat: Option<u64>, cap_tickets: i64, cap_locked_sats: i64)
-              -> Result<Sizing, Refusal> {
+/// The ticket size and pool for a seller: 2 tickets of the seller's size for a task with a few
+/// sellers; 1 ticket sized to what the seller is expected to earn for a task with more than
+/// [`MANY_SELLERS`]. The seller's terms and the owner's caps bound both. `cap_tickets` and
+/// `cap_locked_sats` are the owner's caps for this seller. `dust_msat`: the smallest ticket that
+/// may be held on the wallet's channels ([`Limits::dust_msat`]); a ticket is never held below it
+/// or below 546 sat (`ticket_dust`). `slot_room`: how many more held tickets the slot budget has
+/// room for ([`Limits::room`], less what open sessions will still lock); with none, no ticket is
+/// held with this seller (`ticket_slots`).
+#[allow(clippy::too_many_arguments)]
+pub fn sizing(terms: &Terms, pol: &TicketPolicy, sellers_in_task: usize, expect_msat: Option<u64>, cap_tickets: i64, cap_locked_sats: i64, dust_msat: u64,
+              slot_room: i64) -> Result<Sizing, Refusal> {
     let many = sellers_in_task as i64 > pol.many_sellers;
-    let floor_msat = (pol.floor_ticket_sats.max(0) as u64).saturating_mul(1000);
+    let floor_msat = (pol.floor_ticket_sats.max(0) as u64).saturating_mul(1000).max(dust_msat).max(FLOOR_MSAT);
     let pool_of = |n: i64| u32::try_from(n.max(0)).unwrap_or(u32::MAX);
     if i64::from(terms.ticket_blocks) > pol.max_ticket_blocks {
         return refuse("ticket_blocks", format!("ticketBlocks {} is above the owner's tickets.max_ticket_blocks {}", terms.ticket_blocks, pol.max_ticket_blocks));
@@ -539,9 +697,14 @@ pub fn sizing(terms: &Terms, pol: &TicketPolicy, sellers_in_task: usize, expect_
         None => terms.ticket_msat,
         Some(min) => {
             let hi = terms.ticket_msat.min(owner_max);
-            let lo = if many { min.max(floor_msat) } else { min };
+            // never below the floor: a held ticket under a channel's dust limit cannot be claimed on chain
+            let lo = min.max(floor_msat);
+            if terms.ticket_msat < floor_msat {
+                return refuse("ticket_dust", format!("the seller's ticket of {} msat is below {floor_msat} msat, the smallest that may be held: below a \
+                                                      channel's dust limit a held payment has no output and is lost if the channel is force-closed", terms.ticket_msat));
+            }
             if hi < lo {
-                return refuse("ticket_size", format!("the seller's smallest ticket ({lo} msat) is above what the owner allows for this seller ({owner_max} msat)"));
+                return refuse("ticket_size", format!("the smallest ticket that may be held with this seller ({lo} msat) is above what the owner allows for it ({owner_max} msat)"));
             }
             match expect_msat {
                 Some(e) if many => e.div_ceil(u64::from(pool_of(pol.pool_many).max(1))).clamp(lo, hi),
@@ -549,8 +712,9 @@ pub fn sizing(terms: &Terms, pol: &TicketPolicy, sellers_in_task: usize, expect_
             }
         }
     };
-    if ticket_msat < 1000 {
-        return refuse("ticket_size", "a ticket below 1 sat: no node forwards it");
+    if ticket_msat < floor_msat {
+        return refuse("ticket_dust", format!("a ticket of {ticket_msat} msat is below {floor_msat} msat, the smallest that may be held: below a channel's dust \
+                                              limit a held payment has no output and is lost if the channel is force-closed"));
     }
     let base = if many { pool_of(pol.pool_many) } else { pool_of(pol.pool) };
     let by_sats = cap_locked_sats.max(0) as u64 / sats_ceil(ticket_msat).max(1) as u64;
@@ -558,7 +722,41 @@ pub fn sizing(terms: &Terms, pol: &TicketPolicy, sellers_in_task: usize, expect_
     if pool == 0 {
         return refuse("ticket_seller_cap", "the owner's caps for this seller allow no ticket of this size");
     }
+    let pool = pool.min(slot_room.max(0) as u64);
+    if pool == 0 {
+        return refuse("ticket_slots", "the wallet's held tickets already take half of the pending payments its channel carries: no further ticket is held");
+    }
     Ok(Sizing { ticket_msat, pool: pool as u32 })
+}
+
+/// The size of a prepaid ticket with this seller, from its `on-arrival` terms: the seller's one
+/// size, inside the owner's largest ticket. It is paid at once and never held, so neither a dust
+/// limit nor a slot bounds it.
+pub fn prepaid_size(terms: &Terms, pol: &TicketPolicy) -> Result<u64, Refusal> {
+    if i64::from(terms.ticket_blocks) > pol.max_ticket_blocks {
+        return refuse("ticket_blocks", format!("ticketBlocks {} is above the owner's tickets.max_ticket_blocks {}", terms.ticket_blocks, pol.max_ticket_blocks));
+    }
+    if terms.ticket_msat > pol.max_ticket_msat() {
+        return refuse("ticket_size", format!("a prepaid ticket of {} msat is above the owner's tickets.max_ticket_sats ({} msat)", terms.ticket_msat,
+                                             pol.max_ticket_msat()));
+    }
+    if terms.ticket_msat < 1000 {
+        return refuse("ticket_size", "a ticket below 1 sat: no node forwards it");
+    }
+    Ok(terms.ticket_msat)
+}
+
+/// Whether a ticket payment's failure, as the node names it, is what a full channel looks like: a
+/// channel out of slots is reported as a balance that is short, or as no route (a hop's failure
+/// names no cause). The buyer cannot tell a full hop from an empty one, and holds less either way.
+pub fn slot_failure(reason: &str) -> bool {
+    let r = reason.to_ascii_uppercase();
+    ["INSUFFICIENT_BALANCE", "NO_ROUTE", "FAILURE_REASON_ERROR"].iter().any(|k| r.contains(k)) || r == "ERROR"
+}
+
+/// How long nothing is locked after the `fails`-th failed round in a row: 30 s, doubling to 10 minutes.
+pub fn slot_wait_s(fails: u32) -> f64 {
+    (SLOT_WAIT_S * f64::from(2u32.saturating_pow(fails.saturating_sub(1).min(16)))).min(SLOT_WAIT_MAX_S)
 }
 
 // --- the book --------------------------------------------------------------------------------------
@@ -657,15 +855,24 @@ pub struct Ticket {
     /// When it settled or failed, and why it failed.
     pub done_ts: f64,
     pub note: String,
+    /// A prepaid ticket: an ordinary payment for a hash of the seller's, spent when it is paid.
+    /// Booked (`released`) before the payment is sent and never `locked`: no secret of this
+    /// wallet's releases it, and its nonce only makes the payment's tag.
+    pub prepaid: bool,
 }
 
 impl Ticket {
     pub fn row(&self) -> Value {
-        json!({"e": "ticket", "hash": self.hash, "nonce": hex::encode(self.nonce), "session": self.session, "payee": self.payee, "task": self.task,
+        let mut r = json!({"e": "ticket", "hash": self.hash, "nonce": hex::encode(self.nonce), "session": self.session, "payee": self.payee, "task": self.task,
                "msat": self.msat.to_string(), "fee_limit_msat": self.fee_limit_msat.to_string(), "state": self.state.as_str(), "ts": ts_value(self.ts),
                "sent_ts": ts_value(self.sent_ts), "invoice_expires": ts_value(self.invoice_expires), "released_ts": ts_value(self.released_ts),
                "booked_sats": self.booked_sats, "cltv_until": self.cltv_until, "final_expiry": self.final_expiry,
-               "fee_msat": self.fee_msat.to_string(), "done_ts": ts_value(self.done_ts), "note": self.note})
+               "fee_msat": self.fee_msat.to_string(), "done_ts": ts_value(self.done_ts), "note": self.note});
+        // written only when set: a row from before prepaid tickets reads as a held one
+        if self.prepaid {
+            r["prepaid"] = true.into();
+        }
+        r
     }
 
     fn from_row(r: &Value) -> Option<Self> {
@@ -680,14 +887,19 @@ impl Ticket {
                     state: TState::parse(&str_or_empty(r.get("state")))?, ts: f("ts")?, sent_ts: f("sent_ts")?, invoice_expires: f("invoice_expires")?,
                     released_ts: f("released_ts")?, booked_sats: py_int(r.get("booked_sats")).filter(|n| *n >= 0)?,
                     cltv_until: py_int(r.get("cltv_until"))?, final_expiry: py_int(r.get("final_expiry"))?, fee_msat: outside_u64(r.get("fee_msat"))?,
-                    done_ts: f("done_ts")?, note: str_or_empty(r.get("note")) })
+                    done_ts: f("done_ts")?, note: str_or_empty(r.get("note")),
+                    prepaid: match r.get("prepaid") {
+                        None => false,
+                        Some(v) => v.as_bool()?,
+                    } })
     }
 
     /// What the reply to a caller shows of a ticket: never its nonce.
     pub fn public(&self) -> Value {
         json!({"hash": self.hash, "state": self.state.as_str(), "msat": self.msat.to_string(), "booked_sats": self.booked_sats,
                "fee_msat": self.fee_msat.to_string(), "cltv_until": self.cltv_until, "final_expiry": self.final_expiry,
-               "sent_ts": ts_value(self.sent_ts), "released_ts": ts_value(self.released_ts), "done_ts": ts_value(self.done_ts), "note": self.note})
+               "sent_ts": ts_value(self.sent_ts), "released_ts": ts_value(self.released_ts), "done_ts": ts_value(self.done_ts), "note": self.note,
+               "prepaid": self.prepaid})
     }
 }
 
@@ -736,6 +948,14 @@ pub struct Session {
     /// speaks HTTP to the seller ([`crate::ticket_pay`]). Kept so that a wallet that restarted can
     /// still ask for its tickets to be cancelled.
     pub http: Option<SellerSession>,
+    /// The size of a prepaid ticket with this seller, in msat, where its terms offer them
+    /// (`settle: "on-arrival"`); 0 where they do not.
+    pub prepaid_msat: u64,
+    /// Lock rounds in a row that failed for lack of a slot.
+    pub slot_fails: u32,
+    /// Nothing is locked for this session before this time (0: no wait), and why.
+    pub hold_until: f64,
+    pub hold_why: String,
 }
 
 /// The seller's side of a session the wallet pays over HTTP: the id and the key the seller gave in
@@ -763,7 +983,47 @@ impl Session {
         if let Some(h) = &self.http {
             r["http"] = json!({"id": h.id, "key": hex::encode(h.key), "base": h.base});
         }
+        // written only when set: a row from before reads as a session that holds and waits for nothing
+        if self.prepaid_msat > 0 {
+            r["prepaid_msat"] = self.prepaid_msat.to_string().into();
+        }
+        if self.slot_fails > 0 || self.hold_until > 0.0 || !self.hold_why.is_empty() {
+            r["hold"] = json!({"fails": self.slot_fails, "until": ts_value(self.hold_until), "why": self.hold_why});
+        }
         r
+    }
+
+    /// Whether this session pays with a prepaid ticket now: the seller offers them, and no ticket
+    /// is held (a pool of none) or none may be locked for the moment (a wait).
+    pub fn prepaid_now(&self, now: f64) -> bool {
+        self.prepaid_msat > 0 && (self.pool == 0 || now < self.hold_until)
+    }
+
+    /// What a lock round came to: `locked` tickets the node holds, `slot_failed` that failed as a
+    /// full channel does ([`slot_failure`]). A failure halves the pool (never below 1) and sets
+    /// the wait; the third failed round in a row ends holding with this seller (a pool of none,
+    /// [`ROUTE_FULL`]). A round that locked and failed nothing ends the run of failures. Returns
+    /// whether anything changed.
+    pub fn lock_round(&mut self, locked: usize, slot_failed: usize, now: f64) -> bool {
+        if slot_failed == 0 {
+            let had = self.slot_fails;
+            if locked > 0 {
+                self.slot_fails = 0;
+            }
+            return had != self.slot_fails;
+        }
+        if locked == 0 {
+            self.slot_fails = self.slot_fails.saturating_add(1);
+        }
+        self.pool = (self.pool / 2).max(1).min(self.pool);
+        self.hold_until = now + slot_wait_s(self.slot_fails.max(1));
+        self.hold_why = "ticket_slots".into();
+        if self.slot_fails >= SLOT_FAILS_MAX {
+            self.pool = 0;
+            self.hold_until = now + SLOT_WAIT_MAX_S;
+            self.hold_why = ROUTE_FULL.into();
+        }
+        true
     }
 
     fn from_row(r: &Value) -> Option<Self> {
@@ -788,13 +1048,28 @@ impl Session {
                         // a row that names a seller session names all of it, or the row is damage
                         Some(h) => Some(SellerSession { id: str_or_empty(h.get("id")), key: hex::decode(str_or_empty(h.get("key"))).ok()?.try_into().ok()?,
                                                         base: str_or_empty(h.get("base")) }),
-                    } })
+                    },
+                    prepaid_msat: match r.get("prepaid_msat") {
+                        None => 0,
+                        Some(v) => outside_u64(Some(v))?,
+                    },
+                    slot_fails: match r.get("hold") {
+                        None => 0,
+                        Some(h) => outside_u64(h.get("fails")).and_then(|n| u32::try_from(n).ok())?,
+                    },
+                    hold_until: match r.get("hold") {
+                        None => 0.0,
+                        Some(h) => h.get("until").and_then(Value::as_f64)?,
+                    },
+                    hold_why: r.get("hold").map(|h| str_or_empty(h.get("why"))).unwrap_or_default() })
     }
 
     pub fn public(&self) -> Value {
         json!({"session": self.id, "payee": self.payee, "origin": self.origin, "task": self.task, "listed": self.listed,
                "ticket_msat": self.ticket_msat.to_string(), "pool": self.pool, "state": self.state.as_str(), "opened_ts": ts_value(self.opened_ts),
-               "stopped_ts": ts_value(self.stopped_ts), "closed_ts": ts_value(self.closed_ts), "why": self.why, "http": self.http.is_some()})
+               "stopped_ts": ts_value(self.stopped_ts), "closed_ts": ts_value(self.closed_ts), "why": self.why, "http": self.http.is_some(),
+               "prepaid_msat": self.prepaid_msat.to_string(), "hold_until": ts_value(self.hold_until), "hold_why": self.hold_why,
+               "slot_fails": self.slot_fails})
     }
 }
 
@@ -911,9 +1186,41 @@ impl Book {
         v
     }
 
-    /// How many hashes a session's pool wants now: up to its target once fewer than half of it are
-    /// unreleased, counting hashes offered and not yet lapsed as on their way.
+    /// The held tickets the open sessions are set to hold: what they have locked or will lock.
+    /// A new session's pool is sized inside what the slot budget has left after these.
+    pub fn pools_open(&self) -> i64 {
+        self.sessions.values().filter(|s| s.state == SState::Open).fold(0i64, |a, s| a.saturating_add(i64::from(s.pool)))
+    }
+
+    /// The last session with this seller that held less for lack of a slot, if its wait ended
+    /// less than [`SLOT_WAIT_MAX_S`] ago or has not ended. What it learnt outlasts it: a new
+    /// session with the seller starts with its smaller pool, its count of failed rounds and what
+    /// is left of its wait, so that stopping a session and opening another does not try at once
+    /// what just failed.
+    pub fn held_less(&self, payee: &str, now: f64) -> Option<&Session> {
+        self.sessions.values().filter(|s| s.payee == payee && HOLD_SHORT.contains(&s.hold_why.as_str()) && s.hold_why != "ticket_dust")
+            .filter(|s| s.hold_until > now - SLOT_WAIT_MAX_S).max_by(|a, b| a.hold_until.total_cmp(&b.hold_until).then_with(|| a.opened_ts.total_cmp(&b.opened_ts)))
+    }
+
+    /// A prepaid ticket of the session whose payment is not final: the next is bought only after it.
+    pub fn prepaid_pending(&self, session: &str) -> Option<&Ticket> {
+        self.tickets.values().find(|t| t.session == session && t.prepaid && !t.state.terminal())
+    }
+
+    /// Held tickets on their way to the node that it does not show yet (`on_node`: the payment
+    /// hashes pending on its channels): they take a slot each as soon as they arrive.
+    pub fn sending_unseen(&self, on_node: &dyn Fn(&str) -> bool) -> i64 {
+        i64::try_from(self.tickets.values().filter(|t| t.state == TState::Sending && !on_node(&t.hash)).count()).unwrap_or(i64::MAX)
+    }
+
+    /// How many hashes a session's pool wants now: up to its target once half of it or fewer are
+    /// unreleased (2 tickets: when 1 is left; 1 ticket: when it is spent), counting hashes offered
+    /// and not yet lapsed as on their way. None while the session waits after a lock that found
+    /// no slot, and none for a session that holds nothing.
     pub fn want(&self, s: &Session, now: f64) -> usize {
+        if s.pool == 0 || now < s.hold_until {
+            return 0;
+        }
         let (mut have, mut coming) = (0usize, 0usize);
         for t in self.tickets.values().filter(|t| t.session == s.id) {
             match t.state {
@@ -923,7 +1230,7 @@ impl Book {
             }
         }
         let pool = s.pool as usize;
-        if have + coming >= pool.div_ceil(2).max(1) {
+        if have + coming > pool / 2 {
             return 0;
         }
         pool.saturating_sub(have + coming).min(MAX_BATCH)
@@ -977,6 +1284,40 @@ pub fn check_ticket_invoice(inv: &crate::bolt11::Invoice, s: &Session, pol: &Tic
     Ok(())
 }
 
+/// What an invoice must say to be paid as a prepaid ticket of this session (`docs/TICKETS.md`
+/// section 5): the seller's node, the session's prepaid size and nothing else, the terms' final
+/// CLTV delta inside the owner's bound, payable for no longer than the owner allows. Its payment
+/// hash is the seller's own. The chain's prefix, feature bit 512 and a non-zero amount are
+/// [`crate::ln::check_invoice`]'s.
+pub fn check_prepaid_invoice(inv: &crate::bolt11::Invoice, s: &Session, pol: &TicketPolicy, now: f64) -> Result<(), Refusal> {
+    if s.prepaid_msat == 0 {
+        return refuse("ticket_terms", "this seller's terms offer no prepaid tickets");
+    }
+    if inv.payee_hex() != s.payee {
+        return refuse("ticket_payee", format!("the invoice pays {}, not the seller's node {}", inv.payee_hex(), s.payee));
+    }
+    if inv.amount_msat != Some(s.prepaid_msat) {
+        return refuse("ticket_amount", format!("the invoice is for {:?} msat, a prepaid ticket of this session is {} msat", inv.amount_msat, s.prepaid_msat));
+    }
+    if inv.min_final_cltv != u64::from(s.ticket_blocks) {
+        return refuse("ticket_blocks", format!("the invoice's final CLTV delta is {}, the terms said {}", inv.min_final_cltv, s.ticket_blocks));
+    }
+    if i64::try_from(inv.min_final_cltv).unwrap_or(i64::MAX) > pol.max_ticket_blocks {
+        return refuse("ticket_blocks", format!("a final CLTV delta of {} is above the owner's tickets.max_ticket_blocks {}", inv.min_final_cltv, pol.max_ticket_blocks));
+    }
+    if i64::try_from(inv.expiry_s).unwrap_or(i64::MAX) > pol.max_invoice_expiry_s {
+        return refuse("ticket_expiry", format!("the invoice stays payable for {} s, above the owner's tickets.max_invoice_expiry_s {}", inv.expiry_s,
+                                               pol.max_invoice_expiry_s));
+    }
+    if (inv.expires_at() as f64) < now + 5.0 {
+        return refuse("ticket_expiry", "the invoice has expired, or does within 5 s");
+    }
+    if inv.payment_secret.is_none() {
+        return refuse("ticket_invoice", "the invoice has no payment secret (payment_addr)");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -992,7 +1333,7 @@ mod tests {
     }
 
     fn terms(ticket_msat: u64, min: Option<u64>, max_tickets: u32) -> Terms {
-        Terms { payee: node_id(), ticket_msat, min_ticket_msat: min, max_tickets, ticket_blocks: 40 }
+        Terms { payee: node_id(), ticket_msat, min_ticket_msat: min, max_tickets, ticket_blocks: 40, settle: Settle::OnUse }
     }
 
     #[test]
@@ -1014,6 +1355,15 @@ mod tests {
         assert_eq!(seed().read_tag(&[tag.as_slice(), &[0]].concat(), &hash), None);
         // the tag gives nobody the secret: it is the nonce and a MAC, and the secret needs the seed
         assert!(!tag.windows(8).any(|w| seed().secret(&a).windows(8).any(|s| s == w)));
+        // a prepaid ticket's hash is the seller's: its tag is this seed's all the same, and is no held ticket's tag
+        let theirs = [0x5au8; 32];
+        let pt = seed().prepaid_tag(&a, &theirs);
+        assert_eq!(seed().read_prepaid_tag(&pt, &theirs), Some(a));
+        assert_eq!(seed().read_tag(&pt, &theirs), None, "no nonce of this seed derives the seller's hash");
+        assert_eq!(seed().read_prepaid_tag(&tag, &hash), None, "a held ticket's tag is not a prepaid one's");
+        assert_eq!(Seed::new([8u8; 32]).read_prepaid_tag(&pt, &theirs), None);
+        assert_eq!(seed().read_prepaid_tag(&pt, &hash), None, "moved to another payment");
+        assert_eq!(seed().read_prepaid_tag(&pt[..31], &theirs), None);
     }
 
     #[test]
@@ -1059,7 +1409,10 @@ mod tests {
         assert_eq!(with(&["payTo"], json!(node_id().to_uppercase())), Err("ticket_terms"), "upper case");
         assert_eq!(with(&["extra", "version"], json!("ticket/1")), Err("ticket_terms"));
         assert_eq!(with(&["extra", "features"], json!([9])), Err("ticket_feature_512"));
-        assert_eq!(with(&["extra", "settle"], json!("on-arrival")), Err("ticket_terms"));
+        assert_eq!(with(&["extra", "settle"], json!("on-arrival")).map(|t| t.settle), Ok(Settle::OnArrival), "prepaid tickets");
+        assert_eq!(t.settle, Settle::OnUse);
+        assert_eq!(with(&["extra", "settle"], json!("whenever")), Err("ticket_terms"));
+        assert_eq!(with(&["extra", "settle"], Value::Null), Err("ticket_terms"));
         assert_eq!(with(&["extra", "release"], json!("whenever")), Err("ticket_terms"));
         assert!(with(&["extra", "release"], json!("after-verify")).is_ok());
         for bad in [json!("0"), json!("-5"), json!(1.5), json!("1e6"), json!("18446744073709551616"), json!(null)] {
@@ -1073,34 +1426,181 @@ mod tests {
     }
 
     #[test]
-    fn a_pool_is_8_of_the_sellers_size_for_a_few_sellers_and_2_sized_to_earnings_for_many() {
+    fn a_pool_is_2_of_the_sellers_size_for_a_few_sellers_and_1_sized_to_earnings_for_many() {
         let pol = TicketPolicy::default();
-        let few = |t: &Terms, n: usize, e: Option<u64>| sizing(t, &pol, n, e, pol.seller_max_tickets, pol.seller_max_locked_sats);
-        assert_eq!(few(&terms(1_000_000, None, 8), 1, None), Ok(Sizing { ticket_msat: 1_000_000, pool: 8 }));
-        assert_eq!(few(&terms(1_000_000, None, 8), 8, None), Ok(Sizing { ticket_msat: 1_000_000, pool: 8 }), "8 sellers are still a few");
-        assert_eq!(few(&terms(1_000_000, None, 8), 9, None), Ok(Sizing { ticket_msat: 1_000_000, pool: 2 }), "a seller with one size keeps it");
-        assert_eq!(few(&terms(1_000_000, None, 3), 1, None).map(|s| s.pool), Ok(3), "the seller's maxTickets binds");
-        assert_eq!(few(&terms(1_000_000, None, 100), 1, None).map(|s| s.pool), Ok(8), "a seller that asks for 100 gets 8");
-        // sized to expected earnings: half each, between the floor and the seller's size
+        let free = Limits::unseen();
+        let few = |t: &Terms, n: usize, e: Option<u64>| sizing(t, &pol, n, e, pol.seller_max_tickets, pol.seller_max_locked_sats, free.dust_msat, free.room(0, 0));
+        assert_eq!(few(&terms(1_000_000, None, 8), 1, None), Ok(Sizing { ticket_msat: 1_000_000, pool: 2 }));
+        assert_eq!(few(&terms(1_000_000, None, 8), 4, None), Ok(Sizing { ticket_msat: 1_000_000, pool: 2 }), "4 sellers are still a few");
+        assert_eq!(few(&terms(1_000_000, None, 8), 5, None), Ok(Sizing { ticket_msat: 1_000_000, pool: 1 }), "a seller with one size keeps it");
+        assert_eq!(few(&terms(1_000_000, None, 1), 1, None).map(|s| s.pool), Ok(1), "the seller's maxTickets binds");
+        assert_eq!(few(&terms(1_000_000, None, 100), 1, None).map(|s| s.pool), Ok(2), "a seller that asks for 100 gets 2");
+        // sized to expected earnings, between the floor and the seller's size
         let flex = terms(1_000_000, Some(1_000), 8);
-        assert_eq!(few(&flex, 20, Some(300_000)), Ok(Sizing { ticket_msat: 150_000, pool: 2 }));
-        assert_eq!(few(&flex, 20, Some(10_000)), Ok(Sizing { ticket_msat: FLOOR_MSAT, pool: 2 }), "the 64 sat floor");
-        assert_eq!(few(&flex, 20, Some(u64::MAX)), Ok(Sizing { ticket_msat: 1_000_000, pool: 2 }), "never above the seller's size");
-        assert_eq!(few(&flex, 20, None), Ok(Sizing { ticket_msat: 1_000_000, pool: 2 }), "no expectation: the seller's size");
-        assert_eq!(few(&flex, 3, Some(10_000)), Ok(Sizing { ticket_msat: 1_000_000, pool: 8 }), "a few sellers: the seller's size");
-        assert_eq!(few(&terms(1_000_000, Some(200_000), 8), 20, Some(10_000)).map(|s| s.ticket_msat), Ok(200_000), "the seller's floor binds");
+        assert_eq!(few(&flex, 20, Some(700_000)), Ok(Sizing { ticket_msat: 700_000, pool: 1 }));
+        assert_eq!(few(&flex, 20, Some(10_000)), Ok(Sizing { ticket_msat: FLOOR_MSAT, pool: 1 }), "never below 546 sat");
+        assert_eq!(few(&flex, 20, Some(u64::MAX)), Ok(Sizing { ticket_msat: 1_000_000, pool: 1 }), "never above the seller's size");
+        assert_eq!(few(&flex, 20, None), Ok(Sizing { ticket_msat: 1_000_000, pool: 1 }), "no expectation: the seller's size");
+        assert_eq!(few(&flex, 3, Some(10_000)), Ok(Sizing { ticket_msat: 1_000_000, pool: 2 }), "a few sellers: the seller's size");
+        assert_eq!(few(&terms(1_000_000, Some(800_000), 8), 20, Some(10_000)).map(|s| s.ticket_msat), Ok(800_000), "the seller's floor binds");
         // the owner's bounds
         assert_eq!(few(&terms(5_000_000, None, 8), 1, None).map_err(|e| e.0), Err("ticket_size"), "one size, above the owner's");
-        assert_eq!(few(&terms(5_000_000, Some(500_000), 8), 1, None), Ok(Sizing { ticket_msat: 1_000_000, pool: 8 }), "a flexible seller is cut to it");
+        assert_eq!(few(&terms(5_000_000, Some(600_000), 8), 1, None), Ok(Sizing { ticket_msat: 1_000_000, pool: 2 }), "a flexible seller is cut to it");
         assert_eq!(few(&terms(5_000_000, Some(2_000_000), 8), 1, None).map_err(|e| e.0), Err("ticket_size"));
         assert_eq!(few(&Terms { ticket_blocks: 41, ..terms(1_000_000, None, 8) }, 1, None).map_err(|e| e.0), Err("ticket_blocks"));
-        assert_eq!(few(&terms(999, None, 8), 1, None).map_err(|e| e.0), Err("ticket_size"), "below 1 sat");
-        // an unnamed seller's caps: 2 tickets, 2,000 sat locked
-        assert_eq!(sizing(&terms(1_000_000, None, 8), &pol, 1, None, 2, 2_000), Ok(Sizing { ticket_msat: 1_000_000, pool: 2 }));
-        assert_eq!(sizing(&terms(1_000_000, None, 8), &pol, 1, None, 8, 1_500).map(|s| s.pool), Ok(1), "the locked-sats cap binds");
-        assert_eq!(sizing(&terms(1_000_000, None, 8), &pol, 1, None, 8, 999).map_err(|e| e.0), Err("ticket_size"));
-        assert_eq!(sizing(&terms(1_000_000, None, 8), &pol, 1, None, 0, 8_000).map_err(|e| e.0), Err("ticket_seller_cap"));
-        assert_eq!(sizing(&terms(1_000_000, None, 8), &pol, 1, None, -5, i64::MIN).map_err(|e| e.0), Err("ticket_size"), "negative caps allow nothing");
+        // an unnamed seller's caps: 1 ticket, 2,000 sat locked
+        assert_eq!(sizing(&terms(1_000_000, None, 8), &pol, 1, None, 1, 2_000, FLOOR_MSAT, 15), Ok(Sizing { ticket_msat: 1_000_000, pool: 1 }));
+        assert_eq!(sizing(&terms(1_000_000, None, 8), &pol, 1, None, 8, 1_500, FLOOR_MSAT, 15).map(|s| s.pool), Ok(1), "the locked-sats cap binds");
+        assert_eq!(sizing(&terms(1_000_000, None, 8), &pol, 1, None, 8, 999, FLOOR_MSAT, 15).map_err(|e| e.0), Err("ticket_size"));
+        assert_eq!(sizing(&terms(1_000_000, None, 8), &pol, 1, None, 0, 8_000, FLOOR_MSAT, 15).map_err(|e| e.0), Err("ticket_seller_cap"));
+        assert_eq!(sizing(&terms(1_000_000, None, 8), &pol, 1, None, -5, i64::MIN, FLOOR_MSAT, 15).map_err(|e| e.0), Err("ticket_size"), "negative caps allow nothing");
+    }
+
+    #[test]
+    fn a_held_ticket_is_never_dust() {
+        let pol = TicketPolicy::default();
+        let at = |t: &Terms, dust: u64| sizing(t, &pol, 1, None, 2, 2_000, dust, 15).map_err(|e| e.0);
+        // 546 sat is the least, whatever the seller offers and whatever the wallet sees
+        assert_eq!(at(&terms(546_000, None, 2), FLOOR_MSAT), Ok(Sizing { ticket_msat: 546_000, pool: 2 }));
+        assert_eq!(at(&terms(545_999, None, 2), FLOOR_MSAT), Err("ticket_dust"));
+        assert_eq!(at(&terms(64_000, None, 2), FLOOR_MSAT), Err("ticket_dust"), "the many-seller ticket of the earlier design");
+        assert_eq!(at(&terms(999, None, 2), FLOOR_MSAT), Err("ticket_dust"));
+        assert_eq!(at(&terms(64_000, None, 2), 0), Err("ticket_dust"), "a channel that claims no dust limit does not lower the floor");
+        // a seller that lets the buyer choose is asked for no less than the floor
+        assert_eq!(at(&terms(1_000_000, Some(64_000), 2), FLOOR_MSAT).map(|s| s.ticket_msat), Ok(1_000_000));
+        let many = |e: u64| sizing(&terms(1_000_000, Some(64_000), 2), &pol, 9, Some(e), 2, 2_000, FLOOR_MSAT, 15).map(|s| s.ticket_msat);
+        assert_eq!((many(64_000), many(600_000)), (Ok(546_000), Ok(600_000)));
+        assert_eq!(at(&terms(400_000, Some(64_000), 2), FLOOR_MSAT), Err("ticket_dust"), "its largest ticket is dust");
+        // a channel whose dust limit is higher raises it (a channel without anchors at a high fee rate)
+        assert_eq!(at(&terms(1_000_000, None, 2), 1_424_000), Err("ticket_dust"));
+        assert_eq!(at(&terms(1_000_000, Some(64_000), 2), 1_424_000), Err("ticket_dust"), "its largest ticket is dust on that channel");
+        assert_eq!(at(&terms(5_000_000, Some(64_000), 2), 1_424_000), Err("ticket_size"), "the least that may be held is above the owner's largest ticket");
+        // the owner's own floor can only raise it
+        let high = TicketPolicy::from_map(json!({"floor_ticket_sats": 800}).as_object().unwrap());
+        assert_eq!(sizing(&terms(700_000, None, 2), &high, 1, None, 2, 2_000, FLOOR_MSAT, 15).map_err(|e| e.0), Err("ticket_dust"));
+        let low = TicketPolicy::from_map(json!({"floor_ticket_sats": 64}).as_object().unwrap());
+        assert_eq!(sizing(&terms(64_000, None, 2), &low, 1, None, 2, 2_000, FLOOR_MSAT, 15).map_err(|e| e.0), Err("ticket_dust"));
+        let (mut errors, mut warnings) = (vec![], vec![]);
+        validate(&json!({"floor_ticket_sats": 64, "max_locked_tickets": 64}), &mut errors, &mut warnings);
+        assert!(errors.is_empty() && warnings.iter().any(|w| w.contains("floor_ticket_sats 64 is below 546")), "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("max_locked_tickets 64 is above 15")), "an earlier policy is told what it now means: {warnings:?}");
+        // a prepaid ticket is paid at once and never held: no floor but the node's 1 sat
+        let pre = |msat: u64| prepaid_size(&Terms { settle: Settle::OnArrival, ..terms(msat, None, 2) }, &pol).map_err(|e| e.0);
+        assert_eq!((pre(64_000), pre(1_000_000), pre(999), pre(1_000_001)), (Ok(64_000), Ok(1_000_000), Err("ticket_size"), Err("ticket_size")));
+        assert_eq!(prepaid_size(&Terms { ticket_blocks: 41, ..terms(64_000, None, 2) }, &pol).map_err(|e| e.0), Err("ticket_blocks"));
+    }
+
+    fn chan(id: u64, local: Value, remote: Value, kind: Value, pending_out: usize, pending_in: usize) -> Value {
+        let mut htlcs: Vec<Value> = (0..pending_out).map(|n| json!({"incoming": false, "amount": "1000", "hash_lock": format!("o{n}")})).collect();
+        htlcs.extend((0..pending_in).map(|n| json!({"incoming": true, "amount": "1000", "hash_lock": format!("i{n}")})));
+        let mut c = json!({"chan_id": id.to_string(), "active": true, "fee_per_kw": "253", "pending_htlcs": htlcs});
+        for (k, v) in [("local_constraints", local), ("remote_constraints", remote), ("commitment_type", kind)] {
+            if !v.is_null() {
+                c[k] = v;
+            }
+        }
+        c
+    }
+
+    fn side(slots: u64, dust: u64) -> Value {
+        json!({"max_accepted_htlcs": slots, "dust_limit_sat": dust.to_string()})
+    }
+
+    #[test]
+    fn a_channels_slots_are_the_smaller_number_and_held_tickets_take_half() {
+        let ids = |v: &[u64]| v.iter().map(u64::to_string).collect::<Vec<_>>();
+        // between two Lightning Fork nodes: 483 each way, 354 sat
+        let lf = chan(1, side(483, 354), side(483, 354), json!("ANCHORS"), 0, 0);
+        assert_eq!(channel_limits(&[lf.clone()], &ids(&[1])), Limits { slots: 483, room: 241, dust_msat: FLOOR_MSAT });
+        // with a Core Lightning node: the listing says 30 one way and 483 the other, and the channel carries 30 both ways
+        let cln = chan(2, side(30, 354), side(483, 546), json!("ANCHORS"), 4, 9);
+        let l = channel_limits(&[cln.clone()], &ids(&[2]));
+        assert_eq!(l, Limits { slots: 30, room: 11, dust_msat: 546_000 }, "15 less the 4 payments pending outwards; inbound ones use the other side's slots");
+        assert_eq!((l.budget(), l.room(0, 0), l.room(3, 0), l.room(0, 5), l.room(14, 0), l.room(15, 0), l.room(99, 99)), (15, 11, 11, 6, 1, 0, 0));
+        // two channels a ticket may leave on: the smaller budget, the fuller channel, the larger dust limit
+        assert_eq!(channel_limits(&[lf.clone(), cln.clone()], &ids(&[1, 2])), Limits { slots: 30, room: 11, dust_msat: 546_000 });
+        // a channel the payment may not leave on does not count
+        assert_eq!(channel_limits(&[lf.clone(), cln.clone()], &ids(&[1])).slots, 483);
+        // a full channel has no room, however much the budget is
+        let full = chan(3, side(30, 546), side(30, 546), json!("ANCHORS"), 15, 0);
+        assert_eq!(channel_limits(&[full], &ids(&[3])).room(0, 0), 0);
+        let over = chan(3, side(30, 546), side(30, 546), json!("ANCHORS"), 22, 0);
+        assert_eq!((channel_limits(&[over.clone()], &ids(&[3])).room, channel_limits(&[over], &ids(&[3])).room(0, 0)), (-7, 0));
+        // a listing that does not say is read as the cautious number, never as 483
+        let blind = chan(4, Value::Null, Value::Null, Value::Null, 2, 0);
+        assert_eq!(channel_limits(&[blind], &ids(&[4])), Limits { slots: 30, room: 13, dust_msat: FLOOR_MSAT });
+        let half_said = chan(5, side(483, 354), json!({"max_accepted_htlcs": "many"}), json!("ANCHORS"), 0, 0);
+        assert_eq!(channel_limits(&[half_said], &ids(&[5])).slots, 30);
+        let zero = chan(6, side(0, 354), side(483, 354), json!("ANCHORS"), 0, 0);
+        assert_eq!(channel_limits(&[zero], &ids(&[6])).slots, 30);
+        let huge = chan(7, side(100_000, 354), side(100_000, 354), json!("ANCHORS"), 0, 0);
+        assert_eq!(channel_limits(&[huge], &ids(&[7])).slots, 483, "no channel carries more than the protocol's ceiling");
+        assert_eq!(channel_limits(&[lf], &[]), Limits::unseen(), "no channel named: nothing is seen");
+        assert_eq!(Limits::unseen(), Limits { slots: 30, room: 15, dust_msat: 546_000 });
+        // without anchors the HTLC's own transaction pays a fee: 703 weight units at four times the channel's rate on top
+        let legacy = |kw: u64| {
+            let mut c = chan(8, side(483, 354), side(483, 546), json!("STATIC_REMOTE_KEY"), 0, 0);
+            c["fee_per_kw"] = kw.to_string().into();
+            channel_limits(&[c], &ids(&[8])).dust_msat
+        };
+        assert_eq!(legacy(253), (546 + 712) * 1000, "703 * 4 * 253 / 1000, rounded up");
+        assert_eq!(legacy(1250), (546 + 3515) * 1000);
+        assert_eq!(legacy(u64::MAX), u64::MAX, "a rate that does not fit is the largest floor, which refuses every ticket");
+        for anchors in ["ANCHORS", "SCRIPT_ENFORCED_LEASE", "SIMPLE_TAPROOT", "anchors"] {
+            let c = chan(9, side(483, 354), side(483, 546), json!(anchors), 0, 0);
+            assert_eq!(channel_limits(&[c], &ids(&[9])).dust_msat, 546_000, "{anchors}");
+        }
+    }
+
+    #[test]
+    fn a_lock_that_finds_no_slot_makes_the_session_hold_less_then_wait_then_nothing() {
+        for (reason, slot) in [("FAILURE_REASON_INSUFFICIENT_BALANCE", true), ("FAILURE_REASON_NO_ROUTE", true), ("FAILURE_REASON_ERROR", true),
+                               ("insufficient_balance", true), ("FAILURE_REASON_TIMEOUT", false), ("FAILURE_REASON_INCORRECT_PAYMENT_DETAILS", false), ("", false)] {
+            assert_eq!(slot_failure(reason), slot, "{reason}");
+        }
+        assert_eq!((slot_wait_s(1), slot_wait_s(2), slot_wait_s(3), slot_wait_s(5), slot_wait_s(6), slot_wait_s(u32::MAX)), (30.0, 60.0, 120.0, 480.0, 600.0, 600.0));
+        let mut s = session("s1", 2);
+        assert!(!s.lock_round(2, 0, 100.0), "a round that locked what it asked for changes nothing");
+        // one of two failed: one ticket from now on, and a wait
+        assert!(s.lock_round(1, 1, 100.0));
+        assert_eq!((s.pool, s.slot_fails, s.hold_until, s.hold_why.as_str()), (1, 0, 130.0, "ticket_slots"));
+        let mut b = Book::default();
+        b.sessions.insert(s.id.clone(), s.clone());
+        assert_eq!((b.want(&s, 129.0), b.want(&s, 130.0)), (0, 1), "nothing is offered during the wait");
+        // the one ticket does not lock either: the wait doubles
+        assert!(s.lock_round(0, 1, 130.0));
+        assert_eq!((s.pool, s.slot_fails, s.hold_until), (1, 1, 160.0));
+        assert!(s.lock_round(0, 1, 160.0));
+        assert_eq!((s.pool, s.slot_fails, s.hold_until), (1, 2, 220.0));
+        // a round that locks ends the run
+        let mut ok = s.clone();
+        assert!(ok.lock_round(1, 0, 220.0));
+        assert_eq!((ok.pool, ok.slot_fails), (1, 0), "the smaller pool stays: the route is as full as it was");
+        // the third failed round in a row: no ticket is held with this seller, for 10 minutes
+        assert!(s.lock_round(0, 1, 220.0));
+        assert_eq!((s.pool, s.slot_fails, s.hold_until, s.hold_why.as_str()), (0, 3, 820.0, ROUTE_FULL));
+        b.sessions.insert(s.id.clone(), s.clone());
+        assert_eq!(b.want(&s, 10_000.0), 0, "a pool of none wants nothing, ever");
+        assert_eq!((b.held_less("p", 500.0).map(|s| (s.hold_until, s.hold_why.as_str())), b.held_less("other", 500.0)), (Some((820.0, ROUTE_FULL)), None));
+        assert_eq!(b.held_less("p", 1419.0).map(|s| s.slot_fails), Some(3), "what a session learnt is kept for 10 minutes after its wait");
+        assert_eq!(b.held_less("p", 1420.0), None);
+        assert_eq!(b.pools_open(), 0);
+        // with prepaid tickets on offer the session pays that way while it waits and once it holds nothing
+        let mut p = session("s2", 2);
+        p.prepaid_msat = 1_000_000;
+        assert!(!p.prepaid_now(100.0), "held tickets are the default");
+        p.lock_round(0, 1, 100.0);
+        assert!(p.prepaid_now(129.0) && !p.prepaid_now(130.0));
+        p.pool = 0;
+        assert!(p.prepaid_now(1e9));
+        assert!(!session("s3", 0).prepaid_now(0.0), "a seller that offers none");
+        // the wait and the offer outlive a restart, and a row from before has neither
+        assert_eq!(Session::from_row(&p.row()), Some(p.clone()));
+        assert_eq!(Session::from_row(&s.row()), Some(s));
+        let mut old = session("s4", 8).row();
+        assert!(old.get("hold").is_none() && old.get("prepaid_msat").is_none());
+        old["hold"] = json!({"fails": "x"});
+        assert_eq!(Session::from_row(&old), None, "a damaged row is refused, not read as no wait");
     }
 
     #[test]
@@ -1113,7 +1613,7 @@ mod tests {
         let p = TicketPolicy::from_map(raw.as_object().unwrap());
         assert_eq!((p.max_ticket_sats, p.max_locked_sats, p.max_locked_tickets), (0, 0, 9), "a wrong number refuses, it never widens");
         let t = &p.tasks["inference"];
-        assert_eq!((t.budget_sats, t.admit, t.window_s, t.max_locked_tickets, t.unlisted_max_tickets), (5000, Admit::Any, MAX_TASK_WINDOW_S, 9, 2));
+        assert_eq!((t.budget_sats, t.admit, t.window_s, t.max_locked_tickets, t.unlisted_max_tickets), (5000, Admit::Any, MAX_TASK_WINDOW_S, 9, 1));
         assert_eq!(p.tasks["strict"].admit, Admit::Listed, "an unknown admission is the strict one");
         assert!(!p.tasks.contains_key("Bad Name"));
         let (mut errors, mut warnings) = (vec![], vec![]);
@@ -1133,13 +1633,13 @@ mod tests {
     fn ticket(hash: u8, session: &str, state: TState, ts: f64) -> Ticket {
         Ticket { hash: hex::encode([hash; 32]), nonce: [hash; 16], session: session.into(), payee: "p".into(), task: "t".into(), msat: 1_000_000,
                  fee_limit_msat: 15_000, state, ts, sent_ts: 0.0, invoice_expires: 0.0, released_ts: 0.0, booked_sats: 0, cltv_until: 0,
-                 final_expiry: 300, fee_msat: 0, done_ts: 0.0, note: String::new() }
+                 final_expiry: 300, fee_msat: 0, done_ts: 0.0, note: String::new(), prepaid: false }
     }
 
     fn session(id: &str, pool: u32) -> Session {
         Session { id: id.into(), payee: "p".into(), origin: String::new(), task: "t".into(), listed: true, ticket_msat: 1_000_000, pool, max_tickets: 8,
                   ticket_blocks: 40, max_sats: 0, state: SState::Open, opened_ts: 1.0, active_ts: 1.0, stopped_ts: 0.0, closed_ts: 0.0, why: String::new(),
-                  http: None }
+                  http: None, prepaid_msat: 0, slot_fails: 0, hold_until: 0.0, hold_why: String::new() }
     }
 
     #[test]
@@ -1161,15 +1661,16 @@ mod tests {
     fn velocity_counts_every_release_unless_the_owner_says_a_session_is_one_payment() {
         let rows = [memo("film", "s1"), memo("film", "s1"), memo("film", "s2"), "xbt402 signed delta".to_string(), memo("recovered", ""), memo("film", "s1")];
         let count = |mode, own| velocity_count(rows.iter().map(String::as_str), mode, own);
-        assert_eq!(count(Velocity::Release, None), 6, "the default: every row is a payment");
+        assert_eq!(count(Velocity::Release, None), 6, "every row is a payment");
         assert_eq!(count(Velocity::Release, Some("s1")), 6, "and a release is never free of its own session's rows");
         assert_eq!(count(Velocity::Session, None), 4, "s1 once, s2 once, the channel payment, the ticket without a session");
         assert_eq!(count(Velocity::Session, Some("s1")), 3, "a release of s1 does not count s1 against itself");
         assert_eq!(count(Velocity::Session, Some("s3")), 4, "a new session is one more payment");
-        // the setting: only the word "session" changes the default
+        // the setting: a session counts once unless the owner says "release"; a word that is neither counts every release
         let pol = |v: Value| TicketPolicy::from_map(json!({"velocity": v}).as_object().unwrap()).velocity;
         assert_eq!((pol(json!("session")), pol(json!("release")), pol(json!("Session")), pol(json!(true)), pol(Value::Null)),
-                   (Velocity::Session, Velocity::Release, Velocity::Release, Velocity::Release, Velocity::Release));
+                   (Velocity::Session, Velocity::Release, Velocity::Release, Velocity::Release, Velocity::Session));
+        assert_eq!(TicketPolicy::from_map(&Map::new()).velocity, Velocity::Session, "a policy that does not say: a session is one payment");
         let (mut errors, mut warnings) = (vec![], vec![]);
         validate(&json!({"velocity": "sessions"}), &mut errors, &mut warnings);
         assert!(errors.iter().any(|e| e.contains("tickets.velocity")), "{errors:?}");
@@ -1178,14 +1679,21 @@ mod tests {
     #[test]
     fn the_pool_and_the_floor_are_the_owners_settings_with_one_default_each() {
         let d = TicketPolicy::default();
+        assert_eq!((d.pool, d.pool_many, d.many_sellers, d.floor_ticket_sats), (2, 1, 4, 546));
         assert_eq!((d.pool, d.pool_many, d.many_sellers, d.floor_ticket_sats), (POOL_FEW as i64, POOL_MANY as i64, MANY_SELLERS as i64, (FLOOR_MSAT / 1000) as i64));
-        // a node that takes 30 payments in flight a channel: three tickets a seller, a floor above the dust limit
-        let pol = TicketPolicy::from_map(json!({"pool": 3, "pool_many": 1, "many_sellers": 2, "floor_ticket_sats": 400}).as_object().unwrap());
+        assert_eq!((d.seller_max_tickets, d.seller_max_locked_sats, d.max_locked_tickets, d.max_locked_sats, d.max_sellers), (2, 2_000, 15, 15_000, 15),
+                   "one seller: 2 tickets; in all: half of a 30-slot channel");
+        // an owner whose channels all carry 483: eight tickets a seller, as before
+        let pol = TicketPolicy::from_map(json!({"pool": 8, "pool_many": 2, "many_sellers": 8, "floor_ticket_sats": 700}).as_object().unwrap());
         let flex = terms(1_000_000, Some(1_000), 8);
-        assert_eq!(sizing(&flex, &pol, 1, None, 8, 8_000), Ok(Sizing { ticket_msat: 1_000_000, pool: 3 }));
-        assert_eq!(sizing(&flex, &pol, 3, Some(10_000), 8, 8_000), Ok(Sizing { ticket_msat: 400_000, pool: 1 }), "more than many_sellers: the floor, one ticket");
+        assert_eq!(sizing(&flex, &pol, 1, None, 8, 8_000, FLOOR_MSAT, 241), Ok(Sizing { ticket_msat: 1_000_000, pool: 8 }));
+        assert_eq!(sizing(&flex, &pol, 9, Some(10_000), 8, 8_000, FLOOR_MSAT, 241), Ok(Sizing { ticket_msat: 700_000, pool: 2 }), "more than many_sellers: the floor");
+        // the slot budget bounds the pool whatever the owner set, and with no room nothing is held
+        assert_eq!(sizing(&flex, &pol, 1, None, 8, 8_000, FLOOR_MSAT, 3).map(|s| s.pool), Ok(3));
+        assert_eq!(sizing(&flex, &pol, 1, None, 8, 8_000, FLOOR_MSAT, 0).map_err(|e| e.0), Err("ticket_slots"));
+        assert_eq!(sizing(&flex, &pol, 1, None, 8, 8_000, FLOOR_MSAT, -4).map_err(|e| e.0), Err("ticket_slots"));
         let none = TicketPolicy::from_map(json!({"pool": 0}).as_object().unwrap());
-        assert_eq!(sizing(&flex, &none, 1, None, 8, 8_000).map_err(|e| e.0), Err("ticket_seller_cap"), "a pool of 0 locks nothing");
+        assert_eq!(sizing(&flex, &none, 1, None, 8, 8_000, FLOOR_MSAT, 15).map_err(|e| e.0), Err("ticket_seller_cap"), "a pool of 0 locks nothing");
     }
 
     #[test]
@@ -1229,7 +1737,39 @@ mod tests {
     }
 
     #[test]
-    fn the_pool_refills_below_half_and_counts_hashes_on_their_way() {
+    fn the_pool_refills_when_half_or_fewer_are_left_and_counts_hashes_on_their_way() {
+        // the shipped pool of 2: the next is locked when one is left
+        let mut b = Book::default();
+        let two = session("s2", 2);
+        b.sessions.insert(two.id.clone(), two.clone());
+        assert_eq!(b.want(&two, 100.0), 2, "an empty pool wants all of it");
+        for i in 0..2 {
+            let t = ticket(100 + i, "s2", TState::Locked, 100.0);
+            b.tickets.insert(t.hash.clone(), t);
+        }
+        assert_eq!(b.want(&two, 101.0), 0);
+        b.tickets.get_mut(&hex::encode([100u8; 32])).unwrap().state = TState::Released;
+        assert_eq!(b.want(&two, 101.0), 1, "1 of 2 left: the next is locked now");
+        // a pool of 1 (many sellers): locked again when it is spent
+        let one = session("s1x", 1);
+        assert_eq!(b.want(&one, 101.0), 1);
+        let mut t = ticket(120, "s1x", TState::Locked, 100.0);
+        b.tickets.insert(t.hash.clone(), t.clone());
+        assert_eq!(b.want(&one, 101.0), 0);
+        t.state = TState::Released;
+        b.tickets.insert(t.hash.clone(), t);
+        assert_eq!(b.want(&one, 101.0), 1);
+        // a prepaid ticket is not a held one: it fills no place in a pool
+        let mut pre = ticket(121, "s1x", TState::Released, 100.0);
+        pre.prepaid = true;
+        b.tickets.insert(pre.hash.clone(), pre.clone());
+        assert_eq!(b.want(&one, 101.0), 1);
+        assert_eq!(b.prepaid_pending("s1x").map(|t| t.hash.clone()), Some(pre.hash.clone()));
+        assert_eq!(b.prepaid_pending("s2"), None);
+        assert_eq!(Ticket::from_row(&pre.row()), Some(pre.clone()));
+        assert!(ticket(1, "s", TState::Locked, 1.0).row().get("prepaid").is_none(), "a held ticket's row is as it was");
+        assert_eq!(b.locked(|t| t.session == "s1x"), Locked::default(), "nor is it counted as locked");
+        // a larger pool, an owner's choice
         let mut b = Book::default();
         let s = session("s1", 8);
         b.sessions.insert(s.id.clone(), s.clone());
@@ -1245,15 +1785,21 @@ mod tests {
         }
         assert_eq!(b.want(&s, 101.0), 0);
         let hashes: Vec<String> = b.of_session("s1").iter().map(|t| t.hash.clone()).collect();
-        for h in &hashes[..4] {
+        for h in &hashes[..3] {
             b.tickets.get_mut(h).unwrap().state = TState::Released;
         }
-        assert_eq!(b.want(&s, 101.0), 0, "4 of 8 left: at the mark, not below it");
+        assert_eq!(b.want(&s, 101.0), 0, "5 of 8 left: above the mark");
+        b.tickets.get_mut(&hashes[3]).unwrap().state = TState::Released;
+        assert_eq!(b.want(&s, 101.0), 4, "4 left, half: back to 8");
         b.tickets.get_mut(&hashes[4]).unwrap().state = TState::Released;
-        assert_eq!(b.want(&s, 101.0), 5, "3 left: back to 8");
         assert_eq!(b.locked(|_| true), Locked { tickets: 3, sats: 3_000, booking: 3 * 1015 });
         assert_eq!(b.locked(|t| t.session == "other"), Locked::default());
         assert_eq!(b.want(&session("s2", 1), 101.0), 1);
+        assert_eq!(b.pools_open(), 8);
+        // tickets on their way that the node does not show yet take a slot each when they arrive
+        b.tickets.get_mut(&hashes[5]).unwrap().state = TState::Sending;
+        b.tickets.get_mut(&hashes[6]).unwrap().state = TState::Sending;
+        assert_eq!((b.sending_unseen(&|_| false), b.sending_unseen(&|h| h == hashes[5])), (2, 1));
         let full = Locked { tickets: i64::MAX, sats: i64::MAX, booking: i64::MAX };
         assert_eq!(full.plus(5, i64::MAX, i64::MAX), full, "a sum that does not fit is the largest, never a small one");
     }

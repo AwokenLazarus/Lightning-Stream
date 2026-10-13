@@ -17,14 +17,20 @@
 //! | The node decides whether money is locked, moved or back; the book decides whether a secret has left. | [`Signer::ticket_apply`]: `SUCCEEDED` with the preimage settles (exact cost), `FAILED` with no HTLC out un-books, anything else changes nothing in the ledger. |
 //! | Budgets count what was released and the fee the node paid, never a number from outside. | The ledger row is [`crate::ticket::booking_sats`] of the book's own ticket at release, and the node's `value_msat + fee_msat` (never below the ticket) at settle. No field of a seller's or a caller's message reaches the ledger. |
 //! | An invoice is paid only if it is the session's ticket. | [`Signer::ticket_lock`]: the six checks of the wire draft on the signer's own decode, then the node's decode, then the caps, before the write-ahead row. |
-//! | One hash, one payment. | Only an `offered` ticket of the session takes an invoice; the write-ahead row makes it `sending` before the node sees the invoice. |
+//! | One hash, one payment. | Only an `offered` ticket of the session takes an invoice; the write-ahead row makes it `sending` before the node sees the invoice. A prepaid ticket's hash is refused if the book has it. |
+//! | A held ticket is never dust. | [`crate::ticket::sizing`] when a session opens, and [`Signer::ticket_book_sends`] before every lock, on the dust limits of the channels the payment may leave on as the node lists them then. |
+//! | Held tickets take at most half of a channel's slots. | [`Signer::ticket_book_sends`], on a channel listing read in that lock round: the book's held tickets against half of the smallest channel, and the payments pending on each channel (whoever's) against half of that channel. A listing that cannot be read is an error and locks nothing. |
+//! | A lock that fails for lack of a slot makes the wallet hold less. | [`Signer::ticket_lock`] gives every round's outcome to [`crate::ticket::Session::lock_round`]; [`crate::ticket::Book::want`] offers nothing during the wait. |
+//! | At most 8 ticket payments are with the router at once. | [`Pace`]: every send of a ticket, held or prepaid, enters it. |
+//! | A prepaid ticket is spent when it is paid, and bought one at a time. | [`Signer::ticket_prepay`]: every rule of a release, the ledger row and the book row (`released`) before the payment is sent; none while an earlier one of the session is not final. |
 //!
 //! Locks: the wallet's spend lock, then the book's. No lock is held while the node routes a
 //! ticket, so a release never waits for a lock round.
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -38,8 +44,9 @@ use crate::policy::{normalize_dest, Payment, PolicyConfig, DAY_S, WEEK_S};
 use crate::pyjson::{dumps_indent, py_int, str_or_empty, ts_value};
 use crate::sigaudit;
 use crate::signer::{deny, with, Signer};
-use crate::ticket::{self, booking_sats, check_ticket_invoice, ledger_id, sats_ceil, sizing, Admit, Book, SState, Seed, Session, TState, TaskPolicy, Terms,
-                    Ticket, TicketPolicy, KEEP_DONE_S, MAX_BATCH, OFFER_TTL_S, SESSION_IDLE_S, TAG_RECORD};
+use crate::ticket::{self, booking_sats, check_prepaid_invoice, check_ticket_invoice, ledger_id, sats_ceil, sizing, Admit, Book, Limits, SState, Seed, Session,
+                    Settle, TState, TaskPolicy, Terms, Ticket, TicketPolicy, HOLD_SHORT, KEEP_DONE_S, MAX_BATCH, OFFER_TTL_S, ROUTE_FULL, SESSION_IDLE_S,
+                    TAG_RECORD};
 use crate::{err, Result};
 
 pub const BOOK_FILE: &str = "tickets.jsonl";
@@ -50,8 +57,52 @@ pub const RECOVERED_TASK: &str = "recovered";
 /// Payments read from the node's list in one call, and calls in one reconcile.
 const LIST_PAGE: u64 = 100;
 const LIST_PAGES: usize = 50;
-/// Tickets handed to the node's router at once.
-const SEND_PARALLEL: usize = 16;
+/// Ticket payments with the node's router at once, all sessions together. A channel that carries
+/// 30 pending payments took 200 small payments sent 8 at a time without a failure, and failed 139
+/// of 200 sent 64 at a time (`docs/TICKETS.md` section 11).
+pub const SEND_PARALLEL: usize = 8;
+
+/// The gate every ticket payment passes on its way to the node's router: at most
+/// [`SEND_PARALLEL`] are inside at once. Who waits here: the threads of lock rounds and of prepaid
+/// purchases, of which the owner's `tickets.max_sellers` bounds the number; each leaves when its
+/// send returns, which the Lightning rail's `timeout_s` bounds.
+#[derive(Default)]
+pub struct Pace {
+    inside: Mutex<usize>,
+    left: Condvar,
+}
+
+pub struct PaceGuard<'a>(&'a Pace);
+
+impl Pace {
+    pub fn enter(&self) -> PaceGuard<'_> {
+        let mut n = self.inside.lock().unwrap_or_else(|p| p.into_inner());
+        while *n >= SEND_PARALLEL {
+            n = self.left.wait(n).unwrap_or_else(|p| p.into_inner());
+        }
+        *n += 1;
+        PaceGuard(self)
+    }
+
+    /// How many are inside now.
+    pub fn inside(&self) -> usize {
+        *self.inside.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+impl Drop for PaceGuard<'_> {
+    fn drop(&mut self) {
+        let mut n = self.0.inside.lock().unwrap_or_else(|p| p.into_inner());
+        *n = n.saturating_sub(1);
+        self.0.left.notify_one();
+    }
+}
+
+/// Whether the node is done with a payment: it succeeded, or failed with no HTLC out.
+fn payment_over(p: &Value) -> bool {
+    let status = str_or_empty(p.get("status"));
+    status == "SUCCEEDED" || (status == "FAILED" && !htlcs_in_flight(p))
+}
 
 /// The book on disk: `tickets.jsonl`, an append-only log ([`crate::applog`]) of whole sessions and
 /// tickets, folded into a [`Book`]. A change is durable before it is in memory, and before
@@ -406,9 +457,30 @@ impl Signer {
             Ok(n) => n.replacen("bip122:", "lightning:", 1),
             Err(e) => return refusal("ticket_network", e.msg),
         };
-        let terms = match Terms::parse(p.get("terms").unwrap_or(&Value::Null), &net) {
+        let first = match Terms::parse(p.get("terms").unwrap_or(&Value::Null), &net) {
             Ok(t) => t,
             Err((rule, why)) => return refusal(rule, why),
+        };
+        // a seller that offers both ways lists two entries: the held one is `terms`, and
+        // `prepaid_terms` its entry for tickets settled on arrival. One that offers only prepaid
+        // tickets has that entry as `terms`. A second entry that is not the same seller's is no offer
+        let (held, prepaid) = match first.settle {
+            Settle::OnUse => {
+                let second = p.get("prepaid_terms").filter(|v| !v.is_null()).and_then(|v| Terms::parse(v, &net).ok())
+                    .filter(|t| t.settle == Settle::OnArrival && t.payee == first.payee && t.ticket_blocks == first.ticket_blocks);
+                (Some(first.clone()), second)
+            }
+            Settle::OnArrival => (None, Some(first.clone())),
+        };
+        let terms = first;
+        let prepaid_msat = match &prepaid {
+            None => 0,
+            Some(t) => match (ticket::prepaid_size(t, &tp), &held) {
+                (Ok(m), _) => m,
+                // prepaid tickets the owner's bounds refuse are not on offer; with nothing else, the seller is refused
+                (Err(_), Some(_)) => 0,
+                (Err((rule, why)), None) => return refusal(rule, why),
+            },
         };
         let cfg = self.config();
         let origin = str_or_empty(p.get("origin"));
@@ -419,6 +491,9 @@ impl Signer {
         }
         let (cap_tickets, cap_locked, _, _) = Self::ticket_seller_caps(&cfg, &tp, task, listed);
         let now = self.engine.now();
+        // what the wallet's own channels allow of held tickets, read now; channels that cannot be read are
+        // taken to carry 30 pending payments, and every lock reads them again and refuses without a listing
+        let limits = if held.is_some() { self.ticket_limits_read().unwrap_or_else(Limits::unseen) } else { Limits::unseen() };
         let out = (|| -> Result<Value> {
             let mut g = self.ticket_store()?;
             let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
@@ -437,12 +512,41 @@ impl Signer {
             }
             let sellers = st.book.open_sessions(Some(&task_name)) + 1;
             let expect_msat = expect_sats.map(|s| (s as u64).saturating_mul(1000));
-            let size = match sizing(&terms, &tp, sellers, expect_msat, cap_tickets, cap_locked) {
-                Ok(s) => s,
-                Err((rule, why)) => return Ok(refusal(rule, why)),
+            // the slot budget: half of the smallest channel, less what the open sessions hold or will lock
+            let committed = st.book.pools_open();
+            let to_fill = committed.saturating_sub(st.book.locked(|_| true).tickets).max(0);
+            let room = limits.room(committed, to_fill);
+            // what an earlier session with this seller learnt about its route, if it is recent
+            let before = st.book.held_less(&terms.payee, now).cloned();
+            let held_size = held.as_ref().map(|t| {
+                if let Some(b) = before.as_ref().filter(|b| b.hold_why == ROUTE_FULL && now < b.hold_until) {
+                    return Err((ROUTE_FULL, format!("three lock rounds in a row found no slot on the route to this seller: no ticket is held with it for another {:.0} s",
+                                                    b.hold_until - now)));
+                }
+                sizing(t, &tp, sellers, expect_msat, cap_tickets, cap_locked, limits.dust_msat, room)
+            });
+            // held tickets are the default; where none can be held for lack of a slot or for dust, and the
+            // seller offers prepaid tickets, the session holds nothing and buys those one at a time
+            let (mut size, mut hold_why) = match held_size {
+                Some(Ok(s)) => (s, String::new()),
+                Some(Err((rule, _))) if prepaid_msat > 0 && HOLD_SHORT.contains(&rule) => (ticket::Sizing { ticket_msat: prepaid_msat, pool: 0 }, rule.to_string()),
+                Some(Err((rule, why))) => return Ok(with(refusal(rule, why), json!({"slots": limits.slots, "held_budget": limits.budget(), "held_now": committed}))),
+                None => (ticket::Sizing { ticket_msat: prepaid_msat, pool: 0 }, String::new()),
             };
+            // a session that holds tickets goes on where the last one with this seller stopped: its smaller pool,
+            // its failed rounds, and what is left of its wait
+            let (mut slot_fails, mut hold_until) = (0u32, 0.0f64);
+            if let Some(b) = before.filter(|_| size.pool > 0) {
+                size.pool = size.pool.min(b.pool.max(1));
+                // after a route that was full for three rounds the first failed round is the third again: ten more minutes
+                slot_fails = if b.hold_why == ROUTE_FULL { ticket::SLOT_FAILS_MAX - 1 } else { b.slot_fails };
+                if now < b.hold_until {
+                    (hold_until, hold_why) = (b.hold_until, b.hold_why.clone());
+                }
+            }
             let lp = LnPolicy::from_map(&cfg.ln);
-            let one = booking_sats(size.ticket_msat, (lp.fee_limit_sats(sats_ceil(size.ticket_msat)).max(0) as u64).saturating_mul(1000));
+            let largest = size.ticket_msat.max(prepaid_msat);
+            let one = booking_sats(largest, (lp.fee_limit_sats(sats_ceil(largest)).max(0) as u64).saturating_mul(1000));
             // no human can approve a release as it happens: a ticket that would need one is refused here
             if one >= cfg.human_threshold_sats || one > cfg.max_per_tx_sats {
                 return Ok(refusal("ticket_size", format!("one ticket with its fee limit is {one} sats: at or above human_threshold_sats {} or above \
@@ -457,10 +561,12 @@ impl Signer {
             }
             let s = Session { id, payee: terms.payee.clone(), origin: origin.chars().take(200).collect(), task: task_name.clone(),
                               listed, ticket_msat: size.ticket_msat, pool: size.pool, max_tickets: terms.max_tickets, ticket_blocks: terms.ticket_blocks,
-                              max_sats, state: SState::Open, opened_ts: now, active_ts: now, stopped_ts: 0.0, closed_ts: 0.0, why: String::new(), http: None };
+                              max_sats, state: SState::Open, opened_ts: now, active_ts: now, stopped_ts: 0.0, closed_ts: 0.0, why: String::new(), http: None,
+                              prepaid_msat, slot_fails, hold_until, hold_why };
             st.commit(&[s.row()])?;
             self.ticket_audit("ticket_open", json!({"session": s.id, "dest": format!("ln:{}", s.payee), "task": s.task, "listed": listed,
-                                                    "ticket_msat": s.ticket_msat.to_string(), "pool": s.pool}));
+                                                    "ticket_msat": s.ticket_msat.to_string(), "pool": s.pool, "prepaid_msat": s.prepaid_msat.to_string(),
+                                                    "hold_why": s.hold_why, "slots": limits.slots}));
             Ok(with(json!({"verdict": "allow", "rail": "ticket"}), s.public()))
         })();
         out.unwrap_or_else(|e| refusal("ticket", e.msg))
@@ -505,7 +611,7 @@ impl Signer {
                 }
                 rows.push(Ticket { hash: hash.clone(), nonce, session: sid.clone(), payee: s.payee.clone(), task: s.task.clone(), msat: s.ticket_msat,
                                    fee_limit_msat: 0, state: TState::Offered, ts: now, sent_ts: 0.0, invoice_expires: 0.0, released_ts: 0.0, booked_sats: 0,
-                                   cltv_until: 0, final_expiry: 0, fee_msat: 0, done_ts: 0.0, note: String::new() }.row());
+                                   cltv_until: 0, final_expiry: 0, fee_msat: 0, done_ts: 0.0, note: String::new(), prepaid: false }.row());
                 hashes.push(hash);
             }
             if !hashes.is_empty() {
@@ -622,13 +728,16 @@ impl Signer {
             Ok(s) => s,
             Err(d) => return d,
         };
-        // the node routes them, several at once; no lock is held
+        // the node routes them, a few at once (all sessions together: `Pace`); no lock is held
         let mut outcomes: Vec<Result<Value>> = vec![];
         for chunk in sends.chunks(SEND_PARALLEL) {
             outcomes.extend(std::thread::scope(|sc| {
                 let hs: Vec<_> = chunk.iter().map(|(_, r)| {
-                    let ln = &ln;
-                    sc.spawn(move || ln.send_held(r))
+                    let (ln, pace) = (&ln, &self.ticket_pace);
+                    sc.spawn(move || {
+                        let _inside = pace.enter();
+                        ln.send_held(r)
+                    })
                 }).collect();
                 hs.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(err("ln_send", "the send did not return")))).collect::<Vec<_>>()
             }));
@@ -636,9 +745,11 @@ impl Signer {
         // what the node made of each
         let _g = self.lock();
         let mut tickets = vec![];
+        let mut held_less = Value::Null;
         let res = (|| -> Result<()> {
             let mut g = self.ticket_store()?;
             let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
+            let (mut locked, mut slot_failed) = (0usize, 0usize);
             for ((hash, _), sent) in sends.iter().zip(outcomes) {
                 let pmt = match sent {
                     Ok(p) => Some(p),
@@ -649,7 +760,22 @@ impl Signer {
                     self.ticket_apply(st, hash, &pmt)?;
                 }
                 if let Some(t) = st.book.tickets.get(hash) {
+                    locked += usize::from(t.state == TState::Locked);
+                    // a payment that failed as a full channel does: the node names no slot, only a balance or a route
+                    slot_failed += usize::from(t.state == TState::Failed && ticket::slot_failure(&t.note));
                     tickets.push(t.public());
+                }
+            }
+            // a round that found no slot makes the session hold less: one ticket fewer, a wait, then nothing
+            if let Some(mut s) = st.book.sessions.get(&sid).filter(|s| s.state == SState::Open).cloned() {
+                let had = s.pool;
+                if !sends.is_empty() && s.lock_round(locked, slot_failed, self.engine.now()) {
+                    st.commit(&[s.row()])?;
+                    if slot_failed > 0 {
+                        held_less = json!({"slot_failed": slot_failed, "pool_was": had, "pool": s.pool, "slot_fails": s.slot_fails,
+                                           "hold_until": ts_value(s.hold_until), "hold_why": s.hold_why});
+                        self.ticket_audit("ticket_slot_failure", with(json!({"session": sid, "dest": dest, "locked": locked}), held_less.clone()));
+                    }
                 }
             }
             Ok(())
@@ -661,6 +787,9 @@ impl Signer {
         self.ticket_audit("ticket_lock", json!({"session": sid, "dest": dest, "asked": items.len(), "sent": sends.len(), "locked": locked, "refused": refused.len()}));
         let mut out = json!({"verdict": if sends.is_empty() { "deny" } else { "allow" }, "rail": "ticket", "session": sid, "locked": locked, "tickets": tickets,
                              "refused": refused, "charged_sats": 0});
+        if !held_less.is_null() {
+            out["held_less"] = held_less;
+        }
         if sends.is_empty() {
             out = with(out, json!({"rule": "ticket_refused", "reason": "no invoice passed the checks: nothing was paid"}));
         }
@@ -703,7 +832,41 @@ impl Signer {
         let (face, each) = (sats_ceil(s.ticket_msat), booking_sats(s.ticket_msat, fee_limit_msat));
         let mut sent_last_hour = st.book.sends_since(now - 3600.0) as i64;
         let (mut n, mut rows, mut sends) = (0i64, vec![], vec![]);
+        // the two limits of the channels these payments may leave on, as the node lists them in this round
+        let limits = ticket::channel_limits(chans, ids);
+        let on_node: HashSet<String> = htlc_locks(chans, &|_| true).list.iter().map(|h| str_or_empty(h.get("payment_hash"))).collect();
+        let slot_room = limits.room(all.tickets, st.book.sending_unseen(&|h| on_node.contains(h)));
+        let mut held = false;
+        // a hash refused for the channel's sake is given up at once: its invoice would be refused whoever issued it
+        // again, and the session's wait keeps a new one from being offered straight away
+        let give_up = |book: &Book, hash: &str, why: &str| book.tickets.get(hash).filter(|t| t.session == sid && t.state == TState::Offered).map(|t| {
+            let mut t = t.clone();
+            (t.state, t.done_ts, t.note) = (TState::Failed, now, why.into());
+            t.row()
+        });
+        if s.ticket_msat < limits.dust_msat {
+            // the ticket was sized before a channel with a higher dust limit was in the way: none of this size is held
+            for (hash, _, _) in read {
+                refuse(hash, "ticket_dust", format!("a ticket of {} msat is below {} msat, the dust limit of a channel it may leave on: it would have no output \
+                                                     there, and be lost if that channel is force-closed", s.ticket_msat, limits.dust_msat));
+                rows.extend(give_up(&st.book, hash, "below the dust limit of a channel it may leave on"));
+            }
+            (s.pool, s.hold_why, held) = (0, "ticket_dust".into(), true);
+        }
         for (hash, invoice, inv) in read {
+            if held && s.pool == 0 {
+                break;
+            }
+            if n >= slot_room {
+                refuse(hash, "ticket_slots", format!("with this ticket the wallet would hold more than half of the pending payments a channel it may leave on carries \
+                                                      ({} of {}; {} held now, room for {} more)", limits.budget(), limits.slots, all.tickets, slot_room));
+                rows.extend(give_up(&st.book, hash, "no free slot on the channel it would leave on"));
+                // nothing more is offered for a while: a slot frees when a ticket is released or cancelled
+                if !held {
+                    (s.hold_until, s.hold_why, held) = (now + ticket::SLOT_WAIT_S, "ticket_slots".into(), true);
+                }
+                continue;
+            }
             let (all, in_task, with_seller, in_session) = (all.plus(n + 1, face, each), in_task.plus(n + 1, face, each), with_seller.plus(n + 1, face, each),
                                                            in_session.plus(n + 1, face, each));
             // (what is counted, what it may be at most, the owner's or the seller's name for the bound)
@@ -750,8 +913,10 @@ impl Signer {
             n += 1;
             sent_last_hour += 1;
         }
-        if !sends.is_empty() {
-            s.active_ts = now;
+        if !sends.is_empty() || held {
+            if !sends.is_empty() {
+                s.active_ts = now;
+            }
             rows.push(s.row());
         }
         // write-ahead: every ticket is `sending` on disk before the node sees its invoice
@@ -1030,8 +1195,9 @@ impl Signer {
                             Some(s) => s.clone(),
                             None => seed.insert(self.ticket_seed(&st.book)?).clone(),
                         };
-                        if let Some(nonce) = tags.iter().find_map(|t| seed.read_tag(t, &raw)) {
-                            self.ticket_recover(st, p, &hash, nonce, lp, now)?;
+                        let mine = tags.iter().find_map(|t| seed.read_tag(t, &raw).map(|n| (n, false)).or_else(|| seed.read_prepaid_tag(t, &raw).map(|n| (n, true))));
+                        if let Some((nonce, prepaid)) = mine {
+                            self.ticket_recover(st, p, &hash, nonce, prepaid, lp, now)?;
                             out.push(json!({"payment_hash": hash, "recovered": true, "state": st.book.tickets.get(&hash).map(|t| t.state.as_str())}));
                         }
                     }
@@ -1053,7 +1219,8 @@ impl Signer {
     /// A payment on the node that carries this wallet's tag and is not in the book: the book is
     /// older than the node. It is booked as released, dated when the node made it, and then
     /// brought to what the node says of it.
-    fn ticket_recover(&self, st: &mut TicketStore, p: &Value, hash: &str, nonce: [u8; 16], lp: &LnPolicy, now: f64) -> Result<()> {
+    #[allow(clippy::too_many_arguments)]
+    fn ticket_recover(&self, st: &mut TicketStore, p: &Value, hash: &str, nonce: [u8; 16], prepaid: bool, lp: &LnPolicy, now: f64) -> Result<()> {
         // where the money went is what the node's own route says, not what an invoice text says
         let payee = payment_payee(p).or_else(|| bolt11::decode(&str_or_empty(p.get("payment_request"))).ok().map(|i| i.payee_hex())).unwrap_or_default();
         let (msat, _) = paid_msat(p);
@@ -1061,12 +1228,247 @@ impl Signer {
         let fee_limit_msat = (lp.fee_limit_sats(sats_ceil(msat)).max(0) as u64).saturating_mul(1000);
         let t = Ticket { hash: hash.into(), nonce, session: String::new(), payee, task: RECOVERED_TASK.into(), msat, fee_limit_msat, state: TState::Sending,
                          ts: made, sent_ts: made, invoice_expires: 0.0, released_ts: 0.0, booked_sats: 0, cltv_until: 0, final_expiry: 0, fee_msat: 0,
-                         done_ts: 0.0, note: String::new() };
+                         done_ts: 0.0, note: String::new(), prepaid };
         self.ticket_audit("ticket_recovered", json!({"payment_hash": hash, "dest": format!("ln:{}", t.payee), "msat": msat.to_string(),
                                                      "status": str_or_empty(p.get("status")),
                                                      "note": "on the node with this wallet's tag and not in its book: the book is older than the node"}));
         self.ticket_retire(st, t, now, "found on the node and not in the book: its secret may have left")?;
         self.ticket_apply(st, hash, p)
+    }
+
+    // --- prepaid tickets ----------------------------------------------------------------------------
+
+    /// The limits of the channels a ticket may leave on, read from the node now. `None`: the node
+    /// or its channel list could not be read, or no channel is usable.
+    fn ticket_limits_read(&self) -> Option<Limits> {
+        let ln = self.ln.clone()?;
+        let lp = LnPolicy::from_map(&self.config().ln);
+        let chans = ln.channels().ok()?;
+        let (ids, _) = self.ln_channels(&chans, lp.split(&self.chain));
+        (!ids.is_empty()).then(|| ticket::channel_limits(&chans, &ids))
+    }
+
+    /// Buy one prepaid ticket of a session: check the seller's invoice, book it as spent, pay it,
+    /// and return the payment's preimage, which the seller credits the session for. `invoice` is
+    /// the seller's word, and so is its hash: the ticket is an ordinary payment, spent when it
+    /// arrives and never had back. So every rule of a release is applied before the payment is
+    /// sent, and one is bought at a time. Not a socket method: only the wallet's own payer, which
+    /// read the seller's terms itself, calls this.
+    pub(crate) fn ticket_prepay(&self, p: &Value) -> Value {
+        if let Some(d) = self.ticket_shut() {
+            return d;
+        }
+        let sid = str_or_empty(p.get("session"));
+        let invoice = str_or_empty(p.get("invoice")).trim().to_string();
+        let (ln, lp, session) = {
+            let _g = self.lock();
+            let tp = match self.ticket_synced() {
+                Ok(t) => t,
+                Err(d) => return d,
+            };
+            let (ln, lp) = match self.ln_ready() {
+                Ok(x) => x,
+                Err(d) => return with(d, json!({"rail": "ticket", "charged_sats": 0})),
+            };
+            let session = match self.ticket_store() {
+                Ok(g) => g.as_ref().and_then(|st| st.book.sessions.get(&sid).cloned()),
+                Err(e) => return refusal("ticket", e.msg),
+            };
+            let Some(session) = session.filter(|s| s.state == SState::Open) else { return refusal("ticket_session", "no such open session") };
+            if !tp.tasks.contains_key(&session.task) {
+                return refusal("ticket_task", format!("the owner's policy no longer names the task {:?}", session.task));
+            }
+            (ln, lp, session)
+        };
+        let dest = format!("ln:{}", session.payee);
+        if let Err(d) = self.ln_node_checks(&*ln, &lp, &dest, "") {
+            return with(d, json!({"rail": "ticket"}));
+        }
+        let routes = match self.ln_route_checks(&*ln, &lp, &dest, "", false) {
+            Ok(r) => r,
+            Err(d) => return with(d, json!({"rail": "ticket"})),
+        };
+        // the invoice as the signer reads it and as the node reads it
+        let now = self.engine.now();
+        let tp_now = self.ticket_policy();
+        let relaxed = LnPolicy { min_expiry_s: 0, max_cltv_blocks: i64::MAX, require_description: false, ..lp.clone() };
+        let refuse = |hash: &str, rule: &str, why: String| {
+            self.ticket_audit("ticket_refused", json!({"session": sid, "dest": dest, "payment_hash": hash, "rule": rule, "reason": why, "prepaid": true}));
+            with(refusal(rule, why), json!({"session": sid}))
+        };
+        let inv = match bolt11::decode(&invoice) {
+            Ok(i) => i,
+            Err(e) => return refuse("", "ticket_invoice", format!("not a valid BOLT 11 invoice: {e}")),
+        };
+        let hash = inv.payment_hash_hex();
+        let named = str_or_empty(p.get("hash"));
+        if !named.is_empty() && named != hash {
+            return refuse(&named, "ticket_hash", "the invoice is for another payment hash than the one it was returned for".into());
+        }
+        if let Err((rule, why)) = check_invoice(&inv, &self.chain, now, &relaxed, "") {
+            return refuse(&hash, &rule, why);
+        }
+        if let Err((rule, why)) = check_prepaid_invoice(&inv, &session, &tp_now, now) {
+            return refuse(&hash, rule, why);
+        }
+        match ln.decode(&invoice) {
+            Ok(d) => {
+                if let Err(why) = cross_check(&inv, &d) {
+                    return refuse(&hash, "ln_decode_mismatch", why);
+                }
+            }
+            Err(e) => return refuse(&hash, "ln_backend", e.msg),
+        }
+        // every rule of a release, the ledger and the book, under the wallet's spend lock
+        let booked = {
+            let _g = self.lock();
+            self.ticket_book_prepay(&sid, &hash, &invoice, &inv, &lp, &routes.ids)
+        };
+        let send = match booked {
+            Ok(Ok(s)) => s,
+            Ok(Err(d)) => return d,
+            Err(e) => return refusal("ticket", e.msg),
+        };
+        // the node routes it; no lock is held. An ordinary payment is over in a moment, and its end is waited for
+        let sent = {
+            let _inside = self.ticket_pace.enter();
+            ln.send_held(&send)
+        };
+        let mut pmt = match sent {
+            Ok(p) => Some(p),
+            Err(_) => ln.lookup(&hash).ok().flatten(),
+        };
+        let deadline = Instant::now() + Duration::from_secs(lp.timeout_s.clamp(1, 600) as u64 + 5);
+        while pmt.as_ref().is_none_or(|p| !payment_over(p)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            if let Ok(Some(p)) = ln.lookup(&hash) {
+                pmt = Some(p);
+            }
+        }
+        let _g = self.lock();
+        let res = (|| -> Result<Option<Ticket>> {
+            let mut g = self.ticket_store()?;
+            let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
+            if let Some(pmt) = &pmt {
+                self.ticket_apply(st, &hash, pmt)?;
+            }
+            Ok(st.book.tickets.get(&hash).cloned())
+        })();
+        let t = match res {
+            Ok(Some(t)) => t,
+            Ok(None) => return refusal("ticket", "the book lost a ticket"),
+            Err(e) => return refusal("ticket", e.msg),
+        };
+        let about = json!({"rail": "ticket", "session": sid, "hash": hash, "prepaid": true, "ticket_msat": t.msat.to_string()});
+        match t.state {
+            TState::Settled => {
+                let preimage = pmt.as_ref().map(preimage_bytes).unwrap_or_default();
+                if !preimage_proves(&preimage, &hash) {
+                    return with(refusal("ticket_prepay_unproven", "the node shows the prepaid ticket paid without the preimage of its hash: it is booked, and \
+                                                                   nothing can be shown to the seller"), with(about, json!({"charged_sats": t.booked_sats})));
+                }
+                self.ticket_audit("ticket_prepaid", json!({"session": sid, "dest": dest, "payment_hash": hash, "spent_sats": t.booked_sats}));
+                // the preimage is what the buyer shows the seller for its credit: it moves no money any more
+                with(json!({"verdict": "allow", "ticket_secret": hex::encode(&preimage), "charged_sats": t.booked_sats}), about)
+            }
+            TState::Failed => with(refusal("ticket_prepay_failed", format!("the payment of the prepaid ticket failed ({}): nothing was spent", t.note)), about),
+            // not final within the wait: booked, and the node's word decides later
+            _ => with(with(refusal("ticket_prepay_pending", "the payment of the prepaid ticket is not final yet: it is booked as spent until the wallet's node \
+                                                             shows it failed"), about), json!({"verdict": "pending", "charged_sats": t.booked_sats})),
+        }
+    }
+
+    /// The rules and the two rows of a prepaid ticket (the caller holds the spend lock): what
+    /// [`Self::ticket_release_locked`] checks of a held ticket's release, then the ledger row, then
+    /// the book row, then the signature log. Returns the send; an `Err` inside is the refusal.
+    fn ticket_book_prepay(&self, sid: &str, hash: &str, invoice: &str, inv: &Invoice, lp: &LnPolicy, ids: &[String]) -> Result<std::result::Result<HeldSend, Value>> {
+        let tp = match self.ticket_synced() {
+            Ok(t) => t,
+            Err(d) => return Ok(Err(d)),
+        };
+        let cfg = self.config();
+        let now = self.engine.now();
+        let mut g = self.ticket_store()?;
+        let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
+        let Some(mut s) = st.book.sessions.get(sid).filter(|s| s.state == SState::Open).cloned() else { return Ok(Err(refusal("ticket_session", "no such open session"))) };
+        if s.prepaid_msat == 0 {
+            return Ok(Err(refusal("ticket_terms", "this seller's terms offer no prepaid tickets")));
+        }
+        let Some(task) = tp.tasks.get(&s.task) else {
+            return Ok(Err(refusal("ticket_task", format!("the owner's policy no longer names the task {:?}", s.task))));
+        };
+        let listed = self.ticket_listed(&cfg, &s.payee, &s.origin) && s.listed;
+        if !listed && task.admit != Admit::Any {
+            return Ok(Err(refusal("ticket_admission", format!("the owner no longer names the seller {} and task {:?} pays only named sellers", s.payee, s.task))));
+        }
+        // one hash, one payment; and one prepaid ticket at a time: what is bought ahead cannot be had back
+        if st.book.tickets.contains_key(hash) {
+            return Ok(Err(refusal("ticket_replay", "the wallet has paid, or is paying, a ticket for this hash: a hash is paid once")));
+        }
+        if let Some(t) = st.book.prepaid_pending(sid) {
+            return Ok(Err(with(refusal("ticket_prepaid_pending", "an earlier prepaid ticket of this session is not final on the wallet's node: the next is bought after it"),
+                               json!({"session": sid, "hash": t.hash}))));
+        }
+        if tp.max_sends_per_hour > 0 && st.book.sends_since(now - 3600.0) as i64 >= tp.max_sends_per_hour {
+            return Ok(Err(refusal("ticket_rate_limit", format!("already {} ticket payments sent to the node in the last hour (tickets.max_sends_per_hour)", tp.max_sends_per_hour))));
+        }
+        let Ok(raw) = <[u8; 32]>::try_from(inv.payment_hash.as_slice()) else { return Ok(Err(refusal("ticket_invoice", "the invoice has no 32-byte payment hash"))) };
+        let dest = format!("ln:{}", s.payee);
+        let fee_limit_msat = (lp.fee_limit_sats(sats_ceil(s.prepaid_msat)).max(0) as u64).saturating_mul(1000);
+        let sats = booking_sats(s.prepaid_msat, fee_limit_msat);
+        let (_, _, cap_spend, seller_window) = Self::ticket_seller_caps(&cfg, &tp, task, listed);
+        let spent = self.ticket_spent(now, &s.task, task.window_s as f64, &dest, seller_window)?;
+        let session_booked = st.book.of_session(sid).iter().fold(0i64, |a, x| a.saturating_add(x.booked_sats));
+        let over = [(spent.task.saturating_add(sats), task.budget_sats, "ticket_task_budget", "the task's budget_sats"),
+                    (spent.seller.saturating_add(sats), cap_spend, "ticket_seller_cap", "the owner's cap on sats paid to this seller"),
+                    (if s.max_sats > 0 { session_booked.saturating_add(sats) } else { 0 }, s.max_sats.max(0), "max_sats", "the session's max_sats")];
+        if let Some((have, cap, rule, name)) = over.iter().find(|(have, cap, _, _)| have > cap) {
+            return Ok(Err(refusal(rule, format!("with this ticket's {sats} sats, {have} would be above {name} ({cap})"))));
+        }
+        // the wallet's own rules: per payment, daily and weekly budgets, the counterparty cap, velocity, the human threshold
+        let pay = Payment::new(&dest, sats, &ticket::memo(&s.task, &s.id));
+        let d = self.engine.evaluate_admitted(&pay, sats)?;
+        if !d.allowed() {
+            if let Some(tok) = &d.approval_token {
+                self.engine.store.pop_approval(tok)?;
+            }
+            return Ok(Err(with(with(d.as_value(), json!({"verdict": "deny", "rail": "ticket", "charged_sats": 0, "approval_token": null, "approval_expires": null})),
+                               json!({"session": sid}))));
+        }
+        let seed = self.ticket_seed(&st.book)?;
+        let nonce = random_bytes::<16>();
+        sigaudit::set_rule(&format!("policy:{}", d.rule));
+        // 1. the spend, in the ledger: a prepaid ticket is spent when it is paid, used or not
+        if !self.engine.commit_once(&pay, &ledger_id(hash))? {
+            self.engine.store.amend(&ledger_id(hash), Some(sats))?;
+        }
+        // 2. the ticket in the book, booked, before the node sees its invoice
+        let t = Ticket { hash: hash.to_string(), nonce, session: sid.to_string(), payee: s.payee.clone(), task: s.task.clone(), msat: s.prepaid_msat, fee_limit_msat,
+                         state: TState::Released, ts: now, sent_ts: now, invoice_expires: inv.expires_at() as f64, released_ts: now, booked_sats: sats,
+                         cltv_until: 0, final_expiry: 0, fee_msat: 0, done_ts: 0.0, note: String::new(), prepaid: true };
+        s.active_ts = now;
+        st.commit(&[t.row(), s.row()])?;
+        // 3. the signature log, which the anchor witness covers
+        self.sigaudit.record("ticket_prepay", &[], "", &dest, json!({"payment_hash": hash, "session": sid, "booked_sats": sats}))?;
+        self.ticket_audit("ticket_prepay", json!({"session": sid, "dest": dest, "payment_hash": hash, "booked_sats": sats, "task": s.task}));
+        Ok(Ok(HeldSend { invoice: invoice.to_string(), fee_limit_msat: fee_limit_msat.max(1), timeout_s: lp.timeout_s.max(1), cltv_limit: tp.max_htlc_blocks,
+                         outgoing_chan_ids: ids.to_vec(), tag: seed.prepaid_tag(&nonce, &raw).to_vec() }))
+    }
+
+    /// Lock nothing for a session for `secs` seconds (1 to 600), for the reason `why`: a seller that
+    /// says it has no slot for a held ticket (`slots_short`) is waited for, not treated as failing.
+    /// Returns the time the wait ends.
+    pub(crate) fn ticket_hold(&self, sid: &str, secs: u64, why: &str) -> Result<f64> {
+        let _g = self.lock();
+        let now = self.engine.now();
+        let mut g = self.ticket_store()?;
+        let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
+        let mut s = st.book.sessions.get(sid).cloned().ok_or_else(|| err("ticket_session", "no such session"))?;
+        s.hold_until = now + secs.clamp(1, ticket::SLOT_WAIT_MAX_S as u64) as f64;
+        s.hold_why = why.chars().take(40).collect();
+        st.commit(&[s.row()])?;
+        self.ticket_audit("ticket_hold", json!({"session": sid, "dest": format!("ln:{}", s.payee), "why": s.hold_why, "hold_until": ts_value(s.hold_until)}));
+        Ok(s.hold_until)
     }
 
     // --- what the wallet's own payer reads and writes ([`crate::ticket_pay`]) -----------------------
@@ -1155,6 +1557,7 @@ impl Signer {
         let n = |f: &dyn Fn(TState) -> bool| ts.iter().filter(|t| f(t.state)).count();
         let locked = st.book.locked(|t| t.session == sid);
         json!({"locked": locked.tickets, "locked_sats": locked.sats, "released": n(&|s| s == TState::Released), "retired": n(&|s| s == TState::Retired),
+               "prepaid": ts.iter().filter(|t| t.prepaid).count(),
                "settled": n(&|s| s == TState::Settled), "failed": n(&|s| s == TState::Failed),
                "booked_sats": ts.iter().fold(0i64, |a, t| a.saturating_add(t.booked_sats))})
     }
@@ -1288,4 +1691,46 @@ fn dropped(t: &Ticket, now: f64) -> Value {
     t.done_ts = now;
     t.note = "its session stopped before an invoice was paid".into();
     t.row()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    #[test]
+    fn at_most_eight_ticket_payments_are_with_the_router_at_once() {
+        assert_eq!(SEND_PARALLEL, 8);
+        let pace = Pace::default();
+        let (now, peak) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        std::thread::scope(|sc| {
+            for _ in 0..64 {
+                sc.spawn(|| {
+                    let _inside = pace.enter();
+                    let n = now.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(n, Ordering::SeqCst);
+                    assert!(pace.inside() <= SEND_PARALLEL);
+                    std::thread::sleep(Duration::from_millis(5));
+                    now.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+        });
+        assert_eq!((peak.load(Ordering::SeqCst), pace.inside()), (SEND_PARALLEL, 0), "64 sends at once: 8 inside, the rest wait, and all of them leave");
+        // a send that panics leaves the gate as well
+        let died = std::thread::scope(|sc| sc.spawn(|| {
+            let _inside = pace.enter();
+            panic!("the send died");
+        }).join());
+        assert!(died.is_err() && pace.inside() == 0);
+    }
+
+    #[test]
+    fn a_payment_is_over_when_it_succeeded_or_failed_with_nothing_out() {
+        assert!(payment_over(&json!({"status": "SUCCEEDED"})));
+        assert!(payment_over(&json!({"status": "FAILED", "htlcs": []})));
+        assert!(!payment_over(&json!({"status": "FAILED", "htlcs": [{"status": "IN_FLIGHT"}]})), "its funds are still locked");
+        assert!(!payment_over(&json!({"status": "IN_FLIGHT", "htlcs": [{"status": "IN_FLIGHT"}]})));
+        assert!(!payment_over(&json!({})), "no status is no end");
+    }
 }

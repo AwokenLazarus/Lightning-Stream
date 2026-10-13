@@ -152,8 +152,10 @@ impl PayTerms {
 /// What a 402 offers, in the order the wallet takes them (`docs/TICKETS.md` section 12).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Offer {
-    /// `scheme: "ticket"` on this Lightning network.
-    Ticket(Value),
+    /// `scheme: "ticket"` on this Lightning network: the entry the session is opened on (held
+    /// tickets, `settle: "on-use"`, where the seller offers them), and beside a held entry the
+    /// seller's entry for prepaid tickets (`settle: "on-arrival"`) if it lists one.
+    Ticket(Value, Option<Value>),
     /// `scheme: "exact"` on this Lightning network, with a BOLT 11 invoice: one payment, then the
     /// request again with the preimage.
     Lightning(Value),
@@ -164,7 +166,7 @@ pub enum Offer {
 impl Offer {
     pub fn rail(&self) -> &'static str {
         match self {
-            Offer::Ticket(_) => "ticket",
+            Offer::Ticket(..) => "ticket",
             Offer::Lightning(_) => "ln",
             Offer::Channel(_) => "xbt402",
         }
@@ -178,7 +180,18 @@ pub fn offers(pr: &Value, lightning: &str, chain: &str) -> Vec<Offer> {
     let entries: Vec<&Value> = pr.get("accepts").and_then(Value::as_array).into_iter().flatten().collect();
     let on = |a: &&&Value, scheme: &str, net: &str| a.get("scheme").and_then(Value::as_str) == Some(scheme) && a.get("network").and_then(Value::as_str) == Some(net);
     let mut out = vec![];
-    out.extend(entries.iter().find(|a| on(a, xbt402::ticket::SCHEME, lightning)).map(|a| Offer::Ticket((*a).clone())));
+    // a seller that offers both ways of settling lists two ticket entries: held tickets are the wallet's
+    // first choice, prepaid ones what it falls back to. An entry that names neither way is taken as the
+    // seller's one entry, and refused when it is read
+    let settles = |a: &&&Value, word: &str| on(a, xbt402::ticket::SCHEME, lightning) && a.get("extra").and_then(|x| x.get("settle")).and_then(Value::as_str) == Some(word);
+    let held = entries.iter().find(|a| settles(a, xbt402::ticket::SETTLE_ON_USE));
+    let prepaid = entries.iter().find(|a| settles(a, xbt402::ticket::SETTLE_ON_ARRIVAL));
+    let ticket = match (held, prepaid) {
+        (Some(h), p) => Some(Offer::Ticket((*h).clone(), p.map(|p| (*p).clone()))),
+        (None, Some(p)) => Some(Offer::Ticket((*p).clone(), None)),
+        (None, None) => entries.iter().find(|a| on(a, xbt402::ticket::SCHEME, lightning)).map(|a| Offer::Ticket((*a).clone(), None)),
+    };
+    out.extend(ticket);
     out.extend(entries.iter().find(|a| on(a, LN_SCHEME, lightning)).map(|a| Offer::Lightning((*a).clone())));
     out.extend(entries.iter().find(|a| xbt402::wire::scheme_accepted(a.get("scheme").and_then(Value::as_str)) && a.get("network").and_then(Value::as_str) == Some(chain))
         .map(|a| Offer::Channel((*a).clone())));

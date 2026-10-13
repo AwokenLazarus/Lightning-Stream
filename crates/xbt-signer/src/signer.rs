@@ -245,6 +245,8 @@ pub struct Signer {
     pub(crate) ticket_error: Mutex<Option<String>>,
     pub(crate) ticket_seed: Mutex<Option<Arc<crate::ticket::Seed>>>,
     pub(crate) ticket_synced: std::sync::atomic::AtomicBool,
+    /// How many ticket payments are with the node's router at once ([`crate::ticket_rail::Pace`]).
+    pub(crate) ticket_pace: crate::ticket_rail::Pace,
     /// Stream tickets over HTTP ([`crate::ticket_pay`]): the transport, one place per seller origin
     /// for its session, the sessions of an earlier run whose cancel was asked for, and this signer
     /// itself (for the thread that refills a pool behind a call).
@@ -341,6 +343,7 @@ impl Signer {
                                 keystore, sigaudit, anchor, hot, book, session, open_tried: Mutex::new(HashMap::new()), close_claims: Mutex::new(HashSet::new()), watch_interval,
                                 ln, ln_error, ln_book, ln_funding: Mutex::new(HashMap::new()), tickets: Mutex::new(None),
                                 ticket_error: Mutex::new(None), ticket_seed: Mutex::new(None), ticket_synced: std::sync::atomic::AtomicBool::new(false),
+                                ticket_pace: crate::ticket_rail::Pace::default(),
                                 ticket_wire: opts.ticket_wire.clone().unwrap_or_else(|| Arc::new(crate::ticket_pay::UreqWire::default())),
                                 ticket_http: Mutex::new(HashMap::new()), ticket_cancel_tried: Mutex::new(HashSet::new()), me: std::sync::OnceLock::new(), enroll: Mutex::new(Default::default()),
                                 used_sigs: crate::admin::UsedSigs::new(&root.join(".run").join(crate::admin::USED_SIGS_FILE)) });

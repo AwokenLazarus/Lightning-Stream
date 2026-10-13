@@ -33,7 +33,9 @@ use crate::Error;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Caps {
     pub ticket_msat: u64,
-    /// Unreleased tickets one session may hold (unpaid ones included).
+    /// Unreleased tickets one session may hold (unpaid ones included), and as many tickets settled
+    /// on arrival that it may have issued and not yet paid: the two are counted apart, so that
+    /// held tickets whose payment found no slot do not keep the session from buying a prepaid one.
     pub max_tickets: u32,
     /// Sessions with a ticket locked or a response open, at once.
     pub max_sessions: u32,
@@ -421,8 +423,12 @@ impl Book {
                 (id, Some(key))
             }
         };
-        let live = self.sessions.get(&id).map_or(0, |s| s.live);
-        let room_session = self.caps.max_tickets.saturating_sub(live) as usize;
+        let live = self
+            .tickets
+            .values()
+            .filter(|t| t.session == id && t.prepaid == prepaid)
+            .count();
+        let room_session = (self.caps.max_tickets as usize).saturating_sub(live);
         let room_total = if prepaid {
             usize::MAX
         } else {
@@ -1847,6 +1853,9 @@ mod tests {
             b.presented_kind(&g.session, &secret(2)),
             Err(Refusal::TicketUsed)
         );
+        // held tickets of the session do not use up its prepaid ones, nor the other way round
+        let mixed = b.lock("b", Some(&g.session), &[hash(20)], false, &ent(0), 0);
+        assert_eq!(mixed, Err(Refusal::SlotsShort(30)), "the one held place is another session's");
         // the session's own cap bounds what it can have issued and not paid
         let g2 = b
             .lock(
