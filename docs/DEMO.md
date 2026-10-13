@@ -232,6 +232,8 @@ sellers' wins would, and the sellers' side is one node's work.
   web and TV apps also log in, browse and report progress with headers the gateway does not pass
   on by default, and they direct-play with `Range`. A paying proxy that carries those is not
   built.
+- **A player on a screen.** The players of the run are ffmpeg, for the first frame, and a script
+  that asks for segments as an HLS player does. mpv, VLC and a browser were not tried.
 - **Direct play.** See section 5.
 - **Seeking inside what was paid for.** A viewer who seeks back pays for those segments again.
 - **An AI model as the agent.** The agent of the demo is a script that speaks MCP.

@@ -87,7 +87,7 @@ the full list, with a link for each, is [`docs/REFERENCES.md`](docs/REFERENCES.m
   buyer that never pays, a seller that lies about wins, and a kill of each part. The argument
   that the draw is fair is our own and unreviewed.
 - **A demo: a film paid for as it plays (regtest only).** A stock Jellyfin behind the gateway,
-  and a film bought piece by piece through the wallet while an ordinary player plays it: first
+  and a film bought piece by piece through the wallet while a player reads it (ffmpeg and a scripted HLS client): first
   frame in half a second, nothing paid while paused, the held tickets back when the viewer stops.
   The same file is then bought in 1,054 pieces from 20 gateways at once, paid by draws.
   `scripts/demo_film.sh` runs it; [`docs/DEMO.md`](docs/DEMO.md) is the guide for a node runner,
