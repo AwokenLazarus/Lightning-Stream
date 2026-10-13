@@ -144,11 +144,13 @@ impl Terms {
     }
 }
 
-/// The error codes of the ticket scheme: what a gateway answers a payer with.
-pub const PROTOCOL_CODES: [&str; 20] = [
-    "bad_auth", "bad_payment", "bad_request", "bad_seq", "bad_target", "balance_short", "hash_refused", "journal", "no_route", "node_unavailable",
-    "pledge_outstanding", "session_unknown", "slots_short", "ticket_expiring", "ticket_not_locked", "ticket_unknown", "ticket_used",
-    "too_many_sessions", "too_many_tickets", "upstream_unavailable",
+/// The error codes of the ticket scheme and of the lottery beside it ([`crate::lottery`]): what a
+/// gateway answers a payer with.
+pub const PROTOCOL_CODES: [&str; 32] = [
+    "amount_mismatch", "amount_not_below_win", "bad_auth", "bad_payment", "bad_request", "bad_seq", "bad_target", "balance_short", "chain_spent",
+    "draw_out_of_order", "draw_used", "hash_refused", "journal", "no_route", "node_unavailable", "piece_unknown", "pledge_outstanding",
+    "session_unknown", "slots_short", "ticket_expiring", "ticket_not_locked", "ticket_unknown", "ticket_used", "too_many_sessions",
+    "too_many_tickets", "too_many_voids", "upstream_unavailable", "value_conflict", "value_missing", "value_reused", "win_size", "win_unpaid",
 ];
 
 /// The seller's error code as one of the scheme's own ([`PROTOCOL_CODES`]), or `""`. The string

@@ -57,6 +57,8 @@ use crate::store::{Store, COMPACT_AT};
 use crate::upstream::{decoded_path, forwarded, returned, Answer, Upstream};
 use crate::Error;
 
+mod draws;
+
 /// A body no larger than this, on a route priced per request only, is read whole so that its
 /// receipt can carry its hash. Larger or metered bodies are streamed.
 const WHOLE_BODY: u64 = 256 << 10;
@@ -114,6 +116,8 @@ pub struct Gateway {
     clock: Box<dyn Fn() -> u64 + Send + Sync>,
     settled: AtomicU64,
     settle_max_us: AtomicU64,
+    /// The lottery's sessions, where the runner offers it (`docs/TICKETS.md`, section 9).
+    lottery: Option<draws::Lottery>,
 }
 
 /// Wall-clock seconds.
@@ -273,6 +277,7 @@ impl Gateway {
             clock,
             settled: AtomicU64::new(0),
             settle_max_us: AtomicU64::new(0),
+            lottery: cfg.lottery.clone().map(draws::Lottery::new),
             cfg,
         });
         for hash in unfinished {
@@ -469,6 +474,7 @@ impl Gateway {
         for hash in &sweep.cancel {
             self.cancel_on_node(hash);
         }
+        self.lottery_tick();
         let file = {
             let mut st = self.lock();
             let marks = st.book.take_marks();
@@ -683,7 +689,7 @@ impl Gateway {
             (self.cfg.held, SETTLE_ON_USE),
             (self.cfg.prepaid, SETTLE_ON_ARRIVAL),
         ];
-        let accepts: Vec<Value> = route
+        let mut accepts: Vec<Value> = route
             .into_iter()
             .flat_map(|r| {
                 ways.iter().filter(|(on, _)| *on).map(|(_, settle)| {
@@ -696,6 +702,8 @@ impl Gateway {
                 })
             })
             .collect();
+        // and the lottery, last: a buyer that knows only tickets skips an entry it cannot read
+        accepts.extend(route.and_then(|r| self.lottery_entry(r)));
         m.insert("accepts".into(), Value::Array(accepts));
         if let Some(s) = session {
             m.insert("session".into(), s);
@@ -1182,7 +1190,8 @@ impl Gateway {
             .cfg
             .routes
             .iter()
-            .map(|r| json!({"path": r.path, "methods": r.methods, "free": r.free, "price": r.price.terms(), "release": r.release.name()}))
+            .map(|r| json!({"path": r.path, "methods": r.methods, "free": r.free, "price": r.price.terms(), "release": r.release.name(),
+                            "lottery": self.lottery_entry(r).is_some()}))
             .collect();
         let settle: Vec<&str> = [
             (self.cfg.held, SETTLE_ON_USE),
@@ -1196,7 +1205,8 @@ impl Gateway {
             200,
             &json!({"version": "services/0", "signed": false, "scheme": ticket::SCHEME, "network": self.terms.network, "payTo": self.terms.pay_to,
                     "receiptKey": self.terms.receipt_key, "session": self.terms.session, "ticketMsat": self.terms.ticket_msat.to_string(),
-                    "maxTickets": self.terms.max_tickets, "ticketBlocks": self.terms.ticket_blocks, "settle": settle, "routes": routes}),
+                    "maxTickets": self.terms.max_tickets, "ticketBlocks": self.terms.ticket_blocks, "settle": settle, "routes": routes,
+                    "lottery": self.cfg.lottery.as_ref().map(|c| self.lottery_terms(c).accepts(0, "", &Value::Null)["extra"].clone())}),
         )
     }
 
@@ -1206,7 +1216,8 @@ impl Gateway {
             200,
             &json!({"height": s.height, "sessions": s.sessions, "activeSessions": s.active_sessions, "heldTickets": s.held_tickets,
                     "maxHeld": s.max_held, "prepaidTickets": s.prepaid_tickets,
-                    "heldMsat": (s.held_tickets as u64).saturating_mul(self.cfg.caps.ticket_msat).to_string(), "settled": s.settled, "settleMaxUs": s.settle_max_us}),
+                    "heldMsat": (s.held_tickets as u64).saturating_mul(self.cfg.caps.ticket_msat).to_string(), "settled": s.settled, "settleMaxUs": s.settle_max_us,
+                    "lottery": self.lottery_health()}),
         )
     }
 
@@ -1283,6 +1294,9 @@ impl Gateway {
         }
         if route.free {
             return self.free(&req, route);
+        }
+        if Self::pays_by_lottery(&req) {
+            return self.lottery_route(req, route);
         }
         let pay = match self.pay_header(&req) {
             Ok(Some(p)) => p,
@@ -1612,12 +1626,17 @@ impl Service {
         path.strip_prefix(ticket::SESSION_PATH)
             .and_then(|p| p.strip_prefix('/'))
     }
+
+    fn lottery_path<'a>(&self, path: &'a str) -> Option<&'a str> {
+        path.strip_prefix(xbt402::lottery::SESSION_PATH)
+            .and_then(|p| p.strip_prefix('/'))
+    }
 }
 
 impl Handler for Service {
     fn body_limit(&self, _method: &str, target: &str) -> usize {
         let path = target.split('?').next().unwrap_or("");
-        if self.session_path(path).is_some() {
+        if self.session_path(path).is_some() || self.lottery_path(path).is_some() {
             return SESSION_BODY;
         }
         decoded_path(target)
@@ -1647,6 +1666,12 @@ impl Handler for Service {
                 ("POST", "release" | "cancel" | "status") => gw.session_call(&req, call),
                 // the operator's view, for the machine the gateway runs on only
                 ("GET", "health") if loopback => gw.health(),
+                _ => error(404, "no_route", "no such session endpoint"),
+            });
+        }
+        if let Some(call) = self.lottery_path(&path) {
+            return Reply::Whole(match (req.method.as_str(), call) {
+                ("POST", "open" | "draw" | "status" | "close") => gw.lottery_call(&req, call),
                 _ => error(404, "no_route", "no such session endpoint"),
             });
         }

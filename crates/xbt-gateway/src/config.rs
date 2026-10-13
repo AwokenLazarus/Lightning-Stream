@@ -11,6 +11,7 @@ use xbt402::ticket::{
 };
 
 use crate::book::Caps;
+use crate::lottery::LotteryConfig;
 use crate::price::Price;
 use crate::Error;
 
@@ -124,6 +125,9 @@ pub struct Config {
     /// The runner wrote `caps.max_held_tickets`: a gateway that reads its channels keeps to it.
     pub held_set: bool,
     pub caps: Caps,
+    /// The lottery (`docs/TICKETS.md`, section 9), where the runner offers it: pieces priced below
+    /// one win, paid by draws, with nothing held. Absent: not offered.
+    pub lottery: Option<LotteryConfig>,
     pub routes: Vec<Route>,
     pub http: Http,
     pub times: Times,
@@ -194,6 +198,7 @@ impl Config {
                 "network",
                 "node",
                 "tickets",
+                "lottery",
                 "caps",
                 "routes",
                 "http",
@@ -437,6 +442,10 @@ impl Config {
             {
                 return Err(format!("route {}: that path is the gateway's own", r.path));
             }
+            let lottery_path = xbt402::lottery::SESSION_PATH;
+            if r.path == lottery_path || r.path.starts_with(&format!("{lottery_path}/")) {
+                return Err(format!("route {}: that path is the gateway's own", r.path));
+            }
             if r.release == Release::AfterVerify && r.price.request_msat > ticket_msat {
                 return Err(format!(
                     "route {}: a piece served before its secret costs at most one ticket",
@@ -444,6 +453,11 @@ impl Config {
                 ));
             }
         }
+        // the lottery is offered only by a runner who says so: with it the seller serves first
+        let lottery = match top.get("lottery") {
+            None | Some(Value::Null) => None,
+            Some(l) => Some(LotteryConfig::parse(l, ticket_blocks)?),
+        };
         Ok(Self {
             listen: req_str(top, "listen")?.to_string(),
             public_url: origin.trim_end_matches('/').to_string(),
@@ -458,6 +472,7 @@ impl Config {
             inbound_slots,
             held_set,
             caps,
+            lottery,
             routes,
             http,
             times,
@@ -580,7 +595,7 @@ fn route(v: &Value) -> Result<Route, String> {
     })
 }
 
-fn obj<'a>(v: &'a Value, what: &str, known: &[&str]) -> Result<&'a Map<String, Value>, String> {
+pub(crate) fn obj<'a>(v: &'a Value, what: &str, known: &[&str]) -> Result<&'a Map<String, Value>, String> {
     let m = v
         .as_object()
         .ok_or_else(|| format!("{what} is an object"))?;
@@ -608,14 +623,14 @@ fn opt_str<'a>(m: &'a Map<String, Value>, k: &str) -> Result<Option<&'a str>, St
 }
 
 /// A whole number, or the default when the key is absent. Anything else is an error, not the default.
-fn num(m: &Map<String, Value>, k: &str, default: u64) -> Result<u64, String> {
+pub(crate) fn num(m: &Map<String, Value>, k: &str, default: u64) -> Result<u64, String> {
     match m.get(k) {
         None => Ok(default),
         Some(v) => v.as_u64().ok_or_else(|| format!("{k} is a whole number")),
     }
 }
 
-fn num32(m: &Map<String, Value>, k: &str, default: u32) -> Result<u32, String> {
+pub(crate) fn num32(m: &Map<String, Value>, k: &str, default: u32) -> Result<u32, String> {
     u32::try_from(num(m, k, u64::from(default))?).map_err(|_| format!("{k} is too large"))
 }
 
@@ -732,12 +747,30 @@ mod tests {
         let v: Value = serde_json::from_str(include_str!("../gateway.example.json")).unwrap();
         let c = Config::from_json(&v).unwrap();
         assert!(c.mainnet());
-        assert_eq!(c.routes.len(), 5);
+        assert_eq!(c.routes.len(), 6);
         assert_eq!(
             c.route("/films/a.mkv").unwrap().price.for_bytes(1 << 20),
             Some(200_000)
         );
         assert_eq!(c.route("/chunks/1").unwrap().release, Release::AfterVerify);
+        // the lottery: pieces of a tenth of a sat are offered by draws, and so is a film's piece of
+        // 50 sat, which is below the 64-sat win (a buyer's owner decides whether odds of 25 in 32
+        // are a lottery). A chunk of 100 sat is dearer than a win: tickets only
+        let l = c.lottery.as_ref().unwrap();
+        assert_eq!((l.win_msat, l.min_win_msat, l.piece_bytes), (64_000, 16_000, 262_144));
+        assert!(l.offers(&c.route("/pieces/1").unwrap().price) && l.offers(&c.route("/api/x").unwrap().price));
+        assert_eq!(l.dearest_piece(&c.route("/films/a.mkv").unwrap().price), Some(50_000));
+        assert!(l.offers(&c.route("/films/a.mkv").unwrap().price) && !l.offers(&c.route("/chunks/1").unwrap().price));
+        // a file with no lottery section offers none, and a section that is not one is refused
+        let mut none = v.clone();
+        none.as_object_mut().unwrap().remove("lottery");
+        assert_eq!(Config::from_json(&none).unwrap().lottery, None);
+        let mut bad = v.clone();
+        bad["lottery"]["window"] = json!(0);
+        assert!(Config::from_json(&bad).is_err());
+        let mut own = v;
+        own["routes"][0]["path"] = json!("/x402/lottery/x");
+        assert!(Config::from_json(&own).is_err(), "the lottery's endpoints are the gateway's own");
     }
 
     #[test]

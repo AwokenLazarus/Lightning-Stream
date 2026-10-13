@@ -10,9 +10,11 @@
     "info_macaroon": "/var/lib/xbt-gateway/info.macaroon"
   },
   "tickets": {"ticket_msat": 1000000, "max_tickets": 2, "ticket_blocks": 40, "settle": ["on-use", "on-arrival"]},
+  "lottery": {"win_msat": 64000, "min_win_msat": 16000, "window": 8, "grace_seconds": 10, "grace_pieces": 64, "max_unpaid_wins": 2, "piece_bytes": 262144},
   "caps": {"max_sessions": 30, "sessions_per_address": 2, "inbound_slots": 30, "max_held_tickets": 15},
   "routes": [
     {"path": "/films/", "price": {"byte_msat": 200000, "per_bytes": 1048576}, "forward_headers": []},
+    {"path": "/pieces/", "price": {"byte_msat": 100, "per_bytes": 262144}},
     {"path": "/api/", "methods": ["GET", "POST"], "price": {"request_msat": 2500}, "max_body": 65536},
     {"path": "/live/", "price": {"second_msat": 5000}},
     {"path": "/chunks/", "price": {"request_msat": 100000}, "release": "after-verify"},
