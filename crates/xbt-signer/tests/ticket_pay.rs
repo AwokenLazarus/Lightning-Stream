@@ -2532,7 +2532,17 @@ fn a_seller_that_lies_about_a_win_or_its_invoice_is_paid_nothing_for_the_lie() {
         assert!(v["wins"].as_u64().unwrap() >= 1 && v["wins_paid"] == 0, "{v}");
         assert!(v["wins_unpaid"].as_array().unwrap().iter().all(|w| w["rule"] == rule), "{v}");
         assert!(r.ledger().is_empty() && r.ln.state().payments.is_empty(), "nothing was booked and nothing reached the node");
-        assert!(r.audit("ticket_refused").iter().all(|a| a["rule"] == rule && a["win"].as_u64().unwrap() > 0));
+        let refusals = r.audit("ticket_refused");
+        assert!(refusals.iter().all(|a| a["rule"] == rule && a["win"].as_u64().unwrap() > 0));
+        // after three such invoices the seller is not asked for another in this session: it is faulty and is
+        // stopped, and a later call starts a new one
+        assert!((1..=4).contains(&refusals.len()), "{} refusals", refusals.len());
+        if refusals.len() >= 3 {
+            assert!(v["ended"].as_str().unwrap().contains("lottery_seller_fault"), "{v}");
+            let next = r.pay("/tiny/10", 5);
+            assert_ne!(next["session"], v["session"], "{next}");
+            assert_eq!(r.session(v["session"].as_str().unwrap())["sessions"][0]["state"], "closed");
+        }
         // (the seller, unpaid, stops serving when its grace is over: whether this file ends first is the draws' luck)
     }
     // a win claimed for a draw that lost: the wallet works every draw out itself

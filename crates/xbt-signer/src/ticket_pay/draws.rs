@@ -96,14 +96,17 @@ struct State {
     /// was not final yet. None is handed again while its payment is being made, or is in the book and has not
     /// failed.
     handed: HashMap<u64, (Win, bool)>,
-    /// Invoices the payer has been given, by their text: one is looked at once, whatever became of it.
-    tried: HashSet<String>,
+    /// Invoices the payer has been given, each by 16 bytes of its SHA-256: one is looked at once, whatever
+    /// became of it. One entry for every try of a win, so at most as many as the session has rounds.
+    tried: HashSet<[u8; 16]>,
     draws: u64,
     wins: u64,
     wins_paid: u64,
     /// The price of every piece a value was given for, in msat, and what the wins paid booked, in sats.
     used_msat: u64,
     paid_sats: i64,
+    /// Invoices of this seller's that the wallet's checks refused (another payee, another amount, no bit 512).
+    bad_invoices: u32,
     /// Why this session draws no more.
     fault: Option<String>,
 }
@@ -137,6 +140,18 @@ impl DrawSession {
                "wins_paid": s.wins_paid, "wins_owed": s.owed.len(), "price_msat": s.used_msat.to_string(), "paid_sats": s.paid_sats, "fault": s.fault})
     }
 }
+
+/// What a session remembers of an invoice it has handed to the payer.
+fn invoice_mark(invoice: &str) -> [u8; 16] {
+    let mut m = [0u8; 16];
+    m.copy_from_slice(&Sha256::digest(invoice.as_bytes())[..16]);
+    m
+}
+
+/// The refusals of wins a call's reply lists: more than this are not listed.
+const UNPAID_LISTED: usize = 64;
+/// A seller whose invoices fail the wallet's checks this many times is not asked for another.
+const BAD_INVOICES_MAX: u32 = 3;
 
 /// What one round of values came to.
 struct Round {
@@ -478,7 +493,7 @@ impl Signer {
             }
             match invoice {
                 // an invoice the payer has had before is not looked at again: its payment is in the book, or its checks refused it
-                Some(inv) if s.tried.contains(inv) => {}
+                Some(inv) if s.tried.contains(&invoice_mark(inv)) => {}
                 Some(inv) if mine && invoices.iter().any(|(d, _)| *d == draw) => {
                     // booked exactly: the first invoice of a win is the one that is looked at, a second is refused unread
                     self.ticket_audit("lottery_win_refused", json!({"session": ds.sid, "dest": format!("ln:{}", ds.terms.payee), "win": draw,
@@ -495,7 +510,7 @@ impl Signer {
             match invoices.iter().find(|(d, _)| *d == w.draw()) {
                 Some((d, inv)) => {
                     s.handed.insert(*d, (w.clone(), false));
-                    s.tried.insert(inv.clone());
+                    s.tried.insert(invoice_mark(inv));
                     wins.push((w, Some(inv.clone())));
                 }
                 // no invoice yet: the win stays owed, and the seller's next answer may bring one
@@ -540,7 +555,9 @@ impl Signer {
             Some("pending") => {
                 s.paid_sats = s.paid_sats.saturating_add(charged);
                 c.paid_sats = c.paid_sats.saturating_add(charged);
-                c.unpaid.push(json!({"draw": win.draw(), "rule": rule, "booked_sats": charged}));
+                if c.unpaid.len() < UNPAID_LISTED {
+                    c.unpaid.push(json!({"draw": win.draw(), "rule": rule, "booked_sats": charged}));
+                }
                 if let Some(h) = s.handed.get_mut(&win.draw()) {
                     h.1 = true;
                 }
@@ -555,9 +572,22 @@ impl Signer {
                 // the wallet's own nodes gave no answer for a moment: nothing was booked and nothing was sent, so
                 // the same invoice is good the next time the seller lists it
                 let not_now = matches!(rule.as_str(), "ln_backend" | "ln_no_safe_channel" | "ln_unavailable");
-                c.unpaid.push(json!({"draw": win.draw(), "rule": rule}));
+                if c.unpaid.len() < UNPAID_LISTED {
+                    c.unpaid.push(json!({"draw": win.draw(), "rule": rule}));
+                }
                 if not_now {
-                    s.tried.remove(invoice);
+                    s.tried.remove(&invoice_mark(invoice));
+                }
+                // an invoice the wallet's checks refused is the seller's doing. After three, the session is over: a
+                // seller that cannot make an invoice for its own node at its own win size is not asked again
+                if retry && rule != "lottery_win_failed" {
+                    s.bad_invoices += 1;
+                    if s.bad_invoices >= BAD_INVOICES_MAX {
+                        let why = format!("{} invoices of this seller failed the wallet's checks (the last: {rule})", s.bad_invoices);
+                        s.fault.get_or_insert(why);
+                        c.stop.get_or_insert(format!("lottery_seller_fault: the seller's invoices for wins fail the wallet's checks ({rule})"));
+                        c.halt = true;
+                    }
                 }
                 if retry || not_now {
                     // owed again: another invoice of the seller's for it is looked at, never one that was booked
