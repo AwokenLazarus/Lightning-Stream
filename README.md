@@ -18,10 +18,11 @@ collects. A few tickets are locked before the service starts and topped up in th
 no request waits for a payment. Lightning's own routing carries tickets to any seller the
 network reaches, with no change to the node software.
 
-This direction was decided on 2026-10-11. **Tickets are half built**: the design was measured on
-a three-node Lightning Fork regtest, and the seller's side (the gateway) is built and runs on
-that regtest. The wallet's side is not built, so nothing can be bought with tickets yet. The
-sections below say what exists today, what is being built, and what was retired.
+This direction was decided on 2026-10-11. **Tickets run end to end on regtest, and nowhere
+else**: the design was measured on a three-node Lightning Fork regtest, the seller's side (the
+gateway) and the wallet's side are built, and on that regtest an agent's one call to the wallet
+buys a page, or a 100 MB file as it arrives, from a service behind the gateway. Nothing has run
+on mainnet. The sections below say what exists today, what is being built, and what was retired.
 
 Whitepaper: **<https://lazarus-xbt.xyz/stream/>**
 
@@ -62,13 +63,21 @@ the full list, with a link for each, is [`docs/REFERENCES.md`](docs/REFERENCES.m
   front of any HTTP service: it offers ticket terms in a 402, registers hold invoices for a
   buyer's hashes, settles a ticket when its secret arrives, meters the answer per request, per
   byte or per second, and signs a receipt. `scripts/gateway_regtest.sh` runs it on three
-  Lightning Fork nodes with a test buyer; no wallet pays it yet.
+  Lightning Fork nodes with a test buyer, and `scripts/ticket_e2e_regtest.sh` with the wallet as
+  the buyer.
 - **The ticket book in the wallet's signer.** The buyer's side of stream tickets: secrets derived
   in the signer from a sealed seed, many tickets locked at once through the owner's node, each
   release written to disk as spent before its secret leaves, under an owner's policy with a
   budget for each task, an exposure cap, and small caps for sellers the owner has not named.
-  `scripts/ticket_book_regtest.sh` runs it against Lightning Fork nodes on regtest. It is reached
-  through the signer's socket; paying an HTTP request with it is not built yet.
+  `scripts/ticket_book_regtest.sh` runs it against Lightning Fork nodes on regtest.
+- **The wallet pays a gateway (regtest only).** The agent's ordinary `xbt402_pay` call chooses
+  the rail: stream tickets where the seller offers them and the owner's policy allows them, a
+  single Lightning invoice where that is what the seller offers, and otherwise the frozen
+  channel. For tickets the signer fetches the seller's terms itself, locks a pool, releases a
+  ticket each time the balance with that seller runs out, reads the answer as it arrives, checks
+  every receipt against its own count, and cancels what is left when the session stops.
+  `scripts/ticket_e2e_regtest.sh` runs it through a routing hop with the release binaries and a
+  stock file server behind the gateway, a lying seller and a kill of each part included.
 - **The on-chain one-way channel (frozen).** A direct channel anchored on the chain, for paying
   one seller piece by piece: the buyer signs a slightly larger running total for each piece and
   the seller settles once. It is kept in the tree and tested, off the main path, with no new
@@ -82,9 +91,9 @@ the full list, with a link for each, is [`docs/REFERENCES.md`](docs/REFERENCES.m
 
 ## What is being built
 
-Stream tickets. The ticket book in the wallet's signer and the seller gateway beside a Lightning
-node are both built (above) and run on regtest. Next: the wallet's side of the HTTP 402 entry, so
-that `xbt402_pay` pays a gateway; then the lottery for amounts smaller than a ticket.
+Stream tickets. The ticket book in the wallet's signer, the seller gateway beside a Lightning
+node and the wallet's side of the HTTP 402 entry are built (above) and run on regtest. Next: the
+lottery for amounts smaller than a ticket, a signed list of what a seller sells, and packaging.
 The wire is written down as a draft in [`docs/TICKETS.md`](docs/TICKETS.md), and
 `scripts/ln_ticket_regtest.sh` reproduces its measurements on four Lightning Fork nodes (31 checks).
 Defaults in the design: 1,000-sat tickets, 2 in flight, a life of about 40 blocks. The buyer goes
@@ -105,8 +114,8 @@ wallet's ticket book and the gateway still have the earlier defaults** (8 ticket
 slots); `docs/LIMITS.md` says what that means on a 30-slot channel.
 
 A seller will need a Lightning node with inbound capacity, and a buyer a Lightning node with a
-channel. `docs/LIMITS.md` states what the design gives up, what the wallet's ticket book does not
-do and what the gateway does not do (the "Stream tickets" sections and "Seller gateway").
+channel. `docs/LIMITS.md` states what the design gives up, and what the wallet's ticket book, its
+payer and the gateway do not do (the "Stream tickets" sections and "Seller gateway").
 
 ### Lottery tickets (in design)
 
@@ -202,7 +211,7 @@ on-chain channel, pay with work, and the services and packages around them.
 |---|---|
 | `xbt-primitives` | XBT transactions, scripts, addresses, UnifiedSighash (0x21), strict ECDSA, BLAKE2b headers and proof of work |
 | `xbt402` | the frozen on-chain channel: funding, signed states, close, rollover, refund, the HTTP 402 wire (x402 v2 `batch-settlement`), receipts, provider and payer |
-| `xbt-signer` | the agent wallet's signer: keys never reach the agent (the owner can export a sealed backup); the owner's signed policy (budgets, per-seller caps, allowlist, human approval); a tamper-evident signature log; the Lightning rail (BOLT 11 and BOLT 12) |
+| `xbt-signer` | the agent wallet's signer: keys never reach the agent (the owner can export a sealed backup); the owner's signed policy (budgets, per-seller caps, allowlist, human approval); a tamper-evident signature log; the Lightning rail (BOLT 11 and BOLT 12); the ticket book and the payer that lets `xbt402_pay` pay a gateway with stream tickets (regtest only) |
 | `xbt-wallet-mcp` | the wallet's MCP server, over stdio and streamable HTTP, so an AI agent can quote and pay without holding a key |
 | `xbt-wallet-ui` | the owner's web UI: approvals, policy, channels, signature log |
 | `xbt-electrum` | a light chain backend for the buyer's wallet (it watches the frozen channel): it checks headers, proof of work and Merkle proofs itself; "not there" is answered only when every configured server answered, and servers that all hide a transaction make it read as absent |

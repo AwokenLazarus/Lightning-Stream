@@ -35,13 +35,28 @@ const _: () = assert!(TAG_RECORD % 2 == 1 && TAG_RECORD >= 65_536);
 pub const TAG_LEN: usize = 32;
 /// The feature the wire draft's terms must list.
 pub const WIRE_VERSION: &str = "ticket/0";
-/// More sellers than this in one task: two tickets a seller instead of eight.
+/// The defaults of the pool settings ([`TicketPolicy`] `many_sellers`, `pool`, `pool_many` and
+/// `floor_ticket_sats`): this is the one place they live. More sellers than `MANY_SELLERS` in one
+/// task: `POOL_MANY` tickets a seller instead of `POOL_FEW`; `FLOOR_MSAT` is the smallest ticket
+/// the wallet chooses by itself (64 sat).
 pub const MANY_SELLERS: usize = 8;
-/// A pool for one seller of a few, and for one of many.
 pub const POOL_FEW: u32 = 8;
 pub const POOL_MANY: u32 = 2;
-/// The smallest ticket the wallet chooses by itself, in msat (64 sat).
 pub const FLOOR_MSAT: u64 = 64_000;
+/// The default of `tickets.http_idle_s`: a session the wallet pays over HTTP is stopped, and its
+/// unused tickets cancelled, after this long without a paid request. Below the gateway's own five
+/// minutes, so that the wallet cancels before the seller does.
+pub const HTTP_IDLE_S: i64 = 120;
+/// The default of `tickets.ready_wait_ms`: how long a release waits for the seller's own word that
+/// the ticket is locked on its node.
+pub const READY_WAIT_MS: i64 = 3_000;
+/// The default of `tickets.max_answer_s`: the longest the wallet keeps an answer that is paid for
+/// as it arrives open. Below the 60 seconds a caller of the signer's socket waits by default, so
+/// that a call ends, and says where it stopped, before its caller gives up on it.
+pub const MAX_ANSWER_S: i64 = 50;
+/// The default of `tickets.read_timeout_s`: how long the wallet waits for the next byte of a
+/// seller's answer before it gives the answer up.
+pub const READ_TIMEOUT_S: i64 = 30;
 /// A ticket with this many blocks or fewer before its last hop's expiry is no longer released: the
 /// seller refuses it (24, `docs/TICKETS.md` section 3) and one block is ours.
 pub const USABLE_MARGIN_BLOCKS: i64 = 25;
@@ -142,14 +157,68 @@ pub fn task_name_ok(s: &str) -> bool {
     !s.is_empty() && s.len() <= 32 && s.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_')
 }
 
-/// The memo of a ticket's ledger row: the task it was released under.
-pub fn memo(task: &str) -> String {
-    format!("ticket task={task}")
+/// The memo of a ticket's ledger row: the task it was released under and, for a ticket that has
+/// one, its session (what [`Velocity::Session`] counts once).
+pub fn memo(task: &str, session: &str) -> String {
+    if session_name_ok(session) { format!("ticket task={task} session={session}") } else { format!("ticket task={task}") }
+}
+
+fn memo_parts(memo: &str) -> Option<(&str, Option<&str>)> {
+    let rest = memo.strip_prefix("ticket task=")?;
+    let (task, session) = match rest.split_once(" session=") {
+        Some((t, s)) => (t, Some(s).filter(|s| session_name_ok(s))),
+        None => (rest, None),
+    };
+    task_name_ok(task).then_some((task, session))
 }
 
 /// The task a ledger row's memo names, if it is a ticket's.
 pub fn memo_task(memo: &str) -> Option<&str> {
-    memo.strip_prefix("ticket task=").filter(|t| task_name_ok(t))
+    memo_parts(memo).map(|(t, _)| t)
+}
+
+/// The session a ticket's ledger row names (a row from before sessions were named has none).
+pub fn memo_session(memo: &str) -> Option<&str> {
+    memo_parts(memo).and_then(|(_, s)| s)
+}
+
+/// A session id as the book makes them: what a memo can carry without escaping.
+pub fn session_name_ok(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && s.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+}
+
+/// What `velocity_max` counts of ticket payments (policy.json `tickets.velocity`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Velocity {
+    /// Every release is one payment: the reading that pays least, and the default. With the
+    /// shipped `velocity_max` of 8 an hour a wallet releases at most 8 tickets an hour.
+    Release,
+    /// A session is one payment, counted from its first release for as long as one of its
+    /// releases is inside the window. What bounds the releases of a session is then the budgets,
+    /// the caps on locked funds and `max_sends_per_hour`.
+    Session,
+}
+
+/// How many payments `rows` are for `velocity_max`: every row is one, except that under
+/// [`Velocity::Session`] the ticket rows of one session are one together. `own_session`: the
+/// session of the payment being decided, which is not counted against itself (its earlier
+/// releases are that same payment). Rows are `(memo)` of the ledger entries inside the window.
+pub fn velocity_count<'a>(memos: impl Iterator<Item = &'a str>, mode: Velocity, own_session: Option<&str>) -> i64 {
+    let mut seen: Vec<&str> = vec![];
+    let mut n = 0i64;
+    for m in memos {
+        match (mode, memo_session(m)) {
+            (Velocity::Session, Some(s)) if own_session == Some(s) => {}
+            (Velocity::Session, Some(s)) => {
+                if !seen.contains(&s) {
+                    seen.push(s);
+                    n = n.saturating_add(1);
+                }
+            }
+            _ => n = n.saturating_add(1),
+        }
+    }
+    n
 }
 
 /// The ledger id of a ticket's spend.
@@ -212,6 +281,21 @@ pub struct TicketPolicy {
     pub max_new_sellers_per_min: i64,
     /// Ticket payments handed to the node's router an hour, failed ones included.
     pub max_sends_per_hour: i64,
+    /// The pool: unreleased tickets kept with one seller of a few, and with one of more than
+    /// `many_sellers` in a task; the smallest ticket the wallet chooses by itself, in sats.
+    pub pool: i64,
+    pub pool_many: i64,
+    pub many_sellers: i64,
+    pub floor_ticket_sats: i64,
+    /// What `velocity_max` counts ([`Velocity`]).
+    pub velocity: Velocity,
+    /// The HTTP binding: idle time before a session is stopped, how long a release waits for the
+    /// seller to show the ticket locked, how long a read of an answer may wait for its next byte.
+    pub http_idle_s: i64,
+    pub ready_wait_ms: i64,
+    pub read_timeout_s: i64,
+    /// The longest an answer that is paid for as it arrives stays open, in seconds.
+    pub max_answer_s: i64,
     pub tasks: BTreeMap<String, TaskPolicy>,
 }
 
@@ -221,13 +305,17 @@ impl Default for TicketPolicy {
         // hops of 80 blocks and the node's 3), and nothing is paid until the owner names a task
         Self { enabled: false, max_ticket_sats: 1_000, max_ticket_blocks: 40, max_htlc_blocks: 204, max_invoice_expiry_s: 3_600,
                max_locked_sats: 16_000, max_locked_tickets: 64, seller_max_tickets: 8, seller_max_locked_sats: 8_000, max_sellers: 32,
-               max_new_sellers_per_min: 30, max_sends_per_hour: 1_200, tasks: BTreeMap::new() }
+               max_new_sellers_per_min: 30, max_sends_per_hour: 1_200, pool: POOL_FEW as i64, pool_many: POOL_MANY as i64,
+               many_sellers: MANY_SELLERS as i64, floor_ticket_sats: (FLOOR_MSAT / 1000) as i64, velocity: Velocity::Release,
+               http_idle_s: HTTP_IDLE_S, ready_wait_ms: READY_WAIT_MS, read_timeout_s: READ_TIMEOUT_S, max_answer_s: MAX_ANSWER_S,
+               tasks: BTreeMap::new() }
     }
 }
 
-pub const TICKET_INT_KEYS: [&str; 11] = ["max_ticket_sats", "max_ticket_blocks", "max_htlc_blocks", "max_invoice_expiry_s", "max_locked_sats",
+pub const TICKET_INT_KEYS: [&str; 19] = ["max_ticket_sats", "max_ticket_blocks", "max_htlc_blocks", "max_invoice_expiry_s", "max_locked_sats",
                                          "max_locked_tickets", "seller_max_tickets", "seller_max_locked_sats", "max_sellers",
-                                         "max_new_sellers_per_min", "max_sends_per_hour"];
+                                         "max_new_sellers_per_min", "max_sends_per_hour", "pool", "pool_many", "many_sellers", "floor_ticket_sats",
+                                         "http_idle_s", "ready_wait_ms", "read_timeout_s", "max_answer_s"];
 pub const TASK_INT_KEYS: [&str; 8] = ["budget_sats", "window_s", "max_locked_sats", "max_locked_tickets", "max_sellers",
                                       "unlisted_max_spend_sats", "unlisted_max_tickets", "unlisted_max_locked_sats"];
 /// The longest window a task's budget can be read over: what the ledger keeps.
@@ -249,7 +337,14 @@ impl TicketPolicy {
                            seller_max_tickets: i(m, "seller_max_tickets", d.seller_max_tickets),
                            seller_max_locked_sats: i(m, "seller_max_locked_sats", d.seller_max_locked_sats), max_sellers: i(m, "max_sellers", d.max_sellers),
                            max_new_sellers_per_min: i(m, "max_new_sellers_per_min", d.max_new_sellers_per_min),
-                           max_sends_per_hour: i(m, "max_sends_per_hour", d.max_sends_per_hour), tasks: BTreeMap::new() };
+                           max_sends_per_hour: i(m, "max_sends_per_hour", d.max_sends_per_hour), pool: i(m, "pool", d.pool),
+                           pool_many: i(m, "pool_many", d.pool_many), many_sellers: i(m, "many_sellers", d.many_sellers),
+                           floor_ticket_sats: i(m, "floor_ticket_sats", d.floor_ticket_sats),
+                           // anything but the word "session" is the default: a misspelling never widens
+                           velocity: if m.get("velocity").and_then(Value::as_str) == Some("session") { Velocity::Session } else { Velocity::Release },
+                           http_idle_s: i(m, "http_idle_s", d.http_idle_s), ready_wait_ms: i(m, "ready_wait_ms", d.ready_wait_ms),
+                           read_timeout_s: i(m, "read_timeout_s", d.read_timeout_s), max_answer_s: i(m, "max_answer_s", d.max_answer_s),
+                           tasks: BTreeMap::new() };
         for (name, t) in m.get("tasks").and_then(Value::as_object).into_iter().flatten() {
             let Some(t) = t.as_object() else { continue };
             if !task_name_ok(name) {
@@ -263,7 +358,7 @@ impl TicketPolicy {
                 max_locked_sats: i(t, "max_locked_sats", p.max_locked_sats), max_locked_tickets: i(t, "max_locked_tickets", p.max_locked_tickets),
                 max_sellers: i(t, "max_sellers", p.max_sellers),
                 admit: if t.get("admit").and_then(Value::as_str) == Some("any") { Admit::Any } else { Admit::Listed },
-                unlisted_max_spend_sats: i(t, "unlisted_max_spend_sats", two.saturating_mul(2)), unlisted_max_tickets: i(t, "unlisted_max_tickets", POOL_MANY as i64),
+                unlisted_max_spend_sats: i(t, "unlisted_max_spend_sats", two.saturating_mul(2)), unlisted_max_tickets: i(t, "unlisted_max_tickets", p.pool_many),
                 unlisted_max_locked_sats: i(t, "unlisted_max_locked_sats", two) });
         }
         p.max_ticket_sats = p.max_ticket_sats.min(i64::MAX / 1000);
@@ -293,11 +388,19 @@ pub fn validate(raw: &Value, errors: &mut Vec<String>, warnings: &mut Vec<String
     };
     ints(m, &TICKET_INT_KEYS, "tickets", errors);
     for k in m.keys() {
-        if k != "enabled" && k != "tasks" && !TICKET_INT_KEYS.contains(&k.as_str()) {
+        if k != "enabled" && k != "tasks" && k != "velocity" && !TICKET_INT_KEYS.contains(&k.as_str()) {
             warnings.push(format!("policy.json tickets.{k}: unknown key (the signer ignores it)"));
         }
     }
+    if let Some(v) = m.get("velocity").filter(|v| !v.is_null()) {
+        if !matches!(v.as_str(), Some("release" | "session")) {
+            errors.push("policy.json tickets.velocity: must be \"release\" (every release is one payment for velocity_max) or \"session\" (a session is one)".into());
+        }
+    }
     let p = TicketPolicy::from_map(m);
+    if p.pool == 0 || p.pool_many == 0 {
+        warnings.push("policy.json tickets.pool or pool_many is 0: no ticket is locked".into());
+    }
     match m.get("tasks") {
         None | Some(Value::Null) => {}
         Some(Value::Object(tasks)) => {
@@ -421,7 +524,9 @@ pub struct Sizing {
 /// `cap_tickets` and `cap_locked_sats` are the owner's caps for this seller.
 pub fn sizing(terms: &Terms, pol: &TicketPolicy, sellers_in_task: usize, expect_msat: Option<u64>, cap_tickets: i64, cap_locked_sats: i64)
               -> Result<Sizing, Refusal> {
-    let many = sellers_in_task > MANY_SELLERS;
+    let many = sellers_in_task as i64 > pol.many_sellers;
+    let floor_msat = (pol.floor_ticket_sats.max(0) as u64).saturating_mul(1000);
+    let pool_of = |n: i64| u32::try_from(n.max(0)).unwrap_or(u32::MAX);
     if i64::from(terms.ticket_blocks) > pol.max_ticket_blocks {
         return refuse("ticket_blocks", format!("ticketBlocks {} is above the owner's tickets.max_ticket_blocks {}", terms.ticket_blocks, pol.max_ticket_blocks));
     }
@@ -434,12 +539,12 @@ pub fn sizing(terms: &Terms, pol: &TicketPolicy, sellers_in_task: usize, expect_
         None => terms.ticket_msat,
         Some(min) => {
             let hi = terms.ticket_msat.min(owner_max);
-            let lo = if many { min.max(FLOOR_MSAT) } else { min };
+            let lo = if many { min.max(floor_msat) } else { min };
             if hi < lo {
                 return refuse("ticket_size", format!("the seller's smallest ticket ({lo} msat) is above what the owner allows for this seller ({owner_max} msat)"));
             }
             match expect_msat {
-                Some(e) if many => e.div_ceil(u64::from(POOL_MANY)).clamp(lo, hi),
+                Some(e) if many => e.div_ceil(u64::from(pool_of(pol.pool_many).max(1))).clamp(lo, hi),
                 _ => hi,
             }
         }
@@ -447,7 +552,7 @@ pub fn sizing(terms: &Terms, pol: &TicketPolicy, sellers_in_task: usize, expect_
     if ticket_msat < 1000 {
         return refuse("ticket_size", "a ticket below 1 sat: no node forwards it");
     }
-    let base = if many { POOL_MANY } else { POOL_FEW };
+    let base = if many { pool_of(pol.pool_many) } else { pool_of(pol.pool) };
     let by_sats = cap_locked_sats.max(0) as u64 / sats_ceil(ticket_msat).max(1) as u64;
     let pool = u64::from(base.min(terms.max_tickets)).min(cap_tickets.max(0) as u64).min(by_sats);
     if pool == 0 {
@@ -627,14 +732,38 @@ pub struct Session {
     pub stopped_ts: f64,
     pub closed_ts: f64,
     pub why: String,
+    /// The seller's own name for this session and where its endpoints are, when the wallet itself
+    /// speaks HTTP to the seller ([`crate::ticket_pay`]). Kept so that a wallet that restarted can
+    /// still ask for its tickets to be cancelled.
+    pub http: Option<SellerSession>,
+}
+
+/// The seller's side of a session the wallet pays over HTTP: the id and the key the seller gave in
+/// its first lock answer, and the URL of its session endpoints. The key authenticates requests of
+/// this session; it is no ticket secret and releases no money.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SellerSession {
+    pub id: String,
+    pub key: [u8; 32],
+    pub base: String,
+}
+
+impl std::fmt::Debug for SellerSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SellerSession {{ id: {:?}, base: {:?}, key: .. }}", self.id, self.base)
+    }
 }
 
 impl Session {
     pub fn row(&self) -> Value {
-        json!({"e": "session", "id": self.id, "payee": self.payee, "origin": self.origin, "task": self.task, "listed": self.listed,
+        let mut r = json!({"e": "session", "id": self.id, "payee": self.payee, "origin": self.origin, "task": self.task, "listed": self.listed,
                "ticket_msat": self.ticket_msat.to_string(), "pool": self.pool, "max_tickets": self.max_tickets, "ticket_blocks": self.ticket_blocks,
                "max_sats": self.max_sats, "state": self.state.as_str(), "opened_ts": ts_value(self.opened_ts), "active_ts": ts_value(self.active_ts),
-               "stopped_ts": ts_value(self.stopped_ts), "closed_ts": ts_value(self.closed_ts), "why": self.why})
+               "stopped_ts": ts_value(self.stopped_ts), "closed_ts": ts_value(self.closed_ts), "why": self.why});
+        if let Some(h) = &self.http {
+            r["http"] = json!({"id": h.id, "key": hex::encode(h.key), "base": h.base});
+        }
+        r
     }
 
     fn from_row(r: &Value) -> Option<Self> {
@@ -653,13 +782,19 @@ impl Session {
         Some(Self { id, payee: str_or_empty(r.get("payee")), origin: str_or_empty(r.get("origin")), task: str_or_empty(r.get("task")),
                     listed: r.get("listed")?.as_bool()?, ticket_msat: outside_u64(r.get("ticket_msat"))?, pool: u("pool")?, max_tickets: u("max_tickets")?,
                     ticket_blocks: u("ticket_blocks")?, max_sats: py_int(r.get("max_sats")).filter(|n| *n >= 0)?, state, opened_ts: f("opened_ts")?,
-                    active_ts: f("active_ts")?, stopped_ts: f("stopped_ts")?, closed_ts: f("closed_ts")?, why: str_or_empty(r.get("why")) })
+                    active_ts: f("active_ts")?, stopped_ts: f("stopped_ts")?, closed_ts: f("closed_ts")?, why: str_or_empty(r.get("why")),
+                    http: match r.get("http").filter(|h| !h.is_null()) {
+                        None => None,
+                        // a row that names a seller session names all of it, or the row is damage
+                        Some(h) => Some(SellerSession { id: str_or_empty(h.get("id")), key: hex::decode(str_or_empty(h.get("key"))).ok()?.try_into().ok()?,
+                                                        base: str_or_empty(h.get("base")) }),
+                    } })
     }
 
     pub fn public(&self) -> Value {
         json!({"session": self.id, "payee": self.payee, "origin": self.origin, "task": self.task, "listed": self.listed,
                "ticket_msat": self.ticket_msat.to_string(), "pool": self.pool, "state": self.state.as_str(), "opened_ts": ts_value(self.opened_ts),
-               "stopped_ts": ts_value(self.stopped_ts), "closed_ts": ts_value(self.closed_ts), "why": self.why})
+               "stopped_ts": ts_value(self.stopped_ts), "closed_ts": ts_value(self.closed_ts), "why": self.why, "http": self.http.is_some()})
     }
 }
 
@@ -1003,7 +1138,54 @@ mod tests {
 
     fn session(id: &str, pool: u32) -> Session {
         Session { id: id.into(), payee: "p".into(), origin: String::new(), task: "t".into(), listed: true, ticket_msat: 1_000_000, pool, max_tickets: 8,
-                  ticket_blocks: 40, max_sats: 0, state: SState::Open, opened_ts: 1.0, active_ts: 1.0, stopped_ts: 0.0, closed_ts: 0.0, why: String::new() }
+                  ticket_blocks: 40, max_sats: 0, state: SState::Open, opened_ts: 1.0, active_ts: 1.0, stopped_ts: 0.0, closed_ts: 0.0, why: String::new(),
+                  http: None }
+    }
+
+    #[test]
+    fn the_sellers_side_of_a_session_is_kept_in_its_row_and_a_damaged_one_refuses_the_row() {
+        let mut s = session("s1", 8);
+        assert_eq!(Session::from_row(&s.row()), Some(s.clone()), "a row from before the HTTP binding has no seller side");
+        s.http = Some(SellerSession { id: "ab".repeat(16), key: [7u8; 32], base: "https://seller.example/x402/ticket".into() });
+        let row = s.row();
+        assert_eq!(Session::from_row(&row), Some(s.clone()));
+        assert_eq!(s.public()["http"], true);
+        assert!(!s.public().to_string().contains(&hex::encode([7u8; 32])), "the key is not in what a caller is shown");
+        assert!(!format!("{s:?}").contains("0707"), "nor in a debug print");
+        let mut bent = row.clone();
+        bent["http"]["key"] = "07".into();
+        assert_eq!(Session::from_row(&bent), None);
+    }
+
+    #[test]
+    fn velocity_counts_every_release_unless_the_owner_says_a_session_is_one_payment() {
+        let rows = [memo("film", "s1"), memo("film", "s1"), memo("film", "s2"), "xbt402 signed delta".to_string(), memo("recovered", ""), memo("film", "s1")];
+        let count = |mode, own| velocity_count(rows.iter().map(String::as_str), mode, own);
+        assert_eq!(count(Velocity::Release, None), 6, "the default: every row is a payment");
+        assert_eq!(count(Velocity::Release, Some("s1")), 6, "and a release is never free of its own session's rows");
+        assert_eq!(count(Velocity::Session, None), 4, "s1 once, s2 once, the channel payment, the ticket without a session");
+        assert_eq!(count(Velocity::Session, Some("s1")), 3, "a release of s1 does not count s1 against itself");
+        assert_eq!(count(Velocity::Session, Some("s3")), 4, "a new session is one more payment");
+        // the setting: only the word "session" changes the default
+        let pol = |v: Value| TicketPolicy::from_map(json!({"velocity": v}).as_object().unwrap()).velocity;
+        assert_eq!((pol(json!("session")), pol(json!("release")), pol(json!("Session")), pol(json!(true)), pol(Value::Null)),
+                   (Velocity::Session, Velocity::Release, Velocity::Release, Velocity::Release, Velocity::Release));
+        let (mut errors, mut warnings) = (vec![], vec![]);
+        validate(&json!({"velocity": "sessions"}), &mut errors, &mut warnings);
+        assert!(errors.iter().any(|e| e.contains("tickets.velocity")), "{errors:?}");
+    }
+
+    #[test]
+    fn the_pool_and_the_floor_are_the_owners_settings_with_one_default_each() {
+        let d = TicketPolicy::default();
+        assert_eq!((d.pool, d.pool_many, d.many_sellers, d.floor_ticket_sats), (POOL_FEW as i64, POOL_MANY as i64, MANY_SELLERS as i64, (FLOOR_MSAT / 1000) as i64));
+        // a node that takes 30 payments in flight a channel: three tickets a seller, a floor above the dust limit
+        let pol = TicketPolicy::from_map(json!({"pool": 3, "pool_many": 1, "many_sellers": 2, "floor_ticket_sats": 400}).as_object().unwrap());
+        let flex = terms(1_000_000, Some(1_000), 8);
+        assert_eq!(sizing(&flex, &pol, 1, None, 8, 8_000), Ok(Sizing { ticket_msat: 1_000_000, pool: 3 }));
+        assert_eq!(sizing(&flex, &pol, 3, Some(10_000), 8, 8_000), Ok(Sizing { ticket_msat: 400_000, pool: 1 }), "more than many_sellers: the floor, one ticket");
+        let none = TicketPolicy::from_map(json!({"pool": 0}).as_object().unwrap());
+        assert_eq!(sizing(&flex, &none, 1, None, 8, 8_000).map_err(|e| e.0), Err("ticket_seller_cap"), "a pool of 0 locks nothing");
     }
 
     #[test]
@@ -1096,7 +1278,11 @@ mod tests {
 
     #[test]
     fn a_task_name_is_what_a_memo_can_carry() {
-        assert_eq!(memo_task(&memo("inference-1")), Some("inference-1"));
+        assert_eq!(memo_task(&memo("inference-1", "")), Some("inference-1"));
+        let m = memo("inference-1", "aB3_-x");
+        assert_eq!((memo_task(&m), memo_session(&m)), (Some("inference-1"), Some("aB3_-x")));
+        assert_eq!(memo_session(&memo("t", "no spaces")), None, "a session name that would need escaping is not written");
+        assert_eq!(memo_session("ticket task=t session=a b"), None);
         for bad in ["", "Has Space", "UPPER", "a=b", &"x".repeat(33)] {
             assert!(!task_name_ok(bad), "{bad}");
         }

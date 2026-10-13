@@ -71,6 +71,11 @@ cargo test -j2 --manifest-path tools/lazarus-crosscheck/Cargo.toml  # header/PoW
 ./scripts/work_interop.sh          # AGP-032: pay-with-work on regtest, Rust payer/provider vs primed (branch rnd/agp-011, not public) (PAYER=py / PROVIDER=py: vs the Python side)
 ./scripts/work_matrix.sh           # AGP-032: xbt-work on every AGP-031 target; writes dist/WORK_MATRIX.md
 ./scripts/container_test.sh         # AGP-038: the images on regtest (signer+witness+MCP+hub, env + data dir only), paid call, restart, /readyz
+./scripts/ln_rail_regtest.sh        # the Lightning rail (ln_pay) on Lightning Fork nodes
+./scripts/ln_ticket_regtest.sh      # stream tickets as such: the measurements of docs/TICKETS.md
+./scripts/ticket_book_regtest.sh    # the ticket book in the wallet's signer, through its socket
+./scripts/gateway_regtest.sh        # the seller gateway with a test buyer
+./scripts/ticket_e2e_regtest.sh     # the wallet pays the gateway: xbt402_pay over tickets through a hop, a lying seller, kills of each part
 ```
 
 Run heavy work under a CPU and memory cap:

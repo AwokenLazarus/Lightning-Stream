@@ -26,6 +26,10 @@ pub const LN_TOOL_NAMES: [&str; 2] = ["ln_pay", "ln_status"];
 /// here: `ticket_open`, `ticket_offer`, `ticket_lock` and `ticket_release` are socket methods for
 /// the wallet's own payer, and a released secret is spent money.
 pub const TICKET_TOOL_NAMES: [&str; 2] = ["ticket_status", "ticket_stop"];
+/// Tools that every wallet has and that are described anew, with what tickets add, when the
+/// operator turns tickets on: `xbt402_pay` then chooses the rail and takes the owner's `task`, and
+/// `channels` also shows the tickets in flight.
+pub const TICKET_REDESCRIBED: [&str; 2] = ["xbt402_pay", "channels"];
 /// Never tools: a model cannot approve its own payments or move the hot key (B2 `FORBIDDEN_MCP_TOOLS`),
 /// nor reach the web UI's methods (AGP-039): the policy, the human key, the signed rotation, the backup.
 pub const FORBIDDEN: [&str; 12] = ["approve", "recover_vault", "recover_treasury", "sweep_hot", "rotate_hot_key", "deny_approval", "policy_prepare",
@@ -50,7 +54,13 @@ pub fn tools_with(ln: bool, tickets: bool) -> Value {
         if on {
             let extra: Value = serde_json::from_str(text).expect("a tool list of this crate");
             if let (Some(a), Value::Array(x)) = (t.get_mut("tools").and_then(Value::as_array_mut), extra) {
-                a.extend(x);
+                for tool in x {
+                    // a tool of the same name is the same tool, described for a wallet that has this rail
+                    match a.iter_mut().find(|have| have.get("name") == tool.get("name")) {
+                        Some(have) => *have = tool,
+                        None => a.push(tool),
+                    }
+                }
             }
         }
     }
@@ -173,7 +183,7 @@ impl Server {
             && !(self.wallet.ticket_tools && TICKET_TOOL_NAMES.contains(&name)) {
             return tool_error(format!("Unknown tool: {name}"));
         }
-        let params = match args::validate(name, args) {
+        let params = match args::validate_for(name, args, self.wallet.ticket_tools) {
             Ok(p) => p,
             Err(e) => return tool_error(format!("Error executing tool {name}: {e}")),
         };
@@ -203,10 +213,11 @@ mod tests {
         for forbidden in ["ticket_open", "ticket_offer", "ticket_lock", "ticket_release"] {
             assert!(!on.iter().any(|n| n == forbidden) && crate::args::spec(forbidden).is_none(), "{forbidden} is a socket method, not a tool");
         }
-        // the published schema of each ticket tool names exactly the arguments the server takes
+        // the published schema of each ticket tool, and of each tool tickets describe anew, names exactly the arguments the server takes
         let listed = tools_with(false, true);
-        for t in listed["tools"].as_array().unwrap().iter().filter(|t| TICKET_TOOL_NAMES.contains(&t["name"].as_str().unwrap())) {
-            let spec = crate::args::spec(t["name"].as_str().unwrap()).unwrap();
+        assert_eq!(names(listed.clone())[..10], TOOL_NAMES, "a redescribed tool keeps its place and its name");
+        for t in listed["tools"].as_array().unwrap().iter().filter(|t| TICKET_TOOL_NAMES.contains(&t["name"].as_str().unwrap()) || TICKET_REDESCRIBED.contains(&t["name"].as_str().unwrap())) {
+            let spec = crate::args::spec_for(t["name"].as_str().unwrap(), true).unwrap();
             let mut props: Vec<&str> = t["inputSchema"]["properties"].as_object().unwrap().keys().map(String::as_str).collect();
             let mut args: Vec<&str> = spec.iter().map(|a| a.name).collect();
             props.sort_unstable();
@@ -217,6 +228,15 @@ mod tests {
             assert_eq!(required, listed_required, "{}", t["name"]);
             assert!(t["description"].as_str().unwrap().contains("cannot") || t["description"].as_str().unwrap().contains("Read-only"),
                     "{}: the description says what the tool cannot cause", t["name"]);
+        }
+        // with tickets off the wallet's surface is B2's, byte for byte: no task argument, the old descriptions
+        let off = tools_with(true, false);
+        let pay = |v: &Value| v["tools"].as_array().unwrap().iter().find(|t| t["name"] == "xbt402_pay").cloned().unwrap();
+        assert_eq!(pay(&off), pay(&tools()));
+        assert!(pay(&off)["inputSchema"]["properties"].get("task").is_none() && pay(&listed)["inputSchema"]["properties"]["task"]["default"] == "");
+        let d = pay(&listed)["description"].as_str().unwrap().to_string();
+        for must in ["stream tickets", "single Lightning invoice", "on-chain channel", "What you can cause", "What you cannot cause", "rails_passed_over"] {
+            assert!(d.contains(must), "xbt402_pay's description names {must:?}");
         }
     }
 

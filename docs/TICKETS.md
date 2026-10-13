@@ -1,20 +1,20 @@
 # Stream tickets: the wire, draft v0
 
 **Draft v0.** It was written down before any wallet or seller code so that it could be argued
-with. Both sides are now built and run on regtest: the seller's side by `xbt-gateway`
-(`crates/xbt-gateway`, run by `scripts/gateway_regtest.sh` against Lightning Fork nodes with a test
-buyer that speaks this wire), and the buyer's side of sections 2 to 4 by the ticket book in the
-wallet's signer (`crates/xbt-signer/src/ticket.rs` and `ticket_rail.rs`, run by
-`scripts/ticket_book_regtest.sh`). The wallet's HTTP binding of section 3 is not built, so no
-wallet pays a gateway yet. The numbers were measured on regtest by `scripts/ln_ticket_regtest.sh`
-(four Lightning Fork nodes, default settings, one host, loopback) and, where a sentence names the
-gateway, by `scripts/gateway_regtest.sh`; anyone can rerun them. The few that come from reading
-the node's source say so. Nothing here has run on mainnet. Section 10 lists what building the
-gateway changed in this draft. Section 11 (2026-10-12) sets the defaults again for channels that
-carry 30 pending payments, which is Core Lightning's default, and for the dust limits; it was
-measured with the XBT Core Lightning fork in the lab, and the wallet and the gateway in this tree
-still have the earlier defaults. XBT is Bitcoin on BLAKE2b proof of work; "the SHA-256 chain" is the
-other chain.
+with. Both sides are now built, and a wallet pays a gateway on regtest: the seller's side is
+`xbt-gateway` (`crates/xbt-gateway`), and the buyer's side is the wallet's signer: the ticket book
+(`crates/xbt-signer/src/ticket.rs` and `ticket_rail.rs`) and the HTTP binding under `xbt402_pay`
+(`ticket_http.rs` and `ticket_pay.rs`, section 12). The numbers were measured on regtest (Lightning
+Fork nodes, default settings, one host, loopback) by the script each sentence names:
+`scripts/ln_ticket_regtest.sh` where none is named, `scripts/gateway_regtest.sh` for the gateway
+with a test buyer, `scripts/ticket_book_regtest.sh` for the book, and
+`scripts/ticket_e2e_regtest.sh` for the wallet paying the gateway; anyone can rerun them. The few
+that come from reading the node's source say so. Nothing here has run on mainnet. Sections 10 and
+13 list what building each side changed in this draft. Section 11 (2026-10-12) sets the defaults
+again for channels that carry 30 pending payments, which is Core Lightning's default, and for the
+dust limits; it was measured with the XBT Core Lightning fork in the lab, and the wallet and the
+gateway in this tree still have the earlier defaults. XBT is Bitcoin on BLAKE2b proof of work;
+"the SHA-256 chain" is the other chain.
 
 A **ticket** is a small Lightning payment that is locked along an ordinary route and not yet
 released. The buyer picks a 32-byte secret and gives the seller its SHA-256 hash. The seller's node
@@ -140,7 +140,10 @@ sees `IN_FLIGHT` first, by about one commitment exchange per channel on the rout
 the lab), and cannot see `ACCEPTED` at all. A buyer that releases a ticket in that moment gets
 `ticket_not_locked` (section 3); the seller has not used the ticket, and the buyer sends the same
 secret again. On the lab a buyer that paid as soon as its own node showed 8 tickets in flight was
-answered so and served on the retry. Locked funds
+answered so and served on the retry. A buyer SHOULD wait for the seller's own word instead: the
+session's signed `status` (section 4) lists each ticket's state, and the wallet built here releases
+a ticket only after `status` has shown it `ACCEPTED`, for a bounded time (3 s by default), so that
+no secret leaves for a ticket the seller cannot yet use. Locked funds
 are not spent. They count against a cap on locked funds, not against a budget.
 
 The seller MUST cap sessions as well as tickets per session, and SHOULD let an unpaid invoice lapse
@@ -208,8 +211,9 @@ otherwise. The seller, for each request, in this order:
    `{"scheme": "ticket", "session", "seq", "releasedMsat", "spentMsat", "charged", "req", "status",
    "bodyHash"}`, signed as the channel wire signs its receipts, under the tag
    `xbt402/ticket-receipt/v0`, over these fields in this order. `releasedMsat` is the sum of the
-   tickets settled in this session and `spentMsat` the running total of what was served. Both only
-   rise.
+   tickets settled in this session and `spentMsat` the running total of what was served.
+   `releasedMsat` only rises. `spentMsat` rises as pieces are served, and falls only by what the
+   seller charged ahead of sending and then did not send (an answer the buyer stopped reading).
 
 The step-2 height is the seller's node's, and the seller's macaroon of section 7 cannot read it:
 with `invoices:read` and `invoices:write` the node answers `permission denied` to `GetInfo` and to
@@ -245,6 +249,10 @@ The buyer books what it released plus the routing fee its own node reports, neve
 seller sends. It checks each receipt against its own count, and stops if `spentMsat` exceeds what it
 asked for or `releasedMsat` differs from what it released. The requests MUST go over TLS (or
 loopback): on a plain connection a listener learns the session key.
+
+The wallet built here never puts a secret in a request for a resource: every secret travels in
+`release` (section 4), and requests are paid from the balance. A secret then has one path and one
+answer, and a request that is refused has cost no secret (section 12).
 
 A buyer that starts cannot tell a restart from a restore of older records, in which a ticket shown
 as locked may have been released since. It MUST treat every ticket that was locked before the start
@@ -415,6 +423,11 @@ Lightning node, and each node caps the total of such HTLCs per channel (section 
   node's `SignMessage`, which neither of the seller's macaroons allows; the runner can sign the
   list once with its own tools, or a third narrow macaroon can. Until then the list is the TLS
   origin's word, as the terms are.
+- The entry for a single Lightning payment (section 12, rail 2) is x402's `exact` with a network
+  id of ours and the invoice in `extra.invoice`. No seller in this tree offers it, and it was not
+  run on the lab.
+- `bytes` and `complete` beside the last receipt of a long answer are not signed. What is signed
+  is `charged` and `bodyHash`.
 - The price of a piece only the service can count, such as the tokens a model produced, cannot be
   stated by a gateway that sees bytes and seconds. The response header `Ticket-Units` is kept for
   such a count; this draft reads no price from it.
@@ -528,10 +541,133 @@ values that binary has by default on mainnet (30 slots, a time lock delta of 34,
 
 | | This draft now | The wallet's ticket book | The gateway |
 |---|---|---|---|
-| Tickets per session | 2 | 8 for up to 8 sellers, then 2 | 8 (`tickets.max_tickets`) |
-| Smallest held ticket | 546 sat | 64 sat by its own choice | 1 sat (`tickets.ticket_msat` from 1000) |
+| Tickets per session | 2 | 8 for up to 8 sellers, then 2: the defaults of the owner's `tickets.pool`, `many_sellers` and `pool_many` | 8 (`tickets.max_tickets`) |
+| Smallest held ticket | 546 sat | 64 sat by its own choice: the default of the owner's `tickets.floor_ticket_sats` | 1 sat (`tickets.ticket_msat` from 1000) |
 | Held tickets in all | Half the slots of a channel: 15 of 30 | 64 (`max_locked_tickets`), with no look at the channel's slots | 240 (30 sessions of 8), with 483 slots assumed |
 | A dust check before paying | Yes | No | Not its part |
 | A lock that fails for lack of a slot | Hold less, wait, stop | The reason is noted on the ticket | Not its part |
 | `slots_short` | Yes | Not known | Not sent |
 | `settle: "on-arrival"` | Section 5 | Refused | Not offered |
+
+## 12. The wallet's side: `xbt402_pay`
+
+An agent pays with one tool call, `xbt402_pay(url, method, body, max_sats, task)`. Everything else
+is the wallet's signer's (`crates/xbt-signer/src/ticket_pay.rs`): it sends the request once without
+paying, reads the 402 itself, and chooses the rail. Who the seller is therefore comes from what
+the signer fetched from the URL's own origin, never from its caller.
+
+**The rail.** One function, in this order; the first entry the seller offers and the owner's
+policy allows is paid.
+
+| | Entry of the 402 | Paid when | Otherwise |
+|---|---|---|---|
+| 1 | `scheme: "ticket"` on the wallet's Lightning network | Tickets are on (`tickets.enabled`); the call names one of the owner's tasks, or the owner has one task, or one named `default`; the seller is admitted (its origin is on the allowlist and tied to its node id, or the task pays any seller); the terms are inside the owner's bounds; `release` is `with-request`; the origin is https, or http on this machine. | The next entry, with the reason. |
+| 2 | `scheme: "exact"` on the wallet's Lightning network, with a BOLT 11 invoice in `extra.invoice` | The Lightning rail is on; the origin is on the allowlist; the invoice pays the entry's `payTo` its `amount`; and `ln_pay` would pay that invoice (every rule of that rail, the payee on the allowlist among them). The wallet pays it and sends the request again with `{"preimage"}` as the payload of `PAYMENT-SIGNATURE`. | The next entry, with the reason. |
+| 3 | `batch-settlement` (alias `xbt-channel`) on the chain: the frozen on-chain channel | The origin is on the allowlist and the owner has not set `channel_rail: false`. This path is unchanged. | The report below. |
+| | None of them | Nothing is paid. The reply is `no_rail` and lists each entry that was passed over and why. | |
+
+A rail is passed over only for a reason that makes it unusable for this seller: it is off, the
+seller is not admitted, or the terms are outside the owner's bounds. A budget, a cap or a velocity
+limit that is used up refuses the call and tries no other rail. With tickets off in the policy,
+and for a call with `max_sats` 0, `xbt402_pay` is the channel path from its first byte, as before.
+No request leaves for a host the owner did not allow: the URL is read by one parser, and its origin
+is on the allowlist, or the call's task pays any seller, before the first byte is sent.
+
+**A paid request, in order.**
+
+1. The unpaid request, and the 402's ticket entry, read strictly (section 1). An open session
+   whose seller now states another node, receipt key, ticket or session path is stopped, and the
+   call is refused (`ticket_terms_changed`). A route's price may differ from request to request.
+2. No session yet: the book opens one under the owner's rules, the wallet sends the pool's hashes
+   to `lock`, writes the seller's session id and key to its book, and only then pays the invoices
+   that pass the checks of section 2.
+3. While the seller's balance does not cover what it wants before it serves (the request's price,
+   the first second, the first byte): one ticket. The seller's signed `status` must list the
+   ticket `ACCEPTED`; the book books it and gives the secret; the secret goes to `release`; the
+   seller's signed answer must credit it. One secret at a time. No ticket is released while the
+   seller has not closed an earlier answer of the session that the wallet stopped reading: a
+   seller that is waiting for a refill of that answer would take the ticket for it. The answer's
+   last receipt in `status` is the seller's word that it is closed; the wallet waits 5 s a call
+   for it and gives the session up after 30 s.
+4. The request, authenticated, with no secret. Its answer must carry a receipt signed by the
+   terms' `receiptKey` for this session, this `seq`, this request digest and this status.
+5. The body. An answer paid at its head is read and hashed against the receipt's `bodyHash`. An
+   answer priced as it goes is read as it arrives; the next ticket is released when everything
+   the released ones pay for has arrived (by the second: in the last fifth of the second before
+   the unpaid one), and the wallet stops reading when the book refuses a release, when the call's
+   `max_sats` is used up by its own count of bytes and seconds, or when the answer has been open
+   for `tickets.max_answer_s` (50 s by default). It then asks `status` for the last receipt and
+   checks it against what arrived.
+6. The pool is refilled behind the call when fewer than half of it are left.
+
+`max_sats` bounds what the call uses, by the wallet's own count. Money moves a ticket at a time,
+so a call can release one ticket more than it uses: a 3-sat page releases a 1,000-sat ticket, and
+the rest is the session's balance for later calls. What a seller's receipts say moves only the
+wallet's count of that balance, and only where it stands inside the wallet's own count (the
+released total never above what the wallet released, a charge never above the price by the terms
+of what was asked for and received). The ledger holds the wallet's own tickets and the fees its
+node reports, and nothing else.
+
+**Stop.** `ticket_stop`, a session idle for `tickets.http_idle_s` (120 s by default), a seller
+fault and changed terms all end a session the same way: the book locks and releases nothing more,
+the wallet sends `cancel` for all the session's tickets, and its own node shows them back. A
+wallet that starts again has stopped every session (section 3); it asks each seller on record,
+once, to cancel what it left locked. Stopping gives up the session's balance: the unused part of
+the last ticket.
+
+**What goes wrong, and what the wallet then does.**
+
+| What happens | What the wallet does | What it can cost |
+|---|---|---|
+| The answer to a `release` is lost. | It asks `status`. Credited: it goes on. Not credited: the same secret again, never another. | Nothing more: the ticket was booked when its secret left. |
+| The seller says a released ticket is `ticket_not_locked`. | The same secret again, five times within about a second; then the call is refused and the next call sends it first. | The ticket, if the seller never takes it and never cancels it: booked until the wallet's node shows it failed. |
+| The answer to a paid request is lost. | The call says so. No secret travels with a request. | What the seller charged the balance for it. |
+| An answer carries a receipt for another request (a replay), a receipt signed by another key, or none. | It is not believed. A 5xx without a receipt is reported and the session kept; any other answer nobody signed stops the session. | The session's balance. |
+| A refusal that is not signed (a forged `balance_short`, or `session_unknown` from a seller that lost its records). | Nothing is released on its word. The session is stopped; the next call opens a new one. | The session's balance. |
+| An unsigned `bad_seq` with `nextSeq`. | Adopted, twice at most: a `seq` only orders requests. | Nothing. |
+| A receipt's totals or charge contradict the wallet's count (inflated metering). | The session is stopped as faulty. | At most the ticket in use. |
+| The body is not the one the receipt signs. | The body is handed on marked as such, and the session is stopped. | At most the ticket in use. |
+| The answer stops in the middle. | The call reports how far it came, and the last receipt if there is one. No ticket is released after the last byte. | The part of the last released ticket that paid for nothing. |
+| The wallet stopped reading an answer when its pool ran out, and pays that seller again at once. | It waits until the seller has closed the old answer (the gateway does so after its 3 s wait for a refill), then releases. | Up to 3 s of waiting. Before this rule a ticket released in that time was charged for bytes of the old answer that nobody read, and the wallet took the honest seller's receipt for a lie. |
+| The seller stops answering. | The call reports it. An unconfirmed secret is sent again by the next call before anything else. The idle rule stops the session. | At most one ticket, and the pool locked until the seller cancels it or it expires (section 6). |
+| The seller never shows a ticket `ACCEPTED`. | `ticket_not_ready` after `tickets.ready_wait_ms`. | Nothing: no secret was released. |
+| The wallet's signer is killed. | On its next start every locked ticket is booked as if released and never released, and the sellers on record are asked to cancel. | The balance; and the pool's worst case held against the budgets until the node shows the tickets failed. |
+
+**Velocity.** The owner's `velocity_max` (8 an hour as shipped) counts payments. What a ticket
+payment is for that count is the owner's choice, `tickets.velocity`: `"release"`, the default,
+counts every release, so a wallet with the shipped policy releases at most 8 tickets an hour on
+every rail together and a long answer stops at the eighth; `"session"` counts a session once, from
+its first release, and bounds its releases by the budgets, the caps on locked funds and
+`max_sends_per_hour`. An existing policy has no `tickets.velocity` and means `"release"`.
+
+Measured on the lab (`scripts/ticket_e2e_regtest.sh`; one hop, loopback, the release binaries, an
+agent calling the MCP tool): a first request on a new session (the unpaid request, 8 tickets locked through the hop, the
+seller's word that they are locked, one release, the paid request) took 0.37 to 0.42 s in 50
+tries over ten runs, median 0.38 s. A paid page from the balance took 1.7 to 1.9 ms and a free
+page 1.3 to 1.5 ms, both through the MCP server, the signer and the gateway (medians of 200): paying
+added 0.30 to 0.38 ms. A 100 MB file at 200,000 msat per MiB came through whole in 1.7 to 1.9 s
+with 20 tickets released one at a time; under a call that allowed half its price (9,536 sat,
+which pays for 49,996,103 bytes) it stopped at 49,996,224 to 50,004,032 bytes, the end of the
+read that reached the limit. After the agent's stop the unused tickets were back on both nodes
+in 2.1 to 3.1 s. What the buyer's node paid, what the seller's node received, what the wallet's
+book holds as settled and what the seller's receipts say was released were one number to the
+millisat (37,000,000 or 38,000,000 msat, by how far the stopped answer had come), and the ledger
+was each ticket and its routing fee (1,002 sat a ticket).
+
+## 13. What building the wallet changed in this draft
+
+Each of these was found by building `xbt402_pay` over tickets against this draft and the gateway.
+
+| Section | Before | Now, and why |
+|---|---|---|
+| 2 | The buyer cannot see `ACCEPTED`; it releases and sends the same secret again on `ticket_not_locked`. | It asks the seller's signed `status` first and releases only what `status` shows `ACCEPTED`. A secret is spent when it leaves, so the wallet does not let one leave to find out. |
+| 3 | The secret travels with the request it pays for. | The wallet sends every secret in `release` and pays requests from the balance. One path for a secret, one signed answer to it, and a refused or lost request has cost no secret. |
+| 3 | `releasedMsat` and `spentMsat` "both only rise". | `spentMsat` falls by what the gateway charged ahead and did not send. A buyer that treats a fall as a lie stops honest sellers; a fall is in its favour, so it is taken. |
+| 3 | A refusal of an authenticated request is signed. | `bad_seq` and `session_unknown` cannot be: the first is answered before authentication, and a seller that has forgotten a session has no totals to sign. The wallet adopts the first and treats the second as the end of the session. |
+| 4 | "The receipt for the whole answer ... is in the answer to `status`." | It appears there when the seller has finished with the answer, which for one the buyer stopped reading is when the seller's next write fails or its wait for a refill ends. The wallet asks for 2 s and otherwise keeps its own count. |
+| 4 | A buyer that stops paying for a long answer lets it end. | The seller goes on waiting for a refill for a few seconds, and a ticket released to the session in that time continues the old answer, which the buyer no longer reads. A buyer MUST NOT release into a session until `status` lists the last receipt of every answer it stopped reading. Found on the lab when the buyer's node was killed in the middle of a file and the next call came 2 s later. |
+| 2 | A buyer drops a hash it got no invoice for after two minutes. | The wallet drops it at once when the lock's answer was lost or refused, or when its own node could not be asked about the invoices, and offers new hashes in the next round. Waiting two minutes left the pool empty for as long: after its node had been away for a few seconds the wallet could pay nobody. A hash whose invoice was refused by a cap still waits. |
+| 4 | Stop and cancel need the session's key. | A wallet that starts again has lost its sessions but kept each seller's session id and key in its book, written before any ticket of the session was paid. Its first `cancel` uses `seq` 0 and adopts the `nextSeq` the seller answers. |
+| 1 | The terms came "over TLS from the seller". | The wallet refuses the ticket entry of an origin that is neither https nor on its own machine: the session key travels in the first lock answer. |
+| 7, 11 | The pool and the smallest ticket were numbers in the wallet's code. | They are the owner's settings (`tickets.pool`, `pool_many`, `many_sellers`, `floor_ticket_sats`), each with its default in one place. The defaults are still the earlier ones (8, then 2 beyond 8 sellers, 64 sat): section 11's rules change those defaults and add the checks of a channel's slots and dust limit, which the wallet does not make yet. |
+| new | | The rail table of section 12, the `exact` entry for a single Lightning payment, and the owner's `channel_rail` switch. |

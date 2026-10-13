@@ -550,7 +550,7 @@ fn eight_locked_five_released_three_cancelled_and_the_book_is_the_node() {
     // fees are booked: five tickets at what the node paid for each, and nothing for the three that came back
     assert_eq!((r.ledger_sum(), r.ledger().len()), (5 * SETTLED, 5));
     let rows = r.ledger();
-    assert!(rows.iter().all(|x| x["dest"] == r.seller.dest() && x["memo"] == "ticket task=work"), "{rows:?}");
+    assert!(rows.iter().all(|x| x["dest"] == r.seller.dest() && x["memo"] == format!("ticket task=work session={sid}")), "{rows:?}");
     assert_eq!(r.audit("ticket_release").len(), 5);
     // the signature log has every release by its payment hash, and never a secret
     let sigs = std::fs::read_to_string(r.root.join(".run/signatures.jsonl")).unwrap();
