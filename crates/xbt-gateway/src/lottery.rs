@@ -749,6 +749,20 @@ mod tests {
     }
 
     #[test]
+    fn every_code_a_buyer_can_be_answered_with_is_one_the_wallet_names() {
+        // a wallet repeats a seller's error only as one of the codes it knows (`xbt402::ticket::PROTOCOL_CODES`):
+        // every refusal of this module, and every refusal of a value, is on that list
+        let draws = [DrawError::AmountNotBelowWin, DrawError::ChainSpent, DrawError::PieceUnknown, DrawError::AmountMismatch, DrawError::DrawOutOfOrder,
+                     DrawError::DrawUsed, DrawError::ValueConflict, DrawError::ValueReused];
+        let all = [Refusal::SessionUnknown, Refusal::BadAuth, Refusal::BadSeq(0), Refusal::TooManySessions, Refusal::WinSize, Refusal::WinUnpaid, Refusal::ValueMissing,
+                   Refusal::TooManyVoids].into_iter().chain(draws.into_iter().map(Refusal::Draw));
+        for r in all {
+            assert!(xbt402::ticket::PROTOCOL_CODES.contains(&r.code()), "{}", r.code());
+            assert_eq!(xbt402::ticket::protocol_code(Some(&json!(r.code()))), r.code());
+        }
+    }
+
+    #[test]
     fn a_draw_request_stops_at_the_first_value_it_refuses_and_reveals_for_what_it_took() {
         let mut b = Book::new(cfg());
         let id = open(&mut b, 1, "a").unwrap();
