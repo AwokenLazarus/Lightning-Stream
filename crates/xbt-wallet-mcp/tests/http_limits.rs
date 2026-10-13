@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use xbt_wallet_mcp::mcp::Server;
 use xbt_wallet_mcp::transport::{serve_listener, HttpConfig};
-use xbt_wallet_mcp::wallet::{PayerMode, Wallet};
+use xbt_wallet_mcp::wallet::Wallet;
 
 const OK: &str = "GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
 const SLOW: &str = "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer t0ken\r\nContent-Type: application/json\r\nContent-Length: 100000\r\n\r\n";
@@ -20,9 +20,7 @@ fn start() -> String {
     let mut cfg = HttpConfig::new(addr.clone());
     cfg.token = Some("t0ken".into());
     let server = Arc::new(Server::new(Arc::new(Wallet::new(
-        "/nonexistent/signer.sock".into(),
-        PayerMode::Signer,
-    ))));
+        "/nonexistent/signer.sock".into()))));
     serve_listener(server, cfg, l).unwrap();
     addr
 }

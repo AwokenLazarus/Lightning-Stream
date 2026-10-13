@@ -8,9 +8,8 @@
 //!   xbt-wallet-mcp --list-tools         print the tool list (JSON) and exit
 //!
 //! Environment (B2's): `B2_SIGNER_SOCK` (a socket path or `tcp://127.0.0.1:PORT`) or `B2_ROOT`
-//! (socket `$B2_ROOT/.run/signer.sock`), `B2_SIGNER_TIMEOUT`, `B2_BODY_CAP`. Ours: `XBT_MCP_PAYER`
-//! (`signer`, the default, or `local`; see the README), `XBT_MCP_NETWORK` and the other `XBT_MCP_*`
-//! payer settings, `XBT_MCP_HTTP_TOKEN` (a bearer token for HTTP; dev mode only when `XBT_MODE` is
+//! (socket `$B2_ROOT/.run/signer.sock`), `B2_SIGNER_TIMEOUT`. Ours: `XBT_MCP_LN` and
+//! `XBT_MCP_TICKETS` (the tools of those rails), `XBT_MCP_APPROVAL_WAIT_S`, `XBT_MCP_HTTP_TOKEN` (a bearer token for HTTP; dev mode only when `XBT_MODE` is
 //! production, which reads the secret `mcp-http-token` instead).
 //!
 //! Container-ready (AGP-038, `docs/CONTAINER.md`): `XBT_MCP_HTTP` (= `--http`), `XBT_MCP_PATH`,

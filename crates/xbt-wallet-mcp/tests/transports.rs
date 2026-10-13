@@ -185,7 +185,7 @@ fn streamable_http_sessions_and_guards() {
     assert_eq!(req("POST", &h.base, Some(&list), &[a, ("Mcp-Session-Id", "nope")]).0, 404);
     let (st, _, body) = req("POST", &h.base, Some(&list), &[a, ("Mcp-Session-Id", &sid), ("MCP-Protocol-Version", "2025-06-18")]);
     assert_eq!(st, 200);
-    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["result"]["tools"].as_array().unwrap().len(), 10);
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["result"]["tools"].as_array().unwrap().len(), 6);
     let note = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
     assert_eq!(req("POST", &h.base, Some(&note), &[a, ("Mcp-Session-Id", &sid)]).0, 202);
     let call = json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "balance", "arguments": {}}});
@@ -238,24 +238,13 @@ fn x1_the_generated_token_is_private_and_origin_is_checked_with_allow_remote() {
     assert_eq!(req("POST", &r.base, Some(&init_msg(1)), &[b, ("Origin", "http://127.0.0.1:29062")]).0, 200);
 }
 
+/// The in-process payer paid the on-chain channel, which was removed: a start that still asks for
+/// it is refused with the reason, and never runs as if it paid that way.
 #[test]
-fn x1_the_local_payer_checks_the_allowlist_before_any_request() {
-    let dir = tempfile::tempdir().unwrap();
-    let (sock, seen) = mock_signer(dir.path());
-    let target = std::net::TcpListener::bind("127.0.0.1:29063").unwrap();
-    target.set_nonblocking(true).unwrap();
-    let mut child = Command::new(BIN).env_clear().env("B2_SIGNER_SOCK", &sock).env("XBT_MCP_PAYER", "local").env("XBT_MCP_NETWORK", "regtest")
-        .env("XBT_MCP_LEDGER", dir.path().join("payer.jsonl")).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
-    let out = BufReader::new(child.stdout.take().unwrap());
-    let mut s = Stdio_ { child, out };
-    s.ask(init_msg(1));
-    let r = s.call(2, "xbt402_pay", json!({"url": "http://127.0.0.1:29063/internal", "max_sats": 5}));
-    let v: Value = serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
-    assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("allowlist")), "{v}");
-    assert!(matches!(target.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock), "the probe never left");
-    assert!(seen.lock().unwrap().iter().any(|q| q["method"] == "policy_get"));
-    drop(s.child.stdin.take());
-    let _ = s.child.wait();
+fn a_start_that_asks_for_the_removed_local_payer_is_refused() {
+    let out = Command::new(BIN).env_clear().env("XBT_MCP_PAYER", "local").env("XBT_MCP_NETWORK", "regtest").output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("which was removed"), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
 #[test]

@@ -573,8 +573,7 @@ fn the_agents_page_shows_the_mcp_endpoint_and_token_only_after_login() {
     assert!(page.contains(&"ab".repeat(32)) && page.contains("Bearer ") && page.contains("<details>"), "{page}");
     assert!(page.contains("aria-current=\"page\">Agents") && page.contains("Rotate the token"), "{page}");
     // AGP-042: the real MCP HTTP transport, reading the same file (the UI never calls it to rotate)
-    let wallet = std::sync::Arc::new(xbt_wallet_mcp::wallet::Wallet::new(tdir.path().join("no-signer.sock"),
-                                                                          xbt_wallet_mcp::wallet::PayerMode::Signer));
+    let wallet = std::sync::Arc::new(xbt_wallet_mcp::wallet::Wallet::new(tdir.path().join("no-signer.sock")));
     let mut cfg = xbt_wallet_mcp::transport::HttpConfig::new("127.0.0.1:34202");
     cfg.token_file = Some(tok.clone());
     let server = std::sync::Arc::new(xbt_wallet_mcp::mcp::Server::new(wallet));
@@ -648,7 +647,7 @@ fn an_over_threshold_xbt402_pay_through_the_mcp_waits_for_the_ui_approval_then_i
     let bx = start(json!({}), false, |_| {});
     bx.rig.fund_hot(1, 12_000);
     let sock = bx.app.cfg.signer_sock.clone();
-    let mut wallet = xbt_wallet_mcp::wallet::Wallet::new(sock, xbt_wallet_mcp::wallet::PayerMode::Signer);
+    let mut wallet = xbt_wallet_mcp::wallet::Wallet::new(sock);
     wallet.approval_wait = Duration::from_secs(30);
     let agent = std::thread::spawn(move || {
         let mut args = serde_json::Map::new();
@@ -695,11 +694,11 @@ fn without_a_wait_the_mcp_answers_needs_human_at_once_and_a_deny_ends_a_wait() {
         a.insert("max_sats".into(), 1000.into());
         a
     };
-    let w0 = xbt_wallet_mcp::wallet::Wallet::new(sock.clone(), xbt_wallet_mcp::wallet::PayerMode::Signer);
+    let w0 = xbt_wallet_mcp::wallet::Wallet::new(sock.clone());
     let v: Value = serde_json::from_str(&w0.call_tool("xbt402_pay", args()).unwrap()).unwrap();
     assert_eq!(v["verdict"], "needs_human");
     assert!(v.get("approval_state").is_none(), "B2's answer, unchanged");
-    let mut w = xbt_wallet_mcp::wallet::Wallet::new(sock, xbt_wallet_mcp::wallet::PayerMode::Signer);
+    let mut w = xbt_wallet_mcp::wallet::Wallet::new(sock);
     w.approval_wait = Duration::from_secs(30);
     let t = std::thread::spawn(move || w.call_tool("xbt402_pay", args()));
     let mut br = logged_in(&bx);
