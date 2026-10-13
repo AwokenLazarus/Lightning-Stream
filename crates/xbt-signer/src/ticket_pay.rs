@@ -42,7 +42,6 @@ use crate::ln::LnPolicy;
 use crate::policy::normalize_dest;
 use crate::pyjson::{py_int, str_or_empty};
 use crate::sanitize::{untrusted, UNTRUSTED_KEY};
-use crate::session::{body_cap, origin_of};
 use crate::signer::{deny, with, Signer};
 use crate::ticket::{sats_ceil, Admit, SState, SellerSession, Terms, TicketPolicy, HOLD_SHORT, ROUTE_FULL};
 use crate::ticket_http::{offers, Account, Due, Offer, PayTerms, Price, Receipt};
@@ -380,6 +379,29 @@ impl Stream {
     }
 }
 
+/// The x402 scheme name of the on-chain channel this wallet once paid: recognised in a 402 only to
+/// say that it is no longer a rail here.
+const CHANNEL_SCHEME: &str = "batch-settlement";
+
+/// The most of a seller's text an answer to the agent carries, in bytes (`B2_BODY_CAP`).
+pub fn body_cap() -> usize {
+    std::env::var("B2_BODY_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(12_000)
+}
+
+/// `scheme://netloc` of an absolute URL. A URL with a `#` is refused (AGP-081, review T2: the
+/// request binding does not cover a fragment).
+pub fn origin_of(url: &str) -> Result<String> {
+    if url.contains('#') {
+        return Err(err("dest", "a URL with a # fragment is not paid: the fragment is outside the request binding"));
+    }
+    let (scheme, rest) = url.split_once("://").ok_or_else(|| err("dest", "xbt402_pay needs an absolute URL"))?;
+    let netloc = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    if scheme.is_empty() || netloc.is_empty() || !scheme.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c)) {
+        return Err(err("dest", "xbt402_pay needs an absolute URL"));
+    }
+    Ok(format!("{}://{netloc}", scheme.to_ascii_lowercase()))
+}
+
 impl Signer {
     fn ticket_net(&self) -> Result<String> {
         Ok(crate::node::network(&*self.node, &self.chain, None)?.replacen("bip122:", "lightning:", 1))
@@ -413,29 +435,38 @@ impl Signer {
 
     // --- the entry: one function chooses the rail ---------------------------------------------------
 
-    /// `xbt402_pay`. With stream tickets off in the owner's policy this is the frozen channel
-    /// path, unchanged. With them on, the signer asks the seller once without paying, and pays by
-    /// the first of these the 402 offers and the policy allows:
+    /// `xbt402_pay`. The signer asks the seller once without paying, and pays by the first of these
+    /// the 402 offers and the policy allows:
     ///
-    /// 1. a ticket entry (`scheme: "ticket"` on this Lightning network);
+    /// 1. a ticket entry (`scheme: "ticket"` on this Lightning network), or the lottery entry beside
+    ///    it, where the owner turned tickets on;
     /// 2. a single Lightning payment (`scheme: "exact"` with a BOLT 11 invoice), as `ln_pay` pays one;
-    /// 3. the on-chain channel entry, unless the owner turned it off (`channel_rail: false`);
     ///
     /// and otherwise reports what each entry would have needed. A rail is passed over only for a
     /// reason that makes it unusable for this seller (off, not admitted, terms outside the owner's
     /// bounds); a budget or a cap that is used up refuses the call and tries no other rail.
+    ///
+    /// With `max_sats` 0 the call pays nothing: an answer that is not a 402 is handed back, and a
+    /// 402 is refused. (Until 2026-10 a third entry, the on-chain channel, was paid here, and a call
+    /// with tickets off went to it; that rail was removed.)
     pub(crate) fn xbt402_pay(&self, p: &Value) -> Value {
         let tp = self.ticket_policy();
         let cfg = self.config();
         let max_sats = match p.get("max_sats").filter(|v| !v.is_null()) {
-            None => Some(0),
-            Some(v) => py_int(Some(v)),
+            None => 0,
+            Some(v) => match py_int(Some(v)) {
+                Some(n) if n >= 0 => n,
+                Some(_) => return deny("amount", "max_sats must be >= 0"),
+                None => return deny("amount", "max_sats must be an integer"),
+            },
         };
-        let url = sendable_url(&str_or_empty(p.get("url"))).ok();
-        let origin = url.as_deref().and_then(|u| origin_of(u).ok()).map(|o| normalize_dest(&o)).filter(|o| !o.is_empty());
-        // tickets off, a free-only call (max_sats 0) or arguments the channel path refuses: its own answer, as before
-        let (Some(max_sats), Some(url), Some(origin)) = (max_sats.filter(|m| *m > 0 && tp.enabled), url, origin) else {
-            return self.xbt402_pay_channel(p, &cfg);
+        let asked = str_or_empty(p.get("url"));
+        let origin = match origin_of(&asked) {
+            Ok(o) => normalize_dest(&o),
+            Err(e) => return deny("dest", e.msg),
+        };
+        let Some(url) = sendable_url(&asked).ok().filter(|_| !origin.is_empty()) else {
+            return deny("dest", "xbt402_pay needs an absolute http or https URL");
         };
         let method = Some(str_or_empty(p.get("method")).to_uppercase()).filter(|m| !m.is_empty()).unwrap_or_else(|| "GET".into());
         let raw: Vec<u8> = match p.get("body") {
@@ -449,7 +480,7 @@ impl Signer {
         if !self.ticket_may_reach(&origin, task.as_deref().unwrap_or("")) {
             return deny("allowlist", format!("destination not on allowlist: {origin} (and the call names no task that pays any seller)"));
         }
-        let (lightning, chain) = match (self.ticket_net(), self.session.network()) {
+        let (lightning, chain) = match (self.ticket_net(), self.network()) {
             (Ok(l), Ok(c)) => (l, c),
             (Err(e), _) | (_, Err(e)) => return deny("xbt402", e.msg),
         };
@@ -472,9 +503,12 @@ impl Signer {
         drop(probe);
         let piece_hashes: Vec<String> = p.get("piece_sha256").and_then(Value::as_array).into_iter().flatten().take(1 << 20)
             .map(|h| h.as_str().unwrap_or("").to_ascii_lowercase()).collect();
+        if max_sats == 0 {
+            return with(deny("max_sats", "the seller asks to be paid and this call may spend nothing (max_sats 0)"), json!({"charged_sats": 0}));
+        }
         let call = Call { url: &url, origin: &origin, method: &method, body: &raw, max_sats, task, piece_hashes };
         let mut passed: Vec<Value> = vec![];
-        let mut ways = offers(&pr, &lightning, &chain);
+        let mut ways = offers(&pr, &lightning);
         // tickets or draws first: one rule ([`crate::lottery::choose`]); the other is tried after it
         if self.draws_first(&call, &ways, &lightning, &tp) {
             if let Some(i) = ways.iter().position(|o| matches!(o, Offer::Lottery(_))) {
@@ -485,13 +519,11 @@ impl Signer {
         for offer in ways {
             let rail = offer.rail();
             let tried = match &offer {
+                Offer::Ticket(..) | Offer::Lottery(_) if !tp.enabled => Tried::Next("stream tickets are off in this policy (tickets.enabled)".into()),
                 Offer::Lottery(acc) => self.lottery_pay(&call, acc, &lightning),
                 Offer::Ticket(acc, prepaid) => self.ticket_pay(&call, acc, prepaid.as_ref(), &lightning),
                 Offer::Lightning(_) if !listed => Tried::Next("the seller is not on the owner's allowlist: only a ticket task that pays any seller reaches it".into()),
                 Offer::Lightning(acc) => self.ln_exact_pay(&call, acc, &tp),
-                Offer::Channel(_) if !listed => Tried::Next("the seller is not on the owner's allowlist: only a ticket task that pays any seller reaches it".into()),
-                Offer::Channel(_) if !cfg.channel_rail => Tried::Next("the owner's policy has turned the on-chain channel off (channel_rail)".into()),
-                Offer::Channel(_) => Tried::Done(self.xbt402_pay_channel(p, &cfg)),
             };
             match tried {
                 Tried::Done(mut v) => {
@@ -509,7 +541,7 @@ impl Signer {
                 let scheme = a.get("scheme").and_then(Value::as_str);
                 let scheme = if scheme == Some(xbt402::ticket::SCHEME) { xbt402::ticket::SCHEME } else if scheme == Some(xbt402::lottery::SCHEME) { xbt402::lottery::SCHEME }
                              else if scheme == Some("exact") { "exact" }
-                             else if xbt402::wire::scheme_accepted(scheme) { xbt402::wire::SCHEME } else { "other" };
+                             else if matches!(scheme, Some(CHANNEL_SCHEME | "xbt-channel")) { CHANNEL_SCHEME } else { "other" };
                 let network = match a.get("network").and_then(Value::as_str) {
                     Some(n) if n == lightning => "this wallet's Lightning network",
                     Some(n) if n == chain => "this wallet's chain",
@@ -517,9 +549,12 @@ impl Signer {
                 };
                 json!({"scheme": scheme, "network": network})
             }).take(16).collect();
+        if offered.iter().any(|o| o["scheme"] == CHANNEL_SCHEME) {
+            passed.push(json!({"rail": "channel", "why": "the seller offers the on-chain channel, which this wallet no longer has"}));
+        }
         with(deny("no_rail", "the seller's 402 offers no way to pay that this wallet's policy allows: see rails_passed_over for what each entry needs"),
              json!({"charged_sats": 0, "rails_passed_over": passed, "offered": offered,
-                    "wallet": {"lightning": lightning, "chain": chain, "tickets": tp.enabled, "ln": LnPolicy::from_map(&cfg.ln).enabled, "channel_rail": cfg.channel_rail}}))
+                    "wallet": {"lightning": lightning, "chain": chain, "tickets": tp.enabled, "ln": LnPolicy::from_map(&cfg.ln).enabled}}))
     }
 
     /// Whether this seller is paid by draws before tickets are tried: what [`crate::lottery::choose`]
@@ -545,15 +580,6 @@ impl Signer {
             dearest_msat: draw.dearest_piece().unwrap_or(u64::MAX), ticket_msat: ticket.as_ref().map_or(u64::MAX, |t| t.ticket_msat),
             expect_msat: (c.max_sats.max(0) as u64).saturating_mul(1000), held_fits: ticket.is_some() && self.ticket_held_fits(task),
             stay_tickets: tp.lottery.stay_tickets.max(1) as u64 })
-    }
-
-    /// The frozen on-chain channel path of `xbt402_pay`, under the wallet's spend lock as before.
-    fn xbt402_pay_channel(&self, p: &Value, cfg: &crate::policy::PolicyConfig) -> Value {
-        if !cfg.channel_rail {
-            return deny("channel_rail", "the owner's policy has turned the on-chain channel off (channel_rail): xbt402_pay funds no channel and signs no state");
-        }
-        let _g = self.lock();
-        self.xbt402_pay_locked(p)
     }
 
     /// A single Lightning payment the seller's 402 asks for: `extra.invoice`, paid as `ln_pay` pays

@@ -1,7 +1,7 @@
-//! AGP-039: the signer methods behind the web UI, on the runbook rig (a regtest signer, the Rust
-//! provider in process): the xbt402 approval grant, deny, the human-signed policy change and its live
-//! effect, human-key enrolment and rotation, the signed hot-key rotation, the backup export, and the
-//! close report kept for the UI.
+//! AGP-039: the signer methods behind the web UI, on the test rig (a regtest signer): approve and
+//! deny, the human-signed policy change and its live effect, human-key enrolment and rotation, the
+//! signed hot-key rotation, the backup export, and what an earlier version's on-chain channels left
+//! for the UI to show.
 mod common;
 
 use common::*;
@@ -20,68 +20,29 @@ fn approve(rig: &Rig, r: &Value, sig_over: Option<Vec<u8>>) -> Value {
     rig.call("approve", json!({"token": token, "dest": dest, "amount_sats": amount, "expiry": expiry_of(r), "signature": sign_human(&msg)}))
 }
 
-fn big_pay(rig: &Rig) -> Value {
-    rig.call("xbt402_pay", json!({"url": URL, "method": "GET", "body": "", "max_sats": 1000}))
-}
-
+/// An approval that a payment over the on-chain channel asked for, before that rail was removed,
+/// can pay nothing: approving it drops it and says why.
 #[test]
-fn an_over_threshold_xbt402_call_waits_for_the_human_then_pays_once_under_the_grant() {
+fn an_approval_asked_for_by_a_channel_payment_is_dropped_with_the_reason() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let rig = Rig::new(json!({}), false);
-    rig.fund_hot(1, 12_000);
-    let r = big_pay(&rig);
+    let r = rig.call("pay", json!({"to": ADDR, "amount_sats": 1000, "memo": "m"}));
     assert_eq!(r["verdict"], "needs_human", "{r}");
     let token = r["approval_token"].as_str().unwrap().to_string();
-    let q = rig.call("approvals", json!({}));
-    let row = q["approvals"].as_array().unwrap().iter().find(|a| a["token"] == token.as_str()).unwrap().clone();
-    assert_eq!(row["kind"], "xbt402");
-    assert_eq!(row["url"], URL);
-    assert_eq!(row["state"], "pending");
-    assert_eq!(rig.call("approval_status", json!({"token": token}))["state"], "pending");
-    // nothing is funded or signed while it waits
-    assert!(rig.s.book.get(PROVIDER).is_none());
-    // a signature over other fields, or by another key, is refused
-    let bad = approve(&rig, &r, Some(canonical_message(&token, PROVIDER, 999, expiry_of(&r))));
-    assert_eq!(bad["rule"], "approval_sig", "{bad}");
-    // the agent retrying before the human is a new request, not a payment
-    assert_eq!(big_pay(&rig)["verdict"], "needs_human");
+    // as the removed rail left it on disk
+    rig.s.engine.store.update_approval(&token, &json!({"kind": "xbt402", "url": "http://127.0.0.1:33210/x", "method": "GET"})).unwrap();
+    assert_eq!(rig.call("approvals", json!({}))["approvals"][0]["kind"], "xbt402");
     let ok = approve(&rig, &r, None);
-    assert_eq!(ok["granted"], true, "{ok}");
-    assert_eq!(ok["verdict"], "allow");
-    assert!(ok.get("txid").is_none() && ok.get("chan").is_none(), "approve of an xbt402 call pays nothing by itself: {ok}");
-    assert_eq!(rig.call("approval_status", json!({"token": token}))["state"], "approved");
-    assert_eq!(approve(&rig, &r, None)["rule"], "approval_replay");
-    // another amount or url does not match the grant
-    let other = rig.call("xbt402_pay", json!({"url": URL, "method": "GET", "body": "", "max_sats": 999}));
-    assert_ne!(other.get("approved"), Some(&Value::Bool(true)), "{other}");
-    // the channel's funding waits for a block: the grant survives a "pending"
-    let first = big_pay(&rig);
-    assert_eq!(first["verdict"], "pending", "{first}");
-    assert_eq!(rig.call("approval_status", json!({"token": token}))["state"], "approved");
-    rig.chain.mine(1);
-    let paid = big_pay(&rig);
-    assert_eq!(paid["verdict"], "allow", "{paid}");
-    assert_eq!(paid["approved"], true);
-    assert_eq!(paid["approval_token"], token.as_str());
-    assert!(paid["charged_sats"].as_i64().unwrap() > 0);
-    assert_eq!(rig.call("approval_status", json!({"token": token}))["state"], "used");
-    // once
-    assert_eq!(big_pay(&rig)["verdict"], "needs_human");
-    let sigs = rig.sigs();
-    assert!(sigs.iter().any(|s| s["rule"] == "human:approval_signature"), "the paid state is logged under the human's approval");
-    let hist = rig.call("history", json!({"limit": 200}))["events"].clone();
-    for t in ["approval_granted", "approval_used"] {
-        assert!(hist.as_array().unwrap().iter().any(|e| e["type"] == t), "audit has {t}");
-    }
+    assert_eq!((ok["verdict"].as_str(), ok["rule"].as_str()), (Some("deny"), Some("removed")), "{ok}");
+    assert!(rig.call("approvals", json!({}))["approvals"].as_array().unwrap().is_empty(), "it is gone from the queue");
+    assert!(rig.s.engine.store.payments().unwrap().is_empty(), "nothing was paid");
 }
 
 #[test]
 fn a_pay_token_approved_through_the_queue_pays_at_once_as_in_b2_and_deny_drops_a_token() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
-    let payto = hex::encode(xbt_primitives::ecdsa::pubkey(&secret("provider payTo")));
-    let rig = Rig::new(json!({"counterparties": {PROVIDER: {"pay_to": payto}}}), false);
-    rig.fund_hot(1, 12_000);
-    let r = rig.call("pay", json!({"to": PROVIDER, "amount_sats": 1000, "memo": "m"}));
+    let rig = Rig::new(json!({}), false);
+    let r = rig.call("pay", json!({"to": ADDR, "amount_sats": 1000, "memo": "m"}));
     assert_eq!(r["verdict"], "needs_human", "{r}");
     let q = rig.call("approvals", json!({}));
     assert_eq!(q["approvals"][0]["kind"], "pay");
@@ -94,10 +55,10 @@ fn a_pay_token_approved_through_the_queue_pays_at_once_as_in_b2_and_deny_drops_a
     assert!(rig.call("approvals", json!({}))["approvals"].as_array().unwrap().is_empty());
     assert_eq!(rig.call("deny_approval", json!({"token": "nope"}))["rule"], "approval");
     // B2's approve of a pay token pays at once
-    let r = rig.call("pay", json!({"to": PROVIDER, "amount_sats": 1000, "memo": "m"}));
+    let r = rig.call("pay", json!({"to": ADDR, "amount_sats": 1000, "memo": "m"}));
     let ok = approve(&rig, &r, None);
     assert_eq!(ok["approved"], true, "{ok}");
-    assert_eq!(ok["rail"], "channel", "{ok}");
+    assert_eq!(ok["rail"], "onchain", "{ok}");
     assert_eq!(rig.call("approval_status", json!({"token": r["approval_token"]}))["state"], "used");
 }
 
@@ -123,22 +84,30 @@ fn a_policy_change_needs_the_human_key_is_validated_like_the_engine_and_applies_
     assert_eq!(rig.call("policy_prepare", json!({"policy": pol}))["errors"], v["errors"]);
     pol["max_per_tx_sats"] = 5000.into();
     pol["daily_budget_sats"] = (-1).into();
-    pol["counterparties"] = json!({"http://x:1": {"pay_to": "02abcd"}});
+    pol["counterparties"] = json!({"http://x:1": {"ln_node": "02abcd", "pay_to": "02abcd"}});
+    pol["channel_expiry_blocks"] = "soon".into();
+    pol["refund_enabled"] = true.into();
     let v = rig.call("policy_validate", json!({"policy": pol}));
     let errs: Vec<String> = v["errors"].as_array().unwrap().iter().map(|e| e.as_str().unwrap().to_string()).collect();
     assert!(errs.contains(&"policy.json daily_budget_sats: must be >= 0 (got -1)".into()), "{errs:?}");
-    assert!(errs.iter().any(|e| e.contains("counterparties[http://x:1].pay_to")), "{errs:?}");
+    assert!(errs.iter().any(|e| e.contains("counterparties[http://x:1].ln_node")), "{errs:?}");
+    // settings of the removed on-chain channel load with a warning and are ignored, whatever they hold
+    let warns: Vec<String> = v["warnings"].as_array().unwrap().iter().map(|e| e.as_str().unwrap().to_string()).collect();
+    for k in ["channel_expiry_blocks", "refund_enabled", "counterparties[http://x:1].pay_to"] {
+        assert!(warns.iter().any(|w| w.contains(k) && w.contains("on-chain channel") && w.contains("ignores")), "{k}: {warns:?}");
+    }
+    assert!(!errs.iter().any(|e| e.contains("channel_expiry_blocks")), "{errs:?}");
     // a valid change: raise the human threshold and the hot cap
     pol["daily_budget_sats"] = 6000.into();
     pol["counterparties"] = json!({});
     pol["human_threshold_sats"] = 5000.into();
     pol["hot_balance_cap_sats"] = 20_000.into();
-    pol["open_wait_s"] = 7.into();
+    pol["anchor_interval_s"] = 7.into();
     // the prepared policy keeps the enrolled human key, whatever the form says
     pol["human_pubkey"] = "00".repeat(32).into();
     let (prep, set) = sign_policy(&rig, pol.clone());
     assert!(prep["text"].as_str().unwrap().contains(&hex::encode(human().verifying_key().to_bytes())));
-    assert!(prep["diff"].as_array().unwrap().iter().any(|d| d["key"] == "open_wait_s" && d["restart"] == true));
+    assert!(prep["diff"].as_array().unwrap().iter().any(|d| d["key"] == "anchor_interval_s" && d["restart"] == true));
     // a bad signature, a tampered text, an expired one
     let mut bad = set.clone();
     bad["signature"] = sign_human(b"something else").into();
@@ -148,7 +117,7 @@ fn a_policy_change_needs_the_human_key_is_validated_like_the_engine_and_applies_
     assert_eq!(rig.call("policy_set", bad)["rule"], "human_sig");
     let r = rig.call("policy_set", set.clone());
     assert_eq!(r["ok"], true, "{r}");
-    assert_eq!(r["pending_restart"], json!(["open_wait_s"]));
+    assert_eq!(r["pending_restart"], json!(["anchor_interval_s"]));
     // live: 1,000 sats no longer needs a human; the hot cap moved
     let q = rig.call("quote_payment", json!({"to": PROVIDER, "amount_xbt": 0.00001}));
     assert_eq!(q["verdict"], "allow", "{q}");
@@ -236,16 +205,29 @@ fn the_signed_rotation_and_the_backup_export() {
     assert!(xbt_signer::keystore::KeyStore::with_passphrase(b"wrong horse battery").open(&doc["wrapping_sealed"], "xbt-agentwallet-backup-wrapping").is_err());
 }
 
+/// A wallet that was upgraded with an on-chain channel still open: the UI is shown the record and
+/// the close reports the earlier version kept, the owner is told what to do, and nothing is written.
 #[test]
-fn a_close_keeps_its_report_for_the_ui() {
+fn what_an_earlier_versions_channels_left_is_shown_and_never_written() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
-    let rig = Rig::new(json!({}), false);
-    rig.fund_hot(1, 12_000);
-    let chan = rig.open()["chan"].as_str().unwrap().to_string();
-    let c = rig.call("close_channel", json!({"counterparty": PROVIDER}));
-    assert_eq!(c["close_report"]["status"], "ok", "{c}");
+    let mut rig = Rig::new(json!({}), false);
+    let run = rig.root.join(".run");
+    let book = r#"{"channels": {"http://127.0.0.1:33210": {"state": "open", "dest": "http://127.0.0.1:33210", "chan": "c1", "cap_sats": 9400, "used_sats": 546, "expiry": 7728}}, "archived": []}"#;
+    std::fs::write(run.join("channels.json"), book).unwrap();
+    std::fs::write(run.join("channel_keys.json"), r#"{"sealed": {"ct": "00"}}"#).unwrap();
+    std::fs::write(run.join("close_reports.json"), r#"{"c0": {"report": {"status": "ok"}, "cum": 546}}"#).unwrap();
+    rig.restart().unwrap();
     let reps = rig.call("channel_reports", json!({}));
-    assert_eq!(reps["reports"][&chan]["report"]["status"], "ok", "{reps}");
-    assert_eq!(reps["reports"][&chan]["cum"], c["cum"]);
-    assert_eq!(reps["refund_margin_blocks"], 6);
+    assert_eq!(reps["reports"]["c0"]["report"]["status"], "ok", "{reps}");
+    assert_eq!(reps["legacy_channels"]["unsettled"], 1, "{reps}");
+    let ch = rig.call("channels", json!({}));
+    assert_eq!((ch["channels"][0]["chan"].as_str(), ch["channels"][0]["legacy"].as_bool()), (Some("c1"), Some(true)), "{ch}");
+    assert!(ch["legacy_channels"]["what_to_do"].as_str().unwrap().contains("cannot close or refund"));
+    assert_eq!(rig.call("health", json!({}))["legacy_channels"]["unsettled"], 1);
+    for m in ["close_channel", "xbt402_refund"] {
+        assert_eq!(rig.call(m, json!({"counterparty": PROVIDER}))["rule"], "removed");
+    }
+    rig.call("watch_tick", json!({}));
+    assert_eq!(std::fs::read_to_string(run.join("channels.json")).unwrap(), book, "the book is left as it was");
+    assert_eq!(std::fs::read_to_string(run.join("channel_keys.json")).unwrap(), r#"{"sealed": {"ct": "00"}}"#);
 }

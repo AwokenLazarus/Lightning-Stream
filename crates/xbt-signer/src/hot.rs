@@ -1,16 +1,18 @@
 //! The signer-owned secp256k1 hot key (B2 `hot.py`). Every spend is signed SIGHASH_ALL|UNIFIED
 //! (0x21) by the signer itself.
 //!
+//! The hot key funded the on-chain channels this wallet once paid over, and took their change and
+//! refunds. That rail was removed, and nothing here sends coins to a seller any more. What is left
+//! is custody of what the key holds: a wallet that was upgraded with coins on its hot key can see
+//! them, and its owner can sweep them out.
+//!
 //! Custody (AGP-013/016/017), with B2's file formats:
 //! * `hot.json` holds the current and retired keys, AES-256-GCM sealed (AAD `b2/hot-key`);
 //! * `hot_utxos.json` holds the hot coins, sealed (AAD `b2/hot-utxos`), rewritten on every change and
 //!   reconciled against the node at start (`gettxout`, `scantxoutset`);
 //! * [`HotWallet::rotate`] makes a new key and sweeps the old one's coins into it; retired keys stay
 //!   sealed so later coins to them are swept by the watcher;
-//! * a balance cap refuses new channels until a human sweeps ([`HotWallet::sweep_to`]);
-//! * [`HotWallet::prepare_fund`] / [`HotWallet::broadcast`] / [`HotWallet::commit`] split a funding
-//!   so the caller can seal what it needs before the broadcast (P1);
-//! * [`HotWallet::learn_close_change`] counts a close's change exactly once (AGP-022).
+//! * a balance cap is shown as exceeded until a human sweeps ([`HotWallet::sweep_to`]).
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -37,8 +39,6 @@ pub const DUST: i64 = 546;
 pub const AAD: &str = "b2/hot-key";
 pub const UTXO_AAD: &str = "b2/hot-utxos";
 pub const MAX_STALE: usize = 500;
-pub const CLOSE_MAX_OUTPUTS: u32 = 4;
-pub const CLOSE_SCAN_MAX: u64 = 144;
 /// B1's default input sequence (RBF-signalling).
 pub const SEQUENCE: u32 = 0xFFFF_FFFD;
 
@@ -525,100 +525,6 @@ impl HotWallet {
         Ok(added)
     }
 
-    /// AGP-022: count a channel close's change to a hot key, once. Returns `{status, txid,
-    /// scan_from, added}`; status "counted" | "none" | "spent" | "pending" (ask again later).
-    pub fn learn_close_change(&self, txid: &str, funding: (&str, u32), scan_from: u64, limit: u64) -> Result<Value> {
-        let node = &*self.node;
-        let mut out = json!({"status": "pending", "txid": txid, "scan_from": scan_from, "added": 0});
-        let mut txid = txid.to_string();
-        if txid.is_empty() {
-            // the provider's reply had no txid: find the spend
-            if let Ok(r) = node.call("gettxspendingprevout", json!([[{"txid": funding.0, "vout": funding.1}]])) {
-                txid = r.get(0).and_then(|x| x.get("spendingtxid")).and_then(Value::as_str).unwrap_or("").to_string();
-                out["txid"] = txid.clone().into();
-            }
-        }
-        let mut raw = if txid.is_empty() { None } else { node::get_tx(node, &txid, "") };
-        if raw.is_none() && !txid.is_empty() {
-            // confirmed: its unspent outputs answer gettxout
-            for n in 0..CLOSE_MAX_OUTPUTS {
-                if let Some(c) = gettxout(node, &txid, n)? {
-                    let mine = { let g = self.lock(); Self::key_for_spk(&g, &spk_of(&c)).is_some() };
-                    if mine {
-                        let added = self.count_close(&txid, &[(n, c)])?;
-                        out["status"] = "counted".into();
-                        out["added"] = added.into();
-                        return Ok(out);
-                    }
-                }
-            }
-        }
-        if raw.is_none() {
-            // no unspent output of ours: find the spend of the funding in a block
-            raw = self.close_in_blocks(&mut out, funding, limit);
-            txid = out["txid"].as_str().unwrap_or("").to_string();
-        }
-        let Some(raw) = raw else { return Ok(out) };
-        let mine: Vec<u32> = {
-            let g = self.lock();
-            raw.get("vout").and_then(Value::as_array).into_iter().flatten()
-                .filter(|o| Self::key_for_out(&g, o).is_some()).map(|o| py_int(o.get("n")).unwrap_or(0) as u32).collect()
-        };
-        if mine.is_empty() {
-            out["status"] = "none".into();
-            return Ok(out);
-        }
-        let mut live = vec![];
-        for n in mine {
-            if let Some(c) = gettxout(node, &txid, n)? {
-                live.push((n, c));
-            }
-        }
-        if live.is_empty() {
-            out["status"] = "spent".into();
-            return Ok(out);
-        }
-        out["added"] = self.count_close(&txid, &live)?.into();
-        out["status"] = "counted".into();
-        Ok(out)
-    }
-
-    fn count_close(&self, txid: &str, coins: &[(u32, Value)]) -> Result<usize> {
-        let mut g = self.lock();
-        let before = g.utxos.len();
-        for (n, c) in coins {
-            if let Some(spk) = Self::key_for_spk(&g, &spk_of(c)).map(HotKey::spk_hex) {
-                self.notice_locked(&mut g, txid, *n, sats(c.get("value")), &spk)?;
-            }
-        }
-        Ok(g.utxos.len() - before)
-    }
-
-    fn close_in_blocks(&self, out: &mut Value, funding: (&str, u32), limit: u64) -> Option<Value> {
-        let tip = node::height(&*self.node).ok()?;
-        let sf = out["scan_from"].as_u64().unwrap_or(0);
-        let start = if sf == 0 { tip } else { sf };
-        if start > tip {
-            return None;
-        }
-        let end = tip.min(start + limit - 1);
-        for h in start..=end {
-            let blk = node::block_hash(&*self.node, h).and_then(|bh| self.node.call("getblock", json!([bh, 2])));
-            let Ok(blk) = blk else { return None }; // keep scan_from here: retry this block next time
-            for tx in blk.get("tx").and_then(Value::as_array).into_iter().flatten() {
-                if node::tx_spends(tx, funding.0, funding.1) {
-                    if let Some(t) = tx.get("txid").and_then(Value::as_str) {
-                        out["txid"] = t.into();
-                    }
-                    out["scan_from"] = h.into();
-                    return Some(tx.clone());
-                }
-            }
-            out["scan_from"] = (h + 1).into();
-        }
-        None
-    }
-
     pub fn balance_sats(&self) -> i64 {
         self.lock().utxos.iter().map(|u| u.value).sum()
     }
@@ -627,14 +533,12 @@ impl HotWallet {
         self.cap_sats() > 0 && self.balance_sats() > self.cap_sats()
     }
 
-    /// Before a new channel is funded: above the cap, a human sweeps first (`hot_balance_cap`).
-    pub fn check_channel_funding(&self) -> Result<()> {
-        if self.over_cap() {
-            return Err(err("hot_balance_cap", format!(
-                "hot key holds {} sats, above its {} sat cap: a human must sweep it (agentwallet-approve sweep) before new channels are funded",
-                self.balance_sats(), self.cap_sats())));
-        }
-        Ok(())
+    /// Sats the key could spend in the next block, and sats of coinbase coins it holds that are not
+    /// mature yet ([`HotWallet::spendable`] over every coin).
+    pub fn spendable_now(&self) -> (i64, i64) {
+        let coins = self.lock().utxos.clone();
+        let (ok, held) = self.spendable(&coins);
+        (ok.iter().map(|u| u.value).sum(), held)
     }
 
     pub fn holds(&self, txid: &str, vout: u32) -> bool {
@@ -743,35 +647,6 @@ impl HotWallet {
         let txid = self.broadcast(&prep)?;
         self.commit(&prep)?;
         Ok(txid)
-    }
-
-    /// Build, 0x21-sign and broadcast a payment of `sats` to `dest_spk`. Returns (txid, 0).
-    pub fn fund(&self, dest_spk: &[u8], sats: i64, fee: i64) -> Result<(String, u32)> {
-        let prep = self.prepare_fund(dest_spk, sats, fee)?;
-        let txid = self.broadcast(&prep)?;
-        self.commit(&prep)?;
-        Ok((txid, 0))
-    }
-
-    /// `fund` without the broadcast (P1): output 0 pays `dest_spk`, output 1 is our change.
-    pub fn prepare_fund(&self, dest_spk: &[u8], sats: i64, fee: i64) -> Result<Prep> {
-        if sats <= 0 {
-            return Err(err("hot", "fund amount must be positive"));
-        }
-        let need = sats + fee;
-        let g = self.lock();
-        let cur = g.current.spk_hex();
-        let bal: i64 = g.utxos.iter().map(|u| u.value).sum();
-        let (ok, held) = self.spendable(&g.utxos);
-        let immature = if held > 0 { format!(", {held} of it immature coinbase") } else { String::new() };
-        let utxo = ok.into_iter().find(|u| (u.spk.is_empty() || u.spk == cur) && u.value >= need)
-            .ok_or_else(|| err("hot", format!("hot wallet has no UTXO \u{2265} {need} sats (have {bal}{immature})")))?;
-        let change = utxo.value - need;
-        let mut outs = vec![TxOut::new(sats, dest_spk.to_vec())];
-        if change >= DUST {
-            outs.push(TxOut::new(change, g.current.spk.clone()));
-        }
-        self.prepare_locked(&g, &[utxo], outs, "funding", json!({"dest_spk": hex::encode(dest_spk)}))
     }
 
     fn sweep(&self, utxos: &[Coin], dest_spk: &[u8], kind: &str, extra: Value) -> Result<Value> {

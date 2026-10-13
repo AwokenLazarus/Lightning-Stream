@@ -1,6 +1,6 @@
 // AGP-039: the UI in a real headless Chrome (rootless, over the DevTools protocol), as a human uses it:
 // set the password with the setup code, make the approval key IN THE BROWSER, save its backup, enrol it,
-// approve a waiting xbt402 call by signing in the page, sign a policy change, and check the pages on a
+// approve a waiting payment by signing in the page, sign a policy change, and check the pages on a
 // phone-sized screen. Screenshots and HTML snapshots go to OUT.
 //   node browser_test.mjs BASE SETUP_CODE OUT ENROLL_CODE
 import { spawn } from "node:child_process";
@@ -126,14 +126,14 @@ try {
   check("a wrong passphrase is refused in the browser", (await wrongPin()) === "wrong passphrase");
   await set("form[data-sign=approve] input.pin", PASS);
   await submitAndWait("document.querySelector('form[data-sign=approve] button[type=submit]').click()");
-  check("approved in the UI", (await flash()).startsWith("Approved."), await flash());
+  check("approved in the UI", (await flash()).startsWith("Approved and paid"), await flash());
   const after = await ev("JSON.parse(localStorage.getItem('xbt-wallet-human-key-v1')).iter");
   check("the 60k wrap migrated to 210000 on unlock", after === 210000, String(after));
   // 4. a policy change, signed in the page
   await go("/policy?template=starter");
   await shot("04-policy", 1100);
   await set("[name=f_allowlist]", "http://127.0.0.1:33210");
-  await set("[name=f_per_counterparty_cap_sats]", "9400"); // the test provider's channels hold at most 10,000
+  await set("[name=f_per_counterparty_cap_sats]", "9400");
   await submitAndWait("document.querySelector('form.policy').submit()");
   check("the review shows the text to sign", await ev("!!document.querySelector('pre.signed-text')"));
   await shot("05-policy-review", 1100);

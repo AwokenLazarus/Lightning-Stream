@@ -13,15 +13,10 @@
   "human_threshold_sats": 150000,
   "split_window_s": 600,
   "approval_ttl_s": 900,
-  "channel_expiry_blocks": 1008,
   "treasury_csv": 4320,
   "recovery_address": "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
   "human_pubkey": "3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29",
   "hot_balance_cap_sats": 1500000,
   "anchor_interval_s": 300,
-  "anchor_required": true,
-  "refund_enabled": true,
-  "refund_margin_blocks": 6,
-  "open_wait_s": 45,
-  "close_fee_max_sats": 2000
+  "anchor_required": true
 }

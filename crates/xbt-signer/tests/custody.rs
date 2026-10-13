@@ -10,20 +10,17 @@ fn read(p: &std::path::Path) -> Value {
 }
 
 #[test]
-fn hot_key_channel_keys_and_coins_are_sealed_at_rest() {
+fn hot_key_and_coins_are_sealed_at_rest() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let rig = Rig::new(json!({}), false);
     rig.fund_hot(1, 12_000);
-    let r = rig.open();
     let run = rig.root.join(".run");
     let hot = read(&run.join("hot.json"));
     assert_eq!(hot["encrypted"], true);
     assert!(hot["current"]["sealed"]["ct"].is_string() && hot["current"].get("secret").is_none());
-    let keys = read(&run.join("channel_keys.json"));
-    assert!(keys.get("sealed").is_some() && keys.get("secrets").is_none());
     let utx = read(&run.join("hot_utxos.json"));
     assert!(utx.get("sealed").is_some() && utx.get("utxos").is_none());
-    for f in ["hot.json", "channel_keys.json", "hot_utxos.json", "channels.json"] {
+    for f in ["hot.json", "hot_utxos.json"] {
         assert_eq!(xbt_signer::fsx::mode_of(&run.join(f)), 0o600, "{f}");
         let text = std::fs::read_to_string(run.join(f)).unwrap();
         assert!(!text.contains("\"secret\""), "{f} names no plaintext secret");
@@ -32,7 +29,8 @@ fn hot_key_channel_keys_and_coins_are_sealed_at_rest() {
     for m in ["balance", "channels", "hot_address", "signatures", "anchor_status"] {
         assert!(xbt_signer::sanitize::assert_no_key_material(&rig.call(m, json!({}))).is_ok(), "{m}");
     }
-    assert!(xbt_signer::sanitize::assert_no_key_material(&r).is_ok());
+    // this version writes no channel book and no channel keys
+    assert!(!run.join("channels.json").exists() && !run.join("channel_keys.json").exists());
 }
 
 #[test]
@@ -71,11 +69,11 @@ fn keyfile_inside_the_run_dir_is_refused_and_a_passphrase_is_consumed() {
     let d = tempfile::tempdir().unwrap();
     std::env::set_var("B2_HOT_PASSPHRASE", "pw");
     let root = root_with(d.path(), &runbook_policy(json!({})));
-    let s = signer(&root, &rig.chain, &rig.web, None).unwrap();
+    let s = signer(&root, &rig.chain, None).unwrap();
     assert_eq!(read(&root.join(".run/hot.json"))["current"]["sealed"]["kdf"], "scrypt");
     drop(s);
     std::env::set_var("B2_HOT_PASSPHRASE", "pw");
-    assert!(signer(&root, &rig.chain, &rig.web, None).is_ok(), "the same passphrase reopens it");
+    assert!(signer(&root, &rig.chain, None).is_ok(), "the same passphrase reopens it");
 }
 
 #[test]
@@ -86,15 +84,14 @@ fn plaintext_files_from_an_older_run_are_resealed() {
     std::env::remove_var("B2_HOT_KEYFILE");
     std::env::set_var("B2_HOT_ALLOW_PLAINTEXT", "1");
     let chain = FakeChain::new("regtest", 6_720);
-    let web = std::sync::Arc::new(Web::default());
     let root = root_with(d.path(), &runbook_policy(json!({})));
-    let s = signer(&root, &chain, &web, None).unwrap();
+    let s = signer(&root, &chain, None).unwrap();
     let addr = call(&s, "hot_address", json!({}))["hot_address"].clone();
     assert!(read(&root.join(".run/hot.json"))["current"]["secret"].is_string(), "plaintext only when explicitly allowed");
     drop(s);
     std::env::remove_var("B2_HOT_ALLOW_PLAINTEXT");
     std::env::set_var("B2_HOT_KEYFILE", d.path().join("keys/hot.key"));
-    let s = signer(&root, &chain, &web, None).unwrap();
+    let s = signer(&root, &chain, None).unwrap();
     assert_eq!(call(&s, "hot_address", json!({}))["hot_address"], addr, "the same key");
     let h = read(&root.join(".run/hot.json"));
     assert!(h["current"].get("sealed").is_some() && h["current"].get("secret").is_none());
@@ -116,7 +113,7 @@ fn rotation_sweeps_old_coins_keeps_the_old_key_sealed_and_later_coins_are_swept(
     let h = read(&rig.root.join(".run/hot.json"));
     assert_eq!(h["retired"].as_array().unwrap().len(), 1);
     assert!(h["retired"][0]["sealed"].is_object() && h["retired"][0]["retired_at"].is_f64());
-    // a coin that later reaches the retired address (a close's change) is swept by the watcher
+    // a coin that later reaches the retired address is swept by the watcher
     rig.chain.credit(&"cc".repeat(32), 0, 2_000, &old_spk, true);
     rig.call("notice_hot_txid", json!({"txid": "cc".repeat(32)}));
     assert_eq!(rig.call("hot_address", json!({}))["hot_retired_sats"], 2_000);
@@ -129,40 +126,38 @@ fn rotation_sweeps_old_coins_keeps_the_old_key_sealed_and_later_coins_are_swept(
 }
 
 #[test]
-fn over_the_cap_no_new_channel_until_a_human_sweeps() {
+fn over_the_cap_the_owner_is_told_until_a_human_sweeps() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let rig = Rig::new(json!({"hot_balance_cap_sats": 15_000}), false);
     rig.fund_hot(1, 20_000);
-    let r = rig.pay();
-    assert_eq!((r["verdict"].as_str(), r["rule"].as_str(), r["action"].as_str()), (Some("deny"), Some("hot_balance_cap"), Some("human_sweep")), "{r}");
-    assert_eq!((r["hot_sats"].as_i64(), r["cap_sats"].as_i64()), (Some(20_000), Some(15_000)));
-    assert!(rig.chain.mempool().is_empty(), "nothing was funded");
-    let hot = rig.call("hot_address", json!({}))["hot_address"].as_str().unwrap().to_string();
+    let h = rig.call("hot_address", json!({}));
+    assert_eq!((h["hot_sats"].as_i64(), h["hot_cap_sats"].as_i64(), h["hot_over_cap"].as_bool()), (Some(20_000), Some(15_000), Some(true)), "{h}");
+    let hot = h["hot_address"].as_str().unwrap().to_string();
     let exp = xbt_signer::pyjson::now_f64() as i64 + 600;
     let to = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
     let sig = sign_human(&xbt_signer::approval::sweep_message(&hot, to, 8_000, exp));
     let s = rig.call("sweep_hot", json!({"to": to, "amount_sats": 8_000, "expiry": exp, "signature": sig}));
     assert_eq!(s["ok"], true, "{s}");
-    assert_eq!(rig.pay()["verdict"], "pending", "under the cap again: the channel is funded");
+    assert_eq!(rig.call("hot_address", json!({}))["hot_over_cap"], false, "under the cap again");
 }
 
 #[test]
-fn every_signature_is_logged_with_channel_rule_and_chain() {
+fn every_signature_is_logged_with_its_rule_and_the_log_chains() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let rig = Rig::new(json!({}), false);
     rig.fund_hot(1, 12_000);
-    let r = rig.open();
-    rig.pay();
-    rig.call("close_channel", json!({"counterparty": PROVIDER}));
+    let hot = rig.call("hot_address", json!({}))["hot_address"].as_str().unwrap().to_string();
+    let exp = xbt_signer::pyjson::now_f64() as i64 + 600;
+    let to = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+    let sig = sign_human(&xbt_signer::approval::sweep_message(&hot, to, 4_000, exp));
+    assert_eq!(rig.call("sweep_hot", json!({"to": to, "amount_sats": 4_000, "expiry": exp, "signature": sig}))["ok"], true);
+    rig.rotate_hot_key();
     let sigs = rig.sigs();
-    let kinds: Vec<&str> = sigs.iter().map(|x| x["kind"].as_str().unwrap()).collect();
-    assert_eq!(kinds, vec!["funding", "channel_state", "channel_state", "close_auth"]);
+    let kinds: Vec<String> = sigs.iter().map(|x| format!("{}/{}", x["kind"].as_str().unwrap(), x["rule"].as_str().unwrap())).collect();
+    assert_eq!(kinds, vec!["human_sweep/human:sweep_signature", "rotation_sweep/human:rotate_signature"]);
     for x in &sigs {
         assert_eq!(x["sig_sha256"].as_str().unwrap().len(), 64);
-        assert!(!x["rule"].as_str().unwrap().is_empty() && x["rule"] != "unattributed");
     }
-    assert_eq!(sigs[1]["chan"], r["chan"]);
-    assert_eq!(sigs[1]["cum"], 546);
     assert_eq!(rig.call("signatures", json!({}))["chain_ok"], true);
 }
 

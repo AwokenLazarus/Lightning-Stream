@@ -16,7 +16,7 @@
 //!   `spentMsat` that falls is taken: a seller gives back what it charged ahead and did not send,
 //!   and a fall is in the buyer's favour.)
 //! * **Which rail pays is one function** ([`offers`]): a ticket entry, then a single Lightning
-//!   payment, then the frozen channel entry.
+//!   payment.
 //!
 //! Every number from outside is parsed as a `u64` of decimal digits and combined with checked
 //! arithmetic; a price that does not fit is no price.
@@ -163,8 +163,6 @@ pub enum Offer {
     /// `scheme: "exact"` on this Lightning network, with a BOLT 11 invoice: one payment, then the
     /// request again with the preimage.
     Lightning(Value),
-    /// The on-chain channel entry (`batch-settlement`) on this chain: the frozen rail.
-    Channel(Value),
 }
 
 impl Offer {
@@ -173,15 +171,14 @@ impl Offer {
             Offer::Ticket(..) => "ticket",
             Offer::Lottery(_) => "lottery",
             Offer::Lightning(_) => "ln",
-            Offer::Channel(_) => "xbt402",
         }
     }
 }
 
 /// The entries of a `PAYMENT-REQUIRED` this wallet could pay, in its order of choice: a ticket
-/// entry, a single Lightning payment, the channel entry. `lightning` and `chain` are this wallet's
-/// network ids (`lightning:<32 hex>`, `bip122:...`); an entry on any other network is not listed.
-pub fn offers(pr: &Value, lightning: &str, chain: &str) -> Vec<Offer> {
+/// entry, a single Lightning payment. `lightning` is this wallet's Lightning network id
+/// (`lightning:<32 hex>`); an entry on any other network is not listed.
+pub fn offers(pr: &Value, lightning: &str) -> Vec<Offer> {
     let entries: Vec<&Value> = pr.get("accepts").and_then(Value::as_array).into_iter().flatten().collect();
     let on = |a: &&&Value, scheme: &str, net: &str| a.get("scheme").and_then(Value::as_str) == Some(scheme) && a.get("network").and_then(Value::as_str) == Some(net);
     let mut out = vec![];
@@ -199,8 +196,6 @@ pub fn offers(pr: &Value, lightning: &str, chain: &str) -> Vec<Offer> {
     out.extend(ticket);
     out.extend(entries.iter().find(|a| on(a, xbt402::lottery::SCHEME, lightning)).map(|a| Offer::Lottery((*a).clone())));
     out.extend(entries.iter().find(|a| on(a, LN_SCHEME, lightning)).map(|a| Offer::Lightning((*a).clone())));
-    out.extend(entries.iter().find(|a| xbt402::wire::scheme_accepted(a.get("scheme").and_then(Value::as_str)) && a.get("network").and_then(Value::as_str) == Some(chain))
-        .map(|a| Offer::Channel((*a).clone())));
     out
 }
 
@@ -417,12 +412,12 @@ mod tests {
         let channel = json!({"scheme": "batch-settlement", "network": chain, "amount": 3});
         let ln = json!({"scheme": "exact", "network": NET, "amount": "3000", "extra": {"invoice": "lnbcrt1..."}});
         let pr = json!({"accepts": [channel, ln, ticket, {"scheme": "ticket", "network": "lightning:other"}, {"scheme": "exact", "network": "lnbtc:x"}, 7]});
-        let got = offers(&pr, NET, chain);
-        assert_eq!(got.iter().map(Offer::rail).collect::<Vec<_>>(), ["ticket", "ln", "xbt402"]);
-        assert_eq!(offers(&json!({"accepts": [channel]}), NET, chain).iter().map(Offer::rail).collect::<Vec<_>>(), ["xbt402"]);
-        assert!(offers(&json!({"accepts": [{"scheme": "ticket", "network": chain}]}), NET, chain).is_empty(), "a ticket entry names a Lightning network");
-        assert!(offers(&json!({}), NET, chain).is_empty());
-        assert!(offers(&json!({"accepts": "all"}), NET, chain).is_empty());
+        let got = offers(&pr, NET);
+        assert_eq!(got.iter().map(Offer::rail).collect::<Vec<_>>(), ["ticket", "ln"]);
+        assert!(offers(&json!({"accepts": [channel]}), NET).is_empty(), "the on-chain channel entry is no rail of this wallet");
+        assert!(offers(&json!({"accepts": [{"scheme": "ticket", "network": chain}]}), NET).is_empty(), "a ticket entry names a Lightning network");
+        assert!(offers(&json!({}), NET).is_empty());
+        assert!(offers(&json!({"accepts": "all"}), NET).is_empty());
     }
 
     fn receipt(seq: u64, released: u64, spent: u64, charged: u64, status: u16, body: &str) -> Value {

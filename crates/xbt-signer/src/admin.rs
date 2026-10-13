@@ -9,9 +9,9 @@
 //! code this signer writes to its log and `.run/enroll-code` while none is enrolled (W4): a process on
 //! the socket cannot read the console or the run dir, so it cannot enrol its own key first.
 //!
-//! An over-threshold `xbt402_pay` becomes a *grant* when approved: the human signs (token, origin,
-//! max_sats, expiry) and the agent's next `xbt402_pay` of the same URL, method and `max_sats` pays under
-//! it, once (see `Signer::xbt402_pay_locked`). Every other token keeps B2's `approve` (pay at once).
+//! An over-threshold `ln_pay` becomes a *grant* when approved: the human signs (token, dest, amount,
+//! expiry) and the agent's next `ln_pay` of the same invoice pays under it, once. Every other token
+//! keeps B2's `approve` (pay at once).
 use std::path::Path;
 
 use serde_json::{json, Map, Value};
@@ -145,9 +145,8 @@ pub fn effective(c: &PolicyConfig) -> Value {
     json!({"max_per_tx_sats": c.max_per_tx_sats, "daily_budget_sats": c.daily_budget_sats, "weekly_budget_sats": c.weekly_budget_sats,
            "per_counterparty_cap_sats": c.per_counterparty_cap_sats, "velocity_max": c.velocity_max, "velocity_window_s": c.velocity_window_s,
            "human_threshold_sats": c.human_threshold_sats, "split_window_s": c.split_window_s, "approval_ttl_s": c.approval_ttl_s,
-           "channel_expiry_blocks": c.channel_expiry_blocks, "treasury_csv": c.treasury_csv, "refund_enabled": c.refund_enabled,
-           "refund_margin_blocks": c.refund_margin_blocks, "hot_balance_cap_sats": c.hot_balance_cap_sats, "anchor_interval_s": c.anchor_interval_s,
-           "anchor_required": c.anchor_required, "open_wait_s": c.open_wait_s, "open_retry_s": c.open_retry_s, "close_fee_max_sats": c.close_fee_max_sats,
+           "treasury_csv": c.treasury_csv, "hot_balance_cap_sats": c.hot_balance_cap_sats, "anchor_interval_s": c.anchor_interval_s,
+           "anchor_required": c.anchor_required,
            "regtest_mine": c.regtest_mine, "forward": c.forward})
 }
 
@@ -256,9 +255,9 @@ impl Signer {
             "rotate_hot_key" | "rotate_hot_key_signed" => self.rotate_signed(p),
             "backup_export" => self.backup_export(p),
             "keystore_status" => self.keystore_status(),
+            // what an earlier version's on-chain channels left: their records and close reports, read-only
             "channel_reports" => Ok(json!({"reports": self.close_reports(), "height": self.height_safe(),
-                                           "refund_margin_blocks": self.config().refund_margin_blocks,
-                                           "refund_enabled": self.config().refund_enabled})),
+                                           "legacy_channels": self.legacy_channels.notice()})),
             _ => return None,
         })
     }
@@ -506,59 +505,32 @@ impl Signer {
         self.run.join("close_reports.json")
     }
 
+    /// The close reports an earlier version kept of its on-chain channels (AGP-029). Never written here.
     pub(crate) fn close_reports(&self) -> Value {
         std::fs::read_to_string(self.close_reports_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(json!({}))
     }
 
-    /// Keep a close's report (AGP-029) for the UI; B2's channels.json format is left as it is.
-    pub(crate) fn save_close_report(&self, out: &Value) {
-        let (Some(chan), Some(report)) = (out.get("chan").and_then(Value::as_str), out.get("close_report")) else { return };
-        let mut all = self.close_reports();
-        all[chan] = json!({"report": report, "txid": out.get("txid"), "cum": out.get("cum"), "dest": out.get("dest"), "ts": self.now_i()});
-        let path = self.close_reports_path();
-        let tmp = path.with_extension("tmp");
-        if std::fs::write(&tmp, dumps(&all)).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
-        }
-    }
-
-    // --- the xbt402 grant --------------------------------------------------------------------------
-
-    /// A human-approved, unused, unexpired xbt402 grant for exactly this call.
-    pub(crate) fn find_xbt402_grant(&self, dest: &str, max_sats: i64, url: &str, method: &str) -> Option<String> {
-        let now = self.now_i();
-        self.engine.store.approvals().ok()?.into_iter().find(|(_, a)| {
-            a.get("kind").and_then(Value::as_str) == Some("xbt402") && a.get("approved") == Some(&Value::Bool(true))
-                && a.get("used") != Some(&Value::Bool(true)) && py_int(a.get("expires")).unwrap_or(0) >= now
-                && a.get("dest").and_then(Value::as_str) == Some(dest) && py_int(a.get("amount_sats")) == Some(max_sats)
-                && a.get("url").and_then(Value::as_str) == Some(url) && a.get("method").and_then(Value::as_str) == Some(method)
-        }).map(|(t, _)| t)
-    }
+    // --- the grant of a Lightning payment ------------------------------------------------------------
 
     /// The grant was spent: drop it and remember the outcome.
-    pub(crate) fn use_xbt402_grant(&self, token: &str, charged: i64) {
+    pub(crate) fn use_grant(&self, token: &str, charged: i64) {
         let _ = self.engine.store.pop_approval(token);
         self.engine.audit.append(json!({"type": "approval_used", "token": token, "charged_sats": charged, "ts": ts_value(self.engine.now())}));
         self.remember(token, outcome("used", json!({"token": token, "charged_sats": charged})));
     }
 
-    /// `approve` of an xbt402 or (AGP-048) an ln token (the signature is already checked): mark it
-    /// granted. The agent's same call again pays under it, once.
-    pub(crate) fn grant_xbt402(&self, token: &str, payload: &Value) -> Result<Value> {
+    /// `approve` of an ln token (AGP-048; the signature is already checked): mark it granted. The
+    /// agent's same call again pays under it, once.
+    pub(crate) fn grant_ln(&self, token: &str, payload: &Value) -> Result<Value> {
         if payload.get("approved") == Some(&Value::Bool(true)) {
             return Ok(deny("approval_replay", "approval token already approved"));
         }
         self.engine.store.update_approval(token, &json!({"approved": true, "approved_at": ts_value(self.engine.now())}))?;
         self.engine.audit.append(json!({"type": "approval_granted", "token": token, "dest": payload.get("dest"),
                                         "amount_sats": payload.get("amount_sats"), "url": payload.get("url"), "ts": ts_value(self.engine.now())}));
-        if payload.get("kind").and_then(Value::as_str) == Some("ln") {
-            return Ok(json!({"verdict": "allow", "approved": true, "granted": true, "rail": "ln", "token": token, "dest": payload.get("dest"),
-                             "amount_sats": payload.get("amount_sats"), "payment_hash": payload.get("payment_hash"), "expires": payload.get("expires"),
-                             "note": "the agent's next ln_pay of this invoice pays under this approval, once"}));
-        }
-        Ok(json!({"verdict": "allow", "approved": true, "granted": true, "rail": "xbt402", "token": token, "dest": payload.get("dest"),
-                  "amount_sats": payload.get("amount_sats"), "url": payload.get("url"), "expires": payload.get("expires"),
-                  "note": "the agent's next xbt402_pay of this url with this max_sats pays under this approval, once"}))
+        Ok(json!({"verdict": "allow", "approved": true, "granted": true, "rail": "ln", "token": token, "dest": payload.get("dest"),
+                  "amount_sats": payload.get("amount_sats"), "payment_hash": payload.get("payment_hash"), "expires": payload.get("expires"),
+                  "note": "the agent's next ln_pay of this invoice pays under this approval, once"}))
     }
 
     pub(crate) fn note_expired(&self, token: &str) {

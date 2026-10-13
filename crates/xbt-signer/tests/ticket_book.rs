@@ -386,7 +386,7 @@ impl Rig {
 
     fn start(root: &std::path::Path, node: &Arc<FundNode>, ln: &Arc<HeldLn>, clock: &Arc<AtomicU64>) -> Arc<Signer> {
         let c = clock.clone();
-        Signer::new(root, SignerOptions { node: Some(node.clone()), transport: Some(Arc::new(Web::default())), ln: Some(ln.clone()),
+        Signer::new(root, SignerOptions { node: Some(node.clone()), ln: Some(ln.clone()),
                                           clock: Some(Arc::new(move || c.load(Ordering::SeqCst) as f64)), ..Default::default() }).unwrap()
     }
 

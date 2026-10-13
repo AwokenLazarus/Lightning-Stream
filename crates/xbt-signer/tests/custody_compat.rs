@@ -1,8 +1,7 @@
 //! Format compatibility with B2 (Python) custody files, `vectors/b2_custody.json` (made by B2's own
 //! code): the Rust signer opens B2's sealed blobs (key file and scrypt passphrase), hot.json with a
-//! retired key, the sealed UTXO set, the sealed channel keys and channels.json, and checks B2's
-//! signature log against B2's witness store, then extends both. The reverse direction (B2 opening
-//! Rust-written files) runs in scripts/signer_interop.sh (scripts/interop/signer_runbook.py).
+//! retired key and the sealed UTXO set, reads B2's channels.json as records it only lists, and checks
+//! B2's signature log against B2's witness store, then extends both.
 mod common;
 
 use std::sync::Arc;
@@ -10,7 +9,6 @@ use std::sync::Arc;
 use common::*;
 use serde_json::{json, Value};
 use xbt_signer::anchor::AnchorStore;
-use xbt_signer::channels::ChannelBook;
 use xbt_signer::hot::HotWallet;
 use xbt_signer::keystore::KeyStore;
 use xbt_signer::sigaudit::{check_chain, SigAudit};
@@ -35,7 +33,7 @@ fn opens_b2_sealed_blobs() {
 }
 
 #[test]
-fn opens_b2_hot_wallet_and_channel_book() {
+fn opens_b2_hot_wallet_and_lists_its_channel_book_without_writing_it() {
     let v = vectors();
     let d = tempfile::tempdir().unwrap();
     let w = |name: &str, x: &Value| std::fs::write(d.path().join(name), x.to_string()).unwrap();
@@ -54,28 +52,17 @@ fn opens_b2_hot_wallet_and_channel_book() {
     // a wrong wrapping key cannot open it
     assert!(HotWallet::open(&d.path().join("hot.json"), chain.clone(), "bcrt", Some(Arc::new(KeyStore::with_key([1; 32]))), None, 0).is_err());
 
-    let book = ChannelBook::open(&d.path().join("channels.json"), &d.path().join("channel_keys.json"), Some(ks.clone()), None).unwrap();
-    let dest = "http://127.0.0.1:33210";
-    let rec = book.get(dest).unwrap();
-    assert_eq!(rec.chan, v["channels"]["chan"].as_str().unwrap());
-    assert_eq!((rec.state.as_str(), rec.used_sats, rec.spent_sats, rec.cap_sats), ("open", 546, 500, 9400));
-    assert_eq!(rec.params().unwrap().channel_id(), rec.chan, "params rebuilt byte for byte");
-    // B2's payer key signs here: the next state verifies under the recorded payer pubkey
-    let sig = book.sign_state(dest, 1_000).unwrap();
-    let p = rec.params().unwrap();
-    let z = p.sighash(&p.state_tx(1_000).unwrap()).unwrap();
-    let pk = hex::decode(v["channels"]["payer_pub"].as_str().unwrap()).unwrap();
-    assert!(xbt_primitives::ecdsa::verify(&pk, &z, &sig[..sig.len() - 1]));
-    assert_eq!(book.sign_state(dest, 900).unwrap_err().code, "stale_amount");
-    // the Rust book re-seals the keys file in the same format
-    let keys: Value = serde_json::from_str(&std::fs::read_to_string(d.path().join("channel_keys.json")).unwrap()).unwrap();
-    assert_eq!(keys["sealed"]["aad"], "b2/channel-keys");
-    let inner: Value = serde_json::from_slice(&ks.open(&keys["sealed"], "b2/channel-keys").unwrap()).unwrap();
-    assert!(inner["secrets"][rec.chan.as_str()].is_string());
-    let chans: Value = serde_json::from_str(&std::fs::read_to_string(d.path().join("channels.json")).unwrap()).unwrap();
-    let fields: Vec<&String> = chans["channels"][dest].as_object().unwrap().keys().collect();
-    let b2_fields: Vec<&String> = v["channels"]["channels.json"]["channels"][dest].as_object().unwrap().keys().collect();
-    assert_eq!(fields, b2_fields, "the same ChannelRecord fields as B2 (B2 loads it with ChannelRecord(**rec))");
+    // B2's channel book is read, listed without a key, and left byte for byte as it was
+    let before = (std::fs::read(d.path().join("channels.json")).unwrap(), std::fs::read(d.path().join("channel_keys.json")).unwrap());
+    let legacy = xbt_signer::legacy::LegacyChannels::read(&d.path().join("channels.json"));
+    let rows = legacy.public();
+    assert_eq!(rows.len(), 1);
+    assert_eq!((rows[0]["dest"].as_str(), rows[0]["chan"].as_str(), rows[0]["state"].as_str(), rows[0]["cap_sats"].as_i64(), rows[0]["used_sats"].as_i64()),
+               (Some("http://127.0.0.1:33210"), v["channels"]["chan"].as_str(), Some("open"), Some(9400), Some(546)));
+    assert!(xbt_signer::sanitize::assert_no_key_material(&json!(rows)).is_ok());
+    assert_eq!(legacy.unsettled(), 1);
+    assert!(legacy.notice().unwrap()["what_to_do"].as_str().unwrap().contains(xbt_signer::legacy::LAST_WITH_CHANNEL));
+    assert_eq!((std::fs::read(d.path().join("channels.json")).unwrap(), std::fs::read(d.path().join("channel_keys.json")).unwrap()), before);
 }
 
 #[test]
