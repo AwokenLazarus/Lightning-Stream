@@ -1000,6 +1000,7 @@ impl Signer {
             t.released_ts = now;
             t.booked_sats = sats;
             s.active_ts = now;
+            s.held_one();
             st.commit(&[t.row(), s.row()])?;
             // 3. the signature log, which the anchor witness covers: its hash, never the secret
             self.sigaudit.record("ticket_release", &[], "", &dest, json!({"payment_hash": t.hash, "session": sid, "booked_sats": sats}))?;
@@ -1053,12 +1054,27 @@ impl Signer {
                 self.engine.store.amend(&ledger_id(hash), None)?;
             }
             let back = t.booked_sats;
+            let was_locked = t.state == TState::Locked && !t.prepaid;
             t.note = str_or_empty(pmt.get("failure_reason")).chars().take(80).collect();
             t.state = TState::Failed;
             t.booked_sats = 0;
             t.done_ts = now;
             st.commit(&[t.row()])?;
             self.ticket_audit("ticket_failed", json!({"payment_hash": hash, "dest": dest, "released_sats": back}));
+            // a ticket that was in flight and then failed as a full channel does met a hop without a slot: its
+            // payment left the wallet's node before that hop refused it. It counts as a failed round, once per
+            // wait (the tickets of one round fail together)
+            if was_locked && ticket::slot_failure(&t.note) {
+                if let Some(mut s) = st.book.sessions.get(&t.session).filter(|s| s.state == SState::Open && now >= s.hold_until).cloned() {
+                    let had = s.pool;
+                    if s.lock_round(0, 1, now) {
+                        st.commit(&[s.row()])?;
+                        self.ticket_audit("ticket_slot_failure", json!({"session": s.id, "dest": dest, "locked": 0, "slot_failed": 1, "pool_was": had, "pool": s.pool,
+                                                                        "slot_fails": s.slot_fails, "hold_until": ts_value(s.hold_until), "hold_why": s.hold_why,
+                                                                        "after": "in flight, then failed at a later hop"}));
+                    }
+                }
+            }
             return Ok(());
         }
         // SUCCEEDED

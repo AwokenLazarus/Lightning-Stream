@@ -994,6 +994,12 @@ impl Session {
         r
     }
 
+    /// A ticket of this session was released: the seller held it, so the route had a slot. The
+    /// run of failed rounds is over; the smaller pool stays.
+    pub fn held_one(&mut self) {
+        self.slot_fails = 0;
+    }
+
     /// Whether this session pays with a prepaid ticket now: the seller offers them, and no ticket
     /// is held (a pool of none) or none may be locked for the moment (a wait).
     pub fn prepaid_now(&self, now: f64) -> bool {
@@ -1003,15 +1009,13 @@ impl Session {
     /// What a lock round came to: `locked` tickets the node holds, `slot_failed` that failed as a
     /// full channel does ([`slot_failure`]). A failure halves the pool (never below 1) and sets
     /// the wait; the third failed round in a row ends holding with this seller (a pool of none,
-    /// [`ROUTE_FULL`]). A round that locked and failed nothing ends the run of failures. Returns
-    /// whether anything changed.
+    /// [`ROUTE_FULL`]). Returns whether anything changed. A round that locked does not end the run
+    /// of failures: a ticket that finds no slot at a later hop is in flight on the buyer's node
+    /// for a moment before it fails, so "locked" here is not yet "held by the seller". What ends
+    /// the run is a release ([`Self::held_one`]).
     pub fn lock_round(&mut self, locked: usize, slot_failed: usize, now: f64) -> bool {
         if slot_failed == 0 {
-            let had = self.slot_fails;
-            if locked > 0 {
-                self.slot_fails = 0;
-            }
-            return had != self.slot_fails;
+            return false;
         }
         if locked == 0 {
             self.slot_fails = self.slot_fails.saturating_add(1);
@@ -1213,10 +1217,11 @@ impl Book {
         self.tickets.values().find(|t| t.session == session && t.prepaid && !t.state.terminal())
     }
 
-    /// Held tickets on their way to the node that it does not show yet (`on_node`: the payment
-    /// hashes pending on its channels): they take a slot each as soon as they arrive.
+    /// Held tickets that the node's channel list does not show yet (`on_node`: the payment
+    /// hashes pending on its channels): on their way to the node, or locked a moment ago, since a
+    /// payment is in flight before the channel lists it. Each takes a slot.
     pub fn sending_unseen(&self, on_node: &dyn Fn(&str) -> bool) -> i64 {
-        i64::try_from(self.tickets.values().filter(|t| t.state == TState::Sending && !on_node(&t.hash)).count()).unwrap_or(i64::MAX)
+        i64::try_from(self.tickets.values().filter(|t| t.state.unreleased() && !on_node(&t.hash)).count()).unwrap_or(i64::MAX)
     }
 
     /// How many hashes a session's pool wants now: up to its target once half of it or fewer are
@@ -1578,9 +1583,11 @@ mod tests {
         assert_eq!((s.pool, s.slot_fails, s.hold_until), (1, 1, 160.0));
         assert!(s.lock_round(0, 1, 160.0));
         assert_eq!((s.pool, s.slot_fails, s.hold_until), (1, 2, 220.0));
-        // a round that locks ends the run
+        // a round that locks does not end the run (a ticket can be in flight a moment before a later hop fails it); a release does
         let mut ok = s.clone();
-        assert!(ok.lock_round(1, 0, 220.0));
+        assert!(!ok.lock_round(1, 0, 220.0));
+        assert_eq!((ok.pool, ok.slot_fails), (1, 2));
+        ok.held_one();
         assert_eq!((ok.pool, ok.slot_fails), (1, 0), "the smaller pool stays: the route is as full as it was");
         // the third failed round in a row: no ticket is held with this seller, for 10 minutes
         assert!(s.lock_round(0, 1, 220.0));
@@ -1805,7 +1812,8 @@ mod tests {
         // tickets on their way that the node does not show yet take a slot each when they arrive
         b.tickets.get_mut(&hashes[5]).unwrap().state = TState::Sending;
         b.tickets.get_mut(&hashes[6]).unwrap().state = TState::Sending;
-        assert_eq!((b.sending_unseen(&|_| false), b.sending_unseen(&|h| h == hashes[5])), (2, 1));
+        assert_eq!((b.sending_unseen(&|_| false), b.sending_unseen(&|h| h == hashes[5]), b.sending_unseen(&|_| true)), (3, 2, 0),
+                   "the two on their way and the one locked, until the channel lists them");
         let full = Locked { tickets: i64::MAX, sats: i64::MAX, booking: i64::MAX };
         assert_eq!(full.plus(5, i64::MAX, i64::MAX), full, "a sum that does not fit is the largest, never a small one");
     }

@@ -1417,11 +1417,30 @@ fn every_lock_reads_the_channel_again_and_stays_within_half_of_what_it_carries()
     r.lock(&sid, hashes.iter().map(|h| (h.clone(), sellers[0].invoice(r.now(), h, &Inv::default()))).collect());
     let s = r.status()["sessions"].as_array().unwrap().iter().find(|s| s["session"] == sid.as_str()).cloned().unwrap();
     assert_eq!((s["pool"].as_i64(), s["hold_why"].as_str()), (Some(0), Some("ticket_route_full")), "{s}");
-    // and a round that locks ends it
+    // a round that locks is not yet a ticket the seller holds
     r.pass(601);
     r.call("ticket_stop", json!({"session": sid}));
     r.ln.set_mode(Send::Lock);
     let sid = r.open_with(&sellers[0], "work")["session"].as_str().unwrap().to_string();
     assert_eq!(r.fill_with(&sid, &sellers[0]).len(), 1);
+    let fails = |r: &Rig| r.status()["sessions"].as_array().unwrap().iter().find(|s| s["session"] == sid.as_str()).map(|s| s["slot_fails"].as_i64().unwrap());
+    assert_eq!(fails(&r), Some(2), "locked on the wallet's node is not yet held by the seller");
+    // a ticket that was in flight and then fails at a later hop is a failed round too
+    let hash = r.status()["sessions"].as_array().map(|_| r.ln.in_flight().into_iter().next().unwrap()).unwrap();
+    r.ln.with_payment(&hash, |p| {
+        p["status"] = "FAILED".into();
+        p["failure_reason"] = "FAILURE_REASON_NO_ROUTE".into();
+        p["htlcs"] = json!([]);
+    });
+    r.call("watch_tick", json!({}));
+    let s = r.status()["sessions"].as_array().unwrap().iter().find(|s| s["session"] == sid.as_str()).cloned().unwrap();
+    assert_eq!((s["pool"].as_i64(), s["hold_why"].as_str()), (Some(0), Some("ticket_route_full")), "{s}");
+    // and a release ends the run
+    r.pass(601);
+    r.call("ticket_stop", json!({"session": sid}));
+    let sid = r.open_with(&sellers[0], "work")["session"].as_str().unwrap().to_string();
+    assert_eq!(r.fill_with(&sid, &sellers[0]).len(), 1);
+    assert_eq!(r.release(&sid)["verdict"], "allow");
+    assert_eq!(fails(&r), None, "the stopped session is closed");
     assert_eq!(r.status()["sessions"].as_array().unwrap().iter().find(|s| s["session"] == sid.as_str()).unwrap()["slot_fails"], 0);
 }

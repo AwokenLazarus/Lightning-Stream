@@ -946,6 +946,7 @@ def slots() -> None:
     # 13 payments of others are pending on the buyer's channel: room for 2 under half of 30
     pending = others_pending(other, BUDGET - 2)
     b = fresh(shop)
+    lab.wait("the channel to list the wallet's tickets", 30, lambda: set(b.hashes) <= buyer_in_flight(), every=0.1)
     st = status()
     check(f"slots: with {BUDGET - 2} payments of others pending on its {SLOTS}-slot channel the wallet holds its 2 tickets: {BUDGET} pending, half",
           len(b.hashes) == HELD and len(buyer_in_flight()) == BUDGET and st["locked"]["tickets"] == HELD, {"pending_on_channel": len(buyer_in_flight()), "book": st["locked"]})
@@ -953,6 +954,7 @@ def slots() -> None:
     rel, code = b.pay()
     lab.wait("the released ticket's settle to be back on lf1", 30, lambda: len(buyer_in_flight()) == BUDGET - 1, every=0.2)
     lab.wait("the refill", 60, lambda: b.lock() is not None and len(b.hashes) == HELD + 1, every=0.5)
+    lab.wait("the channel to list the refill", 30, lambda: len(buyer_in_flight()) == BUDGET, every=0.1)
     check("slots: after a release the next ticket is locked, and the channel is at half again", code == 200 and len(buyer_in_flight()) == BUDGET, {"pending_on_channel": len(buyer_in_flight())})
     # one more payment of others arrives: 16 pending. The next refill is refused by the wallet before the node is asked
     pending += others_pending(other, 1)
@@ -982,36 +984,55 @@ def full() -> None:
     victim = SELLERS[3]
     shop = SHOPS[victim]
     blocked = []
-    for _ in range(483):
+    for _ in range(500):
         h = hashlib.sha256(secrets.token_bytes(32)).hexdigest()
         blocked.append(h)
     invoices = list(POOL.map(lambda h: shop.hold_invoice(h, msat=1000, life_s=3600), blocked))
     first = list(POOL.map(lambda inv: lab.pay_invoice(HOP, inv, 60).get("status"), invoices))
     lab.wait("the seller's inbound channel to be full", 180, lambda: sum(len(c["pending_htlcs"]) for c in lab.channels(victim)) >= 483, every=2)
     REPORT["measured"]["full_filled_with"] = lab.tally_states(str(x) for x in first)
+    # full when the hop's own next payment over that channel fails
+    def no_slot() -> bool:
+        h = hashlib.sha256(secrets.token_bytes(32)).hexdigest()
+        blocked.append(h)
+        lab.pay_invoice(HOP, shop.hold_invoice(h, msat=1000, life_s=3600), 5)
+        # a payment is IN_FLIGHT from the moment it is tried: what it came to is asked a little later
+        time.sleep(3)
+        now = lab.stream(HOP, "GET", "/v2/router/track/" + lab.url64(bytes.fromhex(h)), None, lambda u: True)
+        return now.get("status") == "FAILED"
+
+    lab.wait("the hop to have no slot left towards the seller", 120, no_slot, every=1)
+    REPORT["measured"]["full_pending_on_the_sellers_channel"] = sum(len(c["pending_htlcs"]) for c in lab.channels(victim))
+    spent0 = WALLET_PROC.spent()
     b = Buyer(shop, "swarm")
     opened = b.open()
-    rounds = []
-    for wait in (31, 61, 0):
-        out = b.lock()
-        s = session_of(b.session)
-        rounds.append({"offered": len(out.get("tickets", [])) + len(out.get("refused", [])), "locked": out.get("locked"),
-                       "reasons": sorted({t.get("note", "") for t in out.get("tickets", [])}), "pool": s.get("pool"), "slot_fails": s.get("slot_fails"), "hold_why": s.get("hold_why")})
-        idle = signer("ticket_offer", {"session": b.session}).get("hashes")
-        if idle:
-            rounds[-1]["offered_during_wait"] = len(idle)
-        if wait:
-            time.sleep(wait)
-    check("full: a lock that finds no slot on the way fails on the buyer's node, and the session holds less: a wait, a longer wait, then nothing",
-          opened.get("pool") == 1 and [r["locked"] for r in rounds] == [0, 0, 0] and [r["slot_fails"] for r in rounds] == [1, 2, 3]
-          and [r["hold_why"] for r in rounds] == ["ticket_slots", "ticket_slots", "ticket_route_full"] and rounds[-1]["pool"] == 0
-          and not any("offered_during_wait" in r for r in rounds), rounds)
-    REPORT["measured"]["full_failure_reasons"] = sorted({x for r in rounds for x in r["reasons"]})
-    again = Buyer(shop, "swarm")
+    rounds: list[dict[str, Any]] = []
+    end = time.time() + 240
+    # a ticket for a seller behind a full channel leaves the buyer's node and is refused at the hop: the node shows it
+    # in flight for a moment and then failed, or (while its routing remembers the failure) fails it at once
+    while time.time() < end and session_of(b.session).get("pool") != 0:
+        offer = signer("ticket_offer", {"session": b.session}).get("hashes") or []
+        if not offer:
+            time.sleep(1)
+            continue
+        code, ans = shop_http("POST", f"/{shop.node}/x402/ticket/lock", dict({"version": "ticket/0", "hashes": offer}, **({"session": b.remote} if b.remote else {})))
+        b.remote = ans.get("session", b.remote)
+        out = signer("ticket_lock", {"session": b.session, "tickets": ans.get("tickets", [])})
+        lab.wait("the round's tickets to fail or hold", 30, lambda: not any(t["state"] in ("sending", "locked") for t in status(b.session).get("session_tickets", [])) or time.time() > end, every=0.5)
+        s1 = session_of(b.session)
+        notes = sorted({t.get("note", "") for t in status(b.session).get("session_tickets", []) if t["state"] == "failed"})
+        rounds.append({"offered": len(offer), "in_flight_at_first": out.get("locked"), "failed_as": notes, "pool": s1.get("pool"), "slot_fails": s1.get("slot_fails"), "hold_why": s1.get("hold_why"),
+                       "wait_s": round(float(s1.get("hold_until") or 0) - time.time())})
+    s1 = session_of(b.session)
+    held_now = sum(1 for t in status(b.session).get("session_tickets", []) if t["state"] in ("sending", "locked"))
+    check("full: a ticket that finds no slot on the way fails on the buyer's node, and the session holds less each time: a wait of 30 s, of 60 s, and after the third round nothing is held with that seller",
+          opened.get("pool") == 1 and len(rounds) == 3 and [r["slot_fails"] for r in rounds] == [1, 2, 3] and [r["hold_why"] for r in rounds] == ["ticket_slots", "ticket_slots", "ticket_route_full"]
+          and s1.get("pool") == 0 and held_now == 0 and WALLET_PROC.spent() == spent0, rounds)
+    REPORT["measured"]["full_failure_reasons"] = sorted({x for r in rounds for x in r["failed_as"]})
     signer("ticket_stop", {"session": b.session})
-    denied = again.open()
+    denied = Buyer(shop, "swarm").open()
     check("full: a new session with that seller holds nothing for ten minutes, and nothing was spent or is locked",
-          denied.get("rule") == "ticket_route_full" and status()["locked"]["tickets"] == 0, {"rule": denied.get("rule"), "locked": status()["locked"]})
+          denied.get("rule") == "ticket_route_full" and status()["locked"]["tickets"] == 0 and WALLET_PROC.spent() == spent0, {"rule": denied.get("rule"), "locked": status()["locked"]})
     list(POOL.map(lambda h: lab.post(victim, "/v2/invoices/cancel", {"payment_hash": lab.b64(bytes.fromhex(h))}), blocked))
     lab.wait("the seller's inbound channel to be empty again", 120, lambda: sum(len(c["pending_htlcs"]) for c in lab.channels(victim)) == 0, every=2)
 
