@@ -769,6 +769,19 @@ impl Signer {
                         if done && lock(&shared).pending.is_empty() {
                             return;
                         }
+                        // a win that is owed (the seller sent no invoice for it yet, or a try came to nothing before
+                        // anything was sent): the seller is asked for its list again. Without this the answer stands
+                        // still, the seller waiting for the payment and the wallet for the next piece
+                        if !lock(&ds.state).owed.is_empty() && ds.fault().is_none() && !lock(counted).halt {
+                            if let Ok(r) = self.draw_round(ds, &[], &[], true, counted) {
+                                for (w, inv) in r.wins {
+                                    if let Some(inv) = inv {
+                                        scope.spawn(move || self.draw_pay(ds, &w, &inv, counted));
+                                    }
+                                }
+                            }
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
                         continue;
                     }
                     if ds.fault().is_some() || lock(counted).halt {
@@ -914,7 +927,10 @@ impl Signer {
         if !complete && ds.fault().is_none() {
             let ahead = u64::from(ds.terms.window).min(1024) + 1;
             let secs = if price.second_msat > 0 { head_at.elapsed().as_secs() + 1 } else { 0 };
-            let mut ids: Vec<PieceId> = vec![PieceId { seq, kind: Kind::Request, k: 0 }];
+            let mut ids: Vec<PieceId> = vec![];
+            if price.request_msat > 0 {
+                ids.push(PieceId { seq, kind: Kind::Request, k: 0 });
+            }
             if by_bytes {
                 ids.extend((0..sink.bytes / piece_bytes + ahead).map(|k| PieceId { seq, kind: Kind::Bytes, k }));
             }

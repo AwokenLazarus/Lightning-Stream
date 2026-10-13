@@ -2677,6 +2677,44 @@ fn a_win_whose_payment_fails_is_owed_until_the_sellers_next_invoice_and_never_pa
     assert_eq!((r.ledger_sum(), r.ln.paid_msat(), r.shop.settled()), (in_doubt * 67, 0, 0), "booked for as long as the node cannot say, and nothing paid twice");
 }
 
+/// A win's payment that the wallet could not even begin (its own Lightning node gave no answer for
+/// a moment) is tried again while the answer is still arriving.
+///
+/// FAILS before the drawer asked the seller again for an owed win: the seller waited for the
+/// payment, the wallet for the next piece, and the answer stood still until the seller's grace
+/// was over and it cut the answer. Seen on the lab with 100 sellers: one file of 300.
+#[test]
+fn a_win_that_could_not_be_paid_for_a_moment_is_paid_while_the_answer_waits() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let r = draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
+    let (ln, armed) = (r.ln.clone(), Arc::new(AtomicUsize::new(0)));
+    r.tap.set(Box::new(move |seen, real| {
+        if !seen.path.starts_with("/x402/lottery/draw") {
+            return None;
+        }
+        let (status, headers, body) = whole(real().unwrap());
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        // the wallet's node is away when the first win is to be paid, and back 300 ms later
+        if v["wins"].as_array().is_some_and(|w| !w.is_empty()) && armed.fetch_add(1, Ordering::SeqCst) == 0 {
+            ln.st.lock().unwrap().down = true;
+            let back = ln.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                back.st.lock().unwrap().down = false;
+            });
+        }
+        let headers: Vec<(String, String)> = headers.into_iter().filter(|(k, _)| !k.eq_ignore_ascii_case("content-length")).collect();
+        Some(Ok(answer(status, headers, body)))
+    }));
+    let t = Instant::now();
+    let v = r.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
+    let wins = v["wins"].as_u64().unwrap();
+    assert!(wins >= 1, "{v}");
+    assert_eq!((v["complete"].as_bool(), v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(true), Some(wins), Some(0)), "{v}");
+    assert!(t.elapsed() < Duration::from_millis(1_800), "the answer did not stand still for the seller's grace of 2 s: {:?}", t.elapsed());
+    assert_wins(&r, wins);
+}
+
 #[test]
 fn a_killed_signer_or_gateway_ends_a_session_of_draws_plainly_and_pays_no_win_twice() {
     let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
@@ -2735,6 +2773,7 @@ fn a_piece_whose_hash_the_caller_named_gets_its_value_only_if_it_matches() {
     assert_eq!((v["complete"].as_bool(), v["piece_mismatch"].as_u64(), v["draws"].as_u64()), (Some(false), Some(3), Some(3)), "{v}");
     assert!(v["ended"].as_str().unwrap().contains("piece 3"), "{v}");
     let voids: Vec<Value> = r.tap.seen("/x402/lottery/draw").iter().flat_map(|s| serde_json::from_str::<Value>(&s.body).unwrap()["void"].as_array().cloned().unwrap_or_default()).collect();
-    assert_eq!(voids.len(), 1, "{voids:?}");
-    assert_eq!((voids[0]["kind"].as_str(), voids[0]["k"].as_u64()), (Some("bytes"), Some(3)));
+    // the piece that did not match, and then those after it, which the wallet did not wait for
+    assert_eq!((voids[0]["kind"].as_str(), voids[0]["k"].as_u64()), (Some("bytes"), Some(3)), "{voids:?}");
+    assert!(voids.len() > 1 && voids.iter().all(|v| v["kind"] == "bytes" && v["k"].as_u64().unwrap() >= 3), "{voids:?}");
 }
