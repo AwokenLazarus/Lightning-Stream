@@ -48,6 +48,9 @@ use crate::ticket::{sats_ceil, Admit, SState, SellerSession, Terms, TicketPolicy
 use crate::ticket_http::{offers, Account, Due, Offer, PayTerms, Price, Receipt};
 use crate::{err, Result};
 
+mod draws;
+pub(crate) use draws::DrawSession;
+
 /// The most of a session endpoint's answer that is read.
 const SMALL_BODY: u64 = 1 << 20;
 /// How long the wallet looks for the last receipt of an answer that was sent as it arrived.
@@ -306,6 +309,9 @@ struct Call<'a> {
     body: &'a [u8],
     max_sats: i64,
     task: std::result::Result<String, String>,
+    /// SHA-256 of each piece of the answer's body, hex, where the caller knows them (a file whose
+    /// piece hashes it already holds): a piece paid by a draw gets its value only if it matches.
+    piece_hashes: Vec<String>,
 }
 
 /// What one call released: the hashes, the sats the book put in the ledger for them, and how many
@@ -464,11 +470,22 @@ impl Signer {
             return deny("xbt402", "402 without a readable PAYMENT-REQUIRED");
         };
         drop(probe);
-        let call = Call { url: &url, origin: &origin, method: &method, body: &raw, max_sats, task };
+        let piece_hashes: Vec<String> = p.get("piece_sha256").and_then(Value::as_array).into_iter().flatten().take(1 << 20)
+            .map(|h| h.as_str().unwrap_or("").to_ascii_lowercase()).collect();
+        let call = Call { url: &url, origin: &origin, method: &method, body: &raw, max_sats, task, piece_hashes };
         let mut passed: Vec<Value> = vec![];
-        for offer in offers(&pr, &lightning, &chain) {
+        let mut ways = offers(&pr, &lightning, &chain);
+        // tickets or draws first: one rule ([`crate::lottery::choose`]); the other is tried after it
+        if self.draws_first(&call, &ways, &lightning, &tp) {
+            if let Some(i) = ways.iter().position(|o| matches!(o, Offer::Lottery(_))) {
+                let l = ways.remove(i);
+                ways.insert(0, l);
+            }
+        }
+        for offer in ways {
             let rail = offer.rail();
             let tried = match &offer {
+                Offer::Lottery(acc) => self.lottery_pay(&call, acc, &lightning),
                 Offer::Ticket(acc, prepaid) => self.ticket_pay(&call, acc, prepaid.as_ref(), &lightning),
                 Offer::Lightning(_) if !listed => Tried::Next("the seller is not on the owner's allowlist: only a ticket task that pays any seller reaches it".into()),
                 Offer::Lightning(acc) => self.ln_exact_pay(&call, acc, &tp),
@@ -490,7 +507,8 @@ impl Signer {
         let offered: Vec<Value> = pr.get("accepts").and_then(Value::as_array).into_iter().flatten()
             .map(|a| {
                 let scheme = a.get("scheme").and_then(Value::as_str);
-                let scheme = if scheme == Some(xbt402::ticket::SCHEME) { xbt402::ticket::SCHEME } else if scheme == Some("exact") { "exact" }
+                let scheme = if scheme == Some(xbt402::ticket::SCHEME) { xbt402::ticket::SCHEME } else if scheme == Some(xbt402::lottery::SCHEME) { xbt402::lottery::SCHEME }
+                             else if scheme == Some("exact") { "exact" }
                              else if xbt402::wire::scheme_accepted(scheme) { xbt402::wire::SCHEME } else { "other" };
                 let network = match a.get("network").and_then(Value::as_str) {
                     Some(n) if n == lightning => "this wallet's Lightning network",
@@ -502,6 +520,31 @@ impl Signer {
         with(deny("no_rail", "the seller's 402 offers no way to pay that this wallet's policy allows: see rails_passed_over for what each entry needs"),
              json!({"charged_sats": 0, "rails_passed_over": passed, "offered": offered,
                     "wallet": {"lightning": lightning, "chain": chain, "tickets": tp.enabled, "ln": LnPolicy::from_map(&cfg.ln).enabled, "channel_rail": cfg.channel_rail}}))
+    }
+
+    /// Whether this seller is paid by draws before tickets are tried: what [`crate::lottery::choose`]
+    /// says of the two entries of its 402, the owner's policy, the call's limit, whether a held
+    /// ticket fits, and the session that is open with it, if one is.
+    fn draws_first(&self, c: &Call, ways: &[Offer], lightning: &str, tp: &TicketPolicy) -> bool {
+        let draw = ways.iter().find_map(|o| match o {
+            Offer::Lottery(acc) => crate::lottery::DrawTerms::parse(acc, lightning).ok(),
+            _ => None,
+        });
+        let ticket = ways.iter().find_map(|o| match o {
+            Offer::Ticket(acc, _) => Terms::parse(acc, lightning).ok(),
+            _ => None,
+        });
+        let Some(draw) = draw else { return false };
+        let task = c.task.as_deref().unwrap_or("");
+        let payee = draw.payee.clone();
+        crate::lottery::choose(&crate::lottery::Choice {
+            ticket_entry: ticket.is_some(), lottery_entry: true, lottery_on: tp.lottery.enabled,
+            meter: tp.tasks.get(task).map_or(crate::lottery::Meter::Auto, |t| t.meter),
+            // a session this process pays this origin by draws is the one that is open; else what the book holds open with the seller's node
+            open: if lock(&self.draw_http).contains_key(c.origin) { Some(true) } else { self.ticket_open_kind(&payee, c.origin) },
+            dearest_msat: draw.dearest_piece().unwrap_or(u64::MAX), ticket_msat: ticket.as_ref().map_or(u64::MAX, |t| t.ticket_msat),
+            expect_msat: (c.max_sats.max(0) as u64).saturating_mul(1000), held_fits: ticket.is_some() && self.ticket_held_fits(task),
+            stay_tickets: tp.lottery.stay_tickets.max(1) as u64 })
     }
 
     /// The frozen on-chain channel path of `xbt402_pay`, under the wallet's spend lock as before.
@@ -1589,6 +1632,11 @@ impl Signer {
     /// the caller to have cancelled, as before.
     pub(crate) fn ticket_stop(&self, p: &Value) -> Value {
         let sid = str_or_empty(p.get("session"));
+        // a session that pays by draws holds nothing: it is stopped, and the seller told
+        if let Some(done) = self.draw_stop_by_id(&sid) {
+            let _g = self.lock();
+            return with(self.ticket_stop_locked(&json!({"session": sid})), json!({"http": done}));
+        }
         if let Some(hs) = self.ticket_http_of(&sid) {
             let done = self.ticket_http_stop(&hs, "stopped by the caller", CANCEL_WAIT);
             let _g = self.lock();
@@ -1671,13 +1719,16 @@ impl Signer {
             }
             out.push(json!({"ticket_cancel_asked": self.ticket_cancel_recorded(&s, Duration::ZERO)}));
         }
+        out.extend(self.draw_http_tick());
         out
     }
 
     /// What the wallet counts for each session it pays over HTTP: for `ticket_status` and `channels`.
     pub(crate) fn ticket_http_public(&self) -> Vec<Value> {
         let slots: Vec<Arc<Slot>> = lock(&self.ticket_http).values().cloned().collect();
-        slots.iter().filter_map(|s| s.open.try_lock().ok().and_then(|o| o.as_ref().map(|h| h.public()))).collect()
+        let mut out: Vec<Value> = slots.iter().filter_map(|s| s.open.try_lock().ok().and_then(|o| o.as_ref().map(|h| h.public()))).collect();
+        out.extend(self.draw_http_public());
+        out
     }
 }
 

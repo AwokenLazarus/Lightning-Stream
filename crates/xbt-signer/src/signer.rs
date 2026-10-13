@@ -252,6 +252,8 @@ pub struct Signer {
     /// itself (for the thread that refills a pool behind a call).
     pub(crate) ticket_wire: Arc<dyn crate::ticket_pay::TicketWire>,
     pub(crate) ticket_http: Mutex<HashMap<String, Arc<crate::ticket_pay::Slot>>>,
+    /// The sessions this process pays by draws, by the seller's origin (`docs/TICKETS.md`, section 9).
+    pub(crate) draw_http: Mutex<HashMap<String, Arc<crate::ticket_pay::DrawSession>>>,
     pub(crate) ticket_cancel_tried: Mutex<HashSet<String>>,
     pub(crate) me: std::sync::OnceLock<std::sync::Weak<Signer>>,
     /// AGP-063 W4: the one-time code that enrols the first human key.
@@ -345,7 +347,7 @@ impl Signer {
                                 ticket_error: Mutex::new(None), ticket_seed: Mutex::new(None), ticket_synced: std::sync::atomic::AtomicBool::new(false),
                                 ticket_pace: crate::ticket_rail::Pace::default(),
                                 ticket_wire: opts.ticket_wire.clone().unwrap_or_else(|| Arc::new(crate::ticket_pay::UreqWire::default())),
-                                ticket_http: Mutex::new(HashMap::new()), ticket_cancel_tried: Mutex::new(HashSet::new()), me: std::sync::OnceLock::new(), enroll: Mutex::new(Default::default()),
+                                ticket_http: Mutex::new(HashMap::new()), draw_http: Mutex::new(HashMap::new()), ticket_cancel_tried: Mutex::new(HashSet::new()), me: std::sync::OnceLock::new(), enroll: Mutex::new(Default::default()),
                                 used_sigs: crate::admin::UsedSigs::new(&root.join(".run").join(crate::admin::USED_SIGS_FILE)) });
         let _ = s.me.set(Arc::downgrade(&s));
         // before any request: what the book holds locked is retired (a start may be a restore)

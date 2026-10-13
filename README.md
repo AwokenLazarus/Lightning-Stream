@@ -78,6 +78,14 @@ the full list, with a link for each, is [`docs/REFERENCES.md`](docs/REFERENCES.m
   every receipt against its own count, and cancels what is left when the session stops.
   `scripts/ticket_e2e_regtest.sh` runs it through a routing hop with the release binaries and a
   stock file server behind the gateway, a lying seller and a kill of each part included.
+- **The lottery, pay after a win (regtest only).** For pieces that cost less than a ticket and
+  for paying many sellers at once. The gateway offers it beside tickets and the wallet's
+  `xbt402_pay` chooses between them. Every piece is a draw the wallet's signer checks itself; a
+  win is paid at once by an ordinary Lightning payment, booked before it leaves and paid once,
+  and nothing is locked with any seller. `scripts/lottery_regtest.sh` runs it with the release
+  binaries on channels of 30 slots: a 100 MB file bought by draws, 100 sellers paid at once, a
+  buyer that never pays, a seller that lies about wins, and a kill of each part. The argument
+  that the draw is fair is our own and unreviewed.
 - **The on-chain one-way channel (frozen).** A direct channel anchored on the chain, for paying
   one seller piece by piece: the buyer signs a slightly larger running total for each piece and
   the seller settles once. It is kept in the tree and tested, off the main path, with no new
@@ -92,8 +100,9 @@ the full list, with a link for each, is [`docs/REFERENCES.md`](docs/REFERENCES.m
 ## What is being built
 
 Stream tickets. The ticket book in the wallet's signer, the seller gateway beside a Lightning
-node and the wallet's side of the HTTP 402 entry are built (above) and run on regtest. Next: the
-lottery for amounts smaller than a ticket, a signed list of what a seller sells, and packaging.
+node and the wallet's side of the HTTP 402 entry are built (above) and run on regtest, and so is
+the lottery for amounts smaller than a ticket, in its first form (below). Next: a signed list of
+what a seller sells, and packaging.
 The wire is written down as a draft in [`docs/TICKETS.md`](docs/TICKETS.md), and
 `scripts/ln_ticket_regtest.sh` reproduces its measurements on four Lightning Fork nodes (31 checks).
 Defaults in the design: 1,000-sat tickets, 2 in flight, a life of about 40 blocks. The buyer goes
@@ -122,7 +131,7 @@ A seller will need a Lightning node with inbound capacity, and a buyer a Lightni
 channel. `docs/LIMITS.md` states what the design gives up, and what the wallet's ticket book, its
 payer and the gateway do not do (the "Stream tickets" sections and "Seller gateway").
 
-### Lottery tickets (in design)
+### The lottery: amounts smaller than a ticket (built, its first form)
 
 Some pieces are worth less than the smallest payment worth sending: a routing node charges about
 1 sat to carry any payment, and a piece of a shared file may be worth a tenth of a sat. For those,
@@ -133,19 +142,32 @@ seller fixes its half before the session and the buyer sends its half after the 
 Income and cost are uneven in the short run and exact in the long run, as a miner's income is.
 Paying by lottery is an old idea and not ours: David Wheeler (1996) and Ronald Rivest (1997).
 
-There are two forms. In the first the buyer pays an ordinary invoice after a win: it is simple,
-nothing is locked ahead, and a buyer that does not pay gets about one win's worth of service
-free before the seller stops. In the second a win pays itself: the buyer locks one ticket with
-the seller, each roll gives the seller a small chance of drawing its secret, and the buyer
-cannot refuse. The aim of a win that enforces itself over Lightning is Paul Gerhart's, Jay
+**The first form is built: the buyer pays after a win.** The seller sends an ordinary Lightning
+invoice with each win and the wallet pays it at once. Nothing is locked ahead, no channel slot is
+held between wins, and a seller that leaves leaves nothing stuck. The gateway offers it beside
+tickets for every route whose pieces cost less than a win, and the wallet chooses: tickets for a
+piece worth a ticket or more and for a seller it stays with, draws for anything smaller and
+whenever it pays more sellers than tickets can be held with. The wallet's signer works out every
+draw itself and pays only a win it found, so neither a seller nor an agent can talk it into
+paying one that is not. On regtest, with the shipped binaries on channels of 30 slots
+(`scripts/lottery_regtest.sh`): a 100 MB file priced at a quarter of a sat a piece was bought by
+draws, and what the buyer's node paid was the wins the wallet booked, to the millisat; 100
+sellers were paid at once from one channel with no payment failed, at most 8 payments on their
+way at a time. **What it does not do**: it does not make a buyer pay. A buyer that never pays
+was served about one win's worth before the seller stopped it (measured: 0.8 to 1.4 wins' worth
+on average at a quarter of a sat a piece), and a seller that earns less than one win from a buyer
+can be paid nothing by a cheat. **The argument that the draw is fair is our own and nobody else
+has reviewed it.** `docs/TICKETS.md`, section 9, is the wire; `docs/LIMITS.md`, "The lottery",
+states the limits.
+
+**The second form is designed and not built: a win that pays itself.** The buyer locks one
+ticket with the seller, each roll gives the seller a small chance of drawing its secret, and the
+buyer cannot refuse. The aim of a win that enforces itself over Lightning is Paul Gerhart's, Jay
 Taylor's and Sri Aravinda Krishnan Thyagarajan's ("Probabilistic Atomic Swaps for Bitcoin and
 Friends", [arXiv:2605.04975](https://arxiv.org/abs/2605.04975), May 2026), who set it out and
 built it first; our construction differs from theirs and, unlike theirs, has no formal
-treatment. **Both forms are designed and were measured on a regtest lab. Neither is built
-into the wallet or a seller.** The second rests on an argument that no cryptographer has
-reviewed, and it will not be built until one has. `docs/LIMITS.md`, section "Lottery tickets
-(in design)", states the limits; `docs/TICKETS.md` reserves a place for it on the wire and does
-not specify it.
+treatment. It was measured on a regtest lab and rests on an argument that no cryptographer has
+reviewed; it will not be built until one has (`docs/LIMITS.md`, "The win that pays itself").
 
 ## What was retired
 

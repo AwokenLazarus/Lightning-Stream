@@ -76,6 +76,8 @@ cargo test -j2 --manifest-path tools/lazarus-crosscheck/Cargo.toml  # header/PoW
 ./scripts/ticket_book_regtest.sh    # the ticket book in the wallet's signer, through its socket
 ./scripts/gateway_regtest.sh        # the seller gateway with a test buyer
 ./scripts/ticket_e2e_regtest.sh     # the wallet pays the gateway: xbt402_pay over tickets through a hop, a lying seller, kills of each part
+./scripts/lottery_regtest.sh        # the lottery: xbt402_pay by draws through a hop, 100 sellers at once, a buyer that never pays, a lying seller, kills
+python3 scripts/lottery/draw.py check  # the lottery's draw, written a second time, against vectors/lottery_vectors.json
 ```
 
 Run heavy work under a CPU and memory cap:

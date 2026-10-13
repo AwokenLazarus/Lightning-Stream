@@ -22,7 +22,9 @@
 //! | Held tickets take at most half of a channel's slots. | [`Signer::ticket_book_sends`], on a channel listing read in that lock round: the book's held tickets against half of the smallest channel, and the payments pending on each channel (whoever's) against half of that channel. A listing that cannot be read is an error and locks nothing. |
 //! | A lock that fails for lack of a slot makes the wallet hold less. | [`Signer::ticket_lock`] gives every round's outcome to [`crate::ticket::Session::lock_round`]; [`crate::ticket::Book::want`] offers nothing during the wait. |
 //! | At most 8 ticket payments are with the router at once. | [`Pace`]: every send of a ticket, held or prepaid, enters it. |
-//! | A prepaid ticket is spent when it is paid, and bought one at a time. | [`Signer::ticket_prepay`]: every rule of a release, the ledger row and the book row (`released`) before the payment is sent; none while an earlier one of the session is not final. |
+//! | A prepaid ticket is spent when it is paid, and bought one at a time. | [`Signer::ticket_prepay`]: every rule of a release, the book row (`released`) and then the ledger row, both before the payment is sent; none while an earlier one of the session is not final. |
+//! | A win of the lottery is paid only for a draw the wallet worked out, once, as a prepaid ticket is paid. | [`Signer::lottery_pay_win`] takes a [`xbt402::lottery::Win`], which only the wallet's own check of a seller's reveal makes; [`Signer::ticket_book_prepay`] pays it only in the session it was drawn in, at that session's win size, and refuses a win that has a payment in the book that has not failed ([`crate::ticket::Book::win_payment`]). |
+//! | An ordinary payment is on the channel until it settles, so it stays inside the gate until then. | [`Signer::ticket_pay_ordinary`] holds its place in [`Pace`] until the node shows the payment over. |
 //!
 //! Locks: the wallet's spend lock, then the book's. No lock is held while the node routes a
 //! ticket, so a release never waits for a lock round.
@@ -63,12 +65,19 @@ const LIST_PAGES: usize = 50;
 pub const SEND_PARALLEL: usize = 8;
 
 /// The gate every ticket payment passes on its way to the node's router: at most
-/// [`SEND_PARALLEL`] are inside at once. Who waits here: the threads of lock rounds and of prepaid
-/// purchases, of which the owner's `tickets.max_sellers` bounds the number; each leaves when its
-/// send returns, which the Lightning rail's `timeout_s` bounds.
+/// [`SEND_PARALLEL`] are inside at once. A held ticket leaves when its send returns (it is locked,
+/// and what is locked is bounded by the slot budget); an ordinary payment (a prepaid ticket, a
+/// win of the lottery) stays inside until it is over, since it is pending on the channel until
+/// then. Who waits here: the threads of lock rounds, of prepaid purchases and of wins, of which
+/// the owner's `tickets.max_sellers` and each seller's unpaid wins bound the number; each leaves
+/// within what the Lightning rail's `timeout_s` bounds.
+///
+/// In order of arrival: with a hundred sellers' wins waiting, whoever came first goes first, so
+/// that no seller's win waits behind a later one's until that seller's grace has run out.
 #[derive(Default)]
 pub struct Pace {
-    inside: Mutex<usize>,
+    /// `(inside, the next number to hand out, the number that goes in next)`.
+    state: Mutex<(usize, u64, u64)>,
     left: Condvar,
 }
 
@@ -76,25 +85,36 @@ pub struct PaceGuard<'a>(&'a Pace);
 
 impl Pace {
     pub fn enter(&self) -> PaceGuard<'_> {
-        let mut n = self.inside.lock().unwrap_or_else(|p| p.into_inner());
-        while *n >= SEND_PARALLEL {
-            n = self.left.wait(n).unwrap_or_else(|p| p.into_inner());
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let mine = s.1;
+        s.1 += 1;
+        while s.0 >= SEND_PARALLEL || s.2 != mine {
+            s = self.left.wait(s).unwrap_or_else(|p| p.into_inner());
         }
-        *n += 1;
+        s.0 += 1;
+        s.2 += 1;
+        // the one behind may go in too, if there is room
+        self.left.notify_all();
         PaceGuard(self)
     }
 
     /// How many are inside now.
     pub fn inside(&self) -> usize {
-        *self.inside.lock().unwrap_or_else(|p| p.into_inner())
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).0
+    }
+
+    /// How many wait to go in.
+    pub fn waiting(&self) -> u64 {
+        let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        s.1 - s.2
     }
 }
 
 impl Drop for PaceGuard<'_> {
     fn drop(&mut self) {
-        let mut n = self.0.inside.lock().unwrap_or_else(|p| p.into_inner());
-        *n = n.saturating_sub(1);
-        self.0.left.notify_one();
+        let mut s = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        s.0 = s.0.saturating_sub(1);
+        self.0.left.notify_all();
     }
 }
 
@@ -561,7 +581,7 @@ impl Signer {
                 return Ok(refusal("velocity", format!("already {} payments in the last {}s (a ticket session is one payment: tickets.velocity)",
                                                       cfg.velocity_max, cfg.velocity_window_s)));
             }
-            let s = Session { id, payee: terms.payee.clone(), origin: origin.chars().take(200).collect(), task: task_name.clone(),
+            let s = Session { draws: None, id, payee: terms.payee.clone(), origin: origin.chars().take(200).collect(), task: task_name.clone(),
                               listed, ticket_msat: size.ticket_msat, pool: size.pool, max_tickets: terms.max_tickets, ticket_blocks: terms.ticket_blocks,
                               max_sats, state: SState::Open, opened_ts: now, active_ts: now, stopped_ts: 0.0, closed_ts: 0.0, why: String::new(), http: None,
                               prepaid_msat, slot_fails, hold_until, hold_why };
@@ -611,7 +631,7 @@ impl Signer {
                 if st.book.tickets.contains_key(&hash) {
                     continue;
                 }
-                rows.push(Ticket { hash: hash.clone(), nonce, session: sid.clone(), payee: s.payee.clone(), task: s.task.clone(), msat: s.ticket_msat,
+                rows.push(Ticket { win: 0, hash: hash.clone(), nonce, session: sid.clone(), payee: s.payee.clone(), task: s.task.clone(), msat: s.ticket_msat,
                                    fee_limit_msat: 0, state: TState::Offered, ts: now, sent_ts: 0.0, invoice_expires: 0.0, released_ts: 0.0, booked_sats: 0,
                                    cltv_until: 0, final_expiry: 0, fee_msat: 0, done_ts: 0.0, note: String::new(), prepaid: false }.row());
                 hashes.push(hash);
@@ -1246,7 +1266,7 @@ impl Signer {
         let (msat, _) = paid_msat(p);
         let made = payment_ts(p).unwrap_or(now);
         let fee_limit_msat = (lp.fee_limit_sats(sats_ceil(msat)).max(0) as u64).saturating_mul(1000);
-        let t = Ticket { hash: hash.into(), nonce, session: String::new(), payee, task: RECOVERED_TASK.into(), msat, fee_limit_msat, state: TState::Sending,
+        let t = Ticket { win: 0, hash: hash.into(), nonce, session: String::new(), payee, task: RECOVERED_TASK.into(), msat, fee_limit_msat, state: TState::Sending,
                          ts: made, sent_ts: made, invoice_expires: 0.0, released_ts: 0.0, booked_sats: 0, cltv_until: 0, final_expiry: 0, fee_msat: 0,
                          done_ts: 0.0, note: String::new(), prepaid };
         self.ticket_audit("ticket_recovered", json!({"payment_hash": hash, "dest": format!("ln:{}", t.payee), "msat": msat.to_string(),
@@ -1275,11 +1295,32 @@ impl Signer {
     /// sent, and one is bought at a time. Not a socket method: only the wallet's own payer, which
     /// read the seller's terms itself, calls this.
     pub(crate) fn ticket_prepay(&self, p: &Value) -> Value {
+        self.ticket_pay_ordinary(&str_or_empty(p.get("session")), str_or_empty(p.get("invoice")).trim(), &str_or_empty(p.get("hash")), None)
+    }
+
+    /// Pay one win of a session that pays by draws: the seller's invoice for it, checked, booked
+    /// as spent and paid. `win` is a draw the wallet worked out itself and found won
+    /// ([`xbt402::lottery::Buyer::absorb`] is the only place one is made): a seller's or a caller's
+    /// word that something was won reaches no payment. A win is paid as a prepaid ticket is, under
+    /// every rule of a release, and once: while a payment for it is in the book and has not
+    /// failed, a second invoice for the same win is refused. Not a socket method.
+    pub(crate) fn lottery_pay_win(&self, sid: &str, win: &xbt402::lottery::Win, invoice: &str) -> Value {
+        self.ticket_pay_ordinary(sid, invoice.trim(), "", Some(win))
+    }
+
+    /// An ordinary payment of a session, booked before it is sent: a prepaid ticket (`win` None),
+    /// or the win of a draw.
+    fn ticket_pay_ordinary(&self, sid: &str, invoice: &str, named: &str, win: Option<&xbt402::lottery::Win>) -> Value {
         if let Some(d) = self.ticket_shut() {
             return d;
         }
-        let sid = str_or_empty(p.get("session"));
-        let invoice = str_or_empty(p.get("invoice")).trim().to_string();
+        // the names of the two things this pays, for its refusals and its log lines
+        let (failed, pending, unproven, paid_kind, what) = match win {
+            None => ("ticket_prepay_failed", "ticket_prepay_pending", "ticket_prepay_unproven", "ticket_prepaid", "the prepaid ticket"),
+            Some(_) => ("lottery_win_failed", "lottery_win_pending", "lottery_win_unproven", "lottery_win_paid", "the win"),
+        };
+        let sid = sid.to_string();
+        let invoice = invoice.to_string();
         let (ln, lp, session) = {
             let _g = self.lock();
             let tp = match self.ticket_synced() {
@@ -1301,6 +1342,12 @@ impl Signer {
             (ln, lp, session)
         };
         let dest = format!("ln:{}", session.payee);
+        // through the gate, from its checks to its end: at most 8 ordinary payments are being made at once. The
+        // checks ask the wallet's two nodes several questions each, and a hundred sellers' wins asking at once got
+        // no answer from the chain node for 3 of 309 (seen on the lab). And such a payment is pending on the wallet's
+        // channel until it has settled, so the gate is also what keeps at most 8 of them there. (Leaving when the
+        // send returned, as a held ticket does, let 24 wins be pending on a 30-slot channel, and 47 of 313 failed.)
+        let _inside = self.ticket_pace.enter();
         if let Err(d) = self.ln_node_checks(&*ln, &lp, &dest, "") {
             return with(d, json!({"rail": "ticket"}));
         }
@@ -1313,7 +1360,8 @@ impl Signer {
         let tp_now = self.ticket_policy();
         let relaxed = LnPolicy { min_expiry_s: 0, max_cltv_blocks: i64::MAX, require_description: false, ..lp.clone() };
         let refuse = |hash: &str, rule: &str, why: String| {
-            self.ticket_audit("ticket_refused", json!({"session": sid, "dest": dest, "payment_hash": hash, "rule": rule, "reason": why, "prepaid": true}));
+            self.ticket_audit("ticket_refused", json!({"session": sid, "dest": dest, "payment_hash": hash, "rule": rule, "reason": why, "prepaid": true,
+                                                       "win": win.map(xbt402::lottery::Win::draw)}));
             with(refusal(rule, why), json!({"session": sid}))
         };
         let inv = match bolt11::decode(&invoice) {
@@ -1321,9 +1369,8 @@ impl Signer {
             Err(e) => return refuse("", "ticket_invoice", format!("not a valid BOLT 11 invoice: {e}")),
         };
         let hash = inv.payment_hash_hex();
-        let named = str_or_empty(p.get("hash"));
         if !named.is_empty() && named != hash {
-            return refuse(&named, "ticket_hash", "the invoice is for another payment hash than the one it was returned for".into());
+            return refuse(named, "ticket_hash", "the invoice is for another payment hash than the one it was returned for".into());
         }
         if let Err((rule, why)) = check_invoice(&inv, &self.chain, now, &relaxed, "") {
             return refuse(&hash, &rule, why);
@@ -1342,25 +1389,32 @@ impl Signer {
         // every rule of a release, the ledger and the book, under the wallet's spend lock
         let booked = {
             let _g = self.lock();
-            self.ticket_book_prepay(&sid, &hash, &invoice, &inv, &lp, &routes.ids)
+            self.ticket_book_prepay(&sid, &hash, &invoice, &inv, &lp, &routes.ids, win)
         };
         let send = match booked {
             Ok(Ok(s)) => s,
             Ok(Err(d)) => return d,
             Err(e) => return refusal("ticket", e.msg),
         };
-        // the node routes it; no lock is held. An ordinary payment is over in a moment, and its end is waited for
-        let sent = {
-            let _inside = self.ticket_pace.enter();
-            ln.send_held(&send)
+        // the node routes it; no lock is held. An ordinary payment is over in a moment, and its end is waited for,
+        // still inside the gate
+        let mut pmt = {
+            let mut pmt = match ln.send_held(&send) {
+                Ok(p) => Some(p),
+                Err(_) => ln.lookup(&hash).ok().flatten(),
+            };
+            let deadline = Instant::now() + Duration::from_secs(lp.timeout_s.clamp(1, 600) as u64 + 5);
+            while pmt.as_ref().is_none_or(|p| !payment_over(p)) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+                if let Ok(Some(p)) = ln.lookup(&hash) {
+                    pmt = Some(p);
+                }
+            }
+            pmt
         };
-        let mut pmt = match sent {
-            Ok(p) => Some(p),
-            Err(_) => ln.lookup(&hash).ok().flatten(),
-        };
-        let deadline = Instant::now() + Duration::from_secs(lp.timeout_s.clamp(1, 600) as u64 + 5);
-        while pmt.as_ref().is_none_or(|p| !payment_over(p)) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(50));
+        drop(_inside);
+        // once more outside the gate, for a payment whose end the node had not shown inside the wait
+        if pmt.as_ref().is_none_or(|p| !payment_over(p)) {
             if let Ok(Some(p)) = ln.lookup(&hash) {
                 pmt = Some(p);
             }
@@ -1379,29 +1433,34 @@ impl Signer {
             Ok(None) => return refusal("ticket", "the book lost a ticket"),
             Err(e) => return refusal("ticket", e.msg),
         };
-        let about = json!({"rail": "ticket", "session": sid, "hash": hash, "prepaid": true, "ticket_msat": t.msat.to_string()});
+        let about = json!({"rail": "ticket", "session": sid, "hash": hash, "prepaid": true, "ticket_msat": t.msat.to_string(), "win": win.map(xbt402::lottery::Win::draw),
+                           "fee_msat": t.fee_msat.to_string()});
         match t.state {
             TState::Settled => {
                 let preimage = pmt.as_ref().map(preimage_bytes).unwrap_or_default();
                 if !preimage_proves(&preimage, &hash) {
-                    return with(refusal("ticket_prepay_unproven", "the node shows the prepaid ticket paid without the preimage of its hash: it is booked, and \
-                                                                   nothing can be shown to the seller"), with(about, json!({"charged_sats": t.booked_sats})));
+                    return with(refusal(unproven, format!("the node shows {what} paid without the preimage of its hash: it is booked, and nothing can be shown to the seller")),
+                                with(about, json!({"charged_sats": t.booked_sats})));
                 }
-                self.ticket_audit("ticket_prepaid", json!({"session": sid, "dest": dest, "payment_hash": hash, "spent_sats": t.booked_sats}));
+                self.ticket_audit(paid_kind, json!({"session": sid, "dest": dest, "payment_hash": hash, "spent_sats": t.booked_sats,
+                                                    "win": win.map(xbt402::lottery::Win::draw)}));
                 // the preimage is what the buyer shows the seller for its credit: it moves no money any more
                 with(json!({"verdict": "allow", "ticket_secret": hex::encode(&preimage), "charged_sats": t.booked_sats}), about)
             }
-            TState::Failed => with(refusal("ticket_prepay_failed", format!("the payment of the prepaid ticket failed ({}): nothing was spent", t.note)), about),
+            TState::Failed => with(refusal(failed, format!("the payment of {what} failed ({}): nothing was spent", t.note)), about),
             // not final within the wait: booked, and the node's word decides later
-            _ => with(with(refusal("ticket_prepay_pending", "the payment of the prepaid ticket is not final yet: it is booked as spent until the wallet's node \
-                                                             shows it failed"), about), json!({"verdict": "pending", "charged_sats": t.booked_sats})),
+            _ => with(with(refusal(pending, format!("the payment of {what} is not final yet: it is booked as spent until the wallet's node shows it failed")), about),
+                      json!({"verdict": "pending", "charged_sats": t.booked_sats})),
         }
     }
 
-    /// The rules and the two rows of a prepaid ticket (the caller holds the spend lock): what
-    /// [`Self::ticket_release_locked`] checks of a held ticket's release, then the ledger row, then
-    /// the book row, then the signature log. Returns the send; an `Err` inside is the refusal.
-    fn ticket_book_prepay(&self, sid: &str, hash: &str, invoice: &str, inv: &Invoice, lp: &LnPolicy, ids: &[String]) -> Result<std::result::Result<HeldSend, Value>> {
+    /// The rules and the two rows of a prepaid ticket, or of a win (the caller holds the spend
+    /// lock): what [`Self::ticket_release_locked`] checks of a held ticket's release, then the
+    /// book row, then the ledger row, then the signature log. Returns the send; an `Err` inside is
+    /// the refusal.
+    #[allow(clippy::too_many_arguments)]
+    fn ticket_book_prepay(&self, sid: &str, hash: &str, invoice: &str, inv: &Invoice, lp: &LnPolicy, ids: &[String], win: Option<&xbt402::lottery::Win>)
+                          -> Result<std::result::Result<HeldSend, Value>> {
         let tp = match self.ticket_synced() {
             Ok(t) => t,
             Err(d) => return Ok(Err(d)),
@@ -1414,6 +1473,15 @@ impl Signer {
         if s.prepaid_msat == 0 {
             return Ok(Err(refusal("ticket_terms", "this seller's terms offer no prepaid tickets")));
         }
+        // a session pays by draws or by tickets, never by both: a win is paid only in the session it was drawn in,
+        // at that session's win size, and a prepaid ticket only in a ticket session
+        match (&s.draws, win) {
+            (None, None) => {}
+            (Some(d), Some(w)) if !d.seller.is_empty() && d.seller == w.session() && w.win_msat() == s.prepaid_msat => {}
+            (Some(_), Some(_)) => return Ok(Err(refusal("lottery_win", "the win is not one of this session, or not of its win size: it is not paid here"))),
+            (Some(_), None) => return Ok(Err(refusal("lottery_win", "a session that pays by draws pays only for a win the wallet worked out itself"))),
+            (None, Some(_)) => return Ok(Err(refusal("lottery_session", "this session pays with tickets: no win is paid in it"))),
+        }
         let Some(task) = tp.tasks.get(&s.task) else {
             return Ok(Err(refusal("ticket_task", format!("the owner's policy no longer names the task {:?}", s.task))));
         };
@@ -1425,9 +1493,28 @@ impl Signer {
         if st.book.tickets.contains_key(hash) {
             return Ok(Err(refusal("ticket_replay", "the wallet has paid, or is paying, a ticket for this hash: a hash is paid once")));
         }
-        if let Some(t) = st.book.prepaid_pending(sid) {
-            return Ok(Err(with(refusal("ticket_prepaid_pending", "an earlier prepaid ticket of this session is not final on the wallet's node: the next is bought after it"),
-                               json!({"session": sid, "hash": t.hash}))));
+        match win {
+            None => {
+                if let Some(t) = st.book.prepaid_pending(sid) {
+                    return Ok(Err(with(refusal("ticket_prepaid_pending", "an earlier prepaid ticket of this session is not final on the wallet's node: the next is bought after it"),
+                                       json!({"session": sid, "hash": t.hash}))));
+                }
+            }
+            Some(w) => {
+                if !tp.lottery.enabled {
+                    return Ok(Err(refusal("lottery_disabled", "paying by draws is off in this policy (tickets.lottery.enabled)")));
+                }
+                // one win, one payment: a second invoice for a win that has a payment gets nothing, whatever its hash
+                if let Some(t) = st.book.win_payment(sid, w.draw()) {
+                    return Ok(Err(with(refusal("lottery_win_paid", format!("win {} of this session has a payment in the wallet's book ({}): a win is paid once",
+                                                                           w.draw(), t.state.as_str())), json!({"session": sid, "hash": t.hash}))));
+                }
+                // what one seller the owner has not named can be paid by luck or by lies about its prices: so many wins a window
+                if !listed && st.book.wins_since(&s.payee, &s.task, now - task.window_s as f64) as i64 >= tp.lottery.unlisted_max_wins {
+                    return Ok(Err(refusal("lottery_wins_cap", format!("{} wins were paid to this seller in the task's window, and the owner has not named it \
+                                                                       (tickets.lottery.unlisted_max_wins)", tp.lottery.unlisted_max_wins))));
+                }
+            }
         }
         if tp.max_sends_per_hour > 0 && st.book.sends_since(now - 3600.0) as i64 >= tp.max_sends_per_hour {
             return Ok(Err(refusal("ticket_rate_limit", format!("already {} ticket payments sent to the node in the last hour (tickets.max_sends_per_hour)", tp.max_sends_per_hour))));
@@ -1458,19 +1545,26 @@ impl Signer {
         let seed = self.ticket_seed(&st.book)?;
         let nonce = random_bytes::<16>();
         sigaudit::set_rule(&format!("policy:{}", d.rule));
-        // 1. the spend, in the ledger: a prepaid ticket is spent when it is paid, used or not
-        if !self.engine.commit_once(&pay, &ledger_id(hash))? {
-            self.engine.store.amend(&ledger_id(hash), Some(sats))?;
-        }
-        // 2. the ticket in the book, booked, before the node sees its invoice
-        let t = Ticket { hash: hash.to_string(), nonce, session: sid.to_string(), payee: s.payee.clone(), task: s.task.clone(), msat: s.prepaid_msat, fee_limit_msat,
+        // 1. the ticket in the book, booked. The book first: this ticket has no row yet, and a ledger row
+        // that the book has never heard of would be looked after by nobody. (Killed between the two writes
+        // the other way round, a wallet kept such a row for good: found on the lab.) The payment is sent
+        // only after both, so the book is never ahead of money that has left
+        let win_draw = win.map_or(0, xbt402::lottery::Win::draw);
+        let t = Ticket { win: win_draw, hash: hash.to_string(), nonce, session: sid.to_string(), payee: s.payee.clone(), task: s.task.clone(), msat: s.prepaid_msat, fee_limit_msat,
                          state: TState::Released, ts: now, sent_ts: now, invoice_expires: inv.expires_at() as f64, released_ts: now, booked_sats: sats,
                          cltv_until: 0, final_expiry: 0, fee_msat: 0, done_ts: 0.0, note: String::new(), prepaid: true };
         s.active_ts = now;
         st.commit(&[t.row(), s.row()])?;
+        // 2. the spend, in the ledger, before the node sees the invoice: a prepaid ticket is spent when it is
+        // paid, used or not. Killed before this, the ticket above is given up when no payment of its age can
+        // still be on its way, and was never sent
+        if !self.engine.commit_once(&pay, &ledger_id(hash))? {
+            self.engine.store.amend(&ledger_id(hash), Some(sats))?;
+        }
         // 3. the signature log, which the anchor witness covers
-        self.sigaudit.record("ticket_prepay", &[], "", &dest, json!({"payment_hash": hash, "session": sid, "booked_sats": sats}))?;
-        self.ticket_audit("ticket_prepay", json!({"session": sid, "dest": dest, "payment_hash": hash, "booked_sats": sats, "task": s.task}));
+        let kind = if win.is_some() { "lottery_win_pay" } else { "ticket_prepay" };
+        self.sigaudit.record(kind, &[], "", &dest, json!({"payment_hash": hash, "session": sid, "booked_sats": sats, "win": win_draw}))?;
+        self.ticket_audit(kind, json!({"session": sid, "dest": dest, "payment_hash": hash, "booked_sats": sats, "task": s.task, "win": win_draw}));
         Ok(Ok(HeldSend { invoice: invoice.to_string(), fee_limit_msat: fee_limit_msat.max(1), timeout_s: lp.timeout_s.max(1), cltv_limit: tp.max_htlc_blocks,
                          outgoing_chan_ids: ids.to_vec(), tag: seed.prepaid_tag(&nonce, &raw).to_vec() }))
     }
@@ -1704,6 +1798,173 @@ impl Signer {
     }
 }
 
+// --- sessions that pay by draws (`crate::ticket_pay`, its `draws` part) ----------------------------------
+
+impl Signer {
+    /// Whether a held ticket can be locked with one more seller of `task` now: the slot budget of
+    /// the wallet's own channels and the owner's caps on held tickets have room. What the rule for
+    /// which way a seller is paid asks ([`crate::lottery::choose`]); a channel list that cannot be
+    /// read counts as 30 slots, as it does when a session opens.
+    pub(crate) fn ticket_held_fits(&self, task: &str) -> bool {
+        let tp = self.ticket_policy();
+        let Some(t) = tp.tasks.get(task) else { return false };
+        let limits = self.ticket_limits_read().unwrap_or_else(Limits::unseen);
+        let Ok(g) = self.ticket_store() else { return false };
+        let Some(st) = g.as_ref() else { return limits.budget() >= 1 };
+        let committed = st.book.pools_open();
+        let to_fill = committed.saturating_sub(st.book.locked(|_| true).tickets).max(0);
+        limits.room(committed, to_fill).min(tp.max_locked_tickets.saturating_sub(committed)).min(t.max_locked_tickets.saturating_sub(st.book.pools_open_in(Some(task)))) >= 1
+    }
+
+    /// Whether a win of a session has a payment in the book that has not failed: one that is paid,
+    /// or may still be.
+    pub(crate) fn lottery_win_live(&self, sid: &str, draw: u64) -> bool {
+        // a book that cannot be read is no licence to pay again
+        self.ticket_store().map_or(true, |g| g.as_ref().is_none_or(|st| st.book.win_payment(sid, draw).is_some()))
+    }
+
+    /// Whether the open session with this seller at `origin`, if there is one, pays by draws.
+    pub(crate) fn ticket_open_kind(&self, payee: &str, origin: &str) -> Option<bool> {
+        let g = self.ticket_store().ok()?;
+        let book = &g.as_ref()?.book;
+        if book.draws_open_with(payee, origin).is_some() {
+            return Some(true);
+        }
+        book.open_with(payee).map(|_| false)
+    }
+
+    /// Whether the wallet's node has an active channel of its own to `payee`: a win paid over it
+    /// meets no routing node and pays no fee. False when the channels cannot be read.
+    fn ln_direct_to(&self, payee: &str) -> bool {
+        let Some(ln) = self.ln.clone() else { return false };
+        ln.channels().is_ok_and(|cs| cs.iter().any(|c| c.get("active").and_then(Value::as_bool) == Some(true) && str_or_empty(c.get("remote_pubkey")).eq_ignore_ascii_case(payee)))
+    }
+
+    /// Open a session that pays one seller by draws under one of the owner's tasks (the caller
+    /// holds the spend lock). `terms` is the lottery entry of the 402 the signer itself fetched;
+    /// `expect_sats` is what the call may use. Nothing is paid and nothing is locked: a session of
+    /// draws holds no ticket. The win size is decided here, once, inside the owner's bounds.
+    pub(crate) fn lottery_open_locked(&self, p: &Value) -> Value {
+        if let Some(d) = self.ticket_shut() {
+            return d;
+        }
+        let tp = match self.ticket_synced() {
+            Ok(t) => t,
+            Err(d) => return d,
+        };
+        if !tp.lottery.enabled {
+            return refusal("lottery_disabled", "paying by draws is off in this policy (tickets.lottery.enabled)");
+        }
+        let task_name = str_or_empty(p.get("task"));
+        let Some(task) = tp.tasks.get(&task_name) else {
+            return refusal("ticket_task", format!("the owner's policy names no task {task_name:?} (tickets.tasks): a win is paid only under a task with a budget"));
+        };
+        let expect_msat = py_int(p.get("expect_sats")).filter(|n| *n >= 0).map_or(0, |s| (s as u64).saturating_mul(1000));
+        let net = match node::network(&*self.node, &self.chain, None) {
+            Ok(n) => n.replacen("bip122:", "lightning:", 1),
+            Err(e) => return refusal("ticket_network", e.msg),
+        };
+        let terms = match crate::lottery::DrawTerms::parse(p.get("terms").unwrap_or(&Value::Null), &net) {
+            Ok(t) => t,
+            Err((rule, why)) => return refusal(rule, why),
+        };
+        if i64::from(terms.win_blocks) > tp.max_ticket_blocks {
+            return refusal("ticket_blocks", format!("a win's invoice has a final CLTV delta of {}, above the owner's tickets.max_ticket_blocks {}", terms.win_blocks,
+                                                    tp.max_ticket_blocks));
+        }
+        let cfg = self.config();
+        let origin = str_or_empty(p.get("origin"));
+        let listed = self.ticket_listed(&cfg, &terms.payee, &origin);
+        if !listed && task.admit != Admit::Any {
+            return refusal("ticket_admission", format!("the owner has not named the seller {} and task {task_name:?} pays only named sellers \
+                                                        (the allowlist, or tickets.tasks.{task_name}.admit \"any\")", terms.payee));
+        }
+        let direct = self.ln_direct_to(&terms.payee);
+        let win_msat = match crate::lottery::win_size(&terms, &tp.lottery, listed, expect_msat, direct) {
+            Ok(w) => w,
+            Err((rule, why)) => return refusal(rule, why),
+        };
+        let now = self.engine.now();
+        let out = (|| -> Result<Value> {
+            let mut g = self.ticket_store()?;
+            let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
+            self.ticket_seed(&st.book)?;
+            if let Some(s) = st.book.draws_open_with(&terms.payee, &origin) {
+                return Ok(with(refusal("ticket_session_exists", "a session with this seller is open: stop it first"), json!({"session": s.id})));
+            }
+            if st.book.open_sessions(None) as i64 >= tp.max_sellers {
+                return Ok(refusal("ticket_sellers", format!("{} sessions are open (tickets.max_sellers)", tp.max_sellers)));
+            }
+            if st.book.open_sessions(Some(&task_name)) as i64 >= task.max_sellers {
+                return Ok(refusal("ticket_sellers", format!("task {task_name:?} has {} sessions open (its max_sellers)", task.max_sellers)));
+            }
+            if st.book.opened_since(now - 60.0) as i64 >= tp.max_new_sellers_per_min {
+                return Ok(refusal("ticket_sellers", format!("{} sessions were opened in the last minute (tickets.max_new_sellers_per_min)", tp.max_new_sellers_per_min)));
+            }
+            let lp = LnPolicy::from_map(&cfg.ln);
+            let one = booking_sats(win_msat, (lp.fee_limit_sats(sats_ceil(win_msat)).max(0) as u64).saturating_mul(1000));
+            // no human can approve a win as it is drawn: a win that would need one is refused here
+            if one >= cfg.human_threshold_sats || one > cfg.max_per_tx_sats {
+                return Ok(refusal("lottery_win_size", format!("one win with its fee limit is {one} sats: at or above human_threshold_sats {} or above max_per_tx_sats {}",
+                                                              cfg.human_threshold_sats, cfg.max_per_tx_sats)));
+            }
+            // spend by draws is lumpy: a budget that cannot pay one win and its fee can pay nothing at all
+            let dest = format!("ln:{}", terms.payee);
+            let (_, _, cap_spend, seller_window) = Self::ticket_seller_caps(&cfg, &tp, task, listed);
+            let spent = self.ticket_spent(now, &task_name, task.window_s as f64, &dest, seller_window)?;
+            let over = [(spent.task.saturating_add(one), task.budget_sats, "ticket_task_budget", "the task's budget_sats"),
+                        (spent.seller.saturating_add(one), cap_spend, "ticket_seller_cap", "the owner's cap on sats paid to this seller")];
+            if let Some((have, cap, rule, name)) = over.iter().find(|(have, cap, _, _)| have > cap) {
+                return Ok(refusal(rule, format!("one win and its fee limit are {one} sats: with it, {have} would be above {name} ({cap}), so no win could be paid")));
+            }
+            let id = crate::policy::token_urlsafe();
+            if tp.velocity == ticket::Velocity::Session && self.engine.velocity_used(&ticket::memo(&task_name, &id))? >= cfg.velocity_max {
+                return Ok(refusal("velocity", format!("already {} payments in the last {}s (a session of draws is one payment: tickets.velocity)",
+                                                      cfg.velocity_max, cfg.velocity_window_s)));
+            }
+            let s = Session { draws: Some(ticket::Draws::default()), id, payee: terms.payee.clone(), origin: origin.chars().take(200).collect(), task: task_name.clone(),
+                              listed, ticket_msat: win_msat, pool: 0, max_tickets: 0, ticket_blocks: terms.win_blocks, max_sats: 0, state: SState::Open,
+                              opened_ts: now, active_ts: now, stopped_ts: 0.0, closed_ts: 0.0, why: String::new(), http: None, prepaid_msat: win_msat, slot_fails: 0,
+                              hold_until: 0.0, hold_why: String::new() };
+            st.commit(&[s.row()])?;
+            self.ticket_audit("lottery_open", json!({"session": s.id, "dest": dest, "task": s.task, "listed": listed, "win_msat": win_msat.to_string(), "direct": direct,
+                                                     "expect_msat": expect_msat.to_string()}));
+            Ok(with(with(json!({"verdict": "allow", "rail": "lottery", "win_msat": win_msat.to_string(), "direct": direct, "one_win_sats": one}), s.public()),
+                    json!({"task_budget_left_sats": (task.budget_sats - spent.task).max(0)})))
+        })();
+        out.unwrap_or_else(|e| refusal("ticket", e.msg))
+    }
+
+    /// Write the seller's side of a session of draws into its row: the seller's name for the
+    /// session and the anchor of its chain. An anchor a session of this book was opened on before
+    /// is refused: the seller reuses a chain, and its values are no longer unknown.
+    pub(crate) fn lottery_bind(&self, sid: &str, seller: &str, anchor: &str) -> Result<()> {
+        let _g = self.lock();
+        let mut g = self.ticket_store()?;
+        let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
+        if st.book.anchor_seen(anchor) {
+            return Err(err("lottery_anchor_reused", "the seller opened this session on a chain it has used with this wallet before"));
+        }
+        let mut s = st.book.sessions.get(sid).filter(|s| s.state == SState::Open && s.draws.is_some()).cloned().ok_or_else(|| err("ticket_session", "no such open session"))?;
+        s.draws = Some(ticket::Draws { seller: seller.into(), anchor: anchor.into() });
+        st.commit(&[s.row()])
+    }
+
+    /// The session was used now: it is not idle.
+    pub(crate) fn lottery_touch(&self, sid: &str) {
+        let now = self.engine.now();
+        let _ = (|| -> Result<()> {
+            let mut g = self.ticket_store()?;
+            let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
+            if let Some(mut s) = st.book.sessions.get(sid).filter(|s| s.state == SState::Open && now - s.active_ts > 30.0).cloned() {
+                s.active_ts = now;
+                st.commit(&[s.row()])?;
+            }
+            Ok(())
+        })();
+    }
+}
+
 /// An offered hash of a session that ended: it can no longer take an invoice.
 fn dropped(t: &Ticket, now: f64) -> Value {
     let mut t = t.clone();
@@ -1743,6 +2004,34 @@ mod tests {
             panic!("the send died");
         }).join());
         assert!(died.is_err() && pace.inside() == 0);
+    }
+
+    #[test]
+    fn payments_go_through_the_gate_in_the_order_they_came() {
+        // 8 hold the gate; 40 more arrive one after another and wait; when the gate opens they go in as they came
+        let pace = Pace::default();
+        let order = Mutex::new(vec![]);
+        std::thread::scope(|sc| {
+            let holders: Vec<PaceGuard<'_>> = (0..SEND_PARALLEL).map(|_| pace.enter()).collect();
+            for i in 0..40u64 {
+                let (pace, order) = (&pace, &order);
+                sc.spawn(move || {
+                    let _inside = pace.enter();
+                    order.lock().unwrap().push(i);
+                    std::thread::sleep(Duration::from_millis(2));
+                });
+                // the next comes when this one is in the queue
+                while pace.waiting() <= i {
+                    std::thread::yield_now();
+                }
+            }
+            assert_eq!((pace.waiting(), pace.inside()), (40, SEND_PARALLEL));
+            drop(holders);
+        });
+        let order = order.into_inner().unwrap();
+        // 8 are inside at once, so neighbours may write in either order; nobody is overtaken by more than those beside it
+        assert!(order.iter().enumerate().all(|(at, i)| (at as i64 - *i as i64).unsigned_abs() < SEND_PARALLEL as u64), "{order:?}");
+        assert_eq!((pace.waiting(), pace.inside()), (0, 0));
     }
 
     #[test]
