@@ -4,18 +4,31 @@
 # wire; scripts/ticket_book/drive.py plays the agent (it calls the signer's socket and speaks HTTP
 # to the seller) and the sellers (an HTTP stand-in in front of each seller's node, honest or lying).
 #
-#     lf1 ---- lf2 ---- s01 ... s20
+#     lf1 ---- lf2 ---- s01 ... s16
 #    buyer     hop      sellers
 #
+# The wallet's policy sets no pool and no cap on held tickets: the wallet as it ships. The hop is
+# started with --default-remote-max-htlcs=30, so the buyer's channel carries 30 pending payments
+# towards it: the slot count of a channel with a Core Lightning node at its default. It is a
+# stand-in for that number only. No Core Lightning node is in this lab: a Core Lightning node also
+# limits what it sends, and its dust limit is 546 sat where a Lightning Fork node's is 354.
+#
 # It prints PASS or FAIL for each check with what it saw:
-#   one seller through the hop: 8 tickets locked, 5 released with five paid requests, stop: 5
-#     settled, 3 cancelled, the signer's book and the buyer's node agree, the routing fees booked;
+#   one seller through the hop: 2 tickets locked, 5 released with five paid requests and the next
+#     locked each time one is left, stop: 5 settled, 2 cancelled, the signer's book and the buyer's
+#     node agree, the routing fees booked;
 #   a seller that lies (another payee, another amount, a longer life, a hash that is not the
 #     buyer's, replayed invoices, terms above the owner's bounds): nothing is paid;
 #   the book against the node after a kill of the signer, a restart of the buyer's node, a seller
 #     that neither settles nor cancels until its tickets expire, a restore of the wallet's files
 #     from an older copy;
-#   20 sellers the owner has not named, 2 tickets each, under one task's budget;
+#   15 sellers, 14 of them not named by the owner, 1 ticket each: 15 held, half of the channel's
+#     30 slots, and a sixteenth that gets none;
+#   the half rule against the node's own channel list: payments of others pending on the channel
+#     leave less room, and a lock past half is refused before the node is asked;
+#   a seller behind a channel with no free slot: the lock fails, the session holds less, waits 30
+#     and 60 seconds, and after the third failed round holds nothing with that seller;
+#   a held ticket below 546 sat is refused whatever the seller's terms say;
 #   the wallet's macaroon is the Lightning rail's four permissions; the MCP's ticket tools.
 #
 # Lab: the one scripts/ln_rail_regtest.sh uses (scripts/ln_rail/lab.sh: paulscode/lightning-fork-lab
@@ -25,7 +38,7 @@
 # BASE+40: the chain node's RPC, the nodes' REST (scripts/ticket_book/compose.py) and the stand-in
 # seller (BASE+40). Its own compose project (ticketbook), so it runs beside the other regtest
 # scripts. Each container is capped at 1 or 2 CPUs; host builds run at nice 19 with -j4. The lab's
-# containers and volumes are removed on exit (TICKET_BOOK_KEEP=1 keeps them). About 15 minutes.
+# containers and volumes are removed on exit (TICKET_BOOK_KEEP=1 keeps them). About 20 minutes.
 # Report: run/ticket_book_regtest.json and run/ticket_book_regtest.log.
 #
 #   scripts/ticket_book_regtest.sh              every check
@@ -36,7 +49,7 @@ cd "$(dirname "$0")/.." || exit 1
 ROOT=$PWD
 LAB=$ROOT/run/lightning-fork-lab
 export TICKET_BOOK_PORT_BASE=${TICKET_BOOK_PORT_BASE:-17911}
-export TICKET_BOOK_SELLERS=${TICKET_BOOK_SELLERS:-20}
+export TICKET_BOOK_SELLERS=${TICKET_BOOK_SELLERS:-16}
 export COMPOSE_PROJECT_NAME=ticketbook
 export ACTIVATION_HEIGHT=20
 R=

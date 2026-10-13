@@ -15,6 +15,7 @@ use std::time::Duration;
 use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE as B64URL};
 use base64::Engine;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use xbt402::macaroon::Macaroon;
 
 use crate::Error;
@@ -23,6 +24,11 @@ use crate::Error;
 pub const INVOICE_OPS: [&str; 2] = ["invoices:read", "invoices:write"];
 /// What the height macaroon holds, and all it may hold on mainnet.
 pub const INFO_OPS: [&str; 1] = ["info:read"];
+/// What the optional channels macaroon holds, and all it may hold on mainnet. With it the gateway
+/// reads its node's channel list to size the cap on held tickets. The permission is wider than
+/// that one call: it also shows the node's channel balances, its payments and what it forwarded,
+/// which is why the gateway does not ask for it unless the runner gives it.
+pub const CHANNEL_OPS: [&str; 1] = ["offchain:read"];
 
 pub type Hash = [u8; 32];
 
@@ -66,6 +72,17 @@ impl Invoice {
     }
 }
 
+/// The inbound side of one of the node's channels, as far as held tickets are concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Channel {
+    /// The pending payments the channel carries each way: the smaller of the two
+    /// `max_accepted_htlcs` the node reports for it. A Core Lightning node also sends no more than
+    /// it accepts, so the smaller number is the true one in both directions.
+    pub slots: u32,
+    /// Payments pending on it towards this node now.
+    pub pending_in: u32,
+}
+
 /// What the node says of itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Info {
@@ -88,6 +105,15 @@ pub trait Node: Send + Sync {
         cltv_blocks: u32,
         expiry_s: u32,
     ) -> Result<String, NodeError>;
+    /// Register an ordinary invoice whose preimage is `preimage` (a ticket settled on arrival: the
+    /// node settles it itself when the payment arrives); the BOLT 11 invoice.
+    fn add_invoice(
+        &self,
+        preimage: &[u8; 32],
+        msat: u64,
+        cltv_blocks: u32,
+        expiry_s: u32,
+    ) -> Result<String, NodeError>;
     /// Release a held invoice with its preimage. `Ok` also for an invoice that was settled before:
     /// success alone does not show the invoice was held until now.
     fn settle(&self, preimage: &[u8; 32]) -> Result<(), NodeError>;
@@ -98,6 +124,13 @@ pub trait Node: Send + Sync {
     /// invoice is final (`Ok`), or the stream breaks (`Err`).
     fn watch(&self, hash: &Hash, on: &mut dyn FnMut(Invoice) -> bool) -> Result<(), NodeError>;
     fn info(&self) -> Result<Info, NodeError>;
+    /// The node's active channels. Only a node the runner gave a channels macaroon answers; an
+    /// error is an error, never an empty list.
+    fn channels(&self) -> Result<Vec<Channel>, NodeError> {
+        Err(NodeError::Refused(
+            "this node was given no channels macaroon".into(),
+        ))
+    }
 }
 
 /// Why a macaroon is not the narrow one, if it is not: permissions outside `allowed`, or
@@ -241,6 +274,7 @@ pub struct LndRest {
     base: String,
     invoice_macaroon: String,
     info_macaroon: String,
+    channels_macaroon: Option<String>,
     /// Unary calls: a deadline on every read.
     agent: ureq::Agent,
     /// Invoice streams: silent for as long as nothing happens to the invoice.
@@ -314,9 +348,16 @@ impl LndRest {
             base,
             invoice_macaroon: hex::encode(invoice_macaroon),
             info_macaroon: hex::encode(info_macaroon),
+            channels_macaroon: None,
             agent: build(Duration::from_secs(15)),
             streams: build(STREAM_SILENCE),
         })
+    }
+
+    /// With a macaroon for reading the node's channels ([`CHANNEL_OPS`]), checked by the caller.
+    pub fn with_channels_macaroon(mut self, macaroon: &[u8]) -> Self {
+        self.channels_macaroon = Some(hex::encode(macaroon));
+        self
     }
 
     fn call(
@@ -396,6 +437,43 @@ fn num(v: Option<&Value>) -> Option<u64> {
     }
 }
 
+/// The active channels in the node's `ListChannels` answer. A channel that does not state both
+/// limits is an error: a number that cannot be read is never taken for a large one.
+pub fn channels_of(v: &Value) -> Result<Vec<Channel>, NodeError> {
+    let bad = |what: &str| NodeError::Unreachable(format!("channel list: {what}"));
+    let list = v
+        .get("channels")
+        .and_then(Value::as_array)
+        .ok_or_else(|| bad("no channels list"))?;
+    let mut out = vec![];
+    for c in list {
+        if c.get("active").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        let limit = |side: &str| {
+            num(c.get(side).and_then(|s| s.get("max_accepted_htlcs")))
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|n| *n > 0)
+                .ok_or_else(|| bad("a channel without max_accepted_htlcs"))
+        };
+        let slots = limit("local_constraints")?.min(limit("remote_constraints")?);
+        let pending = c
+            .get("pending_htlcs")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let pending_in = pending
+            .iter()
+            .filter(|h| h.get("incoming").and_then(Value::as_bool) == Some(true))
+            .count();
+        out.push(Channel {
+            slots,
+            pending_in: u32::try_from(pending_in).unwrap_or(u32::MAX),
+        });
+    }
+    Ok(out)
+}
+
 /// An invoice from the node's JSON. An answer without a state it knows is an error, not "open".
 pub fn invoice_of(v: &Value) -> Result<Invoice, NodeError> {
     let bad = |what: &str| NodeError::Unreachable(format!("invoice answer: {what}"));
@@ -467,6 +545,43 @@ impl Node for LndRest {
                 "no payment_request in the answer".into(),
             )),
         }
+    }
+
+    fn add_invoice(
+        &self,
+        preimage: &[u8; 32],
+        msat: u64,
+        cltv_blocks: u32,
+        expiry_s: u32,
+    ) -> Result<String, NodeError> {
+        let body = json!({"r_preimage": B64.encode(preimage), "value_msat": msat.to_string(), "cltv_expiry": cltv_blocks.to_string(), "expiry": expiry_s.to_string()});
+        let v = self.unary(&self.invoice_macaroon, "POST", "/v1/invoices", Some(&body))?;
+        // the invoice is for the hash of the preimage that was sent, or it is not this ticket's
+        let hash: Hash = Sha256::digest(preimage).into();
+        let named = v
+            .get("r_hash")
+            .and_then(Value::as_str)
+            .and_then(|h| B64.decode(h).ok());
+        if named.as_deref() != Some(hash.as_slice()) {
+            return Err(NodeError::Unreachable(
+                "the invoice in the answer is for another payment hash".into(),
+            ));
+        }
+        match v.get("payment_request").and_then(Value::as_str) {
+            Some(inv) if !inv.is_empty() => Ok(inv.to_string()),
+            _ => Err(NodeError::Unreachable(
+                "no payment_request in the answer".into(),
+            )),
+        }
+    }
+
+    fn channels(&self) -> Result<Vec<Channel>, NodeError> {
+        let Some(macaroon) = &self.channels_macaroon else {
+            return Err(NodeError::Refused(
+                "this node was given no channels macaroon".into(),
+            ));
+        };
+        channels_of(&self.unary(macaroon, "GET", "/v1/channels?active_only=true", None)?)
     }
 
     fn settle(&self, preimage: &[u8; 32]) -> Result<(), NodeError> {

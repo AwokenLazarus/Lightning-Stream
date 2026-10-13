@@ -19,6 +19,8 @@
 //! | A ticket is released for an answer only when the balance does not cover its next piece. | [`Stream::due_bytes`] and [`Stream::due_time`], on the bytes and seconds this module counted itself. |
 //! | No ticket is released into a session whose last answer the seller has not closed. | [`Signer::ticket_release_one`] waits for the answer's last receipt in the seller's signed `status` (5 s a call, the session given up after 30 s). A seller waiting for a refill of an answer the wallet stopped reading would take the next ticket for bytes nobody reads. |
 //! | A call uses at most `max_sats`, by the wallet's own count, and ends within the owner's `max_answer_s`. | [`Signer::ticket_request`] refuses a head price above it; [`Stream::over`] cuts the body where its price reaches it or its time is up. |
+//! | Held tickets first; a prepaid one only where none can be held. | [`Signer::ticket_release_one`] buys a prepaid ticket only when the session has no held ticket to release and the book says it pays that way now ([`crate::ticket::Session::prepaid_now`]: a pool of none, or a wait after a lock that found no slot). The purchase itself is the book's ([`Signer::ticket_prepay`]), one at a time. |
+//! | A seller that says `slots_short` is waited for. | [`Signer::ticket_lock_call`] sets the session's wait from the seller's `retryAfter` and offers it no hash until then. |
 //!
 //! Locks: a session's `busy` (one paid request at a time), then `paying` (one secret at a time),
 //! then `link` (one HTTP exchange at a time, in `seq` order), then `money`. The wallet's spend lock
@@ -41,7 +43,7 @@ use crate::pyjson::{py_int, str_or_empty};
 use crate::sanitize::{untrusted, UNTRUSTED_KEY};
 use crate::session::{body_cap, origin_of};
 use crate::signer::{deny, with, Signer};
-use crate::ticket::{sats_ceil, Admit, SState, SellerSession, TicketPolicy};
+use crate::ticket::{sats_ceil, Admit, SState, SellerSession, Terms, TicketPolicy, HOLD_SHORT, ROUTE_FULL};
 use crate::ticket_http::{offers, Account, Due, Offer, PayTerms, Price, Receipt};
 use crate::{err, Result};
 
@@ -56,8 +58,8 @@ const TAIL_GIVE_UP: Duration = Duration::from_secs(30);
 /// How long a stop waits for the wallet's own node to show the cancelled tickets failed.
 pub const CANCEL_WAIT: Duration = Duration::from_secs(5);
 /// Refusals of `ticket_open` that mean "not this rail": the next entry of the 402 is tried.
-const NEXT_RAIL: [&str; 9] = ["ticket_disabled", "ln_disabled", "ticket_task", "ticket_admission", "ticket_terms", "ticket_feature_512", "ticket_network",
-                              "ticket_size", "ticket_blocks"];
+const NEXT_RAIL: [&str; 12] = ["ticket_disabled", "ln_disabled", "ticket_task", "ticket_admission", "ticket_terms", "ticket_feature_512", "ticket_network",
+                               "ticket_size", "ticket_blocks", "ticket_dust", "ticket_slots", ROUTE_FULL];
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
@@ -239,6 +241,9 @@ pub(crate) struct HttpSession {
     pub sid: String,
     task: String,
     pub terms: PayTerms,
+    /// The seller's terms for prepaid tickets, where its 402 listed them beside the entry the
+    /// session was opened on.
+    prepaid: Option<Terms>,
     /// The URL of the session endpoints: the origin and the terms' path.
     base: String,
     busy: Mutex<()>,
@@ -301,11 +306,13 @@ struct Call<'a> {
     task: std::result::Result<String, String>,
 }
 
-/// What one call released: the hashes, and the sats the book put in the ledger for them.
+/// What one call released: the hashes, the sats the book put in the ledger for them, and how many
+/// of them were prepaid tickets.
 #[derive(Default)]
 struct Spent {
     hashes: Vec<String>,
     booked_sats: i64,
+    prepaid: usize,
 }
 
 /// The pacing of one answer that is priced as it goes: when the next ticket is due.
@@ -460,7 +467,7 @@ impl Signer {
         for offer in offers(&pr, &lightning, &chain) {
             let rail = offer.rail();
             let tried = match &offer {
-                Offer::Ticket(acc) => self.ticket_pay(&call, acc, &lightning),
+                Offer::Ticket(acc, prepaid) => self.ticket_pay(&call, acc, prepaid.as_ref(), &lightning),
                 Offer::Lightning(_) if !listed => Tried::Next("the seller is not on the owner's allowlist: only a ticket task that pays any seller reaches it".into()),
                 Offer::Lightning(acc) => self.ln_exact_pay(&call, acc, &tp),
                 Offer::Channel(_) if !listed => Tried::Next("the seller is not on the owner's allowlist: only a ticket task that pays any seller reaches it".into()),
@@ -540,11 +547,17 @@ impl Signer {
 
     /// Pay one request with tickets: read the entry, find or open the session with this seller,
     /// send the request.
-    fn ticket_pay(&self, c: &Call, acc: &Value, lightning: &str) -> Tried {
+    fn ticket_pay(&self, c: &Call, acc: &Value, prepaid_acc: Option<&Value>, lightning: &str) -> Tried {
         let terms = match PayTerms::parse(acc, lightning) {
             Ok(t) => t,
             Err((rule, why)) => return Tried::Next(format!("{rule}: {why}")),
         };
+        // the entry for prepaid tickets counts only as the same seller's second way to be paid: the same
+        // node, receipt key, endpoints and release. Anything else is no offer, and the held entry stands alone
+        let prepaid: Option<(Terms, &Value)> = prepaid_acc.and_then(|a| PayTerms::parse(a, lightning).ok().map(|t| (t, a)))
+            .filter(|(p, _)| p.terms.payee == terms.terms.payee && p.receipt_key == terms.receipt_key && p.session_path == terms.session_path && p.release == terms.release)
+            .map(|(p, a)| (p.terms, a));
+        let prepaid_terms = prepaid.as_ref().map(|(t, _)| t.clone());
         if terms.release != "with-request" {
             return Tried::Next("the entry releases after-verify, which this wallet does not do: it releases a ticket before the piece it pays for".into());
         }
@@ -579,7 +592,7 @@ impl Signer {
                 self.ticket_http_stop(&h, "its session ended", Duration::ZERO);
             }
             match open.as_ref() {
-                Some(h) if !h.terms.same_seller(&terms) => {
+                Some(h) if !h.terms.same_seller(&terms) || h.prepaid != prepaid_terms => {
                     let h = h.clone();
                     *open = None;
                     let stopped = self.ticket_http_stop(&h, "the seller's terms changed", Duration::ZERO);
@@ -595,21 +608,36 @@ impl Signer {
                     };
                     let o = {
                         let _g = self.lock();
-                        self.ticket_open_locked(&json!({"terms": acc, "task": &task, "origin": c.origin}))
+                        self.ticket_open_locked(&json!({"terms": acc, "prepaid_terms": prepaid.as_ref().map(|(_, a)| *a), "task": &task, "origin": c.origin}))
                     };
                     if o["verdict"] != "allow" {
                         let rule = str_or_empty(o.get("rule"));
                         break 'open Err(if NEXT_RAIL.contains(&rule.as_str()) { Tried::Next(format!("{rule}: {}", str_or_empty(o.get("reason")))) } else { Tried::Done(o) });
                     }
-                    let h = Arc::new(HttpSession { origin: c.origin.into(), sid: str_or_empty(o.get("session")), task: task.clone(), terms: terms.clone(), base, busy: Mutex::new(()),
+                    let h = Arc::new(HttpSession { origin: c.origin.into(), sid: str_or_empty(o.get("session")), task: task.clone(), terms: terms.clone(),
+                                                   prepaid: prepaid_terms.clone(), base, busy: Mutex::new(()),
                                                    paying: Mutex::new(()), link: Mutex::new(Link { seller_sid: String::new(), key: Zeroizing::new([0u8; 32]), next_seq: 0 }),
                                                    money: Mutex::new(Money::default()), streaming: AtomicBool::new(false), refilling: AtomicBool::new(false),
                                                    used: Mutex::new(self.engine.now()), unfilled: Mutex::new(None) });
-                    // the first pool, before the call goes on
-                    match self.ticket_fill(&h) {
+                    // the first pool, before the call goes on. A session that holds nothing, or that found no slot
+                    // and waits, goes on where the seller offers prepaid tickets: the call buys one when it needs it
+                    let filled = self.ticket_fill(&h);
+                    let prepaid_now = self.ticket_session(&h.sid).is_some_and(|s| s.prepaid_now(self.engine.now()));
+                    match filled {
                         Ok(n) if n > 0 => {}
+                        _ if prepaid_now => {}
                         Ok(_) => {
+                            // nothing was locked. Where the session waits (a lock found no slot, now or in the session
+                            // before this one), that is the reason, and when to come back
+                            let now = self.engine.now();
+                            let wait = self.ticket_session(&h.sid).filter(|s| now < s.hold_until || s.pool == 0);
                             let stopped = self.ticket_http_stop(&h, "no ticket could be locked", Duration::ZERO);
+                            if let Some(s) = wait {
+                                let why = if s.hold_why.is_empty() { "ticket_slots".to_string() } else { s.hold_why.clone() };
+                                break 'open Err(Tried::Done(with(refusal(&why, format!("no ticket is locked with this seller for another {:.0} s: a lock found no free slot \
+                                                                                        on the way to it, and its terms offer no prepaid tickets", (s.hold_until - now).max(0.0))),
+                                                                 json!({"stopped": stopped, "retry_after_s": (s.hold_until - now).max(0.0).ceil(), "slot_fails": s.slot_fails}))));
+                            }
                             break 'open Err(Tried::Done(with(refusal("ticket_lock", "no ticket was locked with this seller: its invoices did not pass the wallet's checks, or the \
                                                                              node found no route"), json!({"stopped": stopped}))));
                         }
@@ -677,52 +705,11 @@ impl Signer {
         if hs.terms.terms.min_ticket_msat.is_some() && size != hs.terms.terms.ticket_msat {
             body["ticketMsat"] = size.to_string().into();
         }
-        if !self.ticket_may_reach(&hs.origin, &hs.task) {
-            return Err(deny("allowlist", format!("destination not on allowlist: {}", hs.origin)));
-        }
-        let first = lock(&hs.link).seller_sid.is_empty();
-        let answer = if first {
-            let url = format!("{}/lock", hs.base);
-            let raw = body.to_string().into_bytes();
-            let sent = self.ticket_wire.send("POST", &url, &raw, &[("Content-Type".into(), "application/json".into())], Self::ticket_read_timeout(&self.ticket_policy()));
-            let (status, v) = match sent.and_then(|a| Ok((a.status, a.read_small(SMALL_BODY)?))) {
-                Ok((status, raw)) => (status, serde_json::from_slice::<Value>(&raw).unwrap_or(Value::Null)),
-                Err(e) => {
-                    unoffer("the seller gave no answer to the lock");
-                    return Err(refusal("ticket_seller", format!("the seller gave no answer to the first lock: {}", e.msg)));
-                }
-            };
-            if status != 200 {
-                unoffer("the seller refused the lock");
-                let code = Some(str_or_empty(v.get("error"))).filter(|c| safe_code(c)).unwrap_or_default();
-                return Err(refusal("ticket_seller", format!("the seller refused the first lock: HTTP {status} {code}")));
-            }
-            let (seller_sid, key) = (str_or_empty(v.get("session")), str_or_empty(v.get("key")));
-            let key: Option<[u8; 32]> = xbt402::ticket::hex32(&key);
-            let (true, Some(key)) = (seller_sid.len() == 32 && seller_sid.bytes().all(|c| c.is_ascii_hexdigit()), key) else {
-                return Err(refusal("ticket_seller", "the seller's first lock answer names no session id and key"));
-            };
-            // on disk before anything is paid: a wallet that starts again can still ask for the cancel
-            if let Err(e) = self.ticket_set_http(&hs.sid, SellerSession { id: seller_sid.clone(), key, base: hs.base.clone() }) {
-                return Err(refusal("ticket", e.msg));
-            }
-            let mut link = lock(&hs.link);
-            link.seller_sid = seller_sid;
-            link.key = Zeroizing::new(key);
-            v
-        } else {
-            body["session"] = lock(&hs.link).seller_sid.clone().into();
-            match self.ticket_call(hs, "lock", &body, true) {
-                Ok((200, v, _)) => v,
-                Ok((status, v, _)) => {
-                    unoffer("the seller refused the lock");
-                    let code = Some(str_or_empty(v.get("error"))).filter(|c| safe_code(c)).unwrap_or_default();
-                    return Err(refusal("ticket_seller", format!("the seller refused the lock: HTTP {status} {code}")));
-                }
-                Err(e) => {
-                    unoffer("the seller gave no answer to the lock");
-                    return Err(refusal("ticket_seller", format!("the seller gave no answer to the lock: {}", e.msg)));
-                }
+        let answer = match self.ticket_lock_call(hs, body) {
+            Ok(v) => v,
+            Err(d) => {
+                unoffer(&str_or_empty(d.get("reason")));
+                return Err(d);
             }
         };
         // the invoices are the seller's word: every check of them is the book's (`ticket_lock`)
@@ -740,11 +727,23 @@ impl Signer {
                  json!({"session": hs.sid, "refused": locked["refused"].as_array().map(Vec::len)}))
         });
         *lock(&hs.unfilled) = why_not.clone();
-        // an invoice the wallet's own node could not be asked about was not judged either: its hash is given up now
-        let unasked: Vec<String> = locked.get("refused").and_then(Value::as_array).into_iter().flatten().filter(|r| r.get("rule").and_then(Value::as_str) == Some("ln_backend"))
+        // an invoice the wallet's own node could not be asked about was not judged either, and one that was refused for
+        // lack of a slot or for dust is refused whoever issued it: their hashes are given up now, and the session's
+        // wait (set by the book) keeps new ones from being offered at once
+        let unasked: Vec<String> = locked.get("refused").and_then(Value::as_array).into_iter().flatten()
+            .filter(|r| matches!(r.get("rule").and_then(Value::as_str), Some("ln_backend" | "ticket_slots" | "ticket_dust")))
             .filter_map(|r| r.get("hash").and_then(Value::as_str).map(str::to_string)).collect();
         if !unasked.is_empty() {
-            let _ = self.ticket_unoffer(&hs.sid, &unasked, "the wallet's node could not be asked about its invoice");
+            let _ = self.ticket_unoffer(&hs.sid, &unasked, "its invoice was not paid: the wallet's node could not be asked, or no slot was free for it");
+        }
+        // invoices the seller issued and that will not be paid (refused here, or failed on the way) take places under
+        // the seller's cap on held tickets until they lapse: it is asked to cancel them now. Unchecked: a seller that
+        // does not answer cancels them itself when they lapse, and no money depends on it
+        let dead: Vec<Value> = locked.get("refused").and_then(Value::as_array).into_iter().flatten().filter_map(|r| r.get("hash").cloned())
+            .chain(locked.get("tickets").and_then(Value::as_array).into_iter().flatten().filter(|t| t["state"] == "failed").filter_map(|t| t.get("hash").cloned()))
+            .filter(|h| h.as_str().is_some_and(|h| xbt402::ticket::hex32(h).is_some())).collect();
+        if !dead.is_empty() && dead.len() <= hs.terms.terms.max_tickets as usize {
+            let _ = self.ticket_call(hs, "cancel", &json!({"hashes": dead}), true);
         }
         if n == 0 {
             if let Some(d) = why_not {
@@ -759,10 +758,101 @@ impl Signer {
         Ok(n)
     }
 
+    /// One `lock` request to the seller: the first of a session, which makes the seller's side of it
+    /// (its id and key are written to the book before anything is paid), or a later, authenticated
+    /// one. `Ok`: the seller's answer. A seller that answers `slots_short` is not failing: the
+    /// session locks nothing until its `retryAfter` has passed, and the refusal says so.
+    fn ticket_lock_call(&self, hs: &HttpSession, mut body: Value) -> std::result::Result<Value, Value> {
+        if !self.ticket_may_reach(&hs.origin, &hs.task) {
+            return Err(deny("allowlist", format!("destination not on allowlist: {}", hs.origin)));
+        }
+        let refused = |status: u16, v: &Value| {
+            let code = Some(str_or_empty(v.get("error"))).filter(|c| safe_code(c)).unwrap_or_default();
+            if status == 402 && code == "slots_short" {
+                let wait = v.get("retryAfter").and_then(Value::as_u64).unwrap_or(crate::ticket::SLOT_WAIT_S as u64).clamp(1, crate::ticket::SLOT_WAIT_MAX_S as u64);
+                // unchecked: without the wait in the book the next round asks again and is told the same
+                let _ = self.ticket_hold(&hs.sid, wait, "ticket_slots_short");
+                return with(refusal("ticket_slots_short", format!("the seller holds as many tickets as its channels allow and asks buyers to wait {wait} s: \
+                                                                   no ticket is locked with it until then")), json!({"retry_after_s": wait, "session": hs.sid}));
+            }
+            refusal("ticket_seller", format!("the seller refused the lock: HTTP {status} {code}"))
+        };
+        if !lock(&hs.link).seller_sid.is_empty() {
+            body["session"] = lock(&hs.link).seller_sid.clone().into();
+            return match self.ticket_call(hs, "lock", &body, true) {
+                Ok((200, v, _)) => Ok(v),
+                Ok((status, v, _)) => Err(refused(status, &v)),
+                Err(e) => Err(refusal("ticket_seller", format!("the seller gave no answer to the lock: {}", e.msg))),
+            };
+        }
+        let url = format!("{}/lock", hs.base);
+        let raw = body.to_string().into_bytes();
+        let sent = self.ticket_wire.send("POST", &url, &raw, &[("Content-Type".into(), "application/json".into())], Self::ticket_read_timeout(&self.ticket_policy()));
+        let (status, v) = match sent.and_then(|a| Ok((a.status, a.read_small(SMALL_BODY)?))) {
+            Ok((status, raw)) => (status, serde_json::from_slice::<Value>(&raw).unwrap_or(Value::Null)),
+            Err(e) => return Err(refusal("ticket_seller", format!("the seller gave no answer to the first lock: {}", e.msg))),
+        };
+        if status != 200 {
+            return Err(refused(status, &v));
+        }
+        let (seller_sid, key) = (str_or_empty(v.get("session")), str_or_empty(v.get("key")));
+        let key: Option<[u8; 32]> = xbt402::ticket::hex32(&key);
+        let (true, Some(key)) = (seller_sid.len() == 32 && seller_sid.bytes().all(|c| c.is_ascii_hexdigit()), key) else {
+            return Err(refusal("ticket_seller", "the seller's first lock answer names no session id and key"));
+        };
+        // on disk before anything is paid: a wallet that starts again can still ask for the cancel
+        if let Err(e) = self.ticket_set_http(&hs.sid, SellerSession { id: seller_sid.clone(), key, base: hs.base.clone() }) {
+            return Err(refusal("ticket", e.msg));
+        }
+        let mut link = lock(&hs.link);
+        link.seller_sid = seller_sid;
+        link.key = Zeroizing::new(key);
+        Ok(v)
+    }
+
+    /// Buy one prepaid ticket for the session and show the seller its preimage: the seller's
+    /// invoice for a hash of its own, every check and rule of the book ([`Signer::ticket_prepay`]),
+    /// the payment, then `release` with the preimage the wallet's node got for it. Called with the
+    /// session's `paying` lock held, so one is bought at a time.
+    fn ticket_buy_prepaid(&self, hs: &HttpSession, spent: &mut Spent) -> std::result::Result<(), Value> {
+        // the wallet's own node first: no invoice is asked for that the node could not then pay
+        self.ticket_can_lock(&hs.terms.terms.payee)?;
+        let body = json!({"version": xbt402::ticket::VERSION, "settle": xbt402::ticket::SETTLE_ON_ARRIVAL, "count": 1});
+        let answer = self.ticket_lock_call(hs, body)?;
+        let Some(first) = answer.get("tickets").and_then(Value::as_array).and_then(|a| a.first()) else {
+            return Err(refusal("ticket_seller", "the seller issued no invoice for a prepaid ticket"));
+        };
+        let r = self.ticket_prepay(&json!({"session": hs.sid, "hash": first.get("hash"), "invoice": first.get("invoice")}));
+        if r["verdict"] == "pending" {
+            // booked, and neither paid nor failed by the node's word: nothing more is paid in this session
+            return Err(self.ticket_fault(hs, "the payment of a prepaid ticket has no final answer from the wallet's node: it is booked as spent until the node shows it failed"));
+        }
+        if r["verdict"] != "allow" {
+            return Err(r);
+        }
+        let (Some(secret), hash) = (r.get("ticket_secret").and_then(Value::as_str), str_or_empty(r.get("hash"))) else {
+            return Err(refusal("ticket", "the book paid a prepaid ticket and returned no preimage"));
+        };
+        {
+            let mut m = lock(&hs.money);
+            m.acct.released(crate::ticket::outside_u64(r.get("ticket_msat")).unwrap_or(0));
+            m.pending = Some((hash.clone(), Zeroizing::new(secret.to_string())));
+        }
+        spent.hashes.push(hash);
+        spent.prepaid += 1;
+        spent.booked_sats = spent.booked_sats.saturating_add(py_int(r.get("charged_sats")).unwrap_or(0));
+        self.ticket_deliver(hs)
+    }
+
+    /// How many hashes the session's pool wants now, by the book (0 when the book cannot be read:
+    /// nothing is offered on a guess).
+    fn ticket_want(&self, sid: &str) -> usize {
+        self.ticket_store().ok().and_then(|g| g.as_ref().and_then(|st| st.book.sessions.get(sid).map(|s| st.book.want(s, self.engine.now())))).unwrap_or(0)
+    }
+
     /// Fill the pool behind a call, one refill of a session at a time.
     fn ticket_refill_later(&self, hs: &Arc<HttpSession>) {
-        let want = self.ticket_store().ok().and_then(|g| g.as_ref().and_then(|st| st.book.sessions.get(&hs.sid).map(|s| st.book.want(s, self.engine.now())))).unwrap_or(0);
-        if want == 0 || hs.fault().is_some() || hs.refilling.swap(true, Ordering::SeqCst) {
+        if self.ticket_want(&hs.sid) == 0 || hs.fault().is_some() || hs.refilling.swap(true, Ordering::SeqCst) {
             return;
         }
         let (Some(me), hs2) = (self.me.get().and_then(std::sync::Weak::upgrade), hs.clone()) else {
@@ -770,8 +860,14 @@ impl Signer {
             return;
         };
         let spawned = std::thread::Builder::new().name("ticket-refill".into()).spawn(move || {
-            // a refusal here is the next release's to report: it finds no ticket and says why
-            let _ = me.ticket_fill(&hs2);
+            // a refusal here is the next release's to report: it finds no ticket and says why. A release that came
+            // while a round was out has left the pool at its mark again (with a pool of 2, every release does):
+            // another round, a few at most, and none after a round that locked nothing
+            for _ in 0..4 {
+                if !matches!(me.ticket_fill(&hs2), Ok(n) if n > 0) || me.ticket_want(&hs2.sid) == 0 {
+                    break;
+                }
+            }
             hs2.refilling.store(false, Ordering::SeqCst);
         });
         if spawned.is_err() {
@@ -920,10 +1016,36 @@ impl Signer {
             }
             let filled = self.ticket_fill(hs);
             hs.refilling.store(false, Ordering::SeqCst);
-            filled?;
             next = self.ticket_next(&hs.sid).0;
+            if next.is_none() {
+                // no held ticket, and none to be had now. Where the session holds nothing, or waits after a lock that
+                // found no slot, the seller's prepaid tickets are the way to pay; a seller that offers none is
+                // waited for, and after three rounds without a slot the session ends
+                let now = self.engine.now();
+                if let Some(s) = self.ticket_session(&hs.sid).filter(|s| s.state == SState::Open) {
+                    if s.prepaid_now(now) {
+                        return self.ticket_buy_prepaid(hs, spent);
+                    }
+                    if s.pool == 0 {
+                        let why = if s.hold_why.is_empty() { ROUTE_FULL.to_string() } else { s.hold_why.clone() };
+                        let stopped = self.ticket_http_stop(hs, &format!("{why}: no ticket can be held with this seller, and it offers no prepaid ones"), Duration::ZERO);
+                        return Err(with(refusal(if HOLD_SHORT.contains(&why.as_str()) { ROUTE_FULL } else { "ticket_none" },
+                                                format!("no ticket can be held with this seller ({why}) and its terms offer no prepaid tickets: the session was stopped; \
+                                                         pay it another way, or again later")),
+                                        json!({"session": hs.sid, "stopped": stopped, "retry_after_s": (s.hold_until - now).max(0.0).ceil()})));
+                    }
+                    if now < s.hold_until {
+                        filled?;
+                        return Err(with(refusal(if s.hold_why.is_empty() { "ticket_slots" } else { s.hold_why.as_str() },
+                                                format!("no ticket is locked with this seller for another {:.0} s: the last lock found no free slot on the way, and \
+                                                         the seller's terms offer no prepaid tickets", s.hold_until - now)),
+                                        json!({"session": hs.sid, "retry_after_s": (s.hold_until - now).ceil()})));
+                    }
+                }
+            }
+            filled?;
         }
-        let Some(hash) = next else {
+        let Some(mut hash) = next else {
             // the book says why nothing can be released (a stopped session, a task the owner removed, no ticket). It is
             // asked for a ticket that cannot exist, so that it cannot release one a refill locked in this instant.
             // Where the pool is empty because the last fill was refused, that refusal is the reason
@@ -943,6 +1065,29 @@ impl Signer {
             }
             if lock(&hs.money).ready.contains(&hash) {
                 break;
+            }
+            // the ticket may have failed since it was chosen: one that finds no slot at a later hop is in flight on the
+            // wallet's node for a moment before the refusal is back. The node is asked, and the book's next ticket taken
+            {
+                let _g = self.lock();
+                self.ticket_reconcile_locked();
+            }
+            match self.ticket_next(&hs.sid).0 {
+                Some(h) if h == hash => {}
+                Some(h) => {
+                    hash = h;
+                    continue;
+                }
+                None => {
+                    let now = self.engine.now();
+                    let s = self.ticket_session(&hs.sid).filter(|s| s.state == SState::Open);
+                    if s.as_ref().is_some_and(|s| s.prepaid_now(now)) {
+                        return self.ticket_buy_prepaid(hs, spent);
+                    }
+                    let wait = s.map_or(0.0, |s| (s.hold_until - now).max(0.0));
+                    return Err(with(refusal("ticket_slots", "the ticket that was to be released failed on its way to the seller, as a channel without a free slot \
+                                                             fails one: no secret was released"), json!({"session": hs.sid, "retry_after_s": wait.ceil()})));
+                }
             }
             // stopped meanwhile (its tickets are being cancelled, so the seller will never show this one locked)
             if !self.ticket_session(&hs.sid).is_some_and(|s| s.state == SState::Open) {
@@ -1047,6 +1192,7 @@ impl Signer {
         let mut spent = Spent::default();
         let about = |hs: &HttpSession, spent: &Spent| {
             json!({"rail": "ticket", "session": hs.sid, "dest": dest, "origin": hs.origin, "charged_sats": spent.booked_sats, "tickets_released": spent.hashes.len(),
+                   "tickets_prepaid": spent.prepaid,
                    "balance_msat": hs.balance().to_string(), "credited_msat": hs.credited().to_string(), "tickets": self.ticket_session_counts(&hs.sid)})
         };
         let fail = |hs: &HttpSession, spent: &Spent, d: Value| with(d, about(hs, spent));

@@ -29,6 +29,27 @@ pub const SETTLE_MARGIN_BLOCKS: u32 = 24;
 pub const MIN_TICKET_BLOCKS: u32 = 24;
 /// How long an unpaid ticket invoice may wait to be paid, in seconds.
 pub const INVOICE_EXPIRY_S: u32 = 60;
+/// `settle` in the terms: a ticket is a held payment, settled when its secret is used.
+pub const SETTLE_ON_USE: &str = "on-use";
+/// `settle` in the terms: a ticket is an ordinary payment, settled when it arrives (a prepaid
+/// balance). It holds no HTLC slot and needs no hold invoice.
+pub const SETTLE_ON_ARRIVAL: &str = "on-arrival";
+/// The smallest ticket that may be held: the larger of the two dust limits a channel of this
+/// network has (354 sat on a Lightning Fork node, 546 sat on a Core Lightning node). A held
+/// payment below a channel's dust limit has no output in that channel's transaction, and its
+/// value goes to the miners if the channel is force-closed while it is held.
+pub const MIN_HELD_TICKET_MSAT: u64 = 546_000;
+/// The pending payments a channel carries each way where its node does not say: Core Lightning's
+/// default, and the smallest default of the implementations on this network. The protocol's
+/// ceiling is [`MAX_CHANNEL_SLOTS`].
+pub const DEFAULT_CHANNEL_SLOTS: u32 = 30;
+pub const MAX_CHANNEL_SLOTS: u32 = 483;
+
+/// The held tickets a channel of `slots` pending payments may carry: half, so that the other half
+/// stays for ordinary payments, for settles on their way and for everyone else on that channel.
+pub fn held_budget(slots: u32) -> u32 {
+    slots.min(MAX_CHANNEL_SLOTS) / 2
+}
 
 /// `lightning:` and the 32 hex characters of the chain's `bip122` id: a Lightning network is not
 /// the chain, and XBT shares its genesis block with the SHA-256 chain.
@@ -97,8 +118,10 @@ pub struct Terms {
 
 impl Terms {
     /// The `accepts` entry for a request priced at `amount_msat`, released `release`
-    /// (`with-request` or `after-verify`), with the route's price rule as the seller states it.
-    pub fn accepts(&self, amount_msat: u64, release: &str, price: &Value) -> Value {
+    /// (`with-request` or `after-verify`), settled `settle` ([`SETTLE_ON_USE`] or
+    /// [`SETTLE_ON_ARRIVAL`]), with the route's price rule as the seller states it. A seller that
+    /// offers both ways lists two entries, the held one first.
+    pub fn accepts(&self, amount_msat: u64, release: &str, settle: &str, price: &Value) -> Value {
         let mut extra = Map::new();
         extra.insert("version".into(), VERSION.into());
         extra.insert("features".into(), Value::Array(vec![FEATURE_BLAKE2B.into()]));
@@ -106,7 +129,7 @@ impl Terms {
         extra.insert("maxTickets".into(), self.max_tickets.into());
         extra.insert("ticketBlocks".into(), self.ticket_blocks.into());
         extra.insert("release".into(), release.into());
-        extra.insert("settle".into(), "on-use".into());
+        extra.insert("settle".into(), settle.into());
         extra.insert("receiptKey".into(), self.receipt_key.clone().into());
         extra.insert("session".into(), self.session.clone().into());
         extra.insert("price".into(), price.clone());
@@ -184,14 +207,24 @@ mod tests {
 
     #[test]
     fn the_accepts_entry_is_the_one_the_draft_shows() {
-        let t = Terms { network: "lightning:0000000000000050c1e5f69672f45929".into(), pay_to: "02".repeat(33), ticket_msat: 1_000_000, max_tickets: 8, ticket_blocks: 40,
+        let t = Terms { network: "lightning:0000000000000050c1e5f69672f45929".into(), pay_to: "02".repeat(33), ticket_msat: 1_000_000, max_tickets: 2, ticket_blocks: 40,
                         receipt_key: "03".repeat(33), session: SESSION_PATH.into() };
-        let a = t.accepts(2500, "with-request", &json!({"requestMsat": "2500"}));
+        let a = t.accepts(2500, "with-request", SETTLE_ON_USE, &json!({"requestMsat": "2500"}));
         assert_eq!(a["scheme"], "ticket");
         assert_eq!(a["amount"], "2500");
         assert_eq!(a["extra"]["ticketMsat"], "1000000");
         assert_eq!(a["extra"]["features"], json!([512]));
         assert_eq!(a["extra"]["settle"], "on-use");
         assert_eq!(a["extra"]["session"], "/x402/ticket");
+        assert_eq!(a["extra"]["maxTickets"], 2);
+        let b = t.accepts(2500, "with-request", SETTLE_ON_ARRIVAL, &json!({"requestMsat": "2500"}));
+        assert_eq!(b["extra"]["settle"], "on-arrival");
+    }
+
+    #[test]
+    fn held_tickets_take_half_of_a_channels_slots() {
+        assert_eq!((held_budget(DEFAULT_CHANNEL_SLOTS), held_budget(MAX_CHANNEL_SLOTS), held_budget(1), held_budget(0)), (15, 241, 0, 0));
+        assert_eq!(held_budget(u32::MAX), 241, "no channel has more than the protocol's ceiling");
+        assert_eq!(MIN_HELD_TICKET_MSAT, 546_000);
     }
 }

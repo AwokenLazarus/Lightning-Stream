@@ -6,13 +6,22 @@
 #     lf1 ---- lf2 ---- lf3 ==== xbt-gateway ---- file server
 #     buyer    hop     seller
 #
-# It prints PASS or FAIL for each check with what it saw: the 402's terms; what the gateway's two
-# macaroons cannot do, and a wider one refused on mainnet; a 100 MB file priced per byte, fetched
-# with tickets released as it arrives and stopped half way; a 10 MB file end to end; what a paid
-# request adds over an unpaid one; the hostile buyer (a secret for an unpaid ticket, replays,
-# another buyer's secret, 2,000 lock requests, tickets locked and never released); the 24-block
-# margin; the file server stopped; the gateway restarted and the seller's node restarted with
-# tickets locked. The names and what each checks: scripts/gateway/drive.py.
+# The gateway runs with its shipped ticket terms and caps: 2 tickets a session, 15 held for all
+# sessions together, held tickets and prepaid ones. The seller's node is started with
+# --default-remote-max-htlcs=30, so its inbound channel carries 30 pending payments: the slot count
+# of a channel with a Core Lightning node at its default. A stand-in for that number only: no Core
+# Lightning node is in this lab.
+#
+# It prints PASS or FAIL for each check with what it saw: the 402's terms; what the gateway's
+# macaroons cannot do, a wider one refused on mainnet, and a config with held tickets below 546 sat
+# refused; a 100 MB file priced per byte, fetched with tickets released as it arrives and stopped
+# half way; a 10 MB file end to end; what a paid request adds over an unpaid one; the hostile buyer
+# (a secret for an unpaid ticket, replays, another buyer's secret, 2,000 lock requests of which 15
+# tickets are issued and the rest told slots_short, tickets locked and never released); the
+# 24-block margin; prepaid tickets, bought while the held cap is full; the gateway reading its
+# node's channels with a third macaroon and holding nothing while a channel is half full; the file
+# server stopped; the gateway restarted and the seller's node restarted with tickets locked. The
+# names and what each checks: scripts/gateway/drive.py.
 #
 # Lab: the one scripts/ln_rail_regtest.sh uses (scripts/ln_rail/lab.sh), cloned and built under run/
 # when missing. Regtest only: no mainnet node is contacted and no miner starts.
@@ -21,7 +30,7 @@
 # (GATEWAY_UPSTREAM_PORT). Its own compose project (lngateway), so it runs beside the other regtest
 # scripts. Each container is capped at 2 CPUs. The lab's containers and volumes are removed on exit
 # (GATEWAY_KEEP=1 keeps them and the scratch directory, for `scripts/gateway/drive.py --no-setup
-# <check>`; see that file's header for the environment it needs). Takes about 8 minutes.
+# <check>`; see that file's header for the environment it needs). Takes about 12 minutes.
 # Report: run/gateway_regtest.json and run/gateway_regtest.log.
 #
 #   scripts/gateway_regtest.sh               every check

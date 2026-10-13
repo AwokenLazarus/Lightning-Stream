@@ -73,10 +73,15 @@ mainnet; its driver is not in this tree. `docs/TICKETS.md`, section 11, has the 
 - At a full channel a Lightning Fork buyer is told `INSUFFICIENT_BALANCE`, not that the slots
   are gone, and a full remote hop answers as a hop short of balance does. A buyer cannot know a
   remote channel's slot count before it fails against it.
-- The design's defaults are therefore 2 tickets a session and at most half of a channel's slots
-  in held tickets (15 of 30). One buyer holds tickets with 7 sellers at 2 each, or 15 at 1 each,
-  from one 30-slot channel. The earlier figure of 200 sellers from one channel (400 tickets) was
-  measured on 483-slot channels and holds only where every channel on the way has 483.
+- The defaults are therefore 2 tickets a session and at most half of a channel's slots in held
+  tickets (15 of 30), in the wallet and in the gateway. One buyer holds tickets with 7 sellers at
+  2 each, or 15 at 1 each, from one 30-slot channel; with the wallet's own rule (2 each with up
+  to 4 sellers of a task, 1 each beyond) it is 11. The earlier figure of 200 sellers from one
+  channel (400 tickets) was measured on 483-slot channels and holds only where every channel on
+  the way has 483.
+- The half rule is a rule of this software, kept on the numbers each side can read of its own
+  channels. Nothing makes another buyer, another seller or a routing node keep it, and a remote
+  channel's slots cannot be read by anyone but its two ends.
 - A ticket below a channel's dust limit has no output in that side's transaction: 354 sat on a
   Lightning Fork node, 546 sat on a Core Lightning node. *(with Core Lightning)* With tickets of
   400, 600 and 1,000 sat held, a Core Lightning node's force close had outputs for 600 and 1,000
@@ -198,34 +203,65 @@ wallet) and against a stand-in node in its tests.
   and one with `info:read`, because the first cannot read the block height. Each is refused on
   mainnet when it grants anything else; the check reads the macaroon and does not verify it, and
   on any other chain a wider one is taken with a warning.
+- A third macaroon, with `offchain:read`, is the runner's choice (`node.channels_macaroon`). With
+  it the gateway reads its node's channel list before every lock of a held ticket. The permission
+  is wider than that one call: it also shows the node's channel balances, its payments and what
+  it forwarded, to whoever has the gateway's files. Without it the gateway knows nothing of its
+  channels and keeps to the numbers in its config.
 - No secret is taken without a block height from the node that is at most 10 seconds old; such
   a request is answered 503 and the secret is good again later.
 - The 24-block margin is checked against the height the node last reported, which is asked for
   twice a second: a block that arrived since is not counted.
-- The gateway's defaults were sized for channels of 483 slots and it does not look at its
-  node's channels. On a channel with a Core Lightning node at the other end, which carries 30,
-  four buyers at the default of 8 tickets fill it, the 31st ticket's payment fails at the buyer
-  with `INSUFFICIENT_BALANCE`, and nobody can pay the seller over that channel until tickets are
-  released or cancelled (measured on the lab with a Core Lightning seller, not with the
-  gateway). A runner whose node has such a channel sets `tickets.max_tickets` to 2 and
-  `caps.max_held_tickets` to 15 for each 30-slot inbound channel. The gateway accepts a ticket
-  size below the dust limits (from 1 sat), does not answer `slots_short`, and does not offer
-  tickets settled on arrival (`docs/TICKETS.md`, section 11).
-- With the default caps buyers can hold 240 tickets, 240,000 sat of the seller's inbound capacity
-  and 240 of one channel's 483 HTLC slots, at no fee: for 1 minute by a session that never
-  releases a secret, for 5 minutes after a session's last paid request, and again as soon as
-  they are cancelled. One address can hold 4 sessions, 32,000 sat. Measured on the lab: a buyer
-  that locked 8 tickets and released none held 8,000 sat for 16 s with the limit set to 15 s.
+- The gateway's defaults are sized for an inbound channel that carries 30 pending payments (a
+  channel with a Core Lightning node at its default): a session holds 2 tickets, and all
+  sessions together 15 (`caps.max_held_tickets`, half of `caps.inbound_slots`). A buyer beyond
+  that is answered `slots_short` with a time to wait, before any invoice exists. Until 2026-10-13
+  the defaults were 8 a session and 240 in all, sized for 483.
+- The cap is one number for the whole node. The buyer's node chooses the channel a ticket
+  arrives on, so on a node with several inbound channels 15 held tickets can all sit on one of
+  them, and a runner who raises the cap for several channels (`caps.held_over_half`) has said
+  that one channel may be filled past half. Unpaid ticket invoices count against the cap for up
+  to 75 seconds: a buyer that asks for tickets and pays none keeps others waiting that long.
+- The gateway's own count is of the tickets it issued. Payments pending on its node's channels
+  for any other reason (the node's own routing, another program's invoices) are seen only with
+  the channels macaroon; with it, no held ticket is issued while any active channel has half of
+  its slots or more pending inwards, and the cap is half of the smallest active channel unless
+  the runner set one. A channel list that cannot be read falls back to the config's cap and is
+  reported on standard error, once per lock. A gateway whose channels macaroon does not work at
+  its start does not start.
+- With the default caps buyers can hold 15 tickets, 15,000 sat of the seller's inbound capacity
+  and 15 slots, at no fee: for 1 minute by a session that never releases a secret, for 5 minutes
+  after a session's last paid request, and again as soon as they are cancelled. One address can
+  hold 2 sessions, 4,000 sat. Measured on the lab with the earlier caps: a buyer that locked 8
+  tickets and released none held 8,000 sat for 16 s with the limit set to 15 s.
+- A held ticket is at least 546 sat: a config that offers held tickets below that is refused.
+  The gateway does not read its channels' dust limits; on a channel without anchors at a high
+  fee rate a 1,000-sat held ticket can still be below the limit (`docs/TICKETS.md`, section 11),
+  and nothing in the gateway notices.
+- Prepaid tickets (`settle: "on-arrival"`, offered beside held ones unless `tickets.settle` says
+  otherwise) are ordinary invoices, paid in full when they arrive. The buyer cannot have one
+  back: what it bought and did not use is the seller's when the session is forgotten (24 hours
+  after its last paid request, or at once when the balance is nothing). A session can have 2 of
+  them issued and unpaid, beside its 2 held tickets; all sessions together 60 invoices with the
+  default caps, each given up within 75 seconds.
+- A prepaid ticket is credited when the node shows its invoice settled for the full amount:
+  when the buyer presents the preimage, or by the janitor's sweep 75 seconds after it was issued
+  if nobody did. An invoice paid short credits nothing, and the node keeps what arrived. The
+  gateway makes each preimage, hands it to the node with the invoice and does not keep it.
+- The gateway does not make a Core Lightning node a seller: it speaks to a Lightning Fork node's
+  REST interface only, for prepaid tickets as for held ones.
 - The cap per address counts the socket's address: behind a reverse proxy every buyer has the
   proxy's, so the runner sets `sessions_per_address` to 0 and caps in the proxy.
 - Whoever can reach the gateway from enough addresses can take every session place with locks
   it never pays, at no cost, a minute at a time: new buyers are refused meanwhile
   (`too_many_sessions`). Sessions that already hold tickets keep them and their balance, and can
-  refill up to their own 8; a session with nothing locked at that moment waits for a place.
-- Every lock makes invoices on the node, up to 240 at once with the default caps and each given
-  up within 75 seconds if unpaid; the node keeps cancelled invoices in its database until it is
-  set to collect them (`gc-canceled-invoices-on-the-fly`).
-- One thread and one connection to the node per unreleased ticket: 240 with the default caps.
+  refill up to their own 2; a session with nothing locked at that moment waits for a place. With
+  the default caps the 15 held places are taken first, by 8 sessions.
+- Every lock makes invoices on the node, up to 75 at once with the default caps (15 held and 60
+  prepaid) and each given up within 75 seconds if unpaid; the node keeps cancelled invoices in
+  its database until it is set to collect them (`gc-canceled-invoices-on-the-fly`).
+- One thread and one connection to the node per held ticket: 15 with the default caps. A prepaid
+  ticket has neither; the node is asked about it when its preimage is presented and at the sweep.
 - A buyer's balance, the part of its released tickets it has not used, is trusted to the seller:
   it is kept for 24 hours after the session's last paid request and then forgotten.
 - The gateway takes 64 connections in all and 48 from one address, one request per connection,
@@ -278,27 +314,67 @@ wallet) and against a stand-in node in its tests.
 - The gateway speaks plain HTTP: a public seller needs a TLS reverse proxy in front, and
   `public_url` set to the origin buyers use, or every payment fails its request binding.
 - Not run: more than one routing hop, real network latency, mainnet, IPv6, a seller with several
-  channels, and the Core Lightning fork.
+  channels, and the Core Lightning fork. The channels macaroon was run against the stand-in node
+  of the tests and on the lab against a Lightning Fork node whose channel was opened with 30
+  slots; no Core Lightning node was in that lab.
 
 ### Stream tickets: the wallet's ticket book
 
 The buyer's side, in the signer (`ticket.rs`, `ticket_rail.rs`): secrets, tickets locked through
 the owner's node, and the booking. It is reached through six socket methods, and by the wallet's
 own payer under `xbt402_pay` (the next section). Verify-before-release for checkable content,
-prepaid tickets (`settle: on-arrival`), lottery tickets and admission by content hash are not
-built. Run on regtest only (`scripts/ticket_book_regtest.sh`).
+lottery tickets and admission by content hash are not built. Prepaid tickets are bought by the
+payer only: no socket method buys one. Run on regtest only (`scripts/ticket_book_regtest.sh`).
 
-- The ticket book's defaults were sized for channels of 483 slots: a pool of 8 tickets with each
-  of up to 8 sellers and 2 beyond that, 64 held tickets in all, and a smallest ticket of 64 sat
-  where it chooses the size. It does not read its channels' slot counts or dust limits before a
-  lock, and a lock that fails for lack of a slot is recorded on the ticket and nothing more. On
-  a channel that carries 30 (any channel with a Core Lightning node at its default) the 31st
-  held ticket fails, and a 64-sat ticket has no output in any channel's transaction. These are
-  the owner's settings, with the earlier numbers as their defaults: `tickets.pool` (8) and
-  `tickets.pool_many` (2) for the pool, `tickets.max_locked_tickets` (64) for all sessions, and
-  `tickets.floor_ticket_sats` (64) for the smallest ticket the wallet chooses. An owner whose
-  channels carry 30 sets the pool to 2, `max_locked_tickets` to 15 and the floor to 546
-  (`docs/TICKETS.md`, section 11); nothing in the wallet does it for them.
+- The defaults are sized for a channel that carries 30 pending payments: a pool of 2 tickets
+  with each of up to 4 sellers of a task and 1 beyond that (`tickets.pool`, `pool_many`,
+  `many_sellers`), 15 held tickets in all (`max_locked_tickets`, `max_sellers`), and no held
+  ticket below 546 sat. Until 2026-10-13 they were 8, 2 beyond 8 sellers, 64 and 64 sat.
+- **A policy written before 2026-10-13 that sets none of these now means the new numbers.** One
+  that sets them keeps what it says, except in two places, each reported by `validate_policy` as
+  a warning: `floor_ticket_sats` below 546 no longer lowers the floor, and `max_locked_tickets`
+  above half of a channel's slots no longer raises what is held on that channel. And a policy
+  without `tickets.velocity` now counts a session as one payment for `velocity_max`, where it
+  counted every release (see "A release is one payment" below).
+- Before every lock the wallet reads its node's channel list and keeps two rules on the channels
+  the payment may leave on. The tickets to lock and the payments already pending outwards on a
+  channel, whoever's they are, stay within half of the slots it carries; and the ticket is not
+  below the larger dust limit of its two sides (`ticket_slots`, `ticket_dust`). A channel's
+  slots are the smaller of the two `max_accepted_htlcs` the node reports, and 30 where the
+  listing does not give both. With no channel list nothing is locked.
+- These rules see the wallet's own channels only. A hop's or a seller's channel that is full, or
+  that has a higher dust limit, is found by a payment failing, or not at all: a ticket that is
+  dust on a channel further along the route is locked all the same, and can be lost by whoever
+  offered it on that channel if the channel is force-closed while the ticket is held.
+- The wallet's node chooses which of its usable channels a ticket leaves on. The wallet
+  therefore takes the smallest of them for the budget and the fullest for the room, which on a
+  node with a 30-slot and a 483-slot channel holds 15 tickets in all although the larger channel
+  has room for more.
+- On a channel that is not an anchor channel the dust limit is taken with the fee of the HTLC's
+  own transaction at four times the channel's present fee rate. A rate that rises further while
+  a ticket is held can still take the ticket below the limit. A channel type the wallet does not
+  know by name is taken as one without anchors; one the listing does not name at all, as an
+  anchor channel. The wallet does not read the dust the node already carries on a channel
+  against the node's own cap on it.
+- A lock that fails as a full channel does (the node reports `INSUFFICIENT_BALANCE`, `NO_ROUTE`
+  or an error with no HTLC out) halves the session's pool, never below 1, and nothing is locked
+  with that seller for 30 seconds, doubling with each failed round in a row up to 10 minutes.
+  After the third round in a row no ticket is held with that seller for 10 minutes
+  (`ticket_route_full`), and the first failed round after that is 10 more. A new session with
+  the seller starts where the last one stopped. The wallet cannot tell a full channel from one
+  that is short of balance or from a seller that is unreachable, and treats all three this way.
+- The smaller pool stays for the rest of the session, also after the route has room again.
+- A ticket that meets a full channel at a later hop is in flight on the wallet's node for a
+  moment before the refusal is back (seen on the lab). In that moment the book shows it locked.
+  The wallet releases a ticket only after the seller has shown it locked, so no secret leaves
+  for it; a call that had chosen it takes the session's next ticket.
+- With 2 tickets held, a buyer that uses tickets faster than one can be locked waits for locks:
+  a 100 MB file of 20 tickets took 3.4 to 3.7 s on the lab, against 1.7 to 1.9 s with a pool of
+  8 (`scripts/ticket_e2e_regtest.sh`, `stream`). The remedy is a larger ticket, which the owner
+  allows with `tickets.max_ticket_sats`, and not a larger pool.
+- At most 8 ticket payments are with the node's router at once, held and prepaid together, for
+  all sessions of the wallet. Other payments of the node (`ln_pay`, the owner's own) are not
+  counted, and a lock round of more than 8 tickets takes correspondingly longer.
 
 - Tickets are off until the owner's policy turns them on (`tickets.enabled`) and names at least
   one task with a budget (`tickets.tasks`); with tickets on and no task, every session is refused.
@@ -319,6 +395,13 @@ built. Run on regtest only (`scripts/ticket_book_regtest.sh`).
   locked stays booked.
 - The wallet locks and releases nothing between a start and the first complete read of its node's
   payment list (`ticket_sync`); with the node down that is until the node is back.
+- A ticket is locked for as long as the wallet's node says its payment is in flight. Seen on the
+  lab: a Lightning Fork node killed in the instant it was sending a ticket's payment kept that
+  payment `IN_FLIGHT`, with no HTLC on its channel, after it came back and after a further clean
+  restart. The wallet counts such a ticket as locked, against its caps and its slot budget, until
+  the node gives the payment up; how long the node takes was not followed. With a pool of 2 the
+  next ticket is sent after every release, so a node that dies right after a paid request is
+  more likely to be caught in that instant than it was with a pool of 8.
 - For a moment after a ticket settles, `ticket_status` can show the node and the book as not
   agreeing: the node reports the payment settled before it has taken the HTLC off its channel.
 - The seller's node receives a 32-byte tag with every ticket (a random nonce and a MAC). It tells
@@ -335,15 +418,17 @@ built. Run on regtest only (`scripts/ticket_book_regtest.sh`).
 - Nothing is locked that the budgets could not also release at that moment, but locked tickets
   are not booked: another payment of the wallet can use the budget meanwhile, and the tickets are
   then not released and stay locked until the seller cancels them or they expire.
-- A release is one payment under every rule of the wallet. With the shipped `velocity_max` of 8
-  an hour and no `tickets.velocity` in the policy, a wallet releases at most 8 tickets an hour,
-  across all rails: an answer priced as it goes stops at the eighth ticket (8,000 sat with the
-  default ticket). An owner who streams sets `tickets.velocity` to `"session"`: a session is then
-  one payment for `velocity_max`, counted from its first release for as long as one of its
-  releases is inside the window, and its releases are bounded by the budgets, the caps on locked
-  funds and `max_sends_per_hour` (1,200). Under `"session"` the ninth session of an hour is
-  refused when it opens. Releases to one seller inside `split_window_s` add up against
-  `max_per_tx_sats` and the human threshold as any split payment does, under either setting.
+- A release is one payment under every rule of the wallet but one: for `velocity_max` a ticket
+  session is one payment (`tickets.velocity: "session"`, the default since 2026-10-13), counted
+  from its first release for as long as one of its releases is inside the window. Its releases
+  are bounded by the budgets, the caps on locked funds and `max_sends_per_hour` (1,200), not by
+  `velocity_max`: with the shipped 8 an hour, the ninth session of an hour is refused when it
+  opens, and a session can release until a budget stops it. An owner who wants every release
+  counted sets `"release"`: a wallet then releases at most 8 tickets an hour across all rails,
+  and an answer priced as it goes stops at the eighth (8,000 sat with the default ticket). This
+  was the meaning of a policy without the setting until 2026-10-13. Releases to one seller
+  inside `split_window_s` add up against `max_per_tx_sats` and the human threshold as any split
+  payment does, under either setting.
 - A ticket released before this version has no session in its ledger row and counts as one
   payment under either setting.
 - No release can wait for a human: a session whose one ticket, with its fee limit, would reach
@@ -353,7 +438,7 @@ built. Run on regtest only (`scripts/ticket_book_regtest.sh`).
   names nobody. Under `xbt402_pay` the origin is the one the signer itself fetched the terms
   from; on the socket's `ticket_open` it is the caller's word.
 - A seller the owner has not named is paid only under a task that admits any seller, and by
-  default at most 2 tickets locked and 4 tickets' worth paid in the task's window. The cap is per
+  default at most 1 ticket locked and 4 tickets' worth paid in the task's window. The cap is per
   node id, and node ids are free to make: what bounds a seller that takes a ticket and serves
   nothing, under as many node ids as it likes, is the task's budget.
 - A task's budget is read over a rolling window of at most a week (a day by default), from the
@@ -362,11 +447,13 @@ built. Run on regtest only (`scripts/ticket_book_regtest.sh`).
 - One session per seller at a time; a session with no lock or release for 10 minutes is stopped,
   and no session survives a start of the signer.
 - On the six socket methods the signer does not talk to sellers. It says how many hashes a pool
-  wants (below half of the pool: back to the pool's size) and the caller fetches the invoices; a
+  wants (with half of the pool or fewer left: back to the pool's size; with 2, when 1 is left)
+  and the caller fetches the invoices; a
   refill happens when the caller asks, and stopping a session only names the tickets to cancel.
   Under `xbt402_pay` the signer does all of this itself (the next section).
 - A hash whose invoice the book refused (a cap was reached) keeps its place in the pool for 2
-  minutes: the pool asks for no other hash in its place until then. Under `xbt402_pay` a round
+  minutes: the pool asks for no other hash in its place until then. One refused for lack of a
+  slot or for dust is given up at once, and the session's wait takes its place. Under `xbt402_pay` a round
   that never came to an invoice being judged (the seller's lock answer was lost or refused, or
   the wallet's own node could not be asked) gives its hashes up at once; on the socket's methods
   such hashes also wait their 2 minutes.
@@ -410,8 +497,39 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
   budget and its cap per unnamed seller.
 - The wallet sends a secret only in `release`. A seller that takes a secret only with the request
   it pays for cannot be paid; the gateway takes both.
-- An entry that releases `after-verify` or settles `on-arrival` is not paid: the wallet passes it
-  over and tries the next rail.
+- An entry that releases `after-verify` is not paid: the wallet passes it over and tries the
+  next rail.
+- Held tickets are the wallet's first choice. It buys a prepaid ticket (`settle: "on-arrival"`)
+  only when the seller's 402 lists that entry and no ticket can be held: the slot budget has no
+  room, the ticket would be dust on the wallet's channel, a lock found no slot and the session
+  waits, the seller answered `slots_short`, or the seller offers nothing else. Where none of
+  these holds and the seller offers no prepaid tickets, the call is refused with the reason and
+  the seconds to wait (`retry_after_s`), or the next rail of the 402 is tried.
+- A prepaid ticket is spent when it is paid, used or not: the wallet books it in the ledger,
+  under every rule of a release, before the payment is sent. The buyer's worst case is the same
+  one ticket as with a held one, with two differences: an unused prepaid ticket never comes
+  back, and a seller that takes the payment and then refuses the preimage keeps it. The wallet
+  buys one at a time, when the balance does not cover the next piece, and never one ahead.
+- Each prepaid ticket costs the answer a pause: the seller's invoice, the payment and the
+  seller's word that it was credited, 0.21 s at the median through one hop on the lab
+  (`scripts/gateway_regtest.sh`, `prepaid`) and 0.32 s a ticket through the wallet
+  (`scripts/ticket_e2e_regtest.sh`, `slots`), where a held ticket that is already locked costs
+  one request. An answer priced as it goes is slower by that much per
+  ticket, and a seller that waits less than that for a refill would cut it.
+- A prepaid payment whose fate the wallet's node cannot tell within the Lightning rail's
+  `timeout_s` and 5 seconds stays booked as spent, and the session is stopped as faulty. The
+  booking goes when the node shows the payment failed, or, for a payment the node never had,
+  60 seconds after the timeout.
+- The wallet keeps a prepaid ticket's preimage in memory until the seller has credited it. A
+  signer killed in between has paid for a ticket whose balance it then gives up with the
+  session, as it gives up any balance at a restart. The gateway credits the session all the
+  same, 75 seconds after it issued the invoice.
+- The slot and dust checks, the wait after a failed lock and the fallback run on the wallet's
+  own node and on what the seller says. A seller that always answers `slots_short` is paid with
+  prepaid tickets or not at all; it cannot make the wallet hold more, pay more, or pay sooner.
+- After a lock round, the wallet asks the seller to cancel the invoices of that round that were
+  refused or failed. The answer is not read; a seller that does not cancel them holds its own
+  places until the invoices lapse.
 - No ticket is released until the seller's signed `status` shows it locked. A seller that never
   shows it is not paid (`ticket_not_ready` after 3 s), and its tickets stay locked until it
   cancels them or they expire.
@@ -450,8 +568,11 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
   on the lab.
 - The MCP's in-process payer (`XBT_MCP_PAYER=local`) pays channels only.
 - Not run: more than one hop, real network latency, TLS to a seller, mainnet, the Core Lightning
-  fork, more than one seller at once through this path, and a seller other than `xbt-gateway`.
-  An answer priced by the second was run against the gateway in process, not on the lab.
+  fork (no Core Lightning node was in the lab of these scripts: the 30-slot channel there is
+  one a Lightning Fork node opened with `--default-remote-max-htlcs=30`, which bounds what its
+  peer sends it and not, as a Core Lightning node does, what it sends itself), more than one
+  seller at once through this path, and a seller other than `xbt-gateway`. An answer priced by
+  the second was run against the gateway in process, not on the lab.
 
 ### Channel and transport (library client) (frozen)
 

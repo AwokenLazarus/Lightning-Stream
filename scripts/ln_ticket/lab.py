@@ -341,6 +341,14 @@ def pay(buyer: str, tickets: list[Ticket], macaroon: str | None = None, timeout_
     )
 
 
+def pay_invoice(buyer: str, invoice: str, timeout_s: int = 30) -> dict[str, Any]:
+    """Pay one invoice from `buyer`: the payment's first update (IN_FLIGHT, or FAILED or SUCCEEDED
+    at once). A hold invoice stays IN_FLIGHT, pending on every channel of its route, until its
+    seller settles or cancels it."""
+    body = {"timeout_seconds": timeout_s, "fee_limit_msat": "100000", "payment_request": invoice}
+    return stream(buyer, "POST", "/v2/router/send", body, lambda u: u["status"] in ("IN_FLIGHT", "SUCCEEDED", "FAILED"))
+
+
 def state(seller: str, ticket: Ticket, macaroon: str | None = None) -> str:
     return get(seller, "/v2/invoices/lookup?payment_hash=" + url64(ticket.hash), macaroon)["state"]
 

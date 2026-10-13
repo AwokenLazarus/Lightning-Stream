@@ -9,7 +9,7 @@ use common::*;
 use serde_json::{json, Value};
 use xbt402::ticket::ticket_hash;
 use xbt402::wire::unb64json;
-use xbt_gateway::node::{InvoiceState, Node};
+use xbt_gateway::node::{Channel, InvoiceState, Node};
 use xbt_gateway::standin::StandIn;
 
 const KEY: fn(&Rig) -> String = |r| r.gw.terms().receipt_key.clone();
@@ -452,7 +452,9 @@ fn a_hostile_buyer_gets_nothing_it_did_not_pay_for() {
 
 #[test]
 fn locks_and_sessions_are_capped_and_a_flood_stops_at_the_caps() {
-    let (rig, _d) = start(&|v| v["caps"] = json!({"max_sessions": 5, "sessions_per_address": 3}));
+    let (rig, _d) = start(&|v| {
+        v["caps"] = json!({"max_sessions": 5, "sessions_per_address": 3, "inbound_slots": 483})
+    });
     // one address: three sessions
     let mut buyers: Vec<Buyer> = vec![];
     for i in 0..3 {
@@ -662,7 +664,7 @@ fn a_body_priced_per_byte_is_paid_as_it_arrives() {
     // 100 MB body would need one; price it 200 times dearer to make the body need many
     let (rig, _d) = start(&|v| {
         v["routes"][0]["price"] = json!({"byte_msat": 200_000, "per_bytes": 1_048_576});
-        v["tickets"] = json!({"ticket_msat": 2_000_000});
+        v["tickets"] = json!({"ticket_msat": 2_000_000, "max_tickets": 8});
     });
     let mut b = Buyer::new(&rig, 1);
     let size = 100_000_000usize;
@@ -1401,4 +1403,317 @@ fn thousands_of_requests_from_one_buyer_are_bounded_by_what_it_paid() {
     // (a request whose answer the service failed to finish is asked again and charged once)
     assert!(rig.hits() >= 400);
     let _: Value = b.status();
+}
+
+/// The shipped caps: nothing set under `tickets` and `caps` but the per-address cap, which the
+/// tests' one address would meet first.
+fn shipped(v: &mut Value) {
+    v["tickets"] = json!({});
+    v["caps"] = json!({"sessions_per_address": 0});
+}
+
+#[test]
+fn held_tickets_stop_at_half_of_a_30_slot_channel_and_the_next_buyer_is_told_to_wait() {
+    let (rig, _d) = start(&shipped);
+    // the terms: two ways to pay, the held one first, 2 tickets a session
+    let pr = http(&rig.addr, "GET", "/api", &[], b"", None).json();
+    let ways: Vec<(&str, u64)> = pr["accepts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| {
+            (
+                a["extra"]["settle"].as_str().unwrap(),
+                a["extra"]["maxTickets"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(ways, vec![("on-use", 2), ("on-arrival", 2)]);
+    // seven buyers hold 2 each: 14 of the 15
+    let mut buyers: Vec<Buyer> = vec![];
+    for i in 0..7u8 {
+        let mut b = Buyer::new(&rig, i + 1);
+        let s = b.fresh_secrets(3);
+        assert_eq!(
+            b.lock_raw(&s).status,
+            400,
+            "more than a session holds is a bad request"
+        );
+        b.lock(&rig, 2);
+        buyers.push(b);
+    }
+    assert_eq!(rig.gw.stats().held_tickets, 14);
+    // the eighth gets the place that is left
+    let mut eighth = Buyer::new(&rig, 8);
+    let s = eighth.fresh_secrets(2);
+    let got = eighth.lock_raw(&s);
+    assert_eq!(
+        (got.status, got.json()["tickets"].as_array().unwrap().len()),
+        (200, 1)
+    );
+    assert_eq!(
+        (rig.gw.stats().held_tickets, rig.gw.stats().max_held),
+        (15, 15)
+    );
+    // the ninth is told to wait, has no session, and the node was asked for nothing
+    let asked = rig.node.invoices();
+    let mut ninth = Buyer::new(&rig, 9);
+    let s = ninth.fresh_secrets(2);
+    let got = ninth.lock_raw(&s);
+    assert_eq!(
+        (got.status, got.json()),
+        (402, json!({"error": "slots_short", "retryAfter": 30}))
+    );
+    assert_eq!((rig.node.invoices(), rig.gw.stats().sessions), (asked, 8));
+    // a session that has released one of its two is told the same when it asks for the next:
+    // signed, so that the buyer knows it is the seller that says so
+    let secrets = buyers[0].fresh_secrets(1);
+    let first = secret_of(1, 4);
+    assert_eq!(
+        buyers[0].release(&[first]).json()["released"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    // its released place went to nobody yet: it gets it back
+    let again = buyers[0].lock_raw(&secrets);
+    assert_eq!(again.status, 200);
+    let mut tenth = Buyer::new(&rig, 10);
+    let s = tenth.fresh_secrets(1);
+    assert_eq!(tenth.lock_raw(&s).error(), "slots_short");
+    // the eighth, with one of two, asks for its second while the cap is full
+    let s = eighth.fresh_secrets(1);
+    let got = eighth.lock_raw(&s);
+    assert_eq!((got.status, got.error().as_str()), (402, "slots_short"));
+    assert_eq!(got.json()["retryAfter"], 30);
+    let r = got.receipt(&KEY(&rig));
+    assert_eq!(r["charged"], "0");
+    // the buyer who was told to wait pays without a held ticket instead
+    let got = ninth.lock_prepaid(1);
+    assert_eq!(got.status, 200, "{}", got.json());
+    assert_eq!(
+        (rig.gw.stats().held_tickets, rig.gw.stats().prepaid_tickets),
+        (15, 1)
+    );
+}
+
+#[test]
+fn a_prepaid_ticket_is_credited_once_when_its_preimage_is_presented_after_it_was_paid() {
+    let (rig, _d) = start(&shipped);
+    let mut b = Buyer::new(&rig, 1);
+    let got = b.lock_prepaid(1);
+    assert_eq!(got.status, 200, "{}", got.json());
+    let j = got.json();
+    let tickets = j["tickets"].as_array().unwrap();
+    assert_eq!(tickets.len(), 1);
+    let hash = xbt402::ticket::hex32(tickets[0]["hash"].as_str().unwrap()).unwrap();
+    assert!(tickets[0]["invoice"]
+        .as_str()
+        .is_some_and(|i| !i.is_empty()));
+    assert_eq!(
+        (
+            rig.node.calls("add_invoice"),
+            rig.node.calls("add_hold"),
+            rig.gw.stats().held_tickets
+        ),
+        (1, 0, 0),
+        "an ordinary invoice, and nothing held"
+    );
+    let st = b.status();
+    assert_eq!(st["tickets"][0]["settle"], "on-arrival");
+    assert_eq!(st["tickets"][0]["state"], "OPEN");
+    // nothing is credited before the node shows it paid, whatever is presented
+    assert_eq!(rig.node.paid_preimage(&hash), None);
+    let guess = [9u8; 32];
+    let refused = b.release(&[guess]).json();
+    assert_eq!(refused["refused"][0]["error"], "ticket_unknown");
+    assert_eq!(b.balance(), 0);
+    assert_eq!(b.get("/api", None).error(), "balance_short");
+    // the buyer pays; its node hands it the preimage
+    assert!(rig.node.pay(&hash));
+    let preimage = rig.node.paid_preimage(&hash).unwrap();
+    assert_eq!(ticket_hash(&preimage), hash);
+    let settles = rig.node.calls("settle");
+    let got = b.release(&[preimage]);
+    assert_eq!(got.json()["released"], json!([hex::encode(hash)]));
+    assert_eq!(got.receipt(&KEY(&rig))["releasedMsat"], "1000000");
+    assert_eq!(
+        rig.node.calls("settle"),
+        settles,
+        "no settle call: there was nothing held"
+    );
+    // once
+    assert_eq!(
+        b.release(&[preimage]).json()["refused"][0]["error"],
+        "ticket_used"
+    );
+    assert_eq!(b.balance(), 1_000_000);
+    // and it pays for requests like any released ticket
+    let got = b.get("/api", None);
+    assert_eq!(got.status, 200);
+    assert_eq!(b.balance(), 1_000_000 - 2500);
+    // one that was issued and never paid: presented, it buys nothing; the janitor gives it up
+    let got = b.lock_prepaid(2).json();
+    let unpaid: Vec<[u8; 32]> = got["tickets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| xbt402::ticket::hex32(t["hash"].as_str().unwrap()).unwrap())
+        .collect();
+    assert_eq!(unpaid.len(), 2);
+    assert_eq!(b.lock_prepaid(1).error(), "too_many_tickets");
+    // one of the two is paid and never presented: the janitor credits it all the same
+    assert!(rig.node.pay(&unpaid[0]));
+    rig.advance(76);
+    rig.gw.tick();
+    wait_for("the paid one credited and the unpaid one cancelled", || {
+        rig.gw.stats().prepaid_tickets == 0
+    });
+    assert_eq!(rig.node.state_of(&unpaid[1]), Some(InvoiceState::Canceled));
+    assert_eq!(b.balance(), 2_000_000 - 2500);
+}
+
+#[test]
+fn a_prepaid_ticket_outlives_a_restart_and_a_seller_can_offer_nothing_else() {
+    let dir = tempfile::tempdir().unwrap();
+    let only_prepaid = |v: &mut Value| {
+        // no held ticket is offered, so a ticket below the dust limit is no dust
+        v["tickets"] = json!({"ticket_msat": 64_000, "settle": ["on-arrival"]});
+        v["caps"] = json!({"sessions_per_address": 0});
+        v["routes"] = json!([{"path": "/api", "price": {"request_msat": 2500}}]);
+    };
+    let rig = start_on(
+        dir.path(),
+        std::sync::Arc::new(StandIn::new(100)),
+        start_service(),
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1_000_000)),
+        &only_prepaid,
+    );
+    let pr = http(&rig.addr, "GET", "/api", &[], b"", None).json();
+    assert_eq!(pr["accepts"].as_array().unwrap().len(), 1);
+    assert_eq!(pr["accepts"][0]["extra"]["settle"], "on-arrival");
+    assert_eq!(pr["accepts"][0]["extra"]["ticketMsat"], "64000");
+    let mut b = Buyer::new(&rig, 1);
+    // a held ticket is not on offer
+    let s = b.fresh_secrets(1);
+    assert_eq!(b.lock_raw(&s).status, 400);
+    let j = b.lock_prepaid(1).json();
+    let hash = xbt402::ticket::hex32(j["tickets"][0]["hash"].as_str().unwrap()).unwrap();
+    let (session, key, seq) = (b.session.clone(), b.key, b.seq);
+    // the gateway restarts with the invoice unpaid; the buyer pays meanwhile
+    let (node, service, clock) = rig.stop();
+    assert!(node.pay(&hash));
+    let rig = start_on(dir.path(), node, service, clock, &only_prepaid);
+    assert_eq!(
+        rig.gw.stats().prepaid_tickets,
+        0,
+        "read from the node at start, and credited"
+    );
+    let mut b = Buyer::new(&rig, 1);
+    (b.session, b.key, b.seq) = (session, key, seq);
+    assert_eq!(b.balance(), 64_000);
+    let preimage = rig.node.paid_preimage(&hash).unwrap();
+    assert_eq!(
+        b.release(&[preimage]).json()["refused"][0]["error"],
+        "ticket_used",
+        "credited at the start, from the node's word: the balance is there, and it is not credited twice"
+    );
+    assert_eq!(b.get("/api", None).status, 200);
+}
+
+#[test]
+fn a_gateway_given_a_channels_macaroon_sizes_itself_and_waits_while_a_channel_is_half_full() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = std::sync::Arc::new(StandIn::new(100));
+    // two inbound channels: one with a Lightning Fork node (483), one with a Core Lightning node (30)
+    node.set_channels(Some(vec![
+        Channel {
+            slots: 483,
+            pending_in: 3,
+        },
+        Channel {
+            slots: 30,
+            pending_in: 0,
+        },
+    ]));
+    let sized = |v: &mut Value| {
+        v["tickets"] = json!({});
+        v["caps"] = json!({"sessions_per_address": 0, "inbound_slots": 483});
+        v["node"]["channels_macaroon"] = json!("unused");
+    };
+    let rig = start_on(
+        dir.path(),
+        node,
+        start_service(),
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1_000_000)),
+        &sized,
+    );
+    assert_eq!(
+        rig.gw.stats().max_held,
+        15,
+        "half of the smallest channel, whatever the config assumed"
+    );
+    let mut b = Buyer::new(&rig, 1);
+    b.lock(&rig, 2);
+    // the 30-slot channel is half full of pending payments (anyone's): nothing more is issued
+    rig.node.set_channels(Some(vec![
+        Channel {
+            slots: 483,
+            pending_in: 3,
+        },
+        Channel {
+            slots: 30,
+            pending_in: 15,
+        },
+    ]));
+    let mut c = Buyer::new(&rig, 2);
+    let s = c.fresh_secrets(1);
+    let got = c.lock_raw(&s);
+    assert_eq!((got.status, got.error().as_str()), (402, "slots_short"));
+    assert_eq!(rig.gw.stats().sessions, 1);
+    // it empties: issued again
+    rig.node.set_channels(Some(vec![
+        Channel {
+            slots: 483,
+            pending_in: 3,
+        },
+        Channel {
+            slots: 30,
+            pending_in: 14,
+        },
+    ]));
+    assert_eq!(c.lock_raw(&s).status, 200);
+    // the smaller channel closes: the cap follows the channels that are left
+    rig.node.set_channels(Some(vec![Channel {
+        slots: 483,
+        pending_in: 3,
+    }]));
+    let s = c.fresh_secrets(1);
+    assert_eq!(c.lock_raw(&s).status, 200);
+    assert_eq!(rig.gw.stats().max_held, 241);
+    // no channel at all: no held ticket
+    rig.node.set_channels(Some(vec![]));
+    let mut d = Buyer::new(&rig, 3);
+    let s = d.fresh_secrets(1);
+    assert_eq!(d.lock_raw(&s).error(), "slots_short");
+    assert_eq!(rig.gw.stats().max_held, 0);
+    // the list cannot be read: the config's own cap, never a wider one
+    rig.node.set_channels(None);
+    assert_eq!(d.lock_raw(&s).status, 200);
+    assert_eq!(
+        rig.gw.stats().max_held,
+        241,
+        "caps.inbound_slots 483 in this config"
+    );
+    // and a gateway whose macaroon does not work does not start
+    let dir2 = tempfile::tempdir().unwrap();
+    let cfg = config(dir2.path(), "http://127.0.0.1:9", &sized);
+    let started = xbt_gateway::gateway::Gateway::start(
+        xbt_gateway::config::Config::from_json(&cfg).unwrap(),
+        std::sync::Arc::new(StandIn::new(100)),
+        receipt_secret(),
+        Box::new(|| 1),
+    );
+    assert!(started.is_err_and(|e| e.to_string().contains("channels")));
 }
