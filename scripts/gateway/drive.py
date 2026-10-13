@@ -627,7 +627,7 @@ def fetch() -> None:
     while not done.is_set() and b.released < stop_at:
         if b.balance() == 0:
             b.release(pool.pop(0))
-            if len(pool) < POOL and b.released + len(pool) < stop_at:
+            if len(pool) < POOL:
                 pool += b.lock(1)
                 locks += 1
         else:
@@ -765,10 +765,11 @@ def locked() -> None:
     b.learn("/small.txt")
     served = upstream_requests("/small.txt")
     # issued, never paid
-    _, unpaid = a.ask(2)
+    _, unpaid = a.ask(1)
     got = a.get("/small.txt", unpaid[0])
     check("locked: a secret for a ticket that was never paid buys nothing", (got.status, got.error()) == (402, "ticket_not_locked") and seller_state(unpaid[0]) == "OPEN", {"http": got.status, "error": got.error(), "node": seller_state(unpaid[0])})
-    sa, sb = a.lock(2), b.lock(2)
+    # (the unpaid one still has one of the session's two places)
+    sa, sb = a.lock(1), b.lock(POOL)
     ok1 = a.get("/small.txt", sa[0]).status == 200
     # the same request again, byte for byte
     header = a.header("GET", "/small.txt", b"")
@@ -921,6 +922,9 @@ def prepaid() -> None:
     refused, _ = b.ask(POOL)
     served = upstream_requests("/small.txt")
     secret, secs = b.buy_prepaid()
+    # the payment is settled before its HTLC is off the channel: a moment, not a hold
+    gone = lab.wait("the prepaid ticket's payment to be off the seller's channel", 10, lambda: lab.pending_htlcs(SELLER) == idle, every=0.02)
+    measured("prepaid_off_the_channel_after_s", round(gone, 3))
     h = health()
     check("prepaid: with the held cap full a held ticket is refused (slots_short) and a prepaid one is issued and paid; nothing is pending on the seller's channel",
           (refused.status, refused.error()) == (402, "slots_short") and h["heldTickets"] == HELD_CAP and h["prepaidTickets"] == 1 and lab.pending_htlcs(SELLER) == idle and seller_state(secret) == "SETTLED",
@@ -946,6 +950,7 @@ def prepaid() -> None:
             raise LabError("a paid prepaid ticket was not credited")
         times.append(t2 + time.perf_counter() - t0)
     measured("prepaid_ticket_ms", lab.spread(times))
+    lab.wait("the last payment to be off the seller's channel", 10, lambda: lab.pending_htlcs(SELLER) == idle, every=0.02)
     fees = sum(p.fee_msat for p in lab.payments(BUYER, list(b.tickets.values())) if p.status == "SUCCEEDED")
     check("prepaid: ten prepaid tickets bought one at a time through the hop: each from the lock request to the seller's signed credit, all credited, none held",
           int(b.status()["session"]["releasedMsat"]) == 10 * TICKET_MSAT and b.bad_receipts == 0 and lab.pending_htlcs(SELLER) == idle,
