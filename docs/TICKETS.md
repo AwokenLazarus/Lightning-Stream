@@ -699,7 +699,13 @@ The buyer MUST write the spend down, on disk, before the payment leaves, and tak
 when its own node shows the payment failed with nothing in flight. It books what its node paid
 and the fee its node reports, never an expected value and never a number in a receipt. The
 wallet sends at most 8 payments to its node's router at once, tickets and wins together (section
-7).
+7). They go in the order they were found, with one exception: a win that its seller's answer
+stands still for (section 9.6) goes before the wins no seller waits for. A buyer that pays many
+sellers at once SHOULD do the same, or such a win waits behind all the others while its seller
+counts 10 s. The buyer knows which wins these are by its own count against the terms, and takes
+no seller's word for it: with more than `maxUnpaidWins` wins of a session unpaid, the oldest
+ones above that number; and a win since which it has given values for `gracePieces` pieces,
+less the `window` the seller may be ahead of it.
 
 The seller treats a win as paid when its own node shows that invoice settled for the full
 amount, never on the buyer's word. The gateway makes the preimage of each invoice itself, gives
@@ -732,7 +738,9 @@ The seller goes first, and these are what bound it:
   of the three a request is refused `win_unpaid`, with the unpaid wins and their invoices, and
   an answer that is being sent stands still for the payment (10 s at the gateway, and never
   beyond the grace) and is then cut short. Service goes on when the seller's node shows the wins
-  paid.
+  paid. A file of 64 pieces at one win expected draws three or more wins 8 times in 100,
+  and its answer then stands still at the third until the first is paid: what that takes is the
+  buyer's to keep short (section 9.5).
 
 A buyer that gives values and never pays is therefore served up to its first win, and the grace.
 Nothing on today's Lightning makes it pay: the lottery is a cheap way for buyers who mean to pay
@@ -877,7 +885,8 @@ numbers are one run's; a draw is random, so the wins differ from run to run.
 - The gate that lets 8 payments through at a time let a win out when its send returned, as it
   does a held ticket. With 100 sellers, 24 wins were pending on the 30-slot channel at once and
   47 of 313 payments failed. A win now stays inside the gate, with the checks before it, until
-  the node shows it over, and wins go through in the order they were found.
+  the node shows it over, and wins go through in the order they were found (but see the last
+  item).
 - The gateway's grace of 10 s was sized for wins that are not paced. Paced 8 at a time, the last
   of 100 sellers' wins waited 13 s. The default is 30 s, and an answer that is being sent stands
   still for a payment for 10 s at the most.
@@ -887,6 +896,17 @@ numbers are one run's; a draw is random, so the wins differ from run to run.
   next request was refused `value_missing`. The wallet now names them as void.
 - A win whose payment could not begin, or was not final when the wallet stopped waiting, was not
   looked at again. It is owed again, and the wallet asks the seller for its list while one is.
+- With 100 sellers, a file that drew three wins was cut short by its seller, with every one of
+  its wins paid a moment later (2026-10-13). The gateway bears two unpaid wins; at the third
+  its answer stands still, for 10 s at the most. The first of the three was waiting its turn
+  behind the other sellers' wins: about 7 s by the rate (100 wins at 14 a second) when the
+  host did nothing else, where 13 runs of the swarm check cut no file, and more than 10 s when
+  it was busy. With 16 busy loops beside the lab (`while :; do :; done`, on its 16 cores), a
+  file was cut in 12 of 15 runs of the swarm check: 5 of 5 at the tree before this change (a
+  compile ran beside those as well), 3 of 5 at the one before the on-chain channel was removed,
+  and 4 of 5 at the tree the lottery was first merged in. The wallet now pays first the wins a seller's answer stands still for (section
+  9.5): under the same load, 5 runs of 5 had every file whole. The numbers are of one lab on
+  one day; the load is not a measure of anything but itself.
 
 ## 10. What building the seller changed in this draft
 

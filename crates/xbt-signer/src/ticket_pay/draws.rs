@@ -19,6 +19,7 @@
 //! | What is booked is what the node paid. | The ledger rows are the book's, written before a payment is sent and made exact when the node shows it settled. A seller's `wonMsat` or `paidMsat` moves nothing. |
 //! | A call uses at most `max_sats` by the wallet's own count, and pays at most the luck cap above it. | [`Signer::draw_stream`] stops reading when the pieces it gave values for cost `max_sats`, or when the wins of the call reach [`xbt402::lottery::luck_cap_msat`]; the task's budget and the caps per seller refuse a payment whatever the draws did. |
 //! | At most 8 payments are with the router at once. | Every win goes through [`crate::ticket_rail::Pace`], with every ticket. |
+//! | A win the seller's answer stands still for is paid before the wins no seller waits for. | [`Signer::draw_hurry`], by the wallet's own count against the seller's terms (`maxUnpaidWins`, `gracePieces`): while an answer is being read, and for a request the seller refused `win_unpaid`. A seller's word moves no payment forward. |
 //! | No request leaves for a host the owner did not allow, and none over a channel others can read. | [`Signer::ticket_may_reach`] before every request; `private_channel` before a session is opened (the session key comes back in the open's answer). |
 //!
 //! Locks: a session's `busy` (one paid request at a time), then `link` (one HTTP exchange at a
@@ -99,6 +100,8 @@ struct State {
     /// Invoices the payer has been given, each by 16 bytes of its SHA-256: one is looked at once, whatever
     /// became of it. One entry for every try of a win, so at most as many as the session has rounds.
     tried: HashSet<[u8; 16]>,
+    /// The draws of the wins a payer has now: it has not come back with what became of the payment.
+    paying: HashSet<u64>,
     draws: u64,
     wins: u64,
     wins_paid: u64,
@@ -523,7 +526,7 @@ impl Signer {
             // what was honestly won in this answer is still paid; the session then ends
             for (w, inv) in &wins {
                 if let Some(inv) = inv {
-                    self.draw_pay(ds, w, inv, counted);
+                    self.draw_pay(ds, w, inv, false, counted);
                 }
             }
             return Err(self.draw_fault(ds, &why));
@@ -533,12 +536,15 @@ impl Signer {
 
     /// Pay one win with the seller's invoice for it, through the ticket rail. What the payment
     /// booked goes into the session's and the call's counts; a refusal is noted with its rule, and
-    /// a refusal by the owner's bounds stops the call asking for more.
-    fn draw_pay(&self, ds: &DrawSession, win: &Win, invoice: &str, counted: &Mutex<Counted>) {
-        let out = self.lottery_pay_win(&ds.sid, win, invoice);
+    /// a refusal by the owner's bounds stops the call asking for more. `first`: the seller stands
+    /// still for this win already.
+    fn draw_pay(&self, ds: &DrawSession, win: &Win, invoice: &str, first: bool, counted: &Mutex<Counted>) {
+        lock(&ds.state).paying.insert(win.draw());
+        let out = self.lottery_pay_win(&ds.sid, win, invoice, first);
         let charged = py_int(out.get("charged_sats")).unwrap_or(0).max(0);
         let rule = str_or_empty(out.get("rule"));
         let mut s = lock(&ds.state);
+        s.paying.remove(&win.draw());
         let mut c = lock(counted);
         match out.get("verdict").and_then(Value::as_str) {
             Some("allow") => {
@@ -599,6 +605,33 @@ impl Signer {
                     c.halt = true;
                 }
             }
+        }
+    }
+
+    /// The wins of this session that the seller's answer stands still for, by the wallet's own
+    /// count against the seller's terms: they go through the gate before the wins no seller waits
+    /// for. A seller serves on beside `maxUnpaidWins` unpaid wins, and beside a win for
+    /// `gracePieces` pieces after it; beyond either its answer stands still, for 10 s at the
+    /// gateway, and is then cut short. So with more than `maxUnpaidWins` unpaid, the oldest of them
+    /// that are above that number go first; and a win goes first when the pieces the wallet has
+    /// given values for since it are within the seller's `window` of `gracePieces` (the seller is
+    /// that many pieces ahead of the wallet's values at the most). Called while an answer is being
+    /// read: of an answer that is over, no piece waits for a payment.
+    fn draw_hurry(&self, ds: &DrawSession) {
+        let first: Vec<u64> = {
+            let s = lock(&ds.state);
+            if s.paying.is_empty() {
+                return;
+            }
+            let mut unpaid: Vec<u64> = s.owed.iter().map(Win::draw).chain(s.paying.iter().copied()).collect();
+            unpaid.sort_unstable();
+            let above = unpaid.len().saturating_sub(ds.terms.max_unpaid_wins as usize);
+            let issued = s.buyer.as_ref().map_or(0, Buyer::issued);
+            let far = u64::from(ds.terms.grace_pieces).saturating_sub(u64::from(ds.terms.window));
+            unpaid.iter().enumerate().filter(|(i, d)| *i < above || issued.saturating_sub(**d) >= far).map(|(_, d)| *d).filter(|d| s.paying.contains(d)).collect()
+        };
+        if !first.is_empty() {
+            self.ticket_pace.hurry(&ds.sid, &first);
         }
     }
 
@@ -674,7 +707,8 @@ impl Signer {
                         Ok(r) => {
                             for (w, inv) in &r.wins {
                                 if let Some(inv) = inv {
-                                    self.draw_pay(ds, w, inv, &counted);
+                                    // the seller serves this request when they are paid: they go first
+                                    self.draw_pay(ds, w, inv, true, &counted);
                                 }
                             }
                             if lock(&counted).stop.is_none() {
@@ -794,6 +828,11 @@ impl Signer {
                         let pieces = if tries == 0 { std::mem::take(&mut s.pending) } else { vec![] };
                         (pieces, std::mem::take(&mut s.void), s.done)
                     };
+                    // a win the seller stands still for, or is about to: said on every round, since a payer may not have
+                    // reached the gate when its win became one
+                    if !done {
+                        self.draw_hurry(ds);
+                    }
                     let open = lock(&ds.state).buyer.as_ref().is_some_and(|b| b.open().next().is_some());
                     if pieces.is_empty() && voids.is_empty() && !open {
                         if done && lock(&shared).pending.is_empty() {
@@ -806,7 +845,7 @@ impl Signer {
                             if let Ok(r) = self.draw_round(ds, &[], &[], true, counted) {
                                 for (w, inv) in r.wins {
                                     if let Some(inv) = inv {
-                                        scope.spawn(move || self.draw_pay(ds, &w, &inv, counted));
+                                        scope.spawn(move || self.draw_pay(ds, &w, &inv, false, counted));
                                     }
                                 }
                             }
@@ -831,7 +870,7 @@ impl Signer {
                             for (w, inv) in r.wins {
                                 if let Some(inv) = inv {
                                     // paid beside the reading: a payment takes a quarter second through a hop
-                                    scope.spawn(move || self.draw_pay(ds, &w, &inv, counted));
+                                    scope.spawn(move || self.draw_pay(ds, &w, &inv, false, counted));
                                 }
                             }
                             tries = if r.again { tries + 1 } else { 0 };
@@ -939,7 +978,7 @@ impl Signer {
                 Ok(r) => {
                     for (w, inv) in &r.wins {
                         if let Some(inv) = inv {
-                            self.draw_pay(ds, w, inv, counted);
+                            self.draw_pay(ds, w, inv, false, counted);
                         }
                     }
                 }

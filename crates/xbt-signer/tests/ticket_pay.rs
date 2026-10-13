@@ -105,7 +105,7 @@ impl Handler for Service {
             let _ = n;
             Reply::Stream(Streamed { status: 200, headers: vec![("Content-Type".into(), "application/octet-stream".into())], length, body: b })
         };
-        if let Some(n) = sized("/files/").or_else(|| sized("/page/")).or_else(|| sized("/free/")).or_else(|| sized("/pieces/")).or_else(|| sized("/tiny/")) {
+        if let Some(n) = sized("/files/").or_else(|| sized("/page/")).or_else(|| sized("/free/")).or_else(|| sized("/pieces/")).or_else(|| sized("/hot/")).or_else(|| sized("/tiny/")) {
             return stream(n, Some(n as u64), body(n, 64 << 10, Duration::ZERO));
         }
         if let Some(n) = sized("/slow/") {
@@ -133,6 +133,8 @@ fn routes() -> Value {
         {"path": "/timed/", "price": {"second_msat": 400_000}},
         // priced below a ticket: 2 sat for a piece of 64 KiB, half a sat for a request
         {"path": "/pieces/", "price": {"byte_msat": 2000, "per_bytes": 65_536}},
+        // a quarter of a win of 64 sat for a piece of 64 KiB: one piece in four wins
+        {"path": "/hot/", "price": {"byte_msat": 16_000, "per_bytes": 65_536}},
         {"path": "/tiny/", "price": {"request_msat": 500}},
         {"path": "/tick/", "price": {"second_msat": 1000}},
         {"path": "/free/", "free": true}
@@ -286,6 +288,20 @@ impl Shop {
                conf }
     }
 
+    /// One more gateway beside the node of `first`, with a service of its own: another seller's shop that
+    /// is paid on the same node, as a hundred shops beside one node are.
+    fn beside(first: &Shop, conf: Value) -> Self {
+        let service = Arc::new(Service::default());
+        let service_running = serve_with(service.clone(), TcpListener::bind("127.0.0.1:0").unwrap(), 16, Limits { per_address: 0, connections: 256, ..Limits::default() }).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let state = tempfile::tempdir().unwrap();
+        let (origin, upstream) = (format!("http://127.0.0.1:{port}"), format!("http://{}", service_running.addr));
+        let (gw, running) = start_gateway(&shop_config(&origin, &upstream, state.path(), &first.network, &conf), &first.node, &first.clock, listener);
+        Self { gw, running: Some(running), node: first.node.clone(), standin: first.standin.clone(), service, _service_running: service_running, upstream, state, origin, port,
+               network: first.network.clone(), clock: first.clock.clone(), conf }
+    }
+
     fn up(&mut self, listener: TcpListener) {
         let (gw, running) = start_gateway(&shop_config(&self.origin, &self.upstream, self.state.path(), &self.network, &self.conf), &self.node, &self.clock, listener);
         self.gw = gw;
@@ -418,6 +434,8 @@ struct PayState {
     /// The node takes no payment and answers no question about one (a connection that died as a
     /// payment was sent); everything else it still answers.
     router_down: bool,
+    /// How long a send takes to return: a payment's way through a hop.
+    send_takes: Duration,
 }
 
 /// A fake LND for the buyer: a ticket payment is held by the seller's stand-in node, and ends as
@@ -535,6 +553,8 @@ impl LnBackend for PayLn {
         let hash = d.payment_hash_hex();
         let raw: Hash = d.payment_hash.as_slice().try_into().map_err(|_| node_err("a hash of another length"))?;
         let h = self.chain.height();
+        let takes = self.st.lock().unwrap().send_takes;
+        std::thread::sleep(takes);
         let mut s = self.st.lock().unwrap();
         if s.down || s.router_down {
             return Err(node_err("LN node unreachable"));
@@ -687,6 +707,8 @@ struct Rig {
     clock: Arc<AtomicU64>,
     s: Arc<Signer>,
     shop: Shop,
+    /// More sellers' shops beside the same node ([`Shop::beside`]), each named in the owner's policy.
+    more: Vec<Shop>,
 }
 
 impl Rig {
@@ -707,6 +729,11 @@ impl Rig {
     }
 
     fn with(extra: Value, named: bool, shipped: bool, slots: u64, shop_conf: Value) -> Self {
+        Self::with_more(extra, named, shipped, slots, shop_conf, &[])
+    }
+
+    /// [`Rig::with`], and one more shop beside the same node for each of `more` (its `tickets`, `caps` and `lottery`).
+    fn with_more(extra: Value, named: bool, shipped: bool, slots: u64, shop_conf: Value, more: &[Value]) -> Self {
         let dir = tempfile::tempdir().unwrap();
         env_for(dir.path());
         std::env::remove_var("B2_LN_REST");
@@ -717,8 +744,11 @@ impl Rig {
         let clock = Arc::new(AtomicU64::new(T0));
         let network = xbt_signer::node::network(&*node, "regtest", None).unwrap().replacen("bip122:", "lightning:", 1);
         let shop = Shop::new(&network, &clock, shop_conf);
-        let mut pol = json!({"allowlist": if named { json!([PROVIDER, shop.origin]) } else { json!([PROVIDER]) },
-                             "counterparties": {shop.origin.clone(): {"ln_node": shop.id()}},
+        let more: Vec<Shop> = more.iter().map(|conf| Shop::beside(&shop, conf.clone())).collect();
+        let origins: Vec<&String> = std::iter::once(&shop.origin).chain(more.iter().map(|m| &m.origin)).collect();
+        let named_origins: Vec<Value> = std::iter::once(json!(PROVIDER)).chain(origins.iter().filter(|_| named).map(|o| json!(o))).collect();
+        let mut pol = json!({"allowlist": named_origins,
+                             "counterparties": origins.iter().map(|o| ((*o).clone(), json!({"ln_node": shop.id()}))).collect::<serde_json::Map<String, Value>>(),
                              "max_per_tx_sats": 50_000, "daily_budget_sats": 60_000, "weekly_budget_sats": 90_000, "per_counterparty_cap_sats": 60_000,
                              "human_threshold_sats": 40_000, "velocity_max": 1_000,
                              "ln": {"enabled": true, "split_height": 6000, "max_fee_base_sats": 2, "max_fee_ppm": 1000},
@@ -744,7 +774,7 @@ impl Rig {
                                                "remote_constraints": {"max_accepted_htlcs": slots, "dust_limit_sat": "354"}});
         let tap = Arc::new(Tap::default());
         let s = Self::start(&root, &node, &ln, &tap, &clock);
-        Self { _dir: dir, root, node, ln, tap, clock, s, shop }
+        Self { _dir: dir, root, node, ln, tap, clock, s, shop, more }
     }
 
     fn new(extra: Value) -> Self {
@@ -2734,6 +2764,49 @@ fn a_win_that_could_not_be_paid_for_a_moment_is_paid_while_the_answer_waits() {
     assert_eq!((v["complete"].as_bool(), v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(true), Some(wins), Some(0)), "{v}");
     assert!(t.elapsed() < Duration::from_millis(1_800), "the answer did not stand still for the seller's grace of 2 s: {:?}", t.elapsed());
     assert_wins(&r, wins);
+}
+
+#[test]
+fn a_win_the_seller_stands_still_for_is_paid_before_the_wins_no_seller_waits_for() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    // one seller as the gateway ships (it bears 2 unpaid wins, and its answer stands still for a third for 1 s here,
+    // where the gateway ships 10), and 20 sellers beside it that serve on whatever is unpaid: their wins fill the
+    // wallet's gate, 8 at a time, and no answer waits for one of them
+    let strict = json!({"tickets": {}, "caps": {"sessions_per_address": 0}, "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 1}});
+    let patient = json!({"tickets": {}, "caps": {"sessions_per_address": 0},
+                         "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 1, "max_unpaid_wins": 100_000, "grace_pieces": 100_000}});
+    let owner = json!({"daily_budget_sats": 600_000, "weekly_budget_sats": 900_000, "per_counterparty_cap_sats": 600_000,
+                       "tickets": {"max_sellers": 64, "max_new_sellers_per_min": 400, "tasks": {"film": {"budget_sats": 400_000, "max_sellers": 64}}}});
+    let r = Rig::with_more(owner, true, true, 30, strict, &vec![patient; 20]);
+    // a payment takes 100 ms through the hop: the gate lets 80 through in a second
+    r.ln.st.lock().unwrap().send_takes = Duration::from_millis(100);
+    let size = 64 * PIECE;
+    let buy = |shop: &Shop| r.call("xbt402_pay", json!({"url": shop.url(&format!("/hot/{size}")), "max_sats": 2_000, "task": "film"}));
+    let (strict_one, others) = std::thread::scope(|sc| {
+        // 64 pieces from each of the 20, a win in every fourth: 320 wins expected, four seconds of the gate
+        let others: Vec<_> = r.more.iter().map(|shop| sc.spawn(move || buy(shop))).collect();
+        // once more than a second's worth of them wait (the node has an invoice for each, and no payment yet), the file
+        // from the strict seller: its third unpaid win stops its answer, which is cut after a second
+        wait_for("120 wins waiting at the gate", || r.shop.node.preimages.lock().unwrap().len() >= r.ln.st.lock().unwrap().payments.len() + 120);
+        let v = buy(&r.shop);
+        (v, others.into_iter().map(|t| t.join().unwrap()).collect::<Vec<Value>>())
+    });
+    let whole = |v: &Value| {
+        let wins = v["wins"].as_u64().unwrap_or(0);
+        assert_eq!((v["verdict"].as_str(), v["rail"].as_str(), v["complete"].as_bool(), v["ended"].as_str()), (Some("allow"), Some("lottery"), Some(true), None), "{v}");
+        assert_eq!((v["bytes"].as_u64(), v["draws"].as_u64(), v["body_digest"].as_str()), (Some(size as u64), Some(64), Some(pattern_digest(size).as_str())), "{v}");
+        assert_eq!((v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(wins), Some(0)), "{v}");
+        wins
+    };
+    // the strict seller's file is whole: every win its answer stood still for went through the gate before the hundred
+    // and more that waited there for nobody
+    let wins = whole(&strict_one);
+    assert!(wins >= 3, "a file of 64 pieces at one win in four that drew {wins} wins: its seller never stood still");
+    let all: u64 = wins + others.iter().map(whole).sum::<u64>();
+    // one number on the node, at the seller and in the ledger, and never more than 8 payments at once
+    r.tick();
+    assert_eq!((r.ln.paid_msat(), r.shop.settled() as u64, r.ledger_sum()), (all * WIN, all, all as i64 * WIN_SETTLED));
+    assert!(r.ln.state().peak <= 8, "{} payments at once", r.ln.state().peak);
 }
 
 #[test]
