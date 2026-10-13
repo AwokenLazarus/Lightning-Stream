@@ -5,8 +5,9 @@
 > library client, their binaries and the `xbt402-interop` tools, the wallet's channel rail
 > (`xbt402_pay` over a channel, the signer's channel book and its socket methods, the MCP's
 > in-process payer), the light client `xbt-electrum`, the fair exchange built on channel states,
-> the BLAKE2b header and retarget code only the light client used, and their tests, vectors and
-> scripts. All of it is in the git history, last at commit `2a31170`.
+> and their tests, vectors and scripts. All of it is in the git history, last at commit `2a31170`.
+> (The BLAKE2b header and retarget code the light client was built on stays in `xbt-primitives`,
+> with its vector tests.)
 >
 > So nearly everything below describes code that is no longer here. It is kept as the record of
 > how that code was built, reviewed and fixed, and as the reasoning behind rules that the wallet,
