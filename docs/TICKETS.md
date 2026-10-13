@@ -54,7 +54,7 @@ A seller that takes tickets adds one entry to `accepts` in its `402` (`PAYMENT-R
 
 | Field | Meaning | Why |
 |---|---|---|
-| `network` | `lightning:` and the 32 hex characters of the chain's `bip122` id. Not the chain id itself. | A client picks an entry by scheme and network. The chain id already means "a channel on the chain". XBT and the SHA-256 chain share a genesis block, so a Lightning id keyed on it would name both networks. |
+| `network` | `lightning:` and the 32 hex characters of the chain's `bip122` id. Not the chain id itself. | A client picks an entry by scheme and network. The chain id names the chain itself (it was the network of the on-chain channel entry this project once had). XBT and the SHA-256 chain share a genesis block, so a Lightning id keyed on it would name both networks. |
 | `features: [512]` | Every invoice of this entry carries feature bit 512, required. | Bit 512 is what separates an XBT Lightning invoice from one of the SHA-256 chain. The wallet's Lightning rail already refuses an invoice without it. |
 | `amount` | The price of this request before its body, in msat: `price.requestMsat`. | Pieces are metered below one sat; money moves a ticket at a time (section 3). |
 | `price` | The whole price rule: `requestMsat` once per request, `byteMsat` for every `perBytes` bytes of the response body (rounded up over the whole body), `secondMsat` for every started second the response is open. | A body priced by its size or its duration has no price before it is sent (section 4). |
@@ -187,8 +187,11 @@ PAYMENT-SIGNATURE: base64({"x402Version": 2, "accepted": <the accepts entry>,
 auth = HMAC-SHA256(key, "ticket/auth|" session "|" seq "|" secret "|" ticket "|" request_digest_v2)
 ```
 
-`seq` starts at 0 and rises by one per request in a session. `request_digest_v2` is the request
-digest of the channel wire (method, scheme, host, port, target, body); a field that is absent is
+`seq` starts at 0 and rises by one per request in a session. `request_digest_v2` is the hex of
+`tagged_hash("xbt402/req/v2", f(method) ‖ f(scheme) ‖ f(host) ‖ f(port) ‖ f(target) ‖ f(body))`,
+where `f(x)` is the length of `x` as 8 bytes little-endian followed by `x`, `tagged_hash(t, m)` is
+`SHA-256(SHA-256(t) ‖ SHA-256(t) ‖ m)`, the scheme and host are lower case, and the port is
+its decimal number, 80 or 443 when the URL names none (`xbt402::wire::request_digest_v2`). A field that is absent is
 empty in `auth` (`ticket` belongs to section 5). A request needs no ticket id: **the secret names
 its ticket**, since its hash is the ticket's payment hash.
 
@@ -223,8 +226,10 @@ otherwise. The seller, for each request, in this order:
    ticket `ACCEPTED`, and marks it used itself before it settles.
 4. Serves, and returns `PAYMENT-RESPONSE` with a receipt signed by `receiptKey`:
    `{"scheme": "ticket", "session", "seq", "releasedMsat", "spentMsat", "charged", "req", "status",
-   "bodyHash"}`, signed as the channel wire signs its receipts, under the tag
-   `xbt402/ticket-receipt/v0`, over these fields in this order. `releasedMsat` is the sum of the
+   "bodyHash"}`. What is signed is `tagged_hash("xbt402/ticket-receipt/v0", f(v1) ‖ … ‖ f(v9))`
+   over these fields in this order, each value as its decimal or plain string (a JSON number and
+   its decimal string sign alike), `f` and `tagged_hash` as in the request digest above; the
+   signature is ECDSA on secp256k1, strict DER, low S (`xbt402::ticket::receipt_message`). `releasedMsat` is the sum of the
    tickets settled in this session and `spentMsat` the running total of what was served.
    `releasedMsat` only rises. `spentMsat` rises as pieces are served, and falls only by what the
    seller charged ahead of sending and then did not send (an answer the buyer stopped reading).
@@ -999,14 +1004,17 @@ section 9.7 says which of the two is tried first, and the other is tried after i
 |---|---|---|---|
 | 1a | `scheme: "ticket"` on the wallet's Lightning network | Tickets are on (`tickets.enabled`); the call names one of the owner's tasks, or the owner has one task, or one named `default`; the seller is admitted (its origin is on the allowlist and tied to its node id, or the task pays any seller); the terms are inside the owner's bounds; `release` is `with-request`; the origin is https, or http on this machine. | The next entry, with the reason. |
 | 1b | `scheme: "lottery"` on the wallet's Lightning network (section 9) | The lottery is on (`tickets.lottery.enabled`); the task and the seller are admitted as for a ticket; a win size fits the seller's terms and the owner's bounds (section 9.7); the task's budget covers one win and its fee; the origin is https, or http on this machine. | The next entry, with the reason. |
-| 2 | `scheme: "exact"` on the wallet's Lightning network, with a BOLT 11 invoice in `extra.invoice` | The Lightning rail is on; the origin is on the allowlist; the invoice pays the entry's `payTo` its `amount`; and `ln_pay` would pay that invoice (every rule of that rail, the payee on the allowlist among them). The wallet pays it and sends the request again with `{"preimage"}` as the payload of `PAYMENT-SIGNATURE`. | The next entry, with the reason. |
-| 3 | `batch-settlement` (alias `xbt-channel`) on the chain: the frozen on-chain channel | The origin is on the allowlist and the owner has not set `channel_rail: false`. This path is unchanged. | The report below. |
+| 2 | `scheme: "exact"` on the wallet's Lightning network, with a BOLT 11 invoice in `extra.invoice` | The Lightning rail is on; the origin is on the allowlist; the invoice pays the entry's `payTo` its `amount`; and `ln_pay` would pay that invoice (every rule of that rail, the payee on the allowlist among them). The wallet pays it and sends the request again with `{"preimage"}` as the payload of `PAYMENT-SIGNATURE`. | The report below. |
 | | None of them | Nothing is paid. The reply is `no_rail` and lists each entry that was passed over and why. | |
 
 A rail is passed over only for a reason that makes it unusable for this seller: it is off, the
 seller is not admitted, or the terms are outside the owner's bounds. A budget, a cap or a velocity
-limit that is used up refuses the call and tries no other rail. With tickets off in the policy,
-and for a call with `max_sats` 0, `xbt402_pay` is the channel path from its first byte, as before.
+limit that is used up refuses the call and tries no other rail. With tickets off in the policy
+the wallet still sends the one unpaid request and reads the 402; entries 1a and 1b are then passed
+over. A call with `max_sats` 0 pays nothing: an answer that is not a 402 is handed back, and a 402
+is refused (`max_sats`). Until October 2026 a third entry, the on-chain channel
+(`batch-settlement`), was paid here, and both of these cases went to it; that channel was removed
+(`docs/LIMITS.md`). A seller that still offers it is told so in `rails_passed_over`.
 No request leaves for a host the owner did not allow: the URL is read by one parser, and its origin
 is on the allowlist, or the call's task pays any seller, before the first byte is sent.
 
@@ -1114,7 +1122,7 @@ Each of these was found by building `xbt402_pay` over tickets against this draft
 | 4 | Stop and cancel need the session's key. | A wallet that starts again has lost its sessions but kept each seller's session id and key in its book, written before any ticket of the session was paid. Its first `cancel` uses `seq` 0 and adopts the `nextSeq` the seller answers. |
 | 1 | The terms came "over TLS from the seller". | The wallet refuses the ticket entry of an origin that is neither https nor on its own machine: the session key travels in the first lock answer. |
 | 7, 11 | The pool and the smallest ticket were numbers in the wallet's code. | They are the owner's settings (`tickets.pool`, `pool_many`, `many_sellers`, `floor_ticket_sats`), each with its default in one place. Section 14 has the defaults and the checks that section 11 asked for. |
-| new | | The rail table of section 12, the `exact` entry for a single Lightning payment, and the owner's `channel_rail` switch. |
+| new | | The rail table of section 12 and the `exact` entry for a single Lightning payment. (The owner's `channel_rail` switch, added with them, went with the on-chain channel.) |
 
 ## 14. What building the limits changed in this draft
 

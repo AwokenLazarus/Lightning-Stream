@@ -9,11 +9,11 @@ outside the project has reviewed the fixes. The history, with counts, is in the 
 reasoning behind each rule is in the engineering notes (`docs/ENGINEERING.md` in the published
 tree).
 
-Direction, decided on 2026-10-11: Lightning Stream is being rebuilt on Lightning. It adds stream
-tickets to ordinary XBT Lightning channels (the wallet's ticket book and the seller's gateway are
-built and have run on regtest; the binding of the wallet to paid HTTP requests is not). The hub was retired on that
-day and its code removed. The on-chain one-way channel is **frozen**: kept in the tree and
-tested, off the main path, with no new work. Sections about it are marked "frozen" below.
+Direction, decided on 2026-10-11: Lightning Stream is built on Lightning. It adds stream tickets
+to ordinary XBT Lightning channels (the wallet's ticket book, its payer and the seller's gateway
+are built and have run on regtest). The hub was retired on that day and its code removed. The
+on-chain one-way channel was frozen on that day and removed in October 2026; "channel" in this
+file means a Lightning channel unless a sentence says otherwise.
 
 This file has three parts:
 
@@ -39,15 +39,48 @@ does what the hub did. The code and those limits are in the git history, last at
 
 - A wallet policy that still has a `routing` section loads; the signer ignores the section and
   says so in a warning.
-- A wallet channel record that an earlier version left with a pending routed lock keeps it: the
-  signer signs no plain state below the locked amount, and has no method left to complete or give
-  up the lock. The channel is refunded at its expiry.
-- A provider ledger that still holds a channel a hub funded treats it as an ordinary channel: it
-  is closed at the close margin with the best signed state, and a routed lock recorded on it is
-  not waited for.
 - The signer socket no longer answers `xbt402_sign_state_adaptor`, `xbt402_resolve_lock`,
   `xbt402_void_lock`, `xbt402_adopt_lock`, `xbt402_recover_lock` or `routing_status`; nor does
   the Python wallet reference, which had them removed after this one.
+
+### Removed: the on-chain one-way channel
+
+The on-chain one-way channel (the x402 `batch-settlement` scheme on XBT), its provider and
+library client, the wallet's channel rail, the light client (`xbt-electrum`) and the fair exchange
+built on channel states were removed in October 2026. The limits stated for them here (the
+sections "Channel and transport", "Light client and consensus" and the channel sentences of
+"Agent wallet") and the three open items on the channel's path went with them. The code and those
+limits are in the git history, last at commit `2a31170`. What the removal leaves behind:
+
+- A wallet that was upgraded with channels on record cannot close or refund them: this version
+  has no method for either and no watcher that refunds at expiry. It never writes the channel book
+  (`channels.json`) or its sealed keys (`channel_keys.json`), reads the book once at start, lists
+  the records under `channels` and `balance`, and says in its log, in `health` and on the UI's
+  Channels page how many are not settled. Settling them needs the version at `2a31170`, run on the
+  same data directory; until then the coins of an open channel stay in its script.
+- A wallet policy that still has `channel_expiry_blocks`, `refund_enabled`, `refund_margin_blocks`,
+  `open_wait_s`, `open_retry_s`, `close_fee_max_sats`, `channel_rail` or a `pay_to` under
+  `counterparties` loads; the signer ignores them, whatever they hold, and says so in a warning.
+  Every other policy key means what it meant.
+- The signer socket answers `deny/removed` to `fund`, `open_channel`, `sign_state`, the
+  `xbt402_sign_*` methods, `xbt402_new_key`, `xbt402_attach`, `xbt402_funded`,
+  `xbt402_request_auth`, `xbt402_mark_closed`, `close_channel`, `xbt402_refund`,
+  `tx_confirmations` and the `forward_*` methods. The MCP server no longer lists `close_channel`,
+  `xbt402_refund`, `forward_status` or `forward_recover`, and refuses to start with
+  `XBT_MCP_PAYER=local`. The Python wallet reference still has all of these.
+- An approval that a channel payment asked for before the removal pays nothing: approving it
+  drops it and says why.
+- The hot key funds nothing any more. It is kept so that coins on it can be seen and swept by the
+  owner; `hot_balance_cap_sats` only marks the key as over its cap in the wallet's status.
+- The wallet pays a seller over Lightning only. The Umbrel and StartOS packages and the container
+  stack wire no Lightning node into the wallet, so a packaged wallet pays no seller, and their
+  tests no longer contain a paid call.
+- A seller that offers only the channel is answered `no_rail` by `xbt402_pay`, with the reason.
+- Content paid for chunk by chunk against a Merkle root with a hash-locked last chunk
+  (`xbt402-merkle-v1`) can no longer be bought. The ticket wire has its own form of it
+  (`docs/TICKETS.md`, section 5, `after-verify`), which the wallet does not do yet.
+- Another program that linked the channel's provider or client from the `xbt402` crate no longer
+  builds against this tree; it has to pin `2a31170` or pay another way.
 
 ### Stream tickets (the design's measurements)
 
@@ -549,9 +582,10 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
 
 - The ticket rail exists only where the owner's policy turns tickets on, and an agent reaches it
   only where the operator starts the MCP server with `XBT_MCP_TICKETS=1`. With tickets off,
-  `xbt402_pay` is the channel path as it was. With tickets on, a seller that answers without a
-  402 is answered from the wallet's one unpaid request (`rule: free`, `rail: none`), and a seller
-  paid by channel is asked twice without payment before it is paid.
+  `xbt402_pay` still asks the seller once without paying, and can pay only a single Lightning
+  invoice (where the Lightning rail is on). A seller that answers without a 402 is answered from
+  the wallet's one unpaid request (`rule: free`, `rail: none`). A call with `max_sats` 0 pays
+  nothing: a 402 is refused (`max_sats`).
 - `max_sats` bounds what a call uses, by the wallet's own count of the bytes and seconds it
   received. It does not bound what the call books: a ticket is released whole, so a call that
   uses 3 sat can book one ticket and its fee limit (1,015 sat with the defaults). The rest is a
@@ -634,7 +668,6 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
 - The single Lightning payment of a 402 (`scheme: "exact"`) pays first: an invoice that is paid
   and then not honoured is lost, once. No seller in this tree offers the entry and it was not run
   on the lab.
-- The MCP's in-process payer (`XBT_MCP_PAYER=local`) pays channels only.
 - Not run: more than one hop, real network latency, TLS to a seller, mainnet, the Core Lightning
   fork (no Core Lightning node was in the lab of these scripts: the 30-slot channel there is
   one a Lightning Fork node opened with `--default-remote-max-htlcs=30`, which bounds what its
@@ -642,131 +675,50 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
   seller at once through this path, and a seller other than `xbt-gateway`. An answer priced by
   the second was run against the gateway in process, not on the lab.
 
-### Channel and transport (library client) (frozen)
+### HTTP: what every rail shares
 
-The on-chain one-way channel. Frozen: these limits stand as written and get no new work.
-
-- The open preflight is the seller's word: a seller that says yes and then refuses the funded open
-  locks the buyer's capacity until the channel's expiry, at most 4,032 blocks, and the client can
-  sign no close for such a channel.
-- A funded channel the seller refuses to open blocks that seller until its record is removed, also
-  after the refund; the MCP wallet has no tool for that. *(test)*
-- A payer's book has one channel per seller origin. It reads as one origin every spelling that
-  differs only in letter case, a default port or a user name. A URL whose host two URL parsers
-  could read differently is refused before anything is paid or sent: a backslash, a host with
-  percent-encoding or non-ASCII letters, the short, decimal and hexadecimal forms of an IP
-  address. A trailing dot on a name is a separate origin, so a seller reached under both
-  spellings can be funded once per spelling, up to the payer's budget. *(test)*
-- With the shipped payers a payer has 1,007 blocks, about a week, to come back for a channel its
-  signer funded and whose confirmation it did not wait for; a payer built on the library's default
-  of 1,008 blocks has 144, about a day. After that the coins wait for the refund at the expiry, up
-  to 1,009 blocks, and that seller cannot be paid through that signer meanwhile. *(test)*
-- A payer that keeps no ledger (`xbt-signer-payer`) can take up a channel its signer funded only
-  until it is attached; after that it must keep a ledger, or the owner closes the channel through
-  the signer, which works only once a state has been signed on it.
-- One signer serves one payer per seller: a second payer started while the first one's funding is
-  unconfirmed takes that channel and the first is refused from then on; two that both hold it
-  break each other's calls. No coin can be taken. *(test)*
-- Payer and signer are upgraded together: a payer of this version asks the signer what it funded
-  on every open, and an older signer answers `unknown method`, so the open fails with nothing
-  funded. A third-party signer that funds channels must answer that question too.
-- A payer that takes up a channel its signer funded does not apply its own budget, capacity or
-  expiry settings to it: the signer's policy approved that funding. *(test)*
-- With a wallet whose funding call can fail after it sent and that cannot list its sends, every
-  retry pays the channel again, the client holds a refund for one output only, and its budget
-  counts one; neither wallet shipped here is such a wallet. *(test)*
-- A paid request that gets no receipt is paid for if the provider later says it charged it: the
-  provider is believed for one call's price for every such request, on an unsigned message. So a
-  provider that answers errors, anyone who can alter answers on the way, or a payer process that
-  stopped after a request left, can make the payer pay for each such request; measured, 1,650 sat
-  signed for 150 sat of service. A caller that retries on errors should set a daily budget.
-  *(test)*
-- A refusal is not signed: whoever can answer in a provider's place can hide a served answer
-  behind a forged refusal. The payer absorbs one such charge in a channel's life; after the
-  second, every call on that channel is refused until its owner closes it and removes its record.
-  *(test)*
-- The library client does not watch the chain; after a rollover answered with an error the
-  embedder must find the rollover and adopt it.
-- Records of rollover attempts that were never adopted stay in the client's book and ledger until
-  the embedder removes them; at 16 for one channel the client signs no further rollover of it.
-- Earlier scripts of an open that was never funded are kept, 16 per seller; past that the oldest
-  script's terms are forgotten and its key is kept.
-- How long a channel lasts is at least the seller's own floor and at least 144 blocks (or the
-  owner's wish if smaller), and at most 4,032 blocks unless the owner raises it; an offer outside
-  that is refused before anything is funded.
-- A program that uses these crates' HTTP client from another workspace does not compile until it
-  adds the patched `ureq` to its own manifest, and `cargo deny` reports no advisory for the patched
-  copy; advisories for `ureq` are looked up by hand.
-- `LocalSigner` keeps its keys in memory: a process that restarts with one has lost them.
-- A close is bumped by a child that spends only the provider's own output of that close, up to
-  10,000 sat, so fees above about 37 sat/vB for the whole 144-block margin, or a provider output
-  too small to pay, still let the buyer's refund win; no shipped binary has a setting for the bump
-  ceiling.
+- A URL whose host two URL parsers could read differently is refused before anything is paid or
+  sent: a backslash, a host with percent-encoding or non-ASCII letters, the short, decimal and
+  hexadecimal forms of an IP address. A payer reads as one origin every spelling that differs only
+  in letter case, a default port or a user name; a trailing dot on a name is a separate origin.
 - A receipt covers the request, the answer's status and its body, not its headers; a body sent
   with neither Content-Length nor chunking ends when the connection does, so only the receipt's
   body hash shows it was cut.
-- A payment is bound to the method, scheme, host, port, target and body as the request states
-  them, so a TLS proxy that does not set `X-Forwarded-Proto` makes every payment fail.
 - A server takes 64 connections in all and 48 from one address; a public listener needs a reverse
   proxy with its own limits.
-- The ledger lock is on the path as given; a symlink or hard link to the ledger file is a second,
-  unlocked way in.
+- A program that uses these crates' HTTP client from another workspace does not compile until it
+  adds the patched `ureq` to its own manifest, and `cargo deny` reports no advisory for the patched
+  copy; advisories for `ureq` are looked up by hand.
 
 ### Agent wallet (`xbt-signer`)
 
-The sentences here about channels, rollovers, closes and refunds are about the frozen on-chain
-channel; the rest (policy, approvals, keys, the socket) holds for every rail.
+Policy, approvals, keys and the socket: what holds for every rail.
 
-- Channel funding is not a budget item: up to the per-channel cap plus the close fee can sit in
-  one channel per allowlisted seller, and on-chain fees are outside every budget.
-- A seller's terms can lock a channel's coins for up to `max(channel_expiry_blocks, 4032)` blocks,
-  whoever names it. The 144-block floor on a channel's life holds for channels the pay tool opens on a seller's offer; the socket's `open_channel`, `fund` and rollover
-  refuse only an expiry inside the refund margin (6 blocks).
-- After an answer is lost the wallet pays the next call with one new state on the seller's
-  unsigned word that it holds the last one. A seller that serves nothing, or anyone who can answer
-  in its place, can so be signed one call's price for every call the agent makes, inside the call's
-  `max_sats` and the budgets; those calls report a charge of 0. A request lost before the seller
-  saw it is paid for as well when the next call costs more. *(test)*
-- On a postpay channel the seller is owed one call per lost answer until the close. (Buying a
-  streamed result on such a channel is an open item, below.)
-- After a close the wallet opens no new channel to that seller until the close is in a block; if
-  the close is never mined, not until the old channel's expiry. "In a block" means one
-  confirmation; a reorganisation that removes a close or a refund is not followed.
-- If a rollover the wallet attached from the mempool is never mined, the channel it would have
-  spent is no longer watched and no wallet method refunds it; its key is kept, and the owner must
-  restore the record by hand. No new channel to that seller can be opened meanwhile. *(test)*
-- A channel's rollovers may be signed into at most eight different next channels while none is
-  attached; after that it must be closed.
-- The next channel of a rollover the seller broadcast after refusing it is refunded by the watcher
-  only while the rolled channel is still the wallet's record for that seller; if the rolled
-  channel was marked closed and a new one funded first, the next channel's coins stay in its
-  script past its expiry, with its key kept. *(test)*
+- The wallet has two rails off Lightning, and neither pays a seller's 402: `pay` sends coins on
+  chain from the node's wallet to an address on the allowlist, under the budgets, and on-chain
+  fees are outside every budget. A payment over the human threshold waits for the owner's
+  signature; so does a Lightning payment (`ln_pay`), which is then paid when the agent asks again.
+  Ticket and lottery payments are bounded by the task's budget and caps and never wait for a human.
 - A human-signed operation runs once, as long as the file of used signatures is neither deleted
   nor restored from before the signature was used; a missing file is read as an empty one. A
   human-signed operation run while the host clock is far ahead fixes that time in the wallet:
   later signatures that expire before it are refused, policy changes included, until the owner
   resets the file, which also forgets every used signature. *(test)*
 - Every socket-level finding needs a process that can open the signer socket; an agent held to the
-  MCP tool list cannot reach those methods. A process on the socket can ask for payer keys without
-  limit, and can ask which channel the signer funded for any seller.
+  MCP tool list cannot reach those methods.
 - The one-time enrolment code protects the first approval key only when the socket and the
   signer's directory belong to different users, as in the container layout.
-- A payment or funding whose fate the node did not report stays counted and is kept; if it can
-  never confirm, its seller stays blocked until the node can name, in a block, another transaction
-  that spent one of the funding's inputs within the last 4,032 blocks, and otherwise until an
-  operator removes the record.
+- An on-chain payment whose fate the node did not report stays counted against the budgets: the
+  node may have sent it.
 - A crash between holding an approval and paying costs the approval with nothing paid; the same
   holds for a human signature, which is used up when its operation starts.
 - The backup export's signature does not name the passphrase the backup is sealed under; an
   expired approval can be dismissed without a signature; a key blob without a recorded cost opens
   at scrypt 2^15 and is re-sealed only when its file is next written.
 - Key wiping covers long-lived copies in the Rust signer only.
-- Stream chunks are paid without a signed receipt; each is bound by a Merkle proof or a hash lock.
-  An answer of 400 or above is handed to the agent without a receipt.
-- One payment at a time on the channel: the wallet holds one lock for a whole `xbt402_pay` on
-  that rail, the seller's answers included, so a slow seller delays every other payment, approval
-  and refund for as long as it answers. On the ticket rail the lock is held for each lock round's
-  bookkeeping and each release, not while a seller answers.
+- The wallet's spend lock is held for each lock round's bookkeeping and each release on the
+  ticket rail, not while a seller answers; an on-chain `pay` and a single Lightning payment hold
+  it for the whole payment.
 - A watcher step that panics is reported and skipped, and the next tick tries again; in a
   `release-small` build a panic ends the signer process, and whatever supervises it restarts it.
 
@@ -781,18 +733,15 @@ untrusted field.
 
 | payer and rail | where a seller's words reached the wallet's own fields | now |
 |---|---|---|
-| wallet MCP, `XBT_MCP_PAYER=local` (xbt402's `Client`, frozen channel) | `rule` was the seller's error code and `reason` its `detail`, verbatim (the open item that was here); `billing` was the offer's string; a refused offer's `derivation` and a receipt's `seq` were quoted in `bad_offer` and `bad_receipt` | `rule` is one of the protocol's codes or `provider_error`, `reason` is the client's sentence, and the seller's answer is under `untrusted_provider_response`; `billing` is `prepay` or `postpay`; neither string is quoted |
-| the signer's own channel rail (`xbt402_pay`, `close_channel`, `channels`; frozen) | the seller's error code, let through by its shape, ended the open's `reason` and the channel's stored `open_error`; a stream's `id` was in `stream.id` and in the stored file's name, and its `root` in `stream.merkle_root` unchecked | a code is named only when it is the protocol's; a stream's id and root are named only when they are hex |
 | Lightning (`ln_pay`, `ln_status`) | a refused invoice's or offer's prefix (free text, under a checksum its writer computes) and an offer's currency were quoted in `reason`; the node's error message, which can repeat a payee's or an issuer's, was the `reason` of `ln_backend` and `ln_fetch_invoice`; `ln_status.recent[].failure` was the bare text | a refused string is described and not quoted; the node's message is under `untrusted_ln_data` (`node_message`), and so is each listed `failure` |
 | stream tickets (`xbt402_pay`, `ticket_status`, `ticket_stop`) | refused terms were quoted in `rails_passed_over`; `offered` listed each entry's scheme and network; the seller's error code, by its shape, was in `reason`, `seller_code`, `seller_fault`, `ended` and a stopped session's `why`; a refused invoice's prefix was in `reason`; the last receipt of a streamed answer was the seller's whole object | terms are described; `offered` says `ticket`, `exact`, `batch-settlement` or `other`, on this wallet's network or `other`; a code is named only when it is the scheme's; the receipt is given as its numbers, and the seller's object as `untrusted_provider_response.last_receipt` |
 | every rail's HTTP | the transport's error text went into `reason`: it quotes a status that is not a number (three characters) and, on the ticket rail, the URL with the seller's session path | a fixed sentence per kind of failure |
 
 - A seller's error code is its words unless it is one of the protocol's own
-  (`xbt402::wire::PROTOCOL_CODES`, `xbt402::ticket::PROTOCOL_CODES`). A code the shipped provider
-  or gateway adds later is not named by an older wallet: it reads as no code.
+  (`xbt402::ticket::PROTOCOL_CODES`). A code the shipped gateway adds later is not named by an
+  older wallet: it reads as no code.
 - Numbers are not words, and nor are hashes, keys, ids and signatures of a fixed hex shape: a
-  result gives them as they are (`chan`, `payment_hash`, `funding_txid`, a hex stream id, a
-  receipt's amounts).
+  result gives them as they are (`payment_hash`, a session id, a receipt's amounts).
 - One character can still come through: a field that should be hex and is not is reported by the
   hex reader as `Invalid character 'x' at position n`, and where that is a seller's field the
   character is the seller's.
@@ -802,14 +751,14 @@ untrusted field.
 - The wallet's own Lightning node is trusted for what it reports as fields: a channel's
   `remote_pubkey`, `commitment_type` and `channel_point`, the watchtowers' addresses, its
   `identity_pubkey`. Its alias, its version and its error messages are under `untrusted_ln_data`.
-- Records written before this change are read back as they were written: a channel's
-  `open_error`, a stopped ticket session's `why`, and the audit log that `history` returns can
-  still hold a seller's error code that an earlier version let through by its shape.
+- Records written before this change are read back as they were written: a stopped ticket
+  session's `why` and the audit log that `history` returns can still hold a seller's error code
+  that an earlier version let through by its shape. (A channel record an earlier version left is
+  listed by its numbers and ids only.)
 - The files an operator reads are outside the rule: the call log (`B2_CALLS_JSONL`) and the
   processes' own logs.
 - The rule is held by reading the code and by tests that plant a marker in the strings a seller
-  controls (`agp128` in the test names of `xbt402`, `xbt-signer` and `xbt-wallet-mcp`; check E2.4
-  of `scripts/failure_interop.sh` for the local payer end to end). It is not held by the type
+  controls (`agp128` in the test names of `xbt402` and `xbt-signer`). It is not held by the type
   system: a new result field that copies a seller's string would break it, and only a test with
   that string would show it.
 
@@ -889,58 +838,12 @@ untrusted field.
   its address does not start until its owner removes one; neither is dropped.
 - The pay-with-work rail binds a payment to no host; run it over TLS.
 
-### Light client and consensus
+### Signature hash and replay
 
-- The light client believes a chain only once it reaches Knots' block 964264 and Knots' minimum
-  chain work; above that block, a client all of whose servers lie can be shown a fake confirmation
-  for the cost of one real-difficulty block each.
-- Setting `B2_ELECTRUM_CHECKPOINT` at or above the pinned height replaces the pin and the minimum
-  work with the operator's own block.
-- A script with more than 10,000 history entries, or a transaction above 1,000,000 bytes, is not
-  answered by the light backend, and anyone can push a script over that bound by paying dust to
-  it; for a channel's funding script that also stops the light wallet's refund of that channel.
-- If every Electrum server you configured hides a transaction, or one hides it while the others
-  have not seen it yet, the light client reads it as absent; it never books a channel as closed
-  on that, only on a proven spend, and coins it cannot see come back when a server shows them.
-- A "not there" answer needs every configured server to answer, so one server that is down or
-  silent makes those answers, and scans of your coins, fail until you remove it; what the wallet
-  proves keeps working. The wallet never drops a server by itself.
-- One slow server can hold a lookup for the call deadline (four request timeouts, one minute)
-  plus a header sync before it and one inside it (up to a minute each).
-- A server that sends a number no integer or float holds is hung up on for that line, so its
-  other answers in that call are lost with it: a "not there" answer then fails as it does beside
-  any server that did not answer.
-- In a scan, a server that lists a coin and answers "busy" for its transaction fails the scan.
-- The search for a spend does not wait for every server: when the honest server misses a scan's
-  one history request, coins that only a lying server lists as unspent are listed, and the scan
-  still says every server answered. Such a coin fails at broadcast. *(test)*
-- A first scan of an address with N coins asks each server for N proofs, 16 at a time; a server
-  that needs more than one timeout for 16 answers is dropped for that call and the other servers
-  decide.
-- A lookup made while a header sync is in flight and a block has just arrived can fail with "not
-  known" for that block's transactions, for at most one sync round.
-- A request given up at a call's deadline is forgotten once 16 newer ones are kept on the same
-  connection; a late, large answer to a forgotten one closes that connection.
-- `min-servers` counts servers the wallet is connected to, not servers that answered: a server
-  that accepts the connection and answers nothing else counts.
-- The light client recognises "no such transaction" from the server's own words (bitcoind's,
-  electrs', ElectrumX's and Fulcrum's, tested against electrs and simulators); another wording
-  counts as no answer.
-- Nothing the light client proved is kept across a restart: every proof is asked for again.
-- A light wallet's coin scan says whether every server answered, but the wallet does not read
-  that: a coin only the missing server shows is counted at a later reconcile.
-- On the light backend a funding that can never confirm holds its destination for good.
-- The provider needs a full node: on the light backend "not shown" would read as
-  "spent".
-- A light hot wallet cannot spend coinbase coins. The light client supports mainnet and regtest
-  only. A server that keeps refusing to give its tip is connected to again on every header sync,
-  with no back-off.
-- On the light backend the fee estimate shown in a quote is the first answering server's word,
-  unverified; the wallet's own transactions use fixed fees. A wake-up for a watched script can be
-  late by one polling interval (10 seconds).
 - The annex and codeseparator sighash vectors were generated with Knots' Python and not executed
-  against its C++; the retarget vectors are recorded from the project's own Python. Funding sent
-  through the node wallet is replay-protected only if that node does not run `-walletoldsigs`.
+  against its C++; the retarget vectors are recorded from the project's own Python.
+- A payment sent through the node wallet (`pay`) is replay-protected only if that node does not
+  run `-walletoldsigs`.
 
 ### Lightning rail
 
@@ -978,44 +881,28 @@ untrusted field.
 
 - Release builds check every integer addition, subtraction and multiplication in every crate; a
   missed overflow stops the request it is in with a `500`, and nothing of that request is kept.
-- A panic in one watcher tick or loop round is caught and the next one runs, in the
-  provider binaries, the signer and the work provider; what a panic that repeats every round does
-  is in each area above.
+- A panic in one watcher tick or loop round is caught and the next one runs, in the signer and
+  the work provider; what a panic that repeats every round does is in each area above.
 - A binary built with the `release-small` profile aborts the whole process on any panic; the
   shipped images are not built with it, and it must not be used for a server.
 - The wallet MCP over stdio ends on a panic in a quick tool and has to be started again by its
   client.
-- A payer that sends a request `seq` of 2^64 - 1 has spent every later request on that channel; it
-  can still close it.
 - The images and size tables under `dist/` were built before overflow checks were turned on.
 
 ### Python references
 
-The two Python references state the same rules where they have the code. What differs there, and
-the limits of the Python agent wallet and its forward rail, are in `docs/LIMITS.md` of each
-reference's own repository:
+The two Python references still hold the on-chain channel that this tree no longer has: the
+channel itself, and a wallet that pays over it. They have no tickets, no lottery and no gateway.
+Their limits, the channel's among them, and those of the Python agent wallet's forward rail, are
+in `docs/LIMITS.md` of each reference's own repository:
 [Lightning-Stream-py-channel](https://github.com/AwokenLazarus/Lightning-Stream-py-channel) and
 [Lightning-Stream-py-wallet](https://github.com/AwokenLazarus/Lightning-Stream-py-wallet).
 
 ## Open items
 
-Not fixed. Each is marked in the code with the text in brackets, on a test that asserts the right
-behaviour; searching the trees for `open: AGP-102` and `open: AGP-111` finds exactly these. The
-`AGP-111` ones are checks of `scripts/failure_interop.sh`, which runs the release binaries: the
-script prints them as `FAIL (open item)` with what it observed, and goes on.
+Not fixed. One item is open, and it is not in this tree's code: it is in the Python wallet
+reference, on a rail the Rust wallet never had.
 
-The two `AGP-111` items are both on the frozen on-chain channel's pay rail. They stay listed
-and get no fix unless the channel is kept. (There were three: the third, a seller's refusal text
-reaching the agent as the wallet's own `reason`, was the one an agent could be steered by, and is
-fixed: check E2.4 of that script, and "What a seller wrote" below.)
-
-- **A streamed result cannot be bought on a postpay channel that is one call behind**
-  (`open: AGP-102 list 1 item 13`; Rust wallet, two tests; Python wallet, one). A stream's last
-  state gets no receipt, so after the first stream on a channel, or after one lost answer, the
-  wallet is one call behind for the life of that channel; every later stream ends at its first
-  chunk, and the wallet has paid for the manifest and got no data. Nothing is signed past the
-  call's `max_sats` or a budget. No seller in these trees sells streams. Do not rely on buying
-  streams on a postpay channel.
 - **Forward rail of the Python wallet (off by default): a lot recovered after its channel was
   replaced** (`open: AGP-102 list 1 item 5`; Python wallet, three tests). After such a recovery the
   next channel to that market signs states that are not booked and not checked against the
@@ -1023,22 +910,15 @@ fixed: check E2.4 of that script, and "What a seller wrote" below.)
   recovery from a close that is then never mined ends that channel's refund watch. It needs the
   rail turned on, an allowed market and the agent's own calls. Do not turn the forward rail on.
 
-- **On the signer's own pay rail, a call whose answer was lost is not paid at the close**
-  (`open: AGP-111 item 1`; `scripts/failure_interop.sh`, checks A1.2, A3.2 and D2.4). The wallet
-  signs each call's state before the call; when the answer is lost it sends that same state with
-  the next call, the shipped provider serves that call on credit, and from then on the wallet is
-  one call behind. Its cooperative close signs what it has signed so far, so the seller is short
-  one call's price and its close report says `debt`: measured, 900 sat paid for 7 calls of 150 sat
-  served, and the same after a signer killed with a signed request on the wire. Two answers lost
-  in a row leave the seller one call short as well, not two. The payer never pays twice, and the
-  library client (the wallet's `local` payer) pays every served call exactly once in the same
-  runs. This is what "the seller is owed one call per lost answer until the close" above comes
-  to: the close does not settle it. A seller should not extend credit it needs back.
-- **A signer policy that leaves out `per_counterparty_cap_sats` cannot pay the shipped provider**
-  (`open: AGP-111 item 2`; `scripts/failure_interop.sh`, check S1). The built-in cap is 30,000,000
-  sat and the wallet funds a channel of that capacity; the provider's built-in maximum is
-  10,000,000 sat, so the open is refused, before anything is funded. The example policy sets
-  100,000 sat and is not affected. Set the cap in your policy.
+Three more items were open on the on-chain channel's path until it was removed, and are not open
+here because their code is gone; the Python references, which keep the channel, still have the
+first: a streamed result that could not be bought on a postpay channel one call behind
+(`AGP-102 list 1 item 13`), a call whose answer was lost and that the close did not pay
+(`AGP-111 item 1`), and a default per-seller cap above the shipped provider's maximum
+(`AGP-111 item 2`). Whether the streamed-result item applies to tickets was checked: it does not.
+It came from a channel state that got no receipt; on the ticket rail every answer has a receipt,
+a streamed one at its head and in the session's `status`, and the wallet buys no content
+`after-verify` at all (a stated limit above).
 
 ## Not reviewed by anyone
 
@@ -1061,15 +941,16 @@ Neither the external review nor any of the project's four audits covered:
   only, and the argument read by nobody outside it;
 - the removal of the hub itself (2026-10-11): what was cut from the provider, the client library
   and the signer, and how records of the removed features are treated;
-- anything on a real network: no mainnet node, no public Electrum server and no Lightning node
-  outside a test rig was used, and every "blocks" figure was measured on regtest blocks mined at
-  once.
+- the removal of the on-chain channel (October 2026): what was cut from the wallet, the MCP
+  server and the web interface, what `xbt402_pay` does without a channel to fall to, the server
+  and payer that pay with work was moved onto, and how channel records, policy keys and approvals
+  an earlier version left are treated;
+- anything on a real network: no mainnet node and no Lightning node outside a test rig was used,
+  and every "blocks" figure was measured on regtest blocks mined at once.
 
-The cross-implementation scripts run the ordinary path. `scripts/failure_interop.sh` runs these
-failure paths through the release binaries on regtest, and no others have been run that way: an
-answer lost on a direct channel (the signer's rail and the library client); a provider that stops
-answering; one hostile Electrum server among two honest ones (silent,
-hiding the wallet's transactions, sending malformed numbers); a kill and restart of the provider
-and the signer in the middle of a payment; and a seller that refuses a funded open. Its
-faults are injected on loopback by a proxy and by signals: a slow or lossy network, a full disk,
-a clock that jumps and two faults at once were not tried.
+Failure paths through the release binaries are run for the ticket rail and the lottery only
+(`scripts/ticket_e2e_regtest.sh` and `scripts/lottery_regtest.sh`: a seller that lies, played by a
+proxy, and a kill of each part with a payment in flight). The script that ran them for the
+on-chain channel and the light client went with those. Faults are injected on loopback by a proxy
+and by signals: a slow or lossy network, a full disk, a clock that jumps and two faults at once
+were not tried. Pay with work has no such run.

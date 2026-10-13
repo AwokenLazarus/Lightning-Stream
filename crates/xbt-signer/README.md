@@ -1,21 +1,29 @@
 # xbt-signer
 
-B2's agent-wallet signer in Rust (AGP-027). One process holds every key. The model-facing process
-(B2's Python MCP server, or a Rust payer through `client::RemoteSigner`) only calls its socket. The
+The agent wallet's signer (AGP-027; it began as a Rust port of B2's Python signer). One process
+holds every key. The model-facing process (the wallet's MCP server) only calls its socket. The
 signer carries:
 
-- B2's policy engine;
-- sealed hot and channel keys;
-- the write-ahead channel open (P1) and the minConf wait (P2);
-- refund custody at expiry (the watcher);
-- the AGP-022 close-change retry;
+- the policy engine (B2's, with B2's decision table as its conformance test);
+- the sealed hot key;
+- the Lightning rail (BOLT 11 and BOLT 12) through the owner's node;
+- the stream-ticket book and the payer that lets `xbt402_pay` pay a seller with tickets, by
+  draws, or with a single Lightning invoice;
 - the hash-chained signature log, anchored with B2's witness.
 
-It uses B2's socket protocol (`b2/docs/B2_SIGNER_API.md`) and B2's on-disk formats, so either signer
-runs behind either client and opens the other's files.
+It uses B2's socket protocol (`docs/B2_SIGNER_API.md` in the Python wallet's repository) and B2's
+on-disk formats where B2 has them.
 
-Reference: B2 `agp-next2` `04c3f56` (`agentwallet/signer.py`, `channels.py`, `hot.py`, `keystore.py`,
-`sigaudit.py`, `anchor.py`, `policy.py`, `xbt402.py`, `stream.py`, `netparams.py`).
+**The on-chain channel was removed (October 2026).** Until then the signer also funded, paid
+over, closed and refunded an on-chain one-way channel per seller. This version has none of that:
+the methods listed under "Removed" answer `deny/removed`, `xbt402_pay` pays over Lightning only,
+and a wallet that still has channels on record is told so and is shown them read-only
+(`src/legacy.rs`). Closing or refunding such a channel needs the last revision with the channel,
+`2a31170`, run on the same wallet directory; this version never writes `channels.json` or
+`channel_keys.json`.
+
+Reference: B2 `agp-next2` `04c3f56` (`agentwallet/signer.py`, `hot.py`, `keystore.py`,
+`sigaudit.py`, `anchor.py`, `policy.py`, `netparams.py`).
 
 ## Run
 
@@ -44,35 +52,25 @@ The environment is B2's:
 Every B2 method listed below behaves as in B2:
 
 - `balance`, `quote_payment`, `pay`, `approve`, `history`;
-- `health`, `chain_backend`, `channels`, `hot_address`, `notice_hot_txid`, `fund`;
-- `open_channel`, `sign_state`, `xbt402_pay`;
-- `xbt402_request_auth`, `xbt402_sign_state_a3`;
-- `close_channel`, `xbt402_refund` (alias `refund_channel`), `watch_tick`;
+- `health`, `chain_backend`, `hot_address`, `notice_hot_txid`, `watch_tick`;
 - `rotate_hot_key`, `sweep_hot`, `signatures`, `anchor_now`, `anchor_status`, `hot_reconcile`.
 
-`xbt402_pay` includes streamed results (`xbt402-merkle-v1`). Limit: on a postpay channel a streamed
-result can be bought once per channel and not after a lost answer (each further try pays for the
-manifest and gets no data); an open item, see `docs/LIMITS.md`.
+`pay` sends coins on chain from the node's wallet to an address; a seller's URL is refused there
+(it used to open a channel). `channels` lists the tickets in flight (where the wallet has a ticket
+book) and, under `channels`, the on-chain channel records an earlier version left, each marked
+`legacy`; `balance`, `channels` and `health` carry `legacy_channels` (how many are not settled,
+and what to do) when there are any. `xbt402_pay` is described under "Stream tickets" below.
 
-### New for an external payer
+### Removed
 
-These are B1's `ChannelSigner` interface, so a client never holds a payer key. Each one is
-policy-checked where it raises the signed amount.
-
-| method | params | result |
-|---|---|---|
-| `xbt402_new_key` | `origin` | `{pub}`: the payer key issued for that origin and not yet bound to a channel (a new one only when none is pending), sealed on disk at once as `pending:<origin>` |
-| `xbt402_attach` | `origin`, `params` (ChannelParams `to_dict`) | `{chan, dest}`: binds the issued key to the funded channel (open at once); `<origin>/next` is a rollover's successor, attached only once this signer's node shows the rollover (else `deny/rollover_unproven`) |
-| `xbt402_sign_state` (= `sign_state`) | `chan` or `dest`, `cum` | policy on `cum - used`, then `{verdict, chan, cum, sig}` |
-| `xbt402_sign_rollover` | `chan`, `amount`, `next_spk`, `next_capacity` | policy on the increase, then `{sig}` (audit kind `channel_rollover`) |
-| `xbt402_sign_conditional` | `chan`, `uncond`, `hash`, `amount`, `csv_delta` | policy on `uncond + amount - used`, then `{sig}` |
-| `xbt402_sign_close` | `chan` | `{sig}` (close authorisation) |
-| `xbt402_sign_refund` | `chan` | `{hex, expiry, to}`: the CLTV refund, always to the hot key |
-| `xbt402_mark_closed` | `chan`, `txid` | the channel's record after its change was learned (AGP-022), once this signer's node shows the funding spent; before that `deny/close_unproven` and the channel stays refundable (AGP-080) |
-| `tx_confirmations` | `txid`, `vout` | `{confirmations, height}` (read-only; for the payer's P2 wait) |
-
-`client::RemoteSigner` implements `xbt402::signer::StateSigner` and `xbt402::client::Wallet` over
-these methods: `Client::new(..).with_signer(Arc::new(RemoteSigner::new(sock)))`.
+These were methods of the on-chain channel, and of the forward rail that rode on its closes. Each
+answers `{"verdict": "deny", "rule": "removed", ...}`: `fund`, `open_channel`, `sign_state`,
+`xbt402_sign_state`, `xbt402_request_auth`, `xbt402_sign_state_a3`, `xbt402_sign_rollover`,
+`xbt402_sign_conditional`, `xbt402_sign_close`, `xbt402_sign_refund`, `xbt402_new_key`,
+`xbt402_attach`, `xbt402_funded`, `xbt402_mark_closed`, `close_channel`, `xbt402_refund`
+(`refund_channel`), `tx_confirmations`, `forward_status`, `forward_pending`, `forward_transfers`,
+`forward_recover`. The socket's external-payer seam (`client::RemoteSigner`) and the
+`xbt-signer-payer` binary went with them; `client::SignerClient` is the socket client.
 
 ### Routed payments (retired)
 
@@ -80,9 +78,7 @@ The hub was retired on 2026-10-11: payments between parties route over ordinary 
 The signer no longer has a routing policy and no longer answers B2's lock methods
 (`xbt402_sign_state_adaptor`, `xbt402_resolve_lock`, `xbt402_void_lock`, `xbt402_adopt_lock`,
 `xbt402_recover_lock`, `routing_status`); B2 still has them. A `routing` section in `policy.json`
-is ignored, with a warning. A channel record that an earlier version left with a pending lock
-keeps it: no plain state below the locked amount is signed, and the channel is refunded at its
-expiry. The code is in the git history (last at commit `a548fb0`).
+is ignored, with a warning. The code is in the git history (last at commit `a548fb0`).
 
 ### For the web UI (AGP-039)
 
@@ -92,7 +88,7 @@ are in `approval.rs`. None of these methods is an MCP tool.
 
 | method | params | result |
 |---|---|---|
-| `approvals` | | pending, approved (xbt402 grants) and expired approval tokens with dest, amount, memo, url, expiry |
+| `approvals` | | pending, approved (granted Lightning payments) and expired approval tokens with dest, amount, memo, expiry |
 | `approval_status` | `token` | `pending`, `approved`, `used`, `denied`, `expired` or `unknown` |
 | `deny_approval` | `token`, `reason`, `expiry`, `signature` | drops the token. AGP-063 W3: a live approval needs the human signature over `deny_message(token, expiry)`, so the agent cannot refuse for the owner; an expired one is dropped without one |
 | `policy_get` / `policy_validate` | / `policy` | the file, its SHA-256 and the values in force; the validator's `errors` (the engine's parse errors first) and `warnings` |
@@ -102,13 +98,13 @@ are in `approval.rs`. None of these methods is an MCP tool.
 | `human_key_rotate` | `pubkey`, `expiry`, `signature` (by the current key) | the new human key |
 | `rotate_hot_key_signed` | `expiry`, `signature` | `rotate_hot_key`, logged under `human:rotate_signature`. AGP-063 W3: `rotate_hot_key` itself is this method now |
 | `backup_export` | `backup_pass`, `expiry`, `signature` | policy, sealed keys, books and logs, plus the wrapping secret sealed under the backup passphrase |
-| `keystore_status`, `channel_reports` | | the wrapping-key source and mode; each close's report (AGP-029: cum, unpaidMsat, payeeFee, payeeNet) |
+| `keystore_status`, `channel_reports` | | the wrapping-key source and mode; the close reports an earlier version kept of its on-chain channels (read-only), and `legacy_channels` |
 
-An over-threshold `xbt402_pay` stores its approval as `kind: "xbt402"` with its url and method.
-`approve` of such a token grants it: nothing is paid yet. The agent's next `xbt402_pay` with the same
-url, method and `max_sats` then pays under it once, with `human = true`, and returns `approved: true`.
-Other tokens keep B2's `approve`, which pays at once. `close_channel` now returns B2's AGP-029
-`close_report`.
+An over-threshold `ln_pay` stores its approval as `kind: "ln"` with the invoice's payment hash.
+`approve` of such a token grants it: nothing is paid yet. The agent's next `ln_pay` of the same
+invoice then pays under it once and returns `approved: true`. Other tokens keep B2's `approve`,
+which pays at once (an on-chain `pay`). A token a channel payment asked for before the channel was
+removed (`kind: "xbt402"`) pays nothing: approving it drops it, with `deny/removed`.
 
 ### Lightning: `rail=ln` (AGP-048)
 
@@ -269,16 +265,16 @@ as `prepaid_terms` and answers `prepaid_msat`, and no socket method buys one. Fo
 `ln:<node id>` on the allowlist, or with an allowlisted origin whose `counterparties` entry has
 `ln_node`. The wallet's own rules (the daily and weekly budgets, the per-counterparty cap, velocity,
 the split window) apply to every release; a ticket that would reach the human threshold is refused
-when the session opens. Top-level `channel_rail` (true): whether `xbt402_pay` may still pay the
-on-chain channel.
+when the session opens.
 
 ### Stream tickets: `xbt402_pay` pays a seller
 
 `src/ticket_http.rs` (a seller's messages read strictly, the wallet's count of a session: no IO) and
 `src/ticket_pay.rs` (the rail choice, the session over HTTP, the answer read as it arrives). With
-tickets on, `xbt402_pay` takes one more argument, `task`, and asks the seller once without paying; the
-402 it gets back decides the rail (`docs/TICKETS.md`, section 12): a ticket entry, a single Lightning
-invoice, the on-chain channel, or `no_rail` with what each entry would need. The reply of a call paid
+tickets on, `xbt402_pay` takes one more argument, `task`. It asks the seller once without paying; the
+402 it gets back decides the rail (`docs/TICKETS.md`, section 12): a ticket or lottery entry, a single
+Lightning invoice, or `no_rail` with what each entry would need. With tickets off it still asks once and
+can pay only a single Lightning invoice; with `max_sats` 0 it pays nothing and refuses a 402. The reply of a call paid
 with tickets has `rail: "ticket"`, `status`, `charged_sats` (what the book put in the ledger for the
 tickets this call released), `tickets_released`, `price_msat` (what the call used, by the wallet's own
 count), `balance_msat` (what is left with the seller), `complete` and `ended`, `bytes`, `body_digest`
@@ -315,40 +311,17 @@ write step of a release, a lock, a settle and a start. `docs/LIMITS.md` states w
 
 ## Budget integrity and privileged methods (AGP-063)
 
-Every signature that raises the signed amount is booked as the signed delta (`xbt402:<chan>:<cum>`)
-before it is sent, never the seller's `charged`. The budget sums are held to that increase,
-including a channel's dust floor (`PolicyEngine::evaluate_booking`). `minCapacity` above the owner's cap is
-`deny/min_capacity`. A negative payment or amend is refused. `fund`, `open_channel`,
-`xbt402_attach` and `xbt402_sign_rollover` are bound to an issued key, the seller's verified payTo
-and the owner's bounds. `rotate_hot_key` and a live `deny_approval` need the human signature, and
-the first `human_key_enroll` needs the one-time code. Passphrase blobs use scrypt N=2^17 with
-`log_n`. Details, error codes and the wire changes are in the workspace README section
-"Agent-wallet budget integrity and privileged methods (AGP-063)".
+A negative payment or amend is refused. `rotate_hot_key` and a live `deny_approval` need the human
+signature, and the first `human_key_enroll` needs the one-time code. Passphrase blobs use scrypt
+N=2^17 with `log_n`. (The rest of this fix wave bound what a channel could be funded and signed
+for; it went with the on-chain channel. `docs/ENGINEERING.md` has it as history.)
 
-## No unbooked signature, no close on anyone's word (AGP-080)
+## Booked before it is sent (AGP-080)
 
-- **Hash-locked last chunk.** A stream's last chunk is bought with a state that pays the plain
-  amount plus the chunk to whoever holds the key. The ledger holds both before that state is
-  signed. The plain state that folds the lock in books nothing more, and a seller that keeps the
-  signature and withholds the key releases nothing.
-- **Closed means spent on our node.** `xbt402_mark_closed` marks a channel closed only when this
-  signer's node shows its funding output spent (`deny/close_unproven` otherwise; the claim is kept
-  in memory and the watcher marks the channel closed when the spend arrives). `close_channel`
-  reports the provider's close with `close_proven`; a close our node has not shown is recorded
-  `close_unproven`, stays with the watcher, and is not replaced by a new channel
-  (`deny/close_unproven`). If the funding is still unspent at expiry the record is opened again
-  and refunded. `xbt402_attach` of `<origin>/next` needs the rollover on our node: the live
-  channel's funding spent by the transaction whose output is the next channel's script and
-  capacity (it waits up to `open_wait_s`, then `deny/rollover_unproven`; the issued key and the
-  live record are kept). A live record is never overwritten.
-- **Seller URLs.** `openUrl`, `closeUrl` and a stream's `chunkUrl` are the seller's strings. Each
-  must be a path starting with one `/`, or an absolute URL on the channel's own origin, with no
-  backslash, whitespace or control character (`xbt402::wire::seller_url`; `deny/seller_url`
-  before any request). The HTTP client follows no redirect.
 - **On-chain `pay`.** The payment is committed to the ledger before `sendtoaddress`. The node's
   own refusal (`rpc_refused`, a JSON-RPC error) takes the row back; any other failure leaves it
   (`onchain:unconfirmed:<id>`), because the node may have sent.
-- **Keys in memory.** The hot keys, the channel payer keys, a `Payer`'s key and every plaintext
+- **Keys in memory.** The hot keys, the ticket seed and every plaintext
   the keystore opens are wiped when dropped. `SecretKey` is `Copy`: a copy made on the stack while
   signing is not tracked, and libsecp256k1's own scratch memory is its own.
 
@@ -356,7 +329,9 @@ the first `human_key_enroll` needs the one-time code. Passphrase blobs use scryp
 
 One process owns a wallet directory. The files are B2's, byte format included: a directory written
 by either signer opens in the other (`tests/custody_compat.rs`), except B2's routed-spend log
-(`.run/routing.json`), which this signer no longer reads or writes.
+(`.run/routing.json`), which this signer no longer reads or writes, and B2's channel book
+(`.run/channels.json`, `.run/channel_keys.json`), which this signer reads only to list it and
+never writes. A backup export includes both channel files when they are there.
 
 - `.run/ledger.payments.jsonl` (the policy ledger's payments) is an append-only log (`src/applog.rs`): a header line
   `{"kind":...,"v":1}`, then one JSON object per line, each fsynced. A last line without its newline
@@ -376,13 +351,13 @@ by either signer opens in the other (`tests/custody_compat.rs`), except B2's rou
 
 Each of these answers that it is unavailable:
 
-- **The forward rail** (`forward.py`): `forward_status` answers `ported: false`, and `forward_recover`
-  is refused. `xbt402_pay` refuses an offer with `extra.forward` before any payment
-  (`deny/forward_disabled`).
+- **The forward rail** (`forward.py`): it rode on the on-chain channel's closes and was never
+  ported; its methods now answer `deny/removed` with the channel's.
 - **The CSV treasury and the presigned vault**: `fund_treasury`, `recover_treasury` and
   `recover_vault` answer `ok: false`, and `balance` reports `vault`/`treasury` as null.
-- **The Electrum light backend** (AGP-024). With `B2_CHAIN_BACKEND=electrum` the signer refuses to
-  start; AGP-028 owns Electrum.
+- **A light backend.** With `B2_CHAIN_BACKEND=electrum` the signer refuses to start: it reads the
+  chain from its own node. (The Electrum light client this tree had served the on-chain channel
+  and was removed with it.)
 
 ## Portability
 

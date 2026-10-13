@@ -40,7 +40,7 @@ const dict = {
   'Connect the wallet to your XBT node before starting it': 40,
   'Once the service runs, get the web UI setup code and choose your password': 41,
   'Web interface': 42,
-  'Set the policy, approve payments, and see balances, channels and the signature log': 43,
+  'Set the policy, approve payments, and see balances, keys and the signature log': 43,
   'MCP server for agents': 44,
   'Agents connect here (path /mcp) with the bearer token from the Agent connection action': 45,
   Listening: 48,

@@ -1,5 +1,22 @@
 # Engineering notes (xbt-rs)
 
+> **Read this first (October 2026).** The on-chain one-way channel was removed from this tree:
+> the channel itself (funding, signed states, close, rollover, refund, watcher), its provider and
+> library client, their binaries and the `xbt402-interop` tools, the wallet's channel rail
+> (`xbt402_pay` over a channel, the signer's channel book and its socket methods, the MCP's
+> in-process payer), the light client `xbt-electrum`, the fair exchange built on channel states,
+> the BLAKE2b header and retarget code only the light client used, and their tests, vectors and
+> scripts. All of it is in the git history, last at commit `2a31170`.
+>
+> So nearly everything below describes code that is no longer here. It is kept as the record of
+> how that code was built, reviewed and fixed, and as the reasoning behind rules that the wallet,
+> the request binding, the HTTP server, pay with work and the Lightning rail still follow. The
+> sections on pay with work, the Lightning rail, BOLT 12, the one bounded HTTP server and the
+> agent wallet's approvals and keys still describe the tree, except where they speak of a
+> channel. What runs today is in `README.md`, the wire of what is built now is in
+> `docs/TICKETS.md`, and what is and is not covered is in `docs/LIMITS.md`. The note of
+> 2026-10-11 that follows was written when the channel was frozen and is left as it was.
+
 > **Read this first (2026-10-11).** The direction changed on this day. Lightning Stream is now
 > built on Lightning: it adds stream tickets to ordinary XBT Lightning channels, and that work is
 > in design, not built. The hub was retired and its code removed: the `xbt402-hub` binary, hub

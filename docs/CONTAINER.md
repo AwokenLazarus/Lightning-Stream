@@ -22,10 +22,10 @@ tmpfs `/tmp`.
 
 ```
 /data/
-  signer/          agp  uid 10001  0700  policy.json, .run/ (B2 state: ledger, audit, sealed hot/channel keys,
-                                         channels, signatures.jsonl), secrets/
+  signer/          agp  uid 10001  0700  policy.json, .run/ (B2 state: ledger, audit, the sealed hot key,
+                                         the ticket book, signatures.jsonl), secrets/
   witness/         agp  uid 10002  0700  anchors.jsonl, alerts.jsonl       (XBT_WITNESS_DIR: own mount, own owner)
-  mcp/             agp  uid 10003  0700  secrets/, mcp-payer.jsonl (local payer mode)
+  mcp/             agp  uid 10003  0700  secrets/
   ui/              agp  uid 10005  0700  password.scrypt (the login hash), setup-code (first run only), secrets/
   relay/           agp  uid 10006  0700  blobs/ (the xbt-work receipt relay's sealed blobs, one file each), secrets/
   cmp-node/        cmp  uid 10011  0700  operator key, operator service, merchant ledgers and meters, secrets/
@@ -104,7 +104,7 @@ the data dir, and in the env variable (upper-cased, `-` → `_`). Lookup order (
 
 | name | component | what | first run |
 |---|---|---|---|
-| `signer-wrap-key` | signer | 32-byte AES-256-GCM wrapping key for the sealed hot and channel keys (raw or 64 hex) | generated |
+| `signer-wrap-key` | signer | 32-byte AES-256-GCM wrapping key for the sealed hot key and ticket seed (raw or 64 hex) | generated |
 | `signer-passphrase` | signer | instead of the wrap key: scrypt passphrase (B2 format) | never generated |
 | `node-rpc-auth` | signer (cmp: any node client) | `user:password` in cookie format (a node's `.cookie` works as is) | provisioned by the installer |
 | `mcp-http-token` | mcp (ui on a box) | bearer token for MCP over HTTP (64 hex) | generated when listening off loopback. On a box with the UI, `xbt-init` makes it `run/ui/mcp-http-token` instead: owned by the UI, 0640, the MCP reads it by group on every request and never writes it (AGP-042, §8) |
@@ -176,7 +176,7 @@ Every setting has an env variable. Files are optional.
 |---|---|
 | signer | B2's `B2_*` env (unchanged), plus `XBT_NODE_RPC_HOST`, `XBT_NODE_RPC_PORT`, `XBT_CHAIN`, `XBT_NODE_WALLET`. Policy: `XBT_SIGNER_POLICY` (JSON; authoritative, and rewrites `policy.json` when it changes), or `XBT_SIGNER_POLICY_FILE`, or the existing `policy.json`, or a default that pays nobody. `XBT_ANCHOR=off` runs without a witness. New knobs: `B2_RPCHOST`, `B2_RPCCOOKIE` (a credentials file), `B2_SIGNER_SOCK_MODE` (≤ 660). |
 | witness | `XBT_WITNESS_DIR`, `XBT_ANCHOR_SOCK` (defaults under `/data`) |
-| MCP | `XBT_MCP_HTTP`, `XBT_MCP_PATH`, `XBT_BASE_PATH`, `XBT_MCP_HTTP_ALLOW_REMOTE`, the existing `XBT_MCP_*` payer settings, and `B2_SIGNER_SOCK` (default `/data/run/signer/signer.sock`). `XBT_MCP_HTTP_TOKEN_FILE` (default `run/ui/mcp-http-token` when it exists): the UI-owned token, read on every request, fail closed. The MCP has no rotation endpoint (AGP-042). |
+| MCP | `XBT_MCP_HTTP`, `XBT_MCP_PATH`, `XBT_BASE_PATH`, `XBT_MCP_HTTP_ALLOW_REMOTE`, `XBT_MCP_LN` and `XBT_MCP_TICKETS` (the tools of those rails), `XBT_MCP_APPROVAL_WAIT_S`, and `B2_SIGNER_SOCK` (default `/data/run/signer/signer.sock`). `XBT_MCP_HTTP_TOKEN_FILE` (default `run/ui/mcp-http-token` when it exists): the UI-owned token, read on every request, fail closed. The MCP has no rotation endpoint (AGP-042). |
 | relay | `XBT_RELAY_BIND` (image `0.0.0.0:9490`, public, GET only), `XBT_RELAY_PUSH_BIND` (image `0.0.0.0:9491`, the Prime's pushes; `off`), `XBT_RELAY_STORE` (default `/data/relay/blobs`), `XBT_RELAY_RATE`/`_BURST` (GETs per second per client, default 10/40), `XBT_RELAY_MAX_ENTRIES` (1,000,000), `XBT_RELAY_TTL_DAYS` (30), `XBT_RELAY_THREADS`, `XBT_RELAY_PUSH_ALLOW_OPEN`, `XBT_BASE_PATH`, `XBT_TRUST_FORWARDED` (count clients by the proxy's `X-Forwarded-For` hop) |
 
 None of these binaries depends on systemd. `$CREDENTIALS_DIRECTORY` is just one secret source.
@@ -250,8 +250,12 @@ binary layers have not been verified yet.
 `scripts/container_test.sh` builds and inspects all the images, then runs the amd64 ones on a private
 Docker network with a Knots regtest node. They are configured only by env and the data dir (named
 volumes). The test:
-1. pays an xbt402 call through the MCP over HTTP, behind a base path and with the bearer token;
-2. kills and restarts the containers and checks that everything persists;
+1. reaches the MCP over HTTP, behind a base path and with the bearer token: the tool list, the
+   balance, a payment quoted under the policy; and funds the hot key. No seller is paid: the stack
+   has no Lightning node, and the on-chain channel it once paid over was removed (an agent paying
+   a seller through the MCP is proven on Lightning by `scripts/ticket_e2e_regtest.sh`);
+2. kills and restarts the containers and checks that the keys, the hot key's coins, the token and
+   the anchors persist;
 3. checks that `/readyz` follows the witness and the node.
 
 Ports 23700–23799. Evidence is written to `run/container-test/<stamp>/`.

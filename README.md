@@ -22,7 +22,8 @@ This direction was decided on 2026-10-11. **Tickets run end to end on regtest, a
 else**: the design was measured on a three-node Lightning Fork regtest, the seller's side (the
 gateway) and the wallet's side are built, and on that regtest an agent's one call to the wallet
 buys a page, or a 100 MB file as it arrives, from a service behind the gateway. Nothing has run
-on mainnet. The sections below say what exists today, what is being built, and what was retired.
+on mainnet. The sections below say what exists today, what is being built, and what was retired
+or removed.
 
 Whitepaper: **<https://lazarus-xbt.xyz/stream/>**
 
@@ -36,9 +37,10 @@ the full list, with a link for each, is [`docs/REFERENCES.md`](docs/REFERENCES.m
 > budget accounting, the hub, the pay-with-work audit and the HTTP layer. Six rounds of fixes are in
 > this tree. Four follow-up audits of our own checked them: the first found 14 items (3 high), the
 > second 20 (6 high), the third 23 (none high, 11 medium), the fourth 18 (none high, 9 medium).
-> After the sixth round every finding is fixed or ends as a stated limit, and two items are open.
-> A later run of failure paths through the release binaries found three more open items, all on
-> the frozen on-chain channel; the one an agent could be steered by is fixed and two stay open. The hub has since been removed, and that removal has not been
+> After the sixth round every finding was fixed or ended as a stated limit, with two items open.
+> The hub was then removed, and in October 2026 the on-chain channel, which most of those findings
+> were about: the findings on it, its stated limits and the open items on its path left the tree
+> with it, and one open item remains, in the Python reference wallet. Neither removal has been
 > reviewed by anyone.
 > **`docs/LIMITS.md` lists every stated limit, the open items, and what nobody has reviewed.**
 > None of the fixes has been re-reviewed by anyone outside the project; an independent audit is
@@ -47,9 +49,8 @@ the full list, with a link for each, is [`docs/REFERENCES.md`](docs/REFERENCES.m
 > Conformance results in `docs/ENGINEERING.md` are measured against our own Python references:
 > [Lightning-Stream-py-channel](https://github.com/AwokenLazarus/Lightning-Stream-py-channel) and
 > [Lightning-Stream-py-wallet](https://github.com/AwokenLazarus/Lightning-Stream-py-wallet). The
-> pay-with-work specification (XBT-053) and its vectors are not published yet. The channel scheme
-> uses the x402 `batch-settlement` name with our own binding to XBT; upstream x402 clients cannot
-> pay it.
+> pay-with-work specification (XBT-053) and its vectors are not published yet. Both Python
+> repositories still hold the on-chain channel that this tree no longer has.
 
 ## What exists today
 
@@ -71,9 +72,8 @@ the full list, with a link for each, is [`docs/REFERENCES.md`](docs/REFERENCES.m
   budget for each task, an exposure cap, and small caps for sellers the owner has not named.
   `scripts/ticket_book_regtest.sh` runs it against Lightning Fork nodes on regtest.
 - **The wallet pays a gateway (regtest only).** The agent's ordinary `xbt402_pay` call chooses
-  the rail: stream tickets where the seller offers them and the owner's policy allows them, a
-  single Lightning invoice where that is what the seller offers, and otherwise the frozen
-  channel. For tickets the signer fetches the seller's terms itself, locks a pool, releases a
+  the rail: stream tickets where the seller offers them and the owner's policy allows them, and
+  a single Lightning invoice where that is what the seller offers. For tickets the signer fetches the seller's terms itself, locks a pool, releases a
   ticket each time the balance with that seller runs out, reads the answer as it arrives, checks
   every receipt against its own count, and cancels what is left when the session stops.
   `scripts/ticket_e2e_regtest.sh` runs it through a routing hop with the release binaries and a
@@ -86,16 +86,8 @@ the full list, with a link for each, is [`docs/REFERENCES.md`](docs/REFERENCES.m
   binaries on channels of 30 slots: a 100 MB file bought by draws, 100 sellers paid at once, a
   buyer that never pays, a seller that lies about wins, and a kill of each part. The argument
   that the draw is fair is our own and unreviewed.
-- **The on-chain one-way channel (frozen).** A direct channel anchored on the chain, for paying
-  one seller piece by piece: the buyer signs a slightly larger running total for each piece and
-  the seller settles once. It is kept in the tree and tested, off the main path, with no new
-  work. Its remaining case is a seller that cannot run a Lightning node. Whether it stays is
-  decided after tickets run end to end.
 - **Pay with work.** A miner pays for a service with pool shares, settled in the coinbase and
   checked by an audit.
-- **Fair exchange.** Content that can be checked piece by piece is paid for only as it checks
-  out: each chunk is bound by a Merkle proof, and the last one by a hash lock. Today this runs on
-  the frozen channel.
 
 ## What is being built
 
@@ -169,7 +161,7 @@ built it first; our construction differs from theirs and, unlike theirs, has no 
 treatment. It was measured on a regtest lab and rests on an argument that no cryptographer has
 reviewed; it will not be built until one has (`docs/LIMITS.md`, "The win that pays itself").
 
-## What was retired
+## What was retired and removed
 
 **The hub**, on 2026-10-11: the `xbt402-hub` service, routing between channels with adaptor
 signatures, the hub's link to a Lightning node, and the routed client. It was this project's own
@@ -177,6 +169,22 @@ way for one channel to reach many sellers. Lightning's routing already does that
 that exists, so the hub rebuilt part of Lightning beside it. The external review also found the
 hub the weakest part of the tree. Its code, tests, scripts, vectors and packages are removed;
 they are in the git history, last at commit `a548fb0`.
+
+**The on-chain one-way channel**, frozen on 2026-10-11 and removed in October 2026. It was a
+direct channel anchored on the chain for paying one seller piece by piece (x402's
+`batch-settlement` name, with our own binding to XBT): the buyer signed a slightly larger running
+total for each piece and the seller settled once. Tickets and the lottery do that job on
+Lightning, and the channel carried the open defects that were left. With it went its provider
+and library client, the wallet's channel rail, the light client that watched it
+(`xbt-electrum`), the fair exchange built on its states (Merkle-proved chunks and a hash-locked
+last one), and their tests, vectors and scripts. They are in the git history, last at commit
+`2a31170`. Three things follow from the removal:
+
+- A wallet that was upgraded with channels on record cannot close or refund them with this
+  version. It leaves their records and sealed keys untouched and says which revision settles them.
+- The wallet pays sellers over Lightning only. The Umbrel and StartOS packages do not wire a
+  Lightning node into the wallet yet, so a packaged wallet can pay no seller for now.
+- A seller that cannot run a Lightning node has no rail here; pay with work is the other way in.
 
 ## Built on
 
@@ -195,8 +203,7 @@ they are in the git history, last at commit `a548fb0`.
   `v26.06.9-blake2b.7` in the lab as buyer, hop and seller to measure its limits
   ([`docs/TICKETS.md`](docs/TICKETS.md), section 11); the wallet and the gateway speak to
   Lightning Fork nodes only.
-- **electrs** by Roman Zeyde, the Electrum server the light chain backend talks to, and
-  **libsecp256k1**, where all signing and verification runs.
+- **libsecp256k1**, where all signing and verification runs.
 - **x402** (created by Coinbase, kept by the x402 Foundation) for the HTTP 402 wire, and the
   **Model Context Protocol** (Anthropic; now the Agentic AI Foundation) for the agent's tools.
 - **OCEAN's DATUM and TIDES**, which pay with work is built around.
@@ -211,8 +218,9 @@ Nothing in a stream ticket is a new mechanism. Each line names whose it is;
 - **The ticket** is a hold invoice (Joost Jager, lnd, 2019) on a hash the buyer chose. Releasing
   a payment in a second step, by a key the payer holds back, is Hiroki Gondo's "stuckless
   payments" proposal of 2019, which uses point locks.
-- **The on-chain channel** is Jeremy Spilman's one-way channel of 2013, in the
-  `CHECKLOCKTIMEVERIFY` form BIP 65 describes. **Lightning** is Joseph Poon's and Tadge Dryja's.
+- **Lightning** is Joseph Poon's and Tadge Dryja's. **The removed on-chain channel** was Jeremy
+  Spilman's one-way channel of 2013, in the `CHECKLOCKTIMEVERIFY` form BIP 65 describes; the
+  light client that watched it spoke the Electrum protocol to **electrs** (Roman Zeyde).
 - **The retired hub** used adaptor signatures (Andrew Poelstra's scriptless scripts; ECDSA
   adaptor signatures after Lloyd Fournier) in the shape of TumbleBit and A2L.
 - **Paying over HTTP 402**: x402, and Lightning Labs' L402, which a seller that settles each
@@ -231,26 +239,24 @@ credit for that is his; the mistakes that remain are ours.
 
 ## What is in the tree
 
-A Rust workspace: the agent wallet that AI agents use over MCP, its Lightning rail, the frozen
-on-chain channel, pay with work, and the services and packages around them.
+A Rust workspace: the agent wallet that AI agents use over MCP, its Lightning rail, stream
+tickets and the lottery on both sides, pay with work, and the services and packages around them.
 
 | crate | what |
 |---|---|
 | `xbt-primitives` | XBT transactions, scripts, addresses, UnifiedSighash (0x21), strict ECDSA, BLAKE2b headers and proof of work |
-| `xbt402` | the frozen on-chain channel: funding, signed states, close, rollover, refund, the HTTP 402 wire (x402 v2 `batch-settlement`), receipts, provider and payer |
+| `xbt402` | what the paid-HTTP schemes share: the x402 v2 headers and the request binding, the stream-ticket and lottery wires, and the server and payer that pay with work plugs into |
 | `xbt-signer` | the agent wallet's signer: keys never reach the agent (the owner can export a sealed backup); the owner's signed policy (budgets, per-seller caps, allowlist, human approval); a tamper-evident signature log; the Lightning rail (BOLT 11 and BOLT 12); the ticket book and the payer that lets `xbt402_pay` pay a gateway with stream tickets (regtest only) |
 | `xbt-wallet-mcp` | the wallet's MCP server, over stdio and streamable HTTP, so an AI agent can quote and pay without holding a key |
-| `xbt-wallet-ui` | the owner's web UI: approvals, policy, channels, signature log |
-| `xbt-electrum` | a light chain backend for the buyer's wallet (it watches the frozen channel): it checks headers, proof of work and Merkle proofs itself; "not there" is answered only when every configured server answered, and servers that all hide a transaction make it read as absent |
+| `xbt-wallet-ui` | the owner's web UI: approvals, policy, keys, signature log |
 | `xbt-work`, `xbt-work-relay` | pay with work: a miner pays with pool shares, settled in the coinbase and checked by an audit |
 | `xbt-gateway` | the stream-ticket seller gateway: a reverse proxy beside a Lightning node that puts a price per piece on any HTTP service (regtest only) |
 | `xbt-svc` | container plumbing: data dir, secrets, readiness, the bounded HTTP server |
-| `xbt402-interop` | conformance vectors and cross-implementation tools |
 
 `packaging/` holds the Umbrel and StartOS apps of the wallet. `container/` and `docs/CONTAINER.md`
 cover the images. `docs/ENGINEERING.md` has the design notes, conformance results and measurements
-of the on-chain channel and the hub, as history. `docs/LIMITS.md` has the stated limits and open
-items.
+of the on-chain channel and the hub, as history: most of what it names is no longer in the tree.
+`docs/LIMITS.md` has the stated limits and open items.
 
 ## Build
 
@@ -262,9 +268,10 @@ cargo build --release -p xbt-signer -p xbt-wallet-mcp -p xbt-wallet-ui
 Rust stable; libsecp256k1 is built from source. Cross builds (Linux x86_64, aarch64, armv7, riscv64,
 macOS, Windows) use zig as the C compiler: see `docs/ENGINEERING.md`.
 
-The regtest scripts in `scripts/` need a Bitcoin Knots 29.4.2 build for XBT (`XBT_BIN`), and the
-cross-implementation ones also need the Python reference implementations (linked above; set
-`XBT402_B1` and `XBT402_B2` to their checkouts).
+The Lightning regtest scripts in `scripts/` (tickets, the gateway, the lottery, the Lightning
+rail) need Docker; they build the Lightning Fork lab under `run/`. The others need a Bitcoin Knots
+29.4.2 build for XBT (`XBT_BIN`). `scripts/mcp/verify_agp030.sh` and `scripts/ui/regtest_ui.sh`
+also use the Python reference implementations linked above.
 
 ## License
 

@@ -76,7 +76,7 @@ connects an agent. The owner never needs a shell:
 
 ### Backups
 
-- **StartOS:** backs up the `main` volume (sealed keys and their wrapping key, anchors, channels, ledgers,
+- **StartOS:** backs up the `main` volume (sealed keys and their wrapping key, anchors, ledgers, the ticket book,
   the UI's hash) and `startos` (the node connection). The backup is encrypted with the server's master
   password. After a restore, `init` puts the owners back.
 - **Umbrel:** backs up `${APP_DATA_DIR}` the same way.
@@ -97,7 +97,7 @@ sharing the uid table with the services, `FROM scratch`, on all three architectu
 |---|---|---|
 | depend on an XBT node app that exports `APP_XBT_KNOTS_*` | yes | one node per box, shared with xbt-compute |
 | bundle a node in the wallet app | no | a second node on a box that runs cmp's |
-| an Electrum fallback | not possible yet | the Rust signer has no Electrum backend (AGP-028); B2's Python signer has one, but it is not the shipping signer |
+| a light client in place of a node | no | this tree has none: the Electrum light backend it had watched the on-chain channel and was removed with it |
 
 The stand-in's export contract is five variables: host, RPC port, chain, user, password. cmp's node-host app
 (CMP-098) must export the same names. Until then `lazarus-xbt-knots` is a stand-in, reusing A3's
@@ -148,13 +148,21 @@ applied there.
 
 ## Not done, and gaps
 
+- **The packaged wallet pays no seller.** The wallet pays sellers over Lightning (stream tickets, the
+  lottery, a single invoice), and neither package wires a Lightning node into it (no `B2_LN_*`
+  setting in the Umbrel compose or the StartOS spec). Until October 2026 it paid over an on-chain
+  channel funded from its hot key; that channel was removed. What the packages give today: keys, the
+  signed policy, approvals, the signature log and its witness, the agent's MCP endpoint and token. The
+  package tests no longer contain a paid call: where it was they check the agent's tool list and
+  balance, and custody of the hot key across a restart and a restore.
+
 - No install on a real Umbrel or StartOS box (needs Mike). The StartOS build targets StartOS 0.4
   (`osVersion` 0.4.0-beta.10 in the manifest, start-sdk 2.0.9).
 - The XBT node:
   - on Umbrel, the wallet needs the stand-in, **amd64-only**, until CMP-098 (documented dependency:
     same `APP_XBT_KNOTS_*`);
   - on StartOS, an external connection until CMP-099;
-  - no Electrum fallback (AGP-028).
+  - no light client: the wallet needs a node's RPC.
 - Token rotation: the wallet UI Agents page writes a new token into `run/ui/mcp-http-token`; the MCP reads
   it on every request, so the old token gets 401 at once. The MCP has no rotation endpoint (docs/CONTAINER.md
   §10). StartOS also keeps the delete-and-restart action.
