@@ -52,7 +52,8 @@ tool_lists() {
 mkdir -p run
 echo "MCP verify: $(git rev-parse --short HEAD), $(date -u +%FT%TZ)"
 step "build (release, -j2)" "${SOAK[@]}" cargo build -q -j2 --release --offline -p xbt-wallet-mcp -p xbt-signer -p xbt-gateway --bins
-step "cargo test --workspace" bash -c "${SOAK[*]} cargo test -q -j2 --workspace --offline 2>&1 | grep -E '^test result' | awk '{p+=\$4; f+=\$6} END {print \"tests passed\", p, \"failed\", f; exit f>0}'"
+# the whole output is kept (run/verify-tests.log): a failure is named here, not only counted
+step "cargo test --workspace" bash -c "${SOAK[*]} cargo test -j2 --workspace --offline --no-fail-fast > run/verify-tests.log 2>&1; grep -E '^test .* FAILED|panicked at' run/verify-tests.log; grep -E '^test result' run/verify-tests.log | awk '{p+=\$4; f+=\$6} END {print \"tests passed\", p, \"failed\", f; exit f>0}'"
 step "no serde_json arbitrary_precision" bash -c "! cargo tree --offline -e features -i serde_json --workspace 2>/dev/null | grep -q arbitrary_precision"
 step "the tool lists" tool_lists
 if [ "${PARITY:-1}" != 0 ]; then
