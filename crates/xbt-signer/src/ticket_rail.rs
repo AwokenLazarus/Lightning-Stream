@@ -28,7 +28,7 @@
 //!
 //! Locks: the wallet's spend lock, then the book's. No lock is held while the node routes a
 //! ticket, so a release never waits for a lock round.
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -39,7 +39,7 @@ use serde_json::{json, Value};
 use crate::applog::AppendLog;
 use crate::bolt11::{self, Invoice};
 use crate::keystore::{random_bytes, write_private};
-use crate::ln::{check_invoice, cltv_until, cross_check, htlc_locks, htlcs_in_flight, i64_of, paid_msat, preimage_bytes, preimage_proves, u64_of, HeldSend,
+use crate::ln::{check_invoice, cltv_until, cross_check, htlc_locks, htlcs_in_flight, i64_of, node_said, paid_msat, preimage_bytes, preimage_proves, u64_of, HeldSend,
                 LnBackend, LnPolicy};
 use crate::node;
 use crate::policy::{normalize_dest, Payment, PolicyConfig, DAY_S, WEEK_S};
@@ -700,6 +700,8 @@ impl Signer {
             refused.push(json!({"hash": hash, "rule": rule, "reason": why}));
         };
         let mut read: Vec<(String, String, Invoice)> = vec![];
+        // what the node answered where it gave an error, by payment hash: shown with the row it is about, as untrusted text
+        let mut node_errors: HashMap<String, crate::Error> = HashMap::new();
         for it in &items {
             // the hash an invoice was returned for is the seller's string: compared as it came, recorded only when it is a hash
             let said = str_or_empty(it.get("hash"));
@@ -737,7 +739,8 @@ impl Signer {
                     }
                 }
                 Err(e) => {
-                    refuse(&hash, "ln_backend", e.msg);
+                    refuse(&hash, "ln_backend", e.msg.clone());
+                    node_errors.insert(hash, e);
                     continue;
                 }
             }
@@ -752,6 +755,11 @@ impl Signer {
             Ok(s) => s,
             Err(d) => return d,
         };
+        for r in refused.iter_mut().filter(|r| r["rule"] == "ln_backend") {
+            if let Some(e) = r["hash"].as_str().and_then(|h| node_errors.get(h)) {
+                *r = node_said(r.take(), e);
+            }
+        }
         // the node routes them, a few at once (all sessions together: `Pace`); no lock is held
         let mut outcomes: Vec<Result<Value>> = vec![];
         for chunk in sends.chunks(SEND_PARALLEL) {
@@ -775,11 +783,13 @@ impl Signer {
             let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
             let (mut locked, mut slot_failed) = (0usize, 0usize);
             for ((hash, _), sent) in sends.iter().zip(outcomes) {
-                let pmt = match sent {
-                    Ok(p) => Some(p),
+                let (pmt, unsent) = match sent {
+                    Ok(p) => (Some(p), None),
                     // did it reach the router? The node's own record says; with no answer it stays `sending`
-                    Err(_) => ln.lookup(hash).ok().flatten(),
+                    Err(e) => (ln.lookup(hash).ok().flatten(), Some(e)),
                 };
+                // an error the node's record did not replace: it goes with the ticket's row
+                let unsent = unsent.filter(|_| pmt.is_none());
                 if let Some(pmt) = pmt {
                     self.ticket_apply(st, hash, &pmt)?;
                 }
@@ -787,7 +797,10 @@ impl Signer {
                     locked += usize::from(t.state == TState::Locked);
                     // a payment that failed as a full channel does: the node names no slot, only a balance or a route
                     slot_failed += usize::from(t.state == TState::Failed && ticket::slot_failure(&t.note));
-                    tickets.push(t.public());
+                    tickets.push(match &unsent {
+                        Some(e) => node_said(with(t.public(), json!({"send_error": e.msg})), e),
+                        None => t.public(),
+                    });
                 }
             }
             // a round that found no slot makes the session hold less: one ticket fewer, a wait, then nothing
@@ -1172,7 +1185,7 @@ impl Signer {
                     }
                     // a ticket the node once showed and now has no record of stays as it is: booked, if it was
                     Ok(None) => {}
-                    Err(e) => out.push(json!({"payment_hash": t.hash, "error": e.msg})),
+                    Err(e) => out.push(node_said(json!({"payment_hash": t.hash, "error": e.msg}), &e)),
                 }
                 if let Some(n) = st.book.tickets.get(&t.hash).filter(|n| n.state != t.state) {
                     out.push(json!({"payment_hash": t.hash, "was": t.state.as_str(), "state": n.state.as_str(), "booked_sats": n.booked_sats}));
@@ -1200,7 +1213,7 @@ impl Signer {
             st.compact_if_grown(now)
         })();
         if let Err(e) = res {
-            out.push(json!({"error": e.msg}));
+            out.push(node_said(json!({"error": e.msg}), &e));
         }
         out
     }
@@ -1384,7 +1397,7 @@ impl Signer {
                     return refuse(&hash, "ln_decode_mismatch", why);
                 }
             }
-            Err(e) => return refuse(&hash, "ln_backend", e.msg),
+            Err(e) => return node_said(refuse(&hash, "ln_backend", e.msg.clone()), &e),
         }
         // every rule of a release, the ledger and the book, under the wallet's spend lock
         let booked = {
@@ -1398,10 +1411,14 @@ impl Signer {
         };
         // the node routes it; no lock is held. An ordinary payment is over in a moment, and its end is waited for,
         // still inside the gate
+        let mut unsent: Option<crate::Error> = None;
         let mut pmt = {
             let mut pmt = match ln.send_held(&send) {
                 Ok(p) => Some(p),
-                Err(_) => ln.lookup(&hash).ok().flatten(),
+                Err(e) => {
+                    unsent = Some(e);
+                    ln.lookup(&hash).ok().flatten()
+                }
             };
             let deadline = Instant::now() + Duration::from_secs(lp.timeout_s.clamp(1, 600) as u64 + 5);
             while pmt.as_ref().is_none_or(|p| !payment_over(p)) && Instant::now() < deadline {
@@ -1449,8 +1466,15 @@ impl Signer {
             }
             TState::Failed => with(refusal(failed, format!("the payment of {what} failed ({}): nothing was spent", t.note)), about),
             // not final within the wait: booked, and the node's word decides later
-            _ => with(with(refusal(pending, format!("the payment of {what} is not final yet: it is booked as spent until the wallet's node shows it failed")), about),
-                      json!({"verdict": "pending", "charged_sats": t.booked_sats})),
+            _ => {
+                let v = with(with(refusal(pending, format!("the payment of {what} is not final yet: it is booked as spent until the wallet's node shows it failed")), about),
+                             json!({"verdict": "pending", "charged_sats": t.booked_sats}));
+                // the node answered the send with an error and has shown no record of the payment since
+                match unsent.filter(|_| pmt.is_none()) {
+                    Some(e) => node_said(with(v, json!({"send_error": e.msg})), &e),
+                    None => v,
+                }
+            }
         }
     }
 
@@ -1783,7 +1807,7 @@ impl Signer {
                     v["node"] = json!({"htlcs": on_node.len(), "agree": missing.is_empty() && extra.is_empty(), "in_book_not_on_node": missing,
                                        "on_node_not_in_book": extra});
                 }
-                Some(Err(e)) => v["node"] = json!({"error": e.msg}),
+                Some(Err(e)) => v["node"] = node_said(json!({"error": e.msg}), e),
                 None => v["node"] = Value::Null,
             }
             Ok(v)

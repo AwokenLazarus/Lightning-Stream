@@ -157,7 +157,9 @@ Before anything reaches the router (`src/ln.rs`, `src/bolt11.rs`):
 8. the macaroon, read from the file (`src/macaroon.rs`): `ln_status` shows its permissions and
    caveats (`only_needed`, `excess_ops`); on mainnet one granting anything beyond `info:read
    offchain:read offchain:write onchain:read` (a `uri:` permission included), or whose permissions
-   cannot be read, is refused (`ln_macaroon`; AGP-066);
+   cannot be read, is refused (`ln_macaroon`; AGP-066). A macaroon the node itself refuses on the
+   first call (a caveat that does not hold, an expiry, a missing permission) is `ln_macaroon` too, in
+   `ln_pay` and as `ln_status`'s `reason`; the node's own message is under `untrusted_ln_data`;
 9. HTLCs under CLTV: outgoing HTLCs the node started that the wallet did not book (sent outside it)
    hold funds until their expiry and count against what is left of the daily and weekly budgets
    (`ln_htlc_lock`) until they resolve. The wallet's own in-flight payments stay booked, with the CLTV

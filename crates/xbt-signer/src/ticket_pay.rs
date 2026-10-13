@@ -778,8 +778,13 @@ impl Signer {
         // why the book did not pay one of them: its first refusal, by its own rule. Kept for a release that finds the pool empty
         let why_not = locked.get("refused").and_then(Value::as_array).and_then(|a| a.first()).map(|first| {
             let (rule, why) = (str_or_empty(first.get("rule")), str_or_empty(first.get("reason")));
-            with(refusal(if rule.is_empty() { "ticket_lock" } else { rule.as_str() }, format!("a ticket could not be locked with this seller: {why}")),
-                 json!({"session": hs.sid, "refused": locked["refused"].as_array().map(Vec::len)}))
+            let mut v = with(refusal(if rule.is_empty() { "ticket_lock" } else { rule.as_str() }, format!("a ticket could not be locked with this seller: {why}")),
+                             json!({"session": hs.sid, "refused": locked["refused"].as_array().map(Vec::len)}));
+            // what the wallet's node said, where the refusal was its error: untrusted text, kept as the book gave it
+            if let Some(said) = first.get(crate::ln::UNTRUSTED_LN_KEY) {
+                v[crate::ln::UNTRUSTED_LN_KEY] = said.clone();
+            }
+            v
         });
         *lock(&hs.unfilled) = why_not.clone();
         // an invoice the wallet's own node could not be asked about was not judged either, and one that was refused for
