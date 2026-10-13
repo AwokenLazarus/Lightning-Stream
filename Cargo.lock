@@ -2648,16 +2648,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "xbt402-interop"
-version = "0.1.0"
-dependencies = [
- "hex",
- "serde_json",
- "xbt-primitives",
- "xbt402",
-]
-
-[[package]]
 name = "yoke"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
