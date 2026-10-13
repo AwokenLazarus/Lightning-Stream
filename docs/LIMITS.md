@@ -208,12 +208,26 @@ involved no node.
   (0.22 s at the median on the lab, 0.44 s with 8 on their way), and wins of 64 sat are below both dust limits while they are
   pending: one that is pending when a channel on its route is force-closed has no output there
   (reasoned, not run). The wallet keeps at most 8 payments on its way at once, tickets and wins
-  together, in the order they were found. On one 30-slot channel that paid the wins of 100
+  together, in the order they were found, except that a win its seller's answer stands still
+  for goes first. On one 30-slot channel that paid the wins of 100
   sellers of one buyer at 14 wins a second, with no payment failed; a buyer whose wins come
   faster than that keeps its sellers waiting: a seller serves on for its grace of 30 s, and an
   answer it is sending stands still for a payment for 10 s at the most before it is cut. Before the wallet kept a win inside that limit until it had settled, 24 payments were
   pending on the channel at once and 47 of 313 failed: found on the lab, and what the limit is
   for.
+- What those two waits bound, reasoned from the lab's rate and not run beyond 100 sellers. A
+  win no answer waits for takes its turn: with 100 sellers' wins waiting that is about 7 s at
+  the lab's 14 wins a second, and a turn reaches the seller's 30 s at about 420 wins waiting;
+  past that the seller serves that buyer nothing more until the win is paid. A win an answer
+  stands still for (the third unpaid win of a session, or one that 64 pieces were served after)
+  goes before those, so its wait is the next of the 8 places to come free, its own payment
+  (0.44 s at the median on the lab), and the other wins of that kind ahead of it: some 140 of
+  them at once would take the 10 s. Before the wallet did this, such a win took its turn with
+  the rest, and on a busy host the turn passed 10 s: with 16 busy loops beside the lab a file
+  was cut short in 12 of 15 runs of the 100-seller check, each time with every win paid
+  afterwards, and in none of 5 with the wins in this order (`docs/TICKETS.md`, section 9.12).
+  The wallet pays 8 at a time whatever the host: a slower host, or a slower route, has a lower
+  rate, and these numbers shrink with it.
 - An answer the wallet stops reading (its `max_sats`, the owner's `max_answer_s`, a piece that
   does not match) leaves up to the seller's window of pieces that it was sent and gives no value
   for: it names them as void. A seller takes so many voids a session (16 at the gateway); after

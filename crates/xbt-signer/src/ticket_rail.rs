@@ -25,6 +25,7 @@
 //! | A prepaid ticket is spent when it is paid, and bought one at a time. | [`Signer::ticket_prepay`]: every rule of a release, the book row (`released`) and then the ledger row, both before the payment is sent; none while an earlier one of the session is not final. |
 //! | A win of the lottery is paid only for a draw the wallet worked out, once, as a prepaid ticket is paid. | [`Signer::lottery_pay_win`] takes a [`xbt402::lottery::Win`], which only the wallet's own check of a seller's reveal makes; [`Signer::ticket_book_prepay`] pays it only in the session it was drawn in, at that session's win size, and refuses a win that has a payment in the book that has not failed ([`crate::ticket::Book::win_payment`]). |
 //! | An ordinary payment is on the channel until it settles, so it stays inside the gate until then. | [`Signer::ticket_pay_ordinary`] holds its place in [`Pace`] until the node shows the payment over. |
+//! | A win a seller's answer stands still for is not kept waiting behind wins no seller waits for. | [`Pace::hurry`], said by the session that found the win ([`crate::ticket_pay`]). It changes the order of payments the book allows anyway, and nothing else: which are paid, and how many at once, are as before. |
 //!
 //! Locks: the wallet's spend lock, then the book's. No lock is held while the node routes a
 //! ticket, so a release never waits for a lock round.
@@ -73,47 +74,97 @@ pub const SEND_PARALLEL: usize = 8;
 /// within what the Lightning rail's `timeout_s` bounds.
 ///
 /// In order of arrival: with a hundred sellers' wins waiting, whoever came first goes first, so
-/// that no seller's win waits behind a later one's until that seller's grace has run out.
+/// that no seller's win waits behind a later one's until that seller's grace has run out. Before
+/// them all, in their own order of arrival, go the wins a seller's answer stands still for
+/// ([`Pace::hurry`]): a seller waits 30 s for a win it serves on beside, and 10 s for one it has
+/// stopped for, so the second cannot wait behind a hundred of the first.
 #[derive(Default)]
 pub struct Pace {
-    /// `(inside, the next number to hand out, the number that goes in next)`.
-    state: Mutex<(usize, u64, u64)>,
+    state: Mutex<PaceState>,
     left: Condvar,
+}
+
+#[derive(Default)]
+struct PaceState {
+    inside: usize,
+    /// The next number to hand out.
+    next: u64,
+    /// Who waits, in order of arrival.
+    waiting: Vec<Waiter>,
+}
+
+struct Waiter {
+    n: u64,
+    /// The win it pays: the book's session and the draw. None: a ticket.
+    win: Option<(String, u64)>,
+    /// It goes before every waiter that is not `first`.
+    first: bool,
+}
+
+impl PaceState {
+    /// Whose turn it is: the earliest of those that go first, or else the earliest.
+    fn turn(&self) -> Option<u64> {
+        self.waiting.iter().find(|w| w.first).or(self.waiting.first()).map(|w| w.n)
+    }
 }
 
 pub struct PaceGuard<'a>(&'a Pace);
 
 impl Pace {
     pub fn enter(&self) -> PaceGuard<'_> {
+        self.enter_for(None, false)
+    }
+
+    /// Enter to pay the win of `win` (the book's session and the draw), or a ticket (None).
+    /// `first`: a seller stands still for this payment already.
+    pub fn enter_for(&self, win: Option<(&str, u64)>, first: bool) -> PaceGuard<'_> {
         let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        let mine = s.1;
-        s.1 += 1;
-        while s.0 >= SEND_PARALLEL || s.2 != mine {
+        let mine = s.next;
+        s.next += 1;
+        s.waiting.push(Waiter { n: mine, win: win.map(|(session, draw)| (session.to_string(), draw)), first });
+        while s.inside >= SEND_PARALLEL || s.turn() != Some(mine) {
             s = self.left.wait(s).unwrap_or_else(|p| p.into_inner());
         }
-        s.0 += 1;
-        s.2 += 1;
+        s.waiting.retain(|w| w.n != mine);
+        s.inside += 1;
         // the one behind may go in too, if there is room
         self.left.notify_all();
         PaceGuard(self)
     }
 
+    /// The wins of `session` with these draws that wait here go first from now on: their seller
+    /// stands still for them. How many were moved. A win that is not waiting (it is inside, or
+    /// has not come yet) is not remembered: the caller says it again while it holds.
+    pub fn hurry(&self, session: &str, draws: &[u64]) -> usize {
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut moved = 0;
+        for w in s.waiting.iter_mut().filter(|w| !w.first) {
+            if w.win.as_ref().is_some_and(|(sid, d)| sid == session && draws.contains(d)) {
+                w.first = true;
+                moved += 1;
+            }
+        }
+        if moved > 0 {
+            self.left.notify_all();
+        }
+        moved
+    }
+
     /// How many are inside now.
     pub fn inside(&self) -> usize {
-        self.state.lock().unwrap_or_else(|p| p.into_inner()).0
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).inside
     }
 
     /// How many wait to go in.
     pub fn waiting(&self) -> u64 {
-        let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        s.1 - s.2
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).waiting.len() as u64
     }
 }
 
 impl Drop for PaceGuard<'_> {
     fn drop(&mut self) {
         let mut s = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
-        s.0 = s.0.saturating_sub(1);
+        s.inside = s.inside.saturating_sub(1);
         self.0.left.notify_all();
     }
 }
@@ -1308,7 +1359,7 @@ impl Signer {
     /// sent, and one is bought at a time. Not a socket method: only the wallet's own payer, which
     /// read the seller's terms itself, calls this.
     pub(crate) fn ticket_prepay(&self, p: &Value) -> Value {
-        self.ticket_pay_ordinary(&str_or_empty(p.get("session")), str_or_empty(p.get("invoice")).trim(), &str_or_empty(p.get("hash")), None)
+        self.ticket_pay_ordinary(&str_or_empty(p.get("session")), str_or_empty(p.get("invoice")).trim(), &str_or_empty(p.get("hash")), None, false)
     }
 
     /// Pay one win of a session that pays by draws: the seller's invoice for it, checked, booked
@@ -1317,13 +1368,15 @@ impl Signer {
     /// word that something was won reaches no payment. A win is paid as a prepaid ticket is, under
     /// every rule of a release, and once: while a payment for it is in the book and has not
     /// failed, a second invoice for the same win is refused. Not a socket method.
-    pub(crate) fn lottery_pay_win(&self, sid: &str, win: &xbt402::lottery::Win, invoice: &str) -> Value {
-        self.ticket_pay_ordinary(sid, invoice.trim(), "", Some(win))
+    /// `first`: the seller stands still for this win already, and it goes through the gate before
+    /// the wins no seller waits for ([`Pace`]).
+    pub(crate) fn lottery_pay_win(&self, sid: &str, win: &xbt402::lottery::Win, invoice: &str, first: bool) -> Value {
+        self.ticket_pay_ordinary(sid, invoice.trim(), "", Some(win), first)
     }
 
     /// An ordinary payment of a session, booked before it is sent: a prepaid ticket (`win` None),
     /// or the win of a draw.
-    fn ticket_pay_ordinary(&self, sid: &str, invoice: &str, named: &str, win: Option<&xbt402::lottery::Win>) -> Value {
+    fn ticket_pay_ordinary(&self, sid: &str, invoice: &str, named: &str, win: Option<&xbt402::lottery::Win>, first: bool) -> Value {
         if let Some(d) = self.ticket_shut() {
             return d;
         }
@@ -1360,7 +1413,7 @@ impl Signer {
         // no answer from the chain node for 3 of 309 (seen on the lab). And such a payment is pending on the wallet's
         // channel until it has settled, so the gate is also what keeps at most 8 of them there. (Leaving when the
         // send returned, as a held ticket does, let 24 wins be pending on a 30-slot channel, and 47 of 313 failed.)
-        let _inside = self.ticket_pace.enter();
+        let _inside = self.ticket_pace.enter_for(win.map(|w| (sid.as_str(), w.draw())), first);
         if let Err(d) = self.ln_node_checks(&*ln, &lp, &dest, "") {
             return with(d, json!({"rail": "ticket"}));
         }
@@ -2055,6 +2108,53 @@ mod tests {
         let order = order.into_inner().unwrap();
         // 8 are inside at once, so neighbours may write in either order; nobody is overtaken by more than those beside it
         assert!(order.iter().enumerate().all(|(at, i)| (at as i64 - *i as i64).unsigned_abs() < SEND_PARALLEL as u64), "{order:?}");
+        assert_eq!((pace.waiting(), pace.inside()), (0, 0));
+    }
+
+    #[test]
+    fn a_win_a_seller_stands_still_for_goes_through_the_gate_before_the_ones_that_wait_for_nothing() {
+        // 8 hold the gate; 40 wins of 40 sessions wait in order, and then the seller of the 31st and the 37th stands still
+        let pace = Pace::default();
+        let order = Mutex::new(vec![]);
+        std::thread::scope(|sc| {
+            let mut holders: Vec<PaceGuard<'_>> = (0..SEND_PARALLEL).map(|_| pace.enter()).collect();
+            for i in 0..40u64 {
+                let (pace, order) = (&pace, &order);
+                sc.spawn(move || {
+                    let _inside = pace.enter_for(Some((&format!("s{i}"), 7)), false);
+                    order.lock().unwrap().push(i);
+                    std::thread::sleep(Duration::from_millis(2));
+                });
+                while pace.waiting() <= i {
+                    std::thread::yield_now();
+                }
+            }
+            assert_eq!(pace.hurry("s36", &[7]), 1);
+            assert_eq!(pace.hurry("s30", &[1, 7]), 1);
+            // said again, for another draw of a session that waits, and for a session that is not here: nothing moves
+            assert_eq!((pace.hurry("s36", &[7]), pace.hurry("s35", &[8]), pace.hurry("nobody", &[7])), (0, 0, 0));
+            // one that comes with its seller standing still already goes with them, behind those that came before it
+            let (pace_, order_) = (&pace, &order);
+            sc.spawn(move || {
+                let _inside = pace_.enter_for(Some(("late", 1)), true);
+                order_.lock().unwrap().push(99);
+            });
+            while pace.waiting() < 41 {
+                std::thread::yield_now();
+            }
+            assert_eq!((pace.waiting(), pace.inside()), (41, SEND_PARALLEL));
+            // one place opens: the three that go first take it one after another, in the order they came
+            drop(holders.pop());
+            while order.lock().unwrap().len() < 3 {
+                std::thread::yield_now();
+            }
+            assert_eq!(order.lock().unwrap()[..3], [30, 36, 99], "the wins a seller stands still for, in their order of arrival");
+            drop(holders);
+        });
+        let order = order.into_inner().unwrap();
+        // the others then go in as they came
+        let rest = &order[3..];
+        assert!(rest.windows(2).filter(|w| w[0] > w[1]).count() <= SEND_PARALLEL && rest.len() == 38, "{order:?}");
         assert_eq!((pace.waiting(), pace.inside()), (0, 0));
     }
 

@@ -222,9 +222,20 @@ def open_channel(*args, svc="lf1"):
 
 def links_up():
     """Every lf1 channel active: right after a channel opens, lf1's peer bootstrapper can open a second
-    connection to lf2 and drop the first, leaving the channels inactive for a moment (run 2 of AGP-049)."""
-    wait("lf1's channels active", 60,
-         lambda: len(ln("lf1", "listchannels", "--active_only")["channels"]) == len(ln("lf1", "listchannels")["channels"]))
+    connection to lf2 and drop the first, leaving the channels inactive for a moment (run 2 of AGP-049).
+    Three readings a second apart must all show it: one reading can fall just before the drop (AGP-136)."""
+    def up():
+        return len(ln("lf1", "listchannels", "--active_only")["channels"]) == len(ln("lf1", "listchannels")["channels"])
+
+    def stays_up():
+        for i in range(3):
+            if i:
+                time.sleep(1)
+            if not up():
+                return False
+        return True
+
+    wait("lf1's channels active", 60, stays_up)
 
 
 def ledger_payments(run_dir):
@@ -374,6 +385,11 @@ def run(mcp, sock, human, lf2_pub, sha_pub, coinB, procs):
     links_up()
     inv4 = ln("lf2", "addinvoice", "--amt=29500")
     r = mcp.tool("ln_pay", {"invoice": inv4["payment_request"], "max_sats": 40_000})
+    for _ in range(5):  # the links can still drop after they were seen up: no active channel is the lab's state, not the rule under test
+        if r.get("rule") != "ln_no_safe_channel":
+            break
+        links_up()
+        r = mcp.tool("ln_pay", {"invoice": inv4["payment_request"], "max_sats": 40_000})
     REPORT["scenarios"]["S4_over_budget"] = r
     check("S4 over budget: denied daily_budget", r.get("verdict") == "deny" and r.get("rule") == "daily_budget", r)
     check("S4 no HTLC for it on lf1", inv4["r_hash"] not in payments("lf1"), None)
