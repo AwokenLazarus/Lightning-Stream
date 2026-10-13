@@ -70,8 +70,8 @@ fn session() -> Result<u64, String> {
     for seq in 0..200u64 {
         let piece = Piece { id: PieceId { seq, kind: Kind::parse("request").ok_or("kind")?, k: 0 }, req: sha256(&seq.to_le_bytes()), amount_msat: WIN / 10 };
         let value = sha256(&[b"buyer value".as_slice(), &seq.to_le_bytes()].concat());
-        seller.serve(piece.clone()).map_err(|e| e.code().to_string())?;
-        let draw = buyer.issue(piece.clone(), value, 0).map_err(|e| e.code().to_string())?;
+        seller.serve(piece).map_err(|e| e.code().to_string())?;
+        let draw = buyer.issue(piece, value, 0).map_err(|e| e.code().to_string())?;
         let taken = seller.take(draw, piece.id, piece.amount_msat, &value).map_err(|e| e.code().to_string())?;
         seller_wins += u64::from(taken.won);
         let (drawn, reveal) = seller.reveal().ok_or("nothing to reveal")?;
