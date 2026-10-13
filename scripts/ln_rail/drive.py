@@ -603,12 +603,18 @@ def run_049(mcp, sock, human_pub, lf2_pub, coinA2, procs, ln_env):
     rc_lf2, out_lf2 = lncli_from_lf2(f"{RUN}/ip-lf2.macaroon", "getinfo")
     rc_gw, out_gw = lncli_from_lf2(f"{RUN}/ip-gw.macaroon", "getinfo")
     REPORT["scenarios"]["S12_ip_caveat"] = {"gateway": gw, "lf2_ip": lf2_ip, "rest_127": {k: st_lo.get(k) for k in ("ready", "macaroon")},
-                                            "rest_gateway": {k: st_gw.get(k) for k in ("ready", "reason")},
+                                            "rest_gateway": {k: st_gw.get(k) for k in ("ready", "reason", "untrusted_ln_data")},
                                             "grpc_lf2_locked_to_lf2": [rc_lf2, out_lf2[-200:]], "grpc_lf2_locked_to_gateway": [rc_gw, out_gw[-200:]]}
     check("S12 REST: a macaroon locked to 127.0.0.1 works from the host (the REST gateway's gRPC peer is loopback)",
           st_lo.get("chain_check", {}).get("ok") is True and st_lo.get("macaroon", {}).get("ip_caveat") == "127.0.0.1", st_lo.get("macaroon"))
+    # the wallet says in its own words that the node refused the macaroon; which refusal it was is the
+    # node's message, and that is only under the field marked untrusted (AGP-134)
+    gw_said = st_gw.get("untrusted_ln_data") or {}
     check(f"S12 REST: a macaroon locked to the caller's real address ({gw}) is refused",
-          st_gw.get("ready") is False and "locked to different IP" in str(st_gw.get("reason")), st_gw.get("reason"))
+          st_gw.get("ready") is False and "the LN node refused the macaroon" in str(st_gw.get("reason"))
+          and "locked to different IP" not in str(st_gw.get("reason")) and gw_said.get("trust") == "untrusted"
+          and "locked to different IP" in str((gw_said.get("data") or {}).get("node_message")),
+          {k: st_gw.get(k) for k in ("ready", "reason", "untrusted_ln_data")})
     check("S12 gRPC: the caveat binds: locked to lf2's address works from lf2, locked to another is refused",
           rc_lf2 == 0 and "identity_pubkey" in out_lf2 and rc_gw != 0 and "locked to different IP" in out_gw, {"lf2": out_lf2[-160:], "gw": out_gw[-160:]})
 

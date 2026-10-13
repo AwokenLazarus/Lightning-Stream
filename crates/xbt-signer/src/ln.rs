@@ -408,6 +408,32 @@ pub(crate) fn node_said(mut v: Value, e: &crate::Error) -> Value {
     v
 }
 
+/// `e` with the node's message of `from`, the error it was made of.
+fn carrying(e: crate::Error, from: &crate::Error) -> crate::Error {
+    match from.seller.as_deref() {
+        Some(m) => e.with_seller(m),
+        None => e,
+    }
+}
+
+/// Whether the node's message `m` is one of its refusals of a macaroon (Lightning Fork `macaroons/`
+/// and the bakery under it: a caveat not satisfied, as `macaroon locked to different IP address`
+/// and `macaroon has expired` are, `verification failed`, `permission denied`).
+fn macaroon_refusal(m: &str) -> bool {
+    ["macaroon", "caveat", "verification failed", "permission denied"].iter().any(|w| m.contains(w))
+}
+
+/// The node's `getinfo`, the first call that presents the macaroon and one that carries nothing
+/// another party wrote. A refusal of the macaroon is named as one (`ln_macaroon`) in the wallet's
+/// words; which refusal it was is the node's message, carried apart ([`node_said`]).
+pub(crate) fn node_info(ln: &dyn LnBackend) -> Result<Value> {
+    ln.get_info().map_err(|e| match e.seller.as_deref() {
+        Some(m) if macaroon_refusal(m) => carrying(err("ln_macaroon", format!(
+            "the LN node refused the macaroon ({}): the node's own message is under {UNTRUSTED_LN_KEY}", e.msg)), &e),
+        _ => e,
+    })
+}
+
 /// LND's REST API: a macaroon header, TLS pinned to the node's own certificate.
 pub struct LndRest {
     base: String,
@@ -693,7 +719,7 @@ fn features_have(v: Option<&Value>, bit: usize) -> bool {
 /// its hash at the anchor height (pinned on mainnet), its tip, then its own bit 512 and its sync.
 /// Ok: the evidence.
 pub fn verify_backend(ln: &dyn LnBackend, node: &dyn Node, chain: &str, pol: &LnPolicy) -> Result<Value> {
-    let info = ln.get_info()?;
+    let info = node_info(ln)?;
     let want = lnd_network(chain);
     let nets: Vec<String> = info.get("chains").and_then(Value::as_array).into_iter().flatten()
         .map(|c| format!("{}/{}", str_or_empty(c.get("chain")), str_or_empty(c.get("network")))).collect();
@@ -707,7 +733,7 @@ pub fn verify_backend(ln: &dyn LnBackend, node: &dyn Node, chain: &str, pol: &Ln
             return Err(err("ln_chain", format!("our own node's block {ah} is {ours}, not the pinned {p}")));
         }
     }
-    let theirs = ln.block_hash(ah).map_err(|e| err("ln_chain", format!("the LN node's block {ah}: {}", e.msg)))?;
+    let theirs = ln.block_hash(ah).map_err(|e| carrying(err("ln_chain", format!("the LN node's block {ah}: {}", e.msg)), &e))?;
     if theirs != ours {
         return Err(err("ln_chain", format!("the LN node's block {ah} is {theirs}, ours is {ours}: its backend is on another chain")));
     }
@@ -1301,7 +1327,7 @@ impl Signer {
                                                       None, vec![]),
             Err(e) => {
                 let m = format!("the LN node's watchtower list is unavailable: {}", e.msg);
-                (json!({"wtclient": "unknown", "policy": mode, "error": e.msg}), refuse.then(|| m.clone()), if refuse { vec![] } else { vec![m] })
+                (node_said(json!({"wtclient": "unknown", "policy": mode, "error": e.msg}), &e), refuse.then(|| m.clone()), if refuse { vec![] } else { vec![m] })
             }
         }
     }
@@ -1443,8 +1469,8 @@ impl Signer {
     /// The node's chain identity ([`verify_backend`]), then its macaroon. Ok: the chain evidence.
     pub(crate) fn ln_node_checks(&self, ln: &dyn LnBackend, pol: &LnPolicy, dest: &str, hash: &str) -> std::result::Result<Value, Value> {
         let chain_ok = verify_backend(ln, &*self.node, &self.chain, pol).map_err(|e| {
-            let rule = if e.code == "ln_chain" { "ln_chain" } else { "ln_backend" };
-            self.ln_refuse(rule, &e.msg, dest, hash)
+            let rule = if e.code == "ln_chain" || e.code == "ln_macaroon" { e.code.as_str() } else { "ln_backend" };
+            node_said(self.ln_refuse(rule, &e.msg, dest, hash), &e)
         })?;
         if let (_, Some(why)) = self.ln_macaroon(ln) {
             return Err(self.ln_refuse("ln_macaroon", &why, dest, hash));
@@ -1504,6 +1530,7 @@ impl Signer {
     /// After the write-ahead booking and the node's answer to the send (`sent`): settle, release or keep
     /// the booking, use the approval, and the reply.
     pub(crate) fn ln_sent(&self, ln: &dyn LnBackend, hash: &str, sent: Result<Value>, s: LnSent) -> Value {
+        let mut unanswered: Option<crate::Error> = None;
         let outcome = match sent {
             Ok(pmt) => Some(pmt),
             // did it reach the router? The node's own payment list says.
@@ -1513,14 +1540,24 @@ impl Signer {
                     let rec = self.ln_book.get(hash).unwrap_or(Value::Null);
                     return with(self.ln_release(hash, &rec, &format!("not sent: {} {}", e.msg, e.seller.as_deref().unwrap_or("")), true), json!({"chain_check": s.facts["chain_check"]}));
                 }
-                Err(_) => None,
+                // neither the send nor the lookup was answered: what the node said to each goes with the reply
+                Err(l) => {
+                    unanswered = Some(if e.seller.is_some() { e } else { l });
+                    None
+                }
             },
         };
         let rec = self.ln_book.get(hash).unwrap_or(Value::Null);
         let out = match outcome {
             Some(pmt) => self.ln_apply(hash, &rec, &pmt),
-            None => json!({"verdict": "pending", "rail": "ln", "status": "UNKNOWN", "payment_hash": hash,
-                           "note": "the LN node did not answer; the payment is booked and is reconciled before the next one"}),
+            None => {
+                let v = json!({"verdict": "pending", "rail": "ln", "status": "UNKNOWN", "payment_hash": hash,
+                               "note": "the LN node did not answer; the payment is booked and is reconciled before the next one"});
+                match &unanswered {
+                    Some(e) => node_said(v, e),
+                    None => v,
+                }
+            }
         };
         if let Some(t) = &s.grant {
             if out["verdict"] != "deny" {
@@ -1776,7 +1813,11 @@ impl Signer {
                     }
                 }
                 Ok(None) => continue,
-                Err(e) => json!({"payment_hash": hash, "error": e.msg}),
+                // no answer about it: it stays booked, and the row says why
+                Err(e) => {
+                    out.push(node_said(json!({"payment_hash": hash, "verdict": null, "status": null, "charged_sats": null, "error": e.msg}), &e));
+                    continue;
+                }
             };
             out.push(json!({"payment_hash": hash, "verdict": r.get("verdict"), "status": r.get("status"), "charged_sats": r.get("charged_sats")}));
         }
@@ -1805,19 +1846,33 @@ impl Signer {
         };
         let reconciled = self.ln_reconcile_locked();
         out["halted"] = json!(self.ln_book.halted());
-        let info = match ln.get_info() {
+        let info = match node_info(&*ln) {
             Ok(i) => i,
-            Err(e) => return with(out, json!({"ready": false, "reason": e.msg, "reconciled": reconciled})),
+            Err(e) => return node_said(with(out, json!({"ready": false, "reason": e.msg, "reconciled": reconciled})), &e),
         };
         let chain = match verify_backend(&*ln, &*self.node, &self.chain, &pol) {
             Ok(v) => v,
-            Err(e) => json!({"ok": false, "reason": e.msg}),
+            Err(e) => node_said(json!({"ok": false, "reason": e.msg}), &e),
         };
         let split = pol.split(&self.chain);
-        let chans = ln.channels().unwrap_or_default();
+        // a list the node did not give is not an empty list: the status says so, with the node's message, and is
+        // not ready if `ln_pay` reads that list (the coins: only for an exposure cap)
+        let needs_coins = pol.exposure_cap_sats > 0 || self.chain == "main";
+        let mut unread: Vec<String> = vec![];
+        let mut unread_said = Map::new();
+        let mut blocking = false;
+        let mut read = |what: &str, needed: bool, r: Result<Vec<Value>>| r.unwrap_or_else(|e| {
+            blocking |= needed;
+            unread.push(format!("the LN node's {what} could not be read ({}): what is shown of them is not the node's", e.msg));
+            if let Some(m) = e.seller.as_deref().filter(|m| !m.is_empty()) {
+                unread_said.insert(what.to_string(), m.into());
+            }
+            vec![]
+        });
+        let chans = read("channels", true, ln.channels());
+        let utxos = read("coins", needs_coins, ln.utxos());
         let (ids, report) = self.ln_channels(&chans, split);
         let tip = node::height(&*self.node).map(|h| h as i64).unwrap_or(0);
-        let utxos = ln.utxos().unwrap_or_default();
         let presplit = presplit_utxos(&utxos, tip, split);
         let (exposure, over) = self.ln_exposure(&pol, &chans, &utxos);
         let (towers, tower_refusal, mut warnings) = self.ln_towers(&*ln, &pol);
@@ -1835,8 +1890,12 @@ impl Signer {
         let halt_refusal = (!out["halted"].is_null())
             .then(|| format!("the rail is halted until the human resumes it: {}", str_or_empty(out["halted"].get("reason"))));
         let blocked: Vec<&String> = [&over, &tower_refusal, &mac_refusal, &halt_refusal].into_iter().flatten().collect();
+        let mut node_text = json!({"alias": str_or_empty(info.get("alias")), "version": str_or_empty(info.get("version"))});
+        if !unread_said.is_empty() {
+            node_text["node_messages"] = Value::Object(unread_said);
+        }
         out = with(out, json!({
-            "ready": chain["ok"] == true && !ids.is_empty() && blocked.is_empty(),
+            "ready": chain["ok"] == true && !ids.is_empty() && blocked.is_empty() && !blocking,
             "node": {"identity_pubkey": str_or_empty(info.get("identity_pubkey")), "block_height": i64_of(info.get("block_height")),
                      "synced_to_chain": info.get("synced_to_chain"), "feature_512": features_have(info.get("features"), FEATURE_BLAKE2B)},
             "chain_check": chain, "split_height": split, "channels": report, "usable_channels": ids.len(),
@@ -1845,7 +1904,7 @@ impl Signer {
                                                               "sent_last_hour": self.ln_book.sends_since(self.engine.now() - 3600.0)},
             "fee_limit": {"base_sats": pol.max_fee_base_sats, "ppm": pol.max_fee_ppm},
             "in_flight": in_flight.len(), "in_flight_payments": in_flight, "reconciled": reconciled, "recent": self.ln_book.recent(10),
-            UNTRUSTED_LN_KEY: untrusted_ln(json!({"alias": str_or_empty(info.get("alias")), "version": str_or_empty(info.get("version"))})),
+            UNTRUSTED_LN_KEY: untrusted_ln(node_text),
             "channel_opens": "never: this wallet pays through the node's existing channels",
         }));
         if !presplit.is_empty() {
@@ -1856,6 +1915,7 @@ impl Signer {
                                   locks.unbooked_sats, locks.until_height));
         }
         warnings.extend(blocked.into_iter().map(|b| format!("ln_pay refuses: {b}")));
+        warnings.extend(unread);
         if !warnings.is_empty() {
             out["warnings"] = json!(warnings);
         }

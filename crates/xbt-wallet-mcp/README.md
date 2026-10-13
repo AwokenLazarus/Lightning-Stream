@@ -73,7 +73,9 @@ model can't approve its own payments or move the hot key. Humans use the out-of-
   receipt of a streamed answer is given as its numbers, and the seller's own object as
   `untrusted_provider_response.last_receipt`. On the Lightning rail the node's own messages can
   repeat a payee's, so they come back under `untrusted_ln_data` (`node_message`, `failure`), in
-  `ln_pay` and in `ln_status`. Numbers, and hashes, keys and ids of a fixed hex shape, are not
+  `ln_pay` and in `ln_status`: at the top of a refusal, or inside the part of a status the error is
+  about. The `reason` beside it is the wallet's sentence (a macaroon the node will not take reads
+  `the LN node refused the macaroon`; the node's message says which caveat or permission). Numbers, and hashes, keys and ids of a fixed hex shape, are not
   words and are given as they are. `docs/LIMITS.md` ("What a seller wrote") has the table by
   payer and rail, and what is outside this rule.
 - **Arguments are checked as B2 checks them** (pydantic 2, lax mode). `"7"` and `7.0` are the integer
