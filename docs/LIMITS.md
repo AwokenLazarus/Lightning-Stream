@@ -364,6 +364,14 @@ payer only: no socket method buys one. Run on regtest only (`scripts/ticket_book
   the seller starts where the last one stopped. The wallet cannot tell a full channel from one
   that is short of balance or from a seller that is unreachable, and treats all three this way.
 - The smaller pool stays for the rest of the session, also after the route has room again.
+- A ticket that meets a full channel at a later hop is in flight on the wallet's node for a
+  moment before the refusal is back (seen on the lab). In that moment the book shows it locked.
+  The wallet releases a ticket only after the seller has shown it locked, so no secret leaves
+  for it; a call that had chosen it takes the session's next ticket.
+- With 2 tickets held, a buyer that uses tickets faster than one can be locked waits for locks:
+  a 100 MB file of 20 tickets took 3.4 to 3.7 s on the lab, against 1.7 to 1.9 s with a pool of
+  8 (`scripts/ticket_e2e_regtest.sh`, `stream`). The remedy is a larger ticket, which the owner
+  allows with `tickets.max_ticket_sats`, and not a larger pool.
 - At most 8 ticket payments are with the node's router at once, held and prepaid together, for
   all sessions of the wallet. Other payments of the node (`ln_pay`, the owner's own) are not
   counted, and a lock round of more than 8 tickets takes correspondingly longer.
@@ -387,6 +395,13 @@ payer only: no socket method buys one. Run on regtest only (`scripts/ticket_book
   locked stays booked.
 - The wallet locks and releases nothing between a start and the first complete read of its node's
   payment list (`ticket_sync`); with the node down that is until the node is back.
+- A ticket is locked for as long as the wallet's node says its payment is in flight. Seen on the
+  lab: a Lightning Fork node killed in the instant it was sending a ticket's payment kept that
+  payment `IN_FLIGHT`, with no HTLC on its channel, after it came back and after a further clean
+  restart. The wallet counts such a ticket as locked, against its caps and its slot budget, until
+  the node gives the payment up; how long the node takes was not followed. With a pool of 2 the
+  next ticket is sent after every release, so a node that dies right after a paid request is
+  more likely to be caught in that instant than it was with a pool of 8.
 - For a moment after a ticket settles, `ticket_status` can show the node and the book as not
   agreeing: the node reports the payment settled before it has taken the HTLC off its channel.
 - The seller's node receives a 32-byte tag with every ticket (a random nonce and a MAC). It tells
@@ -496,8 +511,10 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
   back, and a seller that takes the payment and then refuses the preimage keeps it. The wallet
   buys one at a time, when the balance does not cover the next piece, and never one ahead.
 - Each prepaid ticket costs the answer a pause: the seller's invoice, the payment and the
-  seller's word that it was credited, 0.1 to 0.3 s on the lab, where a held ticket that is
-  already locked costs one request. An answer priced as it goes is slower by that much per
+  seller's word that it was credited, 0.21 s at the median through one hop on the lab
+  (`scripts/gateway_regtest.sh`, `prepaid`) and 0.32 s a ticket through the wallet
+  (`scripts/ticket_e2e_regtest.sh`, `slots`), where a held ticket that is already locked costs
+  one request. An answer priced as it goes is slower by that much per
   ticket, and a seller that waits less than that for a refill would cut it.
 - A prepaid payment whose fate the wallet's node cannot tell within the Lightning rail's
   `timeout_s` and 5 seconds stays booked as spent, and the session is stopped as faulty. The

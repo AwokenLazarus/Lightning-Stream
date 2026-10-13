@@ -408,6 +408,9 @@ struct PayState {
     peak: usize,
     /// The next sends fail as a full channel does, however many this says.
     fail_next: usize,
+    /// The next sends leave the node and are refused at a later hop: in flight at first, failed
+    /// with no route when the node is asked again.
+    late_fail: usize,
     /// The node takes no payment and answers no question about one (a connection that died as a
     /// payment was sent); everything else it still answers.
     router_down: bool,
@@ -432,6 +435,12 @@ impl PayLn {
     /// Bring every payment in flight to what the seller's node has made of its invoice.
     fn refresh(&self, s: &mut PayState) {
         for p in s.payments.iter_mut().filter(|p| p["status"] == "IN_FLIGHT") {
+            if p["late_fail"] == true {
+                p["status"] = "FAILED".into();
+                p["failure_reason"] = "FAILURE_REASON_NO_ROUTE".into();
+                p["htlcs"] = json!([]);
+                continue;
+            }
             let hash = p["payment_hash"].as_str().unwrap().to_string();
             let raw: Hash = hex::decode(&hash).unwrap().try_into().unwrap();
             match self.seller.state_of(&raw) {
@@ -532,7 +541,9 @@ impl LnBackend for PayLn {
         // a ticket of 40 blocks through one hop of 80 and the node's 3: no route inside a smaller limit
         let failing = s.hop_full || s.fail_next > 0;
         s.fail_next = s.fail_next.saturating_sub(1);
-        let arrives = !failing && r.cltv_limit >= 123 && self.seller.pay_msat(&raw, d.amount_msat);
+        let late = !failing && s.late_fail > 0;
+        s.late_fail = s.late_fail.saturating_sub(usize::from(late));
+        let arrives = !failing && r.cltv_limit >= 123 && (late || self.seller.pay_msat(&raw, d.amount_msat));
         let status = if arrives { "IN_FLIGHT" } else { "FAILED" };
         let in_flight = s.payments.iter().filter(|p| p["status"] == "IN_FLIGHT").count() + usize::from(arrives);
         s.peak = s.peak.max(in_flight);
@@ -543,7 +554,7 @@ impl LnBackend for PayLn {
         let p = json!({"payment_hash": hash, "payment_index": s.next_index.to_string(), "status": status, "value_msat": d.amount_msat.unwrap_or(0).to_string(),
                        "fee_msat": "0", "payment_preimage": "00".repeat(32), "payment_request": r.invoice, "creation_time_ns": (T0 * 1_000_000_000).to_string(),
                        "failure_reason": if arrives { "FAILURE_REASON_NONE" } else { "FAILURE_REASON_NO_ROUTE" },
-                       "htlcs": if arrives { json!([{"status": "IN_FLIGHT", "route": route}]) } else { json!([]) }});
+                       "htlcs": if arrives { json!([{"status": "IN_FLIGHT", "route": route}]) } else { json!([]) }, "late_fail": late});
         s.payments.push(p.clone());
         Ok(p)
     }
@@ -2099,3 +2110,33 @@ fn a_prepaid_ticket_is_booked_before_it_is_paid_and_a_seller_that_lies_about_it_
     assert_eq!(r.ledger_sum(), 2 * SETTLED, "the ticket the old book has never heard of is booked at what the node paid");
     assert!(st["halted"].is_null(), "{st}");
 }
+
+#[test]
+fn a_ticket_that_is_in_flight_and_then_refused_at_a_later_hop_is_not_waited_for_and_counts_as_a_failed_lock() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    // one of the session's two tickets leaves the wallet's node and finds no slot further on: the node shows it in
+    // flight, and failed a moment later. Whichever of the two the wallet meant to release, the call is paid
+    {
+        let r = Rig::shipped(json!({}), 30, held_only_shop());
+        // one send of the first round (the two go out together, so which one is not fixed)
+        r.ln.st.lock().unwrap().late_fail = 1;
+        let v = r.pay("/page/1000", 10);
+        assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64()), (Some(200), Some(1)), "{v}");
+        let s = session_of(&r, &v);
+        assert_eq!((s["pool"].as_i64(), s["hold_why"].as_str(), s["slot_fails"].as_i64()), (Some(1), Some("ticket_slots"), Some(0)),
+                   "one ticket from now on and a wait; the release that followed ended the run of failures: {s}");
+        let fail = r.audit("ticket_slot_failure");
+        assert_eq!((fail.len(), fail[0]["after"].as_str()), (1, Some("in flight, then failed at a later hop")), "{fail:?}");
+        assert_eq!((r.ln.by_status("FAILED").len(), r.tap.secrets().len()), (1, 1), "no secret left for the ticket that failed");
+        r.assert_booked();
+    }
+    // with both tickets refused so, and no prepaid tickets on offer: nothing is released, and the call says when to come back
+    let r = Rig::shipped(json!({}), 30, held_only_shop());
+    r.ln.st.lock().unwrap().late_fail = 2;
+    let v = r.pay("/page/1000", 10);
+    assert_eq!((v["verdict"].as_str(), v["rule"].as_str(), v["tickets_released"].as_u64()), (Some("deny"), Some("ticket_slots"), Some(0)), "{v}");
+    assert!(v["retry_after_s"].as_f64().is_some_and(|w| w > 0.0 && w <= 30.0), "{v}");
+    assert!(r.tap.secrets().is_empty());
+    assert_eq!(r.ledger_sum(), 0);
+}
+

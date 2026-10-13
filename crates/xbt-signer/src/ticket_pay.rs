@@ -1045,7 +1045,7 @@ impl Signer {
             }
             filled?;
         }
-        let Some(hash) = next else {
+        let Some(mut hash) = next else {
             // the book says why nothing can be released (a stopped session, a task the owner removed, no ticket). It is
             // asked for a ticket that cannot exist, so that it cannot release one a refill locked in this instant.
             // Where the pool is empty because the last fill was refused, that refusal is the reason
@@ -1065,6 +1065,29 @@ impl Signer {
             }
             if lock(&hs.money).ready.contains(&hash) {
                 break;
+            }
+            // the ticket may have failed since it was chosen: one that finds no slot at a later hop is in flight on the
+            // wallet's node for a moment before the refusal is back. The node is asked, and the book's next ticket taken
+            {
+                let _g = self.lock();
+                self.ticket_reconcile_locked();
+            }
+            match self.ticket_next(&hs.sid).0 {
+                Some(h) if h == hash => {}
+                Some(h) => {
+                    hash = h;
+                    continue;
+                }
+                None => {
+                    let now = self.engine.now();
+                    let s = self.ticket_session(&hs.sid).filter(|s| s.state == SState::Open);
+                    if s.as_ref().is_some_and(|s| s.prepaid_now(now)) {
+                        return self.ticket_buy_prepaid(hs, spent);
+                    }
+                    let wait = s.map_or(0.0, |s| (s.hold_until - now).max(0.0));
+                    return Err(with(refusal("ticket_slots", "the ticket that was to be released failed on its way to the seller, as a channel without a free slot \
+                                                             fails one: no secret was released"), json!({"session": hs.sid, "retry_after_s": wait.ceil()})));
+                }
             }
             // stopped meanwhile (its tickets are being cancelled, so the seller will never show this one locked)
             if !self.ticket_session(&hs.sid).is_some_and(|s| s.state == SState::Open) {

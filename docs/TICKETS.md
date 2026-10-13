@@ -752,8 +752,23 @@ answered `slots_short`. Otherwise it releases a held ticket. A seller that offer
 tickets is, in those cases, not paid: the call says why and how long to wait, or the next rail of
 the 402 is tried (section 12).
 
-**What a buyer's node shows at the limit, on the lab** (`scripts/ticket_e2e_regtest.sh slots`, a
-channel of 30 slots towards the seller, the release binaries): see the script's report,
-`run/ticket_e2e_regtest.json`, keys `slots_*`. The numbers are in the table of
-`docs/LIMITS.md` that the script's name stands beside; none is repeated here unmeasured.
+**Measured on the lab on 2026-10-13**, with the wallet and the gateway as they ship, Lightning Fork
+nodes, and the buyer's channel and the seller's inbound channel opened with 30 slots (one host,
+loopback, one hop, the release binaries; no Core Lightning node). Each line names its script.
+
+| What | Measured | Script |
+|---|---|---|
+| The wallet's node lists its 30-slot channel | `max_accepted_htlcs` 30 on one side and 483 on the other; the wallet takes 30 | `ticket_book_regtest.sh` (`one`) |
+| Lock 2 tickets through the hop; lock the next when one is left | 0.04 s each, by the signer's own call (invoices made by a stand-in seller) | `ticket_book_regtest.sh` (`one`) |
+| 15 sellers of one task, 1 ticket each | 15 locked in 0.21 to 0.23 s: half of the channel; a sixteenth seller is refused | `ticket_book_regtest.sh` (`many`) |
+| 13 payments of others pending on the buyer's channel | the wallet holds its 2: 15 pending. With 15 pending a lock is refused before the node is asked, and a new session holds nothing | `ticket_book_regtest.sh` (`slots`) |
+| A seller behind a channel with no free slot (483 of 483 taken) | the ticket is in flight on the buyer's node for a moment, then `FAILURE_REASON_NO_ROUTE`; the second try fails at once; waits of 30 s and 60 s, and after the third round nothing is held | `ticket_book_regtest.sh` (`full`) |
+| 2,000 lock requests to the gateway | 8 sessions served and 15 tickets issued; 1,992 answered `slots_short` with `retryAfter` 30, in 0.5 s | `gateway_regtest.sh` (`flood`) |
+| A prepaid ticket, from the lock request to the seller's signed credit | 0.21 s at the median, 0.26 s at most (10 tickets); its HTLC was off the seller's channel 0.04 s after the payment succeeded | `gateway_regtest.sh` (`prepaid`) |
+| The gateway given `offchain:read`, with a config that assumed 483 | cap 15, read from the node; with 15 payments it did not issue pending inwards, `slots_short` | `gateway_regtest.sh` (`slots`) |
+| A first request through the wallet, pool of 2 locked through the hop | 0.34 s (median of 5 new sessions; it was 0.38 s with a pool of 8) | `ticket_e2e_regtest.sh` (`page`) |
+| A paid page from the balance over a free page, through MCP, signer and gateway | 1.7 to 1.8 ms against 1.3 to 1.4 ms: 0.3 to 0.4 ms more (medians of 200, four runs) | `ticket_e2e_regtest.sh` (`latency`) |
+| A 100 MB file, 20 tickets | 3.4 to 3.7 s (1.7 to 1.9 s with a pool of 8): with 2 held, a stream that uses a ticket every 0.09 s waits for locks. A buyer that spends this fast wants larger tickets (section 11, rule 1) | `ticket_e2e_regtest.sh` (`stream`) |
+| The same wallet with 15 payments of others on its channel | a first request by prepaid ticket in 0.33 s; a stream bought its tickets prepaid at 0.32 s each, never more than one of its payments pending | `ticket_e2e_regtest.sh` (`slots`) |
+| One slot left on the seller's channel | one of the wallet's two tickets held, the other `FAILURE_REASON_NO_ROUTE`; the page was paid, the session went to 1 ticket and a 30 s wait, and the next tickets were prepaid | `ticket_e2e_regtest.sh` (`slots`) |
 

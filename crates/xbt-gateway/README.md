@@ -122,8 +122,10 @@ tickets over your channels, and a cap sized for several can fill one.
 ## Measured
 
 Regtest, one host, loopback, three Lightning Fork nodes (buyer, a routing hop, seller), a stock
-`python3 -m http.server` behind the gateway. Rerun with `scripts/gateway_regtest.sh` (about 8
-minutes, 40 checks); the report is `run/gateway_regtest.json`. From five runs:
+`python3 -m http.server` behind the gateway. Rerun with `scripts/gateway_regtest.sh` (about 12
+minutes, 51 checks); the report is `run/gateway_regtest.json`. The first six rows are from five
+runs before 2026-10-13, with 8 tickets a session; the rows after them from the run of that day,
+with the shipped caps and the seller's channel opened with 30 slots:
 
 | What | Measured | Check |
 |---|---|---|
@@ -134,3 +136,7 @@ minutes, 40 checks); the report is `run/gateway_regtest.json`. From five runs:
 | 2,000 lock requests against a cap of 6 sessions of 8 tickets (the caps before 2026-10-13) | 6 served, 1,994 refused, 48 invoices on the node | `flood` |
 | A buyer that locks 8 tickets and releases none, limit set to 15 s (before 2026-10-13) | its tickets cancelled after 16 s | `flood` |
 | A restart of the gateway with tickets locked | back in 0.05 s, the tickets still good | `restart` |
+| A paid request over an unpaid one; one that carries a secret | 0.08 ms and 3.1 ms more (medians of 300 and 32) | `latency` |
+| 2,000 lock requests against the shipped cap of 15 held tickets | 8 sessions served, 15 tickets issued, 1,992 answered `slots_short` with `retryAfter` 30; 15 invoices on the node | `flood` |
+| A prepaid ticket through the hop, from the lock request to the signed credit | 0.21 s at the median, 0.26 s at most (10 tickets); nothing left pending on the channel 0.04 s after the payment | `prepaid` |
+| The gateway given the channels macaroon, its config assuming 483 slots | cap 15, read from the node; no held ticket while 15 payments it did not issue are pending inwards | `slots` |

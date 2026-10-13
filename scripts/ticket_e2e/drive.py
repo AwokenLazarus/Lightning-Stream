@@ -333,14 +333,24 @@ def quiet(secs: float = 120) -> float:
     seller's, and the wallet's book agrees with its node. The seconds it took."""
 
     def ok() -> bool:
-        if in_flight() or held():
+        # a buyer's node that was killed in the instant it sent a payment can go on calling that payment in flight with
+        # nothing on its channel (docs/LIMITS.md): such a payment holds no money and no slot, and is not waited for
+        on_channel = {base64.b64decode(h["hash_lock"]).hex() for c in lab.channels(BUYER) for h in c["pending_htlcs"]}
+        flying = {h for h, p in buyer_payments().items() if p["status"] == "IN_FLIGHT"}
+        if on_channel or held():
             return False
+        ORPHANS.update(flying)
         st = status()
         if not st.get("sessions") and not st.get("tickets"):
             return True  # a wallet that has never opened a session has no book to compare
-        return st.get("synced") is True and (st.get("node") or {}).get("agree") is True and st["locked"]["tickets"] == 0
+        node = st.get("node") or {}
+        left = set(node.get("in_book_not_on_node") or [])
+        return st.get("synced") is True and not node.get("on_node_not_in_book") and left <= ORPHANS and st["locked"]["tickets"] <= len(left)
 
     return lab.wait("no ticket locked anywhere", secs, ok, every=0.25)
+
+
+ORPHANS: set[str] = set()  # payments the buyer's node calls in flight with nothing on its channel
 
 
 def stop_sessions(who: Mcp | None = None) -> None:
@@ -364,6 +374,9 @@ def money() -> dict[str, Any]:
         "wallet_book_settled_msat": st["tickets"].get("settled", 0) * TICKET_MSAT,
         "receipts_released_msat": sum(RECEIPTS.values()),
         "wallet_ledger_sats": sum(int(r["amount_sats"]) for r in rows),
+        # booked as spent and not settled: after `quiet`, only tickets whose payment the buyer's node still calls in
+        # flight with nothing on its channel (a node killed as it sent one). The wallet counts them until the node drops them
+        "booked_for_payments_the_node_left_in_flight_sats": int(st.get("booked_sats") or 0),
         "buyer_node_cost_sats": sum(cost_sats(p) for p in pays),
         "fees_msat": sum(int(p["fee_msat"]) for p in pays),
         "tickets": len(pays),
@@ -374,7 +387,8 @@ def agrees(m: dict[str, Any], receipts: bool = True) -> bool:
     one = {m["buyer_node_paid_msat"], m["seller_node_received_msat"], m["wallet_book_settled_msat"]}
     if receipts:
         one.add(m["receipts_released_msat"])
-    return len(one) == 1 and m["wallet_ledger_sats"] == m["buyer_node_cost_sats"]
+    left = m["booked_for_payments_the_node_left_in_flight_sats"]
+    return len(one) == 1 and m["wallet_ledger_sats"] == m["buyer_node_cost_sats"] + left and (left == 0 or bool(ORPHANS))
 
 
 def booked_and_once() -> dict[str, Any]:
@@ -716,7 +730,7 @@ def page() -> None:
         pass
     # one of the two was released, so the next was locked behind the call
     try:
-        lab.wait("the refill behind the call", 15, lambda: status()["locked"]["tickets"] == 2 and status()["node"]["agree"] is True, every=0.1)
+        lab.wait("the refill behind the call", 15, lambda: status()["locked"]["tickets"] == 2 and status()["node"]["agree"] is True and held() == 2, every=0.1)
     except LabError:
         pass
     st = status()
@@ -961,6 +975,17 @@ def kill() -> None:
         r = pay(f"{ORIGIN}/small.txt")
         if not call_paid(r):
             raise LabError(f"kill {victim}: the page before: {brief(r)}")
+        # the pool is filled again behind the call: the kill comes when that round is over and the channel lists both
+        # tickets. (A buyer's node killed in the instant it sends a payment can keep that payment "in flight" with
+        # nothing on its channel, also after a restart: seen on this lab, and stated in docs/LIMITS.md.)
+        # (two tickets; one, for the ten minutes after the slots check, in which the wallet holds less with this seller)
+        def settled_down() -> bool:
+            s = session_of(r)
+            locked = status()["locked"]["tickets"]
+            waiting = float(s.get("hold_until") or 0) > time.time()
+            return locked == wallet_in_flight(0) and (waiting or locked == int(s.get("pool") or 0))
+
+        lab.wait("the pool locked and listed", 30, settled_down, every=0.1)
         killed(victim, "a pool locked")
         resumed = next_call_pays(f"kill {victim} with a pool locked")
         stop_sessions()
@@ -996,7 +1021,8 @@ def kill() -> None:
         how = result.get("error") or result.get("ended") or ("complete" if result.get("complete") else brief(result))
         check(f"kill: {victim}, in the middle of an answer: after the restart nothing the seller took is missing from the wallet's ledger, nothing is paid twice, and the next call pays",
               not inv["not_in_ledger"] and inv["same_tickets"] and agrees(m, receipts=False),
-              {"the_call_ended": str(how)[:160], "bytes": result.get("bytes"), "next": resumed, **inv, "ledger_sats": m["wallet_ledger_sats"], "node_cost_sats": m["buyer_node_cost_sats"]})
+              {"the_call_ended": str(how)[:160], "bytes": result.get("bytes"), "next": resumed, **inv, "ledger_sats": m["wallet_ledger_sats"], "node_cost_sats": m["buyer_node_cost_sats"],
+               "payments_the_node_still_calls_in_flight_with_nothing_on_its_channel": len(ORPHANS)})
 
 
 def session_of(r: dict[str, Any]) -> dict[str, Any]:
@@ -1082,7 +1108,14 @@ def slots() -> None:
     stop_sessions()
     # 4. a channel on the way with one slot left: 29 of the seller's 30 are taken by payments from the hop itself
     blockers, _ = lab.lock(HOP, SELLER, 29, secs=120)
+    # the wait the seller named in step 3 is kept across sessions: a held ticket is asked for again only after it
+    time.sleep(31)
     r = pay(f"{ORIGIN}/small.txt")
+    # the ticket that found no slot is in flight on the wallet's node for a moment before the hop's refusal is back
+    try:
+        lab.wait("the wallet to have seen the failed lock", 20, lambda: bool(events("ticket_slot_failure", str(r.get("session")))), every=0.5)
+    except LabError:
+        pass
     failures = events("ticket_slot_failure", str(r.get("session")))
     reasons = sorted({p.get("failure_reason", "") for p in buyer_payments().values() if p["status"] == "FAILED"} - {"FAILURE_REASON_INCORRECT_PAYMENT_DETAILS"})
     s1 = session_of(r)
