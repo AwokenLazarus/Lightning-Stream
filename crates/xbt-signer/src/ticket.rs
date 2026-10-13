@@ -724,7 +724,8 @@ pub fn sizing(terms: &Terms, pol: &TicketPolicy, sellers_in_task: usize, expect_
     }
     let pool = pool.min(slot_room.max(0) as u64);
     if pool == 0 {
-        return refuse("ticket_slots", "the wallet's held tickets already take half of the pending payments its channel carries: no further ticket is held");
+        return refuse("ticket_slots", "the tickets the wallet holds, or is set to hold, already take what half of its channel's pending payments and the owner's \
+                                       caps on held tickets allow: no further ticket is held");
     }
     Ok(Sizing { ticket_msat, pool: pool as u32 })
 }
@@ -1189,7 +1190,12 @@ impl Book {
     /// The held tickets the open sessions are set to hold: what they have locked or will lock.
     /// A new session's pool is sized inside what the slot budget has left after these.
     pub fn pools_open(&self) -> i64 {
-        self.sessions.values().filter(|s| s.state == SState::Open).fold(0i64, |a, s| a.saturating_add(i64::from(s.pool)))
+        self.pools_open_in(None)
+    }
+
+    /// As [`Self::pools_open`], for the open sessions of one task.
+    pub fn pools_open_in(&self, task: Option<&str>) -> i64 {
+        self.sessions.values().filter(|s| s.state == SState::Open && task.is_none_or(|t| s.task == t)).fold(0i64, |a, s| a.saturating_add(i64::from(s.pool)))
     }
 
     /// The last session with this seller that held less for lack of a slot, if its wait ended
@@ -1511,10 +1517,10 @@ mod tests {
         let ids = |v: &[u64]| v.iter().map(u64::to_string).collect::<Vec<_>>();
         // between two Lightning Fork nodes: 483 each way, 354 sat
         let lf = chan(1, side(483, 354), side(483, 354), json!("ANCHORS"), 0, 0);
-        assert_eq!(channel_limits(&[lf.clone()], &ids(&[1])), Limits { slots: 483, room: 241, dust_msat: FLOOR_MSAT });
+        assert_eq!(channel_limits(std::slice::from_ref(&lf), &ids(&[1])), Limits { slots: 483, room: 241, dust_msat: FLOOR_MSAT });
         // with a Core Lightning node: the listing says 30 one way and 483 the other, and the channel carries 30 both ways
         let cln = chan(2, side(30, 354), side(483, 546), json!("ANCHORS"), 4, 9);
-        let l = channel_limits(&[cln.clone()], &ids(&[2]));
+        let l = channel_limits(std::slice::from_ref(&cln), &ids(&[2]));
         assert_eq!(l, Limits { slots: 30, room: 11, dust_msat: 546_000 }, "15 less the 4 payments pending outwards; inbound ones use the other side's slots");
         assert_eq!((l.budget(), l.room(0, 0), l.room(3, 0), l.room(0, 5), l.room(14, 0), l.room(15, 0), l.room(99, 99)), (15, 11, 11, 6, 1, 0, 0));
         // two channels a ticket may leave on: the smaller budget, the fuller channel, the larger dust limit
@@ -1525,7 +1531,7 @@ mod tests {
         let full = chan(3, side(30, 546), side(30, 546), json!("ANCHORS"), 15, 0);
         assert_eq!(channel_limits(&[full], &ids(&[3])).room(0, 0), 0);
         let over = chan(3, side(30, 546), side(30, 546), json!("ANCHORS"), 22, 0);
-        assert_eq!((channel_limits(&[over.clone()], &ids(&[3])).room, channel_limits(&[over], &ids(&[3])).room(0, 0)), (-7, 0));
+        assert_eq!((channel_limits(std::slice::from_ref(&over), &ids(&[3])).room, channel_limits(std::slice::from_ref(&over), &ids(&[3])).room(0, 0)), (-7, 0));
         // a listing that does not say is read as the cautious number, never as 483
         let blind = chan(4, Value::Null, Value::Null, Value::Null, 2, 0);
         assert_eq!(channel_limits(&[blind], &ids(&[4])), Limits { slots: 30, room: 13, dust_msat: FLOOR_MSAT });
@@ -1795,7 +1801,7 @@ mod tests {
         assert_eq!(b.locked(|_| true), Locked { tickets: 3, sats: 3_000, booking: 3 * 1015 });
         assert_eq!(b.locked(|t| t.session == "other"), Locked::default());
         assert_eq!(b.want(&session("s2", 1), 101.0), 1);
-        assert_eq!(b.pools_open(), 8);
+        assert_eq!((b.pools_open(), b.pools_open_in(Some("t")), b.pools_open_in(Some("other"))), (8, 8, 0));
         // tickets on their way that the node does not show yet take a slot each when they arrive
         b.tickets.get_mut(&hashes[5]).unwrap().state = TState::Sending;
         b.tickets.get_mut(&hashes[6]).unwrap().state = TState::Sending;

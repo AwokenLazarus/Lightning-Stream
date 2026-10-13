@@ -19,17 +19,26 @@ Three parties, two of them played here:
                use, cancel), which can also lie in its lock answers.
 
 Channels: lf1->lf2 of 5,000,000 sat from a coin that exists on XBT alone (the rail's funding proof),
-lf2->sNN of 2,000,000 sat each. A ticket is 1,000 sat for 40 blocks. Checks, each PASS or FAIL:
+lf2->sNN of 2,000,000 sat each. The hop accepts 30 pending payments from a peer, so the buyer's
+channel carries 30: the slot count of a channel with a Core Lightning node at its default. The
+wallet's policy sets no pool and no cap on held tickets: what is checked is the wallet as it
+ships. A ticket is 1,000 sat for 40 blocks. Checks, each PASS or FAIL:
 
-  one      402, open, lock 8 through the hop, five paid requests, stop: 5 settled and 3 cancelled on
-           both nodes, the book and the buyer's node agree, the ledger holds the tickets and the fees
+  one      402, open, lock 2 through the hop, five paid requests with the next ticket locked each
+           time one is left, stop: 5 settled and 2 cancelled on both nodes, the book and the buyer's
+           node agree, the ledger holds the tickets and the fees
   liar     lock answers that lie (another payee, amount, life, expiry, a hash that is not ours,
            replayed invoices, garbage) and terms above the owner's bounds: no payment leaves lf1
   kill     the signer is killed with tickets locked and started again
   node     the buyer's node restarts with tickets locked
   silent   a seller that neither settles nor cancels: its tickets come back at their expiry
   restore  the wallet's files are put back from an older copy
-  many     NN sellers the owner has not named, 2 tickets each, one paid request each, stop
+  many     15 sellers (14 the owner has not named), 1 ticket each: 15 held, half of the channel's 30
+  slots    the half rule on the node's own numbers: payments of others pending on the channel leave
+           less room, a full half leaves none, and a lock is refused before it is sent
+  full     a seller behind a channel with no free slot: the lock fails, the session holds less and
+           waits, and after the third round holds nothing
+  dust     a held ticket below 546 sat is refused, whatever the seller offers
   surface  the wallet's macaroon; the MCP's ticket tools
 
 Usage: drive.py [check ...]   (all, in this order, when none is named)
@@ -62,7 +71,10 @@ from lab import LabError  # noqa: E402
 
 RUN, OUT, BIN = (os.environ[k] for k in ("RUN", "OUT", "BIN"))
 BASE = int(os.environ.get("TICKET_BOOK_PORT_BASE", "17911"))
-N = int(os.environ.get("TICKET_BOOK_SELLERS", "20"))
+N = int(os.environ.get("TICKET_BOOK_SELLERS", "16"))
+HELD = 2  # tickets the wallet holds with one seller, as shipped
+SLOTS = 30  # pending payments the buyer's channel carries towards the hop
+BUDGET = SLOTS // 2  # held tickets in all: half of them
 SELLERS = [f"s{i:02d}" for i in range(1, N + 1)]
 BUYER, HOP = "lf1", "lf2"
 ALL = (BUYER, HOP, *SELLERS)
@@ -141,8 +153,6 @@ class Wallet:
             "tickets": {
                 "enabled": True,
                 "max_new_sellers_per_min": 200,
-                "max_locked_tickets": 64,
-                "max_locked_sats": 64_000,
                 "tasks": {"stream": {"budget_sats": 100_000}, "swarm": {"budget_sats": 100_000, "admit": "any", "max_sellers": 40}},
             },
         }
@@ -283,7 +293,7 @@ class Seller:
             "version": "ticket/0",
             "features": [512],
             "ticketMsat": str(TICKET_MSAT),
-            "maxTickets": 8,
+            "maxTickets": HELD,
             "ticketBlocks": CLTV,
             "release": "with-request",
             "settle": "on-use",
@@ -590,7 +600,7 @@ def setup() -> None:
 
 
 def fresh(shop: Seller, task: str = "stream", **more: Any) -> Buyer:
-    """A session with its pool locked: 8 tickets with a seller the owner named, 2 with one it has
+    """A session with its pool locked: 2 tickets with a seller the owner named, 1 with one it has
     not (a route to a new seller can take a few tries to be found)."""
     b = Buyer(shop, task)
     out = b.open(**more)
@@ -619,29 +629,47 @@ def one() -> None:
     shop = SHOPS[SELLERS[0]]
     b = Buyer(shop, "stream")
     opened = b.open()
-    check("one: the seller's 402 opens a session of 8 tickets of 1,000 sat with a seller the owner named",
-          opened.get("verdict") == "allow" and opened.get("pool") == 8 and opened.get("ticket_msat") == str(TICKET_MSAT) and opened.get("listed") is True, opened)
+    check(f"one: the seller's 402 opens a session of {HELD} tickets of 1,000 sat with a seller the owner named",
+          opened.get("verdict") == "allow" and opened.get("pool") == HELD and opened.get("ticket_msat") == str(TICKET_MSAT) and opened.get("listed") is True, opened)
+    seen = [e for e in signer("history", {"limit": 5000})["events"] if e.get("type") == "ticket_open" and e.get("session") == b.session]
+    chan = lab.channels(BUYER)[0]
+    limits = {k: {"max_accepted_htlcs": chan[k]["max_accepted_htlcs"], "dust_limit_sat": chan[k]["dust_limit_sat"]} for k in ("local_constraints", "remote_constraints")}
+    REPORT["measured"]["buyer_channel"] = dict(limits, commitment_type=chan.get("commitment_type"), fee_per_kw=chan.get("fee_per_kw"))
+    check(f"one: the wallet reads its channel's slots from its node: {SLOTS}, the smaller of the two numbers the node lists",
+          bool(seen) and seen[0].get("slots") == SLOTS and min(int(v["max_accepted_htlcs"]) for v in limits.values()) == SLOTS, {"wallet": seen[0].get("slots") if seen else None, "node": limits})
     spent0 = WALLET_PROC.spent()
     lab.wait("a route to the seller", 240, lambda: b.lock()["locked"] > 0 or len(b.hashes) > 0, every=3)
     t0 = time.perf_counter()
-    while len(b.hashes) < 8:
+    while len(b.hashes) < HELD:
         b.lock()
-    hashes = list(b.hashes)
-    st = agree(8)
-    check("one: 8 tickets locked through the hop: ACCEPTED on the seller's node, in flight on the buyer's, nothing spent",
-          shop.states(hashes) == {"ACCEPTED": 8} and buyer_in_flight() == set(hashes) and st["locked"] == {"tickets": 8, "sats": 8000} and WALLET_PROC.spent() == spent0,
-          {"seller": shop.states(hashes), "buyer_htlcs": len(buyer_in_flight()), "book": st["locked"], "agree": st["node"], "ledger": WALLET_PROC.spent() - spent0})
-    inv = lab.get(shop.node, "/v2/invoices/lookup?payment_hash=" + lab.url64(bytes.fromhex(hashes[0])))
+    REPORT["measured"][f"one_lock_{HELD}_s"] = round(time.perf_counter() - t0, 3)
+    first = list(b.hashes)
+    st = agree(HELD)
+    check(f"one: {HELD} tickets locked through the hop: ACCEPTED on the seller's node, in flight on the buyer's, nothing spent",
+          shop.states(first) == {"ACCEPTED": HELD} and buyer_in_flight() == set(first) and st["locked"] == {"tickets": HELD, "sats": HELD * 1000} and WALLET_PROC.spent() == spent0,
+          {"seller": shop.states(first), "buyer_htlcs": len(buyer_in_flight()), "book": st["locked"], "agree": st["node"], "ledger": WALLET_PROC.spent() - spent0})
+    inv = lab.get(shop.node, "/v2/invoices/lookup?payment_hash=" + lab.url64(bytes.fromhex(first[0])))
     check("one: the payment carries the wallet's tag to the seller's node and nothing else of the wallet's",
           TAG_RECORD in inv["htlcs"][0]["custom_records"] and len(base64.b64decode(inv["htlcs"][0]["custom_records"][TAG_RECORD])) == 32,
           {"custom_records": list(inv["htlcs"][0]["custom_records"])})
-    codes, booked = [], []
+    codes, booked, wants, refills = [], [], [], []
     for _ in range(5):
         rel, code = b.pay()
         codes.append(code)
         booked.append(rel.get("charged_sats"))
+        wants.append(rel.get("want"))
+        # one is left: the next is locked now, behind the request
+        t1 = time.perf_counter()
+        end = time.time() + 60
+        while len(b.hashes) < len(codes) + HELD and time.time() < end:
+            b.lock()
+        refills.append(round(time.perf_counter() - t1, 3))
+    hashes = list(b.hashes)
     check("one: five paid requests, each with a secret the signer booked before returning it, each served",
           codes == [200] * 5 and shop.served == 5 and all(c and c >= 1000 for c in booked), {"http": codes, "booked_at_release": booked})
+    check("one: after each release one ticket is left and the pool asks for one more, which locks before the next request",
+          wants == [1] * 5 and len(hashes) == HELD + 5, {"want_after_each_release": wants, "tickets_locked_in_all": len(hashes), "refill_s": refills})
+    REPORT["measured"]["one_refill_1_s"] = sorted(refills)[len(refills) // 2]
     cancel = b.stop().get("cancel", [])
     lab.wait("the session to close", 60, lambda: status(b.session)["sessions"][0]["state"] == "closed", every=0.5)
     st = agree(0)
@@ -649,13 +677,12 @@ def one() -> None:
     ours = [pays[h] for h in hashes]
     cost = sum(cost_sats(p) for p in ours if p["status"] == "SUCCEEDED")
     fees = sum(int(p["fee_msat"]) for p in ours if p["status"] == "SUCCEEDED")
-    check("one: stop: 5 settled and 3 cancelled on both nodes, the book and the buyer's node agree, no HTLC left",
-          len(cancel) == 3 and b.tickets() == {"failed": 3, "settled": 5} and shop.states(hashes) == {"CANCELED": 3, "SETTLED": 5}
-          and lab.tally_states(p["status"] for p in ours) == {"FAILED": 3, "SUCCEEDED": 5} and st["node"]["agree"] and not buyer_in_flight(),
+    check(f"one: stop: 5 settled and {HELD} cancelled on both nodes, the book and the buyer's node agree, no HTLC left",
+          len(cancel) == HELD and b.tickets() == {"failed": HELD, "settled": 5} and shop.states(hashes) == {"CANCELED": HELD, "SETTLED": 5}
+          and lab.tally_states(p["status"] for p in ours) == {"FAILED": HELD, "SUCCEEDED": 5} and st["node"]["agree"] and not buyer_in_flight(),
           {"book": b.tickets(), "seller": shop.states(hashes), "buyer": lab.tally_states(p["status"] for p in ours), "node": st["node"]})
-    check("one: the ledger holds what lf1 paid for the five, routing fees included, and nothing for the three that came back",
+    check(f"one: the ledger holds what lf1 paid for the five, routing fees included, and nothing for the {HELD} that came back",
           WALLET_PROC.spent() - spent0 == cost and fees > 0, {"ledger_sats": WALLET_PROC.spent() - spent0, "node_cost_sats": cost, "fees_msat": fees})
-    REPORT["measured"]["one_lock_8_s"] = round(time.perf_counter() - t0, 3)
     REPORT["paid_invoices"] = [p["payment_request"] for p in ours if p["status"] == "SUCCEEDED"]
 
 
@@ -688,7 +715,7 @@ def liar() -> None:
           {"refusals": saw, "lf1_payments_before_after": [before[0], after[0]], "ledger_before_after": [before[1], after[1]]})
     terms: dict[str, Any] = {}
     for name, lie, rule in (("ticket of 5,000 sat", {"ticketMsat": "5000000"}, "ticket_size"), ("life of 2,016 blocks", {"ticketBlocks": 2016}, "ticket_blocks"),
-                            ("no feature bit 512", {"features": []}, "ticket_feature_512"), ("a prepaid balance", {"settle": "on-arrival"}, "ticket_terms")):
+                            ("no feature bit 512", {"features": []}, "ticket_feature_512"), ("a way of settling nobody knows", {"settle": "whenever"}, "ticket_terms")):
         shop.terms_lie = lie
         try:
             terms[name] = Buyer(shop, "stream").open().get("rule")
@@ -700,8 +727,8 @@ def liar() -> None:
     greedy = Buyer(shop, "stream").open()
     shop.terms_lie = {}
     signer("ticket_stop", {"session": greedy.get("session", "")})
-    check("liar: terms above the owner's bounds refuse the seller; a seller that asks for 400 tickets gets the owner's 8",
-          list(terms.values()) == ["ticket_size", "ticket_blocks", "ticket_feature_512", "ticket_terms"] and greedy.get("pool") == 8, {"terms": terms, "pool_for_400": greedy.get("pool")})
+    check(f"liar: terms above the owner's bounds refuse the seller; a seller that asks for 400 tickets gets the owner's {HELD}",
+          list(terms.values()) == ["ticket_size", "ticket_blocks", "ticket_feature_512", "ticket_terms"] and greedy.get("pool") == HELD, {"terms": terms, "pool_for_400": greedy.get("pool")})
     other = Buyer(SHOPS[SELLERS[1]], "stream").open()
     check("liar: a seller the owner has not named is refused under a task for named sellers", other.get("rule") == "ticket_admission", other.get("reason"))
 
@@ -710,28 +737,29 @@ def kill() -> None:
     shop = SHOPS[SELLERS[0]]
     spent0 = WALLET_PROC.spent()
     b = fresh(shop)
-    used = [b.pay() for _ in range(2)]
+    used = [b.pay()]
+    lab.wait("the refill of one", 60, lambda: b.lock() is not None and len(b.hashes) == HELD + 1, every=0.5)
     held = signer("ticket_release", {"session": b.session})  # a secret that left the signer and never reached the seller
     WALLET_PROC.kill()
     WALLET_PROC.start()
-    st = agree(6)
+    st = agree(2)
     tickets = b.tickets()
     again = signer("ticket_release", {"session": b.session})
-    check("kill: after a kill of the signer the book is the node (6 in flight), 5 tickets it cannot vouch for are retired, and no secret is released again",
-          st["node"]["agree"] and st["node"]["htlcs"] == 6 and buyer_in_flight() == {t for t in b.hashes if t not in {u[0]["hash"] for u in used}}
-          and tickets == {"released": 1, "retired": 5, "settled": 2} and again.get("verdict") == "deny" and "ticket_secret" not in again,
+    check("kill: after a kill of the signer the book is the node (2 in flight), the ticket it cannot vouch for is retired, and no secret is released again",
+          st["node"]["agree"] and st["node"]["htlcs"] == 2 and buyer_in_flight() == {t for t in b.hashes if t not in {u[0]["hash"] for u in used}}
+          and tickets == {"released": 1, "retired": 1, "settled": 1} and again.get("verdict") == "deny" and "ticket_secret" not in again,
           {"node": st["node"], "book": tickets, "release_after": again.get("rule"), "used": [u[1] for u in used]})
     pays = buyer_payments()
     settled = sum(cost_sats(pays[u[0]["hash"]]) for u in used)
     booked = WALLET_PROC.spent() - spent0
-    check("kill: the ledger never under-counts: the two used at what lf1 paid, the six still locked at their worst case",
-          booked == settled + 6 * held["charged_sats"], {"ledger_sats": booked, "settled_sats": settled, "worst_case_each": held["charged_sats"]})
+    check("kill: the ledger never under-counts: the one used at what lf1 paid, the two still locked at their worst case",
+          booked == settled + 2 * held["charged_sats"], {"ledger_sats": booked, "settled_sats": settled, "worst_case_each": held["charged_sats"]})
     b.seq += 1
     shop_http("POST", f"/{shop.node}/x402/ticket/cancel", {"session": b.remote, "seq": b.seq, "hashes": "all"})
     lab.wait("the session to close", 60, lambda: status(b.session)["sessions"][0]["state"] == "closed", every=0.5)
     st = agree(0)
-    check("kill: the seller cancels what is left: the bookings of the six go, the two that were used stay",
-          WALLET_PROC.spent() - spent0 == settled and b.tickets() == {"failed": 6, "settled": 2} and st["node"]["agree"],
+    check("kill: the seller cancels what is left: the bookings of the two go, the one that was used stays",
+          WALLET_PROC.spent() - spent0 == settled and b.tickets() == {"failed": 2, "settled": 1} and st["node"]["agree"],
           {"ledger_sats": WALLET_PROC.spent() - spent0, "book": b.tickets()})
 
 
@@ -740,15 +768,15 @@ def node() -> None:
     b = fresh(shop)
     secs = lab.start(BUYER)
     lab.wait("lf1's channel active again", 120, partial(active, BUYER, 1))
-    st = agree(8, secs=60)
-    check("node: after a restart of the buyer's node its 8 tickets are still locked there and in the book",
-          st["node"]["agree"] and st["node"]["htlcs"] == 8 and b.tickets() == {"locked": 8} and shop.states(b.hashes) == {"ACCEPTED": 8},
+    st = agree(HELD, secs=60)
+    check(f"node: after a restart of the buyer's node its {HELD} tickets are still locked there and in the book",
+          st["node"]["agree"] and st["node"]["htlcs"] == HELD and b.tickets() == {"locked": HELD} and shop.states(b.hashes) == {"ACCEPTED": HELD},
           {"node": st["node"], "book": b.tickets(), "seller": shop.states(b.hashes), "restart_s": round(secs, 1)})
     rel, code = b.pay()
     end_session(b)
     st = agree(0)
-    check("node: a ticket locked before the restart pays a request after it; stop returns the other seven",
-          code == 200 and b.tickets() == {"failed": 7, "settled": 1} and st["node"]["agree"], {"http": code, "book": b.tickets(), "node": st["node"]})
+    check("node: a ticket locked before the restart pays a request after it; stop returns the other",
+          code == 200 and b.tickets() == {"failed": HELD - 1, "settled": 1} and st["node"]["agree"], {"http": code, "book": b.tickets(), "node": st["node"]})
 
 
 def silent() -> None:
@@ -766,7 +794,7 @@ def silent() -> None:
     lab.wait("the session to close", 60, lambda: status(b.session)["sessions"][0]["state"] == "closed", every=0.5)
     st = agree(0)
     check("silent: a seller that neither settles nor cancels: its node gives the tickets up before their expiry, and the released one's booking goes",
-          booked == held["charged_sats"] and b.tickets() == {"failed": 8} and WALLET_PROC.spent() == spent0 and st["node"]["agree"] and mined <= CLTV,
+          booked == held["charged_sats"] and b.tickets() == {"failed": HELD} and WALLET_PROC.spent() == spent0 and st["node"]["agree"] and mined <= CLTV,
           {"booked_while_out": booked, "blocks_until_free": mined, "locked_at": h0, "book": b.tickets(), "ledger_after": WALLET_PROC.spent() - spent0})
     REPORT["measured"]["silent_blocks_until_free"] = mined
 
@@ -791,18 +819,19 @@ def restore() -> None:
     shutil.rmtree(f"{WALLET}/.run")
     shutil.copytree(f"{RUN}/backup", f"{WALLET}/.run")
     WALLET_PROC.start()
-    # in flight on lf1: the 8 of the first session, 7 of the second, 1 of the other seller's
-    st = agree(16)
+    # in flight on lf1: the 2 of the first session and the released one of the second. The second session's used
+    # ticket and the other seller's one ticket have settled
+    st = agree(3)
     pays = buyer_payments()
     counts = st["tickets"]
     after = WALLET_PROC.spent() - spent0
     settled = cost_sats(pays[used_a["hash"]]) + cost_sats(pays[used_c["hash"]])
     events = [e for e in signer("history", {"limit": 5000})["events"] if e.get("type") == "ticket_recovered"]
-    check("restore: a wallet put back from an older copy finds on lf1 the 10 tickets its book has never held, and its book is the node again",
-          len(events) == 10 and st["node"]["agree"] and st["node"]["htlcs"] == 16 and st["synced"] is True,
+    check("restore: a wallet put back from an older copy finds on lf1 the 3 tickets its book has never held, and its book is the node again",
+          len(events) == 3 and st["node"]["agree"] and st["node"]["htlcs"] == 3 and st["synced"] is True,
           {"recovered": len(events), "node": st["node"], "book": counts})
-    check("restore: nothing spent is missing from the ledger: the two settled at what lf1 paid, the sixteen in flight at their worst case",
-          after >= truth and after == settled + 16 * held_a["charged_sats"], {"ledger_before_restore": truth, "ledger_after": after, "settled_sats": settled})
+    check("restore: nothing spent is missing from the ledger: the two settled at what lf1 paid, the three in flight at their worst case",
+          after >= truth and after == settled + 3 * held_a["charged_sats"], {"ledger_before_restore": truth, "ledger_after": after, "settled_sats": settled})
     old = signer("ticket_release", {"session": a.session})
     check("restore: no ticket of the old book is released by the restored wallet", old.get("verdict") == "deny" and "ticket_secret" not in old, old.get("rule"))
     # the secret that was out before the restore is still good: the seller settles it, the rest is cancelled
@@ -821,14 +850,17 @@ def restore() -> None:
 
 def many() -> None:
     spent0 = WALLET_PROC.spent()
-    # the sellers the owner has not named first, the one it has named last: by then the task has many sellers
-    buyers = [Buyer(SHOPS[s], "swarm") for s in SELLERS[1:] + SELLERS[:1]]
+    # the sellers the owner has not named first, the one it has named last: by then the task has many sellers.
+    # As shipped the wallet has 15 sessions at once and holds 15 tickets: more sellers than that are not opened here
+    names = SELLERS[1:BUDGET] + SELLERS[:1]
+    m = len(names)
+    buyers = [Buyer(SHOPS[s], "swarm") for s in names]
     opened = [b.open() for b in buyers]
-    # an unnamed seller gets 2 tickets whatever the task; a named one 8 among a few sellers and 2 among more than 8
-    want = [(2, False)] * (N - 1) + [(2 if N > 8 else 8, True)]
+    # an unnamed seller gets 1 ticket whatever the task; a named one 2 among a few sellers and 1 among more than 4
+    want = [(1, False)] * (m - 1) + [(1 if m > 4 else HELD, True)]
     pools = [int(o.get("pool", 0)) for o in opened]
     total = sum(pools)
-    check(f"many: {N} sellers open under the swarm task, {N - 1} the owner has not named and one it has, with a pool of 2 each",
+    check(f"many: {m} sellers open under the swarm task, {m - 1} the owner has not named and one it has, with a pool of 1 each",
           [(o.get("pool"), o.get("listed")) for o in opened] == want,
           lab.tally_states(f"{o.get('verdict')}/pool {o.get('pool')}/named {o.get('listed')}{o.get('rule', '')}" for o in opened))
 
@@ -845,11 +877,16 @@ def many() -> None:
     locked = list(POOL.map(fill, zip(buyers, pools)))
     secs = time.perf_counter() - t0
     st = agree(total, secs=60)
-    check(f"many: {total} tickets locked with {N} sellers at once, the book and lf1 agree",
+    check(f"many: {total} tickets locked with {m} sellers at once, the book and lf1 agree",
           locked == pools and st["node"]["agree"] and st["node"]["htlcs"] == total and st["locked"]["tickets"] == total,
           {"locked": sum(locked), "seconds": round(secs, 2), "node": st["node"], "book": st["locked"]})
     REPORT["measured"]["many_lock_s"] = round(secs, 2)
     REPORT["measured"]["many_tickets"] = total
+    if m == BUDGET and N > BUDGET:
+        # the budget is used up: one more seller holds nothing, and is told why before anything is asked of it
+        extra = Buyer(SHOPS[SELLERS[BUDGET]], "swarm").open()
+        check(f"many: with {BUDGET} tickets held, half of the channel's {SLOTS} slots, a further seller gets no held ticket",
+              extra.get("verdict") == "deny" and extra.get("rule") in ("ticket_slots", "ticket_sellers"), {k: extra.get(k) for k in ("verdict", "rule", "reason", "held_budget", "slots")})
     codes = list(POOL.map(lambda b: b.pay()[1], buyers))
     list(POOL.map(lambda b: b.stop(), buyers))
     lab.wait("no HTLC on lf1", 120, lambda: not buyer_in_flight())
@@ -858,11 +895,131 @@ def many() -> None:
     ours = [pays[h] for b in buyers for h in b.hashes]
     cost = sum(cost_sats(p) for p in ours if p["status"] == "SUCCEEDED")
     lab.wait("the ledger to settle", 30, lambda: WALLET_PROC.spent() - spent0 == cost)
-    check(f"many: one paid request to each of {N} sellers, then stop: {N} settled, {total - N} cancelled, the book and lf1 agree, fees booked",
-          codes == [200] * N and lab.tally_states(p["status"] for p in ours) == {"FAILED": total - N, "SUCCEEDED": N} and st["node"]["agree"]
+    check(f"many: one paid request to each of {m} sellers, then stop: {m} settled, {total - m} cancelled, the book and lf1 agree, fees booked",
+          codes == [200] * m and lab.tally_states(p["status"] for p in ours) == ({"FAILED": total - m, "SUCCEEDED": m} if total > m else {"SUCCEEDED": m}) and st["node"]["agree"]
           and st["locked"]["tickets"] == 0 and WALLET_PROC.spent() - spent0 == cost,
           {"http": lab.tally_states(str(c) for c in codes), "buyer": lab.tally_states(p["status"] for p in ours), "ledger_sats": WALLET_PROC.spent() - spent0,
            "node_cost_sats": cost, "node": st["node"]})
+
+
+def others_pending(seller: str, count: int) -> list[str]:
+    """`count` payments of 1,000 sat from the buyer's node to hold invoices of `seller` that are no
+    ticket of the wallet's: what someone else's use of the same channel looks like. Their hashes."""
+    hashes = []
+    for _ in range(count):
+        h = hashlib.sha256(secrets.token_bytes(32)).hexdigest()
+        first = lab.pay_invoice(BUYER, SHOPS[seller].hold_invoice(h))
+        if first.get("status") != "IN_FLIGHT":
+            raise LabError(f"a payment of the lab's own did not lock: {json.dumps(first)[:300]}")
+        hashes.append(h)
+    lab.wait(f"{count} payments pending on lf1's channel", 60, lambda: set(hashes) <= buyer_in_flight(), every=0.5)
+    return hashes
+
+
+def cancel_pending(seller: str, hashes: list[str]) -> None:
+    for h in hashes:
+        lab.post(seller, "/v2/invoices/cancel", {"payment_hash": lab.b64(bytes.fromhex(h))})
+    lab.wait("lf1's channel empty again", 60, lambda: not (set(hashes) & buyer_in_flight()), every=0.5)
+
+
+def session_of(sid: str) -> dict[str, Any]:
+    return next((x for x in status(sid).get("sessions", []) if x.get("session") == sid), {})
+
+
+def slots() -> None:
+    shop, other = SHOPS[SELLERS[0]], SELLERS[1]
+    sends0 = len(buyer_payments())
+    # 13 payments of others are pending on the buyer's channel: room for 2 under half of 30
+    pending = others_pending(other, BUDGET - 2)
+    b = fresh(shop)
+    st = status()
+    check(f"slots: with {BUDGET - 2} payments of others pending on its {SLOTS}-slot channel the wallet holds its 2 tickets: {BUDGET} pending, half",
+          len(b.hashes) == HELD and len(buyer_in_flight()) == BUDGET and st["locked"]["tickets"] == HELD, {"pending_on_channel": len(buyer_in_flight()), "book": st["locked"]})
+    # a release leaves 1 held and 15 pending until the seller's settle is back; then the refill of 1 fits again
+    rel, code = b.pay()
+    lab.wait("the released ticket's settle to be back on lf1", 30, lambda: len(buyer_in_flight()) == BUDGET - 1, every=0.2)
+    lab.wait("the refill", 60, lambda: b.lock() is not None and len(b.hashes) == HELD + 1, every=0.5)
+    check("slots: after a release the next ticket is locked, and the channel is at half again", code == 200 and len(buyer_in_flight()) == BUDGET, {"pending_on_channel": len(buyer_in_flight())})
+    # one more payment of others arrives: 16 pending. The next refill is refused by the wallet before the node is asked
+    pending += others_pending(other, 1)
+    rel, code = b.pay()
+    lab.wait("the released ticket's settle to be back on lf1", 30, lambda: len(buyer_in_flight()) == BUDGET, every=0.2)
+    sends = len(buyer_payments())
+    out = b.lock()
+    s = session_of(b.session)
+    check("slots: with the channel past half, a lock is refused as ticket_slots, nothing is sent to the node, and the session waits",
+          code == 200 and out.get("locked") == 0 and [r.get("rule") for r in out.get("refused", [])] == ["ticket_slots"] and len(buyer_payments()) == sends
+          and s.get("hold_why") == "ticket_slots" and not signer("ticket_offer", {"session": b.session}).get("hashes"),
+          {"lock": {k: out.get(k) for k in ("locked", "refused")}, "session": {k: s.get(k) for k in ("pool", "hold_why", "slot_fails")}, "pending_on_channel": len(buyer_in_flight())})
+    # a second seller, with the channel at half: no held ticket at all
+    full = Buyer(SHOPS[SELLERS[2]], "swarm").open()
+    check("slots: a new session with another seller holds nothing while the channel is at half",
+          full.get("verdict") == "deny" and full.get("rule") == "ticket_slots", {k: full.get(k) for k in ("verdict", "rule", "slots", "held_budget", "held_now")})
+    end_session(b)
+    cancel_pending(other, pending)
+    st = agree(0)
+    check("slots: the others' payments are cancelled and the session stopped: the channel is empty and the book agrees with the node",
+          st["node"]["agree"] and not buyer_in_flight(), {"node": st["node"], "payments_sent_in_this_check": len(buyer_payments()) - sends0})
+
+
+def full() -> None:
+    # the seller's inbound channel takes 483: fill it from the hop, so that a ticket through the hop finds no slot there.
+    # (The buyer's node is then told what a hop out of slots or out of balance tells it: no route.)
+    victim = SELLERS[3]
+    shop = SHOPS[victim]
+    blocked = []
+    for _ in range(483):
+        h = hashlib.sha256(secrets.token_bytes(32)).hexdigest()
+        blocked.append(h)
+    invoices = list(POOL.map(lambda h: shop.hold_invoice(h, msat=1000, life_s=3600), blocked))
+    first = list(POOL.map(lambda inv: lab.pay_invoice(HOP, inv, 60).get("status"), invoices))
+    lab.wait("the seller's inbound channel to be full", 180, lambda: sum(len(c["pending_htlcs"]) for c in lab.channels(victim)) >= 483, every=2)
+    REPORT["measured"]["full_filled_with"] = lab.tally_states(str(x) for x in first)
+    b = Buyer(shop, "swarm")
+    opened = b.open()
+    rounds = []
+    for wait in (31, 61, 0):
+        out = b.lock()
+        s = session_of(b.session)
+        rounds.append({"offered": len(out.get("tickets", [])) + len(out.get("refused", [])), "locked": out.get("locked"),
+                       "reasons": sorted({t.get("note", "") for t in out.get("tickets", [])}), "pool": s.get("pool"), "slot_fails": s.get("slot_fails"), "hold_why": s.get("hold_why")})
+        idle = signer("ticket_offer", {"session": b.session}).get("hashes")
+        if idle:
+            rounds[-1]["offered_during_wait"] = len(idle)
+        if wait:
+            time.sleep(wait)
+    check("full: a lock that finds no slot on the way fails on the buyer's node, and the session holds less: a wait, a longer wait, then nothing",
+          opened.get("pool") == 1 and [r["locked"] for r in rounds] == [0, 0, 0] and [r["slot_fails"] for r in rounds] == [1, 2, 3]
+          and [r["hold_why"] for r in rounds] == ["ticket_slots", "ticket_slots", "ticket_route_full"] and rounds[-1]["pool"] == 0
+          and not any("offered_during_wait" in r for r in rounds), rounds)
+    REPORT["measured"]["full_failure_reasons"] = sorted({x for r in rounds for x in r["reasons"]})
+    again = Buyer(shop, "swarm")
+    signer("ticket_stop", {"session": b.session})
+    denied = again.open()
+    check("full: a new session with that seller holds nothing for ten minutes, and nothing was spent or is locked",
+          denied.get("rule") == "ticket_route_full" and status()["locked"]["tickets"] == 0, {"rule": denied.get("rule"), "locked": status()["locked"]})
+    list(POOL.map(lambda h: lab.post(victim, "/v2/invoices/cancel", {"payment_hash": lab.b64(bytes.fromhex(h))}), blocked))
+    lab.wait("the seller's inbound channel to be empty again", 120, lambda: sum(len(c["pending_htlcs"]) for c in lab.channels(victim)) == 0, every=2)
+
+
+def dust() -> None:
+    shop = SHOPS[SELLERS[0]]
+    saw = {}
+    for name, lie, want in (("545,999 msat", {"ticketMsat": "545999"}, "ticket_dust"), ("64 sat", {"ticketMsat": "64000"}, "ticket_dust"),
+                            ("64 sat as the smallest of a seller that lets the buyer choose", {"minTicketMsat": "64000"}, None), ("546 sat", {"ticketMsat": "546000"}, None)):
+        shop.terms_lie = lie
+        try:
+            out = Buyer(shop, "stream").open()
+        finally:
+            shop.terms_lie = {}
+        saw[name] = {"verdict": out.get("verdict"), "rule": out.get("rule"), "ticket_msat": out.get("ticket_msat")}
+        if out.get("session"):
+            signer("ticket_stop", {"session": out["session"]})
+        if out.get("rule") != want:
+            FAILED.append(f"dust: {name}")
+    check("dust: a held ticket below 546 sat is refused; 546 sat is held; a seller that would go lower is asked for its full size",
+          saw["545,999 msat"]["rule"] == "ticket_dust" and saw["64 sat"]["rule"] == "ticket_dust" and saw["546 sat"] == {"verdict": "allow", "rule": None, "ticket_msat": "546000"}
+          and saw["64 sat as the smallest of a seller that lets the buyer choose"]["ticket_msat"] == str(TICKET_MSAT), saw)
 
 
 def surface() -> None:
@@ -893,7 +1050,8 @@ def surface() -> None:
           ticket_tools == ["ticket_status", "ticket_stop"] and not any(t.startswith("ticket_") for t in plain), {"with": ticket_tools, "without": len(plain)})
 
 
-CHECKS = {"one": one, "liar": liar, "kill": kill, "node": node, "silent": silent, "restore": restore, "many": many, "surface": surface}
+CHECKS = {"one": one, "liar": liar, "kill": kill, "node": node, "silent": silent, "restore": restore, "many": many, "slots": slots, "full": full, "dust": dust,
+          "surface": surface}
 
 
 def main() -> int:

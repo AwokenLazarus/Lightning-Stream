@@ -853,10 +853,11 @@ fn try_fill(r: &Rig, sid: &str, seller: &Seller) -> (i64, String) {
 fn the_exposure_cap_the_seller_cap_and_the_task_cap_bound_what_is_locked() {
     let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
     for (policy, locked, why) in [
-        (json!({"tickets": {"max_locked_tickets": 3}}), 3, "max_locked_tickets"),
+        // a cap on the number of held tickets sizes the pool when the session opens: nothing more is asked of the seller
+        (json!({"tickets": {"max_locked_tickets": 3}}), 3, ""),
         (json!({"tickets": {"max_locked_sats": 5_999}}), 5, "max_locked_sats"),
-        (json!({"tickets": {"max_locked_tickets": 3, "tasks": {"work": {"budget_sats": 10_000, "max_locked_tickets": 50}}}}), 3, "tickets.max_locked_tickets"),
-        (json!({"tickets": {"tasks": {"work": {"budget_sats": 10_000, "max_locked_tickets": 2}}}}), 2, "the task's max_locked_tickets"),
+        (json!({"tickets": {"max_locked_tickets": 3, "tasks": {"work": {"budget_sats": 10_000, "max_locked_tickets": 50}}}}), 3, ""),
+        (json!({"tickets": {"tasks": {"work": {"budget_sats": 10_000, "max_locked_tickets": 2}}}}), 2, ""),
         (json!({"tickets": {"tasks": {"work": {"budget_sats": 10_000, "max_locked_sats": 4_100}}}}), 4, "the task's max_locked_sats"),
         // nothing is locked that the budgets could not also release
         (json!({"tickets": {"tasks": {"work": {"budget_sats": 6 * BOOKING}}}}), 6, "the task's budget_sats"),

@@ -1495,6 +1495,8 @@ fn while_the_wallets_own_node_is_away_no_hash_is_offered_and_the_next_call_pays_
     let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let r = Rig::new(json!({"tickets": {"enabled": true, "pool": 2, "tasks": {"film": {"budget_sats": 40_000}}}}));
     assert_eq!(r.pay("/page/10", 10)["status"].as_u64(), Some(200));
+    // one of two is left, so the next is locked behind the call: that round is over before the node goes
+    wait_for("the refill behind the first call", || r.status()["locked"]["tickets"].as_i64() == Some(2));
     // the node goes away in the middle of a file: the two tickets of the pool are released (a release needs no node),
     // the refill cannot lock, and the answer ends there
     r.ln.st.lock().unwrap().down = true;

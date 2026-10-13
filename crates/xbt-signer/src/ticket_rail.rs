@@ -513,9 +513,11 @@ impl Signer {
             let sellers = st.book.open_sessions(Some(&task_name)) + 1;
             let expect_msat = expect_sats.map(|s| (s as u64).saturating_mul(1000));
             // the slot budget: half of the smallest channel, less what the open sessions hold or will lock
+            // and never more than the owner's own caps on held tickets leave: a session beyond them holds nothing
             let committed = st.book.pools_open();
             let to_fill = committed.saturating_sub(st.book.locked(|_| true).tickets).max(0);
-            let room = limits.room(committed, to_fill);
+            let room = limits.room(committed, to_fill).min(tp.max_locked_tickets.saturating_sub(committed))
+                .min(task.max_locked_tickets.saturating_sub(st.book.pools_open_in(Some(&task_name))));
             // what an earlier session with this seller learnt about its route, if it is recent
             let before = st.book.held_less(&terms.payee, now).cloned();
             let held_size = held.as_ref().map(|t| {
