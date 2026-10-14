@@ -6,14 +6,32 @@ use std::time::Duration;
 
 use serde_json::{Map, Value};
 use xbt402::ticket::{
-    held_budget, DEFAULT_CHANNEL_SLOTS, MAX_CHANNEL_SLOTS, MIN_HELD_TICKET_MSAT, MIN_TICKET_BLOCKS,
-    SESSION_PATH, SETTLE_MARGIN_BLOCKS, SETTLE_ON_ARRIVAL, SETTLE_ON_USE,
+    held_budget, DEFAULT_CHANNEL_SLOTS, HOLD_EXPIRY_DELTA, MAX_CHANNEL_SLOTS, MIN_HELD_TICKET_MSAT,
+    MIN_TICKET_BLOCKS, SESSION_PATH, SETTLE_CHAIN_BLOCKS, SETTLE_MARGIN_BLOCKS, SETTLE_ON_ARRIVAL,
+    SETTLE_ON_USE,
 };
 
 use crate::book::Caps;
 use crate::lottery::LotteryConfig;
 use crate::price::Price;
 use crate::Error;
+
+/// What `mainnet_ack` must say, word for word, before a config with `chain: "main"` is taken.
+pub const MAINNET_ACK: &str = "real funds, software that has run on regtest only";
+
+/// What a gateway prints when it starts on mainnet: the things its runner should know before a
+/// buyer does. A short fixed text; the whole of it, with the measurements, is `docs/LIMITS.md`.
+pub const MAINNET_NOTICE: [&str; 9] = [
+    "chain main: this gateway has run on regtest only. Before you rely on it, read docs/LIMITS.md. In short:",
+    "- A held ticket of 1,000 sat can be below a channel's dust limit at mainnet fee rates on a channel without anchors: it then has no output there, and is lost to the miners if that channel is force-closed while it is held. The gateway does not read its channels' dust limits.",
+    "- Claiming settled tickets on chain after a force close cost 900 to 1,700 sat for three tickets at 1 sat/vB; at higher fee rates one ticket costs more to claim than it is worth.",
+    "- Held tickets take pending-payment slots of every channel on their route for no fee, on your node and on the routing nodes before it. Nothing but this software keeps buyers to half of a channel's slots.",
+    "- A lock costs a buyer nothing until it pays: whoever reaches the gateway from enough addresses can take every session place with invoices it never pays.",
+    "- With a lottery section you serve first, and nothing makes a buyer pay a win.",
+    "- The gateway speaks an lnd-family node's REST interface and no other; a Core Lightning seller is not supported.",
+    "- The gateway speaks plain HTTP: buyers must reach it through a TLS proxy, with public_url set to the https origin they use.",
+    "- A buyer's unused balance is trusted to you, and a lost state directory loses every session, key and balance.",
+];
 
 /// The node adds this many blocks to a ticket's final CLTV delta when it pays.
 pub const PAYER_PAD_BLOCKS: u32 = 3;
@@ -99,6 +117,10 @@ pub struct NodeConfig {
     /// on held tickets itself. Not the default: the permission also shows the node's balances,
     /// its payments and what it forwarded.
     pub channels_macaroon: Option<PathBuf>,
+    /// How many blocks before a held ticket's expiry the node cancels it (lnd's
+    /// `invoices.holdexpirydelta`): the runner's word, [`HOLD_EXPIRY_DELTA`] unless it says
+    /// otherwise. The node does not tell it, and the margin rests on it.
+    pub hold_expiry_delta: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,7 +131,8 @@ pub struct Config {
     /// The service: `http://host:port`, optionally with a path prefix.
     pub upstream: String,
     pub state_dir: PathBuf,
-    /// `main`, or another chain's name with `network` given.
+    /// `regtest` unless the file says otherwise. Another test chain's name with `network` given,
+    /// or `main`, which also needs `mainnet_ack` ([`MAINNET_ACK`]).
     pub chain: String,
     /// `lightning:<32 hex>`.
     pub network: String,
@@ -130,7 +153,20 @@ pub struct Config {
     pub lottery: Option<LotteryConfig>,
     pub routes: Vec<Route>,
     pub http: Http,
+    /// Off unless the runner writes it: whose word the caps per address take for a buyer's address.
+    pub forwarded: Option<Forwarded>,
     pub times: Times,
+}
+
+/// A reverse proxy in front of the gateway, and the header in which it reports the address it
+/// took each request from (`http.forwarded_address`). Absent: the caps per address count the
+/// socket's address, which behind a proxy is the proxy's for every buyer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Forwarded {
+    /// The header's name, lower case.
+    pub header: String,
+    /// The addresses the proxy connects from. The header is read on connections from these only.
+    pub proxies: Vec<std::net::IpAddr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,6 +193,15 @@ pub struct Times {
 impl Config {
     pub fn mainnet(&self) -> bool {
         self.chain == "main"
+    }
+
+    /// What is printed at a start on mainnet ([`MAINNET_NOTICE`]); nothing on any other chain.
+    pub fn mainnet_notice(&self) -> &'static [&'static str] {
+        if self.mainnet() {
+            &MAINNET_NOTICE
+        } else {
+            &[]
+        }
     }
 
     /// The route for a decoded path: the longest matching one.
@@ -195,6 +240,7 @@ impl Config {
                 "upstream",
                 "state_dir",
                 "chain",
+                "mainnet_ack",
                 "network",
                 "node",
                 "tickets",
@@ -205,7 +251,16 @@ impl Config {
                 "times",
             ],
         )?;
-        let chain = opt_str(top, "chain")?.unwrap_or("main").to_string();
+        // a file that names no chain is a regtest file: mainnet is never what a missing key means
+        let chain = opt_str(top, "chain")?.unwrap_or("regtest").to_string();
+        match (chain.as_str(), opt_str(top, "mainnet_ack")?) {
+            ("main", Some(MAINNET_ACK)) => {}
+            ("main", _) => return Err(format!(
+                "chain \"main\" moves real funds through software that has run on regtest only (docs/LIMITS.md). To run it on mainnet all the same, add \"mainnet_ack\": \"{MAINNET_ACK}\""
+            )),
+            (_, Some(_)) => return Err("mainnet_ack is for chain \"main\" only: leave it out".into()),
+            (_, None) => {}
+        }
         let network = match (chain.as_str(), opt_str(top, "network")?) {
             ("main", None) => xbt402::ticket::network_id(xbt_primitives::network::XBT_MAINNET)
                 .ok_or("no mainnet network id")?,
@@ -221,7 +276,7 @@ impl Config {
                 n.to_string()
             }
             _ => return Err(
-                "a chain other than main needs network: \"lightning:<32 hex of its bip122 id>\""
+                "a chain other than main needs network: \"lightning:<32 hex of its bip122 id>\" (chain is \"regtest\" where the file names none)"
                     .into(),
             ),
         };
@@ -232,6 +287,16 @@ impl Config {
             xbt402::wire::sendable_url(&public_url).map_err(|e| format!("public_url: {e}"))?;
         if xbt402::wire::request_url(&origin).target != "/" {
             return Err("public_url is an origin (scheme://host[:port]), without a path".into());
+        }
+        // the gateway speaks plain HTTP. On a loopback address that is the machine's own business;
+        // on any other, session keys and paid answers would cross a network in the clear unless a
+        // TLS proxy stands in front, and public_url is what says one does
+        let listen = req_str(top, "listen")?.to_string();
+        let loopback = listen
+            .parse::<std::net::SocketAddr>()
+            .is_ok_and(|a| a.ip().is_loopback());
+        if !loopback && !origin.starts_with("https://") {
+            return Err(format!("listen {listen} is not a loopback address (an address written as one: a name, even localhost, is whatever the resolver says), and public_url is not https. The gateway speaks plain HTTP: listen on 127.0.0.1 or [::1], or put a TLS proxy in front and set public_url to the https origin buyers use"));
         }
         let upstream = req_str(top, "upstream")?.trim_end_matches('/').to_string();
         let up = xbt402::wire::sendable_url(&upstream).map_err(|e| format!("upstream: {e}"))?;
@@ -248,6 +313,7 @@ impl Config {
                 "macaroon",
                 "info_macaroon",
                 "channels_macaroon",
+                "hold_expiry_delta",
             ],
         )?;
         let node = NodeConfig {
@@ -256,7 +322,19 @@ impl Config {
             macaroon: PathBuf::from(req_str(n, "macaroon")?),
             info_macaroon: PathBuf::from(req_str(n, "info_macaroon")?),
             channels_macaroon: opt_str(n, "channels_macaroon")?.map(PathBuf::from),
+            hold_expiry_delta: num32(n, "hold_expiry_delta", HOLD_EXPIRY_DELTA)?,
         };
+        // the margin is one number for both sides (a buyer stops releasing a ticket a block before
+        // it), so it is not moved to fit a node: a node that cancels held tickets earlier than the
+        // margin allows for leaves no time for a settle that has to go on chain, and is refused
+        if node.hold_expiry_delta + SETTLE_CHAIN_BLOCKS > SETTLE_MARGIN_BLOCKS {
+            return Err(format!(
+                "node.hold_expiry_delta {}: the gateway takes a ticket's secret only while more than {SETTLE_MARGIN_BLOCKS} blocks are left, and keeps {SETTLE_CHAIN_BLOCKS} of them for a settle that has to go on chain. A node that cancels held tickets more than {} blocks before expiry leaves too few: set its invoices.holdexpirydelta to {} or less",
+                node.hold_expiry_delta,
+                SETTLE_MARGIN_BLOCKS - SETTLE_CHAIN_BLOCKS,
+                SETTLE_MARGIN_BLOCKS - SETTLE_CHAIN_BLOCKS
+            ));
+        }
 
         let empty = Map::new();
         let t = match top.get("tickets") {
@@ -386,7 +464,7 @@ impl Config {
         }
 
         let h = match top.get("http") {
-            Some(h) => obj(h, "http", &["connections", "per_address", "threads"])?,
+            Some(h) => obj(h, "http", &["connections", "per_address", "threads", "forwarded_address"])?,
             None => &empty,
         };
         // bounded before they become sizes: each is a number of threads
@@ -402,6 +480,22 @@ impl Config {
             threads: small("threads", 16, 1)?,
         };
 
+        let forwarded = match h.get("forwarded_address") {
+            None | Some(Value::Null) => None,
+            Some(f) => {
+                let f = obj(f, "http.forwarded_address", &["header", "proxies"])?;
+                let header = req_str(f, "header")?.to_ascii_lowercase();
+                if !header.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-') {
+                    return Err("http.forwarded_address.header is a header name".into());
+                }
+                let bad = "http.forwarded_address.proxies is a list of the addresses your reverse proxy connects from, at least one, each written as an address: the header is believed from these and from nobody else";
+                let mut proxies = vec![];
+                for p in f.get("proxies").and_then(Value::as_array).filter(|a| !a.is_empty()).ok_or(bad)? {
+                    proxies.push(p.as_str().and_then(|a| a.parse::<std::net::IpAddr>().ok()).ok_or(bad)?.to_canonical());
+                }
+                Some(Forwarded { header, proxies })
+            }
+        };
         let tm = match top.get("times") {
             Some(t) => obj(
                 t,
@@ -459,7 +553,7 @@ impl Config {
             Some(l) => Some(LotteryConfig::parse(l, ticket_blocks)?),
         };
         Ok(Self {
-            listen: req_str(top, "listen")?.to_string(),
+            listen,
             public_url: origin.trim_end_matches('/').to_string(),
             upstream: up.trim_end_matches('/').to_string(),
             state_dir: PathBuf::from(req_str(top, "state_dir")?),
@@ -475,6 +569,7 @@ impl Config {
             lottery,
             routes,
             http,
+            forwarded,
             times,
         })
     }
@@ -676,6 +771,11 @@ mod tests {
             "the gateway does not read channels unless asked"
         );
         assert_eq!(
+            (c.node.hold_expiry_delta, c.caps.margin_blocks),
+            (18, 24),
+            "the fork's node cancels 18 blocks before expiry; 6 more for a settle on chain"
+        );
+        assert_eq!(
             (
                 c.caps.max_sessions,
                 c.caps.sessions_per_address,
@@ -698,12 +798,58 @@ mod tests {
             (64, 48, 16)
         );
         assert!(!c.mainnet());
-        let mut main = base();
-        main.as_object_mut().unwrap().remove("chain");
-        main.as_object_mut().unwrap().remove("network");
+    }
+
+    #[test]
+    fn a_file_that_names_no_chain_is_regtest_and_mainnet_is_asked_for_twice() {
+        // no chain: regtest, which like every chain but main must say which network it is
+        let mut none = base();
+        none.as_object_mut().unwrap().remove("chain");
+        let c = Config::from_json(&none).unwrap();
+        assert_eq!((c.chain.as_str(), c.mainnet(), c.mainnet_notice().len()), ("regtest", false, 0));
+        none.as_object_mut().unwrap().remove("network");
+        let e = Config::from_json(&none).unwrap_err().to_string();
+        assert!(e.contains("needs network") && e.contains("regtest"), "{e}");
+        // chain main alone is refused, and the refusal says what it takes
+        let mut main = none.clone();
+        main["chain"] = json!("main");
+        let e = Config::from_json(&main).unwrap_err().to_string();
+        assert!(e.contains("mainnet_ack") && e.contains(MAINNET_ACK) && e.contains("docs/LIMITS.md"), "{e}");
+        for wrong in [json!(true), json!("yes"), json!(""), json!(MAINNET_ACK.to_uppercase())] {
+            main["mainnet_ack"] = wrong.clone();
+            assert!(Config::from_json(&main).is_err(), "{wrong}");
+        }
+        main["mainnet_ack"] = json!(MAINNET_ACK);
         let m = Config::from_json(&main).unwrap();
         assert!(m.mainnet());
         assert_eq!(m.network, "lightning:0000000000000050c1e5f69672f45929");
+        // and a start on mainnet says what its runner should know, and where the rest is
+        let notice = m.mainnet_notice().join("\n");
+        assert!(notice.contains("docs/LIMITS.md") && notice.contains("regtest only") && notice.contains("dust"), "{notice}");
+        // the word means nothing on another chain, and a key that means nothing is not taken
+        let mut off = base();
+        off["mainnet_ack"] = json!(MAINNET_ACK);
+        assert!(Config::from_json(&off).unwrap_err().to_string().contains("chain \"main\" only"));
+    }
+
+    #[test]
+    fn the_gateway_listens_off_loopback_only_behind_an_https_origin() {
+        let with = |listen: &str, public: &str| {
+            let mut v = base();
+            v["listen"] = json!(listen);
+            v["public_url"] = json!(public);
+            Config::from_json(&v)
+        };
+        for listen in ["127.0.0.1:8402", "127.0.0.9:0", "[::1]:8402"] {
+            assert!(with(listen, "http://127.0.0.1:8402").is_ok(), "{listen}");
+            assert!(with(listen, "https://seller.example").is_ok(), "{listen}");
+        }
+        // any other address, every address, and a name (which is whatever the resolver says)
+        for listen in ["0.0.0.0:8402", "192.0.2.7:8402", "[::]:8402", "[2001:db8::1]:8402", "localhost:8402", "gateway:8402"] {
+            let e = with(listen, "http://seller.example").unwrap_err().to_string();
+            assert!(e.contains("not a loopback address") && e.contains("https"), "{listen}: {e}");
+            assert!(with(listen, "https://seller.example").is_ok(), "{listen}: behind a TLS proxy");
+        }
     }
 
     #[test]
@@ -743,24 +889,45 @@ mod tests {
     }
 
     #[test]
+    fn the_nodes_hold_expiry_delta_is_the_runners_word_and_is_checked_against_the_margin() {
+        let with = |d: Value| {
+            let mut v = base();
+            v["node"]["hold_expiry_delta"] = d;
+            Config::from_json(&v)
+        };
+        // upstream lnd's 12, and anything up to the fork's 18: the margin stays 24, with room to spare
+        for d in [0u32, 12, 18] {
+            let c = with(json!(d)).unwrap();
+            assert_eq!((c.node.hold_expiry_delta, c.caps.margin_blocks), (d, 24), "{d}");
+        }
+        // a node that cancels 19 or more blocks before expiry leaves fewer than 6 for a settle on chain
+        for d in [19u32, 24, 40] {
+            let e = with(json!(d)).unwrap_err().to_string();
+            assert!(e.contains("holdexpirydelta to 18 or less") && e.contains("on chain"), "{d}: {e}");
+        }
+        assert!(with(json!("18")).is_err() && with(json!(-1)).is_err());
+    }
+
+    #[test]
     fn the_example_file_is_a_config() {
         let v: Value = serde_json::from_str(include_str!("../gateway.example.json")).unwrap();
         let c = Config::from_json(&v).unwrap();
-        assert!(c.mainnet());
+        assert!(!c.mainnet() && c.chain == "regtest", "the example is a regtest config");
         assert_eq!(c.routes.len(), 6);
         assert_eq!(
             c.route("/films/a.mkv").unwrap().price.for_bytes(1 << 20),
             Some(200_000)
         );
         assert_eq!(c.route("/chunks/1").unwrap().release, Release::AfterVerify);
-        // the lottery: pieces of a tenth of a sat are offered by draws, and so is a film's piece of
-        // 50 sat, which is below the 64-sat win (a buyer's owner decides whether odds of 25 in 32
-        // are a lottery). A chunk of 100 sat is dearer than a win: tickets only
+        // the lottery: pieces of a tenth of a sat are offered by draws, and a page of 2.5 sat. A
+        // film's piece of 50 sat is more than a quarter of the 64-sat win, and a chunk of 100 sat
+        // more than a whole one: tickets only
         let l = c.lottery.as_ref().unwrap();
         assert_eq!((l.win_msat, l.min_win_msat, l.piece_bytes), (64_000, 16_000, 262_144));
         assert!(l.offers(&c.route("/pieces/1").unwrap().price) && l.offers(&c.route("/api/x").unwrap().price));
+        assert!(l.offers(&c.route("/live/x").unwrap().price), "5 sat a second");
         assert_eq!(l.dearest_piece(&c.route("/films/a.mkv").unwrap().price), Some(50_000));
-        assert!(l.offers(&c.route("/films/a.mkv").unwrap().price) && !l.offers(&c.route("/chunks/1").unwrap().price));
+        assert!(!l.offers(&c.route("/films/a.mkv").unwrap().price) && !l.offers(&c.route("/chunks/1").unwrap().price));
         // a file with no lottery section offers none, and a section that is not one is refused
         let mut none = v.clone();
         none.as_object_mut().unwrap().remove("lottery");
@@ -771,6 +938,33 @@ mod tests {
         let mut own = v;
         own["routes"][0]["path"] = json!("/x402/lottery/x");
         assert!(Config::from_json(&own).is_err(), "the lottery's endpoints are the gateway's own");
+    }
+
+    #[test]
+    fn a_forwarded_address_is_believed_only_where_the_runner_names_the_proxy() {
+        let with = |f: Value| {
+            let mut v = base();
+            v["http"] = json!({"forwarded_address": f});
+            Config::from_json(&v)
+        };
+        assert_eq!(Config::from_json(&base()).unwrap().forwarded, None, "off unless written");
+        let c = with(json!({"header": "X-Real-IP", "proxies": ["127.0.0.1", "::ffff:192.0.2.9", "2001:db8::1"]})).unwrap();
+        let f = c.forwarded.unwrap();
+        assert_eq!(f.header, "x-real-ip");
+        assert_eq!(f.proxies, ["127.0.0.1".parse::<std::net::IpAddr>().unwrap(), "192.0.2.9".parse().unwrap(), "2001:db8::1".parse().unwrap()]);
+        for bad in [
+            json!({"header": "X-Real-IP"}),
+            json!({"header": "X-Real-IP", "proxies": []}),
+            json!({"header": "X-Real-IP", "proxies": ["proxy.internal"]}),
+            json!({"header": "X-Real-IP", "proxies": ["10.0.0.0/8"]}),
+            json!({"header": "X-Real-IP", "proxies": "127.0.0.1"}),
+            json!({"header": "X Real IP", "proxies": ["127.0.0.1"]}),
+            json!({"proxies": ["127.0.0.1"]}),
+            json!({"header": "X-Real-IP", "proxies": ["127.0.0.1"], "trust": "all"}),
+            json!("X-Real-IP"),
+        ] {
+            assert!(with(bad.clone()).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -996,7 +1190,14 @@ mod tests {
                 "network",
                 Box::new(|v| v["network"] = json!("bip122:00000000000000000000000000000001")),
             ),
-            ("network is fixed", Box::new(|v| v["chain"] = json!("main"))),
+            (
+                "network is fixed",
+                Box::new(|v| {
+                    v["chain"] = json!("main");
+                    v["mainnet_ack"] = json!(MAINNET_ACK);
+                }),
+            ),
+            ("mainnet_ack", Box::new(|v| v["chain"] = json!("main"))),
             (
                 "network",
                 Box::new(|v| {

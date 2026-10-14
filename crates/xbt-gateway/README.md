@@ -15,6 +15,13 @@ project has reviewed it. The wallet of this tree pays it (`scripts/ticket_e2e_re
 tickets, `scripts/lottery_regtest.sh` by draws); the buyer in `scripts/gateway_regtest.sh` is a
 test buyer.
 
+**Your node must be an lnd-family node.** The gateway speaks lnd's REST interface (hold
+invoices: `/v2/invoices/hodl`, `settle`, `cancel`, `lookup`, `subscribe`) and nothing else. A
+Core Lightning seller is not supported for held tickets today: Core Lightning has no hold
+invoice call, and nothing on it cancels a held ticket before it expires (`docs/TICKETS.md`,
+section 8). Pointed at a node that answers `getinfo` in Core Lightning's names, or has no lnd
+`GetInfo`, the gateway stops at start and says so.
+
 ## What it does with a request
 
 1. An unpaid request to a priced route gets `402` with the ticket terms: the node id, the ticket
@@ -56,15 +63,34 @@ shows your channel balances, your node's payments and what it forwarded, to whoe
 gateway's files. Without it the gateway keeps to the numbers in its config, which assume a
 channel that carries 30 pending payments.
 
+The gateway takes a ticket's secret only while more than 24 blocks are left before it expires:
+your node cancels a held ticket itself a number of blocks before expiry (lnd's
+`invoices.holdexpirydelta`: 18 on the Lightning Fork node at its default, 12 on upstream lnd),
+and 6 more are kept for a settle that has to go on chain. The node does not say what it is set
+to, so tell the gateway if yours is not 18: `"node": {"hold_expiry_delta": 12, ...}`. Above 18 the
+gateway does not start: lower the node's setting.
+
 ```bash
 cargo build --release -p xbt-gateway
 target/release/xbt-gateway --check gateway.json   # reads the config and the macaroons, says what the caps cost
 target/release/xbt-gateway gateway.json
 ```
 
-`gateway.example.json` is a config for mainnet. Every key is checked: an unknown one stops the
-start. For a public seller, put a TLS reverse proxy in front and set `public_url` to the origin
-buyers use.
+`gateway.example.json` is a config for regtest. Every key is checked: an unknown one stops the
+start.
+
+- **The chain.** A file that names no `chain` is a regtest file. Every chain but `main` also
+  names its `network`: `lightning:` and the first 32 hex characters of the hash of that chain's
+  block 101 (`getblockhash 101`); the example's is a placeholder. Mainnet is asked for twice:
+  `"chain": "main"` and `"mainnet_ack": "real funds, software that has run on regtest only"`,
+  word for word. With one and not the other nothing starts. A gateway that starts on mainnet
+  prints, at every start and every `--check`, a short list of what is known to be open there;
+  the whole of it is `docs/LIMITS.md`.
+- **Where it listens.** The gateway speaks plain HTTP. It listens on a loopback address
+  (`127.0.0.1` or `[::1]`, written as an address), or on any other address only when
+  `public_url` is an `https` origin: that is how you say a TLS reverse proxy stands in front.
+  For a public seller, run that proxy and set `public_url` to the origin buyers use. The
+  gateway cannot check that the proxy is there.
 
 ## Pricing a piece
 
@@ -131,15 +157,20 @@ you are actually paid comes near that only over many wins: within 20% takes abou
 (4,350 sat at this win size), nine times in ten.
 
 A route is offered this way only if its dearest piece (its request, one second, or `piece_bytes`
-of its body) costs less than `win_msat`. `GET /services` says which routes are.
+of its body) costs a quarter of `win_msat` or less (`max_odds_den`, 4: no piece wins more often
+than one time in four, which is also the most a wallet's owner allows by default). You serve
+`window` pieces before any value has come, so this is what the window costs you in wins: 8
+pieces of a quarter of a win are 2. A dearer route is paid with tickets, and a request that
+names the lottery for it is refused. `GET /services` says which routes are offered.
 
 What it costs you, and what bounds it:
 
 | What a buyer can do | What it gets | The setting |
 |---|---|---|
-| Send no values | `window` pieces a session, then `value_missing` | `window` (8); `max_sessions` (64) and `sessions_per_address` (4); a session that never sent a value is forgotten after `first_use_secs` (60) |
+| Send no values | `window` pieces a session, then `value_missing` | `window` (8) and `max_odds_den` (4): 2 wins' worth a session at the most. `max_sessions` (64) and `sessions_per_address` (4); a session that never sent a value is forgotten after `first_use_secs` (60): 8 wins' worth a minute from one address |
 | Send values and never pay a win | What it was served up to its first win, then the grace: `grace_pieces` more pieces, `grace_seconds`, or until more than `max_unpaid_wins` are unpaid, whichever comes first. Then `win_unpaid` until your node shows the wins paid. An answer that is being sent stands still for the payment for `pay_wait_secs` (10) at the most, holding its connection and one of the server's threads, and is then cut short | `win_msat`, the three grace settings and `pay_wait_secs` |
-| Say a piece never arrived (`void`) | `max_voids` pieces a session (16) | `max_voids` |
+| Say a piece never arrived (`void`) | Nothing more than by sending no values: a voided piece stays counted against `window` for the rest of the session. After `max_voids` voids (4) the session is ended (`too_many_voids`) | `window`, `max_voids`. An honest buyer whose answer was cut voids the pieces that were on their way (one to a few), has a narrower window from then on, and opens another session after the fifth |
+| Close its session and open another | The window again, but a session closed while it owes (pieces with no value, a win unpaid) keeps its place for `first_use_secs` | `sessions_per_address`, `max_sessions`, `first_use_secs` |
 | Open sessions | A chain each: `chain_draws` hashes to make (65,536) and about 34 KiB to keep (one chain value in every 1,024, the block of 1,024 last read, and 8 bytes for every draw taken) | `max_sessions`, `idle_secs` (300) |
 
 Measured on regtest with the wallet of this tree and a buyer that never pays
@@ -156,7 +187,7 @@ The rules it keeps, beside those of the table above:
 
 | Rule | Where |
 |---|---|
-| A chain is made for one session from fresh random bytes, and its anchor is sent before any value of the buyer's. A session lives in the process only: a restart forgets the chain with the values it revealed for. | `lottery.rs`, `Book::open`; `gateway/draws.rs`, `lottery_open` |
+| A chain is made for one session from fresh random bytes, and its anchor is sent before any value of the buyer's. A session outlives a restart: its seed is in the lottery's journal, and a draw is on disk before the reveal for it leaves, so a restart never takes a second value for a draw it revealed for. | `lottery.rs`, `Book::open`; `gateway/draws.rs`, `lottery_open` |
 | A piece waits for its value only once it has left. | `Gateway::lottery_route`, `lottery_pump` |
 | A value is taken only as the next draw, for a piece that was served, at its price, once. The chain value of a draw leaves only in the answer to the request that brought its value. | `xbt402::lottery::Seller::take`, `Book::draw` |
 | A win is paid when the node shows its invoice settled for the full amount, never on a buyer's word. One invoice for a win at a time; another only when the node has cancelled the first. | `Gateway::lottery_refresh`, `Book::claim_invoice` |
@@ -164,6 +195,27 @@ The rules it keeps, beside those of the table above:
 
 The fairness of the draw rests on an argument of this project's own that nobody else has
 reviewed (`docs/LIMITS.md`, "The lottery").
+
+### Behind a reverse proxy: whose address is counted
+
+The caps per address (`caps.sessions_per_address` for tickets, `lottery.sessions_per_address`)
+count the address of the socket. Behind a reverse proxy that is the proxy's for every buyer: the
+cap then holds all your buyers together to a few sessions, or you set it to 0 and it holds
+nobody, and the lottery's bound per address above is gone. To have it count buyers, name the
+proxy and the header it reports their address in:
+
+```json
+"http": {"forwarded_address": {"header": "X-Real-IP", "proxies": ["127.0.0.1"]}}
+```
+
+Off unless you write it. The gateway then reads that header on connections from the listed
+addresses only (written as addresses), takes the last entry if it is a list, and counts a
+request with no such header, or two, under the proxy's own address. Two things are yours to get
+right, and the gateway cannot check either: the proxy must set the header itself on every
+request, replacing whatever the client sent (nginx: `proxy_set_header X-Real-IP $remote_addr;`),
+and nothing else may reach the gateway from a listed address. Get one wrong and a buyer writes
+its own address. The cap on connections (`http.per_address`) is taken before any header is read:
+set it to 0 behind a proxy.
 
 ## What the defaults cost you
 

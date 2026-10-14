@@ -21,10 +21,18 @@ pub const FEATURE_BLAKE2B: u64 = 512;
 /// Where the session endpoints live on the seller's origin unless its terms say otherwise.
 pub const SESSION_PATH: &str = "/x402/ticket";
 pub const RECEIPT_TAG: &str = "xbt402/ticket-receipt/v0";
+/// How many blocks before a held invoice's HTLC expires the seller's node cancels it, unless its
+/// runner set otherwise: lnd's `invoices.holdexpirydelta`, which is 18 on the Lightning Fork node
+/// this was built against (upstream lnd's default is 12). A runner's node may differ; the gateway
+/// takes the runner's word for it (`node.hold_expiry_delta`) and checks it against the margin.
+pub const HOLD_EXPIRY_DELTA: u32 = 18;
+/// The blocks of the margin beyond the node's own cancel: for a settle that has to go on chain.
+pub const SETTLE_CHAIN_BLOCKS: u32 = 6;
 /// A ticket is used only while more than this many blocks are left before its HTLC expires: the
-/// seller's node cancels a held invoice 18 blocks before expiry, and 6 more are for a settle that
-/// has to go on chain.
-pub const SETTLE_MARGIN_BLOCKS: u32 = 24;
+/// seller's node cancels a held invoice [`HOLD_EXPIRY_DELTA`] blocks before expiry, and
+/// [`SETTLE_CHAIN_BLOCKS`] more are for a settle that has to go on chain. A buyer stops releasing
+/// a ticket one block before this, so it is one number for both sides, not a setting.
+pub const SETTLE_MARGIN_BLOCKS: u32 = HOLD_EXPIRY_DELTA + SETTLE_CHAIN_BLOCKS;
 /// The node takes no hold invoice with a final CLTV delta of this or less.
 pub const MIN_TICKET_BLOCKS: u32 = 24;
 /// How long an unpaid ticket invoice may wait to be paid, in seconds.
@@ -145,12 +153,14 @@ impl Terms {
 }
 
 /// The error codes of the ticket scheme and of the lottery beside it ([`crate::lottery`]): what a
-/// gateway answers a payer with.
-pub const PROTOCOL_CODES: [&str; 32] = [
+/// gateway answers a payer with. Every code the gateway in this tree can answer with is here (a
+/// test there holds it to that), so that a payer can name each.
+pub const PROTOCOL_CODES: [&str; 34] = [
     "amount_mismatch", "amount_not_below_win", "bad_auth", "bad_payment", "bad_request", "bad_seq", "bad_target", "balance_short", "chain_spent",
-    "draw_out_of_order", "draw_used", "hash_refused", "journal", "no_route", "node_unavailable", "piece_unknown", "pledge_outstanding",
-    "session_unknown", "slots_short", "ticket_expiring", "ticket_not_locked", "ticket_unknown", "ticket_used", "too_many_sessions",
-    "too_many_tickets", "too_many_voids", "upstream_unavailable", "value_conflict", "value_missing", "value_reused", "win_size", "win_unpaid",
+    "draw_out_of_order", "draw_used", "hash_refused", "internal", "journal", "method_not_allowed", "no_route", "node_unavailable", "piece_unknown",
+    "pledge_outstanding", "session_unknown", "slots_short", "ticket_expiring", "ticket_not_locked", "ticket_unknown", "ticket_used",
+    "too_many_sessions", "too_many_tickets", "too_many_voids", "upstream_unavailable", "value_conflict", "value_missing", "value_reused",
+    "win_size", "win_unpaid",
 ];
 
 /// The seller's error code as one of the scheme's own ([`PROTOCOL_CODES`]), or `""`. The string
@@ -241,6 +251,18 @@ mod tests {
         assert_eq!(a["extra"]["maxTickets"], 2);
         let b = t.accepts(2500, "with-request", SETTLE_ON_ARRIVAL, &json!({"requestMsat": "2500"}));
         assert_eq!(b["extra"]["settle"], "on-arrival");
+    }
+
+    #[test]
+    fn the_codes_are_sorted_once_each_and_a_seller_writes_none_of_its_own() {
+        assert!(PROTOCOL_CODES.windows(2).all(|w| w[0] < w[1]), "sorted, and none twice");
+        assert!(PROTOCOL_CODES.iter().all(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')));
+        for c in PROTOCOL_CODES {
+            assert_eq!(protocol_code(Some(&json!(c))), c);
+        }
+        assert_eq!(protocol_code(Some(&json!("Internal"))), "");
+        assert_eq!(protocol_code(Some(&json!("a seller's own words"))), "");
+        assert_eq!(protocol_code(Some(&json!(7))), "");
     }
 
     #[test]

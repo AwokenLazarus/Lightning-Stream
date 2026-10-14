@@ -233,9 +233,34 @@ involved no node.
   everything free. A download split over 40 sellers at a tenth of a sat a piece is 41 sat a
   seller, which is less than a 64-sat win. *(simulated)* The lottery is a way for buyers who
   mean to pay to do so cheaply. It is not enforcement.
-- A buyer that sends no values is served the seller's window (8 pieces) in every session it is
-  given. The gateway caps sessions (64 in all, 4 from one address) and forgets one that never
-  gave a value after a minute, so one address gets 32 pieces a minute at the most.
+- A buyer that sends no values, or that names every piece as void, is served the seller's
+  window (8 pieces) in every session it is given, and no more: a void makes no room in the
+  window. The gateway caps sessions (64 in all, 4 from one address), keeps a session that never
+  gave a value, or that was closed while it owed, in its place for a minute, and offers the
+  lottery only for a route whose dearest piece is a quarter of a win or less. So one address
+  gets 32 pieces a minute at the most, which is 8 wins' worth at the dearest price the gateway
+  draws for, and 16 addresses that hold all 64 places get 128 wins' worth a minute (8,192 sat
+  with 64-sat wins). Nothing but the caps bounds that: it is the price of serving first.
+  (Until 2026-10-14 a void made room in the window and a session took 16 of them, so a buyer
+  that voided every piece was served 24 pieces a session; a closed session gave its place back
+  at once, so the rate had no bound; and any piece below a whole win was drawn for.)
+- The cap on sessions from one address counts the socket's address unless the runner names a
+  reverse proxy and the header it sets (`http.forwarded_address`, off by default). Behind a
+  proxy without it, every buyer has the proxy's address: the cap holds everyone together to 4
+  sessions, or is set to 0 and holds nobody, and the bound of the item above is then the 64
+  sessions in all. With it, the gateway believes that header from the named addresses only and
+  takes the last entry of a list; it cannot check that the proxy overwrites what a client sent,
+  or that nobody reaches the gateway past the proxy from a named address. Either mistake lets a
+  buyer write its own address. The same address is what a ticket session's place is counted
+  under.
+- An honest buyer pays for the window too. Each piece of an answer that was cut, or that the
+  wallet stopped reading, stays counted for the rest of the session: one to a few pieces for a
+  cut, the window at the most. After 4 voids (`max_voids`, half the window) the gateway ends
+  the session (`too_many_voids`) and the wallet opens another; the one it left keeps its place
+  for a minute, so a buyer whose answers are cut more than four sessions' worth in a minute is
+  refused (`too_many_sessions`) until a place comes back. An answer priced by the second can
+  cost the buyer a void by itself: the seller may have begun one second more than the wallet
+  counted. Not measured; `scripts/lottery_regtest.sh` has no check that cuts answers.
 - Income is uneven. A seller earning 4,096 sat in a day with 64-sat wins is paid 80% to 120% of
   it nine days in ten, and 96% to 104% over a month; a seller earning 1,000 sat a day, 58% to
   141% on a day; a seller earning 100 sat a day gets no win on 21% of days. *(simulated)* A
@@ -285,18 +310,33 @@ involved no node.
   rate, and these numbers shrink with it.
 - An answer the wallet stops reading (its `max_sats`, the owner's `max_answer_s`, a piece that
   does not match) leaves up to the seller's window of pieces that it was sent and gives no value
-  for: it names them as void. A seller takes so many voids a session (16 at the gateway); after
-  that the wallet's next call opens another session. A buyer that voids pieces it did receive
-  has had them free, 16 a session.
+  for: it names them as void. A seller takes so many voids a session (4 at the gateway, and
+  each counts against its window); after that the wallet's next call opens another session. A
+  buyer that voids pieces it did receive has had them free: the window's 8 a session at the
+  most, voided or left open.
 - A win whose payment fails (no route, a fee above the owner's limit) is not paid with the same
   invoice again. It is paid with the seller's next invoice for it, which the gateway makes when
-  the first has lapsed (60 s); a seller whose grace is shorter has stopped serving by then, and
-  serves again when it is paid.
+  the first has lapsed: a win's invoice lives as long as the grace (30 s), so the next one comes
+  with the first request the gateway refuses `win_unpaid`, and the session goes on once it is
+  paid. A slow payment pays less time: an invoice of 30 s that is not paid within it (a win that
+  waited its turn behind many others, section above) fails, and waits for the next one.
 - A wallet that starts again pays no win it found before the start: it cannot tell a start from
-  a restore of older records, in which that win may be paid already. A gateway that starts again
-  has forgotten its lottery sessions, their unpaid wins with them; the wallet opens another
-  session. In both cases the seller has lost the wins that were unpaid at that moment (at most
-  the 2 it bears). A session of draws holds nothing, so there is nothing to recover.
+  a restore of older records, in which that win may be paid already; the seller has lost the
+  wins that were unpaid at that moment (at most the 2 it bears). A gateway that starts again
+  keeps its lottery sessions (`lottery.jsonl` in its state directory): each comes back with its
+  chain, its draws, its open pieces and its unpaid wins, and a win paid while it was down is
+  seen paid. Until 2026-10-14 a restart forgot them all, and with them the wins that were unpaid.
+- The lottery's journal holds each session's seed. Whoever can read the state directory can work
+  out every draw of every session to come, and a buyer that could would never win. It is
+  written private to the gateway's owner, as the session keys and the receipt key are.
+- What keeps a restart from taking a second value for a draw it revealed for is that draw being
+  on disk first: every answer that reveals waits for the journal's sync (a few milliseconds on
+  an SSD, more on a slow disk; not measured on the lab). A disk that cannot be written ends the
+  session whose draw it was (`500 journal`, nothing revealed). Everything else is synced twice a
+  second: a power cut can lose the last half second of pieces served and values voided, which
+  the buyer then has free, and of seqs used up, which it is told again (`bad_seq`). A gateway
+  that starts reads every session's chain again: `chain_draws` hashes each, about 64 times
+  65,536 with the default caps.
 - A buyer's node that is killed as it sends a win's payment can go on calling that payment in
   flight with nothing on its channel (the same behaviour as for a ticket, below). The wallet
   keeps that win booked as spent and does not pay it again, the seller is not paid for it, and
@@ -374,14 +414,30 @@ wallet) and against a stand-in node in its tests.
   mainnet when it grants anything else; the check reads the macaroon and does not verify it, and
   on any other chain a wider one is taken with a warning.
 - A third macaroon, with `offchain:read`, is the runner's choice (`node.channels_macaroon`). With
-  it the gateway reads its node's channel list before every lock of a held ticket. The permission
+  it the gateway reads its node's channel list before every lock of a held ticket that its caps
+  on sessions let through: one call to the node for each, with a timeout of 15 seconds. A lock
+  those caps refuse (`too_many_sessions`, `too_many_tickets`) is refused before the call, and a
+  lock for an existing session is authenticated before it; a first lock is authenticated by
+  nobody, so while session places are free anyone can make the gateway read the list once per
+  request. The permission
   is wider than that one call: it also shows the node's channel balances, its payments and what
   it forwarded, to whoever has the gateway's files. Without it the gateway knows nothing of its
   channels and keeps to the numbers in its config.
+- A cancel is two calls to the node: the cancel, and a lookup of the same invoice, because the
+  gateway takes no cancel's success for the invoice's state. Whether the fork's node ever
+  answers success to the cancel of a settled invoice was not checked in its source; the stand-in
+  node of the tests is made to, and the gateway then credits the ticket and reports nothing
+  cancelled.
 - No secret is taken without a block height from the node that is at most 10 seconds old; such
   a request is answered 503 and the secret is good again later.
 - The 24-block margin is checked against the height the node last reported, which is asked for
   twice a second: a block that arrived since is not counted.
+- The margin rests on when the node cancels a held ticket by itself (lnd's
+  `invoices.holdexpirydelta`), which no call of the gateway's macaroons can read. The gateway
+  takes the runner's word for it (`node.hold_expiry_delta`, 18 as the Lightning Fork node ships)
+  and refuses to start above 18. A runner who writes a smaller number than the node's has a
+  margin that leaves less than 6 blocks for a settle that has to go on chain, and nothing
+  notices.
 - The gateway's defaults are sized for an inbound channel that carries 30 pending payments (a
   channel with a Core Lightning node at its default): a session holds 2 tickets, and all
   sessions together 15 (`caps.max_held_tickets`, half of `caps.inbound_slots`). A buyer beyond
@@ -422,10 +478,19 @@ wallet) and against a stand-in node in its tests.
   when the buyer presents the preimage, or by the janitor's sweep 75 seconds after it was issued
   if nobody did. An invoice paid short credits nothing, and the node keeps what arrived. The
   gateway makes each preimage, hands it to the node with the invoice and does not keep it.
-- The gateway does not make a Core Lightning node a seller: it speaks to a Lightning Fork node's
-  REST interface only, for prepaid tickets as for held ones.
+- The gateway does not make a Core Lightning node a seller: it speaks lnd's REST interface only
+  (an lnd-family node: the Lightning Fork node, or lnd), for prepaid tickets as for held ones. A
+  Core Lightning seller is not supported for held tickets today. A node whose `getinfo` answer
+  is in Core Lightning's names, or whose REST interface has no lnd `GetInfo` (404 or 405), stops
+  the start with that reason; one that answers lnd's call as lnd does is taken for lnd, and
+  nothing else is checked. Upstream lnd (without feature bit 512) is refused as not an XBT
+  build.
 - The cap per address counts the socket's address: behind a reverse proxy every buyer has the
-  proxy's, so the runner sets `sessions_per_address` to 0 and caps in the proxy.
+  proxy's. The runner either names the proxy and the header it reports a buyer's address in
+  (`http.forwarded_address`: believed from the named addresses only, the last entry of a list,
+  and a request without one counted under the proxy's own address), or sets
+  `sessions_per_address` to 0 and caps in the proxy. The cap on connections from one address
+  (`http.per_address`) is taken before any header is read and always counts the socket.
 - Whoever can reach the gateway from enough addresses can take every session place with locks
   it never pays, at no cost, a minute at a time: new buyers are refused meanwhile
   (`too_many_sessions`). Sessions that already hold tickets keep them and their balance, and can
@@ -447,6 +512,17 @@ wallet) and against a stand-in node in its tests.
   than one ticket ahead.
 - A body priced per second is charged for every second it is open, also while the service says
   nothing (at most 10 seconds, then the answer ends) or the buyer reads slowly.
+- A `HEAD` of a route priced by the byte or the second costs nothing, and a `GET` the service
+  answers 204 or 304 costs the request's price only. Neither is served to a ticket session with
+  no balance. For honest buyers that means: a `HEAD` needs a session that has released a ticket
+  and still has a balance (at least the request's price, one byte's and one second's); a buyer
+  that only wants a length has to buy a ticket first, and keeps its balance. A session with any
+  balance left can ask for as many such answers as it likes, and the service works for each.
+  In a session of draws a `HEAD` of such a route is refused, so a buyer that pays by draws
+  learns a length from the body's own head or pays that one request with tickets; and a 204 or
+  304 reaches it without the service's headers, which still tells it, free, whether what it
+  holds is current: one bit a request, by which a date could be found in about 30 of them. An
+  error (400 and above) is passed on with its headers as before.
 - A request is charged when the service answers with a status below 400. An error from the
   service is passed on (64 KiB of it) and not charged, so a buyer whose balance covers one
   request can make the service work on any number of requests that end in errors.
@@ -483,10 +559,21 @@ wallet) and against a stand-in node in its tests.
   arrives, and loses it when the buyer never sends the secret: once per session, 30,000 sat with
   the default caps and tickets. The gateway does not know what "checks out" means for the content.
 - The list at `/services` is not signed. The operator's `health` view is given to loopback
-  callers, which behind a reverse proxy on the same host is every caller; it shows counts and no
-  secret.
+  callers, which behind a reverse proxy on the same host is every caller unless the runner named
+  the proxy (`http.forwarded_address`): then the address the proxy reports decides. It shows
+  counts and no secret.
 - The gateway speaks plain HTTP: a public seller needs a TLS reverse proxy in front, and
-  `public_url` set to the origin buyers use, or every payment fails its request binding.
+  `public_url` set to the origin buyers use, or every payment fails its request binding. It
+  refuses a config that listens off loopback (any address but `127.0.0.1` or `[::1]`, and any
+  name) unless `public_url` is `https`. That is the runner's word that a proxy is there, and the
+  gateway cannot check it: a runner who writes an `https` origin and runs no proxy serves
+  session keys and paid answers in the clear.
+- A config that names no chain is a regtest config. Mainnet takes two keys, `"chain": "main"`
+  and `mainnet_ack` with a fixed sentence, and a gateway that starts there prints a short list
+  of what is open, at every start. That is a guard against a mainnet start by omission and
+  nothing more: the two keys make no part of the gateway fit for mainnet, and a runner who
+  writes them has the limits of this file as they stand. The chain is also checked against the
+  node's own at the start, as before.
 - Not run: more than one routing hop, real network latency, mainnet, IPv6, a seller with several
   channels, and the Core Lightning fork. The channels macaroon was run against the stand-in node
   of the tests and on the lab against a Lightning Fork node whose channel was opened with 30
@@ -822,8 +909,10 @@ untrusted field.
 | every rail's HTTP | the transport's error text went into `reason`: it quotes a status that is not a number (three characters) and, on the ticket rail, the URL with the seller's session path | a fixed sentence per kind of failure |
 
 - A seller's error code is its words unless it is one of the protocol's own
-  (`xbt402::ticket::PROTOCOL_CODES`). A code the shipped gateway adds later is not named by an
-  older wallet: it reads as no code.
+  (`xbt402::ticket::PROTOCOL_CODES`). Every code the gateway of this tree answers with is on
+  that list, and a test of the gateway's reads each one out of its source to hold it there
+  (`internal` and `method_not_allowed` were missing until 2026-10-14, and read as no code). A
+  code the shipped gateway adds later is not named by an older wallet: it reads as no code.
 - Numbers are not words, and nor are hashes, keys, ids and signatures of a fixed hex shape: a
   result gives them as they are (`payment_hash`, a session id, a receipt's amounts).
 - One character can still come through: a field that should be hex and is not is reported by the

@@ -25,12 +25,15 @@
 //!   together, never pass the cap, and with a channels macaroon none is issued while an inbound
 //!   channel of the node is half full of pending payments. A buyer that meets either is told
 //!   `slots_short` and when to come back, before any invoice exists.
+//! - **The caps before the node** ([`Book::lock_room`]): a lock that the caps on sessions, or the
+//!   session's own cap on tickets, refuse is refused before the node is asked for its channel
+//!   list. A lock for an existing session is authenticated before that; a first lock cannot be.
 //! - **Prepaid is the node's word** ([`Gateway::take_prepaid`]): a ticket settled on arrival is
 //!   an ordinary invoice whose preimage the gateway makes and forgets; it is credited once, when
 //!   the node shows that invoice settled for the full amount, whoever asks.
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read};
-use std::net::{SocketAddr, TcpListener};
+use std::net::{IpAddr, TcpListener};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -52,6 +55,7 @@ use xbt_svc::http::{
 use crate::book::{Book, Rec, Refusal};
 use crate::config::{Config, Release, Route, SERVICES_PATH};
 use crate::node::{Hash, Invoice, InvoiceState, Node, NodeError};
+pub use draws::JOURNAL as LOTTERY_JOURNAL;
 use crate::price::Meter;
 use crate::store::{Store, COMPACT_AT};
 use crate::upstream::{decoded_path, forwarded, returned, Answer, Upstream};
@@ -151,8 +155,8 @@ fn error(status: u16, code: &str, detail: &str) -> Response {
     json_response(status, &json!({"error": code, "detail": detail}))
 }
 
-fn addr_name(peer: Option<SocketAddr>) -> String {
-    match peer.map(|a| AddrKey::of(a.ip())) {
+fn addr_name(client: Option<IpAddr>) -> String {
+    match client.map(AddrKey::of) {
         Some(AddrKey::V4(a)) => format!("v4:{a}"),
         Some(AddrKey::V6Prefix(p)) => format!("v6:{p:016x}"),
         None => "none".into(),
@@ -176,6 +180,8 @@ struct Authed {
     seq: u64,
     digest: String,
     ticket: Option<Hash>,
+    /// The request is a HEAD: its answer has no body, whatever the route.
+    head: bool,
 }
 
 /// What a streamed body needs to meter itself and sign its last receipt.
@@ -257,6 +263,11 @@ impl Gateway {
             .into_iter()
             .filter(|h| book.ticket(h).is_some_and(|t| !t.prepaid))
             .collect();
+        // the lottery's sessions, as its own journal beside the tickets' has them
+        let lottery = match cfg.lottery.clone() {
+            Some(l) => Some(draws::Lottery::open(l, &cfg.state_dir, clock())?),
+            None => None,
+        };
         let upstream = Upstream::new(&cfg.upstream, cfg.times.upstream_wait);
         let gw = Arc::new(Self {
             terms,
@@ -277,13 +288,14 @@ impl Gateway {
             clock,
             settled: AtomicU64::new(0),
             settle_max_us: AtomicU64::new(0),
-            lottery: cfg.lottery.clone().map(draws::Lottery::new),
+            lottery,
             cfg,
         });
         for hash in unfinished {
             gw.watch(hash)
                 .map_err(|e| Error::Start(format!("a watcher thread: {e}")))?;
         }
+        gw.lottery_restored();
         let j = gw.clone();
         std::thread::Builder::new()
             .name("gateway-janitor".into())
@@ -321,11 +333,22 @@ impl Gateway {
         self.stop.store(true, Ordering::SeqCst);
         st.store.close();
         drop(st);
+        if let Some(l) = &self.lottery {
+            l.close();
+        }
         self.credited.notify_all();
     }
 
     pub fn terms(&self) -> &Terms {
         &self.terms
+    }
+
+    /// For tests: the lottery's journal stops taking records, as a full disk would.
+    #[doc(hidden)]
+    pub fn break_lottery_journal(&self) {
+        if let Some(l) = &self.lottery {
+            l.close();
+        }
     }
 
     pub fn stats(&self) -> Stats {
@@ -490,36 +513,33 @@ impl Gateway {
         self.sync(&file);
     }
 
-    /// Cancel a ticket on the node and take it out of the book. True: it is cancelled.
+    /// Cancel a ticket on the node, and bring the book to what the node then shows of it. True:
+    /// the node shows it cancelled.
+    ///
+    /// The answer to the cancel call is not taken for the invoice's state, yes or no. A yes says
+    /// the call was accepted; whether the invoice is cancelled, or was settled a moment before
+    /// (a settle whose answer was lost, a payment that arrived as the sweep ran), is what a
+    /// lookup says. A ticket taken out of the book on a yes alone, when the node had in fact
+    /// settled it, would be money the seller holds and the buyer was never credited. So: one
+    /// lookup after every cancel that was answered, and the book follows the lookup. With no
+    /// answer to the lookup the ticket stays as it was, and the next sweep asks again.
     fn cancel_on_node(&self, hash: &Hash) -> bool {
-        match self.node.cancel(hash) {
-            Ok(()) => {
-                self.apply(
-                    hash,
-                    &Invoice {
-                        state: InvoiceState::Canceled,
-                        paid_msat: 0,
-                        expiry_height: None,
-                        accept_height: None,
-                    },
-                );
-                true
+        if let Err(NodeError::Unreachable(_)) = self.node.cancel(hash) {
+            return false;
+        }
+        match self.node.lookup(hash) {
+            Ok(Some(inv)) => {
+                self.apply(hash, &inv);
+                inv.state == InvoiceState::Canceled
             }
-            Err(NodeError::Refused(_)) => {
-                // settled meanwhile, or gone: the node's own word decides
-                match self.node.lookup(hash) {
-                    Ok(Some(inv)) => self.apply(hash, &inv),
-                    Ok(None) => {
-                        let mut st = self.lock();
-                        if let Some(rec) = st.book.node_has_none(hash) {
-                            self.journal(&mut st, &[rec]);
-                        }
-                    }
-                    Err(_) => {}
+            Ok(None) => {
+                let mut st = self.lock();
+                if let Some(rec) = st.book.node_has_none(hash) {
+                    self.journal(&mut st, &[rec]);
                 }
                 false
             }
-            Err(NodeError::Unreachable(_)) => false,
+            Err(_) => false,
         }
     }
 
@@ -662,6 +682,26 @@ impl Gateway {
 
     // --- the wire ---------------------------------------------------------------------------------
 
+    /// The address the caps per address count a request under: the socket's peer, or, where the
+    /// runner named a reverse proxy and the header it sets (`http.forwarded_address`), the address
+    /// that proxy says it took the request from. The header is read only on a connection from one
+    /// of the named proxies; anyone else's is just a header, and that request counts under its own
+    /// socket address. Of a list (`a, b, c`) the last entry is the one the proxy wrote. A header
+    /// that is missing, sent twice or not an address counts the request under the proxy's own
+    /// address, with everything else that came that way: the cap is then too tight, never open.
+    fn client_ip(&self, req: &Request) -> Option<IpAddr> {
+        let peer = req.peer.map(|p| p.ip().to_canonical())?;
+        let Some(f) = self.cfg.forwarded.as_ref().filter(|f| f.proxies.contains(&peer)) else {
+            return Some(peer);
+        };
+        let mut named = req.headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case(&f.header));
+        let client = match (named.next(), named.next()) {
+            (Some((_, v)), None) => v.rsplit(',').next().and_then(|a| a.trim().parse::<IpAddr>().ok()),
+            _ => None,
+        };
+        Some(client.map_or(peer, |a| a.to_canonical()))
+    }
+
     fn url(&self, target: &str) -> String {
         format!("{}{target}", self.cfg.public_url)
     }
@@ -671,6 +711,7 @@ impl Gateway {
         &self,
         target: &str,
         route: Option<&Route>,
+        head: bool,
         why: Option<Refusal>,
         session: Option<Value>,
     ) -> (Value, String) {
@@ -703,7 +744,7 @@ impl Gateway {
             })
             .collect();
         // and the lottery, last: a buyer that knows only tickets skips an entry it cannot read
-        accepts.extend(route.and_then(|r| self.lottery_entry(r)));
+        accepts.extend(route.and_then(|r| self.lottery_entry(r, head)));
         m.insert("accepts".into(), Value::Array(accepts));
         if let Some(s) = session {
             m.insert("session".into(), s);
@@ -714,8 +755,8 @@ impl Gateway {
     }
 
     /// The 402 of an unpaid request: the terms.
-    fn unpaid(&self, target: &str, route: &Route) -> Response {
-        let (body, header) = self.required(target, Some(route), None, None);
+    fn unpaid(&self, target: &str, route: &Route, head: bool) -> Response {
+        let (body, header) = self.required(target, Some(route), head, None, None);
         let mut r = json_response(402, &body);
         r.headers.push(("PAYMENT-REQUIRED".into(), header));
         r
@@ -783,6 +824,7 @@ impl Gateway {
         let (body, header) = self.required(
             target,
             route,
+            a.head,
             Some(why),
             Some(self.session_view(&a.session)),
         );
@@ -893,7 +935,7 @@ impl Gateway {
                 ))
             }
             Err(why) => {
-                let (body, header) = self.required(&req.target, route, Some(why), None);
+                let (body, header) = self.required(&req.target, route, req.method == "HEAD", Some(why), None);
                 let mut r = json_response(402, &body);
                 r.headers.push(("PAYMENT-REQUIRED".into(), header));
                 return Err(r);
@@ -904,6 +946,7 @@ impl Gateway {
             seq: pay.seq,
             digest,
             ticket: pay.ticket,
+            head: req.method == "HEAD",
         };
         if let Some(secret) = &pay.secret {
             if let Err(why) = self.take_secret(&a.session, secret) {
@@ -1012,12 +1055,18 @@ impl Gateway {
         };
         let mut entropy = [0u8; 48];
         entropy.copy_from_slice(&xbt_svc::random_bytes(48));
-        // a held ticket takes a slot of the channel it arrives on: the node's channels first
-        let room = if prepaid { Ok(()) } else { self.slot_room() };
+        let addr = addr_name(self.client_ip(req));
+        // the caps on sessions before the node is asked for anything, its channel list included:
+        // a first lock is authenticated by nobody, and one these caps refuse must cost one look
+        // at the book and no call to the node (a gateway that reads its channels makes one, with
+        // a timeout of seconds, for every lock that gets further than this)
+        let fits = self.lock().book.lock_room(&addr, authed.as_ref().map(|a| a.session.as_str()), prepaid);
+        // a held ticket takes a slot of the channel it arrives on: the node's channels next
+        let room = fits.and_then(|_| if prepaid { Ok(()) } else { self.slot_room() });
         let granted = room.and_then(|()| {
             let mut st = self.lock();
             let granted = st.book.lock(
-                &addr_name(req.peer),
+                &addr,
                 authed.as_ref().map(|a| a.session.as_str()),
                 &hashes,
                 prepaid,
@@ -1191,7 +1240,7 @@ impl Gateway {
             .routes
             .iter()
             .map(|r| json!({"path": r.path, "methods": r.methods, "free": r.free, "price": r.price.terms(), "release": r.release.name(),
-                            "lottery": self.lottery_entry(r).is_some()}))
+                            "lottery": self.lottery_entry(r, false).is_some()}))
             .collect();
         let settle: Vec<&str> = [
             (self.cfg.held, SETTLE_ON_USE),
@@ -1300,7 +1349,7 @@ impl Gateway {
         }
         let pay = match self.pay_header(&req) {
             Ok(Some(p)) => p,
-            Ok(None) => return Reply::Whole(self.unpaid(&req.target, route)),
+            Ok(None) => return Reply::Whole(self.unpaid(&req.target, route, req.method == "HEAD")),
             Err(r) => return Reply::Whole(r),
         };
         let a = match self.authenticate(&req, &pay, Some(route)) {
@@ -1338,10 +1387,21 @@ impl Gateway {
         let Some(reserve) = route.price.request_msat.checked_add(first_second) else {
             return Reply::Whole(self.refused(&a, &req.target, Some(route), Refusal::BalanceShort));
         };
-        let first_byte = u64::from(!head_only && route.price.byte_msat > 0);
+        // what the session must be able to pay to be served at all is the same with a body and
+        // without: the request, the first second and the first byte. A HEAD is charged the
+        // request's price alone, which on a route priced by the byte or the second is nothing;
+        // were it also served to a session with nothing, a buyer that asked for tickets and paid
+        // none would read the service's headers (a length, an ETag) for as long as its session
+        // lives. So no answer of a priced route goes to a session that has no balance
+        let first_byte = u64::from(route.price.byte_msat > 0);
+        let needed = route
+            .price
+            .request_msat
+            .saturating_add(route.price.second_msat)
+            .saturating_add(first_byte);
         let charged = {
             let mut st = self.lock();
-            if st.book.chargeable(&a.session, on_pledge) < reserve.saturating_add(first_byte) {
+            if st.book.chargeable(&a.session, on_pledge) < needed {
                 Err(Refusal::BalanceShort)
             } else {
                 st.book.charge(&a.session, reserve, on_pledge, self.now())
@@ -1660,7 +1720,8 @@ impl Handler for Service {
         let gw = &self.0;
         let path = req.path().to_string();
         if let Some(call) = self.session_path(&path) {
-            let loopback = req.peer.is_some_and(|p| p.ip().is_loopback());
+            // behind a named proxy on this machine every socket is loopback: the address it reports decides
+            let loopback = gw.client_ip(&req).is_some_and(|a| a.is_loopback());
             return Reply::Whole(match (req.method.as_str(), call) {
                 ("POST", "lock") => gw.lock_tickets(&req),
                 ("POST", "release" | "cancel" | "status") => gw.session_call(&req, call),
@@ -1679,5 +1740,91 @@ impl Handler for Service {
             return Reply::Whole(gw.services());
         }
         gw.route(req)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xbt402::lottery::DrawError;
+    use xbt402::ticket::PROTOCOL_CODES;
+
+    /// Every code that follows `error(<status>, ` or `"error": ` in `src`, as written there.
+    fn written_codes(src: &str) -> Vec<String> {
+        let literal = |rest: &str| -> Option<String> {
+            let rest = rest.trim_start().strip_prefix('"')?;
+            let end = rest.find('"')?;
+            let code = &rest[..end];
+            (!code.is_empty() && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')).then(|| code.to_string())
+        };
+        let mut out = vec![];
+        for (at, _) in src.match_indices("error(") {
+            let rest = src[at + 6..].trim_start();
+            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+            if digits == 3 {
+                if let Some(c) = rest[digits..].trim_start().strip_prefix(',').and_then(literal) {
+                    out.push(c);
+                }
+            }
+        }
+        // `"error": "code"`, and `"error": if .. { "a" } else { "b" }`: every literal up to the end of the value
+        for (at, _) in src.match_indices("\"error\":") {
+            let rest = &src[at + 8..];
+            // the value ends where the next key starts, or the object does
+            let end = [", \"", ",\"", "})"].iter().filter_map(|e| rest.find(e)).min().unwrap_or(rest.len());
+            let mut v = &rest[..end];
+            while let Some(i) = v.find('"') {
+                if let Some(c) = literal(&v[i..]) {
+                    out.push(c);
+                }
+                v = &v[i + 1..];
+                if let Some(j) = v.find('"') {
+                    v = &v[j + 1..];
+                } else {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn every_code_the_gateway_answers_with_is_one_the_wallet_names() {
+        // a wallet repeats a seller's error only as one of the codes of `xbt402::ticket::PROTOCOL_CODES`;
+        // a code that is not there it reports as nothing at all
+        let mut codes: Vec<String> = vec![];
+        // every refusal of the ticket book: the match has no wildcard, so a refusal added later is
+        // a compile error here until it is listed
+        let tickets = [Refusal::SessionUnknown, Refusal::BadAuth, Refusal::BadSeq(0), Refusal::TicketUnknown, Refusal::TicketNotLocked, Refusal::TicketUsed,
+                       Refusal::TicketExpiring, Refusal::BalanceShort, Refusal::TooManyTickets, Refusal::TooManySessions, Refusal::SlotsShort(1),
+                       Refusal::HeightUnknown, Refusal::PledgeOutstanding];
+        for r in tickets {
+            match r {
+                Refusal::SessionUnknown | Refusal::BadAuth | Refusal::BadSeq(_) | Refusal::TicketUnknown | Refusal::TicketNotLocked | Refusal::TicketUsed
+                | Refusal::TicketExpiring | Refusal::BalanceShort | Refusal::TooManyTickets | Refusal::TooManySessions | Refusal::SlotsShort(_)
+                | Refusal::HeightUnknown | Refusal::PledgeOutstanding => codes.push(r.code().into()),
+            }
+        }
+        // every refusal of the lottery's book, and every refusal of a value the seller's draw can give
+        use crate::lottery::Refusal as Draws;
+        let draws = [DrawError::AmountNotBelowWin, DrawError::ChainSpent, DrawError::PieceUnknown, DrawError::AmountMismatch, DrawError::DrawOutOfOrder,
+                     DrawError::DrawUsed, DrawError::ValueConflict, DrawError::ValueReused];
+        for r in [Draws::SessionUnknown, Draws::BadAuth, Draws::BadSeq(0), Draws::TooManySessions, Draws::WinSize, Draws::WinUnpaid, Draws::ValueMissing,
+                  Draws::TooManyVoids].into_iter().chain(draws.into_iter().map(Draws::Draw)) {
+            codes.push(r.code().into());
+        }
+        // and every code written out in the answers themselves
+        // (of this file, the part before its tests)
+        let own = include_str!("gateway.rs");
+        let own = &own[..own.find("#[cfg(test)]").unwrap_or(own.len())];
+        let written: Vec<String> = [own, include_str!("gateway/draws.rs")].iter().flat_map(|s| written_codes(s)).collect();
+        for want in ["method_not_allowed", "internal", "bad_target", "no_route", "journal", "hash_refused", "node_unavailable", "upstream_unavailable"] {
+            assert!(written.iter().any(|c| c == want), "the scan finds {want}: {written:?}");
+        }
+        codes.extend(written);
+        for c in &codes {
+            assert!(PROTOCOL_CODES.contains(&c.as_str()), "{c} is answered by the gateway and unknown to the wallet");
+            assert_eq!(xbt402::ticket::protocol_code(Some(&json!(c))), c);
+        }
     }
 }

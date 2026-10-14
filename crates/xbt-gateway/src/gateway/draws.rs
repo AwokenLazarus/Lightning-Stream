@@ -10,38 +10,143 @@
 //!    the request digest, which covers a `draw`'s body and so every value in it.
 //! 3. **Inside the window and the grace** ([`Book::blocked`]), on the node's own word about each
 //!    unpaid win ([`Gateway::lottery_refresh`]): a buyer's claim that it paid moves nothing.
-//! 4. **Every piece costs less than the session's win** (`amount_not_below_win` otherwise): a
-//!    dearer piece is paid with tickets.
+//! 4. **Only a route the terms offer by lottery** ([`crate::lottery::LotteryConfig::offers`]: its
+//!    dearest piece is a small part of a win), and every piece below the session's own win
+//!    (`amount_not_below_win` otherwise): a dearer piece is paid with tickets, whatever the
+//!    request's header says.
 //! 5. **Only what the runner allowed reaches the service**, and nothing the service says is read
 //!    for money: a piece is the bytes the gateway itself sent and the seconds it itself counted.
 //! 6. **A piece is a piece once it has left** ([`Book::serve`]): the buyer's value can only follow
 //!    the work it pays for, so the gateway learns no result before it has served.
-//! 7. **A reveal follows the value** ([`Book::draw`]): the chain value of a draw leaves only in the
-//!    answer to the request that brought its value. A session and its chain live in this process
-//!    only, so no restart can take a second value for a draw it has revealed for.
+//! 7. **A reveal follows the value, and the disk** ([`Book::draw`], [`Gateway::lottery_call`]):
+//!    the chain value of a draw leaves only in the answer to the request that brought its value,
+//!    and only once the lottery's journal holds the draw on disk. A session outlives a restart
+//!    with its chain, so this is what keeps a restart from taking a second value for a draw it
+//!    has revealed for. A draw that cannot be written down ends its session, and nothing is
+//!    revealed.
 //! 8. **An invoice per win**, made by the node for the session's win size, with a preimage the
-//!    gateway makes and forgets. A win is paid when the node shows that invoice settled in full.
+//!    gateway makes and forgets. Its hash is on disk before the node is asked for it, so a win
+//!    paid across a restart is seen paid. A win is paid when the node shows that invoice settled
+//!    in full.
 //! 9. **Receipt**: every answer to an authenticated request carries one, signed by the receipt key.
+use std::ops::{Deref, DerefMut};
+use std::path::Path;
+
 use xbt402::lottery::{self, DrawError, Kind, PieceId, RELEASE_AFTER_ANSWER, RELEASE_AFTER_VERIFY};
 
 use super::*;
-use crate::lottery::{Book as Draws, Refusal as Refused, Value32, MAX_BATCH};
+use crate::lottery::{Book as Draws, LotteryConfig, Rec as Logged, Refusal as Refused, Value32, MAX_BATCH};
+
+/// The lottery's journal in the state directory, beside the tickets'.
+pub const JOURNAL: &str = "lottery.jsonl";
 
 /// The lottery's state beside the ticket book: its own lock, so that a draw never waits for a
 /// ticket's settle.
 pub(super) struct Lottery {
-    book: Mutex<Draws>,
+    state: Mutex<Journaled>,
     /// Signalled when a value is taken or a win is paid: answers that wait for either wake.
     changed: Condvar,
 }
 
+/// The book and its journal under one lock: every change is appended in the order it was made.
+pub(super) struct Journaled {
+    book: Draws,
+    store: Store<Logged>,
+}
+
+/// The book, locked. What it logged is appended to the journal when the guard goes, still under
+/// the lock (an append is a write to the file's cache; what must be on disk is synced by the
+/// caller, without the lock, from [`Guard::written`]).
+pub(super) struct Guard<'a> {
+    inner: Option<MutexGuard<'a, Journaled>>,
+}
+
+impl Deref for Guard<'_> {
+    type Target = Draws;
+    fn deref(&self) -> &Draws {
+        &self.inner.as_ref().expect("a guard holds its lock until it goes").book
+    }
+}
+
+impl DerefMut for Guard<'_> {
+    fn deref_mut(&mut self) -> &mut Draws {
+        &mut self.inner.as_mut().expect("a guard holds its lock until it goes").book
+    }
+}
+
+impl Guard<'_> {
+    /// Append what the book has logged; the journal's file, to sync, or None where it could not
+    /// be written (the reason is on standard error).
+    pub(super) fn written(&mut self) -> Option<Arc<std::fs::File>> {
+        let j = self.inner.as_mut()?;
+        let recs = j.book.take_log();
+        // a gateway that is stopping writes nothing more, and says nothing of it
+        if j.store.is_closed() {
+            return None;
+        }
+        match j.store.append(&recs) {
+            Ok(()) => Some(j.store.handle()),
+            Err(e) => {
+                eprintln!("xbt-gateway: the lottery's journal could not be written: {e}");
+                None
+            }
+        }
+    }
+}
+
+impl Drop for Guard<'_> {
+    fn drop(&mut self) {
+        drop(self.written());
+    }
+}
+
 impl Lottery {
-    pub(super) fn new(cfg: crate::lottery::LotteryConfig) -> Self {
-        Self { book: Mutex::new(Draws::new(cfg)), changed: Condvar::new() }
+    /// The lottery of `cfg` with the sessions its journal in `dir` holds, at `now`. `Err`: the
+    /// journal cannot be read whole, and nothing starts. Sessions whose records do not hold
+    /// together are left out, and reported.
+    pub(super) fn open(cfg: LotteryConfig, dir: &Path, now: u64) -> Result<Self, Error> {
+        let (mut store, recs) = Store::open_beside(dir, JOURNAL).map_err(|e| Error::Journal(format!("{JOURNAL}: {e}")))?;
+        let (book, problems) = Draws::restore(cfg, &recs, now);
+        for p in problems {
+            eprintln!("xbt-gateway: {p}; it is forgotten");
+        }
+        store.compact(&book.snapshot()).map_err(|e| Error::Journal(format!("{JOURNAL}: {e}")))?;
+        Ok(Self { state: Mutex::new(Journaled { book, store }), changed: Condvar::new() })
     }
 
-    fn lock(&self) -> MutexGuard<'_, Draws> {
-        self.book.lock().unwrap_or_else(|p| p.into_inner())
+    pub(super) fn lock(&self) -> Guard<'_> {
+        Guard { inner: Some(self.state.lock().unwrap_or_else(|p| p.into_inner())) }
+    }
+
+    /// Wait on [`Lottery::changed`] for at most `dur`, with what was logged written first.
+    fn wait<'a>(&'a self, mut g: Guard<'a>, dur: Duration) -> Guard<'a> {
+        drop(g.written());
+        let Some(inner) = g.inner.take() else { return g };
+        let (inner, _) = self.changed.wait_timeout(inner, dur).unwrap_or_else(|p| p.into_inner());
+        Guard { inner: Some(inner) }
+    }
+
+    /// Nothing more is written: the gateway is stopping.
+    pub(super) fn close(&self) {
+        let mut g = self.lock();
+        drop(g.written());
+        if let Some(j) = g.inner.as_mut() {
+            j.store.close();
+        }
+    }
+
+    /// The journal's maintenance, from the janitor: rewritten when it has grown, and its file to sync.
+    fn tend(&self) -> Arc<std::fs::File> {
+        let mut g = self.lock();
+        drop(g.written());
+        let j = g.inner.as_mut().expect("a guard holds its lock until it goes");
+        if j.store.lines() > COMPACT_AT {
+            let snapshot = j.book.snapshot();
+            if let Err(e) = j.store.compact(&snapshot) {
+                eprintln!("xbt-gateway: the lottery's journal could not be rewritten: {e}");
+            }
+        }
+        j.store.handle()
     }
 }
 
@@ -105,11 +210,16 @@ impl Gateway {
             .is_some_and(|v| v.get("accepted").and_then(|a| a.get("scheme")).and_then(Value::as_str) == Some(lottery::SCHEME))
     }
 
-    /// The lottery entry of a route's 402, where the runner offers the lottery and every piece of
-    /// the route costs less than a win.
-    pub(super) fn lottery_entry(&self, route: &Route) -> Option<Value> {
+    /// The lottery entry of a route's 402, where the runner offers the lottery and the route's
+    /// dearest piece is a small enough part of a win.
+    ///
+    /// `head`: the terms are for a HEAD. A HEAD has no body, so its only piece is the request's
+    /// own; on a route with no price per request it has none, and nothing to draw for. Such a
+    /// request is not offered by lottery ([`Gateway::lottery_route`] refuses it): a lottery
+    /// session costs nothing to open, and would read the service's headers for nothing.
+    pub(super) fn lottery_entry(&self, route: &Route, head: bool) -> Option<Value> {
         let cfg = self.cfg.lottery.as_ref()?;
-        if !cfg.offers(&route.price) {
+        if !cfg.offers(&route.price) || (head && route.price.request_msat == 0) {
             return None;
         }
         let release = match route.release {
@@ -151,10 +261,48 @@ impl Gateway {
     }
 
     /// One round of the janitor for the lottery: quiet sessions are forgotten.
+    /// One round of the janitor for the lottery: quiet sessions are forgotten, each after a last
+    /// look at the node for wins it shows paid, and the journal is put on disk.
     pub(super) fn lottery_tick(&self) {
         if let Some(l) = &self.lottery {
             let now = self.now();
+            let due = l.lock().due(now);
+            for id in &due {
+                self.lottery_settle(l, id);
+            }
             l.lock().sweep(now);
+            let file = l.tend();
+            self.sync(&file);
+        }
+    }
+
+    /// Every session the journal brought back: a win its buyer paid while the gateway was down
+    /// is seen paid now, whether or not that buyer comes back. The node is asked, nothing is made.
+    pub(super) fn lottery_restored(&self) {
+        if let Some(l) = &self.lottery {
+            let ids: Vec<String> = l.lock().ids();
+            for id in &ids {
+                self.lottery_settle(l, id);
+            }
+        }
+    }
+
+    /// Ask the node about each unpaid win of `session` that has an invoice: one it shows settled
+    /// in full is paid. Nothing is cancelled and nothing made.
+    fn lottery_settle(&self, l: &Lottery, session: &str) {
+        let (hashes, win_msat) = {
+            let b = l.lock();
+            match b.session(session) {
+                Some(s) => (s.unpaid.iter().filter(|w| !w.issuing).filter_map(|w| w.invoice.as_ref().map(|i| i.hash)).collect::<Vec<Hash>>(), s.win_msat),
+                None => return,
+            }
+        };
+        for h in hashes {
+            if let Ok(Some(inv)) = self.node.lookup(&h) {
+                if inv.state == InvoiceState::Settled && inv.paid_msat >= win_msat && l.lock().win_paid(session, &h) {
+                    l.changed.notify_all();
+                }
+            }
         }
     }
 
@@ -198,7 +346,7 @@ impl Gateway {
             auth_eq(&lottery::request_auth(key, &pay.session, pay.seq, &digest), &pay.auth)
         });
         match checked {
-            Ok(()) => Ok(Authed { session: pay.session.clone(), seq: pay.seq, digest, ticket: None }),
+            Ok(()) => Ok(Authed { session: pay.session.clone(), seq: pay.seq, digest, ticket: None, head: req.method == "HEAD" }),
             // nothing about a session is told to someone who has not shown its key
             Err(Refused::BadAuth) => Err(error(401, "bad_auth", "the request is not authenticated for this session")),
             Err(Refused::BadSeq(next)) => Err(json_response(402, &json!({"error": "bad_seq", "nextSeq": next}))),
@@ -213,7 +361,7 @@ impl Gateway {
                 let wins: Vec<Value> = s
                     .unpaid
                     .iter()
-                    .map(|w| json!({"draw": w.draw, "invoice": w.invoice.as_ref().map(|(_, inv, _)| inv.as_str())}))
+                    .map(|w| json!({"draw": w.draw, "invoice": w.invoice.as_ref().and_then(|i| i.text.as_deref())}))
                     .collect();
                 json!({"id": session, "nextSeq": s.next_seq, "winMsat": s.win_msat.to_string(), "drawn": s.drawn(), "pending": s.pending(),
                        "servedMsat": s.served_msat.to_string(), "wonMsat": s.won_msat().to_string(), "paidMsat": s.paid_msat().to_string(),
@@ -251,7 +399,7 @@ impl Gateway {
     /// An authenticated request that is not served: the code, the terms again, the session's
     /// numbers and its unpaid wins with their invoices.
     fn draw_refused(&self, l: &Lottery, a: &Authed, target: &str, route: Option<&Route>, code: &str) -> Response {
-        let (mut body, _) = self.required(target, route, None, Some(self.draw_view(l, &a.session)));
+        let (mut body, _) = self.required(target, route, a.head, None, Some(self.draw_view(l, &a.session)));
         body["error"] = code.into();
         let mut r = json_response(402, &body);
         r.headers.push(("PAYMENT-REQUIRED".into(), b64json(&body)));
@@ -270,30 +418,62 @@ impl Gateway {
             }
         };
         let mut paid = false;
+        let settled = |inv: &Invoice| inv.state == InvoiceState::Settled && inv.paid_msat >= win_msat;
         for w in unpaid {
             let lapsed = match &w.invoice {
                 None => true,
-                Some((hash, _, _)) => match self.node.lookup(hash) {
-                    Ok(Some(inv)) if inv.state == InvoiceState::Settled && inv.paid_msat >= win_msat => {
-                        paid |= l.lock().win_paid(session, hash);
+                // another request is asking the node for it at this moment
+                Some(_) if w.issuing => false,
+                Some(i) => match self.node.lookup(&i.hash) {
+                    Ok(Some(inv)) if settled(&inv) => {
+                        paid |= l.lock().win_paid(session, &i.hash);
                         false
                     }
                     // cancelled by the node when its time ran out: it can no longer be paid
-                    Ok(Some(inv)) => inv.state == InvoiceState::Canceled,
+                    Ok(Some(inv)) if inv.state == InvoiceState::Canceled => true,
                     Ok(None) => true,
+                    // known here by its hash alone: the node was asked for it and the answer was lost, to
+                    // a restart or to the node. The buyer may have been sent it, or not; it is cancelled
+                    // on the node, and replaced once the node shows it cancelled, never before
+                    Ok(Some(_)) if i.text.is_none() => {
+                        drop(self.node.cancel(&i.hash));
+                        match self.node.lookup(&i.hash) {
+                            Ok(Some(inv)) if settled(&inv) => {
+                                paid |= l.lock().win_paid(session, &i.hash);
+                                false
+                            }
+                            Ok(Some(inv)) => inv.state == InvoiceState::Canceled,
+                            Ok(None) => true,
+                            Err(_) => false,
+                        }
+                    }
+                    Ok(Some(_)) => false,
                     // no answer: the win is as it was, and is asked about again
                     Err(_) => false,
                 },
             };
+            if !lapsed {
+                continue;
+            }
             // one request at a time asks the node for a win's invoice: a second invoice for one win
             // could be paid and never be seen paid
-            if lapsed && l.lock().claim_invoice(session, w.draw, w.invoice.as_ref().map(|(h, _, _)| h)) {
-                let mut preimage = [0u8; 32];
-                preimage.copy_from_slice(&xbt_svc::random_bytes(32));
-                let made = self.node.add_invoice(&preimage, win_msat, win_blocks, invoice_secs).ok().map(|invoice| (Hash::from(Sha256::digest(preimage)), invoice));
-                l.lock().win_invoiced(session, w.draw, made, self.now());
-                l.changed.notify_all();
-            }
+            let mut preimage = [0u8; 32];
+            preimage.copy_from_slice(&xbt_svc::random_bytes(32));
+            let hash = Hash::from(Sha256::digest(preimage));
+            let now = self.now();
+            let claimed = {
+                let mut b = l.lock();
+                b.claim_invoice(session, w.draw, w.invoice.as_ref().map(|i| &i.hash), hash, now).then(|| b.written())
+            };
+            let Some(file) = claimed else { continue };
+            // the invoice's hash on disk before the node is asked: an invoice the node makes is never
+            // one the journal forgot, so a win paid across a restart is seen paid
+            let made = match file {
+                Some(f) if self.sync(&f) => self.node.add_invoice(&preimage, win_msat, win_blocks, invoice_secs).ok(),
+                _ => None,
+            };
+            l.lock().win_invoiced(session, w.draw, &hash, made);
+            l.changed.notify_all();
         }
         if paid {
             l.changed.notify_all();
@@ -307,7 +487,7 @@ impl Gateway {
             if left.is_zero() {
                 break;
             }
-            b = l.changed.wait_timeout(b, left).unwrap_or_else(|p| p.into_inner()).0;
+            b = l.wait(b, left);
         }
     }
 
@@ -334,7 +514,7 @@ impl Gateway {
                 return false;
             }
             // a payment shows on the node, not on the condvar: look again soon
-            drop(l.changed.wait_timeout(b, left.min(Duration::from_millis(50))).unwrap_or_else(|p| p.into_inner()));
+            drop(l.wait(b, left.min(Duration::from_millis(50))));
         }
     }
 
@@ -372,10 +552,22 @@ impl Gateway {
         let mut out = json!({});
         if call == "draw" {
             let now = self.now();
-            let drawn = l.lock().draw(&a.session, &batch.0, &batch.1, now);
+            let (drawn, file) = {
+                let mut b = l.lock();
+                let d = b.draw(&a.session, &batch.0, &batch.1, now);
+                let file = b.written();
+                (d, file)
+            };
             l.changed.notify_all();
             match drawn {
                 Ok(d) => {
+                    // the draws this answer reveals for are on disk before it leaves: a session outlives a
+                    // restart, and a restart that had lost a draw would take a second value for it from a
+                    // buyer that holds its chain value. A draw that cannot be written down ends the session
+                    if d.reveal.is_some() && !file.is_some_and(|f| self.sync(&f)) {
+                        l.lock().forget(&a.session);
+                        return error(500, "journal", "the gateway could not record the draw: nothing was revealed, and the session is over");
+                    }
                     out["drawn"] = d.reveal.map_or(0, |(i, _)| i).into();
                     out["reveal"] = d.reveal.map_or(Value::Null, |(_, c)| hex::encode(c).into());
                     out["refused"] = d.refused.map_or(Value::Null, |(draw, e)| json!({"draw": draw, "error": e.code()}));
@@ -394,7 +586,8 @@ impl Gateway {
         out["session"] = view;
         let answer = self.draw_answered(&a, json_response(200, &out), 0);
         if call == "close" {
-            l.lock().close(&a.session);
+            let now = self.now();
+            l.lock().close(&a.session, now);
         }
         answer
     }
@@ -414,7 +607,7 @@ impl Gateway {
                 None => return error(400, "bad_request", "winMsat is a decimal string"),
             },
         };
-        let addr = addr_name(req.peer);
+        let addr = addr_name(self.client_ip(req));
         // the caps first: a request they refuse costs no chain
         let (win_msat, chain_draws) = {
             let b = l.lock();
@@ -433,7 +626,7 @@ impl Gateway {
         entropy.copy_from_slice(&xbt_svc::random_bytes(48));
         let opened = {
             let mut b = l.lock();
-            b.open(&entropy, chain, &addr, win_msat, self.now()).map(|id| {
+            b.open(&entropy, seed, chain, &addr, win_msat, self.now()).map(|id| {
                 let anchor = b.anchor(&id).unwrap_or([0; 32]);
                 (id, anchor)
             })
@@ -487,12 +680,13 @@ impl Gateway {
     }
 
     pub(super) fn lottery_route(self: &Arc<Self>, req: Request, route: &Route) -> Reply {
+        let head_only = req.method == "HEAD";
         let Some(l) = &self.lottery else {
-            return Reply::Whole(self.unpaid(&req.target, route));
+            return Reply::Whole(self.unpaid(&req.target, route, head_only));
         };
         let pay = match self.draw_pay_header(&req) {
             Ok(Some(p)) => p,
-            Ok(None) => return Reply::Whole(self.unpaid(&req.target, route)),
+            Ok(None) => return Reply::Whole(self.unpaid(&req.target, route, head_only)),
             Err(r) => return Reply::Whole(r),
         };
         let a = match self.draw_authenticate(l, &req, &pay) {
@@ -503,17 +697,22 @@ impl Gateway {
             return Reply::Whole(error(500, "internal", "a request digest that is not 32 bytes"));
         };
         self.lottery_refresh(l, &a.session);
-        let (blocked, win_msat, dearest) = {
+        let (blocked, win_msat, dearest, offered) = {
             let b = l.lock();
-            (b.blocked(&a.session, self.now()), b.session(&a.session).map_or(0, |s| s.win_msat), b.cfg().dearest_piece(&route.price))
+            (b.blocked(&a.session, self.now()), b.session(&a.session).map_or(0, |s| s.win_msat), b.cfg().dearest_piece(&route.price), b.cfg().offers(&route.price))
         };
         if let Some(why) = blocked {
             return Reply::Whole(self.draw_refused(l, &a, &req.target, Some(route), why.code()));
         }
-        if dearest.is_none_or(|d| d >= win_msat) {
+        // the 402 offers the lottery only for a route whose dearest piece is a small part of a win, and
+        // a buyer that names the lottery all the same is held to that: it is the buyer that reads no 402
+        // whom the rule is for
+        // and a HEAD of a route with no price per request has no piece at all: it is not a draw, and a
+        // session that costs nothing to open is not told the service's headers for it. Its 402 lists
+        // tickets only
+        if !offered || dearest.is_none_or(|d| d >= win_msat) || (head_only && route.price.request_msat == 0) {
             return Reply::Whole(self.draw_refused(l, &a, &req.target, Some(route), DrawError::AmountNotBelowWin.code()));
         }
-        let head_only = req.method == "HEAD";
         let mut answer = match self.upstream.send(&req.method, &req.target, &forwarded(route, &req.headers), &req.body) {
             // a service behind the gateway does not ask for payment through it
             Ok(ans) if ans.status != 402 => ans,
@@ -557,9 +756,25 @@ impl Gateway {
         } else {
             None
         };
-        // the request's own piece: it has left when the answer's head does
-        if self.lottery_serve(l, &m, Kind::Request, 0, m.at_head).is_err() {
-            return Reply::Whole(self.draw_refused(l, &a, &req.target, Some(route), DrawError::ChainSpent.code()));
+        // the request's own piece: it has left when the answer's head does. The window is asked
+        // again as the piece is marked: requests of one session that arrived together each found room
+        if let Err(why) = self.lottery_serve(l, &m, Kind::Request, 0, m.at_head) {
+            let code = match why {
+                Refused::Draw(DrawError::AmountNotBelowWin) => DrawError::AmountNotBelowWin.code(),
+                Refused::Draw(_) => DrawError::ChainSpent.code(),
+                other => other.code(),
+            };
+            return Reply::Whole(self.draw_refused(l, &a, &req.target, Some(route), code));
+        }
+        if no_body && m.at_head == 0 {
+            // the service answered a GET without a body (not modified, no content) on a route with no
+            // price per request: no piece was served, so nothing is owed, and nothing of the service's
+            // is told but that status. A session of draws has no balance to have paid from
+            let mut headers = vec![];
+            if let Some(receipt) = self.draw_receipt(&a.session, a.seq, 0, &a.digest, answer.status, &body_hash(b"")) {
+                headers.push(("PAYMENT-RESPONSE".into(), b64json(&settlement_response(&receipt, &self.cfg.network, "", true))));
+            }
+            return Reply::Stream(Streamed { status: answer.status, headers, length: None, body: Box::new(|_| Ok(())) });
         }
         if no_body {
             // the answer keeps the length the service stated (what a HEAD is asked for)

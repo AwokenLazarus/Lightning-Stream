@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use crate::node::{Channel, Hash, Info, Invoice, InvoiceState, Node, NodeError};
 
 /// The node cancels a held invoice this many blocks before its HTLC expires.
-pub const HOLD_EXPIRY_DELTA: u32 = 18;
+pub const HOLD_EXPIRY_DELTA: u32 = xbt402::ticket::HOLD_EXPIRY_DELTA;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Held {
@@ -23,6 +23,8 @@ struct Held {
     cltv: u32,
     /// An ordinary invoice: a payment that arrives settles it at once, and no HTLC stays pending.
     ordinary: bool,
+    /// How long it may be paid for, as asked: the node's own expiry is the test's to call.
+    expiry_s: u32,
 }
 
 /// One settle call the stand-in answered with success.
@@ -50,6 +52,13 @@ struct State {
     lose_settle_answer: bool,
     /// Streams deliver nothing while this is set: a stream that has fallen behind.
     streams_held: bool,
+    /// A cancel of a settled invoice answers success and changes nothing. Not what the node was
+    /// seen to do: a fault, to show the gateway takes no cancel's yes for the invoice's state.
+    cancel_yes_for_settled: bool,
+    /// The next lookup is answered as if the connection had died.
+    lose_lookup_answer: bool,
+    /// The next ordinary invoice is made, and its answer lost as if the connection had died.
+    lose_invoice_answer: bool,
     pubkey: String,
     networks: Vec<String>,
     /// What `channels` answers (`None`: the node was given no channels macaroon).
@@ -191,6 +200,19 @@ impl StandIn {
         self.lock().lose_settle_answer = true;
     }
 
+    /// From now on a cancel of a settled invoice answers success (and cancels nothing).
+    pub fn cancel_answers_yes_for_settled(&self) {
+        self.lock().cancel_yes_for_settled = true;
+    }
+
+    pub fn lose_next_lookup_answer(&self) {
+        self.lock().lose_lookup_answer = true;
+    }
+
+    pub fn lose_next_invoice_answer(&self) {
+        self.lock().lose_invoice_answer = true;
+    }
+
     pub fn set_identity(&self, pubkey: &str, networks: &[&str]) {
         let mut s = self.lock();
         s.pubkey = pubkey.to_string();
@@ -201,6 +223,11 @@ impl StandIn {
 
     pub fn state_of(&self, hash: &Hash) -> Option<InvoiceState> {
         self.lock().invoices.get(hash).map(|h| h.inv.state)
+    }
+
+    /// The seconds an invoice was made payable for.
+    pub fn expiry_of(&self, hash: &Hash) -> Option<u32> {
+        self.lock().invoices.get(hash).map(|h| h.expiry_s)
     }
 
     pub fn count(&self, state: InvoiceState) -> usize {
@@ -232,7 +259,7 @@ impl Node for StandIn {
         hash: &Hash,
         msat: u64,
         cltv_blocks: u32,
-        _expiry_s: u32,
+        expiry_s: u32,
     ) -> Result<String, NodeError> {
         let mut s = self.call("add_hold")?;
         if s.invoices.contains_key(hash) {
@@ -258,6 +285,7 @@ impl Node for StandIn {
                 msat,
                 cltv: cltv_blocks,
                 ordinary: false,
+                expiry_s,
             },
         );
         self.touch(&mut s);
@@ -269,7 +297,7 @@ impl Node for StandIn {
         preimage: &[u8; 32],
         msat: u64,
         cltv_blocks: u32,
-        _expiry_s: u32,
+        expiry_s: u32,
     ) -> Result<String, NodeError> {
         let mut s = self.call("add_invoice")?;
         let hash: Hash = Sha256::digest(preimage).into();
@@ -291,10 +319,14 @@ impl Node for StandIn {
                 msat,
                 cltv: cltv_blocks,
                 ordinary: true,
+                expiry_s,
             },
         );
         s.preimages.insert(hash, *preimage);
         self.touch(&mut s);
+        if std::mem::take(&mut s.lose_invoice_answer) {
+            return Err(NodeError::Unreachable("connection reset".into()));
+        }
         Ok(format!("lnbcrt-standin-{}", hex::encode(hash)))
     }
 
@@ -337,10 +369,12 @@ impl Node for StandIn {
 
     fn cancel(&self, hash: &Hash) -> Result<(), NodeError> {
         let mut s = self.call("cancel")?;
+        let yes_for_settled = s.cancel_yes_for_settled;
         let Some(h) = s.invoices.get_mut(hash) else {
             return Err(NodeError::Refused("unable to locate invoice".into()));
         };
         match h.inv.state {
+            InvoiceState::Settled if yes_for_settled => return Ok(()),
             InvoiceState::Settled => {
                 return Err(NodeError::Refused("invoice already settled".into()))
             }
@@ -352,7 +386,10 @@ impl Node for StandIn {
     }
 
     fn lookup(&self, hash: &Hash) -> Result<Option<Invoice>, NodeError> {
-        let s = self.call("lookup")?;
+        let mut s = self.call("lookup")?;
+        if std::mem::take(&mut s.lose_lookup_answer) {
+            return Err(NodeError::Unreachable("connection reset".into()));
+        }
         Ok(s.invoices.get(hash).map(|h| h.inv))
     }
 

@@ -1717,3 +1717,145 @@ fn a_gateway_given_a_channels_macaroon_sizes_itself_and_waits_while_a_channel_is
     );
     assert!(started.is_err_and(|e| e.to_string().contains("channels")));
 }
+
+#[test]
+fn a_lock_the_caps_refuse_does_not_ask_the_node_for_its_channels() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = std::sync::Arc::new(StandIn::new(100));
+    node.set_channels(Some(vec![Channel {
+        slots: 483,
+        pending_in: 0,
+    }]));
+    // a gateway that reads its channels, with room for two sessions of two tickets
+    let rig = start_on(
+        dir.path(),
+        node,
+        start_service(),
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1_000_000)),
+        &|v| {
+            v["tickets"] = json!({"max_tickets": 2});
+            v["caps"] = json!({"sessions_per_address": 0, "inbound_slots": 483, "max_sessions": 2});
+            v["node"]["channels_macaroon"] = json!("unused");
+        },
+    );
+    let read = || rig.node.calls("channels");
+    let at_start = read();
+    let mut a = Buyer::new(&rig, 1);
+    a.lock(&rig, 2);
+    let mut b = Buyer::new(&rig, 2);
+    b.lock(&rig, 1);
+    let after_locks = read();
+    assert_eq!(after_locks, at_start + 2, "a lock that is served reads the channels once");
+    // every session place is taken: 50 first locks, authenticated by nobody, are refused on the book alone
+    for n in 0..50u8 {
+        let mut flood = Buyer::new(&rig, 100 + n);
+        let s = flood.fresh_secrets(1);
+        let got = flood.lock_raw(&s);
+        assert_eq!((got.status, got.error().as_str()), (402, "too_many_sessions"));
+    }
+    assert_eq!(read(), after_locks, "a lock the session caps refuse asks the node for nothing");
+    assert_eq!(rig.node.invoices(), 3);
+    // a session at its own cap of tickets: refused as before, and again without the channel list
+    let more = a.fresh_secrets(1);
+    assert_eq!(a.lock_raw(&more).error(), "too_many_tickets");
+    assert_eq!(read(), after_locks);
+    // a lock for a session that is not authenticated never gets as far as either
+    let mut forged = Buyer::new(&rig, 9);
+    forged.session = a.session.clone();
+    forged.seq = a.seq;
+    let s = forged.fresh_secrets(1);
+    assert_eq!(forged.lock_raw(&s).status, 401);
+    assert_eq!(read(), after_locks);
+    // one that the caps let through still reads them: b has room for one more ticket
+    let s = b.fresh_secrets(1);
+    assert_eq!(b.lock_raw(&s).status, 200);
+    assert_eq!(read(), after_locks + 1);
+}
+
+#[test]
+fn a_cancel_the_node_says_yes_to_moves_the_book_only_to_what_a_lookup_then_shows() {
+    let (rig, _d) = start(&|_| {});
+    let mut b = Buyer::new(&rig, 1);
+    let s = b.lock(&rig, 3);
+    let hashes: Vec<String> = s.iter().map(|x| hex::encode(ticket_hash(x))).collect();
+    // ticket 0 is settled on the node and the gateway does not know: the settle's answer was lost,
+    // and the node's stream has fallen behind
+    rig.node.hold_streams(true);
+    rig.node.lose_next_settle_answer();
+    let got = b.release(&s[..1]);
+    assert_eq!(got.json()["refused"][0]["error"], "node_unavailable");
+    assert_eq!(rig.node.state_of(&ticket_hash(&s[0])), Some(InvoiceState::Settled));
+    assert_eq!(b.balance(), 0, "nothing is credited on a settle with no answer");
+    // a node that answers yes to the cancel of a settled invoice. The gateway does not take the
+    // yes for "cancelled": it looks, finds the ticket settled, and credits it
+    rig.node.cancel_answers_yes_for_settled();
+    let got = b.call("cancel", &json!({"hashes": [hashes[0]]}));
+    assert_eq!(got.status, 200);
+    assert_eq!(got.json()["cancelled"], json!([]), "a settled ticket is not reported cancelled");
+    assert_eq!(got.json()["session"]["releasedMsat"], "1000000", "and what the node holds for the seller is the buyer's credit");
+    assert_eq!(b.balance(), 1_000_000);
+    // an honest yes: the lookup shows the ticket cancelled, and it leaves the book
+    let got = b.call("cancel", &json!({"hashes": [hashes[1]]}));
+    assert_eq!(got.json()["cancelled"], json!([hashes[1]]));
+    assert_eq!(rig.node.state_of(&ticket_hash(&s[1])), Some(InvoiceState::Canceled));
+    // a yes, and then no answer to the lookup: the ticket stays in the book as it was, to be asked about again
+    rig.node.lose_next_lookup_answer();
+    let got = b.call("cancel", &json!({"hashes": [hashes[2]]}));
+    assert_eq!(got.json()["cancelled"], json!([]));
+    assert_eq!(b.status()["tickets"].as_array().unwrap().len(), 1, "still the session's ticket");
+    let got = b.call("cancel", &json!({"hashes": [hashes[2]]}));
+    assert_eq!(got.json()["cancelled"], json!([hashes[2]]));
+    assert_eq!(rig.gw.stats().held_tickets, 0);
+    rig.node.hold_streams(false);
+    assert_eq!(b.balance(), 1_000_000, "one ticket credited, once");
+}
+
+#[test]
+fn a_session_that_paid_nothing_is_told_nothing_of_a_priced_route_not_even_by_a_head() {
+    let (rig, _d) = start(&|_| {});
+    // a session with tickets asked for and none paid: it exists, is authenticated, and has no balance
+    let mut b = Buyer::new(&rig, 1);
+    let s = b.fresh_secrets(1);
+    assert_eq!(b.lock_raw(&s).status, 200);
+    let head = |b: &mut Buyer, target: &str| {
+        let sig = b.sign("HEAD", target, b"", None, None);
+        let got = http(&rig.addr, "HEAD", target, &[("PAYMENT-SIGNATURE", &sig)], b"", None);
+        b.used(&got);
+        got
+    };
+    // a route priced by the byte, one priced by the second, one priced by the request: no answer of
+    // the service's, no length and no ETag of its, and the service is not asked
+    for target in ["/files/1000", "/timed/8192", "/whole/10"] {
+        let got = head(&mut b, target);
+        assert_eq!(got.status, 402, "{target}");
+        assert_eq!(unb64json(got.header("PAYMENT-REQUIRED").unwrap()).unwrap()["error"], "balance_short", "{target}");
+        assert!(got.header("ETag").is_none() && got.header("Content-Length") != Some("1000"), "{target}");
+        assert_eq!(got.receipt(&KEY(&rig))["charged"], "0");
+    }
+    assert_eq!(rig.hits(), 0);
+    // the ticket is paid and held, and still nothing was released: the same
+    assert!(rig.node.pay(&ticket_hash(&s[0])));
+    b.wait_state(&s, "ACCEPTED");
+    assert_eq!(head(&mut b, "/files/1000").status, 402);
+    assert_eq!(rig.hits(), 0);
+    // released: the session has a balance, and a HEAD costs it nothing, as before
+    assert_eq!(b.release(&s).status, 200);
+    let got = head(&mut b, "/files/1000");
+    assert_eq!((got.status, got.header("Content-Length"), got.header("ETag")), (200, Some("1000"), Some("\"e\"")));
+    assert_eq!(got.receipt(&KEY(&rig))["charged"], "0");
+    assert_eq!((rig.hits(), b.balance()), (1, 1_000_000));
+    // a balance that covers the request but not the body's first second is no balance for that route
+    let (tight, _d2) = start(&|v| {
+        for r in v["routes"].as_array_mut().unwrap() {
+            if r["path"] == "/timed/" {
+                r["price"] = json!({"second_msat": 2_000_000});
+            }
+        }
+    });
+    let mut c = Buyer::new(&tight, 2);
+    let s = c.lock(&tight, 1);
+    assert_eq!(c.release(&s).status, 200);
+    let sig = c.sign("HEAD", "/timed/8192", b"", None, None);
+    let got = http(&tight.addr, "HEAD", "/timed/8192", &[("PAYMENT-SIGNATURE", &sig)], b"", None);
+    assert_eq!((got.status, tight.hits()), (402, 0), "one ticket does not pay for a second of 2,000 sat");
+}
