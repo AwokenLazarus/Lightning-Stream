@@ -153,12 +153,14 @@ impl Terms {
 }
 
 /// The error codes of the ticket scheme and of the lottery beside it ([`crate::lottery`]): what a
-/// gateway answers a payer with.
-pub const PROTOCOL_CODES: [&str; 32] = [
+/// gateway answers a payer with. Every code the gateway in this tree can answer with is here (a
+/// test there holds it to that), so that a payer can name each.
+pub const PROTOCOL_CODES: [&str; 34] = [
     "amount_mismatch", "amount_not_below_win", "bad_auth", "bad_payment", "bad_request", "bad_seq", "bad_target", "balance_short", "chain_spent",
-    "draw_out_of_order", "draw_used", "hash_refused", "journal", "no_route", "node_unavailable", "piece_unknown", "pledge_outstanding",
-    "session_unknown", "slots_short", "ticket_expiring", "ticket_not_locked", "ticket_unknown", "ticket_used", "too_many_sessions",
-    "too_many_tickets", "too_many_voids", "upstream_unavailable", "value_conflict", "value_missing", "value_reused", "win_size", "win_unpaid",
+    "draw_out_of_order", "draw_used", "hash_refused", "internal", "journal", "method_not_allowed", "no_route", "node_unavailable", "piece_unknown",
+    "pledge_outstanding", "session_unknown", "slots_short", "ticket_expiring", "ticket_not_locked", "ticket_unknown", "ticket_used",
+    "too_many_sessions", "too_many_tickets", "too_many_voids", "upstream_unavailable", "value_conflict", "value_missing", "value_reused",
+    "win_size", "win_unpaid",
 ];
 
 /// The seller's error code as one of the scheme's own ([`PROTOCOL_CODES`]), or `""`. The string
@@ -249,6 +251,18 @@ mod tests {
         assert_eq!(a["extra"]["maxTickets"], 2);
         let b = t.accepts(2500, "with-request", SETTLE_ON_ARRIVAL, &json!({"requestMsat": "2500"}));
         assert_eq!(b["extra"]["settle"], "on-arrival");
+    }
+
+    #[test]
+    fn the_codes_are_sorted_once_each_and_a_seller_writes_none_of_its_own() {
+        assert!(PROTOCOL_CODES.windows(2).all(|w| w[0] < w[1]), "sorted, and none twice");
+        assert!(PROTOCOL_CODES.iter().all(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')));
+        for c in PROTOCOL_CODES {
+            assert_eq!(protocol_code(Some(&json!(c))), c);
+        }
+        assert_eq!(protocol_code(Some(&json!("Internal"))), "");
+        assert_eq!(protocol_code(Some(&json!("a seller's own words"))), "");
+        assert_eq!(protocol_code(Some(&json!(7))), "");
     }
 
     #[test]

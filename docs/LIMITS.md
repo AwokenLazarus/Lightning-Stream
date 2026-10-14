@@ -835,8 +835,10 @@ untrusted field.
 | every rail's HTTP | the transport's error text went into `reason`: it quotes a status that is not a number (three characters) and, on the ticket rail, the URL with the seller's session path | a fixed sentence per kind of failure |
 
 - A seller's error code is its words unless it is one of the protocol's own
-  (`xbt402::ticket::PROTOCOL_CODES`). A code the shipped gateway adds later is not named by an
-  older wallet: it reads as no code.
+  (`xbt402::ticket::PROTOCOL_CODES`). Every code the gateway of this tree answers with is on
+  that list, and a test of the gateway's reads each one out of its source to hold it there
+  (`internal` and `method_not_allowed` were missing until 2026-10-14, and read as no code). A
+  code the shipped gateway adds later is not named by an older wallet: it reads as no code.
 - Numbers are not words, and nor are hashes, keys, ids and signatures of a fixed hex shape: a
   result gives them as they are (`payment_hash`, a session id, a receipt's amounts).
 - One character can still come through: a field that should be hex and is not is reported by the

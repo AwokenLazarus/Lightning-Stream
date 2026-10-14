@@ -1742,3 +1742,89 @@ impl Handler for Service {
         gw.route(req)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xbt402::lottery::DrawError;
+    use xbt402::ticket::PROTOCOL_CODES;
+
+    /// Every code that follows `error(<status>, ` or `"error": ` in `src`, as written there.
+    fn written_codes(src: &str) -> Vec<String> {
+        let literal = |rest: &str| -> Option<String> {
+            let rest = rest.trim_start().strip_prefix('"')?;
+            let end = rest.find('"')?;
+            let code = &rest[..end];
+            (!code.is_empty() && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')).then(|| code.to_string())
+        };
+        let mut out = vec![];
+        for (at, _) in src.match_indices("error(") {
+            let rest = src[at + 6..].trim_start();
+            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+            if digits == 3 {
+                if let Some(c) = rest[digits..].trim_start().strip_prefix(',').and_then(literal) {
+                    out.push(c);
+                }
+            }
+        }
+        // `"error": "code"`, and `"error": if .. { "a" } else { "b" }`: every literal up to the end of the value
+        for (at, _) in src.match_indices("\"error\":") {
+            let rest = &src[at + 8..];
+            // the value ends where the next key starts, or the object does
+            let end = [", \"", ",\"", "})"].iter().filter_map(|e| rest.find(e)).min().unwrap_or(rest.len());
+            let mut v = &rest[..end];
+            while let Some(i) = v.find('"') {
+                if let Some(c) = literal(&v[i..]) {
+                    out.push(c);
+                }
+                v = &v[i + 1..];
+                if let Some(j) = v.find('"') {
+                    v = &v[j + 1..];
+                } else {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn every_code_the_gateway_answers_with_is_one_the_wallet_names() {
+        // a wallet repeats a seller's error only as one of the codes of `xbt402::ticket::PROTOCOL_CODES`;
+        // a code that is not there it reports as nothing at all
+        let mut codes: Vec<String> = vec![];
+        // every refusal of the ticket book: the match has no wildcard, so a refusal added later is
+        // a compile error here until it is listed
+        let tickets = [Refusal::SessionUnknown, Refusal::BadAuth, Refusal::BadSeq(0), Refusal::TicketUnknown, Refusal::TicketNotLocked, Refusal::TicketUsed,
+                       Refusal::TicketExpiring, Refusal::BalanceShort, Refusal::TooManyTickets, Refusal::TooManySessions, Refusal::SlotsShort(1),
+                       Refusal::HeightUnknown, Refusal::PledgeOutstanding];
+        for r in tickets {
+            match r {
+                Refusal::SessionUnknown | Refusal::BadAuth | Refusal::BadSeq(_) | Refusal::TicketUnknown | Refusal::TicketNotLocked | Refusal::TicketUsed
+                | Refusal::TicketExpiring | Refusal::BalanceShort | Refusal::TooManyTickets | Refusal::TooManySessions | Refusal::SlotsShort(_)
+                | Refusal::HeightUnknown | Refusal::PledgeOutstanding => codes.push(r.code().into()),
+            }
+        }
+        // every refusal of the lottery's book, and every refusal of a value the seller's draw can give
+        use crate::lottery::Refusal as Draws;
+        let draws = [DrawError::AmountNotBelowWin, DrawError::ChainSpent, DrawError::PieceUnknown, DrawError::AmountMismatch, DrawError::DrawOutOfOrder,
+                     DrawError::DrawUsed, DrawError::ValueConflict, DrawError::ValueReused];
+        for r in [Draws::SessionUnknown, Draws::BadAuth, Draws::BadSeq(0), Draws::TooManySessions, Draws::WinSize, Draws::WinUnpaid, Draws::ValueMissing,
+                  Draws::TooManyVoids].into_iter().chain(draws.into_iter().map(Draws::Draw)) {
+            codes.push(r.code().into());
+        }
+        // and every code written out in the answers themselves
+        // (of this file, the part before its tests)
+        let own = include_str!("gateway.rs");
+        let own = &own[..own.find("#[cfg(test)]").unwrap_or(own.len())];
+        let written: Vec<String> = [own, include_str!("gateway/draws.rs")].iter().flat_map(|s| written_codes(s)).collect();
+        for want in ["method_not_allowed", "internal", "bad_target", "no_route", "journal", "hash_refused", "node_unavailable", "upstream_unavailable"] {
+            assert!(written.iter().any(|c| c == want), "the scan finds {want}: {written:?}");
+        }
+        codes.extend(written);
+        for c in &codes {
+            assert!(PROTOCOL_CODES.contains(&c.as_str()), "{c} is answered by the gateway and unknown to the wallet");
+            assert_eq!(xbt402::ticket::protocol_code(Some(&json!(c))), c);
+        }
+    }
+}
