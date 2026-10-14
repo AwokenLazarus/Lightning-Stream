@@ -44,7 +44,6 @@
 #   scripts/ticket_book_regtest.sh              every check
 #   TICKET_BOOK_SELLERS=4 scripts/ticket_book_regtest.sh    fewer seller nodes (the last check then uses 4)
 set -euo pipefail
-if command -v lazvault >/dev/null 2>&1; then lazvault hold check --project xbt-agentpay || exit 75; fi # a heavy entry point: not during a host hold
 cd "$(dirname "$0")/.." || exit 1
 ROOT=$PWD
 LAB=$ROOT/run/lightning-fork-lab

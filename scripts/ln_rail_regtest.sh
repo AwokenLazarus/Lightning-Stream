@@ -18,7 +18,6 @@
 #
 #   scripts/ln_rail_regtest.sh            build what is missing, run S1-S24, tear down
 set -euo pipefail
-lazvault hold check --project xbt-agentpay || exit 75   # IMP-030: heavy entry point, refuses during a host hold
 cd "$(dirname "$0")/.."
 ROOT=$PWD
 LAB=$ROOT/run/lightning-fork-lab

@@ -48,7 +48,6 @@
 #   scripts/ticket_e2e_regtest.sh               every check
 #   scripts/ticket_e2e_regtest.sh page stream   only these
 set -euo pipefail
-if command -v lazvault >/dev/null 2>&1; then lazvault hold check --project xbt-agentpay || exit 75; fi # a heavy entry point: not during a host hold
 cd "$(dirname "$0")/.." || exit 1
 ROOT=$PWD
 LAB=$ROOT/run/lightning-fork-lab

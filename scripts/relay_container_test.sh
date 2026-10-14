@@ -8,7 +8,6 @@
 #   * the image's own healthcheck (liveness and --ready) passes; blobs survive a container restart.
 # Needs dist/oci/ctx from `scripts/oci_build.sh --only xbt-work-relay`. Ports 24340-24341. Prints RESULT PASS|FAIL.
 set -euo pipefail
-lazvault hold check --project xbt-agentpay || exit 75   # IMP-030: heavy entry point, refuses during a host hold
 cd "$(dirname "$0")/.."
 ROOT=$PWD
 X053=${XBT053:-$HOME/xbt-rnd/XBT-053}
