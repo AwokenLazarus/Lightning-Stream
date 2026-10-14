@@ -7,9 +7,12 @@
 #     (the driver)   (MCP, stdio)    (the wallet)   buyer     hop     seller    (one a seller each)    (python3 -m http.server)
 #
 # The file server is stock and unchanged; the signer, the MCP server and the gateways are the
-# release binaries of this tree, with the wallet's lottery policy and the gateway's lottery terms
-# as they ship (wins of 64 sat, a window of 8 pieces, a grace of 30 s and 64 pieces, 2 unpaid
-# wins); the nodes are Lightning Fork nodes, the hop and the seller started with
+# release binaries of this tree, with the lottery's own rules as they ship on both sides (wins of
+# 64 sat, a window of 8 pieces, a grace of 30 s and 64 pieces, 2 unpaid wins). Not as shipped, in
+# scripts/lottery/drive.py: the wallet's velocity_max, max_sellers, max_new_sellers_per_min,
+# max_sends_per_hour, max_answer_s and budgets; the gateways' cap on sessions from one address
+# (none: every buyer comes from 127.0.0.1), the age of a block height they accept (30 s) and the
+# swarm gateways' tick (5 s); the nodes are Lightning Fork nodes, the hop and the seller started with
 # --default-remote-max-htlcs=30, so that the buyer's channel and the seller's inbound channel carry
 # 30 pending payments each: the slot count of a channel with a Core Lightning node at its default.
 # A stand-in for that number only: no Core Lightning node is in this lab. The 100 sellers of the

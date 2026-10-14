@@ -115,8 +115,9 @@ class Wallet(e2e.Wallet):
             "regtest_mine": False,
             "anchor_interval_s": 3600,
             "ln": {"enabled": True, "split_height": e2e.SPLIT},
-            # the lottery as shipped (wins of 64 sat through a hop, 1 in 4 at the most, 8 values ahead). What the owner
-            # raised: the sellers a task may pay at once, and how many may be new in a minute
+            # the lottery as shipped (wins of 64 sat through a hop, 1 in 4 at the most, 8 values ahead). Not as shipped
+            # (shipped value in brackets): the sellers a task may pay at once (15) and how many may be new in a minute
+            # (30), max_sends_per_hour (1,200), max_answer_s (50), velocity_max above (8), and a lab wallet's budgets
             "tickets": {"enabled": True, "max_sellers": SELLERS + 8, "max_new_sellers_per_min": 4 * SELLERS, "max_sends_per_hour": 100_000, "max_answer_s": 120,
                         "tasks": {"film": {"budget_sats": 3_000_000, "max_sellers": SELLERS + 8}}},
         }

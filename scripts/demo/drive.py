@@ -11,8 +11,9 @@ Run by scripts/demo_film.sh, which builds the binaries and brings up the chain n
                                                                                            +== xbt-gateway x 20 ---- a file server
                                                                                                (the swarm: one a seller each)
 
-What is real: the signer, the MCP server and the gateways (the release binaries of this tree, the
-wallet's ticket policy and the gateways' caps as they ship), four Lightning Fork nodes whose
+What is real: the signer, the MCP server and the gateways (the release binaries of this tree; the
+ticket and lottery rules are the shipped ones, and docs/DEMO.md, "What the demo's settings change",
+lists every setting this file sets to something else), four Lightning Fork nodes whose
 channels carry 30 pending payments each, and the service: a stock Jellyfin in its own container,
 set up over its own API as a node runner would in its web pages (a library, a user without admin
 rights), or a Jellyfin that already runs somewhere (DEMO_JELLYFIN_URL), or, with DEMO_SERVICE=files,
@@ -325,8 +326,11 @@ class Wallet(e2e.Wallet):
             "regtest_mine": False,
             "anchor_interval_s": 3600,
             "ln": {"enabled": True, "split_height": e2e.SPLIT},
-            # tickets and the lottery as shipped (2 tickets held with a seller, wins of 64 sat through a hop). What the owner
-            # set: a budget for each of two tasks, and for the swarm how many sellers a task may pay at once
+            # Not the shipped policy. Shipped and kept: 2 tickets held with a seller, 15 held in all, tickets of 1,000 sat,
+            # wins of 64 sat through a hop. Changed here (shipped value in brackets): velocity_max above (8), max_sellers
+            # (15: the swarm pays 20 at once), max_new_sellers_per_min (30), max_sends_per_hour (1,200), max_answer_s (50);
+            # the budgets, max_per_tx_sats and human_threshold_sats above are a lab wallet's, lower than shipped;
+            # split_window_s is 0 (600) and anchor_interval_s 3600 (60). docs/DEMO.md has the table
             "tickets": {"enabled": True, "max_sellers": SWARM + 8, "max_new_sellers_per_min": 200, "max_sends_per_hour": 100_000, "max_answer_s": 120,
                         "tasks": {"film": {"budget_sats": 1_000_000}, "swarm": {"budget_sats": 100_000, "max_sellers": SWARM + 8}}},
         }
@@ -341,8 +345,11 @@ def write_gateway(name: str, port: int, public: str, node: str, upstream: str, r
         "chain": "regtest",
         "network": NETWORK[0],
         "node": {"rest": f"https://127.0.0.1:{lab.PORT[node]}", "tls_cert": f"{RUN}/{node}.tls.cert", "macaroon": f"{RUN}/{node}.invoices.macaroon", "info_macaroon": f"{RUN}/{node}.info.macaroon"},
-        # every buyer of this lab comes from 127.0.0.1: no cap on sessions from one address. The rest as shipped
+        # every buyer of this lab comes from 127.0.0.1: no cap on sessions from one address (shipped: 2). The other
+        # caps as shipped
         "caps": {"sessions_per_address": 0},
+        # not as shipped: a block height may be 30 s old (shipped: 10), and the swarm's gateways tick every 5 s
+        # (shipped and here for the film's: 500 ms)
         "times": {"height_max_age_secs": 30, "tick_ms": tick_ms},
         "routes": routes,
     }
@@ -819,7 +826,7 @@ def whole_film(label: str) -> dict[str, Any]:
     out = {"segments": n["segments"], "of": len(p.segments), "film_seconds": round(p.length(), 1), "MiB": round((r1["bytes"] - r0["bytes"]) / MIB, 1), "price_sats": round(price_msat / 1000, 1),
            "tickets_released": r1["tickets_released"] - r0["tickets_released"], "seconds": round(secs, 1), "failed_requests": n["failed_requests"], **d,
            "pending_on_the_buyers_channel": pending.report(), "left_with_the_seller_msat": [s.get("left_with_the_seller_msat") for s in stopped.get("sessions", [])]}
-    check(f"{label}: the whole film arrives, every segment, and what the buyer's node paid for it is the tickets released: the price rounded up to a ticket, and never more than 2 tickets held ahead",
+    check(f"{label}: the whole film arrives, every segment, and what the buyer's node paid for it is the tickets released: the price rounded up to a ticket, and never more than 3 payments pending on the buyer's channel (2 tickets held ahead, and one released and not yet settled)",
           n["segments"] == len(p.segments) and not n["failed_requests"] and d["paid_sats"] * 1000 == out["tickets_released"] * TICKET_MSAT
           and 0 <= d["paid_sats"] * 1000 - price_msat < TICKET_MSAT and out["pending_on_the_buyers_channel"]["most_pending_at_once"] <= 3, out)
     measured(f"{label}_whole_film", out)
@@ -947,7 +954,7 @@ def film() -> None:
         p.close()
     capture("2-the-readout-while-it-plays", [f"{about['title']}: {about['mbit_per_s']} Mbit/s, {SAT_PER_MIB} sat a MiB, tickets of 1,000 sat, one routing hop. A line every 5 s.", ""] + ro.lines)
     m1 = money()
-    check("film: the viewer stops: the 2 tickets that were held and not spent are cancelled by the seller and are back on the buyer's node within 5 s; what is left of the last ticket stays with the seller",
+    check("film: the viewer stops: the 2 tickets that were held and not spent are cancelled by the seller and are back on the buyer's node within 6 s; what is left of the last ticket stays with the seller",
           stop_s <= 6.0 and all(s.get("seller_took_the_cancel") and s.get("still_locked") == [] for s in stopped.get("sessions", [{}])) and m1["in_flight"] == 0,
           {"seconds": round(stop_s, 2), "held_before": {"tickets": last["held_tickets"], "sats": last["held_sats"]}, "stop": stopped.get("sessions"), "wait_s": round(back, 2)})
     capture("3-the-stop", ["What stopping returned, as the proxy reports it:", ""] + json.dumps(stopped, indent=1).splitlines()
@@ -1092,7 +1099,7 @@ def swarm() -> None:
                "seconds": round(secs, 1), "MiB": round(film_file.size / MIB, 1), "pending_on_the_buyers_channel": p, "bad": bad[:3]}
         check(f"swarm: the film's file arrives whole in {pieces} pieces of 256 KiB from {SWARM} sellers at once, every piece its own hash, each piece one draw, paid by the wallet's own rule with draws",
               not bad and h.hexdigest() == film_file.sha256 and out["draws"] == pieces and sum(r["pieces"] for r in results) == pieces, out)
-        check(f"swarm: {SWARM} sellers are paid from the one 30-slot channel: every win is one payment of the win's size, none failed, never more than 8 on the channel at once, and nothing is held between wins",
+        check(f"swarm: {SWARM} sellers are paid from the one 30-slot channel: every win is one payment of the win's size, none failed, never more than 9 pending on the channel at once (the wallet sends 8 at a time), and nothing is held between wins",
               d["payments"] == wins and sum(r["wins_paid"] for r in results) == wins and d["payments_that_came_back"] == 0 and len(win_msat) <= 1 and d["paid_sats"] * 1000 == wins * (win_msat[0] if win_msat else 0)
               and p["most_pending_at_once"] <= 9 and lab.pending_htlcs(BUYER) == 0, {**d, **p})
         check("swarm: after the swarm the buyer's node, the sellers' node and the wallet's ledger agree, to the millisat", agrees(m1), m1)

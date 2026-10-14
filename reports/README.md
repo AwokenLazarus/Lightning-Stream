@@ -67,6 +67,11 @@ first run fetches and builds the Lightning Fork lab under `run/`, which is why `
 by git and this folder is not. The head of each script lists its ports and settings. Times
 differ from host to host, and the lottery's wins differ from run to run: a draw is random.
 
+The tables in the documents were written from earlier runs of the same scripts, most of them on
+2026-10-13, whose reports these runs overwrote. A figure that differs from run to run (a time,
+or anything the lottery draws) is therefore not the same in a document and in its report here.
+The documents have not been compared with these reports figure by figure.
+
 A figure in the documents that is marked as measured before 2026-10-13, or as measured with the
 Core Lightning fork, comes from an earlier run or from a lab whose driver is not in this tree,
 and has no report here.

@@ -1128,9 +1128,16 @@ Each line below was found by building both sides and running them.
 On regtest on 2026-10-13, by `scripts/lottery_regtest.sh` (30 checks): the release binaries of
 this tree (the wallet's signer, its MCP server, the gateway), a stock file server, three
 Lightning Fork nodes (buyer, one routing hop, seller) on one host over loopback, the buyer's
-channel and the seller's inbound channel opened with 30 slots. The wallet's lottery policy and
-the gateway's lottery terms as they ship, with pieces of 64 KiB. No Core Lightning node. The
-numbers are one run's; a draw is random, so the wins differ from run to run.
+channel and the seller's inbound channel opened with 30 slots. The lottery's own rules are the
+shipped ones on both sides (wins of 64 sat through a hop, odds of 1 in 4 at the most, 8 values
+ahead; a window of 8 pieces, a grace of 30 s and 64 pieces, 2 unpaid wins), with pieces of
+64 KiB. Other settings of the lab are not the shipped ones. Its wallet policy has
+`velocity_max` 1,000 (shipped: 8), `max_sellers` 108 and `max_new_sellers_per_min` 400 for the
+100 sellers (15 and 30), `max_sends_per_hour` 100,000 (1,200), `max_answer_s` 120 (50) and a lab
+wallet's budgets; its gateways have no cap on sessions from one address, since every buyer
+comes from 127.0.0.1 (4), take a block height up to 30 s old (10), and those of the swarm tick
+every 5 s (0.5). No Core Lightning node. The numbers are one run's; a draw is random, so the
+wins differ from run to run. The report of the latest run is `reports/lottery_regtest.json`.
 
 | What | Measured | Check |
 |---|---|---|
@@ -1461,7 +1468,10 @@ answered `slots_short`. Otherwise it releases a held ticket. A seller that offer
 tickets is, in those cases, not paid: the call says why and how long to wait, or the next rail of
 the 402 is tried (section 12).
 
-**Measured on the lab on 2026-10-13**, with the wallet and the gateway as they ship, Lightning Fork
+**Measured on the lab on 2026-10-13**, with the pool, the caps on held tickets and the ticket size
+as they ship (the lab's policies also raise `velocity_max`, `max_sends_per_hour` and
+`max_answer_s`, lift the gateway's cap on sessions from one address, and shorten some of its
+waits: each script's driver has the values), Lightning Fork
 nodes, and the buyer's channel and the seller's inbound channel opened with 30 slots (one host,
 loopback, one hop, the release binaries; no Core Lightning node). Each line names its script.
 
