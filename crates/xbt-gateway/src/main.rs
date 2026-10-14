@@ -20,6 +20,11 @@ fn run(args: &[String]) -> Result<(), String> {
         _ => return Err("usage: xbt-gateway [--check] <config.json>".into()),
     };
     let cfg = Config::load(std::path::Path::new(path)).map_err(|e| e.to_string())?;
+    // mainnet is asked for twice in the file (`chain` and `mainnet_ack`); a runner who did is told,
+    // at every start and every check, what is known to be open there
+    for line in cfg.mainnet_notice() {
+        eprintln!("xbt-gateway: {line}");
+    }
     let read = |p: &std::path::Path| std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()));
     let (invoice, info) = (read(&cfg.node.macaroon)?, read(&cfg.node.info_macaroon)?);
     // each macaroon holds its own permissions and, on mainnet, nothing else: a gateway that is

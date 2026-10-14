@@ -56,9 +56,21 @@ target/release/xbt-gateway --check gateway.json   # reads the config and the mac
 target/release/xbt-gateway gateway.json
 ```
 
-`gateway.example.json` is a config for mainnet. Every key is checked: an unknown one stops the
-start. For a public seller, put a TLS reverse proxy in front and set `public_url` to the origin
-buyers use.
+`gateway.example.json` is a config for regtest. Every key is checked: an unknown one stops the
+start.
+
+- **The chain.** A file that names no `chain` is a regtest file. Every chain but `main` also
+  names its `network`: `lightning:` and the first 32 hex characters of the hash of that chain's
+  block 101 (`getblockhash 101`); the example's is a placeholder. Mainnet is asked for twice:
+  `"chain": "main"` and `"mainnet_ack": "real funds, software that has run on regtest only"`,
+  word for word. With one and not the other nothing starts. A gateway that starts on mainnet
+  prints, at every start and every `--check`, a short list of what is known to be open there;
+  the whole of it is `docs/LIMITS.md`.
+- **Where it listens.** The gateway speaks plain HTTP. It listens on a loopback address
+  (`127.0.0.1` or `[::1]`, written as an address), or on any other address only when
+  `public_url` is an `https` origin: that is how you say a TLS reverse proxy stands in front.
+  For a public seller, run that proxy and set `public_url` to the origin buyers use. The
+  gateway cannot check that the proxy is there.
 
 ## Pricing a piece
 

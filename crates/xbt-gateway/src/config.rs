@@ -15,6 +15,23 @@ use crate::lottery::LotteryConfig;
 use crate::price::Price;
 use crate::Error;
 
+/// What `mainnet_ack` must say, word for word, before a config with `chain: "main"` is taken.
+pub const MAINNET_ACK: &str = "real funds, software that has run on regtest only";
+
+/// What a gateway prints when it starts on mainnet: the things its runner should know before a
+/// buyer does. A short fixed text; the whole of it, with the measurements, is `docs/LIMITS.md`.
+pub const MAINNET_NOTICE: [&str; 9] = [
+    "chain main: this gateway has run on regtest only. Before you rely on it, read docs/LIMITS.md. In short:",
+    "- A held ticket of 1,000 sat can be below a channel's dust limit at mainnet fee rates on a channel without anchors: it then has no output there, and is lost to the miners if that channel is force-closed while it is held. The gateway does not read its channels' dust limits.",
+    "- Claiming settled tickets on chain after a force close cost 900 to 1,700 sat for three tickets at 1 sat/vB; at higher fee rates one ticket costs more to claim than it is worth.",
+    "- Held tickets take pending-payment slots of every channel on their route for no fee, on your node and on the routing nodes before it. Nothing but this software keeps buyers to half of a channel's slots.",
+    "- A lock costs a buyer nothing until it pays: whoever reaches the gateway from enough addresses can take every session place with invoices it never pays.",
+    "- With a lottery section you serve first, and nothing makes a buyer pay a win.",
+    "- The gateway speaks an lnd-family node's REST interface and no other; a Core Lightning seller is not supported.",
+    "- The gateway speaks plain HTTP: buyers must reach it through a TLS proxy, with public_url set to the https origin they use.",
+    "- A buyer's unused balance is trusted to you, and a lost state directory loses every session, key and balance.",
+];
+
 /// The node adds this many blocks to a ticket's final CLTV delta when it pays.
 pub const PAYER_PAD_BLOCKS: u32 = 3;
 /// The most held tickets any config may allow: each has a thread and a connection to the node.
@@ -109,7 +126,8 @@ pub struct Config {
     /// The service: `http://host:port`, optionally with a path prefix.
     pub upstream: String,
     pub state_dir: PathBuf,
-    /// `main`, or another chain's name with `network` given.
+    /// `regtest` unless the file says otherwise. Another test chain's name with `network` given,
+    /// or `main`, which also needs `mainnet_ack` ([`MAINNET_ACK`]).
     pub chain: String,
     /// `lightning:<32 hex>`.
     pub network: String,
@@ -159,6 +177,15 @@ impl Config {
         self.chain == "main"
     }
 
+    /// What is printed at a start on mainnet ([`MAINNET_NOTICE`]); nothing on any other chain.
+    pub fn mainnet_notice(&self) -> &'static [&'static str] {
+        if self.mainnet() {
+            &MAINNET_NOTICE
+        } else {
+            &[]
+        }
+    }
+
     /// The route for a decoded path: the longest matching one.
     pub fn route(&self, path: &str) -> Option<&Route> {
         self.routes
@@ -195,6 +222,7 @@ impl Config {
                 "upstream",
                 "state_dir",
                 "chain",
+                "mainnet_ack",
                 "network",
                 "node",
                 "tickets",
@@ -205,7 +233,16 @@ impl Config {
                 "times",
             ],
         )?;
-        let chain = opt_str(top, "chain")?.unwrap_or("main").to_string();
+        // a file that names no chain is a regtest file: mainnet is never what a missing key means
+        let chain = opt_str(top, "chain")?.unwrap_or("regtest").to_string();
+        match (chain.as_str(), opt_str(top, "mainnet_ack")?) {
+            ("main", Some(MAINNET_ACK)) => {}
+            ("main", _) => return Err(format!(
+                "chain \"main\" moves real funds through software that has run on regtest only (docs/LIMITS.md). To run it on mainnet all the same, add \"mainnet_ack\": \"{MAINNET_ACK}\""
+            )),
+            (_, Some(_)) => return Err("mainnet_ack is for chain \"main\" only: leave it out".into()),
+            (_, None) => {}
+        }
         let network = match (chain.as_str(), opt_str(top, "network")?) {
             ("main", None) => xbt402::ticket::network_id(xbt_primitives::network::XBT_MAINNET)
                 .ok_or("no mainnet network id")?,
@@ -221,7 +258,7 @@ impl Config {
                 n.to_string()
             }
             _ => return Err(
-                "a chain other than main needs network: \"lightning:<32 hex of its bip122 id>\""
+                "a chain other than main needs network: \"lightning:<32 hex of its bip122 id>\" (chain is \"regtest\" where the file names none)"
                     .into(),
             ),
         };
@@ -232,6 +269,16 @@ impl Config {
             xbt402::wire::sendable_url(&public_url).map_err(|e| format!("public_url: {e}"))?;
         if xbt402::wire::request_url(&origin).target != "/" {
             return Err("public_url is an origin (scheme://host[:port]), without a path".into());
+        }
+        // the gateway speaks plain HTTP. On a loopback address that is the machine's own business;
+        // on any other, session keys and paid answers would cross a network in the clear unless a
+        // TLS proxy stands in front, and public_url is what says one does
+        let listen = req_str(top, "listen")?.to_string();
+        let loopback = listen
+            .parse::<std::net::SocketAddr>()
+            .is_ok_and(|a| a.ip().is_loopback());
+        if !loopback && !origin.starts_with("https://") {
+            return Err(format!("listen {listen} is not a loopback address (an address written as one: a name, even localhost, is whatever the resolver says), and public_url is not https. The gateway speaks plain HTTP: listen on 127.0.0.1 or [::1], or put a TLS proxy in front and set public_url to the https origin buyers use"));
         }
         let upstream = req_str(top, "upstream")?.trim_end_matches('/').to_string();
         let up = xbt402::wire::sendable_url(&upstream).map_err(|e| format!("upstream: {e}"))?;
@@ -459,7 +506,7 @@ impl Config {
             Some(l) => Some(LotteryConfig::parse(l, ticket_blocks)?),
         };
         Ok(Self {
-            listen: req_str(top, "listen")?.to_string(),
+            listen,
             public_url: origin.trim_end_matches('/').to_string(),
             upstream: up.trim_end_matches('/').to_string(),
             state_dir: PathBuf::from(req_str(top, "state_dir")?),
@@ -698,12 +745,58 @@ mod tests {
             (64, 48, 16)
         );
         assert!(!c.mainnet());
-        let mut main = base();
-        main.as_object_mut().unwrap().remove("chain");
-        main.as_object_mut().unwrap().remove("network");
+    }
+
+    #[test]
+    fn a_file_that_names_no_chain_is_regtest_and_mainnet_is_asked_for_twice() {
+        // no chain: regtest, which like every chain but main must say which network it is
+        let mut none = base();
+        none.as_object_mut().unwrap().remove("chain");
+        let c = Config::from_json(&none).unwrap();
+        assert_eq!((c.chain.as_str(), c.mainnet(), c.mainnet_notice().len()), ("regtest", false, 0));
+        none.as_object_mut().unwrap().remove("network");
+        let e = Config::from_json(&none).unwrap_err().to_string();
+        assert!(e.contains("needs network") && e.contains("regtest"), "{e}");
+        // chain main alone is refused, and the refusal says what it takes
+        let mut main = none.clone();
+        main["chain"] = json!("main");
+        let e = Config::from_json(&main).unwrap_err().to_string();
+        assert!(e.contains("mainnet_ack") && e.contains(MAINNET_ACK) && e.contains("docs/LIMITS.md"), "{e}");
+        for wrong in [json!(true), json!("yes"), json!(""), json!(MAINNET_ACK.to_uppercase())] {
+            main["mainnet_ack"] = wrong.clone();
+            assert!(Config::from_json(&main).is_err(), "{wrong}");
+        }
+        main["mainnet_ack"] = json!(MAINNET_ACK);
         let m = Config::from_json(&main).unwrap();
         assert!(m.mainnet());
         assert_eq!(m.network, "lightning:0000000000000050c1e5f69672f45929");
+        // and a start on mainnet says what its runner should know, and where the rest is
+        let notice = m.mainnet_notice().join("\n");
+        assert!(notice.contains("docs/LIMITS.md") && notice.contains("regtest only") && notice.contains("dust"), "{notice}");
+        // the word means nothing on another chain, and a key that means nothing is not taken
+        let mut off = base();
+        off["mainnet_ack"] = json!(MAINNET_ACK);
+        assert!(Config::from_json(&off).unwrap_err().to_string().contains("chain \"main\" only"));
+    }
+
+    #[test]
+    fn the_gateway_listens_off_loopback_only_behind_an_https_origin() {
+        let with = |listen: &str, public: &str| {
+            let mut v = base();
+            v["listen"] = json!(listen);
+            v["public_url"] = json!(public);
+            Config::from_json(&v)
+        };
+        for listen in ["127.0.0.1:8402", "127.0.0.9:0", "[::1]:8402"] {
+            assert!(with(listen, "http://127.0.0.1:8402").is_ok(), "{listen}");
+            assert!(with(listen, "https://seller.example").is_ok(), "{listen}");
+        }
+        // any other address, every address, and a name (which is whatever the resolver says)
+        for listen in ["0.0.0.0:8402", "192.0.2.7:8402", "[::]:8402", "[2001:db8::1]:8402", "localhost:8402", "gateway:8402"] {
+            let e = with(listen, "http://seller.example").unwrap_err().to_string();
+            assert!(e.contains("not a loopback address") && e.contains("https"), "{listen}: {e}");
+            assert!(with(listen, "https://seller.example").is_ok(), "{listen}: behind a TLS proxy");
+        }
     }
 
     #[test]
@@ -746,7 +839,7 @@ mod tests {
     fn the_example_file_is_a_config() {
         let v: Value = serde_json::from_str(include_str!("../gateway.example.json")).unwrap();
         let c = Config::from_json(&v).unwrap();
-        assert!(c.mainnet());
+        assert!(!c.mainnet() && c.chain == "regtest", "the example is a regtest config");
         assert_eq!(c.routes.len(), 6);
         assert_eq!(
             c.route("/films/a.mkv").unwrap().price.for_bytes(1 << 20),
@@ -996,7 +1089,14 @@ mod tests {
                 "network",
                 Box::new(|v| v["network"] = json!("bip122:00000000000000000000000000000001")),
             ),
-            ("network is fixed", Box::new(|v| v["chain"] = json!("main"))),
+            (
+                "network is fixed",
+                Box::new(|v| {
+                    v["chain"] = json!("main");
+                    v["mainnet_ack"] = json!(MAINNET_ACK);
+                }),
+            ),
+            ("mainnet_ack", Box::new(|v| v["chain"] = json!("main"))),
             (
                 "network",
                 Box::new(|v| {

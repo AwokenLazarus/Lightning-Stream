@@ -72,6 +72,8 @@ The whole of it, for one film at 100 sat a MiB:
   "public_url": "https://films.example",
   "upstream": "http://127.0.0.1:8096",
   "state_dir": "/var/lib/xbt-gateway",
+  "chain": "regtest",
+  "network": "lightning:<the first 32 hex characters of your chain's block 101>",
   "node": {
     "rest": "https://127.0.0.1:8081",
     "tls_cert": "/var/lib/lnd/tls.cert",
@@ -92,8 +94,10 @@ xbt-gateway --check gateway.json   # reads the config and the macaroons, says wh
 xbt-gateway gateway.json
 ```
 
-For buyers elsewhere, put a TLS reverse proxy in front and set `public_url` to the address they
-use. The demo does not do this: everything in it listens on 127.0.0.1.
+A config that names no chain is a regtest one, and mainnet has to be asked for twice
+(`crates/xbt-gateway/README.md`). For buyers elsewhere, put a TLS reverse proxy in front and set
+`public_url` to the address they use; the gateway listens off 127.0.0.1 only when `public_url`
+is `https`. The demo does not do this: everything in it listens on 127.0.0.1.
 
 ### 5. By the byte, or by the second?
 

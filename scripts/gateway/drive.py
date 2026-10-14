@@ -430,6 +430,9 @@ def write_config(path: str, chain: str, macaroon: str, info_macaroon: str, chann
     }
     if chain != "main":
         cfg["chain"], cfg["network"] = chain, NETWORK
+    else:
+        # mainnet is asked for twice: without the second key no config for it is read at all
+        cfg["chain"], cfg["mainnet_ack"] = "main", "real funds, software that has run on regtest only"
     if channels_macaroon:
         cfg["node"]["channels_macaroon"] = channels_macaroon
     cfg["caps"].update(caps or {})

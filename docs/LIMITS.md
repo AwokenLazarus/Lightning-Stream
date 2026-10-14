@@ -427,7 +427,17 @@ wallet) and against a stand-in node in its tests.
   callers, which behind a reverse proxy on the same host is every caller; it shows counts and no
   secret.
 - The gateway speaks plain HTTP: a public seller needs a TLS reverse proxy in front, and
-  `public_url` set to the origin buyers use, or every payment fails its request binding.
+  `public_url` set to the origin buyers use, or every payment fails its request binding. It
+  refuses a config that listens off loopback (any address but `127.0.0.1` or `[::1]`, and any
+  name) unless `public_url` is `https`. That is the runner's word that a proxy is there, and the
+  gateway cannot check it: a runner who writes an `https` origin and runs no proxy serves
+  session keys and paid answers in the clear.
+- A config that names no chain is a regtest config. Mainnet takes two keys, `"chain": "main"`
+  and `mainnet_ack` with a fixed sentence, and a gateway that starts there prints a short list
+  of what is open, at every start. That is a guard against a mainnet start by omission and
+  nothing more: the two keys make no part of the gateway fit for mainnet, and a runner who
+  writes them has the limits of this file as they stand. The chain is also checked against the
+  node's own at the start, as before.
 - Not run: more than one routing hop, real network latency, mainnet, IPv6, a seller with several
   channels, and the Core Lightning fork. The channels macaroon was run against the stand-in node
   of the tests and on the lab against a Lightning Fork node whose channel was opened with 30
