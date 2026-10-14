@@ -41,8 +41,8 @@ packaging/startos/test-startos.sh          # RESULT PASS: build + inspect + regt
 scripts/verify_agp040.sh                   # all of it, plus the unit tests and AGP-038's container test
 ```
 
-The StartOS build needs `start-cli` 2.1.0 (`~/.local/opt/start-cli/start-cli`, from the start-technologies
-releases) and a packaging workspace outside the repo (`~/.local/share/xbt-startos-ws`; its `.startos/` holds
+The StartOS build needs `start-cli` 2.1.0 (`START_CLI`, by default `~/.local/opt/start-cli/start-cli`; from the
+start-technologies releases) and a packaging workspace outside the repo (`~/.local/share/xbt-startos-ws`; its `.startos/` holds
 the key that signs the package, so it is never committed).
 
 ## What the apps do on a box

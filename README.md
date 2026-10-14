@@ -298,10 +298,20 @@ cargo build --release -p xbt-signer -p xbt-wallet-mcp -p xbt-wallet-ui
 Rust stable; libsecp256k1 is built from source. Cross builds (Linux x86_64, aarch64, armv7, riscv64,
 macOS, Windows) use zig as the C compiler: see `docs/ENGINEERING.md`.
 
-The Lightning regtest scripts in `scripts/` (tickets, the gateway, the lottery, the Lightning
-rail) need Docker; they build the Lightning Fork lab under `run/`. The others need a Bitcoin Knots
-29.4.2 build for XBT (`XBT_BIN`). `scripts/mcp/verify_agp030.sh` and `scripts/ui/regtest_ui.sh`
-also use the Python reference implementations linked above.
+What each script needs beyond this repository:
+
+| Scripts | Need | Can someone outside the project run them? |
+|---|---|---|
+| The Lightning regtest scripts: `ln_ticket_regtest.sh`, `gateway_regtest.sh`, `ticket_book_regtest.sh`, `ticket_e2e_regtest.sh`, `lottery_regtest.sh`, `ln_rail_regtest.sh`, `demo_film.sh` | Docker with compose and python3 (the demo also ffmpeg). They fetch and build the Lightning Fork lab under `run/` | Yes. The reports of our latest runs are in `reports/` |
+| `container_test.sh`, `ui/regtest_ui.sh` | A Bitcoin Knots 29.4.2 build for XBT (`XBT_BIN`), Docker | Yes, with that build |
+| `mcp/verify_agp030.sh`, `ui/regtest_ui.sh`, the vector generators (`gen_*.py`) | The Python references linked above, at the paths their headers name (`B2_TREE`, `XBT402_B1`); `gen_unified_sighash_ext.py` needs a Knots source tree instead | Yes |
+| The cross builds: `build_matrix.sh`, `oci_build.sh`, `cmp_clean_build.sh`, `work_matrix.sh` | zig as the C compiler, from the `ziglang` Python wheel in a virtual environment (`XBT_ZIG_PY`; no version of it is pinned in this tree). `cmp_clean_build.sh` also needs cargo-zigbuild 0.23.4 | Yes |
+| The pay-with-work scripts: `work_conformance.sh`, `work_interop.sh`, `work_nta.sh`, `relay_container_test.sh` | The pay-with-work specification tree (XBT-053) and a pool server (`primed`) built from a branch that is not published; `work_nta.sh` also calls a helper of the machine it was written on, and goes on without it | **No.** Nothing they report can be reproduced outside the project until those are published |
+| `tools/lazarus-crosscheck` (headers and proof of work against the pool's own Rust) | A checkout of [AwokenLazarus/Bitcoin](https://github.com/AwokenLazarus/Bitcoin) at a fixed place outside this repository: `../../Bitcoin` seen from this repository's root, two directories up. It is not a workspace member, so the workspace builds and tests without it | Yes, with that checkout in that place |
+
+Several scripts have defaults that point into the directory layout of the machine they were
+written on (`$HOME/xbt-rnd/...`); each takes the path from an environment variable its header
+names.
 
 ## License
 
