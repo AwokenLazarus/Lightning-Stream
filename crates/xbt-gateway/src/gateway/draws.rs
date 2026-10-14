@@ -109,9 +109,14 @@ impl Gateway {
 
     /// The lottery entry of a route's 402, where the runner offers the lottery and the route's
     /// dearest piece is a small enough part of a win.
-    pub(super) fn lottery_entry(&self, route: &Route) -> Option<Value> {
+    ///
+    /// `head`: the terms are for a HEAD. A HEAD has no body, so its only piece is the request's
+    /// own; on a route with no price per request it has none, and nothing to draw for. Such a
+    /// request is not offered by lottery ([`Gateway::lottery_route`] refuses it): a lottery
+    /// session costs nothing to open, and would read the service's headers for nothing.
+    pub(super) fn lottery_entry(&self, route: &Route, head: bool) -> Option<Value> {
         let cfg = self.cfg.lottery.as_ref()?;
-        if !cfg.offers(&route.price) {
+        if !cfg.offers(&route.price) || (head && route.price.request_msat == 0) {
             return None;
         }
         let release = match route.release {
@@ -200,7 +205,7 @@ impl Gateway {
             auth_eq(&lottery::request_auth(key, &pay.session, pay.seq, &digest), &pay.auth)
         });
         match checked {
-            Ok(()) => Ok(Authed { session: pay.session.clone(), seq: pay.seq, digest, ticket: None }),
+            Ok(()) => Ok(Authed { session: pay.session.clone(), seq: pay.seq, digest, ticket: None, head: req.method == "HEAD" }),
             // nothing about a session is told to someone who has not shown its key
             Err(Refused::BadAuth) => Err(error(401, "bad_auth", "the request is not authenticated for this session")),
             Err(Refused::BadSeq(next)) => Err(json_response(402, &json!({"error": "bad_seq", "nextSeq": next}))),
@@ -253,7 +258,7 @@ impl Gateway {
     /// An authenticated request that is not served: the code, the terms again, the session's
     /// numbers and its unpaid wins with their invoices.
     fn draw_refused(&self, l: &Lottery, a: &Authed, target: &str, route: Option<&Route>, code: &str) -> Response {
-        let (mut body, _) = self.required(target, route, None, Some(self.draw_view(l, &a.session)));
+        let (mut body, _) = self.required(target, route, a.head, None, Some(self.draw_view(l, &a.session)));
         body["error"] = code.into();
         let mut r = json_response(402, &body);
         r.headers.push(("PAYMENT-REQUIRED".into(), b64json(&body)));
@@ -490,12 +495,13 @@ impl Gateway {
     }
 
     pub(super) fn lottery_route(self: &Arc<Self>, req: Request, route: &Route) -> Reply {
+        let head_only = req.method == "HEAD";
         let Some(l) = &self.lottery else {
-            return Reply::Whole(self.unpaid(&req.target, route));
+            return Reply::Whole(self.unpaid(&req.target, route, head_only));
         };
         let pay = match self.draw_pay_header(&req) {
             Ok(Some(p)) => p,
-            Ok(None) => return Reply::Whole(self.unpaid(&req.target, route)),
+            Ok(None) => return Reply::Whole(self.unpaid(&req.target, route, head_only)),
             Err(r) => return Reply::Whole(r),
         };
         let a = match self.draw_authenticate(l, &req, &pay) {
@@ -516,10 +522,12 @@ impl Gateway {
         // the 402 offers the lottery only for a route whose dearest piece is a small part of a win, and
         // a buyer that names the lottery all the same is held to that: it is the buyer that reads no 402
         // whom the rule is for
-        if !offered || dearest.is_none_or(|d| d >= win_msat) {
+        // and a HEAD of a route with no price per request has no piece at all: it is not a draw, and a
+        // session that costs nothing to open is not told the service's headers for it. Its 402 lists
+        // tickets only
+        if !offered || dearest.is_none_or(|d| d >= win_msat) || (head_only && route.price.request_msat == 0) {
             return Reply::Whole(self.draw_refused(l, &a, &req.target, Some(route), DrawError::AmountNotBelowWin.code()));
         }
-        let head_only = req.method == "HEAD";
         let mut answer = match self.upstream.send(&req.method, &req.target, &forwarded(route, &req.headers), &req.body) {
             // a service behind the gateway does not ask for payment through it
             Ok(ans) if ans.status != 402 => ans,
@@ -572,6 +580,16 @@ impl Gateway {
                 other => other.code(),
             };
             return Reply::Whole(self.draw_refused(l, &a, &req.target, Some(route), code));
+        }
+        if no_body && m.at_head == 0 {
+            // the service answered a GET without a body (not modified, no content) on a route with no
+            // price per request: no piece was served, so nothing is owed, and nothing of the service's
+            // is told but that status. A session of draws has no balance to have paid from
+            let mut headers = vec![];
+            if let Some(receipt) = self.draw_receipt(&a.session, a.seq, 0, &a.digest, answer.status, &body_hash(b"")) {
+                headers.push(("PAYMENT-RESPONSE".into(), b64json(&settlement_response(&receipt, &self.cfg.network, "", true))));
+            }
+            return Reply::Stream(Streamed { status: answer.status, headers, length: None, body: Box::new(|_| Ok(())) });
         }
         if no_body {
             // the answer keeps the length the service stated (what a HEAD is asked for)

@@ -179,6 +179,8 @@ struct Authed {
     seq: u64,
     digest: String,
     ticket: Option<Hash>,
+    /// The request is a HEAD: its answer has no body, whatever the route.
+    head: bool,
 }
 
 /// What a streamed body needs to meter itself and sign its last receipt.
@@ -691,6 +693,7 @@ impl Gateway {
         &self,
         target: &str,
         route: Option<&Route>,
+        head: bool,
         why: Option<Refusal>,
         session: Option<Value>,
     ) -> (Value, String) {
@@ -723,7 +726,7 @@ impl Gateway {
             })
             .collect();
         // and the lottery, last: a buyer that knows only tickets skips an entry it cannot read
-        accepts.extend(route.and_then(|r| self.lottery_entry(r)));
+        accepts.extend(route.and_then(|r| self.lottery_entry(r, head)));
         m.insert("accepts".into(), Value::Array(accepts));
         if let Some(s) = session {
             m.insert("session".into(), s);
@@ -734,8 +737,8 @@ impl Gateway {
     }
 
     /// The 402 of an unpaid request: the terms.
-    fn unpaid(&self, target: &str, route: &Route) -> Response {
-        let (body, header) = self.required(target, Some(route), None, None);
+    fn unpaid(&self, target: &str, route: &Route, head: bool) -> Response {
+        let (body, header) = self.required(target, Some(route), head, None, None);
         let mut r = json_response(402, &body);
         r.headers.push(("PAYMENT-REQUIRED".into(), header));
         r
@@ -803,6 +806,7 @@ impl Gateway {
         let (body, header) = self.required(
             target,
             route,
+            a.head,
             Some(why),
             Some(self.session_view(&a.session)),
         );
@@ -913,7 +917,7 @@ impl Gateway {
                 ))
             }
             Err(why) => {
-                let (body, header) = self.required(&req.target, route, Some(why), None);
+                let (body, header) = self.required(&req.target, route, req.method == "HEAD", Some(why), None);
                 let mut r = json_response(402, &body);
                 r.headers.push(("PAYMENT-REQUIRED".into(), header));
                 return Err(r);
@@ -924,6 +928,7 @@ impl Gateway {
             seq: pay.seq,
             digest,
             ticket: pay.ticket,
+            head: req.method == "HEAD",
         };
         if let Some(secret) = &pay.secret {
             if let Err(why) = self.take_secret(&a.session, secret) {
@@ -1217,7 +1222,7 @@ impl Gateway {
             .routes
             .iter()
             .map(|r| json!({"path": r.path, "methods": r.methods, "free": r.free, "price": r.price.terms(), "release": r.release.name(),
-                            "lottery": self.lottery_entry(r).is_some()}))
+                            "lottery": self.lottery_entry(r, false).is_some()}))
             .collect();
         let settle: Vec<&str> = [
             (self.cfg.held, SETTLE_ON_USE),
@@ -1326,7 +1331,7 @@ impl Gateway {
         }
         let pay = match self.pay_header(&req) {
             Ok(Some(p)) => p,
-            Ok(None) => return Reply::Whole(self.unpaid(&req.target, route)),
+            Ok(None) => return Reply::Whole(self.unpaid(&req.target, route, req.method == "HEAD")),
             Err(r) => return Reply::Whole(r),
         };
         let a = match self.authenticate(&req, &pay, Some(route)) {
@@ -1364,10 +1369,21 @@ impl Gateway {
         let Some(reserve) = route.price.request_msat.checked_add(first_second) else {
             return Reply::Whole(self.refused(&a, &req.target, Some(route), Refusal::BalanceShort));
         };
-        let first_byte = u64::from(!head_only && route.price.byte_msat > 0);
+        // what the session must be able to pay to be served at all is the same with a body and
+        // without: the request, the first second and the first byte. A HEAD is charged the
+        // request's price alone, which on a route priced by the byte or the second is nothing;
+        // were it also served to a session with nothing, a buyer that asked for tickets and paid
+        // none would read the service's headers (a length, an ETag) for as long as its session
+        // lives. So no answer of a priced route goes to a session that has no balance
+        let first_byte = u64::from(route.price.byte_msat > 0);
+        let needed = route
+            .price
+            .request_msat
+            .saturating_add(route.price.second_msat)
+            .saturating_add(first_byte);
         let charged = {
             let mut st = self.lock();
-            if st.book.chargeable(&a.session, on_pledge) < reserve.saturating_add(first_byte) {
+            if st.book.chargeable(&a.session, on_pledge) < needed {
                 Err(Refusal::BalanceShort)
             } else {
                 st.book.charge(&a.session, reserve, on_pledge, self.now())

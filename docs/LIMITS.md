@@ -428,6 +428,17 @@ wallet) and against a stand-in node in its tests.
   than one ticket ahead.
 - A body priced per second is charged for every second it is open, also while the service says
   nothing (at most 10 seconds, then the answer ends) or the buyer reads slowly.
+- A `HEAD` of a route priced by the byte or the second costs nothing, and a `GET` the service
+  answers 204 or 304 costs the request's price only. Neither is served to a ticket session with
+  no balance. For honest buyers that means: a `HEAD` needs a session that has released a ticket
+  and still has a balance (at least the request's price, one byte's and one second's); a buyer
+  that only wants a length has to buy a ticket first, and keeps its balance. A session with any
+  balance left can ask for as many such answers as it likes, and the service works for each.
+  In a session of draws a `HEAD` of such a route is refused, so a buyer that pays by draws
+  learns a length from the body's own head or pays that one request with tickets; and a 204 or
+  304 reaches it without the service's headers, which still tells it, free, whether what it
+  holds is current: one bit a request, by which a date could be found in about 30 of them. An
+  error (400 and above) is passed on with its headers as before.
 - A request is charged when the service answers with a status below 400. An error from the
   service is passed on (64 KiB of it) and not charged, so a buyer whose balance covers one
   request can make the service work on any number of requests that end in errors.

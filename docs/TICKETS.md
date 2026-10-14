@@ -341,6 +341,20 @@ their state and expiry height. On the lab a 100 MB file at 200,000 msat per MiB,
 a hop with one ticket released each time the last was used up, stopped after the tenth ticket at
 52,428,800 bytes: what ten tickets pay for, to the byte (`scripts/gateway_regtest.sh fetch`).
 
+**An answer without a body.** A `HEAD`, and a `GET` the service answers with 204 or 304, costs
+the request's price and no byte or second: on a route priced only by the byte or the second it
+costs nothing. Its headers are still the service's (a length, an ETag, a date), so a seller
+SHOULD NOT give such an answer to a session that has paid nothing, or anyone who asks for
+tickets and pays none reads them for as long as that session lives. The gateway serves a request
+of a priced route, with a body or without, only to a session whose balance covers the request's
+price and the body's first byte and first second (`balance_short` otherwise); it charges a
+`HEAD` what it did before. A session of draws (section 9) has no balance and costs nothing to
+open, so there the rule is the piece: a `HEAD` of a route with no price per request has no piece,
+is not offered by lottery (its 402 lists the ticket entries only) and is refused
+(`amount_not_below_win`) before the service is asked; and a `GET` such a route answers without a
+body is passed on as its status alone, with none of the service's headers. A `HEAD` of a route
+that has a price per request is that request's piece, and is served like any other.
+
 **Stop and cancel.** `POST <session>/cancel {"hashes": [...] or "all"}`, authenticated as any
 request of the session. The seller cancels those tickets on its node (`CancelInvoice`) and answers
 with the hashes it cancelled and a receipt. The seller SHOULD NOT take the call's success for the

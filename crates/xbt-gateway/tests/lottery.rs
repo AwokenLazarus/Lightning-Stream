@@ -739,3 +739,56 @@ fn the_cap_per_address_counts_the_address_a_named_proxy_reports_and_nobody_elses
     assert_eq!(http(&rig.addr, "GET", "/x402/ticket/health", &[("X-Real-IP", "127.0.0.1")], b"", None).status, 200);
     assert_eq!(http(&plain.addr, "GET", "/x402/ticket/health", &[("X-Real-IP", "198.51.100.1")], b"", None).status, 200);
 }
+
+#[test]
+fn a_request_with_no_piece_is_not_a_draw_and_a_session_of_draws_is_told_nothing_for_it() {
+    // "/status/" priced by the byte, so that the service's 304 comes from a route with no price per request
+    let (rig, _d) = start(&|v| {
+        lottery(v);
+        for r in v["routes"].as_array_mut().unwrap() {
+            if r["path"] == "/status/" {
+                r["price"] = json!({"byte_msat": 16000, "per_bytes": 1048576});
+            }
+        }
+    });
+    let schemes = |method: &str, target: &str| -> Vec<String> {
+        let got = http(&rig.addr, method, target, &[], b"", None);
+        assert_eq!(got.status, 402);
+        unb64json(got.header("PAYMENT-REQUIRED").unwrap()).unwrap()["accepts"].as_array().unwrap().iter().map(|a| a["scheme"].as_str().unwrap().to_string()).collect()
+    };
+    // the terms of a HEAD: a route priced by the byte only has no piece for it, so tickets; a route
+    // with a price per request has one, the request's own
+    assert_eq!(schemes("GET", "/files/1000"), ["ticket", "ticket", "lottery"]);
+    assert_eq!(schemes("HEAD", "/files/1000"), ["ticket", "ticket"]);
+    assert_eq!(schemes("HEAD", "/timed/8192"), ["ticket", "ticket"]);
+    assert_eq!(schemes("HEAD", "/whole/10"), ["ticket", "ticket", "lottery"]);
+    // a session of draws costs nothing to open. Its HEAD of a file is refused, signed, and the
+    // service is not asked: no length, no ETag
+    let mut b = Drawer::open(&rig, 50);
+    for target in ["/files/1000", "/timed/8192"] {
+        let (_, got) = b.send("HEAD", target, b"");
+        assert_eq!(got.status, 402, "{target}");
+        let j = unb64json(got.header("PAYMENT-REQUIRED").unwrap()).unwrap();
+        assert_eq!(j["error"], "amount_not_below_win");
+        assert!(j["accepts"].as_array().unwrap().iter().all(|a| a["scheme"] == "ticket"), "{j}");
+        assert!(got.header("ETag").is_none() && got.header("Content-Length") != Some("1000"));
+        assert_eq!(receipt_of(&got, &b.receipt_key)["charged"], "0");
+    }
+    assert_eq!(rig.hits(), 0);
+    // where the request has a price it is a piece like any other: served, with the length, and owed a value
+    let (seq, got) = b.send("HEAD", "/whole/10", b"");
+    assert_eq!((got.status, got.header("Content-Length"), got.header("ETag")), (200, Some("10"), Some("\"e\"")));
+    assert_eq!(receipt_of(&got, &b.receipt_key)["charged"], "2500");
+    assert_eq!(b.status()["session"]["pending"], 1);
+    let p = Piece { id: PieceId { seq, kind: Kind::Request, k: 0 }, req: b.digest("HEAD", "/whole/10", b""), amount_msat: 2500 };
+    let j = b.draw(&[p]);
+    assert_eq!(j["refused"], Value::Null, "{j}");
+    b.pay_all(&rig, &j);
+    // a GET the service answers without a body, on a route priced by the byte: no piece, nothing
+    // owed, and the status alone
+    let (_, got) = b.get("/status/304");
+    assert_eq!((got.status, got.body.len()), (304, 0));
+    assert!(got.header("Content-Type").is_none() && got.header("Content-Length").is_none(), "{:?}", got.headers);
+    assert_eq!(receipt_of(&got, &b.receipt_key)["charged"], "0");
+    assert_eq!(b.status()["session"]["pending"], 0);
+}

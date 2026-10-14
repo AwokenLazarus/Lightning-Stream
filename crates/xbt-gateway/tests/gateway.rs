@@ -1809,3 +1809,53 @@ fn a_cancel_the_node_says_yes_to_moves_the_book_only_to_what_a_lookup_then_shows
     rig.node.hold_streams(false);
     assert_eq!(b.balance(), 1_000_000, "one ticket credited, once");
 }
+
+#[test]
+fn a_session_that_paid_nothing_is_told_nothing_of_a_priced_route_not_even_by_a_head() {
+    let (rig, _d) = start(&|_| {});
+    // a session with tickets asked for and none paid: it exists, is authenticated, and has no balance
+    let mut b = Buyer::new(&rig, 1);
+    let s = b.fresh_secrets(1);
+    assert_eq!(b.lock_raw(&s).status, 200);
+    let head = |b: &mut Buyer, target: &str| {
+        let sig = b.sign("HEAD", target, b"", None, None);
+        let got = http(&rig.addr, "HEAD", target, &[("PAYMENT-SIGNATURE", &sig)], b"", None);
+        b.used(&got);
+        got
+    };
+    // a route priced by the byte, one priced by the second, one priced by the request: no answer of
+    // the service's, no length and no ETag of its, and the service is not asked
+    for target in ["/files/1000", "/timed/8192", "/whole/10"] {
+        let got = head(&mut b, target);
+        assert_eq!(got.status, 402, "{target}");
+        assert_eq!(unb64json(got.header("PAYMENT-REQUIRED").unwrap()).unwrap()["error"], "balance_short", "{target}");
+        assert!(got.header("ETag").is_none() && got.header("Content-Length") != Some("1000"), "{target}");
+        assert_eq!(got.receipt(&KEY(&rig))["charged"], "0");
+    }
+    assert_eq!(rig.hits(), 0);
+    // the ticket is paid and held, and still nothing was released: the same
+    assert!(rig.node.pay(&ticket_hash(&s[0])));
+    b.wait_state(&s, "ACCEPTED");
+    assert_eq!(head(&mut b, "/files/1000").status, 402);
+    assert_eq!(rig.hits(), 0);
+    // released: the session has a balance, and a HEAD costs it nothing, as before
+    assert_eq!(b.release(&s).status, 200);
+    let got = head(&mut b, "/files/1000");
+    assert_eq!((got.status, got.header("Content-Length"), got.header("ETag")), (200, Some("1000"), Some("\"e\"")));
+    assert_eq!(got.receipt(&KEY(&rig))["charged"], "0");
+    assert_eq!((rig.hits(), b.balance()), (1, 1_000_000));
+    // a balance that covers the request but not the body's first second is no balance for that route
+    let (tight, _d2) = start(&|v| {
+        for r in v["routes"].as_array_mut().unwrap() {
+            if r["path"] == "/timed/" {
+                r["price"] = json!({"second_msat": 2_000_000});
+            }
+        }
+    });
+    let mut c = Buyer::new(&tight, 2);
+    let s = c.lock(&tight, 1);
+    assert_eq!(c.release(&s).status, 200);
+    let sig = c.sign("HEAD", "/timed/8192", b"", None, None);
+    let got = http(&tight.addr, "HEAD", "/timed/8192", &[("PAYMENT-SIGNATURE", &sig)], b"", None);
+    assert_eq!((got.status, tight.hits()), (402, 0), "one ticket does not pay for a second of 2,000 sat");
+}
