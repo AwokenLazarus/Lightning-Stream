@@ -1053,7 +1053,9 @@ session whose window is used up (`too_many_voids`) and the buyer opens another, 
 that was told nothing would wait for values (`value_missing`). The same goes for the end of any
 answer priced by the second:
 the seller counts its seconds on its own clock, which started a moment before the buyer's, and
-may have begun one second more than the buyer gave a value for.
+may have begun one second more than the buyer gave a value for. The message that names the voids
+carries the values no reveal has covered yet, as every `draw` message does, and its answer can
+list a win among them, which is owed like any other (the wallet pays it in the same call).
 
 ### 9.6 The window and the grace: when the seller stops
 
@@ -1466,6 +1468,7 @@ the last ticket.
 | The answer to a paid request is lost. | The call says so. No secret travels with a request. | What the seller charged the balance for it. |
 | An answer carries a receipt for another request (a replay), a receipt signed by another key, or none. | It is not believed. A 5xx without a receipt is reported and the session kept; any other answer nobody signed stops the session. | The session's balance. |
 | A refusal that is not signed (a forged `balance_short`, or `session_unknown` from a seller that lost its records). | Nothing is released on its word. The session is stopped; the next call opens a new one. | The session's balance. |
+| `session_unknown`, unsigned, to a `lock` or a `status` (the seller forgot a session that held nothing and was quiet for its `idle_secs`). | The session is stopped (`ticket_session_ended`); the next call opens a new one. | Nothing: the seller forgets only a session with no balance, or with one that was not used for a day. |
 | An unsigned `bad_seq` with `nextSeq`. | Adopted, twice at most: a `seq` only orders requests. | Nothing. |
 | A receipt's totals or charge contradict the wallet's count (inflated metering). | The session is stopped as faulty. | At most the ticket in use. |
 | The body is not the one the receipt signs. | The body is handed on marked as such, and the session is stopped. | At most the ticket in use. |
@@ -1473,6 +1476,8 @@ the last ticket.
 | The wallet stopped reading an answer when its pool ran out, and pays that seller again at once. | It waits until the seller has closed the old answer (the gateway does so after its 3 s wait for a refill), then releases. | Up to 3 s of waiting. Before this rule a ticket released in that time was charged for bytes of the old answer that nobody read, and the wallet took the honest seller's receipt for a lie. |
 | The seller stops answering. | The call reports it. An unconfirmed secret is sent again by the next call before anything else. The idle rule stops the session. | At most one ticket, and the pool locked until the seller cancels it or it expires (section 6). |
 | The seller never shows a ticket `ACCEPTED`. | `ticket_not_ready` after `tickets.ready_wait_ms`. | Nothing: no secret was released. |
+| The seller never shows a ticket `ACCEPTED`, and the wallet's own node calls its payment in flight and carries it on no channel (a node killed as it sent it). | The session is stopped (`ticket_session_ended`); the next call opens a new one, with a pool inside what the owner's cap for that seller has left. | Nothing: no secret was released. The ticket counts as locked until the node gives it up. |
+| Tickets failed on the wallet's node after their lock round was over. | The seller is asked to cancel their invoices before the next lock, once for each. | Nothing. Without it the seller refused the lock (`too_many_tickets`) until the invoices lapsed. |
 | The wallet's signer is killed. | On its next start every locked ticket is booked as if released and never released, and the sellers on record are asked to cancel. | The balance; and the pool's worst case held against the budgets until the node shows the tickets failed. |
 
 **Velocity.** The owner's `velocity_max` (8 an hour as shipped) counts payments. What a ticket

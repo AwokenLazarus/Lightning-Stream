@@ -314,6 +314,12 @@ involved no node.
   each counts against its window); after that the wallet's next call opens another session. A
   buyer that voids pieces it did receive has had them free: the window's 8 a session at the
   most, voided or left open.
+- The values no reveal had covered when an answer ended go to the seller with the voids, and
+  its answer can show that one of them won. The wallet pays such a win in the same call.
+  *(test)* Where the call gives no more values (an owner's bound refused a win, or its wins
+  passed the luck cap) the win stays owed and the session's next call pays it. Before this the
+  win was marked as handed to a payer and never paid, and the seller waited for it until it
+  refused the session.
 - A win whose payment fails (no route, a fee above the owner's limit) is not paid with the same
   invoice again. It is paid with the seller's next invoice for it, which the gateway makes when
   the first has lapsed: a win's invoice lives as long as the grace (30 s), so the next one comes
@@ -663,6 +669,26 @@ payer only: no socket method buys one. Run on regtest only (`scripts/ticket_book
   the node gives the payment up; how long the node takes was not followed. With a pool of 2 the
   next ticket is sent after every release, so a node that dies right after a paid request is
   more likely to be caught in that instant than it was with a pool of 8.
+- Such a ticket never arrives at the seller, and it is the oldest of its session. The first
+  release that waits for it (`tickets.ready_wait_ms`, 3 s) finds it on none of the node's
+  channels and ends the session (`ticket_session_ended`); the next call opens another. The
+  ticket stays locked in the book. A new session's pool is sized inside what the owner's cap on
+  tickets locked with one seller (2 as shipped) has left, so after one such ticket the wallet
+  holds one ticket with that seller, and after two it holds none and buys prepaid tickets, one
+  at a time; a seller that offers none is then not paid with tickets until the node gives the
+  payments up. *(test)* Before this, every call to that seller was refused `ticket_not_ready`
+  for as long as the seller kept the session.
+- A seller's gateway forgets a session that holds nothing and has been quiet for its
+  `idle_secs` (300 s as shipped). A wallet whose node was away for that long is told
+  `session_unknown`, without a receipt, at its next lock or `status`: it ends its own session
+  on that word (`ticket_session_ended`) and the next call opens another. Nothing is released on
+  an unsigned answer; whoever can answer in the seller's place can end a session this way, as
+  it can with any other unsigned answer to a paid request. *(test)*
+- Tickets whose payment failed after their lock round was over (the node went away as it sent
+  them) are found by the wallet's next reading of its node. Before the session's next lock the
+  wallet asks the seller to cancel their invoices, once for each; until then they take places
+  under the seller's `maxTickets`. *(test)* A seller that does not cancel them refuses the lock
+  (`too_many_tickets`) until they lapse, 75 s at the gateway.
 - For a moment after a ticket settles, `ticket_status` can show the node and the book as not
   agreeing: the node reports the payment settled before it has taken the HTLC off its channel.
 - The seller's node receives a 32-byte tag with every ticket (a random nonce and a MAC), in a
@@ -804,7 +830,8 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
   places until the invoices lapse.
 - No ticket is released until the seller's signed `status` shows it locked. A seller that never
   shows it is not paid (`ticket_not_ready` after 3 s), and its tickets stay locked until it
-  cancels them or they expire.
+  cancels them or they expire. The session goes on trying that ticket, its oldest, for as long
+  as the wallet's own node carries it on a channel.
 - One paid request per seller at a time: a long answer delays every other call to that seller,
   and one session per seller node, so two origins of one node cannot be paid at once.
 - The ticket rail needs https, or http to the wallet's own machine. The wallet does not pin a

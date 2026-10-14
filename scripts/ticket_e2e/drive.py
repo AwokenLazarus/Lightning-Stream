@@ -978,12 +978,20 @@ def kill() -> None:
         # the pool is filled again behind the call: the kill comes when that round is over and the channel lists both
         # tickets. (A buyer's node killed in the instant it sends a payment can keep that payment "in flight" with
         # nothing on its channel, also after a restart: seen on this lab, and stated in docs/LIMITS.md.)
-        # (two tickets; one, for the ten minutes after the slots check, in which the wallet holds less with this seller)
+        # (two tickets; one, for the ten minutes after the slots check, in which the wallet holds less with this seller;
+        # and after a kill of the buyer's node left tickets locked in the book that are on none of its channels, the
+        # session holds what the owner's cap for one seller has left, which can be nothing. Those tickets are in
+        # neither count here: they are in the book, and not on the channel.) And the seller's node holds each of them:
+        # a ticket is on the buyer's channel a moment before it is on the seller's, and a node killed in that moment
+        # sends it back through the hop as a failure of that hop's channel, after which the buyer's node finds no
+        # route for a while (seen on this lab: the download that follows was then refused, with nothing paid)
         def settled_down() -> bool:
             s = session_of(r)
-            locked = status()["locked"]["tickets"]
+            st = status()
+            stranded = len(set((st.get("node") or {}).get("in_book_not_on_node") or []) & ORPHANS)
+            locked = st["locked"]["tickets"] - stranded
             waiting = float(s.get("hold_until") or 0) > time.time()
-            return locked == wallet_in_flight(0) and (waiting or locked == int(s.get("pool") or 0))
+            return locked == wallet_in_flight(0) and locked == held() and (waiting or locked == int(s.get("pool") or 0))
 
         lab.wait("the pool locked and listed", 30, settled_down, every=0.1)
         killed(victim, "a pool locked")

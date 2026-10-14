@@ -15,6 +15,7 @@
 //! | A value follows the piece it is for, and is random. | [`Signer::draw_stream`] and [`Signer::draw_request`] queue a piece only when all of it has arrived (and, where the caller gave its hash, checked out); [`Signer::draw_round`] makes each value from the operating system's random source at that moment. |
 //! | One value per draw, ever. | [`xbt402::lottery::Buyer::issue`] numbers draws and keeps each value until a reveal covers it; a round that got no answer sends the same values again. A session lives in this process only: a signer that starts again has no session to resend into. |
 //! | A seller that takes values and reveals nothing gets no more. | [`xbt402::lottery::Buyer::issue`] refuses beyond `tickets.lottery.ahead` values without a checked reveal; the session ends as faulty. |
+//! | A win that is handed out has a payer. | Every caller of [`Signer::draw_round`] gives the wins it returns to [`Signer::draw_pay`], the round that names void pieces through [`Signer::draw_pay_late`], which puts back as owed what a halted call does not pay. |
 //! | A win is paid once, by its own invoice, after every check of an invoice. | [`Signer::draw_pay`]: a draw is handed to the payer once (`State::handed`); the book refuses a second payment for a win and a second payment for a hash; the invoice must name the seller's node, the session's win size and its CLTV delta, carry bit 512 and a payment secret, and not be expired. |
 //! | What is booked is what the node paid. | The ledger rows are the book's, written before a payment is sent and made exact when the node shows it settled. A seller's `wonMsat` or `paidMsat` moves nothing. |
 //! | A call uses at most `max_sats` by the wallet's own count, and pays at most the luck cap above it. | [`Signer::draw_stream`] stops reading when the pieces it gave values for cost `max_sats`, or when the wins of the call reach [`xbt402::lottery::luck_cap_msat`]; the task's budget and the caps per seller refuse a payment whatever the draws did. |
@@ -608,6 +609,29 @@ impl Signer {
         }
     }
 
+    /// The wins of a round that was made after the answer had ended (the round that names void
+    /// pieces): each is paid with its invoice, as [`Signer::draw_pay`] pays one. Where the call
+    /// gives no more values (`Counted::halt`: an owner's bound refused a win, or the call's wins
+    /// passed its luck cap) or the session is faulty, nothing more is paid in it: the win goes back
+    /// to the wins that are owed, its invoice unread, and the session's next call pays it when the
+    /// seller lists it again. Either way no win [`Signer::draw_round`] handed out is left with no
+    /// payer: a win that is handed and not paid is never asked for again, and the seller waits
+    /// for it for good.
+    fn draw_pay_late(&self, ds: &DrawSession, wins: Vec<(Win, Option<String>)>, counted: &Mutex<Counted>) {
+        for (w, inv) in wins {
+            let Some(inv) = inv else { continue };
+            if ds.fault().is_some() || lock(counted).halt {
+                let mut s = lock(&ds.state);
+                if let Some((w, _)) = s.handed.remove(&w.draw()) {
+                    s.owed.push(w);
+                }
+                s.tried.remove(&invoice_mark(&inv));
+                continue;
+            }
+            self.draw_pay(ds, &w, &inv, false, counted);
+        }
+    }
+
     /// The wins of this session that the seller's answer stands still for, by the wallet's own
     /// count against the seller's terms: they go through the gate before the wins no seller waits
     /// for. A seller serves on beside `maxUnpaidWins` unpaid wins, and beside a win for
@@ -1011,8 +1035,11 @@ impl Signer {
                 ids.into_iter().filter(|id| st.buyer.as_ref().is_some_and(|b| !b.knows(*id))).collect()
             };
             for chunk in open.chunks(64) {
-                if self.draw_round(ds, &[], chunk, false, counted).is_err() {
-                    break;
+                // the values no reveal covered yet go with the voids, and the seller's answer may show that one of them
+                // won, or bring the invoice of a win that was owed: such a win is paid here like any other of the call
+                match self.draw_round(ds, &[], chunk, false, counted) {
+                    Ok(r) => self.draw_pay_late(ds, r.wins, counted),
+                    Err(_) => break,
                 }
             }
         }

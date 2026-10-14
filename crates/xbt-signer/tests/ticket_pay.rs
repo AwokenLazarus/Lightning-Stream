@@ -436,6 +436,11 @@ struct PayState {
     router_down: bool,
     /// How long a send takes to return: a payment's way through a hop.
     send_takes: Duration,
+    /// The next sends are in flight on this node and never reach the seller's (the node dies as it
+    /// sends them); once `stranded_off_channel` is set, no channel of the node carries them and
+    /// the node goes on calling them in flight.
+    strand_next: usize,
+    stranded_off_channel: bool,
 }
 
 /// A fake LND for the buyer: a ticket payment is held by the seller's stand-in node, and ends as
@@ -456,7 +461,7 @@ fn node_err(m: &str) -> xbt402::ChannelError {
 impl PayLn {
     /// Bring every payment in flight to what the seller's node has made of its invoice.
     fn refresh(&self, s: &mut PayState) {
-        for p in s.payments.iter_mut().filter(|p| p["status"] == "IN_FLIGHT") {
+        for p in s.payments.iter_mut().filter(|p| p["status"] == "IN_FLIGHT" && p["stranded"] != true) {
             if p["late_fail"] == true {
                 p["status"] = "FAILED".into();
                 p["failure_reason"] = "FAILURE_REASON_NO_ROUTE".into();
@@ -524,7 +529,7 @@ impl LnBackend for PayLn {
     fn channels(&self) -> xbt402::Result<Vec<Value>> {
         let s = self.state();
         let mut c = s.channel.clone();
-        let mut htlcs: Vec<Value> = s.payments.iter().filter(|p| p["status"] == "IN_FLIGHT").map(|p| {
+        let mut htlcs: Vec<Value> = s.payments.iter().filter(|p| p["status"] == "IN_FLIGHT" && !(s.stranded_off_channel && p["stranded"] == true)).map(|p| {
             json!({"incoming": false, "amount": (p["value_msat"].as_str().unwrap().parse::<u64>().unwrap() / 1000).to_string(), "hash_lock": p["payment_hash"],
                    "expiration_height": p["htlcs"][0]["route"]["total_time_lock"]})
         }).collect();
@@ -567,7 +572,9 @@ impl LnBackend for PayLn {
         s.fail_next = s.fail_next.saturating_sub(1);
         let late = !failing && s.late_fail > 0;
         s.late_fail = s.late_fail.saturating_sub(usize::from(late));
-        let arrives = !failing && r.cltv_limit >= 123 && (late || self.seller.pay_msat(&raw, d.amount_msat));
+        let stranded = !failing && !late && s.strand_next > 0;
+        s.strand_next = s.strand_next.saturating_sub(usize::from(stranded));
+        let arrives = !failing && r.cltv_limit >= 123 && (late || stranded || self.seller.pay_msat(&raw, d.amount_msat));
         let status = if arrives { "IN_FLIGHT" } else { "FAILED" };
         let in_flight = s.payments.iter().filter(|p| p["status"] == "IN_FLIGHT").count() + usize::from(arrives);
         s.peak = s.peak.max(in_flight);
@@ -578,7 +585,7 @@ impl LnBackend for PayLn {
         let p = json!({"payment_hash": hash, "payment_index": s.next_index.to_string(), "status": status, "value_msat": d.amount_msat.unwrap_or(0).to_string(),
                        "fee_msat": "0", "payment_preimage": "00".repeat(32), "payment_request": r.invoice, "creation_time_ns": (T0 * 1_000_000_000).to_string(),
                        "failure_reason": if arrives { "FAILURE_REASON_NONE" } else { "FAILURE_REASON_NO_ROUTE" },
-                       "htlcs": if arrives { json!([{"status": "IN_FLIGHT", "route": route}]) } else { json!([]) }, "late_fail": late});
+                       "htlcs": if arrives { json!([{"status": "IN_FLIGHT", "route": route}]) } else { json!([]) }, "late_fail": late, "stranded": stranded});
         s.payments.push(p.clone());
         Ok(p)
     }
@@ -2895,4 +2902,189 @@ fn a_piece_whose_hash_the_caller_named_gets_its_value_only_if_it_matches() {
     // the piece that did not match, and then those after it, which the wallet did not wait for
     assert_eq!((voids[0]["kind"].as_str(), voids[0]["k"].as_u64()), (Some("bytes"), Some(3)), "{voids:?}");
     assert!(voids.len() > 1 && voids.iter().all(|v| v["kind"] == "bytes" && v["k"].as_u64().unwrap() >= 3), "{voids:?}");
+}
+
+/// A win the wallet finds only when it names the void pieces of an answer that did not arrive
+/// whole is paid in that call, like every other win of it. The values no reveal had covered when
+/// the answer ended go to the seller with the voids, and its reveal for them can show a win.
+///
+/// FAILS before the wins of that round were given to a payer: the round marked the win as handed
+/// out and nobody paid it, in that call or in any later one (`wins` 1, `wins_paid` 0, and no
+/// entry in `wins_unpaid`), so the seller waited for it until it refused the session.
+#[test]
+fn a_win_found_as_the_void_pieces_of_a_cut_answer_are_named_is_paid_in_that_call() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let r = draws_rig(json!({}));
+    // the seller's draw endpoint gives no answer to the first values of each answer, seven times in a row: the
+    // wallet gives up the answer with those values open. The round that names the void pieces is let through
+    let (lost, late) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let (l, found) = (lost.clone(), late.clone());
+    r.tap.set(Box::new(move |seen, real| {
+        if !seen.path.starts_with("/x402/lottery/draw") {
+            return None;
+        }
+        let sent: Value = serde_json::from_str(&seen.body).unwrap();
+        let some = |k: &str| sent[k].as_array().is_some_and(|a| !a.is_empty());
+        if !some("void") {
+            if some("values") && l.fetch_add(1, Ordering::SeqCst) < 7 {
+                return Some(Err(xbt402::ChannelError::new("transport_error", "connection reset")));
+            }
+            return None;
+        }
+        let (status, headers, body) = whole(real().unwrap());
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        // a win the seller lists, with its invoice, in the answer to a round that names void pieces
+        found.fetch_add(v["wins"].as_array().into_iter().flatten().filter(|w| w["invoice"].is_string()).count(), Ordering::SeqCst);
+        let headers: Vec<(String, String)> = headers.into_iter().filter(|(k, _)| !k.eq_ignore_ascii_case("content-length")).collect();
+        Some(Ok(answer(status, headers, body)))
+    }));
+    // a piece of /hot/ wins one time in four, and a handful of values are open when the answer is given up: most
+    // answers reach the case, and the first that does is the test
+    let mut all = 0;
+    for n in 0..40 {
+        lost.store(0, Ordering::SeqCst);
+        let v = r.pay(&format!("/hot/{}", 64 * PIECE), 2_000);
+        assert_eq!((v["rail"].as_str(), v["status"].as_u64(), v["complete"].as_bool()), (Some("lottery"), Some(200), Some(false)), "answer {n}: {v}");
+        assert!(v["ended"].as_str().unwrap().contains("did not take the values"), "answer {n}: {v}");
+        let wins = v["wins"].as_u64().unwrap();
+        assert_eq!((v["wins_paid"].as_u64(), v["wins_unpaid"].as_array().map(Vec::len)), (Some(wins), Some(0)),
+                   "answer {n}: every win the wallet found in the call is paid in it, also one found as the void pieces were named: {v}");
+        all += wins;
+        // one number on the node, at the seller and in the ledger: each win once
+        assert_wins(&r, all);
+        if late.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+    }
+    assert!(late.load(Ordering::SeqCst) > 0 && all > 0, "no round that named void pieces found a win in 40 answers");
+    // and the seller waits for nothing: the session's next request is served
+    r.tap.clear();
+    let next = r.pay("/tiny/10", 5);
+    assert_eq!((next["status"].as_u64(), next["rail"].as_str()), (Some(200), Some("lottery")), "{next}");
+    assert_wins(&r, all + next["wins_paid"].as_u64().unwrap());
+}
+
+/// The wallet's own node dies as it sends the tickets that fill a pool again, and says only when
+/// it is back that those payments failed. The seller still has their invoices, two of the two a
+/// session may have, and the wallet asks it to cancel them before it locks again.
+///
+/// FAILS before the wallet asked: every call was refused `ticket_seller: the seller refused the
+/// lock: HTTP 402 too_many_tickets` until the seller's own 75 s for an unpaid invoice were over.
+/// Seen on the lab when the buyer's node was killed in the middle of a download.
+#[test]
+fn tickets_whose_payment_failed_after_their_lock_round_give_their_places_with_the_seller_back() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let r = Rig::shipped(json!({"ln": {"timeout_s": 1}}), 30, shipped_shop());
+    // 200 sat a MiB: a ticket of 1,000 sat is 5 MiB
+    let v = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["tickets_released"].as_u64()), (Some(200), Some(true), Some(1)), "{v}");
+    wait_for("the pool to be filled again", || r.shop.held() == 2);
+    // the node takes no payment and answers no question about one: the two tickets that were held pay for 10 MiB,
+    // and the two that were to follow them are with the seller as invoices and with the book as sent
+    r.ln.st.lock().unwrap().router_down = true;
+    let cut = r.pay(&format!("/files/{}", 15 * MIB), 5_000);
+    assert_eq!((cut["status"].as_u64(), cut["complete"].as_bool(), cut["tickets_released"].as_u64(), cut["bytes"].as_u64()),
+               (Some(200), Some(false), Some(2), Some(10 * MIB as u64)), "{cut}");
+    let sid = cut["session"].as_str().unwrap().to_string();
+    // the node is back and never had them: once no payment of that age can still arrive, the book gives them up
+    r.ln.st.lock().unwrap().router_down = false;
+    r.clock.fetch_add(70, Ordering::SeqCst);
+    r.tick();
+    let failed = r.session(&sid)["session_tickets"].as_array().unwrap().iter().filter(|t| t["state"] == "failed").count();
+    assert_eq!((failed, r.status()["locked"]["tickets"].as_i64()), (2, Some(0)), "{}", r.session(&sid));
+    // the next call locks again in the same session, and pays
+    let next = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
+    assert_eq!((next["status"].as_u64(), next["complete"].as_bool(), next["tickets_released"].as_u64(), next["session"].as_str()),
+               (Some(200), Some(true), Some(1), Some(sid.as_str())), "{next}");
+    let asked: Vec<Value> = r.tap.seen("/x402/ticket/cancel").iter().map(|s| serde_json::from_str::<Value>(&s.body).unwrap()).collect();
+    assert_eq!((asked.len(), asked[0]["hashes"].as_array().map(Vec::len)), (1, Some(2)), "the two dead invoices, asked for once: {asked:?}");
+    r.assert_booked();
+    wait_for("the last ticket to settle", || r.money().0 == 4 * TICKET);
+    assert_eq!(r.money(), (4 * TICKET, 4 * TICKET, 4 * TICKET, 4 * SETTLED));
+}
+
+/// A seller's gateway forgets a session that holds nothing and has been quiet for its `idle_secs`
+/// (300 s as shipped): a wallet whose node was away for that long comes back to a session only it
+/// remembers. The seller's `session_unknown` ends the session in the wallet too, and the next
+/// call opens another.
+///
+/// FAILS before the wallet ended it: a session whose balance was used up asked the seller for
+/// `status` or for a lock before every release, was told `session_unknown`, and refused the call
+/// with `ticket_seller`, again at every call for as long as the agent went on calling (the
+/// wallet's own idle rules count from the last call). Seen on the lab when the buyer's node was
+/// killed in the middle of a download: no call was paid in the 150 s the check waits.
+#[test]
+fn a_session_the_seller_has_forgotten_is_ended_and_the_next_call_opens_another() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let r = Rig::shipped(json!({}), 30, shipped_shop());
+    // a file that uses its one ticket up to the last msat
+    let v = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["tickets_released"].as_u64(), v["balance_msat"].as_str()), (Some(200), Some(true), Some(1), Some("0")), "{v}");
+    let sid = v["session"].as_str().unwrap().to_string();
+    wait_for("the pool to be filled again", || r.shop.held() == 2);
+    // nothing is heard of the wallet for longer than the seller keeps a quiet session: the seller cancels what the
+    // session held and forgets it. (The wallet's watcher did not run meanwhile: its node was away.)
+    r.clock.fetch_add(350, Ordering::SeqCst);
+    wait_for("the seller to cancel what the session held", || r.shop.held() == 0);
+    std::thread::sleep(Duration::from_millis(300));
+    let gone = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
+    assert_eq!((gone["verdict"].as_str(), gone["rule"].as_str()), (Some("deny"), Some("ticket_session_ended")), "{gone}");
+    assert!(gone["reason"].as_str().unwrap().contains("forgotten the session"), "{gone}");
+    let s = r.session(&sid);
+    assert_eq!((s["sessions"][0]["state"].as_str() != Some("open"), s["sessions"][0]["why"].as_str()), (true, Some("the seller has forgotten the session")), "{s}");
+    // the next call opens another session and pays
+    let next = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
+    assert_eq!((next["status"].as_u64(), next["complete"].as_bool(), next["tickets_released"].as_u64()), (Some(200), Some(true), Some(1)), "{next}");
+    assert_ne!(next["session"].as_str(), Some(sid.as_str()));
+    // nothing is paid twice and nothing is missing: two tickets settled, and whatever else left the book is booked
+    // until the node shows it failed
+    r.assert_booked();
+    wait_for("the tickets of the forgotten session to come back", || {
+        r.tick();
+        r.ln.by_status("IN_FLIGHT").len() <= 2
+    });
+    assert_eq!(r.money(), (2 * TICKET, 2 * TICKET, 2 * TICKET, 2 * SETTLED));
+}
+
+/// A Lightning Fork node that is killed as it sends a ticket's payment can go on calling that
+/// payment in flight with nothing on its channel. Such a ticket is the oldest of its session and
+/// the seller never shows it locked: the session ends at the first release that waits for it, and
+/// the next call opens another.
+///
+/// FAILS before the session was ended: every call waited `ready_wait_ms` for that ticket and was
+/// refused `ticket_not_ready`, for as long as the seller kept the session (300 s as shipped).
+/// Seen on the lab when the buyer's node was killed in the middle of a download.
+#[test]
+fn a_ticket_that_is_on_none_of_the_nodes_channels_ends_its_session_and_the_next_call_pays() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let r = Rig::shipped(json!({"tickets": {"ready_wait_ms": 300}}), 30, shipped_shop());
+    let v = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["balance_msat"].as_str()), (Some(200), Some(true), Some("0")), "{v}");
+    let sid = v["session"].as_str().unwrap().to_string();
+    wait_for("the pool to be filled again", || r.shop.held() == 2);
+    // the two held tickets pay for 10 MiB; the node dies as it sends the two that are to follow them. While the
+    // node still shows them on its channel the wallet waits for the seller, as for any ticket that is on its way
+    r.ln.st.lock().unwrap().strand_next = 2;
+    let cut = r.pay(&format!("/files/{}", 15 * MIB), 5_000);
+    assert_eq!((cut["complete"].as_bool(), cut["tickets_released"].as_u64(), cut["bytes"].as_u64()), (Some(false), Some(2), Some(10 * MIB as u64)), "{cut}");
+    assert!(cut["ended"].as_str().unwrap().contains("ticket_not_ready"), "{cut}");
+    // the node is back: it calls the payments in flight and no channel carries them
+    r.ln.st.lock().unwrap().stranded_off_channel = true;
+    let st = r.status();
+    assert_eq!((st["locked"]["tickets"].as_i64(), st["node"]["in_book_not_on_node"].as_array().map(Vec::len), r.shop.held()), (Some(2), Some(2), 0), "{st}");
+    let ended = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
+    assert_eq!((ended["verdict"].as_str(), ended["rule"].as_str(), ended["tickets_released"].as_u64()), (Some("deny"), Some("ticket_session_ended"), Some(0)), "{ended}");
+    assert_ne!(r.session(&sid)["sessions"][0]["state"], "open");
+    // the next call opens another session and pays. The two stranded tickets stay locked in the book, and are the two
+    // the owner lets the wallet hold with one seller: the new session holds none and buys a prepaid ticket
+    let next = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
+    assert_eq!((next["status"].as_u64(), next["complete"].as_bool(), next["tickets_released"].as_u64(), next["tickets_prepaid"].as_u64()),
+               (Some(200), Some(true), Some(1), Some(1)), "{next}");
+    assert_ne!(next["session"].as_str(), Some(sid.as_str()));
+    // one number on the node, at the seller, in the book and in the ledger: three held tickets and the prepaid one
+    wait_for("the last ticket to settle", || r.money().0 == 4 * TICKET);
+    assert_eq!(r.money(), (4 * TICKET, 4 * TICKET, 4 * TICKET, 4 * SETTLED));
+    let stranded: Vec<Value> = r.session(&sid)["session_tickets"].as_array().unwrap().iter().filter(|t| t["state"] == "locked").cloned().collect();
+    assert_eq!((stranded.len(), stranded.iter().map(|t| t["booked_sats"].as_i64().unwrap()).sum::<i64>()), (2, 0),
+               "locked for as long as the node calls them in flight, and no secret of theirs left: {stranded:?}");
 }

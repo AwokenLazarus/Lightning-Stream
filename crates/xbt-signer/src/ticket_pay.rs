@@ -21,6 +21,8 @@
 //! | A call uses at most `max_sats`, by the wallet's own count, and ends within the owner's `max_answer_s`. | [`Signer::ticket_request`] refuses a head price above it; [`Stream::over`] cuts the body where its price reaches it or its time is up. |
 //! | Held tickets first; a prepaid one only where none can be held. | [`Signer::ticket_release_one`] buys a prepaid ticket only when the session has no held ticket to release and the book says it pays that way now ([`crate::ticket::Session::prepaid_now`]: a pool of none, or a wait after a lock that found no slot). The purchase itself is the book's ([`Signer::ticket_prepay`]), one at a time. |
 //! | A seller that says `slots_short` is waited for. | [`Signer::ticket_lock_call`] sets the session's wait from the seller's `retryAfter` and offers it no hash until then. |
+//! | A session that can release nothing more is ended, and said so. | [`Signer::ticket_forgotten`]: the seller's unsigned `session_unknown` to a lock or a `status` stops the session, as an unsigned answer to a paid request does. [`Signer::ticket_release_one`]: a ticket the seller has not shown after `ready_wait_ms` that the wallet's own node carries on no channel ([`Signer::ticket_stranded`]) stops it too. Neither releases or books anything. |
+//! | An invoice that will not be paid gives its place with the seller back. | [`Signer::ticket_fill_once`] asks the seller to cancel the invoices a lock round refused or failed, and [`Signer::ticket_cancel_dead`] those of tickets that failed after their round, each once. The answer is not read. |
 //!
 //! Locks: a session's `busy` (one paid request at a time), then `paying` (one secret at a time),
 //! then `link` (one HTTP exchange at a time, in `seq` order), then `money`. The wallet's spend lock
@@ -262,6 +264,9 @@ pub(crate) struct HttpSession {
     /// Why the last attempt to fill the pool locked nothing: what a release that finds the pool
     /// empty reports.
     unfilled: Mutex<Option<Value>>,
+    /// Hashes of this session's tickets the seller was asked to cancel because their payment had
+    /// failed: each is asked for once.
+    cancel_asked: Mutex<HashSet<String>>,
 }
 
 impl HttpSession {
@@ -699,7 +704,8 @@ impl Signer {
                                                    prepaid: prepaid_terms.clone(), base, busy: Mutex::new(()),
                                                    paying: Mutex::new(()), link: Mutex::new(Link { seller_sid: String::new(), key: Zeroizing::new([0u8; 32]), next_seq: 0 }),
                                                    money: Mutex::new(Money::default()), streaming: AtomicBool::new(false), refilling: AtomicBool::new(false),
-                                                   used: Mutex::new(self.engine.now()), unfilled: Mutex::new(None) });
+                                                   used: Mutex::new(self.engine.now()), unfilled: Mutex::new(None),
+                                                   cancel_asked: Mutex::new(HashSet::new()) });
                     // the first pool, before the call goes on. A session that holds nothing, or that found no slot
                     // and waits, goes on where the seller offers prepaid tickets: the call buys one when it needs it
                     let filled = self.ticket_fill(&h);
@@ -763,6 +769,7 @@ impl Signer {
     fn ticket_fill_once(&self, hs: &HttpSession) -> std::result::Result<usize, Value> {
         // the wallet's own node first: no hash goes to a seller that the node could not then pay for
         self.ticket_can_lock(&hs.terms.terms.payee)?;
+        self.ticket_cancel_dead(hs);
         let offer = {
             let _g = self.lock();
             self.ticket_offer_locked(&json!({"session": hs.sid}))
@@ -830,6 +837,7 @@ impl Signer {
             .filter(|h| h.as_str().is_some_and(|h| xbt402::ticket::hex32(h).is_some())).collect();
         if !dead.is_empty() && dead.len() <= hs.terms.terms.max_tickets as usize {
             let _ = self.ticket_call(hs, "cancel", &json!({"hashes": dead}), true);
+            lock(&hs.cancel_asked).extend(dead.iter().filter_map(|h| h.as_str().map(str::to_string)));
         }
         if n == 0 {
             if let Some(d) = why_not {
@@ -842,6 +850,52 @@ impl Signer {
             }
         }
         Ok(n)
+    }
+
+    /// Ask the seller to cancel the invoices of this session's tickets whose payment failed after
+    /// its lock round was over (the wallet's node went away as it sent them, and said so only when
+    /// it was back): a lock round asks for the invoices that failed in it, and these failed
+    /// later. Until the seller cancels such an invoice or it lapses, it takes a place under the
+    /// seller's `maxTickets`, and with 2 places a session whose two sends died could lock nothing
+    /// (`too_many_tickets`) for as long. Each hash is asked for once. Unchecked, like the cancel of
+    /// a lock round: a seller that does not answer cancels them itself when they lapse, and no
+    /// money depends on it.
+    fn ticket_cancel_dead(&self, hs: &HttpSession) {
+        if lock(&hs.link).seller_sid.is_empty() {
+            return;
+        }
+        let dead: Vec<String> = {
+            let asked = lock(&hs.cancel_asked);
+            self.ticket_dead_invoices(&hs.sid).into_iter().filter(|h| !asked.contains(h)).take(hs.terms.terms.max_tickets.max(1) as usize).collect()
+        };
+        if dead.is_empty() {
+            return;
+        }
+        let _ = self.ticket_call(hs, "cancel", &json!({"hashes": dead}), true);
+        lock(&hs.cancel_asked).extend(dead);
+    }
+
+    /// The seller answered a request of the session with `session_unknown` and no receipt: it has
+    /// forgotten the session (a gateway drops one that holds nothing and has been quiet, as this
+    /// one is after the wallet's node was away for that long). Nothing more can be locked or
+    /// released in it, so it is stopped here, and the next call opens another. Returns what the
+    /// caller is told. Like every answer nobody signed, this one moves no money: a session that is
+    /// stopped releases nothing, and what was released in it stays booked until the wallet's own
+    /// node says what became of it.
+    fn ticket_forgotten(&self, hs: &HttpSession, status: u16, v: &Value) -> Option<String> {
+        if status != 402 || protocol_code(v.get("error")) != "session_unknown" {
+            return None;
+        }
+        let why = "the seller has forgotten the session";
+        lock(&hs.money).fault.get_or_insert_with(|| why.to_string());
+        self.ticket_http_stop(hs, why, Duration::ZERO);
+        Some(format!("{why} (HTTP 402 session_unknown): the session was stopped, and the next call opens another"))
+    }
+
+    /// The rule a refusal carries when the seller's `status` could not be had: the session ended
+    /// with it ([`Signer::ticket_forgotten`]), or the seller gave no answer that can be believed.
+    fn status_rule(hs: &HttpSession) -> &'static str {
+        if hs.fault().is_some() { "ticket_session_ended" } else { "ticket_seller" }
     }
 
     /// One `lock` request to the seller: the first of a session, which makes the seller's side of it
@@ -860,6 +914,9 @@ impl Signer {
                 let _ = self.ticket_hold(&hs.sid, wait, "ticket_slots_short");
                 return with(refusal("ticket_slots_short", format!("the seller holds as many tickets as its channels allow and asks buyers to wait {wait} s: \
                                                                    no ticket is locked with it until then")), json!({"retry_after_s": wait, "session": hs.sid}));
+            }
+            if let Some(gone) = self.ticket_forgotten(hs, status, v) {
+                return with(refusal("ticket_session_ended", gone), json!({"session": hs.sid}));
             }
             refusal("ticket_seller", format!("the seller refused the lock: HTTP {status} {code}"))
         };
@@ -1031,7 +1088,8 @@ impl Signer {
                 Ok(v)
             }
             Ok((status, _, Ok(_))) => Err(format!("the seller answered status with HTTP {status}")),
-            Ok((status, _, Err(why))) => Err(format!("the seller's answer to status (HTTP {status}) has no valid receipt: {why}")),
+            Ok((status, v, Err(why))) => Err(self.ticket_forgotten(hs, status, &v)
+                                                 .unwrap_or_else(|| format!("the seller's answer to status (HTTP {status}) has no valid receipt: {why}"))),
             Err(e) => Err(e.msg),
         }
     }
@@ -1069,7 +1127,7 @@ impl Signer {
             let deadline = Instant::now() + TAIL_WAIT;
             loop {
                 if let Err(why) = self.ticket_status_of(hs, true) {
-                    return Err(refusal("ticket_seller", format!("{why}: no secret was released")));
+                    return Err(refusal(Self::status_rule(hs), format!("{why}: no secret was released")));
                 }
                 if lock(&hs.money).tail.is_none() {
                     break;
@@ -1147,7 +1205,7 @@ impl Signer {
         let mut wait = Duration::from_millis(10);
         while !lock(&hs.money).ready.contains(&hash) {
             if let Err(why) = self.ticket_status_of(hs, true) {
-                return Err(refusal("ticket_seller", format!("{why}: no secret was released")));
+                return Err(refusal(Self::status_rule(hs), format!("{why}: no secret was released")));
             }
             if lock(&hs.money).ready.contains(&hash) {
                 break;
@@ -1180,6 +1238,17 @@ impl Signer {
                 return Err(refusal("ticket_session", "the session was stopped: nothing more is released for it"));
             }
             if Instant::now() >= deadline {
+                // a ticket the wallet's own node calls in flight and has on none of its channels (a node that was
+                // killed as it sent it) never arrives: the seller will not show it, and it is the session's oldest,
+                // so every release of the session would wait here. The session ends, and the next call opens
+                // another; the ticket stays locked in the book for as long as the node calls it in flight
+                if self.ticket_stranded(&hash) {
+                    let stopped = self.ticket_http_stop(hs, "a ticket of the session is on none of the wallet's channels", Duration::ZERO);
+                    return Err(with(refusal("ticket_session_ended", "a ticket of this session is on none of the channels of the wallet's Lightning node, though the node \
+                                                                     calls its payment in flight: the seller cannot be shown it, so the session was stopped and no \
+                                                                     secret was released; the next call opens another session"),
+                                    json!({"session": hs.sid, "hash": hash, "stopped": stopped})));
+                }
                 return Err(with(refusal("ticket_not_ready", format!("the seller has not shown the ticket locked on its node within {} ms: no secret was released",
                                                                      tp.ready_wait_ms)), json!({"session": hs.sid, "hash": hash})));
             }
@@ -1245,6 +1314,10 @@ impl Signer {
                         let m = lock(&hs.money);
                         (m.acct.acked_msat == m.acct.sent_msat).then_some(true)
                     }
+                    // (a session that was stopped here sends nothing again: the ticket stays booked until the wallet's node says what became of it)
+                    Err(why) if hs.fault().is_some() => return Err(with(refusal(Self::status_rule(hs), format!("{why}: one released ticket is unconfirmed and stays booked until \
+                                                                                                               the wallet's node shows what became of it")),
+                                                                        json!({"session": hs.sid, "unconfirmed_release": hash}))),
                     Err(why) => return Err(with(refusal("ticket_seller", format!("{why}: one released ticket is unconfirmed; the same secret is sent again by the next call")),
                                                 json!({"session": hs.sid, "unconfirmed_release": hash}))),
                 },

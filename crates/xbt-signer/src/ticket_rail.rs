@@ -565,6 +565,11 @@ impl Signer {
         // what the wallet's own channels allow of held tickets, read now; channels that cannot be read are
         // taken to carry 30 pending payments, and every lock reads them again and refuses without a listing
         let limits = if held.is_some() { self.ticket_limits_read().unwrap_or_else(Limits::unseen) } else { Limits::unseen() };
+        // the book as the node has it now: the pool is sized inside what is still locked with this seller, and a
+        // ticket of an earlier session that the seller has cancelled meanwhile is not
+        if held.is_some() {
+            self.ticket_reconcile_locked();
+        }
         let out = (|| -> Result<Value> {
             let mut g = self.ticket_store()?;
             let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
@@ -587,8 +592,12 @@ impl Signer {
             // and never more than the owner's own caps on held tickets leave: a session beyond them holds nothing
             let committed = st.book.pools_open();
             let to_fill = committed.saturating_sub(st.book.locked(|_| true).tickets).max(0);
+            // nor more than the owner's cap on tickets locked with this seller has left: tickets of an earlier session
+            // with it that are still locked (being cancelled, or called in flight by a node that carries them on no
+            // channel) count against that cap in every lock round, so a pool sized without them could not be filled
             let room = limits.room(committed, to_fill).min(tp.max_locked_tickets.saturating_sub(committed))
-                .min(task.max_locked_tickets.saturating_sub(st.book.pools_open_in(Some(&task_name))));
+                .min(task.max_locked_tickets.saturating_sub(st.book.pools_open_in(Some(&task_name))))
+                .min(cap_tickets.saturating_sub(st.book.locked(|t| t.payee == terms.payee).tickets));
             // what an earlier session with this seller learnt about its route, if it is recent
             let before = st.book.held_less(&terms.payee, now).cloned();
             let held_size = held.as_ref().map(|t| {
@@ -1697,6 +1706,28 @@ impl Signer {
             },
             Err(_) => (None, 0),
         }
+    }
+
+    /// Whether the wallet's own node calls a ticket's payment in flight and carries it on none of
+    /// its channels: seen of a Lightning Fork node that was killed as it sent the payment
+    /// (`docs/LIMITS.md`). The seller will never show such a ticket locked. `false` whenever the
+    /// node or its channel list cannot be read: nothing is concluded from a node that gave no answer.
+    pub(crate) fn ticket_stranded(&self, hash: &str) -> bool {
+        let Some(ln) = self.ln.clone() else { return false };
+        let Ok(Some(p)) = ln.lookup(hash) else { return false };
+        if str_or_empty(p.get("status")) != "IN_FLIGHT" {
+            return false;
+        }
+        ln.channels().is_ok_and(|cs| !htlc_locks(&cs, &|_| true).list.iter().any(|h| str_or_empty(h.get("payment_hash")) == hash))
+    }
+
+    /// Held tickets of a session whose invoice was sent to the node and whose payment failed: the
+    /// seller may still count each against the session's `maxTickets`, until it cancels the
+    /// invoice or the invoice lapses.
+    pub(crate) fn ticket_dead_invoices(&self, sid: &str) -> Vec<String> {
+        let Ok(g) = self.ticket_store() else { return vec![] };
+        let Some(st) = g.as_ref() else { return vec![] };
+        st.book.of_session(sid).into_iter().filter(|t| t.state == TState::Failed && !t.prepaid && t.sent_ts > 0.0).map(|t| t.hash.clone()).collect()
     }
 
     /// Give up hashes of a session that were offered and whose lock round never came to an invoice
