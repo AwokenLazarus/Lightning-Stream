@@ -165,7 +165,7 @@ The rules it keeps, beside those of the table above:
 
 | Rule | Where |
 |---|---|
-| A chain is made for one session from fresh random bytes, and its anchor is sent before any value of the buyer's. A session lives in the process only: a restart forgets the chain with the values it revealed for. | `lottery.rs`, `Book::open`; `gateway/draws.rs`, `lottery_open` |
+| A chain is made for one session from fresh random bytes, and its anchor is sent before any value of the buyer's. A session outlives a restart: its seed is in the lottery's journal, and a draw is on disk before the reveal for it leaves, so a restart never takes a second value for a draw it revealed for. | `lottery.rs`, `Book::open`; `gateway/draws.rs`, `lottery_open` |
 | A piece waits for its value only once it has left. | `Gateway::lottery_route`, `lottery_pump` |
 | A value is taken only as the next draw, for a piece that was served, at its price, once. The chain value of a draw leaves only in the answer to the request that brought its value. | `xbt402::lottery::Seller::take`, `Book::draw` |
 | A win is paid when the node shows its invoice settled for the full amount, never on a buyer's word. One invoice for a win at a time; another only when the node has cancelled the first. | `Gateway::lottery_refresh`, `Book::claim_invoice` |

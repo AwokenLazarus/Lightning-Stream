@@ -55,6 +55,8 @@ struct State {
     cancel_yes_for_settled: bool,
     /// The next lookup is answered as if the connection had died.
     lose_lookup_answer: bool,
+    /// The next ordinary invoice is made, and its answer lost as if the connection had died.
+    lose_invoice_answer: bool,
     pubkey: String,
     networks: Vec<String>,
     /// What `channels` answers (`None`: the node was given no channels macaroon).
@@ -205,6 +207,10 @@ impl StandIn {
         self.lock().lose_lookup_answer = true;
     }
 
+    pub fn lose_next_invoice_answer(&self) {
+        self.lock().lose_invoice_answer = true;
+    }
+
     pub fn set_identity(&self, pubkey: &str, networks: &[&str]) {
         let mut s = self.lock();
         s.pubkey = pubkey.to_string();
@@ -309,6 +315,9 @@ impl Node for StandIn {
         );
         s.preimages.insert(hash, *preimage);
         self.touch(&mut s);
+        if std::mem::take(&mut s.lose_invoice_answer) {
+            return Err(NodeError::Unreachable("connection reset".into()));
+        }
         Ok(format!("lnbcrt-standin-{}", hex::encode(hash)))
     }
 

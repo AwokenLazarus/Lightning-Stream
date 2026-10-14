@@ -395,6 +395,46 @@ impl Seller {
         Ok(Self { session: session.into(), win_msat, chain, drawn: 0, pending: BTreeMap::new(), recent: VecDeque::new(), seen: HashSet::new(), served: HashSet::new() })
     }
 
+    /// A seller that comes back after a restart, from what it wrote down: the session's chain (made
+    /// again from its seed) and the number of draws it had taken. The pieces that were open are
+    /// served again ([`Self::serve`]) and the last draws put back ([`Self::remember`]) by the
+    /// caller, from its own record.
+    ///
+    /// `drawn` MUST be no lower than the last draw this session ever revealed for: the caller
+    /// has it on disk before a reveal leaves ([`Self::take`]). A seller resumed below that would
+    /// take a second value for a draw whose chain value the buyer holds, which is the buyer
+    /// choosing the result. Resumed above it, it has only skipped draws it never revealed for.
+    pub fn resume(session: &str, win_msat: u64, chain: Chain, drawn: u64) -> Result<Self, DrawError> {
+        if drawn > u64::from(chain.len()) {
+            return Err(DrawError::ChainSpent);
+        }
+        let mut s = Self::new(session, win_msat, chain)?;
+        s.drawn = drawn;
+        Ok(s)
+    }
+
+    /// Put a draw taken before a restart back among the ones a repeated message is answered for
+    /// ([`Self::take`] answers it as it did the first time). False: the draw is not one this
+    /// seller has taken, or is there already. The values of older draws are not known again
+    /// after a restart, so [`DrawError::ValueReused`] is then told only for these; that check is
+    /// for the buyer's sake (its own side keeps it too), and no rule of the seller's rests on it.
+    pub fn remember(&mut self, taken: Taken) -> bool {
+        if taken.draw == 0 || taken.draw > self.drawn || self.recent.iter().any(|t| t.draw == taken.draw) {
+            return false;
+        }
+        self.seen.insert(prefix(&taken.value));
+        if self.recent.len() == RECENT_DRAWS {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(Taken { repeated: false, ..taken });
+        true
+    }
+
+    /// The last draws taken, oldest first: the ones a repeated message can still be answered for.
+    pub fn recent(&self) -> impl Iterator<Item = &Taken> {
+        self.recent.iter()
+    }
+
     pub fn anchor(&self) -> [u8; 32] {
         self.chain.anchor()
     }
@@ -1153,6 +1193,59 @@ mod tests {
         assert!(seller.void(piece(1, 0, 100).id));
         seller.forget_before(3);
         assert_eq!(seller.served.len(), 0);
+    }
+
+    #[test]
+    fn a_seller_that_is_resumed_takes_no_second_value_for_a_draw_it_revealed_for() {
+        let mut rng = Rng(12);
+        let seed = rng.bytes();
+        let mut seller = Seller::new("s1", WIN, Chain::new(seed, 64).unwrap()).unwrap();
+        let mut buyer = Buyer::new("s1", WIN, seller.anchor(), 64).unwrap();
+        let mut sent = vec![];
+        for j in 0..5u64 {
+            let p = piece(1, j, 16_000);
+            seller.serve(p).unwrap();
+            let v = rng.bytes();
+            let d = buyer.issue(p, v, 8).unwrap();
+            sent.push((d, p, v, seller.take(d, p.id, p.amount_msat, &v).unwrap().won));
+        }
+        let (drawn, reveal) = seller.reveal().unwrap();
+        // one piece is open when the seller stops: served, no value yet
+        let open = piece(2, 0, 16_000);
+        seller.serve(open).unwrap();
+        // what it wrote down: the seed, the draws taken, the open piece, the last draws
+        let kept: Vec<Taken> = seller.recent().copied().collect();
+        let mut back = Seller::resume("s1", WIN, Chain::new(seed, 64).unwrap(), drawn).unwrap();
+        back.serve(open).unwrap();
+        for t in &kept {
+            assert!(back.remember(*t));
+            assert!(!back.remember(*t), "once");
+        }
+        assert_eq!((back.drawn(), back.left(), back.pending_count(), back.anchor()), (5, 59, 1, seller.anchor()));
+        // the same chain: its reveal is the one the buyer was sent, and checks out
+        assert_eq!(back.reveal(), Some((drawn, reveal)));
+        assert_eq!(buyer.absorb(drawn, &reveal).unwrap().iter().map(|o| o.win.is_some()).collect::<Vec<_>>(), sent.iter().map(|s| s.3).collect::<Vec<_>>());
+        // the buyer holds c[5] now. Another value for draw 5, or for any draw before it: refused
+        let (d, p, v, won) = sent[4];
+        assert_eq!(back.take(d, p.id, p.amount_msat, &rng.bytes()).unwrap_err(), DrawError::ValueConflict);
+        assert_eq!(back.take(3, sent[2].1.id, 16_000, &rng.bytes()).unwrap_err(), DrawError::ValueConflict);
+        // the same message again: the same answer, and no second draw
+        let again = back.take(d, p.id, p.amount_msat, &v).unwrap();
+        assert!(again.repeated && again.won == won && back.drawn() == 5);
+        // a value it was given before the restart is still a value used
+        assert_eq!(back.take(6, open.id, open.amount_msat, &v).unwrap_err(), DrawError::ValueReused);
+        // and the session goes on where it was: the open piece is draw 6, on the chain the buyer checks
+        let v6 = rng.bytes();
+        assert_eq!(buyer.issue(open, v6, 8).unwrap(), 6);
+        let t = back.take(6, open.id, open.amount_msat, &v6).unwrap();
+        let (drawn, reveal) = back.reveal().unwrap();
+        assert_eq!(buyer.absorb(drawn, &reveal).unwrap()[0].win.is_some(), t.won);
+        // a seller that wrote nothing down about its last draws answers them as too old, never anew
+        let mut bare = Seller::resume("s1", WIN, Chain::new(seed, 64).unwrap(), 5).unwrap();
+        assert_eq!(bare.take(5, p.id, p.amount_msat, &rng.bytes()).unwrap_err(), DrawError::DrawUsed);
+        assert!(!bare.remember(Taken { draw: 6, ..kept[0] }) && !bare.remember(Taken { draw: 0, ..kept[0] }), "only a draw it has taken");
+        assert_eq!(Seller::resume("s1", WIN, Chain::new(seed, 64).unwrap(), 65).unwrap_err(), DrawError::ChainSpent);
+        assert!(Seller::resume("s1", WIN, Chain::new(seed, 64).unwrap(), 64).unwrap().reveal().is_some_and(|(i, c)| i == 64 && c == seed));
     }
 
     #[test]

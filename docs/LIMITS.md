@@ -264,10 +264,22 @@ involved no node.
   the first has lapsed (60 s); a seller whose grace is shorter has stopped serving by then, and
   serves again when it is paid.
 - A wallet that starts again pays no win it found before the start: it cannot tell a start from
-  a restore of older records, in which that win may be paid already. A gateway that starts again
-  has forgotten its lottery sessions, their unpaid wins with them; the wallet opens another
-  session. In both cases the seller has lost the wins that were unpaid at that moment (at most
-  the 2 it bears). A session of draws holds nothing, so there is nothing to recover.
+  a restore of older records, in which that win may be paid already; the seller has lost the
+  wins that were unpaid at that moment (at most the 2 it bears). A gateway that starts again
+  keeps its lottery sessions (`lottery.jsonl` in its state directory): each comes back with its
+  chain, its draws, its open pieces and its unpaid wins, and a win paid while it was down is
+  seen paid. Until 2026-10-14 a restart forgot them all, and with them the wins that were unpaid.
+- The lottery's journal holds each session's seed. Whoever can read the state directory can work
+  out every draw of every session to come, and a buyer that could would never win. It is
+  written private to the gateway's owner, as the session keys and the receipt key are.
+- What keeps a restart from taking a second value for a draw it revealed for is that draw being
+  on disk first: every answer that reveals waits for the journal's sync (a few milliseconds on
+  an SSD, more on a slow disk; not measured on the lab). A disk that cannot be written ends the
+  session whose draw it was (`500 journal`, nothing revealed). Everything else is synced twice a
+  second: a power cut can lose the last half second of pieces served and values voided, which
+  the buyer then has free, and of seqs used up, which it is told again (`bad_seq`). A gateway
+  that starts reads every session's chain again: `chain_draws` hashes each, about 64 times
+  65,536 with the default caps.
 - A buyer's node that is killed as it sends a win's payment can go on calling that payment in
   flight with nothing on its channel (the same behaviour as for a ticket, below). The wallet
   keeps that win booked as spent and does not pay it again, the seller is not paid for it, and

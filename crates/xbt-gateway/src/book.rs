@@ -195,8 +195,8 @@ pub enum Rec {
     },
 }
 
-impl Rec {
-    pub fn to_json(&self) -> Value {
+impl crate::store::Record for Rec {
+    fn to_json(&self) -> Value {
         match self {
             Self::Session { id, key, addr } => {
                 json!({"t": "session", "id": id, "key": hex::encode(key), "addr": addr})
@@ -228,8 +228,7 @@ impl Rec {
         }
     }
 
-    /// `None`: not a record this version writes. A journal with such a line is not loaded.
-    pub fn from_json(v: &Value) -> Option<Self> {
+    fn from_json(v: &Value) -> Option<Self> {
         let s = |k: &str| v.get(k).and_then(Value::as_str);
         let h = |k: &str| s(k).and_then(hex32);
         let n = |k: &str| v.get(k).and_then(Value::as_u64);
@@ -1035,6 +1034,7 @@ fn carry_hash(session: &str) -> Hash {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::Record;
 
     pub(crate) fn caps() -> Caps {
         Caps {

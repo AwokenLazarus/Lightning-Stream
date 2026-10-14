@@ -55,6 +55,7 @@ use xbt_svc::http::{
 use crate::book::{Book, Rec, Refusal};
 use crate::config::{Config, Release, Route, SERVICES_PATH};
 use crate::node::{Hash, Invoice, InvoiceState, Node, NodeError};
+pub use draws::JOURNAL as LOTTERY_JOURNAL;
 use crate::price::Meter;
 use crate::store::{Store, COMPACT_AT};
 use crate::upstream::{decoded_path, forwarded, returned, Answer, Upstream};
@@ -262,6 +263,11 @@ impl Gateway {
             .into_iter()
             .filter(|h| book.ticket(h).is_some_and(|t| !t.prepaid))
             .collect();
+        // the lottery's sessions, as its own journal beside the tickets' has them
+        let lottery = match cfg.lottery.clone() {
+            Some(l) => Some(draws::Lottery::open(l, &cfg.state_dir, clock())?),
+            None => None,
+        };
         let upstream = Upstream::new(&cfg.upstream, cfg.times.upstream_wait);
         let gw = Arc::new(Self {
             terms,
@@ -282,13 +288,14 @@ impl Gateway {
             clock,
             settled: AtomicU64::new(0),
             settle_max_us: AtomicU64::new(0),
-            lottery: cfg.lottery.clone().map(draws::Lottery::new),
+            lottery,
             cfg,
         });
         for hash in unfinished {
             gw.watch(hash)
                 .map_err(|e| Error::Start(format!("a watcher thread: {e}")))?;
         }
+        gw.lottery_restored();
         let j = gw.clone();
         std::thread::Builder::new()
             .name("gateway-janitor".into())
@@ -326,11 +333,22 @@ impl Gateway {
         self.stop.store(true, Ordering::SeqCst);
         st.store.close();
         drop(st);
+        if let Some(l) = &self.lottery {
+            l.close();
+        }
         self.credited.notify_all();
     }
 
     pub fn terms(&self) -> &Terms {
         &self.terms
+    }
+
+    /// For tests: the lottery's journal stops taking records, as a full disk would.
+    #[doc(hidden)]
+    pub fn break_lottery_journal(&self) {
+        if let Some(l) = &self.lottery {
+            l.close();
+        }
     }
 
     pub fn stats(&self) -> Stats {

@@ -586,8 +586,10 @@ PAYMENT-SIGNATURE: base64({"x402Version": 2, "accepted": <the lottery entry>,
 
 - The seller MUST make a new chain for every session, from fresh random bytes, and send its
   anchor before it has any value of the buyer's. A chain used for two sessions lets their
-  buyers know values ahead and lose on purpose. The gateway keeps a session and its chain in
-  memory only, so a restart cannot bring a chain back.
+  buyers know values ahead and lose on purpose. A seller whose sessions outlive a restart keeps
+  each chain's seed where only it can read it: whoever reads the seed knows every draw to come.
+  The gateway writes it to the lottery's journal in its state directory (`lottery.jsonl`,
+  private to its owner, beside the session keys and the receipt key).
 - The seller MUST cap sessions, in all and from one address, and forget a quiet one. A session
   costs `chainDraws` hashes to make and about 34 KiB to keep at the default length (one chain value
   in every 1,024 and the block last read), and anyone can ask for one. Every session is also
@@ -701,6 +703,11 @@ The seller:
   refused (`value_reused`).
 - MUST NOT reveal `c[i]` before it holds the value of draw `i`. A reveal discloses every chain
   value below it.
+- MUST have draw `i` on disk before `c[i]` leaves, where its sessions outlive a restart. A
+  restart that had lost the draw would take a second value for it from a buyer that holds
+  `c[i]`, and that buyer then chooses the result. The gateway syncs its lottery journal before
+  every answer that reveals; a draw it cannot write down is not revealed (`500 journal`), and
+  its session ends.
 - MUST mark a piece as served no earlier than when its last bytes leave. The gateway marks a
   piece just before its last write, so that a buyer that has all of it never names a piece the
   seller does not know; the last, short piece of a body of unknown length is marked when the body
@@ -741,7 +748,9 @@ less the `window` the seller may be ahead of it.
 
 The seller treats a win as paid when its own node shows that invoice settled for the full
 amount, never on the buyer's word. The gateway makes the preimage of each invoice itself, gives
-it to the node and keeps no copy, makes one invoice for a win at a time, and makes another only
+it to the node and keeps no copy, writes the invoice's payment hash to its journal, on disk,
+before the node is asked (so that a win paid across a restart is seen paid), makes one invoice
+for a win at a time, and makes another only
 when the node shows the first cancelled (it lapsed unpaid).
 
 A payment that fails (no route, a fee limit) is not a spent one. The wallet does not send that
@@ -863,7 +872,7 @@ budgets, `max_sellers`, `max_new_sellers_per_min`, `max_sends_per_hour`.
 |---|---|---|
 | Seller | The service given to a buyer that gives values and never pays: up to its first unpaid win, and the grace. | `winMsat` (a smaller win for a buyer it does not know), `graceSeconds`, `gracePieces`, `maxUnpaidWins`. Measured in section 9.12. |
 | Seller | `window` pieces to a buyer that sends no values, or that voids every piece, for every session it is given: 8 pieces of a quarter of a win at the most, 2 wins. One address is given 4 sessions and gets each place back after a minute: 8 wins a minute at the most. All 64 places, taken from 16 addresses or more: 128 wins a minute. | `window`; the dearest piece a route may have (`max_odds_den`); the caps on sessions and on sessions from one address; a session that never drew, or was closed while it owed, keeps its place for a minute. Behind a reverse proxy the cap per address counts nothing unless the runner names the proxy and its header (`http.forwarded_address`): the gateway then believes that header from that proxy's address, the last entry of a list, and counts a request without one under the proxy's own address. A proxy that passes on a header its client wrote, or a gateway that can be reached past the proxy from one of the named addresses, makes the cap the buyer's to set. |
-| Seller | A win it never invoices or whose invoice lapses. | Its own node and gateway. A session, with its unpaid wins, does not outlive the gateway's process. |
+| Seller | A win it never invoices or whose invoice lapses. | Its own node and gateway. A session and its unpaid wins outlive a restart of the gateway (its lottery journal); a win whose invoice the node made and the gateway never learnt of (the answer lost, then a restart) is cancelled on the node and invoiced again. A lost state directory loses them all. |
 | Seller | Uneven income: a seller that earns less than a win from a buyer is usually paid nothing by it, and sometimes a whole win. | The number of wins: pay is within 20% after about 68 wins. |
 | Buyer | Nothing beyond wins it worked out itself. An unlucky run costs more than the price, a lucky one less. | The owner's caps on a win, on the odds and on wins to an unnamed seller; the luck cap of a call; the task's budget. |
 | Buyer | A win it could not pay (its node away, no route, a cap reached): the seller stops serving it. | The grace. A signer that starts again pays no win it found before: it cannot tell a start from a restore of older records, in which that win may be paid already. |
@@ -879,8 +888,10 @@ Beside those of section 3 that apply (`bad_auth`, `bad_seq`, `session_unknown`,
 not one the terms offer by lottery), `win_size` (the size asked for at `open` is outside the terms),
 `chain_spent`, and, for a value in a `draw` request, `draw_out_of_order`, `draw_used` (a draw
 taken too long ago to answer again), `piece_unknown`, `amount_mismatch`, `value_conflict`,
-`value_reused`. A gateway that restarts has forgotten its sessions and answers
-`session_unknown`, unsigned; the wallet ends its session and opens another.
+`value_reused`. A session outlives a restart of the gateway, with its draws, its open pieces
+and its unpaid wins. One the gateway has forgotten (closed, quiet too long, or one whose draw
+it could not write down) is answered `session_unknown`, unsigned; the wallet ends its session
+and opens another.
 
 ### 9.11 What building it changed in the design
 

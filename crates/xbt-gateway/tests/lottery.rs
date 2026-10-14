@@ -570,7 +570,7 @@ fn a_body_priced_per_second_is_a_draw_for_every_second_it_is_open() {
 }
 
 #[test]
-fn sessions_are_capped_a_wrong_size_is_refused_and_a_session_does_not_outlive_the_gateway() {
+fn sessions_are_capped_a_wrong_size_is_refused_and_a_session_outlives_the_gateway() {
     let (rig, _d) = start(&lottery);
     for bad in [json!({}), json!({"version": "ticket/0"}), json!({"version": "lottery/0", "winMsat": 64000})] {
         assert_eq!(Drawer::open_raw(&rig, &bad).status, 400, "{bad}");
@@ -603,16 +603,24 @@ fn sessions_are_capped_a_wrong_size_is_refused_and_a_session_does_not_outlive_th
     assert_eq!(closed.status, 200);
     assert_eq!(receipt_of(&closed, &b.receipt_key)["servedMsat"], "2500");
     assert_eq!(b.get("/api").1.error(), "session_unknown");
-    // a restart of the gateway: the session is unknown, and says so plainly
+    // a restart of the gateway: the session goes on where it was, its piece still open
     let mut c = Drawer::open(&rig, 31);
-    assert_eq!(c.get("/api").1.status, 200);
+    let (seq, got) = c.get("/api");
+    assert_eq!(got.status, 200);
     let dir = _d;
     let (node, service, clock) = rig.stop();
     let rig = start_on(dir.path(), node, service, clock, &lottery);
     c.addr = rig.addr.clone();
-    let (_, got) = c.get("/api");
+    b.addr = rig.addr.clone();
+    let st = c.status();
+    assert_eq!((st["session"]["pending"].as_u64(), st["session"]["servedMsat"].as_str()), (Some(1), Some("2500")));
+    let p = c.piece(seq, "/api", Kind::Request, 0, 2500);
+    assert_eq!(c.draw(&[p])["refused"], Value::Null);
+    // and a closed one stays closed: known to nobody, unsigned
+    let (_, got) = b.get("/api");
     assert_eq!((got.status, got.error().as_str()), (402, "session_unknown"));
     assert!(got.header("PAYMENT-RESPONSE").is_none(), "a forgotten session has no totals to sign");
+    assert_eq!(rig.gw.stats().held_tickets, 0);
 }
 
 #[test]
@@ -791,4 +799,176 @@ fn a_request_with_no_piece_is_not_a_draw_and_a_session_of_draws_is_told_nothing_
     assert!(got.header("Content-Type").is_none() && got.header("Content-Length").is_none(), "{:?}", got.headers);
     assert_eq!(receipt_of(&got, &b.receipt_key)["charged"], "0");
     assert_eq!(b.status()["session"]["pending"], 0);
+}
+
+/// The lottery's journal of a gateway's state directory, a record a line.
+fn journal_of(dir: &std::path::Path) -> Vec<Value> {
+    std::fs::read_to_string(dir.join(xbt_gateway::gateway::LOTTERY_JOURNAL)).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+}
+
+/// Whether the journal holds draw `draw` of `session` taken: as a record of its own, or inside the
+/// session's counters after a rewrite.
+fn holds_draw(journal: &[Value], session: &str, draw: u64) -> bool {
+    journal.iter().any(|r| r["session"] == session && r["t"] == "take" && r["draw"].as_u64() == Some(draw))
+        || journal.iter().any(|r| r["t"] == "session" && r["id"] == session && r["drawn"].as_u64() >= Some(draw))
+}
+
+/// A status call that adopts the seq the gateway expects, as a buyer does after the gateway lost a
+/// few of its last counters.
+fn status_adopting(b: &mut Drawer) -> Got {
+    for _ in 0..2 {
+        let got = b.call("status", &json!({}));
+        if got.status == 402 && got.error() == "bad_seq" {
+            b.seq = got.json()["nextSeq"].as_u64().unwrap();
+            continue;
+        }
+        return got;
+    }
+    panic!("the gateway kept refusing the seq it asked for");
+}
+
+/// Stop a gateway without touching its node: the node's state is what a kill leaves.
+fn halt(rig: Rig) -> (std::sync::Arc<xbt_gateway::standin::StandIn>, (xbt_svc::http::Running, std::sync::Arc<Service>), std::sync::Arc<std::sync::atomic::AtomicU64>) {
+    rig.gw.stop();
+    rig.running.stopper().stop();
+    for t in rig.running.threads {
+        let _ = t.join();
+    }
+    (rig.node, (rig.service_running, rig.service), rig.clock)
+}
+
+#[test]
+fn a_session_and_its_unpaid_wins_outlive_a_restart_and_a_kill_at_any_write_of_the_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let rig = start_on(&state, std::sync::Arc::new(xbt_gateway::standin::StandIn::new(100)), start_service(), std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1_000_000)), &lottery);
+    let mut b = Drawer::open(&rig, 60);
+    // pages, each drawn for. Every reveal the buyer is sent is for draws the journal holds already:
+    // they were written, and synced, before the answer left
+    let mut wins = vec![];
+    while wins.len() < 2 {
+        let (seq, got) = b.get("/api");
+        assert_eq!(got.status, 200, "{}", String::from_utf8_lossy(&got.body));
+        let p = b.piece(seq, "/api", Kind::Request, 0, 2500);
+        let j = b.draw(&[p]);
+        let drawn = j["drawn"].as_u64().unwrap();
+        assert!(holds_draw(&journal_of(&state), &b.session, drawn), "draw {drawn} was revealed before the journal held it");
+        if let Some(&w) = b.owed.last() {
+            // the win's invoice is the journal's, by its hash, as soon as the buyer has it
+            let h = b.invoice_hash(&j, w);
+            assert!(journal_of(&state).iter().any(|r| r["t"] == "invoice" && r["hash"] == hex::encode(h)));
+            wins.push((w, h));
+            b.owed.clear();
+        }
+    }
+    // the first win is paid; the second's invoice lapses, and the node makes its next one but the
+    // answer is lost: that invoice is the journal's by its hash alone
+    let ((_, paid), (second, lapsed)) = (wins[0], wins[1]);
+    assert!(rig.node.pay(&paid));
+    assert_eq!(b.status()["wins"].as_array().unwrap().len(), 1);
+    rig.node.expire_unpaid(&lapsed);
+    rig.node.lose_next_invoice_answer();
+    let st = b.status();
+    assert_eq!(st["wins"], json!([{"draw": second, "invoice": null}]), "an invoice whose answer was lost is not listed");
+    let asked: Vec<String> = journal_of(&state).iter().filter(|r| r["t"] == "invoice" && r["draw"].as_u64() == Some(second)).map(|r| r["hash"].as_str().unwrap().to_string()).collect();
+    let unknown = hex32(asked.last().unwrap()).unwrap();
+    assert_eq!((asked.len(), rig.node.state_of(&unknown)), (2, Some(InvoiceState::Open)), "the node made it; the gateway does not know its text");
+    // and one piece is served that has no value yet
+    let (open_seq, got) = b.get("/api");
+    assert_eq!(got.status, 200);
+    let full = b.status()["session"].clone();
+    let (node, mut service, clock) = halt(rig);
+    // the journal as the kill would find it: before a restart rewrites it
+    let whole: Vec<String> = std::fs::read_to_string(state.join(xbt_gateway::gateway::LOTTERY_JOURNAL)).unwrap().lines().map(str::to_string).collect();
+
+    // a restart on the whole journal: the session, its open piece and its unpaid win, which gets an
+    // invoice anew once the one the node made unseen is cancelled there
+    let rig = start_on(&state, node.clone(), service, clock.clone(), &lottery);
+    b.addr = rig.addr.clone();
+    let st = status_adopting(&mut b).json();
+    for k in ["drawn", "pending", "servedMsat", "wonMsat", "paidMsat", "voids"] {
+        assert_eq!(st["session"][k], full[k], "{k}");
+    }
+    let fresh = Drawer::hash_in(&st, second);
+    assert!(fresh != unknown && fresh != lapsed);
+    assert_eq!((node.state_of(&unknown), node.state_of(&fresh)), (Some(InvoiceState::Canceled), Some(InvoiceState::Open)));
+    // the open piece is drawn for where it was, and the win is paid on its new invoice
+    let p = b.piece(open_seq, "/api", Kind::Request, 0, 2500);
+    assert_eq!(b.draw(&[p])["refused"], Value::Null);
+    assert!(node.pay(&fresh));
+    let st = b.status();
+    assert!(st["wins"].as_array().unwrap().iter().all(|w| w["draw"] != second), "{st}");
+    let (node, s2, clock) = halt(rig);
+    service = s2;
+
+    // a kill at every write: the journal cut after each of its first `lines` records, a gateway
+    // started on what is left. Each starts, takes back no draw it held, answers the last draw it
+    // holds as it did, and lists no win the node shows paid
+    let all: Vec<Value> = whole.iter().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let (mut restored, mut repeated, mut listed) = (0, 0, 0);
+    for n in 0..=whole.len() {
+        let cut = dir.path().join(format!("cut-{n}"));
+        std::fs::create_dir_all(&cut).unwrap();
+        let mut text: String = whole[..n].iter().map(|l| format!("{l}\n")).collect();
+        // and a write the kill tore in half
+        text.push_str(&whole[n.min(whole.len() - 1)][..10]);
+        std::fs::write(cut.join(xbt_gateway::gateway::LOTTERY_JOURNAL), text).unwrap();
+        let rig = start_on(&cut, node.clone(), service, clock.clone(), &lottery);
+        let mut c = Drawer { addr: rig.addr.clone(), seq: 0, outcomes: vec![], owed: vec![], ..Drawer::open(&rig, 61) };
+        c.session = b.session.clone();
+        c.key = b.key;
+        let opened = all[..n].iter().any(|r| r["t"] == "session" && r["id"] == b.session.as_str());
+        let got = status_adopting(&mut c);
+        if !opened {
+            assert_eq!((got.status, got.error().as_str()), (402, "session_unknown"), "{n}");
+        } else {
+            assert_eq!(got.status, 200, "{n}: {}", String::from_utf8_lossy(&got.body));
+            let st = got.json();
+            let drawn = st["session"]["drawn"].as_u64().unwrap();
+            let held = (1..=drawn).all(|d| holds_draw(&all[..n], &b.session, d));
+            assert!(held, "{n}: drawn {drawn} with draws the cut journal does not hold");
+            // the last draw it holds is answered as it was the first time
+            if let Some(o) = b.outcomes.iter().find(|o| o.draw == drawn) {
+                let p = &o.piece;
+                let v = b.draws.open().count();
+                assert_eq!(v, 0);
+                let sent = all[..n].iter().find(|r| r["t"] == "take" && r["draw"].as_u64() == Some(drawn)).map(|r| r["value"].as_str().unwrap().to_string());
+                if let Some(value) = sent {
+                    let j = c.call("draw", &json!({"values": [{"draw": drawn, "seq": p.id.seq, "kind": p.id.kind.name(), "k": p.id.k, "amountMsat": p.amount_msat.to_string(), "value": value}]})).json();
+                    assert_eq!((j["refused"].clone(), j["drawn"].as_u64()), (Value::Null, Some(drawn)), "{n}: {j}");
+                    repeated += 1;
+                }
+            }
+            // every win it lists has an invoice the node holds open, and the paid ones are not listed
+            for w in st["wins"].as_array().unwrap() {
+                let h = Drawer::hash_in(&st, w["draw"].as_u64().unwrap());
+                assert_eq!(node.state_of(&h), Some(InvoiceState::Open), "{n}: {st}");
+                assert!(h != paid && h != fresh, "{n}: a win the node shows paid is listed unpaid");
+                listed += 1;
+            }
+            restored += 1;
+        }
+        let (n2, s2, c2) = halt(rig);
+        drop((n2, c2));
+        service = s2;
+    }
+    assert!(restored + 1 >= whole.len() && repeated * 4 >= restored * 3 && listed > 0, "{restored} restored, {repeated} draws answered again, {listed} wins listed, of {} cuts", whole.len() + 1);
+}
+
+#[test]
+fn a_draw_that_cannot_be_written_down_is_not_revealed_and_ends_its_session() {
+    let (rig, _d) = start(&lottery);
+    let mut b = Drawer::open(&rig, 62);
+    let (seq, got) = b.get("/api");
+    assert_eq!(got.status, 200);
+    rig.gw.break_lottery_journal();
+    let p = b.piece(seq, "/api", Kind::Request, 0, 2500);
+    let v = b.fresh_value();
+    b.draws.issue(p, v, 64).unwrap();
+    let values: Vec<Value> = b.draws.open().map(|(d, p, v)| json!({"draw": d, "seq": p.id.seq, "kind": p.id.kind.name(), "k": p.id.k, "amountMsat": p.amount_msat.to_string(), "value": hex::encode(v)})).collect();
+    let got = b.call("draw", &json!({"values": values}));
+    assert_eq!((got.status, got.error().as_str()), (500, "journal"));
+    assert!(got.json()["reveal"].is_null() && got.header("PAYMENT-RESPONSE").is_none(), "no reveal, and no totals of a session that is over");
+    let (_, got) = b.get("/api");
+    assert_eq!(got.error(), "session_unknown");
 }
