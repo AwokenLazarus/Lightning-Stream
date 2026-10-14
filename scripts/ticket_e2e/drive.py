@@ -853,7 +853,10 @@ def stream() -> None:
         os.remove(result["saved_to"])
     measured("cancel_s", round(cancelled_s, 2))
     check("stream: after the stop the unused tickets are cancelled within 5 s: none in flight on the buyer's node, none held on the seller's",
-          cancelled_s <= 5.0 and stop["http"]["cancel_sent"] is True, {"seconds": round(cancelled_s, 2), "wait_s": round(freed, 2), "stop": stop["http"]})
+          # (the cancel is sent when the stop finds a ticket locked; with a pool of 2 a stop can come between two
+          # lock rounds, when both tickets are released and nothing is locked: then there is nothing to ask for)
+          cancelled_s <= 5.0 and (stop["http"]["cancel_sent"] is True or stop["http"]["cancel_asked"] == 0),
+          {"seconds": round(cancelled_s, 2), "wait_s": round(freed, 2), "stop": stop["http"]})
     quiet()
     m = money()
     check("stream: what the buyer's node paid, what the seller's node received, what the wallet booked and what the seller's receipts say was released are one number, to the millisat; the ledger is each ticket and its fee",
@@ -985,15 +988,26 @@ def kill() -> None:
         # a ticket is on the buyer's channel a moment before it is on the seller's, and a node killed in that moment
         # sends it back through the hop as a failure of that hop's channel, after which the buyer's node finds no
         # route for a while (seen on this lab: the download that follows was then refused, with nothing paid)
+        saw: dict[str, Any] = {}
+
         def settled_down() -> bool:
             s = session_of(r)
             st = status()
-            stranded = len(set((st.get("node") or {}).get("in_book_not_on_node") or []) & ORPHANS)
+            # (only those the book counts as locked: a payment the node left in flight after its secret was booked,
+            # a prepaid ticket's for one, is on no channel either and is not among the locked)
+            left = set((st.get("node") or {}).get("in_book_not_on_node") or []) & ORPHANS
+            stranded = sum(1 for x in st.get("sessions", []) if left for t in status(x["session"]).get("session_tickets", [])
+                           if t["hash"] in left and t["state"] in ("locked", "sending"))
             locked = st["locked"]["tickets"] - stranded
             waiting = float(s.get("hold_until") or 0) > time.time()
-            return locked == wallet_in_flight(0) and locked == held() and (waiting or locked == int(s.get("pool") or 0))
+            saw.update(locked=st["locked"]["tickets"], stranded=stranded, on_channel=wallet_in_flight(0), held_by_seller=held(), pool=s.get("pool"), waiting=waiting,
+                       hold_why=s.get("hold_why"), tickets=st.get("tickets"), node=st.get("node"), orphans=len(ORPHANS))
+            return locked == saw["on_channel"] and locked == saw["held_by_seller"] and (waiting or locked == int(s.get("pool") or 0))
 
-        lab.wait("the pool locked and listed", 30, settled_down, every=0.1)
+        try:
+            lab.wait("the pool locked and listed", 30, settled_down, every=0.1)
+        except LabError as e:
+            raise LabError(f"{e}; last seen: {json.dumps(saw)[:900]}") from e
         killed(victim, "a pool locked")
         resumed = next_call_pays(f"kill {victim} with a pool locked")
         stop_sessions()
