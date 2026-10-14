@@ -354,6 +354,11 @@ wallet) and against a stand-in node in its tests.
   is wider than that one call: it also shows the node's channel balances, its payments and what
   it forwarded, to whoever has the gateway's files. Without it the gateway knows nothing of its
   channels and keeps to the numbers in its config.
+- A cancel is two calls to the node: the cancel, and a lookup of the same invoice, because the
+  gateway takes no cancel's success for the invoice's state. Whether the fork's node ever
+  answers success to the cancel of a settled invoice was not checked in its source; the stand-in
+  node of the tests is made to, and the gateway then credits the ticket and reports nothing
+  cancelled.
 - No secret is taken without a block height from the node that is at most 10 seconds old; such
   a request is answered 503 and the secret is good again later.
 - The 24-block margin is checked against the height the node last reported, which is asked for

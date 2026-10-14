@@ -1771,3 +1771,41 @@ fn a_lock_the_caps_refuse_does_not_ask_the_node_for_its_channels() {
     assert_eq!(b.lock_raw(&s).status, 200);
     assert_eq!(read(), after_locks + 1);
 }
+
+#[test]
+fn a_cancel_the_node_says_yes_to_moves_the_book_only_to_what_a_lookup_then_shows() {
+    let (rig, _d) = start(&|_| {});
+    let mut b = Buyer::new(&rig, 1);
+    let s = b.lock(&rig, 3);
+    let hashes: Vec<String> = s.iter().map(|x| hex::encode(ticket_hash(x))).collect();
+    // ticket 0 is settled on the node and the gateway does not know: the settle's answer was lost,
+    // and the node's stream has fallen behind
+    rig.node.hold_streams(true);
+    rig.node.lose_next_settle_answer();
+    let got = b.release(&s[..1]);
+    assert_eq!(got.json()["refused"][0]["error"], "node_unavailable");
+    assert_eq!(rig.node.state_of(&ticket_hash(&s[0])), Some(InvoiceState::Settled));
+    assert_eq!(b.balance(), 0, "nothing is credited on a settle with no answer");
+    // a node that answers yes to the cancel of a settled invoice. The gateway does not take the
+    // yes for "cancelled": it looks, finds the ticket settled, and credits it
+    rig.node.cancel_answers_yes_for_settled();
+    let got = b.call("cancel", &json!({"hashes": [hashes[0]]}));
+    assert_eq!(got.status, 200);
+    assert_eq!(got.json()["cancelled"], json!([]), "a settled ticket is not reported cancelled");
+    assert_eq!(got.json()["session"]["releasedMsat"], "1000000", "and what the node holds for the seller is the buyer's credit");
+    assert_eq!(b.balance(), 1_000_000);
+    // an honest yes: the lookup shows the ticket cancelled, and it leaves the book
+    let got = b.call("cancel", &json!({"hashes": [hashes[1]]}));
+    assert_eq!(got.json()["cancelled"], json!([hashes[1]]));
+    assert_eq!(rig.node.state_of(&ticket_hash(&s[1])), Some(InvoiceState::Canceled));
+    // a yes, and then no answer to the lookup: the ticket stays in the book as it was, to be asked about again
+    rig.node.lose_next_lookup_answer();
+    let got = b.call("cancel", &json!({"hashes": [hashes[2]]}));
+    assert_eq!(got.json()["cancelled"], json!([]));
+    assert_eq!(b.status()["tickets"].as_array().unwrap().len(), 1, "still the session's ticket");
+    let got = b.call("cancel", &json!({"hashes": [hashes[2]]}));
+    assert_eq!(got.json()["cancelled"], json!([hashes[2]]));
+    assert_eq!(rig.gw.stats().held_tickets, 0);
+    rig.node.hold_streams(false);
+    assert_eq!(b.balance(), 1_000_000, "one ticket credited, once");
+}

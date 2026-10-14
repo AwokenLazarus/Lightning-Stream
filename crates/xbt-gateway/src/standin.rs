@@ -50,6 +50,11 @@ struct State {
     lose_settle_answer: bool,
     /// Streams deliver nothing while this is set: a stream that has fallen behind.
     streams_held: bool,
+    /// A cancel of a settled invoice answers success and changes nothing. Not what the node was
+    /// seen to do: a fault, to show the gateway takes no cancel's yes for the invoice's state.
+    cancel_yes_for_settled: bool,
+    /// The next lookup is answered as if the connection had died.
+    lose_lookup_answer: bool,
     pubkey: String,
     networks: Vec<String>,
     /// What `channels` answers (`None`: the node was given no channels macaroon).
@@ -189,6 +194,15 @@ impl StandIn {
 
     pub fn lose_next_settle_answer(&self) {
         self.lock().lose_settle_answer = true;
+    }
+
+    /// From now on a cancel of a settled invoice answers success (and cancels nothing).
+    pub fn cancel_answers_yes_for_settled(&self) {
+        self.lock().cancel_yes_for_settled = true;
+    }
+
+    pub fn lose_next_lookup_answer(&self) {
+        self.lock().lose_lookup_answer = true;
     }
 
     pub fn set_identity(&self, pubkey: &str, networks: &[&str]) {
@@ -337,10 +351,12 @@ impl Node for StandIn {
 
     fn cancel(&self, hash: &Hash) -> Result<(), NodeError> {
         let mut s = self.call("cancel")?;
+        let yes_for_settled = s.cancel_yes_for_settled;
         let Some(h) = s.invoices.get_mut(hash) else {
             return Err(NodeError::Refused("unable to locate invoice".into()));
         };
         match h.inv.state {
+            InvoiceState::Settled if yes_for_settled => return Ok(()),
             InvoiceState::Settled => {
                 return Err(NodeError::Refused("invoice already settled".into()))
             }
@@ -352,7 +368,10 @@ impl Node for StandIn {
     }
 
     fn lookup(&self, hash: &Hash) -> Result<Option<Invoice>, NodeError> {
-        let s = self.call("lookup")?;
+        let mut s = self.call("lookup")?;
+        if std::mem::take(&mut s.lose_lookup_answer) {
+            return Err(NodeError::Unreachable("connection reset".into()));
+        }
         Ok(s.invoices.get(hash).map(|h| h.inv))
     }
 

@@ -493,36 +493,33 @@ impl Gateway {
         self.sync(&file);
     }
 
-    /// Cancel a ticket on the node and take it out of the book. True: it is cancelled.
+    /// Cancel a ticket on the node, and bring the book to what the node then shows of it. True:
+    /// the node shows it cancelled.
+    ///
+    /// The answer to the cancel call is not taken for the invoice's state, yes or no. A yes says
+    /// the call was accepted; whether the invoice is cancelled, or was settled a moment before
+    /// (a settle whose answer was lost, a payment that arrived as the sweep ran), is what a
+    /// lookup says. A ticket taken out of the book on a yes alone, when the node had in fact
+    /// settled it, would be money the seller holds and the buyer was never credited. So: one
+    /// lookup after every cancel that was answered, and the book follows the lookup. With no
+    /// answer to the lookup the ticket stays as it was, and the next sweep asks again.
     fn cancel_on_node(&self, hash: &Hash) -> bool {
-        match self.node.cancel(hash) {
-            Ok(()) => {
-                self.apply(
-                    hash,
-                    &Invoice {
-                        state: InvoiceState::Canceled,
-                        paid_msat: 0,
-                        expiry_height: None,
-                        accept_height: None,
-                    },
-                );
-                true
+        if let Err(NodeError::Unreachable(_)) = self.node.cancel(hash) {
+            return false;
+        }
+        match self.node.lookup(hash) {
+            Ok(Some(inv)) => {
+                self.apply(hash, &inv);
+                inv.state == InvoiceState::Canceled
             }
-            Err(NodeError::Refused(_)) => {
-                // settled meanwhile, or gone: the node's own word decides
-                match self.node.lookup(hash) {
-                    Ok(Some(inv)) => self.apply(hash, &inv),
-                    Ok(None) => {
-                        let mut st = self.lock();
-                        if let Some(rec) = st.book.node_has_none(hash) {
-                            self.journal(&mut st, &[rec]);
-                        }
-                    }
-                    Err(_) => {}
+            Ok(None) => {
+                let mut st = self.lock();
+                if let Some(rec) = st.book.node_has_none(hash) {
+                    self.journal(&mut st, &[rec]);
                 }
                 false
             }
-            Err(NodeError::Unreachable(_)) => false,
+            Err(_) => false,
         }
     }
 

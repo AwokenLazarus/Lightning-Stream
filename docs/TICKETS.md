@@ -343,7 +343,10 @@ a hop with one ticket released each time the last was used up, stopped after the
 
 **Stop and cancel.** `POST <session>/cancel {"hashes": [...] or "all"}`, authenticated as any
 request of the session. The seller cancels those tickets on its node (`CancelInvoice`) and answers
-with the hashes it cancelled and a receipt. The buyer's funds are free as soon as the cancel has travelled back
+with the hashes it cancelled and a receipt. The seller SHOULD NOT take the call's success for the
+ticket's state: a ticket it drops as cancelled that its node had in fact settled (a settle whose
+answer was lost) is money it holds and never credited. The gateway looks each ticket up after
+the call and follows what the node shows: cancelled, or settled and then credited. The buyer's funds are free as soon as the cancel has travelled back
 along the route: 0.16 s for 8 tickets on the lab. The buyer believes its own node, not the answer:
 a ticket is free when its payment shows `FAILED` there. The seller SHOULD also cancel the tickets
 of a session that has been idle for some minutes, and SHOULD cancel a ticket that has reached its
