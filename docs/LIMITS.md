@@ -169,6 +169,18 @@ mainnet; its driver is not in this tree. `docs/TICKETS.md`, section 11, has the 
 - Tickets are held payments. A cancelled ticket pays routing nodes nothing for the capacity and
   the slot it held, which is the behaviour Lightning's jamming defences are designed against; so
   tickets have to stay few, small and short-lived.
+- The fallback, if the network adopts upfront fees or hold fees: tickets pay them, so a
+  cancelled ticket then costs its buyer something, and prepaid tickets or the lottery become
+  the only mode for strangers. Both are built. A routing node can also act on its own before
+  any such change, by raising its fees to a peer whose channel fills with held payments or by
+  closing that channel; nothing in this design prevents it.
+- A channel with a ticket pending cannot be closed co-operatively: every channel on a ticket's
+  route is kept from a clean close until the ticket is settled, cancelled or expired (from
+  BOLT 2; not run). The other way out is a force close.
+- Decided and not yet built: a session with a seller the owner has not named will start with one
+  prepaid ticket and hold tickets only after it, 1 at a time (2 with a named seller). Today
+  such a session opens with a held ticket where one fits, and a seller issues its first hold
+  invoice to a buyer that has paid nothing (`docs/TICKETS.md`, section 6.4).
 - BOLT 11 hold invoices only. The Lightning Fork's BOLT 12 offers have no hold path.
 - One hop was measured, on one host. Two or more hops, real network latency, mainnet routes and
   fees, a direct channel, and a force close with many tickets were not.

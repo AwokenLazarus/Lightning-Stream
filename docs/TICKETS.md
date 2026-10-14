@@ -583,6 +583,41 @@ without that check, or a rate that rises more than four times while a ticket is 
 meet. The rows for a routing node and a seller are not covered by any check: nobody on the route
 can see their channels.
 
+### 6.4 What held tickets cost the network, and the fallback
+
+**A cancelled ticket pays routing nodes nothing.** While it is held it takes a slot and its
+amount of capacity on every channel of its route, and when it is cancelled no fee was earned by
+anyone. The half rule and the small defaults limit how much of this the software in this tree
+does. They are rules of this software: nothing makes another wallet, another seller or a routing
+node keep them (`LIMITS.md`). A node that sees a peer's channel full of held payments can raise
+its fees to that peer or close the channel, and nothing here prevents that.
+
+**A channel with a ticket pending cannot be closed co-operatively.** A co-operative close is
+negotiated only when no HTLC is pending on the channel (BOLT 2), so every channel on a ticket's
+route is kept from a clean close until the ticket is settled, cancelled or expired: up to the
+ticket's life at the seller, and behind a hop that has gone up to the buyer's own HTLC expiry
+(123 blocks through one hop at the default, section 2). The other way out is a force close, at
+the cost of section 6.2. This is from the specification and was not run.
+
+**If the network adopts upfront fees or hold fees, tickets pay them.** These are the defences
+proposed against channel jamming ([`REFERENCES.md`](REFERENCES.md), 10 to 13): a fee that is
+paid whether or not the payment settles, or a fee for the time a payment is held. Neither exists
+on this network today. With either, every locked ticket costs its buyer something when it is
+cancelled, and with a hold fee more the longer it is held. Then:
+
+- a held ticket is for a seller the buyer stays with, where the fee is small beside what the
+  session pays;
+- for strangers, **prepaid tickets (section 5) or the lottery (section 9) become the only
+  mode**: each is an ordinary payment that is in flight for a fraction of a second and holds
+  nothing. Both are built, and the wire needs no change for it.
+
+**The direction for strangers (decided, not yet built).** A session with a seller the owner has
+not named will start with one prepaid ticket, paid and settled on arrival, and hold tickets only
+after it. The wallet will hold 1 ticket at a time with such a seller and 2 with a named one.
+Today the wallet already locks at most 1 ticket with a seller its owner has not named
+(`unlisted_max_tickets`), but it opens every session with held tickets where they fit, and a
+seller's first hold invoice is issued to a buyer that has paid nothing.
+
 ## 7. The numbers and their reasons
 
 | Number | Value | Reason |
@@ -630,7 +665,8 @@ can see their channels.
   been checked against them.
 - A hop that has gone, and real network latency, were not run. Fees are the forks' defaults, not
   what XBT's nodes charge.
-- A fee for a held payment does not exist on this network. If one is adopted, tickets pay it.
+- A fee for a held payment does not exist on this network. If one is adopted, tickets pay it,
+  and prepaid tickets or the lottery become the only mode for strangers (section 6.4).
 - The list of what a seller sells (`GET /services` on the gateway: the node id, the receipt key,
   the ticket terms and each route's price) is not signed. Signing it with the node's key needs the
   node's `SignMessage`, which neither of the seller's macaroons allows; the runner can sign the
