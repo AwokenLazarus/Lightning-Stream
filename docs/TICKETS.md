@@ -1161,10 +1161,17 @@ where, and what each side cannot see.
 it will accept from it (`max_accepted_htlcs`, BOLT 2; 483 at most). Lightning Fork's default is
 483. Core Lightning's is 30 on mainnet (`--max-concurrent-htlcs`), and a Core Lightning node also
 sends no more than its own number, so a channel with a Core Lightning node at either end carries
-30 each way. The number cannot be changed while the channel is open. A held ticket takes one slot
+30 each way. The defaults of the other implementations, as commonly documented and not checked
+here: 483 for lnd, 30 for Core Lightning, 50 for LDK and 30 for eclair. The number cannot be
+changed while the channel is open. A held ticket takes one slot
 of every channel on its route until it is settled or cancelled, and the slots of a channel are
 shared by every buyer, every seller and every ordinary payment that crosses it. A node knows the
-numbers of its own channels. Nobody can know a remote channel's: it is not in gossip.
+numbers of its own channels. Nobody can know a remote channel's: it is not in gossip. What binds
+a buyer is therefore the smallest channel on the route, shared with every other buyer whose
+tickets cross it, and the figure to plan with is the 30-slot one: 7 sellers at 2 tickets each or
+15 at 1 each from one channel (rule 2). What the lab showed on 483-slot channels is that one
+Lightning Fork node accepts 483 pending payments on one channel; it did not show a route. More
+sellers at once than these, as in a swarm, are paid by the lottery (section 9).
 
 **Dust.** An HTLC below a side's dust limit has no output in that side's commitment transaction.
 The limit is 354 sat on a Lightning Fork node and 546 sat on a Core Lightning node. On the channel

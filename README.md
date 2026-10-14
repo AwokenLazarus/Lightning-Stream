@@ -116,7 +116,8 @@ before releasing its ticket.
 
 **Two limits shape those defaults** (set on 2026-10-12, after Kyle Santiago pointed them out). A held ticket takes one of a channel's slots for pending payments on every channel of its
 route, and those slots are shared by everyone using the channel: 483 between Lightning Fork
-nodes, 30 where either end is a Core Lightning node at its default. So a session holds 2 tickets,
+nodes, 30 where either end is a Core Lightning node at its default (as commonly documented, lnd's
+default is 483, Core Lightning's 30, LDK's 50 and eclair's 30). So a session holds 2 tickets,
 not 8, and held tickets take at most half of a channel's slots: from one 30-slot channel a buyer
 holds tickets with 7 sellers at once, or 15 at one ticket each. And a ticket below a channel's
 dust limit (354 sat on Lightning Fork, 546 sat on Core Lightning) cannot be claimed on chain, so

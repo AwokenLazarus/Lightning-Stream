@@ -112,9 +112,15 @@ mainnet; its driver is not in this tree. `docs/TICKETS.md`, section 11, has the 
 - The defaults are therefore 2 tickets a session and at most half of a channel's slots in held
   tickets (15 of 30), in the wallet and in the gateway. One buyer holds tickets with 7 sellers at
   2 each, or 15 at 1 each, from one 30-slot channel; with the wallet's own rule (2 each with up
-  to 4 sellers of a task, 1 each beyond) it is 11. The earlier figure of 200 sellers from one
-  channel (400 tickets) was measured on 483-slot channels and holds only where every channel on
-  the way has 483.
+  to 4 sellers of a task, 1 each beyond) it is 11. That is the figure for held tickets. A larger
+  figure this project gave earlier is withdrawn: it was measured between two Lightning Fork
+  nodes, where a channel carries 483, and showed what one node accepts on one channel, not a
+  route.
+- A ticket takes a slot on every channel of its route, so what binds is the smallest channel on
+  the way, shared with every other buyer that crosses it. The defaults of the implementations,
+  as commonly documented and not checked by us beyond the two forks in the lab: lnd 483, Core
+  Lightning 30, LDK 50, eclair 30. Paying more sellers at once than that, as in a swarm, is the
+  lottery's job: a win is paid at once and holds no slot.
 - The half rule is a rule of this software, kept on the numbers each side can read of its own
   channels. Nothing makes another buyer, another seller or a routing node keep it, and a remote
   channel's slots cannot be read by anyone but its two ends.
