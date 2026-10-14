@@ -975,8 +975,11 @@ fn a_draw_that_cannot_be_written_down_is_not_revealed_and_ends_its_session() {
 
 #[test]
 fn a_win_whose_payment_failed_has_its_next_invoice_by_the_time_the_grace_ends() {
-    // the tests' grace is 10 s, and no invoice_secs in the file: a win's invoice lives 10 s
-    let (rig, _d) = start(&lottery);
+    // a grace of 20 s, and no invoice_secs in the file: a win's invoice lives 20 s
+    let (rig, _d) = start(&|v| {
+        lottery(v);
+        v["lottery"]["grace_seconds"] = json!(20);
+    });
     let mut b = Drawer::open(&rig, 63);
     let j = loop {
         let (seq, got) = b.get("/api");
@@ -988,11 +991,11 @@ fn a_win_whose_payment_failed_has_its_next_invoice_by_the_time_the_grace_ends() 
         }
     };
     let first = b.invoice_hash(&j, b.owed[0]);
-    assert_eq!(rig.node.expiry_of(&first), Some(10), "the invoice lives as long as the grace, not longer");
+    assert_eq!(rig.node.expiry_of(&first), Some(20), "the invoice lives as long as the grace, not longer");
     // the buyer's payment fails, and the buyer does not pay that invoice again. When the grace ends
     // the invoice has lapsed with it (the node cancels it), and the request the gateway refuses
     // carries the next one, which the buyer pays; then it is served
-    rig.advance(11);
+    rig.advance(21);
     rig.node.expire_unpaid(&first);
     let (_, got) = b.get("/api");
     assert_eq!((got.status, got.error().as_str()), (402, "win_unpaid"));

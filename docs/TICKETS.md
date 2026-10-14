@@ -767,7 +767,8 @@ when the node shows the first cancelled (it lapsed unpaid).
 A payment that fails (no route, a fee limit) is not a spent one. The wallet does not send that
 invoice again: the win stays owed until the seller sends another invoice for it, which the
 gateway does when the first has lapsed. A win's invoice lives as long as the seller's grace
-(`graceSeconds`, 30 s at the gateway; `invoice_secs`, which may not be longer), so the next
+(`graceSeconds`, 30 s at the gateway; `invoice_secs`, which may not be longer, and is never
+below 15 s, since the wallet refuses an invoice that expires within 5 s), so the next
 invoice is there by the time the grace ends: the request the seller then refuses `win_unpaid`
 carries it, the wallet pays it and asks again. (Until 2026-10-14 an invoice lived 60 s against a
 grace of 30, and a buyer whose payment failed was refused for about 30 s with no invoice it

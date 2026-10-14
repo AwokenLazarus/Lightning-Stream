@@ -28,6 +28,10 @@ use crate::price::Price;
 
 /// Final receipts of streamed answers kept per session, for `status`.
 const FINALS_KEPT: usize = 8;
+/// The shortest life of a win's invoice: the wallet of this tree refuses an invoice that expires
+/// within 5 s, and the payment itself takes some of what is left.
+pub const MIN_INVOICE_SECS: u32 = 15;
+
 /// The values and the voids one `draw` request may carry.
 pub const MAX_BATCH: usize = 64;
 
@@ -67,8 +71,9 @@ pub struct LotteryConfig {
     /// A session that has never given a value is forgotten after this many seconds.
     pub first_use_secs: u64,
     /// A win's invoice can be paid for this many seconds; an unpaid win gets a new one after. At
-    /// most `grace_seconds` (5 where the grace is shorter): a buyer whose payment failed does not
-    /// pay that invoice again, and waits for the next one, which must come before the grace ends.
+    /// most `grace_seconds` ([`MIN_INVOICE_SECS`] where the grace is shorter): a buyer whose
+    /// payment failed does not pay that invoice again, and waits for the next one, which must
+    /// come before the grace ends.
     pub invoice_secs: u32,
 }
 
@@ -126,10 +131,10 @@ impl LotteryConfig {
         if !(1..=1_000_000).contains(&c.max_odds_den) {
             return Err("lottery.max_odds_den is from 1 to 1000000: a route is drawn for only if its dearest piece costs at most win_msat divided by it".into());
         }
-        if !(5..=3600).contains(&c.invoice_secs) {
-            return Err("lottery.invoice_secs is from 5 to 3600".into());
+        if !(MIN_INVOICE_SECS..=3600).contains(&c.invoice_secs) {
+            return Err(format!("lottery.invoice_secs is from {MIN_INVOICE_SECS} (a wallet refuses an invoice that expires within 5 s) to 3600"));
         }
-        if c.invoice_secs > c.grace_seconds.max(5) {
+        if c.invoice_secs > c.grace_seconds.max(MIN_INVOICE_SECS) {
             return Err(format!("lottery.invoice_secs {} is more than lottery.grace_seconds {}: a buyer whose payment of a win failed waits for that win's next invoice, which comes only when the first has lapsed, and the session would be refused win_unpaid in between", c.invoice_secs, c.grace_seconds));
         }
         Ok(c)
@@ -161,7 +166,7 @@ impl LotteryConfig {
             idle_secs: num(m, "idle_secs", 300)?,
             first_use_secs: num(m, "first_use_secs", 60)?,
             // the grace: an invoice that lapses unpaid is replaced by the time the grace ends
-            invoice_secs: num32(m, "invoice_secs", grace_seconds.clamp(5, 3600))?,
+            invoice_secs: num32(m, "invoice_secs", grace_seconds.clamp(MIN_INVOICE_SECS, 3600))?,
         })
     }
 
@@ -1050,11 +1055,12 @@ mod tests {
         assert_eq!((c.piece_bytes, c.max_sessions, c.sessions_per_address, c.max_voids, c.max_odds_den), (262_144, 64, 4, 4, 4));
         assert_eq!((c.idle_secs, c.first_use_secs, c.invoice_secs, c.pay_wait_secs), (300, 60, 30, 10));
         // a win's invoice lives no longer than the grace, unless the grace is shorter than 5 s
-        for (grace, invoice) in [(10, 10), (3, 5), (0, 5), (100, 100), (7200, 3600)] {
+        for (grace, invoice) in [(20, 20), (10, 15), (0, 15), (100, 100), (7200, 3600)] {
             assert_eq!(LotteryConfig::parse(&json!({"grace_seconds": grace}), 40).unwrap().invoice_secs, invoice, "{grace}");
         }
         assert!(LotteryConfig::parse(&json!({"grace_seconds": 30, "invoice_secs": 31}), 40).unwrap_err().contains("win_unpaid"));
-        assert_eq!(LotteryConfig::parse(&json!({"grace_seconds": 3, "invoice_secs": 5}), 40).unwrap().invoice_secs, 5);
+        assert_eq!(LotteryConfig::parse(&json!({"grace_seconds": 3, "invoice_secs": 15}), 40).unwrap().invoice_secs, 15);
+        assert!(LotteryConfig::parse(&json!({"grace_seconds": 3, "invoice_secs": 14}), 40).is_err());
         assert_eq!(LotteryConfig::parse(&json!({"win_msat": 8000}), 40).unwrap().min_win_msat, 8000);
         for bad in [
             json!({"win_msat": 999}),
