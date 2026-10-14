@@ -407,21 +407,29 @@ Lightning invoice whose preimage is that key: paying it reveals it, across any n
 
 ## 6. What each side can lose
 
+The first table is what the lab showed. Every on-chain figure in it was measured on regtest, on
+anchor channels, at 1 sat/vB, and holds for that case only. Sections 6.1 to 6.3 give the same
+cases at 1, 10 and 50 sat/vB, on anchor channels and on channels without anchors. Those figures
+are computed from the weights in BOLT 3, or scaled from the lab's 1 sat/vB figures, and each says
+which. Nothing was run at 10 or 50 sat/vB, and no channel without anchors was run.
+
 | Who | Worst case | Bound, and what the lab showed |
 |---|---|---|
 | Buyer | **One ticket** (`with-request`). A seller takes the secret and serves nothing. | It cannot take the next one: the buyer releases one secret at a time and stops. |
 | Buyer | **The unused part of the last ticket.** A ticket cannot be partly released. | Less than one ticket. Trusted to the seller, by design. |
+| Buyer | **A routing fee on every ticket that settles.** | At the forks' default policy (a base fee of 1,000 msat and 1 part in a million) a hop takes 1,001 msat for a 1,000-sat ticket and 1,000 msat for a 546-sat one: 0.10% and 0.18% of the ticket per hop, 0.20% and 0.37% through two. The 1,000-sat figures were measured through one hop and through two (`scripts/demo_film.sh`); the 546-sat ones are computed (1,000 ÷ 546,000). A cancelled ticket pays no fee. What XBT's routing nodes charge was not measured. |
 | Buyer | **Funds locked, not lost: a seller that neither settles nor cancels.** | The seller's node cancels 18 blocks before the ticket's expiry: 25 blocks after the lock for a 40-block ticket. All channels stayed open. |
 | Buyer | **Funds locked, not lost: a seller whose node has gone.** | The hop closed its channel to the seller on chain at the tickets' expiry (43 blocks after the lock) and the buyer's funds were free 47 blocks after the lock, 48 with 100 tickets. The buyer's own channel stayed open and its balance was unchanged. |
 | Buyer | **Funds locked, not lost: a hop that has gone.** | Until the buyer's own HTLC expires: 123 blocks through one hop at the default, which is what `cltv_limit` bounds. Then the buyer's node closes that channel on chain. Not run here. |
-| Seller | **Nothing**, if it serves only after a successful settle of a locked ticket. | Settle returned in 4 ms with the hop stopped, and the buyer's node had the secret as soon as the hop was back. After a restart of the seller, the hop or the buyer the tickets were still `ACCEPTED` and settled. |
+| Seller | **Nothing while its channel peer stays**, if it serves only after a successful settle of a locked ticket. | Settle returned in 4 ms with the hop stopped, and the buyer's node had the secret as soon as the hop was back. After a restart of the seller, the hop or the buyer the tickets were still `ACCEPTED` and settled. |
+| Seller | **A ticket it settled and its peer never took.** The settle call's success is the seller's own node's word. The money is the seller's when the upstream hop has fulfilled the HTLC, or when the seller has claimed it on chain. | A seller SHOULD NOT count a settled ticket as income until the upstream hop has fulfilled it: its node then no longer lists that HTLC as pending on the channel. Until then the ticket is a claim that may have to go on chain (next row), and on a channel where the ticket has no output it cannot be claimed at all (section 6.1). The gateway in this tree counts a ticket when the settle call returns and does not look at the channel. |
 | Seller | **A ticket it served and did not settle** in time. | Its own node cancels it 18 blocks before expiry. So: settle first, then serve. |
-| Seller | **An on-chain claim**, when it settled and the hop then stays away. | Its node closed the channel 16 blocks before the tickets' expiry and had the secrets on chain 12 blocks before it. It kept the 3 tickets (3,000 sat), paid 900 to 1,700 sat in fees at 1 sat/vB (five runs), and waited about 650 blocks for its funds, its whole channel balance with them. The buyer's node learned the secrets from the chain when the hop returned. |
+| Seller | **An on-chain claim**, when it settled and the hop then stays away. | Its node closed the channel 16 blocks before the tickets' expiry and had the secrets on chain 12 blocks before it. It kept the 3 tickets (3,000 sat), paid 900 to 1,700 sat in fees at 1 sat/vB (five runs, anchor channels), and waited about 650 blocks for its funds, its whole channel balance with them. The buyer's node learned the secrets from the chain when the hop returned. At 10 sat/vB the same claim would cost more than the three tickets: an on-chain claim pays only in aggregate (section 6.2). |
 | Seller | **A closed channel**, if its node is offline when locked tickets expire. | As in the fourth row: the hop closes it. The seller's balance comes back on chain. |
-| Routing hop | **Slots and capacity held for no fee.** A cancelled ticket pays nothing: 10 locked and 5 settled cost the buyer 5,005 sat for 5,000 delivered. A hop's slots are shared by all who route through it: through a Core Lightning hop one buyer held 20 tickets and a second got 10 of the 20 it asked for. | `maxTickets`, `ticketBlocks` and the half rule of section 11. This is Lightning's known jamming exposure. Tickets use it on purpose, which is why the defaults are small. |
+| Routing hop | **Slots and capacity held for no fee.** A cancelled ticket pays nothing: 10 locked and 5 settled cost the buyer 5,005 sat for 5,000 delivered. A hop's slots are shared by all who route through it: through a Core Lightning hop one buyer held 20 tickets and a second got 10 of the 20 it asked for. | `maxTickets`, `ticketBlocks` and the half rule of section 11. This is Lightning's known jamming exposure. Tickets use it on purpose, which is why the defaults are small. Whoever funded a channel also carries the commitment fee of each held ticket's output on it: 172 weight units, 43 sat a ticket at 1 sat/vB (computed, section 6.2). |
 | Seller | **Being unreachable**, when held tickets fill its inbound slots. | With 30 tickets held on a 30-slot channel an ordinary payment over it failed. A buyer free to route filled the seller's other channels too: 70 tickets held on three. The seller's cap on what it holds for all sessions is the only bound. |
-| Any node on the route | **A ticket below a dust limit, if that channel is force-closed while it is held.** | Its value goes to the miners. Not possible for a ticket of 546 sat or more on the channel types the forks open by default. |
-| Routing hop | **The cost of a force close** when a seller vanishes with tickets locked, if the hop opened that channel. | With 100 tickets: a commitment transaction of 18,313 weight units and 104 outputs, 4,635 sat in fee, and about 29,000 sat in all to get its funds back at 1 sat/vB, which is 29% of the tickets' value. With 3 tickets it was 1,530 sat. |
+| Any node on the route | **A ticket below a dust limit, if that channel is force-closed while it is held.** | Its value goes to the miners, and so does that of every other ticket held on that channel that is below the limit. Not possible for a ticket of 546 sat or more on the channel types the forks open by default (anchors). On a channel without anchors a 1,000-sat ticket is below the limit from about 2.6 sat/vB (computed, section 6.1). |
+| Routing hop | **The cost of a force close** when a seller vanishes with tickets locked, if the hop opened that channel. | With 100 tickets: a commitment transaction of 18,313 weight units and 104 outputs, 4,635 sat in fee, and about 29,000 sat in all to get its funds back at 1 sat/vB, which is 29% of the tickets' value. With 3 tickets it was 1,530 sat. Measured on anchor channels on regtest; other fee rates are in section 6.2. |
 
 Two more things that are true of any Lightning payment and matter more here. Every hop sees the
 same hash, so hops that work together can tell that a run of equal payments goes to one seller.
@@ -429,11 +437,159 @@ And a ticket below a channel's dust limit has no output in that side's commitmen
 nobody can claim it on chain. The limit is 354 sat on a Lightning Fork node and 546 sat on a Core
 Lightning node, and each node caps the total of such HTLCs per channel (section 11).
 
+### 6.1 Where a ticket has no output, by fee rate
+
+A pending HTLC has an output in a commitment transaction only if, after the fee of the
+transaction that would claim it, it is still at or above that side's dust limit (BOLT 3). An HTLC
+without an output is **trimmed**: its value is added to the commitment transaction's fee, and if
+the channel is force-closed while it is pending it goes to the miners. Nobody can claim it.
+
+```text
+no output when   amount < dust_limit + weight × feerate ÷ 1000        (feerate in sat per 1,000 weight units)
+weight           703 on the side that receives the HTLC (HTLC-success), 663 on the side that offers it (HTLC-timeout)
+                 0 on an anchor channel whose HTLC transactions pay no fee, the type both forks open by default
+1 sat/vB         = 250 sat per 1,000 weight units
+```
+
+A ticket travels towards the seller, so on every channel of its route the side nearer the seller
+receives it, and that side's higher weight (703) decides first.
+
+The smallest amount that still has an output, in sat. All of it is computed, none of it run:
+
+| Channel, and whose dust limit | 1 sat/vB | 10 sat/vB | 50 sat/vB |
+|---|---|---|---|
+| Anchors, Lightning Fork (354) | 354 | 354 | 354 |
+| Anchors, Core Lightning (546) | 546 | 546 | 546 |
+| No anchors, Lightning Fork (354), receiving side: 354 + 703 × rate ÷ 1000 | 530 | 2,112 | 9,142 |
+| No anchors, Core Lightning (546), receiving side: 546 + 703 × rate ÷ 1000 | 722 | 2,304 | 9,334 |
+| No anchors, Core Lightning (546), offering side: 546 + 663 × rate ÷ 1000 | 712 | 2,204 | 8,834 |
+| **Does a 1,000-sat ticket have an output?** Anchors | yes | yes | yes |
+| **Does a 1,000-sat ticket have an output?** No anchors | yes | no | no |
+
+On a channel without anchors a 1,000-sat ticket loses its output where 546 + 703 × rate ÷ 1000
+passes 1,000: at 646 sat per 1,000 weight units, which is about 2.6 sat/vB, against a dust limit
+of 546 sat ((1,000 − 546) × 1,000 ÷ 703 = 645.8). Against a dust limit of 354 sat it is about
+3.7 sat/vB (919 sat per 1,000 weight units).
+
+What follows from it:
+
+- A force close of such a channel loses every ticket held on it that is below the threshold, not
+  one: 2 for one session, and up to 15 with the defaults of section 11.
+- The loss falls on the node that offered the ticket on that channel: the buyer on its own
+  channel, a routing node on a channel further along. Its balance there was lowered by the
+  ticket, and no output gives it back.
+- A seller that had already settled such a ticket and served on it is not paid for it either: it
+  holds the secret and has no output to claim with it.
+- Each side sees only its own channels. The wallet checks the channel a ticket leaves on (below).
+  A ticket that is below the threshold on a channel further along is locked all the same.
+- The channel's fee rate is set by whoever funded the channel and can rise while a ticket is
+  held.
+
+**What the code does today.** The wallet holds no ticket below the larger dust limit of a channel
+its payment may leave on, and on a channel without anchors it adds the fee of 703 weight units at
+four times that channel's present fee rate: 546 + 703 × 4 × 250 ÷ 1000 = 1,249 sat at 1 sat/vB
+against a dust limit of 546. So on a channel of its own without anchors it already holds no
+1,000-sat ticket at 1 sat/vB, and buys prepaid tickets there (section 5). The gateway reads no
+dust limit and no channel type. Neither side can see a remote channel.
+
+**The floor for held tickets (decided, not yet built).** 1,000 sat stays the default ticket.
+Where a channel without anchors may be on the route, a held ticket will be at least
+
+```text
+max(546, dust_limit + 663 × feerate_cap ÷ 1000) sat
+```
+
+with `feerate_cap` the fee rate the floor is sized for, in sat per 1,000 weight units. Against a
+dust limit of 546 sat that is 712 sat at 1 sat/vB, 2,204 sat at 10 and 8,834 sat at 50 (computed:
+546 + 166, 546 + 1,658, 546 + 8,288, rounded up). Open: 663 is the weight on the offering side;
+the receiving side trims with 703, which gives 722, 2,304 and 9,334 sat, and which of the two the
+built floor uses is not settled. Open too: how either side learns that a remote channel has no
+anchors, since the channel type is not in gossip. Below the floor a seller is paid without a held
+payment: a prepaid ticket, or the lottery.
+
+### 6.2 What a force close costs, by fee rate
+
+**The funder's commitment fee.** Each HTLC with an output adds 172 weight units (43 vB) to the
+commitment transaction (BOLT 3). The fee of that transaction is paid by whoever funded the
+channel, out of its balance in the channel, and the room for it is taken from that balance for as
+long as the HTLC is pending, whether or not the channel is ever closed on chain.
+
+| Held tickets with an output on one channel | Weight added | 1 sat/vB | 10 sat/vB | 50 sat/vB |
+|---|---|---|---|---|
+| 1 | 172 | 43 sat | 430 sat | 2,150 sat |
+| 2 (one session) | 344 | 86 sat | 860 sat | 4,300 sat |
+| 15 (half of a 30-slot channel) | 2,580 | 645 sat | 6,450 sat | 32,250 sat |
+| 100 | 17,200 | 4,300 sat | 43,000 sat | 215,000 sat |
+
+Computed: tickets × 172 × rate ÷ 1000, with the rate at 250, 2,500 and 12,500 sat per 1,000
+weight units. Measured, for comparison: with 100 tickets held the lab's commitment transaction
+was 18,313 weight units with 104 outputs and paid 4,635 sat at regtest's 1 sat/vB, on an anchor
+channel (the first table); and 483 tickets took a commitment transaction from 1,116 to 84,200
+weight units (section 7), which is 172 a ticket. Scaled by the rate and not run, the 4,635 sat
+are 46,350 sat at 10 sat/vB and 231,750 sat at 50. On an anchor channel an lnd-family node
+keeps the commitment transaction's own fee rate under a cap (10 sat/vB by default, as commonly
+documented; not checked in the fork's source) and whoever closes pays the rest through the
+anchor output, so the 50 sat/vB column is in full a commitment fee only on a channel without
+anchors.
+
+**Claiming a ticket on chain.** A seller whose peer is gone claims each settled ticket with one
+HTLC-success transaction, and the buyer's or a hop's node takes back each expired one with one
+HTLC-timeout transaction.
+
+| One 1,000-sat ticket | 1 sat/vB | 10 sat/vB | 50 sat/vB |
+|---|---|---|---|
+| No anchors: the claim's fee (703 weight units) comes out of the ticket | 176 sat, 824 left | no output: lost to the miners | no output: lost to the miners |
+| Anchors: the claim (706 weight units) pays no fee itself; the claimer adds an input that pays at least for its weight | 177 sat or more | 1,765 sat or more | 8,825 sat or more |
+| The lab's whole close with 3 tickets, the seller's cost (measured at 1 sat/vB, scaled beyond) | 900 to 1,700 sat | 9,000 to 17,000 sat | 45,000 to 85,000 sat |
+
+Computed: weight × rate ÷ 1000. The last row is the measured 900 to 1,700 sat multiplied by the
+rate, which takes the transactions to have the same weights at every rate; it was not run.
+
+**On-chain claims only pay in aggregate.** On an anchor channel, claiming one 1,000-sat ticket
+alone costs more than the ticket from about 5.7 sat/vB (1,000 ÷ 176.5 vB), before the second
+transaction that brings the claimed coin home. The lab's whole close cost more than its three
+tickets from about 1.8 to 3.3 sat/vB (3,000 ÷ 1,700 and 3,000 ÷ 900). A seller claims on chain
+because its whole channel balance is in that channel, and many tickets share the fixed part of
+the close; tickets by themselves do not pay for it.
+
+### 6.3 Who can lose what, by fee rate
+
+In sat, for the default 1,000-sat ticket, 2 held a session. "Lost" means gone to the miners.
+Every figure is computed from sections 6.1 and 6.2 unless it says measured.
+
+**Anchor channels** (what both forks open by default; the type the lab ran):
+
+| Who, and when | 1 sat/vB | 10 sat/vB | 50 sat/vB |
+|---|---|---|---|
+| Buyer: a seller takes one secret and serves nothing | 1,000 and the routing fee (measured: 1,001 a hop) | the same | the same |
+| Buyer: its own channel is force-closed with its 2 tickets held (it funded the channel) | 86 of commitment fee; each ticket comes back by a 666-weight timeout claim: 167 or more | 860; 1,665 or more a ticket, more than the ticket | 4,300 (less where the cap above applies); 8,325 or more a ticket |
+| Seller: its peer is gone after it settled 3 tickets | 900 to 1,700 for the close (measured), against 3,000 | 9,000 to 17,000 (scaled), against 3,000 | 45,000 to 85,000 (scaled), against 3,000 |
+| Channel funder: 15 tickets held on its channel, for as long as they are held | 645 kept out of its balance | 6,450 | 32,250 (less where the cap above applies) |
+| Channel funder: a force close with 100 tickets pending | 4,635 of commitment fee, about 29,000 in all (measured) | 46,350 and about 290,000 (scaled) | 231,750 and about 1,450,000 (scaled) |
+
+**Channels without anchors** (not run; what XBT's nodes have open was not measured):
+
+| Who, and when | 1 sat/vB | 10 sat/vB | 50 sat/vB |
+|---|---|---|---|
+| Buyer: a seller takes one secret and serves nothing | 1,000 and the routing fee | the same | the same |
+| Buyer: its own channel is force-closed with its 2 tickets held | 86 of commitment fee and 166 a ticket for the timeout claim, 834 a ticket back | both tickets lost: 2,000 | both tickets lost: 2,000 |
+| Routing node: a channel it offered tickets on is force-closed with 15 held | 2,486 in claim fees (15 × 165.75) if it takes them back on chain, and the commitment fee if it funded the channel | all 15 lost: 15,000 | all 15 lost: 15,000 |
+| Seller: its peer is gone after it settled 3 tickets | 527 in claim fees (3 × 175.75), 2,473 kept | nothing to claim: 3,000 of service unpaid | nothing to claim: 3,000 of service unpaid |
+| Channel funder: 15 tickets held on its channel | 645 kept out of its balance | nothing for the tickets (no outputs); they count against the node's dust cap (section 11) | the same |
+
+With the wallet in this tree the two buyer rows without anchors do not arise at these rates on
+the buyer's own channel: it holds no 1,000-sat ticket there (section 6.1). They are what a buyer
+without that check, or a rate that rises more than four times while a ticket is held, would
+meet. The rows for a routing node and a seller are not covered by any check: nobody on the route
+can see their channels.
+
 ## 7. The numbers and their reasons
 
 | Number | Value | Reason |
 |---|---|---|
-| Ticket size | 1,000 sat | A hop charges 1,001 msat for a settled 1,000-sat ticket at the forks' default policy (0.1% per hop; nothing on a direct channel, 2,002 msat through two hops). Above both dust limits (354 and 546 sat), so it has an output in every channel on the route and can be claimed on chain. |
+| Ticket size | 1,000 sat | A hop charges 1,001 msat for a settled 1,000-sat ticket at the forks' default policy (0.1% per hop; nothing on a direct channel, 2,002 msat through two hops). Above both dust limits (354 and 546 sat), so on anchor channels it has an output in every channel on the route at any fee rate. On a channel without anchors it has none from about 2.6 sat/vB, and above a few sat/vB it costs more to claim on chain than it is worth on either kind (sections 6.1 and 6.2). It stays the default; the fee-aware floor two rows down is decided and not yet built. |
+| Smallest ticket that is held, where a channel without anchors may be on the route (decided, not yet built) | max(546, dust_limit + 663 × feerate_cap ÷ 1000) sat | The dust threshold of such a channel rises with its fee rate (section 6.1): 712, 2,204 and 8,834 sat at 1, 10 and 50 sat/vB against a dust limit of 546 (computed). Today the wallet applies a rule of its own to the channel a ticket leaves on (1,249 sat at 1 sat/vB) and the gateway applies none. |
+| A held ticket's cost to the channel's funder | 172 weight units of commitment transaction | 43, 430 and 2,150 sat a ticket at 1, 10 and 50 sat/vB (computed, section 6.2); 483 tickets took a commitment transaction from 1,116 to 84,200 weight units on the lab. |
 | Smallest ticket that is held | 546 sat, the larger of the two dust limits | Below 354 sat a ticket has no output in a Lightning Fork channel's transaction, below 546 sat none in a Core Lightning one (seen on chain, section 11). At 546 sat one hop's fee is 0.18%. A node takes nothing below 1 sat (999 msat found no route, through a Lightning Fork hop or on one channel), and a 1-sat ticket through a hop pays a fee of 1 sat. |
 | Tickets unreleased per session | 2 | 2,000 sat locked and 2 slots of every channel on the route, of which a Core Lightning channel has 30. The next is locked when one is left; a lock of one takes 0.2 s through a hop. It was 8 until 2026-10-12, sized for 483 slots. |
 | Held tickets on one channel, all sessions together | Half of the channel's slots: 15 of 30 | The other half is for ordinary payments, for settles on their way and for everyone else (section 11). |

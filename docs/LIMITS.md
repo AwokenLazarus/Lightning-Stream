@@ -95,7 +95,10 @@ nodes, two of the Core Lightning nodes started with the values that binary has b
 mainnet; its driver is not in this tree. `docs/TICKETS.md`, section 11, has the table.
 
 - Money moves a ticket at a time (1,000 sat by default; a ticket that is held is at least 546
-  sat by the design's rule, and a node carries nothing below 1 sat). Pieces inside a ticket are
+  sat by the design's rule, and a node carries nothing below 1 sat). Decided and not yet built:
+  where a channel without anchors may be on the route, a held ticket will be at least
+  max(546, dust_limit + 663 × feerate_cap ÷ 1000) sat, which against a dust limit of 546 is 712,
+  2,204 and 8,834 sat at 1, 10 and 50 sat/vB (computed; `docs/TICKETS.md`, section 6.1). Pieces inside a ticket are
   metered, and the unused part of the ticket in use is trusted to the seller.
 - A held ticket takes one HTLC slot of every channel on its route, and a channel's slots are
   shared by everyone who uses it. A channel carries 483 each way between Lightning Fork nodes
@@ -120,17 +123,39 @@ mainnet; its driver is not in this tree. `docs/TICKETS.md`, section 11, has the 
   400, 600 and 1,000 sat held, a Core Lightning node's force close had outputs for 600 and 1,000
   only. Such a ticket cannot be claimed on chain and goes to the miners if that channel is
   force-closed while it is held. On a channel without anchors the limit also rises with the fee
-  rate (computed, not run: the forks open anchor channels by default).
+  rate, by the fee of 703 weight units on the receiving side: a 1,000-sat ticket has no output
+  there from about 2.6 sat/vB against a dust limit of 546 sat, and the smallest ticket with an
+  output is 722, 2,304 and 9,334 sat at 1, 10 and 50 sat/vB (computed, not run: the forks open
+  anchor channels by default; `docs/TICKETS.md`, section 6.1). A force close of such a channel
+  loses every ticket held on it that is below that, not one.
+- The dust rule is checked by the buyer's wallet on its own channel only. On a channel further
+  along the route nobody checks it: the routing node that offered the ticket there loses it in a
+  force close, and a seller that had settled it is not paid.
 - A node caps the dust it carries per channel: Core Lightning at 50,000 sat, Lightning Fork at
   500,000 sat with the channel's fee. *(with Core Lightning)* On a Core Lightning channel opened
   with 483 slots, 100 tickets of 500 sat locked and the next 30 failed; the buyer's node then
   found no route to that seller for a 1,000-sat ticket either. Lightning Fork's cap was not
   reached with 483 tickets of 300 sat.
 - Above the dust limit is not the same as worth claiming: a seller's claim of 3 tickets on
-  chain cost 900 to 1,700 sat at 1 sat/vB, so at higher fee rates a single 1,000-sat ticket
-  costs more to claim than it is worth.
+  chain cost 900 to 1,700 sat at 1 sat/vB (measured, anchor channels, regtest), so at higher fee
+  rates a single 1,000-sat ticket costs more to claim than it is worth. Scaled by the rate and
+  not run, that close costs more than its 3,000 sat from about 1.8 to 3.3 sat/vB, and the claim
+  transaction of one ticket alone (706 weight units) costs more than the ticket from about
+  5.7 sat/vB. An on-chain claim pays only in aggregate, with a channel balance or many tickets
+  behind it (`docs/TICKETS.md`, section 6.2).
+- A settled ticket is not yet income. The settle call's success is the seller's own node's word;
+  the money is the seller's when the upstream hop has fulfilled the HTLC or the seller has
+  claimed it on chain. A seller should not count it before that. The gateway counts a ticket
+  when the settle call returns and does not look at the channel.
+- Each held ticket with an output adds 172 weight units to the commitment transaction of every
+  channel on its route, and whoever funded the channel carries the fee out of its balance while
+  the ticket is held, and pays it in a force close: 43, 430 and 2,150 sat a ticket at 1, 10 and
+  50 sat/vB (computed). Measured on the lab at 1 sat/vB on an anchor channel: 4,635 sat of
+  commitment fee with 100 tickets pending.
 - The buyer can lose one ticket: a secret is spent when it leaves the wallet, and a seller can
-  take it and serve nothing.
+  take it and serve nothing. That bound does not move with the fee rate. What does is in
+  `docs/TICKETS.md`, sections 6.1 to 6.3: what a force close costs the buyer, a routing node, the
+  seller and the channel's funder at 1, 10 and 50 sat/vB, with and without anchors.
 - Unused tickets stay locked until the seller cancels them or they expire. Measured with 40-block
   tickets: 25 blocks with a seller that neither settles nor cancels, 51 blocks through one hop
   with a seller that went offline.
@@ -354,9 +379,13 @@ wallet) and against a stand-in node in its tests.
   hold 2 sessions, 4,000 sat. Measured on the lab with the earlier caps: a buyer that locked 8
   tickets and released none held 8,000 sat for 16 s with the limit set to 15 s.
 - A held ticket is at least 546 sat: a config that offers held tickets below that is refused.
-  The gateway does not read its channels' dust limits; on a channel without anchors at a high
-  fee rate a 1,000-sat held ticket can still be below the limit (`docs/TICKETS.md`, section 11),
-  and nothing in the gateway notices.
+  The gateway does not read its channels' dust limits or their types; on a channel without
+  anchors a 1,000-sat held ticket is below the limit from about 2.6 sat/vB (computed;
+  `docs/TICKETS.md`, section 6.1), and nothing in the gateway notices. The fee-aware floor of
+  that section is decided and not built.
+- The gateway credits a held ticket when its node answers the settle call. It does not wait for
+  the channel peer to take the secret, so with the peer away its totals, and a receipt's
+  `releasedMsat`, can include tickets that still need an on-chain claim.
 - Prepaid tickets (`settle: "on-arrival"`, offered beside held ones unless `tickets.settle` says
   otherwise) are ordinary invoices, paid in full when they arrive. The buyer cannot have one
   back: what it bought and did not use is the seller's when the session is forgotten (24 hours
