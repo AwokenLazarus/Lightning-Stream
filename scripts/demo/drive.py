@@ -259,13 +259,8 @@ def jellyfin_container(film: Film) -> Service:
     jf_ok("POST", f"/Users/{user['Id']}/Policy", policy, admin)
     key = jf_ok("POST", "/Users/AuthenticateByName", {"Username": "stream-demo", "Pw": demo_pw})["AccessToken"]
     sees = sorted(i["Name"] for i in jf_ok("GET", f"/Items?Recursive=true&IncludeItemTypes=Movie&userId={user['Id']}", token=key)["Items"])
-    # what Jellyfin itself does with a request for the film outside the user's library: asked directly, not through the gateway
-    direct = {"the_file_with_no_login": send("GET", f"/Videos/{private}/stream?static=true", JF_PORT, {"Range": "bytes=0-99"})[0],
-              "its_playlist_with_the_demo_users_key": send("GET", f"/Videos/{private}/master.m3u8?{hls_query(private, key)}", JF_PORT)[0],
-              "its_playlist_with_no_key": send("GET", f"/Videos/{private}/master.m3u8?MediaSourceId={private}", JF_PORT)[0]}
     check("setup: a stock Jellyfin is up with a library of one freely licensed film and a user without admin rights who sees that library only",
           len(sees) == 1 and sees[0].startswith(film.title.rsplit(" (", 1)[0]) and policy["IsAdministrator"] is False, {"jellyfin": version, "image": JF_IMAGE, "the_demo_user_sees": sees, "licence": film.licence})
-    measured("jellyfin_itself_serves_a_film_outside_the_users_library", direct)
     s = Service()
     s.upstream, s.routes = f"http://127.0.0.1:{JF_PORT}", [f"/Videos/{item}/"]
     s.play, s.file, s.outside = f"/Videos/{item}/master.m3u8?{hls_query(item, key)}", f"/Videos/{item}/stream?static=true", f"/Videos/{private}/stream?static=true"

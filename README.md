@@ -56,7 +56,8 @@ the full list, with a link for each, is [`docs/REFERENCES.md`](docs/REFERENCES.m
 
 - **The agent wallet and its policy engine.** An AI agent pays through the wallet over MCP and
   never holds a key. The owner sets a signed policy: budgets, per-seller caps, an allowlist, a
-  threshold above which a human approves. Every signature goes into a tamper-evident log.
+  threshold above which a human approves a single payment (a ticket or lottery call is bounded
+  by its task's budget and asks nobody). Every signature goes into a tamper-evident log.
 - **The Lightning rail.** The wallet pays XBT Lightning invoices (BOLT 11) and offers (BOLT 12)
   through the owner's Lightning node, under the same policy. This rail is what tickets are
   built on.

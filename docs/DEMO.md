@@ -42,15 +42,11 @@ In Jellyfin's own pages make a library that holds only the films you sell, and a
 admin rights who sees only that library. Sell only what you may: the demo's library holds one
 freely licensed film.
 
-Two things we found in Jellyfin 10.11.0 decide the rest of the setup:
-
-- **Jellyfin sends a film's file to anyone who has its address, with no login**
-  (`/Videos/<item id>/stream?static=true`), and it gives a film's playlist to any user's key, also
-  for a film in a library that user cannot see. A user's library limits do not protect a file.
-- So **what a buyer can reach is decided by the gateway's routes, and by nothing in Jellyfin.**
-  Name each film you sell by its item id in the gateway's config. A path with no route is not
-  served: in the demo another film on the same server, and the server's own pages, answer 404
-  through the gateway. And never publish Jellyfin's own port: only the gateway's.
+**What a buyer can reach is decided by the gateway's routes.** Name each film you sell by its
+item id in the gateway's config. A path with no route is not served: in the demo another film on
+the same server, and the server's own pages, answer 404 through the gateway. Do not rely on the
+service's own logins or library limits for that, and never publish the service's own port: only
+the gateway's.
 
 The film's item id is the long hex name in the film's address in Jellyfin's web pages
 (`…#/details?id=<item id>`).
