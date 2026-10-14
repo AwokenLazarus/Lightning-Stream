@@ -1,0 +1,76 @@
+# Build, test and lint the workspace on every push and pull request.
+#
+# What this runs: the unit and integration suites of the workspace. They need no Lightning node,
+# no chain node and no Docker: the tests use stand-in nodes in process. Two tests of the wallet's
+# web UI (crates/xbt-wallet-ui/tests/browser.rs and crypto_js.rs) drive node and headless Chrome
+# when they find them and print "skipped" when they do not; a hosted runner has both.
+#
+# What this does not run: the regtest lab scripts under scripts/ (they need Docker and build a
+# Lightning Fork lab) and the cross builds. Their latest reports are in reports/.
+#
+# The toolchain is pinned to the version these four steps were last run on by hand. Cargo.toml
+# states 1.89 as the minimum, but Cargo.lock holds a dependency that needs 1.90, and clippy 1.91
+# reports two lints that clippy 1.98 does not; until those are settled the pin is 1.98.0.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_TOOLCHAIN: "1.98.0"
+
+jobs:
+  workspace:
+    name: build, test, clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
+          rustc --version
+          cargo --version
+      # every crate comes from crates.io at the version and checksum Cargo.lock names, but for
+      # ureq, which is the patched copy under vendor/ureq
+      - name: Fetch the dependencies Cargo.lock names
+        run: cargo fetch --locked
+      - name: Build
+        run: cargo build --workspace --locked
+      - name: Test
+        run: cargo test --workspace --locked --no-fail-fast
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  # Licences, banned crates and sources (deny.toml). The advisory check is left out on purpose:
+  # it reads a database that changes every day, so it can fail a push that changed nothing. Run
+  # `cargo deny check` by hand for it; it cannot see advisories for the vendored ureq.
+  deny:
+    name: cargo deny (licences, bans, sources)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny@0.20.2
+      - name: Check licences, bans and sources
+        run: cargo deny check licenses bans sources

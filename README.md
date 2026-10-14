@@ -295,7 +295,10 @@ cargo test -j2 --workspace
 cargo build --release -p xbt-signer -p xbt-wallet-mcp -p xbt-wallet-ui
 ```
 
-Rust stable; libsecp256k1 is built from source. Cross builds (Linux x86_64, aarch64, armv7, riscv64,
+Rust stable; libsecp256k1 is built from source. The workspace builds, tests and passes clippy on
+Rust 1.98.0, which is what `.github/workflows/ci.yml` runs on every push and pull request, and
+builds and tests on 1.91.1. The minimum stated in `Cargo.toml` (1.89) is not right today: a locked
+dependency (`ruint` 1.20.1) needs 1.90. Cross builds (Linux x86_64, aarch64, armv7, riscv64,
 macOS, Windows) use zig as the C compiler: see `docs/ENGINEERING.md`.
 
 What each script needs beyond this repository:
