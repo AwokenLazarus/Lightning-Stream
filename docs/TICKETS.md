@@ -516,7 +516,8 @@ What follows from it:
 its payment may leave on, and on a channel without anchors it adds the fee of 703 weight units at
 four times that channel's present fee rate: 546 + 703 × 4 × 250 ÷ 1000 = 1,249 sat at 1 sat/vB
 against a dust limit of 546. So on a channel of its own without anchors it already holds no
-1,000-sat ticket at 1 sat/vB, and buys prepaid tickets there (section 5). The gateway reads no
+1,000-sat ticket at 1 sat/vB, and buys prepaid tickets there where the seller offers them
+(section 5). The gateway reads no
 dust limit and no channel type. Neither side can see a remote channel.
 
 **The floor for held tickets (decided, not yet built).** 1,000 sat stays the default ticket.
