@@ -1,0 +1,620 @@
+{
+ "checks": [
+  {
+   "check": "setup: the buyer's channel and the seller's inbound channel carry 30 pending payments",
+   "ok": true,
+   "saw": {
+    "lf1": 30,
+    "lf3": 30
+   }
+  },
+  {
+   "check": "setup: the Lightning rail is ready on lf1: chain verified, its one channel's funding proven",
+   "ok": true,
+   "saw": {
+    "ready": true,
+    "warnings": null
+   }
+  },
+  {
+   "check": "terms: the 402 lists held tickets, prepaid tickets and, last, the lottery: a win of 64 sat (16 at the least), paid after it by an invoice, the window of 8, the grace of 30 s and 64 pieces, and the piece size",
+   "ok": true,
+   "saw": {
+    "schemes": [
+     "ticket",
+     "ticket",
+     "lottery"
+    ],
+    "lottery": {
+     "winMsat": "64000",
+     "minWinMsat": "16000",
+     "pay": "on-win",
+     "release": "after-answer",
+     "window": 8,
+     "graceSeconds": 30,
+     "gracePieces": 64,
+     "maxUnpaidWins": 2,
+     "chainDraws": 65536,
+     "pieceBytes": "65536"
+    }
+   }
+  },
+  {
+   "check": "terms: the MCP's xbt402_pay says a call may be paid by draws, that what it pays is uneven, and what such a call cannot cause",
+   "ok": true,
+   "saw": [
+    "pays by draws",
+    "uneven"
+   ]
+  },
+  {
+   "check": "file: a 100 MB file priced at a quarter of a sat a piece arrives whole, five times, bought by draws: 1,526 pieces and as many draws each time, and a price that is the pieces' own",
+   "ok": true,
+   "saw": [
+    {
+     "ok": true,
+     "draws": 1526,
+     "price_msat": "381470",
+     "wins": 6,
+     "wins_paid": 6,
+     "charged_sats": 390,
+     "fee_msat": "6000",
+     "seconds": 0.97,
+     "ended": null,
+     "unpaid": []
+    },
+    {
+     "ok": true,
+     "draws": 1526,
+     "price_msat": "381470",
+     "wins": 4,
+     "wins_paid": 4,
+     "charged_sats": 260,
+     "fee_msat": "4000",
+     "seconds": 0.91,
+     "ended": null,
+     "unpaid": []
+    },
+    {
+     "ok": true,
+     "draws": 1526,
+     "price_msat": "381470",
+     "wins": 7,
+     "wins_paid": 7,
+     "charged_sats": 455,
+     "fee_msat": "7000",
+     "seconds": 1.51,
+     "ended": null,
+     "unpaid": []
+    },
+    {
+     "ok": true,
+     "draws": 1526,
+     "price_msat": "381470",
+     "wins": 6,
+     "wins_paid": 6,
+     "charged_sats": 390,
+     "fee_msat": "6000",
+     "seconds": 1.5,
+     "ended": null,
+     "unpaid": []
+    },
+    {
+     "ok": true,
+     "draws": 1526,
+     "price_msat": "381470",
+     "wins": 6,
+     "wins_paid": 6,
+     "charged_sats": 390,
+     "fee_msat": "6000",
+     "seconds": 1.48,
+     "ended": null,
+     "unpaid": []
+    }
+   ]
+  },
+  {
+   "check": "file: what the buyer's node paid is the wins the wallet found and booked, to the millisat: each win 64,000 msat, each paid once, and the ledger is each win and its routing fee",
+   "ok": true,
+   "saw": {
+    "wins": 29,
+    "paid_msat": 1856000,
+    "expected_wins": 29.8,
+    "buyer_node_paid_msat": 1856000,
+    "seller_node_received_msat": 1856000,
+    "wallet_book_settled": 29,
+    "wallet_ledger_sats": 1885,
+    "buyer_node_cost_sats": 1885,
+    "fees_msat": 29000,
+    "payments": 29,
+    "failed_payments": 0,
+    "in_flight": 0,
+    "booked_not_settled_sats": 0,
+    "node_agrees": true
+   }
+  },
+  {
+   "check": "file: each download paid inside its band: at most the luck cap of a call of max_sats 800 (1565 sat), whatever the draws did",
+   "ok": true,
+   "saw": [
+    390,
+    260,
+    455,
+    390,
+    390
+   ]
+  },
+  {
+   "check": "file: nothing is held between wins: everything that was ever pending on the buyer's channel was a win on its way, never more than 8 at once, and nothing was pending when the downloads were over",
+   "ok": true,
+   "saw": {
+    "samples": 307,
+    "nothing_pending_share": 0.446,
+    "most_pending": 3,
+    "payments_seen_pending": 29,
+    "not_a_win_in_flight": []
+   }
+  },
+  {
+   "check": "page: a page priced at 2.5 sat a request is one draw a request, 200 times, in one session; a win is paid before its call returns",
+   "ok": true,
+   "saw": {
+    "wins": 9,
+    "expected_wins": 7.8,
+    "calls_without_a_win": 191
+   }
+  },
+  {
+   "check": "swarm: 20 sellers paid at once by draws from one 30-slot channel, 3 files of 64 pieces from each: every file whole, every win paid, no payment failed",
+   "ok": true,
+   "saw": {
+    "sellers": 20,
+    "sessions_open": 20,
+    "wins": 69,
+    "expected_wins": 60,
+    "paid_msat": 4416000,
+    "failed_payments": 0,
+    "seconds": 4.8,
+    "bad": []
+   }
+  },
+  {
+   "check": "swarm: with 20 sellers the wallet never had more than 8 payments on its channel at once (30 slots), held nothing between wins, and an ordinary payment over that channel succeeded meanwhile",
+   "ok": true,
+   "saw": {
+    "samples": 216,
+    "nothing_pending_share": 0.079,
+    "most_pending": 8,
+    "payments_seen_pending": 70,
+    "not_a_win_in_flight": [],
+    "ordinary_payment": {
+     "paid": true,
+     "seconds": 0.58
+    }
+   }
+  },
+  {
+   "check": "swarm: after 20 sellers the buyer's node, the seller's node, the wallet's book and its ledger agree to the millisat",
+   "ok": true,
+   "saw": {
+    "buyer_node_paid_msat": 6848000,
+    "seller_node_received_msat": 6848000,
+    "wallet_book_settled": 107,
+    "wallet_ledger_sats": 6955,
+    "buyer_node_cost_sats": 6955,
+    "fees_msat": 107000,
+    "payments": 107,
+    "failed_payments": 0,
+    "in_flight": 0,
+    "booked_not_settled_sats": 0,
+    "node_agrees": true
+   }
+  },
+  {
+   "check": "swarm: 100 sellers paid at once by draws from one 30-slot channel, 3 files of 64 pieces from each: every file whole, every win paid, no payment failed",
+   "ok": true,
+   "saw": {
+    "sellers": 100,
+    "sessions_open": 100,
+    "wins": 295,
+    "expected_wins": 300,
+    "paid_msat": 18880000,
+    "failed_payments": 0,
+    "seconds": 21.5,
+    "bad": []
+   }
+  },
+  {
+   "check": "swarm: with 100 sellers the wallet never had more than 8 payments on its channel at once (30 slots), held nothing between wins, and an ordinary payment over that channel succeeded meanwhile",
+   "ok": true,
+   "saw": {
+    "samples": 971,
+    "nothing_pending_share": 0.046,
+    "most_pending": 9,
+    "payments_seen_pending": 296,
+    "not_a_win_in_flight": [],
+    "ordinary_payment": {
+     "paid": true,
+     "seconds": 0.48
+    }
+   }
+  },
+  {
+   "check": "swarm: after 100 sellers the buyer's node, the seller's node, the wallet's book and its ledger agree to the millisat",
+   "ok": true,
+   "saw": {
+    "buyer_node_paid_msat": 25728000,
+    "seller_node_received_msat": 25728000,
+    "wallet_book_settled": 402,
+    "wallet_ledger_sats": 26130,
+    "buyer_node_cost_sats": 26130,
+    "fees_msat": 402000,
+    "payments": 402,
+    "failed_payments": 0,
+    "in_flight": 0,
+    "booked_not_settled_sats": 0,
+    "node_agrees": true
+   }
+  },
+  {
+   "check": "cheat: a buyer that sends no values is served the window (8 pieces) and no more: its answer is cut, and its next request is refused value_missing",
+   "ok": true,
+   "saw": {
+    "first": {
+     "status": 200,
+     "bytes": 524288
+    },
+    "then": {
+     "status": 402,
+     "error": "value_missing",
+     "bytes": 0
+    }
+   }
+  },
+  {
+   "check": "cheat: a buyer that gives values and never pays a win is cut off: its next request is refused win_unpaid, the seller's node was paid nothing, and the seller's wins are exactly the ones a second implementation of the draw works out",
+   "ok": true,
+   "saw": {
+    "sessions": 10,
+    "wins_unpaid_each_mean": 4.2
+   }
+  },
+  {
+   "check": "cheat: at a quarter of a sat a piece a buyer that never pays is served about one win's worth and the grace of 64 pieces (a quarter of a win) before it is stopped",
+   "ok": true,
+   "saw": {
+    "mean_wins_worth": 1.66,
+    "each": [
+     0.56,
+     0.57,
+     0.62,
+     1.14,
+     1.4,
+     1.74,
+     1.95,
+     2.49,
+     2.53,
+     3.61
+    ]
+   }
+  },
+  {
+   "check": "liar: a seller that claims a win for a draw that lost, with a real invoice of its own node is paid nothing for it: the wallet's own check refuses it (lottery_win), books the refusal, and its ledger is what its node paid",
+   "ok": true,
+   "saw": {
+    "lies": 1,
+    "refusals_booked": 1,
+    "paid_msat": 0,
+    "ended": "stopped by the wallet: lottery_seller_fault: the session with this seller was stopped: the seller lists draw 1 as a win: by the wallet's own",
+    "wins_unpaid": []
+   }
+  },
+  {
+   "check": "liar: a seller that sends, for a real win, an invoice that pays another node is paid nothing for it: the wallet's own check refuses it (ticket_payee), books the refusal, and its ledger is what its node paid",
+   "ok": true,
+   "saw": {
+    "lies": 5,
+    "refusals_booked": 5,
+    "paid_msat": 0,
+    "ended": "stopped by the wallet: lottery_seller_fault: the seller's invoices for wins fail the wallet's checks (ticket_payee)",
+    "wins_unpaid": [
+     {
+      "draw": 1,
+      "rule": "ticket_payee"
+     },
+     {
+      "draw": 1,
+      "rule": "ticket_payee"
+     }
+    ]
+   }
+  },
+  {
+   "check": "liar: a seller that sends, for a real win, an invoice for one sat more is paid nothing for it: the wallet's own check refuses it (ticket_amount), books the refusal, and its ledger is what its node paid",
+   "ok": true,
+   "saw": {
+    "lies": 5,
+    "refusals_booked": 5,
+    "paid_msat": 0,
+    "ended": "stopped by the wallet: lottery_seller_fault: the seller's invoices for wins fail the wallet's checks (ticket_amount)",
+    "wins_unpaid": [
+     {
+      "draw": 2,
+      "rule": "ticket_amount"
+     },
+     {
+      "draw": 5,
+      "rule": "ticket_amount"
+     }
+    ]
+   }
+  },
+  {
+   "check": "liar: a seller that sends two invoices for every win is paid each win once: the second invoices are open on its node and unpaid, and the ledger is what the node paid",
+   "ok": true,
+   "saw": {
+    "wins": 68,
+    "second_invoices": 68,
+    "second_invoices_paid": 0,
+    "paid_msat": 4352000
+   }
+  },
+  {
+   "check": "kill: signer, between two calls of a session of draws: no win paid twice, none booked and not paid, none paid and not booked, and the next call is served",
+   "ok": true,
+   "saw": {
+    "next": {
+     "calls": 1,
+     "said_first": []
+    },
+    "settled_on_seller": 470,
+    "paid_on_buyer": 470,
+    "same_hashes": true,
+    "paid_not_booked": [],
+    "booked_not_paid": [],
+    "a_win_paid_twice": [],
+    "payments_the_node_left_in_flight_with_nothing_on_its_channel": 0,
+    "ledger_sats": 30550,
+    "node_cost_sats": 30550
+   }
+  },
+  {
+   "check": "kill: signer, in the middle of a download with wins being paid: no win paid twice, none booked and not paid, none paid and not booked, and the next call is served",
+   "ok": true,
+   "saw": {
+    "the_call_ended": "tool xbt402_pay: Error executing tool xbt402_pay",
+    "bytes": null,
+    "wins": null,
+    "wins_paid": null,
+    "next": {
+     "calls": 1,
+     "said_first": []
+    },
+    "settled_on_seller": 476,
+    "paid_on_buyer": 476,
+    "same_hashes": true,
+    "paid_not_booked": [],
+    "booked_not_paid": [],
+    "a_win_paid_twice": [],
+    "payments_the_node_left_in_flight_with_nothing_on_its_channel": 0,
+    "ledger_sats": 30940,
+    "node_cost_sats": 30940
+   }
+  },
+  {
+   "check": "kill: gateway, between two calls of a session of draws: no win paid twice, none booked and not paid, none paid and not booked, and the next call is served",
+   "ok": true,
+   "saw": {
+    "next": {
+     "calls": 1,
+     "said_first": []
+    },
+    "settled_on_seller": 476,
+    "paid_on_buyer": 476,
+    "same_hashes": true,
+    "paid_not_booked": [],
+    "booked_not_paid": [],
+    "a_win_paid_twice": [],
+    "payments_the_node_left_in_flight_with_nothing_on_its_channel": 0,
+    "ledger_sats": 30940,
+    "node_cost_sats": 30940
+   }
+  },
+  {
+   "check": "kill: gateway, in the middle of a download with wins being paid: no win paid twice, none booked and not paid, none paid and not booked, and the next call is served",
+   "ok": true,
+   "saw": {
+    "the_call_ended": "cut short by the seller: UnexpectedEof",
+    "bytes": 1376256,
+    "wins": 9,
+    "wins_paid": 9,
+    "next": {
+     "calls": 1,
+     "said_first": []
+    },
+    "settled_on_seller": 485,
+    "paid_on_buyer": 485,
+    "same_hashes": true,
+    "paid_not_booked": [],
+    "booked_not_paid": [],
+    "a_win_paid_twice": [],
+    "payments_the_node_left_in_flight_with_nothing_on_its_channel": 0,
+    "ledger_sats": 31525,
+    "node_cost_sats": 31525
+   }
+  },
+  {
+   "check": "kill: lf1, between two calls of a session of draws: no win paid twice, none booked and not paid, none paid and not booked, and the next call is served",
+   "ok": true,
+   "saw": {
+    "next": {
+     "calls": 1,
+     "said_first": []
+    },
+    "settled_on_seller": 485,
+    "paid_on_buyer": 485,
+    "same_hashes": true,
+    "paid_not_booked": [],
+    "booked_not_paid": [],
+    "a_win_paid_twice": [],
+    "payments_the_node_left_in_flight_with_nothing_on_its_channel": 0,
+    "ledger_sats": 31525,
+    "node_cost_sats": 31525
+   }
+  },
+  {
+   "check": "kill: lf1, in the middle of a download with wins being paid: no win paid twice, none booked and not paid, none paid and not booked, and the next call is served",
+   "ok": true,
+   "saw": {
+    "the_call_ended": "stopped by the wallet: max_sats: the call's limit is used up",
+    "bytes": 15975296,
+    "wins": 56,
+    "wins_paid": 56,
+    "next": {
+     "calls": 1,
+     "said_first": []
+    },
+    "settled_on_seller": 541,
+    "paid_on_buyer": 541,
+    "same_hashes": true,
+    "paid_not_booked": [],
+    "booked_not_paid": [],
+    "a_win_paid_twice": [],
+    "payments_the_node_left_in_flight_with_nothing_on_its_channel": 0,
+    "ledger_sats": 35165,
+    "node_cost_sats": 35165
+   }
+  },
+  {
+   "check": "kill: lf3, between two calls of a session of draws: no win paid twice, none booked and not paid, none paid and not booked, and the next call is served",
+   "ok": true,
+   "saw": {
+    "next": {
+     "calls": 1,
+     "said_first": []
+    },
+    "settled_on_seller": 541,
+    "paid_on_buyer": 541,
+    "same_hashes": true,
+    "paid_not_booked": [],
+    "booked_not_paid": [],
+    "a_win_paid_twice": [],
+    "payments_the_node_left_in_flight_with_nothing_on_its_channel": 0,
+    "ledger_sats": 35165,
+    "node_cost_sats": 35165
+   }
+  },
+  {
+   "check": "kill: lf3, in the middle of a download with wins being paid: no win paid twice, none booked and not paid, none paid and not booked, and the next call is served",
+   "ok": true,
+   "saw": {
+    "the_call_ended": "cut short by the seller: UnexpectedEof",
+    "bytes": 5898240,
+    "wins": 19,
+    "wins_paid": 18,
+    "next": {
+     "calls": 11,
+     "said_first": [
+      "lottery_refused"
+     ]
+    },
+    "settled_on_seller": 560,
+    "paid_on_buyer": 560,
+    "same_hashes": true,
+    "paid_not_booked": [],
+    "booked_not_paid": [],
+    "a_win_paid_twice": [],
+    "payments_the_node_left_in_flight_with_nothing_on_its_channel": 0,
+    "ledger_sats": 36400,
+    "node_cost_sats": 36400
+   }
+  }
+ ],
+ "measured": {
+  "file_win_in_flight_ms": {
+   "payments": 29,
+   "median": 215,
+   "p90": 244,
+   "longest": 251
+  },
+  "file_download_s": [
+   0.97,
+   0.91,
+   1.51,
+   1.5,
+   1.48
+  ],
+  "file_price_sats": 381.5,
+  "file_paid_sats_each": [
+   390,
+   260,
+   455,
+   390,
+   390
+  ],
+  "file_wins_each": [
+   6,
+   4,
+   7,
+   6,
+   6
+  ],
+  "file_pending_on_buyer_channel": {
+   "samples": 307,
+   "nothing_pending_share": 0.446,
+   "most_pending": 3,
+   "payments_seen_pending": 29,
+   "not_a_win_in_flight": []
+  },
+  "page_free_ms_median": 1.51,
+  "page_by_draw_ms_median": 3.06,
+  "page_draw_adds_ms": 1.55,
+  "swarm20_seconds": 4.8,
+  "swarm20_wins": 69,
+  "swarm20_pending_on_buyer_channel": {
+   "samples": 216,
+   "nothing_pending_share": 0.079,
+   "most_pending": 8,
+   "payments_seen_pending": 70,
+   "not_a_win_in_flight": []
+  },
+  "swarm20_win_in_flight_ms": {
+   "payments": 69,
+   "median": 437,
+   "p90": 484,
+   "longest": 515
+  },
+  "swarm100_seconds": 21.5,
+  "swarm100_wins": 295,
+  "swarm100_pending_on_buyer_channel": {
+   "samples": 971,
+   "nothing_pending_share": 0.046,
+   "most_pending": 9,
+   "payments_seen_pending": 296,
+   "not_a_win_in_flight": []
+  },
+  "swarm100_win_in_flight_ms": {
+   "payments": 295,
+   "median": 446,
+   "p90": 507,
+   "longest": 1881
+  },
+  "cheat_free_service_in_wins_at_a_quarter_win_a_piece": {
+   "mean": 4.53,
+   "median": 4.12,
+   "most": 7.5,
+   "sessions": 10,
+   "note": "pieces of 16 sat on wins of 64 sat: the seller stops at the third unpaid win"
+  },
+  "cheat_free_service_in_wins_at_a_quarter_sat_a_piece": {
+   "mean": 1.66,
+   "median": 1.57,
+   "most": 3.61,
+   "sessions": 10,
+   "wins_unpaid_each_mean": 1.6,
+   "note": "what a buyer that never pays was served before it was stopped, in units of one win (64 sat)"
+  }
+ },
+ "failed": [],
+ "seconds": 457
+}

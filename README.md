@@ -284,7 +284,9 @@ tickets and the lottery on both sides, pay with work, and the services and packa
 `packaging/` holds the Umbrel and StartOS apps of the wallet. `container/` and `docs/CONTAINER.md`
 cover the images. `docs/ENGINEERING.md` has the design notes, conformance results and measurements
 of the on-chain channel and the hub, as history: most of what it names is no longer in the tree.
-`docs/LIMITS.md` has the stated limits and open items.
+`docs/LIMITS.md` has the stated limits and open items. `reports/` holds the reports the regtest
+scripts wrote on their latest runs, as they were written: our own runs, on one host
+(`reports/README.md`).
 
 ## Build
 

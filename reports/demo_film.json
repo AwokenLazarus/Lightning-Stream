@@ -1,0 +1,717 @@
+{
+ "checks": [
+  {
+   "check": "setup: four Lightning Fork nodes in a line, and every channel a ticket crosses carries 30 pending payments",
+   "ok": true,
+   "saw": {
+    "lf1": 30,
+    "lf3": 30,
+    "lf4": 30
+   }
+  },
+  {
+   "check": "setup: a stock Jellyfin is up with a library of one freely licensed film and a user without admin rights who sees that library only",
+   "ok": true,
+   "saw": {
+    "jellyfin": "10.11.0",
+    "image": "jellyfin/jellyfin:10.11.0",
+    "the_demo_user_sees": [
+     "Big Buck Bunny (2008)"
+    ],
+    "licence": "Big Buck Bunny, (c) 2008 Blender Foundation, www.bigbuckbunny.org, CC BY 3.0"
+   }
+  },
+  {
+   "check": "setup: the wallet's Lightning rail is ready on the buyer's node",
+   "ok": true,
+   "saw": {
+    "ready": true,
+    "warnings": null
+   }
+  },
+  {
+   "check": "film: an unpaid request for the film gets a 402 that offers stream tickets (held, and prepaid) and no lottery; a path of the service that is not the film's has no route, and is not served",
+   "ok": true,
+   "saw": {
+    "status": 402,
+    "offers": [
+     [
+      "ticket",
+      "on-use"
+     ],
+     [
+      "ticket",
+      "on-arrival"
+     ]
+    ],
+    "price": "100 sat a MiB",
+    "another_film_of_the_same_server": 404,
+    "the_servers_own_pages": 404,
+    "service": "Jellyfin 10.11.0 (the image jellyfin/jellyfin:10.11.0, unchanged), in a container on this host"
+   }
+  },
+  {
+   "check": "film: an ordinary player (ffmpeg) pointed at the proxy decodes the film's first frame, from a wallet with no session open, three times",
+   "ok": true,
+   "saw": {
+    "new_session_s": [
+     0.89,
+     0.51,
+     0.51
+    ],
+    "median_s": 0.51,
+    "session_open_s": [
+     0.17,
+     0.16,
+     0.19
+    ],
+    "session_open_median_s": 0.17,
+    "what_it_took": [
+     {
+      "paid_sats": 1015,
+      "tickets_released": 1,
+      "held_tickets": 2,
+      "requests": 6,
+      "MiB": 7.03
+     },
+     {
+      "paid_sats": 1015,
+      "tickets_released": 1,
+      "held_tickets": 2,
+      "requests": 4,
+      "MiB": 7.03
+     },
+     {
+      "paid_sats": 1015,
+      "tickets_released": 1,
+      "held_tickets": 2,
+      "requests": 4,
+      "MiB": 7.03
+     }
+    ]
+   }
+  },
+  {
+   "check": "film: the film plays in real time for 90 s through one routing hop without a stall, bought a few seconds ahead of the clock and paid for as it arrives",
+   "ok": true,
+   "saw": {
+    "position": 90.0,
+    "ahead_s": 12.0,
+    "segments": 17,
+    "bytes": 39426608,
+    "film_seconds_bought": 102.0,
+    "stalled_s": 0.02,
+    "failed_requests": 0,
+    "fetching": false,
+    "paid_sats": 4060,
+    "tickets_released": 4,
+    "held_tickets": 2,
+    "sats_a_minute_of_film": 2213
+   }
+  },
+  {
+   "check": "film: paused, the player stops asking once its buffer is full and the wallet pays nothing more: at most one ticket after the pause was pressed, none in the 20 s after, and the 2 held tickets stay held, not spent",
+   "ok": true,
+   "saw": {
+    "tickets_released_after_the_pause_was_pressed": 0,
+    "film_bought_ahead_s": 12.0,
+    "paid_in_the_20_s_after_sats": 0,
+    "held_tickets": 2,
+    "held_sats": 2000,
+    "left_of_the_last_ticket_sats": 237
+   }
+  },
+  {
+   "check": "film: played on after the pause, then a seek to 5:00: the film is there again and plays from the new place",
+   "ok": true,
+   "saw": {
+    "seek_to_playing_s": 0.02,
+    "position": 306.0,
+    "stalled_s_in_all": 0.04
+   }
+  },
+  {
+   "check": "film: the connection to the seller is dropped in the middle of a segment: the player asks again and the film goes on; what the cut answer had brought was paid for and is bought again, and nothing else is lost",
+   "ok": true,
+   "saw": {
+    "failed_requests": 1,
+    "said": "segment 53: 502 b'{\\n \"error\": \"the answer stopped part way\",\\n \"ended\": \"cut short by the seller: UnexpectedEof\",\\n \"bytes\": 260972,\\n \"charged_sats\": 0\\n}'",
+    "film_stalled_s": 0.0,
+    "the_segment_whole_after_s": 0.51,
+    "the_cut_answers": [
+     {
+      "bytes": 260972,
+      "price_msat": 34264,
+      "ended": "cut short by the seller: UnexpectedEof"
+     }
+    ],
+    "tickets_released_meanwhile": 0
+   }
+  },
+  {
+   "check": "film: the seller's gateway is killed and started again 8 s later: the player's requests fail meanwhile and it asks again; the film goes on, with the tickets that were held or with a new session, and the viewer loses at most what was left of one ticket",
+   "ok": true,
+   "saw": {
+    "gateway_back_after_s": 8.05,
+    "film_going_again_after_s": 34.26,
+    "film_stalled_s": 18.7,
+    "failed_requests": 1,
+    "said": [
+     "402 b'{\\n \"error\": \"the wallet did not pay\",\\n \"rule\": \"xbt402\",\\n \"reason\": \"the seller gave no answer: the connection "
+    ],
+    "new_session": false,
+    "tickets_released_meanwhile": 1,
+    "balance_before_sats": 110,
+    "balance_after_sats": 454
+   }
+  },
+  {
+   "check": "film: the viewer stops: the 2 tickets that were held and not spent are cancelled by the seller and are back on the buyer's node within 5 s; what is left of the last ticket stays with the seller",
+   "ok": true,
+   "saw": {
+    "seconds": 0.24,
+    "held_before": {
+     "tickets": 2,
+     "sats": 2000
+    },
+    "stop": [
+     {
+      "session": "kBWEdjCQmD5t4uebesle1YgZHTbG1Jos",
+      "held_tickets_asked_back": 2,
+      "seller_took_the_cancel": true,
+      "still_locked": [],
+      "left_with_the_seller_msat": "454735"
+     }
+    ],
+    "wait_s": 0.0
+   }
+  },
+  {
+   "check": "film: the whole film arrives, every segment, and what the buyer's node paid for it is the tickets released: the price rounded up to a ticket, and never more than 2 tickets held ahead",
+   "ok": true,
+   "saw": {
+    "segments": 106,
+    "of": 106,
+    "film_seconds": 634.6,
+    "MiB": 274.7,
+    "price_sats": 27466.1,
+    "tickets_released": 28,
+    "seconds": 4.6,
+    "failed_requests": 0,
+    "payments": 28,
+    "paid_sats": 28000,
+    "fees_msat": 28028,
+    "fee_msat_a_payment": 1001,
+    "payments_that_came_back": 2,
+    "pending_on_the_buyers_channel": {
+     "samples": 216,
+     "most_pending_at_once": 2,
+     "nothing_pending_share": 0.032
+    },
+    "left_with_the_seller_msat": [
+     "533918"
+    ]
+   }
+  },
+  {
+   "check": "film: what the buyer's node paid, what the seller's node received and what the wallet's ledger holds (each ticket and its routing fee) agree, to the millisat",
+   "ok": true,
+   "saw": {
+    "buyer_node_paid_msat": 41000000,
+    "sellers_nodes_received_msat": 41000000,
+    "received_by": {
+     "lf3": 41000000,
+     "lf4": 0
+    },
+    "wallet_ledger_sats": 41082,
+    "buyer_node_cost_sats": 41082,
+    "fees_msat": 41041,
+    "payments": 41,
+    "failed_payments": 10,
+    "in_flight": 0,
+    "booked_not_settled_sats": 0
+   }
+  },
+  {
+   "check": "far: an ordinary player (ffmpeg) pointed at the proxy decodes the film's first frame, from a wallet with no session open, three times",
+   "ok": true,
+   "saw": {
+    "new_session_s": [
+     0.56,
+     0.56,
+     0.56
+    ],
+    "median_s": 0.56,
+    "session_open_s": [
+     0.13,
+     0.12,
+     0.12
+    ],
+    "session_open_median_s": 0.12,
+    "what_it_took": [
+     {
+      "paid_sats": 1015,
+      "tickets_released": 1,
+      "held_tickets": 2,
+      "requests": 4,
+      "MiB": 7.03
+     },
+     {
+      "paid_sats": 1015,
+      "tickets_released": 1,
+      "held_tickets": 2,
+      "requests": 4,
+      "MiB": 7.03
+     },
+     {
+      "paid_sats": 1015,
+      "tickets_released": 1,
+      "held_tickets": 2,
+      "requests": 4,
+      "MiB": 7.03
+     }
+    ]
+   }
+  },
+  {
+   "check": "far: the same film from the seller two routing hops away plays in real time without a stall",
+   "ok": true,
+   "saw": {
+    "position": 45.0,
+    "ahead_s": 15.0,
+    "segments": 10,
+    "bytes": 26698256,
+    "film_seconds_bought": 60.0,
+    "stalled_s": 0.01,
+    "failed_requests": 0,
+    "fetching": false,
+    "paid_sats": 3045,
+    "tickets_released": 3,
+    "held_tickets": 2
+   }
+  },
+  {
+   "check": "far: the whole film arrives, every segment, and what the buyer's node paid for it is the tickets released: the price rounded up to a ticket, and never more than 2 tickets held ahead",
+   "ok": true,
+   "saw": {
+    "segments": 106,
+    "of": 106,
+    "film_seconds": 634.6,
+    "MiB": 274.7,
+    "price_sats": 27466.1,
+    "tickets_released": 28,
+    "seconds": 6.5,
+    "failed_requests": 0,
+    "payments": 28,
+    "paid_sats": 28000,
+    "fees_msat": 56056,
+    "fee_msat_a_payment": 2002,
+    "payments_that_came_back": 2,
+    "pending_on_the_buyers_channel": {
+     "samples": 304,
+     "most_pending_at_once": 2,
+     "nothing_pending_share": 0.076
+    },
+    "left_with_the_seller_msat": [
+     "533918"
+    ]
+   }
+  },
+  {
+   "check": "far: after the film from two hops away the buyer's node, the two sellers' nodes and the wallet's ledger agree, to the millisat",
+   "ok": true,
+   "saw": {
+    "buyer_node_paid_msat": 78000000,
+    "sellers_nodes_received_msat": 78000000,
+    "received_by": {
+     "lf3": 41000000,
+     "lf4": 37000000
+    },
+    "wallet_ledger_sats": 78193,
+    "buyer_node_cost_sats": 78193,
+    "fees_msat": 115115,
+    "payments": 78,
+    "failed_payments": 20,
+    "in_flight": 0,
+    "booked_not_settled_sats": 0
+   }
+  },
+  {
+   "check": "agent: an agent with only the wallet's tools buys the first part of the film's file with one call that may use 300 sat: the wallet stops the answer where 300 sat are used by its own count, and what arrived is the file's own first bytes",
+   "ok": true,
+   "saw": {
+    "the_agents_tools": [
+     "balance",
+     "channels",
+     "history",
+     "pay",
+     "quote_payment",
+     "ticket_status",
+     "ticket_stop",
+     "xbt402_pay"
+    ],
+    "bytes": 3153699,
+    "price_of_those_bytes_msat": 300761,
+    "charged_sats": 1015,
+    "tickets_released": 1,
+    "ended": "stopped by the wallet: max_sats: the call's limit is used up",
+    "is_the_films_first_bytes": true,
+    "it_read": "ftypisom",
+    "seconds": 0.38
+   }
+  },
+  {
+   "check": "agent: the agent then stops the session itself, and the tickets it held come back",
+   "ok": true,
+   "saw": {
+    "session": "IfuqXurnQCTEQUWD0V43TpoUOWcMczyR",
+    "stop": {
+     "cancel_asked": 1,
+     "cancel_sent": true,
+     "still_locked": []
+    }
+   }
+  },
+  {
+   "check": "swarm: the film's file arrives whole in 1054 pieces of 256 KiB from 20 sellers at once, every piece its own hash, each piece one draw, paid by the wallet's own rule with draws",
+   "ok": true,
+   "saw": {
+    "sellers": 20,
+    "pieces": 1054,
+    "draws": 1054,
+    "wins": 10,
+    "expected_wins": 16.5,
+    "win_sats": [
+     64
+    ],
+    "price_sats": 1053.4,
+    "payments": 10,
+    "paid_sats": 640,
+    "fees_msat": 10000,
+    "fee_msat_a_payment": 1000,
+    "payments_that_came_back": 0,
+    "sellers_paid_nothing": 12,
+    "wins_by_seller": [
+     1,
+     0,
+     1,
+     0,
+     0,
+     0,
+     2,
+     0,
+     1,
+     0,
+     1,
+     0,
+     0,
+     1,
+     2,
+     1,
+     0,
+     0,
+     0,
+     0
+    ],
+    "seconds": 1.9,
+    "MiB": 263.3,
+    "pending_on_the_buyers_channel": {
+     "samples": 88,
+     "most_pending_at_once": 3,
+     "nothing_pending_share": 0.443
+    },
+    "bad": []
+   }
+  },
+  {
+   "check": "swarm: 20 sellers are paid from the one 30-slot channel: every win is one payment of the win's size, none failed, never more than 8 on the channel at once, and nothing is held between wins",
+   "ok": true,
+   "saw": {
+    "payments": 10,
+    "paid_sats": 640,
+    "fees_msat": 10000,
+    "fee_msat_a_payment": 1000,
+    "payments_that_came_back": 0,
+    "samples": 88,
+    "most_pending_at_once": 3,
+    "nothing_pending_share": 0.443
+   }
+  },
+  {
+   "check": "swarm: after the swarm the buyer's node, the sellers' node and the wallet's ledger agree, to the millisat",
+   "ok": true,
+   "saw": {
+    "buyer_node_paid_msat": 79640000,
+    "sellers_nodes_received_msat": 79640000,
+    "received_by": {
+     "lf3": 42640000,
+     "lf4": 37000000
+    },
+    "wallet_ledger_sats": 79845,
+    "buyer_node_cost_sats": 79845,
+    "fees_msat": 126116,
+    "payments": 89,
+    "failed_payments": 21,
+    "in_flight": 0,
+    "booked_not_settled_sats": 0
+   }
+  }
+ ],
+ "measured": {
+  "film": {
+   "title": "Big Buck Bunny (2008)",
+   "licence": "Big Buck Bunny, (c) 2008 Blender Foundation, www.bigbuckbunny.org, CC BY 3.0",
+   "bytes": 276134947,
+   "seconds": 634.6,
+   "mbit_per_s": 3.48,
+   "streams": [
+    "h264 1920x1080",
+    "mp3",
+    "ac3"
+   ],
+   "sha256": "ae51005850b0ff757fe60c3dd7a12d754d3cd2397d87d939b55235e457f97658"
+  },
+  "price": {
+   "sat_per_MiB": 100,
+   "ticket_sats": 1000,
+   "note": "a number chosen so that a ticket lasts about half a minute of this film; not a market price"
+  },
+  "film_first_frame": {
+   "new_session_s": [
+    0.89,
+    0.51,
+    0.51
+   ],
+   "median_s": 0.51,
+   "session_open_s": [
+    0.17,
+    0.16,
+    0.19
+   ],
+   "session_open_median_s": 0.17,
+   "what_it_took": [
+    {
+     "paid_sats": 1015,
+     "tickets_released": 1,
+     "held_tickets": 2,
+     "requests": 6,
+     "MiB": 7.03
+    },
+    {
+     "paid_sats": 1015,
+     "tickets_released": 1,
+     "held_tickets": 2,
+     "requests": 4,
+     "MiB": 7.03
+    },
+    {
+     "paid_sats": 1015,
+     "tickets_released": 1,
+     "held_tickets": 2,
+     "requests": 4,
+     "MiB": 7.03
+    }
+   ]
+  },
+  "film_sats_a_minute": {
+   "by_price": 2213,
+   "film_seconds_bought": 102.0,
+   "price_sats": 3762.8,
+   "film_mbit_per_s": 3.48,
+   "MiB_a_minute": 22.1
+  },
+  "film_seek_s": 0.02,
+  "film_dropped_connection": {
+   "the_segment_whole_after_s": 0.51,
+   "film_stalled_s": 0.0,
+   "failed_requests": 1,
+   "the_cut_answers": [
+    {
+     "bytes": 260972,
+     "price_msat": 34264,
+     "ended": "cut short by the seller: UnexpectedEof"
+    }
+   ]
+  },
+  "film_seller_restart": {
+   "gateway_back_after_s": 8.05,
+   "film_going_again_after_s": 34.26,
+   "film_stalled_s": 18.7,
+   "new_session": false
+  },
+  "film_whole_film": {
+   "segments": 106,
+   "of": 106,
+   "film_seconds": 634.6,
+   "MiB": 274.7,
+   "price_sats": 27466.1,
+   "tickets_released": 28,
+   "seconds": 4.6,
+   "failed_requests": 0,
+   "payments": 28,
+   "paid_sats": 28000,
+   "fees_msat": 28028,
+   "fee_msat_a_payment": 1001,
+   "payments_that_came_back": 2,
+   "pending_on_the_buyers_channel": {
+    "samples": 216,
+    "most_pending_at_once": 2,
+    "nothing_pending_share": 0.032
+   },
+   "left_with_the_seller_msat": [
+    "533918"
+   ]
+  },
+  "film_one_hop_money": {
+   "payments": 35,
+   "paid_sats": 35000,
+   "fees_msat": 35035,
+   "fee_msat_a_payment": 1001,
+   "payments_that_came_back": 4,
+   "of_which_the_whole_film": 28000
+  },
+  "far_first_frame": {
+   "new_session_s": [
+    0.56,
+    0.56,
+    0.56
+   ],
+   "median_s": 0.56,
+   "session_open_s": [
+    0.13,
+    0.12,
+    0.12
+   ],
+   "session_open_median_s": 0.12,
+   "what_it_took": [
+    {
+     "paid_sats": 1015,
+     "tickets_released": 1,
+     "held_tickets": 2,
+     "requests": 4,
+     "MiB": 7.03
+    },
+    {
+     "paid_sats": 1015,
+     "tickets_released": 1,
+     "held_tickets": 2,
+     "requests": 4,
+     "MiB": 7.03
+    },
+    {
+     "paid_sats": 1015,
+     "tickets_released": 1,
+     "held_tickets": 2,
+     "requests": 4,
+     "MiB": 7.03
+    }
+   ]
+  },
+  "far_whole_film": {
+   "segments": 106,
+   "of": 106,
+   "film_seconds": 634.6,
+   "MiB": 274.7,
+   "price_sats": 27466.1,
+   "tickets_released": 28,
+   "seconds": 6.5,
+   "failed_requests": 0,
+   "payments": 28,
+   "paid_sats": 28000,
+   "fees_msat": 56056,
+   "fee_msat_a_payment": 2002,
+   "payments_that_came_back": 2,
+   "pending_on_the_buyers_channel": {
+    "samples": 304,
+    "most_pending_at_once": 2,
+    "nothing_pending_share": 0.076
+   },
+   "left_with_the_seller_msat": [
+    "533918"
+   ]
+  },
+  "far_two_hops_money": {
+   "payments": 37,
+   "paid_sats": 37000,
+   "fees_msat": 74074,
+   "fee_msat_a_payment": 2002,
+   "payments_that_came_back": 10,
+   "of_which_the_whole_film": 28000
+  },
+  "agent_call": {
+   "bytes": 3153699,
+   "charged_sats": 1015,
+   "seconds": 0.38,
+   "reply": {
+    "balance_msat": "681271",
+    "body_digest": "a3ed5359d2883a260dbab57b0e0f5f7c5fab3582907206653e7b9461225239e6",
+    "bytes": 3153699,
+    "charged_sats": 1015,
+    "complete": false,
+    "credited_msat": "1000000",
+    "dest": "ln:034a7d2292b345818836a0004329229cbe79a1fb471d5041f52262074f5dd65ef8",
+    "ended": "stopped by the wallet: max_sats: the call's limit is used up",
+    "ms": 304.5,
+    "origin": "http://127.0.0.1:18307",
+    "price_msat": "318729",
+    "rail": "ticket",
+    "rule": "ok",
+    "saved_to": "<repo>/run/demo-9wEirJ/bodies/ticket-O6g0AHBKBY1lXeWxcvAKoaKPgtHp_KbM.bin",
+    "session": "IfuqXurnQCTEQUWD0V43TpoUOWcMczyR",
+    "status": 200,
+    "tickets_prepaid": 0,
+    "tickets_released": 1,
+    "verdict": "allow"
+   }
+  },
+  "swarm": {
+   "sellers": 20,
+   "pieces": 1054,
+   "draws": 1054,
+   "wins": 10,
+   "expected_wins": 16.5,
+   "win_sats": [
+    64
+   ],
+   "price_sats": 1053.4,
+   "payments": 10,
+   "paid_sats": 640,
+   "fees_msat": 10000,
+   "fee_msat_a_payment": 1000,
+   "payments_that_came_back": 0,
+   "sellers_paid_nothing": 12,
+   "wins_by_seller": [
+    1,
+    0,
+    1,
+    0,
+    0,
+    0,
+    2,
+    0,
+    1,
+    0,
+    1,
+    0,
+    0,
+    1,
+    2,
+    1,
+    0,
+    0,
+    0,
+    0
+   ],
+   "seconds": 1.9,
+   "MiB": 263.3,
+   "pending_on_the_buyers_channel": {
+    "samples": 88,
+    "most_pending_at_once": 3,
+    "nothing_pending_share": 0.443
+   },
+   "bad": []
+  }
+ },
+ "failed": [],
+ "seconds": 386
+}

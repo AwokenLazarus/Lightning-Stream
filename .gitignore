@@ -1,7 +1,9 @@
 /target
 /tools/lazarus-crosscheck/target
 *.tmp
+# what the lab scripts build and write: the node sources, logs and reports of a run
 /run
+# reports/ is not ignored: it holds the reports of the latest runs, copied from run/ (reports/README.md)
 # everything the build and packaging scripts generate (size tables, image tars, packages)
 /dist/
 __pycache__/

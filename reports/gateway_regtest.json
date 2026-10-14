@@ -1,0 +1,777 @@
+{
+ "checks": [
+  {
+   "check": "terms: the 402 names the seller's node, the ticket terms (2 a session; held tickets first, prepaid ones second) and the price rule",
+   "ok": true,
+   "saw": [
+    {
+     "scheme": "ticket",
+     "network": "lightning:4ffb7d9309368b43cbd4c13e8f3a8441",
+     "asset": "XBT:msat",
+     "amount": "0",
+     "payTo": "03c5733586102af7627b69a02375c125e4aa66da905ddba26576c53f9879bd5f9d",
+     "extra": {
+      "version": "ticket/0",
+      "features": [
+       512
+      ],
+      "ticketMsat": "1000000",
+      "maxTickets": 2,
+      "ticketBlocks": 40,
+      "release": "with-request",
+      "settle": "on-use",
+      "receiptKey": "0277428c543391503d3d82ea2b863638b3f281bfed3cce24b20e728d12ba1dc698",
+      "session": "/x402/ticket",
+      "price": {
+       "requestMsat": "0",
+       "byteMsat": "200000",
+       "perBytes": "1048576",
+       "secondMsat": "0"
+      }
+     }
+    },
+    {
+     "scheme": "ticket",
+     "network": "lightning:4ffb7d9309368b43cbd4c13e8f3a8441",
+     "asset": "XBT:msat",
+     "amount": "0",
+     "payTo": "03c5733586102af7627b69a02375c125e4aa66da905ddba26576c53f9879bd5f9d",
+     "extra": {
+      "version": "ticket/0",
+      "features": [
+       512
+      ],
+      "ticketMsat": "1000000",
+      "maxTickets": 2,
+      "ticketBlocks": 40,
+      "release": "with-request",
+      "settle": "on-arrival",
+      "receiptKey": "0277428c543391503d3d82ea2b863638b3f281bfed3cce24b20e728d12ba1dc698",
+      "session": "/x402/ticket",
+      "price": {
+       "requestMsat": "0",
+       "byteMsat": "200000",
+       "perBytes": "1048576",
+       "secondMsat": "0"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "check": "terms: /services lists the routes, unsigned",
+   "ok": true,
+   "saw": {
+    "version": "services/0",
+    "signed": false,
+    "scheme": "ticket",
+    "network": "lightning:4ffb7d9309368b43cbd4c13e8f3a8441",
+    "payTo": "03c5733586102af7627b69a02375c125e4aa66da905ddba26576c53f9879bd5f9d",
+    "receiptKey": "0277428c543391503d3d82ea2b863638b3f281bfed3cce24b20e728d12ba1dc698",
+    "session": "/x402/ticket",
+    "ticketMsat": "1000000",
+    "maxTickets": 2,
+    "ticketBlocks": 40,
+    "settle": [
+     "on-use",
+     "on-arrival"
+    ],
+    "routes": [
+     {
+      "path": "/big.bin",
+      "methods": [
+       "GET",
+       "HEAD"
+      ],
+      "free": false,
+      "price": {
+       "requestMsat": "0",
+       "byteMsat": "200000",
+       "perBytes": "1048576",
+       "secondMsat": "0"
+      },
+      "release": "with-request",
+      "lottery": false
+     },
+     {
+      "path": "/mid.bin",
+      "methods": [
+       "GET",
+       "HEAD"
+      ],
+      "free": false,
+      "price": {
+       "requestMsat": "0",
+       "byteMsat": "200000",
+       "perBytes": "1048576",
+       "secondMsat": "0"
+      },
+      "release": "with-request",
+      "lottery": false
+     },
+     {
+      "path": "/small.txt",
+      "methods": [
+       "GET",
+       "HEAD"
+      ],
+      "free": false,
+      "price": {
+       "requestMsat": "2500",
+       "byteMsat": "0",
+       "perBytes": "1",
+       "secondMsat": "0"
+      },
+      "release": "with-request",
+      "lottery": false
+     },
+     {
+      "path": "/free/",
+      "methods": [
+       "GET",
+       "HEAD"
+      ],
+      "free": true,
+      "price": {
+       "requestMsat": "0",
+       "byteMsat": "0",
+       "perBytes": "1",
+       "secondMsat": "0"
+      },
+      "release": "with-request",
+      "lottery": false
+     }
+    ],
+    "lottery": null
+   }
+  },
+  {
+   "check": "terms: a path with no route is 404 from the gateway",
+   "ok": true,
+   "saw": 404
+  },
+  {
+   "check": "macaroons: neither of the gateway's two can send coins, pay, open a channel, bake or read the wallet",
+   "ok": true,
+   "saw": {
+    "invoices": {
+     "send coins": true,
+     "pay": true,
+     "open a channel": true,
+     "bake a macaroon": true,
+     "read the wallet": true
+    },
+    "info": {
+     "send coins": true,
+     "pay": true,
+     "open a channel": true,
+     "bake a macaroon": true,
+     "read the wallet": true
+    },
+    "invoices cannot read the height": true,
+    "info cannot make an invoice": true
+   }
+  },
+  {
+   "check": "macaroons: a wider macaroon is refused on mainnet, in either place; the two narrow ones are taken",
+   "ok": true,
+   "saw": {
+    "wide": [
+     1,
+     "xbt-gateway: node.macaroon is refused on mainnet: it grants onchain:write: bake one with only invoices:read invoices:write"
+    ],
+    "wide as the height macaroon": [
+     1,
+     "xbt-gateway: node.info_macaroon lacks info:read: bake one with info:read"
+    ],
+    "narrow": [
+     0,
+     "xbt-gateway: prepaid tickets: paid in full when they arrive, one at a time, with nothing held on any channel"
+    ],
+    "wide off mainnet": [
+     0,
+     "xbt-gateway: prepaid tickets: paid in full when they arrive, one at a time, with nothing held on any channel"
+    ]
+   }
+  },
+  {
+   "check": "macaroons: the optional channels macaroon (offchain:read) cannot pay, open a channel, make an invoice or read the wallet; it does show balances and payments; a wider one is refused on mainnet",
+   "ok": true,
+   "saw": {
+    "cannot": {
+     "pay": true,
+     "open a channel": true,
+     "make an invoice": true,
+     "read the on-chain wallet": true
+    },
+    "shows": {
+     "the channel balances": true,
+     "the node's payments": true,
+     "the channel list": true
+    },
+    "narrow": [
+     0,
+     "xbt-gateway: prepaid tickets: paid in full when they arrive, one at a time, with nothing held on any channel"
+    ],
+    "wide": [
+     1,
+     "xbt-gateway: node.channels_macaroon is refused on mainnet: it grants offchain:write: bake one with only offchain:read"
+    ]
+   }
+  },
+  {
+   "check": "macaroons: a config that offers held tickets of 500 sat is refused: below 546 sat a held ticket is dust",
+   "ok": true,
+   "saw": [
+    1,
+    "xbt-gateway: tickets.ticket_msat is at least 546000 (546 sat) where held tickets are offered: a held payment below a channel's dust limit has no output in that channel's transaction, and is lost to the miners if the channel is force-closed while it is held. For smaller tickets offer only prepaid one"
+   ]
+  },
+  {
+   "check": "fetch: the head's receipt is signed and says the body is a stream",
+   "ok": true,
+   "saw": {
+    "scheme": "ticket",
+    "session": "0bed3eb54c4843082b855642db6f05d4",
+    "seq": 9,
+    "releasedMsat": "1000000",
+    "spentMsat": "0",
+    "charged": "0",
+    "req": "9cc68f32c6e704e9548a4a70a24d5084482f82bce2080e40f57f65bb9e74de8a",
+    "status": 200,
+    "bodyHash": "",
+    "sig": "3044022054bcf3f1253b21092a5d364748766d6acfc9e5510767b96fbaa796c05b87021002200bc77198ef00dba556d6cccdb476b54d761df19c6dc15c884b547de616d54c36"
+   }
+  },
+  {
+   "check": "fetch: what came back is what ten tickets pay for, to the byte, and is the file's",
+   "ok": true,
+   "saw": {
+    "bytes": 52428800,
+    "paid_for": 52428800
+   }
+  },
+  {
+   "check": "fetch: the last receipt is signed, and has the bytes sent, their hash and their price",
+   "ok": true,
+   "saw": {
+    "scheme": "ticket",
+    "session": "0bed3eb54c4843082b855642db6f05d4",
+    "seq": 9,
+    "releasedMsat": "10000000",
+    "spentMsat": "10000000",
+    "charged": "10000000",
+    "req": "9cc68f32c6e704e9548a4a70a24d5084482f82bce2080e40f57f65bb9e74de8a",
+    "status": 200,
+    "bodyHash": "19d812755a30d3cdfef76c3e2bef15af5d77af123c0bb1ec1ac11785a6b74e65",
+    "sig": "3045022100fe600b369864e860393a0a4e8620ee29eff9da21f3051fda251453c9b6c1aaa8022012a74ac66abf4192022138a2a89cd844cad8cdc04ac8bf61775275f26629bc17",
+    "bytes": 52428800,
+    "complete": false
+   }
+  },
+  {
+   "check": "fetch: nothing was served beyond what was released (spent equals released, balance 0)",
+   "ok": true,
+   "saw": {
+    "id": "0bed3eb54c4843082b855642db6f05d4",
+    "nextSeq": 114,
+    "releasedMsat": "10000000",
+    "spentMsat": "10000000",
+    "balanceMsat": "0",
+    "tickets": 1
+   }
+  },
+  {
+   "check": "fetch: the body stopped within the refill wait of the buyer's last release",
+   "ok": true,
+   "saw": 2.77
+  },
+  {
+   "check": "fetch: the tickets it did not release were cancelled and its node shows them failed; the released ones succeeded",
+   "ok": true,
+   "saw": {
+    "unreleased": 1,
+    "cancelled": 1,
+    "buyer_node": {
+     "FAILED:INCORRECT_PAYMENT_DETAILS": 1,
+     "SUCCEEDED": 10
+    }
+   }
+  },
+  {
+   "check": "fetch: every receipt the buyer got was signed and agreed with its own count of what it released",
+   "ok": true,
+   "saw": 0
+  },
+  {
+   "check": "fetch: the file server was asked once",
+   "ok": true,
+   "saw": 1
+  },
+  {
+   "check": "whole: 10 MB end to end: the file's bytes, and a signed last receipt with their hash and price",
+   "ok": true,
+   "saw": {
+    "bytes": 10000000,
+    "price_msat": 1907349,
+    "receipt": {
+     "scheme": "ticket",
+     "session": "64a9efd396711057ac50d0470ff0dcd1",
+     "seq": 9,
+     "releasedMsat": "2000000",
+     "spentMsat": "1907349",
+     "charged": "1907349",
+     "req": "f57a4599df78a951516b59a039e06c5182c11a51593188fe402d7e0a250d3ed7",
+     "status": 200,
+     "bodyHash": "a9a5a8a9dbaaae77c908983d007c69dc0b6a8f6f0cfbf0061618e2fddaf96656",
+     "sig": "304502210084985db478a59c42931bd494558a7918deaf630ff7499380ea8fa452cd2dc03e0220795517773526b9dcc000aad32a804a96ba73a814f1149119f5cffe6501ccd4b9",
+     "bytes": 10000000,
+     "complete": true
+    }
+   }
+  },
+  {
+   "check": "whole: the buyer released two tickets for 1,907,349 msat and keeps the rest as balance; every receipt agreed with its own count",
+   "ok": true,
+   "saw": {
+    "released": 2,
+    "session": {
+     "id": "64a9efd396711057ac50d0470ff0dcd1",
+     "nextSeq": 15,
+     "releasedMsat": "2000000",
+     "spentMsat": "1907349",
+     "balanceMsat": "92651",
+     "tickets": 0
+    },
+    "bad_receipts": 0
+   }
+  },
+  {
+   "check": "latency: a paid request adds at most 5 ms at the median over the same request unpaid (399 of 400 requests at this price carry no secret)",
+   "ok": true,
+   "saw": {
+    "added_ms": 0.09
+   }
+  },
+  {
+   "check": "latency: no secret was refused and no receipt disagreed",
+   "ok": true,
+   "saw": {
+    "released": 33,
+    "with_a_secret": 32,
+    "bad_receipts": 0
+   }
+  },
+  {
+   "check": "latency: every used ticket was settled within 1 s of its secret arriving (the gateway's own worst case so far)",
+   "ok": true,
+   "saw": {
+    "settled": 45,
+    "worst_ms": 4.2
+   }
+  },
+  {
+   "check": "locked: a secret for a ticket that was never paid buys nothing",
+   "ok": true,
+   "saw": {
+    "http": 402,
+    "error": "ticket_not_locked",
+    "node": "OPEN"
+   }
+  },
+  {
+   "check": "locked: a replayed request is refused",
+   "ok": true,
+   "saw": {
+    "first": 200,
+    "again": "bad_seq"
+   }
+  },
+  {
+   "check": "locked: a replayed secret is refused",
+   "ok": true,
+   "saw": "ticket_used"
+  },
+  {
+   "check": "locked: another buyer's secret is refused, and that buyer's ticket is still locked",
+   "ok": true,
+   "saw": {
+    "error": "ticket_unknown",
+    "node": "ACCEPTED"
+   }
+  },
+  {
+   "check": "locked: a payment made for one target does not pay another",
+   "ok": true,
+   "saw": "bad_auth"
+  },
+  {
+   "check": "locked: the file server saw the two paid requests and nothing else",
+   "ok": true,
+   "saw": 2
+  },
+  {
+   "check": "locked: the buyer was charged for what it was served and no more",
+   "ok": true,
+   "saw": 995000
+  },
+  {
+   "check": "margin: a ticket with 25 blocks left is settled and served",
+   "ok": true,
+   "saw": {
+    "http": 200,
+    "blocks_left": 25
+   }
+  },
+  {
+   "check": "margin: with 24 blocks left a secret is refused, nothing is settled, and the gateway gives the ticket back",
+   "ok": true,
+   "saw": {
+    "http": 402,
+    "error": "ticket_unknown",
+    "blocks_left": 24,
+    "node": [
+     "CANCELED"
+    ]
+   }
+  },
+  {
+   "check": "margin: the buyer's node shows one ticket paid and one failed, 6 blocks before the node's own cancel",
+   "ok": true,
+   "saw": {
+    "FAILED:INCORRECT_PAYMENT_DETAILS": 1,
+    "SUCCEEDED": 1
+   }
+  },
+  {
+   "check": "flood: of 2,000 lock requests 15 tickets were issued, half of the channel's 30 slots; every other buyer was told slots_short and to come back in 30 s, has no session, and the node was asked for nothing more",
+   "ok": true,
+   "saw": {
+    "answers": {
+     "200": 8,
+     "402 slots_short": 1992
+    },
+    "held_tickets": 15,
+    "unpaid_invoices": 15,
+    "sessions_made": 8,
+    "retry_after": [
+     30
+    ]
+   }
+  },
+  {
+   "check": "flood: sessions that never paid were closed after 15 s, their invoices cancelled on the node, and nothing of them is kept",
+   "ok": true,
+   "saw": {
+    "unpaid_invoices_left": 0,
+    "sessions_before": 6,
+    "sessions_after": 5
+   }
+  },
+  {
+   "check": "flood: a buyer that locks 2 tickets and releases none held 2,000 sat of the seller's inbound capacity until the gateway cancelled them; its node shows them failed",
+   "ok": true,
+   "saw": {
+    "held_htlcs": 2,
+    "seconds": 15.6,
+    "buyer_node": {
+     "FAILED:INCORRECT_PAYMENT_DETAILS": 2
+    }
+   }
+  },
+  {
+   "check": "flood: and it was served nothing",
+   "ok": true,
+   "saw": {
+    "http": 402,
+    "error": "balance_short"
+   }
+  },
+  {
+   "check": "prepaid: with the held cap full a held ticket is refused (slots_short) and a prepaid one is issued and paid; nothing is pending on the seller's channel",
+   "ok": true,
+   "saw": {
+    "held_lock": "slots_short",
+    "held": 15,
+    "prepaid_open": 1,
+    "pending_htlcs": 0,
+    "node": "SETTLED"
+   }
+  },
+  {
+   "check": "prepaid: nothing is credited before the preimage is presented; the node's own preimage credits one ticket, once; a made-up one credits nothing",
+   "ok": true,
+   "saw": {
+    "before": "balance_short",
+    "made_up": [
+     {
+      "hash": "35c1fdcf6d404a8f1a5e6299faf0b9c90b62c39662571d4f240160ce883cbdb4",
+      "error": "ticket_unknown"
+     }
+    ],
+    "released": {
+     "released": [
+      "d6bf6b7ca2f89a2adad62dfeb0dea6e708714b7aaaa2735845652295ef2a3c2c"
+     ],
+     "refused": [],
+     "session": {
+      "id": "14f5b8be207b27b628eac4e26bab9b88",
+      "nextSeq": 3,
+      "releasedMsat": "1000000",
+      "spentMsat": "0",
+      "balanceMsat": "1000000",
+      "tickets": 0
+     }
+    },
+    "again": [
+     {
+      "hash": "d6bf6b7ca2f89a2adad62dfeb0dea6e708714b7aaaa2735845652295ef2a3c2c",
+      "error": "ticket_used"
+     }
+    ],
+    "session": {
+     "id": "14f5b8be207b27b628eac4e26bab9b88",
+     "nextSeq": 5,
+     "releasedMsat": "1000000",
+     "spentMsat": "0",
+     "balanceMsat": "1000000",
+     "tickets": 0
+    }
+   }
+  },
+  {
+   "check": "prepaid: the balance pays requests like any released ticket's",
+   "ok": true,
+   "saw": {
+    "http": 200,
+    "balance": 997500
+   }
+  },
+  {
+   "check": "prepaid: ten prepaid tickets bought one at a time through the hop: each from the lock request to the seller's signed credit, all credited, none held",
+   "ok": true,
+   "saw": {
+    "per_ticket_ms": {
+     "n": 10,
+     "p50_ms": 236.18,
+     "p90_ms": 299.36,
+     "max_ms": 299.36
+    },
+    "routing_fee_msat": 10010
+   }
+  },
+  {
+   "check": "prepaid: a paid ticket whose preimage was never presented is credited by the gateway's own sweep",
+   "ok": true,
+   "saw": 1000000
+  },
+  {
+   "check": "slots: a gateway given the channels macaroon takes half of its smallest channel as its cap: 15 of 30, whatever its config assumed",
+   "ok": true,
+   "saw": {
+    "max_held": 15,
+    "node_lists": {
+     "local_constraints": 483,
+     "remote_constraints": 30
+    }
+   }
+  },
+  {
+   "check": "slots: with its inbound channel half full of payments it did not issue, the gateway issues no held ticket and says slots_short",
+   "ok": true,
+   "saw": {
+    "http": 402,
+    "error": "slots_short",
+    "pending_towards_the_seller": 15,
+    "held_by_the_gateway": 0
+   }
+  },
+  {
+   "check": "slots: a prepaid ticket is sold all the same",
+   "ok": true,
+   "saw": {
+    "id": "0b2793502ba4547504a20ad0c7662bd5",
+    "nextSeq": 2,
+    "releasedMsat": "1000000",
+    "spentMsat": "0",
+    "balanceMsat": "1000000",
+    "tickets": 0
+   }
+  },
+  {
+   "check": "slots: once the channel has room the same buyer holds its two tickets",
+   "ok": true,
+   "saw": {
+    "height": 163,
+    "sessions": 8,
+    "activeSessions": 1,
+    "heldTickets": 2,
+    "maxHeld": 15,
+    "prepaidTickets": 0,
+    "heldMsat": "2000000",
+    "settled": 0,
+    "settleMaxUs": 0,
+    "lottery": null
+   }
+  },
+  {
+   "check": "upstream: with the file server stopped a paid request is 502 and nothing is charged",
+   "ok": true,
+   "saw": {
+    "http": 502,
+    "charged": "0",
+    "spent_before": 2500,
+    "spent_after": 2500
+   }
+  },
+  {
+   "check": "upstream: with the file server back the same session is served",
+   "ok": true,
+   "saw": 200
+  },
+  {
+   "check": "restart: after the gateway restarts, the session, its balance and its locked ticket are there and the ticket is used",
+   "ok": true,
+   "saw": {
+    "restart_s": 0.05,
+    "before": {
+     "id": "695c4e59ced1aeab70c1a80ff2289328",
+     "nextSeq": 11,
+     "releasedMsat": "1000000",
+     "spentMsat": "2500",
+     "balanceMsat": "997500",
+     "tickets": 1
+    },
+    "after": {
+     "id": "695c4e59ced1aeab70c1a80ff2289328",
+     "nextSeq": 12,
+     "releasedMsat": "1000000",
+     "spentMsat": "2500",
+     "balanceMsat": "997500",
+     "tickets": 1
+    },
+    "http": 200
+   }
+  },
+  {
+   "check": "restart: a secret used before the restart is not good again",
+   "ok": true,
+   "saw": "ticket_unknown"
+  },
+  {
+   "check": "restart: with the seller's node stopped a secret is not taken (503) and the balance still pays",
+   "ok": true,
+   "saw": {
+    "secret": 503,
+    "balance": 200
+   }
+  },
+  {
+   "check": "restart: after the seller's node restarts, tickets locked before it are settled and served",
+   "ok": true,
+   "saw": {
+    "node_restart_s": 1.0,
+    "http": [
+     200,
+     200
+    ],
+    "node": [
+     "SETTLED",
+     "SETTLED"
+    ]
+   }
+  },
+  {
+   "check": "restart: the buyer's node shows all four tickets paid",
+   "ok": true,
+   "saw": {
+    "SUCCEEDED": 4
+   }
+  },
+  {
+   "check": "restart: every receipt was signed by the same key, before and after",
+   "ok": true,
+   "saw": 0
+  }
+ ],
+ "measured": {
+  "gateway_start_s": 0.05,
+  "fetch": {
+   "tickets_released": 10,
+   "locks": 10,
+   "bytes": 52428800,
+   "seconds": 2.35,
+   "ended_after_last_release_s": 2.77,
+   "spent_msat": 10000000
+  },
+  "fetch_routing_fee_msat": 10010,
+  "latency_ms": {
+   "direct": {
+    "n": 300,
+    "p50_ms": 0.54,
+    "p90_ms": 0.7,
+    "max_ms": 1.01
+   },
+   "through_a_free_route": {
+    "n": 300,
+    "p50_ms": 0.62,
+    "p90_ms": 0.75,
+    "max_ms": 1.7
+   },
+   "paid_from_the_balance": {
+    "n": 300,
+    "p50_ms": 0.71,
+    "p90_ms": 0.81,
+    "max_ms": 1.71
+   },
+   "paid_with_a_secret": {
+    "n": 32,
+    "p50_ms": 3.9,
+    "p90_ms": 4.92,
+    "max_ms": 5.77
+   }
+  },
+  "paid_minus_unpaid_p50_ms": 0.09,
+  "paid_with_a_secret_minus_unpaid_p50_ms": 3.28,
+  "note_secret": "one request in 400 carries a secret and waits for the node's settle call: 3.28 ms more than unpaid at the median",
+  "settle_max_ms": 4.2,
+  "margin": {
+   "locked_at": 144,
+   "htlc_expiry": 187
+  },
+  "flood": {
+   "requests": 2000,
+   "seconds": 0.5,
+   "answers": {
+    "200": 8,
+    "402 slots_short": 1992
+   },
+   "active_sessions": 8,
+   "held_tickets": 15,
+   "max_held": 15,
+   "held_msat": "15000000",
+   "unpaid_invoices_on_the_node": 15,
+   "retry_after": [
+    30
+   ]
+  },
+  "silent_buyer_locked_s": 15.6,
+  "prepaid_off_the_channel_after_s": 0.067,
+  "prepaid_ticket_ms": {
+   "n": 10,
+   "p50_ms": 236.18,
+   "p90_ms": 299.36,
+   "max_ms": 299.36
+  },
+  "seller_channel": {
+   "local_constraints": 483,
+   "remote_constraints": 30,
+   "commitment_type": "ANCHORS",
+   "dust_limit_sat": {
+    "local_constraints": "354",
+    "remote_constraints": "354"
+   }
+  }
+ },
+ "failed": []
+}
