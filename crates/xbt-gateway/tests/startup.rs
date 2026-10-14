@@ -70,3 +70,40 @@ fn the_binary_does_not_listen_off_loopback_without_an_https_origin() {
     let (ok, said) = check(&config(d.path(), &|v| v["listen"] = json!("0.0.0.0:8402")));
     assert!(ok, "{said}");
 }
+
+#[test]
+fn a_node_that_is_not_of_the_lnd_family_stops_the_start_with_a_reason() {
+    // a node that answers getinfo in Core Lightning's names
+    struct Cln;
+    impl xbt_svc::http::Handler for Cln {
+        fn body_limit(&self, _m: &str, _t: &str) -> usize {
+            0
+        }
+        fn handle(&self, _req: xbt_svc::http::Request) -> xbt_svc::http::Response {
+            xbt_svc::http::Response::text(200, "application/json", r#"{"id": "02", "alias": "seller", "blockheight": 7, "network": "regtest"}"#)
+        }
+    }
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let node = xbt_svc::http::serve(std::sync::Arc::new(Cln), l, 2).unwrap();
+    let d = tempfile::tempdir().unwrap();
+    let path = config(d.path(), &|v| v["node"]["rest"] = json!(format!("http://{}", node.addr)));
+    // the check says what kind of node it must be; the start finds it is not, and says so, at once
+    let (ok, said) = check(&path);
+    assert!(ok && said.contains("lnd-family node") && said.contains("Core Lightning seller is not supported"), "{said}");
+    let mut child = Command::new(BIN).arg(&path).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        if std::time::Instant::now() > deadline {
+            child.kill().unwrap();
+            panic!("the gateway waited for a node that will never answer as one it can use");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let mut said = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut said).unwrap();
+    assert!(!status.success() && said.contains("not an lnd-family node") && said.contains("Core Lightning's names"), "{said}");
+    node.stopper().stop();
+}

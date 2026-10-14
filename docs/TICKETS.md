@@ -469,12 +469,18 @@ Lightning node, and each node caps the total of such HTLCs per channel (section 
   was held through its `htlc_accepted` hook by a lab plugin only. Of the two published hold
   plugins, one issues invoices without feature bit 512, which a Lightning Fork buyer refuses, and
   the other keeps the secret on the seller's node. Nothing on a Core Lightning node cancels a
-  held ticket before it expires, as Lightning Fork does 18 blocks before. The gateway and the
-  wallet speak to Lightning Fork nodes only.
+  held ticket before it expires, as Lightning Fork does 18 blocks before. **A Core Lightning
+  seller is not supported for held tickets today.** "No change to the node" holds for the lnd
+  family only: the gateway speaks lnd's REST interface (`AddHoldInvoice`, `SettleInvoice`,
+  `CancelInvoice`, `LookupInvoice`, `SubscribeSingleInvoice`), and the wallet speaks to its own
+  node the same way. Pointed at a node whose `getinfo` is not lnd's, the gateway does not start,
+  and says why; on the lab, a Core Lightning seller that neither settled nor cancelled had the
+  buyer's node force-close its own channel to it (section 11).
 - `settle: "on-arrival"` (section 5) holds no slot and needs no hold invoice, so it is what a
   Core Lightning seller could offer as shipped, and what a buyer falls back to when slots are
-  short. The wallet and the gateway implement it (section 14). The gateway still speaks to a
-  Lightning Fork node only: a seller component for a Core Lightning node does not exist.
+  short. The wallet and the gateway implement it (section 14). The gateway still speaks to an
+  lnd-family node only: a seller component for a Core Lightning node does not exist, for prepaid
+  tickets as for held ones.
 - How a seller says that it settles both ways (two entries of `accepts`), and the `settle` and
   `count` fields of a lock, are this tree's reading of section 5. No other implementation has
   been checked against them.

@@ -1,7 +1,8 @@
 # xbt-gateway
 
-The stream-ticket seller gateway: one program beside a Lightning node. Point it at an HTTP
-service you already run, set a price per route, and buyers pay piece by piece with stream tickets.
+The stream-ticket seller gateway: one program beside a Lightning node of the lnd family (the
+Lightning Fork node it was built against). Point it at an HTTP service you already run, set a
+price per route, and buyers pay piece by piece with stream tickets.
 The service needs no change. The wire is `docs/TICKETS.md` (draft v0); what the gateway does not
 do is in `docs/LIMITS.md`, section "Seller gateway".
 
@@ -10,6 +11,13 @@ Status: regtest only. It has run against Lightning Fork nodes on one host
 project has reviewed it. The wallet of this tree pays it (`scripts/ticket_e2e_regtest.sh` with
 tickets, `scripts/lottery_regtest.sh` by draws); the buyer in `scripts/gateway_regtest.sh` is a
 test buyer.
+
+**Your node must be an lnd-family node.** The gateway speaks lnd's REST interface (hold
+invoices: `/v2/invoices/hodl`, `settle`, `cancel`, `lookup`, `subscribe`) and nothing else. A
+Core Lightning seller is not supported for held tickets today: Core Lightning has no hold
+invoice call, and nothing on it cancels a held ticket before it expires (`docs/TICKETS.md`,
+section 8). Pointed at a node that answers `getinfo` in Core Lightning's names, or has no lnd
+`GetInfo`, the gateway stops at start and says so.
 
 ## What it does with a request
 

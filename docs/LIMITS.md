@@ -419,8 +419,13 @@ wallet) and against a stand-in node in its tests.
   when the buyer presents the preimage, or by the janitor's sweep 75 seconds after it was issued
   if nobody did. An invoice paid short credits nothing, and the node keeps what arrived. The
   gateway makes each preimage, hands it to the node with the invoice and does not keep it.
-- The gateway does not make a Core Lightning node a seller: it speaks to a Lightning Fork node's
-  REST interface only, for prepaid tickets as for held ones.
+- The gateway does not make a Core Lightning node a seller: it speaks lnd's REST interface only
+  (an lnd-family node: the Lightning Fork node, or lnd), for prepaid tickets as for held ones. A
+  Core Lightning seller is not supported for held tickets today. A node whose `getinfo` answer
+  is in Core Lightning's names, or whose REST interface has no lnd `GetInfo` (404 or 405), stops
+  the start with that reason; one that answers lnd's call as lnd does is taken for lnd, and
+  nothing else is checked. Upstream lnd (without feature bit 512) is refused as not an XBT
+  build.
 - The cap per address counts the socket's address: behind a reverse proxy every buyer has the
   proxy's. The runner either names the proxy and the header it reports a buyer's address in
   (`http.forwarded_address`: believed from the named addresses only, the last entry of a list,

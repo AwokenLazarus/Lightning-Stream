@@ -2,6 +2,11 @@
 //! invoices, and read the block height. [`LndRest`] speaks the node's REST interface over TLS
 //! pinned to the node's own certificate; [`crate::standin::StandIn`] is the node of the tests.
 //!
+//! That interface is lnd's (`/v2/invoices/hodl`, `settle`, `cancel`, `lookup`, `subscribe`), so
+//! the node is an lnd-family node: the Lightning Fork node this was built against, or lnd. A node
+//! of another implementation is told apart where its answer to `getinfo` shows it ([`NOT_LND`]):
+//! Core Lightning has no hold invoice call, and a seller on it is not supported.
+//!
 //! Two macaroons, each refused on mainnet when it grants more than its list:
 //! [`INVOICE_OPS`] for every invoice call, and [`INFO_OPS`] for the one call that tells the block
 //! height. The invoice permissions cannot read the height (the node answers `permission denied`),
@@ -31,6 +36,10 @@ pub const INFO_OPS: [&str; 1] = ["info:read"];
 pub const CHANNEL_OPS: [&str; 1] = ["offchain:read"];
 
 pub type Hash = [u8; 32];
+
+/// How a refusal begins when the node is not an lnd-family node: nothing the gateway asks of it
+/// would work, and waiting for it does not help.
+pub const NOT_LND: &str = "not an lnd-family node";
 
 /// Why a call on the node gave no answer to act on.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -386,7 +395,8 @@ impl LndRest {
             Err(ureq::Error::Status(code, r)) => {
                 let text = read_capped(r.into_reader(), 64 << 10).unwrap_or_default();
                 let v = serde_json::from_str::<Value>(&text).unwrap_or(Value::Null);
-                let msg = message_of(&v).unwrap_or_else(|| text.chars().take(200).collect());
+                // lnd answers every error with its own JSON; a status without it is said as a status
+                let msg = message_of(&v).unwrap_or_else(|| format!("HTTP {code}: {}", text.chars().take(200).collect::<String>()));
                 // 5xx without the node's own JSON error is a proxy or a starting node: no answer
                 if code >= 500 && message_of(&v).is_none() {
                     return Err(NodeError::Unreachable(format!("HTTP {code}: {msg}")));
@@ -472,6 +482,44 @@ pub fn channels_of(v: &Value) -> Result<Vec<Channel>, NodeError> {
         });
     }
     Ok(out)
+}
+
+/// What the node says of itself, from its answer to lnd's `GetInfo`. An answer that is another
+/// implementation's (Core Lightning's names its node `id` and its height `blockheight`) is
+/// refused as [`NOT_LND`]; one that is lnd's and lacks a field is an answer that cannot be read.
+pub fn info_of(v: &Value) -> Result<Info, NodeError> {
+    let bad = |what: &str| NodeError::Unreachable(format!("getinfo: {what}"));
+    if v.get("identity_pubkey").is_none() && (v.get("id").is_some() || v.get("blockheight").is_some()) {
+        return Err(NodeError::Refused(format!(
+            "{NOT_LND}: its getinfo answer is in Core Lightning's names (id, blockheight). The gateway speaks lnd's REST interface only, and a Core Lightning seller is not supported for held tickets (docs/TICKETS.md, section 8)"
+        )));
+    }
+    let pubkey = v
+        .get("identity_pubkey")
+        .and_then(Value::as_str)
+        .filter(|k| k.len() == 66)
+        .ok_or_else(|| bad("no identity_pubkey"))?;
+    let height = num(v.get("block_height"))
+        .and_then(|h| u32::try_from(h).ok())
+        .ok_or_else(|| bad("no block_height"))?;
+    let networks = v
+        .get("chains")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|c| c.get("network").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect();
+    Ok(Info {
+        pubkey: pubkey.to_string(),
+        height,
+        synced: v.get("synced_to_chain") == Some(&Value::Bool(true)),
+        networks,
+        blake2b: v
+            .get("features")
+            .and_then(Value::as_object)
+            .is_some_and(|f| f.contains_key("512")),
+    })
 }
 
 /// An invoice from the node's JSON. An answer without a state it knows is an error, not "open".
@@ -652,34 +700,17 @@ impl Node for LndRest {
     }
 
     fn info(&self) -> Result<Info, NodeError> {
-        let v = self.unary(&self.info_macaroon, "GET", "/v1/getinfo", None)?;
-        let bad = |what: &str| NodeError::Unreachable(format!("getinfo: {what}"));
-        let pubkey = v
-            .get("identity_pubkey")
-            .and_then(Value::as_str)
-            .filter(|k| k.len() == 66)
-            .ok_or_else(|| bad("no identity_pubkey"))?;
-        let height = num(v.get("block_height"))
-            .and_then(|h| u32::try_from(h).ok())
-            .ok_or_else(|| bad("no block_height"))?;
-        let networks = v
-            .get("chains")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|c| c.get("network").and_then(Value::as_str))
-            .map(str::to_string)
-            .collect();
-        Ok(Info {
-            pubkey: pubkey.to_string(),
-            height,
-            synced: v.get("synced_to_chain") == Some(&Value::Bool(true)),
-            networks,
-            blake2b: v
-                .get("features")
-                .and_then(Value::as_object)
-                .is_some_and(|f| f.contains_key("512")),
-        })
+        let v = match self.unary(&self.info_macaroon, "GET", "/v1/getinfo", None) {
+            // lnd answers GET /v1/getinfo, with its JSON even when it refuses. A bare "not found" or
+            // "method not allowed" is a REST interface that is not lnd's
+            Err(NodeError::Refused(m)) if m.starts_with("HTTP 404") || m.starts_with("HTTP 405") => {
+                return Err(NodeError::Refused(format!(
+                    "{NOT_LND}: its REST interface has no lnd GetInfo ({m}). The gateway speaks lnd's REST interface only, and a Core Lightning seller is not supported for held tickets (docs/TICKETS.md, section 8)"
+                )))
+            }
+            other => other?,
+        };
+        info_of(&v)
     }
 }
 
@@ -788,6 +819,49 @@ mod tests {
             json!({"state": "ACCEPTED", "htlcs": [{"state": "ACCEPTED", "amt_msat": "18446744073709551615", "expiry_height": 5}, {"state": "ACCEPTED", "amt_msat": "1", "expiry_height": 5}]}),
         ] {
             assert!(invoice_of(&bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_node_that_is_not_of_the_lnd_family_is_told_apart_where_it_can_be() {
+        let lnd = json!({"identity_pubkey": "02".repeat(33), "block_height": 144, "synced_to_chain": true,
+                         "chains": [{"chain": "bitcoin", "network": "regtest"}], "features": {"512": {"name": "blake2b"}}});
+        let i = info_of(&lnd).unwrap();
+        assert_eq!((i.height, i.synced, i.networks.clone(), i.blake2b), (144, true, vec!["regtest".to_string()], true));
+        // Core Lightning's getinfo: refused for what it is, and the refusal says what is supported
+        let cln = json!({"id": "02".repeat(33), "alias": "seller", "blockheight": 144, "network": "regtest", "num_peers": 1});
+        match info_of(&cln) {
+            Err(NodeError::Refused(m)) => assert!(m.starts_with(NOT_LND) && m.contains("Core Lightning seller is not supported"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        // lnd's names with a field missing: an answer that cannot be read, waited out like a node that is starting
+        let mut short = lnd.clone();
+        short.as_object_mut().unwrap().remove("block_height");
+        assert!(matches!(info_of(&short), Err(NodeError::Unreachable(_))));
+        assert!(matches!(info_of(&json!({})), Err(NodeError::Unreachable(_))));
+        // over the wire: a REST interface with no lnd GetInfo, and one that answers in Core Lightning's names
+        struct Rest(u16, &'static str);
+        impl xbt_svc::http::Handler for Rest {
+            fn body_limit(&self, _m: &str, _t: &str) -> usize {
+                0
+            }
+            fn handle(&self, _req: xbt_svc::http::Request) -> xbt_svc::http::Response {
+                xbt_svc::http::Response::text(self.0, "application/json", self.1)
+            }
+        }
+        for (status, body, want) in [
+            (404, "Not Found", "no lnd GetInfo (HTTP 404"),
+            (405, "", "no lnd GetInfo (HTTP 405"),
+            (200, r#"{"id": "02", "blockheight": 7}"#, "Core Lightning's names"),
+        ] {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let run = xbt_svc::http::serve(Arc::new(Rest(status, body)), l, 1).unwrap();
+            let node = LndRest::new(&format!("http://{}", run.addr), b"", b"", None).unwrap();
+            match node.info() {
+                Err(NodeError::Refused(m)) => assert!(m.starts_with(NOT_LND) && m.contains(want), "{status}: {m}"),
+                other => panic!("{status}: {other:?}"),
+            }
+            run.stopper().stop();
         }
     }
 

@@ -1,4 +1,5 @@
-//! xbt-gateway: the stream-ticket seller gateway. One program beside a Lightning node: point it at
+//! xbt-gateway: the stream-ticket seller gateway. One program beside a Lightning node of the lnd
+//! family (it speaks lnd's REST interface; a Core Lightning seller is not supported): point it at
 //! an HTTP service, set a price per route, and buyers pay piece by piece with stream tickets
 //! (`docs/TICKETS.md`).
 //!
@@ -11,7 +12,9 @@ use std::time::Duration;
 
 use xbt_gateway::config::Config;
 use xbt_gateway::gateway::{unix_now, Gateway};
-use xbt_gateway::node::{checked_macaroon, LndRest, Node, CHANNEL_OPS, INFO_OPS, INVOICE_OPS};
+use xbt_gateway::node::{
+    checked_macaroon, LndRest, Node, NodeError, CHANNEL_OPS, INFO_OPS, INVOICE_OPS, NOT_LND,
+};
 
 fn run(args: &[String]) -> Result<(), String> {
     let (check, path) = match args {
@@ -81,6 +84,7 @@ fn run(args: &[String]) -> Result<(), String> {
     if cfg.prepaid {
         eprintln!("xbt-gateway: prepaid tickets: paid in full when they arrive, one at a time, with nothing held on any channel");
     }
+    eprintln!("xbt-gateway: the node at {} is spoken to over lnd's REST interface: it must be an lnd-family node (Lightning Fork, or lnd). A Core Lightning seller is not supported", cfg.node.rest);
     if check {
         return Ok(());
     }
@@ -101,17 +105,26 @@ fn run(args: &[String]) -> Result<(), String> {
     let listener =
         TcpListener::bind(&cfg.listen).map_err(|e| format!("listen {}: {e}", cfg.listen))?;
     let mut waited = 0u32;
-    while let Err(e) = node.info() {
-        if waited.is_multiple_of(15) {
-            eprintln!("xbt-gateway: waiting for the node: {e}");
+    loop {
+        match node.info() {
+            Ok(_) => break,
+            // another implementation's node: nothing the gateway asks of it would work, and waiting does not help
+            Err(NodeError::Refused(m)) if m.starts_with(NOT_LND) => {
+                return Err(format!("node.rest {}: {m}", cfg.node.rest))
+            }
+            Err(e) => {
+                if waited.is_multiple_of(15) {
+                    eprintln!("xbt-gateway: waiting for the node: {e}");
+                }
+                waited += 1;
+                std::thread::sleep(Duration::from_secs(2));
+            }
         }
-        waited += 1;
-        std::thread::sleep(Duration::from_secs(2));
     }
     let gw = Gateway::start(cfg, node, key, Box::new(unix_now)).map_err(|e| e.to_string())?;
     let running = gw.serve(listener).map_err(|e| e.to_string())?;
     eprintln!(
-        "xbt-gateway: listening on {}; node {}; receipts signed by {}",
+        "xbt-gateway: listening on {}; an lnd-family node, {}; receipts signed by {}",
         running.addr,
         gw.terms().pay_to,
         gw.terms().receipt_key
