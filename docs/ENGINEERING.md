@@ -19,8 +19,8 @@
 > 2026-10-11 that follows was written when the channel was frozen and is left as it was.
 
 > **Read this first (2026-10-11).** The direction changed on this day. Lightning Stream is now
-> built on Lightning: it adds stream tickets to ordinary XBT Lightning channels, and that work is
-> in design, not built. The hub was retired and its code removed: the `xbt402-hub` binary, hub
+> built on Lightning: it adds stream tickets to ordinary XBT Lightning channels, and that work was
+> not yet built on that day (it has been since, and runs on regtest: `README.md`). The hub was retired and its code removed: the `xbt402-hub` binary, hub
 > routing with adaptor signatures, the hub's link to a Lightning node, the routed client, the
 > route providers, the wallet's routing policy and lock methods, their tests, scripts, vectors and
 > packages. The on-chain one-way channel is frozen: kept and tested, off the main path, no new
@@ -783,7 +783,7 @@ Reports: `docs/rollover-load-agp057-cap-before-2026-10-03.json` and `...-cap-aft
 ```sh
 XBT_RS_LOAD_PORT_BASE=42000 XBT_RS_LOAD_PORT_SPAN=20 \
 LOAD_ONLY=RS-RS-cmp,PY-PY-cmp,RS-RS-cmp-lag,PY-PY-cmp-lag,RS-RS-cmp-slow,PY-PY-cmp-slow,RS-RS-cmp-slow-sized,PY-PY-cmp-slow-sized \
-  lazvault heavy --project xbt-agentpay -- ./scripts/rollover_load_regtest.sh
+  ./scripts/rollover_load_regtest.sh
 ```
 (the before column: the same command on the base commits, `XBT402_B1` at the B1 checkout).
 
@@ -868,7 +868,7 @@ runs out three times. `-exhaust-before` is the same with `refill_ahead_locks` 0.
 ```sh
 XBT_RS_LOAD_PORT_BASE=42000 XBT_RS_LOAD_PORT_SPAN=20 \
 LOAD_ONLY=RS-RS-exhaust,PY-PY-exhaust,RS-PY-exhaust,PY-RS-exhaust,RS-RS-exhaust-before,PY-PY-exhaust-before \
-  lazvault heavy --project xbt-agentpay -- ./scripts/rollover_load_regtest.sh
+  ./scripts/rollover_load_regtest.sh
 ```
 Report: `docs/rollover-load-agp057-exhaust-2026-10-03.json`. Each run also checks the money: every
 rollover tx pays the provider signed − closeFee, every replaced ch2 is closed on its signed state
@@ -4414,7 +4414,8 @@ at 5 channels: raise it. Closing means 64 × 190 vB ≈ 12,200 vB and 64 × 600 
 fees, plus 64 × 546 = 34,944 sat of floors. In total that is ~22,000 vB on chain and ~93,000 sat of
 fees and floors before any real use.
 
-**Hub routing (the intended answer).** One ch1 to a hub (one funding, one close, one floor: ~340 vB
+**Hub routing (the intended answer when this was written; the hub was retired on 2026-10-11, and
+Lightning's own routing does this now).** One ch1 to a hub (one funding, one close, one floor: ~340 vB
 and ~1,450 sat in all) reaches every vendor. The hub runs the ch2s and charges `feeBaseMsat` +
 `feePpm` per lock (defaults 1,000 msat + 2,000 ppm; carried exactly in 1e-6 msat, charged as the
 ceil of the running total, never rounded per lock). Prices are amsat per call (1 sat = 10^21 amsat)

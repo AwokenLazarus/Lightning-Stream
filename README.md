@@ -124,9 +124,12 @@ dust limit (354 sat on Lightning Fork, 546 sat on Core Lightning) cannot be clai
 a held ticket is never below 546 sat. Paying many sellers at once, as in a swarm, is therefore
 the lottery's job (below): a win is paid at once and holds nothing. This was measured with the
 XBT Core Lightning fork in the lab ([`docs/TICKETS.md`](docs/TICKETS.md), section 11). **The
-wallet's ticket book and the gateway have these defaults and keep these rules since 2026-10-13**:
-each reads the slots and dust limits of its own node's channels, the wallet holds less after a
-lock that finds no slot, and a seller at its cap tells buyers to wait. Where no ticket can be
+wallet's ticket book and the gateway have these defaults and keep these rules since 2026-10-13**,
+each as far as it can see. The wallet reads the slots and the dust limits of its own node's
+channels before every lock, and holds less after a lock that finds no slot. The gateway keeps to
+the numbers in its config (30 slots unless the runner says more); it reads its node's slots only
+when the runner gives it a third, wider macaroon, and it never reads a dust limit. A seller at
+its cap tells buyers to wait. Where no ticket can be
 held, the wallet buys **prepaid tickets** one at a time: ordinary payments that are spent when
 they are paid and hold nothing, which the gateway offers beside held tickets. The regtest scripts
 run all of it on channels opened with 30 slots between Lightning Fork nodes; no Core Lightning
