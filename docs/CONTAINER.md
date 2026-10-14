@@ -7,7 +7,14 @@ components already have their places here. agentpay implements it in `xbt-signer
 in the `xbt-svc` crate. `scripts/container_test.sh` tests it on regtest. The Umbrel apps and the StartOS
 package built on it (AGP-040) are in `packaging/` (README there).
 
-Status: **proposal, pending cmp-lead's OK** (forwarded by agp-lead, 2026-09-28).
+Status: **proposal**, not yet agreed with the xbt-compute project (sent 2026-09-28).
+
+**What is not here.** There is no image and no package of the seller gateway (`xbt-gateway`): it
+is built and run from source (`crates/xbt-gateway/README.md`). And the images below ship a wallet
+that cannot pay a seller: the wallet pays over Lightning only, and neither the container stack
+nor the Umbrel and StartOS packages connect it to a Lightning node (section 7; `packaging/README.md`).
+What they ship is the keys, the signed policy, approvals, the signature log and the agent's MCP
+endpoint.
 
 The hub was retired on 2026-10-11: payments between parties route over ordinary Lightning instead. Its
 code is in the git history (last at commit 0911cc0). Its image, user and data dir are gone from this

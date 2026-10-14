@@ -31,7 +31,9 @@ not in this repository.
 
 ### 1. What you install
 
-- Your Lightning node, with inbound capacity. The gateway speaks to Lightning Fork nodes.
+- Your Lightning node, with inbound capacity. The gateway speaks to Lightning Fork nodes (a fork
+  of lnd). A Core Lightning node cannot be the seller's node: it has no hold invoices, and the
+  gateway does not speak its interface ([`TICKETS.md`](TICKETS.md), section 8).
 - Your Jellyfin, as it is.
 - `xbt-gateway`, one program, on the machine the node runs on:
   `cargo build --release -p xbt-gateway`.
@@ -192,9 +194,54 @@ After every part, what the buyer's node paid, what the sellers' nodes received a
 ledger holds agreed to the millisat. The readout counts a ticket with its fee limit (1,015 sat)
 when it is released; the node then paid 1,001.
 
-Numbers of one run on 2026-10-13 (`run/demo_film.json`); rerun with `scripts/demo_film.sh`. On one
-host everything is a loopback away, so the times say what the software adds and nothing about a
-real network.
+Numbers of one run on 2026-10-13; rerun with `scripts/demo_film.sh`, which writes
+`run/demo_film.json`. That run's report was overwritten by later runs. The report of the latest
+run (2026-10-14) is in the tree as [`reports/demo_film.json`](../reports/demo_film.json), and
+differs from these tables where one run differs from another: its stop left 455 sat with the
+seller, and its swarm drew 10 wins. On one host everything is a loopback away, so the times say
+what the software adds and nothing about a real network.
+
+### What the demo's settings change
+
+The demo does not run the shipped defaults throughout. The rules of tickets and of the lottery
+are the shipped ones: 2 tickets held with a seller, at most 15 held in all, tickets of 1,000 sat
+that live 40 blocks, wins of 64 sat through a routing hop, the seller's window of 8 pieces and
+its grace. The driver (`scripts/demo/drive.py`) sets the following to something else. Where the
+script gives a reason it is given here; where it gives none, this says so.
+
+The wallet's policy:
+
+| Setting | Shipped | The demo | Why |
+|---|---|---|---|
+| `tickets.enabled`, and the tasks `film` (a budget of 1,000,000 sat) and `swarm` (100,000 sat) | off, no task | on | Tickets are off until an owner turns them on and names a task with a budget |
+| `allowlist`, `counterparties` | empty | the two film gateways and the 20 swarm gateways, each tied to its node id | The owner names its sellers; nothing in the demo is paid as a stranger |
+| `velocity_max` | 8 payments an hour | 1,000 | A ticket or lottery session counts as one payment, and the demo opens more than 8 sessions in an hour: 20 for the swarm alone |
+| `tickets.max_sellers`, also for the `swarm` task | 15 | 28 | The swarm pays 20 sellers at once |
+| `tickets.max_new_sellers_per_min` | 30 | 200 | No reason given. The demo's 20 new sellers are within the shipped 30 |
+| `tickets.max_sends_per_hour` | 1,200 | 100,000 | No reason given. Whether the run stays within 1,200 was not checked |
+| `tickets.max_answer_s` | 50 s | 120 s | The wallet cuts an answer that is paid as it arrives after this long. No reason given; the whole film came in 4.6 s in the latest report |
+| `max_per_tx_sats`, `daily_budget_sats`, `weekly_budget_sats`, `per_counterparty_cap_sats`, `human_threshold_sats` | 10,000,000; 50,000,000; 200,000,000; 30,000,000; 10,000,000 | 50,000; 4,000,000; 8,000,000; 4,000,000; 40,000 | A lab wallet's budgets, all lower than shipped |
+| `split_window_s` | 600 s | 0 | Payments to one seller inside this window add up against `max_per_tx_sats` and the human threshold; at 0 each ticket is judged alone. No reason given |
+| `anchor_interval_s`, `regtest_mine`, `ln.enabled`, `ln.split_height` | 60 s; unset; off; unset | 3,600 s; off; on; the lab chain's | Settings of the lab chain and its Lightning rail |
+
+Each gateway's config:
+
+| Setting | Shipped | The demo | Why |
+|---|---|---|---|
+| `caps.sessions_per_address`, and `lottery.sessions_per_address` on the swarm's gateways | 2, and 4 | 0: no cap | Every buyer of this lab comes from 127.0.0.1 |
+| `times.height_max_age_secs` | 10 s | 30 s | No reason given. A gateway takes no secret without a block height at most this old |
+| `times.tick_ms`, on the 20 swarm gateways only | 500 ms | 5,000 ms | No reason given. All 20 stand beside one node, and each asks it for the height every tick |
+| `lottery` on the swarm's gateways | not offered unless the section is written | offered, with `piece_bytes` 262,144, which is the shipped piece size | The swarm is paid by draws |
+| `chain`, `network` | the runner's chain | regtest | The lab |
+
+Three of the script's checks pass on a looser bound than this page's measured figure, and the
+check's own words now name the bound it asserts:
+
+| Check | Asserted | Measured in the run above |
+|---|---|---|
+| The held tickets are back on the buyer's node after a stop | within 6 s | 0.24 s |
+| Payments pending on the buyer's channel during the swarm | never more than 9 (the wallet sends 8 at a time) | at most 4 |
+| Payments pending on the buyer's channel while the whole film is bought | never more than 3 | 2 |
 
 ## Many sellers at once: the swarm
 
@@ -213,8 +260,9 @@ wins, and a win is an ordinary payment of 64 sat. Nothing is locked with any sel
 | Routing fees | 14 sat, 1 sat a win |
 | On the buyer's 30-slot channel | at most 4 payments at once; nothing held between wins; no payment failed |
 
-That is the lottery as it is: exact on average and uneven in one run, for the buyer and for each
-seller.
+That is the lottery as it is: exact in expectation and uneven in one run, for the buyer and for
+each seller. With 16.5 wins expected the spread of one run is about a quarter of the price
+(1 ÷ √16.5), and a seller that expects 0.8 of a win is paid nothing in 44% of runs (e^(−0.82)).
 
 The 20 gateways stand beside one seller node: the buyer's channel and the route carry what 20
 sellers' wins would, and the sellers' side is one node's work.

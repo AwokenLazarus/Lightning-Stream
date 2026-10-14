@@ -1,0 +1,802 @@
+{
+ "checks": [
+  {
+   "check": "accept: the hold invoice names the seller, the buyer's hash, the amount and the CLTV delta, and carries feature bit 512",
+   "ok": true,
+   "saw": {
+    "destination": "032b5e393729719a45ce1efc2138a68eac13525872651d20136ab2de2f0903640b",
+    "payment_hash": "b864d79a97b1e762ce9ee2da93d7ea95719d365319e8a4a57330547758297937",
+    "num_msat": "1000000",
+    "cltv_expiry": "40",
+    "feature_512": {
+     "name": "blake2b",
+     "is_required": true,
+     "is_known": true
+    }
+   }
+  },
+  {
+   "check": "accept: 8 tickets for hashes only the buyer knows are ACCEPTED on the seller's node, through the hop",
+   "ok": true,
+   "saw": {
+    "seller": {
+     "ACCEPTED": 8
+    },
+    "buyer": {
+     "IN_FLIGHT": 8
+    },
+    "htlcs_on_hop": 16,
+    "lock_s": 0.327
+   }
+  },
+  {
+   "check": "accept: the seller's node refuses to settle with a secret that is not a ticket's",
+   "ok": true,
+   "saw": "unable to locate invoice"
+  },
+  {
+   "check": "accept: a ticket that is not locked (OPEN) cannot be settled",
+   "ok": true,
+   "saw": "invoice still open"
+  },
+  {
+   "check": "accept: an invoice nobody paid within its life (2 s here) is cancelled by the seller's node and can no longer be paid",
+   "ok": true,
+   "saw": {
+    "cancelled_after_s": 2.0,
+    "late_payment": "invoice expired. Valid until 2026-10-14 02:14:52 +0000 UTC"
+   }
+  },
+  {
+   "check": "accept: settle returns the buyer's own secret to the buyer's node as the payment preimage",
+   "ok": true,
+   "saw": {
+    "buyer": "SUCCEEDED",
+    "preimage_is_the_secret": true,
+    "seller": "SETTLED"
+   }
+  },
+  {
+   "check": "accept: the 7 cancelled tickets fail on the buyer's node and nothing stays pending",
+   "ok": true,
+   "saw": {
+    "FAILED:INCORRECT_PAYMENT_DETAILS": 7
+   }
+  },
+  {
+   "check": "fees: 10 locked, 5 settled, 5 cancelled: the buyer pays a routing fee on the settled tickets only",
+   "ok": true,
+   "saw": {
+    "buyer_paid_sat": 5005,
+    "seller_got_sat": 5000,
+    "fee_msat_settled": [
+     1001,
+     1001,
+     1001,
+     1001,
+     1001
+    ],
+    "fee_msat_cancelled": [
+     0,
+     0,
+     0,
+     0,
+     0
+    ]
+   }
+  },
+  {
+   "check": "dust: a 1,000-sat ticket has its own output in the commitment transactions of both channels on the route and a 200-sat ticket has none",
+   "ok": true,
+   "saw": {
+    "weight_added_by_one_ticket_of_sat": {
+     "200": [
+      0,
+      0
+     ],
+     "353": [
+      172,
+      0
+     ],
+     "354": [
+      172,
+      172
+     ],
+     "1000": [
+      172,
+      172
+     ]
+    }
+   }
+  },
+  {
+   "check": "smallest: a ticket of 1 sat locks and settles, through a hop (at a fee as large as the ticket) and on one channel; one of 999 msat does not",
+   "ok": true,
+   "saw": {
+    "through_a_hop": {
+     "999_msat": {
+      "FAILED:NO_ROUTE": 1
+     },
+     "1_sat": {
+      "SUCCEEDED": 1
+     },
+     "1_sat_fee_msat": 1000
+    },
+    "one_channel": {
+     "999_msat": {
+      "FAILED:NO_ROUTE": 1
+     },
+     "1_sat": {
+      "SUCCEEDED": 1
+     },
+     "1_sat_fee_msat": 0
+    }
+   }
+  },
+  {
+   "check": "direct: tickets over one channel lock, settle with the buyer's secret and cancel, at no fee",
+   "ok": true,
+   "saw": {
+    "buyer": {
+     "FAILED:INCORRECT_PAYMENT_DETAILS": 4,
+     "SUCCEEDED": 4
+    },
+    "buyer_paid_sat": 4000,
+    "seller_got_sat": 4000,
+    "lock_8_s": 0.192,
+    "lock_1_s": 0.119
+   }
+  },
+  {
+   "check": "two_hops: tickets through two routing nodes lock, settle with the buyer's secret and cancel; each hop takes its fee on settled tickets only",
+   "ok": true,
+   "saw": {
+    "buyer": {
+     "FAILED:INCORRECT_PAYMENT_DETAILS": 4,
+     "SUCCEEDED": 4
+    },
+    "fee_msat_settled": [
+     2002,
+     2002,
+     2002,
+     2002
+    ],
+    "buyer_paid_sat": 4009,
+    "htlcs_on_each_hop_while_locked": [
+     18,
+     18
+    ],
+    "lock_8_s": 0.462,
+    "lock_1_s": 0.336
+   }
+  },
+  {
+   "check": "latency: 30 paid requests, each ticket looked up ACCEPTED, settled, and SUCCEEDED on the buyer's node; and the locks",
+   "ok": true,
+   "saw": {
+    "per_request_ms": {
+     "seller_hashes_and_looks_up": {
+      "n": 30,
+      "p50_ms": 0.98,
+      "p90_ms": 1.23,
+      "max_ms": 1.36
+     },
+     "seller_settle_returns": {
+      "n": 30,
+      "p50_ms": 3.44,
+      "p90_ms": 6.19,
+      "max_ms": 7.29
+     },
+     "buyer_node_SUCCEEDED": {
+      "n": 30,
+      "p50_ms": 12.96,
+      "p90_ms": 21.46,
+      "max_ms": 28.48
+     }
+    },
+    "lock_s": {
+     "1": 0.212,
+     "8": 0.327,
+     "10": 0.321,
+     "50": 1.187,
+     "100": 2.063,
+     "200": 3.851,
+     "400": 7.356
+    },
+    "stop_8_tickets_freed_s": 0.191
+   }
+  },
+  {
+   "check": "macaroons: the wallet rail's macaroon (info:read, offchain:read, offchain:write, onchain:read) locks tickets and follows them",
+   "ok": true,
+   "saw": {
+    "FAILED:INCORRECT_PAYMENT_DETAILS": 1,
+    "SUCCEEDED": 1
+   }
+  },
+  {
+   "check": "macaroons: invoices:read and invoices:write are enough to make, look up, settle and cancel tickets",
+   "ok": true,
+   "saw": {
+    "looked_up": [
+     "ACCEPTED",
+     "ACCEPTED"
+    ],
+    "settle": {},
+    "cancel": {}
+   }
+  },
+  {
+   "check": "macaroons: the seller's macaroon cannot send coins, pay, open a channel, read the wallet or bake a macaroon",
+   "ok": true,
+   "saw": {
+    "send coins": "permission denied",
+    "pay an invoice": "permission denied",
+    "open a channel": "permission denied",
+    "read the on-chain balance": "permission denied",
+    "bake a macaroon": "permission denied"
+   }
+  },
+  {
+   "check": "macaroons: the buyer's macaroon cannot send coins on chain, make invoices or bake a macaroon",
+   "ok": true,
+   "saw": {
+    "send coins": "permission denied",
+    "make a hold invoice": "permission denied",
+    "bake a macaroon": "permission denied"
+   }
+  },
+  {
+   "check": "min_cltv: the seller's node refuses a hold invoice with a final CLTV delta of 18 and takes 30",
+   "ok": true,
+   "saw": {
+    "18": "lf3 POST /v2/invoices/hodl: CLTV delta of 18 must be greater than minimum of 24",
+    "23": "lf3 POST /v2/invoices/hodl: CLTV delta of 23 must be greater than minimum of 24",
+    "24": "ACCEPTED",
+    "25": "ACCEPTED",
+    "30": "ACCEPTED"
+   }
+  },
+  {
+   "check": "slots: of 520 tickets offered at once through one channel, 483 lock and the other 37 fail on the buyer's node with nothing held",
+   "ok": true,
+   "saw": {
+    "accepted_on_seller": 483,
+    "buyer": {
+     "FAILED:INSUFFICIENT_BALANCE": 37,
+     "IN_FLIGHT": 483
+    },
+    "first_update": {
+     "IN_FLIGHT": 520
+    },
+    "htlcs_per_channel": {
+     "lf1": [
+      483
+     ],
+     "lf2": [
+      483,
+      483
+     ],
+     "lf3": [
+      483
+     ]
+    },
+    "seconds": 8.0
+   }
+  },
+  {
+   "check": "slots: cancelling all 520 frees every HTLC and the channels stay open",
+   "ok": true,
+   "saw": {
+    "buyer": {
+     "FAILED:INCORRECT_PAYMENT_DETAILS": 483,
+     "FAILED:INSUFFICIENT_BALANCE": 37
+    },
+    "htlcs_gone_s": 3.9,
+    "then_all_payments_final_s": 3.2
+   }
+  },
+  {
+   "check": "restart: with 4 tickets locked, a restart of the seller, of the hop and of the buyer leaves them ACCEPTED; then 2 settle and 2 cancel",
+   "ok": true,
+   "saw": {
+    "lf3": {
+     "back_s": 1.0,
+     "channels_active_s": 0.0,
+     "seller": {
+      "ACCEPTED": 4
+     },
+     "htlcs": [
+      4,
+      8,
+      4
+     ],
+     "buyer": {
+      "FAILED:INCORRECT_PAYMENT_DETAILS": 2,
+      "SUCCEEDED": 2
+     }
+    },
+    "lf2": {
+     "back_s": 1.0,
+     "channels_active_s": 0.0,
+     "seller": {
+      "ACCEPTED": 4
+     },
+     "htlcs": [
+      4,
+      8,
+      4
+     ],
+     "buyer": {
+      "FAILED:INCORRECT_PAYMENT_DETAILS": 2,
+      "SUCCEEDED": 2
+     }
+    },
+    "lf1": {
+     "back_s": 1.1,
+     "channels_active_s": 0.0,
+     "seller": {
+      "ACCEPTED": 4
+     },
+     "htlcs": [
+      4,
+      8,
+      4
+     ],
+     "buyer": {
+      "FAILED:INCORRECT_PAYMENT_DETAILS": 2,
+      "SUCCEEDED": 2
+     }
+    }
+   }
+  },
+  {
+   "check": "hop_down: with the hop stopped the seller's settle and cancel return at once and its node records them; the buyer's node still shows 4 in flight",
+   "ok": true,
+   "saw": {
+    "settle_ms": 4.0,
+    "seller": [
+     "SETTLED",
+     "CANCELED",
+     "ACCEPTED",
+     "ACCEPTED"
+    ],
+    "buyer": {
+     "IN_FLIGHT": 4
+    }
+   }
+  },
+  {
+   "check": "hop_down: once the hop is back the buyer's node has the settled ticket as SUCCEEDED with its secret and the cancelled one as FAILED",
+   "ok": true,
+   "saw": {
+    "buyer": {
+     "FAILED:INCORRECT_PAYMENT_DETAILS": 1,
+     "SUCCEEDED": 1
+    },
+    "hop_back_s": 1.0,
+    "then_s": 0.2
+   }
+  },
+  {
+   "check": "expiry: a seller that neither settles nor cancels has its tickets cancelled by its own node 18 blocks before their expiry, with every channel still open",
+   "ok": true,
+   "saw": {
+    "locked_at": 144,
+    "seller_htlc_expiry": 187,
+    "buyer_htlc_expiry": 267,
+    "cancelled_at": 169,
+    "blocks_before_expiry": 18,
+    "blocks_held": 25,
+    "buyer": {
+     "FAILED:TIMEOUT": 3
+    },
+    "channels_open": true
+   }
+  },
+  {
+   "check": "claim: the seller settled with the hop down and the hop stayed down: the seller's node closed the channel and put all 3 secrets on chain before the tickets' expiry",
+   "ok": true,
+   "saw": {
+    "locked_at": 169,
+    "seller_htlc_expiry": 212,
+    "commitment_broadcast_by": 196,
+    "commitment_mined_by": 199,
+    "secrets_on_chain_at": [
+     200,
+     200,
+     200
+    ],
+    "blocks_before_expiry": 12
+   }
+  },
+  {
+   "check": "claim: once the hop is back it reads the secrets from the chain and the buyer's node has all 3 tickets SUCCEEDED, before the buyer's own HTLCs expire, its channel open",
+   "ok": true,
+   "saw": {
+    "buyer_while_hop_down": {
+     "IN_FLIGHT": 3
+    },
+    "buyer": {
+     "SUCCEEDED": 3
+    },
+    "at_height": 201,
+    "buyer_htlc_expiry": 292
+   }
+  },
+  {
+   "check": "claim: the seller's wallet ends with its channel balance and the 3 tickets, less the fees of its own sweeps",
+   "ok": true,
+   "saw": {
+    "channel_balance_before": 1052002,
+    "tickets_sat": 3000,
+    "wallet_gained": 1053562,
+    "cost_sat": 1440,
+    "blocks_from_claim_to_wallet": 652
+   }
+  },
+  {
+   "check": "offline: the seller's node gone with 3 tickets locked: the hop closes its channel to the seller at the tickets' expiry; every ticket fails on the buyer's node long before the buyer's own HTLCs expire, and the buyer has its whole balance and its channel",
+   "ok": true,
+   "saw": {
+    "locked_at": 860,
+    "hop_htlc_expiry": 903,
+    "buyer_htlc_expiry": 983,
+    "commitment_broadcast_by": 903,
+    "commitment_mined_by": 906,
+    "buyer_free_at": 907,
+    "blocks_locked": 47,
+    "buyer": {
+     "FAILED:TIMEOUT": 3
+    },
+    "buyer_balance_change_sat": 0,
+    "commitment": {
+     "weight": 1630,
+     "outputs": 7,
+     "fee_sat": 414
+    },
+    "lock_s": 0.25
+   }
+  },
+  {
+   "check": "offline: the hop gets its side of the closed channel back on chain, 3 tickets included, less the fees of the close",
+   "ok": true,
+   "saw": {
+    "hop_cost_sat": 1530,
+    "blocks_from_lock_to_wallet": 698
+   }
+  },
+  {
+   "check": "offline_100: the seller's node gone with 100 tickets locked: the hop closes its channel to the seller at the tickets' expiry; every ticket fails on the buyer's node long before the buyer's own HTLCs expire, and the buyer has its whole balance and its channel",
+   "ok": true,
+   "saw": {
+    "locked_at": 1566,
+    "hop_htlc_expiry": 1609,
+    "buyer_htlc_expiry": 1689,
+    "commitment_broadcast_by": 1609,
+    "commitment_mined_by": 1612,
+    "buyer_free_at": 1614,
+    "blocks_locked": 48,
+    "buyer": {
+     "FAILED:TIMEOUT": 100
+    },
+    "buyer_balance_change_sat": 0,
+    "commitment": {
+     "weight": 18313,
+     "outputs": 104,
+     "fee_sat": 4635
+    },
+    "lock_s": 1.89
+   }
+  },
+  {
+   "check": "offline_100: the hop gets its side of the closed channel back on chain, 100 tickets included, less the fees of the close",
+   "ok": true,
+   "saw": {
+    "hop_cost_sat": 28975,
+    "blocks_from_lock_to_wallet": 699
+   }
+  }
+ ],
+ "measured": {
+  "fee_msat_per_settled_ticket_one_hop": 1001,
+  "buyer_paid_sat_for_5_of_10": 5005,
+  "smallest_ticket_sat_with_an_output": 354,
+  "weight_units_per_ticket_output": 172,
+  "smallest_ticket_msat_through_a_hop": 1000,
+  "fee_msat_on_a_1_sat_ticket": 1000,
+  "direct_lock_s": {
+   "1": 0.119,
+   "8": 0.192
+  },
+  "direct_fee_msat": 0,
+  "two_hops_lock_s": {
+   "1": 0.336,
+   "8": 0.462
+  },
+  "fee_msat_per_settled_ticket_two_hops": 2002,
+  "lock_s_one_hop": {
+   "1": 0.212,
+   "8": 0.327,
+   "10": 0.321,
+   "50": 1.187,
+   "100": 2.063,
+   "200": 3.851,
+   "400": 7.356
+  },
+  "stop_8_tickets_freed_s": 0.191,
+  "per_request_ms": {
+   "seller_hashes_and_looks_up": {
+    "n": 30,
+    "p50_ms": 0.98,
+    "p90_ms": 1.23,
+    "max_ms": 1.36
+   },
+   "seller_settle_returns": {
+    "n": 30,
+    "p50_ms": 3.44,
+    "p90_ms": 6.19,
+    "max_ms": 7.29
+   },
+   "buyer_node_SUCCEEDED": {
+    "n": 30,
+    "p50_ms": 12.96,
+    "p90_ms": 21.46,
+    "max_ms": 28.48
+   }
+  },
+  "smallest_final_cltv_delta_accepted": 24,
+  "tickets_in_flight_per_channel": 483,
+  "buyer_failures_of_the_37": {
+   "FAILED:INSUFFICIENT_BALANCE": 37
+  },
+  "commitment_weight": {
+   "idle": 1116,
+   "with_483": 84200
+  },
+  "commitment_fee_sat": {
+   "idle": 285,
+   "with_483": 21303
+  },
+  "restart_back_s": {
+   "lf3": 1.0,
+   "lf2": 1.0,
+   "lf1": 1.1
+  },
+  "settle_call_with_hop_down_ms": 4.0,
+  "blocks_held_by_a_silent_seller": 25,
+  "seller_htlc_expiry_minus_lock_height": 43,
+  "buyer_htlc_expiry_minus_lock_height": 123,
+  "seller_closes_blocks_before_expiry": 16,
+  "seller_claim_on_chain_blocks_before_expiry": 12,
+  "seller_on_chain_claim_cost_sat": 1440,
+  "offline_force_close_blocks_after_lock": 43,
+  "offline_buyer_funds_back_blocks_after_lock": 47,
+  "offline_commitment": {
+   "weight": 1630,
+   "outputs": 7,
+   "fee_sat": 414
+  },
+  "offline_hop_cost_sat": 1530,
+  "offline_100_buyer_funds_back_blocks_after_lock": 48,
+  "offline_100_commitment": {
+   "weight": 18313,
+   "outputs": 104,
+   "fee_sat": 4635
+  },
+  "offline_100_hop_cost_sat": 28975
+ },
+ "against_earlier_run": [
+  {
+   "what": "fee_msat_per_settled_ticket_one_hop",
+   "measured": 1001,
+   "earlier": 1001,
+   "differs": false,
+   "exact": true
+  },
+  {
+   "what": "buyer_paid_sat_for_5_of_10",
+   "measured": 5005,
+   "earlier": 5005,
+   "differs": false,
+   "exact": true
+  },
+  {
+   "what": "smallest_ticket_sat_with_an_output",
+   "measured": 354,
+   "earlier": 354,
+   "differs": false,
+   "exact": true
+  },
+  {
+   "what": "weight_units_per_ticket_output",
+   "measured": 172,
+   "earlier": 172,
+   "differs": false,
+   "exact": true
+  },
+  {
+   "what": "smallest_ticket_msat_through_a_hop",
+   "measured": 1000,
+   "earlier": 1000,
+   "differs": false,
+   "exact": true
+  },
+  {
+   "what": "fee_msat_on_a_1_sat_ticket",
+   "measured": 1000,
+   "earlier": 1000,
+   "differs": false,
+   "exact": true
+  },
+  {
+   "what": "direct_fee_msat",
+   "measured": 0,
+   "earlier": 0,
+   "differs": false,
+   "exact": true
+  },
+  {
+   "what": "lock_s_one_hop",
+   "measured": {
+    "1": 0.212,
+    "8": 0.327,
+    "10": 0.321,
+    "50": 1.187,
+    "100": 2.063,
+    "200": 3.851,
+    "400": 7.356
+   },
+   "earlier": {
+    "1": 0.27,
+    "10": 0.59,
+    "50": 1.9,
+    "100": 3.0,
+    "200": 5.0,
+    "400": 9.6
+   },
+   "differs": false,
+   "exact": false
+  },
+  {
+   "what": "per_request_ms",
+   "measured": {
+    "seller_hashes_and_looks_up": {
+     "n": 30,
+     "p50_ms": 0.98,
+     "p90_ms": 1.23,
+     "max_ms": 1.36
+    },
+    "seller_settle_returns": {
+     "n": 30,
+     "p50_ms": 3.44,
+     "p90_ms": 6.19,
+     "max_ms": 7.29
+    },
+    "buyer_node_SUCCEEDED": {
+     "n": 30,
+     "p50_ms": 12.96,
+     "p90_ms": 21.46,
+     "max_ms": 28.48
+    }
+   },
+   "earlier": {
+    "seller_hashes_and_looks_up": 0.93,
+    "seller_settle_returns": 3.5,
+    "buyer_node_SUCCEEDED": 11
+   },
+   "differs": false,
+   "exact": false
+  },
+  {
+   "what": "smallest_final_cltv_delta_accepted",
+   "measured": 24,
+   "earlier": 25,
+   "differs": true,
+   "exact": true
+  },
+  {
+   "what": "tickets_in_flight_per_channel",
+   "measured": 483,
+   "earlier": 483,
+   "differs": false,
+   "exact": true
+  },
+  {
+   "what": "buyer_failures_of_the_37",
+   "measured": {
+    "FAILED:INSUFFICIENT_BALANCE": 37
+   },
+   "earlier": {
+    "FAILED:INSUFFICIENT_BALANCE": 37
+   },
+   "differs": false,
+   "exact": true
+  },
+  {
+   "what": "commitment_weight",
+   "measured": {
+    "idle": 1116,
+    "with_483": 84200
+   },
+   "earlier": {
+    "idle": 1116,
+    "with_483": 84200
+   },
+   "differs": false,
+   "exact": true
+  },
+  {
+   "what": "commitment_fee_sat",
+   "measured": {
+    "idle": 285,
+    "with_483": 21303
+   },
+   "earlier": {
+    "idle": 285,
+    "with_483": 21304
+   },
+   "differs": false,
+   "exact": false
+  },
+  {
+   "what": "restart_back_s",
+   "measured": {
+    "lf3": 1.0,
+    "lf2": 1.0,
+    "lf1": 1.1
+   },
+   "earlier": {
+    "lf3": 1.0,
+    "lf2": 1.0,
+    "lf1": 1.5
+   },
+   "differs": false,
+   "exact": false
+  },
+  {
+   "what": "settle_call_with_hop_down_ms",
+   "measured": 4.0,
+   "earlier": 4.2,
+   "differs": false,
+   "exact": false
+  },
+  {
+   "what": "blocks_held_by_a_silent_seller",
+   "measured": 25,
+   "earlier": 25,
+   "differs": false,
+   "exact": true
+  },
+  {
+   "what": "seller_htlc_expiry_minus_lock_height",
+   "measured": 43,
+   "earlier": 43,
+   "differs": false,
+   "exact": true
+  },
+  {
+   "what": "buyer_htlc_expiry_minus_lock_height",
+   "measured": 123,
+   "earlier": 123,
+   "differs": false,
+   "exact": true
+  },
+  {
+   "what": "offline_force_close_blocks_after_lock",
+   "measured": 43,
+   "earlier": 43,
+   "differs": false,
+   "exact": true
+  },
+  {
+   "what": "offline_buyer_funds_back_blocks_after_lock",
+   "measured": 47,
+   "earlier": 51,
+   "differs": true,
+   "exact": true
+  }
+ ],
+ "failed": [],
+ "seconds": 981
+}

@@ -1,0 +1,830 @@
+{
+ "checks": [
+  {
+   "check": "setup: the Lightning rail is ready on lf1: chain verified, its one channel's funding proven",
+   "ok": true,
+   "saw": {
+    "ready": true,
+    "warnings": null
+   }
+  },
+  {
+   "check": "setup: the MCP's xbt402_pay says which rails it chooses from and what an agent can and cannot cause, and takes the owner's task",
+   "ok": true,
+   "saw": [
+    "ticket_status",
+    "ticket_stop",
+    "xbt402_pay"
+   ]
+  },
+  {
+   "check": "page: one xbt402_pay call fetched a priced page behind the gateway, through the hop: one ticket of the pool released, 2,500 msat used, the seller's receipt signs the body",
+   "ok": true,
+   "saw": {
+    "balance_msat": "997500",
+    "body_digest": "f82fec6c8f4cf79f29c6124b3a66cceec05c3cbb4a2bc0ca8dad3d4d2c03903f",
+    "bytes": 260,
+    "charged_sats": 1015,
+    "complete": true,
+    "credited_msat": "1000000",
+    "dest": "ln:0250b8babdff7cd2cc2a68a04bc39b2100d19d4090e4030a40d498b120f81ad0cb",
+    "ended": null,
+    "ms": 285.9,
+    "origin": "http://127.0.0.1:17965",
+    "price_msat": "2500",
+    "rail": "ticket",
+    "receipt": {
+     "body": "as signed",
+     "signed": true
+    },
+    "rule": "ok",
+    "session": "PF8dHIttREvn6Gbf4mt5w9txlSSZQ0dE",
+    "status": 200,
+    "tickets_prepaid": 0,
+    "tickets_released": 1,
+    "verdict": "allow"
+   }
+  },
+  {
+   "check": "page: one ticket was left and the next was locked behind the call: two are locked and unreleased again, and the wallet's book is its node's payments in flight",
+   "ok": true,
+   "saw": {
+    "locked": {
+     "tickets": 2,
+     "sats": 2000
+    },
+    "node": {
+     "htlcs": 2,
+     "agree": true,
+     "in_book_not_on_node": [],
+     "on_node_not_in_book": []
+    },
+    "buyer_in_flight": 2,
+    "seller_held": 2
+   }
+  },
+  {
+   "check": "page: a first request, with the pool of 2 tickets locked through one hop, completes in 1 s (median of 5 new sessions, timed around the MCP tool call)",
+   "ok": true,
+   "saw": {
+    "median_s": 0.337,
+    "each_s": [
+     0.357,
+     0.335,
+     0.337,
+     0.339,
+     0.334
+    ]
+   }
+  },
+  {
+   "check": "latency: a paid request from the balance adds at most 5 ms (median) over an unpaid one: 200 xbt402_pay calls of a priced page against 200 of a free page, each through the MCP, the signer and the gateway",
+   "ok": true,
+   "saw": {
+    "paid_ms": 1.745,
+    "unpaid_ms": 1.48,
+    "added_ms": 0.265,
+    "tickets_locked_meanwhile": 1
+   }
+  },
+  {
+   "check": "stream: a 100 MB file priced per byte came through the wallet whole: 20 tickets released one at a time as it arrived, the stored file is the seller's file, and the last receipt signs its hash and its price",
+   "ok": true,
+   "saw": {
+    "balance_msat": "926513",
+    "body_digest": "b9c4c3a2ee8f5462ae299bdbcf74a32b96d224ef0a6d776186bf6907523719a8",
+    "bytes": 100000000,
+    "charged_sats": 20300,
+    "complete": true,
+    "credited_msat": "20000000",
+    "dest": "ln:0250b8babdff7cd2cc2a68a04bc39b2100d19d4090e4030a40d498b120f81ad0cb",
+    "ended": null,
+    "ms": 3374.9,
+    "origin": "http://127.0.0.1:17965",
+    "price_msat": "19073487",
+    "rail": "ticket",
+    "receipt": {
+     "body": "as signed"
+    },
+    "rule": "ok",
+    "saved_to": "<repo>/run/ticket-e2e-pdefRT/bodies/ticket-HIgaieSyEwm4YtaZl-vBrXQmQnhhBPht.bin",
+    "session": "CfNW-OXNNvBA_ZpIbuo_ROxYLd-OCBMH",
+    "status": 200,
+    "tickets_prepaid": 0,
+    "tickets_released": 20,
+    "verdict": "allow",
+    "seconds": 3.43,
+    "stored_is_the_file": true
+   }
+  },
+  {
+   "check": "stream: the same file under a call that allows half its price stops half way, at the byte the call's max_sats pays for by the wallet's own count",
+   "ok": true,
+   "saw": {
+    "balance_msat": "342076",
+    "body_digest": "f0f1119f2a836c4137044aaa29d9e2e0dbb02f59c8fba7b6e8e2a2907c596c60",
+    "bytes": 50003708,
+    "charged_sats": 9135,
+    "complete": false,
+    "credited_msat": "29000000",
+    "dest": "ln:0250b8babdff7cd2cc2a68a04bc39b2100d19d4090e4030a40d498b120f81ad0cb",
+    "ended": "stopped by the wallet: max_sats: the call's limit is used up",
+    "ms": 1539.9,
+    "origin": "http://127.0.0.1:17965",
+    "price_msat": "9584437",
+    "rail": "ticket",
+    "receipt": {
+     "body": "cut short"
+    },
+    "rule": "ok",
+    "saved_to": "<repo>/run/ticket-e2e-pdefRT/bodies/ticket-op1hsUAb39l8mN96oqnAgNrak5g-qtfJ.bin",
+    "session": "CfNW-OXNNvBA_ZpIbuo_ROxYLd-OCBMH",
+    "status": 200,
+    "tickets_prepaid": 0,
+    "tickets_released": 9,
+    "verdict": "allow",
+    "max_sats": 9536,
+    "price_of_bytes_msat": 9537451
+   }
+  },
+  {
+   "check": "stream: the agent stops the session while the file arrives: the answer ends there, and what arrived is a true prefix of the file",
+   "ok": true,
+   "saw": {
+    "balance_msat": "0",
+    "body_digest": "916b2cb32bbfd5f74f9633313baf5a33025ee03c128053b3efff1a8e464760fa",
+    "bytes": 17522103,
+    "charged_sats": 3045,
+    "complete": false,
+    "credited_msat": "32000000",
+    "dest": "ln:0250b8babdff7cd2cc2a68a04bc39b2100d19d4090e4030a40d498b120f81ad0cb",
+    "ended": "stopped by the wallet: ticket_session: the session was stopped: nothing more is released for it",
+    "ms": 2387.6,
+    "origin": "http://127.0.0.1:17965",
+    "price_msat": "3342076",
+    "rail": "ticket",
+    "receipt": {
+     "body": null
+    },
+    "rule": "ok",
+    "saved_to": "<repo>/run/ticket-e2e-pdefRT/bodies/ticket-Rh0f7s0Y3G3ieb_W6jA_OjDYI-kBUe_a.bin",
+    "session": "CfNW-OXNNvBA_ZpIbuo_ROxYLd-OCBMH",
+    "status": 200,
+    "tickets_prepaid": 0,
+    "tickets_released": 3,
+    "verdict": "allow"
+   }
+  },
+  {
+   "check": "stream: after the stop the unused tickets are cancelled within 5 s: none in flight on the buyer's node, none held on the seller's",
+   "ok": true,
+   "saw": {
+    "seconds": 2.06,
+    "wait_s": 0.01,
+    "stop": {
+     "account": {
+      "answer_open": true,
+      "answer_unclosed": false,
+      "balance_msat": "0",
+      "credited_msat": "32000000",
+      "fault": null,
+      "origin": "http://127.0.0.1:17965",
+      "released_msat": "32000000",
+      "session": "CfNW-OXNNvBA_ZpIbuo_ROxYLd-OCBMH",
+      "spent_msat": "32000000",
+      "unconfirmed_release": null
+     },
+     "cancel_asked": 1,
+     "cancel_sent": true,
+     "session": "CfNW-OXNNvBA_ZpIbuo_ROxYLd-OCBMH",
+     "still_locked": [],
+     "why": "stopped by the caller"
+    }
+   }
+  },
+  {
+   "check": "stream: what the buyer's node paid, what the seller's node received, what the wallet booked and what the seller's receipts say was released are one number, to the millisat; the ledger is each ticket and its fee",
+   "ok": true,
+   "saw": {
+    "buyer_node_paid_msat": 37000000,
+    "seller_node_received_msat": 37000000,
+    "wallet_book_settled_msat": 37000000,
+    "receipts_released_msat": 37000000,
+    "wallet_ledger_sats": 37074,
+    "booked_for_payments_the_node_left_in_flight_sats": 0,
+    "buyer_node_cost_sats": 37074,
+    "fees_msat": 37037,
+    "tickets": 37
+   }
+  },
+  {
+   "check": "slots: on a channel that carries 30 the wallet holds 2 tickets with the seller, and the gateway holds at most 15 for all buyers",
+   "ok": true,
+   "saw": {
+    "pool": 2,
+    "slots_read_by_the_wallet": 30,
+    "node_lists": {
+     "local_constraints": 30,
+     "remote_constraints": 483
+    },
+    "gateway_max_held": 15
+   }
+  },
+  {
+   "check": "slots: with 15 payments of others pending on its channel, half of the 30, the wallet holds no ticket and buys a prepaid one: the page is paid and nothing of the wallet's stays pending",
+   "ok": true,
+   "saw": {
+    "balance_msat": "997500",
+    "body_digest": "f82fec6c8f4cf79f29c6124b3a66cceec05c3cbb4a2bc0ca8dad3d4d2c03903f",
+    "bytes": 260,
+    "charged_sats": 1002,
+    "complete": true,
+    "credited_msat": "1000000",
+    "dest": "ln:0250b8babdff7cd2cc2a68a04bc39b2100d19d4090e4030a40d498b120f81ad0cb",
+    "ended": null,
+    "ms": 292.9,
+    "origin": "http://127.0.0.1:17965",
+    "price_msat": "2500",
+    "rail": "ticket",
+    "receipt": {
+     "body": "as signed",
+     "signed": true
+    },
+    "rule": "ok",
+    "session": {
+     "pool": 0,
+     "hold_why": "ticket_slots",
+     "prepaid_msat": "1000000"
+    },
+    "status": 200,
+    "tickets_prepaid": 1,
+    "tickets_released": 1,
+    "verdict": "allow",
+    "pending_on_the_channel": 15
+   }
+  },
+  {
+   "check": "slots: a file is paid for with prepaid tickets bought one at a time as the balance runs out: never more than one payment of the wallet's is pending beside the 15, and never more than half the channel plus one",
+   "ok": true,
+   "saw": {
+    "balance_msat": "955263",
+    "body_digest": "e0f083f6e870d50280171b2a3b40d6d215eb0f0b6aeee138dd8725237e406ee9",
+    "bytes": 26217676,
+    "charged_sats": 5010,
+    "complete": false,
+    "credited_msat": "6000000",
+    "dest": "ln:0250b8babdff7cd2cc2a68a04bc39b2100d19d4090e4030a40d498b120f81ad0cb",
+    "ended": "stopped by the wallet: max_sats: the call's limit is used up",
+    "ms": 1458.6,
+    "origin": "http://127.0.0.1:17965",
+    "price_msat": "5042237",
+    "rail": "ticket",
+    "receipt": {
+     "body": "cut short",
+     "last": {
+      "charged": "5042237",
+      "releasedMsat": "6000000",
+      "seq": 2,
+      "spentMsat": "5044737",
+      "status": 200
+     },
+     "signed": true
+    },
+    "rule": "ok",
+    "saved_to": "<repo>/run/ticket-e2e-pdefRT/bodies/ticket-B2OHNC0uDeQ6UBQ1YTmIWepl9NmLZ3Fu.bin",
+    "session": "FBq_ienJHEsplqZlcmr577VdukC_ogAf",
+    "status": 200,
+    "tickets_prepaid": 5,
+    "tickets_released": 5,
+    "verdict": "allow",
+    "most_pending_of_the_wallets": 1,
+    "seconds": 1.46
+   }
+  },
+  {
+   "check": "slots: a seller at its cap of 15 held tickets says slots_short before it issues anything: the wallet waits the 30 s it names before it asks for a held ticket again, and pays this page with a prepaid one",
+   "ok": true,
+   "saw": {
+    "balance_msat": "997500",
+    "body_digest": "f82fec6c8f4cf79f29c6124b3a66cceec05c3cbb4a2bc0ca8dad3d4d2c03903f",
+    "bytes": 260,
+    "charged_sats": 1002,
+    "complete": true,
+    "credited_msat": "1000000",
+    "dest": "ln:0250b8babdff7cd2cc2a68a04bc39b2100d19d4090e4030a40d498b120f81ad0cb",
+    "ended": null,
+    "ms": 274.8,
+    "origin": "http://127.0.0.1:17965",
+    "price_msat": "2500",
+    "rail": "ticket",
+    "receipt": {
+     "body": "as signed",
+     "signed": true
+    },
+    "rule": "ok",
+    "session": {
+     "pool": 2,
+     "hold_why": "ticket_slots_short"
+    },
+    "status": 200,
+    "tickets_prepaid": 1,
+    "tickets_released": 1,
+    "verdict": "allow",
+    "sessions_of_other_buyers": 8
+   }
+  },
+  {
+   "check": "slots: with one slot left on the seller's channel one of the wallet's two tickets locks and the other fails on the wallet's node as a full channel does: the page is paid, and the session holds one ticket from now on and waits before it locks again",
+   "ok": true,
+   "saw": {
+    "balance_msat": "997500",
+    "body_digest": "f82fec6c8f4cf79f29c6124b3a66cceec05c3cbb4a2bc0ca8dad3d4d2c03903f",
+    "bytes": 260,
+    "charged_sats": 1015,
+    "complete": true,
+    "credited_msat": "1000000",
+    "dest": "ln:0250b8babdff7cd2cc2a68a04bc39b2100d19d4090e4030a40d498b120f81ad0cb",
+    "ended": null,
+    "ms": 298.7,
+    "origin": "http://127.0.0.1:17965",
+    "price_msat": "2500",
+    "rail": "ticket",
+    "receipt": {
+     "body": "as signed",
+     "signed": true
+    },
+    "rule": "ok",
+    "session": {
+     "pool": 1,
+     "hold_why": "ticket_slots",
+     "slot_fails": 0
+    },
+    "status": 200,
+    "tickets_prepaid": 0,
+    "tickets_released": 1,
+    "verdict": "allow",
+    "failure": [
+     {
+      "after": "in flight, then failed at a later hop",
+      "dest": "ln:0250b8babdff7cd2cc2a68a04bc39b2100d19d4090e4030a40d498b120f81ad0cb",
+      "hold_until": 1791942716.8002124,
+      "hold_why": "ticket_slots",
+      "locked": 0,
+      "pool": 1,
+      "pool_was": 2,
+      "session": "QaAD1oqYJkO6p9MbzHvA5AB0ODv62C8U",
+      "slot_failed": 1,
+      "slot_fails": 1,
+      "ts": 1791942686.8078637,
+      "type": "ticket_slot_failure"
+     }
+    ],
+    "the_node_said": [
+     "FAILURE_REASON_NO_ROUTE"
+    ]
+   }
+  },
+  {
+   "check": "slots: after all of it, what the buyer's node paid, what the seller's node received, what the wallet's book holds as settled and what the seller's receipts say are one number, and the ledger is each ticket and its fee",
+   "ok": true,
+   "saw": {
+    "buyer_node_paid_msat": 49000000,
+    "seller_node_received_msat": 49000000,
+    "wallet_book_settled_msat": 49000000,
+    "receipts_released_msat": 49000000,
+    "wallet_ledger_sats": 49098,
+    "booked_for_payments_the_node_left_in_flight_sats": 0,
+    "buyer_node_cost_sats": 49098,
+    "fees_msat": 49049,
+    "tickets": 49
+   }
+  },
+  {
+   "check": "liar: with the proxy passing everything on, the second gateway is paid as the first is",
+   "ok": true,
+   "saw": {
+    "balance_msat": "997500",
+    "body_digest": "f82fec6c8f4cf79f29c6124b3a66cceec05c3cbb4a2bc0ca8dad3d4d2c03903f",
+    "bytes": 260,
+    "charged_sats": 1002,
+    "complete": true,
+    "credited_msat": "1000000",
+    "dest": "ln:0250b8babdff7cd2cc2a68a04bc39b2100d19d4090e4030a40d498b120f81ad0cb",
+    "ended": null,
+    "ms": 426.3,
+    "origin": "http://127.0.0.1:17968",
+    "price_msat": "2500",
+    "rail": "ticket",
+    "receipt": {
+     "body": "as signed",
+     "signed": true
+    },
+    "rule": "ok",
+    "session": "PUzp2LIzhUYC40ERuDWD3DxECzZ6b64H",
+    "status": 200,
+    "tickets_prepaid": 1,
+    "tickets_released": 1,
+    "verdict": "allow"
+   }
+  },
+  {
+   "check": "liar: terms that name another node id than the one the owner tied to this origin: nothing is locked and nothing paid",
+   "ok": true,
+   "saw": {
+    "reply": {
+     "charged_sats": 0,
+     "offered": [
+      {
+       "network": "this wallet's Lightning network",
+       "scheme": "ticket"
+      },
+      {
+       "network": "this wallet's Lightning network",
+       "scheme": "ticket"
+      }
+     ],
+     "reason": "the seller's 402 offers no way to pay that this wallet's policy allows: see rails_passed_over for what each entry needs",
+     "rule": "no_rail",
+     "verdict": "deny",
+     "wallet": {
+      "chain": "bip122:6808aa2cbfa835d261042ac18eb6fdf6",
+      "lightning": "lightning:6808aa2cbfa835d261042ac18eb6fdf6",
+      "ln": true,
+      "tickets": true
+     }
+    },
+    "tickets_it_cost": 0,
+    "payments_started": 0,
+    "booked_exactly": true,
+    "ledger_sats": 50100,
+    "node_cost_sats": 50100
+   }
+  },
+  {
+   "check": "liar: tickets for another payee (hold invoices of another node for the buyer's hashes): no payment leaves the buyer's node",
+   "ok": true,
+   "saw": {
+    "reply": {
+     "balance_msat": "0",
+     "charged_sats": 0,
+     "credited_msat": "0",
+     "dest": "ln:0250b8babdff7cd2cc2a68a04bc39b2100d19d4090e4030a40d498b120f81ad0cb",
+     "origin": "http://127.0.0.1:17968",
+     "rail": "ticket",
+     "reason": "the invoice pays 0285e9c06eb9cad377f073de851ff4e3c5035e0e3869f3dc920b6b07eeb2ffbb75, not the seller's node 0250b8babdff7cd2cc2a68a04bc39b2100d19d4090e4030a40d498b120f81ad0cb",
+     "rule": "ticket_payee",
+     "session": "5GQco2pTPkvsSPi2r8VvKddcnZDFND3b",
+     "tickets_prepaid": 0,
+     "tickets_released": 0,
+     "verdict": "deny"
+    },
+    "tickets_it_cost": 0,
+    "payments_started": 0,
+    "booked_exactly": true,
+    "ledger_sats": 50100,
+    "node_cost_sats": 50100
+   }
+  },
+  {
+   "check": "liar: terms that change under an open session: the session is stopped and nothing more is paid",
+   "ok": true,
+   "saw": {
+    "reply": {
+     "charged_sats": 0,
+     "rail": "ticket",
+     "reason": "the seller's 402 now names another node, receipt key, ticket or session path than the session was opened on: the session was stopped and nothing was paid; call again to pay on the new terms, if the owner's policy allows them",
+     "rule": "ticket_terms_changed",
+     "verdict": "deny"
+    },
+    "tickets_it_cost": 1,
+    "payments_started": 1,
+    "booked_exactly": true,
+    "ledger_sats": 51102,
+    "node_cost_sats": 51102
+   }
+  },
+  {
+   "check": "liar: inflated metering, in a receipt signed by the seller's own key (5,000 msat for a page priced at 2,500): the session is stopped",
+   "ok": true,
+   "saw": {
+    "reply": {
+     "balance_msat": "997500",
+     "charged_sats": 0,
+     "credited_msat": "1000000",
+     "dest": "ln:0250b8babdff7cd2cc2a68a04bc39b2100d19d4090e4030a40d498b120f81ad0cb",
+     "origin": "http://127.0.0.1:17968",
+     "rail": "ticket",
+     "reason": "the session with this seller was stopped: the seller charged 5000 msat for a request whose price by its terms is at most 2500",
+     "rule": "ticket_seller_fault",
+     "session": "Rph131kCMylmWJdlTjtpZfZcIUBmnOIN",
+     "status": 200,
+     "tickets_prepaid": 0,
+     "tickets_released": 0,
+     "verdict": "deny"
+    },
+    "tickets_it_cost": 1,
+    "payments_started": 1,
+    "booked_exactly": true,
+    "ledger_sats": 52104,
+    "node_cost_sats": 52104
+   }
+  },
+  {
+   "check": "liar: a served answer with no receipt: the session is stopped",
+   "ok": true,
+   "saw": {
+    "reply": {
+     "balance_msat": "997500",
+     "charged_sats": 0,
+     "credited_msat": "1000000",
+     "dest": "ln:0250b8babdff7cd2cc2a68a04bc39b2100d19d4090e4030a40d498b120f81ad0cb",
+     "origin": "http://127.0.0.1:17968",
+     "rail": "ticket",
+     "reason": "the session with this seller was stopped: an answer to a paid request (HTTP 200 ) without a valid receipt: the answer has no PAYMENT-RESPONSE",
+     "rule": "ticket_seller_fault",
+     "session": "oc_qVUm0-qLHx4zcOZhrTFZ73H7PvewT",
+     "status": 200,
+     "tickets_prepaid": 0,
+     "tickets_released": 0,
+     "verdict": "deny"
+    },
+    "tickets_it_cost": 1,
+    "payments_started": 1,
+    "booked_exactly": true,
+    "ledger_sats": 53106,
+    "node_cost_sats": 53106
+   }
+  },
+  {
+   "check": "liar: a receipt for another request (the page before's, replayed): the session is stopped",
+   "ok": true,
+   "saw": {
+    "reply": {
+     "balance_msat": "995000",
+     "charged_sats": 0,
+     "credited_msat": "1000000",
+     "dest": "ln:0250b8babdff7cd2cc2a68a04bc39b2100d19d4090e4030a40d498b120f81ad0cb",
+     "origin": "http://127.0.0.1:17968",
+     "rail": "ticket",
+     "reason": "the session with this seller was stopped: an answer to a paid request (HTTP 200 ) without a valid receipt: the receipt is for another request",
+     "rule": "ticket_seller_fault",
+     "session": "8zmsHlRqTtG8qZZIdc6URLNZapBnYwIL",
+     "status": 200,
+     "tickets_prepaid": 0,
+     "tickets_released": 0,
+     "verdict": "deny"
+    },
+    "tickets_it_cost": 1,
+    "payments_started": 1,
+    "booked_exactly": true,
+    "ledger_sats": 54108,
+    "node_cost_sats": 54108
+   }
+  },
+  {
+   "check": "liar: an answer that stops in the middle (7 MiB of a 100 MB file): what was released for it is paid, less than one ticket of it for nothing, and no ticket after it",
+   "ok": true,
+   "saw": {
+    "reply": {
+     "balance_msat": "562451",
+     "body_digest": "6666fd19b2e4b3c484c6d8e6592898d4a9b608967b2c5024d0f2c057ef3b4a6a",
+     "bytes": 7340032,
+     "charged_sats": 2004,
+     "complete": false,
+     "credited_msat": "2000000",
+     "dest": "ln:0250b8babdff7cd2cc2a68a04bc39b2100d19d4090e4030a40d498b120f81ad0cb",
+     "ended": "cut short by the seller: UnexpectedEof",
+     "ms": 591.0,
+     "origin": "http://127.0.0.1:17968",
+     "price_msat": "1437549",
+     "rail": "ticket",
+     "receipt": {
+      "body": "cut short",
+      "last": {
+       "charged": "1437549",
+       "releasedMsat": "2000000",
+       "seq": 1,
+       "spentMsat": "1437549",
+       "status": 200
+      },
+      "signed": true
+     },
+     "rule": "ok",
+     "saved_to": "<repo>/run/ticket-e2e-pdefRT/bodies/ticket-DBy4LH5OsPfRF5B_nlbq-Ac5-xAGmRNN.bin",
+     "session": "QmQC47g7yX7ttLzwbHgLoLlFOL3-UTxT",
+     "status": 200,
+     "tickets_prepaid": 2,
+     "tickets_released": 2,
+     "verdict": "allow"
+    },
+    "tickets_it_cost": 2,
+    "payments_started": 2,
+    "booked_exactly": true,
+    "ledger_sats": 56112,
+    "node_cost_sats": 56112
+   }
+  },
+  {
+   "check": "kill: signer, with a pool locked: after the restart nothing the seller took is missing from the wallet's ledger, nothing is paid twice, and the next call pays",
+   "ok": true,
+   "saw": {
+    "next": {
+     "calls": 1,
+     "said_first": [],
+     "prepaid": 1
+    },
+    "settled_on_seller": 58,
+    "not_in_ledger": [],
+    "paid_on_buyer": 58,
+    "same_tickets": true,
+    "ledger_sats": 58116,
+    "node_cost_sats": 58116
+   }
+  },
+  {
+   "check": "kill: signer, in the middle of an answer: after the restart nothing the seller took is missing from the wallet's ledger, nothing is paid twice, and the next call pays",
+   "ok": true,
+   "saw": {
+    "the_call_ended": "tool xbt402_pay: Error executing tool xbt402_pay",
+    "bytes": null,
+    "next": {
+     "calls": 1,
+     "said_first": [],
+     "prepaid": 1
+    },
+    "settled_on_seller": 62,
+    "not_in_ledger": [],
+    "paid_on_buyer": 62,
+    "same_tickets": true,
+    "ledger_sats": 62124,
+    "node_cost_sats": 62124,
+    "payments_the_node_still_calls_in_flight_with_nothing_on_its_channel": 0
+   }
+  },
+  {
+   "check": "kill: mcp, with a pool locked: after the restart nothing the seller took is missing from the wallet's ledger, nothing is paid twice, and the next call pays",
+   "ok": true,
+   "saw": {
+    "next": {
+     "calls": 1,
+     "said_first": [],
+     "prepaid": 0
+    },
+    "settled_on_seller": 63,
+    "not_in_ledger": [],
+    "paid_on_buyer": 63,
+    "same_tickets": true,
+    "ledger_sats": 63126,
+    "node_cost_sats": 63126
+   }
+  },
+  {
+   "check": "kill: mcp, in the middle of an answer: after the restart nothing the seller took is missing from the wallet's ledger, nothing is paid twice, and the next call pays",
+   "ok": true,
+   "saw": {
+    "the_call_ended": "the MCP server gave no answer to tools/call",
+    "bytes": null,
+    "next": {
+     "calls": 1,
+     "said_first": [],
+     "prepaid": 0
+    },
+    "settled_on_seller": 83,
+    "not_in_ledger": [],
+    "paid_on_buyer": 83,
+    "same_tickets": true,
+    "ledger_sats": 83166,
+    "node_cost_sats": 83166,
+    "payments_the_node_still_calls_in_flight_with_nothing_on_its_channel": 0
+   }
+  },
+  {
+   "check": "kill: gateway, with a pool locked: after the restart nothing the seller took is missing from the wallet's ledger, nothing is paid twice, and the next call pays",
+   "ok": true,
+   "saw": {
+    "next": {
+     "calls": 1,
+     "said_first": [],
+     "prepaid": 0
+    },
+    "settled_on_seller": 84,
+    "not_in_ledger": [],
+    "paid_on_buyer": 84,
+    "same_tickets": true,
+    "ledger_sats": 84168,
+    "node_cost_sats": 84168
+   }
+  },
+  {
+   "check": "kill: gateway, in the middle of an answer: after the restart nothing the seller took is missing from the wallet's ledger, nothing is paid twice, and the next call pays",
+   "ok": true,
+   "saw": {
+    "the_call_ended": "cut short by the seller: UnexpectedEof",
+    "bytes": 11311872,
+    "next": {
+     "calls": 1,
+     "said_first": [],
+     "prepaid": 0
+    },
+    "settled_on_seller": 87,
+    "not_in_ledger": [],
+    "paid_on_buyer": 87,
+    "same_tickets": true,
+    "ledger_sats": 87174,
+    "node_cost_sats": 87174,
+    "payments_the_node_still_calls_in_flight_with_nothing_on_its_channel": 0
+   }
+  },
+  {
+   "check": "kill: lf1, with a pool locked: after the restart nothing the seller took is missing from the wallet's ledger, nothing is paid twice, and the next call pays",
+   "ok": true,
+   "saw": {
+    "next": {
+     "calls": 1,
+     "said_first": [],
+     "prepaid": 0
+    },
+    "settled_on_seller": 88,
+    "not_in_ledger": [],
+    "paid_on_buyer": 88,
+    "same_tickets": true,
+    "ledger_sats": 88176,
+    "node_cost_sats": 88176
+   }
+  },
+  {
+   "check": "kill: lf1, in the middle of an answer: after the restart nothing the seller took is missing from the wallet's ledger, nothing is paid twice, and the next call pays",
+   "ok": true,
+   "saw": {
+    "the_call_ended": "stopped by the wallet: ticket_seller_fault: the session with this seller was stopped: the payment of a prepaid ticket has no final answer from the wallet's node",
+    "bytes": 15728640,
+    "next": {
+     "calls": 1,
+     "said_first": [],
+     "prepaid": 0
+    },
+    "settled_on_seller": 92,
+    "not_in_ledger": [],
+    "paid_on_buyer": 92,
+    "same_tickets": true,
+    "ledger_sats": 93199,
+    "node_cost_sats": 92184,
+    "payments_the_node_still_calls_in_flight_with_nothing_on_its_channel": 1
+   }
+  },
+  {
+   "check": "kill: ran to its end",
+   "ok": false,
+   "saw": "LabError: timed out after 30 s waiting for the pool locked and listed"
+  }
+ ],
+ "measured": {
+  "gateway_start_s": 0.05,
+  "first_request_s": [
+   0.357,
+   0.335,
+   0.337,
+   0.339,
+   0.334
+  ],
+  "paid_request_ms": {
+   "median": 1.745,
+   "p90": 1.844
+  },
+  "unpaid_request_ms": {
+   "median": 1.48,
+   "p90": 1.59
+  },
+  "direct_http_free_ms": {
+   "median": 0.51
+  },
+  "file_100mb_s": 3.43,
+  "cancel_s": 2.06,
+  "buyer_channel": {
+   "local_constraints": 30,
+   "remote_constraints": 483,
+   "commitment_type": "ANCHORS",
+   "dust_limit_sat": {
+    "local_constraints": "354",
+    "remote_constraints": "354"
+   }
+  },
+  "slots_first_request_prepaid_s": 0.31,
+  "slots_prepaid_stream_s_per_ticket": 0.292,
+  "slots_full_channel_failure_reasons": [
+   "FAILURE_REASON_NO_ROUTE"
+  ],
+  "slots_after_a_failed_lock": {
+   "verdict": "allow",
+   "rule": "ok",
+   "tickets_released": 3,
+   "tickets_prepaid": 3,
+   "ended": "stopped by the wallet: max_sats: the call's limit is used up",
+   "reason": "None"
+  }
+ },
+ "failed": [
+  "kill: ran to its end"
+ ],
+ "seconds": 285
+}

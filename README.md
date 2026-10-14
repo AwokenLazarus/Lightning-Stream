@@ -12,11 +12,17 @@ once, as in a torrent swarm or people lending hardware for AI.
 channels, not beside them, and adds one thing: the **stream ticket**. A ticket is a small
 Lightning payment that is locked along the route but not yet released. The buyer picks a secret
 and gives the seller only its hash; the seller's node issues a hold invoice for that hash and the
-buyer's node pays it. Nobody can take the money, because only the buyer knows the secret. To pay
-for a request, the buyer puts the secret in the request; the seller checks it, serves, and
-collects. A few tickets are locked before the service starts and topped up in the background, so
+buyer's node pays it. Nobody can take the money, because only the buyer knows the secret. To pay,
+the buyer sends the seller the secret; the seller checks it, collects, and serves requests from
+the balance that ticket makes. A few tickets are locked before the service starts and topped up in the background, so
 no request waits for a payment. Lightning's own routing carries tickets to any seller the
-network reaches, with no change to the node software.
+network reaches, with no change to an lnd-family node: lnd and its forks, which have hold
+invoices. Only one of them was run, Lightning Fork. **A Core Lightning node cannot be a seller's
+node for held tickets today**: it has no hold-invoice call, neither published hold plugin fits
+(one issues invoices without XBT's feature bit, the other keeps the secret on the seller's node),
+nothing on it cancels a held ticket before the ticket expires, and the gateway speaks to
+lnd-family nodes only. As a buyer's node or a routing node it needed nothing in the lab
+([`docs/TICKETS.md`](docs/TICKETS.md), sections 8 and 11).
 
 This direction was decided on 2026-10-11. **Tickets run end to end on regtest, and nowhere
 else**: the design was measured on a three-node Lightning Fork regtest, the seller's side (the
@@ -110,24 +116,29 @@ before releasing its ticket.
 
 **Two limits shape those defaults** (set on 2026-10-12, after Kyle Santiago pointed them out). A held ticket takes one of a channel's slots for pending payments on every channel of its
 route, and those slots are shared by everyone using the channel: 483 between Lightning Fork
-nodes, 30 where either end is a Core Lightning node at its default. So a session holds 2 tickets,
+nodes, 30 where either end is a Core Lightning node at its default (as commonly documented, lnd's
+default is 483, Core Lightning's 30, LDK's 50 and eclair's 30). So a session holds 2 tickets,
 not 8, and held tickets take at most half of a channel's slots: from one 30-slot channel a buyer
 holds tickets with 7 sellers at once, or 15 at one ticket each. And a ticket below a channel's
 dust limit (354 sat on Lightning Fork, 546 sat on Core Lightning) cannot be claimed on chain, so
 a held ticket is never below 546 sat. Paying many sellers at once, as in a swarm, is therefore
 the lottery's job (below): a win is paid at once and holds nothing. This was measured with the
 XBT Core Lightning fork in the lab ([`docs/TICKETS.md`](docs/TICKETS.md), section 11). **The
-wallet's ticket book and the gateway have these defaults and keep these rules since 2026-10-13**:
-each reads the slots and dust limits of its own node's channels, the wallet holds less after a
-lock that finds no slot, and a seller at its cap tells buyers to wait. Where no ticket can be
+wallet's ticket book and the gateway have these defaults and keep these rules since 2026-10-13**,
+each as far as it can see. The wallet reads the slots and the dust limits of its own node's
+channels before every lock, and holds less after a lock that finds no slot. The gateway keeps to
+the numbers in its config (30 slots unless the runner says more); it reads its node's slots only
+when the runner gives it a third, wider macaroon, and it never reads a dust limit. A seller at
+its cap tells buyers to wait. Where no ticket can be
 held, the wallet buys **prepaid tickets** one at a time: ordinary payments that are spent when
 they are paid and hold nothing, which the gateway offers beside held tickets. The regtest scripts
 run all of it on channels opened with 30 slots between Lightning Fork nodes; no Core Lightning
 node is in their lab. An owner's policy written before that date means the new numbers where it
 sets none ([`docs/LIMITS.md`](docs/LIMITS.md), "Stream tickets: the wallet's ticket book").
 
-A seller will need a Lightning node with inbound capacity, and a buyer a Lightning node with a
-channel. `docs/LIMITS.md` states what the design gives up, and what the wallet's ticket book, its
+A seller will need an lnd-family Lightning node with inbound capacity (today that is a Lightning
+Fork node: see the top of this page for why a Core Lightning node cannot hold tickets), and a
+buyer a Lightning Fork node with a channel. `docs/LIMITS.md` states what the design gives up, and what the wallet's ticket book, its
 payer and the gateway do not do (the "Stream tickets" sections and "Seller gateway").
 
 ### The lottery: amounts smaller than a ticket (built, its first form)
@@ -135,13 +146,23 @@ payer and the gateway do not do (the "Stream tickets" sections and "Seller gatew
 Some pieces are worth less than the smallest payment worth sending: a routing node charges about
 1 sat to carry any payment, and a piece of a shared file may be worth a tenth of a sat. For those,
 buyer and seller roll a fair die for every piece. Most rolls pay nothing, a win pays a
-normal-sized amount, and the odds are set so that the average is the exact price: at a tenth of
-a sat a piece and a win of 64 sat, 1 roll in 640 wins. Neither side can steer a roll, because the
+normal-sized amount, and the odds are set so that the expected payment is the exact price: at a
+tenth of a sat a piece and a win of 64 sat, 1 roll in 640 wins. Neither side can steer a roll, because the
 seller fixes its half before the session and the buyer sends its half after the piece arrived.
-Income and cost are uneven in the short run and exact in the long run, as a miner's income is.
+Income and cost are exact in expectation and uneven in any one run, as a miner's income is. How
+uneven depends on the number of wins between one buyer and one seller: the spread is about 1
+over the square root of the wins expected, so it takes about 68 wins (4,350 sat at 64-sat wins)
+to be within 20% nine times in ten, and about 1,080 wins (69,000 sat) to be within 5%. A call
+worth 10 sat, paid through a routing node where a win is 64 sat, pays nothing about 85% of the
+time and 64 sat or more otherwise ([`docs/TICKETS.md`](docs/TICKETS.md), section 9, has the
+arithmetic).
 Paying by lottery is an old idea and not ours: David Wheeler (1996) and Ronald Rivest (1997).
 
-**The first form is built: the buyer pays after a win.** The seller sends an ordinary Lightning
+**The first form is built: the buyer pays after a win.** It is the Wheeler and Rivest shape and
+nothing newer: the seller commits to a hash chain, the buyer adds a random value after each
+piece, and a hash of the two decides. It is not built on the 2026 paper named below and uses
+none of its construction; that paper is cited for the second form only, which is not built. The
+seller sends an ordinary Lightning
 invoice with each win and the wallet pays it at once. Nothing is locked ahead, no channel slot is
 held between wins, and a seller that leaves leaves nothing stuck. The gateway offers it beside
 tickets for every route whose pieces cost less than a win, and the wallet chooses: tickets for a
@@ -263,7 +284,9 @@ tickets and the lottery on both sides, pay with work, and the services and packa
 `packaging/` holds the Umbrel and StartOS apps of the wallet. `container/` and `docs/CONTAINER.md`
 cover the images. `docs/ENGINEERING.md` has the design notes, conformance results and measurements
 of the on-chain channel and the hub, as history: most of what it names is no longer in the tree.
-`docs/LIMITS.md` has the stated limits and open items.
+`docs/LIMITS.md` has the stated limits and open items. `reports/` holds the reports the regtest
+scripts wrote on their latest runs, as they were written: our own runs, on one host
+(`reports/README.md`).
 
 ## Build
 
@@ -272,13 +295,26 @@ cargo test -j2 --workspace
 cargo build --release -p xbt-signer -p xbt-wallet-mcp -p xbt-wallet-ui
 ```
 
-Rust stable; libsecp256k1 is built from source. Cross builds (Linux x86_64, aarch64, armv7, riscv64,
+Rust stable; libsecp256k1 is built from source. The workspace builds, tests and passes clippy on
+Rust 1.98.0, which is what `.github/workflows/ci.yml` runs on every push and pull request, and
+builds and tests on 1.91.1. The minimum stated in `Cargo.toml` (1.89) is not right today: a locked
+dependency (`ruint` 1.20.1) needs 1.90. Cross builds (Linux x86_64, aarch64, armv7, riscv64,
 macOS, Windows) use zig as the C compiler: see `docs/ENGINEERING.md`.
 
-The Lightning regtest scripts in `scripts/` (tickets, the gateway, the lottery, the Lightning
-rail) need Docker; they build the Lightning Fork lab under `run/`. The others need a Bitcoin Knots
-29.4.2 build for XBT (`XBT_BIN`). `scripts/mcp/verify_agp030.sh` and `scripts/ui/regtest_ui.sh`
-also use the Python reference implementations linked above.
+What each script needs beyond this repository:
+
+| Scripts | Need | Can someone outside the project run them? |
+|---|---|---|
+| The Lightning regtest scripts: `ln_ticket_regtest.sh`, `gateway_regtest.sh`, `ticket_book_regtest.sh`, `ticket_e2e_regtest.sh`, `lottery_regtest.sh`, `ln_rail_regtest.sh`, `demo_film.sh` | Docker with compose and python3 (the demo also ffmpeg). They fetch and build the Lightning Fork lab under `run/` | Yes. The reports of our latest runs are in `reports/` |
+| `container_test.sh`, `ui/regtest_ui.sh` | A Bitcoin Knots 29.4.2 build for XBT (`XBT_BIN`), Docker | Yes, with that build |
+| `mcp/verify_agp030.sh`, `ui/regtest_ui.sh`, the vector generators (`gen_*.py`) | The Python references linked above, at the paths their headers name (`B2_TREE`, `XBT402_B1`); `gen_unified_sighash_ext.py` needs a Knots source tree instead | Yes |
+| The cross builds: `build_matrix.sh`, `oci_build.sh`, `cmp_clean_build.sh`, `work_matrix.sh` | zig as the C compiler, from the `ziglang` Python wheel in a virtual environment (`XBT_ZIG_PY`; no version of it is pinned in this tree). `cmp_clean_build.sh` also needs cargo-zigbuild 0.23.4 | Yes |
+| The pay-with-work scripts: `work_conformance.sh`, `work_interop.sh`, `work_nta.sh`, `relay_container_test.sh` | The pay-with-work specification tree (XBT-053) and a pool server (`primed`) built from a branch that is not published; `work_nta.sh` also calls a helper of the machine it was written on, and goes on without it | **No.** Nothing they report can be reproduced outside the project until those are published |
+| `tools/lazarus-crosscheck` (headers and proof of work against the pool's own Rust) | A checkout of [AwokenLazarus/Bitcoin](https://github.com/AwokenLazarus/Bitcoin) at a fixed place outside this repository: `../../Bitcoin` seen from this repository's root, two directories up. It is not a workspace member, so the workspace builds and tests without it | Yes, with that checkout in that place |
+
+Several scripts have defaults that point into the directory layout of the machine they were
+written on (`$HOME/xbt-rnd/...`); each takes the path from an environment variable its header
+names.
 
 ## License
 

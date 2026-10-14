@@ -2,7 +2,11 @@
 
 The stream-ticket seller gateway: one program beside a Lightning node. Point it at an HTTP
 service you already run, set a price per route, and buyers pay piece by piece with stream tickets.
-The service needs no change. The wire is `docs/TICKETS.md` (draft v0); what the gateway does not
+The service needs no change, and nor does the node if it is of the lnd family (lnd and its forks):
+the gateway uses that node's hold invoices over its REST interface, and has run against Lightning
+Fork only. **It cannot make a Core Lightning node a seller.** Such a node has no hold-invoice
+call, neither published hold plugin fits, nothing on it cancels a held ticket before the ticket
+expires, and the gateway does not speak its interface (`docs/TICKETS.md`, section 8). The wire is `docs/TICKETS.md` (draft v0); what the gateway does not
 do is in `docs/LIMITS.md`, section "Seller gateway".
 
 Status: regtest only. It has run against Lightning Fork nodes on one host
@@ -17,9 +21,11 @@ test buyer.
    size, how many tickets a buyer may hold, how long a ticket lives, who goes first, the price rule.
 2. `POST /x402/ticket/lock` registers a hold invoice on your node for each hash the buyer sends.
    The buyer's node pays them; each is now a locked ticket. Only the buyer knows the secrets.
-3. A paid request carries a secret. The gateway hashes it, finds the ticket in that buyer's
-   session, checks the node holds it (`ACCEPTED`) with more than 24 blocks left, settles it on
-   your node, and only then passes the request to your service.
+3. The buyer releases a ticket by sending its secret: in `POST /x402/ticket/release`, which is
+   what the wallet of this tree does, or inside a paid request, which the gateway also takes.
+   The gateway hashes it, finds the ticket in that buyer's session, checks the node holds it
+   (`ACCEPTED`) with more than 24 blocks left, settles it on your node, and only then serves on
+   it.
 4. The answer is metered against the session's balance in millisatoshi and comes with a receipt
    signed by the gateway's receipt key. A long answer stops when the buyer stops releasing tickets.
 5. Tickets of a buyer that goes quiet are cancelled, so they stop holding your inbound capacity.
@@ -119,8 +125,10 @@ an answer priced by its size and each second of an answer priced by its time is 
 the piece the buyer sends a random value; the gateway reveals the next value of a chain it
 committed to when the session opened, and the two together decide whether the piece won. Most
 pieces win nothing. A piece that wins gets an ordinary invoice of `win_msat` from your node, and
-the buyer pays it at once. The odds are the piece's price over the win, so what you are paid is
-your price on average: a piece of a tenth of a sat wins a 64-sat payment one time in 640.
+the buyer pays it at once. The odds are the piece's price over the win, so what you can expect to
+be paid is your price: a piece of a tenth of a sat wins a 64-sat payment one time in 640. What
+you are actually paid comes near that only over many wins: within 20% takes about 68 wins
+(4,350 sat at this win size), nine times in ten.
 
 A route is offered this way only if its dearest piece (its request, one second, or `piece_bytes`
 of its body) costs less than `win_msat`. `GET /services` says which routes are.

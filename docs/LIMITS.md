@@ -86,7 +86,7 @@ limits are in the git history, last at commit `1ad0c48`. What the removal leaves
 
 The sentences of this section are about tickets as such, whoever builds on them. A ticket is a small Lightning payment locked along a
 route to a hash whose secret only the buyer knows (a hold invoice on the seller's node); the
-buyer releases it by putting the secret in a paid request. Each sentence below comes from the
+buyer releases it by sending the seller the secret. Each sentence below comes from the
 design's lab measurements: three Lightning Fork nodes on regtest, buyer and seller one routing
 node apart, default node settings. The wallet's ticket book and the seller's gateway have their own sections below.
 A sentence marked *(with Core Lightning)* comes from a later lab run with three nodes of the XBT
@@ -95,7 +95,10 @@ nodes, two of the Core Lightning nodes started with the values that binary has b
 mainnet; its driver is not in this tree. `docs/TICKETS.md`, section 11, has the table.
 
 - Money moves a ticket at a time (1,000 sat by default; a ticket that is held is at least 546
-  sat by the design's rule, and a node carries nothing below 1 sat). Pieces inside a ticket are
+  sat by the design's rule, and a node carries nothing below 1 sat). Decided and not yet built:
+  where a channel without anchors may be on the route, a held ticket will be at least
+  max(546, dust_limit + 663 × feerate_cap ÷ 1000) sat, which against a dust limit of 546 is 712,
+  2,204 and 8,834 sat at 1, 10 and 50 sat/vB (computed; `docs/TICKETS.md`, section 6.1). Pieces inside a ticket are
   metered, and the unused part of the ticket in use is trusted to the seller.
 - A held ticket takes one HTLC slot of every channel on its route, and a channel's slots are
   shared by everyone who uses it. A channel carries 483 each way between Lightning Fork nodes
@@ -109,9 +112,15 @@ mainnet; its driver is not in this tree. `docs/TICKETS.md`, section 11, has the 
 - The defaults are therefore 2 tickets a session and at most half of a channel's slots in held
   tickets (15 of 30), in the wallet and in the gateway. One buyer holds tickets with 7 sellers at
   2 each, or 15 at 1 each, from one 30-slot channel; with the wallet's own rule (2 each with up
-  to 4 sellers of a task, 1 each beyond) it is 11. The earlier figure of 200 sellers from one
-  channel (400 tickets) was measured on 483-slot channels and holds only where every channel on
-  the way has 483.
+  to 4 sellers of a task, 1 each beyond) it is 11. That is the figure for held tickets. A larger
+  figure this project gave earlier is withdrawn: it was measured between two Lightning Fork
+  nodes, where a channel carries 483, and showed what one node accepts on one channel, not a
+  route.
+- A ticket takes a slot on every channel of its route, so what binds is the smallest channel on
+  the way, shared with every other buyer that crosses it. The defaults of the implementations,
+  as commonly documented and not checked by us beyond the two forks in the lab: lnd 483, Core
+  Lightning 30, LDK 50, eclair 30. Paying more sellers at once than that, as in a swarm, is the
+  lottery's job: a win is paid at once and holds no slot.
 - The half rule is a rule of this software, kept on the numbers each side can read of its own
   channels. Nothing makes another buyer, another seller or a routing node keep it, and a remote
   channel's slots cannot be read by anyone but its two ends.
@@ -120,26 +129,64 @@ mainnet; its driver is not in this tree. `docs/TICKETS.md`, section 11, has the 
   400, 600 and 1,000 sat held, a Core Lightning node's force close had outputs for 600 and 1,000
   only. Such a ticket cannot be claimed on chain and goes to the miners if that channel is
   force-closed while it is held. On a channel without anchors the limit also rises with the fee
-  rate (computed, not run: the forks open anchor channels by default).
+  rate, by the fee of 703 weight units on the receiving side: a 1,000-sat ticket has no output
+  there from about 2.6 sat/vB against a dust limit of 546 sat, and the smallest ticket with an
+  output is 722, 2,304 and 9,334 sat at 1, 10 and 50 sat/vB (computed, not run: the forks open
+  anchor channels by default; `docs/TICKETS.md`, section 6.1). A force close of such a channel
+  loses every ticket held on it that is below that, not one.
+- The dust rule is checked by the buyer's wallet on its own channel only. On a channel further
+  along the route nobody checks it: the routing node that offered the ticket there loses it in a
+  force close, and a seller that had settled it is not paid.
 - A node caps the dust it carries per channel: Core Lightning at 50,000 sat, Lightning Fork at
   500,000 sat with the channel's fee. *(with Core Lightning)* On a Core Lightning channel opened
   with 483 slots, 100 tickets of 500 sat locked and the next 30 failed; the buyer's node then
   found no route to that seller for a 1,000-sat ticket either. Lightning Fork's cap was not
   reached with 483 tickets of 300 sat.
 - Above the dust limit is not the same as worth claiming: a seller's claim of 3 tickets on
-  chain cost 900 to 1,700 sat at 1 sat/vB, so at higher fee rates a single 1,000-sat ticket
-  costs more to claim than it is worth.
+  chain cost 900 to 1,700 sat at 1 sat/vB (measured, anchor channels, regtest), so at higher fee
+  rates a single 1,000-sat ticket costs more to claim than it is worth. Scaled by the rate and
+  not run, that close costs more than its 3,000 sat from about 1.8 to 3.3 sat/vB, and the claim
+  transaction of one ticket alone (706 weight units) costs more than the ticket from about
+  5.7 sat/vB. An on-chain claim pays only in aggregate, with a channel balance or many tickets
+  behind it (`docs/TICKETS.md`, section 6.2).
+- A settled ticket is not yet income. The settle call's success is the seller's own node's word;
+  the money is the seller's when the upstream hop has fulfilled the HTLC or the seller has
+  claimed it on chain. A seller should not count it before that. The gateway counts a ticket
+  when the settle call returns and does not look at the channel.
+- Each held ticket with an output adds 172 weight units to the commitment transaction of every
+  channel on its route, and whoever funded the channel carries the fee out of its balance while
+  the ticket is held, and pays it in a force close: 43, 430 and 2,150 sat a ticket at 1, 10 and
+  50 sat/vB (computed). Measured on the lab at 1 sat/vB on an anchor channel: 4,635 sat of
+  commitment fee with 100 tickets pending.
 - The buyer can lose one ticket: a secret is spent when it leaves the wallet, and a seller can
-  take it and serve nothing.
+  take it and serve nothing. That bound does not move with the fee rate. What does is in
+  `docs/TICKETS.md`, sections 6.1 to 6.3: what a force close costs the buyer, a routing node, the
+  seller and the channel's funder at 1, 10 and 50 sat/vB, with and without anchors.
 - Unused tickets stay locked until the seller cancels them or they expire. Measured with 40-block
   tickets: 25 blocks with a seller that neither settles nor cancels, 51 blocks through one hop
   with a seller that went offline.
+- "No change to the node" means no change to an lnd-family node (lnd and its forks, of which
+  only Lightning Fork was run): a held ticket is that family's hold invoice. A Core Lightning
+  node cannot be a seller's node for held tickets today; the two sentences marked *(with Core
+  Lightning)* further down say why.
 - The seller needs a Lightning node with inbound capacity, and must stay online while tickets are
   locked: a seller offline when locked tickets expire had its channel force-closed (measured), and
   a ticket not settled 18 blocks before its expiry is cancelled by the seller's own node.
 - Tickets are held payments. A cancelled ticket pays routing nodes nothing for the capacity and
   the slot it held, which is the behaviour Lightning's jamming defences are designed against; so
   tickets have to stay few, small and short-lived.
+- The fallback, if the network adopts upfront fees or hold fees: tickets pay them, so a
+  cancelled ticket then costs its buyer something, and prepaid tickets or the lottery become
+  the only mode for strangers. Both are built. A routing node can also act on its own before
+  any such change, by raising its fees to a peer whose channel fills with held payments or by
+  closing that channel; nothing in this design prevents it.
+- A channel with a ticket pending cannot be closed co-operatively: every channel on a ticket's
+  route is kept from a clean close until the ticket is settled, cancelled or expired (from
+  BOLT 2; not run). The other way out is a force close.
+- Decided and not yet built: a session with a seller the owner has not named will start with one
+  prepaid ticket and hold tickets only after it, 1 at a time (2 with a named seller). Today
+  such a session opens with a held ticket where one fits, and a seller issues its first hold
+  invoice to a buyer that has paid nothing (`docs/TICKETS.md`, section 6.4).
 - BOLT 11 hold invoices only. The Lightning Fork's BOLT 12 offers have no hold path.
 - One hop was measured, on one host. Two or more hops, real network latency, mainnet routes and
   fees, a direct channel, and a force close with many tickets were not.
@@ -159,7 +206,10 @@ mainnet; its driver is not in this tree. `docs/TICKETS.md`, section 11, has the 
 ### The lottery: pay after a win
 
 A piece that costs less than a ticket is paid by a fair draw: it wins a payment of one fixed
-size (64 sat as shipped) with probability price ÷ that size, so the average paid is the price.
+size (64 sat as shipped) with probability price ÷ that size, so the expected payment is the
+price. Expected only: the spread of what is actually paid is about 1 over the square root of the
+wins expected between one buyer and one seller (41% at 6 wins, 12% at 68, 3% at 1,080;
+`docs/TICKETS.md`, section 9, has the arithmetic).
 Nothing is locked ahead; the buyer pays an ordinary invoice for each win. The gateway and the
 wallet build it (`docs/TICKETS.md`, section 9). Regtest only: `scripts/lottery_regtest.sh` runs
 the shipped binaries on Lightning Fork nodes whose channels carry 30 pending payments, one
@@ -190,6 +240,11 @@ involved no node.
   it nine days in ten, and 96% to 104% over a month; a seller earning 1,000 sat a day, 58% to
   141% on a day; a seller earning 100 sat a day gets no win on 21% of days. *(simulated)* A
   seller that earns less than one win from a buyer is usually paid nothing by it.
+- Through a routing node the wallet's floor makes every win at least 64 sat, so a small call is
+  mostly paid nothing and sometimes many times its price: a 10-sat call pays nothing about 85%
+  of the time and 64 sat or more otherwise, up to its luck cap of 152 sat (computed). The wallet
+  has no rule that keeps a call expecting few wins off the lottery, and nothing pools draws
+  across sellers.
 - A buyer's cost is uneven. Measured: a file priced at 381.5 sat, bought five times, cost
   520, 780, 390, 260 and 325 sat with routing fees. A download priced at 1,638 sat on 64-sat wins costs 1,152
   to 2,176 sat nine times in ten. *(simulated)* `max_sats` bounds what a call uses by the
@@ -350,9 +405,13 @@ wallet) and against a stand-in node in its tests.
   hold 2 sessions, 4,000 sat. Measured on the lab with the earlier caps: a buyer that locked 8
   tickets and released none held 8,000 sat for 16 s with the limit set to 15 s.
 - A held ticket is at least 546 sat: a config that offers held tickets below that is refused.
-  The gateway does not read its channels' dust limits; on a channel without anchors at a high
-  fee rate a 1,000-sat held ticket can still be below the limit (`docs/TICKETS.md`, section 11),
-  and nothing in the gateway notices.
+  The gateway does not read its channels' dust limits or their types; on a channel without
+  anchors a 1,000-sat held ticket is below the limit from about 2.6 sat/vB (computed;
+  `docs/TICKETS.md`, section 6.1), and nothing in the gateway notices. The fee-aware floor of
+  that section is decided and not built.
+- The gateway credits a held ticket when its node answers the settle call. It does not wait for
+  the channel peer to take the secret, so with the peer away its totals, and a receipt's
+  `releasedMsat`, can include tickets that still need an on-chain claim.
 - Prepaid tickets (`settle: "on-arrival"`, offered beside held ones unless `tickets.settle` says
   otherwise) are ordinary invoices, paid in full when they arrive. The buyer cannot have one
   back: what it bought and did not use is the seller's when the session is forgotten (24 hours
@@ -519,8 +578,10 @@ payer only: no socket method buys one. Run on regtest only (`scripts/ticket_book
   more likely to be caught in that instant than it was with a pool of 8.
 - For a moment after a ticket settles, `ticket_status` can show the node and the book as not
   agreeing: the node reports the payment settled before it has taken the HTLC off its channel.
-- The seller's node receives a 32-byte tag with every ticket (a random nonce and a MAC). It tells
-  the seller nothing about the wallet beyond what the payment hash already does.
+- The seller's node receives a 32-byte tag with every ticket (a random nonce and a MAC), in a
+  custom record of type 1953063787. The contents tell the seller nothing. The type does: no
+  other software uses it, so every ticket payment identifies this wallet software to the node
+  it pays. Routing nodes do not see the record.
 - The ticket rail trusts its own Lightning node as the Lightning rail does: a ticket the node
   reports failed is no longer counted as spent, and a fee the node reports is the fee booked. A
   settle is believed only with the preimage of the ticket's hash, and is never booked below the
@@ -600,6 +661,12 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
   invoice (where the Lightning rail is on). A seller that answers without a 402 is answered from
   the wallet's one unpaid request (`rule: free`, `rail: none`). A call with `max_sats` 0 pays
   nothing: a 402 is refused (`max_sats`).
+- A paid call is at least two requests, never one: `xbt402_pay` sends every call without
+  payment first, reads the seller's 402, and sends the request again with its payment, also on
+  an open session, and a request body goes twice. The on-chain channel this replaced carried the
+  payment in the first request. The 0.3 to 0.4 ms that paying added on the lab is a loopback
+  figure; over a real network it is one more round trip to the seller on every call, and more on
+  a call that releases a ticket or opens a session. None of that was measured.
 - `max_sats` bounds what a call uses, by the wallet's own count of the bytes and seconds it
   received. It does not bound what the call books: a ticket is released whole, so a call that
   uses 3 sat can book one ticket and its fee limit (1,015 sat with the defaults). The rest is a
@@ -612,7 +679,9 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
   origins are free to make, so under a task that pays any seller what bounds this is the task's
   budget and its cap per unnamed seller.
 - The wallet sends a secret only in `release`. A seller that takes a secret only with the request
-  it pays for cannot be paid; the gateway takes both.
+  it pays for cannot be paid; the gateway takes both. The draft says which a seller must
+  support: `release` (`docs/TICKETS.md`, sections 1 and 3). The terms have no field for it, and
+  `with-request` names both.
 - An entry that releases `after-verify` is not paid: the wallet passes it over and tries the
   next rail.
 - Held tickets are the wallet's first choice. It buys a prepaid ticket (`settle: "on-arrival"`)

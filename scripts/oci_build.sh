@@ -3,8 +3,9 @@
 #   xbt-signer, xbt-anchor-witness, xbt-wallet-mcp; AGP-040: xbt-wallet-ui, xbt-init; AGP-043: xbt-work-relay
 #   platforms linux/amd64, linux/arm64, linux/arm/v7, FROM scratch, static musl (zig), docs/CONTAINER.md
 #
-# Steps: build the static musl binaries for the three targets (release profile, cargo -j2 under the soak
-# rules); stage them with the shared base layer (container/mkbase.py); `docker buildx build` each image
+# Steps: build the static musl binaries for the three targets (release profile, --locked so that the
+# dependencies are the ones Cargo.lock names and a lockfile that is out of date stops the build, cargo -j2
+# under the soak rules); stage them with the shared base layer (container/mkbase.py); `docker buildx build` each image
 # for all three platforms into dist/oci/<image>.tar (an OCI archive with SOURCE_DATE_EPOCH = the commit
 # time and rewritten timestamps). With --load, also load the images into the local Docker: the amd64 ones as
 # <image>:agp038 (scripts/container_test.sh runs these), and every platform as <image>:<version> (the
@@ -53,13 +54,13 @@ if [ $CARGO = 1 ]; then
   for t in "${!ARCH[@]}"; do
     echo "== cargo build --release --target $t"
     if want xbt-signer || want xbt-anchor-witness; then
-      "${SOAK[@]}" cargo build -q -j2 --release --target "$t" -p xbt-signer --bin xbt-signer --bin xbt-anchor-witness
+      "${SOAK[@]}" cargo build -q -j2 --release --locked --target "$t" -p xbt-signer --bin xbt-signer --bin xbt-anchor-witness
     fi
-    if want xbt-wallet-mcp; then "${SOAK[@]}" cargo build -q -j2 --release --target "$t" -p xbt-wallet-mcp; fi
+    if want xbt-wallet-mcp; then "${SOAK[@]}" cargo build -q -j2 --release --locked --target "$t" -p xbt-wallet-mcp; fi
     if want xbt-wallet-ui || want xbt-init; then
-      "${SOAK[@]}" cargo build -q -j2 --release --target "$t" -p xbt-wallet-ui -p xbt-svc --bin xbt-wallet-ui --bin xbt-init
+      "${SOAK[@]}" cargo build -q -j2 --release --locked --target "$t" -p xbt-wallet-ui -p xbt-svc --bin xbt-wallet-ui --bin xbt-init
     fi
-    if want xbt-work-relay; then "${SOAK[@]}" cargo build -q -j2 --release --target "$t" -p xbt-work-relay --bin xbt-work-relay; fi
+    if want xbt-work-relay; then "${SOAK[@]}" cargo build -q -j2 --release --locked --target "$t" -p xbt-work-relay --bin xbt-work-relay; fi
   done
 fi
 for t in "${!ARCH[@]}"; do

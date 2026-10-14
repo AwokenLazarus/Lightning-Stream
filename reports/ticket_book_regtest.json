@@ -1,0 +1,621 @@
+{
+ "checks": [
+  {
+   "check": "setup: the Lightning rail is ready on lf1: chain verified, its one channel's funding proven",
+   "ok": true,
+   "saw": {
+    "ready": true,
+    "warnings": null
+   }
+  },
+  {
+   "check": "one: the seller's 402 opens a session of 2 tickets of 1,000 sat with a seller the owner named",
+   "ok": true,
+   "saw": {
+    "verdict": "allow",
+    "rail": "ticket",
+    "session": "ab_DrZBHgUbI0IZXYgEVyO_XwNIGu8oy",
+    "payee": "024f33d5fc2125ce968f1db14a75bdbfc6865d8efa68dc73999c06f987c407255f",
+    "origin": "",
+    "task": "stream",
+    "listed": true,
+    "ticket_msat": "1000000",
+    "pool": 2,
+    "state": "open",
+    "opened_ts": 1791943417.8774724,
+    "stopped_ts": 0.0,
+    "closed_ts": 0.0,
+    "why": "",
+    "http": false,
+    "prepaid_msat": "0",
+    "hold_until": 0.0,
+    "hold_why": "",
+    "slot_fails": 0,
+    "draws": false
+   }
+  },
+  {
+   "check": "one: the wallet reads its channel's slots from its node: 30, the smaller of the two numbers the node lists",
+   "ok": true,
+   "saw": {
+    "wallet": 30,
+    "node": {
+     "local_constraints": {
+      "max_accepted_htlcs": 30,
+      "dust_limit_sat": "354"
+     },
+     "remote_constraints": {
+      "max_accepted_htlcs": 483,
+      "dust_limit_sat": "354"
+     }
+    }
+   }
+  },
+  {
+   "check": "one: 2 tickets locked through the hop: ACCEPTED on the seller's node, in flight on the buyer's, nothing spent",
+   "ok": true,
+   "saw": {
+    "seller": {
+     "ACCEPTED": 2
+    },
+    "buyer_htlcs": 2,
+    "book": {
+     "tickets": 2,
+     "sats": 2000
+    },
+    "agree": {
+     "htlcs": 2,
+     "agree": true,
+     "in_book_not_on_node": [],
+     "on_node_not_in_book": []
+    },
+    "ledger": 0
+   }
+  },
+  {
+   "check": "one: the payment carries the wallet's tag to the seller's node and nothing else of the wallet's",
+   "ok": true,
+   "saw": {
+    "custom_records": [
+     "106823",
+     "1953063787"
+    ]
+   }
+  },
+  {
+   "check": "one: five paid requests, each with a secret the signer booked before returning it, each served",
+   "ok": true,
+   "saw": {
+    "http": [
+     200,
+     200,
+     200,
+     200,
+     200
+    ],
+    "booked_at_release": [
+     1015,
+     1015,
+     1015,
+     1015,
+     1015
+    ]
+   }
+  },
+  {
+   "check": "one: after each release one ticket is left and the pool asks for one more, which locks before the next request",
+   "ok": true,
+   "saw": {
+    "want_after_each_release": [
+     1,
+     1,
+     1,
+     1,
+     1
+    ],
+    "tickets_locked_in_all": 7,
+    "refill_s": [
+     0.035,
+     0.034,
+     0.041,
+     0.039,
+     0.043
+    ]
+   }
+  },
+  {
+   "check": "one: stop: 5 settled and 2 cancelled on both nodes, the book and the buyer's node agree, no HTLC left",
+   "ok": true,
+   "saw": {
+    "book": {
+     "failed": 2,
+     "settled": 5
+    },
+    "seller": {
+     "CANCELED": 2,
+     "SETTLED": 5
+    },
+    "buyer": {
+     "FAILED": 2,
+     "SUCCEEDED": 5
+    },
+    "node": {
+     "htlcs": 0,
+     "agree": true,
+     "in_book_not_on_node": [],
+     "on_node_not_in_book": []
+    }
+   }
+  },
+  {
+   "check": "one: the ledger holds what lf1 paid for the five, routing fees included, and nothing for the 2 that came back",
+   "ok": true,
+   "saw": {
+    "ledger_sats": 5010,
+    "node_cost_sats": 5010,
+    "fees_msat": 5005
+   }
+  },
+  {
+   "check": "liar: lock answers with another payee, amount, life, expiry, a hash of the seller's own, garbage, replayed invoices: nothing is paid",
+   "ok": true,
+   "saw": {
+    "refusals": {
+     "other_payee": {
+      "locked": 0,
+      "rules": [
+       "ticket_payee"
+      ]
+     },
+     "amount": {
+      "locked": 0,
+      "rules": [
+       "ticket_amount"
+      ]
+     },
+     "life": {
+      "locked": 0,
+      "rules": [
+       "ticket_blocks"
+      ]
+     },
+     "expiry": {
+      "locked": 0,
+      "rules": [
+       "ticket_expiry"
+      ]
+     },
+     "own_hash": {
+      "locked": 0,
+      "rules": [
+       "ticket_hash"
+      ]
+     },
+     "garbage": {
+      "locked": 0,
+      "rules": [
+       "ticket_invoice"
+      ]
+     },
+     "replay": {
+      "locked": 0,
+      "rules": [
+       "ticket_hash"
+      ]
+     }
+    },
+    "lf1_payments_before_after": [
+     44,
+     44
+    ],
+    "ledger_before_after": [
+     5010,
+     5010
+    ]
+   }
+  },
+  {
+   "check": "liar: terms above the owner's bounds refuse the seller; a seller that asks for 400 tickets gets the owner's 2",
+   "ok": true,
+   "saw": {
+    "terms": {
+     "ticket of 5,000 sat": "ticket_size",
+     "life of 2,016 blocks": "ticket_blocks",
+     "no feature bit 512": "ticket_feature_512",
+     "a way of settling nobody knows": "ticket_terms"
+    },
+    "pool_for_400": 2
+   }
+  },
+  {
+   "check": "liar: a seller the owner has not named is refused under a task for named sellers",
+   "ok": true,
+   "saw": "the owner has not named the seller 0210bc5ef68e7e0ce96144f49bcd9ce8966ea5861447eac0af3a211cbff40b118f and task \"stream\" pays only named sellers (the allowlist, or tickets.tasks.stream.admit \"any\")"
+  },
+  {
+   "check": "kill: after a kill of the signer the book is the node (2 in flight), the ticket it cannot vouch for is retired, and no secret is released again",
+   "ok": true,
+   "saw": {
+    "node": {
+     "htlcs": 2,
+     "agree": true,
+     "in_book_not_on_node": [],
+     "on_node_not_in_book": []
+    },
+    "book": {
+     "released": 1,
+     "retired": 1,
+     "settled": 1
+    },
+    "release_after": "ticket_session",
+    "used": [
+     200
+    ]
+   }
+  },
+  {
+   "check": "kill: the ledger never under-counts: the one used at what lf1 paid, the two still locked at their worst case",
+   "ok": true,
+   "saw": {
+    "ledger_sats": 3032,
+    "settled_sats": 1002,
+    "worst_case_each": 1015
+   }
+  },
+  {
+   "check": "kill: the seller cancels what is left: the bookings of the two go, the one that was used stays",
+   "ok": true,
+   "saw": {
+    "ledger_sats": 1002,
+    "book": {
+     "failed": 2,
+     "settled": 1
+    }
+   }
+  },
+  {
+   "check": "node: after a restart of the buyer's node its 2 tickets are still locked there and in the book",
+   "ok": true,
+   "saw": {
+    "node": {
+     "htlcs": 2,
+     "agree": true,
+     "in_book_not_on_node": [],
+     "on_node_not_in_book": []
+    },
+    "book": {
+     "locked": 2
+    },
+    "seller": {
+     "ACCEPTED": 2
+    },
+    "restart_s": 1.0
+   }
+  },
+  {
+   "check": "node: a ticket locked before the restart pays a request after it; stop returns the other",
+   "ok": true,
+   "saw": {
+    "http": 200,
+    "book": {
+     "failed": 1,
+     "settled": 1
+    },
+    "node": {
+     "htlcs": 0,
+     "agree": true,
+     "in_book_not_on_node": [],
+     "on_node_not_in_book": []
+    }
+   }
+  },
+  {
+   "check": "silent: a seller that neither settles nor cancels: its node gives the tickets up before their expiry, and the released one's booking goes",
+   "ok": true,
+   "saw": {
+    "booked_while_out": 1015,
+    "blocks_until_free": 25,
+    "locked_at": 145,
+    "book": {
+     "failed": 2
+    },
+    "ledger_after": 0
+   }
+  },
+  {
+   "check": "restore: a wallet put back from an older copy finds on lf1 the 3 tickets its book has never held, and its book is the node again",
+   "ok": true,
+   "saw": {
+    "recovered": 3,
+    "node": {
+     "htlcs": 3,
+     "agree": true,
+     "in_book_not_on_node": [],
+     "on_node_not_in_book": []
+    },
+    "book": {
+     "failed": 21,
+     "settled": 9,
+     "retired": 3
+    }
+   }
+  },
+  {
+   "check": "restore: nothing spent is missing from the ledger: the two settled at what lf1 paid, the three in flight at their worst case",
+   "ok": true,
+   "saw": {
+    "ledger_before_restore": 5049,
+    "ledger_after": 5049,
+    "settled_sats": 2004
+   }
+  },
+  {
+   "check": "restore: no ticket of the old book is released by the restored wallet",
+   "ok": true,
+   "saw": "ticket_session"
+  },
+  {
+   "check": "restore: once every ticket is settled or cancelled the ledger is exactly what lf1 paid",
+   "ok": true,
+   "saw": {
+    "ledger_sats": 3006,
+    "node_cost_sats": 3006
+   }
+  },
+  {
+   "check": "many: 15 sellers open under the swarm task, 14 the owner has not named and one it has, with a pool of 1 each",
+   "ok": true,
+   "saw": {
+    "allow/pool 1/named False": 14,
+    "allow/pool 1/named True": 1
+   }
+  },
+  {
+   "check": "many: 15 tickets locked with 15 sellers at once, the book and lf1 agree",
+   "ok": true,
+   "saw": {
+    "locked": 15,
+    "seconds": 0.21,
+    "node": {
+     "htlcs": 15,
+     "agree": true,
+     "in_book_not_on_node": [],
+     "on_node_not_in_book": []
+    },
+    "book": {
+     "tickets": 15,
+     "sats": 15000
+    }
+   }
+  },
+  {
+   "check": "many: with 15 tickets held, half of the channel's 30 slots, a further seller gets no held ticket",
+   "ok": true,
+   "saw": {
+    "verdict": "deny",
+    "rule": "ticket_sellers",
+    "reason": "15 sessions are open (tickets.max_sellers)",
+    "held_budget": null,
+    "slots": null
+   }
+  },
+  {
+   "check": "many: one paid request to each of 15 sellers, then stop: 15 settled, 0 cancelled, the book and lf1 agree, fees booked",
+   "ok": true,
+   "saw": {
+    "http": {
+     "200": 15
+    },
+    "buyer": {
+     "SUCCEEDED": 15
+    },
+    "ledger_sats": 15030,
+    "node_cost_sats": 15030,
+    "node": {
+     "htlcs": 0,
+     "agree": true,
+     "in_book_not_on_node": [],
+     "on_node_not_in_book": []
+    }
+   }
+  },
+  {
+   "check": "slots: with 13 payments of others pending on its 30-slot channel the wallet holds its 2 tickets: 15 pending, half",
+   "ok": true,
+   "saw": {
+    "pending_on_channel": 15,
+    "book": {
+     "tickets": 2,
+     "sats": 2000
+    }
+   }
+  },
+  {
+   "check": "slots: after a release the next ticket is locked, and the channel is at half again",
+   "ok": true,
+   "saw": {
+    "pending_on_channel": 15
+   }
+  },
+  {
+   "check": "slots: with the channel past half, a lock is refused as ticket_slots, nothing is sent to the node, and the session waits",
+   "ok": true,
+   "saw": {
+    "lock": {
+     "locked": 0,
+     "refused": [
+      {
+       "hash": "7c5012843ce78ce90f3e02ddf5b30fd211287891aa01ba1424f89fe200bf5af4",
+       "rule": "ticket_slots",
+       "reason": "with this ticket the wallet would hold more than half of the pending payments a channel it may leave on carries (15 of 30; 1 held now, room for 0 more)"
+      }
+     ]
+    },
+    "session": {
+     "pool": 2,
+     "hold_why": "ticket_slots",
+     "slot_fails": 0
+    },
+    "pending_on_channel": 15
+   }
+  },
+  {
+   "check": "slots: a new session with another seller holds nothing while the channel is at half",
+   "ok": true,
+   "saw": {
+    "verdict": "deny",
+    "rule": "ticket_slots",
+    "slots": 30,
+    "held_budget": 15,
+    "held_now": 2
+   }
+  },
+  {
+   "check": "slots: the others' payments are cancelled and the session stopped: the channel is empty and the book agrees with the node",
+   "ok": true,
+   "saw": {
+    "node": {
+     "htlcs": 0,
+     "agree": true,
+     "in_book_not_on_node": [],
+     "on_node_not_in_book": []
+    },
+    "payments_sent_in_this_check": 17
+   }
+  },
+  {
+   "check": "full: a ticket that finds no slot on the way fails on the buyer's node, and the session holds less each time: a wait of 30 s, of 60 s, and after the third round nothing is held with that seller",
+   "ok": true,
+   "saw": [
+    {
+     "offered": 1,
+     "in_flight_at_first": 1,
+     "failed_as": [
+      "FAILURE_REASON_NO_ROUTE"
+     ],
+     "pool": 1,
+     "slot_fails": 1,
+     "hold_why": "ticket_slots",
+     "wait_s": 30
+    },
+    {
+     "offered": 1,
+     "in_flight_at_first": 0,
+     "failed_as": [
+      "FAILURE_REASON_NO_ROUTE"
+     ],
+     "pool": 1,
+     "slot_fails": 2,
+     "hold_why": "ticket_slots",
+     "wait_s": 60
+    },
+    {
+     "offered": 1,
+     "in_flight_at_first": 1,
+     "failed_as": [
+      "FAILURE_REASON_NO_ROUTE"
+     ],
+     "pool": 0,
+     "slot_fails": 3,
+     "hold_why": "ticket_route_full",
+     "wait_s": 600
+    }
+   ]
+  },
+  {
+   "check": "full: a new session with that seller holds nothing for ten minutes, and nothing was spent or is locked",
+   "ok": true,
+   "saw": {
+    "rule": "ticket_route_full",
+    "locked": {
+     "tickets": 0,
+     "sats": 0
+    }
+   }
+  },
+  {
+   "check": "dust: a held ticket below 546 sat is refused; 546 sat is held; a seller that would go lower is asked for its full size",
+   "ok": true,
+   "saw": {
+    "545,999 msat": {
+     "verdict": "deny",
+     "rule": "ticket_dust",
+     "ticket_msat": null
+    },
+    "64 sat": {
+     "verdict": "deny",
+     "rule": "ticket_dust",
+     "ticket_msat": null
+    },
+    "64 sat as the smallest of a seller that lets the buyer choose": {
+     "verdict": "allow",
+     "rule": null,
+     "ticket_msat": "1000000"
+    },
+    "546 sat": {
+     "verdict": "allow",
+     "rule": null,
+     "ticket_msat": "546000"
+    }
+   }
+  },
+  {
+   "check": "surface: the wallet's macaroon for lf1 is the Lightning rail's four permissions and nothing more",
+   "ok": true,
+   "saw": [
+    "info:read",
+    "offchain:read",
+    "offchain:write",
+    "onchain:read"
+   ]
+  },
+  {
+   "check": "surface: the MCP offers ticket_status and ticket_stop only when the operator turns them on, and never a tool that locks or releases",
+   "ok": true,
+   "saw": {
+    "with": [
+     "ticket_status",
+     "ticket_stop"
+    ],
+    "without": 6
+   }
+  }
+ ],
+ "measured": {
+  "routes_known_after_s": 27,
+  "buyer_channel": {
+   "local_constraints": {
+    "max_accepted_htlcs": 30,
+    "dust_limit_sat": "354"
+   },
+   "remote_constraints": {
+    "max_accepted_htlcs": 483,
+    "dust_limit_sat": "354"
+   },
+   "commitment_type": "ANCHORS",
+   "fee_per_kw": "253"
+  },
+  "one_lock_2_s": 0.035,
+  "one_refill_1_s": 0.039,
+  "silent_blocks_until_free": 25,
+  "many_lock_s": 0.21,
+  "many_tickets": 15,
+  "full_filled_with": {
+   "IN_FLIGHT": 500
+  },
+  "full_pending_on_the_sellers_channel": 483,
+  "full_failure_reasons": [
+   "FAILURE_REASON_NO_ROUTE"
+  ],
+  "requests_sent_again_ticket_not_locked": 11
+ },
+ "paid_invoices": [
+  "lnbcrt10u1p4vachepp5725sz83c0g7wgtjrgyayv8qcp2qxg4yxpgdrhc7wtugr66dl6zjqdqqcqzpgxqzpusp5z0kg8q7xm8fzqhsxm2lsqm540mspgelcyd7037ggh8znh486cqms9r8yqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqpqysgqju2d8mf7dnvq5l7h5yd2ttjljdrpd5g3vkrf8027e2xwg4dmgngykcnxqlfhd8y72yw80hewftj6vxcsnjq6h7mth0s59zgddc9y4cqp63v5hu",
+  "lnbcrt10u1p4vachepp5kawjlf9mrtvtsj2xxw05x8xsqrsma5acx6tnhauqvyavq2f7hlcsdqqcqzpgxqzpusp5zgelwpmrjrk6qwl2d9e58e8n7p9m25h9la0kjg59zskucsrwuh2q9r8yqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqpqysgqz6nn4hudm28dn5rlqxt85g9e0v0h0xt300g0tlvzv98mgavfy7rjh9jdkh28gepqy83dxc8ert479gaejum5g3rdxj6gyqj2rfyyyecqg9tpvc",
+  "lnbcrt10u1p4vach6pp5f9mscmnxnphys75c9z39pl0e4sfhf0p3f8nv5zld086z2x4jp3wsdqqcqzpgxqzpusp59z2ynhdax9p922ncqunnnnulvj9y8hw8fgp8ycq9yvhqngz9u5as9r8yqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqpqysgqs23fck5hg5ljqmpav6qvlk9mrd8xld8gsvv9asmpaq6vyyqujnfz98sm7u7e69mau5rshurhgellzmxtk6r8f75rf9n6au53ypjd6esqkq4ydm",
+  "lnbcrt10u1p4vach6pp5g3wgf2x3sunnzg53etuphaf8zxu8ajyzpmszju4ydukfdl3zh7wsdqqcqzpgxqzpusp5cu5nzz9jdgks3wexe6dzjs6mfzna2hws58dq3dkc9wjlkyug2yss9r8yqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqpqysgqfwwart0mwfrkttvnuwd3vlwnp0jg2jwnls30yhv859a6h3lajdhqddqasl6hmrwgqv4sm9derhtx65mluenlyh5t4kx0rc068q4y93qqj0c7wj",
+  "lnbcrt10u1p4vach6pp5pfah278rec0h5mleh2sldu3ktfxckh8zpdmgxj9ecmnxvaf3kclqdqqcqzpgxqzpusp5quaqyvxq2jyfeegjs6pskknw7eyyde4gnaslw9lvr5ln4mpe8lys9r8yqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqpqysgqanhudht6xg0ypkwcyq0q3dzc7t7mpag9m8usydcg3q9wq0tpdmcz25wpwyp58alt4dm0hycy8c4x6xga5fcxr25hwntpflyzyhqpjcqql2sfw7"
+ ],
+ "failed": [],
+ "seconds": 322
+}

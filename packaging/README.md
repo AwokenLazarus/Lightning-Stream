@@ -2,7 +2,12 @@
 
 Side-load packages of the agent wallet (signer, anchor witness, MCP server, web UI), built on the
 container standard in `docs/CONTAINER.md` and the one image set `scripts/oci_build.sh` makes. **Local only:** nothing is pushed to a registry, and nothing is submitted to the Umbrel App Store or
-the Start9 marketplace. That submission is Mike's call.
+the Start9 marketplace. That submission is the project owner's decision.
+
+**Two things these packages do not do.** The wallet in them cannot pay a seller: it pays over
+Lightning only, and neither package connects it to a Lightning node ("Not done, and gaps"
+below). And there is no package and no image of the seller gateway (`xbt-gateway`); a seller
+builds and runs it from source (`crates/xbt-gateway/README.md`).
 
 The hub was retired on 2026-10-11: payments between parties route over ordinary Lightning instead. Its
 code is in the git history (last at commit 0911cc0). Its Umbrel app, its StartOS toggle and its tests are
@@ -36,8 +41,8 @@ packaging/startos/test-startos.sh          # RESULT PASS: build + inspect + regt
 scripts/verify_agp040.sh                   # all of it, plus the unit tests and AGP-038's container test
 ```
 
-The StartOS build needs `start-cli` 2.1.0 (`~/.local/opt/start-cli/start-cli`, from the start-technologies
-releases) and a packaging workspace outside the repo (`~/.local/share/xbt-startos-ws`; its `.startos/` holds
+The StartOS build needs `start-cli` 2.1.0 (`START_CLI`, by default `~/.local/opt/start-cli/start-cli`; from the
+start-technologies releases) and a packaging workspace outside the repo (`~/.local/share/xbt-startos-ws`; its `.startos/` holds
 the key that signs the package, so it is never committed).
 
 ## What the apps do on a box
@@ -136,9 +141,9 @@ applied there.
   - one shared network namespace;
   - init as a one-shot;
   - image users.
-- **Neither** replaces an install on a real box. That needs a box Mike chooses.
+- **Neither** replaces an install on a real box. That needs a box the project owner chooses.
 
-## Side-load (a pilot, when Mike approves)
+## Side-load (a pilot, when the project owner approves)
 
 - **Umbrel:** `packaging/umbrel/bundle.sh` writes `dist/umbrel/`: the store folder, `images-amd64.tar`,
   `images-arm64.tar` and `SHA256SUMS`. See its README.txt. umbrelOS adds community stores by git URL, so
@@ -156,7 +161,7 @@ applied there.
   package tests no longer contain a paid call: where it was they check the agent's tool list and
   balance, and custody of the hot key across a restart and a restore.
 
-- No install on a real Umbrel or StartOS box (needs Mike). The StartOS build targets StartOS 0.4
+- No install on a real Umbrel or StartOS box (not done yet). The StartOS build targets StartOS 0.4
   (`osVersion` 0.4.0-beta.10 in the manifest, start-sdk 2.0.9).
 - The XBT node:
   - on Umbrel, the wallet needs the stand-in, **amd64-only**, until CMP-098 (documented dependency:

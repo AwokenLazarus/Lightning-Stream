@@ -38,7 +38,9 @@ released inside an HTTP request, under an owner's signed policy), the policy wal
 [`TICKETS.md`](TICKETS.md), the XBT binding of x402, the lottery as it is built (Rivest's hash
 chain on the seller's side and a value of the buyer's after each piece, with a win paid by an
 ordinary Lightning invoice and nobody holding money for the winner: [`TICKETS.md`](TICKETS.md),
-section 9), and the way the sealed draw's parts are put together. The argument that the built
+section 9), and the way the sealed draw's parts are put together. The lottery as it is built
+takes nothing from reference 44: that paper is cited for the win that pays itself, which is
+designed and not built. The argument that the built
 lottery's draw is fair, and the sealed draw, are unreviewed. An external review of the earlier design, by
 Chris Guida, found serious issues (see the README) and is the reason this is built on Lightning.
 
