@@ -50,6 +50,13 @@ shows your channel balances, your node's payments and what it forwarded, to whoe
 gateway's files. Without it the gateway keeps to the numbers in its config, which assume a
 channel that carries 30 pending payments.
 
+The gateway takes a ticket's secret only while more than 24 blocks are left before it expires:
+your node cancels a held ticket itself a number of blocks before expiry (lnd's
+`invoices.holdexpirydelta`: 18 on the Lightning Fork node at its default, 12 on upstream lnd),
+and 6 more are kept for a settle that has to go on chain. The node does not say what it is set
+to, so tell the gateway if yours is not 18: `"node": {"hold_expiry_delta": 12, ...}`. Above 18 the
+gateway does not start: lower the node's setting.
+
 ```bash
 cargo build --release -p xbt-gateway
 target/release/xbt-gateway --check gateway.json   # reads the config and the macaroons, says what the caps cost

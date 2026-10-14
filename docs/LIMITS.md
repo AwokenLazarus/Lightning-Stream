@@ -375,6 +375,12 @@ wallet) and against a stand-in node in its tests.
   a request is answered 503 and the secret is good again later.
 - The 24-block margin is checked against the height the node last reported, which is asked for
   twice a second: a block that arrived since is not counted.
+- The margin rests on when the node cancels a held ticket by itself (lnd's
+  `invoices.holdexpirydelta`), which no call of the gateway's macaroons can read. The gateway
+  takes the runner's word for it (`node.hold_expiry_delta`, 18 as the Lightning Fork node ships)
+  and refuses to start above 18. A runner who writes a smaller number than the node's has a
+  margin that leaves less than 6 blocks for a settle that has to go on chain, and nothing
+  notices.
 - The gateway's defaults are sized for an inbound channel that carries 30 pending payments (a
   channel with a Core Lightning node at its default): a session holds 2 tickets, and all
   sessions together 15 (`caps.max_held_tickets`, half of `caps.inbound_slots`). A buyer beyond

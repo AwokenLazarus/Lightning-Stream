@@ -21,10 +21,18 @@ pub const FEATURE_BLAKE2B: u64 = 512;
 /// Where the session endpoints live on the seller's origin unless its terms say otherwise.
 pub const SESSION_PATH: &str = "/x402/ticket";
 pub const RECEIPT_TAG: &str = "xbt402/ticket-receipt/v0";
+/// How many blocks before a held invoice's HTLC expires the seller's node cancels it, unless its
+/// runner set otherwise: lnd's `invoices.holdexpirydelta`, which is 18 on the Lightning Fork node
+/// this was built against (upstream lnd's default is 12). A runner's node may differ; the gateway
+/// takes the runner's word for it (`node.hold_expiry_delta`) and checks it against the margin.
+pub const HOLD_EXPIRY_DELTA: u32 = 18;
+/// The blocks of the margin beyond the node's own cancel: for a settle that has to go on chain.
+pub const SETTLE_CHAIN_BLOCKS: u32 = 6;
 /// A ticket is used only while more than this many blocks are left before its HTLC expires: the
-/// seller's node cancels a held invoice 18 blocks before expiry, and 6 more are for a settle that
-/// has to go on chain.
-pub const SETTLE_MARGIN_BLOCKS: u32 = 24;
+/// seller's node cancels a held invoice [`HOLD_EXPIRY_DELTA`] blocks before expiry, and
+/// [`SETTLE_CHAIN_BLOCKS`] more are for a settle that has to go on chain. A buyer stops releasing
+/// a ticket one block before this, so it is one number for both sides, not a setting.
+pub const SETTLE_MARGIN_BLOCKS: u32 = HOLD_EXPIRY_DELTA + SETTLE_CHAIN_BLOCKS;
 /// The node takes no hold invoice with a final CLTV delta of this or less.
 pub const MIN_TICKET_BLOCKS: u32 = 24;
 /// How long an unpaid ticket invoice may wait to be paid, in seconds.

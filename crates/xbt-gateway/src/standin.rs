@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use crate::node::{Channel, Hash, Info, Invoice, InvoiceState, Node, NodeError};
 
 /// The node cancels a held invoice this many blocks before its HTLC expires.
-pub const HOLD_EXPIRY_DELTA: u32 = 18;
+pub const HOLD_EXPIRY_DELTA: u32 = xbt402::ticket::HOLD_EXPIRY_DELTA;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Held {

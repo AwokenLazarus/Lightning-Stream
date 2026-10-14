@@ -6,8 +6,9 @@ use std::time::Duration;
 
 use serde_json::{Map, Value};
 use xbt402::ticket::{
-    held_budget, DEFAULT_CHANNEL_SLOTS, MAX_CHANNEL_SLOTS, MIN_HELD_TICKET_MSAT, MIN_TICKET_BLOCKS,
-    SESSION_PATH, SETTLE_MARGIN_BLOCKS, SETTLE_ON_ARRIVAL, SETTLE_ON_USE,
+    held_budget, DEFAULT_CHANNEL_SLOTS, HOLD_EXPIRY_DELTA, MAX_CHANNEL_SLOTS, MIN_HELD_TICKET_MSAT,
+    MIN_TICKET_BLOCKS, SESSION_PATH, SETTLE_CHAIN_BLOCKS, SETTLE_MARGIN_BLOCKS, SETTLE_ON_ARRIVAL,
+    SETTLE_ON_USE,
 };
 
 use crate::book::Caps;
@@ -116,6 +117,10 @@ pub struct NodeConfig {
     /// on held tickets itself. Not the default: the permission also shows the node's balances,
     /// its payments and what it forwarded.
     pub channels_macaroon: Option<PathBuf>,
+    /// How many blocks before a held ticket's expiry the node cancels it (lnd's
+    /// `invoices.holdexpirydelta`): the runner's word, [`HOLD_EXPIRY_DELTA`] unless it says
+    /// otherwise. The node does not tell it, and the margin rests on it.
+    pub hold_expiry_delta: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -308,6 +313,7 @@ impl Config {
                 "macaroon",
                 "info_macaroon",
                 "channels_macaroon",
+                "hold_expiry_delta",
             ],
         )?;
         let node = NodeConfig {
@@ -316,7 +322,19 @@ impl Config {
             macaroon: PathBuf::from(req_str(n, "macaroon")?),
             info_macaroon: PathBuf::from(req_str(n, "info_macaroon")?),
             channels_macaroon: opt_str(n, "channels_macaroon")?.map(PathBuf::from),
+            hold_expiry_delta: num32(n, "hold_expiry_delta", HOLD_EXPIRY_DELTA)?,
         };
+        // the margin is one number for both sides (a buyer stops releasing a ticket a block before
+        // it), so it is not moved to fit a node: a node that cancels held tickets earlier than the
+        // margin allows for leaves no time for a settle that has to go on chain, and is refused
+        if node.hold_expiry_delta + SETTLE_CHAIN_BLOCKS > SETTLE_MARGIN_BLOCKS {
+            return Err(format!(
+                "node.hold_expiry_delta {}: the gateway takes a ticket's secret only while more than {SETTLE_MARGIN_BLOCKS} blocks are left, and keeps {SETTLE_CHAIN_BLOCKS} of them for a settle that has to go on chain. A node that cancels held tickets more than {} blocks before expiry leaves too few: set its invoices.holdexpirydelta to {} or less",
+                node.hold_expiry_delta,
+                SETTLE_MARGIN_BLOCKS - SETTLE_CHAIN_BLOCKS,
+                SETTLE_MARGIN_BLOCKS - SETTLE_CHAIN_BLOCKS
+            ));
+        }
 
         let empty = Map::new();
         let t = match top.get("tickets") {
@@ -753,6 +771,11 @@ mod tests {
             "the gateway does not read channels unless asked"
         );
         assert_eq!(
+            (c.node.hold_expiry_delta, c.caps.margin_blocks),
+            (18, 24),
+            "the fork's node cancels 18 blocks before expiry; 6 more for a settle on chain"
+        );
+        assert_eq!(
             (
                 c.caps.max_sessions,
                 c.caps.sessions_per_address,
@@ -863,6 +886,26 @@ mod tests {
         assert_eq!((c.held, c.prepaid), (true, false));
         let c = with(&|v| v["node"]["channels_macaroon"] = json!("c")).unwrap();
         assert_eq!(c.node.channels_macaroon, Some(PathBuf::from("c")));
+    }
+
+    #[test]
+    fn the_nodes_hold_expiry_delta_is_the_runners_word_and_is_checked_against_the_margin() {
+        let with = |d: Value| {
+            let mut v = base();
+            v["node"]["hold_expiry_delta"] = d;
+            Config::from_json(&v)
+        };
+        // upstream lnd's 12, and anything up to the fork's 18: the margin stays 24, with room to spare
+        for d in [0u32, 12, 18] {
+            let c = with(json!(d)).unwrap();
+            assert_eq!((c.node.hold_expiry_delta, c.caps.margin_blocks), (d, 24), "{d}");
+        }
+        // a node that cancels 19 or more blocks before expiry leaves fewer than 6 for a settle on chain
+        for d in [19u32, 24, 40] {
+            let e = with(json!(d)).unwrap_err().to_string();
+            assert!(e.contains("holdexpirydelta to 18 or less") && e.contains("on chain"), "{d}: {e}");
+        }
+        assert!(with(json!("18")).is_err() && with(json!(-1)).is_err());
     }
 
     #[test]

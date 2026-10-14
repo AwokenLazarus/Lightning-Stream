@@ -57,11 +57,13 @@ fn run(args: &[String]) -> Result<(), String> {
     }
     let held_sat = u64::from(cfg.caps.max_held).saturating_mul(cfg.caps.ticket_msat) / 1000;
     eprintln!(
-        "xbt-gateway: chain {}, {} routes, tickets of {} msat living {} blocks; at most {} sessions ({} per address) of {} tickets",
+        "xbt-gateway: chain {}, {} routes, tickets of {} msat living {} blocks, used while more than {} are left (the node cancels a held one {} before expiry: node.hold_expiry_delta); at most {} sessions ({} per address) of {} tickets",
         cfg.chain,
         cfg.routes.len(),
         cfg.caps.ticket_msat,
         cfg.ticket_blocks,
+        cfg.caps.margin_blocks,
+        cfg.node.hold_expiry_delta,
         cfg.caps.max_sessions,
         cfg.caps.sessions_per_address,
         cfg.caps.max_tickets,
