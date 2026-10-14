@@ -765,7 +765,9 @@ Paying by lottery is Wheeler's and Rivest's idea. The seller's hash chain is Riv
 shape (a commitment by the receiver, a value of the payer's, a hash of both under a threshold)
 is the one Orchid and Livepeer use against a contract, and a win that pays itself over Lightning
 was first set out by Gerhart, Taylor and Thyagarajan in 2026 ([`REFERENCES.md`](REFERENCES.md),
-33 to 44). What is ours is the binding to a metered HTTP answer and to an ordinary Lightning
+33 to 44). The lottery built here uses none of that paper's construction (an oblivious
+pseudorandom function, adaptor signatures, a proof): it is cited for the form that is not
+built. What is ours is the binding to a metered HTTP answer and to an ordinary Lightning
 invoice with nobody holding money for the winner.
 
 **The fairness argument is this project's own and nobody else has reviewed it.** It takes

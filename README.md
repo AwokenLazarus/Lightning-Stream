@@ -155,7 +155,11 @@ time and 64 sat or more otherwise ([`docs/TICKETS.md`](docs/TICKETS.md), section
 arithmetic).
 Paying by lottery is an old idea and not ours: David Wheeler (1996) and Ronald Rivest (1997).
 
-**The first form is built: the buyer pays after a win.** The seller sends an ordinary Lightning
+**The first form is built: the buyer pays after a win.** It is the Wheeler and Rivest shape and
+nothing newer: the seller commits to a hash chain, the buyer adds a random value after each
+piece, and a hash of the two decides. It is not built on the 2026 paper named below and uses
+none of its construction; that paper is cited for the second form only, which is not built. The
+seller sends an ordinary Lightning
 invoice with each win and the wallet pays it at once. Nothing is locked ahead, no channel slot is
 held between wins, and a seller that leaves leaves nothing stuck. The gateway offers it beside
 tickets for every route whose pieces cost less than a win, and the wallet chooses: tickets for a
