@@ -125,8 +125,10 @@ an answer priced by its size and each second of an answer priced by its time is 
 the piece the buyer sends a random value; the gateway reveals the next value of a chain it
 committed to when the session opened, and the two together decide whether the piece won. Most
 pieces win nothing. A piece that wins gets an ordinary invoice of `win_msat` from your node, and
-the buyer pays it at once. The odds are the piece's price over the win, so what you are paid is
-your price on average: a piece of a tenth of a sat wins a 64-sat payment one time in 640.
+the buyer pays it at once. The odds are the piece's price over the win, so what you can expect to
+be paid is your price: a piece of a tenth of a sat wins a 64-sat payment one time in 640. What
+you are actually paid comes near that only over many wins: within 20% takes about 68 wins
+(4,350 sat at this win size), nine times in ten.
 
 A route is offered this way only if its dearest piece (its request, one second, or `piece_bytes`
 of its body) costs less than `win_msat`. `GET /services` says which routes are.

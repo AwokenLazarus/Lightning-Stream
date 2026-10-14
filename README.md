@@ -143,10 +143,16 @@ payer and the gateway do not do (the "Stream tickets" sections and "Seller gatew
 Some pieces are worth less than the smallest payment worth sending: a routing node charges about
 1 sat to carry any payment, and a piece of a shared file may be worth a tenth of a sat. For those,
 buyer and seller roll a fair die for every piece. Most rolls pay nothing, a win pays a
-normal-sized amount, and the odds are set so that the average is the exact price: at a tenth of
-a sat a piece and a win of 64 sat, 1 roll in 640 wins. Neither side can steer a roll, because the
+normal-sized amount, and the odds are set so that the expected payment is the exact price: at a
+tenth of a sat a piece and a win of 64 sat, 1 roll in 640 wins. Neither side can steer a roll, because the
 seller fixes its half before the session and the buyer sends its half after the piece arrived.
-Income and cost are uneven in the short run and exact in the long run, as a miner's income is.
+Income and cost are exact in expectation and uneven in any one run, as a miner's income is. How
+uneven depends on the number of wins between one buyer and one seller: the spread is about 1
+over the square root of the wins expected, so it takes about 68 wins (4,350 sat at 64-sat wins)
+to be within 20% nine times in ten, and about 1,080 wins (69,000 sat) to be within 5%. A call
+worth 10 sat, paid through a routing node where a win is 64 sat, pays nothing about 85% of the
+time and 64 sat or more otherwise ([`docs/TICKETS.md`](docs/TICKETS.md), section 9, has the
+arithmetic).
 Paying by lottery is an old idea and not ours: David Wheeler (1996) and Ronald Rivest (1997).
 
 **The first form is built: the buyer pays after a win.** The seller sends an ordinary Lightning

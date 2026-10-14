@@ -206,7 +206,10 @@ mainnet; its driver is not in this tree. `docs/TICKETS.md`, section 11, has the 
 ### The lottery: pay after a win
 
 A piece that costs less than a ticket is paid by a fair draw: it wins a payment of one fixed
-size (64 sat as shipped) with probability price ÷ that size, so the average paid is the price.
+size (64 sat as shipped) with probability price ÷ that size, so the expected payment is the
+price. Expected only: the spread of what is actually paid is about 1 over the square root of the
+wins expected between one buyer and one seller (41% at 6 wins, 12% at 68, 3% at 1,080;
+`docs/TICKETS.md`, section 9, has the arithmetic).
 Nothing is locked ahead; the buyer pays an ordinary invoice for each win. The gateway and the
 wallet build it (`docs/TICKETS.md`, section 9). Regtest only: `scripts/lottery_regtest.sh` runs
 the shipped binaries on Lightning Fork nodes whose channels carry 30 pending payments, one
@@ -237,6 +240,11 @@ involved no node.
   it nine days in ten, and 96% to 104% over a month; a seller earning 1,000 sat a day, 58% to
   141% on a day; a seller earning 100 sat a day gets no win on 21% of days. *(simulated)* A
   seller that earns less than one win from a buyer is usually paid nothing by it.
+- Through a routing node the wallet's floor makes every win at least 64 sat, so a small call is
+  mostly paid nothing and sometimes many times its price: a 10-sat call pays nothing about 85%
+  of the time and 64 sat or more otherwise, up to its luck cap of 152 sat (computed). The wallet
+  has no rule that keeps a call expecting few wins off the lottery, and nothing pools draws
+  across sellers.
 - A buyer's cost is uneven. Measured: a file priced at 381.5 sat, bought five times, cost
   520, 780, 390, 260 and 325 sat with routing fees. A download priced at 1,638 sat on 64-sat wins costs 1,152
   to 2,176 sat nine times in ten. *(simulated)* `max_sats` bounds what a call uses by the

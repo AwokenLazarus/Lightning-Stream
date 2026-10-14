@@ -215,8 +215,9 @@ wins, and a win is an ordinary payment of 64 sat. Nothing is locked with any sel
 | Routing fees | 14 sat, 1 sat a win |
 | On the buyer's 30-slot channel | at most 4 payments at once; nothing held between wins; no payment failed |
 
-That is the lottery as it is: exact on average and uneven in one run, for the buyer and for each
-seller.
+That is the lottery as it is: exact in expectation and uneven in one run, for the buyer and for
+each seller. With 16.5 wins expected the spread of one run is about a quarter of the price
+(1 ÷ √16.5), and a seller that expects 0.8 of a win is paid nothing in 44% of runs (e^(−0.82)).
 
 The 20 gateways stand beside one seller node: the buyer's channel and the route carry what 20
 sellers' wins would, and the sellers' side is one node's work.

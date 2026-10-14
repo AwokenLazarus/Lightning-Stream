@@ -712,11 +712,47 @@ seller's first hold invoice is issued to a buyer that has paid nothing.
 
 A request, or a piece of an answer, priced below one payment is paid by a fair draw: it wins a
 payment of one fixed size (a **win**, 64 sat unless the terms say otherwise) with probability
-price ÷ that size, so what is paid is the price on average. Most draws pay nothing. A win is paid
+price ÷ that size, so what is paid is the price in expectation, and only in expectation: the
+paragraph after next says how many wins it takes to come near it. Most draws pay nothing. A win is paid
 at once by an ordinary Lightning payment, in flight for a fraction of a second, and nothing is
 locked with the seller at any time: no hold invoice, no slot of any channel between wins. This is
 how the wallet pays amounts below a ticket, and how it pays more sellers at once than tickets can
 be held with (section 11).
+
+**How far "on average" reaches.** What a buyer pays one seller is a whole number of wins. The
+number of wins is a sum of independent draws, each with a small chance, so its variance is at
+most its mean: where n wins are expected, the standard deviation is about √n wins, and the
+relative standard deviation of what is paid is 1 ÷ √n. Nine times in ten a result lies within
+1.645 standard deviations of what was expected (the normal approximation, which is rough below
+about ten wins).
+
+| Wins expected with one seller | That is, at 64-sat wins | Relative standard deviation | Paid, nine times in ten |
+|---|---|---|---|
+| 0.16 | a 10-sat call | 250% | nothing about 85% of the time, else 64 sat or more |
+| 1 | 64 sat | 100% | nothing 37% of the time (e⁻¹) |
+| 6 | the 381.5-sat file of section 9.12 | 41% (156 sat) | 130 to 640 sat, roughly |
+| 16 | 1,024 sat: what a session is sized for | 25% | within 41% |
+| 68 | 4,350 sat | 12% | within 20% |
+| 1,080 | 69,000 sat | 3% | within 5% |
+
+The arithmetic: 1.645 ÷ √n = 0.20 gives n = 67.6, and 1.645 ÷ √n = 0.05 gives n = 1,082; times
+64 sat that is 4,330 and 69,270 sat. The file of section 9.12 expects 381.5 ÷ 64 = 5.96 wins,
+with a standard deviation of √5.96 = 2.44 wins, 156 sat; its run of 12 wins was 2.5 standard
+deviations above what was expected.
+
+Small calls never reach the sizing of section 9.7. A win is sized at one sixteenth of the call
+but never below the fee floor, which is 64 sat through a routing node, so for every call under
+about 1,024 sat (16 × 64) the win is 64 sat and fewer than 16 wins are expected. A 10-sat call
+through a routing node expects 10 ÷ 64 = 0.16 wins. It pays nothing 84% of the time as one piece
+(1 − 10 ÷ 64) and 86% as many small pieces (e^(−10 ÷ 64)): about 85%. Otherwise it pays 64 sat,
+6.4 times its price, or more; its luck cap is 152 sat (10 + 3.1 × √(10 × 64) + 64, section 9.8).
+
+The same holds for a seller's income: within 20% of what it earned takes about 68 wins from its
+buyers together, and a seller that earns less than one win from a buyer is usually paid nothing
+by it (section 9.9). The only thing that evens this out is more wins between the same two
+parties. A session pools the calls of one buyer to one seller; nothing pools across sellers or
+across buyers, and there is no bank. The wallet has no rule that keeps a call expecting few wins
+off the lottery: it chooses draws for anything smaller than four tickets' worth (section 9.7).
 
 Both sides are built: the draw is `xbt402::lottery` (`crates/xbt402/src/lottery.rs`, no IO, used
 by both), the seller's side is in `xbt-gateway` (`lottery.rs`, `gateway/draws.rs`), and the
@@ -996,7 +1032,9 @@ sats, so that a session expects about 16 wins; never above the seller's `winMsat
 cap; never below the seller's `minWinMsat`, the owner's smallest win, four times the route's
 dearest piece (so that no piece wins more than one time in four, the owner's `max_odds_den`), or
 the **fee floor** of the way to the seller. That floor is 64 sat when the payment goes through a
-routing node and 4 sat over a channel of the wallet's own to the seller's node.
+routing node and 4 sat over a channel of the wallet's own to the seller's node. Through a routing
+node the floor therefore decides the win for every call that may use less than 1,024 sat
+(16 × 64), and such a call expects fewer than 16 wins: one that may use 100 sat expects 1.6.
 
 What a wallet can know of a route's fee before it pays is little. It knows its own channels,
 and so whether the seller's node is its direct peer, where no hop is paid. It knows the fee
