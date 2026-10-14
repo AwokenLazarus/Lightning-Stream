@@ -570,8 +570,10 @@ payer only: no socket method buys one. Run on regtest only (`scripts/ticket_book
   more likely to be caught in that instant than it was with a pool of 8.
 - For a moment after a ticket settles, `ticket_status` can show the node and the book as not
   agreeing: the node reports the payment settled before it has taken the HTLC off its channel.
-- The seller's node receives a 32-byte tag with every ticket (a random nonce and a MAC). It tells
-  the seller nothing about the wallet beyond what the payment hash already does.
+- The seller's node receives a 32-byte tag with every ticket (a random nonce and a MAC), in a
+  custom record of type 1953063787. The contents tell the seller nothing. The type does: no
+  other software uses it, so every ticket payment identifies this wallet software to the node
+  it pays. Routing nodes do not see the record.
 - The ticket rail trusts its own Lightning node as the Lightning rail does: a ticket the node
   reports failed is no longer counted as spent, and a fee the node reports is the fee booked. A
   settle is believed only with the preimage of the ticket's hash, and is never booked below the
@@ -651,6 +653,12 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
   invoice (where the Lightning rail is on). A seller that answers without a 402 is answered from
   the wallet's one unpaid request (`rule: free`, `rail: none`). A call with `max_sats` 0 pays
   nothing: a 402 is refused (`max_sats`).
+- A paid call is at least two requests, never one: `xbt402_pay` sends every call without
+  payment first, reads the seller's 402, and sends the request again with its payment, also on
+  an open session, and a request body goes twice. The on-chain channel this replaced carried the
+  payment in the first request. The 0.3 to 0.4 ms that paying added on the lab is a loopback
+  figure; over a real network it is one more round trip to the seller on every call, and more on
+  a call that releases a ticket or opens a session. None of that was measured.
 - `max_sats` bounds what a call uses, by the wallet's own count of the bytes and seconds it
   received. It does not bound what the call books: a ticket is released whole, so a call that
   uses 3 sat can book one ticket and its fee limit (1,015 sat with the defaults). The rest is a

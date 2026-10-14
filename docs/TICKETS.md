@@ -150,7 +150,9 @@ buyer's funds can be stuck behind a hop that has gone away.
 
 **The buyer's tag.** A ticket payment MAY carry one custom record to the seller's node: type
 1953063787 (odd, so a node that does not know it ignores it), 32 bytes, a nonce and a MAC under a
-key only the buyer's wallet has. It says nothing to the seller, which ignores it. The buyer's own
+key only the buyer's wallet has. Its contents say nothing to the seller, which ignores it. Its
+type number is this wallet software's own, though, so its presence on a payment tells the
+seller's node which wallet software the payer runs (section 6). The buyer's own
 node keeps it with the payment, and that is its use: a wallet whose records are older than its
 node's (a restore from a backup) reads its node's payment list and knows which payments are its
 tickets. On the lab the record reached the seller's hold invoice and stayed in the buyer node's
@@ -450,9 +452,15 @@ which. Nothing was run at 10 or 50 sat/vB, and no channel without anchors was ru
 | Any node on the route | **A ticket below a dust limit, if that channel is force-closed while it is held.** | Its value goes to the miners, and so does that of every other ticket held on that channel that is below the limit. Not possible for a ticket of 546 sat or more on the channel types the forks open by default (anchors). On a channel without anchors a 1,000-sat ticket is below the limit from about 2.6 sat/vB (computed, section 6.1). |
 | Routing hop | **The cost of a force close** when a seller vanishes with tickets locked, if the hop opened that channel. | With 100 tickets: a commitment transaction of 18,313 weight units and 104 outputs, 4,635 sat in fee, and about 29,000 sat in all to get its funds back at 1 sat/vB, which is 29% of the tickets' value. With 3 tickets it was 1,530 sat. Measured on anchor channels on regtest; other fee rates are in section 6.2. |
 
-Two more things that are true of any Lightning payment and matter more here. Every hop sees the
-same hash, so hops that work together can tell that a run of equal payments goes to one seller.
-And a ticket below a channel's dust limit has no output in that side's commitment transaction, so
+**Privacy.** Every hop sees the same hash, so hops that work together can tell that a run of
+equal payments goes to one seller; that is true of any Lightning payment and matters more here.
+The seller's node sees one thing more: the custom record of type 1953063787 that the wallet in
+this tree puts on every ticket payment (section 2). No other software uses that type, so the
+record identifies the wallet software to the seller's node, on every ticket and for every
+seller, whatever its contents hide. Routing hops do not see it. And the seller sees the buyer's
+network address on the HTTP connection, as any web server does.
+
+One more thing that is true of any Lightning payment and matters more here: a ticket below a channel's dust limit has no output in that side's commitment transaction, so
 nobody can claim it on chain. The limit is 354 sat on a Lightning Fork node and 546 sat on a Core
 Lightning node, and each node caps the total of such HTLCs per channel (section 11).
 
@@ -641,10 +649,10 @@ seller's first hold invoice is issued to a buyer that has paid nothing.
 
 | Number | Value | Reason |
 |---|---|---|
-| Ticket size | 1,000 sat | A hop charges 1,001 msat for a settled 1,000-sat ticket at the forks' default policy (0.1% per hop; nothing on a direct channel, 2,002 msat through two hops). Above both dust limits (354 and 546 sat), so on anchor channels it has an output in every channel on the route at any fee rate. On a channel without anchors it has none from about 2.6 sat/vB, and above a few sat/vB it costs more to claim on chain than it is worth on either kind (sections 6.1 and 6.2). It stays the default; the fee-aware floor two rows down is decided and not yet built. |
+| Ticket size | 1,000 sat | A hop charges 1,001 msat for a settled 1,000-sat ticket at the forks' default policy: a base fee of 1,000 msat and a rate of 1 part in a million (0.0001%). For a ticket of this size that is an overhead of 0.1% of the ticket per hop, nearly all of it the base fee; it is a ratio for this amount and not a fee rate. Nothing on a direct channel, 2,002 msat through two hops. Above both dust limits (354 and 546 sat), so on anchor channels it has an output in every channel on the route at any fee rate. On a channel without anchors it has none from about 2.6 sat/vB, and above a few sat/vB it costs more to claim on chain than it is worth on either kind (sections 6.1 and 6.2). It stays the default; the fee-aware floor two rows down is decided and not yet built. |
 | Smallest ticket that is held, where a channel without anchors may be on the route (decided, not yet built) | max(546, dust_limit + 663 × feerate_cap ÷ 1000) sat | The dust threshold of such a channel rises with its fee rate (section 6.1): 712, 2,204 and 8,834 sat at 1, 10 and 50 sat/vB against a dust limit of 546 (computed). Today the wallet applies a rule of its own to the channel a ticket leaves on (1,249 sat at 1 sat/vB) and the gateway applies none. |
 | A held ticket's cost to the channel's funder | 172 weight units of commitment transaction | 43, 430 and 2,150 sat a ticket at 1, 10 and 50 sat/vB (computed, section 6.2); 483 tickets took a commitment transaction from 1,116 to 84,200 weight units on the lab. |
-| Smallest ticket that is held | 546 sat, the larger of the two dust limits | Below 354 sat a ticket has no output in a Lightning Fork channel's transaction, below 546 sat none in a Core Lightning one (seen on chain, section 11). At 546 sat one hop's fee is 0.18%. A node takes nothing below 1 sat (999 msat found no route, through a Lightning Fork hop or on one channel), and a 1-sat ticket through a hop pays a fee of 1 sat. |
+| Smallest ticket that is held | 546 sat, the larger of the two dust limits | Below 354 sat a ticket has no output in a Lightning Fork channel's transaction, below 546 sat none in a Core Lightning one (seen on chain, section 11). At 546 sat one hop's fee (1,000 msat) is 0.18% of the ticket, 0.37% through two hops. A node takes nothing below 1 sat (999 msat found no route, through a Lightning Fork hop or on one channel), and a 1-sat ticket through a hop pays a fee of 1 sat. |
 | Tickets unreleased per session | 2 | 2,000 sat locked and 2 slots of every channel on the route, of which a Core Lightning channel has 30. The next is locked when one is left; a lock of one takes 0.2 s through a hop. It was 8 until 2026-10-12, sized for 483 slots. |
 | Held tickets on one channel, all sessions together | Half of the channel's slots: 15 of 30 | The other half is for ordinary payments, for settles on their way and for everyone else (section 11). |
 | Ticket life (`ticketBlocks`) | 40 blocks | The node takes no less than 24. The seller's node cancels at 18 before expiry, the seller stops accepting at 24 before, and the payer's node adds 3: so 19 usable blocks, and at most 25 blocks locked behind a silent seller. |
@@ -1244,6 +1252,17 @@ An agent pays with one tool call, `xbt402_pay(url, method, body, max_sats, task)
 is the wallet's signer's (`crates/xbt-signer/src/ticket_pay.rs`): it sends the request once without
 paying, reads the 402 itself, and chooses the rail. Who the seller is therefore comes from what
 the signer fetched from the URL's own origin, never from its caller.
+
+**What this gives up: a paid call is not one request.** The design this replaced carried the
+payment in a header of the request, so a paid call was one round trip. Here every call is at
+least two: the request without payment, which the seller answers with the 402, and then the
+request again with its payment header. That holds for every call, also the hundredth of an open
+session, because the wallet reads the terms afresh each time; and a request body is sent twice.
+A call that finds the balance short adds a `status` and a `release` before the paid request, a
+call paid by draws adds a `draw` after it, and the first call of a session adds the lock and the
+payments of its tickets. The measured cost of paying, 0.3 to 0.4 ms over a free call, is on
+loopback, where a request takes a fraction of a millisecond. On a real network each of these is
+a round trip to the seller, and none of that was measured.
 
 **The rail.** One function, in this order; the first entry the seller offers and the owner's
 policy allows is paid. Where a seller's 402 has a ticket entry and a lottery entry, the rule of
