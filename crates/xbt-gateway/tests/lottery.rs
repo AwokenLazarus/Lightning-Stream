@@ -20,10 +20,13 @@ use xbt_gateway::node::{Hash, InvoiceState};
 
 const PIECE: u64 = 65_536;
 
-/// The tests' lottery: wins of 4,000 msat, so that a 2,500-msat page wins five times in eight.
+/// The tests' lottery: wins of 4,000 msat, so that a 2,500-msat page wins five times in eight
+/// and a test meets wins without thousands of draws. A runner who wanted that says
+/// `max_odds_den: 1`, as here; the shipped rule (a piece is a quarter of a win at the most) has
+/// its own test.
 fn lottery(v: &mut Value) {
     v["lottery"] = json!({"win_msat": 4000, "min_win_msat": 2000, "window": 3, "piece_bytes": PIECE, "grace_seconds": 10, "grace_pieces": 4,
-                          "max_unpaid_wins": 2, "chain_draws": 4096, "sessions_per_address": 0, "max_sessions": 8, "max_voids": 2});
+                          "max_unpaid_wins": 2, "chain_draws": 4096, "sessions_per_address": 0, "max_sessions": 8, "max_voids": 2, "max_odds_den": 1});
     // a megabyte for 16,000 msat: a piece of 64 KiB costs 1,000 msat, a quarter of a win
     v["routes"][0]["price"] = json!({"byte_msat": 16000, "per_bytes": 1048576});
     for r in v["routes"].as_array_mut().unwrap() {
@@ -610,4 +613,129 @@ fn sessions_are_capped_a_wrong_size_is_refused_and_a_session_does_not_outlive_th
     let (_, got) = c.get("/api");
     assert_eq!((got.status, got.error().as_str()), (402, "session_unknown"));
     assert!(got.header("PAYMENT-RESPONSE").is_none(), "a forgotten session has no totals to sign");
+}
+
+#[test]
+fn a_route_whose_dearest_piece_is_more_than_a_quarter_of_a_win_is_not_drawn_for_whatever_the_request_says() {
+    // the shipped rule: no max_odds_den in the file
+    let (rig, _d) = start(&|v| {
+        lottery(v);
+        v["lottery"].as_object_mut().unwrap().remove("max_odds_den");
+    });
+    // a page of 2,500 msat on a win of 4,000: tickets only, in the 402 and in the list of what is sold
+    let j = http(&rig.addr, "GET", "/api", &[], b"", None).json();
+    assert!(j["accepts"].as_array().unwrap().iter().all(|a| a["scheme"] == "ticket"), "{j}");
+    // a body whose pieces cost 1,000 msat, a quarter of the win: offered
+    let j = http(&rig.addr, "GET", "/files/10", &[], b"", None).json();
+    assert_eq!(j["accepts"].as_array().unwrap().last().unwrap()["scheme"], "lottery");
+    let s = http(&rig.addr, "GET", "/services", &[], b"", None).json();
+    let by = |p: &str| s["routes"].as_array().unwrap().iter().find(|r| r["path"] == p).unwrap()["lottery"].clone();
+    assert_eq!((by("/api"), by("/files/")), (json!(false), json!(true)));
+    // a buyer that reads no 402 and names the lottery for the page: refused, signed, and the service is not asked
+    let mut b = Drawer::open(&rig, 40);
+    let (_, got) = b.get("/api");
+    assert_eq!((got.status, got.error().as_str()), (402, "amount_not_below_win"));
+    assert_eq!(receipt_of(&got, &b.receipt_key)["charged"], "0");
+    assert_eq!(rig.hits(), 0);
+    // the body is served to the same session
+    let (_, got) = b.get(&format!("/files/{PIECE}"));
+    assert!(got.status == 200 && got.complete);
+    assert_eq!(rig.hits(), 1);
+}
+
+#[test]
+fn a_buyer_that_voids_every_piece_gets_the_window_and_closing_does_not_give_it_another() {
+    // a cap on voids far above the window, so that the window is what stops it; two sessions an address
+    let (rig, _d) = start(&|v| {
+        lottery(v);
+        v["lottery"]["max_voids"] = json!(1000);
+        v["lottery"]["sessions_per_address"] = json!(2);
+    });
+    let void_all = |b: &mut Drawer| -> (usize, Got) {
+        let mut served = 0;
+        loop {
+            let (seq, got) = b.get("/api");
+            if got.status != 200 {
+                return (served, got);
+            }
+            served += 1;
+            assert!(served <= 20, "a buyer that voids every piece is served without end");
+            // "it never arrived": no value, and so no draw
+            let j = b.call("draw", &json!({"void": [{"seq": seq, "kind": "request", "k": 0}]})).json();
+            assert_eq!((j["session"]["voids"].as_u64(), j["session"]["pending"].as_u64(), j["drawn"].as_u64()), (Some(served as u64), Some(0), Some(0)), "{j}");
+        }
+    };
+    let mut first = Drawer::open(&rig, 41);
+    let (served, refused) = void_all(&mut first);
+    assert_eq!((served, refused.status, refused.error().as_str()), (3, 402, "too_many_voids"), "the window is 3");
+    assert_eq!(receipt_of(&refused, &first.receipt_key)["servedMsat"], "7500");
+    // it closes and opens another: served the window again, and that was its address's second place
+    assert_eq!(first.call("close", &json!({})).status, 200);
+    assert_eq!(first.get("/api").1.error(), "session_unknown", "a closed session is known to nobody");
+    let mut second = Drawer::open(&rig, 42);
+    assert_eq!(void_all(&mut second).0, 3);
+    assert_eq!(second.call("close", &json!({})).status, 200);
+    let third = Drawer::open_raw(&rig, &json!({"version": "lottery/0"}));
+    assert_eq!((third.status, third.error().as_str()), (402, "too_many_sessions"), "the closed sessions keep their places");
+    assert_eq!(rig.hits(), 6, "two sessions, the window each, and nothing more");
+    // as long as a session that never drew is kept, and no longer
+    rig.advance(61);
+    rig.gw.tick();
+    let mut later = Drawer::open(&rig, 43);
+    // a session that owes nothing gives its place back at once
+    let (seq, got) = later.get("/api");
+    assert_eq!(got.status, 200);
+    let p = later.piece(seq, "/api", Kind::Request, 0, 2500);
+    let j = later.draw(&[p]);
+    later.pay_all(&rig, &j);
+    let _ = later.status();
+    assert_eq!(later.call("close", &json!({})).status, 200);
+    let _a = Drawer::open(&rig, 44);
+    let _b = Drawer::open(&rig, 45);
+}
+
+#[test]
+fn the_cap_per_address_counts_the_address_a_named_proxy_reports_and_nobody_elses_word() {
+    let open = |rig: &Rig, headers: &[(&str, &str)]| {
+        let got = http(&rig.addr, "POST", "/x402/lottery/open", headers, json!({"version": "lottery/0"}).to_string().as_bytes(), None);
+        (got.status, got.json()["error"].as_str().unwrap_or("").to_string())
+    };
+    let (ok, full) = ((200, String::new()), (402, "too_many_sessions".to_string()));
+    // no proxy named: every request counts under its socket's address, whatever header it carries
+    let (plain, _d1) = start(&|v| {
+        lottery(v);
+        v["lottery"]["sessions_per_address"] = json!(1);
+    });
+    assert_eq!(open(&plain, &[("X-Real-IP", "198.51.100.1")]), ok);
+    assert_eq!(open(&plain, &[("X-Real-IP", "198.51.100.2")]), full, "a header nobody was told to believe");
+    // the proxy named (the tests' sockets come from 127.0.0.1): one session for each address it reports
+    let (rig, _d2) = start(&|v| {
+        lottery(v);
+        v["lottery"]["sessions_per_address"] = json!(1);
+        v["caps"]["sessions_per_address"] = json!(1);
+        v["http"] = json!({"forwarded_address": {"header": "X-Real-IP", "proxies": ["127.0.0.1"]}});
+    });
+    assert_eq!(open(&rig, &[("X-Real-IP", "198.51.100.1")]), ok);
+    assert_eq!(open(&rig, &[("x-real-ip", "198.51.100.1")]), full);
+    assert_eq!(open(&rig, &[("X-Real-IP", "198.51.100.2")]), ok);
+    // of a list the last entry is the proxy's own; the ones before it are the buyer's to write
+    assert_eq!(open(&rig, &[("X-Real-IP", "203.0.113.50, 198.51.100.2")]), full);
+    assert_eq!(open(&rig, &[("X-Real-IP", "198.51.100.2, 203.0.113.50")]), ok);
+    // no header, two of them, or no address in it: counted with the proxy itself, as one address
+    assert_eq!(open(&rig, &[]), ok);
+    assert_eq!(open(&rig, &[("X-Real-IP", "198.51.100.3"), ("X-Real-IP", "198.51.100.4")]), full);
+    assert_eq!(open(&rig, &[("X-Real-IP", "unknown")]), full);
+    // the same address is what a ticket session's place is counted under
+    let lock = |headers: &[(&str, &str)], n: u8| {
+        let body = json!({"version": "ticket/0", "hashes": [hex::encode(xbt402::ticket::ticket_hash(&[n; 32]))]});
+        let got = http(&rig.addr, "POST", "/x402/ticket/lock", headers, body.to_string().as_bytes(), None);
+        (got.status, got.json()["error"].as_str().unwrap_or("").to_string())
+    };
+    assert_eq!(lock(&[("X-Real-IP", "198.51.100.9")], 1), ok);
+    assert_eq!(lock(&[("X-Real-IP", "198.51.100.9")], 2), full);
+    assert_eq!(lock(&[("X-Real-IP", "198.51.100.10")], 3), ok);
+    // and the operator's view is for this machine: a caller the proxy brought from elsewhere does not get it
+    assert_eq!(http(&rig.addr, "GET", "/x402/ticket/health", &[("X-Real-IP", "198.51.100.1")], b"", None).status, 404);
+    assert_eq!(http(&rig.addr, "GET", "/x402/ticket/health", &[("X-Real-IP", "127.0.0.1")], b"", None).status, 200);
+    assert_eq!(http(&plain.addr, "GET", "/x402/ticket/health", &[("X-Real-IP", "198.51.100.1")], b"", None).status, 200);
 }

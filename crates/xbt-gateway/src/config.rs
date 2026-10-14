@@ -148,7 +148,20 @@ pub struct Config {
     pub lottery: Option<LotteryConfig>,
     pub routes: Vec<Route>,
     pub http: Http,
+    /// Off unless the runner writes it: whose word the caps per address take for a buyer's address.
+    pub forwarded: Option<Forwarded>,
     pub times: Times,
+}
+
+/// A reverse proxy in front of the gateway, and the header in which it reports the address it
+/// took each request from (`http.forwarded_address`). Absent: the caps per address count the
+/// socket's address, which behind a proxy is the proxy's for every buyer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Forwarded {
+    /// The header's name, lower case.
+    pub header: String,
+    /// The addresses the proxy connects from. The header is read on connections from these only.
+    pub proxies: Vec<std::net::IpAddr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -433,7 +446,7 @@ impl Config {
         }
 
         let h = match top.get("http") {
-            Some(h) => obj(h, "http", &["connections", "per_address", "threads"])?,
+            Some(h) => obj(h, "http", &["connections", "per_address", "threads", "forwarded_address"])?,
             None => &empty,
         };
         // bounded before they become sizes: each is a number of threads
@@ -449,6 +462,22 @@ impl Config {
             threads: small("threads", 16, 1)?,
         };
 
+        let forwarded = match h.get("forwarded_address") {
+            None | Some(Value::Null) => None,
+            Some(f) => {
+                let f = obj(f, "http.forwarded_address", &["header", "proxies"])?;
+                let header = req_str(f, "header")?.to_ascii_lowercase();
+                if !header.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-') {
+                    return Err("http.forwarded_address.header is a header name".into());
+                }
+                let bad = "http.forwarded_address.proxies is a list of the addresses your reverse proxy connects from, at least one, each written as an address: the header is believed from these and from nobody else";
+                let mut proxies = vec![];
+                for p in f.get("proxies").and_then(Value::as_array).filter(|a| !a.is_empty()).ok_or(bad)? {
+                    proxies.push(p.as_str().and_then(|a| a.parse::<std::net::IpAddr>().ok()).ok_or(bad)?.to_canonical());
+                }
+                Some(Forwarded { header, proxies })
+            }
+        };
         let tm = match top.get("times") {
             Some(t) => obj(
                 t,
@@ -522,6 +551,7 @@ impl Config {
             lottery,
             routes,
             http,
+            forwarded,
             times,
         })
     }
@@ -846,14 +876,15 @@ mod tests {
             Some(200_000)
         );
         assert_eq!(c.route("/chunks/1").unwrap().release, Release::AfterVerify);
-        // the lottery: pieces of a tenth of a sat are offered by draws, and so is a film's piece of
-        // 50 sat, which is below the 64-sat win (a buyer's owner decides whether odds of 25 in 32
-        // are a lottery). A chunk of 100 sat is dearer than a win: tickets only
+        // the lottery: pieces of a tenth of a sat are offered by draws, and a page of 2.5 sat. A
+        // film's piece of 50 sat is more than a quarter of the 64-sat win, and a chunk of 100 sat
+        // more than a whole one: tickets only
         let l = c.lottery.as_ref().unwrap();
         assert_eq!((l.win_msat, l.min_win_msat, l.piece_bytes), (64_000, 16_000, 262_144));
         assert!(l.offers(&c.route("/pieces/1").unwrap().price) && l.offers(&c.route("/api/x").unwrap().price));
+        assert!(l.offers(&c.route("/live/x").unwrap().price), "5 sat a second");
         assert_eq!(l.dearest_piece(&c.route("/films/a.mkv").unwrap().price), Some(50_000));
-        assert!(l.offers(&c.route("/films/a.mkv").unwrap().price) && !l.offers(&c.route("/chunks/1").unwrap().price));
+        assert!(!l.offers(&c.route("/films/a.mkv").unwrap().price) && !l.offers(&c.route("/chunks/1").unwrap().price));
         // a file with no lottery section offers none, and a section that is not one is refused
         let mut none = v.clone();
         none.as_object_mut().unwrap().remove("lottery");
@@ -864,6 +895,33 @@ mod tests {
         let mut own = v;
         own["routes"][0]["path"] = json!("/x402/lottery/x");
         assert!(Config::from_json(&own).is_err(), "the lottery's endpoints are the gateway's own");
+    }
+
+    #[test]
+    fn a_forwarded_address_is_believed_only_where_the_runner_names_the_proxy() {
+        let with = |f: Value| {
+            let mut v = base();
+            v["http"] = json!({"forwarded_address": f});
+            Config::from_json(&v)
+        };
+        assert_eq!(Config::from_json(&base()).unwrap().forwarded, None, "off unless written");
+        let c = with(json!({"header": "X-Real-IP", "proxies": ["127.0.0.1", "::ffff:192.0.2.9", "2001:db8::1"]})).unwrap();
+        let f = c.forwarded.unwrap();
+        assert_eq!(f.header, "x-real-ip");
+        assert_eq!(f.proxies, ["127.0.0.1".parse::<std::net::IpAddr>().unwrap(), "192.0.2.9".parse().unwrap(), "2001:db8::1".parse().unwrap()]);
+        for bad in [
+            json!({"header": "X-Real-IP"}),
+            json!({"header": "X-Real-IP", "proxies": []}),
+            json!({"header": "X-Real-IP", "proxies": ["proxy.internal"]}),
+            json!({"header": "X-Real-IP", "proxies": ["10.0.0.0/8"]}),
+            json!({"header": "X-Real-IP", "proxies": "127.0.0.1"}),
+            json!({"header": "X Real IP", "proxies": ["127.0.0.1"]}),
+            json!({"proxies": ["127.0.0.1"]}),
+            json!({"header": "X-Real-IP", "proxies": ["127.0.0.1"], "trust": "all"}),
+            json!("X-Real-IP"),
+        ] {
+            assert!(with(bad.clone()).is_err(), "{bad}");
+        }
     }
 
     #[test]

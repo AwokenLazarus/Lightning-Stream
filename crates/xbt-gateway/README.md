@@ -135,15 +135,20 @@ the buyer pays it at once. The odds are the piece's price over the win, so what 
 your price on average: a piece of a tenth of a sat wins a 64-sat payment one time in 640.
 
 A route is offered this way only if its dearest piece (its request, one second, or `piece_bytes`
-of its body) costs less than `win_msat`. `GET /services` says which routes are.
+of its body) costs a quarter of `win_msat` or less (`max_odds_den`, 4: no piece wins more often
+than one time in four, which is also the most a wallet's owner allows by default). You serve
+`window` pieces before any value has come, so this is what the window costs you in wins: 8
+pieces of a quarter of a win are 2. A dearer route is paid with tickets, and a request that
+names the lottery for it is refused. `GET /services` says which routes are offered.
 
 What it costs you, and what bounds it:
 
 | What a buyer can do | What it gets | The setting |
 |---|---|---|
-| Send no values | `window` pieces a session, then `value_missing` | `window` (8); `max_sessions` (64) and `sessions_per_address` (4); a session that never sent a value is forgotten after `first_use_secs` (60) |
+| Send no values | `window` pieces a session, then `value_missing` | `window` (8) and `max_odds_den` (4): 2 wins' worth a session at the most. `max_sessions` (64) and `sessions_per_address` (4); a session that never sent a value is forgotten after `first_use_secs` (60): 8 wins' worth a minute from one address |
 | Send values and never pay a win | What it was served up to its first win, then the grace: `grace_pieces` more pieces, `grace_seconds`, or until more than `max_unpaid_wins` are unpaid, whichever comes first. Then `win_unpaid` until your node shows the wins paid. An answer that is being sent stands still for the payment for `pay_wait_secs` (10) at the most, holding its connection and one of the server's threads, and is then cut short | `win_msat`, the three grace settings and `pay_wait_secs` |
-| Say a piece never arrived (`void`) | `max_voids` pieces a session (16) | `max_voids` |
+| Say a piece never arrived (`void`) | Nothing more than by sending no values: a voided piece stays counted against `window` for the rest of the session. After `max_voids` voids (4) the session is ended (`too_many_voids`) | `window`, `max_voids`. An honest buyer whose answer was cut voids the pieces that were on their way (one to a few), has a narrower window from then on, and opens another session after the fifth |
+| Close its session and open another | The window again, but a session closed while it owes (pieces with no value, a win unpaid) keeps its place for `first_use_secs` | `sessions_per_address`, `max_sessions`, `first_use_secs` |
 | Open sessions | A chain each: `chain_draws` hashes to make (65,536) and about 34 KiB to keep (one chain value in every 1,024, the block of 1,024 last read, and 8 bytes for every draw taken) | `max_sessions`, `idle_secs` (300) |
 
 Measured on regtest with the wallet of this tree and a buyer that never pays
@@ -168,6 +173,27 @@ The rules it keeps, beside those of the table above:
 
 The fairness of the draw rests on an argument of this project's own that nobody else has
 reviewed (`docs/LIMITS.md`, "The lottery").
+
+### Behind a reverse proxy: whose address is counted
+
+The caps per address (`caps.sessions_per_address` for tickets, `lottery.sessions_per_address`)
+count the address of the socket. Behind a reverse proxy that is the proxy's for every buyer: the
+cap then holds all your buyers together to a few sessions, or you set it to 0 and it holds
+nobody, and the lottery's bound per address above is gone. To have it count buyers, name the
+proxy and the header it reports their address in:
+
+```json
+"http": {"forwarded_address": {"header": "X-Real-IP", "proxies": ["127.0.0.1"]}}
+```
+
+Off unless you write it. The gateway then reads that header on connections from the listed
+addresses only (written as addresses), takes the last entry if it is a list, and counts a
+request with no such header, or two, under the proxy's own address. Two things are yours to get
+right, and the gateway cannot check either: the proxy must set the header itself on every
+request, replacing whatever the client sent (nginx: `proxy_set_header X-Real-IP $remote_addr;`),
+and nothing else may reach the gateway from a listed address. Get one wrong and a buyer writes
+its own address. The cap on connections (`http.per_address`) is taken before any header is read:
+set it to 0 behind a proxy.
 
 ## What the defaults cost you
 

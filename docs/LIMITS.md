@@ -183,9 +183,34 @@ involved no node.
   everything free. A download split over 40 sellers at a tenth of a sat a piece is 41 sat a
   seller, which is less than a 64-sat win. *(simulated)* The lottery is a way for buyers who
   mean to pay to do so cheaply. It is not enforcement.
-- A buyer that sends no values is served the seller's window (8 pieces) in every session it is
-  given. The gateway caps sessions (64 in all, 4 from one address) and forgets one that never
-  gave a value after a minute, so one address gets 32 pieces a minute at the most.
+- A buyer that sends no values, or that names every piece as void, is served the seller's
+  window (8 pieces) in every session it is given, and no more: a void makes no room in the
+  window. The gateway caps sessions (64 in all, 4 from one address), keeps a session that never
+  gave a value, or that was closed while it owed, in its place for a minute, and offers the
+  lottery only for a route whose dearest piece is a quarter of a win or less. So one address
+  gets 32 pieces a minute at the most, which is 8 wins' worth at the dearest price the gateway
+  draws for, and 16 addresses that hold all 64 places get 128 wins' worth a minute (8,192 sat
+  with 64-sat wins). Nothing but the caps bounds that: it is the price of serving first.
+  (Until 2026-10-14 a void made room in the window and a session took 16 of them, so a buyer
+  that voided every piece was served 24 pieces a session; a closed session gave its place back
+  at once, so the rate had no bound; and any piece below a whole win was drawn for.)
+- The cap on sessions from one address counts the socket's address unless the runner names a
+  reverse proxy and the header it sets (`http.forwarded_address`, off by default). Behind a
+  proxy without it, every buyer has the proxy's address: the cap holds everyone together to 4
+  sessions, or is set to 0 and holds nobody, and the bound of the item above is then the 64
+  sessions in all. With it, the gateway believes that header from the named addresses only and
+  takes the last entry of a list; it cannot check that the proxy overwrites what a client sent,
+  or that nobody reaches the gateway past the proxy from a named address. Either mistake lets a
+  buyer write its own address. The same address is what a ticket session's place is counted
+  under.
+- An honest buyer pays for the window too. Each piece of an answer that was cut, or that the
+  wallet stopped reading, stays counted for the rest of the session: one to a few pieces for a
+  cut, the window at the most. After 4 voids (`max_voids`, half the window) the gateway ends
+  the session (`too_many_voids`) and the wallet opens another; the one it left keeps its place
+  for a minute, so a buyer whose answers are cut more than four sessions' worth in a minute is
+  refused (`too_many_sessions`) until a place comes back. An answer priced by the second can
+  cost the buyer a void by itself: the seller may have begun one second more than the wallet
+  counted. Not measured; `scripts/lottery_regtest.sh` has no check that cuts answers.
 - Income is uneven. A seller earning 4,096 sat in a day with 64-sat wins is paid 80% to 120% of
   it nine days in ten, and 96% to 104% over a month; a seller earning 1,000 sat a day, 58% to
   141% on a day; a seller earning 100 sat a day gets no win on 21% of days. *(simulated)* A
@@ -230,9 +255,10 @@ involved no node.
   rate, and these numbers shrink with it.
 - An answer the wallet stops reading (its `max_sats`, the owner's `max_answer_s`, a piece that
   does not match) leaves up to the seller's window of pieces that it was sent and gives no value
-  for: it names them as void. A seller takes so many voids a session (16 at the gateway); after
-  that the wallet's next call opens another session. A buyer that voids pieces it did receive
-  has had them free, 16 a session.
+  for: it names them as void. A seller takes so many voids a session (4 at the gateway, and
+  each counts against its window); after that the wallet's next call opens another session. A
+  buyer that voids pieces it did receive has had them free: the window's 8 a session at the
+  most, voided or left open.
 - A win whose payment fails (no route, a fee above the owner's limit) is not paid with the same
   invoice again. It is paid with the seller's next invoice for it, which the gateway makes when
   the first has lapsed (60 s); a seller whose grace is shorter has stopped serving by then, and
@@ -366,7 +392,11 @@ wallet) and against a stand-in node in its tests.
 - The gateway does not make a Core Lightning node a seller: it speaks to a Lightning Fork node's
   REST interface only, for prepaid tickets as for held ones.
 - The cap per address counts the socket's address: behind a reverse proxy every buyer has the
-  proxy's, so the runner sets `sessions_per_address` to 0 and caps in the proxy.
+  proxy's. The runner either names the proxy and the header it reports a buyer's address in
+  (`http.forwarded_address`: believed from the named addresses only, the last entry of a list,
+  and a request without one counted under the proxy's own address), or sets
+  `sessions_per_address` to 0 and caps in the proxy. The cap on connections from one address
+  (`http.per_address`) is taken before any header is read and always counts the socket.
 - Whoever can reach the gateway from enough addresses can take every session place with locks
   it never pays, at no cost, a minute at a time: new buyers are refused meanwhile
   (`too_many_sessions`). Sessions that already hold tickets keep them and their balance, and can
@@ -424,8 +454,9 @@ wallet) and against a stand-in node in its tests.
   arrives, and loses it when the buyer never sends the secret: once per session, 30,000 sat with
   the default caps and tickets. The gateway does not know what "checks out" means for the content.
 - The list at `/services` is not signed. The operator's `health` view is given to loopback
-  callers, which behind a reverse proxy on the same host is every caller; it shows counts and no
-  secret.
+  callers, which behind a reverse proxy on the same host is every caller unless the runner named
+  the proxy (`http.forwarded_address`): then the address the proxy reports decides. It shows
+  counts and no secret.
 - The gateway speaks plain HTTP: a public seller needs a TLS reverse proxy in front, and
   `public_url` set to the origin buyers use, or every payment fails its request binding. It
   refuses a config that listens off loopback (any address but `127.0.0.1` or `[::1]`, and any

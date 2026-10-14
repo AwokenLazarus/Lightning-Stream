@@ -8,10 +8,12 @@
 //!
 //! | Rule | Kept by | Who could break it, and the bound |
 //! |---|---|---|
-//! | A piece is served only inside the window. | [`Book::blocked`]: no more than `window` pieces are open (served, with neither a value nor a void). | A buyer that sends no values: `window` pieces a session. |
+//! | A piece is served only inside the window. | [`Book::blocked`], and again at the moment a piece is marked ([`Book::serve`]): the pieces a session was served and gave no value for, the open ones and the voided ones together, are fewer than `window`. | A buyer that sends no values, or voids every piece: `window` pieces a session. |
 //! | A win is paid within the grace or the buyer is served nothing more. | [`Book::blocked`]: no win unpaid for more than `grace_seconds`, or once `grace_pieces` pieces were served since it was drawn, and at most `max_unpaid_wins` unpaid at once. Paid is the node's word ([`Book::win_paid`]), never the buyer's. | A buyer that never pays: what it was served up to its first win, and the grace. |
-//! | A piece is voided by a buyer that knows no result, and not without end. | [`Book::draw`]: more than `max_voids` voids stop the session. | A buyer that voids every piece: `max_voids` pieces a session. |
+//! | A void closes a piece and frees no place. | [`Book::blocked`]: a voided piece counts against the window for the rest of its session, and more than `max_voids` voids end the session. | A buyer that voids every piece: no more than one that sends nothing. |
+//! | A route is drawn for only if its dearest piece is a small part of a win. | [`LotteryConfig::offers`], kept by the 402 and by every request ([`crate::gateway`]): the dearest piece times `max_odds_den` is at most the win. | A runner that prices a piece near a whole win: the window is then worth `window` wins to a buyer that gives no value. |
 //! | Sessions are capped in all and per address, and a quiet one is forgotten. | [`Book::open`], [`Book::sweep`]. A session costs its chain: `chain_draws` hashes to make, and one value in every 1,024 and the block last read to keep (34 KiB at the default length). | Anyone, since opening a session needs no payment: `max_sessions` chains. |
+//! | Closing a session does not give its place back while it owes. | [`Book::close`]: a session closed with pieces it gave no value for, or with wins unpaid, serves nothing more and keeps its place until it has been quiet for `first_use_secs`. | A buyer that opens, takes the window and closes, again and again: the same as one that never closes. |
 //! | A chain is for one session. | [`Book::open`] makes each chain from fresh random bytes it is given and keeps it nowhere else. A session does not outlive the gateway's process: a restart forgets the chain with the values it revealed for. | Nobody. |
 use std::collections::{HashMap, VecDeque};
 
@@ -51,8 +53,13 @@ pub struct LotteryConfig {
     pub max_sessions: u32,
     /// Sessions from one client address; 0 is no cap per address.
     pub sessions_per_address: u32,
-    /// Pieces one session may void before it is served nothing more.
+    /// Pieces one session may void before it is served nothing more. A void never makes room
+    /// in the window, so this is not what bounds the pieces a buyer gets for no value (`window`
+    /// is): it is where a session whose window has narrowed is ended and another opened.
     pub max_voids: u32,
+    /// A route is drawn for only if its dearest piece wins at most 1 time in this many: the
+    /// piece's price times this is at most `win_msat`. The wallet's owner has the same cap.
+    pub max_odds_den: u32,
     /// A session is forgotten after this many seconds without a request.
     pub idle_secs: u64,
     /// A session that has never given a value is forgotten after this many seconds.
@@ -81,6 +88,7 @@ impl LotteryConfig {
                 "max_sessions",
                 "sessions_per_address",
                 "max_voids",
+                "max_odds_den",
                 "idle_secs",
                 "first_use_secs",
                 "invoice_secs",
@@ -111,6 +119,9 @@ impl LotteryConfig {
         if c.max_sessions == 0 {
             return Err("lottery.max_sessions is at least 1".into());
         }
+        if !(1..=1_000_000).contains(&c.max_odds_den) {
+            return Err("lottery.max_odds_den is from 1 to 1000000: a route is drawn for only if its dearest piece costs at most win_msat divided by it".into());
+        }
         if !(5..=3600).contains(&c.invoice_secs) {
             return Err("lottery.invoice_secs is from 5 to 3600".into());
         }
@@ -134,7 +145,11 @@ impl LotteryConfig {
             piece_bytes: num(m, "piece_bytes", 262_144)?,
             max_sessions: num32(m, "max_sessions", 64)?,
             sessions_per_address: num32(m, "sessions_per_address", 4)?,
-            max_voids: num32(m, "max_voids", 16)?,
+            // half of the default window. An answer that is cut leaves the pieces that were on their
+            // way, one to a few and the window at the most, and each void narrows the window by one
+            // for the rest of the session: past half of it the buyer is better served by a new session
+            max_voids: num32(m, "max_voids", 4)?,
+            max_odds_den: num32(m, "max_odds_den", 4)?,
             idle_secs: num(m, "idle_secs", 300)?,
             first_use_secs: num(m, "first_use_secs", 60)?,
             invoice_secs: num32(m, "invoice_secs", 60)?,
@@ -152,10 +167,14 @@ impl LotteryConfig {
         Some(price.request_msat.max(price.second_msat).max(bytes))
     }
 
-    /// Whether a route is offered by lottery: every piece of it costs less than the largest win.
-    /// A route with a dearer piece is paid with tickets, and its 402 has no lottery entry.
+    /// Whether a route is offered by lottery: its dearest piece wins at most 1 time in
+    /// `max_odds_den` at the largest win (and always costs less than a win). A route with a
+    /// dearer piece is paid with tickets: its 402 has no lottery entry, and a request that names
+    /// the lottery for it is refused. The seller serves `window` pieces before any value has
+    /// come, so this is what bounds, in wins, what a buyer that gives none is served.
     pub fn offers(&self, price: &Price) -> bool {
-        !price.is_free() && self.dearest_piece(price).is_some_and(|d| d < self.win_msat)
+        let small = |d: u64| d < self.win_msat && u128::from(d) * u128::from(self.max_odds_den) <= u128::from(self.win_msat);
+        !price.is_free() && self.dearest_piece(price).is_some_and(small)
     }
 }
 
@@ -226,6 +245,9 @@ pub struct Session {
     /// Answers of this session that are still being sent.
     pub open_responses: u32,
     pub finals: VecDeque<Value>,
+    /// When the buyer closed it, if it did while it owed: it serves nothing more and keeps its
+    /// place in the caps until it has been quiet for `first_use_secs`.
+    pub closed: Option<u64>,
 }
 
 impl Session {
@@ -235,6 +257,12 @@ impl Session {
 
     pub fn pending(&self) -> usize {
         self.seller.pending_count()
+    }
+
+    /// The pieces this session was served and gave no value for: the open ones and the voided
+    /// ones. What the window counts.
+    pub fn unvalued(&self) -> usize {
+        self.seller.pending_count().saturating_add(self.voids as usize)
     }
 
     pub fn won_msat(&self) -> u64 {
@@ -354,6 +382,7 @@ impl Book {
                 voids: 0,
                 open_responses: 0,
                 finals: VecDeque::new(),
+                closed: None,
             },
         );
         self.totals.opened += 1;
@@ -367,7 +396,8 @@ impl Book {
     /// The session exists, `verify` accepts its key, `seq` is the next one. A `seq` is used up by
     /// any request that passes here, served or not.
     pub fn authenticate(&mut self, session: &str, seq: u64, now: u64, verify: impl FnOnce(&[u8; 32]) -> bool) -> Result<(), Refusal> {
-        let s = self.sessions.get_mut(session).ok_or(Refusal::SessionUnknown)?;
+        // a session its buyer closed is known to nobody, whatever place it still keeps
+        let s = self.sessions.get_mut(session).filter(|s| s.closed.is_none()).ok_or(Refusal::SessionUnknown)?;
         if !verify(&s.key) {
             return Err(Refusal::BadAuth);
         }
@@ -383,7 +413,7 @@ impl Book {
 
     /// Why this session is served no further piece now, if it is not.
     pub fn blocked(&self, session: &str, now: u64) -> Option<Refusal> {
-        let Some(s) = self.sessions.get(session) else { return Some(Refusal::SessionUnknown) };
+        let Some(s) = self.sessions.get(session).filter(|s| s.closed.is_none()) else { return Some(Refusal::SessionUnknown) };
         if s.voids > self.cfg.max_voids {
             return Some(Refusal::TooManyVoids);
         }
@@ -391,10 +421,18 @@ impl Book {
         if s.unpaid.len() > self.cfg.max_unpaid_wins as usize || s.unpaid.iter().any(late) {
             return Some(Refusal::WinUnpaid);
         }
-        if s.seller.pending_count() >= self.cfg.window as usize {
-            return Some(Refusal::ValueMissing);
+        Self::window_full(&self.cfg, s)
+    }
+
+    /// The window: a session is served no piece while the pieces it gave no value for, open and
+    /// voided together, are `window` or more. A value for an open piece makes room; a void makes
+    /// none, or a buyer that voids every piece is served without end and without a draw. With
+    /// nothing open no value can make room: the session is over (`too_many_voids`).
+    fn window_full(cfg: &LotteryConfig, s: &Session) -> Option<Refusal> {
+        if s.unvalued() < cfg.window as usize {
+            return None;
         }
-        None
+        Some(if s.seller.pending_count() > 0 { Refusal::ValueMissing } else { Refusal::TooManyVoids })
     }
 
     /// How long an answer that is being sent may stand still for the session's oldest unpaid win,
@@ -406,11 +444,18 @@ impl Book {
         left.min(u64::from(self.cfg.pay_wait_secs))
     }
 
-    /// A piece has left for the buyer. A piece with no price is not a piece.
+    /// A piece is about to leave for the buyer: it is marked, or refused because the window is
+    /// full. The window is asked again here, in the same step that marks the piece, because
+    /// [`Book::blocked`] was asked before the service was: several requests of one session that
+    /// arrive together would each have found room for the same place. A piece with no price is
+    /// not a piece.
     pub fn serve(&mut self, session: &str, piece: Piece) -> Result<(), Refusal> {
-        let s = self.sessions.get_mut(session).ok_or(Refusal::SessionUnknown)?;
+        let s = self.sessions.get_mut(session).filter(|s| s.closed.is_none()).ok_or(Refusal::SessionUnknown)?;
         if piece.amount_msat == 0 {
             return Ok(());
+        }
+        if let Some(full) = Self::window_full(&self.cfg, s) {
+            return Err(full);
         }
         s.seller.serve(piece).map_err(Refusal::Draw)?;
         s.served_msat = s.served_msat.saturating_add(piece.amount_msat);
@@ -429,7 +474,7 @@ impl Book {
     /// Take a `draw` request: the voids, then the values in order, stopping at the first one
     /// refused. A win is listed unpaid from here, with no invoice yet.
     pub fn draw(&mut self, session: &str, values: &[Value32], voids: &[PieceId], now: u64) -> Result<Drawn, Refusal> {
-        let s = self.sessions.get_mut(session).ok_or(Refusal::SessionUnknown)?;
+        let s = self.sessions.get_mut(session).filter(|s| s.closed.is_none()).ok_or(Refusal::SessionUnknown)?;
         for id in voids {
             if s.seller.void(*id) {
                 s.voids = s.voids.saturating_add(1);
@@ -514,9 +559,18 @@ impl Book {
         }
     }
 
-    /// Forget a session the buyer closed. Its unpaid wins go with it: their invoices lapse.
-    pub fn close(&mut self, session: &str) -> bool {
-        self.sessions.remove(session).is_some()
+    /// The buyer closed its session: it is served nothing more. One that owes nothing is
+    /// forgotten at once. One that was served pieces it gave no value for, or has a win unpaid,
+    /// keeps its place in the caps until [`Book::sweep`] takes it: closing must not be a way to
+    /// take the window again and again from one address.
+    pub fn close(&mut self, session: &str, now: u64) -> bool {
+        let Some(s) = self.sessions.get_mut(session).filter(|s| s.closed.is_none()) else { return false };
+        if s.unvalued() == 0 && s.unpaid.is_empty() {
+            self.sessions.remove(session);
+        } else {
+            s.closed = Some(now);
+        }
+        true
     }
 
     /// Forget the sessions that have gone quiet: none with an answer still being sent. Returns
@@ -527,7 +581,10 @@ impl Book {
         self.sessions.retain(|_, s| {
             let quiet = now.saturating_sub(s.active);
             let unused = s.seller.drawn() == 0 && now.saturating_sub(s.opened) > cfg.first_use_secs && quiet > cfg.first_use_secs;
-            s.open_responses > 0 || !(quiet > cfg.idle_secs || unused)
+            // a closed one waits as long as one that never drew, whatever it drew: no longer, or a
+            // buyer whose answers are cut would be kept out by its own closed sessions
+            let closed = s.closed.is_some_and(|at| now.saturating_sub(at) > cfg.first_use_secs);
+            s.open_responses > 0 || !(quiet > cfg.idle_secs || unused || closed)
         });
         before - self.sessions.len()
     }
@@ -579,7 +636,7 @@ mod tests {
         let c = LotteryConfig::parse(&json!({}), 40).unwrap();
         assert_eq!((c.win_msat, c.min_win_msat, c.win_blocks, c.window), (64_000, 16_000, 40, 8));
         assert_eq!((c.grace_seconds, c.grace_pieces, c.max_unpaid_wins, c.chain_draws), (30, 64, 2, 65_536));
-        assert_eq!((c.piece_bytes, c.max_sessions, c.sessions_per_address, c.max_voids), (262_144, 64, 4, 16));
+        assert_eq!((c.piece_bytes, c.max_sessions, c.sessions_per_address, c.max_voids, c.max_odds_den), (262_144, 64, 4, 4, 4));
         assert_eq!((c.idle_secs, c.first_use_secs, c.invoice_secs, c.pay_wait_secs), (300, 60, 60, 10));
         assert_eq!(LotteryConfig::parse(&json!({"win_msat": 8000}), 40).unwrap().min_win_msat, 8000);
         for bad in [
@@ -595,6 +652,7 @@ mod tests {
             json!({"max_sessions": 0}),
             json!({"win_blocks": 17}),
             json!({"invoice_secs": 4}),
+            json!({"max_odds_den": 0}),
             json!({"window": "8"}),
             json!({"windows": 8}),
             json!([]),
@@ -604,17 +662,25 @@ mod tests {
     }
 
     #[test]
-    fn a_route_is_offered_by_lottery_only_if_every_piece_costs_less_than_a_win() {
+    fn a_route_is_offered_by_lottery_only_if_its_dearest_piece_is_a_quarter_of_a_win_or_less() {
         let c = LotteryConfig::parse(&json!({}), 40).unwrap();
         let p = |request_msat, byte_msat, per_bytes, second_msat| Price { request_msat, byte_msat, per_bytes, second_msat };
         assert!(c.offers(&p(100, 0, 1, 0)) && !c.offers(&p(0, 0, 1, 0)), "a free route has nothing to draw for");
-        assert!(c.offers(&p(63_999, 0, 1, 0)) && !c.offers(&p(64_000, 0, 1, 0)));
-        assert!(c.offers(&p(0, 0, 1, 63_999)) && !c.offers(&p(0, 0, 1, 64_000)));
-        // 100 msat for a piece of 256 KiB; and a price at which one piece is a whole win
-        assert!(c.offers(&p(0, 100, 262_144, 0)));
-        assert!(!c.offers(&p(0, 64_000, 262_144, 0)) && c.offers(&p(0, 63_999, 262_144, 0)));
+        // a quarter of the 64-sat win is offered, one msat more is not: for a request, a second and a piece of bytes
+        assert!(c.offers(&p(16_000, 0, 1, 0)) && !c.offers(&p(16_001, 0, 1, 0)));
+        assert!(c.offers(&p(0, 0, 1, 16_000)) && !c.offers(&p(0, 0, 1, 16_001)));
+        assert!(c.offers(&p(0, 16_000, 262_144, 0)) && !c.offers(&p(0, 16_001, 262_144, 0)));
+        // the dearest of the three decides
+        assert!(!c.offers(&p(100, 100, 262_144, 16_001)));
         assert!(!c.offers(&p(0, u64::MAX, 1, 0)), "a price that does not fit is no offer");
         assert_eq!(c.dearest_piece(&p(5, 100, 262_144, 7)), Some(100));
+        // the runner's own number: 1 is every piece below a whole win, and never a whole win
+        let any = LotteryConfig::parse(&json!({"max_odds_den": 1}), 40).unwrap();
+        assert!(any.offers(&p(63_999, 0, 1, 0)) && !any.offers(&p(64_000, 0, 1, 0)));
+        let strict = LotteryConfig::parse(&json!({"max_odds_den": 640}), 40).unwrap();
+        assert!(strict.offers(&p(0, 100, 262_144, 0)) && !strict.offers(&p(0, 101, 262_144, 0)));
+        // what the rule bounds: the window, in wins. 8 pieces of a quarter of a win at the most
+        assert!(u64::from(c.window) * 16_000 <= 2 * c.win_msat);
     }
 
     #[test]
@@ -663,30 +729,110 @@ mod tests {
             b.serve(&id, *p).unwrap();
         }
         assert_eq!(b.blocked(&id, 1000), Some(Refusal::ValueMissing));
-        // one value, or one void, makes room for one piece
+        // the window is kept where a piece is marked too: a request that found room a moment ago,
+        // beside another that took it, marks nothing
+        assert_eq!(b.serve(&id, bytes(0, 3, 100)).unwrap_err(), Refusal::ValueMissing);
+        assert_eq!((b.session(&id).unwrap().pending(), b.session(&id).unwrap().served_msat), (3, 300));
+        // one value makes room for one piece
         b.draw(&id, &[value(1, &ps[1], 1)], &[], 1000).unwrap();
         assert_eq!(b.blocked(&id, 1000), None);
         b.serve(&id, bytes(0, 3, 100)).unwrap();
         assert_eq!(b.blocked(&id, 1000), Some(Refusal::ValueMissing));
-        b.draw(&id, &[], &[ps[0].id], 1000).unwrap();
-        assert_eq!((b.blocked(&id, 1000), b.session(&id).unwrap().voids), (None, 1));
-        // a piece with no price is not a piece: nothing waits for a value
+        // a piece with no price is not a piece: nothing waits for a value, and a full window does not refuse it
         b.serve(&id, bytes(0, 9, 0)).unwrap();
-        assert_eq!(b.session(&id).unwrap().pending(), 2);
+        assert_eq!(b.session(&id).unwrap().pending(), 3);
         assert_eq!(b.session(&id).unwrap().served_msat, 400);
     }
 
     #[test]
-    fn a_buyer_that_voids_every_piece_is_stopped() {
+    fn a_void_makes_no_room_so_a_buyer_that_voids_every_piece_gets_the_window_and_no_more() {
+        // whatever the cap on voids: 2 (below the window of 3), and one far above it
+        for max_voids in [2u32, 1000] {
+            let mut c = cfg();
+            c.max_voids = max_voids;
+            let mut b = Book::new(c);
+            let id = open(&mut b, 1, "a").unwrap();
+            let mut served = 0;
+            for k in 0..50 {
+                if b.blocked(&id, 1000).is_some() {
+                    break;
+                }
+                let p = bytes(0, k, 100);
+                b.serve(&id, p).unwrap();
+                served += 1;
+                // a void for a piece that is not open counts for nothing
+                b.draw(&id, &[], &[p.id, p.id, bytes(5, 5, 1).id], 1000).unwrap();
+            }
+            assert_eq!((served, b.session(&id).unwrap().voids), (3, 3), "max_voids {max_voids}");
+            // nothing is open, so no value can make room: the session is over, and says so
+            assert_eq!(b.blocked(&id, 1000), Some(Refusal::TooManyVoids));
+            assert_eq!(b.serve(&id, bytes(0, 99, 100)).unwrap_err(), Refusal::TooManyVoids);
+        }
+        // voids and silence mixed: still the window. One void, then two pieces left open
         let mut b = Book::new(cfg());
         let id = open(&mut b, 1, "a").unwrap();
+        let p0 = bytes(0, 0, 100);
+        b.serve(&id, p0).unwrap();
+        b.draw(&id, &[], &[p0.id], 1000).unwrap();
+        let (p1, p2) = (bytes(0, 1, 100), bytes(0, 2, 100));
+        b.serve(&id, p1).unwrap();
+        b.serve(&id, p2).unwrap();
+        assert_eq!(b.blocked(&id, 1000), Some(Refusal::ValueMissing), "values for the open pieces would make room");
+        // an honest buyer whose answer was cut once: it voided one piece and draws for the rest. Its
+        // window is one narrower from then on, and it is served
+        b.draw(&id, &[value(1, &p1, 1), value(2, &p2, 2)], &[], 1000).unwrap();
+        assert_eq!((b.blocked(&id, 1000), b.session(&id).unwrap().unvalued()), (None, 1));
+        for k in 3..5 {
+            b.serve(&id, bytes(0, k, 100)).unwrap();
+        }
+        assert_eq!(b.blocked(&id, 1000), Some(Refusal::ValueMissing), "two open and one voided of three");
+        // and past max_voids (2) the session ends, with room or without
+        let mut b = Book::new(LotteryConfig::parse(&json!({"window": 8, "max_voids": 2, "chain_draws": 4096}), 40).unwrap());
+        let id = open(&mut b, 1, "a").unwrap();
         for k in 0..3 {
+            assert_eq!(b.blocked(&id, 1000), None);
             let p = bytes(0, k, 100);
             b.serve(&id, p).unwrap();
-            // a void for a piece that is not open counts for nothing
-            b.draw(&id, &[], &[p.id, p.id, bytes(5, 5, 1).id], 1000).unwrap();
+            b.draw(&id, &[], &[p.id], 1000).unwrap();
         }
-        assert_eq!((b.session(&id).unwrap().voids, b.blocked(&id, 1000)), (3, Some(Refusal::TooManyVoids)));
+        assert_eq!(b.blocked(&id, 1000), Some(Refusal::TooManyVoids));
+    }
+
+    #[test]
+    fn a_session_closed_while_it_owes_keeps_its_place_and_one_that_owes_nothing_is_forgotten() {
+        let mut b = Book::new(cfg());
+        // owes nothing: every piece it was served has its value
+        let clean = open(&mut b, 1, "v4:1.1.1.1").unwrap();
+        let p = bytes(0, 0, 1);
+        b.serve(&clean, p).unwrap();
+        b.draw(&clean, &[value(1, &p, 1)], &[], 1000).unwrap();
+        assert!(b.session(&clean).unwrap().unpaid.is_empty(), "1 msat on a 64-sat win does not win with this value");
+        assert!(b.close(&clean, 1000) && b.session(&clean).is_none() && !b.close(&clean, 1000));
+        // took the window and closed: served nothing more, known to nobody, and still in its place
+        let a = open(&mut b, 2, "v4:1.1.1.1").unwrap();
+        let c = open(&mut b, 3, "v4:1.1.1.1").unwrap();
+        for id in [&a, &c] {
+            for k in 0..3 {
+                b.serve(id, bytes(0, k, 100)).unwrap();
+            }
+            assert!(b.close(id, 1000));
+            assert_eq!(b.blocked(id, 1000), Some(Refusal::SessionUnknown));
+            assert_eq!(b.authenticate(id, 0, 1000, |_| true).unwrap_err(), Refusal::SessionUnknown);
+            assert_eq!(b.serve(id, bytes(1, 0, 100)).unwrap_err(), Refusal::SessionUnknown);
+            assert_eq!(b.draw(id, &[], &[], 1000).unwrap_err(), Refusal::SessionUnknown);
+        }
+        assert_eq!(open(&mut b, 4, "v4:1.1.1.1").unwrap_err(), Refusal::TooManySessions, "two from one address, closed or not");
+        assert_eq!(b.sessions(), 2);
+        // until they have been quiet for first_use_secs (60), as a session that never drew is
+        assert_eq!(b.sweep(1060), 0);
+        assert_eq!(b.sweep(1061), 2);
+        open(&mut b, 4, "v4:1.1.1.1").unwrap();
+        // one void is a debt too
+        let v = open(&mut b, 5, "v4:1.1.1.1").unwrap();
+        let p = bytes(0, 0, 100);
+        b.serve(&v, p).unwrap();
+        b.draw(&v, &[], &[p.id], 2000).unwrap();
+        assert!(b.close(&v, 2000) && b.session(&v).is_some_and(|s| s.closed == Some(2000)));
     }
 
     #[test]

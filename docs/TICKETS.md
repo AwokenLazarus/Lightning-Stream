@@ -537,8 +537,12 @@ knows only tickets skips an entry it cannot read.
 | `chainDraws` | The draws one session's chain covers. | A session ends when its chain does; the buyer opens another. |
 | `pieceBytes` | The bytes of an answer that make one piece. | Both sides must cut an answer at the same places. |
 
-An entry is offered only for a route whose every piece (its request, one second, one full piece
-of bytes) costs less than `winMsat`. A buyer MUST refuse an entry whose win is outside what its
+An entry is offered only for a route whose dearest piece (its request, one second, one full piece
+of bytes) is a small part of `winMsat`: a quarter at the most at the gateway (`max_odds_den`, 4),
+which is the odds cap the wallet's owner has too (section 9.8). The seller serves `window` pieces
+before any value has come, so the dearest piece over the win is what that costs it in wins: 8
+pieces of a quarter of a win are 2 wins. A request that names the lottery for a route that is not
+offered is refused `amount_not_below_win`, and the service is not asked. A buyer MUST refuse an entry whose win is outside what its
 owner allows, or whose pieces would win more often than its owner allows, or it pays larger
 amounts, or more often, than the owner agreed to. It MUST refuse an entry it cannot read whole,
 and one whose `pay` it does not build: a draw the two sides would work out differently is a win
@@ -569,7 +573,13 @@ PAYMENT-SIGNATURE: base64({"x402Version": 2, "accepted": <the lottery entry>,
   memory only, so a restart cannot bring a chain back.
 - The seller MUST cap sessions, in all and from one address, and forget a quiet one. A session
   costs `chainDraws` hashes to make and about 34 KiB to keep at the default length (one chain value
-  in every 1,024 and the block last read), and anyone can ask for one.
+  in every 1,024 and the block last read), and anyone can ask for one. Every session is also
+  served its window before any value (section 9.6), so the cap per address is what bounds the
+  pieces one buyer gets for nothing, and it MUST count the buyer's address: behind a reverse
+  proxy the socket's address is the proxy's for everyone, and the cap then holds the whole world
+  to a few sessions or, set to 0, holds nobody. The gateway counts the address a proxy reports
+  only where its runner names the proxy and the header (`http.forwarded_address`, off by
+  default); section 9.9.
 - The buyer MUST refuse an anchor it has been given before, and an answer that names another win
   size or chain length than it asked for.
 - The requests MUST go over TLS (or loopback): the session key travels in this answer.
@@ -678,7 +688,12 @@ The seller:
   piece just before its last write, so that a buyer that has all of it never names a piece the
   seller does not know; the last, short piece of a body of unknown length is marked when the body
   has ended, and a buyer whose value for it is refused `piece_unknown` sends the same value again.
-- SHOULD stop a session with more voids than it allows (`too_many_voids`, 16 at the gateway).
+- MUST count a voided piece against the window (section 9.6) for the rest of its session: a
+  void closes the piece and makes no room. A seller that lets a void make room serves a buyer
+  that voids every piece without end and without a draw, and cannot tell it from a buyer whose
+  connection was cut.
+- SHOULD end a session with more voids than it allows (`too_many_voids`; 4 at the gateway, half
+  of its window), and one in which voids alone fill the window.
 
 ### 9.5 Paying a win
 
@@ -720,8 +735,11 @@ above three times is not asked for another: the session ends as faulty.
 
 An answer that did not arrive whole (the wallet stopped reading it, or it was cut) can leave
 pieces open with the seller: it marks a piece when its last bytes leave. The buyer SHOULD name as
-`void` every piece of such an answer that will get no value, or they fill the seller's window
-for the session's next request. The same goes for the end of any answer priced by the second:
+`void` every piece of such an answer that will get no value. That makes no room in the seller's
+window (section 9.6); it tells the seller that no value will come, so that the seller ends a
+session whose window is used up (`too_many_voids`) and the buyer opens another, where a seller
+that was told nothing would wait for values (`value_missing`). The same goes for the end of any
+answer priced by the second:
 the seller counts its seconds on its own clock, which started a moment before the buyer's, and
 may have begun one second more than the buyer gave a value for.
 
@@ -729,10 +747,20 @@ may have begun one second more than the buyer gave a value for.
 
 The seller goes first, and these are what bound it:
 
-- **The window.** No more than `window` pieces are open (served, with neither a value nor a
-  void) at once. A request beyond that is refused `value_missing`; an answer that is being sent
-  waits for a value for as long as it would wait for a ticket (3 s at the gateway) and is then
-  cut short.
+- **The window.** A session is served no piece while the pieces it was served and gave no value
+  for are `window` or more: the ones still open and the ones it voided, together. A value for an
+  open piece makes room for one more; a void makes none. A request beyond the window is refused
+  `value_missing` while a value could still make room, and `too_many_voids` when none could; an
+  answer that is being sent waits for a value for as long as it would wait for a ticket (3 s at
+  the gateway) and is then cut short. So a buyer that sends nothing, and a buyer that voids
+  every piece, are each served `window` pieces in a session and no more. An honest buyer pays
+  for this too: every piece of an answer that was cut (one to a few; `window` at the most)
+  narrows its window by one for the rest of the session, and after 4 voids at the gateway
+  (`max_voids`) the session ends and it opens another.
+- **Closing.** A session its buyer closes is served nothing more. If it owes (pieces it gave no
+  value for, or a win unpaid) it keeps its place in the seller's caps until it has been quiet
+  for as long as a session that never drew is kept (60 s at the gateway): or opening, taking
+  the window and closing would be a loop with no bound but the request rate.
 - **The grace.** While a win is unpaid the seller serves on: for `graceSeconds`, for
   `gracePieces` pieces after that win, and with at most `maxUnpaidWins` wins unpaid. Beyond any
   of the three a request is refused `win_unpaid`, with the unpaid wins and their invoices, and
@@ -817,7 +845,7 @@ budgets, `max_sellers`, `max_new_sellers_per_min`, `max_sends_per_hour`.
 | Who | Worst case | Bound |
 |---|---|---|
 | Seller | The service given to a buyer that gives values and never pays: up to its first unpaid win, and the grace. | `winMsat` (a smaller win for a buyer it does not know), `graceSeconds`, `gracePieces`, `maxUnpaidWins`. Measured in section 9.12. |
-| Seller | `window` pieces to a buyer that sends no values, for every session it is given. | `window`; the caps on sessions and on sessions from one address; a session that never drew is forgotten after a minute. |
+| Seller | `window` pieces to a buyer that sends no values, or that voids every piece, for every session it is given: 8 pieces of a quarter of a win at the most, 2 wins. One address is given 4 sessions and gets each place back after a minute: 8 wins a minute at the most. All 64 places, taken from 16 addresses or more: 128 wins a minute. | `window`; the dearest piece a route may have (`max_odds_den`); the caps on sessions and on sessions from one address; a session that never drew, or was closed while it owed, keeps its place for a minute. Behind a reverse proxy the cap per address counts nothing unless the runner names the proxy and its header (`http.forwarded_address`): the gateway then believes that header from that proxy's address, the last entry of a list, and counts a request without one under the proxy's own address. A proxy that passes on a header its client wrote, or a gateway that can be reached past the proxy from one of the named addresses, makes the cap the buyer's to set. |
 | Seller | A win it never invoices or whose invoice lapses. | Its own node and gateway. A session, with its unpaid wins, does not outlive the gateway's process. |
 | Seller | Uneven income: a seller that earns less than a win from a buyer is usually paid nothing by it, and sometimes a whole win. | The number of wins: pay is within 20% after about 68 wins. |
 | Buyer | Nothing beyond wins it worked out itself. An unlucky run costs more than the price, a lucky one less. | The owner's caps on a win, on the odds and on wins to an unnamed seller; the luck cap of a call; the task's budget. |
@@ -828,8 +856,10 @@ budgets, `max_sellers`, `max_new_sellers_per_min`, `max_sends_per_hour`.
 ### 9.10 Errors
 
 Beside those of section 3 that apply (`bad_auth`, `bad_seq`, `session_unknown`,
-`too_many_sessions`, `upstream_unavailable`): `value_missing`, `win_unpaid`, `too_many_voids`,
-`amount_not_below_win`, `win_size` (the size asked for at `open` is outside the terms),
+`too_many_sessions`, `upstream_unavailable`): `value_missing`, `win_unpaid`, `too_many_voids`
+(the session is over: its voids are past the seller's cap, or fill its window),
+`amount_not_below_win` (a piece of the route costs the session's win or more, or the route is
+not one the terms offer by lottery), `win_size` (the size asked for at `open` is outside the terms),
 `chain_spent`, and, for a value in a `draw` request, `draw_out_of_order`, `draw_used` (a draw
 taken too long ago to answer again), `piece_unknown`, `amount_mismatch`, `value_conflict`,
 `value_reused`. A gateway that restarts has forgotten its sessions and answers

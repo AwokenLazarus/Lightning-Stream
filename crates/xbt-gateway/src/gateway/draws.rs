@@ -10,8 +10,10 @@
 //!    the request digest, which covers a `draw`'s body and so every value in it.
 //! 3. **Inside the window and the grace** ([`Book::blocked`]), on the node's own word about each
 //!    unpaid win ([`Gateway::lottery_refresh`]): a buyer's claim that it paid moves nothing.
-//! 4. **Every piece costs less than the session's win** (`amount_not_below_win` otherwise): a
-//!    dearer piece is paid with tickets.
+//! 4. **Only a route the terms offer by lottery** ([`crate::lottery::LotteryConfig::offers`]: its
+//!    dearest piece is a small part of a win), and every piece below the session's own win
+//!    (`amount_not_below_win` otherwise): a dearer piece is paid with tickets, whatever the
+//!    request's header says.
 //! 5. **Only what the runner allowed reaches the service**, and nothing the service says is read
 //!    for money: a piece is the bytes the gateway itself sent and the seconds it itself counted.
 //! 6. **A piece is a piece once it has left** ([`Book::serve`]): the buyer's value can only follow
@@ -105,8 +107,8 @@ impl Gateway {
             .is_some_and(|v| v.get("accepted").and_then(|a| a.get("scheme")).and_then(Value::as_str) == Some(lottery::SCHEME))
     }
 
-    /// The lottery entry of a route's 402, where the runner offers the lottery and every piece of
-    /// the route costs less than a win.
+    /// The lottery entry of a route's 402, where the runner offers the lottery and the route's
+    /// dearest piece is a small enough part of a win.
     pub(super) fn lottery_entry(&self, route: &Route) -> Option<Value> {
         let cfg = self.cfg.lottery.as_ref()?;
         if !cfg.offers(&route.price) {
@@ -394,7 +396,8 @@ impl Gateway {
         out["session"] = view;
         let answer = self.draw_answered(&a, json_response(200, &out), 0);
         if call == "close" {
-            l.lock().close(&a.session);
+            let now = self.now();
+            l.lock().close(&a.session, now);
         }
         answer
     }
@@ -414,7 +417,7 @@ impl Gateway {
                 None => return error(400, "bad_request", "winMsat is a decimal string"),
             },
         };
-        let addr = addr_name(req.peer);
+        let addr = addr_name(self.client_ip(req));
         // the caps first: a request they refuse costs no chain
         let (win_msat, chain_draws) = {
             let b = l.lock();
@@ -503,14 +506,17 @@ impl Gateway {
             return Reply::Whole(error(500, "internal", "a request digest that is not 32 bytes"));
         };
         self.lottery_refresh(l, &a.session);
-        let (blocked, win_msat, dearest) = {
+        let (blocked, win_msat, dearest, offered) = {
             let b = l.lock();
-            (b.blocked(&a.session, self.now()), b.session(&a.session).map_or(0, |s| s.win_msat), b.cfg().dearest_piece(&route.price))
+            (b.blocked(&a.session, self.now()), b.session(&a.session).map_or(0, |s| s.win_msat), b.cfg().dearest_piece(&route.price), b.cfg().offers(&route.price))
         };
         if let Some(why) = blocked {
             return Reply::Whole(self.draw_refused(l, &a, &req.target, Some(route), why.code()));
         }
-        if dearest.is_none_or(|d| d >= win_msat) {
+        // the 402 offers the lottery only for a route whose dearest piece is a small part of a win, and
+        // a buyer that names the lottery all the same is held to that: it is the buyer that reads no 402
+        // whom the rule is for
+        if !offered || dearest.is_none_or(|d| d >= win_msat) {
             return Reply::Whole(self.draw_refused(l, &a, &req.target, Some(route), DrawError::AmountNotBelowWin.code()));
         }
         let head_only = req.method == "HEAD";
@@ -557,9 +563,15 @@ impl Gateway {
         } else {
             None
         };
-        // the request's own piece: it has left when the answer's head does
-        if self.lottery_serve(l, &m, Kind::Request, 0, m.at_head).is_err() {
-            return Reply::Whole(self.draw_refused(l, &a, &req.target, Some(route), DrawError::ChainSpent.code()));
+        // the request's own piece: it has left when the answer's head does. The window is asked
+        // again as the piece is marked: requests of one session that arrived together each found room
+        if let Err(why) = self.lottery_serve(l, &m, Kind::Request, 0, m.at_head) {
+            let code = match why {
+                Refused::Draw(DrawError::AmountNotBelowWin) => DrawError::AmountNotBelowWin.code(),
+                Refused::Draw(_) => DrawError::ChainSpent.code(),
+                other => other.code(),
+            };
+            return Reply::Whole(self.draw_refused(l, &a, &req.target, Some(route), code));
         }
         if no_body {
             // the answer keeps the length the service stated (what a HEAD is asked for)

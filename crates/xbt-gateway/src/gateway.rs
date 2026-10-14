@@ -30,7 +30,7 @@
 //!   the node shows that invoice settled for the full amount, whoever asks.
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read};
-use std::net::{SocketAddr, TcpListener};
+use std::net::{IpAddr, TcpListener};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -151,8 +151,8 @@ fn error(status: u16, code: &str, detail: &str) -> Response {
     json_response(status, &json!({"error": code, "detail": detail}))
 }
 
-fn addr_name(peer: Option<SocketAddr>) -> String {
-    match peer.map(|a| AddrKey::of(a.ip())) {
+fn addr_name(client: Option<IpAddr>) -> String {
+    match client.map(AddrKey::of) {
         Some(AddrKey::V4(a)) => format!("v4:{a}"),
         Some(AddrKey::V6Prefix(p)) => format!("v6:{p:016x}"),
         None => "none".into(),
@@ -662,6 +662,26 @@ impl Gateway {
 
     // --- the wire ---------------------------------------------------------------------------------
 
+    /// The address the caps per address count a request under: the socket's peer, or, where the
+    /// runner named a reverse proxy and the header it sets (`http.forwarded_address`), the address
+    /// that proxy says it took the request from. The header is read only on a connection from one
+    /// of the named proxies; anyone else's is just a header, and that request counts under its own
+    /// socket address. Of a list (`a, b, c`) the last entry is the one the proxy wrote. A header
+    /// that is missing, sent twice or not an address counts the request under the proxy's own
+    /// address, with everything else that came that way: the cap is then too tight, never open.
+    fn client_ip(&self, req: &Request) -> Option<IpAddr> {
+        let peer = req.peer.map(|p| p.ip().to_canonical())?;
+        let Some(f) = self.cfg.forwarded.as_ref().filter(|f| f.proxies.contains(&peer)) else {
+            return Some(peer);
+        };
+        let mut named = req.headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case(&f.header));
+        let client = match (named.next(), named.next()) {
+            (Some((_, v)), None) => v.rsplit(',').next().and_then(|a| a.trim().parse::<IpAddr>().ok()),
+            _ => None,
+        };
+        Some(client.map_or(peer, |a| a.to_canonical()))
+    }
+
     fn url(&self, target: &str) -> String {
         format!("{}{target}", self.cfg.public_url)
     }
@@ -1017,7 +1037,7 @@ impl Gateway {
         let granted = room.and_then(|()| {
             let mut st = self.lock();
             let granted = st.book.lock(
-                &addr_name(req.peer),
+                &addr_name(self.client_ip(req)),
                 authed.as_ref().map(|a| a.session.as_str()),
                 &hashes,
                 prepaid,
@@ -1660,7 +1680,8 @@ impl Handler for Service {
         let gw = &self.0;
         let path = req.path().to_string();
         if let Some(call) = self.session_path(&path) {
-            let loopback = req.peer.is_some_and(|p| p.ip().is_loopback());
+            // behind a named proxy on this machine every socket is loopback: the address it reports decides
+            let loopback = gw.client_ip(&req).is_some_and(|a| a.is_loopback());
             return Reply::Whole(match (req.method.as_str(), call) {
                 ("POST", "lock") => gw.lock_tickets(&req),
                 ("POST", "release" | "cancel" | "status") => gw.session_call(&req, call),
