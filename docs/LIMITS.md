@@ -86,7 +86,7 @@ limits are in the git history, last at commit `1ad0c48`. What the removal leaves
 
 The sentences of this section are about tickets as such, whoever builds on them. A ticket is a small Lightning payment locked along a
 route to a hash whose secret only the buyer knows (a hold invoice on the seller's node); the
-buyer releases it by putting the secret in a paid request. Each sentence below comes from the
+buyer releases it by sending the seller the secret. Each sentence below comes from the
 design's lab measurements: three Lightning Fork nodes on regtest, buyer and seller one routing
 node apart, default node settings. The wallet's ticket book and the seller's gateway have their own sections below.
 A sentence marked *(with Core Lightning)* comes from a later lab run with three nodes of the XBT
@@ -657,7 +657,9 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
   origins are free to make, so under a task that pays any seller what bounds this is the task's
   budget and its cap per unnamed seller.
 - The wallet sends a secret only in `release`. A seller that takes a secret only with the request
-  it pays for cannot be paid; the gateway takes both.
+  it pays for cannot be paid; the gateway takes both. The draft says which a seller must
+  support: `release` (`docs/TICKETS.md`, sections 1 and 3). The terms have no field for it, and
+  `with-request` names both.
 - An entry that releases `after-verify` is not paid: the wallet passes it over and tries the
   next rail.
 - Held tickets are the wallet's first choice. It buys a prepaid ticket (`settle: "on-arrival"`)

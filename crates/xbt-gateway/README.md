@@ -21,9 +21,11 @@ test buyer.
    size, how many tickets a buyer may hold, how long a ticket lives, who goes first, the price rule.
 2. `POST /x402/ticket/lock` registers a hold invoice on your node for each hash the buyer sends.
    The buyer's node pays them; each is now a locked ticket. Only the buyer knows the secrets.
-3. A paid request carries a secret. The gateway hashes it, finds the ticket in that buyer's
-   session, checks the node holds it (`ACCEPTED`) with more than 24 blocks left, settles it on
-   your node, and only then passes the request to your service.
+3. The buyer releases a ticket by sending its secret: in `POST /x402/ticket/release`, which is
+   what the wallet of this tree does, or inside a paid request, which the gateway also takes.
+   The gateway hashes it, finds the ticket in that buyer's session, checks the node holds it
+   (`ACCEPTED`) with more than 24 blocks left, settles it on your node, and only then serves on
+   it.
 4. The answer is metered against the session's balance in millisatoshi and comes with a receipt
    signed by the gateway's receipt key. A long answer stops when the buyer stops releasing tickets.
 5. Tickets of a buyer that goes quiet are cancelled, so they stop holding your inbound capacity.

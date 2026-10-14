@@ -12,9 +12,9 @@ once, as in a torrent swarm or people lending hardware for AI.
 channels, not beside them, and adds one thing: the **stream ticket**. A ticket is a small
 Lightning payment that is locked along the route but not yet released. The buyer picks a secret
 and gives the seller only its hash; the seller's node issues a hold invoice for that hash and the
-buyer's node pays it. Nobody can take the money, because only the buyer knows the secret. To pay
-for a request, the buyer puts the secret in the request; the seller checks it, serves, and
-collects. A few tickets are locked before the service starts and topped up in the background, so
+buyer's node pays it. Nobody can take the money, because only the buyer knows the secret. To pay,
+the buyer sends the seller the secret; the seller checks it, collects, and serves requests from
+the balance that ticket makes. A few tickets are locked before the service starts and topped up in the background, so
 no request waits for a payment. Lightning's own routing carries tickets to any seller the
 network reaches, with no change to an lnd-family node: lnd and its forks, which have hold
 invoices. Only one of them was run, Lightning Fork. **A Core Lightning node cannot be a seller's

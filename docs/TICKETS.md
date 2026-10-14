@@ -22,9 +22,10 @@ of work; "the SHA-256 chain" is the other chain.
 A **ticket** is a small Lightning payment that is locked along an ordinary route and not yet
 released. The buyer picks a 32-byte secret and gives the seller its SHA-256 hash. The seller's node
 issues a hold invoice for that hash, and the buyer's node pays it. The money is now committed to the
-seller along the route, and nobody can take it, because only the buyer knows the secret. To pay for
-a request the buyer puts the secret in the request. The seller hashes it, finds the ticket, collects
-and serves. Tickets are locked a few at a time, ahead of use, so no request waits for a payment.
+seller along the route, and nobody can take it, because only the buyer knows the secret. To pay,
+the buyer gives the seller the secret: the seller hashes it, finds the ticket, collects, and
+serves requests from the balance that ticket makes. The secret travels in a request of its own
+(`release`, section 4); a seller may also take it inside the request it pays for (section 3). Tickets are locked a few at a time, ahead of use, so no request waits for a payment.
 This needs no change to an lnd-family node (lnd and its forks): it is `AddHoldInvoice`,
 `SettleInvoice` and `CancelInvoice`, as those nodes ship them. Of that family only Lightning Fork
 was run. A Core Lightning node cannot be a seller's node for held tickets today. It has no
@@ -68,7 +69,7 @@ A seller that takes tickets adds one entry to `accepts` in its `402` (`PAYMENT-R
 | `minTicketMsat` | Optional. The smallest ticket the seller issues when a buyer asks for a smaller one (section 2). Absent: `ticketMsat` is the only size. | A buyer that pays many sellers a little each sizes its tickets to what a seller will earn; without this a seller cannot say how small it will go. A ticket that is held is never below 546 sat (section 11). |
 | `maxTickets` | The most tickets the seller holds unreleased for one session. | Each held ticket takes one HTLC slot of every channel on the route, and the seller's inbound capacity. A channel has between 30 and 483 slots each way, for everyone who uses it (section 11). |
 | `ticketBlocks` | The final CLTV delta of every ticket invoice: how long a ticket lives. | It bounds how long the buyer's money can be locked (section 6). |
-| `release` | `with-request`: the secret comes with the request. `after-verify`: section 5. | Who goes first, and so who risks one piece. |
+| `release` | `with-request`: the buyer goes first, and a secret is released before the piece it pays for. The secret travels in `POST <session>/release` (section 4), which every seller MUST accept; a seller MAY also accept it in the payload of a paid request (section 3). `after-verify`: section 5. | Who goes first, and so who risks one piece. The word says when a secret is released, not which request carries it: it dates from when the two were the same. |
 | `settle` | `on-use`: tickets are held until used. `on-arrival`: section 5. | Whether a ticket can be had back. |
 | `receiptKey` | The key that signs the seller's receipts. | With tickets the payment preimage proves nothing: the buyer always knew it. The signed receipt is the proof of what was paid for. |
 | `session` | Path of the session endpoints on the seller's origin. | |
@@ -216,8 +217,23 @@ counters in a power cut). The buyer sends the requests of one session one after 
 when the head of the last answer has arrived: two sent together can arrive out of order.
 
 The session has a balance in msat. Each secret released adds `ticketMsat`; each request served
-subtracts its price. A request carries a secret when the balance does not cover its price, and none
-otherwise. The seller, for each request, in this order:
+subtracts its price.
+
+**Where a secret travels.** There are two places, and `release: "with-request"` in the terms
+covers both; no field of the terms says which a seller takes.
+
+- In `POST <session>/release` (section 4), a request of the session that carries secrets and
+  asks for no resource. **A seller MUST accept a secret there.** It is the only place the wallet
+  in this tree sends one (section 12), so a seller that does not accept it there cannot be paid
+  by that wallet.
+- In `payload.secret` of a paid request for a resource, when the balance does not cover that
+  request's price. A seller MAY accept a secret there; the gateway in this tree does, and the
+  test buyer of `scripts/gateway_regtest.sh` pays that way. A buyer MUST NOT count on it with a
+  seller it has not seen take one: a seller that ignores the field answers `balance_short`, and
+  the secret has left the buyer all the same.
+
+In both places the seller does steps 2 and 3 below with the secret. The seller, for each
+request, in this order:
 
 1. Checks `auth` and that `seq` is the next one. Without `auth` anyone who sees a session id spends
    its balance. Without `seq` a replayed request is served twice.
@@ -282,7 +298,9 @@ loopback): on a plain connection a listener learns the session key.
 
 The wallet built here never puts a secret in a request for a resource: every secret travels in
 `release` (section 4), and requests are paid from the balance. A secret then has one path and one
-answer, and a request that is refused has cost no secret (section 12).
+answer, and a request that is refused has cost no secret (section 12). That is why `release` is
+the place a seller must accept: a seller built to this section that took secrets only inside
+paid requests would answer every request of this wallet `balance_short`.
 
 A buyer that starts cannot tell a restart from a restore of older records, in which a ticket shown
 as locked may have been released since. It MUST treat every ticket that was locked before the start
@@ -298,7 +316,8 @@ its node, and about 4 ms in all until the settle call returned. The buyer's node
 Through the gateway (`scripts/gateway_regtest.sh latency`; medians of 300 requests, loopback, a
 260-byte file behind it): 0.45 ms direct to the file server, 0.56 ms through a free route and
 0.63 ms paid from the balance. A paid request added 0.07 to 0.11 ms over an unpaid one in five
-runs. The one request in a ticket's worth that carries a secret waits for the node's settle call:
+runs. The one request in a ticket's worth that carries a secret (this script's test buyer sends
+it inside the paid request) waits for the node's settle call:
 it added 3.4, 3.5 and 3.6 ms on a lab just set up, and 5.7 and 6.0 ms on one that had run for an
 hour (medians of 32). The longest any secret waited for its settle was 19 ms.
 
@@ -1225,7 +1244,7 @@ section 9.7 says which of the two is tried first, and the other is tried after i
 
 | | Entry of the 402 | Paid when | Otherwise |
 |---|---|---|---|
-| 1a | `scheme: "ticket"` on the wallet's Lightning network | Tickets are on (`tickets.enabled`); the call names one of the owner's tasks, or the owner has one task, or one named `default`; the seller is admitted (its origin is on the allowlist and tied to its node id, or the task pays any seller); the terms are inside the owner's bounds; `release` is `with-request`; the origin is https, or http on this machine. | The next entry, with the reason. |
+| 1a | `scheme: "ticket"` on the wallet's Lightning network | Tickets are on (`tickets.enabled`); the call names one of the owner's tasks, or the owner has one task, or one named `default`; the seller is admitted (its origin is on the allowlist and tied to its node id, or the task pays any seller); the terms are inside the owner's bounds; `release` is `with-request`, which the wallet pays by sending each secret in `POST <session>/release` and never inside a paid request (section 3); the origin is https, or http on this machine. | The next entry, with the reason. |
 | 1b | `scheme: "lottery"` on the wallet's Lightning network (section 9) | The lottery is on (`tickets.lottery.enabled`); the task and the seller are admitted as for a ticket; a win size fits the seller's terms and the owner's bounds (section 9.7); the task's budget covers one win and its fee; the origin is https, or http on this machine. | The next entry, with the reason. |
 | 2 | `scheme: "exact"` on the wallet's Lightning network, with a BOLT 11 invoice in `extra.invoice` | The Lightning rail is on; the origin is on the allowlist; the invoice pays the entry's `payTo` its `amount`; and `ln_pay` would pay that invoice (every rule of that rail, the payee on the allowlist among them). The wallet pays it and sends the request again with `{"preimage"}` as the payload of `PAYMENT-SIGNATURE`. | The report below. |
 | | None of them | Nothing is paid. The reply is `no_rail` and lists each entry that was passed over and why. | |
@@ -1336,7 +1355,7 @@ Each of these was found by building `xbt402_pay` over tickets against this draft
 | Section | Before | Now, and why |
 |---|---|---|
 | 2 | The buyer cannot see `ACCEPTED`; it releases and sends the same secret again on `ticket_not_locked`. | It asks the seller's signed `status` first and releases only what `status` shows `ACCEPTED`. A secret is spent when it leaves, so the wallet does not let one leave to find out. |
-| 3 | The secret travels with the request it pays for. | The wallet sends every secret in `release` and pays requests from the balance. One path for a secret, one signed answer to it, and a refused or lost request has cost no secret. |
+| 3 | The secret travels with the request it pays for. | The wallet sends every secret in `release` and pays requests from the balance. One path for a secret, one signed answer to it, and a refused or lost request has cost no secret. Sections 1 and 3 now say so: a seller MUST accept a secret in `release` and MAY accept one inside a paid request. |
 | 3 | `releasedMsat` and `spentMsat` "both only rise". | `spentMsat` falls by what the gateway charged ahead and did not send. A buyer that treats a fall as a lie stops honest sellers; a fall is in its favour, so it is taken. |
 | 3 | A refusal of an authenticated request is signed. | `bad_seq` and `session_unknown` cannot be: the first is answered before authentication, and a seller that has forgotten a session has no totals to sign. The wallet adopts the first and treats the second as the end of the session. |
 | 4 | "The receipt for the whole answer ... is in the answer to `status`." | It appears there when the seller has finished with the answer, which for one the buyer stopped reading is when the seller's next write fails or its wait for a refill ends. The wallet asks for 2 s and otherwise keeps its own count. |
