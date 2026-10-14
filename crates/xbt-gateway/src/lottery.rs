@@ -66,7 +66,9 @@ pub struct LotteryConfig {
     pub idle_secs: u64,
     /// A session that has never given a value is forgotten after this many seconds.
     pub first_use_secs: u64,
-    /// A win's invoice can be paid for this many seconds; an unpaid win gets a new one after.
+    /// A win's invoice can be paid for this many seconds; an unpaid win gets a new one after. At
+    /// most `grace_seconds` (5 where the grace is shorter): a buyer whose payment failed does not
+    /// pay that invoice again, and waits for the next one, which must come before the grace ends.
     pub invoice_secs: u32,
 }
 
@@ -127,11 +129,15 @@ impl LotteryConfig {
         if !(5..=3600).contains(&c.invoice_secs) {
             return Err("lottery.invoice_secs is from 5 to 3600".into());
         }
+        if c.invoice_secs > c.grace_seconds.max(5) {
+            return Err(format!("lottery.invoice_secs {} is more than lottery.grace_seconds {}: a buyer whose payment of a win failed waits for that win's next invoice, which comes only when the first has lapsed, and the session would be refused win_unpaid in between", c.invoice_secs, c.grace_seconds));
+        }
         Ok(c)
     }
 
     fn read(m: &Map<String, Value>, ticket_blocks: u32) -> Result<Self, String> {
         let win_msat = num(m, "win_msat", 64_000)?;
+        let grace_seconds = num32(m, "grace_seconds", 30)?;
         Ok(Self {
             win_msat,
             min_win_msat: num(m, "min_win_msat", win_msat.min(16_000))?,
@@ -139,7 +145,7 @@ impl LotteryConfig {
             window: num32(m, "window", 8)?,
             // a wallet pays 8 wins at a time (a channel may carry 30 pending payments): with 100 sellers of one
             // buyer winning at once the last of them waited 13 s on the lab, and 10 s cut that seller's answer
-            grace_seconds: num32(m, "grace_seconds", 30)?,
+            grace_seconds,
             grace_pieces: num32(m, "grace_pieces", 64)?,
             max_unpaid_wins: num32(m, "max_unpaid_wins", 2)?,
             pay_wait_secs: num32(m, "pay_wait_secs", 10)?,
@@ -154,7 +160,8 @@ impl LotteryConfig {
             max_odds_den: num32(m, "max_odds_den", 4)?,
             idle_secs: num(m, "idle_secs", 300)?,
             first_use_secs: num(m, "first_use_secs", 60)?,
-            invoice_secs: num32(m, "invoice_secs", 60)?,
+            // the grace: an invoice that lapses unpaid is replaced by the time the grace ends
+            invoice_secs: num32(m, "invoice_secs", grace_seconds.clamp(5, 3600))?,
         })
     }
 
@@ -1041,7 +1048,13 @@ mod tests {
         assert_eq!((c.win_msat, c.min_win_msat, c.win_blocks, c.window), (64_000, 16_000, 40, 8));
         assert_eq!((c.grace_seconds, c.grace_pieces, c.max_unpaid_wins, c.chain_draws), (30, 64, 2, 65_536));
         assert_eq!((c.piece_bytes, c.max_sessions, c.sessions_per_address, c.max_voids, c.max_odds_den), (262_144, 64, 4, 4, 4));
-        assert_eq!((c.idle_secs, c.first_use_secs, c.invoice_secs, c.pay_wait_secs), (300, 60, 60, 10));
+        assert_eq!((c.idle_secs, c.first_use_secs, c.invoice_secs, c.pay_wait_secs), (300, 60, 30, 10));
+        // a win's invoice lives no longer than the grace, unless the grace is shorter than 5 s
+        for (grace, invoice) in [(10, 10), (3, 5), (0, 5), (100, 100), (7200, 3600)] {
+            assert_eq!(LotteryConfig::parse(&json!({"grace_seconds": grace}), 40).unwrap().invoice_secs, invoice, "{grace}");
+        }
+        assert!(LotteryConfig::parse(&json!({"grace_seconds": 30, "invoice_secs": 31}), 40).unwrap_err().contains("win_unpaid"));
+        assert_eq!(LotteryConfig::parse(&json!({"grace_seconds": 3, "invoice_secs": 5}), 40).unwrap().invoice_secs, 5);
         assert_eq!(LotteryConfig::parse(&json!({"win_msat": 8000}), 40).unwrap().min_win_msat, 8000);
         for bad in [
             json!({"win_msat": 999}),

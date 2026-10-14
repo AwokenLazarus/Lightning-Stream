@@ -23,6 +23,8 @@ struct Held {
     cltv: u32,
     /// An ordinary invoice: a payment that arrives settles it at once, and no HTLC stays pending.
     ordinary: bool,
+    /// How long it may be paid for, as asked: the node's own expiry is the test's to call.
+    expiry_s: u32,
 }
 
 /// One settle call the stand-in answered with success.
@@ -223,6 +225,11 @@ impl StandIn {
         self.lock().invoices.get(hash).map(|h| h.inv.state)
     }
 
+    /// The seconds an invoice was made payable for.
+    pub fn expiry_of(&self, hash: &Hash) -> Option<u32> {
+        self.lock().invoices.get(hash).map(|h| h.expiry_s)
+    }
+
     pub fn count(&self, state: InvoiceState) -> usize {
         self.lock()
             .invoices
@@ -252,7 +259,7 @@ impl Node for StandIn {
         hash: &Hash,
         msat: u64,
         cltv_blocks: u32,
-        _expiry_s: u32,
+        expiry_s: u32,
     ) -> Result<String, NodeError> {
         let mut s = self.call("add_hold")?;
         if s.invoices.contains_key(hash) {
@@ -278,6 +285,7 @@ impl Node for StandIn {
                 msat,
                 cltv: cltv_blocks,
                 ordinary: false,
+                expiry_s,
             },
         );
         self.touch(&mut s);
@@ -289,7 +297,7 @@ impl Node for StandIn {
         preimage: &[u8; 32],
         msat: u64,
         cltv_blocks: u32,
-        _expiry_s: u32,
+        expiry_s: u32,
     ) -> Result<String, NodeError> {
         let mut s = self.call("add_invoice")?;
         let hash: Hash = Sha256::digest(preimage).into();
@@ -311,6 +319,7 @@ impl Node for StandIn {
                 msat,
                 cltv: cltv_blocks,
                 ordinary: true,
+                expiry_s,
             },
         );
         s.preimages.insert(hash, *preimage);

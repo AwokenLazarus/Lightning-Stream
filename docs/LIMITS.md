@@ -261,8 +261,10 @@ involved no node.
   most, voided or left open.
 - A win whose payment fails (no route, a fee above the owner's limit) is not paid with the same
   invoice again. It is paid with the seller's next invoice for it, which the gateway makes when
-  the first has lapsed (60 s); a seller whose grace is shorter has stopped serving by then, and
-  serves again when it is paid.
+  the first has lapsed: a win's invoice lives as long as the grace (30 s), so the next one comes
+  with the first request the gateway refuses `win_unpaid`, and the session goes on once it is
+  paid. A slow payment pays less time: an invoice of 30 s that is not paid within it (a win that
+  waited its turn behind many others, section above) fails, and waits for the next one.
 - A wallet that starts again pays no win it found before the start: it cannot tell a start from
   a restore of older records, in which that win may be paid already; the seller has lost the
   wins that were unpaid at that moment (at most the 2 it bears). A gateway that starts again

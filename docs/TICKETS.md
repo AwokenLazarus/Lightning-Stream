@@ -590,7 +590,10 @@ PAYMENT-SIGNATURE: base64({"x402Version": 2, "accepted": <the lottery entry>,
   each chain's seed where only it can read it: whoever reads the seed knows every draw to come.
   The gateway writes it to the lottery's journal in its state directory (`lottery.jsonl`,
   private to its owner, beside the session keys and the receipt key).
-- The seller MUST cap sessions, in all and from one address, and forget a quiet one. A session
+- The seller MUST cap sessions, in all and from one address, and forget a quiet one: the
+  gateway forgets a session that has never drawn a minute after it opened (`first_use_secs`),
+  and one that has drawn after 5 minutes without a request (`idle_secs`), so a session place
+  that drew once is taken for 5 minutes. A session
   costs `chainDraws` hashes to make and about 34 KiB to keep at the default length (one chain value
   in every 1,024 and the block last read), and anyone can ask for one. Every session is also
   served its window before any value (section 9.6), so the cap per address is what bounds the
@@ -708,10 +711,12 @@ The seller:
   `c[i]`, and that buyer then chooses the result. The gateway syncs its lottery journal before
   every answer that reveals; a draw it cannot write down is not revealed (`500 journal`), and
   its session ends.
-- MUST mark a piece as served no earlier than when its last bytes leave. The gateway marks a
-  piece just before its last write, so that a buyer that has all of it never names a piece the
-  seller does not know; the last, short piece of a body of unknown length is marked when the body
-  has ended, and a buyer whose value for it is refused `piece_unknown` sends the same value again.
+- MUST mark a piece as served by the time its last bytes leave, so that a buyer that has all of
+  it never names a piece the seller does not know. The gateway marks a piece just before its
+  last write. Marking it early tells the seller nothing: the value that decides the draw comes
+  from the buyer, after the piece. The last, short piece of a body of unknown length is marked
+  when the body has ended, and a buyer whose value for it is refused `piece_unknown` sends the
+  same value again.
 - MUST count a voided piece against the window (section 9.6) for the rest of its session: a
   void closes the piece and makes no room. A seller that lets a void make room serves a buyer
   that voids every piece without end and without a draw, and cannot tell it from a buyer whose
@@ -755,7 +760,12 @@ when the node shows the first cancelled (it lapsed unpaid).
 
 A payment that fails (no route, a fee limit) is not a spent one. The wallet does not send that
 invoice again: the win stays owed until the seller sends another invoice for it, which the
-gateway does when the first has lapsed (60 s). A payment the wallet could not begin (its own node
+gateway does when the first has lapsed. A win's invoice lives as long as the seller's grace
+(`graceSeconds`, 30 s at the gateway; `invoice_secs`, which may not be longer), so the next
+invoice is there by the time the grace ends: the request the seller then refuses `win_unpaid`
+carries it, the wallet pays it and asks again. (Until 2026-10-14 an invoice lived 60 s against a
+grace of 30, and a buyer whose payment failed was refused for about 30 s with no invoice it
+would pay.) A payment the wallet could not begin (its own node
 gave no answer) is tried again with the same invoice. A seller whose invoices fail the checks
 above three times is not asked for another: the session ends as faulty.
 
@@ -871,7 +881,7 @@ budgets, `max_sellers`, `max_new_sellers_per_min`, `max_sends_per_hour`.
 | Who | Worst case | Bound |
 |---|---|---|
 | Seller | The service given to a buyer that gives values and never pays: up to its first unpaid win, and the grace. | `winMsat` (a smaller win for a buyer it does not know), `graceSeconds`, `gracePieces`, `maxUnpaidWins`. Measured in section 9.12. |
-| Seller | `window` pieces to a buyer that sends no values, or that voids every piece, for every session it is given: 8 pieces of a quarter of a win at the most, 2 wins. One address is given 4 sessions and gets each place back after a minute: 8 wins a minute at the most. All 64 places, taken from 16 addresses or more: 128 wins a minute. | `window`; the dearest piece a route may have (`max_odds_den`); the caps on sessions and on sessions from one address; a session that never drew, or was closed while it owed, keeps its place for a minute. Behind a reverse proxy the cap per address counts nothing unless the runner names the proxy and its header (`http.forwarded_address`): the gateway then believes that header from that proxy's address, the last entry of a list, and counts a request without one under the proxy's own address. A proxy that passes on a header its client wrote, or a gateway that can be reached past the proxy from one of the named addresses, makes the cap the buyer's to set. |
+| Seller | `window` pieces to a buyer that sends no values, or that voids every piece, for every session it is given: 8 pieces of a quarter of a win at the most, 2 wins. One address is given 4 sessions and gets each place back after a minute (a session that drew keeps its place for 5 minutes without a request): 8 wins a minute at the most. All 64 places, taken from 16 addresses or more: 128 wins a minute. | `window`; the dearest piece a route may have (`max_odds_den`); the caps on sessions and on sessions from one address; a session that never drew, or was closed while it owed, keeps its place for a minute. Behind a reverse proxy the cap per address counts nothing unless the runner names the proxy and its header (`http.forwarded_address`): the gateway then believes that header from that proxy's address, the last entry of a list, and counts a request without one under the proxy's own address. A proxy that passes on a header its client wrote, or a gateway that can be reached past the proxy from one of the named addresses, makes the cap the buyer's to set. |
 | Seller | A win it never invoices or whose invoice lapses. | Its own node and gateway. A session and its unpaid wins outlive a restart of the gateway (its lottery journal); a win whose invoice the node made and the gateway never learnt of (the answer lost, then a restart) is cancelled on the node and invoiced again. A lost state directory loses them all. |
 | Seller | Uneven income: a seller that earns less than a win from a buyer is usually paid nothing by it, and sometimes a whole win. | The number of wins: pay is within 20% after about 68 wins. |
 | Buyer | Nothing beyond wins it worked out itself. An unlucky run costs more than the price, a lucky one less. | The owner's caps on a win, on the odds and on wins to an unnamed seller; the luck cap of a call; the task's budget. |
@@ -909,7 +919,7 @@ Each line below was found by building both sides and running them.
 | Several wins in one invoice. | Not built: one invoice a win. |
 | A seller-held ticket for content that cannot be checked. | Not built. Every route is paid after a win, and the buyer checks what it can. |
 | The seller serves on for `graceSeconds`. | And for `gracePieces`, and with `maxUnpaidWins` at most: a fast seller gives away more in ten seconds than a win. |
-| A win's invoice was not specified. | An ordinary invoice of the win size with the terms' `winBlocks`, payable for 60 s, one at a time for a win. Found by a test: two answers of one session each asked the node for the same win's invoice, the wallet paid the first, and the gateway knew only the second; the gateway now lets one request at a time ask. |
+| A win's invoice was not specified. | An ordinary invoice of the win size with the terms' `winBlocks`, payable for as long as the grace (60 s until 2026-10-14), one at a time for a win. Found by a test: two answers of one session each asked the node for the same win's invoice, the wallet paid the first, and the gateway knew only the second; the gateway now lets one request at a time ask. |
 
 ### 9.12 Measured
 
