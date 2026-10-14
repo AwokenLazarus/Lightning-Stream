@@ -388,32 +388,10 @@ impl Book {
         now: u64,
     ) -> Result<Granted, Refusal> {
         let mut recs = vec![];
-        // a session takes one of the capped places while it holds a ticket or a response; one that
-        // only keeps a balance it paid for does not, or a few paid tickets would hold every place
-        let active = |s: &Session| s.live > 0 || s.open_responses > 0;
-        let places_taken = || {
-            let all = self.sessions.values().filter(|s| active(s)).count();
-            let here = self
-                .sessions
-                .values()
-                .filter(|s| active(s) && s.addr == addr)
-                .count();
-            all >= self.caps.max_sessions as usize
-                || self.caps.sessions_per_address > 0
-                    && here >= self.caps.sessions_per_address as usize
-        };
+        let room_session = self.lock_room(addr, session, prepaid)?;
         let (id, key) = match session {
-            Some(id) => {
-                let s = self.sessions.get(id).ok_or(Refusal::SessionUnknown)?;
-                if !active(s) && places_taken() {
-                    return Err(Refusal::TooManySessions);
-                }
-                (id.to_string(), None)
-            }
+            Some(id) => (id.to_string(), None),
             None => {
-                if places_taken() || self.sessions.len() >= self.caps.max_kept_sessions as usize {
-                    return Err(Refusal::TooManySessions);
-                }
                 let id = hex::encode(&entropy[..16]);
                 let mut key = [0u8; 32];
                 key.copy_from_slice(&entropy[16..]);
@@ -423,12 +401,6 @@ impl Book {
                 (id, Some(key))
             }
         };
-        let live = self
-            .tickets
-            .values()
-            .filter(|t| t.session == id && t.prepaid == prepaid)
-            .count();
-        let room_session = (self.caps.max_tickets as usize).saturating_sub(live);
         let room_total = if prepaid {
             usize::MAX
         } else {
@@ -500,6 +472,50 @@ impl Book {
             issue,
             recs,
         })
+    }
+
+    /// The caps on sessions and on a session's own tickets, for a lock from `addr` (`session`
+    /// None: a first lock, which would make a session): the tickets the session may still be
+    /// issued, or why the lock is refused. Everything [`Book::lock`] refuses that does not turn
+    /// on the cap on held tickets, which a gateway that reads its node's channels has to ask the
+    /// node about: so this is asked first, and a lock these caps refuse costs the node nothing.
+    pub fn lock_room(&self, addr: &str, session: Option<&str>, prepaid: bool) -> Result<usize, Refusal> {
+        // a session takes one of the capped places while it holds a ticket or a response; one that
+        // only keeps a balance it paid for does not, or a few paid tickets would hold every place
+        let active = |s: &Session| s.live > 0 || s.open_responses > 0;
+        let places_taken = || {
+            let all = self.sessions.values().filter(|s| active(s)).count();
+            let here = self
+                .sessions
+                .values()
+                .filter(|s| active(s) && s.addr == addr)
+                .count();
+            all >= self.caps.max_sessions as usize
+                || self.caps.sessions_per_address > 0
+                    && here >= self.caps.sessions_per_address as usize
+        };
+        let live = match session {
+            Some(id) => {
+                let s = self.sessions.get(id).ok_or(Refusal::SessionUnknown)?;
+                if !active(s) && places_taken() {
+                    return Err(Refusal::TooManySessions);
+                }
+                self.tickets
+                    .values()
+                    .filter(|t| t.session == id && t.prepaid == prepaid)
+                    .count()
+            }
+            None => {
+                if places_taken() || self.sessions.len() >= self.caps.max_kept_sessions as usize {
+                    return Err(Refusal::TooManySessions);
+                }
+                0
+            }
+        };
+        match (self.caps.max_tickets as usize).saturating_sub(live) {
+            0 => Err(Refusal::TooManyTickets),
+            room => Ok(room),
+        }
     }
 
     /// The node's answer to issuing `hash`: not issued, the ticket leaves the book.

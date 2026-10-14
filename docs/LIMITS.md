@@ -345,7 +345,12 @@ wallet) and against a stand-in node in its tests.
   mainnet when it grants anything else; the check reads the macaroon and does not verify it, and
   on any other chain a wider one is taken with a warning.
 - A third macaroon, with `offchain:read`, is the runner's choice (`node.channels_macaroon`). With
-  it the gateway reads its node's channel list before every lock of a held ticket. The permission
+  it the gateway reads its node's channel list before every lock of a held ticket that its caps
+  on sessions let through: one call to the node for each, with a timeout of 15 seconds. A lock
+  those caps refuse (`too_many_sessions`, `too_many_tickets`) is refused before the call, and a
+  lock for an existing session is authenticated before it; a first lock is authenticated by
+  nobody, so while session places are free anyone can make the gateway read the list once per
+  request. The permission
   is wider than that one call: it also shows the node's channel balances, its payments and what
   it forwarded, to whoever has the gateway's files. Without it the gateway knows nothing of its
   channels and keeps to the numbers in its config.

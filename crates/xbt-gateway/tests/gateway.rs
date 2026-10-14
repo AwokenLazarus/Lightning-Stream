@@ -1717,3 +1717,57 @@ fn a_gateway_given_a_channels_macaroon_sizes_itself_and_waits_while_a_channel_is
     );
     assert!(started.is_err_and(|e| e.to_string().contains("channels")));
 }
+
+#[test]
+fn a_lock_the_caps_refuse_does_not_ask_the_node_for_its_channels() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = std::sync::Arc::new(StandIn::new(100));
+    node.set_channels(Some(vec![Channel {
+        slots: 483,
+        pending_in: 0,
+    }]));
+    // a gateway that reads its channels, with room for two sessions of two tickets
+    let rig = start_on(
+        dir.path(),
+        node,
+        start_service(),
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1_000_000)),
+        &|v| {
+            v["tickets"] = json!({"max_tickets": 2});
+            v["caps"] = json!({"sessions_per_address": 0, "inbound_slots": 483, "max_sessions": 2});
+            v["node"]["channels_macaroon"] = json!("unused");
+        },
+    );
+    let read = || rig.node.calls("channels");
+    let at_start = read();
+    let mut a = Buyer::new(&rig, 1);
+    a.lock(&rig, 2);
+    let mut b = Buyer::new(&rig, 2);
+    b.lock(&rig, 1);
+    let after_locks = read();
+    assert_eq!(after_locks, at_start + 2, "a lock that is served reads the channels once");
+    // every session place is taken: 50 first locks, authenticated by nobody, are refused on the book alone
+    for n in 0..50u8 {
+        let mut flood = Buyer::new(&rig, 100 + n);
+        let s = flood.fresh_secrets(1);
+        let got = flood.lock_raw(&s);
+        assert_eq!((got.status, got.error().as_str()), (402, "too_many_sessions"));
+    }
+    assert_eq!(read(), after_locks, "a lock the session caps refuse asks the node for nothing");
+    assert_eq!(rig.node.invoices(), 3);
+    // a session at its own cap of tickets: refused as before, and again without the channel list
+    let more = a.fresh_secrets(1);
+    assert_eq!(a.lock_raw(&more).error(), "too_many_tickets");
+    assert_eq!(read(), after_locks);
+    // a lock for a session that is not authenticated never gets as far as either
+    let mut forged = Buyer::new(&rig, 9);
+    forged.session = a.session.clone();
+    forged.seq = a.seq;
+    let s = forged.fresh_secrets(1);
+    assert_eq!(forged.lock_raw(&s).status, 401);
+    assert_eq!(read(), after_locks);
+    // one that the caps let through still reads them: b has room for one more ticket
+    let s = b.fresh_secrets(1);
+    assert_eq!(b.lock_raw(&s).status, 200);
+    assert_eq!(read(), after_locks + 1);
+}

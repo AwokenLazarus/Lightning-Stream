@@ -25,6 +25,9 @@
 //!   together, never pass the cap, and with a channels macaroon none is issued while an inbound
 //!   channel of the node is half full of pending payments. A buyer that meets either is told
 //!   `slots_short` and when to come back, before any invoice exists.
+//! - **The caps before the node** ([`Book::lock_room`]): a lock that the caps on sessions, or the
+//!   session's own cap on tickets, refuse is refused before the node is asked for its channel
+//!   list. A lock for an existing session is authenticated before that; a first lock cannot be.
 //! - **Prepaid is the node's word** ([`Gateway::take_prepaid`]): a ticket settled on arrival is
 //!   an ordinary invoice whose preimage the gateway makes and forgets; it is credited once, when
 //!   the node shows that invoice settled for the full amount, whoever asks.
@@ -1032,12 +1035,18 @@ impl Gateway {
         };
         let mut entropy = [0u8; 48];
         entropy.copy_from_slice(&xbt_svc::random_bytes(48));
-        // a held ticket takes a slot of the channel it arrives on: the node's channels first
-        let room = if prepaid { Ok(()) } else { self.slot_room() };
+        let addr = addr_name(self.client_ip(req));
+        // the caps on sessions before the node is asked for anything, its channel list included:
+        // a first lock is authenticated by nobody, and one these caps refuse must cost one look
+        // at the book and no call to the node (a gateway that reads its channels makes one, with
+        // a timeout of seconds, for every lock that gets further than this)
+        let fits = self.lock().book.lock_room(&addr, authed.as_ref().map(|a| a.session.as_str()), prepaid);
+        // a held ticket takes a slot of the channel it arrives on: the node's channels next
+        let room = fits.and_then(|_| if prepaid { Ok(()) } else { self.slot_room() });
         let granted = room.and_then(|()| {
             let mut st = self.lock();
             let granted = st.book.lock(
-                &addr_name(self.client_ip(req)),
+                &addr,
                 authed.as_ref().map(|a| a.session.as_str()),
                 &hashes,
                 prepaid,
