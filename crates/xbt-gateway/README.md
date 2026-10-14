@@ -2,7 +2,11 @@
 
 The stream-ticket seller gateway: one program beside a Lightning node. Point it at an HTTP
 service you already run, set a price per route, and buyers pay piece by piece with stream tickets.
-The service needs no change. The wire is `docs/TICKETS.md` (draft v0); what the gateway does not
+The service needs no change, and nor does the node if it is of the lnd family (lnd and its forks):
+the gateway uses that node's hold invoices over its REST interface, and has run against Lightning
+Fork only. **It cannot make a Core Lightning node a seller.** Such a node has no hold-invoice
+call, neither published hold plugin fits, nothing on it cancels a held ticket before the ticket
+expires, and the gateway does not speak its interface (`docs/TICKETS.md`, section 8). The wire is `docs/TICKETS.md` (draft v0); what the gateway does not
 do is in `docs/LIMITS.md`, section "Seller gateway".
 
 Status: regtest only. It has run against Lightning Fork nodes on one host

@@ -25,8 +25,13 @@ issues a hold invoice for that hash, and the buyer's node pays it. The money is 
 seller along the route, and nobody can take it, because only the buyer knows the secret. To pay for
 a request the buyer puts the secret in the request. The seller hashes it, finds the ticket, collects
 and serves. Tickets are locked a few at a time, ahead of use, so no request waits for a payment.
-This needs no change to the Lightning node: it is `AddHoldInvoice`, `SettleInvoice` and
-`CancelInvoice`, as nodes ship them.
+This needs no change to an lnd-family node (lnd and its forks): it is `AddHoldInvoice`,
+`SettleInvoice` and `CancelInvoice`, as those nodes ship them. Of that family only Lightning Fork
+was run. A Core Lightning node cannot be a seller's node for held tickets today. It has no
+hold-invoice call; of the two published hold plugins one issues invoices without feature bit 512
+and the other keeps the secret on the seller's node; and nothing on it cancels a held ticket
+before the ticket expires, so a seller that neither settled nor cancelled ended in a force close
+on the lab (sections 8 and 11). As a buyer's node or a routing node it needed no change.
 
 None of the parts is ours. Hold invoices are lnd's (Joost Jager, 2019). A payment that the payer
 releases in a second step was proposed for Lightning by Hiroki Gondo in 2019 as "stuckless
@@ -77,6 +82,12 @@ In an entry with `settle: "on-use"`, `ticketMsat` and `minTicketMsat` MUST be at
 (546 sat), or the ticket has no output in a Core Lightning channel's transaction and nobody can
 claim it on chain (section 11). The terms carry no slot count and no dust limit: each side reads
 those of its own channels, and neither could check a number the other sent.
+
+An entry with `settle: "on-use"` can be offered only by a seller whose node has hold invoices:
+today an lnd-family node, which needs no change for it. A seller on a Core Lightning node cannot
+offer it (the reasons are in the introduction and in section 8); what such a seller could offer
+is `settle: "on-arrival"` (section 5), and no seller component for a Core Lightning node exists
+in this tree.
 
 A seller that settles both ways lists two entries, alike but for `settle` (and, if it likes, the
 ticket size): the `on-use` one first. A buyer takes the first entry it can use. One that knows

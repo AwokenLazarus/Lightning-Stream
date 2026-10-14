@@ -31,7 +31,9 @@ not in this repository.
 
 ### 1. What you install
 
-- Your Lightning node, with inbound capacity. The gateway speaks to Lightning Fork nodes.
+- Your Lightning node, with inbound capacity. The gateway speaks to Lightning Fork nodes (a fork
+  of lnd). A Core Lightning node cannot be the seller's node: it has no hold invoices, and the
+  gateway does not speak its interface ([`TICKETS.md`](TICKETS.md), section 8).
 - Your Jellyfin, as it is.
 - `xbt-gateway`, one program, on the machine the node runs on:
   `cargo build --release -p xbt-gateway`.

@@ -16,7 +16,13 @@ buyer's node pays it. Nobody can take the money, because only the buyer knows th
 for a request, the buyer puts the secret in the request; the seller checks it, serves, and
 collects. A few tickets are locked before the service starts and topped up in the background, so
 no request waits for a payment. Lightning's own routing carries tickets to any seller the
-network reaches, with no change to the node software.
+network reaches, with no change to an lnd-family node: lnd and its forks, which have hold
+invoices. Only one of them was run, Lightning Fork. **A Core Lightning node cannot be a seller's
+node for held tickets today**: it has no hold-invoice call, neither published hold plugin fits
+(one issues invoices without XBT's feature bit, the other keeps the secret on the seller's node),
+nothing on it cancels a held ticket before the ticket expires, and the gateway speaks to
+lnd-family nodes only. As a buyer's node or a routing node it needed nothing in the lab
+([`docs/TICKETS.md`](docs/TICKETS.md), sections 8 and 11).
 
 This direction was decided on 2026-10-11. **Tickets run end to end on regtest, and nowhere
 else**: the design was measured on a three-node Lightning Fork regtest, the seller's side (the
@@ -126,8 +132,9 @@ run all of it on channels opened with 30 slots between Lightning Fork nodes; no 
 node is in their lab. An owner's policy written before that date means the new numbers where it
 sets none ([`docs/LIMITS.md`](docs/LIMITS.md), "Stream tickets: the wallet's ticket book").
 
-A seller will need a Lightning node with inbound capacity, and a buyer a Lightning node with a
-channel. `docs/LIMITS.md` states what the design gives up, and what the wallet's ticket book, its
+A seller will need an lnd-family Lightning node with inbound capacity (today that is a Lightning
+Fork node: see the top of this page for why a Core Lightning node cannot hold tickets), and a
+buyer a Lightning Fork node with a channel. `docs/LIMITS.md` states what the design gives up, and what the wallet's ticket book, its
 payer and the gateway do not do (the "Stream tickets" sections and "Seller gateway").
 
 ### The lottery: amounts smaller than a ticket (built, its first form)

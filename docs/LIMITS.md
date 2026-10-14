@@ -134,6 +134,10 @@ mainnet; its driver is not in this tree. `docs/TICKETS.md`, section 11, has the 
 - Unused tickets stay locked until the seller cancels them or they expire. Measured with 40-block
   tickets: 25 blocks with a seller that neither settles nor cancels, 51 blocks through one hop
   with a seller that went offline.
+- "No change to the node" means no change to an lnd-family node (lnd and its forks, of which
+  only Lightning Fork was run): a held ticket is that family's hold invoice. A Core Lightning
+  node cannot be a seller's node for held tickets today; the two sentences marked *(with Core
+  Lightning)* further down say why.
 - The seller needs a Lightning node with inbound capacity, and must stay online while tickets are
   locked: a seller offline when locked tickets expire had its channel force-closed (measured), and
   a ticket not settled 18 blocks before its expiry is cancelled by the seller's own node.
