@@ -947,6 +947,12 @@ def next_call_pays(what: str) -> dict[str, Any]:
     raise LabError(f"{what}: no call paid after the restart: {said}")
 
 
+def has_route() -> bool:
+    """The buyer's node finds a route for a ticket to the seller, as its own payments look for one."""
+    path = f"/v1/graph/routes/{lab.pubkey(SELLER)}/{TICKET_MSAT // 1000}?use_mission_control=true&fee_limit.fixed=1000"
+    return bool(lab.get(BUYER, path).get("routes"))
+
+
 def killed(victim: str, at: str) -> None:
     """Kill `victim`, as a power cut, and start it again."""
     if victim == "signer":
@@ -968,6 +974,10 @@ def killed(victim: str, at: str) -> None:
         lab.wait(f"{victim}'s channel active again", 180, partial(active, victim, peers), every=0.5)
         if victim == BUYER:
             lab.wait("the wallet's Lightning rail ready again", 120, lambda: signer("ln_status").get("ready") is True, every=1)
+        # the buyer's node finds a route to the seller again, as its payments will look for one (with what it has
+        # learnt of failed hops): on a busy host the hop's channel to a seller that restarted went down and up for
+        # minutes, and every payment meanwhile failed with no route, nothing spent (seen on this lab)
+        lab.wait("a route from the buyer's node to the seller", 300, has_route, every=1)
     print(f"     killed and restarted: {victim} ({at})", flush=True)
 
 
