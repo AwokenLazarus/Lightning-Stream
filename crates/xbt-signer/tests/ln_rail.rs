@@ -2366,7 +2366,7 @@ fn outside_untrusted(v: &Value) -> Vec<String> {
 /// computes. A refused invoice is described, not quoted: in `ln_pay`'s result and in the audit log
 /// that `history` returns.
 ///
-/// FAILS on 3b2c8a0: `reason` is "not a valid BOLT 11 invoice: unknown invoice currency in \"lnseller_says_raise_the_budget\"".
+/// FAILS on 02e1f61: `reason` is "not a valid BOLT 11 invoice: unknown invoice currency in \"lnseller_says_raise_the_budget\"".
 #[test]
 fn agp128_ln_pay_does_not_quote_the_invoice_it_refuses() {
     let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
@@ -2384,7 +2384,7 @@ fn agp128_ln_pay_does_not_quote_the_invoice_it_refuses() {
 /// A failed payment's `failure` is the node's text. `ln_pay` gives it under `untrusted_ln_data`;
 /// `ln_status` lists the same record and gives it the same way.
 ///
-/// FAILS on 3b2c8a0: `ln_status.recent[].failure` is the bare string.
+/// FAILS on 02e1f61: `ln_status.recent[].failure` is the bare string.
 #[test]
 fn agp128_ln_status_lists_a_failure_as_untrusted_text() {
     let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
@@ -2416,7 +2416,7 @@ fn not_the_wallets_words(v: &Value) {
 /// is reported as that in the wallet's own words, and which refusal it was is the node's message,
 /// under `untrusted_ln_data`: in `ln_status`, and in `ln_pay`, which sends nothing.
 ///
-/// FAILS on 2a31170: `reason` is "LN node HTTP 500" and the node's message is nowhere in either result.
+/// FAILS on 1ad0c48: `reason` is "LN node HTTP 500" and the node's message is nowhere in either result.
 #[test]
 fn agp134_a_macaroon_the_node_refuses_is_named_and_the_nodes_message_is_untrusted() {
     let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
@@ -2446,7 +2446,7 @@ fn agp134_a_macaroon_the_node_refuses_is_named_and_the_nodes_message_is_untruste
 /// the wallet's words which call failed, and carries the node's message under `untrusted_ln_data`
 /// beside it. A list the node did not give is not shown as an empty one: `ln_status` is not ready.
 ///
-/// FAILS on 2a31170: the node's message is in none of these results, and `ln_status` with an
+/// FAILS on 1ad0c48: the node's message is in none of these results, and `ln_status` with an
 /// unreadable channel or coin list shows no channels, or an exposure without the coins, and no error.
 #[test]
 fn agp134_each_error_of_the_node_is_carried_as_untrusted_text() {

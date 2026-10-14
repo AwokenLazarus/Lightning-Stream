@@ -3,7 +3,7 @@
 //!
 //! Tests named `holds_*` pass and are evidence that a path is closed. Tests named `limit_*` pass and
 //! pin down a behaviour a reader has to be told about. Tests named `hole_*` state the outcome the
-//! review asked for and FAIL on main f0554d0: each is a finding of this audit. Nothing here is a fix.
+//! review asked for and FAIL on main c80ee94: each is a finding of this audit. Nothing here is a fix.
 //!
 //! AGP-091 fixed the holes; every `hole_*` test passes unchanged. Two tests here asserted the hole
 //! itself on a neighbouring path and were changed, each with a comment at the changed lines:
@@ -312,7 +312,7 @@ fn limit_distrust_is_for_good() {
 }
 
 // ------------------------------------------------------------------------------------------------
-// Holes (these FAIL on f0554d0)
+// Holes (these FAIL on c80ee94)
 // ------------------------------------------------------------------------------------------------
 
 fn payment(inv_doc: &Value, k: &PrimeKey, r: &WorkReceipt, n: u64, method: &str, path: &str) -> Value {

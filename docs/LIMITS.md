@@ -35,7 +35,7 @@ chain. Numbers are the shipped defaults unless a sentence says otherwise.
 The hub, the hub beside a Lightning node and the routed client were retired on 2026-10-11 and
 their code removed; the 59 limits stated for them here went with them. Lightning's own routing
 does what the hub did. The code and those limits are in the git history, last at commit
-`a548fb0`. What the removal leaves behind:
+`0911cc0`. What the removal leaves behind:
 
 - A wallet policy that still has a `routing` section loads; the signer ignores the section and
   says so in a warning.
@@ -50,13 +50,13 @@ library client, the wallet's channel rail, the light client (`xbt-electrum`) and
 built on channel states were removed in October 2026. The limits stated for them here (the
 sections "Channel and transport", "Light client and consensus" and the channel sentences of
 "Agent wallet") and the three open items on the channel's path went with them. The code and those
-limits are in the git history, last at commit `2a31170`. What the removal leaves behind:
+limits are in the git history, last at commit `1ad0c48`. What the removal leaves behind:
 
 - A wallet that was upgraded with channels on record cannot close or refund them: this version
   has no method for either and no watcher that refunds at expiry. It never writes the channel book
   (`channels.json`) or its sealed keys (`channel_keys.json`), reads the book once at start, lists
   the records under `channels` and `balance`, and says in its log, in `health` and on the UI's
-  Channels page how many are not settled. Settling them needs the version at `2a31170`, run on the
+  Channels page how many are not settled. Settling them needs the version at `1ad0c48`, run on the
   same data directory; until then the coins of an open channel stay in its script.
 - A wallet policy that still has `channel_expiry_blocks`, `refund_enabled`, `refund_margin_blocks`,
   `open_wait_s`, `open_retry_s`, `close_fee_max_sats`, `channel_rail` or a `pay_to` under
@@ -80,7 +80,7 @@ limits are in the git history, last at commit `2a31170`. What the removal leaves
   (`xbt402-merkle-v1`) can no longer be bought. The ticket wire has its own form of it
   (`docs/TICKETS.md`, section 5, `after-verify`), which the wallet does not do yet.
 - Another program that linked the channel's provider or client from the `xbt402` crate no longer
-  builds against this tree; it has to pin `2a31170` or pay another way.
+  builds against this tree; it has to pin `1ad0c48` or pay another way.
 
 ### Stream tickets (the design's measurements)
 

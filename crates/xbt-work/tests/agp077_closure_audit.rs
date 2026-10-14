@@ -1,4 +1,4 @@
-//! AGP-077 closure audit, fixed by AGP-079: what the audit found open on main 71714d5 in the coinbase
+//! AGP-077 closure audit, fixed by AGP-079: what the audit found open on main f20a342 in the coinbase
 //! audit (the review's P1 "the Prime controls the audit's inputs", P4). Each test states the outcome
 //! the review asked for; all of them failed before AGP-079.
 //!

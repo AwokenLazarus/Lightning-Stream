@@ -14,7 +14,7 @@ use std::path::Path;
 use serde_json::{json, Value};
 
 /// The last revision of this repository whose wallet could close and refund a channel.
-pub const LAST_WITH_CHANNEL: &str = "2a31170";
+pub const LAST_WITH_CHANNEL: &str = "1ad0c48";
 
 /// The fields of a record a reader may see (never a key: the book holds none, they are sealed apart).
 const SHOWN: [&str; 9] = ["state", "dest", "origin", "chan", "cap_sats", "used_sats", "expiry", "funding_txid", "closed_txid"];

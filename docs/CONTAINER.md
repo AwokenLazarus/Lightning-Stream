@@ -10,7 +10,7 @@ package built on it (AGP-040) are in `packaging/` (README there).
 Status: **proposal, pending cmp-lead's OK** (forwarded by agp-lead, 2026-09-28).
 
 The hub was retired on 2026-10-11: payments between parties route over ordinary Lightning instead. Its
-code is in the git history (last at commit a548fb0). Its image, user and data dir are gone from this
+code is in the git history (last at commit 0911cc0). Its image, user and data dir are gone from this
 page; uid 10004 and port 9480 were its and are not reused.
 
 ## 1. One data dir, one sub-dir per component

@@ -25,7 +25,7 @@ has no Lightning node, so no seller is paid here: an agent paying a seller throu
 Lightning by scripts/ticket_e2e_regtest.sh.)
 (The H checks ran the hub and are retired with it; the other letters are unchanged. The hub was retired
 on 2026-10-11: payments between parties route over ordinary Lightning instead. Its code is in the git
-history, last at commit a548fb0.)
+history, last at commit 0911cc0.)
     scripts/container_test.sh   (builds the images, then runs this)
 """
 import json

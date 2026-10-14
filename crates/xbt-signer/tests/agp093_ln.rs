@@ -1,6 +1,6 @@
 //! AGP-093 (third closure audit, area LIGHT, the Lightning rail).
 //!
-//! `hole_*` tests FAIL on `d4c8328`; `evidence_*` tests pass and pin down a stated limit.
+//! `hole_*` tests FAIL on `f52e235`; `evidence_*` tests pass and pin down a stated limit.
 //!
 //! * Overflow checks are on in every build (AGP-089), so an unchecked `*` or `+` on a number an
 //!   invoice or the LN node supplies is now a panic. Two are reachable: the BOLT 11 amount (u128

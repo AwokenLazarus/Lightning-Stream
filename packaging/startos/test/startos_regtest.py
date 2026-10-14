@@ -19,7 +19,7 @@ after the whole volume came back root-owned (StartOS remounts, or a restore), B 
 package wires no Lightning node into the wallet yet, so the packaged wallet pays no seller: see regtest_lib.py.)
 (The H checks ran the hub and are retired with it; the other letters are unchanged. The hub was retired
 on 2026-10-11: payments between parties route over ordinary Lightning instead. Its code is in the git
-history, last at commit a548fb0.)
+history, last at commit 0911cc0.)
     startos_regtest.py OUT
 """
 import json

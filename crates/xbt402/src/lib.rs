@@ -17,7 +17,7 @@
 //! The crate began as the Rust port of the on-chain one-way channel (the x402 `batch-settlement`
 //! scheme on XBT: funding, signed states, close, rollover, refund). That channel was frozen on
 //! 2026-10-11 and removed in 2026-10; its code is in the repository's history, last at revision
-//! `2a31170`.
+//! `1ad0c48`.
 //!
 //! Optional features: `http-client` (ureq transport), `http-server` (std::net around the
 //! provider), `rpc` (a bitcoind JSON-RPC client).

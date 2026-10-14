@@ -235,7 +235,7 @@ fn x1_a_redirect_is_not_followed() {
 /// are the crate's own. ureq's message for a status that is not a number quotes it (three
 /// characters of the seller's choosing), after the URL.
 ///
-/// FAILS on 3b2c8a0: "http://127.0.0.1:.../x: Bad Status: unable to parse status as u16 (zq7)".
+/// FAILS on 02e1f61: "http://127.0.0.1:.../x: Bad Status: unable to parse status as u16 (zq7)".
 #[test]
 fn agp128_a_malformed_answer_is_not_quoted_in_the_transport_error() {
     let addr = raw_server("HTTP/1.1 zq7 OK\r\nContent-Length: 0\r\n\r\n".to_string(), Arc::new(vec![]));

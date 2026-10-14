@@ -1,10 +1,10 @@
-//! AGP-093, third closure audit, pay-with-work (xbt-rs d4c8328). Written by the area auditor; no
+//! AGP-093, third closure audit, pay-with-work (xbt-rs f52e235). Written by the area auditor; no
 //! code was changed.
 //!
 //! * `holds_*` pass: they pin a bound the audit checked (above all the P4 bound of AGP-091's
 //!   decision 1: a Prime that never gives a statement).
 //! * `limit_*` pass: they pin a number a reader has to be told.
-//! * every other test is named as the claim that should hold and FAILS on d4c8328 (a hole).
+//! * every other test is named as the claim that should hold and FAILS on f52e235 (a hole).
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 

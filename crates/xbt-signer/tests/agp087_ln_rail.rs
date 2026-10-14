@@ -2101,7 +2101,7 @@ fn agp082_invoices_asked_of_an_offer_are_rate_limited() {
 /// segwit (P2WPKH) spend signed 0x21. Its parent is a 0x01 spend, valid on both chains, confirmed here
 /// above the split. A segwit witness is not part of the txid, so the holder of that key can publish
 /// the same funding txid on the SHA-256 chain with a 0x01 witness: the funding outpoint exists on both
-/// chains, and the proof calls it proven. EXPECTED TO FAIL on f0554d0.
+/// chains, and the proof calls it proven. EXPECTED TO FAIL on c80ee94.
 #[test]
 fn agp087_ln_l5_a_funding_whose_replayed_parent_is_signed_0x01_is_not_proven() {
     let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
@@ -2132,7 +2132,7 @@ fn agp087_ln_l5_a_funding_whose_replayed_parent_is_signed_0x01_is_not_proven() {
 /// most `max_cltv_blocks`; the hops before the path add theirs. Here: delta 1,008 is accepted, the pay
 /// RPC drops with no record on the node, the booking is released, and the node records the payment
 /// settled 1,160 blocks later (1,008 for the path + 152 for the hops to it): past the watch.
-/// EXPECTED TO FAIL on f0554d0.
+/// EXPECTED TO FAIL on c80ee94.
 #[test]
 fn agp087_ln_l4_an_offers_htlc_can_outlive_the_rebook_watch() {
     let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
@@ -2167,7 +2167,7 @@ fn agp087_ln_l4_an_offers_htlc_can_outlive_the_rebook_watch() {
 
 /// Side-step (the rate limit, AGP-049): "at most this many payments sent to the LN node's router per
 /// hour, failed ones included". The count is of book records, one per payment hash, and a retry of the
-/// same invoice replaces its record. EXPECTED TO FAIL on f0554d0.
+/// same invoice replaces its record. EXPECTED TO FAIL on c80ee94.
 #[test]
 fn agp087_ln_side_retries_of_one_invoice_are_not_rate_limited() {
     let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());

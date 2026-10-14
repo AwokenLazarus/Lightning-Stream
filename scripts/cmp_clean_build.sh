@@ -4,7 +4,7 @@
 #
 # The embedder this was written for (xbt-compute, "cmp") linked the on-chain channel's provider and
 # client from xbt402. That channel was removed in 2026-10: an embedder that still needs it pins
-# revision 2a31170, the last with it. What is built and linked here is what the crates offer now.
+# revision 1ad0c48, the last with it. What is built and linked here is what the crates offer now.
 #
 #   scripts/cmp_clean_build.sh [REF]          (REF: branch, tag or commit of this repo; default main)
 #

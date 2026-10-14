@@ -7,7 +7,7 @@ validation, validation messages, result JSON and errors. It serves its tools ove
 
 Six of B2's ten tools are here. The other four (`close_channel`, `xbt402_refund`,
 `forward_status`, `forward_recover`) worked the on-chain channel, which this wallet no longer has
-(removed in October 2026; the code is in the git history, last at commit `2a31170`).
+(removed in October 2026; the code is in the git history, last at commit `1ad0c48`).
 
 It talks only to the signer's socket and never holds a key: the signer holds every key, and the
 model-facing process gets only the socket path.

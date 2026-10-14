@@ -175,7 +175,7 @@ signatures, the hub's link to a Lightning node, and the routed client. It was th
 way for one channel to reach many sellers. Lightning's routing already does that, on a network
 that exists, so the hub rebuilt part of Lightning beside it. The external review also found the
 hub the weakest part of the tree. Its code, tests, scripts, vectors and packages are removed;
-they are in the git history, last at commit `a548fb0`.
+they are in the git history, last at commit `0911cc0`.
 
 **The on-chain one-way channel**, frozen on 2026-10-11 and removed in October 2026. It was a
 direct channel anchored on the chain for paying one seller piece by piece (x402's
@@ -185,7 +185,7 @@ Lightning, and the channel carried the open defects that were left. With it went
 and library client, the wallet's channel rail, the light client that watched it
 (`xbt-electrum`), the fair exchange built on its states (Merkle-proved chunks and a hash-locked
 last one), and their tests, vectors and scripts. They are in the git history, last at commit
-`2a31170`. Three things follow from the removal:
+`1ad0c48`. Three things follow from the removal:
 
 - A wallet that was upgraded with channels on record cannot close or refund them with this
   version. It leaves their records and sealed keys untouched and says which revision settles them.

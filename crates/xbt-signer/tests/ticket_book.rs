@@ -1479,7 +1479,7 @@ fn outside_untrusted(v: &Value) -> Vec<String> {
 /// refused invoice of a lock, a ticket whose send got no answer, the reconcile's lookup and its
 /// read of the payment list, and `ticket_status`'s reading of the channels.
 ///
-/// FAILS on 2a31170: the node's message is in none of these results.
+/// FAILS on 1ad0c48: the node's message is in none of these results.
 #[test]
 fn agp134_the_nodes_message_goes_with_each_ticket_error_as_untrusted_text() {
     let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());

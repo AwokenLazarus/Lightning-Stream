@@ -19,7 +19,7 @@ over, closed and refunded an on-chain one-way channel per seller. This version h
 the methods listed under "Removed" answer `deny/removed`, `xbt402_pay` pays over Lightning only,
 and a wallet that still has channels on record is told so and is shown them read-only
 (`src/legacy.rs`). Closing or refunding such a channel needs the last revision with the channel,
-`2a31170`, run on the same wallet directory; this version never writes `channels.json` or
+`1ad0c48`, run on the same wallet directory; this version never writes `channels.json` or
 `channel_keys.json`.
 
 Reference: B2 `agp-next2` `04c3f56` (`agentwallet/signer.py`, `hot.py`, `keystore.py`,
@@ -78,7 +78,7 @@ The hub was retired on 2026-10-11: payments between parties route over ordinary 
 The signer no longer has a routing policy and no longer answers B2's lock methods
 (`xbt402_sign_state_adaptor`, `xbt402_resolve_lock`, `xbt402_void_lock`, `xbt402_adopt_lock`,
 `xbt402_recover_lock`, `routing_status`); B2 still has them. A `routing` section in `policy.json`
-is ignored, with a warning. The code is in the git history (last at commit `a548fb0`).
+is ignored, with a warning. The code is in the git history (last at commit `0911cc0`).
 
 ### For the web UI (AGP-039)
 

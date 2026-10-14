@@ -2352,7 +2352,7 @@ fn agp128_the_last_receipt_of_a_streamed_answer_is_given_as_numbers_and_the_sell
 /// The hash an invoice is returned for is a string of the seller's: an answer that names something
 /// else there is refused (as before), and what it named is in no result and not in the audit log.
 ///
-/// FAILS on 3b2c8a0: the audit log's `ticket_refused` row, which `history` returns, has the seller's string as `payment_hash`.
+/// FAILS on 02e1f61: the audit log's `ticket_refused` row, which `history` returns, has the seller's string as `payment_hash`.
 #[test]
 fn agp128_a_lock_answer_that_names_words_for_a_hash_is_refused_and_not_recorded() {
     let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());

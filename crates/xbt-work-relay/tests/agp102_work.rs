@@ -1,5 +1,5 @@
 //! AGP-102, fourth closure audit, pay-with-work: the provider's relay pull against the relay as
-//! shipped (xbt-rs 2e745f2). Written by the area auditor; no code was changed. The other tests of
+//! shipped (xbt-rs f5a4198). Written by the area auditor; no code was changed. The other tests of
 //! this area are in `crates/xbt-work/tests/agp102_work.rs`.
 //!
 //! AGP-107 (close-out): the one test here is a `limit_` test now. AGP-106 wrote the item down

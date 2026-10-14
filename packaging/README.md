@@ -5,7 +5,7 @@ container standard in `docs/CONTAINER.md` and the one image set `scripts/oci_bui
 the Start9 marketplace. That submission is Mike's call.
 
 The hub was retired on 2026-10-11: payments between parties route over ordinary Lightning instead. Its
-code is in the git history (last at commit a548fb0). Its Umbrel app, its StartOS toggle and its tests are
+code is in the git history (last at commit 0911cc0). Its Umbrel app, its StartOS toggle and its tests are
 gone from here.
 
 ```

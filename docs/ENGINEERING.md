@@ -5,7 +5,7 @@
 > library client, their binaries and the `xbt402-interop` tools, the wallet's channel rail
 > (`xbt402_pay` over a channel, the signer's channel book and its socket methods, the MCP's
 > in-process payer), the light client `xbt-electrum`, the fair exchange built on channel states,
-> and their tests, vectors and scripts. All of it is in the git history, last at commit `2a31170`.
+> and their tests, vectors and scripts. All of it is in the git history, last at commit `1ad0c48`.
 > (The BLAKE2b header and retarget code the light client was built on stays in `xbt-primitives`,
 > with its vector tests.)
 >
@@ -28,7 +28,7 @@
 >
 > Everything below this note is the history of the on-chain channel and the hub, left as it was
 > written. Sections about the hub, routing, adaptor locks and the routed client describe code
-> that is no longer in the tree; it is in the git history, last at commit `a548fb0`. Commands,
+> that is no longer in the tree; it is in the git history, last at commit `0911cc0`. Commands,
 > scripts, crate rows, test counts and vector counts below that name removed parts no longer run
 > or no longer match. What runs today is in `README.md`; what is and is not covered is in
 > `docs/LIMITS.md`.
@@ -766,7 +766,7 @@ the watcher every 5 s (the hub's default). `cmp-slow`: a block only every 6 s. `
 same with the provider's cap sized for it (`--zero-conf-max` 24 locks). Every cap refusal is
 classified: was the child's rollover in a block already (the hub's flag was stale), or not.
 
-| run | refused before (base `25f5e2f`) | paid | max gap ms | refused after | paid | max gap ms |
+| run | refused before (base `58e3a0e`) | paid | max gap ms | refused after | paid | max gap ms |
 |---|---|---|---|---|---|---|
 | `RS-RS-cmp` | 0 | 56 | 529 | 0 | 56 | 521 |
 | `PY-PY-cmp` | 0 | 56 | 525 | 0 | 56 | 547 |
@@ -925,7 +925,7 @@ before that line again.
 ## Hub routing safety (AGP-064)
 From an external review of the hub: two High findings, H1 and H2, where the hub could pay a
 provider on ch2 without being able to collect from the client on ch1. There was also a test-only
-nonce API in the library. Both were still present on `main` (`e0b832a`), and the tests below
+nonce API in the library. Both were still present on `main` (`0ff8a44`), and the tests below
 reproduce each one there. The same changes are in B1 `agp-064-w4`, with the same test names. The
 hub is now marked **experimental** (above, and in `xbt402-hub`'s startup log).
 
@@ -1558,7 +1558,7 @@ Options weighed (best-performing-stack rule):
 a fresh connection per request, served by xbt-work-relay, is at most `tiny_http`'s + 50 µs; (b) on
 armv7 the extra per request is at most 0.5 ms. Measured with
 `cargo run --release -p xbt-svc --example http_bench -- 127.0.0.1:29080 /healthz 5000 8` against
-`xbt-work-relay --bind 127.0.0.1:29080 --push-bind off --memory` built from `main` (7d03b84) and
+`xbt-work-relay --bind 127.0.0.1:29080 --push-bind off --memory` built from `main` (1e0a1db) and
 from this branch, on a Ryzen 9 9950X3D, two runs each:
 
 | build | median | p99 | 8 clients |
@@ -1586,7 +1586,7 @@ unchanged. Each slow-body test waits for the 30 s body deadline.
 
 ## Hub follow-ups: sealed ch2 keys, written-off ch2s, orphan locks, preflight (AGP-073)
 Four follow-ups from AGP-063 (K1) and from the trade-offs of AGP-064 and AGP-067. The same changes
-are in B1 `agp-073`, with the same test names. All the tests below fail on `main` (`20900a0`) and pass
+are in B1 `agp-073`, with the same test names. All the tests below fail on `main` (`5c501b1`) and pass
 here.
 
 **K1: the ch2 payer keys are sealed at rest.** The hub's state file (`<datadir>/ch2.json`) held every
@@ -1729,7 +1729,7 @@ test.
 
 ## Hub closure-audit fixes: rollover with a lock open, refused seqs, the lock bound (AGP-078)
 The closure audit of the external review (AGP-077) found three hub items still open on `main`
-(`0a84665`). Each was the neighbour of a path an earlier fix had closed. The same changes are in B1
+(`fcbc66d`). Each was the neighbour of a path an earlier fix had closed. The same changes are in B1
 `agp-078`, with the same test names. The hub stays **experimental**.
 
 **H1 and H2 through a ch1 rollover.** AGP-064 made a ch1 close refuse `lock_pending` while a routed
@@ -1873,7 +1873,7 @@ with no run); the freeze rules are applied again when the state loads.
 ## Transport, light-client and rollover closure fixes (AGP-081)
 
 The closure audit of the external review (AGP-077, list 1 items 8, 9 and 10) found these still open
-on `main` (`68d9650`). Each is the neighbour of a path an earlier fix closed. B1 `agp-081`
+on `main` (`4040700`). Each is the neighbour of a path an earlier fix closed. B1 `agp-081`
 (`7e28c87`) and B2 `agp-081` (`542d0ca`) carry the same changes where they have the code, with the
 same test names (`test_` prefixed): B1 `tests/security/test_agp081_closure_audit.py` (receipt,
 fragment, per-address cap, the ASGI path held to loopback and documented as needing a proxy, and
@@ -1952,7 +1952,7 @@ whose only peer is its reverse proxy; anything but a whole number stops the serv
 
 Measured with `crates/xbt-electrum/examples/e1_attacks.rs` on a Ryzen 9 9950X3D, release build, the
 hostile server in a child process, wall time and the client's peak resident memory. "Before" is the
-same file built in a worktree of `main` (`68d9650`):
+same file built in a worktree of `main` (`4040700`):
 
 ```
 for a in trickle bigline history "history 20000"; do
@@ -3002,7 +3002,7 @@ through `xbt-primitives` (NTA BIP340).
 An external reviewer read the public snapshot (xbt-rs `9201104`). The point: the §10.3 audit took every
 number from the Prime's own window statement, so a Prime colluding with a payer could receipt work
 nobody mined and then sign a statement that excused the unpaid coinbase. Every finding was still
-present on `main` (`e0b832a`). Each now has a test in `crates/xbt-work/tests/review_p.rs`; P1–P4 were
+present on `main` (`0ff8a44`). Each now has a test in `crates/xbt-work/tests/review_p.rs`; P1–P4 were
 first run against `main` and failed there.
 
 * **P1: the provider pins the Prime's terms.** `WorkConfig::terms` (`audit::PrimeTerms { window,
@@ -3150,7 +3150,7 @@ makes one pass over the spans; before, it recomputed the caps' room for each ope
 
 The closure audit (AGP-077) reproduced four routes by which a Prime colluding with a payer still got
 unmined work credited and released, and two ways an underpaid block escaped the audit. All were present
-on `main` (`0a84665`). Tests: `crates/xbt-work/tests/agp077_closure_audit.rs` (10; the six that state
+on `main` (`fcbc66d`). Tests: `crates/xbt-work/tests/agp077_closure_audit.rs` (10; the six that state
 the findings failed before the fix), `review_p.rs`, and the book's unit tests.
 
 **The cause.** AGP-065 bounded every number in a window statement, but a *passing* audit still released
@@ -3260,7 +3260,7 @@ within `room`; these reach it or the payments:
   rail are not part of this task.
 
 **Cost.** `cargo run --release -p xbt-work --example audit_cost` on x86_64, this branch against `main`
-(`0a84665`), 1,000 receipted increases over 100 invoices: credit room per paid call 0.02 µs (main
+(`fcbc66d`), 1,000 receipted increases over 100 invoices: credit room per paid call 0.02 µs (main
 1.8 µs), `audit_block` 71 µs (71 µs), `check_fraud_proof` 2.9 ms (2.9 ms). The AGP-065 pass lines are
 for armv7; armv7 was not rerun. The room is now one walk over the unpaid credit instead of over every
 span.
@@ -3288,7 +3288,7 @@ rule above are specified by this crate, which is the reference for them until th
 ## Pay-with-work, fix wave 4: what the second audit left (AGP-091)
 
 The second closure audit (AGP-087, list 1 items 9, 10, 11 and 17) found the neighbours of the P1,
-P4 and P6 fixes open on `main` (`f0554d0`). The cover rule of AGP-079 held against everything the
+P4 and P6 fixes open on `main` (`c80ee94`). The cover rule of AGP-079 held against everything the
 audit tried and is unchanged: no unit of credit leaves the caps without sats in a coinbase output to
 the provider's address, read from the provider's node, under a statement that passes. Each item
 below is one rule, kept in one place, with the paths that could break it.
@@ -3535,9 +3535,9 @@ the coinbase payment with a plain `+`; it uses the audit's own sum now (`audit::
 
 An external review of the public snapshot (xbt-rs `9201104`) found five weaknesses in the payer-only
 `rail=ln` (AGP-048/049, `crates/xbt-signer/src/ln.rs`). All five were still present on `main`
-(`7d03b84`); since `9201104`, the LN code had changed only in `a64c41e` (AGP-055, how the tests read
+(`1e0a1db`); since `9201104`, the LN code had changed only in `c7c3d8e` (AGP-055, how the tests read
 the ledger), which none of the findings depends on. Each
-has a test in `crates/xbt-signer/tests/ln_rail.rs` that failed on `main`; commit `fbc55b2` holds the
+has a test in `crates/xbt-signer/tests/ln_rail.rs` that failed on `main`; commit `b79125b` holds the
 tests alone. Neither Python reference has a Lightning rail (B1 `xbt402/` and B2 `agentwallet/` have
 none), so there is no parity change and no vector changed.
 
@@ -4194,7 +4194,7 @@ payment (`payer_id` in `ln_payments.json`, the signature log and the reply) and 
 only. A stable payer id needs a change in the fork.
 
 **The audit's two Lightning findings** (the AGP-077 closure audit, list 1, item 11), fixed here because they are in
-the same file. Each has a test that failed before the fix (commit `db5d8cf` holds the tests alone):
+the same file. Each has a test that failed before the fix (commit `4335595` holds the tests alone):
 
 * **Redirects.** The REST client followed up to five redirects and kept the macaroon header, so a
   node (or anything answering on its port) could send the macaroon to a host the loopback and

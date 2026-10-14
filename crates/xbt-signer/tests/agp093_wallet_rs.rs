@@ -18,7 +18,7 @@ const MIKE: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 /// back (a wrong RTC at boot, an NTP correction, whoever can set the host's time), a signature that
 /// was used, then pruned, is inside its window again and is not in the file: it runs a second time.
 ///
-/// Fails on d4c8328: the second sweep with the same signature answers `ok: true`.
+/// Fails on f52e235: the second sweep with the same signature answers `ok: true`.
 #[test]
 fn hole_a_used_human_signature_stays_used_when_the_clock_goes_back() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());

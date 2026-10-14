@@ -23,7 +23,7 @@ fn invoice_under(hrp: &str) -> String {
 /// The decoders' errors go into `reason` (`ln_pay`, `ln_pay_offer`, the ticket path's invoices):
 /// they say what is wrong and never repeat the string, whose prefix is free text.
 ///
-/// FAILS on 3b2c8a0: "unknown invoice currency in \"lnseller_says...\"", "bad invoice amount
+/// FAILS on 02e1f61: "unknown invoice currency in \"lnseller_says...\"", "bad invoice amount
 /// \"seller_says...\"", "not an offer (prefix \"seller_says...\", not lno)".
 #[test]
 fn an_invoice_or_offer_that_does_not_decode_is_not_quoted() {

@@ -57,7 +57,7 @@ impl Node for GateNode {
 /// double click, or a retry after a timeout) while another payment holds the signer's spend lock,
 /// which `xbt402_pay` can do for `open_wait_s`. One approval pays once.
 ///
-/// Fails on f0554d0: `approve_signed` reads the token and its `used` flag before it takes the
+/// Fails on c80ee94: `approve_signed` reads the token and its `used` flag before it takes the
 /// spend lock (signer.rs:1567-1597), so both calls pass the check, and the second writes the hold
 /// again and pays again: two payments of 1,000 sat, 2,100 sat booked.
 #[test]
