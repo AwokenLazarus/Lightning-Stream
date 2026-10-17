@@ -721,6 +721,7 @@ fn the_starter_policy_turns_the_rail_and_tickets_on_and_is_low_on_mainnet() {
     let m = xbt_wallet_ui::app::starter_policy("main");
     assert_eq!(m["ln"]["split_height"], json!(xbt_wallet_ui::app::MAINNET_SPLIT_HEIGHT));
     assert!(m["max_per_tx_sats"].as_i64().unwrap() <= 2000 && m["daily_budget_sats"].as_i64().unwrap() <= 10000);
+    assert!(m["tickets"]["tasks"]["default"]["budget_sats"].as_i64().unwrap() <= 10000);
     // the signer takes both
     for p in [t, m] {
         assert!(xbt_signer::policy::validate_policy(&p).0.is_empty(), "{p}");
