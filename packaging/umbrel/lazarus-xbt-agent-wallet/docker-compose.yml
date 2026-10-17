@@ -15,6 +15,9 @@ version: "3.7"
 
 x-service: &service
   restart: on-failure
+  # a static binary as PID 1 gets no default action for SIGTERM: without an init, a stop waits out the
+  # grace period and kills the service (umbrelOS stops and restarts apps with SIGTERM)
+  init: true
   read_only: true
   tmpfs:
     - /tmp:rw,size=16m
