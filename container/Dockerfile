@@ -1,10 +1,11 @@
-# AGP-038: the agentpay images, one per binary, FROM scratch (docs/CONTAINER.md). AGP-040 adds the wallet UI
-# (AGP-039) and xbt-init, the one-shot that fixes a bind mount's owners before the services start. AGP-043 adds
-# xbt-work-relay, the blinded receipt relay of pay-with-work.
+# The images, one per service, FROM scratch (docs/CONTAINER.md): the signer, the anchor witness, the MCP
+# server, the wallet UI, xbt-init (the one-shot that fixes a bind mount's owners before the services
+# start), xbt-work-relay (the blinded receipt relay of pay-with-work) and xbt-gateway (the seller gateway).
 # Built by scripts/oci_build.sh with docker buildx for linux/amd64, linux/arm64 and linux/arm/v7 from the
 # static musl binaries it stages under bin/<arch>/. There is no RUN, so no emulator is needed.
 # Layer 1 (base.tar: passwd/group, /tmp, the /data skeleton with each component's owner) is byte-identical
-# in all the images and stored once. Layer 2 is the binary.
+# in all the images and stored once. Layer 2 is the binary (the signer and the gateway: with xbt-supervise
+# beside it, from bin/<arch>/<image>.d/).
 # No `# syntax=` line: the builder's built-in frontend, nothing pulled.
 
 ARG IMAGE=xbt-signer
@@ -13,10 +14,12 @@ FROM scratch AS base
 ADD base.tar /
 ENV XBT_DATA_DIR=/data XBT_MODE=production
 
+# xbt-supervise rides along: a package runs the signer under it, so a rail macaroon the UI writes
+# restarts the signer (packaging/DESIGN.md). The image's own entrypoint is the signer alone.
 FROM base AS xbt-signer
 ARG TARGETARCH
 ARG TARGETVARIANT
-COPY --chmod=0555 bin/${TARGETARCH}${TARGETVARIANT}/xbt-signer /usr/bin/xbt-signer
+COPY --chmod=0555 bin/${TARGETARCH}${TARGETVARIANT}/xbt-signer.d/ /usr/bin/
 USER xbt-signer
 ENTRYPOINT ["/usr/bin/xbt-signer"]
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 CMD ["/usr/bin/xbt-signer", "healthcheck"]
@@ -64,6 +67,21 @@ USER xbt-work-relay
 ENTRYPOINT ["/usr/bin/xbt-work-relay"]
 CMD ["serve"]
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 CMD ["/usr/bin/xbt-work-relay", "healthcheck"]
+
+# The stream-ticket seller gateway. It reads one config file, which the UI's gateway page writes into
+# /data/run/gateway; xbt-supervise starts the gateway once that file exists and again when it or a
+# macaroon changes. 8402 is for buyers, behind an https proxy (the gateway refuses a non-loopback
+# listen without an https public_url). State: /data/gateway.
+FROM base AS xbt-gateway
+ARG TARGETARCH
+ARG TARGETVARIANT
+COPY --chmod=0555 bin/${TARGETARCH}${TARGETVARIANT}/xbt-gateway.d/ /usr/bin/
+EXPOSE 8402
+USER xbt-gateway
+ENTRYPOINT ["/usr/bin/xbt-supervise", "--wait", "/data/run/gateway/config.json", "--watch", "/data/run/gateway/invoices.macaroon", \
+            "--watch", "/data/run/gateway/info.macaroon", "--watch", "/data/lightning/tls.cert", "--", \
+            "/usr/bin/xbt-gateway", "/data/run/gateway/config.json"]
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 CMD ["/usr/bin/xbt-supervise", "probe", "http://127.0.0.1:8402/x402/ticket/health"]
 
 # The one image that runs as root: it exits once the data dir's owners and modes are right. Run it with
 # cap_drop ALL + CHOWN, FOWNER, DAC_OVERRIDE, no network, read-only (docs/CONTAINER.md §7).

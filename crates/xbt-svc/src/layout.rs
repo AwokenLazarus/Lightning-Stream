@@ -39,6 +39,33 @@ pub const COMPONENTS: &[Component] = &[
     Component { name: crate::MCP, user: "xbt-wallet-mcp", uid: 10003 },
     Component { name: crate::UI, user: "xbt-wallet-ui", uid: 10005 },
     Component { name: crate::RELAY, user: "xbt-work-relay", uid: 10006 },
+    Component { name: crate::GATEWAY, user: "xbt-gateway", uid: 10007 },
+];
+
+/// The group of the wallet's Lightning rail files (`run/ln/`): the signer is its only member, so the
+/// MCP (in the signer's and the UI's groups) cannot read the rail macaroon.
+pub const LN_RAIL_GID: u32 = 10008;
+
+/// A dir under `run/` that one component writes and another reads by group, made only when both are
+/// in the layout. The writer is a member of the group too (the images' /etc/group) and gives each
+/// file it writes there the dir's group. No setgid bit: `xbt-init` has no CAP_FSETID, and the kernel
+/// clears that bit when such a process sets the mode of a dir whose group it is not in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SharedDir {
+    pub dir: &'static str,
+    /// The component that writes (owner).
+    pub writer: &'static str,
+    /// The component that reads, by group.
+    pub reader: &'static str,
+    pub gid: u32,
+    pub mode: u32,
+}
+
+/// The UI's setup pages write here: the wallet's rail macaroon for the signer (`run/ln/`), and the
+/// gateway's config and macaroons for the gateway (`run/gateway/`).
+pub const SHARED_DIRS: &[SharedDir] = &[
+    SharedDir { dir: crate::RUN_LN, writer: crate::UI, reader: crate::SIGNER, gid: LN_RAIL_GID, mode: 0o750 },
+    SharedDir { dir: crate::RUN_GATEWAY, writer: crate::UI, reader: crate::GATEWAY, gid: 10007, mode: 0o750 },
 ];
 
 /// The socket dirs: (dir under `run/`, the component that serves it).
@@ -109,8 +136,8 @@ fn owner_mode(p: &Path) -> io::Result<(u32, u32, u32)> {
 }
 
 #[cfg(unix)]
-fn lchown(p: &Path, uid: u32) -> io::Result<()> {
-    std::os::unix::fs::lchown(p, Some(uid), Some(uid))
+fn lchown(p: &Path, uid: u32, gid: u32) -> io::Result<()> {
+    std::os::unix::fs::lchown(p, Some(uid), Some(gid))
 }
 
 /// Open `p` itself: O_NOFOLLOW refuses a symlink in its last component (ELOOP), O_NONBLOCK keeps
@@ -142,11 +169,11 @@ fn entries_of(d: &std::fs::File, path: &Path) -> PathBuf {
 /// opened O_NOFOLLOW relative to their parent's fd and chowned through their own fd; anything else
 /// is lchowned in place, so no symlink is ever followed, even one swapped in during the walk.
 #[cfg(unix)]
-fn chown_tree(d: &std::fs::File, path: &Path, uid: u32, changed: &mut u64) -> io::Result<()> {
+fn chown_tree(d: &std::fs::File, path: &Path, uid: u32, gid: u32, changed: &mut u64) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let md = d.metadata()?;
-    if md.uid() != uid || md.gid() != uid {
-        std::os::unix::fs::fchown(d, Some(uid), Some(uid))?;
+    if md.uid() != uid || md.gid() != gid {
+        std::os::unix::fs::fchown(d, Some(uid), Some(gid))?;
         *changed += 1;
     }
     if !md.file_type().is_dir() {
@@ -159,15 +186,15 @@ fn chown_tree(d: &std::fs::File, path: &Path, uid: u32, changed: &mut u64) -> io
         let m = std::fs::symlink_metadata(&p)?;
         if m.file_type().is_dir() {
             match open_nofollow(&p, true) {
-                Ok(c) => chown_tree(&c, &path.join(&name), uid, changed)?,
+                Ok(c) => chown_tree(&c, &path.join(&name), uid, gid, changed)?,
                 Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR)) => {
-                    lchown(&p, uid)?;
+                    lchown(&p, uid, gid)?;
                     *changed += 1;
                 }
                 Err(e) => return Err(e),
             }
-        } else if m.uid() != uid || m.gid() != uid {
-            lchown(&p, uid)?;
+        } else if m.uid() != uid || m.gid() != gid {
+            lchown(&p, uid, gid)?;
             *changed += 1;
         }
     }
@@ -178,6 +205,12 @@ fn chown_tree(d: &std::fs::File, path: &Path, uid: u32, changed: &mut u64) -> io
 /// contents change owner too (the bind-mount case). Returns a report row.
 #[cfg(unix)]
 fn own_dir(dir: &Path, uid: u32, mode: u32, recurse: bool) -> Result<Value, String> {
+    own_dir_gid(dir, uid, uid, mode, recurse)
+}
+
+/// [`own_dir`] with a group other than the owner's own.
+#[cfg(unix)]
+fn own_dir_gid(dir: &Path, uid: u32, gid: u32, mode: u32, recurse: bool) -> Result<Value, String> {
     let ctx = |e: io::Error| format!("{}: {e}", dir.display());
     let created = !dir.exists();
     if created {
@@ -196,11 +229,11 @@ fn own_dir(dir: &Path, uid: u32, mode: u32, recurse: bool) -> Result<Value, Stri
         (m.uid(), m.gid(), m.mode() & 0o7777)
     };
     let mut changed = 0u64;
-    if u0 != uid || g0 != uid {
+    if u0 != uid || g0 != gid {
         if recurse {
-            chown_tree(&f, dir, uid, &mut changed).map_err(ctx)?;
+            chown_tree(&f, dir, uid, gid, &mut changed).map_err(ctx)?;
         } else {
-            std::os::unix::fs::fchown(&f, Some(uid), Some(uid)).map_err(ctx)?;
+            std::os::unix::fs::fchown(&f, Some(uid), Some(gid)).map_err(ctx)?;
             changed = 1;
         }
     }
@@ -208,7 +241,7 @@ fn own_dir(dir: &Path, uid: u32, mode: u32, recurse: bool) -> Result<Value, Stri
         use std::os::unix::fs::PermissionsExt;
         f.set_permissions(std::fs::Permissions::from_mode(mode)).map_err(ctx)?;
     }
-    Ok(json!({"path": dir.display().to_string(), "uid": uid, "mode": format!("{mode:o}"), "created": created,
+    Ok(json!({"path": dir.display().to_string(), "uid": uid, "gid": gid, "mode": format!("{mode:o}"), "created": created,
               "was": {"uid": u0, "gid": g0, "mode": format!("{m0:o}")}, "chowned": changed}))
 }
 
@@ -289,6 +322,13 @@ fn init_with(root: &Path, names: &[String], prov: &Provision, uid_of: &dyn Fn(&C
             dirs.push(own_dir(&run.join(dir), uid_of(c), 0o750, true)?);
         }
     }
+    for sd in SHARED_DIRS {
+        if let (Some(w), true) = (comps.iter().find(|c| c.name == sd.writer), has(sd.reader)) {
+            // tests run every component as their own uid: the group is then theirs too
+            let gid = if uid_of(w) == w.uid { sd.gid } else { uid_of(w) };
+            dirs.push(own_dir_gid(&run.join(sd.dir), uid_of(w), gid, sd.mode, true)?);
+        }
+    }
     let mut secrets = vec![];
     let mut put = |comp: &str, name: &str, value: &[u8]| -> Result<(), String> {
         let c = component(comp).expect("known");
@@ -337,15 +377,21 @@ fn init_with(root: &Path, names: &[String], prov: &Provision, uid_of: &dyn Fn(&C
 pub fn check(root: &Path, names: &[String]) -> Value {
     let mut problems = vec![];
     let mut rows = vec![];
-    let mut want = |p: PathBuf, uid: u32, mode: u32, problems: &mut Vec<String>| match owner_mode(&p) {
+    let mut want_gid = |p: PathBuf, uid: u32, gid: u32, mode: u32, problems: &mut Vec<String>| match owner_mode(&p) {
         Ok((u, g, m)) => {
             rows.push(json!({"path": p.display().to_string(), "uid": u, "gid": g, "mode": format!("{m:o}")}));
-            if (u, g, m) != (uid, uid, mode) {
-                problems.push(format!("{}: {u}:{g} {m:o}, want {uid}:{uid} {mode:o}", p.display()));
+            if (u, g, m) != (uid, gid, mode) {
+                problems.push(format!("{}: {u}:{g} {m:o}, want {uid}:{gid} {mode:o}", p.display()));
             }
         }
         Err(e) => problems.push(format!("{}: {e}", p.display())),
     };
+    for sd in SHARED_DIRS {
+        if let (Some(w), true) = (component(sd.writer), names.iter().any(|n| n == sd.writer) && names.iter().any(|n| n == sd.reader)) {
+            want_gid(root.join("run").join(sd.dir), w.uid, sd.gid, sd.mode, &mut problems);
+        }
+    }
+    let mut want = |p: PathBuf, uid: u32, mode: u32, problems: &mut Vec<String>| want_gid(p, uid, uid, mode, problems);
     for n in names {
         let Some(c) = component(n) else {
             problems.push(format!("unknown component {n}"));
@@ -384,7 +430,7 @@ mod tests {
     #[test]
     fn table_matches_container_md() {
         let t: Vec<_> = COMPONENTS.iter().map(|c| (c.name, c.uid)).collect();
-        assert_eq!(t, vec![("signer", 10001), ("witness", 10002), ("mcp", 10003), ("ui", 10005), ("relay", 10006)]);
+        assert_eq!(t, vec![("signer", 10001), ("witness", 10002), ("mcp", 10003), ("ui", 10005), ("relay", 10006), ("gateway", 10007)]);
     }
 
     #[test]
@@ -498,7 +544,7 @@ mod tests {
             std::os::unix::fs::chown(&p, None, Some(g)).unwrap();
         }
         let mut changed = 0;
-        chown_tree(&open_nofollow(&tree, true).unwrap(), &tree, uid, &mut changed).unwrap();
+        chown_tree(&open_nofollow(&tree, true).unwrap(), &tree, uid, uid, &mut changed).unwrap();
         assert_eq!(std::fs::metadata(tree.join("a/f")).unwrap().gid(), uid);
         assert_eq!(std::fs::metadata(outside.join("v")).unwrap().gid(), g);
         assert_eq!(std::fs::metadata(&outside).unwrap().gid(), g);
@@ -508,6 +554,27 @@ mod tests {
 
     fn init_as(root: &Path, names: &[String], prov: &Provision, uid: u32) -> Result<Value, String> {
         init_with(root, names, prov, &|_| uid)
+    }
+
+    /// The setup pages' dirs: made only when both the writer and the reader are in the layout.
+    #[test]
+    fn shared_dirs_follow_the_components() {
+        let uid = me();
+        if uid == 0 {
+            return;
+        }
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("data");
+        let names: Vec<String> = ["signer", "ui", "gateway"].iter().map(|s| s.to_string()).collect();
+        init_as(&root, &names, &Provision::default(), uid).unwrap();
+        for d in ["run/ln", "run/gateway"] {
+            assert_eq!(std::fs::metadata(root.join(d)).unwrap().mode() & 0o7777, 0o750, "{d}");
+        }
+        assert_eq!(std::fs::metadata(root.join("gateway")).unwrap().mode() & 0o777, 0o700);
+        let root2 = t.path().join("wallet-only");
+        let names: Vec<String> = ["signer", "mcp"].iter().map(|s| s.to_string()).collect();
+        init_as(&root2, &names, &Provision::default(), uid).unwrap();
+        assert!(!root2.join("run/ln").exists() && !root2.join("run/gateway").exists());
     }
 
     #[test]

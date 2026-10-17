@@ -1,6 +1,7 @@
 #!/bin/bash
 # AGP-038: multi-arch OCI images of the agentpay services, saved locally (never pushed).
-#   xbt-signer, xbt-anchor-witness, xbt-wallet-mcp; AGP-040: xbt-wallet-ui, xbt-init; AGP-043: xbt-work-relay
+#   xbt-signer, xbt-anchor-witness, xbt-wallet-mcp, xbt-wallet-ui, xbt-init, xbt-work-relay, xbt-gateway
+#   (xbt-supervise is not an image: it is copied into the signer and gateway images)
 #   platforms linux/amd64, linux/arm64, linux/arm/v7, FROM scratch, static musl (zig), docs/CONTAINER.md
 #
 # Steps: build the static musl binaries for the three targets (release profile, --locked so that the
@@ -31,7 +32,7 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-IMAGES=(xbt-signer xbt-anchor-witness xbt-wallet-mcp xbt-wallet-ui xbt-init xbt-work-relay)
+IMAGES=(xbt-signer xbt-anchor-witness xbt-wallet-mcp xbt-wallet-ui xbt-init xbt-work-relay xbt-gateway)
 [ -n "$ONLY" ] && IMAGES=(${ONLY//,/ })
 TGT=${CARGO_TARGET_DIR:-target}
 want() { [[ " ${IMAGES[*]} " == *" $1 "* ]]; }
@@ -56,6 +57,10 @@ if [ $CARGO = 1 ]; then
     if want xbt-signer || want xbt-anchor-witness; then
       "${SOAK[@]}" cargo build -q -j2 --release --locked --target "$t" -p xbt-signer --bin xbt-signer --bin xbt-anchor-witness
     fi
+    if want xbt-gateway; then "${SOAK[@]}" cargo build -q -j2 --release --locked --target "$t" -p xbt-gateway --bin xbt-gateway; fi
+    if want xbt-signer || want xbt-gateway; then
+      "${SOAK[@]}" cargo build -q -j2 --release --locked --target "$t" -p xbt-svc --bin xbt-supervise
+    fi
     if want xbt-wallet-mcp; then "${SOAK[@]}" cargo build -q -j2 --release --locked --target "$t" -p xbt-wallet-mcp; fi
     if want xbt-wallet-ui || want xbt-init; then
       "${SOAK[@]}" cargo build -q -j2 --release --locked --target "$t" -p xbt-wallet-ui -p xbt-svc --bin xbt-wallet-ui --bin xbt-init
@@ -65,19 +70,27 @@ if [ $CARGO = 1 ]; then
 fi
 for t in "${!ARCH[@]}"; do
   mkdir -p "$CTX/bin/${ARCH[$t]}"
-  for b in "${IMAGES[@]}"; do
+  bins=("${IMAGES[@]}")
+  if want xbt-signer || want xbt-gateway; then bins+=(xbt-supervise); fi
+  for b in "${bins[@]}"; do
     f=$TGT/$t/release/$b
     [ -x "$f" ] || { echo "oci_build: $f missing (run without --skip-cargo)" >&2; exit 1; }
     file -b "$f" | grep -q "statically linked" || { echo "oci_build: $f is not static: $(file -b "$f")" >&2; exit 1; }
     cp "$f" "$CTX/bin/${ARCH[$t]}/$b"
   done
+  # the images whose layer holds xbt-supervise beside their own binary
+  for b in xbt-signer xbt-gateway; do
+    if want "$b"; then
+      mkdir -p "$CTX/bin/${ARCH[$t]}/$b.d"
+      cp "$CTX/bin/${ARCH[$t]}/$b" "$CTX/bin/${ARCH[$t]}/xbt-supervise" "$CTX/bin/${ARCH[$t]}/$b.d/"
+    fi
+  done
 done
 python3 container/mkbase.py "$CTX/base.tar"
 cp container/Dockerfile "$CTX/Dockerfile"
 
-LABELS=(--label "org.opencontainers.image.source=xbt-rs (local)" --label "org.opencontainers.image.revision=$REV$DIRTY"
-        --label "org.opencontainers.image.version=$VERSION" --label "org.opencontainers.image.licenses=MIT OR Apache-2.0"
-        --label "xbt.task=AGP-038")
+LABELS=(--label "org.opencontainers.image.source=https://github.com/AwokenLazarus/Lightning-Stream" --label "org.opencontainers.image.revision=$REV$DIRTY"
+        --label "org.opencontainers.image.version=$VERSION" --label "org.opencontainers.image.licenses=MIT OR Apache-2.0")
 for img in "${IMAGES[@]}"; do
   echo "== buildx $img ($PLATFORMS)"
   docker buildx build -q --platform "$PLATFORMS" --target "$img" "${LABELS[@]}" \
