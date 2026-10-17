@@ -1,0 +1,9 @@
+# Test port on loopback only: the gateway's UI on 24031. Nothing else differs from the app; the gateway
+# itself publishes nothing (the wallet's signer joins its network namespace: see lazarus-xbt-agent-wallet.yml).
+services:
+  gateway:
+    restart: "no"
+  ui:
+    restart: "no"
+    ports:
+      - "127.0.0.1:${UMBREL_TEST_GW_UI_PORT}:8481"

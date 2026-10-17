@@ -1,0 +1,43 @@
+manifestVersion: 1.1
+id: lazarus-lightning-stream-gateway
+category: lightning
+name: Lightning Stream Gateway
+version: "0.1.0"
+tagline: Sell a service on your box per request, per MiB or per second, paid with stream tickets
+description: >-
+  Put a price on any HTTP service you run and let buyers' agents pay for it piece by piece over XBT
+  Lightning. Each buyer locks a few small tickets (hold invoices on your Lightning Fork node) and
+  releases one secret per paid piece; the gateway passes each paid request to your service and signs
+  a receipt.
+
+
+  Setup, on this app's page: the service to sell, the https address buyers use, one price, and two
+  macaroons you make in Lightning Fork's dashboard with exactly invoices:read invoices:write and
+  info:read. The app reads only the node's certificate; it never holds an admin macaroon, and its
+  macaroons cannot pay.
+
+
+  Buyers reach the gateway over https only. umbrelOS gives apps no https of their own: point a TLS
+  proxy you run (with a public certificate) at this app's gateway on port 8402. On mainnet this
+  software takes real payments and has run on regtest only: the page asks you to acknowledge that and
+  starts you with low caps.
+
+
+  Needs Lightning Fork. Unpublished and side-load only; the images stay on this box.
+developer: Lazarus
+website: https://github.com/AwokenLazarus/Lightning-Stream
+repo: https://github.com/AwokenLazarus/Lightning-Stream
+support: https://github.com/AwokenLazarus/Lightning-Stream/issues
+port: 8481
+gallery: []
+releaseNotes: >-
+  0.1.0: the stream-ticket gateway and its setup page. Local package, regtest-tested only.
+dependencies:
+  # in its author's community store: umbrelOS resolves dependencies by installed app id
+  - paulscode-lightning-fork
+path: ""
+defaultUsername: ""
+deterministicPassword: true
+submitter: Lazarus
+submission: unpublished-local
+icon: ""

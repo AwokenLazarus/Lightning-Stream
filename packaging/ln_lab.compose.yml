@@ -1,0 +1,12 @@
+# The package tests' overlay on lightning-fork-lab (packaging/ln_lab.py): the two Lightning Fork nodes'
+# REST interfaces on loopback for the test driver, and a CPU cap on what runs. The packages under test
+# join the lab's network and reach the nodes as lf1:8080 and lf2:8080, the chain node as knots-b2b:18443.
+services:
+  knots-b2b:
+    cpus: 2
+  lf1:
+    cpus: 2
+    ports: ["127.0.0.1:${PKG_LAB_PORT_LF1}:8080"]
+  lf2:
+    cpus: 2
+    ports: ["127.0.0.1:${PKG_LAB_PORT_LF2}:8080"]

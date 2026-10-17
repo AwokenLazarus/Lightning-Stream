@@ -1,8 +1,10 @@
-"""AGP-040: helpers shared by the Umbrel and StartOS-shaped regtest drivers (stdlib only).
+"""Helpers shared by the package regtest drivers (Umbrel, StartOS-shaped, the container test; stdlib only).
 
 Checks are recorded as PASS/FAIL rows (results.json). HTTP, the MCP over streamable HTTP, a UI browser (cookie,
 CSRF, the signed-form flow with `xbt-wallet-ui sign`), a small reverse proxy that plays the box's proxy
-(Umbrel app_proxy, StartOS) by adding X-Forwarded-*, and the regtest chain set-up the AGP-038 test uses.
+(Umbrel app_proxy, StartOS) by adding X-Forwarded-*, and the paid buy over stream tickets: the owner sets up
+a packaged gateway and a packaged wallet on their setup pages, and an agent pays the gateway through the
+wallet's MCP (`paid_buy`; the Lightning side is packaging/ln_lab.py).
 """
 import http.client as http_client
 import http.server as http_server
@@ -196,13 +198,18 @@ def sign(sign_bin, key_file, message_hex):
     return sh(sign_bin, "sign", "--key", key_file, "--message-hex", message_hex).stdout.strip()
 
 
-def owner_setup(ui, sign_bin, key_file, policy):
-    """The owner's first run in the UI, no terminal: enrol the approval key, then sign a policy (the
-    "sign on another device" path; the in-browser path is covered by xbt-wallet-ui's browser test).
-    Returns (enrolled flash, applied flash, pending_restart text)."""
+def owner_setup(ui, sign_bin, key_file, policy, code=""):
+    """The owner's first run in the UI, no terminal: enrol the approval key with the signer's one-time
+    code (the app's log shows it), then sign a policy (the "sign on another device" path; the in-browser
+    path is covered by xbt-wallet-ui's browser test). Returns (public key, enrolled flash, applied flash)."""
     pub = sh(sign_bin, "pubkey", "--key", key_file).stdout.strip()
-    ui.post("/setup", "/human-key-enroll", {"pubkey": pub})
+    ui.post("/setup", "/human-key-enroll", {"pubkey": pub, "code": code})
     f1 = ui.flash("/setup")
+    return pub, f1, sign_policy(ui, sign_bin, key_file, policy)
+
+
+def sign_policy(ui, sign_bin, key_file, policy):
+    """A policy change in the UI, signed on another device. Returns the flash after it is applied."""
     csrf = field(ui.get("/policy"), "csrf")
     st, _, page = ui.req("POST", "/policy", {"csrf": csrf, "mode": "json", "json": json.dumps(policy)})
     hx = re.search(r'<pre class="hex">([0-9a-f]+)</pre>', page)
@@ -215,8 +222,7 @@ def owner_setup(ui, sign_bin, key_file, policy):
     form["signature_ext"] = sign(sign_bin, key_file, hx.group(1))
     form["csrf"] = field(page, "csrf")
     ui.req("POST", "/policy-apply", form)
-    f2 = ui.flash("/policy")
-    return pub, f1, f2
+    return ui.flash("/policy")
 
 
 class ProxyHandler(http_server.BaseHTTPRequestHandler):
@@ -261,26 +267,26 @@ POLICY_BASE = {"max_per_tx_sats": 1000, "daily_budget_sats": 20000, "weekly_budg
 
 # what the wallet's MCP lists with no rail's own tools turned on
 BASE_TOOLS = ["balance", "quote_payment", "pay", "history", "channels", "xbt402_pay"]
+# the packages turn the Lightning rail's and the tickets' own tools on (XBT_MCP_LN, XBT_MCP_TICKETS)
+PACKAGE_TOOLS = BASE_TOOLS + ["ln_pay", "ln_status", "ticket_status", "ticket_stop"]
 
 
-def agent_and_custody(group, agent, ui, sign_bin, key_file, chain, sc):
-    """What a packaged wallet can show of itself today, through the agent's MCP and the owner's UI.
-
-    The packages wire no Lightning node into the wallet yet, and the on-chain channel the wallet
-    once paid over was removed, so no payment to a seller is made here (an agent paying a seller
-    through the MCP is proven on Lightning by scripts/ticket_e2e_regtest.sh). What is checked: the
-    agent's surface (the tool list, the balance, a payment quoted under the owner's policy), and
-    custody of the hot key (coins received and counted, then swept out by the owner with a
-    signature made on another device). `sc(method, params)` calls the signer's socket. Returns the
-    facts a later restart or restore is compared with."""
+def agent_and_custody(group, agent, ui, sign_bin, key_file, chain, sc, tools="base"):
+    """The wallet's own surface, through the agent's MCP and the owner's UI: the tool list, the balance, a
+    payment quoted under the owner's policy, and custody of the hot key (coins received and counted, then
+    swept out by the owner with a signature made on another device). The paid buy is `paid_buy`.
+    `sc(method, params)` calls the signer's socket. Returns the facts a later restart or restore is
+    compared with."""
     ha = sc("hot_address")
-    txid = chain.cli("sendtoaddress", ha["hot_address"], "0.0005", wallet="faucet")
+    txid = chain.cli("sendtoaddress", ha["hot_address"], "0.0005", wallet=getattr(chain, "faucet_wallet", "faucet"))
     chain.mine(1)
     sc("notice_hot_txid", {"txid": txid})
     check(group, "the hot key received 50,000 sat and the wallet counts them", sc("hot_address").get("hot_sats") == 50000, sc("hot_address"))
     code, listed = agent.post({"jsonrpc": "2.0", "id": 9000, "method": "tools/list"})
     names = [t.get("name") for t in listed.get("result", {}).get("tools", [])] if isinstance(listed, dict) else listed
-    check(group, "the agent's tools: the six every wallet has, and none of the removed on-chain channel", names == BASE_TOOLS, names)
+    want = PACKAGE_TOOLS if tools == "package" else BASE_TOOLS
+    check(group, f"the agent's tools: the six every wallet has{', the rail and ticket tools' if tools == 'package' else ''}, and none of the "
+                 "removed on-chain channel", names == want, names)
     bal = agent.tool("balance")
     check(group, "the agent reads the balance: the hot key's coins, no channel", bal.get("hot", {}).get("hot_sats") == 50000 and bal.get("channels") == []
           and not bal.get("legacy_channels"), bal)
@@ -331,3 +337,92 @@ def write_results(out):
     n_ok = sum(r["ok"] for r in RESULTS)
     log(f"== {n_ok}/{len(RESULTS)} checks passed")
     return bool(RESULTS) and n_ok == len(RESULTS)
+
+
+# --- the paid buy over stream tickets -------------------------------------------------------------------
+
+
+def gateway_owner_setup(gui, facts, public_url, price_msat=2500):
+    """The gateway's owner on its page, no terminal: the service, the origin buyers use, a price per
+    request, the test chain's network id, and the two macaroons baked in the node's dashboard."""
+    form = {"upstream": facts["upstream"], "price_msat": str(price_msat), "unit": "request", "public_url": public_url, "proxies": "",
+            "chain": "regtest", "network": facts["network"], "mainnet_ack": "", "max_sessions": "30", "sessions_per_address": "2",
+            "max_held_tickets": "15", "invoices_macaroon": facts["invoices_macaroon"], "info_macaroon": facts["info_macaroon"]}
+    st, loc, body = gui.post("/", "/gateway", form)
+    return st, (gui.flash("/") if st == 303 else unescape(re.sub(r"<[^>]+>", " ", body))[-600:])
+
+
+def ticket_policy(origin, seller_pubkey, split):
+    """The owner's policy for the paid buy: the gateway's origin tied to its node, the rail and tickets on."""
+    return dict(POLICY_BASE, allowlist=[origin], counterparties={origin: {"ln_node": seller_pubkey}}, max_per_tx_sats=5000,
+                per_counterparty_cap_sats=20000, human_threshold_sats=10000, ln={"enabled": True, "split_height": split},
+                tickets={"enabled": True, "tasks": {"default": {"budget_sats": 20000}}})
+
+
+def paid_buy(group, agent, ui, gui, sign_bin, key_file, lab, sc, gateway_up, origin):
+    """The owner sets up both packages on their pages, then the agent buys a priced page from the
+    gateway with one `xbt402_pay` call through the wallet's MCP, paid with a stream ticket over lf1 ->
+    lf2. `sc(method, params)` calls the signer's socket; `gateway_up()` is the gateway's health as
+    its container reports it. Returns the facts a restart is compared with."""
+    from ln_lab import PAGE  # noqa: PLC0415
+    f = lab.facts
+    st, flash = gateway_owner_setup(gui, f, origin)
+    check(group, "gateway page: the owner's config (service, origin, price, network, two narrow macaroons) is checked by the gateway's parser and saved",
+          st == 303 and "Saved" in flash, [st, flash])
+    t0 = time.time()
+    wait_until(gateway_up, 120, "the gateway healthy from the config the page wrote", every=2)
+    check(group, f"the gateway started from that config ({time.time() - t0:.0f} s; xbt-supervise waited for the file) and answers its health check", True)
+    applied = sign_policy(ui, sign_bin, key_file, ticket_policy(origin, f["lf2_pubkey"], f["split"]))
+    check(group, "the owner signs a policy that allows the gateway (its origin tied to the seller's node id) with the rail and tickets on",
+          "applied" in applied.lower(), applied)
+    # a setting that waits for a signer restart is taken when the rail macaroon below restarts it
+    st, loc, _ = ui.post("/lightning", "/lightning", {"action": "save", "macaroon": f["rail_macaroon"]})
+    flash = ui.flash("/lightning")
+    check(group, "Lightning page: the rail macaroon (the four permissions the rail needs, nothing more) is stored", "saved" in flash.lower(), flash)
+    t0 = time.time()
+    last = {}
+
+    def rail_ready():
+        last.update(sc("ln_status"))
+        return last if last.get("ready") is True else None
+    try:
+        st_ln = wait_until(rail_ready, 180, "the rail ready", every=3)
+    except RuntimeError:
+        st_ln = last
+    check(group, f"the signer restarted with it ({time.time() - t0:.0f} s; xbt-supervise saw the file) and the rail is ready: chain verified, "
+                 "the channel's funding proven", st_ln.get("ready") is True, {k: st_ln.get(k) for k in ("ready", "warnings", "backend")})
+    before_settled = len(lab.seller_settled())
+    r = agent.tool("xbt402_pay", url=f"{origin}/small.txt", max_sats=10)
+    body = str((r.get("untrusted_provider_response") or {}).get("body", ""))
+    check(group, "the agent's one xbt402_pay call buys the priced page through the packaged wallet: a stream ticket over lf1 -> lf2, "
+                 "2,500 msat used, the seller's receipt signs the body",
+          r.get("verdict") == "allow" and r.get("rail") == "ticket" and r.get("status") == 200 and body == PAGE and r.get("tickets_released") == 1
+          and r.get("price_msat") == "2500" and r.get("receipt") == {"signed": True, "body": "as signed"},
+          {k: r.get(k) for k in ("verdict", "rail", "status", "tickets_released", "price_msat", "balance_msat", "receipt", "reason", "rails_passed_over")})
+    settled = wait_until(lambda: (lambda x: x if len(x) > before_settled else None)(lab.seller_settled()), 30, "the seller's node settled the ticket")
+    t_settled = settled[-1]
+    h = bytes_hex(t_settled.get("r_hash"))
+    # the seller settles first; the buyer's node marks the payment a moment later, when the HTLC is settled back to it
+    try:
+        mine = wait_until(lambda: (lambda m: m if m and m[0].get("status") == "SUCCEEDED" else None)(
+            [p for p in lab.buyer_payments() if p.get("payment_hash") == h]), 30, "the buyer's payment SUCCEEDED")
+    except RuntimeError:
+        mine = [p for p in lab.buyer_payments() if p.get("payment_hash") == h]
+    check(group, "the seller's node settled one ticket of 1,000 sat, and the buyer's node paid it: the same hash, SUCCEEDED, 1,000 sat",
+          int(t_settled.get("amt_paid_msat") or 0) == 1_000_000 and len(mine) == 1 and mine[0].get("status") == "SUCCEEDED"
+          and int(mine[0].get("value_msat") or 0) == 1_000_000,
+          {"settled_msat": t_settled.get("amt_paid_msat"), "hash": h, "buyer": [{k: p.get(k) for k in ("payment_hash", "status", "value_msat")}
+                                                                                for p in lab.buyer_payments()][-4:]})
+    r2 = agent.tool("xbt402_pay", url=f"{origin}/small.txt", max_sats=10)
+    check(group, "a second call is paid from the same ticket's balance: no new ticket released, 2,500 msat more used",
+          r2.get("status") == 200 and r2.get("tickets_released") == 0 and int(r2.get("balance_msat") or 0) == int(r.get("balance_msat") or 0) - 2500,
+          {k: r2.get(k) for k in ("verdict", "rail", "status", "tickets_released", "balance_msat", "reason")})
+    return {"settled": len(lab.seller_settled()), "balance_msat": r2.get("balance_msat")}
+
+
+def bytes_hex(b64):
+    import base64  # noqa: PLC0415
+    try:
+        return base64.b64decode(b64 or "").hex()
+    except ValueError:
+        return ""

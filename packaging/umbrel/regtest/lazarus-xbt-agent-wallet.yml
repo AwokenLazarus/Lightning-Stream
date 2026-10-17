@@ -1,8 +1,17 @@
 # Test ports on loopback only (24000-24099): MCP 24010, UI 24030 (the driver's app_proxy stand-in is 24080).
-# Faster readiness and watch intervals for the test; nothing else differs from the app.
+# Faster readiness and watch intervals for the test.
+#
+# One change of the network, for the paid buy only: the signer runs in the gateway's network namespace,
+# so that it reaches the packaged gateway at http://127.0.0.1:8402. The wallet pays tickets over https
+# or to its own machine only, and trusts only public certificate authorities: a regtest has no https
+# name with such a certificate, so the buyer and the seller share loopback here. On boxes they are two
+# machines and the buyer reaches the seller's https origin (packaging/DESIGN.md, section 3). Through
+# the gateway's namespace the signer still reaches the XBT node and its Lightning node on the box network.
 services:
   signer:
-    restart: "no"
+    # the app's own restart policy (on-failure) stays: after a restart of the app the signer can start
+    # before the witness answers, refuses (anchor_required) and is started again
+    network_mode: "container:lazarus-lightning-stream-gateway_gateway_1"
     environment:
       XBT_READY_INTERVAL: "2"
       B2_WATCH_INTERVAL: "2"

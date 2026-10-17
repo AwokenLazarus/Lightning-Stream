@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""AGP-040: lint the local Umbrel store (SOV-005's lint-manifest.py, extended for the agentpay apps).
+"""Lint the local Umbrel store.
 
 Manifest: the keys umbrelOS reads, manifestVersion 1/1.1, a known category, the id prefixed with the store id,
-gallery files present, dependencies in this store or a node slot (`bitcoin`) an app here implements, unique
-ports, `deterministicPassword` when ${APP_PASSWORD} is used.
+gallery files present, dependencies in this store, a node slot (`bitcoin`) an app here implements, or an app
+of another community store named in OTHER_STORES (Lightning Fork), unique ports, `deterministicPassword` when
+${APP_PASSWORD} is used.
 Compose: app_proxy's APP_HOST is `<app-id>_<service>_1` of a real service; every volume is under
 ${APP_DATA_DIR}; every image is a local one (no registry, nothing pulled); every ${VAR} is provided by umbrelOS,
 this app's exports or a dependency's exports; a slot's variable (APP_BITCOIN_*, set by whichever node app the
 owner selects) is only used as `${APP_BITCOIN_X:-${FALLBACK}}` with a fallback this store's implementing app
 exports; `docker compose config` accepts the file with those values, and with the slot's values alone.
 Hardening (docs/CONTAINER.md): the agentpay services run read-only, cap_drop ALL, no-new-privileges, as their
-image's non-root user, and mount only their own sub-dir plus the socket dirs they need (a peer's read-only);
-`init` (xbt-init) is the only root container: no network, at most CHOWN/FOWNER/DAC_OVERRIDE.
+image's non-root user, and mount only their own sub-dir plus the dirs they need (a peer's read-only); of the
+Lightning node's data, only its tls.cert, read-only, as a bind that never creates a missing path; no
+admin macaroon. `init` (xbt-init) is the only root container: no network, at most CHOWN/FOWNER/DAC_OVERRIDE.
     python3 packaging/umbrel/lint.py [STORE_DIR]
 """
 from __future__ import annotations
@@ -31,17 +33,26 @@ CATEGORIES = {"bitcoin", "lightning", "finance", "networking", "social", "media"
 # what umbrelOS sets for every app's compose
 UMBREL_VARS = {"APP_DATA_DIR", "APP_SEED", "APP_PASSWORD", "DEVICE_DOMAIN_NAME", "DEVICE_HOSTNAME", "TOR_PROXY_IP", "TOR_PROXY_PORT",
                "APP_HIDDEN_SERVICE"}
-LOCAL_IMAGES = re.compile(r"^(xbt-signer|xbt-anchor-witness|xbt-wallet-mcp|xbt-wallet-ui|xbt-init):\d+\.\d+\.\d+$|^xbt-a3-knots:29\.4\.2$")
-# image -> (component sub-dir, own socket dir, peer socket dirs it may mount read-only)
+LOCAL_IMAGES = re.compile(r"^(xbt-signer|xbt-anchor-witness|xbt-wallet-mcp|xbt-wallet-ui|xbt-init|xbt-gateway):\d+\.\d+\.\d+$|^xbt-a3-knots:29\.4\.2$")
+# image -> (component sub-dir, run/ dirs it writes, run/ dirs it may mount read-only)
 AGENTPAY = {
-    "xbt-signer": ("signer", "signer", {"anchor"}),
-    "xbt-anchor-witness": ("witness", "anchor", set()),
-    # AGP-042: run/ui holds the UI-owned MCP token; the MCP may only read it
-    "xbt-wallet-mcp": ("mcp", None, {"signer", "ui"}),
-    "xbt-wallet-ui": ("ui", "ui", {"signer"}),
+    "xbt-signer": ("signer", {"signer"}, {"anchor", "ln"}),
+    "xbt-anchor-witness": ("witness", {"anchor"}, set()),
+    # run/ui holds the UI-owned MCP token; the MCP may only read it
+    "xbt-wallet-mcp": ("mcp", set(), {"signer", "ui"}),
+    # the setup pages write run/ln (the rail macaroon) and run/gateway (the gateway's config and macaroons)
+    "xbt-wallet-ui": ("ui", {"ui", "ln", "gateway"}, {"signer"}),
+    "xbt-gateway": ("gateway", set(), {"gateway"}),
 }
+# the Lightning node's certificate: the only file of another app's data a service here may mount
+CERT_MOUNT = {"type": "bind", "source": "${APP_LIGHTNING_FORK_NODE_DATA_DIR}/tls.cert", "target": "/data/lightning/tls.cert", "read_only": True,
+              "bind": {"create_host_path": False}}
+# apps of another community store a dependency may name, and what their exports give a dependent (Paul's
+# umbrel-store, paulscode-lightning-fork/exports.sh)
+OTHER_STORES = {"paulscode-lightning-fork": {"APP_LIGHTNING_FORK_NODE_IP": "10.21.21.66", "APP_LIGHTNING_FORK_NODE_REST_PORT": "8180",
+                                             "APP_LIGHTNING_FORK_NODE_DATA_DIR": "/tmp/lightning-fork-stub/data/lnd"}}
 INIT_CAPS = {"CHOWN", "FOWNER", "DAC_OVERRIDE"}
-# AGP-100: a dependency slot another store's app may fill (umbrelOS `implements`), and what the selected app
+# A dependency slot another store's app may fill (umbrelOS `implements`), and what the selected app
 # sets for the dependent (Paul's paulscode-knots-blake2b exports.sh; the names Lightning Fork reads).
 SLOTS = {"bitcoin": {"APP_BITCOIN_NODE_IP": "10.21.21.62", "APP_BITCOIN_RPC_PORT": "18443", "APP_BITCOIN_RPC_USER": "umbrel",
                      "APP_BITCOIN_RPC_PASS": "stub"}}
@@ -94,13 +105,13 @@ def main() -> int:
             if d in SLOTS:
                 if not any(d in (am.get("implements") or []) for _, am in apps.values()):
                     bad(f"{folder}: no app in this store implements the slot {d} (the fallback node)")
-            elif d not in apps:
+            elif d not in apps and d not in OTHER_STORES:
                 bad(f"{folder}: dependency {d} is not in this store")
         for i in m.get("implements") or []:
             if i not in SLOTS:
                 bad(f"{folder}: implements {i!r}, not a known slot")
         if m["submission"] != "unpublished-local":
-            bad(f"{folder}: submission must stay unpublished-local (store submission needs Mike)")
+            bad(f"{folder}: submission must stay unpublished-local (a store submission is the project owner's decision)")
         compose_p = mp.parent / "docker-compose.yml"
         text = compose_p.read_text()
         c = yaml.safe_load(text)
@@ -123,9 +134,10 @@ def main() -> int:
         # a slot is filled by the app the owner selects: here, the apps of this store that implement it
         providers = [a for d in m["dependencies"] or [] for a, (_, am) in apps.items() if a == d or d in (am.get("implements") or [])]
         dep = {k: v for a in providers for k, v in exports_vars(apps[a][0].parent / "exports.sh").items()}
+        dep.update({k: v for d in m["dependencies"] or [] for k, v in OTHER_STORES.get(d, {}).items()})
         slot = {k: v for d in m["dependencies"] or [] for k, v in SLOTS.get(d, {}).items()}
         text_nc = re.sub(r"(?m)^\s*#.*$", "", text)
-        used = set(re.findall(r"\$\{([A-Z0-9_]+)\}", text_nc))
+        used = set(re.findall(r"\$\{([A-Z0-9_]+)\}", text_nc)) | set(re.findall(r"\$\{([A-Z0-9_]+):-\}", text_nc))
         for v, fallback in re.findall(r"\$\{([A-Z0-9_]+):-\$\{([A-Z0-9_]+)\}\}", text_nc):
             if v not in slot:
                 bad(f"{folder}: ${{{v}:-...}}: only a slot's variable takes a fallback")
@@ -145,9 +157,15 @@ def main() -> int:
             if not LOCAL_IMAGES.match(img):
                 bad(f"{folder}/{name}: image {img!r} is not one of the local images (nothing may be pulled)")
             for v in s.get("volumes") or []:
+                if isinstance(v, dict):
+                    if v != CERT_MOUNT:
+                        bad(f"{folder}/{name}: a long-form mount is only the Lightning node's tls.cert, read-only, never created: {v}")
+                    continue
                 src = str(v).split(":")[0]
                 if not src.startswith("${APP_DATA_DIR}/"):
                     bad(f"{folder}/{name}: volume {v} is not under ${{APP_DATA_DIR}}")
+                if "macaroon" in str(v) or "LIGHTNING" in src:
+                    bad(f"{folder}/{name}: mounts the Lightning node's data or a macaroon of it: {v}")
             base = img.split(":")[0]
             if base == "xbt-init":
                 caps = set(s.get("cap_add") or [])
@@ -156,7 +174,7 @@ def main() -> int:
                 if s.get("restart") != "no":
                     bad(f"{folder}/{name}: xbt-init is a one-shot (restart: \"no\")")
             elif base in AGENTPAY:
-                comp, own_run, peers = AGENTPAY[base]
+                comp, own_runs, peers = AGENTPAY[base]
                 if not s.get("read_only") or s.get("cap_drop") != ["ALL"] or "no-new-privileges:true" not in (s.get("security_opt") or []):
                     bad(f"{folder}/{name}: needs read_only, cap_drop ALL, no-new-privileges")
                 if "user" in s:
@@ -164,10 +182,11 @@ def main() -> int:
                 if (s.get("depends_on") or {}).get("init", {}).get("condition") != "service_completed_successfully":
                     bad(f"{folder}/{name}: must wait for init (service_completed_successfully)")
                 allowed = {f"${{APP_DATA_DIR}}/data/{comp}:/data/{comp}"}
-                if own_run:
-                    allowed.add(f"${{APP_DATA_DIR}}/data/run/{own_run}:/data/run/{own_run}")
+                allowed |= {f"${{APP_DATA_DIR}}/data/run/{r}:/data/run/{r}" for r in own_runs}
                 allowed |= {f"${{APP_DATA_DIR}}/data/run/{p}:/data/run/{p}:ro" for p in peers}
                 for v in s.get("volumes") or []:
+                    if isinstance(v, dict):
+                        continue
                     if v not in allowed:
                         bad(f"{folder}/{name}: mount {v} is outside its own sub-dir and socket dirs")
                 if f"${{APP_DATA_DIR}}/data/{comp}:/data/{comp}" not in (s.get("volumes") or []):
@@ -185,7 +204,8 @@ def main() -> int:
                 bad(f"{folder}: docker compose config: {r.stderr.strip()[-400:]}")
             if slot:
                 # the slot's node alone (no app of this store installed): the slot's values reach the services
-                base = {k: v for k, v in envs.items() if k not in dep}
+                other = {k for d in m["dependencies"] or [] for k in OTHER_STORES.get(d, {})}
+                base = {k: v for k, v in envs.items() if k not in dep or k in other}
                 r = subprocess.run(["docker", "compose", "-f", str(compose_p), "-f", str(ov), "config"], capture_output=True, text=True,
                                    env={**{k: v for k, v in os.environ.items() if not k.startswith("APP_")}, **base, **slot}, cwd=mp.parent)
                 if r.returncode != 0 or not all(v in r.stdout for v in slot.values()):
