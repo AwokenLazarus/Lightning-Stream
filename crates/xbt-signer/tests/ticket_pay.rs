@@ -904,6 +904,16 @@ fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
     }
 }
 
+/// Wait for a refill: `n` tickets locked, and none of them still on its way to the node. The
+/// book counts a ticket as locked from `sending` on, before its payment is in the node's list,
+/// so a count of locked tickets alone can be reached while the refill's send has not returned.
+fn wait_refill(r: &Rig, what: &str, n: i64) {
+    wait_for(what, || {
+        let s = r.status();
+        s["locked"]["tickets"].as_i64() == Some(n) && s["tickets"]["sending"].as_i64().unwrap_or(0) == 0
+    });
+}
+
 fn body_of(v: &Value) -> &str {
     v["untrusted_provider_response"]["body"].as_str().unwrap_or("")
 }
@@ -1007,7 +1017,7 @@ fn a_file_priced_by_the_byte_is_paid_as_it_arrives_and_stops_where_the_call_or_t
     // everything that was released is on both nodes and in the ledger, to the millisat
     assert_eq!(r.money(), (7 * TICKET, 7 * TICKET, 7 * TICKET, 7 * SETTLED));
     // the pool fell to half (four of eight) during the answer and was filled again behind it; three more were released since
-    wait_for("the refill", || r.status()["locked"]["tickets"].as_i64() == Some(5));
+    wait_refill(&r, "the refill", 5);
     assert_eq!(r.ln.state().payments.len(), 12, "eight, and four more when four were left");
     // the agent stops a session while an answer is open: the answer ends within one ticket
     let slow = 30 * MIB;
@@ -1100,7 +1110,7 @@ fn no_request_leaves_for_a_host_the_owner_did_not_allow_and_an_unnamed_seller_is
     let st = r.status();
     assert_eq!((st["sessions"][0]["listed"].as_bool(), st["sessions"][0]["pool"].as_i64(), st["sessions"][0]["task"].as_str()), (Some(false), Some(1), Some("swarm")), "{st}");
     // paid: the session holds, one ticket
-    wait_for("one ticket held after the prepaid one", || r.status()["locked"]["tickets"] == 1);
+    wait_refill(&r, "one ticket held after the prepaid one", 1);
     assert!(locks.iter().skip(1).all(|l| l["hashes"].as_array().is_none_or(|h| h.len() <= 1)), "{locks:?}");
     let file = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{}", 30 * MIB)), "max_sats": 20_000, "task": "swarm"}));
     assert_eq!(file["complete"], false, "{file}");
@@ -1611,7 +1621,7 @@ fn while_the_wallets_own_node_is_away_no_hash_is_offered_and_the_next_call_pays_
     let r = Rig::new(json!({"tickets": {"enabled": true, "pool": 2, "tasks": {"film": {"budget_sats": 40_000}}}}));
     assert_eq!(r.pay("/page/10", 10)["status"].as_u64(), Some(200));
     // one of two is left, so the next is locked behind the call: that round is over before the node goes
-    wait_for("the refill behind the first call", || r.status()["locked"]["tickets"].as_i64() == Some(2));
+    wait_refill(&r, "the refill behind the first call", 2);
     // the node goes away in the middle of a file: the two tickets of the pool are released (a release needs no node),
     // the refill cannot lock, and the answer ends there
     r.ln.st.lock().unwrap().down = true;
@@ -1758,7 +1768,7 @@ fn a_seller_that_holds_only_after_a_prepaid_ticket_is_paid_one_first_and_then_he
     let st = r.status();
     assert_eq!((st["sessions"][0]["listed"].as_bool(), st["sessions"][0]["pool"].as_i64()), (Some(true), Some(2)), "{st}");
     // paid: the named seller is held with as before, 2 tickets
-    wait_for("two tickets held after the prepaid one", || r.status()["locked"]["tickets"] == 2);
+    wait_refill(&r, "two tickets held after the prepaid one", 2);
     // (6 MiB at 200 sat a MiB: more than the prepaid ticket left)
     let next = r.pay(&format!("/files/{}", 6 * MIB), 2_000);
     assert_eq!((next["status"].as_u64(), next["tickets_prepaid"].as_u64(), next["session"].as_str()), (Some(200), Some(0), v["session"].as_str()), "{next}");
@@ -1795,7 +1805,7 @@ fn a_kill_at_every_write_of_a_call_that_buys_its_prepaid_ticket_first_never_unde
             survived = Some(step);
             // a call that ended holds 2 tickets behind it once its refill is back: this rig's "kill" leaves the old
             // signer's threads running, so the refill is waited for rather than raced
-            wait_for("the refill behind the call", || r.status()["locked"]["tickets"] == 2);
+            wait_refill(&r, "the refill behind the call", 2);
         }
         r.restart();
         r.assert_booked();
@@ -2011,7 +2021,7 @@ fn as_shipped_a_session_holds_two_tickets_and_the_next_is_locked_when_one_is_lef
     assert_eq!((first["verdict"].as_str(), first["rail"].as_str(), first["status"].as_u64()), (Some("allow"), Some("ticket"), Some(200)), "{first}");
     assert_eq!((first["tickets_released"].as_u64(), first["tickets_prepaid"].as_u64(), first["charged_sats"].as_i64()), (Some(1), Some(0), Some(BOOKING)), "{first}");
     // two were locked, one was released, and the next is locked behind the call: one left is the refill mark
-    wait_for("the refill", || r.status()["locked"]["tickets"].as_i64() == Some(2));
+    wait_refill(&r, "the refill", 2);
     assert_eq!(r.ln.state().payments.len(), 3, "two, and one more when one was left");
     let s = session_of(&r, &first);
     assert_eq!((s["pool"].as_i64(), s["prepaid_msat"].as_str(), s["hold_why"].as_str()), (Some(2), Some("1000000"), Some("")), "{s}");
@@ -2025,7 +2035,7 @@ fn as_shipped_a_session_holds_two_tickets_and_the_next_is_locked_when_one_is_lef
     assert!(r.ln.state().peak <= 3, "two held and at most one on its way to being settled: {}", r.ln.state().peak);
     // a refill that was asked for while another was out is made by the next call at the latest
     assert_eq!(r.pay("/page/300", 10)["tickets_released"], 0);
-    wait_for("the last refill", || r.status()["locked"]["tickets"].as_i64() == Some(2));
+    wait_refill(&r, "the last refill", 2);
     assert_eq!(r.money(), (3 * TICKET, 3 * TICKET, 3 * TICKET, 3 * SETTLED));
     r.assert_booked();
     // the shipped policy counts a session as one payment: three releases, one of the hour's payments
@@ -2098,13 +2108,13 @@ fn held_tickets_never_take_more_than_half_of_the_channels_slots() {
     let r = Rig::shipped(json!({}), 30, held_only_shop());
     let v = r.pay("/page/1000", 10);
     assert_eq!(v["status"].as_u64(), Some(200), "{v}");
-    wait_for("the first refill", || r.status()["locked"]["tickets"].as_i64() == Some(2));
+    wait_refill(&r, "the first refill", 2);
     r.ln.st.lock().unwrap().foreign = 13;
     // 13 of others and the wallet's 2: half. A release leaves 14 pending, and room for one more
     let page = |r: &Rig| r.pay(&format!("/files/{}", 6 * MIB), 5_000);
     let v = page(&r);
     assert_eq!(v["complete"], true, "{v}");
-    wait_for("the refill of one", || r.status()["locked"]["tickets"].as_i64() == Some(2));
+    wait_refill(&r, "the refill of one", 2);
     r.ln.st.lock().unwrap().foreign = 14;
     let before = r.ln.state().payments.len();
     let v = page(&r);
@@ -2189,7 +2199,7 @@ fn a_ticket_below_a_channels_dust_limit_is_never_held() {
     let r = Rig::shipped(json!({}), 30, shipped_shop());
     let v = r.pay("/page/1000", 10);
     assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(0)), "{v}");
-    wait_for("the first refill", || r.status()["locked"]["tickets"].as_i64() == Some(2));
+    wait_refill(&r, "the first refill", 2);
     r.ln.st.lock().unwrap().channel["remote_constraints"]["dust_limit_sat"] = "1001".into();
     let sends = r.ln.state().payments.len();
     let v = r.pay(&format!("/files/{}", 12 * MIB), 5_000);
