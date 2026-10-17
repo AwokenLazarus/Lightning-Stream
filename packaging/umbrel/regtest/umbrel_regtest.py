@@ -20,7 +20,7 @@ umbrelOS, simulated on plain Docker (no Umbrel dev environment runs rootless her
 Checks (results.json): I install and layout, S hardening, U the UI (no terminal: password, key, policy, token),
 P the agent's MCP surface and custody of the hot key, T the paid buy over tickets (both setup pages, the rail,
 the gateway, the agent's call, what the nodes saw), R restart persistence (and a buy after it), W token rotation,
-G /readyz gating, X uninstall.
+M idle memory after the buy, G /readyz gating, X uninstall.
     umbrel_regtest.py OUT RUN_INDEX
 """
 import hashlib
@@ -279,6 +279,22 @@ def main():
           [rail_files, gw_files])
     mcp_mounts = [m["Destination"] for m in inspect(cname(WALLET, "mcp"))[0]["Mounts"]]
     check("T", "the agent's MCP container has no view of the rail macaroon (run/ln is not mounted there)", "/data/run/ln" not in mcp_mounts, mcp_mounts)
+
+    # --- M: idle memory after the buy (the pass lines are packaging/README.md's) ------------------------------
+    time.sleep(60)
+    names = [cname(WALLET, x) for x in ("witness", "signer", "mcp", "ui")] + [cname(GATEWAY, x) for x in ("gateway", "ui")]
+    out = docker("stats", "--no-stream", "--format", "{{.Name}} {{.MemUsage}}", *names).stdout.split("\n")
+    units = {"B": 1 / 2**20, "KiB": 1 / 1024, "kB": 1 / 1024, "MiB": 1, "MB": 1, "GiB": 1024, "GB": 1024}
+
+    def mib(v):
+        num = re.match(r"([0-9.]+)\s*([A-Za-z]+)", v)
+        return float(num.group(1)) * units.get(num.group(2), 1) if num else 0.0
+    mem = {ln.split()[0]: round(mib(ln.split(" ", 1)[1].split("/")[0].strip()), 2) for ln in out if ln.strip()}
+    w = round(sum(v for k, v in mem.items() if k.startswith(WALLET)), 2)
+    g = round(sum(v for k, v in mem.items() if k.startswith(GATEWAY)), 2)
+    with open(os.path.join(OUT, "memory.json"), "w") as f:
+        json.dump({"method": "docker stats --no-stream, 60 s after the paid buy", "mib": mem, "wallet_mib": w, "gateway_mib": g}, f, indent=1)
+    check("M", f"idle memory 60 s after the buy: the wallet app {w} MiB (pass line 64), the gateway app {g} MiB (pass line 32)", w <= 64 and g <= 32, mem)
 
     # --- R: restart the app (umbrelOS: stop + start, or a reboot) -----------------------------------------------
     log("== R: restart the wallet app")
