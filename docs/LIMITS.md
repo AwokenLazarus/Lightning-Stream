@@ -886,9 +886,11 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
 - A body longer than the preview is stored only when `B2_BODY_DIR` is set; otherwise the wallet
   hands on its first 12,000 bytes, its length and its hash. Stored files are never removed by
   the wallet.
-- On mainnet the wallet pays no ticket and no win unless its owner's policy also says
-  `tickets.mainnet_ack` with the same fixed sentence the gateway asks for ("real funds, software
-  that has run on regtest only"): without it the rail is off, the signer says so at start, and
+- On mainnet the wallet pays no ticket and no win unless its owner acknowledges it with the same
+  fixed sentence the gateway asks for ("real funds, software that has run on regtest only"):
+  in the policy's `tickets.mainnet_ack`, or alone in a file the environment variable
+  `B2_MAINNET_ACK_FILE` names (what a package's setup page writes; white space around it is
+  allowed, anything else is no acknowledgement). Without it the rail is off, the signer says so at start, and
   every refusal of the rail carries the sentence (`ticket_mainnet`). With it, the caps the owner
   did not set are smaller than elsewhere: 4 tickets and 4,000 sat locked at once, 4 sellers at
   once and 4 new ones a minute, 120 ticket payments an hour (15, 15,000, 15, 30 and 1,200

@@ -293,7 +293,7 @@ impl Signer {
             eprintln!("xbt-signer: {w}");
         }
         // tickets on, on mainnet, without the owner's acknowledgement: off, and said so at start as well as on each refusal
-        if let Some(why) = crate::ticket::TicketPolicy::for_chain(&config.tickets, &chain).mainnet_off {
+        if let Some(why) = crate::ticket::TicketPolicy::for_chain(&config.tickets, &chain, chain == "main" && crate::ticket::mainnet_ack_file()).mainnet_off {
             eprintln!("xbt-signer: {why}");
         }
         let watch_interval = std::env::var("B2_WATCH_INTERVAL").ok().and_then(|v| v.parse().ok()).unwrap_or(10.0);

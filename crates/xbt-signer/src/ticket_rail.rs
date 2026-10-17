@@ -286,7 +286,7 @@ impl Signer {
     }
 
     pub(crate) fn ticket_policy(&self) -> TicketPolicy {
-        TicketPolicy::for_chain(&self.config().tickets, &self.chain)
+        TicketPolicy::for_chain(&self.config().tickets, &self.chain, self.chain == "main" && ticket::mainnet_ack_file())
     }
 
     /// The book, opened (and created) when first needed. An error keeps the ticket rail shut and

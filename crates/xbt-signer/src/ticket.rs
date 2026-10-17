@@ -393,6 +393,19 @@ impl Default for TicketPolicy {
     }
 }
 
+/// The environment variable that names a file holding the owner's mainnet acknowledgement (what
+/// a package's setup page writes): [`xbt402::ticket::MAINNET_ACK`], and nothing else but
+/// surrounding white space.
+pub const MAINNET_ACK_ENV: &str = "B2_MAINNET_ACK_FILE";
+
+/// Whether the file [`MAINNET_ACK_ENV`] names holds the acknowledgement. A file that is missing,
+/// unreadable, larger than 1 KiB or says anything else is no acknowledgement.
+pub fn mainnet_ack_file() -> bool {
+    let Some(path) = std::env::var_os(MAINNET_ACK_ENV).filter(|p| !p.is_empty()) else { return false };
+    std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() <= 1024)
+        && std::fs::read_to_string(&path).is_ok_and(|s| s.trim() == xbt402::ticket::MAINNET_ACK)
+}
+
 /// The owner's caps on mainnet where the policy does not set them: at most 4 tickets and 4,000
 /// sat locked at once, 4 sellers at once and 4 new ones a minute, 120 ticket payments an hour.
 /// Elsewhere 15, 15,000, 15, 30 and 1,200.
@@ -468,11 +481,12 @@ impl TicketPolicy {
         p
     }
 
-    /// The policy for `chain`. On mainnet: tickets and draws stay off unless the owner wrote
-    /// `tickets.mainnet_ack` ([`xbt402::ticket::MAINNET_ACK`], word for word), and why is in
-    /// `mainnet_off`; and the caps the owner did not set are smaller than elsewhere
+    /// The policy for `chain`. On mainnet: tickets and draws stay off unless the owner
+    /// acknowledged it ([`xbt402::ticket::MAINNET_ACK`], word for word), in `tickets.mainnet_ack`
+    /// or in the file `B2_MAINNET_ACK_FILE` names (`file_ack`: [`mainnet_ack_file`]), and why is
+    /// in `mainnet_off`; and the caps the owner did not set are smaller than elsewhere
     /// ([`MAINNET_DEFAULTS`]).
-    pub fn for_chain(m: &Map<String, Value>, chain: &str) -> Self {
+    pub fn for_chain(m: &Map<String, Value>, chain: &str, file_ack: bool) -> Self {
         if chain != "main" {
             return Self::from_map(m);
         }
@@ -481,10 +495,12 @@ impl TicketPolicy {
             with.entry(k.to_string()).or_insert(json!(v));
         }
         let mut p = Self::from_map(&with);
+        p.mainnet_ack |= file_ack;
         if p.enabled && !p.mainnet_ack {
             p.enabled = false;
-            p.mainnet_off = Some(format!("on mainnet stream tickets and draws are off until the owner's policy says tickets.mainnet_ack: {:?}: this software has \
-                                          run on regtest only (docs/LIMITS.md)", xbt402::ticket::MAINNET_ACK));
+            p.mainnet_off = Some(format!("on mainnet stream tickets and draws are off until the owner acknowledges {:?}, in the policy's tickets.mainnet_ack or \
+                                          in the file {MAINNET_ACK_ENV} names: this software has run on regtest only (docs/LIMITS.md)",
+                                         xbt402::ticket::MAINNET_ACK));
         }
         p
     }
@@ -1870,31 +1886,48 @@ mod tests {
     fn on_mainnet_tickets_are_off_until_the_owner_acknowledges_and_the_caps_are_small() {
         let on = json!({"enabled": true, "tasks": {"t": {"budget_sats": 5_000}}});
         let m = on.as_object().unwrap();
-        let reg = TicketPolicy::for_chain(m, "regtest");
+        let reg = TicketPolicy::for_chain(m, "regtest", false);
         assert!(reg.enabled && reg.mainnet_off.is_none());
         assert_eq!((reg.max_locked_tickets, reg.max_locked_sats, reg.max_sellers, reg.max_sends_per_hour), (15, 15_000, 15, 1_200));
-        let main = TicketPolicy::for_chain(m, "main");
+        let main = TicketPolicy::for_chain(m, "main", false);
         assert!(!main.enabled);
         assert!(main.mainnet_off.as_deref().is_some_and(|w| w.contains("tickets.mainnet_ack") && w.contains(xbt402::ticket::MAINNET_ACK)), "{main:?}");
         let mut acked = on.clone();
         acked["mainnet_ack"] = xbt402::ticket::MAINNET_ACK.into();
-        let main = TicketPolicy::for_chain(acked.as_object().unwrap(), "main");
+        let main = TicketPolicy::for_chain(acked.as_object().unwrap(), "main", false);
         assert!(main.enabled && main.mainnet_off.is_none());
         assert_eq!((main.max_locked_tickets, main.max_locked_sats, main.max_sellers, main.max_new_sellers_per_min, main.max_sends_per_hour), (4, 4_000, 4, 4, 120));
         // what the owner set is what it set
         acked["max_locked_tickets"] = 9.into();
-        assert_eq!(TicketPolicy::for_chain(acked.as_object().unwrap(), "main").max_locked_tickets, 9);
+        assert_eq!(TicketPolicy::for_chain(acked.as_object().unwrap(), "main", false).max_locked_tickets, 9);
         // not quite the words: off, and an error in the policy check
         for wrong in [json!(true), json!("yes"), json!(xbt402::ticket::MAINNET_ACK.to_uppercase())] {
             let mut w = on.clone();
             w["mainnet_ack"] = wrong.clone();
-            assert!(!TicketPolicy::for_chain(w.as_object().unwrap(), "main").enabled, "{wrong}");
+            assert!(!TicketPolicy::for_chain(w.as_object().unwrap(), "main", false).enabled, "{wrong}");
             let (mut errors, mut warnings) = (vec![], vec![]);
             validate(&w, &mut errors, &mut warnings);
             assert!(errors.iter().any(|e| e.contains("mainnet_ack")), "{wrong}: {errors:?}");
         }
         // off, it says nothing on mainnet either
-        assert!(TicketPolicy::for_chain(&Map::new(), "main").mainnet_off.is_none());
+        assert!(TicketPolicy::for_chain(&Map::new(), "main", false).mainnet_off.is_none());
+        // the acknowledgement in a file, on its own
+        assert!(TicketPolicy::for_chain(m, "main", true).enabled);
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("mainnet-ack");
+        let read = |content: Option<&str>| {
+            match content {
+                Some(c) => std::fs::write(&f, c).unwrap(),
+                None => { let _ = std::fs::remove_file(&f); }
+            }
+            std::env::set_var(MAINNET_ACK_ENV, &f);
+            let got = mainnet_ack_file();
+            std::env::remove_var(MAINNET_ACK_ENV);
+            got
+        };
+        assert!(read(Some(&format!("{}\n", xbt402::ticket::MAINNET_ACK))));
+        assert!(!read(Some("yes")) && !read(Some(&xbt402::ticket::MAINNET_ACK.to_uppercase())) && !read(None));
+        assert!(!mainnet_ack_file(), "no variable, no file");
     }
 
     #[test]
