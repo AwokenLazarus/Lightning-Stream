@@ -7,8 +7,9 @@ exclude = ["vendor"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-# 1.89: std `File::try_lock`, the ledger file lock (AGP-067)
-rust-version = "1.89"
+# 1.90: the locked ruint 1.20.1 declares it, and it is the highest of any locked package (the
+# code itself needs 1.89: std `File::try_lock`, the ledger file lock). Checked with 1.91.1 and 1.98
+rust-version = "1.90"
 license = "MIT OR Apache-2.0"
 publish = false
 

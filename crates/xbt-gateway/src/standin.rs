@@ -243,6 +243,15 @@ impl StandIn {
     }
 
     /// Every settle call answered with success, in order.
+    /// Held invoices (not ordinary ones) in `state`.
+    pub fn count_held(&self, state: InvoiceState) -> usize {
+        self.lock()
+            .invoices
+            .values()
+            .filter(|h| !h.ordinary && h.inv.state == state)
+            .count()
+    }
+
     pub fn settles(&self) -> Vec<Settle> {
         self.lock().settles.clone()
     }

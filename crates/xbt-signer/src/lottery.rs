@@ -54,17 +54,22 @@ pub struct LotteryPolicy {
     pub direct_floor_sats: i64,
     /// A seller expected to earn this many tickets or more from a call is one the buyer stays with.
     pub stay_tickets: i64,
+    /// A call expected to draw fewer wins than this is not paid by draws where the seller's ticket
+    /// entry can pay it: with so few wins what it costs is mostly luck (nothing, or several times
+    /// its price), and a ticket costs what it says.
+    pub min_expected_wins: i64,
 }
 
 impl Default for LotteryPolicy {
     fn default() -> Self {
         Self { enabled: true, max_win_sats: 1_000, unlisted_max_win_sats: 250, min_win_sats: 16, max_odds_den: 4, expected_wins: 16, luck_tenths: 31, ahead: 8,
-               unlisted_max_wins: 32, routed_floor_sats: ROUTED_FLOOR_SATS, direct_floor_sats: DIRECT_FLOOR_SATS, stay_tickets: 4 }
+               unlisted_max_wins: 32, routed_floor_sats: ROUTED_FLOOR_SATS, direct_floor_sats: DIRECT_FLOOR_SATS, stay_tickets: 4,
+               min_expected_wins: 4 }
     }
 }
 
-pub const LOTTERY_INT_KEYS: [&str; 11] = ["max_win_sats", "unlisted_max_win_sats", "min_win_sats", "max_odds_den", "expected_wins", "luck_tenths", "ahead",
-                                          "unlisted_max_wins", "routed_floor_sats", "direct_floor_sats", "stay_tickets"];
+pub const LOTTERY_INT_KEYS: [&str; 12] = ["max_win_sats", "unlisted_max_win_sats", "min_win_sats", "max_odds_den", "expected_wins", "luck_tenths", "ahead",
+                                          "unlisted_max_wins", "routed_floor_sats", "direct_floor_sats", "stay_tickets", "min_expected_wins"];
 
 impl LotteryPolicy {
     /// From policy.json `tickets.lottery`. A number that is missing takes the default; one that is
@@ -81,7 +86,7 @@ impl LotteryPolicy {
                min_win_sats: i("min_win_sats", d.min_win_sats), max_odds_den: i("max_odds_den", d.max_odds_den), expected_wins: i("expected_wins", d.expected_wins),
                luck_tenths: i("luck_tenths", d.luck_tenths), ahead: i("ahead", d.ahead), unlisted_max_wins: i("unlisted_max_wins", d.unlisted_max_wins),
                routed_floor_sats: i("routed_floor_sats", d.routed_floor_sats), direct_floor_sats: i("direct_floor_sats", d.direct_floor_sats),
-               stay_tickets: i("stay_tickets", d.stay_tickets) }
+               stay_tickets: i("stay_tickets", d.stay_tickets), min_expected_wins: i("min_expected_wins", d.min_expected_wins) }
     }
 
     /// The largest win for a seller, in msat.
@@ -191,7 +196,7 @@ impl DrawTerms {
         if acc.get("scheme").and_then(Value::as_str) != Some(xbt402::lottery::SCHEME) {
             return refuse(R, "not a lottery entry");
         }
-        if acc.get("network").and_then(Value::as_str) != Some(lightning) {
+        if !xbt402::ticket::on_network(acc, lightning) {
             return refuse("ticket_network", "the entry is for another Lightning network than this wallet's");
         }
         if acc.get("asset").and_then(Value::as_str) != Some(xbt402::ticket::ASSET) {
@@ -295,6 +300,12 @@ pub struct Choice {
     /// on held tickets have room.
     pub held_fits: bool,
     pub stay_tickets: u64,
+    /// The seller's ticket entry has prepaid tickets beside it (or is one).
+    pub prepaid_entry: bool,
+    /// The win a session with this seller would be opened with (0: none fits), and the owner's
+    /// `min_expected_wins`.
+    pub win_msat: u64,
+    pub min_wins: u64,
 }
 
 /// Which way a seller is paid, tried first. The other is tried after it where the first is not
@@ -305,6 +316,7 @@ pub struct Choice {
 /// | A session with this seller is open | what that session pays by |
 /// | The seller offers one of the two, or the owner turned the lottery off, or the task says | that one |
 /// | A piece of the route costs one ticket or more | tickets |
+/// | The call is expected to draw fewer than `min_expected_wins` wins (4), and the seller offers prepaid tickets | tickets |
 /// | The call may use four tickets' worth or more with this seller, and a held ticket fits | tickets |
 /// | Anything smaller, and whenever no held ticket fits | draws |
 ///
@@ -323,6 +335,10 @@ pub fn choose(c: &Choice) -> bool {
     if c.dearest_msat >= c.ticket_msat {
         return false;
     }
+    // so few wins expected that the call's cost is mostly luck: a ticket, where one can be had without holding
+    if c.prepaid_entry && c.win_msat > 0 && c.expect_msat < c.win_msat.saturating_mul(c.min_wins) {
+        return false;
+    }
     let stays = c.expect_msat >= c.ticket_msat.saturating_mul(c.stay_tickets.max(1));
     !(stays && c.held_fits)
 }
@@ -332,7 +348,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const NET: &str = "lightning:00000000000000000000000000000001";
+    const NET: &str = "bip122:00000000000000000000000000000001";
 
     fn node_id() -> String {
         let sk = xbt_primitives::secp256k1::SecretKey::from_slice(&[3u8; 32]).unwrap();
@@ -342,7 +358,7 @@ mod tests {
     fn accepts(price: Value) -> Value {
         let amount = price.get("requestMsat").and_then(Value::as_str).unwrap_or("0").to_string();
         json!({"scheme": "lottery", "network": NET, "asset": "XBT:msat", "amount": amount, "payTo": node_id(),
-               "extra": {"version": "lottery/0", "features": [512], "winMsat": "64000", "minWinMsat": "16000", "winBlocks": 40, "pay": "on-win",
+               "extra": {"version": "lottery/0", "layer": "lightning", "features": [512], "winMsat": "64000", "minWinMsat": "16000", "winBlocks": 40, "pay": "on-win",
                          "release": "after-answer", "window": 8, "graceSeconds": 10, "gracePieces": 64, "maxUnpaidWins": 2, "chainDraws": 65536,
                          "pieceBytes": "262144", "receiptKey": node_id(), "session": "/x402/lottery", "price": price}})
     }
@@ -458,9 +474,15 @@ mod tests {
     #[test]
     fn tickets_for_a_piece_worth_one_and_for_a_seller_one_stays_with_draws_for_the_rest() {
         let base = Choice { ticket_entry: true, lottery_entry: true, lottery_on: true, meter: Meter::Auto, open: None, dearest_msat: 100, ticket_msat: 1_000_000,
-                            expect_msat: 1_638_000, held_fits: true, stay_tickets: 4 };
+                            expect_msat: 1_638_000, held_fits: true, stay_tickets: 4, prepaid_entry: false, win_msat: 64_000, min_wins: 4 };
         // a download worth less than two tickets: draws
         assert!(choose(&base));
+        // a call expected to draw fewer than 4 wins of 64 sat (255 sat or less): a prepaid ticket, where the seller offers them
+        assert!(!choose(&Choice { expect_msat: 255_999, prepaid_entry: true, ..base }));
+        assert!(choose(&Choice { expect_msat: 256_000, prepaid_entry: true, ..base }));
+        assert!(choose(&Choice { expect_msat: 255_999, ..base }), "no prepaid tickets: draws");
+        assert!(choose(&Choice { expect_msat: 255_999, prepaid_entry: true, min_wins: 0, ..base }), "the owner turned the rule off");
+        assert!(choose(&Choice { expect_msat: 1_000, prepaid_entry: true, open: Some(true), ..base }), "an open session keeps its way");
         // a piece worth a ticket or more
         assert!(!choose(&Choice { dearest_msat: 1_000_000, ..base }));
         assert!(choose(&Choice { dearest_msat: 999_999, ..base }));

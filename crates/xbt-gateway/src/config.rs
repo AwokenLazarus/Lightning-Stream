@@ -16,8 +16,9 @@ use crate::lottery::LotteryConfig;
 use crate::price::Price;
 use crate::Error;
 
-/// What `mainnet_ack` must say, word for word, before a config with `chain: "main"` is taken.
-pub const MAINNET_ACK: &str = "real funds, software that has run on regtest only";
+/// What `mainnet_ack` must say, word for word, before a config with `chain: "main"` is taken (the
+/// same words a wallet's policy says for its side).
+pub use xbt402::ticket::MAINNET_ACK;
 
 /// What a gateway prints when it starts on mainnet: the things its runner should know before a
 /// buyer does. A short fixed text; the whole of it, with the measurements, is `docs/LIMITS.md`.
@@ -26,12 +27,14 @@ pub const MAINNET_NOTICE: [&str; 9] = [
     "- A held ticket of 1,000 sat can be below a channel's dust limit at mainnet fee rates on a channel without anchors: it then has no output there, and is lost to the miners if that channel is force-closed while it is held. The gateway does not read its channels' dust limits.",
     "- Claiming settled tickets on chain after a force close cost 900 to 1,700 sat for three tickets at 1 sat/vB; at higher fee rates one ticket costs more to claim than it is worth.",
     "- Held tickets take pending-payment slots of every channel on their route for no fee, on your node and on the routing nodes before it. Nothing but this software keeps buyers to half of a channel's slots.",
-    "- A lock costs a buyer nothing until it pays: whoever reaches the gateway from enough addresses can take every session place with invoices it never pays.",
+    "- A session's first ticket is a prepaid one (caps.held_after_paid), so a hold invoice costs whoever asks for it one paid ticket; but a first lock still costs nothing, and whoever reaches the gateway from enough addresses can take every session place with prepaid invoices it never pays, for 20 s at a time (caps.first_lock_secs).",
     "- With a lottery section you serve first, and nothing makes a buyer pay a win.",
     "- The gateway speaks an lnd-family node's REST interface and no other; a Core Lightning seller is not supported.",
     "- The gateway speaks plain HTTP: buyers must reach it through a TLS proxy, with public_url set to the https origin they use.",
     "- A buyer's unused balance is trusted to you, and a lost state directory loses every session, key and balance.",
 ];
+
+const NEEDS_NETWORK: &str = "a chain other than main needs network: \"bip122:<32 hex of its bip122 id>\" (chain is \"regtest\" where the file names none)";
 
 /// The node adds this many blocks to a ticket's final CLTV delta when it pays.
 pub const PAYER_PAD_BLOCKS: u32 = 3;
@@ -265,20 +268,13 @@ impl Config {
             ("main", None) => xbt402::ticket::network_id(xbt_primitives::network::XBT_MAINNET)
                 .ok_or("no mainnet network id")?,
             ("main", Some(_)) => return Err("network is fixed on chain main: leave it out".into()),
-            (_, Some(n))
-                if n.strip_prefix("lightning:").is_some_and(|id| {
-                    id.len() == 32
-                        && id
-                            .bytes()
-                            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
-                }) =>
-            {
-                n.to_string()
-            }
-            _ => return Err(
-                "a chain other than main needs network: \"lightning:<32 hex of its bip122 id>\" (chain is \"regtest\" where the file names none)"
-                    .into(),
-            ),
+            // the chain's CAIP-2 id; the name of before 2026-10, `lightning:` and the same 32 hex, is read for one
+            // release and written the new way
+            (_, Some(n)) => match xbt402::ticket::network_id(&n.replacen("lightning:", "bip122:", 1)) {
+                Some(id) if n.starts_with("bip122:") || n.starts_with("lightning:") => id,
+                _ => return Err(NEEDS_NETWORK.into()),
+            },
+            (_, None) => return Err(NEEDS_NETWORK.into()),
         };
         let public_url = req_str(top, "public_url")?
             .trim_end_matches('/')
@@ -392,6 +388,9 @@ impl Config {
                     "held_over_half",
                     "slots_retry_secs",
                     "unpaid_secs",
+                    "first_lock_secs",
+                    "unpaid_per_address",
+                    "held_after_paid",
                     "first_use_secs",
                     "idle_secs",
                     "keep_secs",
@@ -442,6 +441,20 @@ impl Config {
         ticket_msat
             .checked_mul(u64::from(max_held))
             .ok_or("the cap on held funds does not fit")?;
+        // hold invoices only to a session that has paid something: on wherever prepaid tickets are offered
+        // beside held ones, since a first ticket has to be had some way
+        let held_after_paid = match c.get("held_after_paid") {
+            None => held && prepaid,
+            Some(Value::Bool(true)) if !(held && prepaid) => {
+                return Err(format!("caps.held_after_paid needs tickets.settle to offer both \"{SETTLE_ON_USE}\" and \"{SETTLE_ON_ARRIVAL}\": a session's first ticket is a prepaid one"))
+            }
+            Some(Value::Bool(b)) => *b,
+            Some(_) => return Err("caps.held_after_paid is true or false".into()),
+        };
+        let first_lock_secs = num(c, "first_lock_secs", 20)?;
+        if !(5..=u64::from(xbt402::ticket::INVOICE_EXPIRY_S)).contains(&first_lock_secs) {
+            return Err(format!("caps.first_lock_secs is from 5 to {}: how long the invoices of a session's first lock stay payable", xbt402::ticket::INVOICE_EXPIRY_S));
+        }
         let caps = Caps {
             ticket_msat,
             max_tickets,
@@ -452,6 +465,9 @@ impl Config {
             slots_retry_secs,
             margin_blocks: SETTLE_MARGIN_BLOCKS,
             unpaid_secs: num(c, "unpaid_secs", 75)?,
+            first_lock_secs,
+            unpaid_per_address: num32(c, "unpaid_per_address", 2)?,
+            held_after_paid,
             first_use_secs: num(c, "first_use_secs", 60)?,
             idle_secs: num(c, "idle_secs", 300)?,
             keep_secs: num(c, "keep_secs", 86_400)?,
@@ -736,7 +752,7 @@ mod tests {
 
     pub(crate) fn base() -> Value {
         json!({"listen": "127.0.0.1:0", "public_url": "http://127.0.0.1:8402", "upstream": "http://127.0.0.1:8080", "state_dir": "/tmp/x",
-               "chain": "regtest", "network": "lightning:00000000000000000000000000000001",
+               "chain": "regtest", "network": "bip122:00000000000000000000000000000001",
                "node": {"rest": "https://127.0.0.1:8080", "tls_cert": "tls.cert", "macaroon": "a", "info_macaroon": "b"},
                "routes": [{"path": "/files/", "price": {"byte_msat": 1000, "per_bytes": 1048576}},
                           {"path": "/files/free/", "free": true},
@@ -822,7 +838,7 @@ mod tests {
         main["mainnet_ack"] = json!(MAINNET_ACK);
         let m = Config::from_json(&main).unwrap();
         assert!(m.mainnet());
-        assert_eq!(m.network, "lightning:0000000000000050c1e5f69672f45929");
+        assert_eq!(m.network, "bip122:0000000000000050c1e5f69672f45929");
         // and a start on mainnet says what its runner should know, and where the rest is
         let notice = m.mainnet_notice().join("\n");
         assert!(notice.contains("docs/LIMITS.md") && notice.contains("regtest only") && notice.contains("dust"), "{notice}");
@@ -850,6 +866,41 @@ mod tests {
             assert!(e.contains("not a loopback address") && e.contains("https"), "{listen}: {e}");
             assert!(with(listen, "https://seller.example").is_ok(), "{listen}: behind a TLS proxy");
         }
+    }
+
+    #[test]
+    fn the_network_is_the_chains_id_and_the_old_name_is_read_for_one_release() {
+        let c = Config::from_json(&base()).unwrap();
+        assert_eq!(c.network, "bip122:00000000000000000000000000000001");
+        let mut old = base();
+        old["network"] = json!("lightning:00000000000000000000000000000001");
+        assert_eq!(Config::from_json(&old).unwrap().network, "bip122:00000000000000000000000000000001", "read, and written the new way");
+        for bad in ["bip122:0000000000000000000000000000000G", "lightning:01", "bip122:", "00000000000000000000000000000001"] {
+            old["network"] = json!(bad);
+            assert!(Config::from_json(&old).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn hold_invoices_go_to_a_session_that_has_paid_by_default_where_prepaid_tickets_are_offered() {
+        let c = Config::from_json(&base()).unwrap();
+        assert_eq!((c.caps.held_after_paid, c.caps.first_lock_secs, c.caps.unpaid_per_address), (true, 20, 2));
+        let with = |tickets: Value, caps: Value| {
+            let mut v = base();
+            v["tickets"] = tickets;
+            v["caps"] = caps;
+            Config::from_json(&v)
+        };
+        // only held tickets: a first ticket cannot be prepaid, so the rule is off, and cannot be asked for
+        assert!(!with(json!({"settle": ["on-use"]}), json!({})).unwrap().caps.held_after_paid);
+        let e = with(json!({"settle": ["on-use"]}), json!({"held_after_paid": true})).unwrap_err().to_string();
+        assert!(e.contains("held_after_paid") && e.contains("on-arrival"), "{e}");
+        assert!(!with(json!({}), json!({"held_after_paid": false})).unwrap().caps.held_after_paid);
+        assert!(with(json!({}), json!({"held_after_paid": "yes"})).is_err());
+        for bad in [4, 61] {
+            assert!(with(json!({}), json!({"first_lock_secs": bad})).unwrap_err().to_string().contains("first_lock_secs"), "{bad}");
+        }
+        assert_eq!(with(json!({}), json!({"first_lock_secs": 15, "unpaid_per_address": 0})).unwrap().caps.unpaid_per_address, 0);
     }
 
     #[test]
@@ -1188,7 +1239,7 @@ mod tests {
             ),
             (
                 "network",
-                Box::new(|v| v["network"] = json!("bip122:00000000000000000000000000000001")),
+                Box::new(|v| v["network"] = json!("liquid:00000000000000000000000000000001")),
             ),
             (
                 "network is fixed",

@@ -852,7 +852,7 @@ impl Gateway {
         }
         let accepted = v.get("accepted").ok_or_else(|| bad("no accepted entry"))?;
         if accepted.get("scheme").and_then(Value::as_str) != Some(ticket::SCHEME)
-            || accepted.get("network").and_then(Value::as_str) != Some(self.cfg.network.as_str())
+            || !xbt402::ticket::on_network(accepted, &self.cfg.network)
         {
             return Err(bad("accepted is not this seller's ticket entry"));
         }
@@ -1102,6 +1102,12 @@ impl Gateway {
             }
             (Err(why), None) => return json_response(402, &json!({"error": why.code()})),
         };
+        // a first lock is nobody's yet: its invoices lapse sooner, so that unpaid ones give their places back
+        let expiry = if g.key.is_some() {
+            u32::try_from(self.cfg.caps.first_lock_secs).unwrap_or(INVOICE_EXPIRY_S).min(INVOICE_EXPIRY_S)
+        } else {
+            INVOICE_EXPIRY_S
+        };
         let (mut tickets, mut refused, mut down) = (vec![], vec![], false);
         for h in &g.issue {
             let made = match (down, preimages.get(h)) {
@@ -1110,7 +1116,7 @@ impl Gateway {
                     preimage,
                     self.cfg.caps.ticket_msat,
                     self.cfg.ticket_blocks,
-                    INVOICE_EXPIRY_S,
+                    expiry,
                 ),
                 (false, None) => self
                     .node
@@ -1118,7 +1124,7 @@ impl Gateway {
                         h,
                         self.cfg.caps.ticket_msat,
                         self.cfg.ticket_blocks,
-                        INVOICE_EXPIRY_S,
+                        expiry,
                     )
                     .and_then(|inv| {
                         self.watch(*h)
@@ -1797,12 +1803,12 @@ mod tests {
         // a compile error here until it is listed
         let tickets = [Refusal::SessionUnknown, Refusal::BadAuth, Refusal::BadSeq(0), Refusal::TicketUnknown, Refusal::TicketNotLocked, Refusal::TicketUsed,
                        Refusal::TicketExpiring, Refusal::BalanceShort, Refusal::TooManyTickets, Refusal::TooManySessions, Refusal::SlotsShort(1),
-                       Refusal::HeightUnknown, Refusal::PledgeOutstanding];
+                       Refusal::HeightUnknown, Refusal::PledgeOutstanding, Refusal::PrepaidFirst];
         for r in tickets {
             match r {
                 Refusal::SessionUnknown | Refusal::BadAuth | Refusal::BadSeq(_) | Refusal::TicketUnknown | Refusal::TicketNotLocked | Refusal::TicketUsed
                 | Refusal::TicketExpiring | Refusal::BalanceShort | Refusal::TooManyTickets | Refusal::TooManySessions | Refusal::SlotsShort(_)
-                | Refusal::HeightUnknown | Refusal::PledgeOutstanding => codes.push(r.code().into()),
+                | Refusal::HeightUnknown | Refusal::PledgeOutstanding | Refusal::PrepaidFirst => codes.push(r.code().into()),
             }
         }
         // every refusal of the lottery's book, and every refusal of a value the seller's draw can give

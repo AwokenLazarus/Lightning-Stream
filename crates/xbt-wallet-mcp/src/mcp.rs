@@ -180,8 +180,9 @@ impl Server {
 
     /// `tools/call`'s result for one tool.
     pub fn call_tool(&self, name: &str, args: &Map<String, Value>) -> Value {
-        if !TOOL_NAMES.contains(&name) && !(self.wallet.ln_tools && LN_TOOL_NAMES.contains(&name))
-            && !(self.wallet.ticket_tools && TICKET_TOOL_NAMES.contains(&name)) {
+        let known = TOOL_NAMES.contains(&name) || self.wallet.ln_tools && LN_TOOL_NAMES.contains(&name)
+            || self.wallet.ticket_tools && TICKET_TOOL_NAMES.contains(&name);
+        if !known {
             return tool_error(format!("Unknown tool: {name}"));
         }
         let params = match args::validate_for(name, args, self.wallet.ticket_tools) {

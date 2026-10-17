@@ -348,6 +348,44 @@ pub fn root_with(dir: &Path, policy: &Value) -> PathBuf {
 /// Serializes the tests that set process environment variables.
 pub static ENV: Mutex<()> = Mutex::new(());
 
+/// The test that holds [`ENV`] (through [`env_lock`]), and since when.
+static ENV_HELD: Mutex<Option<(String, std::time::Instant)>> = Mutex::new(None);
+
+/// [`ENV`] held, as a guard that also says which test holds it. A watchdog ends the process
+/// with that test's name when one has held it for longer than `XBT_TEST_HANG_SECS` (600 by
+/// default): since every test of a binary waits for this lock, one that never returns would
+/// otherwise keep the whole binary running, silently, until a CI job's own limit.
+pub fn env_lock() -> EnvGuard {
+    static WATCH: std::sync::Once = std::sync::Once::new();
+    WATCH.call_once(|| {
+        let limit = std::env::var("XBT_TEST_HANG_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(600u64);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            if let Some((name, since)) = ENV_HELD.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+                if since.elapsed().as_secs() > limit {
+                    // straight to the process's stderr: a thread spawned by a test inherits that test's capture of eprintln!
+                    use std::io::Write;
+                    let _ = writeln!(std::io::stderr(), "test {name} has run for more than {limit} s: the process is ended so that the hang has a name");
+                    std::process::exit(101);
+                }
+            }
+        });
+    });
+    let g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let name = std::thread::current().name().unwrap_or("?").to_string();
+    *ENV_HELD.lock().unwrap_or_else(|p| p.into_inner()) = Some((name, std::time::Instant::now()));
+    EnvGuard(Some(g))
+}
+
+pub struct EnvGuard(Option<std::sync::MutexGuard<'static, ()>>);
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        *ENV_HELD.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        self.0.take();
+    }
+}
+
 pub fn env_for(dir: &Path) {
     std::env::set_var("B2_HOT_KEYFILE", dir.join("keys").join("hot.key"));
     std::env::remove_var("B2_HOT_PASSPHRASE");

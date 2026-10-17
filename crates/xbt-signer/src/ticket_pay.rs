@@ -19,7 +19,7 @@
 //! | A ticket is released for an answer only when the balance does not cover its next piece. | [`Stream::due_bytes`] and [`Stream::due_time`], on the bytes and seconds this module counted itself. |
 //! | No ticket is released into a session whose last answer the seller has not closed. | [`Signer::ticket_release_one`] waits for the answer's last receipt in the seller's signed `status` (5 s a call, the session given up after 30 s). A seller waiting for a refill of an answer the wallet stopped reading would take the next ticket for bytes nobody reads. |
 //! | A call uses at most `max_sats`, by the wallet's own count, and ends within the owner's `max_answer_s`. | [`Signer::ticket_request`] refuses a head price above it; [`Stream::over`] cuts the body where its price reaches it or its time is up. |
-//! | Held tickets first; a prepaid one only where none can be held. | [`Signer::ticket_release_one`] buys a prepaid ticket only when the session has no held ticket to release and the book says it pays that way now ([`crate::ticket::Session::prepaid_now`]: a pool of none, or a wait after a lock that found no slot). The purchase itself is the book's ([`Signer::ticket_prepay`]), one at a time. |
+//! | Held tickets first; a prepaid one only where none can be held, or before any is. | [`Signer::ticket_release_one`] buys a prepaid ticket only when the session has no held ticket to release and the book says it pays that way now ([`crate::ticket::Session::prepaid_now`]: a pool of none, a wait after a lock that found no slot, or a session whose first ticket is a prepaid one: a seller the owner has not named, or one that answered `prepaid_first`). The purchase itself is the book's ([`Signer::ticket_prepay`]), one at a time. |
 //! | A seller that says `slots_short` is waited for. | [`Signer::ticket_lock_call`] sets the session's wait from the seller's `retryAfter` and offers it no hash until then. |
 //! | A session that can release nothing more is ended, and said so. | [`Signer::ticket_forgotten`]: the seller's unsigned `session_unknown` to a lock or a `status` stops the session, as an unsigned answer to a paid request does. [`Signer::ticket_release_one`]: a ticket the seller has not shown after `ready_wait_ms` that the wallet's own node carries on no channel ([`Signer::ticket_stranded`]) stops it too. Neither releases or books anything. |
 //! | An invoice that will not be paid gives its place with the seller back. | [`Signer::ticket_fill_once`] asks the seller to cancel the invoices a lock round refused or failed, and [`Signer::ticket_cancel_dead`] those of tickets that failed after their round, each once. The answer is not read. |
@@ -63,8 +63,8 @@ const TAIL_GIVE_UP: Duration = Duration::from_secs(30);
 /// How long a stop waits for the wallet's own node to show the cancelled tickets failed.
 pub const CANCEL_WAIT: Duration = Duration::from_secs(5);
 /// Refusals of `ticket_open` that mean "not this rail": the next entry of the 402 is tried.
-const NEXT_RAIL: [&str; 12] = ["ticket_disabled", "ln_disabled", "ticket_task", "ticket_admission", "ticket_terms", "ticket_feature_512", "ticket_network",
-                               "ticket_size", "ticket_blocks", "ticket_dust", "ticket_slots", ROUTE_FULL];
+const NEXT_RAIL: [&str; 14] = ["ticket_disabled", "ticket_mainnet", "ln_disabled", "ticket_task", "ticket_admission", "ticket_terms", "ticket_feature_512", "ticket_network",
+                               "ticket_size", "ticket_blocks", "ticket_dust", "ticket_slots", ROUTE_FULL, "ticket_prepaid_first"];
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
@@ -393,6 +393,67 @@ pub fn body_cap() -> usize {
     std::env::var("B2_BODY_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(12_000)
 }
 
+/// Whether `ip` is an address of the public internet: not unspecified, loopback, private, shared
+/// (carrier NAT), link-local, documentation, benchmarking, multicast, broadcast or reserved. An
+/// IPv4 address written inside IPv6 (mapped, or the NAT64 prefix) is judged as that IPv4 address.
+pub fn public_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip.to_canonical() {
+        IpAddr::V4(a) => {
+            let [x, y, z, _] = a.octets();
+            !(x == 0 || x == 10 || x == 127 || x >= 224
+              || (x == 100 && (64..128).contains(&y)) || (x == 169 && y == 254) || (x == 172 && (16..32).contains(&y)) || (x == 192 && y == 168)
+              || (x == 192 && y == 0 && (z == 0 || z == 2)) || (x == 198 && (y == 18 || y == 19)) || (x == 198 && y == 51 && z == 100)
+              || (x == 203 && y == 0 && z == 113))
+        }
+        IpAddr::V6(a) => {
+            let s = a.segments();
+            if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                return public_ip(IpAddr::V4(std::net::Ipv4Addr::new((s[6] >> 8) as u8, s[6] as u8, (s[7] >> 8) as u8, s[7] as u8)));
+            }
+            // only the global unicast block, less documentation and the discard and transition ranges inside it
+            (s[0] & 0xe000) == 0x2000 && !(s[0] == 0x2001 && s[1] == 0x0db8) && !(s[0] == 0x2001 && s[1] < 0x0200) && s[0] != 0x2002
+        }
+    }
+}
+
+/// Whether a request may leave for `origin`, a seller the owner has not named, before anything
+/// is sent to it: the origin is https, and every address its host has is public
+/// ([`public_ip`]). A task that admits any seller is what an agent has when it is told to go and
+/// find sellers, so a URL it was handed must not make the wallet a client of the machine's own
+/// services or of its private network. `Err`: why not.
+///
+/// The name is looked up here and again by the HTTP client when it connects: a name whose
+/// answer changes between the two (DNS rebinding) is not caught by this check.
+pub fn stranger_reachable(origin: &str) -> std::result::Result<(), String> {
+    use std::net::ToSocketAddrs;
+    let Some(netloc) = origin.strip_prefix("https://") else {
+        return Err("a seller the owner has not named is reached over https only".into());
+    };
+    let (host, port) = match netloc.strip_prefix('[') {
+        Some(rest) => match rest.split_once(']') {
+            Some((h, "")) => (h, 443),
+            Some((h, p)) => (h, p.strip_prefix(':').and_then(|p| p.parse::<u16>().ok()).ok_or("the URL's port is not a number")?),
+            None => return Err("the URL's host is not an address".into()),
+        },
+        None => match netloc.rsplit_once(':') {
+            Some((h, p)) => (h, p.parse::<u16>().map_err(|_| "the URL's port is not a number")?),
+            None => (netloc, 443),
+        },
+    };
+    if host.is_empty() || host.contains('@') {
+        return Err("the URL names no host".into());
+    }
+    let addrs: Vec<std::net::SocketAddr> = (host, port).to_socket_addrs().map_err(|e| format!("its host could not be looked up ({:?})", e.kind()))?.collect();
+    if addrs.is_empty() {
+        return Err("its host has no address".into());
+    }
+    if let Some(a) = addrs.iter().find(|a| !public_ip(a.ip())) {
+        return Err(format!("its host has the address {}, which is not an address of the public internet (private, loopback, link-local or reserved)", a.ip()));
+    }
+    Ok(())
+}
+
 /// `scheme://netloc` of an absolute URL. A URL with a `#` is refused (AGP-081, review T2: the
 /// request binding does not cover a fragment).
 pub fn origin_of(url: &str) -> Result<String> {
@@ -409,7 +470,8 @@ pub fn origin_of(url: &str) -> Result<String> {
 
 impl Signer {
     fn ticket_net(&self) -> Result<String> {
-        Ok(crate::node::network(&*self.node, &self.chain, None)?.replacen("bip122:", "lightning:", 1))
+        // the chain's id: an entry for Lightning on it says so in `extra.layer` ([`xbt402::ticket::on_network`])
+        crate::node::network(&*self.node, &self.chain, None)
     }
 
     fn ticket_read_timeout(tp: &TicketPolicy) -> Duration {
@@ -485,6 +547,13 @@ impl Signer {
         if !self.ticket_may_reach(&origin, task.as_deref().unwrap_or("")) {
             return deny("allowlist", format!("destination not on allowlist: {origin} (and the call names no task that pays any seller)"));
         }
+        // a seller the owner has not named, reached through a task that admits any: https and a public address,
+        // before the first byte leaves (the owner may widen this for a lab: tickets.unlisted_private)
+        if !listed && !tp.unlisted_private {
+            if let Err(why) = stranger_reachable(&origin) {
+                return deny("dest_private", format!("{origin} is not on the allowlist, and {why}: nothing was sent to it"));
+            }
+        }
         let (lightning, chain) = match (self.ticket_net(), self.network()) {
             (Ok(l), Ok(c)) => (l, c),
             (Err(e), _) | (_, Err(e)) => return deny("xbt402", e.msg),
@@ -524,7 +593,7 @@ impl Signer {
         for offer in ways {
             let rail = offer.rail();
             let tried = match &offer {
-                Offer::Ticket(..) | Offer::Lottery(_) if !tp.enabled => Tried::Next("stream tickets are off in this policy (tickets.enabled)".into()),
+                Offer::Ticket(..) | Offer::Lottery(_) if !tp.enabled => Tried::Next(tp.mainnet_off.clone().unwrap_or_else(|| "stream tickets are off in this policy (tickets.enabled)".into())),
                 Offer::Lottery(acc) => self.lottery_pay(&call, acc, &lightning),
                 Offer::Ticket(acc, prepaid) => self.ticket_pay(&call, acc, prepaid.as_ref(), &lightning),
                 Offer::Lightning(_) if !listed => Tried::Next("the seller is not on the owner's allowlist: only a ticket task that pays any seller reaches it".into()),
@@ -548,7 +617,7 @@ impl Signer {
                              else if scheme == Some("exact") { "exact" }
                              else if matches!(scheme, Some(CHANNEL_SCHEME | "xbt-channel")) { CHANNEL_SCHEME } else { "other" };
                 let network = match a.get("network").and_then(Value::as_str) {
-                    Some(n) if n == lightning => "this wallet's Lightning network",
+                    _ if xbt402::ticket::on_network(a, &lightning) => "this wallet's Lightning network",
                     Some(n) if n == chain => "this wallet's chain",
                     _ => "other",
                 };
@@ -559,7 +628,7 @@ impl Signer {
         }
         with(deny("no_rail", "the seller's 402 offers no way to pay that this wallet's policy allows: see rails_passed_over for what each entry needs"),
              json!({"charged_sats": 0, "rails_passed_over": passed, "offered": offered,
-                    "wallet": {"lightning": lightning, "chain": chain, "tickets": tp.enabled, "ln": LnPolicy::from_map(&cfg.ln).enabled}}))
+                    "wallet": {"lightning": lightning, "chain": chain, "tickets": tp.enabled, "tickets_off": tp.mainnet_off, "ln": LnPolicy::from_map(&cfg.ln).enabled}}))
     }
 
     /// Whether this seller is paid by draws before tickets are tried: what [`crate::lottery::choose`]
@@ -571,20 +640,26 @@ impl Signer {
             _ => None,
         });
         let ticket = ways.iter().find_map(|o| match o {
-            Offer::Ticket(acc, _) => Terms::parse(acc, lightning).ok(),
+            Offer::Ticket(acc, prepaid) => Terms::parse(acc, lightning).ok().map(|t| (t, prepaid.is_some())),
             _ => None,
         });
+        let prepaid_entry = ticket.as_ref().is_some_and(|(t, beside)| *beside || t.settle == crate::ticket::Settle::OnArrival);
+        let ticket = ticket.map(|(t, _)| t);
         let Some(draw) = draw else { return false };
         let task = c.task.as_deref().unwrap_or("");
         let payee = draw.payee.clone();
+        let expect_msat = (c.max_sats.max(0) as u64).saturating_mul(1000);
+        // the win a session would be opened with, as the book sizes it
+        let listed = self.ticket_listed(&self.config(), &draw.payee, c.origin);
+        let win_msat = crate::lottery::win_size(&draw, &tp.lottery, listed, expect_msat, self.ln_direct_to(&draw.payee)).unwrap_or(0);
         crate::lottery::choose(&crate::lottery::Choice {
             ticket_entry: ticket.is_some(), lottery_entry: true, lottery_on: tp.lottery.enabled,
             meter: tp.tasks.get(task).map_or(crate::lottery::Meter::Auto, |t| t.meter),
             // a session this process pays this origin by draws is the one that is open; else what the book holds open with the seller's node
             open: if lock(&self.draw_http).contains_key(c.origin) { Some(true) } else { self.ticket_open_kind(&payee, c.origin) },
             dearest_msat: draw.dearest_piece().unwrap_or(u64::MAX), ticket_msat: ticket.as_ref().map_or(u64::MAX, |t| t.ticket_msat),
-            expect_msat: (c.max_sats.max(0) as u64).saturating_mul(1000), held_fits: ticket.is_some() && self.ticket_held_fits(task),
-            stay_tickets: tp.lottery.stay_tickets.max(1) as u64 })
+            expect_msat, held_fits: ticket.is_some() && self.ticket_held_fits(task),
+            stay_tickets: tp.lottery.stay_tickets.max(1) as u64, prepaid_entry, win_msat, min_wins: tp.lottery.min_expected_wins.max(0) as u64 })
     }
 
     /// A single Lightning payment the seller's 402 asks for: `extra.invoice`, paid as `ln_pay` pays
@@ -917,6 +992,17 @@ impl Signer {
             }
             if let Some(gone) = self.ticket_forgotten(hs, status, v) {
                 return with(refusal("ticket_session_ended", gone), json!({"session": hs.sid}));
+            }
+            // the seller issues held tickets only to a session that has paid it something: the session's next
+            // ticket is a prepaid one, and it holds after that (the seller's word moves no money: it only orders
+            // the wallet's own steps, each under the owner's rules)
+            if status == 402 && code == "prepaid_first" {
+                return match self.ticket_paid_first(&hs.sid) {
+                    Ok(true) => with(refusal("ticket_prepaid_first", "the seller issues held tickets after one prepaid ticket has been paid: the session buys \
+                                                                       one first"), json!({"session": hs.sid})),
+                    Ok(false) => refusal("ticket_seller", "the seller issues held tickets only after a prepaid one, and its terms offer none"),
+                    Err(e) => refusal("ticket", e.msg),
+                };
             }
             refusal("ticket_seller", format!("the seller refused the lock: HTTP {status} {code}"))
         };
@@ -1769,7 +1855,9 @@ impl Signer {
         let allowed = !origin.is_empty() && (normalize_dest(&s.origin) == origin) && seller_url(&origin, &http.base).is_ok() && self.ticket_may_reach(&origin, &s.task);
         let mut sent = false;
         if allowed {
-            let net = self.ticket_net().unwrap_or_default();
+            // the session's entry is not kept across a start: one is written for the cancel. Under the network's name of
+            // before 2026-10, for the release in which a gateway reads both names: a gateway of before reads only that one
+            let net = self.ticket_net().ok().and_then(|n| xbt402::ticket::legacy_network_id(&n)).unwrap_or_default();
             let accepted = json!({"scheme": xbt402::ticket::SCHEME, "network": net});
             let url = format!("{}/cancel", http.base);
             let raw = json!({"hashes": "all"}).to_string().into_bytes();
@@ -1904,6 +1992,24 @@ mod tests {
         }
         for no in ["http://seller.example", "http://10.0.0.5:8402", "http://127.0.0.1.example", "http://[::2]", "ftp://127.0.0.1", "http://localhost.example", ""] {
             assert!(!private_channel(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn a_seller_nobody_named_is_reached_over_https_at_a_public_address_only() {
+        for ip in ["1.1.1.1", "8.8.8.8", "100.128.0.1", "172.32.0.1", "2606:4700::1111", "::ffff:8.8.8.8", "64:ff9b::808:808"] {
+            assert!(public_ip(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in ["0.0.0.0", "10.1.2.3", "100.64.0.1", "127.0.0.1", "169.254.169.254", "172.16.0.1", "172.31.255.255", "192.168.1.1", "192.0.2.1",
+                   "198.18.0.1", "198.51.100.7", "203.0.113.9", "224.0.0.1", "255.255.255.255", "::", "::1", "fc00::1", "fd12::1", "fe80::1", "ff02::1",
+                   "2001:db8::1", "2002::1", "::ffff:127.0.0.1", "::ffff:10.0.0.1", "64:ff9b::a00:1"] {
+            assert!(!public_ip(ip.parse().unwrap()), "{ip}");
+        }
+        assert_eq!(stranger_reachable("https://1.1.1.1"), Ok(()));
+        assert_eq!(stranger_reachable("https://[2606:4700::1111]:8443"), Ok(()));
+        for no in ["http://1.1.1.1", "https://127.0.0.1:8402", "https://[::1]", "https://10.0.0.5", "https://169.254.169.254", "https://localhost:443",
+                   "https://user@1.1.1.1", "https://1.1.1.1:x", "https://[::1", "https://"] {
+            assert!(stranger_reachable(no).is_err(), "{no}");
         }
     }
 

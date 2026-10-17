@@ -15,7 +15,13 @@
 //!   refuses is refused before anything is asked of the node.
 //! - **Half the slots.** Held tickets, all sessions together, are at most [`Caps::max_held`]: half
 //!   of the pending payments one inbound channel carries unless the runner said more. A lock beyond
-//!   it is refused as `slots_short` with a time to wait, and makes no session.
+//!   it is refused as `slots_short` with a time to wait, and makes no session. An invoice counts
+//!   from when it is issued, so the node never holds more than the cap; unpaid invoices are also
+//!   bounded per client address ([`Caps::unpaid_per_address`]).
+//! - **Paid first.** With [`Caps::held_after_paid`] a hold invoice is issued only to a session
+//!   that has paid something (a prepaid ticket, settled on arrival): a lock for held tickets that
+//!   would make a session, or is of a session that has paid nothing, is `prepaid_first`. A hold
+//!   invoice then costs whoever asks for it one ticket, not an HTTP request.
 //! - **Prepaid is paid, then credited once.** A ticket settled on arrival holds no slot and is not
 //!   counted as held; it is credited when the node shows its invoice settled, and only then.
 //!
@@ -50,6 +56,14 @@ pub struct Caps {
     pub margin_blocks: u32,
     /// An unpaid ticket is given up this many seconds after it was issued.
     pub unpaid_secs: u64,
+    /// The invoices of a first lock (one that makes a session, and that nobody authenticated)
+    /// stay payable this many seconds, and are given up this much sooner than `unpaid_secs`.
+    pub first_lock_secs: u64,
+    /// Unpaid invoices, of either kind, issued to the sessions of one client address and not yet
+    /// paid; 0 is no cap per address.
+    pub unpaid_per_address: u32,
+    /// Hold invoices only to a session that has paid something.
+    pub held_after_paid: bool,
     /// A session that has never released a secret is closed after this many seconds.
     pub first_use_secs: u64,
     /// A session's tickets are cancelled after this many seconds without a paid request.
@@ -78,6 +92,8 @@ pub enum Refusal {
     HeightUnknown,
     /// A ticket is already pledged, or the session owes for a piece it was served.
     PledgeOutstanding,
+    /// Held tickets are issued only to a session that has paid something: buy a prepaid one first.
+    PrepaidFirst,
 }
 
 impl Refusal {
@@ -96,6 +112,7 @@ impl Refusal {
             Self::SlotsShort(_) => "slots_short",
             Self::HeightUnknown => "node_unavailable",
             Self::PledgeOutstanding => "pledge_outstanding",
+            Self::PrepaidFirst => "prepaid_first",
         }
     }
 }
@@ -120,6 +137,9 @@ pub struct Ticket {
     /// Settled on arrival: an ordinary invoice, which holds no slot. It stays `Open` until the
     /// node shows it settled, and is then credited and gone.
     pub prepaid: bool,
+    /// Issued by a first lock: its invoice lives [`Caps::first_lock_secs`]. Not in the journal: a
+    /// ticket read back after a restart is given up after `unpaid_secs`, which is later.
+    pub first: bool,
 }
 
 /// How many used hashes a session remembers, to answer `ticket_used` instead of `ticket_unknown`.
@@ -334,9 +354,15 @@ impl Book {
     }
 
     /// Held tickets in all, unpaid ones included: what the cap on held tickets counts. A ticket
-    /// settled on arrival is not one.
+    /// settled on arrival is not one. An unpaid invoice counts, so that the node never holds more
+    /// than the cap: issued to a session that has paid (`held_after_paid`), it is not free.
     pub fn held(&self) -> usize {
         self.tickets.values().filter(|t| !t.prepaid).count()
+    }
+
+    /// Unpaid invoices, of either kind, of the sessions of one client address.
+    pub fn unpaid_from(&self, addr: &str) -> usize {
+        self.tickets.values().filter(|t| t.state == TicketState::Open && self.sessions.get(&t.session).is_some_and(|s| s.addr == addr)).count()
     }
 
     /// Tickets settled on arrival that are issued and not yet credited.
@@ -405,13 +431,20 @@ impl Book {
         } else {
             (self.caps.max_held as usize).saturating_sub(self.held())
         };
+        let room_addr = match self.caps.unpaid_per_address {
+            0 => usize::MAX,
+            n => (n as usize).saturating_sub(self.unpaid_from(addr)),
+        };
+        if room_addr == 0 {
+            return Err(Refusal::TooManyTickets);
+        }
         // the session's own cap first: a buyer at it gains nothing by waiting for another's slots
         if room_session > 0 && room_total == 0 {
             return Err(Refusal::SlotsShort(self.caps.slots_retry_secs));
         }
         let mut issue: Vec<Hash> = vec![];
         for h in hashes {
-            if issue.len() >= room_session.min(room_total) {
+            if issue.len() >= room_session.min(room_total).min(room_addr) {
                 break;
             }
             if self.tickets.contains_key(h) || issue.contains(h) {
@@ -454,6 +487,7 @@ impl Book {
                     expiry_height: None,
                     issued_at: now,
                     prepaid,
+                    first: key.is_some(),
                 },
             );
             recs.push(Rec::Ticket {
@@ -496,6 +530,9 @@ impl Book {
         let live = match session {
             Some(id) => {
                 let s = self.sessions.get(id).ok_or(Refusal::SessionUnknown)?;
+                if !prepaid && self.caps.held_after_paid && s.released_msat == 0 {
+                    return Err(Refusal::PrepaidFirst);
+                }
                 if !active(s) && places_taken() {
                     return Err(Refusal::TooManySessions);
                 }
@@ -505,6 +542,9 @@ impl Book {
                     .count()
             }
             None => {
+                if !prepaid && self.caps.held_after_paid {
+                    return Err(Refusal::PrepaidFirst);
+                }
                 if places_taken() || self.sessions.len() >= self.caps.max_kept_sessions as usize {
                     return Err(Refusal::TooManySessions);
                 }
@@ -840,12 +880,13 @@ impl Book {
             };
             s.open_responses == 0 && now.saturating_sub(s.last_paid) > limit
         };
+        let first_life = caps.unpaid_secs.saturating_sub(u64::from(xbt402::ticket::INVOICE_EXPIRY_S)).saturating_add(caps.first_lock_secs);
         for (h, t) in &self.tickets {
             if t.state == TicketState::Settling {
                 continue;
             }
-            let unpaid =
-                t.state == TicketState::Open && now.saturating_sub(t.issued_at) > caps.unpaid_secs;
+            let life = if t.first { first_life.min(caps.unpaid_secs) } else { caps.unpaid_secs };
+            let unpaid = t.state == TicketState::Open && now.saturating_sub(t.issued_at) > life;
             let expiring = t.state == TicketState::Accepted
                 && height.is_some()
                 && Self::outside_margin(&caps, t, height).is_err();
@@ -975,6 +1016,7 @@ impl Book {
                                 expiry_height: None,
                                 issued_at: now,
                                 prepaid: *prepaid,
+                                first: false,
                             },
                         )
                         .is_none()
@@ -1047,6 +1089,9 @@ mod tests {
             slots_retry_secs: 30,
             margin_blocks: 24,
             unpaid_secs: 75,
+            first_lock_secs: 20,
+            unpaid_per_address: 0,
+            held_after_paid: false,
             first_use_secs: 60,
             idle_secs: 300,
             keep_secs: 86_400,
@@ -1802,6 +1847,66 @@ mod tests {
             b.lock("a", Some(&sessions[0]), &two(), false, &ent(0), 0),
             Err(Refusal::SlotsShort(30))
         );
+    }
+
+    /// A hold invoice costs whoever asks for it a paid ticket: with `held_after_paid` a lock for held
+    /// tickets that would make a session, or is of a session that has paid nothing, is refused
+    /// before anything is asked of the node; a prepaid first lock makes the session, and once its
+    /// ticket is credited the session may hold.
+    ///
+    /// FAILS before: the first lock carried no authentication and was issued hold invoices, so
+    /// anyone who could reach the gateway took its held places for free.
+    #[test]
+    fn held_tickets_go_only_to_a_session_that_has_paid_something() {
+        let mut b = Book::new(Caps { max_tickets: 2, held_after_paid: true, ..caps() });
+        assert_eq!(b.lock("a", None, &[hash(1)], false, &ent(1), 0), Err(Refusal::PrepaidFirst));
+        assert_eq!(b.lock_room("a", None, false), Err(Refusal::PrepaidFirst));
+        assert_eq!((b.sessions(), Refusal::PrepaidFirst.code()), (0, "prepaid_first"));
+        // the first lock buys a prepaid ticket, and makes the session
+        let g = b.lock("a", None, &[hash(2)], true, &ent(2), 0).unwrap();
+        assert_eq!(b.lock("a", Some(&g.session), &[hash(3)], false, &ent(0), 0), Err(Refusal::PrepaidFirst), "paid nothing yet");
+        // the node shows it settled: credited, and now the session may hold
+        b.node_update(&hash(2), &node_says(InvoiceState::Settled, 1_000_000));
+        assert_eq!(b.session(&g.session).unwrap().released_msat, 1_000_000);
+        assert_eq!(b.lock("a", Some(&g.session), &[hash(3), hash(4)], false, &ent(0), 0).unwrap().issue.len(), 2);
+        // off, every lock is as before
+        let mut off = Book::new(Caps { max_tickets: 2, ..caps() });
+        assert_eq!(off.lock("a", None, &[hash(1)], false, &ent(1), 0).unwrap().issue.len(), 1);
+    }
+
+    /// One client address has at most `unpaid_per_address` unpaid invoices, of either kind, in all
+    /// its sessions; a paid one no longer counts.
+    ///
+    /// FAILS before: nothing bounded unpaid invoices per address but the sessions an address may
+    /// have, each with its own pool.
+    #[test]
+    fn unpaid_invoices_are_bounded_per_address() {
+        let mut b = Book::new(Caps { max_tickets: 2, max_sessions: 30, sessions_per_address: 0, max_kept_sessions: 100, unpaid_per_address: 2, ..caps() });
+        b.lock("a", None, &[hash(1), hash(2)], false, &ent(1), 0).unwrap();
+        // the address has its 2 unpaid: a third is refused, in another session of it too, and makes no session
+        assert_eq!(b.lock("a", None, &[hash(3)], true, &ent(2), 0), Err(Refusal::TooManyTickets));
+        assert_eq!((b.unpaid_from("a"), b.sessions()), (2, 1));
+        // another address is not held to it
+        assert_eq!(b.lock("b", None, &[hash(4)], false, &ent(3), 0).unwrap().issue.len(), 1);
+        // paid: they no longer count against the address
+        b.node_update(&hash(1), &held(500));
+        b.node_update(&hash(2), &held(500));
+        assert_eq!(b.unpaid_from("a"), 0);
+        assert_eq!(b.lock("a", None, &[hash(5), hash(6)], false, &ent(4), 0).unwrap().issue.len(), 2);
+        // a lock asks for as many as are left to the address
+        assert_eq!(b.lock("a", None, &[hash(7)], false, &ent(5), 0), Err(Refusal::TooManyTickets));
+    }
+
+    /// The invoices of a first lock lapse sooner than those of an authenticated one.
+    #[test]
+    fn a_first_locks_invoices_are_given_up_sooner() {
+        let mut b = Book::new(Caps { max_tickets: 2, first_lock_secs: 20, ..caps() });
+        let g = b.lock("a", None, &[hash(1)], true, &ent(1), 100).unwrap();
+        b.lock("a", Some(&g.session), &[hash(2)], true, &ent(0), 100).unwrap();
+        // 20 s of life and the same 15 s after it as any unpaid invoice: the first lock's at 36 s, the other's at 76
+        assert!(b.sweep(135, None).cancel.is_empty());
+        assert_eq!(b.sweep(136, None).cancel, vec![hash(1)]);
+        assert_eq!(b.sweep(176, None).cancel, vec![hash(1), hash(2)]);
     }
 
     #[test]

@@ -226,6 +226,16 @@ impl TicketStore {
     }
 }
 
+/// `v` with what the node wrote as a payment's `failure_reason`, if anything, under
+/// `untrusted_ln_data`: the wallet's own fields carry only [`ticket::failure_code`].
+fn node_failure(mut v: Value, pmt: Option<&Value>) -> Value {
+    let raw = pmt.map(|p| str_or_empty(p.get("failure_reason"))).unwrap_or_default();
+    if !raw.is_empty() {
+        v[crate::ln::UNTRUSTED_LN_KEY] = crate::ln::untrusted_ln(json!({"failure": raw.chars().take(200).collect::<String>()}));
+    }
+    v
+}
+
 fn refusal(rule: &str, reason: impl Into<String>) -> Value {
     with(deny(rule, reason), json!({"rail": "ticket", "charged_sats": 0}))
 }
@@ -276,7 +286,7 @@ impl Signer {
     }
 
     pub(crate) fn ticket_policy(&self) -> TicketPolicy {
-        TicketPolicy::from_map(&self.config().tickets)
+        TicketPolicy::for_chain(&self.config().tickets, &self.chain, self.chain == "main" && ticket::mainnet_ack_file())
     }
 
     /// The book, opened (and created) when first needed. An error keeps the ticket rail shut and
@@ -346,6 +356,9 @@ impl Signer {
     fn ticket_on(&self) -> std::result::Result<TicketPolicy, Value> {
         let tp = self.ticket_policy();
         if !tp.enabled {
+            if let Some(why) = &tp.mainnet_off {
+                return Err(refusal("ticket_mainnet", why.clone()));
+            }
             return Err(refusal("ticket_disabled", "stream tickets are off in this policy (tickets.enabled)"));
         }
         if !LnPolicy::from_map(&self.config().ln).enabled {
@@ -380,7 +393,7 @@ impl Signer {
     /// Whether the owner named this seller: its node id on the allowlist (`ln:<node id>`), or an
     /// allowlisted origin whose `counterparties` entry names the node (`ln_node`). The origin is
     /// the caller's word, so it counts only where the owner tied it to this node id.
-    fn ticket_listed(&self, cfg: &PolicyConfig, payee: &str, origin: &str) -> bool {
+    pub(crate) fn ticket_listed(&self, cfg: &PolicyConfig, payee: &str, origin: &str) -> bool {
         let allow = cfg.normalized_allowlist();
         if allow.contains(&format!("ln:{payee}")) {
             return true;
@@ -525,7 +538,7 @@ impl Signer {
             (Err(d), _) | (_, Err(d)) => return d,
         };
         let net = match node::network(&*self.node, &self.chain, None) {
-            Ok(n) => n.replacen("bip122:", "lightning:", 1),
+            Ok(n) => n,
             Err(e) => return refusal("ticket_network", e.msg),
         };
         let first = match Terms::parse(p.get("terms").unwrap_or(&Value::Null), &net) {
@@ -564,7 +577,8 @@ impl Signer {
         let now = self.engine.now();
         // what the wallet's own channels allow of held tickets, read now; channels that cannot be read are
         // taken to carry 30 pending payments, and every lock reads them again and refuses without a listing
-        let limits = if held.is_some() { self.ticket_limits_read().unwrap_or_else(Limits::unseen) } else { Limits::unseen() };
+        let cap = tp.feerate_cap(&self.chain);
+        let limits = if held.is_some() { self.ticket_limits_read(&terms.payee, cap).unwrap_or_else(|| Limits::unseen(cap)) } else { Limits::unseen(cap) };
         // the book as the node has it now: the pool is sized inside what is still locked with this seller, and a
         // ticket of an earlier session that the seller has cancelled meanwhile is not
         if held.is_some() {
@@ -641,13 +655,22 @@ impl Signer {
                 return Ok(refusal("velocity", format!("already {} payments in the last {}s (a ticket session is one payment: tickets.velocity)",
                                                       cfg.velocity_max, cfg.velocity_window_s)));
             }
+            // a seller the owner has not named is paid one prepaid ticket before any is held with it: a held
+            // ticket takes a slot of every channel on its route for no fee, and a stranger has to show that it
+            // serves first. One that offers no prepaid tickets is not held with at all
+            let paid_first = !listed && size.pool > 0;
+            if paid_first && prepaid_msat == 0 {
+                return Ok(refusal("ticket_prepaid_first", "the owner has not named this seller, and a ticket is held with such a seller only after one prepaid ticket \
+                                                           has been paid: its terms offer no prepaid tickets"));
+            }
             let s = Session { draws: None, id, payee: terms.payee.clone(), origin: origin.chars().take(200).collect(), task: task_name.clone(),
                               listed, ticket_msat: size.ticket_msat, pool: size.pool, max_tickets: terms.max_tickets, ticket_blocks: terms.ticket_blocks,
                               max_sats, state: SState::Open, opened_ts: now, active_ts: now, stopped_ts: 0.0, closed_ts: 0.0, why: String::new(), http: None,
-                              prepaid_msat, slot_fails, hold_until, hold_why };
+                              prepaid_msat, slot_fails, hold_until, hold_why, paid_first };
             st.commit(&[s.row()])?;
             self.ticket_audit("ticket_open", json!({"session": s.id, "dest": format!("ln:{}", s.payee), "task": s.task, "listed": listed,
                                                     "ticket_msat": s.ticket_msat.to_string(), "pool": s.pool, "prepaid_msat": s.prepaid_msat.to_string(),
+                                                    "paid_first": s.paid_first,
                                                     "hold_why": s.hold_why, "slots": limits.slots}));
             Ok(with(json!({"verdict": "allow", "rail": "ticket"}), s.public()))
         })();
@@ -850,8 +873,8 @@ impl Signer {
                 };
                 // an error the node's record did not replace: it goes with the ticket's row
                 let unsent = unsent.filter(|_| pmt.is_none());
-                if let Some(pmt) = pmt {
-                    self.ticket_apply(st, hash, &pmt)?;
+                if let Some(pmt) = &pmt {
+                    self.ticket_apply(st, hash, pmt)?;
                 }
                 if let Some(t) = st.book.tickets.get(hash) {
                     locked += usize::from(t.state == TState::Locked);
@@ -859,7 +882,7 @@ impl Signer {
                     slot_failed += usize::from(t.state == TState::Failed && ticket::slot_failure(&t.note));
                     tickets.push(match &unsent {
                         Some(e) => node_said(with(t.public(), json!({"send_error": e.msg})), e),
-                        None => t.public(),
+                        None => node_failure(t.public(), pmt.as_ref().filter(|_| t.state == TState::Failed)),
                     });
                 }
             }
@@ -930,7 +953,7 @@ impl Signer {
         let mut sent_last_hour = st.book.sends_since(now - 3600.0) as i64;
         let (mut n, mut rows, mut sends) = (0i64, vec![], vec![]);
         // the two limits of the channels these payments may leave on, as the node lists them in this round
-        let limits = ticket::channel_limits(chans, ids);
+        let limits = ticket::channel_limits(chans, ids, &s.payee, tp.feerate_cap(&self.chain));
         let on_node: HashSet<String> = htlc_locks(chans, &|_| true).list.iter().map(|h| str_or_empty(h.get("payment_hash"))).collect();
         let slot_room = limits.room(all.tickets, st.book.sending_unseen(&|h| on_node.contains(h)));
         let mut held = false;
@@ -1150,7 +1173,8 @@ impl Signer {
             }
             let back = t.booked_sats;
             let was_locked = t.state == TState::Locked && !t.prepaid;
-            t.note = str_or_empty(pmt.get("failure_reason")).chars().take(80).collect();
+            // the node's reason, as one of the names the wallet knows: the node's own text is never the wallet's note
+            t.note = ticket::failure_code(&str_or_empty(pmt.get("failure_reason"))).into();
             t.state = TState::Failed;
             t.booked_sats = 0;
             t.done_ts = now;
@@ -1190,7 +1214,14 @@ impl Signer {
         } else if !was.booked() {
             t.note = "settled without a release by this book".into();
         }
-        st.commit(&[t.row()])?;
+        // the prepaid ticket a session had to pay before it holds any: paid, with its preimage. In the same write,
+        // after the ticket's row: a crash that keeps only the first leaves a session that buys one more prepaid
+        // ticket, never one that holds before it paid
+        let first_paid = (proven && t.prepaid && t.win == 0).then(|| st.book.sessions.get(&t.session).filter(|s| s.paid_first).cloned()).flatten().map(|mut s| {
+            s.paid_first = false;
+            s.row()
+        });
+        st.commit(&std::iter::once(t.row()).chain(first_paid).collect::<Vec<_>>())?;
         if proven {
             // the preimage by its hash, as every settled Lightning payment is logged
             let _ = self.sigaudit.record("ticket_settled", &preimage, "", &dest, json!({"payment_hash": hash, "spent_sats": sats, "fee_msat": fee.to_string()}));
@@ -1353,12 +1384,12 @@ impl Signer {
 
     /// The limits of the channels a ticket may leave on, read from the node now. `None`: the node
     /// or its channel list could not be read, or no channel is usable.
-    fn ticket_limits_read(&self) -> Option<Limits> {
+    fn ticket_limits_read(&self, payee: &str, feerate_cap: u64) -> Option<Limits> {
         let ln = self.ln.clone()?;
         let lp = LnPolicy::from_map(&self.config().ln);
         let chans = ln.channels().ok()?;
         let (ids, _) = self.ln_channels(&chans, lp.split(&self.chain));
-        (!ids.is_empty()).then(|| ticket::channel_limits(&chans, &ids))
+        (!ids.is_empty()).then(|| ticket::channel_limits(&chans, &ids, payee, feerate_cap))
     }
 
     /// Buy one prepaid ticket of a session: check the seller's invoice, book it as spent, pay it,
@@ -1526,7 +1557,7 @@ impl Signer {
                 // the preimage is what the buyer shows the seller for its credit: it moves no money any more
                 with(json!({"verdict": "allow", "ticket_secret": hex::encode(&preimage), "charged_sats": t.booked_sats}), about)
             }
-            TState::Failed => with(refusal(failed, format!("the payment of {what} failed ({}): nothing was spent", t.note)), about),
+            TState::Failed => node_failure(with(refusal(failed, format!("the payment of {what} failed ({}): nothing was spent", t.note)), about), pmt.as_ref()),
             // not final within the wait: booked, and the node's word decides later
             _ => {
                 let v = with(with(refusal(pending, format!("the payment of {what} is not final yet: it is booked as spent until the wallet's node shows it failed")), about),
@@ -1658,6 +1689,26 @@ impl Signer {
     /// Lock nothing for a session for `secs` seconds (1 to 600), for the reason `why`: a seller that
     /// says it has no slot for a held ticket (`slots_short`) is waited for, not treated as failing.
     /// Returns the time the wait ends.
+    /// The seller asks that the session pay a prepaid ticket before it is issued a held one
+    /// (`prepaid_first`): the session's next ticket is a prepaid one. `Ok(false)`: the session has
+    /// no prepaid tickets to buy, and the seller can be paid no way this session knows.
+    pub(crate) fn ticket_paid_first(&self, sid: &str) -> Result<bool> {
+        let _g = self.lock();
+        let mut g = self.ticket_store()?;
+        let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
+        let mut s = st.book.sessions.get(sid).cloned().ok_or_else(|| err("ticket_session", "no such session"))?;
+        if s.prepaid_msat == 0 {
+            return Ok(false);
+        }
+        if s.paid_first {
+            return Ok(true);
+        }
+        s.paid_first = true;
+        st.commit(&[s.row()])?;
+        self.ticket_audit("ticket_paid_first", json!({"session": sid, "dest": format!("ln:{}", s.payee), "why": "the seller issues held tickets after a prepaid one"}));
+        Ok(true)
+    }
+
     pub(crate) fn ticket_hold(&self, sid: &str, secs: u64, why: &str) -> Result<f64> {
         let _g = self.lock();
         let now = self.engine.now();
@@ -1884,8 +1935,8 @@ impl Signer {
                     let on_node: HashSet<String> = htlc_locks(cs, &|_| true).list.iter().map(|h| str_or_empty(h.get("payment_hash"))).collect();
                     let mut missing: Vec<&str> = st.book.tickets.values().filter(|t| t.state.in_flight() && t.cltv_until > 0 && !on_node.contains(&t.hash))
                         .map(|t| t.hash.as_str()).collect();
-                    let mut extra: Vec<&str> = on_node.iter().filter(|h| !st.book.tickets.get(*h).is_some_and(|t| t.state.in_flight())
-                        && !ln_book.get(*h).and_then(|r| r.get("state")).and_then(Value::as_str).is_some_and(|x| x == "sending")).map(String::as_str).collect();
+                    let mut extra: Vec<&str> = on_node.iter().filter(|h| !(st.book.tickets.get(*h).is_some_and(|t| t.state.in_flight())
+                        || ln_book.get(*h).and_then(|r| r.get("state")).and_then(Value::as_str).is_some_and(|x| x == "sending"))).map(String::as_str).collect();
                     missing.sort_unstable();
                     extra.sort_unstable();
                     v["node"] = json!({"htlcs": on_node.len(), "agree": missing.is_empty() && extra.is_empty(), "in_book_not_on_node": missing,
@@ -1916,7 +1967,8 @@ impl Signer {
     pub(crate) fn ticket_held_fits(&self, task: &str) -> bool {
         let tp = self.ticket_policy();
         let Some(t) = tp.tasks.get(task) else { return false };
-        let limits = self.ticket_limits_read().unwrap_or_else(Limits::unseen);
+        let cap = tp.feerate_cap(&self.chain);
+        let limits = self.ticket_limits_read("", cap).unwrap_or_else(|| Limits::unseen(cap));
         let Ok(g) = self.ticket_store() else { return false };
         let Some(st) = g.as_ref() else { return limits.budget() >= 1 };
         let committed = st.book.pools_open();
@@ -1943,7 +1995,7 @@ impl Signer {
 
     /// Whether the wallet's node has an active channel of its own to `payee`: a win paid over it
     /// meets no routing node and pays no fee. False when the channels cannot be read.
-    fn ln_direct_to(&self, payee: &str) -> bool {
+    pub(crate) fn ln_direct_to(&self, payee: &str) -> bool {
         let Some(ln) = self.ln.clone() else { return false };
         ln.channels().is_ok_and(|cs| cs.iter().any(|c| c.get("active").and_then(Value::as_bool) == Some(true) && str_or_empty(c.get("remote_pubkey")).eq_ignore_ascii_case(payee)))
     }
@@ -1969,7 +2021,7 @@ impl Signer {
         };
         let expect_msat = py_int(p.get("expect_sats")).filter(|n| *n >= 0).map_or(0, |s| (s as u64).saturating_mul(1000));
         let net = match node::network(&*self.node, &self.chain, None) {
-            Ok(n) => n.replacen("bip122:", "lightning:", 1),
+            Ok(n) => n,
             Err(e) => return refusal("ticket_network", e.msg),
         };
         let terms = match crate::lottery::DrawTerms::parse(p.get("terms").unwrap_or(&Value::Null), &net) {
@@ -2033,7 +2085,7 @@ impl Signer {
             let s = Session { draws: Some(ticket::Draws::default()), id, payee: terms.payee.clone(), origin: origin.chars().take(200).collect(), task: task_name.clone(),
                               listed, ticket_msat: win_msat, pool: 0, max_tickets: 0, ticket_blocks: terms.win_blocks, max_sats: 0, state: SState::Open,
                               opened_ts: now, active_ts: now, stopped_ts: 0.0, closed_ts: 0.0, why: String::new(), http: None, prepaid_msat: win_msat, slot_fails: 0,
-                              hold_until: 0.0, hold_why: String::new() };
+                              hold_until: 0.0, hold_why: String::new(), paid_first: false };
             st.commit(&[s.row()])?;
             self.ticket_audit("lottery_open", json!({"session": s.id, "dest": dest, "task": s.task, "listed": listed, "win_msat": win_msat.to_string(), "direct": direct,
                                                      "expect_msat": expect_msat.to_string()}));

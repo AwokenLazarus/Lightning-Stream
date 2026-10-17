@@ -8,9 +8,9 @@
 # What this does not run: the regtest lab scripts under scripts/ (they need Docker and build a
 # Lightning Fork lab) and the cross builds. Their latest reports are in reports/.
 #
-# The toolchain is pinned to the version these four steps were last run on by hand. Cargo.toml
-# states 1.89 as the minimum, but Cargo.lock holds a dependency that needs 1.90, and clippy 1.91
-# reports two lints that clippy 1.98 does not; until those are settled the pin is 1.98.0.
+# The toolchain is pinned to the version these four steps were last run on by hand. The minimum
+# Cargo.toml states is 1.90 (a locked dependency, ruint 1.20.1, declares it); clippy is clean on
+# 1.91.1 and on 1.98.0.
 name: CI
 
 on:

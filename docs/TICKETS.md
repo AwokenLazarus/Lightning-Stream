@@ -49,9 +49,9 @@ as decimal strings; hashes, secrets and keys are lower-case hex.
 A seller that takes tickets adds one entry to `accepts` in its `402` (`PAYMENT-REQUIRED`, x402 v2):
 
 ```json
-{"scheme": "ticket", "network": "lightning:0000000000000050c1e5f69672f45929",
+{"scheme": "ticket", "network": "bip122:0000000000000050c1e5f69672f45929",
  "asset": "XBT:msat", "amount": "2500", "payTo": "<the seller's Lightning node id, 33 bytes>",
- "extra": {"version": "ticket/0", "features": [512],
+ "extra": {"version": "ticket/0", "layer": "lightning", "features": [512],
            "ticketMsat": "1000000", "maxTickets": 2, "ticketBlocks": 40,
            "release": "with-request", "settle": "on-use",
            "receiptKey": "<33-byte public key>", "session": "/x402/ticket",
@@ -60,7 +60,7 @@ A seller that takes tickets adds one entry to `accepts` in its `402` (`PAYMENT-R
 
 | Field | Meaning | Why |
 |---|---|---|
-| `network` | `lightning:` and the 32 hex characters of the chain's `bip122` id. Not the chain id itself. | A client picks an entry by scheme and network. The chain id names the chain itself (it was the network of the on-chain channel entry this project once had). XBT and the SHA-256 chain share a genesis block, so a Lightning id keyed on it would name both networks. |
+| `network`, `extra.layer` | The chain's CAIP-2 id, `bip122:` and its 32 hex characters, and `"layer": "lightning"`: payments of this entry are made over Lightning on that chain. | A client picks an entry by scheme and network. CAIP-2 is the standard name of a chain; the layer says the entry is not a payment on the chain itself. For XBT the 32 hex characters are of a block after the split (`xbt402::wire::XBT_MAINNET`), since XBT and the SHA-256 chain share a genesis block. Until 2026-10 this was `lightning:` and the same hex, a namespace nobody else defines: the wallet and the gateway built here read that name for one release (the gateway in its config and in a buyer's `accepted`, the wallet in a seller's terms) and write the new one. |
 | `features: [512]` | Every invoice of this entry carries feature bit 512, required. | Bit 512 is what separates an XBT Lightning invoice from one of the SHA-256 chain. The wallet's Lightning rail already refuses an invoice without it. |
 | `amount` | The price of this request before its body, in msat: `price.requestMsat`. | Pieces are metered below one sat; money moves a ticket at a time (section 3). |
 | `price` | The whole price rule: `requestMsat` once per request, `byteMsat` for every `perBytes` bytes of the response body (rounded up over the whole body), `secondMsat` for every started second the response is open. | A body priced by its size or its duration has no price before it is sent (section 4). |
@@ -110,7 +110,15 @@ shape, with hashes of the seller's choosing. Without `settle`, a lock is for hel
 
 The first lock of a session carries no authentication and makes the session. Every later lock is
 a request of that session and carries `PAYMENT-SIGNATURE` as any paid request does (section 3):
-without it, anyone who learns a session id can fill that session's ticket places. A request names
+without it, anyone who learns a session id can fill that session's ticket places. A seller MAY
+issue hold invoices only to a session that has paid it something, a prepaid ticket of section 5,
+and answer a lock for held tickets before that with `402 prepaid_first` (unsigned to a first
+lock, signed to a later one); the gateway in this tree does so by default where it offers both
+kinds (`caps.held_after_paid`). Without such a rule a hold invoice costs whoever asks for it one
+HTTP request, and the seller's held places can be taken by anyone who reaches it from enough
+addresses. A buyer told `prepaid_first` buys one prepaid ticket, and holds after it is credited.
+The invoices of a first lock lapse sooner than others (20 s in the gateway, `caps.first_lock_secs`,
+against 60), and one client address has at most 2 unpaid invoices (`caps.unpaid_per_address`). A request names
 at most `maxTickets` hashes. A hash the seller's node will not issue (it has had an invoice for
 that hash before, in any session) comes back under `refused`; a first lock that issues nothing
 makes no session.
@@ -137,7 +145,7 @@ safety, since a paid ticket cannot be recalled:
 | Feature bit 512 is set and required; the prefix is XBT's. | The wallet pays on the SHA-256 chain's Lightning network. |
 | The final CLTV delta is `ticketBlocks`, and within the owner's bound. | Funds can stay locked for as long as the seller wrote (the node's ceiling for a route is 2,016 blocks, from its source). |
 | With this ticket, unreleased tickets for this seller are at most `maxTickets`, and their sum is within the owner's cap on locked funds. | A seller that asks for more locks more. |
-| The amount is at least 546 sat, and at least the dust limit of each side of the channel the payment will leave on, as the buyer's node reports them (section 11). | A ticket below a channel's dust limit has no output there. Nobody can claim it on chain, and it is lost to the miners if that channel is force-closed while it is held. |
+| The amount is at least 546 sat, and at least the dust limit of each side of the channel the payment will leave on, as the buyer's node reports them (section 11); where a channel without anchors may be on the route, at least the fee-aware floor of section 6.1. | A ticket below a channel's dust limit has no output there. Nobody can claim it on chain, and it is lost to the miners if that channel is force-closed while it is held. |
 | With this ticket, the payments pending on the channel it will leave on are at most half of that channel's slots: the smaller of the two `max_accepted_htlcs` the buyer's node reports for it (section 11). | The channel's slots are shared. Measured on a 30-slot channel: the 31st ticket failed, and so did an ordinary payment. |
 | The invoice is payable for no longer than the owner allows (an hour by default), has not expired, and has a payment secret. | An invoice that stays payable is one the buyer's node could still pay long after the buyer gave the hash up. |
 
@@ -529,28 +537,40 @@ What follows from it:
 - The channel's fee rate is set by whoever funded the channel and can rise while a ticket is
   held.
 
-**What the code does today.** The wallet holds no ticket below the larger dust limit of a channel
-its payment may leave on, and on a channel without anchors it adds the fee of 703 weight units at
-four times that channel's present fee rate: 546 + 703 × 4 × 250 ÷ 1000 = 1,249 sat at 1 sat/vB
-against a dust limit of 546. So on a channel of its own without anchors it already holds no
-1,000-sat ticket at 1 sat/vB, and buys prepaid tickets there where the seller offers them
-(section 5). The gateway reads no
-dust limit and no channel type. Neither side can see a remote channel.
-
-**The floor for held tickets (decided, not yet built).** 1,000 sat stays the default ticket.
-Where a channel without anchors may be on the route, a held ticket will be at least
+**The floor for held tickets (built 2026-10-17).** 1,000 sat stays the default ticket. Where a
+channel without anchors may be on the route, a held ticket is at least
 
 ```text
-max(546, dust_limit + 663 × feerate_cap ÷ 1000) sat
+max(546, dust_limit + 703 × feerate_cap ÷ 1000) sat
 ```
 
-with `feerate_cap` the fee rate the floor is sized for, in sat per 1,000 weight units. Against a
-dust limit of 546 sat that is 712 sat at 1 sat/vB, 2,204 sat at 10 and 8,834 sat at 50 (computed:
-546 + 166, 546 + 1,658, 546 + 8,288, rounded up). Open: 663 is the weight on the offering side;
-the receiving side trims with 703, which gives 722, 2,304 and 9,334 sat, and which of the two the
-built floor uses is not settled. Open too: how either side learns that a remote channel has no
-anchors, since the channel type is not in gossip. Below the floor a seller is paid without a held
-payment: a prepaid ticket, or the lottery.
+with `feerate_cap` the fee rate the floor is sized for, in sat per 1,000 weight units: the owner's
+`tickets.feerate_cap_sat_per_kw`, by default 2,500 (10 sat/vB) on mainnet and 253 (lnd's floor,
+about 1 sat/vB) on regtest and the test networks. 703 is the weight of the receiving side, the
+larger of the two (the offering side trims with 663, which gives 712, 2,204 and 8,834 sat): a
+ticket travels towards the seller, so on every channel of its route the side nearer the seller
+receives it. Against a dust limit of 546 sat the floor is 722 sat at 1 sat/vB, 2,304 sat at 10
+and 9,334 sat at 50 (computed: 546 + 176, 546 + 1,758, 546 + 8,788, rounded up); 724 sat at 253.
+
+How the wallet applies it (`crate::ticket::channel_limits`):
+
+- **Its own channels**, by what its node lists: on an anchor channel the larger of the two dust
+  limits; on a channel without anchors that dust limit and the fee of 703 weight units at the cap
+  or at four times the channel's present fee rate, whichever is more.
+- **The rest of the route**, which nobody here can see (the channel type is not in gossip): where
+  the seller is not the peer of the channel the ticket leaves on, every channel past it is taken
+  to be one without anchors with a dust limit of 546 sat, so the floor is 546 + 703 × cap ÷ 1000.
+  A seller that is the wallet's direct peer has its channel's own floor and nothing more.
+- **Where the floor is above the ticket.** A seller whose terms let the buyer choose a size
+  (`minTicketMsat`) is asked for one at the floor or above, inside the owner's largest ticket
+  and caps; a seller with one size below the floor, or a floor above what the owner allows, holds
+  nothing with this wallet (`ticket_dust`), and the call is paid by a prepaid ticket where the
+  seller offers them, or by the next entry of its 402, the lottery for one.
+
+So on mainnet, at the defaults (a 1,000-sat ticket, the owner's largest ticket of 1,000 sat), no
+ticket is held through a routing node, and calls are paid by prepaid tickets or the lottery; an
+owner who wants held tickets there raises `tickets.max_ticket_sats` to 2,304 or more, with a
+seller that offers that size. The gateway reads no dust limit and no channel type.
 
 ### 6.2 What a force close costs, by fee rate
 
@@ -624,9 +644,11 @@ Every figure is computed from sections 6.1 and 6.2 unless it says measured.
 
 With the wallet in this tree the two buyer rows without anchors do not arise at these rates on
 the buyer's own channel: it holds no 1,000-sat ticket there (section 6.1). They are what a buyer
-without that check, or a rate that rises more than four times while a ticket is held, would
-meet. The rows for a routing node and a seller are not covered by any check: nobody on the route
-can see their channels.
+without that check, or a rate that rises above the floor's cap while a ticket is held, would
+meet. Since 2026-10-17 the rows for a routing node and a seller are covered by the floor's rule
+for the rest of the route (section 6.1): at the mainnet default no 1,000-sat ticket is held
+through a hop. Nobody on the route can see their channels, so the rule takes every one of them
+to be without anchors.
 
 ### 6.4 What held tickets cost the network, and the fallback
 
@@ -656,35 +678,41 @@ cancelled, and with a hold fee more the longer it is held. Then:
   mode**: each is an ordinary payment that is in flight for a fraction of a second and holds
   nothing. Both are built, and the wire needs no change for it.
 
-**The direction for strangers (decided, not yet built).** A session with a seller the owner has
-not named will start with one prepaid ticket, paid and settled on arrival, and hold tickets only
-after it. The wallet will hold 1 ticket at a time with such a seller and 2 with a named one.
-Today the wallet already locks at most 1 ticket with a seller its owner has not named
-(`unlisted_max_tickets`), but it opens every session with held tickets where they fit, and a
-seller's first hold invoice is issued to a buyer that has paid nothing.
+**Strangers (built 2026-10-17).** A session with a seller the owner has not named starts with one
+prepaid ticket, paid and settled on arrival, and holds tickets only after the wallet's node shows
+it paid (the session's `paid_first`, cleared in the same write that books the payment). The
+wallet holds 1 ticket at a time with such a seller and 2 with a named one: a task's
+`unlisted_max_tickets` is 1 by default, whatever `pool_many` says, and the pool follows it. A
+seller the owner has not named whose terms offer no prepaid tickets is not held with at all
+(`ticket_prepaid_first`; the next entry of its 402, the lottery for instance, is tried). On the
+seller's side the gateway issues hold invoices only to a session that has paid something
+(section 2), so a session with a named seller that meets that rule buys its first ticket prepaid
+too, and holds after it.
 
 ## 7. The numbers and their reasons
 
 | Number | Value | Reason |
 |---|---|---|
-| Ticket size | 1,000 sat | A hop charges 1,001 msat for a settled 1,000-sat ticket at the forks' default policy: a base fee of 1,000 msat and a rate of 1 part in a million (0.0001%). For a ticket of this size that is an overhead of 0.1% of the ticket per hop, nearly all of it the base fee; it is a ratio for this amount and not a fee rate. Nothing on a direct channel, 2,002 msat through two hops. Above both dust limits (354 and 546 sat), so on anchor channels it has an output in every channel on the route at any fee rate. On a channel without anchors it has none from about 2.6 sat/vB, and above a few sat/vB it costs more to claim on chain than it is worth on either kind (sections 6.1 and 6.2). It stays the default; the fee-aware floor two rows down is decided and not yet built. |
-| Smallest ticket that is held, where a channel without anchors may be on the route (decided, not yet built) | max(546, dust_limit + 663 × feerate_cap ÷ 1000) sat | The dust threshold of such a channel rises with its fee rate (section 6.1): 712, 2,204 and 8,834 sat at 1, 10 and 50 sat/vB against a dust limit of 546 (computed). Today the wallet applies a rule of its own to the channel a ticket leaves on (1,249 sat at 1 sat/vB) and the gateway applies none. |
+| Ticket size | 1,000 sat | A hop charges 1,001 msat for a settled 1,000-sat ticket at the forks' default policy: a base fee of 1,000 msat and a rate of 1 part in a million (0.0001%). For a ticket of this size that is an overhead of 0.1% of the ticket per hop, nearly all of it the base fee; it is a ratio for this amount and not a fee rate. Nothing on a direct channel, 2,002 msat through two hops. Above both dust limits (354 and 546 sat), so on anchor channels it has an output in every channel on the route at any fee rate. On a channel without anchors it has none from about 2.6 sat/vB, and above a few sat/vB it costs more to claim on chain than it is worth on either kind (sections 6.1 and 6.2). It stays the default; below the fee-aware floor two rows down it is not held. |
+| Smallest ticket that is held, where a channel without anchors may be on the route | max(546, dust_limit + 703 × feerate_cap ÷ 1000) sat | The dust threshold of such a channel rises with its fee rate (section 6.1): 722, 2,304 and 9,334 sat at 1, 10 and 50 sat/vB against a dust limit of 546 (computed). The owner's `tickets.feerate_cap_sat_per_kw`: 2,500 on mainnet (2,304 sat through a routing node), 253 elsewhere (724 sat). Built 2026-10-17 in the wallet; the gateway applies none. |
 | A held ticket's cost to the channel's funder | 172 weight units of commitment transaction | 43, 430 and 2,150 sat a ticket at 1, 10 and 50 sat/vB (computed, section 6.2); 483 tickets took a commitment transaction from 1,116 to 84,200 weight units on the lab. |
 | Smallest ticket that is held | 546 sat, the larger of the two dust limits | Below 354 sat a ticket has no output in a Lightning Fork channel's transaction, below 546 sat none in a Core Lightning one (seen on chain, section 11). At 546 sat one hop's fee (1,000 msat) is 0.18% of the ticket, 0.37% through two hops. A node takes nothing below 1 sat (999 msat found no route, through a Lightning Fork hop or on one channel), and a 1-sat ticket through a hop pays a fee of 1 sat. |
 | Tickets unreleased per session | 2 | 2,000 sat locked and 2 slots of every channel on the route, of which a Core Lightning channel has 30. The next is locked when one is left; a lock of one takes 0.2 s through a hop. It was 8 until 2026-10-12, sized for 483 slots. |
 | Held tickets on one channel, all sessions together | Half of the channel's slots: 15 of 30 | The other half is for ordinary payments, for settles on their way and for everyone else (section 11). |
 | Ticket life (`ticketBlocks`) | 40 blocks | The node takes no less than 24. The seller's node cancels at 18 before expiry, the seller stops accepting at 24 before, and the payer's node adds 3: so 19 usable blocks, and at most 25 blocks locked behind a silent seller. |
 | Seller's margin | 24 blocks before expiry | 18, when its node cancels the ticket itself, and 6 more for a settle that has to go on chain (the node starts that 16 blocks before expiry). The 18 is the node's `invoices.holdexpirydelta`, a setting of the node's runner: 18 on the Lightning Fork node at its default, 12 on upstream lnd. The node does not tell it, so the gateway takes it from its config (`node.hold_expiry_delta`, 18 unless the runner says otherwise) and refuses to start when it is above 18: the margin is one number for both sides (a buyer stops releasing a ticket at 25 blocks), so it is not moved to fit a node. |
-| Invoice time expiry | 60 s | Long enough to pay through a few hops (0.5 s through two), short enough that unpaid invoices do not pile up. |
+| Invoice time expiry | 60 s; 20 s for the invoices of a first lock | Long enough to pay through a few hops (0.5 s through two), short enough that unpaid invoices do not pile up. A first lock is nobody's yet: its invoices give their places back sooner. |
 | Tickets in flight per channel | 30 on a Core Lightning channel, 483 at most | 483 is the protocol's limit and Lightning Fork's default; 30 is Core Lightning's default, each way, set when the channel opens. Between Lightning Fork nodes, of 520 offered at once 483 locked in 8 s and 37 failed on the buyer's node (`INSUFFICIENT_BALANCE`) with nothing held; to a Core Lightning node, of 40 offered 30 locked and 10 failed the same way. 483 tickets take a commitment transaction from 1,116 to 84,200 weight units. |
 | Macaroons | Buyer: `info:read`, `offchain:read`, `offchain:write`, `onchain:read`. Seller: one with `invoices:read`, `invoices:write`, and one with `info:read`. | The buyer's was enough for its side. The seller's invoice macaroon makes, follows, settles and cancels tickets and cannot read the block height; the second one reads it. Neither could send coins, pay, open a channel, read the wallet or bake another. |
-| Seller's caps (the gateway's defaults in this tree) | 15 held tickets for all sessions together, 2 a session, 30 sessions, 2 from one address | What buyers can hold of the seller's inbound capacity at no cost to them: 15,000 sat and half of one 30-slot channel. A runner whose inbound channels all carry more says so (`caps.inbound_slots`), and one with several channels may raise the cap past half of one (`caps.held_over_half`). Until 2026-10-13 the defaults were 8 a session and 240 in all. |
+| Seller's caps (the gateway's defaults in this tree) | 15 held tickets for all sessions together, 2 a session, 30 sessions, 2 from one address, 2 unpaid invoices from one address; hold invoices only to a session that has paid a ticket | What buyers can hold of the seller's inbound capacity at no cost to them: 15,000 sat and half of one 30-slot channel. A runner whose inbound channels all carry more says so (`caps.inbound_slots`), and one with several channels may raise the cap past half of one (`caps.held_over_half`). Until 2026-10-13 the defaults were 8 a session and 240 in all. |
 | Ticket payments with the buyer's router at once | 8 | On a 30-slot channel, 200 small payments sent 8 at a time all succeeded, and 139 of 200 sent 64 at a time failed (section 11). A win of the lottery is one of them. |
 | A win of the lottery (section 9) | 64 sat, 16 at the least | A hop's base fee of 1 sat is 1.6% of 64 sat and 6% of 16. A win is paid at once and never held, so the dust limits and the slot budget do not apply to it. |
 
 ## 8. Open in this draft
 
-- The scheme name and the `lightning:` network id are ours. Nothing upstream defines them.
+- The scheme names (`ticket`, `lottery`) are ours; nothing upstream defines them. The network is
+  CAIP-2's `bip122:` id with `extra.layer: "lightning"` since 2026-10. The asset name
+  `XBT:msat` is ours.
 - What `auth` covers in a second `lock` and in a `cancel` is not written down: section 3 defines it
   for a paid request only.
 - A lock is not idempotent. If the answer to a lock is lost, the seller holds invoices the buyer
@@ -723,9 +751,12 @@ seller's first hold invoice is issued to a buyer that has paid nothing.
   node's `SignMessage`, which neither of the seller's macaroons allows; the runner can sign the
   list once with its own tools, or a third narrow macaroon can. Until then the list is the TLS
   origin's word, as the terms are.
-- The entry for a single Lightning payment (section 12, rail 2) is x402's `exact` with a network
-  id of ours and the invoice in `extra.invoice`. No seller in this tree offers it, and it was not
-  run on the lab.
+- The entry for a single Lightning payment (section 12, rail 2) is x402's `exact` on the chain's
+  `bip122:` id with `extra.layer: "lightning"` (or the old `lightning:` name), the invoice in
+  `extra.invoice` and the preimage as the payload. Upstream x402 has since defined `exact` on
+  Lightning (`REFERENCES.md`, 22); its definition is not in this tree and was not checked against
+  this one, so the invoice's field and the payload are this tree's reading and may differ from
+  upstream's. No seller in this tree offers the entry, and it was not run on the lab.
 - `bytes` and `complete` beside the last receipt of a long answer are not signed. What is signed
   is `charged` and `bodyHash`.
 - The price of a piece only the service can count, such as the tokens a model produced, cannot be
@@ -775,8 +806,11 @@ The same holds for a seller's income: within 20% of what it earned takes about 6
 buyers together, and a seller that earns less than one win from a buyer is usually paid nothing
 by it (section 9.9). The only thing that evens this out is more wins between the same two
 parties. A session pools the calls of one buyer to one seller; nothing pools across sellers or
-across buyers, and there is no bank. The wallet has no rule that keeps a call expecting few wins
-off the lottery: it chooses draws for anything smaller than four tickets' worth (section 9.7).
+across buyers, and there is no bank. Since 2026-10-17 the wallet keeps a call that expects fewer
+than four wins off the lottery where the seller also offers prepaid tickets (the owner's
+`tickets.lottery.min_expected_wins`, section 9.7): such a call costs what its ticket says. As
+shipped that is every call that may use less than 256 sat through a routing node (4 × 64). Below
+four wins, and with a seller that offers no prepaid tickets, it is paid by draws as before.
 
 Both sides are built: the draw is `xbt402::lottery` (`crates/xbt402/src/lottery.rs`, no IO, used
 by both), the seller's side is in `xbt-gateway` (`lottery.rs`, `gateway/draws.rs`), and the
@@ -805,9 +839,9 @@ A seller that takes draws adds one entry to `accepts`, after its ticket entries:
 knows only tickets skips an entry it cannot read.
 
 ```json
-{"scheme": "lottery", "network": "lightning:0000000000000050c1e5f69672f45929",
+{"scheme": "lottery", "network": "bip122:0000000000000050c1e5f69672f45929",
  "asset": "XBT:msat", "amount": "0", "payTo": "<the seller's Lightning node id, 33 bytes>",
- "extra": {"version": "lottery/0", "features": [512],
+ "extra": {"version": "lottery/0", "layer": "lightning", "features": [512],
            "winMsat": "64000", "minWinMsat": "16000", "winBlocks": 40,
            "pay": "on-win", "release": "after-answer",
            "window": 8, "graceSeconds": 30, "gracePieces": 64, "maxUnpaidWins": 2,
@@ -966,8 +1000,9 @@ The buyer:
   the last checked draw steps, at most 4,096, and MUST work out every draw up to `drawn` itself.
   A value that is not on the chain is not a reveal, and a win the buyer cannot reproduce is not a
   win.
-- SHOULD give no more than a few values (8 in the wallet built here) beyond the last reveal it
-  checked. A seller that takes values and reveals nothing is told nothing more.
+- SHOULD give no more than a few values (8 in the wallet built here, however many pieces arrive at
+  once) beyond the last reveal it checked. A seller that takes values and reveals nothing is told
+  nothing more.
 - MAY list a piece under `void` in place of a value: it never arrived, or failed its check. The
   buyer knows no result when it says so.
 
@@ -1099,6 +1134,7 @@ One function in the wallet decides, when a seller's 402 has a ticket entry and a
 | A session with this seller is open | what that session pays by |
 | The seller offers one of the two, the owner turned the lottery off (`tickets.lottery.enabled`), or the task says (`meter`: `tickets` or `draws`) | that one |
 | A piece of the route costs one ticket or more | tickets |
+| The call expects fewer wins than the owner's `min_expected_wins` (4): what it may use (`max_sats`) is less than that many wins of the size a session would be opened with, and the seller's ticket entry has prepaid tickets beside it | tickets: a held one where the seller is named and one fits; a prepaid one first for a seller the owner has not named (section 6.4) |
 | The call may use four tickets' worth or more with this seller (`max_sats`), and a held ticket fits (the slot budget of section 11 and the owner's caps have room) | tickets |
 | Anything smaller, and whenever no held ticket fits | draws |
 | Draws were chosen and no win size fits the owner's bounds | tickets, and with them the prepaid ticket of section 5 where none can be held |
@@ -1132,10 +1168,11 @@ each hop and 6% of a 16-sat one.
 | `max_odds_den` | 4 | No piece wins more often than 1 time in this many: a piece nearer a whole win is paid with tickets |
 | `expected_wins` | 16 | The wins a session is sized to expect |
 | `luck_tenths` | 31 | How far above its price a call may pay before the wallet asks for no more pieces: 3.1 standard deviations, which about one honest call in 1,000 reaches |
-| `ahead` | 8 | Values given beyond the last reveal the wallet checked |
+| `ahead` | 8 | Values given beyond the last reveal the wallet checked. Held however many pieces arrive at once: the rest wait for the next round, which the reveal in the answer to this one makes room for. Until 2026-10-17 a burst of more pieces than this raised the bound to the burst |
 | `unlisted_max_wins` | 32 | Wins paid to one seller the owner has not named, in a task's window |
 | `routed_floor_sats`, `direct_floor_sats` | 64 and 4 | The fee floor of section 9.7 |
 | `stay_tickets` | 4 | The tickets' worth above which a seller is one the buyer stays with |
+| `min_expected_wins` | 4 | A call expecting fewer wins than this is paid with a ticket where the seller offers prepaid ones: its cost by draws would be mostly luck (section 9). 0 turns the rule off |
 
 and, for a task, `meter` (`auto`, `tickets` or `draws`). Everything else is what bounds a ticket:
 the task's `budget_sats`, the cap on sats paid to one seller, the wallet's daily and weekly
@@ -1409,7 +1446,15 @@ is refused (`max_sats`). Until October 2026 a third entry, the on-chain channel
 (`batch-settlement`), was paid here, and both of these cases went to it; that channel was removed
 (`docs/LIMITS.md`). A seller that still offers it is told so in `rails_passed_over`.
 No request leaves for a host the owner did not allow: the URL is read by one parser, and its origin
-is on the allowlist, or the call's task pays any seller, before the first byte is sent.
+is on the allowlist, or the call's task pays any seller, before the first byte is sent. An origin
+that is not on the allowlist is also https, and every address its host has is one of the public
+internet (no loopback, private, shared, link-local, documentation or reserved range, IPv4 inside
+IPv6 judged as IPv4), before the first byte is sent: `dest_private` otherwise, and nothing goes
+out. A task that pays any seller is what an agent has when it is told to go and find sellers, and
+the unpaid request can have any method and body. The host is looked up for this check and again
+when the request connects, so a name whose answer changes in between (DNS rebinding) is not
+caught by it. An owner whose lab runs sellers on its own machine or network says
+`tickets.unlisted_private: true`; the signer warns of it at start.
 
 **A paid request, in order.**
 

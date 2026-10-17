@@ -95,10 +95,16 @@ nodes, two of the Core Lightning nodes started with the values that binary has b
 mainnet; its driver is not in this tree. `docs/TICKETS.md`, section 11, has the table.
 
 - Money moves a ticket at a time (1,000 sat by default; a ticket that is held is at least 546
-  sat by the design's rule, and a node carries nothing below 1 sat). Decided and not yet built:
-  where a channel without anchors may be on the route, a held ticket will be at least
-  max(546, dust_limit + 663 × feerate_cap ÷ 1000) sat, which against a dust limit of 546 is 712,
-  2,204 and 8,834 sat at 1, 10 and 50 sat/vB (computed; `docs/TICKETS.md`, section 6.1). Pieces inside a ticket are
+  sat by the design's rule, and a node carries nothing below 1 sat). Built 2026-10-17: where a
+  channel without anchors may be on the route, a held ticket is at least
+  max(546, dust_limit + 703 × feerate_cap ÷ 1000) sat, which against a dust limit of 546 is 722,
+  2,304 and 9,334 sat at 1, 10 and 50 sat/vB (computed; `docs/TICKETS.md`, section 6.1). The
+  owner's `tickets.feerate_cap_sat_per_kw` is 2,500 (10 sat/vB) on mainnet by default, so there a
+  routed held ticket is at least 2,304 sat: with the default 1,000-sat ticket and the owner's
+  default largest ticket of 1,000 sat, nothing is held through a routing node on mainnet, and
+  calls are paid by prepaid tickets or the lottery. On regtest and the test networks the default
+  is 253 (lnd's floor, about 1 sat/vB): 724 sat. The wallet knows the type of its own channels;
+  every channel past them is taken to be one without anchors. Pieces inside a ticket are
   metered, and the unused part of the ticket in use is trusted to the seller.
 - A held ticket takes one HTLC slot of every channel on its route, and a channel's slots are
   shared by everyone who uses it. A channel carries 483 each way between Lightning Fork nodes
@@ -183,10 +189,14 @@ mainnet; its driver is not in this tree. `docs/TICKETS.md`, section 11, has the 
 - A channel with a ticket pending cannot be closed co-operatively: every channel on a ticket's
   route is kept from a clean close until the ticket is settled, cancelled or expired (from
   BOLT 2; not run). The other way out is a force close.
-- Decided and not yet built: a session with a seller the owner has not named will start with one
-  prepaid ticket and hold tickets only after it, 1 at a time (2 with a named seller). Today
-  such a session opens with a held ticket where one fits, and a seller issues its first hold
-  invoice to a buyer that has paid nothing (`docs/TICKETS.md`, section 6.4).
+- Built 2026-10-17: a session with a seller the owner has not named starts with one prepaid
+  ticket and holds tickets only after the node shows it paid, 1 at a time (2 with a named
+  seller); a seller the owner has not named whose terms offer no prepaid tickets is not held
+  with at all (`ticket_prepaid_first`), and the socket's `ticket_open` path, which cannot buy a
+  prepaid ticket, cannot hold with one. The gateway issues hold invoices only to a session that
+  has paid something (`caps.held_after_paid`, on by default wherever it offers both kinds), so
+  a named seller's session that meets such a gateway buys its first ticket prepaid too
+  (`docs/TICKETS.md`, section 6.4).
 - BOLT 11 hold invoices only. The Lightning Fork's BOLT 12 offers have no hold path.
 - One hop was measured, on one host. Two or more hops, real network latency, mainnet routes and
   fees, a direct channel, and a force close with many tickets were not.
@@ -424,7 +434,9 @@ wallet) and against a stand-in node in its tests.
   on sessions let through: one call to the node for each, with a timeout of 15 seconds. A lock
   those caps refuse (`too_many_sessions`, `too_many_tickets`) is refused before the call, and a
   lock for an existing session is authenticated before it; a first lock is authenticated by
-  nobody, so while session places are free anyone can make the gateway read the list once per
+  nobody, and with `caps.held_after_paid` (the default) a first lock for held tickets is refused
+  before the call, so the list is read for locks of sessions that have paid a ticket only. With
+  the rule off, while session places are free anyone can make the gateway read the list once per
   request. The permission
   is wider than that one call: it also shows the node's channel balances, its payments and what
   it forwarded, to whoever has the gateway's files. Without it the gateway knows nothing of its
@@ -498,10 +510,17 @@ wallet) and against a stand-in node in its tests.
   `sessions_per_address` to 0 and caps in the proxy. The cap on connections from one address
   (`http.per_address`) is taken before any header is read and always counts the socket.
 - Whoever can reach the gateway from enough addresses can take every session place with locks
-  it never pays, at no cost, a minute at a time: new buyers are refused meanwhile
-  (`too_many_sessions`). Sessions that already hold tickets keep them and their balance, and can
-  refill up to their own 2; a session with nothing locked at that moment waits for a place. With
-  the default caps the 15 held places are taken first, by 8 sessions.
+  it never pays, at no cost: new buyers are refused meanwhile (`too_many_sessions`). Sessions that
+  already hold tickets keep them and their balance, and can refill up to their own 2; a session
+  with nothing locked at that moment waits for a place. Since 2026-10-17, with the default caps,
+  such locks are for prepaid tickets: an unauthenticated lock for held ones is refused
+  `prepaid_first`, so the 15 held places go only to sessions that have paid one ticket each; the
+  invoices of a first lock lapse after 20 s (`caps.first_lock_secs`, and the session's place 15 s
+  after that); and one address has at most 2 unpaid invoices (`caps.unpaid_per_address`).
+  Before, 2,000 lock requests from one client took every held place in half a second (measured).
+  An unpaid invoice still counts against the cap on held tickets from when it is issued: not
+  counting it until paid would let the node hold more than the cap, and with paid-first it is not
+  free.
 - Every lock makes invoices on the node, up to 75 at once with the default caps (15 held and 60
   prepaid) and each given up within 75 seconds if unpaid; the node keeps cancelled invoices in
   its database until it is set to collect them (`gc-canceled-invoices-on-the-fly`).
@@ -726,6 +745,11 @@ payer only: no socket method buys one. Run on regtest only (`scripts/ticket_book
   allowlisted origin whose `counterparties` entry gives the node id (`ln_node`). An origin alone
   names nobody. Under `xbt402_pay` the origin is the one the signer itself fetched the terms
   from; on the socket's `ticket_open` it is the caller's word.
+- A seller the owner has not named is reached only over https and at public addresses: the
+  check is made before the unpaid first request, and looks the host up itself, so a name that
+  answers one address to the check and another to the request that follows (DNS rebinding) gets
+  past it (`docs/TICKETS.md` section 12; until 2026-10-17 the first request went out before any
+  such check, to any address).
 - A seller the owner has not named is paid only under a task that admits any seller, and by
   default at most 1 ticket locked and 4 tickets' worth paid in the task's window. The cap is per
   node id, and node ids are free to make: what bounds a seller that takes a ticket and serves
@@ -862,6 +886,17 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
 - A body longer than the preview is stored only when `B2_BODY_DIR` is set; otherwise the wallet
   hands on its first 12,000 bytes, its length and its hash. Stored files are never removed by
   the wallet.
+- On mainnet the wallet pays no ticket and no win unless its owner acknowledges it with the same
+  fixed sentence the gateway asks for ("real funds, software that has run on regtest only"):
+  in the policy's `tickets.mainnet_ack`, or alone in a file the environment variable
+  `B2_MAINNET_ACK_FILE` names (what a package's setup page writes; white space around it is
+  allowed, anything else is no acknowledgement). Without it the rail is off, the signer says so at start, and
+  every refusal of the rail carries the sentence (`ticket_mainnet`). With it, the caps the owner
+  did not set are smaller than elsewhere: 4 tickets and 4,000 sat locked at once, 4 sellers at
+  once and 4 new ones a minute, 120 ticket payments an hour (15, 15,000, 15, 30 and 1,200
+  elsewhere), and a held ticket through a routing node is at least 2,304 sat (the fee-aware
+  floor, above). Like the gateway's, this is a guard against using mainnet by omission and no
+  more. Added 2026-10-17.
 - The single Lightning payment of a 402 (`scheme: "exact"`) pays first: an invoice that is paid
   and then not honoured is lost, once. No seller in this tree offers the entry and it was not run
   on the lab.
@@ -931,7 +966,7 @@ untrusted field.
 | payer and rail | where a seller's words reached the wallet's own fields | now |
 |---|---|---|
 | Lightning (`ln_pay`, `ln_status`) | a refused invoice's or offer's prefix (free text, under a checksum its writer computes) and an offer's currency were quoted in `reason`; the node's error message, which can repeat a payee's or an issuer's, was the `reason` of `ln_backend` and `ln_fetch_invoice`; `ln_status.recent[].failure` was the bare text | a refused string is described and not quoted; the node's message is under `untrusted_ln_data` (`node_message`), and so is each listed `failure`. Every result that reports an error of the node carries its message there, beside the wallet's sentence: at the top of an `ln_pay` refusal and of an `ln_status` that could not reach the node, and inside the part it is about (`chain_check`, `watchtowers`, a `reconciled` row; an unreadable channel or coin list under `node_messages`). A macaroon the node refuses is `ln_macaroon`, "the LN node refused the macaroon"; which refusal it was (a caveat, an expiry, a permission) is the node's message |
-| stream tickets, the wallet's node (`ticket_lock`, `ticket_status`, a prepaid ticket or a win) | the node's error message was dropped: a refused invoice, a send with no answer, a reconcile row and `ticket_status.node` gave the wallet's sentence alone | each of those rows carries the node's message under its own `untrusted_ln_data` (`node_message`); a ticket whose send got no answer says so in `send_error` |
+| stream tickets, the wallet's node (`ticket_lock`, `ticket_status`, a prepaid ticket or a win) | the node's error message was dropped: a refused invoice, a send with no answer, a reconcile row and `ticket_status.node` gave the wallet's sentence alone; and a failed payment's `failure_reason` was the ticket's `note` and part of the refusal's `reason` (until 2026-10-17) | each of those rows carries the node's message under its own `untrusted_ln_data` (`node_message`); a ticket whose send got no answer says so in `send_error`; a failed payment's `note` is the reason by the wallet's own list of the node's names (`FAILURE_REASON_NO_ROUTE` and the six others, or `failure_reason_unknown`), and what the node wrote is under `untrusted_ln_data` (`failure`) |
 | stream tickets (`xbt402_pay`, `ticket_status`, `ticket_stop`) | refused terms were quoted in `rails_passed_over`; `offered` listed each entry's scheme and network; the seller's error code, by its shape, was in `reason`, `seller_code`, `seller_fault`, `ended` and a stopped session's `why`; a refused invoice's prefix was in `reason`; the last receipt of a streamed answer was the seller's whole object | terms are described; `offered` says `ticket`, `exact`, `batch-settlement` or `other`, on this wallet's network or `other`; a code is named only when it is the scheme's; the receipt is given as its numbers, and the seller's object as `untrusted_provider_response.last_receipt` |
 | every rail's HTTP | the transport's error text went into `reason`: it quotes a status that is not a number (three characters) and, on the ticket rail, the URL with the seller's session path | a fixed sentence per kind of failure |
 

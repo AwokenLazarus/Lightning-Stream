@@ -716,7 +716,7 @@ pub fn receipt_message(r: &Value) -> [u8; 32] {
 /// What a seller's terms say about the lottery: the `extra` of its `accepts` entry.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Terms {
-    /// `lightning:<32 hex>`.
+    /// The chain's CAIP-2 id, `bip122:<32 hex>` ([`crate::ticket::network_id`]); the entry says `extra.layer`.
     pub network: String,
     /// The seller's Lightning node id, 33 bytes hex: the payee of every win's invoice.
     pub pay_to: String,
@@ -746,6 +746,7 @@ impl Terms {
     pub fn accepts(&self, amount_msat: u64, release: &str, price: &Value) -> Value {
         let mut extra = Map::new();
         extra.insert("version".into(), VERSION.into());
+        extra.insert("layer".into(), crate::ticket::LAYER.into());
         extra.insert("features".into(), Value::Array(vec![FEATURE_BLAKE2B.into()]));
         extra.insert("winMsat".into(), self.win_msat.to_string().into());
         extra.insert("minWinMsat".into(), self.min_win_msat.to_string().into());
@@ -1301,7 +1302,7 @@ mod tests {
 
     #[test]
     fn the_accepts_entry_is_the_one_the_draft_shows() {
-        let t = Terms { network: "lightning:0000000000000050c1e5f69672f45929".into(), pay_to: "02".repeat(33), win_msat: 64_000, min_win_msat: 16_000, win_blocks: 40,
+        let t = Terms { network: "bip122:0000000000000050c1e5f69672f45929".into(), pay_to: "02".repeat(33), win_msat: 64_000, min_win_msat: 16_000, win_blocks: 40,
                         window: 8, grace_seconds: 10, grace_pieces: 64, max_unpaid_wins: 2, chain_draws: DEFAULT_CHAIN_DRAWS, piece_bytes: 262_144,
                         receipt_key: "03".repeat(33), session: SESSION_PATH.into() };
         let a = t.accepts(100, RELEASE_AFTER_ANSWER, &json!({"requestMsat": "100"}));

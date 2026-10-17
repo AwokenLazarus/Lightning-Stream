@@ -18,7 +18,9 @@ use xbt_gateway::node::{Hash, InvoiceState};
 use xbt_gateway::standin::StandIn;
 use xbt_svc::http::{serve_with, Handler, Limits, Reply, Request, Response, Running, Streamed};
 
-pub const NET: &str = "lightning:00000000000000000000000000000001";
+pub const NET: &str = "bip122:00000000000000000000000000000001";
+/// The name a ticket entry's network had until 2026-10, read for one release.
+pub const OLD_NET: &str = "lightning:00000000000000000000000000000001";
 
 // --- the service behind the gateway -----------------------------------------------------------------
 
@@ -175,14 +177,16 @@ pub fn routes() -> Value {
 }
 
 /// A config for tests: `edit` changes it before it is read. The tests of the gateway's mechanisms
-/// run a seller whose inbound channels all carry 483 pending payments and who lets a session hold
-/// 8 tickets; the shipped defaults (2 a session, 15 in all) have tests of their own.
+/// run a seller whose inbound channels all carry 483 pending payments, who lets a session hold
+/// 8 tickets, and who issues hold invoices to a session that has paid nothing; the shipped
+/// defaults (2 a session, 15 in all, a prepaid ticket first, 2 unpaid invoices an address) have
+/// tests of their own.
 pub fn config(state: &Path, upstream: &str, edit: &dyn Fn(&mut Value)) -> Value {
     let mut v = json!({"listen": "127.0.0.1:0", "public_url": "http://gateway.test:8402", "upstream": upstream, "state_dir": state,
         "chain": "regtest", "network": NET,
         "node": {"rest": "http://127.0.0.1:1", "macaroon": "unused", "info_macaroon": "unused"},
         "tickets": {"max_tickets": 8},
-        "caps": {"sessions_per_address": 0, "inbound_slots": 483},
+        "caps": {"sessions_per_address": 0, "inbound_slots": 483, "held_after_paid": false, "unpaid_per_address": 0},
         "times": {"refill_wait_ms": 300, "upstream_wait_secs": 2, "tick_ms": 50},
         "routes": routes()});
     edit(&mut v);
@@ -396,7 +400,7 @@ pub fn http(
         status,
         headers,
         body,
-        complete: complete && method != "HEAD" || method == "HEAD",
+        complete: complete || method == "HEAD",
     }
 }
 
@@ -435,6 +439,8 @@ pub struct Buyer {
     pub receipt_key: String,
     pub next_secret: u64,
     pub tag: u8,
+    /// The network its `accepted` entry names ([`NET`]; [`OLD_NET`] for a buyer of before 2026-10).
+    pub net: &'static str,
 }
 
 pub fn secret_of(tag: u8, n: u64) -> [u8; 32] {
@@ -454,6 +460,7 @@ impl Buyer {
             receipt_key: rig.gw.terms().receipt_key.clone(),
             next_secret: 0,
             tag,
+            net: NET,
         }
     }
 
@@ -503,7 +510,7 @@ impl Buyer {
             payload["ticket"] = t.into();
         }
         b64json(
-            &json!({"x402Version": 2, "accepted": {"scheme": "ticket", "network": NET}, "payload": payload}),
+            &json!({"x402Version": 2, "accepted": {"scheme": "ticket", "network": self.net, "extra": {"layer": "lightning"}}, "payload": payload}),
         )
     }
 

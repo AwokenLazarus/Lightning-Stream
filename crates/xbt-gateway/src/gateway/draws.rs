@@ -321,7 +321,7 @@ impl Gateway {
         }
         let accepted = v.get("accepted").ok_or_else(|| bad("no accepted entry"))?;
         if accepted.get("scheme").and_then(Value::as_str) != Some(lottery::SCHEME)
-            || accepted.get("network").and_then(Value::as_str) != Some(self.cfg.network.as_str())
+            || !xbt402::ticket::on_network(accepted, &self.cfg.network)
         {
             return Err(bad("accepted is not this seller's lottery entry"));
         }

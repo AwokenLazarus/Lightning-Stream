@@ -33,12 +33,14 @@ ships. A ticket is 1,000 sat for 40 blocks. Checks, each PASS or FAIL:
   node     the buyer's node restarts with tickets locked
   silent   a seller that neither settles nor cancels: its tickets come back at their expiry
   restore  the wallet's files are put back from an older copy
-  many     15 sellers (14 the owner has not named), 1 ticket each: 15 held, half of the channel's 30
+  many     named sellers under one task: 2 tickets with each of the first 4, 1 with each beyond, 15 held,
+           half of the channel's 30; the rest hold nothing
   slots    the half rule on the node's own numbers: payments of others pending on the channel leave
            less room, a full half leaves none, and a lock is refused before it is sent
   full     a seller behind a channel with no free slot: the lock fails, the session holds less and
            waits, and after the third round holds nothing
-  dust     a held ticket below 546 sat is refused, whatever the seller offers
+  dust     a held ticket below the floor of a route that may have a channel without anchors (724 sat
+           through the hop at regtest's fee rate) is refused, whatever the seller offers
   surface  the wallet's macaroon; the MCP's ticket tools
 
 Usage: drive.py [check ...]   (all, in this order, when none is named)
@@ -136,9 +138,11 @@ class Wallet:
         self.proc: subprocess.Popen[bytes] | None = None
 
     def policy(self) -> dict[str, Any]:
-        # s01 is the one seller the owner names; "stream" pays named sellers, "swarm" anyone inside its caps
+        # the owner names every seller but the last; "stream" pays named sellers, "swarm" anyone inside its caps.
+        # (A seller the owner has not named is held with only after a prepaid ticket, which the sellers of this lab
+        # do not offer and the signer's socket cannot buy: the last seller is the one stranger, and is refused)
         return {
-            "allowlist": [f"ln:{lab.pubkey(SELLERS[0])}"],
+            "allowlist": [f"ln:{lab.pubkey(s)}" for s in SELLERS[:-1]],
             "max_per_tx_sats": 50_000,
             "daily_budget_sats": 400_000,
             "weekly_budget_sats": 800_000,
@@ -288,9 +292,10 @@ class Seller:
         self.lock = threading.Lock()
 
     def accepts(self) -> dict[str, Any]:
-        net = "lightning:" + lab.chain("getblockhash", "101")[:32]
+        net = "bip122:" + lab.chain("getblockhash", "101")[:32]
         extra = {
             "version": "ticket/0",
+            "layer": "lightning",
             "features": [512],
             "ticketMsat": str(TICKET_MSAT),
             "maxTickets": HELD,
@@ -743,8 +748,11 @@ def liar() -> None:
     signer("ticket_stop", {"session": greedy.get("session", "")})
     check(f"liar: terms above the owner's bounds refuse the seller; a seller that asks for 400 tickets gets the owner's {HELD}",
           list(terms.values()) == ["ticket_size", "ticket_blocks", "ticket_feature_512", "ticket_terms"] and greedy.get("pool") == HELD, {"terms": terms, "pool_for_400": greedy.get("pool")})
-    other = Buyer(SHOPS[SELLERS[1]], "stream").open()
+    other = Buyer(SHOPS[SELLERS[-1]], "stream").open()
     check("liar: a seller the owner has not named is refused under a task for named sellers", other.get("rule") == "ticket_admission", other.get("reason"))
+    stranger = Buyer(SHOPS[SELLERS[-1]], "swarm").open()
+    check("liar: and under a task that pays any seller it is held with only after a prepaid ticket, which it does not offer: refused, nothing locked",
+          (stranger.get("verdict"), stranger.get("rule")) == ("deny", "ticket_prepaid_first"), {k: stranger.get(k) for k in ("verdict", "rule", "reason")})
 
 
 def kill() -> None:
@@ -824,7 +832,12 @@ def restore() -> None:
     a2 = fresh(first)
     used_a, _ = a2.pay()
     held_a = signer("ticket_release", {"session": a2.session})
-    c = fresh(second, task="swarm")
+    # one ticket with the second seller (its terms say so), as the counts below expect
+    second.terms_lie = {"maxTickets": 1}
+    try:
+        c = fresh(second, task="swarm")
+    finally:
+        second.terms_lie = {}
     used_c, _ = c.pay()
     lab.wait("lf1 to see both settled", 30, lambda: all(buyer_payments()[h]["status"] == "SUCCEEDED" for h in (used_a["hash"], used_c["hash"])))
     time.sleep(3)
@@ -864,19 +877,21 @@ def restore() -> None:
 
 def many() -> None:
     spent0 = WALLET_PROC.spent()
-    # the sellers the owner has not named first, the one it has named last: by then the task has many sellers.
-    # As shipped the wallet has 15 sessions at once and holds 15 tickets: more sellers than that are not opened here
-    names = SELLERS[1:BUDGET] + SELLERS[:1]
-    m = len(names)
-    buyers = [Buyer(SHOPS[s], "swarm") for s in names]
-    opened = [b.open() for b in buyers]
-    # an unnamed seller gets 1 ticket whatever the task; a named one 2 among a few sellers and 1 among more than 4
-    want = [(1, False)] * (m - 1) + [(1 if m > 4 else HELD, True)]
+    # sellers the owner named, opened one after another under one task: 2 tickets each with the first 4 (a few
+    # sellers), 1 each beyond, until the wallet holds 15, half of the channel's 30; a further one holds nothing
+    tried = [Buyer(SHOPS[s], "swarm") for s in SELLERS[: BUDGET]]
+    tried_open = [b.open() for b in tried]
+    few = min(4, BUDGET // HELD)
+    want_pools = [HELD] * few + [1] * (BUDGET - HELD * few)
+    got = [(o.get("verdict"), o.get("pool"), o.get("listed"), o.get("rule")) for o in tried_open]
+    want = [("allow", p, True, None) for p in want_pools] + [("deny", None, None, "ticket_slots")] * (len(tried) - len(want_pools))
+    check(f"many: {len(tried)} named sellers opened under the swarm task: 2 tickets with the first {few}, 1 with each beyond, {BUDGET} in all, half of the channel's {SLOTS} slots; the rest hold nothing (ticket_slots)",
+          got == want, lab.tally_states(f"{o.get('verdict')}/pool {o.get('pool')}/named {o.get('listed')}{o.get('rule', '')}" for o in tried_open))
+    buyers = [b for b, o in zip(tried, tried_open) if o.get("verdict") == "allow"]
+    opened = [o for o in tried_open if o.get("verdict") == "allow"]
+    m = len(buyers)
     pools = [int(o.get("pool", 0)) for o in opened]
     total = sum(pools)
-    check(f"many: {m} sellers open under the swarm task, {m - 1} the owner has not named and one it has, with a pool of 1 each",
-          [(o.get("pool"), o.get("listed")) for o in opened] == want,
-          lab.tally_states(f"{o.get('verdict')}/pool {o.get('pool')}/named {o.get('listed')}{o.get('rule', '')}" for o in opened))
 
     def fill(pair: tuple[Buyer, int]) -> int:
         b, pool = pair
@@ -896,9 +911,9 @@ def many() -> None:
           {"locked": sum(locked), "seconds": round(secs, 2), "node": st["node"], "book": st["locked"]})
     REPORT["measured"]["many_lock_s"] = round(secs, 2)
     REPORT["measured"]["many_tickets"] = total
-    if m == BUDGET and N > BUDGET:
+    if total == BUDGET and N > BUDGET:
         # the budget is used up: one more seller holds nothing, and is told why before anything is asked of it
-        extra = Buyer(SHOPS[SELLERS[BUDGET]], "swarm").open()
+        extra = Buyer(SHOPS[SELLERS[BUDGET - 1]], "swarm").open()
         check(f"many: with {BUDGET} tickets held, half of the channel's {SLOTS} slots, a further seller gets no held ticket",
               extra.get("verdict") == "deny" and extra.get("rule") in ("ticket_slots", "ticket_sellers"), {k: extra.get(k) for k in ("verdict", "rule", "reason", "held_budget", "slots")})
     codes = list(POOL.map(lambda b: b.pay()[1], buyers))
@@ -1026,7 +1041,7 @@ def full() -> None:
     s1 = session_of(b.session)
     held_now = sum(1 for t in status(b.session).get("session_tickets", []) if t["state"] in ("sending", "locked"))
     check("full: a ticket that finds no slot on the way fails on the buyer's node, and the session holds less each time: a wait of 30 s, of 60 s, and after the third round nothing is held with that seller",
-          opened.get("pool") == 1 and len(rounds) == 3 and [r["slot_fails"] for r in rounds] == [1, 2, 3] and [r["hold_why"] for r in rounds] == ["ticket_slots", "ticket_slots", "ticket_route_full"]
+          opened.get("pool") == HELD and len(rounds) == 3 and [r["slot_fails"] for r in rounds] == [1, 2, 3] and [r["hold_why"] for r in rounds] == ["ticket_slots", "ticket_slots", "ticket_route_full"]
           and s1.get("pool") == 0 and held_now == 0 and WALLET_PROC.spent() == spent0, rounds)
     REPORT["measured"]["full_failure_reasons"] = sorted({x for r in rounds for x in r["failed_as"]})
     signer("ticket_stop", {"session": b.session})
@@ -1040,8 +1055,11 @@ def full() -> None:
 def dust() -> None:
     shop = SHOPS[SELLERS[0]]
     saw = {}
+    # through the hop the route may have a channel without anchors: the floor is 546 + 703 x 253 / 1000 = 724 sat at the
+    # fee rate a held ticket is sized for on regtest
     for name, lie, want in (("545,999 msat", {"ticketMsat": "545999"}, "ticket_dust"), ("64 sat", {"ticketMsat": "64000"}, "ticket_dust"),
-                            ("64 sat as the smallest of a seller that lets the buyer choose", {"minTicketMsat": "64000"}, None), ("546 sat", {"ticketMsat": "546000"}, None)):
+                            ("546 sat", {"ticketMsat": "546000"}, "ticket_dust"), ("723,999 msat", {"ticketMsat": "723999"}, "ticket_dust"),
+                            ("64 sat as the smallest of a seller that lets the buyer choose", {"minTicketMsat": "64000"}, None), ("724 sat", {"ticketMsat": "724000"}, None)):
         shop.terms_lie = lie
         try:
             out = Buyer(shop, "stream").open()
@@ -1052,8 +1070,8 @@ def dust() -> None:
             signer("ticket_stop", {"session": out["session"]})
         if out.get("rule") != want:
             FAILED.append(f"dust: {name}")
-    check("dust: a held ticket below 546 sat is refused; 546 sat is held; a seller that would go lower is asked for its full size",
-          saw["545,999 msat"]["rule"] == "ticket_dust" and saw["64 sat"]["rule"] == "ticket_dust" and saw["546 sat"] == {"verdict": "allow", "rule": None, "ticket_msat": "546000"}
+    check("dust: through a hop a held ticket below 724 sat is refused (546 and 723.999 included); 724 sat is held; a seller that would go lower is asked for its full size",
+          all(saw[k]["rule"] == "ticket_dust" for k in ("545,999 msat", "64 sat", "546 sat", "723,999 msat")) and saw["724 sat"] == {"verdict": "allow", "rule": None, "ticket_msat": "724000"}
           and saw["64 sat as the smallest of a seller that lets the buyer choose"]["ticket_msat"] == str(TICKET_MSAT), saw)
 
 

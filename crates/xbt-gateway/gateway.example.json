@@ -4,7 +4,7 @@
   "upstream": "http://127.0.0.1:8080",
   "state_dir": "/var/lib/xbt-gateway",
   "chain": "regtest",
-  "network": "lightning:00000000000000000000000000000000",
+  "network": "bip122:00000000000000000000000000000000",
   "node": {
     "rest": "https://127.0.0.1:8081",
     "tls_cert": "/var/lib/lnd/tls.cert",

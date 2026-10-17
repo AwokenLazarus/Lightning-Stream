@@ -75,7 +75,7 @@ The whole of it, for one film at 100 sat a MiB:
   "upstream": "http://127.0.0.1:8096",
   "state_dir": "/var/lib/xbt-gateway",
   "chain": "regtest",
-  "network": "lightning:<the first 32 hex characters of your chain's block 101>",
+  "network": "bip122:<the first 32 hex characters of your chain's block 101>",
   "node": {
     "rest": "https://127.0.0.1:8081",
     "tls_cert": "/var/lib/lnd/tls.cert",
