@@ -38,7 +38,7 @@ GW_PKG = os.path.join(os.path.dirname(HERE), "lightning-stream-gateway")
 sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
 from ln_lab import Lab  # noqa: E402
 from regtest_lib import (agent_and_custody, agent_rotation_attempts, leaks, POLICY_BASE, ROOT, Mcp, Ui, check, docker, http, log, open_log,  # noqa: E402
-                         owner_setup, paid_buy, sh, status, wait_until, write_results)
+                         image_of, owner_setup, paid_buy, sh, status, test_image, wait_until, write_results)
 
 OUT = sys.argv[1]
 PID = os.getpid()
@@ -87,7 +87,7 @@ def run_service(s, images, vol, name=None, cert=None):
         if m["readonly"]:
             mnt += ",readonly"
         args += ["--mount", mnt]
-    args += ["--entrypoint", s["command"][0], images[s["image"]], *s["command"][1:]]
+    args += ["--entrypoint", s["command"][0], test_image(images[s["image"]]), *s["command"][1:]]
     return docker(*args)
 
 
@@ -345,7 +345,7 @@ def main():
     wc = docker("run", "--rm", "--user", "0", "--network", "none",
                 "--mount", f"type=volume,src={vol2},dst=/data/witness,volume-subpath=witness,volume-nocopy=true,readonly",
                 "--mount", f"type=volume,src={vol2},dst=/data/signer,volume-subpath=signer,volume-nocopy=true,readonly",
-                "xbt-anchor-witness:0.1.0", "check", "--store", "/data/witness", "--log", "/data/signer/.run/signatures.jsonl", check_rc=False)
+                image_of("xbt-anchor-witness"), "check", "--store", "/data/witness", "--log", "/data/signer/.run/signatures.jsonl", check_rc=False)
     check("B", "auditor: the restored witness store checks the restored signature log", wc.returncode == 0, wc.stdout + wc.stderr)
 
     # --- W: Reset the web UI password (the action deletes ui/password.scrypt and restarts) ---------------------------------

@@ -13,7 +13,7 @@ OUT/state.json (mode 600: it holds the test macaroons). Nothing secret is logged
 OUT/results.json as in the off-box drivers.
 
 Before it, on the build host (a throwaway box on the LAN, regtest only; stop all three afterwards):
-    docker run -d -p 127.0.0.1:5000:5000 registry:2       # push the images there as 127.0.0.1:5000/<image>
+    docker run -d -p 127.0.0.1:5000:5000 registry:2       # push the images there as 127.0.0.1:5000/<image>:<tag>
     ssh -N -R 127.0.0.1:5000:127.0.0.1:5000 umbrel@<box>  # the box's Docker reaches it on its own loopback
     make_stores.py OUT_STORES 127.0.0.1:5000 && serve_git.py <LAN ip> <port> OUT_STORES
 Docker allows a plain-http registry on loopback, so nothing on the box changes and nothing is exposed.

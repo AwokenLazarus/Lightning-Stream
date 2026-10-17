@@ -6,7 +6,8 @@ gallery files present, dependencies in this store, a node slot (`bitcoin`) an ap
 of another community store named in OTHER_STORES (Lightning Fork), unique ports, `deterministicPassword` when
 ${APP_PASSWORD} is used.
 Compose: app_proxy's APP_HOST is `<app-id>_<service>_1` of a real service; every volume is under
-${APP_DATA_DIR}; every image is a local one (no registry, nothing pulled); every ${VAR} is provided by umbrelOS,
+${APP_DATA_DIR}; every agentpay image is a published one, ghcr.io/awokenlazarus/<image>:<version>-<commit>@sha256:<digest>,
+the very reference packaging/images.lock pins (the stand-in node's image is the one local image, amd64-only); every ${VAR} is provided by umbrelOS,
 this app's exports or a dependency's exports; a slot's variable (APP_BITCOIN_*, set by whichever node app the
 owner selects) is only used as `${APP_BITCOIN_X:-${FALLBACK}}` with a fallback this store's implementing app
 exports; `docker compose config` accepts the file with those values, and with the slot's values alone.
@@ -27,13 +28,20 @@ from pathlib import Path
 
 import yaml
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from pin_images import REF, load_lock  # noqa: E402
+
 REQUIRED = ["manifestVersion", "id", "category", "name", "version", "tagline", "description", "developer", "website",
             "repo", "support", "port", "gallery", "dependencies", "submitter", "submission"]
 CATEGORIES = {"bitcoin", "lightning", "finance", "networking", "social", "media", "automation", "developer", "ai", "files"}
 # what umbrelOS sets for every app's compose
 UMBREL_VARS = {"APP_DATA_DIR", "APP_SEED", "APP_PASSWORD", "DEVICE_DOMAIN_NAME", "DEVICE_HOSTNAME", "TOR_PROXY_IP", "TOR_PROXY_PORT",
                "APP_HIDDEN_SERVICE"}
-LOCAL_IMAGES = re.compile(r"^(xbt-signer|xbt-anchor-witness|xbt-wallet-mcp|xbt-wallet-ui|xbt-init|xbt-gateway):\d+\.\d+\.\d+$|^xbt-a3-knots:29\.4\.2$")
+# the agentpay images: published, pinned by digest (packaging/images.lock); the registry is this one
+REGISTRY = "ghcr.io/awokenlazarus"
+# the one image of this store that is not published: the stand-in XBT node (lazarus-xbt-knots), amd64-only, which
+# a box with Paul's Knots BLAKE2b Companion never installs
+LOCAL_ONLY = {"lazarus-xbt-knots": re.compile(r"^xbt-a3-knots:29\.4\.2$")}
 # image -> (component sub-dir, run/ dirs it writes, run/ dirs it may mount read-only)
 AGENTPAY = {
     "xbt-signer": ("signer", {"signer"}, {"anchor", "ln"}),
@@ -82,6 +90,11 @@ def main() -> int:
     if not apps:
         bad("no apps")
     ports: dict[int, str] = {}
+    try:
+        pins = load_lock()
+    except (OSError, ValueError) as e:
+        pins = {}
+        bad(f"packaging/images.lock: {e}")
     for folder, (mp, m) in apps.items():
         print(f"== {folder}")
         missing = [k for k in REQUIRED if k not in m]
@@ -154,8 +167,13 @@ def main() -> int:
             if name == "app_proxy":
                 continue
             img = str(s.get("image", ""))
-            if not LOCAL_IMAGES.match(img):
-                bad(f"{folder}/{name}: image {img!r} is not one of the local images (nothing may be pulled)")
+            pin = REF.match(img)
+            if folder in LOCAL_ONLY and LOCAL_ONLY[folder].match(img):
+                pass
+            elif not pin or pin["repo"] != REGISTRY:
+                bad(f"{folder}/{name}: image {img!r} is not {REGISTRY}/<image>:<version>-<commit>@sha256:<digest>")
+            elif pins.get(pin["name"]) != img:
+                bad(f"{folder}/{name}: image {img!r} is not the one packaging/images.lock pins ({pins.get(pin['name'])!r})")
             for v in s.get("volumes") or []:
                 if isinstance(v, dict):
                     if v != CERT_MOUNT:
@@ -166,7 +184,7 @@ def main() -> int:
                     bad(f"{folder}/{name}: volume {v} is not under ${{APP_DATA_DIR}}")
                 if "macaroon" in str(v) or "LIGHTNING" in src:
                     bad(f"{folder}/{name}: mounts the Lightning node's data or a macaroon of it: {v}")
-            base = img.split(":")[0]
+            base = pin["name"] if pin else img.split(":")[0]
             if base == "xbt-init":
                 caps = set(s.get("cap_add") or [])
                 if s.get("network_mode") != "none" or s.get("cap_drop") != ["ALL"] or not caps <= INIT_CAPS or not s.get("read_only"):

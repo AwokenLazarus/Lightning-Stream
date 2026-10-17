@@ -35,7 +35,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from ln_lab import Lab  # noqa: E402
 from regtest_lib import (agent_and_custody, agent_rotation_attempts, leaks, POLICY_BASE, Mcp, Ui, check, docker, http, log, open_log,  # noqa: E402
-                         owner_setup, paid_buy, root_helper, sh, start_proxy, status, wait_until, write_results)
+                         owner_setup, paid_buy, root_helper, sh, start_proxy, status, image_of, test_compose, wait_until, write_results)
 
 OUT, RUN = sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "1"
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -107,6 +107,7 @@ def install(app):
     dst = os.path.join(APPS_DIR, app)
     if not os.path.exists(dst):
         shutil.copytree(os.path.join(STORE, app), dst)
+        test_compose(os.path.join(dst, "docker-compose.yml"))
     compose(app, "up", "-d")
 
 
@@ -355,7 +356,7 @@ def main():
           {"leaks": leaks(seen, new_token), "statuses": [(w, st) for w, st, _, _ in seen]})
     time.sleep(6)
     wc = docker("run", "--rm", "--user", "0", "--network", "none", "-v", f"{wdata}/witness:/data/witness:ro", "-v", f"{wdata}/signer:/data/signer:ro",
-                "xbt-anchor-witness:0.1.0", "check", "--store", "/data/witness", "--log", "/data/signer/.run/signatures.jsonl", check_rc=False)
+                image_of("xbt-anchor-witness"), "check", "--store", "/data/witness", "--log", "/data/signer/.run/signatures.jsonl", check_rc=False)
     check("R", "auditor: the witness's check of the signer's signature log passes", wc.returncode == 0, wc.stdout + wc.stderr)
 
     # --- G: readiness follows the node ------------------------------------------------------------------------

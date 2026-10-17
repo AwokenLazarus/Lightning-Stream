@@ -20,6 +20,19 @@ PORTS=${STARTOS_TEST_PORTS:-24100-24199}
 busy=$(ss -ltnH | awk '{print $4}' | sed 's/.*://' | awk -v lo="${PORTS%-*}" -v hi="${PORTS#*-}" '$1>=lo && $1<=hi' | sort -u | tr '\n' ' ')
 [ -z "$busy" ] || { echo "test-startos: ports busy in $PORTS: $busy" >&2; exit 1; }
 START_CLI=${START_CLI:-$HOME/.local/opt/start-cli/start-cli}
+# The .s9pk files always pack the published images the specs pin (build.sh). The regtest run of the specs'
+# containers takes XBT_TEST_IMAGES: local (default) runs the tree's own build, <image>:0.1.0
+# (scripts/oci_build.sh --load), in their place; pinned runs the published images themselves.
+case ${XBT_TEST_IMAGES:=local} in
+  local)
+    for i in xbt-signer xbt-anchor-witness xbt-wallet-mcp xbt-wallet-ui xbt-init xbt-gateway; do
+      docker image inspect "$i:0.1.0" >/dev/null 2>&1 || { echo "test-startos: image $i:0.1.0 missing (scripts/oci_build.sh --load)" >&2; exit 1; }
+    done ;;
+  pinned) ;;
+  *) echo "test-startos: XBT_TEST_IMAGES is local or pinned" >&2; exit 2 ;;
+esac
+export XBT_TEST_IMAGES
+echo "== images: packed pinned; regtest run $XBT_TEST_IMAGES" | tee "$OUT/images.log"
 
 echo "== build (packaging/startos/build.sh)"
 packaging/startos/build.sh 2>&1 | tee "$OUT/build.log" | grep -E "^== |s9pk$|error|Error" || true
