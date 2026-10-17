@@ -17,8 +17,8 @@ services:
     entrypoint: ["bitcoind"]
     command:
       - -datadir=/data
+      # peers.conf comes from xbt.conf's includeconf: Knots refuses -includeconf on the command line
       - -conf=/etc/xbt/xbt.conf
-      - -includeconf=/etc/xbt/peers.conf
       - -rpcuser=${APP_XBT_KNOTS_RPC_USER}
       - -rpcpassword=${APP_XBT_KNOTS_RPC_PASS}
     volumes:

@@ -11,8 +11,9 @@ image set `scripts/oci_build.sh` makes:
 How they reach the Lightning node, what the owner is asked, how buyers reach a gateway, mainnet and what
 cannot be done yet: `DESIGN.md`. **Local only:** nothing is pushed to a registry, and nothing is submitted
 to the Umbrel App Store or the Start9 marketplace. That submission is the project owner's decision. Both
-have run on regtest only, against Lightning Fork nodes from the regtest lab; neither has been installed on
-a real Umbrel or StartOS box.
+have run on regtest only. On a real umbrelOS 2.0 box both installed from a community store and the wallet
+bought from the gateway with a ticket (`umbrel/realbox/`); on a real StartOS 0.4 server neither starts
+beside Lightning Fork yet (below, and `DESIGN.md` section 6).
 
 The hub was retired on 2026-10-11: payments between parties route over ordinary Lightning instead. Its
 code is in the git history (last at commit 0911cc0). Its Umbrel app, its StartOS toggle and its tests are
@@ -181,13 +182,18 @@ applied there.
   - image users.
 - **Lightning Fork** is played by the regtest lab's nodes (`ln_lab.py`), not by Paul's packages: lf1 is the
   wallet's box's node, lf2 the gateway's.
-- **Neither** replaces an install on a real box. That needs a box the project owner chooses.
+- **Real boxes:** `umbrel/realbox/realbox_umbrel.py` installs, sets up, buys with, restarts and removes both
+  apps on a real umbrelOS 2.0 box through its own API, beside regtest stand-ins for Paul's apps (a second
+  store, `paulscode`, with his app ids and export names); `startos/realbox/realbox_startos.py` does the same on
+  a StartOS 0.4 server with a Lightning Fork stand-in. Both on a LAN test box, regtest only.
 
 ## Side-load (a pilot, when the project owner approves)
 
 - **Umbrel:** `packaging/umbrel/bundle.sh` writes `dist/umbrel/`: the store folder, `images-amd64.tar`,
-  `images-arm64.tar` and `SHA256SUMS`. See its README.txt. umbrelOS adds community stores by git URL, so
-  the store folder goes into a private repo on the LAN. That step is untested here.
+  `images-arm64.tar` and `SHA256SUMS`. See its README.txt. umbrelOS 2.0 pulls every image of an app when it
+  installs it, so the images must be in a registry the box can pull from (`REGISTRY=host:port bundle.sh`
+  names them by it); `docker load` alone ends in "pull access denied". It adds community stores by git URL
+  (smart HTTP), and lists only apps whose id starts with the store's id.
 - **StartOS:** in the StartOS UI, System → Sideload a service, with `dist/startos/xbt-agent-wallet_x86_64.s9pk`
   and/or `dist/startos/lightning-stream-gateway_x86_64.s9pk` (or `_aarch64`). The packages are signed with the
   workspace's developer key, not a Start9 registry key.
@@ -233,8 +239,12 @@ They can, on regtest, with the images of this tree:
 
 They cannot, yet:
 
-- run on a real box: no install on umbrelOS or StartOS was made, and Paul's Lightning Fork and Knots packages
-  were read, not run, here;
+- start on StartOS beside Lightning Fork: StartOS mounts a dependency's directory only, never one file, and
+  Lightning Fork keeps tls.cert at the root of its volume beside its macaroons (`DESIGN.md`, section 6);
+- buy from a gateway on the same box, except through the test profile's shared loopback (Umbrel): the wallet
+  pays tickets over https with a publicly trusted certificate, or to its own machine;
+- be installed from a store by an outside tester on Umbrel until the images are in a registry the tester's box
+  can pull from;
 - reach a seller over Tor: an onion address is plain http, which the wallet does not pay tickets over;
 - give a gateway https on Umbrel by themselves: the owner runs the TLS proxy;
 - pay or sell on mainnet with anything but low caps and the owner's typed acknowledgement, and the wallet's
@@ -242,8 +252,9 @@ They cannot, yet:
 
 ## Not done, and gaps
 
-- No install on a real Umbrel or StartOS box (not done yet). The StartOS build targets StartOS 0.4
-  (`osVersion` 0.4.0-beta.10 in the manifest, start-sdk 2.0.9).
+- Paul's Lightning Fork and Knots packages were read, not run: the real-box runs used regtest stand-ins with
+  their ids, addresses, ports and export names. The StartOS build targets StartOS 0.4 (`osVersion`
+  0.4.0-beta.10 in the manifest, start-sdk 2.0.9); the test server ran 0.4.0.1.
 - The XBT node:
   - on Umbrel, the `bitcoin` slot (Paul's Knots BLAKE2b Companion, or the stand-in, **amd64-only**);
   - on StartOS, an external connection;
@@ -254,5 +265,6 @@ They cannot, yet:
   §10). StartOS also keeps the delete-and-restart action.
 - The StartOS package's text is English only; other locales fall back to it. Translations, gallery images
   and icons are store-submission work.
-- The images are referenced by tag (`:0.1.0`) and side-loaded with `docker load`. A store needs registry
-  images pinned by digest (`dist/oci/IMAGES.md` has the index digests).
+- The images are referenced by tag (`:0.1.0`). umbrelOS pulls them on install, so a store needs them in a
+  registry, pinned by digest (`dist/oci/IMAGES.md` has the index digests); the real-box run used a registry on
+  the build host's loopback, tunnelled to the box's.

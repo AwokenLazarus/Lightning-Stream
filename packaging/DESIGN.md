@@ -25,7 +25,8 @@ which is why section 5 makes mainnet a separate, deliberate step.
 
 **Credentials.** Neither package ever holds an admin macaroon. The package mounts exactly one file
 of the Lightning node's, `tls.cert`, read-only (Umbrel: a single-file bind mount that refuses to
-create a missing path; StartOS: `mountDependency` with `type: 'file'`), and pins it. The owner bakes
+create a missing path; StartOS: `mountDependency` with `type: 'file'`, which StartOS 0.4 refuses: see
+section 6), and pins it. The owner bakes
 the macaroons in Lightning Fork's own dashboard and pastes them (hex) into this package's setup page:
 
 | for | permissions | file in the package's data |
@@ -123,13 +124,22 @@ signer's chain is `main` unless the owner types the acknowledgement.
 
 ## 6. What cannot be done yet
 
-- **No install on a real Umbrel or StartOS box.** The tests imitate each platform on plain Docker,
-  against Lightning Fork nodes from the regtest lab; Paul's packages themselves are read, not run.
-- **No dependency on Lightning Fork can be declared and tested end to end here.** The Umbrel manifest
-  names `paulscode-lightning-fork`, which lives in another community store (umbrelOS resolves
-  dependencies by installed app id, so this should work; not tried on a box). The StartOS manifest
-  declares `lightning-fork` as a dependency; the container address and single-file mount are from
-  the SDK, not tried on a box.
+- **Real boxes, regtest only.** On a real umbrelOS 2.0 box both apps installed from a community store
+  through the dashboard's API, beside regtest stand-ins with the ids and export names of Paul's apps in
+  a second store (`paulscode`): the dependency on `paulscode-lightning-fork` across stores and the
+  `bitcoin` slot resolve as designed, and the wallet bought from the gateway with a ticket, again after
+  a restart and a reboot. Paul's packages themselves were not run (they follow mainnet only).
+- **StartOS mounts a dependency's directory, never one file.** StartOS 0.4 refuses file mounts of a
+  dependency's volume (start-sdk 3.0 removed the option), so the single-file mount of Lightning Fork's
+  `tls.cert` fails ("mount exited with exit status: 32") and neither package starts while Lightning
+  Fork is installed. Lightning Fork keeps `tls.cert` at the root of its `main` volume, beside its
+  macaroons and wallet, so mounting that directory would hand the packages the admin macaroon. A test
+  profile with the certificate alone in a sub-directory, mounted as a directory, ran: the Lightning
+  page showed the container address and the pinned certificate, and the rail was ready. The fix is
+  Lightning Fork's (the certificate in a directory of its own) or a copy made at start; not decided.
+- **One box cannot buy from itself, except through loopback.** On Umbrel the test profile puts the
+  wallet's signer in the gateway's network namespace, as the off-box tests do. On StartOS each package
+  is its own container and there is one Lightning node, so a buy needs a second box.
 - **The certificate is read at start.** When StartOS reissues Lightning Fork's certificate (its
   container address changed), the pin fails until the watched file changes and the child restarts;
   the supervisor does that, but it was not exercised on StartOS.

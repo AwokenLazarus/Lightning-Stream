@@ -10,8 +10,8 @@ ${APP_DATA_DIR}; every image is a local one (no registry, nothing pulled); every
 this app's exports or a dependency's exports; a slot's variable (APP_BITCOIN_*, set by whichever node app the
 owner selects) is only used as `${APP_BITCOIN_X:-${FALLBACK}}` with a fallback this store's implementing app
 exports; `docker compose config` accepts the file with those values, and with the slot's values alone.
-Hardening (docs/CONTAINER.md): the agentpay services run read-only, cap_drop ALL, no-new-privileges, as their
-image's non-root user, and mount only their own sub-dir plus the dirs they need (a peer's read-only); of the
+Hardening (docs/CONTAINER.md): the agentpay services run read-only, cap_drop ALL, no-new-privileges, under an init
+(init: true), as their image's non-root user, and mount only their own sub-dir plus the dirs they need (a peer's read-only); of the
 Lightning node's data, only its tls.cert, read-only, as a bind that never creates a missing path; no
 admin macaroon. `init` (xbt-init) is the only root container: no network, at most CHOWN/FOWNER/DAC_OVERRIDE.
     python3 packaging/umbrel/lint.py [STORE_DIR]
@@ -179,6 +179,8 @@ def main() -> int:
                     bad(f"{folder}/{name}: needs read_only, cap_drop ALL, no-new-privileges")
                 if "user" in s:
                     bad(f"{folder}/{name}: must run as its image's own user (no user: override; CONTAINER.md uid table)")
+                if s.get("init") is not True:
+                    bad(f"{folder}/{name}: needs init: true (the binary as PID 1 ignores SIGTERM, so a stop waits out the grace period and kills it)")
                 if (s.get("depends_on") or {}).get("init", {}).get("condition") != "service_completed_successfully":
                     bad(f"{folder}/{name}: must wait for init (service_completed_successfully)")
                 allowed = {f"${{APP_DATA_DIR}}/data/{comp}:/data/{comp}"}
