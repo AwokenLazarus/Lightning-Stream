@@ -192,6 +192,22 @@ applied there.
   and/or `dist/startos/lightning-stream-gateway_x86_64.s9pk` (or `_aarch64`). The packages are signed with the
   workspace's developer key, not a Start9 registry key.
 
+## Size and memory
+
+Hardware: the floor is a Raspberry Pi 4 (arm64) running umbrelOS beside a pruned Knots node and Lightning
+Fork; the top is an x86_64 server. Pass lines, set before measuring:
+
+| what | pass line | how measured |
+|---|---|---|
+| each image, amd64, compressed | at most 10 MB | `dist/oci/IMAGES.md` (the OCI archive's layers) |
+| the wallet app's images, amd64, compressed | at most 15 MB | the sum of init, witness, signer, MCP, UI |
+| the gateway app's images, amd64, compressed | at most 6 MB | the sum of init, gateway, UI |
+| the wallet app idle | at most 64 MiB | `docker stats --no-stream` memory of its four services, after the paid buy and 60 s idle |
+| the gateway app idle | at most 32 MiB | the same for the gateway and its UI |
+
+Measured: see the evidence of the latest Umbrel run (`run/umbrel-test/latest/run1/memory.json`). The Pi floor
+was not measured: no Pi was reached; the arm64 and arm/v7 images were built and inspected only.
+
 ## What a packaged wallet and gateway can do, and cannot
 
 They can, on regtest, with the images of this tree:
