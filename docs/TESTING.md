@@ -51,8 +51,9 @@ ulimit -n 4096                   # the tests open many connections at once
 
 Run one lab at a time: each takes a block of loopback ports and its own containers, and removes
 its containers and volumes when it ends. The head of each script lists its ports, its settings
-and its environment variables. If the knots image (`knots-blake2b:final-zmq`) is not on your
-machine yet, the first lab also builds it, which adds time we did not measure on a clean machine.
+and its environment variables. The first lab also builds the chain node's image
+(`knots-blake2b:final-zmq`) from source when it is not there yet: that took 4 minutes on four
+cores, on top of the times above.
 
 What each step writes, under `run/` (ignored by git):
 
