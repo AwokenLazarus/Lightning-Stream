@@ -33,6 +33,9 @@ or removed.
 
 Whitepaper: **<https://lazarus-xbt.xyz/stream/>**
 
+**To try it**: [`docs/TESTING.md`](docs/TESTING.md) is the guide for an outside tester: build it,
+run the regtest labs and the film demo on your own machine, and report what broke.
+
 Lightning Stream adds little of its own to a great deal of other people's work. What it is
 built on and what came before it are under [Built on](#built-on) and [Prior art](#prior-art);
 the full list, with a link for each, is [`docs/REFERENCES.md`](docs/REFERENCES.md).
