@@ -24,6 +24,41 @@ RESULTS = []
 LOG = None
 
 
+# Which images the regtest drivers run: "local" (default) the tree's own build, <image>:<version> as
+# scripts/oci_build.sh --load tags it; "pinned" the published images exactly as the packages name them
+# (packaging/images.lock, pulled by digest).
+TEST_IMAGES = os.environ.get("XBT_TEST_IMAGES", "local")
+PINNED = re.compile(r"^[a-z0-9.:/-]+/(xbt-[a-z0-9-]+):([0-9]+\.[0-9]+\.[0-9]+)-[0-9a-f]{12}@sha256:[0-9a-f]{64}$")
+
+
+def test_image(ref):
+    """The image a driver runs for a package's reference: the local build's tag unless XBT_TEST_IMAGES=pinned."""
+    if TEST_IMAGES not in ("local", "pinned"):
+        raise SystemExit(f"XBT_TEST_IMAGES={TEST_IMAGES!r}: local or pinned")
+    m = PINNED.match(ref)
+    return f"{m.group(1)}:{m.group(2)}" if m and TEST_IMAGES == "local" else ref
+
+
+def image_of(name):
+    """The image a driver runs for one of the agentpay images, by name (packaging/images.lock)."""
+    with open(os.path.join(ROOT, "packaging", "images.lock")) as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) == 2 and parts[0] == name:
+                return test_image(parts[1])
+    raise SystemExit(f"packaging/images.lock has no {name}")
+
+
+def test_compose(path):
+    """Rewrite an installed copy of a compose file to the images test_image() picks (the store is untouched)."""
+    with open(path) as f:
+        text = f.read()
+    new = re.sub(r"(?m)^(    image: )(\S+)$", lambda m: m.group(1) + test_image(m.group(2)), text)
+    if new != text:
+        with open(path, "w") as f:
+            f.write(new)
+
+
 def open_log(path):
     global LOG
     LOG = open(path, "a")

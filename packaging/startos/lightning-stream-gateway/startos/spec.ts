@@ -45,11 +45,14 @@ export type Config = {
 
 export const LIGHTNING = { packageId: 'lightning-fork', restPort: 8080, cert: '/data/lightning/tls.cert' } as const
 
-/** The local image tags (scripts/oci_build.sh --load); the image set Umbrel and the wallet package use. */
+/**
+ * The published images, pinned by digest (packaging/images.lock; packaging/pin_images.py writes them);
+ * the image set Umbrel and the wallet package use.
+ */
 export const IMAGES: Record<ImageKey, string> = {
-  init: 'xbt-init:0.1.0',
-  gateway: 'xbt-gateway:0.1.0',
-  ui: 'xbt-wallet-ui:0.1.0',
+  init: 'ghcr.io/awokenlazarus/xbt-init:0.1.0-cc28002e474e@sha256:dd00b3194dd4c32e955aeae8b729b1e7460ce3f57214eda878f24e2b3c0c276b',
+  gateway: 'ghcr.io/awokenlazarus/xbt-gateway:0.1.0-cc28002e474e@sha256:2890c98a4aefd545c08b78b882111d9435fbb43058fe2098d13b80f28d3c214f',
+  ui: 'ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-cc28002e474e@sha256:c71d62e384b01b3910d50c21c4f4ff3bc59b847806c0a9b04cc30b130ff6ea53',
 }
 
 const vol = (subpath: string | null, mountpoint: string, readonly = false): MountSpec => ({ subpath, mountpoint, readonly })

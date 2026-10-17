@@ -209,9 +209,15 @@ None of these binaries depends on systemd. `$CREDENTIALS_DIRECTORY` is just one 
 `xbt-signer`, `xbt-anchor-witness`, `xbt-wallet-mcp`, `xbt-wallet-ui`, `xbt-init`, `xbt-work-relay` and
 `xbt-gateway` (`--only IMAGE,...` builds a subset; the binaries come from `$CARGO_TARGET_DIR`). Each
 is `FROM scratch` with the static musl binary (built with zig). There is no `RUN`, so no emulator or
-binfmt is needed. The images are saved as OCI archives in `dist/oci/*.tar` (never pushed), with digests
-and sizes in `dist/oci/IMAGES.md`. `scripts/oci_inspect.py` checks every platform: architecture, static
-ELF, non-root, HEALTHCHECK, two layers, and the shared base layer.
+binfmt is needed. The images are saved as OCI archives in `dist/oci/*.tar`, with digests and sizes in
+`dist/oci/IMAGES.md`. `scripts/oci_inspect.py` checks every platform: architecture, static ELF, non-root,
+HEALTHCHECK, two layers, and the shared base layer.
+
+`scripts/oci_publish.sh` (run by the hand-started "Publish images" workflow) pushes the six images the
+Umbrel and StartOS packages run, all but `xbt-work-relay`, to `ghcr.io/awokenlazarus/<image>:<version>-<commit>`
+from the same build, checks that the registry serves the index of the inspected archive, and records the
+digests in `packaging/images.lock`. The packages pin those images by digest; how to check one, and what has
+not been checked (reproducible builds), is in `packaging/README.md`, "Images".
 
 - **Layer 1** is shared and byte-identical in every image and platform, so it is stored once:
   `/etc/passwd`, `/etc/group`, `/tmp` (1777), and the `/data` skeleton with owners. It is generated

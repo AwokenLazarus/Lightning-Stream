@@ -63,13 +63,16 @@ export const LIGHTNING = {
   macaroon: '/data/run/ln/rail.macaroon',
 } as const
 
-/** The local image tags (scripts/oci_build.sh --load); one image set for Umbrel, StartOS and xbt-compute. */
+/**
+ * The published images, pinned by digest (packaging/images.lock; packaging/pin_images.py writes them);
+ * one image set for Umbrel, StartOS and xbt-compute.
+ */
 export const IMAGES: Record<ImageKey, string> = {
-  init: 'xbt-init:0.1.0',
-  signer: 'xbt-signer:0.1.0',
-  witness: 'xbt-anchor-witness:0.1.0',
-  mcp: 'xbt-wallet-mcp:0.1.0',
-  ui: 'xbt-wallet-ui:0.1.0',
+  init: 'ghcr.io/awokenlazarus/xbt-init:0.1.0-cc28002e474e@sha256:dd00b3194dd4c32e955aeae8b729b1e7460ce3f57214eda878f24e2b3c0c276b',
+  signer: 'ghcr.io/awokenlazarus/xbt-signer:0.1.0-cc28002e474e@sha256:68823bb1e1895807c42aa90df2f2658ead4eaa7fd7b3630540fd41433fd9a011',
+  witness: 'ghcr.io/awokenlazarus/xbt-anchor-witness:0.1.0-cc28002e474e@sha256:f09ab563ba4571055e52f0d9139c01057b2aa07c45d44ef82307a85daf57abe8',
+  mcp: 'ghcr.io/awokenlazarus/xbt-wallet-mcp:0.1.0-cc28002e474e@sha256:bca54d260f3a3edb8ff2b14f278bcaa9f6ff5a2156ca9a8d8d6f7f6cef433ebe',
+  ui: 'ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-cc28002e474e@sha256:c71d62e384b01b3910d50c21c4f4ff3bc59b847806c0a9b04cc30b130ff6ea53',
 }
 
 const vol = (subpath: string | null, mountpoint: string, readonly = false): MountSpec => ({ subpath, mountpoint, readonly })

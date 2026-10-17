@@ -22,9 +22,21 @@ mkdir -p "$OUT"
 PORTS=${UMBREL_TEST_PORTS:-24000-24099}
 busy=$(ss -ltnH | awk '{print $4}' | sed 's/.*://' | awk -v lo="${PORTS%-*}" -v hi="${PORTS#*-}" '$1>=lo && $1<=hi' | sort -u | tr '\n' ' ')
 [ -z "$busy" ] || { echo "test-umbrel-apps: ports busy in $PORTS: $busy" >&2; exit 1; }
-for i in xbt-signer xbt-anchor-witness xbt-wallet-mcp xbt-wallet-ui xbt-init xbt-gateway; do
-  docker image inspect "$i:0.1.0" >/dev/null 2>&1 || { echo "test-umbrel-apps: image $i:0.1.0 missing (scripts/oci_build.sh --load)" >&2; exit 1; }
-done
+# XBT_TEST_IMAGES=local (default): the apps run the tree's own build, <image>:0.1.0 (scripts/oci_build.sh --load),
+# in place of the published images the store pins; =pinned: the published images themselves, pulled by digest.
+case ${XBT_TEST_IMAGES:=local} in
+  local)
+    for i in xbt-signer xbt-anchor-witness xbt-wallet-mcp xbt-wallet-ui xbt-init xbt-gateway; do
+      docker image inspect "$i:0.1.0" >/dev/null 2>&1 || { echo "test-umbrel-apps: image $i:0.1.0 missing (scripts/oci_build.sh --load)" >&2; exit 1; }
+    done ;;
+  pinned)
+    for ref in $(awk '!/^#/ && NF == 2 {print $2}' packaging/images.lock); do
+      docker image inspect "$ref" >/dev/null 2>&1 || docker pull -q "$ref" >/dev/null || { echo "test-umbrel-apps: cannot pull $ref" >&2; exit 1; }
+    done ;;
+  *) echo "test-umbrel-apps: XBT_TEST_IMAGES is local or pinned" >&2; exit 2 ;;
+esac
+export XBT_TEST_IMAGES
+echo "== images: $XBT_TEST_IMAGES" | tee "$OUT/images.log"
 
 echo "== lint the store" | tee "$OUT/lint.log"
 python3 packaging/umbrel/lint.py packaging/umbrel 2>&1 | tee -a "$OUT/lint.log"
@@ -32,9 +44,10 @@ echo "== lint catches a broken app (a copy with the signer run as the box user)"
 NEG=$(mktemp -d)
 cp -r packaging/umbrel/. "$NEG/"
 python3 - "$NEG/lazarus-xbt-agent-wallet/docker-compose.yml" <<'PY'
-import sys
+import re, sys
 p = sys.argv[1]
-s = open(p).read().replace("    image: xbt-signer:0.1.0\n", "    image: xbt-signer:0.1.0\n    user: \"1000:1000\"\n", 1)
+s, n = re.subn(r"(?m)^(    image: \S*/xbt-signer:\S+\n)", r'\1    user: "1000:1000"\n', open(p).read(), count=1)
+assert n == 1
 open(p, "w").write(s)
 PY
 if python3 packaging/umbrel/lint.py "$NEG" >>"$OUT/lint.log" 2>&1; then echo "lint missed the broken app" | tee -a "$OUT/lint.log"; rm -rf "$NEG"; echo "RESULT FAIL"; exit 1; fi

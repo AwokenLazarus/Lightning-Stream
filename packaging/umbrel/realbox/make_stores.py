@@ -8,8 +8,10 @@ Writes OUT/lazarus.git and OUT/paulscode.git, bare repositories (`git update-ser
 store's id, so the apps of another author live in a store of that author's id.
 
 OUT/lazarus: the wallet and the gateway of packaging/umbrel, changed only in this:
-  * every image is REGISTRY/<image>: umbreld `docker pull`s every image of an app on install, so a `docker
-    load`ed image fails ("pull access denied"); the box reaches REGISTRY (a registry on loopback, tunnelled);
+  * every image is REGISTRY/<image>:<tag>: umbreld `docker pull`s every image of an app on install, so a
+    `docker load`ed image fails ("pull access denied"); the box reaches REGISTRY (a registry on loopback,
+    tunnelled). The store pins the published images by digest; here the digest is dropped, because an image
+    pushed to REGISTRY one platform at a time has a manifest of its own (packaging/umbrel/bundle.sh);
   * the wallet's signer runs in the gateway's network namespace, as in the off-box test overlay
     (regtest/lazarus-xbt-agent-wallet.yml): the wallet pays tickets over https or to its own machine only,
     and trusts only public certificate authorities, so on one box with no public https name the buyer
@@ -81,7 +83,8 @@ def lazarus(out, reg):
         def change(c, app=app):
             for s in c["services"].values():
                 if "image" in s:
-                    s["image"] = f"{reg}/{s['image']}"
+                    # the pinned ghcr.io reference as REGISTRY/<image>:<tag>, the digest dropped as bundle.sh does
+                    s["image"] = f"{reg}/{s['image'].split('@')[0].rsplit('/', 1)[-1]}"
             if app == "lazarus-xbt-agent-wallet":
                 c["services"]["signer"]["network_mode"] = "container:lazarus-lightning-stream-gateway_gateway_1"
         edit_compose(os.path.join(store, app, "docker-compose.yml"), change)
