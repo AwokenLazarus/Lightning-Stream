@@ -390,7 +390,7 @@ impl Signer {
     /// Whether the owner named this seller: its node id on the allowlist (`ln:<node id>`), or an
     /// allowlisted origin whose `counterparties` entry names the node (`ln_node`). The origin is
     /// the caller's word, so it counts only where the owner tied it to this node id.
-    fn ticket_listed(&self, cfg: &PolicyConfig, payee: &str, origin: &str) -> bool {
+    pub(crate) fn ticket_listed(&self, cfg: &PolicyConfig, payee: &str, origin: &str) -> bool {
         let allow = cfg.normalized_allowlist();
         if allow.contains(&format!("ln:{payee}")) {
             return true;
@@ -1954,7 +1954,7 @@ impl Signer {
 
     /// Whether the wallet's node has an active channel of its own to `payee`: a win paid over it
     /// meets no routing node and pays no fee. False when the channels cannot be read.
-    fn ln_direct_to(&self, payee: &str) -> bool {
+    pub(crate) fn ln_direct_to(&self, payee: &str) -> bool {
         let Some(ln) = self.ln.clone() else { return false };
         ln.channels().is_ok_and(|cs| cs.iter().any(|c| c.get("active").and_then(Value::as_bool) == Some(true) && str_or_empty(c.get("remote_pubkey")).eq_ignore_ascii_case(payee)))
     }

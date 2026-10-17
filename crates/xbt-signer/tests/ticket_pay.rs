@@ -2514,6 +2514,17 @@ fn tickets_for_a_seller_one_stays_with_draws_for_a_small_call_and_the_owner_can_
     let v = r.pay(&format!("/pieces/{}", 4 * PIECE), 3_999);
     assert_eq!((v["rail"].as_str(), v["draws"].as_u64()), (Some("lottery"), Some(4)), "{v}");
     assert!(r.tap.seen("/x402/ticket/").is_empty());
+    // a call so small that it expects fewer than four wins of 64 sat (255 sat or less, as shipped): its cost would be
+    // mostly luck, and the seller offers prepaid tickets beside its held ones, so it is paid with a ticket. FAILS
+    // before the owner's tickets.lottery.min_expected_wins: such a call was paid by draws
+    let r = draws_rig(json!({}));
+    let v = r.pay(&format!("/pieces/{PIECE}"), 255);
+    assert_eq!(v["rail"], "ticket", "{v}");
+    assert!(r.tap.seen("/x402/lottery/").is_empty());
+    let v = draws_rig(json!({})).pay(&format!("/pieces/{PIECE}"), 256);
+    assert_eq!(v["rail"], "lottery", "four wins expected: {v}");
+    let r = draws_rig(json!({"tickets": {"lottery": {"min_expected_wins": 0}}}));
+    assert_eq!(r.pay(&format!("/pieces/{PIECE}"), 255)["rail"], "lottery", "the owner turned the rule off");
     // the owner turned the lottery off: tickets, and no lottery endpoint is asked
     let r = draws_rig(json!({"tickets": {"lottery": {"enabled": false}}}));
     let v = r.pay(&format!("/pieces/{}", 4 * PIECE), 100);
@@ -2540,13 +2551,16 @@ fn tickets_for_a_seller_one_stays_with_draws_for_a_small_call_and_the_owner_can_
 fn the_owners_bounds_hold_for_draws_and_spend_is_what_the_node_paid() {
     let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
     // a budget below one win and its fee can pay nothing at all: said before anything is asked of the seller's session
-    let r = draws_rig(json!({"tickets": {"tasks": {"film": {"budget_sats": 60}}}}));
+    // (calls this small are paid with a ticket as shipped, since they expect fewer than four wins: the rule is off
+    // here, where what is tested is the draws)
+    let few = json!({"min_expected_wins": 0});
+    let r = draws_rig(json!({"tickets": {"lottery": few, "tasks": {"film": {"budget_sats": 60}}}}));
     let v = r.pay(&format!("/pieces/{PIECE}"), 50);
     assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("ticket_task_budget")), "{v}");
     assert!(r.tap.seen("/x402/lottery/").is_empty() && r.ledger().is_empty());
     // a call's max_sats bounds what it uses by the wallet's own count: 10 sat is 5 pieces, and the wallet reads no
     // further than the read that reached it
-    let r = draws_rig(json!({}));
+    let r = draws_rig(json!({"tickets": {"lottery": few}}));
     let v = r.pay(&format!("/pieces/{}", 64 * PIECE), 10);
     let used: u64 = v["price_msat"].as_str().unwrap().parse().unwrap();
     assert!(v["complete"] == false && v["ended"].as_str().unwrap().contains("max_sats"), "{v}");
@@ -2580,7 +2594,8 @@ fn the_owners_bounds_hold_for_draws_and_spend_is_what_the_node_paid() {
     assert!(wins >= 2, "384 draws at 1 in 32: {wins} wins");
     assert_wins(&r, wins);
     // a seller the owner has not named: a win of 250 sat at most, and so many wins a window
-    let r = Rig::with(json!({"tickets": {"lottery": {"unlisted_max_wins": 1, "unlisted_max_win_sats": 32, "routed_floor_sats": 16}}}), false, true, 30, draws_shop());
+    let r = Rig::with(json!({"tickets": {"unlisted_private": true, "lottery": {"unlisted_max_wins": 1, "unlisted_max_win_sats": 32, "routed_floor_sats": 16}}}), false, true,
+                      30, draws_shop());
     let pay = |path: &str, max: i64| r.call("xbt402_pay", json!({"url": r.shop.url(path), "max_sats": max, "task": "swarm"}));
     let v = pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
     assert_eq!((v["rail"].as_str(), v["win_msat"].as_str()), (Some("lottery"), Some("32000")), "the owner's cap for a seller it has not named: {v}");
@@ -2742,8 +2757,9 @@ fn a_win_whose_payment_fails_is_owed_until_the_sellers_next_invoice_and_never_pa
     assert!(pending.iter().all(|d| settled.iter().filter(|s| *s == d).count() == 1), "each win that was owed has one payment that settled: {settled:?}");
     // a payment the node can say nothing about for good (a node killed as it sent it can go on calling it in flight):
     // the wallet does not pay that win again, the seller waits for it, and the session cannot go on. It ends plainly,
-    // the payment stays booked, and the next call is served in a new session
-    let r = draws_rig(json!({"ln": {"timeout_s": 1}, "tickets": {"lottery": {"max_odds_den": 2}}}));
+    // the payment stays booked, and the next call is served in a new session (of draws: the small calls' rule of
+    // four expected wins is off here)
+    let r = draws_rig(json!({"ln": {"timeout_s": 1}, "tickets": {"lottery": {"max_odds_den": 2, "min_expected_wins": 0}}}));
     r.ln.st.lock().unwrap().router_down = true;
     let v = r.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
     let in_doubt = v["wins_unpaid"].as_array().unwrap().iter().filter(|w| w["rule"] == "lottery_win_pending").count() as i64;
@@ -2885,7 +2901,7 @@ fn a_killed_signer_or_gateway_ends_a_session_of_draws_plainly_and_pays_no_win_tw
 #[test]
 fn an_answer_priced_by_the_second_is_a_draw_for_every_second_it_was_open() {
     let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
-    let r = draws_rig(json!({}));
+    let r = draws_rig(json!({"tickets": {"lottery": {"min_expected_wins": 0}}}));  // calls of a few sat: draws, the rule of four expected wins off
     // 1 KiB every 100 ms with no length stated: 25 KiB is open for two and a half seconds, at 1 sat a second
     let mut sid = String::new();
     for n in 0..6 {
@@ -2907,10 +2923,38 @@ fn an_answer_priced_by_the_second_is_a_draw_for_every_second_it_was_open() {
     assert!(r.tap.seen("/x402/lottery/draw").iter().all(|s| !s.body.contains("\"bytes\"")), "no piece of bytes on a route priced by the second");
 }
 
+/// However many pieces arrive at once, the wallet gives no more values beyond the last reveal it
+/// has checked than the owner's `tickets.lottery.ahead` (8): the rest wait for the next round.
+///
+/// FAILS before: the cap was raised to the number of pieces that had arrived, so a seller that
+/// served a burst of 32 pieces got 32 values in one request, with no reveal for any of them yet.
+#[test]
+fn a_burst_of_pieces_gets_no_more_values_ahead_of_a_reveal_than_the_owner_allows() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    // a seller that serves 32 pieces ahead of the values it has, where the gateway ships 8
+    let shop = json!({"tickets": {}, "caps": {"sessions_per_address": 0}, "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 2, "window": 32}});
+    let r = Rig::shipped(json!({}), 30, shop);
+    // its first answer to a draw is slow: the pieces that arrive meanwhile wait for the wallet's next round
+    let slow = Arc::new(AtomicUsize::new(0));
+    let s2 = slow.clone();
+    r.tap.set(Box::new(move |seen, real| {
+        if seen.path.starts_with("/x402/lottery/draw") && s2.fetch_add(1, Ordering::SeqCst) == 0 {
+            std::thread::sleep(Duration::from_millis(400));
+            return Some(real());
+        }
+        None
+    }));
+    let v = r.pay(&format!("/pieces/{}", 40 * PIECE), 1_000);
+    assert_eq!((v["rail"].as_str(), v["complete"].as_bool(), v["draws"].as_u64()), (Some("lottery"), Some(true), Some(40)), "{v}");
+    let most = r.tap.seen("/x402/lottery/draw").iter().map(|s| serde_json::from_str::<Value>(&s.body).unwrap()["values"].as_array().map_or(0, Vec::len)).max().unwrap();
+    assert!(most <= 8, "a request carried {most} values ahead of any reveal");
+    assert_wins(&r, v["wins_paid"].as_u64().unwrap());
+}
+
 #[test]
 fn a_piece_whose_hash_the_caller_named_gets_its_value_only_if_it_matches() {
     let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
-    let r = draws_rig(json!({}));
+    let r = draws_rig(json!({"tickets": {"lottery": {"min_expected_wins": 0}}}));  // calls of a few sat: draws, the rule of four expected wins off
     let size = 8 * PIECE + 100;
     let all: Vec<u8> = (0..size).map(pattern).collect();
     let mut hashes: Vec<String> = all.chunks(PIECE).map(|c| hex::encode(Sha256::digest(c))).collect();

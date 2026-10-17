@@ -639,20 +639,26 @@ impl Signer {
             _ => None,
         });
         let ticket = ways.iter().find_map(|o| match o {
-            Offer::Ticket(acc, _) => Terms::parse(acc, lightning).ok(),
+            Offer::Ticket(acc, prepaid) => Terms::parse(acc, lightning).ok().map(|t| (t, prepaid.is_some())),
             _ => None,
         });
+        let prepaid_entry = ticket.as_ref().is_some_and(|(t, beside)| *beside || t.settle == crate::ticket::Settle::OnArrival);
+        let ticket = ticket.map(|(t, _)| t);
         let Some(draw) = draw else { return false };
         let task = c.task.as_deref().unwrap_or("");
         let payee = draw.payee.clone();
+        let expect_msat = (c.max_sats.max(0) as u64).saturating_mul(1000);
+        // the win a session would be opened with, as the book sizes it
+        let listed = self.ticket_listed(&self.config(), &draw.payee, c.origin);
+        let win_msat = crate::lottery::win_size(&draw, &tp.lottery, listed, expect_msat, self.ln_direct_to(&draw.payee)).unwrap_or(0);
         crate::lottery::choose(&crate::lottery::Choice {
             ticket_entry: ticket.is_some(), lottery_entry: true, lottery_on: tp.lottery.enabled,
             meter: tp.tasks.get(task).map_or(crate::lottery::Meter::Auto, |t| t.meter),
             // a session this process pays this origin by draws is the one that is open; else what the book holds open with the seller's node
             open: if lock(&self.draw_http).contains_key(c.origin) { Some(true) } else { self.ticket_open_kind(&payee, c.origin) },
             dearest_msat: draw.dearest_piece().unwrap_or(u64::MAX), ticket_msat: ticket.as_ref().map_or(u64::MAX, |t| t.ticket_msat),
-            expect_msat: (c.max_sats.max(0) as u64).saturating_mul(1000), held_fits: ticket.is_some() && self.ticket_held_fits(task),
-            stay_tickets: tp.lottery.stay_tickets.max(1) as u64 })
+            expect_msat, held_fits: ticket.is_some() && self.ticket_held_fits(task),
+            stay_tickets: tp.lottery.stay_tickets.max(1) as u64, prepaid_entry, win_msat, min_wins: tp.lottery.min_expected_wins.max(0) as u64 })
     }
 
     /// A single Lightning payment the seller's 402 asks for: `extra.invoice`, paid as `ln_pay` pays

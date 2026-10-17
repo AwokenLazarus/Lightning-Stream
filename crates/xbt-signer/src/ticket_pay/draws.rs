@@ -163,6 +163,9 @@ struct Round {
     wins: Vec<(Win, Option<String>)>,
     /// The seller did not answer, or did not know a piece yet: the same values are sent again.
     again: bool,
+    /// Pieces given no value in this round: as many values wait for a reveal as the owner's
+    /// `tickets.lottery.ahead` allows. They go back to the front of what is pending.
+    left: Vec<Piece>,
 }
 
 /// What one call counted: for its reply.
@@ -399,6 +402,7 @@ impl Signer {
     /// was stopped. This is the only place a [`Win`] comes from.
     fn draw_round(&self, ds: &DrawSession, pieces: &[Piece], voids: &[PieceId], ask: bool, counted: &Mutex<Counted>) -> std::result::Result<Round, Value> {
         let ahead = self.ticket_policy().lottery.ahead.max(1) as u64;
+        let mut left: Vec<Piece> = vec![];
         let values: Vec<Value> = {
             let mut s = lock(&ds.state);
             let st = &mut *s;
@@ -407,8 +411,14 @@ impl Signer {
                 buyer.void(*id);
             }
             for p in pieces {
+                // no more values beyond the last reveal than the owner allows, however many pieces came at once: the rest
+                // wait for the next round, which this one's reveal makes room for
+                if buyer.open().count() as u64 >= ahead {
+                    left.push(*p);
+                    continue;
+                }
                 // fresh random bytes of the wallet's own, made now: after the piece arrived, and from nothing the seller has seen
-                match buyer.issue(*p, random_bytes::<32>(), ahead.max(pieces.len() as u64)) {
+                match buyer.issue(*p, random_bytes::<32>(), ahead) {
                     Ok(_) => {
                         st.draws += 1;
                         st.used_msat = st.used_msat.saturating_add(p.amount_msat);
@@ -427,18 +437,18 @@ impl Signer {
         };
         // with nothing to send, the seller is asked only where the caller wants its list of unpaid wins (`ask`)
         if values.is_empty() && voids.is_empty() && !ask {
-            return Ok(Round { wins: vec![], again: false });
+            return Ok(Round { wins: vec![], again: false, left });
         }
         let void: Vec<Value> = voids.iter().map(|id| json!({"seq": id.seq, "kind": id.kind.name(), "k": id.k})).collect();
         let (status, v, receipt) = match self.draw_call(ds, "draw", &json!({"values": values, "void": void})) {
             Ok(x) => x,
             // no answer: the values are kept, and the same ones are sent again
-            Err(_) => return Ok(Round { wins: vec![], again: true }),
+            Err(_) => return Ok(Round { wins: vec![], again: true, left }),
         };
         if let Err(why) = &receipt {
             let code = protocol_code(v.get("error"));
             if status >= 500 {
-                return Ok(Round { wins: vec![], again: true });
+                return Ok(Round { wins: vec![], again: true, left });
             }
             if code == "session_unknown" {
                 self.draw_stop(ds, "the seller has forgotten the session", false);
@@ -468,6 +478,10 @@ impl Signer {
             Some(code) if code == DrawError::PieceUnknown.code() => true,
             Some(code) => return Err(self.draw_fault(ds, &format!("the seller refused a value the wallet gave for a piece it received: {code}"))),
         };
+        // pieces waited for room, and the seller took every value and revealed none of them: it gets no more
+        if !left.is_empty() && !again && lock(&ds.state).buyer.as_ref().is_some_and(|b| b.open().count() as u64 >= ahead) {
+            return Err(self.draw_fault(ds, &format!("the seller has {ahead} values and reveals for none of them: no value is given for a further piece")));
+        }
         // the seller's list of unpaid wins: an invoice counts only for a draw the wallet itself found won
         // a win that was handed to the payer and whose payment the book now shows failed (a payment that was not
         // final when the payer stopped waiting, and that the wallet's node then failed or never had) is owed again
@@ -532,7 +546,7 @@ impl Signer {
             }
             return Err(self.draw_fault(ds, &why));
         }
-        Ok(Round { wins, again })
+        Ok(Round { wins, again, left })
     }
 
     /// Pay one win with the seller's invoice for it, through the ticket rail. What the payment
@@ -891,6 +905,10 @@ impl Signer {
                     }
                     match self.draw_round(ds, &pieces, &voids, false, counted) {
                         Ok(r) => {
+                            if !r.left.is_empty() {
+                                let mut s = lock(&shared);
+                                s.pending.splice(0..0, r.left);
+                            }
                             for (w, inv) in r.wins {
                                 if let Some(inv) = inv {
                                     // paid beside the reading: a payment takes a quarter second through a hop

@@ -775,8 +775,11 @@ The same holds for a seller's income: within 20% of what it earned takes about 6
 buyers together, and a seller that earns less than one win from a buyer is usually paid nothing
 by it (section 9.9). The only thing that evens this out is more wins between the same two
 parties. A session pools the calls of one buyer to one seller; nothing pools across sellers or
-across buyers, and there is no bank. The wallet has no rule that keeps a call expecting few wins
-off the lottery: it chooses draws for anything smaller than four tickets' worth (section 9.7).
+across buyers, and there is no bank. Since 2026-10-17 the wallet keeps a call that expects fewer
+than four wins off the lottery where the seller also offers prepaid tickets (the owner's
+`tickets.lottery.min_expected_wins`, section 9.7): such a call costs what its ticket says. As
+shipped that is every call that may use less than 256 sat through a routing node (4 × 64). Below
+four wins, and with a seller that offers no prepaid tickets, it is paid by draws as before.
 
 Both sides are built: the draw is `xbt402::lottery` (`crates/xbt402/src/lottery.rs`, no IO, used
 by both), the seller's side is in `xbt-gateway` (`lottery.rs`, `gateway/draws.rs`), and the
@@ -966,8 +969,9 @@ The buyer:
   the last checked draw steps, at most 4,096, and MUST work out every draw up to `drawn` itself.
   A value that is not on the chain is not a reveal, and a win the buyer cannot reproduce is not a
   win.
-- SHOULD give no more than a few values (8 in the wallet built here) beyond the last reveal it
-  checked. A seller that takes values and reveals nothing is told nothing more.
+- SHOULD give no more than a few values (8 in the wallet built here, however many pieces arrive at
+  once) beyond the last reveal it checked. A seller that takes values and reveals nothing is told
+  nothing more.
 - MAY list a piece under `void` in place of a value: it never arrived, or failed its check. The
   buyer knows no result when it says so.
 
@@ -1099,6 +1103,7 @@ One function in the wallet decides, when a seller's 402 has a ticket entry and a
 | A session with this seller is open | what that session pays by |
 | The seller offers one of the two, the owner turned the lottery off (`tickets.lottery.enabled`), or the task says (`meter`: `tickets` or `draws`) | that one |
 | A piece of the route costs one ticket or more | tickets |
+| The call expects fewer wins than the owner's `min_expected_wins` (4): what it may use (`max_sats`) is less than that many wins of the size a session would be opened with, and the seller's ticket entry has prepaid tickets beside it | tickets: a held one where the seller is named and one fits; a prepaid one first for a seller the owner has not named (section 6.4) |
 | The call may use four tickets' worth or more with this seller (`max_sats`), and a held ticket fits (the slot budget of section 11 and the owner's caps have room) | tickets |
 | Anything smaller, and whenever no held ticket fits | draws |
 | Draws were chosen and no win size fits the owner's bounds | tickets, and with them the prepaid ticket of section 5 where none can be held |
@@ -1132,10 +1137,11 @@ each hop and 6% of a 16-sat one.
 | `max_odds_den` | 4 | No piece wins more often than 1 time in this many: a piece nearer a whole win is paid with tickets |
 | `expected_wins` | 16 | The wins a session is sized to expect |
 | `luck_tenths` | 31 | How far above its price a call may pay before the wallet asks for no more pieces: 3.1 standard deviations, which about one honest call in 1,000 reaches |
-| `ahead` | 8 | Values given beyond the last reveal the wallet checked |
+| `ahead` | 8 | Values given beyond the last reveal the wallet checked. Held however many pieces arrive at once: the rest wait for the next round, which the reveal in the answer to this one makes room for. Until 2026-10-17 a burst of more pieces than this raised the bound to the burst |
 | `unlisted_max_wins` | 32 | Wins paid to one seller the owner has not named, in a task's window |
 | `routed_floor_sats`, `direct_floor_sats` | 64 and 4 | The fee floor of section 9.7 |
 | `stay_tickets` | 4 | The tickets' worth above which a seller is one the buyer stays with |
+| `min_expected_wins` | 4 | A call expecting fewer wins than this is paid with a ticket where the seller offers prepaid ones: its cost by draws would be mostly luck (section 9). 0 turns the rule off |
 
 and, for a task, `meter` (`auto`, `tickets` or `draws`). Everything else is what bounds a ticket:
 the task's `budget_sats`, the cap on sats paid to one seller, the wallet's daily and weekly
