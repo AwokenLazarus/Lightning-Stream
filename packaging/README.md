@@ -205,8 +205,20 @@ Fork; the top is an x86_64 server. Pass lines, set before measuring:
 | the wallet app idle | at most 64 MiB | `docker stats --no-stream` memory of its four services, after the paid buy and 60 s idle |
 | the gateway app idle | at most 32 MiB | the same for the gateway and its UI |
 
-Measured: see the evidence of the latest Umbrel run (`run/umbrel-test/latest/run1/memory.json`). The Pi floor
-was not measured: no Pi was reached; the arm64 and arm/v7 images were built and inspected only.
+Measured on 2026-10-17 on the x86_64 build host (images of commit 37e844a; memory from the two cold Umbrel
+runs of `test-umbrel-apps.sh`, which checks the lines itself):
+
+| what | measured | pass |
+|---|---|---|
+| largest image, amd64, compressed | xbt-signer 4.16 MB (gateway 2.10 MB, UI 0.68 MB, MCP 0.52 MB, witness 0.38 MB, init 0.28 MB) | yes |
+| the wallet app's images | 6.02 MB (arm64: 5.72 MB) | yes |
+| the gateway app's images | 3.06 MB (arm64: 2.95 MB) | yes |
+| the wallet app idle | 4.96 and 5.01 MiB (signer 1.9, UI 1.2, MCP 1.0, witness 0.9) | yes |
+| the gateway app idle | 2.45 and 2.44 MiB (gateway 1.7, UI 0.8) | yes |
+
+`docker stats` reports the cgroup's memory less its page cache. The `.s9pk` files: the wallet 6.9 MB (x86_64)
+and 6.6 MB (aarch64), the gateway 4.0 MB and 3.9 MB. The Pi floor was not measured: no Pi was reached; the
+arm64 and arm/v7 images were built and inspected only.
 
 ## What a packaged wallet and gateway can do, and cannot
 
