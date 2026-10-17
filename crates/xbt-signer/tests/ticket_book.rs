@@ -992,17 +992,18 @@ fn a_task_has_a_budget_a_limit_on_sellers_and_two_tickets_a_seller_when_there_ar
         sids.push(o["session"].as_str().unwrap().to_string());
     }
     assert!(pools[..8].iter().all(|p| *p == (8, "1000000".to_string())), "{pools:?}");
-    assert!(pools[8..].iter().all(|p| *p == (2, "546000".to_string())), "the ninth seller and after, never below 546 sat: {pools:?}");
+    // (the floor through a routing node: 546 + 703 × 253 ÷ 1000, the fee rate held tickets are sized for on regtest)
+    assert!(pools[8..].iter().all(|p| *p == (2, "724000".to_string())), "the ninth seller and after, never below the floor of a route: {pools:?}");
     let ninth = Seller::new(0x79);
     let sid = sids[8].clone();
     let hashes = r.offer(&sid);
     assert_eq!(hashes.len(), 2);
     // the seller must issue the size the session chose: its own default is refused
     assert_eq!(r.lock(&sid, vec![(hashes[0].clone(), ninth.invoice(r.now(), &hashes[0], &Inv::default()))])["refused"][0]["rule"], "ticket_amount");
-    let small = Inv { msat: 546_000, ..Inv::default() };
+    let small = Inv { msat: 724_000, ..Inv::default() };
     assert_eq!(r.lock(&sid, hashes.iter().map(|h| (h.clone(), ninth.invoice(r.now(), h, &small))).collect())["locked"], 2);
-    // 546 sat and a fee limit of 2 sat + 0.1%: booked as 549
-    assert_eq!(r.release(&sid)["charged_sats"], 549);
+    // 724 sat and a fee limit of 2 sat + 0.1%: booked as 727
+    assert_eq!(r.release(&sid)["charged_sats"], 727);
 }
 
 #[test]

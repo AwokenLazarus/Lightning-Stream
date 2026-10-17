@@ -95,10 +95,16 @@ nodes, two of the Core Lightning nodes started with the values that binary has b
 mainnet; its driver is not in this tree. `docs/TICKETS.md`, section 11, has the table.
 
 - Money moves a ticket at a time (1,000 sat by default; a ticket that is held is at least 546
-  sat by the design's rule, and a node carries nothing below 1 sat). Decided and not yet built:
-  where a channel without anchors may be on the route, a held ticket will be at least
-  max(546, dust_limit + 663 × feerate_cap ÷ 1000) sat, which against a dust limit of 546 is 712,
-  2,204 and 8,834 sat at 1, 10 and 50 sat/vB (computed; `docs/TICKETS.md`, section 6.1). Pieces inside a ticket are
+  sat by the design's rule, and a node carries nothing below 1 sat). Built 2026-10-17: where a
+  channel without anchors may be on the route, a held ticket is at least
+  max(546, dust_limit + 703 × feerate_cap ÷ 1000) sat, which against a dust limit of 546 is 722,
+  2,304 and 9,334 sat at 1, 10 and 50 sat/vB (computed; `docs/TICKETS.md`, section 6.1). The
+  owner's `tickets.feerate_cap_sat_per_kw` is 2,500 (10 sat/vB) on mainnet by default, so there a
+  routed held ticket is at least 2,304 sat: with the default 1,000-sat ticket and the owner's
+  default largest ticket of 1,000 sat, nothing is held through a routing node on mainnet, and
+  calls are paid by prepaid tickets or the lottery. On regtest and the test networks the default
+  is 253 (lnd's floor, about 1 sat/vB): 724 sat. The wallet knows the type of its own channels;
+  every channel past them is taken to be one without anchors. Pieces inside a ticket are
   metered, and the unused part of the ticket in use is trusted to the seller.
 - A held ticket takes one HTLC slot of every channel on its route, and a channel's slots are
   shared by everyone who uses it. A channel carries 483 each way between Lightning Fork nodes

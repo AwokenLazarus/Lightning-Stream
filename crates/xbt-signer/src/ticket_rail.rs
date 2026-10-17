@@ -574,7 +574,8 @@ impl Signer {
         let now = self.engine.now();
         // what the wallet's own channels allow of held tickets, read now; channels that cannot be read are
         // taken to carry 30 pending payments, and every lock reads them again and refuses without a listing
-        let limits = if held.is_some() { self.ticket_limits_read().unwrap_or_else(Limits::unseen) } else { Limits::unseen() };
+        let cap = tp.feerate_cap(&self.chain);
+        let limits = if held.is_some() { self.ticket_limits_read(&terms.payee, cap).unwrap_or_else(|| Limits::unseen(cap)) } else { Limits::unseen(cap) };
         // the book as the node has it now: the pool is sized inside what is still locked with this seller, and a
         // ticket of an earlier session that the seller has cancelled meanwhile is not
         if held.is_some() {
@@ -949,7 +950,7 @@ impl Signer {
         let mut sent_last_hour = st.book.sends_since(now - 3600.0) as i64;
         let (mut n, mut rows, mut sends) = (0i64, vec![], vec![]);
         // the two limits of the channels these payments may leave on, as the node lists them in this round
-        let limits = ticket::channel_limits(chans, ids);
+        let limits = ticket::channel_limits(chans, ids, &s.payee, tp.feerate_cap(&self.chain));
         let on_node: HashSet<String> = htlc_locks(chans, &|_| true).list.iter().map(|h| str_or_empty(h.get("payment_hash"))).collect();
         let slot_room = limits.room(all.tickets, st.book.sending_unseen(&|h| on_node.contains(h)));
         let mut held = false;
@@ -1380,12 +1381,12 @@ impl Signer {
 
     /// The limits of the channels a ticket may leave on, read from the node now. `None`: the node
     /// or its channel list could not be read, or no channel is usable.
-    fn ticket_limits_read(&self) -> Option<Limits> {
+    fn ticket_limits_read(&self, payee: &str, feerate_cap: u64) -> Option<Limits> {
         let ln = self.ln.clone()?;
         let lp = LnPolicy::from_map(&self.config().ln);
         let chans = ln.channels().ok()?;
         let (ids, _) = self.ln_channels(&chans, lp.split(&self.chain));
-        (!ids.is_empty()).then(|| ticket::channel_limits(&chans, &ids))
+        (!ids.is_empty()).then(|| ticket::channel_limits(&chans, &ids, payee, feerate_cap))
     }
 
     /// Buy one prepaid ticket of a session: check the seller's invoice, book it as spent, pay it,
@@ -1963,7 +1964,8 @@ impl Signer {
     pub(crate) fn ticket_held_fits(&self, task: &str) -> bool {
         let tp = self.ticket_policy();
         let Some(t) = tp.tasks.get(task) else { return false };
-        let limits = self.ticket_limits_read().unwrap_or_else(Limits::unseen);
+        let cap = tp.feerate_cap(&self.chain);
+        let limits = self.ticket_limits_read("", cap).unwrap_or_else(|| Limits::unseen(cap));
         let Ok(g) = self.ticket_store() else { return false };
         let Some(st) = g.as_ref() else { return limits.budget() >= 1 };
         let committed = st.book.pools_open();

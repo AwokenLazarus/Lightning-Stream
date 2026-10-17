@@ -2130,12 +2130,37 @@ fn held_tickets_never_take_more_than_half_of_the_channels_slots() {
 fn a_ticket_below_a_channels_dust_limit_is_never_held() {
     let _g = env_lock();
     let small = |settle: Value| json!({"tickets": {"ticket_msat": 600_000, "settle": settle}, "caps": {"sessions_per_address": 0}});
-    // 600 sat on an anchor channel whose two sides say 354 and 546: above both, held
+    // 600 sat on an anchor channel to the seller itself, whose two sides say 354 and 546: above both, held
     let r = Rig::shipped(json!({}), 30, small(json!(["on-use"])));
-    r.ln.st.lock().unwrap().channel["remote_constraints"]["dust_limit_sat"] = "546".into();
+    {
+        let mut st = r.ln.st.lock().unwrap();
+        st.channel["remote_constraints"]["dust_limit_sat"] = "546".into();
+        st.channel["remote_pubkey"] = r.shop.id().into();
+    }
     let v = r.pay("/page/1000", 10);
     assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1), Some(0)), "{v}");
     assert_eq!(session_of(&r, &v)["ticket_msat"], "600000");
+    // the same ticket through a routing node: past the wallet's own channel the route may have a channel without
+    // anchors, so a held ticket is at least 546 + 703 × 253 ÷ 1000 = 724 sat at the fee rate held tickets are sized
+    // for on regtest. Not held. FAILS before the fee-aware floor: the wallet looked at its own channel only
+    let r = Rig::shipped(json!({}), 30, small(json!(["on-use"])));
+    r.ln.st.lock().unwrap().channel["remote_constraints"]["dust_limit_sat"] = "546".into();
+    let v = r.pay("/page/1000", 10);
+    assert_eq!(v["rule"], "no_rail", "{v}");
+    assert!(v["rails_passed_over"][0]["why"].as_str().unwrap().contains("below 724000 msat"), "{v}");
+    // at the owner's 10 sat/vB, the mainnet default, the floor through a hop is 2,304 sat: the shipped 1,000-sat ticket
+    // is not held, and the seller's prepaid ticket pays the call
+    let r = Rig::shipped(json!({"tickets": {"feerate_cap_sat_per_kw": 2_500}}), 30, shipped_shop());
+    let v = r.pay("/page/1000", 10);
+    assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64(), r.shop.held()), (Some(200), Some(1), 0), "{v}");
+    assert_eq!(session_of(&r, &v)["hold_why"], "ticket_dust");
+    // a seller whose ticket is 3,000 sat, above the floor, and an owner whose largest ticket allows it: held. (A seller
+    // that lets the buyer choose a size is asked for one at the floor or above: tests/ticket_book.rs)
+    let r = Rig::shipped(json!({"tickets": {"feerate_cap_sat_per_kw": 2_500, "max_ticket_sats": 3_000, "seller_max_locked_sats": 6_000}}), 30,
+                         json!({"tickets": {"ticket_msat": 3_000_000, "settle": ["on-use"]}, "caps": {"sessions_per_address": 0}}));
+    let v = r.pay("/page/1000", 10);
+    assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(0)), "{v}");
+    assert_eq!(session_of(&r, &v)["ticket_msat"], "3000000");
     // one side says 601 sat: the ticket would have no output in that side's transaction. Not held; with nothing else on offer, not paid
     let r = Rig::shipped(json!({}), 30, small(json!(["on-use"])));
     r.ln.st.lock().unwrap().channel["remote_constraints"]["dust_limit_sat"] = "601".into();

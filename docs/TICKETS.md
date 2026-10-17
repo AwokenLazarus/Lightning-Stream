@@ -145,7 +145,7 @@ safety, since a paid ticket cannot be recalled:
 | Feature bit 512 is set and required; the prefix is XBT's. | The wallet pays on the SHA-256 chain's Lightning network. |
 | The final CLTV delta is `ticketBlocks`, and within the owner's bound. | Funds can stay locked for as long as the seller wrote (the node's ceiling for a route is 2,016 blocks, from its source). |
 | With this ticket, unreleased tickets for this seller are at most `maxTickets`, and their sum is within the owner's cap on locked funds. | A seller that asks for more locks more. |
-| The amount is at least 546 sat, and at least the dust limit of each side of the channel the payment will leave on, as the buyer's node reports them (section 11). | A ticket below a channel's dust limit has no output there. Nobody can claim it on chain, and it is lost to the miners if that channel is force-closed while it is held. |
+| The amount is at least 546 sat, and at least the dust limit of each side of the channel the payment will leave on, as the buyer's node reports them (section 11); where a channel without anchors may be on the route, at least the fee-aware floor of section 6.1. | A ticket below a channel's dust limit has no output there. Nobody can claim it on chain, and it is lost to the miners if that channel is force-closed while it is held. |
 | With this ticket, the payments pending on the channel it will leave on are at most half of that channel's slots: the smaller of the two `max_accepted_htlcs` the buyer's node reports for it (section 11). | The channel's slots are shared. Measured on a 30-slot channel: the 31st ticket failed, and so did an ordinary payment. |
 | The invoice is payable for no longer than the owner allows (an hour by default), has not expired, and has a payment secret. | An invoice that stays payable is one the buyer's node could still pay long after the buyer gave the hash up. |
 
@@ -537,28 +537,40 @@ What follows from it:
 - The channel's fee rate is set by whoever funded the channel and can rise while a ticket is
   held.
 
-**What the code does today.** The wallet holds no ticket below the larger dust limit of a channel
-its payment may leave on, and on a channel without anchors it adds the fee of 703 weight units at
-four times that channel's present fee rate: 546 + 703 × 4 × 250 ÷ 1000 = 1,249 sat at 1 sat/vB
-against a dust limit of 546. So on a channel of its own without anchors it already holds no
-1,000-sat ticket at 1 sat/vB, and buys prepaid tickets there where the seller offers them
-(section 5). The gateway reads no
-dust limit and no channel type. Neither side can see a remote channel.
-
-**The floor for held tickets (decided, not yet built).** 1,000 sat stays the default ticket.
-Where a channel without anchors may be on the route, a held ticket will be at least
+**The floor for held tickets (built 2026-10-17).** 1,000 sat stays the default ticket. Where a
+channel without anchors may be on the route, a held ticket is at least
 
 ```text
-max(546, dust_limit + 663 × feerate_cap ÷ 1000) sat
+max(546, dust_limit + 703 × feerate_cap ÷ 1000) sat
 ```
 
-with `feerate_cap` the fee rate the floor is sized for, in sat per 1,000 weight units. Against a
-dust limit of 546 sat that is 712 sat at 1 sat/vB, 2,204 sat at 10 and 8,834 sat at 50 (computed:
-546 + 166, 546 + 1,658, 546 + 8,288, rounded up). Open: 663 is the weight on the offering side;
-the receiving side trims with 703, which gives 722, 2,304 and 9,334 sat, and which of the two the
-built floor uses is not settled. Open too: how either side learns that a remote channel has no
-anchors, since the channel type is not in gossip. Below the floor a seller is paid without a held
-payment: a prepaid ticket, or the lottery.
+with `feerate_cap` the fee rate the floor is sized for, in sat per 1,000 weight units: the owner's
+`tickets.feerate_cap_sat_per_kw`, by default 2,500 (10 sat/vB) on mainnet and 253 (lnd's floor,
+about 1 sat/vB) on regtest and the test networks. 703 is the weight of the receiving side, the
+larger of the two (the offering side trims with 663, which gives 712, 2,204 and 8,834 sat): a
+ticket travels towards the seller, so on every channel of its route the side nearer the seller
+receives it. Against a dust limit of 546 sat the floor is 722 sat at 1 sat/vB, 2,304 sat at 10
+and 9,334 sat at 50 (computed: 546 + 176, 546 + 1,758, 546 + 8,788, rounded up); 724 sat at 253.
+
+How the wallet applies it (`crate::ticket::channel_limits`):
+
+- **Its own channels**, by what its node lists: on an anchor channel the larger of the two dust
+  limits; on a channel without anchors that dust limit and the fee of 703 weight units at the cap
+  or at four times the channel's present fee rate, whichever is more.
+- **The rest of the route**, which nobody here can see (the channel type is not in gossip): where
+  the seller is not the peer of the channel the ticket leaves on, every channel past it is taken
+  to be one without anchors with a dust limit of 546 sat, so the floor is 546 + 703 × cap ÷ 1000.
+  A seller that is the wallet's direct peer has its channel's own floor and nothing more.
+- **Where the floor is above the ticket.** A seller whose terms let the buyer choose a size
+  (`minTicketMsat`) is asked for one at the floor or above, inside the owner's largest ticket
+  and caps; a seller with one size below the floor, or a floor above what the owner allows, holds
+  nothing with this wallet (`ticket_dust`), and the call is paid by a prepaid ticket where the
+  seller offers them, or by the next entry of its 402, the lottery for one.
+
+So on mainnet, at the defaults (a 1,000-sat ticket, the owner's largest ticket of 1,000 sat), no
+ticket is held through a routing node, and calls are paid by prepaid tickets or the lottery; an
+owner who wants held tickets there raises `tickets.max_ticket_sats` to 2,304 or more, with a
+seller that offers that size. The gateway reads no dust limit and no channel type.
 
 ### 6.2 What a force close costs, by fee rate
 
@@ -632,9 +644,11 @@ Every figure is computed from sections 6.1 and 6.2 unless it says measured.
 
 With the wallet in this tree the two buyer rows without anchors do not arise at these rates on
 the buyer's own channel: it holds no 1,000-sat ticket there (section 6.1). They are what a buyer
-without that check, or a rate that rises more than four times while a ticket is held, would
-meet. The rows for a routing node and a seller are not covered by any check: nobody on the route
-can see their channels.
+without that check, or a rate that rises above the floor's cap while a ticket is held, would
+meet. Since 2026-10-17 the rows for a routing node and a seller are covered by the floor's rule
+for the rest of the route (section 6.1): at the mainnet default no 1,000-sat ticket is held
+through a hop. Nobody on the route can see their channels, so the rule takes every one of them
+to be without anchors.
 
 ### 6.4 What held tickets cost the network, and the fallback
 

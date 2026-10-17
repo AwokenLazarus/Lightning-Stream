@@ -63,6 +63,20 @@ pub const HTLC_SUCCESS_WEIGHT: u64 = 703;
 /// The fee rate that fee is taken at, as a multiple of the channel's present one: a ticket must
 /// stay above dust while it is held, and the rate can rise meanwhile.
 pub const DUST_FEE_MARGIN: u64 = 4;
+/// The fee rate the floor of a held ticket is sized for where a channel without anchors may be on
+/// its route, in sat per 1,000 weight units, unless the owner says (`tickets.feerate_cap_sat_per_kw`):
+/// 10 sat/vB on mainnet, and on regtest and the test networks 253, the floor of lnd's fee rates
+/// (about 1 sat/vB).
+pub const FEERATE_CAP_MAIN: u64 = 2_500;
+pub const FEERATE_CAP_TEST: u64 = 253;
+
+/// The smallest held ticket that keeps an output on a channel without anchors whose dust limit is
+/// `dust_sat`, at `feerate` sat per 1,000 weight units, in msat: the dust limit and the fee of the
+/// transaction that would claim it, never below 546 sat (`docs/TICKETS.md` section 6.1). The weight
+/// is that of the side receiving the HTLC (703), the larger of the two.
+pub fn non_anchor_floor_msat(dust_sat: u64, feerate: u64) -> u64 {
+    dust_sat.saturating_add(feerate.saturating_mul(HTLC_SUCCESS_WEIGHT).div_ceil(1000)).saturating_mul(1000).max(FLOOR_MSAT)
+}
 /// After a lock that failed for lack of a slot the wallet locks nothing with that seller for this
 /// long, doubling with each failed round in a row up to [`SLOT_WAIT_MAX_S`].
 pub const SLOT_WAIT_S: f64 = 30.0;
@@ -345,6 +359,10 @@ pub struct TicketPolicy {
     pub read_timeout_s: i64,
     /// The longest an answer that is paid for as it arrives stays open, in seconds.
     pub max_answer_s: i64,
+    /// The fee rate a held ticket's floor is sized for where a channel without anchors may be on
+    /// its route, in sat per 1,000 weight units; 0: the chain's default ([`FEERATE_CAP_MAIN`],
+    /// [`FEERATE_CAP_TEST`]).
+    pub feerate_cap_sat_per_kw: i64,
     /// Paying by draws ([`crate::lottery`]): on wherever tickets are, unless the owner says otherwise.
     pub lottery: crate::lottery::LotteryPolicy,
     /// A seller the owner has not named may be reached at a private, loopback or link-local
@@ -365,15 +383,15 @@ impl Default for TicketPolicy {
                seller_max_locked_sats: POOL_FEW as i64 * 1_000, max_sellers: half,
                max_new_sellers_per_min: 30, max_sends_per_hour: 1_200, pool: POOL_FEW as i64, pool_many: POOL_MANY as i64,
                many_sellers: MANY_SELLERS as i64, floor_ticket_sats: (FLOOR_MSAT / 1000) as i64, velocity: Velocity::Session,
-               http_idle_s: HTTP_IDLE_S, ready_wait_ms: READY_WAIT_MS, read_timeout_s: READ_TIMEOUT_S, max_answer_s: MAX_ANSWER_S,
+               http_idle_s: HTTP_IDLE_S, ready_wait_ms: READY_WAIT_MS, read_timeout_s: READ_TIMEOUT_S, max_answer_s: MAX_ANSWER_S, feerate_cap_sat_per_kw: 0,
                lottery: crate::lottery::LotteryPolicy::default(), unlisted_private: false, tasks: BTreeMap::new() }
     }
 }
 
-pub const TICKET_INT_KEYS: [&str; 19] = ["max_ticket_sats", "max_ticket_blocks", "max_htlc_blocks", "max_invoice_expiry_s", "max_locked_sats",
+pub const TICKET_INT_KEYS: [&str; 20] = ["max_ticket_sats", "max_ticket_blocks", "max_htlc_blocks", "max_invoice_expiry_s", "max_locked_sats",
                                          "max_locked_tickets", "seller_max_tickets", "seller_max_locked_sats", "max_sellers",
                                          "max_new_sellers_per_min", "max_sends_per_hour", "pool", "pool_many", "many_sellers", "floor_ticket_sats",
-                                         "http_idle_s", "ready_wait_ms", "read_timeout_s", "max_answer_s"];
+                                         "http_idle_s", "ready_wait_ms", "read_timeout_s", "max_answer_s", "feerate_cap_sat_per_kw"];
 pub const TASK_INT_KEYS: [&str; 8] = ["budget_sats", "window_s", "max_locked_sats", "max_locked_tickets", "max_sellers",
                                       "unlisted_max_spend_sats", "unlisted_max_tickets", "unlisted_max_locked_sats"];
 /// The longest window a task's budget can be read over: what the ledger keeps.
@@ -407,6 +425,7 @@ impl TicketPolicy {
                            },
                            http_idle_s: i(m, "http_idle_s", d.http_idle_s), ready_wait_ms: i(m, "ready_wait_ms", d.ready_wait_ms),
                            read_timeout_s: i(m, "read_timeout_s", d.read_timeout_s), max_answer_s: i(m, "max_answer_s", d.max_answer_s),
+                           feerate_cap_sat_per_kw: i(m, "feerate_cap_sat_per_kw", d.feerate_cap_sat_per_kw),
                            // an entry that is not an object is no permission: the lottery is off
                            lottery: match m.get("lottery").filter(|v| !v.is_null()) {
                                None => d.lottery,
@@ -439,6 +458,15 @@ impl TicketPolicy {
 
     pub fn max_ticket_msat(&self) -> u64 {
         (self.max_ticket_sats.max(0) as u64).saturating_mul(1000)
+    }
+
+    /// The fee rate held tickets are sized for on `chain` (`feerate_cap_sat_per_kw`, or the chain's default).
+    pub fn feerate_cap(&self, chain: &str) -> u64 {
+        match self.feerate_cap_sat_per_kw {
+            n if n > 0 => n as u64,
+            _ if chain == "main" => FEERATE_CAP_MAIN,
+            _ => FEERATE_CAP_TEST,
+        }
     }
 }
 
@@ -634,10 +662,11 @@ pub struct Limits {
 
 impl Limits {
     /// What is assumed of channels that cannot be seen: 30 slots, of which none is known to be
-    /// taken, and the larger of the two dust limits.
-    pub fn unseen() -> Self {
+    /// taken, and the floor of a route that may have a channel without anchors on it at
+    /// `feerate_cap` ([`non_anchor_floor_msat`] with the larger of the two dust limits).
+    pub fn unseen(feerate_cap: u64) -> Self {
         let slots = xbt402::ticket::DEFAULT_CHANNEL_SLOTS;
-        Self { slots, room: i64::from(xbt402::ticket::held_budget(slots)), dust_msat: FLOOR_MSAT }
+        Self { slots, room: i64::from(xbt402::ticket::held_budget(slots)), dust_msat: non_anchor_floor_msat(FLOOR_MSAT / 1000, feerate_cap) }
     }
 
     /// The held tickets the wallet may have in all: half of the smallest channel's slots.
@@ -653,14 +682,17 @@ impl Limits {
     }
 }
 
-/// The limits of the channels `ids` among the node's channel list `chans` (`GET /v1/channels`).
-/// A channel's slots are the smaller of the two `max_accepted_htlcs` its node reports for it (a
-/// Core Lightning node also sends no more than it accepts); its dust limit the larger of the two
-/// `dust_limit_sat`, and on a channel that is not an anchor channel the fee of
-/// [`HTLC_SUCCESS_WEIGHT`] at [`DUST_FEE_MARGIN`] times its fee rate on top. A number the listing
-/// does not give is the cautious one (30 slots, 546 sat), never a large one. No channel named:
-/// [`Limits::unseen`].
-pub fn channel_limits(chans: &[Value], ids: &[String]) -> Limits {
+/// The limits of the channels `ids` among the node's channel list `chans` (`GET /v1/channels`),
+/// for a ticket to `payee` sized for `feerate_cap`. A channel's slots are the smaller of the two
+/// `max_accepted_htlcs` its node reports for it (a Core Lightning node also sends no more than it
+/// accepts); its dust limit the larger of the two `dust_limit_sat`, and on a channel that is not
+/// an anchor channel the fee of [`HTLC_SUCCESS_WEIGHT`] on top, at `feerate_cap` or at
+/// [`DUST_FEE_MARGIN`] times its own fee rate, whichever is more. Where a channel's peer is not the
+/// payee, the route goes on past it over channels nobody here can see, any of which may have no
+/// anchors: the floor is then also [`non_anchor_floor_msat`] of 546 sat at `feerate_cap`. A number
+/// the listing does not give is the cautious one (30 slots, 546 sat), never a large one. No
+/// channel named: [`Limits::unseen`].
+pub fn channel_limits(chans: &[Value], ids: &[String], payee: &str, feerate_cap: u64) -> Limits {
     let num = |v: Option<&Value>| outside_u64(v);
     let mut out: Option<Limits> = None;
     for c in chans.iter().filter(|c| num(c.get("chan_id")).is_some_and(|id| ids.iter().any(|i| *i == id.to_string()))) {
@@ -682,15 +714,19 @@ pub fn channel_limits(chans: &[Value], ids: &[String]) -> Limits {
         let fee_sat = if anchors {
             0
         } else {
-            num(c.get("fee_per_kw")).unwrap_or(0).saturating_mul(DUST_FEE_MARGIN).saturating_mul(HTLC_SUCCESS_WEIGHT).div_ceil(1000)
+            num(c.get("fee_per_kw")).unwrap_or(0).saturating_mul(DUST_FEE_MARGIN).max(feerate_cap).saturating_mul(HTLC_SUCCESS_WEIGHT).div_ceil(1000)
         };
-        let dust_msat = dust_sat.saturating_add(fee_sat).saturating_mul(1000).max(FLOOR_MSAT);
+        let mut dust_msat = dust_sat.saturating_add(fee_sat).saturating_mul(1000).max(FLOOR_MSAT);
+        // the payee is not this channel's peer: the rest of the route may be without anchors
+        if !c.get("remote_pubkey").and_then(Value::as_str).is_some_and(|k| k.eq_ignore_ascii_case(payee)) {
+            dust_msat = dust_msat.max(non_anchor_floor_msat(FLOOR_MSAT / 1000, feerate_cap));
+        }
         out = Some(match out {
             None => Limits { slots, room, dust_msat },
             Some(l) => Limits { slots: l.slots.min(slots), room: l.room.min(room), dust_msat: l.dust_msat.max(dust_msat) },
         });
     }
-    out.unwrap_or_else(Limits::unseen)
+    out.unwrap_or_else(|| Limits::unseen(feerate_cap))
 }
 
 /// A session's pool, decided when it opens.
@@ -1552,7 +1588,7 @@ mod tests {
     #[test]
     fn a_pool_is_2_of_the_sellers_size_for_a_few_sellers_and_1_sized_to_earnings_for_many() {
         let pol = TicketPolicy::default();
-        let free = Limits::unseen();
+        let free = Limits::unseen(0);
         let few = |t: &Terms, n: usize, e: Option<u64>| sizing(t, &pol, n, e, pol.seller_max_tickets, pol.seller_max_locked_sats, free.dust_msat, free.room(0, 0));
         assert_eq!(few(&terms(1_000_000, None, 8), 1, None), Ok(Sizing { ticket_msat: 1_000_000, pool: 2 }));
         assert_eq!(few(&terms(1_000_000, None, 8), 4, None), Ok(Sizing { ticket_msat: 1_000_000, pool: 2 }), "4 sellers are still a few");
@@ -1635,45 +1671,79 @@ mod tests {
         let ids = |v: &[u64]| v.iter().map(u64::to_string).collect::<Vec<_>>();
         // between two Lightning Fork nodes: 483 each way, 354 sat
         let lf = chan(1, side(483, 354), side(483, 354), json!("ANCHORS"), 0, 0);
-        assert_eq!(channel_limits(std::slice::from_ref(&lf), &ids(&[1])), Limits { slots: 483, room: 241, dust_msat: FLOOR_MSAT });
+        assert_eq!(channel_limits(std::slice::from_ref(&lf), &ids(&[1]), "", 0), Limits { slots: 483, room: 241, dust_msat: FLOOR_MSAT });
         // with a Core Lightning node: the listing says 30 one way and 483 the other, and the channel carries 30 both ways
         let cln = chan(2, side(30, 354), side(483, 546), json!("ANCHORS"), 4, 9);
-        let l = channel_limits(std::slice::from_ref(&cln), &ids(&[2]));
+        let l = channel_limits(std::slice::from_ref(&cln), &ids(&[2]), "", 0);
         assert_eq!(l, Limits { slots: 30, room: 11, dust_msat: 546_000 }, "15 less the 4 payments pending outwards; inbound ones use the other side's slots");
         assert_eq!((l.budget(), l.room(0, 0), l.room(3, 0), l.room(0, 5), l.room(14, 0), l.room(15, 0), l.room(99, 99)), (15, 11, 11, 6, 1, 0, 0));
         // two channels a ticket may leave on: the smaller budget, the fuller channel, the larger dust limit
-        assert_eq!(channel_limits(&[lf.clone(), cln.clone()], &ids(&[1, 2])), Limits { slots: 30, room: 11, dust_msat: 546_000 });
+        assert_eq!(channel_limits(&[lf.clone(), cln.clone()], &ids(&[1, 2]), "", 0), Limits { slots: 30, room: 11, dust_msat: 546_000 });
         // a channel the payment may not leave on does not count
-        assert_eq!(channel_limits(&[lf.clone(), cln.clone()], &ids(&[1])).slots, 483);
+        assert_eq!(channel_limits(&[lf.clone(), cln.clone()], &ids(&[1]), "", 0).slots, 483);
         // a full channel has no room, however much the budget is
         let full = chan(3, side(30, 546), side(30, 546), json!("ANCHORS"), 15, 0);
-        assert_eq!(channel_limits(&[full], &ids(&[3])).room(0, 0), 0);
+        assert_eq!(channel_limits(&[full], &ids(&[3]), "", 0).room(0, 0), 0);
         let over = chan(3, side(30, 546), side(30, 546), json!("ANCHORS"), 22, 0);
-        assert_eq!((channel_limits(std::slice::from_ref(&over), &ids(&[3])).room, channel_limits(std::slice::from_ref(&over), &ids(&[3])).room(0, 0)), (-7, 0));
+        assert_eq!((channel_limits(std::slice::from_ref(&over), &ids(&[3]), "", 0).room, channel_limits(std::slice::from_ref(&over), &ids(&[3]), "", 0).room(0, 0)), (-7, 0));
         // a listing that does not say is read as the cautious number, never as 483
         let blind = chan(4, Value::Null, Value::Null, Value::Null, 2, 0);
-        assert_eq!(channel_limits(&[blind], &ids(&[4])), Limits { slots: 30, room: 13, dust_msat: FLOOR_MSAT });
+        assert_eq!(channel_limits(&[blind], &ids(&[4]), "", 0), Limits { slots: 30, room: 13, dust_msat: FLOOR_MSAT });
         let half_said = chan(5, side(483, 354), json!({"max_accepted_htlcs": "many"}), json!("ANCHORS"), 0, 0);
-        assert_eq!(channel_limits(&[half_said], &ids(&[5])).slots, 30);
+        assert_eq!(channel_limits(&[half_said], &ids(&[5]), "", 0).slots, 30);
         let zero = chan(6, side(0, 354), side(483, 354), json!("ANCHORS"), 0, 0);
-        assert_eq!(channel_limits(&[zero], &ids(&[6])).slots, 30);
+        assert_eq!(channel_limits(&[zero], &ids(&[6]), "", 0).slots, 30);
         let huge = chan(7, side(100_000, 354), side(100_000, 354), json!("ANCHORS"), 0, 0);
-        assert_eq!(channel_limits(&[huge], &ids(&[7])).slots, 483, "no channel carries more than the protocol's ceiling");
-        assert_eq!(channel_limits(&[lf], &[]), Limits::unseen(), "no channel named: nothing is seen");
-        assert_eq!(Limits::unseen(), Limits { slots: 30, room: 15, dust_msat: 546_000 });
+        assert_eq!(channel_limits(&[huge], &ids(&[7]), "", 0).slots, 483, "no channel carries more than the protocol's ceiling");
+        assert_eq!(channel_limits(&[lf], &[], "", 0), Limits::unseen(0), "no channel named: nothing is seen");
+        assert_eq!(Limits::unseen(0), Limits { slots: 30, room: 15, dust_msat: 546_000 });
         // without anchors the HTLC's own transaction pays a fee: 703 weight units at four times the channel's rate on top
         let legacy = |kw: u64| {
             let mut c = chan(8, side(483, 354), side(483, 546), json!("STATIC_REMOTE_KEY"), 0, 0);
             c["fee_per_kw"] = kw.to_string().into();
-            channel_limits(&[c], &ids(&[8])).dust_msat
+            channel_limits(&[c], &ids(&[8]), "", 0).dust_msat
         };
         assert_eq!(legacy(253), (546 + 712) * 1000, "703 * 4 * 253 / 1000, rounded up");
         assert_eq!(legacy(1250), (546 + 3515) * 1000);
         assert_eq!(legacy(u64::MAX), u64::MAX, "a rate that does not fit is the largest floor, which refuses every ticket");
         for anchors in ["ANCHORS", "SCRIPT_ENFORCED_LEASE", "SIMPLE_TAPROOT", "anchors"] {
             let c = chan(9, side(483, 354), side(483, 546), json!(anchors), 0, 0);
-            assert_eq!(channel_limits(&[c], &ids(&[9])).dust_msat, 546_000, "{anchors}");
+            assert_eq!(channel_limits(&[c], &ids(&[9]), "", 0).dust_msat, 546_000, "{anchors}");
         }
+    }
+
+    /// Where a channel without anchors may be on a ticket's route, a held ticket is at least
+    /// max(546, dust_limit + 703 × feerate_cap ÷ 1000) sat: on the wallet's own channels by their
+    /// type and limits, and past them, where nobody here can see, at a dust limit of 546.
+    ///
+    /// FAILS before: the wallet sized its floor by its own channel only (546 sat on an anchor
+    /// channel, whatever lay beyond it), so a 1,000-sat ticket was held at any fee rate.
+    #[test]
+    fn a_held_ticket_is_above_the_dust_of_a_channel_without_anchors_at_the_owners_fee_rate() {
+        let ids = |v: &[u64]| v.iter().map(u64::to_string).collect::<Vec<_>>();
+        let peer = "02".to_string() + &"bb".repeat(32);
+        let mut anchors = chan(1, side(483, 354), side(483, 546), json!("ANCHORS"), 0, 0);
+        anchors["remote_pubkey"] = peer.clone().into();
+        // the seller is the channel's peer: the route is that one anchor channel, and its dust limit is the floor
+        assert_eq!(channel_limits(std::slice::from_ref(&anchors), &ids(&[1]), &peer, 2_500).dust_msat, 546_000);
+        // the seller is further: 546 + 703 × rate ÷ 1000, rounded up (722, 2,304 and 9,334 sat at 1, 10 and 50 sat/vB)
+        let routed = |rate: u64| channel_limits(std::slice::from_ref(&anchors), &ids(&[1]), "03ff", rate).dust_msat;
+        assert_eq!((routed(250), routed(2_500), routed(12_500)), (722_000, 2_304_000, 9_334_000));
+        assert_eq!(routed(253), 724_000, "the default on regtest and the test networks");
+        // the wallet's own channel without anchors to the seller: its own dust limit and the cap, or four times its rate
+        let mut legacy = chan(2, side(483, 354), side(483, 354), json!("STATIC_REMOTE_KEY"), 0, 0);
+        legacy["remote_pubkey"] = peer.clone().into();
+        assert_eq!(channel_limits(std::slice::from_ref(&legacy), &ids(&[2]), &peer, 2_500).dust_msat, (354 + 1_758) * 1000);
+        legacy["fee_per_kw"] = "1000".into();
+        assert_eq!(channel_limits(std::slice::from_ref(&legacy), &ids(&[2]), &peer, 250).dust_msat, (354 + 2_812) * 1000, "four times its own rate is more");
+        // nothing seen: the remote floor
+        assert_eq!(Limits::unseen(2_500).dust_msat, 2_304_000);
+        assert_eq!(non_anchor_floor_msat(0, 0), FLOOR_MSAT, "never below 546 sat");
+        // the owner's value, or the chain's
+        let mut pol = TicketPolicy::default();
+        assert_eq!((pol.feerate_cap("main"), pol.feerate_cap("regtest"), pol.feerate_cap("testnet4")), (2_500, 253, 253));
+        pol.feerate_cap_sat_per_kw = 5_000;
+        assert_eq!(pol.feerate_cap("main"), 5_000);
     }
 
     #[test]
