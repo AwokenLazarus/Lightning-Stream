@@ -393,6 +393,67 @@ pub fn body_cap() -> usize {
     std::env::var("B2_BODY_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(12_000)
 }
 
+/// Whether `ip` is an address of the public internet: not unspecified, loopback, private, shared
+/// (carrier NAT), link-local, documentation, benchmarking, multicast, broadcast or reserved. An
+/// IPv4 address written inside IPv6 (mapped, or the NAT64 prefix) is judged as that IPv4 address.
+pub fn public_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip.to_canonical() {
+        IpAddr::V4(a) => {
+            let [x, y, z, _] = a.octets();
+            !(x == 0 || x == 10 || x == 127 || x >= 224
+              || (x == 100 && (64..128).contains(&y)) || (x == 169 && y == 254) || (x == 172 && (16..32).contains(&y)) || (x == 192 && y == 168)
+              || (x == 192 && y == 0 && (z == 0 || z == 2)) || (x == 198 && (y == 18 || y == 19)) || (x == 198 && y == 51 && z == 100)
+              || (x == 203 && y == 0 && z == 113))
+        }
+        IpAddr::V6(a) => {
+            let s = a.segments();
+            if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                return public_ip(IpAddr::V4(std::net::Ipv4Addr::new((s[6] >> 8) as u8, s[6] as u8, (s[7] >> 8) as u8, s[7] as u8)));
+            }
+            // only the global unicast block, less documentation and the discard and transition ranges inside it
+            (s[0] & 0xe000) == 0x2000 && !(s[0] == 0x2001 && s[1] == 0x0db8) && !(s[0] == 0x2001 && s[1] < 0x0200) && s[0] != 0x2002
+        }
+    }
+}
+
+/// Whether a request may leave for `origin`, a seller the owner has not named, before anything
+/// is sent to it: the origin is https, and every address its host has is public
+/// ([`public_ip`]). A task that admits any seller is what an agent has when it is told to go and
+/// find sellers, so a URL it was handed must not make the wallet a client of the machine's own
+/// services or of its private network. `Err`: why not.
+///
+/// The name is looked up here and again by the HTTP client when it connects: a name whose
+/// answer changes between the two (DNS rebinding) is not caught by this check.
+pub fn stranger_reachable(origin: &str) -> std::result::Result<(), String> {
+    use std::net::ToSocketAddrs;
+    let Some(netloc) = origin.strip_prefix("https://") else {
+        return Err("a seller the owner has not named is reached over https only".into());
+    };
+    let (host, port) = match netloc.strip_prefix('[') {
+        Some(rest) => match rest.split_once(']') {
+            Some((h, "")) => (h, 443),
+            Some((h, p)) => (h, p.strip_prefix(':').and_then(|p| p.parse::<u16>().ok()).ok_or("the URL's port is not a number")?),
+            None => return Err("the URL's host is not an address".into()),
+        },
+        None => match netloc.rsplit_once(':') {
+            Some((h, p)) => (h, p.parse::<u16>().map_err(|_| "the URL's port is not a number")?),
+            None => (netloc, 443),
+        },
+    };
+    if host.is_empty() || host.contains('@') {
+        return Err("the URL names no host".into());
+    }
+    let addrs: Vec<std::net::SocketAddr> = (host, port).to_socket_addrs().map_err(|e| format!("its host could not be looked up ({:?})", e.kind()))?.collect();
+    if addrs.is_empty() {
+        return Err("its host has no address".into());
+    }
+    if let Some(a) = addrs.iter().find(|a| !public_ip(a.ip())) {
+        return Err(format!("its host has the address {}, which is not an address of the public internet (private, loopback, link-local or reserved)", a.ip()));
+    }
+    Ok(())
+}
+
 /// `scheme://netloc` of an absolute URL. A URL with a `#` is refused (AGP-081, review T2: the
 /// request binding does not cover a fragment).
 pub fn origin_of(url: &str) -> Result<String> {
@@ -484,6 +545,13 @@ impl Signer {
         let listed = self.engine.allowlist().contains(&origin);
         if !self.ticket_may_reach(&origin, task.as_deref().unwrap_or("")) {
             return deny("allowlist", format!("destination not on allowlist: {origin} (and the call names no task that pays any seller)"));
+        }
+        // a seller the owner has not named, reached through a task that admits any: https and a public address,
+        // before the first byte leaves (the owner may widen this for a lab: tickets.unlisted_private)
+        if !listed && !tp.unlisted_private {
+            if let Err(why) = stranger_reachable(&origin) {
+                return deny("dest_private", format!("{origin} is not on the allowlist, and {why}: nothing was sent to it"));
+            }
         }
         let (lightning, chain) = match (self.ticket_net(), self.network()) {
             (Ok(l), Ok(c)) => (l, c),
@@ -1904,6 +1972,24 @@ mod tests {
         }
         for no in ["http://seller.example", "http://10.0.0.5:8402", "http://127.0.0.1.example", "http://[::2]", "ftp://127.0.0.1", "http://localhost.example", ""] {
             assert!(!private_channel(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn a_seller_nobody_named_is_reached_over_https_at_a_public_address_only() {
+        for ip in ["1.1.1.1", "8.8.8.8", "100.128.0.1", "172.32.0.1", "2606:4700::1111", "::ffff:8.8.8.8", "64:ff9b::808:808"] {
+            assert!(public_ip(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in ["0.0.0.0", "10.1.2.3", "100.64.0.1", "127.0.0.1", "169.254.169.254", "172.16.0.1", "172.31.255.255", "192.168.1.1", "192.0.2.1",
+                   "198.18.0.1", "198.51.100.7", "203.0.113.9", "224.0.0.1", "255.255.255.255", "::", "::1", "fc00::1", "fd12::1", "fe80::1", "ff02::1",
+                   "2001:db8::1", "2002::1", "::ffff:127.0.0.1", "::ffff:10.0.0.1", "64:ff9b::a00:1"] {
+            assert!(!public_ip(ip.parse().unwrap()), "{ip}");
+        }
+        assert_eq!(stranger_reachable("https://1.1.1.1"), Ok(()));
+        assert_eq!(stranger_reachable("https://[2606:4700::1111]:8443"), Ok(()));
+        for no in ["http://1.1.1.1", "https://127.0.0.1:8402", "https://[::1]", "https://10.0.0.5", "https://169.254.169.254", "https://localhost:443",
+                   "https://user@1.1.1.1", "https://1.1.1.1:x", "https://[::1", "https://"] {
+            assert!(stranger_reachable(no).is_err(), "{no}");
         }
     }
 

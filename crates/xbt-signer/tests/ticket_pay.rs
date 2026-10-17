@@ -1028,11 +1028,32 @@ fn an_answer_priced_by_the_second_is_paid_by_the_clock() {
 
 // --- the owner's policy through the HTTP path -------------------------------------------------------
 
+/// A task that pays any seller is what an agent has when it is told to go and find sellers: a URL
+/// it was handed does not make the wallet a client of this machine's own services or of its
+/// private network, and does not go out over plain http.
+///
+/// FAILS before the check: the unpaid first request went out (any method, any body) and the
+/// answer's first bytes came back to the agent.
+#[test]
+fn an_unnamed_seller_at_a_private_address_or_over_plain_http_is_sent_nothing() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let r = Rig::build(json!({}), false);
+    for (method, path) in [("GET", "/page/10"), ("POST", "/page/10"), ("DELETE", "/admin")] {
+        let v = r.call("xbt402_pay", json!({"url": r.shop.url(path), "method": method, "body": "x", "max_sats": 10, "task": "swarm"}));
+        assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("dest_private")), "{v}");
+        assert!(v["reason"].as_str().unwrap().contains("https only"), "{v}");
+    }
+    assert!(r.tap.log.lock().unwrap().is_empty() && r.shop.service.hits.load(Ordering::SeqCst) == 0, "nothing was sent");
+    // a named seller on this machine is the owner's choice, and is paid as before
+    let named = Rig::new(json!({}));
+    assert_eq!(named.pay("/page/10", 10)["status"], 200);
+}
+
 #[test]
 fn no_request_leaves_for_a_host_the_owner_did_not_allow_and_an_unnamed_seller_is_paid_only_a_little() {
     let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
-    // the shop is not on the allowlist
-    let r = Rig::build(json!({}), false);
+    // the shop is not on the allowlist (and is on this machine, which the owner allows for an unnamed seller here)
+    let r = Rig::build(json!({"tickets": {"unlisted_private": true}}), false);
     let no = r.pay("/page/10", 10);
     assert_eq!((no["verdict"].as_str(), no["rule"].as_str()), (Some("deny"), Some("allowlist")), "{no}");
     let no = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": 10, "task": "film"}));
@@ -2499,7 +2520,8 @@ fn tickets_for_a_seller_one_stays_with_draws_for_a_small_call_and_the_owner_can_
     assert_eq!(v["rail"], "ticket", "{v}");
     assert!(r.tap.seen("/x402/lottery/").is_empty());
     // a task that says tickets, and one that says draws whatever the call may use
-    let r = draws_rig(json!({"tickets": {"tasks": {"film": {"budget_sats": 40_000, "meter": "tickets"}, "swarm": {"budget_sats": 5_000, "admit": "any", "meter": "draws"}}}}));
+    let r = draws_rig(json!({"tickets": {"unlisted_private": true, "tasks": {"film": {"budget_sats": 40_000, "meter": "tickets"},
+                                                                             "swarm": {"budget_sats": 5_000, "admit": "any", "meter": "draws"}}}}));
     assert_eq!(r.pay(&format!("/pieces/{PIECE}"), 100)["rail"], "ticket");
     let r = draws_rig(json!({"tickets": {"tasks": {"film": {"budget_sats": 40_000, "meter": "draws"}}}}));
     assert_eq!(r.pay(&format!("/pieces/{PIECE}"), 30_000)["rail"], "lottery");

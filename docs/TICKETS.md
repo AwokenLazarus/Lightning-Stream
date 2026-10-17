@@ -1409,7 +1409,15 @@ is refused (`max_sats`). Until October 2026 a third entry, the on-chain channel
 (`batch-settlement`), was paid here, and both of these cases went to it; that channel was removed
 (`docs/LIMITS.md`). A seller that still offers it is told so in `rails_passed_over`.
 No request leaves for a host the owner did not allow: the URL is read by one parser, and its origin
-is on the allowlist, or the call's task pays any seller, before the first byte is sent.
+is on the allowlist, or the call's task pays any seller, before the first byte is sent. An origin
+that is not on the allowlist is also https, and every address its host has is one of the public
+internet (no loopback, private, shared, link-local, documentation or reserved range, IPv4 inside
+IPv6 judged as IPv4), before the first byte is sent: `dest_private` otherwise, and nothing goes
+out. A task that pays any seller is what an agent has when it is told to go and find sellers, and
+the unpaid request can have any method and body. The host is looked up for this check and again
+when the request connects, so a name whose answer changes in between (DNS rebinding) is not
+caught by it. An owner whose lab runs sellers on its own machine or network says
+`tickets.unlisted_private: true`; the signer warns of it at start.
 
 **A paid request, in order.**
 

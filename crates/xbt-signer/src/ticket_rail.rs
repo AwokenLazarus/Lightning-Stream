@@ -226,6 +226,16 @@ impl TicketStore {
     }
 }
 
+/// `v` with what the node wrote as a payment's `failure_reason`, if anything, under
+/// `untrusted_ln_data`: the wallet's own fields carry only [`ticket::failure_code`].
+fn node_failure(mut v: Value, pmt: Option<&Value>) -> Value {
+    let raw = pmt.map(|p| str_or_empty(p.get("failure_reason"))).unwrap_or_default();
+    if !raw.is_empty() {
+        v[crate::ln::UNTRUSTED_LN_KEY] = crate::ln::untrusted_ln(json!({"failure": raw.chars().take(200).collect::<String>()}));
+    }
+    v
+}
+
 fn refusal(rule: &str, reason: impl Into<String>) -> Value {
     with(deny(rule, reason), json!({"rail": "ticket", "charged_sats": 0}))
 }
@@ -850,8 +860,8 @@ impl Signer {
                 };
                 // an error the node's record did not replace: it goes with the ticket's row
                 let unsent = unsent.filter(|_| pmt.is_none());
-                if let Some(pmt) = pmt {
-                    self.ticket_apply(st, hash, &pmt)?;
+                if let Some(pmt) = &pmt {
+                    self.ticket_apply(st, hash, pmt)?;
                 }
                 if let Some(t) = st.book.tickets.get(hash) {
                     locked += usize::from(t.state == TState::Locked);
@@ -859,7 +869,7 @@ impl Signer {
                     slot_failed += usize::from(t.state == TState::Failed && ticket::slot_failure(&t.note));
                     tickets.push(match &unsent {
                         Some(e) => node_said(with(t.public(), json!({"send_error": e.msg})), e),
-                        None => t.public(),
+                        None => node_failure(t.public(), pmt.as_ref().filter(|_| t.state == TState::Failed)),
                     });
                 }
             }
@@ -1150,7 +1160,8 @@ impl Signer {
             }
             let back = t.booked_sats;
             let was_locked = t.state == TState::Locked && !t.prepaid;
-            t.note = str_or_empty(pmt.get("failure_reason")).chars().take(80).collect();
+            // the node's reason, as one of the names the wallet knows: the node's own text is never the wallet's note
+            t.note = ticket::failure_code(&str_or_empty(pmt.get("failure_reason"))).into();
             t.state = TState::Failed;
             t.booked_sats = 0;
             t.done_ts = now;
@@ -1526,7 +1537,7 @@ impl Signer {
                 // the preimage is what the buyer shows the seller for its credit: it moves no money any more
                 with(json!({"verdict": "allow", "ticket_secret": hex::encode(&preimage), "charged_sats": t.booked_sats}), about)
             }
-            TState::Failed => with(refusal(failed, format!("the payment of {what} failed ({}): nothing was spent", t.note)), about),
+            TState::Failed => node_failure(with(refusal(failed, format!("the payment of {what} failed ({}): nothing was spent", t.note)), about), pmt.as_ref()),
             // not final within the wait: booked, and the node's word decides later
             _ => {
                 let v = with(with(refusal(pending, format!("the payment of {what} is not final yet: it is booked as spent until the wallet's node shows it failed")), about),

@@ -347,6 +347,10 @@ pub struct TicketPolicy {
     pub max_answer_s: i64,
     /// Paying by draws ([`crate::lottery`]): on wherever tickets are, unless the owner says otherwise.
     pub lottery: crate::lottery::LotteryPolicy,
+    /// A seller the owner has not named may be reached at a private, loopback or link-local
+    /// address, and over plain http: for a lab whose sellers run on this machine or its network.
+    /// Off unless `tickets.unlisted_private` is `true` exactly.
+    pub unlisted_private: bool,
     pub tasks: BTreeMap<String, TaskPolicy>,
 }
 
@@ -362,7 +366,7 @@ impl Default for TicketPolicy {
                max_new_sellers_per_min: 30, max_sends_per_hour: 1_200, pool: POOL_FEW as i64, pool_many: POOL_MANY as i64,
                many_sellers: MANY_SELLERS as i64, floor_ticket_sats: (FLOOR_MSAT / 1000) as i64, velocity: Velocity::Session,
                http_idle_s: HTTP_IDLE_S, ready_wait_ms: READY_WAIT_MS, read_timeout_s: READ_TIMEOUT_S, max_answer_s: MAX_ANSWER_S,
-               lottery: crate::lottery::LotteryPolicy::default(), tasks: BTreeMap::new() }
+               lottery: crate::lottery::LotteryPolicy::default(), unlisted_private: false, tasks: BTreeMap::new() }
     }
 }
 
@@ -409,6 +413,8 @@ impl TicketPolicy {
                                Some(Value::Object(l)) => crate::lottery::LotteryPolicy::from_map(Some(l)),
                                Some(_) => crate::lottery::LotteryPolicy { enabled: false, ..d.lottery },
                            },
+                           // a widening: only the literal true turns it on
+                           unlisted_private: m.get("unlisted_private") == Some(&Value::Bool(true)),
                            tasks: BTreeMap::new() };
         for (name, t) in m.get("tasks").and_then(Value::as_object).into_iter().flatten() {
             let Some(t) = t.as_object() else { continue };
@@ -454,7 +460,7 @@ pub fn validate(raw: &Value, errors: &mut Vec<String>, warnings: &mut Vec<String
     };
     ints(m, &TICKET_INT_KEYS, "tickets", errors);
     for k in m.keys() {
-        if k != "enabled" && k != "tasks" && k != "velocity" && k != "lottery" && !TICKET_INT_KEYS.contains(&k.as_str()) {
+        if !["enabled", "tasks", "velocity", "lottery", "unlisted_private"].contains(&k.as_str()) && !TICKET_INT_KEYS.contains(&k.as_str()) {
             warnings.push(format!("policy.json tickets.{k}: unknown key (the signer ignores it)"));
         }
     }
@@ -465,6 +471,12 @@ pub fn validate(raw: &Value, errors: &mut Vec<String>, warnings: &mut Vec<String
     }
     if let Some(l) = m.get("lottery").filter(|v| !v.is_null()) {
         crate::lottery::validate(l, errors, warnings);
+    }
+    match m.get("unlisted_private") {
+        None | Some(Value::Bool(false)) => {}
+        Some(Value::Bool(true)) => warnings.push("policy.json tickets.unlisted_private is true: a task that admits any seller may send requests to private, \
+                                                  loopback and link-local addresses, and over plain http. For a lab only".into()),
+        Some(_) => errors.push("policy.json tickets.unlisted_private: must be true or false".into()),
     }
     let p = TicketPolicy::from_map(m);
     if p.pool == 0 || p.pool_many == 0 {
@@ -763,6 +775,17 @@ pub fn prepaid_size(terms: &Terms, pol: &TicketPolicy) -> Result<u64, Refusal> {
         return refuse("ticket_size", "a ticket below 1 sat: no node forwards it");
     }
     Ok(terms.ticket_msat)
+}
+
+/// The payment-level failure reasons of an lnd-family node (`failure_reason` of a payment).
+pub const LN_FAILURE_REASONS: [&str; 7] = ["FAILURE_REASON_CANCELED", "FAILURE_REASON_ERROR", "FAILURE_REASON_INCORRECT_PAYMENT_DETAILS",
+                                           "FAILURE_REASON_INSUFFICIENT_BALANCE", "FAILURE_REASON_NONE", "FAILURE_REASON_NO_ROUTE", "FAILURE_REASON_TIMEOUT"];
+
+/// A node's `failure_reason` in the wallet's own words: one of [`LN_FAILURE_REASONS`], the
+/// string being this crate's and never the node's bytes, or `"failure_reason_unknown"`. Whatever
+/// the node wrote goes to the agent only under `untrusted_ln_data`.
+pub fn failure_code(raw: &str) -> &'static str {
+    LN_FAILURE_REASONS.iter().copied().find(|c| *c == raw).unwrap_or("failure_reason_unknown")
 }
 
 /// Whether a ticket payment's failure, as the node names it, is what a full channel looks like: a
