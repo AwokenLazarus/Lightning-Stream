@@ -60,7 +60,7 @@ trap 'exit 130' INT TERM HUP
 mkdir -p "$ROOT/run"
 R=$(mktemp -d "$ROOT/run/gateway-XXXXXX")
 
-nice -n 19 cargo build -q --release -j4 -p xbt-gateway --offline
+nice -n 19 cargo build -q --release -j4 -p xbt-gateway --locked
 
 # the lab and the node binaries: cloned and built when missing
 # shellcheck source=scripts/ln_rail/lab.sh
