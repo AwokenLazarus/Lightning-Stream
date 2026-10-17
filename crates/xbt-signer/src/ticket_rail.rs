@@ -1884,8 +1884,8 @@ impl Signer {
                     let on_node: HashSet<String> = htlc_locks(cs, &|_| true).list.iter().map(|h| str_or_empty(h.get("payment_hash"))).collect();
                     let mut missing: Vec<&str> = st.book.tickets.values().filter(|t| t.state.in_flight() && t.cltv_until > 0 && !on_node.contains(&t.hash))
                         .map(|t| t.hash.as_str()).collect();
-                    let mut extra: Vec<&str> = on_node.iter().filter(|h| !st.book.tickets.get(*h).is_some_and(|t| t.state.in_flight())
-                        && !ln_book.get(*h).and_then(|r| r.get("state")).and_then(Value::as_str).is_some_and(|x| x == "sending")).map(String::as_str).collect();
+                    let mut extra: Vec<&str> = on_node.iter().filter(|h| !(st.book.tickets.get(*h).is_some_and(|t| t.state.in_flight())
+                        || ln_book.get(*h).and_then(|r| r.get("state")).and_then(Value::as_str).is_some_and(|x| x == "sending"))).map(String::as_str).collect();
                     missing.sort_unstable();
                     extra.sort_unstable();
                     v["node"] = json!({"htlcs": on_node.len(), "agree": missing.is_empty() && extra.is_empty(), "in_book_not_on_node": missing,

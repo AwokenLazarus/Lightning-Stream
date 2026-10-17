@@ -127,7 +127,7 @@ pub fn parse_py(s: &str) -> serde_json::Result<Value> {
     while i < b.len() {
         let c = b[i];
         if in_str {
-            in_str = !(c == b'"' && !esc);
+            in_str = c != b'"' || esc;
             esc = c == b'\\' && !esc;
         } else if c == b'"' {
             in_str = true;

@@ -396,7 +396,7 @@ pub fn http(
         status,
         headers,
         body,
-        complete: complete && method != "HEAD" || method == "HEAD",
+        complete: complete || method == "HEAD",
     }
 }
 
