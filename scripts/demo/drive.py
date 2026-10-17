@@ -330,8 +330,11 @@ class Wallet(e2e.Wallet):
             # wins of 64 sat through a hop. Changed here (shipped value in brackets): velocity_max above (8), max_sellers
             # (15: the swarm pays 20 at once), max_new_sellers_per_min (30), max_sends_per_hour (1,200), max_answer_s (50);
             # the budgets, max_per_tx_sats and human_threshold_sats above are a lab wallet's, lower than shipped;
-            # split_window_s is 0 (600) and anchor_interval_s 3600 (60). docs/DEMO.md has the table
+            # split_window_s is 0 (600) and anchor_interval_s 3600 (60); and min_expected_wins is 0 (4): as shipped, the
+            # swarm's calls, each expecting under one win from its seller, would be paid with a prepaid ticket each, and
+            # what the swarm shows is the draws. docs/DEMO.md has the table
             "tickets": {"enabled": True, "max_sellers": SWARM + 8, "max_new_sellers_per_min": 200, "max_sends_per_hour": 100_000, "max_answer_s": 120,
+                        "lottery": {"min_expected_wins": 0},
                         "tasks": {"film": {"budget_sats": 1_000_000}, "swarm": {"budget_sats": 100_000, "max_sellers": SWARM + 8}}},
         }
 

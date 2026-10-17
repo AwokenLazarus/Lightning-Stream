@@ -224,6 +224,7 @@ The wallet's policy:
 | `tickets.max_new_sellers_per_min` | 30 | 200 | No reason given. The demo's 20 new sellers are within the shipped 30 |
 | `tickets.max_sends_per_hour` | 1,200 | 100,000 | No reason given. Whether the run stays within 1,200 was not checked |
 | `tickets.max_answer_s` | 50 s | 120 s | The wallet cuts an answer that is paid as it arrives after this long. No reason given; the whole film came in 4.6 s in the latest report |
+| `tickets.lottery.min_expected_wins` | 4 | 0 | As shipped, a call that expects fewer than 4 wins from its seller is paid with a prepaid ticket where the seller offers one. Each of the swarm's calls expects under one win, so as shipped the swarm would buy 20 prepaid tickets and draw nothing; the demo turns the rule off to show the draws. |
 | `max_per_tx_sats`, `daily_budget_sats`, `weekly_budget_sats`, `per_counterparty_cap_sats`, `human_threshold_sats` | 10,000,000; 50,000,000; 200,000,000; 30,000,000; 10,000,000 | 50,000; 4,000,000; 8,000,000; 4,000,000; 40,000 | A lab wallet's budgets, all lower than shipped |
 | `split_window_s` | 600 s | 0 | Payments to one seller inside this window add up against `max_per_tx_sats` and the human threshold; at 0 each ticket is judged alone. No reason given |
 | `anchor_interval_s`, `regtest_mine`, `ln.enabled`, `ln.split_height` | 60 s; unset; off; unset | 3,600 s; off; on; the lab chain's | Settings of the lab chain and its Lightning rail |
