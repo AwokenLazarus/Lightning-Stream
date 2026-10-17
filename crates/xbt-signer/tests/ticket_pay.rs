@@ -2834,14 +2834,16 @@ fn a_killed_signer_or_gateway_ends_a_session_of_draws_plainly_and_pays_no_win_tw
     assert_wins(&r, wins);
     let anchors: Vec<String> = r.tap.seen("/x402/lottery/open").iter().map(|s| s.body.clone()).collect();
     assert_eq!(anchors.len(), 2);
-    // the gateway is killed and started again: it has forgotten the session; the wallet's call says so by opening
-    // another, and the request is served on that one
+    // the gateway is killed and started again: it keeps its sessions of draws in its journal, so the session goes on
+    // where it was, on the same chain, and no new session is opened for it
     r.shop.restart();
     let v3 = r.pay(&format!("/pieces/{}", 128 * PIECE), 1_000);
-    assert!(v3["rail"] == "lottery" && v3["complete"] == true && v3["session"] != v2["session"], "{v3}");
+    assert!(v3["rail"] == "lottery" && v3["complete"] == true && v3["session"] == v2["session"], "{v3}");
+    assert_eq!(r.tap.seen("/x402/lottery/open").len(), 2, "a restart of the gateway opens no session");
+    assert_eq!(v3["session_totals"]["draws"].as_u64(), Some(v2["session_totals"]["draws"].as_u64().unwrap() + 128), "{v3}");
     wins += v3["wins_paid"].as_u64().unwrap();
     assert_wins(&r, wins);
-    assert_eq!(r.session(v2["session"].as_str().unwrap())["sessions"][0]["why"], "the seller has forgotten the session");
+    assert_eq!(r.session(v2["session"].as_str().unwrap())["sessions"][0]["state"], "open", "{}", r.session(v2["session"].as_str().unwrap()));
     // the signer is killed while a win's payment is with the node: the payment is booked, and the node's word settles
     // it after the start; the win is not paid again
     r.ln.st.lock().unwrap().router_down = true;

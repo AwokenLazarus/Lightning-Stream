@@ -232,7 +232,7 @@ impl Signer {
                 let _busy = lock(&ds.busy);
                 self.draw_request(&ds, c, &terms.price)
             };
-            // a seller that has forgotten the session (it restarted, or the session went quiet): this one is over, and
+            // a seller that has forgotten the session (it went quiet, or the seller started again without its journal): this one is over, and
             // the call is made once more on a new one. Nothing was served for the request that found it gone
             if out.get("rule").and_then(Value::as_str) == Some("lottery_session_ended") && attempt == 0 {
                 continue;
