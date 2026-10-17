@@ -26,7 +26,7 @@ pub const MAINNET_NOTICE: [&str; 9] = [
     "- A held ticket of 1,000 sat can be below a channel's dust limit at mainnet fee rates on a channel without anchors: it then has no output there, and is lost to the miners if that channel is force-closed while it is held. The gateway does not read its channels' dust limits.",
     "- Claiming settled tickets on chain after a force close cost 900 to 1,700 sat for three tickets at 1 sat/vB; at higher fee rates one ticket costs more to claim than it is worth.",
     "- Held tickets take pending-payment slots of every channel on their route for no fee, on your node and on the routing nodes before it. Nothing but this software keeps buyers to half of a channel's slots.",
-    "- A lock costs a buyer nothing until it pays: whoever reaches the gateway from enough addresses can take every session place with invoices it never pays.",
+    "- A session's first ticket is a prepaid one (caps.held_after_paid), so a hold invoice costs whoever asks for it one paid ticket; but a first lock still costs nothing, and whoever reaches the gateway from enough addresses can take every session place with prepaid invoices it never pays, for 20 s at a time (caps.first_lock_secs).",
     "- With a lottery section you serve first, and nothing makes a buyer pay a win.",
     "- The gateway speaks an lnd-family node's REST interface and no other; a Core Lightning seller is not supported.",
     "- The gateway speaks plain HTTP: buyers must reach it through a TLS proxy, with public_url set to the https origin they use.",
@@ -392,6 +392,9 @@ impl Config {
                     "held_over_half",
                     "slots_retry_secs",
                     "unpaid_secs",
+                    "first_lock_secs",
+                    "unpaid_per_address",
+                    "held_after_paid",
                     "first_use_secs",
                     "idle_secs",
                     "keep_secs",
@@ -442,6 +445,20 @@ impl Config {
         ticket_msat
             .checked_mul(u64::from(max_held))
             .ok_or("the cap on held funds does not fit")?;
+        // hold invoices only to a session that has paid something: on wherever prepaid tickets are offered
+        // beside held ones, since a first ticket has to be had some way
+        let held_after_paid = match c.get("held_after_paid") {
+            None => held && prepaid,
+            Some(Value::Bool(true)) if !(held && prepaid) => {
+                return Err(format!("caps.held_after_paid needs tickets.settle to offer both \"{SETTLE_ON_USE}\" and \"{SETTLE_ON_ARRIVAL}\": a session's first ticket is a prepaid one"))
+            }
+            Some(Value::Bool(b)) => *b,
+            Some(_) => return Err("caps.held_after_paid is true or false".into()),
+        };
+        let first_lock_secs = num(c, "first_lock_secs", 20)?;
+        if !(5..=u64::from(xbt402::ticket::INVOICE_EXPIRY_S)).contains(&first_lock_secs) {
+            return Err(format!("caps.first_lock_secs is from 5 to {}: how long the invoices of a session's first lock stay payable", xbt402::ticket::INVOICE_EXPIRY_S));
+        }
         let caps = Caps {
             ticket_msat,
             max_tickets,
@@ -452,6 +469,9 @@ impl Config {
             slots_retry_secs,
             margin_blocks: SETTLE_MARGIN_BLOCKS,
             unpaid_secs: num(c, "unpaid_secs", 75)?,
+            first_lock_secs,
+            unpaid_per_address: num32(c, "unpaid_per_address", 2)?,
+            held_after_paid,
             first_use_secs: num(c, "first_use_secs", 60)?,
             idle_secs: num(c, "idle_secs", 300)?,
             keep_secs: num(c, "keep_secs", 86_400)?,
@@ -850,6 +870,28 @@ mod tests {
             assert!(e.contains("not a loopback address") && e.contains("https"), "{listen}: {e}");
             assert!(with(listen, "https://seller.example").is_ok(), "{listen}: behind a TLS proxy");
         }
+    }
+
+    #[test]
+    fn hold_invoices_go_to_a_session_that_has_paid_by_default_where_prepaid_tickets_are_offered() {
+        let c = Config::from_json(&base()).unwrap();
+        assert_eq!((c.caps.held_after_paid, c.caps.first_lock_secs, c.caps.unpaid_per_address), (true, 20, 2));
+        let with = |tickets: Value, caps: Value| {
+            let mut v = base();
+            v["tickets"] = tickets;
+            v["caps"] = caps;
+            Config::from_json(&v)
+        };
+        // only held tickets: a first ticket cannot be prepaid, so the rule is off, and cannot be asked for
+        assert!(!with(json!({"settle": ["on-use"]}), json!({})).unwrap().caps.held_after_paid);
+        let e = with(json!({"settle": ["on-use"]}), json!({"held_after_paid": true})).unwrap_err().to_string();
+        assert!(e.contains("held_after_paid") && e.contains("on-arrival"), "{e}");
+        assert!(!with(json!({}), json!({"held_after_paid": false})).unwrap().caps.held_after_paid);
+        assert!(with(json!({}), json!({"held_after_paid": "yes"})).is_err());
+        for bad in [4, 61] {
+            assert!(with(json!({}), json!({"first_lock_secs": bad})).unwrap_err().to_string().contains("first_lock_secs"), "{bad}");
+        }
+        assert_eq!(with(json!({}), json!({"first_lock_secs": 15, "unpaid_per_address": 0})).unwrap().caps.unpaid_per_address, 0);
     }
 
     #[test]

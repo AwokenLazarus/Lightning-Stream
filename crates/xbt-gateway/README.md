@@ -28,6 +28,13 @@ section 8). Pointed at a node that answers `getinfo` in Core Lightning's names, 
    size, how many tickets a buyer may hold, how long a ticket lives, who goes first, the price rule.
 2. `POST /x402/ticket/lock` registers a hold invoice on your node for each hash the buyer sends.
    The buyer's node pays them; each is now a locked ticket. Only the buyer knows the secrets.
+   As shipped, a session's first lock is for a prepaid ticket (an ordinary invoice, paid in
+   full on arrival), and hold invoices are issued only to a session that has paid one: a lock
+   for held tickets before that is `402 prepaid_first`, and asks your node for nothing
+   (`caps.held_after_paid`, on wherever you offer both kinds; `false` turns it off). A first
+   lock's invoice lapses after 20 s (`caps.first_lock_secs`), and one client address has at most
+   2 unpaid invoices at once (`caps.unpaid_per_address`, 0 for no cap: the address is the
+   socket's unless `http.forwarded_address` names your proxy).
 3. The buyer releases a ticket by sending its secret: in `POST /x402/ticket/release`, which is
    what the wallet of this tree does, or inside a paid request, which the gateway also takes.
    The gateway hashes it, finds the ticket in that buyer's session, checks the node holds it

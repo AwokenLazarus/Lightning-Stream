@@ -453,7 +453,7 @@ fn a_hostile_buyer_gets_nothing_it_did_not_pay_for() {
 #[test]
 fn locks_and_sessions_are_capped_and_a_flood_stops_at_the_caps() {
     let (rig, _d) = start(&|v| {
-        v["caps"] = json!({"max_sessions": 5, "sessions_per_address": 3, "inbound_slots": 483})
+        v["caps"] = json!({"max_sessions": 5, "sessions_per_address": 3, "inbound_slots": 483, "held_after_paid": false, "unpaid_per_address": 0})
     });
     // one address: three sessions
     let mut buyers: Vec<Buyer> = vec![];
@@ -1405,11 +1405,59 @@ fn thousands_of_requests_from_one_buyer_are_bounded_by_what_it_paid() {
     let _: Value = b.status();
 }
 
-/// The shipped caps: nothing set under `tickets` and `caps` but the per-address cap, which the
-/// tests' one address would meet first.
+/// The shipped caps: nothing set under `tickets` and `caps` but the caps per address, which the
+/// tests' one address would meet first, and the rule that a session's first ticket is a prepaid
+/// one, so that these tests of the caps on held tickets can lock held ones at once. Both are
+/// tested as shipped in [`a_hold_invoice_goes_only_to_a_session_that_has_paid_a_ticket`].
 fn shipped(v: &mut Value) {
     v["tickets"] = json!({});
-    v["caps"] = json!({"sessions_per_address": 0});
+    v["caps"] = json!({"sessions_per_address": 0, "unpaid_per_address": 0, "held_after_paid": false});
+}
+
+/// As shipped: a lock for held tickets that nobody authenticated, or of a session that has paid
+/// nothing, is refused `prepaid_first` and asks the node for nothing; a session's first lock is
+/// for a prepaid ticket, whose invoice lapses in 20 s; once that ticket is paid and presented the
+/// session is issued hold invoices; and one address has at most 2 unpaid invoices.
+///
+/// FAILS before: a first lock carried no authentication and was issued hold invoices that lived
+/// 60 s and counted against the cap from the moment they were issued: 2,000 such locks from one
+/// HTTP client took every held place on the lab in half a second.
+#[test]
+fn a_hold_invoice_goes_only_to_a_session_that_has_paid_a_ticket() {
+    let (rig, _d) = start(&|v| {
+        v["tickets"] = json!({});
+        v["caps"] = json!({"sessions_per_address": 0});
+    });
+    let mut b = Buyer::new(&rig, 1);
+    let secrets = b.fresh_secrets(2);
+    let got = b.lock_raw(&secrets);
+    assert_eq!((got.status, got.error()), (402, "prepaid_first".to_string()), "{}", got.json());
+    assert_eq!((rig.node.calls("add_hold"), rig.gw.stats().sessions), (0, 0), "nothing asked of the node, no session made");
+    // the first lock buys a prepaid ticket and makes the session; its invoice lapses sooner than a later one's
+    let got = b.lock_prepaid(1);
+    assert_eq!(got.status, 200, "{}", got.json());
+    let hash = xbt402::ticket::hex32(got.json()["tickets"][0]["hash"].as_str().unwrap()).unwrap();
+    assert_eq!(rig.node.expiry_of(&hash), Some(20));
+    // a held lock of the session before its ticket is paid: refused, in a signed answer
+    let one = b.fresh_secrets(1);
+    let early = b.lock_raw(&one);
+    assert_eq!((early.status, early.error()), (402, "prepaid_first".to_string()));
+    assert!(early.header("PAYMENT-RESPONSE").is_some(), "a refusal of an authenticated request is signed");
+    // paid and presented: credited, and now the session holds
+    assert!(rig.node.pay(&hash));
+    let preimage = rig.node.paid_preimage(&hash).unwrap();
+    assert_eq!(b.release(&[preimage]).json()["released"], json!([hex::encode(hash)]));
+    let held = b.lock(&rig, 2);
+    assert_eq!((held.len(), rig.node.calls("add_hold")), (2, 2));
+    // a second session from the same address takes its 2 unpaid invoices; a third session from it gets none,
+    // and is not made
+    let mut c = Buyer::new(&rig, 2);
+    assert_eq!(c.lock_prepaid(2).status, 200);
+    let sessions = rig.gw.stats().sessions;
+    let mut d = Buyer::new(&rig, 3);
+    let third = d.lock_prepaid(1);
+    assert_eq!((third.status, third.error()), (402, "too_many_tickets".to_string()), "{}", third.json());
+    assert_eq!(rig.gw.stats().sessions, sessions);
 }
 
 #[test]
@@ -1639,7 +1687,7 @@ fn a_gateway_given_a_channels_macaroon_sizes_itself_and_waits_while_a_channel_is
     ]));
     let sized = |v: &mut Value| {
         v["tickets"] = json!({});
-        v["caps"] = json!({"sessions_per_address": 0, "inbound_slots": 483});
+        v["caps"] = json!({"sessions_per_address": 0, "inbound_slots": 483, "held_after_paid": false, "unpaid_per_address": 0});
         v["node"]["channels_macaroon"] = json!("unused");
     };
     let rig = start_on(
@@ -1734,7 +1782,7 @@ fn a_lock_the_caps_refuse_does_not_ask_the_node_for_its_channels() {
         std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1_000_000)),
         &|v| {
             v["tickets"] = json!({"max_tickets": 2});
-            v["caps"] = json!({"sessions_per_address": 0, "inbound_slots": 483, "max_sessions": 2});
+            v["caps"] = json!({"sessions_per_address": 0, "inbound_slots": 483, "max_sessions": 2, "held_after_paid": false, "unpaid_per_address": 0});
             v["node"]["channels_macaroon"] = json!("unused");
         },
     );

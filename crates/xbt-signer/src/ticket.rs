@@ -421,16 +421,16 @@ impl TicketPolicy {
             if !task_name_ok(name) {
                 continue;
             }
-            // a task's own caps default to the rail's; for a seller the owner has not named, to the
-            // smaller pool held (`pool_many`), two tickets' worth locked and four tickets' worth
-            // paid in the task's window
+            // a task's own caps default to the rail's; for a seller the owner has not named, to one
+            // ticket held at a time (no more than `pool_many`), two tickets' worth locked and four
+            // tickets' worth paid in the task's window
             let two = p.max_ticket_sats.saturating_mul(2);
             p.tasks.insert(name.clone(), TaskPolicy {
                 budget_sats: i(t, "budget_sats", 0), window_s: i(t, "window_s", 86_400).clamp(1, MAX_TASK_WINDOW_S),
                 max_locked_sats: i(t, "max_locked_sats", p.max_locked_sats), max_locked_tickets: i(t, "max_locked_tickets", p.max_locked_tickets),
                 max_sellers: i(t, "max_sellers", p.max_sellers),
                 admit: if t.get("admit").and_then(Value::as_str) == Some("any") { Admit::Any } else { Admit::Listed },
-                unlisted_max_spend_sats: i(t, "unlisted_max_spend_sats", two.saturating_mul(2)), unlisted_max_tickets: i(t, "unlisted_max_tickets", p.pool_many),
+                unlisted_max_spend_sats: i(t, "unlisted_max_spend_sats", two.saturating_mul(2)), unlisted_max_tickets: i(t, "unlisted_max_tickets", p.pool_many.min(1)),
                 unlisted_max_locked_sats: i(t, "unlisted_max_locked_sats", two), meter: crate::lottery::Meter::parse(t.get("meter")) });
         }
         p.max_ticket_sats = p.max_ticket_sats.min(i64::MAX / 1000);
@@ -1012,6 +1012,10 @@ pub struct Session {
     /// A session that pays by draws ([`crate::ticket_pay`]). It holds no ticket: `pool` is 0, and
     /// `prepaid_msat` is the size of a win. `None`: a ticket session.
     pub draws: Option<Draws>,
+    /// The session's next ticket is a prepaid one, and no ticket is held before it has been paid:
+    /// a seller the owner has not named starts so, and so does any seller that asks for it
+    /// (`prepaid_first`). Cleared when the node shows the session's prepaid ticket paid.
+    pub paid_first: bool,
 }
 
 /// The seller's side of a session that pays by draws: the seller's own name for the session, which
@@ -1058,6 +1062,10 @@ impl Session {
         if let Some(d) = &self.draws {
             r["draws"] = json!({"seller": d.seller, "anchor": d.anchor});
         }
+        // written only when set: a row from before reads as a session that may hold at once
+        if self.paid_first {
+            r["paid_first"] = true.into();
+        }
         r
     }
 
@@ -1068,9 +1076,10 @@ impl Session {
     }
 
     /// Whether this session pays with a prepaid ticket now: the seller offers them, and no ticket
-    /// is held (a pool of none) or none may be locked for the moment (a wait).
+    /// is held (a pool of none), or none may be locked for the moment (a wait), or none may be
+    /// locked before a prepaid one is paid ([`Session::paid_first`]).
     pub fn prepaid_now(&self, now: f64) -> bool {
-        self.prepaid_msat > 0 && (self.pool == 0 || now < self.hold_until)
+        self.prepaid_msat > 0 && (self.pool == 0 || now < self.hold_until || self.paid_first)
     }
 
     /// What a lock round came to: `locked` tickets the node holds, `slot_failed` that failed as a
@@ -1139,6 +1148,10 @@ impl Session {
                         // a row that says it pays by draws says all of it, or the row is damage
                         Some(v) => Some(Draws { seller: v.get("seller")?.as_str()?.to_string(),
                                                 anchor: v.get("anchor")?.as_str().filter(|a| a.is_empty() || is_hex(a, 64))?.to_string() }),
+                    },
+                    paid_first: match r.get("paid_first") {
+                        None => false,
+                        Some(v) => v.as_bool()?,
                     } })
     }
 
@@ -1147,7 +1160,7 @@ impl Session {
                "ticket_msat": self.ticket_msat.to_string(), "pool": self.pool, "state": self.state.as_str(), "opened_ts": ts_value(self.opened_ts),
                "stopped_ts": ts_value(self.stopped_ts), "closed_ts": ts_value(self.closed_ts), "why": self.why, "http": self.http.is_some(),
                "prepaid_msat": self.prepaid_msat.to_string(), "hold_until": ts_value(self.hold_until), "hold_why": self.hold_why,
-               "slot_fails": self.slot_fails, "draws": self.draws.is_some()})
+               "slot_fails": self.slot_fails, "draws": self.draws.is_some(), "paid_first": self.paid_first})
     }
 }
 
@@ -1329,7 +1342,7 @@ impl Book {
     /// and not yet lapsed as on their way. None while the session waits after a lock that found
     /// no slot, and none for a session that holds nothing.
     pub fn want(&self, s: &Session, now: f64) -> usize {
-        if s.pool == 0 || now < s.hold_until {
+        if s.pool == 0 || now < s.hold_until || s.paid_first {
             return 0;
         }
         let (mut have, mut coming) = (0usize, 0usize);
@@ -1717,6 +1730,26 @@ mod tests {
     }
 
     #[test]
+    fn a_session_that_pays_a_prepaid_ticket_first_offers_no_hash_until_then() {
+        let mut b = Book::default();
+        let mut s = session("s1", 2);
+        s.prepaid_msat = 1_000_000;
+        s.paid_first = true;
+        b.apply(&s.row()).unwrap();
+        assert_eq!(b.want(&s, 100.0), 0, "no hash before the prepaid ticket is paid");
+        assert!(s.prepaid_now(100.0));
+        // the mark is on disk with the session, and a row from before has none
+        assert_eq!(Session::from_row(&s.row()), Some(s.clone()));
+        assert!(session("s2", 2).row().get("paid_first").is_none());
+        let mut bad = s.row();
+        bad["paid_first"] = json!("yes");
+        assert_eq!(Session::from_row(&bad), None);
+        s.paid_first = false;
+        assert_eq!(b.want(&s, 100.0), 2);
+        assert!(!s.prepaid_now(100.0));
+    }
+
+    #[test]
     fn the_policy_reads_missing_as_the_default_and_wrong_as_zero() {
         assert_eq!(TicketPolicy::from_map(&Map::new()), TicketPolicy::default());
         assert!(!TicketPolicy::default().enabled && TicketPolicy::default().tasks.is_empty(), "shipped: off, and no task to pay under");
@@ -1750,7 +1783,7 @@ mod tests {
     }
 
     fn session(id: &str, pool: u32) -> Session {
-        Session { draws: None, id: id.into(), payee: "p".into(), origin: String::new(), task: "t".into(), listed: true, ticket_msat: 1_000_000, pool, max_tickets: 8,
+        Session { draws: None, paid_first: false, id: id.into(), payee: "p".into(), origin: String::new(), task: "t".into(), listed: true, ticket_msat: 1_000_000, pool, max_tickets: 8,
                   ticket_blocks: 40, max_sats: 0, state: SState::Open, opened_ts: 1.0, active_ts: 1.0, stopped_ts: 0.0, closed_ts: 0.0, why: String::new(),
                   http: None, prepaid_msat: 0, slot_fails: 0, hold_until: 0.0, hold_why: String::new() }
     }

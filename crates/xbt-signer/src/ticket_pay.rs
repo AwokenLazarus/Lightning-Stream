@@ -19,7 +19,7 @@
 //! | A ticket is released for an answer only when the balance does not cover its next piece. | [`Stream::due_bytes`] and [`Stream::due_time`], on the bytes and seconds this module counted itself. |
 //! | No ticket is released into a session whose last answer the seller has not closed. | [`Signer::ticket_release_one`] waits for the answer's last receipt in the seller's signed `status` (5 s a call, the session given up after 30 s). A seller waiting for a refill of an answer the wallet stopped reading would take the next ticket for bytes nobody reads. |
 //! | A call uses at most `max_sats`, by the wallet's own count, and ends within the owner's `max_answer_s`. | [`Signer::ticket_request`] refuses a head price above it; [`Stream::over`] cuts the body where its price reaches it or its time is up. |
-//! | Held tickets first; a prepaid one only where none can be held. | [`Signer::ticket_release_one`] buys a prepaid ticket only when the session has no held ticket to release and the book says it pays that way now ([`crate::ticket::Session::prepaid_now`]: a pool of none, or a wait after a lock that found no slot). The purchase itself is the book's ([`Signer::ticket_prepay`]), one at a time. |
+//! | Held tickets first; a prepaid one only where none can be held, or before any is. | [`Signer::ticket_release_one`] buys a prepaid ticket only when the session has no held ticket to release and the book says it pays that way now ([`crate::ticket::Session::prepaid_now`]: a pool of none, a wait after a lock that found no slot, or a session whose first ticket is a prepaid one: a seller the owner has not named, or one that answered `prepaid_first`). The purchase itself is the book's ([`Signer::ticket_prepay`]), one at a time. |
 //! | A seller that says `slots_short` is waited for. | [`Signer::ticket_lock_call`] sets the session's wait from the seller's `retryAfter` and offers it no hash until then. |
 //! | A session that can release nothing more is ended, and said so. | [`Signer::ticket_forgotten`]: the seller's unsigned `session_unknown` to a lock or a `status` stops the session, as an unsigned answer to a paid request does. [`Signer::ticket_release_one`]: a ticket the seller has not shown after `ready_wait_ms` that the wallet's own node carries on no channel ([`Signer::ticket_stranded`]) stops it too. Neither releases or books anything. |
 //! | An invoice that will not be paid gives its place with the seller back. | [`Signer::ticket_fill_once`] asks the seller to cancel the invoices a lock round refused or failed, and [`Signer::ticket_cancel_dead`] those of tickets that failed after their round, each once. The answer is not read. |
@@ -63,8 +63,8 @@ const TAIL_GIVE_UP: Duration = Duration::from_secs(30);
 /// How long a stop waits for the wallet's own node to show the cancelled tickets failed.
 pub const CANCEL_WAIT: Duration = Duration::from_secs(5);
 /// Refusals of `ticket_open` that mean "not this rail": the next entry of the 402 is tried.
-const NEXT_RAIL: [&str; 12] = ["ticket_disabled", "ln_disabled", "ticket_task", "ticket_admission", "ticket_terms", "ticket_feature_512", "ticket_network",
-                               "ticket_size", "ticket_blocks", "ticket_dust", "ticket_slots", ROUTE_FULL];
+const NEXT_RAIL: [&str; 13] = ["ticket_disabled", "ln_disabled", "ticket_task", "ticket_admission", "ticket_terms", "ticket_feature_512", "ticket_network",
+                               "ticket_size", "ticket_blocks", "ticket_dust", "ticket_slots", ROUTE_FULL, "ticket_prepaid_first"];
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
@@ -991,6 +991,17 @@ impl Signer {
             }
             if let Some(gone) = self.ticket_forgotten(hs, status, v) {
                 return with(refusal("ticket_session_ended", gone), json!({"session": hs.sid}));
+            }
+            // the seller issues held tickets only to a session that has paid it something: the session's next
+            // ticket is a prepaid one, and it holds after that (the seller's word moves no money: it only orders
+            // the wallet's own steps, each under the owner's rules)
+            if status == 402 && code == "prepaid_first" {
+                return match self.ticket_paid_first(&hs.sid) {
+                    Ok(true) => with(refusal("ticket_prepaid_first", "the seller issues held tickets after one prepaid ticket has been paid: the session buys \
+                                                                       one first"), json!({"session": hs.sid})),
+                    Ok(false) => refusal("ticket_seller", "the seller issues held tickets only after a prepaid one, and its terms offer none"),
+                    Err(e) => refusal("ticket", e.msg),
+                };
             }
             refusal("ticket_seller", format!("the seller refused the lock: HTTP {status} {code}"))
         };

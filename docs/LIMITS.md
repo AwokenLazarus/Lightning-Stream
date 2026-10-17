@@ -183,10 +183,14 @@ mainnet; its driver is not in this tree. `docs/TICKETS.md`, section 11, has the 
 - A channel with a ticket pending cannot be closed co-operatively: every channel on a ticket's
   route is kept from a clean close until the ticket is settled, cancelled or expired (from
   BOLT 2; not run). The other way out is a force close.
-- Decided and not yet built: a session with a seller the owner has not named will start with one
-  prepaid ticket and hold tickets only after it, 1 at a time (2 with a named seller). Today
-  such a session opens with a held ticket where one fits, and a seller issues its first hold
-  invoice to a buyer that has paid nothing (`docs/TICKETS.md`, section 6.4).
+- Built 2026-10-17: a session with a seller the owner has not named starts with one prepaid
+  ticket and holds tickets only after the node shows it paid, 1 at a time (2 with a named
+  seller); a seller the owner has not named whose terms offer no prepaid tickets is not held
+  with at all (`ticket_prepaid_first`), and the socket's `ticket_open` path, which cannot buy a
+  prepaid ticket, cannot hold with one. The gateway issues hold invoices only to a session that
+  has paid something (`caps.held_after_paid`, on by default wherever it offers both kinds), so
+  a named seller's session that meets such a gateway buys its first ticket prepaid too
+  (`docs/TICKETS.md`, section 6.4).
 - BOLT 11 hold invoices only. The Lightning Fork's BOLT 12 offers have no hold path.
 - One hop was measured, on one host. Two or more hops, real network latency, mainnet routes and
   fees, a direct channel, and a force close with many tickets were not.
@@ -424,7 +428,9 @@ wallet) and against a stand-in node in its tests.
   on sessions let through: one call to the node for each, with a timeout of 15 seconds. A lock
   those caps refuse (`too_many_sessions`, `too_many_tickets`) is refused before the call, and a
   lock for an existing session is authenticated before it; a first lock is authenticated by
-  nobody, so while session places are free anyone can make the gateway read the list once per
+  nobody, and with `caps.held_after_paid` (the default) a first lock for held tickets is refused
+  before the call, so the list is read for locks of sessions that have paid a ticket only. With
+  the rule off, while session places are free anyone can make the gateway read the list once per
   request. The permission
   is wider than that one call: it also shows the node's channel balances, its payments and what
   it forwarded, to whoever has the gateway's files. Without it the gateway knows nothing of its
@@ -498,10 +504,17 @@ wallet) and against a stand-in node in its tests.
   `sessions_per_address` to 0 and caps in the proxy. The cap on connections from one address
   (`http.per_address`) is taken before any header is read and always counts the socket.
 - Whoever can reach the gateway from enough addresses can take every session place with locks
-  it never pays, at no cost, a minute at a time: new buyers are refused meanwhile
-  (`too_many_sessions`). Sessions that already hold tickets keep them and their balance, and can
-  refill up to their own 2; a session with nothing locked at that moment waits for a place. With
-  the default caps the 15 held places are taken first, by 8 sessions.
+  it never pays, at no cost: new buyers are refused meanwhile (`too_many_sessions`). Sessions that
+  already hold tickets keep them and their balance, and can refill up to their own 2; a session
+  with nothing locked at that moment waits for a place. Since 2026-10-17, with the default caps,
+  such locks are for prepaid tickets: an unauthenticated lock for held ones is refused
+  `prepaid_first`, so the 15 held places go only to sessions that have paid one ticket each; the
+  invoices of a first lock lapse after 20 s (`caps.first_lock_secs`, and the session's place 15 s
+  after that); and one address has at most 2 unpaid invoices (`caps.unpaid_per_address`).
+  Before, 2,000 lock requests from one client took every held place in half a second (measured).
+  An unpaid invoice still counts against the cap on held tickets from when it is issued: not
+  counting it until paid would let the node hold more than the cap, and with paid-first it is not
+  free.
 - Every lock makes invoices on the node, up to 75 at once with the default caps (15 held and 60
   prepaid) and each given up within 75 seconds if unpaid; the node keeps cancelled invoices in
   its database until it is set to collect them (`gc-canceled-invoices-on-the-fly`).

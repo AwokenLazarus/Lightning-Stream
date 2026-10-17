@@ -155,10 +155,10 @@ impl Terms {
 /// The error codes of the ticket scheme and of the lottery beside it ([`crate::lottery`]): what a
 /// gateway answers a payer with. Every code the gateway in this tree can answer with is here (a
 /// test there holds it to that), so that a payer can name each.
-pub const PROTOCOL_CODES: [&str; 34] = [
+pub const PROTOCOL_CODES: [&str; 35] = [
     "amount_mismatch", "amount_not_below_win", "bad_auth", "bad_payment", "bad_request", "bad_seq", "bad_target", "balance_short", "chain_spent",
     "draw_out_of_order", "draw_used", "hash_refused", "internal", "journal", "method_not_allowed", "no_route", "node_unavailable", "piece_unknown",
-    "pledge_outstanding", "session_unknown", "slots_short", "ticket_expiring", "ticket_not_locked", "ticket_unknown", "ticket_used",
+    "pledge_outstanding", "prepaid_first", "session_unknown", "slots_short", "ticket_expiring", "ticket_not_locked", "ticket_unknown", "ticket_used",
     "too_many_sessions", "too_many_tickets", "too_many_voids", "upstream_unavailable", "value_conflict", "value_missing", "value_reused",
     "win_size", "win_unpaid",
 ];

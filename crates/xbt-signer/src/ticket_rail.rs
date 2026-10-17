@@ -651,13 +651,22 @@ impl Signer {
                 return Ok(refusal("velocity", format!("already {} payments in the last {}s (a ticket session is one payment: tickets.velocity)",
                                                       cfg.velocity_max, cfg.velocity_window_s)));
             }
+            // a seller the owner has not named is paid one prepaid ticket before any is held with it: a held
+            // ticket takes a slot of every channel on its route for no fee, and a stranger has to show that it
+            // serves first. One that offers no prepaid tickets is not held with at all
+            let paid_first = !listed && size.pool > 0;
+            if paid_first && prepaid_msat == 0 {
+                return Ok(refusal("ticket_prepaid_first", "the owner has not named this seller, and a ticket is held with such a seller only after one prepaid ticket \
+                                                           has been paid: its terms offer no prepaid tickets"));
+            }
             let s = Session { draws: None, id, payee: terms.payee.clone(), origin: origin.chars().take(200).collect(), task: task_name.clone(),
                               listed, ticket_msat: size.ticket_msat, pool: size.pool, max_tickets: terms.max_tickets, ticket_blocks: terms.ticket_blocks,
                               max_sats, state: SState::Open, opened_ts: now, active_ts: now, stopped_ts: 0.0, closed_ts: 0.0, why: String::new(), http: None,
-                              prepaid_msat, slot_fails, hold_until, hold_why };
+                              prepaid_msat, slot_fails, hold_until, hold_why, paid_first };
             st.commit(&[s.row()])?;
             self.ticket_audit("ticket_open", json!({"session": s.id, "dest": format!("ln:{}", s.payee), "task": s.task, "listed": listed,
                                                     "ticket_msat": s.ticket_msat.to_string(), "pool": s.pool, "prepaid_msat": s.prepaid_msat.to_string(),
+                                                    "paid_first": s.paid_first,
                                                     "hold_why": s.hold_why, "slots": limits.slots}));
             Ok(with(json!({"verdict": "allow", "rail": "ticket"}), s.public()))
         })();
@@ -1201,7 +1210,14 @@ impl Signer {
         } else if !was.booked() {
             t.note = "settled without a release by this book".into();
         }
-        st.commit(&[t.row()])?;
+        // the prepaid ticket a session had to pay before it holds any: paid, with its preimage. In the same write,
+        // after the ticket's row: a crash that keeps only the first leaves a session that buys one more prepaid
+        // ticket, never one that holds before it paid
+        let first_paid = (proven && t.prepaid && t.win == 0).then(|| st.book.sessions.get(&t.session).filter(|s| s.paid_first).cloned()).flatten().map(|mut s| {
+            s.paid_first = false;
+            s.row()
+        });
+        st.commit(&std::iter::once(t.row()).chain(first_paid).collect::<Vec<_>>())?;
         if proven {
             // the preimage by its hash, as every settled Lightning payment is logged
             let _ = self.sigaudit.record("ticket_settled", &preimage, "", &dest, json!({"payment_hash": hash, "spent_sats": sats, "fee_msat": fee.to_string()}));
@@ -1669,6 +1685,26 @@ impl Signer {
     /// Lock nothing for a session for `secs` seconds (1 to 600), for the reason `why`: a seller that
     /// says it has no slot for a held ticket (`slots_short`) is waited for, not treated as failing.
     /// Returns the time the wait ends.
+    /// The seller asks that the session pay a prepaid ticket before it is issued a held one
+    /// (`prepaid_first`): the session's next ticket is a prepaid one. `Ok(false)`: the session has
+    /// no prepaid tickets to buy, and the seller can be paid no way this session knows.
+    pub(crate) fn ticket_paid_first(&self, sid: &str) -> Result<bool> {
+        let _g = self.lock();
+        let mut g = self.ticket_store()?;
+        let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
+        let mut s = st.book.sessions.get(sid).cloned().ok_or_else(|| err("ticket_session", "no such session"))?;
+        if s.prepaid_msat == 0 {
+            return Ok(false);
+        }
+        if s.paid_first {
+            return Ok(true);
+        }
+        s.paid_first = true;
+        st.commit(&[s.row()])?;
+        self.ticket_audit("ticket_paid_first", json!({"session": sid, "dest": format!("ln:{}", s.payee), "why": "the seller issues held tickets after a prepaid one"}));
+        Ok(true)
+    }
+
     pub(crate) fn ticket_hold(&self, sid: &str, secs: u64, why: &str) -> Result<f64> {
         let _g = self.lock();
         let now = self.engine.now();
@@ -2044,7 +2080,7 @@ impl Signer {
             let s = Session { draws: Some(ticket::Draws::default()), id, payee: terms.payee.clone(), origin: origin.chars().take(200).collect(), task: task_name.clone(),
                               listed, ticket_msat: win_msat, pool: 0, max_tickets: 0, ticket_blocks: terms.win_blocks, max_sats: 0, state: SState::Open,
                               opened_ts: now, active_ts: now, stopped_ts: 0.0, closed_ts: 0.0, why: String::new(), http: None, prepaid_msat: win_msat, slot_fails: 0,
-                              hold_until: 0.0, hold_why: String::new() };
+                              hold_until: 0.0, hold_why: String::new(), paid_first: false };
             st.commit(&[s.row()])?;
             self.ticket_audit("lottery_open", json!({"session": s.id, "dest": dest, "task": s.task, "listed": listed, "win_msat": win_msat.to_string(), "direct": direct,
                                                      "expect_msat": expect_msat.to_string()}));

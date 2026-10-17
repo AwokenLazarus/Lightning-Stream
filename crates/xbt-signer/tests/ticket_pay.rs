@@ -248,6 +248,12 @@ fn shipped_shop() -> Value {
     json!({"tickets": {}, "caps": {"sessions_per_address": 0}})
 }
 
+/// The gateway as it ships, but for the cap on sessions per address (the tests have one address):
+/// a session's first ticket is a prepaid one, and 2 unpaid invoices an address.
+fn strict_shop() -> Value {
+    json!({"tickets": {}, "caps": {"sessions_per_address": 0, "strict": true}})
+}
+
 fn receipt_secret() -> SecretKey {
     SecretKey::from_slice(&[9u8; 32]).unwrap()
 }
@@ -255,10 +261,22 @@ fn receipt_secret() -> SecretKey {
 /// How long the next shop waits for a refill before it ends an answer (the gateway's own default is 3 s).
 static REFILL_WAIT_MS: AtomicU64 = AtomicU64::new(400);
 
+/// The gateway's config for a shop. Unless `conf` says otherwise, the shop issues held tickets to
+/// a session that has paid nothing yet and counts no unpaid invoices per address (the gateway
+/// ships with a prepaid ticket first and 2 unpaid invoices an address), so that the tests of the
+/// wallet's mechanisms can hold at once; [`strict_shop`] is the gateway as it ships.
 fn shop_config(origin: &str, upstream: &str, state: &std::path::Path, network: &str, conf: &Value) -> Value {
+    let mut caps = conf["caps"].clone();
+    if let Some(c) = caps.as_object_mut() {
+        if !c.contains_key("strict") {
+            c.entry("held_after_paid").or_insert(json!(false));
+            c.entry("unpaid_per_address").or_insert(json!(0));
+        }
+        c.remove("strict");
+    }
     json!({"listen": "127.0.0.1:0", "public_url": origin, "upstream": upstream, "state_dir": state, "chain": "regtest",
            "network": network, "node": {"rest": "http://127.0.0.1:1", "macaroon": "unused", "info_macaroon": "unused"},
-           "tickets": conf["tickets"], "caps": conf["caps"], "lottery": conf["lottery"],
+           "tickets": conf["tickets"], "caps": caps, "lottery": conf["lottery"],
            "times": {"refill_wait_ms": REFILL_WAIT_MS.load(Ordering::SeqCst), "upstream_wait_secs": 2, "tick_ms": 50},
            "routes": routes()})
 }
@@ -866,9 +884,10 @@ impl Rig {
             let failed = self.ln.by_status("FAILED").iter().any(|p| p["payment_hash"] == hash);
             assert!(failed || rows.iter().any(|r| r["txid"] == format!("ticket:{hash}")), "the secret of {hash} left the wallet and is not in the ledger");
         }
+        // held tickets: each settled by one call that found it held (a prepaid ticket settles on arrival)
         let settles = self.shop.standin.settles();
         let fresh = settles.iter().filter(|s| s.was_held).count();
-        assert_eq!(fresh, self.shop.settled(), "a ticket settled twice: {settles:?}");
+        assert_eq!(fresh, self.shop.standin.count_held(InvoiceState::Settled), "a ticket settled twice: {settles:?}");
     }
 }
 
@@ -1065,11 +1084,19 @@ fn no_request_leaves_for_a_host_the_owner_did_not_allow_and_an_unnamed_seller_is
         assert_eq!(v["verdict"], "deny", "{url}: {v}");
     }
     assert!(r.tap.log.lock().unwrap().is_empty());
-    // under the task that pays any seller: two tickets locked, and four tickets' worth paid at most
+    // under the task that pays any seller: the first ticket is a prepaid one, and nothing is held before it is paid;
+    // then one ticket held at a time (the owner's policy here holds 2 with a seller of a few). FAILS before the
+    // owner's decision on sellers it has not named: the session held a pool of 2 from its first lock, and the
+    // seller's first hold invoice went to a buyer that had paid it nothing
     let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": 10, "task": "swarm"}));
-    assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64(), v["tickets"]["locked"].as_i64()), (Some(200), Some(1), Some(1)), "{v}");
+    assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1), Some(1)), "{v}");
+    let locks: Vec<Value> = r.tap.seen("/x402/ticket/lock").iter().map(|s| serde_json::from_str(&s.body).unwrap()).collect();
+    assert_eq!((locks[0]["settle"].as_str(), locks[0].get("hashes")), (Some("on-arrival"), None), "the first lock is for a prepaid ticket: {locks:?}");
     let st = r.status();
-    assert_eq!((st["sessions"][0]["listed"].as_bool(), st["sessions"][0]["pool"].as_i64(), st["sessions"][0]["task"].as_str()), (Some(false), Some(2), Some("swarm")), "{st}");
+    assert_eq!((st["sessions"][0]["listed"].as_bool(), st["sessions"][0]["pool"].as_i64(), st["sessions"][0]["task"].as_str()), (Some(false), Some(1), Some("swarm")), "{st}");
+    // paid: the session holds, one ticket
+    wait_for("one ticket held after the prepaid one", || r.status()["locked"]["tickets"] == 1);
+    assert!(locks.iter().skip(1).all(|l| l["hashes"].as_array().is_none_or(|h| h.len() <= 1)), "{locks:?}");
     let file = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{}", 30 * MIB)), "max_sats": 20_000, "task": "swarm"}));
     assert_eq!(file["complete"], false, "{file}");
     assert!(file["ended"].as_str().unwrap().contains("the owner's cap on sats paid to this seller"), "the owner's cap for a seller it has not named: {file}");
@@ -1707,6 +1734,85 @@ fn a_kill_of_the_signer_at_every_write_of_a_paid_call_never_undercounts_and_the_
         }
     }
     assert!(survived.is_some_and(|s| s > 5), "the call was killed at every write step up to its end: {survived:?}");
+}
+
+/// A seller that issues held tickets only to a session that has paid it (the gateway as it
+/// ships) is paid one prepaid ticket first, and then held tickets, by a wallet that would hold at
+/// once with a seller its owner named.
+///
+/// FAILS before: the wallet read the seller's `prepaid_first` as a refusal of the lock and gave up
+/// the session (`ticket_seller`), so no seller as shipped could be paid with tickets.
+#[test]
+fn a_seller_that_holds_only_after_a_prepaid_ticket_is_paid_one_first_and_then_held_ones() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, strict_shop());
+    let v = r.pay("/page/10", 10);
+    assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1), Some(1)), "{v}");
+    let locks: Vec<Value> = r.tap.seen("/x402/ticket/lock").iter().map(|s| serde_json::from_str(&s.body).unwrap()).collect();
+    assert!(locks[0]["hashes"].is_array() && locks[1]["settle"] == "on-arrival", "a held lock, refused, then a prepaid one: {locks:?}");
+    let st = r.status();
+    assert_eq!((st["sessions"][0]["listed"].as_bool(), st["sessions"][0]["pool"].as_i64()), (Some(true), Some(2)), "{st}");
+    // paid: the named seller is held with as before, 2 tickets
+    wait_for("two tickets held after the prepaid one", || r.status()["locked"]["tickets"] == 2);
+    // (6 MiB at 200 sat a MiB: more than the prepaid ticket left)
+    let next = r.pay(&format!("/files/{}", 6 * MIB), 2_000);
+    assert_eq!((next["status"].as_u64(), next["tickets_prepaid"].as_u64(), next["session"].as_str()), (Some(200), Some(0), v["session"].as_str()), "{next}");
+    assert!(next["tickets_released"].as_u64().unwrap() >= 1, "{next}");
+    r.tick();
+    r.assert_booked();
+}
+
+/// A seller the owner has not named, whose terms offer no prepaid tickets, is not held with at
+/// all: its first ticket would have to be a held one.
+#[test]
+fn an_unnamed_seller_without_prepaid_tickets_is_not_held_with() {
+    let _g = env_lock();
+    let held_only = json!({"tickets": {"settle": ["on-use"]}, "caps": {"sessions_per_address": 0}});
+    let r = Rig::with(json!({"tickets": {"unlisted_private": true}}), false, true, 30, held_only);
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": 10, "task": "swarm"}));
+    assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("no_rail")), "{v}");
+    assert!(v["rails_passed_over"][0]["why"].as_str().unwrap().starts_with("ticket_prepaid_first"), "{v}");
+    assert!(r.tap.seen("/x402/ticket/").is_empty() && r.ln.paid_msat() == 0, "nothing locked, nothing paid");
+}
+
+/// The signer killed at every write of a first call to a seller as it ships (a held lock refused
+/// `prepaid_first`, the session marked to buy a prepaid ticket, the purchase): nothing is booked
+/// that the node did not pay, nothing paid that is not booked, and the next call pays.
+#[test]
+fn a_kill_at_every_write_of_a_call_that_buys_its_prepaid_ticket_first_never_undercounts() {
+    let _g = env_lock();
+    let mut survived = None;
+    for step in 0..400 {
+        let mut r = Rig::shipped(json!({}), 30, strict_shop());
+        let done = crashing(step, || r.pay("/page/10", 10));
+        if let Some(v) = &done {
+            assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "step {step}: {v}");
+            survived = Some(step);
+            // a call that ended holds 2 tickets behind it once its refill is back: this rig's "kill" leaves the old
+            // signer's threads running, so the refill is waited for rather than raced
+            wait_for("the refill behind the call", || r.status()["locked"]["tickets"] == 2);
+        }
+        r.restart();
+        r.assert_booked();
+        r.clock.fetch_add(200, Ordering::SeqCst);
+        r.tick();
+        wait_for(&format!("nothing in flight (step {step}, survived {})", done.is_some()), || {
+            r.tick();
+            r.ln.by_status("IN_FLIGHT").is_empty()
+        });
+        // what the node paid is booked, and it is at most the prepaid ticket of the call
+        let (paid, taken, _, ledger) = r.money();
+        assert_eq!(taken, paid, "step {step}");
+        assert!(paid <= TICKET, "step {step}: {paid}");
+        assert_eq!(ledger, (paid / TICKET) as i64 * SETTLED, "step {step}: {:?}", r.ledger());
+        let v = r.pay("/page/10", 10);
+        assert_eq!(v["status"].as_u64(), Some(200), "step {step}: {v}");
+        r.assert_booked();
+        if done.is_some() {
+            break;
+        }
+    }
+    assert!(survived.is_some_and(|s| s > 5), "{survived:?}");
 }
 
 /// An ordinary payment (a prepaid ticket here; a win of the lottery is booked by the same function)

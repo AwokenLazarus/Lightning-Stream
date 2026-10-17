@@ -175,14 +175,16 @@ pub fn routes() -> Value {
 }
 
 /// A config for tests: `edit` changes it before it is read. The tests of the gateway's mechanisms
-/// run a seller whose inbound channels all carry 483 pending payments and who lets a session hold
-/// 8 tickets; the shipped defaults (2 a session, 15 in all) have tests of their own.
+/// run a seller whose inbound channels all carry 483 pending payments, who lets a session hold
+/// 8 tickets, and who issues hold invoices to a session that has paid nothing; the shipped
+/// defaults (2 a session, 15 in all, a prepaid ticket first, 2 unpaid invoices an address) have
+/// tests of their own.
 pub fn config(state: &Path, upstream: &str, edit: &dyn Fn(&mut Value)) -> Value {
     let mut v = json!({"listen": "127.0.0.1:0", "public_url": "http://gateway.test:8402", "upstream": upstream, "state_dir": state,
         "chain": "regtest", "network": NET,
         "node": {"rest": "http://127.0.0.1:1", "macaroon": "unused", "info_macaroon": "unused"},
         "tickets": {"max_tickets": 8},
-        "caps": {"sessions_per_address": 0, "inbound_slots": 483},
+        "caps": {"sessions_per_address": 0, "inbound_slots": 483, "held_after_paid": false, "unpaid_per_address": 0},
         "times": {"refill_wait_ms": 300, "upstream_wait_secs": 2, "tick_ms": 50},
         "routes": routes()});
     edit(&mut v);

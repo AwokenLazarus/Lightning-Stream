@@ -760,7 +760,7 @@ fn a_kill_at_every_write_point_of_a_settle_or_a_start_leaves_the_ledger_exact() 
 #[test]
 fn an_invoice_that_is_not_the_sessions_ticket_is_never_paid() {
     let _g = env_lock();
-    let r = Rig::new(json!({}));
+    let r = Rig::new(json!({"allowlist": naming(&[0x55])}));
     let sid = r.open();
     let other = Seller::new(0x55);
     let other_sid = r.open_with(&other, "swarm")["session"].as_str().unwrap().to_string();
@@ -920,24 +920,21 @@ fn an_unnamed_seller_is_paid_only_inside_a_task_that_admits_any_and_only_a_littl
     let r = Rig::new(json!({}));
     let stranger = Seller::new(0x55);
     assert_eq!(r.open_with(&stranger, "work")["rule"], "ticket_admission", "work pays only sellers the owner named");
+    // a seller the owner has not named is held with only after one prepaid ticket has been paid: with terms that
+    // offer none, it is not held with at all. FAILS before the owner's decision: a pool of 2 was locked at once
     let o = r.open_with(&stranger, "swarm");
-    assert_eq!((o["verdict"].as_str(), o["listed"].as_bool(), o["pool"].as_i64()), (Some("allow"), Some(false), Some(2)), "{o}");
+    assert_eq!((o["verdict"].as_str(), o["rule"].as_str()), (Some("deny"), Some("ticket_prepaid_first")), "{o}");
+    let mut prepaid = r.terms(&stranger);
+    prepaid["extra"]["settle"] = "on-arrival".into();
+    let o = r.call("ticket_open", json!({"terms": r.terms(&stranger), "prepaid_terms": prepaid, "task": "swarm"}));
+    // and then 1 ticket held at a time, where the owner holds 2 with a named seller of a few
+    assert_eq!((o["verdict"].as_str(), o["listed"].as_bool(), o["pool"].as_i64(), o["prepaid_msat"].as_str()), (Some("allow"), Some(false), Some(1), Some("1000000")), "{o}");
     let sid = o["session"].as_str().unwrap().to_string();
-    assert_eq!(r.fill_with(&sid, &stranger).len(), 2, "two tickets locked with a seller the owner has not named");
-    // 4,000 sat paid to an unnamed seller a day by default: three tickets with their fee limit fit, a fourth does not
-    for _ in 0..2 {
-        assert_eq!(r.release(&sid)["verdict"], "allow");
-    }
-    let (n, why) = try_fill(&r, &sid, &stranger);
-    assert_eq!(n, 1, "{why}");
-    assert!(why.contains("the owner's cap on sats paid to this seller (4000)"), "{why}");
-    assert_eq!(r.release(&sid)["verdict"], "allow");
-    assert_eq!(r.release(&sid)["rule"], "ticket_none");
-    assert_eq!((try_fill(&r, &sid, &stranger).0, r.ledger_sum()), (0, 3 * BOOKING));
-    // the wallet's own cap for one counterparty binds an unnamed seller too
-    let tight = Rig::new(json!({"per_counterparty_cap_sats": BOOKING + 5}));
-    let sid = tight.open_with(&stranger, "swarm")["session"].as_str().unwrap().to_string();
-    assert_eq!(try_fill(&tight, &sid, &stranger).0, 1);
+    assert!(r.offer(&sid).is_empty(), "no hash goes to the seller before the prepaid ticket is paid");
+    let st = r.session(&sid);
+    assert_eq!(st["sessions"][0]["paid_first"], true, "{st}");
+    // (what such a seller is paid in all, and the wallet's cap for one counterparty, are held on the HTTP path,
+    // which buys the prepaid ticket: tests/ticket_pay.rs)
     // an origin counts as named only where the owner tied it to this node id
     let named = Seller::new(0x56);
     let tied = Rig::new(json!({"counterparties": {PROVIDER: {"ln_node": named.id()}}}));
@@ -960,17 +957,17 @@ fn an_unnamed_seller_is_paid_only_inside_a_task_that_admits_any_and_only_a_littl
 fn a_task_has_a_budget_a_limit_on_sellers_and_two_tickets_a_seller_when_there_are_many() {
     let _g = env_lock();
     // the task budget, fees included, across its sellers
-    let r = Rig::new(json!({"tickets": {"tasks": {"swarm": {"budget_sats": 3 * BOOKING + 10, "admit": "any", "unlisted_max_spend_sats": 5_000}}}}));
+    let r = Rig::new(json!({"allowlist": naming(&[0x61, 0x62]), "tickets": {"tasks": {"swarm": {"budget_sats": 3 * BOOKING + 10, "admit": "any"}}}}));
     let (a, b) = (Seller::new(0x61), Seller::new(0x62));
     let (sa, sb) = (r.open_with(&a, "swarm")["session"].as_str().unwrap().to_string(), r.open_with(&b, "swarm")["session"].as_str().unwrap().to_string());
-    assert_eq!((r.fill_with(&sa, &a).len(), r.fill_with(&sb, &b).len()), (2, 1), "the third ticket of the second seller would lock past the task's budget");
-    assert_eq!((r.release(&sa)["verdict"].as_str(), r.release(&sa)["verdict"].as_str(), r.release(&sb)["verdict"].as_str()), (Some("allow"), Some("allow"), Some("allow")));
+    assert_eq!((r.fill_with(&sa, &a).len(), r.fill_with(&sb, &b).len()), (3, 0), "a fourth ticket, of either seller, would lock past the task's budget");
+    assert_eq!((r.release(&sa)["verdict"].as_str(), r.release(&sa)["verdict"].as_str(), r.release(&sa)["verdict"].as_str()), (Some("allow"), Some("allow"), Some("allow")));
     assert_eq!(r.ledger_sum(), 3 * BOOKING);
     for s in [&sa, &sb] {
         assert!(r.fill_with(s, if s == &sa { &a } else { &b }).is_empty(), "nothing more is locked under a spent budget");
     }
     // how many sellers at once, and how many new ones a minute
-    let r = Rig::new(json!({"tickets": {"max_new_sellers_per_min": 3, "tasks": {"swarm": {"budget_sats": 5_000, "admit": "any", "max_sellers": 2}}}}));
+    let r = Rig::new(json!({"allowlist": naming(&[0x61, 0x62, 0x63, 0x64]), "tickets": {"max_new_sellers_per_min": 3, "tasks": {"swarm": {"budget_sats": 5_000, "admit": "any", "max_sellers": 2}}}}));
     assert_eq!(r.open_with(&Seller::new(0x61), "swarm")["verdict"], "allow");
     let second = r.open_with(&Seller::new(0x62), "swarm")["session"].as_str().unwrap().to_string();
     assert_eq!(r.open_with(&Seller::new(0x63), "swarm")["rule"], "ticket_sellers", "the task's max_sellers");
@@ -1083,7 +1080,7 @@ fn after_a_restart_what_was_locked_is_booked_and_never_released_and_comes_back_a
 #[test]
 fn a_restore_from_an_older_backup_finds_its_tickets_on_the_node_and_counts_them_as_spent() {
     let _g = env_lock();
-    let mut r = Rig::new(json!({}));
+    let mut r = Rig::new(json!({"allowlist": naming(&[0x55])}));
     let sid = r.open();
     let first = r.fill(&sid);
     let s1 = r.release(&sid)["ticket_secret"].as_str().unwrap().to_string();
@@ -1099,7 +1096,9 @@ fn a_restore_from_an_older_backup_finds_its_tickets_on_the_node_and_counts_them_
     let s3 = r.release(&sid)["ticket_secret"].as_str().unwrap().to_string();
     assert!(r.ln.settle(&s2));
     let other = Seller::new(0x55);
-    let sid2 = r.open_with(&other, "swarm")["session"].as_str().unwrap().to_string();
+    let mut two = r.terms(&other);
+    two["extra"]["maxTickets"] = 2.into();
+    let sid2 = r.call("ticket_open", json!({"terms": two, "task": "swarm"}))["session"].as_str().unwrap().to_string();
     let second = r.fill_with(&sid2, &other);
     assert_eq!(second.len(), 2);
     let s4 = r.release(&sid2)["ticket_secret"].as_str().unwrap().to_string();
@@ -1145,7 +1144,7 @@ fn a_restore_from_an_older_backup_finds_its_tickets_on_the_node_and_counts_them_
 #[test]
 fn only_this_wallets_tag_makes_a_node_payment_a_ticket_and_the_list_is_read_before_anything_is_paid() {
     let _g = env_lock();
-    let mut r = Rig::new(json!({}));
+    let mut r = Rig::new(json!({"allowlist": naming(&[0x55])}));
     let sid = r.open();
     r.fill(&sid);
     // on the same node: a payment with another wallet's tag, one with no tag, one tagged with garbage
@@ -1498,6 +1497,16 @@ fn a_payments_failure_reason_is_the_nodes_text_and_stays_under_the_untrusted_fie
     let hashes = r.offer(&sid);
     let locked = r.lock(&sid, hashes.iter().map(|h| (h.clone(), r.seller.invoice(r.now(), h, &Inv::default()))).collect());
     assert!(locked["tickets"].as_array().unwrap().iter().all(|t| t["note"] == "FAILURE_REASON_INSUFFICIENT_BALANCE"), "{locked}");
+}
+
+/// The owner's allowlist naming the rig's seller and `others`: for tests of the book's mechanics
+/// with several sellers, where whether the owner named them is not what is tested. (A seller the
+/// owner has not named is held with only after a prepaid ticket, which the socket's `ticket_open`
+/// path cannot buy: the wallet's own HTTP payer does.)
+fn naming(others: &[u8]) -> Value {
+    let mut a = vec![json!(PROVIDER), json!(Seller::new(0x33).dest())];
+    a.extend(others.iter().map(|n| json!(Seller::new(*n).dest())));
+    json!(a)
 }
 
 /// Every string of a result, keys included, outside `untrusted_ln_data`.
