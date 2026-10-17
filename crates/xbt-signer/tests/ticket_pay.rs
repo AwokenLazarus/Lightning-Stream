@@ -3084,6 +3084,34 @@ fn a_burst_of_pieces_gets_no_more_values_ahead_of_a_reveal_than_the_owner_allows
     assert_wins(&r, v["wins_paid"].as_u64().unwrap());
 }
 
+/// A `HEAD` of a route priced by the byte or the second costs nothing, and the gateway serves it
+/// only to a session that has paid something (its balance covers the first byte and second); a
+/// `HEAD` of a route with no price per request has no piece to draw for, so the seller's 402
+/// offers no lottery entry for it. The wallet pays such a `HEAD` with a ticket in either case: it
+/// releases one into a session whose balance is zero, and with a seller it pays by draws it opens a
+/// ticket session beside that one.
+#[test]
+fn a_head_is_paid_with_a_ticket_where_the_seller_wants_one_and_never_by_draws() {
+    let _g = env_lock();
+    // a session with nothing in it: a ticket is released, and the HEAD is served from the balance
+    let r = Rig::new(json!({}));
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{}", MIB)), "method": "HEAD", "max_sats": 100, "task": "film"}));
+    assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64(), v["bytes"].as_u64()), (Some(200), Some(1), Some(0)), "{v}");
+    // a route priced by the second, in a new session of its own
+    let r = Rig::new(json!({}));
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/timed/3"), "method": "HEAD", "max_sats": 1_000, "task": "film"}));
+    assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64()), (Some(200), Some(1)), "{v}");
+    // the same from a seller the wallet pays by draws, with a session of draws open: the HEAD has no lottery entry
+    let r = draws_rig(json!({}));
+    let first = r.pay(&format!("/pieces/{}", 4 * PIECE), 1_000);
+    assert_eq!(first["rail"], "lottery", "{first}");
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/pieces/{}", 4 * PIECE)), "method": "HEAD", "max_sats": 2_000, "task": "film"}));
+    assert_eq!((v["status"].as_u64(), v["rail"].as_str()), (Some(200), Some("ticket")), "{v}");
+    // and the next GET goes on by draws in the session that was open
+    let next = r.pay(&format!("/pieces/{}", 4 * PIECE), 1_000);
+    assert_eq!((next["rail"].as_str(), next["session"].as_str()), (Some("lottery"), first["session"].as_str()), "{next}");
+}
+
 #[test]
 fn a_piece_whose_hash_the_caller_named_gets_its_value_only_if_it_matches() {
     let _g = env_lock();
