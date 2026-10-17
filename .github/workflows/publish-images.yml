@@ -1,0 +1,75 @@
+# Publish the images the Umbrel apps and the StartOS packages run to GitHub's container registry.
+#
+# Started by hand only (Actions -> "Publish images" -> Run workflow). It runs scripts/oci_publish.sh on
+# the commit it is started from: static musl binaries for linux/amd64, linux/arm64 and linux/arm/v7,
+# FROM scratch, pushed as ghcr.io/<owner>/<image>:<version>-<12-hex commit>. A tag that is already
+# published is refused, never moved. The digests it pushed are in packaging/images.lock, uploaded as an
+# artifact of the run; the maintainers commit that file, which pins the packages to those digests.
+#
+# The workflow's own token logs in to the registry; no personal token is used. A package GitHub creates
+# on the first push is private until it is made public in its settings (packaging/README.md, "Images").
+name: Publish images
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-images
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_TOOLCHAIN: "1.98.0"
+  ZIGLANG_VERSION: "0.16.0"
+
+jobs:
+  publish:
+    name: build and publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain and the three musl targets
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --no-self-update \
+            --target x86_64-unknown-linux-musl --target aarch64-unknown-linux-musl --target armv7-unknown-linux-musleabihf
+          rustup default "$RUST_TOOLCHAIN"
+          rustc --version
+      - name: Install zig (the linker tools/zig-cc runs)
+        run: |
+          python3 -m venv "$HOME/.local/share/ziglang-venv"
+          "$HOME/.local/share/ziglang-venv/bin/pip" install --quiet "ziglang==$ZIGLANG_VERSION"
+          "$HOME/.local/share/ziglang-venv/bin/python" -m ziglang version
+      - name: Install the tools the build checks with
+        run: sudo apt-get update -q && sudo apt-get install -y -q file
+      # buildx keeps a multi-platform index only with the containerd image store or a container builder
+      - name: Set up a buildx builder
+        run: |
+          docker buildx create --name publish --driver docker-container --use
+          docker buildx inspect --bootstrap
+      - name: Log in to the registry with the workflow's token
+        env:
+          TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: printf '%s' "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+      - name: Fetch the dependencies Cargo.lock names
+        run: cargo fetch --locked
+      - name: Build and publish
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: scripts/oci_publish.sh --no-pin --registry "ghcr.io/${OWNER,,}"
+      - name: Keep the digests
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: images-lock
+          path: |
+            packaging/images.lock
+            dist/oci/IMAGES.md
+          if-no-files-found: error
