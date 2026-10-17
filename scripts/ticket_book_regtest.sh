@@ -80,7 +80,7 @@ export COMPOSE_FILE=$LAB/docker-compose.yml:$R/compose.yml
 B=$TICKET_BOOK_PORT_BASE
 # shellcheck disable=SC2046 # the port list is meant to split
 python3 "$ROOT/scripts/portcheck.py" wait "$B" $((B + 1)) $((B + 2)) $((B + 40)) $(seq $((B + 11)) $((B + 10 + TICKET_BOOK_SELLERS)))
-nice -n 19 cargo build -q -j4 --release --offline -p xbt-signer --bin xbt-signer -p xbt-wallet-mcp --bin xbt-wallet-mcp
+nice -n 19 cargo build -q -j4 --release --locked -p xbt-signer --bin xbt-signer -p xbt-wallet-mcp --bin xbt-wallet-mcp
 BIN=${CARGO_TARGET_DIR:-$ROOT/target}/release
 (cd "$LAB" && docker compose up -d fees knots-b2b)
 

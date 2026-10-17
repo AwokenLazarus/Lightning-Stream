@@ -86,7 +86,7 @@ R=$(mktemp -d "$ROOT/run/demo-XXXXXX")
 for tool in docker python3 ffmpeg ffprobe; do
   command -v "$tool" >/dev/null 2>&1 || { echo "demo: $tool is needed and is not on the PATH" >&2; exit 1; }
 done
-nice -n 19 cargo build -q -j4 --release --offline -p xbt-signer --bin xbt-signer -p xbt-wallet-mcp --bin xbt-wallet-mcp -p xbt-gateway --bin xbt-gateway
+nice -n 19 cargo build -q -j4 --release --locked -p xbt-signer --bin xbt-signer -p xbt-wallet-mcp --bin xbt-wallet-mcp -p xbt-gateway --bin xbt-gateway
 BIN=${CARGO_TARGET_DIR:-$ROOT/target}/release
 
 # the lab and the node binaries: cloned and built when missing

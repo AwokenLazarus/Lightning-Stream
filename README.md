@@ -33,6 +33,9 @@ or removed.
 
 Whitepaper: **<https://lazarus-xbt.xyz/stream/>**
 
+**To try it**: [`docs/TESTING.md`](docs/TESTING.md) is the guide for an outside tester: build it,
+run the regtest labs and the film demo on your own machine, and report what broke.
+
 Lightning Stream adds little of its own to a great deal of other people's work. What it is
 built on and what came before it are under [Built on](#built-on) and [Prior art](#prior-art);
 the full list, with a link for each, is [`docs/REFERENCES.md`](docs/REFERENCES.md).
@@ -292,12 +295,24 @@ scripts wrote on their latest runs, as they were written: our own runs, on one h
 
 ## Build
 
+What to install first, on a stock Ubuntu 24.04 (other systems need the same things under their
+own names): git, a C compiler and linker (`build-essential`; libsecp256k1 is built from source),
+and Rust stable from <https://rustup.rs>.
+
 ```bash
-cargo test -j2 --workspace
+sudo apt-get install -y git curl build-essential
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+git clone https://github.com/AwokenLazarus/Lightning-Stream.git && cd Lightning-Stream
+ulimit -n 4096    # the tests open many loopback connections at once
+cargo test -j2 --workspace --locked
 cargo build --release -p xbt-signer -p xbt-wallet-mcp -p xbt-wallet-ui
 ```
 
-Rust stable; libsecp256k1 is built from source. The workspace builds, tests and passes clippy on
+The `ulimit` line matters: at the open-file limit of 1024 that many Linux shells start with,
+about half of `crates/xbt-signer/tests/ticket_pay.rs` fails with "Too many open files". With
+4096 the whole workspace passes.
+
+The workspace builds, tests and passes clippy on
 Rust 1.98.0, which is what `.github/workflows/ci.yml` runs on every push and pull request, and
 builds, tests and passes clippy on 1.91.1. The minimum stated in `Cargo.toml` is 1.90: the locked
 `ruint` 1.20.1 declares it, the highest of any locked package (the code itself needs 1.89). No
@@ -309,7 +324,8 @@ What each script needs beyond this repository:
 | Scripts | Need | Can someone outside the project run them? |
 |---|---|---|
 | The Lightning regtest scripts: `ln_ticket_regtest.sh`, `gateway_regtest.sh`, `ticket_book_regtest.sh`, `ticket_e2e_regtest.sh`, `lottery_regtest.sh`, `ln_rail_regtest.sh`, `demo_film.sh` | Docker with compose and python3 (the demo also ffmpeg). They fetch and build the Lightning Fork lab under `run/` | Yes. The reports of our latest runs are in `reports/` |
-| `container_test.sh`, `ui/regtest_ui.sh` | A Bitcoin Knots 29.4.2 build for XBT (`XBT_BIN`), Docker | Yes, with that build |
+| `container_test.sh` | Docker with compose and buildx, python3, `file` and `ss` (Ubuntu: `file`, `iproute2`), the three musl targets (`rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf`) and zig: `python3 -m venv ~/.local/share/ziglang-venv && ~/.local/share/ziglang-venv/bin/pip install ziglang==0.16.0` (or point `XBT_ZIG_PY` at a Python that has it). It builds the images and loads them into Docker as `<image>:agp038` and `<image>:0.1.0`, replacing images of those names, and uses the Lightning Fork lab above | Yes |
+| `ui/regtest_ui.sh` | A Bitcoin Knots 29.4.2 build for XBT (`XBT_BIN`), Docker | Yes, with that build |
 | `mcp/verify_agp030.sh`, `ui/regtest_ui.sh`, the vector generators (`gen_*.py`) | The Python references linked above, at the paths their headers name (`B2_TREE`, `XBT402_B1`); `gen_unified_sighash_ext.py` needs a Knots source tree instead | Yes |
 | The cross builds: `build_matrix.sh`, `oci_build.sh`, `cmp_clean_build.sh`, `work_matrix.sh` | zig as the C compiler, from the `ziglang` Python wheel in a virtual environment (`XBT_ZIG_PY`; no version of it is pinned in this tree). `cmp_clean_build.sh` also needs cargo-zigbuild 0.23.4 | Yes |
 | The pay-with-work scripts: `work_conformance.sh`, `work_interop.sh`, `work_nta.sh`, `relay_container_test.sh` | The pay-with-work specification tree (XBT-053) and a pool server (`primed`) built from a branch that is not published; `work_nta.sh` also calls a helper of the machine it was written on, and goes on without it | **No.** Nothing they report can be reproduced outside the project until those are published |

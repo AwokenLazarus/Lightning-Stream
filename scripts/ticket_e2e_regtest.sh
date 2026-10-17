@@ -77,7 +77,7 @@ trap 'exit 130' INT TERM HUP
 mkdir -p "$ROOT/run"
 R=$(mktemp -d "$ROOT/run/ticket-e2e-XXXXXX")
 
-nice -n 19 cargo build -q -j4 --release --offline -p xbt-signer --bin xbt-signer -p xbt-wallet-mcp --bin xbt-wallet-mcp -p xbt-gateway --bin xbt-gateway
+nice -n 19 cargo build -q -j4 --release --locked -p xbt-signer --bin xbt-signer -p xbt-wallet-mcp --bin xbt-wallet-mcp -p xbt-gateway --bin xbt-gateway
 BIN=${CARGO_TARGET_DIR:-$ROOT/target}/release
 
 # the lab and the node binaries: cloned and built when missing
