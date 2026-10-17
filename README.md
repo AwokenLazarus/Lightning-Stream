@@ -210,8 +210,10 @@ last one), and their tests, vectors and scripts. They are in the git history, la
 
 - A wallet that was upgraded with channels on record cannot close or refund them with this
   version. It leaves their records and sealed keys untouched and says which revision settles them.
-- The wallet pays sellers over Lightning only. The Umbrel and StartOS packages do not wire a
-  Lightning node into the wallet yet, so a packaged wallet can pay no seller for now.
+- The wallet pays sellers over Lightning only. The Umbrel and StartOS packages (a wallet app and
+  a gateway app each) use the box's Lightning Fork node; a packaged wallet has bought from a
+  packaged gateway with tickets on regtest only, and no package has been installed on a real box
+  yet (`packaging/README.md`, `packaging/DESIGN.md`).
 - A seller that cannot run a Lightning node has no rail here; pay with work is the other way in.
 
 ## Built on
@@ -281,7 +283,7 @@ tickets and the lottery on both sides, pay with work, and the services and packa
 | `xbt-gateway` | the stream-ticket seller gateway: a reverse proxy beside a Lightning node that puts a price per piece on any HTTP service (regtest only) |
 | `xbt-svc` | container plumbing: data dir, secrets, readiness, the bounded HTTP server |
 
-`packaging/` holds the Umbrel and StartOS apps of the wallet. `container/` and `docs/CONTAINER.md`
+`packaging/` holds the Umbrel and StartOS apps of the wallet and of the gateway. `container/` and `docs/CONTAINER.md`
 cover the images. `docs/ENGINEERING.md` has the design notes, conformance results and measurements
 of the on-chain channel and the hub, as history: most of what it names is no longer in the tree.
 `docs/LIMITS.md` has the stated limits and open items. `reports/` holds the reports the regtest

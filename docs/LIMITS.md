@@ -73,8 +73,10 @@ limits are in the git history, last at commit `1ad0c48`. What the removal leaves
 - The hot key funds nothing any more. It is kept so that coins on it can be seen and swept by the
   owner; `hot_balance_cap_sats` only marks the key as over its cap in the wallet's status.
 - The wallet pays a seller over Lightning only. The Umbrel and StartOS packages and the container
-  stack wire no Lightning node into the wallet, so a packaged wallet pays no seller, and their
-  tests no longer contain a paid call.
+  stack take the box's Lightning Fork node; their tests buy from a packaged gateway with a ticket,
+  on regtest, with the wallet and the gateway sharing one network namespace (regtest has no https
+  name with a public certificate). No package has been installed on a real umbrelOS or StartOS
+  box; what that leaves untried is in `packaging/README.md`.
 - A seller that offers only the channel is answered `no_rail` by `xbt402_pay`, with the reason.
 - Content paid for chunk by chunk against a Merkle root with a hash-locked last chunk
   (`xbt402-merkle-v1`) can no longer be bought. The ticket wire has its own form of it
