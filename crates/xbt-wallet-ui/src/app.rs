@@ -10,8 +10,8 @@ use std::sync::Arc;
 use serde_json::{json, Map, Value};
 
 use crate::auth::Auth;
-use crate::config::Config;
-use crate::html::{esc, escv, int, json_block, kv, page, sats, short, txt, utc, Nav};
+use crate::config::{Config, Role};
+use crate::html::{esc, escv, int, json_block, kv, page, sats, short, txt, utc, Nav, GATEWAY_BRAND, GATEWAY_PAGES, WALLET_BRAND, WALLET_PAGES};
 use crate::link::SignerLink;
 use crate::server::{strip_base, Req, Resp};
 use crate::{msg, now};
@@ -51,10 +51,10 @@ impl Ext {
 }
 
 /// One request's session.
-struct Ctx {
-    sid: String,
-    csrf: String,
-    flash: Option<(bool, String)>,
+pub(crate) struct Ctx {
+    pub(crate) sid: String,
+    pub(crate) csrf: String,
+    pub(crate) flash: Option<(bool, String)>,
 }
 
 const INT_KEYS: [(&str, &str, &str); 12] = [
@@ -72,11 +72,26 @@ const INT_KEYS: [(&str, &str, &str); 12] = [
     ("treasury_csv", "Treasury CSV (blocks; B2 field, unused by the Rust signer)", "anchor"),
 ];
 
-/// A conservative first policy (the setup wizard's template; `xbt-wallet-mcp/policy.example.json`'s limits).
-pub fn starter_policy() -> Value {
-    json!({"allowlist": [], "counterparties": {}, "max_per_tx_sats": 100000, "daily_budget_sats": 200000, "weekly_budget_sats": 500000,
+/// The height the XBT chain split from the SHA-256 chain at: a Lightning channel funded only from
+/// coins older than this exists on both chains, and the rail refuses it.
+pub const MAINNET_SPLIT_HEIGHT: i64 = 961_640;
+
+/// A conservative first policy (the setup wizard's template; `xbt-wallet-mcp/policy.example.json`'s limits),
+/// with the Lightning rail and stream tickets on. On mainnet (`chain` "main") the caps are low: the
+/// software has run on regtest only.
+pub fn starter_policy(chain: &str) -> Value {
+    let mut p = json!({"allowlist": [], "counterparties": {}, "max_per_tx_sats": 100000, "daily_budget_sats": 200000, "weekly_budget_sats": 500000,
            "per_counterparty_cap_sats": 100000, "velocity_max": 60, "velocity_window_s": 3600, "human_threshold_sats": 50000,
-           "split_window_s": 600, "approval_ttl_s": 900, "hot_balance_cap_sats": 1500000, "anchor_interval_s": 300})
+           "split_window_s": 600, "approval_ttl_s": 900, "hot_balance_cap_sats": 1500000, "anchor_interval_s": 300,
+           "ln": {"enabled": true}, "tickets": {"enabled": true}});
+    if chain == "main" {
+        for (k, v) in [("max_per_tx_sats", 2000), ("daily_budget_sats", 10000), ("weekly_budget_sats", 30000), ("per_counterparty_cap_sats", 10000),
+                       ("human_threshold_sats", 1000), ("hot_balance_cap_sats", 50000)] {
+            p[k] = json!(v);
+        }
+        p["ln"]["split_height"] = json!(MAINNET_SPLIT_HEIGHT);
+    }
+    p
 }
 
 fn state_of(c: &Value) -> &'static str {
@@ -118,7 +133,7 @@ impl App {
         self.signer.call(method, params)
     }
 
-    fn cookie(&self, req: &Req, sid: &str, max_age: i64) -> String {
+    pub(crate) fn cookie(&self, req: &Req, sid: &str, max_age: i64) -> String {
         let secure = self.cfg.secure_cookie.unwrap_or_else(|| req.header("x-forwarded-proto").eq_ignore_ascii_case("https"));
         format!("{COOKIE}={sid}; Path={}; HttpOnly; SameSite=Strict; Max-Age={max_age}{}", self.cfg.base_path, if secure { "; Secure" } else { "" })
     }
@@ -149,6 +164,7 @@ impl App {
             (true, "/ui.js") => return Resp::text(200, "text/javascript; charset=utf-8", crate::UI_JS).header("Cache-Control", "public, max-age=86400"),
             (true, "/ui.css") => return Resp::text(200, "text/css; charset=utf-8", crate::UI_CSS).header("Cache-Control", "public, max-age=86400"),
             (true, "/healthz") => return Resp::json(200, &json!({"ok": true})),
+            (true, "/readyz") if self.cfg.role == Role::Gateway => return Resp::json(200, &json!({"ok": true, "role": "gateway"})),
             (true, "/readyz") => {
                 let up = self.call("health", json!({})).is_ok();
                 return Resp::json(if up { 200 } else { 503 }, &json!({"ok": up, "signer": if up { "reachable" } else { "unreachable" }}));
@@ -184,7 +200,16 @@ impl App {
             if !self.auth.check_csrf(&ctx.sid, form.get("csrf").map(String::as_str).unwrap_or("")) {
                 return Resp::text(403, "text/plain", "missing or wrong CSRF token: reload the page");
             }
+            if self.cfg.role == Role::Gateway {
+                return self.gateway_post(&req, &ctx, &form);
+            }
             return self.post(&req, &ctx, &form);
+        }
+        if self.cfg.role == Role::Gateway {
+            return match req.path.as_str() {
+                "/" => self.gateway_page(&ctx, None),
+                _ => Resp::html(404, self.render("Not found", &ctx, "<p>No such page. <a href=\"./\">Gateway</a></p>")),
+            };
         }
         match req.path.as_str() {
             "/" => self.overview(&ctx),
@@ -195,12 +220,13 @@ impl App {
             "/keys" => self.keys(&ctx),
             "/agents" => self.agents(&ctx),
             "/setup" => self.setup(&ctx),
+            "/lightning" => self.lightning_page(&ctx),
             "/api/pending" => Resp::json(200, &json!({"pending": self.pending_count()})),
             _ => Resp::html(404, self.render("Not found", &ctx, "<p>No such page. <a href=\"./\">Overview</a></p>")),
         }
     }
 
-    fn flash(&self, ctx: &Ctx, ok: bool, m: impl Into<String>) {
+    pub(crate) fn flash(&self, ctx: &Ctx, ok: bool, m: impl Into<String>) {
         let m = m.into();
         self.auth.with_session(&ctx.sid, |s| s.flash = Some((ok, m)));
     }
@@ -210,20 +236,28 @@ impl App {
             .map(|a| a.iter().filter(|x| x["state"] == "pending").count()).unwrap_or(0)
     }
 
-    fn render(&self, title: &str, ctx: &Ctx, body: &str) -> String {
-        let nav = Nav { active: title, csrf: &ctx.csrf, pending: self.pending_count(), logged_in: true };
-        page(title, &nav, ctx.flash.clone(), body)
+    pub(crate) fn nav<'a>(&self, active: &'a str, csrf: &'a str, logged_in: bool) -> Nav<'a> {
+        let (pages, brand): (&'static [(&'static str, &'static str)], &'static str) = match self.cfg.role {
+            Role::Wallet => (&WALLET_PAGES, WALLET_BRAND),
+            Role::Gateway => (&GATEWAY_PAGES, GATEWAY_BRAND),
+        };
+        let pending = if logged_in && self.cfg.role == Role::Wallet { self.pending_count() } else { 0 };
+        Nav { active, csrf, pending, logged_in, pages, brand }
     }
 
-    fn page(&self, title: &str, ctx: &Ctx, body: String) -> Resp {
+    pub(crate) fn render(&self, title: &str, ctx: &Ctx, body: &str) -> String {
+        page(title, &self.nav(title, &ctx.csrf, true), ctx.flash.clone(), body)
+    }
+
+    pub(crate) fn page(&self, title: &str, ctx: &Ctx, body: String) -> Resp {
         Resp::html(200, self.render(title, ctx, &body))
     }
 
-    fn csrf_input(ctx: &Ctx) -> String {
+    pub(crate) fn csrf_input(ctx: &Ctx) -> String {
         format!("<input type=\"hidden\" name=\"csrf\" value=\"{}\">", esc(&ctx.csrf))
     }
 
-    fn error_box(e: &str) -> String {
+    pub(crate) fn error_box(e: &str) -> String {
         format!("<div class=\"flash bad\">{}</div>", esc(e))
     }
 
@@ -250,7 +284,7 @@ impl App {
     // --- login and first run ------------------------------------------------------------------------
 
     fn bare(&self, title: &str, flash: Option<(bool, String)>, body: &str) -> String {
-        page(title, &Nav { active: "", csrf: "", pending: 0, logged_in: false }, flash, body)
+        page(title, &self.nav("", "", false), flash, body)
     }
 
     fn setup_password(&self, req: &Req) -> Resp {
@@ -363,6 +397,7 @@ impl App {
                 }
                 Resp::redirect("./agents")
             }
+            "/lightning" => self.lightning_post(ctx, f),
             "/anchor-now" => back("./signatures", self.call("anchor_now", json!({"reason": "operator:ui"})), &|_| "Anchored.".into()),
             "/backup" => {
                 if f.get("backup_pass") != f.get("backup_pass2") {
@@ -576,13 +611,15 @@ impl App {
         let mut p = cur["policy"].clone();
         if template {
             let keep = p.clone();
-            p = starter_policy();
+            let chain = self.call("health", json!({})).ok().and_then(|h| h.get("chain").and_then(Value::as_str).map(str::to_string)).unwrap_or_default();
+            p = starter_policy(&chain);
             for k in ["allowlist", "counterparties", "human_pubkey"] {
                 if let Some(v) = keep.get(k) {
                     p[k] = v.clone();
                 }
             }
-            b.push_str("<div class=\"flash ok\">The conservative template is filled in below (your allowlist and counterparties are kept). Review, then sign.</div>");
+            b.push_str("<div class=\"flash ok\">The conservative template is filled in below (your allowlist and counterparties are kept), with the Lightning rail \
+                        and stream tickets on. Review, then sign.</div>");
         }
         let errs: Vec<String> = cur["errors"].as_array().map(|a| a.iter().map(|x| txt(Some(x))).collect()).unwrap_or_default();
         let warns: Vec<String> = cur["warnings"].as_array().map(|a| a.iter().map(|x| txt(Some(x))).collect()).unwrap_or_default();
@@ -963,7 +1000,7 @@ impl App {
         let step = |done: bool, title: &str, body: String| {
             format!("<li class=\"step {}\"><h2>{} {}</h2>{body}</li>", if done { "done" } else { "todo" }, if done { "✓" } else { "○" }, esc(title))
         };
-        let mut b = String::from("<p>Four steps. The wallet is safe to leave running after each one; nothing is paid until your policy allows it.</p><ol class=\"steps\">");
+        let mut b = String::from("<p>Five steps. The wallet is safe to leave running after each one; nothing is paid until your policy allows it.</p><ol class=\"steps\">");
         b.push_str(&step(true, "UI password", "<p>Set. Sessions end after 15 minutes idle.</p>".into()));
         let key_body = if human.is_empty() {
             format!("<section id=\"human-key-state\" data-enrolled=\"\"><p id=\"browser-key\" class=\"msg\"></p>{}</section>", self.keygen_block(ctx, true))
@@ -975,6 +1012,11 @@ impl App {
         b.push_str(&step(seen("policy_change"), "Your policy",
             format!("<p>{} destination{} allowed now. Start from the conservative template, add the services your agent may pay, and sign it.</p>\
                      <p><a href=\"./policy?template=starter\">Open the template →</a></p>", allow_n, if allow_n == 1 { "" } else { "s" })));
+        let ln = self.call("ln_status", json!({})).unwrap_or(json!({}));
+        b.push_str(&step(ln["ready"] == true, "The Lightning rail",
+            format!("<p>{}</p><p><a href=\"./lightning\">Lightning →</a></p>",
+                    if ln["ready"] == true { "Connected to your Lightning node and ready to pay.".to_string() }
+                    else { format!("Not ready: {}", esc(&txt(ln.get("reason").or(ln.get("config_error"))))) })));
         let enc = ks["encrypted"] == true;
         b.push_str(&step(enc && seen("backup_export"), "Wrapping key and backup",
             format!("<p>The signer's keys are {} at rest{}. {}</p><p><a href=\"./keys\">Download an encrypted backup →</a></p>",

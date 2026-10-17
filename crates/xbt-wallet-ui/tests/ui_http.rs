@@ -666,3 +666,139 @@ fn xbt_compute_status_tile_and_link_when_configured() {
     let mut br = logged_in(&bx);
     assert!(br.get("/").body.contains("unreachable"), "a down cmp shows as unreachable, the page still renders");
 }
+
+// --- the setup pages: the Lightning rail and the seller gateway ------------------------------------
+
+fn mac(ops: &[(&str, &[&str])]) -> String {
+    hex::encode(xbt402::macaroon::lnd_macaroon_for_tests(ops, &[]))
+}
+
+#[cfg(unix)]
+#[test]
+fn the_lightning_page_stores_only_the_rail_s_macaroon_and_never_shows_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let ln = tempfile::tempdir().unwrap();
+    let dir = ln.path().to_path_buf();
+    let b = start(json!({}), false, |c| {
+        c.ln.dir = dir.clone();
+        c.ln.rest = Some("https://10.21.21.66:8180".into());
+    });
+    let mut br = logged_in(&b);
+    let page = br.get("/lightning").body;
+    assert!(page.contains("https://10.21.21.66:8180") && page.contains("info:read offchain:read offchain:write onchain:read"), "{page}");
+    // an admin-like macaroon is refused, and nothing is written
+    let admin = mac(&[("info", &["read"]), ("offchain", &["read", "write"]), ("onchain", &["read", "write"]), ("macaroon", &["generate"])]);
+    let r = br.act("/lightning", "/lightning", &[("action", "save"), ("macaroon", &admin)]);
+    let f = br.flash_after(&r);
+    assert!(f.contains("onchain:write") || f.contains("grants"), "{f}");
+    assert!(!dir.join("rail.macaroon").exists());
+    // one that lacks a permission is refused too
+    let short = mac(&[("info", &["read"]), ("offchain", &["read"])]);
+    let r = br.act("/lightning", "/lightning", &[("action", "save"), ("macaroon", &short)]);
+    assert!(br.flash_after(&r).contains("lacks"));
+    // the rail's four: stored 0640, never shown back
+    let good = mac(&[("info", &["read"]), ("offchain", &["read", "write"]), ("onchain", &["read"])]);
+    let r = br.act("/lightning", "/lightning", &[("action", "save"), ("macaroon", &good)]);
+    assert!(br.flash_after(&r).contains("saved"), "save");
+    let stored = std::fs::read(dir.join("rail.macaroon")).unwrap();
+    assert_eq!(hex::encode(&stored), good);
+    assert_eq!(std::fs::metadata(dir.join("rail.macaroon")).unwrap().permissions().mode() & 0o777, 0o640);
+    let page = br.get("/lightning").body;
+    assert!(page.contains("stored") && !page.contains(&good));
+    // regtest: no acknowledgement asked, none written
+    assert!(!dir.join("mainnet-ack").exists() && !page.contains("name=\"mainnet_ack\""));
+    let r = br.act("/lightning", "/lightning", &[("action", "remove")]);
+    assert!(br.flash_after(&r).contains("removed"));
+    assert!(!dir.join("rail.macaroon").exists());
+}
+
+#[test]
+fn the_starter_policy_turns_the_rail_and_tickets_on_and_is_low_on_mainnet() {
+    let t = xbt_wallet_ui::app::starter_policy("regtest");
+    assert_eq!((t["ln"]["enabled"].clone(), t["tickets"]["enabled"].clone()), (json!(true), json!(true)));
+    assert!(t["ln"].get("split_height").is_none());
+    let m = xbt_wallet_ui::app::starter_policy("main");
+    assert_eq!(m["ln"]["split_height"], json!(xbt_wallet_ui::app::MAINNET_SPLIT_HEIGHT));
+    assert!(m["max_per_tx_sats"].as_i64().unwrap() <= 2000 && m["daily_budget_sats"].as_i64().unwrap() <= 10000);
+    // the signer takes both
+    for p in [t, m] {
+        assert!(xbt_signer::policy::validate_policy(&p).0.is_empty(), "{p}");
+    }
+}
+
+/// The gateway app's UI: no signer, one page.
+fn gateway_ui(dir: &std::path::Path) -> (tempfile::TempDir, Arc<App>, xbt_wallet_ui::server::Running, String) {
+    let data = tempfile::tempdir().unwrap();
+    let mut cfg = Config::for_test(data.path().join("no-signer.sock"), data.path().join("ui"), "127.0.0.1:0");
+    cfg.role = xbt_wallet_ui::config::Role::Gateway;
+    cfg.gw.dir = dir.to_path_buf();
+    cfg.gw.node_rest = Some("https://10.21.21.66:8180".into());
+    cfg.gw.node_tls_cert = Some("/data/lightning/tls.cert".into());
+    let app = App::new(cfg).unwrap();
+    let srv = xbt_wallet_ui::server::spawn(app.clone()).unwrap();
+    let base = format!("http://{}", srv.addr);
+    (data, app, srv, base)
+}
+
+#[cfg(unix)]
+#[test]
+fn the_gateway_page_writes_a_config_the_gateway_takes_and_mainnet_is_asked_for() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let gw = tempfile::tempdir().unwrap();
+    let dir = gw.path();
+    let (data, _app, _srv, base) = gateway_ui(dir);
+    let mut br = B::new(&base);
+    let code = std::fs::read_to_string(data.path().join("ui/setup-code")).unwrap();
+    assert_eq!(br.post("/setup-password", &[("code", code.trim()), ("password", PW), ("password2", PW)]).status, 303);
+    assert_eq!(br.get("/readyz").status, 200, "no signer, and ready");
+    let page = br.get("/").body;
+    assert!(page.contains("Lightning Stream Gateway") && page.contains("invoices:read invoices:write") && !page.contains("Approvals"), "{page}");
+    assert_eq!(br.get("/policy").status, 404);
+    let inv = mac(&[("invoices", &["read", "write"])]);
+    let info = mac(&[("info", &["read"])]);
+    let net = "lightning:0123456789abcdef0123456789abcdef";
+    let form = |public: &str, inv: &str, chain: &str, ack: &str| -> Vec<(String, String)> {
+        [("upstream", "http://10.21.21.50:8080"), ("price_msat", "2500"), ("unit", "request"), ("public_url", public), ("proxies", ""),
+         ("chain", chain), ("network", if chain == "main" { "" } else { net }), ("mainnet_ack", ack), ("max_sessions", "30"),
+         ("sessions_per_address", "2"), ("max_held_tickets", "15"), ("invoices_macaroon", inv), ("info_macaroon", info.as_str())]
+            .iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    };
+    let send = |br: &mut B, f: Vec<(String, String)>| {
+        let f: Vec<(&str, &str)> = f.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        br.act("/", "/gateway", &f)
+    };
+    // the gateway's own parser refuses plain http to a non-loopback origin; nothing is written
+    let r = send(&mut br, form("http://seller.example", &inv, "regtest", ""));
+    assert_eq!(r.status, 200);
+    assert!(unescape(&r.body).contains("not https"), "{}", r.body);
+    assert!(!dir.join("config.json").exists());
+    // a macaroon wider than invoices is refused
+    let wide = mac(&[("invoices", &["read", "write"]), ("offchain", &["write"])]);
+    let r = send(&mut br, form("https://seller.example", &wide, "regtest", ""));
+    assert!(unescape(&r.body).contains("offchain:write"), "{}", r.body);
+    // a good one: https behind a proxy listens on every address, and with no proxy named the per-address cap is off
+    let r = send(&mut br, form("https://seller.example", &inv, "regtest", ""));
+    assert!(br.flash_after(&r).contains("Saved"));
+    let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    assert_eq!((c["listen"].as_str(), c["caps"]["sessions_per_address"].as_u64()), (Some("0.0.0.0:8402"), Some(0)));
+    assert_eq!(c["node"]["macaroon"], json!(dir.join("invoices.macaroon").display().to_string()));
+    assert_eq!(c["routes"], json!([{"path": "/", "price": {"request_msat": 2500}}]));
+    xbt_gateway::config::Config::from_json(&c).unwrap();
+    assert_eq!(hex::encode(std::fs::read(dir.join("invoices.macaroon")).unwrap()), inv);
+    // a buyer on this machine (a test): loopback, and the macaroons kept when left empty
+    let r = send(&mut br, form("http://127.0.0.1:8402", "", "regtest", ""));
+    assert!(br.flash_after(&r).contains("Saved"));
+    let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    assert_eq!(c["listen"], json!("127.0.0.1:8402"));
+    // mainnet: refused without the acknowledgement word for word; with it, the warning shows and the caps go low
+    let r = send(&mut br, form("https://seller.example", "", "main", "yes"));
+    assert!(unescape(&r.body).contains(xbt_gateway::config::MAINNET_ACK) && unescape(&r.body).contains("regtest only"), "{}", r.body);
+    let r = send(&mut br, form("https://seller.example", "", "main", xbt_gateway::config::MAINNET_ACK));
+    assert!(br.flash_after(&r).contains("mainnet"));
+    let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    assert_eq!((c["chain"].as_str(), c["mainnet_ack"].as_str()), (Some("main"), Some(xbt_gateway::config::MAINNET_ACK)));
+    assert_eq!((c["caps"]["max_sessions"].as_u64(), c["caps"]["max_held_tickets"].as_u64()), (Some(4), Some(4)));
+    assert!(c.get("network").is_none());
+    xbt_gateway::config::Config::from_json(&c).unwrap();
+}
