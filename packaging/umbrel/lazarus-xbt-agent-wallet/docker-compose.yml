@@ -84,6 +84,7 @@ services:
       XBT_CHAIN: ${APP_XBT_KNOTS_CHAIN:-}
       B2_LN_REST: https://${APP_LIGHTNING_FORK_NODE_IP}:${APP_LIGHTNING_FORK_NODE_REST_PORT}
       B2_LN_MACAROON: /data/run/ln/rail.macaroon
+      B2_MAINNET_ACK_FILE: /data/run/ln/mainnet-ack
       B2_LN_TLS_CERT: /data/lightning/tls.cert
     volumes:
       - ${APP_DATA_DIR}/data/signer:/data/signer

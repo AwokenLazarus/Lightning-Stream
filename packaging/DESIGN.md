@@ -117,9 +117,9 @@ signer's chain is `main` unless the owner types the acknowledgement.
   and needs the acknowledgement typed exactly (`mainnet_ack`); the page then writes low caps
   (4 sessions, 1 per address, 4 held tickets of 1,000 sat, 2 per session), which the owner can raise.
 - **Wallet:** the page shows the same kind of warning; the starter policy on mainnet caps a payment
-  at 2,000 sat and a day at 10,000. The acknowledgement is stored as `run/ln/mainnet-ack`. The signer
-  itself does not read it yet (a signer-side switch is being added separately); until then the
-  page's refusal is the gate.
+  at 2,000 sat and a day at 10,000. The acknowledgement is stored as `run/ln/mainnet-ack`, and both
+  packages point the signer at it (`B2_MAINNET_ACK_FILE`): on mainnet the signer refuses tickets
+  and draws without it, whatever the page did.
 
 ## 6. What cannot be done yet
 

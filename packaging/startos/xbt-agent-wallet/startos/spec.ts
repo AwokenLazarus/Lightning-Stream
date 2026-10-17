@@ -117,7 +117,7 @@ export function services(cfg: Config): ServiceSpec[] {
       command: ['/usr/bin/xbt-supervise', '--watch', LIGHTNING.macaroon, '--watch', LIGHTNING.cert, '--', '/usr/bin/xbt-signer'],
       env: {
         ...node,
-        ...(cfg.lightningRest ? { B2_LN_REST: cfg.lightningRest, B2_LN_MACAROON: LIGHTNING.macaroon, B2_LN_TLS_CERT: LIGHTNING.cert } : {}),
+        ...(cfg.lightningRest ? { B2_LN_REST: cfg.lightningRest, B2_LN_MACAROON: LIGHTNING.macaroon, B2_MAINNET_ACK_FILE: '/data/run/ln/mainnet-ack', B2_LN_TLS_CERT: LIGHTNING.cert } : {}),
       },
       // run/ln: the rail macaroon (group xbt-ln-rail: the UI writes it, the signer reads it, the MCP cannot)
       mounts: [
