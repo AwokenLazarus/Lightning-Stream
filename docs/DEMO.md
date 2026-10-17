@@ -16,7 +16,8 @@ people. Do not use it with real funds. What the gateway and the wallet do not do
 scripts/demo_film.sh
 ```
 
-It needs docker with compose, python3, ffmpeg and a Rust toolchain, and takes about 7 minutes once the lab and the film are there (the first run also builds the nodes and fetches the film). It
+It needs docker with compose, python3, ffmpeg, a Rust toolchain and a C compiler (the README's
+"Build" section says what to install on a fresh machine), and takes about 7 minutes once the lab and the film are there (the first run also builds the nodes and fetches the film). It
 builds the wallet and the gateway, brings up four Lightning Fork nodes on a regtest chain, starts a
 stock Jellyfin in a container with one film, puts gateways in front of it, and plays the film
 through the wallet. It prints PASS or FAIL for each check and a readout while the film plays, and
