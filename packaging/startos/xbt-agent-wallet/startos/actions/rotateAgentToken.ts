@@ -3,7 +3,7 @@ import { i18n } from '../i18n'
 import { sdk } from '../sdk'
 
 /** A new MCP bearer token: delete it (and an older layout's copies); on the restart xbt-init makes a new one.
- *  The web UI's Agents page does the same with no restart (AGP-042). */
+ *  The web UI's Agents page does the same with no restart. */
 export const rotateAgentToken = sdk.Action.withoutInput(
   'rotate-agent-token',
   {

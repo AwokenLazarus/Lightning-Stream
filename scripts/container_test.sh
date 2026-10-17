@@ -1,10 +1,11 @@
 #!/bin/bash
-# AGP-038: the container test. Builds the multi-arch images (scripts/oci_build.sh --load: all three platforms
+# The container test. Builds the multi-arch images (scripts/oci_build.sh --load: all three platforms
 # into dist/oci/*.tar, the amd64 ones loaded as <image>:agp038), checks the arm64 and arm/v7 images with
-# scripts/oci_inspect.py, then runs scripts/container/container_test.py: signer + witness + MCP
-# composed with a Knots 29.4.2 regtest node, configured only by env and a data dir; the agent's MCP over
-# HTTP and the hot key's custody; kill/restart persistence; /readyz gating. Ports 23700-23799 (published
-# on 127.0.0.1 only: MCP 23710). Soak rules: cargo under CPUQuota 200%, MemoryMax 4G, nice 19, -j2.
+# scripts/oci_inspect.py, then runs scripts/container/container_test.py: signer + witness + MCP and the
+# gateway, configured only by env and a data dir, beside a Lightning Fork regtest lab (packaging/ln_lab.py);
+# the agent's MCP over HTTP and the hot key's custody; a paid buy over stream tickets; kill/restart
+# persistence; /readyz gating. Ports 23700-23799 (published on 127.0.0.1 only: MCP 23710, the lab nodes'
+# REST 23750-23751). Soak rules: cargo under CPUQuota 200%, MemoryMax 4G, nice 19, -j2.
 # Evidence: run/container-test/<stamp>/.
 #   scripts/container_test.sh [--skip-build]      CONTAINER_TEST_KEEP=1 keeps the volumes
 set -euo pipefail
@@ -21,7 +22,7 @@ if [ "${1:-}" != "--skip-build" ]; then
 fi
 echo "== inspect: every image, every platform (arm64 and arm/v7 included)"
 set +e
-python3 scripts/oci_inspect.py dist/oci xbt-signer xbt-anchor-witness xbt-wallet-mcp >"$OUT/oci_inspect.json"
+python3 scripts/oci_inspect.py dist/oci xbt-signer xbt-anchor-witness xbt-wallet-mcp xbt-gateway >"$OUT/oci_inspect.json"
 irc=$?
 set -e
 python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print('   inspect ok:', d['ok'], d['problems'] or '')" "$OUT/oci_inspect.json"

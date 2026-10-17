@@ -1,7 +1,7 @@
 import { i18n } from './i18n'
 import { sdk } from './sdk'
 import { storeJson } from './fileModels/store.json'
-import { PORTS, services, ServiceSpec } from './spec'
+import { LIGHTNING, PORTS, services, ServiceSpec } from './spec'
 
 export const main = sdk.setupMain(async ({ effects }) => {
   const store = await storeJson.read().const(effects)
@@ -14,13 +14,27 @@ export const main = sdk.setupMain(async ({ effects }) => {
     .find((i) => i.id === 'mcp')
   const mcpUrls = (mcpIface?.addressInfo?.nonLocal.format('urlstring') ?? []).map((u) => u.replace(/\/$/, '') + '/mcp')
 
-  const specs = services({ node: store.node, mcpUrls })
+  // Lightning Fork's own REST listener at its container address, which its certificate names
+  // (lightning-fork-startos init/setupCerts.ts); the OS proxy's address would present another certificate
+  const lfIp = await sdk.getContainerIp(effects, { packageId: LIGHTNING.packageId }).const().catch(() => null)
+  const lightningRest = lfIp ? `https://${lfIp}:${LIGHTNING.restPort}` : ''
+
+  const specs = services({ node: store.node, mcpUrls, lightningRest })
   const spec = (id: ServiceSpec['id']) => specs.find((s) => s.id === id) as ServiceSpec
 
   const sub = (s: ServiceSpec) => {
     let mounts = sdk.Mounts.of()
     for (const m of s.mounts) {
-      mounts = mounts.mountVolume({ volumeId: 'main', subpath: m.subpath, mountpoint: m.mountpoint, readonly: m.readonly })
+      mounts = m.dependency
+        ? mounts.mountDependency({
+            dependencyId: m.dependency.packageId,
+            volumeId: m.dependency.volumeId,
+            subpath: m.subpath,
+            mountpoint: m.mountpoint,
+            readonly: true,
+            type: m.dependency.type,
+          })
+        : mounts.mountVolume({ volumeId: 'main', subpath: m.subpath, mountpoint: m.mountpoint, readonly: m.readonly })
     }
     return sdk.SubContainer.of(effects, { imageId: s.image }, mounts, `${s.id}-sub`)
   }

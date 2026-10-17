@@ -1,9 +1,16 @@
-# XBT Agent Wallet (AGP-040). Unpublished: side-load only, images loaded locally (never pulled).
+# XBT Agent Wallet. Unpublished: side-load only, images loaded locally (never pulled).
 # The data dir is ${APP_DATA_DIR}/data, laid out as docs/CONTAINER.md §1: one sub-dir per component, each
 # owned by its own uid. `init` (xbt-init, the only root container: no network, three capabilities) gives
 # the bind mount those owners and provisions the node credentials, the UI password (${APP_PASSWORD}) and the
-# MCP token before anything else starts. Every service mounts only its own sub-dir and the socket dirs it
-# needs, runs read-only as its own non-root user, with no capabilities. The witness has no network at all.
+# MCP token before anything else starts. Every service mounts only its own sub-dir and the dirs it needs,
+# runs read-only as its own non-root user, with no capabilities. The witness has no network at all.
+#
+# The XBT node is the `bitcoin` slot (the node app the owner selects; Lightning Fork uses the same), with this
+# store's stand-in node as the fallback. The Lightning node is Lightning Fork: its REST address from its
+# exports, and its tls.cert, the one file of its data dir mounted here, read-only. The rail macaroon is
+# the owner's, pasted on the UI's Lightning page into run/ln/ (group xbt-ln-rail: the UI writes, the
+# signer reads, the MCP cannot); the signer runs under xbt-supervise, which restarts it when that file
+# or the certificate changes. No admin macaroon is ever mounted or kept.
 version: "3.7"
 
 x-service: &service
@@ -18,6 +25,15 @@ x-service: &service
   depends_on:
     init:
       condition: service_completed_successfully
+
+x-lightning-cert: &lightning-cert
+  type: bind
+  source: ${APP_LIGHTNING_FORK_NODE_DATA_DIR}/tls.cert
+  target: /data/lightning/tls.cert
+  read_only: true
+  bind:
+    # a missing certificate stops the start: Docker would otherwise make a directory in its place
+    create_host_path: false
 
 services:
   app_proxy:
@@ -41,8 +57,8 @@ services:
       - no-new-privileges:true
     environment:
       XBT_INIT_COMPONENTS: signer,witness,mcp,ui
-      XBT_INIT_NODE_RPC_USER: ${APP_XBT_KNOTS_RPC_USER}
-      XBT_INIT_NODE_RPC_PASS: ${APP_XBT_KNOTS_RPC_PASS}
+      XBT_INIT_NODE_RPC_USER: ${APP_BITCOIN_RPC_USER:-${APP_XBT_KNOTS_RPC_USER}}
+      XBT_INIT_NODE_RPC_PASS: ${APP_BITCOIN_RPC_PASS:-${APP_XBT_KNOTS_RPC_PASS}}
       XBT_INIT_UI_PASSWORD: ${APP_PASSWORD}
     volumes:
       - ${APP_DATA_DIR}/data:/data
@@ -59,15 +75,22 @@ services:
   signer:
     <<: *service
     image: xbt-signer:0.1.0
+    entrypoint: ["/usr/bin/xbt-supervise", "--watch", "/data/run/ln/rail.macaroon", "--watch", "/data/lightning/tls.cert", "--", "/usr/bin/xbt-signer"]
     stop_grace_period: 1m
     environment:
-      XBT_NODE_RPC_HOST: ${APP_XBT_KNOTS_NODE_HOST}
-      XBT_NODE_RPC_PORT: ${APP_XBT_KNOTS_RPC_PORT}
-      XBT_CHAIN: ${APP_XBT_KNOTS_CHAIN}
+      XBT_NODE_RPC_HOST: ${APP_BITCOIN_NODE_IP:-${APP_XBT_KNOTS_NODE_HOST}}
+      XBT_NODE_RPC_PORT: ${APP_BITCOIN_RPC_PORT:-${APP_XBT_KNOTS_RPC_PORT}}
+      # the stand-in names its chain; with the slot's node the signer reads it from the node
+      XBT_CHAIN: ${APP_XBT_KNOTS_CHAIN:-}
+      B2_LN_REST: https://${APP_LIGHTNING_FORK_NODE_IP}:${APP_LIGHTNING_FORK_NODE_REST_PORT}
+      B2_LN_MACAROON: /data/run/ln/rail.macaroon
+      B2_LN_TLS_CERT: /data/lightning/tls.cert
     volumes:
       - ${APP_DATA_DIR}/data/signer:/data/signer
       - ${APP_DATA_DIR}/data/run/signer:/data/run/signer
       - ${APP_DATA_DIR}/data/run/anchor:/data/run/anchor:ro
+      - ${APP_DATA_DIR}/data/run/ln:/data/run/ln:ro
+      - *lightning-cert
 
   mcp:
     <<: *service
@@ -76,6 +99,9 @@ services:
     environment:
       # an over-threshold payment waits this long for the owner's approval in the UI
       XBT_MCP_APPROVAL_WAIT_S: "300"
+      # the Lightning rail's and the tickets' own tools (status, stop) beside xbt402_pay
+      XBT_MCP_LN: "1"
+      XBT_MCP_TICKETS: "1"
     ports:
       # agents on the LAN (and in other apps on this box, at lazarus-xbt-agent-wallet_mcp_1:33510);
       # always behind the bearer token from the Agents page
@@ -94,8 +120,13 @@ services:
       XBT_UI_PASSWORD_FILE: /data/ui/secrets/xbt-ui-password
       XBT_UI_SIGNER_SOCK: /data/run/signer/signer.sock
       XBT_UI_MCP_URL: http://${DEVICE_DOMAIN_NAME}:33510/mcp
+      XBT_UI_LN_REST: https://${APP_LIGHTNING_FORK_NODE_IP}:${APP_LIGHTNING_FORK_NODE_REST_PORT}
+      XBT_UI_LN_TLS_CERT: /data/lightning/tls.cert
     volumes:
       - ${APP_DATA_DIR}/data/ui:/data/ui
       - ${APP_DATA_DIR}/data/run/signer:/data/run/signer:ro
-      # the UI owns the MCP token (run/ui/mcp-http-token) and rotates it on its Agents page (AGP-042)
+      # the UI owns the MCP token (run/ui/mcp-http-token) and rotates it on its Agents page
       - ${APP_DATA_DIR}/data/run/ui:/data/run/ui
+      # the Lightning page writes the rail macaroon here
+      - ${APP_DATA_DIR}/data/run/ln:/data/run/ln
+      - *lightning-cert

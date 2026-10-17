@@ -1,8 +1,9 @@
 #!/bin/bash
-# AGP-040 verify for the StartOS package: build it (build.sh: tsc, the SDK's eslint, ncc, `start-cli s9pk pack`
-# for x86_64 and aarch64), check both .s9pk files (manifest, images per arch, static ELF of the right arch,
-# image users), then run the package's own container spec on regtest the way StartOS does
-# (test/startos_regtest.py). No StartOS VM runs here (no KVM for this user); a real-box test needs Mike.
+# Verify for the StartOS packages: build them (build.sh: tsc, the SDK's eslint, ncc, `start-cli s9pk pack` for
+# x86_64 and aarch64), check the four .s9pk files (manifest, images per arch, static ELF of the right arch,
+# image users), then run both packages' own container specs on regtest the way StartOS does, beside a
+# Lightning Fork lab, with a paid buy over stream tickets (test/startos_regtest.py). No StartOS VM runs here;
+# a real-box test needs a box chosen for it.
 # Ports 24100-24199 on 127.0.0.1 only (STARTOS_TEST_PORTS=LO-HI and STARTOS_TEST_{MCP,UI,PROV}_PORT move them). Soak rules: CPUQuota 200%, MemoryMax 4G, nice 19. Never publishes.
 # Evidence: run/startos-test/<stamp>/.
 set -euo pipefail
@@ -29,16 +30,22 @@ python3 - "$START_CLI" "$ROOT/dist/startos" "$OUT" <<'PY' | tee "$OUT/inspect.lo
 import json, os, subprocess, sys, tempfile
 cli, d, out = sys.argv[1:4]
 ELF = {"x86_64": 0x3E, "aarch64": 0xB7}
-IMAGES = {"init": ("xbt-init", "0:0"), "signer": ("xbt-signer", "xbt-signer"), "witness": ("xbt-anchor-witness", "xbt-anchor-witness"),
-          "mcp": ("xbt-wallet-mcp", "xbt-wallet-mcp"), "ui": ("xbt-wallet-ui", "xbt-wallet-ui")}
+PKGS = {
+    "xbt-agent-wallet": (["main", "startos"], {"init": ("xbt-init", "0:0"), "signer": ("xbt-signer", "xbt-signer"),
+                                                "witness": ("xbt-anchor-witness", "xbt-anchor-witness"), "mcp": ("xbt-wallet-mcp", "xbt-wallet-mcp"),
+                                                "ui": ("xbt-wallet-ui", "xbt-wallet-ui")}),
+    "lightning-stream-gateway": (["main"], {"init": ("xbt-init", "0:0"), "gateway": ("xbt-gateway", "xbt-gateway"), "ui": ("xbt-wallet-ui", "xbt-wallet-ui")}),
+}
 probs, rep = [], {}
-for arch in ("x86_64", "aarch64"):
-    f = os.path.join(d, f"xbt-agent-wallet_{arch}.s9pk")
+for (pkg, (volumes, IMAGES)) in PKGS.items():
+  for arch in ("x86_64", "aarch64"):
+    f = os.path.join(d, f"{pkg}_{arch}.s9pk")
     m = json.loads(subprocess.check_output([cli, "s9pk", "inspect", f, "manifest"]))
     tree = json.loads(subprocess.check_output([cli, "s9pk", "inspect", f, "file-tree"]))
-    rep[arch] = {"bytes": os.path.getsize(f), "version": m["version"], "sdk": m["sdkVersion"], "os": m.get("osVersion"), "gitHash": m.get("gitHash")}
-    if m["id"] != "xbt-agent-wallet" or m["volumes"] != ["main", "startos"] or m["hardwareRequirements"].get("arch") != [arch]:
-        probs.append(f"{arch}: manifest {m['id']} {m['volumes']} {m['hardwareRequirements']}")
+    rep[f"{pkg}/{arch}"] = {"bytes": os.path.getsize(f), "version": m["version"], "sdk": m["sdkVersion"], "os": m.get("osVersion"),
+                             "gitHash": m.get("gitHash"), "dependencies": sorted(m.get("dependencies", {}))}
+    if m["id"] != pkg or m["volumes"] != volumes or m["hardwareRequirements"].get("arch") != [arch] or "lightning-fork" not in m.get("dependencies", {}):
+        probs.append(f"{pkg} {arch}: manifest {m['id']} {m['volumes']} {m['hardwareRequirements']} {m.get('dependencies')}")
     for img, (binary, user) in IMAGES.items():
         for ext in ("json", "env", "squashfs"):
             if f"images/{arch}/{img}.{ext}" not in tree:

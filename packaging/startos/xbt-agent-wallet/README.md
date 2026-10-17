@@ -1,7 +1,7 @@
 # XBT Agent Wallet for StartOS
 
-Technical reference for this package (AGP-040). The user guide is `instructions.md`; the design, the tests
-and the choices are in `../../README.md` and the container standard in `docs/CONTAINER.md` (xbt-rs).
+Technical reference for this package. The user guide is `instructions.md`; the design, the tests
+and the choices are in `../../README.md` and `../../DESIGN.md`, and the container standard in `docs/CONTAINER.md`.
 
 ## Containers
 
@@ -13,9 +13,13 @@ volume `startos` holds `store.json` (the node connection) and is mounted by noth
 |---|---|---|---|---|
 | init (oneshot) | xbt-init | root | all | exits 0 |
 | witness | xbt-anchor-witness | xbt-anchor-witness | witness, run/anchor | `xbt-anchor-witness healthcheck` |
-| signer | xbt-signer | xbt-signer | signer, run/signer, run/anchor (ro) | `xbt-signer healthcheck` |
+| signer | xbt-signer, under xbt-supervise | xbt-signer | signer, run/signer, run/anchor (ro), run/ln (ro); Lightning Fork's tls.cert (ro) | `xbt-signer healthcheck` |
 | mcp | xbt-wallet-mcp | xbt-wallet-mcp | mcp, run/signer (ro), run/ui (ro) | port 33510 |
-| ui | xbt-wallet-ui | xbt-wallet-ui | ui, run/signer (ro), run/ui | port 8480 |
+| ui | xbt-wallet-ui | xbt-wallet-ui | ui, run/signer (ro), run/ui, run/ln; Lightning Fork's tls.cert (ro) | port 8480 |
+
+The rail: Lightning Fork's REST listener at its container address (port 8080), its `tls.cert` pinned, and the
+macaroon the owner pastes on the UI's Lightning page (`run/ln/rail.macaroon`). The signer restarts when that
+file or the certificate changes.
 
 Health check `wallet-ready`: the MCP's `/readyz` (200: synced and unlocked; 503: loading, with the reason).
 

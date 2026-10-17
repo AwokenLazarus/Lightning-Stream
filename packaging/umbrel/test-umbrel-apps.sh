@@ -1,10 +1,12 @@
 #!/bin/bash
-# AGP-040 verify for the Umbrel apps (SOV-005's test-umbrel-app.sh shape): lint the store, then install the
-# node and wallet apps from cold on a regtest chain the way umbrelOS does (umbrel_regtest.py), RUNS times
-# (default 2), and print RESULT PASS|FAIL with each run's time to a ready wallet.
-# Needs the images loaded (scripts/oci_build.sh --load). Ports 24000-24099 on 127.0.0.1 only (UMBREL_TEST_PORTS=LO-HI
-# and UMBREL_TEST_*_PORT move them). Soak rules:
-# CPUQuota 200%, MemoryMax 4G, nice 19. Starts no miners (blocks come from generatetoaddress). Never pushes,
+# Verify for the Umbrel apps: lint the store, then install the gateway and wallet apps from cold the way
+# umbrelOS does, beside a Lightning Fork regtest lab (two nodes, one channel; packaging/ln_lab.py), and buy
+# from the gateway through the wallet with stream tickets (umbrel_regtest.py), RUNS times (default 2). Prints
+# RESULT PASS|FAIL with each run's time to a ready wallet.
+# Needs the images loaded (scripts/oci_build.sh --load) and the lab (run/lightning-fork-lab, cloned and built
+# by scripts/ln_rail/lab.sh when missing). Ports 24000-24099 on 127.0.0.1 only (UMBREL_TEST_PORTS=LO-HI
+# and UMBREL_TEST_*_PORT move them). Soak rules: the driver under CPUQuota 200%, MemoryMax 4G, nice 19;
+# each lab container capped at 2 CPUs. Starts no miners (blocks come from generatetoaddress). Never pushes,
 # never submits to a store. Evidence: run/umbrel-test/<stamp>/.
 set -euo pipefail
 if [ -z "${UMBREL_TEST_SCOPED:-}" ] && command -v systemd-run >/dev/null; then
@@ -20,7 +22,7 @@ mkdir -p "$OUT"
 PORTS=${UMBREL_TEST_PORTS:-24000-24099}
 busy=$(ss -ltnH | awk '{print $4}' | sed 's/.*://' | awk -v lo="${PORTS%-*}" -v hi="${PORTS#*-}" '$1>=lo && $1<=hi' | sort -u | tr '\n' ' ')
 [ -z "$busy" ] || { echo "test-umbrel-apps: ports busy in $PORTS: $busy" >&2; exit 1; }
-for i in xbt-signer xbt-anchor-witness xbt-wallet-mcp xbt-wallet-ui xbt-init; do
+for i in xbt-signer xbt-anchor-witness xbt-wallet-mcp xbt-wallet-ui xbt-init xbt-gateway; do
   docker image inspect "$i:0.1.0" >/dev/null 2>&1 || { echo "test-umbrel-apps: image $i:0.1.0 missing (scripts/oci_build.sh --load)" >&2; exit 1; }
 done
 

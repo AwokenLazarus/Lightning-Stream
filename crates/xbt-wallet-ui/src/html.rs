@@ -89,15 +89,21 @@ pub struct Nav<'a> {
     pub csrf: &'a str,
     pub pending: usize,
     pub logged_in: bool,
+    pub pages: &'a [(&'static str, &'static str)],
+    pub brand: &'a str,
 }
 
-const PAGES: [(&str, &str); 8] = [("./", "Overview"), ("./approvals", "Approvals"), ("./policy", "Policy"), ("./channels", "Channels"),
-                                  ("./signatures", "Signatures"), ("./keys", "Keys"), ("./agents", "Agents"), ("./setup", "Setup")];
+pub const WALLET_PAGES: [(&str, &str); 9] = [("./", "Overview"), ("./approvals", "Approvals"), ("./policy", "Policy"), ("./lightning", "Lightning"),
+                                             ("./channels", "Channels"), ("./signatures", "Signatures"), ("./keys", "Keys"), ("./agents", "Agents"),
+                                             ("./setup", "Setup")];
+pub const GATEWAY_PAGES: [(&str, &str); 1] = [("./", "Gateway")];
+pub const WALLET_BRAND: &str = "XBT Agent Wallet";
+pub const GATEWAY_BRAND: &str = "Lightning Stream Gateway";
 
 pub fn page(title: &str, nav: &Nav, flash: Option<(bool, String)>, body: &str) -> String {
     let mut links = String::new();
     if nav.logged_in {
-        for (href, name) in PAGES {
+        for &(href, name) in nav.pages {
             let cur = if name == nav.active { " aria-current=\"page\"" } else { "" };
             let badge = if name == "Approvals" {
                 format!(" <span id=\"pending-badge\" class=\"badge\"{}>{}</span>", if nav.pending == 0 { " hidden" } else { "" },
@@ -112,13 +118,16 @@ pub fn page(title: &str, nav: &Nav, flash: Option<(bool, String)>, body: &str) -
     }
     let flash = flash.map(|(ok, m)| format!("<div class=\"flash {}\" role=\"status\">{}</div>", if ok { "ok" } else { "bad" }, esc(&m))).unwrap_or_default();
     format!("<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-             <meta name=\"referrer\" content=\"no-referrer\"><link rel=\"icon\" href=\"data:,\"><title>{} · XBT Agent Wallet</title>\
+             <meta name=\"referrer\" content=\"no-referrer\"><link rel=\"icon\" href=\"data:,\"><title>{} · {}</title>\
              <link rel=\"stylesheet\" href=\"./ui.css?v={}\"></head><body>\
-             <header><div class=\"brand\">XBT Agent Wallet</div><nav>{links}</nav></header>\
+             <header><div class=\"brand\">{}</div><nav>{links}</nav></header>\
              <main>{flash}<h1>{}</h1>{body}</main>\
-             <footer>Keys stay in the signer; your approval key stays in your browser.</footer>\
+             <footer>{}</footer>\
              <script src=\"./ui.js?v={}\"></script></body></html>\n",
-            esc(title), asset_version(crate::UI_CSS), esc(title), asset_version(crate::UI_JS))
+            esc(title), esc(nav.brand), asset_version(crate::UI_CSS), esc(nav.brand), esc(title),
+            if nav.brand == GATEWAY_BRAND { "The macaroons stay on this box; the gateway can make invoices and read the node's height, nothing more." }
+            else { "Keys stay in the signer; your approval key stays in your browser." },
+            asset_version(crate::UI_JS))
 }
 
 /// A short content hash for cache busting.

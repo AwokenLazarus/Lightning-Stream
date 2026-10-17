@@ -10,9 +10,9 @@ export const manifest = setupManifest({
   id: 'xbt-agent-wallet',
   title: 'XBT Agent Wallet',
   license: 'MIT OR Apache-2.0',
-  packageRepo: 'https://github.com/AwokenLazarus/Bitcoin',
-  upstreamRepo: 'https://github.com/AwokenLazarus/Bitcoin',
-  marketingUrl: 'https://lazarus-xbt.xyz',
+  packageRepo: 'https://github.com/AwokenLazarus/Lightning-Stream',
+  upstreamRepo: 'https://github.com/AwokenLazarus/Lightning-Stream',
+  marketingUrl: 'https://github.com/AwokenLazarus/Lightning-Stream',
   donationUrl: null,
   description: { short, long },
   volumes: ['main', 'startos'],
@@ -26,5 +26,14 @@ export const manifest = setupManifest({
   hardwareRequirements: {
     ram: 512 * 1024 ** 2, // 512 MiB: every service is a small static binary
   },
-  dependencies: {},
+  dependencies: {
+    'lightning-fork': {
+      description: 'The Lightning node the wallet pays through. The wallet mounts only its tls.cert; you give it a narrow macaroon on the Lightning page.',
+      optional: false,
+      metadata: {
+        title: 'Lightning Fork',
+        icon: 'https://raw.githubusercontent.com/paulscode/lightning-fork-startos/master/icon.png',
+      },
+    },
+  },
 })

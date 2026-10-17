@@ -17,6 +17,15 @@
 //! | `XBT_UI_CMP_URL` | | xbt-compute's node status page: a link on the Overview page (one dashboard for an operator) |
 //! | `XBT_UI_CMP_STATUS_URL` | | xbt-compute's status JSON (`http://…/readyz`, CONTRACT §U), read server-side for a compact tile |
 //! | `XBT_UI_MCP_URL` | | the MCP endpoint(s) agents connect to, comma-separated (`http://umbrel.local:33510/mcp`), shown on the Agents page |
+//! | `XBT_UI_ROLE` | `wallet` | `wallet`: the wallet's pages; `gateway`: the seller gateway's setup page only (the gateway package; no signer) |
+//! | `XBT_UI_LN_DIR` | `$XBT_DATA_DIR/run/ln` | where the Lightning page writes the rail macaroon (`rail.macaroon`) and the mainnet acknowledgement (`mainnet-ack`); the signer reads them |
+//! | `XBT_UI_LN_REST` / `XBT_UI_LN_TLS_CERT` | | the Lightning node's REST address and the certificate the package pins (set by the platform; shown, never typed) |
+//! | `XBT_UI_GW_DIR` | `$XBT_DATA_DIR/run/gateway` | where the gateway page writes `config.json`, `invoices.macaroon` and `info.macaroon` (the same path in the gateway's container) |
+//! | `XBT_UI_GW_NODE_REST` / `XBT_UI_GW_NODE_TLS_CERT` | | the Lightning node's REST address and the certificate path, as the gateway's container sees them (set by the platform) |
+//! | `XBT_UI_GW_STATE_DIR` | `/data/gateway` | the gateway's state dir, written into its config |
+//! | `XBT_UI_GW_PORT` | `8402` | the port the gateway listens on |
+//! | `XBT_UI_GW_HEALTH_URL` | | the gateway's `/x402/ticket/health`, read server-side for the page (plain http on the box network) |
+//! | `XBT_UI_GW_PROXIES` | | the addresses of the box's own proxy in front of the gateway (StartOS), offered as the default for the forwarded-address setting |
 //! | `XBT_UI_MCP_TOKEN_FILE` | `$XBT_DATA_DIR/run/ui/mcp-http-token` when `XBT_DATA_DIR` is set, else `<data dir>/secrets/mcp-http-token` | the MCP bearer token, shown to the logged-in owner on the Agents page and rotated there (AGP-042). The UI owns it; the MCP only reads it (`xbt-init` makes it 0640, group `xbt-wallet-ui`). |
 use std::path::PathBuf;
 use std::time::Duration;
@@ -40,6 +49,35 @@ pub struct Config {
     pub mcp_urls: Vec<String>,
     pub mcp_token_file: PathBuf,
     pub threads: usize,
+    pub role: Role,
+    pub ln: LnSetup,
+    pub gw: GatewaySetup,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Wallet,
+    Gateway,
+}
+
+/// The wallet's Lightning page: where it writes, and what the platform said about the node.
+#[derive(Debug, Clone, Default)]
+pub struct LnSetup {
+    pub dir: PathBuf,
+    pub rest: Option<String>,
+    pub tls_cert: Option<PathBuf>,
+}
+
+/// The gateway page: where it writes, and the node and paths as the gateway's container sees them.
+#[derive(Debug, Clone, Default)]
+pub struct GatewaySetup {
+    pub dir: PathBuf,
+    pub node_rest: Option<String>,
+    pub node_tls_cert: Option<PathBuf>,
+    pub state_dir: String,
+    pub port: u16,
+    pub health_url: Option<String>,
+    pub proxies: Vec<String>,
 }
 
 fn env(k: &str) -> Option<String> {
@@ -82,6 +120,26 @@ impl Config {
             return Err("the configured UI password is shorter than 8 characters".into());
         }
         let secs = |k: &str, d: u64| env(k).and_then(|v| v.parse::<u64>().ok()).filter(|v| *v > 0).unwrap_or(d);
+        let role = match env("XBT_UI_ROLE").as_deref() {
+            None | Some("wallet") => Role::Wallet,
+            Some("gateway") => Role::Gateway,
+            Some(o) => return Err(format!("XBT_UI_ROLE {o}: wallet or gateway")),
+        };
+        let run_dir = |name: &str| env("XBT_DATA_DIR").map(|d| PathBuf::from(d).join("run").join(name)).unwrap_or_else(|| data_dir.join(name));
+        let ln = LnSetup {
+            dir: env("XBT_UI_LN_DIR").map(PathBuf::from).unwrap_or_else(|| run_dir("ln")),
+            rest: env("XBT_UI_LN_REST"),
+            tls_cert: env("XBT_UI_LN_TLS_CERT").map(PathBuf::from),
+        };
+        let gw = GatewaySetup {
+            dir: env("XBT_UI_GW_DIR").map(PathBuf::from).unwrap_or_else(|| run_dir("gateway")),
+            node_rest: env("XBT_UI_GW_NODE_REST"),
+            node_tls_cert: env("XBT_UI_GW_NODE_TLS_CERT").map(PathBuf::from),
+            state_dir: env("XBT_UI_GW_STATE_DIR").unwrap_or_else(|| "/data/gateway".into()),
+            port: env("XBT_UI_GW_PORT").and_then(|p| p.parse().ok()).filter(|p| *p > 0).unwrap_or(8402),
+            health_url: env("XBT_UI_GW_HEALTH_URL").filter(|u| u.starts_with("http://")),
+            proxies: env("XBT_UI_GW_PROXIES").map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default(),
+        };
         let secure_cookie = match env("XBT_UI_SECURE_COOKIE").as_deref() {
             Some("1") | Some("true") => Some(true),
             Some("0") | Some("false") => Some(false),
@@ -106,6 +164,9 @@ impl Config {
                 .unwrap_or_else(|| data_dir.join("secrets").join("mcp-http-token")),
             data_dir,
             threads: secs("XBT_UI_THREADS", 4) as usize,
+            role,
+            ln,
+            gw,
         })
     }
 
@@ -113,6 +174,7 @@ impl Config {
     pub fn for_test(signer_sock: PathBuf, data_dir: PathBuf, bind: &str) -> Self {
         Self { bind: bind.into(), signer_sock, data_dir, password: None, base_path: "/".into(), session_idle: Duration::from_secs(900),
                session_max: Duration::from_secs(28_800), secure_cookie: None, allow_ips: vec![], allowed_hosts: vec![], setup_open: false, cmp_url: None,
-               cmp_status_url: None, mcp_urls: vec![], mcp_token_file: PathBuf::from("/nonexistent/mcp-http-token"), threads: 4 }
+               cmp_status_url: None, mcp_urls: vec![], mcp_token_file: PathBuf::from("/nonexistent/mcp-http-token"), threads: 4, role: Role::Wallet,
+               ln: LnSetup::default(), gw: GatewaySetup { state_dir: "/data/gateway".into(), port: 8402, ..Default::default() } }
     }
 }

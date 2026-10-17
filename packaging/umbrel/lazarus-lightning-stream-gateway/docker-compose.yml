@@ -1,0 +1,90 @@
+# Lightning Stream Gateway. Unpublished: side-load only, images loaded locally (never pulled).
+# Sells a service of the owner's per piece: buyers pay with stream tickets, held on this box's Lightning
+# Fork node, and each paid request is passed to the service. The owner sets it up on the UI's gateway page
+# (XBT_UI_ROLE=gateway): the service, the https origin buyers use, a price and two narrow macaroons baked
+# in Lightning Fork's dashboard (invoices:read invoices:write; info:read). The page writes them into
+# run/gateway/ (the UI writes, the gateway reads by group), and the gateway starts once its config is
+# there and again when it changes (xbt-supervise). No admin macaroon is ever mounted or kept: the one file
+# of Lightning Fork's data dir mounted here is its tls.cert, read-only, pinned by the gateway.
+#
+# Buyers: the gateway listens on 8402 on the box network and publishes no host port. It refuses a
+# non-loopback listen unless the public URL is https, and buyers' wallets pay tickets over https only:
+# point a TLS proxy with a public certificate (one you run on this box) at
+# lazarus-lightning-stream-gateway_gateway_1:8402. umbrelOS gives apps no https of their own.
+version: "3.7"
+
+x-service: &service
+  restart: on-failure
+  read_only: true
+  tmpfs:
+    - /tmp:rw,size=16m
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  depends_on:
+    init:
+      condition: service_completed_successfully
+
+x-lightning-cert: &lightning-cert
+  type: bind
+  source: ${APP_LIGHTNING_FORK_NODE_DATA_DIR}/tls.cert
+  target: /data/lightning/tls.cert
+  read_only: true
+  bind:
+    # a missing certificate stops the start: Docker would otherwise make a directory in its place
+    create_host_path: false
+
+services:
+  app_proxy:
+    environment:
+      APP_HOST: lazarus-lightning-stream-gateway_ui_1
+      APP_PORT: 8481
+
+  init:
+    image: xbt-init:0.1.0
+    user: "0:0"
+    restart: "no"
+    network_mode: none
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - FOWNER
+      - DAC_OVERRIDE
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      XBT_INIT_COMPONENTS: gateway,ui
+      XBT_INIT_UI_PASSWORD: ${APP_PASSWORD}
+    volumes:
+      - ${APP_DATA_DIR}/data:/data
+
+  gateway:
+    <<: *service
+    image: xbt-gateway:0.1.0
+    # each held ticket is followed on its own connection to the node; a stop cancels nothing
+    stop_grace_period: 30s
+    volumes:
+      - ${APP_DATA_DIR}/data/gateway:/data/gateway
+      - ${APP_DATA_DIR}/data/run/gateway:/data/run/gateway:ro
+      - *lightning-cert
+
+  ui:
+    <<: *service
+    image: xbt-wallet-ui:0.1.0
+    stop_grace_period: 15s
+    environment:
+      XBT_UI_ROLE: gateway
+      XBT_UI_BIND: 0.0.0.0:8481
+      XBT_UI_PASSWORD_FILE: /data/ui/secrets/xbt-ui-password
+      XBT_UI_GW_NODE_REST: https://${APP_LIGHTNING_FORK_NODE_IP}:${APP_LIGHTNING_FORK_NODE_REST_PORT}
+      XBT_UI_GW_NODE_TLS_CERT: /data/lightning/tls.cert
+      XBT_UI_GW_HEALTH_URL: http://lazarus-lightning-stream-gateway_gateway_1:8402/x402/ticket/health
+    volumes:
+      - ${APP_DATA_DIR}/data/ui:/data/ui
+      - ${APP_DATA_DIR}/data/run/ui:/data/run/ui
+      # the gateway page writes the gateway's config and macaroons here
+      - ${APP_DATA_DIR}/data/run/gateway:/data/run/gateway
+      - *lightning-cert

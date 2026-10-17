@@ -8,30 +8,40 @@ description: >-
   Give your AI agents a wallet they can pay with, and keep the keys and the rules to yourself. Agents
   connect to the wallet's MCP server and can only pay what your policy allows, within its budgets.
   Anything above your threshold waits for you to approve it here, signed with a key that stays in
-  your browser. The wallet pays services over XBT Lightning (stream tickets). This app does not
-  connect it to a Lightning node yet: until it does, agents can see the wallet and ask, and no
-  service is paid.
+  your browser. The wallet pays services over XBT Lightning with stream tickets, through your
+  Lightning Fork node.
+
+
+  Setup, in this app's pages: enrol your approval key, sign a policy (the starter template turns
+  Lightning and stream tickets on with low caps), and on the Lightning page paste a macaroon you make
+  in Lightning Fork's dashboard with exactly info:read, offchain:read, offchain:write and
+  onchain:read. The app reads only the node's certificate; it never holds an admin macaroon.
 
 
   The keys stay in the signer, sealed on this box's disk. A separate anchor witness keeps a tamper
-  record of every signature. The web UI sets the policy, approves payments, shows balances, keys and
-  the signature log, and gives you the MCP address and token for your agents (Agents page).
+  record of every signature. On mainnet this software moves real funds and has run on regtest only:
+  the Lightning page asks you to acknowledge that before it stores a macaroon.
 
 
-  Needs the XBT Node app. Unpublished and side-load only; the images stay on this box.
+  Needs Lightning Fork and an XBT (BLAKE2b) node. Unpublished and side-load only; the images stay on
+  this box.
 developer: Lazarus
-website: https://lazarus-xbt.xyz
-repo: https://github.com/AwokenLazarus/Bitcoin
-support: https://github.com/AwokenLazarus/Bitcoin/issues
+website: https://github.com/AwokenLazarus/Lightning-Stream
+repo: https://github.com/AwokenLazarus/Lightning-Stream
+support: https://github.com/AwokenLazarus/Lightning-Stream/issues
 port: 8480
 gallery:
   - 1.png
   - 2.png
   - 3.png
 releaseNotes: >-
-  0.1.0: first local package (AGP-040) of the signer, the anchor witness, the MCP server and the web UI.
+  0.1.0: the signer, the anchor witness, the MCP server and the web UI, paying over the box's Lightning
+  Fork node with stream tickets. Local package, regtest-tested only.
 dependencies:
-  - lazarus-xbt-knots
+  # the XBT node slot (Paul's paulscode-knots-blake2b, or this store's stand-in) and Lightning Fork,
+  # which is in its author's community store: umbrelOS resolves dependencies by installed app id
+  - bitcoin
+  - paulscode-lightning-fork
 path: ""
 defaultUsername: ""
 deterministicPassword: true

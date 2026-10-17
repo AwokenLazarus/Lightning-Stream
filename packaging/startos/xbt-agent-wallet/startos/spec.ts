@@ -1,5 +1,5 @@
 /**
- * The package's containers as plain data (AGP-040): which image, which user, which parts of the `main`
+ * The package's containers as plain data: which image, which user, which parts of the `main`
  * volume each one mounts, its environment and what it waits for. `main.ts` turns this into daemons, and
  * packaging/startos/test runs exactly these on Docker (the StartOS-shaped regtest run), so the test and the
  * package cannot drift. No SDK import here: `node --experimental-strip-types` loads it on its own.
@@ -13,7 +13,16 @@ export const PORTS = { ui: 8480, mcp: 33510 } as const
 export type ImageKey = 'init' | 'signer' | 'witness' | 'mcp' | 'ui'
 export type DaemonId = 'init' | 'witness' | 'signer' | 'mcp' | 'ui'
 
-export type MountSpec = { subpath: string | null; mountpoint: string; readonly: boolean }
+/**
+ * A part of the `main` volume, or (with `dependency`) one file of another package's volume: Lightning Fork's
+ * `tls.cert`, the one file of its data the package mounts, read-only (`mountDependency`, type `file`).
+ */
+export type MountSpec = {
+  subpath: string | null
+  mountpoint: string
+  readonly: boolean
+  dependency?: { packageId: string; volumeId: string; type: 'file' }
+}
 
 export type ServiceSpec = {
   id: DaemonId
@@ -42,7 +51,17 @@ export type Config = {
   node: NodeConfig
   /** shown on the UI's Agents page: the MCP interface's addresses */
   mcpUrls: string[]
+  /** Lightning Fork's REST address (`https://<its container address>:8080`), empty while it is not installed */
+  lightningRest: string
 }
+
+/** Where the Lightning node's certificate is mounted in the signer and the UI, and where the rail macaroon is. */
+export const LIGHTNING = {
+  packageId: 'lightning-fork',
+  restPort: 8080,
+  cert: '/data/lightning/tls.cert',
+  macaroon: '/data/run/ln/rail.macaroon',
+} as const
 
 /** The local image tags (scripts/oci_build.sh --load); one image set for Umbrel, StartOS and xbt-compute. */
 export const IMAGES: Record<ImageKey, string> = {
@@ -54,6 +73,13 @@ export const IMAGES: Record<ImageKey, string> = {
 }
 
 const vol = (subpath: string | null, mountpoint: string, readonly = false): MountSpec => ({ subpath, mountpoint, readonly })
+/** Lightning Fork's tls.cert, at the root of its `main` volume (its init/setupCerts.ts writes it there) */
+const lightningCert: MountSpec = {
+  subpath: 'tls.cert',
+  mountpoint: LIGHTNING.cert,
+  readonly: true,
+  dependency: { packageId: LIGHTNING.packageId, volumeId: 'main', type: 'file' },
+}
 
 export function services(cfg: Config): ServiceSpec[] {
   const node = {
@@ -87,9 +113,20 @@ export function services(cfg: Config): ServiceSpec[] {
     {
       id: 'signer',
       image: 'signer',
-      command: ['/usr/bin/xbt-signer'],
-      env: { ...node },
-      mounts: [vol('signer', '/data/signer'), vol('run/signer', '/data/run/signer'), vol('run/anchor', '/data/run/anchor', true)],
+      // xbt-supervise restarts the signer when the rail macaroon the UI writes, or the certificate, changes
+      command: ['/usr/bin/xbt-supervise', '--watch', LIGHTNING.macaroon, '--watch', LIGHTNING.cert, '--', '/usr/bin/xbt-signer'],
+      env: {
+        ...node,
+        ...(cfg.lightningRest ? { B2_LN_REST: cfg.lightningRest, B2_LN_MACAROON: LIGHTNING.macaroon, B2_LN_TLS_CERT: LIGHTNING.cert } : {}),
+      },
+      // run/ln: the rail macaroon (group xbt-ln-rail: the UI writes it, the signer reads it, the MCP cannot)
+      mounts: [
+        vol('signer', '/data/signer'),
+        vol('run/signer', '/data/run/signer'),
+        vol('run/anchor', '/data/run/anchor', true),
+        vol('run/ln', '/data/run/ln', true),
+        ...(cfg.lightningRest ? [lightningCert] : []),
+      ],
       requires: ['witness'],
       readyCommand: ['/usr/bin/xbt-signer', 'healthcheck'],
     },
@@ -98,8 +135,9 @@ export function services(cfg: Config): ServiceSpec[] {
       image: 'mcp',
       command: ['/usr/bin/xbt-wallet-mcp'],
       // an over-threshold payment waits this long for the owner's approval in the UI
-      env: { XBT_MCP_HTTP: `0.0.0.0:${PORTS.mcp}`, XBT_MCP_APPROVAL_WAIT_S: '300' },
-      // the bearer token is the UI's run/ui/mcp-http-token (0640, group xbt-wallet-ui): read-only here (AGP-042)
+      // the Lightning rail's and the tickets' own tools (status, stop) beside xbt402_pay
+      env: { XBT_MCP_HTTP: `0.0.0.0:${PORTS.mcp}`, XBT_MCP_APPROVAL_WAIT_S: '300', XBT_MCP_LN: '1', XBT_MCP_TICKETS: '1' },
+      // the bearer token is the UI's run/ui/mcp-http-token (0640, group xbt-wallet-ui): read-only here
       mounts: [vol('mcp', '/data/mcp'), vol('run/signer', '/data/run/signer', true), vol('run/ui', '/data/run/ui', true)],
       requires: ['signer'],
       port: PORTS.mcp,
@@ -112,9 +150,16 @@ export function services(cfg: Config): ServiceSpec[] {
         XBT_UI_BIND: `0.0.0.0:${PORTS.ui}`,
         XBT_UI_SIGNER_SOCK: '/data/run/signer/signer.sock',
         XBT_UI_MCP_URL: cfg.mcpUrls.join(','),
+        ...(cfg.lightningRest ? { XBT_UI_LN_REST: cfg.lightningRest, XBT_UI_LN_TLS_CERT: LIGHTNING.cert } : {}),
       },
-      // the UI owns the MCP token and rotates it on its Agents page (AGP-042)
-      mounts: [vol('ui', '/data/ui'), vol('run/signer', '/data/run/signer', true), vol('run/ui', '/data/run/ui')],
+      // the UI owns the MCP token and rotates it on its Agents page; its Lightning page writes run/ln
+      mounts: [
+        vol('ui', '/data/ui'),
+        vol('run/signer', '/data/run/signer', true),
+        vol('run/ui', '/data/run/ui'),
+        vol('run/ln', '/data/run/ln'),
+        ...(cfg.lightningRest ? [lightningCert] : []),
+      ],
       requires: ['signer'],
       port: PORTS.ui,
     },

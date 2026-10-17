@@ -67,11 +67,17 @@ pub const MCP: &str = "mcp";
 pub const UI: &str = "ui";
 /// The xbt-work blinded receipt relay (AGP-043): its blob store and push token.
 pub const RELAY: &str = "relay";
+/// The stream-ticket seller gateway: its state dir (receipt key, sessions, journal).
+pub const GATEWAY: &str = "gateway";
 /// The socket directory of the signer (`signer.sock`, `ready.json`) and of the witness (`anchor.sock`).
 pub const RUN_SIGNER: &str = "signer";
 pub const RUN_ANCHOR: &str = "anchor";
 /// The UI's shared dir (AGP-042): `mcp-http-token`, which the UI writes and the MCP only reads (group).
 pub const RUN_UI: &str = "ui";
+/// The wallet's Lightning rail files the UI writes and the signer reads: `rail.macaroon`, `mainnet-ack`.
+pub const RUN_LN: &str = "ln";
+/// The gateway's config and macaroons, written by the UI's gateway page, read by the gateway.
+pub const RUN_GATEWAY: &str = "gateway";
 /// The MCP bearer token's name, in `run/ui/` on a box (AGP-042) or `mcp/secrets/` without a UI.
 pub const MCP_TOKEN: &str = "mcp-http-token";
 

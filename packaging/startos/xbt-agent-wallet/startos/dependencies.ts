@@ -1,6 +1,8 @@
 import { sdk } from './sdk'
 
-// No StartOS package runs an XBT node yet (Start9's bitcoind is the SHA256d chain), so the node is an external
-// connection set in the Node connection action. When xbt-compute's node-host package (CMP-099) exists, declare it
-// here and offer it next to "external node" (recipe: Support Alternative Dependencies).
-export const setDependencies = sdk.setupDependencies(async () => ({}))
+// The Lightning node is Lightning Fork (the XBT chain's lnd), required running: the wallet pays over it.
+// The XBT node is still an external connection set in the Node connection action (no package here declares
+// Paul's knots-blake2b yet; Lightning Fork does, and declaring it is the next step).
+export const setDependencies = sdk.setupDependencies(async () => ({
+  'lightning-fork': { kind: 'running', versionRange: '>=0.21.0:0', healthChecks: [] },
+}))

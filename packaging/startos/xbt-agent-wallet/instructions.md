@@ -5,6 +5,9 @@ the services your policy allows, within its budgets, and anything above your thr
 
 ## First start
 
+0. Install Lightning Fork first (the package depends on it), with a channel to the sellers' side of the
+   network. In its dashboard, **Macaroons**: make one with exactly `info:read offchain:read offchain:write
+   onchain:read` and a root key of its own. Never use the admin macaroon: the wallet refuses one.
 1. **Node connection** (Actions). Enter your XBT (BLAKE2b) node's RPC host, port, user and password, and its
    chain. The service will not start without it.
 2. Start the service. When *Wallet ready to pay* shows success, the node is synced and the keys are unlocked.
@@ -12,8 +15,11 @@ the services your policy allows, within its budgets, and anything above your thr
    (at least 10 characters).
 4. In the web interface, **Setup**:
    - enrol your approval key: it is made in your browser and never leaves it; write down its backup;
-   - sign your first policy: which services your agents may pay, the budgets, and the threshold above which
-     you approve each payment yourself.
+   - sign your first policy: which services your agents may pay (each seller with its Lightning node id), the
+     budgets, and the threshold above which you approve each payment yourself. The starter template turns
+     Lightning and stream tickets on with low caps.
+   - **Lightning**: paste the macaroon from step 0. On mainnet the page asks you to type an
+     acknowledgement first: this software has run on regtest only.
 5. **Agents** page (or the *Agent connection* action): give your agent the MCP endpoint and the bearer token.
 
 ## Everyday use
@@ -21,8 +27,7 @@ the services your policy allows, within its budgets, and anything above your thr
 - Payments above your threshold appear under **Approvals**; approve or deny them there, signed with your key.
 - **Signatures** shows the signature log and its anchors; **Keys** the hot key, its sweep and its
   rotation. **Channels** lists only what an earlier version of the wallet left: this wallet pays
-  over Lightning and has no on-chain channel. The package does not connect the wallet to a
-  Lightning node yet, so for now no service is paid.
+  over Lightning and has no on-chain channel. **Lightning** shows the rail's state.
 - The token lets an agent pay what your policy allows. If it leaks, open the **Agents** page and rotate it
   there (no restart), or run the *Rotate the agent token* action. Give your agents the new one.
 
