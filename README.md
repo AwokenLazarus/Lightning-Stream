@@ -292,12 +292,24 @@ scripts wrote on their latest runs, as they were written: our own runs, on one h
 
 ## Build
 
+What to install first, on a stock Ubuntu 24.04 (other systems need the same things under their
+own names): git, a C compiler and linker (`build-essential`; libsecp256k1 is built from source),
+and Rust stable from <https://rustup.rs>.
+
 ```bash
-cargo test -j2 --workspace
+sudo apt-get install -y git curl build-essential
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+git clone https://github.com/AwokenLazarus/Lightning-Stream.git && cd Lightning-Stream
+ulimit -n 4096    # the tests open many loopback connections at once
+cargo test -j2 --workspace --locked
 cargo build --release -p xbt-signer -p xbt-wallet-mcp -p xbt-wallet-ui
 ```
 
-Rust stable; libsecp256k1 is built from source. The workspace builds, tests and passes clippy on
+The `ulimit` line matters: at the open-file limit of 1024 that many Linux shells start with,
+about half of `crates/xbt-signer/tests/ticket_pay.rs` fails with "Too many open files". With
+4096 the whole workspace passes.
+
+The workspace builds, tests and passes clippy on
 Rust 1.98.0, which is what `.github/workflows/ci.yml` runs on every push and pull request, and
 builds, tests and passes clippy on 1.91.1. The minimum stated in `Cargo.toml` is 1.90: the locked
 `ruint` 1.20.1 declares it, the highest of any locked package (the code itself needs 1.89). No
