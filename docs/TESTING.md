@@ -53,7 +53,8 @@ Run one lab at a time: each takes a block of loopback ports and its own containe
 its containers and volumes when it ends. The head of each script lists its ports, its settings
 and its environment variables. The first lab also builds the chain node's image
 (`knots-blake2b:final-zmq`) from source when it is not there yet: that took 4 minutes on four
-cores, on top of the times above.
+cores, on top of the times above. The Jellyfin image (1.9 GB) and the Go image (1.3 GB) the labs
+use were already on the machine of that run, so their download is not in the times either.
 
 What each step writes, under `run/` (ignored by git):
 
