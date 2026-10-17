@@ -14,6 +14,29 @@ use xbt_gateway::standin::StandIn;
 
 const KEY: fn(&Rig) -> String = |r| r.gw.terms().receipt_key.clone();
 
+/// The terms name the chain's CAIP-2 id with `extra.layer: "lightning"`; a buyer that still names
+/// the network the way of before 2026-10 (`lightning:<32 hex>`) is served for one release.
+#[test]
+fn the_network_is_the_chains_id_with_its_layer_and_the_old_name_is_still_taken() {
+    let (rig, _d) = start(&|v| v["network"] = json!(OLD_NET));
+    let got = http(&rig.addr, "GET", "/files/1000", &[], b"", None);
+    let a = &got.json()["accepts"][0];
+    assert_eq!((a["network"].as_str(), a["extra"]["layer"].as_str()), (Some(NET), Some("lightning")), "{a}");
+    for net in [NET, OLD_NET] {
+        let mut b = Buyer::new(&rig, if net == NET { 1 } else { 2 });
+        b.net = net;
+        let secrets = b.lock(&rig, 1);
+        assert_eq!(b.get("/api", Some(&secrets[0])).status, 200, "{net}");
+    }
+    // the chain id without its layer is a payment on the chain itself: not this entry
+    let mut b = Buyer::new(&rig, 3);
+    b.net = "bip122:00000000000000000000000000000002";
+    let one = b.fresh_secrets(1);
+    let got = b.lock_raw(&one);
+    assert_eq!(got.status, 200, "a first lock carries no entry");
+    assert_eq!(b.get("/api", Some(&one[0])).error(), "bad_payment");
+}
+
 #[test]
 fn an_unpaid_request_gets_the_terms_and_reaches_nothing() {
     let (rig, _d) = start(&|_| {});

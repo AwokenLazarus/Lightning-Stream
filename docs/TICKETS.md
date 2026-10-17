@@ -49,9 +49,9 @@ as decimal strings; hashes, secrets and keys are lower-case hex.
 A seller that takes tickets adds one entry to `accepts` in its `402` (`PAYMENT-REQUIRED`, x402 v2):
 
 ```json
-{"scheme": "ticket", "network": "lightning:0000000000000050c1e5f69672f45929",
+{"scheme": "ticket", "network": "bip122:0000000000000050c1e5f69672f45929",
  "asset": "XBT:msat", "amount": "2500", "payTo": "<the seller's Lightning node id, 33 bytes>",
- "extra": {"version": "ticket/0", "features": [512],
+ "extra": {"version": "ticket/0", "layer": "lightning", "features": [512],
            "ticketMsat": "1000000", "maxTickets": 2, "ticketBlocks": 40,
            "release": "with-request", "settle": "on-use",
            "receiptKey": "<33-byte public key>", "session": "/x402/ticket",
@@ -60,7 +60,7 @@ A seller that takes tickets adds one entry to `accepts` in its `402` (`PAYMENT-R
 
 | Field | Meaning | Why |
 |---|---|---|
-| `network` | `lightning:` and the 32 hex characters of the chain's `bip122` id. Not the chain id itself. | A client picks an entry by scheme and network. The chain id names the chain itself (it was the network of the on-chain channel entry this project once had). XBT and the SHA-256 chain share a genesis block, so a Lightning id keyed on it would name both networks. |
+| `network`, `extra.layer` | The chain's CAIP-2 id, `bip122:` and its 32 hex characters, and `"layer": "lightning"`: payments of this entry are made over Lightning on that chain. | A client picks an entry by scheme and network. CAIP-2 is the standard name of a chain; the layer says the entry is not a payment on the chain itself. For XBT the 32 hex characters are of a block after the split (`xbt402::wire::XBT_MAINNET`), since XBT and the SHA-256 chain share a genesis block. Until 2026-10 this was `lightning:` and the same hex, a namespace nobody else defines: the wallet and the gateway built here read that name for one release (the gateway in its config and in a buyer's `accepted`, the wallet in a seller's terms) and write the new one. |
 | `features: [512]` | Every invoice of this entry carries feature bit 512, required. | Bit 512 is what separates an XBT Lightning invoice from one of the SHA-256 chain. The wallet's Lightning rail already refuses an invoice without it. |
 | `amount` | The price of this request before its body, in msat: `price.requestMsat`. | Pieces are metered below one sat; money moves a ticket at a time (section 3). |
 | `price` | The whole price rule: `requestMsat` once per request, `byteMsat` for every `perBytes` bytes of the response body (rounded up over the whole body), `secondMsat` for every started second the response is open. | A body priced by its size or its duration has no price before it is sent (section 4). |
@@ -710,7 +710,9 @@ too, and holds after it.
 
 ## 8. Open in this draft
 
-- The scheme name and the `lightning:` network id are ours. Nothing upstream defines them.
+- The scheme names (`ticket`, `lottery`) are ours; nothing upstream defines them. The network is
+  CAIP-2's `bip122:` id with `extra.layer: "lightning"` since 2026-10. The asset name
+  `XBT:msat` is ours.
 - What `auth` covers in a second `lock` and in a `cancel` is not written down: section 3 defines it
   for a paid request only.
 - A lock is not idempotent. If the answer to a lock is lost, the seller holds invoices the buyer
@@ -749,9 +751,12 @@ too, and holds after it.
   node's `SignMessage`, which neither of the seller's macaroons allows; the runner can sign the
   list once with its own tools, or a third narrow macaroon can. Until then the list is the TLS
   origin's word, as the terms are.
-- The entry for a single Lightning payment (section 12, rail 2) is x402's `exact` with a network
-  id of ours and the invoice in `extra.invoice`. No seller in this tree offers it, and it was not
-  run on the lab.
+- The entry for a single Lightning payment (section 12, rail 2) is x402's `exact` on the chain's
+  `bip122:` id with `extra.layer: "lightning"` (or the old `lightning:` name), the invoice in
+  `extra.invoice` and the preimage as the payload. Upstream x402 has since defined `exact` on
+  Lightning (`REFERENCES.md`, 22); its definition is not in this tree and was not checked against
+  this one, so the invoice's field and the payload are this tree's reading and may differ from
+  upstream's. No seller in this tree offers the entry, and it was not run on the lab.
 - `bytes` and `complete` beside the last receipt of a long answer are not signed. What is signed
   is `charged` and `bodyHash`.
 - The price of a piece only the service can count, such as the tokens a model produced, cannot be
@@ -834,9 +839,9 @@ A seller that takes draws adds one entry to `accepts`, after its ticket entries:
 knows only tickets skips an entry it cannot read.
 
 ```json
-{"scheme": "lottery", "network": "lightning:0000000000000050c1e5f69672f45929",
+{"scheme": "lottery", "network": "bip122:0000000000000050c1e5f69672f45929",
  "asset": "XBT:msat", "amount": "0", "payTo": "<the seller's Lightning node id, 33 bytes>",
- "extra": {"version": "lottery/0", "features": [512],
+ "extra": {"version": "lottery/0", "layer": "lightning", "features": [512],
            "winMsat": "64000", "minWinMsat": "16000", "winBlocks": 40,
            "pay": "on-win", "release": "after-answer",
            "window": 8, "graceSeconds": 30, "gracePieces": 64, "maxUnpaidWins": 2,

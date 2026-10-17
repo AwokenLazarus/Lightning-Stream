@@ -87,8 +87,10 @@ target/release/xbt-gateway gateway.json
 start.
 
 - **The chain.** A file that names no `chain` is a regtest file. Every chain but `main` also
-  names its `network`: `lightning:` and the first 32 hex characters of the hash of that chain's
-  block 101 (`getblockhash 101`); the example's is a placeholder. Mainnet is asked for twice:
+  names its `network`: `bip122:` and the first 32 hex characters of the hash of that chain's
+  block 101 (`getblockhash 101`); the example's is a placeholder. (The terms say it with
+  `extra.layer: "lightning"`. A file that still writes `lightning:` and the same hex, the name of
+  before 2026-10, is read for one release.) Mainnet is asked for twice:
   `"chain": "main"` and `"mainnet_ack": "real funds, software that has run on regtest only"`,
   word for word. With one and not the other nothing starts. A gateway that starts on mainnet
   prints, at every start and every `--check`, a short list of what is known to be open there;

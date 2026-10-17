@@ -288,9 +288,10 @@ class Seller:
         self.lock = threading.Lock()
 
     def accepts(self) -> dict[str, Any]:
-        net = "lightning:" + lab.chain("getblockhash", "101")[:32]
+        net = "bip122:" + lab.chain("getblockhash", "101")[:32]
         extra = {
             "version": "ticket/0",
+            "layer": "lightning",
             "features": [512],
             "ticketMsat": str(TICKET_MSAT),
             "maxTickets": HELD,

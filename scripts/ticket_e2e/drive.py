@@ -678,7 +678,7 @@ def setup() -> None:
         with open(f"{RUN}/{name}.macaroon", "wb") as f:
             f.write(bytes.fromhex(lab.bake(node, perms)))
         os.chmod(f"{RUN}/{name}.macaroon", 0o600)
-    NETWORK[0] = "lightning:" + lab.chain("getblockhash", "101")[:32]
+    NETWORK[0] = "bip122:" + lab.chain("getblockhash", "101")[:32]
     # the service: a stock file server, with a file where every MiB differs
     os.makedirs(f"{RUN}/www/free", exist_ok=True)
     block = os.urandom(1 << 20)

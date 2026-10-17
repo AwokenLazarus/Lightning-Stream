@@ -637,15 +637,17 @@ fn refuse<T>(rule: &'static str, msg: impl Into<String>) -> Result<T, Refusal> {
 }
 
 impl Terms {
-    /// Read an `accepts` entry for the network `lightning` (`lightning:<32 hex>`). Everything in
-    /// it is the seller's word: what is not exactly what the draft says is refused.
+    /// Read an `accepts` entry for Lightning on the chain `lightning` (its CAIP-2 id,
+    /// `bip122:<32 hex>`, with `extra.layer: "lightning"`, or the name of before 2026-10:
+    /// [`xbt402::ticket::on_network`]). Everything in it is the seller's word: what is not exactly
+    /// what the draft says is refused.
     pub fn parse(acc: &Value, lightning: &str) -> Result<Self, Refusal> {
         let s = |v: &Value, k: &str| str_or_empty(v.get(k));
         if s(acc, "scheme") != "ticket" {
             return refuse("ticket_terms", "the scheme is not \"ticket\"");
         }
-        if s(acc, "network") != lightning {
-            return refuse("ticket_network", format!("the terms are for another network, this wallet is on {lightning:?}"));
+        if !xbt402::ticket::on_network(acc, lightning) {
+            return refuse("ticket_network", format!("the terms are for another network, this wallet is on Lightning on {lightning:?}"));
         }
         if s(acc, "asset") != "XBT:msat" {
             return refuse("ticket_terms", "the asset is not \"XBT:msat\"");
@@ -1579,15 +1581,15 @@ mod tests {
     }
 
     fn accepts() -> Value {
-        json!({"scheme": "ticket", "network": "lightning:00000000000000000000000000000001", "asset": "XBT:msat", "amount": "2500",
+        json!({"scheme": "ticket", "network": "bip122:00000000000000000000000000000001", "asset": "XBT:msat", "amount": "2500",
                "payTo": node_id(),
-               "extra": {"version": "ticket/0", "features": [512], "ticketMsat": "1000000", "maxTickets": 8, "ticketBlocks": 40,
+               "extra": {"version": "ticket/0", "layer": "lightning", "features": [512], "ticketMsat": "1000000", "maxTickets": 8, "ticketBlocks": 40,
                          "release": "with-request", "settle": "on-use", "receiptKey": "02", "session": "/x402/ticket"}})
     }
 
     #[test]
     fn terms_are_read_exactly_as_the_draft_writes_them() {
-        let net = "lightning:00000000000000000000000000000001";
+        let net = "bip122:00000000000000000000000000000001";
         let t = Terms::parse(&accepts(), net).unwrap();
         assert_eq!((t.ticket_msat, t.min_ticket_msat, t.max_tickets, t.ticket_blocks), (1_000_000, None, 8, 40));
         let with = |path: &[&str], v: Value| {
@@ -1601,7 +1603,8 @@ mod tests {
         };
         assert_eq!(with(&["scheme"], json!("xbt-channel")), Err("ticket_terms"));
         assert_eq!(with(&["network"], json!("lightning:00000000000000000000000000000002")), Err("ticket_network"));
-        assert_eq!(with(&["network"], json!("bip122:00000000000000000000000000000001")), Err("ticket_network"));
+        assert_eq!(with(&["extra", "layer"], json!("liquid")), Err("ticket_network"), "the chain's id with another layer");
+        assert!(with(&["network"], json!("lightning:00000000000000000000000000000001")).is_ok(), "the name of before 2026-10, for one release");
         assert_eq!(with(&["asset"], json!("XBT")), Err("ticket_terms"));
         assert_eq!(with(&["payTo"], json!(node_id()[..64])), Err("ticket_terms"));
         assert_eq!(with(&["payTo"], json!("05".to_string() + &node_id()[2..])), Err("ticket_terms"), "not a point");

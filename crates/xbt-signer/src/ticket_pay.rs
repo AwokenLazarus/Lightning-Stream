@@ -470,7 +470,8 @@ pub fn origin_of(url: &str) -> Result<String> {
 
 impl Signer {
     fn ticket_net(&self) -> Result<String> {
-        Ok(crate::node::network(&*self.node, &self.chain, None)?.replacen("bip122:", "lightning:", 1))
+        // the chain's id: an entry for Lightning on it says so in `extra.layer` ([`xbt402::ticket::on_network`])
+        crate::node::network(&*self.node, &self.chain, None)
     }
 
     fn ticket_read_timeout(tp: &TicketPolicy) -> Duration {
@@ -616,7 +617,7 @@ impl Signer {
                              else if scheme == Some("exact") { "exact" }
                              else if matches!(scheme, Some(CHANNEL_SCHEME | "xbt-channel")) { CHANNEL_SCHEME } else { "other" };
                 let network = match a.get("network").and_then(Value::as_str) {
-                    Some(n) if n == lightning => "this wallet's Lightning network",
+                    _ if xbt402::ticket::on_network(a, &lightning) => "this wallet's Lightning network",
                     Some(n) if n == chain => "this wallet's chain",
                     _ => "other",
                 };
@@ -1854,7 +1855,9 @@ impl Signer {
         let allowed = !origin.is_empty() && (normalize_dest(&s.origin) == origin) && seller_url(&origin, &http.base).is_ok() && self.ticket_may_reach(&origin, &s.task);
         let mut sent = false;
         if allowed {
-            let net = self.ticket_net().unwrap_or_default();
+            // the session's entry is not kept across a start: one is written for the cancel. Under the network's name of
+            // before 2026-10, for the release in which a gateway reads both names: a gateway of before reads only that one
+            let net = self.ticket_net().ok().and_then(|n| xbt402::ticket::legacy_network_id(&n)).unwrap_or_default();
             let accepted = json!({"scheme": xbt402::ticket::SCHEME, "network": net});
             let url = format!("{}/cancel", http.base);
             let raw = json!({"hashes": "all"}).to_string().into_bytes();

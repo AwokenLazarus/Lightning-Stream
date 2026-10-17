@@ -235,7 +235,7 @@ class Buyer:
             payload["secret"] = s
         if seq is None:
             self.seq += 1
-        accepted = {"scheme": "ticket", "network": NETWORK}
+        accepted = {"scheme": "ticket", "network": NETWORK, "extra": {"layer": "lightning"}}
         return base64.b64encode(json.dumps({"x402Version": 2, "accepted": accepted, "payload": payload}).encode()).decode()
 
     def took(self, a: Answer, secret: bytes | None) -> Answer:
@@ -484,7 +484,7 @@ def setup() -> None:
 def prepare() -> None:
     """Macaroons, files, the config; then the file server and the gateway."""
     global NETWORK
-    NETWORK = "lightning:" + lab.chain("getblockhash", "101")[:32]
+    NETWORK = "bip122:" + lab.chain("getblockhash", "101")[:32]
     MAC["buyer"] = lab.bake(BUYER, lab.BUYER_PERMISSIONS)
     MAC["invoices"] = lab.bake(SELLER, lab.SELLER_PERMISSIONS)
     MAC["info"] = lab.bake(SELLER, ("info:read",))
@@ -519,6 +519,7 @@ def terms() -> None:
         saw["status"] == 402
         and a["scheme"] == "ticket"
         and a["network"] == NETWORK
+        and x.get("layer") == "lightning"
         and a["payTo"] == lab.pubkey(SELLER)
         and (x["ticketMsat"], x["maxTickets"], x["ticketBlocks"], x["release"], x["settle"], x["session"]) == ("1000000", POOL, 40, "with-request", "on-use", "/x402/ticket")
         and [o["extra"]["settle"] for o in b.offers] == ["on-use", "on-arrival"]

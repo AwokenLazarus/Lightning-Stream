@@ -102,7 +102,7 @@ impl Drawer {
     fn sign_at(&self, seq: u64, method: &str, target: &str, body: &[u8]) -> String {
         let digest = request_digest_v2(method, &format!("{}{target}", self.origin), body);
         let auth = lottery::request_auth(&self.key, &self.session, seq, &digest);
-        b64json(&json!({"x402Version": 2, "accepted": {"scheme": "lottery", "network": NET},
+        b64json(&json!({"x402Version": 2, "accepted": {"scheme": "lottery", "network": NET, "extra": {"layer": "lightning"}},
                         "payload": {"session": self.session, "seq": seq, "auth": auth}}))
     }
 
@@ -451,7 +451,7 @@ fn a_hostile_buyer_changes_no_draw_and_learns_no_chain_value_early() {
     // without the session's key, or with another session's: nothing, and nothing is told
     let raw = body(1, &p, 2500, &v1).to_string();
     assert_eq!(http(&rig.addr, "POST", "/x402/lottery/draw", &[], raw.as_bytes(), None).status, 401);
-    let forged = b64json(&json!({"x402Version": 2, "accepted": {"scheme": "lottery", "network": NET},
+    let forged = b64json(&json!({"x402Version": 2, "accepted": {"scheme": "lottery", "network": NET, "extra": {"layer": "lightning"}},
         "payload": {"session": b.session, "seq": b.seq, "auth": lottery::request_auth(&other.key, &b.session, b.seq, &request_digest_v2("POST", &format!("{}/x402/lottery/draw", b.origin), raw.as_bytes()))}}));
     let got = http(&rig.addr, "POST", "/x402/lottery/draw", &[("PAYMENT-SIGNATURE", &forged)], raw.as_bytes(), None);
     assert_eq!((got.status, got.error().as_str()), (401, "bad_auth"));
@@ -484,7 +484,7 @@ fn a_hostile_buyer_changes_no_draw_and_learns_no_chain_value_early() {
     let replay = http(&rig.addr, "GET", "/api", &[("PAYMENT-SIGNATURE", &sig)], b"", None);
     assert_eq!((replay.status, replay.error().as_str()), (402, "bad_seq"));
     // values in the request's own header are not a thing: one path for a value
-    let with_values = b64json(&json!({"x402Version": 2, "accepted": {"scheme": "lottery", "network": NET},
+    let with_values = b64json(&json!({"x402Version": 2, "accepted": {"scheme": "lottery", "network": NET, "extra": {"layer": "lightning"}},
         "payload": {"session": b.session, "seq": b.seq, "auth": "0".repeat(64), "values": []}}));
     assert_eq!(http(&rig.addr, "GET", "/api", &[("PAYMENT-SIGNATURE", &with_values)], b"", None).status, 400);
     // a body that is not a draw request uses up no seq

@@ -201,7 +201,7 @@ def setup() -> None:
         with open(f"{RUN}/{name}.macaroon", "wb") as f:
             f.write(bytes.fromhex(lab.bake(node, perms)))
         os.chmod(f"{RUN}/{name}.macaroon", 0o600)
-    e2e.NETWORK[0] = "lightning:" + lab.chain("getblockhash", "101")[:32]
+    e2e.NETWORK[0] = "bip122:" + lab.chain("getblockhash", "101")[:32]
     # the service: a stock file server; every piece of each file differs
     os.makedirs(f"{RUN}/www/free", exist_ok=True)
     block = os.urandom(1 << 20)
@@ -558,7 +558,7 @@ class Cheat:
         self.sid, self.key, self.win = o["session"], bytes.fromhex(o["key"]), int(o["winMsat"])
         self.view = draw.BuyerView(bytes.fromhex(o["anchor"]))
         self.seq, self.draws, self.wins, self.agree = 0, 0, 0, True
-        self.accepted = {"scheme": "lottery", "network": e2e.NETWORK[0]}
+        self.accepted = {"scheme": "lottery", "network": e2e.NETWORK[0], "extra": {"layer": "lightning"}}
 
     def header(self, method: str, target: str, body: bytes) -> tuple[dict[str, str], str]:
         req = request_digest(method, self.origin, target, body)

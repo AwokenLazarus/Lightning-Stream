@@ -196,7 +196,7 @@ impl DrawTerms {
         if acc.get("scheme").and_then(Value::as_str) != Some(xbt402::lottery::SCHEME) {
             return refuse(R, "not a lottery entry");
         }
-        if acc.get("network").and_then(Value::as_str) != Some(lightning) {
+        if !xbt402::ticket::on_network(acc, lightning) {
             return refuse("ticket_network", "the entry is for another Lightning network than this wallet's");
         }
         if acc.get("asset").and_then(Value::as_str) != Some(xbt402::ticket::ASSET) {
@@ -348,7 +348,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const NET: &str = "lightning:00000000000000000000000000000001";
+    const NET: &str = "bip122:00000000000000000000000000000001";
 
     fn node_id() -> String {
         let sk = xbt_primitives::secp256k1::SecretKey::from_slice(&[3u8; 32]).unwrap();
@@ -358,7 +358,7 @@ mod tests {
     fn accepts(price: Value) -> Value {
         let amount = price.get("requestMsat").and_then(Value::as_str).unwrap_or("0").to_string();
         json!({"scheme": "lottery", "network": NET, "asset": "XBT:msat", "amount": amount, "payTo": node_id(),
-               "extra": {"version": "lottery/0", "features": [512], "winMsat": "64000", "minWinMsat": "16000", "winBlocks": 40, "pay": "on-win",
+               "extra": {"version": "lottery/0", "layer": "lightning", "features": [512], "winMsat": "64000", "minWinMsat": "16000", "winBlocks": 40, "pay": "on-win",
                          "release": "after-answer", "window": 8, "graceSeconds": 10, "gracePieces": 64, "maxUnpaidWins": 2, "chainDraws": 65536,
                          "pieceBytes": "262144", "receiptKey": node_id(), "session": "/x402/lottery", "price": price}})
     }

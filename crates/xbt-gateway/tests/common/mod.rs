@@ -18,7 +18,9 @@ use xbt_gateway::node::{Hash, InvoiceState};
 use xbt_gateway::standin::StandIn;
 use xbt_svc::http::{serve_with, Handler, Limits, Reply, Request, Response, Running, Streamed};
 
-pub const NET: &str = "lightning:00000000000000000000000000000001";
+pub const NET: &str = "bip122:00000000000000000000000000000001";
+/// The name a ticket entry's network had until 2026-10, read for one release.
+pub const OLD_NET: &str = "lightning:00000000000000000000000000000001";
 
 // --- the service behind the gateway -----------------------------------------------------------------
 
@@ -437,6 +439,8 @@ pub struct Buyer {
     pub receipt_key: String,
     pub next_secret: u64,
     pub tag: u8,
+    /// The network its `accepted` entry names ([`NET`]; [`OLD_NET`] for a buyer of before 2026-10).
+    pub net: &'static str,
 }
 
 pub fn secret_of(tag: u8, n: u64) -> [u8; 32] {
@@ -456,6 +460,7 @@ impl Buyer {
             receipt_key: rig.gw.terms().receipt_key.clone(),
             next_secret: 0,
             tag,
+            net: NET,
         }
     }
 
@@ -505,7 +510,7 @@ impl Buyer {
             payload["ticket"] = t.into();
         }
         b64json(
-            &json!({"x402Version": 2, "accepted": {"scheme": "ticket", "network": NET}, "payload": payload}),
+            &json!({"x402Version": 2, "accepted": {"scheme": "ticket", "network": self.net, "extra": {"layer": "lightning"}}, "payload": payload}),
         )
     }
 

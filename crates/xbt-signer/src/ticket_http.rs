@@ -176,11 +176,12 @@ impl Offer {
 }
 
 /// The entries of a `PAYMENT-REQUIRED` this wallet could pay, in its order of choice: a ticket
-/// entry, a single Lightning payment. `lightning` is this wallet's Lightning network id
-/// (`lightning:<32 hex>`); an entry on any other network is not listed.
+/// entry, a single Lightning payment. `lightning` is the id of this wallet's chain
+/// (`bip122:<32 hex>`): an entry is listed when it is for Lightning on it, by its `extra.layer`
+/// or by the name of before 2026-10 ([`xbt402::ticket::on_network`]).
 pub fn offers(pr: &Value, lightning: &str) -> Vec<Offer> {
     let entries: Vec<&Value> = pr.get("accepts").and_then(Value::as_array).into_iter().flatten().collect();
-    let on = |a: &&&Value, scheme: &str, net: &str| a.get("scheme").and_then(Value::as_str) == Some(scheme) && a.get("network").and_then(Value::as_str) == Some(net);
+    let on = |a: &&&Value, scheme: &str, net: &str| a.get("scheme").and_then(Value::as_str) == Some(scheme) && xbt402::ticket::on_network(a, net);
     let mut out = vec![];
     // a seller that offers both ways of settling lists two ticket entries: held tickets are the wallet's
     // first choice, prepaid ones what it falls back to. An entry that names neither way is taken as the
@@ -344,11 +345,11 @@ mod tests {
         hex::encode(ecdsa::pubkey(&ecdsa::secret_key(&[0x33; 32]).unwrap()))
     }
 
-    const NET: &str = "lightning:00000000000000000000000000000001";
+    const NET: &str = "bip122:00000000000000000000000000000001";
 
     fn accepts(price: Value) -> Value {
         json!({"scheme": "ticket", "network": NET, "asset": "XBT:msat", "amount": "2500", "payTo": node_id(),
-               "extra": {"version": "ticket/0", "features": [512], "ticketMsat": "1000000", "maxTickets": 8, "ticketBlocks": 40,
+               "extra": {"version": "ticket/0", "layer": "lightning", "features": [512], "ticketMsat": "1000000", "maxTickets": 8, "ticketBlocks": 40,
                          "release": "with-request", "settle": "on-use", "receiptKey": hex::encode(key().1), "session": "/x402/ticket", "price": price}})
     }
 
@@ -410,7 +411,7 @@ mod tests {
         let chain = "bip122:00000000000000000000000000000001";
         let ticket = accepts(json!({"requestMsat": "2500"}));
         let channel = json!({"scheme": "batch-settlement", "network": chain, "amount": 3});
-        let ln = json!({"scheme": "exact", "network": NET, "amount": "3000", "extra": {"invoice": "lnbcrt1..."}});
+        let ln = json!({"scheme": "exact", "network": NET, "amount": "3000", "extra": {"layer": "lightning", "invoice": "lnbcrt1..."}});
         let pr = json!({"accepts": [channel, ln, ticket, {"scheme": "ticket", "network": "lightning:other"}, {"scheme": "exact", "network": "lnbtc:x"}, 7]});
         let got = offers(&pr, NET);
         assert_eq!(got.iter().map(Offer::rail).collect::<Vec<_>>(), ["ticket", "ln"]);

@@ -473,7 +473,7 @@ def setup() -> None:
         with open(f"{RUN}/{name}.macaroon", "wb") as f:
             f.write(bytes.fromhex(lab.bake(node, perms)))
         os.chmod(f"{RUN}/{name}.macaroon", 0o600)
-    NETWORK[0] = "lightning:" + lab.chain("getblockhash", "101")[:32]
+    NETWORK[0] = "bip122:" + lab.chain("getblockhash", "101")[:32]
     # the stock file server: the swarm's pieces, and the film where no Jellyfin is used
     os.makedirs(f"{RUN}/www/pieces", exist_ok=True)
     service = file_server(film) if SERVICE == "files" else jellyfin_running() if os.environ.get("DEMO_JELLYFIN_URL") else jellyfin_container(film)

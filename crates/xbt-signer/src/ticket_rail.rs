@@ -538,7 +538,7 @@ impl Signer {
             (Err(d), _) | (_, Err(d)) => return d,
         };
         let net = match node::network(&*self.node, &self.chain, None) {
-            Ok(n) => n.replacen("bip122:", "lightning:", 1),
+            Ok(n) => n,
             Err(e) => return refusal("ticket_network", e.msg),
         };
         let first = match Terms::parse(p.get("terms").unwrap_or(&Value::Null), &net) {
@@ -2021,7 +2021,7 @@ impl Signer {
         };
         let expect_msat = py_int(p.get("expect_sats")).filter(|n| *n >= 0).map_or(0, |s| (s as u64).saturating_mul(1000));
         let net = match node::network(&*self.node, &self.chain, None) {
-            Ok(n) => n.replacen("bip122:", "lightning:", 1),
+            Ok(n) => n,
             Err(e) => return refusal("ticket_network", e.msg),
         };
         let terms = match crate::lottery::DrawTerms::parse(p.get("terms").unwrap_or(&Value::Null), &net) {

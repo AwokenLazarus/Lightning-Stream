@@ -62,11 +62,35 @@ pub fn held_budget(slots: u32) -> u32 {
     slots.min(MAX_CHANNEL_SLOTS) / 2
 }
 
-/// `lightning:` and the 32 hex characters of the chain's `bip122` id: a Lightning network is not
-/// the chain, and XBT shares its genesis block with the SHA-256 chain.
+/// What `extra.layer` of an `accepts` entry says when its payments are made over Lightning on the
+/// chain its `network` names.
+pub const LAYER: &str = "lightning";
+
+/// The `network` of an entry paid over Lightning: the chain's own CAIP-2 id, `bip122:` and 32 lower
+/// case hex characters (for XBT the hash of a block after the split, since it shares its genesis
+/// block with the SHA-256 chain), beside `extra.layer: "lightning"`. `None`: not such an id.
 pub fn network_id(bip122: &str) -> Option<String> {
     let id = bip122.strip_prefix("bip122:")?;
-    (id.len() == 32 && id.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))).then(|| format!("lightning:{id}"))
+    (id.len() == 32 && id.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))).then(|| bip122.to_string())
+}
+
+/// The name such an entry's `network` had until 2026-10: `lightning:` and the same 32 hex
+/// characters, a namespace nobody else defines. Read for one release beside the standard name,
+/// and never written.
+pub fn legacy_network_id(bip122: &str) -> Option<String> {
+    network_id(bip122).map(|n| n.replacen("bip122:", "lightning:", 1))
+}
+
+/// Whether an `accepts` entry is paid over Lightning on the chain `bip122`: its `network` is that
+/// chain's id and its `extra.layer` is [`LAYER`], or its `network` is the legacy name
+/// ([`legacy_network_id`]). An entry on the chain id with no layer is a payment on the chain itself.
+pub fn on_network(entry: &Value, bip122: &str) -> bool {
+    let net = entry.get("network").and_then(Value::as_str);
+    let layer = entry.get("extra").and_then(|x| x.get("layer")).and_then(Value::as_str);
+    match (network_id(bip122), legacy_network_id(bip122)) {
+        (Some(id), Some(legacy)) => (net == Some(id.as_str()) && layer == Some(LAYER)) || net == Some(legacy.as_str()),
+        _ => false,
+    }
 }
 
 /// The message `payload.auth` MACs. A field that is absent is empty.
@@ -114,7 +138,7 @@ pub fn hex32(s: &str) -> Option<[u8; 32]> {
 /// What a seller's terms say about tickets: the `extra` of its `accepts` entry.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Terms {
-    /// `lightning:<32 hex>`.
+    /// The chain's CAIP-2 id, `bip122:<32 hex>` ([`network_id`]); the entry says `extra.layer`.
     pub network: String,
     /// The seller's Lightning node id, 33 bytes hex: the payee of every ticket invoice.
     pub pay_to: String,
@@ -135,6 +159,7 @@ impl Terms {
     pub fn accepts(&self, amount_msat: u64, release: &str, settle: &str, price: &Value) -> Value {
         let mut extra = Map::new();
         extra.insert("version".into(), VERSION.into());
+        extra.insert("layer".into(), LAYER.into());
         extra.insert("features".into(), Value::Array(vec![FEATURE_BLAKE2B.into()]));
         extra.insert("ticketMsat".into(), self.ticket_msat.to_string().into());
         extra.insert("maxTickets".into(), self.max_tickets.into());
@@ -180,11 +205,20 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn the_network_id_is_the_chain_id_under_another_prefix() {
-        assert_eq!(network_id(xbt_primitives::network::XBT_MAINNET).as_deref(), Some("lightning:0000000000000050c1e5f69672f45929"));
+    fn the_network_is_the_chain_id_and_the_layer_says_lightning() {
+        let main = xbt_primitives::network::XBT_MAINNET;
+        assert_eq!(network_id(main).as_deref(), Some("bip122:0000000000000050c1e5f69672f45929"));
+        assert_eq!(legacy_network_id(main).as_deref(), Some("lightning:0000000000000050c1e5f69672f45929"));
         for bad in ["", "bip122:", "bip122:00", "lightning:0000000000000050c1e5f69672f45929", "bip122:0000000000000050C1E5F69672F45929", "bip122:0000000000000050c1e5f69672f459299"] {
             assert_eq!(network_id(bad), None, "{bad}");
         }
+        // the standard name with its layer, and the old name for one release; the chain id alone is the chain
+        assert!(on_network(&json!({"network": main, "extra": {"layer": "lightning"}}), main));
+        assert!(on_network(&json!({"network": "lightning:0000000000000050c1e5f69672f45929"}), main));
+        assert!(!on_network(&json!({"network": main}), main), "no layer: a payment on the chain itself");
+        assert!(!on_network(&json!({"network": main, "extra": {"layer": "liquid"}}), main));
+        assert!(!on_network(&json!({"network": "bip122:00000000000000000000000000000001", "extra": {"layer": "lightning"}}), main));
+        assert!(!on_network(&json!({"network": main, "extra": {"layer": "lightning"}}), "lightning:0000000000000050c1e5f69672f45929"));
     }
 
     #[test]
@@ -242,7 +276,7 @@ mod tests {
 
     #[test]
     fn the_accepts_entry_is_the_one_the_draft_shows() {
-        let t = Terms { network: "lightning:0000000000000050c1e5f69672f45929".into(), pay_to: "02".repeat(33), ticket_msat: 1_000_000, max_tickets: 2, ticket_blocks: 40,
+        let t = Terms { network: "bip122:0000000000000050c1e5f69672f45929".into(), pay_to: "02".repeat(33), ticket_msat: 1_000_000, max_tickets: 2, ticket_blocks: 40,
                         receipt_key: "03".repeat(33), session: SESSION_PATH.into() };
         let a = t.accepts(2500, "with-request", SETTLE_ON_USE, &json!({"requestMsat": "2500"}));
         assert_eq!(a["scheme"], "ticket");

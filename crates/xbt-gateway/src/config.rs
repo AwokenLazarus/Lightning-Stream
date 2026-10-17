@@ -34,6 +34,8 @@ pub const MAINNET_NOTICE: [&str; 9] = [
     "- A buyer's unused balance is trusted to you, and a lost state directory loses every session, key and balance.",
 ];
 
+const NEEDS_NETWORK: &str = "a chain other than main needs network: \"bip122:<32 hex of its bip122 id>\" (chain is \"regtest\" where the file names none)";
+
 /// The node adds this many blocks to a ticket's final CLTV delta when it pays.
 pub const PAYER_PAD_BLOCKS: u32 = 3;
 /// The most held tickets any config may allow: each has a thread and a connection to the node.
@@ -266,20 +268,13 @@ impl Config {
             ("main", None) => xbt402::ticket::network_id(xbt_primitives::network::XBT_MAINNET)
                 .ok_or("no mainnet network id")?,
             ("main", Some(_)) => return Err("network is fixed on chain main: leave it out".into()),
-            (_, Some(n))
-                if n.strip_prefix("lightning:").is_some_and(|id| {
-                    id.len() == 32
-                        && id
-                            .bytes()
-                            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
-                }) =>
-            {
-                n.to_string()
-            }
-            _ => return Err(
-                "a chain other than main needs network: \"lightning:<32 hex of its bip122 id>\" (chain is \"regtest\" where the file names none)"
-                    .into(),
-            ),
+            // the chain's CAIP-2 id; the name of before 2026-10, `lightning:` and the same 32 hex, is read for one
+            // release and written the new way
+            (_, Some(n)) => match xbt402::ticket::network_id(&n.replacen("lightning:", "bip122:", 1)) {
+                Some(id) if n.starts_with("bip122:") || n.starts_with("lightning:") => id,
+                _ => return Err(NEEDS_NETWORK.into()),
+            },
+            (_, None) => return Err(NEEDS_NETWORK.into()),
         };
         let public_url = req_str(top, "public_url")?
             .trim_end_matches('/')
@@ -757,7 +752,7 @@ mod tests {
 
     pub(crate) fn base() -> Value {
         json!({"listen": "127.0.0.1:0", "public_url": "http://127.0.0.1:8402", "upstream": "http://127.0.0.1:8080", "state_dir": "/tmp/x",
-               "chain": "regtest", "network": "lightning:00000000000000000000000000000001",
+               "chain": "regtest", "network": "bip122:00000000000000000000000000000001",
                "node": {"rest": "https://127.0.0.1:8080", "tls_cert": "tls.cert", "macaroon": "a", "info_macaroon": "b"},
                "routes": [{"path": "/files/", "price": {"byte_msat": 1000, "per_bytes": 1048576}},
                           {"path": "/files/free/", "free": true},
@@ -843,7 +838,7 @@ mod tests {
         main["mainnet_ack"] = json!(MAINNET_ACK);
         let m = Config::from_json(&main).unwrap();
         assert!(m.mainnet());
-        assert_eq!(m.network, "lightning:0000000000000050c1e5f69672f45929");
+        assert_eq!(m.network, "bip122:0000000000000050c1e5f69672f45929");
         // and a start on mainnet says what its runner should know, and where the rest is
         let notice = m.mainnet_notice().join("\n");
         assert!(notice.contains("docs/LIMITS.md") && notice.contains("regtest only") && notice.contains("dust"), "{notice}");
@@ -870,6 +865,19 @@ mod tests {
             let e = with(listen, "http://seller.example").unwrap_err().to_string();
             assert!(e.contains("not a loopback address") && e.contains("https"), "{listen}: {e}");
             assert!(with(listen, "https://seller.example").is_ok(), "{listen}: behind a TLS proxy");
+        }
+    }
+
+    #[test]
+    fn the_network_is_the_chains_id_and_the_old_name_is_read_for_one_release() {
+        let c = Config::from_json(&base()).unwrap();
+        assert_eq!(c.network, "bip122:00000000000000000000000000000001");
+        let mut old = base();
+        old["network"] = json!("lightning:00000000000000000000000000000001");
+        assert_eq!(Config::from_json(&old).unwrap().network, "bip122:00000000000000000000000000000001", "read, and written the new way");
+        for bad in ["bip122:0000000000000000000000000000000G", "lightning:01", "bip122:", "00000000000000000000000000000001"] {
+            old["network"] = json!(bad);
+            assert!(Config::from_json(&old).is_err(), "{bad}");
         }
     }
 
@@ -1231,7 +1239,7 @@ mod tests {
             ),
             (
                 "network",
-                Box::new(|v| v["network"] = json!("bip122:00000000000000000000000000000001")),
+                Box::new(|v| v["network"] = json!("liquid:00000000000000000000000000000001")),
             ),
             (
                 "network is fixed",
