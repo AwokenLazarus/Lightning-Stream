@@ -117,8 +117,11 @@ class Wallet(e2e.Wallet):
             "ln": {"enabled": True, "split_height": e2e.SPLIT},
             # the lottery as shipped (wins of 64 sat through a hop, 1 in 4 at the most, 8 values ahead). Not as shipped
             # (shipped value in brackets): the sellers a task may pay at once (15) and how many may be new in a minute
-            # (30), max_sends_per_hour (1,200), max_answer_s (50), velocity_max above (8), and a lab wallet's budgets
+            # (30), max_sends_per_hour (1,200), max_answer_s (50), velocity_max above (8), a lab wallet's budgets, and the
+            # rule that a call expecting fewer than 4 wins is paid with a ticket where the seller offers prepaid ones
+            # (min_expected_wins, 4): the calls here are small on purpose, and what this lab measures is the draws
             "tickets": {"enabled": True, "max_sellers": SELLERS + 8, "max_new_sellers_per_min": 4 * SELLERS, "max_sends_per_hour": 100_000, "max_answer_s": 120,
+                        "lottery": {"min_expected_wins": 0},
                         "tasks": {"film": {"budget_sats": 3_000_000, "max_sellers": SELLERS + 8}}},
         }
 
@@ -133,7 +136,7 @@ def gateway_config(name: str, port: int, public: str, tick_ms: int = 500, idle: 
         "network": e2e.NETWORK[0],
         "node": {"rest": f"https://127.0.0.1:{lab.PORT[SELLER]}", "tls_cert": f"{RUN}/{SELLER}.tls.cert", "macaroon": f"{RUN}/invoices.macaroon",
                  "info_macaroon": f"{RUN}/info.macaroon"},
-        "caps": {"sessions_per_address": 0},
+        "caps": {"sessions_per_address": 0, "unpaid_per_address": 0},
         # the lottery as the gateway ships it, but for the piece size and the cap on sessions from one address (every
         # buyer of this lab comes from 127.0.0.1)
         "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "idle_secs": idle},

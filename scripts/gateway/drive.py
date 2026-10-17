@@ -30,6 +30,9 @@ msat per request. Every check prints PASS or FAIL and what it saw.
   flood       2,000 lock requests: 15 tickets are issued, half of the channel's 30 slots, and every
               other buyer is told slots_short and when to come back; a buyer that locks and never
               releases has its tickets cancelled, and its node shows them failed
+  paidfirst   the gateway as shipped: 2,000 locks for held tickets from buyers that paid nothing get
+              prepaid_first and no hold invoice; a buyer that pays a prepaid ticket first (an invoice
+              payable for 20 s) then holds its 2
   prepaid     a ticket settled on arrival: an ordinary invoice, paid, credited once when its
               preimage is presented, with nothing held on any channel; bought while the held cap is full
   slots       the gateway given a third macaroon (offchain:read) reads its node's channels: half of
@@ -418,8 +421,9 @@ def write_config(path: str, chain: str, macaroon: str, info_macaroon: str, chann
         "node": {"rest": f"https://127.0.0.1:{lab.PORT[SELLER]}", "tls_cert": f"{RUN}/{SELLER}.tls.cert", "macaroon": macaroon, "info_macaroon": info_macaroon},
         # the shipped ticket terms and the shipped cap on held tickets (15: half of a 30-slot channel). A shorter
         # time to first use than the default 60 s, so that an unused session is closed within the run; every
-        # buyer here comes from one address
-        "caps": {"sessions_per_address": 0, "first_use_secs": FIRST_USE_S},
+        # buyer here comes from one address. The checks of the ticket mechanics lock held tickets at once: the
+        # shipped rule that a session's first ticket is a prepaid one has a check of its own (paidfirst)
+        "caps": {"sessions_per_address": 0, "first_use_secs": FIRST_USE_S, "held_after_paid": False, "unpaid_per_address": 0},
         "times": {"height_max_age_secs": 5},
         "routes": [
             {"path": "/big.bin", "price": {"byte_msat": BYTE_MSAT, "per_bytes": PER_BYTES}},
@@ -968,6 +972,51 @@ def prepaid() -> None:
     lab.wait("the crowd's unpaid tickets to lapse", FIRST_USE_S + 100, lambda: health()["heldTickets"] == 0, every=1)
 
 
+def paidfirst() -> None:
+    """The gateway as it ships: hold invoices only to a session that has paid a ticket."""
+    stop("gateway")
+    write_config(f"{RUN}/paidfirst.json", "regtest", f"{RUN}/invoices.macaroon", f"{RUN}/info.macaroon", caps={"held_after_paid": True, "unpaid_per_address": 2})
+    with open(f"{RUN}/paidfirst.json") as f:
+        cfg = json.load(f)
+    # as shipped, but for the address cap on sessions (every buyer here has one address)
+    for k in ("held_after_paid", "unpaid_per_address"):
+        cfg["caps"].pop(k)
+    with open(f"{RUN}/paidfirst.json", "w") as f:
+        json.dump(cfg, f, indent=1)
+    start_gateway("paidfirst.json")
+    before = health()
+    pending_before = len(lab.get(SELLER, "/v1/invoices?pending_only=true&num_max_invoices=5000")["invoices"])
+    tallies: dict[str, int] = {}
+    t0 = time.monotonic()
+    for _ in range(2000):
+        a, _ = Buyer().ask(POOL)
+        key = f"{a.status} {a.error()}".strip()
+        tallies[key] = tallies.get(key, 0) + 1
+    took = time.monotonic() - t0
+    h = health()
+    pending = len(lab.get(SELLER, "/v1/invoices?pending_only=true&num_max_invoices=5000")["invoices"]) - pending_before
+    measured("paidfirst_flood", {"requests": 2000, "seconds": round(took, 1), "answers": tallies, "held_tickets": h["heldTickets"], "unpaid_invoices_on_the_node": pending,
+                                 "sessions_made": h["sessions"] - before["sessions"]})
+    check("paidfirst: of 2,000 locks for held tickets from buyers that have paid nothing, none is issued a hold invoice: each is told prepaid_first, has no session, and the node is asked for nothing",
+          tallies == {"402 prepaid_first": 2000} and pending == 0 and h["heldTickets"] == 0 and h["sessions"] == before["sessions"], {"answers": tallies, "unpaid_invoices": pending})
+    # a buyer that pays a prepaid ticket first, and then holds
+    b = Buyer()
+    b.learn("/small.txt")
+    secret, _ = b.buy_prepaid()
+    inv = b.tickets[hashlib.sha256(secret).hexdigest()].invoice
+    expiry = int(lab.get(BUYER, "/v1/payreq/" + inv, MAC["buyer"]).get("expiry", 0))
+    check("paidfirst: a first lock buys a prepaid ticket, whose invoice is payable for 20 s", expiry == 20, {"expiry": expiry})
+    early, _ = b.ask(POOL)
+    released = b.release(secret).json().get("released")
+    s = b.lock(POOL)
+    check("paidfirst: before its prepaid ticket is presented the session is told prepaid_first; once it is credited the session holds its 2 tickets",
+          (early.status, early.error()) == (402, "prepaid_first") and released == [hashlib.sha256(secret).hexdigest()] and len(s) == POOL and health()["heldTickets"] == POOL,
+          {"early": [early.status, early.error()], "released": released, "held": health()["heldTickets"]})
+    b.call("cancel", {"hashes": "all"})
+    stop("gateway")
+    start_gateway()
+
+
 def slots() -> None:
     # a config that assumes every inbound channel carries 483 (a cap of 241), and the channels macaroon: the gateway
     # reads its node and finds 30
@@ -1001,7 +1050,7 @@ def slots() -> None:
     start_gateway()
 
 
-CHECKS = {"terms": terms, "macaroons": macaroons, "fetch": fetch, "whole": whole, "latency": latency, "locked": locked, "margin": margin, "flood": flood, "prepaid": prepaid,
+CHECKS = {"terms": terms, "macaroons": macaroons, "fetch": fetch, "whole": whole, "latency": latency, "locked": locked, "margin": margin, "flood": flood, "paidfirst": paidfirst, "prepaid": prepaid,
           "slots": slots, "upstream": upstream, "restart": restart}
 
 

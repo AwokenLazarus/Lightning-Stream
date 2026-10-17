@@ -415,7 +415,7 @@ def send(method: str, target: str, port: int, headers: dict[str, str] | None = N
         conn.close()
 
 
-def gateway_config(name: str, port: int, public: str) -> str:
+def gateway_config(name: str, port: int, public: str, caps: dict[str, Any] | None = None) -> str:
     cfg = {
         "listen": f"127.0.0.1:{port}",
         "public_url": public,
@@ -425,7 +425,8 @@ def gateway_config(name: str, port: int, public: str) -> str:
         "network": NETWORK[0],
         "node": {"rest": f"https://127.0.0.1:{lab.PORT[SELLER]}", "tls_cert": f"{RUN}/{SELLER}.tls.cert", "macaroon": f"{RUN}/invoices.macaroon",
                  "info_macaroon": f"{RUN}/info.macaroon"},
-        "caps": {"sessions_per_address": 0, "first_use_secs": 20, "idle_secs": 40},
+        # (every buyer of this lab comes from 127.0.0.1: the caps per address would count them all as one)
+        "caps": {"sessions_per_address": 0, "unpaid_per_address": 0, "first_use_secs": 20, "idle_secs": 40, **(caps or {})},
         "times": {"height_max_age_secs": 5},
         "routes": [
             {"path": "/big.bin", "price": {"byte_msat": BYTE_MSAT, "per_bytes": PER_BYTES}},
@@ -437,6 +438,14 @@ def gateway_config(name: str, port: int, public: str) -> str:
     with open(path, "w") as f:
         json.dump(cfg, f, indent=1)
     return path
+
+
+def restart_gateway(caps: dict[str, Any]) -> None:
+    """The lab's main gateway stopped and started again on its journal, with `caps` over its config's."""
+    PROCS["gateway"].terminate()
+    PROCS["gateway"].wait(10)
+    gateway_config("gateway", GW_PORT, ORIGIN, caps)
+    start_gateway("gateway", GW_PORT)
 
 
 def start_gateway(name: str, port: int) -> float:
@@ -1123,7 +1132,10 @@ def slots() -> None:
         os.remove(r2["saved_to"])
     lab.cancel_all(SELLER, others)
     stop_sessions()
-    # 3. the seller holds as many tickets as it will: other buyers have asked for its 15 places and not paid
+    # 3. the seller holds as many tickets as it will: other buyers have asked for its 15 places and not paid. A gateway
+    # as shipped issues hold invoices only to a session that has paid a ticket, so for this step it is started again
+    # letting a buyer lock before it pays (the crowd is that), and as shipped after it
+    restart_gateway({"held_after_paid": False})
     crowd = 0
     while gateway_health()["heldTickets"] < 15:
         body = json.dumps({"version": "ticket/0", "hashes": [secrets.token_bytes(32).hex() for _ in range(2)]}).encode()
@@ -1138,6 +1150,7 @@ def slots() -> None:
           {**brief(r), "sessions_of_other_buyers": crowd, "session": {k: session_of(r).get(k) for k in ("pool", "hold_why")}})
     lab.wait("the other buyers' unpaid tickets to lapse", 120, lambda: gateway_health()["heldTickets"] == 0, every=1)
     stop_sessions()
+    restart_gateway({})
     # 4. a channel on the way with one slot left: 29 of the seller's 30 are taken by payments from the hop itself
     blockers, _ = lab.lock(HOP, SELLER, 29, secs=120)
     # the wait the seller named in step 3 is kept across sessions: a held ticket is asked for again only after it
