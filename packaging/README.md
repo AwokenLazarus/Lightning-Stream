@@ -9,8 +9,9 @@ image set `scripts/oci_build.sh` makes:
   stream tickets on the box's Lightning Fork node, and its setup page.
 
 How they reach the Lightning node, what the owner is asked, how buyers reach a gateway, mainnet and what
-cannot be done yet: `DESIGN.md`. **Local only:** nothing is pushed to a registry, and nothing is submitted
-to the Umbrel App Store or the Start9 marketplace. That submission is the project owner's decision. Both
+cannot be done yet: `DESIGN.md`. **Side-load only:** the packages name the images published on GitHub's
+container registry, pinned by digest (Images, below), and nothing is submitted to the Umbrel App Store or
+the Start9 marketplace. That submission is the project owner's decision. Both
 have run on regtest only. On a real umbrelOS 2.0 box both installed from a community store and the wallet
 bought from the gateway with a ticket (`umbrel/realbox/`); on a real StartOS 0.4 server neither starts
 beside Lightning Fork yet (below, and `DESIGN.md` section 6).
@@ -22,6 +23,8 @@ gone from here.
 ```
 packaging/
   DESIGN.md                   the design: the Lightning node, credentials, two apps, buyers, mainnet, limits
+  images.lock                 the published images the packages pin (scripts/oci_publish.sh writes it)
+  pin_images.py               writes images.lock's references into the compose files and the StartOS specs
   regtest_lib.py              helpers shared by the drivers, among them the paid buy over tickets
   ln_lab.py, ln_lab.compose.yml   the Lightning side of the tests: two Lightning Fork nodes of the regtest lab
   umbrel/                     a local Umbrel community store (id "lazarus")
@@ -29,7 +32,7 @@ packaging/
     lazarus-xbt-agent-wallet/ the wallet: init + witness + signer + MCP + UI, app_proxy -> UI
     lazarus-lightning-stream-gateway/  the gateway: init + gateway + UI (gateway role), app_proxy -> UI
     lazarus-xbt-knots/        a stand-in XBT node (pruned Knots 29.4.2, amd64 only) that fills the bitcoin slot
-    lint.py                   manifest + compose + hardening lint
+    lint.py                   manifest + compose + hardening lint; the images pinned to images.lock
     regtest/                  the off-Umbrel overlays and the driver (umbrel_regtest.py)
     test-umbrel-apps.sh       verify: lint, then install both apps from cold beside the lab and buy, twice
     bundle.sh                 side-load bundle: the store + docker-saved images (dist/umbrel/)
@@ -51,6 +54,19 @@ packaging/umbrel/test-umbrel-apps.sh       # RESULT PASS: lint + 2 cold regtest 
 packaging/startos/test-startos.sh          # RESULT PASS: build + inspect + regtest run with the paid buy (ports 24100-24199)
 ```
 
+The packages name the published images (Images, below). The two package tests run, by default, the tree's
+own build in their place: `XBT_TEST_IMAGES=local`, the `<image>:0.1.0` tags `oci_build.sh --load` gives, so
+a change is tested before it is published. `XBT_TEST_IMAGES=pinned` runs the published images themselves,
+pulled by digest:
+
+```bash
+XBT_TEST_IMAGES=pinned packaging/umbrel/test-umbrel-apps.sh
+XBT_TEST_IMAGES=pinned packaging/startos/test-startos.sh
+```
+
+The `.s9pk` files always carry the pinned images, whatever `XBT_TEST_IMAGES` says: `build.sh` pulls any of
+them that is missing (amd64 and arm64) and packs it.
+
 The three tests bring up the Lightning lab of `scripts/ln_rail_regtest.sh` (`scripts/ln_rail/lab.sh`, cloned
 and built under `run/` when missing), each in its own compose project. In every one the buyer reaches the
 seller on loopback: the wallet's signer shares the gateway's network namespace. That is the tests' one
@@ -62,6 +78,51 @@ seller's https origin.
 The StartOS build needs `start-cli` 2.1.0 (`START_CLI`, by default `~/.local/opt/start-cli/start-cli`; from the
 start-technologies releases) and a packaging workspace outside the repo (`~/.local/share/xbt-startos-ws`; its `.startos/` holds
 the key that signs the package, so it is never committed).
+
+## Images
+
+The six images the packages run are published on GitHub's container registry, as public packages of the
+`awokenlazarus` account, for linux/amd64, linux/arm64 and linux/arm/v7:
+
+    ghcr.io/awokenlazarus/<image>:<version>-<commit>@sha256:<index digest>
+    <image>: xbt-init, xbt-signer, xbt-anchor-witness, xbt-wallet-mcp, xbt-wallet-ui, xbt-gateway
+
+`packaging/images.lock` lists them, one line per image. The tag names the workspace version and the commit
+the images were built from (`0.1.0-cc28002e474e`: commit cc28002e474e of this repository); a tag is never
+moved or reused, and there is no `latest`. The packages name each image by tag *and* digest, so Docker and
+start-cli use the digest and the tag is only a label for people. `packaging/pin_images.py` writes the lock's
+references into the Umbrel compose files and the StartOS specs (`startos/spec.ts`); `umbrel/lint.py` and
+`startos/build.sh` refuse a package that does not match the lock. The one image of the store that is not
+published is the stand-in XBT node's, `xbt-a3-knots:29.4.2` (amd64-only), which a box with Paul's Knots
+BLAKE2b Companion never installs.
+
+Check what a reference serves, without pulling it:
+
+```bash
+docker buildx imagetools inspect ghcr.io/awokenlazarus/xbt-signer:0.1.0-cc28002e474e
+```
+
+`Digest:` is the index digest, which must equal the one in `images.lock`, and the manifest list names the
+three platforms. With `--raw`, `sha256sum` of the output is that digest. Pulling by the locked reference
+(`docker pull <reference from images.lock>`) fails if the registry serves anything else.
+
+How they were built: the "Publish images" workflow (`.github/workflows/publish-images.yml`, started by hand)
+runs `scripts/oci_publish.sh` at a named commit: `scripts/oci_build.sh`'s build (static musl binaries,
+`cargo --locked`, `FROM scratch`, `SOURCE_DATE_EPOCH` the commit time), pushed with the workflow's own token.
+The script checks that the registry serves, under each tag, the index of the OCI archive it built and
+inspected, then writes the lock. The lock is uploaded as the run's artifact and committed by hand. Each
+image carries the OCI labels of its source and commit (`docker buildx imagetools inspect --format
+'{{json .Image}}'`).
+
+What has not been checked: that the images are byte-for-byte reproducible, that is, that building the named
+commit again gives the same digests. The base layer is the same on every build (`docs/CONTAINER.md`, section
+6); rebuilds of the binary layers have not been compared. Until they are, trust in an image is trust in
+the workflow run that built it.
+
+To publish a new set (the project owner's decision): run the workflow at the commit, or `scripts/oci_publish.sh`
+with a token that may write packages; a package GitHub creates on the first push is private, so make it public
+in its settings once. Then put the new lock in `packaging/images.lock`, run `python3 packaging/pin_images.py`,
+and run the tests with `XBT_TEST_IMAGES=pinned`.
 
 ## What the apps do on a box
 
@@ -191,8 +252,11 @@ applied there.
 
 - **Umbrel:** `packaging/umbrel/bundle.sh` writes `dist/umbrel/`: the store folder, `images-amd64.tar`,
   `images-arm64.tar` and `SHA256SUMS`. See its README.txt. umbrelOS 2.0 pulls every image of an app when it
-  installs it, so the images must be in a registry the box can pull from (`REGISTRY=host:port bundle.sh`
-  names them by it); `docker load` alone ends in "pull access denied". It adds community stores by git URL
+  installs it; `docker load` alone ends in "pull access denied". By default the store names the published
+  images on ghcr.io by digest, which a box with internet access pulls itself. For a box that should pull
+  from a registry on the LAN instead, `REGISTRY=host:port bundle.sh` names every image `host:port/<image>:<tag>`
+  (push the saved images there first). That drops the digest: an image loaded and pushed one platform at a
+  time gets a manifest, and so a digest, of its own; `IMAGES.txt` has each image's id to compare. It adds community stores by git URL
   (smart HTTP), and lists only apps whose id starts with the store's id.
 - **StartOS:** in the StartOS UI, System → Sideload a service, with `dist/startos/xbt-agent-wallet_x86_64.s9pk`
   and/or `dist/startos/lightning-stream-gateway_x86_64.s9pk` (or `_aarch64`). The packages are signed with the
@@ -243,8 +307,9 @@ They cannot, yet:
   Lightning Fork keeps tls.cert at the root of its volume beside its macaroons (`DESIGN.md`, section 6);
 - buy from a gateway on the same box, except through the test profile's shared loopback (Umbrel): the wallet
   pays tickets over https with a publicly trusted certificate, or to its own machine;
-- be installed from a store by an outside tester on Umbrel until the images are in a registry the tester's box
-  can pull from;
+- be installed from a store by an outside tester without that tester hosting the store: the images are
+  public on ghcr.io, but the store is a git repository the tester serves (bundle.sh's README.txt). No box
+  has yet installed the apps with the images pulled from ghcr.io: the real-box run used a registry on loopback;
 - reach a seller over Tor: an onion address is plain http, which the wallet does not pay tickets over;
 - give a gateway https on Umbrel by themselves: the owner runs the TLS proxy;
 - pay or sell on mainnet with anything but low caps and the owner's typed acknowledgement, and the wallet's
@@ -265,6 +330,6 @@ They cannot, yet:
   §10). StartOS also keeps the delete-and-restart action.
 - The StartOS package's text is English only; other locales fall back to it. Translations, gallery images
   and icons are store-submission work.
-- The images are referenced by tag (`:0.1.0`). umbrelOS pulls them on install, so a store needs them in a
-  registry, pinned by digest (`dist/oci/IMAGES.md` has the index digests); the real-box run used a registry on
-  the build host's loopback, tunnelled to the box's.
+- The images are published and pinned by digest (Images, above), but byte-for-byte reproducible builds have
+  not been checked, and no box has installed them from ghcr.io yet (the real-box run used a registry on the
+  build host's loopback, tunnelled to the box's).
