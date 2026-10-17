@@ -888,7 +888,7 @@ fn body_of(v: &Value) -> &str {
 
 #[test]
 fn a_page_is_paid_with_one_ticket_and_the_next_pages_from_the_balance() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     let r = Rig::new(json!({}));
     let first = r.pay("/page/1000", 10);
     assert_eq!((first["verdict"].as_str(), first["rail"].as_str(), first["status"].as_u64()), (Some("allow"), Some("ticket"), Some(200)), "{first}");
@@ -955,7 +955,7 @@ fn a_page_is_paid_with_one_ticket_and_the_next_pages_from_the_balance() {
 
 #[test]
 fn a_file_priced_by_the_byte_is_paid_as_it_arrives_and_stops_where_the_call_or_the_agent_says() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     let r = Rig::new(json!({}));
     // 12 MiB at 200 sat a MiB: 2,400 sat, so three tickets of 1,000, each released when the last is used up
     let n = 12 * MIB;
@@ -1014,7 +1014,7 @@ fn a_file_priced_by_the_byte_is_paid_as_it_arrives_and_stops_where_the_call_or_t
 
 #[test]
 fn an_answer_priced_by_the_second_is_paid_by_the_clock() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     let r = Rig::new(json!({}));
     // 36 KiB at 1 KiB every 100 ms: about 3.6 s open, four started seconds at 400 sat: two tickets
     let v = r.pay("/timed/36864", 5_000);
@@ -1036,7 +1036,7 @@ fn an_answer_priced_by_the_second_is_paid_by_the_clock() {
 /// answer's first bytes came back to the agent.
 #[test]
 fn an_unnamed_seller_at_a_private_address_or_over_plain_http_is_sent_nothing() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     let r = Rig::build(json!({}), false);
     for (method, path) in [("GET", "/page/10"), ("POST", "/page/10"), ("DELETE", "/admin")] {
         let v = r.call("xbt402_pay", json!({"url": r.shop.url(path), "method": method, "body": "x", "max_sats": 10, "task": "swarm"}));
@@ -1051,7 +1051,7 @@ fn an_unnamed_seller_at_a_private_address_or_over_plain_http_is_sent_nothing() {
 
 #[test]
 fn no_request_leaves_for_a_host_the_owner_did_not_allow_and_an_unnamed_seller_is_paid_only_a_little() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     // the shop is not on the allowlist (and is on this machine, which the owner allows for an unnamed seller here)
     let r = Rig::build(json!({"tickets": {"unlisted_private": true}}), false);
     let no = r.pay("/page/10", 10);
@@ -1083,7 +1083,7 @@ fn no_request_leaves_for_a_host_the_owner_did_not_allow_and_an_unnamed_seller_is
 
 #[test]
 fn the_budgets_and_the_exposure_cap_hold_through_the_http_path_and_count_only_the_books_own_numbers() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     // a task with 3,500 sat: three tickets with their fee limit fit, the fourth does not
     let r = Rig::new(json!({"tickets": {"enabled": true, "max_locked_sats": 3_000, "tasks": {"film": {"budget_sats": 3_500}}}}));
     // a seller that says in every receipt that nothing was spent and everything was released cannot move the ledger:
@@ -1107,7 +1107,7 @@ fn the_budgets_and_the_exposure_cap_hold_through_the_http_path_and_count_only_th
 
 #[test]
 fn velocity_counts_a_session_once_by_default_and_every_release_when_the_owner_says_so() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     // an owner who says "release" (this rig's policy does): every release is a payment, so three an hour is three tickets
     let r = Rig::new(json!({"velocity_max": 3}));
     let v = r.pay(&format!("/files/{}", 30 * MIB), 20_000);
@@ -1142,7 +1142,7 @@ fn required(accepts: Value) -> WireAnswer {
 
 #[test]
 fn xbt402_pay_takes_the_ticket_entry_then_a_lightning_invoice_and_says_what_is_missing() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     let r = Rig::new(json!({}));
     let net = r.shop.network.clone();
     let chain = net.replacen("lightning:", "bip122:", 1);
@@ -1219,7 +1219,7 @@ fn xbt402_pay_takes_the_ticket_entry_then_a_lightning_invoice_and_says_what_is_m
 
 #[test]
 fn a_lightning_invoice_in_a_402_is_paid_once_under_the_lightning_rails_rules() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     let seller = SecretKey::from_slice(&[0x33; 32]).unwrap();
     // the owner allows the origin and, for the Lightning rail, the seller's node
     let mut r = Rig::new(json!({}));
@@ -1264,7 +1264,7 @@ fn a_lightning_invoice_in_a_402_is_paid_once_under_the_lightning_rails_rules() {
 
 #[test]
 fn a_seller_whose_terms_or_invoices_name_another_node_is_paid_nothing() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     // the terms name the node the owner tied to this origin, the invoices pay another
     let r = Rig::new(json!({}));
     *r.shop.node.lie.lock().unwrap() = Lie::OtherPayee;
@@ -1303,7 +1303,7 @@ fn a_seller_whose_terms_or_invoices_name_another_node_is_paid_nothing() {
 
 #[test]
 fn terms_that_change_under_an_open_session_stop_it_and_pay_nothing_more() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     let r = Rig::new(json!({}));
     let first = r.pay("/page/10", 10);
     assert_eq!(first["status"].as_u64(), Some(200), "{first}");
@@ -1359,7 +1359,7 @@ fn one_ticket_booked_exactly(r: &Rig, what: &str) {
 
 #[test]
 fn a_receipt_that_charges_more_than_the_terms_or_is_missing_or_is_for_another_request_stops_the_session() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     // inflated metering, signed by the seller's own key: 5,000 msat for a page priced at 2,500
     let (r, v) = lied_to(Box::new(|seen, real| {
         if !(seen.paid && seen.path.starts_with("/page/")) {
@@ -1436,7 +1436,7 @@ fn a_receipt_that_charges_more_than_the_terms_or_is_missing_or_is_for_another_re
 
 #[test]
 fn a_forged_refusal_releases_nothing_and_a_signed_one_is_believed_for_one_ticket() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     // someone answers a paid request in the seller's place: 402 balance_short, unsigned
     let (r, v) = lied_to(Box::new(|seen, _| {
         if !(seen.paid && seen.path.starts_with("/page/")) {
@@ -1464,7 +1464,7 @@ fn a_forged_refusal_releases_nothing_and_a_signed_one_is_believed_for_one_ticket
 
 #[test]
 fn an_answer_that_is_lost_never_releases_a_second_secret_for_the_same_ticket() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     // the answer to a release is lost after the seller took the secret: its signed status says so
     let r = Rig::new(json!({}));
     let n = Arc::new(AtomicUsize::new(0));
@@ -1520,7 +1520,7 @@ fn an_answer_that_is_lost_never_releases_a_second_secret_for_the_same_ticket() {
 
 #[test]
 fn an_answer_that_stops_in_the_middle_costs_what_was_released_for_it() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     let r = Rig::new(json!({}));
     // the connection dies after 7 MiB of a 30 MiB file
     r.tap.set(Box::new(|seen, real| {
@@ -1557,7 +1557,7 @@ fn an_answer_that_stops_in_the_middle_costs_what_was_released_for_it() {
 
 #[test]
 fn no_secret_leaves_for_a_ticket_the_seller_has_not_shown_locked() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     let r = Rig::new(json!({"tickets": {"enabled": true, "ready_wait_ms": 300, "tasks": {"film": {"budget_sats": 40_000}}}}));
     // the seller's node holds the payments, and the seller has not heard of it yet
     r.shop.standin.hold_streams(true);
@@ -1575,7 +1575,7 @@ fn no_secret_leaves_for_a_ticket_the_seller_has_not_shown_locked() {
 
 #[test]
 fn while_the_wallets_own_node_is_away_no_hash_is_offered_and_the_next_call_pays_when_it_is_back() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     let r = Rig::new(json!({"tickets": {"enabled": true, "pool": 2, "tasks": {"film": {"budget_sats": 40_000}}}}));
     assert_eq!(r.pay("/page/10", 10)["status"].as_u64(), Some(200));
     // one of two is left, so the next is locked behind the call: that round is over before the node goes
@@ -1597,7 +1597,7 @@ fn while_the_wallets_own_node_is_away_no_hash_is_offered_and_the_next_call_pays_
 
 #[test]
 fn a_lock_round_that_never_reached_an_invoice_frees_its_places_in_the_pool_at_once() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     let r = Rig::new(json!({"tickets": {"enabled": true, "pool": 2, "tasks": {"film": {"budget_sats": 40_000}}}}));
     assert_eq!(r.pay("/page/10", 10)["status"].as_u64(), Some(200));
     // the answer to the next lock is lost: its hashes were offered and no invoice came for them
@@ -1625,7 +1625,7 @@ fn a_lock_round_that_never_reached_an_invoice_frees_its_places_in_the_pool_at_on
 
 #[test]
 fn no_ticket_is_released_into_an_answer_the_seller_is_still_waiting_to_go_on_with() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     // a seller that waits 3 s for a refill before it ends an answer, as the gateway does by default
     REFILL_WAIT_MS.store(3_000, Ordering::SeqCst);
     let r = Rig::new(json!({"tickets": {"enabled": true, "pool": 2, "tasks": {"film": {"budget_sats": 40_000}}}}));
@@ -1668,7 +1668,7 @@ fn crashing<T>(step: u64, f: impl FnOnce() -> T) -> Option<T> {
 
 #[test]
 fn a_kill_of_the_signer_at_every_write_of_a_paid_call_never_undercounts_and_the_next_call_pays() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     let mut survived = None;
     for step in 0..400 {
         let mut r = Rig::new(json!({}));
@@ -1718,7 +1718,7 @@ fn a_kill_of_the_signer_at_every_write_of_a_paid_call_never_undercounts_and_the_
 /// the lab, with a win, when the signer was killed in the middle of a download.
 #[test]
 fn a_kill_of_the_signer_at_every_write_of_an_ordinary_payment_leaves_nothing_booked_that_was_not_paid() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     let mut survived = None;
     for step in 0..400 {
         // a seller that offers only prepaid tickets: the page is paid by one ordinary payment
@@ -1750,7 +1750,7 @@ fn a_kill_of_the_signer_at_every_write_of_an_ordinary_payment_leaves_nothing_boo
 
 #[test]
 fn a_restart_of_the_gateway_or_of_the_signer_in_the_middle_of_a_session_resumes_or_says_so() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     let mut r = Rig::new(json!({}));
     let first = r.pay("/page/10", 10);
     assert_eq!(first["status"].as_u64(), Some(200), "{first}");
@@ -1801,7 +1801,7 @@ fn a_restart_of_the_gateway_or_of_the_signer_in_the_middle_of_a_session_resumes_
 
 #[test]
 fn a_seller_the_owner_takes_off_the_list_is_not_sent_another_byte_not_even_a_cancel() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     let mut r = Rig::new(json!({}));
     assert_eq!(r.pay("/page/10", 10)["status"].as_u64(), Some(200));
     // the owner's policy no longer names the shop; the signer starts again on it
@@ -1821,7 +1821,7 @@ fn a_seller_the_owner_takes_off_the_list_is_not_sent_another_byte_not_even_a_can
 
 #[test]
 fn an_idle_session_is_stopped_and_its_tickets_cancelled_by_the_wallet_itself() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     let r = Rig::new(json!({}));
     let v = r.pay("/page/10", 10);
     assert_eq!(v["status"].as_u64(), Some(200), "{v}");
@@ -1894,7 +1894,7 @@ fn session_of(r: &Rig, v: &Value) -> Value {
 
 #[test]
 fn as_shipped_a_session_holds_two_tickets_and_the_next_is_locked_when_one_is_left() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     let r = Rig::shipped(json!({}), 30, shipped_shop());
     let first = r.pay("/page/1000", 10);
     assert_eq!((first["verdict"].as_str(), first["rail"].as_str(), first["status"].as_u64()), (Some("allow"), Some("ticket"), Some(200)), "{first}");
@@ -1924,7 +1924,7 @@ fn as_shipped_a_session_holds_two_tickets_and_the_next_is_locked_when_one_is_lef
 
 #[test]
 fn where_no_slot_is_free_for_a_held_ticket_the_wallet_buys_prepaid_ones_one_at_a_time() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     let r = Rig::shipped(json!({}), 30, shipped_shop());
     // the wallet's channel already carries 15 payments of its node's own routing: half of its 30
     r.ln.st.lock().unwrap().foreign = 15;
@@ -1969,7 +1969,7 @@ fn where_no_slot_is_free_for_a_held_ticket_the_wallet_buys_prepaid_ones_one_at_a
 
 #[test]
 fn held_tickets_never_take_more_than_half_of_the_channels_slots() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     // room for one: 14 of the 30 are pending already
     let r = Rig::shipped(json!({}), 30, held_only_shop());
     r.ln.st.lock().unwrap().foreign = 14;
@@ -2022,7 +2022,7 @@ fn held_tickets_never_take_more_than_half_of_the_channels_slots() {
 
 #[test]
 fn a_ticket_below_a_channels_dust_limit_is_never_held() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     let small = |settle: Value| json!({"tickets": {"ticket_msat": 600_000, "settle": settle}, "caps": {"sessions_per_address": 0}});
     // 600 sat on an anchor channel whose two sides say 354 and 546: above both, held
     let r = Rig::shipped(json!({}), 30, small(json!(["on-use"])));
@@ -2069,7 +2069,7 @@ fn a_ticket_below_a_channels_dust_limit_is_never_held() {
 
 #[test]
 fn a_lock_that_finds_no_slot_makes_the_wallet_hold_less_wait_and_then_pay_another_way() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     // a seller that offers prepaid tickets: the first two locks meet a full channel somewhere on the way
     let r = Rig::shipped(json!({}), 30, shipped_shop());
     r.ln.st.lock().unwrap().fail_next = 2;
@@ -2129,7 +2129,7 @@ fn a_lock_that_finds_no_slot_makes_the_wallet_hold_less_wait_and_then_pay_anothe
 
 #[test]
 fn a_seller_that_says_slots_short_is_waited_for_or_paid_with_a_prepaid_ticket() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     let one_place = |settle: Value| json!({"tickets": {"max_tickets": 1, "settle": settle}, "caps": {"sessions_per_address": 0, "max_held_tickets": 1}});
     // held tickets only, and another buyer has the seller's one place
     let r = Rig::shipped(json!({}), 30, one_place(json!(["on-use"])));
@@ -2166,7 +2166,7 @@ fn a_seller_that_says_slots_short_is_waited_for_or_paid_with_a_prepaid_ticket() 
 
 #[test]
 fn a_prepaid_ticket_is_booked_before_it_is_paid_and_a_seller_that_lies_about_it_is_paid_nothing() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     let prepaid_only = || json!({"tickets": {"settle": ["on-arrival"]}, "caps": {"sessions_per_address": 0}});
     // an invoice for another amount, or another node, is not paid, and nothing is booked
     for lie in [Lie::OtherAmount, Lie::OtherPayee] {
@@ -2224,7 +2224,7 @@ fn a_prepaid_ticket_is_booked_before_it_is_paid_and_a_seller_that_lies_about_it_
 
 #[test]
 fn a_ticket_that_is_in_flight_and_then_refused_at_a_later_hop_is_not_waited_for_and_counts_as_a_failed_lock() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     // one of the session's two tickets leaves the wallet's node and finds no slot further on: the node shows it in
     // flight, and failed a moment later. Whichever of the two the wallet meant to release, the call is paid
     {
@@ -2278,7 +2278,7 @@ fn assert_no_seller_words(what: &str, v: &Value) {
 
 #[test]
 fn agp128_the_sellers_terms_are_refused_in_the_wallets_words() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     let r = Rig::new(json!({}));
     let (net, seller_id) = (r.shop.network.clone(), r.shop.id());
     let entry = move || json!({"scheme": "ticket", "network": net, "asset": "XBT:msat", "amount": "2500", "payTo": seller_id,
@@ -2315,7 +2315,7 @@ fn agp128_the_sellers_terms_are_refused_in_the_wallets_words() {
 
 #[test]
 fn agp128_a_seller_that_refuses_in_its_own_words_is_reported_in_the_wallets() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     let refusal = || Some(Ok(answer(403, vec![], serde_json::to_vec(&json!({"error": SELLER_CODE, "detail": SELLER_WORDS})).unwrap())));
     // the first lock of a session
     let r = Rig::new(json!({}));
@@ -2353,7 +2353,7 @@ fn agp128_a_seller_that_refuses_in_its_own_words_is_reported_in_the_wallets() {
 
 #[test]
 fn agp128_the_last_receipt_of_a_streamed_answer_is_given_as_numbers_and_the_sellers_own_as_untrusted() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     let r = Rig::new(json!({}));
     // the seller's status lists its receipts: each carries a field the signature does not cover
     r.tap.set(Box::new(|seen, real| {
@@ -2383,7 +2383,7 @@ fn agp128_the_last_receipt_of_a_streamed_answer_is_given_as_numbers_and_the_sell
 /// FAILS on 02e1f61: the audit log's `ticket_refused` row, which `history` returns, has the seller's string as `payment_hash`.
 #[test]
 fn agp128_a_lock_answer_that_names_words_for_a_hash_is_refused_and_not_recorded() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     let r = Rig::new(json!({}));
     r.tap.set(Box::new(|seen, real| {
         if !seen.path.starts_with("/x402/ticket/lock") {
@@ -2442,7 +2442,7 @@ fn assert_wins(r: &Rig, wins: u64) {
 
 #[test]
 fn a_file_of_small_pieces_is_bought_by_draws_and_what_the_node_paid_is_the_wins_booked() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     let r = draws_rig(json!({}));
     // 256 pieces of 2 sat: 512 sat, on wins of 64 sat (1 in 32): 8 wins expected
     let size = 256 * PIECE;
@@ -2500,7 +2500,7 @@ fn a_file_of_small_pieces_is_bought_by_draws_and_what_the_node_paid_is_the_wins_
 
 #[test]
 fn tickets_for_a_seller_one_stays_with_draws_for_a_small_call_and_the_owner_can_say_which() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     // a call that may use four tickets' worth with this seller: tickets, as before the lottery
     let r = draws_rig(json!({}));
     let v = r.pay(&format!("/pieces/{}", 4 * PIECE), 4_000);
@@ -2549,7 +2549,7 @@ fn tickets_for_a_seller_one_stays_with_draws_for_a_small_call_and_the_owner_can_
 
 #[test]
 fn the_owners_bounds_hold_for_draws_and_spend_is_what_the_node_paid() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     // a budget below one win and its fee can pay nothing at all: said before anything is asked of the seller's session
     // (calls this small are paid with a ticket as shipped, since they expect fewer than four wins: the rule is off
     // here, where what is tested is the draws)
@@ -2607,7 +2607,7 @@ fn the_owners_bounds_hold_for_draws_and_spend_is_what_the_node_paid() {
 
 #[test]
 fn a_seller_that_lies_about_a_win_or_its_invoice_is_paid_nothing_for_the_lie() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     // an invoice for another payee, and one for another amount: refused by the checks every invoice passes, nothing booked
     for (lie, rule) in [(Lie::OtherPayee, "ticket_payee"), (Lie::OtherAmount, "ticket_amount")] {
         let r = draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
@@ -2703,7 +2703,7 @@ fn a_seller_that_lies_about_a_win_or_its_invoice_is_paid_nothing_for_the_lie() {
 
 #[test]
 fn a_win_whose_payment_fails_is_owed_until_the_sellers_next_invoice_and_never_paid_twice() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     let r = draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
     // the first payment finds no route: nothing is spent, and the win stays owed
     r.ln.st.lock().unwrap().fail_next = 1;
@@ -2781,7 +2781,7 @@ fn a_win_whose_payment_fails_is_owed_until_the_sellers_next_invoice_and_never_pa
 /// was over and it cut the answer. Seen on the lab with 100 sellers: one file of 300.
 #[test]
 fn a_win_that_could_not_be_paid_for_a_moment_is_paid_while_the_answer_waits() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     let r = draws_rig(json!({"tickets": {"lottery": {"max_odds_den": 2}}}));
     let (ln, armed) = (r.ln.clone(), Arc::new(AtomicUsize::new(0)));
     r.tap.set(Box::new(move |seen, real| {
@@ -2813,25 +2813,27 @@ fn a_win_that_could_not_be_paid_for_a_moment_is_paid_while_the_answer_waits() {
 
 #[test]
 fn a_win_the_seller_stands_still_for_is_paid_before_the_wins_no_seller_waits_for() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
-    // one seller as the gateway ships (it bears 2 unpaid wins, and its answer stands still for a third for 1 s here,
+    let _g = env_lock();
+    // one seller as the gateway ships (it bears 2 unpaid wins, and its answer stands still for a third for 2 s here,
     // where the gateway ships 10), and 20 sellers beside it that serve on whatever is unpaid: their wins fill the
     // wallet's gate, 8 at a time, and no answer waits for one of them
-    let strict = json!({"tickets": {}, "caps": {"sessions_per_address": 0}, "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 1}});
+    let strict = json!({"tickets": {}, "caps": {"sessions_per_address": 0}, "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 2}});
     let patient = json!({"tickets": {}, "caps": {"sessions_per_address": 0},
-                         "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 1, "max_unpaid_wins": 100_000, "grace_pieces": 100_000}});
+                         "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 2, "max_unpaid_wins": 100_000, "grace_pieces": 100_000}});
     let owner = json!({"daily_budget_sats": 600_000, "weekly_budget_sats": 900_000, "per_counterparty_cap_sats": 600_000,
                        "tickets": {"max_sellers": 64, "max_new_sellers_per_min": 400, "tasks": {"film": {"budget_sats": 400_000, "max_sellers": 64}}}});
     let r = Rig::with_more(owner, true, true, 30, strict, &vec![patient; 20]);
-    // a payment takes 100 ms through the hop: the gate lets 80 through in a second
-    r.ln.st.lock().unwrap().send_takes = Duration::from_millis(100);
+    // a payment takes 200 ms through the hop: the gate lets 40 through in a second. (100 ms and a grace of 1 s
+    // failed now and then on a shared machine with two cores, where the hurried win's own path took more than a
+    // second; the wins that wait still take longer than the grace to pass, so a gate in order of arrival fails)
+    r.ln.st.lock().unwrap().send_takes = Duration::from_millis(200);
     let size = 64 * PIECE;
     let buy = |shop: &Shop| r.call("xbt402_pay", json!({"url": shop.url(&format!("/hot/{size}")), "max_sats": 2_000, "task": "film"}));
     let (strict_one, others) = std::thread::scope(|sc| {
-        // 64 pieces from each of the 20, a win in every fourth: 320 wins expected, four seconds of the gate
+        // 64 pieces from each of the 20, a win in every fourth: 320 wins expected, eight seconds of the gate
         let others: Vec<_> = r.more.iter().map(|shop| sc.spawn(move || buy(shop))).collect();
-        // once more than a second's worth of them wait (the node has an invoice for each, and no payment yet), the file
-        // from the strict seller: its third unpaid win stops its answer, which is cut after a second
+        // once three seconds' worth of them wait (the node has an invoice for each, and no payment yet), the file from
+        // the strict seller: its third unpaid win stops its answer, which is cut after two seconds
         wait_for("120 wins waiting at the gate", || r.shop.node.preimages.lock().unwrap().len() >= r.ln.st.lock().unwrap().payments.len() + 120);
         let v = buy(&r.shop);
         (v, others.into_iter().map(|t| t.join().unwrap()).collect::<Vec<Value>>())
@@ -2856,7 +2858,7 @@ fn a_win_the_seller_stands_still_for_is_paid_before_the_wins_no_seller_waits_for
 
 #[test]
 fn a_killed_signer_or_gateway_ends_a_session_of_draws_plainly_and_pays_no_win_twice() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     let mut r = draws_rig(json!({"ln": {"timeout_s": 1}, "tickets": {"lottery": {"max_odds_den": 2}}}));
     let v = r.pay(&format!("/pieces/{}", 128 * PIECE), 1_000);
     let (sid, mut wins) = (v["session"].as_str().unwrap().to_string(), v["wins_paid"].as_u64().unwrap());
@@ -2900,7 +2902,7 @@ fn a_killed_signer_or_gateway_ends_a_session_of_draws_plainly_and_pays_no_win_tw
 
 #[test]
 fn an_answer_priced_by_the_second_is_a_draw_for_every_second_it_was_open() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     let r = draws_rig(json!({"tickets": {"lottery": {"min_expected_wins": 0}}}));  // calls of a few sat: draws, the rule of four expected wins off
     // 1 KiB every 100 ms with no length stated: 25 KiB is open for two and a half seconds, at 1 sat a second
     let mut sid = String::new();
@@ -2930,7 +2932,7 @@ fn an_answer_priced_by_the_second_is_a_draw_for_every_second_it_was_open() {
 /// served a burst of 32 pieces got 32 values in one request, with no reveal for any of them yet.
 #[test]
 fn a_burst_of_pieces_gets_no_more_values_ahead_of_a_reveal_than_the_owner_allows() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     // a seller that serves 32 pieces ahead of the values it has, where the gateway ships 8
     let shop = json!({"tickets": {}, "caps": {"sessions_per_address": 0}, "lottery": {"piece_bytes": PIECE, "sessions_per_address": 0, "grace_seconds": 2, "window": 32}});
     let r = Rig::shipped(json!({}), 30, shop);
@@ -2953,7 +2955,7 @@ fn a_burst_of_pieces_gets_no_more_values_ahead_of_a_reveal_than_the_owner_allows
 
 #[test]
 fn a_piece_whose_hash_the_caller_named_gets_its_value_only_if_it_matches() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     let r = draws_rig(json!({"tickets": {"lottery": {"min_expected_wins": 0}}}));  // calls of a few sat: draws, the rule of four expected wins off
     let size = 8 * PIECE + 100;
     let all: Vec<u8> = (0..size).map(pattern).collect();
@@ -2981,7 +2983,7 @@ fn a_piece_whose_hash_the_caller_named_gets_its_value_only_if_it_matches() {
 /// entry in `wins_unpaid`), so the seller waited for it until it refused the session.
 #[test]
 fn a_win_found_as_the_void_pieces_of_a_cut_answer_are_named_is_paid_in_that_call() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     let r = draws_rig(json!({}));
     // the seller's draw endpoint gives no answer to the first values of each answer, seven times in a row: the
     // wallet gives up the answer with those values open. The round that names the void pieces is let through
@@ -3041,7 +3043,7 @@ fn a_win_found_as_the_void_pieces_of_a_cut_answer_are_named_is_paid_in_that_call
 /// Seen on the lab when the buyer's node was killed in the middle of a download.
 #[test]
 fn tickets_whose_payment_failed_after_their_lock_round_give_their_places_with_the_seller_back() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     let r = Rig::shipped(json!({"ln": {"timeout_s": 1}}), 30, shipped_shop());
     // 200 sat a MiB: a ticket of 1,000 sat is 5 MiB
     let v = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
@@ -3083,7 +3085,7 @@ fn tickets_whose_payment_failed_after_their_lock_round_give_their_places_with_th
 /// killed in the middle of a download: no call was paid in the 150 s the check waits.
 #[test]
 fn a_session_the_seller_has_forgotten_is_ended_and_the_next_call_opens_another() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     let r = Rig::shipped(json!({}), 30, shipped_shop());
     // a file that uses its one ticket up to the last msat
     let v = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
@@ -3124,7 +3126,7 @@ fn a_session_the_seller_has_forgotten_is_ended_and_the_next_call_opens_another()
 /// Seen on the lab when the buyer's node was killed in the middle of a download.
 #[test]
 fn a_ticket_that_is_on_none_of_the_nodes_channels_ends_its_session_and_the_next_call_pays() {
-    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = env_lock();
     let r = Rig::shipped(json!({"tickets": {"ready_wait_ms": 300}}), 30, shipped_shop());
     let v = r.pay(&format!("/files/{}", 5 * MIB), 2_000);
     assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["balance_msat"].as_str()), (Some(200), Some(true), Some("0")), "{v}");
