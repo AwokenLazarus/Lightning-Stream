@@ -50,6 +50,13 @@ jobs:
         run: cargo fetch --locked
       - name: Build
         run: cargo build --workspace --locked
+      # a test binary that hangs is ended by its watchdog (crates/xbt-signer/tests/common/mod.rs,
+      # XBT_TEST_HANG_SECS), which first prints every thread's stack with gdb: gdb on the PATH, and
+      # a process may be traced by its own child
+      - name: Let a hung test print its threads' stacks
+        run: |
+          command -v gdb || { sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends gdb; }
+          sudo sysctl -w kernel.yama.ptrace_scope=0
       - name: Test
         run: cargo test --workspace --locked --no-fail-fast
       - name: Clippy

@@ -354,20 +354,23 @@ static ENV_HELD: Mutex<Option<(String, std::time::Instant)>> = Mutex::new(None);
 /// [`ENV`] held, as a guard that also says which test holds it. A watchdog ends the process
 /// with that test's name when one has held it for longer than `XBT_TEST_HANG_SECS` (600 by
 /// default): since every test of a binary waits for this lock, one that never returns would
-/// otherwise keep the whole binary running, silently, until a CI job's own limit.
+/// otherwise keep the whole binary running, silently, until a CI job's own limit. Before it
+/// ends the process it prints the stack of every thread ([`print_stacks`]), which names the
+/// wait each one is stuck in.
 pub fn env_lock() -> EnvGuard {
     static WATCH: std::sync::Once = std::sync::Once::new();
     WATCH.call_once(|| {
         let limit = std::env::var("XBT_TEST_HANG_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(600u64);
         std::thread::spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_secs(5));
-            if let Some((name, since)) = ENV_HELD.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
-                if since.elapsed().as_secs() > limit {
-                    // straight to the process's stderr: a thread spawned by a test inherits that test's capture of eprintln!
-                    use std::io::Write;
-                    let _ = writeln!(std::io::stderr(), "test {name} has run for more than {limit} s: the process is ended so that the hang has a name");
-                    std::process::exit(101);
-                }
+            let hung = ENV_HELD.lock().unwrap_or_else(|p| p.into_inner()).as_ref().filter(|(_, since)| since.elapsed().as_secs() > limit).map(|(name, _)| name.clone());
+            if let Some(name) = hung {
+                // straight to the process's stderr: a thread spawned by a test inherits that test's capture of eprintln!
+                use std::io::Write;
+                let _ = writeln!(std::io::stderr(), "test {name} has run for more than {limit} s: the stacks of its process follow, and the process is ended so that the hang has a name");
+                print_stacks();
+                let _ = writeln!(std::io::stderr(), "test {name} has run for more than {limit} s: the process is ended so that the hang has a name");
+                std::process::exit(101);
             }
         });
     });
@@ -375,6 +378,47 @@ pub fn env_lock() -> EnvGuard {
     let name = std::thread::current().name().unwrap_or("?").to_string();
     *ENV_HELD.lock().unwrap_or_else(|p| p.into_inner()) = Some((name, std::time::Instant::now()));
     EnvGuard(Some(g))
+}
+
+/// Every thread's stack of this process, to its own stdout and stderr (not a test's capture),
+/// by gdb (`thread apply all bt`), for a test that hangs. gdb attaches to the process that started it only where the system lets a
+/// process be traced by its own child (`kernel.yama.ptrace_scope` 0, as CI sets it) or gdb runs
+/// as root; elsewhere, or with no gdb on the PATH, one line says so. gdb gets 120 s, and is
+/// then killed.
+pub fn print_stacks() {
+    use std::io::Write;
+    let pid = std::process::id().to_string();
+    let child = std::process::Command::new("gdb")
+        .args(["-p", pid.as_str(), "-batch", "-nx", "-q", "-ex", "set pagination off", "-ex", "set print thread-events off", "-ex", "thread apply all bt"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = writeln!(std::io::stderr(), "no thread stacks: gdb did not start ({e}); install gdb to have them");
+            return;
+        }
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    let _ = writeln!(std::io::stderr(), "gdb ended with {status}: where it could not attach, set kernel.yama.ptrace_scope to 0 or run the tests as root");
+                }
+                return;
+            }
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(200)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = writeln!(std::io::stderr(), "gdb took more than 120 s and was killed");
+                return;
+            }
+        }
+    }
 }
 
 pub struct EnvGuard(Option<std::sync::MutexGuard<'static, ()>>);

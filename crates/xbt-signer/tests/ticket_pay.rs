@@ -463,6 +463,11 @@ struct PayState {
 
 /// A fake LND for the buyer: a ticket payment is held by the seller's stand-in node, and ends as
 /// that node settles or cancels it.
+///
+/// Its locks are taken in one order: `st`, then the seller's (the stand-in's, `preimages`), as
+/// [`PayLn::refresh`] does under `st`. A test that holds `preimages` (or `SellerNode::preimages`,
+/// the same map) and then waits for `st` deadlocks with any payer in `refresh`: a test reads
+/// the two one after the other.
 struct PayLn {
     chain: Arc<FakeChain>,
     seller: Arc<StandIn>,
@@ -2965,7 +2970,11 @@ fn a_win_the_seller_stands_still_for_is_paid_before_the_wins_no_seller_waits_for
         let others: Vec<_> = r.more.iter().map(|shop| sc.spawn(move || buy(shop))).collect();
         // once three seconds' worth of them wait (the node has an invoice for each, and no payment yet), the file from
         // the strict seller: its third unpaid win stops its answer, which is cut after two seconds
-        wait_for("120 wins waiting at the gate", || r.shop.node.preimages.lock().unwrap().len() >= r.ln.st.lock().unwrap().payments.len() + 120);
+        // the two counts one after the other, never one lock inside the other ([`PayLn`] takes `preimages` under `st`)
+        wait_for("120 wins waiting at the gate", || {
+            let invoiced = r.shop.node.preimages.lock().unwrap().len();
+            invoiced >= r.ln.st.lock().unwrap().payments.len() + 120
+        });
         let v = buy(&r.shop);
         (v, others.into_iter().map(|t| t.join().unwrap()).collect::<Vec<Value>>())
     });
