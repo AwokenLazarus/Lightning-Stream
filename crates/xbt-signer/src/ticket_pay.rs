@@ -63,7 +63,7 @@ const TAIL_GIVE_UP: Duration = Duration::from_secs(30);
 /// How long a stop waits for the wallet's own node to show the cancelled tickets failed.
 pub const CANCEL_WAIT: Duration = Duration::from_secs(5);
 /// Refusals of `ticket_open` that mean "not this rail": the next entry of the 402 is tried.
-const NEXT_RAIL: [&str; 13] = ["ticket_disabled", "ln_disabled", "ticket_task", "ticket_admission", "ticket_terms", "ticket_feature_512", "ticket_network",
+const NEXT_RAIL: [&str; 14] = ["ticket_disabled", "ticket_mainnet", "ln_disabled", "ticket_task", "ticket_admission", "ticket_terms", "ticket_feature_512", "ticket_network",
                                "ticket_size", "ticket_blocks", "ticket_dust", "ticket_slots", ROUTE_FULL, "ticket_prepaid_first"];
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -592,7 +592,7 @@ impl Signer {
         for offer in ways {
             let rail = offer.rail();
             let tried = match &offer {
-                Offer::Ticket(..) | Offer::Lottery(_) if !tp.enabled => Tried::Next("stream tickets are off in this policy (tickets.enabled)".into()),
+                Offer::Ticket(..) | Offer::Lottery(_) if !tp.enabled => Tried::Next(tp.mainnet_off.clone().unwrap_or_else(|| "stream tickets are off in this policy (tickets.enabled)".into())),
                 Offer::Lottery(acc) => self.lottery_pay(&call, acc, &lightning),
                 Offer::Ticket(acc, prepaid) => self.ticket_pay(&call, acc, prepaid.as_ref(), &lightning),
                 Offer::Lightning(_) if !listed => Tried::Next("the seller is not on the owner's allowlist: only a ticket task that pays any seller reaches it".into()),
@@ -627,7 +627,7 @@ impl Signer {
         }
         with(deny("no_rail", "the seller's 402 offers no way to pay that this wallet's policy allows: see rails_passed_over for what each entry needs"),
              json!({"charged_sats": 0, "rails_passed_over": passed, "offered": offered,
-                    "wallet": {"lightning": lightning, "chain": chain, "tickets": tp.enabled, "ln": LnPolicy::from_map(&cfg.ln).enabled}}))
+                    "wallet": {"lightning": lightning, "chain": chain, "tickets": tp.enabled, "tickets_off": tp.mainnet_off, "ln": LnPolicy::from_map(&cfg.ln).enabled}}))
     }
 
     /// Whether this seller is paid by draws before tickets are tried: what [`crate::lottery::choose`]

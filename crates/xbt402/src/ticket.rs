@@ -37,6 +37,9 @@ pub const SETTLE_MARGIN_BLOCKS: u32 = HOLD_EXPIRY_DELTA + SETTLE_CHAIN_BLOCKS;
 pub const MIN_TICKET_BLOCKS: u32 = 24;
 /// How long an unpaid ticket invoice may wait to be paid, in seconds.
 pub const INVOICE_EXPIRY_S: u32 = 60;
+/// What a seller's config (`mainnet_ack`) and a buyer's policy (`tickets.mainnet_ack`) must say,
+/// word for word, before tickets or draws move funds on mainnet.
+pub const MAINNET_ACK: &str = "real funds, software that has run on regtest only";
 /// `settle` in the terms: a ticket is a held payment, settled when its secret is used.
 pub const SETTLE_ON_USE: &str = "on-use";
 /// `settle` in the terms: a ticket is an ordinary payment, settled when it arrives (a prepaid

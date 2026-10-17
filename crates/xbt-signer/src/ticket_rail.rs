@@ -286,7 +286,7 @@ impl Signer {
     }
 
     pub(crate) fn ticket_policy(&self) -> TicketPolicy {
-        TicketPolicy::from_map(&self.config().tickets)
+        TicketPolicy::for_chain(&self.config().tickets, &self.chain)
     }
 
     /// The book, opened (and created) when first needed. An error keeps the ticket rail shut and
@@ -356,6 +356,9 @@ impl Signer {
     fn ticket_on(&self) -> std::result::Result<TicketPolicy, Value> {
         let tp = self.ticket_policy();
         if !tp.enabled {
+            if let Some(why) = &tp.mainnet_off {
+                return Err(refusal("ticket_mainnet", why.clone()));
+            }
             return Err(refusal("ticket_disabled", "stream tickets are off in this policy (tickets.enabled)"));
         }
         if !LnPolicy::from_map(&self.config().ln).enabled {

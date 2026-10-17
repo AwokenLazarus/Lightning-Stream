@@ -369,6 +369,11 @@ pub struct TicketPolicy {
     /// address, and over plain http: for a lab whose sellers run on this machine or its network.
     /// Off unless `tickets.unlisted_private` is `true` exactly.
     pub unlisted_private: bool,
+    /// `tickets.mainnet_ack` is [`xbt402::ticket::MAINNET_ACK`], word for word. On mainnet the
+    /// rail is off without it ([`TicketPolicy::for_chain`]).
+    pub mainnet_ack: bool,
+    /// On mainnet, why the rail is off though `enabled` was set: the acknowledgement is missing.
+    pub mainnet_off: Option<String>,
     pub tasks: BTreeMap<String, TaskPolicy>,
 }
 
@@ -384,9 +389,15 @@ impl Default for TicketPolicy {
                max_new_sellers_per_min: 30, max_sends_per_hour: 1_200, pool: POOL_FEW as i64, pool_many: POOL_MANY as i64,
                many_sellers: MANY_SELLERS as i64, floor_ticket_sats: (FLOOR_MSAT / 1000) as i64, velocity: Velocity::Session,
                http_idle_s: HTTP_IDLE_S, ready_wait_ms: READY_WAIT_MS, read_timeout_s: READ_TIMEOUT_S, max_answer_s: MAX_ANSWER_S, feerate_cap_sat_per_kw: 0,
-               lottery: crate::lottery::LotteryPolicy::default(), unlisted_private: false, tasks: BTreeMap::new() }
+               lottery: crate::lottery::LotteryPolicy::default(), unlisted_private: false, mainnet_ack: false, mainnet_off: None, tasks: BTreeMap::new() }
     }
 }
+
+/// The owner's caps on mainnet where the policy does not set them: at most 4 tickets and 4,000
+/// sat locked at once, 4 sellers at once and 4 new ones a minute, 120 ticket payments an hour.
+/// Elsewhere 15, 15,000, 15, 30 and 1,200.
+pub const MAINNET_DEFAULTS: [(&str, i64); 5] = [("max_locked_tickets", 4), ("max_locked_sats", 4_000), ("max_sellers", 4), ("max_new_sellers_per_min", 4),
+                                               ("max_sends_per_hour", 120)];
 
 pub const TICKET_INT_KEYS: [&str; 20] = ["max_ticket_sats", "max_ticket_blocks", "max_htlc_blocks", "max_invoice_expiry_s", "max_locked_sats",
                                          "max_locked_tickets", "seller_max_tickets", "seller_max_locked_sats", "max_sellers",
@@ -434,6 +445,7 @@ impl TicketPolicy {
                            },
                            // a widening: only the literal true turns it on
                            unlisted_private: m.get("unlisted_private") == Some(&Value::Bool(true)),
+                           mainnet_ack: m.get("mainnet_ack").and_then(Value::as_str) == Some(xbt402::ticket::MAINNET_ACK), mainnet_off: None,
                            tasks: BTreeMap::new() };
         for (name, t) in m.get("tasks").and_then(Value::as_object).into_iter().flatten() {
             let Some(t) = t.as_object() else { continue };
@@ -453,6 +465,27 @@ impl TicketPolicy {
                 unlisted_max_locked_sats: i(t, "unlisted_max_locked_sats", two), meter: crate::lottery::Meter::parse(t.get("meter")) });
         }
         p.max_ticket_sats = p.max_ticket_sats.min(i64::MAX / 1000);
+        p
+    }
+
+    /// The policy for `chain`. On mainnet: tickets and draws stay off unless the owner wrote
+    /// `tickets.mainnet_ack` ([`xbt402::ticket::MAINNET_ACK`], word for word), and why is in
+    /// `mainnet_off`; and the caps the owner did not set are smaller than elsewhere
+    /// ([`MAINNET_DEFAULTS`]).
+    pub fn for_chain(m: &Map<String, Value>, chain: &str) -> Self {
+        if chain != "main" {
+            return Self::from_map(m);
+        }
+        let mut with = m.clone();
+        for (k, v) in MAINNET_DEFAULTS {
+            with.entry(k.to_string()).or_insert(json!(v));
+        }
+        let mut p = Self::from_map(&with);
+        if p.enabled && !p.mainnet_ack {
+            p.enabled = false;
+            p.mainnet_off = Some(format!("on mainnet stream tickets and draws are off until the owner's policy says tickets.mainnet_ack: {:?}: this software has \
+                                          run on regtest only (docs/LIMITS.md)", xbt402::ticket::MAINNET_ACK));
+        }
         p
     }
 
@@ -488,7 +521,7 @@ pub fn validate(raw: &Value, errors: &mut Vec<String>, warnings: &mut Vec<String
     };
     ints(m, &TICKET_INT_KEYS, "tickets", errors);
     for k in m.keys() {
-        if !["enabled", "tasks", "velocity", "lottery", "unlisted_private"].contains(&k.as_str()) && !TICKET_INT_KEYS.contains(&k.as_str()) {
+        if !["enabled", "tasks", "velocity", "lottery", "unlisted_private", "mainnet_ack"].contains(&k.as_str()) && !TICKET_INT_KEYS.contains(&k.as_str()) {
             warnings.push(format!("policy.json tickets.{k}: unknown key (the signer ignores it)"));
         }
     }
@@ -499,6 +532,12 @@ pub fn validate(raw: &Value, errors: &mut Vec<String>, warnings: &mut Vec<String
     }
     if let Some(l) = m.get("lottery").filter(|v| !v.is_null()) {
         crate::lottery::validate(l, errors, warnings);
+    }
+    match m.get("mainnet_ack") {
+        None => {}
+        Some(Value::String(a)) if a == xbt402::ticket::MAINNET_ACK => {}
+        Some(_) => errors.push(format!("policy.json tickets.mainnet_ack: is {:?}, word for word, or left out (it lets tickets and draws move funds on mainnet)",
+                                       xbt402::ticket::MAINNET_ACK)),
     }
     match m.get("unlisted_private") {
         None | Some(Value::Bool(false)) => {}
@@ -1817,6 +1856,42 @@ mod tests {
         s.paid_first = false;
         assert_eq!(b.want(&s, 100.0), 2);
         assert!(!s.prepaid_now(100.0));
+    }
+
+    /// On mainnet, tickets and draws stay off unless the owner's policy says the gateway's words
+    /// (`tickets.mainnet_ack`), and say why; the caps the owner did not set are smaller there.
+    ///
+    /// FAILS before: the wallet paid tickets on mainnet with nothing more than `enabled`, at the
+    /// caps it has on regtest.
+    #[test]
+    fn on_mainnet_tickets_are_off_until_the_owner_acknowledges_and_the_caps_are_small() {
+        let on = json!({"enabled": true, "tasks": {"t": {"budget_sats": 5_000}}});
+        let m = on.as_object().unwrap();
+        let reg = TicketPolicy::for_chain(m, "regtest");
+        assert!(reg.enabled && reg.mainnet_off.is_none());
+        assert_eq!((reg.max_locked_tickets, reg.max_locked_sats, reg.max_sellers, reg.max_sends_per_hour), (15, 15_000, 15, 1_200));
+        let main = TicketPolicy::for_chain(m, "main");
+        assert!(!main.enabled);
+        assert!(main.mainnet_off.as_deref().is_some_and(|w| w.contains("tickets.mainnet_ack") && w.contains(xbt402::ticket::MAINNET_ACK)), "{main:?}");
+        let mut acked = on.clone();
+        acked["mainnet_ack"] = xbt402::ticket::MAINNET_ACK.into();
+        let main = TicketPolicy::for_chain(acked.as_object().unwrap(), "main");
+        assert!(main.enabled && main.mainnet_off.is_none());
+        assert_eq!((main.max_locked_tickets, main.max_locked_sats, main.max_sellers, main.max_new_sellers_per_min, main.max_sends_per_hour), (4, 4_000, 4, 4, 120));
+        // what the owner set is what it set
+        acked["max_locked_tickets"] = 9.into();
+        assert_eq!(TicketPolicy::for_chain(acked.as_object().unwrap(), "main").max_locked_tickets, 9);
+        // not quite the words: off, and an error in the policy check
+        for wrong in [json!(true), json!("yes"), json!(xbt402::ticket::MAINNET_ACK.to_uppercase())] {
+            let mut w = on.clone();
+            w["mainnet_ack"] = wrong.clone();
+            assert!(!TicketPolicy::for_chain(w.as_object().unwrap(), "main").enabled, "{wrong}");
+            let (mut errors, mut warnings) = (vec![], vec![]);
+            validate(&w, &mut errors, &mut warnings);
+            assert!(errors.iter().any(|e| e.contains("mainnet_ack")), "{wrong}: {errors:?}");
+        }
+        // off, it says nothing on mainnet either
+        assert!(TicketPolicy::for_chain(&Map::new(), "main").mainnet_off.is_none());
     }
 
     #[test]

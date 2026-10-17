@@ -16,8 +16,9 @@ use crate::lottery::LotteryConfig;
 use crate::price::Price;
 use crate::Error;
 
-/// What `mainnet_ack` must say, word for word, before a config with `chain: "main"` is taken.
-pub const MAINNET_ACK: &str = "real funds, software that has run on regtest only";
+/// What `mainnet_ack` must say, word for word, before a config with `chain: "main"` is taken (the
+/// same words a wallet's policy says for its side).
+pub use xbt402::ticket::MAINNET_ACK;
 
 /// What a gateway prints when it starts on mainnet: the things its runner should know before a
 /// buyer does. A short fixed text; the whole of it, with the measurements, is `docs/LIMITS.md`.
