@@ -9,12 +9,12 @@ package built on it (AGP-040) are in `packaging/` (README there).
 
 Status: **proposal**, not yet agreed with the xbt-compute project (sent 2026-09-28).
 
-**What is not here.** There is no image and no package of the seller gateway (`xbt-gateway`): it
-is built and run from source (`crates/xbt-gateway/README.md`). And the images below ship a wallet
-that cannot pay a seller: the wallet pays over Lightning only, and neither the container stack
-nor the Umbrel and StartOS packages connect it to a Lightning node (section 7; `packaging/README.md`).
-What they ship is the keys, the signed policy, approvals, the signature log and the agent's MCP
-endpoint.
+**The Lightning side.** The images include the seller gateway (`xbt-gateway`), and the wallet's signer
+takes its Lightning rail from the environment (`B2_LN_REST`, `B2_LN_TLS_CERT`, `B2_LN_MACAROON`: a file).
+`scripts/container_test.sh` runs both on regtest with a paid buy over stream tickets (section 7), and the
+Umbrel and StartOS packages wire them to the box's Lightning Fork node (`packaging/DESIGN.md`). Neither the
+images nor the packages hold an admin macaroon: of the Lightning node's data they mount only its
+`tls.cert`, and the macaroons are narrow ones the owner bakes.
 
 The hub was retired on 2026-10-11: payments between parties route over ordinary Lightning instead. Its
 code is in the git history (last at commit 0911cc0). Its image, user and data dir are gone from this
@@ -35,6 +35,7 @@ tmpfs `/tmp`.
   mcp/             agp  uid 10003  0700  secrets/
   ui/              agp  uid 10005  0700  password.scrypt (the login hash), setup-code (first run only), secrets/
   relay/           agp  uid 10006  0700  blobs/ (the xbt-work receipt relay's sealed blobs, one file each), secrets/
+  gateway/         agp  uid 10007  0700  the seller gateway's state: receipt.key, sessions, the journal
   cmp-node/        cmp  uid 10011  0700  operator key, operator service, merchant ledgers and meters, secrets/
   cmpd/            cmp  uid 10012  0700  device runtime state, secrets/
   cmpd-cache/      cmp  uid 10012  0700  the model span cache: LARGE, its own mount (CMP_CACHE_DIR), safe to prune
@@ -44,6 +45,11 @@ tmpfs `/tmp`.
      run/signer/   signer.sock, ready.json
      run/anchor/   anchor.sock
      run/ui/       mcp-http-token (0640): the MCP bearer token, owned by the UI, read by the MCP (AGP-042)
+  run/ln/          uid 10005, gid 10008 (xbt-ln-rail), 0750: rail.macaroon, mainnet-ack (0640), written by the
+                   UI's Lightning page, read by the signer; the MCP is not in the group
+  run/gateway/     uid 10005, gid 10007 (xbt-gateway), 0750: config.json, invoices.macaroon, info.macaroon
+                   (0640), written by the UI's gateway page, read by the gateway
+  lightning/tls.cert   not under the data dir: the Lightning node's certificate, one file bind-mounted read-only
 ```
 
 Rules:
@@ -51,8 +57,10 @@ Rules:
   connects to. Read-only is enough to connect to a Unix socket.
   - The MCP mounts `mcp/` and `run/signer/` (ro). So does the UI, with `ui/`. With the UI, the MCP also
     mounts `run/ui/` (ro) and the UI mounts it read-write (AGP-042, §8).
-  - The signer mounts `signer/`, `run/signer/` and `run/anchor/` (ro).
+  - The signer mounts `signer/`, `run/signer/` and `run/anchor/` (ro); in a package also `run/ln/` (ro).
   - The witness mounts `witness/` and `run/anchor/`.
+  - The gateway mounts `gateway/` and `run/gateway/` (ro); the UI in its gateway role mounts `ui/`,
+    `run/ui/` and `run/gateway/`.
 - **Separately mountable paths** have their own override variable, for another disk, another owner or
   pruning:
   - `XBT_WITNESS_DIR`: the witness store, which the signer's user must not be able to write.
@@ -69,9 +77,14 @@ Rules:
 - **Socket groups:** a socket's group is its server's group, and each client is a member of it.
   `/etc/group` in the images:
   - `xbt-signer` group: `xbt-wallet-mcp` and `xbt-wallet-ui` are members;
-  - `xbt-anchor-witness` group: `xbt-signer` is a member.
+  - `xbt-anchor-witness` group: `xbt-signer` is a member;
+  - `xbt-ln-rail` group (10008, a group only): `xbt-signer` and `xbt-wallet-ui`;
+  - `xbt-gateway` group: `xbt-wallet-ui` is a member.
 
-  So the MCP cannot reach the witness, and the witness cannot reach the signer.
+  So the MCP cannot reach the witness or read the rail macaroon, and the witness cannot reach the signer.
+  The UI gives each file it writes in `run/ln/` and `run/gateway/` the dir's group (no setgid bit:
+  `xbt-init` has no CAP_FSETID, and the kernel clears that bit when such a process sets the mode of a dir
+  whose group it is not in).
 - **State formats do not change.** `signer/` is exactly B2's signer root (`policy.json` + `.run/`), so
   B2's Python tools and an existing bare-metal wallet move in unchanged.
 
@@ -85,6 +98,8 @@ UID table (the images' `USER`; the cmp rows are reserved):
 | 10004 | (not used; was the retired hub's) | |
 | 10005 | xbt-wallet-ui | xbt-wallet-ui |
 | 10006 | xbt-work-relay | xbt-work-relay (AGP-043) |
+| 10007 | xbt-gateway | xbt-gateway |
+| 10008 | (group xbt-ln-rail only) | |
 | 0 | root | xbt-init (a one-shot that exits; §8) |
 | 10011 | cmp-node | cmp-node (reserved) |
 | 10012 | cmpd | cmpd-* (reserved) |
@@ -191,8 +206,8 @@ None of these binaries depends on systemd. `$CREDENTIALS_DIRECTORY` is just one 
 ## 6. Images
 
 `scripts/oci_build.sh` builds one image per binary for **linux/amd64, linux/arm64 and linux/arm/v7**:
-`xbt-signer`, `xbt-anchor-witness`, `xbt-wallet-mcp`, `xbt-wallet-ui`, `xbt-init` and (AGP-043)
-`xbt-work-relay` (`--only IMAGE,...` builds a subset; the binaries come from `$CARGO_TARGET_DIR`). Each
+`xbt-signer`, `xbt-anchor-witness`, `xbt-wallet-mcp`, `xbt-wallet-ui`, `xbt-init`, `xbt-work-relay` and
+`xbt-gateway` (`--only IMAGE,...` builds a subset; the binaries come from `$CARGO_TARGET_DIR`). Each
 is `FROM scratch` with the static musl binary (built with zig). There is no `RUN`, so no emulator or
 binfmt is needed. The images are saved as OCI archives in `dist/oci/*.tar` (never pushed), with digests
 and sizes in `dist/oci/IMAGES.md`. `scripts/oci_inspect.py` checks every platform: architecture, static
@@ -201,7 +216,8 @@ ELF, non-root, HEALTHCHECK, two layers, and the shared base layer.
 - **Layer 1** is shared and byte-identical in every image and platform, so it is stored once:
   `/etc/passwd`, `/etc/group`, `/tmp` (1777), and the `/data` skeleton with owners. It is generated
   deterministically by `container/mkbase.py`.
-- **Layer 2** is the binary.
+- **Layer 2** is the binary. The signer and the gateway images also carry `xbt-supervise` in it
+  (below).
 - **Config:**
   - `USER` is the component's user, never root (except `xbt-init`, §8);
   - `ENV XBT_DATA_DIR=/data XBT_MODE=production`;
@@ -209,6 +225,14 @@ ELF, non-root, HEALTHCHECK, two layers, and the shared base layer.
   - `HEALTHCHECK` runs the binary's own `healthcheck`.
 
   Run the containers with `read_only: true`, `tmpfs: /tmp` and `no-new-privileges`.
+- **`xbt-supervise`** (crate `xbt-svc`): `xbt-supervise [--wait FILE]... [--watch FILE]... -- PROGRAM ARGS`
+  starts PROGRAM once every `--wait` file exists and restarts it when a waited or watched file's content
+  changes (SIGTERM, then SIGKILL after 15 s); SIGTERM to it stops PROGRAM and exits 0, and PROGRAM's own exit
+  is its exit. `xbt-supervise probe URL` is a plain-http GET for a HEALTHCHECK. The gateway image's
+  entrypoint is `xbt-supervise --wait /data/run/gateway/config.json --watch` (its macaroons and
+  `/data/lightning/tls.cert`) `-- xbt-gateway /data/run/gateway/config.json`; the packages run the signer
+  under it with `--watch /data/run/ln/rail.macaroon --watch /data/lightning/tls.cert`. The signer image's own
+  entrypoint is still the signer alone.
 - **cmp's images follow the same pattern:**
   - `cmp-node` and `cmp-client` are one image each.
   - `cmpd` comes in **per-backend variants**: `cmpd-cpu` (static, the default on boxes, which are usually
@@ -254,18 +278,25 @@ binary layers have not been verified yet.
 
 ## 7. Test
 
-`scripts/container_test.sh` builds and inspects all the images, then runs the amd64 ones on a private
-Docker network with a Knots regtest node. They are configured only by env and the data dir (named
-volumes). The test:
-1. reaches the MCP over HTTP, behind a base path and with the bearer token: the tool list, the
-   balance, a payment quoted under the policy; and funds the hot key. No seller is paid: the stack
-   has no Lightning node, and the on-chain channel it once paid over was removed (an agent paying
-   a seller through the MCP is proven on Lightning by `scripts/ticket_e2e_regtest.sh`);
-2. kills and restarts the containers and checks that the keys, the hot key's coins, the token and
-   the anchors persist;
-3. checks that `/readyz` follows the witness and the node.
+`scripts/container_test.sh` builds and inspects all the images, then runs the amd64 ones on the network of a
+Lightning Fork regtest lab (`packaging/ln_lab.py`: a Knots BLAKE2b regtest, the buyer's node lf1 and the
+seller's lf2, one channel). They are configured only by env and the data dir (named volumes), with the rail
+macaroon, the gateway's config and its two macaroons put in place by a helper as an installer would. The
+test:
+1. starts the gateway with no config (its supervisor waits), then gives it one: it starts and answers its
+   health check;
+2. reaches the MCP over HTTP, behind a base path and with the bearer token: the tool list, the balance, a
+   payment quoted under the policy; and funds the hot key;
+3. buys from the gateway: one `xbt402_pay` of the agent, a stream ticket over lf1 to lf2, the page and the
+   seller's signed receipt; the seller's node settled the ticket and the buyer's node paid it. The signer
+   runs in the gateway's network namespace, so it reaches the gateway at 127.0.0.1: the wallet pays
+   tickets over https or to its own machine only, and a regtest has no https name with a public certificate;
+4. kills and restarts the containers and checks that the keys, the hot key's coins, the token and the
+   anchors persist, and buys again;
+5. checks that `/readyz` follows the witness and the node.
 
-Ports 23700–23799. Evidence is written to `run/container-test/<stamp>/`.
+Ports 23700–23799 (the MCP on 23710, the lab nodes' REST on 23750 and 23751). Evidence is written to
+`run/container-test/<stamp>/`.
 
 ## 8. Bind mounts and `xbt-init` (AGP-040)
 
