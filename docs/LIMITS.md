@@ -1098,6 +1098,18 @@ untrusted field.
   raised the node's limit must raise `ln.node_max_cltv_blocks` too.
 - A channel's funding proof reads signature types from the owner's own node and does not verify
   signatures.
+- The funding proof reads, on the owner's node, the block holding the funding transaction and the
+  blocks of the transactions behind it that it searches, with their undo data; it needs no
+  transaction index. A pruned node proves a channel while it still has those blocks (it keeps at
+  least the last 288, and as many more as its prune target holds), which for a channel just opened
+  it does; the wallet keeps each verdict in `.run/ln_funding.json` and uses it for as long as the
+  funding block is on the node's best chain. A channel whose blocks the node pruned before the wallet
+  proved it (a channel opened while the wallet was not running, for longer than the node keeps
+  blocks, or any channel once `ln_funding.json` is lost) cannot be proven on that node and carries no
+  payment; the refusal says what the proof needs. An unpruned node (with `txindex=1` for one too old
+  to give an input's `prevout`) proves any channel at any time.
+- A kept verdict is trusted as written: anyone who can write the wallet's run directory can mark a
+  channel proven, as they can change its ledger.
 - A channel is used only if its funding descends, within 256 transactions searched breadth first,
   from a coin taken to exist on XBT alone: a coinbase mined after the split, or a coin spent from
   a legacy (P2PKH) address with an XBT signature. Channels funded from coins that only moved

@@ -63,13 +63,29 @@
 //! no node of the SHA-256 chain to compare heights with, so it cannot check this; the rule is kept as
 //! the owner decided it (2026-10-11) and this is its stated limit.
 //!
-//! The funding transaction's checks: the channel's txid, output, amount and P2WSH. Inputs are looked up
-//! with `getrawtransaction` (the signer's node needs `txindex=1`); a lookup that fails leaves the
-//! channel unproven, and an unproven channel carries no payment. The verdict carries the funding block's
-//! hash, which the signer's cache is keyed on, so a reorg proves the channel again.
-use std::collections::{HashSet, VecDeque};
+//! The funding transaction's checks: the channel's txid, output, amount and P2WSH. A lookup that fails
+//! leaves the channel unproven, and an unproven channel carries no payment. The verdict carries the
+//! funding block's hash, which the signer's cache is keyed on, so a reorg proves the channel again.
+//!
+//! **What the proof reads from the node, and a pruned node without txindex.** Of each transaction it
+//! reads (the funding, then the ancestors it searches) it needs the transaction itself and, of every
+//! coin that transaction spends, the coin's scriptPubKey, the height it was confirmed at and whether a
+//! coinbase made it. All of that is in the transaction's block and that block's undo data, which a node
+//! keeps together and prunes together: `getrawtransaction <txid> 2 <block hash>` returns the
+//! transaction with each input's `prevout` from the undo data, with no txindex. The funding's block is
+//! at its short channel id's height; an ancestor's is at the height its coin's `prevout` gives, on the
+//! same best chain. So a pruned node proves a channel for as long as it keeps the blocks the proof
+//! reads, which for a newly opened channel are recent. A node that does not give `prevout` (one older
+//! than verbosity 2) is asked for the coin's transaction by txid, which needs txindex. Once the blocks
+//! are pruned the proof cannot be made again, so the signer keeps every final verdict on disk
+//! ([`Kept`]), keyed as its cache is, and a kept verdict stands for as long as its funding block is on
+//! the best chain: a reorg that replaced any block the proof read would replace the funding block too,
+//! since every one of them is at or below it. Nothing the proof checks is skipped on any node.
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use xbt_primitives::script::{classify, SpkKind};
 use xbt_primitives::tx::{Tx, TxIn};
 
@@ -89,7 +105,7 @@ pub enum Funding {
     Proven(Value),
     /// The transaction says the channel is unsafe (or is not the channel's): why, and the evidence.
     Refused(String, Value),
-    /// The signer's node could not answer (a missing txindex, the node down): not cached.
+    /// The signer's node could not answer (a block the proof reads is pruned, the node down): not cached.
     Unknown(String),
 }
 
@@ -254,14 +270,104 @@ fn is_coinbase(tx: &Tx) -> bool {
     tx.inputs.len() == 1 && tx.inputs[0].prevout.txid == [0u8; 32] && tx.inputs[0].prevout.vout == 0xFFFF_FFFF
 }
 
-/// A confirmed transaction on our node: itself and its height. `Err`: the node cannot say.
-fn confirmed_tx(node: &dyn Node, txid: &str) -> Result<(Tx, i64), String> {
-    let v = node::get_tx(node, txid, "").ok_or_else(|| format!("our node cannot find transaction {txid} (the signer's node needs txindex=1)"))?;
-    let tx = v.get("hex").and_then(Value::as_str).and_then(|h| Tx::parse_hex(h).ok()).filter(|t| t.txid() == txid)
-        .ok_or_else(|| format!("our node's transaction {txid} does not parse to that txid"))?;
-    let h = v.get("blockhash").and_then(Value::as_str).and_then(|b| height_of_block(node, b))
-        .ok_or_else(|| format!("transaction {txid} has no confirmed block on our node"))?;
-    Ok((tx, h))
+/// What a proof our node cannot make needs of it: said with every such verdict.
+pub const NEEDS: &str = "the proof reads the funding's block and the blocks behind it on the signer's node: a pruned node proves a channel while \
+                         it still has them (soon after the channel opens), and the signer then keeps the verdict on disk; an unpruned node with \
+                         txindex=1 proves it at any time";
+
+/// The coin an input spends, as our node has it: its scriptPubKey, the height of the block that
+/// confirmed it (on our node's best chain) and whether a coinbase made it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Coin {
+    pub spk: Vec<u8>,
+    pub height: i64,
+    pub coinbase: bool,
+}
+
+/// What our node says of the coins a transaction's inputs spend, one per input.
+pub type Coins = Vec<Result<Coin, Miss>>;
+
+/// Why our node gave nothing for a lookup.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Miss {
+    /// It answered without it: a pruned block, a transaction it does not index.
+    Gone(String),
+    /// What it returned is not what was asked for (another txid, another input).
+    Bad(String),
+    /// It did not answer.
+    NoAnswer(String),
+}
+
+impl Miss {
+    fn of(e: crate::Error) -> Self {
+        if e.code == node::REFUSED { Miss::Gone(e.msg) } else { Miss::NoAnswer(e.msg) }
+    }
+
+    fn text(&self) -> &str {
+        match self {
+            Miss::Gone(s) | Miss::Bad(s) | Miss::NoAnswer(s) => s,
+        }
+    }
+}
+
+/// `txid` from our node's block `bh`, and the node's verbose answer: `getrawtransaction <txid> 2 <bh>`,
+/// whose inputs carry their `prevout` from the block's undo data. Needs the block, not txindex.
+fn in_block(node: &dyn Node, txid: &str, bh: &str) -> Result<(Tx, Value), Miss> {
+    let v = node.call("getrawtransaction", json!([txid, 2, bh])).map_err(Miss::of)?;
+    if v.is_null() {
+        return Err(Miss::Gone(format!("our node has no transaction {txid} in block {bh}")));
+    }
+    let tx = tx_hex(&v).and_then(|h| Tx::parse_hex(&h).ok()).filter(|t| t.txid() == txid)
+        .ok_or_else(|| Miss::Bad(format!("our node's transaction {txid} does not parse to that txid")))?;
+    Ok((tx, v))
+}
+
+/// `txid`, confirmed at `height` on our node's best chain, and the coins it spends.
+fn at_height(node: &dyn Node, txid: &str, height: i64) -> Result<(Tx, Coins), Miss> {
+    let h = u64::try_from(height).map_err(|_| Miss::Bad(format!("a coin's height {height} is not a block height")))?;
+    let bh = node::block_hash(node, h).map_err(Miss::of)?;
+    let (tx, v) = in_block(node, txid, &bh)?;
+    let coins = coins(node, &tx, &v);
+    Ok((tx, coins))
+}
+
+/// The coin `txid:vout`, from our node's copy of its transaction looked up by txid alone: the mempool
+/// or txindex. For a node that does not give an input's `prevout`.
+fn by_txid(node: &dyn Node, txid: &str, vout: u32) -> Result<Coin, Miss> {
+    let v = node.call("getrawtransaction", json!([txid, true])).map_err(Miss::of)?;
+    if v.is_null() {
+        return Err(Miss::Gone(format!("our node has no transaction {txid}")));
+    }
+    let prev = tx_hex(&v).and_then(|h| Tx::parse_hex(&h).ok()).filter(|t| t.txid() == txid)
+        .ok_or_else(|| Miss::Bad(format!("our node's transaction {txid} does not parse to that txid")))?;
+    let spk = prev.outputs.get(vout as usize).map(|o| o.script_pubkey.clone())
+        .ok_or_else(|| Miss::Bad(format!("the coin {txid}:{vout} is not in our node's copy of its transaction")))?;
+    let height = v.get("blockhash").and_then(Value::as_str).and_then(|b| height_of_block(node, b))
+        .ok_or_else(|| Miss::Gone(format!("transaction {txid} has no confirmed block on our node")))?;
+    Ok(Coin { spk, height, coinbase: is_coinbase(&prev) })
+}
+
+/// The coins `tx`'s inputs spend, one per input; `v` is our node's verbose answer for `tx`. From the
+/// input's `prevout` where the node gives one (its block's undo data), else from the coin's own
+/// transaction ([`by_txid`]). The node's input must be the transaction's, outpoint for outpoint.
+fn coins(node: &dyn Node, tx: &Tx, v: &Value) -> Coins {
+    let vin = v.get("vin").and_then(Value::as_array);
+    tx.inputs.iter().enumerate().map(|(i, inp)| {
+        let (prev_txid, pv) = (inp.prevout.txid_hex(), inp.prevout.vout);
+        if let Some(e) = vin.and_then(|a| a.get(i)) {
+            if e.get("txid").and_then(Value::as_str) != Some(prev_txid.as_str()) || e.get("vout").and_then(Value::as_u64) != Some(pv as u64) {
+                return Err(Miss::Bad(format!("our node's input {i} of {} is not {prev_txid}:{pv}", tx.txid())));
+            }
+            if let Some(p) = e.get("prevout") {
+                let spk = p.get("scriptPubKey").and_then(|s| s.get("hex")).and_then(Value::as_str).and_then(|h| hex::decode(h).ok());
+                return match (spk, p.get("height").and_then(Value::as_i64), p.get("generated").and_then(Value::as_bool)) {
+                    (Some(spk), Some(height), Some(coinbase)) => Ok(Coin { spk, height, coinbase }),
+                    _ => Err(Miss::Bad(format!("our node's prevout of {prev_txid}:{pv} lacks its scriptPubKey, height or coinbase flag"))),
+                };
+            }
+        }
+        by_txid(node, &prev_txid, pv)
+    }).collect()
 }
 
 /// Is `inp` a P2PKH spend whose one signature is 0x21? Then the signature is in the scriptSig, which
@@ -272,41 +378,59 @@ fn pinned_by_script_sig(inp: &TxIn, prev_spk: &[u8]) -> bool {
 }
 
 /// What pins `funding`'s txid to XBT (the module documentation's rule), searched breadth first from
-/// its inputs: `Ok(Some(evidence))`, `Ok(None)` when [`ANCESTRY_LOOKUPS`] transactions held no pin, and
-/// `Err` when our node could not return an ancestor (then nothing is concluded).
-pub fn xbt_only(node: &dyn Node, funding: &Tx, split_height: i64) -> Result<Option<Value>, String> {
+/// its inputs (`coins`: what each spends): `Ok(Some(evidence))`, `Ok(None)` when [`ANCESTRY_LOOKUPS`]
+/// inputs, or every transaction in reach, held no pin, and `Err` when our node could not return a
+/// transaction or a coin the search needed and none it could return held a pin (then nothing is
+/// concluded). One pin is enough, so a branch our node cannot read (a pruned block) does not stop the
+/// search of the others.
+pub fn xbt_only(node: &dyn Node, funding: &Tx, coins: Coins, split_height: i64) -> Result<Option<Value>, String> {
     let mut seen: HashSet<String> = HashSet::from([funding.txid()]);
-    let mut queue: VecDeque<(Tx, u32)> = VecDeque::from([(funding.clone(), 0)]);
+    let mut queue: VecDeque<(Tx, Coins, u32)> = VecDeque::from([(funding.clone(), coins, 0)]);
     let mut looked_up = 0usize;
-    while let Some((tx, depth)) = queue.pop_front() {
-        for (i, inp) in tx.inputs.iter().enumerate() {
-            let prev_txid = inp.prevout.txid_hex();
+    let mut missed: Option<String> = None;
+    while let Some((tx, coins, depth)) = queue.pop_front() {
+        for (i, (inp, coin)) in tx.inputs.iter().zip(coins).enumerate() {
+            let (prev_txid, pv) = (inp.prevout.txid_hex(), inp.prevout.vout);
             if looked_up == ANCESTRY_LOOKUPS {
                 return Ok(None);
             }
             looked_up += 1;
-            let (prev, h) = confirmed_tx(node, &prev_txid)?;
-            let Some(coin) = prev.outputs.get(inp.prevout.vout as usize) else {
-                return Err(format!("our node's copy of {prev_txid} has no output {}", inp.prevout.vout));
+            let coin = match coin {
+                Ok(c) => c,
+                Err(Miss::NoAnswer(m)) => return Err(format!("our node did not answer for the coin {prev_txid}:{pv} ({m})")),
+                Err(m) => {
+                    missed.get_or_insert(format!("the coin {prev_txid}:{pv}: {}", m.text()));
+                    continue;
+                }
             };
             // whatever the coin's age: the signature is in this transaction's txid
-            if pinned_by_script_sig(inp, &coin.script_pubkey) {
+            if pinned_by_script_sig(inp, &coin.spk) {
                 return Ok(Some(json!({"pinned_by": "a 0x21 signature in a scriptSig", "txid": tx.txid(), "input": i, "generations": depth,
                                       "looked_up": looked_up})));
             }
-            if h < split_height {
+            if coin.height < split_height {
                 continue; // below the split every transaction is on both chains: nothing behind it helps
             }
-            if is_coinbase(&prev) {
-                return Ok(Some(json!({"pinned_by": "a coinbase at or above the split", "txid": prev_txid, "height": h, "generations": depth + 1,
+            if coin.coinbase {
+                return Ok(Some(json!({"pinned_by": "a coinbase at or above the split", "txid": prev_txid, "height": coin.height, "generations": depth + 1,
                                       "looked_up": looked_up})));
             }
-            if seen.insert(prev_txid) {
-                queue.push_back((prev, depth + 1));
+            if seen.insert(prev_txid.clone()) {
+                match at_height(node, &prev_txid, coin.height) {
+                    Ok((prev, c)) => queue.push_back((prev, c, depth + 1)),
+                    Err(Miss::NoAnswer(m)) => return Err(format!("our node did not answer for transaction {prev_txid} ({m})")),
+                    Err(m) => {
+                        missed.get_or_insert(format!("transaction {prev_txid} of block {}: {}", coin.height, m.text()));
+                    }
+                }
             }
         }
     }
-    Ok(None)
+    match missed {
+        Some(m) => Err(format!("our node could not return all of the transactions behind the funding ({m}), and none it returned pins the funding \
+                                to XBT: {NEEDS}")),
+        None => Ok(None),
+    }
 }
 
 /// Prove (or refuse) one channel's funding: `channel_point` is LND's `txid:vout`, `scid` its short
@@ -337,7 +461,7 @@ pub fn check(node: &dyn Node, channel_point: &str, scid: u64, capacity: i64, spl
     };
     let block = match node.call("getblock", json!([bh, 1])) {
         Ok(b) => b,
-        Err(e) => return Funding::Unknown(format!("getblock {height}: {}", e.msg)),
+        Err(e) => return Funding::Unknown(format!("our node cannot return block {height}, which holds the funding ({}): {NEEDS}", e.msg)),
     };
     let at = block.get("tx").and_then(Value::as_array).and_then(|t| t.get(pos))
         .and_then(|t| t.as_str().map(str::to_string).or_else(|| t.get("txid").and_then(Value::as_str).map(str::to_string)));
@@ -345,13 +469,10 @@ pub fn check(node: &dyn Node, channel_point: &str, scid: u64, capacity: i64, spl
         return Funding::Refused(format!("our node's block {height} holds {} at position {pos}, not the channel's funding",
                                         at.unwrap_or_else(|| "nothing".into())), ev(json!({})));
     }
-    let raw = match node.call("getrawtransaction", json!([txid, true, bh])).ok().as_ref().and_then(tx_hex) {
-        Some(h) => h,
-        None => return Funding::Unknown(format!("our node cannot return the funding transaction {txid}")),
-    };
-    let tx = match Tx::parse_hex(&raw) {
-        Ok(t) if t.txid() == txid => t,
-        _ => return Funding::Refused(format!("our node's transaction {txid} does not parse to that txid"), ev(json!({}))),
+    let (tx, verbose) = match in_block(node, &txid, &bh) {
+        Ok(t) => t,
+        Err(Miss::Bad(why)) => return Funding::Refused(why, ev(json!({}))),
+        Err(m) => return Funding::Unknown(format!("our node cannot return the funding transaction {txid} ({}): {NEEDS}", m.text())),
     };
     let Some(o) = tx.outputs.get(vout as usize) else {
         return Funding::Refused(format!("the funding transaction has no output {vout}"), ev(json!({})));
@@ -362,26 +483,18 @@ pub fn check(node: &dyn Node, channel_point: &str, scid: u64, capacity: i64, spl
     if classify(&o.script_pubkey) != Some(SpkKind::P2wsh) {
         return Funding::Refused("the funding output is not a P2WSH 2-of-2".into(), ev(json!({})));
     }
+    let coins = coins(node, &tx, &verbose);
     let mut inputs = vec![];
     let mut bad = vec![];
-    for (i, inp) in tx.inputs.iter().enumerate() {
-        let prev_txid = inp.prevout.txid_hex();
-        let pv = inp.prevout.vout;
-        let Some(prev) = node::get_tx(node, &prev_txid, "") else {
-            return Funding::Unknown(format!("our node cannot find input {i}'s transaction {prev_txid} (the signer's node needs txindex=1)"));
+    for (i, (inp, coin)) in tx.inputs.iter().zip(&coins).enumerate() {
+        let (prev_txid, pv) = (inp.prevout.txid_hex(), inp.prevout.vout);
+        let coin = match coin {
+            Ok(c) => c,
+            // our node's answer is not about this input: no verdict on the transaction, and none kept
+            Err(Miss::Bad(why)) => return Funding::Unknown(format!("input {i} ({prev_txid}:{pv}): {why}")),
+            Err(m) => return Funding::Unknown(format!("our node cannot say what coin input {i} ({prev_txid}:{pv}) spends ({}): {NEEDS}", m.text())),
         };
-        let spk = match prev.get("hex").and_then(Value::as_str).and_then(|h| Tx::parse_hex(h).ok()) {
-            Some(t) if t.txid() == prev_txid => t.outputs.get(pv as usize).map(|o| o.script_pubkey.clone()),
-            _ => None,
-        };
-        let Some(spk) = spk else {
-            return Funding::Refused(format!("input {i}'s coin {prev_txid}:{pv} is not in our node's copy of its transaction"), ev(json!({})));
-        };
-        let h = prev.get("blockhash").and_then(Value::as_str).and_then(|b| height_of_block(node, b));
-        let Some(h) = h else {
-            return Funding::Unknown(format!("input {i}'s transaction {prev_txid} has no confirmed block on our node"));
-        };
-        let sh = checked_sighashes(inp, &spk);
+        let sh = checked_sighashes(inp, &coin.spk);
         let shown: Vec<String> = sh.iter().flatten().map(|b| format!("0x{b:02x}")).collect();
         match &sh {
             Err(why) => bad.push(format!("input {i} ({prev_txid}:{pv}): {why}")),
@@ -392,16 +505,16 @@ pub fn check(node: &dyn Node, channel_point: &str, scid: u64, capacity: i64, spl
             }
             Ok(_) => {}
         }
-        if h < split_height {
-            bad.push(format!("input {i} ({prev_txid}:{pv}) was confirmed at {h}, below the split {split_height}"));
+        if coin.height < split_height {
+            bad.push(format!("input {i} ({prev_txid}:{pv}) was confirmed at {}, below the split {split_height}", coin.height));
         }
-        inputs.push(json!({"outpoint": format!("{prev_txid}:{pv}"), "height": h, "sighash": shown}));
+        inputs.push(json!({"outpoint": format!("{prev_txid}:{pv}"), "height": coin.height, "sighash": shown}));
     }
     let mut evidence = ev(json!({"inputs": inputs, "source": "the signer's own node"}));
     if !bad.is_empty() {
         return Funding::Refused(bad.join("; "), evidence);
     }
-    match xbt_only(node, &tx, split_height) {
+    match xbt_only(node, &tx, coins, split_height) {
         Ok(Some(pin)) => {
             evidence["xbt_only"] = pin;
             Funding::Proven(evidence)
@@ -413,6 +526,78 @@ pub fn check(node: &dyn Node, channel_point: &str, scid: u64, capacity: i64, spl
              from coins that passed through a P2PKH address after the split"), evidence),
         Err(why) => Funding::Unknown(why),
     }
+}
+
+// --- verdicts kept on disk ------------------------------------------------------------------------
+
+/// The file in the signer's run directory that keeps final verdicts ([`Kept`]).
+pub const KEPT_FILE: &str = "ln_funding.json";
+/// The rules a kept verdict was reached under. A file written under other rules keeps nothing, so
+/// its channels are proven again: raise this whenever what [`check`] proves or refuses changes.
+pub const KEPT_RULES: u64 = 1;
+
+/// Final verdicts by channel (the signer's key: channel point, short channel id, capacity and split),
+/// each with the hash of the block it was reached on, in memory and in [`KEPT_FILE`]. A verdict goes
+/// to disk (a synced file renamed into place, then the directory synced) before it is kept in
+/// memory, so one that is kept after a restart was durable. A kept verdict holds while its block is
+/// our node's block at the channel's height (the module documentation says why that is enough); it is
+/// what lets a pruned node use a channel whose blocks it no longer has. A file that cannot be read, or
+/// that other rules wrote, keeps nothing and is replaced at the next write.
+pub struct Kept {
+    path: PathBuf,
+    map: Mutex<HashMap<String, (String, Funding)>>,
+}
+
+impl Kept {
+    pub fn open(path: &Path) -> Self {
+        let map = std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .filter(|v| v.get("rules").and_then(Value::as_u64) == Some(KEPT_RULES))
+            .and_then(|v| v.get("verdicts").and_then(Value::as_object).cloned())
+            .map(|m| m.into_iter().filter_map(|(k, e)| Some((k, read_kept(&e)?))).collect())
+            .unwrap_or_default();
+        Self { path: path.into(), map: Mutex::new(map) }
+    }
+
+    /// The verdict kept for `key`, if it was reached on block `bh`.
+    pub fn get(&self, key: &str, bh: &str) -> Option<Funding> {
+        self.map.lock().unwrap_or_else(|p| p.into_inner()).get(key).filter(|(h, _)| h == bh).map(|(_, f)| f.clone())
+    }
+
+    /// Keep `f`, a final verdict reached on block `bh`: on disk first, then in memory. `Err`: it is not
+    /// kept (it still holds for the call that reached it).
+    pub fn keep(&self, key: &str, bh: &str, f: &Funding) -> crate::Result<()> {
+        if !f.is_final() || f.block_hash() != Some(bh) {
+            return Err(crate::err("ln_funding", "only a final verdict reached on that block is kept"));
+        }
+        let mut m = self.map.lock().unwrap_or_else(|p| p.into_inner());
+        let mut next = m.clone();
+        next.insert(key.into(), (bh.into(), f.clone()));
+        let verdicts: Map<String, Value> = next.iter().map(|(k, (_, f))| (k.clone(), kept_json(f))).collect();
+        crate::ln::write_json(&self.path, &json!({"rules": KEPT_RULES, "verdicts": verdicts}))?;
+        *m = next;
+        Ok(())
+    }
+}
+
+fn kept_json(f: &Funding) -> Value {
+    match f {
+        Funding::Proven(ev) => json!({"proven": true, "evidence": ev}),
+        Funding::Refused(why, ev) => json!({"proven": false, "reason": why, "evidence": ev}),
+        Funding::Unknown(_) => Value::Null,
+    }
+}
+
+/// A kept verdict and its block hash, if the record is whole: a proven one with its evidence, a
+/// refused one with its reason, and the evidence naming a block.
+fn read_kept(e: &Value) -> Option<(String, Funding)> {
+    let ev = e.get("evidence").filter(|v| v.is_object())?.clone();
+    let f = match (e.get("proven").and_then(Value::as_bool)?, e.get("reason").and_then(Value::as_str)) {
+        (true, None) => Funding::Proven(ev),
+        (false, Some(why)) => Funding::Refused(why.into(), ev),
+        _ => return None,
+    };
+    let bh = f.block_hash().filter(|h| h.len() == 64 && h.bytes().all(|c| c.is_ascii_hexdigit()))?.to_string();
+    Some((bh, f))
 }
 
 #[cfg(test)]
