@@ -48,6 +48,7 @@ ulimit -n 4096                   # the tests open many connections at once
 | 2. The wallet paying a gateway with tickets | `scripts/ticket_e2e_regtest.sh` | about 7 min the first time (it clones and builds the Lightning Fork lab under `run/`) | One `PASS` line for each check, then `ticket_e2e: 35 of 35 checks passed` and `ticket_e2e: OK` |
 | 3. The lottery | `scripts/lottery_regtest.sh` | about 13 min | `lottery: 30 of 30 checks passed`, `lottery: OK` |
 | 4. The film demo | `scripts/demo_film.sh` | about 7 min (it fetches the 276 MB film once) | `demo: 22 of 22 checks passed`, `demo: OK`, and a readout while the film plays |
+| 5. A pruned chain node without txindex | `TICKET_E2E_PRUNED=1 scripts/ticket_e2e_regtest.sh` | about 10 min | The chain node runs with `prune=550` and no txindex, as the node packages most owners run do; the buyer's channel is proven, every block the proof read is pruned, the signer restarts, and ln_status, ln_pay, a ticket purchase and a lottery win each pass; then, without the kept verdict, the channel is refused with a reason that names what the proof needs. `ticket_e2e: N of N checks passed` |
 
 Run one lab at a time: each takes a block of loopback ports and its own containers, and removes
 its containers and volumes when it ends. The head of each script lists its ports, its settings
@@ -58,7 +59,7 @@ use were already on the machine of that run, so their download is not in the tim
 
 What each step writes, under `run/` (ignored by git):
 
-- `run/ticket_e2e_regtest.json` and `.log`
+- `run/ticket_e2e_regtest.json` and `.log` (step 5 writes the same files)
 - `run/lottery_regtest.json` and `.log`
 - `run/demo_film.json`, `run/demo_film.log` and `run/demo-captures/`
 

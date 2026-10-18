@@ -45,8 +45,15 @@
 # (TICKET_E2E_KEEP=1 keeps them and the scratch directory). About 25 minutes.
 # Report: run/ticket_e2e_regtest.json and run/ticket_e2e_regtest.log.
 #
+#   pruned   (TICKET_E2E_PRUNED=1 only) the chain node pruned and without txindex
+#            (scripts/ticket_e2e/compose.pruned.yml): the buyer's channel proven while its blocks
+#            are recent, then every block the proof read pruned and the signer restarted: ln_status,
+#            ln_pay, a ticket purchase and a lottery win (a third gateway, on BASE+8, offers the
+#            lottery), and what the wallet says once it has no kept verdict. About 10 minutes.
+#
 #   scripts/ticket_e2e_regtest.sh               every check
 #   scripts/ticket_e2e_regtest.sh page stream   only these
+#   TICKET_E2E_PRUNED=1 scripts/ticket_e2e_regtest.sh        the pruned check
 set -euo pipefail
 cd "$(dirname "$0")/.." || exit 1
 ROOT=$PWD
@@ -56,6 +63,11 @@ export TICKET_E2E_PORT_BASE=$B TICKET_E2E_PORT_RPC=$B
 export LN_TICKET_PORT_LF1=$((B + 1)) LN_TICKET_PORT_LF2=$((B + 2)) LN_TICKET_PORT_LF3=$((B + 3))
 export COMPOSE_PROJECT_NAME=tickete2e
 export COMPOSE_FILE=$LAB/docker-compose.yml:$ROOT/scripts/ticket_e2e/compose.yml
+PORTS=$(seq "$B" $((B + 7)))
+if [ "${TICKET_E2E_PRUNED:-0}" = 1 ]; then
+  COMPOSE_FILE=$COMPOSE_FILE:$ROOT/scripts/ticket_e2e/compose.pruned.yml
+  PORTS="$PORTS $((B + 8))"
+fi
 export ACTIVATION_HEIGHT=20
 R=
 
@@ -86,8 +98,8 @@ BIN=${CARGO_TARGET_DIR:-$ROOT/target}/release
 
 # a lab an earlier TICKET_E2E_KEEP=1 run left holds the ports and an old chain: it goes first
 (cd "$LAB" && docker compose down -v >/dev/null 2>&1) || true
-# shellcheck disable=SC2046 # the port list is meant to split
-python3 "$ROOT/scripts/portcheck.py" wait $(seq "$B" $((B + 7)))
+# shellcheck disable=SC2086 # the port list is meant to split
+python3 "$ROOT/scripts/portcheck.py" wait $PORTS
 (cd "$LAB" && docker compose up -d fees knots-b2b)
 
 export LAB RUN=$R OUT=$ROOT/run BIN
