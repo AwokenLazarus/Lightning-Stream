@@ -160,8 +160,12 @@ mainnet; its driver is not in this tree. `docs/TICKETS.md`, section 11, has the 
   behind it (`docs/TICKETS.md`, section 6.2).
 - A settled ticket is not yet income. The settle call's success is the seller's own node's word;
   the money is the seller's when the upstream hop has fulfilled the HTLC or the seller has
-  claimed it on chain. A seller should not count it before that. The gateway counts a ticket
-  when the settle call returns and does not look at the channel.
+  claimed it on chain. A seller should not count it before that. The invoice cannot tell: its
+  state is `SETTLED` from the moment the seller's node releases the preimage, whatever the hop
+  then does. Only the channel can: the HTLC stays among the open channel's pending HTLCs until
+  the hop has committed to the fulfil. The gateway does not look at the channel: its `settled`
+  count (`/x402/ticket/health`) and the balance it serves a buyer against follow the settle
+  call's answer, and a prepaid ticket or a lottery win follows the invoice's state.
 - Each held ticket with an output adds 172 weight units to the commitment transaction of every
   channel on its route, and whoever funded the channel carries the fee out of its balance while
   the ticket is held, and pays it in a force close: 43, 430 and 2,150 sat a ticket at 1, 10 and

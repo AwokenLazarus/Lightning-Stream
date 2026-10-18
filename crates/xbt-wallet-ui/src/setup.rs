@@ -335,6 +335,8 @@ impl App {
             ("Certificate (pinned)", cert_line(gw.node_tls_cert.as_deref())),
             ("Macaroons", format!("invoices {}, height {}", if gw.dir.join(GW_INVOICES).is_file() { "stored" } else { "none" },
                                   if gw.dir.join(GW_INFO).is_file() { "stored" } else { "none" })),
+            // what the gateway can know: its node's word on an invoice, never the channel peer's fulfil
+            ("Settled", "<code>settled</code> counts the tickets your node settled, by its own word. It is not yet income: the payment                          is yours once the channel peer it came through has taken the preimage, which the gateway does not check".into()),
         ]));
         if let Some(c) = self.current_gateway() {
             b.push_str(&format!("<details><summary>The config the gateway reads</summary>{}</details>", json_block(&c)));

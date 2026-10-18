@@ -755,6 +755,8 @@ fn the_gateway_page_writes_a_config_the_gateway_takes_and_mainnet_is_asked_for()
     assert_eq!(br.get("/readyz").status, 200, "no signer, and ready");
     let page = br.get("/").body;
     assert!(page.contains("Lightning Stream Gateway") && page.contains("invoices:read invoices:write") && !page.contains("Approvals"), "{page}");
+    // the count it shows is said to be the node's word, not income
+    assert!(page.contains("by its own word") && page.contains("not yet income"), "{page}");
     assert_eq!(br.get("/policy").status, 404);
     let inv = mac(&[("invoices", &["read", "write"])]);
     let info = mac(&[("info", &["read"])]);

@@ -133,6 +133,18 @@ model produced.
 | A prepaid ticket is credited once, when the node shows its invoice settled in full: on the buyer's preimage, or by the sweep. | `Gateway::take_prepaid`, `Book::settled` |
 | Only the headers and methods you allowed reach your service; nothing it answers is read for money. | `upstream.rs` |
 
+## What the gateway knows of your money
+
+Only what your node says of an invoice. A held ticket counts as settled (`settled` in
+`/x402/ticket/health`, and the buyer's balance that the gateway serves against) when the settle
+call to your node returns success; a prepaid ticket and a lottery win count when your node shows
+the invoice `SETTLED`. That is your node's own state: it is set when your node releases the
+preimage, and nothing in the invoice changes when the channel peer the payment came through
+commits to the fulfil, or if it never does. The money is yours once the peer has done so (your
+node no longer lists the HTLC among that open channel's pending HTLCs) or once you have claimed it
+on chain. The gateway does not read your channels for this, so do not read `settled` as income
+(`docs/TICKETS.md`, section 6, the seller's rows; `docs/LIMITS.md`).
+
 ## Two kinds of ticket
 
 `tickets.settle` lists what your terms offer; the default is both.
