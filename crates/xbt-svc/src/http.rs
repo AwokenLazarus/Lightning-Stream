@@ -184,6 +184,8 @@ pub trait Handler: Send + Sync {
 pub struct Stop {
     flag: Arc<AtomicBool>,
     addr: SocketAddr,
+    /// The connections open now (each is one request: `Connection: close`).
+    open: Arc<AtomicUsize>,
 }
 
 impl Stop {
@@ -201,6 +203,26 @@ impl Stop {
             });
         }
         let _ = TcpStream::connect_timeout(&a, Duration::from_secs(1));
+    }
+
+    /// The connections open now, the requests in flight among them.
+    pub fn open(&self) -> usize {
+        self.open.load(Ordering::SeqCst)
+    }
+
+    /// [`Stop::stop`], then wait at most `bound` for the open connections to end (a service that
+    /// is told to stop: [`crate::shutdown`]). True: every one ended; false: some are still open,
+    /// and the caller abandons them.
+    pub fn drain(&self, bound: Duration) -> bool {
+        self.stop();
+        let end = Instant::now() + bound;
+        while self.open() > 0 {
+            if Instant::now() >= end {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
     }
 }
 
@@ -245,11 +267,12 @@ pub fn serve_with(
     let stop = Stop {
         flag: Arc::new(AtomicBool::new(false)),
         addr,
+        open: Arc::new(AtomicUsize::new(0)),
     };
-    let flag = stop.flag.clone();
+    let (flag, open) = (stop.flag.clone(), stop.open.clone());
     let accept = std::thread::Builder::new()
         .name("http-accept".into())
-        .spawn(move || accept(listener, handler, gate, limits, &flag))?;
+        .spawn(move || accept(listener, handler, gate, limits, &flag, open))?;
     Ok(Running {
         addr,
         threads: vec![accept],
@@ -440,8 +463,8 @@ fn accept(
     gate: Arc<Gate>,
     limits: Limits,
     stop: &AtomicBool,
+    open: Arc<AtomicUsize>,
 ) {
-    let open = Arc::new(AtomicUsize::new(0));
     let per = Arc::new(PerAddress {
         max: limits.per_address,
         open: Mutex::new(HashMap::new()),

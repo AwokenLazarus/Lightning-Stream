@@ -23,6 +23,8 @@
 //! one, every push needs `Authorization: Bearer <token>`. A push listener off loopback without a token
 //! is refused unless `XBT_RELAY_PUSH_ALLOW_OPEN=1` (a push port reachable only on a private network,
 //! for a Prime that sends no token).
+//!
+//! `serve` stops on SIGTERM or SIGINT: no new connection, the requests in flight get 5 s, exit 0.
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -66,6 +68,8 @@ fn main() {
             Err(e) => die(e),
         }
     }
+    // SIGTERM and SIGINT before the first thread: a stop is answered at once, also as PID 1
+    let signals = xbt_svc::shutdown::listen().unwrap_or_else(|e| die(format!("signals: {e}")));
     let mode = Mode::from_env().unwrap_or_else(|e| die(e));
     let data = DataDir::from_env();
     let push_bind = opt(&args, "--push-bind", "XBT_RELAY_PUSH_BIND").unwrap_or_else(|| "127.0.0.1:9491".into());
@@ -121,7 +125,8 @@ fn main() {
             }
         }
     });
-    for t in run.threads {
-        let _ = t.join();
-    }
+    let sig = signals.wait();
+    xbt_svc::shutdown::say_stopping(SERVICE, sig);
+    let drained = run.finish(xbt_svc::shutdown::DRAIN);
+    xbt_svc::shutdown::say_stopped(SERVICE, drained);
 }

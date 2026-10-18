@@ -313,6 +313,8 @@ pub struct Witness {
     pub store: Arc<AnchorStore>,
     pub sock_path: PathBuf,
     stop: Arc<AtomicBool>,
+    /// The requests being answered: a stop lets them finish ([`Witness::finish`]).
+    drain: Arc<xbt_svc::shutdown::Drain>,
 }
 
 impl Drop for Witness {
@@ -322,12 +324,26 @@ impl Drop for Witness {
     }
 }
 
+impl Witness {
+    /// Stop (SIGTERM): no new connection, and no new request on an open one (it is told the witness
+    /// is stopping); the requests running get `bound` to finish. Each anchor is appended and fsynced
+    /// before its answer is written, so there is nothing to flush. True: none was left running.
+    pub fn finish(&self, bound: Duration) -> bool {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = Stream::connect(&self.sock_path);
+        let done = self.drain.finish(bound);
+        let _ = std::fs::remove_file(&self.sock_path);
+        done
+    }
+}
+
 /// Bind the witness socket (mode `sock_mode`) and serve it on a background thread.
 pub fn serve_witness(store_dir: &Path, sock_path: &Path, sock_mode: u32) -> Result<Witness> {
     let store = Arc::new(AnchorStore::open(store_dir)?);
     let listener = Listener::bind(sock_path, sock_mode).map_err(|e| err("anchor", format!("{}: {e}", sock_path.display())))?;
     let stop = Arc::new(AtomicBool::new(false));
-    let (st2, stop2) = (store.clone(), stop.clone());
+    let drain = Arc::new(xbt_svc::shutdown::Drain::default());
+    let (st2, stop2, drain2) = (store.clone(), stop.clone(), drain.clone());
     std::thread::Builder::new().name("anchor-witness".into()).spawn(move || {
         loop {
             let conn = listener.accept();
@@ -335,12 +351,15 @@ pub fn serve_witness(store_dir: &Path, sock_path: &Path, sock_mode: u32) -> Resu
                 break;
             }
             if let Ok(conn) = conn {
-                let st = st2.clone();
-                std::thread::spawn(move || serve_conn(conn, |req| st.handle(req)));
+                let (st, d) = (st2.clone(), drain2.clone());
+                std::thread::spawn(move || serve_conn(conn, |req| match d.enter() {
+                    Some(_busy) => st.handle(req),
+                    None => Err(err("stopping", "the anchor witness is stopping")),
+                }));
             }
         }
     }).map_err(|e| err("anchor", e.to_string()))?;
-    Ok(Witness { store, sock_path: sock_path.into(), stop })
+    Ok(Witness { store, sock_path: sock_path.into(), stop, drain })
 }
 
 /// Newline-delimited JSON request/response loop over one connection.

@@ -17,6 +17,9 @@
 //! the secret `node-rpc-auth`; the wrapping key is the secret `signer-passphrase`, else
 //! `signer-wrap-key` (32 bytes, generated 0600 on first run). The signer writes its readiness to
 //! `run/signer/ready.json` every `XBT_READY_INTERVAL` seconds (default 5).
+//!
+//! SIGTERM or SIGINT stops it: no new request, the ones running and the watcher's tick get 5 s to
+//! finish, the socket is removed, exit 0.
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -217,6 +220,9 @@ fn main() {
             die(1, "refusing to start: B2_HOT_ALLOW_PLAINTEXT is for tests, refused in production mode");
         }
     }
+    // SIGTERM and SIGINT before the first thread (the signer starts some as it opens): a stop is
+    // answered at once, also as PID 1 (xbt_svc::shutdown)
+    let signals = if check { xbt_svc::shutdown::Signals::none() } else { xbt_svc::shutdown::listen().unwrap_or_else(|e| die(1, format!("signals: {e}"))) };
     let data = DataDir::from_env();
     let mut opts = SignerOptions::default();
     let root = match (root, &data) {
@@ -251,7 +257,7 @@ fn main() {
             std::thread::sleep(every);
         }).unwrap_or_else(|e| die(1, e));
     }
-    if let Err(e) = xbt_signer::server::serve(signer) {
+    if let Err(e) = xbt_signer::server::serve(signer, signals) {
         die(1, e.msg);
     }
 }

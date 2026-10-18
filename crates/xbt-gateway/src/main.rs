@@ -5,6 +5,10 @@
 //!
 //!     xbt-gateway <config.json>           run
 //!     xbt-gateway --check <config.json>   read the config and the macaroons, say what the caps cost, and exit
+//!
+//! SIGTERM or SIGINT stops a run: no new connection, the requests in flight get 5 s, then what the
+//! book has counted since the last tick goes into the journal, the journal is fsynced and closed,
+//! and the gateway exits 0. A request still running after that is cut where a kill would cut it.
 use std::net::TcpListener;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -88,6 +92,9 @@ fn run(args: &[String]) -> Result<(), String> {
     if check {
         return Ok(());
     }
+    // SIGTERM and SIGINT before the first thread (the node client and the gateway start some):
+    // a stop is answered at once, also as PID 1 (xbt_svc::shutdown)
+    let signals = xbt_svc::shutdown::listen().map_err(|e| format!("signals: {e}"))?;
     let node = LndRest::new(
         &cfg.node.rest,
         &invoice,
@@ -117,7 +124,11 @@ fn run(args: &[String]) -> Result<(), String> {
                     eprintln!("xbt-gateway: waiting for the node: {e}");
                 }
                 waited += 1;
-                std::thread::sleep(Duration::from_secs(2));
+                // nothing is open yet: a stop while waiting is just an exit
+                if let Some(sig) = signals.wait_timeout(Duration::from_secs(2)) {
+                    eprintln!("xbt-gateway: {} received while waiting for the node: stopped", xbt_svc::shutdown::name(sig));
+                    return Ok(());
+                }
             }
         }
     }
@@ -129,10 +140,16 @@ fn run(args: &[String]) -> Result<(), String> {
         gw.terms().pay_to,
         gw.terms().receipt_key
     );
-    for t in running.threads {
-        // the accept thread ends only when the process is told to stop
-        let _ = t.join();
-    }
+    let sig = signals.wait();
+    xbt_svc::shutdown::say_stopping("xbt-gateway", sig);
+    // the listener first, so that nothing new starts; then the requests in flight; then the book.
+    // Gateway::stop journals the counters the book marked since the last tick, fsyncs the journal
+    // and closes it: a request still running after the bound then writes no record (a lock that
+    // cannot journal is refused, as on a full disk), and a ticket it settled is credited at the
+    // next start from the node's word, as every ticket the gateway does not finish is
+    let drained = running.stopper().drain(xbt_svc::shutdown::DRAIN);
+    gw.stop();
+    xbt_svc::shutdown::say_stopped("xbt-gateway", drained);
     Ok(())
 }
 

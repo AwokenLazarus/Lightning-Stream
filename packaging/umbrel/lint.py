@@ -198,7 +198,7 @@ def main() -> int:
                 if "user" in s:
                     bad(f"{folder}/{name}: must run as its image's own user (no user: override; CONTAINER.md uid table)")
                 if s.get("init") is not True:
-                    bad(f"{folder}/{name}: needs init: true (the binary as PID 1 ignores SIGTERM, so a stop waits out the grace period and kills it)")
+                    bad(f"{folder}/{name}: needs init: true (the binaries stop on SIGTERM by themselves; an init still reaps and forwards for anything they start)")
                 if (s.get("depends_on") or {}).get("init", {}).get("condition") != "service_completed_successfully":
                     bad(f"{folder}/{name}: must wait for init (service_completed_successfully)")
                 allowed = {f"${{APP_DATA_DIR}}/data/{comp}:/data/{comp}"}

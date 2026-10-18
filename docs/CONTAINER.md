@@ -231,9 +231,16 @@ not been checked (reproducible builds), is in `packaging/README.md`, "Images".
   - `HEALTHCHECK` runs the binary's own `healthcheck`.
 
   Run the containers with `read_only: true`, `tmpfs: /tmp` and `no-new-privileges`.
+- **Stop:** every service binary (signer, witness, MCP over HTTP, UI, relay, gateway, `xbt-supervise`) takes
+  SIGTERM and SIGINT itself (`xbt_svc::shutdown`), so it stops at once also as PID 1, with or without an
+  init: it takes no new connection or request, gives the ones in flight 5 s, flushes what it owns (the
+  gateway journals its counters and fsyncs its journal) and exits 0. Work still running at 5 s is cut as
+  a kill would cut it, which each service survives by design: a record is durable before anything that
+  depends on it (the signer books a ticket before its secret leaves). The packages keep `init: true`
+  anyway. `scripts/container_test.sh` times a `docker stop` of each service (check Q).
 - **`xbt-supervise`** (crate `xbt-svc`): `xbt-supervise [--wait FILE]... [--watch FILE]... -- PROGRAM ARGS`
   starts PROGRAM once every `--wait` file exists and restarts it when a waited or watched file's content
-  changes (SIGTERM, then SIGKILL after 15 s); SIGTERM to it stops PROGRAM and exits 0, and PROGRAM's own exit
+  changes (SIGTERM, then SIGKILL after 15 s); SIGTERM to it stops PROGRAM at once and exits 0, and PROGRAM's own exit
   is its exit. `xbt-supervise probe URL` is a plain-http GET for a HEALTHCHECK. The gateway image's
   entrypoint is `xbt-supervise --wait /data/run/gateway/config.json --watch` (its macaroons and
   `/data/lightning/tls.cert`) `-- xbt-gateway /data/run/gateway/config.json`; the packages run the signer

@@ -9,18 +9,13 @@
 //! away. `--watch`: a FILE whose content changes (appears, goes away, is rewritten) restarts PROGRAM.
 //! Waited files are watched too. Files are compared by content every `--every` seconds (default 2).
 //! PROGRAM is stopped with SIGTERM, then SIGKILL after 15 s. SIGTERM or SIGINT to this process stops
-//! PROGRAM the same way and exits 0. When PROGRAM exits on its own, this exits with its code, so the
-//! platform's restart policy applies.
+//! PROGRAM the same way, at once (not at the next look at the files), and exits 0. When PROGRAM
+//! exits on its own, this exits with its code, so the platform's restart policy applies.
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitCode};
-use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
-static SIGNAL: AtomicI32 = AtomicI32::new(0);
-
-extern "C" fn on_signal(sig: libc::c_int) {
-    SIGNAL.store(sig, Ordering::SeqCst);
-}
+use xbt_svc::shutdown::Signals;
 
 struct Args {
     wait: Vec<PathBuf>,
@@ -73,10 +68,6 @@ fn say(msg: impl std::fmt::Display) {
     eprintln!("xbt-supervise: {msg}");
 }
 
-fn stopped() -> bool {
-    SIGNAL.load(Ordering::SeqCst) != 0
-}
-
 /// SIGTERM, then SIGKILL after 15 s.
 fn stop(child: &mut Child) {
     if let Ok(pid) = libc::pid_t::try_from(child.id()) {
@@ -90,18 +81,14 @@ fn stop(child: &mut Child) {
         if let Ok(Some(_)) = child.try_wait() {
             return;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(20));
     }
     let _ = child.kill();
     let _ = child.wait();
 }
 
-fn supervise(a: Args) -> ExitCode {
-    // SAFETY: the handler only stores into an atomic, which is async-signal-safe
-    unsafe {
-        libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
-    }
+fn supervise(a: Args, signals: Signals) -> ExitCode {
+    let stopped = || signals.received().is_some();
     let all: Vec<PathBuf> = a.wait.iter().chain(a.watch.iter()).cloned().collect();
     loop {
         // wait for every --wait file
@@ -118,7 +105,7 @@ fn supervise(a: Args) -> ExitCode {
                 say(format!("waiting for {} before starting {}", missing.join(", "), a.program[0]));
                 told = true;
             }
-            std::thread::sleep(a.every);
+            signals.wait_timeout(a.every);
         }
         let seen = snapshot(&all);
         let mut child = match Command::new(&a.program[0]).args(&a.program[1..]).spawn() {
@@ -129,7 +116,8 @@ fn supervise(a: Args) -> ExitCode {
             }
         };
         loop {
-            std::thread::sleep(a.every);
+            // a stop signal cuts the wait short; so does the child's own exit, at the next look
+            signals.wait_timeout(a.every);
             if stopped() {
                 stop(&mut child);
                 return ExitCode::SUCCESS;
@@ -192,7 +180,14 @@ fn main() -> ExitCode {
             }
         },
         _ => match parse(&args) {
-            Ok(a) => supervise(a),
+            // the signals before any thread or child exists (xbt_svc::shutdown)
+            Ok(a) => match xbt_svc::shutdown::listen() {
+                Ok(signals) => supervise(a, signals),
+                Err(e) => {
+                    say(format!("signals: {e}"));
+                    ExitCode::from(1)
+                }
+            },
             Err(e) => {
                 say(e);
                 ExitCode::from(2)
