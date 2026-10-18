@@ -30,5 +30,5 @@ implements:
 defaultUsername: ""
 defaultPassword: ""
 submitter: Lazarus
-submission: unpublished-local
-icon: ""
+submission: https://github.com/AwokenLazarus/Lightning-Stream/tree/main/packaging/umbrel
+icon: https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-xbt-knots/icon.svg

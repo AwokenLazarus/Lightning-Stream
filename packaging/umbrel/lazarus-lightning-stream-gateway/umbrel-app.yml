@@ -23,13 +23,16 @@ description: >-
   starts you with low caps.
 
 
-  Needs Lightning Fork. Unpublished and side-load only; the images stay on this box.
+  Needs Lightning Fork. Side-load only, from a community store you add; the images are the project's
+  published ones, pinned by digest.
 developer: Lazarus
 website: https://github.com/AwokenLazarus/Lightning-Stream
 repo: https://github.com/AwokenLazarus/Lightning-Stream
 support: https://github.com/AwokenLazarus/Lightning-Stream/issues
 port: 8481
-gallery: []
+gallery:
+  - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream-gateway/1.png
+  - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream-gateway/2.png
 releaseNotes: >-
   0.1.0: the stream-ticket gateway and its setup page. Local package, regtest-tested only.
 dependencies:
@@ -39,5 +42,5 @@ path: ""
 defaultUsername: ""
 deterministicPassword: true
 submitter: Lazarus
-submission: unpublished-local
-icon: ""
+submission: https://github.com/AwokenLazarus/Lightning-Stream/tree/main/packaging/umbrel
+icon: https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream-gateway/icon.svg

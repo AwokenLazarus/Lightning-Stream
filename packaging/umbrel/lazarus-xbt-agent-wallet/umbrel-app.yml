@@ -23,17 +23,17 @@ description: >-
   the Lightning page asks you to acknowledge that before it stores a macaroon.
 
 
-  Needs Lightning Fork and an XBT (BLAKE2b) node. Unpublished and side-load only; the images stay on
-  this box.
+  Needs Lightning Fork and an XBT (BLAKE2b) node. Side-load only, from a community store you add; the
+  images are the project's published ones, pinned by digest.
 developer: Lazarus
 website: https://github.com/AwokenLazarus/Lightning-Stream
 repo: https://github.com/AwokenLazarus/Lightning-Stream
 support: https://github.com/AwokenLazarus/Lightning-Stream/issues
 port: 8480
 gallery:
-  - 1.png
-  - 2.png
-  - 3.png
+  - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-xbt-agent-wallet/1.png
+  - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-xbt-agent-wallet/2.png
+  - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-xbt-agent-wallet/3.png
 releaseNotes: >-
   0.1.0: the signer, the anchor witness, the MCP server and the web UI, paying over the box's Lightning
   Fork node with stream tickets. Local package, regtest-tested only.
@@ -46,5 +46,5 @@ path: ""
 defaultUsername: ""
 deterministicPassword: true
 submitter: Lazarus
-submission: unpublished-local
-icon: ""
+submission: https://github.com/AwokenLazarus/Lightning-Stream/tree/main/packaging/umbrel
+icon: https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-xbt-agent-wallet/icon.svg

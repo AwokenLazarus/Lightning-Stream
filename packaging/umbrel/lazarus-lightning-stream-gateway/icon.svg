@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- Lightning Stream Gateway: pieces passing one at a time through a gate. Drawn for this project; no third-party marks. -->
+  <rect width="256" height="256" fill="#14532d"/>
+  <rect x="112" y="48" width="14" height="160" rx="7" fill="#f0fdf4"/>
+  <rect x="130" y="48" width="14" height="160" rx="7" fill="#f0fdf4"/>
+  <rect x="36" y="114" width="28" height="28" rx="6" fill="#86efac"/>
+  <rect x="74" y="114" width="28" height="28" rx="6" fill="#86efac"/>
+  <rect x="154" y="114" width="28" height="28" rx="6" fill="#4ade80"/>
+  <path d="M196 106 L222 128 L196 150 Z" fill="#4ade80"/>
+</svg>
