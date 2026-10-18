@@ -1,0 +1,13 @@
+# TICKET_E2E_PRUNED=1 (scripts/ticket_e2e_regtest.sh): the wallet's chain node as most node packages
+# run it, pruned and with no transaction index. The lab image's entrypoint writes prune=550 and, for
+# regtest, fastprune (small block files, so a few hundred blocks can be pruned); the command line is
+# the lab's (lightning-fork-lab a5cadc5, docker-compose.yml) with -txindex=0 in place of -txindex=1.
+services:
+  knots-b2b:
+    environment:
+      PRUNE: "550"
+      FASTPRUNE: "1"
+    command:
+      - -zmqpubrawblock=tcp://0.0.0.0:28332
+      - -zmqpubrawtx=tcp://0.0.0.0:28333
+      - -txindex=0

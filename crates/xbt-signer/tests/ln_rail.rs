@@ -51,7 +51,9 @@ fn der(sighash: u8) -> Vec<u8> {
 }
 
 /// The signer's own node (AGP-049): the fake chain, plus the blocks and transactions that fund the
-/// fake LN node's channels (`getblock` / `getrawtransaction`, as with txindex).
+/// fake LN node's channels (`getblock` / `getrawtransaction`, as with txindex). Like a real node it
+/// gives each input's `prevout` (its block's undo data) when a transaction is asked for with its block
+/// at verbosity 2; `undo` off is a node too old to. `pruned`: the heights whose blocks it no longer has.
 struct LnNode {
     chain: Arc<FakeChain>,
     name: String,
@@ -65,13 +67,40 @@ struct LnNode {
     alt_blocks: Mutex<HashMap<String, (u64, Vec<String>)>>,
     /// AGP-092: `getrawtransaction` calls so far.
     lookups: AtomicU64,
+    undo: std::sync::atomic::AtomicBool,
+    pruned: Mutex<std::collections::HashSet<u64>>,
 }
 
 impl LnNode {
     fn new(chain: &Arc<FakeChain>, name: &str) -> Arc<Self> {
         Arc::new(LnNode { chain: chain.clone(), name: name.into(), txs: Mutex::new(HashMap::new()), blocks: Mutex::new(HashMap::new()),
                           txindex: std::sync::atomic::AtomicBool::new(true), reorged: Mutex::new(HashMap::new()),
-                          alt_blocks: Mutex::new(HashMap::new()), lookups: AtomicU64::new(0) })
+                          alt_blocks: Mutex::new(HashMap::new()), lookups: AtomicU64::new(0),
+                          undo: std::sync::atomic::AtomicBool::new(true), pruned: Mutex::new(Default::default()) })
+    }
+
+    /// Prune the blocks (and their undo data) at these heights, as `pruneblockchain` does.
+    fn prune(&self, heights: impl IntoIterator<Item = u64>) {
+        self.pruned.lock().unwrap().extend(heights);
+    }
+
+    /// Each input's `prevout`, as the undo data of the block holding `tx` gives it (an input whose coin
+    /// this node never had gets none).
+    fn vin(&self, tx: &Tx) -> Vec<Value> {
+        let txs = self.txs.lock().unwrap();
+        tx.inputs.iter().map(|i| {
+            let (txid, vout) = (i.prevout.txid_hex(), i.prevout.vout);
+            let mut e = json!({"txid": txid, "vout": vout});
+            if let Some((hex, h)) = txs.get(&txid) {
+                let prev = Tx::parse_hex(hex).unwrap();
+                let coinbase = prev.inputs.len() == 1 && prev.inputs[0].prevout.txid == [0u8; 32] && prev.inputs[0].prevout.vout == 0xffff_ffff;
+                if let Some(o) = prev.outputs.get(vout as usize) {
+                    e["prevout"] = json!({"generated": coinbase, "height": h, "value": o.value as f64 / 1e8,
+                                          "scriptPubKey": {"hex": hex::encode(&o.script_pubkey)}});
+                }
+            }
+            e
+        }).collect()
     }
 
     fn height_of(&self, bh: &str) -> u64 {
@@ -157,6 +186,9 @@ impl Node for LnNode {
                 }
             }
             "getblock" => {
+                if self.pruned.lock().unwrap().contains(&self.height_of(p[0].as_str().unwrap_or(""))) {
+                    return Err(xbt402::ChannelError::new(xbt_signer::node::REFUSED, r#"{"code":-1,"message":"Block not available (pruned data)"}"#.to_string()));
+                }
                 if let Some((h, txs)) = self.alt_blocks.lock().unwrap().get(p[0].as_str().unwrap_or("")) {
                     return Ok(json!({"height": h, "tx": txs}));
                 }
@@ -169,11 +201,20 @@ impl Node for LnNode {
                 self.lookups.fetch_add(1, Ordering::SeqCst);
                 let txid = p[0].as_str().unwrap_or("");
                 let by_block = p.get(2).and_then(Value::as_str).map(|b| self.height_of(b));
-                if let Some((hex, h)) = self.txs.lock().unwrap().get(txid).cloned() {
+                if by_block.is_some_and(|b| self.pruned.lock().unwrap().contains(&b)) {
+                    return Err(xbt402::ChannelError::new(xbt_signer::node::REFUSED, r#"{"code":-1,"message":"Block not available"}"#.to_string()));
+                }
+                let known = self.txs.lock().unwrap().get(txid).cloned();
+                if let Some((hex, h)) = known {
                     if self.txindex.load(Ordering::SeqCst) || by_block == Some(h) {
-                        return Ok(json!({"txid": txid, "hex": hex, "blockhash": FakeChain::bhash(&self.name, h)}));
+                        let mut v = json!({"txid": txid, "hex": hex, "blockhash": FakeChain::bhash(&self.name, h)});
+                        if by_block == Some(h) && p[1] == 2 && self.undo.load(Ordering::SeqCst) {
+                            v["vin"] = self.vin(&Tx::parse_hex(&hex).unwrap()).into();
+                        }
+                        return Ok(v);
                     }
-                    return Err(xbt402::ChannelError::new("rpc_error", "No such mempool transaction. Use -txindex".to_string()));
+                    return Err(xbt402::ChannelError::new(xbt_signer::node::REFUSED,
+                                                         r#"{"code":-5,"message":"No such mempool transaction. Use -txindex or provide a block hash"}"#.to_string()));
                 }
             }
             _ => {}
@@ -949,14 +990,17 @@ fn funding_is_proven_from_the_transaction_not_the_nodes_flag() {
     assert!(why[2].contains("not the channel's funding") || why[2].contains("output"), "{why:?}");
     assert!(why[3].contains("the channel says 900000"), "{why:?}");
     assert_eq!(rig.ln.sent(), 0, "no HTLC through an unproven channel");
-    // our node without txindex cannot see the input: unproven now (and not cached), proven once it can
+    // a node without txindex that does not give an input's prevout (older than verbosity 2) cannot say
+    // what the input spends: unproven now (and not cached), proven once it can, here from the funding
+    // block's undo data with still no txindex
     rig.node.txindex.store(false, Ordering::SeqCst);
+    rig.node.undo.store(false, Ordering::SeqCst);
     let fresh = rig.funded(6_310, 1, "ANCHORS", true, 0x21, 6_250);
     rig.ln.set(|s| s.channels = vec![fresh.clone()]);
     let r = rig.pay(&inv, 1000);
     assert_eq!(r["rule"], "ln_no_safe_channel", "{r}");
     assert!(r["channels"][0]["refused"].as_str().unwrap().contains("txindex"), "{r}");
-    rig.node.txindex.store(true, Ordering::SeqCst);
+    rig.node.undo.store(true, Ordering::SeqCst);
     let r = rig.pay(&inv, 1000);
     assert_eq!(r["verdict"], "allow", "{r}");
     assert_eq!(rig.ln.st.lock().unwrap().sent[0].outgoing_chan_ids, vec![scid(6_310, 1)]);
@@ -967,6 +1011,190 @@ fn funding_is_proven_from_the_transaction_not_the_nodes_flag() {
     assert_eq!(f["evidence"]["inputs"][0]["sighash"], json!(["0x21"]));
     assert_eq!(f["evidence"]["inputs"][0]["height"], 6_250);
     assert_eq!(f["evidence"]["source"], "the signer's own node");
+}
+
+/// A pruned node without txindex, as most node packages run. Its blocks and their undo data are all the
+/// proof needs: the funding's block gives the funding and, in each input's `prevout`, the coin it
+/// spends (its script, height, whether a coinbase made it). The verdict is kept on disk, so once the
+/// node prunes those blocks the channel still carries payments, after a restart too; without a kept
+/// verdict the refusal names what the proof needs. A reorg still proves the channel again.
+///
+/// FAILS on aaad6da: the first payment is refused, "our node cannot find input 0's transaction ...
+/// (the signer's node needs txindex=1)", and nothing is kept on disk.
+#[test]
+fn a_pruned_node_without_txindex_proves_a_channel_and_keeps_the_verdict() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let mut rig = LnRig::new(json!({}));
+    rig.node.txindex.store(false, Ordering::SeqCst);
+    let fresh = rig.funded(6_310, 1, "ANCHORS", true, 0x21, 6_250);
+    rig.ln.set(|s| s.channels = vec![fresh.clone()]);
+    let (inv, _) = rig.invoice(100, 94, XBT);
+    let r = rig.pay(&inv, 1000);
+    assert_eq!(r["verdict"], "allow", "{r}");
+    let st = rig.call("ln_status", json!({}));
+    let f = &st["channels"][0]["funding"];
+    assert_eq!((f["proven"].as_bool(), f["evidence"]["inputs"][0]["height"].as_i64()), (Some(true), Some(6_250)), "{st}");
+    assert_eq!(f["evidence"]["xbt_only"]["pinned_by"], "a coinbase at or above the split", "{st}");
+    let kept: Value = serde_json::from_str(&std::fs::read_to_string(rig.root.join(".run").join("ln_funding.json")).unwrap()).unwrap();
+    assert_eq!(kept["rules"], xbt_signer::ln_funding::KEPT_RULES);
+    assert_eq!(kept["verdicts"].as_object().unwrap().len(), 1, "{kept}");
+    // the node prunes every block the proof read; the signer restarts and uses the kept verdict
+    rig.node.prune(0..6_700);
+    rig.restart();
+    let (inv, _) = rig.invoice(100, 95, XBT);
+    let r = rig.pay(&inv, 1000);
+    assert_eq!(r["verdict"], "allow", "{r}");
+    assert_eq!(rig.ln.st.lock().unwrap().sent.last().unwrap().outgoing_chan_ids, vec![scid(6_310, 1)]);
+    // with no kept verdict the channel is refused, and the refusal says what the proof needs
+    std::fs::remove_file(rig.root.join(".run").join("ln_funding.json")).unwrap();
+    rig.restart();
+    let (inv, _) = rig.invoice(100, 96, XBT);
+    let r = rig.pay(&inv, 1000);
+    assert_eq!(r["rule"], "ln_no_safe_channel", "{r}");
+    let why = r["channels"][0]["refused"].as_str().unwrap();
+    assert!(why.contains("pruned") && why.contains(xbt_signer::ln_funding::NEEDS), "{why}");
+    // a reorg of the funding block: the kept verdict was reached on the old block and is not used
+    rig.node.pruned.lock().unwrap().clear();
+    let st = rig.call("ln_status", json!({}));
+    assert_eq!(st["channels"][0]["funding"]["proven"], true, "{st}");
+    rig.node.reorg(6_310, Some(vec![format!("{:064x}", 1), format!("{:064x}", 2)]));
+    let st = rig.call("ln_status", json!({}));
+    assert_eq!(st["channels"][0]["funding"]["proven"], false, "{st}");
+    rig.restart();
+    let st = rig.call("ln_status", json!({}));
+    assert_eq!(st["channels"][0]["funding"]["proven"], false, "the kept verdict names the old block: {st}");
+}
+
+/// The search behind a funding on a pruned node: one pin is enough, so a branch whose block is gone does
+/// not stop the others; when none of what the node still has pins the funding, nothing is concluded.
+///
+/// FAILS on aaad6da: without txindex no input of the funding can be looked up (Unknown in both cases).
+#[test]
+fn a_pruned_branch_of_the_ancestry_does_not_hide_a_pin_in_another() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let rig = LnRig::new(json!({}));
+    rig.node.txindex.store(false, Ordering::SeqCst);
+    // input 0 spends a segwit coin whose block (6,350) is pruned; input 1 one whose block is kept, and behind it a coinbase above the split
+    let pre = Tx::new(2, vec![TxIn::new(OutPoint::new([0x35; 32], 0), 0)], vec![TxOut::new(100_000, p2wpkh(0x4f))], 5);
+    rig.node.place(&pre, 5_000, 7);
+    let old = segwit_spend(&pre, 0x21, p2wpkh(0x50));
+    rig.node.place(&old, 6_100, 7);
+    let a = segwit_spend(&old, 0x21, p2wpkh(0x51));
+    rig.node.place(&a, 6_350, 7);
+    let cb = Tx::new(2, vec![TxIn::new(OutPoint::new([0u8; 32], 0xffff_ffff), 78)], vec![TxOut::new(100_000, p2wpkh(0x52))], 0);
+    rig.node.place(&cb, 6_050, 7);
+    let b = segwit_spend(&cb, 0x21, p2wpkh(0x53));
+    rig.node.place(&b, 6_360, 7);
+    let mut f = Tx::new(2, vec![TxIn::new(OutPoint::new(a.txid_bytes(), 0), 0xffff_fffd), TxIn::new(OutPoint::new(b.txid_bytes(), 0), 0xffff_fffd)],
+                        vec![TxOut::new(100_000, funding_spk())], 0);
+    f.inputs[0].witness = vec![der(0x21), vec![0x02; 33]];
+    f.inputs[1].witness = vec![der(0x21), vec![0x02; 33]];
+    rig.node.place(&f, 6_400, 7);
+    rig.node.prune([6_350, 6_100]);
+    match verdict(&rig, &f, 6_400, 7) {
+        xbt_signer::ln_funding::Funding::Proven(ev) => {
+            assert_eq!((ev["xbt_only"]["txid"].as_str(), ev["xbt_only"]["generations"].as_u64()), (Some(cb.txid().as_str()), Some(2)), "{ev}");
+            assert_eq!(ev["inputs"][1]["height"], 6_360, "{ev}");
+        }
+        other => panic!("{other:?}"),
+    }
+    // the other branch's block is gone too: no pin in reach of what the node has, and no conclusion
+    rig.node.prune([6_360]);
+    match verdict(&rig, &f, 6_400, 7) {
+        xbt_signer::ln_funding::Funding::Unknown(why) => assert!(why.contains("could not return") && why.contains(xbt_signer::ln_funding::NEEDS), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    // and with every block kept, the pruned branch alone holds no pin: refused, as on a node with txindex
+    rig.node.pruned.lock().unwrap().clear();
+    let mut g = f.clone();
+    g.inputs.truncate(1);
+    rig.node.place(&g, 6_400, 8);
+    assert!(matches!(verdict(&rig, &g, 6_400, 8), xbt_signer::ln_funding::Funding::Refused(..)));
+}
+
+/// What a node answers is checked against the transaction: an input's `prevout` given for another
+/// outpoint, or without its script, is not used as the coin (and decides nothing, so nothing is kept).
+#[test]
+fn a_prevout_that_is_not_the_inputs_is_not_used() {
+    struct Lying(Arc<LnNode>, &'static str);
+    impl Node for Lying {
+        fn call(&self, method: &str, p: Value) -> xbt402::Result<Value> {
+            let mut v = self.0.call(method, p.clone())?;
+            if method == "getrawtransaction" && p[1] == 2 {
+                match self.1 {
+                    "outpoint" => v["vin"][0]["vout"] = 7.into(),
+                    _ => {
+                        v["vin"][0]["prevout"].as_object_mut().unwrap().remove("scriptPubKey");
+                    }
+                }
+            }
+            Ok(v)
+        }
+    }
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let rig = LnRig::new(json!({}));
+    rig.node.txindex.store(false, Ordering::SeqCst);
+    let cp = rig.node.fund(6_320, 1, 100_000, 0x21, 6_250);
+    for lie in ["outpoint", "script"] {
+        let f = xbt_signer::ln_funding::check(&Lying(rig.node.clone(), lie), &cp, scid(6_320, 1).parse().unwrap(), 100_000, 6_000);
+        assert!(matches!(&f, xbt_signer::ln_funding::Funding::Unknown(why) if why.contains("input 0")), "{lie}: {f:?}");
+    }
+}
+
+/// The kept verdicts' file is written through the four durable steps, and a crash at any of them
+/// leaves the file as it was or as it is meant to be, never torn: a reopened store holds the earlier
+/// verdict, and the new one only once the rename happened. A file that does not parse, or that
+/// other rules wrote, keeps nothing (its channels are proven again), and a record that is not whole is
+/// dropped.
+#[test]
+fn kept_verdicts_survive_a_crash_at_every_durable_step() {
+    use xbt_signer::fsx::probe;
+    use xbt_signer::ln_funding::{Funding, Kept, KEPT_FILE, KEPT_RULES};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(KEPT_FILE);
+    let (b1, b2) = ("11".repeat(32), "22".repeat(32));
+    let one = Funding::Proven(json!({"txid": "aa", "block_hash": b1}));
+    let two = Funding::Refused("signed 0x01".into(), json!({"txid": "bb", "block_hash": b2}));
+    Kept::open(&path).keep("one", &b1, &one).unwrap();
+    probe::reset();
+    let k = Kept::open(&path);
+    k.keep("two", &b2, &two).unwrap();
+    assert_eq!(probe::counts(), probe::Counts { steps: 4, writes: 1, syncs: 2, renames: 1 });
+    std::fs::remove_file(&path).unwrap();
+    Kept::open(&path).keep("one", &b1, &one).unwrap();
+    for steps in 0..4 {
+        for torn in [false, true] {
+            let k = Kept::open(&path);
+            probe::crash_at(steps, torn);
+            let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| k.keep("two", &b2, &two)));
+            probe::reset();
+            assert!(died.is_err_and(|e| e.is::<probe::Crash>()), "step {steps}");
+            let after = Kept::open(&path);
+            assert_eq!(after.get("one", &b1), Some(one.clone()), "step {steps} torn {torn}");
+            assert_eq!(after.get("two", &b2), if steps >= 3 { Some(two.clone()) } else { None }, "step {steps} torn {torn}");
+            std::fs::remove_file(&path).unwrap();
+            let _ = std::fs::remove_file(path.with_extension("tmp"));
+            Kept::open(&path).keep("one", &b1, &one).unwrap();
+        }
+    }
+    // a verdict on another block is not this block's; an unknown one is never kept
+    assert_eq!(Kept::open(&path).get("one", &b2), None);
+    assert!(Kept::open(&path).keep("x", &b1, &Funding::Unknown("node down".into())).is_err());
+    assert!(Kept::open(&path).keep("x", &b2, &one).is_err(), "reached on another block");
+    for text in ["{\"rules\": 1, \"verdicts\": {\"one\": ".to_string(), "not json".into(),
+                 json!({"rules": KEPT_RULES + 1, "verdicts": {"one": {"proven": true, "evidence": {"block_hash": b1}}}}).to_string()] {
+        std::fs::write(&path, text).unwrap();
+        assert_eq!(Kept::open(&path).get("one", &b1), None);
+    }
+    std::fs::write(&path, json!({"rules": KEPT_RULES, "verdicts": {
+        "proven_with_reason": {"proven": true, "reason": "x", "evidence": {"block_hash": b1}},
+        "no_block": {"proven": true, "evidence": {"txid": "aa"}},
+        "short_block": {"proven": true, "evidence": {"block_hash": "11"}},
+        "refused_no_reason": {"proven": false, "evidence": {"block_hash": b1}},
+        "whole": {"proven": true, "evidence": {"block_hash": b1}}}}).to_string()).unwrap();
+    let k = Kept::open(&path);
+    assert_eq!(["proven_with_reason", "no_block", "short_block", "refused_no_reason"].map(|n| k.get(n, &b1).is_some()), [false; 4]);
+    assert!(k.get("whole", &b1).is_some());
 }
 
 #[test]

@@ -139,8 +139,13 @@ Before anything reaches the router (`src/ln.rs`, `src/bolt11.rs`):
    condition is signatures are read (P2WPKH, P2SH-P2WPKH, P2PKH, `<key> CHECKSIG` or
    `m <keys> n CHECKMULTISIG` P2WSH, a taproot key path; AGP-066). LND's `unified_sigs` flag is not
    trusted for this. A verdict holds while the funding block is on the node's best chain: after a reorg
-   the channel is proven again. The signer's node needs `txindex=1` to look up the inputs; an unprovable
-   channel carries nothing;
+   the channel is proven again. The proof needs no txindex: it reads each transaction from its block
+   with `getrawtransaction <txid> 2 <block hash>`, whose inputs carry the coins they spend from the
+   block's undo data, so a pruned node proves a channel while it still has the blocks the proof reads
+   (a newly opened channel's are recent). Every final verdict is kept on disk (`.run/ln_funding.json`,
+   written before it is kept in memory) and used while its funding block stands, so the channel keeps
+   working once the node prunes them. A channel no verdict was kept for, whose blocks are gone, is
+   refused with what the proof needs; an unprovable channel carries nothing;
 5. the node's exposure: while it holds more than `ln.exposure_cap_sats` (channel local balances, HTLCs
    in flight and its on-chain coins), `ln_pay` refuses (`ln_exposure_cap`); mainnet requires a cap;
 6. the send rate: at most `ln.max_sends_per_hour` payments reach the router per hour, failed ones

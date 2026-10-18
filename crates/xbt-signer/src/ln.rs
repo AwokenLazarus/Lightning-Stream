@@ -16,7 +16,8 @@
 //!    **not taproot**, not zero-conf, funded at or above the split height, and (AGP-049) a funding
 //!    transaction proven on our own node to carry, on every input, only 0x21 signatures that the
 //!    input's script checks ([`crate::ln_funding`], AGP-066), whatever the node's `unified_sigs` flag
-//!    says; the proof is cached per funding block hash, so a reorg proves it again;
+//!    says; the proof is cached per funding block hash, so a reorg proves it again, and kept on disk,
+//!    so a pruned node goes on using a channel whose blocks it no longer has;
 //! 5. (AGP-049) the node's exposure against `exposure_cap_sats`, the send rate, its watchtowers (a
 //!    tower's chain can't be verified from LF's wtclient), its macaroon on mainnet
 //!    ([`crate::macaroon`]);
@@ -1248,19 +1249,21 @@ impl Signer {
             }
             let (cp, scid, cap) = (str_or_empty(c.get("channel_point")), u64_of(c.get("chan_id")), i64_of(c.get("capacity")));
             let key = format!("{cp}/{scid}/{cap}/{split}");
+            let mut not_kept = None;
             let f = match node::block_hash(&*self.node, scid >> 40) {
                 Err(e) => Funding::Unknown(format!("our node has no block {}: {}", scid >> 40, e.msg)),
-                Ok(bh) => {
-                    let cached = self.ln_funding.lock().unwrap_or_else(|p| p.into_inner()).get(&key).filter(|(h, _)| *h == bh).map(|(_, f)| f.clone());
-                    cached.unwrap_or_else(|| {
-                        let f = ln_funding::check(&*self.node, &cp, scid, cap, split);
-                        if f.is_final() && f.block_hash() == Some(bh.as_str()) {
-                            self.ln_funding.lock().unwrap_or_else(|p| p.into_inner()).insert(key, (bh, f.clone()));
-                        }
-                        f
-                    })
-                }
+                Ok(bh) => self.ln_funding.get(&key, &bh).unwrap_or_else(|| {
+                    let f = ln_funding::check(&*self.node, &cp, scid, cap, split);
+                    // kept on disk before it is relied on after a restart; a verdict that could not be kept holds for this call alone
+                    if f.is_final() && f.block_hash() == Some(bh.as_str()) {
+                        not_kept = self.ln_funding.keep(&key, &bh, &f).err().map(|e| e.msg);
+                    }
+                    f
+                }),
             };
+            if let Some(e) = not_kept {
+                r["funding_not_kept"] = format!("the verdict could not be written to {}: {e}", ln_funding::KEPT_FILE).into();
+            }
             let why = match f {
                 Funding::Proven(ev) => {
                     r["funding"] = json!({"proven": true, "evidence": ev});

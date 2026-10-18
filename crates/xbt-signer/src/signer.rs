@@ -216,8 +216,9 @@ pub struct Signer {
     pub ln_error: Option<String>,
     pub ln_book: LnBook,
     /// AGP-049: channel funding verdicts from our own node, per funding outpoint (final ones only).
-    /// Funding verdicts by funding, with the hash of the block each was reached on (AGP-066).
-    pub(crate) ln_funding: Mutex<HashMap<String, (String, crate::ln_funding::Funding)>>,
+    /// Funding verdicts by funding, with the hash of the block each was reached on (AGP-066), kept on
+    /// disk too, so a pruned node can still use a channel whose blocks it no longer has.
+    pub(crate) ln_funding: crate::ln_funding::Kept,
     /// Stream tickets ([`crate::ticket_rail`]): the book (opened when first needed), what kept it
     /// from coming up at start, the seed once read, and whether the node's payment list has been
     /// read to its end since this process started.
@@ -307,10 +308,11 @@ impl Signer {
             },
         };
         let ln_book = LnBook::open(&run.join("ln_payments.json"))?;
+        let ln_funding = crate::ln_funding::Kept::open(&run.join(crate::ln_funding::KEPT_FILE));
         let s = Arc::new(Self { root: root.into(), run, config: RwLock::new(config), engine, node, chain, hrp, mining, sock_path,
                                 human_pubkey: RwLock::new(human_pubkey), spend: Mutex::new(()), approval_outcomes: Mutex::new(HashMap::new()), boot_policy: raw,
                                 keystore, sigaudit, anchor, hot, legacy_channels, net: Mutex::new(None), watch_interval,
-                                ln, ln_error, ln_book, ln_funding: Mutex::new(HashMap::new()), tickets: Mutex::new(None),
+                                ln, ln_error, ln_book, ln_funding, tickets: Mutex::new(None),
                                 ticket_error: Mutex::new(None), ticket_seed: Mutex::new(None), ticket_synced: std::sync::atomic::AtomicBool::new(false),
                                 ticket_pace: crate::ticket_rail::Pace::default(),
                                 ticket_wire: opts.ticket_wire.clone().unwrap_or_else(|| Arc::new(crate::ticket_pay::UreqWire::default())),

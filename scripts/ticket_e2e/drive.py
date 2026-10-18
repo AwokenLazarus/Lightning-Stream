@@ -1183,11 +1183,129 @@ def slots() -> None:
           agrees(m), m)
 
 
-CHECKS = {"page": page, "latency": latency, "stream": stream, "slots": slots, "liar": liar, "kill": kill}
+# --- a pruned chain node without txindex ------------------------------------------------------------------
+
+PRUNED = os.environ.get("TICKET_E2E_PRUNED") == "1"
+LOTTERY_PORT = BASE + 8
+LOTTERY = f"http://127.0.0.1:{LOTTERY_PORT}"
+KEPT = f"{WALLET}/.run/ln_funding.json"
+
+
+def lottery_gateway() -> None:
+    """A third gateway beside the seller node that also offers the lottery (docs/TICKETS.md, section 9),
+    as the gateway ships it but for the piece size and the per-address caps: a 2 MiB file at 16 sat a
+    piece of 64 KiB, so a call on it wins about 8 times."""
+    with open(f"{RUN}/www/hot.bin", "wb") as f:
+        f.write(os.urandom(2 << 20))
+    cfg = {"listen": f"127.0.0.1:{LOTTERY_PORT}", "public_url": LOTTERY, "upstream": f"http://127.0.0.1:{UP_PORT}", "state_dir": f"{RUN}/state-lottery",
+           "chain": "regtest", "network": NETWORK[0],
+           "node": {"rest": f"https://127.0.0.1:{lab.PORT[SELLER]}", "tls_cert": f"{RUN}/{SELLER}.tls.cert", "macaroon": f"{RUN}/invoices.macaroon",
+                    "info_macaroon": f"{RUN}/info.macaroon"},
+           "caps": {"sessions_per_address": 0, "unpaid_per_address": 0},
+           "lottery": {"piece_bytes": 65_536, "sessions_per_address": 0, "idle_secs": 300},
+           "times": {"height_max_age_secs": 30, "tick_ms": 500},
+           "routes": [{"path": "/hot.bin", "price": {"byte_msat": 16_000, "per_bytes": 65_536}}]}
+    with open(f"{RUN}/lottery.json", "w") as f:
+        json.dump(cfg, f, indent=1)
+    with open(f"{RUN}/lottery.log", "ab") as log:
+        PROCS["lottery"] = subprocess.Popen([f"{BIN}/xbt-gateway", f"{RUN}/lottery.json"], stdout=log, stderr=log)
+    lab.wait("the lottery gateway", 60, lambda: json.loads(send("GET", "/x402/ticket/health", LOTTERY_PORT)[2])["height"] is not None, every=0.1)
+
+
+def restart_signer(drop_kept: bool = False) -> None:
+    """Stop the signer and start it again on its files (without its kept funding verdicts, with `drop_kept`)."""
+    PROCS["signer"].terminate()
+    PROCS["signer"].wait(20)
+    if drop_kept and os.path.exists(KEPT):
+        os.remove(KEPT)
+    WALLET_PROC.start()
+
+
+def funding_report() -> dict[str, Any]:
+    """The buyer channel's line in ln_status: whether its funding is proven, and why not."""
+    st = signer("ln_status")
+    ch = (st.get("channels") or [{}])[0]
+    f = ch.get("funding") or {}
+    return {"ready": st.get("ready"), "usable": ch.get("usable"), "proven": f.get("proven"), "refused": ch.get("refused"),
+            "pinned_by": (f.get("evidence") or {}).get("xbt_only", {}).get("pinned_by"), "not_kept": ch.get("funding_not_kept")}
+
+
+def pruned() -> None:
+    """The wallet against a chain node that is pruned and has no txindex, as the node packages most
+    owners run (TICKET_E2E_PRUNED=1: knots-b2b with prune=550, fastprune and txindex=0). The buyer's
+    channel was opened and proven while its blocks were recent. The node then prunes every block the
+    funding proof read, the signer restarts (its memory goes), and each way the wallet pays over
+    Lightning is tried: ln_status, ln_pay of the seller's invoice, a ticket purchase and a lottery win.
+    Last, with the kept verdict removed, what the wallet says when it cannot prove the channel. Each
+    step's outcome is a check, so a wallet that fails one still reports the rest."""
+    if not PRUNED:
+        raise LabError("the pruned check needs the pruned chain node: TICKET_E2E_PRUNED=1 scripts/ticket_e2e_regtest.sh pruned")
+    bci = json.loads(lab.chain("getblockchaininfo"))
+    idx = json.loads(lab.chain("getindexinfo"))
+    check("pruned: the wallet's chain node is pruned and keeps no transaction index", bci.get("pruned") is True and "txindex" not in idx,
+          {"pruned": bci.get("pruned"), "indexes": sorted(idx)})
+    chan = lab.channels(BUYER)[0]
+    fund_h = int(chan["chan_id"]) >> 40
+    fund_bh = lab.chain("getblockhash", str(fund_h))
+    before = funding_report()
+    check("pruned: before pruning, the buyer's channel is proven from its blocks, and the verdict is on disk", before["proven"] is True and os.path.exists(KEPT),
+          {**before, "kept_file": os.path.exists(KEPT)})
+    # the seller's node id for ln_pay, and the lottery's origin, in the policy; the lottery paid by draws
+    pk = lab.pubkey(SELLER)
+    pol = WALLET_PROC.policy()
+    pol["allowlist"] += [LOTTERY, f"ln:{pk}"]
+    pol["counterparties"][LOTTERY] = {"ln_node": pk}
+    pol["tickets"]["lottery"] = {"min_expected_wins": 0}
+    with open(f"{WALLET}/policy.json", "w") as f:
+        json.dump(pol, f, indent=1)
+    lottery_gateway()
+    # prune: the node keeps at least 288 blocks behind its tip, and fastprune's block files are small
+    stop_sessions()
+    tip = lab.mine(600, NODES)
+    pruned_to = int(lab.chain("pruneblockchain", str(tip - 300)))
+    gone = subprocess.run(["docker", "compose", "exec", "-T", "knots-b2b", "bitcoin-cli", "-datadir=/data", "-rpcuser=lab", "-rpcpassword=lab", "getblock", fund_bh],
+                          cwd=os.environ["LAB"], capture_output=True, text=True)
+    check("pruned: the node pruned the funding's block and every block below it", pruned_to > fund_h and gone.returncode != 0,
+          {"funding_height": fund_h, "pruned_to": pruned_to, "tip": tip, "getblock": (gone.stderr or gone.stdout).strip()[-120:]})
+    restart_signer()
+    after = funding_report()
+    measured("pruned_ln_status", after)
+    check("pruned: after a restart, ln_status: ready, the channel proven by the verdict kept on disk", after["ready"] is True and after["proven"] is True, after)
+    inv = lab.lncli(SELLER, "addinvoice", "--amt=1000")["payment_request"]
+    r = signer("ln_pay", {"invoice": inv, "max_sats": 1100})
+    measured("pruned_ln_pay", {k: r.get(k) for k in ("verdict", "rule", "reason", "status", "charged_sats")})
+    check("pruned: ln_pay of the seller's invoice: paid", r.get("verdict") == "allow" and r.get("status") == "SUCCEEDED",
+          {k: r.get(k) for k in ("verdict", "rule", "reason", "status")})
+    r = pay(f"{ORIGIN}/small.txt")
+    measured("pruned_ticket", {k: r.get(k) for k in ("verdict", "rule", "reason", "rail", "status", "tickets_released")})
+    check("pruned: a ticket purchase: the priced page is paid with a ticket", call_paid(r) and r.get("rail") == "ticket" and body_of(r) == PAGE, brief(r))
+    stop_sessions()
+    r = agent().tool("xbt402_pay", {"url": f"{LOTTERY}/hot.bin", "max_sats": 1000, "task": "film"})
+    if r.get("saved_to") and os.path.exists(r["saved_to"]):
+        os.remove(r["saved_to"])
+    lot = {k: r.get(k) for k in ("verdict", "rule", "reason", "rail", "status", "complete", "wins", "wins_paid", "wins_unpaid", "ended")}
+    measured("pruned_lottery", lot)
+    check("pruned: a lottery win: the file is bought by draws and every win is paid", call_paid(r) and r.get("rail") == "lottery" and r.get("complete") is True
+          and int(r.get("wins") or 0) >= 1 and r.get("wins") == r.get("wins_paid") and not r.get("wins_unpaid"), lot)
+    stop_sessions()
+    # without the kept verdict the proof cannot be made again on this node: the channel is refused, and the wallet says what it needs
+    restart_signer(drop_kept=True)
+    lost = funding_report()
+    measured("pruned_no_kept_ln_status", lost)
+    check("pruned: with no kept verdict, the channel is refused and the refusal names what the proof needs of the node",
+          lost["ready"] is False and lost["proven"] is False and "txindex=1" in str(lost["refused"]) and "pruned" in str(lost["refused"]), lost)
+    inv = lab.lncli(SELLER, "addinvoice", "--amt=1000")["payment_request"]
+    r = signer("ln_pay", {"invoice": inv, "max_sats": 1100})
+    measured("pruned_no_kept_ln_pay", {k: r.get(k) for k in ("verdict", "rule", "reason")})
+    check("pruned: with no kept verdict, ln_pay is refused before anything is sent (ln_no_safe_channel)", r.get("rule") == "ln_no_safe_channel", {k: r.get(k) for k in ("verdict", "rule", "reason")})
+
+
+CHECKS = {"page": page, "latency": latency, "stream": stream, "slots": slots, "liar": liar, "kill": kill, "pruned": pruned}
 
 
 def main() -> int:
-    names = sys.argv[1:] or list(CHECKS)
+    # with the pruned node, the pruned check; else every check that runs on the lab's own node
+    names = sys.argv[1:] or (["pruned"] if PRUNED else [n for n in CHECKS if n != "pruned"])
     unknown = [n for n in names if n not in CHECKS]
     if unknown:
         print(f"unknown check {unknown}; the checks are {' '.join(CHECKS)}", file=sys.stderr)
