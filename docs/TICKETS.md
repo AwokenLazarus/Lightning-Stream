@@ -1456,6 +1456,22 @@ when the request connects, so a name whose answer changes in between (DNS rebind
 caught by it. An owner whose lab runs sellers on its own machine or network says
 `tickets.unlisted_private: true`; the signer warns of it at start.
 
+**A seller on a LAN, a test aid** (`tickets.seller_tls`). A seller's https is checked against the
+public certificate authorities (the Mozilla roots built into the wallet), so two boxes on a LAN with
+no public name cannot test a buy. For a seller the owner names, the policy can say what to check it
+against instead: `"seller_tls": {"https://seller.lan:8443": {"ca_file": "/abs/path/lan-ca.pem"}}`
+(the certificate must chain to a CA in that PEM file and name the host the URL names) or
+`{"cert_sha256": "<64 hex>"}` (exactly that certificate, by the SHA-256 of its DER; its names and
+dates are not read, its handshake signature is). The entry is used only while that origin is on
+the allowlist, and it replaces the public authorities for that seller rather than adding to them.
+A seller the owner has not named is reached over https with the public authorities only, whatever
+the entry says; an entry that does not parse is not used. The risk: whoever holds that CA's key, or
+that certificate's key, can stand in for the seller and take what the policy lets the wallet pay
+it, and whoever can write the CA file can choose who that is. Keep the file where only the signer
+can write it (its own data dir), prefer the pin, and remove the entry after the test. The signer
+warns of the entry at start, and the policy page shows the warning when the owner signs it; an
+entry for an origin off the allowlist, which is never used, is warned of the same way.
+
 **A paid request, in order.**
 
 1. The unpaid request, and the 402's ticket entry, read strictly (section 1). An open session

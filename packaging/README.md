@@ -306,7 +306,9 @@ They cannot, yet:
 - start on StartOS beside Lightning Fork: StartOS mounts a dependency's directory only, never one file, and
   Lightning Fork keeps tls.cert at the root of its volume beside its macaroons (`DESIGN.md`, section 6);
 - buy from a gateway on the same box, except through the test profile's shared loopback (Umbrel): the wallet
-  pays tickets over https with a publicly trusted certificate, or to its own machine;
+  pays tickets over https with a publicly trusted certificate, or to its own machine (for a test between
+  two boxes on a LAN, a seller the owner names can be checked against its own certificate instead:
+  `tickets.seller_tls`, `DESIGN.md` section 3);
 - be installed from a store by an outside tester without that tester hosting the store: the images are
   public on ghcr.io, but the store is a git repository the tester serves (bundle.sh's README.txt). No box
   has yet installed the apps with the images pulled from ghcr.io: the real-box run used a registry on loopback;

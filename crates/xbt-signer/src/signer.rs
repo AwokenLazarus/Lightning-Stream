@@ -289,7 +289,8 @@ impl Signer {
         if let Some(n) = legacy_channels.notice() {
             eprintln!("xbt-signer: {}", n["what_to_do"].as_str().unwrap_or_default());
         }
-        for w in crate::policy::validate_policy(&raw).1.iter().filter(|w| w.contains("on-chain channel")) {
+        // and the test aid for sellers on a LAN, which the owner should not forget is on
+        for w in crate::policy::validate_policy(&raw).1.iter().filter(|w| w.contains("on-chain channel") || w.contains("tickets.seller_tls")) {
             eprintln!("xbt-signer: {w}");
         }
         // tickets on, on mainnet, without the owner's acknowledgement: off, and said so at start as well as on each refusal

@@ -270,7 +270,7 @@ impl Signer {
         // the seller's side: its name for the session, the session key and the anchor of its chain
         let body = json!({"version": lottery::VERSION, "winMsat": win_msat.to_string()}).to_string().into_bytes();
         let url = format!("{}/open", ds.base);
-        let ans = match self.ticket_wire.send("POST", &url, &body, &[("Content-Type".into(), "application/json".into())], Self::ticket_read_timeout(&self.ticket_policy())) {
+        let ans = match self.wire("POST", &url, &body, &[("Content-Type".into(), "application/json".into())], Self::ticket_read_timeout(&self.ticket_policy())) {
             Ok(a) => a,
             Err(e) => return Err(give_up(format!("the seller gave no answer to the open: {}", e.msg))),
         };
@@ -320,7 +320,7 @@ impl Signer {
         if json_body {
             headers.push(("Content-Type".into(), "application/json".into()));
         }
-        let sent = self.ticket_wire.send(method, url, body, &headers, timeout);
+        let sent = self.wire(method, url, body, &headers, timeout);
         // the seq is used up once the request has left, answered or not
         link.next_seq = seq.saturating_add(1);
         let ans = sent?;

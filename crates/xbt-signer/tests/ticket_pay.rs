@@ -37,6 +37,7 @@ use xbt_signer::ln::{HeldSend, LnBackend, SendRequest};
 use xbt_signer::node::Node;
 use xbt_signer::signer::{Signer, SignerOptions};
 use xbt_signer::ticket::TAG_RECORD;
+use xbt_signer::ticket::SellerTls;
 use xbt_signer::ticket_pay::{TicketWire, UreqWire, WireAnswer};
 use xbt_svc::http::{serve_with, Handler, Limits, Reply, Request, Response, Running, Streamed};
 
@@ -658,9 +659,17 @@ struct Tap {
     inner: UreqWire,
     hook: Mutex<Option<Hook>>,
     log: Mutex<Vec<Seen>>,
+    /// The certificate trust each request was sent with, by URL (`None`: the public authorities).
+    trust: Mutex<Vec<(String, Option<SellerTls>)>>,
 }
 
 impl TicketWire for Tap {
+    fn send_with(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)], read_timeout: Duration, tls: Option<&SellerTls>)
+                 -> xbt402::Result<WireAnswer> {
+        self.trust.lock().unwrap().push((url.to_string(), tls.cloned()));
+        self.send(method, url, body, headers, read_timeout)
+    }
+
     fn send(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)], read_timeout: Duration) -> xbt402::Result<WireAnswer> {
         let path = url.splitn(4, '/').nth(3).map(|p| format!("/{p}")).unwrap_or_default();
         let seen = Seen { method: method.into(), path, body: String::from_utf8_lossy(body).into_owned(), paid: headers.iter().any(|(k, _)| k == "PAYMENT-SIGNATURE") };
@@ -1081,6 +1090,32 @@ fn an_unnamed_seller_at_a_private_address_or_over_plain_http_is_sent_nothing() {
     // a named seller on this machine is the owner's choice, and is paid as before
     let named = Rig::new(json!({}));
     assert_eq!(named.pay("/page/10", 10)["status"], 200);
+}
+
+/// A seller on a LAN (`tickets.seller_tls`): the owner's CA file or pinned certificate is what a
+/// request to a seller it names is checked against, and never a seller it has not named, even one
+/// with an entry, which keeps the public certificate authorities only. The wire's own use of the
+/// entry over real TLS is `tests/seller_tls.rs`.
+///
+/// FAILS before the setting: every request went out with the public authorities, so a seller on a
+/// LAN with its own certificate could not be paid.
+#[test]
+fn a_sellers_own_certificate_is_used_for_a_seller_the_owner_names_and_for_no_other() {
+    let _g = env_lock();
+    let (lan, plain, stranger) = ("https://seller.lan:8443", "https://named.lan", "https://stranger.lan");
+    let pin = "ab".repeat(32);
+    let r = Rig::build(json!({"allowlist": [PROVIDER, lan, plain],
+                              "tickets": {"unlisted_private": true, "seller_tls": {lan: {"cert_sha256": pin}, stranger: {"ca_file": "/etc/lan-ca.pem"}}}}), false);
+    // the sellers answer without a 402: nothing is paid, and the request's trust is what is looked at
+    r.tap.set(Box::new(|_, _| Some(Ok(answer(200, vec![], b"free".to_vec())))));
+    for (url, task) in [(lan, "film"), (plain, "film"), (stranger, "swarm")] {
+        let v = r.call("xbt402_pay", json!({"url": format!("{url}/page"), "max_sats": 10, "task": task}));
+        assert_eq!((v["verdict"].as_str(), v["status"].as_u64()), (Some("allow"), Some(200)), "{url}: {v}");
+    }
+    let trust = r.tap.trust.lock().unwrap().clone();
+    let pinned: [u8; 32] = hex::decode(&pin).unwrap().try_into().unwrap();
+    assert_eq!(trust, vec![(format!("{lan}/page"), Some(SellerTls::CertSha256(pinned))), (format!("{plain}/page"), None), (format!("{stranger}/page"), None)],
+               "the named seller's own certificate, the public authorities for a named seller with no entry and for an unnamed one with one");
 }
 
 #[test]
