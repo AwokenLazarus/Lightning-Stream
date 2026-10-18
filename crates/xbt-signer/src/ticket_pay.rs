@@ -45,7 +45,7 @@ use crate::policy::normalize_dest;
 use crate::pyjson::{py_int, str_or_empty};
 use crate::sanitize::{untrusted, UNTRUSTED_KEY};
 use crate::signer::{deny, with, Signer};
-use crate::ticket::{sats_ceil, Admit, SState, SellerSession, Terms, TicketPolicy, HOLD_SHORT, ROUTE_FULL};
+use crate::ticket::{sats_ceil, Admit, SState, SellerSession, SellerTls, Terms, TicketPolicy, HOLD_SHORT, ROUTE_FULL};
 use crate::ticket_http::{offers, Account, Due, Offer, PayTerms, Price, Receipt};
 use crate::{err, Result};
 
@@ -110,23 +110,132 @@ impl WireAnswer {
 /// body left to be read. No redirect is followed.
 pub trait TicketWire: Send + Sync {
     fn send(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)], read_timeout: Duration) -> Result<WireAnswer>;
+
+    /// [`TicketWire::send`], with an https seller's certificate checked against `tls` in place of
+    /// the public certificate authorities (`None`: the public ones). The signer passes `Some` only
+    /// for a seller the owner names, with an entry in `tickets.seller_tls` ([`Signer`]'s
+    /// `seller_tls_for`). A wire that cannot do this keeps the public ones: stricter, never wider.
+    fn send_with(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)], read_timeout: Duration, tls: Option<&SellerTls>)
+                 -> Result<WireAnswer> {
+        let _ = tls;
+        self.send(method, url, body, headers, read_timeout)
+    }
 }
 
 /// [`TicketWire`] over ureq. No overall deadline (an answer may be long); a connect, a read and a
 /// write each have one.
 #[derive(Default)]
 pub struct UreqWire {
-    agents: Mutex<HashMap<u64, ureq::Agent>>,
+    /// By read timeout, and the trust: "" the public authorities (ureq's own, the Mozilla roots),
+    /// else what [`seller_tls_key`] says of a `tickets.seller_tls` entry as it is now.
+    agents: Mutex<HashMap<(u64, String), ureq::Agent>>,
+}
+
+/// A TLS verifier that accepts exactly one certificate, by the SHA-256 of its DER (a seller's own
+/// self-signed one on a LAN). The handshake signature is still verified with the certificate's key.
+#[derive(Debug)]
+struct PinnedSha256 {
+    pin: [u8; 32],
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedSha256 {
+    fn verify_server_cert(&self, end_entity: &rustls::pki_types::CertificateDer<'_>, _i: &[rustls::pki_types::CertificateDer<'_>],
+                          _n: &rustls::pki_types::ServerName<'_>, _o: &[u8], _now: rustls::pki_types::UnixTime)
+                          -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let got: [u8; 32] = Sha256::digest(end_entity.as_ref()).into();
+        if got == self.pin {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General("the seller's certificate is not the one the owner pinned (tickets.seller_tls)".into()))
+        }
+    }
+
+    fn verify_tls12_signature(&self, m: &[u8], c: &rustls::pki_types::CertificateDer<'_>, d: &rustls::DigitallySignedStruct)
+                              -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(m, c, d, &self.provider.signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(&self, m: &[u8], c: &rustls::pki_types::CertificateDer<'_>, d: &rustls::DigitallySignedStruct)
+                              -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(m, c, d, &self.provider.signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// Every certificate in a PEM text, as DER.
+fn pem_certs(pem: &str) -> Vec<Vec<u8>> {
+    use base64::Engine as _;
+    pem.split("-----BEGIN CERTIFICATE-----").skip(1).filter_map(|b| {
+        let body = &b[..b.find("-----END CERTIFICATE-----")?];
+        base64::engine::general_purpose::STANDARD.decode(body.chars().filter(|c| !c.is_whitespace()).collect::<String>()).ok()
+    }).collect()
+}
+
+/// A `tickets.seller_tls` entry as it is now: the CA file's certificates (read again for every
+/// request, so that a changed file is what the next request uses), or the pin. The cache key, and
+/// the certificates to trust.
+fn seller_tls_key(tls: &SellerTls) -> Result<(String, Vec<Vec<u8>>)> {
+    match tls {
+        SellerTls::CaFile(p) => {
+            let pem = std::fs::read_to_string(p).map_err(|e| err("seller_tls", format!("the owner's CA file for this seller ({}): {e}", p.display())))?;
+            let certs = pem_certs(&pem);
+            if certs.is_empty() {
+                return Err(err("seller_tls", format!("the owner's CA file for this seller ({}) holds no PEM certificate", p.display())));
+            }
+            Ok((format!("ca:{}", hex::encode(Sha256::digest(certs.concat()))), certs))
+        }
+        SellerTls::CertSha256(pin) => Ok((format!("pin:{}", hex::encode(pin)), vec![])),
+    }
+}
+
+/// The TLS client config for a named seller's entry: its CA file's certificates as the only roots,
+/// or the one pinned certificate.
+fn seller_tls_config(tls: &SellerTls, roots: Vec<Vec<u8>>) -> Result<Arc<rustls::ClientConfig>> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let b = rustls::ClientConfig::builder_with_provider(provider.clone()).with_safe_default_protocol_versions()
+        .map_err(|e| err("seller_tls", e.to_string()))?;
+    let cfg = match tls {
+        SellerTls::CaFile(_) => {
+            let mut store = rustls::RootCertStore::empty();
+            for der in roots {
+                store.add(rustls::pki_types::CertificateDer::from(der)).map_err(|e| err("seller_tls", format!("the owner's CA file for this seller: {e}")))?;
+            }
+            b.with_root_certificates(store).with_no_client_auth()
+        }
+        SellerTls::CertSha256(pin) => b.dangerous().with_custom_certificate_verifier(Arc::new(PinnedSha256 { pin: *pin, provider })).with_no_client_auth(),
+    };
+    Ok(Arc::new(cfg))
 }
 
 impl TicketWire for UreqWire {
     fn send(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)], read_timeout: Duration) -> Result<WireAnswer> {
+        self.send_with(method, url, body, headers, read_timeout, None)
+    }
+
+    fn send_with(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)], read_timeout: Duration, tls: Option<&SellerTls>)
+                 -> Result<WireAnswer> {
         // ureq parses the string again, so it is given only what `request_url` read
         let url = sendable_url(url)?;
         let secs = read_timeout.as_secs().clamp(1, 3600);
-        let agent = lock(&self.agents).entry(secs).or_insert_with(|| {
-            ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(secs)).timeout_write(Duration::from_secs(secs))
-                .redirects(0).build()
+        let (key, roots) = match tls {
+            Some(t) => seller_tls_key(t)?,
+            None => (String::new(), vec![]),
+        };
+        let tls_config = match tls {
+            Some(t) if !lock(&self.agents).contains_key(&(secs, key.clone())) => Some(seller_tls_config(t, roots)?),
+            _ => None,
+        };
+        let agent = lock(&self.agents).entry((secs, key)).or_insert_with(|| {
+            let b = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(secs)).timeout_write(Duration::from_secs(secs))
+                .redirects(0);
+            match tls_config {
+                Some(c) => b.tls_config(c).build(),
+                None => b.build(),
+            }
         }).clone();
         let mut req = agent.request(method, &url).set("Accept-Encoding", "identity");
         for (k, v) in headers {
@@ -492,6 +601,25 @@ impl Signer {
         }
     }
 
+    /// What a request to `url` checks the seller's https against: the owner's `tickets.seller_tls`
+    /// entry for its origin while that origin is on the allowlist (a named seller), and otherwise
+    /// nothing but the public certificate authorities (`None`). Asked before every request, as
+    /// [`Signer::ticket_may_reach`] is: a seller taken off the list loses its entry with it.
+    pub(crate) fn seller_tls_for(&self, url: &str) -> Option<SellerTls> {
+        let origin = normalize_dest(&origin_of(url).ok()?);
+        if !origin.starts_with("https://") || !self.engine.allowlist().contains(&origin) {
+            return None;
+        }
+        self.ticket_policy().seller_tls.get(&origin).cloned()
+    }
+
+    /// Every request this module sends to a seller: [`TicketWire::send_with`] with
+    /// [`Signer::seller_tls_for`] its URL.
+    pub(crate) fn wire(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)], read_timeout: Duration) -> Result<WireAnswer> {
+        let tls = self.seller_tls_for(url);
+        self.ticket_wire.send_with(method, url, body, headers, read_timeout, tls.as_ref())
+    }
+
     /// Whether the owner's policy, as it is now, lets a request leave for `origin` under `task`: the
     /// origin is on the allowlist, or the task pays any seller. Asked before every request this
     /// module sends: the first of a call, and each one of a session after it, so that a seller the
@@ -558,7 +686,7 @@ impl Signer {
             (Ok(l), Ok(c)) => (l, c),
             (Err(e), _) | (_, Err(e)) => return deny("xbt402", e.msg),
         };
-        let probe = match self.ticket_wire.send(&method, &url, &raw, &[], Self::ticket_read_timeout(&tp)) {
+        let probe = match self.wire(&method, &url, &raw, &[], Self::ticket_read_timeout(&tp)) {
             Ok(a) => a,
             Err(e) => return deny("xbt402", format!("the seller gave no answer: {}", e.msg)),
         };
@@ -690,7 +818,7 @@ impl Signer {
         let header = b64json(&payment_payload(acc, &json!({"preimage": paid["preimage"]})));
         let mut out = with(json!({"verdict": "allow", "rule": "ok", "rail": "ln"}),
                            json!({"charged_sats": paid["charged_sats"], "payment_hash": paid["payment_hash"], "dest": paid["dest"], "fee_msat": paid["fee_msat"]}));
-        match self.ticket_wire.send(c.method, c.url, c.body, &[("PAYMENT-SIGNATURE".into(), header)], Self::ticket_read_timeout(tp)) {
+        match self.wire(c.method, c.url, c.body, &[("PAYMENT-SIGNATURE".into(), header)], Self::ticket_read_timeout(tp)) {
             Ok(ans) => {
                 out["status"] = ans.status.into();
                 let mut sink = Sink::new();
@@ -1016,7 +1144,7 @@ impl Signer {
         }
         let url = format!("{}/lock", hs.base);
         let raw = body.to_string().into_bytes();
-        let sent = self.ticket_wire.send("POST", &url, &raw, &[("Content-Type".into(), "application/json".into())], Self::ticket_read_timeout(&self.ticket_policy()));
+        let sent = self.wire("POST", &url, &raw, &[("Content-Type".into(), "application/json".into())], Self::ticket_read_timeout(&self.ticket_policy()));
         let (status, v) = match sent.and_then(|a| Ok((a.status, a.read_small(SMALL_BODY)?))) {
             Ok((status, raw)) => (status, serde_json::from_slice::<Value>(&raw).unwrap_or(Value::Null)),
             Err(e) => return Err(refusal("ticket_seller", format!("the seller gave no answer to the first lock: {}", e.msg))),
@@ -1122,7 +1250,7 @@ impl Signer {
             let (seq, digest) = (link.next_seq, request_digest_v2("POST", &url, &raw));
             let auth = xbt402::ticket::request_auth(&link.key, &link.seller_sid, seq, "", "", &digest);
             let header = b64json(&payment_payload(&hs.terms.accepted, &json!({"session": link.seller_sid, "seq": seq, "auth": auth})));
-            let ans = self.ticket_wire.send("POST", &url, &raw, &[("Content-Type".into(), "application/json".into()), ("PAYMENT-SIGNATURE".into(), header)], timeout)?;
+            let ans = self.wire("POST", &url, &raw, &[("Content-Type".into(), "application/json".into()), ("PAYMENT-SIGNATURE".into(), header)], timeout)?;
             // the seq is used up once the request has left, answered or not
             link.next_seq = seq.saturating_add(1);
             let (status, payment_response) = (ans.status, ans.header("PAYMENT-RESPONSE").map(str::to_string));
@@ -1467,7 +1595,7 @@ impl Signer {
             let (seq, digest) = (link.next_seq, request_digest_v2(c.method, c.url, c.body));
             let auth = xbt402::ticket::request_auth(&link.key, &link.seller_sid, seq, "", "", &digest);
             let header = b64json(&payment_payload(&hs.terms.accepted, &json!({"session": link.seller_sid, "seq": seq, "auth": auth})));
-            let ans = match self.ticket_wire.send(c.method, c.url, c.body, &[("PAYMENT-SIGNATURE".into(), header)], Self::ticket_read_timeout(&tp)) {
+            let ans = match self.wire(c.method, c.url, c.body, &[("PAYMENT-SIGNATURE".into(), header)], Self::ticket_read_timeout(&tp)) {
                 Ok(a) => a,
                 // no secret travels with a request, so a lost answer costs what the seller charged the balance, if anything
                 Err(e) => {
@@ -1866,7 +1994,7 @@ impl Signer {
                 let digest = request_digest_v2("POST", &url, &raw);
                 let auth = xbt402::ticket::request_auth(&http.key, &http.id, seq, "", "", &digest);
                 let header = b64json(&payment_payload(&accepted, &json!({"session": http.id, "seq": seq, "auth": auth})));
-                let Ok(ans) = self.ticket_wire.send("POST", &url, &raw, &[("Content-Type".into(), "application/json".into()), ("PAYMENT-SIGNATURE".into(), header)],
+                let Ok(ans) = self.wire("POST", &url, &raw, &[("Content-Type".into(), "application/json".into()), ("PAYMENT-SIGNATURE".into(), header)],
                                                     Duration::from_secs(10)) else { break };
                 let status = ans.status;
                 let v: Value = ans.read_small(SMALL_BODY).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);

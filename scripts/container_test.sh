@@ -4,7 +4,7 @@
 # scripts/oci_inspect.py, then runs scripts/container/container_test.py: signer + witness + MCP and the
 # gateway, configured only by env and a data dir, beside a Lightning Fork regtest lab (packaging/ln_lab.py);
 # the agent's MCP over HTTP and the hot key's custody; a paid buy over stream tickets; kill/restart
-# persistence; /readyz gating. Ports 23700-23799 (published on 127.0.0.1 only: MCP 23710, the lab nodes'
+# persistence; /readyz gating; a timed docker stop of each service (exit 0 within 5 s of SIGTERM). Ports 23700-23799 (published on 127.0.0.1 only: MCP 23710, the lab nodes'
 # REST 23750-23751). Soak rules: cargo under CPUQuota 200%, MemoryMax 4G, nice 19, -j2.
 # Evidence: run/container-test/<stamp>/.
 #   scripts/container_test.sh [--skip-build]      CONTAINER_TEST_KEEP=1 keeps the volumes

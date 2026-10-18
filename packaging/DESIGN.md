@@ -84,6 +84,13 @@ certificate authorities (the Mozilla roots built into it). The gateway enforces 
 other side: it refuses to listen on a non-loopback address unless `public_url` is an https origin.
 So a seller needs an https name with a publicly trusted certificate in front of the gateway.
 
+For a test between two boxes on a LAN, the owner can name the seller on the allowlist and give the
+wallet the seller's own certificate to check it against, by its SHA-256 or by a CA file
+(`tickets.seller_tls` in the signed policy, `docs/TICKETS.md`). It is a test aid with a risk
+(whoever holds that certificate's key stands in for the seller), and only for a named seller: an
+unnamed seller is reached over https with public certificates only. The seller still runs a TLS
+proxy in front of the gateway, with that certificate, and sets the gateway's public URL to it.
+
 - **StartOS:** the gateway's buyer interface is a StartOS interface; the owner adds a public domain
   to it (StartOS 0.4 issues the certificate with ACME through a gateway or a port forward) and types
   that origin as the public URL. LAN-only by default; nothing is public until the owner does this.

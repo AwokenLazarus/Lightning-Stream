@@ -300,7 +300,12 @@ def main():
     # --- R: restart the app (umbrelOS: stop + start, or a reboot) -----------------------------------------------
     log("== R: restart the wallet app")
     time.sleep(6)  # one anchor interval
+    t0 = time.monotonic()
     compose(WALLET, "stop")
+    took = round(time.monotonic() - t0, 2)
+    exits = {n: docker("inspect", "-f", "{{.State.ExitCode}}", cname(WALLET, n)).stdout.strip() for n in ("witness", "signer", "mcp", "ui")}
+    check("R", f"the app stops in {took} s (pass line 5 s), each service exiting 0 on SIGTERM", took < 5 and all(c == "0" for c in exits.values()),
+          {"seconds": took, "exit": exits})
     compose(WALLET, "up", "-d")
     wait_until(lambda: status(f"http://127.0.0.1:{P_MCP}/readyz") == 200, 180, "MCP /readyz after the restart")
     rep2 = json.loads(docker("logs", cname(WALLET, "init")).stdout.strip().splitlines()[-1])

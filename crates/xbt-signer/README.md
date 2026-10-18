@@ -254,6 +254,10 @@ fewer are left), `pool_many` (1, with each seller of a task that has more than `
 (`"session"`, the default: a ticket session is one payment for `velocity_max`; `"release"`: every
 release is one). These defaults changed on 2026-10-13 (they were 8, 2, 8, 64 and `"release"`, with 64
 tickets and 16,000 sat locked in all): a policy that sets none of them now means the new ones.
+`seller_tls` (none): a test aid for a seller on a LAN, by https origin, `{"ca_file": "/abs/path.pem"}` or
+`{"cert_sha256": "<64 hex>"}`, what that seller's certificate is checked against in place of the public
+certificate authorities; used only while the origin is on the allowlist, never for a seller the owner has
+not named (`docs/TICKETS.md`, "A seller on a LAN", for its risk).
 
 Whatever the policy says, before every lock the signer reads its node's channel list and holds a ticket
 only if it is not below the dust limit of a channel it may leave on (`ticket_dust`) and if, with it, the

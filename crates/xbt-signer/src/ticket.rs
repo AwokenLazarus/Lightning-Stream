@@ -369,6 +369,13 @@ pub struct TicketPolicy {
     /// address, and over plain http: for a lab whose sellers run on this machine or its network.
     /// Off unless `tickets.unlisted_private` is `true` exactly.
     pub unlisted_private: bool,
+    /// A test aid (`tickets.seller_tls`): for a seller the owner names, the certificate its https is
+    /// checked against in place of the public certificate authorities, so that two boxes on a LAN
+    /// can test a buy without a public name. Used only while the origin is on the allowlist
+    /// ([`crate::signer::Signer`]'s `seller_tls_for`); a seller the owner has not named is always
+    /// reached with the public authorities only. An entry that does not parse is left out (the
+    /// seller is then checked against the public authorities) and is an error in [`validate`].
+    pub seller_tls: BTreeMap<String, SellerTls>,
     /// `tickets.mainnet_ack` is [`xbt402::ticket::MAINNET_ACK`], word for word. On mainnet the
     /// rail is off without it ([`TicketPolicy::for_chain`]).
     pub mainnet_ack: bool,
@@ -389,8 +396,44 @@ impl Default for TicketPolicy {
                max_new_sellers_per_min: 30, max_sends_per_hour: 1_200, pool: POOL_FEW as i64, pool_many: POOL_MANY as i64,
                many_sellers: MANY_SELLERS as i64, floor_ticket_sats: (FLOOR_MSAT / 1000) as i64, velocity: Velocity::Session,
                http_idle_s: HTTP_IDLE_S, ready_wait_ms: READY_WAIT_MS, read_timeout_s: READ_TIMEOUT_S, max_answer_s: MAX_ANSWER_S, feerate_cap_sat_per_kw: 0,
-               lottery: crate::lottery::LotteryPolicy::default(), unlisted_private: false, mainnet_ack: false, mainnet_off: None, tasks: BTreeMap::new() }
+               lottery: crate::lottery::LotteryPolicy::default(), unlisted_private: false, seller_tls: BTreeMap::new(), mainnet_ack: false, mainnet_off: None,
+               tasks: BTreeMap::new() }
     }
+}
+
+/// What a named seller's https is checked against, by the owner's word (`tickets.seller_tls`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SellerTls {
+    /// `{"ca_file": "/abs/path.pem"}`: the certificate authorities in this PEM file, and no other.
+    /// The seller's certificate must chain to one of them and name the host the URL names.
+    CaFile(std::path::PathBuf),
+    /// `{"cert_sha256": "<64 hex>"}`: exactly the certificate whose DER has this SHA-256 (a
+    /// self-signed one, say); its names and dates are not read, its handshake signature is.
+    CertSha256([u8; 32]),
+}
+
+impl SellerTls {
+    /// One entry of `tickets.seller_tls`: exactly one of the two keys, well formed.
+    pub fn parse(v: &Value) -> std::result::Result<Self, String> {
+        let m = v.as_object().ok_or("must be an object: {\"ca_file\": PATH} or {\"cert_sha256\": HEX}")?;
+        match (m.get("ca_file"), m.get("cert_sha256"), m.len()) {
+            (Some(Value::String(p)), None, 1) if std::path::Path::new(p).is_absolute() => Ok(Self::CaFile(p.into())),
+            (Some(_), None, 1) => Err("ca_file must be an absolute path to a PEM file of certificates".into()),
+            (None, Some(Value::String(h)), 1) => {
+                let b = hex::decode(h.trim()).ok().filter(|b| b.len() == 32).ok_or("cert_sha256 must be 64 hex characters (the SHA-256 of the certificate's DER)")?;
+                Ok(Self::CertSha256(b.try_into().map_err(|_| "cert_sha256")?))
+            }
+            _ => Err("exactly one key: ca_file or cert_sha256".into()),
+        }
+    }
+}
+
+/// The `tickets.seller_tls` keys that are an https origin (`https://host[:port]`, nothing after it),
+/// as the allowlist spells them ([`crate::policy::normalize_dest`]). `None`: not one.
+pub fn seller_tls_origin(k: &str) -> Option<String> {
+    let o = crate::policy::normalize_dest(k);
+    let netloc = o.strip_prefix("https://")?;
+    (!netloc.is_empty() && !netloc.contains('@') && o.len() == k.trim().trim_end_matches('/').len()).then_some(o)
 }
 
 /// The environment variable that names a file holding the owner's mainnet acknowledgement (what
@@ -458,6 +501,9 @@ impl TicketPolicy {
                            },
                            // a widening: only the literal true turns it on
                            unlisted_private: m.get("unlisted_private") == Some(&Value::Bool(true)),
+                           // a widening for the sellers named in it: only well-formed entries for https origins
+                           seller_tls: m.get("seller_tls").and_then(Value::as_object).into_iter().flatten()
+                               .filter_map(|(k, v)| Some((seller_tls_origin(k)?, SellerTls::parse(v).ok()?))).collect(),
                            mainnet_ack: m.get("mainnet_ack").and_then(Value::as_str) == Some(xbt402::ticket::MAINNET_ACK), mainnet_off: None,
                            tasks: BTreeMap::new() };
         for (name, t) in m.get("tasks").and_then(Value::as_object).into_iter().flatten() {
@@ -537,7 +583,7 @@ pub fn validate(raw: &Value, errors: &mut Vec<String>, warnings: &mut Vec<String
     };
     ints(m, &TICKET_INT_KEYS, "tickets", errors);
     for k in m.keys() {
-        if !["enabled", "tasks", "velocity", "lottery", "unlisted_private", "mainnet_ack"].contains(&k.as_str()) && !TICKET_INT_KEYS.contains(&k.as_str()) {
+        if !["enabled", "tasks", "velocity", "lottery", "unlisted_private", "seller_tls", "mainnet_ack"].contains(&k.as_str()) && !TICKET_INT_KEYS.contains(&k.as_str()) {
             warnings.push(format!("policy.json tickets.{k}: unknown key (the signer ignores it)"));
         }
     }
@@ -560,6 +606,26 @@ pub fn validate(raw: &Value, errors: &mut Vec<String>, warnings: &mut Vec<String
         Some(Value::Bool(true)) => warnings.push("policy.json tickets.unlisted_private is true: a task that admits any seller may send requests to private, \
                                                   loopback and link-local addresses, and over plain http. For a lab only".into()),
         Some(_) => errors.push("policy.json tickets.unlisted_private: must be true or false".into()),
+    }
+    match m.get("seller_tls") {
+        None | Some(Value::Null) => {}
+        Some(Value::Object(e)) => {
+            for (k, v) in e {
+                if seller_tls_origin(k).is_none() {
+                    errors.push(format!("policy.json tickets.seller_tls[{k}]: not an https origin (https://host[:port], nothing after it)"));
+                }
+                if let Err(why) = SellerTls::parse(v) {
+                    errors.push(format!("policy.json tickets.seller_tls[{k}]: {why}"));
+                }
+            }
+            if !e.is_empty() {
+                warnings.push("policy.json tickets.seller_tls is set: a test aid. For each seller named there (and on the allowlist), the wallet \
+                               trusts that CA file or that one certificate in place of the public certificate authorities. Whoever holds the CA's key, or \
+                               that certificate's, can stand in for the seller and take what the policy lets the wallet pay it; keep the file where only \
+                               the signer can write it, and remove the entry after the test".into());
+            }
+        }
+        Some(_) => errors.push("policy.json tickets.seller_tls: must be an object of https origin -> {\"ca_file\": PATH} or {\"cert_sha256\": HEX}".into()),
     }
     let p = TicketPolicy::from_map(m);
     if p.pool == 0 || p.pool_many == 0 {

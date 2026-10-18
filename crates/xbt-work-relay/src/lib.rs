@@ -514,6 +514,21 @@ pub struct Running {
     pub public: SocketAddr,
     pub push: Option<SocketAddr>,
     pub threads: Vec<JoinHandle<()>>,
+    /// The listeners' stops, public first.
+    pub stops: Vec<xbt_svc::http::Stop>,
+}
+
+impl Running {
+    /// Stop both listeners and wait at most `bound` for their open connections (a stop signal). A
+    /// pushed blob is written and fsynced before its answer, so nothing waits to be flushed. True:
+    /// every request in flight ended.
+    pub fn finish(&self, bound: Duration) -> bool {
+        for s in &self.stops {
+            s.stop();
+        }
+        let end = std::time::Instant::now() + bound;
+        self.stops.iter().all(|s| s.drain(end.saturating_duration_since(std::time::Instant::now())))
+    }
 }
 
 fn listen(addr: &str) -> io::Result<TcpListener> {
@@ -525,10 +540,11 @@ fn listen(addr: &str) -> io::Result<TcpListener> {
 /// every `sweep` (when the store has a TTL).
 pub fn serve(relay: Arc<Relay>, public: &str, push: Option<&str>, threads: usize, sweep: Duration) -> io::Result<Running> {
     let p = xbt_svc::http::serve(Arc::new(Public(relay.clone())), listen(public)?, threads.max(1))?;
-    let mut out = Running { public: p.addr, push: None, threads: p.threads };
+    let mut out = Running { public: p.addr, push: None, stops: vec![p.stopper()], threads: p.threads };
     if let Some(addr) = push {
         let q = xbt_svc::http::serve(Arc::new(Push(relay.clone())), listen(addr)?, threads.clamp(1, 4))?;
         out.push = Some(q.addr);
+        out.stops.push(q.stopper());
         out.threads.extend(q.threads);
     }
     if relay.store.ttl_secs > 0 {

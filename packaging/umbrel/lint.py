@@ -2,7 +2,11 @@
 """Lint the local Umbrel store.
 
 Manifest: the keys umbrelOS reads, manifestVersion 1/1.1, a known category, the id prefixed with the store id,
-gallery files present, dependencies in this store, a node slot (`bitcoin`) an app here implements, or an app
+an icon and gallery images given as URLs (umbrelOS shows a community store's `icon` and `gallery` as they are: a
+file name or an empty icon shows nothing), each a raw.githubusercontent.com URL on this repository's main branch
+of a file in the app's own folder here, the icon a plain SVG (no script, nothing fetched); a gallery for every app
+but the stand-in node; `submission` a URL into this repository (a store submission is the project owner's
+decision); dependencies in this store, a node slot (`bitcoin`) an app here implements, or an app
 of another community store named in OTHER_STORES (Lightning Fork), unique ports, `deterministicPassword` when
 ${APP_PASSWORD} is used.
 Compose: app_proxy's APP_HOST is `<app-id>_<service>_1` of a real service; every volume is under
@@ -32,7 +36,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from pin_images import REF, load_lock  # noqa: E402
 
 REQUIRED = ["manifestVersion", "id", "category", "name", "version", "tagline", "description", "developer", "website",
-            "repo", "support", "port", "gallery", "dependencies", "submitter", "submission"]
+            "repo", "support", "port", "gallery", "dependencies", "submitter", "submission", "icon"]
+# where the icon and the gallery are served from: this repository's main branch, the app's folder in this store
+RAW = "https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel"
+# what `submission` may point at: this repository (never an app store's pull request)
+SUBMISSION = "https://github.com/AwokenLazarus/Lightning-Stream/"
 CATEGORIES = {"bitcoin", "lightning", "finance", "networking", "social", "media", "automation", "developer", "ai", "files"}
 # what umbrelOS sets for every app's compose
 UMBREL_VARS = {"APP_DATA_DIR", "APP_SEED", "APP_PASSWORD", "DEVICE_DOMAIN_NAME", "DEVICE_HOSTNAME", "TOR_PROXY_IP", "TOR_PROXY_PORT",
@@ -74,6 +82,45 @@ def bad(msg: str) -> None:
     print(f"  FAIL {msg}")
 
 
+def served(folder: str, here: Path, what: str, url, kinds: tuple[str, ...]) -> Path | None:
+    """`url` is RAW/<folder>/<file> of a file in the app's folder here, of one of `kinds`: what umbrelOS fetches
+    once this tree is on main. The file, or None (and a problem)."""
+    url = str(url or "")
+    prefix = f"{RAW}/{folder}/"
+    name = url[len(prefix):] if url.startswith(prefix) else ""
+    if not name or "/" in name or name.startswith("."):
+        bad(f"{folder}: {what} {url!r} is not {prefix}<file> (a URL: umbrelOS shows a community store's {what} as it is given)")
+        return None
+    f = here / name
+    if not f.is_file():
+        bad(f"{folder}: {what} {url!r} names {name}, which is not in {here.name}/")
+        return None
+    if f.suffix.lower() not in kinds:
+        bad(f"{folder}: {what} {name} is not one of {kinds}")
+        return None
+    return f
+
+
+def plain_svg(folder: str, f: Path) -> None:
+    """An icon drawn here: an <svg> document with no script, no event handler and nothing it fetches."""
+    import xml.etree.ElementTree as ET
+    text = f.read_text()
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as e:
+        bad(f"{folder}: icon {f.name} is not XML: {e}")
+        return
+    if root.tag not in ("svg", "{http://www.w3.org/2000/svg}svg"):
+        bad(f"{folder}: icon {f.name} is not an <svg> document")
+    for el in root.iter():
+        tag = el.tag.split("}")[-1]
+        if tag in ("script", "foreignObject", "image", "use", "style"):
+            bad(f"{folder}: icon {f.name} has <{tag}> (a plain drawing only)")
+        for k, v in el.attrib.items():
+            if k.split("}")[-1].lower().startswith("on") or "href" in k or "url(" in v:
+                bad(f"{folder}: icon {f.name}: {k}={v!r} (no handler, link or reference)")
+
+
 def exports_vars(p: Path) -> dict[str, str]:
     return dict(re.findall(r'^export\s+([A-Z0-9_]+)="?([^"\n]*)"?', p.read_text(), re.M)) if p.exists() else {}
 
@@ -109,11 +156,13 @@ def main() -> int:
             bad(f"{folder}: category {m['category']!r}")
         if not isinstance(m["gallery"], list):
             bad(f"{folder}: gallery must be a list")
-        elif not m["gallery"]:
-            warnings.append(f"{folder}: empty gallery (fine side-loaded; a store submission needs images)")
+        elif not m["gallery"] and folder not in LOCAL_ONLY:
+            bad(f"{folder}: empty gallery (umbrelOS shows the app with no pictures)")
         for g in m["gallery"] or []:
-            if not (mp.parent / g).is_file():
-                bad(f"{folder}: gallery file {g} missing")
+            served(folder, mp.parent, "gallery", g, (".png", ".jpg", ".jpeg"))
+        icon = served(folder, mp.parent, "icon", m["icon"], (".svg", ".png"))
+        if icon and icon.suffix == ".svg":
+            plain_svg(folder, icon)
         for d in m["dependencies"] or []:
             if d in SLOTS:
                 if not any(d in (am.get("implements") or []) for _, am in apps.values()):
@@ -123,8 +172,8 @@ def main() -> int:
         for i in m.get("implements") or []:
             if i not in SLOTS:
                 bad(f"{folder}: implements {i!r}, not a known slot")
-        if m["submission"] != "unpublished-local":
-            bad(f"{folder}: submission must stay unpublished-local (a store submission is the project owner's decision)")
+        if not str(m["submission"]).startswith(SUBMISSION):
+            bad(f"{folder}: submission {m['submission']!r} is not a URL into {SUBMISSION} (a store submission is the project owner's decision)")
         compose_p = mp.parent / "docker-compose.yml"
         text = compose_p.read_text()
         c = yaml.safe_load(text)
@@ -198,7 +247,7 @@ def main() -> int:
                 if "user" in s:
                     bad(f"{folder}/{name}: must run as its image's own user (no user: override; CONTAINER.md uid table)")
                 if s.get("init") is not True:
-                    bad(f"{folder}/{name}: needs init: true (the binary as PID 1 ignores SIGTERM, so a stop waits out the grace period and kills it)")
+                    bad(f"{folder}/{name}: needs init: true (the binaries stop on SIGTERM by themselves; an init still reaps and forwards for anything they start)")
                 if (s.get("depends_on") or {}).get("init", {}).get("condition") != "service_completed_successfully":
                     bad(f"{folder}/{name}: must wait for init (service_completed_successfully)")
                 allowed = {f"${{APP_DATA_DIR}}/data/{comp}:/data/{comp}"}

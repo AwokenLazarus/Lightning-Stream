@@ -1,6 +1,7 @@
 //! AGP-072: the shared bounded server's edges over real sockets: HEAD and 204 carry no body, a
 //! handler cannot inject headers or keep a handler slot, Expect: 100-continue, 413 before the body, the
-//! peer is the socket's, and a stopped server takes no more connections.
+//! peer is the socket's, a stopped server takes no more connections, and a drained one lets the
+//! request in flight finish, within its bound.
 #[path = "common/slowloris.rs"]
 mod slowloris;
 
@@ -25,6 +26,10 @@ impl Handler for T {
     fn handle(&self, req: Request) -> Response {
         match req.path() {
             "/panic" => panic!("handler bug"),
+            "/slow" => {
+                std::thread::sleep(Duration::from_millis(400));
+                Response::text(200, "text/plain", "slow")
+            }
             "/empty" => Response::new(204, vec![("X-A".into(), "1".into())], b"ignored".to_vec()),
             "/inject" => Response::new(
                 200,
@@ -167,6 +172,37 @@ fn the_peer_is_the_socket_s() {
         b"GET /peer HTTP/1.1\r\nHost: h\r\nX-Forwarded-For: 203.0.113.9\r\n\r\n"
     )
     .ends_with("\r\n\r\n127.0.0.1"));
+}
+
+#[test]
+fn a_drained_server_finishes_the_request_in_flight_and_takes_no_more() {
+    let (run, a) = start();
+    let stop = run.stopper();
+    let a2 = a.clone();
+    let slow = std::thread::spawn(move || raw(&a2, b"GET /slow HTTP/1.1\r\nHost: h\r\n\r\n"));
+    let t0 = std::time::Instant::now();
+    while stop.open() == 0 {
+        assert!(t0.elapsed() < Duration::from_secs(5), "the slow request never arrived");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(stop.drain(Duration::from_secs(5)), "the request in flight ended inside the bound");
+    assert!(t0.elapsed() >= Duration::from_millis(300), "drain waited for it");
+    assert!(slow.join().unwrap().ends_with("slow"), "and it was answered in full");
+    for t in run.threads {
+        t.join().unwrap();
+    }
+    assert!(TcpStream::connect(&a).is_err(), "the listener is closed");
+    // a bound shorter than the request: drain says so, and does not wait it out
+    let (run, a) = start();
+    let stop = run.stopper();
+    let slow = std::thread::spawn(move || raw(&a, b"GET /slow HTTP/1.1\r\nHost: h\r\n\r\n"));
+    while stop.open() == 0 {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let t0 = std::time::Instant::now();
+    assert!(!stop.drain(Duration::from_millis(50)));
+    assert!(t0.elapsed() < Duration::from_millis(350));
+    let _ = slow.join();
 }
 
 #[test]

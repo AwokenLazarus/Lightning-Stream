@@ -289,7 +289,8 @@ impl Signer {
         if let Some(n) = legacy_channels.notice() {
             eprintln!("xbt-signer: {}", n["what_to_do"].as_str().unwrap_or_default());
         }
-        for w in crate::policy::validate_policy(&raw).1.iter().filter(|w| w.contains("on-chain channel")) {
+        // and the test aid for sellers on a LAN, which the owner should not forget is on
+        for w in crate::policy::validate_policy(&raw).1.iter().filter(|w| w.contains("on-chain channel") || w.contains("tickets.seller_tls")) {
             eprintln!("xbt-signer: {w}");
         }
         // tickets on, on mainnet, without the owner's acknowledgement: off, and said so at start as well as on each refusal
@@ -825,6 +826,12 @@ pub fn mine_blocks(node: &dyn Node, n: u64) -> Result<()> {
 impl Signer {
     /// Sleep until the next watcher tick; `true` when stopping.
     pub fn watch_loop(self: &Arc<Self>, stop: Arc<std::sync::atomic::AtomicBool>) {
+        self.watch_loop_in(stop, &xbt_svc::shutdown::Drain::default())
+    }
+
+    /// [`Signer::watch_loop`], each tick counted as work in flight in `drain`: a signer that is told
+    /// to stop lets the tick that is running finish, and starts no other.
+    pub fn watch_loop_in(self: &Arc<Self>, stop: Arc<std::sync::atomic::AtomicBool>, drain: &xbt_svc::shutdown::Drain) {
         use std::sync::atomic::Ordering;
         loop {
             let steps = ((self.watch_interval * 10.0) as u64).max(1);
@@ -834,6 +841,7 @@ impl Signer {
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
+            let Some(_busy) = drain.enter() else { return };
             // every step of a tick is guarded (`watch_step`); this guards what is left around them,
             // so the thread ends only when the signer stops (AGP-095)
             let tick = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.watch_tick()));

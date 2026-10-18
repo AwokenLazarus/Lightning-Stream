@@ -322,6 +322,15 @@ pub fn validate_policy(raw: &Value) -> (Vec<String>, Vec<String>) {
     }
     if let Some(t) = obj.get("tickets") {
         crate::ticket::validate(t, &mut errors, &mut warnings);
+        // the test aid is for named sellers only: an entry for an origin off the allowlist is never used
+        let listed: Vec<String> = obj.get("allowlist").and_then(Value::as_array).into_iter().flatten()
+            .filter_map(Value::as_str).map(normalize_dest).collect();
+        for k in t.get("seller_tls").and_then(Value::as_object).into_iter().flatten().map(|(k, _)| k) {
+            if crate::ticket::seller_tls_origin(k).is_some_and(|o| !listed.contains(&o)) {
+                warnings.push(format!("policy.json tickets.seller_tls[{k}]: not on the allowlist, so never used (a seller the owner has not named \
+                                       is reached with the public certificate authorities only)"));
+            }
+        }
     }
     (errors, warnings)
 }

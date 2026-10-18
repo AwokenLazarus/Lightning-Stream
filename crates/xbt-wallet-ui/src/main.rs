@@ -7,6 +7,8 @@
 //!   xbt-wallet-ui pubkey --key FILE             the key file's public key (for enrolment)
 //!   xbt-wallet-ui healthcheck [--ready]         GET /healthz (or /readyz) on XBT_UI_BIND: the image's
 //!                                               HEALTHCHECK (it has no shell or curl); exit 0 on 200
+//!
+//! `serve` stops on SIGTERM or SIGINT: no new connection, the requests in flight get 5 s, exit 0.
 use std::io::Read;
 
 fn key_from(path: &str) -> Result<[u8; 32], String> {
@@ -83,6 +85,14 @@ fn healthcheck(ready: bool) -> i32 {
 }
 
 fn serve() -> i32 {
+    // SIGTERM and SIGINT before the first thread: a stop is answered at once, also as PID 1
+    let signals = match xbt_svc::shutdown::listen() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("xbt-wallet-ui: signals: {e}");
+            return 2;
+        }
+    };
     let cfg = match xbt_wallet_ui::config::Config::from_env() {
         Ok(c) => c,
         Err(e) => {
@@ -100,9 +110,11 @@ fn serve() -> i32 {
     match xbt_wallet_ui::server::spawn(app.clone()) {
         Ok(r) => {
             eprintln!("xbt-wallet-ui listening on http://{}{} (signer {})", r.addr, app.cfg.base_path, app.cfg.signer_sock.display());
-            loop {
-                std::thread::park();
-            }
+            let sig = signals.wait();
+            xbt_svc::shutdown::say_stopping("xbt-wallet-ui", sig);
+            let drained = r.finish(xbt_svc::shutdown::DRAIN);
+            xbt_svc::shutdown::say_stopped("xbt-wallet-ui", drained);
+            0
         }
         Err(e) => {
             eprintln!("xbt-wallet-ui: {e}");

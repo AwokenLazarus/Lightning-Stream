@@ -29,10 +29,10 @@ packaging/
   ln_lab.py, ln_lab.compose.yml   the Lightning side of the tests: two Lightning Fork nodes of the regtest lab
   umbrel/                     a local Umbrel community store (id "lazarus")
     umbrel-app-store.yml
-    lazarus-xbt-agent-wallet/ the wallet: init + witness + signer + MCP + UI, app_proxy -> UI
-    lazarus-lightning-stream-gateway/  the gateway: init + gateway + UI (gateway role), app_proxy -> UI
+    lazarus-xbt-agent-wallet/ the wallet: init + witness + signer + MCP + UI, app_proxy -> UI; icon.svg, gallery N.png
+    lazarus-lightning-stream-gateway/  the gateway: init + gateway + UI (gateway role), app_proxy -> UI; icon.svg, gallery
     lazarus-xbt-knots/        a stand-in XBT node (pruned Knots 29.4.2, amd64 only) that fills the bitcoin slot
-    lint.py                   manifest + compose + hardening lint; the images pinned to images.lock
+    lint.py                   manifest + compose + hardening lint; the images pinned to images.lock; icon and gallery URLs
     regtest/                  the off-Umbrel overlays and the driver (umbrel_regtest.py)
     test-umbrel-apps.sh       verify: lint, then install both apps from cold beside the lab and buy, twice
     bundle.sh                 side-load bundle: the store + docker-saved images (dist/umbrel/)
@@ -306,7 +306,9 @@ They cannot, yet:
 - start on StartOS beside Lightning Fork: StartOS mounts a dependency's directory only, never one file, and
   Lightning Fork keeps tls.cert at the root of its volume beside its macaroons (`DESIGN.md`, section 6);
 - buy from a gateway on the same box, except through the test profile's shared loopback (Umbrel): the wallet
-  pays tickets over https with a publicly trusted certificate, or to its own machine;
+  pays tickets over https with a publicly trusted certificate, or to its own machine (for a test between
+  two boxes on a LAN, a seller the owner names can be checked against its own certificate instead:
+  `tickets.seller_tls`, `DESIGN.md` section 3);
 - be installed from a store by an outside tester without that tester hosting the store: the images are
   public on ghcr.io, but the store is a git repository the tester serves (bundle.sh's README.txt). No box
   has yet installed the apps with the images pulled from ghcr.io: the real-box run used a registry on loopback;
@@ -328,8 +330,13 @@ They cannot, yet:
 - Token rotation: the wallet UI Agents page writes a new token into `run/ui/mcp-http-token`; the MCP reads
   it on every request, so the old token gets 401 at once. The MCP has no rotation endpoint (docs/CONTAINER.md
   §10). StartOS also keeps the delete-and-restart action.
-- The StartOS package's text is English only; other locales fall back to it. Translations, gallery images
-  and icons are store-submission work.
+- The StartOS package's text is English only; other locales fall back to it. Translations and gallery
+  images there are store-submission work.
+- Icons and gallery on Umbrel: each app's manifest names its icon (`icon.svg`, drawn for this project) and its
+  gallery (screenshots of its own pages) as raw.githubusercontent.com URLs of the files in its folder on this
+  repository's main branch, because umbrelOS shows a community store's `icon` and `gallery` exactly as given (a
+  bare file name, or an empty icon, shows nothing). So a changed picture shows on a box once it is on main.
+  `lint.py` checks every URL names a file in the app's folder and that each icon is a plain SVG.
 - The images are published and pinned by digest (Images, above), but byte-for-byte reproducible builds have
   not been checked, and no box has installed them from ghcr.io yet (the real-box run used a registry on the
   build host's loopback, tunnelled to the box's).

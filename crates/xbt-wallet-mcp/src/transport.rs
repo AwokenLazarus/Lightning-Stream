@@ -269,6 +269,20 @@ pub fn serve_http(server: Arc<Server>, cfg: HttpConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// [`serve_http`] until a stop signal (the binary): then no new connection, the requests in flight
+/// get [`xbt_svc::shutdown::DRAIN`], and this returns. The MCP holds no state of its own to flush:
+/// the signer books every payment. `signals` was made before the process started any thread.
+pub fn serve_http_until(server: Arc<Server>, cfg: HttpConfig, signals: &xbt_svc::shutdown::Signals) -> Result<(), String> {
+    check_http(&cfg)?;
+    let listener = TcpListener::bind(&cfg.addr).map_err(|e| format!("{}: {e}", cfg.addr))?;
+    let run = serve_listener(server, cfg, listener)?;
+    let sig = signals.wait();
+    xbt_svc::shutdown::say_stopping("xbt-wallet-mcp", sig);
+    let drained = run.stopper().drain(xbt_svc::shutdown::DRAIN);
+    xbt_svc::shutdown::say_stopped("xbt-wallet-mcp", drained);
+    Ok(())
+}
+
 /// The listener's guards (AGP-063 X1): loopback unless `allow_remote` with a token, and a token always.
 fn check_http(cfg: &HttpConfig) -> Result<(), String> {
     let host = cfg.addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(&cfg.addr);

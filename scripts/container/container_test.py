@@ -30,6 +30,8 @@ Checks (each is PASS/FAIL in results.json):
      priced page through the wallet; the seller's node settled the ticket and the buyer's node paid it
   R  docker kill + start of witness, signer and MCP: the keys, the hot key's coins, the token and the
      anchors persist; the witness's check of the signature log passes; the agent buys again
+  Q  docker stop of MCP, signer, witness and gateway (each PID 1, no --init): every one exits 0 within 5 s
+     of SIGTERM, timed in stops.json
     scripts/container_test.sh   (builds the images, then runs this)
 """
 import base64
@@ -419,6 +421,19 @@ def main():
     for n in ("witness", "signer", "mcp"):
         wait_until(lambda: health(n) == "healthy", 120, f"{n} healthy at the end", every=3)
     check("S", "every service HEALTHCHECK healthy at the end", True)
+    # --- Q: a stop is a clean exit, at once: each binary runs as PID 1 here (no --init) and takes SIGTERM itself ---
+    log("== T: docker stop (SIGTERM, 10 s grace) of each service")
+    stops = {}
+    for n in ("mcp", "signer", "witness", "gateway"):
+        t0 = time.monotonic()
+        docker("stop", "-t", "10", f"{P}-{n}")
+        took = round(time.monotonic() - t0, 2)
+        code = docker("inspect", "-f", "{{.State.ExitCode}}", f"{P}-{n}").stdout.strip()
+        stops[n] = {"seconds": took, "exit": code}
+    with open(os.path.join(OUT, "stops.json"), "w") as f:
+        json.dump(stops, f, indent=1)
+    check("Q", "docker stop: every service (PID 1) exits 0 within 5 s of SIGTERM, not at the kill after the grace period",
+          all(v["exit"] == "0" and v["seconds"] < 5 for v in stops.values()), stops)
     with open(os.path.join(OUT, "facts.json"), "w") as f:
         json.dump({"hot_before": hot1, "hot_after_restart": ha2, "balance_before": bal1, "balance_after_restart": bal2}, f, indent=1, default=str)
 

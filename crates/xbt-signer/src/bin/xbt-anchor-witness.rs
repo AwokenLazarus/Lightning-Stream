@@ -2,7 +2,8 @@
 //!   xbt-anchor-witness serve --store DIR --sock PATH [--sock-mode 660]
 //!   xbt-anchor-witness check --store DIR --log signatures.jsonl
 //!   xbt-anchor-witness healthcheck [--sock PATH]    the image's HEALTHCHECK: `latest` answers on the socket
-//! Run it as its own user, with a store directory the signer's user cannot write.
+//! Run it as its own user, with a store directory the signer's user cannot write. SIGTERM or SIGINT
+//! stops it: the requests being answered finish (5 s at most), the socket is removed, exit 0.
 //!
 //! Container mode (AGP-038): `--store` defaults to `XBT_WITNESS_DIR` (else `$XBT_DATA_DIR/witness`), and
 //! `--sock` to `XBT_ANCHOR_SOCK` (else `$XBT_DATA_DIR/run/anchor/anchor.sock`); the witness has no secrets.
@@ -42,12 +43,16 @@ fn main() {
                     xbt_svc::ensure_dir(d, m).unwrap_or_else(|e| die(1, format!("{}: {e}", d.display())));
                 }
             }
+            // SIGTERM and SIGINT before the first thread: a stop is answered at once, also as PID 1
+            let signals = xbt_svc::shutdown::listen().unwrap_or_else(|e| die(1, format!("signals: {e}")));
             match serve_witness(&store, &sock, mode) {
                 Ok(w) => {
                     println!("anchor witness on {}, store {}, latest {}", sock.display(), store.display(), w.store.latest());
-                    loop {
-                        std::thread::park();
-                    }
+                    let sig = signals.wait();
+                    xbt_svc::shutdown::say_stopping("xbt-anchor-witness", sig);
+                    let drained = w.finish(xbt_svc::shutdown::DRAIN);
+                    xbt_svc::shutdown::say_stopped("xbt-anchor-witness", drained);
+                    std::process::exit(0);
                 }
                 Err(e) => die(1, e.msg),
             }

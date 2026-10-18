@@ -155,6 +155,15 @@ impl Drop for Running {
     }
 }
 
+impl Running {
+    /// Stop taking connections and wait at most `bound` for the open ones (a stop signal). The UI's
+    /// files are written whole (a temp file, fsynced, renamed), so nothing waits to be flushed.
+    /// True: every request in flight ended.
+    pub fn finish(&self, bound: std::time::Duration) -> bool {
+        self.stop.drain(bound)
+    }
+}
+
 pub fn spawn(app: Arc<App>) -> Result<Running, String> {
     let listener = std::net::TcpListener::bind(&app.cfg.bind).map_err(|e| format!("bind {}: {e}", app.cfg.bind))?;
     let threads = app.cfg.threads;

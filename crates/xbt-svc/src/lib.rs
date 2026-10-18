@@ -11,6 +11,8 @@
 //! * [`probe`]: a minimal HTTP GET for `healthcheck` subcommands (images have no shell or curl).
 //! * [`http`]: the bounded HTTP/1.1 server every service listens with: header caps, head and body
 //!   deadlines, a connection limit, a fixed worker pool (review T1; AGP-068, AGP-072).
+//! * [`shutdown`]: SIGTERM and SIGINT taken in a thread of their own, and the bounded wait for
+//!   the work in flight, so a service stops at once and cleanly when it runs as PID 1.
 //! * [`layout`]: the data dir's owners and modes, and `xbt-init`, which makes a bind mount or a
 //!   root-owned volume match them (Umbrel, StartOS; AGP-040).
 use std::io::{self, Write};
@@ -18,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 pub mod http;
 pub mod layout;
+pub mod shutdown;
 
 /// A non-empty, trimmed environment variable.
 pub fn env(name: &str) -> Option<String> {

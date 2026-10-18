@@ -20,7 +20,8 @@
 //! `XBT_MCP_HTTP_TOKEN_FILE`, default `run/ui/mcp-http-token` when it exists (xbt-init makes it, 0640,
 //! group `xbt-wallet-ui`). The MCP reads it on every request and never writes it, so the owner's
 //! rotation on the UI's Agents page cuts the old token off at once. `GET /healthz` is the process; `GET /readyz` is the signer answering
-//! and its readiness file (node synced, keys unlocked, witness reachable) fresh and ok.
+//! and its readiness file (node synced, keys unlocked, witness reachable) fresh and ok. Over HTTP,
+//! SIGTERM or SIGINT stops it: no new connection, the requests in flight get 5 s, exit 0.
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,7 +29,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use xbt_svc::{env, env_bool, health, probe, DataDir, Mode, Secrets};
 use xbt_wallet_mcp::mcp::{tools_with, Server};
-use xbt_wallet_mcp::transport::{read_token_file, serve_http, serve_stdio, HttpConfig, ReadyFn};
+use xbt_wallet_mcp::transport::{read_token_file, serve_http_until, serve_stdio, HttpConfig, ReadyFn};
 use xbt_wallet_mcp::wallet::Wallet;
 
 fn arg(args: &[String], name: &str) -> Option<String> {
@@ -123,6 +124,13 @@ fn main() {
             }
         }
     }
+    // over HTTP, SIGTERM and SIGINT before the first thread: a stop is answered at once, also as
+    // PID 1 (xbt_svc::shutdown). Over stdio the client's end of the pipe stops the server
+    let signals = if addr.is_some() && !args.iter().any(|a| a == "--check") {
+        xbt_svc::shutdown::listen().unwrap_or_else(|e| die(&format!("signals: {e}")))
+    } else {
+        xbt_svc::shutdown::Signals::none()
+    };
     let mode = Mode::from_env().unwrap_or_else(|e| die(&e));
     let data = DataDir::from_env();
     if let Some(d) = &data {
@@ -193,7 +201,7 @@ fn main() {
         .unwrap_or_default();
     let ready_file = env("XBT_SIGNER_READY_FILE").map(PathBuf::from).or_else(|| data.as_ref().map(DataDir::signer_ready));
     let cfg = HttpConfig { addr, path, token, token_file, allow_remote, allowed_origins, base, ready: Some(readiness(wallet, ready_file)) };
-    if let Err(e) = serve_http(server, cfg) {
+    if let Err(e) = serve_http_until(server, cfg, &signals) {
         die(&e);
     }
 }
