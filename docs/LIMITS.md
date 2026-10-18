@@ -75,8 +75,9 @@ limits are in the git history, last at commit `1ad0c48`. What the removal leaves
 - The wallet pays a seller over Lightning only. The Umbrel and StartOS packages and the container
   stack take the box's Lightning Fork node; their tests buy from a packaged gateway with a ticket,
   on regtest, with the wallet and the gateway sharing one network namespace (regtest has no https
-  name with a public certificate). No package has been installed on a real umbrelOS or StartOS
-  box; what that leaves untried is in `packaging/README.md`.
+  name with a public certificate). On a real umbrelOS box they ran with regtest stand-ins for the
+  node apps; a real StartOS box cannot start them until Lightning Fork's package keeps its
+  certificate in a folder of its own. What is still untried is in `packaging/README.md`.
 - A seller that offers only the channel is answered `no_rail` by `xbt402_pay`, with the reason.
 - Content paid for chunk by chunk against a Merkle root with a hash-locked last chunk
   (`xbt402-merkle-v1`) can no longer be bought. The ticket wire has its own form of it
@@ -279,9 +280,10 @@ involved no node.
   seller that earns less than one win from a buyer is usually paid nothing by it.
 - Through a routing node the wallet's floor makes every win at least 64 sat, so a small call is
   mostly paid nothing and sometimes many times its price: a 10-sat call pays nothing about 85%
-  of the time and 64 sat or more otherwise, up to its luck cap of 152 sat (computed). The wallet
-  has no rule that keeps a call expecting few wins off the lottery, and nothing pools draws
-  across sellers.
+  of the time and 64 sat or more otherwise, up to its luck cap of 152 sat (computed). A call that
+  expects fewer than `tickets.lottery.min_expected_wins` wins (4 as shipped) is paid with a
+  prepaid ticket where the seller offers one; where it offers none, the call is drawn as above.
+  Nothing pools draws across sellers.
 - A buyer's cost is uneven. Measured: a file priced at 381.5 sat, bought five times, cost
   520, 780, 390, 260 and 325 sat with routing fees. A download priced at 1,638 sat on 64-sat wins costs 1,152
   to 2,176 sat nine times in ten. *(simulated)* `max_sats` bounds what a call uses by the

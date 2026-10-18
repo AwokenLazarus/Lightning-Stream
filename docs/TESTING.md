@@ -19,7 +19,7 @@ has run on regtest only, on one host, between the project's own Lightning Fork n
    (`packaging/README.md`), a wallet app and a gateway app on a box with a Lightning Fork node.
    On mainnet neither app pays or sells until the owner types the mainnet acknowledgement, and
    both start with low caps (the wallet's starter policy: 2,000 sat a payment, 10,000 sat a
-   day). **Mainnet testing has not started.** No package has been installed on a real box yet.
+   day). **Mainnet testing has not started.** The packages have run on a real umbrelOS box only with regtest stand-ins for the node apps.
    What you could lose in such a test is the balance of the Lightning channel the wallet pays
    from, so open that channel small. Do not try mainnet before we ask; `docs/LIMITS.md` says why.
 

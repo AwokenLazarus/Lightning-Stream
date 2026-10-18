@@ -215,8 +215,9 @@ last one), and their tests, vectors and scripts. They are in the git history, la
   version. It leaves their records and sealed keys untouched and says which revision settles them.
 - The wallet pays sellers over Lightning only. The Umbrel and StartOS packages (a wallet app and
   a gateway app each) use the box's Lightning Fork node; a packaged wallet has bought from a
-  packaged gateway with tickets on regtest only, and no package has been installed on a real box
-  yet (`packaging/README.md`, `packaging/DESIGN.md`).
+  packaged gateway with tickets on regtest only. On a real umbrelOS box (with regtest stand-ins for
+  the node apps) the apps installed, bought, restarted and uninstalled cleanly; StartOS waits on a
+  certificate folder in Lightning Fork's package (`packaging/README.md`, `packaging/DESIGN.md`).
 - A seller that cannot run a Lightning node has no rail here; pay with work is the other way in.
 
 ## Built on
