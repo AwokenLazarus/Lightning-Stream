@@ -1788,10 +1788,12 @@ fn a_kill_of_the_signer_at_every_write_of_a_paid_call_never_undercounts_and_the_
 
 /// A seller that issues held tickets only to a session that has paid it (the gateway as it
 /// ships) is paid one prepaid ticket first, and then held tickets, by a wallet that would hold at
-/// once with a seller its owner named.
+/// once with a seller its owner named. The seller's terms say so (`heldAfterPaid`), so the first lock
+/// is the prepaid one: no hash is offered to be refused, and no ticket is booked failed.
 ///
 /// FAILS before: the wallet read the seller's `prepaid_first` as a refusal of the lock and gave up
-/// the session (`ticket_seller`), so no seller as shipped could be paid with tickets.
+/// the session (`ticket_seller`), so no seller as shipped could be paid with tickets. Later, before
+/// `heldAfterPaid`: the wallet offered two held hashes first, was refused, and booked both failed.
 #[test]
 fn a_seller_that_holds_only_after_a_prepaid_ticket_is_paid_one_first_and_then_held_ones() {
     let _g = env_lock();
@@ -1799,8 +1801,9 @@ fn a_seller_that_holds_only_after_a_prepaid_ticket_is_paid_one_first_and_then_he
     let v = r.pay("/page/10", 10);
     assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1), Some(1)), "{v}");
     let locks: Vec<Value> = r.tap.seen("/x402/ticket/lock").iter().map(|s| serde_json::from_str(&s.body).unwrap()).collect();
-    assert!(locks[0]["hashes"].is_array() && locks[1]["settle"] == "on-arrival", "a held lock, refused, then a prepaid one: {locks:?}");
+    assert_eq!(locks[0]["settle"], "on-arrival", "the prepaid lock first: {locks:?}");
     let st = r.status();
+    assert_eq!(st["failed_by"], json!({"never_sent": 0, "cancelled_at_stop": 0, "payment_failed": 0}), "{st}");
     assert_eq!((st["sessions"][0]["listed"].as_bool(), st["sessions"][0]["pool"].as_i64()), (Some(true), Some(2)), "{st}");
     // paid: the named seller is held with as before, 2 tickets
     wait_refill(&r, "two tickets held after the prepaid one", 2);

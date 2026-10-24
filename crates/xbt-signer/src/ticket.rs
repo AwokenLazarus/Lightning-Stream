@@ -700,6 +700,9 @@ pub struct Terms {
     pub max_tickets: u32,
     pub ticket_blocks: u32,
     pub settle: Settle,
+    /// The seller issues held tickets only to a session that has paid one prepaid ticket
+    /// (`heldAfterPaid`, on its held entry).
+    pub held_after_paid: bool,
 }
 
 /// How a seller's tickets are settled (`settle` in its terms).
@@ -765,7 +768,8 @@ impl Terms {
             return refuse("ticket_terms", "minTicketMsat is above ticketMsat");
         }
         let small = |k: &str| num(k).and_then(|n| u32::try_from(n).map_err(|_| ("ticket_terms", format!("{k} is too large"))));
-        Ok(Self { payee, ticket_msat, min_ticket_msat, max_tickets: small("maxTickets")?, ticket_blocks: small("ticketBlocks")?, settle })
+        Ok(Self { payee, ticket_msat, min_ticket_msat, max_tickets: small("maxTickets")?, ticket_blocks: small("ticketBlocks")?, settle,
+                  held_after_paid: settle == Settle::OnUse && x.get("heldAfterPaid") == Some(&Value::Bool(true)) })
     }
 }
 
@@ -1616,7 +1620,7 @@ mod tests {
     }
 
     fn terms(ticket_msat: u64, min: Option<u64>, max_tickets: u32) -> Terms {
-        Terms { payee: node_id(), ticket_msat, min_ticket_msat: min, max_tickets, ticket_blocks: 40, settle: Settle::OnUse }
+        Terms { payee: node_id(), ticket_msat, min_ticket_msat: min, max_tickets, ticket_blocks: 40, settle: Settle::OnUse, held_after_paid: false }
     }
 
     #[test]
@@ -1673,7 +1677,7 @@ mod tests {
     fn terms_are_read_exactly_as_the_draft_writes_them() {
         let net = "bip122:00000000000000000000000000000001";
         let t = Terms::parse(&accepts(), net).unwrap();
-        assert_eq!((t.ticket_msat, t.min_ticket_msat, t.max_tickets, t.ticket_blocks), (1_000_000, None, 8, 40));
+        assert_eq!((t.ticket_msat, t.min_ticket_msat, t.max_tickets, t.ticket_blocks, t.held_after_paid), (1_000_000, None, 8, 40, false));
         let with = |path: &[&str], v: Value| {
             let mut a = accepts();
             let mut at = &mut a;
@@ -1694,6 +1698,9 @@ mod tests {
         assert_eq!(with(&["extra", "version"], json!("ticket/1")), Err("ticket_terms"));
         assert_eq!(with(&["extra", "features"], json!([9])), Err("ticket_feature_512"));
         assert_eq!(with(&["extra", "settle"], json!("on-arrival")).map(|t| t.settle), Ok(Settle::OnArrival), "prepaid tickets");
+        // a held entry may say that the seller holds only after a prepaid ticket; only `true` says so
+        assert_eq!(with(&["extra", "heldAfterPaid"], json!(true)).map(|t| t.held_after_paid), Ok(true));
+        assert_eq!(with(&["extra", "heldAfterPaid"], json!("true")).map(|t| t.held_after_paid), Ok(false));
         assert_eq!(t.settle, Settle::OnUse);
         assert_eq!(with(&["extra", "settle"], json!("whenever")), Err("ticket_terms"));
         assert_eq!(with(&["extra", "settle"], Value::Null), Err("ticket_terms"));

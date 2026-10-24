@@ -734,12 +734,18 @@ impl Gateway {
             .into_iter()
             .flat_map(|r| {
                 ways.iter().filter(|(on, _)| *on).map(|(_, settle)| {
-                    self.terms.accepts(
+                    let mut e = self.terms.accepts(
                         r.price.request_msat,
                         r.release.name(),
                         settle,
                         &r.price.terms(),
-                    )
+                    );
+                    // said up front, so that a buyer buys its prepaid ticket first instead of
+                    // offering hashes the lock would refuse
+                    if *settle == SETTLE_ON_USE && self.cfg.caps.held_after_paid {
+                        e["extra"]["heldAfterPaid"] = true.into();
+                    }
+                    e
                 })
             })
             .collect();
