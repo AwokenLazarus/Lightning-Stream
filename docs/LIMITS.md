@@ -1092,6 +1092,11 @@ untrusted field.
 
 - The rail's policy binds only what goes through the wallet: anyone holding a broader macaroon for
   the node bypasses it.
+- `ln.exposure_cap_sats` (required on mainnet) counts what the node holds in its channels: local
+  balances and HTLCs in flight. Its on-chain coins are shown by `ln_status` and not counted, since a
+  payment cannot spend them; the node is trusted with them all the same, so keep its on-chain
+  wallet small. Until 2026-10 the cap counted them too, and any cap below the node's whole balance
+  refused every payment.
 - The rail trusts its own Lightning node for everything but the proof of a settled payment: its
   fee figure, its "failed" and its "no such payment" are taken as given; a payment the node
   reports failed and later settled is not booked.
