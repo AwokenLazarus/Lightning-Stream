@@ -1005,3 +1005,33 @@ fn a_win_whose_payment_failed_has_its_next_invoice_by_the_time_the_grace_ends() 
     assert!(rig.node.pay(&next));
     assert_eq!(b.get("/api").1.status, 200);
 }
+
+/// A win paid after the buyer's last request is counted by the janitor's next round: the
+/// operator's `paidWins` and `paidMsat` show it without the buyer asking for anything more.
+///
+/// FAILS before: the gateway looked at a win's invoice only when the buyer next asked for one, or
+/// when its session was forgotten, so health showed the wins of a session that had just ended unpaid.
+#[test]
+fn a_win_paid_after_the_last_request_is_counted_by_the_next_round_of_the_janitor() {
+    let (rig, _d) = start(&lottery);
+    let mut b = Drawer::open(&rig, 1);
+    let mut last = Value::Null;
+    for _ in 0..40 {
+        let (seq, got) = b.get("/api");
+        assert_eq!(got.status, 200);
+        let p = b.piece(seq, "/api", Kind::Request, 0, 2500);
+        last = b.draw(&[p]);
+        if !b.owed.is_empty() {
+            break;
+        }
+    }
+    let wins = b.owed.len() as u64;
+    assert!(wins > 0, "40 draws at 5 in 8 and no win");
+    let health = || http(&rig.addr, "GET", "/x402/ticket/health", &[("X-Real-IP", "127.0.0.1")], b"", None).json()["lottery"].clone();
+    assert_eq!(health()["paidWins"], 0);
+    b.pay_all(&rig, &last);
+    rig.gw.tick();
+    let h = health();
+    assert_eq!((h["wins"].as_u64(), h["paidWins"].as_u64(), h["paidMsat"].as_str()), (Some(wins), Some(wins), Some((wins * 4000).to_string().as_str())), "{h}");
+    assert_eq!(h["sessions"], 1, "the session is still open: {h}");
+}

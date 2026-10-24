@@ -657,6 +657,13 @@ impl Book {
         }
     }
 
+    /// The sessions with a win invoiced and not yet seen paid: what the janitor asks the node about.
+    pub fn awaiting_pay(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.sessions.iter().filter(|(_, s)| s.unpaid.iter().any(|w| !w.issuing && w.invoice.is_some())).map(|(id, _)| id.clone()).collect();
+        v.sort();
+        v
+    }
+
     /// The sessions [`Book::sweep`] would forget at `now`.
     pub fn due(&self, now: u64) -> Vec<String> {
         let mut v: Vec<String> = self.sessions.iter().filter(|(_, s)| self.gone(s, now)).map(|(id, _)| id.clone()).collect();
