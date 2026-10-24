@@ -1285,24 +1285,29 @@ impl Signer {
         (ok, report)
     }
 
-    /// What the LN node holds (channel local balances, HTLCs in flight, on-chain coins) against
+    /// What the LN node holds in its channels (local balances and HTLCs in flight) against
     /// `ln.exposure_cap_sats`: the report and, when over the cap (or no cap on mainnet), the refusal.
-    pub(crate) fn ln_exposure(&self, pol: &LnPolicy, chans: &[Value], utxos: &[Value]) -> (Value, Option<String>) {
+    /// The node's on-chain coins are reported but not counted: a payment cannot spend them, and
+    /// counting them made any cap below the node's whole balance refuse every payment. A node that
+    /// holds coins on chain is trusted with them all the same; `docs/LIMITS.md` says so.
+    pub(crate) fn ln_exposure(&self, pol: &LnPolicy, chans: &[Value], utxos: Option<&[Value]>) -> (Value, Option<String>) {
         // the node's numbers (AGP-095): a sum that does not fit is the most there is, over any cap
         let sum = |vs: &[Value], k: &str| vs.iter().fold(0i64, |a, v| a.saturating_add(i64_of(v.get(k))));
-        let (local, htlc, onchain) = (sum(chans, "local_balance"), sum(chans, "unsettled_balance"), sum(utxos, "amount_sat"));
-        let total = local.saturating_add(htlc).saturating_add(onchain);
+        let (local, htlc) = (sum(chans, "local_balance"), sum(chans, "unsettled_balance"));
+        // not read on the payment path: null there, not 0
+        let onchain = utxos.map(|u| sum(u, "amount_sat"));
+        let total = local.saturating_add(htlc);
         let cap = pol.exposure_cap_sats;
         let refusal = if cap == 0 && self.chain == "main" {
             Some("mainnet needs ln.exposure_cap_sats: the LN node is trusted with everything it holds".to_string())
         } else if cap > 0 && total > cap {
-            Some(format!("the LN node holds {total} sats (channels {local}, HTLCs {htlc}, on chain {onchain}), above ln.exposure_cap_sats {cap}: \
+            Some(format!("the LN node holds {total} sats in its channels (local {local}, HTLCs {htlc}), above ln.exposure_cap_sats {cap}: \
                           move funds off it before paying through it"))
         } else {
             None
         };
-        (json!({"channel_local_sats": local, "htlc_sats": htlc, "onchain_sats": onchain, "total_sats": total, "cap_sats": cap,
-                "over_cap": cap > 0 && total > cap, "enforced": true}), refusal)
+        (json!({"channel_local_sats": local, "htlc_sats": htlc, "onchain_sats": onchain, "onchain_counted": false, "total_sats": total,
+                "cap_sats": cap, "over_cap": cap > 0 && total > cap, "enforced": true}), refusal)
     }
 
     /// The node's watchtowers: `(report, refusal, warnings)`. An unverified tower refuses payments when
@@ -1496,12 +1501,8 @@ impl Signer {
     /// payments go on, confined to the proven channels.
     pub(crate) fn ln_route_checks(&self, ln: &dyn LnBackend, pol: &LnPolicy, dest: &str, hash: &str, every: bool) -> std::result::Result<LnRoutes, Value> {
         let chans = ln.channels().map_err(|e| node_said(self.ln_refuse("ln_backend", &e.msg, dest, hash), &e))?;
-        let utxos = if pol.exposure_cap_sats > 0 || self.chain == "main" {
-            ln.utxos().map_err(|e| node_said(self.ln_refuse("ln_backend", &format!("the exposure cap needs the node's coins: {}", e.msg), dest, hash), &e))?
-        } else {
-            vec![]
-        };
-        let (exposure, over) = self.ln_exposure(pol, &chans, &utxos);
+        // the cap counts channels only, so a payment does not wait on the node's coin list
+        let (exposure, over) = self.ln_exposure(pol, &chans, None);
         if let Some(why) = over {
             return Err(with(self.ln_refuse("ln_exposure_cap", &why, dest, hash), json!({"exposure": exposure})));
         }
@@ -1859,8 +1860,7 @@ impl Signer {
         };
         let split = pol.split(&self.chain);
         // a list the node did not give is not an empty list: the status says so, with the node's message, and is
-        // not ready if `ln_pay` reads that list (the coins: only for an exposure cap)
-        let needs_coins = pol.exposure_cap_sats > 0 || self.chain == "main";
+        // not ready if `ln_pay` reads that list (the channels; the coins are only reported)
         let mut unread: Vec<String> = vec![];
         let mut unread_said = Map::new();
         let mut blocking = false;
@@ -1873,11 +1873,11 @@ impl Signer {
             vec![]
         });
         let chans = read("channels", true, ln.channels());
-        let utxos = read("coins", needs_coins, ln.utxos());
+        let utxos = read("coins", false, ln.utxos());
         let (ids, report) = self.ln_channels(&chans, split);
         let tip = node::height(&*self.node).map(|h| h as i64).unwrap_or(0);
         let presplit = presplit_utxos(&utxos, tip, split);
-        let (exposure, over) = self.ln_exposure(&pol, &chans, &utxos);
+        let (exposure, over) = self.ln_exposure(&pol, &chans, Some(&utxos));
         let (towers, tower_refusal, mut warnings) = self.ln_towers(&*ln, &pol);
         let (mac, mac_refusal) = self.ln_macaroon(&*ln);
         let book = self.ln_book.all();

@@ -1032,7 +1032,7 @@ def kill() -> None:
         stop_sessions()
         inv, m = booked_and_once(), money()
         check(f"kill: {victim}, with a pool locked: after the restart nothing the seller took is missing from the wallet's ledger, nothing is paid twice, and the next call pays",
-              not inv["not_in_ledger"] and inv["same_tickets"] and agrees(m, receipts=False), {"next": resumed, **inv, "ledger_sats": m["wallet_ledger_sats"], "node_cost_sats": m["buyer_node_cost_sats"]})
+              not inv["not_in_ledger"] and inv["same_tickets"] and agrees(m, receipts=False), {"next": resumed, **inv, "ledger_sats": m["wallet_ledger_sats"], "node_cost_sats": m["buyer_node_cost_sats"], "money": m, "orphans": sorted(ORPHANS)})
         # in the middle of an answer that is being paid for
         other = Mcp()
         result: dict[str, Any] = {}
@@ -1062,7 +1062,7 @@ def kill() -> None:
         how = result.get("error") or result.get("ended") or ("complete" if result.get("complete") else brief(result))
         check(f"kill: {victim}, in the middle of an answer: after the restart nothing the seller took is missing from the wallet's ledger, nothing is paid twice, and the next call pays",
               not inv["not_in_ledger"] and inv["same_tickets"] and agrees(m, receipts=False),
-              {"the_call_ended": str(how)[:160], "bytes": result.get("bytes"), "next": resumed, **inv, "ledger_sats": m["wallet_ledger_sats"], "node_cost_sats": m["buyer_node_cost_sats"],
+              {"the_call_ended": str(how)[:160], "bytes": result.get("bytes"), "next": resumed, **inv, "ledger_sats": m["wallet_ledger_sats"], "node_cost_sats": m["buyer_node_cost_sats"], "money": m, "orphans": sorted(ORPHANS),
                "payments_the_node_still_calls_in_flight_with_nothing_on_its_channel": len(ORPHANS)})
 
 

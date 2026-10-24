@@ -266,8 +266,14 @@ impl Gateway {
     pub(super) fn lottery_tick(&self) {
         if let Some(l) = &self.lottery {
             let now = self.now();
+            // a win paid between requests is counted when the node shows it, not when the buyer
+            // next asks for something: the operator's paidWins and a session's own count keep up
             let due = l.lock().due(now);
-            for id in &due {
+            let mut look = l.lock().awaiting_pay();
+            look.extend(due.iter().cloned());
+            look.sort();
+            look.dedup();
+            for id in &look {
                 self.lottery_settle(l, id);
             }
             l.lock().sweep(now);

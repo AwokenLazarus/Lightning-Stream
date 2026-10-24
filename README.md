@@ -24,11 +24,14 @@ nothing on it cancels a held ticket before the ticket expires, and the gateway s
 lnd-family nodes only. As a buyer's node or a routing node it needed nothing in the lab
 ([`docs/TICKETS.md`](docs/TICKETS.md), sections 8 and 11).
 
-This direction was decided on 2026-10-11. **Tickets run end to end on regtest, and nowhere
-else**: the design was measured on a three-node Lightning Fork regtest, the seller's side (the
-gateway) and the wallet's side are built, and on that regtest an agent's one call to the wallet
-buys a page, or a 100 MB file as it arrives, from a service behind the gateway. Nothing has run
-on mainnet. The sections below say what exists today, what is being built, and what was retired
+This direction was decided on 2026-10-11. **Tickets run end to end on regtest**: the design was
+measured on a three-node Lightning Fork regtest, the seller's side (the gateway) and the wallet's
+side are built, and on that regtest an agent's one call to the wallet buys a page, or a 100 MB
+file as it arrives, from a service behind the gateway. **On mainnet, one rehearsal between two
+of our own nodes** (23 and 24 October 2026): one machine, one direct private channel of
+100,000 sat, everything on loopback. Tickets bought a page and a 5 MB file and the lottery 20
+pieces; the first run found four faults, fixed in this tree before the second run passed. Nothing
+has run through anyone else's node or with anyone outside the project. The sections below say what exists today, what is being built, and what was retired
 or removed.
 
 Whitepaper: **<https://lazarus-xbt.xyz/stream/>**
@@ -40,8 +43,8 @@ Lightning Stream adds little of its own to a great deal of other people's work. 
 built on and what came before it are under [Built on](#built-on) and [Prior art](#prior-art);
 the full list, with a link for each, is [`docs/REFERENCES.md`](docs/REFERENCES.md).
 
-> **Status: test networks only.** Everything here runs on XBT regtest. Do not use it with mainnet
-> funds. It has had an internal security review and one external review, not an independent audit.
+> **Status: test networks, and one rehearsal on mainnet between our own nodes.** Everything here
+> runs on XBT regtest. Do not use it with mainnet funds you cannot lose. It has had an internal security review and one external review, not an independent audit.
 > The external review (October 2026) found critical and high-severity issues in the agent wallet's
 > budget accounting, the hub, the pay-with-work audit and the HTTP layer. Six rounds of fixes are in
 > this tree. Four follow-up audits of our own checked them: the first found 14 items (3 high), the

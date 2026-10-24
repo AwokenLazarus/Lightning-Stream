@@ -657,8 +657,11 @@ impl Signer {
             }
             // a seller the owner has not named is paid one prepaid ticket before any is held with it: a held
             // ticket takes a slot of every channel on its route for no fee, and a stranger has to show that it
-            // serves first. One that offers no prepaid tickets is not held with at all
-            let paid_first = !listed && size.pool > 0;
+            // serves first. One that offers no prepaid tickets is not held with at all. A seller whose terms say
+            // it holds only after a prepaid ticket (`heldAfterPaid`) is paid one first too, named or not: offering
+            // it hashes first would only have them refused
+            let seller_asks = held.as_ref().is_some_and(|t| t.held_after_paid) && prepaid_msat > 0;
+            let paid_first = (!listed || seller_asks) && size.pool > 0;
             if paid_first && prepaid_msat == 0 {
                 return Ok(refusal("ticket_prepaid_first", "the owner has not named this seller, and a ticket is held with such a seller only after one prepaid ticket \
                                                            has been paid: its terms offer no prepaid tickets"));
@@ -1832,6 +1835,7 @@ impl Signer {
         json!({"locked": locked.tickets, "locked_sats": locked.sats, "released": n(&|s| s == TState::Released), "retired": n(&|s| s == TState::Retired),
                "prepaid": ts.iter().filter(|t| t.prepaid).count(),
                "settled": n(&|s| s == TState::Settled), "failed": n(&|s| s == TState::Failed),
+               "failed_by": failed_by(ts.iter().copied(), &st.book),
                "booked_sats": ts.iter().fold(0i64, |a, t| a.saturating_add(t.booked_sats))})
     }
 
@@ -1921,7 +1925,8 @@ impl Signer {
             let locked = st.book.locked(|_| true);
             let mut sessions: Vec<&Session> = st.book.sessions.values().filter(|s| if sid.is_empty() { s.state != SState::Closed } else { s.id == sid }).collect();
             sessions.sort_by(|a, b| a.opened_ts.total_cmp(&b.opened_ts));
-            let mut v = json!({"synced": self.ticket_synced.load(Ordering::SeqCst), "tickets": counts, "locked": {"tickets": locked.tickets, "sats": locked.sats},
+            let mut v = json!({"synced": self.ticket_synced.load(Ordering::SeqCst), "tickets": counts,
+                               "failed_by": failed_by(st.book.tickets.values(), &st.book), "locked": {"tickets": locked.tickets, "sats": locked.sats},
                                "booked_sats": booked, "sessions": sessions.iter().map(|s| s.public()).collect::<Vec<_>>(), "cursor": st.book.cursor.to_string(),
                                "caps": {"max_locked_sats": tp.max_locked_sats, "max_locked_tickets": tp.max_locked_tickets}, "reconciled": reconciled});
             if !sid.is_empty() {
@@ -2123,6 +2128,31 @@ impl Signer {
             Ok(())
         })();
     }
+}
+
+/// Why a failed ticket failed, for the counts: `never_sent` (a hash offered that no payment ever
+/// left for: refused by the seller, withdrawn, or dropped when its session ended),
+/// `cancelled_at_stop` (a held ticket that failed once its session was stopping: the unused ones the
+/// seller cancels when a session ends) or `payment_failed`. A failed ticket spent nothing in each case.
+fn failed_as(t: &Ticket, book: &Book) -> &'static str {
+    let stopped = book.sessions.get(&t.session).map_or(0.0, |s| s.stopped_ts);
+    if t.sent_ts <= 0.0 {
+        "never_sent"
+    } else if !t.prepaid && stopped > 0.0 && t.done_ts >= stopped {
+        "cancelled_at_stop"
+    } else {
+        "payment_failed"
+    }
+}
+
+/// How many failed tickets failed each way ([`failed_as`]).
+fn failed_by<'a>(ts: impl Iterator<Item = &'a Ticket>, book: &Book) -> Value {
+    let mut by = json!({"never_sent": 0, "cancelled_at_stop": 0, "payment_failed": 0});
+    for t in ts.filter(|t| t.state == TState::Failed) {
+        let k = failed_as(t, book);
+        by[k] = json!(by[k].as_i64().unwrap_or(0) + 1);
+    }
+    by
 }
 
 /// An offered hash of a session that ended: it can no longer take an invoice.

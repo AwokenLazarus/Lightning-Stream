@@ -73,6 +73,7 @@ A seller that takes tickets adds one entry to `accepts` in its `402` (`PAYMENT-R
 | `settle` | `on-use`: tickets are held until used. `on-arrival`: section 5. | Whether a ticket can be had back. |
 | `receiptKey` | The key that signs the seller's receipts. | With tickets the payment preimage proves nothing: the buyer always knew it. The signed receipt is the proof of what was paid for. |
 | `session` | Path of the session endpoints on the seller's origin. | |
+| `heldAfterPaid` | Optional, on an `on-use` entry: `true` when the seller issues held tickets only to a session that has paid a prepaid ticket (section 2, `prepaid_first`). Absent: no such rule is stated. | A buyer that knows the rule buys its prepaid ticket first, instead of offering hashes the seller would refuse. A buyer that does not read it is still told `prepaid_first` and recovers. |
 
 A buyer MUST refuse an entry whose `ticketBlocks` is above what its owner allows, and one whose
 `ticketMsat` is above it unless `minTicketMsat` lets it ask for a size its owner does allow, or it
@@ -116,7 +117,8 @@ and answer a lock for held tickets before that with `402 prepaid_first` (unsigne
 lock, signed to a later one); the gateway in this tree does so by default where it offers both
 kinds (`caps.held_after_paid`). Without such a rule a hold invoice costs whoever asks for it one
 HTTP request, and the seller's held places can be taken by anyone who reaches it from enough
-addresses. A buyer told `prepaid_first` buys one prepaid ticket, and holds after it is credited.
+addresses. Such a seller says so in its terms (`heldAfterPaid`, section 1), and a buyer that reads
+them buys one prepaid ticket first. A buyer told `prepaid_first` buys one prepaid ticket, and holds after it is credited.
 The invoices of a first lock lapse sooner than others (20 s in the gateway, `caps.first_lock_secs`,
 against 60), and one client address has at most 2 unpaid invoices (`caps.unpaid_per_address`). A request names
 at most `maxTickets` hashes. A hash the seller's node will not issue (it has had an invoice for

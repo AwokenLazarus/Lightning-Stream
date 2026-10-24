@@ -1211,19 +1211,27 @@ fn the_exposure_cap_is_enforced() {
     assert_eq!(st["ready"], false, "{st}");
     assert_eq!(st["exposure"]["over_cap"], true);
     assert!(st["warnings"].to_string().contains("ln_pay refuses"), "{st}");
-    // on-chain coins and HTLCs count too
-    let rig = LnRig::new(json!({"ln": {"exposure_cap_sats": 200_000}}));
+    // HTLCs count; on-chain coins are reported by ln_status and do not count: a cap below the
+    // node's whole balance still pays while its channels are under it
+    let rig = LnRig::new(json!({"ln": {"exposure_cap_sats": 190_000}}));
     let (inv, _) = rig.invoice(100, 32, XBT);
-    rig.ln.set(|s| s.utxos = vec![json!({"amount_sat": "15000", "confirmations": "3", "outpoint": {"txid_str": "cc".repeat(32), "output_index": 0}})]);
+    rig.ln.set(|s| s.utxos = vec![json!({"amount_sat": "500000", "confirmations": "3", "outpoint": {"txid_str": "cc".repeat(32), "output_index": 0}})]);
     rig.ln.set(|s| s.channels[0]["unsettled_balance"] = "6000".into());
-    let r = rig.pay(&inv, 1000);
-    assert_eq!(r["rule"], "ln_exposure_cap", "{r}");
-    assert_eq!(r["exposure"]["onchain_sats"], 15_000);
-    assert_eq!(r["exposure"]["htlc_sats"], 6_000);
-    rig.ln.set(|s| s.utxos.clear());
     let r = rig.pay(&inv, 1000);
     assert_eq!(r["verdict"], "allow", "{r}");
     assert_eq!(r["exposure"]["total_sats"], 186_000);
+    assert_eq!(r["exposure"]["htlc_sats"], 6_000);
+    assert_eq!(r["exposure"]["onchain_sats"], Value::Null, "the payment path does not read the coins: {r}");
+    let st = rig.call("ln_status", json!({}));
+    assert_eq!(st["exposure"]["onchain_sats"], 500_000, "{st}");
+    assert_eq!(st["exposure"]["onchain_counted"], false);
+    assert_eq!(st["exposure"]["over_cap"], false);
+    // more in flight takes the channels over the cap
+    rig.ln.set(|s| s.channels[0]["unsettled_balance"] = "11000".into());
+    let (inv, _) = rig.invoice(100, 40, XBT);
+    let r = rig.pay(&inv, 1000);
+    assert_eq!(r["rule"], "ln_exposure_cap", "{r}");
+    assert_eq!(r["exposure"]["total_sats"], 191_000);
 }
 
 #[test]
@@ -2690,16 +2698,19 @@ fn agp134_each_error_of_the_node_is_carried_as_untrusted_text() {
     assert_eq!((st["ready"].as_bool(), st["chain_check"]["ok"].as_bool(), node_message(&st["chain_check"]).as_str()), (Some(false), Some(false), Some(NODE_SAYS)), "{st}");
     not_the_wallets_words(&r);
     not_the_wallets_words(&st);
-    // the channel list and the coins
+    // the channel list and the coins; a payment reads only the channels (the exposure cap does not
+    // count coins), so unreadable coins leave the rail ready and are a warning in ln_status
     for (call, what) in [("channels", "channels"), ("utxos", "coins")] {
         refusing(&[call]);
-        let r = rig.pay(&inv, 1000);
-        assert_eq!((r["rule"].as_str(), node_message(&r).as_str()), (Some("ln_backend"), Some(NODE_SAYS)), "{call}: {r}");
+        if call == "channels" {
+            let r = rig.pay(&inv, 1000);
+            assert_eq!((r["rule"].as_str(), node_message(&r).as_str()), (Some("ln_backend"), Some(NODE_SAYS)), "{call}: {r}");
+            not_the_wallets_words(&r);
+        }
         let st = rig.call("ln_status", json!({}));
-        assert_eq!(st["ready"], false, "{call}: {st}");
+        assert_eq!(st["ready"], call == "utxos", "{call}: {st}");
         assert_eq!(st["untrusted_ln_data"]["data"]["node_messages"][what], NODE_SAYS, "{call}: {st}");
         assert!(st["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().starts_with(&format!("the LN node's {what} could not be read (LN node HTTP 500)"))), "{call}: {st}");
-        not_the_wallets_words(&r);
         not_the_wallets_words(&st);
     }
     // the watchtower list: a warning on regtest, with the message in the list's own report
