@@ -8,7 +8,8 @@ LAB=$ROOT/run/lightning-fork-lab
 LF=$ROOT/run/lightning-fork
 LAB_REV=a5cadc5604cd18a0b2f4901ef380cdf4d44ee75a
 # LAB_LF_REV: another Lightning Fork revision or tag to build and run instead (the bin/ marker
-# rebuilds the nodes whenever it changes)
+# rebuilds the nodes whenever it changes); LAB_GO_IMAGE: the Go image to build it with, for a
+# release that needs a newer Go (0.21.4-beta-blake2b.21 needs golang:1.26.8)
 LF_REV=${LAB_LF_REV:-cebc10fe01e811a38c2830c0396bd3c9182e5d62}
 # wtclientrpc (AGP-049): ln_status lists the wtclient's towers over REST
 LF_TAGS="autopilotrpc signrpc walletrpc chainrpc invoicesrpc watchtowerrpc wtclientrpc peersrpc routerrpc offersrpc"
@@ -22,7 +23,7 @@ if [ ! -x "$LAB/bin/lnd" ] || [ ! -x "$LAB/bin/lncli" ] || [ "$(cat "$LAB/bin/.t
   GOCACHE_DIR=${LN_RAIL_GOCACHE:-$ROOT/run/gocache}
   mkdir -p "$LAB/bin" "$GOCACHE_DIR"
   docker run --rm --cpus=4 -u "$(id -u):$(id -g)" -e HOME=/tmp -e GOWORK=off -e GOCACHE=/cache/build -e GOMODCACHE=/cache/mod \
-    -e GOFLAGS=-buildvcs=false -e T="$LF_TAGS" -v "$LF:/src:ro" -v "$GOCACHE_DIR:/cache" -v "$LAB/bin:/out" -w /src golang:1.25.13 \
+    -e GOFLAGS=-buildvcs=false -e T="$LF_TAGS" -v "$LF:/src:ro" -v "$GOCACHE_DIR:/cache" -v "$LAB/bin:/out" -w /src "${LAB_GO_IMAGE:-golang:1.25.13}" \
     sh -c 'go build -tags "$T" -o /out/lnd ./cmd/lnd && go build -tags "$T" -o /out/lncli ./cmd/lncli'
   echo "$LF_REV $LF_TAGS" > "$LAB/bin/.tags"
 fi
