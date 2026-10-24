@@ -7,7 +7,9 @@
 LAB=$ROOT/run/lightning-fork-lab
 LF=$ROOT/run/lightning-fork
 LAB_REV=a5cadc5604cd18a0b2f4901ef380cdf4d44ee75a
-LF_REV=cebc10fe01e811a38c2830c0396bd3c9182e5d62
+# LAB_LF_REV: another Lightning Fork revision or tag to build and run instead (the bin/ marker
+# rebuilds the nodes whenever it changes)
+LF_REV=${LAB_LF_REV:-cebc10fe01e811a38c2830c0396bd3c9182e5d62}
 # wtclientrpc (AGP-049): ln_status lists the wtclient's towers over REST
 LF_TAGS="autopilotrpc signrpc walletrpc chainrpc invoicesrpc watchtowerrpc wtclientrpc peersrpc routerrpc offersrpc"
 
