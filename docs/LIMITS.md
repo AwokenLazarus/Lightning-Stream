@@ -819,7 +819,11 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
 - An answer the wallet stops at `max_sats` can be charged for what the seller had already sent:
   up to the balance, so less than one ticket more than the call's limit.
 - The balance is given up whenever a session ends: `ticket_stop`, 120 s without a paid request, a
-  seller fault, changed terms, a restart of the signer. Each costs less than one ticket.
+  seller fault, changed terms, a restart of the signer. Each costs less than one ticket (on
+  mainnet, 580 sat of a 1,000 sat ticket in the first rehearsal). The stop reports it
+  (`left_with_seller_msat`) and the audit log records it (`ticket_left_with_seller`). The seller
+  keeps a balance for 24 hours, but a new session of the wallet does not take up an old one, so
+  the wallet does not spend it later. Smaller tickets make this cost smaller.
 - A seller can take one ticket and serve nothing; the wallet then stops the session. Node ids and
   origins are free to make, so under a task that pays any seller what bounds this is the task's
   budget and its cap per unnamed seller.

@@ -1915,7 +1915,15 @@ impl Signer {
             sent = matches!(self.ticket_call(hs, "cancel", &json!({"hashes": "all"}), false), Ok((200, _, _)));
         }
         let still = self.ticket_wait_cancelled(&hs.sid, if sent { wait } else { Duration::ZERO });
-        json!({"session": hs.sid, "why": why, "cancel_asked": asked.len(), "cancel_sent": sent, "still_locked": still, "account": hs.public()})
+        // what the seller was paid and did not serve: under one ticket, since a ticket is released only when
+        // the balance does not cover the next request. It is the seller's now; the owner sees it here and in the audit
+        let left = hs.balance();
+        if left > 0 {
+            self.ticket_audit("ticket_left_with_seller", json!({"session": hs.sid, "dest": format!("ln:{}", hs.terms.terms.payee), "origin": hs.origin,
+                                                                "left_msat": left.to_string(), "why": why}));
+        }
+        json!({"session": hs.sid, "why": why, "cancel_asked": asked.len(), "cancel_sent": sent, "still_locked": still, "left_with_seller_msat": left.to_string(),
+               "account": hs.public()})
     }
 
     /// Reconcile with the wallet's node until no ticket of the session is locked and unreleased, or

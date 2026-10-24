@@ -996,6 +996,27 @@ fn a_page_is_paid_with_one_ticket_and_the_next_pages_from_the_balance() {
     assert_ne!(again["session"], first["session"]);
 }
 
+/// The most a session leaves with the seller when it ends is under one ticket: a ticket is released
+/// only when the balance does not cover what the next request needs, so after every call the
+/// balance is what the released tickets came to less what was served, and less than one ticket.
+#[test]
+fn the_balance_a_session_leaves_with_the_seller_is_always_under_one_ticket() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    let (mut released, mut spent) = (0u64, 0u64);
+    // a page, then files of 5 MB (the size of the mainnet rehearsal's), 1 MiB, 7 MiB and 3 bytes
+    for (path, max) in [("/page/10".to_string(), 10), (format!("/files/{}", 5_000_000), 2_000), (format!("/files/{MIB}"), 2_000),
+                        (format!("/files/{}", 7 * MIB), 2_000), ("/files/3".to_string(), 10)] {
+        let v = r.pay(&path, max);
+        assert_eq!((v["status"].as_u64(), v["complete"].as_bool().unwrap_or(true)), (Some(200), true), "{path}: {v}");
+        released += v["tickets_released"].as_u64().unwrap();
+        spent += v["price_msat"].as_str().unwrap().parse::<u64>().unwrap();
+        let balance: u64 = v["balance_msat"].as_str().unwrap().parse().unwrap();
+        assert_eq!(balance, released * TICKET - spent, "{path}: {v}");
+        assert!(balance < TICKET, "{path}: {balance} msat left, a ticket or more: {v}");
+    }
+}
+
 #[test]
 fn a_file_priced_by_the_byte_is_paid_as_it_arrives_and_stops_where_the_call_or_the_agent_says() {
     let _g = env_lock();
@@ -1990,6 +2011,10 @@ fn an_idle_session_is_stopped_and_its_tickets_cancelled_by_the_wallet_itself() {
     let acts = r.tick();
     let stop = acts["actions"].as_array().unwrap().iter().find_map(|a| a.get("ticket_idle_stop")).cloned().unwrap_or_else(|| panic!("{acts}"));
     assert_eq!((stop["cancel_asked"].as_u64(), stop["cancel_sent"].as_bool()), (Some(7), Some(true)), "{stop}");
+    // what the seller keeps of the one ticket released: the part of it the page did not use, and under one ticket
+    let left: u64 = stop["left_with_seller_msat"].as_str().unwrap().parse().unwrap();
+    assert_eq!(left.to_string(), stop["account"]["balance_msat"].as_str().unwrap(), "{stop}");
+    assert!(left > 0 && left < TICKET, "{stop}");
     wait_for("the seven to come back", || {
         r.tick();
         r.ln.by_status("IN_FLIGHT").is_empty()
