@@ -1017,6 +1017,49 @@ fn the_balance_a_session_leaves_with_the_seller_is_always_under_one_ticket() {
     }
 }
 
+/// A body streamed on as it is paid for (`stream_to`), as a local player needs it: the reader at
+/// the socket gets the whole body, the same bytes the receipt signs; and a reader that goes away
+/// ends the call there, with nothing more released.
+#[test]
+fn a_body_is_streamed_to_a_local_reader_as_it_is_paid_and_stops_when_the_reader_goes() {
+    use std::io::Read as _;
+    use std::os::unix::net::UnixListener;
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = Rig::new(json!({}));
+    // the whole body, to a reader that reads it all
+    let l = UnixListener::bind(dir.path().join("film-1")).unwrap();
+    let reader = std::thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        let mut all = vec![];
+        s.read_to_end(&mut all).unwrap();
+        all
+    });
+    let n = 12 * MIB;
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{n}")), "max_sats": 5_000, "task": "film", "stream_to": "film-1"}));
+    let got = reader.join().unwrap();
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), got.len()), (Some(200), Some(true), n), "{v}");
+    assert_eq!(hex::encode(Sha256::digest(&got)), pattern_digest(n));
+    // a reader that takes 1 MiB and goes: the call stops, and does not pay for the rest of the file
+    let l = UnixListener::bind(dir.path().join("film-2")).unwrap();
+    let reader = std::thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        let mut buf = vec![0u8; MIB];
+        s.read_exact(&mut buf).unwrap();
+    });
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{}", 30 * MIB)), "max_sats": 20_000, "task": "film", "stream_to": "film-2"}));
+    reader.join().unwrap();
+    assert_eq!(v["complete"].as_bool(), Some(false), "{v}");
+    assert!(v["ended"].as_str().unwrap().contains("stopped by the buyer"), "{v}");
+    assert!(v["tickets_released"].as_u64().unwrap() <= 2, "{v}");
+    // a name with a path in it is refused before anything is sent
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": 10, "task": "film", "stream_to": "../x"}));
+    assert_eq!(v["rule"], "stream_to", "{v}");
+    std::env::remove_var("B2_STREAM_DIR");
+    r.assert_booked();
+}
+
 #[test]
 fn a_file_priced_by_the_byte_is_paid_as_it_arrives_and_stops_where_the_call_or_the_agent_says() {
     let _g = env_lock();

@@ -267,15 +267,39 @@ struct Sink {
     cap: usize,
     file: Option<(std::fs::File, PathBuf)>,
     file_error: Option<String>,
+    /// Where the body goes as it arrives, for a caller that streams it on (a player): the socket
+    /// the call named in `stream_to`.
+    out: Option<std::os::unix::net::UnixStream>,
+    /// The reader at `out` went away: the call reads no further.
+    gone: bool,
 }
 
 impl Sink {
     fn new() -> Self {
-        Self { hash: Sha256::new(), bytes: 0, preview: vec![], cap: body_cap(), file: None, file_error: None }
+        Self { hash: Sha256::new(), bytes: 0, preview: vec![], cap: body_cap(), file: None, file_error: None, out: None, gone: false }
+    }
+
+    /// A sink for `c`: one that streams to the call's socket where it named one. A socket that
+    /// cannot be reached is a reader already gone.
+    fn for_call(c: &Call) -> Self {
+        let mut s = Self::new();
+        if let Some(path) = &c.stream_to {
+            match std::os::unix::net::UnixStream::connect(path) {
+                Ok(u) => s.out = Some(u),
+                Err(_) => s.gone = true,
+            }
+        }
+        s
     }
 
     fn put(&mut self, chunk: &[u8]) {
         use std::io::Write;
+        if let Some(out) = self.out.as_mut() {
+            if out.write_all(chunk).is_err() {
+                self.out = None;
+                self.gone = true;
+            }
+        }
         self.hash.update(chunk);
         self.bytes += chunk.len() as u64;
         let room = self.cap.saturating_sub(self.preview.len());
@@ -425,6 +449,8 @@ struct Call<'a> {
     /// SHA-256 of each piece of the answer's body, hex, where the caller knows them (a file whose
     /// piece hashes it already holds): a piece paid by a draw gets its value only if it matches.
     piece_hashes: Vec<String>,
+    /// A socket in `B2_STREAM_DIR` the body is streamed to as it arrives (`stream_to`).
+    stream_to: Option<PathBuf>,
 }
 
 /// What one call released: the hashes, the sats the book put in the ledger for them, and how many
@@ -510,6 +536,21 @@ impl Stream {
     fn due_time(&self, credited: u64) -> bool {
         self.price.second_msat > 0 && self.avail(credited) < self.fixed().saturating_add(self.price.second_msat)
     }
+}
+
+/// Why a call stopped reading when the program it streams to stopped reading first.
+const READER_GONE: &str = "stopped by the buyer: the reader the body was streamed to went away";
+
+/// The socket a call streams its body to (`stream_to`): a name in `B2_STREAM_DIR`, which the
+/// operator sets for a local program that hands the body on (a player). A name, never a path, so a
+/// call reaches no socket outside that directory.
+fn stream_socket(v: Option<&Value>) -> std::result::Result<Option<PathBuf>, String> {
+    let Some(name) = v.and_then(Value::as_str).filter(|s| !s.is_empty()) else { return Ok(None) };
+    if name.len() > 64 || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.') || name.starts_with('.') {
+        return Err("stream_to is a socket name of letters, digits, '-', '_' and '.', in B2_STREAM_DIR".into());
+    }
+    let dir = std::env::var("B2_STREAM_DIR").map_err(|_| "stream_to needs B2_STREAM_DIR, the directory of the sockets a body may be streamed to".to_string())?;
+    Ok(Some(PathBuf::from(dir).join(name)))
 }
 
 /// The x402 scheme name of the on-chain channel this wallet once paid: recognised in a 402 only to
@@ -689,6 +730,10 @@ impl Signer {
             _ => vec![],
         };
         let task = Self::ticket_task_for(&tp, &str_or_empty(p.get("task")));
+        let stream_to = match stream_socket(p.get("stream_to")) {
+            Ok(s) => s,
+            Err(why) => return deny("stream_to", why),
+        };
         // the owner's word before any request leaves: an allowlisted origin, or a task that pays any seller
         let listed = self.engine.allowlist().contains(&origin);
         if !self.ticket_may_reach(&origin, task.as_deref().unwrap_or("")) {
@@ -711,7 +756,10 @@ impl Signer {
         };
         if probe.status != 402 {
             let status = probe.status;
-            let mut sink = Sink::new();
+            let mut sink = match &stream_to {
+                Some(path) => Sink { out: std::os::unix::net::UnixStream::connect(path).ok(), ..Sink::new() },
+                None => Sink::new(),
+            };
             let ended = read_all(probe, &mut sink);
             let (_, stored, text) = sink.done();
             return with(with(json!({"verdict": "allow", "rule": "free", "rail": "none", "status": status, "charged_sats": 0, "note": "no 402 (already free or error)",
@@ -727,7 +775,7 @@ impl Signer {
         if max_sats == 0 {
             return with(deny("max_sats", "the seller asks to be paid and this call may spend nothing (max_sats 0)"), json!({"charged_sats": 0}));
         }
-        let call = Call { url: &url, origin: &origin, method: &method, body: &raw, max_sats, task, piece_hashes };
+        let call = Call { url: &url, origin: &origin, method: &method, body: &raw, max_sats, task, piece_hashes, stream_to };
         let mut passed: Vec<Value> = vec![];
         let mut ways = offers(&pr, &lightning);
         // tickets or draws first: one rule ([`crate::lottery::choose`]); the other is tried after it
@@ -840,7 +888,7 @@ impl Signer {
         match self.wire(c.method, c.url, c.body, &[("PAYMENT-SIGNATURE".into(), header)], Self::ticket_read_timeout(tp)) {
             Ok(ans) => {
                 out["status"] = ans.status.into();
-                let mut sink = Sink::new();
+                let mut sink = Sink::for_call(c);
                 let ended = read_all(ans, &mut sink);
                 let (_, stored, text) = sink.done();
                 out = with(with(out, stored), json!({"complete": ended.is_none(), "ended": ended, UNTRUSTED_KEY: untrusted(&text, Value::Null)}));
@@ -1686,7 +1734,7 @@ impl Signer {
         };
         let status = ans.status;
         let mut out = json!({"verdict": "allow", "rule": "ok", "status": status});
-        let mut sink = Sink::new();
+        let mut sink = Sink::for_call(c);
         let mut seller_last = Value::Null;
         let (price_msat, receipt_note) = if !hs.streaming.load(Ordering::SeqCst) {
             // a whole answer: paid for at its head, its body hashed against the receipt
@@ -1796,6 +1844,10 @@ impl Signer {
                     }
                 };
                 sink.put(&buf[..n]);
+                if sink.gone {
+                    lock(&state).1.get_or_insert(READER_GONE.into());
+                    break;
+                }
                 let bytes = sink.bytes;
                 lock(&state).0 = bytes;
                 if length.is_some_and(|l| bytes >= l) {
@@ -2108,6 +2160,9 @@ fn read_all(ans: WireAnswer, sink: &mut Sink) -> Option<String> {
             Ok(0) => break,
             Ok(n) => sink.put(&buf[..n]),
             Err(e) => return Some(format!("cut short: {:?}", e.kind())),
+        }
+        if sink.gone {
+            return Some(READER_GONE.into());
         }
     }
     length.filter(|l| *l != sink.bytes).map(|l| format!("cut short: {} of {l} bytes", sink.bytes))

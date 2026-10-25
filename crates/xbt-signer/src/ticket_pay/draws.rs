@@ -786,7 +786,7 @@ impl Signer {
         };
         let status = ans.status;
         let mut out = json!({"verdict": "allow", "rule": "ok", "status": status});
-        let mut sink = Sink::new();
+        let mut sink = Sink::for_call(c);
         if status >= 400 {
             // an error of the service, passed on: no piece, and no draw
             let ended = read_all(ans, &mut sink);
@@ -982,6 +982,10 @@ impl Signer {
                     let have = sink.bytes;
                     let take = if by_bytes { ((n - off) as u64).min(piece_bytes - have % piece_bytes) as usize } else { n - off };
                     sink.put(&buf[off..off + take]);
+                    if sink.gone {
+                        stop_now(super::READER_GONE.into());
+                        break;
+                    }
                     off += take;
                     if by_bytes {
                         piece_hash.update(&buf[off - take..off]);
@@ -992,7 +996,7 @@ impl Signer {
                         }
                     }
                 }
-                if length.is_some_and(|l| sink.bytes >= l) {
+                if sink.gone || length.is_some_and(|l| sink.bytes >= l) {
                     break;
                 }
             }
