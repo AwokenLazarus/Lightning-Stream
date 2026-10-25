@@ -396,7 +396,7 @@ mod tests {
                                 url: "https://media.lazarus-xbt.xyz/v?static=true&x=1".into(), credit: "CC <BY>".into() }] };
         let ctx = Ctx { sid: "s".into(), csrf: "tok&1".into(), flash: None };
         let html = player_html(&ctx, "http://127.0.0.1:8480/", &svc, &svc.items[0]);
-        assert!(html.contains("src=\"http://127.0.0.1:8480/s/https://media.lazarus-xbt.xyz/v?static=true&amp;x=1\""));
+        assert!(html.contains("src=\"./s/https://media.lazarus-xbt.xyz/v?static=true&amp;x=1\""));
         assert!(html.contains("Stop and cut the connection"));
         assert!(html.contains("value=\"tok&amp;1\""));
         assert!(html.contains("&lt;b&gt;") && html.contains("CC &lt;BY&gt;"));

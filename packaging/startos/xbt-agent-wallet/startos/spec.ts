@@ -21,7 +21,7 @@ export type MountSpec = {
   subpath: string | null
   mountpoint: string
   readonly: boolean
-  dependency?: { packageId: string; volumeId: string; type: 'file' }
+  dependency?: { packageId: string; volumeId: string; type: 'file' | 'directory' }
 }
 
 export type ServiceSpec = {
@@ -55,11 +55,24 @@ export type Config = {
   lightningRest: string
 }
 
-/** Where the Lightning node's certificate is mounted in the signer and the UI, and where the rail macaroon is. */
+/**
+ * How the Lightning node's certificate reaches the signer and the UI.
+ * - 'pin' (now): StartOS 0.4 mounts another package's data only as a folder, and Lightning Fork keeps
+ *   tls.cert beside its macaroons, the admin one among them. Nothing of it is mounted: the owner pins
+ *   the certificate on the UI's Lightning page (it shows the fingerprint the node presents), which
+ *   writes it into the wallet's own run/ln. A certificate that later changes is refused by the signer
+ *   until the owner pins again.
+ * - 'folder' (once Lightning Fork keeps tls.cert in a folder of its own): mount that folder read-only
+ *   (LF_CERT_FOLDER, to be confirmed against its release) and the page offers no pinning.
+ */
+export const CERT_SOURCE = 'pin' as 'pin' | 'folder'
+const LF_CERT_FOLDER = 'tls'
+
+/** Where the Lightning node's certificate is in the signer and the UI, and where the rail macaroon is. */
 export const LIGHTNING = {
   packageId: 'lightning-fork',
   restPort: 8080,
-  cert: '/data/lightning/tls.cert',
+  cert: CERT_SOURCE === 'pin' ? '/data/run/ln/tls.cert' : '/data/lightning/tls.cert',
   macaroon: '/data/run/ln/rail.macaroon',
 } as const
 
@@ -76,13 +89,14 @@ export const IMAGES: Record<ImageKey, string> = {
 }
 
 const vol = (subpath: string | null, mountpoint: string, readonly = false): MountSpec => ({ subpath, mountpoint, readonly })
-/** Lightning Fork's tls.cert, at the root of its `main` volume (its init/setupCerts.ts writes it there) */
+/** Lightning Fork's certificate folder, mounted only in the 'folder' mode (CERT_SOURCE) */
 const lightningCert: MountSpec = {
-  subpath: 'tls.cert',
-  mountpoint: LIGHTNING.cert,
+  subpath: LF_CERT_FOLDER,
+  mountpoint: '/data/lightning',
   readonly: true,
-  dependency: { packageId: LIGHTNING.packageId, volumeId: 'main', type: 'file' },
+  dependency: { packageId: LIGHTNING.packageId, volumeId: 'main', type: 'directory' },
 }
+const certMounts = (rest: string): MountSpec[] => (rest && CERT_SOURCE === 'folder' ? [lightningCert] : [])
 
 export function services(cfg: Config): ServiceSpec[] {
   const node = {
@@ -128,7 +142,7 @@ export function services(cfg: Config): ServiceSpec[] {
         vol('run/signer', '/data/run/signer'),
         vol('run/anchor', '/data/run/anchor', true),
         vol('run/ln', '/data/run/ln', true),
-        ...(cfg.lightningRest ? [lightningCert] : []),
+        ...certMounts(cfg.lightningRest),
       ],
       requires: ['witness'],
       readyCommand: ['/usr/bin/xbt-signer', 'healthcheck'],
@@ -153,7 +167,7 @@ export function services(cfg: Config): ServiceSpec[] {
         XBT_UI_BIND: `0.0.0.0:${PORTS.ui}`,
         XBT_UI_SIGNER_SOCK: '/data/run/signer/signer.sock',
         XBT_UI_MCP_URL: cfg.mcpUrls.join(','),
-        ...(cfg.lightningRest ? { XBT_UI_LN_REST: cfg.lightningRest, XBT_UI_LN_TLS_CERT: LIGHTNING.cert } : {}),
+        ...(cfg.lightningRest ? { XBT_UI_LN_REST: cfg.lightningRest, XBT_UI_LN_TLS_CERT: LIGHTNING.cert, XBT_UI_LN_TLS_PIN: CERT_SOURCE === 'pin' ? '1' : '0' } : {}),
       },
       // the UI owns the MCP token and rotates it on its Agents page; its Lightning page writes run/ln
       mounts: [
@@ -161,7 +175,7 @@ export function services(cfg: Config): ServiceSpec[] {
         vol('run/signer', '/data/run/signer', true),
         vol('run/ui', '/data/run/ui'),
         vol('run/ln', '/data/run/ln'),
-        ...(cfg.lightningRest ? [lightningCert] : []),
+        ...certMounts(cfg.lightningRest),
       ],
       requires: ['signer'],
       port: PORTS.ui,

@@ -24,11 +24,14 @@ ed25519-dalek = "2.1"
 xbt-gateway = { path = "../xbt-gateway" }
 # a macaroon pasted as base64 (already in the tree through the gateway and the signer)
 base64.workspace = true
+# the player's video, relayed from the connector on loopback (the tree's own HTTP client, already used by the gateway)
+ureq.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
-ureq.workspace = true
 xbt-signer.workspace = true
 xbt-wallet-mcp = { path = "../xbt-wallet-mcp" }
 xbt402 = { workspace = true, features = ["http-client", "http-server"] }
 xbt-primitives.workspace = true
+# a TLS node for the certificate-pinning test (the gateway's own version and features)
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

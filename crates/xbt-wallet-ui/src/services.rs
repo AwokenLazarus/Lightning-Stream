@@ -285,7 +285,9 @@ pub fn player_src(connector: &str, item_url: &str) -> Result<String, String> {
     let base = connector.trim().trim_end_matches('/');
     http_url(base, "XBT_UI_CONNECTOR")?;
     http_url(item_url, "item url")?;
-    Ok(format!("{base}/s/{item_url}"))
+    // this page's own address: the UI relays it to the connector ([`crate::server`]), so a player on
+    // another device of the network reaches it too (the connector itself listens on loopback only)
+    Ok(format!("./s/{item_url}"))
 }
 
 /// Percent-encoding for a query value.

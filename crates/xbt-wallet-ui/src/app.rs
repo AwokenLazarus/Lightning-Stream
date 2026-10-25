@@ -146,6 +146,26 @@ impl App {
         self.cfg.allow_ips.is_empty() || self.cfg.allow_ips.iter().any(|p| peer == p || (p.ends_with('.') || p.ends_with(':')) && peer.starts_with(p.as_str()))
     }
 
+    /// For `GET /s/<seller URL>` (the player's video), the same checks as a page of the wallet:
+    /// `Some(Ok)` to relay it, `Some(Err)` with the answer that refuses it; `None` for anything else.
+    pub fn relay_gate(&self, req: &Req) -> Option<Result<(), Resp>> {
+        let path = strip_base(&req.path, &self.cfg.base_path)?;
+        if req.method != "GET" || !path.starts_with("/s/") || self.cfg.role == Role::Gateway {
+            return None;
+        }
+        if !self.peer_allowed(&req.peer) {
+            return Some(Err(Resp::text(403, "text/plain", "forbidden")));
+        }
+        if !host_allowed(req.header("host"), &self.cfg.allowed_hosts) {
+            return Some(Err(Resp::text(421, "text/plain", "unknown Host: add it to XBT_UI_ALLOWED_HOSTS")));
+        }
+        let sid = req.cookie(COOKIE).unwrap_or_default();
+        if !self.auth.has_password() || self.auth.with_session(&sid, |_| ()).is_none() {
+            return Some(Err(Resp::text(401, "text/plain", "login required")));
+        }
+        Some(Ok(()))
+    }
+
     pub fn handle(&self, mut req: Req) -> Resp {
         if !self.peer_allowed(&req.peer) {
             return Resp::text(403, "text/plain", "forbidden");
