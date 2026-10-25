@@ -63,10 +63,10 @@ export type Config = {
  *   writes it into the wallet's own run/ln. A certificate that later changes is refused by the signer
  *   until the owner pins again.
  * - 'folder' (once Lightning Fork keeps tls.cert in a folder of its own): mount that folder read-only
- *   (LF_CERT_FOLDER, to be confirmed against its release) and the page offers no pinning.
+ *   (LF_CERT_FOLDER: Lightning Fork's public/ folder, which holds only tls.cert and is kept current) and the page offers no pinning.
  */
 export const CERT_SOURCE = 'pin' as 'pin' | 'folder'
-const LF_CERT_FOLDER = 'tls'
+const LF_CERT_FOLDER = 'public'
 
 /** Where the Lightning node's certificate is in the signer and the UI, and where the rail macaroon is. */
 export const LIGHTNING = {

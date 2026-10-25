@@ -48,10 +48,10 @@ export type Config = {
  * mounts nothing of Lightning Fork (its tls.cert sits beside its macaroons, and StartOS 0.4 mounts a
  * folder or nothing); the owner pins the certificate on the setup page, which writes it into the
  * gateway's own run/gateway. 'folder', once Lightning Fork keeps tls.cert in a folder of its own,
- * mounts that folder read-only (LF_CERT_FOLDER, to be confirmed against its release).
+ * mounts that folder read-only (LF_CERT_FOLDER: Lightning Fork's public/ folder, which holds only tls.cert and is kept current).
  */
 export const CERT_SOURCE = 'pin' as 'pin' | 'folder'
-const LF_CERT_FOLDER = 'tls'
+const LF_CERT_FOLDER = 'public'
 
 export const LIGHTNING = {
   packageId: 'lightning-fork',
