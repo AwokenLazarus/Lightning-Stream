@@ -13,6 +13,7 @@
 //! * [`maturity`]: coinbase maturity as the node reports it (`getdeploymentinfo`).
 //! * [`macaroon`]: a Lightning node's macaroon, read (shared with `xbt-signer`'s Lightning rail).
 //! * [`json`]: JSON written as the Python references write it, and integers above 2^64.
+//! * [`listing`]: a seller's signed catalog (`docs/LISTINGS.md`).
 //!
 //! The crate began as the Rust port of the on-chain one-way channel (the x402 `batch-settlement`
 //! scheme on XBT: funding, signed states, close, rollover, refund). That channel was frozen on
@@ -25,6 +26,7 @@
 pub mod client;
 pub mod error;
 pub mod json;
+pub mod listing;
 pub mod lottery;
 pub mod macaroon;
 pub mod maturity;
