@@ -580,7 +580,10 @@ impl Node for LndRest {
         cltv_blocks: u32,
         expiry_s: u32,
     ) -> Result<String, NodeError> {
-        let body = json!({"hash": B64.encode(hash), "value_msat": msat.to_string(), "cltv_expiry": cltv_blocks.to_string(), "expiry": expiry_s.to_string()});
+        let body = json!({"hash": B64.encode(hash), "value_msat": msat.to_string(), "cltv_expiry": cltv_blocks.to_string(), "expiry": expiry_s.to_string(),
+                          // route hints for the node's private channels: a seller with no public channel is
+                          // otherwise unreachable, and the hints cost nothing where it has public ones
+                          "private": true});
         let v = self.unary(
             &self.invoice_macaroon,
             "POST",
@@ -602,7 +605,10 @@ impl Node for LndRest {
         cltv_blocks: u32,
         expiry_s: u32,
     ) -> Result<String, NodeError> {
-        let body = json!({"r_preimage": B64.encode(preimage), "value_msat": msat.to_string(), "cltv_expiry": cltv_blocks.to_string(), "expiry": expiry_s.to_string()});
+        let body = json!({"r_preimage": B64.encode(preimage), "value_msat": msat.to_string(), "cltv_expiry": cltv_blocks.to_string(), "expiry": expiry_s.to_string(),
+                          // route hints for the node's private channels: a seller with no public channel is
+                          // otherwise unreachable, and the hints cost nothing where it has public ones
+                          "private": true});
         let v = self.unary(&self.invoice_macaroon, "POST", "/v1/invoices", Some(&body))?;
         // the invoice is for the hash of the preimage that was sent, or it is not this ticket's
         let hash: Hash = Sha256::digest(preimage).into();
@@ -863,6 +869,39 @@ mod tests {
             }
             run.stopper().stop();
         }
+    }
+
+    /// Every invoice asks for route hints: a seller node with only private channels issues invoices
+    /// nobody can route to without them.
+    ///
+    /// FAILS before: neither request named `private`, and a seller with no public channel could not
+    /// be paid.
+    #[test]
+    fn every_invoice_asks_the_node_for_route_hints() {
+        struct Rest(std::sync::Mutex<Vec<(String, Value)>>);
+        impl xbt_svc::http::Handler for Rest {
+            fn body_limit(&self, _m: &str, _t: &str) -> usize {
+                4096
+            }
+            fn handle(&self, req: xbt_svc::http::Request) -> xbt_svc::http::Response {
+                let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+                let hash = body.get("r_preimage").and_then(Value::as_str).and_then(|p| B64.decode(p).ok())
+                    .map(|p| B64.encode(Sha256::digest(&p))).unwrap_or_default();
+                self.0.lock().unwrap().push((req.target.clone(), body));
+                let answer = json!({"payment_request": "lnbc1", "r_hash": hash});
+                xbt_svc::http::Response::text(200, "application/json", answer.to_string())
+            }
+        }
+        let rest = Arc::new(Rest(std::sync::Mutex::new(vec![])));
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let run = xbt_svc::http::serve(rest.clone(), l, 1).unwrap();
+        let node = LndRest::new(&format!("http://{}", run.addr), b"", b"", None).unwrap();
+        node.add_hold(&[7u8; 32], 1_000_000, 40, 60).unwrap();
+        node.add_invoice(&[9u8; 32], 64_000, 40, 60).unwrap();
+        run.stopper().stop();
+        let seen = rest.0.lock().unwrap().clone();
+        assert_eq!(seen.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(), ["/v2/invoices/hodl", "/v1/invoices"]);
+        assert!(seen.iter().all(|(_, b)| b["private"] == true), "{seen:?}");
     }
 
     #[test]
