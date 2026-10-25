@@ -93,14 +93,20 @@ pub struct Nav<'a> {
     pub brand: &'a str,
 }
 
-pub const WALLET_PAGES: [(&str, &str); 9] = [("./", "Overview"), ("./approvals", "Approvals"), ("./policy", "Policy"), ("./lightning", "Lightning"),
-                                             ("./channels", "Channels"), ("./signatures", "Signatures"), ("./keys", "Keys"), ("./agents", "Agents"),
-                                             ("./setup", "Setup")];
+pub const WALLET_PAGES: [(&str, &str); 12] = [("./", "Overview"), ("./browse", "Browse"), ("./play", "Player"), ("./connections", "Connections"),
+                                              ("./approvals", "Approvals"), ("./policy", "Policy"), ("./lightning", "Lightning"), ("./channels", "Channels"),
+                                              ("./signatures", "Signatures"), ("./keys", "Keys"), ("./agents", "Agents"), ("./setup", "Setup")];
 pub const GATEWAY_PAGES: [(&str, &str); 1] = [("./", "Gateway")];
 pub const WALLET_BRAND: &str = "XBT Agent Wallet";
 pub const GATEWAY_BRAND: &str = "Lightning Stream Gateway";
 
 pub fn page(title: &str, nav: &Nav, flash: Option<(bool, String)>, body: &str) -> String {
+    page_head(title, nav, flash, body, "")
+}
+
+/// As [`page`], with extra markup inside `<head>` (a refresh, for the connections page). `head` is
+/// this crate's own markup, never a value from a request or from a seller.
+pub fn page_head(title: &str, nav: &Nav, flash: Option<(bool, String)>, body: &str, head: &str) -> String {
     let mut links = String::new();
     if nav.logged_in {
         for &(href, name) in nav.pages {
@@ -118,7 +124,7 @@ pub fn page(title: &str, nav: &Nav, flash: Option<(bool, String)>, body: &str) -
     }
     let flash = flash.map(|(ok, m)| format!("<div class=\"flash {}\" role=\"status\">{}</div>", if ok { "ok" } else { "bad" }, esc(&m))).unwrap_or_default();
     format!("<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-             <meta name=\"referrer\" content=\"no-referrer\"><link rel=\"icon\" href=\"data:,\"><title>{} · {}</title>\
+             <meta name=\"referrer\" content=\"no-referrer\">{head}<link rel=\"icon\" href=\"data:,\"><title>{} · {}</title>\
              <link rel=\"stylesheet\" href=\"./ui.css?v={}\"></head><body>\
              <header><div class=\"brand\">{}</div><nav>{links}</nav></header>\
              <main>{flash}<h1>{}</h1>{body}</main>\

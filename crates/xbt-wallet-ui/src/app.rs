@@ -16,6 +16,9 @@ use crate::link::SignerLink;
 use crate::server::{strip_base, Req, Resp};
 use crate::{msg, now};
 
+#[path = "stream_pages.rs"]
+mod stream_pages;
+
 pub const COOKIE: &str = "xbtui";
 /// How long a signed form stays valid.
 pub const SIGN_WINDOW_S: i64 = 600;
@@ -214,6 +217,9 @@ impl App {
         }
         match req.path.as_str() {
             "/" => self.overview(&ctx),
+            "/browse" => self.browse(&ctx, &req.query),
+            "/play" => self.play(&ctx, &req.query),
+            "/connections" => self.connections(&ctx),
             "/approvals" => self.approvals(&ctx),
             "/policy" => self.policy_page(&ctx, req.query.get("template").map(|t| t == "starter").unwrap_or(false)),
             "/channels" => self.channels(&ctx),
@@ -355,6 +361,8 @@ impl App {
             Resp::redirect(to)
         };
         match req.path.as_str() {
+            "/play" => self.play_stop(ctx, f),
+            "/connections" => self.connections_stop(ctx, f),
             "/logout" => {
                 self.auth.logout(&ctx.sid);
                 Resp::redirect("./login").header("Set-Cookie", &self.cookie(req, "", 0))

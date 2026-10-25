@@ -114,8 +114,14 @@ pub fn strip_base(path: &str, base: &str) -> Option<String> {
     path.strip_prefix(b).filter(|r| r.starts_with('/')).map(str::to_string).or_else(|| Some(path.to_string()))
 }
 
-pub fn security_headers(r: &mut Resp) {
-    for (k, v) in [("Content-Security-Policy", CSP), ("X-Frame-Options", "DENY"), ("X-Content-Type-Options", "nosniff"),
+/// A connector origin is safe to put in `media-src` when it is exactly the canonical http(s) origin.
+fn media_ok(origin: &str) -> bool {
+    crate::services::http_origin(origin).is_some_and(|o| o == origin)
+}
+
+pub fn security_headers(r: &mut Resp, media_origin: &str) {
+    let csp = if media_ok(media_origin) { format!("{CSP}; media-src {media_origin}") } else { CSP.to_string() };
+    for (k, v) in [("Content-Security-Policy", csp.as_str()), ("X-Frame-Options", "DENY"), ("X-Content-Type-Options", "nosniff"),
                    ("Referrer-Policy", "no-referrer"), ("Cross-Origin-Opener-Policy", "same-origin"),
                    ("Cross-Origin-Resource-Policy", "same-origin"), ("Permissions-Policy", "camera=(), microphone=(), geolocation=(), usb=()")] {
         r.headers.push((k.into(), v.into()));
@@ -138,7 +144,8 @@ impl xbt_svc::http::Handler for Ui {
         let headers = rq.headers.iter().map(|(k, v)| (k.to_ascii_lowercase(), v.clone())).collect();
         let req = Req { method: rq.method.to_uppercase(), path: raw_path.to_string(), query: parse_qs(q), headers, body: rq.body, peer };
         let mut resp = self.0.handle(req);
-        security_headers(&mut resp);
+        let media = crate::services::http_origin(&self.0.cfg.connector).unwrap_or_default();
+        security_headers(&mut resp, &media);
         xbt_svc::http::Response::new(resp.status, resp.headers, resp.body)
     }
 }

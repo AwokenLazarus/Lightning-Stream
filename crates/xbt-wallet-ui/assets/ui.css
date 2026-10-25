@@ -87,3 +87,4 @@ ol.steps { list-style: none; padding: 0; }
 [hidden] { display: none !important; }
 dl.kv dt { overflow-wrap: normal; word-break: normal; }
 section.grid { margin-bottom: 24px; }
+video { display: block; width: 100%; max-height: 70vh; background: #000; border-radius: 8px; margin: 0 0 12px; }
