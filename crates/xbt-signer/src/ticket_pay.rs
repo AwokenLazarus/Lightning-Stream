@@ -437,6 +437,10 @@ struct Spent {
 }
 
 /// The pacing of one answer that is priced as it goes: when the next ticket is due.
+/// How far ahead of the last paid byte the next ticket of a body priced by its size is released:
+/// more than a proxy holds back of an answer that pauses ([`Stream::due_bytes`]).
+const PROXY_SLACK: u64 = 64 << 10;
+
 struct Stream {
     price: Price,
     /// The seller's `spentMsat` before this request.
@@ -481,10 +485,25 @@ impl Stream {
         self.price.request_msat.saturating_add(self.price.for_seconds(self.seconds()).unwrap_or(u64::MAX))
     }
 
-    /// A body priced by its size: everything the released tickets pay for has arrived, so the
-    /// balance does not cover one more byte.
-    fn due_bytes(&self, credited: u64, bytes: u64) -> bool {
-        self.price.byte_msat > 0 && bytes >= self.price.bytes_for(self.avail(credited).saturating_sub(self.fixed()))
+    /// How many bytes of the body the released tickets pay for.
+    fn covered(&self, credited: u64) -> u64 {
+        self.price.bytes_for(self.avail(credited).saturating_sub(self.fixed()))
+    }
+
+    /// A body priced by its size: all but the last [`PROXY_SLACK`] bytes the released tickets pay
+    /// for have arrived (at most a quarter of them), and the body goes on past what they pay for.
+    /// Not every paid byte: a proxy between the two (a TLS proxy, a CDN) can hold back the tail of
+    /// an answer that pauses, and the seller pauses where the balance runs out, so a wallet that
+    /// waited for every paid byte would wait for bytes the seller is waiting to be paid to push.
+    fn due_bytes(&self, credited: u64, bytes: u64, length: Option<u64>) -> bool {
+        if self.price.byte_msat == 0 {
+            return false;
+        }
+        let covered = self.covered(credited);
+        if length.is_some_and(|l| l <= covered) {
+            return false;
+        }
+        bytes.saturating_add(PROXY_SLACK.min(covered / 4)) >= covered
     }
 
     /// A body priced by the second: the balance does not cover the second that starts next.
@@ -1763,6 +1782,7 @@ impl Signer {
                 });
             }
             let mut buf = vec![0u8; 64 << 10];
+            let mut unpaid: Option<String> = None;
             loop {
                 if lock(&state).1.is_some() {
                     break;
@@ -1785,13 +1805,20 @@ impl Signer {
                     lock(&state).1.get_or_insert(why);
                     break;
                 }
-                // by bytes: everything the released tickets pay for has arrived, so the next one is due
-                if st.due_bytes(credited(), bytes) {
-                    if let Some(why) = pay(bytes) {
-                        lock(&state).1.get_or_insert(why);
-                        break;
-                    }
+                // by bytes: the next ticket goes a little before what the released ones pay for has all
+                // arrived. If it cannot go, what is paid for is still read, and the answer stops there
+                if unpaid.is_none() && st.due_bytes(credited(), bytes, length) {
+                    unpaid = pay(bytes);
                 }
+                if let Some(why) = unpaid.as_ref().filter(|_| bytes >= st.covered(credited())) {
+                    lock(&state).1.get_or_insert(why.clone());
+                    break;
+                }
+            }
+            // a seller that ended the answer where the paid bytes ran out ended it for the ticket that could not go
+            // (not one that finished the body: a body read to its end needed no more tickets)
+            if let Some(why) = unpaid.filter(|_| read_error.is_some() || length.is_some_and(|l| lock(&state).0 < l)) {
+                lock(&state).1.get_or_insert(why);
             }
             lock(&state).2 = true;
             wake.notify_all();
@@ -2097,9 +2124,18 @@ mod tests {
         // one ticket of 1,000 sat credited on top of the 10 sat spent before: 1,000,000 - 2,500 msat of bytes
         let credited = 1_010_000;
         let limit = per_mib.bytes_for(1_000_000 - 2500);
-        assert!(!st.due_bytes(credited, 0) && !st.due_bytes(credited, limit - 1));
-        assert!(st.due_bytes(credited, limit), "everything the ticket pays for has arrived");
-        assert!(!st.due_bytes(credited + 1_000_000, limit), "the next ticket covers the next byte");
+        // due a little before the last paid byte, by what a proxy may hold back, and not before
+        let early = limit - PROXY_SLACK;
+        assert!(!st.due_bytes(credited, 0, None) && !st.due_bytes(credited, early - 1, None));
+        assert!(st.due_bytes(credited, early, None), "all but the slack of what the ticket pays for has arrived");
+        assert!(st.due_bytes(credited, limit, None));
+        assert!(!st.due_bytes(credited + 1_000_000, limit, None), "the next ticket covers the next byte");
+        // never for a body the balance already covers to its end
+        assert!(!st.due_bytes(credited, early, Some(limit)) && st.due_bytes(credited, early, Some(limit + 1)));
+        // a small balance: the slack is a quarter of what it covers, not more
+        let (small, covered) = (10_000 + 2500 + 800, per_mib.bytes_for(800));
+        let at = covered - covered / 4;
+        assert!(covered / 4 < PROXY_SLACK && !st.due_bytes(small, at - 1, None) && st.due_bytes(small, at, None));
         assert!(!st.due_time(credited), "not priced by time");
         assert_eq!(st.cost(1 << 20), 202_500);
         // by the second: due when the next second is not covered
@@ -2107,11 +2143,11 @@ mod tests {
         let st = Stream { price: per_s, base_spent: 0, started: Instant::now(), max_msat: u64::MAX, max_open: Duration::from_secs(50) };
         assert_eq!(st.seconds(), 1, "the first second has started");
         assert!(st.due_time(100_000), "one second paid, the second is not");
-        assert!(!st.due_time(200_000) && !st.due_bytes(100_000, 1 << 30));
+        assert!(!st.due_time(200_000) && !st.due_bytes(100_000, 1 << 30, None));
         // a price that does not fit is due at once and costs the most there is
         let huge = Stream { price: Price { request_msat: u64::MAX, byte_msat: 1, per_bytes: 1, second_msat: 0 }, base_spent: 0, started: Instant::now(), max_msat: 5, max_open: Duration::from_secs(50) };
         assert_eq!(huge.cost(1), u64::MAX);
-        assert!(huge.due_bytes(1_000_000, 0));
+        assert!(huge.due_bytes(1_000_000, 0, None));
         assert!(huge.over(0).is_some_and(|w| w.starts_with("max_sats")), "and is over any limit");
         // a long body paid for at its head is not cut where the call's limit equals its price
         let flat = Stream { price: Price { request_msat: 5_000, byte_msat: 0, per_bytes: 1, second_msat: 0 }, base_spent: 0, started: Instant::now(), max_msat: 5_000,
