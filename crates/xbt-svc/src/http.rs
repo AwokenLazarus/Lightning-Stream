@@ -142,6 +142,12 @@ pub trait BodyWriter {
     /// Send `bytes` now. An error means the client is gone or took nothing within
     /// [`Limits::stream_write`]: the body stops there.
     fn send(&mut self, bytes: &[u8]) -> io::Result<()>;
+
+    /// Whether the client has closed the connection, seen without waiting. A body that pauses
+    /// (one waiting to be paid for) asks this, since it writes nothing that would fail.
+    fn gone(&mut self) -> bool {
+        false
+    }
 }
 
 /// The body of a [`Streamed`] answer. `Ok` is the whole body; an error is a body cut short, which
@@ -767,6 +773,21 @@ struct StreamOut<'a> {
 }
 
 impl BodyWriter for StreamOut<'_> {
+    fn gone(&mut self) -> bool {
+        // one request per connection: a client still there has sent nothing more, so a read that
+        // would block is a client still there, and the end of the stream or a reset is one gone
+        if self.sock.set_nonblocking(true).is_err() {
+            return false;
+        }
+        let r = self.sock.peek(&mut [0u8; 1]);
+        let _ = self.sock.set_nonblocking(false);
+        match r {
+            Ok(0) => true,
+            Ok(_) => false,
+            Err(e) => !matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted),
+        }
+    }
+
     fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
         if bytes.is_empty() {
             return Ok(());
