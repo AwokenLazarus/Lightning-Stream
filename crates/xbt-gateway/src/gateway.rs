@@ -53,7 +53,7 @@ use xbt_svc::http::{
 };
 
 use crate::book::{Book, Rec, Refusal};
-use crate::config::{Config, Release, Route, SERVICES_PATH};
+use crate::config::{Config, Release, Route, LISTING_PATH, SERVICES_PATH};
 use crate::node::{Hash, Invoice, InvoiceState, Node, NodeError};
 pub use draws::JOURNAL as LOTTERY_JOURNAL;
 use crate::price::Meter;
@@ -1247,6 +1247,13 @@ impl Gateway {
         self.answered(&a, json_response(200, &out), 0)
     }
 
+    /// The signed catalog (`docs/LISTINGS.md`), when the runner wrote one. The receipt key signs it.
+    fn listing_doc(&self) -> Option<Value> {
+        let spec = self.cfg.listing.as_ref()?;
+        let doc = xbt402::listing::document(spec, &self.cfg.public_url, &self.terms.receipt_key);
+        Some(xbt402::listing::sign(&self.key, &doc))
+    }
+
     /// What this gateway sells, for anyone who asks. Not signed: see `docs/TICKETS.md`, section 8.
     fn services(&self) -> Response {
         let routes: Vec<Value> = self
@@ -1763,6 +1770,12 @@ impl Handler for Service {
         }
         if path == SERVICES_PATH && req.method == "GET" {
             return Reply::Whole(gw.services());
+        }
+        if path == LISTING_PATH && req.method == "GET" {
+            return Reply::Whole(match gw.listing_doc() {
+                Some(body) => json_response(200, &body),
+                None => error(404, "no_route", "this seller publishes no listing"),
+            });
         }
         gw.route(req)
     }

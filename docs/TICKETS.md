@@ -712,6 +712,8 @@ too, and holds after it.
 
 ## 8. Open in this draft
 
+- `/services` stays unsigned (`signed: false`). A seller's catalog is a separate document, signed
+  by the receipt key, at `GET /.well-known/lightning-stream.json` (`docs/LISTINGS.md`).
 - The scheme names (`ticket`, `lottery`) are ours; nothing upstream defines them. The network is
   CAIP-2's `bip122:` id with `extra.layer: "lightning"` since 2026-10. The asset name
   `XBT:msat` is ours.

@@ -1930,3 +1930,32 @@ fn a_session_that_paid_nothing_is_told_nothing_of_a_priced_route_not_even_by_a_h
     let got = http(&tight.addr, "HEAD", "/timed/8192", &[("PAYMENT-SIGNATURE", &sig)], b"", None);
     assert_eq!((got.status, tight.hits()), (402, 0), "one ticket does not pay for a second of 2,000 sat");
 }
+
+#[test]
+fn a_listing_is_free_and_signed_by_the_receipt_key() {
+    let (bare, _d) = start(&|_| {});
+    let missing = http(&bare.addr, "GET", "/.well-known/lightning-stream.json", &[], b"", None);
+    assert_eq!(missing.status, 404);
+    assert_eq!(missing.json()["error"], "no_route");
+
+    let (rig, _d2) = start(&|v| {
+        v["listing"] = json!({
+            "name": "Films",
+            "kind": "video",
+            "prices": {"byte_msat": 20, "per_bytes": 1048576},
+            "items": [{"title": "Sintel", "url": "https://media.lazarus-xbt.xyz/Videos/s", "year": 2010, "credit": "(c) Blender Foundation"}],
+            "licence": "CC BY 3.0",
+            "credits": "(c) Blender Foundation, CC BY 3.0",
+            "updated": "2026-10-25",
+        });
+    });
+    let got = http(&rig.addr, "GET", "/.well-known/lightning-stream.json", &[], b"", None);
+    assert_eq!(got.status, 200);
+    assert!(got.header("PAYMENT-REQUIRED").is_none());
+    let listing = xbt402::listing::verify(&got.json(), &KEY(&rig)).unwrap();
+    assert_eq!(listing.seller, rig.origin);
+    assert_eq!((listing.kind.as_str(), listing.items[0].year), ("video", Some(2010)));
+    let priced = http(&rig.addr, "GET", "/files/1000", &[], b"", None);
+    assert_eq!(priced.status, 402);
+    assert_eq!(priced.json()["accepts"][0]["extra"]["receiptKey"], KEY(&rig));
+}

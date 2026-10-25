@@ -42,6 +42,8 @@ Without a password source, the first start prints a one-time setup code and writ
 | `XBT_UI_CMP_STATUS_URL` | | xbt-compute's status JSON (e.g. its `/readyz`, CONTRACT §U), shown as a compact tile |
 | `XBT_UI_MCP_URL` | | MCP endpoint(s) shown on the Agents page |
 | `XBT_UI_MCP_TOKEN_FILE` | `$XBT_DATA_DIR/run/ui/mcp-http-token`, else `<data dir>/secrets/mcp-http-token` | the bearer token shown on Agents. The UI owns it and rotates it there (atomic replace, mode kept, never world-readable); the MCP only reads it (AGP-042) |
+| `XBT_UI_SERVICES` | | path of a JSON list of services for Browse and the player. Each service is `{name, kind, seller, price_text, items}` with `kind` one of `video`, `files`, `api`, and each item `{title, year, url, credit}`. See `examples/services.example.json` (three Creative Commons films). |
+| `XBT_UI_CONNECTOR` | `http://127.0.0.1:8480` | the connector the player loads. A video's source is this URL plus `/s/` plus the item URL. The page's `media-src` allows only that origin. This is the connector's default listen address; the UI's own default bind is the same port, so on one machine set one of the two. |
 
 `GET /healthz` is always 200. `GET /readyz` is 200 when the signer answers, else 503. Neither needs
 a login, and neither reveals wallet state.

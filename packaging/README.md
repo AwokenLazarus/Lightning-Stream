@@ -31,6 +31,7 @@ packaging/
     umbrel-app-store.yml
     lazarus-xbt-agent-wallet/ the wallet: init + witness + signer + MCP + UI, app_proxy -> UI; icon.svg, gallery N.png
     lazarus-lightning-stream-gateway/  the gateway: init + gateway + UI (gateway role), app_proxy -> UI; icon.svg, gallery
+    lazarus-lightning-stream/ one app: the wallet's services, the connector and the gateway; the connector is not on the LAN
     lazarus-xbt-knots/        a stand-in XBT node (pruned Knots 29.4.2, amd64 only) that fills the bitcoin slot
     lint.py                   manifest + compose + hardening lint; the images pinned to images.lock; icon and gallery URLs
     regtest/                  the off-Umbrel overlays and the driver (umbrel_regtest.py)
@@ -81,7 +82,7 @@ the key that signs the package, so it is never committed).
 
 ## Images
 
-The six images the packages run are published on GitHub's container registry, as public packages of the
+The images the wallet and gateway packages run are published on GitHub's container registry, as public packages of the
 `awokenlazarus` account, for linux/amd64, linux/arm64 and linux/arm/v7:
 
     ghcr.io/awokenlazarus/<image>:<version>-<commit>@sha256:<index digest>
@@ -94,7 +95,9 @@ start-cli use the digest and the tag is only a label for people. `packaging/pin_
 references into the Umbrel compose files and the StartOS specs (`startos/spec.ts`); `umbrel/lint.py` and
 `startos/build.sh` refuse a package that does not match the lock. The one image of the store that is not
 published is the stand-in XBT node's, `xbt-a3-knots:29.4.2` (amd64-only), which a box with Paul's Knots
-BLAKE2b Companion never installs.
+BLAKE2b Companion never installs. `lightning-stream` is built by `scripts/oci_build.sh` and is in
+`scripts/oci_publish.sh`'s list, and it has no lock line until that publish runs. The Lightning Stream
+app names `lightning-stream:0.1.0` until then. No digest is invented for it.
 
 Check what a reference serves, without pulling it:
 
@@ -143,6 +146,13 @@ The gateway:
 | init (one-shot) | `xbt-init` (root) | the whole data dir | none |
 | gateway | `xbt-gateway` (10007), under `xbt-supervise` | `gateway/`, `run/gateway/` ro, `tls.cert` ro | Lightning Fork's REST; 8402 for buyers, through an https proxy |
 | UI | `xbt-wallet-ui` (10005), `XBT_UI_ROLE=gateway` | `ui/`, `run/ui/`, `run/gateway/`, `tls.cert` ro | 8481 behind the box's proxy |
+
+Lightning Stream (`lazarus-lightning-stream`) is those two sets in one app, plus the connector. The main
+page is port 8482. Agents use host port 33511 (the service port on the box network is still 33510). The
+sell page is host port 8483. The connector (`lightning-stream`, user `xbt-signer`) shares the UI's
+network namespace, listens on `127.0.0.1:8484` and publishes no port. `B2_STREAM_DIR` is
+`/data/run/signer/streams` for the signer and the connector. The gateway publishes no host port and
+does not listen until its config exists. The two apps above are unchanged.
 
 The UI writes `run/ln/rail.macaroon` (group `xbt-ln-rail`: the signer and the UI, never the MCP) and
 `run/gateway/{config.json, invoices.macaroon, info.macaroon}` (group `xbt-gateway`), each 0640.

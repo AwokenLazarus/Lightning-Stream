@@ -114,8 +114,11 @@ pub fn strip_base(path: &str, base: &str) -> Option<String> {
     path.strip_prefix(b).filter(|r| r.starts_with('/')).map(str::to_string).or_else(|| Some(path.to_string()))
 }
 
+/// The security headers of every answer. Video plays from this page's own origin: the UI relays
+/// the connector (`/s/…`).
 pub fn security_headers(r: &mut Resp) {
-    for (k, v) in [("Content-Security-Policy", CSP), ("X-Frame-Options", "DENY"), ("X-Content-Type-Options", "nosniff"),
+    let csp = format!("{CSP}; media-src 'self'");
+    for (k, v) in [("Content-Security-Policy", csp.as_str()), ("X-Frame-Options", "DENY"), ("X-Content-Type-Options", "nosniff"),
                    ("Referrer-Policy", "no-referrer"), ("Cross-Origin-Opener-Policy", "same-origin"),
                    ("Cross-Origin-Resource-Policy", "same-origin"), ("Permissions-Policy", "camera=(), microphone=(), geolocation=(), usb=()")] {
         r.headers.push((k.into(), v.into()));
@@ -141,6 +144,65 @@ impl xbt_svc::http::Handler for Ui {
         security_headers(&mut resp);
         xbt_svc::http::Response::new(resp.status, resp.headers, resp.body)
     }
+
+    /// A paid video for the player: `GET /s/<seller URL>`, past the same checks as every page, relayed
+    /// from the connector as it streams. Everything else is [`Self::handle`].
+    fn reply(&self, rq: xbt_svc::http::Request) -> xbt_svc::http::Reply {
+        let peer = rq.peer.map(|a| a.ip().to_string()).unwrap_or_default();
+        let (raw_path, q) = rq.target.split_once('?').unwrap_or((&rq.target, ""));
+        let headers = rq.headers.iter().map(|(k, v)| (k.to_ascii_lowercase(), v.clone())).collect();
+        let req = Req { method: rq.method.to_uppercase(), path: raw_path.to_string(), query: parse_qs(q), headers, body: vec![], peer };
+        match self.0.relay_gate(&req) {
+            None => xbt_svc::http::Reply::Whole(self.handle(rq)),
+            Some(Err(mut resp)) => {
+                security_headers(&mut resp);
+                xbt_svc::http::Reply::Whole(xbt_svc::http::Response::new(resp.status, resp.headers, resp.body))
+            }
+            Some(Ok(())) => {
+                // the seller URL is everything after /s/, its own query included
+                let item = rq.target.split_once("/s/").map(|(_, u)| u).unwrap_or("");
+                relay(&self.0.cfg.connector, item)
+            }
+        }
+    }
+}
+
+/// Stream the connector's answer for `item` (a seller URL) to the player.
+fn relay(connector: &str, item: &str) -> xbt_svc::http::Reply {
+    let url = format!("{}/s/{item}", connector.trim_end_matches('/'));
+    let agent = ureq::AgentBuilder::new().timeout_connect(std::time::Duration::from_secs(5)).build();
+    let resp = match agent.get(&url).call() {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, r)) => {
+            let body = r.into_string().unwrap_or_default().into_bytes();
+            let mut whole = Resp::text(code, "application/json", body);
+            security_headers(&mut whole);
+            return xbt_svc::http::Reply::Whole(xbt_svc::http::Response::new(whole.status, whole.headers, whole.body));
+        }
+        Err(e) => {
+            let mut whole = Resp::json(502, &serde_json::json!({"error": format!("the connector: {e}")}));
+            security_headers(&mut whole);
+            return xbt_svc::http::Reply::Whole(xbt_svc::http::Response::new(whole.status, whole.headers, whole.body));
+        }
+    };
+    let ctype = resp.header("Content-Type").unwrap_or("application/octet-stream").to_string();
+    let mut src = resp.into_reader();
+    xbt_svc::http::Reply::Stream(xbt_svc::http::Streamed {
+        status: 200,
+        headers: vec![("Content-Type".into(), ctype), ("Cache-Control".into(), "no-store".into()), ("X-Content-Type-Options".into(), "nosniff".into())],
+        length: None,
+        body: Box::new(move |out: &mut dyn xbt_svc::http::BodyWriter| {
+            let mut buf = vec![0u8; 64 << 10];
+            loop {
+                let n = std::io::Read::read(&mut src, &mut buf)?;
+                if n == 0 {
+                    return Ok(());
+                }
+                // a player that has gone: the connection to the connector closes, and the wallet stops paying
+                out.send(&buf[..n])?;
+            }
+        }),
+    })
 }
 
 /// A running server; stops when dropped.

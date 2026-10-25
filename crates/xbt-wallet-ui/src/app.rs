@@ -16,6 +16,9 @@ use crate::link::SignerLink;
 use crate::server::{strip_base, Req, Resp};
 use crate::{msg, now};
 
+#[path = "stream_pages.rs"]
+mod stream_pages;
+
 pub const COOKIE: &str = "xbtui";
 /// How long a signed form stays valid.
 pub const SIGN_WINDOW_S: i64 = 600;
@@ -143,6 +146,26 @@ impl App {
         self.cfg.allow_ips.is_empty() || self.cfg.allow_ips.iter().any(|p| peer == p || (p.ends_with('.') || p.ends_with(':')) && peer.starts_with(p.as_str()))
     }
 
+    /// For `GET /s/<seller URL>` (the player's video), the same checks as a page of the wallet:
+    /// `Some(Ok)` to relay it, `Some(Err)` with the answer that refuses it; `None` for anything else.
+    pub fn relay_gate(&self, req: &Req) -> Option<Result<(), Resp>> {
+        let path = strip_base(&req.path, &self.cfg.base_path)?;
+        if req.method != "GET" || !path.starts_with("/s/") || self.cfg.role == Role::Gateway {
+            return None;
+        }
+        if !self.peer_allowed(&req.peer) {
+            return Some(Err(Resp::text(403, "text/plain", "forbidden")));
+        }
+        if !host_allowed(req.header("host"), &self.cfg.allowed_hosts) {
+            return Some(Err(Resp::text(421, "text/plain", "unknown Host: add it to XBT_UI_ALLOWED_HOSTS")));
+        }
+        let sid = req.cookie(COOKIE).unwrap_or_default();
+        if !self.auth.has_password() || self.auth.with_session(&sid, |_| ()).is_none() {
+            return Some(Err(Resp::text(401, "text/plain", "login required")));
+        }
+        Some(Ok(()))
+    }
+
     pub fn handle(&self, mut req: Req) -> Resp {
         if !self.peer_allowed(&req.peer) {
             return Resp::text(403, "text/plain", "forbidden");
@@ -214,6 +237,9 @@ impl App {
         }
         match req.path.as_str() {
             "/" => self.overview(&ctx),
+            "/browse" => self.browse(&ctx, &req.query),
+            "/play" => self.play(&ctx, &req.query),
+            "/connections" => self.connections(&ctx),
             "/approvals" => self.approvals(&ctx),
             "/policy" => self.policy_page(&ctx, req.query.get("template").map(|t| t == "starter").unwrap_or(false)),
             "/channels" => self.channels(&ctx),
@@ -355,6 +381,8 @@ impl App {
             Resp::redirect(to)
         };
         match req.path.as_str() {
+            "/play" => self.play_stop(ctx, f),
+            "/connections" => self.connections_stop(ctx, f),
             "/logout" => {
                 self.auth.logout(&ctx.sid);
                 Resp::redirect("./login").header("Set-Cookie", &self.cookie(req, "", 0))

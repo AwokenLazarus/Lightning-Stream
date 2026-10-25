@@ -1,0 +1,18 @@
+[package]
+name = "lightning-stream"
+description = "The Lightning Stream app's connector service: hands a paid seller's answer to a local program (a player) as it is paid for, through the wallet's signer, holding no keys"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+xbt-svc.workspace = true
+xbt-wallet-mcp = { path = "../xbt-wallet-mcp" }
+serde_json.workspace = true
+getrandom = "0.2"
+hex.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,7 +1,8 @@
 #!/bin/bash
 # AGP-038: multi-arch OCI images of the agentpay services, saved locally (pushed only with --push, which
 # scripts/oci_publish.sh drives).
-#   xbt-signer, xbt-anchor-witness, xbt-wallet-mcp, xbt-wallet-ui, xbt-init, xbt-work-relay, xbt-gateway
+#   xbt-signer, xbt-anchor-witness, xbt-wallet-mcp, xbt-wallet-ui, xbt-init, xbt-work-relay, xbt-gateway,
+#   lightning-stream (the connector; not in packaging/images.lock until scripts/oci_publish.sh records it)
 #   (xbt-supervise is not an image: it is copied into the signer and gateway images)
 #   platforms linux/amd64, linux/arm64, linux/arm/v7, FROM scratch, static musl (zig), docs/CONTAINER.md
 #
@@ -39,7 +40,7 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-IMAGES=(xbt-signer xbt-anchor-witness xbt-wallet-mcp xbt-wallet-ui xbt-init xbt-work-relay xbt-gateway)
+IMAGES=(xbt-signer xbt-anchor-witness xbt-wallet-mcp xbt-wallet-ui xbt-init xbt-work-relay xbt-gateway lightning-stream)
 [ -n "$ONLY" ] && IMAGES=(${ONLY//,/ })
 TGT=${CARGO_TARGET_DIR:-target}
 want() { [[ " ${IMAGES[*]} " == *" $1 "* ]]; }
@@ -83,6 +84,7 @@ if [ $CARGO = 1 ]; then
       "${SOAK[@]}" cargo build -q -j2 --release --locked "${RM[@]}" --target "$t" -p xbt-wallet-ui -p xbt-svc --bin xbt-wallet-ui --bin xbt-init
     fi
     if want xbt-work-relay; then "${SOAK[@]}" cargo build -q -j2 --release --locked "${RM[@]}" --target "$t" -p xbt-work-relay --bin xbt-work-relay; fi
+    if want lightning-stream; then "${SOAK[@]}" cargo build -q -j2 --release --locked "${RM[@]}" --target "$t" -p lightning-stream --bin lightning-stream; fi
   done
 fi
 for t in "${!ARCH[@]}"; do

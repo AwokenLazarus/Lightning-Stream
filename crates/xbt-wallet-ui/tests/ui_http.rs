@@ -805,3 +805,174 @@ fn the_gateway_page_writes_a_config_the_gateway_takes_and_mainnet_is_asked_for()
     assert!(c.get("network").is_none());
     xbt_gateway::config::Config::from_json(&c).unwrap();
 }
+
+const FILM: &str = "https://media.lazarus-xbt.xyz/Videos/057627270372dfed4d8ea15fa9ab5f01/stream?static=true";
+const NOTES: &str = "https://files.example/notes?a=1&b=2";
+
+#[test]
+fn browse_player_and_connections_follow_the_services_file_and_stop_through_the_signer() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("services.json");
+    std::fs::write(&path, format!(r#"[
+        {{"name": "Zebra files", "kind": "files", "seller": "https://files.example", "price_text": "5 sat a file",
+         "items": [{{"title": "<b>notes</b>", "year": 2020, "url": "{NOTES}", "credit": "CC0"}}]}},
+        {{"name": "Alpha films", "kind": "video", "seller": "https://media.lazarus-xbt.xyz", "price_text": "20 sat a MiB",
+         "items": [{{"title": "Big Buck Bunny", "year": 2008, "url": "{FILM}", "credit": "(c) Blender Foundation, CC BY 3.0"}}]}}
+    ]"#)).unwrap();
+    let bx = start(json!({}), false, |c| c.services_file = Some(path.clone()));
+    let mut br = logged_in(&bx);
+    let mut anon = B::new(&bx.base);
+    assert_eq!(anon.get("/browse").location(), "./login");
+    assert_eq!(anon.get("/connections").location(), "./login");
+
+    let page = br.get("/browse");
+    assert_eq!(page.status, 200);
+    assert!(page.body.contains("aria-current=\"page\">Browse"));
+    assert!(page.body.contains("href=\"./play\"") && page.body.contains("href=\"./connections\""));
+    assert!(page.body.find("Alpha films").unwrap() < page.body.find("Zebra files").unwrap(), "name sort");
+    assert!(page.body.contains("&lt;b&gt;notes&lt;/b&gt;") && !page.body.contains("<b>notes</b>"));
+    assert!(page.body.contains(&format!("href=\"./play?item={}\"", enc(FILM))));
+    assert!(page.headers.get("content-security-policy").is_some_and(|v| v.contains("media-src 'self'")));
+
+    let by_price = br.get("/browse?sort=price").body;
+    assert!(by_price.find("Zebra files").unwrap() < by_price.find("Alpha films").unwrap(), "price sort");
+    assert!(by_price.contains("selected>Price") || by_price.contains("value=\"price\" selected"));
+    let files = br.get("/browse?kind=files").body;
+    assert!(files.contains("Zebra files") && !files.contains("Big Buck Bunny"));
+    assert!(files.contains("notes?a=1&amp;b=2"));
+    let videos = br.get("/browse?kind=video").body;
+    assert!(videos.contains("Big Buck Bunny") && !videos.contains("Zebra files"));
+    assert!(br.get("/browse?kind=nope").body.contains("No services of this kind"));
+
+    let play = br.get(&format!("/play?item={}", enc(FILM)));
+    assert!(play.body.contains("aria-current=\"page\">Player"));
+    assert!(play.body.contains(&format!("src=\"./s/{FILM}\"")));
+    assert!(play.body.contains("<video controls autoplay"));
+    assert!(play.body.contains("CC BY 3.0") && play.body.contains("Stop and cut the connection"));
+    assert!(play.body.contains("20 sat a MiB"));
+    assert!(br.get("/play").body.contains("Choose a video"));
+    assert!(br.get("/play?item=https://media.lazarus-xbt.xyz/missing").body.contains("not in the services file"));
+    let notes = br.get(&format!("/play?item={}", enc(NOTES))).body;
+    assert!(!notes.contains("<video") && notes.contains("files item"));
+
+    let r = br.post("/play", &[("item", FILM)]);
+    assert_eq!(r.status, 403, "a stop without the CSRF token is refused");
+    let r = br.act(&format!("/play?item={}", enc(FILM)), "/play", &[("item", FILM)]);
+    assert!(br.flash_after(&r).contains("No open session"), "nothing is open with that seller");
+
+    let conn = br.get("/connections");
+    assert!(conn.body.contains("aria-current=\"page\">Connections"));
+    assert!(conn.body.contains("http-equiv=\"refresh\" content=\"4\""));
+    assert!(conn.body.contains("Nothing is open") && conn.body.contains("Cut all"));
+    let r = br.act("/connections", "/connections", &[("all", "1")]);
+    assert!(br.flash_after(&r).contains("Nothing is open"));
+    let r = br.act("/connections", "/connections", &[("session", "not-a-session")]);
+    assert!(br.flash_after(&r).contains("No open session"));
+
+    std::fs::remove_file(&path).unwrap();
+    let gone = br.get("/browse").body;
+    assert!(gone.contains("services file") && gone.contains("XBT_UI_SERVICES") && gone.contains("examples/services.example.json"));
+}
+
+/// A TLS node on loopback with the gateway's test certificate (public test data), answering nothing.
+fn tls_node() -> (u16, Vec<u8>) {
+    use std::sync::Arc;
+    let der = |name: &str| {
+        use base64::Engine;
+        let pem = std::fs::read_to_string(format!("{}/../xbt-gateway/tests/data/node-tls/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+        base64::engine::general_purpose::STANDARD.decode(body).unwrap()
+    };
+    let cert = der("seller.pem");
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let cfg = Arc::new(rustls::ServerConfig::builder_with_provider(provider).with_safe_default_protocol_versions().unwrap().with_no_client_auth()
+        .with_single_cert(vec![rustls::pki_types::CertificateDer::from(cert.clone())],
+                          rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(der("seller.key")))).unwrap());
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for sock in l.incoming().flatten() {
+            let cfg = cfg.clone();
+            std::thread::spawn(move || {
+                use std::io::Read;
+                let mut tls = rustls::StreamOwned::new(rustls::ServerConnection::new(cfg).unwrap(), sock);
+                let _ = tls.read(&mut [0u8; 1]);
+            });
+        }
+    });
+    (port, cert)
+}
+
+/// A platform that cannot mount the node's certificate alone (`XBT_UI_LN_TLS_PIN=1`): the Lightning
+/// page shows the certificate the node presents and its fingerprint, and pins it when the owner
+/// confirms; a fingerprint that is not the node's pins nothing; without the setting there is no
+/// card, and the platform's own certificate is used as before.
+#[test]
+fn the_owner_pins_the_node_certificate_on_a_platform_that_cannot_mount_it() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (port, cert) = tls_node();
+    let pinned_dir = tempfile::tempdir().unwrap();
+    let pinned = pinned_dir.path().join("tls.cert");
+    let p2 = pinned.clone();
+    let b = start(json!({}), false, move |c| {
+        c.ln.rest = Some(format!("https://127.0.0.1:{port}"));
+        c.ln.tls_cert = Some(p2);
+        c.ln.pin = true;
+    });
+    let mut br = logged_in(&b);
+    let page = br.get("/lightning").body;
+    assert!(page.contains("Pin the node&#39;s certificate") || page.contains("Pin the node's certificate"), "{page}");
+    let fp = field(&page, "fingerprint");
+    assert_eq!(fp.split(':').count(), 32, "{fp}");
+    // a fingerprint that is not the one the node shows: nothing pinned
+    let r = br.act("/lightning", "/lightning", &[("action", "pin_cert"), ("fingerprint", "00:11")]);
+    assert!(br.flash_after(&r).contains("another certificate"));
+    assert!(!pinned.exists());
+    // the owner confirms the one shown
+    let r = br.act("/lightning", "/lightning", &[("action", "pin_cert"), ("fingerprint", &fp)]);
+    assert!(br.flash_after(&r).starts_with("Certificate pinned"));
+    let pem = std::fs::read_to_string(&pinned).unwrap();
+    assert_eq!(xbt_gateway::node::pem_cert_der(&pem).unwrap(), cert);
+    // without the platform's setting: no card, and pinning is refused
+    let b2 = start(json!({}), false, |c| c.ln.rest = Some("https://127.0.0.1:1".into()));
+    let mut br2 = logged_in(&b2);
+    assert!(!br2.get("/lightning").body.contains("name=\"fingerprint\""));
+    let r = br2.act("/lightning", "/lightning", &[("action", "pin_cert"), ("fingerprint", &fp)]);
+    assert!(br2.flash_after(&r).contains("gives the node's certificate itself"));
+}
+
+/// The player's video comes from the page's own origin: the UI relays `/s/<seller URL>` to the
+/// connector (which listens on loopback only), for a logged-in owner only, so a player on another
+/// device of the network can play it.
+#[test]
+fn the_ui_relays_the_players_video_from_the_connector_to_a_logged_in_owner() {
+    use std::io::{Read, Write};
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let film: Vec<u8> = b"\0\0\0\x20ftypisom".iter().copied().chain((0..200_000u32).map(|i| (i % 251) as u8)).collect();
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let connector = format!("http://{}", l.local_addr().unwrap());
+    let body = film.clone();
+    std::thread::spawn(move || {
+        for mut s in l.incoming().flatten() {
+            let mut head = [0u8; 4096];
+            let n = s.read(&mut head).unwrap_or(0);
+            let asked = String::from_utf8_lossy(&head[..n]).to_string();
+            if asked.starts_with("GET /s/https://media.lazarus-xbt.xyz/v?static=true ") {
+                let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                let _ = s.write_all(&body);
+            } else {
+                let _ = write!(s, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
+        }
+    });
+    let b = start(json!({}), false, move |c| c.connector = connector);
+    let mut anon = B::new(&b.base);
+    assert_eq!(anon.get("/s/https://media.lazarus-xbt.xyz/v?static=true").status, 401, "not logged in");
+    let br = logged_in(&b);
+    let resp = br.agent.get(&format!("{}/s/https://media.lazarus-xbt.xyz/v?static=true", b.base)).set("Cookie", &br.cookie).call().unwrap();
+    assert_eq!(resp.header("Content-Type"), Some("video/mp4"));
+    let mut got = vec![];
+    resp.into_reader().read_to_end(&mut got).unwrap();
+    assert_eq!(got, film);
+}

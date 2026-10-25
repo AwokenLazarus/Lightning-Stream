@@ -20,7 +20,7 @@ export type MountSpec = {
   subpath: string | null
   mountpoint: string
   readonly: boolean
-  dependency?: { packageId: string; volumeId: string; type: 'file' }
+  dependency?: { packageId: string; volumeId: string; type: 'file' | 'directory' }
 }
 
 export type ServiceSpec = {
@@ -43,7 +43,21 @@ export type Config = {
   proxies: string[]
 }
 
-export const LIGHTNING = { packageId: 'lightning-fork', restPort: 8080, cert: '/data/lightning/tls.cert' } as const
+/**
+ * How the Lightning node's certificate reaches the gateway, as in the wallet package: 'pin' (now)
+ * mounts nothing of Lightning Fork (its tls.cert sits beside its macaroons, and StartOS 0.4 mounts a
+ * folder or nothing); the owner pins the certificate on the setup page, which writes it into the
+ * gateway's own run/gateway. 'folder', once Lightning Fork keeps tls.cert in a folder of its own,
+ * mounts that folder read-only (LF_CERT_FOLDER, to be confirmed against its release).
+ */
+export const CERT_SOURCE = 'pin' as 'pin' | 'folder'
+const LF_CERT_FOLDER = 'tls'
+
+export const LIGHTNING = {
+  packageId: 'lightning-fork',
+  restPort: 8080,
+  cert: CERT_SOURCE === 'pin' ? '/data/run/gateway/tls.cert' : '/data/lightning/tls.cert',
+} as const
 
 /**
  * The published images, pinned by digest (packaging/images.lock; packaging/pin_images.py writes them);
@@ -57,14 +71,14 @@ export const IMAGES: Record<ImageKey, string> = {
 
 const vol = (subpath: string | null, mountpoint: string, readonly = false): MountSpec => ({ subpath, mountpoint, readonly })
 const lightningCert: MountSpec = {
-  subpath: 'tls.cert',
-  mountpoint: LIGHTNING.cert,
+  subpath: LF_CERT_FOLDER,
+  mountpoint: '/data/lightning',
   readonly: true,
-  dependency: { packageId: LIGHTNING.packageId, volumeId: 'main', type: 'file' },
+  dependency: { packageId: LIGHTNING.packageId, volumeId: 'main', type: 'directory' },
 }
 
 export function services(cfg: Config): ServiceSpec[] {
-  const cert = cfg.lightningRest ? [lightningCert] : []
+  const cert = cfg.lightningRest && CERT_SOURCE === 'folder' ? [lightningCert] : []
   return [
     {
       id: 'init',
@@ -109,7 +123,7 @@ export function services(cfg: Config): ServiceSpec[] {
         XBT_UI_GW_PORT: String(PORTS.gateway),
         XBT_UI_GW_HEALTH_URL: `http://127.0.0.1:${PORTS.gateway}/x402/ticket/health`,
         XBT_UI_GW_PROXIES: cfg.proxies.join(','),
-        ...(cfg.lightningRest ? { XBT_UI_GW_NODE_REST: cfg.lightningRest, XBT_UI_GW_NODE_TLS_CERT: LIGHTNING.cert } : {}),
+        ...(cfg.lightningRest ? { XBT_UI_GW_NODE_REST: cfg.lightningRest, XBT_UI_GW_NODE_TLS_CERT: LIGHTNING.cert, XBT_UI_GW_NODE_TLS_PIN: CERT_SOURCE === 'pin' ? '1' : '0' } : {}),
       },
       // the setup page writes run/gateway
       mounts: [vol('ui', '/data/ui'), vol('run/ui', '/data/run/ui'), vol('run/gateway', '/data/run/gateway'), ...cert],

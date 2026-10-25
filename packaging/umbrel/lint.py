@@ -11,7 +11,8 @@ of another community store named in OTHER_STORES (Lightning Fork), unique ports,
 ${APP_PASSWORD} is used.
 Compose: app_proxy's APP_HOST is `<app-id>_<service>_1` of a real service; every volume is under
 ${APP_DATA_DIR}; every agentpay image is a published one, ghcr.io/awokenlazarus/<image>:<version>-<commit>@sha256:<digest>,
-the very reference packaging/images.lock pins (the stand-in node's image is the one local image, amd64-only); every ${VAR} is provided by umbrelOS,
+the very reference packaging/images.lock pins (the stand-in node's image is the one local image, amd64-only;
+lightning-stream:0.1.0 is the connector, which has no digest until it is published); every ${VAR} is provided by umbrelOS,
 this app's exports or a dependency's exports; a slot's variable (APP_BITCOIN_*, set by whichever node app the
 owner selects) is only used as `${APP_BITCOIN_X:-${FALLBACK}}` with a fallback this store's implementing app
 exports; `docker compose config` accepts the file with those values, and with the slot's values alone.
@@ -50,7 +51,13 @@ REGISTRY = "ghcr.io/awokenlazarus"
 # the one image of this store that is not published: the stand-in XBT node (lazarus-xbt-knots), amd64-only, which
 # a box with Paul's Knots BLAKE2b Companion never installs
 LOCAL_ONLY = {"lazarus-xbt-knots": re.compile(r"^xbt-a3-knots:29\.4\.2$")}
-# image -> (component sub-dir, run/ dirs it writes, run/ dirs it may mount read-only)
+# the connector has no line in images.lock yet. oci_build.sh --load tags it lightning-stream:0.1.0.
+# A digest is not invented here. Anything else (a registry name, a made-up digest) still fails.
+UNPUBLISHED = re.compile(r"^lightning-stream:0\.1\.0$")
+# the stream directory the connector writes, inside the signer's socket dir. Read-write, and the
+# only extra mount it may have. It does not get the signer's state.
+STREAM_MOUNT = "${APP_DATA_DIR}/data/run/signer/streams:/data/run/signer/streams"
+# image -> (component sub-dir or None, run/ dirs it writes, run/ dirs it may mount read-only)
 AGENTPAY = {
     "xbt-signer": ("signer", {"signer"}, {"anchor", "ln"}),
     "xbt-anchor-witness": ("witness", {"anchor"}, set()),
@@ -59,6 +66,8 @@ AGENTPAY = {
     # the setup pages write run/ln (the rail macaroon) and run/gateway (the gateway's config and macaroons)
     "xbt-wallet-ui": ("ui", {"ui", "ln", "gateway"}, {"signer"}),
     "xbt-gateway": ("gateway", set(), {"gateway"}),
+    # no state of its own. The control socket is read-only; the stream sockets are STREAM_MOUNT.
+    "lightning-stream": (None, set(), {"signer"}),
 }
 # the Lightning node's certificate: the only file of another app's data a service here may mount
 CERT_MOUNT = {"type": "bind", "source": "${APP_LIGHTNING_FORK_NODE_DATA_DIR}/tls.cert", "target": "/data/lightning/tls.cert", "read_only": True,
@@ -219,6 +228,8 @@ def main() -> int:
             pin = REF.match(img)
             if folder in LOCAL_ONLY and LOCAL_ONLY[folder].match(img):
                 pass
+            elif UNPUBLISHED.match(img):
+                pass
             elif not pin or pin["repo"] != REGISTRY:
                 bad(f"{folder}/{name}: image {img!r} is not {REGISTRY}/<image>:<version>-<commit>@sha256:<digest>")
             elif pins.get(pin["name"]) != img:
@@ -250,16 +261,26 @@ def main() -> int:
                     bad(f"{folder}/{name}: needs init: true (the binaries stop on SIGTERM by themselves; an init still reaps and forwards for anything they start)")
                 if (s.get("depends_on") or {}).get("init", {}).get("condition") != "service_completed_successfully":
                     bad(f"{folder}/{name}: must wait for init (service_completed_successfully)")
-                allowed = {f"${{APP_DATA_DIR}}/data/{comp}:/data/{comp}"}
+                if base == "lightning-stream" and s.get("ports"):
+                    bad(f"{folder}/{name}: the connector is not published on the LAN")
+                allowed = {f"${{APP_DATA_DIR}}/data/{comp}:/data/{comp}"} if comp else set()
                 allowed |= {f"${{APP_DATA_DIR}}/data/run/{r}:/data/run/{r}" for r in own_runs}
                 allowed |= {f"${{APP_DATA_DIR}}/data/run/{p}:/data/run/{p}:ro" for p in peers}
-                for v in s.get("volumes") or []:
-                    if isinstance(v, dict):
-                        continue
+                if base == "lightning-stream":
+                    allowed.add(STREAM_MOUNT)
+                vols = [v for v in (s.get("volumes") or []) if not isinstance(v, dict)]
+                for v in vols:
                     if v not in allowed:
                         bad(f"{folder}/{name}: mount {v} is outside its own sub-dir and socket dirs")
-                if f"${{APP_DATA_DIR}}/data/{comp}:/data/{comp}" not in (s.get("volumes") or []):
+                if comp and f"${{APP_DATA_DIR}}/data/{comp}:/data/{comp}" not in vols:
                     bad(f"{folder}/{name}: does not mount its own data sub-dir")
+                if base == "lightning-stream":
+                    if STREAM_MOUNT not in vols:
+                        bad(f"{folder}/{name}: must mount the stream directory read-write")
+                    if "${APP_DATA_DIR}/data/run/signer:/data/run/signer:ro" not in vols:
+                        bad(f"{folder}/{name}: must mount the signer's socket dir read-only")
+                    if any(str(v).startswith("${APP_DATA_DIR}/data/signer:") for v in vols):
+                        bad(f"{folder}/{name}: must not mount the signer's state")
         # --- docker compose accepts it (umbrelOS values stubbed)
         envs = {"APP_DATA_DIR": "/tmp/app-data", "APP_SEED": "0" * 64, "APP_PASSWORD": "x" * 32, "DEVICE_DOMAIN_NAME": "umbrel.local",
                 "DEVICE_HOSTNAME": "umbrel", **{k: (v if "$(" not in v else "stub") for k, v in {**dep, **own}.items()}}
