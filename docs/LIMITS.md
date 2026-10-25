@@ -880,8 +880,11 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
   its seconds from before it sent the request, so it can pay for one second the seller did not
   charge.
 - After an answer that the wallet stopped reading because its pool ran out, the next call to
-  that seller waits until the seller has closed the answer: 3 s with the gateway's default wait
-  for a refill, at most 5 s a call (`ticket_answer_open`, nothing released), and after 30 s the
+  that seller waits until the seller has closed the answer. The gateway closes it as soon as it
+  sees the buyer's connection closed (it looks every 250 ms while it waits to be paid), and
+  otherwise after its refill wait, 15 s by default (3 s until 2026-10, too short behind a CDN,
+  which holds back the tail of a paused answer). A proxy in front of the gateway that keeps the
+  connection to it open after the buyer has left hides that from it; at most 5 s a call (`ticket_answer_open`, nothing released), and after 30 s the
   session is stopped and the next call opens another.
 - The last receipt of a long answer is asked for during 2 s. A seller that has not finished with
   the answer by then, or a gateway that restarted, leaves the wallet with its own count and the

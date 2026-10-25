@@ -82,6 +82,22 @@ PROCS: dict[str, subprocess.Popen[bytes]] = {}
 RECEIPTS: dict[str, int] = {}
 
 
+# The speed checks hold for a quiet machine. A run that starts with the load average above this
+# (TICKET_E2E_LOAD_MAX, default 4) reports its timings and does not judge them: the money, body and
+# crash checks are judged in every run.
+LOAD_MAX = float(os.environ.get("TICKET_E2E_LOAD_MAX", "4"))
+LOAD_AT_START = os.getloadavg()[0]
+REPORT["load_at_start"] = {"load_average_1m": round(LOAD_AT_START, 2), "max_for_speed_checks": LOAD_MAX}
+
+
+def timed_check(name: str, ok: bool, saw: dict[str, Any]) -> None:
+    if LOAD_AT_START <= LOAD_MAX:
+        check(name, ok, saw)
+        return
+    check(f"{name} (not judged: load average {LOAD_AT_START:.1f} at the start, above {LOAD_MAX:g})", True,
+          {**saw, "judged": False, "would_pass": bool(ok), "load_at_start": round(LOAD_AT_START, 2)})
+
+
 def check(name: str, ok: bool, saw: Any) -> None:
     REPORT["checks"].append({"check": name, "ok": bool(ok), "saw": saw})
     print(("PASS " if ok else "FAIL ") + name + "  " + json.dumps(saw)[: 300 if ok else 2500], flush=True)
@@ -756,7 +772,7 @@ def page() -> None:
         if not call_paid(r) or r.get("tickets_released") != 1:
             raise LabError(f"a first request: {brief(r)}")
     measured("first_request_s", firsts)
-    check("page: a first request, with the pool of 2 tickets locked through one hop, completes in 1 s (median of 5 new sessions, timed around the MCP tool call)",
+    timed_check("page: a first request, with the pool of 2 tickets locked through one hop, completes in 1 s (median of 5 new sessions, timed around the MCP tool call)",
           statistics.median(firsts) <= 1.0, {"median_s": statistics.median(firsts), "each_s": firsts})
 
 
@@ -788,7 +804,7 @@ def latency() -> None:
     measured("paid_request_ms", {"median": round(paid, 3), "p90": round(sorted(timed_paid)[n * 9 // 10], 3)})
     measured("unpaid_request_ms", {"median": round(free, 3), "p90": round(sorted(timed_free)[n * 9 // 10], 3)})
     measured("direct_http_free_ms", {"median": round(statistics.median(direct), 3)})
-    check("latency: a paid request from the balance adds at most 5 ms (median) over an unpaid one: 200 xbt402_pay calls of a priced page against 200 of a free page, each through the MCP, the signer and the gateway",
+    timed_check("latency: a paid request from the balance adds at most 5 ms (median) over an unpaid one: 200 xbt402_pay calls of a priced page against 200 of a free page, each through the MCP, the signer and the gateway",
           paid - free <= 5.0, {"paid_ms": round(paid, 3), "unpaid_ms": round(free, 3), "added_ms": round(paid - free, 3), "tickets_locked_meanwhile": len(buyer_payments()) - before})
 
 

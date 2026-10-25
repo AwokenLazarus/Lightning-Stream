@@ -72,6 +72,8 @@ const ERROR_BODY: u64 = 64 << 10;
 const SESSION_BODY: usize = 16 << 10;
 /// One read of the service's body, and so the most that is charged ahead of a write.
 const CHUNK: usize = 16 << 10;
+/// How often an answer waiting to be paid for looks whether its buyer is still there.
+const GONE_CHECK: Duration = Duration::from_millis(250);
 /// Final receipts of streamed responses kept per session, for `status`.
 const FINALS_KEPT: usize = 8;
 
@@ -1544,7 +1546,7 @@ impl Gateway {
     /// Take what `want` further bytes of a body cost, waiting for a release when the balance is
     /// out. Returns how many bytes were paid for (fewer than `want` when the balance covers
     /// fewer) and what they cost; 0 bytes: the wait ran out, the buyer has stopped paying.
-    fn pay_bytes(&self, m: &Metered, meter: &Meter, want: u64) -> (u64, u64) {
+    fn pay_bytes(&self, m: &Metered, meter: &Meter, want: u64, gone: &mut dyn FnMut() -> bool) -> (u64, u64) {
         let on_pledge = m.route.release == Release::AfterVerify;
         let deadline = Instant::now() + self.cfg.times.refill_wait;
         let mut st = self.lock();
@@ -1567,16 +1569,22 @@ impl Gateway {
             if left.is_zero() || self.stop.load(Ordering::SeqCst) {
                 return (0, 0);
             }
+            // a buyer that has gone is not waited for: the answer ends now, not at the deadline
+            drop(st);
+            if gone() {
+                return (0, 0);
+            }
+            st = self.lock();
             st = self
                 .credited
-                .wait_timeout(st, left)
+                .wait_timeout(st, left.min(GONE_CHECK))
                 .unwrap_or_else(|p| p.into_inner())
                 .0;
         }
     }
 
     /// Take `due` for seconds that have started, waiting as [`Gateway::pay_bytes`] does.
-    fn pay_seconds(&self, m: &Metered, due: u64) -> bool {
+    fn pay_seconds(&self, m: &Metered, due: u64, gone: &mut dyn FnMut() -> bool) -> bool {
         let on_pledge = m.route.release == Release::AfterVerify;
         let deadline = Instant::now() + self.cfg.times.refill_wait;
         let mut st = self.lock();
@@ -1592,9 +1600,14 @@ impl Gateway {
             if left.is_zero() || self.stop.load(Ordering::SeqCst) {
                 return false;
             }
+            drop(st);
+            if gone() {
+                return false;
+            }
+            st = self.lock();
             st = self
                 .credited
-                .wait_timeout(st, left)
+                .wait_timeout(st, left.min(GONE_CHECK))
                 .unwrap_or_else(|p| p.into_inner())
                 .0;
         }
@@ -1621,7 +1634,7 @@ impl Gateway {
             }
             match meter.seconds_due(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)) {
                 Some((0, _)) => {}
-                Some((secs, due)) if self.pay_seconds(&m, due) => meter.seconds_charged(secs, due),
+                Some((secs, due)) if self.pay_seconds(&m, due, &mut || out.gone()) => meter.seconds_charged(secs, due),
                 _ => break stopped("no balance for another second"),
             }
             let n = match src.read(&mut buf) {
@@ -1631,7 +1644,7 @@ impl Gateway {
             };
             let mut off = 0;
             while off < n {
-                let (take, due) = self.pay_bytes(&m, &meter, (n - off) as u64);
+                let (take, due) = self.pay_bytes(&m, &meter, (n - off) as u64, &mut || out.gone());
                 if take == 0 {
                     break 'body stopped("no balance for another byte");
                 }

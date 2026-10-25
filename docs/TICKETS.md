@@ -1102,7 +1102,7 @@ The seller goes first, and these are what bound it:
   for are `window` or more: the ones still open and the ones it voided, together. A value for an
   open piece makes room for one more; a void makes none. A request beyond the window is refused
   `value_missing` while a value could still make room, and `too_many_voids` when none could; an
-  answer that is being sent waits for a value for as long as it would wait for a ticket (3 s at
+  answer that is being sent waits for a value for as long as it would wait for a ticket (15 s at
   the gateway) and is then cut short. So a buyer that sends nothing, and a buyer that voids
   every piece, are each served `window` pieces in a session and no more. An honest buyer pays
   for this too: every piece of an answer that was cut (one to a few; `window` at the most)

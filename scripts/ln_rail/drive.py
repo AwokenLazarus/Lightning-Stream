@@ -68,6 +68,10 @@ from cryptography.hazmat.primitives import serialization
 LAB, OUT, BIN, RUN = (os.environ[k] for k in ("LAB", "OUT", "BIN", "RUN"))
 SPLIT = 125  # the regtest stand-in for mainnet's 961,632
 REPORT = {"checks": [], "scenarios": {}}
+# whether lf1 could open the taproot channel the scenarios start from: Lightning Fork from
+# 0.21.4-beta-blake2b.21 refuses a channel that cannot carry unified signatures, so on it the
+# node's own refusal is checked, and the scenarios expect one channel fewer
+TAPROOT = True
 FAILED = []
 
 
@@ -304,11 +308,19 @@ def main():
     print(f"chain: coin A (pre-split) at {hA}, coin B at {hB}, split {SPLIT}", flush=True)
 
     # --- a taproot channel only (from coin A: the operator's choice; this wallet opens none) -------------
+    global TAPROOT
     ln("lf1", "connect", f"{lf2_pub}@lf2:9735")
-    tap = open_channel(f"--node_key={lf2_pub}", "--local_amt=400000", "--channel_type=taproot", "--private",
-             f"--utxo={coinA}")
-    mine(6)
-    wait("taproot channel active", 90, lambda: len(ln("lf1", "listchannels", "--active_only")["channels"]) == 1)
+    try:
+        tap = open_channel(f"--node_key={lf2_pub}", "--local_amt=400000", "--channel_type=taproot", "--private",
+                           f"--utxo={coinA}")
+    except RuntimeError as e:
+        if "needs option_unified_sigs" not in str(e):
+            raise
+        TAPROOT, tap = False, {"refused_by_node": str(e)[-200:]}
+        check("S0 lf1 itself refuses to open a taproot channel (it cannot carry unified signatures)", True, tap)
+    if TAPROOT:
+        mine(6)
+        wait("taproot channel active", 90, lambda: len(ln("lf1", "listchannels", "--active_only")["channels"]) == 1)
     REPORT["taproot_channel"] = tap
 
     # --- the signer (the agent's) and the MCP ---------------------------------------------------------
@@ -344,24 +356,28 @@ def run(mcp, sock, human, lf2_pub, sha_pub, coinB, procs):
     st = mcp.tool("ln_status", {})
     REPORT["scenarios"]["S1_status_taproot_only"] = st
     check("S1 ln_status: chain check ok against our Knots node", st.get("chain_check", {}).get("ok") is True, st.get("chain_check"))
-    check("S1 ln_status: the taproot channel is refused, rail not ready",
-          st.get("ready") is False and st["channels"][0]["usable"] is False and "taproot" in st["channels"][0]["refused"], st.get("channels"))
+    if TAPROOT:
+        check("S1 ln_status: the taproot channel is refused, rail not ready",
+              st.get("ready") is False and st["channels"][0]["usable"] is False and "taproot" in st["channels"][0]["refused"], st.get("channels"))
+    else:
+        check("S1 ln_status: no channel, rail not ready", st.get("ready") is False and not st.get("channels"), st.get("channels"))
     check("S1 ln_status: coin A's remainder (below the split) is reported", len(st.get("presplit_utxos", [])) >= 1, st.get("presplit_utxos"))
     inv1 = ln("lf2", "addinvoice", "--amt=1000", "--memo=coffee")
     r = mcp.tool("ln_pay", {"invoice": inv1["payment_request"], "max_sats": 1100})
     REPORT["scenarios"]["S2_taproot_only"] = r
     h1 = inv1["r_hash"]
-    check("S2 taproot-only: refused ln_no_safe_channel", r.get("rule") == "ln_no_safe_channel", r)
+    check("S2 taproot-only (or no channel): refused ln_no_safe_channel", r.get("rule") == "ln_no_safe_channel", r)
     check("S2 no HTLC left lf1", h1 not in payments("lf1"), None)
 
     # S3: a unified anchors channel from the post-split coin B; pay within budget
     uni = open_channel(f"--node_key={lf2_pub}", "--local_amt=1000000", f"--utxo={coinB}")
     mine(6)
-    wait("both channels active", 90, lambda: len(ln("lf1", "listchannels", "--active_only")["channels"]) == 2)
+    wait("the channels active", 90, lambda: len(ln("lf1", "listchannels", "--active_only")["channels"]) == 1 + TAPROOT)
     chans = ln("lf1", "listchannels")["channels"]
     unified = [c for c in chans if c.get("unified_sigs")]
     REPORT["channels"] = [{k: c.get(k) for k in ("scid", "scid_str", "chan_id", "commitment_type", "unified_sigs", "capacity", "private")} for c in chans]
-    check("S3 lf1 has one unified anchors channel and one taproot", len(unified) == 1 and "TAPROOT" not in unified[0]["commitment_type"], REPORT["channels"])
+    check("S3 lf1 has one unified anchors channel" + (" and one taproot" if TAPROOT else ""),
+          len(unified) == 1 and len(chans) == 1 + TAPROOT and "TAPROOT" not in unified[0]["commitment_type"], REPORT["channels"])
     time.sleep(3)
     r = mcp.tool("ln_pay", {"invoice": inv1["payment_request"], "max_sats": 1100, "description": "coffee"})
     for _ in range(5):  # a channel just active can fail its first try while channel_updates settle
@@ -571,7 +587,7 @@ def run_049(mcp, sock, human_pub, lf2_pub, coinA2, procs, ln_env):
     # LF opens a channel from coin A2, confirmed below the split: it signs 0x21 and LND calls it unified
     a2 = open_channel(f"--node_key={lf2_pub}", "--local_amt=150000", f"--utxo={coinA2}")
     mine(6)
-    wait("the coin-A2 channel active", 90, lambda: len(ln("lf1", "listchannels", "--active_only")["channels"]) == 3)
+    wait("the coin-A2 channel active", 90, lambda: len(ln("lf1", "listchannels", "--active_only")["channels"]) == 2 + TAPROOT)
     a2_txid = a2.get("funding_txid", "") if isinstance(a2, dict) else ""
     lnd_view = [c for c in ln("lf1", "listchannels")["channels"] if c["channel_point"].startswith(a2_txid)]
     st = mcp.tool("ln_status", {})
@@ -808,10 +824,11 @@ def run_083(mcp, human_pub, lf2_pub, procs):
     REPORT["scenarios"]["S19_unsafe_channel"] = {"offer": lno_a, "offer_id": oid_a, "pay": r, "lf2_invoices_issued": n_a,
                                                  "lf1_version": ln("lf1", "getinfo").get("version")}
     refused = [c for c in r.get("channels", []) if c.get("usable") is not True]
-    check("S19 lf1 runs Lightning Fork .17", "blake2b.17" in str(ln("lf1", "getinfo").get("version")), ln("lf1", "getinfo").get("version"))
-    check("S19 an offer through lf1: refused ln_offer_unsafe_channel, naming the taproot and the pre-split channel",
-          r.get("rule") == "ln_offer_unsafe_channel" and r.get("dest") == f"ln-offer:{oid_a}" and len(refused) == 2
-          and any("taproot" in str(c.get("refused")) for c in refused) and any("below the split" in str(c.get("refused")) for c in refused), r)
+    want = os.environ.get("LAB_LF_VERSION", "blake2b.17")
+    check(f"S19 lf1 runs Lightning Fork {want}", want in str(ln("lf1", "getinfo").get("version")), ln("lf1", "getinfo").get("version"))
+    check("S19 an offer through lf1: refused ln_offer_unsafe_channel, naming the pre-split channel" + (" and the taproot one" if TAPROOT else ""),
+          r.get("rule") == "ln_offer_unsafe_channel" and r.get("dest") == f"ln-offer:{oid_a}" and len(refused) == 1 + TAPROOT
+          and (not TAPROOT or any("taproot" in str(c.get("refused")) for c in refused)) and any("below the split" in str(c.get("refused")) for c in refused), r)
     check("S19 before any invoice: lf2 issued none for the offer", n_a == 0 and rows_a == [], {"issued": n_a, "rows": rows_a})
     links_up()
     inv = ln("lf2", "addinvoice", "--amt=400")
