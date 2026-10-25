@@ -1,6 +1,7 @@
 # The images, one per service, FROM scratch (docs/CONTAINER.md): the signer, the anchor witness, the MCP
 # server, the wallet UI, xbt-init (the one-shot that fixes a bind mount's owners before the services
-# start), xbt-work-relay (the blinded receipt relay of pay-with-work) and xbt-gateway (the seller gateway).
+# start), xbt-work-relay (the blinded receipt relay of pay-with-work), xbt-gateway (the seller gateway)
+# and lightning-stream (the connector).
 # Built by scripts/oci_build.sh with docker buildx for linux/amd64, linux/arm64 and linux/arm/v7 from the
 # static musl binaries it stages under bin/<arch>/. There is no RUN, so no emulator is needed.
 # Layer 1 (base.tar: passwd/group, /tmp, the /data skeleton with each component's owner) is byte-identical
@@ -82,6 +83,18 @@ ENTRYPOINT ["/usr/bin/xbt-supervise", "--wait", "/data/run/gateway/config.json",
             "--watch", "/data/run/gateway/info.macaroon", "--watch", "/data/lightning/tls.cert", "--", \
             "/usr/bin/xbt-gateway", "/data/run/gateway/config.json"]
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 CMD ["/usr/bin/xbt-supervise", "probe", "http://127.0.0.1:8402/x402/ticket/health"]
+
+# The connector. A local player asks it for a seller's URL; the signer pays and streams the body.
+# It holds no keys. USER is the signer's user: the sockets it binds have to be ones that user can
+# connect to, and the published signer image cannot gain a group until it is rebuilt. Loopback only.
+FROM base AS lightning-stream
+ARG TARGETARCH
+ARG TARGETVARIANT
+COPY --chmod=0555 bin/${TARGETARCH}${TARGETVARIANT}/lightning-stream /usr/bin/lightning-stream
+USER xbt-signer
+ENV LS_LISTEN=127.0.0.1:8484
+ENTRYPOINT ["/usr/bin/lightning-stream"]
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 CMD ["/usr/bin/lightning-stream", "healthcheck"]
 
 # The one image that runs as root: it exits once the data dir's owners and modes are right. Run it with
 # cap_drop ALL + CHOWN, FOWNER, DAC_OVERRIDE, no network, read-only (docs/CONTAINER.md §7).

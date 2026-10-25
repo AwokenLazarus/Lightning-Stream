@@ -2,6 +2,8 @@
 #   <image> <registry>/<image>:<version>-<commit>@<index digest>
 # Built from commit cc28002e474e for linux/amd64, linux/arm64 and linux/arm/v7. packaging/pin_images.py writes
 # them into the Umbrel compose files and the StartOS specs; packaging/umbrel/lint.py checks they agree.
+# lightning-stream is absent on purpose: it is not published. The Lightning Stream app names
+# lightning-stream:0.1.0 (the tag scripts/oci_build.sh --load gives) until oci_publish.sh writes a line.
 xbt-init ghcr.io/awokenlazarus/xbt-init:0.1.0-cc28002e474e@sha256:dd00b3194dd4c32e955aeae8b729b1e7460ce3f57214eda878f24e2b3c0c276b
 xbt-signer ghcr.io/awokenlazarus/xbt-signer:0.1.0-cc28002e474e@sha256:68823bb1e1895807c42aa90df2f2658ead4eaa7fd7b3630540fd41433fd9a011
 xbt-anchor-witness ghcr.io/awokenlazarus/xbt-anchor-witness:0.1.0-cc28002e474e@sha256:f09ab563ba4571055e52f0d9139c01057b2aa07c45d44ef82307a85daf57abe8

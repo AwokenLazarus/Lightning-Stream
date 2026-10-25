@@ -8,8 +8,9 @@
 //! `GET /health`: whether the signer answers.
 
 use std::io::{self, Read};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -51,7 +52,7 @@ impl Connector {
     fn stream(&self, url: &str, max_sats: i64) -> Reply {
         let name = format!("ls-{}", random_hex());
         let path = self.cfg.stream_dir.join(&name);
-        let listener = match UnixListener::bind(&path) {
+        let listener = match listen_stream(&path) {
             Ok(l) => l,
             Err(e) => return Reply::Whole(json_response(500, &json!({"error": format!("stream socket: {e}")}))),
         };
@@ -184,6 +185,17 @@ fn json_response(status: u16, v: &Value) -> Response {
     Response::text(status, "application/json", v.to_string())
 }
 
+/// Bind `path` and make it group-writable. The signer's user connects to it; a process umask would
+/// leave the socket owner-only, and the directory's group is that user.
+fn listen_stream(path: &Path) -> io::Result<UnixListener> {
+    let listener = UnixListener::bind(path)?;
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660)) {
+        let _ = std::fs::remove_file(path);
+        return Err(e);
+    }
+    Ok(listener)
+}
+
 fn random_hex() -> String {
     let mut b = [0u8; 12];
     getrandom::getrandom(&mut b).expect("the system's random source");
@@ -193,4 +205,20 @@ fn random_hex() -> String {
 /// Serve the connector on `listener`.
 pub fn serve(cfg: Config, listener: std::net::TcpListener) -> io::Result<xbt_svc::http::Running> {
     xbt_svc::http::serve(Arc::new(Connector::new(cfg)), listener, 16)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::listen_stream;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_stream_socket_is_group_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ls-abc");
+        let listener = listen_stream(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o660);
+        drop(listener);
+    }
 }

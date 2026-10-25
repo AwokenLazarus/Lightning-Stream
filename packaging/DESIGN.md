@@ -60,6 +60,15 @@ needs the other, and each app then holds only its own macaroons (the gateway's c
 wallet's cannot make invoices). Both use the same image set and the same data dir layout
 (`docs/CONTAINER.md`).
 
+**One app as well.** `lazarus-lightning-stream` ("Lightning Stream") runs the wallet's services, the
+connector and the gateway together, for a box that buys and sells. The two apps above are unchanged.
+The connector is not published on the LAN: it shares the UI's network namespace and listens on
+loopback. The gateway stays idle until the owner saves a config on the sell page (a second UI, the
+gateway role, on its own host port). The connector runs as the signer's user so that user can connect
+to the stream sockets, mounts the signer's socket directory read-only and the stream directory
+read-write, and does not mount the signer's state. Its image has no published digest yet
+(`lightning-stream:0.1.0`, the tag `scripts/oci_build.sh --load` gives).
+
 **Setup pages (no terminal).** Both are pages of the existing web UI binary (`xbt-wallet-ui`); the
 gateway app runs it with `XBT_UI_ROLE=gateway`.
 
