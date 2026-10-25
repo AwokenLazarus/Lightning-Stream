@@ -527,7 +527,9 @@ impl Config {
             None => &empty,
         };
         let times = Times {
-            refill_wait: Duration::from_millis(num(tm, "refill_wait_ms", 3000)?),
+            // 15 s: a proxy in front of the gateway (a TLS proxy, a CDN) can hold a paused answer's tail,
+            // and the buyer pays for the next ticket only once it has read nearly all it paid for
+            refill_wait: Duration::from_millis(num(tm, "refill_wait_ms", 15_000)?),
             upstream_wait: Duration::from_secs(num(tm, "upstream_wait_secs", 10)?.max(1)),
             height_max_age: Duration::from_secs(num(tm, "height_max_age_secs", 10)?.max(1)),
             max_response: Duration::from_secs(num(tm, "max_response_secs", 21_600)?.max(1)),
