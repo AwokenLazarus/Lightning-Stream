@@ -43,6 +43,9 @@
 # project (tickete2e), so it runs beside the other regtest scripts. Each container is capped at 2
 # CPUs; host builds run at nice 19 with -j4. The lab's containers and volumes are removed on exit
 # (TICKET_E2E_KEEP=1 keeps them and the scratch directory). About 25 minutes.
+# The two speed checks (a first request in 1 s, a paid request at most 5 ms over an unpaid one) are
+# judged only when the load average at the start is at most TICKET_E2E_LOAD_MAX (default 4); above it
+# the run reports their timings as measured under load. Every other check is judged in every run.
 # Report: run/ticket_e2e_regtest.json and run/ticket_e2e_regtest.log.
 #
 #   pruned   (TICKET_E2E_PRUNED=1 only) the chain node pruned and without txindex
