@@ -1,6 +1,6 @@
 [package]
 name = "xbt-wallet-ui"
-description = "The agent wallet's web UI for boxes with no terminal (Umbrel, StartOS): policy, human approvals, channels, refunds, signature log, anchor status (AGP-039)"
+description = "The agent wallet's web UI for boxes with no terminal (Umbrel, StartOS): policy, human approvals, channels, refunds, signature log, anchor status, and Lightning Stream browse, player and connections (AGP-039)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

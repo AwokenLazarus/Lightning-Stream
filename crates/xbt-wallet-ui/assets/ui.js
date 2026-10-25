@@ -373,6 +373,18 @@
     if (forget) forget.addEventListener("click", function () { dropKey(); dropKey(PENDING); say($("#keygen-msg"), "Removed from this browser."); });
   }
 
+  // The player's Stop button: drop the video's source before the form posts, so the connector
+  // sees the reader go away at once. The POST still asks the signer to stop the session.
+  $$("form[data-stop-player]").forEach(function (form) {
+    form.addEventListener("submit", function () {
+      $$("video").forEach(function (v) {
+        try { v.pause(); } catch (e) { /* already gone */ }
+        v.removeAttribute("src");
+        try { v.load(); } catch (e2) { /* already gone */ }
+      });
+    });
+  });
+
   // The pending-approvals badge.
   var badge = $("#pending-badge");
   if (badge && root.fetch) {

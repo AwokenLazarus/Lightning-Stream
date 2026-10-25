@@ -805,3 +805,72 @@ fn the_gateway_page_writes_a_config_the_gateway_takes_and_mainnet_is_asked_for()
     assert!(c.get("network").is_none());
     xbt_gateway::config::Config::from_json(&c).unwrap();
 }
+
+const FILM: &str = "https://media.lazarus-xbt.xyz/Videos/057627270372dfed4d8ea15fa9ab5f01/stream?static=true";
+const NOTES: &str = "https://files.example/notes?a=1&b=2";
+
+#[test]
+fn browse_player_and_connections_follow_the_services_file_and_stop_through_the_signer() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("services.json");
+    std::fs::write(&path, format!(r#"[
+        {{"name": "Zebra files", "kind": "files", "seller": "https://files.example", "price_text": "5 sat a file",
+         "items": [{{"title": "<b>notes</b>", "year": 2020, "url": "{NOTES}", "credit": "CC0"}}]}},
+        {{"name": "Alpha films", "kind": "video", "seller": "https://media.lazarus-xbt.xyz", "price_text": "20 sat a MiB",
+         "items": [{{"title": "Big Buck Bunny", "year": 2008, "url": "{FILM}", "credit": "(c) Blender Foundation, CC BY 3.0"}}]}}
+    ]"#)).unwrap();
+    let bx = start(json!({}), false, |c| c.services_file = Some(path.clone()));
+    let mut br = logged_in(&bx);
+    let mut anon = B::new(&bx.base);
+    assert_eq!(anon.get("/browse").location(), "./login");
+    assert_eq!(anon.get("/connections").location(), "./login");
+
+    let page = br.get("/browse");
+    assert_eq!(page.status, 200);
+    assert!(page.body.contains("aria-current=\"page\">Browse"));
+    assert!(page.body.contains("href=\"./play\"") && page.body.contains("href=\"./connections\""));
+    assert!(page.body.find("Alpha films").unwrap() < page.body.find("Zebra files").unwrap(), "name sort");
+    assert!(page.body.contains("&lt;b&gt;notes&lt;/b&gt;") && !page.body.contains("<b>notes</b>"));
+    assert!(page.body.contains(&format!("href=\"./play?item={}\"", enc(FILM))));
+    assert!(page.headers.get("content-security-policy").is_some_and(|v| v.contains("media-src http://127.0.0.1:8480")));
+
+    let by_price = br.get("/browse?sort=price").body;
+    assert!(by_price.find("Zebra files").unwrap() < by_price.find("Alpha films").unwrap(), "price sort");
+    assert!(by_price.contains("selected>Price") || by_price.contains("value=\"price\" selected"));
+    let files = br.get("/browse?kind=files").body;
+    assert!(files.contains("Zebra files") && !files.contains("Big Buck Bunny"));
+    assert!(files.contains("notes?a=1&amp;b=2"));
+    let videos = br.get("/browse?kind=video").body;
+    assert!(videos.contains("Big Buck Bunny") && !videos.contains("Zebra files"));
+    assert!(br.get("/browse?kind=nope").body.contains("No services of this kind"));
+
+    let play = br.get(&format!("/play?item={}", enc(FILM)));
+    assert!(play.body.contains("aria-current=\"page\">Player"));
+    assert!(play.body.contains(&format!("src=\"http://127.0.0.1:8480/s/{FILM}\"")));
+    assert!(play.body.contains("<video controls autoplay"));
+    assert!(play.body.contains("CC BY 3.0") && play.body.contains("Stop and cut the connection"));
+    assert!(play.body.contains("20 sat a MiB"));
+    assert!(br.get("/play").body.contains("Choose a video"));
+    assert!(br.get("/play?item=https://media.lazarus-xbt.xyz/missing").body.contains("not in the services file"));
+    let notes = br.get(&format!("/play?item={}", enc(NOTES))).body;
+    assert!(!notes.contains("<video") && notes.contains("files item"));
+
+    let r = br.post("/play", &[("item", FILM)]);
+    assert_eq!(r.status, 403, "a stop without the CSRF token is refused");
+    let r = br.act(&format!("/play?item={}", enc(FILM)), "/play", &[("item", FILM)]);
+    assert!(br.flash_after(&r).contains("No open session"), "nothing is open with that seller");
+
+    let conn = br.get("/connections");
+    assert!(conn.body.contains("aria-current=\"page\">Connections"));
+    assert!(conn.body.contains("http-equiv=\"refresh\" content=\"4\""));
+    assert!(conn.body.contains("Nothing is open") && conn.body.contains("Cut all"));
+    let r = br.act("/connections", "/connections", &[("all", "1")]);
+    assert!(br.flash_after(&r).contains("Nothing is open"));
+    let r = br.act("/connections", "/connections", &[("session", "not-a-session")]);
+    assert!(br.flash_after(&r).contains("No open session"));
+
+    std::fs::remove_file(&path).unwrap();
+    let gone = br.get("/browse").body;
+    assert!(gone.contains("services file") && gone.contains("XBT_UI_SERVICES") && gone.contains("examples/services.example.json"));
+}
