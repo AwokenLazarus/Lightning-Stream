@@ -159,6 +159,8 @@ pub struct Config {
     /// Off unless the runner writes it: whose word the caps per address take for a buyer's address.
     pub forwarded: Option<Forwarded>,
     pub times: Times,
+    /// The signed catalog (`docs/LISTINGS.md`). Absent: the well-known URL answers 404.
+    pub listing: Option<xbt402::listing::Draft>,
 }
 
 /// A reverse proxy in front of the gateway, and the header in which it reports the address it
@@ -252,6 +254,7 @@ impl Config {
                 "routes",
                 "http",
                 "times",
+                "listing",
             ],
         )?;
         // a file that names no chain is a regtest file: mainnet is never what a missing key means
@@ -551,6 +554,7 @@ impl Config {
             if r.path == SESSION_PATH
                 || r.path.starts_with(&format!("{SESSION_PATH}/"))
                 || r.path == SERVICES_PATH
+                || r.path == LISTING_PATH
             {
                 return Err(format!("route {}: that path is the gateway's own", r.path));
             }
@@ -569,6 +573,10 @@ impl Config {
         let lottery = match top.get("lottery") {
             None | Some(Value::Null) => None,
             Some(l) => Some(LotteryConfig::parse(l, ticket_blocks)?),
+        };
+        let listing = match top.get("listing") {
+            None | Some(Value::Null) => None,
+            Some(l) => Some(xbt402::listing::parse_draft(l).map_err(|e| format!("listing: {e}"))?),
         };
         Ok(Self {
             listen,
@@ -589,12 +597,15 @@ impl Config {
             http,
             forwarded,
             times,
+            listing,
         })
     }
 }
 
 /// Where the gateway serves the list of what it sells.
 pub const SERVICES_PATH: &str = "/services";
+/// The signed listing (`docs/LISTINGS.md`). Free. Absent from the config: 404.
+pub const LISTING_PATH: &str = xbt402::listing::PATH;
 
 fn route(v: &Value) -> Result<Route, String> {
     let r = obj(
@@ -1268,5 +1279,34 @@ mod tests {
             let e = edit(&*f).unwrap_err().to_string();
             assert!(e.contains(want), "wanted {want:?}, got {e:?}");
         }
+    }
+
+    #[test]
+    fn a_listing_is_optional_and_names_only_its_own_fields() {
+        assert!(Config::from_json(&base()).unwrap().listing.is_none());
+        let mut v = base();
+        v["listing"] = json!(null);
+        assert!(Config::from_json(&v).unwrap().listing.is_none());
+        v["listing"] = json!({
+            "name": "Films",
+            "kind": "video",
+            "prices": {"byte_msat": 20, "per_bytes": 1048576},
+            "items": [{"title": "Sintel", "url": "https://media.lazarus-xbt.xyz/Videos/s", "year": 2010}],
+            "licence": "CC BY 3.0",
+            "credits": "(c) Blender Foundation, CC BY 3.0",
+            "updated": "2026-10-25",
+        });
+        let got = Config::from_json(&v).unwrap().listing.unwrap();
+        assert_eq!(got.kind, "video");
+        assert_eq!(got.prices["byte_msat"], "20");
+        assert_eq!(got.items[0].year, Some(2010));
+        v["listing"]["kind"] = json!("nope");
+        assert!(Config::from_json(&v).is_err());
+        v["listing"]["kind"] = json!("video");
+        v["listing"]["extra"] = json!(1);
+        assert!(Config::from_json(&v).unwrap_err().to_string().contains("unknown key"));
+        let mut reserved = base();
+        reserved["routes"][0]["path"] = json!("/.well-known/lightning-stream.json");
+        assert!(Config::from_json(&reserved).unwrap_err().to_string().contains("gateway's own"));
     }
 }

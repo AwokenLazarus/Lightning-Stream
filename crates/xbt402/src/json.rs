@@ -239,7 +239,7 @@ fn write_str(out: &mut String, s: &str) {
     out.push('"');
 }
 
-fn write(out: &mut String, v: &Value, item_sep: &str, key_sep: &str) {
+fn write(out: &mut String, v: &Value, item_sep: &str, key_sep: &str, sort: bool) {
     match v {
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
@@ -251,20 +251,24 @@ fn write(out: &mut String, v: &Value, item_sep: &str, key_sep: &str) {
                 if i > 0 {
                     out.push_str(item_sep);
                 }
-                write(out, x, item_sep, key_sep);
+                write(out, x, item_sep, key_sep, sort);
             }
             out.push(']');
         }
         Value::Object(_) if as_big_int(v).is_some() => out.push_str(as_big_int(v).unwrap_or("0")),
         Value::Object(m) => {
             out.push('{');
-            for (i, (k, x)) in m.iter().enumerate() {
+            let mut pairs: Vec<(&String, &Value)> = m.iter().collect();
+            if sort {
+                pairs.sort_by(|a, b| a.0.cmp(b.0));
+            }
+            for (i, (k, x)) in pairs.into_iter().enumerate() {
                 if i > 0 {
                     out.push_str(item_sep);
                 }
                 write_str(out, k);
                 out.push_str(key_sep);
-                write(out, x, item_sep, key_sep);
+                write(out, x, item_sep, key_sep, sort);
             }
             out.push('}');
         }
@@ -274,14 +278,22 @@ fn write(out: &mut String, v: &Value, item_sep: &str, key_sep: &str) {
 /// `json.dumps(v)`: separators `", "` and `": "`.
 pub fn dumps(v: &Value) -> String {
     let mut s = String::new();
-    write(&mut s, v, ", ", ": ");
+    write(&mut s, v, ", ", ": ", false);
     s
 }
 
 /// `json.dumps(v, separators=(",", ":"))`.
 pub fn dumps_compact(v: &Value) -> String {
     let mut s = String::new();
-    write(&mut s, v, ",", ":");
+    write(&mut s, v, ",", ":", false);
+    s
+}
+
+/// `json.dumps(v, sort_keys=True, separators=(",", ":"))`: the bytes a signature covers, so key
+/// order does not change them.
+pub fn dumps_sorted_compact(v: &Value) -> String {
+    let mut s = String::new();
+    write(&mut s, v, ",", ":", true);
     s
 }
 
