@@ -1,0 +1,202 @@
+# Lightning Stream. Unpublished: side-load only. The wallet's services, the connector and the gateway.
+# Buy: the signer, the anchor witness, the MCP server and the web UI, as in the wallet app. The main
+# page is this app's own page (port 8482). Agents on the LAN use host port 33511.
+# Play: the connector pays through the signer and streams the body. It is not published on the LAN.
+# It shares the UI's network namespace and listens on 127.0.0.1:8484, which is what XBT_UI_CONNECTOR
+# names. A browser on another machine cannot open that address. The UI process, in that namespace, can.
+# Sell: the gateway, the same image as the gateway app, so it stays idle until its config exists
+# (xbt-supervise --wait). The owner turns it on from the sell page (host port 8483), which is the UI
+# in its gateway role. The gateway mounts only its narrow macaroons. The signer is the only service
+# that can spend. No admin macaroon is mounted: of the Lightning node's data, only tls.cert.
+#
+# Stream sockets live in run/signer/streams (B2_STREAM_DIR for the signer and the connector). The
+# connector runs as the signer's user, because the published signer image cannot gain a group until
+# it is rebuilt. It mounts that directory read-write and the rest of run/signer read-only, and it
+# does not mount the signer's state. A fresh data dir arrives owned by the box user, so init's chown
+# of run/signer covers the subdirectory. The connector image has no published digest yet: it is the
+# local tag scripts/oci_build.sh --load gives (lightning-stream:0.1.0). The other images are pinned.
+version: "3.7"
+
+x-service: &service
+  restart: on-failure
+  # a static binary as PID 1 gets no default action for SIGTERM: without an init, a stop waits out the
+  # grace period and kills the service (umbrelOS stops and restarts apps with SIGTERM)
+  init: true
+  read_only: true
+  tmpfs:
+    - /tmp:rw,size=16m
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  depends_on:
+    init:
+      condition: service_completed_successfully
+
+x-lightning-cert: &lightning-cert
+  type: bind
+  source: ${APP_LIGHTNING_FORK_NODE_DATA_DIR}/tls.cert
+  target: /data/lightning/tls.cert
+  read_only: true
+  bind:
+    # a missing certificate stops the start: Docker would otherwise make a directory in its place
+    create_host_path: false
+
+services:
+  app_proxy:
+    environment:
+      APP_HOST: lazarus-lightning-stream_ui_1
+      APP_PORT: 8482
+
+  init:
+    image: ghcr.io/awokenlazarus/xbt-init:0.1.0-cc28002e474e@sha256:dd00b3194dd4c32e955aeae8b729b1e7460ce3f57214eda878f24e2b3c0c276b
+    user: "0:0"
+    restart: "no"
+    network_mode: none
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - FOWNER
+      - DAC_OVERRIDE
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      XBT_INIT_COMPONENTS: signer,witness,mcp,ui,gateway
+      XBT_INIT_NODE_RPC_USER: ${APP_BITCOIN_RPC_USER:-${APP_XBT_KNOTS_RPC_USER}}
+      XBT_INIT_NODE_RPC_PASS: ${APP_BITCOIN_RPC_PASS:-${APP_XBT_KNOTS_RPC_PASS}}
+      XBT_INIT_UI_PASSWORD: ${APP_PASSWORD}
+    volumes:
+      - ${APP_DATA_DIR}/data:/data
+
+  witness:
+    <<: *service
+    image: ghcr.io/awokenlazarus/xbt-anchor-witness:0.1.0-cc28002e474e@sha256:f09ab563ba4571055e52f0d9139c01057b2aa07c45d44ef82307a85daf57abe8
+    network_mode: none
+    stop_grace_period: 30s
+    volumes:
+      - ${APP_DATA_DIR}/data/witness:/data/witness
+      - ${APP_DATA_DIR}/data/run/anchor:/data/run/anchor
+
+  signer:
+    <<: *service
+    image: ghcr.io/awokenlazarus/xbt-signer:0.1.0-cc28002e474e@sha256:68823bb1e1895807c42aa90df2f2658ead4eaa7fd7b3630540fd41433fd9a011
+    entrypoint: ["/usr/bin/xbt-supervise", "--watch", "/data/run/ln/rail.macaroon", "--watch", "/data/lightning/tls.cert", "--", "/usr/bin/xbt-signer"]
+    stop_grace_period: 1m
+    environment:
+      XBT_NODE_RPC_HOST: ${APP_BITCOIN_NODE_IP:-${APP_XBT_KNOTS_NODE_HOST}}
+      XBT_NODE_RPC_PORT: ${APP_BITCOIN_RPC_PORT:-${APP_XBT_KNOTS_RPC_PORT}}
+      # the stand-in names its chain; with the slot's node the signer reads it from the node
+      XBT_CHAIN: ${APP_XBT_KNOTS_CHAIN:-}
+      B2_LN_REST: https://${APP_LIGHTNING_FORK_NODE_IP}:${APP_LIGHTNING_FORK_NODE_REST_PORT}
+      B2_LN_MACAROON: /data/run/ln/rail.macaroon
+      B2_MAINNET_ACK_FILE: /data/run/ln/mainnet-ack
+      B2_LN_TLS_CERT: /data/lightning/tls.cert
+      # the same directory the connector binds stream sockets in
+      B2_STREAM_DIR: /data/run/signer/streams
+    volumes:
+      - ${APP_DATA_DIR}/data/signer:/data/signer
+      - ${APP_DATA_DIR}/data/run/signer:/data/run/signer
+      - ${APP_DATA_DIR}/data/run/anchor:/data/run/anchor:ro
+      - ${APP_DATA_DIR}/data/run/ln:/data/run/ln:ro
+      - *lightning-cert
+
+  mcp:
+    <<: *service
+    image: ghcr.io/awokenlazarus/xbt-wallet-mcp:0.1.0-cc28002e474e@sha256:bca54d260f3a3edb8ff2b14f278bcaa9f6ff5a2156ca9a8d8d6f7f6cef433ebe
+    stop_grace_period: 30s
+    environment:
+      # an over-threshold payment waits this long for the owner's approval in the UI
+      XBT_MCP_APPROVAL_WAIT_S: "300"
+      # the Lightning rail's and the tickets' own tools (status, stop) beside xbt402_pay
+      XBT_MCP_LN: "1"
+      XBT_MCP_TICKETS: "1"
+    ports:
+      # agents on the LAN. 33510 is the wallet app's host port, so this app uses 33511.
+      # other apps on this box use lazarus-lightning-stream_mcp_1:33510, behind the bearer token
+      - "33511:33510"
+    volumes:
+      - ${APP_DATA_DIR}/data/mcp:/data/mcp
+      - ${APP_DATA_DIR}/data/run/signer:/data/run/signer:ro
+      # the bearer token is the UI's file (0640, group xbt-wallet-ui): read on every request, never written here
+      - ${APP_DATA_DIR}/data/run/ui:/data/run/ui:ro
+
+  ui:
+    <<: *service
+    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-cc28002e474e@sha256:c71d62e384b01b3910d50c21c4f4ff3bc59b847806c0a9b04cc30b130ff6ea53
+    stop_grace_period: 15s
+    environment:
+      XBT_UI_BIND: 0.0.0.0:8482
+      XBT_UI_PASSWORD_FILE: /data/ui/secrets/xbt-ui-password
+      XBT_UI_SIGNER_SOCK: /data/run/signer/signer.sock
+      XBT_UI_MCP_URL: http://${DEVICE_DOMAIN_NAME}:33511/mcp
+      XBT_UI_LN_REST: https://${APP_LIGHTNING_FORK_NODE_IP}:${APP_LIGHTNING_FORK_NODE_REST_PORT}
+      XBT_UI_LN_TLS_CERT: /data/lightning/tls.cert
+      # the connector shares this container's network namespace and listens on loopback only
+      XBT_UI_CONNECTOR: http://127.0.0.1:8484
+    volumes:
+      - ${APP_DATA_DIR}/data/ui:/data/ui
+      - ${APP_DATA_DIR}/data/run/signer:/data/run/signer:ro
+      # the UI owns the MCP token (run/ui/mcp-http-token) and rotates it on its Agents page
+      - ${APP_DATA_DIR}/data/run/ui:/data/run/ui
+      # the Lightning page writes the rail macaroon here
+      - ${APP_DATA_DIR}/data/run/ln:/data/run/ln
+      - *lightning-cert
+
+  connector:
+    <<: *service
+    image: lightning-stream:0.1.0
+    network_mode: "service:ui"
+    stop_grace_period: 15s
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      ui:
+        condition: service_started
+      signer:
+        condition: service_started
+    environment:
+      B2_SIGNER_SOCK: /data/run/signer/signer.sock
+      B2_STREAM_DIR: /data/run/signer/streams
+      # the starter policy's task; the signed policy can only be tighter than LS_MAX_SATS
+      LS_TASK: default
+      LS_MAX_SATS: "20000"
+      LS_LISTEN: 127.0.0.1:8484
+    volumes:
+      # the control socket, read-only: this service cannot replace it, and it holds no keys
+      - ${APP_DATA_DIR}/data/run/signer:/data/run/signer:ro
+      # the stream sockets, read-write. The same host directory the signer sees under run/signer.
+      - ${APP_DATA_DIR}/data/run/signer/streams:/data/run/signer/streams
+
+  gateway:
+    <<: *service
+    image: ghcr.io/awokenlazarus/xbt-gateway:0.1.0-cc28002e474e@sha256:2890c98a4aefd545c08b78b882111d9435fbb43058fe2098d13b80f28d3c214f
+    # each held ticket is followed on its own connection to the node; a stop cancels nothing.
+    # the image starts the gateway only once run/gateway/config.json exists, and publishes no host port
+    stop_grace_period: 30s
+    volumes:
+      - ${APP_DATA_DIR}/data/gateway:/data/gateway
+      - ${APP_DATA_DIR}/data/run/gateway:/data/run/gateway:ro
+      - *lightning-cert
+
+  sell:
+    <<: *service
+    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-cc28002e474e@sha256:c71d62e384b01b3910d50c21c4f4ff3bc59b847806c0a9b04cc30b130ff6ea53
+    stop_grace_period: 15s
+    environment:
+      XBT_UI_ROLE: gateway
+      XBT_UI_BIND: 0.0.0.0:8481
+      XBT_UI_PASSWORD_FILE: /data/ui/secrets/xbt-ui-password
+      XBT_UI_GW_NODE_REST: https://${APP_LIGHTNING_FORK_NODE_IP}:${APP_LIGHTNING_FORK_NODE_REST_PORT}
+      XBT_UI_GW_NODE_TLS_CERT: /data/lightning/tls.cert
+      XBT_UI_GW_HEALTH_URL: http://lazarus-lightning-stream_gateway_1:8402/x402/ticket/health
+    ports:
+      # the owner turns selling on here. 8480 and 8481 are the other two apps' pages.
+      - "8483:8481"
+    volumes:
+      - ${APP_DATA_DIR}/data/ui:/data/ui
+      - ${APP_DATA_DIR}/data/run/ui:/data/run/ui
+      # the gateway page writes the gateway's config and macaroons here
+      - ${APP_DATA_DIR}/data/run/gateway:/data/run/gateway
+      - *lightning-cert

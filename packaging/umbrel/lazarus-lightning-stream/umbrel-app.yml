@@ -1,0 +1,59 @@
+manifestVersion: 1.1
+id: lazarus-lightning-stream
+category: lightning
+name: Lightning Stream
+version: "0.1.0"
+tagline: Buy and sell over Lightning from this box, and play what you pay for
+description: >-
+  One app for both sides. The wallet pays sellers with stream tickets under a policy you sign, and
+  agents connect to its MCP server. The connector, on this box only, asks the signer to pay for a
+  film and stream it. The sell side is the gateway: it stays idle until you save a service on the
+  sell page, and it holds only the narrow macaroons that page writes. The signer is the only
+  service that can spend.
+
+
+  Setup, on this app's main page: enrol your approval key, sign a policy (the starter template turns
+  Lightning and stream tickets on with low caps), and on the Lightning page paste a macaroon you make
+  in Lightning Fork's dashboard with exactly info:read, offchain:read, offchain:write and
+  onchain:read. The app reads only the node's certificate; it never holds an admin macaroon.
+
+
+  To sell, open port 8483 and log in with the same password. Set the service, the price and two
+  macaroons (invoices:read invoices:write; info:read). Buyers reach the gateway through an https
+  proxy you point at lazarus-lightning-stream_gateway_1:8402. Until that page is saved, the gateway
+  does not listen. Agents on the LAN use port 33511, with the bearer token from the Agents page.
+
+
+  The keys stay in the signer, sealed on this box's disk. A separate anchor witness keeps a tamper
+  record of every signature. On mainnet this software moves real funds and has run on regtest only:
+  the Lightning page asks you to acknowledge that before it stores a macaroon.
+
+
+  Needs Lightning Fork and an XBT (BLAKE2b) node. Side-load only. The connector image is the local
+  tag lightning-stream:0.1.0 until it is published; the other images are pinned by digest.
+developer: Lazarus
+website: https://github.com/AwokenLazarus/Lightning-Stream
+repo: https://github.com/AwokenLazarus/Lightning-Stream
+support: https://github.com/AwokenLazarus/Lightning-Stream/issues
+port: 8482
+gallery:
+  - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/1.png
+  - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/2.png
+  - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/3.png
+  - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/4.png
+  - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/5.png
+releaseNotes: >-
+  0.1.0: the wallet, the connector and the gateway in one app. The connector image is a local build.
+  The gateway does not listen until its page is saved. Local package, regtest-tested only for the
+  two apps this one is built from.
+dependencies:
+  # the XBT node slot (Paul's paulscode-knots-blake2b, or this store's stand-in) and Lightning Fork,
+  # which is in its author's community store: umbrelOS resolves dependencies by installed app id
+  - bitcoin
+  - paulscode-lightning-fork
+path: ""
+defaultUsername: ""
+deterministicPassword: true
+submitter: Lazarus
+submission: https://github.com/AwokenLazarus/Lightning-Stream/tree/main/packaging/umbrel
+icon: https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/icon.svg

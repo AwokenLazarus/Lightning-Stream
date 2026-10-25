@@ -43,6 +43,10 @@ tmpfs `/tmp`.
   knots-xbt/       cmp  uid 10020  0700  the pruned XBT Knots node's datadir (cmp bundles the node image)
   run/<component>/ the server's uid and gid, 0750: its sockets (0660) and readiness file (0640)
      run/signer/   signer.sock, ready.json
+     run/signer/streams/  the connector's stream sockets (0660). The Umbrel app bind-mounts this
+                   directory. A fresh data dir arrives owned by the box user, so init's chown of
+                   run/signer (the owner was wrong) gives the subdirectory to the signer too. The
+                   connector runs as that user, sets the directory to 0750 and does not mount signer/
      run/anchor/   anchor.sock
      run/ui/       mcp-http-token (0640): the MCP bearer token, owned by the UI, read by the MCP (AGP-042)
   run/ln/          uid 10005, gid 10008 (xbt-ln-rail), 0750: rail.macaroon, mainnet-ack (0640), written by the
@@ -92,7 +96,7 @@ UID table (the images' `USER`; the cmp rows are reserved):
 
 | uid/gid | user | image |
 |---|---|---|
-| 10001 | xbt-signer | xbt-signer |
+| 10001 | xbt-signer | xbt-signer, lightning-stream (the connector; see below) |
 | 10002 | xbt-anchor-witness | xbt-anchor-witness |
 | 10003 | xbt-wallet-mcp | xbt-wallet-mcp |
 | 10004 | (not used; was the retired hub's) | |
@@ -105,6 +109,10 @@ UID table (the images' `USER`; the cmp rows are reserved):
 | 10012 | cmpd | cmpd-* (reserved) |
 | 10013 | cmp-client | cmp-client (reserved) |
 | 10020 | knots-xbt | knots-xbt (reserved) |
+
+`lightning-stream` runs as `xbt-signer`. The published signer image's groups stay as they are until that
+image is rebuilt, so the connector cannot be a new user and still have the signer connect to its sockets.
+It mounts `run/signer/` read-only and `run/signer/streams/` read-write, and it does not mount `signer/`.
 
 ## 2. Secrets: one lookup, by name
 
@@ -206,18 +214,20 @@ None of these binaries depends on systemd. `$CREDENTIALS_DIRECTORY` is just one 
 ## 6. Images
 
 `scripts/oci_build.sh` builds one image per binary for **linux/amd64, linux/arm64 and linux/arm/v7**:
-`xbt-signer`, `xbt-anchor-witness`, `xbt-wallet-mcp`, `xbt-wallet-ui`, `xbt-init`, `xbt-work-relay` and
-`xbt-gateway` (`--only IMAGE,...` builds a subset; the binaries come from `$CARGO_TARGET_DIR`). Each
+`xbt-signer`, `xbt-anchor-witness`, `xbt-wallet-mcp`, `xbt-wallet-ui`, `xbt-init`, `xbt-work-relay`,
+`xbt-gateway` and `lightning-stream` (`--only IMAGE,...` builds a subset; the binaries come from `$CARGO_TARGET_DIR`). Each
 is `FROM scratch` with the static musl binary (built with zig). There is no `RUN`, so no emulator or
 binfmt is needed. The images are saved as OCI archives in `dist/oci/*.tar`, with digests and sizes in
 `dist/oci/IMAGES.md`. `scripts/oci_inspect.py` checks every platform: architecture, static ELF, non-root,
 HEALTHCHECK, two layers, and the shared base layer.
 
-`scripts/oci_publish.sh` (run by the hand-started "Publish images" workflow) pushes the six images the
+`scripts/oci_publish.sh` (run by the hand-started "Publish images" workflow) pushes the images the
 Umbrel and StartOS packages run, all but `xbt-work-relay`, to `ghcr.io/awokenlazarus/<image>:<version>-<commit>`
 from the same build, checks that the registry serves the index of the inspected archive, and records the
-digests in `packaging/images.lock`. The packages pin those images by digest; how to check one, and what has
-not been checked (reproducible builds), is in `packaging/README.md`, "Images".
+digests in `packaging/images.lock`. `lightning-stream` is in that list. It has no line in the lock until
+that publish runs; until then the Lightning Stream app names the local tag `lightning-stream:0.1.0`, and
+no digest is invented for it. The other packages pin the images that are in the lock, by digest; how to
+check one, and what has not been checked (reproducible builds), is in `packaging/README.md`, "Images".
 
 - **Layer 1** is shared and byte-identical in every image and platform, so it is stored once:
   `/etc/passwd`, `/etc/group`, `/tmp` (1777), and the `/data` skeleton with owners. It is generated
@@ -231,7 +241,7 @@ not been checked (reproducible builds), is in `packaging/README.md`, "Images".
   - `HEALTHCHECK` runs the binary's own `healthcheck`.
 
   Run the containers with `read_only: true`, `tmpfs: /tmp` and `no-new-privileges`.
-- **Stop:** every service binary (signer, witness, MCP over HTTP, UI, relay, gateway, `xbt-supervise`) takes
+- **Stop:** every service binary (signer, witness, MCP over HTTP, UI, relay, gateway, the connector, `xbt-supervise`) takes
   SIGTERM and SIGINT itself (`xbt_svc::shutdown`), so it stops at once also as PID 1, with or without an
   init: it takes no new connection or request, gives the ones in flight 5 s, flushes what it owns (the
   gateway journals its counters and fsyncs its journal) and exits 0. Work still running at 5 s is cut as
