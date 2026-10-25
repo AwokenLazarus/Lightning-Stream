@@ -124,6 +124,50 @@ pub const WALLET_MAINNET_NOTICE: [&str; 4] = [
     "Read the limits of the software (docs/LIMITS.md in the source) before you rely on it.",
 ];
 
+/// How long reading the node's certificate for pinning may take.
+const PIN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The SHA-256 of a certificate, as the owner compares it: hex in pairs.
+fn fingerprint(der: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(der).iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":")
+}
+
+/// The card that pins the node's certificate, for a platform that cannot hand it over alone: the
+/// certificate the node shows now, its fingerprint for the owner to compare with the node's own
+/// page, and one button. Empty where the platform gives the certificate itself.
+fn pin_card(csrf: &str, pin: bool, rest: Option<&str>, path: Option<&Path>, action: &str) -> String {
+    let (true, Some(rest), Some(path)) = (pin, rest, path) else { return String::new() };
+    let had = path.is_file();
+    let mut b = format!("<section class=\"card\"><h2>{}</h2>", if had { "Pin the node's certificate again" } else { "Pin the node's certificate" });
+    match xbt_gateway::node::peer_certificate(rest, PIN_WAIT) {
+        Ok(der) => {
+            let fp = fingerprint(&der);
+            b.push_str(&format!("<p>{}This is the certificate your Lightning node shows at <code>{}</code>. Compare its fingerprint with the one \
+                on the node's own page; pin it only if they match. From then on the wallet talks to this certificate and no other.</p>\
+                <p><code>SHA-256 {}</code></p><form method=\"post\" action=\"{}\">{}<input type=\"hidden\" name=\"action\" value=\"pin_cert\">\
+                <input type=\"hidden\" name=\"fingerprint\" value=\"{}\"><button>Yes, this is my node: pin it</button></form>",
+                if had { "Pin again only if you know the node's certificate changed (a new node, or a certificate it renewed). " } else { "" },
+                esc(rest), esc(&fp), esc(action), csrf, esc(&fp)));
+        }
+        Err(e) => b.push_str(&format!("<p><span class=\"tag bad\">the node's certificate could not be read</span> {}</p>", esc(&e))),
+    }
+    b.push_str("</section>");
+    b
+}
+
+/// Pin the certificate the node shows now, if it is the one the owner was shown (`fp`).
+fn pin_cert(pin: bool, rest: Option<&str>, path: Option<&Path>, fp: &str) -> Result<String, String> {
+    let (true, Some(rest), Some(path)) = (pin, rest, path) else { return Err("this platform gives the node's certificate itself".into()) };
+    let der = xbt_gateway::node::peer_certificate(rest, PIN_WAIT)?;
+    if fingerprint(&der) != fp {
+        return Err("the node now shows another certificate than the one you confirmed: nothing was pinned; look again".into());
+    }
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else { return Err("the certificate path has no directory".into()) };
+    write_shared(dir, name, xbt_gateway::node::cert_pem(&der).as_bytes())?;
+    Ok(format!("Certificate pinned (SHA-256 {fp}). The services that talk to the node restart to use it."))
+}
+
 impl App {
     // --- the wallet: the Lightning rail ------------------------------------------------------------
 
@@ -153,6 +197,7 @@ impl App {
                      else { format!("<span class=\"tag bad\">not ready</span> {}", esc(&txt(status.get("reason").or(status.get("config_error"))))) }),
         ]));
         b.push_str(&format!("<details><summary>The signer's view of the rail</summary>{}</details></section>", json_block(&status)));
+        b.push_str(&pin_card(&App::csrf_input(ctx), ln.pin, ln.rest.as_deref(), ln.tls_cert.as_deref(), "./lightning"));
         let main = chain == "main";
         if main {
             b.push_str(&notice_html(&WALLET_MAINNET_NOTICE));
@@ -177,7 +222,9 @@ impl App {
 
     pub(crate) fn lightning_post(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {
         let dir = &self.cfg.ln.dir;
+        let ln = &self.cfg.ln;
         let result = match f.get("action").map(String::as_str) {
+            Some("pin_cert") => pin_cert(ln.pin, ln.rest.as_deref(), ln.tls_cert.as_deref(), f.get("fingerprint").map(String::as_str).unwrap_or("")),
             Some("remove") => remove_shared(dir, RAIL_MACAROON).map(|had| {
                 let _ = remove_shared(dir, MAINNET_ACK_FILE);
                 if had { "Rail macaroon removed: the signer restarts without it.".to_string() } else { "There was no rail macaroon.".into() }
@@ -322,6 +369,7 @@ impl App {
             request to your service. It needs two macaroons from your Lightning node's dashboard (Lightning Fork: <em>Macaroons</em>), each with \
             exactly these permissions and a root key of its own:</p>");
         b.push_str(&format!("<ul><li>invoices: <code>{}</code></li><li>height: <code>{}</code></li></ul>", INVOICE_OPS.join(" "), INFO_OPS.join(" ")));
+        b.push_str(&pin_card(&App::csrf_input(ctx), gw.node_pin, gw.node_rest.as_deref(), gw.node_tls_cert.as_deref(), "./gateway"));
         b.push_str("<section class=\"card\"><h2>Now</h2>");
         let health = gw.health_url.as_deref().map(|u| match crate::app::http_get(u) {
             Ok((200, body)) => format!("<span class=\"tag ok\">running</span> <code>{}</code>", esc(&crate::html::short(body.trim(), 200))),
@@ -388,6 +436,14 @@ impl App {
             }
             "/gateway" => {}
             _ => return Resp::text(404, "text/plain", "not found"),
+        }
+        if f.get("action").map(String::as_str) == Some("pin_cert") {
+            let gw = &self.cfg.gw;
+            match pin_cert(gw.node_pin, gw.node_rest.as_deref(), gw.node_tls_cert.as_deref(), f.get("fingerprint").map(String::as_str).unwrap_or("")) {
+                Ok(m) => self.flash(ctx, true, m),
+                Err(e) => self.flash(ctx, false, e),
+            }
+            return Resp::redirect("./gateway");
         }
         let dir = &self.cfg.gw.dir;
         let mut f = f.clone();

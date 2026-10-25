@@ -32,3 +32,5 @@ xbt-signer.workspace = true
 xbt-wallet-mcp = { path = "../xbt-wallet-mcp" }
 xbt402 = { workspace = true, features = ["http-client", "http-server"] }
 xbt-primitives.workspace = true
+# a TLS node for the certificate-pinning test (the gateway's own version and features)
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

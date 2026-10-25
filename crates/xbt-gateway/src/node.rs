@@ -253,8 +253,101 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCert {
     }
 }
 
+/// A TLS verifier that accepts whatever certificate the node shows and keeps it, for one look:
+/// how a package with no certificate file learns the node's, so that the owner can confirm its
+/// fingerprint and pin it ([`peer_certificate`]). The handshake signatures are still verified.
+#[derive(Debug)]
+struct SeenCert {
+    seen: std::sync::Mutex<Option<Vec<u8>>>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for SeenCert {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _i: &[rustls::pki_types::CertificateDer<'_>],
+        _n: &rustls::pki_types::ServerName<'_>,
+        _o: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        *self.seen.lock().unwrap_or_else(|p| p.into_inner()) = Some(end_entity.as_ref().to_vec());
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        m: &[u8],
+        c: &rustls::pki_types::CertificateDer<'_>,
+        d: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(m, c, d, &self.provider.signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        m: &[u8],
+        c: &rustls::pki_types::CertificateDer<'_>,
+        d: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(m, c, d, &self.provider.signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// The certificate the node at `rest` (`https://host:port`) shows in a TLS handshake, as DER. Only
+/// for the owner to confirm and pin: nothing is sent over this connection, and a certificate read
+/// this way is trusted only once the owner has compared its fingerprint.
+pub fn peer_certificate(rest: &str, timeout: Duration) -> Result<Vec<u8>, String> {
+    use std::net::ToSocketAddrs;
+    let hostport = rest
+        .strip_prefix("https://")
+        .ok_or("the node's REST address is not https")?
+        .split('/')
+        .next()
+        .unwrap_or("");
+    let host = hostport.rsplit_once(':').map(|(h, _)| h).unwrap_or(hostport).trim_start_matches('[').trim_end_matches(']').to_string();
+    let target = if hostport.contains(':') { hostport.to_string() } else { format!("{hostport}:443") };
+    let addr = target
+        .to_socket_addrs()
+        .map_err(|e| format!("{hostport}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("{hostport}: no address"))?;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let seen = Arc::new(SeenCert { seen: std::sync::Mutex::new(None), provider: provider.clone() });
+    let cfg = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())?
+        .dangerous()
+        .with_custom_certificate_verifier(seen.clone())
+        .with_no_client_auth();
+    let name = match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => rustls::pki_types::ServerName::IpAddress(ip.into()),
+        Err(_) => rustls::pki_types::ServerName::try_from(host.clone()).map_err(|e| e.to_string())?,
+    };
+    let mut conn = rustls::ClientConnection::new(Arc::new(cfg), name).map_err(|e| e.to_string())?;
+    let mut sock = std::net::TcpStream::connect_timeout(&addr, timeout).map_err(|e| format!("{hostport}: {e}"))?;
+    let _ = sock.set_read_timeout(Some(timeout));
+    let _ = sock.set_write_timeout(Some(timeout));
+    while conn.is_handshaking() {
+        conn.complete_io(&mut sock).map_err(|e| format!("TLS with {hostport}: {e}"))?;
+    }
+    let der = seen.seen.lock().unwrap_or_else(|p| p.into_inner()).take();
+    der.ok_or_else(|| format!("{hostport} showed no certificate"))
+}
+
+/// `der` as a PEM certificate, the form `tls.cert` files have.
+pub fn cert_pem(der: &[u8]) -> String {
+    let b64 = B64.encode(der);
+    let lines: Vec<&str> = b64.as_bytes().chunks(64).map(|c| std::str::from_utf8(c).unwrap_or("")).collect();
+    format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", lines.join("\n"))
+}
+
 /// The first certificate in a PEM file, as DER.
-fn pem_cert_der(pem: &str) -> Result<Vec<u8>, String> {
+pub fn pem_cert_der(pem: &str) -> Result<Vec<u8>, String> {
     let start = pem
         .find("-----BEGIN CERTIFICATE-----")
         .ok_or("tls.cert: no PEM certificate")?;

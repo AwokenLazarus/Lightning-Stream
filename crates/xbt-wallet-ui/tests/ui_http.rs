@@ -805,3 +805,70 @@ fn the_gateway_page_writes_a_config_the_gateway_takes_and_mainnet_is_asked_for()
     assert!(c.get("network").is_none());
     xbt_gateway::config::Config::from_json(&c).unwrap();
 }
+
+/// A TLS node on loopback with the gateway's test certificate (public test data), answering nothing.
+fn tls_node() -> (u16, Vec<u8>) {
+    use std::sync::Arc;
+    let der = |name: &str| {
+        use base64::Engine;
+        let pem = std::fs::read_to_string(format!("{}/../xbt-gateway/tests/data/node-tls/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+        base64::engine::general_purpose::STANDARD.decode(body).unwrap()
+    };
+    let cert = der("seller.pem");
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let cfg = Arc::new(rustls::ServerConfig::builder_with_provider(provider).with_safe_default_protocol_versions().unwrap().with_no_client_auth()
+        .with_single_cert(vec![rustls::pki_types::CertificateDer::from(cert.clone())],
+                          rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(der("seller.key")))).unwrap());
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for sock in l.incoming().flatten() {
+            let cfg = cfg.clone();
+            std::thread::spawn(move || {
+                use std::io::Read;
+                let mut tls = rustls::StreamOwned::new(rustls::ServerConnection::new(cfg).unwrap(), sock);
+                let _ = tls.read(&mut [0u8; 1]);
+            });
+        }
+    });
+    (port, cert)
+}
+
+/// A platform that cannot mount the node's certificate alone (`XBT_UI_LN_TLS_PIN=1`): the Lightning
+/// page shows the certificate the node presents and its fingerprint, and pins it when the owner
+/// confirms; a fingerprint that is not the node's pins nothing; without the setting there is no
+/// card, and the platform's own certificate is used as before.
+#[test]
+fn the_owner_pins_the_node_certificate_on_a_platform_that_cannot_mount_it() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (port, cert) = tls_node();
+    let pinned_dir = tempfile::tempdir().unwrap();
+    let pinned = pinned_dir.path().join("tls.cert");
+    let p2 = pinned.clone();
+    let b = start(json!({}), false, move |c| {
+        c.ln.rest = Some(format!("https://127.0.0.1:{port}"));
+        c.ln.tls_cert = Some(p2);
+        c.ln.pin = true;
+    });
+    let mut br = logged_in(&b);
+    let page = br.get("/lightning").body;
+    assert!(page.contains("Pin the node&#39;s certificate") || page.contains("Pin the node's certificate"), "{page}");
+    let fp = field(&page, "fingerprint");
+    assert_eq!(fp.split(':').count(), 32, "{fp}");
+    // a fingerprint that is not the one the node shows: nothing pinned
+    let r = br.act("/lightning", "/lightning", &[("action", "pin_cert"), ("fingerprint", "00:11")]);
+    assert!(br.flash_after(&r).contains("another certificate"));
+    assert!(!pinned.exists());
+    // the owner confirms the one shown
+    let r = br.act("/lightning", "/lightning", &[("action", "pin_cert"), ("fingerprint", &fp)]);
+    assert!(br.flash_after(&r).starts_with("Certificate pinned"));
+    let pem = std::fs::read_to_string(&pinned).unwrap();
+    assert_eq!(xbt_gateway::node::pem_cert_der(&pem).unwrap(), cert);
+    // without the platform's setting: no card, and pinning is refused
+    let b2 = start(json!({}), false, |c| c.ln.rest = Some("https://127.0.0.1:1".into()));
+    let mut br2 = logged_in(&b2);
+    assert!(!br2.get("/lightning").body.contains("name=\"fingerprint\""));
+    let r = br2.act("/lightning", "/lightning", &[("action", "pin_cert"), ("fingerprint", &fp)]);
+    assert!(br2.flash_after(&r).contains("gives the node's certificate itself"));
+}

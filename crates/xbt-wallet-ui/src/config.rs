@@ -66,6 +66,9 @@ pub struct LnSetup {
     pub dir: PathBuf,
     pub rest: Option<String>,
     pub tls_cert: Option<PathBuf>,
+    /// The owner pins the node's certificate on the Lightning page (`XBT_UI_LN_TLS_PIN=1`): for a
+    /// platform that cannot mount the certificate alone, the page writes it to `tls_cert`.
+    pub pin: bool,
 }
 
 /// The gateway page: where it writes, and the node and paths as the gateway's container sees them.
@@ -74,6 +77,8 @@ pub struct GatewaySetup {
     pub dir: PathBuf,
     pub node_rest: Option<String>,
     pub node_tls_cert: Option<PathBuf>,
+    /// As [`LnSetup::pin`], for the gateway's node certificate (`XBT_UI_GW_NODE_TLS_PIN=1`).
+    pub node_pin: bool,
     pub state_dir: String,
     pub port: u16,
     pub health_url: Option<String>,
@@ -130,11 +135,13 @@ impl Config {
             dir: env("XBT_UI_LN_DIR").map(PathBuf::from).unwrap_or_else(|| run_dir("ln")),
             rest: env("XBT_UI_LN_REST"),
             tls_cert: env("XBT_UI_LN_TLS_CERT").map(PathBuf::from),
+            pin: env("XBT_UI_LN_TLS_PIN").as_deref() == Some("1"),
         };
         let gw = GatewaySetup {
             dir: env("XBT_UI_GW_DIR").map(PathBuf::from).unwrap_or_else(|| run_dir("gateway")),
             node_rest: env("XBT_UI_GW_NODE_REST"),
             node_tls_cert: env("XBT_UI_GW_NODE_TLS_CERT").map(PathBuf::from),
+            node_pin: env("XBT_UI_GW_NODE_TLS_PIN").as_deref() == Some("1"),
             state_dir: env("XBT_UI_GW_STATE_DIR").unwrap_or_else(|| "/data/gateway".into()),
             port: env("XBT_UI_GW_PORT").and_then(|p| p.parse().ok()).filter(|p| *p > 0).unwrap_or(8402),
             health_url: env("XBT_UI_GW_HEALTH_URL").filter(|u| u.starts_with("http://")),
