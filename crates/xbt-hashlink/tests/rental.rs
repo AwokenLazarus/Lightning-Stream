@@ -29,10 +29,21 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// `N` distinct free ports: all bound at once before any is let go, so none is picked twice.
+/// `N` distinct free ports: all bound at once before any is let go, so none is picked twice. They
+/// come from below the kernel's ephemeral range (on Linux 32768 and up by default): a port the
+/// kernel hands out itself can be taken, between being let go and bound again, as the source port
+/// of any outgoing connection on the machine.
 fn ports<const N: usize>() -> [String; N] {
-    let ls: Vec<TcpListener> = (0..N).map(|_| TcpListener::bind("127.0.0.1:0").unwrap()).collect();
-    std::array::from_fn(|i| ls[i].local_addr().unwrap().to_string())
+    loop {
+        let mut b = [0u8; 2];
+        getrandom::getrandom(&mut b).unwrap();
+        let base = 20_000 + u16::from_le_bytes(b) % 12_000;
+        let ls: Vec<TcpListener> =
+            (0..N as u16).filter_map(|i| TcpListener::bind(("127.0.0.1", base + i * 7)).ok()).collect();
+        if ls.len() == N {
+            return std::array::from_fn(|i| ls[i].local_addr().unwrap().to_string());
+        }
+    }
 }
 
 fn wait_for(addr: &str) {
@@ -173,8 +184,18 @@ fn rental(stop_paying_after: Option<u64>, miner_secs: u64, wallet: bool) -> Run 
     let miners_done_ms = xbt_hashlink::now_ms();
     let buyer = b.join().unwrap();
     let hasher = h.join().unwrap();
+    // the stand-in pool rewrites its report every 500 ms: wait past one rewrite, then for the file,
+    // which on a loaded machine may not be there yet
     thread::sleep(Duration::from_millis(700));
-    let pool = serde_json::from_slice(&std::fs::read(&pool_report).unwrap()).unwrap();
+    let pool = (0..200)
+        .find_map(|_| {
+            let got = std::fs::read(&pool_report).ok().and_then(|b| serde_json::from_slice(&b).ok());
+            if got.is_none() {
+                thread::sleep(Duration::from_millis(50));
+            }
+            got
+        })
+        .expect("the stand-in pool wrote its report within 10 s");
     let wallet_calls = calls.lock().unwrap().clone();
     Run { hasher, buyer, pool, miners_done_ms, wallet_calls }
 }
