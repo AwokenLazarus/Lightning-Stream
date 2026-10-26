@@ -454,8 +454,33 @@ pub fn fetch(seller_url: &str, mut get: impl FnMut(&str) -> Result<Page, String>
         return Err(format!("the listing answered {}", listed.status));
     }
     let doc: Value = serde_json::from_str(&listed.body).map_err(|_| "the listing is not JSON".to_string())?;
-    let terms = get(seller_url)?;
-    let key = terms_key(&terms)?;
+    // the terms of the URL given, else of a path the listing sells under: a seller whose `/` is
+    // no route answers 404 there. Every one of them is on the seller's own origin
+    let mut tries = vec![seller_url.to_string()];
+    for s in doc.get("services").and_then(Value::as_array).into_iter().flatten().take(MAX_SERVICES) {
+        if let Some(p) = s.get("path").and_then(Value::as_str).filter(|p| route_path(p)) {
+            let u = format!("{origin}{p}");
+            if !tries.contains(&u) {
+                tries.push(u);
+            }
+        }
+    }
+    let mut why = String::new();
+    let mut key = None;
+    for u in tries.iter().take(4) {
+        match get(u).and_then(|page| terms_key(&page)) {
+            Ok(k) => {
+                key = Some(k);
+                break;
+            }
+            Err(e) => {
+                if why.is_empty() {
+                    why = e;
+                }
+            }
+        }
+    }
+    let key = key.ok_or(why)?;
     let listing = verify(&doc, &key)?;
     if canonical_origin(&listing.seller) != origin {
         return Err("the listing names another seller".into());
@@ -554,6 +579,26 @@ mod tests {
             f(&mut v);
             assert!(parse_draft(&v).is_err(), "{why}");
         }
+    }
+
+    #[test]
+    fn fetch_finds_the_terms_under_a_path_the_listing_sells() {
+        let (sk, pk) = key();
+        let origin = "https://seller.example";
+        let d = parse_draft(&json!({"name": "n", "updated": "u", "services": [{"name": "a", "kind": "api", "path": "/ai/", "prices": {"request_msat": 1}, "items": []}]})).unwrap();
+        let body = serde_json::to_string(&sign(&sk, &document(&d, origin, &pk))).unwrap();
+        let terms = serde_json::to_string(&json!({"accepts": [{"extra": {"receiptKey": pk}}]})).unwrap();
+        let got = fetch(origin, |url| {
+            Ok(if url.ends_with(PATH) {
+                Page { status: 200, headers: vec![], body: body.clone() }
+            } else if url == "https://seller.example/ai/" {
+                Page { status: 402, headers: vec![], body: terms.clone() }
+            } else {
+                Page { status: 404, headers: vec![], body: String::new() }
+            })
+        })
+        .unwrap();
+        assert_eq!(got.services[0].path, "/ai/");
     }
 
     #[test]

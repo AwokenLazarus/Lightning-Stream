@@ -136,7 +136,7 @@ fn fingerprint(der: &[u8]) -> String {
 /// The card that pins the node's certificate, for a platform that cannot hand it over alone: the
 /// certificate the node shows now, its fingerprint for the owner to compare with the node's own
 /// page, and one button. Empty where the platform gives the certificate itself.
-fn pin_card(csrf: &str, pin: bool, rest: Option<&str>, path: Option<&Path>, action: &str) -> String {
+pub(crate) fn pin_card(csrf: &str, pin: bool, rest: Option<&str>, path: Option<&Path>, action: &str) -> String {
     let (true, Some(rest), Some(path)) = (pin, rest, path) else { return String::new() };
     let had = path.is_file();
     let mut b = format!("<section class=\"card\"><h2>{}</h2>", if had { "Pin the node's certificate again" } else { "Pin the node's certificate" });
@@ -157,7 +157,7 @@ fn pin_card(csrf: &str, pin: bool, rest: Option<&str>, path: Option<&Path>, acti
 }
 
 /// Pin the certificate the node shows now, if it is the one the owner was shown (`fp`).
-fn pin_cert(pin: bool, rest: Option<&str>, path: Option<&Path>, fp: &str) -> Result<String, String> {
+pub(crate) fn pin_cert(pin: bool, rest: Option<&str>, path: Option<&Path>, fp: &str) -> Result<String, String> {
     let (true, Some(rest), Some(path)) = (pin, rest, path) else { return Err("this platform gives the node's certificate itself".into()) };
     let der = xbt_gateway::node::peer_certificate(rest, PIN_WAIT)?;
     if fingerprint(&der) != fp {
