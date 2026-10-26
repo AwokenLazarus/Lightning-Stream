@@ -2643,6 +2643,7 @@ dependencies = [
  "tempfile",
  "ureq",
  "xbt-gateway",
+ "xbt-nostr",
  "xbt-nwc",
  "xbt-primitives",
  "xbt-signer",

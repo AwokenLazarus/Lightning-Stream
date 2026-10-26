@@ -26,6 +26,9 @@ xbt-gateway = { path = "../xbt-gateway" }
 base64.workspace = true
 # the player's video, relayed from the connector on loopback (the tree's own HTTP client, already used by the gateway)
 ureq.workspace = true
+# Browse's Nostr page: the relay query, the listing checks, and the seller's own listing (fetch)
+xbt-nostr.workspace = true
+xbt402.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

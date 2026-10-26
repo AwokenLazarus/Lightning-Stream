@@ -1201,3 +1201,115 @@ fn walk(d: &std::path::Path) -> Vec<std::path::PathBuf> {
     }
     out
 }
+
+/// A seller on loopback: its signed listing at the well-known path, and a 402 naming a receipt
+/// key on anything else.
+struct Seller {
+    listing: String,
+    terms: String,
+}
+
+impl xbt_svc::http::Handler for Seller {
+    fn body_limit(&self, _: &str, _: &str) -> usize {
+        0
+    }
+    fn handle(&self, req: xbt_svc::http::Request) -> xbt_svc::http::Response {
+        if req.path() == xbt402::listing::PATH {
+            xbt_svc::http::Response::text(200, "application/json", self.listing.clone())
+        } else {
+            xbt_svc::http::Response::text(402, "application/json", self.terms.clone())
+        }
+    }
+}
+
+type Sk = xbt_primitives::secp256k1::SecretKey;
+
+fn receipt_key(seed: &[u8]) -> (Sk, String) {
+    let sk = xbt_primitives::ecdsa::secret_key(&xbt_primitives::hash::sha256(seed)).unwrap();
+    (sk, hex::encode(xbt_primitives::ecdsa::pubkey(&sk)))
+}
+
+/// A seller whose listing `name` is signed by `sk`, and whose terms name `terms_key`: its origin
+/// and its signed listing.
+fn seller_on(sk: &Sk, pk: &str, name: &str, terms_key: &str) -> (String, Value) {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin = format!("http://{}", l.local_addr().unwrap());
+    let d = xbt402::listing::parse_draft(&json!({
+        "name": name, "kind": "video", "prices": {"byte_msat": 20000, "per_bytes": 1048576},
+        "items": [{"title": "Sintel", "url": format!("{origin}/v/sintel"), "year": 2010, "credit": "(c) Blender Foundation, CC BY 3.0"}],
+        "licence": "CC BY 3.0", "credits": "Blender Foundation", "updated": "2026-10-26",
+    }))
+    .unwrap();
+    let doc = xbt402::listing::sign(sk, &xbt402::listing::document(&d, &origin, pk));
+    let terms = json!({"accepts": [{"extra": {"receiptKey": terms_key}}]});
+    let h = Seller { listing: doc.to_string(), terms: terms.to_string() };
+    std::mem::forget(xbt_svc::http::serve(Arc::new(h), l, 2).unwrap());
+    (origin, doc)
+}
+
+#[test]
+fn browse_nostr_lists_checked_listings_unvetted_and_the_seller_confirms_its_own() {
+    use xbt_nostr::{event::Event, event::Keys, market, oneshot, standin::StandinRelay};
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let relay = StandinRelay::start().unwrap();
+    let relays = vec![relay.url.clone()];
+    let publish = |keys: &Keys, sk: &Sk, doc: &Value, seller: &str| {
+        let bind = xbt402::listing::bind(sk, &keys.public.serialize(), seller);
+        let ev = market::listing_event(keys, doc, &bind, xbt_nostr::now()).unwrap();
+        assert_eq!(oneshot::publish(&relays, &ev, Duration::from_secs(5))[0].result, Ok(()));
+        ev
+    };
+    // a genuine seller, whose own terms name the key that signed its listing
+    let (sk, pk) = receipt_key(b"films seller");
+    let (origin, doc) = seller_on(&sk, &pk, "Open films", &pk);
+    publish(&Keys::generate(), &sk, &doc, &origin);
+    // a listing well signed by a key the seller's own address does not name
+    let (isk, ipk) = receipt_key(b"impostor");
+    let (other, idoc) = seller_on(&isk, &ipk, "Impostor films", &receipt_key(b"real owner").1);
+    let impostor = publish(&Keys::generate(), &isk, &idoc, &other);
+    // a forged event: the listing changed after it was signed, under a third Nostr key
+    let mut forged = idoc.clone();
+    forged["name"] = json!("Forged films");
+    let tags = impostor.tags.iter().map(|t| if t[0] == market::LISTING_TAG { vec![t[0].clone(), forged.to_string()] } else { t.clone() }).collect();
+    oneshot::publish(&relays, &Event::sign(&Keys::generate(), impostor.created_at, impostor.kind, tags, impostor.content.clone()), Duration::from_secs(5));
+
+    let bx = start(json!({}), false, |c| c.nostr_relays = relays.clone());
+    let mut br = logged_in(&bx);
+    assert_eq!(B::new(&bx.base).get("/nostr").location(), "./login");
+    assert!(br.get("/browse").body.contains("href=\"./nostr\""));
+    let page = br.get("/nostr");
+    assert_eq!(page.status, 200);
+    assert!(page.body.contains("Unvetted") && page.body.contains(">unvetted<"));
+    assert!(page.body.contains("Open films") && page.body.contains("Impostor films") && !page.body.contains("Forged films"));
+    assert!(page.body.contains("failed a signature check"));
+    assert!(page.body.contains("20 sat a MiB"));
+    assert!(!br.get("/browse").body.contains("Open films"), "Browse lists the services file only");
+    // a film found on Nostr plays as one of the services file does
+    let film = format!("{origin}/v/sintel");
+    assert!(page.body.contains(&format!("href=\"./play?item={}\"", enc(&film))));
+    assert!(br.get(&format!("/play?item={}", enc(&film))).body.contains(&format!("src=\"./s/{film}\"")));
+
+    let event_of = |name: &str| {
+        let rest = &page.body[page.body.find(name).unwrap()..];
+        let v = rest.find("name=\"event\" value=\"").unwrap() + "name=\"event\" value=\"".len();
+        rest[v..v + 64].to_string()
+    };
+    let r = br.act("/nostr", "/nostr-check", &[("event", &event_of("Open films"))]);
+    assert!(br.flash_after(&r).contains("same receipt key"));
+    let r = br.act("/nostr", "/nostr-check", &[("event", &event_of("Impostor films"))]);
+    assert!(br.flash_after(&r).contains("the seller's terms name"));
+    let r = br.act("/nostr", "/nostr-check", &[("event", "00")]);
+    assert!(br.flash_after(&r).contains("no longer"));
+}
+
+#[test]
+fn without_relays_the_nostr_page_asks_none_and_relays_are_checked() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let bx = start(json!({}), false, |_| {});
+    let mut br = logged_in(&bx);
+    assert!(!br.get("/browse").body.contains("href=\"./nostr\""));
+    assert!(br.get("/nostr").body.contains("No Nostr relays are set"));
+    assert_eq!(xbt_wallet_ui::config::nostr_relays(Some("wss://a.example, wss://b.example")).unwrap().len(), 2);
+    assert!(xbt_wallet_ui::config::nostr_relays(Some("ws://relay.example")).is_err());
+    assert!(xbt_wallet_ui::config::nostr_relays(None).unwrap().is_empty());
+}

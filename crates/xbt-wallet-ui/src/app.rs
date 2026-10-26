@@ -21,6 +21,8 @@ use crate::{msg, now};
 mod stream_pages;
 #[path = "nwc_pages.rs"]
 mod nwc_pages;
+#[path = "nostr_pages.rs"]
+mod nostr_pages;
 
 pub const COOKIE: &str = "xbtui";
 /// How long a signed form stays valid.
@@ -32,6 +34,8 @@ pub struct App {
     pub signer: SignerLink,
     /// The links external players play one item through ([`crate::relay`]).
     pub relays: RelayLinks,
+    /// Sellers found on Nostr, when the owner set relays ([`crate::nostr`]).
+    pub nostr: crate::nostr::NostrCache,
 }
 
 /// What a human who signs on another device needs.
@@ -136,7 +140,8 @@ impl App {
         let auth = Auth::open(&cfg.data_dir, cfg.password.as_deref(), cfg.setup_open, cfg.session_idle, cfg.session_max)?;
         let signer = SignerLink::new(cfg.signer_sock.clone(), std::time::Duration::from_secs(90));
         let relays = RelayLinks::new(cfg.relay_ttl);
-        Ok(Arc::new(Self { cfg, auth, signer, relays }))
+        let nostr = crate::nostr::NostrCache::new(cfg.nostr_relays.clone());
+        Ok(Arc::new(Self { cfg, auth, signer, relays, nostr }))
     }
 
     fn call(&self, method: &str, params: Value) -> Result<Value, String> {
@@ -259,6 +264,7 @@ impl App {
         match req.path.as_str() {
             "/" => self.overview(&ctx),
             "/browse" => self.browse(&ctx, &req.query),
+            "/nostr" => self.nostr_page(&ctx, &req.query),
             "/play" => self.play(&ctx, &req),
             "/connections" => self.connections(&ctx),
             "/apps" => self.apps_page(&ctx),
@@ -405,6 +411,7 @@ impl App {
         match req.path.as_str() {
             "/play" => self.play_stop(ctx, f),
             "/play-link" => self.play_link(ctx, f),
+            "/nostr-check" => self.nostr_check(ctx, f),
             "/connections" => self.connections_stop(ctx, f),
             "/apps-create" => self.apps_create(ctx, f),
             "/apps-revoke" => self.apps_revoke(ctx, f),

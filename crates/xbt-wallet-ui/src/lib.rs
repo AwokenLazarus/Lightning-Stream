@@ -20,6 +20,7 @@ pub mod config;
 pub mod html;
 pub mod link;
 pub mod msg;
+pub mod nostr;
 pub mod relay;
 pub mod server;
 pub mod setup;
