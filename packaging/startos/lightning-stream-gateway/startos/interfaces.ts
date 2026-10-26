@@ -27,10 +27,12 @@ export const setInterfaces = sdk.setupInterfaces(async ({ effects }) => {
     ]),
   )
 
+  // The gateway speaks HTTP/1.1 only. With no ALPN named, the OS's TLS proxy offers h2 and a client that takes
+  // it gets its connection closed, so name http/1.1, as the SDK's default for 'http' does.
   const gw = await sdk.MultiHost.of(effects, 'gateway').bindPort(PORTS.gateway, {
     protocol: 'http',
     preferredExternalPort: PORTS.gateway,
-    addSsl: { alpn: null, auth: null, preferredExternalPort: 443, addXForwardedHeaders: true },
+    addSsl: { alpn: { specified: ['http/1.1'] }, auth: null, preferredExternalPort: 443, addXForwardedHeaders: true },
   })
   receipts.push(
     await gw.export([
