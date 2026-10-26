@@ -116,6 +116,14 @@ each; one renter taking three while the fourth stays on the fallback; a renter t
 losing only its own miner, which goes back to the fallback while the other rental goes on; and no
 gap between accepted shares longer than one job (2 s in the test) when a miner moves, either way.
 
+With a real miner (`scripts/p2p_hash_fallback_miner.sh`, no money: the lab's rail): a BLAKE2b
+ASIC on stock firmware, pointed once at the hasher, hashed for the fallback (a DATUM Gateway) for a
+minute, was rented by a buyer for two minutes (6 slices paid, 25 shares accepted, receipts and both
+meters equal) and went back to the fallback by itself when the rental ended. It does not ask for
+`mining.set_extranonce`, so it was moved by `client.reconnect`. Real firmware waits for the answer to
+its subscribe before it authorizes, so a miner is placed as soon as it connects and named when it
+authorizes; the stand-in miner now does the same.
+
 The app (Umbrel) has a page for each side: Sell → Hashrate (the fallback, the price, how many
 miners to rent out, each miner and each rental, a Stop button) and Services → Hashrate (the offers,
 a budget and a duration, each rental with a Cut button, the buyer's DATUM Gateway). Rentals also
