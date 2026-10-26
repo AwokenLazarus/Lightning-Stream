@@ -1438,6 +1438,16 @@ def offers() -> None:
     measured("offers_terms", {"entries": {k: bool(v) for k, v in by.items()}, "num_paths": paths})
     check("offers: the gateway's 402 names one BOLT 12 offer, on its prepaid entry, and the offer carries blinded paths (lf4's own decode)",
           len(named) == 1 and by.get("ticket/on-arrival") == lno and paths >= 1, {"entries": {k: bool(v) for k, v in by.items()}, "num_paths": paths})
+    # lf4 issues invoices for its offer only once its blinded paths can be used: until then it refuses
+    # invoice requests ("cannot issue an invoice right now"), and a ticket bought in that window falls
+    # back to a BOLT 11 invoice whose route hint may not route yet either. So wait until the buyer's
+    # node is given an invoice for the offer (not paid), then a few seconds more, so the probes do not
+    # take the issuer's rate limit from the pages below
+    if lno:
+        lab.wait(f"{OFFER_NODE} issuing invoices for its offer", 180,
+                 lambda: lab.post(BUYER, "/v2/offers/fetchinvoice", {"offer": lno, "amount_msat": "1000000", "timeout_seconds": 10}).get("invoice"),
+                 every=3)
+        time.sleep(5)
     offers_policy(on=True)
     before = settled_on(OFFER_NODE)
     pages = [pay(f"{OFFERS}/small.txt", max_sats=200) for _ in range(3)]

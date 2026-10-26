@@ -556,6 +556,38 @@ impl LndRest {
     }
 }
 
+/// Have the node at `rest` bake a macaroon with exactly `ops`, under its own root key `root_key_id`
+/// (revocable alone: `lncli revokemacaroonkey`), asked with `admin`, a macaroon that may generate
+/// macaroons. What comes back is checked to hold `ops` and nothing more before it is returned.
+/// `admin` is used for this one call and kept nowhere.
+pub fn bake_macaroon(
+    rest: &str,
+    tls_cert: Option<&Path>,
+    admin: &[u8],
+    ops: &[&str],
+    root_key_id: u64,
+) -> Result<Vec<u8>, String> {
+    let node = LndRest::build(rest, admin, admin, tls_cert)?;
+    let permissions: Vec<Value> = ops
+        .iter()
+        .map(|op| {
+            let (entity, action) = op.split_once(':').unwrap_or((op, ""));
+            serde_json::json!({"entity": entity, "action": action})
+        })
+        .collect();
+    let body = serde_json::json!({"permissions": permissions, "root_key_id": root_key_id.to_string()});
+    let v = node
+        .unary(&node.invoice_macaroon, "POST", "/v1/macaroon", Some(&body))
+        .map_err(|e| format!("the node did not bake the macaroon: {e}"))?;
+    let hex_mac = v
+        .get("macaroon")
+        .and_then(Value::as_str)
+        .ok_or("the node's answer has no macaroon")?;
+    let bytes = hex::decode(hex_mac).map_err(|_| "the node's macaroon is not hex".to_string())?;
+    check_macaroon(&bytes, "the baked macaroon", ops, true)?;
+    Ok(bytes)
+}
+
 fn read_capped(r: impl Read, cap: u64) -> Result<String, String> {
     let mut s = String::new();
     r.take(cap)
@@ -1147,6 +1179,57 @@ mod tests {
         let seen = rest.0.lock().unwrap().clone();
         assert_eq!(seen.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(), ["/v2/invoices/hodl", "/v1/invoices"]);
         assert!(seen.iter().all(|(_, b)| b["private"] == true), "{seen:?}");
+    }
+
+    /// A narrow macaroon is baked with exactly its permissions and its own root key id, asked with
+    /// the admin macaroon; an answer granting more is refused.
+    #[test]
+    fn a_macaroon_is_baked_with_exactly_its_permissions_and_a_wider_answer_refused() {
+        struct Rest(std::sync::Mutex<Vec<(String, String, Value)>>, bool);
+        impl xbt_svc::http::Handler for Rest {
+            fn body_limit(&self, _m: &str, _t: &str) -> usize {
+                4096
+            }
+            fn handle(&self, req: xbt_svc::http::Request) -> xbt_svc::http::Response {
+                let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+                let mac = req.header("Grpc-Metadata-macaroon").unwrap_or("").to_string();
+                self.0.lock().unwrap().push((req.target.clone(), mac, body.clone()));
+                let mut ops: Vec<(String, Vec<String>)> = vec![];
+                for p in body["permissions"].as_array().cloned().unwrap_or_default() {
+                    let e = p["entity"].as_str().unwrap_or("").to_string();
+                    let a = p["action"].as_str().unwrap_or("").to_string();
+                    match ops.iter_mut().find(|(x, _)| *x == e) {
+                        Some((_, acts)) => acts.push(a),
+                        None => ops.push((e, vec![a])),
+                    }
+                }
+                if self.1 {
+                    ops.push(("offchain".into(), vec!["write".into()]));
+                }
+                let refs: Vec<(&str, Vec<&str>)> = ops.iter().map(|(e, a)| (e.as_str(), a.iter().map(String::as_str).collect())).collect();
+                let refs2: Vec<(&str, &[&str])> = refs.iter().map(|(e, a)| (*e, a.as_slice())).collect();
+                let m = lnd_macaroon(&refs2, &[]);
+                xbt_svc::http::Response::text(200, "application/json", json!({"macaroon": hex::encode(m)}).to_string())
+            }
+        }
+        for wider in [false, true] {
+            let rest = Arc::new(Rest(std::sync::Mutex::new(vec![]), wider));
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let run = xbt_svc::http::serve(rest.clone(), l, 1).unwrap();
+            let got = bake_macaroon(&format!("http://{}", run.addr), None, b"admin", &INVOICE_OPS, 4_611_686_018_427_387_905);
+            run.stopper().stop();
+            let seen = rest.0.lock().unwrap().clone();
+            assert_eq!(seen.len(), 1);
+            let (target, mac, body) = &seen[0];
+            assert_eq!((target.as_str(), mac.as_str()), ("/v1/macaroon", hex::encode(b"admin").as_str()));
+            assert_eq!(body["root_key_id"], "4611686018427387905");
+            assert_eq!(body["permissions"], json!([{"entity": "invoices", "action": "read"}, {"entity": "invoices", "action": "write"}]));
+            if wider {
+                assert!(got.unwrap_err().contains("refused on mainnet"));
+            } else {
+                assert_eq!(checked_macaroon(&got.unwrap(), "m", &INVOICE_OPS, true), Ok(None));
+            }
+        }
     }
 
     /// The offer calls go to `offersrpc` over REST with the invoice macaroon: the offer is made

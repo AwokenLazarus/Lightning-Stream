@@ -33,6 +33,9 @@
 //! | `XBT_UI_NOSTR_RELAYS` | | Nostr relays to read sellers' signed listings from (`wss://`, comma-separated), for Browse's Nostr page. Unset: no relay is ever asked |
 //! | `XBT_UI_NWC_SOCK` | | the NWC wallet service's admin socket (`xbt-nwc`'s `NWC_ADMIN_SOCK`): the Connected apps page makes, lists and revokes NWC connections there |
 //! | `XBT_UI_CONNECTOR` | `http://127.0.0.1:8480` | the connector the player loads video from (`<connector>/s/<item URL>`). That is also the connector's default listen address, and the UI's own default bind: on one machine set one of the two ports. |
+//! | `XBT_UI_PLATFORM_LOGIN` | | the host name of the platform's own login proxy (Umbrel: `<app id>_app_proxy_1`). A request from that peer is the owner's, already logged in by the platform: no app password is asked. Every other peer still needs the password |
+//! | `XBT_UI_ENROLL_CODE_FILE` | | the signer's one-time enrolment code, where the signer writes a copy for the UI (`B2_ENROLL_CODE_COPY`): the setup page fills it in, so the owner reads no log |
+//! | `XBT_UI_LOCAL_SERVICES` | | services on this box the Sell page offers, `Name=http://host:port`, comma-separated, beside the ones it finds by their usual names |
 //! | `XBT_UI_HASHER` | | the hasher service's control page (`http://…`): turns on Sell → Hashrate, renting out this box's miners |
 //! | `XBT_UI_HASHER_SETTINGS` | `$XBT_DATA_DIR/run/hashrate/settings.json` | the settings file the Hashrate page writes and the hasher service reads |
 //! | `XBT_UI_HASHER_SLICES` | | where the shop passes paid slices of work to the hasher service (`http://…`): the shop then sells them under `/hashrate/` |
@@ -81,6 +84,12 @@ pub struct Config {
     pub nostr_relays: Vec<String>,
     /// `XBT_UI_SUGGESTED_SELLERS`: sellers offered to add in one click.
     pub suggested_sellers: Vec<String>,
+    /// `XBT_UI_PLATFORM_LOGIN`: the platform's login proxy, whose requests need no app password.
+    pub platform_login: Option<String>,
+    /// `XBT_UI_ENROLL_CODE_FILE`: the signer's enrolment code, for the setup page.
+    pub enroll_code_file: Option<PathBuf>,
+    /// `XBT_UI_LOCAL_SERVICES`: services on this box to offer on the Sell page, (name, address).
+    pub local_services: Vec<(String, String)>,
     /// Hashrate: the hasher's and the renter's services, when this box runs them.
     pub hash: HashSetup,
 }
@@ -241,6 +250,13 @@ impl Config {
             nostr_relays: nostr_relays(env("XBT_UI_NOSTR_RELAYS").as_deref())?,
             suggested_sellers: env("XBT_UI_SUGGESTED_SELLERS").map(|v| v.split(',').map(|s| s.trim().trim_end_matches('/').to_string())
                 .filter(|s| crate::services::http_origin(s).is_some()).take(10).collect()).unwrap_or_default(),
+            platform_login: env("XBT_UI_PLATFORM_LOGIN").filter(|h| h.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))),
+            enroll_code_file: env("XBT_UI_ENROLL_CODE_FILE").map(PathBuf::from),
+            local_services: env("XBT_UI_LOCAL_SERVICES").map(|v| v.split(',').filter_map(|e| {
+                let (n, u) = e.split_once('=')?;
+                let (n, u) = (n.trim(), u.trim().trim_end_matches('/'));
+                (!n.is_empty() && u.starts_with("http://")).then(|| (n.to_string(), u.to_string()))
+            }).take(20).collect()).unwrap_or_default(),
             hash: HashSetup {
                 hasher: env("XBT_UI_HASHER").filter(|u| u.starts_with("http://")),
                 settings: hash_settings,
@@ -265,7 +281,8 @@ impl Config {
                cmp_status_url: None, mcp_urls: vec![], mcp_token_file: PathBuf::from("/nonexistent/mcp-http-token"), threads: 4, role: Role::Wallet,
                ln: LnSetup::default(), gw: GatewaySetup { state_dir: "/data/gateway".into(), port: 8402, ..Default::default() },
                services_file: None, sell: false, connector: "http://127.0.0.1:8480".into(), relay_ttl: Duration::from_secs(6 * 3600),
-               nwc_sock: None, nostr_relays: vec![], suggested_sellers: vec![],
+               nwc_sock: None, nostr_relays: vec![], suggested_sellers: vec![], platform_login: None, enroll_code_file: None,
+               local_services: vec![],
                hash: HashSetup { settings: PathBuf::from("/nonexistent/hashrate/settings.json"), datum_guide: DATUM_GUIDE.into(), ..Default::default() } }
     }
 }

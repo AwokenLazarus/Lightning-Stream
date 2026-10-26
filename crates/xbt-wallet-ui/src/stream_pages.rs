@@ -25,7 +25,7 @@ impl App {
         let cat = q.get("cat").or(q.get("kind")).map(String::as_str).unwrap_or("");
         let sort = Sort::parse(q.get("sort").map(String::as_str).unwrap_or(""));
         let body = match self.file_services() {
-            Ok(all) => browse_html(&all, cat, sort, &self.suggested(ctx, &all)),
+            Ok(all) => browse_html(&all, cat, sort, &self.suggested(ctx, &all), &|seller| self.is_own_shop(seller)),
             Err(e) => format!("{}{}", Self::error_box(&e), empty_how(&self.suggested(ctx, &[]))),
         };
         let more = if self.nostr.enabled() {
@@ -54,7 +54,7 @@ impl App {
         let found = self.services().ok().and_then(|all| all.into_iter().find(|s| services::same_origin(&s.seller, seller) && s.name == name));
         match found {
             Some(svc) => {
-                let body = service_html(&svc);
+                let body = service_html(&svc, self.is_own_shop(&svc.seller));
                 self.html_page("Service", &svc.name, ctx, &body, "")
             }
             None => self.html_page("Service", "Service", ctx, &format!("{}<p><a href=\"./browse\">Back to Browse</a></p>",
@@ -69,9 +69,22 @@ impl App {
             Ok(all) => match services::find_item(&all, item_url) {
                 Some((service, item)) => {
                     title = item.title.clone();
-                    let links = self.relays.of_item(&item.url);
-                    format!("{}{}", player_html(ctx, &self.cfg.connector, service, item),
-                            if service.kind == Kind::Video { links_html(ctx, &self.link_base(req), &item.url, &links) } else { String::new() })
+                    if self.is_own_shop(&service.seller) {
+                        own_player_html(service, item)
+                    } else if let Some((words, link, href)) = self.play_blocker() {
+                        format!("<p class=\"small\"><a href=\"{}\">← {}</a></p><section class=\"status bad\"><p class=\"status-head\">{}</p>\
+                                 <p><a class=\"button-link primary\" href=\"{}\">{}</a></p></section>",
+                                service_href(service), esc(&service.name), esc(&words), esc(&href), esc(&link))
+                    } else {
+                        let links = self.relays.of_item(&item.url);
+                        let warn = self.play_warning().map(|w| {
+                            let (href, link) = if w.contains("spending rules") { ("./policy?template=starter", "Open the starter rules") } else { ("./lightning", "Check your node") };
+                            format!("<div class=\"flash warn\">{} <a href=\"{href}\">{link}</a></div>", esc(&w))
+                        })
+                            .unwrap_or_default();
+                        format!("{warn}{}{}", player_html(ctx, &self.cfg.connector, service, item),
+                                if service.kind == Kind::Video { links_html(ctx, &self.link_base(req), &item.url, &links) } else { String::new() })
+                    }
                 }
                 None if item_url.is_empty() => "<p>Choose something to play from a media service on <a href=\"./browse?cat=media\">Browse</a>.</p>".into(),
                 None => format!("{}<p><a href=\"./browse\">Back to Browse</a></p>", Self::error_box("That item is not in your list of services.")),
@@ -241,7 +254,7 @@ fn empty_how(suggested: &str) -> String {
      <p><a class=\"button-link primary\" href=\"./services\">Add a seller</a></p>{suggested}</section>")
 }
 
-fn browse_html(all: &[Service], cat: &str, sort: Sort, suggested: &str) -> String {
+fn browse_html(all: &[Service], cat: &str, sort: Sort, suggested: &str, own: &dyn Fn(&str) -> bool) -> String {
     let cat = cat.trim().to_ascii_lowercase();
     // a kind (`video`, from an older link) names its category
     let cat = match cat.as_str() {
@@ -280,9 +293,12 @@ fn browse_html(all: &[Service], cat: &str, sort: Sort, suggested: &str) -> Strin
             Kind::Files if !s.items.is_empty() => format!("{} file{}", s.items.len(), if s.items.len() == 1 { "" } else { "s" }),
             Kind::Files => "Files".into(),
         };
-        b.push_str(&format!("<a class=\"card service-card\" href=\"{}\"><span class=\"pill cat-{}\">{}</span><h2>{}</h2>\
+        let mine = own(&s.seller);
+        b.push_str(&format!("<a class=\"card service-card\" href=\"{}\"><span class=\"pill cat-{}\">{}</span>{}<h2>{}</h2>\
                              <p class=\"price\">{}</p><p class=\"small\">{} · {}</p></a>",
-                            service_href(s), s.kind.category(), esc(s.kind.category_words()), esc(&s.name), esc(&s.price_text), esc(&what), esc(&host(&s.seller))));
+                            service_href(s), s.kind.category(), esc(s.kind.category_words()),
+                            if mine { " <span class=\"pill good\">Your shop</span>" } else { "" },
+                            esc(&s.name), esc(&s.price_text), esc(&what), esc(&host(&s.seller))));
     }
     b.push_str("</div>");
     b
@@ -296,12 +312,18 @@ fn service_href(s: &Service) -> String {
     format!("./service?seller={}&amp;name={}", services::urlenc(&s.seller), services::urlenc(&s.name))
 }
 
-/// A service's own page: its price and seller, then what its category needs.
-fn service_html(s: &Service) -> String {
+/// A service's own page: its price and seller, then what its category needs. `own`: the seller is
+/// this box's own shop, which this box cannot buy from: its items play as a free preview instead.
+fn service_html(s: &Service, own: bool) -> String {
     let mut b = format!("<p class=\"small\"><a href=\"./browse?cat={}\">← {}</a></p>\
         <section class=\"card\"><div class=\"offer-head\"><span class=\"pill cat-{}\">{}</span><span class=\"price\">{}</span></div>\
         <p class=\"small\">Sold by {}</p></section>",
         s.kind.category(), esc(s.kind.category_words()), s.kind.category(), esc(s.kind.category_words()), esc(&s.price_text), esc(&host(&s.seller)));
+    if own {
+        b.push_str("<section class=\"status ok\"><p class=\"status-head\">This is your shop</p><p>Buyers pay for this. You can preview it \
+            here for free: it plays straight from your service on this box, and nothing is paid.</p></section>");
+    }
+    let play = if own { "Preview (free)" } else { "Play" };
     match s.kind {
         Kind::Video => {
             if s.items.is_empty() {
@@ -310,7 +332,7 @@ fn service_html(s: &Service) -> String {
                 b.push_str("<div class=\"grid\">");
                 for item in &s.items {
                     b.push_str(&format!("<article class=\"card item\"><h3>{} <span class=\"small\">{}</span></h3><p class=\"small\">{}</p>\
-                                         <p><a class=\"button-link\" href=\"./play?item={}\">Play</a></p></article>",
+                                         <p><a class=\"button-link\" href=\"./play?item={}\">{play}</a></p></article>",
                                         esc(&item.title), esc(&item.year), esc(&item.credit), services::urlenc(&item.url)));
                 }
                 b.push_str("</div>");
@@ -348,14 +370,27 @@ fn player_html(ctx: &Ctx, connector: &str, service: &Service, item: &services::I
         Err(e) => return format!("{}<p><a href=\"./browse\">Back to Browse</a></p>", App::error_box(&e)),
     };
     format!("<p class=\"small\"><a href=\"{}\">← {}</a> · {} · <span class=\"price\">{}</span></p>\
-             <video controls autoplay src=\"{}\"></video>\
+             <div class=\"player\" data-player data-item=\"{}\"><video controls autoplay src=\"{}\"></video>\
+             <p class=\"player-msg\" role=\"status\" aria-live=\"polite\" hidden></p></div>\
              <p class=\"small\">{}</p>\
              <form method=\"post\" action=\"./play\" data-stop-player>\
              {}<input type=\"hidden\" name=\"item\" value=\"{}\">\
              <button class=\"danger\" type=\"submit\">Stop and cut the connection</button></form>\
              <p class=\"hint\">You pay as it plays. Stopping ends the payments at once; <a href=\"./connections\">Live connections</a> shows what is open.</p>",
-            service_href(service), esc(&service.name), esc(&item.year), esc(&service.price_text), esc(&src), esc(&item.credit),
+            service_href(service), esc(&service.name), esc(&item.year), esc(&service.price_text), esc(&item.url), esc(&src), esc(&item.credit),
             App::csrf_input(ctx), esc(&item.url))
+}
+
+/// The owner's own shop: a free preview, straight from the service on this box (`/preview`), never
+/// through the gateway and never paid. Only the owner, logged in, gets this page.
+fn own_player_html(service: &Service, item: &services::Item) -> String {
+    format!("<p class=\"small\"><a href=\"{}\">← {}</a> · {}</p>\
+             <section class=\"status ok\"><p class=\"status-head\">Preview of your shop (free)</p><p>This plays straight from your service on \
+             this box. Nothing is paid: a box cannot buy from its own shop. Buyers pay {}.</p></section>\
+             <div class=\"player\" data-player data-item=\"{}\" data-preview><video controls autoplay src=\"./preview?item={}\"></video>\
+             <p class=\"player-msg\" role=\"status\" aria-live=\"polite\" hidden></p></div>\
+             <p class=\"small\">{}</p>",
+            service_href(service), esc(&service.name), esc(&item.year), esc(&service.price_text), esc(&item.url), services::urlenc(&item.url), esc(&item.credit))
 }
 
 /// `6 hours`, `90 minutes`, `45 seconds`.

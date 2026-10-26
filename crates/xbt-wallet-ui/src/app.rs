@@ -25,7 +25,7 @@ mod nwc_pages;
 #[path = "sell.rs"]
 pub(crate) mod sell;
 #[path = "services_page.rs"]
-mod services_page;
+pub mod services_page;
 #[path = "nostr_pages.rs"]
 mod nostr_pages;
 #[path = "hashrate.rs"]
@@ -43,6 +43,10 @@ pub struct App {
     pub relays: RelayLinks,
     /// Sellers found on Nostr, when the owner set relays ([`crate::nostr`]).
     pub nostr: crate::nostr::NostrCache,
+    /// The platform's login proxy, when it does the login ([`crate::auth::PlatformLogin`]).
+    pub platform: Option<crate::auth::PlatformLogin>,
+    /// Why the last play of an item failed, by item URL, for the player page to say (a few minutes).
+    pub play_errors: std::sync::Mutex<HashMap<String, (std::time::Instant, u16, Value)>>,
 }
 
 /// What a human who signs on another device needs.
@@ -155,7 +159,8 @@ impl App {
         let signer = SignerLink::new(cfg.signer_sock.clone(), std::time::Duration::from_secs(90));
         let relays = RelayLinks::new(cfg.relay_ttl);
         let nostr = crate::nostr::NostrCache::new(cfg.nostr_relays.clone());
-        Ok(Arc::new(Self { cfg, auth, signer, relays, nostr }))
+        let platform = cfg.platform_login.as_deref().map(crate::auth::PlatformLogin::new);
+        Ok(Arc::new(Self { cfg, auth, signer, relays, nostr, platform, play_errors: std::sync::Mutex::new(HashMap::new()) }))
     }
 
     fn call(&self, method: &str, params: Value) -> Result<Value, String> {
@@ -165,6 +170,11 @@ impl App {
     pub(crate) fn cookie(&self, req: &Req, sid: &str, max_age: i64) -> String {
         let secure = self.cfg.secure_cookie.unwrap_or_else(|| req.header("x-forwarded-proto").eq_ignore_ascii_case("https"));
         format!("{COOKIE}={sid}; Path={}; HttpOnly; SameSite=Strict; Max-Age={max_age}{}", self.cfg.base_path, if secure { "; Secure" } else { "" })
+    }
+
+    /// Whether the request came through the platform's login proxy (the owner, logged in by the box).
+    pub(crate) fn platform_owner(&self, req: &Req) -> bool {
+        self.platform.as_ref().is_some_and(|p| p.is_proxy(&req.peer))
     }
 
     fn peer_allowed(&self, peer: &str) -> bool {
@@ -188,7 +198,7 @@ impl App {
         if !host_allowed(req.header("host"), &self.cfg.allowed_hosts) {
             return Some(Err(Resp::text(421, "text/plain", "unknown Host: add it to XBT_UI_ALLOWED_HOSTS")));
         }
-        if !self.auth.has_password() {
+        if !self.auth.has_password() && !self.platform_owner(req) {
             return Some(Err(Resp::text(401, "text/plain", "login required")));
         }
         if let Some(token) = link {
@@ -204,6 +214,64 @@ impl App {
             return Some(Err(Resp::text(401, "text/plain", "login required")));
         }
         Some(Ok(None))
+    }
+
+    /// For `GET /preview?item=<URL>`: the owner's free preview of an item of their own shop, past
+    /// the same checks as every page (login included: there is no link for it). `Some(Ok(url))`:
+    /// stream `url`, the service on this box; `None` for any other request.
+    pub fn preview_gate(&self, req: &Req) -> Option<Result<String, Resp>> {
+        let path = strip_base(&req.path, &self.cfg.base_path)?;
+        if req.method != "GET" || path != "/preview" || self.cfg.role == Role::Gateway {
+            return None;
+        }
+        if !self.peer_allowed(&req.peer) {
+            return Some(Err(Resp::text(403, "text/plain", "forbidden")));
+        }
+        if !host_allowed(req.header("host"), &self.cfg.allowed_hosts) {
+            return Some(Err(Resp::text(421, "text/plain", "unknown Host: add it to XBT_UI_ALLOWED_HOSTS")));
+        }
+        let sid = req.cookie(COOKIE).unwrap_or_default();
+        if self.auth.with_session(&sid, |_| ()).is_none() {
+            return Some(Err(Resp::text(401, "text/plain", "login required")));
+        }
+        let item = req.query.get("item").map(String::as_str).unwrap_or("");
+        Some(self.preview_upstream(item).map_err(|e| Resp::json(404, &json!({"error": e}))))
+    }
+
+    /// What stops any payment before a play is tried, in plain words with the next step: no
+    /// approval key enrolled, so no spending rules can be signed and nothing can be paid.
+    pub fn play_blocker(&self) -> Option<(String, String, String)> {
+        let ks = self.call("keystore_status", json!({})).ok()?;
+        txt(ks.get("human_pubkey")).is_empty()
+            .then(|| ("Your wallet isn't set up yet, so it can't pay for this.".into(), "Finish setup".into(), "./setup".into()))
+    }
+
+    /// A Lightning node that is not ready to pay: said above the player (the play is still tried;
+    /// if it fails, the player says why).
+    pub fn play_warning(&self) -> Option<String> {
+        let ln = self.call("ln_status", json!({})).ok()?;
+        (ln["ready"] != true).then(|| {
+            let why = txt(ln.get("reason").or(ln.get("config_error")));
+            if why.is_empty() { "Your wallet may not be able to pay yet: your Lightning node isn't ready.".into() }
+            else { format!("Your wallet may not be able to pay yet. {}", crate::setup::plain_reason(&why)) }
+        })
+    }
+
+    /// Keep why a play of `item` failed, for [`Self::play_error`].
+    pub fn note_play_error(&self, item: &str, status: u16, body: &[u8]) {
+        let v: Value = serde_json::from_slice(body).unwrap_or_else(|_| json!({"error": String::from_utf8_lossy(&body[..body.len().min(300)]).to_string()}));
+        let mut g = self.play_errors.lock().unwrap_or_else(|p| p.into_inner());
+        g.retain(|_, (t, _, _)| t.elapsed() < std::time::Duration::from_secs(600));
+        if g.len() < 256 {
+            g.insert(item.to_string(), (std::time::Instant::now(), status, v));
+        }
+    }
+
+    /// Why the last play of `item` failed, in plain words, with the next step: (headline, link text, link).
+    pub fn play_error(&self, item: &str) -> Option<(String, String, String)> {
+        let g = self.play_errors.lock().unwrap_or_else(|p| p.into_inner());
+        let (t, status, v) = g.get(item)?;
+        (t.elapsed() < std::time::Duration::from_secs(600)).then(|| play_error_words(*status, v))
     }
 
     pub fn handle(&self, mut req: Req) -> Resp {
@@ -244,7 +312,22 @@ impl App {
         if post && !origin.is_empty() && !origin_allowed(origin, &self.cfg.allowed_hosts) {
             return Resp::text(403, "text/plain", "cross-origin request refused");
         }
-        if !self.auth.has_password() {
+        // the box's own login proxy: its user is the owner, logged in by the platform. A session is
+        // made at once and the same page asked again with its cookie; no app password is needed
+        if self.platform_owner(&req) {
+            let sid = req.cookie(COOKIE).unwrap_or_default();
+            if self.auth.with_session(&sid, |_| ()).is_none() {
+                let sid = self.auth.new_session();
+                let page = match req.path.as_str() {
+                    "/login" | "/setup-password" => "./".to_string(),
+                    p => format!(".{p}{}", query_string(&req.query)),
+                };
+                return Resp::redirect(&page).header("Set-Cookie", &self.cookie(&req, &sid, self.cfg.session_max.as_secs() as i64));
+            }
+            if matches!(req.path.as_str(), "/login" | "/setup-password") {
+                return Resp::redirect("./");
+            }
+        } else if !self.auth.has_password() {
             return self.setup_password(&req);
         }
         match req.path.as_str() {
@@ -290,7 +373,8 @@ impl App {
             "/connections" => self.connections(&ctx),
             "/apps" => self.apps_page(&ctx),
             "/approvals" => self.approvals(&ctx),
-            "/policy" => self.policy_page(&ctx, req.query.get("template").map(|t| t == "starter").unwrap_or(false)),
+            "/policy" => self.policy_page(&ctx, req.query.get("template").map(|t| t == "starter").unwrap_or(false),
+                                          req.query.get("allow").zip(req.query.get("node")).map(|(a, n)| (a.as_str(), n.as_str()))),
             "/channels" => self.channels(&ctx),
             "/signatures" => self.signatures(&ctx),
             "/keys" => self.keys(&ctx),
@@ -298,6 +382,13 @@ impl App {
             "/setup" => self.setup(&ctx),
             "/lightning" => self.lightning_page(&ctx),
             "/api/pending" => Resp::json(200, &json!({"pending": self.pending_count()})),
+            "/api/play-error" => {
+                let item = req.query.get("item").map(String::as_str).unwrap_or("");
+                match self.play_error(item) {
+                    Some((words, link, href)) => Resp::json(200, &json!({"failed": true, "words": words, "link": link, "href": href})),
+                    None => Resp::json(200, &json!({"failed": false})),
+                }
+            }
             _ => Resp::html(404, self.render("Not found", &ctx, "<p>No such page. <a href=\"./\">Home</a></p>")),
         }
     }
@@ -402,7 +493,7 @@ impl App {
             Err(e) => form(Some((false, e))),
             Ok(()) => {
                 let sid = self.auth.new_session();
-                self.auth.with_session(&sid, |s| s.flash = Some((true, "Password set. Next: connect your Lightning node.".into())));
+                self.auth.with_session(&sid, |s| s.flash = Some((true, "Password set. Next: your approval key and your spending rules.".into())));
                 Resp::redirect("./setup").header("Set-Cookie", &self.cookie(req, &sid, self.cfg.session_max.as_secs() as i64))
             }
         }
@@ -738,7 +829,7 @@ impl App {
         b
     }
 
-    fn policy_page(&self, ctx: &Ctx, template: bool) -> Resp {
+    fn policy_page(&self, ctx: &Ctx, template: bool, allow: Option<(&str, &str)>) -> Resp {
         let cur = match self.call("policy_get", json!({})) {
             Ok(v) => v,
             Err(e) => return self.page("Spending rules", ctx, Self::error_box(&e)),
@@ -762,6 +853,25 @@ impl App {
             }
             b.push_str("<div class=\"flash ok\">The safe starter rules are filled in below (your list of sellers is kept), with paying over \
                         Lightning turned on and low limits. Review them, then sign.</div>");
+        }
+        // a seller to allow, from the Sellers page: its address on the list, tied to its node
+        if let Some((origin, node)) = allow {
+            let origin = crate::services::http_origin(origin).unwrap_or_default();
+            let node = node.trim().to_ascii_lowercase();
+            if !origin.is_empty() && node.len() == 66 && node.bytes().all(|c| c.is_ascii_hexdigit()) {
+                let mut list: Vec<Value> = p["allowlist"].as_array().cloned().unwrap_or_default();
+                if !list.iter().any(|x| x.as_str().and_then(crate::services::http_origin).as_deref() == Some(origin.as_str())) {
+                    list.push(Value::from(origin.clone()));
+                }
+                p["allowlist"] = Value::from(list);
+                if !p["counterparties"].is_object() {
+                    p["counterparties"] = json!({});
+                }
+                p["counterparties"][origin.as_str()] = json!({"ln_node": node});
+                let cap = p.get("per_counterparty_cap_sats").or(cur["effective"].get("per_counterparty_cap_sats")).and_then(Value::as_i64).unwrap_or(0);
+                b.push_str(&format!("<div class=\"flash ok\"><p><strong>Allow {} to be paid.</strong> Sign below with your approval key. \
+                    The app may then pay this seller up to {} in any 7 days, within your other limits.</p></div>", esc(&origin), money(cap)));
+            }
         }
         let errs: Vec<String> = cur["errors"].as_array().map(|a| a.iter().map(|x| txt(Some(x))).collect()).unwrap_or_default();
         let warns: Vec<String> = cur["warnings"].as_array().map(|a| a.iter().map(|x| txt(Some(x))).collect()).unwrap_or_default();
@@ -951,12 +1061,19 @@ impl App {
     // --- keys ---------------------------------------------------------------------------------------
 
     fn keygen_block(&self, ctx: &Ctx, enroll: bool) -> String {
+        // the box hands the setup page the signer's one-time code (`XBT_UI_ENROLL_CODE_FILE`): nothing to read in a log
+        let given = self.cfg.enroll_code_file.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty() && c.len() <= 64 && c.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'));
         let enroll_form = if enroll {
-            format!("<form method=\"post\" action=\"./human-key-enroll\" id=\"enroll-form\" hidden>{}<input type=\"hidden\" name=\"pubkey\" value=\"\">\
-                     <label>Enrolment code<input name=\"code\" class=\"mono\" autocomplete=\"off\" required placeholder=\"XXXX-XXXX-XXXX\"></label>\
+            let code_field = match &given {
+                Some(c) => format!("<input type=\"hidden\" name=\"code\" value=\"{}\">", esc(c)),
+                None => "<label>Enrolment code<input name=\"code\" class=\"mono\" autocomplete=\"off\" required placeholder=\"XXXX-XXXX-XXXX\"></label>\
                      <p class=\"hint\">The signer prints a one-time code in its log while no key is enrolled (Umbrel: the app's log; StartOS: Logs; \
-                     a server: the signer's stderr or <code>.run/enroll-code</code>).</p>\
-                     <button>Enrol this public key with the signer</button></form>", Self::csrf_input(ctx))
+                     a server: the signer's stderr or <code>.run/enroll-code</code>).</p>".to_string(),
+            };
+            format!("<form method=\"post\" action=\"./human-key-enroll\" id=\"enroll-form\" hidden>{}<input type=\"hidden\" name=\"pubkey\" value=\"\">\
+                     {code_field}<button>{}</button></form>", Self::csrf_input(ctx),
+                    if given.is_some() { "Use this key for approvals" } else { "Enrol this public key with the signer" })
         } else {
             String::new()
         };
@@ -966,8 +1083,11 @@ impl App {
             <p><button type=\"button\" id=\"keygen-new\">Make a new key</button></p>\
             <details><summary>…or restore a key from its backup</summary><input id=\"keygen-import-hex\" class=\"mono\" placeholder=\"64 hex characters\" autocomplete=\"off\">\
             <button type=\"button\" id=\"keygen-import\">Use this key</button></details>\
-            <div id=\"keygen-step2\" hidden><p>Backup (keep it offline):</p><pre id=\"keygen-backup\" class=\"hex\"></pre>\
-            <label>Type its last 8 characters<input id=\"keygen-confirm\" autocomplete=\"off\"></label>\
+            <div id=\"keygen-step2\" hidden><p>Your key's backup. It is the only copy: keep it somewhere safe, off this computer \
+            (a USB stick in a drawer, or written on paper).</p><pre id=\"keygen-backup\" class=\"hex\"></pre>\
+            <p><button type=\"button\" id=\"keygen-download\" class=\"secondary\">Download the backup file</button></p>\
+            <label class=\"check\"><input type=\"checkbox\" id=\"keygen-saved\"> I saved the backup somewhere safe</label>\
+            <details><summary>…or confirm by typing its last 8 characters</summary><label>Last 8 characters<input id=\"keygen-confirm\" autocomplete=\"off\"></label></details>\
             <label>Passphrase for this browser (at least 12 characters, not only digits or a repeated pattern)\
             <input id=\"keygen-pin\" type=\"password\" autocomplete=\"new-password\" minlength=\"12\"></label>\
             <p id=\"keygen-strength\" class=\"hint\" aria-live=\"polite\">At least 12 characters, not only digits, not a repeated pattern.</p>\
@@ -1158,7 +1278,11 @@ impl App {
         let mut b = progress(if n == done.len() { 3 } else { 2 });
         b.push_str(&format!("<p class=\"lead\">{n} of {} done. The app is safe to leave running after each step: nothing is paid until your rules allow it.</p><ol class=\"steps\">",
                             done.len()));
-        b.push_str(&step(true, "Password", "<p>Set. You are logged out after 15 minutes without use.</p>".into()));
+        b.push_str(&step(true, "Password", if self.platform.is_some() {
+            "<p>Not needed: you opened the app from your box's dashboard, which already asked who you are.</p>".into()
+        } else {
+            "<p>Set. You are logged out after 15 minutes without use.</p>".into()
+        }));
         let key_body = if human.is_empty() {
             format!("<p>Your approval key is how you say yes to a large payment or a change of rules. It is made and kept in this browser, \
                      under a passphrase only you know.</p><section id=\"human-key-state\" data-enrolled=\"\"><p id=\"browser-key\" class=\"msg\"></p>{}</section>",
@@ -1185,6 +1309,45 @@ impl App {
     }
 }
 
+/// A failed play in plain words and the next step: (what happened, link text, link). From the
+/// connector's answer: the wallet's refusal (`402`, with its `rule` and reason) or an error.
+pub fn play_error_words(status: u16, v: &Value) -> (String, String, String) {
+    let rule = v["rule"].as_str().unwrap_or("").to_ascii_lowercase();
+    let why = v["error"].as_str().unwrap_or("").to_ascii_lowercase();
+    let has = |words: &[&str]| words.iter().any(|w| rule.contains(w) || why.contains(w));
+    let (h, l, href) = if why.starts_with("the connector") {
+        ("The app's player part isn't answering. Restart the app from your box's dashboard.", "See live connections", "./connections")
+    } else if has(&["human_key", "enrol", "no policy", "policy is not"]) {
+        ("Your wallet isn't set up yet.", "Finish setup", "./setup")
+    } else if has(&["allowlist", "not named", "unlisted", "listed", "not allowed"]) {
+        ("Payment refused by your spending rules: this seller is not allowed yet.", "Allow this seller", "./services")
+    } else if has(&["budget", "cap", "velocity", "max_sats", "limit", "threshold"]) {
+        ("Payment refused: your spending limit is reached.", "See your spending rules", "./policy")
+    } else if has(&["balance", "liquidity", "insufficient", "no route", "no_route", "unable to find a path", "outbound"]) {
+        ("Not enough balance to pay: your node has no way to send this much.", "See your wallet", "./wallet")
+    } else if has(&["ln_unavailable", "ln_disabled", "ln_config", "ln_halted", "no_rail", "mainnet", "macaroon", "not ready"]) {
+        ("Your wallet can't pay yet: your Lightning node isn't ready.", "Check your node", "./lightning")
+    } else if status == 504 || has(&["sent nothing", "did not answer", "could not reach", "timed out", "unreachable", "connection refused"]) {
+        ("The seller didn't answer. Try again in a moment.", "See your sellers", "./services")
+    } else if status == 401 {
+        ("You were logged out. Log in and press play again.", "Log in", "./login")
+    } else {
+        return (format!("This didn't play: {}.", v["error"].as_str().unwrap_or("the payment did not go through").trim_end_matches('.')),
+                "See live connections".into(), "./connections".into());
+    };
+    (h.into(), l.into(), href.into())
+}
+
+/// `?k=v&...` for a redirect back to the same page (empty when there is no query).
+fn query_string(q: &HashMap<String, String>) -> String {
+    if q.is_empty() {
+        return String::new();
+    }
+    let mut kv: Vec<_> = q.iter().collect();
+    kv.sort();
+    format!("?{}", kv.iter().map(|(k, v)| format!("{}={}", crate::services::urlenc(k), crate::services::urlenc(v))).collect::<Vec<_>>().join("&"))
+}
+
 /// An amount as the pages show money: sats, in the money colour.
 pub(crate) fn money(n: i64) -> String {
     format!("<span class=\"money\">{}</span>", sats(n))
@@ -1193,7 +1356,7 @@ pub(crate) fn money(n: i64) -> String {
 /// The first run's three steps, with `now` (1 to 3) the one the owner is on.
 pub(crate) fn progress(now: usize) -> String {
     let mut b = String::from("<ol class=\"progress\" aria-label=\"Getting started\">");
-    for (i, name) in ["Password", "Connect your node", "Ready"].iter().enumerate() {
+    for (i, name) in ["Password", "Your approval key and rules", "Ready"].iter().enumerate() {
         let n = i + 1;
         let class = if n < now { "done" } else if n == now { "now" } else { "" };
         b.push_str(&format!("<li class=\"{class}\"{}><span>{n}</span> {name}</li>", if n == now { " aria-current=\"step\"" } else { "" }));

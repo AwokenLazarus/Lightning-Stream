@@ -347,11 +347,31 @@
       paintStrength($("#keygen-pin").value);
     });
     $("#keygen-pin").addEventListener("input", function () { paintStrength(this.value); });
+    var downloaded = false;
+    var dl = $("#keygen-download");
+    if (dl) dl.addEventListener("click", function () {
+      if (!seed) return;
+      var text = "Lightning Stream: approval key backup\n\n" + hex(seed) + "\n\nThis is the only copy of your approval key. Keep it offline and private: " +
+                 "whoever has it can approve payments and change your spending rules. To restore it, open Keys, then " +
+                 "\"restore a key from its backup\", and paste the 64 characters above.\n";
+      var a = document.createElement("a");
+      a.href = URL.createObjectURL(new Blob([text], { type: "text/plain" }));
+      a.download = "lightning-stream-approval-key.txt";
+      document.body.appendChild(a); a.click(); a.remove();
+      downloaded = true;
+      var box = $("#keygen-saved"); if (box) box.checked = true;
+    });
     $("#keygen-save").addEventListener("click", function () {
       var msg = $("#keygen-msg");
       if (!seed) { say(msg, "generate or import a key first", true); return; }
       var tail = hex(seed).slice(-8);
-      if ($("#keygen-confirm").value.trim().toLowerCase() !== tail) { say(msg, "type the last 8 characters of your backup to confirm you saved it", true); return; }
+      var savedBox = $("#keygen-saved");
+      var typed = $("#keygen-confirm").value.trim().toLowerCase() === tail;
+      // the backup was downloaded and the owner says it is kept, or its end was typed back
+      if (!typed && !(downloaded && savedBox && savedBox.checked)) {
+        say(msg, downloaded ? "tick \"I saved the backup somewhere safe\" once it is kept" : "download the backup file (or type its last 8 characters) first", true);
+        return;
+      }
       var p1 = $("#keygen-pin").value, p2 = $("#keygen-pin2").value;
       var strength = passphraseStrength(p1);
       if (!strength.ok) { say(msg, strength.reason, true); paintStrength(p1); return; }
@@ -364,7 +384,13 @@
           seed.fill(0); seed = null;
           $("#keygen-backup").textContent = "(saved; this page no longer shows it)";
           var f = $("#enroll-form");
-          if (f) { $("[name=pubkey]", f).value = pub; f.hidden = false; say(msg, "Saved in this browser. Public key " + pub + ". Enrol it below."); }
+          if (f) {
+            $("[name=pubkey]", f).value = pub;
+            var code = $("[name=code]", f);
+            // the box gave the enrolment code: one step, nothing more to do here
+            if (code && code.type === "hidden" && code.value) { say(msg, "Saved in this browser. Setting it up…"); f.submit(); }
+            else { f.hidden = false; say(msg, "Saved in this browser. Public key " + pub + ". Enrol it below."); }
+          }
           else say(msg, "Saved in this browser. Public key " + pub + ".");
         } catch (e) { say(msg, e.message, true); }
       }, 20);
@@ -372,6 +398,48 @@
     var forget = $("#keygen-forget");
     if (forget) forget.addEventListener("click", function () { dropKey(); dropKey(PENDING); say($("#keygen-msg"), "Removed from this browser."); });
   }
+
+  // The player never sits black: a short message while the first part is paid for and the seller
+  // answers, and, when the play fails, why in plain words with the next step (the UI keeps the
+  // connector's reason: ./api/play-error).
+  $$("[data-player]").forEach(function (box) {
+    var v = $("video", box), out = $(".player-msg", box);
+    if (!v || !out) return;
+    var preview = box.hasAttribute("data-preview"), item = box.getAttribute("data-item") || "", done = false, timers = [];
+    function show(text, cls, link, href) {
+      out.hidden = false;
+      out.className = "player-msg flash " + cls;
+      out.textContent = text + (link ? " " : "");
+      if (link) { var a = document.createElement("a"); a.href = href; a.textContent = link; a.className = "button-link"; out.appendChild(a); }
+    }
+    function clear() { timers.forEach(clearTimeout); timers = []; }
+    function failed() {
+      if (done) return;
+      done = true; clear();
+      if (preview) { show("Your service on this box didn't answer. Check that it is running, then try again.", "bad", "Your services", "./sell"); return; }
+      fetch("./api/play-error?item=" + encodeURIComponent(item), { credentials: "same-origin" })
+        .then(function (r) { return r.json(); })
+        .then(function (j) {
+          if (j && j.failed) show(j.words, "bad", j.link, j.href);
+          else show("This didn't play. Try again, or see what is open.", "bad", "Live connections", "./connections");
+        })
+        .catch(function () { show("This didn't play, and the app could not say why. Try again.", "bad", null, null); });
+    }
+    timers.push(setTimeout(function () { if (!done) show(preview ? "Starting the preview…" : "Starting: paying for the first part…", "ok"); }, 1500));
+    timers.push(setTimeout(function () { if (!done) show(preview ? "Still waiting for your service…" : "Still waiting for the seller to answer…", "warn"); }, 8000));
+    timers.push(setTimeout(function () { if (!done && v.readyState < 2) failed(); }, 30000));
+    v.addEventListener("playing", function () { done = true; clear(); out.hidden = true; });
+    v.addEventListener("loadeddata", function () { done = true; clear(); out.hidden = true; });
+    v.addEventListener("error", failed);
+  });
+
+  // A service found on this box fills the address field in one click (the Sell page).
+  $$("[data-fill]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var form = btn.closest("form"), field = form && form.querySelector("[name='" + btn.getAttribute("data-fill") + "']");
+      if (field) { field.value = btn.getAttribute("data-value"); field.focus(); }
+    });
+  });
 
   // The player's Stop button: drop the video's source before the form posts, so the connector
   // sees the reader go away at once. The POST still asks the signer to stop the session.

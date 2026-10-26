@@ -59,13 +59,14 @@ UNPUBLISHED = re.compile(r"^(lightning-stream|xbt-hashlink):0\.1\.0$")
 STREAM_MOUNT = "${APP_DATA_DIR}/data/run/signer/streams:/data/run/signer/streams"
 # image -> (component sub-dir or None, run/ dirs it writes, run/ dirs it may mount read-only)
 AGENTPAY = {
-    "xbt-signer": ("signer", {"signer"}, {"anchor", "ln"}),
+    # run/enroll: the copy of the one-time enrolment code the signer writes for the setup page
+    "xbt-signer": ("signer", {"signer", "enroll"}, {"anchor", "ln"}),
     "xbt-anchor-witness": ("witness", {"anchor"}, set()),
     # run/ui holds the UI-owned MCP token; the MCP may only read it
     "xbt-wallet-mcp": ("mcp", set(), {"signer", "ui"}),
     # the setup pages write run/ln (the rail macaroon), run/gateway (the gateway's config and macaroons)
     # and run/hashrate (the hasher's settings)
-    "xbt-wallet-ui": ("ui", {"ui", "ln", "gateway", "hashrate"}, {"signer"}),
+    "xbt-wallet-ui": ("ui", {"ui", "ln", "gateway", "hashrate"}, {"signer", "enroll"}),
     "xbt-gateway": ("gateway", set(), {"gateway"}),
     # no state of its own. The control socket is read-only; the stream sockets are STREAM_MOUNT.
     "lightning-stream": (None, set(), {"signer"}),
@@ -76,6 +77,15 @@ AGENTPAY = {
 # the Lightning node's certificate: the only file of another app's data a service here may mount
 CERT_MOUNT = {"type": "bind", "source": "${APP_LIGHTNING_FORK_NODE_DATA_DIR}/tls.cert", "target": "/data/lightning/tls.cert", "read_only": True,
               "bind": {"create_host_path": False}}
+# The Lightning node's mainnet admin macaroon, the file alone (the directories above it are 0700):
+# only the one-shot node-keys (the UI image, `command: ["node-keys"]`) may mount it, read-only, never
+# created. It reads it once to have the node bake the app's narrow macaroons, and writes only those
+# (run/ln, run/gateway).
+NODE_DATA_MOUNT = {"type": "bind", "source": "${APP_LIGHTNING_FORK_NODE_DATA_DIR}/data/chain/bitcoin/mainnet/admin.macaroon",
+                   "target": "/node/admin.macaroon", "read_only": True,
+                   "bind": {"create_host_path": False}}
+NODE_KEYS_MOUNTS = {"${APP_DATA_DIR}/data/run/ln:/data/run/ln", "${APP_DATA_DIR}/data/run/gateway:/data/run/gateway"}
+
 # apps of another community store a dependency may name, and what their exports give a dependent (Paul's
 # umbrel-store, paulscode-lightning-fork/exports.sh)
 OTHER_STORES = {"paulscode-lightning-fork": {"APP_LIGHTNING_FORK_NODE_IP": "10.21.21.66", "APP_LIGHTNING_FORK_NODE_REST_PORT": "8180",
@@ -238,8 +248,11 @@ def main() -> int:
                 bad(f"{folder}/{name}: image {img!r} is not {REGISTRY}/<image>:<version>-<commit>@sha256:<digest>")
             elif pins.get(pin["name"]) != img:
                 bad(f"{folder}/{name}: image {img!r} is not the one packaging/images.lock pins ({pins.get(pin['name'])!r})")
+            node_keys = s.get("command") == ["node-keys"]
             for v in s.get("volumes") or []:
                 if isinstance(v, dict):
+                    if node_keys and v == NODE_DATA_MOUNT:
+                        continue
                     if v != CERT_MOUNT:
                         bad(f"{folder}/{name}: a long-form mount is only the Lightning node's tls.cert, read-only, never created: {v}")
                     continue
@@ -255,6 +268,18 @@ def main() -> int:
                     bad(f"{folder}/{name}: xbt-init must run with network_mode none, read_only, cap_drop ALL, cap_add within {sorted(INIT_CAPS)}")
                 if s.get("restart") != "no":
                     bad(f"{folder}/{name}: xbt-init is a one-shot (restart: \"no\")")
+            elif node_keys:
+                if base != "xbt-wallet-ui":
+                    bad(f"{folder}/{name}: node-keys runs from the UI's image")
+                if not s.get("read_only") or s.get("cap_drop") != ["ALL"] or "no-new-privileges:true" not in (s.get("security_opt") or []):
+                    bad(f"{folder}/{name}: needs read_only, cap_drop ALL, no-new-privileges")
+                if "user" in s or s.get("ports") or s.get("restart") != "no":
+                    bad(f"{folder}/{name}: node-keys is a one-shot (restart: \"no\") as its image's user, with no port")
+                if set(map(str, s.get("group_add") or [])) - {"1000"}:
+                    bad(f"{folder}/{name}: node-keys may join only the Lightning app's group (1000)")
+                vols = s.get("volumes") or []
+                if NODE_DATA_MOUNT not in vols or {str(v) for v in vols if not isinstance(v, dict)} - NODE_KEYS_MOUNTS:
+                    bad(f"{folder}/{name}: node-keys mounts the node's chain data read-only and writes only run/ln and run/gateway")
             elif base in AGENTPAY:
                 comp, own_runs, peers = AGENTPAY[base]
                 if not s.get("read_only") or s.get("cap_drop") != ["ALL"] or "no-new-privileges:true" not in (s.get("security_opt") or []):

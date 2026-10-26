@@ -11,7 +11,7 @@
 export const PORTS = { ui: 8480, mcp: 33510 } as const
 
 export type ImageKey = 'init' | 'signer' | 'witness' | 'mcp' | 'ui'
-export type DaemonId = 'init' | 'witness' | 'signer' | 'mcp' | 'ui'
+export type DaemonId = 'init' | 'node-keys' | 'witness' | 'signer' | 'mcp' | 'ui'
 
 /**
  * A part of the `main` volume, or (with `dependency`) one file of another package's volume: Lightning Fork's
@@ -97,6 +97,18 @@ const lightningCert: MountSpec = {
   dependency: { packageId: LIGHTNING.packageId, volumeId: 'main', type: 'directory' },
 }
 const certMounts = (rest: string): MountSpec[] => (rest && CERT_SOURCE === 'folder' ? [lightningCert] : [])
+/**
+ * Lightning Fork's chain data, where its admin macaroon is: mounted read-only into the one-shot
+ * node-keys only, which has the node bake the wallet's narrow rail macaroon (under a root key of its
+ * own) and writes only that, into run/ln. No other service mounts it. Lightning Fork keeps its lnd
+ * dir at the root of its main volume (tls.cert beside data/), so the chain data is `data/chain`.
+ */
+const lightningChainData: MountSpec = {
+  subpath: 'data/chain',
+  mountpoint: '/node/chain',
+  readonly: true,
+  dependency: { packageId: LIGHTNING.packageId, volumeId: 'main', type: 'directory' },
+}
 
 export function services(cfg: Config): ServiceSpec[] {
   const node = {
@@ -119,6 +131,20 @@ export function services(cfg: Config): ServiceSpec[] {
       requires: [],
     },
     {
+      // connects the wallet to the box's Lightning node with no step by the owner; it exits once the
+      // rail macaroon is there (made now, made before, or the owner's own). Root: Lightning Fork's
+      // files are its own user's, and this one-shot only reads them and writes run/ln (given its group)
+      id: 'node-keys',
+      image: 'ui',
+      user: 'root',
+      command: ['/usr/bin/xbt-wallet-ui', 'node-keys'],
+      env: cfg.lightningRest
+        ? { XBT_KEYS_NODE_REST: cfg.lightningRest, XBT_KEYS_TLS_CERT: LIGHTNING.cert, XBT_KEYS_ADMIN: '/node/chain', XBT_KEYS_RAIL_DIR: '/data/run/ln' }
+        : {},
+      mounts: cfg.lightningRest && CERT_SOURCE === 'folder' ? [vol('run/ln', '/data/run/ln'), lightningChainData, lightningCert] : [],
+      requires: ['init'],
+    },
+    {
       id: 'witness',
       image: 'witness',
       command: ['/usr/bin/xbt-anchor-witness', 'serve'],
@@ -135,6 +161,8 @@ export function services(cfg: Config): ServiceSpec[] {
       env: {
         ...node,
         ...(cfg.lightningRest ? { B2_LN_REST: cfg.lightningRest, B2_LN_MACAROON: LIGHTNING.macaroon, B2_MAINNET_ACK_FILE: '/data/run/ln/mainnet-ack', B2_LN_TLS_CERT: LIGHTNING.cert } : {}),
+        // a copy of the one-time enrolment code for the setup page (run/enroll: the signer and the UI only)
+        B2_ENROLL_CODE_COPY: '/data/run/enroll/enroll-code',
       },
       // run/ln: the rail macaroon (group xbt-ln-rail: the UI writes it, the signer reads it, the MCP cannot)
       mounts: [
@@ -142,6 +170,7 @@ export function services(cfg: Config): ServiceSpec[] {
         vol('run/signer', '/data/run/signer'),
         vol('run/anchor', '/data/run/anchor', true),
         vol('run/ln', '/data/run/ln', true),
+        vol('run/enroll', '/data/run/enroll'),
         ...certMounts(cfg.lightningRest),
       ],
       requires: ['witness'],
@@ -168,6 +197,8 @@ export function services(cfg: Config): ServiceSpec[] {
         XBT_UI_SIGNER_SOCK: '/data/run/signer/signer.sock',
         XBT_UI_MCP_URL: cfg.mcpUrls.join(','),
         ...(cfg.lightningRest ? { XBT_UI_LN_REST: cfg.lightningRest, XBT_UI_LN_TLS_CERT: LIGHTNING.cert, XBT_UI_LN_TLS_PIN: CERT_SOURCE === 'pin' ? '1' : '0' } : {}),
+        // the signer's one-time enrolment code: the setup page fills it in, so no log has to be read
+        XBT_UI_ENROLL_CODE_FILE: '/data/run/enroll/enroll-code',
       },
       // the UI owns the MCP token and rotates it on its Agents page; its Lightning page writes run/ln
       mounts: [
@@ -175,6 +206,7 @@ export function services(cfg: Config): ServiceSpec[] {
         vol('run/signer', '/data/run/signer', true),
         vol('run/ui', '/data/run/ui'),
         vol('run/ln', '/data/run/ln'),
+        vol('run/enroll', '/data/run/enroll', true),
         ...certMounts(cfg.lightningRest),
       ],
       requires: ['signer'],
