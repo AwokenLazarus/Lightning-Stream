@@ -7,24 +7,40 @@
 //!                     [--slices ADDR]              paid slices come from the hasher's gateway (else: the lab's rail)
 //!                     [--relays URL,URL --nostr-key F --name N --link-public ADDR --pay-url URL --pay-node HEX
 //!                      --hashrate-hs N [--listing-out F]]    publish the hashrate listing first
+//!                     [--fallback ADDR [--rentable N] [--control ADDR [--control-token-file F]] [--config F]
+//!                      [--gateway URL] [--miners-public ADDR]]
+//!                         keep serving: miners not rented hash at the fallback, any number of rentals,
+//!                         a control page for the app (GET /status, POST /stop/RENTAL), settings read
+//!                         from F as they change; without --fallback and --config: one rental, then exit
+//! xbt-hashlink renter --key F --control ADDR [--control-token-file F] --upstream ADDR|auto --user U --relays URL,URL
+//!                     [--signer SOCK --task T] [--expect-node HEX] [--datum-candidates ADDR,ADDR] [--state DIR]
+//!                         rent from the app: GET /status, GET /offers, POST /rent, POST /cut, POST /datum
 //! xbt-hashlink buyer  --key F --upstream ADDR --user U [--idle-s S] [--duration-s S] [--stop-paying-after N]
-//!                     [--rental ID] [--report F]
+//!                     [--rental ID] [--report F] [--miners N] [--budget-sats N]
 //!                     ( --hasher ADDR --hasher-key HEX --slice-work W --price-msat P [--grace-ms G]
 //!                     | --find URL,URL [--expect-node HEX] [--max-price-msat P] [--found-out F] )
 //!                     [--signer SOCK --task T --max-sats N [--pay-url URL]]   pay through the wallet
 //! xbt-hashlink relay  --listen ADDR                 a stand-in Nostr relay (in memory, for a lab or a rehearsal)
 //! xbt-hashlink standin-pool  --listen ADDR --diff D [--job-ms MS] [--report F]
 //! xbt-hashlink standin-miner --pool ADDR --user U [--rate SHARES_PER_S] [--bad-every N] [--duration-s S]
+//!                            [--reconnect 1] [--extranonce-subscribe 1]
 //! ```
 
 use secp256k1::{PublicKey, SecretKey};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
-use xbt_hashlink::listing::{self, Hashrate};
+use xbt_hashlink::listing::{self, Capacity, Hashrate};
 use xbt_hashlink::msg::Terms;
 use xbt_hashlink::rail::{LabBuyer, LabSeller, SignerPayer};
 use xbt_hashlink::{buyer, hasher, noise, standin};
+
+#[path = "hashlink/http.rs"]
+mod http;
+#[path = "hashlink/renter.rs"]
+mod renter;
+#[path = "hashlink/service.rs"]
+mod service;
 
 fn flags(args: &[String]) -> Result<HashMap<String, String>, String> {
     let mut m = HashMap::new();
@@ -37,18 +53,18 @@ fn flags(args: &[String]) -> Result<HashMap<String, String>, String> {
     Ok(m)
 }
 
-fn need<'a>(f: &'a HashMap<String, String>, k: &str) -> Result<&'a str, String> {
+pub(crate) fn need<'a>(f: &'a HashMap<String, String>, k: &str) -> Result<&'a str, String> {
     f.get(k).map(String::as_str).ok_or_else(|| format!("--{k} is required"))
 }
 
-fn num<T: std::str::FromStr>(f: &HashMap<String, String>, k: &str, default: Option<T>) -> Result<T, String> {
+pub(crate) fn num<T: std::str::FromStr>(f: &HashMap<String, String>, k: &str, default: Option<T>) -> Result<T, String> {
     match f.get(k) {
         Some(v) => v.parse().map_err(|_| format!("--{k}: not a number: {v}")),
         None => default.ok_or_else(|| format!("--{k} is required")),
     }
 }
 
-fn read_key(path: &str) -> Result<SecretKey, String> {
+pub(crate) fn read_key(path: &str) -> Result<SecretKey, String> {
     let s = std::fs::read_to_string(path).map_err(|e| format!("key {path}: {e}"))?;
     let b = hex::decode(s.trim()).map_err(|_| format!("key {path}: not hex"))?;
     SecretKey::from_slice(&b).map_err(|_| format!("key {path}: not a secp256k1 key"))
@@ -66,7 +82,7 @@ fn terms(f: &HashMap<String, String>) -> Result<Terms, String> {
     })
 }
 
-fn relays(s: &str) -> Vec<String> {
+pub(crate) fn relays(s: &str) -> Vec<String> {
     s.split(',').map(str::trim).filter(|r| !r.is_empty()).map(str::to_string).collect()
 }
 
@@ -101,6 +117,7 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         "hasher" => hasher_cmd(&flags(rest)?),
         "buyer" => buyer_cmd(&flags(rest)?),
+        "renter" => renter::run(&flags(rest)?),
         "relay" => {
             let f = flags(rest)?;
             let r = xbt_nostr::standin::StandinRelay::start_on(need(&f, "listen")?).map_err(|e| e.to_string())?;
@@ -120,14 +137,19 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         "standin-miner" => {
             let f = flags(rest)?;
-            let (sent, ok, bad) = standin::miner(standin::MinerConfig {
+            let r = standin::miner(standin::MinerConfig {
                 pool: need(&f, "pool")?.into(),
                 user: need(&f, "user")?.into(),
                 max_rate: num(&f, "rate", Some(20.0))?,
                 bad_every: num(&f, "bad-every", Some(0))?,
                 duration: f.get("duration-s").map(|v| v.parse().map(Duration::from_secs)).transpose().map_err(|_| "--duration-s")?,
+                reconnect: num(&f, "reconnect", Some(0u8))? == 1,
+                extranonce_subscribe: num(&f, "extranonce-subscribe", Some(0u8))? == 1,
             })?;
-            eprintln!("miner: submitted {sent}, accepted {ok}, rejected {bad}");
+            eprintln!(
+                "miner: submitted {}, accepted {}, rejected {}, sessions {}, extranonce changes {}, longest gap {} ms",
+                r.submitted, r.accepted, r.rejected, r.sessions, r.extranonce_changes, r.max_gap_ms
+            );
             Ok(())
         }
         c => Err(format!("unknown command {c}")),
@@ -135,27 +157,15 @@ fn run(args: &[String]) -> Result<(), String> {
 }
 
 fn hasher_cmd(f: &HashMap<String, String>) -> Result<(), String> {
+    if f.contains_key("fallback") || f.contains_key("config") {
+        let key = service::key_file(need(f, "key")?)?;
+        return service::run(f, key);
+    }
     let key = read_key(need(f, "key")?)?;
     let t = terms(f)?;
     if let Some(r) = f.get("relays") {
-        let h = Hashrate {
-            name: need(f, "name")?.into(),
-            algorithm: "blake2b".into(),
-            hashrate_hs: num(f, "hashrate-hs", None)?,
-            link_addr: need(f, "link-public")?.into(),
-            link_key: pubkey(&key),
-            pay_url: need(f, "pay-url")?.into(),
-            pay_node: need(f, "pay-node")?.into(),
-            terms: t.clone(),
-        };
-        let nostr = xbt_nostr::event::Keys::new(read_key(need(f, "nostr-key")?)?);
-        let ev = h.event(&key, &nostr, xbt_nostr::now())?;
-        let said = listing::publish(&relays(r), &ev);
-        eprintln!("hasher: listing {} published: {}", ev.id, serde_json::Value::from(said.clone()));
-        write_json(f.get("listing-out"), &serde_json::json!({"event": ev.to_value(), "relays": said}));
-        if !said.iter().any(|s| s["ok"] == true) {
-            return Err("no relay took the listing".into());
-        }
+        let h = listing_of(f, &key, &t, Capacity::default())?;
+        publish(f, r, &key, &h)?;
     }
     let cfg = hasher::Config {
         miners: need(f, "miners")?.into(),
@@ -164,9 +174,37 @@ fn hasher_cmd(f: &HashMap<String, String>) -> Result<(), String> {
         terms: t,
         report: f.get("report").map(PathBuf::from),
         slices: f.get("slices").cloned(),
+        fallback: None,
+        rentable: None,
     };
     let r = hasher::run(cfg, Box::<LabSeller>::default())?;
     eprintln!("hasher: done: {}", r["stopped"]);
+    Ok(())
+}
+
+pub(crate) fn listing_of(f: &HashMap<String, String>, key: &SecretKey, t: &Terms, capacity: Capacity) -> Result<Hashrate, String> {
+    Ok(Hashrate {
+        name: need(f, "name")?.into(),
+        algorithm: "blake2b".into(),
+        hashrate_hs: num(f, "hashrate-hs", Some(capacity.free_hs))?,
+        link_addr: need(f, "link-public")?.into(),
+        link_key: pubkey(key),
+        pay_url: need(f, "pay-url")?.into(),
+        pay_node: need(f, "pay-node")?.into(),
+        terms: t.clone(),
+        capacity,
+    })
+}
+
+pub(crate) fn publish(f: &HashMap<String, String>, relays_s: &str, key: &SecretKey, h: &Hashrate) -> Result<(), String> {
+    let nostr = xbt_nostr::event::Keys::new(read_key(need(f, "nostr-key")?)?);
+    let ev = h.event(key, &nostr, xbt_nostr::now())?;
+    let said = listing::publish(&relays(relays_s), &ev);
+    eprintln!("hasher: listing {} published: {}", ev.id, serde_json::Value::from(said.clone()));
+    write_json(f.get("listing-out"), &serde_json::json!({"event": ev.to_value(), "relays": said}));
+    if !said.iter().any(|s| s["ok"] == true) {
+        return Err("no relay took the listing".into());
+    }
     Ok(())
 }
 
@@ -199,6 +237,10 @@ fn buyer_cmd(f: &HashMap<String, String>) -> Result<(), String> {
         None => None,
     };
     let cfg = buyer::Config {
+        miners: num(f, "miners", Some(0))?,
+        budget_msat: f.get("budget-sats").map(|v| v.parse::<u64>().map(|s| s * 1000)).transpose().map_err(|_| "--budget-sats")?,
+        cut: None,
+        live: None,
         hasher,
         hasher_key,
         key: read_key(need(f, "key")?)?,
@@ -218,7 +260,7 @@ fn buyer_cmd(f: &HashMap<String, String>) -> Result<(), String> {
     Ok(())
 }
 
-fn write_secret(path: &str, s: &str) -> Result<(), String> {
+pub(crate) fn write_secret(path: &str, s: &str) -> Result<(), String> {
     use std::io::Write;
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;

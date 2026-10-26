@@ -547,6 +547,11 @@ impl App {
                 sections.push(json!({"name": o.name, "kind": o.kind.listing_kind(), "path": p, "items": items}));
             }
         }
+        // pieces of work from this box's miners, when renting them out is on
+        if let Some(r) = self.hash_route() {
+            routes.retain(|x| x.get("path") != r.get("path"));
+            routes.push(r);
+        }
         c.insert("routes".into(), Value::Array(routes));
         if sections.is_empty() {
             c.remove("listing");
@@ -562,7 +567,7 @@ impl App {
 
     /// Save the shop, and the gateway's config when the shop is complete. `Ok`: the words for
     /// the owner.
-    fn commit(&self, shop: &Shop, done: &str) -> Result<String, String> {
+    pub(crate) fn commit(&self, shop: &Shop, done: &str) -> Result<String, String> {
         self.save_shop(shop)?;
         match self.shop_config(shop, &self.chain()) {
             Ok(cfg) => {

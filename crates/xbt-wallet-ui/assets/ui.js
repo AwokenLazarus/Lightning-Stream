@@ -485,9 +485,10 @@
   }
 
   // Live connections: when money moved since the last look, a pulse runs down the river.
-  var spent = $("[data-spent]");
-  if (spent) {
-    var now = Number(spent.getAttribute("data-spent")) || 0, before = null;
+  var spent = $$("[data-spent]");
+  if (spent.length) {
+    var now = 0, before = null;
+    spent.forEach(function (el) { now += Number(el.getAttribute("data-spent")) || 0; });
     try { before = Number(root.sessionStorage.getItem("ls-spent")); root.sessionStorage.setItem("ls-spent", String(now)); } catch (e) { /* no storage */ }
     if (before !== null && now > before) {
       root.addEventListener("load", function () { if (root.lsRiver) root.lsRiver.pulse(); });

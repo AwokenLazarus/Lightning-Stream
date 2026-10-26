@@ -48,6 +48,17 @@ pub struct Hashrate {
     pub pay_url: String,
     pub pay_node: String,
     pub terms: Terms,
+    /// Miners behind the hasher's app, and how many of them (with how much hashrate) are free to
+    /// rent now. A rental takes whole miners. Zero miners: the listing does not say.
+    pub capacity: Capacity,
+}
+
+/// What a hasher has, and what of it is free, as the listing says when it was published.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Capacity {
+    pub miners: u32,
+    pub free_miners: u32,
+    pub free_hs: u64,
 }
 
 fn bind_message(nostr: &[u8; 32]) -> Message {
@@ -65,6 +76,7 @@ impl Hashrate {
             "link": {"addr": self.link_addr, "key": hex::encode(self.link_key.serialize())},
             "pay": {"url": self.pay_url, "node": self.pay_node},
             "terms": self.terms.to_json(),
+            "capacity": {"miners": self.capacity.miners, "freeMiners": self.capacity.free_miners, "freeHs": self.capacity.free_hs.to_string()},
         })
     }
 
@@ -83,6 +95,12 @@ impl Hashrate {
             pay_url: s("/pay/url")?,
             pay_node: s("/pay/node")?,
             terms: Terms::from_json(v.get("terms").ok_or("terms missing")?).ok_or("bad terms")?,
+            // optional: a listing from before several renters says nothing of its capacity
+            capacity: v.get("capacity").map(|c| Capacity {
+                miners: c.get("miners").and_then(Value::as_u64).and_then(|m| u32::try_from(m).ok()).unwrap_or(0),
+                free_miners: c.get("freeMiners").and_then(Value::as_u64).and_then(|m| u32::try_from(m).ok()).unwrap_or(0),
+                free_hs: c.get("freeHs").and_then(Value::as_str).and_then(|h| h.parse().ok()).unwrap_or(0),
+            }).unwrap_or_default(),
         })
     }
 
@@ -105,8 +123,13 @@ impl Hashrate {
             tag(DOC_TAG, &self.to_json().to_string()),
             tag(BIND_TAG, &hex::encode(bind.serialize_compact())),
         ];
+        let free = if self.capacity.miners > 0 {
+            format!(" {} of {} miners free now, about {:.2} TH/s.", self.capacity.free_miners, self.capacity.miners, self.capacity.free_hs as f64 / 1e12)
+        } else {
+            String::new()
+        };
         let content = format!(
-            "**{}**: {} hashrate for rent, about {:.2} TH/s, pointed at your own DATUM Gateway. Paid per slice of accepted work over Lightning Stream.\n",
+            "**{}**: {} hashrate for rent, about {:.2} TH/s, pointed at your own DATUM Gateway. Paid per slice of accepted work over Lightning Stream.{free}\n",
             self.name,
             self.algorithm,
             self.hashrate_hs as f64 / 1e12
@@ -183,6 +206,7 @@ mod tests {
             pay_url: "https://192.0.2.1:8443/hashrate".into(),
             pay_node: "02".to_string() + &"11".repeat(32),
             terms: Terms { slice_work: 1 << 50, price_msat: 40_000, grace_ms: 30_000 },
+            capacity: Capacity { miners: 4, free_miners: 1, free_hs: 4_100_000_000_000 },
         }
     }
 

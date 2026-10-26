@@ -15,6 +15,8 @@ Deterministic (mtime 0, sorted, numeric owners) so the layer digest is the same 
   /data/run/gateway 0750 xbt-wallet-ui:xbt-gateway, the gateway's config and macaroons the UI's gateway page writes
   /data/run/enroll  0750 xbt-signer:xbt-enroll, the signer's enrolment code for the UI's setup page; the group
                     (10009, a group only) has the signer and the UI in it, never the MCP
+  /data/hashrate    0700, the hashrate services' keys and state (xbt-hashrate, 10010)
+  /data/run/hashrate 0750 xbt-wallet-ui:xbt-hashrate, their settings the UI's Hashrate page writes, and their control token
 Uid 10004 is not used: it was the retired hub's, and the other uids keep their numbers.
     python3 container/mkbase.py OUT.tar
 """
@@ -23,11 +25,11 @@ import sys
 import tarfile
 
 USERS = [("xbt-signer", 10001), ("xbt-anchor-witness", 10002), ("xbt-wallet-mcp", 10003), ("xbt-wallet-ui", 10005),
-         ("xbt-work-relay", 10006), ("xbt-gateway", 10007)]
+         ("xbt-work-relay", 10006), ("xbt-gateway", 10007), ("xbt-hashrate", 10010)]
 HOME = {"xbt-signer": "/data/signer", "xbt-anchor-witness": "/data/witness", "xbt-wallet-mcp": "/data/mcp",
-        "xbt-wallet-ui": "/data/ui", "xbt-work-relay": "/data/relay", "xbt-gateway": "/data/gateway"}
-MEMBERS = {"xbt-signer": "xbt-wallet-mcp,xbt-wallet-ui", "xbt-anchor-witness": "xbt-signer", "xbt-wallet-ui": "xbt-wallet-mcp",
-           "xbt-gateway": "xbt-wallet-ui"}
+        "xbt-wallet-ui": "/data/ui", "xbt-work-relay": "/data/relay", "xbt-gateway": "/data/gateway", "xbt-hashrate": "/data/hashrate"}
+MEMBERS = {"xbt-signer": "xbt-wallet-mcp,xbt-wallet-ui,xbt-hashrate", "xbt-anchor-witness": "xbt-signer", "xbt-wallet-ui": "xbt-wallet-mcp",
+           "xbt-gateway": "xbt-wallet-ui", "xbt-hashrate": "xbt-wallet-ui"}
 # groups with no user of their own
 GROUPS = [("xbt-ln-rail", 10008, "xbt-signer,xbt-wallet-ui"), ("xbt-enroll", 10009, "xbt-signer,xbt-wallet-ui")]
 
@@ -37,9 +39,10 @@ group = ("root:x:0:\n" + "".join(f"{n}:x:{u}:{MEMBERS.get(n, '')}\n" for n, u in
 
 DIRS = [("etc", 0, 0, 0o755), ("tmp", 0, 0, 0o1777), ("usr", 0, 0, 0o755), ("usr/bin", 0, 0, 0o755), ("data", 0, 0, 0o755),
         ("data/signer", 10001, 10001, 0o700), ("data/witness", 10002, 10002, 0o700), ("data/mcp", 10003, 10003, 0o700),
-        ("data/ui", 10005, 10005, 0o700), ("data/relay", 10006, 10006, 0o700), ("data/gateway", 10007, 10007, 0o700), ("data/run", 0, 0, 0o755), ("data/run/signer", 10001, 10001, 0o750),
+        ("data/ui", 10005, 10005, 0o700), ("data/relay", 10006, 10006, 0o700), ("data/gateway", 10007, 10007, 0o700), ("data/hashrate", 10010, 10010, 0o700), ("data/run", 0, 0, 0o755), ("data/run/signer", 10001, 10001, 0o750),
         ("data/run/anchor", 10002, 10002, 0o750), ("data/run/ui", 10005, 10005, 0o750),
-        ("data/run/ln", 10005, 10008, 0o750), ("data/run/gateway", 10005, 10007, 0o750), ("data/run/enroll", 10001, 10009, 0o750)]
+        ("data/run/ln", 10005, 10008, 0o750), ("data/run/gateway", 10005, 10007, 0o750), ("data/run/enroll", 10001, 10009, 0o750),
+        ("data/run/hashrate", 10005, 10010, 0o750)]
 FILES = [("etc/passwd", passwd, 0o644), ("etc/group", group, 0o644)]
 
 entries = []

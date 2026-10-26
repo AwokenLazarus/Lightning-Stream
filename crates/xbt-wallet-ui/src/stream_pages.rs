@@ -96,10 +96,15 @@ impl App {
 
     pub(crate) fn connections(&self, ctx: &Ctx) -> Resp {
         let names = self.services().unwrap_or_default();
-        let body = match self.call("ticket_status", json!({})) {
-            Ok(st) => connections_html(ctx, &st, &|id| self.call("ticket_status", json!({"session": id})), &names, crate::now()),
+        // rented hashrate is one more kind of connection: a pulse for each piece of work paid
+        let (cards, spent) = self.hash_live_cards(ctx);
+        let mut body = match self.call("ticket_status", json!({})) {
+            Ok(st) => connections_html(ctx, &st, &|id| self.call("ticket_status", json!({"session": id})), &names, crate::now(), !cards.is_empty()),
             Err(e) => Self::error_box(&e),
         };
+        if !cards.is_empty() {
+            body.push_str(&format!("<h2>Rented hashrate</h2><div class=\"stack\" data-spent=\"{spent}\">{cards}</div>"));
+        }
         self.html_page("Live connections", "Live connections", ctx, &body, REFRESH)
     }
 
@@ -529,7 +534,8 @@ fn balance_cell(paying: &Value, sid: &str, booked_sats: i64) -> String {
     "—".into()
 }
 
-fn connections_html(ctx: &Ctx, st: &Value, detail: &dyn Fn(&str) -> Result<Value, String>, names: &[Service], now: i64) -> String {
+/// `more`: other connections (rented hashrate) follow, so an empty list here is not "nothing open".
+fn connections_html(ctx: &Ctx, st: &Value, detail: &dyn Fn(&str) -> Result<Value, String>, names: &[Service], now: i64, more: bool) -> String {
     let csrf = App::csrf_input(ctx);
     let mut b = String::from("<p class=\"lead\">Every service you are paying for right now. Stop one and its payments end at once; \
                               what you paid ahead and did not use comes back to you. This page updates every few seconds.</p>");
@@ -537,7 +543,9 @@ fn connections_html(ctx: &Ctx, st: &Value, detail: &dyn Fn(&str) -> Result<Value
         b.push_str(&App::error_box(e));
     }
     let Some(sessions) = st.get("sessions").and_then(Value::as_array).filter(|a| !a.is_empty()) else {
-        b.push_str("<p class=\"empty\">Nothing is open. Use a service from <a href=\"./browse\">Browse</a> and it shows up here.</p>");
+        if !more {
+            b.push_str("<p class=\"empty\">Nothing is open. Use a service from <a href=\"./browse\">Browse</a> and it shows up here.</p>");
+        }
         return b;
     };
     let paying = st.get("paying").cloned().unwrap_or(json!([]));

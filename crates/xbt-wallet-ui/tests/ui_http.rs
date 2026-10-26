@@ -1565,6 +1565,147 @@ fn main_screens_speak_plain_words() {
     check("seller's page", &g.get("/").body);
 }
 
+/// Requests a stand-in control page saw: (method, path, the Authorization header, the body).
+type ControlSeen = Arc<std::sync::Mutex<Vec<(String, String, String, String)>>>;
+
+/// A stand-in for the hasher's and the renter's control pages: fixed answers, every request kept.
+fn control_standin(answer: fn(&str, &str) -> Value) -> (String, ControlSeen) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    let seen: ControlSeen = Arc::default();
+    let s2 = seen.clone();
+    std::thread::spawn(move || {
+        for c in l.incoming() {
+            let Ok(mut c) = c else { continue };
+            let mut r = BufReader::new(c.try_clone().unwrap());
+            let mut line = String::new();
+            r.read_line(&mut line).unwrap();
+            let mut it = line.split_whitespace();
+            let (m, p) = (it.next().unwrap_or("").to_string(), it.next().unwrap_or("").to_string());
+            let (mut len, mut auth) = (0usize, String::new());
+            loop {
+                let mut h = String::new();
+                r.read_line(&mut h).unwrap();
+                let h = h.trim_end().to_string();
+                if h.is_empty() {
+                    break;
+                }
+                let (k, v) = h.split_once(':').unwrap();
+                match k.to_ascii_lowercase().as_str() {
+                    "content-length" => len = v.trim().parse().unwrap(),
+                    "authorization" => auth = v.trim().to_string(),
+                    _ => {}
+                }
+            }
+            let mut body = vec![0u8; len];
+            r.read_exact(&mut body).unwrap();
+            let out = answer(&m, &p).to_string();
+            s2.lock().unwrap().push((m, p, auth, String::from_utf8_lossy(&body).to_string()));
+            let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{out}", out.len());
+        }
+    });
+    (base, seen)
+}
+
+#[test]
+fn hashrate_is_rented_out_and_rented_in_plain_words() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (hasher, hseen) = control_standin(|m, p| match (m, p) {
+        ("GET", "/status") => json!({
+            "open": true, "settings": {"enabled": true, "fallback": "192.168.1.20:23334", "priceSat": 40, "sliceWork": "140737488355328", "graceMs": 45000,
+                                       "rentable": null, "name": "Basement miners"},
+            "minersAddress": "umbrel.local:23334", "listing": {"ok": true, "freeMiners": 1, "miners": 2},
+            "miners": [{"name": "s11", "connected": true, "hashrateHs": 4.1e12, "rentedTo": "r1", "earnedMsat": 120000},
+                       {"name": "s12", "connected": true, "hashrateHs": 4.0e12, "rentedTo": null, "earnedMsat": 0}],
+            "rentals": [{"rental": "r1", "buyer": "02aa", "miners": ["s11"], "paid": 3, "earnedMsat": 120000}]}),
+        ("POST", "/stop/r1") => json!({"ok": true, "stopped": "r1"}),
+        _ => json!({"error": "no"}),
+    });
+    let (renter, rseen) = control_standin(|m, p| match (m, p) {
+        ("GET", "/status") => json!({
+            "datum": {"addr": "datum-gateway:23334", "reachable": true, "found": ["datum-gateway:23334"]},
+            "rentals": [{"rental": "r9", "hasher": "Basement miners", "miners": 1, "budgetSats": 4000, "minutes": 60, "ended": false,
+                         "live": {"closed": null, "paidSlices": 5, "spentMsat": 200000, "miners": 1, "lastRate": {"hs": 4.1e12}}}]}),
+        ("GET", "/offers") => json!({"offers": [{"name": "Basement miners", "linkKey": "02bb", "priceMsat": 40000, "sliceWork": "140737488355328",
+                                                  "miners": 2, "freeMiners": 1, "freeHs": "4000000000000"}]}),
+        ("POST", "/rent") => json!({"ok": true, "rental": "r10"}),
+        ("POST", "/cut") => json!({"ok": true}),
+        ("POST", "/datum") => json!({"ok": true, "datum": "datum-gateway:23334", "reachable": true}),
+        _ => json!({"error": "no"}),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (htok, rtok) = (dir.path().join("hasher-token"), dir.path().join("renter-token"));
+    std::fs::write(&htok, "h".repeat(64)).unwrap();
+    std::fs::write(&rtok, "r".repeat(64)).unwrap();
+    let settings = dir.path().join("hashrate/settings.json");
+    let gw = dir.path().join("gateway");
+    std::fs::create_dir_all(&gw).unwrap();
+    let bx = start(json!({}), false, |c| {
+        c.sell = true;
+        c.gw.dir = gw.clone();
+        c.gw.node_rest = Some("https://10.21.21.66:8180".into());
+        c.hash.hasher = Some(hasher.clone());
+        c.hash.hasher_token = Some(htok.clone());
+        c.hash.renter = Some(renter.clone());
+        c.hash.renter_token = Some(rtok.clone());
+        c.hash.slices = Some("http://127.0.0.1:9".into());
+        c.hash.settings = settings.clone();
+    });
+    let mut br = logged_in(&bx);
+    const JARGON: [&str; 11] = ["macaroon", "msat", "millisat", "preimage", "upstream", "htlc", "cltv", "receipt key", "mcp", "nwc", "xbt_ui_"];
+    let plain = |what: &str, page: &str| {
+        let words = main_words(page);
+        for j in JARGON {
+            assert!(!words.contains(j), "{what}: \"{j}\" on the main screen: {words}");
+        }
+    };
+
+    // Sell → Hashrate: where to point the miners, each miner, the rental going on
+    let p = br.get("/sell-hashrate");
+    assert_eq!(p.status, 200);
+    for s in ["Renting out: 1 of 2 miners rented", "stratum+tcp://umbrel.local:23334", "Your pool", "Rented out", "4.10 TH/s", "120 sats", "Stop this rental"] {
+        assert!(p.body.contains(s), "{s} missing from Sell hashrate");
+    }
+    assert!(p.body.contains("href=\"./sell-hashrate\" aria-current"), "Hashrate is a tab of Sell");
+    assert!(br.get("/browse").body.contains("href=\"./hashrate\""), "and of Services");
+    plain("/sell-hashrate", &p.body);
+    let r = br.act("/sell-hashrate", "/sell-hashrate", &[("action", "stop"), ("rental", "r1")]);
+    assert!(br.flash_after(&r).starts_with("Stopped."));
+    assert!(hseen.lock().unwrap().iter().any(|(m, p, a, _)| m == "POST" && p == "/stop/r1" && *a == format!("Bearer {}", "h".repeat(64))),
+            "the stop went to the hasher's control page with its token");
+    // turning renting on writes the hasher's settings
+    let r = br.act("/sell-hashrate", "/sell-hashrate", &[("action", "save"), ("fallback", "192.168.1.20:23334"), ("price", "40"), ("rentable", "1"),
+                                                          ("name", "Basement miners"), ("enabled", "1")]);
+    assert!(br.flash_after(&r).starts_with("Saved. Renting is on."));
+    let s: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    assert_eq!((s["enabled"].clone(), s["fallback"].clone(), s["priceSat"].clone(), s["rentable"].clone()),
+               (json!(true), json!("192.168.1.20:23334"), json!(40), json!(1)));
+    let r = br.act("/sell-hashrate", "/sell-hashrate", &[("action", "save"), ("fallback", "no port"), ("price", "40")]);
+    assert!(br.flash_after(&r).contains("with its port"));
+
+    // Services → Hashrate: the offers, the rental going on, renting and cutting
+    let p = br.get("/hashrate");
+    assert_eq!(p.status, 200);
+    for s in ["Ready to rent", "Basement miners", "1 of 2 machines free", "Rent", "Hashrate from Basement miners", "200 sats", "Cut", "Lazarus Pool"] {
+        assert!(p.body.contains(s), "{s} missing from Hashrate");
+    }
+    plain("/hashrate", &p.body);
+    let r = br.act("/hashrate", "/hashrate", &[("action", "rent"), ("key", "02bb"), ("miners", "1"), ("budget", "4000"), ("minutes", "60")]);
+    assert!(br.flash_after(&r).starts_with("Renting."));
+    let rent = rseen.lock().unwrap().iter().find(|(m, p, _, _)| m == "POST" && p == "/rent").cloned().unwrap();
+    let body: Value = serde_json::from_str(&rent.3).unwrap();
+    assert_eq!((body["linkKey"].clone(), body["miners"].clone(), body["budgetSats"].clone()), (json!("02bb"), json!(1), json!(4000)));
+    assert_eq!(rent.2, format!("Bearer {}", "r".repeat(64)));
+    // Live connections shows the rental, with its Cut button
+    let p = br.get("/connections");
+    assert!(p.body.contains("Rented hashrate") && p.body.contains("data-spent=\"200\""), "{}", p.body);
+    plain("/connections", &p.body);
+    let r = br.act("/connections", "/hashrate", &[("action", "cut"), ("rental", "r9"), ("back", "connections")]);
+    assert_eq!(r.location(), "./connections");
+    assert!(rseen.lock().unwrap().iter().any(|(m, p, _, b)| m == "POST" && p == "/cut" && b.contains("r9")));
+}
+
 // --- no setup on a box: the node connects itself, the box's login, the code, the player, your shop --
 
 /// The keys the app makes itself through the box's node: the Lightning page says it is connected by

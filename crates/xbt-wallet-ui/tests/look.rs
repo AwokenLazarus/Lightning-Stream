@@ -159,3 +159,54 @@ fn the_look_in_headless_chrome() {
     let extra = r["cost"]["with_river"]["still"]["cpu_pct_one_core"].as_f64().unwrap() - r["cost"]["without_river"]["still"]["cpu_pct_one_core"].as_f64().unwrap();
     assert!(extra < 3.0, "the river at rest costs under 3% of one core: {r}");
 }
+
+/// The Hashrate pages against running hashrate services (`XBT_UI_HASH_SHOTS=1`, with
+/// `XBT_UI_HASH_HASHER` and `XBT_UI_HASH_RENTER` their control pages, `XBT_UI_HASH_TOKEN` the
+/// token file): screenshots of Sell → Hashrate, Services → Hashrate and Live connections, in light,
+/// dark and at phone width, into `$XBT_UI_LOOK_DIR`.
+#[test]
+fn the_hashrate_pages_in_headless_chrome() {
+    if std::env::var("XBT_UI_HASH_SHOTS").ok().as_deref() != Some("1") {
+        return eprintln!("set XBT_UI_HASH_SHOTS=1 (and the services' addresses) to shoot the Hashrate pages: skipped");
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let find = |c: &[String]| c.iter().find(|c| std::process::Command::new(c).arg("--version").output().is_ok_and(|o| o.status.success())).cloned();
+    let (Some(node), Some(chrome)) = (find(&["node".into(), format!("{home}/.local/share/nodejs/bin/node")]),
+                                      find(&[std::env::var("CHROME").unwrap_or_else(|_| "google-chrome".into()), "chromium".into()])) else {
+        return eprintln!("node or chrome not found: skipped");
+    };
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let rig = Rig::new(json!({"human_pubkey": ""}), true);
+    let sock_path = rig.dir.path().join("signer.sock");
+    let _sock = xbt_signer::server::spawn(rig.s.clone(), &sock_path, false).unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let mut cfg = Config::for_test(sock_path, data.path().join("ui"), "127.0.0.1:0");
+    cfg.sell = true;
+    cfg.gw.dir = data.path().join("gateway");
+    std::fs::create_dir_all(&cfg.gw.dir).unwrap();
+    cfg.gw.node_rest = Some("https://10.21.21.66:8180".into());
+    let token = std::env::var("XBT_UI_HASH_TOKEN").ok().map(std::path::PathBuf::from);
+    cfg.hash.hasher = std::env::var("XBT_UI_HASH_HASHER").ok();
+    cfg.hash.hasher_token = token.clone();
+    cfg.hash.renter = std::env::var("XBT_UI_HASH_RENTER").ok();
+    cfg.hash.renter_token = token;
+    cfg.hash.settings = data.path().join("hashrate/settings.json");
+    let srv = xbt_wallet_ui::server::spawn(App::new(cfg).unwrap()).unwrap();
+    let gdata = tempfile::tempdir().unwrap();
+    let mut gcfg = Config::for_test(gdata.path().join("no-signer.sock"), gdata.path().join("ui"), "127.0.0.1:0");
+    gcfg.role = Role::Gateway;
+    gcfg.gw.dir = gdata.path().join("gateway");
+    std::fs::create_dir_all(&gcfg.gw.dir).unwrap();
+    let gsrv = xbt_wallet_ui::server::spawn(App::new(gcfg).unwrap()).unwrap();
+    let code = std::fs::read_to_string(data.path().join("ui/setup-code")).unwrap();
+    let gcode = std::fs::read_to_string(gdata.path().join("ui/setup-code")).unwrap();
+    let out = std::env::var("XBT_UI_LOOK_DIR").unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/ui-look").into());
+    let pages = json!([["sell-hashrate", "/sell-hashrate"], ["hashrate", "/hashrate"], ["live-hashrate", "/connections"]]).to_string();
+    let o = std::process::Command::new(node).env("CHROME", chrome)
+        .args([concat!(env!("CARGO_MANIFEST_DIR"), "/tests/js/look_test.mjs"), &format!("http://{}", srv.addr), code.trim(),
+               &format!("http://{}", gsrv.addr), gcode.trim(), &out, "/connections", "2", &pages])
+        .output().unwrap();
+    let text = String::from_utf8_lossy(&o.stdout);
+    eprintln!("{text}{}", String::from_utf8_lossy(&o.stderr));
+    assert!(o.status.success());
+}

@@ -51,9 +51,9 @@ REGISTRY = "ghcr.io/awokenlazarus"
 # the one image of this store that is not published: the stand-in XBT node (lazarus-xbt-knots), amd64-only, which
 # a box with Paul's Knots BLAKE2b Companion never installs
 LOCAL_ONLY = {"lazarus-xbt-knots": re.compile(r"^xbt-a3-knots:29\.4\.2$")}
-# the connector has no line in images.lock yet. oci_build.sh --load tags it lightning-stream:0.1.0.
-# A digest is not invented here. Anything else (a registry name, a made-up digest) still fails.
-UNPUBLISHED = re.compile(r"^lightning-stream:0\.1\.0$")
+# the connector and xbt-hashlink have no line in images.lock yet. oci_build.sh --load tags them
+# <image>:0.1.0. A digest is not invented here. Anything else (a registry name, a made-up digest) still fails.
+UNPUBLISHED = re.compile(r"^(lightning-stream|xbt-hashlink):0\.1\.0$")
 # the stream directory the connector writes, inside the signer's socket dir. Read-write, and the
 # only extra mount it may have. It does not get the signer's state.
 STREAM_MOUNT = "${APP_DATA_DIR}/data/run/signer/streams:/data/run/signer/streams"
@@ -64,11 +64,15 @@ AGENTPAY = {
     "xbt-anchor-witness": ("witness", {"anchor"}, set()),
     # run/ui holds the UI-owned MCP token; the MCP may only read it
     "xbt-wallet-mcp": ("mcp", set(), {"signer", "ui"}),
-    # the setup pages write run/ln (the rail macaroon) and run/gateway (the gateway's config and macaroons)
-    "xbt-wallet-ui": ("ui", {"ui", "ln", "gateway"}, {"signer", "enroll"}),
+    # the setup pages write run/ln (the rail macaroon), run/gateway (the gateway's config and macaroons)
+    # and run/hashrate (the hasher's settings)
+    "xbt-wallet-ui": ("ui", {"ui", "ln", "gateway", "hashrate"}, {"signer", "enroll"}),
     "xbt-gateway": ("gateway", set(), {"gateway"}),
     # no state of its own. The control socket is read-only; the stream sockets are STREAM_MOUNT.
     "lightning-stream": (None, set(), {"signer"}),
+    # the hasher and the renter: their keys and state; the settings and token read-only; the renter
+    # also the signer's socket, read-only
+    "xbt-hashlink": ("hashrate", set(), {"hashrate", "signer"}),
 }
 # the Lightning node's certificate: the only file of another app's data a service here may mount
 CERT_MOUNT = {"type": "bind", "source": "${APP_LIGHTNING_FORK_NODE_DATA_DIR}/tls.cert", "target": "/data/lightning/tls.cert", "read_only": True,

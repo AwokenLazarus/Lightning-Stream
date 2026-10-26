@@ -1,7 +1,7 @@
 # The images, one per service, FROM scratch (docs/CONTAINER.md): the signer, the anchor witness, the MCP
 # server, the wallet UI, xbt-init (the one-shot that fixes a bind mount's owners before the services
-# start), xbt-work-relay (the blinded receipt relay of pay-with-work), xbt-gateway (the seller gateway)
-# and lightning-stream (the connector).
+# start), xbt-work-relay (the blinded receipt relay of pay-with-work), xbt-gateway (the seller gateway),
+# lightning-stream (the connector) and xbt-hashlink (p2p-hash).
 # Built by scripts/oci_build.sh with docker buildx for linux/amd64, linux/arm64 and linux/arm/v7 from the
 # static musl binaries it stages under bin/<arch>/. There is no RUN, so no emulator is needed.
 # Layer 1 (base.tar: passwd/group, /tmp, the /data skeleton with each component's owner) is byte-identical
@@ -95,6 +95,16 @@ USER xbt-signer
 ENV LS_LISTEN=127.0.0.1:8484
 ENTRYPOINT ["/usr/bin/lightning-stream"]
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 CMD ["/usr/bin/lightning-stream", "healthcheck"]
+
+# p2p-hash: the hasher's service (miners in, renters' links in, paid pieces of work in) and the
+# renter's (offers from Nostr, rentals into the owner's DATUM Gateway, paid through the signer: its
+# user is in the signer's group for the socket). One binary, xbt-hashlink, run as xbt-hashrate.
+FROM base AS xbt-hashlink
+ARG TARGETARCH
+ARG TARGETVARIANT
+COPY --chmod=0555 bin/${TARGETARCH}${TARGETVARIANT}/xbt-hashlink /usr/bin/xbt-hashlink
+USER xbt-hashrate
+ENTRYPOINT ["/usr/bin/xbt-hashlink"]
 
 # The one image that runs as root: it exits once the data dir's owners and modes are right. Run it with
 # cap_drop ALL + CHOWN, FOWNER, DAC_OVERRIDE, no network, read-only (docs/CONTAINER.md §7).

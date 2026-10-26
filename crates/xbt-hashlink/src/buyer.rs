@@ -2,6 +2,11 @@
 //! each of the hasher's miners, carry the lines both ways (the gateway credits the buyer: its
 //! user name replaces the miner's), meter the gateway's verdicts, and pay each finished slice by
 //! releasing its ticket with a signed work receipt. Two tickets are kept locked ahead.
+//!
+//! A channel's meter is let go only after its upstream session has ended and its last verdict
+//! was sent on: the buyer then says `shut`, and the hasher lets the channel go at that same
+//! point, so both count the same work to the end. When the buyer ends the rental it says how many
+//! slices it counted.
 
 use crate::link::{self, Sender};
 use crate::meter::{Event, Meter, Receipt};
@@ -14,6 +19,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -38,6 +44,14 @@ pub struct Config {
     /// Slices paid by the wallet through the hasher's gateway; without it, over the link (the
     /// lab's stand-in rail).
     pub payer: Option<SignerPayer>,
+    /// How many of the hasher's miners to rent (0: as many as are free).
+    pub miners: u32,
+    /// The most the rental may cost: it ends once that much is paid.
+    pub budget_msat: Option<u64>,
+    /// Set to end the rental now (the app's Cut button).
+    pub cut: Option<Arc<AtomicBool>>,
+    /// The report, kept current (twice a second) for the app's pages.
+    pub live: Option<Arc<Mutex<Value>>>,
 }
 
 /// Tickets kept locked ahead of the work.
@@ -64,6 +78,7 @@ struct St {
     queue: Option<mpsc::Sender<(u64, Value)>>,
     /// The wallet refused or failed a slice: no later slice is asked for.
     pay_failed: bool,
+    budget_msat: Option<u64>,
 }
 
 impl St {
@@ -99,6 +114,9 @@ impl St {
             if self.stop_paying_after.is_some_and(|n| slice > n) {
                 return;
             }
+            if self.budget_msat.is_some_and(|b| slice * self.terms.price_msat > b) {
+                return;
+            }
             let receipt = Receipt {
                 rental: self.rental.clone(),
                 slice,
@@ -126,12 +144,23 @@ impl St {
         }
     }
 
+    /// Slices paid: by the wallet (its answers), or released over the link.
+    fn paid_slices(&self) -> u64 {
+        if self.queue.is_some() || !self.pays.is_empty() && self.pays.iter().any(|p| p.get("ok").is_some()) {
+            self.pays.iter().filter(|p| p["ok"] == true).count() as u64
+        } else {
+            self.released
+        }
+    }
+
     fn report(&self) -> Value {
         json!({
             "role": "buyer", "rental": self.rental, "terms": self.terms.to_json(), "meter": self.meter.to_json(),
             "slicesDone": self.done.iter().map(|(w, t)| json!({"work": w.to_string(), "atMs": t})).collect::<Vec<_>>(),
             "released": self.released, "locked": self.locked, "pays": self.pays, "receipts": self.receipts,
             "lastRate": self.rate, "closed": self.closed, "payFailed": self.pay_failed, "events": self.events,
+            "paidSlices": self.paid_slices(), "spentMsat": self.paid_slices() * self.terms.price_msat,
+            "miners": self.upstreams.len(), "budgetMsat": self.budget_msat,
         })
     }
 }
@@ -149,11 +178,11 @@ fn write_report(path: &Option<PathBuf>, v: &Value) {
 /// tickets; whatever is still locked at the end is cancelled.
 pub fn run(cfg: Config, rail: Box<dyn BuyerRail>) -> Result<Value, String> {
     let link::Link { tx, mut rx, .. } = link::dial(&cfg.hasher, cfg.key, cfg.hasher_key).map_err(|e| e.to_string())?;
-    tx.send(&Msg::Hello { rental: cfg.rental.clone(), listing: cfg.listing.clone(), terms: cfg.terms.clone() })
+    tx.send(&Msg::Hello { rental: cfg.rental.clone(), listing: cfg.listing.clone(), terms: cfg.terms.clone(), miners: cfg.miners })
         .map_err(|e| e.to_string())?;
     match rx.recv().map_err(|e| e.to_string())? {
         Some(Msg::Welcome { terms_hash, .. }) if terms_hash == hex::encode(cfg.terms.hash()) => {}
-        Some(Msg::Close { reason }) => return Err(format!("hasher refused: {reason}")),
+        Some(Msg::Close { reason, .. }) => return Err(format!("hasher refused: {reason}")),
         _ => return Err("no welcome".into()),
     }
     eprintln!("buyer: rental {} with hasher {}", cfg.rental, cfg.hasher);
@@ -176,6 +205,7 @@ pub fn run(cfg: Config, rail: Box<dyn BuyerRail>) -> Result<Value, String> {
         closed: None,
         queue: None,
         pay_failed: false,
+        budget_msat: cfg.budget_msat,
     }));
     lock(&st).lock_ahead(&tx);
 
@@ -211,15 +241,24 @@ pub fn run(cfg: Config, rail: Box<dyn BuyerRail>) -> Result<Value, String> {
         let st = st.clone();
         let tx = tx.clone();
         let report = cfg.report.clone();
-        let (idle, duration) = (cfg.idle, cfg.duration);
+        let (idle, duration, cut, live) = (cfg.idle, cfg.duration, cfg.cut.clone(), cfg.live.clone());
         let t0 = Instant::now();
         std::thread::spawn(move || loop {
             std::thread::sleep(Duration::from_millis(500));
             let mut g = lock(&st);
+            if let Some(l) = &live {
+                *l.lock().unwrap_or_else(|p| p.into_inner()) = g.report();
+            }
             if g.closed.is_some() {
                 return;
             }
-            let why = if g.last_work.elapsed() > idle {
+            let spent = g.released * g.terms.price_msat;
+            let why = if cut.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+                Some("cut by the buyer")
+            } else if g.budget_msat.is_some_and(|b| spent + g.terms.price_msat > b) {
+                // the next piece could not be paid: end before the hasher does it
+                Some("budget used up")
+            } else if g.last_work.elapsed() > idle {
                 Some("no accepted work")
             } else if duration.is_some_and(|d| t0.elapsed() > d) {
                 Some("rental time over")
@@ -228,7 +267,8 @@ pub fn run(cfg: Config, rail: Box<dyn BuyerRail>) -> Result<Value, String> {
             };
             if let Some(why) = why {
                 g.closed = Some(why.to_string());
-                let _ = tx.send(&Msg::Close { reason: why.into() });
+                let slices = g.done.len() as u64;
+                let _ = tx.send(&Msg::Close { reason: why.into(), slices: Some(slices) });
                 tx.shutdown();
                 return;
             }
@@ -260,6 +300,7 @@ pub fn run(cfg: Config, rail: Box<dyn BuyerRail>) -> Result<Value, String> {
                         std::thread::spawn(move || upstream(chan, u, st, tx));
                     }
                     Err(_) => {
+                        g.meter.close(chan);
                         let _ = tx.send(&Msg::Shut { chan });
                     }
                 }
@@ -277,17 +318,18 @@ pub fn run(cfg: Config, rail: Box<dyn BuyerRail>) -> Result<Value, String> {
                 }
             }
             Msg::Shut { chan } => {
+                // the miner is gone: close its upstream session; the channel is let go (and the
+                // hasher told) when that session's last verdict has been read
                 let mut g = lock(&st);
                 if let Some(u) = g.upstreams.remove(&chan) {
                     let _ = u.shutdown(std::net::Shutdown::Both);
                 }
-                g.meter.close(chan);
             }
             Msg::Rate { hs, miners } => lock(&st).rate = Some(json!({"hs": hs, "miners": miners, "atMs": now_ms()})),
             Msg::Ping { n } => {
                 let _ = tx.send(&Msg::Pong { n });
             }
-            Msg::Close { reason } => {
+            Msg::Close { reason, .. } => {
                 // the hasher answers our own close with one of its own: the first reason stands
                 lock(&st).closed.get_or_insert_with(|| format!("hasher closed: {reason}"));
                 break;
@@ -315,6 +357,9 @@ pub fn run(cfg: Config, rail: Box<dyn BuyerRail>) -> Result<Value, String> {
     tx.shutdown();
     let r = g.report();
     write_report(&cfg.report, &r);
+    if let Some(l) = &cfg.live {
+        *l.lock().unwrap_or_else(|p| p.into_inner()) = r.clone();
+    }
     Ok(r)
 }
 
@@ -346,8 +391,9 @@ fn upstream(chan: u32, u: TcpStream, st: Arc<Mutex<St>>, tx: Sender) {
             g.settle_up(&tx);
         }
     }
+    // this channel's last verdict has been read and sent: both sides let it go here
     let mut g = st.lock().unwrap_or_else(|p| p.into_inner());
-    if g.upstreams.remove(&chan).is_some() {
-        let _ = tx.send(&Msg::Shut { chan });
-    }
+    g.upstreams.remove(&chan);
+    g.meter.close(chan);
+    let _ = tx.send(&Msg::Shut { chan });
 }

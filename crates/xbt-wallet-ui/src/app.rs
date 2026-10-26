@@ -12,7 +12,7 @@ use serde_json::{json, Map, Value};
 use crate::auth::Auth;
 use crate::config::{Config, Role};
 use crate::html::{esc, escv, int, json_block, kv, page, sats, short, txt, utc, Nav, Section, GATEWAY_BRAND, GATEWAY_SECTIONS, STREAM_BRAND, STREAM_SECTIONS,
-                  WALLET_BRAND, WALLET_SECTIONS};
+                  STREAM_SECTIONS_HASH, WALLET_BRAND, WALLET_SECTIONS, WALLET_SECTIONS_HASH};
 use crate::link::SignerLink;
 use crate::relay::RelayLinks;
 use crate::server::{strip_base, Req, Resp};
@@ -28,6 +28,8 @@ pub(crate) mod sell;
 pub mod services_page;
 #[path = "nostr_pages.rs"]
 mod nostr_pages;
+#[path = "hashrate.rs"]
+pub(crate) mod hashrate;
 
 pub const COOKIE: &str = "xbtui";
 /// How long a signed form stays valid.
@@ -364,6 +366,8 @@ impl App {
             "/service" => self.service_page(&ctx, &req.query),
             "/services" => self.services_page(&ctx),
             "/sell" if self.cfg.sell => self.sell_page(&ctx, &req.query),
+            "/sell-hashrate" if self.cfg.sell => self.sell_hashrate_page(&ctx),
+            "/hashrate" => self.hashrate_page(&ctx),
             "/nostr" => self.nostr_page(&ctx, &req.query),
             "/play" => self.play(&ctx, &req),
             "/connections" => self.connections(&ctx),
@@ -400,8 +404,11 @@ impl App {
     }
 
     pub(crate) fn nav<'a>(&self, active: &'a str, csrf: &'a str, logged_in: bool) -> Nav<'a> {
+        let hash = self.cfg.hash.hasher.is_some() || self.cfg.hash.renter.is_some();
         let (sections, brand): (&'static [&'static Section], &'static str) = match self.cfg.role {
+            Role::Wallet if self.cfg.sell && hash => (&STREAM_SECTIONS_HASH, STREAM_BRAND),
             Role::Wallet if self.cfg.sell => (&STREAM_SECTIONS, STREAM_BRAND),
+            Role::Wallet if hash => (&WALLET_SECTIONS_HASH, WALLET_BRAND),
             Role::Wallet => (&WALLET_SECTIONS, WALLET_BRAND),
             Role::Gateway => (&GATEWAY_SECTIONS, GATEWAY_BRAND),
         };
@@ -525,6 +532,8 @@ impl App {
             "/play" => self.play_stop(ctx, f),
             "/services" => self.services_post(ctx, f),
             "/sell" if self.cfg.sell => self.sell_post(ctx, f),
+            "/sell-hashrate" if self.cfg.sell => self.sell_hashrate_post(ctx, f),
+            "/hashrate" => self.hashrate_post(ctx, f),
             "/play-link" => self.play_link(ctx, f),
             "/nostr-check" => self.nostr_check(ctx, f),
             "/connections" => self.connections_stop(ctx, f),

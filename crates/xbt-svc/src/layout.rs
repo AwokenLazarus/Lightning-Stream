@@ -40,6 +40,7 @@ pub const COMPONENTS: &[Component] = &[
     Component { name: crate::UI, user: "xbt-wallet-ui", uid: 10005 },
     Component { name: crate::RELAY, user: "xbt-work-relay", uid: 10006 },
     Component { name: crate::GATEWAY, user: "xbt-gateway", uid: 10007 },
+    Component { name: crate::HASHRATE, user: "xbt-hashrate", uid: 10010 },
 ];
 
 /// The group of the wallet's Lightning rail files (`run/ln/`): the signer is its only member, so the
@@ -70,7 +71,14 @@ pub const SHARED_DIRS: &[SharedDir] = &[
     SharedDir { dir: crate::RUN_LN, writer: crate::UI, reader: crate::SIGNER, gid: LN_RAIL_GID, mode: 0o750 },
     SharedDir { dir: crate::RUN_GATEWAY, writer: crate::UI, reader: crate::GATEWAY, gid: 10007, mode: 0o750 },
     SharedDir { dir: crate::RUN_ENROLL, writer: crate::SIGNER, reader: crate::UI, gid: ENROLL_GID, mode: 0o750 },
+    SharedDir { dir: crate::RUN_HASHRATE, writer: crate::UI, reader: crate::HASHRATE, gid: HASHRATE_GID, mode: 0o750 },
 ];
+
+/// The hashrate services' group: the settings the UI writes in `run/hashrate/`, and their control token.
+pub const HASHRATE_GID: u32 = 10010;
+/// The control token of the hashrate services, in `run/hashrate/`: the UI owns it and calls them with
+/// it; they read it by group (0640). Made once by init.
+pub const HASHRATE_TOKEN: &str = "control-token";
 
 /// The socket dirs: (dir under `run/`, the component that serves it).
 /// `signer/streams` comes after `signer`: a platform that mounts it on its own (to share it with the
@@ -256,15 +264,21 @@ fn own_dir_gid(dir: &Path, uid: u32, gid: u32, mode: u32, recurse: bool) -> Resu
 /// exclusively (never through a symlink a service may have planted) and renamed over the target.
 #[cfg(unix)]
 fn put_secret(path: &Path, value: &[u8], uid: u32, mode: u32) -> Result<&'static str, String> {
+    put_secret_gid(path, value, uid, uid, mode)
+}
+
+/// [`put_secret`] with a group of its own (a shared dir's, so its reader reads it by group).
+#[cfg(unix)]
+fn put_secret_gid(path: &Path, value: &[u8], uid: u32, gid: u32, mode: u32) -> Result<&'static str, String> {
     let ctx = |e: io::Error| format!("{}: {e}", path.display());
     if let Ok(mut f) = open_nofollow(path, false) {
         use std::os::unix::fs::MetadataExt;
         let md = f.metadata().map_err(ctx)?;
         let mut cur = vec![];
         if md.file_type().is_file() && std::io::Read::read_to_end(&mut f, &mut cur).is_ok() && cur == value {
-            if (md.uid(), md.gid(), md.mode() & 0o7777) != (uid, uid, mode) {
+            if (md.uid(), md.gid(), md.mode() & 0o7777) != (uid, gid, mode) {
                 use std::os::unix::fs::PermissionsExt;
-                std::os::unix::fs::fchown(&f, Some(uid), Some(uid)).map_err(ctx)?;
+                std::os::unix::fs::fchown(&f, Some(uid), Some(gid)).map_err(ctx)?;
                 f.set_permissions(std::fs::Permissions::from_mode(mode)).map_err(ctx)?;
                 return Ok("fixed");
             }
@@ -279,7 +293,7 @@ fn put_secret(path: &Path, value: &[u8], uid: u32, mode: u32) -> Result<&'static
     o.write(true).create_new(true);
     std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
     let mut f = o.open(&tmp).map_err(ctx)?;
-    std::os::unix::fs::fchown(&f, Some(uid), Some(uid)).map_err(ctx)?;
+    std::os::unix::fs::fchown(&f, Some(uid), Some(gid)).map_err(ctx)?;
     f.write_all(value).and_then(|_| f.sync_all()).map_err(ctx)?;
     if mode != 0o600 {
         use std::os::unix::fs::PermissionsExt;
@@ -375,6 +389,15 @@ fn init_with(root: &Path, names: &[String], prov: &Provision, uid_of: &dyn Fn(&C
             put(crate::MCP, crate::MCP_TOKEN, &read_regular(&tp).unwrap_or_else(fresh))?;
         }
     }
+    if has(crate::UI) && has(crate::HASHRATE) {
+        let path = root.join("run").join(crate::RUN_HASHRATE).join(HASHRATE_TOKEN);
+        let token = read_regular(&path).unwrap_or_else(|| crate::to_hex(&crate::random_bytes(32)).into_bytes());
+        let ui = uid_of(component(crate::UI).expect("known"));
+        // tests run every component as their own uid: the group is then theirs too
+        let gid = if ui == component(crate::UI).expect("known").uid { HASHRATE_GID } else { ui };
+        let r = put_secret_gid(&path, &token, ui, gid, MCP_TOKEN_MODE)?;
+        secrets.push(json!({"component": crate::UI, "name": format!("run/{}/{HASHRATE_TOKEN}", crate::RUN_HASHRATE), "result": r}));
+    }
     Ok(json!({"ok": true, "root": root.display().to_string(), "dirs": dirs, "secrets": secrets}))
 }
 
@@ -437,7 +460,7 @@ mod tests {
     #[test]
     fn table_matches_container_md() {
         let t: Vec<_> = COMPONENTS.iter().map(|c| (c.name, c.uid)).collect();
-        assert_eq!(t, vec![("signer", 10001), ("witness", 10002), ("mcp", 10003), ("ui", 10005), ("relay", 10006), ("gateway", 10007)]);
+        assert_eq!(t, vec![("signer", 10001), ("witness", 10002), ("mcp", 10003), ("ui", 10005), ("relay", 10006), ("gateway", 10007), ("hashrate", 10010)]);
     }
 
     #[test]
@@ -583,6 +606,19 @@ mod tests {
         let names: Vec<String> = ["signer", "mcp"].iter().map(|s| s.to_string()).collect();
         init_as(&root2, &names, &Provision::default(), uid).unwrap();
         assert!(!root2.join("run/ln").exists() && !root2.join("run/gateway").exists());
+        // with the hashrate services: their settings dir, and one control token the UI owns and
+        // they read by group, made once and kept across restarts
+        let root3 = t.path().join("hashrate");
+        let names: Vec<String> = ["signer", "ui", "hashrate"].iter().map(|s| s.to_string()).collect();
+        init_as(&root3, &names, &Provision::default(), uid).unwrap();
+        assert_eq!(std::fs::metadata(root3.join("run/hashrate")).unwrap().mode() & 0o7777, 0o750);
+        let tok = root3.join("run/hashrate").join(HASHRATE_TOKEN);
+        let first = std::fs::read(&tok).unwrap();
+        assert_eq!(first.len(), 64);
+        assert_eq!(std::fs::metadata(&tok).unwrap().mode() & 0o7777, 0o640);
+        init_as(&root3, &names, &Provision::default(), uid).unwrap();
+        assert_eq!(std::fs::read(&tok).unwrap(), first, "the token survives a restart");
+        assert!(!root.join("run/hashrate").exists(), "no hashrate dir without the hashrate component");
     }
 
     #[test]
