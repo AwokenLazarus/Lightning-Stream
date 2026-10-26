@@ -160,9 +160,9 @@ services:
       XBT_UI_SUGGESTED_SELLERS: https://media.lazarus-xbt.xyz
       # Nostr relays the Services page reads sellers' signed listings from (opt-in Nostr page)
       XBT_UI_NOSTR_RELAYS: wss://relay.damus.io,wss://nos.lol
-      # the box's own login proxy: a request through it is the owner's, logged in to the box, and needs
-      # no app password. Any other peer on the box network still needs the password
-      XBT_UI_PLATFORM_LOGIN: lazarus-lightning-stream_app_proxy_1
+      # no XBT_UI_PLATFORM_LOGIN: umbrelOS 2.0 runs no app-proxy container (umbreld proxies the port
+      # itself, after its own login), so that name is free for any other app to take on this network.
+      # The app password is Umbrel's deterministic one, shown on the app's page in the dashboard
       # the signer's one-time enrolment code: the setup page fills it in, so no log has to be read
       XBT_UI_ENROLL_CODE_FILE: /data/run/enroll/enroll-code
     volumes:

@@ -46,7 +46,7 @@ gallery:
   - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/5.png
 releaseNotes: >-
   0.1.4: no setup to connect your Lightning node (the app makes its own narrow keys through the node),
-  no app password when you open it from the Umbrel dashboard, no codes to read from logs, an approval
+  the app password shown on the app's page in the Umbrel dashboard, no codes to read from logs, an approval
   key backup you can download, "Allow this seller" in one signature, services on this box offered on
   the Sell page, help with an https address, a player that says why something does not play, and a
   free preview of your own shop (a box cannot buy from itself).
