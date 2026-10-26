@@ -22,11 +22,16 @@ impl App {
     pub(crate) fn browse(&self, ctx: &Ctx, q: &HashMap<String, String>) -> Resp {
         let kind = q.get("kind").map(String::as_str).unwrap_or("");
         let sort = Sort::parse(q.get("sort").map(String::as_str).unwrap_or(""));
-        let body = match self.services() {
+        let body = match self.file_services() {
             Ok(all) => browse_html(&all, kind, sort),
             Err(e) => format!("{}{}", Self::error_box(&e), empty_how()),
         };
-        self.html_page("Browse", ctx, &body, "")
+        let tabs = if self.nostr.enabled() {
+            "<p><strong>Your services</strong> · <a href=\"./nostr\">Nostr (unvetted)</a></p>"
+        } else {
+            ""
+        };
+        self.html_page("Browse", ctx, &format!("{tabs}{body}"), "")
     }
 
     pub(crate) fn play(&self, ctx: &Ctx, req: &Req) -> Resp {
@@ -144,7 +149,16 @@ impl App {
         format!("{}://{host}{base}", if https { "https" } else { "http" })
     }
 
+    /// What the player and the links for external players may open: the services file, and the
+    /// sellers the Nostr page last found (unvetted, shown on that page only).
     pub(crate) fn services(&self) -> Result<Vec<Service>, String> {
+        let mut all = self.file_services()?;
+        all.extend(self.nostr.services());
+        Ok(all)
+    }
+
+    /// The services file, as Browse lists it.
+    pub(crate) fn file_services(&self) -> Result<Vec<Service>, String> {
         match &self.cfg.services_file {
             Some(p) => services::load(p),
             // the default file exists once the Services page added a seller

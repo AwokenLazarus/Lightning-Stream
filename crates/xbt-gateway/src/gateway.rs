@@ -345,6 +345,21 @@ impl Gateway {
         self.credited.notify_all();
     }
 
+    /// The signed listing, as the well-known URL serves it; `None` without a listing section.
+    pub fn listing(&self) -> Option<Value> {
+        self.listing_doc()
+    }
+
+    /// The receipt key's binding of `nostr_pubkey` to this seller (`docs/NOSTR.md`).
+    pub fn bind_nostr(&self, nostr_pubkey: &[u8; 32]) -> String {
+        xbt402::listing::bind(&self.key, nostr_pubkey, &self.cfg.public_url)
+    }
+
+    /// [`Self::stop`] has run.
+    pub fn stopped(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+
     pub fn terms(&self) -> &Terms {
         &self.terms
     }

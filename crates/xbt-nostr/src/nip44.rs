@@ -1,4 +1,4 @@
-//! NIP-44 version 2: the encryption of NWC requests and responses.
+//! NIP-44 version 2: the encryption of NWC requests and responses, and of any other direct message.
 //!
 //! ECDH on secp256k1 (the shared point's x coordinate, unhashed), HKDF-SHA256 extract with the salt
 //! `nip44-v2` (the conversation key), HKDF expand with the message's 32-byte nonce into a ChaCha20

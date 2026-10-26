@@ -60,7 +60,7 @@ impl App {
             <label>Seller's address<input name=\"url\" type=\"url\" inputmode=\"url\" required placeholder=\"https://seller.example\" \
             pattern=\"https?://.+\" title=\"Paste the seller's web address, starting with https://\" autocomplete=\"off\"></label>\
             <button>Add seller</button></form>", App::csrf_input(ctx)));
-        match self.services() {
+        match self.file_services() {
             Err(e) => b.push_str(&App::error_box(&format!("The list of sellers could not be read: {e}"))),
             Ok(all) if all.is_empty() => b.push_str("<p class=\"empty\">No sellers yet. Add one above.</p>"),
             Ok(all) => {
@@ -107,7 +107,7 @@ impl App {
         }
         let listing = xbt402::listing::fetch(url, get).map_err(|e| format!("That seller's list could not be used: {e}."))?;
         let new = services::from_listing(&listing);
-        let mut all = self.services().unwrap_or_default();
+        let mut all = self.file_services().unwrap_or_default();
         let had = all.iter().any(|s| services::same_origin(&s.seller, &listing.seller));
         all.retain(|s| !services::same_origin(&s.seller, &listing.seller));
         let n = new.len();
@@ -117,7 +117,7 @@ impl App {
     }
 
     fn remove_seller(&self, url: &str) -> Result<String, String> {
-        let mut all = self.services()?;
+        let mut all = self.file_services()?;
         let before = all.len();
         all.retain(|s| !services::same_origin(&s.seller, url));
         if all.len() == before {

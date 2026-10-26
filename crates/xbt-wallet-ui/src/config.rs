@@ -29,6 +29,7 @@
 //! | `XBT_UI_MCP_TOKEN_FILE` | `$XBT_DATA_DIR/run/ui/mcp-http-token` when `XBT_DATA_DIR` is set, else `<data dir>/secrets/mcp-http-token` | the MCP bearer token, shown to the logged-in owner on the Agents page and rotated there (AGP-042). The UI owns it; the MCP only reads it (`xbt-init` makes it 0640, group `xbt-wallet-ui`). |
 //! | `XBT_UI_SERVICES` | `<data dir>/services.json` | path of the services JSON Browse and the player read (a list of `{name, kind, seller, price_text, items}`); the Services page writes it |
 //! | `XBT_UI_SELL` | `0` | `1`: the wallet's UI also has the Sell page (`/sell`), which sets up the gateway beside it (the `XBT_UI_GW_*` settings); the app is then branded Lightning Stream |
+//! | `XBT_UI_NOSTR_RELAYS` | | Nostr relays to read sellers' signed listings from (`wss://`, comma-separated), for Browse's Nostr page. Unset: no relay is ever asked |
 //! | `XBT_UI_NWC_SOCK` | | the NWC wallet service's admin socket (`xbt-nwc`'s `NWC_ADMIN_SOCK`): the Connected apps page makes, lists and revokes NWC connections there |
 //! | `XBT_UI_CONNECTOR` | `http://127.0.0.1:8480` | the connector the player loads video from (`<connector>/s/<item URL>`). That is also the connector's default listen address, and the UI's own default bind: on one machine set one of the two ports. |
 //! | `XBT_UI_RELAY_LINK_S` | `21600` (6 hours) | how long a link for an external player (VLC, mpv) made on the Player page lives (60 s to 7 days) |
@@ -68,6 +69,8 @@ pub struct Config {
     pub relay_ttl: Duration,
     /// `XBT_UI_NWC_SOCK`: the NWC wallet service's admin socket, when the box runs it.
     pub nwc_sock: Option<PathBuf>,
+    /// `XBT_UI_NOSTR_RELAYS`: where Browse's Nostr page reads listings; empty: it reads none.
+    pub nostr_relays: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +106,18 @@ pub struct GatewaySetup {
 
 fn env(k: &str) -> Option<String> {
     std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
+/// The relays of `XBT_UI_NOSTR_RELAYS`: each a `wss://` URL (`ws://` only to this machine), at most ten.
+pub fn nostr_relays(v: Option<&str>) -> Result<Vec<String>, String> {
+    let list: Vec<String> = v.unwrap_or("").split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    if list.len() > 10 {
+        return Err("XBT_UI_NOSTR_RELAYS: at most 10 relays".into());
+    }
+    for r in &list {
+        xbt_nostr::ws::parse_url(r).map_err(|e| format!("XBT_UI_NOSTR_RELAYS {r}: {e}"))?;
+    }
+    Ok(list)
 }
 
 pub fn normalize_base(b: &str) -> String {
@@ -195,6 +210,7 @@ impl Config {
             connector: env("XBT_UI_CONNECTOR").unwrap_or_else(|| "http://127.0.0.1:8480".into()),
             relay_ttl: Duration::from_secs(secs("XBT_UI_RELAY_LINK_S", 6 * 3600).clamp(60, 7 * 86_400)),
             nwc_sock: env("XBT_UI_NWC_SOCK").map(PathBuf::from),
+            nostr_relays: nostr_relays(env("XBT_UI_NOSTR_RELAYS").as_deref())?,
         })
     }
 
@@ -210,6 +226,6 @@ impl Config {
                cmp_status_url: None, mcp_urls: vec![], mcp_token_file: PathBuf::from("/nonexistent/mcp-http-token"), threads: 4, role: Role::Wallet,
                ln: LnSetup::default(), gw: GatewaySetup { state_dir: "/data/gateway".into(), port: 8402, ..Default::default() },
                services_file: None, sell: false, connector: "http://127.0.0.1:8480".into(), relay_ttl: Duration::from_secs(6 * 3600),
-               nwc_sock: None }
+               nwc_sock: None, nostr_relays: vec![] }
     }
 }

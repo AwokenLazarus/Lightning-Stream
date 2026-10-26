@@ -14,7 +14,8 @@ different key, or a different origin, is not that seller's catalog.
 No directory and no relay is part of this. A buyer who already has a seller's URL fetches the
 listing from it. To read the terms, the buyer asks that URL; when it is not a priced path (a seller
 whose `/` is no route answers 404), it asks the paths the listing sells under, all on the same
-origin.
+origin. A seller can also publish the same signed document on Nostr, so that buyers who do not
+have its URL can find it (`docs/NOSTR.md`).
 
 There are two versions. `listing/0` describes one service. `listing/1` lists several, each sold
 under a route of its own (a media server at `/`, a model's API at `/ai/`); it is described after

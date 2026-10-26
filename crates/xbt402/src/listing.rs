@@ -418,6 +418,39 @@ fn strip_serve(m: &Map<String, Value>) -> Map<String, Value> {
     o
 }
 
+/// The tag of the binding of a Nostr key to a seller (`docs/NOSTR.md`). Two fields: the Nostr
+/// public key (32 bytes, x-only) and the seller's canonical origin.
+const BIND_TAG: &str = "xbt402/nostr-bind/0";
+
+/// The 32 bytes the receipt key signs to say that `nostr_pubkey` publishes `seller`'s listing.
+pub fn bind_message(nostr_pubkey: &[u8; 32], seller: &str) -> [u8; 32] {
+    let mut h = tagged(BIND_TAG);
+    put_field(&mut h, nostr_pubkey);
+    put_field(&mut h, canonical_origin(seller).as_bytes());
+    h.finalize().into()
+}
+
+/// Hex of the DER signature binding `nostr_pubkey` to `seller`, by the receipt key.
+pub fn bind(sk: &SecretKey, nostr_pubkey: &[u8; 32], seller: &str) -> String {
+    hex::encode(ecdsa::sign(sk, &bind_message(nostr_pubkey, seller)))
+}
+
+/// Whether `sig_hex` is `receipt_key`'s binding of `nostr_pubkey` to `seller`.
+pub fn verify_bind(receipt_key: &str, nostr_pubkey: &[u8; 32], seller: &str, sig_hex: &str) -> bool {
+    match (hex::decode(receipt_key), hex::decode(sig_hex)) {
+        (Ok(pk), Ok(sig)) => ecdsa::verify(&pk, &bind_message(nostr_pubkey, seller), &sig),
+        _ => false,
+    }
+}
+
+/// A listing read without a seller URL to check it against (from a Nostr relay): the signature
+/// verifies under the receipt key the document names. Who that key belongs to is not known until
+/// the seller's own 402 terms name it ([`fetch`]).
+pub fn verify_self(doc: &Value) -> Result<Listing, String> {
+    let key = doc.get("receipt_key").and_then(Value::as_str).ok_or("receipt_key is missing")?;
+    verify(doc, key)
+}
+
 fn terms_key(page: &Page) -> Result<String, String> {
     if page.status != 402 {
         return Err("the seller did not answer 402".into());

@@ -1,0 +1,30 @@
+[package]
+name = "xbt-nostr"
+description = "Nostr for Lightning Stream: events and BIP-340 signatures, NIP-44 v2, a WebSocket client and relay pool, a stand-in relay for tests, and sellers' signed listings published and read as NIP-99 classified listings"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# the signed listing (listing/0) and the receipt key's binding of a Nostr key to a seller
+xbt402.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+base64.workspace = true
+getrandom = "0.2"
+# NIP-44 v2 and Nostr events: ECDH and BIP-340 Schnorr (secp256k1), HKDF and HMAC (hmac + sha2),
+# ChaCha20. All already in the tree: chacha20 comes with xbt-work's chacha20poly1305
+secp256k1.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+chacha20 = "0.9.1"
+# wss:// to relays: the tree's rustls (as the gateway and the signer use it), with Mozilla's roots
+# (already in the tree through ureq), and ring's SHA-1 for the WebSocket handshake's accept check
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+ring = "0.17"
+
+[dev-dependencies]
+xbt-primitives.workspace = true

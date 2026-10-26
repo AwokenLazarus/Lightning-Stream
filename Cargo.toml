@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/xbt-primitives", "crates/xbt402", "crates/xbt-signer", "crates/xbt-wallet-mcp", "crates/xbt-svc", "crates/xbt-wallet-ui", "crates/xbt-work", "crates/xbt-work-relay", "crates/xbt-gateway", "crates/lightning-stream", "crates/xbt-nwc"]
+members = ["crates/xbt-primitives", "crates/xbt402", "crates/xbt-signer", "crates/xbt-wallet-mcp", "crates/xbt-svc", "crates/xbt-wallet-ui", "crates/xbt-work", "crates/xbt-work-relay", "crates/xbt-gateway", "crates/lightning-stream", "crates/xbt-nwc", "crates/xbt-nostr"]
 # ureq 2.12.1 with one patch (a chunked body cut short is an error): see vendor/ureq/XBT-PATCH.md
 exclude = ["vendor"]
 
@@ -31,6 +31,7 @@ xbt402 = { path = "crates/xbt402" }
 xbt-signer = { path = "crates/xbt-signer" }
 xbt-svc = { path = "crates/xbt-svc" }
 xbt-work = { path = "crates/xbt-work" }
+xbt-nostr = { path = "crates/xbt-nostr" }
 
 # scrypt (the UI login hash, the signer's passphrase keystore) is unusably slow unoptimised in tests
 [profile.dev.package.scrypt]

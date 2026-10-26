@@ -80,7 +80,7 @@ impl Pool {
             let (tx, rx) = mpsc::channel();
             let status = Arc::new(Mutex::new(RelayStatus::default()));
             let (hub, url, st) = (self.hub.clone(), u.clone(), status.clone());
-            let _ = std::thread::Builder::new().name("nwc-relay".into()).spawn(move || run(url, hub, rx, st));
+            let _ = std::thread::Builder::new().name("nostr-relay".into()).spawn(move || run(url, hub, rx, st));
             rs.insert(u.clone(), Relay { tx, status });
         }
     }
@@ -206,7 +206,7 @@ fn run(url: String, hub: Weak<dyn Hub>, rx: Receiver<Out>, st: Arc<Mutex<RelaySt
             }
             if last_ping.elapsed() > KEEPALIVE {
                 last_ping = Instant::now();
-                if let Err(e) = ws.send_ping(b"nwc") {
+                if let Err(e) = ws.send_ping(b"xbt") {
                     err = Some(e.to_string());
                 }
             }
