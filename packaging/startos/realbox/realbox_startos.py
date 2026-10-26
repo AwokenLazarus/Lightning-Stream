@@ -261,6 +261,7 @@ def phase_wallet_start():
     check("I", "wallet: the Node connection action (a critical task) takes the stand-in's chain node; its task is done",
           "xbt-agent-wallet:node-config" not in tasks, tasks)
     cli("package", "start", W)
+    cli("package", "start", G)  # its setup page gives the code the owner phase reads
     try:
         wait_until(lambda: (lambda h: h[0].get("wallet-ready", (None,))[0] == "success")(health(W)), 300, "wallet-ready", every=5)
     except RuntimeError:
@@ -380,8 +381,8 @@ def phase_buy():
     agent = Mcp(f"https://{HOST}:{S[f'lan_{W}_mcp']}", S["mcp_token"])
     agent.start()
     sc = lambda m, p=None: json.loads(attach(W, "signer-sub", "/usr/bin/xbt-signer", "call", m, json.dumps(p or {})))  # noqa: E731
-    gip = container_ip(G)
-    origin = f"http://{gip}:8402"
+    # the gateway takes only an https origin (or plain http on loopback): its LAN https interface, the OS's TLS proxy
+    origin = f"https://{HOST}:{enable_lan(G, 'gateway', 8402)}"
     S["gateway_origin"] = origin
     upstream = f"http://{S['lf_ip']}:8090"  # nothing serves there: the buy is refused before any request is passed on
     st, flash = rl.gateway_owner_setup(gui, dict(f, upstream=upstream), origin)
@@ -410,7 +411,11 @@ def phase_buy():
         r = {"error": str(e)}
     S["buy_attempt"] = r
     save()
-    check("T", "the paid buy on one StartOS box: the wallet refuses a seller at a private http address (expected; see the report)",
+    lock = json.loads(http("POST", f"{origin}/x402/ticket/lock", json.dumps({"version": "ticket/0", "settle": "on-arrival", "count": 1}).encode(),
+                           {"Content-Type": "application/json"})[2] or "{}")
+    check("T", "the gateway makes a prepaid ticket's invoice on the dependency's node over its LAN https interface",
+          any(t.get("invoice", "").startswith("lnbcrt") for t in lock.get("tickets", [])), {k: lock.get(k) for k in ("refused", "error")})
+    check("T", "the paid buy on one StartOS box does not complete: the wallet's connection to the LAN interface fails (it has the server's own CA, not a public one)",
           r.get("status") != 200, {k: r.get(k) for k in ("verdict", "rail", "status", "reason", "rails_passed_over", "error")})
 
 

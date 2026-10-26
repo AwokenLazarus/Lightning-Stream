@@ -100,6 +100,11 @@ fn serve() -> i32 {
             return 2;
         }
     };
+    match xbt_wallet_ui::setup::follow_node(&cfg.gw) {
+        Ok(true) => eprintln!("xbt-wallet-ui: the gateway's config now names the node at {}", cfg.gw.node_rest.as_deref().unwrap_or("")),
+        Ok(false) => {}
+        Err(e) => eprintln!("xbt-wallet-ui: the gateway's config was left as it was: {e}"),
+    }
     let app = match xbt_wallet_ui::app::App::new(cfg) {
         Ok(a) => a,
         Err(e) => {

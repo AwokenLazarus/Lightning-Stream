@@ -5,7 +5,7 @@ const RPC = ['--bitcoind.rpchost=127.0.0.1:18443', '--bitcoind.rpcuser=lab', '--
 const lnd = (alias: string, grpc: number, rest: number, p2p: number): [string, ...string[]] => ['/usr/local/bin/lnd', '--lnddir=/data', '--noseedbackup',
   '--bitcoin.regtest', '--bitcoin.node=bitcoind', '--bitcoin.blake2b-activation-height=20', ...RPC,
   `--rpclisten=0.0.0.0:${grpc}`, `--restlisten=0.0.0.0:${rest}`, `--listen=0.0.0.0:${p2p}`, `--alias=${alias}`,
-  '--protocol.simple-taproot-chans', '--accept-keysend']
+  '--protocol.simple-taproot-chans', '--accept-keysend', '--tlsautorefresh']
 
 export const main = sdk.setupMain(async ({ effects }) => {
   const vol = (subpath: string | null) => sdk.Mounts.of().mountVolume({ volumeId: 'main', subpath, mountpoint: '/data', readonly: false })
@@ -28,6 +28,12 @@ export const main = sdk.setupMain(async ({ effects }) => {
       exec: { command: lnd('standin-lf1', 10009, 8080, 9735), user: 'root' },
       ready: { display: 'Lightning node (box)', fn: port(8080, 'REST'), gracePeriod: 120_000 },
       requires: ['knots'],
+    })
+    // a copy of tls.cert alone in public/, as the real package keeps it for packages that depend on it
+    .addOneshot('public-tls-cert', {
+      subcontainer: sdk.SubContainer.of(effects, { imageId: 'lnd' }, vol(null), 'cert-sub'),
+      exec: { command: ['sh', '-c', 'mkdir -p /data/public && cp /data/tls.cert /data/public/tls.cert.tmp && mv /data/public/tls.cert.tmp /data/public/tls.cert'], user: 'root' },
+      requires: ['lf1'],
     })
     // the far end of the channel
     .addDaemon('lf2', {
