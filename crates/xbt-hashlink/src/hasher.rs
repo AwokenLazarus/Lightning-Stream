@@ -53,6 +53,8 @@ struct St {
     rate: VecDeque<(Instant, u128)>,
     last_heard: Instant,
     events: Vec<Value>,
+    /// Stratum methods seen from the miners (which extensions they use).
+    methods: BTreeMap<String, u64>,
     rail: Box<dyn SellerRail>,
 }
 
@@ -103,7 +105,7 @@ impl St {
             "terms": self.terms.to_json(), "meter": self.meter.to_json(),
             "slicesDone": self.done.iter().map(|(w, t)| json!({"work": w.to_string(), "atMs": t})).collect::<Vec<_>>(),
             "paid": self.paid, "receiptsAgree": self.agree, "receiptsDisagree": self.disagree,
-            "receipts": self.receipts, "stopped": self.stopped, "events": self.events,
+            "receipts": self.receipts, "stopped": self.stopped, "methods": self.methods, "events": self.events,
         })
     }
 }
@@ -164,6 +166,7 @@ pub fn run(cfg: Config, rail: Box<dyn SellerRail>) -> Result<Value, String> {
         rate: VecDeque::new(),
         last_heard: Instant::now(),
         events: Vec::new(),
+        methods: BTreeMap::new(),
         rail,
     }));
 
@@ -369,6 +372,9 @@ fn serve_miner(conn: TcpStream, st: Arc<Mutex<St>>, tx: Sender) {
         }
         if let Some(worker) = sv1::authorize_user(&v) {
             g.note(json!({"ev": "authorize", "chan": chan, "worker": worker, "atMs": now_ms()}));
+        }
+        if let Some(m) = sv1::method(&v) {
+            *g.methods.entry(m.to_string()).or_default() += 1;
         }
         g.meter.up(chan, &v);
         if tx.send(&Msg::Up { chan, line: line.trim_end().to_string() }).is_err() {

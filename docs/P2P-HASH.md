@@ -46,6 +46,14 @@ rejected shares count no work; no payment after the miners stopped and both lock
 cancelled; with payment stopped after slice 3, the hasher stopped 0.40 slice past the unpaid
 slice and the gateway saw no work after that.
 
+## With a real miner
+
+`scripts/p2p_hash_miner.sh` runs a short rental from a miner with the DragonMint web UI into a real
+DATUM Gateway: it saves the miner's pools, points pool 1 at the hasher (the saved pool stays as
+the fallback), lets the buyer pay a few slices and then stop paying, and restores the pools on
+every exit and compares them. It credits the same gateway user the miner already uses. Not yet
+run.
+
 ## Choices
 
 ### Noise: implement BOLT 8, not the `snow` crate
