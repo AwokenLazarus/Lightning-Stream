@@ -154,6 +154,9 @@ pub struct Config {
     /// The lottery (`docs/TICKETS.md`, section 9), where the runner offers it: pieces priced below
     /// one win, paid by draws, with nothing held. Absent: not offered.
     pub lottery: Option<LotteryConfig>,
+    /// Payment by BOLT 12 offer for prepaid tickets and lottery wins (`docs/TICKETS.md`, section
+    /// 15), where the runner turns it on. Absent: no offer is made or named in the terms.
+    pub offers: Option<OffersConfig>,
     pub routes: Vec<Route>,
     pub http: Http,
     /// Off unless the runner writes it: whose word the caps per address take for a buyer's address.
@@ -161,6 +164,14 @@ pub struct Config {
     pub times: Times,
     /// The signed catalog (`docs/LISTINGS.md`). Absent: the well-known URL answers 404.
     pub listing: Option<xbt402::listing::Draft>,
+}
+
+/// The runner's `offers` section: the gateway makes one BOLT 12 offer on its node at the start, with
+/// no amount (each invoice names its own), and names it in its prepaid and lottery terms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OffersConfig {
+    /// The offer's description, shown to whoever pays it.
+    pub description: String,
 }
 
 /// A reverse proxy in front of the gateway, and the header in which it reports the address it
@@ -250,6 +261,7 @@ impl Config {
                 "node",
                 "tickets",
                 "lottery",
+                "offers",
                 "caps",
                 "routes",
                 "http",
@@ -574,6 +586,25 @@ impl Config {
             None | Some(Value::Null) => None,
             Some(l) => Some(LotteryConfig::parse(l, ticket_blocks)?),
         };
+        // payment by offer: off unless the runner turns it on, and only beside a way it pays
+        let offers = match top.get("offers") {
+            None | Some(Value::Null) => None,
+            Some(o) => {
+                let o = obj(o, "offers", &["enabled", "description"])?;
+                let on = match o.get("enabled") {
+                    Some(Value::Bool(b)) => *b,
+                    _ => return Err("offers.enabled is true or false".into()),
+                };
+                if on && !prepaid && lottery.is_none() {
+                    return Err(format!("offers: an offer pays prepaid tickets and lottery wins, and this config offers neither (tickets.settle has no \"{SETTLE_ON_ARRIVAL}\" and there is no lottery section)"));
+                }
+                let description = opt_str(o, "description")?.unwrap_or("xbt-gateway").to_string();
+                if description.is_empty() || description.len() > 200 || description.chars().any(char::is_control) {
+                    return Err("offers.description is 1 to 200 characters, none of them a control character".into());
+                }
+                on.then_some(OffersConfig { description })
+            }
+        };
         let listing = match top.get("listing") {
             None | Some(Value::Null) => None,
             Some(l) => Some(xbt402::listing::parse_draft(l).map_err(|e| format!("listing: {e}"))?),
@@ -593,6 +624,7 @@ impl Config {
             held_set,
             caps,
             lottery,
+            offers,
             routes,
             http,
             forwarded,

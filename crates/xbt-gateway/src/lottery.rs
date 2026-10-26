@@ -616,6 +616,21 @@ impl Book {
         paid > 0
     }
 
+    /// The win of `draw` was paid by BOLT 12 offer: the node shows an offer invoice settled in
+    /// full whose payer note, under this session's key, names this draw (the caller checked it).
+    /// `Some`: the win was unpaid and is paid now, with the BOLT 11 invoice it had, if any, which
+    /// the caller cancels on the node. `None`: no such unpaid win.
+    pub fn win_paid_by_offer(&mut self, session: &str, draw: u64) -> Option<Option<Hash>> {
+        let s = self.sessions.get_mut(session)?;
+        let i = s.unpaid.iter().position(|w| w.draw == draw)?;
+        let w = s.unpaid.remove(i);
+        s.paid_wins += 1;
+        self.totals.paid_wins += 1;
+        self.totals.paid_msat = self.totals.paid_msat.saturating_add(s.win_msat);
+        self.log.push(Rec::PaidDraw { session: session.into(), draw });
+        Some(w.invoice.map(|i| i.hash))
+    }
+
     /// An answer of the session started (`open`) or ended.
     pub fn response(&mut self, session: &str, open: bool, now: u64) {
         if let Some(s) = self.sessions.get_mut(session) {
@@ -813,6 +828,11 @@ impl Book {
                 s.unpaid.retain(|w| w.invoice.as_ref().is_none_or(|i| &i.hash != hash));
                 s.paid_wins += (before - s.unpaid.len()) as u64;
             }
+            Rec::PaidDraw { draw, .. } => {
+                let before = s.unpaid.len();
+                s.unpaid.retain(|w| w.draw != *draw);
+                s.paid_wins += (before - s.unpaid.len()) as u64;
+            }
             Rec::Closed { at, .. } => s.closed = Some(*at),
             Rec::Drop { session } => {
                 self.sessions.remove(session);
@@ -886,6 +906,8 @@ pub enum Rec {
     Invoiced { session: String, draw: u64, hash: Hash, text: String },
     /// The node shows the invoice `hash` paid in full.
     Paid { session: String, hash: Hash },
+    /// The win of this draw was paid by BOLT 12 offer.
+    PaidDraw { session: String, draw: u64 },
     Closed { session: String, at: u64 },
     Drop { session: String },
 }
@@ -903,6 +925,7 @@ impl Rec {
             | Self::Invoice { session, .. }
             | Self::Invoiced { session, .. }
             | Self::Paid { session, .. }
+            | Self::PaidDraw { session, .. }
             | Self::Closed { session, .. }
             | Self::Drop { session } => session,
         }
@@ -945,6 +968,7 @@ impl crate::store::Record for Rec {
             Self::Invoice { session, draw, hash, at } => json!({"t": "invoice", "session": session, "draw": draw, "hash": hex::encode(hash), "at": at}),
             Self::Invoiced { session, draw, hash, text } => json!({"t": "invoiced", "session": session, "draw": draw, "hash": hex::encode(hash), "text": text}),
             Self::Paid { session, hash } => json!({"t": "paid", "session": session, "hash": hex::encode(hash)}),
+            Self::PaidDraw { session, draw } => json!({"t": "paid_draw", "session": session, "draw": draw}),
             Self::Closed { session, at } => json!({"t": "closed", "session": session, "at": at}),
             Self::Drop { session } => json!({"t": "drop", "session": session}),
         }
@@ -1006,6 +1030,7 @@ impl crate::store::Record for Rec {
             "invoice" => Self::Invoice { session: session()?, draw: n("draw")?, hash: h("hash")?, at: n("at")? },
             "invoiced" => Self::Invoiced { session: session()?, draw: n("draw")?, hash: h("hash")?, text: s("text")?.to_string() },
             "paid" => Self::Paid { session: session()?, hash: h("hash")? },
+            "paid_draw" => Self::PaidDraw { session: session()?, draw: n("draw")? },
             "closed" => Self::Closed { session: session()?, at: n("at")? },
             "drop" => Self::Drop { session: session()? },
             _ => return None,

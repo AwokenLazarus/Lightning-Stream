@@ -88,6 +88,9 @@ fn run(args: &[String]) -> Result<(), String> {
     if cfg.prepaid {
         eprintln!("xbt-gateway: prepaid tickets: paid in full when they arrive, one at a time, with nothing held on any channel");
     }
+    if cfg.offers.is_some() {
+        eprintln!("xbt-gateway: payment by BOLT 12 offer: one offer of the node, made at the start with no amount, pays prepaid tickets and lottery wins; a payment is credited to the session its payer note names, once. The node's offersrpc is used with node.macaroon ({}); held tickets stay hold invoices", xbt_gateway::node::OFFER_OPS.join(" "));
+    }
     eprintln!("xbt-gateway: the node at {} is spoken to over lnd's REST interface: it must be an lnd-family node (Lightning Fork, or lnd). A Core Lightning seller is not supported", cfg.node.rest);
     if check {
         return Ok(());

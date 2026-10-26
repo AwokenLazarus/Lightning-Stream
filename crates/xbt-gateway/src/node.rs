@@ -105,6 +105,35 @@ pub struct Info {
     pub blake2b: bool,
 }
 
+/// The node's BOLT 12 offer, as the gateway made it (`offersrpc`, `CreateOffer`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeOffer {
+    /// The offer id: the SHA-256 of the offer's fields.
+    pub id: Hash,
+    /// The offer, `lno1...`.
+    pub bolt12: String,
+}
+
+/// An invoice the node issued for one of its offers (`ListOfferInvoices`), with the payer's note
+/// the invoice repeats from its request (`invreq_payer_note`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfferInvoice {
+    pub payment_hash: Hash,
+    /// `None`: a state the node names that is none of the four (`UNKNOWN`).
+    pub state: Option<InvoiceState>,
+    /// What was paid, in msat, once settled.
+    pub paid_msat: u64,
+    /// When the node issued it, in unix seconds.
+    pub created_at: u64,
+    /// `None`: the request carried no note, or the invoice could not be read.
+    pub payer_note: Option<String>,
+}
+
+/// What the node's offer calls need: `CreateOffer` and `EnableOffer` are `invoices:write`,
+/// `ListOfferInvoices` and `DecodeBolt12` are `invoices:read` (Lightning Fork's `offersrpc`). So the
+/// invoice macaroon ([`INVOICE_OPS`]) serves them, and nothing is added to it.
+pub const OFFER_OPS: [&str; 2] = INVOICE_OPS;
+
 pub trait Node: Send + Sync {
     /// Register a hold invoice for `hash`; the BOLT 11 invoice.
     fn add_hold(
@@ -139,6 +168,15 @@ pub trait Node: Send + Sync {
         Err(NodeError::Refused(
             "this node was given no channels macaroon".into(),
         ))
+    }
+    /// Make (or, with the same fields, find again) the node's BOLT 12 offer with no amount and
+    /// this description, and have it served. The same description gives the same offer.
+    fn create_offer(&self, _description: &str) -> Result<NodeOffer, NodeError> {
+        Err(NodeError::Refused("this node makes no BOLT 12 offers".into()))
+    }
+    /// Every invoice the node issued for the offer `offer_id`, each with its payer's note.
+    fn offer_invoices(&self, _offer_id: &Hash) -> Result<Vec<OfferInvoice>, NodeError> {
+        Err(NodeError::Refused("this node makes no BOLT 12 offers".into()))
     }
 }
 
@@ -377,6 +415,9 @@ pub struct LndRest {
     invoice_macaroon: String,
     info_macaroon: String,
     channels_macaroon: Option<String>,
+    /// The payer's note of each paid offer invoice read so far, by payment hash: an invoice is
+    /// decoded by the node once ([`Node::offer_invoices`]).
+    notes: std::sync::Mutex<std::collections::HashMap<Hash, Option<String>>>,
     /// Unary calls: a deadline on every read.
     agent: ureq::Agent,
     /// Invoice streams: silent for as long as nothing happens to the invoice.
@@ -451,6 +492,7 @@ impl LndRest {
             invoice_macaroon: hex::encode(invoice_macaroon),
             info_macaroon: hex::encode(info_macaroon),
             channels_macaroon: None,
+            notes: std::sync::Mutex::new(std::collections::HashMap::new()),
             agent: build(Duration::from_secs(15)),
             streams: build(STREAM_SILENCE),
         })
@@ -615,6 +657,68 @@ pub fn info_of(v: &Value) -> Result<Info, NodeError> {
     })
 }
 
+/// A `bytes` field of the node's REST JSON (base64) that must be 32 bytes.
+fn bytes32(v: Option<&Value>) -> Option<Hash> {
+    let raw = B64.decode(v?.as_str()?).ok()?;
+    <[u8; 32]>::try_from(raw.as_slice()).ok()
+}
+
+/// The offer in the node's answer to `CreateOffer`, and whether it is active.
+pub fn offer_of(v: &Value) -> Result<(NodeOffer, bool), NodeError> {
+    let bad = |what: &str| NodeError::Unreachable(format!("offer answer: {what}"));
+    let o = v.get("offer").filter(|o| o.is_object()).ok_or_else(|| bad("no offer"))?;
+    let id = bytes32(o.get("offer_id")).ok_or_else(|| bad("no 32-byte offer_id"))?;
+    let bolt12 = o
+        .get("bolt12")
+        .and_then(Value::as_str)
+        .filter(|s| s.starts_with("lno1"))
+        .ok_or_else(|| bad("no lno1 offer"))?;
+    Ok((NodeOffer { id, bolt12: bolt12.to_string() }, o.get("active") == Some(&Value::Bool(true))))
+}
+
+/// The invoices in the node's answer to `ListOfferInvoices`, without their notes. An invoice
+/// without a readable payment hash is an error: nothing is credited on a guess.
+pub fn offer_invoices_of(v: &Value) -> Result<Vec<(OfferInvoice, String)>, NodeError> {
+    let bad = |what: &str| NodeError::Unreachable(format!("offer invoice list: {what}"));
+    let list = match v.get("invoices") {
+        None | Some(Value::Null) => return Ok(vec![]),
+        Some(Value::Array(a)) => a,
+        Some(_) => return Err(bad("invoices is not a list")),
+    };
+    list.iter()
+        .map(|i| {
+            let state = match i.get("state").and_then(Value::as_str) {
+                Some("OPEN") => Some(InvoiceState::Open),
+                Some("ACCEPTED") => Some(InvoiceState::Accepted),
+                Some("SETTLED") => Some(InvoiceState::Settled),
+                Some("CANCELED") => Some(InvoiceState::Canceled),
+                _ => None,
+            };
+            let inv = OfferInvoice {
+                payment_hash: bytes32(i.get("payment_hash")).ok_or_else(|| bad("an invoice without a 32-byte payment_hash"))?,
+                state,
+                paid_msat: num(i.get("amount_paid_msat")).unwrap_or(0),
+                created_at: num(i.get("created_at")).unwrap_or(0),
+                payer_note: None,
+            };
+            Ok((inv, i.get("bolt12").and_then(Value::as_str).unwrap_or("").to_string()))
+        })
+        .collect()
+}
+
+/// The payer's note in the node's answer to `DecodeBolt12` of an invoice, if the answer is for
+/// that invoice (`hash`) and carries one.
+pub fn decoded_note(v: &Value, hash: &Hash) -> Option<String> {
+    if v.get("type").and_then(Value::as_str) != Some("invoice") || bytes32(v.get("invoice").and_then(|i| i.get("payment_hash"))) != Some(*hash) {
+        return None;
+    }
+    v.get("invoice_request")
+        .and_then(|r| r.get("payer_note"))
+        .and_then(Value::as_str)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+}
+
 /// An invoice from the node's JSON. An answer without a state it knows is an error, not "open".
 pub fn invoice_of(v: &Value) -> Result<Invoice, NodeError> {
     let bad = |what: &str| NodeError::Unreachable(format!("invoice answer: {what}"));
@@ -720,6 +824,54 @@ impl Node for LndRest {
                 "no payment_request in the answer".into(),
             )),
         }
+    }
+
+    fn create_offer(&self, description: &str) -> Result<NodeOffer, NodeError> {
+        // no amount: each invoice is asked for its own (a ticket's size, a win's), and the same
+        // fields mint the same offer again, so a restart names the offer buyers already have
+        let body = json!({"description": description, "amount_msat": "0", "label": "xbt-gateway"});
+        let (offer, active) = offer_of(&self.unary(&self.invoice_macaroon, "POST", "/v2/offers", Some(&body))?)?;
+        if !active {
+            self.unary(
+                &self.invoice_macaroon,
+                "POST",
+                "/v2/offers/enable",
+                Some(&json!({"offer_id": B64.encode(offer.id)})),
+            )?;
+        }
+        Ok(offer)
+    }
+
+    fn offer_invoices(&self, offer_id: &Hash) -> Result<Vec<OfferInvoice>, NodeError> {
+        let v = self.unary(
+            &self.invoice_macaroon,
+            "POST",
+            "/v2/offers/invoices",
+            Some(&json!({"offer_id": B64.encode(offer_id)})),
+        )?;
+        let mut out = vec![];
+        for (mut inv, bolt12) in offer_invoices_of(&v)? {
+            // only a paid invoice is credited, so only its note is read; a note does not change,
+            // and is asked of the node once
+            if inv.state == Some(InvoiceState::Settled) {
+                let known = self.notes.lock().unwrap_or_else(|p| p.into_inner()).get(&inv.payment_hash).cloned();
+                inv.payer_note = match known {
+                    Some(n) => n,
+                    None => {
+                        let d = self.unary(&self.invoice_macaroon, "POST", "/v2/offers/decode", Some(&json!({"bolt12": bolt12})))?;
+                        let n = decoded_note(&d, &inv.payment_hash);
+                        let mut notes = self.notes.lock().unwrap_or_else(|p| p.into_inner());
+                        if notes.len() >= 65_536 {
+                            notes.clear();
+                        }
+                        notes.insert(inv.payment_hash, n.clone());
+                        n
+                    }
+                };
+            }
+            out.push(inv);
+        }
+        Ok(out)
     }
 
     fn channels(&self) -> Result<Vec<Channel>, NodeError> {
@@ -995,6 +1147,60 @@ mod tests {
         let seen = rest.0.lock().unwrap().clone();
         assert_eq!(seen.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(), ["/v2/invoices/hodl", "/v1/invoices"]);
         assert!(seen.iter().all(|(_, b)| b["private"] == true), "{seen:?}");
+    }
+
+    /// The offer calls go to `offersrpc` over REST with the invoice macaroon: the offer is made
+    /// with no amount and served (enabled where the node had it disabled), and only a paid
+    /// invoice's note is asked of the node, once.
+    #[test]
+    fn the_offer_is_made_and_its_paid_invoices_read_with_the_invoice_macaroon() {
+        struct Rest(std::sync::Mutex<Vec<(String, String, Value)>>);
+        impl xbt_svc::http::Handler for Rest {
+            fn body_limit(&self, _m: &str, _t: &str) -> usize {
+                4096
+            }
+            fn handle(&self, req: xbt_svc::http::Request) -> xbt_svc::http::Response {
+                let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+                let mac = req.header("Grpc-Metadata-macaroon").unwrap_or("").to_string();
+                self.0.lock().unwrap().push((req.target.clone(), mac, body));
+                let paid = B64.encode([1u8; 32]);
+                let answer = match req.target.as_str() {
+                    "/v2/offers" => json!({"offer": {"offer_id": B64.encode([7u8; 32]), "bolt12": "lno1qcp4256ypq", "active": false}, "created": false}),
+                    "/v2/offers/invoices" => json!({"invoices": [
+                        {"payment_hash": paid, "state": "SETTLED", "amount_paid_msat": "1000000", "created_at": "1790000000", "bolt12": "lni1paid"},
+                        {"payment_hash": B64.encode([2u8; 32]), "state": "OPEN", "amount_paid_msat": "0", "created_at": "1790000001", "bolt12": "lni1open"}]}),
+                    "/v2/offers/decode" => json!({"type": "invoice", "invoice": {"payment_hash": paid}, "invoice_request": {"payer_note": "xbt402-note/0 the note"}}),
+                    _ => json!({}),
+                };
+                xbt_svc::http::Response::text(200, "application/json", answer.to_string())
+            }
+        }
+        let rest = Arc::new(Rest(std::sync::Mutex::new(vec![])));
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let run = xbt_svc::http::serve(rest.clone(), l, 1).unwrap();
+        let node = LndRest::new(&format!("http://{}", run.addr), b"inv", b"info", None).unwrap();
+        let offer = node.create_offer("a shop").unwrap();
+        assert_eq!(offer, NodeOffer { id: [7u8; 32], bolt12: "lno1qcp4256ypq".into() });
+        for _ in 0..2 {
+            let invs = node.offer_invoices(&offer.id).unwrap();
+            assert_eq!(invs.iter().map(|i| (i.state, i.paid_msat, i.payer_note.clone())).collect::<Vec<_>>(),
+                       [(Some(InvoiceState::Settled), 1_000_000, Some("xbt402-note/0 the note".to_string())), (Some(InvoiceState::Open), 0, None)]);
+        }
+        run.stopper().stop();
+        let seen = rest.0.lock().unwrap().clone();
+        let targets: Vec<&str> = seen.iter().map(|(t, _, _)| t.as_str()).collect();
+        assert_eq!(targets, ["/v2/offers", "/v2/offers/enable", "/v2/offers/invoices", "/v2/offers/decode", "/v2/offers/invoices"]);
+        assert!(seen.iter().all(|(_, m, _)| m == &hex::encode(b"inv")), "the invoice macaroon, and no other: {seen:?}");
+        assert_eq!((seen[0].2["amount_msat"].as_str(), seen[0].2["description"].as_str()), (Some("0"), Some("a shop")));
+        assert_eq!(seen[1].2["offer_id"], B64.encode([7u8; 32]));
+        // what the node may answer that is not an offer, or an invoice list that cannot be read
+        assert!(offer_of(&json!({"offer": {"offer_id": "AA==", "bolt12": "lno1x"}})).is_err());
+        assert!(offer_of(&json!({"offer": {"offer_id": B64.encode([7u8; 32]), "bolt12": "lnbc1"}})).is_err());
+        assert!(offer_invoices_of(&json!({"invoices": [{"state": "SETTLED"}]})).is_err());
+        assert_eq!(offer_invoices_of(&json!({})).unwrap(), vec![]);
+        // a decode for another invoice, or of another kind, is no note
+        assert_eq!(decoded_note(&json!({"type": "invoice", "invoice": {"payment_hash": B64.encode([3u8; 32])}, "invoice_request": {"payer_note": "x"}}), &[1u8; 32]), None);
+        assert_eq!(decoded_note(&json!({"type": "offer", "invoice_request": {"payer_note": "x"}}), &[1u8; 32]), None);
     }
 
     #[test]

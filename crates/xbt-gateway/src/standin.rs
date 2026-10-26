@@ -11,7 +11,7 @@ use std::sync::{Condvar, Mutex, MutexGuard};
 
 use sha2::{Digest, Sha256};
 
-use crate::node::{Channel, Hash, Info, Invoice, InvoiceState, Node, NodeError};
+use crate::node::{Channel, Hash, Info, Invoice, InvoiceState, Node, NodeError, NodeOffer, OfferInvoice};
 
 /// The node cancels a held invoice this many blocks before its HTLC expires.
 pub const HOLD_EXPIRY_DELTA: u32 = xbt402::ticket::HOLD_EXPIRY_DELTA;
@@ -65,6 +65,10 @@ struct State {
     channels: Option<Vec<Channel>>,
     /// The preimages of the ordinary invoices: what a payer learns when its payment settles.
     preimages: HashMap<Hash, [u8; 32]>,
+    /// The node's BOLT 12 offer, once made (or as a test set it), and the invoices issued for it,
+    /// in the order they were, with their preimages.
+    offer: Option<NodeOffer>,
+    offer_invoices: Vec<(OfferInvoice, [u8; 32])>,
 }
 
 #[derive(Debug)]
@@ -217,6 +221,64 @@ impl StandIn {
         let mut s = self.lock();
         s.pubkey = pubkey.to_string();
         s.networks = networks.iter().map(|n| n.to_string()).collect();
+    }
+
+    /// The offer [`Node::create_offer`] answers with from now on (a test that needs a real one).
+    pub fn set_offer(&self, offer: NodeOffer) {
+        self.lock().offer = Some(offer);
+    }
+
+    /// A buyer fetched an invoice from the node's offer with this payer note: the invoice is
+    /// issued, open, at `created_at` (unix seconds). Returns its preimage, which the payer learns
+    /// when it pays ([`StandIn::pay_offer_invoice`]).
+    pub fn issue_offer_invoice(&self, note: Option<&str>, created_at: u64) -> [u8; 32] {
+        let mut preimage = [0u8; 32];
+        preimage.copy_from_slice(&xbt_svc::random_bytes(32));
+        let inv = OfferInvoice {
+            payment_hash: Sha256::digest(preimage).into(),
+            state: Some(InvoiceState::Open),
+            paid_msat: 0,
+            created_at,
+            payer_note: note.map(str::to_string),
+        };
+        let mut s = self.lock();
+        s.offer_invoices.push((inv, preimage));
+        self.touch(&mut s);
+        preimage
+    }
+
+    /// The payment of an offer invoice arrives, for `msat`: it is settled at once, as an ordinary
+    /// invoice is. False: there is no such open invoice.
+    pub fn pay_offer_invoice(&self, hash: &Hash, msat: u64) -> bool {
+        let mut s = self.lock();
+        let Some((inv, _)) = s
+            .offer_invoices
+            .iter_mut()
+            .find(|(i, _)| &i.payment_hash == hash && i.state == Some(InvoiceState::Open))
+        else {
+            return false;
+        };
+        inv.state = Some(InvoiceState::Settled);
+        inv.paid_msat = msat;
+        self.touch(&mut s);
+        true
+    }
+
+    /// A payment by offer from start to end: an invoice with `note` issued and paid for `msat`.
+    /// Returns its preimage, the payer's proof.
+    pub fn pay_by_offer(&self, note: Option<&str>, msat: u64, created_at: u64) -> [u8; 32] {
+        let p = self.issue_offer_invoice(note, created_at);
+        self.pay_offer_invoice(&Sha256::digest(p).into(), msat);
+        p
+    }
+
+    /// The preimage of a paid offer invoice: what its payer learnt.
+    pub fn offer_preimage(&self, hash: &Hash) -> Option<[u8; 32]> {
+        self.lock()
+            .offer_invoices
+            .iter()
+            .find(|(i, _)| &i.payment_hash == hash && i.state == Some(InvoiceState::Settled))
+            .map(|(_, p)| *p)
     }
 
     // --- what a test reads ----------------------------------------------------------------------------
@@ -427,6 +489,25 @@ impl Node for StandIn {
                 s = self.changed.wait(s).unwrap_or_else(|p| p.into_inner());
             }
         }
+    }
+
+    fn create_offer(&self, description: &str) -> Result<NodeOffer, NodeError> {
+        let mut s = self.call("create_offer")?;
+        // the same fields make the same offer, as the node's do
+        let made = s.offer.clone().unwrap_or_else(|| {
+            let id: Hash = Sha256::digest(format!("standin-offer|{description}")).into();
+            NodeOffer { id, bolt12: format!("lno1standin{}", hex::encode(id)) }
+        });
+        s.offer = Some(made.clone());
+        Ok(made)
+    }
+
+    fn offer_invoices(&self, offer_id: &Hash) -> Result<Vec<OfferInvoice>, NodeError> {
+        let s = self.call("offer_invoices")?;
+        if s.offer.as_ref().map(|o| &o.id) != Some(offer_id) {
+            return Err(NodeError::Refused("offer not found".into()));
+        }
+        Ok(s.offer_invoices.iter().map(|(i, _)| i.clone()).collect())
     }
 
     fn info(&self) -> Result<Info, NodeError> {
