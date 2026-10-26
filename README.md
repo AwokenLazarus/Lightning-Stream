@@ -107,6 +107,11 @@ the full list, with a link for each, is [`docs/REFERENCES.md`](docs/REFERENCES.m
   with the numbers and what the demo does not show.
 - **Pay with work.** A miner pays for a service with pool shares, settled in the coinbase and
   checked by an audit.
+- **Rented hashrate, paid per slice of work (p2p-hash).** A hasher's miners work for a buyer's
+  own DATUM Gateway over an encrypted link (BOLT 8 Noise), and the buyer's wallet pays each slice
+  of accepted work through the hasher's gateway; the buyer finds the hasher by a signed listing on
+  Nostr. Run once on mainnet between two machines of one LAN with a real BLAKE2b miner, command line
+  only: [`docs/P2P-HASH-TRY-IT.md`](docs/P2P-HASH-TRY-IT.md) is the guide, with the result.
 
 ## What is being built
 
@@ -289,6 +294,7 @@ tickets and the lottery on both sides, pay with work, and the services and packa
 | `xbt-nwc` | Nostr Wallet Connect (NIP-47): other apps pay through the owner's node, under the owner's policy, through the signer (`docs/NWC.md`) |
 | `xbt-nostr` | the Nostr pieces, with no wallet in them: events, NIP-44 v2, a WebSocket and relay client, and sellers' signed listings published and read as NIP-99 classifieds (`docs/NOSTR.md`) |
 | `xbt-work`, `xbt-work-relay` | pay with work: a miner pays with pool shares, settled in the coinbase and checked by an audit |
+| `xbt-hashlink` | p2p-hash: the encrypted link between a hasher and a buyer, a Stratum V1 relay, the meter of accepted work, and the hashrate listing (`docs/P2P-HASH.md`) |
 | `xbt-gateway` | the stream-ticket seller gateway: a reverse proxy beside a Lightning node that puts a price per piece on any HTTP service (regtest only) |
 | `xbt-svc` | container plumbing: data dir, secrets, readiness, the bounded HTTP server |
 

@@ -9,7 +9,7 @@ miners ──SV1 (LAN)──> hasher's app ══ link (BOLT 8 Noise_XK) ══>
                         meter                                  meter, tickets, receipts
 ```
 
-Crate: `crates/xbt-hashlink`. Lab: `scripts/p2p_hash_lab.sh`.
+Crate: `crates/xbt-hashlink`. Lab: `scripts/p2p_hash_lab.sh`. To run it yourself: [P2P-HASH-TRY-IT.md](P2P-HASH-TRY-IT.md).
 
 ## What is built
 
@@ -51,8 +51,14 @@ slice and the gateway saw no work after that.
 `scripts/p2p_hash_miner.sh` runs a short rental from a miner with the DragonMint web UI into a real
 DATUM Gateway: it saves the miner's pools, points pool 1 at the hasher (the saved pool stays as
 the fallback), lets the buyer pay a few slices and then stop paying, and restores the pools on
-every exit and compares them. It credits the same gateway user the miner already uses. Not yet
-run.
+every exit and compares them. It credits the same gateway user the miner already uses. It has
+run: 58 shares accepted, 4 slices paid, the hasher stopping 0.8 slice after the unpaid one.
+
+## Between two machines, paid in real sats
+
+`scripts/p2p_hash_rehearsal.sh` runs the hasher and the buyer on two machines, the buyer finding
+the hasher by its Nostr listing and paying each slice through the hasher's gateway over
+Lightning. The result, and a guide to run it yourself: [P2P-HASH-TRY-IT.md](P2P-HASH-TRY-IT.md).
 
 ## Choices
 
