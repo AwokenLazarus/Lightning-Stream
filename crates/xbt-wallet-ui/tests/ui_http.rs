@@ -1323,6 +1323,14 @@ fn the_sell_page_sets_up_several_services_and_says_what_each_one_needs() {
     let r = br.act("/sell-hashrate", "/sell-hashrate", &[("action", "save"), ("fallback", "192.168.1.20:23334"), ("price", "40")]);
     assert!(br.flash_after(&r).contains("Renting is off"));
     assert!(listing().services.iter().all(|s| s.kind != "hashrate"));
+    // an update that lists more: the config is written again at start, without a Save
+    let mut st: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("hashrate-settings.json")).unwrap()).unwrap();
+    st["enabled"] = json!(true);
+    std::fs::write(dir.join("hashrate-settings.json"), st.to_string()).unwrap();
+    assert!(listing().services.iter().all(|s| s.kind != "hashrate"));
+    assert_eq!(bx._app.refresh_shop_config(), Some("written"));
+    assert!(listing().services.iter().any(|s| s.kind == "hashrate"));
+    assert_eq!(bx._app.refresh_shop_config(), Some("unchanged"), "and only once");
 }
 
 #[test]

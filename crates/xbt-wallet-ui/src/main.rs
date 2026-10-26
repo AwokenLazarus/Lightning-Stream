@@ -151,6 +151,23 @@ fn serve() -> i32 {
             return 2;
         }
     };
+    if app.cfg.sell {
+        let app = app.clone();
+        std::thread::spawn(move || {
+            // the signer may still be starting: ask for up to two minutes
+            for _ in 0..24 {
+                match app.refresh_shop_config() {
+                    Some("written") => eprintln!("xbt-wallet-ui: the gateway's config was written again for this version"),
+                    Some(_) => {}
+                    None => {
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                        continue;
+                    }
+                }
+                return;
+            }
+        });
+    }
     match xbt_wallet_ui::server::spawn(app.clone()) {
         Ok(r) => {
             eprintln!("xbt-wallet-ui listening on http://{}{} (signer {})", r.addr, app.cfg.base_path, app.cfg.signer_sock.display());

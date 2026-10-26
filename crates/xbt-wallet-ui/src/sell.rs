@@ -582,6 +582,35 @@ impl App {
         }
     }
 
+    /// At start: write the gateway's config again when the shop, as this version describes it,
+    /// differs from the one there is (an update that lists more, or lists it otherwise, takes
+    /// effect without the owner pressing Save). The listing's date alone is no change. `None`:
+    /// the signer did not say its chain yet; ask again.
+    pub fn refresh_shop_config(&self) -> Option<&'static str> {
+        let chain = self.chain();
+        if chain.is_empty() {
+            return None;
+        }
+        let Ok(new) = self.shop_config(&self.shop(), &chain) else { return Some("not complete") };
+        let undated = |v: &Value| {
+            let mut v = v.clone();
+            if let Some(l) = v.get_mut("listing").and_then(Value::as_object_mut) {
+                l.remove("updated");
+            }
+            v
+        };
+        let path = self.cfg.gw.dir.join(GW_CONFIG);
+        let old = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok());
+        if old.as_ref().map(undated) == Some(undated(&new)) {
+            return Some("unchanged");
+        }
+        let Ok(text) = serde_json::to_string_pretty(&new) else { return Some("not written") };
+        match write_shared(&self.cfg.gw.dir, GW_CONFIG, (text + "\n").as_bytes()) {
+            Ok(()) => Some("written"),
+            Err(_) => Some("not written"),
+        }
+    }
+
     fn reachable(address: &str) -> bool {
         crate::app::http_get(&format!("{address}/")).is_ok_and(|(code, _)| code > 0)
     }
