@@ -93,7 +93,8 @@ pub struct Nav<'a> {
     pub brand: &'a str,
 }
 
-pub const WALLET_PAGES: [(&str, &str); 12] = [("./", "Overview"), ("./browse", "Browse"), ("./play", "Player"), ("./connections", "Connections"),
+pub const WALLET_PAGES: [(&str, &str); 13] = [("./", "Overview"), ("./browse", "Browse"), ("./play", "Player"), ("./connections", "Connections"),
+                                              ("./apps", "Connected apps"),
                                               ("./approvals", "Approvals"), ("./policy", "Policy"), ("./lightning", "Lightning"), ("./channels", "Channels"),
                                               ("./signatures", "Signatures"), ("./keys", "Keys"), ("./agents", "Agents"), ("./setup", "Setup")];
 pub const GATEWAY_PAGES: [(&str, &str); 1] = [("./", "Gateway")];

@@ -28,6 +28,7 @@
 //! | `XBT_UI_GW_PROXIES` | | the addresses of the box's own proxy in front of the gateway (StartOS), offered as the default for the forwarded-address setting |
 //! | `XBT_UI_MCP_TOKEN_FILE` | `$XBT_DATA_DIR/run/ui/mcp-http-token` when `XBT_DATA_DIR` is set, else `<data dir>/secrets/mcp-http-token` | the MCP bearer token, shown to the logged-in owner on the Agents page and rotated there (AGP-042). The UI owns it; the MCP only reads it (`xbt-init` makes it 0640, group `xbt-wallet-ui`). |
 //! | `XBT_UI_SERVICES` | | path of the services JSON Browse and the player read (a list of `{name, kind, seller, price_text, items}`) |
+//! | `XBT_UI_NWC_SOCK` | | the NWC wallet service's admin socket (`xbt-nwc`'s `NWC_ADMIN_SOCK`): the Connected apps page makes, lists and revokes NWC connections there |
 //! | `XBT_UI_CONNECTOR` | `http://127.0.0.1:8480` | the connector the player loads video from (`<connector>/s/<item URL>`). That is also the connector's default listen address, and the UI's own default bind: on one machine set one of the two ports. |
 use std::path::PathBuf;
 use std::time::Duration;
@@ -58,6 +59,8 @@ pub struct Config {
     pub services_file: Option<PathBuf>,
     /// `XBT_UI_CONNECTOR`: base URL of the connector, no trailing slash required.
     pub connector: String,
+    /// `XBT_UI_NWC_SOCK`: the NWC wallet service's admin socket, when the box runs it.
+    pub nwc_sock: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,6 +185,7 @@ impl Config {
             gw,
             services_file: env("XBT_UI_SERVICES").map(PathBuf::from),
             connector: env("XBT_UI_CONNECTOR").unwrap_or_else(|| "http://127.0.0.1:8480".into()),
+            nwc_sock: env("XBT_UI_NWC_SOCK").map(PathBuf::from),
         })
     }
 
@@ -191,6 +195,6 @@ impl Config {
                session_max: Duration::from_secs(28_800), secure_cookie: None, allow_ips: vec![], allowed_hosts: vec![], setup_open: false, cmp_url: None,
                cmp_status_url: None, mcp_urls: vec![], mcp_token_file: PathBuf::from("/nonexistent/mcp-http-token"), threads: 4, role: Role::Wallet,
                ln: LnSetup::default(), gw: GatewaySetup { state_dir: "/data/gateway".into(), port: 8402, ..Default::default() },
-               services_file: None, connector: "http://127.0.0.1:8480".into() }
+               services_file: None, connector: "http://127.0.0.1:8480".into(), nwc_sock: None }
     }
 }

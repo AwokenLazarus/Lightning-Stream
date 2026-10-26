@@ -976,3 +976,78 @@ fn the_ui_relays_the_players_video_from_the_connector_to_a_logged_in_owner() {
     resp.into_reader().read_to_end(&mut got).unwrap();
     assert_eq!(got, film);
 }
+
+/// Connected apps: a connection made on the NWC service's admin socket, its URI shown once (in the
+/// answer to the form, never stored here), listed with its budget, and revoked.
+#[test]
+fn connected_apps_make_show_once_list_and_revoke() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    // without the NWC service the page says how to set it up
+    let plain = start(json!({}), false, |_| {});
+    let mut br = logged_in(&plain);
+    let page = br.get("/apps").body;
+    assert!(page.contains("aria-current=\"page\">Connected apps"), "{page}");
+    assert!(page.contains("XBT_UI_NWC_SOCK"));
+
+    let nwc_dir = tempfile::tempdir().unwrap();
+    let mut cfg = xbt_nwc::service::Config::new(nwc_dir.path().join("state"), nwc_dir.path().join("no-signer.sock"));
+    cfg.default_relays = vec!["wss://relay.example.com".into()];
+    let svc = xbt_nwc::service::Service::new(cfg).unwrap();
+    let sock = nwc_dir.path().join("admin.sock");
+    let _admin = xbt_nwc::admin::spawn(svc.clone(), &sock, 0o600).unwrap();
+    let b = start(json!({}), false, |c| c.nwc_sock = Some(sock.clone()));
+    let mut br = logged_in(&b);
+    let mut anon = B::new(&b.base);
+    assert_eq!(anon.get("/apps").location(), "./login");
+    let page = br.get("/apps").body;
+    assert!(page.contains("No app is connected"));
+    assert!(page.contains("wss://relay.example.com"), "the service's default relays are offered");
+    assert_eq!(br.post("/apps-create", &[("name", "x"), ("budget_sats_per_day", "10")]).status, 403, "no CSRF token");
+
+    let form = [("name", "Phone <wallet>"), ("budget_sats_per_day", "2500"), ("expires_in_s", "604800"), ("m_pay_invoice", "1"),
+                ("m_get_info", "1"), ("relays", "wss://relay.example.com\nwss://relay.example.org")];
+    let made = br.act("/apps", "/apps-create", &form);
+    assert_eq!(made.status, 200, "{}", made.body);
+    assert_eq!(made.headers.get("cache-control").map(String::as_str), Some("no-store"));
+    assert_eq!(made.body.matches("nostr+walletconnect://").count(), 1);
+    assert!(made.body.contains("data-copy=\"nwc-uri\""));
+    assert!(made.body.contains("only time"));
+    let at = made.body.find("nostr+walletconnect://").unwrap();
+    let uri = unescape(made.body[at..].split('"').next().unwrap());
+    let parsed = xbt_nwc::client::Uri::parse(&uri).unwrap();
+    assert_eq!(parsed.relays, vec!["wss://relay.example.com", "wss://relay.example.org"]);
+    // never again: not on the page, not in the UI's data dir
+    let page = br.get("/apps").body;
+    assert!(!page.contains("nostr+walletconnect://") && !page.contains(&parsed.secret.secret_hex()));
+    assert!(page.contains("Phone &lt;wallet&gt;") && !page.contains("Phone <wallet>"));
+    assert!(page.contains("pay_invoice get_info") && page.contains("2,500 sats"));
+    for f in walk(b.data.path()) {
+        let t = std::fs::read(&f).unwrap_or_default();
+        assert!(!String::from_utf8_lossy(&t).contains(&parsed.secret.secret_hex()), "{}", f.display());
+    }
+    let listed = svc.list();
+    assert_eq!(listed["connections"][0]["methods"], json!(["pay_invoice", "get_info"]));
+    assert_eq!(listed["connections"][0]["budget_sats_per_day"], 2500);
+
+    let r = br.act("/apps", "/apps-create", &[("name", "bad"), ("budget_sats_per_day", "0"), ("expires_in_s", "0"), ("m_get_info", "1")]);
+    assert!(br.flash_after(&r).contains("Not made"));
+
+    let id = field(&br.get("/apps").body, "id");
+    let r = br.act("/apps", "/apps-revoke", &[("id", &id)]);
+    assert!(br.flash_after(&r).contains("Revoked"));
+    assert!(br.get("/apps").body.contains("No app is connected"));
+    assert_eq!(svc.list()["connections"], json!([]));
+}
+
+fn walk(d: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = vec![];
+    for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(walk(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
