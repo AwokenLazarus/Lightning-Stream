@@ -841,7 +841,14 @@ fn halt(rig: Rig) -> (std::sync::Arc<xbt_gateway::standin::StandIn>, (xbt_svc::h
 fn a_session_and_its_unpaid_wins_outlive_a_restart_and_a_kill_at_any_write_of_the_journal() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
-    let rig = start_on(&state, std::sync::Arc::new(xbt_gateway::standin::StandIn::new(100)), start_service(), std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1_000_000)), &lottery);
+    // two wins must stand unpaid at once, and draws are random: with the usual grace of 4 pieces a
+    // second win that comes later than that finds the session refused (about one run in 50), so
+    // the grace here is wide enough for any run
+    let roomy = |v: &mut Value| {
+        lottery(v);
+        v["lottery"]["grace_pieces"] = json!(64);
+    };
+    let rig = start_on(&state, std::sync::Arc::new(xbt_gateway::standin::StandIn::new(100)), start_service(), std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1_000_000)), &roomy);
     let mut b = Drawer::open(&rig, 60);
     // pages, each drawn for. Every reveal the buyer is sent is for draws the journal holds already:
     // they were written, and synced, before the answer left
@@ -883,7 +890,7 @@ fn a_session_and_its_unpaid_wins_outlive_a_restart_and_a_kill_at_any_write_of_th
 
     // a restart on the whole journal: the session, its open piece and its unpaid win, which gets an
     // invoice anew once the one the node made unseen is cancelled there
-    let rig = start_on(&state, node.clone(), service, clock.clone(), &lottery);
+    let rig = start_on(&state, node.clone(), service, clock.clone(), &roomy);
     b.addr = rig.addr.clone();
     let st = status_adopting(&mut b).json();
     for k in ["drawn", "pending", "servedMsat", "wonMsat", "paidMsat", "voids"] {
@@ -913,7 +920,7 @@ fn a_session_and_its_unpaid_wins_outlive_a_restart_and_a_kill_at_any_write_of_th
         // and a write the kill tore in half
         text.push_str(&whole[n.min(whole.len() - 1)][..10]);
         std::fs::write(cut.join(xbt_gateway::gateway::LOTTERY_JOURNAL), text).unwrap();
-        let rig = start_on(&cut, node.clone(), service, clock.clone(), &lottery);
+        let rig = start_on(&cut, node.clone(), service, clock.clone(), &roomy);
         let mut c = Drawer { addr: rig.addr.clone(), seq: 0, outcomes: vec![], owed: vec![], ..Drawer::open(&rig, 61) };
         c.session = b.session.clone();
         c.key = b.key;
