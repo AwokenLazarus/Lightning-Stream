@@ -53,17 +53,22 @@ trap finish EXIT
 # the relay on this machine, then the hasher's side on its machine
 "$BIN" relay --listen "$RELAY_LISTEN" 2> "$D/relay.log" &
 pids+=($!)
+# the hasher reaches the relay through an ssh tunnel to its own loopback: a relay on another
+# machine is spoken to only over TLS, and this stand-in relay has none
+ssh -o BatchMode=yes -o ExitOnForwardFailure=yes -N -R "127.0.0.1:${RELAY_LISTEN##*:}:$RELAY_LISTEN" "$HASHER_SSH" &
+pids+=($!)
+sleep 2
 remote "cd $H && rm -f listing.json hasher.json && \
   (nohup python3 $H/tls_front.py $HASHER_IP:$FRONT_PORT 127.0.0.1:$GW_PORT $H/front.crt $H/front.key > front.log 2>&1 &) && \
   (nohup $H/xbt-gateway $H/gateway.json > gateway.log 2>&1 &) && sleep 3 && \
   (nohup $H/xbt-hashlink hasher --key $H/hasher.key --miners $HASHER_IP:$MINERS_PORT --link $HASHER_IP:$LINK_PORT \
      --slices 127.0.0.1:$SLICES_PORT $TERMS --report $H/hasher.json \
-     --relays ws://$RELAY_LISTEN --nostr-key $H/nostr.key --name '$LISTING_NAME' --link-public $HASHER_IP:$LINK_PORT \
+     --relays ws://127.0.0.1:${RELAY_LISTEN##*:} --nostr-key $H/nostr.key --name '$LISTING_NAME' --link-public $HASHER_IP:$LINK_PORT \
      --pay-url https://$HASHER_IP:$FRONT_PORT/hashrate --pay-node $PAY_NODE --hashrate-hs $HASHRATE_HS \
      --listing-out $H/listing.json > hasher.log 2>&1 &)"
 for _ in $(seq 60); do remote "test -s $H/listing.json" && break; sleep 1; done
 remote "test -s $H/listing.json" || { echo "the hasher published no listing; see $H/hasher.log on $HASHER_SSH" >&2; exit 1; }
-curl -sk --max-time 10 "https://$HASHER_IP:$FRONT_PORT/x402/ticket/health" > "$D/gateway-health-before.json"
+curl -sk --max-time 10 "https://$HASHER_IP:$FRONT_PORT/x402/ticket/health" > "$D/gateway-health-before.json" || { echo "the hasher's gateway did not answer; see $H/gateway.log and front.log on $HASHER_SSH" >&2; exit 1; }
 # the wallet reads the hasher's terms and pays nothing (max_sats 0): the pin, the allowlist and the 402
 python3 -I -c 'import json,socket,sys
 s=socket.socket(socket.AF_UNIX); s.settimeout(120); s.connect(sys.argv[1])
@@ -101,7 +106,7 @@ sleep 5
 curl -sk --max-time 10 "https://$HASHER_IP:$FRONT_PORT/x402/ticket/health" > "$D/gateway-health-after.json" || true
 finish
 trap - EXIT
-scp -q -o BatchMode=yes "$HASHER_SSH:$H/{hasher.json,listing.json,hasher.log,gateway.log,front.log}" "$D/hasher/" || true
+for f in hasher.json listing.json hasher.log gateway.log front.log; do scp -q -o BatchMode=yes "$HASHER_SSH:$H/$f" "$D/hasher/" || true; done
 $BUYER_LNCLI listpayments --include_incomplete > "$D/buyer-payments.json" || true
-remote "$SELLER_LNCLI listinvoices --max_invoices 200 --reversed" > "$D/seller-invoices.json" || true
+remote "$SELLER_LNCLI listinvoices --max_invoices 200 --index_offset 0" > "$D/seller-invoices.json" || true
 python3 -I scripts/p2p_hash/rehearsal_summary.py "$D" "$T0" "$SLICE_WORK" "$STOP_PAYING_AFTER" "$HASHER_IP" "$MINER" | tee "$D/summary.json"
