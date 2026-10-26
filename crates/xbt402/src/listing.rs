@@ -498,6 +498,23 @@ pub fn fetch(seller_url: &str, mut get: impl FnMut(&str) -> Result<Page, String>
             }
         }
     }
+    // and the first items' own URLs: a seller that prices each item under a route of its own (a
+    // film each) answers 402 there and nowhere else
+    let items = doc.get("items").and_then(Value::as_array).into_iter().flatten();
+    let service_items = doc
+        .get("services")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(MAX_SERVICES)
+        .flat_map(|s| s.get("items").and_then(Value::as_array).into_iter().flatten());
+    for it in items.chain(service_items).take(2) {
+        if let Some(u) = it.get("url").and_then(Value::as_str).filter(|u| http_url(u) && canonical_origin(u) == origin) {
+            if !tries.contains(&u.to_string()) {
+                tries.push(u.to_string());
+            }
+        }
+    }
     let mut why = String::new();
     let mut key = None;
     for u in tries.iter().take(4) {
@@ -632,6 +649,28 @@ mod tests {
         })
         .unwrap();
         assert_eq!(got.services[0].path, "/ai/");
+    }
+
+    #[test]
+    fn fetch_finds_the_terms_under_an_item_when_each_item_is_its_own_route() {
+        let (sk, pk) = key();
+        let origin = "https://media.lazarus-xbt.xyz";
+        let body = serde_json::to_string(&sign(&sk, &document(&draft(), origin, &pk))).unwrap();
+        let terms = serde_json::to_string(&json!({"accepts": [{"extra": {"receiptKey": pk}}]})).unwrap();
+        let mut asked = vec![];
+        let got = fetch(origin, |url| {
+            asked.push(url.to_string());
+            Ok(if url.ends_with(PATH) {
+                Page { status: 200, headers: vec![], body: body.clone() }
+            } else if url == "https://media.lazarus-xbt.xyz/Videos/s" {
+                Page { status: 402, headers: vec![], body: terms.clone() }
+            } else {
+                Page { status: 404, headers: vec![], body: String::new() }
+            })
+        })
+        .unwrap();
+        assert_eq!(got.services.len(), 1);
+        assert!(asked.contains(&"https://media.lazarus-xbt.xyz/Videos/s".to_string()));
     }
 
     #[test]
