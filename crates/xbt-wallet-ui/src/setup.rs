@@ -125,9 +125,13 @@ pub const WALLET_MAINNET_NOTICE: [&str; 4] = [
 ];
 
 /// The signer's reason a node is not ready, in words for the owner where a common one is known.
-fn plain_reason(r: &str) -> String {
+pub(crate) fn plain_reason(r: &str) -> String {
     let l = r.to_ascii_lowercase();
-    if l.contains("no usable channel") || l.contains("no channel") {
+    if l.contains("off in this policy") || l.contains("ln.enabled") {
+        "Paying is not turned on in your spending rules yet. Sign the safe starter rules to turn it on.".into()
+    } else if l.contains("mainnet") && (l.contains("ack") || l.contains("acknowledg")) {
+        "Confirm that the app may pay with real money (on Your node).".into()
+    } else if l.contains("no usable channel") || l.contains("no channel") {
         "Your node has no channel the app can pay through. Open a channel in your node's app first.".into()
     } else if l.contains("connect") || l.contains("unreachable") || l.contains("refused") {
         "The app can't reach your node. Check that your Lightning node app is running.".into()
@@ -226,20 +230,39 @@ impl App {
         let have = ln.dir.join(RAIL_MACAROON).is_file();
         let acked = ln.dir.join(MAINNET_ACK_FILE).is_file();
         let ready = status["ready"] == true;
-        let mut b = String::from("<p class=\"lead\">The app pays for services through your own Lightning node. Connect it once with a key \
-            you make in your node's app. The key lets the app pay within your spending rules; it cannot open or close channels.</p>");
+        // the keys the app made itself through the box's own node (`node-keys`), with no step by the owner
+        let auto = have && crate::node_keys::made_by_box(&ln.dir);
+        let main = chain == "main";
+        let mut b = String::from(if auto {
+            "<p class=\"lead\">The app pays for services through this box's own Lightning node. It connected by itself when it was \
+             installed, with a key that can pay only within your spending rules; it cannot open or close channels.</p>"
+        } else {
+            "<p class=\"lead\">The app pays for services through your own Lightning node. Connect it once with a key \
+             you make in your node's app. The key lets the app pay within your spending rules; it cannot open or close channels.</p>"
+        });
+        let needs_ack = have && main && !acked;
         b.push_str(&format!("<section class=\"status {}\"><p class=\"status-head\">{}</p><p>{}</p></section>",
             if ready { "ok" } else if have { "warn" } else { "bad" },
-            if ready { "Connected and ready to pay" } else if have { "Connected, not ready yet" } else { "Not connected" },
+            if ready && auto { "Connected to your Lightning node" } else if ready { "Connected and ready to pay" }
+            else if needs_ack { "Connected: one last step" } else if have { "Connected, not ready yet" } else { "Not connected" },
             if ready { "Nothing to do here.".to_string() }
+            else if needs_ack { "Confirm below that the app may pay with real money.".into() }
             else if have { format!("{} If this stays, open the details below.", esc(&plain_reason(&txt(status.get("reason").or(status.get("config_error")))))) }
             else { "Make the key in your node's app and paste it below.".into() }));
+        if needs_ack {
+            b.push_str(&format!("<form method=\"post\" action=\"./lightning\" class=\"card primary\">{}<input type=\"hidden\" name=\"action\" value=\"ack\">\
+                <h2>Pay with real money</h2><p>This is a real Lightning node. Keep your spending rules low while you try the app.</p>\
+                <details><summary>Read before you start</summary>{}</details>\
+                <label class=\"check\"><input type=\"checkbox\" name=\"ack\" value=\"1\" required> I understand that the app pays with real money, within my spending rules</label>\
+                <button>Start paying</button></form>", App::csrf_input(ctx), notice_html(&WALLET_MAINNET_NOTICE)));
+        }
         b.push_str(&pin_card(&App::csrf_input(ctx), ln.pin, ln.rest.as_deref(), ln.tls_cert.as_deref(), "./lightning"));
-        let main = chain == "main";
-        if main {
+        if main && !auto {
             b.push_str(&format!("<div class=\"flash warn\"><p><strong>This is real money.</strong> Keep your spending rules low while you try the app.</p>\
                 <details><summary>Read before you connect</summary>{}</details></div>", notice_html(&WALLET_MAINNET_NOTICE)));
         }
+        // the owner's own key: the main form when nothing is connected, under Advanced when the box connected the app
+        b.push_str(if auto { "<details class=\"card\"><summary>Advanced: use a key of your own instead</summary>" } else { "" });
         b.push_str(&format!("<form method=\"post\" action=\"./lightning\" class=\"card{}\">{}<input type=\"hidden\" name=\"action\" value=\"save\">\
             <h2>{}</h2>\
             <details><summary>How do I make the key?</summary><ol><li>Open your Lightning node's app (Lightning Fork) and find the page called \
@@ -253,11 +276,14 @@ impl App {
                                 esc(MAINNET_ACK), if acked { "<p class=\"hint\">You typed it before; type it again to replace the key.</p>" } else { "" }));
         }
         b.push_str(&format!("<button{}>Connect</button></form>", if have { " class=\"secondary\"" } else { "" }));
+        b.push_str(if auto { "</details>" } else { "" });
         b.push_str("<details class=\"card\"><summary>Details</summary>");
         b.push_str(&kv(&[
             ("Node address", ln.rest.as_deref().map(|r| format!("<code>{}</code>", esc(r))).unwrap_or_else(|| "<span class=\"pill bad\">not given by this box</span>".into())),
             ("Node certificate", cert_line(ln.tls_cert.as_deref())),
-            ("Key", if have { "<span class=\"pill good\">stored</span> (never shown again)".into() } else { "<span class=\"pill warn\">none</span>".into() }),
+            ("Key", if auto { format!("<span class=\"pill good\">made by the app</span> with only <code>{}</code>, under a root key of its own: \
+                              you can revoke it in your node's app ({})", RAIL_OPS.join(" "), esc(&crate::node_keys::root_key_line(&ln.dir, RAIL_MACAROON))) }
+                    else if have { "<span class=\"pill good\">stored</span> (never shown again)".into() } else { "<span class=\"pill warn\">none</span>".into() }),
             ("Chain", esc(&chain)),
         ]));
         b.push_str(&format!("<p>What the wallet sees of the node:</p>{}", json_block(&status)));
@@ -277,8 +303,23 @@ impl App {
         let ln = &self.cfg.ln;
         let result = match f.get("action").map(String::as_str) {
             Some("pin_cert") => pin_cert(ln.pin, ln.rest.as_deref(), ln.tls_cert.as_deref(), f.get("fingerprint").map(String::as_str).unwrap_or("")),
+            Some("ack") => (|| {
+                if self.signer_chain() != "main" {
+                    return Ok("Nothing to confirm on a test network.".to_string());
+                }
+                if f.get("ack").map(String::as_str) != Some("1") {
+                    return Err("Tick the box to confirm that the app pays with real money.".into());
+                }
+                if !dir.join(RAIL_MACAROON).is_file() {
+                    return Err("Your node is not connected yet.".into());
+                }
+                write_shared(dir, MAINNET_ACK_FILE, format!("{MAINNET_ACK}\n").as_bytes())?;
+                Ok("Done. The app can now pay within your spending rules; the status above follows in a few seconds.".into())
+            })(),
             Some("remove") => remove_shared(dir, RAIL_MACAROON).map(|had| {
                 let _ = remove_shared(dir, MAINNET_ACK_FILE);
+                // a key the app made itself is not made again at the next start
+                let _ = crate::node_keys::turn_off(dir);
                 if had { "Your node is disconnected: its key was removed from this box, and the app pays nothing now.".to_string() } else { "Your node was not connected.".into() }
             }),
             Some("save") => (|| {

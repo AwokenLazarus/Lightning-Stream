@@ -1564,3 +1564,202 @@ fn main_screens_speak_plain_words() {
     assert_eq!(g.post("/setup-password", &[("code", code.trim()), ("password", PW), ("password2", PW)]).status, 303);
     check("seller's page", &g.get("/").body);
 }
+
+// --- no setup on a box: the node connects itself, the box's login, the code, the player, your shop --
+
+/// The keys the app makes itself through the box's node: the Lightning page says it is connected by
+/// itself, keeps the owner's own key under Advanced, and a disconnect is not undone at the next start.
+#[cfg(unix)]
+#[test]
+fn a_node_the_box_connected_by_itself_needs_no_key_and_a_disconnect_stays() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let ln = tempfile::tempdir().unwrap();
+    let dir = ln.path().to_path_buf();
+    let s = xbt_wallet_ui::node_keys::Settings { rest: "https://10.21.21.66:8180".into(), tls_cert: None, admin: dir.join("none"),
+                                                 rail_dir: Some(dir.clone()), gw_dir: None };
+    let rail = mac(&[("info", &["read"]), ("offchain", &["read", "write"]), ("onchain", &["read"])]);
+    let made = xbt_wallet_ui::node_keys::make_keys(&s, &mut |_, _| Ok(hex::decode(&rail).unwrap())).unwrap();
+    assert_eq!(made.made, vec!["rail.macaroon"]);
+    let b = start(json!({}), false, |c| {
+        c.ln.dir = dir.clone();
+        c.ln.rest = Some("https://10.21.21.66:8180".into());
+    });
+    let mut br = logged_in(&b);
+    let page = br.get("/lightning").body;
+    assert!(page.contains("connected by itself") && page.contains("made by the app") && page.contains("root key id "), "{page}");
+    assert!(page.contains("Advanced: use a key of your own instead") && !page.contains(&rail), "{page}");
+    let r = br.act("/lightning", "/lightning", &[("action", "remove")]);
+    assert!(br.flash_after(&r).contains("removed"));
+    // the next start makes nothing: the node is not even asked
+    assert!(xbt_wallet_ui::node_keys::run(&s).unwrap().made.is_empty());
+    assert!(!dir.join("rail.macaroon").exists());
+    assert!(br.get("/lightning").body.contains("Not connected"));
+}
+
+/// The box's own login proxy (here: the loopback peer, named `localhost`) is the owner, already logged
+/// in by the box: no app password. A box whose proxy is another peer still asks for it.
+#[test]
+fn the_boxs_login_proxy_needs_no_app_password_and_other_peers_still_do() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let b = start(json!({}), false, |c| c.platform_login = Some("localhost".into()));
+    let mut br = B::new(&b.base);
+    let r = br.get("/wallet?x=1");
+    assert_eq!((r.status, r.location()), (303, "./wallet?x=1"), "{}", r.body);
+    assert!(!br.cookie.is_empty(), "a session is made at once");
+    let page = br.get("/wallet");
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert_eq!(br.get("/login").location(), "./");
+    let other = start(json!({}), false, |c| c.platform_login = Some("no-such-host.invalid".into()));
+    let mut br = B::new(&other.base);
+    let r = br.get("/wallet");
+    assert_ne!(r.status, 200);
+    assert!(br.cookie.is_empty(), "no session for a peer that is not the proxy");
+}
+
+/// The box hands the setup page the signer's one-time code: the owner types nothing from a log.
+#[test]
+fn the_enrolment_code_the_box_gives_is_filled_in() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let code = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(code.path(), "ABCD-EFGH-IJKL\n").unwrap();
+    let path = code.path().to_path_buf();
+    let b = start_on(Rig::new(json!({"human_pubkey": ""}), false), |c| c.enroll_code_file = Some(path.clone()));
+    let mut br = logged_in(&b);
+    let page = br.get("/setup").body;
+    assert!(page.contains("<input type=\"hidden\" name=\"code\" value=\"ABCD-EFGH-IJKL\">"), "{page}");
+    assert!(!page.contains("Enrolment code<input") && page.contains("Use this key for approvals"), "{page}");
+    assert!(page.contains("Download the backup file") && page.contains("I saved the backup somewhere safe"), "{page}");
+    // without the box's copy the code is asked as before
+    let b = start_on(Rig::new(json!({"human_pubkey": ""}), false), |_| {});
+    let mut br = logged_in(&b);
+    assert!(br.get("/setup").body.contains("Enrolment code<input"));
+}
+
+const FILM2: &str = "https://media.lazarus-xbt.xyz/Videos/0f0967c6719ebc0951976655686df3bc/stream?static=true";
+
+/// The player never sits black: a wallet that cannot pay says so before anything is tried, with the
+/// next step, and a play that failed says why in plain words.
+#[test]
+fn the_player_says_why_it_cannot_play_and_what_to_do() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("services.json");
+    std::fs::write(&path, format!(r#"[{{"name": "Films", "kind": "video", "seller": "https://media.lazarus-xbt.xyz", "price_text": "20 sat a MiB",
+        "items": [{{"title": "Elephants Dream", "year": 2006, "url": "{FILM2}", "credit": "CC BY 2.5"}}]}}]"#)).unwrap();
+    // no approval key: nothing can pay yet
+    let b = start_on(Rig::new(json!({"human_pubkey": ""}), false), |c| c.services_file = Some(path.clone()));
+    let mut br = logged_in(&b);
+    let play = br.get(&format!("/play?item={}", enc(FILM2))).body;
+    assert!(play.contains("Your wallet isn&#39;t set up yet") || play.contains("Your wallet isn't set up yet"), "{play}");
+    assert!(play.contains("href=\"./setup\"") && play.contains("Finish setup") && !play.contains("<video"), "{play}");
+    // with a key: the player, with a place for a message, and the reason of a failed play on ask
+    let b = start(json!({}), false, |c| c.services_file = Some(path.clone()));
+    let mut br = logged_in(&b);
+    let play = br.get(&format!("/play?item={}", enc(FILM2))).body;
+    assert!(play.contains("<video") && play.contains("data-player") && play.contains("class=\"player-msg\""), "{play}");
+    // this rig's node is not ready: said above the player, with where to look
+    assert!(play.contains("may not be able to pay yet") && (play.contains("Check your node") || play.contains("Open the starter rules")), "{play}");
+    assert_eq!(serde_json::from_str::<Value>(&br.get(&format!("/api/play-error?item={}", enc(FILM2))).body).unwrap()["failed"], false);
+    for (status, body, words, href) in [
+        (402, r#"{"error": "the seller is not on the allowlist", "rule": "allowlist"}"#, "not allowed yet", "./services"),
+        (402, r#"{"error": "the daily budget is spent", "rule": "daily_budget"}"#, "spending limit", "./policy"),
+        (402, r#"{"error": "no route: insufficient outbound balance", "rule": "ln"}"#, "Not enough balance", "./wallet"),
+        (504, r#"{"error": "the seller sent nothing within 60 s"}"#, "didn't answer", "./services"),
+        (402, r#"{"error": "no human key is enrolled", "rule": "human_key"}"#, "isn't set up", "./setup"),
+    ] {
+        b._app.note_play_error(FILM2, status, body.as_bytes());
+        let v: Value = serde_json::from_str(&br.get(&format!("/api/play-error?item={}", enc(FILM2))).body).unwrap();
+        assert_eq!(v["failed"], true);
+        assert!(v["words"].as_str().unwrap().contains(words), "{v}");
+        assert_eq!(v["href"], href, "{v}");
+    }
+    // the reason is the owner's: not without a login
+    assert_eq!(B::new(&b.base).get(&format!("/api/play-error?item={}", enc(FILM2))).status, 401);
+}
+
+/// A box cannot buy from its own shop: its services are marked as the owner's, and their items play
+/// as a free preview straight from the service on the box, for the logged-in owner only.
+#[test]
+fn your_own_shop_is_marked_and_previews_free_for_you_only() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    fn film(path: &str) -> (u16, &'static str) {
+        if path.starts_with("/Videos/abc/") { (200, "FILM BYTES") } else { (404, "{}") }
+    }
+    let service = mock_http(film);
+    let gw = tempfile::tempdir().unwrap();
+    std::fs::write(gw.path().join("config.json"), json!({"public_url": "https://media.example", "upstream": format!("http://{service}"),
+        "routes": [{"path": "/Videos/abc/"}]}).to_string()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("services.json");
+    let item = "https://media.example/Videos/abc/stream?static=true";
+    std::fs::write(&path, format!(r#"[{{"name": "My films", "kind": "video", "seller": "https://media.example", "price_text": "20 sat a MiB",
+        "items": [{{"title": "Sintel", "year": 2010, "url": "{item}", "credit": "CC BY 3.0"}}]}},
+        {{"name": "Their films", "kind": "video", "seller": "https://other.example", "price_text": "20 sat a MiB",
+        "items": [{{"title": "Other", "year": 2010, "url": "https://other.example/Videos/abc/stream", "credit": "CC0"}}]}}]"#)).unwrap();
+    let gwdir = gw.path().to_path_buf();
+    let b = start(json!({}), false, |c| {
+        c.services_file = Some(path.clone());
+        c.sell = true;
+        c.gw.dir = gwdir.clone();
+    });
+    let mut br = logged_in(&b);
+    let browse = br.get("/browse").body;
+    assert_eq!(browse.matches("Your shop</span>").count(), 1, "{browse}");
+    let page = br.get(&format!("/service?seller={}&name={}", enc("https://media.example"), enc("My films"))).body;
+    assert!(page.contains("This is your shop") && page.contains("Preview (free)"), "{page}");
+    let theirs = br.get(&format!("/service?seller={}&name={}", enc("https://other.example"), enc("Their films"))).body;
+    assert!(!theirs.contains("This is your shop") && !theirs.contains("Preview (free)"));
+    let play = br.get(&format!("/play?item={}", enc(item))).body;
+    assert!(play.contains(&format!("src=\"./preview?item={}\"", enc(item))) && play.contains("Nothing is paid"), "{play}");
+    assert!(!play.contains("./s/"), "never through the gateway or the wallet");
+    let r = br.get(&format!("/preview?item={}", enc(item)));
+    assert_eq!((r.status, r.body.as_str()), (200, "FILM BYTES"));
+    // not without the owner's login, and never another seller's item
+    assert_eq!(B::new(&b.base).get(&format!("/preview?item={}", enc(item))).status, 401);
+    assert_eq!(br.get(&format!("/preview?item={}", enc("https://other.example/Videos/abc/stream"))).status, 404);
+}
+
+/// "Allow this seller to be paid": the seller's node read from its own terms, then the spending rules
+/// filled in with its address tied to that node, for one signature.
+#[test]
+fn allowing_a_seller_fills_in_the_spending_rules_for_one_signature() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let node = format!("02{}", "ab".repeat(32));
+    let terms = json!({"accepts": [{"scheme": "ticket", "payTo": node}]}).to_string();
+    let got = xbt_wallet_ui::app::services_page::seller_node(&["https://seller.example/x".into(), "https://seller.example".into()], |u| {
+        Ok(if u.ends_with("/x") { xbt402::listing::Page { status: 402, headers: vec![], body: terms.clone() } }
+           else { xbt402::listing::Page { status: 404, headers: vec![], body: String::new() } })
+    }).unwrap();
+    assert_eq!(got, node);
+    assert!(xbt_wallet_ui::app::services_page::seller_node(&["https://seller.example".into()], |_| {
+        Ok(xbt402::listing::Page { status: 200, headers: vec![], body: String::new() })
+    }).is_err());
+    let b = start(json!({}), false, |_| {});
+    let mut br = logged_in(&b);
+    let page = br.get(&format!("/policy?allow={}&node={node}", enc("https://seller.example"))).body;
+    assert!(page.contains("Allow https://seller.example to be paid") && page.contains("in any 7 days"), "{page}");
+    assert!(page.contains("https://seller.example") && page.contains(&node), "{page}");
+    // a bad node is ignored: nothing filled in
+    let page = br.get(&format!("/policy?allow={}&node=zz", enc("https://seller.example"))).body;
+    assert!(!page.contains("Allow https://seller.example to be paid"));
+}
+
+/// The Sell page offers the services it finds on the box, in one click.
+#[test]
+fn the_sell_page_offers_the_services_found_on_the_box() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    fn ok(_: &str) -> (u16, &'static str) { (200, "{}") }
+    let jelly = mock_http(ok);
+    let gw = tempfile::tempdir().unwrap();
+    let gwdir = gw.path().to_path_buf();
+    let b = start(json!({}), false, |c| {
+        c.sell = true;
+        c.gw.dir = gwdir.clone();
+        c.local_services = vec![("Jellyfin".into(), format!("http://{jelly}")), ("Gone".into(), "http://127.0.0.1:1".into())];
+    });
+    let mut br = logged_in(&b);
+    let page = br.get("/sell").body;
+    assert!(page.contains("Found on this box") && page.contains(&format!("data-value=\"http://{jelly}\"")), "{page}");
+    assert!(!page.contains("http://127.0.0.1:1\""), "a service that does not answer is not offered");
+    assert!(page.contains("I don&#39;t have an https address yet") || page.contains("I don't have an https address yet"), "{page}");
+}

@@ -153,6 +153,16 @@ impl xbt_svc::http::Handler for Ui {
         let (raw_path, q) = rq.target.split_once('?').unwrap_or((&rq.target, ""));
         let headers = rq.headers.iter().map(|(k, v)| (k.to_ascii_lowercase(), v.clone())).collect();
         let req = Req { method: rq.method.to_uppercase(), path: raw_path.to_string(), query: parse_qs(q), headers, body: vec![], peer };
+        // the owner's free preview of an item of their own shop, straight from the service on the box
+        if let Some(gate) = self.0.preview_gate(&req) {
+            return match gate {
+                Err(mut resp) => {
+                    security_headers(&mut resp);
+                    xbt_svc::http::Reply::Whole(xbt_svc::http::Response::new(resp.status, resp.headers, resp.body))
+                }
+                Ok(url) => relay(&url, req.headers.get("range").map(String::as_str), &|_, _| {}),
+            };
+        }
         match self.0.relay_gate(&req) {
             None => xbt_svc::http::Reply::Whole(self.handle(rq)),
             Some(Err(mut resp)) => {
@@ -162,7 +172,9 @@ impl xbt_svc::http::Handler for Ui {
             Some(Ok(item)) => {
                 // for /s/, the seller URL is everything after /s/, its own query included
                 let item = item.unwrap_or_else(|| rq.target.split_once("/s/").map(|(_, u)| u.to_string()).unwrap_or_default());
-                relay(&self.0.cfg.connector, &item, req.headers.get("range").map(String::as_str))
+                let url = format!("{}/s/{item}", self.0.cfg.connector.trim_end_matches('/'));
+                let app = self.0.clone();
+                relay(&url, req.headers.get("range").map(String::as_str), &move |code, body| app.note_play_error(&item, code, body))
             }
         }
     }
@@ -171,13 +183,13 @@ impl xbt_svc::http::Handler for Ui {
 /// The headers of a relayed answer that are passed on from the connector.
 const RELAYED: [&str; 3] = ["Content-Type", "Content-Range", "Accept-Ranges"];
 
-/// Stream the connector's answer for `item` (a seller URL) to the player, with the player's
-/// `Range` (the connector takes one plain byte range and ignores any other), and the connector's
-/// status, `Content-Range`, `Accept-Ranges` and `Content-Length` back.
-fn relay(connector: &str, item: &str, range: Option<&str>) -> xbt_svc::http::Reply {
-    let url = format!("{}/s/{item}", connector.trim_end_matches('/'));
-    let agent = ureq::AgentBuilder::new().timeout_connect(std::time::Duration::from_secs(5)).build();
-    let mut rq = agent.get(&url);
+/// Stream the answer at `url` (the connector's for a seller URL, or the owner's own service for a
+/// preview) to the player, with the player's `Range` (the connector takes one plain byte range and
+/// ignores any other). An answer that is not a success is handed whole to `failed` first, so the
+/// player page can say why.
+fn relay(url: &str, range: Option<&str>, failed: &dyn Fn(u16, &[u8])) -> xbt_svc::http::Reply {
+    let agent = ureq::AgentBuilder::new().timeout_connect(std::time::Duration::from_secs(5)).redirects(0).build();
+    let mut rq = agent.get(url);
     if let Some(r) = range.map(str::trim).filter(|r| r.len() <= 128 && r.bytes().all(|b| b.is_ascii_graphic() || b == b' ')) {
         rq = rq.set("Range", r);
     }
@@ -189,13 +201,16 @@ fn relay(connector: &str, item: &str, range: Option<&str>) -> xbt_svc::http::Rep
         Err(ureq::Error::Status(code, r)) => {
             let headers = passed(&r).into_iter().filter(|(k, _)| k != "Content-Type").collect::<Vec<_>>();
             let body = r.into_string().unwrap_or_default().into_bytes();
+            failed(code, &body);
             let mut whole = Resp::text(code, "application/json", body);
             whole.headers.extend(headers);
             security_headers(&mut whole);
             return xbt_svc::http::Reply::Whole(xbt_svc::http::Response::new(whole.status, whole.headers, whole.body));
         }
         Err(e) => {
-            let mut whole = Resp::json(502, &serde_json::json!({"error": format!("the connector: {e}")}));
+            let v = serde_json::json!({"error": format!("the connector: {e}")});
+            failed(502, v.to_string().as_bytes());
+            let mut whole = Resp::json(502, &v);
             security_headers(&mut whole);
             return xbt_svc::http::Reply::Whole(xbt_svc::http::Response::new(whole.status, whole.headers, whole.body));
         }

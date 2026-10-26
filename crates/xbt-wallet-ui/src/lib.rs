@@ -19,6 +19,8 @@ pub mod auth;
 pub mod config;
 pub mod html;
 pub mod link;
+pub mod node_keys;
+pub mod own_shop;
 pub mod msg;
 pub mod nostr;
 pub mod relay;

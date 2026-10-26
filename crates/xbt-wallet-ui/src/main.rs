@@ -7,6 +7,9 @@
 //!   xbt-wallet-ui pubkey --key FILE             the key file's public key (for enrolment)
 //!   xbt-wallet-ui healthcheck [--ready]         GET /healthz (or /readyz) on XBT_UI_BIND: the image's
 //!                                               HEALTHCHECK (it has no shell or curl); exit 0 on 200
+//!   xbt-wallet-ui node-keys                     make the app's narrow macaroons through the box's own
+//!                                               Lightning node (`node_keys`), retrying until the node
+//!                                               answers; exit 0 once every key is there
 //!
 //! `serve` stops on SIGTERM or SIGINT: no new connection, the requests in flight get 5 s, exit 0.
 use std::io::Read;
@@ -30,6 +33,7 @@ fn main() {
     let code = match args.first().map(String::as_str) {
         None | Some("serve") => serve(),
         Some("healthcheck") => healthcheck(args.iter().any(|a| a == "--ready")),
+        Some("node-keys") => node_keys(),
         Some("sign") | Some("pubkey") => match offline(&args) {
             Ok(out) => {
                 println!("{out}");
@@ -41,7 +45,7 @@ fn main() {
             }
         },
         Some("-h") | Some("--help") => {
-            println!("usage: xbt-wallet-ui [serve] | sign --key FILE --message-hex HEX | pubkey --key FILE | healthcheck [--ready]\n\
+            println!("usage: xbt-wallet-ui [serve] | sign --key FILE --message-hex HEX | pubkey --key FILE | healthcheck [--ready] | node-keys\n\
                       serve reads XBT_UI_BIND, XBT_UI_SIGNER_SOCK, XBT_UI_DATA_DIR, XBT_UI_PASSWORD_FILE, XBT_UI_BASE_PATH, ... (README)");
             0
         }
@@ -61,6 +65,41 @@ fn offline(args: &[String]) -> Result<String, String> {
     }
     let m = hex::decode(arg(args, "--message-hex").ok_or("--message-hex HEX is required")?.trim()).map_err(|_| "--message-hex is not hex")?;
     Ok(hex::encode(ed25519_dalek::Signer::sign(&sk, &m).to_bytes()))
+}
+
+/// Until every key is there: a node that is starting, or whose wallet is still locked, is asked again
+/// (5 s, doubling to 5 min). A setting that is missing is not retried.
+fn node_keys() -> i32 {
+    // a box that gives the app no Lightning node: nothing to make (the owner can still paste keys)
+    if std::env::var("XBT_KEYS_NODE_REST").map(|v| v.trim().is_empty()).unwrap_or(true) {
+        eprintln!("xbt-wallet-ui node-keys: this box gave no Lightning node; nothing to make");
+        return 0;
+    }
+    let s = match xbt_wallet_ui::node_keys::Settings::from_env() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("xbt-wallet-ui node-keys: {e}");
+            return 2;
+        }
+    };
+    let mut wait = std::time::Duration::from_secs(5);
+    loop {
+        match xbt_wallet_ui::node_keys::run(&s) {
+            Ok(o) if o.made.is_empty() => {
+                eprintln!("xbt-wallet-ui node-keys: the app's keys were already there; nothing made");
+                return 0;
+            }
+            Ok(o) => {
+                eprintln!("xbt-wallet-ui node-keys: made {} through the box's Lightning node (each with a root key of its own)", o.made.join(", "));
+                return 0;
+            }
+            Err(e) => {
+                eprintln!("xbt-wallet-ui node-keys: not yet: {e}; asking again in {} s", wait.as_secs());
+                std::thread::sleep(wait);
+                wait = (wait * 2).min(std::time::Duration::from_secs(300));
+            }
+        }
+    }
 }
 
 fn healthcheck(ready: bool) -> i32 {
