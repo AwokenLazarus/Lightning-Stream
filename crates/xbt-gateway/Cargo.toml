@@ -11,6 +11,8 @@ publish.workspace = true
 xbt-primitives.workspace = true
 xbt402.workspace = true
 xbt-svc.workspace = true
+# the listing published on Nostr (docs/NOSTR.md)
+xbt-nostr.workspace = true
 sha2.workspace = true
 hex.workspace = true
 thiserror.workspace = true

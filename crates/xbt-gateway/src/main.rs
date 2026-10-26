@@ -132,7 +132,16 @@ fn run(args: &[String]) -> Result<(), String> {
             }
         }
     }
+    let nostr = cfg.nostr.clone().filter(|n| n.publish);
+    let nostr_key = match &nostr {
+        Some(_) => Some(xbt_gateway::nostr::load_key(&cfg.state_dir)?),
+        None => None,
+    };
     let gw = Gateway::start(cfg, node, key, Box::new(unix_now)).map_err(|e| e.to_string())?;
+    if let (Some(n), Some(k)) = (nostr, nostr_key) {
+        eprintln!("xbt-gateway: publishing the listing on Nostr to {} relays every {} s, as Nostr key {}", n.relays.len(), n.republish.as_secs(), k.public_hex());
+        xbt_gateway::nostr::spawn(gw.clone(), k, n).map_err(|e| format!("nostr: {e}"))?;
+    }
     let running = gw.serve(listener).map_err(|e| e.to_string())?;
     eprintln!(
         "xbt-gateway: listening on {}; an lnd-family node, {}; receipts signed by {}",

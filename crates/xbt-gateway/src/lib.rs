@@ -37,6 +37,7 @@ pub mod config;
 pub mod gateway;
 pub mod lottery;
 pub mod node;
+pub mod nostr;
 pub mod price;
 pub mod standin;
 pub mod store;

@@ -238,6 +238,21 @@ and nothing else may reach the gateway from a listed address. Get one wrong and 
 its own address. The cap on connections (`http.per_address`) is taken before any header is read:
 set it to 0 behind a proxy.
 
+## The listing on Nostr
+
+With a `listing` section, the gateway can also send its signed listing to Nostr relays, so that
+buyers' apps (and any Nostr client that shows NIP-99 classifieds) find the seller without a
+directory. It is off unless the config says so:
+
+```json
+"nostr": {"relays": ["wss://relay.example"], "publish": true, "republish_s": 21600}
+```
+
+The gateway signs the events with a Nostr key of its own, `nostr.key` in the state directory,
+made on first start, and the receipt key signs a binding of that key to `public_url`. It sends the
+listing at start and every `republish_s` seconds (default six hours, from 600 to 604800). It reads
+nothing back from relays. What goes over Nostr and why: `docs/NOSTR.md`.
+
 ## What the defaults cost you
 
 A channel carries a fixed number of pending payments each way, for everyone who pays over it:

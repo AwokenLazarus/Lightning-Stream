@@ -161,6 +161,55 @@ pub struct Config {
     pub times: Times,
     /// The signed catalog (`docs/LISTINGS.md`). Absent: the well-known URL answers 404.
     pub listing: Option<xbt402::listing::Draft>,
+    /// Publishing the listing on Nostr (`docs/NOSTR.md`). Absent: nothing is published.
+    pub nostr: Option<NostrConfig>,
+}
+
+/// The `nostr` section: the relays the listing goes to, and how often it is sent again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NostrConfig {
+    pub relays: Vec<String>,
+    /// Off unless the runner writes `true`: a listing is public the moment a relay has it.
+    pub publish: bool,
+    /// Relays drop old events, and a relay that was down missed the last one.
+    pub republish: Duration,
+}
+
+/// At most this many relays.
+pub const MAX_NOSTR_RELAYS: usize = 10;
+
+impl NostrConfig {
+    fn parse(v: &Value) -> Result<Self, String> {
+        let m = obj(v, "nostr", &["relays", "publish", "republish_s"])?;
+        let relays = match m.get("relays") {
+            None => Vec::new(),
+            Some(Value::Array(a)) => a
+                .iter()
+                .map(|r| {
+                    let r = r.as_str().ok_or("nostr.relays is a list of wss:// URLs")?;
+                    xbt_nostr::ws::parse_url(r).map_err(|e| format!("nostr.relays {r}: {e}"))?;
+                    Ok(r.to_string())
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+            Some(_) => return Err("nostr.relays is a list of wss:// URLs".into()),
+        };
+        if relays.len() > MAX_NOSTR_RELAYS {
+            return Err(format!("nostr.relays: at most {MAX_NOSTR_RELAYS}"));
+        }
+        let publish = match m.get("publish") {
+            None => false,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => return Err("nostr.publish is true or false".into()),
+        };
+        if publish && relays.is_empty() {
+            return Err("nostr.publish needs at least one relay in nostr.relays".into());
+        }
+        let secs = num(m, "republish_s", 6 * 3600)?;
+        if !(600..=7 * 86_400).contains(&secs) {
+            return Err("nostr.republish_s is from 600 (ten minutes) to 604800 (a week)".into());
+        }
+        Ok(Self { relays, publish, republish: Duration::from_secs(secs) })
+    }
 }
 
 /// A reverse proxy in front of the gateway, and the header in which it reports the address it
@@ -255,6 +304,7 @@ impl Config {
                 "http",
                 "times",
                 "listing",
+                "nostr",
             ],
         )?;
         // a file that names no chain is a regtest file: mainnet is never what a missing key means
@@ -578,6 +628,13 @@ impl Config {
             None | Some(Value::Null) => None,
             Some(l) => Some(xbt402::listing::parse_draft(l).map_err(|e| format!("listing: {e}"))?),
         };
+        let nostr = match top.get("nostr") {
+            None | Some(Value::Null) => None,
+            Some(n) => Some(NostrConfig::parse(n)?),
+        };
+        if nostr.as_ref().is_some_and(|n| n.publish) && listing.is_none() {
+            return Err("nostr.publish publishes the listing: write a listing section, or leave publish out".into());
+        }
         Ok(Self {
             listen,
             public_url: origin.trim_end_matches('/').to_string(),
@@ -598,6 +655,7 @@ impl Config {
             forwarded,
             times,
             listing,
+            nostr,
         })
     }
 }
@@ -1278,6 +1336,26 @@ mod tests {
         for (want, f) in cases {
             let e = edit(&*f).unwrap_err().to_string();
             assert!(e.contains(want), "wanted {want:?}, got {e:?}");
+        }
+    }
+
+    #[test]
+    fn nostr_publishing_is_off_unless_written_and_needs_relays_and_a_listing() {
+        assert!(Config::from_json(&base()).unwrap().nostr.is_none());
+        let mut v = base();
+        v["nostr"] = json!({"relays": ["wss://relay.example"]});
+        let n = Config::from_json(&v).unwrap().nostr.unwrap();
+        assert!(!n.publish);
+        assert_eq!(n.republish, Duration::from_secs(6 * 3600));
+        v["nostr"]["publish"] = json!(true);
+        assert!(Config::from_json(&v).unwrap_err().to_string().contains("listing"));
+        v["listing"] = json!({"name": "n", "kind": "video", "prices": {"request_msat": 1000}, "items": [],
+                              "licence": "l", "credits": "c", "updated": "u"});
+        assert!(Config::from_json(&v).unwrap().nostr.unwrap().publish);
+        for bad in [json!({"relays": ["ws://relay.example"], "publish": true}), json!({"relays": [], "publish": true}),
+                    json!({"relays": ["wss://r.example"], "republish_s": 5}), json!({"relays": ["wss://r.example"], "other": 1})] {
+            v["nostr"] = bad;
+            assert!(Config::from_json(&v).is_err());
         }
     }
 
