@@ -13,7 +13,7 @@ use xbt402::ticket::{
 
 use crate::book::Caps;
 use crate::lottery::LotteryConfig;
-use crate::price::Price;
+use crate::price::{Price, TokenRule};
 use crate::Error;
 
 /// What `mainnet_ack` must say, word for word, before a config with `chain: "main"` is taken (the
@@ -716,6 +716,7 @@ fn route(v: &Value) -> Result<Route, String> {
             "max_body",
             "upstream",
             "strip_prefix",
+            "max_output_tokens",
         ],
     )?;
     let path = req_str(r, "path")?.to_string();
@@ -759,19 +760,36 @@ fn route(v: &Value) -> Result<Route, String> {
         Some(p) => obj(
             p,
             "price",
-            &["request_msat", "byte_msat", "per_bytes", "second_msat"],
+            &["request_msat", "byte_msat", "per_bytes", "second_msat", "per_1k_input_msat", "per_1k_output_msat"],
         )
         .map_err(|e| bad(&e))?,
         None => &empty,
+    };
+    let tokens = TokenRule {
+        input_per_1k_msat: num(p, "per_1k_input_msat", 0)?,
+        output_per_1k_msat: num(p, "per_1k_output_msat", 0)?,
+        max_output: num(r, "max_output_tokens", xbt402::tokens::DEFAULT_MAX_OUTPUT)?,
     };
     let price = Price {
         request_msat: num(p, "request_msat", 0)?,
         byte_msat: num(p, "byte_msat", 0)?,
         per_bytes: num(p, "per_bytes", 1)?,
         second_msat: num(p, "second_msat", 0)?,
+        tokens: if tokens.active() { tokens } else { TokenRule::NONE },
     };
     if price.per_bytes == 0 {
         return Err(bad("price.per_bytes is at least 1"));
+    }
+    if r.get("max_output_tokens").is_some() && !tokens.active() {
+        return Err(bad("max_output_tokens is for a route priced by the token"));
+    }
+    if tokens.active() {
+        if price.byte_msat > 0 || price.second_msat > 0 {
+            return Err(bad("a route priced by the token has no price per byte or per second beside it"));
+        }
+        if !(1..=1_000_000).contains(&tokens.max_output) {
+            return Err(bad("max_output_tokens is from 1 to 1000000"));
+        }
     }
     if free != price.is_free() {
         return Err(bad("a route has a price, or says \"free\": true, and not both: a price left out by mistake must not serve for nothing"));
@@ -858,6 +876,12 @@ fn price_json(p: &Price) -> Value {
     }
     if p.second_msat > 0 {
         o.insert("second_msat".into(), p.second_msat.into());
+    }
+    if p.tokens.input_per_1k_msat > 0 {
+        o.insert("per_1k_input_msat".into(), p.tokens.input_per_1k_msat.into());
+    }
+    if p.tokens.output_per_1k_msat > 0 {
+        o.insert("per_1k_output_msat".into(), p.tokens.output_per_1k_msat.into());
     }
     if o.is_empty() {
         // a free route: one rule of nothing, which a listing can state
@@ -1488,6 +1512,32 @@ mod tests {
             let mut v = base();
             f(&mut v);
             let e = Config::from_json(&v).unwrap_err().to_string();
+            assert!(e.contains(want), "wanted {want:?}, got {e:?}");
+        }
+    }
+
+    #[test]
+    fn a_route_priced_by_the_token_is_read_and_its_mistakes_refused() {
+        let mut v = base();
+        v["routes"][0] = json!({"path": "/v1/", "methods": ["GET", "POST"], "price": {"per_1k_output_msat": 10000}, "max_body": 65536});
+        let c = Config::from_json(&v).unwrap();
+        let t = c.routes[0].price.tokens;
+        assert_eq!((t.input_per_1k_msat, t.output_per_1k_msat, t.max_output), (0, 10_000, xbt402::tokens::DEFAULT_MAX_OUTPUT));
+        assert!(c.routes[0].price.metered() && !c.routes[0].price.is_free());
+        // input is priced only when the runner says so; the cap is the runner's
+        v["routes"][0]["price"]["per_1k_input_msat"] = json!(2000);
+        v["routes"][0]["max_output_tokens"] = json!(512);
+        let t = Config::from_json(&v).unwrap().routes[0].price.tokens;
+        assert_eq!((t.input_per_1k_msat, t.max_output), (2000, 512));
+        assert_eq!(price_json(&Config::from_json(&v).unwrap().routes[0].price), json!({"per_1k_input_msat": 2000, "per_1k_output_msat": 10000}));
+        for (want, f) in [
+            ("no price per byte or per second beside it", Box::new(|v: &mut Value| v["routes"][0]["price"]["byte_msat"] = json!(5)) as Box<dyn Fn(&mut Value)>),
+            ("max_output_tokens is from 1", Box::new(|v: &mut Value| v["routes"][0]["max_output_tokens"] = json!(0))),
+            ("max_output_tokens is for a route priced by the token", Box::new(|v: &mut Value| v["routes"][1]["max_output_tokens"] = json!(10))),
+        ] {
+            let mut w = v.clone();
+            f(&mut w);
+            let e = Config::from_json(&w).unwrap_err().to_string();
             assert!(e.contains(want), "wanted {want:?}, got {e:?}");
         }
     }

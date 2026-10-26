@@ -103,20 +103,55 @@ start.
 
 ## Pricing a piece
 
-A route's price is the sum of three rules:
+A route's price is the sum of these rules:
 
 | Rule | Config | Charged |
 |---|---|---|
 | per request | `request_msat` | once, when your service answers with a status below 400 |
 | per byte | `byte_msat` for every `per_bytes` bytes | as the body is sent, rounded up over the whole body |
 | per second | `second_msat` | for every started second the answer is open, the first at its head |
+| per token out | `per_1k_output_msat` for every 1,000 tokens the model writes | as the answer streams, settled on the model's own count at the end |
+| per token in | `per_1k_input_msat` for every 1,000 tokens of the request (optional; leave it out and the question is free) | with the first part of the answer, settled on the model's own count |
 
 A route is either priced or marked `"free": true`; a path with no route is not served at all.
 `"release": "after-verify"` marks a route whose content the buyer can check: a piece is served on
 a locked ticket before its secret arrives, up to one ticket's worth.
 
-What these rules cannot price is anything only your service can count, such as the tokens a
-model produced.
+### Pricing a model by the token
+
+For an OpenAI-compatible service (llama.cpp's server, vLLM, Ollama and the others that answer
+`/v1/chat/completions` and `/v1/completions`), price the tokens rather than the request, since one
+reply can be ten times another:
+
+```json
+{"path": "/ai/", "upstream": "http://llama:8080", "strip_prefix": true, "methods": ["GET", "POST"],
+ "max_body": 1048576, "max_output_tokens": 512, "price": {"per_1k_output_msat": 10000}}
+```
+
+That is "10 sat per 1,000 tokens": a 500-token reply costs 5 sat. Add `"per_1k_input_msat"` to
+charge for the question as well; buyers then see "2 sat per 1,000 tokens in, 10 sat per 1,000
+tokens out". The rates are per 1,000 tokens so that a price under a millisatoshi a token is a whole
+number.
+
+What the gateway does with a request that has a body (`xbt402::tokens`):
+
+1. It bounds the reply: `max_tokens` is the buyer's or `max_output_tokens` (default 1024),
+   whichever is smaller, and a streamed request asks for the counts at its end
+   (`stream_options.include_usage`).
+2. Before your model is asked, the buyer's balance must cover the most the request can cost:
+   the input at one token per two bytes of the body, and `max_tokens` of output. A buyer that
+   cannot cover it is refused with `balance_short` and your model is never asked.
+3. A streamed reply is passed on event by event, each paid for before it is sent: every chunk with
+   text is one token. When the balance stops covering the next one (another request of the same
+   buyer used it up), the reply stops there and the connection to your model is closed, so it
+   stops writing.
+4. The counts your model states at the end (`usage`) settle the call: input at most one token per
+   two bytes of the request, output at most `max_tokens`. A model that states no counts is charged
+   its chunks for output and one token per four bytes of the request for input.
+
+A request with no body on the same route (`GET /v1/models`, a page) costs the route's
+`request_msat` only: nothing, when it has none. A route priced by the token has no price per byte
+or per second beside it, and is never offered by lottery.
 
 ## Several services behind one gateway
 
@@ -128,7 +163,7 @@ price:
 "routes": [
   {"path": "/", "upstream": "http://jellyfin:8096", "price": {"byte_msat": 20000, "per_bytes": 1048576}},
   {"path": "/ai/", "upstream": "http://ollama:11434", "strip_prefix": true, "methods": ["GET", "HEAD", "POST"],
-   "max_body": 1048576, "price": {"request_msat": 10000}}
+   "max_body": 1048576, "price": {"per_1k_output_msat": 10000}}
 ]
 ```
 
