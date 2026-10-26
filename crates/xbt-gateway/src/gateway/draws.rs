@@ -719,7 +719,7 @@ impl Gateway {
         if !offered || dearest.is_none_or(|d| d >= win_msat) || (head_only && route.price.request_msat == 0) {
             return Reply::Whole(self.draw_refused(l, &a, &req.target, Some(route), DrawError::AmountNotBelowWin.code()));
         }
-        let mut answer = match self.upstream.send(&req.method, &req.target, &forwarded(route, &req.headers), &req.body) {
+        let mut answer = match self.send_upstream(route, &req) {
             // a service behind the gateway does not ask for payment through it
             Ok(ans) if ans.status != 402 => ans,
             _ => {

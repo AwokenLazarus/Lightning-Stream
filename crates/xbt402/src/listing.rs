@@ -10,12 +10,18 @@ use crate::wire::{canonical_origin, put_field, tagged, unb64json};
 use xbt_primitives::ecdsa;
 use xbt_primitives::secp256k1::SecretKey;
 
-/// `version` of a document this module reads.
+/// `version` of a document with one service.
 pub const VERSION: &str = "listing/0";
+/// `version` of a document with a list of services, each behind a path of its own.
+pub const VERSION_1: &str = "listing/1";
 /// Where a seller serves it, on its public origin.
 pub const PATH: &str = "/.well-known/lightning-stream.json";
 /// The tagged-hash tag. One field: the canonical JSON.
 const TAG: &str = "xbt402/listing/0";
+/// The same construction for `listing/1`.
+const TAG_1: &str = "xbt402/listing/1";
+/// At most this many services in one listing.
+const MAX_SERVICES: usize = 32;
 
 const KINDS: [&str; 3] = ["video", "files", "api"];
 const PRICE_KEYS: [&str; 4] = ["request_msat", "byte_msat", "per_bytes", "second_msat"];
@@ -23,6 +29,10 @@ const PRICE_KEYS: [&str; 4] = ["request_msat", "byte_msat", "per_bytes", "second
 const MAX_BODY: usize = 256 << 10;
 
 /// What the seller writes in its config. The gateway adds `seller` and `receipt_key` and signs.
+///
+/// A `listing/0` draft has one service, in `kind`, `prices` and `items`, and `services` is empty.
+/// A `listing/1` draft lists its services in `services`; `kind`, `prices` and `items` are then the
+/// first service's, and `licence` and `credits` may be empty (each service may say its own).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Draft {
     pub name: String,
@@ -32,6 +42,21 @@ pub struct Draft {
     pub licence: String,
     pub credits: String,
     pub updated: String,
+    pub services: Vec<Section>,
+}
+
+/// One service of a `listing/1`: what it is, the path it is sold under, and its price.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Section {
+    pub name: String,
+    pub kind: String,
+    /// The gateway route the service is sold under (`/`, `/ai/`).
+    pub path: String,
+    pub prices: Value,
+    pub items: Vec<Item>,
+    /// Empty: the listing's own.
+    pub licence: String,
+    pub credits: String,
 }
 
 /// One catalog entry.
@@ -44,6 +69,8 @@ pub struct Item {
 }
 
 /// A listing whose signature verified under the receipt key the seller's 402 terms name.
+/// `services` is always filled: a `listing/0` is one service under `/`. `kind`, `prices` and
+/// `items` are the first service's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listing {
     pub name: String,
@@ -55,6 +82,7 @@ pub struct Listing {
     pub licence: String,
     pub credits: String,
     pub updated: String,
+    pub services: Vec<Section>,
 }
 
 /// One HTTP answer, as a reader hands it to [`fetch`].
@@ -99,8 +127,12 @@ fn whole(v: &Value) -> Option<u64> {
     })
 }
 
-/// The config's `listing` object: no `seller`, no `receipt_key`, no `sig`.
+/// The config's `listing` object: no `seller`, no `receipt_key`, no `sig`. With `services` it is a
+/// `listing/1` draft, else a `listing/0` one.
 pub fn parse_draft(v: &Value) -> Result<Draft, String> {
+    if v.get("services").is_some() {
+        return parse_draft_1(v);
+    }
     let m = obj(v, "listing", &["name", "kind", "prices", "items", "licence", "credits", "updated"])?;
     let name = req_str(m, "name")?;
     if name.chars().count() > 200 {
@@ -125,7 +157,87 @@ pub fn parse_draft(v: &Value) -> Result<Draft, String> {
     if updated.chars().count() > 64 {
         return Err("updated is at most 64 characters".into());
     }
-    Ok(Draft { name: name.to_string(), kind: kind.to_string(), prices, items, licence: licence.to_string(), credits: credits.to_string(), updated: updated.to_string() })
+    Ok(Draft { name: name.to_string(), kind: kind.to_string(), prices, items, licence: licence.to_string(), credits: credits.to_string(), updated: updated.to_string(),
+               services: vec![] })
+}
+
+fn opt_text(m: &Map<String, Value>, k: &str) -> Result<String, String> {
+    match m.get(k) {
+        None => Ok(String::new()),
+        Some(_) => req_str(m, k).map(str::to_string),
+    }
+}
+
+fn items_of(m: &Map<String, Value>, what: &str) -> Result<Vec<Item>, String> {
+    let items_v = m.get("items").and_then(Value::as_array).ok_or_else(|| format!("{what}: items is a list"))?;
+    if items_v.len() > 400 {
+        return Err(format!("{what}: items has at most 400 entries"));
+    }
+    items_v.iter().map(parse_item).collect()
+}
+
+/// A route path as the gateway writes one: starts with `/`, plain visible ASCII.
+fn route_path(s: &str) -> bool {
+    s.starts_with('/') && s.len() <= 200 && !s.contains("//") && s.bytes().all(|c| c.is_ascii_graphic() && !b"%?#\\".contains(&c))
+        && !s.split('/').any(|x| x == "." || x == "..")
+}
+
+fn parse_section(v: &Value, n: usize) -> Result<Section, String> {
+    let what = format!("service {n}");
+    let m = obj(v, &what, &["name", "kind", "path", "prices", "items", "licence", "credits"])?;
+    let name = req_str(m, "name").map_err(|e| format!("{what}: {e}"))?;
+    if name.chars().count() > 200 {
+        return Err(format!("{what}: name is at most 200 characters"));
+    }
+    let kind = req_str(m, "kind").map_err(|e| format!("{what}: {e}"))?;
+    if !KINDS.contains(&kind) {
+        return Err(format!("{what}: kind is video, files or api"));
+    }
+    let path = req_str(m, "path").map_err(|e| format!("{what}: {e}"))?;
+    if !route_path(path) {
+        return Err(format!("{what}: path is a route path, starting with /"));
+    }
+    let prices = price_strings(m.get("prices").ok_or_else(|| format!("{what}: prices is missing"))?)?;
+    Ok(Section { name: name.to_string(), kind: kind.to_string(), path: path.to_string(), prices, items: items_of(m, &what)?,
+                 licence: opt_text(m, "licence")?, credits: opt_text(m, "credits")? })
+}
+
+fn parse_draft_1(v: &Value) -> Result<Draft, String> {
+    let m = obj(v, "listing", &["name", "services", "licence", "credits", "updated"])?;
+    let name = req_str(m, "name")?;
+    if name.chars().count() > 200 {
+        return Err("name is at most 200 characters".into());
+    }
+    let list = m.get("services").and_then(Value::as_array).ok_or("services is a list")?;
+    if list.is_empty() || list.len() > MAX_SERVICES {
+        return Err(format!("services has 1 to {MAX_SERVICES} entries"));
+    }
+    let mut services: Vec<Section> = Vec::with_capacity(list.len());
+    for (i, s) in list.iter().enumerate() {
+        let sec = parse_section(s, i + 1)?;
+        if services.iter().any(|o| o.path == sec.path) {
+            return Err(format!("service {}: path {} is named twice", i + 1, sec.path));
+        }
+        services.push(sec);
+    }
+    let updated = req_str(m, "updated")?;
+    if updated.chars().count() > 64 {
+        return Err("updated is at most 64 characters".into());
+    }
+    let first = services[0].clone();
+    Ok(Draft { name: name.to_string(), kind: first.kind, prices: first.prices, items: first.items, licence: opt_text(m, "licence")?,
+               credits: opt_text(m, "credits")?, updated: updated.to_string(), services })
+}
+
+fn section_json(s: &Section) -> Value {
+    let mut v = json!({"name": s.name, "kind": s.kind, "path": s.path, "prices": s.prices, "items": s.items.iter().map(item_json).collect::<Vec<_>>()});
+    if !s.licence.is_empty() {
+        v["licence"] = json!(s.licence);
+    }
+    if !s.credits.is_empty() {
+        v["credits"] = json!(s.credits);
+    }
+    v
 }
 
 fn price_strings(v: &Value) -> Result<Value, String> {
@@ -187,8 +299,25 @@ fn item_json(i: &Item) -> Value {
     v
 }
 
-/// The document before it is signed.
+/// The document before it is signed: `listing/1` when the draft lists services, else `listing/0`.
 pub fn document(d: &Draft, seller: &str, receipt_key: &str) -> Value {
+    if !d.services.is_empty() {
+        let mut v = json!({
+            "version": VERSION_1,
+            "name": d.name,
+            "seller": seller,
+            "receipt_key": receipt_key,
+            "services": d.services.iter().map(section_json).collect::<Vec<_>>(),
+            "updated": d.updated,
+        });
+        if !d.licence.is_empty() {
+            v["licence"] = json!(d.licence);
+        }
+        if !d.credits.is_empty() {
+            v["credits"] = json!(d.credits);
+        }
+        return v;
+    }
     json!({
         "version": VERSION,
         "name": d.name,
@@ -209,7 +338,8 @@ pub fn message(doc: &Value) -> [u8; 32] {
     if let Some(o) = bare.as_object_mut() {
         o.remove("sig");
     }
-    let mut h = tagged(TAG);
+    let v1 = doc.get("version").and_then(Value::as_str) == Some(VERSION_1);
+    let mut h = tagged(if v1 { TAG_1 } else { TAG });
     put_field(&mut h, dumps_sorted_compact(&bare).as_bytes());
     h.finalize().into()
 }
@@ -243,17 +373,27 @@ pub fn verify(doc: &Value, terms_receipt_key: &str) -> Result<Listing, String> {
 }
 
 fn read_signed(m: &Map<String, Value>) -> Result<Listing, String> {
-    let known = ["version", "name", "kind", "seller", "receipt_key", "prices", "items", "licence", "credits", "updated", "sig"];
+    let version = m.get("version").and_then(Value::as_str).ok_or("version is missing")?;
+    let known: &[&str] = match version {
+        VERSION => &["version", "name", "kind", "seller", "receipt_key", "prices", "items", "licence", "credits", "updated", "sig"],
+        VERSION_1 => &["version", "name", "seller", "receipt_key", "services", "licence", "credits", "updated", "sig"],
+        _ => return Err(format!("version is {VERSION} or {VERSION_1}")),
+    };
     if let Some(k) = m.keys().find(|k| !known.contains(&k.as_str())) {
         return Err(format!("unknown key {k:?}"));
-    }
-    let version = m.get("version").and_then(Value::as_str).ok_or("version is missing")?;
-    if version != VERSION {
-        return Err(format!("version is {VERSION}"));
     }
     let seller = m.get("seller").and_then(Value::as_str).filter(|s| http_url(s)).ok_or("seller is an http(s) URL")?;
     let receipt_key = m.get("receipt_key").and_then(Value::as_str).filter(|s| s.len() == 66 && s.chars().all(|c| c.is_ascii_hexdigit())).ok_or("receipt_key is 33 bytes of hex")?;
     let draft = parse_draft(&Value::Object(strip_serve(m)))?;
+    if (version == VERSION_1) == draft.services.is_empty() {
+        return Err("the version does not match the document's shape".into());
+    }
+    let services = if draft.services.is_empty() {
+        vec![Section { name: draft.name.clone(), kind: draft.kind.clone(), path: "/".into(), prices: draft.prices.clone(), items: draft.items.clone(),
+                       licence: draft.licence.clone(), credits: draft.credits.clone() }]
+    } else {
+        draft.services
+    };
     Ok(Listing {
         name: draft.name,
         kind: draft.kind,
@@ -264,6 +404,7 @@ fn read_signed(m: &Map<String, Value>) -> Result<Listing, String> {
         licence: draft.licence,
         credits: draft.credits,
         updated: draft.updated,
+        services,
     })
 }
 
@@ -360,6 +501,59 @@ mod tests {
         tampered["name"] = json!("Other");
         assert!(verify(&tampered, &pk).is_err());
         assert!(parse_draft(&json!({"name": "n", "kind": "nope"})).is_err());
+    }
+
+    #[test]
+    fn a_listing_1_lists_several_services_and_signs_them_all() {
+        let (sk, pk) = key();
+        let d = parse_draft(&json!({
+            "name": "One box",
+            "updated": "2026-10-26",
+            "credits": "the seller",
+            "services": [
+                {"name": "Films", "kind": "video", "path": "/films/", "prices": {"byte_msat": 20, "per_bytes": 1048576}, "licence": "CC BY 3.0",
+                 "items": [{"title": "Sintel", "url": "https://seller.example/films/s"}]},
+                {"name": "Local model", "kind": "api", "path": "/ai/", "prices": {"request_msat": 5000}, "items": []},
+            ],
+        }))
+        .unwrap();
+        assert_eq!((d.services.len(), d.kind.as_str()), (2, "video"));
+        let doc = sign(&sk, &document(&d, "https://seller.example", &pk));
+        assert_eq!(doc["version"], VERSION_1);
+        assert!(doc.get("kind").is_none() && doc.get("items").is_none());
+        let got = verify(&doc, &pk).unwrap();
+        assert_eq!(got.services.iter().map(|s| (s.name.as_str(), s.path.as_str())).collect::<Vec<_>>(), [("Films", "/films/"), ("Local model", "/ai/")]);
+        assert_eq!(got.services[1].prices["request_msat"], "5000");
+        assert_eq!((got.services[0].licence.as_str(), got.licence.as_str(), got.credits.as_str()), ("CC BY 3.0", "", "the seller"));
+        let mut tampered = doc.clone();
+        tampered["services"][1]["prices"]["request_msat"] = json!("1");
+        assert!(verify(&tampered, &pk).is_err(), "a price is signed");
+        // the two versions' digests differ: a document cannot be passed off as the other
+        let mut relabelled = doc.clone();
+        relabelled["version"] = json!(VERSION);
+        assert!(verify(&relabelled, &pk).is_err());
+        // a listing/0 reads as one service under /
+        let one = verify(&sign(&sk, &document(&draft(), "https://seller.example", &pk)), &pk).unwrap();
+        assert_eq!((one.services.len(), one.services[0].path.as_str(), one.services[0].name.as_str()), (1, "/", "Films"));
+    }
+
+    #[test]
+    fn a_listing_1_refuses_a_bad_service() {
+        let base = || json!({"name": "n", "updated": "u", "services": [{"name": "a", "kind": "api", "path": "/a/", "prices": {"request_msat": 1}, "items": []}]});
+        assert!(parse_draft(&base()).is_ok());
+        for (why, f) in [
+            ("no services", Box::new(|v: &mut Value| v["services"] = json!([])) as Box<dyn Fn(&mut Value)>),
+            ("path twice", Box::new(|v: &mut Value| { let s = v["services"][0].clone(); v["services"].as_array_mut().unwrap().push(s) })),
+            ("bad path", Box::new(|v: &mut Value| v["services"][0]["path"] = json!("a/"))),
+            ("dot path", Box::new(|v: &mut Value| v["services"][0]["path"] = json!("/a/../b/"))),
+            ("no prices", Box::new(|v: &mut Value| { v["services"][0].as_object_mut().unwrap().remove("prices"); })),
+            ("bad kind", Box::new(|v: &mut Value| v["services"][0]["kind"] = json!("mining"))),
+            ("stray key", Box::new(|v: &mut Value| v["kind"] = json!("video"))),
+        ] {
+            let mut v = base();
+            f(&mut v);
+            assert!(parse_draft(&v).is_err(), "{why}");
+        }
     }
 
     #[test]
