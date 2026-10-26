@@ -260,9 +260,16 @@ fn one_renter_takes_three_and_the_fourth_stays_on_the_fallback() {
     let _s = serial();
     let rig = rig(4, &[], 40, 6.0);
     let (pool, b) = renter(&rig, "big", 3, 10, None);
-    // while it runs: three rented, one on the fallback
-    thread::sleep(Duration::from_secs(5));
-    let s = rig.hasher.status();
+    // while it runs: three rented, one on the fallback (asked until then: a busy machine takes longer)
+    let t0 = Instant::now();
+    let s = loop {
+        let s = rig.hasher.status();
+        let n = s["miners"].as_array().unwrap().iter().filter(|m| m["rentedTo"] == "big").count();
+        if n == 3 || t0.elapsed() > Duration::from_secs(30) {
+            break s;
+        }
+        thread::sleep(Duration::from_millis(200));
+    };
     let rented: Vec<&Value> = s["miners"].as_array().unwrap().iter().filter(|m| m["rentedTo"] == "big").collect();
     assert_eq!(rented.len(), 3, "{s}");
     assert_eq!(s["capacity"]["freeMiners"], 1, "{s}");
