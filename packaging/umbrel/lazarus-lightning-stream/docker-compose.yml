@@ -143,6 +143,8 @@ services:
       XBT_UI_GW_HEALTH_URL: http://lazarus-lightning-stream_gateway_1:8402/x402/ticket/health
       # offered on Sellers and on an empty Browse, added only when the owner clicks
       XBT_UI_SUGGESTED_SELLERS: https://media.lazarus-xbt.xyz
+      # Nostr relays the Services page reads sellers' signed listings from (opt-in Nostr page)
+      XBT_UI_NOSTR_RELAYS: wss://relay.damus.io,wss://nos.lol
     volumes:
       - ${APP_DATA_DIR}/data/ui:/data/ui
       - ${APP_DATA_DIR}/data/run/signer:/data/run/signer:ro
