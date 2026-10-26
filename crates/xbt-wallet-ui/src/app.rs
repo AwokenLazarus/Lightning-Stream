@@ -13,6 +13,7 @@ use crate::auth::Auth;
 use crate::config::{Config, Role};
 use crate::html::{esc, escv, int, json_block, kv, page, sats, short, txt, utc, Nav, GATEWAY_BRAND, GATEWAY_PAGES, WALLET_BRAND, WALLET_PAGES};
 use crate::link::SignerLink;
+use crate::relay::RelayLinks;
 use crate::server::{strip_base, Req, Resp};
 use crate::{msg, now};
 
@@ -27,6 +28,8 @@ pub struct App {
     pub cfg: Config,
     pub auth: Auth,
     pub signer: SignerLink,
+    /// The links external players play one item through ([`crate::relay`]).
+    pub relays: RelayLinks,
 }
 
 /// What a human who signs on another device needs.
@@ -130,7 +133,8 @@ impl App {
     pub fn new(cfg: Config) -> Result<Arc<Self>, String> {
         let auth = Auth::open(&cfg.data_dir, cfg.password.as_deref(), cfg.setup_open, cfg.session_idle, cfg.session_max)?;
         let signer = SignerLink::new(cfg.signer_sock.clone(), std::time::Duration::from_secs(90));
-        Ok(Arc::new(Self { cfg, auth, signer }))
+        let relays = RelayLinks::new(cfg.relay_ttl);
+        Ok(Arc::new(Self { cfg, auth, signer, relays }))
     }
 
     fn call(&self, method: &str, params: Value) -> Result<Value, String> {
@@ -146,11 +150,15 @@ impl App {
         self.cfg.allow_ips.is_empty() || self.cfg.allow_ips.iter().any(|p| peer == p || (p.ends_with('.') || p.ends_with(':')) && peer.starts_with(p.as_str()))
     }
 
-    /// For `GET /s/<seller URL>` (the player's video), the same checks as a page of the wallet:
-    /// `Some(Ok)` to relay it, `Some(Err)` with the answer that refuses it; `None` for anything else.
-    pub fn relay_gate(&self, req: &Req) -> Option<Result<(), Resp>> {
+    /// For `GET /s/<seller URL>` (the player's video), the same checks as a page of the wallet; for
+    /// `GET /r/<token>` (an external player's link), the same checks less the login, and a live
+    /// token for an item still in the services file. `Some(Ok(url))`: relay the seller URL `url`
+    /// (for `/s/`, `None`: the caller takes it from the request target); `Some(Err)`: the answer
+    /// that refuses it; `None` for anything else.
+    pub fn relay_gate(&self, req: &Req) -> Option<Result<Option<String>, Resp>> {
         let path = strip_base(&req.path, &self.cfg.base_path)?;
-        if req.method != "GET" || !path.starts_with("/s/") || self.cfg.role == Role::Gateway {
+        let link = path.strip_prefix("/r/");
+        if req.method != "GET" || !(path.starts_with("/s/") || link.is_some()) || self.cfg.role == Role::Gateway {
             return None;
         }
         if !self.peer_allowed(&req.peer) {
@@ -159,11 +167,22 @@ impl App {
         if !host_allowed(req.header("host"), &self.cfg.allowed_hosts) {
             return Some(Err(Resp::text(421, "text/plain", "unknown Host: add it to XBT_UI_ALLOWED_HOSTS")));
         }
-        let sid = req.cookie(COOKIE).unwrap_or_default();
-        if !self.auth.has_password() || self.auth.with_session(&sid, |_| ()).is_none() {
+        if !self.auth.has_password() {
             return Some(Err(Resp::text(401, "text/plain", "login required")));
         }
-        Some(Ok(()))
+        if let Some(token) = link {
+            // the link alone: no cookie, and only the one item it was made for
+            let in_file = |item: &str| self.services().is_ok_and(|all| crate::services::find_item(&all, item).is_some());
+            return Some(match self.relays.item_of(token) {
+                Some(item) if in_file(&item) => Ok(Some(item)),
+                _ => Err(Resp::text(404, "text/plain", "no such link: it expired, was revoked, or its item is gone")),
+            });
+        }
+        let sid = req.cookie(COOKIE).unwrap_or_default();
+        if self.auth.with_session(&sid, |_| ()).is_none() {
+            return Some(Err(Resp::text(401, "text/plain", "login required")));
+        }
+        Some(Ok(None))
     }
 
     pub fn handle(&self, mut req: Req) -> Resp {
@@ -238,7 +257,7 @@ impl App {
         match req.path.as_str() {
             "/" => self.overview(&ctx),
             "/browse" => self.browse(&ctx, &req.query),
-            "/play" => self.play(&ctx, &req.query),
+            "/play" => self.play(&ctx, &req),
             "/connections" => self.connections(&ctx),
             "/approvals" => self.approvals(&ctx),
             "/policy" => self.policy_page(&ctx, req.query.get("template").map(|t| t == "starter").unwrap_or(false)),
@@ -382,6 +401,7 @@ impl App {
         };
         match req.path.as_str() {
             "/play" => self.play_stop(ctx, f),
+            "/play-link" => self.play_link(ctx, f),
             "/connections" => self.connections_stop(ctx, f),
             "/logout" => {
                 self.auth.logout(&ctx.sid);

@@ -6,8 +6,29 @@
 //!
 //! `GET /s/<seller URL>`: the seller's answer, paid for as it streams.
 //! `GET /health`: whether the signer answers.
+//!
+//! **Seeking.** A client's `Range` header (one range, `bytes=N-` or `bytes=N-M`) goes to the signer
+//! as the call's `range`, and the signer sends it to the seller; a `Range` of any other form is
+//! ignored and the whole body is asked for, as HTTP lets a server do. Every answer says
+//! `Accept-Ranges: bytes` (unless the seller says `none`), so a player knows it may seek. Each seek
+//! is a call of its own, paid for the bytes that arrive.
+//!
+//! **The head before the body.** The signer's answer to `xbt402_pay` comes back on its socket only
+//! when the body has ended, too late for the status and headers of a streamed answer. So the
+//! connector asks for `stream_head`: the signer writes the seller's head, as it read it, as one
+//! line of JSON on the stream socket before the first byte of the body:
+//!
+//! ```text
+//! {"status":206,"content_length":1000,"content_range":"bytes 1000-1999/5000","accept_ranges":"bytes","content_type":"video/mp4"}
+//! ```
+//!
+//! and the connector answers its client with that status, `Content-Range` and `Content-Length`
+//! (the body that follows is then framed by its length, so a client sees an answer the wallet
+//! stopped as cut short). A head with `error` is an answer the signer will not read (a 206 for
+//! another range than was asked): the client gets 502. One socket, one line, no second round trip
+//! to the signer and no second request to the seller.
 
-use std::io::{self, Read};
+use std::io::{self, BufRead, BufReader, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -22,6 +43,8 @@ use xbt_svc::http::{BodyWriter, Handler, Reply, Request, Response, Streamed};
 const FIRST_BYTE: Duration = Duration::from_secs(60);
 /// The longest one paid answer is followed (a film).
 const LONGEST: Duration = Duration::from_secs(6 * 3600);
+/// The longest head line the signer writes before the body.
+const HEAD_LINE: u64 = 4096;
 
 pub struct Config {
     /// The signer's socket.
@@ -48,8 +71,9 @@ impl Connector {
         json_response(if ok { 200 } else { 503 }, &json!({"signer": ok}))
     }
 
-    /// One paid answer, handed on as it arrives.
-    fn stream(&self, url: &str, max_sats: i64) -> Reply {
+    /// One paid answer, handed on as it arrives: the seller's status and range from the head line,
+    /// then the body.
+    fn stream(&self, url: &str, max_sats: i64, range: Option<&str>) -> Reply {
         let name = format!("ls-{}", random_hex());
         let path = self.cfg.stream_dir.join(&name);
         let listener = match listen_stream(&path) {
@@ -59,14 +83,17 @@ impl Connector {
         let _ = listener.set_nonblocking(true);
         // the signer pays and writes the body to the socket; its answer comes when the body has ended
         let (done_tx, done_rx) = mpsc::channel::<Result<Value, String>>();
-        let params = json!({"url": url, "max_sats": max_sats, "task": self.cfg.task, "stream_to": name});
+        let mut params = json!({"url": url, "max_sats": max_sats, "task": self.cfg.task, "stream_to": name, "stream_head": true});
+        if let Some(r) = range {
+            params["range"] = r.into();
+        }
         let signer = self.cfg.signer.clone();
         std::thread::spawn(move || {
             let _ = done_tx.send(xbt_wallet_mcp::wallet::signer_call(&signer, LONGEST, "xbt402_pay", &params));
         });
         // the first bytes, or the signer's answer without any: a refusal, said to the program plainly
         let started = Instant::now();
-        let mut src = loop {
+        let src = loop {
             match listener.accept() {
                 Ok((s, _)) => break s,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
@@ -84,14 +111,39 @@ impl Connector {
         };
         let _ = std::fs::remove_file(&path);
         let _ = src.set_nonblocking(false);
-        let mut head = vec![0u8; 64];
-        let n = src.read(&mut head).unwrap_or(0);
-        head.truncate(n);
-        let kind = sniff(&head, url);
+        // the seller's head, as the signer read it: one line before the body
+        let _ = src.set_read_timeout(Some(FIRST_BYTE));
+        let mut src = BufReader::new(src);
+        let mut line = String::new();
+        let read = (&mut src).take(HEAD_LINE).read_line(&mut line);
+        let head: Value = match read {
+            Ok(_) if line.ends_with('\n') => serde_json::from_str(&line).unwrap_or(Value::Null),
+            _ => Value::Null,
+        };
+        let _ = src.get_ref().set_read_timeout(None);
+        let Some(status) = head.get("status").and_then(Value::as_u64).and_then(|s| u16::try_from(s).ok()).filter(|s| (200..600).contains(s)) else {
+            return Reply::Whole(json_response(502, &json!({"error": "the signer sent no head for the answer"})));
+        };
+        if let Some(why) = head.get("error").and_then(Value::as_str) {
+            return Reply::Whole(json_response(502, &json!({"error": why})));
+        }
+        let mut first = vec![0u8; 64];
+        let n = src.read(&mut first).unwrap_or(0);
+        first.truncate(n);
+        let head_type = head.get("content_type").and_then(Value::as_str).filter(|t| media_type_ok(t)).map(str::to_string);
+        let kind = head_type.unwrap_or_else(|| sniff(&first, url).to_string());
+        let mut headers = vec![("Content-Type".to_string(), kind), ("Cache-Control".into(), "no-store".into())];
+        let seller_ranges = head.get("accept_ranges").and_then(Value::as_str);
+        headers.push(("Accept-Ranges".into(), if seller_ranges == Some("none") { "none" } else { "bytes" }.into()));
+        if let Some(cr) = head.get("content_range").and_then(Value::as_str).filter(|c| c.len() <= 64 && c.bytes().all(|b| b.is_ascii_graphic() || b == b' ')) {
+            headers.push(("Content-Range".into(), cr.into()));
+        }
+        let length = head.get("content_length").and_then(Value::as_u64);
+        let head = first;
         Reply::Stream(Streamed {
-            status: 200,
-            headers: vec![("Content-Type".into(), kind.into()), ("Cache-Control".into(), "no-store".into())],
-            length: None,
+            status,
+            headers,
+            length,
             body: Box::new(move |out: &mut dyn BodyWriter| {
                 out.send(&head)?;
                 let mut buf = vec![0u8; 64 << 10];
@@ -138,8 +190,25 @@ impl Handler for Connector {
             return Reply::Whole(json_response(400, &json!({"error": "the seller URL starts with https://"})));
         }
         let max_sats = req.header("X-Max-Sats").and_then(|v| v.parse::<i64>().ok()).filter(|n| *n >= 0).unwrap_or(self.cfg.max_sats).min(self.cfg.max_sats);
-        self.stream(url, max_sats)
+        let range = req.header("Range").map(str::trim).filter(|r| one_range(r));
+        self.stream(url, max_sats, range)
     }
+}
+
+/// Whether `r` is one byte range the signer takes: `bytes=N-` or `bytes=N-M`, N <= M.
+pub fn one_range(r: &str) -> bool {
+    let num = |s: &str| (!s.is_empty() && s.len() <= 19 && s.bytes().all(|b| b.is_ascii_digit())).then(|| s.parse::<u64>().ok()).flatten();
+    let Some((a, b)) = r.strip_prefix("bytes=").and_then(|s| s.split_once('-')) else { return false };
+    match (num(a), b.is_empty(), num(b)) {
+        (Some(_), true, _) => true,
+        (Some(a), false, Some(b)) => a <= b,
+        _ => false,
+    }
+}
+
+/// A media type of plain characters (the signer passes on only such a one; checked again here).
+fn media_type_ok(t: &str) -> bool {
+    !t.is_empty() && t.len() <= 128 && t.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~/;= ".contains(&b))
 }
 
 /// A call that ended before any byte came: the wallet's refusal, or the signer's error.
@@ -154,7 +223,7 @@ fn refused(done: Result<Value, String>) -> Response {
     }
 }
 
-/// The body's type, from its first bytes, then the URL: the signer does not pass the seller's headers on.
+/// The body's type, from its first bytes, then the URL: for a seller that states no plain `Content-Type`.
 pub fn sniff(head: &[u8], url: &str) -> &'static str {
     if head.len() >= 8 && &head[4..8] == b"ftyp" {
         return "video/mp4";

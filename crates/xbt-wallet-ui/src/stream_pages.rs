@@ -1,7 +1,9 @@
 //! Browse, the player and the live connections page.
 //!
 //! Browse reads the services file. The player points a `<video>` at the connector
-//! (`XBT_UI_CONNECTOR` + `/s/` + the item URL). Stopping is a POST: this process asks the signer
+//! (`XBT_UI_CONNECTOR` + `/s/` + the item URL), relayed by this process; for VLC, mpv and other
+//! players it makes links of their own for one item ([`crate::relay`], `POST /play-link`), shown
+//! with the exact address to paste. Stopping is a POST: this process asks the signer
 //! to `ticket_stop` the open session whose origin is that seller. Connections lists every session
 //! `ticket_status` still has open and reloads itself every 4 seconds (a meta refresh: the page's
 //! script policy does not allow an inline script).
@@ -11,7 +13,7 @@ use serde_json::{json, Value};
 
 use super::{ok_of, reason_of, App, Ctx};
 use crate::html::{self, esc, int, sats};
-use crate::server::Resp;
+use crate::server::{Req, Resp};
 use crate::services::{self, Kind, Service, Sort};
 
 const REFRESH: &str = "<meta http-equiv=\"refresh\" content=\"4\">";
@@ -27,11 +29,15 @@ impl App {
         self.html_page("Browse", ctx, &body, "")
     }
 
-    pub(crate) fn play(&self, ctx: &Ctx, q: &HashMap<String, String>) -> Resp {
-        let item_url = q.get("item").map(String::as_str).unwrap_or("");
+    pub(crate) fn play(&self, ctx: &Ctx, req: &Req) -> Resp {
+        let item_url = req.query.get("item").map(String::as_str).unwrap_or("");
         let body = match self.services() {
             Ok(all) => match services::find_item(&all, item_url) {
-                Some((service, item)) => player_html(ctx, &self.cfg.connector, service, item),
+                Some((service, item)) => {
+                    let links = self.relays.of_item(&item.url);
+                    format!("{}{}", player_html(ctx, &self.cfg.connector, service, item),
+                            if service.kind == Kind::Video { links_html(ctx, &self.link_base(req), &item.url, &links) } else { String::new() })
+                }
                 None if item_url.is_empty() => "<p>Choose a video on <a href=\"./browse\">Browse</a>. The player opens it through the connector, \
                                                  which pays the seller as it streams.</p>".into(),
                 None => format!("{}<p><a href=\"./browse\">Back to Browse</a></p>", Self::error_box("That item is not in the services file.")),
@@ -100,7 +106,45 @@ impl App {
         Resp::redirect("./connections")
     }
 
-    fn services(&self) -> Result<Vec<Service>, String> {
+    /// `POST /play-link`: make a link for an external player for one video item of the services
+    /// file (`action=create`), or revoke one (`action=revoke`, `token`). The CSRF token was checked
+    /// with every POST.
+    pub(crate) fn play_link(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {
+        let item_url = f.get("item").map(|s| s.trim().to_string()).unwrap_or_default();
+        let back = format!("./play?item={}", services::urlenc(&item_url));
+        match f.get("action").map(String::as_str) {
+            Some("create") => {
+                let video = self.services().ok().is_some_and(|all| services::find_item(&all, &item_url).is_some_and(|(s, _)| s.kind == Kind::Video));
+                if !video {
+                    self.flash(ctx, false, "That item is not a video in the services file.");
+                    return Resp::redirect("./browse");
+                }
+                self.relays.create(&item_url);
+                self.flash(ctx, true, format!("Link made. It plays this film only, and stops working in {}.", lasts(self.cfg.relay_ttl)));
+            }
+            Some("revoke") => {
+                let token = f.get("token").map(|s| s.trim().to_string()).unwrap_or_default();
+                if self.relays.revoke(&token) {
+                    self.flash(ctx, true, "Link revoked: it plays nothing now.");
+                } else {
+                    self.flash(ctx, false, "No such link: it had expired or was revoked already.");
+                }
+            }
+            _ => self.flash(ctx, false, "Unknown action."),
+        }
+        Resp::redirect(&back)
+    }
+
+    /// The address of this UI as the browser reached it, for a link another device opens:
+    /// `http(s)://<Host><base path>`. The Host was checked against the allowed names already.
+    fn link_base(&self, req: &Req) -> String {
+        let https = self.cfg.secure_cookie.unwrap_or_else(|| req.header("x-forwarded-proto").eq_ignore_ascii_case("https"));
+        let host = req.header("host").trim();
+        let base = if self.cfg.base_path.ends_with('/') { self.cfg.base_path.clone() } else { format!("{}/", self.cfg.base_path) };
+        format!("{}://{host}{base}", if https { "https" } else { "http" })
+    }
+
+    pub(crate) fn services(&self) -> Result<Vec<Service>, String> {
         match &self.cfg.services_file {
             Some(p) => services::load(p),
             None => Ok(Vec::new()),
@@ -217,6 +261,38 @@ fn player_html(ctx: &Ctx, connector: &str, service: &Service, item: &services::I
              <p class=\"small\"><a href=\"./browse\">Back to Browse</a> · <a href=\"./connections\">Connections</a></p>",
             esc(&item.title), esc(&item.year), esc(&service.price_text), esc(&service.name), esc(&src), esc(&item.credit),
             esc(&service.seller), App::csrf_input(ctx), esc(&item.url))
+}
+
+/// `6 hours`, `90 minutes`, `45 seconds`.
+fn lasts(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    let (n, unit) = if s >= 7200 { (s / 3600, "hour") } else if s >= 120 { (s / 60, "minute") } else { (s, "second") };
+    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
+}
+
+/// The Player page's section for VLC, mpv and other players: the item's live links, each with the
+/// exact address to paste and a button that revokes it, and a button that makes one.
+fn links_html(ctx: &Ctx, base: &str, item_url: &str, links: &[crate::relay::Shown]) -> String {
+    let csrf = App::csrf_input(ctx);
+    let mut b = String::from("<section class=\"card\"><h3>Play in VLC, mpv or another player</h3>\
+        <p class=\"small\">The player's own address (the connector) is reachable on this box only. A link plays this film through \
+        this page instead, for any device that can reach it, without the login: paste it into VLC (Media, Open Network Stream) or \
+        run <code>mpv '&lt;link&gt;'</code>. Seeking works, and each part a player fetches is paid as it streams, within the \
+        connector's limit per request and your budgets. Anyone who has the link can play this film until it expires or you revoke \
+        it, and nothing else.</p>");
+    for l in links {
+        let url = format!("{base}r/{}", l.token);
+        b.push_str(&format!("<div class=\"row\"><input readonly class=\"relay-link\" aria-label=\"Link for an external player\" value=\"{}\">\
+                             <span class=\"small\">{} left</span>\
+                             <form method=\"post\" action=\"./play-link\" class=\"inline\">{csrf}<input type=\"hidden\" name=\"action\" value=\"revoke\">\
+                             <input type=\"hidden\" name=\"item\" value=\"{}\"><input type=\"hidden\" name=\"token\" value=\"{}\">\
+                             <button class=\"danger\" type=\"submit\">Revoke</button></form></div>",
+                            esc(&url), lasts(l.left), esc(item_url), esc(&l.token)));
+    }
+    b.push_str(&format!("<form method=\"post\" action=\"./play-link\">{csrf}<input type=\"hidden\" name=\"action\" value=\"create\">\
+                         <input type=\"hidden\" name=\"item\" value=\"{}\"><button type=\"submit\">{}</button></form></section>",
+                        esc(item_url), if links.is_empty() { "Make a link" } else { "Make another link" }));
+    b
 }
 
 /// Session ids `ticket_status` lists as open. With `origins`, only those sellers.

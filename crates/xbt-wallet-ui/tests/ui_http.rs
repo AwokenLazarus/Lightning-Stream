@@ -976,3 +976,153 @@ fn the_ui_relays_the_players_video_from_the_connector_to_a_logged_in_owner() {
     resp.into_reader().read_to_end(&mut got).unwrap();
     assert_eq!(got, film);
 }
+
+/// Each request a connector got: its path and its `Range`.
+type Seen = Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
+
+/// A connector on loopback that answers `/s/<FILM>` with the film, or the part a `Range` names as a
+/// 206, and records each request's path and `Range`.
+fn range_connector(film: Vec<u8>) -> (String, Seen) {
+    use std::io::{Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let connector = format!("http://{}", l.local_addr().unwrap());
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        for mut s in l.incoming().flatten() {
+            let mut head = [0u8; 8192];
+            let n = s.read(&mut head).unwrap_or(0);
+            let asked = String::from_utf8_lossy(&head[..n]).to_string();
+            let path = asked.split(' ').nth(1).unwrap_or("").to_string();
+            let range = asked.lines().find_map(|l| l.strip_prefix("Range: ").or_else(|| l.strip_prefix("range: "))).map(str::to_string);
+            log.lock().unwrap().push((path.clone(), range.clone()));
+            if path != format!("/s/{FILM}") {
+                let _ = write!(s, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                continue;
+            }
+            let from = range.as_deref().and_then(|r| r.strip_prefix("bytes=")).and_then(|r| r.strip_suffix('-')).and_then(|a| a.parse::<usize>().ok());
+            match from {
+                Some(a) => {
+                    let _ = write!(s, "HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {a}-{}/{}\r\n\
+                                       Content-Length: {}\r\nConnection: close\r\n\r\n", film.len() - 1, film.len(), film.len() - a);
+                    let _ = s.write_all(&film[a..]);
+                }
+                None => {
+                    let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", film.len());
+                    let _ = s.write_all(&film);
+                }
+            }
+        }
+    });
+    (connector, seen)
+}
+
+/// Seeking through the relay, and the links for VLC and mpv: the player's `Range` reaches the
+/// connector and its 206 comes back with its range; a link is made by a logged-in POST with the
+/// CSRF token, plays its one item without a cookie, names no other, and stops when it is revoked
+/// or expires.
+#[test]
+fn the_relay_passes_range_and_a_players_link_plays_its_one_item_until_it_expires() {
+    use std::io::Read;
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let film: Vec<u8> = b"\0\0\0\x20ftypisom".iter().copied().chain((0..200_000u32).map(|i| (i % 251) as u8)).collect();
+    let (connector, seen) = range_connector(film.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("services.json");
+    std::fs::write(&path, format!(r#"[
+        {{"name": "Films", "kind": "video", "seller": "https://media.lazarus-xbt.xyz", "price_text": "20 sat a MiB",
+         "items": [{{"title": "Big Buck Bunny", "year": 2008, "url": "{FILM}", "credit": "CC BY 3.0"}}]}},
+        {{"name": "Files", "kind": "files", "seller": "https://files.example", "price_text": "5 sat a file",
+         "items": [{{"title": "notes", "year": 2020, "url": "{NOTES}", "credit": "CC0"}}]}}
+    ]"#)).unwrap();
+    let ttl = Duration::from_secs(3);
+    let services = path.clone();
+    let b = start(json!({}), false, move |c| {
+        c.connector = connector;
+        c.services_file = Some(services);
+        c.relay_ttl = ttl;
+    });
+    let mut br = logged_in(&b);
+    let mut anon = B::new(&b.base);
+    let get_range = |url: &str, cookie: Option<&str>, range: Option<&str>| {
+        let mut rq = ureq::AgentBuilder::new().redirects(0).build().get(url);
+        if let Some(c) = cookie {
+            rq = rq.set("Cookie", c);
+        }
+        if let Some(r) = range {
+            rq = rq.set("Range", r);
+        }
+        let resp = match rq.call() {
+            Ok(r) => r,
+            Err(ureq::Error::Status(_, r)) => r,
+            Err(e) => panic!("{url}: {e}"),
+        };
+        let headers: HashMap<String, String> = resp.headers_names().iter().map(|n| (n.to_ascii_lowercase(), resp.header(n).unwrap_or("").to_string())).collect();
+        let status = resp.status();
+        let mut body = vec![];
+        resp.into_reader().read_to_end(&mut body).unwrap();
+        (status, headers, body)
+    };
+
+    // the page's player seeks: the Range goes to the connector, the 206 comes back with its headers
+    let (status, h, body) = get_range(&format!("{}/s/{FILM}", b.base), Some(&br.cookie), Some("bytes=1000-"));
+    assert_eq!(status, 206);
+    assert_eq!((h.get("content-range").map(String::as_str), h.get("accept-ranges").map(String::as_str), h.get("content-type").map(String::as_str)),
+               (Some(format!("bytes 1000-{}/{}", film.len() - 1, film.len()).as_str()), Some("bytes"), Some("video/mp4")));
+    assert_eq!(h.get("content-length").map(String::as_str), Some((film.len() - 1000).to_string().as_str()));
+    assert_eq!(body, film[1000..]);
+    assert_eq!(seen.lock().unwrap().last().unwrap(), &(format!("/s/{FILM}"), Some("bytes=1000-".to_string())));
+    let (status, _, body) = get_range(&format!("{}/s/{FILM}", b.base), Some(&br.cookie), None);
+    assert_eq!((status, body.len()), (200, film.len()));
+    assert_eq!(seen.lock().unwrap().last().unwrap().1, None, "no Range where the player sent none");
+
+    // a link is made only by a logged-in POST with the CSRF token, for a video of the services file
+    let play = format!("/play?item={}", enc(FILM));
+    assert!(br.get(&play).body.contains("Play in VLC, mpv or another player") && br.get(&play).body.contains("Make a link"));
+    assert_eq!(anon.post("/play-link", &[("action", "create"), ("item", FILM)]).location(), "./login");
+    assert_eq!(br.post("/play-link", &[("action", "create"), ("item", FILM)]).status, 403, "no CSRF token");
+    let r = br.act(&play, "/play-link", &[("action", "create"), ("item", NOTES)]);
+    assert!(br.flash_after(&r).contains("not a video"));
+    let r = br.act(&play, "/play-link", &[("action", "create"), ("item", FILM)]);
+    assert!(br.flash_after(&r).contains("Link made"));
+    let page = br.get(&play).body;
+    let at = page.find("/r/").expect("the page shows the link");
+    let token = page[at + 3..at + 3 + 64].to_string();
+    assert!(token.bytes().all(|c| c.is_ascii_hexdigit()));
+    assert!(page.contains(&format!("value=\"{}/r/{token}\"", b.base)), "the exact address to paste");
+    assert!(page.contains("Revoke"));
+
+    // the link plays its item with no cookie, seeking included
+    let link = format!("{}/r/{token}", b.base);
+    let (status, h, body) = get_range(&link, None, Some("bytes=5000-"));
+    assert_eq!((status, h.get("content-range").cloned()), (206, Some(format!("bytes 5000-{}/{}", film.len() - 1, film.len()))));
+    assert_eq!(body, film[5000..]);
+    assert_eq!(seen.lock().unwrap().last().unwrap().0, format!("/s/{FILM}"));
+    // and only that item: the request names no other, another token is nothing, and nothing else of the UI opens with it
+    let n = seen.lock().unwrap().len();
+    let (status, _, body) = get_range(&format!("{link}?item={}", enc(NOTES)), None, None);
+    assert_eq!((status, body.len()), (200, film.len()));
+    assert_eq!(seen.lock().unwrap()[n].0, format!("/s/{FILM}"), "the token's item, whatever the request says");
+    let other = format!("{}{}", &token[..63], if token.ends_with('0') { "1" } else { "0" });
+    for refused in [format!("{}/r/{other}", b.base), format!("{link}/x"), format!("{}/r/", b.base), format!("{}/s/{NOTES}", b.base), format!("{}/s/{FILM}", b.base)] {
+        let (status, _, _) = get_range(&refused, None, None);
+        assert!(status == 404 || status == 401, "{refused}: {status}");
+    }
+    assert_eq!(seen.lock().unwrap().len(), n + 1, "nothing refused reached the connector");
+    assert_eq!(anon.get("/play").location(), "./login", "the link is no login");
+
+    // revoked: it plays nothing
+    let r = br.act(&play, "/play-link", &[("action", "revoke"), ("item", FILM), ("token", &token)]);
+    assert!(br.flash_after(&r).contains("revoked"));
+    assert_eq!(get_range(&link, None, None).0, 404);
+    // a new one expires on its own
+    let r = br.act(&play, "/play-link", &[("action", "create"), ("item", FILM)]);
+    assert!(br.flash_after(&r).contains("Link made"));
+    let page = br.get(&play).body;
+    let at = page.find("/r/").unwrap();
+    let fresh = format!("{}/r/{}", b.base, &page[at + 3..at + 3 + 64]);
+    assert_eq!(get_range(&fresh, None, None).0, 200);
+    std::thread::sleep(ttl + Duration::from_millis(300));
+    assert_eq!(get_range(&fresh, None, None).0, 404, "expired");
+    assert!(!br.get(&play).body.contains("/r/"), "an expired link is not shown");
+}

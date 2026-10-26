@@ -292,6 +292,20 @@ impl Sink {
         s
     }
 
+    /// The head of the answer as the first line on the socket, before any byte of the body: for a
+    /// caller that asked for it (`stream_head`), which hands the seller's status and range on to
+    /// its own client before the body. Not counted or hashed: it is the wallet's line, not the
+    /// seller's bytes.
+    fn head(&mut self, head: &Value) {
+        use std::io::Write;
+        if let Some(out) = self.out.as_mut() {
+            if writeln!(out, "{head}").is_err() {
+                self.out = None;
+                self.gone = true;
+            }
+        }
+    }
+
     fn put(&mut self, chunk: &[u8]) {
         use std::io::Write;
         if let Some(out) = self.out.as_mut() {
@@ -451,6 +465,37 @@ struct Call<'a> {
     piece_hashes: Vec<String>,
     /// A socket in `B2_STREAM_DIR` the body is streamed to as it arrives (`stream_to`).
     stream_to: Option<PathBuf>,
+    /// The head of the answer goes to that socket first, as one line of JSON (`stream_head`).
+    stream_head: bool,
+    /// The byte range asked for (`range`), sent as the `Range` header of every request for the URL.
+    range: Option<ByteRange>,
+}
+
+impl Call<'_> {
+    /// The headers every request of the call for its URL carries beside the payment's.
+    fn headers(&self) -> Vec<(String, String)> {
+        self.range.iter().map(|r| ("Range".to_string(), r.header())).collect()
+    }
+
+    /// The answer's head, read ([`answer_head`]); with `stream_head`, the first line on the socket.
+    /// `Some`: why its body is not read.
+    fn head(&self, ans: &mut WireAnswer, sink: &mut Sink) -> (Value, Option<String>) {
+        head_to(ans, self.range, self.stream_head, sink)
+    }
+}
+
+/// [`answer_head`], and with `line` the head as the first line on the sink's socket (with `error`:
+/// why the body is not read, where it is not).
+fn head_to(ans: &mut WireAnswer, range: Option<ByteRange>, line: bool, sink: &mut Sink) -> (Value, Option<String>) {
+    let (head, refused) = answer_head(ans, range);
+    if line {
+        let mut l = head.clone();
+        if let Some(why) = &refused {
+            l["error"] = why.clone().into();
+        }
+        sink.head(&l);
+    }
+    (head, refused)
 }
 
 /// What one call released: the hashes, the sats the book put in the ledger for them, and how many
@@ -551,6 +596,119 @@ fn stream_socket(v: Option<&Value>) -> std::result::Result<Option<PathBuf>, Stri
     }
     let dir = std::env::var("B2_STREAM_DIR").map_err(|_| "stream_to needs B2_STREAM_DIR, the directory of the sockets a body may be streamed to".to_string())?;
     Ok(Some(PathBuf::from(dir).join(name)))
+}
+
+/// One byte range a call asks for (`range`): `bytes=N-` (from byte N to the end) or `bytes=N-M`
+/// (bytes N to M, both included), and nothing else: no list of ranges, no suffix range, no spaces.
+/// It is sent as the `Range` header of every request of the call to the seller; what is paid is
+/// still what arrives, by the wallet's own count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ByteRange {
+    pub first: u64,
+    pub last: Option<u64>,
+}
+
+/// 1 to 19 ASCII digits (any of them fits a u64).
+fn digits(s: &str) -> Option<u64> {
+    (!s.is_empty() && s.len() <= 19 && s.bytes().all(|b| b.is_ascii_digit())).then(|| s.parse().ok()).flatten()
+}
+
+impl ByteRange {
+    pub fn parse(s: &str) -> Option<Self> {
+        let (first, last) = s.strip_prefix("bytes=")?.split_once('-')?;
+        let first = digits(first)?;
+        let last = if last.is_empty() { None } else { Some(digits(last)?) };
+        last.is_none_or(|l| first <= l).then_some(Self { first, last })
+    }
+
+    /// The `Range` header's value.
+    pub fn header(&self) -> String {
+        match self.last {
+            Some(l) => format!("bytes={}-{l}", self.first),
+            None => format!("bytes={}-", self.first),
+        }
+    }
+}
+
+fn byte_range(v: Option<&Value>) -> std::result::Result<Option<ByteRange>, String> {
+    match v {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s.is_empty() => Ok(None),
+        Some(Value::String(s)) => ByteRange::parse(s).map(Some).ok_or_else(|| "range is one byte range, bytes=N- or bytes=N-M with N <= M".to_string()),
+        Some(_) => Err("range is a string, bytes=N- or bytes=N-M".into()),
+    }
+}
+
+/// `Content-Range: bytes A-B/T` (T a number, or `*`), as `(A, B, T)`.
+fn content_range(s: &str) -> Option<(u64, u64, Option<u64>)> {
+    let (span, total) = s.trim().strip_prefix("bytes ")?.split_once('/')?;
+    let (a, b) = span.split_once('-')?;
+    let (a, b) = (digits(a)?, digits(b)?);
+    let total = if total == "*" { None } else { Some(digits(total)?) };
+    (a <= b && total.is_none_or(|t| b < t)).then_some((a, b, total))
+}
+
+/// A seller's `Content-Type` as it is passed on: a media type of plain characters, else nothing.
+fn plain_media_type(s: &str) -> Option<String> {
+    let ok = !s.is_empty() && s.len() <= 128 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~/;= ".contains(&b));
+    ok.then(|| s.to_string())
+}
+
+/// The head of a seller's answer, in the wallet's words: its status, `Content-Length`,
+/// `Content-Range`, `Accept-Ranges` and `Content-Type`, each only as the wallet could read it
+/// (a range in numbers it parsed, a type of plain characters). These go into the call's answer and,
+/// for a call that asked for it (`stream_head`), as the first line on its socket.
+///
+/// `Err` (with the head as far as it was read): an answer of 206 whose `Content-Range` is not the
+/// range the call asked for, or that cannot be read, or whose `Content-Length` disagrees with it.
+/// The body of such an answer is not read. A 200 to a call that asked for a range is a seller that
+/// sends the whole body; it is read, and metered, like any other.
+///
+/// A 206 that states no `Content-Length` is read to the end of its range and no further: `length`
+/// is set from its `Content-Range`.
+fn answer_head(ans: &mut WireAnswer, asked: Option<ByteRange>) -> (Value, Option<String>) {
+    let mut v = json!({"status": ans.status});
+    if let Some(n) = ans.length.filter(|_| !matches!(ans.status, 100..=199 | 204 | 304)) {
+        v["content_length"] = n.into();
+    }
+    match ans.header("Accept-Ranges").map(|s| s.trim().to_ascii_lowercase()) {
+        Some(a) if a == "bytes" || a == "none" => v["accept_ranges"] = a.into(),
+        _ => {}
+    }
+    if let Some(t) = ans.header("Content-Type").and_then(plain_media_type) {
+        v["content_type"] = t.into();
+    }
+    let cr = ans.header("Content-Range").map(str::to_string);
+    let refuse = |v: Value, why: String| (v, Some(why));
+    match ans.status {
+        206 => {
+            let Some((a, b, total)) = cr.as_deref().and_then(content_range) else {
+                return refuse(v, "the seller's 206 has no Content-Range the wallet can read".into());
+            };
+            if let Some(r) = asked {
+                if a != r.first || r.last.is_some_and(|l| b > l) {
+                    return refuse(v, format!("the seller's 206 is for bytes {a}-{b}, not the range asked for ({})", r.header()));
+                }
+            }
+            let span = b - a + 1;
+            if ans.length.is_some_and(|n| n != span) {
+                return refuse(v, format!("the seller's 206 states a Content-Length of {} for a range of {span} bytes", ans.length.unwrap_or(0)));
+            }
+            ans.length = Some(span);
+            v["content_length"] = span.into();
+            v["content_range"] = match total {
+                Some(t) => format!("bytes {a}-{b}/{t}"),
+                None => format!("bytes {a}-{b}/*"),
+            }.into();
+        }
+        416 => {
+            if let Some(t) = cr.as_deref().and_then(|s| s.trim().strip_prefix("bytes */")).and_then(digits) {
+                v["content_range"] = format!("bytes */{t}").into();
+            }
+        }
+        _ => {}
+    }
+    (v, None)
 }
 
 /// The x402 scheme name of the on-chain channel this wallet once paid: recognised in a 402 only to
@@ -704,6 +862,14 @@ impl Signer {
     /// With `max_sats` 0 the call pays nothing: an answer that is not a 402 is handed back, and a
     /// 402 is refused. (Until 2026-10 a third entry, the on-chain channel, was paid here, and a call
     /// with tickets off went to it; that rail was removed.)
+    ///
+    /// `range` ([`ByteRange`]) asks for part of the body, as a player that seeks does: it goes as
+    /// the `Range` header on the unpaid request and the paid one. Nothing about the price changes:
+    /// a body priced by the byte is paid for the bytes that arrive, and the seller's receipt signs
+    /// the body it sent, which for a 206 is that part. The answer carries the seller's `status`,
+    /// `content_range`, `content_length`, `accept_ranges` and `content_type` as the wallet read
+    /// them ([`answer_head`]); with `stream_to` and `stream_head`, the same head is the first line
+    /// on the socket, before the body.
     pub(crate) fn xbt402_pay(&self, p: &Value) -> Value {
         let tp = self.ticket_policy();
         let cfg = self.config();
@@ -734,6 +900,21 @@ impl Signer {
             Ok(s) => s,
             Err(why) => return deny("stream_to", why),
         };
+        let stream_head = stream_to.is_some() && p.get("stream_head").and_then(Value::as_bool) == Some(true);
+        let range = match byte_range(p.get("range")) {
+            Ok(r) => r,
+            Err(why) => return deny("range", why),
+        };
+        let piece_hashes: Vec<String> = p.get("piece_sha256").and_then(Value::as_array).into_iter().flatten().take(1 << 20)
+            .map(|h| h.as_str().unwrap_or("").to_ascii_lowercase()).collect();
+        if range.is_some() && method != "GET" {
+            return deny("range", "range is for a GET");
+        }
+        // the caller's piece hashes are of the whole body, from its first byte: a part of it would be judged against the wrong pieces
+        if range.is_some() && !piece_hashes.is_empty() {
+            return deny("range", "range and piece_sha256 do not go together: the pieces are counted from the body's first byte");
+        }
+        let range_headers: Vec<(String, String)> = range.iter().map(|r| ("Range".to_string(), r.header())).collect();
         // the owner's word before any request leaves: an allowlisted origin, or a task that pays any seller
         let listed = self.engine.allowlist().contains(&origin);
         if !self.ticket_may_reach(&origin, task.as_deref().unwrap_or("")) {
@@ -750,7 +931,7 @@ impl Signer {
             (Ok(l), Ok(c)) => (l, c),
             (Err(e), _) | (_, Err(e)) => return deny("xbt402", e.msg),
         };
-        let probe = match self.wire(&method, &url, &raw, &[], Self::ticket_read_timeout(&tp)) {
+        let mut probe = match self.wire(&method, &url, &raw, &range_headers, Self::ticket_read_timeout(&tp)) {
             Ok(a) => a,
             Err(e) => return deny("xbt402", format!("the seller gave no answer: {}", e.msg)),
         };
@@ -760,22 +941,24 @@ impl Signer {
                 Some(path) => Sink { out: std::os::unix::net::UnixStream::connect(path).ok(), ..Sink::new() },
                 None => Sink::new(),
             };
-            let ended = read_all(probe, &mut sink);
+            let (head, refused) = head_to(&mut probe, range, stream_head, &mut sink);
+            let ended = match refused {
+                Some(why) => Some(format!("not read: {why}")),
+                None => read_all(probe, &mut sink),
+            };
             let (_, stored, text) = sink.done();
-            return with(with(json!({"verdict": "allow", "rule": "free", "rail": "none", "status": status, "charged_sats": 0, "note": "no 402 (already free or error)",
-                                    "complete": ended.is_none(), UNTRUSTED_KEY: untrusted(&text, Value::Null)}), stored),
-                        json!({"ended": ended}));
+            return with(with(with(json!({"verdict": "allow", "rule": "free", "rail": "none", "status": status, "charged_sats": 0, "note": "no 402 (already free or error)",
+                                         "complete": ended.is_none(), UNTRUSTED_KEY: untrusted(&text, Value::Null)}), stored),
+                             json!({"ended": ended})), head);
         }
         let Some(pr) = probe.header("PAYMENT-REQUIRED").and_then(|h| unb64json(h).ok()) else {
             return deny("xbt402", "402 without a readable PAYMENT-REQUIRED");
         };
         drop(probe);
-        let piece_hashes: Vec<String> = p.get("piece_sha256").and_then(Value::as_array).into_iter().flatten().take(1 << 20)
-            .map(|h| h.as_str().unwrap_or("").to_ascii_lowercase()).collect();
         if max_sats == 0 {
             return with(deny("max_sats", "the seller asks to be paid and this call may spend nothing (max_sats 0)"), json!({"charged_sats": 0}));
         }
-        let call = Call { url: &url, origin: &origin, method: &method, body: &raw, max_sats, task, piece_hashes, stream_to };
+        let call = Call { url: &url, origin: &origin, method: &method, body: &raw, max_sats, task, piece_hashes, stream_to, stream_head, range };
         let mut passed: Vec<Value> = vec![];
         let mut ways = offers(&pr, &lightning);
         // tickets or draws first: one rule ([`crate::lottery::choose`]); the other is tried after it
@@ -885,13 +1068,18 @@ impl Signer {
         let header = b64json(&payment_payload(acc, &json!({"preimage": paid["preimage"]})));
         let mut out = with(json!({"verdict": "allow", "rule": "ok", "rail": "ln"}),
                            json!({"charged_sats": paid["charged_sats"], "payment_hash": paid["payment_hash"], "dest": paid["dest"], "fee_msat": paid["fee_msat"]}));
-        match self.wire(c.method, c.url, c.body, &[("PAYMENT-SIGNATURE".into(), header)], Self::ticket_read_timeout(tp)) {
-            Ok(ans) => {
-                out["status"] = ans.status.into();
+        let mut headers = c.headers();
+        headers.push(("PAYMENT-SIGNATURE".into(), header));
+        match self.wire(c.method, c.url, c.body, &headers, Self::ticket_read_timeout(tp)) {
+            Ok(mut ans) => {
                 let mut sink = Sink::for_call(c);
-                let ended = read_all(ans, &mut sink);
+                let (head, refused) = c.head(&mut ans, &mut sink);
+                let ended = match refused {
+                    Some(why) => Some(format!("not read: {why}")),
+                    None => read_all(ans, &mut sink),
+                };
                 let (_, stored, text) = sink.done();
-                out = with(with(out, stored), json!({"complete": ended.is_none(), "ended": ended, UNTRUSTED_KEY: untrusted(&text, Value::Null)}));
+                out = with(with(with(out, head), stored), json!({"complete": ended.is_none(), "ended": ended, UNTRUSTED_KEY: untrusted(&text, Value::Null)}));
             }
             // paid, and booked by the Lightning rail: said plainly
             Err(e) => out = with(out, json!({"status": null, "note": format!("the invoice was paid and the seller then gave no answer: {}", e.msg)})),
@@ -1662,7 +1850,9 @@ impl Signer {
             let (seq, digest) = (link.next_seq, request_digest_v2(c.method, c.url, c.body));
             let auth = xbt402::ticket::request_auth(&link.key, &link.seller_sid, seq, "", "", &digest);
             let header = b64json(&payment_payload(&hs.terms.accepted, &json!({"session": link.seller_sid, "seq": seq, "auth": auth})));
-            let ans = match self.wire(c.method, c.url, c.body, &[("PAYMENT-SIGNATURE".into(), header)], Self::ticket_read_timeout(&tp)) {
+            let mut headers = c.headers();
+            headers.push(("PAYMENT-SIGNATURE".into(), header));
+            let ans = match self.wire(c.method, c.url, c.body, &headers, Self::ticket_read_timeout(&tp)) {
                 Ok(a) => a,
                 // no secret travels with a request, so a lost answer costs what the seller charged the balance, if anything
                 Err(e) => {
@@ -1732,14 +1922,21 @@ impl Signer {
             }
             break (seq, digest, ans, head);
         };
+        let mut ans = ans;
         let status = ans.status;
         let mut out = json!({"verdict": "allow", "rule": "ok", "status": status});
         let mut sink = Sink::for_call(c);
+        // a 206 for another range than was asked is not read: what it has cost is what its head charged
+        let (head_fields, not_read) = c.head(&mut ans, &mut sink);
+        out = with(out, head_fields);
         let mut seller_last = Value::Null;
         let (price_msat, receipt_note) = if !hs.streaming.load(Ordering::SeqCst) {
             // a whole answer: paid for at its head, its body hashed against the receipt
             let length = ans.length;
-            let ended = read_all(ans, &mut sink);
+            let ended = match &not_read {
+                Some(why) => Some(format!("not read: {why}")),
+                None => read_all(ans, &mut sink),
+            };
             let complete = ended.is_none() && length.is_none_or(|n| n == sink.bytes);
             let digest_now = hex::encode(sink.hash.clone().finalize());
             let note = if !complete {
@@ -1754,7 +1951,7 @@ impl Signer {
             out = with(out, json!({"complete": complete, "ended": ended}));
             (head.charged, note)
         } else {
-            let (m, note, last) = self.ticket_stream(hs, price, &head, seq, &digest, ans, started, max_msat, &mut sink, &mut spent);
+            let (m, note, last) = self.ticket_stream(hs, price, &head, seq, &digest, ans, started, max_msat, &mut sink, &mut spent, not_read);
             seller_last = last;
             out = with(out, m);
             let price_msat = out.get("price_msat").and_then(|v| crate::ticket::outside_u64(Some(v))).unwrap_or(0);
@@ -1778,16 +1975,17 @@ impl Signer {
     /// time the balance no longer covers the next piece, and stopped (the connection closed) when
     /// the book refuses a release or the call's `max_sats` is used up. Then the seller's last
     /// receipt for the answer, checked against what was counted here. Returns fields for the reply
-    /// and what the receipt check found.
+    /// and what the receipt check found. With `stop`, nothing of the body is read: the answer
+    /// stopped at its head, for that reason.
     #[allow(clippy::too_many_arguments)]
     fn ticket_stream(&self, hs: &Arc<HttpSession>, price: &Price, head: &Receipt, seq: u64, digest: &str, ans: WireAnswer, started: Instant, max_msat: u64,
-                     sink: &mut Sink, spent: &mut Spent) -> (Value, Value, Value) {
+                     sink: &mut Sink, spent: &mut Spent, stop: Option<String>) -> (Value, Value, Value) {
         let base_spent = lock(&hs.money).acct.spent_msat.saturating_sub(head.charged);
         let st = Stream { price: *price, base_spent, started, max_msat, max_open: Duration::from_secs(self.ticket_policy().max_answer_s.clamp(1, 86_400) as u64) };
         let length = ans.length;
         let mut body = ans.body;
         // shared with the timer of an answer priced by the second: how far the body is, and why it stopped
-        let state: Mutex<(u64, Option<String>, bool)> = Mutex::new((0, None, false));
+        let state: Mutex<(u64, Option<String>, bool)> = Mutex::new((0, stop, false));
         let wake = Condvar::new();
         let spent_cell = Mutex::new(std::mem::take(spent));
         // one more ticket for this answer, or the reason there is none
@@ -2252,6 +2450,31 @@ mod tests {
         assert!(Signer::ticket_task_for(&tp(&["film", "swarm"]), "").is_err());
         assert!(Signer::ticket_task_for(&tp(&["film"]), "other").is_err());
         assert!(Signer::ticket_task_for(&tp(&[]), "").is_err());
+    }
+
+    #[test]
+    fn a_range_is_one_plain_byte_range_and_a_206_must_answer_it() {
+        assert_eq!(ByteRange::parse("bytes=1000-"), Some(ByteRange { first: 1000, last: None }));
+        assert_eq!(ByteRange::parse("bytes=0-0").map(|r| r.header()), Some("bytes=0-0".into()));
+        for bad in ["bytes=5-2", "bytes=-5", "bytes=1-2,3-4", "bytes= 1-", "Bytes=1-", "bytes=1", "bytes=a-", "bytes=1-2 ", "bytes=00000000000000000001-"] {
+            assert_eq!(ByteRange::parse(bad), None, "{bad}");
+        }
+        assert_eq!(content_range("bytes 10-19/100"), Some((10, 19, Some(100))));
+        assert_eq!(content_range("bytes 10-19/*"), Some((10, 19, None)));
+        for bad in ["bytes 19-10/100", "bytes 10-100/100", "bytes */100", "10-19/100", "bytes 10-19"] {
+            assert_eq!(content_range(bad), None, "{bad}");
+        }
+        let ans = |status: u16, cr: &str, length: Option<u64>| WireAnswer { status, headers: vec![("CONTENT-RANGE".into(), cr.into())], length, body: Box::new(std::io::empty()) };
+        let asked = ByteRange::parse("bytes=10-");
+        let mut a = ans(206, "bytes 10-19/100", None);
+        let (v, refused) = answer_head(&mut a, asked);
+        assert_eq!((refused, a.length, v["content_range"].as_str()), (None, Some(10), Some("bytes 10-19/100")), "the range's span is the length");
+        assert!(answer_head(&mut ans(206, "bytes 0-19/100", Some(20)), asked).1.is_some(), "another start");
+        assert!(answer_head(&mut ans(206, "bytes 10-19/100", Some(11)), asked).1.is_some(), "a length that is not the span");
+        assert!(answer_head(&mut ans(206, "bytes 10-30/100", Some(21)), ByteRange::parse("bytes=10-20")).1.is_some(), "past the end asked for");
+        assert!(answer_head(&mut ans(206, "", Some(5)), None).1.is_some(), "a 206 with no range");
+        assert!(answer_head(&mut ans(200, "", Some(100)), asked).1.is_none(), "a whole body, the range ignored");
+        assert_eq!(answer_head(&mut ans(416, "bytes */100", Some(0)), asked).0["content_range"], "bytes */100");
     }
 
     #[test]

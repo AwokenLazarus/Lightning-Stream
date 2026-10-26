@@ -60,6 +60,7 @@ form.inline { display: inline; }
 .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0; }
 .row input { flex: 1 1 180px; width: auto; margin: 0; }
 .row form { margin: 0; }
+.relay-link { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.85em; }
 form.deny { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
 form.deny input { flex: 1 1 200px; width: auto; margin: 0; }
 fieldset { border: 1px solid var(--line); border-radius: 8px; margin: 0 0 16px; padding: 8px 16px 12px; }

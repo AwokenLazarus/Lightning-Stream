@@ -11,6 +11,7 @@
 //! * [`html`]: escaping, the page layout, formatting.
 //! * [`app`]: the routes and pages; [`server`]: the HTTP server.
 //! * [`services`]: the services file Browse and the player read (`XBT_UI_SERVICES`).
+//! * [`relay`]: the links an external player (VLC, mpv) plays one item through.
 //! * [`setup`]: the Lightning rail page (wallet) and the seller gateway's page (`XBT_UI_ROLE=gateway`).
 pub mod app;
 pub mod services;
@@ -19,6 +20,7 @@ pub mod config;
 pub mod html;
 pub mod link;
 pub mod msg;
+pub mod relay;
 pub mod server;
 pub mod setup;
 
