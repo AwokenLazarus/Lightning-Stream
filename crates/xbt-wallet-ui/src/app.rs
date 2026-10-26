@@ -103,6 +103,13 @@ pub fn starter_policy(chain: &str) -> Value {
     p
 }
 
+/// A static asset. The pages ask for it as `?v=<content hash>`: that URL never changes meaning, so
+/// it is cached for a year; any other request for it, for a day.
+fn asset(req: &Req, ctype: &str, body: &'static str) -> Resp {
+    let current = req.query.get("v").is_some_and(|v| *v == crate::html::asset_version(body));
+    Resp::text(200, ctype, body).header("Cache-Control", if current { "public, max-age=31536000, immutable" } else { "public, max-age=86400" })
+}
+
 fn state_of(c: &Value) -> &'static str {
     if c.get("refund_txid").is_some_and(|v| !v.is_null()) {
         "refunded"
@@ -206,8 +213,9 @@ impl App {
             return Resp::text(405, "text/plain", "method not allowed");
         }
         match (get, req.path.as_str()) {
-            (true, "/ui.js") => return Resp::text(200, "text/javascript; charset=utf-8", crate::UI_JS).header("Cache-Control", "public, max-age=86400"),
-            (true, "/ui.css") => return Resp::text(200, "text/css; charset=utf-8", crate::UI_CSS).header("Cache-Control", "public, max-age=86400"),
+            (true, "/ui.js") => return asset(&req, "text/javascript; charset=utf-8", crate::UI_JS),
+            (true, "/river.js") => return asset(&req, "text/javascript; charset=utf-8", crate::river_js()),
+            (true, "/ui.css") => return asset(&req, "text/css; charset=utf-8", crate::UI_CSS),
             (true, "/healthz") => return Resp::json(200, &json!({"ok": true})),
             (true, "/readyz") if self.cfg.role == Role::Gateway => return Resp::json(200, &json!({"ok": true, "role": "gateway"})),
             (true, "/readyz") => {

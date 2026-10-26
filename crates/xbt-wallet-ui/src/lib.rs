@@ -1,7 +1,7 @@
 //! xbt-wallet-ui (AGP-039): the agent wallet's web UI for a box with no terminal (Umbrel, StartOS).
 //!
 //! A separate process that talks only to the signer's socket, like the MCP server. It renders plain
-//! HTML on the server; the only script, `assets/ui.js`, holds the human's ed25519 key in the browser
+//! HTML on the server; the one script that does anything, `assets/ui.js`, holds the human's ed25519 key in the browser
 //! and signs there, so approvals keep B2's human-key property: the box never holds the approving key.
 //!
 //! * [`config`]: environment and data directory.
@@ -26,6 +26,16 @@ pub mod setup;
 
 pub const UI_JS: &str = include_str!("../assets/ui.js");
 pub const UI_CSS: &str = include_str!("../assets/ui.css");
+/// The river drawn behind every page: decoration only, it reads and sends nothing.
+pub const RIVER_JS_SOURCE: &str = include_str!("../assets/river.js");
+
+/// The river as served: its source without indentation, blank lines and comment lines.
+pub fn river_js() -> &'static str {
+    static SERVED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        RIVER_JS_SOURCE.lines().map(str::trim_start).filter(|l| !l.is_empty() && !l.starts_with("//")).collect::<Vec<_>>().join("\n")
+    });
+    &SERVED
+}
 
 /// OS randomness.
 pub fn random_bytes<const N: usize>() -> [u8; N] {

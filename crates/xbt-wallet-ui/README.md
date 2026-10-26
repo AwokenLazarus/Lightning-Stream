@@ -62,7 +62,7 @@ The MCP server can wait for the approval: with `XBT_MCP_APPROVAL_WAIT_S=N`, an o
 |---|---|---|---|
 | binary | 0.79 MB aarch64, 0.82 MB armv7, 0.88 MB x86_64 (static musl, `release-small`) | the same server plus a 40–150 kB JS bundle and a node toolchain at build time | a pty server plus about 300 kB of xterm.js, and a TUI to write |
 | arm/v7 and small boxes | std HTTP server (`xbt_svc::http`), no async runtime; about 1 MB RSS idle | the same server; the phone does more work | a pty and a process per session |
-| security surface | no JSON API for changes, only form POSTs with CSRF tokens; strict CSP (`script-src 'self'`, no inline script, no eval); one 20 kB script, used only for keys and signing | a JSON API, so CORS and CSRF on every endpoint; larger third-party dependency trees | a shell-like surface; hard to put behind the proxy's auth |
+| security surface | no JSON API for changes, only form POSTs with CSRF tokens; strict CSP (`script-src 'self'`, no inline script, no eval); one 20 kB script, used only for keys and signing (plus the decorative river, which reads and sends nothing) | a JSON API, so CORS and CSRF on every endpoint; larger third-party dependency trees | a shell-like surface; hard to put behind the proxy's auth |
 | accessibility | semantic HTML, labels, keyboard focus, readable without JS (JS is needed only to sign) | depends on care; broken without JS | poor: screen readers and phones |
 | offline, Tor, proxies | relative URLs, no external resources; works on an .onion and under any prefix | the same only with care (router base paths) | WebSocket through Tor and proxies is fragile |
 | maintenance | one Rust crate in the workspace; the pages are functions | two toolchains, a lockfile of npm dependencies | little code, but no real UI |
@@ -147,10 +147,61 @@ but they add proc-macro dependencies for about 15 pages. Everything user-control
 
   The approval of an on-chain `pay` keeps B2's `approve`, which pays at once.
 
+## The look
+
+The app is drawn as an electric river at night, after its icon: a deep-night ground, currents in
+electric blue and violet, and one warm colour (amber) for the main action on a page and for money.
+Light and dark follow the system. `assets/ui.css` holds the tokens and the components: cards,
+buttons (the warm one is the main action; `secondary`, `danger` and `link` for the rest), inputs,
+status pills (`pill good|warn|bad`, a word and a colour), the navigation, empty states and the
+numbered first-run steps. Everything is local: no web fonts, nothing from another host, and the CSP
+stays `default-src 'none'; script-src 'self'; style-src 'self'`.
+
+Behind every page, `assets/river.js` draws a few slow streams on a fixed canvas (`aria-hidden`, no
+pointer events). The pointer bends the streams near it, and near two of them a short arc joins them,
+like a channel opening; `lsRiver.pulse()` sends a pulse down a stream, for payment and stream
+events. It is decoration only: it reads nothing and sends nothing. To stay out of the way:
+
+- it draws in a worker on an `OffscreenCanvas` where the browser has one, so the page's thread only
+  forwards pointer positions; elsewhere it draws in the page with the same code;
+- 30 frames a second while the pointer moves, 6 at rest (sleeping between frames, not waking at
+  every display refresh), none while the tab is hidden or a video plays;
+- half resolution (at most 0.75 backing pixels per CSS pixel; the glow hides it), the stream count
+  scaled to the window, one still frame when the system asks for reduced motion;
+- 7.7 kB as served (the source without indentation and comment lines).
+
+**Cost** (Chrome 152 headless, software rendering with no GPU, which is the dearest case; AMD Ryzen 9
+9950X3D; 1920x1080, dark, the Browse page; CPU of all the browser's processes as % of one core;
+two rounds of 30 s each, alternating with and without the river, averaged; 2026-10-26):
+
+| | pointer still | pointer moving |
+|---|---|---|
+| without the river | 0.42% | 4.62% |
+| with the river (worker) | 3.27% (+2.85) | 17.05% (+12.43) |
+| with the river (in the page, the fallback) | 5.10% (+4.68) | 16.70% (+12.08) |
+| page thread busy, without / with (worker) | 0.07% / 0.08% | 0.67% / 0.92% |
+
+A frame of the river takes 0.12 ms on average and at most 3 ms, in the worker, never on the page's
+thread. A browser with a GPU composites the canvas there, so the cost on a normal desktop or phone
+is lower than this. **Contrast:** averaged over 8x8 px (a letter's size) at the brightest point the
+river and the glow reach, body text is 11.3:1 (dark) and 12.2:1 (light), secondary text 6.5:1 and
+5.7:1; on a card, body text is 15.5:1 and 14.6:1.
+
+Repro (writes the screenshots, `look.json` and the numbers above; about 6 minutes):
+
+```bash
+XBT_UI_LOOK=1 XBT_UI_LOOK_DIR=run/look cargo test -p xbt-wallet-ui --test look -- --nocapture
+```
+
+The test fails if the river at rest costs 3% of one core or more over the page without it, if a
+frame takes more than 4 ms, or if body text falls under 7:1 or secondary text under 4.5:1 anywhere
+over the river.
+
 ## Tests
 
 ```bash
 cargo test -p xbt-wallet-ui          # ui_http (auth, CSRF, headers, proxies, every action), crypto_js, browser (headless Chrome)
+XBT_UI_LOOK=1 cargo test -p xbt-wallet-ui --test look   # screenshots, the river's cost and the contrast (see "The look")
 node crates/xbt-wallet-ui/tests/js/crypto_test.mjs
 scripts/ui/regtest_ui.sh             # real regtest: the agent asks, the UI approves, paid and confirmed on chain; a deny; a sweep
 scripts/ui/verify_agp039.sh          # all of the above plus the signer and MCP suites
