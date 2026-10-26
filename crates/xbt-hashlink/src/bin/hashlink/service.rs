@@ -234,7 +234,7 @@ pub fn run(f: &HashMap<String, String>, key: SecretKey) -> Result<(), String> {
                     }
                 }
             }
-            if fl.get("link-public").is_none() || fl.get("pay-url").is_none() || fl.get("pay-node").is_none() {
+            if ["link-public", "pay-url", "pay-node"].iter().any(|k| !fl.contains_key(*k)) {
                 continue;
             }
             let res = super::listing_of(&fl, &key_of(f)?, &settings.terms, cap).and_then(|l| super::publish(&fl, r, &key_of(f)?, &l).map(|_| l));
