@@ -170,6 +170,27 @@ fn the_first_human_key_is_enrolled_once_and_later_only_the_old_key_can_hand_over
     assert_eq!(rig.call("policy_set", set)["rule"], "human_sig");
 }
 
+/// A box's setup page reads the code from a copy the signer writes beside it (0640, the copy dir's
+/// group): the owner reads no log. The copy goes when the code is spent.
+#[test]
+fn the_enrolment_code_has_a_copy_for_the_setup_page_that_goes_once_spent() {
+    use std::os::unix::fs::PermissionsExt;
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let t = tempfile::tempdir().unwrap();
+    let copy = t.path().join("enroll-code");
+    std::env::set_var(xbt_signer::admin::ENROLL_CODE_COPY_ENV, &copy);
+    let rig = Rig::new(json!({"human_pubkey": ""}), false);
+    std::env::remove_var(xbt_signer::admin::ENROLL_CODE_COPY_ENV);
+    let code = std::fs::read_to_string(rig.root.join(".run/enroll-code")).unwrap();
+    assert_eq!(std::fs::read_to_string(&copy).unwrap(), code);
+    assert_eq!(std::fs::metadata(&copy).unwrap().permissions().mode() & 0o777, 0o640);
+    std::env::set_var(xbt_signer::admin::ENROLL_CODE_COPY_ENV, &copy);
+    let r = rig.call("human_key_enroll", json!({"pubkey": hex::encode(human().verifying_key().to_bytes()), "code": code.trim()}));
+    std::env::remove_var(xbt_signer::admin::ENROLL_CODE_COPY_ENV);
+    assert_eq!(r["ok"], true, "{r}");
+    assert!(!copy.exists(), "the copy is spent with the code");
+}
+
 #[test]
 fn the_signed_rotation_and_the_backup_export() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());

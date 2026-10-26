@@ -31,6 +31,38 @@ pub fn get_page(url: &str) -> Result<xbt402::listing::Page, String> {
     Ok(xbt402::listing::Page { status, headers, body })
 }
 
+/// The seller's Lightning node, from its own 402 terms (`accepts[].payTo`), asked at `urls` in turn
+/// (its priced items, then its address): the node the policy ties the seller's address to.
+pub fn seller_node(urls: &[String], mut get: impl FnMut(&str) -> Result<xbt402::listing::Page, String>) -> Result<String, String> {
+    use base64::Engine;
+    let mut why = String::from("the seller asked for no payment at its address");
+    for u in urls.iter().take(4) {
+        let page = match get(u) {
+            Ok(p) => p,
+            Err(e) => {
+                why = e;
+                continue;
+            }
+        };
+        if page.status != 402 {
+            continue;
+        }
+        let header = page.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("PAYMENT-REQUIRED")).map(|(_, v)| v.clone());
+        let terms: Option<serde_json::Value> = header
+            .and_then(|h| base64::engine::general_purpose::STANDARD.decode(h.trim()).ok())
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .or_else(|| serde_json::from_str(&page.body).ok());
+        let node = terms.as_ref().and_then(|t| t["accepts"].as_array().cloned()).unwrap_or_default().iter()
+            .filter_map(|a| a["payTo"].as_str().map(str::to_string))
+            .find(|n| n.len() == 66 && n.bytes().all(|c| c.is_ascii_hexdigit()));
+        match node {
+            Some(n) => return Ok(n.to_ascii_lowercase()),
+            None => why = "the seller's terms name no Lightning node".into(),
+        }
+    }
+    Err(why)
+}
+
 /// The sellers in the services file, by origin, in the file's order.
 fn by_seller(all: &[Service]) -> Vec<(String, Vec<&Service>)> {
     let mut out: Vec<(String, Vec<&Service>)> = vec![];
@@ -67,7 +99,17 @@ impl App {
                                             s.kind.category(), esc(s.kind.category_words()), esc(&s.name), esc(&s.price_text),
                                             if n > 0 { format!(" <span class=\"small\">{n} to choose from</span>") } else { String::new() }));
                     }
-                    b.push_str("</ul><div class=\"row\">");
+                    b.push_str("</ul>");
+                    let allowed = self.seller_allowed(&origin);
+                    b.push_str(&if allowed {
+                        "<p><span class=\"pill good\">Allowed to be paid</span> within your spending rules.</p>".to_string()
+                    } else {
+                        format!("<p><span class=\"pill warn\">Not allowed to be paid yet</span> Your spending rules list the sellers the app may pay.</p>\
+                                 <form method=\"post\" action=\"./services\">{}<input type=\"hidden\" name=\"action\" value=\"allow\">\
+                                 <input type=\"hidden\" name=\"url\" value=\"{}\"><button>Allow this seller to be paid</button></form>",
+                                App::csrf_input(ctx), esc(&origin))
+                    });
+                    b.push_str("<div class=\"row\">");
                     for (action, label, class) in [("refresh", "Check for updates", " class=\"secondary\""), ("remove", "Remove", " class=\"danger\"")] {
                         b.push_str(&format!("<form method=\"post\" action=\"./services\">{}<input type=\"hidden\" name=\"action\" value=\"{action}\">\
                                              <input type=\"hidden\" name=\"url\" value=\"{}\"><button{class}>{label}</button></form>",
@@ -85,6 +127,10 @@ impl App {
         let result = match f.get("action").map(String::as_str) {
             Some("add") | Some("refresh") => self.add_seller(&url, get_page),
             Some("remove") => self.remove_seller(&url),
+            Some("allow") => match self.allow_link(&url, get_page) {
+                Ok(link) => return Resp::redirect(&link),
+                Err(e) => Err(e),
+            },
             _ => Err("Unknown action.".into()),
         };
         match result {
@@ -107,7 +153,33 @@ impl App {
         let n = new.len();
         all.extend(new);
         services::save(&self.cfg.services_path(), &all)?;
-        Ok(format!("{} {}: {n} service{} on Browse now.", if had { "Updated" } else { "Added" }, listing.name, if n == 1 { "" } else { "s" }))
+        let allowed = self.seller_allowed(&listing.seller);
+        Ok(format!("{} {}: {n} service{} on Browse now.{}", if had { "Updated" } else { "Added" }, listing.name, if n == 1 { "" } else { "s" },
+                   if allowed { "" } else { " To let the app pay this seller, press \"Allow this seller to be paid\" below." }))
+    }
+
+    /// Whether the spending rules let the app pay the seller at `origin`: its address on the list,
+    /// tied to a Lightning node.
+    pub(crate) fn seller_allowed(&self, origin: &str) -> bool {
+        let Ok(p) = self.signer.call("policy_get", serde_json::json!({})) else { return false };
+        let pol = &p["policy"];
+        let o = services::http_origin(origin).unwrap_or_default();
+        let listed = pol["allowlist"].as_array().is_some_and(|a| a.iter().filter_map(|x| x.as_str()).any(|x| services::http_origin(x).as_deref() == Some(o.as_str())));
+        listed && pol["counterparties"].as_object().is_some_and(|m| m.iter().any(|(k, v)|
+            services::http_origin(k).as_deref() == Some(o.as_str()) && v["ln_node"].as_str().is_some_and(|n| !n.is_empty())))
+    }
+
+    /// The spending rules page with this seller added, ready to sign: the seller's node is read from
+    /// its own 402 terms, at its priced items first.
+    pub fn allow_link(&self, url: &str, get: impl FnMut(&str) -> Result<xbt402::listing::Page, String>) -> Result<String, String> {
+        let origin = services::http_origin(url).ok_or("That is not a web address.")?;
+        let mut urls: Vec<String> = self.file_services().unwrap_or_default().iter()
+            .filter(|s| services::same_origin(&s.seller, &origin))
+            .flat_map(|s| s.items.iter().map(|i| i.url.clone()).collect::<Vec<_>>())
+            .filter(|u| services::same_origin(u, &origin)).take(2).collect();
+        urls.push(origin.clone());
+        let node = seller_node(&urls, get).map_err(|e| format!("This seller could not be allowed: {e}."))?;
+        Ok(format!("./policy?allow={}&node={}", services::urlenc(&origin), node))
     }
 
     fn remove_seller(&self, url: &str) -> Result<String, String> {

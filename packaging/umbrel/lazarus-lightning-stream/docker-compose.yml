@@ -7,8 +7,9 @@
 # Sell: the gateway, the same image as the gateway app, so it stays idle until its config exists
 # (xbt-supervise --wait). The owner turns it on from the Sell page of the app's own page
 # (XBT_UI_SELL=1), which writes the gateway's config and its two narrow macaroons. The gateway mounts
-# only those. The signer is the only service that can spend. No admin macaroon is mounted: of the
-# Lightning node's data, only tls.cert.
+# only those. The signer is the only service that can spend. Of the Lightning node's data the
+# services mount only tls.cert; the one-shot node-keys alone reads its admin macaroon, once, to have
+# the node bake the narrow macaroons (below), and keeps nothing of it.
 #
 # Stream sockets live in run/signer/streams (B2_STREAM_DIR for the signer and the connector). The
 # connector runs as the signer's user, because the published signer image cannot gain a group until
@@ -33,6 +34,15 @@ x-service: &service
   depends_on:
     init:
       condition: service_completed_successfully
+
+x-lightning-data: &lightning-data
+  # the Lightning app's chain data, where its admin macaroon is: mounted into node-keys only
+  type: bind
+  source: ${APP_LIGHTNING_FORK_NODE_DATA_DIR}/data/chain
+  target: /node/chain
+  read_only: true
+  bind:
+    create_host_path: false
 
 x-lightning-cert: &lightning-cert
   type: bind
@@ -96,11 +106,14 @@ services:
       B2_LN_TLS_CERT: /data/lightning/tls.cert
       # the same directory the connector binds stream sockets in
       B2_STREAM_DIR: /data/run/signer/streams
+      # a copy of the one-time enrolment code for the setup page (run/enroll: the signer and the UI only)
+      B2_ENROLL_CODE_COPY: /data/run/enroll/enroll-code
     volumes:
       - ${APP_DATA_DIR}/data/signer:/data/signer
       - ${APP_DATA_DIR}/data/run/signer:/data/run/signer
       - ${APP_DATA_DIR}/data/run/anchor:/data/run/anchor:ro
       - ${APP_DATA_DIR}/data/run/ln:/data/run/ln:ro
+      - ${APP_DATA_DIR}/data/run/enroll:/data/run/enroll
       - *lightning-cert
 
   mcp:
@@ -145,6 +158,11 @@ services:
       XBT_UI_SUGGESTED_SELLERS: https://media.lazarus-xbt.xyz
       # Nostr relays the Services page reads sellers' signed listings from (opt-in Nostr page)
       XBT_UI_NOSTR_RELAYS: wss://relay.damus.io,wss://nos.lol
+      # the box's own login proxy: a request through it is the owner's, logged in to the box, and needs
+      # no app password. Any other peer on the box network still needs the password
+      XBT_UI_PLATFORM_LOGIN: lazarus-lightning-stream_app_proxy_1
+      # the signer's one-time enrolment code: the setup page fills it in, so no log has to be read
+      XBT_UI_ENROLL_CODE_FILE: /data/run/enroll/enroll-code
     volumes:
       - ${APP_DATA_DIR}/data/ui:/data/ui
       - ${APP_DATA_DIR}/data/run/signer:/data/run/signer:ro
@@ -154,6 +172,35 @@ services:
       - ${APP_DATA_DIR}/data/run/ln:/data/run/ln
       # the Sell page writes the gateway's config and macaroons here
       - ${APP_DATA_DIR}/data/run/gateway:/data/run/gateway
+      - ${APP_DATA_DIR}/data/run/enroll:/data/run/enroll:ro
+      - *lightning-cert
+
+  # One-shot: connects the app to the box's Lightning node with no step by the owner. It reads the
+  # node's admin macaroon (the Lightning app's data, read-only, here and in no other service) and asks
+  # the node to bake the app's narrow macaroons, each under a root key of its own: the wallet's
+  # (info:read offchain:read offchain:write onchain:read) and the gateway's two (invoices; info:read).
+  # It writes only those, where the setup pages would, and exits. A key already there is kept; a key
+  # the owner disconnected is not made again. The Lightning app's files are its user's (1000), hence
+  # the group. It waits for the node (starting, or its wallet still locked) and asks again.
+  node-keys:
+    <<: *service
+    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-cc28002e474e@sha256:c71d62e384b01b3910d50c21c4f4ff3bc59b847806c0a9b04cc30b130ff6ea53
+    command: ["node-keys"]
+    restart: "no"
+    group_add:
+      - "1000"
+    healthcheck:
+      disable: true
+    environment:
+      XBT_KEYS_NODE_REST: https://${APP_LIGHTNING_FORK_NODE_IP}:${APP_LIGHTNING_FORK_NODE_REST_PORT}
+      XBT_KEYS_TLS_CERT: /data/lightning/tls.cert
+      XBT_KEYS_ADMIN: /node/chain
+      XBT_KEYS_RAIL_DIR: /data/run/ln
+      XBT_KEYS_GW_DIR: /data/run/gateway
+    volumes:
+      - ${APP_DATA_DIR}/data/run/ln:/data/run/ln
+      - ${APP_DATA_DIR}/data/run/gateway:/data/run/gateway
+      - *lightning-data
       - *lightning-cert
 
   connector:

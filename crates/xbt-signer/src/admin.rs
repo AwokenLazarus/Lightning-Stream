@@ -32,6 +32,9 @@ pub const POLICY_SIGN_WINDOW_S: i64 = 600;
 pub const MIN_BACKUP_PASS: usize = 12;
 /// AGP-063 W4: the enrolment code's file under `.run`, and the wrong codes one code survives.
 pub const ENROLL_CODE_FILE: &str = "enroll-code";
+/// Where a box's setup page reads the code (`run/enroll/enroll-code`): a copy, 0640, given the group
+/// of the dir it is in (the signer's and the UI's only, never the model-facing MCP's). Unset: no copy.
+pub const ENROLL_CODE_COPY_ENV: &str = "B2_ENROLL_CODE_COPY";
 pub const ENROLL_CODE_TRIES: u32 = 5;
 
 /// The file under `.run` that remembers which human-signed messages were used.
@@ -107,6 +110,22 @@ pub struct EnrollCode {
 }
 
 /// 60 random bits as `XXXX-XXXX-XXXX` (Crockford base32: no I, L, O or U to misread).
+fn enroll_code_copy() -> Option<std::path::PathBuf> {
+    std::env::var(ENROLL_CODE_COPY_ENV).ok().filter(|p| !p.trim().is_empty()).map(std::path::PathBuf::from)
+}
+
+/// `text` at `path`, 0640 with the group of its dir (the reader's): written private first, then
+/// given the group and the mode, so it is never readable by anyone else on the way.
+fn write_group_copy(path: &Path, text: &str) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    write_private(path, text)?;
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let gid = std::fs::metadata(dir).map_err(|e| err("io", format!("{}: {e}", dir.display())))?.gid();
+    std::os::unix::fs::chown(path, None, Some(gid)).map_err(|e| err("io", format!("{}: {e}", path.display())))?;
+    crate::fsx::set_mode(path, 0o640).map_err(|e| err("io", e.to_string()))?;
+    Ok(())
+}
+
 fn new_enroll_code() -> String {
     const A: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
     let n = u64::from_le_bytes(random_bytes::<8>());
@@ -400,6 +419,11 @@ impl Signer {
     pub(crate) fn issue_enroll_code(&self) -> Result<()> {
         let code = new_enroll_code();
         write_private(&self.run.join(ENROLL_CODE_FILE), &format!("{code}\n"))?;
+        if let Some(copy) = enroll_code_copy() {
+            if let Err(e) = write_group_copy(&copy, &format!("{code}\n")) {
+                eprintln!("xbt-signer: the enrolment code's copy for the setup page was not written: {e}");
+            }
+        }
         eprintln!("xbt-signer: no human key is enrolled. One-time enrolment code: {code} (also in {})", self.run.join(ENROLL_CODE_FILE).display());
         *self.enroll.lock().unwrap_or_else(|p| p.into_inner()) = EnrollCode { code, failures: 0 };
         Ok(())
@@ -413,6 +437,9 @@ impl Signer {
             *g = EnrollCode::default();
             drop(g);
             let _ = std::fs::remove_file(self.run.join(ENROLL_CODE_FILE));
+            if let Some(copy) = enroll_code_copy() {
+                let _ = std::fs::remove_file(copy);
+            }
             return Ok(None);
         }
         g.failures += 1;

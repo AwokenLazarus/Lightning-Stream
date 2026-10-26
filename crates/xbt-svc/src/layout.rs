@@ -45,6 +45,8 @@ pub const COMPONENTS: &[Component] = &[
 /// The group of the wallet's Lightning rail files (`run/ln/`): the signer is its only member, so the
 /// MCP (in the signer's and the UI's groups) cannot read the rail macaroon.
 pub const LN_RAIL_GID: u32 = 10008;
+/// The group of the enrolment code's copy (`run/enroll/`): the signer and the UI, never the MCP.
+pub const ENROLL_GID: u32 = 10009;
 
 /// A dir under `run/` that one component writes and another reads by group, made only when both are
 /// in the layout. The writer is a member of the group too (the images' /etc/group) and gives each
@@ -62,10 +64,12 @@ pub struct SharedDir {
 }
 
 /// The UI's setup pages write here: the wallet's rail macaroon for the signer (`run/ln/`), and the
-/// gateway's config and macaroons for the gateway (`run/gateway/`).
+/// gateway's config and macaroons for the gateway (`run/gateway/`). The signer writes the copy of
+/// its enrolment code for the UI in `run/enroll/`.
 pub const SHARED_DIRS: &[SharedDir] = &[
     SharedDir { dir: crate::RUN_LN, writer: crate::UI, reader: crate::SIGNER, gid: LN_RAIL_GID, mode: 0o750 },
     SharedDir { dir: crate::RUN_GATEWAY, writer: crate::UI, reader: crate::GATEWAY, gid: 10007, mode: 0o750 },
+    SharedDir { dir: crate::RUN_ENROLL, writer: crate::SIGNER, reader: crate::UI, gid: ENROLL_GID, mode: 0o750 },
 ];
 
 /// The socket dirs: (dir under `run/`, the component that serves it).

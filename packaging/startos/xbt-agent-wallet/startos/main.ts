@@ -55,6 +55,9 @@ export const main = sdk.setupMain(async ({ effects }) => {
   // then the witness, the signer, and the two services on the signer's socket
   const daemons = sdk.Daemons.of(effects)
     .addOneshot('init', { subcontainer: sub(init), exec: exec(init), requires: [] })
+    // the wallet's rail macaroon, made through the box's own Lightning node (nothing waits for it:
+    // the signer picks the file up when it appears)
+    .addOneshot('node-keys', { subcontainer: sub(spec('node-keys')), exec: exec(spec('node-keys')), requires: ['init'] })
     .addDaemon('witness', {
       subcontainer: witnessSub,
       exec: exec(witness),

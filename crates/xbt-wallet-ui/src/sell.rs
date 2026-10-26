@@ -387,6 +387,50 @@ impl App {
             })
     }
 
+    /// The address a proxy or tunnel forwards buyers to: this app's selling port on the box.
+    fn selling_port(&self) -> String {
+        let host = self.cfg.gw.health_url.as_deref().and_then(|u| u.strip_prefix("http://")).and_then(|r| r.split(['/', ':']).next())
+            .filter(|h| !h.is_empty()).unwrap_or("this box");
+        format!("http://{host}:{}", self.cfg.gw.port)
+    }
+
+    /// Ask the shop's public address from here, as a buyer would: its signed listing, checked against
+    /// its own terms, or else a 402 at one of its routes. (A box may not reach its own public address
+    /// on some home networks; a tunnel's always works.)
+    fn check_public(&self, shop: &Shop) -> Result<String, String> {
+        let url = shop.public_url.trim_end_matches('/');
+        if !url.starts_with("https://") {
+            return Err("Save the https:// address buyers find you at first.".into());
+        }
+        match xbt402::listing::fetch(url, crate::app::services_page::get_page) {
+            Ok(l) => return Ok(format!("Buyers can reach you: {url} answers with your signed list ({} service{}).",
+                                       l.services.len(), if l.services.len() == 1 { "" } else { "s" })),
+            Err(e) if e.contains("could not reach") => return Err(format!("Buyers can't reach {url} yet: {e}. Check the tunnel or proxy that leads there.")),
+            Err(_) => {}
+        }
+        let first = shop.offers.iter().filter(|o| !o.paused).flat_map(|o| o.paths.clone()).next().unwrap_or_else(|| "/".into());
+        match crate::app::services_page::get_page(&format!("{url}{first}")) {
+            Ok(p) if p.status == 402 => Ok(format!("Buyers can reach you: {url} answers and asks for payment.")),
+            Ok(p) => Err(format!("{url} answers, but not as your shop does (HTTP {}): check that it leads to {}.", p.status, self.selling_port())),
+            Err(e) => Err(format!("Buyers can't reach {url} yet: {e}. Check the tunnel or proxy that leads there.")),
+        }
+    }
+
+    /// Media servers and AI models on this box that answer: the usual names of the apps on Umbrel
+    /// and StartOS, and the ones the box names (`XBT_UI_LOCAL_SERVICES`). Asked in parallel, briefly.
+    fn found_services(&self) -> Vec<(String, String)> {
+        let mut c: Vec<(String, String)> = self.cfg.local_services.clone();
+        for (n, u) in KNOWN_SERVICES {
+            if !c.iter().any(|(_, x)| x == u) {
+                c.push((n.to_string(), u.to_string()));
+            }
+        }
+        std::thread::scope(|s| {
+            let hs: Vec<_> = c.iter().map(|(n, u)| s.spawn(move || answers(u).then(|| (n.clone(), u.clone())))).collect();
+            hs.into_iter().filter_map(|h| h.join().ok().flatten()).collect()
+        })
+    }
+
     fn keys_stored(&self) -> bool {
         self.cfg.gw.dir.join(GW_INVOICES).is_file() && self.cfg.gw.dir.join(GW_INFO).is_file()
     }
@@ -629,9 +673,18 @@ impl App {
             <label>Shop name, as buyers see it<input name=\"name\" value=\"{}\" maxlength=\"200\" placeholder=\"My shop\"></label>\
             <label>Where buyers find you<input name=\"public_url\" type=\"url\" inputmode=\"url\" value=\"{}\" required pattern=\"https://.+|http://(127\\.0\\.0\\.1|localhost|\\[::1\\])(:[0-9]+)?\" \
             title=\"The https:// address of your box's secure link, like https://films.example.com\" placeholder=\"https://films.example.com\"></label>\
-            <p class=\"hint\">The public https:// address that leads to this app's selling port ({}). Buyers' apps pay and connect there.</p>{}\
-            <button class=\"secondary\">Save</button></form></section>",
+            <p class=\"hint\">The public https:// address that leads to this app's selling port ({}). Buyers' apps pay and connect there.</p>\
+            <details><summary>I don't have an https address yet</summary><p>Buyers on the internet need a secure address that leads to this \
+            app's selling port. Pick one of these, then paste the address above:</p><ol>\
+            <li><strong>Cloudflare Tunnel</strong> (an app in the Umbrel App Store, and a free Cloudflare account with your own domain): make a public \
+            hostname, like <code>films.example.com</code>, that points at <code>{}</code>.</li>\
+            <li><strong>Another tunnel app</strong> that offers a public https address for a service on this box (several VPN and \
+            remote-access apps do): point it at <code>{}</code>.</li>\
+            <li><strong>Your own domain and proxy</strong> (for example the Nginx Proxy Manager app): a proxy host with a certificate, forwarding \
+            to <code>{}</code>.</li></ol><p class=\"hint\">The app never makes a public address by itself: what is on the internet stays your choice.</p></details>{}\
+            <button class=\"secondary\">Save</button></form>{}</section>",
             if keys { "" } else { "2. " }, esc(&pv("name", &shop.name)), esc(&pv("public_url", &shop.public_url)), gw.port,
+            esc(&self.selling_port()), esc(&self.selling_port()), esc(&self.selling_port()),
             if main {
                 let mut n = String::from("<div class=\"flash warn\"><p><strong>This is real money.</strong> Start with low prices and the low \
                     limits under Advanced.</p><details><summary>Read the limits</summary><ul>");
@@ -641,6 +694,12 @@ impl App {
                 n.push_str("</ul></details></div>");
                 format!("{n}<label class=\"check\"><input type=\"checkbox\" name=\"mainnet_ok\" value=\"1\"{}> I understand, and I am ready to take real payments</label>",
                         if shop.mainnet_ok { " checked" } else { "" })
+            } else {
+                String::new()
+            },
+            if shop.public_url.starts_with("https://") {
+                format!("<form method=\"post\" action=\"./sell\" class=\"row\">{csrf}<input type=\"hidden\" name=\"action\" value=\"check_public\">\
+                         <button class=\"secondary\">Check that buyers can reach {}</button></form>", esc(shop.public_url.trim_start_matches("https://")))
             } else {
                 String::new()
             }));
@@ -683,8 +742,7 @@ impl App {
             <input type=\"hidden\" name=\"action\" value=\"service\"><input type=\"hidden\" name=\"id\" value=\"{}\">\
             <fieldset class=\"choices\"><legend>What is it?</legend>{kinds}</fieldset>\
             <label>Its address on this box<input name=\"address\" value=\"{}\" required pattern=\"http://[^ ?#@]+\" inputmode=\"url\" class=\"mono\" \
-            title=\"The http:// address other apps on this box use, like {}\" placeholder=\"{}\"></label>\
-            <p class=\"hint\">On Umbrel and StartOS this is the app's own address on the box, such as <code>http://jellyfin:8096</code>.</p>\
+            list=\"found-services\" title=\"The http:// address other apps on this box use, like {}\" placeholder=\"{}\"></label>{}\
             <div class=\"price-row\"><label>Price in sats<input name=\"price\" value=\"{}\" required inputmode=\"decimal\" pattern=\"[0-9][0-9,]*(\\.[0-9]{{1,3}})?|\\.[0-9]{{1,3}}\" \
             title=\"A number of sats, like 20 or 0.5\"></label><label>for each<select name=\"unit\">{units}</select></label></div>\
             <label>Also charge for the question (tokens in) <small>(optional: sats per 1,000 tokens; empty is free)</small>\
@@ -699,7 +757,7 @@ impl App {
             <div class=\"row\"><button{}>{}</button>{}</div></form></section>",
             if editing.is_some() { "Change this service" } else { "Add a service" },
             esc(editing.map(|o| o.id.as_str()).unwrap_or("")),
-            esc(&fv("address", editing.map(|o| o.address.clone()).unwrap_or_default())), kind.example(), kind.example(),
+            esc(&fv("address", editing.map(|o| o.address.clone()).unwrap_or_default())), kind.example(), kind.example(), found_html(&self.found_services()),
             esc(&fv("price", editing.map(|o| msat_to_sats(o.price_msat)).unwrap_or_else(|| sug_price.to_string()))),
             esc(&fv("input_price", editing.filter(|o| o.input_msat > 0).map(|o| msat_to_sats(o.input_msat)).unwrap_or_default())),
             esc(&fv("name", editing.map(|o| o.name.clone()).unwrap_or_default())), kind.words(),
@@ -778,6 +836,7 @@ impl App {
                     self.commit(&shop, "Saved.")
                 }
             }
+            "check_public" => self.check_public(&shop),
             "service" => (|| {
                 let kind = Kind::parse(&g("kind")).ok_or("Pick what it is: a media server, an AI model, or another web service.")?;
                 let address = check_address(&g("address"), kind)?;
@@ -863,6 +922,46 @@ impl App {
             }
         }
     }
+}
+
+/// The usual addresses of media servers and AI models on Umbrel (`<app id>_<service>_1`) and
+/// StartOS (`<package>.startos`, `<package>.embassy`). An address that does not resolve is not offered.
+const KNOWN_SERVICES: &[(&str, &str)] = &[
+    ("Jellyfin", "http://jellyfin_server_1:8096"),
+    ("Jellyfin", "http://jellyfin_jellyfin_1:8096"),
+    ("Jellyfin", "http://jellyfin.startos:8096"),
+    ("Jellyfin", "http://jellyfin.embassy:8096"),
+    ("Plex", "http://plex_server_1:32400"),
+    ("Navidrome", "http://navidrome_server_1:4533"),
+    ("Audiobookshelf", "http://audiobookshelf_web_1:80"),
+    ("Ollama", "http://ollama_ollama_1:11434"),
+    ("Ollama", "http://ollama.startos:11434"),
+    ("Open WebUI", "http://open-webui_web_1:8080"),
+    ("LlamaGPT", "http://llama-gpt_llama-gpt-api_1:8000"),
+];
+
+/// Whether something listens at `url`'s host and port (a TCP connect, at most 600 ms).
+fn answers(url: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    let hostport = url.trim_start_matches("http://").split('/').next().unwrap_or("");
+    let Ok(addrs) = hostport.to_socket_addrs() else { return false };
+    addrs.take(2).any(|a| std::net::TcpStream::connect_timeout(&a, std::time::Duration::from_millis(600)).is_ok())
+}
+
+/// The services found on this box, as suggestions for the address field and one-click fills.
+fn found_html(found: &[(String, String)]) -> String {
+    if found.is_empty() {
+        return "<p class=\"hint\">On Umbrel and StartOS this is the app's own address on the box, such as <code>http://jellyfin_server_1:8096</code>.</p>".into();
+    }
+    let mut b = String::from("<datalist id=\"found-services\">");
+    for (n, u) in found {
+        b.push_str(&format!("<option value=\"{}\">{}</option>", esc(u), esc(n)));
+    }
+    b.push_str("</datalist><p class=\"hint\">Found on this box: ");
+    b.push_str(&found.iter().map(|(n, u)| format!("<button type=\"button\" class=\"link\" data-fill=\"address\" data-value=\"{}\">{} <code>{}</code></button>",
+                                                    esc(u), esc(n), esc(u))).collect::<Vec<_>>().join(" · "));
+    b.push_str("</p>");
+    b
 }
 
 #[cfg(test)]

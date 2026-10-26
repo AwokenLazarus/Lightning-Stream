@@ -213,3 +213,57 @@ impl Auth {
         self.with_session(sid, |s| ct_eq(s.csrf.as_bytes(), token.as_bytes())).unwrap_or(false)
     }
 }
+
+/// A login the platform already did: on Umbrel the app's page is reached only through the box's own
+/// login proxy, which lets in only a user logged in to the box. A request whose peer is that proxy is
+/// the owner's; any other peer (another app on the box's network) still needs the app password.
+/// The proxy is named, not numbered: its address is looked up (again after 30 s, or at once for a
+/// peer that is not on the list, at most once a second), as a container gets a new one on restart.
+pub struct PlatformLogin {
+    host: String,
+    seen: Mutex<(Option<Instant>, Vec<std::net::IpAddr>)>,
+}
+
+impl PlatformLogin {
+    pub fn new(host: &str) -> Self {
+        Self { host: host.to_string(), seen: Mutex::new((None, vec![])) }
+    }
+
+    fn lookup(&self) -> Vec<std::net::IpAddr> {
+        use std::net::ToSocketAddrs;
+        (self.host.as_str(), 0).to_socket_addrs().map(|a| a.map(|s| s.ip()).collect()).unwrap_or_default()
+    }
+
+    /// Whether `peer` (an IP address as text) is the platform's login proxy.
+    pub fn is_proxy(&self, peer: &str) -> bool {
+        let Ok(ip) = peer.parse::<std::net::IpAddr>() else { return false };
+        // an IPv4 peer on a dual-stack socket arrives as ::ffff:a.b.c.d
+        let ip = match ip {
+            std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(ip),
+            v4 => v4,
+        };
+        let mut g = self.seen.lock().unwrap_or_else(|p| p.into_inner());
+        let stale = g.0.is_none_or(|t| t.elapsed() > Duration::from_secs(30));
+        let may_ask = g.0.is_none_or(|t| t.elapsed() > Duration::from_secs(1));
+        if stale || (!g.1.contains(&ip) && may_ask) {
+            *g = (Some(Instant::now()), self.lookup());
+        }
+        g.1.contains(&ip)
+    }
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+
+    #[test]
+    fn only_the_named_proxy_is_let_in_without_a_password() {
+        let p = PlatformLogin::new("localhost");
+        assert!(p.is_proxy("127.0.0.1") || p.is_proxy("::1"));
+        assert!(p.is_proxy("::ffff:127.0.0.1") || p.is_proxy("::1"));
+        assert!(!p.is_proxy("10.21.21.9"));
+        assert!(!p.is_proxy("not an address"));
+        let none = PlatformLogin::new("no-such-host.invalid");
+        assert!(!none.is_proxy("127.0.0.1"));
+    }
+}

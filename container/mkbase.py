@@ -13,6 +13,8 @@ Deterministic (mtime 0, sorted, numeric owners) so the layer digest is the same 
   /data/run/ln      0750 xbt-wallet-ui:xbt-ln-rail, the wallet's rail macaroon the UI's Lightning page writes;
                     the group (10008, a group only) has the signer and the UI in it, never the MCP
   /data/run/gateway 0750 xbt-wallet-ui:xbt-gateway, the gateway's config and macaroons the UI's gateway page writes
+  /data/run/enroll  0750 xbt-signer:xbt-enroll, the signer's enrolment code for the UI's setup page; the group
+                    (10009, a group only) has the signer and the UI in it, never the MCP
 Uid 10004 is not used: it was the retired hub's, and the other uids keep their numbers.
     python3 container/mkbase.py OUT.tar
 """
@@ -27,7 +29,7 @@ HOME = {"xbt-signer": "/data/signer", "xbt-anchor-witness": "/data/witness", "xb
 MEMBERS = {"xbt-signer": "xbt-wallet-mcp,xbt-wallet-ui", "xbt-anchor-witness": "xbt-signer", "xbt-wallet-ui": "xbt-wallet-mcp",
            "xbt-gateway": "xbt-wallet-ui"}
 # groups with no user of their own
-GROUPS = [("xbt-ln-rail", 10008, "xbt-signer,xbt-wallet-ui")]
+GROUPS = [("xbt-ln-rail", 10008, "xbt-signer,xbt-wallet-ui"), ("xbt-enroll", 10009, "xbt-signer,xbt-wallet-ui")]
 
 passwd = "root:x:0:0:root:/:/nonexistent\n" + "".join(f"{n}:x:{u}:{u}:{n}:{HOME[n]}:/nonexistent\n" for n, u in USERS)
 group = ("root:x:0:\n" + "".join(f"{n}:x:{u}:{MEMBERS.get(n, '')}\n" for n, u in USERS)
@@ -37,7 +39,7 @@ DIRS = [("etc", 0, 0, 0o755), ("tmp", 0, 0, 0o1777), ("usr", 0, 0, 0o755), ("usr
         ("data/signer", 10001, 10001, 0o700), ("data/witness", 10002, 10002, 0o700), ("data/mcp", 10003, 10003, 0o700),
         ("data/ui", 10005, 10005, 0o700), ("data/relay", 10006, 10006, 0o700), ("data/gateway", 10007, 10007, 0o700), ("data/run", 0, 0, 0o755), ("data/run/signer", 10001, 10001, 0o750),
         ("data/run/anchor", 10002, 10002, 0o750), ("data/run/ui", 10005, 10005, 0o750),
-        ("data/run/ln", 10005, 10008, 0o750), ("data/run/gateway", 10005, 10007, 0o750)]
+        ("data/run/ln", 10005, 10008, 0o750), ("data/run/gateway", 10005, 10007, 0o750), ("data/run/enroll", 10001, 10009, 0o750)]
 FILES = [("etc/passwd", passwd, 0o644), ("etc/group", group, 0o644)]
 
 entries = []
