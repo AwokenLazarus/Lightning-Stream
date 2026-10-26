@@ -85,7 +85,8 @@ impl Kind {
     pub fn suggested(self) -> (&'static str, Unit) {
         match self {
             Kind::Media => ("20", Unit::Mib),
-            Kind::Ai => ("10", Unit::Request),
+            // a few sats for a reply of a few hundred tokens
+            Kind::Ai => ("10", Unit::Tokens),
             Kind::Web | Kind::Other => ("1", Unit::Request),
         }
     }
@@ -103,6 +104,8 @@ pub enum Unit {
     Mib,
     Request,
     Second,
+    /// 1,000 tokens an AI model writes (an OpenAI-compatible service).
+    Tokens,
 }
 
 impl Unit {
@@ -111,6 +114,7 @@ impl Unit {
             "mib" => Some(Unit::Mib),
             "request" => Some(Unit::Request),
             "second" => Some(Unit::Second),
+            "tokens" => Some(Unit::Tokens),
             _ => None,
         }
     }
@@ -119,6 +123,7 @@ impl Unit {
             Unit::Mib => "mib",
             Unit::Request => "request",
             Unit::Second => "second",
+            Unit::Tokens => "tokens",
         }
     }
     fn words(self) -> &'static str {
@@ -126,6 +131,7 @@ impl Unit {
             Unit::Mib => "a MiB of data sent",
             Unit::Request => "a request",
             Unit::Second => "a second",
+            Unit::Tokens => "1,000 tokens the model writes",
         }
     }
     fn short(self) -> &'static str {
@@ -133,6 +139,7 @@ impl Unit {
             Unit::Mib => "a MiB",
             Unit::Request => "a request",
             Unit::Second => "a second",
+            Unit::Tokens => "per 1,000 tokens",
         }
     }
 }
@@ -148,6 +155,8 @@ pub struct Offer {
     /// The price in millisats a unit.
     pub price_msat: u64,
     pub unit: Unit,
+    /// Priced by the token: millisats per 1,000 tokens of the question (input); 0, the default: free.
+    pub input_msat: u64,
     pub paused: bool,
     /// The gateway routes it is sold under (Advanced). The first is the listing's.
     pub paths: Vec<String>,
@@ -155,6 +164,16 @@ pub struct Offer {
     pub strip: bool,
     /// What buyers can pick, as `(title, link)`.
     pub titles: Vec<(String, String)>,
+}
+
+impl Offer {
+    /// Its price as a buyer reads it: "20 sat a MiB", "10 sat per 1,000 tokens".
+    fn price_words(&self) -> String {
+        match self.unit {
+            Unit::Tokens => xbt402::tokens::price_text(self.input_msat, self.price_msat),
+            u => format!("{} sat {}", msat_to_sats(self.price_msat), u.short()),
+        }
+    }
 }
 
 /// The shop and its offers: `sell.json`.
@@ -221,7 +240,7 @@ fn check_address(a: &str, kind: Kind) -> Result<String, String> {
 }
 
 fn offer_json(o: &Offer) -> Value {
-    json!({"id": o.id, "name": o.name, "kind": o.kind.id(), "address": o.address, "price_msat": o.price_msat, "unit": o.unit.id(),
+    json!({"id": o.id, "name": o.name, "kind": o.kind.id(), "address": o.address, "price_msat": o.price_msat, "unit": o.unit.id(), "input_msat": o.input_msat,
            "paused": o.paused, "paths": o.paths, "strip": o.strip,
            "titles": o.titles.iter().map(|(t, u)| json!({"title": t, "url": u})).collect::<Vec<_>>()})
 }
@@ -235,6 +254,7 @@ fn offer_of(v: &Value) -> Option<Offer> {
         address: s("address"),
         price_msat: v.get("price_msat").and_then(Value::as_u64)?,
         unit: Unit::parse(&s("unit"))?,
+        input_msat: v.get("input_msat").and_then(Value::as_u64).unwrap_or(0),
         paused: v.get("paused").and_then(Value::as_bool).unwrap_or(false),
         paths: v.get("paths").and_then(Value::as_array).map(|a| a.iter().filter_map(|p| p.as_str().map(str::to_string)).collect()).unwrap_or_default(),
         strip: v.get("strip").and_then(Value::as_bool).unwrap_or(false),
@@ -275,7 +295,10 @@ impl Shop {
             let address = r.get("upstream").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| top_up.clone());
             let p = r.get("price").cloned().unwrap_or(json!({}));
             let n = |k: &str| p.get(k).and_then(Value::as_u64).unwrap_or(0);
-            let (unit, msat) = if n("byte_msat") > 0 {
+            let input_msat = n("per_1k_input_msat");
+            let (unit, msat) = if n("per_1k_output_msat") > 0 || input_msat > 0 {
+                (Unit::Tokens, n("per_1k_output_msat"))
+            } else if n("byte_msat") > 0 {
                 // to the msat a MiB
                 (Unit::Mib, n("byte_msat").saturating_mul(MIB) / n("per_bytes").max(1))
             } else if n("second_msat") > 0 {
@@ -284,7 +307,7 @@ impl Shop {
                 (Unit::Request, n("request_msat"))
             };
             let strip = r.get("strip_prefix").and_then(Value::as_bool).unwrap_or(false);
-            if let Some(o) = offers.iter_mut().find(|o| o.address == address && o.unit == unit && o.price_msat == msat && o.strip == strip) {
+            if let Some(o) = offers.iter_mut().find(|o| o.address == address && o.unit == unit && o.price_msat == msat && o.input_msat == input_msat && o.strip == strip) {
                 o.paths.push(path);
                 continue;
             }
@@ -298,7 +321,7 @@ impl Shop {
                 Some((i.get("title")?.as_str()?.to_string(), i.get("url")?.as_str()?.to_string()))
             }).collect()).unwrap_or_default();
             offers.push(Offer { id: format!("s{}", offers.len() + 1), name: if name.is_empty() { kind.words().into() } else { name }, kind, address,
-                                price_msat: msat, unit, paused: false, paths: vec![path], strip, titles });
+                                price_msat: msat, unit, input_msat, paused: false, paths: vec![path], strip, titles });
         }
         let caps = c.get("caps").and_then(|k| Some((k.get("max_sessions")?.as_u64()?, k.get("sessions_per_address")?.as_u64()?,
                                                     k.get("max_held_tickets")?.as_u64()?)));
@@ -442,8 +465,10 @@ impl App {
                 Unit::Mib => json!({"byte_msat": o.price_msat, "per_bytes": MIB}),
                 Unit::Request => json!({"request_msat": o.price_msat}),
                 Unit::Second => json!({"second_msat": o.price_msat}),
+                Unit::Tokens if o.input_msat > 0 => json!({"per_1k_output_msat": o.price_msat, "per_1k_input_msat": o.input_msat}),
+                Unit::Tokens => json!({"per_1k_output_msat": o.price_msat}),
             };
-            let free = o.price_msat == 0;
+            let free = o.price_msat == 0 && o.input_msat == 0;
             for p in &o.paths {
                 // what the page does not show of a route (methods, headers, body size) is kept
                 let mut r = old_routes.iter().find(|r| r.get("path").and_then(Value::as_str) == Some(p.as_str())).cloned()
@@ -630,8 +655,8 @@ impl App {
             let btn = |action: &str, label: &str, class: &str| format!("<form method=\"post\" action=\"./sell\">{csrf}<input type=\"hidden\" name=\"action\" value=\"{action}\">\
                 <input type=\"hidden\" name=\"id\" value=\"{}\"><button{class}>{label}</button></form>", esc(&o.id));
             b.push_str(&format!("<section class=\"card offer\"><div class=\"offer-head\"><h3>{}</h3><span class=\"pill {}\">{}</span></div>\
-                <p>{} &middot; <strong>{} sat {}</strong>{}</p>{}<div class=\"row\"><a class=\"button-link\" href=\"./sell?edit={}#service-form\">Edit</a>{}{}</div></section>",
-                esc(&o.name), s.class, esc(&s.headline), o.kind.words(), msat_to_sats(o.price_msat), o.unit.short(),
+                <p>{} &middot; <strong>{}</strong>{}</p>{}<div class=\"row\"><a class=\"button-link\" href=\"./sell?edit={}#service-form\">Edit</a>{}{}</div></section>",
+                esc(&o.name), s.class, esc(&s.headline), o.kind.words(), o.price_words(),
                 if o.titles.is_empty() { String::new() } else { format!(" &middot; {} to choose from", o.titles.len()) },
                 if s.next.is_empty() { String::new() } else { format!("<p class=\"hint {}\">{}</p>", s.class, esc(&s.next)) },
                 crate::services::urlenc(&o.id),
@@ -651,7 +676,7 @@ impl App {
             format!("<label class=\"choice\"><input type=\"radio\" name=\"kind\" value=\"{}\"{}><span><strong>{}</strong><small>suggested {} sat {}</small></span></label>",
                     k.id(), if *k == kind { " checked" } else { "" }, k.words(), p, u.short())
         }).collect();
-        let units: String = [Unit::Mib, Unit::Request, Unit::Second].iter()
+        let units: String = [Unit::Mib, Unit::Request, Unit::Second, Unit::Tokens].iter()
             .map(|u| format!("<option value=\"{}\"{}>{}</option>", u.id(), if *u == unit { " selected" } else { "" }, u.words())).collect();
         let titles = editing.map(|o| o.titles.iter().map(|(t, u)| format!("{t} | {u}")).collect::<Vec<_>>().join("\n")).unwrap_or_default();
         b.push_str(&format!("<section class=\"card primary\" id=\"service-form\"><h2>{}</h2><form method=\"post\" action=\"./sell\">{csrf}\
@@ -662,6 +687,9 @@ impl App {
             <p class=\"hint\">On Umbrel and StartOS this is the app's own address on the box, such as <code>http://jellyfin:8096</code>.</p>\
             <div class=\"price-row\"><label>Price in sats<input name=\"price\" value=\"{}\" required inputmode=\"decimal\" pattern=\"[0-9][0-9,]*(\\.[0-9]{{1,3}})?|\\.[0-9]{{1,3}}\" \
             title=\"A number of sats, like 20 or 0.5\"></label><label>for each<select name=\"unit\">{units}</select></label></div>\
+            <label>Also charge for the question (tokens in) <small>(optional: sats per 1,000 tokens; empty is free)</small>\
+            <input name=\"input_price\" value=\"{}\" inputmode=\"decimal\" pattern=\"[0-9][0-9,]*(\\.[0-9]{{1,3}})?|\\.[0-9]{{1,3}}\" title=\"A number of sats, like 2 or 0.5\"></label>\
+            <p class=\"hint\">Only for an AI model priced per 1,000 tokens. Usually left empty: buyers then pay for what the model writes.</p>\
             <label>Name, as buyers see it <small>(optional)</small><input name=\"name\" value=\"{}\" maxlength=\"120\" placeholder=\"{}\"></label>\
             <details><summary>Advanced</summary>\
             <label>Items to list for buyers (films, files, models…), one per line: <code>name | link</code><textarea name=\"titles\" rows=\"4\" class=\"mono\">{}</textarea></label>\
@@ -673,6 +701,7 @@ impl App {
             esc(editing.map(|o| o.id.as_str()).unwrap_or("")),
             esc(&fv("address", editing.map(|o| o.address.clone()).unwrap_or_default())), kind.example(), kind.example(),
             esc(&fv("price", editing.map(|o| msat_to_sats(o.price_msat)).unwrap_or_else(|| sug_price.to_string()))),
+            esc(&fv("input_price", editing.filter(|o| o.input_msat > 0).map(|o| msat_to_sats(o.input_msat)).unwrap_or_default())),
             esc(&fv("name", editing.map(|o| o.name.clone()).unwrap_or_default())), kind.words(),
             esc(&fv("titles", titles)),
             esc(&fv("paths", editing.map(|o| o.paths.join(", ")).unwrap_or_default())),
@@ -754,6 +783,10 @@ impl App {
                 let address = check_address(&g("address"), kind)?;
                 let price_msat = sats_to_msat(&g("price"))?;
                 let unit = Unit::parse(&g("unit")).ok_or("Pick what the price is for.")?;
+                let input_msat = if g("input_price").trim().is_empty() { 0 } else { sats_to_msat(&g("input_price"))? };
+                if input_msat > 0 && unit != Unit::Tokens {
+                    return Err("A price for the question is for a price per 1,000 tokens: pick that, or leave the question free.".into());
+                }
                 let name = { let n: String = g("name").chars().take(120).collect(); if n.is_empty() { kind.words().to_string() } else { n } };
                 let mut titles = vec![];
                 for (i, line) in g("titles").lines().map(str::trim).filter(|l| !l.is_empty()).enumerate() {
@@ -784,7 +817,7 @@ impl App {
                         _ => vec![shop.free_path(&name, &new_id)],
                     };
                 }
-                let offer = Offer { id: new_id.clone(), name, kind, address, price_msat, unit, paused: false, paths, strip: g("strip") == "1", titles };
+                let offer = Offer { id: new_id.clone(), name, kind, address, price_msat, unit, input_msat, paused: false, paths, strip: g("strip") == "1", titles };
                 match shop.offers.iter_mut().find(|o| o.id == new_id) {
                     Some(o) => {
                         let paused = o.paused;
@@ -881,10 +914,22 @@ mod tests {
     }
 
     #[test]
+    fn a_model_priced_by_the_token_reads_and_writes_plainly() {
+        let c = json!({"routes": [{"path": "/ai/", "upstream": "http://ollama:11434", "price": {"per_1k_output_msat": 10000}},
+                                  {"path": "/big/", "upstream": "http://big:1", "price": {"per_1k_output_msat": 30000, "per_1k_input_msat": 5000}}]});
+        let s = Shop::import(&c);
+        assert_eq!((s.offers[0].unit, s.offers[0].price_msat, s.offers[0].input_msat), (Unit::Tokens, 10_000, 0));
+        assert_eq!(s.offers[0].price_words(), "10 sat per 1,000 tokens");
+        assert_eq!((s.offers[1].input_msat, s.offers[1].price_words().as_str()), (5000, "5 sat per 1,000 tokens in, 30 sat per 1,000 tokens out"));
+        assert_eq!(Shop::from_json(&s.to_json()), s);
+        assert_eq!(Kind::Ai.suggested(), ("10", Unit::Tokens));
+    }
+
+    #[test]
     fn new_offers_get_a_path_of_their_own() {
         let mut s = Shop::default();
         assert_eq!(s.free_path("Films", "a"), "/");
-        s.offers.push(Offer { id: "a".into(), name: "Films".into(), kind: Kind::Media, address: "http://j:1".into(), price_msat: 1, unit: Unit::Mib,
+        s.offers.push(Offer { id: "a".into(), name: "Films".into(), kind: Kind::Media, address: "http://j:1".into(), price_msat: 1, unit: Unit::Mib, input_msat: 0,
                               paused: false, paths: vec!["/".into()], strip: false, titles: vec![] });
         assert_eq!(s.free_path("My AI model!", "b"), "/my-ai-model/");
         assert_eq!(s.free_path("Films", "a"), "/", "an offer keeps the root when it is the only one");
