@@ -28,7 +28,7 @@ JSON. `version` is `listing/0`. The fields are closed: an unknown key is not thi
 | Field | What it is |
 | --- | --- |
 | `name` | The seller's name, as it writes it. |
-| `kind` | `video`, `files` or `api`. |
+| `kind` | `video`, `files`, `api` or `ai` (a model asked over HTTP, such as a local language model). |
 | `seller` | The seller's public origin, `http` or `https`, with no path. |
 | `receipt_key` | The receipt key, hex of the 33-byte compressed public key. |
 | `prices` | What a request costs, in millisatoshi, as decimal strings: `request_msat`, `byte_msat`, `per_bytes`, `second_msat`. At least one. `per_bytes` is at least 1. |
@@ -62,7 +62,10 @@ listing is then `listing/1`. The fields are closed here too:
 | `name` | The seller's name. |
 | `seller`, `receipt_key`, `updated`, `sig` | As in `listing/0`. |
 | `licence`, `credits` | Optional: what holds for every service that does not say its own. |
-| `services` | One to 32 entries, each `name`, `kind` (`video`, `files` or `api`), `path`, `prices` and `items`, with an optional `licence` and `credits`. `path` is the gateway route the service is sold under; no two entries share one. |
+| `services` | One to 32 entries, each `name`, `kind` (`video`, `files`, `api` or `ai`), `path`, `prices` and `items`, with an optional `licence` and `credits`. `path` is the gateway route the service is sold under; no two entries share one. |
+
+The kind `ai` came after the first apps that read `listing/1`: such an app refuses a listing with an
+`ai` service. A seller who must reach one lists its model as `api`; newer apps show both.
 
 The digest is built as for `listing/0`, under its own tag, `xbt402/listing/1`, so a document of one
 version cannot be passed off as the other.
@@ -77,7 +80,7 @@ is how the page that writes the config keeps the two from disagreeing:
   "updated": "2026-10-26",
   "services": [
     {"name": "Films", "kind": "video", "path": "/", "items": [{"title": "Sintel", "url": "https://seller.example/Videos/s"}]},
-    {"name": "Local model", "kind": "api", "path": "/ai/", "items": []}
+    {"name": "Local model", "kind": "ai", "path": "/ai/", "items": []}
   ]
 }
 ```
