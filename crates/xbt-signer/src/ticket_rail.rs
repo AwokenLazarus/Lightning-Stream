@@ -24,6 +24,7 @@
 //! | At most 8 ticket payments are with the router at once. | [`Pace`]: every send of a ticket, held or prepaid, enters it. |
 //! | A prepaid ticket is spent when it is paid, and bought one at a time. | [`Signer::ticket_prepay`]: every rule of a release, the book row (`released`) and then the ledger row, both before the payment is sent; none while an earlier one of the session is not final. |
 //! | A win of the lottery is paid only for a draw the wallet worked out, once, as a prepaid ticket is paid. | [`Signer::lottery_pay_win`] takes a [`xbt402::lottery::Win`], which only the wallet's own check of a seller's reveal makes; [`Signer::ticket_book_prepay`] pays it only in the session it was drawn in, at that session's win size, and refuses a win that has a payment in the book that has not failed ([`crate::ticket::Book::win_payment`]). |
+//! | A prepaid ticket or a win paid by the seller's BOLT 12 offer is paid under every rule of one paid by invoice, and names the seller's session. | [`Signer::ticket_pay_by_offer`]: the offer and the fetched invoice are read and checked here (bit 512, the chain, the issuer, the exact amount, the wallet's own payer note repeated); every channel of the node must pass the guards, since `PayOffer` takes no set of outgoing channels; then the same book rows, ledger row and gate as [`Signer::ticket_pay_ordinary`]. Anything that fails before the booking leaves nothing booked and nothing sent, and the seller's invoice is paid instead. |
 //! | An ordinary payment is on the channel until it settles, so it stays inside the gate until then. | [`Signer::ticket_pay_ordinary`] holds its place in [`Pace`] until the node shows the payment over. |
 //! | A win a seller's answer stands still for is not kept waiting behind wins no seller waits for. | [`Pace::hurry`], said by the session that found the win ([`crate::ticket_pay`]). It changes the order of payments the book allows anyway, and nothing else: which are paid, and how many at once, are as before. |
 //!
@@ -41,7 +42,7 @@ use crate::applog::AppendLog;
 use crate::bolt11::{self, Invoice};
 use crate::keystore::{random_bytes, write_private};
 use crate::ln::{check_invoice, cltv_until, cross_check, htlc_locks, htlcs_in_flight, i64_of, node_said, paid_msat, preimage_bytes, preimage_proves, u64_of, HeldSend,
-                LnBackend, LnPolicy};
+                LnBackend, LnPolicy, OfferPayRequest};
 use crate::node;
 use crate::policy::{normalize_dest, Payment, PolicyConfig, DAY_S, WEEK_S};
 use crate::pyjson::{dumps_indent, py_int, str_or_empty, ts_value};
@@ -51,6 +52,20 @@ use crate::ticket::{self, booking_sats, check_prepaid_invoice, check_ticket_invo
                     Settle, TState, TaskPolicy, Terms, Ticket, TicketPolicy, HOLD_SHORT, KEEP_DONE_S, MAX_BATCH, OFFER_TTL_S, ROUTE_FULL, SESSION_IDLE_S,
                     TAG_RECORD};
 use crate::{err, Result};
+
+/// The longest the wallet waits for the seller's invoice for its offer, in seconds, before it
+/// pays the ticket or win by the seller's BOLT 11 invoice instead: a win's invoice lives 30 s by
+/// default (the gateway's `lottery.invoice_secs`), and a busy issuer can leave a request
+/// unanswered (in the lab, Lightning Fork's rate limit on invoice requests).
+const OFFER_FETCH_S: i64 = 5;
+
+/// A seller's BOLT 12 offer and the seller's session a payment by it is for: what the payer note
+/// is made of ([`xbt402::offer::note`]). The key is the session key the seller sent.
+pub struct OfferWay<'a> {
+    pub offer: &'a str,
+    pub key: &'a [u8; 32],
+    pub seller_session: &'a str,
+}
 
 pub const BOOK_FILE: &str = "tickets.jsonl";
 pub const SEED_FILE: &str = "ticket_seed.json";
@@ -1413,8 +1428,116 @@ impl Signer {
     /// failed, a second invoice for the same win is refused. Not a socket method.
     /// `first`: the seller stands still for this win already, and it goes through the gate before
     /// the wins no seller waits for ([`Pace`]).
-    pub(crate) fn lottery_pay_win(&self, sid: &str, win: &xbt402::lottery::Win, invoice: &str, first: bool) -> Value {
+    /// `by`: the seller's offer, where its terms name one; the win is paid by it first, and by
+    /// `invoice` where the offer cannot be fetched ([`Signer::ticket_pay_by_offer`]).
+    pub(crate) fn lottery_pay_win(&self, sid: &str, win: &xbt402::lottery::Win, invoice: &str, first: bool, by: Option<&OfferWay<'_>>) -> Value {
+        if let Some(v) = by.and_then(|b| self.ticket_pay_by_offer(sid, b, Some(win), first)) {
+            return v;
+        }
         self.ticket_pay_ordinary(sid, invoice.trim(), "", Some(win), first)
+    }
+
+    /// Pay a prepaid ticket (`win` None) or a win by the seller's BOLT 12 offer
+    /// (`docs/TICKETS.md` section 15), with the payer note that binds the payment to the seller's
+    /// session. Every rule of a payment by invoice holds: the session and its task, the wallet's
+    /// two nodes, the book's rules, budgets, caps and fee limit, the row in the book and the
+    /// ledger before the payment is sent, the gate. And those of the Lightning rail's payment of
+    /// an offer: the offer and the invoice read and checked here, not by the node; every channel
+    /// of the node passes the guards and the funding proof (`PayOffer` takes no set of outgoing
+    /// channels); the issuer is the seller's node where the offer names one; the invoice is for
+    /// exactly the amount, carries bit 512 and repeats this wallet's note.
+    ///
+    /// `None`: nothing was booked and nothing sent, and the caller pays by the seller's invoice:
+    /// the owner turned offers off (`tickets.offers`), the offer or its invoice failed a check,
+    /// or the invoice could not be fetched. `Some`: the outcome, as [`Signer::ticket_pay_ordinary`]
+    /// gives it, with `by_offer`; a refusal by the book's rules is final, since the invoice would
+    /// meet the same rules.
+    pub(crate) fn ticket_pay_by_offer(&self, sid: &str, by: &OfferWay<'_>, win: Option<&xbt402::lottery::Win>, first: bool) -> Option<Value> {
+        if self.ticket_shut().is_some() {
+            return None;
+        }
+        let (ln, lp, session, tp) = {
+            let _g = self.lock();
+            let tp = self.ticket_synced().ok()?;
+            let (ln, lp) = self.ln_ready().ok()?;
+            let session = self.ticket_store().ok()?.as_ref().and_then(|st| st.book.sessions.get(sid).cloned()).filter(|s| s.state == SState::Open)?;
+            tp.tasks.contains_key(&session.task).then_some(())?;
+            (ln, lp, session, tp)
+        };
+        if !tp.offers || session.prepaid_msat == 0 {
+            return None;
+        }
+        let dest = format!("ln:{}", session.payee);
+        let now = self.engine.now();
+        let passed = |rule: &str, why: String| {
+            self.ticket_audit("ticket_offer_passed", json!({"session": sid, "dest": dest, "rule": rule, "reason": why, "win": win.map(xbt402::lottery::Win::draw),
+                                                            "then": "the seller's invoice"}));
+            None
+        };
+        let o = match crate::bolt12::decode_offer(by.offer) {
+            Ok(o) => o,
+            Err(e) => return passed("ln_offer", format!("the seller's offer is not a valid BOLT 12 offer: {e}")),
+        };
+        let Some(genesis) = self.ln_genesis() else { return passed("ln_chain", "our own node did not give its block 0 hash".into()) };
+        if let Err((rule, why)) = crate::bolt12::check_offer(&o, &genesis, now) {
+            return passed(&rule, why);
+        }
+        if o.amount.is_some() {
+            return passed("ln_amount", "the seller's offer names an amount: a ticket or a win is invoiced for its own".into());
+        }
+        if o.issuer_id.is_some_and(|k| hex::encode(k) != session.payee) {
+            return passed("ticket_payee", "the seller's offer names another node than the one its terms name".into());
+        }
+        let amount = session.prepaid_msat;
+        let purpose = win.map_or(xbt402::offer::Purpose::Ticket, |w| xbt402::offer::Purpose::Win(w.draw()));
+        let note = xbt402::offer::note(by.key, by.seller_session, purpose, amount, &random_bytes::<16>());
+        // through the gate, as every ordinary payment of the rail, from its checks to its end
+        let inside = self.ticket_pace.enter_for(win.map(|w| (sid, w.draw())), first);
+        if self.ln_node_checks(&*ln, &lp, &dest, "").is_err() {
+            return passed("ln_node", "the wallet's Lightning node failed its checks".into());
+        }
+        // PayOffer takes no set of outgoing channels: every channel of the node must pass
+        let routes = match self.ln_route_checks(&*ln, &lp, &dest, "", true) {
+            Ok(r) => r,
+            Err(d) => return passed(&str_or_empty(d.get("rule")), "a payment by offer may leave on any channel of the node, and not every one passes the guards".into()),
+        };
+        let resp = match ln.fetch_invoice_noted(by.offer, amount, &note, lp.timeout_s.clamp(1, OFFER_FETCH_S)) {
+            Ok(r) => r,
+            Err(e) => return passed("ln_fetch_invoice", format!("no invoice for the seller's offer: {}", e.msg)),
+        };
+        let lni = str_or_empty(resp.get("bolt12")).trim().to_string();
+        let inv = match crate::bolt12::decode_invoice(&lni) {
+            Ok(i) => i,
+            Err(e) => return passed("ln_invoice", format!("the invoice for the seller's offer is not a valid BOLT 12 invoice: {e}")),
+        };
+        // a prepaid ticket or a win settles on arrival, as any payment of an offer by the Lightning
+        // rail: its blinded paths are held to that rail's limit (`ln.max_cltv_blocks`). The node's
+        // own blinded paths ask more than `tickets.max_htlc_blocks`, which is sized for held tickets
+        // (Lightning Fork's: 259 blocks for one hop)
+        let terms = crate::bolt12::InvoiceTerms { amount_msat: amount, genesis: &genesis, now, min_expiry_s: 5, max_cltv_blocks: lp.max_cltv_blocks };
+        if let Err((rule, why)) = crate::bolt12::check_invoice(&o, &inv, &terms) {
+            return passed(&rule, why);
+        }
+        if inv.payer_note.as_deref() != Some(note.as_str()) {
+            return passed("ticket_offer_note", "the invoice does not repeat the wallet's note: the seller could not tell which session it pays".into());
+        }
+        if let Err(why) = crate::ln_offer::cross_check(&o, &inv, &resp) {
+            return passed("ln_decode_mismatch", why);
+        }
+        let hash = inv.payment_hash_hex();
+        let booked = {
+            let _g = self.lock();
+            self.ticket_book_prepay(sid, &hash, &lni, inv.payment_hash, inv.expires_at() as f64, &lp, &routes.ids, win)
+        };
+        let send = match booked {
+            Ok(Ok(s)) => s,
+            Ok(Err(d)) => return Some(with(d, json!({"by_offer": true}))),
+            Err(e) => return Some(refusal("ticket", e.msg)),
+        };
+        // the invoice is paid, never the offer: paying the offer would fetch another invoice
+        let req = OfferPayRequest { invoice: lni, fee_limit_msat: send.fee_limit_msat, timeout_s: send.timeout_s };
+        let out = self.ticket_ordinary_sent(&*ln, &lp, sid, &dest, &hash, win, inside, &|| ln.pay_offer(&req));
+        Some(with(out, json!({"by_offer": true, "offer_id": o.id_hex()})))
     }
 
     /// An ordinary payment of a session, booked before it is sent: a prepaid ticket (`win` None),
@@ -1423,11 +1546,6 @@ impl Signer {
         if let Some(d) = self.ticket_shut() {
             return d;
         }
-        // the names of the two things this pays, for its refusals and its log lines
-        let (failed, pending, unproven, paid_kind, what) = match win {
-            None => ("ticket_prepay_failed", "ticket_prepay_pending", "ticket_prepay_unproven", "ticket_prepaid", "the prepaid ticket"),
-            Some(_) => ("lottery_win_failed", "lottery_win_pending", "lottery_win_unproven", "lottery_win_paid", "the win"),
-        };
         let sid = sid.to_string();
         let invoice = invoice.to_string();
         let (ln, lp, session) = {
@@ -1456,7 +1574,7 @@ impl Signer {
         // no answer from the chain node for 3 of 309 (seen on the lab). And such a payment is pending on the wallet's
         // channel until it has settled, so the gate is also what keeps at most 8 of them there. (Leaving when the
         // send returned, as a held ticket does, let 24 wins be pending on a 30-slot channel, and 47 of 313 failed.)
-        let _inside = self.ticket_pace.enter_for(win.map(|w| (sid.as_str(), w.draw())), first);
+        let inside = self.ticket_pace.enter_for(win.map(|w| (sid.as_str(), w.draw())), first);
         if let Err(d) = self.ln_node_checks(&*ln, &lp, &dest, "") {
             return with(d, json!({"rail": "ticket"}));
         }
@@ -1478,6 +1596,7 @@ impl Signer {
             Err(e) => return refuse("", "ticket_invoice", format!("not a valid BOLT 11 invoice: {e}")),
         };
         let hash = inv.payment_hash_hex();
+        let Ok(raw) = <[u8; 32]>::try_from(inv.payment_hash.as_slice()) else { return refuse(&hash, "ticket_invoice", "the invoice has no 32-byte payment hash".into()) };
         if !named.is_empty() && named != hash {
             return refuse(named, "ticket_hash", "the invoice is for another payment hash than the one it was returned for".into());
         }
@@ -1498,18 +1617,33 @@ impl Signer {
         // every rule of a release, the ledger and the book, under the wallet's spend lock
         let booked = {
             let _g = self.lock();
-            self.ticket_book_prepay(&sid, &hash, &invoice, &inv, &lp, &routes.ids, win)
+            self.ticket_book_prepay(&sid, &hash, &invoice, raw, inv.expires_at() as f64, &lp, &routes.ids, win)
         };
         let send = match booked {
             Ok(Ok(s)) => s,
             Ok(Err(d)) => return d,
             Err(e) => return refusal("ticket", e.msg),
         };
+        self.ticket_ordinary_sent(&*ln, &lp, &sid, &dest, &hash, win, inside, &|| ln.send_held(&send))
+    }
+
+    /// The end of an ordinary payment, booked: `send` hands it to the node, and the node's word
+    /// on it is waited for inside the gate (`inside`, which leaves when this returns), once more
+    /// outside it, and brought into the book. No lock is held while the node routes it.
+    #[allow(clippy::too_many_arguments)]
+    fn ticket_ordinary_sent(&self, ln: &dyn LnBackend, lp: &LnPolicy, sid: &str, dest: &str, hash: &str, win: Option<&xbt402::lottery::Win>, inside: PaceGuard<'_>,
+                            send: &dyn Fn() -> Result<Value>) -> Value {
+        // the names of the two things this pays, for its refusals and its log lines
+        let (failed, pending, unproven, paid_kind, what) = match win {
+            None => ("ticket_prepay_failed", "ticket_prepay_pending", "ticket_prepay_unproven", "ticket_prepaid", "the prepaid ticket"),
+            Some(_) => ("lottery_win_failed", "lottery_win_pending", "lottery_win_unproven", "lottery_win_paid", "the win"),
+        };
+        let hash = hash.to_string();
         // the node routes it; no lock is held. An ordinary payment is over in a moment, and its end is waited for,
         // still inside the gate
         let mut unsent: Option<crate::Error> = None;
         let mut pmt = {
-            let mut pmt = match ln.send_held(&send) {
+            let mut pmt = match send() {
                 Ok(p) => Some(p),
                 Err(e) => {
                     unsent = Some(e);
@@ -1525,7 +1659,7 @@ impl Signer {
             }
             pmt
         };
-        drop(_inside);
+        drop(inside);
         // once more outside the gate, for a payment whose end the node had not shown inside the wait
         if pmt.as_ref().is_none_or(|p| !payment_over(p)) {
             if let Ok(Some(p)) = ln.lookup(&hash) {
@@ -1579,8 +1713,8 @@ impl Signer {
     /// book row, then the ledger row, then the signature log. Returns the send; an `Err` inside is
     /// the refusal.
     #[allow(clippy::too_many_arguments)]
-    fn ticket_book_prepay(&self, sid: &str, hash: &str, invoice: &str, inv: &Invoice, lp: &LnPolicy, ids: &[String], win: Option<&xbt402::lottery::Win>)
-                          -> Result<std::result::Result<HeldSend, Value>> {
+    fn ticket_book_prepay(&self, sid: &str, hash: &str, invoice: &str, raw: [u8; 32], invoice_expires: f64, lp: &LnPolicy, ids: &[String],
+                          win: Option<&xbt402::lottery::Win>) -> Result<std::result::Result<HeldSend, Value>> {
         let tp = match self.ticket_synced() {
             Ok(t) => t,
             Err(d) => return Ok(Err(d)),
@@ -1639,7 +1773,6 @@ impl Signer {
         if tp.max_sends_per_hour > 0 && st.book.sends_since(now - 3600.0) as i64 >= tp.max_sends_per_hour {
             return Ok(Err(refusal("ticket_rate_limit", format!("already {} ticket payments sent to the node in the last hour (tickets.max_sends_per_hour)", tp.max_sends_per_hour))));
         }
-        let Ok(raw) = <[u8; 32]>::try_from(inv.payment_hash.as_slice()) else { return Ok(Err(refusal("ticket_invoice", "the invoice has no 32-byte payment hash"))) };
         let dest = format!("ln:{}", s.payee);
         let fee_limit_msat = (lp.fee_limit_sats(sats_ceil(s.prepaid_msat)).max(0) as u64).saturating_mul(1000);
         let sats = booking_sats(s.prepaid_msat, fee_limit_msat);
@@ -1671,7 +1804,7 @@ impl Signer {
         // only after both, so the book is never ahead of money that has left
         let win_draw = win.map_or(0, xbt402::lottery::Win::draw);
         let t = Ticket { win: win_draw, hash: hash.to_string(), nonce, session: sid.to_string(), payee: s.payee.clone(), task: s.task.clone(), msat: s.prepaid_msat, fee_limit_msat,
-                         state: TState::Released, ts: now, sent_ts: now, invoice_expires: inv.expires_at() as f64, released_ts: now, booked_sats: sats,
+                         state: TState::Released, ts: now, sent_ts: now, invoice_expires, released_ts: now, booked_sats: sats,
                          cltv_until: 0, final_expiry: 0, fee_msat: 0, done_ts: 0.0, note: String::new(), prepaid: true };
         s.active_ts = now;
         st.commit(&[t.row(), s.row()])?;

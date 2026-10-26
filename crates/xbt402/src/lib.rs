@@ -7,6 +7,7 @@
 //! * [`wire`]: the x402 v2 headers, the request digest, URL reading.
 //! * [`ticket`]: the stream-ticket wire, draft v0 (`docs/TICKETS.md`): request auth and the signed receipt.
 //! * [`lottery`]: the lottery, pay after a win (`docs/TICKETS.md`, section 9): the draw and both sides' bookkeeping of it.
+//! * [`offer`]: paying a prepaid ticket or a win by BOLT 12 offer (`docs/TICKETS.md`, section 15): the payer note.
 //! * [`scheme`]: the two traits a scheme implements to be sold and paid: [`scheme::ProviderScheme`], [`scheme::SchemePayer`].
 //! * [`provider`]: a resource server that sells through its schemes ([`provider::Provider::serve`]).
 //! * [`client`]: the payer for those schemes ([`client::Client`]), and [`client::Transport`].
@@ -30,6 +31,7 @@ pub mod listing;
 pub mod lottery;
 pub mod macaroon;
 pub mod maturity;
+pub mod offer;
 pub mod provider;
 pub mod scheme;
 pub mod ticket;

@@ -369,6 +369,16 @@ pub struct TicketPolicy {
     /// address, and over plain http: for a lab whose sellers run on this machine or its network.
     /// Off unless `tickets.unlisted_private` is `true` exactly.
     pub unlisted_private: bool,
+    /// A prepaid ticket or a win is paid by the seller's BOLT 12 offer where its terms name one
+    /// (`extra.offer`, `docs/TICKETS.md` section 15), under every rule of a BOLT 11 one, and by
+    /// its BOLT 11 invoice where the offer cannot be fetched. `tickets.offers`: on unless it is
+    /// `false`. The node's `PayOffer` takes no set of outgoing channels and no CLTV limit, so a
+    /// payment by offer is made only while every channel of the node passes the guards, as the
+    /// Lightning rail pays an offer. The invoice's blinded paths are checked against that rail's
+    /// limit (`ln.max_cltv_blocks`), not `max_htlc_blocks`, which is sized for held tickets; the
+    /// hops the node adds to reach them are bounded only by the node's own limit
+    /// (`ln.node_max_cltv_blocks`).
+    pub offers: bool,
     /// A test aid (`tickets.seller_tls`): for a seller the owner names, the certificate its https is
     /// checked against in place of the public certificate authorities, so that two boxes on a LAN
     /// can test a buy without a public name. Used only while the origin is on the allowlist
@@ -396,7 +406,7 @@ impl Default for TicketPolicy {
                max_new_sellers_per_min: 30, max_sends_per_hour: 1_200, pool: POOL_FEW as i64, pool_many: POOL_MANY as i64,
                many_sellers: MANY_SELLERS as i64, floor_ticket_sats: (FLOOR_MSAT / 1000) as i64, velocity: Velocity::Session,
                http_idle_s: HTTP_IDLE_S, ready_wait_ms: READY_WAIT_MS, read_timeout_s: READ_TIMEOUT_S, max_answer_s: MAX_ANSWER_S, feerate_cap_sat_per_kw: 0,
-               lottery: crate::lottery::LotteryPolicy::default(), unlisted_private: false, seller_tls: BTreeMap::new(), mainnet_ack: false, mainnet_off: None,
+               lottery: crate::lottery::LotteryPolicy::default(), unlisted_private: false, offers: true, seller_tls: BTreeMap::new(), mainnet_ack: false, mainnet_off: None,
                tasks: BTreeMap::new() }
     }
 }
@@ -501,6 +511,8 @@ impl TicketPolicy {
                            },
                            // a widening: only the literal true turns it on
                            unlisted_private: m.get("unlisted_private") == Some(&Value::Bool(true)),
+                           // anything but true or nothing is no permission: paid by invoice only
+                           offers: matches!(m.get("offers"), None | Some(Value::Null) | Some(Value::Bool(true))),
                            // a widening for the sellers named in it: only well-formed entries for https origins
                            seller_tls: m.get("seller_tls").and_then(Value::as_object).into_iter().flatten()
                                .filter_map(|(k, v)| Some((seller_tls_origin(k)?, SellerTls::parse(v).ok()?))).collect(),
@@ -583,7 +595,7 @@ pub fn validate(raw: &Value, errors: &mut Vec<String>, warnings: &mut Vec<String
     };
     ints(m, &TICKET_INT_KEYS, "tickets", errors);
     for k in m.keys() {
-        if !["enabled", "tasks", "velocity", "lottery", "unlisted_private", "seller_tls", "mainnet_ack"].contains(&k.as_str()) && !TICKET_INT_KEYS.contains(&k.as_str()) {
+        if !["enabled", "tasks", "velocity", "lottery", "unlisted_private", "offers", "seller_tls", "mainnet_ack"].contains(&k.as_str()) && !TICKET_INT_KEYS.contains(&k.as_str()) {
             warnings.push(format!("policy.json tickets.{k}: unknown key (the signer ignores it)"));
         }
     }
@@ -600,6 +612,9 @@ pub fn validate(raw: &Value, errors: &mut Vec<String>, warnings: &mut Vec<String
         Some(Value::String(a)) if a == xbt402::ticket::MAINNET_ACK => {}
         Some(_) => errors.push(format!("policy.json tickets.mainnet_ack: is {:?}, word for word, or left out (it lets tickets and draws move funds on mainnet)",
                                        xbt402::ticket::MAINNET_ACK)),
+    }
+    if !matches!(m.get("offers"), None | Some(Value::Null) | Some(Value::Bool(_))) {
+        errors.push("policy.json tickets.offers: must be true (the default: a prepaid ticket or a win is paid by the seller's BOLT 12 offer where it names one) or false".into());
     }
     match m.get("unlisted_private") {
         None | Some(Value::Bool(false)) => {}
@@ -1621,6 +1636,21 @@ mod tests {
 
     fn terms(ticket_msat: u64, min: Option<u64>, max_tickets: u32) -> Terms {
         Terms { payee: node_id(), ticket_msat, min_ticket_msat: min, max_tickets, ticket_blocks: 40, settle: Settle::OnUse, held_after_paid: false }
+    }
+
+    /// Paying by a seller's offer is on unless the owner says `false`; anything else is no
+    /// permission, and an error in the policy's check.
+    #[test]
+    fn paying_by_offer_is_on_unless_the_owner_says_false() {
+        let read = |v: Value| TicketPolicy::from_map(v.as_object().unwrap()).offers;
+        assert!(read(json!({})) && read(json!({"offers": null})) && read(json!({"offers": true})));
+        assert!(!read(json!({"offers": false})) && !read(json!({"offers": "yes"})) && !read(json!({"offers": 1})));
+        for (v, bad) in [(json!({"offers": true}), false), (json!({"offers": false}), false), (json!({"offers": "yes"}), true)] {
+            let (mut errors, mut warnings) = (vec![], vec![]);
+            validate(&v, &mut errors, &mut warnings);
+            assert_eq!(errors.iter().any(|e| e.contains("tickets.offers")), bad, "{v}: {errors:?}");
+            assert!(!warnings.iter().any(|w| w.contains("tickets.offers")), "a known key: {warnings:?}");
+        }
     }
 
     #[test]

@@ -24,6 +24,10 @@
 #            pays with prepaid tickets, one at a time; a seller at its cap of 15 says slots_short and
 #            is paid with a prepaid ticket; a lock that finds no slot on the way: the session holds
 #            less and waits
+#   offers   a seller node that announces no address and has one private channel (lf4, from the
+#            hop), behind a gateway that sells prepaid tickets and the lottery and names a BOLT 12
+#            offer: tickets and wins all paid by the offer, over its blinded paths; then a wallet
+#            with offers turned off, served by the gateway's invoices as before
 #   liar     a seller that lies, played by a proxy in front of a second gateway: another node id,
 #            tickets for another payee, terms that change, inflated metering signed by the seller's
 #            own key, no receipt, a receipt for another request, an answer that stops in the
@@ -39,7 +43,8 @@
 # and built under run/ when missing. Regtest only: no mainnet node is contacted and no miner starts.
 # Ports (loopback, below the kernel's ephemeral range): TICKET_E2E_PORT_BASE (default 17961) to
 # BASE+7: the chain node's RPC, the three nodes' REST, the gateway (BASE+4), the file server
-# (BASE+5), the second gateway (BASE+6) and the lying proxy in front of it (BASE+7). Its own compose
+# (BASE+5), the second gateway (BASE+6) and the lying proxy in front of it (BASE+7); the offers
+# check's node lf4 (BASE+9) and its gateway (BASE+10). Its own compose
 # project (tickete2e), so it runs beside the other regtest scripts. Each container is capped at 2
 # CPUs; host builds run at nice 19 with -j4. The lab's containers and volumes are removed on exit
 # (TICKET_E2E_KEEP=1 keeps them and the scratch directory). About 25 minutes.
@@ -63,10 +68,10 @@ ROOT=$PWD
 LAB=$ROOT/run/lightning-fork-lab
 B=${TICKET_E2E_PORT_BASE:-17961}
 export TICKET_E2E_PORT_BASE=$B TICKET_E2E_PORT_RPC=$B
-export LN_TICKET_PORT_LF1=$((B + 1)) LN_TICKET_PORT_LF2=$((B + 2)) LN_TICKET_PORT_LF3=$((B + 3))
+export LN_TICKET_PORT_LF1=$((B + 1)) LN_TICKET_PORT_LF2=$((B + 2)) LN_TICKET_PORT_LF3=$((B + 3)) LN_TICKET_PORT_LF4=$((B + 9))
 export COMPOSE_PROJECT_NAME=tickete2e
 export COMPOSE_FILE=$LAB/docker-compose.yml:$ROOT/scripts/ticket_e2e/compose.yml
-PORTS=$(seq "$B" $((B + 7)))
+PORTS="$(seq "$B" $((B + 7))) $((B + 9)) $((B + 10))"
 if [ "${TICKET_E2E_PRUNED:-0}" = 1 ]; then
   COMPOSE_FILE=$COMPOSE_FILE:$ROOT/scripts/ticket_e2e/compose.pruned.yml
   PORTS="$PORTS $((B + 8))"
@@ -90,7 +95,10 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
 mkdir -p "$ROOT/run"
-R=$(mktemp -d "$ROOT/run/ticket-e2e-XXXXXX")
+# TICKET_E2E_SCRATCH: where the scratch directory goes (default run/); the signer's socket is in it,
+# and a socket path is at most 107 bytes, so a checkout with a long path names a shorter place here
+mkdir -p "${TICKET_E2E_SCRATCH:-$ROOT/run}"
+R=$(mktemp -d "${TICKET_E2E_SCRATCH:-$ROOT/run}/ticket-e2e-XXXXXX")
 
 nice -n 19 cargo build -q -j4 --release --locked -p xbt-signer --bin xbt-signer -p xbt-wallet-mcp --bin xbt-wallet-mcp -p xbt-gateway --bin xbt-gateway
 BIN=${CARGO_TARGET_DIR:-$ROOT/target}/release

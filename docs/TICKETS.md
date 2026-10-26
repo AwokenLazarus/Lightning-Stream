@@ -16,7 +16,9 @@ and for the dust limits; it was measured with the XBT Core Lightning fork in the
 2026-10-13 the wallet and the gateway in this tree have those defaults and keep those rules, and
 both build the prepaid tickets of section 5 (section 14). Section 9 is the lottery: pieces priced
 below a ticket, paid by draws with nothing held; both sides build its first form, in which the
-buyer pays after a win, and `scripts/lottery_regtest.sh` runs it. XBT is Bitcoin on BLAKE2b proof
+buyer pays after a win, and `scripts/lottery_regtest.sh` runs it. Section 15 (2026-10-26) lets
+a seller be paid for prepaid tickets and lottery wins by one BOLT 12 offer of its node; held
+tickets stay hold invoices. It has run in process only. XBT is Bitcoin on BLAKE2b proof
 of work; "the SHA-256 chain" is the other chain.
 
 A **ticket** is a small Lightning payment that is locked along an ordinary route and not yet
@@ -74,6 +76,7 @@ A seller that takes tickets adds one entry to `accepts` in its `402` (`PAYMENT-R
 | `receiptKey` | The key that signs the seller's receipts. | With tickets the payment preimage proves nothing: the buyer always knew it. The signed receipt is the proof of what was paid for. |
 | `session` | Path of the session endpoints on the seller's origin. | |
 | `heldAfterPaid` | Optional, on an `on-use` entry: `true` when the seller issues held tickets only to a session that has paid a prepaid ticket (section 2, `prepaid_first`). Absent: no such rule is stated. | A buyer that knows the rule buys its prepaid ticket first, instead of offering hashes the seller would refuse. A buyer that does not read it is still told `prepaid_first` and recovers. |
+| `offer` | Optional, on an `on-arrival` entry: a BOLT 12 offer of the seller's node, with no amount, by which its prepaid tickets can be paid (section 15). Never on an `on-use` entry. | A buyer that pays by offer asks for no invoice over HTTP. One that does not read the field buys its prepaid tickets with `lock` as before. |
 
 A buyer MUST refuse an entry whose `ticketBlocks` is above what its owner allows, and one whose
 `ticketMsat` is above it unless `minTicketMsat` lets it ask for a size its owner does allow, or it
@@ -107,7 +110,10 @@ POST <session>/lock    {"version": "ticket/0", "session": "<id, absent the first
 
 A lock for tickets settled on arrival (section 5) names no hashes: its body is
 `{"version": "ticket/0", "settle": "on-arrival", "count": <n>}`, and the answer has the same
-shape, with hashes of the seller's choosing. Without `settle`, a lock is for held tickets.
+shape, with hashes of the seller's choosing. Without `settle`, a lock is for held tickets. A
+lock for tickets settled on arrival may instead say `"by": "offer"` and name no count: it issues
+no invoice, and makes the session of a buyer that pays its prepaid tickets by the seller's offer
+(section 15).
 
 The first lock of a session carries no authentication and makes the session. Every later lock is
 a request of that session and carries `PAYMENT-SIGNATURE` as any paid request does (section 3):
@@ -438,7 +444,9 @@ gateway built here makes the preimage itself, gives it to the node with the invo
 copy; it credits the session when the buyer presents the preimage and the node shows the invoice
 settled, and credits a paid ticket nobody presented when its sweep finds it (75 seconds after
 issue). A buyer that presents a preimage after that is answered `ticket_used`, and finds the
-ticket in the session's signed totals.
+ticket in the session's signed totals. Where the entry carries an offer (`extra.offer`), a
+prepaid ticket can also be paid by that offer, with a note that names the session; the seller
+credits it by the node's word and the note (section 15).
 
 **`release: "after-verify"` (pay only for what checks out).** For content the buyer can check piece
 by piece, such as chunks with a Merkle proof against a root in the terms. A request names the
@@ -866,6 +874,7 @@ knows only tickets skips an entry it cannot read.
 | `graceSeconds`, `gracePieces`, `maxUnpaidWins` | How long, how many pieces and how many wins the seller serves on while a win is unpaid. | The payment of a win takes a quarter of a second through a hop, and a wallet that pays many sellers sends 8 at a time: with 100 sellers a win waited up to 13 s for its turn (section 9.12). |
 | `chainDraws` | The draws one session's chain covers. | A session ends when its chain does; the buyer opens another. |
 | `pieceBytes` | The bytes of an answer that make one piece. | Both sides must cut an answer at the same places. |
+| `offer` | Optional: a BOLT 12 offer of the seller's node, with no amount, by which a win can be paid in place of its invoice (section 15). | A buyer that does not read it pays the win's invoice (section 9.5) as before. |
 
 An entry is offered only for a route whose dearest piece (its request, one second, one full piece
 of bytes) is a small part of `winMsat`: a quarter at the most at the gateway (`max_odds_den`, 4),
@@ -1637,3 +1646,146 @@ loopback, one hop, the release binaries; no Core Lightning node). Each line name
 | The same wallet with 15 payments of others on its channel | a first request by prepaid ticket in 0.33 s; a stream bought its tickets prepaid at 0.32 s each, never more than one of its payments pending | `ticket_e2e_regtest.sh` (`slots`) |
 | One slot left on the seller's channel | one of the wallet's two tickets held, the other `FAILURE_REASON_NO_ROUTE`; the page was paid, the session went to 1 ticket and a 30 s wait, and the next tickets were prepaid | `ticket_e2e_regtest.sh` (`slots`) |
 
+
+## 15. Paying by BOLT 12 offer (2026-10-26)
+
+A seller whose node makes BOLT 12 offers may be paid for its prepaid tickets (section 5) and its
+lottery wins (section 9) by one offer of its node, in place of an invoice per payment. Held
+tickets are not: they are hold invoices, and Lightning Fork's `offersrpc` has no hold variant
+(an offer's invoices settle when they are paid). Both sides are built: the gateway's side is
+`crates/xbt-gateway/src/gateway/offers.rs`, the wallet's is `Signer::ticket_pay_by_offer` in
+`crates/xbt-signer/src/ticket_rail.rs`, and the note both compute is `xbt402::offer`. It was run
+against the gateway in process with its stand-in node and a fake buyer's node that signs real
+BOLT 12 invoices (`crates/xbt-gateway/tests/offers.rs`, the last test of
+`crates/xbt-gateway/tests/lottery.rs`, and the offer tests of
+`crates/xbt-signer/tests/ticket_pay.rs`); **not on the lab, not on Lightning Fork nodes, and not
+over onion messages.** What it brings: one reusable offer per seller in place of an invoice per
+payment asked for over HTTP, and, where the offer has blinded paths, a seller whose node and
+channels stay private and that can be reached with no announced channel.
+
+**Terms.** The seller's 402 entry for prepaid tickets (`settle: "on-arrival"`) and its lottery
+entry may carry
+
+| Field | Meaning | Why |
+|---|---|---|
+| `extra.offer` | A BOLT 12 offer (`lno1...`) of the seller's node, on this chain, with feature bit 512, and **no amount**. | Each payment asks for its own amount: the session's ticket size, or its win size. A buyer that does not know the field ignores it: it uses `lock` for a prepaid ticket and the win's invoice as before, and the seller serves both. |
+
+The held entry never carries it. A buyer MUST refuse an offer that names an amount, lacks bit
+512, is for another chain, has expired, or names an issuer (`offer_issuer_id`) other than the
+entry's `payTo`; an offer reached only by blinded paths names no node, and is the seller's by
+the same word as `payTo` is (the 402 came over TLS from the seller). The wallet built here pays
+by the invoice in every one of those cases.
+
+**The payer note.** An invoice is fetched from the offer for exactly the amount, and the
+invoice request carries this note (`invreq_payer_note`), which the seller's node repeats in the
+invoice it signs:
+
+```text
+note = "xbt402-note/0" SP scheme SP session SP purpose SP amountMsat SP nonce SP mac
+mac  = HMAC-SHA256(key, "xbt402/offer-note/0|" scheme "|" session "|" purpose "|" amountMsat "|" nonce)
+```
+
+`scheme` is `ticket` or `lottery`; `session` is the seller's session id; `key` is that session's
+key (the one `lock` or `open` sent); `purpose` is `ticket` for a prepaid ticket and `win:<draw>`
+for the win of draw `<draw>`; `amountMsat` is the session's ticket size or win size in decimal;
+`nonce` is 16 fresh random bytes, hex; `mac` is hex. Every field is lower-case ASCII, so a note
+has one spelling, and any other spelling is no note.
+
+| Rule | What goes wrong without it |
+|---|---|
+| The note names the session, and its MAC holds under that session's key. | A session id travels in every request header. Without the MAC anyone who learns one could name it on a payment, and the seller could not tell whose payment it is. |
+| The purpose and the amount are under the MAC. | A note could be moved from a small payment to a large credit, or from a ticket to a win. |
+| A fresh nonce for every invoice requested. | One session buys many prepaid tickets of one size: each note must differ, or the seller could not tell a second payment from a replay of the first. |
+| The buyer pays only an invoice that repeats its note exactly. | An invoice the seller's node did not mark with the note is one the seller cannot credit to the session. |
+
+**Lock by offer.** A session that pays its first prepaid ticket by offer has no session with the
+seller yet. It asks for one with
+
+```text
+POST <session>/lock    {"version": "ticket/0", "settle": "on-arrival", "by": "offer"}
+200                    {"session": "<id>", "key": "<32 bytes>", "tickets": [], "refused": [], "offer": "<lno1...>"}
+```
+
+which issues no invoice. It is bounded as a first lock is (section 2: the caps on sessions, in
+all and from one address, where a session that holds nothing and has paid nothing counts), and
+the session is forgotten as one that never paid is (`first_use_secs`). A later lock by offer is
+a request of its session, authenticated as any. A lock by offer that also names a count or
+hashes, or one to a seller whose terms name no offer, is `400`.
+
+**What the seller credits.** The seller lists its offer's invoices on its own node
+(`ListOfferInvoices`) and reads the note of each paid one (`DecodeBolt12`, once per invoice). It
+credits a paid invoice only when all of these hold:
+
+| Check | What goes wrong without it |
+|---|---|
+| The node shows the invoice settled for at least the amount the note names, and that amount is the session's ticket size (a prepaid ticket) or win size (a win) exactly. | A short payment, or one for a smaller amount, is credited in full. |
+| The note's MAC holds under the key of the session it names, and that session exists. | Anyone's payment could be credited to anyone's session (above). |
+| For a win: the draw is an unpaid win of that session. | A note for a draw that did not win, or for one already paid, moves nothing. |
+| Neither the invoice's payment hash nor the note (its session, purpose and nonce) was credited before. | One payment, or one note on two invoices, is credited twice. |
+| The invoice was issued within the last day. | What was credited could not be forgotten: the gateway keeps the hashes and notes it credited for two days, in its state directory (`offers.jsonl`, synced before each credit, so a crash between the two loses one credit and never makes two). |
+
+A note that fails a check is not credited and the payment is not looked at again: the seller
+keeps what arrived, as it keeps a prepaid ticket paid short (section 5). A buyer that pays an
+offer with a note that does not hold has paid for nothing.
+
+A prepaid ticket credited so is in the session's totals as any prepaid ticket is. The buyer
+presents the invoice's preimage in `release` (section 4) as it would a prepaid ticket's: the
+answer names the hash `released` the first time and `ticket_used` after, and the session's
+signed totals say what was credited. The seller looks at its node's list when a buyer presents a
+preimage it has not seen (at most every 0.2 s), when a lottery session with an unpaid win asks
+for anything (section 9.4), and every 2 s from its janitor, so a payment nobody presents is
+credited too. A win paid by offer has its BOLT 11 invoice (section 9.5) cancelled, and is paid
+from then on.
+
+**Receipts.** Unchanged. The proof of a payment by offer is the invoice's preimage, which the
+buyer's node learns when it pays, as for any prepaid ticket or win; the seller's signed receipt
+is the proof of what was paid for.
+
+**The wallet.** Where a seller's terms carry an offer and the owner's policy allows it
+(`tickets.offers`, on unless it is `false`), the wallet pays a prepaid ticket or a win by the
+offer first, under every rule a payment by invoice has: the session and its task, the checks of
+both of the wallet's nodes, the task's budget, the cap per seller, the session's `max_sats`, the
+wallet's own budgets, the fee limit, the row in its book and in its ledger before the payment is
+sent, and the gate of 8 payments (sections 5, 9.5 and 12). And under the rules of the Lightning
+rail's payment of an offer: the offer and the fetched invoice are read and checked by the wallet
+itself (bit 512, the chain, the issuer, the exact amount, the note), and **every channel of the
+wallet's node must pass the guards and the funding proof**, since `PayOffer` takes no set of
+outgoing channels. It pays the fetched invoice (`PayOffer` with `invoice`), never the offer, so
+that a retry cannot fetch and pay a second one.
+
+Where the offer cannot be used before anything is booked (the owner turned it off, the offer or
+its invoice fails a check, no invoice comes back, the node's channels do not all pass, the
+seller answers a lock by offer with an error) the wallet pays by the seller's invoice instead,
+and nothing was booked or sent. A refusal by the book's rules (a budget, a cap) is final: the
+invoice would meet the same rules.
+
+**Limits.**
+
+- Run on Lightning Fork nodes in one regtest lab only (`scripts/ticket_e2e_regtest.sh offers`):
+  a seller that announces no address and has one private channel, reached through the one
+  blinded path of its offer by a buyer one hop away. Prepaid tickets and lottery wins were all
+  paid by the offer. The seller's node limits how fast it answers invoice requests: when a file
+  bought by draws won several times in a burst, it refused one ("rate limited: too many invoice
+  requests") and that win was paid by the seller's invoice. In a longer run it also left two
+  requests unanswered; the wallet then waited the whole call timeout (60 s) for each, the wins'
+  BOLT 11 invoices (30 s) expired meanwhile, and those two wins went unpaid. The wallet now waits
+  at most 5 s for an invoice by offer before it pays by the seller's invoice. More hops, mainnet
+  and Core Lightning payers are not run.
+- The seller's node pads the fees of its blinded path, so it is paid a little more than the
+  invoice: in the lab 1,391,709 msat for invoices of 1,384,000 msat, out of 15,410 msat of fees
+  the buyer's node paid. The wallet books the amount and the fees, as for any payment.
+- The invoice's blinded paths are held to the Lightning rail's limit (`ln.max_cltv_blocks`,
+  1,008 blocks by default), as any payment of an offer is, not to `tickets.max_htlc_blocks`,
+  which is sized for held tickets: Lightning Fork's own path through one hop asked 259 blocks,
+  above that default of 204. `PayOffer` takes no CLTV limit, so the hops the buyer's node adds to
+  reach the path are bounded only by the node's own limit (`ln.node_max_cltv_blocks`, 2,016
+  blocks by default). A payment that settles at once locks nothing for long; one stuck behind a
+  hop that went away can be locked that long.
+- A payment by offer carries no wallet tag (section 2): `PayOffer` sends no custom record. A
+  wallet restored from a backup older than such a payment does not find it in its node's list;
+  the book written before the payment was sent is its only record.
+- The seller asks its node for every invoice of the offer at each look (`ListOfferInvoices` has
+  no paging), so a look costs more as the offer is paid more. The gateway keeps the notes it read
+  in memory, and asks the node to decode each invoice once.
+- A session forgotten by the seller (section 4) before its payment by offer is seen is credited
+  nothing: the seller keeps the payment.

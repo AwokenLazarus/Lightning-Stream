@@ -297,6 +297,13 @@ pub trait LnBackend: Send + Sync {
     fn fetch_invoice(&self, _offer: &str, _amount_msat: u64, _timeout_s: i64) -> Result<Value> {
         Err(err("ln_backend", "this backend does not fetch BOLT 12 invoices"))
     }
+    /// [`Self::fetch_invoice`] with a note for the issuer in the invoice request (`payer_note`),
+    /// which the issuer repeats in the invoice: how a payment by offer names the session it pays
+    /// for ([`xbt402::offer`]). A backend that cannot send a note answers an error, never an
+    /// invoice without it.
+    fn fetch_invoice_noted(&self, _offer: &str, _amount_msat: u64, _payer_note: &str, _timeout_s: i64) -> Result<Value> {
+        Err(err("ln_backend", "this backend does not fetch BOLT 12 invoices with a payer note"))
+    }
     /// AGP-082, `POST /v2/offers/pay` (`offchain:write`) with the fetched invoice: the payment as a final
     /// `Payment` (status SUCCEEDED, the preimage, what it cost); an error when it failed or its fate is
     /// not known ([`Self::lookup`] by the invoice's payment hash then says).
@@ -669,6 +676,11 @@ impl LnBackend for LndRest {
     fn fetch_invoice(&self, offer: &str, amount_msat: u64, timeout_s: i64) -> Result<Value> {
         self.post("/v2/offers/fetchinvoice", &json!({"offer": offer, "amount_msat": amount_msat.to_string(), "timeout_seconds": timeout_s.max(1)}),
                   timeout_s)
+    }
+
+    fn fetch_invoice_noted(&self, offer: &str, amount_msat: u64, payer_note: &str, timeout_s: i64) -> Result<Value> {
+        self.post("/v2/offers/fetchinvoice", &json!({"offer": offer, "amount_msat": amount_msat.to_string(), "payer_note": payer_note,
+                                                     "timeout_seconds": timeout_s.max(1)}), timeout_s)
     }
 
     fn pay_offer(&self, r: &OfferPayRequest) -> Result<Value> {

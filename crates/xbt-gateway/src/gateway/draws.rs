@@ -45,7 +45,7 @@ pub const JOURNAL: &str = "lottery.jsonl";
 pub(super) struct Lottery {
     state: Mutex<Journaled>,
     /// Signalled when a value is taken or a win is paid: answers that wait for either wake.
-    changed: Condvar,
+    pub(super) changed: Condvar,
 }
 
 /// The book and its journal under one lock: every change is appended in the order it was made.
@@ -226,7 +226,12 @@ impl Gateway {
             Release::AfterVerify => RELEASE_AFTER_VERIFY,
             Release::WithRequest => RELEASE_AFTER_ANSWER,
         };
-        Some(self.lottery_terms(cfg).accepts(route.price.request_msat, release, &route.price.terms()))
+        let mut e = self.lottery_terms(cfg).accepts(route.price.request_msat, release, &route.price.terms());
+        // a win can be paid by the node's offer as well as by its invoice
+        if let Some(o) = self.offer_text() {
+            e["extra"][xbt402::offer::EXTRA_OFFER] = o.into();
+        }
+        Some(e)
     }
 
     pub(super) fn lottery_terms(&self, cfg: &crate::lottery::LotteryConfig) -> lottery::Terms {
@@ -416,6 +421,10 @@ impl Gateway {
     /// settled in full is paid; a win with no invoice, or one whose invoice the node has cancelled
     /// (it lapsed unpaid), gets a new one. No lock is held while the node is asked.
     fn lottery_refresh(&self, l: &Lottery, session: &str) {
+        // a win may have been paid by the node's offer: the node's list of its invoices says
+        if self.offers.is_some() && l.lock().session(session).is_some_and(|s| !s.unpaid.is_empty()) {
+            self.offer_sweep(true);
+        }
         let (unpaid, win_msat, win_blocks, invoice_secs) = {
             let b = l.lock();
             match b.session(session) {

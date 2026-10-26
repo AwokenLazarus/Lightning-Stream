@@ -204,7 +204,10 @@ mainnet; its driver is not in this tree. `docs/TICKETS.md`, section 11, has the 
   has paid something (`caps.held_after_paid`, on by default wherever it offers both kinds), so
   a named seller's session that meets such a gateway buys its first ticket prepaid too
   (`docs/TICKETS.md`, section 6.4).
-- BOLT 11 hold invoices only. The Lightning Fork's BOLT 12 offers have no hold path.
+- Held tickets are BOLT 11 hold invoices only: the Lightning Fork's BOLT 12 offers have no hold
+  path. Since 2026-10-26 prepaid tickets and lottery wins can be paid by a BOLT 12 offer of the
+  seller's node (`docs/TICKETS.md`, section 15); that has run in process only, never on
+  Lightning Fork nodes or over onion messages.
 - One hop was measured, on one host. Two or more hops, real network latency, mainnet routes and
   fees, a direct channel, and a force close with many tickets were not.
 - *(with Core Lightning)* A Core Lightning node needs nothing special as a buyer's node or as a
@@ -607,6 +610,20 @@ wallet) and against a stand-in node in its tests.
   nothing more: the two keys make no part of the gateway fit for mainnet, and a runner who
   writes them has the limits of this file as they stand. The chain is also checked against the
   node's own at the start, as before.
+- Payment by BOLT 12 offer (`offers`, off unless the runner turns it on; `docs/TICKETS.md`,
+  section 15). The gateway makes one offer with no amount at the start and refuses to start if
+  the node makes none. Its calls (`CreateOffer`, `EnableOffer`, `ListOfferInvoices`,
+  `DecodeBolt12`) need `invoices:read` and `invoices:write`, which the invoice macaroon already
+  holds: nothing is added to it. It credits a paid offer invoice only for a payer note whose MAC
+  holds under the named session's key, for that session's exact ticket or win size paid in
+  full, issued within the last day, and never credited before by hash or by note; what it
+  credited is kept two days in `offers.jsonl`, synced before each credit (a crash in between
+  loses that one credit). A payment whose note fails, or whose session was forgotten first, is
+  kept by the seller and credited to nobody. Each look lists every invoice of the offer (the
+  node's call has no paging, so a look costs more the more the offer has been paid; each paid
+  invoice is decoded once, and up to 65,536 notes are remembered): at most every 2 s from the janitor, and at most every 0.2 s when
+  a buyer names a payment the gateway has not seen. Run against the stand-in node, and on
+  Lightning Fork regtest nodes (`scripts/ticket_e2e_regtest.sh offers`).
 - Not run: more than one routing hop, real network latency, mainnet, IPv6, a seller with several
   channels, and the Core Lightning fork. The channels macaroon was run against the stand-in node
   of the tests and on the lab against a Lightning Fork node whose channel was opened with 30
@@ -912,6 +929,22 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
   elsewhere), and a held ticket through a routing node is at least 2,304 sat (the fee-aware
   floor, above). Like the gateway's, this is a guard against using mainnet by omission and no
   more. Added 2026-10-17.
+- A prepaid ticket or a win paid by the seller's BOLT 12 offer (`tickets.offers`, on unless
+  `false`; `docs/TICKETS.md`, section 15) is booked and bounded as one paid by invoice, and is
+  made only while every channel of the wallet's node passes the guards: `PayOffer` takes no set
+  of outgoing channels and no CLTV limit. The wallet refuses an invoice whose blinded payment
+  path asks a `cltv_expiry_delta` above `ln.max_cltv_blocks` (1,008 by default; Lightning Fork's
+  path through one hop asked 259, above `tickets.max_htlc_blocks`' 204), but the hops the node
+  picks to reach the path's first node add to that, and their total is bounded only by the node's
+  own limit (`ln.node_max_cltv_blocks`). A prepaid ticket settles on arrival, so the long lock is
+  a stuck payment's worst case, not a held ticket's normal one. It carries no wallet tag, so
+  a wallet restored from an older backup does not recover it from its node's list. The fetched
+  invoice must repeat the wallet's payer note; where the offer gives no invoice, or one that
+  fails a check, the ticket or win is paid by the seller's invoice, with nothing booked for the
+  offer. Run in process, and on Lightning Fork regtest nodes against a seller that announces no
+  address and has one private channel (`scripts/ticket_e2e_regtest.sh offers`): every prepaid
+  ticket and every win paid by the offer, but for one win the seller's node refused for its rate
+  limit on invoice requests, which was paid by invoice.
 - The single Lightning payment of a 402 (`scheme: "exact"`) pays first: an invoice that is paid
   and then not honoured is lost, once. No seller in this tree offers the entry and it was not run
   on the lab.

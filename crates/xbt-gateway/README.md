@@ -237,6 +237,22 @@ The rules it keeps, beside those of the table above:
 The fairness of the draw rests on an argument of this project's own that nobody else has
 reviewed (`docs/LIMITS.md`, "The lottery").
 
+## Paid by BOLT 12 offer
+
+```json
+"offers": {"enabled": true, "description": "My shop"}
+```
+
+With this section the gateway makes one BOLT 12 offer of your node at its start (no amount; the
+same description finds the same offer after a restart) and names it in its terms for prepaid
+tickets and for the lottery. A buyer that understands it pays a prepaid ticket or a win by the
+offer, with a payer note that names its session; the gateway credits a paid offer invoice to the
+session the note names, only when the note's MAC holds under that session's key, the amount is
+the session's own and was paid in full, and the payment and its note were not credited before
+(`docs/TICKETS.md`, section 15). Held tickets stay hold invoices: offers have none. The offer
+calls need `invoices:read` and `invoices:write`, which `node.macaroon` already has. Run against
+the stand-in node only.
+
 ### Behind a reverse proxy: whose address is counted
 
 The caps per address (`caps.sessions_per_address` for tickets, `lottery.sessions_per_address`)

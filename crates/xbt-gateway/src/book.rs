@@ -557,6 +557,83 @@ impl Book {
         }
     }
 
+    /// A first lock for a session that pays by BOLT 12 offer (`docs/TICKETS.md`, section 15): the
+    /// session and its key, and no invoice. It is bounded as a first lock is ([`Book::lock_room`]),
+    /// and a session that holds nothing and has paid nothing also counts against the cap per
+    /// address, or one address could fill the book with empty sessions. Such a session is
+    /// forgotten as any session that never paid is ([`Caps::first_use_secs`]).
+    pub fn open_session(&mut self, addr: &str, entropy: &[u8; 48], now: u64) -> Result<Granted, Refusal> {
+        self.lock_room(addr, None, true)?;
+        let per = self.caps.sessions_per_address as usize;
+        let empty_here = self
+            .sessions
+            .values()
+            .filter(|s| s.addr == addr && (s.live > 0 || s.open_responses > 0 || s.released_msat == 0))
+            .count();
+        if per > 0 && empty_here >= per {
+            return Err(Refusal::TooManySessions);
+        }
+        let id = hex::encode(&entropy[..16]);
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&entropy[16..]);
+        if self.sessions.contains_key(&id) {
+            return Err(Refusal::TooManySessions);
+        }
+        self.sessions.insert(
+            id.clone(),
+            Session {
+                key,
+                addr: addr.to_string(),
+                next_seq: 0,
+                released_msat: 0,
+                spent_msat: 0,
+                pledge: None,
+                last_paid: now,
+                open_responses: 0,
+                live: 0,
+                used: VecDeque::new(),
+            },
+        );
+        let recs = vec![Rec::Session { id: id.clone(), key, addr: addr.to_string() }];
+        Ok(Granted { session: id, key: Some(key), issue: vec![], recs })
+    }
+
+    /// A prepaid ticket paid by BOLT 12 offer, which the node shows settled for `msat` and whose
+    /// payer note the caller has checked against this session's key: credited once. The payment
+    /// enters the book as a prepaid ticket and is credited at once, so the journal holds it as it
+    /// holds any prepaid ticket (its records, in order). `Err`: the session is gone, or the hash
+    /// is a ticket of the book already.
+    pub fn credit_offer(&mut self, session: &str, hash: &Hash, msat: u64, now: u64) -> Result<Vec<Rec>, Refusal> {
+        if !self.sessions.contains_key(session) {
+            return Err(Refusal::SessionUnknown);
+        }
+        if self.tickets.contains_key(hash) {
+            return Err(Refusal::TicketUsed);
+        }
+        self.tickets.insert(
+            *hash,
+            Ticket {
+                session: session.to_string(),
+                state: TicketState::Open,
+                paid_msat: msat,
+                expiry_height: None,
+                issued_at: now,
+                prepaid: true,
+                first: false,
+            },
+        );
+        if let Some(s) = self.sessions.get_mut(session) {
+            s.live += 1;
+            s.last_paid = now;
+        }
+        let made = Rec::Ticket { hash: *hash, session: session.to_string(), prepaid: true };
+        match self.settled(hash, Some(msat)) {
+            Some(r @ Rec::Released { .. }) => Ok(vec![made, r]),
+            // short of a whole ticket: no credit, and the ticket is gone again
+            _ => Err(Refusal::TicketNotLocked),
+        }
+    }
+
     /// The node's answer to issuing `hash`: not issued, the ticket leaves the book.
     pub fn issued(&mut self, hash: &Hash, ok: bool) -> Option<Rec> {
         if ok {

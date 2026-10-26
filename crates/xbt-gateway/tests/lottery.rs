@@ -1042,3 +1042,62 @@ fn a_win_paid_after_the_last_request_is_counted_by_the_next_round_of_the_janitor
     assert_eq!((h["wins"].as_u64(), h["paidWins"].as_u64(), h["paidMsat"].as_str()), (Some(wins), Some(wins), Some((wins * 4000).to_string().as_str())), "{h}");
     assert_eq!(h["sessions"], 1, "the session is still open: {h}");
 }
+
+/// A win paid by the seller's BOLT 12 offer (`docs/TICKETS.md`, section 15): the payer note names
+/// the session and the draw under the session key, and the node's word that the offer invoice is
+/// paid in full pays that win, once; its BOLT 11 invoice is cancelled. A note for a draw that did
+/// not win, under another key, or seen before, pays nothing.
+#[test]
+fn a_win_paid_by_offer_with_its_own_note_is_paid_once_and_its_invoice_cancelled() {
+    use xbt402::offer::{note, Purpose};
+    let with_offers = |v: &mut Value| {
+        lottery(v);
+        v["offers"] = json!({"enabled": true});
+    };
+    let (rig, _d) = start(&with_offers);
+    let j = http(&rig.addr, "GET", "/api", &[], b"", None).json();
+    let entry = j["accepts"].as_array().unwrap().iter().find(|a| a["scheme"] == "lottery").unwrap().clone();
+    assert!(entry["extra"]["offer"].as_str().is_some_and(|o| o.starts_with("lno1")), "{entry}");
+    let mut b = Drawer::open(&rig, 11);
+    let (j, lost) = loop {
+        let (seq, got) = b.get("/api");
+        assert_eq!(got.status, 200);
+        let p = b.piece(seq, "/api", Kind::Request, 0, 2500);
+        let j = b.draw(&[p]);
+        if !b.owed.is_empty() {
+            // a draw of this session that did not win, for a note that names one
+            let lost = b.outcomes.iter().find(|o| o.win.is_none()).map(|o| o.draw);
+            break (j, lost);
+        }
+    };
+    let draw = b.owed[0];
+    let bolt11 = b.invoice_hash(&j, draw);
+    let now = rig.clock.load(std::sync::atomic::Ordering::SeqCst);
+    // not this win: another key, another amount, a ticket's purpose, a draw that did not win
+    let mut wrong = vec![
+        note(&[0x55; 32], &b.session, Purpose::Win(draw), b.win_msat, &[1; 16]),
+        note(&b.key, &b.session, Purpose::Win(draw), b.win_msat - 1, &[2; 16]),
+        note(&b.key, &b.session, Purpose::Ticket, b.win_msat, &[3; 16]),
+    ];
+    wrong.extend(lost.map(|d| note(&b.key, &b.session, Purpose::Win(d), b.win_msat, &[4; 16])));
+    for n in &wrong {
+        rig.node.pay_by_offer(Some(n), b.win_msat, now);
+    }
+    let st = b.status();
+    assert_eq!((st["session"]["paidMsat"].as_str(), st["wins"].as_array().unwrap().len()), (Some("0"), 1), "{st}");
+    // the win's own note, paid short: nothing
+    rig.node.pay_by_offer(Some(&note(&b.key, &b.session, Purpose::Win(draw), b.win_msat, &[7; 16])), b.win_msat - 1, now);
+    assert_eq!(b.status()["session"]["paidMsat"], "0");
+    // and paid in full: the win is paid, and its BOLT 11 invoice can no longer be paid for it
+    let good = note(&b.key, &b.session, Purpose::Win(draw), b.win_msat, &[5; 16]);
+    rig.node.pay_by_offer(Some(&good), b.win_msat, now);
+    let st = b.status();
+    assert_eq!((st["session"]["paidMsat"].as_str(), st["wins"].as_array().unwrap().len()), (Some(b.win_msat.to_string().as_str()), 0), "{st}");
+    assert_eq!(rig.node.state_of(&bolt11), Some(InvoiceState::Canceled));
+    // the same note paid again, or the same win under a fresh nonce, pays nothing more
+    rig.node.pay_by_offer(Some(&good), b.win_msat, now);
+    rig.node.pay_by_offer(Some(&note(&b.key, &b.session, Purpose::Win(draw), b.win_msat, &[6; 16])), b.win_msat, now);
+    let st = b.status();
+    assert_eq!(st["session"]["paidMsat"].as_str(), Some(b.win_msat.to_string().as_str()));
+    assert_eq!(rig.gw.stats().prepaid_tickets, 0);
+}

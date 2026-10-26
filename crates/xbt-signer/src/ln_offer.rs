@@ -137,7 +137,7 @@ impl Signer {
     }
 
     /// The block 0 hash of the chain our own node follows, in wire order: the chain an offer must name.
-    fn ln_genesis(&self) -> Option<[u8; 32]> {
+    pub(crate) fn ln_genesis(&self) -> Option<[u8; 32]> {
         let mut b = hex::decode(node::block_hash(&*self.node, 0).ok()?).ok()?;
         b.reverse();
         <[u8; 32]>::try_from(b).ok()
