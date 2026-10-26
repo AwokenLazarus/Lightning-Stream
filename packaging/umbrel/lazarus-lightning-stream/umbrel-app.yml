@@ -2,7 +2,7 @@ manifestVersion: 1.1
 id: lazarus-lightning-stream
 category: lightning
 name: Lightning Stream
-version: "0.1.4"
+version: "0.1.5"
 tagline: Buy and sell any service over Lightning from this box, paid as you use it
 description: >-
   One app for both sides. The wallet pays sellers with stream tickets under a policy you sign, and
@@ -15,7 +15,8 @@ description: >-
   Setup takes a few minutes and no keys to copy. The app connects to this box's Lightning node by
   itself: a one-shot service asks the node to make the app's own narrow keys (it can pay only within
   your spending rules, and the selling side can only ask for payments), each revocable alone in the
-  node's app. You open the app from your Umbrel dashboard, already logged in. Then make your approval
+  node's app. You open the app from your Umbrel dashboard and log in with the app password Umbrel
+  shows for it (its default credentials). Then make your approval
   key in the browser (download its backup), confirm that the app pays with real money, and sign the
   starter spending rules.
 
@@ -45,6 +46,9 @@ gallery:
   - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/4.png
   - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/5.png
 releaseNotes: >-
+  0.1.5: the app no longer skips its password for a peer named like the box's login proxy (umbrelOS
+  2.0 runs no such container, so another app could have taken the name); log in with the app password
+  Umbrel shows for this app.
   0.1.4: no setup to connect your Lightning node (the app makes its own narrow keys through the node),
   the app password shown on the app's page in the Umbrel dashboard, no codes to read from logs, an approval
   key backup you can download, "Allow this seller" in one signature, services on this box offered on
