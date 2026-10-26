@@ -444,6 +444,7 @@ fn the_policy_editor_shows_the_signer_s_errors_and_applies_a_signed_change_live(
     good.iter_mut().find(|(k, _)| k == "f_human_threshold_sats").unwrap().1 = "5000".into();
     let prev = post(&mut br, &good).body;
     assert!(prev.contains("<code>human_threshold_sats</code>") && prev.contains("Sign and apply"), "{prev}");
+    assert!(prev.contains("Ask me first for a payment of at least: 5,000 sats (was 1,000 sats)"), "{prev}");
     let text = field(&prev, "text");
     let (sha, exp) = (field(&prev, "prev_sha256"), field(&prev, "expiry"));
     let shown = &prev[prev.find("<pre class=\"signed-text\">").unwrap() + 25..];
@@ -464,8 +465,8 @@ fn the_policy_editor_shows_the_signer_s_errors_and_applies_a_signed_change_live(
     let (text, sha, exp) = (field(&prev, "text"), field(&prev, "prev_sha256"), field(&prev, "expiry"));
     let r = br.post("/policy-apply", &[("csrf", &csrf), ("text", &text), ("prev_sha256", &sha), ("expiry", &exp),
                                         ("signature", &sig(&policy_message(&sha, exp.parse().unwrap(), &text)))]);
-    assert!(br.flash_after(&r).contains("take effect when the signer restarts: anchor_interval_s"));
-    assert!(br.get("/policy").body.contains("waiting for a signer restart: anchor_interval_s"));
+    assert!(br.flash_after(&r).contains("waits for the app to restart (How often the records are sealed)"), "{}", br.flash_after(&r));
+    assert!(br.get("/policy").body.contains("waiting for the app to restart: How often the records are sealed"));
     assert!(br.post("/policy", &[("csrf", &csrf), ("mode", "json"), ("json", "{nope")]).body.contains("policy.json: key must be a string"));
     // the template
     assert!(br.get("/policy?template=starter").body.contains("name=\"f_max_per_tx_sats\" value=\"100000\""));
@@ -1868,6 +1869,14 @@ fn a_node_the_box_connected_by_itself_needs_no_key_and_a_disconnect_stays() {
     let page = br.get("/lightning").body;
     assert!(page.contains("connected by itself") && page.contains("made by the app") && page.contains("root key id "), "{page}");
     assert!(page.contains("Advanced: use a key of your own instead") && !page.contains(&rail), "{page}");
+    assert!(page.contains("Before you uninstall") && page.contains("deletemacaroonid"), "{page}");
+    // Home and Setup tell the same state as this page: connected, not yet ready (no rules signed)
+    if !page.contains("Connected to your Lightning node") {
+        let home = br.get("/").body;
+        assert!(home.contains("connected but cannot pay yet") && !home.contains("Not connected"), "{home}");
+        let setup = br.get("/setup").body;
+        assert!(setup.contains("Connected, not ready yet.") && !setup.contains("ln.enabled") && !setup.contains("Lightning rail"), "{setup}");
+    }
     let r = br.act("/lightning", "/lightning", &[("action", "remove")]);
     assert!(br.flash_after(&r).contains("removed"));
     // the next start makes nothing: the node is not even asked
@@ -1908,7 +1917,9 @@ fn the_enrolment_code_the_box_gives_is_filled_in() {
     let page = br.get("/setup").body;
     assert!(page.contains("<input type=\"hidden\" name=\"code\" value=\"ABCD-EFGH-IJKL\">"), "{page}");
     assert!(!page.contains("Enrolment code<input") && page.contains("Use this key for approvals"), "{page}");
-    assert!(page.contains("Download the backup file") && page.contains("I saved the backup somewhere safe"), "{page}");
+    assert!(page.contains("Download the backup file") && page.contains("I saved the downloaded file somewhere safe"), "{page}");
+    // what saving needs is said before Save is pressed: the download and the tick, or the last 8 characters
+    assert!(page.contains("keep its backup in one of two ways") && page.contains("type the backup's last 8 characters"), "{page}");
     // without the box's copy the code is asked as before
     let b = start_on(Rig::new(json!({"human_pubkey": ""}), false), |_| {});
     let mut br = logged_in(&b);

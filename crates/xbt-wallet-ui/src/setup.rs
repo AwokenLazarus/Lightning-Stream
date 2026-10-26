@@ -128,7 +128,7 @@ pub const WALLET_MAINNET_NOTICE: [&str; 4] = [
 pub(crate) fn plain_reason(r: &str) -> String {
     let l = r.to_ascii_lowercase();
     if l.contains("off in this policy") || l.contains("ln.enabled") {
-        "Paying is not turned on in your spending rules yet. Sign the safe starter rules to turn it on.".into()
+        "Paying is not turned on in your spending rules yet. Sign the safe starter rules (Settings → Spending rules) to turn it on.".into()
     } else if l.contains("mainnet") && (l.contains("ack") || l.contains("acknowledg")) {
         "Confirm that the app may pay with real money (on Your node).".into()
     } else if l.contains("no usable channel") || l.contains("no channel") {
@@ -223,6 +223,15 @@ impl App {
         self.signer.call("health", json!({})).ok().and_then(|h| h.get("chain").and_then(Value::as_str).map(str::to_string)).unwrap_or_default()
     }
 
+    /// The node's state as every page tells it (Home, Setup and Your node read this one answer):
+    /// (ready to pay, connected: the app holds a key for the node, why it cannot pay yet in words).
+    pub(crate) fn node_state(&self) -> (bool, bool, String) {
+        let status = self.signer.call("ln_status", json!({})).unwrap_or_else(|e| json!({"ready": false, "reason": e}));
+        let ready = status["ready"] == true;
+        let have = self.cfg.ln.dir.join(RAIL_MACAROON).is_file() || status["configured"] == true;
+        (ready, have, plain_reason(&txt(status.get("reason").or(status.get("config_error")))))
+    }
+
     pub(crate) fn lightning_page(&self, ctx: &Ctx) -> Resp {
         let ln = &self.cfg.ln;
         let chain = self.signer_chain();
@@ -284,6 +293,14 @@ impl App {
             ("Key", if auto { format!("<span class=\"pill good\">made by the app</span> with only <code>{}</code>, under a root key of its own: \
                               you can revoke it in your node's app ({})", RAIL_OPS.join(" "), esc(&crate::node_keys::root_key_line(&ln.dir, RAIL_MACAROON))) }
                     else if have { "<span class=\"pill good\">stored</span> (never shown again)".into() } else { "<span class=\"pill warn\">none</span>".into() }),
+            ("Before you uninstall", {
+                let mut ids = crate::node_keys::root_key_ids(&ln.dir);
+                ids.extend(crate::node_keys::root_key_ids(&self.cfg.gw.dir));
+                if ids.is_empty() { "The app made no keys on your node.".to_string() } else {
+                    format!("The keys the app made stay valid on your node after an uninstall. Revoke them in your node's app: root key ids <code>{}</code> \
+                             (or <code>lncli deletemacaroonid &lt;id&gt;</code>).", esc(&ids.join(", ")))
+                }
+            }),
             ("Chain", esc(&chain)),
         ]));
         b.push_str(&format!("<p>What the wallet sees of the node:</p>{}", json_block(&status)));

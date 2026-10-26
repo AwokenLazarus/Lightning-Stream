@@ -71,7 +71,8 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 CMD ["/u
 
 # The stream-ticket seller gateway. It reads one config file, which the UI's gateway page writes into
 # /data/run/gateway; xbt-supervise starts the gateway once that file exists and again when it or a
-# macaroon changes. 8402 is for buyers, behind an https proxy (the gateway refuses a non-loopback
+# macaroon changes. Until a shop is saved there is no config: the gateway waits, and that is healthy (the
+# probe passes while the file is missing). 8402 is for buyers, behind an https proxy (the gateway refuses a non-loopback
 # listen without an https public_url). State: /data/gateway.
 FROM base AS xbt-gateway
 ARG TARGETARCH
@@ -82,7 +83,7 @@ USER xbt-gateway
 ENTRYPOINT ["/usr/bin/xbt-supervise", "--wait", "/data/run/gateway/config.json", "--watch", "/data/run/gateway/invoices.macaroon", \
             "--watch", "/data/run/gateway/info.macaroon", "--watch", "/data/lightning/tls.cert", "--", \
             "/usr/bin/xbt-gateway", "/data/run/gateway/config.json"]
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 CMD ["/usr/bin/xbt-supervise", "probe", "http://127.0.0.1:8402/x402/ticket/health"]
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 CMD ["/usr/bin/xbt-supervise", "probe", "http://127.0.0.1:8402/x402/ticket/health", "--waiting-for", "/data/run/gateway/config.json"]
 
 # The connector. A local player asks it for a seller's URL; the signer pays and streams the body.
 # It holds no keys. USER is the signer's user: the sockets it binds have to be ones that user can

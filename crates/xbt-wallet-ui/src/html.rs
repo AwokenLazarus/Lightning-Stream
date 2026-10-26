@@ -38,7 +38,7 @@ pub fn int(v: Option<&Value>) -> i64 {
     }
 }
 
-fn group3(n: u64) -> String {
+pub(crate) fn group3(n: u64) -> String {
     let s = n.to_string();
     let mut o = String::new();
     for (i, c) in s.chars().enumerate() {

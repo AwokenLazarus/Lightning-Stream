@@ -32,8 +32,12 @@ description: >-
   the Lightning page asks you to acknowledge that before it stores a macaroon.
 
 
-  Needs Lightning Fork and an XBT (BLAKE2b) node. Side-load only. The connector image is the local
-  tag lightning-stream:0.1.0 until it is published; the other images are pinned by digest.
+  Uninstalling removes the app's files, but the keys it made stay valid on your Lightning node
+  until you revoke them. Before you uninstall, note the root key ids on the app's Your node page
+  (under Details), then delete them in Lightning Fork (or with `lncli deletemacaroonid <id>`).
+
+
+  Needs Lightning Fork and an XBT (BLAKE2b) node.
 developer: Lazarus
 website: https://github.com/AwokenLazarus/Lightning-Stream
 repo: https://github.com/AwokenLazarus/Lightning-Stream

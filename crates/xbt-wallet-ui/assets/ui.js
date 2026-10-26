@@ -359,7 +359,7 @@
       a.download = "lightning-stream-approval-key.txt";
       document.body.appendChild(a); a.click(); a.remove();
       downloaded = true;
-      var box = $("#keygen-saved"); if (box) box.checked = true;
+      var box = $("#keygen-saved"); if (box) { box.disabled = false; box.checked = true; }
     });
     $("#keygen-save").addEventListener("click", function () {
       var msg = $("#keygen-msg");

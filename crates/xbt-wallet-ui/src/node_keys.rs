@@ -189,6 +189,16 @@ fn is_off(dir: &Path) -> bool {
     read_record(dir)["off"] == true
 }
 
+/// The root key ids of every key this tool made in `dir` (no secret): what to revoke on the node
+/// when the app is uninstalled.
+pub fn root_key_ids(dir: &Path) -> Vec<String> {
+    let rec = read_record(dir);
+    let mut ids: Vec<String> = rec.as_object().into_iter().flatten()
+        .filter_map(|(_, v)| v.get("root_key_id").and_then(serde_json::Value::as_str).map(str::to_string)).collect();
+    ids.sort();
+    ids
+}
+
 /// "root key id N", for revoking `file`'s key in the node's app, or a plain word when unknown.
 pub fn root_key_line(dir: &Path, file: &str) -> String {
     match read_record(dir)[file]["root_key_id"].as_str() {

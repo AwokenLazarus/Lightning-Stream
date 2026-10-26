@@ -3,7 +3,10 @@
 //! macaroon, and the service picks it up without anyone restarting the container.
 //!
 //!   xbt-supervise [--wait FILE]... [--watch FILE]... [--every SECS] -- PROGRAM [ARGS...]
-//!   xbt-supervise probe URL        exit 0 when GET URL (plain http) answers 200: a HEALTHCHECK
+//!   xbt-supervise probe URL [--waiting-for FILE]
+//!                                  exit 0 when GET URL (plain http) answers 200: a HEALTHCHECK.
+//!                                  With --waiting-for, also 0 while FILE is not there: the program
+//!                                  is not started yet by design (a seller with no shop yet), not broken
 //!
 //! `--wait`: PROGRAM is not started until FILE is a regular file, and is stopped again if it goes
 //! away. `--watch`: a FILE whose content changes (appears, goes away, is rewritten) restarts PROGRAM.
@@ -146,7 +149,12 @@ fn supervise(a: Args, signals: Signals) -> ExitCode {
     }
 }
 
-fn probe(url: &str) -> ExitCode {
+fn probe(url: &str, waiting_for: Option<&str>) -> ExitCode {
+    if let Some(f) = waiting_for {
+        if !std::path::Path::new(f).is_file() {
+            return ExitCode::SUCCESS;
+        }
+    }
     let Some(rest) = url.strip_prefix("http://") else {
         say("probe: only http:// URLs");
         return ExitCode::from(2);
@@ -169,13 +177,14 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("-h" | "--help") => {
-            println!("usage: xbt-supervise [--wait FILE]... [--watch FILE]... [--every SECS] -- PROGRAM [ARGS...] | probe URL");
+            println!("usage: xbt-supervise [--wait FILE]... [--watch FILE]... [--every SECS] -- PROGRAM [ARGS...] | probe URL [--waiting-for FILE]");
             ExitCode::SUCCESS
         }
-        Some("probe") => match args.get(1) {
-            Some(u) => probe(u),
-            None => {
-                say("usage: xbt-supervise probe URL");
+        Some("probe") => match (args.get(1), args.get(2).map(String::as_str), args.get(3)) {
+            (Some(u), None, _) => probe(u, None),
+            (Some(u), Some("--waiting-for"), Some(f)) if args.len() == 4 => probe(u, Some(f)),
+            _ => {
+                say("usage: xbt-supervise probe URL [--waiting-for FILE]");
                 ExitCode::from(2)
             }
         },

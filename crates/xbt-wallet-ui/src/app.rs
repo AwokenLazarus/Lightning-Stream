@@ -91,7 +91,7 @@ const INT_KEYS: [(&str, &str, &str); 12] = [
     ("velocity_max", "At most this many payments…", "velocity"),
     ("velocity_window_s", "…in this many seconds", "velocity"),
     ("hot_balance_cap_sats", "Most this box may hold for agents (sats; 0 means no limit)", "hot"),
-    ("anchor_interval_s", "Seal the records every (seconds; after a restart)", "anchor"),
+    ("anchor_interval_s", "How often the records are sealed (seconds; after a restart)", "anchor"),
     ("treasury_csv", "Treasury delay (blocks; not used by this signer)", "anchor"),
 ];
 
@@ -561,8 +561,10 @@ impl App {
             // browsers submit line breaks as CRLF; the signed text is LF only (JSON escapes a CR inside a string)
             "/policy-apply" => back("./policy", self.call("policy_set", json!({"text": f.get("text").map(|t| t.replace("\r\n", "\n")).unwrap_or_default(),
                                                                               "prev_sha256": g("prev_sha256"), "expiry": i("expiry"), "signature": sig()})), &|v| {
-                let pr = v.get("pending_restart").and_then(Value::as_array).map(|a| a.iter().map(|x| txt(Some(x))).collect::<Vec<_>>().join(", ")).unwrap_or_default();
-                if pr.is_empty() { "Policy applied; it is in force now.".into() } else { format!("Policy applied. These take effect when the signer restarts: {pr}.") }
+                let pr = v.get("pending_restart").and_then(Value::as_array).map(|a| a.iter().map(|x| setting_name(&txt(Some(x)))).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+                if pr.is_empty() { "Policy applied; it is in force now.".into() } else {
+                    format!("Policy applied. One part waits for the app to restart ({pr}): restart Lightning Stream from your Umbrel or StartOS dashboard.")
+                }
             }),
             "/human-key-enroll" => back("./setup", self.call("human_key_enroll", json!({"pubkey": g("pubkey"), "code": g("code")})), &|_| "Approval key enrolled.".into()),
             "/human-key-rotate" => back("./keys", self.call("human_key_rotate", json!({"pubkey": g("pubkey"), "expiry": i("expiry"), "signature": sig()})),
@@ -607,13 +609,15 @@ impl App {
         let mut b = String::new();
         let human = !self.human_pub().is_empty();
         let ln = self.call("ln_status", json!({})).unwrap_or(json!({}));
-        let ready = ln["ready"] == true;
+        let (ready, connected, why) = self.node_state();
         if !human || !ready {
             b.push_str(&progress(2));
             b.push_str(&format!("<section class=\"card primary\"><h2>Finish setting up</h2><p>{}</p>\
                 <p><a class=\"button-link primary\" href=\"./setup\">Continue setup</a></p></section>",
-                if !human { "Make your approval key and connect your Lightning node. It takes a few minutes, once." }
-                else { "Connect your Lightning node, so the app can pay for services." }));
+                esc(&if !human && connected { "Make your approval key, then sign the safe starter rules. It takes a few minutes, once.".to_string() }
+                     else if !human { "Make your approval key and connect your Lightning node. It takes a few minutes, once.".to_string() }
+                     else if connected { why.clone() }
+                     else { "Connect your Lightning node, so the app can pay for services.".to_string() })));
         }
         let services = self.file_services().unwrap_or_default();
         let sellers = {
@@ -640,7 +644,7 @@ impl App {
         let line = if ready {
             let n = int(ln.get("usable_channels"));
             format!("<span class=\"pill good\">Ready to pay</span> Your Lightning node is connected, with {n} channel{} to pay through.", if n == 1 { "" } else { "s" })
-        } else if ln["configured"] == true {
+        } else if connected {
             "<span class=\"pill warn\">Not ready</span> Your Lightning node is connected but cannot pay yet. <a href=\"./lightning\">See why</a>".into()
         } else {
             "<span class=\"pill warn\">Not connected</span> Connect your Lightning node to pay for services. <a href=\"./lightning\">Connect it</a>".into()
@@ -839,8 +843,9 @@ impl App {
             effect once you sign it with your approval key. Apps and agents cannot change them.</p>");
         let pr = cur["pending_restart"].as_array().cloned().unwrap_or_default();
         if !pr.is_empty() {
-            b.push_str(&format!("<div class=\"flash warn\">Signed but waiting for a signer restart: {}.</div>",
-                                esc(&pr.iter().map(|x| txt(Some(x))).collect::<Vec<_>>().join(", "))));
+            b.push_str(&format!("<div class=\"flash warn\">Signed, and waiting for the app to restart: {}. Restart Lightning Stream from your \
+                                Umbrel or StartOS dashboard.</div>",
+                                esc(&pr.iter().map(|x| setting_name(&txt(Some(x)))).collect::<Vec<_>>().join(", "))));
         }
         let mut p = cur["policy"].clone();
         if template {
@@ -966,19 +971,25 @@ impl App {
             let body = self.policy_form(ctx, &proposed, &cur["effective"], &strs("errors"), &strs("warnings"));
             return self.page("Spending rules", ctx, body);
         }
-        let mut b = String::from("<p>Check the change, then sign it with your approval key. The signer writes exactly the text below.</p>");
+        let mut b = String::from("<p>Check the change, then sign it with your approval key.</p>");
         let diff = prep["diff"].as_array().cloned().unwrap_or_default();
         if diff.is_empty() {
             b.push_str("<p class=\"empty\">No change.</p>");
         } else {
-            b.push_str("<div class=\"scroll\"><table><thead><tr><th>Setting</th><th>Now</th><th>New</th><th></th></tr></thead><tbody>");
+            b.push_str("<ul class=\"changes\">");
+            for d in &diff {
+                let k = txt(d.get("key"));
+                b.push_str(&format!("<li>{}{}</li>", esc(&change_words(&k, d.get("old").filter(|v| !v.is_null()), d.get("new").filter(|v| !v.is_null()))),
+                                    if d["restart"] == true { " <span class=\"tag warn\">after the app restarts</span>" } else { "" }));
+            }
+            b.push_str("</ul><details><summary>Advanced: each setting as the signer names it</summary><div class=\"scroll\"><table><thead><tr><th>Setting</th><th>Now</th><th>New</th><th></th></tr></thead><tbody>");
             for d in &diff {
                 b.push_str(&format!("<tr><td><code>{}</code></td><td><code>{}</code></td><td><code>{}</code></td><td>{}</td></tr>", escv(d.get("key")),
                                     esc(&short(&d.get("old").map(|v| v.to_string()).unwrap_or_else(|| "(none)".into()), 200)),
                                     esc(&short(&d.get("new").map(|v| v.to_string()).unwrap_or_else(|| "(none)".into()), 200)),
                                     if d["restart"] == true { "<span class=\"tag warn\">after restart</span>" } else { "" }));
             }
-            b.push_str("</tbody></table></div>");
+            b.push_str("</tbody></table></div></details>");
         }
         let w = strs("warnings");
         if !w.is_empty() {
@@ -994,7 +1005,7 @@ impl App {
         let text = txt(prep.get("text"));
         let prev = txt(prep.get("prev_sha256"));
         let exp = int(prep.get("expiry"));
-        let visible = format!("<details open><summary>The policy you sign</summary><pre class=\"signed-text\">{}</pre></details>", esc(&text));
+        let visible = format!("<details><summary>Advanced: the exact text you sign</summary><pre class=\"signed-text\">{}</pre></details>", esc(&text));
         b.push_str(&self.signed_form(ctx, "./policy-apply", "policy", &self.human_pub(),
                                      &[("text", text.clone()), ("prev_sha256", prev.clone()), ("expiry", exp.to_string())], &visible,
                                      "Sign and apply", Ext::Bytes(msg::policy(&prev, exp, &text))));
@@ -1110,9 +1121,12 @@ impl App {
             <button type=\"button\" id=\"keygen-import\">Use this key</button></details>\
             <div id=\"keygen-step2\" hidden><p>Your key's backup. It is the only copy: keep it somewhere safe, off this computer \
             (a USB stick in a drawer, or written on paper).</p><pre id=\"keygen-backup\" class=\"hex\"></pre>\
+            <p class=\"hint\">Before the key is saved, keep its backup in one of two ways: download the backup file and tick the box, \
+            or type the backup's last 8 characters.</p>\
             <p><button type=\"button\" id=\"keygen-download\" class=\"secondary\">Download the backup file</button></p>\
-            <label class=\"check\"><input type=\"checkbox\" id=\"keygen-saved\"> I saved the backup somewhere safe</label>\
-            <details><summary>…or confirm by typing its last 8 characters</summary><label>Last 8 characters<input id=\"keygen-confirm\" autocomplete=\"off\"></label></details>\
+            <label class=\"check\"><input type=\"checkbox\" id=\"keygen-saved\" disabled> I saved the downloaded file somewhere safe \
+            <small>(download it first)</small></label>\
+            <label>…or type the backup's last 8 characters<input id=\"keygen-confirm\" autocomplete=\"off\"></label>\
             <label>Passphrase for this browser (at least 12 characters, not only digits or a repeated pattern)\
             <input id=\"keygen-pin\" type=\"password\" autocomplete=\"new-password\" minlength=\"12\"></label>\
             <p id=\"keygen-strength\" class=\"hint\" aria-live=\"polite\">At least 12 characters, not only digits, not a repeated pattern.</p>\
@@ -1324,7 +1338,10 @@ impl App {
         b.push_str(&step(done[3], "Your Lightning node",
             format!("<p>{}</p><p><a href=\"./lightning\">Your node →</a></p>",
                     if done[3] { "Connected and ready to pay.".to_string() }
-                    else { format!("Not ready yet: {}", esc(&txt(ln.get("reason").or(ln.get("config_error"))))) })));
+                    else {
+                        let (_, connected, why) = self.node_state();
+                        esc(&format!("{} {why}", if connected { "Connected, not ready yet." } else { "Not connected yet." }))
+                    })));
         b.push_str(&step(done[4], "A backup",
             format!("<p>The app's keys are {} on this box. {}</p><p><a href=\"./keys\">Download an encrypted backup →</a></p>",
                     if enc { "locked with encryption" } else { "<strong>not</strong> locked with encryption" },
@@ -1374,6 +1391,64 @@ fn query_string(q: &HashMap<String, String>) -> String {
 }
 
 /// An amount as the pages show money: sats, in the money colour.
+/// A rule's name as the owner reads it (the form's label without its unit), or the setting's own
+/// name where the form has no field for it.
+fn setting_name(k: &str) -> String {
+    match INT_KEYS.iter().find(|(key, _, _)| *key == k) {
+        Some((_, label, _)) => label.split(" (").next().unwrap_or(label).trim_end_matches('…').to_string(),
+        None => match k {
+            "ln" => "Paying over Lightning".into(),
+            "tickets" => "Pay-as-you-go tickets".into(),
+            "allowlist" => "Sellers that may be paid".into(),
+            "counterparties" => "Sellers paid through their Lightning node".into(),
+            "anchor_required" => "Refuse to start without the record keeper".into(),
+            "human_pubkey" => "Your approval key".into(),
+            other => format!("The setting {other}"),
+        },
+    }
+}
+
+/// One change of the rules in a sentence, with its unit: what the owner reviews before signing.
+fn change_words(k: &str, old: Option<&Value>, new: Option<&Value>) -> String {
+    let name = setting_name(k);
+    let unit = INT_KEYS.iter().find(|(key, _, _)| *key == k).map(|(_, label, _)| {
+        if label.contains("(sats") { "sats" } else if label.contains("seconds") { "seconds" } else if label.contains("(blocks") { "blocks" } else { "" }
+    });
+    let count = |v: Option<&Value>| v.and_then(|v| v.as_array().map(Vec::len).or(v.as_object().map(|m| m.len()))).unwrap_or(0);
+    let on = |v: Option<&Value>| v.and_then(|v| v.get("enabled")) == Some(&Value::Bool(true));
+    let word = |b: bool| if b { "on" } else { "off" };
+    match (k, unit) {
+        (_, Some(u)) => {
+            let f = |v: Option<&Value>| match v.and_then(Value::as_i64) {
+                Some(n) if u == "sats" => plain_sats(n),
+                Some(n) => format!("{n} {u}").trim_end().to_string(),
+                None => v.map(|v| v.to_string()).unwrap_or_else(|| "not set".into()),
+            };
+            match old {
+                Some(_) => format!("{name}: {} (was {})", f(new), f(old)),
+                None => format!("{name}: {}", f(new)),
+            }
+        }
+        ("ln", _) if old.is_some() && on(old) == on(new) => format!("{name}: {} (its finer settings change: see Advanced)", word(on(new))),
+        ("ln", _) if old.is_some() => format!("{name}: {} (was {})", word(on(new)), word(on(old))),
+        ("ln", _) => format!("{name}: {}", word(on(new))),
+        ("tickets", _) => {
+            let tasks = new.and_then(|v| v.get("tasks")).and_then(Value::as_object).map(|m| {
+                m.iter().map(|(t, v)| format!("{t} up to {}", plain_sats(v.get("budget_sats").and_then(Value::as_i64).unwrap_or(0)))).collect::<Vec<_>>().join(", ")
+            }).unwrap_or_default();
+            format!("{name}: {}{}", word(on(new)), if tasks.is_empty() { String::new() } else { format!("; budgets: {tasks}") })
+        }
+        ("allowlist" | "counterparties", _) => format!("{name}: {} (was {})", count(new), count(old)),
+        ("anchor_required", _) => format!("{name}: {}", if new == Some(&Value::Bool(true)) { "yes" } else { "no" }),
+        _ => format!("{name} changes (see Advanced)"),
+    }
+}
+
+/// Sats in plain text, grouped: "5,000 sats".
+fn plain_sats(n: i64) -> String {
+    format!("{}{} sats", if n < 0 { "-" } else { "" }, crate::html::group3(n.unsigned_abs()))
+}
+
 pub(crate) fn money(n: i64) -> String {
     format!("<span class=\"money\">{}</span>", sats(n))
 }
