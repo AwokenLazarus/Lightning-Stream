@@ -33,6 +33,13 @@
 //! | `XBT_UI_NOSTR_RELAYS` | | Nostr relays to read sellers' signed listings from (`wss://`, comma-separated), for Browse's Nostr page. Unset: no relay is ever asked |
 //! | `XBT_UI_NWC_SOCK` | | the NWC wallet service's admin socket (`xbt-nwc`'s `NWC_ADMIN_SOCK`): the Connected apps page makes, lists and revokes NWC connections there |
 //! | `XBT_UI_CONNECTOR` | `http://127.0.0.1:8480` | the connector the player loads video from (`<connector>/s/<item URL>`). That is also the connector's default listen address, and the UI's own default bind: on one machine set one of the two ports. |
+//! | `XBT_UI_HASHER` | | the hasher service's control page (`http://…`): turns on Sell → Hashrate, renting out this box's miners |
+//! | `XBT_UI_HASHER_SETTINGS` | `$XBT_DATA_DIR/run/hashrate/settings.json` | the settings file the Hashrate page writes and the hasher service reads |
+//! | `XBT_UI_HASHER_SLICES` | | where the shop passes paid slices of work to the hasher service (`http://…`): the shop then sells them under `/hashrate/` |
+//! | `XBT_UI_HASHER_TOKEN_FILE` | | the hasher service's control token (its `--control-token-file`) |
+//! | `XBT_UI_HASHRENT` | | the renter service's control page (`http://…`): turns on Services → Hashrate, renting other people's miners |
+//! | `XBT_UI_HASHRENT_TOKEN_FILE` | | the renter service's control token |
+//! | `XBT_UI_DATUM_GUIDE` | the project's guide | where a renter without a DATUM Gateway is sent to set one up |
 //! | `XBT_UI_RELAY_LINK_S` | `21600` (6 hours) | how long a link for an external player (VLC, mpv) made on the Player page lives (60 s to 7 days) |
 use std::path::PathBuf;
 use std::time::Duration;
@@ -74,6 +81,8 @@ pub struct Config {
     pub nostr_relays: Vec<String>,
     /// `XBT_UI_SUGGESTED_SELLERS`: sellers offered to add in one click.
     pub suggested_sellers: Vec<String>,
+    /// Hashrate: the hasher's and the renter's services, when this box runs them.
+    pub hash: HashSetup,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +115,21 @@ pub struct GatewaySetup {
     pub health_url: Option<String>,
     pub proxies: Vec<String>,
 }
+
+/// Renting out this box's miners (the hasher service) and renting other people's (the renter).
+#[derive(Debug, Clone, Default)]
+pub struct HashSetup {
+    pub hasher: Option<String>,
+    pub settings: PathBuf,
+    pub slices: Option<String>,
+    pub hasher_token: Option<PathBuf>,
+    pub renter: Option<String>,
+    pub renter_token: Option<PathBuf>,
+    pub datum_guide: String,
+}
+
+/// The guide a renter without a DATUM Gateway is sent to.
+pub const DATUM_GUIDE: &str = "https://github.com/AwokenLazarus/Lightning-Stream/blob/main/docs/P2P-HASH-TRY-IT.md#your-datum-gateway";
 
 fn env(k: &str) -> Option<String> {
     std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
@@ -181,6 +205,7 @@ impl Config {
             health_url: env("XBT_UI_GW_HEALTH_URL").filter(|u| u.starts_with("http://")),
             proxies: env("XBT_UI_GW_PROXIES").map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default(),
         };
+        let hash_settings = env("XBT_UI_HASHER_SETTINGS").map(PathBuf::from).unwrap_or_else(|| run_dir("hashrate").join("settings.json"));
         let secure_cookie = match env("XBT_UI_SECURE_COOKIE").as_deref() {
             Some("1") | Some("true") => Some(true),
             Some("0") | Some("false") => Some(false),
@@ -216,6 +241,15 @@ impl Config {
             nostr_relays: nostr_relays(env("XBT_UI_NOSTR_RELAYS").as_deref())?,
             suggested_sellers: env("XBT_UI_SUGGESTED_SELLERS").map(|v| v.split(',').map(|s| s.trim().trim_end_matches('/').to_string())
                 .filter(|s| crate::services::http_origin(s).is_some()).take(10).collect()).unwrap_or_default(),
+            hash: HashSetup {
+                hasher: env("XBT_UI_HASHER").filter(|u| u.starts_with("http://")),
+                settings: hash_settings,
+                slices: env("XBT_UI_HASHER_SLICES").filter(|u| u.starts_with("http://")),
+                hasher_token: env("XBT_UI_HASHER_TOKEN_FILE").map(PathBuf::from),
+                renter: env("XBT_UI_HASHRENT").filter(|u| u.starts_with("http://")),
+                renter_token: env("XBT_UI_HASHRENT_TOKEN_FILE").map(PathBuf::from),
+                datum_guide: env("XBT_UI_DATUM_GUIDE").filter(|u| u.starts_with("https://")).unwrap_or_else(|| DATUM_GUIDE.into()),
+            },
         })
     }
 
@@ -231,6 +265,7 @@ impl Config {
                cmp_status_url: None, mcp_urls: vec![], mcp_token_file: PathBuf::from("/nonexistent/mcp-http-token"), threads: 4, role: Role::Wallet,
                ln: LnSetup::default(), gw: GatewaySetup { state_dir: "/data/gateway".into(), port: 8402, ..Default::default() },
                services_file: None, sell: false, connector: "http://127.0.0.1:8480".into(), relay_ttl: Duration::from_secs(6 * 3600),
-               nwc_sock: None, nostr_relays: vec![], suggested_sellers: vec![] }
+               nwc_sock: None, nostr_relays: vec![], suggested_sellers: vec![],
+               hash: HashSetup { settings: PathBuf::from("/nonexistent/hashrate/settings.json"), datum_guide: DATUM_GUIDE.into(), ..Default::default() } }
     }
 }

@@ -138,10 +138,25 @@ pub const SETTINGS: Section = Section {
             Tab { href: "./signatures", title: "Records", label: "Records" }, Tab { href: "./channels", title: "Old channels", label: "Old channels" }],
     also: &[],
 };
+/// With hashrate (the box runs the hasher's or the renter's service): renting miners is one
+/// more kind of service, beside the others.
+pub const SERVICES_HASH: Section = Section {
+    label: "Services",
+    tabs: &[Tab { href: "./browse", title: "Browse", label: "Browse" }, Tab { href: "./hashrate", title: "Hashrate", label: "Hashrate" },
+            Tab { href: "./services", title: "Sellers", label: "Sellers" }, Tab { href: "./connections", title: "Live connections", label: "Live connections" }],
+    also: &["Service", "Player"],
+};
+pub const SELL_HASH: Section = Section {
+    label: "Sell",
+    tabs: &[Tab { href: "./sell", title: "Sell", label: "Your services" }, Tab { href: "./sell-hashrate", title: "Sell hashrate", label: "Hashrate" }],
+    also: &[],
+};
 /// The app with Sell (`XBT_UI_SELL=1`): buying and selling.
 pub const STREAM_SECTIONS: [&Section; 5] = [&SERVICES, &SELL, &WALLET, &APPS, &SETTINGS];
+pub const STREAM_SECTIONS_HASH: [&Section; 5] = [&SERVICES_HASH, &SELL_HASH, &WALLET, &APPS, &SETTINGS];
 /// The wallet alone: buying.
 pub const WALLET_SECTIONS: [&Section; 4] = [&SERVICES, &WALLET, &APPS, &SETTINGS];
+pub const WALLET_SECTIONS_HASH: [&Section; 4] = [&SERVICES_HASH, &WALLET, &APPS, &SETTINGS];
 pub const GATEWAY_SECTIONS: [&Section; 0] = [];
 pub const STREAM_BRAND: &str = "Lightning Stream";
 pub const WALLET_BRAND: &str = "Lightning Stream";
@@ -161,7 +176,7 @@ pub fn page_head(title: &str, nav: &Nav, flash: Option<(bool, String)>, body: &s
         for sec in nav.sections {
             let here = sec.has(nav.active);
             let cur = if here { " aria-current=\"page\"" } else { "" };
-            let badge = if std::ptr::eq(*sec, &WALLET) {
+            let badge = if std::ptr::eq(*sec, &WALLET) || sec.label == WALLET.label {
                 format!(" <span id=\"pending-badge\" class=\"badge\" title=\"waiting for your approval\"{}>{}</span>", if nav.pending == 0 { " hidden" } else { "" },
                         if nav.pending == 0 { String::new() } else { nav.pending.to_string() })
             } else {

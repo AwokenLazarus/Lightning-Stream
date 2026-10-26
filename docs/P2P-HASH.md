@@ -77,20 +77,64 @@ The plan allowed one per hasher or one per miner. One per miner needs no extrano
 job rewriting and no knowledge of the chain's header: every line passes as it is, and the
 gateway's own accounting per session applies.
 
+## The fallback pool and several renters
+
+The hasher's side keeps serving instead of ending with one rental (`xbt-hashlink hasher --fallback`
+or `--config`, the service the app runs):
+
+- **Every miner is a unit**, named by its worker name (`mining.authorize`); a connection that does
+  not authorize within ten seconds is let go. A miner nobody rents hashes for the hasher's own pool
+  or DATUM Gateway, the **fallback**, so a hasher points each miner at the app once.
+- **A rental takes whole miners.** The buyer's `hello` says how many (0: as many as are free), up
+  to a cap the hasher sets (`--rentable`). Any split works: one miner each to several buyers, or
+  three to one buyer while the fourth stays on the fallback. Each rental has its own link, meter,
+  receipts and tickets, and when one ends, only its miners go back.
+- **Moving a miner**, either way, without a gap longer than one job:
+  - a miner that asked for `mining.set_extranonce` keeps its connection: the app opens the new
+    upstream session itself (the miner's own subscribe and authorize, replayed), hands the miner
+    the new extranonce and sends the new jobs with `clean_jobs`. Shares for the old upstream's
+    jobs still go there during a ten-second drain;
+  - any other miner is sent `client.reconnect` to the app's own address and is placed by its
+    worker name when it comes back.
+- **The listing says what is free** (`capacity`: miners, free miners, free hashrate) and is
+  published again when that changes.
+- **The end of a rental.** Both sides let a channel's meter go at the same point: after the buyer's
+  upstream session for it has ended and its last verdict was sent, the buyer says `shut`, and the
+  hasher lets the channel go there too. This removed the case where the hasher counted one more
+  finished slice than the buyer. The buyer's `close` also says how many slices it counted; only
+  slices both sides counted are billed, and their payments may still arrive until the grace time
+  ends. A buyer with a budget ends the rental as soon as the next slice could not be paid.
+- **The renter's service** (`xbt-hashlink renter`) finds offers on Nostr and runs several rentals
+  at once into the buyer's own DATUM Gateway, each with a budget and a cut switch, paying through
+  the wallet's signer.
+- **Control pages** for the app (`GET /status`, `POST /stop/RENTAL`; `GET /offers`, `POST /rent`,
+  `POST /cut`, `POST /datum`) answer only with the control token (`--control-token-file`).
+
+Tests (`crates/xbt-hashlink/tests/several.rs`, stand-in pools and miners that connect again when
+asked or take a new extranonce, as real firmware does): four miners with three renters taking one
+each; one renter taking three while the fourth stays on the fallback; a renter that stops paying
+losing only its own miner, which goes back to the fallback while the other rental goes on; and no
+gap between accepted shares longer than one job (2 s in the test) when a miner moves, either way.
+
+The app (Umbrel) has a page for each side: Sell → Hashrate (the fallback, the price, how many
+miners to rent out, each miner and each rental, a Stop button) and Services → Hashrate (the offers,
+a budget and a duration, each rental with a Cut button, the buyer's DATUM Gateway). Rentals also
+show on Live connections.
+
 ## What is left
 
 - **Real tickets**: done for the wallet path. Each finished slice is one paid request to the
   hasher's gateway through the wallet's signer (`--signer`, a "hashrate" task budget);
   `scripts/p2p_hash_regtest.sh` runs it with Lightning Fork nodes. The stand-in rails remain for
   the lab.
-- **The meters at the end of a rental**: once in our runs (1 of 3 regtest runs), the hasher counted
-  one more finished slice than the buyer as the miners stopped, and closed the rental for that
-  slice unpaid. The buyer is never charged for work it did not count; the hasher can lose up to
-  one slice. Making both sides settle the last slice the same way is open.
+- **The meters at the end of a rental**: fixed (above). A rental cut mid-slice still leaves the
+  part of a slice done since the last payment unpaid: the hasher's exposure, by design, is under
+  one slice.
 - **Which key signs the link**: today a key of the app's own. Open: the Lightning node key (a
   signing path to the node) or the app key bound to the node key by a signature in the listing.
 - **Listings** on public relays and directories (the signed `hashrate/0` listing on Nostr is
-  built and used by `--find`), reconnect with resume, the Tor
-  transport, several rentals at once, the UI (Sell: hashrate, Buy: hashrate).
+  built and used by `--find` and the renter's service), reconnect with resume, the Tor transport.
+- **Miners behind one address with one worker name** count as one miner per live connection
+  (`name #2`, …); give each miner its own worker name.
 - **Stale and reject thresholds**: rejected shares cost the hasher (no work counted); a rule to
   end a rental on a high reject rate is not yet there.

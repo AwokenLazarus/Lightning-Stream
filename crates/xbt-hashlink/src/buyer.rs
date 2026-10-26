@@ -255,7 +255,8 @@ pub fn run(cfg: Config, rail: Box<dyn BuyerRail>) -> Result<Value, String> {
             let spent = g.released * g.terms.price_msat;
             let why = if cut.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
                 Some("cut by the buyer")
-            } else if g.budget_msat.is_some_and(|b| spent + g.terms.price_msat > b) && g.done.len() as u64 > g.released {
+            } else if g.budget_msat.is_some_and(|b| spent + g.terms.price_msat > b) {
+                // the next piece could not be paid: end before the hasher does it
                 Some("budget used up")
             } else if g.last_work.elapsed() > idle {
                 Some("no accepted work")

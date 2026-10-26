@@ -153,6 +153,26 @@ target/release/xbt-hashlink keygen buyer.key      # the buyer's link key
      wallet signer, under the task's budget and the policy's caps.
    - `--stop-paying-after N` stops paying after N slices, to see the hasher stop.
 
+## Your DATUM Gateway
+
+Rented hashrate goes to the buyer's own DATUM Gateway: it builds the block templates, and the pool
+that pays you is chosen in its own settings, not in Lightning Stream. If you do not run one yet,
+set one up first: a DATUM Gateway built for this chain's BLAKE2b work, pointed at a pool that takes
+DATUM work. For example Lazarus Pool: its site, lazarus-xbt.xyz, says which gateway to run and the
+pool address to put in its settings. Do not point rentals at a
+pool's public stratum port in place of a DATUM Gateway: you would be paying for work credited to
+whoever that port pays.
+
+Then give the buyer side its address: `--upstream host:port` on the command line, or the "Your
+DATUM Gateway" box on the app's Hashrate page.
+
+## Renting out several miners, with a fallback
+
+With `--fallback host:port` (or a settings file, `--config`), the hasher keeps serving: every miner
+nobody rents hashes there, buyers rent whole miners (`--miners N` on the buyer), and when a rental
+ends its miners go back to the fallback by themselves. `--rentable N` caps how many miners are
+rented out at once. See [P2P-HASH.md](P2P-HASH.md#the-fallback-pool-and-several-renters).
+
 ## What each side sees, and stopping
 
 - `buyer.json` and `hasher.json`: accepted and rejected shares, the work counted, each slice and
@@ -165,7 +185,7 @@ target/release/xbt-hashlink keygen buyer.key      # the buyer's link key
 
 - **Prepaid credit on short rentals.** A ticket is at least 546 sats. A rental shorter than a
   ticket's worth of slices leaves the rest as prepaid credit with the hasher.
-- **Command line only.** There are no app screens yet.
+- **App screens are in the Umbrel app only, and not released yet.** Elsewhere it is command line.
 - **Tested narrowly.** Two machines on one LAN, a private relay, one miner.
 - **One key question is open:** the link is signed with an app key bound to the listing, not
   with the Lightning node key itself.

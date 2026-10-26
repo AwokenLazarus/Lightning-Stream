@@ -84,6 +84,10 @@ pub const RUN_UI: &str = "ui";
 pub const RUN_LN: &str = "ln";
 /// The gateway's config and macaroons, written by the UI's gateway page, read by the gateway.
 pub const RUN_GATEWAY: &str = "gateway";
+/// Renting miners out and in (p2p-hash): the hasher's and the renter's keys and state.
+pub const HASHRATE: &str = "hashrate";
+/// Their settings, written by the UI's Hashrate page, and their control token.
+pub const RUN_HASHRATE: &str = "hashrate";
 /// The MCP bearer token's name, in `run/ui/` on a box (AGP-042) or `mcp/secrets/` without a UI.
 pub const MCP_TOKEN: &str = "mcp-http-token";
 

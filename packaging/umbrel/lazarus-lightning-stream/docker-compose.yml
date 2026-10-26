@@ -10,6 +10,17 @@
 # only those. The signer is the only service that can spend. No admin macaroon is mounted: of the
 # Lightning node's data, only tls.cert.
 #
+# Hashrate: two services of the xbt-hashlink image, as xbt-hashrate. The hasher takes this box's
+# miners on host port 23340 (LAN) and renters' apps on 23341, which needs a port forward or a tunnel
+# to be reached from outside. Until the owner turns renting on (Sell → Hashrate, which writes
+# run/hashrate/settings.json), it publishes nothing and lets miners that connect go. A miner nobody
+# rents hashes for the owner's own pool. Renters pay each piece of work through this app's gateway,
+# under /hashrate/; the gateway passes it to the hasher on 23344, which is not published. The renter
+# rents other people's miners into the owner's own DATUM Gateway and pays through the signer, as the
+# "hashrate" task of the spending rules. It is in the signer's group for the socket. Both control
+# pages (23342, 23343) are reached by the UI only, with the token init makes in run/hashrate/. The
+# image has no published digest yet: it is the local tag scripts/oci_build.sh --load gives.
+#
 # Stream sockets live in run/signer/streams (B2_STREAM_DIR for the signer and the connector). The
 # connector runs as the signer's user, because the published signer image cannot gain a group until
 # it is rebuilt. It mounts that directory read-write and the rest of run/signer read-only, and it
@@ -64,7 +75,7 @@ services:
     security_opt:
       - no-new-privileges:true
     environment:
-      XBT_INIT_COMPONENTS: signer,witness,mcp,ui,gateway
+      XBT_INIT_COMPONENTS: signer,witness,mcp,ui,gateway,hashrate
       XBT_INIT_NODE_RPC_USER: ${APP_BITCOIN_RPC_USER:-${APP_XBT_KNOTS_RPC_USER}}
       XBT_INIT_NODE_RPC_PASS: ${APP_BITCOIN_RPC_PASS:-${APP_XBT_KNOTS_RPC_PASS}}
       XBT_INIT_UI_PASSWORD: ${APP_PASSWORD}
@@ -145,6 +156,13 @@ services:
       XBT_UI_SUGGESTED_SELLERS: https://media.lazarus-xbt.xyz
       # Nostr relays the Services page reads sellers' signed listings from (opt-in Nostr page)
       XBT_UI_NOSTR_RELAYS: wss://relay.damus.io,wss://nos.lol
+      # Hashrate: renting this box's miners out (Sell) and other people's in (Services)
+      XBT_UI_HASHER: http://lazarus-lightning-stream_hasher_1:23342
+      XBT_UI_HASHER_SETTINGS: /data/run/hashrate/settings.json
+      XBT_UI_HASHER_SLICES: http://lazarus-lightning-stream_hasher_1:23344
+      XBT_UI_HASHER_TOKEN_FILE: /data/run/hashrate/control-token
+      XBT_UI_HASHRENT: http://lazarus-lightning-stream_renter_1:23343
+      XBT_UI_HASHRENT_TOKEN_FILE: /data/run/hashrate/control-token
     volumes:
       - ${APP_DATA_DIR}/data/ui:/data/ui
       - ${APP_DATA_DIR}/data/run/signer:/data/run/signer:ro
@@ -154,6 +172,8 @@ services:
       - ${APP_DATA_DIR}/data/run/ln:/data/run/ln
       # the Sell page writes the gateway's config and macaroons here
       - ${APP_DATA_DIR}/data/run/gateway:/data/run/gateway
+      # the Hashrate page writes the hasher's settings here; the control token is here too
+      - ${APP_DATA_DIR}/data/run/hashrate:/data/run/hashrate
       - *lightning-cert
 
   connector:
@@ -192,3 +212,42 @@ services:
       - ${APP_DATA_DIR}/data/run/gateway:/data/run/gateway:ro
       - *lightning-cert
 
+  hasher:
+    <<: *service
+    image: xbt-hashlink:0.1.0
+    stop_grace_period: 15s
+    command: ["hasher", "--key", "/data/hashrate/link.key", "--nostr-key", "/data/hashrate/nostr.key",
+              "--miners", "0.0.0.0:23340", "--link", "0.0.0.0:23341", "--slices", "0.0.0.0:23344",
+              "--control", "0.0.0.0:23342", "--control-token-file", "/data/run/hashrate/control-token",
+              "--config", "/data/run/hashrate/settings.json", "--relays", "wss://relay.damus.io,wss://nos.lol",
+              "--gateway", "http://lazarus-lightning-stream_gateway_1:8402",
+              "--miners-public", "${DEVICE_DOMAIN_NAME}:23340", "--link-public", "${DEVICE_DOMAIN_NAME}:23341",
+              "--report", "/data/hashrate/hasher.json"]
+    ports:
+      # this box's miners, on the LAN
+      - "23340:23340"
+      # renters' apps: reached from outside only with a port forward or a tunnel
+      - "23341:23341"
+    volumes:
+      - ${APP_DATA_DIR}/data/hashrate:/data/hashrate
+      - ${APP_DATA_DIR}/data/run/hashrate:/data/run/hashrate:ro
+
+  renter:
+    <<: *service
+    image: xbt-hashlink:0.1.0
+    stop_grace_period: 15s
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      signer:
+        condition: service_started
+    command: ["renter", "--key", "/data/hashrate/renter.key", "--control", "0.0.0.0:23343",
+              "--control-token-file", "/data/run/hashrate/control-token", "--state", "/data/hashrate",
+              "--upstream", "auto", "--datum-candidates", "datum_web_1:23334,datum-gateway_web_1:23334",
+              "--user", "rented", "--relays", "wss://relay.damus.io,wss://nos.lol",
+              "--signer", "/data/run/signer/signer.sock", "--task", "hashrate"]
+    volumes:
+      - ${APP_DATA_DIR}/data/hashrate:/data/hashrate
+      - ${APP_DATA_DIR}/data/run/hashrate:/data/run/hashrate:ro
+      # the signer's socket, read-only: the renter pays each piece of work through it
+      - ${APP_DATA_DIR}/data/run/signer:/data/run/signer:ro

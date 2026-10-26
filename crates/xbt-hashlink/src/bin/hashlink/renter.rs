@@ -60,7 +60,7 @@ pub fn run(f: &HashMap<String, String>) -> Result<(), String> {
         datum = f.get("datum-candidates").map(|c| super::relays(c)).unwrap_or_default().into_iter().find(|a| reachable(a)).unwrap_or_default();
     }
     let r = Arc::new(Mutex::new(R {
-        key: super::read_key(super::need(f, "key")?)?,
+        key: crate::service::key_file(super::need(f, "key")?)?,
         datum,
         user: f.get("user").cloned().unwrap_or_else(|| "rented".into()),
         relays: f.get("relays").map(|r| super::relays(r)).unwrap_or_default(),
@@ -73,7 +73,8 @@ pub fn run(f: &HashMap<String, String>) -> Result<(), String> {
     }));
     let candidates = f.get("datum-candidates").map(|c| super::relays(c)).unwrap_or_default();
     let addr = super::need(f, "control")?.to_string();
-    http::serve(&addr, Arc::new(move |method, path, body| handle(&r, &candidates, method, path, body)))?;
+    let token = f.get("control-token-file").map(|p| http::token(p)).transpose()?;
+    http::serve(&addr, token, Arc::new(move |method, path, body| handle(&r, &candidates, method, path, body)))?;
     eprintln!("renter: control page on {addr}");
     loop {
         std::thread::sleep(Duration::from_secs(3600));

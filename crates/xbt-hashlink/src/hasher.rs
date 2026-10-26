@@ -64,8 +64,8 @@ const PING_EVERY: Duration = Duration::from_secs(15);
 const QUIET_LIMIT: Duration = Duration::from_secs(60);
 const RATE_WINDOW: Duration = Duration::from_secs(60);
 const LOCK_WAIT: Duration = Duration::from_secs(10);
-/// How long a miner's connection waits for its worker name before it is placed by address.
-const AUTHORIZE_WAIT: Duration = Duration::from_secs(5);
+/// How long a new connection may take to authorize (name its worker) before it is let go.
+const AUTHORIZE_WAIT: Duration = Duration::from_secs(10);
 /// An old upstream session is kept this long after a switch, for shares of its jobs.
 const DRAIN: Duration = Duration::from_secs(10);
 /// After `client.reconnect`, the miner's connection is closed this long later if still open.
@@ -1130,7 +1130,13 @@ fn place(hub: &Shared, id: u64) {
         {
             let mut g = lock(hub);
             let Some(c) = g.conns.get(&id) else { return };
-            if c.authorize.is_some() || t0.elapsed() > AUTHORIZE_WAIT {
+            if c.authorize.is_none() && t0.elapsed() > AUTHORIZE_WAIT {
+                // a miner names itself before it is given work: anything else is let go
+                let _ = c.w.shutdown(std::net::Shutdown::Both);
+                gone(&mut g, id);
+                return;
+            }
+            if c.authorize.is_some() {
                 let worker = c.authorize.as_ref().and_then(sv1::authorize_user).unwrap_or_else(|| c.peer.clone());
                 let peer = c.peer.clone();
                 // two live connections under one worker name are two miners
@@ -1397,12 +1403,17 @@ fn slice_request(hub: &Mutex<Hub>, method: &str, path: &str, body: &[u8]) -> (u1
 
 /// A request line, headers and body (by Content-Length, or chunked).
 pub fn read_request(conn: &mut TcpStream) -> Option<(String, String, Vec<u8>)> {
+    read_request_auth(conn).map(|(m, p, b, _)| (m, p, b))
+}
+
+/// As [`read_request`], with the `Authorization` header.
+pub fn read_request_auth(conn: &mut TcpStream) -> Option<(String, String, Vec<u8>, String)> {
     let mut r = BufReader::new(conn.try_clone().ok()?);
     let mut line = String::new();
     r.read_line(&mut line).ok()?;
     let mut it = line.split_whitespace();
     let (method, path) = (it.next()?.to_string(), it.next()?.to_string());
-    let (mut len, mut chunked) = (0usize, false);
+    let (mut len, mut chunked, mut auth) = (0usize, false, String::new());
     loop {
         let mut h = String::new();
         r.read_line(&mut h).ok()?;
@@ -1414,6 +1425,7 @@ pub fn read_request(conn: &mut TcpStream) -> Option<(String, String, Vec<u8>)> {
         match k.trim().to_ascii_lowercase().as_str() {
             "content-length" => len = v.trim().parse().ok()?,
             "transfer-encoding" => chunked = v.trim().eq_ignore_ascii_case("chunked"),
+            "authorization" => auth = v.trim().to_string(),
             _ => {}
         }
     }
@@ -1439,5 +1451,5 @@ pub fn read_request(conn: &mut TcpStream) -> Option<(String, String, Vec<u8>)> {
     } else {
         return None;
     }
-    Some((method, path, body))
+    Some((method, path, body, auth))
 }

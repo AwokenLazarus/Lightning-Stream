@@ -7,11 +7,12 @@
 //!                     [--slices ADDR]              paid slices come from the hasher's gateway (else: the lab's rail)
 //!                     [--relays URL,URL --nostr-key F --name N --link-public ADDR --pay-url URL --pay-node HEX
 //!                      --hashrate-hs N [--listing-out F]]    publish the hashrate listing first
-//!                     [--fallback ADDR [--rentable N] [--control ADDR] [--config F]]
+//!                     [--fallback ADDR [--rentable N] [--control ADDR [--control-token-file F]] [--config F]
+//!                      [--gateway URL] [--miners-public ADDR]]
 //!                         keep serving: miners not rented hash at the fallback, any number of rentals,
 //!                         a control page for the app (GET /status, POST /stop/RENTAL), settings read
 //!                         from F as they change; without --fallback and --config: one rental, then exit
-//! xbt-hashlink renter --key F --control ADDR --upstream ADDR --user U --relays URL,URL
+//! xbt-hashlink renter --key F --control ADDR [--control-token-file F] --upstream ADDR|auto --user U --relays URL,URL
 //!                     [--signer SOCK --task T] [--expect-node HEX] [--datum-candidates ADDR,ADDR] [--state DIR]
 //!                         rent from the app: GET /status, GET /offers, POST /rent, POST /cut, POST /datum
 //! xbt-hashlink buyer  --key F --upstream ADDR --user U [--idle-s S] [--duration-s S] [--stop-paying-after N]
@@ -156,10 +157,11 @@ fn run(args: &[String]) -> Result<(), String> {
 }
 
 fn hasher_cmd(f: &HashMap<String, String>) -> Result<(), String> {
-    let key = read_key(need(f, "key")?)?;
     if f.contains_key("fallback") || f.contains_key("config") {
+        let key = service::key_file(need(f, "key")?)?;
         return service::run(f, key);
     }
+    let key = read_key(need(f, "key")?)?;
     let t = terms(f)?;
     if let Some(r) = f.get("relays") {
         let h = listing_of(f, &key, &t, Capacity::default())?;
@@ -258,7 +260,7 @@ fn buyer_cmd(f: &HashMap<String, String>) -> Result<(), String> {
     Ok(())
 }
 
-fn write_secret(path: &str, s: &str) -> Result<(), String> {
+pub(crate) fn write_secret(path: &str, s: &str) -> Result<(), String> {
     use std::io::Write;
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
