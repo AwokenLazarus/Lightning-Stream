@@ -1877,7 +1877,10 @@ impl Signer {
                    "balance_msat": hs.balance().to_string(), "credited_msat": hs.credited().to_string(), "tickets": self.ticket_session_counts(&hs.sid)})
         };
         let fail = |hs: &HttpSession, spent: &Spent, d: Value| with(d, about(hs, spent));
-        let Some(reserve) = price.reserve() else { return fail(hs, &spent, refusal("ticket_terms", "the route's price does not fit an amount")) };
+        // by the token, the most the request can cost is wanted in the balance before it is served
+        let Some(reserve) = price.reserve_for(c.body) else {
+            return fail(hs, &spent, refusal("ticket_terms", "the route's price does not fit an amount, or the request is not one the route takes (by the token: a JSON object)"))
+        };
         if reserve > max_msat {
             return fail(hs, &spent, deny("max_sats", format!("quoted {} sats > max_sats {}", sats_ceil(reserve), c.max_sats)));
         }
@@ -2004,7 +2007,9 @@ impl Signer {
             out = with(out, json!({"complete": complete, "ended": ended}));
             (head.charged, note)
         } else {
-            let (m, note, last) = self.ticket_stream(hs, price, &head, seq, &digest, ans, started, max_msat, &mut sink, &mut spent, not_read);
+            let tokens = Some(c.body).filter(|b| price.tokens.active() && !b.is_empty())
+                .and_then(|b| xbt402::tokens::prepare(b, price.tokens.max_output).ok().map(|p| (b.len() as u64, p.max_output)));
+            let (m, note, last) = self.ticket_stream(hs, price, &head, seq, &digest, ans, started, max_msat, &mut sink, &mut spent, not_read, tokens);
             seller_last = last;
             out = with(out, m);
             let price_msat = out.get("price_msat").and_then(|v| crate::ticket::outside_u64(Some(v))).unwrap_or(0);
@@ -2032,7 +2037,11 @@ impl Signer {
     /// stopped at its head, for that reason.
     #[allow(clippy::too_many_arguments)]
     fn ticket_stream(&self, hs: &Arc<HttpSession>, price: &Price, head: &Receipt, seq: u64, digest: &str, ans: WireAnswer, started: Instant, max_msat: u64,
-                     sink: &mut Sink, spent: &mut Spent, stop: Option<String>) -> (Value, Value, Value) {
+                     sink: &mut Sink, spent: &mut Spent, stop: Option<String>, tokens: Option<(u64, u64)>) -> (Value, Value, Value) {
+        // by the token: the answer counted here as the seller counts it, to check its last receipt
+        let event_stream = ans.header("content-type").is_some_and(|v| v.to_ascii_lowercase().starts_with("text/event-stream"));
+        let mut sse = xbt402::tokens::Sse::default();
+        let (mut counted, mut usage, mut whole_body) = (0u64, xbt402::tokens::Usage::default(), Vec::new());
         let base_spent = lock(&hs.money).acct.spent_msat.saturating_sub(head.charged);
         let st = Stream { price: *price, base_spent, started, max_msat, max_open: Duration::from_secs(self.ticket_policy().max_answer_s.clamp(1, 86_400) as u64) };
         let length = ans.length;
@@ -2095,6 +2104,18 @@ impl Signer {
                     }
                 };
                 sink.put(&buf[..n]);
+                if let Some((_, max_output)) = tokens {
+                    if event_stream {
+                        for ev in sse.feed(&buf[..n]).unwrap_or_default() {
+                            counted = counted.saturating_add(ev.tokens).min(max_output);
+                            if let Some(u) = ev.usage {
+                                usage = u;
+                            }
+                        }
+                    } else if whole_body.len() < xbt402::tokens::MAX_WHOLE {
+                        whole_body.extend_from_slice(&buf[..n]);
+                    }
+                }
                 if sink.gone {
                     lock(&state).1.get_or_insert(READER_GONE.into());
                     break;
@@ -2138,7 +2159,17 @@ impl Signer {
             _ => None,
         };
         let secs = if price.second_msat > 0 { started.elapsed().as_secs().saturating_add(2) } else { 0 };
-        let own_cost = price.cost(sink.bytes, secs).unwrap_or(u64::MAX);
+        let own_cost = match tokens {
+            None => price.cost(sink.bytes, secs).unwrap_or(u64::MAX),
+            Some((body_len, max_output)) => {
+                if !event_stream {
+                    let (guess, u) = xbt402::tokens::whole(&whole_body);
+                    (counted, usage) = (guess.min(max_output), u);
+                }
+                let t = xbt402::tokens::settle(body_len, max_output, counted, usage);
+                price.tokens.cost(t).and_then(|c| c.checked_add(price.request_msat)).unwrap_or(u64::MAX)
+            }
+        };
         let own_digest = hex::encode(sink.hash.clone().finalize());
         // the last receipt of this answer, from the seller's signed status
         let deadline = Instant::now() + FINAL_WAIT;
@@ -2425,7 +2456,7 @@ mod tests {
 
     #[test]
     fn a_ticket_is_due_only_when_the_balance_does_not_cover_the_next_piece() {
-        let per_mib = Price { request_msat: 2500, byte_msat: 200_000, per_bytes: 1 << 20, second_msat: 0 };
+        let per_mib = Price { request_msat: 2500, byte_msat: 200_000, per_bytes: 1 << 20, second_msat: 0, tokens: xbt402::tokens::TokenRule::NONE };
         let st = Stream { price: per_mib, base_spent: 10_000, started: Instant::now(), max_msat: u64::MAX, max_open: Duration::from_secs(50) };
         // one ticket of 1,000 sat credited on top of the 10 sat spent before: 1,000,000 - 2,500 msat of bytes
         let credited = 1_010_000;
@@ -2445,18 +2476,18 @@ mod tests {
         assert!(!st.due_time(credited), "not priced by time");
         assert_eq!(st.cost(1 << 20), 202_500);
         // by the second: due when the next second is not covered
-        let per_s = Price { request_msat: 0, byte_msat: 0, per_bytes: 1, second_msat: 100_000 };
+        let per_s = Price { request_msat: 0, byte_msat: 0, per_bytes: 1, second_msat: 100_000, tokens: xbt402::tokens::TokenRule::NONE };
         let st = Stream { price: per_s, base_spent: 0, started: Instant::now(), max_msat: u64::MAX, max_open: Duration::from_secs(50) };
         assert_eq!(st.seconds(), 1, "the first second has started");
         assert!(st.due_time(100_000), "one second paid, the second is not");
         assert!(!st.due_time(200_000) && !st.due_bytes(100_000, 1 << 30, None));
         // a price that does not fit is due at once and costs the most there is
-        let huge = Stream { price: Price { request_msat: u64::MAX, byte_msat: 1, per_bytes: 1, second_msat: 0 }, base_spent: 0, started: Instant::now(), max_msat: 5, max_open: Duration::from_secs(50) };
+        let huge = Stream { price: Price { request_msat: u64::MAX, byte_msat: 1, per_bytes: 1, second_msat: 0, tokens: xbt402::tokens::TokenRule::NONE }, base_spent: 0, started: Instant::now(), max_msat: 5, max_open: Duration::from_secs(50) };
         assert_eq!(huge.cost(1), u64::MAX);
         assert!(huge.due_bytes(1_000_000, 0, None));
         assert!(huge.over(0).is_some_and(|w| w.starts_with("max_sats")), "and is over any limit");
         // a long body paid for at its head is not cut where the call's limit equals its price
-        let flat = Stream { price: Price { request_msat: 5_000, byte_msat: 0, per_bytes: 1, second_msat: 0 }, base_spent: 0, started: Instant::now(), max_msat: 5_000,
+        let flat = Stream { price: Price { request_msat: 5_000, byte_msat: 0, per_bytes: 1, second_msat: 0, tokens: xbt402::tokens::TokenRule::NONE }, base_spent: 0, started: Instant::now(), max_msat: 5_000,
                             max_open: Duration::from_secs(50) };
         assert!(flat.over(1 << 30).is_none());
         let long = Stream { price: per_mib, base_spent: 0, started: Instant::now() - Duration::from_secs(3), max_msat: u64::MAX, max_open: Duration::from_secs(2) };

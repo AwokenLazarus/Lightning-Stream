@@ -135,6 +135,25 @@ impl Handler for Service {
             // n bytes, 1 KiB every 100 ms, with no length stated
             return stream(n, None, body(n, 1 << 10, Duration::from_millis(100)));
         }
+        if path.starts_with("/v1/") && req.method == "POST" {
+            // a stand-in model: `x_n` tokens of output (at most max_tokens), 7 of input, streamed when asked
+            let v: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+            let n = v["x_n"].as_u64().unwrap_or(10).min(v["max_tokens"].as_u64().unwrap_or(u64::MAX));
+            if v["stream"] != true {
+                let body = json!({"choices": [{"message": {"content": "abcd".repeat(n as usize)}}], "usage": {"prompt_tokens": 7, "completion_tokens": n}});
+                return Reply::Whole(Response::text(200, "application/json", body.to_string()));
+            }
+            let usage = v["stream_options"]["include_usage"] == true;
+            return Reply::Stream(Streamed { status: 200, headers: vec![("Content-Type".into(), "text/event-stream".into())], length: None, body: Box::new(move |out| {
+                for _ in 0..n {
+                    out.send(format!("data: {}\n\n", json!({"choices": [{"delta": {"content": "tok"}}]})).as_bytes())?;
+                }
+                if usage {
+                    out.send(format!("data: {}\n\n", json!({"choices": [], "usage": {"prompt_tokens": 7, "completion_tokens": n}})).as_bytes())?;
+                }
+                out.send(b"data: [DONE]\n\n")
+            }) });
+        }
         Reply::Whole(match path.as_str() {
             "/api" => Response::text(200, "application/json", json!({"method": req.method, "body": String::from_utf8_lossy(&req.body)}).to_string()),
             "/broken" => Response::text(500, "text/plain", "the service failed"),
@@ -157,7 +176,9 @@ fn routes() -> Value {
         {"path": "/hot/", "price": {"byte_msat": 16_000, "per_bytes": 65_536}},
         {"path": "/tiny/", "price": {"request_msat": 500}},
         {"path": "/tick/", "price": {"second_msat": 1000}},
-        {"path": "/free/", "free": true}
+        {"path": "/free/", "free": true},
+        // a model: 4 sat per 1,000 tokens in, 20 sat per 1,000 tokens out, at most 500 tokens a reply
+        {"path": "/v1/", "methods": ["GET", "POST"], "price": {"per_1k_input_msat": 4000, "per_1k_output_msat": 20_000}, "max_output_tokens": 500, "max_body": 65536}
     ])
 }
 
@@ -1308,6 +1329,29 @@ fn an_answer_priced_by_the_second_is_paid_by_the_clock() {
     assert_eq!(r.shop.settled(), 2);
 }
 
+#[test]
+fn a_model_priced_by_the_token_is_paid_for_its_tokens_and_its_receipt_checked() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    let call = |body: Value, max_sats: i64| r.call("xbt402_pay", json!({"url": r.shop.url("/v1/chat/completions"), "method": "POST", "body": body.to_string(),
+                                                                          "max_sats": max_sats, "task": "film"}));
+    // streamed: 7 tokens in (28 msat), 40 out (800 msat)
+    let v = call(json!({"messages": [{"role": "user", "content": "hello"}], "stream": true, "x_n": 40}), 20);
+    assert_eq!((v["verdict"].as_str(), v["status"].as_u64(), v["price_msat"].as_str()), (Some("allow"), Some(200), Some("828")), "{v}");
+    assert_eq!(v["receipt"]["body"], "as signed", "{v}");
+    assert!(v.get("seller_fault").is_none(), "{v}");
+    // whole: 7 in, 12 out
+    let v = call(json!({"messages": [{"role": "user", "content": "hello"}], "x_n": 12, "max_tokens": 50}), 20);
+    assert_eq!((v["status"].as_u64(), v["price_msat"].as_str()), (Some(200), Some("268")), "{v}");
+    assert!(v.get("seller_fault").is_none(), "{v}");
+    // the call's max_sats must cover the most the reply can cost (500 tokens out: 10 sat), before anything is sent
+    let v = call(json!({"messages": [], "x_n": 3}), 5);
+    assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("max_sats")), "{v}");
+    // a smaller max_tokens is a smaller bound
+    let v = call(json!({"messages": [], "x_n": 3, "max_tokens": 100}), 5);
+    assert_eq!((v["status"].as_u64(), v["verdict"].as_str()), (Some(200), Some("allow")), "{v}");
+}
+
 // --- the owner's policy through the HTTP path -------------------------------------------------------
 
 /// A task that pays any seller is what an agent has when it is told to go and find sellers: a URL
@@ -2313,8 +2357,8 @@ fn the_wallet_and_the_gateway_price_every_body_alike() {
         let pick = |v: u64, small: u64| if wide { v } else { v % small };
         let (request, byte, per, second) = (pick(next(), 10_000), pick(next(), 1_000_000), pick(next(), 1 << 22).max(1), pick(next(), 1_000_000));
         let (bytes, secs, msat) = (pick(next(), 1 << 30), pick(next(), 100_000), pick(next(), 1 << 40));
-        let theirs = xbt_gateway::price::Price { request_msat: request, byte_msat: byte, per_bytes: per, second_msat: second };
-        let mine = Mine { request_msat: request, byte_msat: byte, per_bytes: per, second_msat: second };
+        let theirs = xbt_gateway::price::Price { request_msat: request, byte_msat: byte, per_bytes: per, second_msat: second, tokens: xbt402::tokens::TokenRule::NONE };
+        let mine = Mine { request_msat: request, byte_msat: byte, per_bytes: per, second_msat: second, tokens: xbt402::tokens::TokenRule::NONE };
         assert_eq!(mine.for_bytes(bytes), theirs.for_bytes(bytes), "{mine:?} {bytes}");
         assert_eq!(mine.for_seconds(secs), theirs.for_seconds(secs), "{mine:?} {secs}");
         assert_eq!(mine.bytes_for(msat), theirs.bytes_for(msat), "{mine:?} {msat}");
