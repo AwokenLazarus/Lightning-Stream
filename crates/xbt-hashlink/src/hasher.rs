@@ -11,7 +11,7 @@ use crate::{now_ms, sv1};
 use secp256k1::{PublicKey, SecretKey};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -26,6 +26,10 @@ pub struct Config {
     pub terms: Terms,
     /// A JSON report, rewritten every second and at the end.
     pub report: Option<PathBuf>,
+    /// Where the hasher's gateway passes on paid slices (`POST <route>/<rental>/<slice>`). With
+    /// it, slices are paid through the gateway's tickets; without it, over the link (the lab's
+    /// stand-in rail), and a slice is served only once its ticket is locked.
+    pub slices: Option<String>,
 }
 
 const PING_EVERY: Duration = Duration::from_secs(15);
@@ -47,6 +51,8 @@ struct St {
     disagree: u64,
     due_since: Option<Instant>,
     lock_missing_since: Option<Instant>,
+    /// Slices are paid over the link, on tickets locked over the link.
+    over_link: bool,
     stopped: Option<Value>,
     miners: HashMap<u32, TcpStream>,
     next_chan: u32,
@@ -124,6 +130,10 @@ fn write_report(path: &Option<PathBuf>, v: &Value) {
 pub fn run(cfg: Config, rail: Box<dyn SellerRail>) -> Result<Value, String> {
     let link_l = TcpListener::bind(&cfg.link).map_err(|e| format!("link listen {}: {e}", cfg.link))?;
     let miners_l = TcpListener::bind(&cfg.miners).map_err(|e| format!("miner listen {}: {e}", cfg.miners))?;
+    let slices_l = match &cfg.slices {
+        Some(a) => Some(TcpListener::bind(a).map_err(|e| format!("slice listen {a}: {e}"))?),
+        None => None,
+    };
     eprintln!(
         "hasher: link {} (key {}), miners {}",
         cfg.link,
@@ -160,6 +170,7 @@ pub fn run(cfg: Config, rail: Box<dyn SellerRail>) -> Result<Value, String> {
         disagree: 0,
         due_since: None,
         lock_missing_since: None,
+        over_link: cfg.slices.is_none(),
         stopped: None,
         miners: HashMap::new(),
         next_chan: 1,
@@ -169,6 +180,11 @@ pub fn run(cfg: Config, rail: Box<dyn SellerRail>) -> Result<Value, String> {
         methods: BTreeMap::new(),
         rail,
     }));
+
+    if let Some(l) = slices_l {
+        let st = st.clone();
+        std::thread::spawn(move || serve_slices(l, st));
+    }
 
     // miners
     {
@@ -298,6 +314,7 @@ pub fn run(cfg: Config, rail: Box<dyn SellerRail>) -> Result<Value, String> {
     Ok(r)
 }
 
+/// A slice paid over the link (the lab's rail): the preimage of the ticket locked for it.
 fn pay(g: &mut St, slice: u64, preimage: &str, receipt: &Value) -> Result<(), String> {
     if slice != g.paid + 1 {
         return Err(format!("expected slice {}", g.paid + 1));
@@ -306,23 +323,142 @@ fn pay(g: &mut St, slice: u64, preimage: &str, receipt: &Value) -> Result<(), St
     if g.locks.get(&slice) != Some(&sha256(&p)) {
         return Err("preimage does not match the locked ticket".into());
     }
+    check_receipt(g, slice, receipt)?;
+    g.rail.settle(slice, &p)?;
+    g.locks.remove(&slice);
+    credit(g, slice, receipt);
+    g.lock_missing_since = (!g.locks.contains_key(&(g.paid + 1))).then(Instant::now);
+    Ok(())
+}
+
+fn check_receipt(g: &mut St, slice: u64, receipt: &Value) -> Result<(), String> {
+    if slice != g.paid + 1 {
+        return Err(format!("expected slice {}", g.paid + 1));
+    }
     let r = Receipt::verify(receipt, &g.buyer).ok_or("bad receipt signature")?;
     if r.rental != g.rental || r.slice != slice {
         return Err("receipt for another rental or slice".into());
     }
+    if g.done.len() < slice as usize {
+        return Err(format!("slice {slice} is not done by this side's count"));
+    }
+    Ok(())
+}
+
+fn credit(g: &mut St, slice: u64, receipt: &Value) {
     let own = g.done.get(slice as usize - 1).map(|(w, _)| *w);
-    if own == Some(r.work) {
+    if own.map(|w| w.to_string()).as_deref() == receipt.get("work").and_then(Value::as_str) {
         g.agree += 1;
     } else {
         g.disagree += 1;
     }
-    g.rail.settle(slice, &p)?;
-    g.locks.remove(&slice);
     g.receipts.push(receipt.clone());
     g.paid = slice;
     g.due_since = (g.completed() > g.paid).then(Instant::now);
-    g.lock_missing_since = (!g.locks.contains_key(&(g.paid + 1))).then(Instant::now);
-    Ok(())
+}
+
+/// The hasher's paid-slice endpoint, behind its gateway: the gateway passes on only a request it
+/// has been paid for, and charges it only when this answers below 400. So a slice is credited
+/// here exactly when its price was taken: the body is the buyer's signed work receipt for it.
+fn serve_slices(l: TcpListener, st: Arc<Mutex<St>>) {
+    for conn in l.incoming() {
+        let Ok(mut conn) = conn else { continue };
+        let st = st.clone();
+        std::thread::spawn(move || {
+            let _ = conn.set_read_timeout(Some(Duration::from_secs(10)));
+            let Some((method, path, body)) = read_request(&mut conn) else { return };
+            let (code, out) = slice_request(&st, &method, &path, &body);
+            let body = out.to_string();
+            let _ = conn.write_all(
+                format!("HTTP/1.1 {code} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", if code == 200 { "OK" } else { "Conflict" }, body.len())
+                    .as_bytes(),
+            );
+        });
+    }
+}
+
+fn slice_request(st: &Mutex<St>, method: &str, path: &str, body: &[u8]) -> (u16, Value) {
+    let parts: Vec<&str> = path.split('?').next().unwrap_or("").trim_matches('/').split('/').collect();
+    let (rental, slice) = match parts.as_slice() {
+        [.., r, s] => (r.to_string(), s.parse::<u64>().ok()),
+        _ => (String::new(), None),
+    };
+    let (Some(slice), "POST") = (slice, method) else {
+        return (404, json!({"error": "POST <route>/<rental>/<slice>"}));
+    };
+    let Ok(receipt) = serde_json::from_slice::<Value>(body) else {
+        return (409, json!({"error": "the body is not a receipt"}));
+    };
+    // the link may bring the verdict that finished the slice a moment after the payment
+    let t0 = Instant::now();
+    loop {
+        let mut g = lock(st);
+        if g.rental != rental {
+            return (409, json!({"error": "another rental"}));
+        }
+        let r = check_receipt(&mut g, slice, &receipt);
+        match r {
+            Err(why) if why.contains("not done") && t0.elapsed() < Duration::from_secs(3) => {}
+            Err(why) => {
+                g.note(json!({"ev": "paid slice refused", "slice": slice, "why": why, "atMs": now_ms()}));
+                return (409, json!({"error": why}));
+            }
+            Ok(()) => {
+                credit(&mut g, slice, &receipt);
+                g.note(json!({"ev": "paid slice", "slice": slice, "atMs": now_ms()}));
+                return (200, json!({"ok": true, "rental": rental, "slice": slice}));
+            }
+        }
+        drop(g);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A request line, headers and body (by Content-Length, or chunked).
+fn read_request(conn: &mut TcpStream) -> Option<(String, String, Vec<u8>)> {
+    let mut r = BufReader::new(conn.try_clone().ok()?);
+    let mut line = String::new();
+    r.read_line(&mut line).ok()?;
+    let mut it = line.split_whitespace();
+    let (method, path) = (it.next()?.to_string(), it.next()?.to_string());
+    let (mut len, mut chunked) = (0usize, false);
+    loop {
+        let mut h = String::new();
+        r.read_line(&mut h).ok()?;
+        let h = h.trim_end();
+        if h.is_empty() {
+            break;
+        }
+        let (k, v) = h.split_once(':')?;
+        match k.trim().to_ascii_lowercase().as_str() {
+            "content-length" => len = v.trim().parse().ok()?,
+            "transfer-encoding" => chunked = v.trim().eq_ignore_ascii_case("chunked"),
+            _ => {}
+        }
+    }
+    let mut body = Vec::new();
+    if chunked {
+        loop {
+            let mut sz = String::new();
+            r.read_line(&mut sz).ok()?;
+            let n = usize::from_str_radix(sz.trim().split(';').next()?, 16).ok()?;
+            let mut chunk = vec![0u8; n + 2];
+            r.read_exact(&mut chunk).ok()?;
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..n]);
+            if body.len() > 64 << 10 {
+                return None;
+            }
+        }
+    } else if len <= 64 << 10 {
+        body.resize(len, 0);
+        r.read_exact(&mut body).ok()?;
+    } else {
+        return None;
+    }
+    Some((method, path, body))
 }
 
 fn lock(st: &Mutex<St>) -> std::sync::MutexGuard<'_, St> {
@@ -339,7 +475,7 @@ fn serve_miner(conn: TcpStream, st: Arc<Mutex<St>>, tx: Sender) {
             if g.stopped.is_some() {
                 return;
             }
-            if g.locks.contains_key(&(g.paid + 1)) {
+            if !g.over_link || g.locks.contains_key(&(g.paid + 1)) {
                 let Ok(w) = conn.try_clone() else { return };
                 let chan = g.next_chan;
                 g.next_chan += 1;

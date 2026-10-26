@@ -16,6 +16,9 @@ chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["
 serde_json.workspace = true
 hex.workspace = true
 getrandom = "0.2"
+base64.workspace = true
+# the hashrate listing on Nostr (NIP-99), and the stand-in relay for the lab
+xbt-nostr.workspace = true
 # the stand-in pool's and miner's share hash (lab only)
 blake2.workspace = true
 

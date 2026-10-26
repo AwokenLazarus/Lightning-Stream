@@ -6,7 +6,7 @@
 use crate::link::{self, Sender};
 use crate::meter::{Event, Meter, Receipt};
 use crate::msg::{Msg, Terms};
-use crate::rail::BuyerRail;
+use crate::rail::{BuyerRail, SignerPayer};
 use crate::{now_ms, sv1};
 use secp256k1::{PublicKey, SecretKey};
 use serde_json::{json, Value};
@@ -14,7 +14,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub struct Config {
@@ -35,6 +35,9 @@ pub struct Config {
     /// End the rental after this long.
     pub duration: Option<Duration>,
     pub report: Option<PathBuf>,
+    /// Slices paid by the wallet through the hasher's gateway; without it, over the link (the
+    /// lab's stand-in rail).
+    pub payer: Option<SignerPayer>,
 }
 
 /// Tickets kept locked ahead of the work.
@@ -57,10 +60,17 @@ struct St {
     pays: Vec<Value>,
     events: Vec<Value>,
     closed: Option<String>,
+    /// Slices for the wallet to pay, in order (with the wallet's payer; none over the link).
+    queue: Option<mpsc::Sender<(u64, Value)>>,
+    /// The wallet refused or failed a slice: no later slice is asked for.
+    pay_failed: bool,
 }
 
 impl St {
     fn lock_ahead(&mut self, tx: &Sender) {
+        if self.queue.is_some() {
+            return;
+        }
         let want = self.released + AHEAD;
         let next = self.locked.last().copied().unwrap_or(self.released).max(self.released) + 1;
         for slice in next..=want {
@@ -98,6 +108,14 @@ impl St {
                 at_ms: now_ms(),
             }
             .sign(&self.key);
+            if let Some(q) = &self.queue {
+                if self.pay_failed || q.send((slice, receipt.clone())).is_err() {
+                    return;
+                }
+                self.receipts.push(receipt);
+                self.released = slice;
+                continue;
+            }
             let Ok(pre) = self.rail.release(slice) else { return };
             self.locked.remove(&slice);
             let _ = tx.send(&Msg::Pay { slice, preimage: hex::encode(pre), receipt: receipt.clone() });
@@ -113,7 +131,7 @@ impl St {
             "role": "buyer", "rental": self.rental, "terms": self.terms.to_json(), "meter": self.meter.to_json(),
             "slicesDone": self.done.iter().map(|(w, t)| json!({"work": w.to_string(), "atMs": t})).collect::<Vec<_>>(),
             "released": self.released, "locked": self.locked, "pays": self.pays, "receipts": self.receipts,
-            "lastRate": self.rate, "closed": self.closed, "events": self.events,
+            "lastRate": self.rate, "closed": self.closed, "payFailed": self.pay_failed, "events": self.events,
         })
     }
 }
@@ -156,8 +174,37 @@ pub fn run(cfg: Config, rail: Box<dyn BuyerRail>) -> Result<Value, String> {
         pays: Vec::new(),
         events: Vec::new(),
         closed: None,
+        queue: None,
+        pay_failed: false,
     }));
     lock(&st).lock_ahead(&tx);
+
+    // the wallet's payer, one slice at a time, off the relay's path
+    let stopped_session: Arc<Mutex<Option<Value>>> = Arc::default();
+    let payer_thread = cfg.payer.map(|mut p| {
+        let (qtx, qrx) = mpsc::channel::<(u64, Value)>();
+        lock(&st).queue = Some(qtx);
+        let (st, rental, out) = (st.clone(), cfg.rental.clone(), stopped_session.clone());
+        std::thread::spawn(move || {
+            for (slice, receipt) in qrx {
+                if lock(&st).pay_failed {
+                    continue;
+                }
+                let t0 = Instant::now();
+                let r = p.pay(&rental, slice, &receipt);
+                let mut g = lock(&st);
+                let ms = t0.elapsed().as_millis() as u64;
+                match r {
+                    Ok(v) => g.pays.push(json!({"slice": slice, "atMs": now_ms(), "ms": ms, "ok": true, "wallet": v})),
+                    Err(why) => {
+                        g.pay_failed = true;
+                        g.pays.push(json!({"slice": slice, "atMs": now_ms(), "ms": ms, "ok": false, "why": why}));
+                    }
+                }
+            }
+            *out.lock().unwrap_or_else(|p| p.into_inner()) = p.stop();
+        })
+    });
 
     // ticker: idle, duration, report
     {
@@ -247,7 +294,16 @@ pub fn run(cfg: Config, rail: Box<dyn BuyerRail>) -> Result<Value, String> {
             _ => {}
         }
     }
+    // the wallet's payer: the slices asked for are paid, or found failed, before the session ends
+    let payer = lock(&st).queue.take();
+    drop(payer);
+    if let Some(h) = payer_thread {
+        let _ = h.join();
+    }
     let mut g = lock(&st);
+    if let Some(stop) = stopped_session.lock().unwrap_or_else(|p| p.into_inner()).take() {
+        g.events.push(json!({"ev": "wallet session stopped", "result": stop, "atMs": now_ms()}));
+    }
     for slice in std::mem::take(&mut g.locked) {
         g.rail.cancel(slice);
         g.events.push(json!({"ev": "cancelled", "slice": slice, "atMs": now_ms()}));

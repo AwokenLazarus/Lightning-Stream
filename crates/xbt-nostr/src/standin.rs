@@ -61,7 +61,12 @@ fn matches(f: &Value, ev: &Event) -> bool {
 
 impl StandinRelay {
     pub fn start() -> std::io::Result<Self> {
-        let l = TcpListener::bind("127.0.0.1:0")?;
+        Self::start_on("127.0.0.1:0")
+    }
+
+    /// The same relay on a chosen address: for a rehearsal between machines of one LAN.
+    pub fn start_on(addr: &str) -> std::io::Result<Self> {
+        let l = TcpListener::bind(addr)?;
         let url = format!("ws://{}", l.local_addr()?);
         let st = Arc::new(Mutex::new(State::default()));
         let stop = Arc::new(AtomicBool::new(false));

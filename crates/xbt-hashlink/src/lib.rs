@@ -13,7 +13,9 @@
 //! * [`link`]: a framed, encrypted, thread-safe link over TCP.
 //! * [`sv1`]: the few Stratum V1 facts the relay and the meter read.
 //! * [`meter`]: accepted work, slices, and the buyer's signed work receipts.
-//! * [`rail`]: how a slice is paid: the ticket interface and the lab's stand-in.
+//! * [`rail`]: how a slice is paid: through the wallet's signer and the hasher's gateway (real
+//!   tickets), or the lab's stand-in over the link.
+//! * [`listing`]: the hasher's signed `hashrate` listing on Nostr.
 //! * [`hasher`]: the hasher's side (miners in, link out).
 //! * [`buyer`]: the buyer's side (link in, the buyer's gateway out).
 //! * [`standin`]: a stand-in pool and miner for the lab, with a toy share hash.
@@ -21,6 +23,7 @@
 pub mod buyer;
 pub mod hasher;
 pub mod link;
+pub mod listing;
 pub mod meter;
 pub mod msg;
 pub mod noise;
