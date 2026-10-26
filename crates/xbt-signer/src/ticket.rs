@@ -374,8 +374,9 @@ pub struct TicketPolicy {
     /// its BOLT 11 invoice where the offer cannot be fetched. `tickets.offers`: on unless it is
     /// `false`. The node's `PayOffer` takes no set of outgoing channels and no CLTV limit, so a
     /// payment by offer is made only while every channel of the node passes the guards, as the
-    /// Lightning rail pays an offer, and its HTLC is bounded by the node's own limit
-    /// (`ln.node_max_cltv_blocks`), not by `max_htlc_blocks`.
+    /// Lightning rail pays an offer. The invoice's blinded paths are checked against
+    /// `max_htlc_blocks`; the hops the node adds to reach them are bounded only by the node's own
+    /// limit (`ln.node_max_cltv_blocks`).
     pub offers: bool,
     /// A test aid (`tickets.seller_tls`): for a seller the owner names, the certificate its https is
     /// checked against in place of the public certificate authorities, so that two boxes on a LAN

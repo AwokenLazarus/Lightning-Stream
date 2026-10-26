@@ -620,7 +620,8 @@ wallet) and against a stand-in node in its tests.
   credited is kept two days in `offers.jsonl`, synced before each credit (a crash in between
   loses that one credit). A payment whose note fails, or whose session was forgotten first, is
   kept by the seller and credited to nobody. Each look lists every invoice of the offer (the
-  node's call has no paging): at most every 2 s from the janitor, and at most every 0.2 s when
+  node's call has no paging, so a look costs more the more the offer has been paid; each paid
+  invoice is decoded once, and up to 65,536 notes are remembered): at most every 2 s from the janitor, and at most every 0.2 s when
   a buyer names a payment the gateway has not seen. Run against the stand-in node only.
 - Not run: more than one routing hop, real network latency, mainnet, IPv6, a seller with several
   channels, and the Core Lightning fork. The channels macaroon was run against the stand-in node
@@ -930,8 +931,11 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
 - A prepaid ticket or a win paid by the seller's BOLT 12 offer (`tickets.offers`, on unless
   `false`; `docs/TICKETS.md`, section 15) is booked and bounded as one paid by invoice, and is
   made only while every channel of the wallet's node passes the guards: `PayOffer` takes no set
-  of outgoing channels and no CLTV limit, so its HTLC is bounded by the node's own limit
-  (`ln.node_max_cltv_blocks`), not by `tickets.max_htlc_blocks`, and it carries no wallet tag, so
+  of outgoing channels and no CLTV limit. The wallet refuses an invoice whose blinded payment
+  path asks a `cltv_expiry_delta` above `tickets.max_htlc_blocks`, but the hops the node picks to
+  reach the path's first node add to that, and their total is bounded only by the node's own
+  limit (`ln.node_max_cltv_blocks`). A prepaid ticket settles on arrival, so the long lock is a
+  stuck payment's worst case, not a held ticket's normal one. It carries no wallet tag, so
   a wallet restored from an older backup does not recover it from its node's list. The fetched
   invoice must repeat the wallet's payer note; where the offer gives no invoice, or one that
   fails a check, the ticket or win is paid by the seller's invoice, with nothing booked for the
