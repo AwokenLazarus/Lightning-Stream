@@ -53,6 +53,12 @@ use crate::ticket::{self, booking_sats, check_prepaid_invoice, check_ticket_invo
                     TAG_RECORD};
 use crate::{err, Result};
 
+/// The longest the wallet waits for the seller's invoice for its offer, in seconds, before it
+/// pays the ticket or win by the seller's BOLT 11 invoice instead: a win's invoice lives 30 s by
+/// default (the gateway's `lottery.invoice_secs`), and a busy issuer can leave a request
+/// unanswered (in the lab, Lightning Fork's rate limit on invoice requests).
+const OFFER_FETCH_S: i64 = 5;
+
 /// A seller's BOLT 12 offer and the seller's session a payment by it is for: what the payer note
 /// is made of ([`xbt402::offer::note`]). The key is the session key the seller sent.
 pub struct OfferWay<'a> {
@@ -1495,7 +1501,7 @@ impl Signer {
             Ok(r) => r,
             Err(d) => return passed(&str_or_empty(d.get("rule")), "a payment by offer may leave on any channel of the node, and not every one passes the guards".into()),
         };
-        let resp = match ln.fetch_invoice_noted(by.offer, amount, &note, lp.timeout_s.max(1)) {
+        let resp = match ln.fetch_invoice_noted(by.offer, amount, &note, lp.timeout_s.clamp(1, OFFER_FETCH_S)) {
             Ok(r) => r,
             Err(e) => return passed("ln_fetch_invoice", format!("no invoice for the seller's offer: {}", e.msg)),
         };

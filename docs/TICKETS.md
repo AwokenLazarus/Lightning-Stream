@@ -1766,8 +1766,11 @@ invoice would meet the same rules.
   blinded path of its offer by a buyer one hop away. Prepaid tickets and lottery wins were all
   paid by the offer. The seller's node limits how fast it answers invoice requests: when a file
   bought by draws won several times in a burst, it refused one ("rate limited: too many invoice
-  requests") and that win was paid by the seller's invoice. More hops, mainnet and Core
-  Lightning payers are not run.
+  requests") and that win was paid by the seller's invoice. In a longer run it also left two
+  requests unanswered; the wallet then waited the whole call timeout (60 s) for each, the wins'
+  BOLT 11 invoices (30 s) expired meanwhile, and those two wins went unpaid. The wallet now waits
+  at most 5 s for an invoice by offer before it pays by the seller's invoice. More hops, mainnet
+  and Core Lightning payers are not run.
 - The seller's node pads the fees of its blinded path, so it is paid a little more than the
   invoice: in the lab 1,391,709 msat for invoices of 1,384,000 msat, out of 15,410 msat of fees
   the buyer's node paid. The wallet books the amount and the fees, as for any payment.
