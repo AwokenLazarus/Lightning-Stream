@@ -1565,13 +1565,15 @@ fn main_screens_speak_plain_words() {
     check("seller's page", &g.get("/").body);
 }
 
-/// A stand-in for the hasher's and the renter's control pages: fixed answers, every request kept
-/// (method, path, the Authorization header, the body).
-fn control_standin(answer: fn(&str, &str) -> Value) -> (String, Arc<std::sync::Mutex<Vec<(String, String, String, String)>>>) {
+/// Requests a stand-in control page saw: (method, path, the Authorization header, the body).
+type ControlSeen = Arc<std::sync::Mutex<Vec<(String, String, String, String)>>>;
+
+/// A stand-in for the hasher's and the renter's control pages: fixed answers, every request kept.
+fn control_standin(answer: fn(&str, &str) -> Value) -> (String, ControlSeen) {
     use std::io::{BufRead, BufReader, Read, Write};
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}", l.local_addr().unwrap());
-    let seen: Arc<std::sync::Mutex<Vec<(String, String, String, String)>>> = Arc::default();
+    let seen: ControlSeen = Arc::default();
     let s2 = seen.clone();
     std::thread::spawn(move || {
         for c in l.incoming() {
