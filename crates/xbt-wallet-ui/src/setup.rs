@@ -168,6 +168,34 @@ fn pin_cert(pin: bool, rest: Option<&str>, path: Option<&Path>, fp: &str) -> Res
     Ok(format!("Certificate pinned (SHA-256 {fp}). The services that talk to the node restart to use it."))
 }
 
+/// The gateway's saved config, pointed again at the node the platform names now. The setup page writes the
+/// node's address into the config when the owner saves it; a platform that gives the node by its container
+/// address (StartOS: `getContainerIp`) gives a new one when that container is made again, and a config left as
+/// it was keeps the gateway dialling an address nobody answers. Run at every start; true when it rewrote.
+pub fn follow_node(gw: &crate::config::GatewaySetup) -> Result<bool, String> {
+    let Some(rest) = gw.node_rest.as_deref() else { return Ok(false) };
+    let Ok(text) = std::fs::read_to_string(gw.dir.join(GW_CONFIG)) else { return Ok(false) };
+    let mut c: Value = serde_json::from_str(&text).map_err(|e| format!("{GW_CONFIG}: {e}"))?;
+    let Some(node) = c.get_mut("node").and_then(Value::as_object_mut) else { return Ok(false) };
+    let mut changed = false;
+    if node.get("rest").and_then(Value::as_str) != Some(rest) {
+        node.insert("rest".into(), json!(rest));
+        changed = true;
+    }
+    if let Some(cert) = &gw.node_tls_cert {
+        let cert = cert.display().to_string();
+        if node.get("tls_cert").and_then(Value::as_str) != Some(cert.as_str()) {
+            node.insert("tls_cert".into(), json!(cert));
+            changed = true;
+        }
+    }
+    if changed {
+        let text = serde_json::to_string_pretty(&c).map_err(|e| e.to_string())? + "\n";
+        write_shared(&gw.dir, GW_CONFIG, text.as_bytes())?;
+    }
+    Ok(changed)
+}
+
 impl App {
     // --- the wallet: the Lightning rail ------------------------------------------------------------
 
@@ -528,5 +556,31 @@ mod tests {
         assert_eq!(std::fs::metadata(t.path().join("x")).unwrap().permissions().mode() & 0o777, 0o640);
         assert_eq!(std::fs::read_dir(t.path()).unwrap().count(), 1, "no temp file left");
         assert!(write_shared(&t.path().join("missing"), "x", b"").is_err());
+    }
+
+    #[test]
+    fn a_saved_config_follows_the_node_to_its_new_address() {
+        let t = tempfile::tempdir().unwrap();
+        let gw = crate::config::GatewaySetup {
+            dir: t.path().into(),
+            node_rest: Some("https://10.0.3.235:8080".into()),
+            node_tls_cert: Some("/data/lightning/tls.cert".into()),
+            ..Default::default()
+        };
+        assert!(!follow_node(&gw).unwrap(), "no config yet: nothing to do");
+        let saved = json!({"listen": "0.0.0.0:8402", "node": {"rest": "https://10.0.3.26:8080", "tls_cert": "/data/lightning/tls.cert",
+                           "macaroon": "/m/invoices.macaroon"}, "caps": {"max_sessions": 4}});
+        std::fs::write(t.path().join(GW_CONFIG), serde_json::to_string(&saved).unwrap()).unwrap();
+        assert!(follow_node(&gw).unwrap());
+        let now: Value = serde_json::from_str(&std::fs::read_to_string(t.path().join(GW_CONFIG)).unwrap()).unwrap();
+        assert_eq!(now["node"]["rest"], "https://10.0.3.235:8080");
+        assert_eq!(now["node"]["macaroon"], "/m/invoices.macaroon", "the rest of the config as it was");
+        assert_eq!(now["caps"], saved["caps"]);
+        assert!(!follow_node(&gw).unwrap(), "already current: not rewritten");
+        let none = crate::config::GatewaySetup { node_rest: None, ..gw.clone() };
+        assert!(!follow_node(&none).unwrap(), "no address from the platform: left alone");
+        std::fs::write(t.path().join(GW_CONFIG), "not json").unwrap();
+        assert!(follow_node(&gw).is_err(), "a config it cannot read is reported, not overwritten");
+        assert_eq!(std::fs::read_to_string(t.path().join(GW_CONFIG)).unwrap(), "not json");
     }
 }
