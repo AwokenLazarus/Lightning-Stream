@@ -192,6 +192,7 @@ mod tests {
                 hash: [2; 32],
                 session: "ab".into(),
                 prepaid: false,
+                msat: None,
             },
         ];
         {

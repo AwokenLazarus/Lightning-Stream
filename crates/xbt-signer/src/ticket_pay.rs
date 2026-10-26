@@ -502,12 +502,42 @@ fn head_to(ans: &mut WireAnswer, range: Option<ByteRange>, line: bool, sink: &mu
 }
 
 /// What one call released: the hashes, the sats the book put in the ledger for them, and how many
-/// of them were prepaid tickets.
+/// of them were prepaid tickets. `limit_sats` is the call's `max_sats`: no ticket is released or
+/// bought for the call that could take what the book puts in the ledger above it ([`Spent::room`]).
 #[derive(Default)]
 struct Spent {
     hashes: Vec<String>,
     booked_sats: i64,
     prepaid: usize,
+    limit_sats: Option<i64>,
+}
+
+impl Spent {
+    /// What is left of the call's `max_sats`, in sats: `None` where it has none.
+    fn left(&self) -> Option<i64> {
+        self.limit_sats.map(|l| l.saturating_sub(self.booked_sats).max(0))
+    }
+
+    /// Whether one more ticket of `face` sats, booked at most `booking` (its fee limit included),
+    /// keeps the call inside its `max_sats`. A seller's ticket is one size: where that size is
+    /// above what is left of the limit, the call pays nothing more and says so.
+    fn room(&self, next: Option<(i64, i64)>, prepaid: bool) -> std::result::Result<(), Value> {
+        let (Some(limit), Some((face, booking))) = (self.limit_sats, next) else { return Ok(()) };
+        if self.booked_sats.saturating_add(booking) <= limit {
+            return Ok(());
+        }
+        let kind = if prepaid { "prepaid ticket" } else { "ticket" };
+        let fee = booking.saturating_sub(face);
+        let left = limit.saturating_sub(self.booked_sats).max(0);
+        let reason = if self.booked_sats == 0 {
+            format!("the smallest {kind} this seller sells is {face} sat (up to {fee} sat more in routing fees), over this call's limit of {limit} sat: nothing was paid; \
+                     call again with max_sats of at least {booking}")
+        } else {
+            format!("the next {kind} of this seller is {face} sat (up to {fee} sat more in routing fees), and only {left} sat of this call's limit of {limit} sat is \
+                     left: no more was paid")
+        };
+        Err(with(deny("max_sats", reason), json!({"ticket_sats": face, "ticket_booking_sats": booking, "max_sats": limit})))
+    }
 }
 
 /// The pacing of one answer that is priced as it goes: when the next ticket is due.
@@ -1155,7 +1185,8 @@ impl Signer {
                     };
                     let o = {
                         let _g = self.lock();
-                        self.ticket_open_locked(&json!({"terms": acc, "prepaid_terms": prepaid.as_ref().map(|(_, a)| *a), "task": &task, "origin": c.origin}))
+                        self.ticket_open_locked(&json!({"terms": acc, "prepaid_terms": prepaid.as_ref().map(|(_, a)| *a), "task": &task, "origin": c.origin,
+                                                                 "fit_sats": c.max_sats.max(0)}))
                     };
                     if o["verdict"] != "allow" {
                         let rule = str_or_empty(o.get("rule"));
@@ -1439,22 +1470,36 @@ impl Signer {
     /// the payment, then `release` with the preimage the wallet's node got for it. Called with the
     /// session's `paying` lock held, so one is bought at a time.
     fn ticket_buy_prepaid(&self, hs: &HttpSession, spent: &mut Spent) -> std::result::Result<(), Value> {
+        // the call's max_sats bounds what leaves for it, a whole ticket included: a smaller ticket is asked for where
+        // the seller's own does not fit and its terms allow one that does, and the call is refused before anything
+        // is asked of the seller where none fits
+        let size = self.ticket_prepaid_size(&hs.sid, spent.left());
+        spent.room(size.map(|(_, face, booked)| (face, booked)), true)?;
+        let asked = size.map(|(m, _, _)| m).filter(|m| self.ticket_session(&hs.sid).is_some_and(|s| s.prepaid_msat != *m));
         // the wallet's own node first: no invoice is asked for that the node could not then pay
         self.ticket_can_lock(&hs.terms.terms.payee)?;
         // by the seller's offer first, where its terms name one: nothing is asked of the seller but its session
         let by_offer = match &hs.offer {
-            Some(offer) if self.ticket_policy().offers => self.ticket_prepay_by_offer(hs, offer),
+            Some(offer) if self.ticket_policy().offers => self.ticket_prepay_by_offer(hs, offer, asked),
             _ => None,
         };
         let r = match by_offer {
             Some(r) => r,
             None => {
-                let body = json!({"version": xbt402::ticket::VERSION, "settle": xbt402::ticket::SETTLE_ON_ARRIVAL, "count": 1});
+                let mut body = json!({"version": xbt402::ticket::VERSION, "settle": xbt402::ticket::SETTLE_ON_ARRIVAL, "count": 1});
+                // a seller that ignores the size asked for invoices its own, and the book refuses that invoice unpaid
+                if let Some(m) = asked {
+                    body["ticketMsat"] = m.to_string().into();
+                }
                 let answer = self.ticket_lock_call(hs, body)?;
                 let Some(first) = answer.get("tickets").and_then(Value::as_array).and_then(|a| a.first()) else {
                     return Err(refusal("ticket_seller", "the seller issued no invoice for a prepaid ticket"));
                 };
-                self.ticket_prepay(&json!({"session": hs.sid, "hash": first.get("hash"), "invoice": first.get("invoice")}))
+                let mut p = json!({"session": hs.sid, "hash": first.get("hash"), "invoice": first.get("invoice")});
+                if let Some(m) = asked {
+                    p["ticket_msat"] = m.to_string().into();
+                }
+                self.ticket_prepay(&p)
             }
         };
         if r["verdict"] == "pending" {
@@ -1482,7 +1527,7 @@ impl Signer {
     /// offer makes it where there is none yet, and issues no invoice), then the payment with the
     /// note that names that session ([`Signer::ticket_pay_by_offer`]). `None`: nothing was paid,
     /// and the ticket is bought by the seller's invoice.
-    fn ticket_prepay_by_offer(&self, hs: &HttpSession, offer: &str) -> Option<Value> {
+    fn ticket_prepay_by_offer(&self, hs: &HttpSession, offer: &str, msat: Option<u64>) -> Option<Value> {
         if lock(&hs.link).seller_sid.is_empty() {
             let body = json!({"version": xbt402::ticket::VERSION, "settle": xbt402::ticket::SETTLE_ON_ARRIVAL, "by": "offer"});
             if let Err(d) = self.ticket_lock_call(hs, body) {
@@ -1499,7 +1544,7 @@ impl Signer {
             return None;
         }
         let by = crate::ticket_rail::OfferWay { offer, key: &key, seller_session: &seller_session };
-        self.ticket_pay_by_offer(&hs.sid, &by, None, false)
+        self.ticket_pay_by_offer(&hs.sid, &by, None, false, msat)
     }
 
     /// The seller's offer left for its invoice before the payment by offer was tried, and why:
@@ -1780,6 +1825,15 @@ impl Signer {
         if let Some(why) = hs.fault() {
             return Err(self.ticket_fault(hs, &why));
         }
+        // the call's max_sats bounds what leaves for it, a whole ticket included. A held ticket that does not fit
+        // gives way to a smaller prepaid one where the seller sells those and one fits
+        if let Err(d) = spent.room(self.ticket_next_booking(&hs.sid, &hash), false) {
+            let prepaid = self.ticket_prepaid_size(&hs.sid, spent.left());
+            if prepaid.is_some_and(|(_, face, booked)| spent.room(Some((face, booked)), true).is_ok()) {
+                return self.ticket_buy_prepaid(hs, spent);
+            }
+            return Err(d);
+        }
         // 2. the book: booked, then the secret exists here
         let r = {
             let _g = self.lock();
@@ -1870,7 +1924,7 @@ impl Signer {
         let tp = self.ticket_policy();
         let max_msat = (c.max_sats.max(0) as u64).saturating_mul(1000);
         let dest = format!("ln:{}", hs.terms.terms.payee);
-        let mut spent = Spent::default();
+        let mut spent = Spent { limit_sats: Some(c.max_sats.max(0)), ..Spent::default() };
         let about = |hs: &HttpSession, spent: &Spent| {
             json!({"rail": "ticket", "session": hs.sid, "dest": dest, "origin": hs.origin, "charged_sats": spent.booked_sats, "tickets_released": spent.hashes.len(),
                    "tickets_prepaid": spent.prepaid,

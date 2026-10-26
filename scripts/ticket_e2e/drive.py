@@ -280,7 +280,12 @@ def note_receipts(r: dict[str, Any]) -> None:
         RECEIPTS[acct["session"]] = max(RECEIPTS.get(acct["session"], 0), int(acct["credited_msat"]))
 
 
-def pay(url: str, max_sats: int = 10, who: Mcp | None = None) -> dict[str, Any]:
+# the limit of a call that pays a few cents' worth: room for whole tickets, since the wallet never pays a ticket that
+# would take a call over its max_sats
+CALL_SATS = 2_000
+
+
+def pay(url: str, max_sats: int = CALL_SATS, who: Mcp | None = None) -> dict[str, Any]:
     """The agent's call: one tool, one URL."""
     r = (who or agent()).tool("xbt402_pay", {"url": url, "max_sats": max_sats, "task": "film"})
     note_receipts(r)
@@ -844,9 +849,12 @@ def stream() -> None:
     r = pay(f"{ORIGIN}/big.bin", max_sats=half)
     got = int(r.get("bytes", 0))
     by_count = -(-got * BYTE_MSAT // PER_BYTES)
+    # no ticket is released that would take the call over its limit, fee limit included: it stops within a ticket
+    # and its fee limit below half, never above
     ok = (call_paid(r) and r.get("complete") is False and str(r.get("ended", "")).startswith("stopped by the wallet: max_sats") and r.get("body_digest") == digest_of_prefix(got)
-          and half * 1000 <= by_count <= half * 1000 + (64 << 10) * BYTE_MSAT // PER_BYTES + 1 and got < BIG * 0.52)
-    check("stream: the same file under a call that allows half its price stops half way, at the byte the call's max_sats pays for by the wallet's own count",
+          and half * 1000 - 1_015_000 <= by_count <= half * 1000 + (64 << 10) * BYTE_MSAT // PER_BYTES + 1 and got < BIG * 0.52
+          and int(r.get("charged_sats") or 0) <= half)
+    check("stream: the same file under a call that allows half its price stops near half way, at the byte the tickets that fit the call's max_sats pay for by the wallet's own count",
           ok, {**brief(r), "receipt": {"body": r["receipt"].get("body")}, "bytes": got, "max_sats": half, "price_of_bytes_msat": by_count})
     if r.get("saved_to"):
         os.remove(r["saved_to"])
@@ -923,7 +931,7 @@ def liar() -> None:
 
         return act
 
-    def from_the_start(mode: str, url: str = page_url, max_sats: int = 10) -> Any:
+    def from_the_start(mode: str, url: str = page_url, max_sats: int = CALL_SATS) -> Any:
         def act() -> dict[str, Any]:
             Lies.mode = mode
             return pay(url, max_sats=max_sats)
@@ -1450,7 +1458,7 @@ def offers() -> None:
         time.sleep(5)
     offers_policy(on=True)
     before = settled_on(OFFER_NODE)
-    pages = [pay(f"{OFFERS}/small.txt", max_sats=200) for _ in range(3)]
+    pages = [pay(f"{OFFERS}/small.txt") for _ in range(3)]
     check("offers: three priced pages from the unannounced seller, each paid with a prepaid ticket",
           all(call_paid(r) and r.get("rail") == "ticket" and body_of(r) == PAGE for r in pages), [brief(r) for r in pages])
     stop_sessions()
@@ -1488,7 +1496,7 @@ def offers() -> None:
           and seen["buyer_node_paid_msat"] <= seen["received_msat"] <= seen["buyer_node_paid_msat"] + seen["buyer_node_fees_msat"], seen)
     offers_policy(on=False)
     before = after
-    r = pay(f"{OFFERS}/small.txt", max_sats=200)
+    r = pay(f"{OFFERS}/small.txt")
     stop_sessions()
     new = {h: m for h, m in settled_on(OFFER_NODE).items() if h not in before}
     by_offer = set(offer_invoices(OFFER_NODE))

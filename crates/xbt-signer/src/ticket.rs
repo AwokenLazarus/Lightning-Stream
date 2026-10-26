@@ -955,6 +955,17 @@ pub fn prepaid_size(terms: &Terms, pol: &TicketPolicy) -> Result<u64, Refusal> {
     Ok(terms.ticket_msat)
 }
 
+/// Whether a prepaid ticket of `msat` may be bought in session `s`: its seller's size, or a
+/// smaller one inside what the seller's terms let the wallet ask for. A session that pays by
+/// draws pays its win size only.
+pub fn prepaid_size_ok(s: &Session, msat: u64) -> Result<(), Refusal> {
+    if msat == s.prepaid_msat || (s.draws.is_none() && s.prepaid_min_msat > 0 && (s.prepaid_min_msat..=s.prepaid_msat).contains(&msat)) {
+        return Ok(());
+    }
+    refuse("ticket_size", format!("a prepaid ticket of {msat} msat: this seller's are {} msat{}", s.prepaid_msat,
+                                  if s.prepaid_min_msat > 0 { format!(", or down to {} msat on request", s.prepaid_min_msat) } else { String::new() }))
+}
+
 /// The payment-level failure reasons of an lnd-family node (`failure_reason` of a payment).
 pub const LN_FAILURE_REASONS: [&str; 7] = ["FAILURE_REASON_CANCELED", "FAILURE_REASON_ERROR", "FAILURE_REASON_INCORRECT_PAYMENT_DETAILS",
                                            "FAILURE_REASON_INSUFFICIENT_BALANCE", "FAILURE_REASON_NONE", "FAILURE_REASON_NO_ROUTE", "FAILURE_REASON_TIMEOUT"];
@@ -1182,6 +1193,9 @@ pub struct Session {
     /// The size of a prepaid ticket with this seller, in msat, where its terms offer them
     /// (`settle: "on-arrival"`); 0 where they do not.
     pub prepaid_msat: u64,
+    /// The smallest prepaid ticket the seller's terms let the wallet ask for (`minTicketMsat`),
+    /// below `prepaid_msat`; 0 where `prepaid_msat` is the only size.
+    pub prepaid_min_msat: u64,
     /// Lock rounds in a row that failed for lack of a slot.
     pub slot_fails: u32,
     /// Nothing is locked for this session before this time (0: no wait), and why.
@@ -1233,6 +1247,9 @@ impl Session {
         // written only when set: a row from before reads as a session that holds and waits for nothing
         if self.prepaid_msat > 0 {
             r["prepaid_msat"] = self.prepaid_msat.to_string().into();
+        }
+        if self.prepaid_min_msat > 0 {
+            r["prepaid_min_msat"] = self.prepaid_min_msat.to_string().into();
         }
         if self.slot_fails > 0 || self.hold_until > 0.0 || !self.hold_why.is_empty() {
             r["hold"] = json!({"fails": self.slot_fails, "until": ts_value(self.hold_until), "why": self.hold_why});
@@ -1309,6 +1326,10 @@ impl Session {
                                                         base: str_or_empty(h.get("base")) }),
                     },
                     prepaid_msat: match r.get("prepaid_msat") {
+                        None => 0,
+                        Some(v) => outside_u64(Some(v))?,
+                    },
+                    prepaid_min_msat: match r.get("prepaid_min_msat") {
                         None => 0,
                         Some(v) => outside_u64(Some(v))?,
                     },
@@ -1591,15 +1612,16 @@ pub fn check_ticket_invoice(inv: &crate::bolt11::Invoice, s: &Session, pol: &Tic
 /// CLTV delta inside the owner's bound, payable for no longer than the owner allows. Its payment
 /// hash is the seller's own. The chain's prefix, feature bit 512 and a non-zero amount are
 /// [`crate::ln::check_invoice`]'s.
-pub fn check_prepaid_invoice(inv: &crate::bolt11::Invoice, s: &Session, pol: &TicketPolicy, now: f64) -> Result<(), Refusal> {
+pub fn check_prepaid_invoice(inv: &crate::bolt11::Invoice, s: &Session, msat: u64, pol: &TicketPolicy, now: f64) -> Result<(), Refusal> {
     if s.prepaid_msat == 0 {
         return refuse("ticket_terms", "this seller's terms offer no prepaid tickets");
     }
+    prepaid_size_ok(s, msat)?;
     if inv.payee_hex() != s.payee {
         return refuse("ticket_payee", format!("the invoice pays {}, not the seller's node {}", inv.payee_hex(), s.payee));
     }
-    if inv.amount_msat != Some(s.prepaid_msat) {
-        return refuse("ticket_amount", format!("the invoice is for {:?} msat, a prepaid ticket of this session is {} msat", inv.amount_msat, s.prepaid_msat));
+    if inv.amount_msat != Some(msat) {
+        return refuse("ticket_amount", format!("the invoice is for {:?} msat, the prepaid ticket asked for is {msat} msat", inv.amount_msat));
     }
     if inv.min_final_cltv != u64::from(s.ticket_blocks) {
         return refuse("ticket_blocks", format!("the invoice's final CLTV delta is {}, the terms said {}", inv.min_final_cltv, s.ticket_blocks));
@@ -2069,7 +2091,7 @@ mod tests {
     fn session(id: &str, pool: u32) -> Session {
         Session { draws: None, paid_first: false, id: id.into(), payee: "p".into(), origin: String::new(), task: "t".into(), listed: true, ticket_msat: 1_000_000, pool, max_tickets: 8,
                   ticket_blocks: 40, max_sats: 0, state: SState::Open, opened_ts: 1.0, active_ts: 1.0, stopped_ts: 0.0, closed_ts: 0.0, why: String::new(),
-                  http: None, prepaid_msat: 0, slot_fails: 0, hold_until: 0.0, hold_why: String::new() }
+                  http: None, prepaid_msat: 0, prepaid_min_msat: 0, slot_fails: 0, hold_until: 0.0, hold_why: String::new() }
     }
 
     #[test]

@@ -1004,7 +1004,7 @@ def agent() -> None:
         tools = sorted(t["name"] for t in a.tools())
         url = ORIGIN_NEAR + service.file
         t0 = time.monotonic()
-        r = a.tool("xbt402_pay", {"url": url, "max_sats": 300, "task": "film"})
+        r = a.tool("xbt402_pay", {"url": url, "max_sats": 2_500, "task": "film"})
         secs = time.monotonic() - t0
         got = int(r.get("bytes") or 0)
         stored = r.get("saved_to", "")
@@ -1018,9 +1018,11 @@ def agent() -> None:
                 with open(film_file.path, "rb") as f:
                     same = f.read(got) == data
         by_count = math.ceil(got * SAT_PER_MIB * 1000 / MIB)
-        check("agent: an agent with only the wallet's tools buys the first part of the film's file with one call that may use 300 sat: the wallet stops the answer where 300 sat are used by its own count, and what arrived is the file's own first bytes",
+        # the wallet releases no ticket that would take the call over 2,500 sat, fee limits included: two 1,000-sat tickets
+        check("agent: an agent with only the wallet's tools buys the first part of the film's file with one call that may use 2,500 sat: the wallet stops the answer where the tickets that fit are used by its own count, and what arrived is the file's own first bytes",
               "xbt402_pay" in tools and r.get("verdict") == "allow" and r.get("rail") == "ticket" and r.get("status") == 200 and r.get("complete") is False
-              and str(r.get("ended", "")).startswith("stopped by the wallet: max_sats") and 300_000 <= by_count <= 300_000 + 7_000 and same is not False and head[4:8] == b"ftyp",
+              and str(r.get("ended", "")).startswith("stopped by the wallet: max_sats") and 1_500_000 <= by_count <= 2_500_000 + 7_000
+              and int(r.get("charged_sats") or 0) <= 2_500 and same is not False and head[4:8] == b"ftyp",
               {"the_agents_tools": tools, "bytes": got, "price_of_those_bytes_msat": by_count, "charged_sats": r.get("charged_sats"), "tickets_released": r.get("tickets_released"),
                "ended": str(r.get("ended"))[:90], "is_the_films_first_bytes": same, "it_read": head[4:12].decode("latin1"), "seconds": round(secs, 2)})
         st = a.tool("ticket_status", {})

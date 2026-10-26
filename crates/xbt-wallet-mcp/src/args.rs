@@ -36,7 +36,7 @@ fn empty() -> Value {
 /// also takes `task`, the owner's task the call is paid under. With tickets off it is B2's.
 pub fn spec_for(tool: &str, tickets: bool) -> Option<&'static [Arg]> {
     static XBT402_PAY_TICKETS: [Arg; 5] = [req("url", Ty::Str), opt("method", Ty::Str, || Value::from("GET")), opt("body", Ty::Str, empty),
-                                           opt("max_sats", Ty::Int, || Value::from(1000)), opt("task", Ty::Str, empty)];
+                                           opt("max_sats", Ty::Int, || Value::from(2000)), opt("task", Ty::Str, empty)];
     match tool {
         "xbt402_pay" if tickets => Some(&XBT402_PAY_TICKETS),
         _ => spec(tool),
@@ -253,7 +253,7 @@ mod tests {
         // `task` exists only for a wallet with tickets on; without them it is an extra key, ignored as pydantic ignores one
         assert_eq!(v("xbt402_pay", json!({"url": "u", "task": "film"})).unwrap(), json!({"url": "u", "method": "GET", "body": "", "max_sats": 1000}));
         let with = |a: Value| validate_for("xbt402_pay", a.as_object().unwrap(), true).map(Value::Object);
-        assert_eq!(with(json!({"url": "u", "task": "film"})).unwrap(), json!({"url": "u", "method": "GET", "body": "", "max_sats": 1000, "task": "film"}));
+        assert_eq!(with(json!({"url": "u", "task": "film"})).unwrap(), json!({"url": "u", "method": "GET", "body": "", "max_sats": 2000, "task": "film"}));
         assert_eq!(with(json!({"url": "u"})).unwrap()["task"], "");
         assert!(with(json!({"url": "u", "task": 7})).unwrap_err().contains("task"));
         let big = xbt402::json::parse(r#"{"limit": "100000000000000000000000"}"#).unwrap();

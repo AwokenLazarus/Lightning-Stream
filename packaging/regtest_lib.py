@@ -427,7 +427,7 @@ def paid_buy(group, agent, ui, gui, sign_bin, key_file, lab, sc, gateway_up, ori
     check(group, f"the signer restarted with it ({time.time() - t0:.0f} s; xbt-supervise saw the file) and the rail is ready: chain verified, "
                  "the channel's funding proven", st_ln.get("ready") is True, {k: st_ln.get(k) for k in ("ready", "warnings", "backend")})
     before_settled = len(lab.seller_settled())
-    r = agent.tool("xbt402_pay", url=f"{origin}/small.txt", max_sats=10)
+    r = agent.tool("xbt402_pay", url=f"{origin}/small.txt", max_sats=2_000)
     body = str((r.get("untrusted_provider_response") or {}).get("body", ""))
     check(group, "the agent's one xbt402_pay call buys the priced page through the packaged wallet: a stream ticket over lf1 -> lf2, "
                  "2,500 msat used, the seller's receipt signs the body",
@@ -448,7 +448,7 @@ def paid_buy(group, agent, ui, gui, sign_bin, key_file, lab, sc, gateway_up, ori
           and int(mine[0].get("value_msat") or 0) == 1_000_000,
           {"settled_msat": t_settled.get("amt_paid_msat"), "hash": h, "buyer": [{k: p.get(k) for k in ("payment_hash", "status", "value_msat")}
                                                                                 for p in lab.buyer_payments()][-4:]})
-    r2 = agent.tool("xbt402_pay", url=f"{origin}/small.txt", max_sats=10)
+    r2 = agent.tool("xbt402_pay", url=f"{origin}/small.txt", max_sats=2_000)
     check(group, "a second call is paid from the same ticket's balance: no new ticket released, 2,500 msat more used",
           r2.get("status") == 200 and r2.get("tickets_released") == 0 and int(r2.get("balance_msat") or 0) == int(r.get("balance_msat") or 0) - 2500,
           {k: r2.get(k) for k in ("verdict", "rail", "status", "tickets_released", "balance_msat", "reason")})

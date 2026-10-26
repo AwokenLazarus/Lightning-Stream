@@ -243,6 +243,7 @@ impl Gateway {
             network: cfg.network.clone(),
             pay_to: info.pubkey.clone(),
             ticket_msat: cfg.caps.ticket_msat,
+            min_ticket_msat: cfg.min_ticket_msat,
             max_tickets: cfg.caps.max_tickets,
             ticket_blocks: cfg.ticket_blocks,
             receipt_key: hex::encode(ecdsa::pubkey(&key)),
@@ -635,8 +636,8 @@ impl Gateway {
         let hash = ticket::ticket_hash(secret);
         match self.node.lookup(&hash) {
             Ok(Some(inv)) => {
-                let paid = inv.state == InvoiceState::Settled
-                    && inv.paid_msat >= self.cfg.caps.ticket_msat;
+                let face = self.lock().book.ticket_msat(&hash).unwrap_or(self.cfg.caps.ticket_msat);
+                let paid = inv.state == InvoiceState::Settled && inv.paid_msat >= face;
                 self.apply(&hash, &inv);
                 match inv.state {
                     _ if paid => Ok(hash),
@@ -1081,6 +1082,23 @@ impl Gateway {
             }
             Some(_) => return error(400, "bad_request", "by is \"offer\", in a lock for tickets settled on arrival of a seller whose terms name an offer"),
         }
+        // the size: the gateway's own, or a smaller one the buyer asks for where the terms let it.
+        // A gateway whose terms name no smallest size ignores the field, as the draft says
+        let size = match (self.cfg.min_ticket_msat, body.get("ticketMsat")) {
+            (None, _) | (_, None) => self.cfg.caps.ticket_msat,
+            (Some(min), Some(v)) => {
+                let asked = match v {
+                    Value::String(s) => s.parse::<u64>().ok(),
+                    v => v.as_u64(),
+                };
+                match asked.filter(|n| (min..=self.cfg.caps.ticket_msat).contains(n)) {
+                    Some(n) => n,
+                    None => {
+                        return error(400, "bad_request", &format!("ticketMsat is from {min} to {}", self.cfg.caps.ticket_msat))
+                    }
+                }
+            }
+        };
         // for a ticket settled on arrival the buyer sends a count and the hashes are the seller's:
         // the preimage of each is made here, given to the node with the invoice, and not kept
         let most = self.cfg.caps.max_tickets as usize;
@@ -1136,11 +1154,12 @@ impl Gateway {
         let room = fits.and_then(|_| if prepaid { Ok(()) } else { self.slot_room() });
         let granted = room.and_then(|()| {
             let mut st = self.lock();
-            let granted = st.book.lock(
+            let granted = st.book.lock_sized(
                 &addr,
                 authed.as_ref().map(|a| a.session.as_str()),
                 &hashes,
                 prepaid,
+                size,
                 &entropy,
                 self.now(),
             );
@@ -1185,7 +1204,7 @@ impl Gateway {
                 (true, _) => Err(NodeError::Unreachable(String::new())),
                 (false, Some(preimage)) => self.node.add_invoice(
                     preimage,
-                    self.cfg.caps.ticket_msat,
+                    size,
                     self.cfg.ticket_blocks,
                     expiry,
                 ),
@@ -1193,7 +1212,7 @@ impl Gateway {
                     .node
                     .add_hold(
                         h,
-                        self.cfg.caps.ticket_msat,
+                        size,
                         self.cfg.ticket_blocks,
                         expiry,
                     )
@@ -1338,6 +1357,7 @@ impl Gateway {
             200,
             &json!({"version": "services/0", "signed": false, "scheme": ticket::SCHEME, "network": self.terms.network, "payTo": self.terms.pay_to,
                     "receiptKey": self.terms.receipt_key, "session": self.terms.session, "ticketMsat": self.terms.ticket_msat.to_string(),
+                    "minTicketMsat": self.terms.min_ticket_msat.map(|m| m.to_string()),
                     "maxTickets": self.terms.max_tickets, "ticketBlocks": self.terms.ticket_blocks, "settle": settle, "routes": routes,
                     "lottery": self.cfg.lottery.as_ref().map(|c| self.lottery_terms(c).accepts(0, "", &Value::Null)["extra"].clone())}),
         )

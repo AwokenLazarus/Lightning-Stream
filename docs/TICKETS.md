@@ -139,7 +139,11 @@ it travels once, over TLS. A secret is for one invoice. The buyer MUST NOT send 
 after a payment that failed: an HTLC for it may still be somewhere on a route. `ticketMsat` in the
 request is the size the buyer wants for this session, between the terms' `minTicketMsat` and
 `ticketMsat`; a seller whose terms have no `minTicketMsat` ignores it and issues its one size, and
-the buyer, which knows that from the terms, does not ask. A buyer drops a hash it got no invoice
+the buyer, which knows that from the terms, does not ask. The same field in a lock for tickets
+settled on arrival (section 5) sizes those tickets, and a prepaid ticket paid by offer (section 15)
+is credited at the amount its note names, inside the same bounds. A size outside them is answered
+`400 bad_request`. The gateway built here offers smaller sizes only where its runner sets
+`tickets.min_ticket_msat`; it records each ticket's size and credits it for that size. A buyer drops a hash it got no invoice
 for after two minutes: an invoice that arrives later is not paid.
 
 Before paying each invoice the buyer MUST check all of these. They are the whole of the buyer's
@@ -1518,9 +1522,16 @@ prepaid ticket instead: a lock with `settle: "on-arrival"` and a count of 1, the
 the invoice and every rule of a release, the ledger row, the payment, and then the preimage in
 `release`. One at a time, and none ahead of need.
 
-`max_sats` bounds what the call uses, by the wallet's own count. Money moves a ticket at a time,
-so a call can release one ticket more than it uses: a 3-sat page releases a 1,000-sat ticket, and
-the rest is the session's balance for later calls. What a seller's receipts say moves only the
+`max_sats` bounds what the call books, and so what it uses. Money moves a ticket at a time, and a
+ticket is released or bought for a call only when it fits what is left of the call's `max_sats`,
+its fee limit included. Where the seller's own size does not fit and its terms let the wallet ask
+for a smaller one (`minTicketMsat`), the wallet asks for the largest that fits, in whole sats: a
+prepaid ticket is sized for each purchase, a session's held tickets once, to the call that opens
+it, and a held ticket that does not fit a later call gives way to a smaller prepaid one where the
+seller sells those. Where nothing fits, nothing is paid and the call is refused (`max_sats`, with
+`ticket_sats` and `ticket_booking_sats`, the size the call would need). A call that fits a ticket
+can still use less of it than it books: a 3-sat page under a limit of 1,003 sat releases a
+1,000-sat ticket, and the rest is the session's balance for later calls, whatever their limits. What a seller's receipts say moves only the
 wallet's count of that balance, and only where it stands inside the wallet's own count (the
 released total never above what the wallet released, a charge never above the price by the terms
 of what was asked for and received). The ledger holds the wallet's own tickets and the fees its

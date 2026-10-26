@@ -173,7 +173,7 @@ impl Gateway {
                         continue;
                     }
                     let mut st = self.lock();
-                    match st.book.credit_offer(&session, &inv.payment_hash, self.cfg.caps.ticket_msat, now) {
+                    match st.book.credit_offer(&session, &inv.payment_hash, note.amount_msat, now) {
                         Ok(recs) => {
                             self.journal(&mut st, &recs);
                             drop(st);
@@ -210,10 +210,12 @@ impl Gateway {
         }
         match note.purpose {
             Purpose::Ticket => {
+                // the gateway's size, or a smaller one its terms let a buyer choose
                 let ticket = self.cfg.caps.ticket_msat;
+                let min = self.cfg.min_ticket_msat.unwrap_or(ticket);
                 let ok = self.cfg.prepaid
-                    && note.amount_msat == ticket
-                    && inv.paid_msat >= ticket
+                    && (min..=ticket).contains(&note.amount_msat)
+                    && inv.paid_msat >= note.amount_msat
                     && self.lock().book.session(&note.session).is_some_and(|s| note.verify(&s.key));
                 if ok { Verdict::Ticket(note.session.clone(), note) } else { Verdict::Pass }
             }

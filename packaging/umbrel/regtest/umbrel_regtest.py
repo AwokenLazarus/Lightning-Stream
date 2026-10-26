@@ -322,7 +322,7 @@ def main():
           and agent.tool("balance").get("hot", {}).get("hot_sats") == before["hot_sats"],
           {"token": token2 == token, "hot": [before, ha2]})
     wait_until(lambda: sc("ln_status").get("ready") is True, 120, "the rail ready after the restart", every=3)
-    r = agent.tool("xbt402_pay", url=f"{ORIGIN}/small.txt", max_sats=10)
+    r = agent.tool("xbt402_pay", url=f"{ORIGIN}/small.txt", max_sats=2_000)
     check("R", "after the restart the rail is ready again from the stored macaroon and the agent buys the page again",
           r.get("verdict") == "allow" and r.get("rail") == "ticket" and r.get("status") == 200,
           {k: r.get(k) for k in ("verdict", "rail", "status", "tickets_released", "balance_msat", "reason")})

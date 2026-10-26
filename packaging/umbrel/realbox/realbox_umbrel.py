@@ -326,7 +326,7 @@ def phase_buy(tag="T"):
         wait_until(gateway_up, 180, "the gateway healthy", every=3)
         wait_until(lambda: sc("ln_status").get("ready") is True, 240, "the rail ready", every=3)
         n0 = len(L.seller_settled())
-        r = agent.tool("xbt402_pay", url=f"{ORIGIN}/small.txt", max_sats=10)
+        r = agent.tool("xbt402_pay", url=f"{ORIGIN}/small.txt", max_sats=2_000)
         check(tag, {"R": "after apps.restart of both apps", "B": "after a reboot of the box"}.get(tag, tag) + ": the agent buys the page again",
               r.get("verdict") == "allow" and r.get("rail") == "ticket" and r.get("status") == 200,
               {k: r.get(k) for k in ("verdict", "rail", "status", "tickets_released", "balance_msat", "reason")})

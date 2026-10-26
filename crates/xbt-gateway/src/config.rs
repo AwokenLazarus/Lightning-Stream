@@ -147,6 +147,9 @@ pub struct Config {
     pub network: String,
     pub node: NodeConfig,
     pub ticket_blocks: u32,
+    /// The smallest ticket a buyer may ask for (`minTicketMsat`, `docs/TICKETS.md` section 2).
+    /// `None`: `caps.ticket_msat` is the only size.
+    pub min_ticket_msat: Option<u64>,
     /// The terms offer held tickets (`settle: "on-use"`), tickets settled on arrival
     /// (`settle: "on-arrival"`), or both: at least one.
     pub held: bool,
@@ -404,7 +407,7 @@ impl Config {
             Some(t) => obj(
                 t,
                 "tickets",
-                &["ticket_msat", "max_tickets", "ticket_blocks", "settle"],
+                &["ticket_msat", "min_ticket_msat", "max_tickets", "ticket_blocks", "settle"],
             )?,
             None => &empty,
         };
@@ -433,6 +436,18 @@ impl Config {
         }
         if held && ticket_msat < MIN_HELD_TICKET_MSAT {
             return Err(format!("tickets.ticket_msat is at least {MIN_HELD_TICKET_MSAT} (546 sat) where held tickets are offered: a held payment below a channel's dust limit has no output in that channel's transaction, and is lost to the miners if the channel is force-closed while it is held. For smaller tickets offer only prepaid ones: tickets.settle [\"{SETTLE_ON_ARRIVAL}\"]"));
+        }
+        // a buyer may ask for a smaller ticket, down to this, where the runner offers it
+        let min_ticket_msat = match t.get("min_ticket_msat") {
+            None => None,
+            Some(_) => Some(num(t, "min_ticket_msat", 0)?),
+        };
+        if let Some(m) = min_ticket_msat {
+            let lo = if held { MIN_HELD_TICKET_MSAT } else { 1000 };
+            if !(lo..=ticket_msat).contains(&m) {
+                return Err(format!("tickets.min_ticket_msat is from {lo} to tickets.ticket_msat ({ticket_msat}): the smallest ticket a buyer may ask for{}",
+                                   if held { ", never below 546 sat where held tickets are offered" } else { "" }));
+            }
         }
         // usable blocks: the delta, plus what the payer's node adds, less the margin
         let floor = (SETTLE_MARGIN_BLOCKS + 2)
@@ -680,6 +695,7 @@ impl Config {
             network,
             node,
             ticket_blocks,
+            min_ticket_msat,
             held,
             prepaid,
             inbound_slots,
@@ -1290,6 +1306,18 @@ mod tests {
             (
                 "546 sat",
                 Box::new(|v| v["tickets"] = json!({"ticket_msat": 545_999})),
+            ),
+            (
+                "tickets.min_ticket_msat",
+                Box::new(|v| v["tickets"] = json!({"min_ticket_msat": 545_999})),
+            ),
+            (
+                "tickets.min_ticket_msat",
+                Box::new(|v| v["tickets"] = json!({"min_ticket_msat": 1_000_001})),
+            ),
+            (
+                "tickets.min_ticket_msat",
+                Box::new(|v| v["tickets"] = json!({"settle": ["on-arrival"], "ticket_msat": 64_000, "min_ticket_msat": 999})),
             ),
             (
                 "tickets.settle",

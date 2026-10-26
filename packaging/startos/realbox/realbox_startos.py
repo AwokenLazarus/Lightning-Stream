@@ -406,7 +406,7 @@ def phase_buy():
     check("T", "the signer restarted with it (xbt-supervise) and the rail is ready over the dependency's REST and pinned certificate",
           last.get("ready") is True, {k: last.get(k) for k in ("ready", "warnings", "backend", "config_error")})
     try:
-        r = agent.tool("xbt402_pay", url=f"{origin}/small.txt", max_sats=10)
+        r = agent.tool("xbt402_pay", url=f"{origin}/small.txt", max_sats=2_000)
     except RuntimeError as e:
         r = {"error": str(e)}
     S["buy_attempt"] = r

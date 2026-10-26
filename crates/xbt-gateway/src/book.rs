@@ -140,6 +140,8 @@ pub struct Ticket {
     /// Issued by a first lock: its invoice lives [`Caps::first_lock_secs`]. Not in the journal: a
     /// ticket read back after a restart is given up after `unpaid_secs`, which is later.
     pub first: bool,
+    /// Its size: [`Caps::ticket_msat`], or the smaller one its lock asked for.
+    pub msat: u64,
 }
 
 /// How many used hashes a session remembers, to answer `ticket_used` instead of `ticket_unknown`.
@@ -193,6 +195,9 @@ pub enum Rec {
         session: String,
         /// Settled on arrival. Written only when true, so a journal from before reads as held.
         prepaid: bool,
+        /// Its size, where its lock asked for one other than [`Caps::ticket_msat`]. Written only
+        /// then, so a journal from before reads as tickets of the gateway's own size.
+        msat: Option<u64>,
     },
     /// The ticket is finished and paid nothing.
     Gone {
@@ -225,10 +230,14 @@ impl crate::store::Record for Rec {
                 hash,
                 session,
                 prepaid,
+                msat,
             } => {
                 let mut v = json!({"t": "ticket", "hash": hex::encode(hash), "session": session});
                 if *prepaid {
                     v["prepaid"] = true.into();
+                }
+                if let Some(m) = msat {
+                    v["msat"] = (*m).into();
                 }
                 v
             }
@@ -265,6 +274,10 @@ impl crate::store::Record for Rec {
                     None => false,
                     Some(Value::Bool(b)) => *b,
                     Some(_) => return None,
+                },
+                msat: match v.get("msat") {
+                    None => None,
+                    Some(m) => Some(m.as_u64()?),
                 },
             },
             "gone" => Self::Gone { hash: h("hash")? },
@@ -412,6 +425,23 @@ impl Book {
         entropy: &[u8; 48],
         now: u64,
     ) -> Result<Granted, Refusal> {
+        let msat = self.caps.ticket_msat;
+        self.lock_sized(addr, session, hashes, prepaid, msat, entropy, now)
+    }
+
+    /// [`Book::lock`] for tickets of `msat` each: the gateway's own size, or a smaller one the
+    /// buyer asked for and the gateway has checked against its terms.
+    #[allow(clippy::too_many_arguments)]
+    pub fn lock_sized(
+        &mut self,
+        addr: &str,
+        session: Option<&str>,
+        hashes: &[Hash],
+        prepaid: bool,
+        msat: u64,
+        entropy: &[u8; 48],
+        now: u64,
+    ) -> Result<Granted, Refusal> {
         let mut recs = vec![];
         let room_session = self.lock_room(addr, session, prepaid)?;
         let (id, key) = match session {
@@ -488,12 +518,14 @@ impl Book {
                     issued_at: now,
                     prepaid,
                     first: key.is_some(),
+                    msat,
                 },
             );
             recs.push(Rec::Ticket {
                 hash: *h,
                 session: id.clone(),
                 prepaid,
+                msat: (msat != self.caps.ticket_msat).then_some(msat),
             });
         }
         if let Some(s) = self.sessions.get_mut(&id) {
@@ -620,18 +652,24 @@ impl Book {
                 issued_at: now,
                 prepaid: true,
                 first: false,
+                msat,
             },
         );
         if let Some(s) = self.sessions.get_mut(session) {
             s.live += 1;
             s.last_paid = now;
         }
-        let made = Rec::Ticket { hash: *hash, session: session.to_string(), prepaid: true };
+        let made = Rec::Ticket { hash: *hash, session: session.to_string(), prepaid: true, msat: (msat != self.caps.ticket_msat).then_some(msat) };
         match self.settled(hash, Some(msat)) {
             Some(r @ Rec::Released { .. }) => Ok(vec![made, r]),
             // short of a whole ticket: no credit, and the ticket is gone again
             _ => Err(Refusal::TicketNotLocked),
         }
+    }
+
+    /// The size of the ticket `hash`, while it is in the book.
+    pub fn ticket_msat(&self, hash: &Hash) -> Option<u64> {
+        self.tickets.get(hash).map(|t| t.msat)
     }
 
     /// The node's answer to issuing `hash`: not issued, the ticket leaves the book.
@@ -712,7 +750,7 @@ impl Book {
             TicketState::Settling => return Err(Refusal::TicketUsed),
             TicketState::Accepted => {}
         }
-        if t.paid_msat < caps.ticket_msat {
+        if t.paid_msat < t.msat {
             return Err(Refusal::TicketNotLocked);
         }
         Self::outside_margin(caps, t, height)?;
@@ -746,10 +784,10 @@ impl Book {
     /// credited before, or is not in the book.
     pub fn settled(&mut self, hash: &Hash, paid_msat: Option<u64>) -> Option<Rec> {
         let t = self.tickets.get(hash)?;
-        let msat = paid_msat.unwrap_or(t.paid_msat).min(self.caps.ticket_msat);
+        let msat = paid_msat.unwrap_or(t.paid_msat).min(t.msat);
         // a ticket settled on arrival that arrived short is no ticket: the session is not
         // credited a part, and the invoice is finished on the node either way
-        if t.prepaid && msat < self.caps.ticket_msat {
+        if t.prepaid && msat < t.msat {
             return self
                 .remove(hash, false)
                 .then_some(Rec::Gone { hash: *hash });
@@ -846,7 +884,7 @@ impl Book {
             _ if s.used.contains(hash) => return Err(Refusal::TicketUsed),
             _ => return Err(Refusal::TicketUnknown),
         };
-        if t.state != TicketState::Accepted || t.paid_msat < self.caps.ticket_msat {
+        if t.state != TicketState::Accepted || t.paid_msat < t.msat {
             return Err(Refusal::TicketNotLocked);
         }
         Self::outside_margin(&self.caps, t, height)?;
@@ -863,10 +901,9 @@ impl Book {
         let Some(s) = self.sessions.get(session) else {
             return 0;
         };
-        let credit = if on_pledge && s.pledge.is_some() {
-            self.caps.ticket_msat
-        } else {
-            0
+        let credit = match s.pledge {
+            Some(h) if on_pledge => self.tickets.get(&h).map_or(self.caps.ticket_msat, |t| t.msat),
+            _ => 0,
         };
         s.released_msat
             .saturating_add(credit)
@@ -1027,6 +1064,7 @@ impl Book {
                     hash: carry_hash(id),
                     session: id.clone(),
                     prepaid: false,
+                    msat: None,
                 });
                 out.push(Rec::Released {
                     hash: carry_hash(id),
@@ -1035,10 +1073,12 @@ impl Book {
             }
         }
         for h in self.unfinished() {
+            let t = &self.tickets[&h];
             out.push(Rec::Ticket {
                 hash: h,
-                session: self.tickets[&h].session.clone(),
-                prepaid: self.tickets[&h].prepaid,
+                session: t.session.clone(),
+                prepaid: t.prepaid,
+                msat: (t.msat != self.caps.ticket_msat).then_some(t.msat),
             });
         }
         for id in self.sessions.keys() {
@@ -1078,6 +1118,7 @@ impl Book {
                     hash,
                     session,
                     prepaid,
+                    msat,
                 } => {
                     let s = b
                         .sessions
@@ -1094,6 +1135,7 @@ impl Book {
                                 issued_at: now,
                                 prepaid: *prepaid,
                                 first: false,
+                                msat: msat.unwrap_or(b.caps.ticket_msat),
                             },
                         )
                         .is_none()
@@ -1856,6 +1898,7 @@ mod tests {
                 hash: hash(1),
                 session: "nobody".into(),
                 prepaid: false,
+                msat: None,
             }],
             0
         )
@@ -2006,7 +2049,8 @@ mod tests {
             Some(&Rec::Ticket {
                 hash: hash(2),
                 session: g.session.clone(),
-                prepaid: true
+                prepaid: true,
+                msat: None,
             })
         );
         assert_eq!((b.held(), b.prepaid_open()), (1, 1));
@@ -2092,15 +2136,29 @@ mod tests {
             Some(Rec::Ticket {
                 hash: hash(9),
                 session: "s".into(),
-                prepaid: false
+                prepaid: false,
+                msat: None,
             })
         );
         let rec = Rec::Ticket {
             hash: hash(9),
             session: "s".into(),
             prepaid: true,
+            msat: None,
         };
         assert_eq!(Rec::from_json(&rec.to_json()), Some(rec));
+        // a ticket of a size the buyer asked for keeps it through the journal and a restart
+        let sized = Rec::Ticket { hash: hash(9), session: "s".into(), prepaid: true, msat: Some(700_000) };
+        assert_eq!(sized.to_json()["msat"], 700_000);
+        assert_eq!(Rec::from_json(&sized.to_json()), Some(sized));
+        let g3 = b.lock_sized("c", None, &[hash(30)], true, 700_000, &ent(7), 0).unwrap();
+        assert!(g3.recs.iter().any(|r| matches!(r, Rec::Ticket { msat: Some(700_000), .. })));
+        let restored = || Book::restore(b.caps().clone(), &b.snapshot(), 0).unwrap();
+        let mut r = restored();
+        assert_eq!((r.ticket_msat(&hash(30)), r.ticket_msat(&hash(4))), (Some(700_000), Some(1_000_000)));
+        // credited for its own size, and one short of it is no ticket
+        assert!(matches!(r.settled(&hash(30), Some(700_000)), Some(Rec::Released { msat: 700_000, .. })));
+        assert!(matches!(restored().settled(&hash(30), Some(699_999)), Some(Rec::Gone { .. })));
         let mut bent = old.clone();
         bent["prepaid"] = "yes".into();
         assert_eq!(Rec::from_json(&bent), None);

@@ -143,6 +143,8 @@ pub struct Terms {
     /// The seller's Lightning node id, 33 bytes hex: the payee of every ticket invoice.
     pub pay_to: String,
     pub ticket_msat: u64,
+    /// The smallest ticket a buyer may ask for (`minTicketMsat`); `None`: `ticket_msat` only.
+    pub min_ticket_msat: Option<u64>,
     pub max_tickets: u32,
     pub ticket_blocks: u32,
     /// The key that signs receipts, 33 bytes hex.
@@ -162,6 +164,9 @@ impl Terms {
         extra.insert("layer".into(), LAYER.into());
         extra.insert("features".into(), Value::Array(vec![FEATURE_BLAKE2B.into()]));
         extra.insert("ticketMsat".into(), self.ticket_msat.to_string().into());
+        if let Some(m) = self.min_ticket_msat {
+            extra.insert("minTicketMsat".into(), m.to_string().into());
+        }
         extra.insert("maxTickets".into(), self.max_tickets.into());
         extra.insert("ticketBlocks".into(), self.ticket_blocks.into());
         extra.insert("release".into(), release.into());
@@ -276,7 +281,7 @@ mod tests {
 
     #[test]
     fn the_accepts_entry_is_the_one_the_draft_shows() {
-        let t = Terms { network: "bip122:0000000000000050c1e5f69672f45929".into(), pay_to: "02".repeat(33), ticket_msat: 1_000_000, max_tickets: 2, ticket_blocks: 40,
+        let t = Terms { network: "bip122:0000000000000050c1e5f69672f45929".into(), pay_to: "02".repeat(33), ticket_msat: 1_000_000, min_ticket_msat: None, max_tickets: 2, ticket_blocks: 40,
                         receipt_key: "03".repeat(33), session: SESSION_PATH.into() };
         let a = t.accepts(2500, "with-request", SETTLE_ON_USE, &json!({"requestMsat": "2500"}));
         assert_eq!(a["scheme"], "ticket");

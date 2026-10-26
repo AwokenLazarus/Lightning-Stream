@@ -1989,3 +1989,54 @@ fn one_gateway_sells_several_services_each_behind_its_own_route() {
     assert_eq!(l.services.iter().map(|s| (s.name.as_str(), s.path.as_str())).collect::<Vec<_>>(), [("Files", "/files/"), ("Model", "/model/")]);
     assert_eq!(l.services[0].prices["byte_msat"], rig.cfg["routes"][0]["price"]["byte_msat"].to_string());
 }
+
+#[test]
+fn a_buyer_may_ask_for_a_smaller_ticket_down_to_the_smallest_the_terms_name() {
+    let (rig, _d) = start(&|v| {
+        v["tickets"] = json!({"ticket_msat": 1_000_000, "min_ticket_msat": 600_000});
+        v["caps"] = json!({"sessions_per_address": 0, "held_after_paid": false});
+    });
+    let pr = http(&rig.addr, "GET", "/api", &[], b"", None).json();
+    assert!(pr["accepts"].as_array().unwrap().iter().all(|a| a["extra"]["minTicketMsat"] == "600000"), "{pr}");
+    let mut b = Buyer::new(&rig, 1);
+    // below the smallest, or above the gateway's own size: refused, and nothing is issued
+    for bad in [json!("599999"), json!("1000001"), json!("many")] {
+        let s = b.fresh_secrets(1);
+        let got = b.lock_with(&s, &json!({"ticketMsat": bad}));
+        assert_eq!((got.status, got.error()), (400, "bad_request".to_string()), "{bad}");
+    }
+    // a held ticket of 700,000 msat: the invoice is for that, and that is what its secret credits
+    let s = b.fresh_secrets(1);
+    let got = b.lock_with(&s, &json!({"ticketMsat": "700000"}));
+    assert_eq!(got.status, 200, "{}", got.json());
+    assert!(rig.node.pay(&ticket_hash(&s[0])));
+    b.wait_state(&s, "ACCEPTED");
+    b.release(&s);
+    assert_eq!(b.balance(), 700_000);
+    // a held ticket paid short of the size it was issued at is not locked
+    let s2 = b.fresh_secrets(1);
+    assert_eq!(b.lock_with(&s2, &json!({"ticketMsat": 650_000})).status, 200);
+    assert!(rig.node.pay_msat(&ticket_hash(&s2[0]), Some(600_000)));
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(b.release(&s2).json()["refused"][0]["error"], "ticket_not_locked");
+    // a prepaid one of 650,000 msat
+    let j = b.lock_prepaid_with(1, &json!({"ticketMsat": "650000"})).json();
+    let hash = xbt402::ticket::hex32(j["tickets"][0]["hash"].as_str().unwrap()).unwrap();
+    assert!(rig.node.pay(&hash));
+    b.release(&[rig.node.paid_preimage(&hash).unwrap()]);
+    assert_eq!(b.balance(), 1_350_000);
+}
+
+#[test]
+fn a_gateway_whose_terms_name_no_smallest_size_ignores_a_size_asked_for() {
+    let (rig, _d) = start(&|v| v["caps"] = json!({"sessions_per_address": 0, "held_after_paid": false}));
+    let pr = http(&rig.addr, "GET", "/api", &[], b"", None).json();
+    assert!(pr["accepts"][0]["extra"].get("minTicketMsat").is_none(), "{pr}");
+    let mut b = Buyer::new(&rig, 1);
+    let s = b.fresh_secrets(1);
+    assert_eq!(b.lock_with(&s, &json!({"ticketMsat": "700000"})).status, 200);
+    assert!(rig.node.pay(&ticket_hash(&s[0])));
+    b.wait_state(&s, "ACCEPTED");
+    b.release(&s);
+    assert_eq!(b.balance(), 1_000_000, "the one size of its terms");
+}

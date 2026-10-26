@@ -548,9 +548,9 @@ impl Signer {
             None => Ok(None),
             Some(v) => py_int(Some(v)).filter(|n| *n >= 0).map(Some).ok_or_else(|| refusal("amount", format!("{k} must be a non-negative integer"))),
         };
-        let (expect_sats, max_sats) = match (amount("expect_sats"), amount("max_sats")) {
-            (Ok(e), Ok(m)) => (e, m.unwrap_or(0)),
-            (Err(d), _) | (_, Err(d)) => return d,
+        let (expect_sats, max_sats, fit_sats) = match (amount("expect_sats"), amount("max_sats"), amount("fit_sats")) {
+            (Ok(e), Ok(m), Ok(f)) => (e, m.unwrap_or(0), f),
+            (Err(d), _, _) | (_, Err(d), _) | (_, _, Err(d)) => return d,
         };
         let net = match node::network(&*self.node, &self.chain, None) {
             Ok(n) => n,
@@ -599,6 +599,9 @@ impl Signer {
         if held.is_some() {
             self.ticket_reconcile_locked();
         }
+        let lp_open = LnPolicy::from_map(&cfg.ln);
+        // the smallest prepaid ticket the seller lets the wallet ask for, below its own size
+        let prepaid_min_msat = prepaid.as_ref().and_then(|t| t.min_ticket_msat).map(|m| m.max(1000)).filter(|m| *m < prepaid_msat).unwrap_or(0);
         let out = (|| -> Result<Value> {
             let mut g = self.ticket_store()?;
             let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
@@ -634,7 +637,15 @@ impl Signer {
                     return Err((ROUTE_FULL, format!("three lock rounds in a row found no slot on the route to this seller: no ticket is held with it for another {:.0} s",
                                                     b.hold_until - now)));
                 }
-                sizing(t, &tp, sellers, expect_msat, cap_tickets, cap_locked, limits.dust_msat, room)
+                let sized = sizing(t, &tp, sellers, expect_msat, cap_tickets, cap_locked, limits.dust_msat, room)?;
+                // the call that opens the session spends at most `fit_sats`: where the seller's terms let the
+                // wallet choose a size, its tickets are no larger than one of them, its fee limit included, can take
+                match (t.min_ticket_msat, fit_sats.and_then(|f| fitting_msat(&lp_open, t.min_ticket_msat.unwrap_or(0), sized.ticket_msat, f))) {
+                    (Some(_), Some(fit)) if fit < sized.ticket_msat => {
+                        sizing(&Terms { ticket_msat: fit, ..t.clone() }, &tp, sellers, expect_msat, cap_tickets, cap_locked, limits.dust_msat, room).or(Ok(sized))
+                    }
+                    _ => Ok(sized),
+                }
             });
             // held tickets are the default; where none can be held for lack of a slot or for dust, and the
             // seller offers prepaid tickets, the session holds nothing and buys those one at a time
@@ -684,7 +695,7 @@ impl Signer {
             let s = Session { draws: None, id, payee: terms.payee.clone(), origin: origin.chars().take(200).collect(), task: task_name.clone(),
                               listed, ticket_msat: size.ticket_msat, pool: size.pool, max_tickets: terms.max_tickets, ticket_blocks: terms.ticket_blocks,
                               max_sats, state: SState::Open, opened_ts: now, active_ts: now, stopped_ts: 0.0, closed_ts: 0.0, why: String::new(), http: None,
-                              prepaid_msat, slot_fails, hold_until, hold_why, paid_first };
+                              prepaid_msat, prepaid_min_msat, slot_fails, hold_until, hold_why, paid_first };
             st.commit(&[s.row()])?;
             self.ticket_audit("ticket_open", json!({"session": s.id, "dest": format!("ln:{}", s.payee), "task": s.task, "listed": listed,
                                                     "ticket_msat": s.ticket_msat.to_string(), "pool": s.pool, "prepaid_msat": s.prepaid_msat.to_string(),
@@ -1416,8 +1427,10 @@ impl Signer {
     /// arrives and never had back. So every rule of a release is applied before the payment is
     /// sent, and one is bought at a time. Not a socket method: only the wallet's own payer, which
     /// read the seller's terms itself, calls this.
+    /// `ticket_msat`, where given: the size asked of the seller for this ticket ([`Signer::ticket_prepaid_size`]).
     pub(crate) fn ticket_prepay(&self, p: &Value) -> Value {
-        self.ticket_pay_ordinary(&str_or_empty(p.get("session")), str_or_empty(p.get("invoice")).trim(), &str_or_empty(p.get("hash")), None, false)
+        let msat = crate::ticket::outside_u64(p.get("ticket_msat"));
+        self.ticket_pay_ordinary(&str_or_empty(p.get("session")), str_or_empty(p.get("invoice")).trim(), &str_or_empty(p.get("hash")), None, false, msat)
     }
 
     /// Pay one win of a session that pays by draws: the seller's invoice for it, checked, booked
@@ -1431,10 +1444,10 @@ impl Signer {
     /// `by`: the seller's offer, where its terms name one; the win is paid by it first, and by
     /// `invoice` where the offer cannot be fetched ([`Signer::ticket_pay_by_offer`]).
     pub(crate) fn lottery_pay_win(&self, sid: &str, win: &xbt402::lottery::Win, invoice: &str, first: bool, by: Option<&OfferWay<'_>>) -> Value {
-        if let Some(v) = by.and_then(|b| self.ticket_pay_by_offer(sid, b, Some(win), first)) {
+        if let Some(v) = by.and_then(|b| self.ticket_pay_by_offer(sid, b, Some(win), first, None)) {
             return v;
         }
-        self.ticket_pay_ordinary(sid, invoice.trim(), "", Some(win), first)
+        self.ticket_pay_ordinary(sid, invoice.trim(), "", Some(win), first, None)
     }
 
     /// Pay a prepaid ticket (`win` None) or a win by the seller's BOLT 12 offer
@@ -1452,7 +1465,8 @@ impl Signer {
     /// or the invoice could not be fetched. `Some`: the outcome, as [`Signer::ticket_pay_ordinary`]
     /// gives it, with `by_offer`; a refusal by the book's rules is final, since the invoice would
     /// meet the same rules.
-    pub(crate) fn ticket_pay_by_offer(&self, sid: &str, by: &OfferWay<'_>, win: Option<&xbt402::lottery::Win>, first: bool) -> Option<Value> {
+    /// `msat`: the size of a prepaid ticket asked for, where it is not the seller's own.
+    pub(crate) fn ticket_pay_by_offer(&self, sid: &str, by: &OfferWay<'_>, win: Option<&xbt402::lottery::Win>, first: bool, msat: Option<u64>) -> Option<Value> {
         if self.ticket_shut().is_some() {
             return None;
         }
@@ -1488,7 +1502,10 @@ impl Signer {
         if o.issuer_id.is_some_and(|k| hex::encode(k) != session.payee) {
             return passed("ticket_payee", "the seller's offer names another node than the one its terms name".into());
         }
-        let amount = session.prepaid_msat;
+        let amount = msat.unwrap_or(session.prepaid_msat);
+        if crate::ticket::prepaid_size_ok(&session, amount).is_err() {
+            return passed("ticket_size", format!("a prepaid ticket of {amount} msat is not one this seller's terms offer"));
+        }
         let purpose = win.map_or(xbt402::offer::Purpose::Ticket, |w| xbt402::offer::Purpose::Win(w.draw()));
         let note = xbt402::offer::note(by.key, by.seller_session, purpose, amount, &random_bytes::<16>());
         // through the gate, as every ordinary payment of the rail, from its checks to its end
@@ -1527,7 +1544,7 @@ impl Signer {
         let hash = inv.payment_hash_hex();
         let booked = {
             let _g = self.lock();
-            self.ticket_book_prepay(sid, &hash, &lni, inv.payment_hash, inv.expires_at() as f64, &lp, &routes.ids, win)
+            self.ticket_book_prepay(sid, &hash, &lni, inv.payment_hash, inv.expires_at() as f64, &lp, &routes.ids, win, amount)
         };
         let send = match booked {
             Ok(Ok(s)) => s,
@@ -1542,7 +1559,7 @@ impl Signer {
 
     /// An ordinary payment of a session, booked before it is sent: a prepaid ticket (`win` None),
     /// or the win of a draw.
-    fn ticket_pay_ordinary(&self, sid: &str, invoice: &str, named: &str, win: Option<&xbt402::lottery::Win>, first: bool) -> Value {
+    fn ticket_pay_ordinary(&self, sid: &str, invoice: &str, named: &str, win: Option<&xbt402::lottery::Win>, first: bool, msat: Option<u64>) -> Value {
         if let Some(d) = self.ticket_shut() {
             return d;
         }
@@ -1603,7 +1620,8 @@ impl Signer {
         if let Err((rule, why)) = check_invoice(&inv, &self.chain, now, &relaxed, "") {
             return refuse(&hash, &rule, why);
         }
-        if let Err((rule, why)) = check_prepaid_invoice(&inv, &session, &tp_now, now) {
+        let msat = msat.unwrap_or(session.prepaid_msat);
+        if let Err((rule, why)) = check_prepaid_invoice(&inv, &session, msat, &tp_now, now) {
             return refuse(&hash, rule, why);
         }
         match ln.decode(&invoice) {
@@ -1617,7 +1635,7 @@ impl Signer {
         // every rule of a release, the ledger and the book, under the wallet's spend lock
         let booked = {
             let _g = self.lock();
-            self.ticket_book_prepay(&sid, &hash, &invoice, raw, inv.expires_at() as f64, &lp, &routes.ids, win)
+            self.ticket_book_prepay(&sid, &hash, &invoice, raw, inv.expires_at() as f64, &lp, &routes.ids, win, msat)
         };
         let send = match booked {
             Ok(Ok(s)) => s,
@@ -1714,7 +1732,7 @@ impl Signer {
     /// the refusal.
     #[allow(clippy::too_many_arguments)]
     fn ticket_book_prepay(&self, sid: &str, hash: &str, invoice: &str, raw: [u8; 32], invoice_expires: f64, lp: &LnPolicy, ids: &[String],
-                          win: Option<&xbt402::lottery::Win>) -> Result<std::result::Result<HeldSend, Value>> {
+                          win: Option<&xbt402::lottery::Win>, msat: u64) -> Result<std::result::Result<HeldSend, Value>> {
         let tp = match self.ticket_synced() {
             Ok(t) => t,
             Err(d) => return Ok(Err(d)),
@@ -1726,6 +1744,9 @@ impl Signer {
         let Some(mut s) = st.book.sessions.get(sid).filter(|s| s.state == SState::Open).cloned() else { return Ok(Err(refusal("ticket_session", "no such open session"))) };
         if s.prepaid_msat == 0 {
             return Ok(Err(refusal("ticket_terms", "this seller's terms offer no prepaid tickets")));
+        }
+        if let Err((rule, why)) = crate::ticket::prepaid_size_ok(&s, msat) {
+            return Ok(Err(refusal(rule, why)));
         }
         // a session pays by draws or by tickets, never by both: a win is paid only in the session it was drawn in,
         // at that session's win size, and a prepaid ticket only in a ticket session
@@ -1774,8 +1795,8 @@ impl Signer {
             return Ok(Err(refusal("ticket_rate_limit", format!("already {} ticket payments sent to the node in the last hour (tickets.max_sends_per_hour)", tp.max_sends_per_hour))));
         }
         let dest = format!("ln:{}", s.payee);
-        let fee_limit_msat = (lp.fee_limit_sats(sats_ceil(s.prepaid_msat)).max(0) as u64).saturating_mul(1000);
-        let sats = booking_sats(s.prepaid_msat, fee_limit_msat);
+        let fee_limit_msat = (lp.fee_limit_sats(sats_ceil(msat)).max(0) as u64).saturating_mul(1000);
+        let sats = booking_sats(msat, fee_limit_msat);
         let (_, _, cap_spend, seller_window) = Self::ticket_seller_caps(&cfg, &tp, task, listed);
         let spent = self.ticket_spent(now, &s.task, task.window_s as f64, &dest, seller_window)?;
         let session_booked = st.book.of_session(sid).iter().fold(0i64, |a, x| a.saturating_add(x.booked_sats));
@@ -1803,7 +1824,7 @@ impl Signer {
         // the other way round, a wallet kept such a row for good: found on the lab.) The payment is sent
         // only after both, so the book is never ahead of money that has left
         let win_draw = win.map_or(0, xbt402::lottery::Win::draw);
-        let t = Ticket { win: win_draw, hash: hash.to_string(), nonce, session: sid.to_string(), payee: s.payee.clone(), task: s.task.clone(), msat: s.prepaid_msat, fee_limit_msat,
+        let t = Ticket { win: win_draw, hash: hash.to_string(), nonce, session: sid.to_string(), payee: s.payee.clone(), task: s.task.clone(), msat, fee_limit_msat,
                          state: TState::Released, ts: now, sent_ts: now, invoice_expires, released_ts: now, booked_sats: sats,
                          cltv_until: 0, final_expiry: 0, fee_msat: 0, done_ts: 0.0, note: String::new(), prepaid: true };
         s.active_ts = now;
@@ -1880,6 +1901,35 @@ impl Signer {
     /// A session of the book, as it is now.
     pub(crate) fn ticket_session(&self, sid: &str) -> Option<Session> {
         self.ticket_store().ok()?.as_ref()?.book.sessions.get(sid).cloned()
+    }
+
+    /// The face of the held ticket `hash` of a session and the most its release books, its fee
+    /// limit included, in sats: what a call's `max_sats` is held against before its secret
+    /// leaves. `None` where the book has no such ticket.
+    pub(crate) fn ticket_next_booking(&self, sid: &str, hash: &str) -> Option<(i64, i64)> {
+        let g = self.ticket_store().ok()?;
+        let st = g.as_ref()?;
+        st.book.of_session(sid).into_iter().find(|t| t.hash == hash).map(|t| (sats_ceil(t.msat), booking_sats(t.msat, t.fee_limit_msat)))
+    }
+
+    /// The size of a session's next prepaid ticket for a call with `left` sats of its `max_sats`
+    /// unspent (`None`: no limit), and what it books, its fee limit included: (msat, face sats,
+    /// booked sats). The seller's own size where it fits; else the largest smaller one, in whole
+    /// sats, that the seller's terms let the wallet ask for (`minTicketMsat`) and that fits; else
+    /// the seller's own size, which the call's limit then refuses. `None`: the session buys no
+    /// prepaid tickets.
+    pub(crate) fn ticket_prepaid_size(&self, sid: &str, left: Option<i64>) -> Option<(u64, i64, i64)> {
+        let lp = LnPolicy::from_map(&self.config().ln);
+        let s = self.ticket_session(sid)?;
+        if s.prepaid_msat == 0 {
+            return None;
+        }
+        let msat = match left {
+            Some(left) if s.prepaid_min_msat > 0 && s.draws.is_none() => fitting_msat(&lp, s.prepaid_min_msat, s.prepaid_msat, left).unwrap_or(s.prepaid_msat),
+            _ => s.prepaid_msat,
+        };
+        let (face, booked) = booking_of(&lp, msat);
+        Some((msat, face, booked))
     }
 
     /// The hash the session's next release would take at the present height, and how many tickets
@@ -2222,7 +2272,7 @@ impl Signer {
             }
             let s = Session { draws: Some(ticket::Draws::default()), id, payee: terms.payee.clone(), origin: origin.chars().take(200).collect(), task: task_name.clone(),
                               listed, ticket_msat: win_msat, pool: 0, max_tickets: 0, ticket_blocks: terms.win_blocks, max_sats: 0, state: SState::Open,
-                              opened_ts: now, active_ts: now, stopped_ts: 0.0, closed_ts: 0.0, why: String::new(), http: None, prepaid_msat: win_msat, slot_fails: 0,
+                              opened_ts: now, active_ts: now, stopped_ts: 0.0, closed_ts: 0.0, why: String::new(), http: None, prepaid_msat: win_msat, prepaid_min_msat: 0, slot_fails: 0,
                               hold_until: 0.0, hold_why: String::new(), paid_first: false };
             st.commit(&[s.row()])?;
             self.ticket_audit("lottery_open", json!({"session": s.id, "dest": dest, "task": s.task, "listed": listed, "win_msat": win_msat.to_string(), "direct": direct,
@@ -2295,6 +2345,32 @@ fn dropped(t: &Ticket, now: f64) -> Value {
     t.done_ts = now;
     t.note = "its session stopped before an invoice was paid".into();
     t.row()
+}
+
+/// A ticket of `msat` and what paying it books, its fee limit under `lp` included: (face sats,
+/// booked sats).
+fn booking_of(lp: &LnPolicy, msat: u64) -> (i64, i64) {
+    let fee_limit_msat = (lp.fee_limit_sats(sats_ceil(msat)).max(0) as u64).saturating_mul(1000);
+    (sats_ceil(msat), booking_sats(msat, fee_limit_msat))
+}
+
+/// The largest ticket from `lo_msat` to `hi_msat`, in whole sats, whose booking under `lp`, its fee
+/// limit included, is at most `left` sats: `hi_msat` itself where it fits. `None`: none fits.
+fn fitting_msat(lp: &LnPolicy, lo_msat: u64, hi_msat: u64, left: i64) -> Option<u64> {
+    let fits = |m: u64| booking_of(lp, m).1 <= left;
+    if fits(hi_msat) {
+        return Some(hi_msat);
+    }
+    // a fee limit only rises with the amount, so the bookings are in order: the largest that fits by halving
+    let (mut lo, mut hi) = (lo_msat.max(1000).div_ceil(1000), hi_msat / 1000);
+    if lo > hi || !fits(lo * 1000) {
+        return None;
+    }
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if fits(mid * 1000) { lo = mid } else { hi = mid - 1 }
+    }
+    Some(lo * 1000)
 }
 
 #[cfg(test)]

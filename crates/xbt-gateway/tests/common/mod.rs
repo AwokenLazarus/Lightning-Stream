@@ -516,18 +516,28 @@ impl Buyer {
 
     /// Ask for tickets for `secrets`; the invoices' hashes that were issued.
     pub fn lock_raw(&mut self, secrets: &[[u8; 32]]) -> Got {
+        self.lock_with(secrets, &json!({}))
+    }
+
+    /// [`Buyer::lock_raw`] with more fields in the lock's body (`ticketMsat`, say).
+    pub fn lock_with(&mut self, secrets: &[[u8; 32]], more: &Value) -> Got {
         let hashes: Vec<String> = secrets
             .iter()
             .map(|s| hex::encode(ticket::ticket_hash(s)))
             .collect();
+        let with_more = |mut v: Value| {
+            for (k, x) in more.as_object().into_iter().flatten() {
+                v[k] = x.clone();
+            }
+            v.to_string()
+        };
         let (body, headers) = if self.session.is_empty() {
             (
-                json!({"version": "ticket/0", "hashes": hashes}).to_string(),
+                with_more(json!({"version": "ticket/0", "hashes": hashes})),
                 vec![],
             )
         } else {
-            let body = json!({"version": "ticket/0", "session": self.session, "hashes": hashes})
-                .to_string();
+            let body = with_more(json!({"version": "ticket/0", "session": self.session, "hashes": hashes}));
             let sig = self.sign("POST", "/x402/ticket/lock", body.as_bytes(), None, None);
             (body, vec![("PAYMENT-SIGNATURE".to_string(), sig)])
         };
@@ -556,8 +566,16 @@ impl Buyer {
 
     /// Ask for `count` tickets settled on arrival (the seller chooses their hashes).
     pub fn lock_prepaid(&mut self, count: u64) -> Got {
+        self.lock_prepaid_with(count, &json!({}))
+    }
+
+    /// [`Buyer::lock_prepaid`] with more fields in the lock's body.
+    pub fn lock_prepaid_with(&mut self, count: u64, more: &Value) -> Got {
         let first = self.session.is_empty();
         let mut body = json!({"version": "ticket/0", "settle": "on-arrival", "count": count});
+        for (k, x) in more.as_object().into_iter().flatten() {
+            body[k] = x.clone();
+        }
         let mut headers = vec![];
         if !first {
             body["session"] = self.session.clone().into();

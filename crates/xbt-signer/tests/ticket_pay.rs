@@ -42,6 +42,10 @@ use xbt_signer::ticket::SellerTls;
 use xbt_signer::ticket_pay::{TicketWire, UreqWire, WireAnswer};
 use xbt_svc::http::{serve_with, Handler, Limits, Reply, Request, Response, Running, Streamed};
 
+
+/// The limit of a call that pays a few cents' worth: room for a few whole tickets, since the wallet
+/// never pays a ticket that would take it over a call's `max_sats`.
+const CALL: i64 = 5_000;
 const T0: u64 = 1_790_000_000;
 const H0: u64 = 6_720;
 const XBT: &[usize] = &[8, 14, 17, 512];
@@ -1047,7 +1051,7 @@ fn body_of(v: &Value) -> &str {
 fn a_page_is_paid_with_one_ticket_and_the_next_pages_from_the_balance() {
     let _g = env_lock();
     let r = Rig::new(json!({}));
-    let first = r.pay("/page/1000", 10);
+    let first = r.pay("/page/1000", CALL);
     assert_eq!((first["verdict"].as_str(), first["rail"].as_str(), first["status"].as_u64()), (Some("allow"), Some("ticket"), Some(200)), "{first}");
     // the wallet fetched the terms itself, locked a pool of 8, released one ticket and paid 2,500 msat from it
     assert_eq!((first["tickets_released"].as_u64(), first["charged_sats"].as_i64(), first["price_msat"].as_str(), first["balance_msat"].as_str()),
@@ -1070,17 +1074,17 @@ fn a_page_is_paid_with_one_ticket_and_the_next_pages_from_the_balance() {
     assert_eq!((r.shop.settled(), r.shop.held()), (1, 7));
     // later pages: no ticket, no secret, the balance pays; the wallet's count and the seller's receipts agree
     for i in 1..=5u64 {
-        let v = r.pay("/page/300", 10);
+        let v = r.pay("/page/300", CALL);
         assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64(), v["charged_sats"].as_i64(), v["price_msat"].as_str()), (Some(200), Some(0), Some(0), Some("2500")), "{v}");
         assert_eq!(v["balance_msat"], (TICKET - 2500 * (i + 1)).to_string());
         assert_eq!(v["untrusted_provider_response"]["receipt"]["spentMsat"], (2500 * (i + 1)).to_string());
     }
     assert_eq!(r.tap.secrets().len(), 1, "one secret for six pages");
     // a POST with a body is bound to its body, and a service error is passed on and not charged
-    let post = r.call("xbt402_pay", json!({"url": r.shop.url("/api"), "method": "POST", "body": "{\"q\": 1}", "max_sats": 10, "task": "film"}));
+    let post = r.call("xbt402_pay", json!({"url": r.shop.url("/api"), "method": "POST", "body": "{\"q\": 1}", "max_sats": CALL, "task": "film"}));
     assert_eq!((post["status"].as_u64(), post["price_msat"].as_str()), (Some(200), Some("2500")), "{post}");
     assert!(body_of(&post).contains("\\\"q\\\": 1"), "{post}");
-    let broken = r.pay("/broken", 10);
+    let broken = r.pay("/broken", CALL);
     assert_eq!((broken["status"].as_u64(), broken["price_msat"].as_str(), broken["verdict"].as_str()), (Some(500), Some("0"), Some("allow")), "{broken}");
     // the node, the seller, the book and the ledger agree
     assert_eq!(r.money(), (TICKET, TICKET, TICKET, SETTLED));
@@ -1091,7 +1095,7 @@ fn a_page_is_paid_with_one_ticket_and_the_next_pages_from_the_balance() {
     let ch = r.call("channels", json!({}));
     assert_eq!((ch["tickets"]["locked_tickets"].as_i64(), ch["tickets"]["locked_sats"].as_i64(), ch["tickets"]["settled_sats"].as_i64()), (Some(7), Some(7_000), Some(SETTLED)), "{ch}");
     // a free route needs no ticket and no session
-    let free = r.pay("/free/10", 10);
+    let free = r.pay("/free/10", CALL);
     assert_eq!((free["rule"].as_str(), free["charged_sats"].as_i64(), free["bytes"].as_u64()), (Some("free"), Some(0), Some(10)), "{free}");
     // stop: the seller is asked to cancel, and the wallet's own node shows the seven back
     let sid = first["session"].as_str().unwrap().to_string();
@@ -1105,7 +1109,7 @@ fn a_page_is_paid_with_one_ticket_and_the_next_pages_from_the_balance() {
     assert_eq!(r.money(), (TICKET, TICKET, TICKET, SETTLED), "what came back is booked back: one ticket and its fee stay");
     r.assert_booked();
     // the next call opens a new session
-    let again = r.pay("/page/10", 10);
+    let again = r.pay("/page/10", CALL);
     assert_eq!((again["status"].as_u64(), again["tickets_released"].as_u64()), (Some(200), Some(1)), "{again}");
     assert_ne!(again["session"], first["session"]);
 }
@@ -1119,8 +1123,8 @@ fn the_balance_a_session_leaves_with_the_seller_is_always_under_one_ticket() {
     let r = Rig::new(json!({}));
     let (mut released, mut spent) = (0u64, 0u64);
     // a page, then files of 5 MB (the size of the mainnet rehearsal's), 1 MiB, 7 MiB and 3 bytes
-    for (path, max) in [("/page/10".to_string(), 10), (format!("/files/{}", 5_000_000), 2_000), (format!("/files/{MIB}"), 2_000),
-                        (format!("/files/{}", 7 * MIB), 2_000), ("/files/3".to_string(), 10)] {
+    for (path, max) in [("/page/10".to_string(), CALL), (format!("/files/{}", 5_000_000), 2_100), (format!("/files/{MIB}"), 2_100),
+                        (format!("/files/{}", 7 * MIB), 2_100), ("/files/3".to_string(), CALL)] {
         let v = r.pay(&path, max);
         assert_eq!((v["status"].as_u64(), v["complete"].as_bool().unwrap_or(true)), (Some(200), true), "{path}: {v}");
         released += v["tickets_released"].as_u64().unwrap();
@@ -1168,7 +1172,7 @@ fn a_body_is_streamed_to_a_local_reader_as_it_is_paid_and_stops_when_the_reader_
     assert!(v["ended"].as_str().unwrap().contains("stopped by the buyer"), "{v}");
     assert!(v["tickets_released"].as_u64().unwrap() <= 2, "{v}");
     // a name with a path in it is refused before anything is sent
-    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": 10, "task": "film", "stream_to": "../x"}));
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": CALL, "task": "film", "stream_to": "../x"}));
     assert_eq!(v["rule"], "stream_to", "{v}");
     std::env::remove_var("B2_STREAM_DIR");
     r.assert_booked();
@@ -1199,7 +1203,7 @@ fn a_range_is_paid_for_the_bytes_that_arrive_and_its_receipt_signs_that_part() {
     // the Range went on the unpaid request and on the paid one
     assert!(r.tap.seen("/files/").len() >= 2);
     // a part of a page priced by the request: the request's price, and the part's bytes as signed at the head
-    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/5000"), "max_sats": 10, "task": "film", "range": "bytes=1000-1999"}));
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/5000"), "max_sats": CALL, "task": "film", "range": "bytes=1000-1999"}));
     assert_eq!((v["status"].as_u64(), v["bytes"].as_u64(), v["price_msat"].as_str(), v["content_range"].as_str()),
                (Some(206), Some(1000), Some("2500"), Some("bytes 1000-1999/5000")), "{v}");
     assert_eq!((v["receipt"]["body"].as_str(), v["body_digest"].as_str()), (Some("as signed"), Some(digest_of(1000, 1999).as_str())), "{v}");
@@ -1241,12 +1245,12 @@ fn a_range_is_paid_for_the_bytes_that_arrive_and_its_receipt_signs_that_part() {
     // ranges that are not one plain byte range are refused before anything is sent
     let sent = r.tap.log.lock().unwrap().len();
     for bad in ["bytes=5-2", "bytes=-500", "bytes=1-2,4-5", "items=1-", " bytes=1-", "bytes=1 -", "bytes=+1-", "bytes=99999999999999999999-", "bytes="] {
-        let v = r.call("xbt402_pay", json!({"url": r.shop.url("/files/10"), "max_sats": 10, "task": "film", "range": bad}));
+        let v = r.call("xbt402_pay", json!({"url": r.shop.url("/files/10"), "max_sats": CALL, "task": "film", "range": bad}));
         assert_eq!(v["rule"], "range", "{bad}: {v}");
     }
-    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/api"), "method": "POST", "max_sats": 10, "task": "film", "range": "bytes=0-"}));
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/api"), "method": "POST", "max_sats": CALL, "task": "film", "range": "bytes=0-"}));
     assert_eq!(v["rule"], "range", "{v}");
-    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/files/10"), "max_sats": 10, "task": "film", "range": "bytes=0-", "piece_sha256": ["00"]}));
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/files/10"), "max_sats": CALL, "task": "film", "range": "bytes=0-", "piece_sha256": ["00"]}));
     assert_eq!(v["rule"], "range", "{v}");
     assert_eq!(r.tap.log.lock().unwrap().len(), sent, "nothing was sent for a refused range");
     std::env::remove_var("B2_STREAM_DIR");
@@ -1272,21 +1276,23 @@ fn a_file_priced_by_the_byte_is_paid_as_it_arrives_and_stops_where_the_call_or_t
     let secrets = r.tap.secrets();
     assert_eq!((secrets.len(), secrets.iter().collect::<std::collections::HashSet<_>>().len()), (3, 3));
     assert_eq!(r.status()["locked"]["tickets"], 5, "five of eight left: above the refill mark of half the pool");
-    // a longer file under a call that allows 4,000 sat: it stops there, half way, by the wallet's own count
+    // a longer file under a call that allows 4,000 sat: three tickets book 3,009 sat with their fee limits, and a
+    // fourth would take the call to 4,012, above its limit, so none is released. The 600 sat of balance and the
+    // three tickets, 3,600 sat, pay for 18 MiB, and the answer stops there by the wallet's own count
     let big = 40 * MIB;
     let cut = r.pay(&format!("/files/{big}"), 4_000);
     assert_eq!((cut["status"].as_u64(), cut["complete"].as_bool()), (Some(200), Some(false)), "{cut}");
     assert!(cut["ended"].as_str().unwrap().starts_with("stopped by the wallet: max_sats"), "{cut}");
     let got = cut["bytes"].as_u64().unwrap();
-    assert!((20 * MIB as u64..=20 * MIB as u64 + (64 << 10)).contains(&got), "4,000 sat pay for 20 MiB: stopped at {got}");
-    // 600 sat of balance and four tickets: 4,600 sat credited covers the 4,000 the call may use
-    assert_eq!(cut["tickets_released"].as_u64(), Some(4), "{cut}");
+    assert!((18 * MIB as u64..=18 * MIB as u64 + (64 << 10)).contains(&got), "3,600 sat pay for 18 MiB: stopped at {got}");
+    assert_eq!(cut["tickets_released"].as_u64(), Some(3), "{cut}");
+    assert!(cut["charged_sats"].as_i64().unwrap() <= 4_000, "never above the call's limit: {cut}");
     let price = cut["price_msat"].as_str().unwrap().parse::<u64>().unwrap();
-    assert!((4_000_000..=4_600_000).contains(&price), "the seller's charge is within what was released: {price}");
+    assert!((3_000_000..=3_600_000).contains(&price), "the seller's charge is within what was released: {price}");
     // everything that was released is on both nodes and in the ledger, to the millisat
-    assert_eq!(r.money(), (7 * TICKET, 7 * TICKET, 7 * TICKET, 7 * SETTLED));
-    // the pool fell to half (four of eight) during the answer and was filled again behind it; three more were released since
-    wait_refill(&r, "the refill", 5);
+    assert_eq!(r.money(), (6 * TICKET, 6 * TICKET, 6 * TICKET, 6 * SETTLED));
+    // the pool fell to half (four of eight) during the answer and was filled again behind it; two more were released since
+    wait_refill(&r, "the refill", 6);
     assert_eq!(r.ln.state().payments.len(), 12, "eight, and four more when four were left");
     // the agent stops a session while an answer is open: the answer ends within one ticket
     let slow = 30 * MIB;
@@ -1335,8 +1341,9 @@ fn a_model_priced_by_the_token_is_paid_for_its_tokens_and_its_receipt_checked() 
     let r = Rig::new(json!({}));
     let call = |body: Value, max_sats: i64| r.call("xbt402_pay", json!({"url": r.shop.url("/v1/chat/completions"), "method": "POST", "body": body.to_string(),
                                                                           "max_sats": max_sats, "task": "film"}));
-    // streamed: 7 tokens in (28 msat), 40 out (800 msat)
-    let v = call(json!({"messages": [{"role": "user", "content": "hello"}], "stream": true, "x_n": 40}), 20);
+    // streamed: 7 tokens in (28 msat), 40 out (800 msat). The first call buys a whole ticket; the later ones are
+    // served from its balance, so their small limits are what bounds them
+    let v = call(json!({"messages": [{"role": "user", "content": "hello"}], "stream": true, "x_n": 40}), CALL);
     assert_eq!((v["verdict"].as_str(), v["status"].as_u64(), v["price_msat"].as_str()), (Some("allow"), Some(200), Some("828")), "{v}");
     assert_eq!(v["receipt"]["body"], "as signed", "{v}");
     assert!(v.get("seller_fault").is_none(), "{v}");
@@ -1365,14 +1372,14 @@ fn an_unnamed_seller_at_a_private_address_or_over_plain_http_is_sent_nothing() {
     let _g = env_lock();
     let r = Rig::build(json!({}), false);
     for (method, path) in [("GET", "/page/10"), ("POST", "/page/10"), ("DELETE", "/admin")] {
-        let v = r.call("xbt402_pay", json!({"url": r.shop.url(path), "method": method, "body": "x", "max_sats": 10, "task": "swarm"}));
+        let v = r.call("xbt402_pay", json!({"url": r.shop.url(path), "method": method, "body": "x", "max_sats": CALL, "task": "swarm"}));
         assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("dest_private")), "{v}");
         assert!(v["reason"].as_str().unwrap().contains("https only"), "{v}");
     }
     assert!(r.tap.log.lock().unwrap().is_empty() && r.shop.service.hits.load(Ordering::SeqCst) == 0, "nothing was sent");
     // a named seller on this machine is the owner's choice, and is paid as before
     let named = Rig::new(json!({}));
-    assert_eq!(named.pay("/page/10", 10)["status"], 200);
+    assert_eq!(named.pay("/page/10", CALL)["status"], 200);
 }
 
 /// A seller on a LAN (`tickets.seller_tls`): the owner's CA file or pinned certificate is what a
@@ -1392,7 +1399,7 @@ fn a_sellers_own_certificate_is_used_for_a_seller_the_owner_names_and_for_no_oth
     // the sellers answer without a 402: nothing is paid, and the request's trust is what is looked at
     r.tap.set(Box::new(|_, _| Some(Ok(answer(200, vec![], b"free".to_vec())))));
     for (url, task) in [(lan, "film"), (plain, "film"), (stranger, "swarm")] {
-        let v = r.call("xbt402_pay", json!({"url": format!("{url}/page"), "max_sats": 10, "task": task}));
+        let v = r.call("xbt402_pay", json!({"url": format!("{url}/page"), "max_sats": CALL, "task": task}));
         assert_eq!((v["verdict"].as_str(), v["status"].as_u64()), (Some("allow"), Some(200)), "{url}: {v}");
     }
     let trust = r.tap.trust.lock().unwrap().clone();
@@ -1406,14 +1413,14 @@ fn no_request_leaves_for_a_host_the_owner_did_not_allow_and_an_unnamed_seller_is
     let _g = env_lock();
     // the shop is not on the allowlist (and is on this machine, which the owner allows for an unnamed seller here)
     let r = Rig::build(json!({"tickets": {"unlisted_private": true}}), false);
-    let no = r.pay("/page/10", 10);
+    let no = r.pay("/page/10", CALL);
     assert_eq!((no["verdict"].as_str(), no["rule"].as_str()), (Some("deny"), Some("allowlist")), "{no}");
-    let no = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": 10, "task": "film"}));
+    let no = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": CALL, "task": "film"}));
     assert_eq!(no["rule"], "allowlist", "a task that pays named sellers admits nobody else: {no}");
     assert!(r.tap.log.lock().unwrap().is_empty() && r.shop.service.hits.load(Ordering::SeqCst) == 0, "nothing was sent");
     // spellings of a host that two parsers could read differently are refused before anything is sent
     for url in [format!("http://127.1:{}/page/10", r.shop.port), format!("http://127.0.0.1:{}\\@evil.example/page/10", r.shop.port), format!("{}#x", r.shop.url("/page/10"))] {
-        let v = r.call("xbt402_pay", json!({"url": url, "max_sats": 10, "task": "swarm"}));
+        let v = r.call("xbt402_pay", json!({"url": url, "max_sats": CALL, "task": "swarm"}));
         assert_eq!(v["verdict"], "deny", "{url}: {v}");
     }
     assert!(r.tap.log.lock().unwrap().is_empty());
@@ -1421,7 +1428,7 @@ fn no_request_leaves_for_a_host_the_owner_did_not_allow_and_an_unnamed_seller_is
     // then one ticket held at a time (the owner's policy here holds 2 with a seller of a few). FAILS before the
     // owner's decision on sellers it has not named: the session held a pool of 2 from its first lock, and the
     // seller's first hold invoice went to a buyer that had paid it nothing
-    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": 10, "task": "swarm"}));
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": CALL, "task": "swarm"}));
     assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1), Some(1)), "{v}");
     let locks: Vec<Value> = r.tap.seen("/x402/ticket/lock").iter().map(|s| serde_json::from_str(&s.body).unwrap()).collect();
     assert_eq!((locks[0]["settle"].as_str(), locks[0].get("hashes")), (Some("on-arrival"), None), "the first lock is for a prepaid ticket: {locks:?}");
@@ -1480,11 +1487,11 @@ fn velocity_counts_a_session_once_by_default_and_every_release_when_the_owner_sa
     // a second session is the second payment of the hour, and a third is refused before it locks anything
     let sid = v["session"].as_str().unwrap().to_string();
     r.call("ticket_stop", json!({"session": sid}));
-    let second = r.pay("/page/10", 10);
+    let second = r.pay("/page/10", CALL);
     assert_eq!(second["status"].as_u64(), Some(200), "{second}");
     r.call("ticket_stop", json!({"session": second["session"]}));
     let sends = r.ln.state().payments.len();
-    let third = r.pay("/page/10", 10);
+    let third = r.pay("/page/10", CALL);
     assert_eq!((third["verdict"].as_str(), third["rule"].as_str()), (Some("deny"), Some("velocity")), "{third}");
     assert_eq!(r.ln.state().payments.len(), sends, "nothing was locked for it");
     // and a payment of another rail counts the two sessions as two
@@ -1515,7 +1522,7 @@ fn xbt402_pay_takes_the_ticket_entry_then_a_lightning_invoice_and_says_what_is_m
                                                        "settle": "on-use", "receiptKey": hex::encode(ecdsa::pubkey(&receipt_secret())), "session": "/x402/ticket"}});
     let t1 = ticket.clone();
     r.tap.set(Box::new(move |_, _| Some(Ok(required(json!([t1("after-verify")]))))));
-    let v = r.pay("/page/10", 10);
+    let v = r.pay("/page/10", CALL);
     assert_eq!((v["verdict"].as_str(), v["rule"].as_str(), v["charged_sats"].as_i64()), (Some("deny"), Some("no_rail"), Some(0)), "{v}");
     assert_eq!(v["rails_passed_over"][0]["rail"], "ticket");
     assert!(v["rails_passed_over"][0]["why"].as_str().unwrap().contains("after-verify"), "{v}");
@@ -1526,7 +1533,7 @@ fn xbt402_pay_takes_the_ticket_entry_then_a_lightning_invoice_and_says_what_is_m
         big["extra"]["ticketBlocks"] = json!(2016);
         Some(Ok(required(json!([c1, big]))))
     }));
-    let v = r.pay("/page/10", 10);
+    let v = r.pay("/page/10", CALL);
     assert_eq!((v["verdict"].as_str(), v["rule"].as_str(), v["charged_sats"].as_i64()), (Some("deny"), Some("no_rail"), Some(0)), "{v}");
     assert_eq!(v["rails_passed_over"][0]["rail"], "ticket");
     assert!(v["rails_passed_over"][0]["why"].as_str().unwrap().contains("ticket_blocks"), "{v}");
@@ -1558,7 +1565,7 @@ fn xbt402_pay_takes_the_ticket_entry_then_a_lightning_invoice_and_says_what_is_m
         let t3 = ticket.clone();
         let c3 = channel.clone();
         off.tap.set(Box::new(move |_, _| Some(Ok(required(json!([c3, t3("with-request")]))))));
-        let v = off.pay("/page/10", 10);
+        let v = off.pay("/page/10", CALL);
         assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("no_rail")), "{v}");
         let why: Vec<(&str, &str)> = v["rails_passed_over"].as_array().unwrap().iter().map(|x| (x["rail"].as_str().unwrap(), x["why"].as_str().unwrap())).collect();
         assert_eq!(why.iter().map(|w| w.0).collect::<Vec<_>>(), ["ticket", "channel"], "{v}");
@@ -1628,14 +1635,14 @@ fn a_seller_whose_terms_or_invoices_name_another_node_is_paid_nothing() {
     // the terms name the node the owner tied to this origin, the invoices pay another
     let r = Rig::new(json!({}));
     *r.shop.node.lie.lock().unwrap() = Lie::OtherPayee;
-    let v = r.pay("/page/10", 10);
+    let v = r.pay("/page/10", CALL);
     assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("ticket_payee")), "{v}");
     assert!(r.ln.state().payments.is_empty() && r.tap.secrets().is_empty() && r.ledger().is_empty());
     assert!(r.audit("ticket_refused").iter().all(|e| e["rule"] == "ticket_payee"), "{:?}", r.audit("ticket_refused"));
     assert_eq!(r.audit("ticket_refused").len(), 8);
     // invoices for one msat more than the ticket
     *r.shop.node.lie.lock().unwrap() = Lie::OtherAmount;
-    let v = r.pay("/page/10", 10);
+    let v = r.pay("/page/10", CALL);
     assert_eq!(v["rule"], "ticket_amount", "{v}");
     assert!(r.ln.state().payments.is_empty() && r.ledger().is_empty());
     // the terms name a node the owner did not tie to this origin: under a task that pays named sellers it is nobody
@@ -1655,7 +1662,7 @@ fn a_seller_whose_terms_or_invoices_name_another_node_is_paid_nothing() {
         }
         Some(Ok(answer(status, headers, body)))
     }));
-    let v = r.pay("/page/10", 10);
+    let v = r.pay("/page/10", CALL);
     assert_eq!(v["rule"], "no_rail", "{v}");
     assert!(v["rails_passed_over"][0]["why"].as_str().unwrap().contains("ticket_admission"), "{v}");
     assert!(r.ln.state().payments.is_empty() && r.ledger().is_empty() && r.tap.secrets().is_empty());
@@ -1665,7 +1672,7 @@ fn a_seller_whose_terms_or_invoices_name_another_node_is_paid_nothing() {
 fn terms_that_change_under_an_open_session_stop_it_and_pay_nothing_more() {
     let _g = env_lock();
     let r = Rig::new(json!({}));
-    let first = r.pay("/page/10", 10);
+    let first = r.pay("/page/10", CALL);
     assert_eq!(first["status"].as_u64(), Some(200), "{first}");
     let other = node_id(&SecretKey::from_slice(&[0x44; 32]).unwrap());
     r.tap.set(Box::new(move |seen, real| {
@@ -1680,13 +1687,13 @@ fn terms_that_change_under_an_open_session_stop_it_and_pay_nothing_more() {
         }
         Some(Ok(answer(status, headers, body)))
     }));
-    let v = r.pay("/page/10", 10);
+    let v = r.pay("/page/10", CALL);
     assert_eq!((v["verdict"].as_str(), v["rule"].as_str(), v["stopped"]["cancel_sent"].as_bool()), (Some("deny"), Some("ticket_terms_changed"), Some(true)), "{v}");
     assert_eq!(r.tap.secrets().len(), 1, "no secret after the terms changed");
     wait_for("the unused tickets to come back", || r.ln.by_status("IN_FLIGHT").is_empty());
     assert_eq!(r.money(), (TICKET, TICKET, TICKET, SETTLED), "one ticket, booked exactly");
     // on the new terms the seller is another node: not the one the owner named
-    let v = r.pay("/page/10", 10);
+    let v = r.pay("/page/10", CALL);
     assert_eq!(v["rule"], "no_rail", "{v}");
     r.assert_booked();
 }
@@ -1695,10 +1702,10 @@ fn terms_that_change_under_an_open_session_stop_it_and_pay_nothing_more() {
 /// answer: the session then holds one released ticket and seven locked ones.
 fn lied_to(hook: Hook) -> (Rig, Value) {
     let r = Rig::new(json!({}));
-    let first = r.pay("/page/10", 10);
+    let first = r.pay("/page/10", CALL);
     assert_eq!(first["status"].as_u64(), Some(200), "{first}");
     r.tap.set(hook);
-    let v = r.pay("/page/20", 10);
+    let v = r.pay("/page/20", CALL);
     r.tap.clear();
     (r, v)
 }
@@ -1774,8 +1781,8 @@ fn a_receipt_that_charges_more_than_the_terms_or_is_missing_or_is_for_another_re
         }
         Some(Ok(answer(status, headers, body)))
     }));
-    assert_eq!(r.pay("/page/10", 10)["status"].as_u64(), Some(200));
-    let v = r.pay("/page/10", 10);
+    assert_eq!(r.pay("/page/10", CALL)["status"].as_u64(), Some(200));
+    let v = r.pay("/page/10", CALL);
     r.tap.clear();
     assert_eq!(v["rule"], "ticket_seller_fault", "the same page again, answered with the first answer's receipt: {v}");
     assert!(v["reason"].as_str().unwrap().contains("another request"), "{v}");
@@ -1808,7 +1815,7 @@ fn a_forged_refusal_releases_nothing_and_a_signed_one_is_believed_for_one_ticket
     one_ticket_booked_exactly(&r, "a forged refusal");
     // a forged bad_seq is adopted (a seq only orders requests) and costs nothing
     let r = Rig::new(json!({}));
-    assert_eq!(r.pay("/page/10", 10)["status"].as_u64(), Some(200));
+    assert_eq!(r.pay("/page/10", CALL)["status"].as_u64(), Some(200));
     let n = Arc::new(AtomicUsize::new(0));
     let n1 = n.clone();
     r.tap.set(Box::new(move |seen, _| {
@@ -1817,7 +1824,7 @@ fn a_forged_refusal_releases_nothing_and_a_signed_one_is_believed_for_one_ticket
         }
         None
     }));
-    let v = r.pay("/page/10", 10);
+    let v = r.pay("/page/10", CALL);
     assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64()), (Some(200), Some(0)), "the seller said which seq it expects, and the wallet took that: {v}");
     assert_eq!(r.tap.secrets().len(), 1);
 }
@@ -1836,7 +1843,7 @@ fn an_answer_that_is_lost_never_releases_a_second_secret_for_the_same_ticket() {
         }
         None
     }));
-    let v = r.pay("/page/10", 10);
+    let v = r.pay("/page/10", CALL);
     assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64()), (Some(200), Some(1)), "{v}");
     assert_eq!((r.tap.secrets().len(), r.shop.settled()), (1, 1), "the secret was not sent again: the seller had it");
     // the release is lost before the seller saw it: the same secret goes again, and no other
@@ -1849,7 +1856,7 @@ fn an_answer_that_is_lost_never_releases_a_second_secret_for_the_same_ticket() {
         }
         None
     }));
-    let v = r.pay("/page/10", 10);
+    let v = r.pay("/page/10", CALL);
     assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64(), v["charged_sats"].as_i64()), (Some(200), Some(1), Some(BOOKING)), "{v}");
     let secrets = r.tap.secrets();
     assert_eq!((secrets.len(), secrets[0] == secrets[1], r.shop.settled()), (2, true, 1), "the same secret twice, one ticket");
@@ -1865,12 +1872,12 @@ fn an_answer_that_is_lost_never_releases_a_second_secret_for_the_same_ticket() {
         }
         (d1.load(Ordering::SeqCst) == 1).then(|| Err(xbt402::ChannelError::new("transport_error", "timed out")))
     }));
-    let v = r.pay("/page/10", 10);
+    let v = r.pay("/page/10", CALL);
     assert_eq!((v["verdict"].as_str(), v["rule"].as_str(), v["charged_sats"].as_i64()), (Some("deny"), Some("ticket_seller"), Some(BOOKING)), "{v}");
     assert!(v["unconfirmed_release"].is_string(), "{v}");
     assert_eq!((r.ledger_sum(), r.shop.settled()), (BOOKING, 0), "spent when it left, whatever came back");
     r.tap.clear();
-    let v = r.pay("/page/10", 10);
+    let v = r.pay("/page/10", CALL);
     assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64()), (Some(200), Some(0)), "{v}");
     let secrets = r.tap.secrets();
     assert!(secrets.len() >= 2 && secrets.iter().all(|s| *s == secrets[0]), "only ever the one secret: {}", secrets.len());
@@ -1918,7 +1925,7 @@ fn a_proxy_that_holds_back_the_tail_of_an_answer_does_not_stall_it() {
         Some(Ok(WireAnswer { status: ans.status, headers: ans.headers, length: ans.length, body: Box::new(Blocks(ans.body, vec![], false)) }))
     }));
     // a page first, as on mainnet: what it cost moves every paid boundary of the file off the proxy's blocks
-    let page = r.pay("/page/10", 10);
+    let page = r.pay("/page/10", CALL);
     assert_eq!(page["status"].as_u64(), Some(200), "{page}");
     let n = 12 * MIB;
     let v = r.pay(&format!("/files/{n}"), 5_000);
@@ -1960,7 +1967,7 @@ fn an_answer_that_stops_in_the_middle_costs_what_was_released_for_it() {
     assert_eq!((v["tickets_released"].as_u64(), r.tap.secrets().len()), (Some(2), 2), "{v}");
     assert_eq!(r.money(), (2 * TICKET, 2 * TICKET, 2 * TICKET, 2 * SETTLED));
     // the session goes on: the seller's signed balance is what is left
-    let next = r.pay("/page/10", 10);
+    let next = r.pay("/page/10", CALL);
     assert_eq!((next["status"].as_u64(), next["tickets_released"].as_u64()), (Some(200), Some(0)), "{next}");
     r.assert_booked();
 }
@@ -1971,14 +1978,14 @@ fn no_secret_leaves_for_a_ticket_the_seller_has_not_shown_locked() {
     let r = Rig::new(json!({"tickets": {"enabled": true, "ready_wait_ms": 300, "tasks": {"film": {"budget_sats": 40_000}}}}));
     // the seller's node holds the payments, and the seller has not heard of it yet
     r.shop.standin.hold_streams(true);
-    let v = r.pay("/page/10", 10);
+    let v = r.pay("/page/10", CALL);
     assert_eq!((v["verdict"].as_str(), v["rule"].as_str(), v["charged_sats"].as_i64()), (Some("deny"), Some("ticket_not_ready"), Some(0)), "{v}");
     assert!(r.tap.secrets().is_empty() && r.ledger().is_empty(), "nothing was released and nothing booked");
     assert_eq!(r.shop.held(), 8, "the tickets are locked on the seller's node all the same");
     assert!(r.tap.seen("/x402/ticket/status").len() >= 2, "it asked more than once, and gave up after 300 ms");
     // once the seller says so, the same session pays
     r.shop.standin.hold_streams(false);
-    let v = r.pay("/page/10", 10);
+    let v = r.pay("/page/10", CALL);
     assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64()), (Some(200), Some(1)), "{v}");
     assert_eq!(r.audit("ticket_open").len(), 1, "the session of the first call");
 }
@@ -1987,7 +1994,7 @@ fn no_secret_leaves_for_a_ticket_the_seller_has_not_shown_locked() {
 fn while_the_wallets_own_node_is_away_no_hash_is_offered_and_the_next_call_pays_when_it_is_back() {
     let _g = env_lock();
     let r = Rig::new(json!({"tickets": {"enabled": true, "pool": 2, "tasks": {"film": {"budget_sats": 40_000}}}}));
-    assert_eq!(r.pay("/page/10", 10)["status"].as_u64(), Some(200));
+    assert_eq!(r.pay("/page/10", CALL)["status"].as_u64(), Some(200));
     // one of two is left, so the next is locked behind the call: that round is over before the node goes
     wait_refill(&r, "the refill behind the first call", 2);
     // the node goes away in the middle of a file: the two tickets of the pool are released (a release needs no node),
@@ -2000,7 +2007,7 @@ fn while_the_wallets_own_node_is_away_no_hash_is_offered_and_the_next_call_pays_
     assert_eq!(r.tap.seen("/x402/ticket/lock").len(), locks_before, "no hash went to the seller while the node could not pay for it");
     // the node is back: the very next call fills the pool and pays
     r.ln.st.lock().unwrap().down = false;
-    let v = r.pay("/page/10", 10);
+    let v = r.pay("/page/10", CALL);
     assert_eq!(v["status"].as_u64(), Some(200), "{v}");
     r.assert_booked();
 }
@@ -2009,7 +2016,7 @@ fn while_the_wallets_own_node_is_away_no_hash_is_offered_and_the_next_call_pays_
 fn a_lock_round_that_never_reached_an_invoice_frees_its_places_in_the_pool_at_once() {
     let _g = env_lock();
     let r = Rig::new(json!({"tickets": {"enabled": true, "pool": 2, "tasks": {"film": {"budget_sats": 40_000}}}}));
-    assert_eq!(r.pay("/page/10", 10)["status"].as_u64(), Some(200));
+    assert_eq!(r.pay("/page/10", CALL)["status"].as_u64(), Some(200));
     // the answer to the next lock is lost: its hashes were offered and no invoice came for them
     let n = Arc::new(AtomicUsize::new(0));
     let n1 = n.clone();
@@ -2040,7 +2047,7 @@ fn no_ticket_is_released_into_an_answer_the_seller_is_still_waiting_to_go_on_wit
     REFILL_WAIT_MS.store(3_000, Ordering::SeqCst);
     let r = Rig::new(json!({"tickets": {"enabled": true, "pool": 2, "tasks": {"film": {"budget_sats": 40_000}}}}));
     REFILL_WAIT_MS.store(400, Ordering::SeqCst);
-    assert_eq!(r.pay("/page/10", 10)["status"].as_u64(), Some(200));
+    assert_eq!(r.pay("/page/10", CALL)["status"].as_u64(), Some(200));
     // the wallet's node goes away in the middle of a file: the answer ends when the pool is used up, and the seller,
     // which has sent everything that was paid for, goes on waiting for the next ticket
     r.ln.st.lock().unwrap().down = true;
@@ -2054,7 +2061,7 @@ fn no_ticket_is_released_into_an_answer_the_seller_is_still_waiting_to_go_on_wit
     // seller would charge it for bytes nobody reads; the wallet waits for the seller to close it first
     r.ln.st.lock().unwrap().down = false;
     let t = Instant::now();
-    let v = r.pay("/page/10", 10);
+    let v = r.pay("/page/10", CALL);
     assert_eq!((v["verdict"].as_str(), v["status"].as_u64(), v["price_msat"].as_str()), (Some("allow"), Some(200), Some("2500")), "{v}");
     if unclosed {
         assert!(t.elapsed() >= Duration::from_millis(300), "it waited for the seller's last receipt of the old answer");
@@ -2087,7 +2094,7 @@ fn a_kill_of_the_signer_at_every_write_of_a_paid_call_never_undercounts_and_the_
     let mut survived = None;
     for step in 0..400 {
         let mut r = Rig::new(json!({}));
-        let done = crashing(step, || r.pay("/page/10", 10));
+        let done = crashing(step, || r.pay("/page/10", CALL));
         if let Some(v) = &done {
             assert_eq!(v["status"].as_u64(), Some(200), "step {step}: {v}");
             survived = Some(step);
@@ -2114,7 +2121,7 @@ fn a_kill_of_the_signer_at_every_write_of_a_paid_call_never_undercounts_and_the_
         assert_eq!(ledger, (paid / TICKET) as i64 * SETTLED, "step {step}: only what the seller took stays booked");
         assert!(paid <= TICKET, "step {step}: at most the one ticket of the call");
         // the next call opens a new session and pays; nothing is paid twice
-        let v = r.pay("/page/10", 10);
+        let v = r.pay("/page/10", CALL);
         assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64()), (Some(200), Some(1)), "step {step}: {v}");
         r.assert_booked();
         if done.is_some() {
@@ -2136,7 +2143,7 @@ fn a_kill_of_the_signer_at_every_write_of_a_paid_call_never_undercounts_and_the_
 fn a_seller_that_holds_only_after_a_prepaid_ticket_is_paid_one_first_and_then_held_ones() {
     let _g = env_lock();
     let r = Rig::shipped(json!({}), 30, strict_shop());
-    let v = r.pay("/page/10", 10);
+    let v = r.pay("/page/10", CALL);
     assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1), Some(1)), "{v}");
     let locks: Vec<Value> = r.tap.seen("/x402/ticket/lock").iter().map(|s| serde_json::from_str(&s.body).unwrap()).collect();
     assert_eq!(locks[0]["settle"], "on-arrival", "the prepaid lock first: {locks:?}");
@@ -2160,7 +2167,7 @@ fn an_unnamed_seller_without_prepaid_tickets_is_not_held_with() {
     let _g = env_lock();
     let held_only = json!({"tickets": {"settle": ["on-use"]}, "caps": {"sessions_per_address": 0}});
     let r = Rig::with(json!({"tickets": {"unlisted_private": true}}), false, true, 30, held_only);
-    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": 10, "task": "swarm"}));
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": CALL, "task": "swarm"}));
     assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("no_rail")), "{v}");
     assert!(v["rails_passed_over"][0]["why"].as_str().unwrap().starts_with("ticket_prepaid_first"), "{v}");
     assert!(r.tap.seen("/x402/ticket/").is_empty() && r.ln.paid_msat() == 0, "nothing locked, nothing paid");
@@ -2175,7 +2182,7 @@ fn a_kill_at_every_write_of_a_call_that_buys_its_prepaid_ticket_first_never_unde
     let mut survived = None;
     for step in 0..400 {
         let mut r = Rig::shipped(json!({}), 30, strict_shop());
-        let done = crashing(step, || r.pay("/page/10", 10));
+        let done = crashing(step, || r.pay("/page/10", CALL));
         if let Some(v) = &done {
             assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "step {step}: {v}");
             survived = Some(step);
@@ -2196,7 +2203,7 @@ fn a_kill_at_every_write_of_a_call_that_buys_its_prepaid_ticket_first_never_unde
         assert_eq!(taken, paid, "step {step}");
         assert!(paid <= TICKET, "step {step}: {paid}");
         assert_eq!(ledger, (paid / TICKET) as i64 * SETTLED, "step {step}: {:?}", r.ledger());
-        let v = r.pay("/page/10", 10);
+        let v = r.pay("/page/10", CALL);
         assert_eq!(v["status"].as_u64(), Some(200), "step {step}: {v}");
         r.assert_booked();
         if done.is_some() {
@@ -2220,7 +2227,7 @@ fn a_kill_of_the_signer_at_every_write_of_an_ordinary_payment_leaves_nothing_boo
     for step in 0..400 {
         // a seller that offers only prepaid tickets: the page is paid by one ordinary payment
         let mut r = Rig::shipped(json!({}), 30, json!({"tickets": {"settle": ["on-arrival"]}, "caps": {"sessions_per_address": 0}}));
-        let done = crashing(step, || r.pay("/page/10", 10));
+        let done = crashing(step, || r.pay("/page/10", CALL));
         if let Some(v) = &done {
             assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "step {step}: {v}");
             survived = Some(step);
@@ -2249,11 +2256,11 @@ fn a_kill_of_the_signer_at_every_write_of_an_ordinary_payment_leaves_nothing_boo
 fn a_restart_of_the_gateway_or_of_the_signer_in_the_middle_of_a_session_resumes_or_says_so() {
     let _g = env_lock();
     let mut r = Rig::new(json!({}));
-    let first = r.pay("/page/10", 10);
+    let first = r.pay("/page/10", CALL);
     assert_eq!(first["status"].as_u64(), Some(200), "{first}");
     // the gateway is killed and started again on its journal: the session, its key and its balance are there
     r.shop.restart();
-    let v = r.pay("/page/10", 10);
+    let v = r.pay("/page/10", CALL);
     assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64(), v["session"] == first["session"]), (Some(200), Some(0), true), "{v}");
     // the signer is killed with seven tickets locked: every one is booked at its worst case, none is released by the
     // new process, and its seller is asked to cancel them
@@ -2274,7 +2281,7 @@ fn a_restart_of_the_gateway_or_of_the_signer_in_the_middle_of_a_session_resumes_
     r.tick();
     assert_eq!(r.tap.seen("/x402/ticket/cancel").len(), asked, "and not again");
     // the next call resumes with a new session
-    let v = r.pay("/page/10", 10);
+    let v = r.pay("/page/10", CALL);
     assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64()), (Some(200), Some(1)), "{v}");
     assert_ne!(v["session"], first["session"]);
     // the seller forgets the session (its state directory is gone): the wallet is told plainly and opens another
@@ -2289,9 +2296,9 @@ fn a_restart_of_the_gateway_or_of_the_signer_in_the_middle_of_a_session_resumes_
         l
     }).unwrap();
     r.shop.up(listener);
-    let lost = r.pay("/page/10", 10);
+    let lost = r.pay("/page/10", CALL);
     assert_eq!((lost["verdict"].as_str(), lost["rule"].as_str(), lost["tickets_released"].as_u64()), (Some("deny"), Some("ticket_seller_fault"), Some(0)), "{lost}");
-    let v = r.pay("/page/10", 10);
+    let v = r.pay("/page/10", CALL);
     assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64()), (Some(200), Some(1)), "{v}");
     r.assert_booked();
 }
@@ -2300,7 +2307,7 @@ fn a_restart_of_the_gateway_or_of_the_signer_in_the_middle_of_a_session_resumes_
 fn a_seller_the_owner_takes_off_the_list_is_not_sent_another_byte_not_even_a_cancel() {
     let _g = env_lock();
     let mut r = Rig::new(json!({}));
-    assert_eq!(r.pay("/page/10", 10)["status"].as_u64(), Some(200));
+    assert_eq!(r.pay("/page/10", CALL)["status"].as_u64(), Some(200));
     // the owner's policy no longer names the shop; the signer starts again on it
     let mut pol: Value = serde_json::from_str(&std::fs::read_to_string(r.root.join("policy.json")).unwrap()).unwrap();
     pol["allowlist"] = json!([PROVIDER]);
@@ -2309,7 +2316,7 @@ fn a_seller_the_owner_takes_off_the_list_is_not_sent_another_byte_not_even_a_can
     let sent = r.tap.log.lock().unwrap().len();
     let acts = r.tick();
     assert!(acts["actions"].as_array().unwrap().iter().any(|a| a["ticket_cancel_asked"]["cancel_sent"] == false), "{acts}");
-    let v = r.pay("/page/10", 10);
+    let v = r.pay("/page/10", CALL);
     assert_eq!(v["rule"], "allowlist", "{v}");
     assert_eq!(r.tap.log.lock().unwrap().len(), sent, "nothing was sent to it");
     // its seven tickets stay locked and booked until the seller cancels them itself or they expire
@@ -2320,7 +2327,7 @@ fn a_seller_the_owner_takes_off_the_list_is_not_sent_another_byte_not_even_a_can
 fn an_idle_session_is_stopped_and_its_tickets_cancelled_by_the_wallet_itself() {
     let _g = env_lock();
     let r = Rig::new(json!({}));
-    let v = r.pay("/page/10", 10);
+    let v = r.pay("/page/10", CALL);
     assert_eq!(v["status"].as_u64(), Some(200), "{v}");
     r.clock.fetch_add(100, Ordering::SeqCst);
     assert!(r.tick()["actions"].as_array().unwrap().iter().all(|a| a.get("ticket_idle_stop").is_none()), "100 s is not idle");
@@ -2397,7 +2404,7 @@ fn session_of(r: &Rig, v: &Value) -> Value {
 fn as_shipped_a_session_holds_two_tickets_and_the_next_is_locked_when_one_is_left() {
     let _g = env_lock();
     let r = Rig::shipped(json!({}), 30, shipped_shop());
-    let first = r.pay("/page/1000", 10);
+    let first = r.pay("/page/1000", CALL);
     assert_eq!((first["verdict"].as_str(), first["rail"].as_str(), first["status"].as_u64()), (Some("allow"), Some("ticket"), Some(200)), "{first}");
     assert_eq!((first["tickets_released"].as_u64(), first["tickets_prepaid"].as_u64(), first["charged_sats"].as_i64()), (Some(1), Some(0), Some(BOOKING)), "{first}");
     // two were locked, one was released, and the next is locked behind the call: one left is the refill mark
@@ -2414,7 +2421,7 @@ fn as_shipped_a_session_holds_two_tickets_and_the_next_is_locked_when_one_is_lef
     assert_eq!((v["tickets_released"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(2), Some(0)), "997.5 sat of balance and two tickets pay for 2,400: {v}");
     assert!(r.ln.state().peak <= 3, "two held and at most one on its way to being settled: {}", r.ln.state().peak);
     // a refill that was asked for while another was out is made by the next call at the latest
-    assert_eq!(r.pay("/page/300", 10)["tickets_released"], 0);
+    assert_eq!(r.pay("/page/300", CALL)["tickets_released"], 0);
     wait_refill(&r, "the last refill", 2);
     assert_eq!(r.money(), (3 * TICKET, 3 * TICKET, 3 * TICKET, 3 * SETTLED));
     r.assert_booked();
@@ -2429,7 +2436,7 @@ fn where_no_slot_is_free_for_a_held_ticket_the_wallet_buys_prepaid_ones_one_at_a
     let r = Rig::shipped(json!({}), 30, shipped_shop());
     // the wallet's channel already carries 15 payments of its node's own routing: half of its 30
     r.ln.st.lock().unwrap().foreign = 15;
-    let first = r.pay("/page/1000", 10);
+    let first = r.pay("/page/1000", CALL);
     assert_eq!((first["verdict"].as_str(), first["status"].as_u64(), first["tickets_released"].as_u64(), first["tickets_prepaid"].as_u64()),
                (Some("allow"), Some(200), Some(1), Some(1)), "{first}");
     assert_eq!((first["charged_sats"].as_i64(), first["balance_msat"].as_str()), (Some(SETTLED), Some("997500")), "booked at what the node paid: {first}");
@@ -2443,7 +2450,7 @@ fn where_no_slot_is_free_for_a_held_ticket_the_wallet_buys_prepaid_ones_one_at_a
     assert_eq!(locks.len(), 1, "{locks:?}", locks = locks.iter().map(|l| l.body.clone()).collect::<Vec<_>>());
     assert_eq!(serde_json::from_str::<Value>(&locks[0].body).unwrap(), json!({"version": "ticket/0", "settle": "on-arrival", "count": 1}));
     // the balance pays the next pages: no ticket is bought ahead
-    let v = r.pay("/page/300", 10);
+    let v = r.pay("/page/300", CALL);
     assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64()), (Some(200), Some(0)), "{v}");
     assert_eq!(r.ln.state().payments.len(), 1);
     // a file of 2,400 sat: prepaid tickets, each bought when the balance has run out, never two at once
@@ -2463,7 +2470,7 @@ fn where_no_slot_is_free_for_a_held_ticket_the_wallet_buys_prepaid_ones_one_at_a
     // the channel empties: a new session holds tickets again
     r.call("ticket_stop", json!({"session": first["session"]}));
     r.ln.st.lock().unwrap().foreign = 0;
-    let again = r.pay("/page/1000", 10);
+    let again = r.pay("/page/1000", CALL);
     assert_eq!((again["tickets_released"].as_u64(), again["tickets_prepaid"].as_u64()), (Some(1), Some(0)), "{again}");
     assert_eq!(session_of(&r, &again)["pool"], 2);
 }
@@ -2474,19 +2481,19 @@ fn held_tickets_never_take_more_than_half_of_the_channels_slots() {
     // room for one: 14 of the 30 are pending already
     let r = Rig::shipped(json!({}), 30, held_only_shop());
     r.ln.st.lock().unwrap().foreign = 14;
-    let v = r.pay("/page/1000", 10);
+    let v = r.pay("/page/1000", CALL);
     assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64()), (Some(200), Some(1)), "{v}");
     assert_eq!(session_of(&r, &v)["pool"], 1, "one ticket fits under half");
     // no room, and a seller that offers nothing but held tickets: nothing is locked, and the call says why
     let r = Rig::shipped(json!({}), 30, held_only_shop());
     r.ln.st.lock().unwrap().foreign = 15;
-    let v = r.pay("/page/1000", 10);
+    let v = r.pay("/page/1000", CALL);
     assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("no_rail")), "{v}");
     assert!(v["rails_passed_over"][0]["why"].as_str().unwrap().starts_with("ticket_slots"), "{v}");
     assert_eq!((r.ln.state().payments.len(), r.shop.standin.invoices(), r.ledger_sum()), (0, 0, 0), "nothing was asked of the seller's node and nothing paid");
     // the channel fills between the session's opening and its refill: the refill locks nothing more
     let r = Rig::shipped(json!({}), 30, held_only_shop());
-    let v = r.pay("/page/1000", 10);
+    let v = r.pay("/page/1000", CALL);
     assert_eq!(v["status"].as_u64(), Some(200), "{v}");
     wait_refill(&r, "the first refill", 2);
     r.ln.st.lock().unwrap().foreign = 13;
@@ -2512,12 +2519,12 @@ fn held_tickets_never_take_more_than_half_of_the_channels_slots() {
         st.channel.as_object_mut().unwrap().remove("remote_constraints");
         st.foreign = 15;
     }
-    let v = r.pay("/page/1000", 10);
+    let v = r.pay("/page/1000", CALL);
     assert_eq!(v["rule"], "no_rail", "{v}");
     // and on a channel that carries 483 the owner's own cap of 15 held tickets still stands
     let r = Rig::shipped(json!({}), 483, held_only_shop());
     r.ln.st.lock().unwrap().foreign = 200;
-    let v = r.pay("/page/1000", 10);
+    let v = r.pay("/page/1000", CALL);
     assert_eq!((v["status"].as_u64(), session_of(&r, &v)["pool"].as_i64()), (Some(200), Some(2)), "{v}");
 }
 
@@ -2532,7 +2539,7 @@ fn a_ticket_below_a_channels_dust_limit_is_never_held() {
         st.channel["remote_constraints"]["dust_limit_sat"] = "546".into();
         st.channel["remote_pubkey"] = r.shop.id().into();
     }
-    let v = r.pay("/page/1000", 10);
+    let v = r.pay("/page/1000", CALL);
     assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1), Some(0)), "{v}");
     assert_eq!(session_of(&r, &v)["ticket_msat"], "600000");
     // the same ticket through a routing node: past the wallet's own channel the route may have a channel without
@@ -2540,44 +2547,44 @@ fn a_ticket_below_a_channels_dust_limit_is_never_held() {
     // for on regtest. Not held. FAILS before the fee-aware floor: the wallet looked at its own channel only
     let r = Rig::shipped(json!({}), 30, small(json!(["on-use"])));
     r.ln.st.lock().unwrap().channel["remote_constraints"]["dust_limit_sat"] = "546".into();
-    let v = r.pay("/page/1000", 10);
+    let v = r.pay("/page/1000", CALL);
     assert_eq!(v["rule"], "no_rail", "{v}");
     assert!(v["rails_passed_over"][0]["why"].as_str().unwrap().contains("below 724000 msat"), "{v}");
     // at the owner's 10 sat/vB, the mainnet default, the floor through a hop is 2,304 sat: the shipped 1,000-sat ticket
     // is not held, and the seller's prepaid ticket pays the call
     let r = Rig::shipped(json!({"tickets": {"feerate_cap_sat_per_kw": 2_500}}), 30, shipped_shop());
-    let v = r.pay("/page/1000", 10);
+    let v = r.pay("/page/1000", CALL);
     assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64(), r.shop.held()), (Some(200), Some(1), 0), "{v}");
     assert_eq!(session_of(&r, &v)["hold_why"], "ticket_dust");
     // a seller whose ticket is 3,000 sat, above the floor, and an owner whose largest ticket allows it: held. (A seller
     // that lets the buyer choose a size is asked for one at the floor or above: tests/ticket_book.rs)
     let r = Rig::shipped(json!({"tickets": {"feerate_cap_sat_per_kw": 2_500, "max_ticket_sats": 3_000, "seller_max_locked_sats": 6_000}}), 30,
                          json!({"tickets": {"ticket_msat": 3_000_000, "settle": ["on-use"]}, "caps": {"sessions_per_address": 0}}));
-    let v = r.pay("/page/1000", 10);
+    let v = r.pay("/page/1000", CALL);
     assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(0)), "{v}");
     assert_eq!(session_of(&r, &v)["ticket_msat"], "3000000");
     // one side says 601 sat: the ticket would have no output in that side's transaction. Not held; with nothing else on offer, not paid
     let r = Rig::shipped(json!({}), 30, small(json!(["on-use"])));
     r.ln.st.lock().unwrap().channel["remote_constraints"]["dust_limit_sat"] = "601".into();
-    let v = r.pay("/page/1000", 10);
+    let v = r.pay("/page/1000", CALL);
     assert_eq!(v["rule"], "no_rail", "{v}");
     assert!(v["rails_passed_over"][0]["why"].as_str().unwrap().starts_with("ticket_dust"), "{v}");
     assert_eq!((r.ln.state().payments.len(), r.ledger_sum()), (0, 0));
     // the same seller offering prepaid tickets as well: paid at once, held never
     let r = Rig::shipped(json!({}), 30, small(json!(["on-use", "on-arrival"])));
     r.ln.st.lock().unwrap().channel["remote_constraints"]["dust_limit_sat"] = "601".into();
-    let v = r.pay("/page/1000", 10);
+    let v = r.pay("/page/1000", CALL);
     assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64(), r.shop.held()), (Some(200), Some(1), 0), "{v}");
     assert_eq!(session_of(&r, &v)["hold_why"], "ticket_dust");
     // a channel without anchors: the HTLC's own transaction pays a fee, 703 weight units at four times 253 per kw
     // is 712 sat on top of the dust limit, so a 1,000-sat ticket is not held there
     let r = Rig::shipped(json!({}), 30, held_only_shop());
     r.ln.st.lock().unwrap().channel["commitment_type"] = "STATIC_REMOTE_KEY".into();
-    let v = r.pay("/page/1000", 10);
+    let v = r.pay("/page/1000", CALL);
     assert!(v["rails_passed_over"][0]["why"].as_str().unwrap().starts_with("ticket_dust"), "{v}");
     // the dust limit rises under an open session (the channel it left on closed, another is in the way): the refill holds nothing
     let r = Rig::shipped(json!({}), 30, shipped_shop());
-    let v = r.pay("/page/1000", 10);
+    let v = r.pay("/page/1000", CALL);
     assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(0)), "{v}");
     wait_refill(&r, "the first refill", 2);
     r.ln.st.lock().unwrap().channel["remote_constraints"]["dust_limit_sat"] = "1001".into();
@@ -2599,7 +2606,7 @@ fn a_lock_that_finds_no_slot_makes_the_wallet_hold_less_wait_and_then_pay_anothe
     // a seller that offers prepaid tickets: the first two locks meet a full channel somewhere on the way
     let r = Rig::shipped(json!({}), 30, shipped_shop());
     r.ln.st.lock().unwrap().fail_next = 2;
-    let v = r.pay("/page/1000", 10);
+    let v = r.pay("/page/1000", CALL);
     assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1), Some(1)), "{v}");
     let s = session_of(&r, &v);
     assert_eq!((s["pool"].as_i64(), s["slot_fails"].as_i64(), s["hold_why"].as_str()), (Some(1), Some(1), Some("ticket_slots")), "one ticket from now on, and a wait: {s}");
@@ -2624,24 +2631,24 @@ fn a_lock_that_finds_no_slot_makes_the_wallet_hold_less_wait_and_then_pay_anothe
     // a seller that offers held tickets only: three rounds in a row, each after its wait, and then nothing is held with it
     let r = Rig::shipped(json!({}), 30, held_only_shop());
     r.ln.st.lock().unwrap().hop_full = true;
-    let v = r.pay("/page/1000", 10);
+    let v = r.pay("/page/1000", CALL);
     assert_eq!((v["verdict"].as_str(), v["rule"].as_str(), v["retry_after_s"].as_f64(), v["slot_fails"].as_i64()), (Some("deny"), Some("ticket_slots"), Some(30.0), Some(1)), "{v}");
     assert_eq!(r.ln.state().payments.len(), 2);
     // asked again at once: not tried again, the same wait
-    let v = r.pay("/page/1000", 10);
+    let v = r.pay("/page/1000", CALL);
     assert_eq!((v["rule"].as_str(), v["retry_after_s"].as_f64()), (Some("ticket_slots"), Some(30.0)), "{v}");
     assert_eq!(r.ln.state().payments.len(), 2, "no lock was tried during the wait");
     r.clock.fetch_add(31, Ordering::SeqCst);
-    let v = r.pay("/page/1000", 10);
+    let v = r.pay("/page/1000", CALL);
     assert_eq!((v["rule"].as_str(), v["retry_after_s"].as_f64(), v["slot_fails"].as_i64()), (Some("ticket_slots"), Some(60.0), Some(2)), "one ticket, and the wait doubles: {v}");
     assert_eq!(r.ln.state().payments.len(), 3);
     r.clock.fetch_add(61, Ordering::SeqCst);
-    let v = r.pay("/page/1000", 10);
+    let v = r.pay("/page/1000", CALL);
     assert_eq!(r.ln.state().payments.len(), 4);
     assert_eq!((v["verdict"].as_str(), v["slot_fails"].as_i64()), (Some("deny"), Some(3)), "{v}");
     // the third failed round: no ticket is held with this seller for ten minutes, whatever is asked
     r.clock.fetch_add(121, Ordering::SeqCst);
-    let v = r.pay("/page/1000", 10);
+    let v = r.pay("/page/1000", CALL);
     assert_eq!(v["rule"], "no_rail", "{v}");
     assert!(v["rails_passed_over"][0]["why"].as_str().unwrap().starts_with("ticket_route_full"), "{v}");
     let locked = r.status()["locked"]["tickets"].as_i64();
@@ -2649,7 +2656,7 @@ fn a_lock_that_finds_no_slot_makes_the_wallet_hold_less_wait_and_then_pay_anothe
     // ten minutes on, the route has room again
     r.clock.fetch_add(600, Ordering::SeqCst);
     r.ln.st.lock().unwrap().hop_full = false;
-    let v = r.pay("/page/1000", 10);
+    let v = r.pay("/page/1000", CALL);
     assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64()), (Some(200), Some(1)), "{v}");
 }
 
@@ -2660,31 +2667,31 @@ fn a_seller_that_says_slots_short_is_waited_for_or_paid_with_a_prepaid_ticket() 
     // held tickets only, and another buyer has the seller's one place
     let r = Rig::shipped(json!({}), 30, one_place(json!(["on-use"])));
     assert_eq!(rival_lock(&r.shop, 1, 1).0, 200);
-    let v = r.pay("/page/1000", 10);
+    let v = r.pay("/page/1000", CALL);
     assert_eq!((v["verdict"].as_str(), v["rule"].as_str(), v["retry_after_s"].as_u64()), (Some("deny"), Some("ticket_slots_short"), Some(30)), "{v}");
     assert_eq!((r.ln.state().payments.len(), r.ledger_sum()), (0, 0), "told before any invoice existed: no payment failed, none was made");
     assert_eq!(r.audit("ticket_hold").len(), 1);
     let asked = r.tap.seen("/x402/ticket/lock").len();
-    let v = r.pay("/page/1000", 10);
+    let v = r.pay("/page/1000", CALL);
     assert_eq!(v["retry_after_s"].as_f64(), Some(30.0), "{v}");
     assert_eq!(r.tap.seen("/x402/ticket/lock").len(), asked, "the seller is not asked again before the time it named");
     // the rival's unpaid ticket lapses; after the wait the wallet gets the place
     r.clock.fetch_add(76, Ordering::SeqCst);
     r.shop.gw.tick();
     wait_for("the rival's ticket given up", || r.shop.gw.stats().held_tickets == 0);
-    let v = r.pay("/page/1000", 10);
+    let v = r.pay("/page/1000", CALL);
     assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64()), (Some(200), Some(1)), "{v}");
     // the same, with prepaid tickets on offer: no wait, a prepaid ticket
     let r = Rig::shipped(json!({}), 30, one_place(json!(["on-use", "on-arrival"])));
     assert_eq!(rival_lock(&r.shop, 2, 1).0, 200);
     assert_eq!(rival_lock(&r.shop, 3, 1), (402, json!({"error": "slots_short", "retryAfter": 30})));
-    let v = r.pay("/page/1000", 10);
+    let v = r.pay("/page/1000", CALL);
     assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1), Some(1)), "{v}");
     let s = session_of(&r, &v);
     assert_eq!((s["pool"].as_i64(), s["hold_why"].as_str()), (Some(1), Some("ticket_slots_short")), "it still means to hold a ticket when the seller has room: {s}");
     // a seller with nothing but prepaid tickets (a node without hold invoices), and tickets below the dust limit at that
     let r = Rig::shipped(json!({}), 30, json!({"tickets": {"ticket_msat": 64_000, "settle": ["on-arrival"]}, "caps": {"sessions_per_address": 0}}));
-    let v = r.pay("/page/1000", 10);
+    let v = r.pay("/page/1000", CALL);
     assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64(), v["tickets_prepaid"].as_u64(), v["balance_msat"].as_str()), (Some(200), Some(1), Some(1), Some("61500")), "{v}");
     assert_eq!((r.shop.standin.calls("add_hold"), r.status()["locked"]["tickets"].as_i64()), (0, Some(0)));
     assert_eq!(session_of(&r, &v)["pool"], 0);
@@ -2698,7 +2705,7 @@ fn a_prepaid_ticket_is_booked_before_it_is_paid_and_a_seller_that_lies_about_it_
     for lie in [Lie::OtherAmount, Lie::OtherPayee] {
         let r = Rig::shipped(json!({}), 30, prepaid_only());
         *r.shop.node.lie.lock().unwrap() = lie;
-        let v = r.pay("/page/1000", 10);
+        let v = r.pay("/page/1000", CALL);
         assert_eq!(v["verdict"], "deny", "{v}");
         assert!(matches!(v["rule"].as_str(), Some("ticket_amount" | "ticket_payee")), "{v}");
         assert_eq!((r.ln.state().payments.len(), r.ledger_sum()), (0, 0));
@@ -2712,7 +2719,7 @@ fn a_prepaid_ticket_is_booked_before_it_is_paid_and_a_seller_that_lies_about_it_
     // the wallet's node goes away as the payment is sent: its fate is not known, so it is booked as spent and the session stops
     let r = Rig::shipped(json!({"ln": {"enabled": true, "split_height": 6000, "max_fee_base_sats": 2, "max_fee_ppm": 1000, "timeout_s": 1}}), 30, prepaid_only());
     r.ln.st.lock().unwrap().router_down = true;
-    let v = r.pay("/page/1000", 10);
+    let v = r.pay("/page/1000", CALL);
     assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("ticket_seller_fault")), "{v}");
     assert_eq!(r.ledger_sum(), BOOKING, "the ticket is in the ledger before the node was asked to pay it: {v}");
     assert!(r.tap.secrets().is_empty());
@@ -2725,7 +2732,7 @@ fn a_prepaid_ticket_is_booked_before_it_is_paid_and_a_seller_that_lies_about_it_
     assert_eq!((r.ledger_sum(), r.status()["tickets"]["failed"].as_i64()), (0, Some(1)));
     // a restore from a backup made before a prepaid ticket was bought: the node's payment carries the wallet's tag, and is counted
     let mut r = Rig::shipped(json!({}), 30, prepaid_only());
-    let v = r.pay("/page/1000", 10);
+    let v = r.pay("/page/1000", CALL);
     assert_eq!(v["tickets_prepaid"].as_u64(), Some(1), "{v}");
     let backup = tempfile::tempdir().unwrap();
     let run = r.root.join(".run");
@@ -2757,7 +2764,7 @@ fn a_ticket_that_is_in_flight_and_then_refused_at_a_later_hop_is_not_waited_for_
         let r = Rig::shipped(json!({}), 30, held_only_shop());
         // one send of the first round (the two go out together, so which one is not fixed)
         r.ln.st.lock().unwrap().late_fail = 1;
-        let v = r.pay("/page/1000", 10);
+        let v = r.pay("/page/1000", CALL);
         assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64()), (Some(200), Some(1)), "{v}");
         let s = session_of(&r, &v);
         assert_eq!((s["pool"].as_i64(), s["hold_why"].as_str()), (Some(1), Some("ticket_slots")), "one ticket from now on, and a wait: {s}");
@@ -2771,7 +2778,7 @@ fn a_ticket_that_is_in_flight_and_then_refused_at_a_later_hop_is_not_waited_for_
     // with both tickets refused so, and no prepaid tickets on offer: nothing is released, and the call says when to come back
     let r = Rig::shipped(json!({}), 30, held_only_shop());
     r.ln.st.lock().unwrap().late_fail = 2;
-    let v = r.pay("/page/1000", 10);
+    let v = r.pay("/page/1000", CALL);
     assert_eq!((v["verdict"].as_str(), v["rule"].as_str(), v["tickets_released"].as_u64()), (Some("deny"), Some("ticket_slots"), Some(0)), "{v}");
     assert!(v["retry_after_s"].as_f64().is_some_and(|w| w > 0.0 && w <= 30.0), "{v}");
     assert!(r.tap.secrets().is_empty());
@@ -2819,7 +2826,7 @@ fn agp128_the_sellers_terms_are_refused_in_the_wallets_words() {
         }
         let other = json!({"scheme": SELLER_WORDS, "network": SELLER_CODE, "amount": 1});
         r.tap.set(Box::new(move |_, _| Some(Ok(required(json!([t.clone(), other.clone()]))))));
-        let v = r.pay("/page/10", 10);
+        let v = r.pay("/page/10", CALL);
         assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("no_rail")), "{field}: {v}");
         assert_eq!(v["rails_passed_over"][0]["rail"], "ticket", "{field}: {v}");
         assert_eq!(v["offered"][1], json!({"scheme": "other", "network": "other"}), "{field}: {v}");
@@ -2832,7 +2839,7 @@ fn agp128_the_sellers_terms_are_refused_in_the_wallets_words() {
                                                       &SecretKey::from_slice(&[0x33; 32]).unwrap());
     r.tap.set(Box::new(move |_, _| Some(Ok(required(json!([{"scheme": "exact", "network": net, "amount": "1000", "payTo": "02".repeat(33),
                                                               "extra": {"invoice": hostile.clone()}}]))))));
-    let v = r.pay("/page/10", 10);
+    let v = r.pay("/page/10", CALL);
     assert_eq!(v["verdict"], "deny", "{v}");
     assert!(v["rails_passed_over"][0]["why"].as_str().unwrap().contains("in the prefix"), "refused for its prefix, the case under test: {v}");
     assert_no_seller_words("an invoice entry", &v);
@@ -2846,7 +2853,7 @@ fn agp128_a_seller_that_refuses_in_its_own_words_is_reported_in_the_wallets() {
     // the first lock of a session
     let r = Rig::new(json!({}));
     r.tap.set(Box::new(move |seen, _| if seen.path.starts_with("/x402/ticket/lock") { refusal() } else { None }));
-    let v = r.pay("/page/10", 10);
+    let v = r.pay("/page/10", CALL);
     assert_eq!(v["verdict"], "deny", "{v}");
     assert_no_seller_words("the first lock", &v);
     assert_no_seller_words("ticket_status after the first lock", &r.status());
@@ -2923,7 +2930,7 @@ fn agp128_a_lock_answer_that_names_words_for_a_hash_is_refused_and_not_recorded(
         let headers: Vec<(String, String)> = headers.into_iter().filter(|(k, _)| !k.eq_ignore_ascii_case("content-length")).collect();
         Some(Ok(answer(status, headers, serde_json::to_vec(&v).unwrap())))
     }));
-    let v = r.pay("/page/10", 10);
+    let v = r.pay("/page/10", CALL);
     assert_eq!(v["verdict"], "deny", "an invoice returned for another hash is not paid: {v}");
     assert_no_seller_words("xbt402_pay", &v);
     let history = r.call("history", json!({}));
@@ -3032,7 +3039,7 @@ fn tickets_for_a_seller_one_stays_with_draws_for_a_small_call_and_the_owner_can_
     let v = r.pay(&format!("/pieces/{}", 4 * PIECE), 4_000);
     assert_eq!((v["rail"].as_str(), v["status"].as_u64(), v["tickets_released"].as_u64()), (Some("ticket"), Some(200), Some(1)), "{v}");
     // and the session that is open keeps its way, however small the next call
-    let next = r.pay(&format!("/pieces/{PIECE}"), 10);
+    let next = r.pay(&format!("/pieces/{PIECE}"), CALL);
     assert_eq!((next["rail"].as_str(), next["session"].as_str()), (Some("ticket"), v["session"].as_str()), "{next}");
     assert!(r.tap.seen("/x402/lottery/").is_empty());
     // a small call: draws
@@ -3494,11 +3501,11 @@ fn a_head_is_paid_with_a_ticket_where_the_seller_wants_one_and_never_by_draws() 
     let _g = env_lock();
     // a session with nothing in it: a ticket is released, and the HEAD is served from the balance
     let r = Rig::new(json!({}));
-    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{}", MIB)), "method": "HEAD", "max_sats": 100, "task": "film"}));
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{}", MIB)), "method": "HEAD", "max_sats": CALL, "task": "film"}));
     assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64(), v["bytes"].as_u64()), (Some(200), Some(1), Some(0)), "{v}");
     // a route priced by the second, in a new session of its own
     let r = Rig::new(json!({}));
-    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/timed/3"), "method": "HEAD", "max_sats": 1_000, "task": "film"}));
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/timed/3"), "method": "HEAD", "max_sats": CALL, "task": "film"}));
     assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64()), (Some(200), Some(1)), "{v}");
     // the same from a seller the wallet pays by draws, with a session of draws open: the HEAD has no lottery entry
     let r = draws_rig(json!({}));
@@ -3735,7 +3742,7 @@ fn lock_bodies(r: &Rig) -> Vec<Value> {
 fn a_prepaid_ticket_is_paid_by_the_sellers_offer_with_the_note_that_names_its_session() {
     let _g = env_lock();
     let r = Rig::shipped(json!({}), 30, offer_shop());
-    let v = r.pay("/page/10", 10);
+    let v = r.pay("/page/10", CALL);
     assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{v}");
     let locks = lock_bodies(&r);
     assert_eq!((locks[0]["by"].as_str(), locks[0].get("count")), (Some("offer"), None), "the first lock asks for no invoice: {locks:?}");
@@ -3768,7 +3775,7 @@ fn a_prepaid_ticket_is_paid_by_the_sellers_offer_with_the_note_that_names_its_se
 fn a_seller_of_prepaid_tickets_only_is_paid_by_its_offer() {
     let _g = env_lock();
     let r = Rig::shipped(json!({}), 30, json!({"tickets": {"settle": ["on-arrival"]}, "caps": {"sessions_per_address": 0, "strict": true}, "offers": {"enabled": true}}));
-    let v = r.pay("/page/10", 10);
+    let v = r.pay("/page/10", CALL);
     assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{v}");
     let locks = lock_bodies(&r);
     assert!(!locks.is_empty() && locks.iter().all(|l| l["by"] == "offer"), "no ticket was asked for by invoice: {locks:?}");
@@ -3784,7 +3791,7 @@ fn where_the_offer_gives_no_invoice_the_prepaid_ticket_is_paid_by_the_sellers_in
     let _g = env_lock();
     let r = Rig::shipped(json!({}), 30, offer_shop());
     r.ln.st.lock().unwrap().offer_fetch_fails = true;
-    let v = r.pay("/page/10", 10);
+    let v = r.pay("/page/10", CALL);
     assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{v}");
     let locks = lock_bodies(&r);
     assert_eq!((locks[0]["by"].as_str(), locks[1]["count"].as_u64()), (Some("offer"), Some(1)), "{locks:?}");
@@ -3795,13 +3802,13 @@ fn where_the_offer_gives_no_invoice_the_prepaid_ticket_is_paid_by_the_sellers_in
     // an invoice that does not repeat the wallet's note: the seller could not credit it, so it is not paid
     let r = Rig::shipped(json!({}), 30, offer_shop());
     r.ln.st.lock().unwrap().offer_note_lie = true;
-    let v = r.pay("/page/10", 10);
+    let v = r.pay("/page/10", CALL);
     assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{v}");
     assert_eq!(r.audit("ticket_offer_passed")[0]["rule"], "ticket_offer_note");
     assert_eq!((r.shop.standin.offer_counts(), r.ledger_sum()), ((1, 0), SETTLED), "fetched, never paid; the ticket by invoice");
     // the owner says no: no offer is asked for anything, no lock by offer is made
     let r = Rig::shipped(json!({"tickets": {"enabled": true, "offers": false, "tasks": {"film": {"budget_sats": 40_000}}}}), 30, offer_shop());
-    let v = r.pay("/page/10", 10);
+    let v = r.pay("/page/10", CALL);
     assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{v}");
     assert!(r.ln.st.lock().unwrap().fetched_notes.is_empty());
     assert!(lock_bodies(&r).iter().all(|l| l.get("by").is_none()));
@@ -3815,7 +3822,7 @@ fn where_the_offer_gives_no_invoice_the_prepaid_ticket_is_paid_by_the_sellers_in
 fn a_payment_by_offer_is_held_to_the_owners_budgets() {
     let _g = env_lock();
     let r = Rig::shipped(json!({"tickets": {"enabled": true, "tasks": {"film": {"budget_sats": BOOKING - 1}}}}), 30, offer_shop());
-    let v = r.pay("/page/10", 10);
+    let v = r.pay("/page/10", CALL);
     assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("ticket_task_budget")), "{v}");
     assert_eq!(r.ln.st.lock().unwrap().fetched_notes.len(), 1, "an invoice was fetched, and not paid");
     assert_eq!((r.ln.state().payments.len(), r.ledger_sum(), r.shop.standin.offer_counts()), (0, 0, (1, 0)));
@@ -3853,4 +3860,102 @@ fn wins_are_paid_by_the_sellers_offer_and_each_once() {
     let sid = v["session"].as_str().unwrap().to_string();
     assert_eq!(win_tickets(&r, &sid).len() as u64, wins);
     assert!(win_tickets(&r, &sid).iter().all(|t| t["state"] == "settled"));
+}
+
+// --- a call's max_sats is a hard cap -------------------------------------------------------------------
+
+/// A call never books more than its `max_sats`, a ticket's fee limit included: a ticket that would take
+/// it over is not paid, and the call says what it would have needed. Nothing reaches the seller.
+#[test]
+fn a_call_never_books_above_its_max_sats_and_the_fee_limit_counts() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    // a 1,000-sat ticket books 1,003 with its fee limit: 1,002 is one short
+    let v = r.pay("/page/10", 1_002);
+    assert_eq!((v["verdict"].as_str(), v["rule"].as_str(), v["ticket_booking_sats"].as_i64(), v["charged_sats"].as_i64()),
+               (Some("deny"), Some("max_sats"), Some(1_003), Some(0)), "{v}");
+    assert!(v["reason"].as_str().unwrap().contains("nothing was paid"), "{v}");
+    assert!(r.tap.secrets().is_empty() && r.ledger().is_empty() && r.shop.settled() == 0, "no secret left and nothing was booked");
+    // at 1,003 it is paid, and the call is charged no more than that
+    let v = r.pay("/page/10", 1_003);
+    assert_eq!((v["status"].as_u64(), v["charged_sats"].as_i64()), (Some(200), Some(1_003)), "{v}");
+    // the balance it left pays the next calls, however small their limits
+    let v = r.pay("/page/10", 3);
+    assert_eq!((v["status"].as_u64(), v["charged_sats"].as_i64()), (Some(200), Some(0)), "{v}");
+}
+
+fn sized_shop(settle: Value, min: Option<u64>) -> Value {
+    let mut t = json!({"ticket_msat": 1_000_000, "settle": settle});
+    if let Some(m) = min {
+        t["min_ticket_msat"] = m.into();
+    }
+    json!({"tickets": t, "caps": {"sessions_per_address": 0}})
+}
+
+/// A seller whose terms let the wallet ask for a smaller ticket (`minTicketMsat`) is asked for the
+/// largest one that fits what is left of the call's `max_sats`, its fee limit included.
+#[test]
+fn a_smaller_prepaid_ticket_is_asked_for_where_the_sellers_own_does_not_fit_the_call() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, sized_shop(json!(["on-arrival"]), Some(600_000)));
+    let v = r.pay("/page/10", 800);
+    assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{v}");
+    let charged = v["charged_sats"].as_i64().unwrap();
+    assert!((600..=800).contains(&charged), "inside the call's limit, fee limit included: {v}");
+    let lock = r.tap.seen("/x402/ticket/lock");
+    let asked: Value = serde_json::from_str(&lock.last().unwrap().body).unwrap();
+    let size: u64 = asked["ticketMsat"].as_str().unwrap().parse().unwrap();
+    assert!((600_000..1_000_000).contains(&size) && size % 1000 == 0, "a whole-sat size the seller allows: {asked}");
+    assert!(r.ledger_sum() <= 800, "the ledger holds what was booked: {}", r.ledger_sum());
+    // below the seller's smallest ticket and its fee: refused before anything is asked of the seller
+    let r = Rig::shipped(json!({}), 30, sized_shop(json!(["on-arrival"]), Some(600_000)));
+    let v = r.pay("/page/10", 500);
+    assert_eq!((v["rule"].as_str(), v["charged_sats"].as_i64()), (Some("max_sats"), Some(0)), "{v}");
+    assert!(r.ln.state().payments.is_empty() && r.ledger().is_empty());
+}
+
+/// Held tickets are sized when the session opens: to the opening call's `max_sats` where the seller's
+/// terms let the wallet choose.
+#[test]
+fn held_tickets_are_sized_to_the_call_that_opens_the_session_where_the_seller_lets_the_wallet_choose() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, sized_shop(json!(["on-use"]), Some(600_000)));
+    {
+        // the seller's own channel, whose two sides say 354 and 546: the floor of a held ticket is 546 sat
+        let mut st = r.ln.st.lock().unwrap();
+        st.channel["remote_constraints"]["dust_limit_sat"] = "546".into();
+        st.channel["remote_pubkey"] = r.shop.id().into();
+    }
+    let v = r.pay("/page/10", 900);
+    assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64()), (Some(200), Some(1)), "{v}");
+    let size: u64 = session_of(&r, &v)["ticket_msat"].as_str().unwrap().parse().unwrap();
+    assert!((600_000..=900_000).contains(&size), "{size}");
+    assert!(v["charged_sats"].as_i64().unwrap() <= 900, "{v}");
+    r.assert_booked();
+}
+
+/// A seller whose terms say it issues smaller tickets but whose invoice is for its own size is paid
+/// nothing: the invoice is checked against the size asked for before anything is booked.
+#[test]
+fn a_seller_that_ignores_the_size_asked_for_is_paid_nothing() {
+    let _g = env_lock();
+    // a seller of one size, whose 402 is made to say it issues smaller ones too
+    let r = Rig::shipped(json!({}), 30, sized_shop(json!(["on-arrival"]), None));
+    r.tap.set(Box::new(move |seen, real| {
+        if seen.paid || seen.path.starts_with("/x402/") {
+            return None;
+        }
+        let (status, mut headers, body) = whole(real().ok()?);
+        for (_, v) in headers.iter_mut().filter(|(k, _)| k == "PAYMENT-REQUIRED") {
+            let mut pr = unb64json(v).unwrap();
+            for a in pr["accepts"].as_array_mut().unwrap() {
+                a["extra"]["minTicketMsat"] = "600000".into();
+            }
+            *v = b64json(&pr);
+        }
+        Some(Ok(answer(status, headers, body)))
+    }));
+    let v = r.pay("/page/10", 800);
+    assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("ticket_amount")), "{v}");
+    assert!(r.ln.state().payments.is_empty() && r.ledger().is_empty(), "nothing booked and nothing sent");
 }

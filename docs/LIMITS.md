@@ -847,12 +847,15 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
   payment in the first request. The 0.3 to 0.4 ms that paying added on the lab is a loopback
   figure; over a real network it is one more round trip to the seller on every call, and more on
   a call that releases a ticket or opens a session. None of that was measured.
-- `max_sats` bounds what a call uses, by the wallet's own count of the bytes and seconds it
-  received. It does not bound what the call books: a ticket is released whole, so a call that
-  uses 3 sat can book one ticket and its fee limit (1,015 sat with the defaults). The rest is a
-  balance with that seller, trusted to it.
-- An answer the wallet stops at `max_sats` can be charged for what the seller had already sent:
-  up to the balance, so less than one ticket more than the call's limit.
+- `max_sats` bounds what a call books, a ticket's fee limit included: a ticket that would take
+  the call over it is not released or bought, and a call whose limit is below the smallest ticket
+  the seller sells is refused with nothing paid. A ticket is still released whole, so a call that
+  uses 3 sat books a whole ticket where its limit allows one (1,003 sat for a 1,000-sat ticket
+  with the defaults); the rest is a balance with that seller, trusted to it. A seller whose terms
+  name `minTicketMsat` is asked for a smaller ticket that fits the call.
+- An answer the wallet stops at `max_sats` can be charged for what the seller had already sent,
+  up to the balance: by the seller's count it may use more than the call's limit, but never more
+  than the call booked.
 - The balance is given up whenever a session ends: `ticket_stop`, 120 s without a paid request, a
   seller fault, changed terms, a restart of the signer. Each costs less than one ticket (on
   mainnet, 580 sat of a 1,000 sat ticket in the first rehearsal). The stop reports it

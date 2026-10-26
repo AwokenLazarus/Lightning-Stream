@@ -212,3 +212,21 @@ fn the_node_away_is_said_as_such_and_the_payment_is_credited_when_it_is_back() {
     wait_for("the credit once the node is back", || a.release(&[p]).json()["released"].as_array().is_some_and(|r| r.len() == 1) || a.balance() == TICKET);
     assert_eq!(a.balance(), TICKET);
 }
+
+#[test]
+fn a_smaller_prepaid_ticket_by_offer_is_credited_inside_the_sizes_the_terms_name_only() {
+    let (rig, _d) = start(&|v| {
+        offers(v);
+        v["tickets"] = json!({"ticket_msat": TICKET, "min_ticket_msat": 600_000});
+    });
+    let mut a = by_offer(&rig, 1);
+    let small = |n: u8, msat: u64| note(&a.key, &a.session, Purpose::Ticket, msat, &[n; 16]);
+    let (good, low) = (small(1, 700_000), small(2, 500_000));
+    let p = rig.node.pay_by_offer(Some(&good), 700_000, now(&rig));
+    assert_eq!(a.release(&[p]).status, 200);
+    assert_eq!(a.balance(), 700_000, "the size its note names");
+    // below the smallest size: never credited
+    let q = rig.node.pay_by_offer(Some(&low), 500_000, now(&rig));
+    assert_ne!(a.release(&[q]).json()["released"][0].as_str(), Some(hex::encode(hash_of(&q)).as_str()));
+    assert_eq!(a.balance(), 700_000);
+}
