@@ -2529,6 +2529,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "xbt-nwc"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "chacha20",
+ "getrandom 0.2.17",
+ "hex",
+ "hmac",
+ "ring",
+ "rustls",
+ "secp256k1",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "webpki-roots 1.0.9",
+ "xbt-signer",
+ "xbt-svc",
+]
+
+[[package]]
 name = "xbt-primitives"
 version = "0.1.0"
 dependencies = [
@@ -2608,6 +2629,7 @@ dependencies = [
  "tempfile",
  "ureq",
  "xbt-gateway",
+ "xbt-nwc",
  "xbt-primitives",
  "xbt-signer",
  "xbt-svc",

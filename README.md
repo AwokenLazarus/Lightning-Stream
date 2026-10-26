@@ -285,7 +285,8 @@ tickets and the lottery on both sides, pay with work, and the services and packa
 | `xbt402` | what the paid-HTTP schemes share: the x402 v2 headers and the request binding, the stream-ticket and lottery wires, and the server and payer that pay with work plugs into |
 | `xbt-signer` | the agent wallet's signer: keys never reach the agent (the owner can export a sealed backup); the owner's signed policy (budgets, per-seller caps, allowlist, human approval); a tamper-evident signature log; the Lightning rail (BOLT 11 and BOLT 12); the ticket book and the payer that lets `xbt402_pay` pay a gateway with stream tickets (regtest only) |
 | `xbt-wallet-mcp` | the wallet's MCP server, over stdio and streamable HTTP, so an AI agent can quote and pay without holding a key |
-| `xbt-wallet-ui` | the owner's web UI: approvals, policy, keys, signature log |
+| `xbt-wallet-ui` | the owner's web UI: approvals, policy, keys, signature log, connected apps |
+| `xbt-nwc` | Nostr Wallet Connect (NIP-47): other apps pay through the owner's node, under the owner's policy, through the signer (`docs/NWC.md`) |
 | `xbt-work`, `xbt-work-relay` | pay with work: a miner pays with pool shares, settled in the coinbase and checked by an audit |
 | `xbt-gateway` | the stream-ticket seller gateway: a reverse proxy beside a Lightning node that puts a price per piece on any HTTP service (regtest only) |
 | `xbt-svc` | container plumbing: data dir, secrets, readiness, the bounded HTTP server |

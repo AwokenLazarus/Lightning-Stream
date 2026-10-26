@@ -385,6 +385,19 @@
     });
   });
 
+  // Copy buttons: the Connected apps page's connection string, shown once. The clipboard API needs a
+  // secure context; on plain http (a box on the LAN) the field is selected and copied the old way.
+  $$("[data-copy]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var el = document.getElementById(btn.getAttribute("data-copy"));
+      if (!el) return;
+      var done = function () { btn.textContent = "Copied"; };
+      var old = function () { el.focus(); el.select(); try { if (document.execCommand("copy")) done(); } catch (e) { /* selected: copy by hand */ } };
+      if (root.isSecureContext && root.navigator && root.navigator.clipboard) root.navigator.clipboard.writeText(el.value).then(done, old);
+      else old();
+    });
+  });
+
   // The pending-approvals badge.
   var badge = $("#pending-badge");
   if (badge && root.fetch) {

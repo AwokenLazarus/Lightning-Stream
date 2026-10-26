@@ -19,6 +19,8 @@ use crate::{msg, now};
 
 #[path = "stream_pages.rs"]
 mod stream_pages;
+#[path = "nwc_pages.rs"]
+mod nwc_pages;
 
 pub const COOKIE: &str = "xbtui";
 /// How long a signed form stays valid.
@@ -259,6 +261,7 @@ impl App {
             "/browse" => self.browse(&ctx, &req.query),
             "/play" => self.play(&ctx, &req),
             "/connections" => self.connections(&ctx),
+            "/apps" => self.apps_page(&ctx),
             "/approvals" => self.approvals(&ctx),
             "/policy" => self.policy_page(&ctx, req.query.get("template").map(|t| t == "starter").unwrap_or(false)),
             "/channels" => self.channels(&ctx),
@@ -403,6 +406,8 @@ impl App {
             "/play" => self.play_stop(ctx, f),
             "/play-link" => self.play_link(ctx, f),
             "/connections" => self.connections_stop(ctx, f),
+            "/apps-create" => self.apps_create(ctx, f),
+            "/apps-revoke" => self.apps_revoke(ctx, f),
             "/logout" => {
                 self.auth.logout(&ctx.sid);
                 Resp::redirect("./login").header("Set-Cookie", &self.cookie(req, "", 0))

@@ -31,6 +31,8 @@ ureq.workspace = true
 tempfile = "3"
 xbt-signer.workspace = true
 xbt-wallet-mcp = { path = "../xbt-wallet-mcp" }
+# the Connected apps page against the NWC service's real admin socket
+xbt-nwc = { path = "../xbt-nwc" }
 xbt402 = { workspace = true, features = ["http-client", "http-server"] }
 xbt-primitives.workspace = true
 # a TLS node for the certificate-pinning test (the gateway's own version and features)

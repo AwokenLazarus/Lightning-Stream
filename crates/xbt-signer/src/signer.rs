@@ -482,6 +482,8 @@ impl Signer {
                 let _g = self.lock();
                 sanitize(self.ln_status_locked())
             }
+            // read only, and without the spend lock: it answers while a payment is in flight
+            "ln_lookup" => sanitize(self.ln_lookup(p)),
             // stream tickets (docs/TICKETS.md): the buyer's book
             "ticket_open" => {
                 let _g = self.lock();

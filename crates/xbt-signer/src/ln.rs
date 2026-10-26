@@ -1924,6 +1924,36 @@ impl Signer {
         }
         out
     }
+
+    /// `ln_lookup`: one payment of the rail's book, by its payment hash, read only. It takes no lock,
+    /// so it answers while another payment is in flight; it reconciles nothing (`ln_status` and the
+    /// next `ln_pay` do). The preimage is given only for a payment settled with the preimage of its
+    /// hash. A keyless front end (the NWC service) reads the outcome of a payment it asked for with it.
+    pub(crate) fn ln_lookup(&self, p: &Value) -> Value {
+        let hash = str_or_empty(p.get("payment_hash")).trim().to_ascii_lowercase();
+        if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return deny("ln_lookup", "payment_hash: 64 hex characters");
+        }
+        let Some(r) = self.ln_book.get(&hash) else {
+            return json!({"rail": "ln", "found": false, "payment_hash": hash});
+        };
+        let state = str_or_empty(r.get("state"));
+        let mut out = json!({"rail": "ln", "found": true, "payment_hash": hash, "state": state});
+        for k in ["amount_msat", "booked_sats", "spent_sats", "value_msat", "fee_msat", "ts", "settled_ts", "failed_ts", "offer_id"] {
+            if let Some(v) = r.get(k).filter(|v| !v.is_null()) {
+                out[k] = v.clone();
+            }
+        }
+        if state == "settled" && r.get("preimage_ok") != Some(&Value::Bool(false)) {
+            if let Some(pre) = r.get("preimage").filter(|v| !v.is_null()) {
+                out["preimage"] = pre.clone();
+            }
+        }
+        if let Some(f) = r.get("failure").filter(|v| !v.is_null()) {
+            out[UNTRUSTED_LN_KEY] = untrusted_ln(json!({"failure": f}));
+        }
+        out
+    }
 }
 
 #[cfg(test)]
