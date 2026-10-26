@@ -24,7 +24,9 @@ LAB=$ROOT/run/lightning-fork-lab
 export COMPOSE_PROJECT_NAME=agp049ln
 export COMPOSE_FILE=$LAB/docker-compose.yml:$ROOT/scripts/ln_rail/compose.ln_rail.yml
 export ACTIVATION_HEIGHT=20
-R=$ROOT/run/ln-rail-$$
+# LN_RAIL_SCRATCH: where the scratch directory goes (default run/); the signers' sockets are in it,
+# and a socket path is at most 107 bytes, so a checkout with a long path names a shorter place here
+R=${LN_RAIL_SCRATCH:-$ROOT/run}/ln-rail-$$
 mkdir -p "$R"
 
 # the lab and the node binaries: cloned and built when missing (scripts/ln_rail/lab.sh)
