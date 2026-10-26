@@ -479,7 +479,8 @@ fn enrol_and_replace_the_human_key_then_sweep_rotate_backup_and_anchor() {
     let mut br = logged_in(&bx);
     let setup = br.get("/setup").body;
     assert!(setup.contains("id=\"keygen\"") && setup.contains("./human-key-enroll"));
-    assert!(br.get("/").body.contains("No approval key is enrolled"));
+    assert!(br.get("/wallet").body.contains("No approval key yet"));
+    assert!(br.get("/").body.contains("Finish setting up"), "home says what is left to do");
     let pubhex = hex::encode(human().verifying_key().to_bytes());
     let r = br.act("/setup", "/human-key-enroll", &[("pubkey", &pubhex), ("code", "0000-0000-0000")]);
     assert!(br.flash_after(&r).contains("enrolment code"), "AGP-063 W4: the code from the signer's log, not trust on first use");
@@ -553,7 +554,7 @@ fn channels_of_an_earlier_version_are_listed_read_only_with_what_to_do() {
         let r = br.act("/channels", gone, &[("counterparty", PROVIDER)]);
         assert_eq!(r.status, 404, "{gone}");
     }
-    let ov = br.get("/").body;
+    let ov = br.get("/wallet").body;
     assert!(ov.contains("Channels of an earlier version") && ov.contains("Open</dt><dd>1") && ov.contains("Closed</dt><dd>1"), "{ov}");
     assert_eq!(std::fs::read_to_string(bx.rig.root.join(".run/channels.json")).unwrap(), book, "the book is left as it was");
     // a wallet that never had a channel shows no such card
@@ -594,12 +595,12 @@ fn the_agents_page_shows_the_mcp_endpoint_and_token_only_after_login() {
     assert_eq!(r.status, 303, "login first");
     let mut br = logged_in(&bx);
     let page = br.get("/agents").body;
-    assert!(page.contains("http://umbrel.local:33510/mcp") && page.contains("No token here yet"), "{page}");
+    assert!(page.contains("http://umbrel.local:33510/mcp") && page.contains("No token in"), "{page}");
     // as xbt-init leaves it on a box: 0640, the MCP reads it by group
     xbt_svc::replace_secret_file(&tok, format!("{}\n", "ab".repeat(32)).as_bytes(), 0o640).unwrap();
     let page = br.get("/agents").body;
     assert!(page.contains(&"ab".repeat(32)) && page.contains("Bearer ") && page.contains("<details>"), "{page}");
-    assert!(page.contains("aria-current=\"page\">Agents") && page.contains("Rotate the token"), "{page}");
+    assert!(page.contains("aria-current=\"page\">AI agents") && page.contains("Rotate the token"), "{page}");
     // AGP-042: the real MCP HTTP transport, reading the same file (the UI never calls it to rotate)
     let wallet = std::sync::Arc::new(xbt_wallet_mcp::wallet::Wallet::new(tdir.path().join("no-signer.sock")));
     let mut cfg = xbt_wallet_mcp::transport::HttpConfig::new("127.0.0.1:34202");
@@ -658,13 +659,13 @@ fn xbt_compute_status_tile_and_link_when_configured() {
         c.cmp_url = Some("http://umbrel.local:3900/".into());
     });
     let mut br = logged_in(&bx);
-    let page = br.get("/").body;
+    let page = br.get("/wallet").body;
     assert!(page.contains("id=\"cmp-status\"") && page.contains(">up</span>") && page.contains("node_sync_pct") && page.contains("99.7"), "{page}");
     assert!(page.contains("href=\"http://umbrel.local:3900/\" target=\"_blank\" rel=\"noopener noreferrer\""));
     drop(bx);
     let bx = start(json!({}), false, |c| c.cmp_status_url = Some("http://127.0.0.1:1/readyz".into()));
     let mut br = logged_in(&bx);
-    assert!(br.get("/").body.contains("unreachable"), "a down cmp shows as unreachable, the page still renders");
+    assert!(br.get("/wallet").body.contains("unreachable"), "a down cmp shows as unreachable, the page still renders");
 }
 
 // --- the setup pages: the Lightning rail and the seller gateway ------------------------------------
@@ -754,7 +755,7 @@ fn the_gateway_page_writes_a_config_the_gateway_takes_and_mainnet_is_asked_for()
     assert_eq!(br.post("/setup-password", &[("code", code.trim()), ("password", PW), ("password2", PW)]).status, 303);
     assert_eq!(br.get("/readyz").status, 200, "no signer, and ready");
     let page = br.get("/").body;
-    assert!(page.contains("Lightning Stream Gateway") && page.contains("invoices:read invoices:write") && !page.contains("Approvals"), "{page}");
+    assert!(page.contains(">Lightning Stream<") && page.contains("<h1>Sell</h1>") && page.contains("invoices:read invoices:write") && !page.contains("Approvals"), "{page}");
     // the count it shows is said to be the node's word, not income
     assert!(page.contains("by its own word") && page.contains("not yet income"), "{page}");
     assert_eq!(br.get("/policy").status, 404);
@@ -828,51 +829,58 @@ fn browse_player_and_connections_follow_the_services_file_and_stop_through_the_s
 
     let page = br.get("/browse");
     assert_eq!(page.status, 200);
-    assert!(page.body.contains("aria-current=\"page\">Browse"));
-    assert!(page.body.contains("href=\"./play\"") && page.body.contains("href=\"./connections\""));
+    assert!(page.body.contains("aria-current=\"page\">Browse") && page.body.contains("aria-current=\"page\">Services"));
+    assert!(page.body.contains("href=\"./services\"") && page.body.contains("href=\"./connections\""));
     assert!(page.body.find("Alpha films").unwrap() < page.body.find("Zebra files").unwrap(), "name sort");
-    assert!(page.body.contains("&lt;b&gt;notes&lt;/b&gt;") && !page.body.contains("<b>notes</b>"));
-    assert!(page.body.contains(&format!("href=\"./play?item={}\"", enc(FILM))));
+    assert!(page.body.contains(">Media <") && page.body.contains(">Data &amp; APIs <"), "the categories, media one of them");
+    assert!(!page.body.contains("Big Buck Bunny"), "Browse lists services, not what a media service has inside");
     assert!(page.headers.get("content-security-policy").is_some_and(|v| v.contains("media-src 'self'")));
+    // a media service's own page lists what it plays
+    let media = br.get(&format!("/service?seller={}&name={}", enc("https://media.lazarus-xbt.xyz"), enc("Alpha films"))).body;
+    assert!(media.contains("Big Buck Bunny") && media.contains(&format!("href=\"./play?item={}\"", enc(FILM))), "{media}");
+    // any other service's page: its address for apps and agents, no player
+    let files = br.get(&format!("/service?seller={}&name={}", enc("https://files.example"), enc("Zebra files"))).body;
+    assert!(files.contains("&lt;b&gt;notes&lt;/b&gt;") && !files.contains("<b>notes</b>"));
+    assert!(files.contains("notes?a=1&amp;b=2") && files.contains("Connect an AI agent") && !files.contains("./play?"), "{files}");
+    assert!(br.get("/service?seller=https://x.example&name=x").body.contains("not in your list"));
 
     let by_price = br.get("/browse?sort=price").body;
     assert!(by_price.find("Zebra files").unwrap() < by_price.find("Alpha films").unwrap(), "price sort");
-    assert!(by_price.contains("selected>Price") || by_price.contains("value=\"price\" selected"));
-    let files = br.get("/browse?kind=files").body;
-    assert!(files.contains("Zebra files") && !files.contains("Big Buck Bunny"));
-    assert!(files.contains("notes?a=1&amp;b=2"));
-    let videos = br.get("/browse?kind=video").body;
-    assert!(videos.contains("Big Buck Bunny") && !videos.contains("Zebra files"));
-    assert!(br.get("/browse?kind=nope").body.contains("No services of this kind"));
+    assert!(by_price.contains("aria-current=\"true\">price"));
+    let data = br.get("/browse?cat=data").body;
+    assert!(data.contains("Zebra files") && !data.contains("Alpha films"));
+    let old_link = br.get("/browse?kind=video").body;
+    assert!(old_link.contains("Alpha films") && !old_link.contains("Zebra files"), "a kind names its category");
+    assert!(br.get("/browse?cat=ai").body.contains("No services in this category yet"));
 
     let play = br.get(&format!("/play?item={}", enc(FILM)));
-    assert!(play.body.contains("aria-current=\"page\">Player"));
+    assert!(play.body.contains("aria-current=\"page\">Services"));
     assert!(play.body.contains(&format!("src=\"./s/{FILM}\"")));
     assert!(play.body.contains("<video controls autoplay"));
     assert!(play.body.contains("CC BY 3.0") && play.body.contains("Stop and cut the connection"));
-    assert!(play.body.contains("20 sat a MiB"));
-    assert!(br.get("/play").body.contains("Choose a video"));
-    assert!(br.get("/play?item=https://media.lazarus-xbt.xyz/missing").body.contains("not in the services file"));
+    assert!(play.body.contains("20 sat a MiB") && play.body.contains("<h1>Big Buck Bunny</h1>"));
+    assert!(br.get("/play").body.contains("Choose something to play"));
+    assert!(br.get("/play?item=https://media.lazarus-xbt.xyz/missing").body.contains("not in your list of services"));
     let notes = br.get(&format!("/play?item={}", enc(NOTES))).body;
-    assert!(!notes.contains("<video") && notes.contains("files item"));
+    assert!(!notes.contains("<video") && notes.contains("not something to play"));
 
     let r = br.post("/play", &[("item", FILM)]);
     assert_eq!(r.status, 403, "a stop without the CSRF token is refused");
     let r = br.act(&format!("/play?item={}", enc(FILM)), "/play", &[("item", FILM)]);
-    assert!(br.flash_after(&r).contains("No open session"), "nothing is open with that seller");
+    assert!(br.flash_after(&r).contains("No open connection"), "nothing is open with that seller");
 
     let conn = br.get("/connections");
-    assert!(conn.body.contains("aria-current=\"page\">Connections"));
+    assert!(conn.body.contains("aria-current=\"page\">Live connections"));
     assert!(conn.body.contains("http-equiv=\"refresh\" content=\"4\""));
-    assert!(conn.body.contains("Nothing is open") && conn.body.contains("Cut all"));
+    assert!(conn.body.contains("Nothing is open"));
     let r = br.act("/connections", "/connections", &[("all", "1")]);
     assert!(br.flash_after(&r).contains("Nothing is open"));
     let r = br.act("/connections", "/connections", &[("session", "not-a-session")]);
-    assert!(br.flash_after(&r).contains("No open session"));
+    assert!(br.flash_after(&r).contains("not open any more"));
 
     std::fs::remove_file(&path).unwrap();
     let gone = br.get("/browse").body;
-    assert!(gone.contains("services file") && gone.contains("XBT_UI_SERVICES") && gone.contains("examples/services.example.json"));
+    assert!(gone.contains("services file") && gone.contains("Add a seller") && gone.contains("href=\"./services\""));
 }
 
 /// A TLS node on loopback with the gateway's test certificate (public test data), answering nothing.
@@ -1136,7 +1144,7 @@ fn connected_apps_make_show_once_list_and_revoke() {
     let plain = start(json!({}), false, |_| {});
     let mut br = logged_in(&plain);
     let page = br.get("/apps").body;
-    assert!(page.contains("aria-current=\"page\">Connected apps"), "{page}");
+    assert!(page.contains("aria-current=\"page\">Apps") && page.contains("not set up on this box"), "{page}");
     assert!(page.contains("XBT_UI_NWC_SOCK"));
 
     let nwc_dir = tempfile::tempdir().unwrap();
@@ -1219,7 +1227,7 @@ fn the_sell_page_sets_up_several_services_and_says_what_each_one_needs() {
     });
     let mut br = logged_in(&bx);
     let page = br.get("/sell").body;
-    assert!(page.contains(">Lightning Stream<") && page.contains("href=\"./sell\"") && page.contains("href=\"./services\""), "{page}");
+    assert!(page.contains(">Lightning Stream<") && page.contains("href=\"./sell\"") && page.contains("href=\"./browse\""), "{page}");
     assert!(page.contains("Not selling yet") && page.contains("Connect your Lightning node"), "{page}");
     // plain words on the main screen; the gateway's own terms only inside the collapsed parts
     let main_part = page[page.find("<main").unwrap()..].split("<details").next().unwrap().replace("<em>Macaroons</em>", "");
@@ -1271,7 +1279,7 @@ fn the_sell_page_sets_up_several_services_and_says_what_each_one_needs() {
     assert_eq!((cfg.routes[0].price.byte_msat, cfg.routes[0].price.per_bytes, cfg.routes[1].price.request_msat), (20_000, 1_048_576, 500));
     assert!(cfg.routes[1].methods.contains(&"POST".to_string()));
     let l = cfg.listing.unwrap();
-    assert_eq!((l.name.as_str(), l.services.len(), l.services[0].kind.as_str(), l.services[1].kind.as_str()), ("Mike's box", 2, "video", "api"));
+    assert_eq!((l.name.as_str(), l.services.len(), l.services[0].kind.as_str(), l.services[1].kind.as_str()), ("Mike's box", 2, "video", "ai"));
     assert_eq!(l.services[0].items[0].url, "https://seller.example/Videos/s/stream");
 
     let page = br.get("/sell").body;
@@ -1305,7 +1313,8 @@ fn without_sell_the_wallet_has_no_sell_page() {
     let mut br = logged_in(&bx);
     assert_eq!(br.get("/sell").status, 404);
     let page = br.get("/").body;
-    assert!(page.contains("XBT Agent Wallet") && !page.contains("href=\"./sell\"") && page.contains("href=\"./services\""));
+    assert!(page.contains(">Lightning Stream<") && !page.contains("href=\"./sell\"") && page.contains("href=\"./browse\""));
+    assert!(page.contains("Use a service") && !page.contains("Sell a service"), "{page}");
 }
 
 /// Services: a seller added by its address shows on Browse with each service its signed listing
@@ -1322,7 +1331,7 @@ fn a_seller_added_by_address_shows_its_services_on_browse() {
     let draft = xbt402::listing::parse_draft(&json!({"name": "Mike's box", "updated": "2026-10-26", "credits": "the makers", "services": [
         {"name": "Films", "kind": "video", "path": "/", "prices": {"byte_msat": 20000, "per_bytes": 1048576},
          "items": [{"title": "Sintel", "url": "https://seller.example/Videos/s", "year": 2010}]},
-        {"name": "Model", "kind": "api", "path": "/ai/", "prices": {"request_msat": 500}, "items": []}]})).unwrap();
+        {"name": "Model", "kind": "ai", "path": "/ai/", "prices": {"request_msat": 500}, "items": []}]})).unwrap();
     let doc = serde_json::to_string(&xbt402::listing::sign(&sk, &xbt402::listing::document(&draft, origin, &pk))).unwrap();
     let terms = serde_json::to_string(&json!({"accepts": [{"extra": {"receiptKey": pk}}]})).unwrap();
     let get = |key: &str| {
@@ -1342,7 +1351,12 @@ fn a_seller_added_by_address_shows_its_services_on_browse() {
     let page = br.get("/services").body;
     assert!(page.contains("Mike&#39;s box: Films") && page.contains("20 sat a MiB") && page.contains("0.5 sat a request"), "{page}");
     let browse = br.get("/browse").body;
-    assert!(browse.contains("Sintel") && browse.contains("Mike&#39;s box: Model"), "{browse}");
+    assert!(browse.contains("Mike&#39;s box: Films") && browse.contains("Mike&#39;s box: Model") && browse.contains("cat-ai"), "{browse}");
+    // the model's page gives the address apps and agents use it at; the films' page lists what it plays
+    let model = br.get(&format!("/service?seller={}&name={}", enc(origin), enc("Mike's box: Model"))).body;
+    assert!(model.contains("value=\"https://seller.example/ai/\"") && model.contains("0.5 sat a request") && !model.contains("<video"), "{model}");
+    let films = br.get(&format!("/service?seller={}&name={}", enc(origin), enc("Mike's box: Films"))).body;
+    assert!(films.contains("Sintel") && films.contains("./play?item="), "{films}");
     // again: replaced, not doubled
     assert!(bx._app.add_seller(&format!("{origin}/"), get(&pk)).unwrap().starts_with("Updated"));
     let all = xbt_wallet_ui::services::load(&bx.data.path().join("ui/services.json")).unwrap();
@@ -1446,7 +1460,7 @@ fn browse_nostr_lists_checked_listings_unvetted_and_the_seller_confirms_its_own(
         rest[v..v + 64].to_string()
     };
     let r = br.act("/nostr", "/nostr-check", &[("event", &event_of("Open films"))]);
-    assert!(br.flash_after(&r).contains("same receipt key"));
+    assert!(br.flash_after(&r).contains("signs with the same key"));
     let r = br.act("/nostr", "/nostr-check", &[("event", &event_of("Impostor films"))]);
     assert!(br.flash_after(&r).contains("the seller's terms name"));
     let r = br.act("/nostr", "/nostr-check", &[("event", "00")]);
@@ -1463,4 +1477,90 @@ fn without_relays_the_nostr_page_asks_none_and_relays_are_checked() {
     assert_eq!(xbt_wallet_ui::config::nostr_relays(Some("wss://a.example, wss://b.example")).unwrap().len(), 2);
     assert!(xbt_wallet_ui::config::nostr_relays(Some("ws://relay.example")).is_err());
     assert!(xbt_wallet_ui::config::nostr_relays(None).unwrap().is_empty());
+}
+
+/// The words a person reads on a page's main screen: the text of `<main>`, without what sits
+/// in a collapsed `<details>` (technical detail is kept there on purpose) and without the tags.
+fn main_words(page: &str) -> String {
+    let main = &page[page.find("<main").unwrap_or(0)..page.find("</main>").unwrap_or(page.len())];
+    let (mut out, mut depth, mut rest) = (String::new(), 0usize, main);
+    while !rest.is_empty() {
+        let open = rest.find("<details");
+        let close = rest.find("</details>");
+        match (open, close) {
+            (Some(o), c) if c.is_none_or(|c| o < c) => {
+                if depth == 0 {
+                    out.push_str(&rest[..o]);
+                }
+                depth += 1;
+                rest = &rest[o + 8..];
+            }
+            (_, Some(c)) => {
+                if depth == 0 {
+                    out.push_str(&rest[..c]);
+                }
+                depth = depth.saturating_sub(1);
+                rest = &rest[c + 10..];
+            }
+            _ => {
+                if depth == 0 {
+                    out.push_str(rest);
+                }
+                break;
+            }
+        }
+    }
+    out.split('<').map(|s| s.split_once('>').map(|(_, t)| t).unwrap_or(s)).collect::<String>().to_ascii_lowercase()
+}
+
+/// Someone with no technical knowledge uses the app: no page's main screen speaks the plumbing's
+/// language. The exact terms stay inside the collapsed "Advanced" and "Details" parts.
+#[cfg(unix)]
+#[test]
+fn main_screens_speak_plain_words() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    assert!(main_words("<main><p>a macaroon</p><details><summary>x</summary><details>msat</details>cltv</details>ok</main>").contains("macaroon")
+            && !main_words("<main><details><details>msat</details>cltv</details></main>").contains("cltv"), "the check sees the main screen, not the details");
+    const JARGON: [&str; 11] = ["macaroon", "msat", "millisat", "preimage", "upstream", "htlc", "cltv", "receipt key", "mcp", "nwc", "xbt_ui_"];
+    let check = |what: &str, page: &str| {
+        let words = main_words(page);
+        assert!(words.split_whitespace().count() > 8, "{what}: the page has words to read: {words}");
+        for j in JARGON {
+            assert!(!words.contains(j), "{what}: \"{j}\" on the main screen: {words}");
+        }
+    };
+    let gw = tempfile::tempdir().unwrap();
+    let services = gw.path().join("services.json");
+    std::fs::write(&services, json!([
+        {"name": "Open films", "kind": "video", "seller": "https://media.example", "price_text": "20 sat a MiB",
+         "items": [{"title": "Sintel", "year": 2010, "url": "https://media.example/v/1", "credit": "CC BY 3.0"}]},
+        {"name": "Local model", "kind": "ai", "seller": "https://ai.example", "address": "https://ai.example/ai/", "price_text": "10 sat a request", "items": []}
+    ]).to_string()).unwrap();
+    let dir = gw.path().join("gateway");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bx = start(json!({}), false, |c| {
+        c.sell = true;
+        c.gw.dir = dir.clone();
+        c.gw.node_rest = Some("https://10.21.21.66:8180".into());
+        c.services_file = Some(services.clone());
+        c.mcp_urls = vec!["http://umbrel.local:33510/mcp".into()];
+    });
+    let mut anon = B::new(&bx.base);
+    check("first run", &anon.get("/").body);
+    let mut br = logged_in(&bx);
+    for path in ["/", "/browse", "/browse?cat=ai", "/services", "/connections", "/sell", "/wallet", "/approvals", "/apps", "/agents", "/setup",
+                 "/lightning", "/policy", "/keys", "/signatures", "/channels", "/nostr",
+                 "/service?seller=https%3A%2F%2Fai.example&name=Local%20model", "/service?seller=https%3A%2F%2Fmedia.example&name=Open%20films",
+                 "/play?item=https%3A%2F%2Fmedia.example%2Fv%2F1"] {
+        let r = br.get(path);
+        assert_eq!(r.status, 200, "{path}");
+        check(path, &r.body);
+    }
+    // the separate seller's page
+    let gdir = tempfile::tempdir().unwrap();
+    let (data, _app, _srv, base) = gateway_ui(gdir.path());
+    let mut g = B::new(&base);
+    let code = std::fs::read_to_string(data.path().join("ui/setup-code")).unwrap();
+    assert_eq!(g.post("/setup-password", &[("code", code.trim()), ("password", PW), ("password2", PW)]).status, 303);
+    check("seller's page", &g.get("/").body);
 }

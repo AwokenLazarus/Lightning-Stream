@@ -95,11 +95,20 @@ fn the_look_in_headless_chrome() {
          "items": [{"title": "Big Buck Bunny", "year": 2008, "url": film, "credit": "(c) Blender Foundation, CC BY 3.0"},
                    {"title": "Elephants Dream", "year": 2006, "url": "https://media.example/Videos/2/stream", "credit": "(c) Blender Foundation, CC BY 2.5"},
                    {"title": "Sintel", "year": 2010, "url": "https://media.example/Videos/3/stream", "credit": "(c) Blender Foundation, CC BY 3.0"}]},
+        {"name": "Local model", "kind": "ai", "seller": "https://box.example", "address": "https://box.example/ai/", "price_text": "10 sat a request",
+         "items": []},
+        {"name": "Weather data", "kind": "api", "seller": "https://weather.example", "price_text": "1 sat a request", "items": []},
         {"name": "Open lectures", "kind": "video", "seller": "https://lectures.example", "price_text": "12 sat a MiB",
          "items": [{"title": "Tears of Steel", "year": 2012, "url": "https://lectures.example/v/4", "credit": "(c) Blender Foundation, CC BY 3.0"}]}
     ]).to_string()).unwrap();
     let mut cfg = Config::for_test(sock_path, data.path().join("ui"), "127.0.0.1:0");
     cfg.services_file = Some(services);
+    // the one app: buying and selling
+    cfg.sell = true;
+    cfg.gw.dir = data.path().join("gateway");
+    std::fs::create_dir_all(&cfg.gw.dir).unwrap();
+    cfg.gw.node_rest = Some("https://10.21.21.66:8180".into());
+    cfg.mcp_urls = vec!["http://umbrel.local:33511/mcp".into()];
     let srv = xbt_wallet_ui::server::spawn(App::new(cfg).unwrap()).unwrap();
     let gdata = tempfile::tempdir().unwrap();
     let mut gcfg = Config::for_test(gdata.path().join("no-signer.sock"), gdata.path().join("ui"), "127.0.0.1:0");
@@ -110,11 +119,17 @@ fn the_look_in_headless_chrome() {
     let code = std::fs::read_to_string(data.path().join("ui/setup-code")).unwrap();
     let gcode = std::fs::read_to_string(gdata.path().join("ui/setup-code")).unwrap();
     let out = std::env::var("XBT_UI_LOOK_DIR").unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/ui-look").into());
-    let play = format!("/play?item={}", film.replace('/', "%2F").replace(':', "%3A").replace('?', "%3F").replace('=', "%3D"));
+    let enc = |v: &str| v.replace('%', "%25").replace('/', "%2F").replace(':', "%3A").replace('?', "%3F").replace('=', "%3D").replace(' ', "%20").replace('&', "%26");
+    let play = format!("/play?item={}", enc(film));
+    let pages = json!([["home", "/"], ["browse", "/browse"], ["browse-ai", "/browse?cat=ai"],
+        ["service-ai", format!("/service?seller={}&name={}", enc("https://box.example"), enc("Local model"))],
+        ["service-media", format!("/service?seller={}&name={}", enc("https://media.example"), enc("Creative Commons films"))],
+        ["player", play.clone()], ["live", "/connections"], ["sellers", "/services"], ["sell", "/sell"], ["wallet", "/wallet"],
+        ["setup", "/setup"], ["apps", "/apps"], ["agents", "/agents"], ["rules", "/policy"]]).to_string();
     let secs = std::env::var("XBT_UI_LOOK_SECONDS").unwrap_or_else(|_| "30".into());
     let o = std::process::Command::new(node).env("CHROME", chrome)
         .args([concat!(env!("CARGO_MANIFEST_DIR"), "/tests/js/look_test.mjs"), &format!("http://{}", srv.addr), code.trim(),
-               &format!("http://{}", gsrv.addr), gcode.trim(), &out, &play, &secs])
+               &format!("http://{}", gsrv.addr), gcode.trim(), &out, &play, &secs, &pages])
         .output().unwrap();
     let text = String::from_utf8_lossy(&o.stdout);
     eprintln!("{text}{}", String::from_utf8_lossy(&o.stderr));

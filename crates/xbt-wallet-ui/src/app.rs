@@ -11,8 +11,8 @@ use serde_json::{json, Map, Value};
 
 use crate::auth::Auth;
 use crate::config::{Config, Role};
-use crate::html::{esc, escv, int, json_block, kv, page, sats, short, txt, utc, Nav, GATEWAY_BRAND, GATEWAY_PAGES, STREAM_BRAND, STREAM_PAGES, WALLET_BRAND,
-                  WALLET_PAGES};
+use crate::html::{esc, escv, int, json_block, kv, page, sats, short, txt, utc, Nav, Section, GATEWAY_BRAND, GATEWAY_SECTIONS, STREAM_BRAND, STREAM_SECTIONS,
+                  WALLET_BRAND, WALLET_SECTIONS};
 use crate::link::SignerLink;
 use crate::relay::RelayLinks;
 use crate::server::{strip_base, Req, Resp};
@@ -23,7 +23,7 @@ mod stream_pages;
 #[path = "nwc_pages.rs"]
 mod nwc_pages;
 #[path = "sell.rs"]
-mod sell;
+pub(crate) mod sell;
 #[path = "services_page.rs"]
 mod services_page;
 #[path = "nostr_pages.rs"]
@@ -76,17 +76,17 @@ pub(crate) struct Ctx {
 
 const INT_KEYS: [(&str, &str, &str); 12] = [
     ("max_per_tx_sats", "Largest single payment (sats)", "budgets"),
-    ("daily_budget_sats", "Daily budget (sats, rolling 24 h)", "budgets"),
-    ("weekly_budget_sats", "Weekly budget (sats, rolling 7 days)", "budgets"),
-    ("per_counterparty_cap_sats", "Per-counterparty cap (sats per 7 days)", "budgets"),
-    ("human_threshold_sats", "Human approval at or above (sats)", "human"),
-    ("approval_ttl_s", "An approval request expires after (s)", "human"),
-    ("split_window_s", "Split-payment window (s): smaller payments to one destination that add up are counted together", "human"),
+    ("daily_budget_sats", "Spending limit for any 24 hours (sats)", "budgets"),
+    ("weekly_budget_sats", "Spending limit for any 7 days (sats)", "budgets"),
+    ("per_counterparty_cap_sats", "Most to any one seller in 7 days (sats)", "budgets"),
+    ("human_threshold_sats", "Ask me first for a payment of at least (sats)", "human"),
+    ("approval_ttl_s", "A request for your approval expires after (seconds)", "human"),
+    ("split_window_s", "Smaller payments to one seller within this many seconds count as one (so a large payment can't be split to avoid asking you)", "human"),
     ("velocity_max", "At most this many payments…", "velocity"),
-    ("velocity_window_s", "…per this many seconds", "velocity"),
-    ("hot_balance_cap_sats", "Hot key balance cap (sats; 0 = none; above it, the overview asks for a sweep)", "hot"),
-    ("anchor_interval_s", "Anchor the signature log every (s, restart)", "anchor"),
-    ("treasury_csv", "Treasury CSV (blocks; B2 field, unused by the Rust signer)", "anchor"),
+    ("velocity_window_s", "…in this many seconds", "velocity"),
+    ("hot_balance_cap_sats", "Most this box may hold for agents (sats; 0 means no limit)", "hot"),
+    ("anchor_interval_s", "Seal the records every (seconds; after a restart)", "anchor"),
+    ("treasury_csv", "Treasury delay (blocks; not used by this signer)", "anchor"),
 ];
 
 /// The height the XBT chain split from the SHA-256 chain at: a Lightning channel funded only from
@@ -271,12 +271,14 @@ impl App {
         if self.cfg.role == Role::Gateway {
             return match req.path.as_str() {
                 "/" => self.gateway_page(&ctx, None),
-                _ => Resp::html(404, self.render("Not found", &ctx, "<p>No such page. <a href=\"./\">Gateway</a></p>")),
+                _ => Resp::html(404, self.render("Not found", &ctx, "<p>No such page. <a href=\"./\">Back to Sell</a></p>")),
             };
         }
         match req.path.as_str() {
-            "/" => self.overview(&ctx),
+            "/" => self.home(&ctx),
+            "/wallet" => self.overview(&ctx),
             "/browse" => self.browse(&ctx, &req.query),
+            "/service" => self.service_page(&ctx, &req.query),
             "/services" => self.services_page(&ctx),
             "/sell" if self.cfg.sell => self.sell_page(&ctx, &req.query),
             "/nostr" => self.nostr_page(&ctx, &req.query),
@@ -292,7 +294,7 @@ impl App {
             "/setup" => self.setup(&ctx),
             "/lightning" => self.lightning_page(&ctx),
             "/api/pending" => Resp::json(200, &json!({"pending": self.pending_count()})),
-            _ => Resp::html(404, self.render("Not found", &ctx, "<p>No such page. <a href=\"./\">Overview</a></p>")),
+            _ => Resp::html(404, self.render("Not found", &ctx, "<p>No such page. <a href=\"./\">Home</a></p>")),
         }
     }
 
@@ -307,13 +309,13 @@ impl App {
     }
 
     pub(crate) fn nav<'a>(&self, active: &'a str, csrf: &'a str, logged_in: bool) -> Nav<'a> {
-        let (pages, brand): (&'static [(&'static str, &'static str)], &'static str) = match self.cfg.role {
-            Role::Wallet if self.cfg.sell => (&STREAM_PAGES, STREAM_BRAND),
-            Role::Wallet => (&WALLET_PAGES, WALLET_BRAND),
-            Role::Gateway => (&GATEWAY_PAGES, GATEWAY_BRAND),
+        let (sections, brand): (&'static [&'static Section], &'static str) = match self.cfg.role {
+            Role::Wallet if self.cfg.sell => (&STREAM_SECTIONS, STREAM_BRAND),
+            Role::Wallet => (&WALLET_SECTIONS, WALLET_BRAND),
+            Role::Gateway => (&GATEWAY_SECTIONS, GATEWAY_BRAND),
         };
         let pending = if logged_in && self.cfg.role == Role::Wallet { self.pending_count() } else { 0 };
-        Nav { active, csrf, pending, logged_in, pages, brand }
+        Nav { active, csrf, pending, logged_in, sections, brand }
     }
 
     pub(crate) fn render(&self, title: &str, ctx: &Ctx, body: &str) -> String {
@@ -360,19 +362,23 @@ impl App {
 
     fn setup_password(&self, req: &Req) -> Resp {
         let code_field = if self.auth.needs_setup_code() {
-            "<label>Setup code <small>(printed in the app's log at first start, and in the file <code>setup-code</code> in the UI's data directory)</small>\
-             <input name=\"code\" autocomplete=\"off\" required></label>"
+            "<label>Setup code<input name=\"code\" autocomplete=\"off\" required></label>\
+             <p class=\"hint\">A one-time code that proves this app is yours. It is in the app's log, on the line that says \
+             <em>setup code</em>. On Umbrel: right-click the Lightning Stream icon and choose <em>Troubleshoot</em>. \
+             On StartOS: open Lightning Stream and choose <em>Logs</em>.</p>\
+             <details><summary>Running it another way?</summary><p>The code is also in the file <code>setup-code</code> in the app's data folder.</p></details>"
         } else {
             ""
         };
         let form = |flash: Option<(bool, String)>| {
-            Resp::html(200, self.bare("First run", flash, &format!(
-                "<p>Choose the password for this wallet's web UI. Anyone with it can see the wallet and deny requests; \
-                 raising limits or approving payments also needs your approval key.</p>\
+            Resp::html(200, self.bare("Welcome", flash, &format!(
+                "{}<p class=\"lead\">Lightning Stream lets you pay for services, and sell your own, in small amounts over Lightning. \
+                 First, choose a password for this app.</p>\
                  <form method=\"post\" action=\"./setup-password\" class=\"card\">{code_field}\
-                 <label>New password (at least {} characters)<input type=\"password\" name=\"password\" autocomplete=\"new-password\" required></label>\
-                 <label>Again<input type=\"password\" name=\"password2\" autocomplete=\"new-password\" required></label>\
-                 <button>Set password</button></form>", crate::auth::MIN_PASSWORD)))
+                 <label>New password<input type=\"password\" name=\"password\" autocomplete=\"new-password\" required minlength=\"{n}\"></label>\
+                 <p class=\"hint\">At least {n} characters. You need it each time you open the app.</p>\
+                 <label>The same password again<input type=\"password\" name=\"password2\" autocomplete=\"new-password\" required></label>\
+                 <button>Set password and continue</button></form>", progress(1), n = crate::auth::MIN_PASSWORD)))
         };
         if req.method != "POST" || req.path != "/setup-password" {
             if req.path != "/setup-password" && req.path != "/" {
@@ -383,13 +389,13 @@ impl App {
         let f = req.form();
         let pw = f.get("password").cloned().unwrap_or_default();
         if Some(&pw) != f.get("password2") {
-            return form(Some((false, "the passwords differ".into())));
+            return form(Some((false, "The two passwords differ. Type the same one twice.".into())));
         }
         match self.auth.set_initial(f.get("code").map(String::as_str).unwrap_or(""), &pw) {
             Err(e) => form(Some((false, e))),
             Ok(()) => {
                 let sid = self.auth.new_session();
-                self.auth.with_session(&sid, |s| s.flash = Some((true, "Password set. Next: your approval key.".into())));
+                self.auth.with_session(&sid, |s| s.flash = Some((true, "Password set. Next: connect your Lightning node.".into())));
                 Resp::redirect("./setup").header("Set-Cookie", &self.cookie(req, &sid, self.cfg.session_max.as_secs() as i64))
             }
         }
@@ -496,32 +502,74 @@ impl App {
 
     // --- overview -----------------------------------------------------------------------------------
 
+    /// Home: what the owner can do here, and whether the wallet is ready, in a few lines.
+    fn home(&self, ctx: &Ctx) -> Resp {
+        let mut b = String::new();
+        let human = !self.human_pub().is_empty();
+        let ln = self.call("ln_status", json!({})).unwrap_or(json!({}));
+        let ready = ln["ready"] == true;
+        if !human || !ready {
+            b.push_str(&progress(2));
+            b.push_str(&format!("<section class=\"card primary\"><h2>Finish setting up</h2><p>{}</p>\
+                <p><a class=\"button-link primary\" href=\"./setup\">Continue setup</a></p></section>",
+                if !human { "Make your approval key and connect your Lightning node. It takes a few minutes, once." }
+                else { "Connect your Lightning node, so the app can pay for services." }));
+        }
+        let services = self.file_services().unwrap_or_default();
+        let sellers = {
+            let mut o: Vec<String> = services.iter().filter_map(|s| crate::services::http_origin(&s.seller)).collect();
+            o.sort();
+            o.dedup();
+            o.len()
+        };
+        let mut cats: Vec<String> = services.iter().map(|s| esc(s.kind.category_words())).collect();
+        cats.sort();
+        cats.dedup();
+        b.push_str("<section class=\"grid home\">");
+        b.push_str(&format!("<div class=\"card choice-card\"><h2>Use a service</h2><p>{}</p><p><a class=\"button-link{}\" href=\"./browse\">Browse services</a></p></div>",
+            if services.is_empty() { "Pay for what you use, a little at a time: media, AI models, data and more. Add a seller to begin.".to_string() }
+            else { format!("{} service{} from {} seller{}: {}.", services.len(), if services.len() == 1 { "" } else { "s" }, sellers,
+                           if sellers == 1 { "" } else { "s" }, cats.join(", ")) },
+            if human && ready { " primary" } else { "" }));
+        if self.cfg.sell {
+            let (class, headline, next) = self.sell_summary();
+            b.push_str(&format!("<div class=\"card choice-card\"><h2>Sell a service</h2><p><span class=\"pill {class}\">{}</span></p><p>{}</p>\
+                <p><a class=\"button-link\" href=\"./sell\">Open Sell</a></p></div>", esc(&headline), esc(&next)));
+        }
+        b.push_str("</section>");
+        let line = if ready {
+            let n = int(ln.get("usable_channels"));
+            format!("<span class=\"pill good\">Ready to pay</span> Your Lightning node is connected, with {n} channel{} to pay through.", if n == 1 { "" } else { "s" })
+        } else if ln["configured"] == true {
+            "<span class=\"pill warn\">Not ready</span> Your Lightning node is connected but cannot pay yet. <a href=\"./lightning\">See why</a>".into()
+        } else {
+            "<span class=\"pill warn\">Not connected</span> Connect your Lightning node to pay for services. <a href=\"./lightning\">Connect it</a>".into()
+        };
+        b.push_str(&format!("<p class=\"status-line\">{line} · <a href=\"./wallet\">Wallet</a></p>"));
+        self.page("Home", ctx, b)
+    }
+
     fn overview(&self, ctx: &Ctx) -> Resp {
         let health = match self.call("health", json!({})) {
             Ok(h) => h,
-            Err(e) => return self.page("Overview", ctx, Self::error_box(&e)),
+            Err(e) => return self.page("Wallet", ctx, Self::error_box(&e)),
         };
         let mut b = String::new();
         let bal = self.call("balance", json!({})).unwrap_or(json!({}));
         let hot = bal.get("hot").cloned().unwrap_or(json!({}));
         let approvals = self.call("approvals", json!({})).unwrap_or(json!({}));
-        let pend: Vec<&Value> = approvals["approvals"].as_array().map(|a| a.iter().filter(|x| x["state"] == "pending").collect()).unwrap_or_default();
-        if !pend.is_empty() {
-            b.push_str(&format!("<div class=\"flash warn\"><a href=\"./approvals\">{} payment{} wait{} for your approval.</a></div>",
-                                pend.len(), if pend.len() == 1 { "" } else { "s" }, if pend.len() == 1 { "s" } else { "" }));
-        }
         if approvals["human_key"] == false {
-            b.push_str("<div class=\"flash warn\">No approval key is enrolled yet: <a href=\"./setup\">finish the setup</a>.</div>");
+            b.push_str("<div class=\"flash warn\">No approval key yet: <a href=\"./setup\">finish the setup</a>.</div>");
         }
         if hot["hot_over_cap"] == true {
-            b.push_str("<div class=\"flash warn\">The hot key is over its balance cap: <a href=\"./keys\">sweep</a> the excess.</div>");
+            b.push_str("<div class=\"flash warn\">This box holds more than you allowed: <a href=\"./keys\">move the extra to your own wallet</a>.</div>");
         }
-        b.push_str("<section class=\"grid\"><div class=\"card\"><h2>Balances</h2>");
-        b.push_str(&kv(&[("Node wallet (confirmed)", sats(int(bal.get("trusted_sats")))), ("Node wallet (pending)", sats(int(bal.get("untrusted_pending_sats")))),
-                         ("Hot key", sats(int(hot.get("hot_sats")))),
-                         ("Hot key cap", if int(hot.get("hot_cap_sats")) > 0 { sats(int(hot.get("hot_cap_sats"))) } else { "none".into() }),
-                         ("Hot key status", if hot["hot_over_cap"] == true { "<span class=\"tag bad\">over cap</span>".into() } else { "<span class=\"tag ok\">within cap</span>".into() }),
-                         ("Keys encrypted at rest", if hot["hot_encrypted"] == true { "yes".into() } else { "<span class=\"tag bad\">no</span>".into() })]));
+        b.push_str("<section class=\"grid\"><div class=\"card\"><h2>Money</h2>");
+        b.push_str(&kv(&[("On your node", money(int(bal.get("trusted_sats")))), ("On its way to your node", money(int(bal.get("untrusted_pending_sats")))),
+                         ("On this box, for agents", money(int(hot.get("hot_sats")))),
+                         ("Most this box may hold", if int(hot.get("hot_cap_sats")) > 0 { money(int(hot.get("hot_cap_sats"))) } else { "no limit".into() }),
+                         ("Status", if hot["hot_over_cap"] == true { "<span class=\"pill bad\">Over the limit</span>".into() } else { "<span class=\"pill good\">Within the limit</span>".into() }),
+                         ("Keys locked with encryption", if hot["hot_encrypted"] == true { "yes".into() } else { "<span class=\"pill bad\">no</span>".into() })]));
         b.push_str("</div>");
         // on-chain channels are no rail of this wallet; a wallet upgraded with some is shown what they hold
         let chans = bal.get("channels").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -533,37 +581,36 @@ impl App {
             b.push_str("<div class=\"card\"><h2>Channels of an earlier version</h2>");
             b.push_str(&kv(&[("Open", counts.get("open").copied().unwrap_or(0).to_string()), ("Pending", counts.get("pending").copied().unwrap_or(0).to_string()),
                              ("Closed", counts.get("closed").copied().unwrap_or(0).to_string()), ("Refunded", counts.get("refunded").copied().unwrap_or(0).to_string())]));
-            b.push_str("<p><a href=\"./channels\">Channels →</a></p></div>");
+            b.push_str("<p><a href=\"./channels\">Old channels →</a></p></div>");
         }
-        let anchor = self.call("anchor_status", json!({})).unwrap_or(json!({}));
-        b.push_str("<div class=\"card\"><h2>Signature log</h2>");
-        b.push_str(&kv(&[("Anchor witness", if anchor["enabled"] == true { "enabled".into() } else { "<span class=\"tag warn\">not configured</span>".into() }),
-                         ("Log lines", escv(anchor.get("log_lines"))), ("Not yet anchored", escv(anchor.get("unanchored_lines"))),
-                         ("Last anchor", utc(int(anchor.get("anchored_at")))),
-                         ("Last error", if anchor["last_error"].as_str().is_some_and(|s| !s.is_empty()) { format!("<span class=\"tag bad\">{}</span>", escv(anchor.get("last_error"))) } else { "none".into() })]));
-        b.push_str("<p><a href=\"./signatures\">Signatures →</a></p></div>");
         if let Some(t) = self.cmp_tile() {
             b.push_str(&t);
         }
-        b.push_str("<div class=\"card\"><h2>Signer</h2>");
-        b.push_str(&kv(&[("Chain", escv(health.get("chain"))), ("Implementation", escv(health.get("implementation"))),
-                         ("Node wallet", escv(health.get("wallet"))), ("Regtest mining", escv(health.get("mining")))]));
-        b.push_str("</div></section>");
+        b.push_str("</section>");
         if let Ok(h) = self.call("history", json!({"limit": 15})) {
-            b.push_str("<h2>Recent activity</h2><div class=\"scroll\"><table><thead><tr><th>When</th><th>Event</th><th>Destination</th><th>Amount</th><th>Detail</th></tr></thead><tbody>");
-            for e in h["events"].as_array().cloned().unwrap_or_default().iter().rev() {
+            b.push_str("<h2>Recent activity</h2><div class=\"scroll\"><table><thead><tr><th>When</th><th>What</th><th>To</th><th>Amount</th><th>Detail</th></tr></thead><tbody>");
+            let events = h["events"].as_array().cloned().unwrap_or_default();
+            if events.is_empty() {
+                b.push_str("<tr><td colspan=\"5\" class=\"small\">Nothing yet.</td></tr>");
+            }
+            for e in events.iter().rev() {
                 let what = match e["type"].as_str() {
-                    Some("decision") => format!("decision: {}", txt(e.get("verdict"))),
-                    Some(t) => t.replace('_', " "),
+                    Some("decision") => match e["verdict"].as_str() { Some("allow") => "Allowed".into(), Some("deny") => "Refused".into(),
+                                                                       Some("needs_human") => "Asked for your approval".into(), v => format!("Decision: {}", v.unwrap_or("")) },
+                    Some(t) => { let t = t.replace('_', " "); let mut c = t.chars(); c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default() }
                     None => String::new(),
                 };
-                let amt = e.get("amount_sats").map(|a| sats(int(Some(a)))).unwrap_or_default();
-                b.push_str(&format!("<tr><td>{}</td><td>{}</td><td>{}</td><td>{amt}</td><td>{}</td></tr>", utc(int(e.get("ts"))), esc(&what),
+                let amt = e.get("amount_sats").map(|a| money(int(Some(a)))).unwrap_or_default();
+                b.push_str(&format!("<tr><td>{}</td><td>{}</td><td>{}</td><td>{amt}</td><td class=\"small\">{}</td></tr>", utc(int(e.get("ts"))), esc(&what),
                                     esc(&short(&txt(e.get("dest")), 40)), esc(&short(&txt(e.get("reason").or(e.get("txid"))), 80))));
             }
             b.push_str("</tbody></table></div>");
         }
-        self.page("Overview", ctx, b)
+        b.push_str("<details class=\"card\"><summary>Technical details</summary>");
+        b.push_str(&kv(&[("Chain", escv(health.get("chain"))), ("Signer", escv(health.get("implementation"))),
+                         ("Node wallet", escv(health.get("wallet"))), ("Test mining", escv(health.get("mining")))]));
+        b.push_str("</details>");
+        self.page("Wallet", ctx, b)
     }
 
     // --- approvals ----------------------------------------------------------------------------------
@@ -574,8 +621,8 @@ impl App {
             Err(e) => return self.page("Approvals", ctx, Self::error_box(&e)),
         };
         let human = self.human_pub();
-        let mut b = String::from("<p>Payments at or above the human threshold wait here. Approving signs \
-            <em>exactly</em> the token, destination, amount and expiry shown, with the approval key in this browser; the signer checks the signature.</p>");
+        let mut b = String::from("<p class=\"lead\">Payments at or above the amount you set wait here for you. Approving signs \
+            <em>exactly</em> what is shown, with the approval key in this browser.</p>");
         let rows = q["approvals"].as_array().cloned().unwrap_or_default();
         if rows.is_empty() {
             b.push_str("<p class=\"empty\">Nothing waits for you.</p>");
@@ -603,8 +650,8 @@ impl App {
             rows.push(("Agent's memo", escv(a.get("memo"))));
             rows.push(("Requested", utc(int(a.get("ts")))));
             rows.push(("Expires", format!("{} · <span data-expires=\"{exp}\"></span>", utc(exp))));
-            rows.push(("Token", format!("<code>{}</code>", esc(&token))));
             b.push_str(&kv(&rows));
+            b.push_str(&format!("<details><summary>Details</summary>{}</details>", kv(&[("Request id", format!("<code>{}</code>", esc(&token)))])));
             match state.as_str() {
                 "pending" => {
                     let hidden = [("token", token.clone()), ("dest", dest.clone()), ("amount_sats", amount.to_string()), ("expiry", exp.to_string())];
@@ -647,8 +694,11 @@ impl App {
             b.push_str("</ul></div>");
         }
         b.push_str(&format!("<form method=\"post\" action=\"./policy\" class=\"policy\">{}<input type=\"hidden\" name=\"mode\" value=\"form\">", Self::csrf_input(ctx)));
-        let groups = [("budgets", "Budgets"), ("human", "Human approval"), ("velocity", "Velocity"), ("hot", "Hot key"), ("anchor", "Signature log")];
+        let groups = [("budgets", "Spending limits"), ("human", "Ask me first"), ("velocity", "How fast"), ("hot", "Money on this box"), ("anchor", "Records")];
         for (g, title) in groups {
+            if g == "velocity" {
+                b.push_str("<details><summary>More rules</summary>");
+            }
             b.push_str(&format!("<fieldset><legend>{title}</legend>"));
             for (k, label, grp) in INT_KEYS {
                 if grp == g {
@@ -656,20 +706,24 @@ impl App {
                 }
             }
             if g == "anchor" {
-                b.push_str(&format!("<label class=\"check\"><input type=\"checkbox\" name=\"f_anchor_required\" value=\"1\"{}> Refuse to start without the anchor witness (restart)</label>",
+                b.push_str(&format!("<label class=\"check\"><input type=\"checkbox\" name=\"f_anchor_required\" value=\"1\"{}> Refuse to start without the separate record keeper (after a restart)</label>",
                                     if p.get("anchor_required").or(eff.get("anchor_required")) == Some(&Value::Bool(true)) { " checked" } else { "" }));
             }
             b.push_str("</fieldset>");
+            if g == "anchor" {
+                b.push_str("</details>");
+            }
         }
         let allow = p.get("allowlist").and_then(Value::as_array).map(|a| a.iter().map(|x| txt(Some(x))).collect::<Vec<_>>().join("\n")).unwrap_or_default();
         let cps = p.get("counterparties").and_then(Value::as_object).map(|m| m.iter().map(|(k, v)| format!("{k} {}", txt(v.get("ln_node")))).collect::<Vec<_>>().join("\n")).unwrap_or_default();
-        b.push_str(&format!("<fieldset><legend>Destinations</legend>\
-            <label>Allowlist: the only destinations the agent may pay (one per line: an xbt402 origin such as <code>https://api.example.net</code>, or an address)\
+        b.push_str(&format!("<fieldset><legend>Who may be paid</legend>\
+            <label>Sellers agents may pay, one per line: a web address such as <code>https://api.example.net</code>, or a coin address\
             <textarea name=\"f_allowlist\" rows=\"4\">{}</textarea></label>\
-            <label>Sellers tied to a Lightning node, for stream tickets (one per line: <code>origin node-id-hex</code>)<textarea name=\"f_counterparties\" rows=\"3\">{}</textarea></label></fieldset>\
-            <p><button>Review the change</button> <a href=\"./policy?template=starter\">Start from the conservative template</a></p></form>",
+            <label>Sellers paid through their Lightning node, one per line: the web address, a space, then the node's id\
+            <textarea name=\"f_counterparties\" rows=\"3\">{}</textarea></label></fieldset>\
+            <div class=\"row\"><button>Review the change</button> <a class=\"button-link\" href=\"./policy?template=starter\">Start from the safe starter rules</a></div></form>",
             esc(&allow), esc(&cps)));
-        b.push_str(&format!("<details><summary>Edit policy.json directly</summary><form method=\"post\" action=\"./policy\">{}\
+        b.push_str(&format!("<details><summary>Edit the rules as a file (policy.json)</summary><form method=\"post\" action=\"./policy\">{}\
             <input type=\"hidden\" name=\"mode\" value=\"json\"><textarea name=\"json\" rows=\"20\" class=\"mono\">{}</textarea>\
             <button>Review the change</button></form></details>", Self::csrf_input(ctx), esc(&serde_json::to_string_pretty(p).unwrap_or_default())));
         b
@@ -678,10 +732,10 @@ impl App {
     fn policy_page(&self, ctx: &Ctx, template: bool) -> Resp {
         let cur = match self.call("policy_get", json!({})) {
             Ok(v) => v,
-            Err(e) => return self.page("Policy", ctx, Self::error_box(&e)),
+            Err(e) => return self.page("Spending rules", ctx, Self::error_box(&e)),
         };
-        let mut b = String::from("<p>The rules the signer applies to every payment the agent asks for. A change takes effect \
-            once you sign it with your approval key; the agent cannot change them.</p>");
+        let mut b = String::from("<p class=\"lead\">The rules the wallet applies to every payment an app or an agent asks for. A change takes \
+            effect once you sign it with your approval key. Apps and agents cannot change them.</p>");
         let pr = cur["pending_restart"].as_array().cloned().unwrap_or_default();
         if !pr.is_empty() {
             b.push_str(&format!("<div class=\"flash warn\">Signed but waiting for a signer restart: {}.</div>",
@@ -697,14 +751,14 @@ impl App {
                     p[k] = v.clone();
                 }
             }
-            b.push_str("<div class=\"flash ok\">The conservative template is filled in below (your allowlist and counterparties are kept), with the Lightning rail \
-                        and stream tickets on. Review, then sign.</div>");
+            b.push_str("<div class=\"flash ok\">The safe starter rules are filled in below (your list of sellers is kept), with paying over \
+                        Lightning turned on and low limits. Review them, then sign.</div>");
         }
         let errs: Vec<String> = cur["errors"].as_array().map(|a| a.iter().map(|x| txt(Some(x))).collect()).unwrap_or_default();
         let warns: Vec<String> = cur["warnings"].as_array().map(|a| a.iter().map(|x| txt(Some(x))).collect()).unwrap_or_default();
         b.push_str(&self.policy_form(ctx, &p, &cur["effective"], &errs, &warns));
         b.push_str(&format!("<p class=\"small\">policy.json SHA-256 <code>{}</code></p>", escv(cur.get("sha256"))));
-        self.page("Policy", ctx, b)
+        self.page("Spending rules", ctx, b)
     }
 
     /// The form's fields on top of the current policy (unknown keys are kept).
@@ -746,14 +800,14 @@ impl App {
     fn policy_preview(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {
         let cur = match self.call("policy_get", json!({})) {
             Ok(v) => v,
-            Err(e) => return self.page("Policy", ctx, Self::error_box(&e)),
+            Err(e) => return self.page("Spending rules", ctx, Self::error_box(&e)),
         };
         let proposed = if f.get("mode").map(String::as_str) == Some("json") {
             match serde_json::from_str::<Value>(f.get("json").map(String::as_str).unwrap_or("")) {
                 Ok(v) => v,
                 Err(e) => {
                     let body = self.policy_form(ctx, &cur["policy"], &cur["effective"], &[format!("policy.json: {e}")], &[]);
-                    return self.page("Policy", ctx, body);
+                    return self.page("Spending rules", ctx, body);
                 }
             }
         } else {
@@ -761,12 +815,12 @@ impl App {
         };
         let prep = match self.call("policy_prepare", json!({"policy": proposed})) {
             Ok(v) => v,
-            Err(e) => return self.page("Policy", ctx, Self::error_box(&e)),
+            Err(e) => return self.page("Spending rules", ctx, Self::error_box(&e)),
         };
         let strs = |k: &str| -> Vec<String> { prep[k].as_array().map(|a| a.iter().map(|x| txt(Some(x))).collect()).unwrap_or_default() };
         if prep["ok"] != true {
             let body = self.policy_form(ctx, &proposed, &cur["effective"], &strs("errors"), &strs("warnings"));
-            return self.page("Policy", ctx, body);
+            return self.page("Spending rules", ctx, body);
         }
         let mut b = String::from("<p>Check the change, then sign it with your approval key. The signer writes exactly the text below.</p>");
         let diff = prep["diff"].as_array().cloned().unwrap_or_default();
@@ -801,7 +855,7 @@ impl App {
                                      &[("text", text.clone()), ("prev_sha256", prev.clone()), ("expiry", exp.to_string())], &visible,
                                      "Sign and apply", Ext::Bytes(msg::policy(&prev, exp, &text))));
         b.push_str("<p><a href=\"./policy\">Cancel</a></p>");
-        self.page("Policy", ctx, b)
+        self.page("Spending rules", ctx, b)
     }
 
     // --- channels -----------------------------------------------------------------------------------
@@ -811,7 +865,7 @@ impl App {
     fn channels(&self, ctx: &Ctx) -> Resp {
         let ch = match self.call("channels", json!({})) {
             Ok(v) => v,
-            Err(e) => return self.page("Channels", ctx, Self::error_box(&e)),
+            Err(e) => return self.page("Old channels", ctx, Self::error_box(&e)),
         };
         let reps = self.call("channel_reports", json!({})).unwrap_or(json!({}));
         let height = int(ch.get("height"));
@@ -849,7 +903,7 @@ impl App {
             b.push_str(&kv(&rows));
             b.push_str("</article>");
         }
-        self.page("Channels", ctx, b)
+        self.page("Old channels", ctx, b)
     }
 
     // --- signatures ---------------------------------------------------------------------------------
@@ -857,11 +911,11 @@ impl App {
     fn signatures(&self, ctx: &Ctx) -> Resp {
         let s = match self.call("signatures", json!({"limit": 200})) {
             Ok(v) => v,
-            Err(e) => return self.page("Signatures", ctx, Self::error_box(&e)),
+            Err(e) => return self.page("Records", ctx, Self::error_box(&e)),
         };
         let a = &s["anchor"];
-        let mut b = String::from("<p>Every signature the signer made, hash-chained, and the chain's head anchored with the witness \
-            (a separate process under another user): a rewritten log fails the check below.</p>");
+        let mut b = String::from("<p class=\"lead\">A tamper-evident record of every payment and change the wallet signed. A separate \
+            record keeper seals it from time to time, so a record changed afterwards fails the check below.</p>");
         let chain_ok = s["chain_ok"] == true;
         b.push_str(&kv(&[
             ("Log check", if chain_ok { "<span class=\"tag ok\">chain intact, matches the anchor</span>".into() }
@@ -874,7 +928,7 @@ impl App {
         if let Some(e) = s.get("chain").and_then(|c| c.get("anchor_error")).or(s.get("anchor_error")) {
             b.push_str(&Self::error_box(&txt(Some(e))));
         }
-        b.push_str(&format!("<form method=\"post\" action=\"./anchor-now\">{}<button>Anchor now</button></form>", Self::csrf_input(ctx)));
+        b.push_str(&format!("<form method=\"post\" action=\"./anchor-now\">{}<button class=\"secondary\">Seal the record now</button></form>", Self::csrf_input(ctx)));
         b.push_str("<div class=\"scroll\"><table><thead><tr><th>When</th><th>Kind</th><th>Authorised by</th><th>Method</th><th>Destination</th><th>Signature hash</th></tr></thead><tbody>");
         for e in s["signatures"].as_array().cloned().unwrap_or_default().iter().rev() {
             b.push_str(&format!("<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><code>{}</code></td></tr>", utc(int(e.get("ts"))),
@@ -882,7 +936,7 @@ impl App {
                                 esc(&short(&txt(e.get("sig_sha256")), 16))));
         }
         b.push_str("</tbody></table></div>");
-        self.page("Signatures", ctx, b)
+        self.page("Records", ctx, b)
     }
 
     // --- keys ---------------------------------------------------------------------------------------
@@ -917,7 +971,7 @@ impl App {
     fn keys(&self, ctx: &Ctx) -> Resp {
         let ks = match self.call("keystore_status", json!({})) {
             Ok(v) => v,
-            Err(e) => return self.page("Keys", ctx, Self::error_box(&e)),
+            Err(e) => return self.page("Keys and backup", ctx, Self::error_box(&e)),
         };
         let human = txt(ks.get("human_pubkey"));
         let hot = &ks["hot"];
@@ -938,7 +992,7 @@ impl App {
             b.push_str("</details>");
         }
         b.push_str("</section>");
-        b.push_str("<section class=\"card\"><h2>Hot key</h2>");
+        b.push_str("<section class=\"card\"><h2>Money on this box, for agents</h2>");
         b.push_str(&kv(&[("Address", format!("<code>{}</code>", esc(&hot_addr))), ("Balance", sats(int(hot.get("hot_sats")))),
                          ("Cap", if int(hot.get("hot_cap_sats")) > 0 { sats(int(hot.get("hot_cap_sats"))) } else { "none".into() }),
                          ("Retired keys", escv(hot.get("hot_retired_keys")))]));
@@ -948,11 +1002,11 @@ impl App {
              <label>Amount (sats)<input name=\"amount_sats\" inputmode=\"numeric\" required></label>",
             "Sign and sweep",
             Ext::Lines(format!("xbt-agentwallet-hot-sweep-v1\n{hot_addr}\n<to address>\n<amount in sats>\n{exp}"))));
-        b.push_str("<h3>Rotate the hot key</h3><p>A new hot key; the coins on the old one move to it.</p>");
+        b.push_str("<h3>Replace this key</h3><p>A new key for the money on this box; the coins on the old one move to it.</p>");
         b.push_str(&self.signed_form(ctx, "./rotate", "rotate", &human, &[("hot_address", hot_addr.clone()), ("expiry", exp.to_string())], "",
                                      "Sign and rotate", Ext::Bytes(msg::rotate(&hot_addr, exp))));
         b.push_str("</section>");
-        b.push_str("<section class=\"card\"><h2>Wrapping key and backup</h2>");
+        b.push_str("<section class=\"card\"><h2>Encryption and backup</h2>");
         b.push_str(&kv(&[("Keys encrypted at rest", if ks["encrypted"] == true { "yes".into() } else { "<span class=\"tag bad\">no (test mode)</span>".into() }),
                          ("Wrapping key", match ks["kdf"].as_str() { Some("keyfile") => "a key file".into(), Some("scrypt") => "a passphrase".into(), _ => "none".into() }),
                          ("Key file", escv(ks.get("keyfile"))),
@@ -965,7 +1019,7 @@ impl App {
              <label>Again<input name=\"backup_pass2\" type=\"password\" autocomplete=\"new-password\" required></label>",
             "Sign and download the backup", Ext::Bytes(msg::backup(&hot_addr, exp))));
         b.push_str("</section>");
-        self.page("Keys", ctx, b)
+        self.page("Keys and backup", ctx, b)
     }
 
     // --- setup ------------------------------------------------------------------------------
@@ -974,38 +1028,47 @@ impl App {
     /// this page is where the owner gets them. The token lets an agent pay allowlisted services within the
     /// policy and below the human threshold; it cannot approve, change the policy or move keys.
     fn agents(&self, ctx: &Ctx) -> Resp {
-        let mut b = String::from("<section class=\"card\"><h2>Connect an agent</h2>\
-            <p>Agents talk to the wallet's MCP server over HTTP with a bearer token. They can pay the services your policy allows, \
-            within its budgets and below the human threshold. They cannot approve payments, change the policy or move keys.</p>");
+        let mut b = String::from("<p class=\"lead\">Let an AI agent pay for services on its own, within your spending rules. It cannot approve \
+            payments, change your rules or move your money. (For other apps, such as a phone wallet, see <a href=\"./apps\">Apps</a>.)</p>\
+            <section class=\"card\"><h2>Connect an agent</h2>");
         let urls = &self.cfg.mcp_urls;
-        if urls.is_empty() {
-            b.push_str("<p>No MCP address is configured for this page (<code>XBT_UI_MCP_URL</code>). The MCP server listens on port 33510 at <code>/mcp</code>.</p>");
-        } else {
-            b.push_str("<p>MCP endpoint:</p><ul>");
-            for u in urls {
-                b.push_str(&format!("<li><code>{}</code></li>", esc(u)));
-            }
-            b.push_str("</ul>");
-        }
         let token = std::fs::read_to_string(&self.cfg.mcp_token_file).ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+        match &token {
+            None => b.push_str("<p class=\"empty\">Agents can't connect yet: the app has not made their access key. It does this when it starts; \
+                                restart the app if this stays.</p>"),
+            Some(_) => b.push_str("<p>Give your agent the address and the access key below. Treat the key like a card with a spending limit: \
+                                   anyone who holds it can pay what your rules allow.</p>"),
+        }
+        if let Some(u) = urls.first() {
+            b.push_str(&format!("<label>Agent address<input readonly class=\"mono\" value=\"{}\"></label>", esc(u)));
+        }
+        let mut details = String::new();
+        if urls.is_empty() {
+            details.push_str("<p>No address is set for this page (<code>XBT_UI_MCP_URL</code>). The agent server (MCP) listens on port 33510 at <code>/mcp</code>.</p>");
+        } else if urls.len() > 1 {
+            details.push_str("<p>Other addresses:</p><ul>");
+            for u in &urls[1..] {
+                details.push_str(&format!("<li><code>{}</code></li>", esc(u)));
+            }
+            details.push_str("</ul>");
+        }
         match token {
-            None => b.push_str(&format!("<p>No token here yet (<code>{}</code>). The box's installer copies it from the MCP server on start.</p>",
-                                        esc(&self.cfg.mcp_token_file.display().to_string()))),
+            None => details.push_str(&format!("<p>No token in <code>{}</code>. The box's installer copies it from the agent server on start.</p>",
+                                              esc(&self.cfg.mcp_token_file.display().to_string()))),
             Some(t) => {
                 let url = urls.first().cloned().unwrap_or_else(|| "http://<this box>:33510/mcp".into());
                 let snippet = json!({"mcpServers": {"xbt-wallet": {"type": "http", "url": url, "headers": {"Authorization": format!("Bearer {t}")}}}});
-                b.push_str(&format!("<details><summary>Show the bearer token</summary><p><code id=\"mcp-token\">{}</code></p>\
-                                     <p>An MCP client configuration:</p>{}</details>\
-                                     <p class=\"msg\">Treat the token like a card with a spending limit: anyone who holds it can pay what your policy allows.</p>",
-                                    esc(&t), json_block(&snippet)));
-                b.push_str(&format!("<form method=\"post\" action=\"./rotate-token\" class=\"stack\">{}<p>If the token leaked, replace it here. \
-                    Every agent loses access until you give it the new one. No terminal and no app restart.</p>\
-                    <label><input type=\"checkbox\" name=\"confirm\" value=\"1\" required> I will give my agents the new token</label>\
-                    <button type=\"submit\">Rotate the token</button></form>", Self::csrf_input(ctx)));
+                b.push_str(&format!("<details><summary>Show the access key</summary><p><code id=\"mcp-token\">{}</code></p>\
+                                     <p>A configuration to paste into an agent that speaks MCP:</p>{}</details>", esc(&t), json_block(&snippet)));
+                b.push_str(&format!("<form method=\"post\" action=\"./rotate-token\" class=\"stack\">{}<h3>Replace the access key</h3><p>If the key \
+                    leaked, replace it here. Every agent loses access until you give it the new one.</p>\
+                    <label class=\"check\"><input type=\"checkbox\" name=\"confirm\" value=\"1\" required> I will give my agents the new key</label>\
+                    <button type=\"submit\" class=\"secondary\">Rotate the token</button></form>", Self::csrf_input(ctx)));
             }
         }
+        b.push_str(&format!("<details><summary>Technical details</summary>{details}</details>"));
         b.push_str("</section>");
-        self.page("Agents", ctx, b)
+        self.page("AI agents", ctx, b)
     }
 
     /// Replace the MCP bearer token (AGP-042). The UI owns the token file and the MCP only reads it, on
@@ -1077,34 +1140,57 @@ impl App {
         let human = txt(ks.get("human_pubkey"));
         let allow_n = pol["policy"]["allowlist"].as_array().map(|a| a.len()).unwrap_or(0);
         let step = |done: bool, title: &str, body: String| {
-            format!("<li class=\"step {}\"><h2>{} {}</h2>{body}</li>", if done { "done" } else { "todo" }, if done { "✓" } else { "○" }, esc(title))
+            format!("<li class=\"step {}\"><h2>{}</h2>{body}</li>", if done { "done" } else { "todo" }, esc(title))
         };
-        let mut b = String::from("<p>Five steps. The wallet is safe to leave running after each one; nothing is paid until your policy allows it.</p><ol class=\"steps\">");
-        b.push_str(&step(true, "UI password", "<p>Set. Sessions end after 15 minutes idle.</p>".into()));
-        let key_body = if human.is_empty() {
-            format!("<section id=\"human-key-state\" data-enrolled=\"\"><p id=\"browser-key\" class=\"msg\"></p>{}</section>", self.keygen_block(ctx, true))
-        } else {
-            format!("<section id=\"human-key-state\" data-enrolled=\"{}\"><p>Enrolled: <code>{}</code></p><p id=\"browser-key\" class=\"msg\"></p>\
-                     <p><a href=\"./keys\">Manage keys →</a></p></section>", esc(&human), esc(&human))
-        };
-        b.push_str(&step(!human.is_empty(), "Your approval key", key_body));
-        b.push_str(&step(seen("policy_change"), "Your policy",
-            format!("<p>{} destination{} allowed now. Start from the conservative template, add the services your agent may pay, and sign it.</p>\
-                     <p><a href=\"./policy?template=starter\">Open the template →</a></p>", allow_n, if allow_n == 1 { "" } else { "s" })));
         let ln = self.call("ln_status", json!({})).unwrap_or(json!({}));
-        b.push_str(&step(ln["ready"] == true, "The Lightning rail",
-            format!("<p>{}</p><p><a href=\"./lightning\">Lightning →</a></p>",
-                    if ln["ready"] == true { "Connected to your Lightning node and ready to pay.".to_string() }
-                    else { format!("Not ready: {}", esc(&txt(ln.get("reason").or(ln.get("config_error"))))) })));
         let enc = ks["encrypted"] == true;
-        b.push_str(&step(enc && seen("backup_export"), "Wrapping key and backup",
-            format!("<p>The signer's keys are {} at rest{}. {}</p><p><a href=\"./keys\">Download an encrypted backup →</a></p>",
-                    if enc { "encrypted" } else { "<strong>not</strong> encrypted" },
-                    match ks["kdf"].as_str() { Some("keyfile") => " with a key file", Some("scrypt") => " with a passphrase", _ => "" },
-                    if seen("backup_export") { "A backup was exported." } else { "No backup exported yet." })));
+        let done = [true, !human.is_empty(), seen("policy_change"), ln["ready"] == true, enc && seen("backup_export")];
+        let n = done.iter().filter(|d| **d).count();
+        let mut b = progress(if n == done.len() { 3 } else { 2 });
+        b.push_str(&format!("<p class=\"lead\">{n} of {} done. The app is safe to leave running after each step: nothing is paid until your rules allow it.</p><ol class=\"steps\">",
+                            done.len()));
+        b.push_str(&step(true, "Password", "<p>Set. You are logged out after 15 minutes without use.</p>".into()));
+        let key_body = if human.is_empty() {
+            format!("<p>Your approval key is how you say yes to a large payment or a change of rules. It is made and kept in this browser, \
+                     under a passphrase only you know.</p><section id=\"human-key-state\" data-enrolled=\"\"><p id=\"browser-key\" class=\"msg\"></p>{}</section>",
+                    self.keygen_block(ctx, true))
+        } else {
+            format!("<section id=\"human-key-state\" data-enrolled=\"{}\"><p>Made and enrolled.</p><p id=\"browser-key\" class=\"msg\"></p>\
+                     <details><summary>Its public half</summary><p><code>{}</code></p></details>\
+                     <p><a href=\"./keys\">Keys and backup →</a></p></section>", esc(&human), esc(&human))
+        };
+        b.push_str(&step(done[1], "Your approval key", key_body));
+        b.push_str(&step(done[2], "Your spending rules",
+            format!("<p>How much may be spent, and when the app asks you first. The safe starter rules are a good start: {} seller{} allowed now.</p>\
+                     <p><a href=\"./policy?template=starter\">Open the starter rules →</a></p>", allow_n, if allow_n == 1 { "" } else { "s" })));
+        b.push_str(&step(done[3], "Your Lightning node",
+            format!("<p>{}</p><p><a href=\"./lightning\">Your node →</a></p>",
+                    if done[3] { "Connected and ready to pay.".to_string() }
+                    else { format!("Not ready yet: {}", esc(&txt(ln.get("reason").or(ln.get("config_error"))))) })));
+        b.push_str(&step(done[4], "A backup",
+            format!("<p>The app's keys are {} on this box. {}</p><p><a href=\"./keys\">Download an encrypted backup →</a></p>",
+                    if enc { "locked with encryption" } else { "<strong>not</strong> locked with encryption" },
+                    if seen("backup_export") { "A backup was exported." } else { "No backup yet." })));
         b.push_str("</ol>");
         self.page("Setup", ctx, b)
     }
+}
+
+/// An amount as the pages show money: sats, in the money colour.
+pub(crate) fn money(n: i64) -> String {
+    format!("<span class=\"money\">{}</span>", sats(n))
+}
+
+/// The first run's three steps, with `now` (1 to 3) the one the owner is on.
+pub(crate) fn progress(now: usize) -> String {
+    let mut b = String::from("<ol class=\"progress\" aria-label=\"Getting started\">");
+    for (i, name) in ["Password", "Connect your node", "Ready"].iter().enumerate() {
+        let n = i + 1;
+        let class = if n < now { "done" } else if n == now { "now" } else { "" };
+        b.push_str(&format!("<li class=\"{class}\"{}><span>{n}</span> {name}</li>", if n == now { " aria-current=\"step\"" } else { "" }));
+    }
+    b.push_str("</ol>");
+    b
 }
 
 #[cfg(unix)]

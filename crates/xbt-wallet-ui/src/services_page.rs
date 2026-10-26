@@ -9,7 +9,7 @@ use std::time::Duration;
 use super::{App, Ctx};
 use crate::html::esc;
 use crate::server::Resp;
-use crate::services::{self, Kind, Service};
+use crate::services::{self, Service};
 
 /// How long one request to a seller may take.
 const FETCH_WAIT: Duration = Duration::from_secs(10);
@@ -31,14 +31,6 @@ pub fn get_page(url: &str) -> Result<xbt402::listing::Page, String> {
     Ok(xbt402::listing::Page { status, headers, body })
 }
 
-fn kind_word(k: Kind) -> &'static str {
-    match k {
-        Kind::Video => "Films and video",
-        Kind::Files => "Files",
-        Kind::Api => "Web service",
-    }
-}
-
 /// The sellers in the services file, by origin, in the file's order.
 fn by_seller(all: &[Service]) -> Vec<(String, Vec<&Service>)> {
     let mut out: Vec<(String, Vec<&Service>)> = vec![];
@@ -55,12 +47,13 @@ fn by_seller(all: &[Service]) -> Vec<(String, Vec<&Service>)> {
 impl App {
     pub(crate) fn services_page(&self, ctx: &Ctx) -> Resp {
         let mut b = String::from("<p class=\"lead\">Add a seller to see what they offer on <a href=\"./browse\">Browse</a>. \
-            Paste the address the seller gave you; the app checks that the list really comes from that seller.</p>");
-        b.push_str(&format!("<form method=\"post\" action=\"./services\" class=\"card add\">{}<input type=\"hidden\" name=\"action\" value=\"add\">\
+            Paste the address the seller gave you. The app checks that the list really comes from that seller.</p>");
+        let all = self.file_services();
+        b.push_str(&format!("<form method=\"post\" action=\"./services\" class=\"card primary add\">{}<input type=\"hidden\" name=\"action\" value=\"add\">\
             <label>Seller's address<input name=\"url\" type=\"url\" inputmode=\"url\" required placeholder=\"https://seller.example\" \
             pattern=\"https?://.+\" title=\"Paste the seller's web address, starting with https://\" autocomplete=\"off\"></label>\
-            <button>Add seller</button></form>", App::csrf_input(ctx)));
-        match self.file_services() {
+            <button>Add seller</button></form>{}", App::csrf_input(ctx), self.suggested(ctx, all.as_deref().unwrap_or(&[]))));
+        match all {
             Err(e) => b.push_str(&App::error_box(&format!("The list of sellers could not be read: {e}"))),
             Ok(all) if all.is_empty() => b.push_str("<p class=\"empty\">No sellers yet. Add one above.</p>"),
             Ok(all) => {
@@ -69,12 +62,13 @@ impl App {
                     b.push_str(&format!("<section class=\"card seller\"><h3>{}</h3><p class=\"small\">{}</p><ul class=\"offers\">",
                                         esc(&list[0].name), esc(&origin)));
                     for s in &list {
-                        b.push_str(&format!("<li><strong>{}</strong> <span class=\"tag\">{}</span> <span class=\"price\">{}</span> \
-                                             <span class=\"small\">{} to choose from</span></li>",
-                                            esc(&s.name), kind_word(s.kind), esc(&s.price_text), s.items.len()));
+                        let n = s.items.len();
+                        b.push_str(&format!("<li><span class=\"pill cat-{}\">{}</span> <strong>{}</strong> <span class=\"price\">{}</span>{}</li>",
+                                            s.kind.category(), esc(s.kind.category_words()), esc(&s.name), esc(&s.price_text),
+                                            if n > 0 { format!(" <span class=\"small\">{n} to choose from</span>") } else { String::new() }));
                     }
                     b.push_str("</ul><div class=\"row\">");
-                    for (action, label, class) in [("refresh", "Check for updates", ""), ("remove", "Remove", " class=\"danger\"")] {
+                    for (action, label, class) in [("refresh", "Check for updates", " class=\"secondary\""), ("remove", "Remove", " class=\"danger\"")] {
                         b.push_str(&format!("<form method=\"post\" action=\"./services\">{}<input type=\"hidden\" name=\"action\" value=\"{action}\">\
                                              <input type=\"hidden\" name=\"url\" value=\"{}\"><button{class}>{label}</button></form>",
                                             App::csrf_input(ctx), esc(&origin)));
@@ -83,7 +77,7 @@ impl App {
                 }
             }
         }
-        self.page("Services", ctx, b)
+        self.page("Sellers", ctx, b)
     }
 
     pub(crate) fn services_post(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {

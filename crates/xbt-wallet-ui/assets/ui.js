@@ -279,9 +279,9 @@
       var shown = $("pre.signed-text", form);
       if (kind === "policy" && shown && shown.textContent !== f.text) { say(out, "the text shown differs from the text to sign: refused", true); return; }
       var w = loadKey();
-      if (!w) { say(out, "this browser holds no human key: set it up under Keys, or sign on another device and paste the signature", true); return; }
+      if (!w) { say(out, "this browser holds no approval key: make one under Settings, Keys and backup, or sign on another device and paste the signature", true); return; }
       var enrolled = form.getAttribute("data-human");
-      if (enrolled && enrolled !== w.pub) { say(out, "the key in this browser is not the enrolled human key", true); return; }
+      if (enrolled && enrolled !== w.pub) { say(out, "the key in this browser is not your enrolled approval key", true); return; }
       var pinEl = $("input.pin", form);
       var pin = pinEl ? pinEl.value : "";
       if (!pin) { say(out, "enter your passphrase", true); return; }
@@ -315,9 +315,9 @@
     else if (pend && mine && mine.pub === enrolled) { dropKey(PENDING); }
     var st = $("#browser-key");
     if (st) {
-      if (!mine) say(st, "This browser holds no human key.", true);
+      if (!mine) say(st, "This browser holds no approval key yet.", true);
       else if (!enrolled) say(st, "This browser holds a key (" + mine.pub.slice(0, 16) + "…), not enrolled yet.", true);
-      else if (mine.pub === enrolled) say(st, "This browser holds the enrolled human key (" + mine.pub.slice(0, 16) + "…).");
+      else if (mine.pub === enrolled) say(st, "This browser holds the enrolled approval key (" + mine.pub.slice(0, 16) + "…).");
       else say(st, "This browser holds another key (" + mine.pub.slice(0, 16) + "…), not the enrolled one.", true);
     }
   }
@@ -397,6 +397,29 @@
       else old();
     });
   });
+
+  // The menu: on a phone, one button opens it.
+  var doc = root.document;
+  if (doc && doc.documentElement) {
+    doc.documentElement.classList.add("js");
+    var toggle = $(".menu-toggle"), header = $("header");
+    if (toggle && header) {
+      toggle.addEventListener("click", function () {
+        var open = header.classList.toggle("open");
+        toggle.setAttribute("aria-expanded", open ? "true" : "false");
+      });
+    }
+  }
+
+  // Live connections: when money moved since the last look, a pulse runs down the river.
+  var spent = $("[data-spent]");
+  if (spent) {
+    var now = Number(spent.getAttribute("data-spent")) || 0, before = null;
+    try { before = Number(root.sessionStorage.getItem("ls-spent")); root.sessionStorage.setItem("ls-spent", String(now)); } catch (e) { /* no storage */ }
+    if (before !== null && now > before) {
+      root.addEventListener("load", function () { if (root.lsRiver) root.lsRiver.pulse(); });
+    }
+  }
 
   // The pending-approvals badge.
   var badge = $("#pending-badge");

@@ -43,22 +43,33 @@ body { margin: 0; min-height: 100vh; background: var(--bg); color: var(--fg); fo
 #river { width: 100%; height: 100%; }
 header, main, footer { position: relative; z-index: 1; }
 
-/* header and navigation */
+/* header and navigation: five places at the top, the pages of the current one as tabs under it */
 header { position: sticky; top: 0; background: var(--head); border-bottom: 1px solid var(--line); padding: 10px 20px;
          display: flex; flex-wrap: wrap; gap: 8px 24px; align-items: center; }
-.brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 1.05rem; letter-spacing: 0.01em; white-space: nowrap; }
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 1.05rem; letter-spacing: 0.01em; white-space: nowrap;
+         color: var(--fg); text-decoration: none; }
 .brand svg { width: 30px; height: 30px; border-radius: 8px; flex: none; }
-nav { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; flex: 1 1 auto; }
-nav a { color: var(--muted); text-decoration: none; padding: 6px 12px; border-radius: 999px; font-size: 0.95rem; white-space: nowrap; }
-nav a:hover { color: var(--fg); background: var(--accent-soft); }
-nav a[aria-current=page] { color: var(--fg); background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent); font-weight: 600; }
-nav form.inline { margin-left: auto; }
-nav form.inline button.link { color: var(--muted); padding: 6px 12px; text-decoration: none; }
-@media (max-width: 720px) {
+header nav { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; flex: 1 1 auto; }
+header nav a { color: var(--muted); text-decoration: none; padding: 7px 14px; border-radius: 999px; font-size: 0.97rem; white-space: nowrap; }
+header nav a:hover { color: var(--fg); background: var(--accent-soft); }
+header nav a[aria-current=page] { color: var(--fg); background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent); font-weight: 600; }
+header nav form.inline { margin-left: auto; }
+header nav form.inline button.link { color: var(--muted); padding: 6px 12px; text-decoration: none; }
+.menu-toggle { display: none; margin-left: auto; min-height: 40px; padding: 6px 16px; background: transparent; color: var(--fg);
+               border: 1px solid var(--line); box-shadow: none; font-weight: 600; }
+@media (max-width: 760px) {
   header { padding: 8px 16px; }
-  nav { flex-wrap: nowrap; overflow-x: auto; width: 100%; padding-bottom: 4px; scrollbar-width: none; }
-  nav::-webkit-scrollbar { display: none; }
+  .js .menu-toggle { display: inline-flex; align-items: center; }
+  .js header nav#site-nav:not(.bare) { display: none; flex-basis: 100%; flex-direction: column; align-items: stretch; padding: 4px 0 8px; }
+  .js header.open nav#site-nav { display: flex; }
+  header nav a { padding: 12px 14px; border-radius: 12px; }
+  header nav form.inline { margin-left: 0; }
 }
+nav.tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 14px; }
+nav.tabs a { color: var(--muted); text-decoration: none; padding: 6px 14px; border-radius: 999px; border: 1px solid var(--line); font-size: 0.92rem;
+             background: var(--card); }
+nav.tabs a:hover { color: var(--fg); border-color: var(--accent); }
+nav.tabs a[aria-current=page] { color: var(--accent-fg); background: var(--accent); border-color: var(--accent); font-weight: 600; }
 a:focus-visible, button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible, summary:focus-visible {
   outline: 3px solid var(--accent); outline-offset: 2px; }
 
@@ -214,6 +225,59 @@ details.card.advanced > summary { font-weight: 600; }
 ul.offers { list-style: none; padding: 0; margin: 0 0 8px; display: grid; gap: 6px; }
 .price { font-weight: 600; color: var(--money); font-variant-numeric: tabular-nums; }
 input:invalid:not(:placeholder-shown) { border-color: var(--bad); }
+
+/* first run: where the owner is, in three steps */
+ol.progress { list-style: none; display: flex; flex-wrap: wrap; gap: 8px 18px; padding: 0; margin: 0 0 18px; counter-reset: none; }
+ol.progress li { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 0.95rem; }
+ol.progress li span { display: grid; place-items: center; width: 28px; height: 28px; border-radius: 50%; font-weight: 700; font-size: 0.85rem;
+                      background: var(--card); box-shadow: inset 0 0 0 1px var(--line); }
+ol.progress li.now { color: var(--fg); font-weight: 600; }
+ol.progress li.now span { color: var(--accent-fg); background: var(--accent); box-shadow: none; }
+ol.progress li.done span { color: var(--ok); background: var(--ok-bg); box-shadow: none; }
+
+/* home: what the owner can do here */
+.grid.home { grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+.choice-card { display: flex; flex-direction: column; gap: 4px; }
+.choice-card h2 { font-size: 1.35rem; }
+.choice-card p:last-child { margin-top: auto; }
+.status-line { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; color: var(--muted); }
+
+/* browse: categories as chips, services as cards */
+nav.chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 12px; }
+nav.chips a { display: inline-flex; gap: 8px; align-items: center; padding: 8px 16px; border-radius: 999px; border: 1px solid var(--line);
+              background: var(--card); color: var(--fg); text-decoration: none; font-weight: 500; }
+nav.chips a:hover { border-color: var(--accent); }
+nav.chips a[aria-current=page] { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); font-weight: 600; }
+nav.chips .count { color: var(--muted); font-size: 0.85em; font-variant-numeric: tabular-nums; }
+.sort { margin: 0 0 14px; }
+.grid.services { grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); }
+a.service-card { display: flex; flex-direction: column; gap: 6px; color: var(--fg); text-decoration: none; margin: 0; }
+a.service-card:hover { border-color: var(--accent); transform: translateY(-1px); }
+a.service-card h2 { margin: 4px 0 0; font-size: 1.1rem; }
+a.service-card p { margin: 0; }
+a.service-card .pill { align-self: flex-start; }
+.pill.cat-media { color: var(--river-b); background: color-mix(in srgb, var(--river-b) 14%, transparent); border-color: transparent; }
+.pill.cat-ai { color: var(--accent); background: var(--accent-soft); border-color: transparent; }
+.pill.cat-data { color: var(--ok); background: var(--ok-bg); border-color: transparent; }
+.pill.cat-media::before, .pill.cat-ai::before, .pill.cat-data::before { display: none; }
+form.suggested { margin: 10px 0 0; justify-content: space-between; }
+.empty-card { text-align: center; }
+.empty-card .row { justify-content: center; }
+
+/* live connections */
+.card.live h2 { margin: 0; font-size: 1.1rem; }
+.card.live p { margin: 8px 0; }
+
+/* a banner for what waits on the owner */
+.flash.banner a { color: inherit; font-weight: 600; text-decoration: none; }
+.flash.banner a:hover { text-decoration: underline; }
+
+/* the rules' groups sit on a card's ground, over the river */
+form.policy > fieldset, form.policy > details > fieldset { background: var(--card); box-shadow: var(--shadow); }
+/* a fieldset inside a card is a group, not a second box */
+.card fieldset { border: none; border-radius: 0; padding: 0; margin: 0 0 22px; min-width: 0; }
+.card fieldset legend { padding: 0 0 2px; font-size: 1.05rem; }
+.card fieldset.choices { border: none; padding: 0; }
 
 [hidden] { display: none !important; }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }

@@ -1,8 +1,10 @@
 //! The services file (`XBT_UI_SERVICES`): what Browse lists and what the player may open.
 //!
-//! A JSON list. Each service is `{name, kind, seller, price_text, items}`. `kind` is `video`,
-//! `files` or `api`. Each item is `{title, year, url, credit}`. `seller` and every item `url` are
-//! absolute `http` or `https` URLs. `year` and `credit` may be left out. An example is
+//! A JSON list. Each service is `{name, kind, seller, price_text, items}`, with an optional
+//! `address`: where apps and agents reach that one service (the seller's origin plus the path it is
+//! sold under). `kind` is `video`, `files`, `api` or `ai`. Each item is `{title, year, url, credit}`.
+//! `seller`, `address` and every item `url` are absolute `http` or `https` URLs. `year` and `credit`
+//! may be left out. An example is
 //! `examples/services.example.json` in this crate.
 //!
 //! The Services page writes this file: a seller added by its address is fetched, its signed
@@ -23,7 +25,11 @@ pub enum Kind {
     Video,
     Files,
     Api,
+    Ai,
 }
+
+/// The categories Browse sorts services into. Media is one of them, not the app's subject.
+pub const CATEGORIES: [(&str, &str); 3] = [("media", "Media"), ("ai", "AI"), ("data", "Data & APIs")];
 
 impl Kind {
     pub fn as_str(self) -> &'static str {
@@ -31,7 +37,22 @@ impl Kind {
             Kind::Video => "video",
             Kind::Files => "files",
             Kind::Api => "api",
+            Kind::Ai => "ai",
         }
+    }
+
+    /// The category's id, as Browse filters by it.
+    pub fn category(self) -> &'static str {
+        match self {
+            Kind::Video => "media",
+            Kind::Ai => "ai",
+            Kind::Files | Kind::Api => "data",
+        }
+    }
+
+    /// The category as people read it.
+    pub fn category_words(self) -> &'static str {
+        CATEGORIES.iter().find(|(id, _)| *id == self.category()).map(|(_, w)| *w).unwrap_or("Other")
     }
 
     fn parse(v: &Value) -> Result<Self, String> {
@@ -39,7 +60,8 @@ impl Kind {
             Some("video") => Ok(Kind::Video),
             Some("files") => Ok(Kind::Files),
             Some("api") => Ok(Kind::Api),
-            Some(o) => Err(format!("kind {o:?} is not video, files or api")),
+            Some("ai") => Ok(Kind::Ai),
+            Some(o) => Err(format!("kind {o:?} is not video, files, api or ai")),
             None => Err("kind must be a string".into()),
         }
     }
@@ -76,6 +98,15 @@ pub struct Service {
     pub seller: String,
     pub price_text: String,
     pub items: Vec<Item>,
+    /// Where apps and agents reach this service; empty: the seller's own address.
+    pub address: String,
+}
+
+impl Service {
+    /// Where apps and agents reach this service.
+    pub fn address(&self) -> &str {
+        if self.address.is_empty() { &self.seller } else { &self.address }
+    }
 }
 
 /// `scheme://host[:port]` of an absolute http(s) URL: lower case, no userinfo, and no port when it
@@ -188,7 +219,11 @@ fn parse_service(v: &Value, n: usize) -> Result<Service, String> {
         items.push(parse_item(item, &format!("{what} item {}", i + 1))?);
     }
     let kind = Kind::parse(obj.get("kind").ok_or_else(|| format!("{what}: missing kind"))?)?;
-    Ok(Service { name: text(obj, "name", &what)?.to_string(), kind, seller, price_text: text(obj, "price_text", &what)?.to_string(), items })
+    let address = if obj.contains_key("address") { text(obj, "address", &what)?.to_string() } else { String::new() };
+    if !address.is_empty() {
+        http_url(&address, &format!("{what} address"))?;
+    }
+    Ok(Service { name: text(obj, "name", &what)?.to_string(), kind, seller, price_text: text(obj, "price_text", &what)?.to_string(), items, address })
 }
 
 /// Parse the services file's text.
@@ -226,7 +261,11 @@ fn service_json(s: &Service) -> Value {
         }
         v
     }).collect();
-    json!({"name": s.name, "kind": s.kind.as_str(), "seller": s.seller, "price_text": s.price_text, "items": items})
+    let mut v = json!({"name": s.name, "kind": s.kind.as_str(), "seller": s.seller, "price_text": s.price_text, "items": items});
+    if !s.address.is_empty() {
+        v["address"] = json!(s.address);
+    }
+    v
 }
 
 /// Write the services file whole: a temp file beside it, then renamed over it.
@@ -279,8 +318,10 @@ pub fn from_listing(l: &xbt402::listing::Listing) -> Vec<Service> {
         let kind = match s.kind.as_str() {
             "video" => Kind::Video,
             "files" => Kind::Files,
+            "ai" => Kind::Ai,
             _ => Kind::Api,
         };
+        let path = if s.path.is_empty() || s.path == "/" { String::new() } else { s.path.clone() };
         let credit = if s.credits.is_empty() { l.credits.clone() } else { s.credits.clone() };
         let name = if several { format!("{}: {}", l.name, s.name) } else { l.name.clone() };
         Service {
@@ -290,6 +331,7 @@ pub fn from_listing(l: &xbt402::listing::Listing) -> Vec<Service> {
             price_text: price_words(&s.prices),
             items: s.items.iter().map(|i| Item { title: i.title.clone(), year: i.year.map(|y| y.to_string()).unwrap_or_default(), url: i.url.clone(),
                                                  credit: i.credit.clone().unwrap_or_else(|| credit.clone()).chars().take(MAX_TEXT).collect() }).collect(),
+            address: if path.is_empty() { String::new() } else { format!("{}{path}", l.seller.trim_end_matches('/')) },
         }
     }).collect()
 }
@@ -321,9 +363,10 @@ pub fn price_num(s: &str) -> Option<u64> {
 }
 
 /// Filter by kind (`None`, `""` or `"all"` keeps every kind) and sort.
+/// `kind`: a kind (`video`) or a category (`media`); empty or `all`: every service.
 pub fn arrange(mut services: Vec<Service>, kind: Option<&str>, sort: Sort) -> Vec<Service> {
     if let Some(k) = kind.map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty() && s != "all") {
-        services.retain(|s| s.kind.as_str() == k);
+        services.retain(|s| s.kind.as_str() == k || s.kind.category() == k);
     }
     match sort {
         Sort::Name => services.sort_by(|a, b| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()).then(a.seller.cmp(&b.seller))),

@@ -1,14 +1,15 @@
 // The look of the app in a real headless Chrome: screenshots of the main pages in light, dark and
 // at phone width, the cost of the river background (CPU and frame time, with and without it), and
 // the contrast of text over the brightest point the river reaches.
-//   node look_test.mjs WALLET_BASE SETUP_CODE GATEWAY_BASE GATEWAY_SETUP_CODE OUT PLAY_PATH SECONDS
+//   node look_test.mjs WALLET_BASE SETUP_CODE GATEWAY_BASE GATEWAY_SETUP_CODE OUT PLAY_PATH SECONDS PAGES
+// PAGES: a JSON list of [name, path] for the wallet's pages to shoot.
 // Prints one JSON line starting "LOOK " with the measurements.
 import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const [BASE, CODE, GW, GWCODE, OUT, PLAY, SECS] = process.argv.slice(2);
+const [BASE, CODE, GW, GWCODE, OUT, PLAY, SECS, PAGES] = process.argv.slice(2);
 const SECONDS = Number(SECS || 30);
 mkdirSync(OUT, { recursive: true });
 const CHROME = process.env.CHROME || "google-chrome";
@@ -89,14 +90,18 @@ try {
   await scheme("light"); await go(BASE + "/"); await shot("setup-first-run-light", 1280); await shot("setup-first-run-phone-light", 390);
   await set("[name=code]", CODE); await set("[name=password]", "look box password"); await set("[name=password2]", "look box password");
   await submitAndWait("document.querySelector('form').submit()");
-  for (const [page, path] of [["setup", "/setup"], ["browse", "/browse"], ["player", PLAY], ["connections", "/connections"]]) {
+  const pages = PAGES ? JSON.parse(PAGES) : [["setup", "/setup"], ["browse", "/browse"], ["player", PLAY], ["connections", "/connections"]];
+  for (const [page, path] of pages) {
     for (const s of ["dark", "light"]) { await scheme(s); await go(BASE + path); await shot(`${page}-${s}`, 1280); await shot(`${page}-phone-${s}`, 390); }
   }
+  // the phone's menu, opened
+  await scheme("light"); await size(390, 844); await go(BASE + "/browse"); await ev("document.querySelector('.menu-toggle').click()"); await sleep(200);
+  { const png = await cdp("Page.captureScreenshot", { format: "png" }); const f = join(OUT, "menu-phone-light.png"); writeFileSync(f, Buffer.from(png.data, "base64")); shots.push(f); }
   // the seller's side
   await scheme("dark"); await go(GW + "/");
   await set("[name=code]", GWCODE); await set("[name=password]", "look box password"); await set("[name=password2]", "look box password");
   await submitAndWait("document.querySelector('form').submit()");
-  for (const s of ["dark", "light"]) { await scheme(s); await go(GW + "/"); await shot(`sell-${s}`, 1280); await shot(`sell-phone-${s}`, 390); }
+  for (const s of ["dark", "light"]) { await scheme(s); await go(GW + "/"); await shot(`seller-app-${s}`, 1280); await shot(`seller-app-phone-${s}`, 390); }
 
   // contrast: text colours against the brightest point the river and the glow reach, anywhere.
   // The page's own canvas is read, so the river draws in the page here (its fallback when a

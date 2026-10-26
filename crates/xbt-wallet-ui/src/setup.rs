@@ -118,11 +118,27 @@ fn notice_html(lines: &[&str]) -> String {
 
 /// What the wallet's page says before mainnet is turned on.
 pub const WALLET_MAINNET_NOTICE: [&str; 4] = [
-    "This wallet's Lightning rail has run on regtest only. On mainnet it pays real funds from your Lightning node's channels.",
-    "The rail macaroon lets the signer pay any invoice your policy allows: keep the policy's caps low (the starter template does).",
-    "A payment the policy allows is final: the signer checks the seller's terms, not the seller's honesty.",
+    "This app is new, and has been tested on test networks. With real money it pays from your Lightning node's channels.",
+    "The key you give lets the app pay anything your spending rules allow: keep their limits low (the starter rules do).",
+    "A payment your rules allow is final: the app checks the seller's prices, not the seller's honesty.",
     "Read the limits of the software (docs/LIMITS.md in the source) before you rely on it.",
 ];
+
+/// The signer's reason a node is not ready, in words for the owner where a common one is known.
+fn plain_reason(r: &str) -> String {
+    let l = r.to_ascii_lowercase();
+    if l.contains("no usable channel") || l.contains("no channel") {
+        "Your node has no channel the app can pay through. Open a channel in your node's app first.".into()
+    } else if l.contains("connect") || l.contains("unreachable") || l.contains("refused") {
+        "The app can't reach your node. Check that your Lightning node app is running.".into()
+    } else if l.contains("macaroon") || l.contains("permission") {
+        "The key doesn't have the right permissions. Make a new one as described below.".into()
+    } else if r.is_empty() {
+        "The app is still checking your node.".into()
+    } else {
+        format!("Your node said: {r}")
+    }
+}
 
 /// How long reading the node's certificate for pinning may take.
 const PIN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -209,43 +225,51 @@ impl App {
         let status = self.signer.call("ln_status", json!({})).unwrap_or_else(|e| json!({"ready": false, "reason": e}));
         let have = ln.dir.join(RAIL_MACAROON).is_file();
         let acked = ln.dir.join(MAINNET_ACK_FILE).is_file();
-        let mut b = String::from("<p>The wallet pays sellers through your Lightning node. It needs the node's address and certificate, which \
-            this box gives it, and a macaroon you make in the node's own dashboard (Lightning Fork: <em>Macaroons</em>) with exactly these \
-            permissions and no others:</p>");
-        b.push_str(&format!("<p><code>{}</code></p>", RAIL_OPS.join(" ")));
-        b.push_str("<p>Give it a root key of its own there, so you can revoke it alone. Never paste the node's admin macaroon: the page \
-            refuses one, and the wallet does not need it.</p>");
-        b.push_str("<section class=\"card\"><h2>The node</h2>");
-        b.push_str(&kv(&[
-            ("REST address", ln.rest.as_deref().map(|r| format!("<code>{}</code>", esc(r))).unwrap_or_else(|| "<span class=\"tag bad\">not given by the platform</span>".into())),
-            ("Certificate (pinned)", cert_line(ln.tls_cert.as_deref())),
-            ("Rail macaroon", if have { "<span class=\"tag ok\">stored</span> (never shown again)".into() } else { "<span class=\"tag warn\">none</span>".into() }),
-            ("Chain", esc(&chain)),
-            ("Rail", if status["ready"] == true { "<span class=\"tag ok\">ready</span>".into() }
-                     else { format!("<span class=\"tag bad\">not ready</span> {}", esc(&txt(status.get("reason").or(status.get("config_error"))))) }),
-        ]));
-        b.push_str(&format!("<details><summary>The signer's view of the rail</summary>{}</details></section>", json_block(&status)));
+        let ready = status["ready"] == true;
+        let mut b = String::from("<p class=\"lead\">The app pays for services through your own Lightning node. Connect it once with a key \
+            you make in your node's app. The key lets the app pay within your spending rules; it cannot open or close channels.</p>");
+        b.push_str(&format!("<section class=\"status {}\"><p class=\"status-head\">{}</p><p>{}</p></section>",
+            if ready { "ok" } else if have { "warn" } else { "bad" },
+            if ready { "Connected and ready to pay" } else if have { "Connected, not ready yet" } else { "Not connected" },
+            if ready { "Nothing to do here.".to_string() }
+            else if have { format!("{} If this stays, open the details below.", esc(&plain_reason(&txt(status.get("reason").or(status.get("config_error")))))) }
+            else { "Make the key in your node's app and paste it below.".into() }));
         b.push_str(&pin_card(&App::csrf_input(ctx), ln.pin, ln.rest.as_deref(), ln.tls_cert.as_deref(), "./lightning"));
         let main = chain == "main";
         if main {
-            b.push_str(&notice_html(&WALLET_MAINNET_NOTICE));
+            b.push_str(&format!("<div class=\"flash warn\"><p><strong>This is real money.</strong> Keep your spending rules low while you try the app.</p>\
+                <details><summary>Read before you connect</summary>{}</details></div>", notice_html(&WALLET_MAINNET_NOTICE)));
         }
-        b.push_str(&format!("<form method=\"post\" action=\"./lightning\" class=\"card\">{}<input type=\"hidden\" name=\"action\" value=\"save\">\
-            <h2>{}</h2><label>Rail macaroon (hex or base64)<textarea name=\"macaroon\" rows=\"4\" class=\"mono\" autocomplete=\"off\" required></textarea></label>",
-            App::csrf_input(ctx), if have { "Replace the rail macaroon" } else { "Connect the rail" }));
+        b.push_str(&format!("<form method=\"post\" action=\"./lightning\" class=\"card{}\">{}<input type=\"hidden\" name=\"action\" value=\"save\">\
+            <h2>{}</h2>\
+            <details><summary>How do I make the key?</summary><ol><li>Open your Lightning node's app (Lightning Fork) and find the page called \
+            <em>Macaroons</em>.</li><li>Make a new one with exactly these permissions, and a root key of its own so you can revoke it alone: \
+            <code>{}</code></li><li>Copy it and paste it here.</li></ol><p class=\"hint\">Never paste the node's admin key: the app refuses one, \
+            and does not need it.</p></details>\
+            <label>Key from your node<textarea name=\"macaroon\" rows=\"4\" class=\"mono\" autocomplete=\"off\" required></textarea></label>",
+            if have { "" } else { " primary" }, App::csrf_input(ctx), if have { "Replace the key" } else { "Connect your node" }, RAIL_OPS.join(" ")));
         if main {
-            b.push_str(&format!("<label>To use the rail on mainnet, type: <code>{}</code><input name=\"mainnet_ack\" autocomplete=\"off\" required></label>{}",
-                                esc(MAINNET_ACK), if acked { "<p class=\"hint\">Acknowledged before; type it again to replace the macaroon.</p>" } else { "" }));
+            b.push_str(&format!("<label>To pay with real money, type: <code>{}</code><input name=\"mainnet_ack\" autocomplete=\"off\" required></label>{}",
+                                esc(MAINNET_ACK), if acked { "<p class=\"hint\">You typed it before; type it again to replace the key.</p>" } else { "" }));
         }
-        b.push_str("<button>Save; the signer restarts to use it</button></form>");
+        b.push_str(&format!("<button{}>Connect</button></form>", if have { " class=\"secondary\"" } else { "" }));
+        b.push_str("<details class=\"card\"><summary>Details</summary>");
+        b.push_str(&kv(&[
+            ("Node address", ln.rest.as_deref().map(|r| format!("<code>{}</code>", esc(r))).unwrap_or_else(|| "<span class=\"pill bad\">not given by this box</span>".into())),
+            ("Node certificate", cert_line(ln.tls_cert.as_deref())),
+            ("Key", if have { "<span class=\"pill good\">stored</span> (never shown again)".into() } else { "<span class=\"pill warn\">none</span>".into() }),
+            ("Chain", esc(&chain)),
+        ]));
+        b.push_str(&format!("<p>What the wallet sees of the node:</p>{}", json_block(&status)));
         if have {
-            b.push_str(&format!("<form method=\"post\" action=\"./lightning\" class=\"card\">{}<input type=\"hidden\" name=\"action\" value=\"remove\">\
-                <h2>Disconnect</h2><p>Removes the macaroon from this box; the wallet then pays nothing over Lightning. Revoke it in the node's \
-                dashboard too if it may have been copied.</p><button>Remove the rail macaroon</button></form>", App::csrf_input(ctx)));
+            b.push_str(&format!("<form method=\"post\" action=\"./lightning\">{}<input type=\"hidden\" name=\"action\" value=\"remove\">\
+                <h3>Disconnect</h3><p>Removes the key from this box; the app then pays nothing. Revoke it in your node's app too if it may have \
+                been copied.</p><button class=\"danger\">Disconnect your node</button></form>", App::csrf_input(ctx)));
         }
-        b.push_str("<p class=\"hint\">The policy decides whom the wallet pays and how much: the <a href=\"./policy?template=starter\">starter template</a> \
-            turns the rail and stream tickets on with low caps. Each seller goes on the allowlist with its node id.</p>");
-        self.page("Lightning", ctx, b)
+        b.push_str("</details>");
+        b.push_str("<p class=\"hint\">Your <a href=\"./policy\">spending rules</a> decide whom the app pays and how much: the \
+            <a href=\"./policy?template=starter\">safe starter rules</a> turn paying on with low limits.</p>");
+        self.page("Your node", ctx, b)
     }
 
     pub(crate) fn lightning_post(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {
@@ -255,22 +279,22 @@ impl App {
             Some("pin_cert") => pin_cert(ln.pin, ln.rest.as_deref(), ln.tls_cert.as_deref(), f.get("fingerprint").map(String::as_str).unwrap_or("")),
             Some("remove") => remove_shared(dir, RAIL_MACAROON).map(|had| {
                 let _ = remove_shared(dir, MAINNET_ACK_FILE);
-                if had { "Rail macaroon removed: the signer restarts without it.".to_string() } else { "There was no rail macaroon.".into() }
+                if had { "Your node is disconnected: its key was removed from this box, and the app pays nothing now.".to_string() } else { "Your node was not connected.".into() }
             }),
             Some("save") => (|| {
                 let chain = self.signer_chain();
                 let main = chain == "main";
                 if main && f.get("mainnet_ack").map(|a| a.trim()) != Some(MAINNET_ACK) {
-                    return Err(format!("on mainnet the rail needs the acknowledgement, word for word: {MAINNET_ACK}"));
+                    return Err(format!("To pay with real money, type the sentence word for word: {MAINNET_ACK}"));
                 }
-                let mac = decode_macaroon(f.get("macaroon").map(String::as_str).unwrap_or("")).map_err(|e| format!("the macaroon: {e}"))?;
+                let mac = decode_macaroon(f.get("macaroon").map(String::as_str).unwrap_or("")).map_err(|_| "That is not a key: copy it again, whole.".to_string())?;
                 // strict on every chain: the page stores only what the rail needs
                 checked_macaroon(&mac, "the rail macaroon", &RAIL_OPS, true).map_err(|e| e.to_string())?;
                 if main {
                     write_shared(dir, MAINNET_ACK_FILE, format!("{MAINNET_ACK}\n").as_bytes())?;
                 }
                 write_shared(dir, RAIL_MACAROON, &mac)?;
-                Ok("Rail macaroon saved. The signer restarts to use it; the rail's state below follows in a few seconds.".into())
+                Ok("Key saved. The app restarts its payments part to use it; the status above follows in a few seconds.".into())
             })(),
             _ => Err("unknown action".into()),
         };
@@ -336,7 +360,7 @@ impl App {
             .iter()
             .any(|p| public_url == *p || public_url.strip_prefix(p).is_some_and(|r| r.starts_with(':')));
         if !public_url.starts_with("https://") && !local {
-            return Err(format!("the public URL is the https origin buyers use, behind a TLS proxy: {public_url} is not https (plain http only as \
+            return Err(format!("Buyers reach you at an https:// address, like https://films.example.com: {public_url} is not https (plain http only as \
                                 http://127.0.0.1:{}, for a buyer on this machine)", gw.port));
         }
         let listen = if public_url.starts_with("https://") { format!("0.0.0.0:{}", gw.port) } else { format!("127.0.0.1:{}", gw.port) };
@@ -371,7 +395,8 @@ impl App {
         if !proxies.is_empty() {
             c.insert("http".into(), json!({"forwarded_address": {"header": "x-forwarded-for", "proxies": proxies}}));
         }
-        let msat = num("price_msat")?;
+        // the page asks for sats; a form that sends millisats (an older page, a script) still works
+        let msat = if g("price").is_empty() { num("price_msat")? } else { crate::app::sell::sats_to_msat(&g("price"))? };
         let price = match g("unit").as_str() {
             "request" => json!({"request_msat": msat}),
             "mib" => json!({"byte_msat": msat, "per_bytes": 1_048_576}),
@@ -393,67 +418,80 @@ impl App {
         if let Some((_, e)) = &sent {
             b.push_str(&App::error_box(e));
         }
-        b.push_str("<p>Sell a service on this box per piece: buyers pay with stream tickets over Lightning, and the gateway passes each paid \
-            request to your service. It needs two macaroons from your Lightning node's dashboard (Lightning Fork: <em>Macaroons</em>), each with \
-            exactly these permissions and a root key of its own:</p>");
-        b.push_str(&format!("<ul><li>invoices: <code>{}</code></li><li>height: <code>{}</code></li></ul>", INVOICE_OPS.join(" "), INFO_OPS.join(" ")));
+        b.push_str("<p class=\"lead\">Sell a service from this box, paid a little at a time over Lightning. Buyers pay before each piece, \
+            and this app passes each paid request on to your service.</p>");
         b.push_str(&pin_card(&App::csrf_input(ctx), gw.node_pin, gw.node_rest.as_deref(), gw.node_tls_cert.as_deref(), "./gateway"));
-        b.push_str("<section class=\"card\"><h2>Now</h2>");
-        let health = gw.health_url.as_deref().map(|u| match crate::app::http_get(u) {
-            Ok((200, body)) => format!("<span class=\"tag ok\">running</span> <code>{}</code>", esc(&crate::html::short(body.trim(), 200))),
-            Ok((code, _)) => format!("<span class=\"tag bad\">HTTP {code}</span>"),
-            Err(e) => format!("<span class=\"tag warn\">not answering</span> {}", esc(&e)),
-        });
-        b.push_str(&kv(&[
-            ("Config", if saved { "<span class=\"tag ok\">saved</span>".into() } else { "<span class=\"tag warn\">none yet: the gateway waits for it</span>".into() }),
-            ("Gateway", health.unwrap_or_else(|| "-".into())),
-            ("Lightning node", gw.node_rest.as_deref().map(|r| format!("<code>{}</code>", esc(r))).unwrap_or_else(|| "<span class=\"tag bad\">not given by the platform</span>".into())),
-            ("Certificate (pinned)", cert_line(gw.node_tls_cert.as_deref())),
-            ("Macaroons", format!("invoices {}, height {}", if gw.dir.join(GW_INVOICES).is_file() { "stored" } else { "none" },
-                                  if gw.dir.join(GW_INFO).is_file() { "stored" } else { "none" })),
-            // what the gateway can know: its node's word on an invoice, never the channel peer's fulfil
-            ("Settled", "<code>settled</code> counts the tickets your node settled, by its own word. It is not yet income: the payment                          is yours once the channel peer it came through has taken the preimage, which the gateway does not check".into()),
-        ]));
-        if let Some(c) = self.current_gateway() {
-            b.push_str(&format!("<details><summary>The config the gateway reads</summary>{}</details>", json_block(&c)));
-        }
-        b.push_str("</section>");
+        let health = gw.health_url.as_deref().map(crate::app::http_get);
+        let (class, head, next) = match (&health, saved) {
+            (_, false) => ("warn", "Not selling yet", "Fill in the form below and save it."),
+            (Some(Ok((200, _))) | None, true) => ("ok", "Selling", "Buyers can pay and use your service."),
+            (Some(Ok(_)), true) => ("bad", "Not answering", "The selling part of the app answers with an error. Check the settings below."),
+            (Some(Err(_)), true) => ("warn", "Starting, or stopped", "It starts by itself in a few seconds; if this stays, restart the app."),
+        };
+        b.push_str(&format!("<section class=\"status {class}\"><p class=\"status-head\">{head}</p><p>{next}</p></section>"));
         let main = v.get("chain").map(String::as_str) == Some("main");
         if main {
-            b.push_str(&notice_html(&MAINNET_NOTICE));
+            b.push_str(&format!("<div class=\"flash warn\"><p><strong>This is real money.</strong> Start with low prices and the low limits below.</p>\
+                <details><summary>Read the limits</summary>{}</details></div>", notice_html(&MAINNET_NOTICE)));
         }
         let sel = |k: &str, opt: &str| if v.get(k).map(String::as_str) == Some(opt) { " selected" } else { "" };
-        b.push_str(&format!("<form method=\"post\" action=\"./gateway\" class=\"card policy\">{}\
+        let price = v.get("price").cloned().unwrap_or_else(|| v.get("price_msat").and_then(|m| m.trim().parse::<u64>().ok())
+            .map(crate::app::sell::msat_to_sats).unwrap_or_default());
+        b.push_str(&format!("<form method=\"post\" action=\"./gateway\" class=\"card primary policy\">{}\
             <fieldset><legend>What you sell</legend>\
-            <label>Your service, as this box's network reaches it (<code>http://host:port</code>, optionally with a path)\
-            <input name=\"upstream\" value=\"{}\" class=\"mono\" required placeholder=\"http://10.21.21.50:8080\"></label>\
-            <label>Price, in millisats<input name=\"price_msat\" value=\"{}\" inputmode=\"numeric\" required></label>\
-            <label>Per<select name=\"unit\"><option value=\"request\"{}>request</option><option value=\"mib\"{}>MiB sent</option>\
-            <option value=\"second\"{}>second of a response</option></select></label></fieldset>\
-            <fieldset><legend>How buyers reach it</legend>\
-            <label>The https origin buyers use (<code>https://seller.example</code>): a TLS proxy with a public certificate in front of \
-            port {} of this app. Plain <code>http://127.0.0.1:{}</code> only for a buyer on the same machine.\
-            <input name=\"public_url\" value=\"{}\" class=\"mono\" required></label>\
-            <label>Your proxy's address, whose <code>X-Forwarded-For</code> the gateway believes (comma-separated; empty: the per-buyer \
-            cap is off behind a proxy)<input name=\"proxies\" value=\"{}\" class=\"mono\"></label></fieldset>\
-            <fieldset><legend>Chain</legend><label>Chain<select name=\"chain\"><option value=\"regtest\"{}>a test chain</option>\
-            <option value=\"main\"{}>mainnet (real funds)</option></select></label>\
-            <label>Test chain only: its network id (<code>lightning:</code> and 32 hex)<input name=\"network\" value=\"{}\" class=\"mono\"></label>\
-            <label>Mainnet only: type <code>{}</code><input name=\"mainnet_ack\" autocomplete=\"off\"></label></fieldset>\
-            <fieldset><legend>Caps</legend>\
+            <label>Your service's address on this box<input name=\"upstream\" value=\"{}\" class=\"mono\" required placeholder=\"http://10.21.21.50:8080\"></label>\
+            <p class=\"hint\">The http:// address other apps on this box use to reach it.</p>\
+            <div class=\"price-row\"><label>Price in sats<input name=\"price\" value=\"{}\" inputmode=\"decimal\" required></label>\
+            <label>for each<select name=\"unit\"><option value=\"request\"{}>request</option><option value=\"mib\"{}>MiB of data sent</option>\
+            <option value=\"second\"{}>second</option></select></label></div></fieldset>\
+            <fieldset><legend>Where buyers find you</legend>\
+            <label>Your public https:// address<input name=\"public_url\" value=\"{}\" class=\"mono\" required placeholder=\"https://seller.example\"></label>\
+            <p class=\"hint\">The secure address that leads to port {} of this app.</p></fieldset>\
+            <fieldset><legend>Money</legend><label>Network<select name=\"chain\"><option value=\"regtest\"{}>A test network</option>\
+            <option value=\"main\"{}>Real money (mainnet)</option></select></label>\
+            <label>Real money only: type <code>{}</code><input name=\"mainnet_ack\" autocomplete=\"off\"></label></fieldset>\
+            <fieldset><legend>Keys from your Lightning node{}</legend>\
+            <details><summary>How do I make them?</summary><p>In your Lightning node's app, open the page called <em>Macaroons</em> and make two, \
+            each with exactly these permissions and a root key of its own:</p>\
+            <ul><li>Payment requests: <code>{}</code></li><li>Network time: <code>{}</code></li></ul>\
+            <p class=\"hint\">They let this app ask for payments and read the time on the network. They cannot spend your money.</p></details>\
+            <label>Payment requests key<textarea name=\"invoices_macaroon\" rows=\"3\" class=\"mono\" autocomplete=\"off\"></textarea></label>\
+            <label>Network time key<textarea name=\"info_macaroon\" rows=\"3\" class=\"mono\" autocomplete=\"off\"></textarea></label></fieldset>\
+            <details><summary>Advanced</summary>\
+            <label>Your proxy's addresses, whose word on the buyer's address the app believes (comma-separated; empty: the limit per buyer is off \
+            behind a proxy)<input name=\"proxies\" value=\"{}\" class=\"mono\"></label>\
+            <label>Test network only: its id (<code>lightning:</code> and 32 hex)<input name=\"network\" value=\"{}\" class=\"mono\"></label>\
             <label>Buyers at once<input name=\"max_sessions\" value=\"{}\" inputmode=\"numeric\"></label>\
             <label>Buyers at once from one address<input name=\"sessions_per_address\" value=\"{}\" inputmode=\"numeric\"></label>\
-            <label>Held tickets in all (1,000 sat each, held on your inbound channels)<input name=\"max_held_tickets\" value=\"{}\" inputmode=\"numeric\"></label>\
-            <p class=\"hint\">On mainnet leave these low: {} buyers, {} per address, {} held tickets.</p></fieldset>\
-            <fieldset><legend>Macaroons{}</legend>\
-            <label>Invoices (hex or base64)<textarea name=\"invoices_macaroon\" rows=\"3\" class=\"mono\" autocomplete=\"off\"></textarea></label>\
-            <label>Height (hex or base64)<textarea name=\"info_macaroon\" rows=\"3\" class=\"mono\" autocomplete=\"off\"></textarea></label></fieldset>\
-            <button>Check and save; the gateway restarts with it</button></form>",
-            App::csrf_input(ctx), g("upstream"), g("price_msat"), sel("unit", "request"), sel("unit", "mib"), sel("unit", "second"),
-            gw.port, gw.port, g("public_url"), g("proxies"), sel("chain", "regtest"), sel("chain", "main"), g("network"), esc(MAINNET_ACK),
-            g("max_sessions"), g("sessions_per_address"), g("max_held_tickets"), MAINNET_CAPS.0, MAINNET_CAPS.1, MAINNET_CAPS.2,
-            if saved { " (leave empty to keep the stored ones)" } else { "" }));
-        self.page("Gateway", ctx, b)
+            <label>Payments held open at once (1,000 sat each, on your inbound channels)<input name=\"max_held_tickets\" value=\"{}\" inputmode=\"numeric\"></label>\
+            <p class=\"hint\">With real money keep these low: {} buyers, {} per address, {} held payments.</p></details>\
+            <button>Check and save</button></form>",
+            App::csrf_input(ctx), g("upstream"), esc(&price), sel("unit", "request"), sel("unit", "mib"), sel("unit", "second"),
+            g("public_url"), gw.port, sel("chain", "regtest"), sel("chain", "main"), esc(MAINNET_ACK),
+            if saved { " (leave empty to keep the ones you saved)" } else { "" }, INVOICE_OPS.join(" "), INFO_OPS.join(" "),
+            g("proxies"), g("network"), g("max_sessions"), g("sessions_per_address"), g("max_held_tickets"), MAINNET_CAPS.0, MAINNET_CAPS.1, MAINNET_CAPS.2));
+        b.push_str("<details class=\"card\"><summary>Details</summary>");
+        b.push_str(&kv(&[
+            ("Settings", if saved { "<span class=\"pill good\">saved</span>".into() } else { "<span class=\"pill warn\">none yet: the selling part waits for them</span>".into() }),
+            ("Selling part", match &health {
+                Some(Ok((200, body))) => format!("<span class=\"pill good\">running</span> <code>{}</code>", esc(&crate::html::short(body.trim(), 200))),
+                Some(Ok((code, _))) => format!("<span class=\"pill bad\">HTTP {code}</span>"),
+                Some(Err(e)) => format!("<span class=\"pill warn\">not answering</span> {}", esc(e)),
+                None => "-".into(),
+            }),
+            ("Lightning node", gw.node_rest.as_deref().map(|r| format!("<code>{}</code>", esc(r))).unwrap_or_else(|| "<span class=\"pill bad\">not given by this box</span>".into())),
+            ("Node certificate", cert_line(gw.node_tls_cert.as_deref())),
+            ("Keys", format!("payment requests {}, network time {}", if gw.dir.join(GW_INVOICES).is_file() { "stored" } else { "none" },
+                             if gw.dir.join(GW_INFO).is_file() { "stored" } else { "none" })),
+            // what the gateway can know: its node's word on an invoice, never the channel peer's fulfil
+            ("Settled", "<code>settled</code> counts the tickets your node settled, by its own word. It is not yet income: the payment \
+                         is yours once the channel peer it came through has taken the preimage, which the gateway does not check".into()),
+        ]));
+        if let Some(c) = self.current_gateway() {
+            b.push_str(&format!("<details><summary>The settings file the selling part reads</summary>{}</details>", json_block(&c)));
+        }
+        b.push_str("</details>");
+        self.page("Sell", ctx, b)
     }
 
     pub(crate) fn gateway_post(&self, req: &Req, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {
@@ -489,12 +527,12 @@ impl App {
             let cfg = self.gateway_config(&f)?;
             let main = cfg["chain"] == "main";
             let mut macs = vec![];
-            for (field, file, ops, what) in [("invoices_macaroon", GW_INVOICES, &INVOICE_OPS[..], "the invoices macaroon"),
-                                             ("info_macaroon", GW_INFO, &INFO_OPS[..], "the height macaroon")] {
+            for (field, file, ops, what) in [("invoices_macaroon", GW_INVOICES, &INVOICE_OPS[..], "The payment requests key"),
+                                             ("info_macaroon", GW_INFO, &INFO_OPS[..], "The network time key")] {
                 let text = f.get(field).map(String::as_str).unwrap_or("").trim().to_string();
                 if text.is_empty() {
                     if !dir.join(file).is_file() {
-                        return Err(format!("{what} is needed"));
+                        return Err(format!("{what} is needed: paste it from your Lightning node's app"));
                     }
                     continue;
                 }
@@ -512,8 +550,8 @@ impl App {
             }
             let text = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())? + "\n";
             write_shared(dir, GW_CONFIG, text.as_bytes())?;
-            Ok(if main { "Saved, on mainnet with the caps shown. The gateway restarts with it in a few seconds.".into() }
-               else { "Saved. The gateway restarts with it in a few seconds.".into() })
+            Ok(if main { "Saved, with real money (mainnet) and the limits shown. Selling restarts with it in a few seconds.".into() }
+               else { "Saved. Selling restarts with it in a few seconds.".into() })
         })();
         match result {
             Ok(m) => {

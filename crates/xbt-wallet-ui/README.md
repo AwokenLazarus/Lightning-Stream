@@ -38,11 +38,12 @@ Without a password source, the first start prints a one-time setup code and writ
 | `XBT_UI_ALLOW_IPS` | all | peers allowed to connect (IPs or prefixes such as `10.21.0.`), e.g. only the box's app proxy |
 | `XBT_UI_ALLOWED_HOSTS` | | AGP-063 W4: extra host names the UI answers to, comma-separated (`wallet.example.com`; `*`: any). Always allowed: IP literals, single-label names (`localhost`, a container name), `*.local`, `*.localhost`, `*.onion`. Another Host is 421 (DNS rebinding); a POST whose `Origin` names another host is 403 (`Origin: null`, which Chrome sends under `no-referrer`, is accepted) |
 | `XBT_UI_SETUP_OPEN` | 0 | `1`: the first-run password setup needs no code (the platform proxy already authenticated the owner) |
-| `XBT_UI_CMP_URL` | | xbt-compute's node status page, linked from Overview |
+| `XBT_UI_CMP_URL` | | xbt-compute's node status page, linked from Wallet |
 | `XBT_UI_CMP_STATUS_URL` | | xbt-compute's status JSON (e.g. its `/readyz`, CONTRACT §U), shown as a compact tile |
 | `XBT_UI_MCP_URL` | | MCP endpoint(s) shown on the Agents page |
 | `XBT_UI_MCP_TOKEN_FILE` | `$XBT_DATA_DIR/run/ui/mcp-http-token`, else `<data dir>/secrets/mcp-http-token` | the bearer token shown on Agents. The UI owns it and rotates it there (atomic replace, mode kept, never world-readable); the MCP only reads it (AGP-042) |
-| `XBT_UI_SERVICES` | `<data dir>/services.json` | path of a JSON list of services for Browse and the player. Each service is `{name, kind, seller, price_text, items}` with `kind` one of `video`, `files`, `api`, and each item `{title, url}` with an optional `year` and `credit`. See `examples/services.example.json` (three Creative Commons films). The Services page writes it: paste a seller's address, and each service its signed listing names is added. |
+| `XBT_UI_SERVICES` | `<data dir>/services.json` | path of a JSON list of services for Browse and the player. Each service is `{name, kind, seller, price_text, items}`, with an optional `address` (where apps and agents use it), `kind` one of `video`, `files`, `api`, `ai`, and each item `{title, url}` with an optional `year` and `credit`. See `examples/services.example.json` (three Creative Commons films). The Services page writes it: paste a seller's address, and each service its signed listing names is added. |
+| `XBT_UI_SUGGESTED_SELLERS` | | sellers' addresses (comma-separated) that Sellers and an empty Browse offer to add in one click. Nothing is fetched until the owner adds one. |
 | `XBT_UI_SELL` | `0` | `1`: the wallet's UI also has the Sell page, which sets up the gateway beside it (the `XBT_UI_GW_*` settings) in plain words: connect the node once, say where buyers find you, and add each service with its address and a price in sats. It keeps the owner's list in `sell.json` in the data dir and writes the gateway's config from it. The one Lightning Stream app sets this. |
 | `XBT_UI_CONNECTOR` | `http://127.0.0.1:8480` | the connector the player loads. A video's source is this URL plus `/s/` plus the item URL. The page's `media-src` allows only that origin. This is the connector's default listen address; the UI's own default bind is the same port, so on one machine set one of the two. |
 | `XBT_UI_RELAY_LINK_S` | 21600 (6 hours) | how long a link for an external player lives. The Player page makes one per item on request (a logged-in POST): `<UI address>/r/<token>`, which VLC or mpv opens without the login and which plays that item only, seeking included. Links can be revoked there, and a restart of the UI revokes them all. |
@@ -147,6 +148,23 @@ but they add proc-macro dependencies for about 15 pages. Everything user-control
   invoice pays under it once. A deny or revoke drops it.
 
   The approval of an on-chain `pay` keeps B2's `approve`, which pays at once.
+
+## Pages and words
+
+The app is for someone with no technical knowledge, and for any kind of service, not one. The menu
+has five places, each with its pages as tabs: **Services** (Browse, Sellers, Live connections),
+**Sell** (with `XBT_UI_SELL=1`), **Wallet** (balance and activity, approvals), **Apps & agents**
+and **Settings** (setup, your node, spending rules, keys and backup, records). Home says what the
+owner can do: use a service, sell a service, and whether the wallet is ready.
+
+Browse lists services by category: Media, AI, and Data & APIs. Each service has a page of its own.
+A media service's page lists what it plays, and opens the player; any other service's page gives
+the address apps and agents use it at. Live connections shows what is being paid for, what it has
+cost and a Stop button.
+
+Main screens use plain words. The exact terms (keys' permissions, node addresses, raw settings) are
+in collapsed "Advanced" and "Details" parts. `tests/ui_http.rs` (`main_screens_speak_plain_words`)
+fails if a word like "macaroon", "msat" or "upstream" reaches a main screen.
 
 ## The look
 
