@@ -1224,6 +1224,8 @@ fn the_sell_page_sets_up_several_services_and_says_what_each_one_needs() {
         c.gw.dir = dir.clone();
         c.gw.node_rest = Some("https://10.21.21.66:8180".into());
         c.gw.node_tls_cert = Some("/data/lightning/tls.cert".into());
+        c.hash.slices = Some("http://127.0.0.1:9".into());
+        c.hash.settings = dir.join("hashrate-settings.json");
     });
     let mut br = logged_in(&bx);
     let page = br.get("/sell").body;
@@ -1304,6 +1306,23 @@ fn the_sell_page_sets_up_several_services_and_says_what_each_one_needs() {
     let r = br.act("/sell", "/sell", &[("action", "remove"), ("id", &ai)]);
     assert!(br.flash_after(&r).contains("Removed"));
     assert!(!br.get("/sell").body.contains("My model"));
+
+    // renting out miners lists hashrate beside the other services, priced by the piece of work
+    let listing = || {
+        let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+        xbt_gateway::config::Config::from_json(&c).unwrap().listing.unwrap()
+    };
+    assert!(listing().services.iter().all(|s| s.kind != "hashrate"), "not while renting is off");
+    let r = br.act("/sell-hashrate", "/sell-hashrate", &[("action", "save"), ("fallback", "192.168.1.20:23334"), ("price", "40"),
+                                                          ("name", "Basement miners"), ("enabled", "1")]);
+    assert!(br.flash_after(&r).starts_with("Saved. Renting is on."));
+    let l = listing();
+    let h = l.services.iter().find(|s| s.kind == "hashrate").expect("a hashrate service");
+    assert_eq!((h.name.as_str(), h.path.as_str(), h.prices["request_msat"].as_str()), ("Basement miners", "/hashrate/", Some("40000")));
+    assert_eq!(l.services.len(), 2);
+    let r = br.act("/sell-hashrate", "/sell-hashrate", &[("action", "save"), ("fallback", "192.168.1.20:23334"), ("price", "40")]);
+    assert!(br.flash_after(&r).contains("Renting is off"));
+    assert!(listing().services.iter().all(|s| s.kind != "hashrate"));
 }
 
 #[test]

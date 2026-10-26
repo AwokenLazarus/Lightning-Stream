@@ -23,7 +23,7 @@ const TAG_1: &str = "xbt402/listing/1";
 /// At most this many services in one listing.
 const MAX_SERVICES: usize = 32;
 
-const KINDS: [&str; 4] = ["video", "files", "api", "ai"];
+const KINDS: [&str; 5] = ["video", "files", "api", "ai", "hashrate"];
 const PRICE_KEYS: [&str; 6] = ["request_msat", "byte_msat", "per_bytes", "second_msat", "per_1k_input_msat", "per_1k_output_msat"];
 /// A fetched document larger than this is refused before it is parsed.
 const MAX_BODY: usize = 256 << 10;
@@ -140,7 +140,7 @@ pub fn parse_draft(v: &Value) -> Result<Draft, String> {
     }
     let kind = req_str(m, "kind")?;
     if !KINDS.contains(&kind) {
-        return Err("kind is video, files, api or ai".into());
+        return Err("kind is video, files, api, ai or hashrate".into());
     }
     let prices = price_strings(m.get("prices").ok_or("prices is missing")?)?;
     let items_v = m.get("items").and_then(Value::as_array).ok_or("items is a list")?;
@@ -191,7 +191,7 @@ fn parse_section(v: &Value, n: usize) -> Result<Section, String> {
     }
     let kind = req_str(m, "kind").map_err(|e| format!("{what}: {e}"))?;
     if !KINDS.contains(&kind) {
-        return Err(format!("{what}: kind is video, files, api or ai"));
+        return Err(format!("{what}: kind is video, files, api, ai or hashrate"));
     }
     let path = req_str(m, "path").map_err(|e| format!("{what}: {e}"))?;
     if !route_path(path) {
@@ -610,6 +610,19 @@ mod tests {
         // a listing/0 reads as one service under /
         let one = verify(&sign(&sk, &document(&draft(), "https://seller.example", &pk)), &pk).unwrap();
         assert_eq!((one.services.len(), one.services[0].path.as_str(), one.services[0].name.as_str()), (1, "/", "Films"));
+    }
+
+    #[test]
+    fn a_listing_1_lists_hashrate_beside_the_other_services() {
+        let (sk, pk) = key();
+        let d = parse_draft(&json!({"name": "One box", "updated": "2026-10-26", "services": [
+            {"name": "Local model", "kind": "ai", "path": "/ai/", "prices": {"per_1k_output_msat": 10000}, "items": []},
+            {"name": "My miners", "kind": "hashrate", "path": "/hashrate/", "prices": {"request_msat": 40000}, "items": []},
+        ]}))
+        .unwrap();
+        let got = verify(&sign(&sk, &document(&d, "https://seller.example", &pk)), &pk).unwrap();
+        assert_eq!(got.services.iter().map(|s| (s.kind.as_str(), s.path.as_str())).collect::<Vec<_>>(), [("ai", "/ai/"), ("hashrate", "/hashrate/")]);
+        assert_eq!(got.services[1].prices["request_msat"], "40000");
     }
 
     #[test]

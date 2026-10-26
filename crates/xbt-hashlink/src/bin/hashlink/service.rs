@@ -27,8 +27,8 @@ use xbt_hashlink::listing::Capacity;
 use xbt_hashlink::msg::Terms;
 use xbt_hashlink::rail::LabSeller;
 
-/// A change in what is for rent (miners, free miners, renting on or off, the terms, the name) is
-/// published again after at least this long since the last publish.
+/// A change in what is for rent (miners, free miners, renting on or off, the terms, the name, or
+/// where renters reach and pay the hasher) is published again after at least this long since the last publish.
 const REPUBLISH_CAPACITY: Duration = Duration::from_secs(60);
 /// A change in the measured hashrate alone is news only when it moves more than this share of the
 /// published value, and is published at most this often: public relays rate-limit.
@@ -44,6 +44,11 @@ struct Said {
     renting: bool,
     terms: Terms,
     name: String,
+    /// Where renters reach the link and pay for the work: an owner setting the address renters
+    /// use is news, not a wait for the long timer.
+    link_public: Option<String>,
+    pay_url: Option<String>,
+    pay_node: Option<String>,
 }
 
 /// Whether to publish now, `since` after the last attempt (`ok`: whether it was taken).
@@ -59,7 +64,10 @@ fn due(last: Option<(&Said, bool)>, now: &Said, since: Duration) -> bool {
         || l.cap.free_miners != now.cap.free_miners
         || l.renting != now.renting
         || l.terms != now.terms
-        || l.name != now.name;
+        || l.name != now.name
+        || l.link_public != now.link_public
+        || l.pay_url != now.pay_url
+        || l.pay_node != now.pay_node;
     if what {
         return since >= REPUBLISH_CAPACITY;
     }
@@ -243,15 +251,17 @@ pub fn run(f: &HashMap<String, String>, key: SecretKey) -> Result<(), String> {
         let Some(r) = f.get("relays") else { continue };
         let renting = settings.enabled && settings.fallback.is_some();
         let cap = if renting { h.capacity() } else { Capacity { free_miners: 0, free_hs: 0, ..h.capacity() } };
-        let now = Said { cap, renting, terms: settings.terms.clone(), name: settings.name.clone() };
-        if !due(last.as_ref().map(|(s, ok)| (s, *ok)), &now, last_pub.elapsed()) {
-            continue;
-        }
+        // the node is asked before comparing, so learning it is not itself a change to publish
         if settings.pay_node.is_none() {
             if let Some(n) = f.get("gateway").and_then(|g| gateway_node(g)) {
                 settings.pay_node = Some(n);
                 *shared.lock().unwrap_or_else(|p| p.into_inner()) = settings.clone();
             }
+        }
+        let now = Said { cap, renting, terms: settings.terms.clone(), name: settings.name.clone(),
+                         link_public: settings.link_public.clone(), pay_url: settings.pay_url.clone(), pay_node: settings.pay_node.clone() };
+        if !due(last.as_ref().map(|(s, ok)| (s, *ok)), &now, last_pub.elapsed()) {
+            continue;
         }
         // no public address renters can reach: no listing on public relays (one naming an address
         // only the LAN can reach would send renters nowhere)
@@ -299,7 +309,8 @@ mod tests {
     use super::*;
 
     fn said(miners: u32, free: u32, hs: u64) -> Said {
-        Said { cap: Capacity { miners, free_miners: free, free_hs: hs }, renting: true, terms: Terms { slice_work: 1 << 47, price_msat: 40_000, grace_ms: 45_000 }, name: "m".into() }
+        Said { cap: Capacity { miners, free_miners: free, free_hs: hs }, renting: true, terms: Terms { slice_work: 1 << 47, price_msat: 40_000, grace_ms: 45_000 }, name: "m".into(),
+              link_public: None, pay_url: Some("https://box.example/hashrate".into()), pay_node: Some("02aa".into()) }
     }
     const S: fn(u64) -> Duration = Duration::from_secs;
 
@@ -329,6 +340,23 @@ mod tests {
         let mut priced = last.clone();
         priced.terms.price_msat = 50_000;
         assert!(due(Some((&last, true)), &priced, S(60)));
+    }
+
+    #[test]
+    fn setting_the_address_renters_use_is_published_after_a_minute() {
+        // the owner adds the address after the "not set" check: published within the minute, not the long timer
+        let last = said(1, 1, 4_000_000_000_000);
+        let mut set = last.clone();
+        set.link_public = Some("203.0.113.7:23341".into());
+        assert!(!due(Some((&last, true)), &set, S(30)));
+        assert!(due(Some((&last, true)), &set, S(60)));
+        let mut moved = set.clone();
+        moved.pay_url = Some("https://other.example/hashrate".into());
+        assert!(due(Some((&set, true)), &moved, S(60)));
+        let mut node = set.clone();
+        node.pay_node = Some("02bb".into());
+        assert!(due(Some((&set, true)), &node, S(60)));
+        assert!(!due(Some((&set, true)), &set.clone(), S(3600)), "unchanged: the long timer");
     }
 
     #[test]

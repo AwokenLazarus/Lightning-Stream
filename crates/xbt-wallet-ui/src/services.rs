@@ -26,10 +26,11 @@ pub enum Kind {
     Files,
     Api,
     Ai,
+    Hashrate,
 }
 
 /// The categories Browse sorts services into. Media is one of them, not the app's subject.
-pub const CATEGORIES: [(&str, &str); 3] = [("media", "Media"), ("ai", "AI"), ("data", "Data & APIs")];
+pub const CATEGORIES: [(&str, &str); 4] = [("media", "Media"), ("ai", "AI"), ("hashrate", "Hashrate"), ("data", "Data & APIs")];
 
 impl Kind {
     pub fn as_str(self) -> &'static str {
@@ -38,6 +39,7 @@ impl Kind {
             Kind::Files => "files",
             Kind::Api => "api",
             Kind::Ai => "ai",
+            Kind::Hashrate => "hashrate",
         }
     }
 
@@ -46,6 +48,7 @@ impl Kind {
         match self {
             Kind::Video => "media",
             Kind::Ai => "ai",
+            Kind::Hashrate => "hashrate",
             Kind::Files | Kind::Api => "data",
         }
     }
@@ -61,7 +64,8 @@ impl Kind {
             Some("files") => Ok(Kind::Files),
             Some("api") => Ok(Kind::Api),
             Some("ai") => Ok(Kind::Ai),
-            Some(o) => Err(format!("kind {o:?} is not video, files, api or ai")),
+            Some("hashrate") => Ok(Kind::Hashrate),
+            Some(o) => Err(format!("kind {o:?} is not video, files, api, ai or hashrate")),
             None => Err("kind must be a string".into()),
         }
     }
@@ -313,6 +317,11 @@ pub fn price_words(prices: &Value) -> String {
     if parts.is_empty() { "free".into() } else { parts.join(" + ") }
 }
 
+/// A hashrate service's price: each paid request buys one piece of work.
+fn work_price_words(prices: &Value) -> String {
+    price_words(prices).replace("a request", "a piece of work")
+}
+
 /// The services a checked listing lists, as Browse shows them. A seller with one service shows
 /// under its own name; with several, each as `seller name: service name`.
 pub fn from_listing(l: &xbt402::listing::Listing) -> Vec<Service> {
@@ -322,6 +331,7 @@ pub fn from_listing(l: &xbt402::listing::Listing) -> Vec<Service> {
             "video" => Kind::Video,
             "files" => Kind::Files,
             "ai" => Kind::Ai,
+            "hashrate" => Kind::Hashrate,
             _ => Kind::Api,
         };
         let path = if s.path.is_empty() || s.path == "/" { String::new() } else { s.path.clone() };
@@ -331,7 +341,7 @@ pub fn from_listing(l: &xbt402::listing::Listing) -> Vec<Service> {
             name: name.chars().take(MAX_TEXT).collect(),
             kind,
             seller: l.seller.clone(),
-            price_text: price_words(&s.prices),
+            price_text: if kind == Kind::Hashrate { work_price_words(&s.prices) } else { price_words(&s.prices) },
             items: s.items.iter().map(|i| Item { title: i.title.clone(), year: i.year.map(|y| y.to_string()).unwrap_or_default(), url: i.url.clone(),
                                                  credit: i.credit.clone().unwrap_or_else(|| credit.clone()).chars().take(MAX_TEXT).collect() }).collect(),
             address: if path.is_empty() { String::new() } else { format!("{}{path}", l.seller.trim_end_matches('/')) },

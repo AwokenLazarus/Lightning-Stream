@@ -121,7 +121,7 @@ fn write_settings(path: &std::path::Path, v: &Value) -> Result<(), String> {
 }
 
 impl App {
-    fn hash_settings(&self) -> Value {
+    pub(crate) fn hash_settings(&self) -> Value {
         std::fs::read_to_string(&self.cfg.hash.settings).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(json!({}))
     }
 
@@ -231,13 +231,20 @@ impl App {
             <label>Address renters use to reach your miners (needs a port forward or tunnel)<input name=\"link_public\" value=\"{}\" class=\"mono\" \
             pattern=\"[A-Za-z0-9.\\-\\[\\]:]+:[0-9]+\" title=\"An address with its port, like my-box.example.com:23341\" placeholder=\"my-box.example.com:23341\"></label>\
             <p class=\"hint\">Renters' apps connect to this box's port 23341. Leave it empty and your offer stays off public listings; renters on your own network can still use {}.</p>\
+            <details><summary>How do I get this address?</summary><ol>\
+            <li>On your router, forward <strong>TCP port 23341</strong> to this box ({}). Forward only 23341: your miners' port stays on your own network.</li>\
+            <li>Write your router's public address with the port, like <code>203.0.113.7:23341</code>, or a name that points at it (dynamic DNS), \
+            like <code>my-box.example.com:23341</code>.</li>\
+            <li>Save. Your offer goes on public listings within a minute.</li></ol>\
+            <p class=\"hint\">This is a plain TCP port, so https tunnels for websites cannot carry it. The link is encrypted end to end, so it needs no \
+            certificate. If you cannot forward ports, a tunnel app that forwards a TCP port to this box works too.</p></details>\
             <label class=\"check\"><input type=\"checkbox\" name=\"enabled\" value=\"1\"{}> Rent out my miners</label>\
             <details><summary>Advanced</summary>\
             <label>Work in each piece (hashes)<input name=\"slice_work\" value=\"{:.0}\" inputmode=\"numeric\" pattern=\"[0-9]+\" class=\"mono\"></label>\
             <label>How long to wait for each payment, in seconds<input name=\"grace_s\" value=\"{grace_s}\" inputmode=\"numeric\" pattern=\"[0-9]+\"></label>\
             </details><div class=\"row\"><button>{}</button></div></form></section>",
             if on { "Change renting" } else { "Rent out your miners" }, esc(&fallback), speed(EXAMPLE_HS), sats_n(per_hour(price as f64, slice, EXAMPLE_HS)),
-            esc(&rentable), esc(&name), esc(&link_public), esc(&link_lan), if on || saved.get("enabled").is_none() { " checked" } else { "" }, slice,
+            esc(&rentable), esc(&name), esc(&link_public), esc(&link_lan), esc(&link_lan), if on || saved.get("enabled").is_none() { " checked" } else { "" }, slice,
             if on { "Save" } else { "Save and start renting" }));
         if let Ok(s) = &st {
             match s["listing"].get("ok") {
@@ -247,7 +254,7 @@ impl App {
                 Some(Value::Bool(false)) => b.push_str(&format!(
                     "<section class=\"card\"><p><span class=\"pill warn\">Not listed</span> {}</p></section>",
                     esc(s["listing"]["why"].as_str().unwrap_or("Your offer is not published yet.")))),
-                _ => b.push_str("<section class=\"card\"><p><span class=\"pill warn\">Not listed yet</span> Your offer goes on public listings once a miner is connected.</p></section>"),
+                _ => b.push_str("<section class=\"card\"><p><span class=\"pill warn\">Not listed yet</span> Your offer goes on public listings once a miner is connected and the address renters use is set.</p></section>"),
             }
         }
         self.html_page("Sell hashrate", "Sell hashrate", ctx, &b, "")

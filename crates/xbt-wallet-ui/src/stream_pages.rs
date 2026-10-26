@@ -292,6 +292,7 @@ fn browse_html(all: &[Service], cat: &str, sort: Sort, suggested: &str, own: &dy
             Kind::Api => "Use it from your apps and agents".into(),
             Kind::Files if !s.items.is_empty() => format!("{} file{}", s.items.len(), if s.items.len() == 1 { "" } else { "s" }),
             Kind::Files => "Files".into(),
+            Kind::Hashrate => "Rent miners by the piece of work".into(),
         };
         let mine = own(&s.seller);
         b.push_str(&format!("<a class=\"card service-card\" href=\"{}\"><span class=\"pill cat-{}\">{}</span>{}<h2>{}</h2>\
@@ -309,6 +310,10 @@ fn host(url: &str) -> String {
 }
 
 fn service_href(s: &Service) -> String {
+    // miners are rented on the Rent hashrate page, which finds the seller's offer itself
+    if s.kind == Kind::Hashrate {
+        return "./hashrate".into();
+    }
     format!("./service?seller={}&amp;name={}", services::urlenc(&s.seller), services::urlenc(&s.name))
 }
 
@@ -338,6 +343,9 @@ fn service_html(s: &Service, own: bool) -> String {
                 b.push_str("</div>");
             }
         }
+        Kind::Hashrate => b.push_str("<section class=\"card primary\"><h2>Rent miners</h2>\
+            <p>This seller rents out its miners: they hash for your own pool, and you pay for each piece of work as it is done.</p>\
+            <div class=\"row\"><a class=\"button-link primary\" href=\"./hashrate\">Rent hashrate</a></div></section>"),
         _ => {
             b.push_str(&format!("<section class=\"card primary\"><h2>Use it</h2>\
                 <p>Apps and AI agents connected to this wallet can use this service. Each request is paid as it is made, a little at a time, \
@@ -636,6 +644,19 @@ mod tests {
         let c = counts_of(&tickets, 8.0);
         assert_eq!((c.locked, c.released, c.prepaid, c.settled, c.booked_sats), (2, 2, 2, 1, 50));
         assert_eq!((c.never_sent, c.cancelled_at_stop, c.payment_failed), (1, 1, 1));
+    }
+
+    #[test]
+    fn hashrate_shows_in_its_own_category_and_leads_to_rent_hashrate() {
+        let section = xbt402::listing::Section { name: "My miners".into(), kind: "hashrate".into(), path: "/hashrate/".into(),
+            prices: json!({"request_msat": "40000"}), items: vec![], licence: String::new(), credits: String::new() };
+        let l = xbt402::listing::Listing { name: "Box".into(), kind: "hashrate".into(), seller: "https://box.example".into(), receipt_key: String::new(),
+            prices: section.prices.clone(), items: vec![], licence: String::new(), credits: String::new(), updated: String::new(), services: vec![section] };
+        let all = services::from_listing(&l);
+        assert_eq!((all[0].kind, all[0].price_text.as_str()), (Kind::Hashrate, "40 sat a piece of work"));
+        let html = browse_html(&all, "hashrate", Sort::Name, "", &|_| false);
+        assert!(html.contains("cat-hashrate") && html.contains("Rent miners by the piece of work") && html.contains("href=\"./hashrate\""), "{html}");
+        assert!(service_html(&all[0], false).contains("href=\"./hashrate\""));
     }
 
     #[test]

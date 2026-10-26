@@ -270,7 +270,8 @@ a.service-card .pill { align-self: flex-start; }
 .pill.cat-media { color: var(--river-b); background: color-mix(in srgb, var(--river-b) 14%, transparent); border-color: transparent; }
 .pill.cat-ai { color: var(--accent); background: var(--accent-soft); border-color: transparent; }
 .pill.cat-data { color: var(--ok); background: var(--ok-bg); border-color: transparent; }
-.pill.cat-media::before, .pill.cat-ai::before, .pill.cat-data::before { display: none; }
+.pill.cat-hashrate { color: var(--river-a); background: color-mix(in srgb, var(--river-a) 14%, transparent); border-color: transparent; }
+.pill.cat-media::before, .pill.cat-ai::before, .pill.cat-hashrate::before, .pill.cat-data::before { display: none; }
 form.suggested { margin: 10px 0 0; justify-content: space-between; }
 .empty-card { text-align: center; }
 .empty-card .row { justify-content: center; }

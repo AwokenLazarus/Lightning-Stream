@@ -550,6 +550,9 @@ impl App {
         // pieces of work from this box's miners, when renting them out is on
         if let Some(r) = self.hash_route() {
             routes.retain(|x| x.get("path") != r.get("path"));
+            // listed beside the other services; its price is the route's
+            let name = self.hash_settings()["name"].as_str().map(str::trim).filter(|n| !n.is_empty()).unwrap_or("Hashrate").to_string();
+            sections.push(json!({"name": name, "kind": "hashrate", "path": r["path"], "items": []}));
             routes.push(r);
         }
         c.insert("routes".into(), Value::Array(routes));
