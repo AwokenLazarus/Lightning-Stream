@@ -23,11 +23,15 @@ fork for the BLAKE2b chain). No other XBT Lightning node is packaged for either 
 Both Lightning Fork packages are mainnet only: on a real box the packages here are on mainnet,
 which is why section 5 makes mainnet a separate, deliberate step.
 
-**Credentials.** Neither package ever holds an admin macaroon. The package mounts exactly one file
-of the Lightning node's, `tls.cert`, read-only (Umbrel: a single-file bind mount that refuses to
-create a missing path; StartOS: `mountDependency` with `type: 'file'`, which StartOS 0.4 refuses: see
-section 6), and pins it. The owner bakes
-the macaroons in Lightning Fork's own dashboard and pastes them (hex) into this package's setup page:
+**Credentials.** No running service holds an admin macaroon. The owner makes no key by hand: a
+one-shot service, `node-keys` (the UI's image, `xbt-wallet-ui node-keys`), mounts the Lightning node's
+chain data read-only (Umbrel: `$APP_LIGHTNING_FORK_NODE_DATA_DIR/data/chain`; StartOS: the `data/chain`
+folder of Lightning Fork's `main` volume), reads the admin macaroon once, and asks the node to bake the
+app's narrow macaroons, each under a root key of its own (revocable alone with
+`lncli revokemacaroonkey`). It writes only those, where the setup pages would, records their root key
+ids in `auto-keys.json` beside them (no secret), and exits. No other service mounts the node's data;
+the services mount only `tls.cert` (Umbrel: a single-file bind mount that refuses to create a
+missing path; StartOS: Lightning Fork's `public/` folder, which holds only `tls.cert`).
 
 | for | permissions | file in the package's data |
 |---|---|---|
@@ -35,13 +39,14 @@ the macaroons in Lightning Fork's own dashboard and pastes them (hex) into this 
 | the gateway, invoices | `invoices:read invoices:write` | `run/gateway/invoices.macaroon` |
 | the gateway, height | `info:read` | `run/gateway/info.macaroon` |
 
-The wallet refuses on mainnet any rail macaroon that grants more than its four permissions; the
-gateway does the same for its two. The easy route other apps take (mounting the node's data dir and
-reading `admin.macaroon`) is not taken: it would put a credential that can spend everything into a
-web-facing package for good. The cost is one manual step per macaroon. The smallest thing that would
-remove it is a "grant a macaroon to an app" call in the Lightning node app (bake with a given
-permission list on the dependent's behalf, write it into the dependent's data), which neither
-platform's package offers today.
+A key that is already there (the owner's own, pasted on the setup page) is kept; a key the owner
+disconnects is not made again at the next start. The wallet refuses on mainnet any rail macaroon that
+grants more than its four permissions; the gateway does the same for its two. The trade: the one-shot
+reads a credential that can spend everything, once, in a container with no port, a read-only root
+and no capabilities; the alternative was one manual step per macaroon for the owner. The smallest
+change on the node's side that would remove even that read is a "grant a macaroon to an app" call in
+the Lightning node's package (bake with a given permission list on the dependent's behalf and write it
+into the dependent's data), which neither platform's package offers today.
 
 The REST address and the certificate path come from the platform; the owner never types them.
 

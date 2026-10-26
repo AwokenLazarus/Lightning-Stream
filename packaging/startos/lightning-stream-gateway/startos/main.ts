@@ -34,6 +34,8 @@ export const main = sdk.setupMain(async ({ effects }) => {
 
   return sdk.Daemons.of(effects)
     .addOneshot('init', { subcontainer: sub(init), exec: exec(init), requires: [] })
+    // the gateway's two macaroons, made through the box's own Lightning node (the gateway picks them up)
+    .addOneshot('node-keys', { subcontainer: sub(spec('node-keys')), exec: exec(spec('node-keys')), requires: ['init'] })
     .addDaemon('ui', {
       subcontainer: sub(ui),
       exec: exec(ui),

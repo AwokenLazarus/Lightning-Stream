@@ -2,28 +2,28 @@ manifestVersion: 1.1
 id: lazarus-lightning-stream
 category: lightning
 name: Lightning Stream
-version: "0.1.3"
+version: "0.1.4"
 tagline: Buy and sell any service over Lightning from this box, paid as you use it
 description: >-
   One app for both sides. The wallet pays sellers with stream tickets under a policy you sign, and
   agents connect to its MCP server. The connector, on this box only, asks the signer to pay for what
   a service sends (a stream, a file, a reply) as it arrives. The sell side is the gateway: it stays idle until you add a service on the
-  Sell page, and it holds only the narrow macaroons that page writes. The signer is the only
+  Sell page, and it holds only the narrow macaroons the app makes for it. The signer is the only
   service that can spend.
 
 
-  Setup, on this app's main page: enrol your approval key, sign a policy (the starter template turns
-  Lightning and stream tickets on with low caps), and on the Lightning page paste a macaroon you make
-  in Lightning Fork's dashboard with exactly info:read, offchain:read, offchain:write and
-  onchain:read. The app reads only the node's certificate; it never holds an admin macaroon.
+  Setup takes a few minutes and no keys to copy. The app connects to this box's Lightning node by
+  itself: a one-shot service asks the node to make the app's own narrow keys (it can pay only within
+  your spending rules, and the selling side can only ask for payments), each revocable alone in the
+  node's app. You open the app from your Umbrel dashboard, already logged in. Then make your approval
+  key in the browser (download its backup), confirm that the app pays with real money, and sign the
+  starter spending rules.
 
 
-  To sell, open the Sell page: connect your Lightning node once (two macaroons: invoices:read
-  invoices:write; info:read), say where buyers find you, and add each service you sell (a media
-  server, an AI model, another web service) with its address on this box and a price in sats.
-  Buyers reach the gateway through an https proxy you point at lazarus-lightning-stream_gateway_1:8402.
-  Until a service is saved, the gateway does not listen. To buy from a seller, paste its address on
-  the Services page. Agents on the LAN use port 33511, with the bearer token from the Agents page.
+  To sell, open Sell: name your shop, say where buyers find you (an https address; the page explains
+  Cloudflare Tunnel, another tunnel app or your own proxy), and add each service you sell: the page lists
+  media servers and AI models it finds on this box. To buy, add a seller on Services and allow it to be
+  paid with one signature. Agents on the LAN use port 33511, with the bearer token from the Agents page.
 
 
   The keys stay in the signer, sealed on this box's disk. A separate anchor witness keeps a tamper
@@ -45,6 +45,13 @@ gallery:
   - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/4.png
   - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/5.png
 releaseNotes: >-
+  0.1.4: no setup to connect your Lightning node (the app makes its own narrow keys through the node),
+  no app password when you open it from the Umbrel dashboard, no codes to read from logs, an approval
+  key backup you can download, "Allow this seller" in one signature, services on this box offered on
+  the Sell page, help with an https address, a player that says why something does not play, and a
+  free preview of your own shop (a box cannot buy from itself).
+
+
   0.1.3: a calmer river (near the pointer the streams brighten and ease aside; a click sends a pulse
   along one), no flash between pages, a top bar the page scrolls under, and adding a seller that
   prices each item separately works.

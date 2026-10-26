@@ -13,7 +13,7 @@
 export const PORTS = { ui: 8481, gateway: 8402 } as const
 
 export type ImageKey = 'init' | 'gateway' | 'ui'
-export type DaemonId = 'init' | 'gateway' | 'ui'
+export type DaemonId = 'init' | 'node-keys' | 'gateway' | 'ui'
 
 /** A part of the `main` volume, or (with `dependency`) one file of another package's volume. */
 export type MountSpec = {
@@ -77,6 +77,18 @@ const lightningCert: MountSpec = {
   dependency: { packageId: LIGHTNING.packageId, volumeId: 'main', type: 'directory' },
 }
 
+/**
+ * Lightning Fork's chain data, where its admin macaroon is: mounted read-only into the one-shot
+ * node-keys only, which has the node bake the gateway's two narrow macaroons (invoices; info:read),
+ * each under a root key of its own, and writes only those into run/gateway.
+ */
+const lightningChainData: MountSpec = {
+  subpath: 'data/chain',
+  mountpoint: '/node/chain',
+  readonly: true,
+  dependency: { packageId: LIGHTNING.packageId, volumeId: 'main', type: 'directory' },
+}
+
 export function services(cfg: Config): ServiceSpec[] {
   const cert = cfg.lightningRest && CERT_SOURCE === 'folder' ? [lightningCert] : []
   return [
@@ -88,6 +100,19 @@ export function services(cfg: Config): ServiceSpec[] {
       env: { XBT_INIT_COMPONENTS: 'gateway,ui' },
       mounts: [vol(null, '/data')],
       requires: [],
+    },
+    {
+      // connects the gateway to the box's Lightning node with no step by the owner; it exits once both
+      // macaroons are there. Root: Lightning Fork's files are its own user's; this only reads them
+      id: 'node-keys',
+      image: 'ui',
+      user: 'root',
+      command: ['/usr/bin/xbt-wallet-ui', 'node-keys'],
+      env: cfg.lightningRest
+        ? { XBT_KEYS_NODE_REST: cfg.lightningRest, XBT_KEYS_TLS_CERT: LIGHTNING.cert, XBT_KEYS_ADMIN: '/node/chain', XBT_KEYS_GW_DIR: '/data/run/gateway' }
+        : {},
+      mounts: cfg.lightningRest && CERT_SOURCE === 'folder' ? [vol('run/gateway', '/data/run/gateway'), lightningChainData, lightningCert] : [],
+      requires: ['init'],
     },
     {
       id: 'gateway',
