@@ -658,6 +658,30 @@ fn pays_within_budget_through_the_safe_channel_only() {
 }
 
 #[test]
+fn ln_lookup_reads_one_payment_of_the_book() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let rig = LnRig::new(json!({}));
+    let (inv, hash) = rig.invoice(300, 41, XBT);
+    assert_eq!(rig.pay(&inv, 400)["verdict"], "allow");
+    let r = rig.call("ln_lookup", json!({"payment_hash": hash.to_uppercase()}));
+    assert_eq!(r["found"], true, "{r}");
+    assert_eq!(r["state"], "settled");
+    assert_eq!(r["spent_sats"], 302);
+    assert_eq!(r["preimage"], hex::encode([41u8; 32]));
+    assert!(r.get("invoice").is_none());
+    // a failed payment: no preimage, the node's reason as untrusted text
+    rig.ln.set(|s| s.mode = Mode::Fail);
+    let (inv2, hash2) = rig.invoice(100, 42, XBT);
+    assert_eq!(rig.pay(&inv2, 400)["rule"], "ln_payment_failed");
+    let r = rig.call("ln_lookup", json!({"payment_hash": hash2}));
+    assert_eq!(r["state"], "failed", "{r}");
+    assert!(r.get("preimage").is_none());
+    assert_eq!(r["untrusted_ln_data"]["trust"], "untrusted");
+    assert_eq!(rig.call("ln_lookup", json!({"payment_hash": "00".repeat(32)}))["found"], false);
+    assert_eq!(rig.call("ln_lookup", json!({"payment_hash": "zz"}))["verdict"], "deny");
+}
+
+#[test]
 fn over_budget_is_denied_before_any_htlc() {
     let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let rig = LnRig::new(json!({"daily_budget_sats": 500}));
