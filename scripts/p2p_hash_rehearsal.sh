@@ -22,7 +22,8 @@ cd "$(dirname "$0")/.."
 CONF=${CONF:-run/p2p-hash/rehearsal/rehearsal.env}
 # shellcheck source=/dev/null
 . "$CONF"
-: "${MINER:?}" "${DM_USER:?}" "${DM_PASS:?}" "${HASHER_SSH:?}" "${HASHER_DIR:?}" "${HASHER_IP:?}" "${GATEWAY:?}" "${GW_USER:?}"
+[ "${CHECK_ONLY:-0}" = 1 ] || : "${MINER:?}" "${DM_USER:?}" "${DM_PASS:?}"
+: "${HASHER_SSH:?}" "${HASHER_DIR:?}" "${HASHER_IP:?}" "${GATEWAY:?}" "${GW_USER:?}"
 : "${SIGNER_SOCK:?}" "${RELAY_LISTEN:?}" "${PAY_NODE:?}" "${BUYER_LNCLI:?}" "${SELLER_LNCLI:?}"
 STOP_PAYING_AFTER=${STOP_PAYING_AFTER:-14}
 MINUTES=${MINUTES:-15}
@@ -30,7 +31,7 @@ D=run/p2p-hash/rehearsal/$(date -u +%Y%m%dT%H%M%SZ)
 mkdir -p "$D/hasher"
 T0=$(date +%s)
 BIN=target/release/xbt-hashlink
-DM="python3 -I scripts/p2p_hash/dragonmint.py $MINER"
+DM="python3 -I scripts/p2p_hash/dragonmint.py ${MINER:-}"
 H="$HASHER_DIR"
 TERMS="--slice-work $SLICE_WORK --price-msat $PRICE_MSAT --grace-ms $GRACE_MS"
 remote() { ssh -o BatchMode=yes "$HASHER_SSH" "$@"; }
@@ -63,6 +64,21 @@ remote "cd $H && rm -f listing.json hasher.json && \
 for _ in $(seq 60); do remote "test -s $H/listing.json" && break; sleep 1; done
 remote "test -s $H/listing.json" || { echo "the hasher published no listing; see $H/hasher.log on $HASHER_SSH" >&2; exit 1; }
 curl -sk --max-time 10 "https://$HASHER_IP:$FRONT_PORT/x402/ticket/health" > "$D/gateway-health-before.json"
+# the wallet reads the hasher's terms and pays nothing (max_sats 0): the pin, the allowlist and the 402
+python3 -I -c 'import json,socket,sys
+s=socket.socket(socket.AF_UNIX); s.settimeout(120); s.connect(sys.argv[1])
+p={"url": sys.argv[2], "method": "POST", "body": "{}", "max_sats": 0, "task": sys.argv[3]}
+s.sendall((json.dumps({"id": 1, "method": "xbt402_pay", "params": p})+"\n").encode())
+b=b""
+while not b.endswith(b"\n"):
+    c=s.recv(65536)
+    if not c: break
+    b+=c
+print(json.dumps(json.loads(b).get("result"), indent=1))' "$SIGNER_SOCK" "https://$HASHER_IP:$FRONT_PORT/hashrate/check/1" "$TASK" | tee "$D/terms-check.json"
+if [ "${CHECK_ONLY:-0}" = 1 ]; then
+  echo "CHECK_ONLY: the miner was not touched; stopping"
+  exit 0
+fi
 
 # the miner: pools saved, then pool 1 pointed at the hasher (the saved pool 1 stays as pool 2)
 $DM save "$D/pools-before.json" | tee "$D/pools-before.redacted.json"
