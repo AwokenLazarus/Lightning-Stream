@@ -107,6 +107,24 @@ impl Handler for Service {
             Reply::Stream(Streamed { status: 200, headers: vec![("Content-Type".into(), "application/octet-stream".into())], length, body: b })
         };
         if let Some(n) = sized("/files/").or_else(|| sized("/page/")).or_else(|| sized("/free/")).or_else(|| sized("/pieces/")).or_else(|| sized("/hot/")).or_else(|| sized("/tiny/")) {
+            // one byte range, as a file server answers it: 206 and that part of the same bytes
+            let range = req.header("Range").and_then(|r| r.strip_prefix("bytes=")).and_then(|r| r.split_once('-'))
+                .and_then(|(a, b)| Some((a.parse::<usize>().ok()?, if b.is_empty() { n.checked_sub(1)? } else { b.parse::<usize>().ok()?.min(n.checked_sub(1)?) })));
+            if let Some((a, b)) = range.filter(|(a, b)| a <= b) {
+                let span = b - a + 1;
+                let part: xbt_svc::http::Body = Box::new(move |out| {
+                    let mut at = a;
+                    while at <= b {
+                        let end = (at + (64 << 10)).min(b + 1);
+                        out.send(&(at..end).map(pattern).collect::<Vec<u8>>())?;
+                        at = end;
+                    }
+                    Ok(())
+                });
+                return Reply::Stream(Streamed { status: 206, headers: vec![("Content-Type".into(), "video/mp4".into()), ("Accept-Ranges".into(), "bytes".into()),
+                                                                        ("Content-Range".into(), format!("bytes {a}-{b}/{n}"))],
+                                                length: Some(span as u64), body: part });
+            }
             return stream(n, Some(n as u64), body(n, 64 << 10, Duration::ZERO));
         }
         if let Some(n) = sized("/slow/") {
@@ -1057,6 +1075,88 @@ fn a_body_is_streamed_to_a_local_reader_as_it_is_paid_and_stops_when_the_reader_
     let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": 10, "task": "film", "stream_to": "../x"}));
     assert_eq!(v["rule"], "stream_to", "{v}");
     std::env::remove_var("B2_STREAM_DIR");
+    r.assert_booked();
+}
+
+/// A part of a body (`range`), as a player that seeks asks for it: the seller's 206 is paid for
+/// the bytes that arrive and no more, its receipt signs that part, and the seller's head comes back
+/// in the answer and, for a caller that asks (`stream_head`), as the first line on its socket.
+#[test]
+fn a_range_is_paid_for_the_bytes_that_arrive_and_its_receipt_signs_that_part() {
+    use std::io::{BufRead as _, Read as _};
+    use std::os::unix::net::UnixListener;
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = Rig::new(json!({}));
+    let n = 12 * MIB;
+    let digest_of = |a: usize, b: usize| hex::encode(Sha256::digest((a..=b).map(pattern).collect::<Vec<u8>>()));
+    // the last 8 MiB of 12, at 200 sat a MiB: 1,600 sat, two tickets, where the whole file took three
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{n}")), "max_sats": 5_000, "task": "film", "range": format!("bytes={}-", 4 * MIB)}));
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["bytes"].as_u64()), (Some(206), Some(true), Some(8 * MIB as u64)), "{v}");
+    assert_eq!((v["content_range"].as_str(), v["content_length"].as_u64(), v["accept_ranges"].as_str(), v["content_type"].as_str()),
+               (Some(format!("bytes {}-{}/{n}", 4 * MIB, n - 1).as_str()), Some(8 * MIB as u64), Some("bytes"), Some("video/mp4")), "{v}");
+    assert_eq!((v["price_msat"].as_str(), v["tickets_released"].as_u64()), (Some("1600000"), Some(2)), "{v}");
+    assert_eq!(v["body_digest"], digest_of(4 * MIB, n - 1));
+    assert_eq!((v["receipt"]["body"].as_str(), v["receipt"]["last"]["charged"].as_str(), v["receipt"]["last"]["status"].as_u64()),
+               (Some("as signed"), Some("1600000"), Some(206)), "{v}");
+    // the Range went on the unpaid request and on the paid one
+    assert!(r.tap.seen("/files/").len() >= 2);
+    // a part of a page priced by the request: the request's price, and the part's bytes as signed at the head
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/5000"), "max_sats": 10, "task": "film", "range": "bytes=1000-1999"}));
+    assert_eq!((v["status"].as_u64(), v["bytes"].as_u64(), v["price_msat"].as_str(), v["content_range"].as_str()),
+               (Some(206), Some(1000), Some("2500"), Some("bytes 1000-1999/5000")), "{v}");
+    assert_eq!((v["receipt"]["body"].as_str(), v["body_digest"].as_str()), (Some("as signed"), Some(digest_of(1000, 1999).as_str())), "{v}");
+    // streamed to a reader with the head first: one line of JSON, then exactly the part
+    let l = UnixListener::bind(dir.path().join("seek-1")).unwrap();
+    let reader = std::thread::spawn(move || {
+        let (s, _) = l.accept().unwrap();
+        let mut s = std::io::BufReader::new(s);
+        let mut line = String::new();
+        s.read_line(&mut line).unwrap();
+        let mut rest = vec![];
+        s.read_to_end(&mut rest).unwrap();
+        (serde_json::from_str::<Value>(&line).unwrap(), rest)
+    });
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/files/{n}")), "max_sats": 5_000, "task": "film", "range": "bytes=100-",
+                                        "stream_to": "seek-1", "stream_head": true}));
+    let (head, rest) = reader.join().unwrap();
+    assert_eq!((head["status"].as_u64(), head["content_range"].as_str(), head["content_length"].as_u64()),
+               (Some(206), Some(format!("bytes 100-{}/{n}", n - 1).as_str()), Some(n as u64 - 100)), "{head}");
+    assert_eq!((rest.len(), v["bytes"].as_u64(), v["complete"].as_bool()), (n - 100, Some(n as u64 - 100), Some(true)), "{v}");
+    assert_eq!(hex::encode(Sha256::digest(&rest)), digest_of(100, n - 1));
+    // a seller whose 206 is for another range than was asked: nothing of it is read
+    r.tap.set(Box::new(|seen, real| {
+        if !(seen.paid && seen.path.starts_with("/files/")) {
+            return None;
+        }
+        let mut ans = real().ok()?;
+        for (k, v) in ans.headers.iter_mut() {
+            if k.eq_ignore_ascii_case("Content-Range") {
+                *v = "bytes 0-298999/300000".into();
+            }
+        }
+        Some(Ok(ans))
+    }));
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/files/300000"), "max_sats": 100, "task": "film", "range": "bytes=1000-"}));
+    r.tap.clear();
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["bytes"].as_u64()), (Some(206), Some(false), Some(0)), "{v}");
+    assert!(v["ended"].as_str().unwrap().contains("not the range asked for"), "{v}");
+    // ranges that are not one plain byte range are refused before anything is sent
+    let sent = r.tap.log.lock().unwrap().len();
+    for bad in ["bytes=5-2", "bytes=-500", "bytes=1-2,4-5", "items=1-", " bytes=1-", "bytes=1 -", "bytes=+1-", "bytes=99999999999999999999-", "bytes="] {
+        let v = r.call("xbt402_pay", json!({"url": r.shop.url("/files/10"), "max_sats": 10, "task": "film", "range": bad}));
+        assert_eq!(v["rule"], "range", "{bad}: {v}");
+    }
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/api"), "method": "POST", "max_sats": 10, "task": "film", "range": "bytes=0-"}));
+    assert_eq!(v["rule"], "range", "{v}");
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/files/10"), "max_sats": 10, "task": "film", "range": "bytes=0-", "piece_sha256": ["00"]}));
+    assert_eq!(v["rule"], "range", "{v}");
+    assert_eq!(r.tap.log.lock().unwrap().len(), sent, "nothing was sent for a refused range");
+    std::env::remove_var("B2_STREAM_DIR");
+    // the node, the seller, the book and the ledger agree, and every secret is booked
+    let (paid, taken, book, ledger) = r.money();
+    assert_eq!((taken, book, ledger), (paid, paid, (paid / TICKET) as i64 * SETTLED));
     r.assert_booked();
 }
 

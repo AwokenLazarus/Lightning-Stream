@@ -308,7 +308,9 @@ impl Signer {
 
     /// One authenticated request of the session, in `seq` order: the status, the receipt (or why
     /// there is none), and the answer with its body still to be read. `Err`: no answer came.
-    fn draw_send(&self, ds: &DrawSession, method: &str, url: &str, body: &[u8], json_body: bool) -> Result<(u64, String, WireAnswer, std::result::Result<DrawReceipt, String>)> {
+    /// `extra`: the headers beside the payment's (a session endpoint's `Content-Type`, the call's `Range`).
+    fn draw_send(&self, ds: &DrawSession, method: &str, url: &str, body: &[u8], extra: Vec<(String, String)>)
+                 -> Result<(u64, String, WireAnswer, std::result::Result<DrawReceipt, String>)> {
         if !self.ticket_may_reach(&ds.origin, &ds.task) {
             return Err(err("allowlist", format!("destination not on allowlist: {}", ds.origin)));
         }
@@ -317,9 +319,7 @@ impl Signer {
         let (seq, digest) = (link.next_seq, request_digest_v2(method, url, body));
         let auth = lottery::request_auth(&link.key, &link.seller_sid, seq, &digest);
         let mut headers = vec![("PAYMENT-SIGNATURE".to_string(), b64json(&payment_payload(&ds.terms.accepted, &json!({"session": link.seller_sid, "seq": seq, "auth": auth}))))];
-        if json_body {
-            headers.push(("Content-Type".into(), "application/json".into()));
-        }
+        headers.extend(extra);
         let sent = self.wire(method, url, body, &headers, timeout);
         // the seq is used up once the request has left, answered or not
         link.next_seq = seq.saturating_add(1);
@@ -333,7 +333,7 @@ impl Signer {
         let url = format!("{}/{what}", ds.base);
         let raw = body.to_string().into_bytes();
         for _ in 0..3 {
-            let (_, _, ans, receipt) = self.draw_send(ds, "POST", &url, &raw, true)?;
+            let (_, _, ans, receipt) = self.draw_send(ds, "POST", &url, &raw, vec![("Content-Type".into(), "application/json".into())])?;
             let status = ans.status;
             let v: Value = serde_json::from_slice(&ans.read_small(SMALL_BODY)?).unwrap_or(Value::Null);
             if receipt.is_err() && status == 402 && v.get("error").and_then(Value::as_str) == Some("bad_seq") {
@@ -706,7 +706,7 @@ impl Signer {
         let mut tries = 0;
         let (seq, digest, ans, head) = loop {
             tries += 1;
-            let (seq, digest, ans, receipt) = match self.draw_send(ds, c.method, c.url, c.body, false) {
+            let (seq, digest, ans, receipt) = match self.draw_send(ds, c.method, c.url, c.body, c.headers()) {
                 Ok(x) => x,
                 Err(e) => return fail(ds, with(refused("ticket_seller", format!("the seller gave no answer to the request: {}", e.msg)), json!({"status": null}))),
             };
@@ -784,9 +784,12 @@ impl Signer {
             }
             break (seq, digest, ans, head);
         };
+        let mut ans = ans;
         let status = ans.status;
         let mut out = json!({"verdict": "allow", "rule": "ok", "status": status});
         let mut sink = Sink::for_call(c);
+        let (head_fields, not_read) = c.head(&mut ans, &mut sink);
+        out = with(out, head_fields);
         if status >= 400 {
             // an error of the service, passed on: no piece, and no draw
             let ended = read_all(ans, &mut sink);
@@ -796,6 +799,10 @@ impl Signer {
             return fail(ds, with(self.draw_fault(ds, &why), json!({"status": status})));
         } else {
             let Some(req) = xbt402::ticket::hex32(&digest) else { return fail(ds, refused("ticket", "a request digest that is not 32 bytes")) };
+            // a 206 for another range than was asked: nothing of it is read, and its pieces are named void
+            if let Some(why) = not_read {
+                lock(&counted).stop.get_or_insert(why);
+            }
             let m = self.draw_stream(ds, c, price, &head, seq, req, ans, max_msat, &mut sink, &counted);
             out = with(out, m);
         }
