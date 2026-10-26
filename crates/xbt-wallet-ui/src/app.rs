@@ -821,8 +821,9 @@ impl App {
             <textarea name=\"f_allowlist\" rows=\"4\">{}</textarea></label>\
             <label>Sellers paid through their Lightning node, one per line: the web address, a space, then the node's id\
             <textarea name=\"f_counterparties\" rows=\"3\">{}</textarea></label></fieldset>\
+            <input type=\"hidden\" name=\"f_unseen\" value=\"{}\">\
             <div class=\"row\"><button>Review the change</button> <a class=\"button-link\" href=\"./policy?template=starter\">Start from the safe starter rules</a></div></form>",
-            esc(&allow), esc(&cps)));
+            esc(&allow), esc(&cps), esc(&Self::unseen_sections(p).to_string())));
         b.push_str(&format!("<details><summary>Edit the rules as a file (policy.json)</summary><form method=\"post\" action=\"./policy\">{}\
             <input type=\"hidden\" name=\"mode\" value=\"json\"><textarea name=\"json\" rows=\"20\" class=\"mono\">{}</textarea>\
             <button>Review the change</button></form></details>", Self::csrf_input(ctx), esc(&serde_json::to_string_pretty(p).unwrap_or_default())));
@@ -880,9 +881,33 @@ impl App {
         self.page("Spending rules", ctx, b)
     }
 
-    /// The form's fields on top of the current policy (unknown keys are kept).
+    /// The sections of `p` the form has no field for (the Lightning and ticket settings, and any key
+    /// this page does not know): the form carries them as they are, so that signing the form signs
+    /// them too. The approval key is never among them: it is the signer's own, and kept from the
+    /// current policy.
+    fn unseen_sections(p: &Value) -> Value {
+        let mut m = p.as_object().cloned().unwrap_or_default();
+        for (k, _, _) in INT_KEYS {
+            m.remove(k);
+        }
+        for k in ["anchor_required", "allowlist", "counterparties", "human_pubkey"] {
+            m.remove(k);
+        }
+        Value::Object(m)
+    }
+
+    /// The form's fields on top of the current policy. Unknown keys are kept, and the sections the
+    /// form carried unseen (the starter rules' Lightning and ticket settings) are put back: a form
+    /// signs every section it was shown with, never fewer.
     fn proposed_from_form(cur: &Value, f: &HashMap<String, String>) -> Value {
         let mut p = cur.as_object().cloned().unwrap_or_default();
+        if let Some(Value::Object(unseen)) = f.get("f_unseen").and_then(|s| serde_json::from_str::<Value>(s).ok()) {
+            for (k, v) in unseen {
+                if k != "human_pubkey" {
+                    p.insert(k, v);
+                }
+            }
+        }
         let num = |s: &str| -> Value { s.trim().parse::<i64>().map(Value::from).unwrap_or_else(|_| Value::from(s.trim())) };
         for (k, _, _) in INT_KEYS {
             if let Some(v) = f.get(&format!("f_{k}")) {

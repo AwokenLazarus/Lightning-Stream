@@ -471,6 +471,68 @@ fn the_policy_editor_shows_the_signer_s_errors_and_applies_a_signed_change_live(
     assert!(br.get("/policy?template=starter").body.contains("name=\"f_max_per_tx_sats\" value=\"100000\""));
 }
 
+/// Every field of the policy form on `page`, as a browser would post it.
+fn policy_form_fields(page: &str) -> Vec<(String, String)> {
+    let mut form: Vec<(String, String)> = vec![("csrf".into(), field(page, "csrf")), ("mode".into(), "form".into())];
+    for k in ["max_per_tx_sats", "daily_budget_sats", "weekly_budget_sats", "per_counterparty_cap_sats", "human_threshold_sats", "approval_ttl_s",
+              "split_window_s", "velocity_max", "velocity_window_s", "hot_balance_cap_sats", "anchor_interval_s", "treasury_csv"] {
+        form.push((format!("f_{k}"), field(page, &format!("f_{k}"))));
+    }
+    form.push(("f_allowlist".into(), PROVIDER.into()));
+    form.push(("f_unseen".into(), field(page, "f_unseen")));
+    form
+}
+
+fn sign_policy_form(br: &mut B, form: &[(String, String)]) -> String {
+    let csrf = form[0].1.clone();
+    let prev = br.post("/policy", &form.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect::<Vec<_>>()).body;
+    assert!(prev.contains("Sign and apply"), "{prev}");
+    let (text, sha, exp) = (field(&prev, "text"), field(&prev, "prev_sha256"), field(&prev, "expiry"));
+    let r = br.post("/policy-apply", &[("csrf", &csrf), ("text", &text), ("prev_sha256", &sha), ("expiry", &exp),
+                                        ("signature", &sig(&policy_message(&sha, exp.parse().unwrap(), &text)))]);
+    br.flash_after(&r)
+}
+
+#[test]
+fn signing_the_starter_rules_turns_paying_over_lightning_and_tickets_on() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let bx = start(json!({}), false, |_| {});
+    let mut br = logged_in(&bx);
+    assert!(bx.rig.call("policy_get", json!({}))["policy"].get("ln").is_none(), "a fresh box has no Lightning section");
+    let page = br.get("/policy?template=starter").body;
+    let flash = sign_policy_form(&mut br, &policy_form_fields(&page));
+    assert!(flash.starts_with("Policy applied"), "{flash}");
+    let p = bx.rig.call("policy_get", json!({}))["policy"].clone();
+    assert_eq!(p["ln"]["enabled"], true, "{p}");
+    assert_eq!(p["tickets"]["enabled"], true, "{p}");
+    assert!(p["tickets"]["tasks"]["default"]["budget_sats"].as_i64().unwrap() > 0, "{p}");
+}
+
+#[test]
+fn editing_one_rule_keeps_every_section_the_form_does_not_show() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let bx = start(json!({"ln": {"enabled": true, "max_fee_ppm": 4000}, "tickets": {"enabled": true, "tasks": {"films": {"budget_sats": 700}}}}), false, |_| {});
+    let mut br = logged_in(&bx);
+    let page = br.get("/policy").body;
+    let mut form = policy_form_fields(&page);
+    form.iter_mut().find(|(k, _)| k == "f_human_threshold_sats").unwrap().1 = "4000".into();
+    let flash = sign_policy_form(&mut br, &form);
+    assert!(flash.starts_with("Policy applied"), "{flash}");
+    let p = bx.rig.call("policy_get", json!({}))["policy"].clone();
+    assert_eq!(p["human_threshold_sats"], 4000);
+    assert_eq!(p["ln"]["max_fee_ppm"], 4000, "{p}");
+    assert_eq!(p["tickets"]["tasks"]["films"]["budget_sats"], 700, "{p}");
+    // a form posted without the carried sections (an old page) still removes nothing
+    let page = br.get("/policy").body;
+    let mut form = policy_form_fields(&page);
+    form.retain(|(k, _)| k != "f_unseen");
+    form.iter_mut().find(|(k, _)| k == "f_human_threshold_sats").unwrap().1 = "3000".into();
+    sign_policy_form(&mut br, &form);
+    let p = bx.rig.call("policy_get", json!({}))["policy"].clone();
+    assert_eq!(p["ln"]["max_fee_ppm"], 4000, "{p}");
+    assert_eq!(p["tickets"]["tasks"]["films"]["budget_sats"], 700, "{p}");
+}
+
 #[test]
 fn enrol_and_replace_the_human_key_then_sweep_rotate_backup_and_anchor() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
