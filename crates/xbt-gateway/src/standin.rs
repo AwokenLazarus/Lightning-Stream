@@ -272,6 +272,13 @@ impl StandIn {
         p
     }
 
+    /// Offer invoices issued, and of them those paid.
+    pub fn offer_counts(&self) -> (usize, usize) {
+        let s = self.lock();
+        let paid = s.offer_invoices.iter().filter(|(i, _)| i.state == Some(InvoiceState::Settled)).count();
+        (s.offer_invoices.len(), paid)
+    }
+
     /// The preimage of a paid offer invoice: what its payer learnt.
     pub fn offer_preimage(&self, hash: &Hash) -> Option<[u8; 32]> {
         self.lock()

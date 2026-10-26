@@ -555,7 +555,16 @@ impl Signer {
     /// still for this win already.
     fn draw_pay(&self, ds: &DrawSession, win: &Win, invoice: &str, first: bool, counted: &Mutex<Counted>) {
         lock(&ds.state).paying.insert(win.draw());
-        let out = self.lottery_pay_win(&ds.sid, win, invoice, first);
+        // the seller's offer first, where its terms name one, with the note that names this session and draw; its
+        // invoice where the offer cannot be fetched
+        let (key, seller_session) = {
+            let link = lock(&ds.link);
+            (Zeroizing::new(*link.key), link.seller_sid.clone())
+        };
+        let by = xbt402::offer::entry_offer(&ds.terms.accepted)
+            .filter(|_| !seller_session.is_empty())
+            .map(|offer| crate::ticket_rail::OfferWay { offer, key: &key, seller_session: &seller_session });
+        let out = self.lottery_pay_win(&ds.sid, win, invoice, first, by.as_ref());
         let charged = py_int(out.get("charged_sats")).unwrap_or(0).max(0);
         let rule = str_or_empty(out.get("rule"));
         let mut s = lock(&ds.state);

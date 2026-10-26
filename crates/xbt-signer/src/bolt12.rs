@@ -92,6 +92,8 @@ pub struct Invoice {
     pub chain: Option<[u8; 32]>,
     pub invreq_amount: Option<u64>,
     pub quantity: Option<u64>,
+    /// `invreq_payer_note`: the note the payer's request carried, repeated by the issuer.
+    pub payer_note: Option<String>,
     /// `invreq_payer_id`: the key the node signed its request with. Lightning Fork draws a new one for
     /// every request, so it identifies one payment, not a payer.
     pub payer_id: [u8; 33],
@@ -557,7 +559,7 @@ pub fn decode_invoice(invoice: &str) -> Result<Invoice, String> {
 pub fn invoice_from_tlv(data: &[u8]) -> Result<Invoice, String> {
     let recs = records(data)?;
     let mut offer_tlv = Vec::new();
-    let (mut chain, mut invreq_amount, mut quantity, mut payer_id) = (None, None, None, None);
+    let (mut chain, mut invreq_amount, mut quantity, mut payer_id, mut payer_note) = (None, None, None, None, None);
     let (mut inv_paths, mut payinfo, mut created_at, mut relative_expiry) = (None, None, None, None);
     let (mut payment_hash, mut amount_msat, mut feats, mut node_id, mut sig) = (None, None, vec![], None, None);
     for r in &recs {
@@ -565,7 +567,8 @@ pub fn invoice_from_tlv(data: &[u8]) -> Result<Invoice, String> {
         match r.typ {
             // the offer it answers, repeated: compared with the offer byte for byte, not read again
             1..=79 => offer_tlv.extend_from_slice(r.raw),
-            0 | 84 | 89 | 90 | 91 | 172 => {}
+            0 | 84 | 90 | 91 | 172 => {}
+            89 => payer_note = Some(utf8(v, "invreq_payer_note")?),
             80 => chain = Some(arr32(v, "invreq_chain")?),
             82 => invreq_amount = Some(tu(v, 8)?),
             86 => quantity = Some(tu(v, 8)?),
@@ -592,7 +595,7 @@ pub fn invoice_from_tlv(data: &[u8]) -> Result<Invoice, String> {
     if offer_tlv.is_empty() {
         return Err("the invoice answers no offer".into());
     }
-    Ok(Invoice { offer_id: Sha256::digest(&offer_tlv).into(), offer_tlv, chain, invreq_amount, quantity,
+    Ok(Invoice { offer_id: Sha256::digest(&offer_tlv).into(), offer_tlv, chain, invreq_amount, quantity, payer_note,
                  payer_id: payer_id.ok_or("the invoice has no invreq_payer_id")?, paths, payinfo,
                  created_at: created_at.ok_or("the invoice has no invoice_created_at")?,
                  relative_expiry: relative_expiry.unwrap_or(DEFAULT_RELATIVE_EXPIRY_S),
@@ -985,6 +988,11 @@ mod tests {
         assert_eq!((inv.offer_id, inv.node_id, inv.amount_msat, inv.payment_hash), (o.id, issuer(), 250_000, [9; 32]));
         assert_eq!((inv.payer_id, inv.expires_at(), inv.amount_sats_ceil()), (encode::pubkey(&payer), NOW - 10 + 3600, 250));
         assert_eq!(check_invoice(&o, &inv, &terms(250_000)), Ok(()));
+        // the payer's note, as the issuer repeats it from the request (a payment by offer names its session so)
+        assert_eq!(inv.payer_note, None);
+        let noted = decode_invoice(&encode::invoice(&InvoiceSpec { extra: vec![(89, b"xbt402-note/0 a note".to_vec())], ..spec(&o, &payer, &alice) })).unwrap();
+        assert_eq!(noted.payer_note.as_deref(), Some("xbt402-note/0 a note"));
+        assert!(decode_invoice(&encode::invoice(&InvoiceSpec { extra: vec![(89, vec![0xff, 0xfe])], ..spec(&o, &payer, &alice) })).is_err(), "a note is UTF-8");
         let rule = |s: &InvoiceSpec, t: &InvoiceTerms| check_invoice(&o, &decode_invoice(&encode::invoice(s)).unwrap(), t).unwrap_err().0;
         // no bit 512; another chain; no chain off mainnet
         assert_eq!(rule(&InvoiceSpec { features: &[], ..spec(&o, &payer, &alice) }, &terms(250_000)), "ln_feature_512");
