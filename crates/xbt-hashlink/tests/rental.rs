@@ -133,6 +133,8 @@ fn rental(stop_paying_after: Option<u64>, miner_secs: u64, wallet: bool) -> Run 
             terms: terms(),
             report: None,
             slices: wallet.then(|| slices_a.clone()),
+            fallback: None,
+            rentable: None,
         };
         thread::spawn(move || hasher::run(cfg, Box::<LabSeller>::default()).unwrap())
     };
@@ -160,6 +162,10 @@ fn rental(stop_paying_after: Option<u64>, miner_secs: u64, wallet: bool) -> Run 
             duration: Some(Duration::from_secs(120)),
             report: None,
             payer,
+            miners: 0,
+            budget_msat: None,
+            cut: None,
+            live: None,
         };
         thread::spawn(move || buyer::run(cfg, Box::<LabBuyer>::default()).unwrap())
     };
@@ -174,6 +180,8 @@ fn rental(stop_paying_after: Option<u64>, miner_secs: u64, wallet: bool) -> Run 
                     max_rate: 8.0,
                     bad_every: 7,
                     duration: Some(Duration::from_secs(miner_secs)),
+                    reconnect: false,
+                    extranonce_subscribe: false,
                 })
             })
         })
@@ -285,12 +293,21 @@ fn a_slice_the_hasher_did_not_count_is_refused() {
     let [link_a, miners_a, slices_a] = ports::<3>();
     let hk = noise::fresh_key();
     let hpub = PublicKey::from_secret_key(secp256k1::SECP256K1, &hk);
-    let cfg = hasher::Config { miners: miners_a, link: link_a.clone(), key: hk, terms: terms(), report: None, slices: Some(slices_a.clone()) };
+    let cfg = hasher::Config {
+        miners: miners_a,
+        link: link_a.clone(),
+        key: hk,
+        terms: terms(),
+        report: None,
+        slices: Some(slices_a.clone()),
+        fallback: None,
+        rentable: None,
+    };
     thread::spawn(move || hasher::run(cfg, Box::<LabSeller>::default()));
     wait_for(&link_a);
     let bk = noise::fresh_key();
     let mut l = xbt_hashlink::link::dial(&link_a, bk, hpub).unwrap();
-    l.tx.send(&xbt_hashlink::msg::Msg::Hello { rental: "r9".into(), listing: "l".into(), terms: terms() }).unwrap();
+    l.tx.send(&xbt_hashlink::msg::Msg::Hello { rental: "r9".into(), listing: "l".into(), terms: terms(), miners: 0 }).unwrap();
     assert!(matches!(l.rx.recv().unwrap(), Some(xbt_hashlink::msg::Msg::Welcome { .. })));
     let receipt = xbt_hashlink::meter::Receipt { rental: "r9".into(), slice: 1, work: terms().slice_work, accepted: 8, rejected: 0, at_ms: 1 }.sign(&bk);
     let post = |path: &str, body: &str| {
@@ -320,6 +337,7 @@ fn the_buyer_finds_the_hasher_on_nostr() {
         pay_url: "https://hasher.example/hashrate".into(),
         pay_node: "02".to_string() + &"aa".repeat(32),
         terms: terms(),
+        capacity: listing::Capacity { miners: 2, free_miners: 2, free_hs: 1_000_000 },
     };
     let nostr = xbt_nostr::event::Keys::generate();
     let ev = h.event(&link, &nostr, xbt_nostr::now()).unwrap();
