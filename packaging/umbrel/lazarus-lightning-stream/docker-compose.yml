@@ -36,10 +36,12 @@ x-service: &service
       condition: service_completed_successfully
 
 x-lightning-data: &lightning-data
-  # the Lightning app's chain data, where its admin macaroon is: mounted into node-keys only
+  # the Lightning node's mainnet admin macaroon, the file alone: mounted into node-keys only. The
+  # directories above it are its owner's alone (0700), so a mount of the directory could not be read
+  # by node-keys' group; the file itself is readable by the group (0640)
   type: bind
-  source: ${APP_LIGHTNING_FORK_NODE_DATA_DIR}/data/chain
-  target: /node/chain
+  source: ${APP_LIGHTNING_FORK_NODE_DATA_DIR}/data/chain/bitcoin/mainnet/admin.macaroon
+  target: /node/admin.macaroon
   read_only: true
   bind:
     create_host_path: false
@@ -194,7 +196,7 @@ services:
     environment:
       XBT_KEYS_NODE_REST: https://${APP_LIGHTNING_FORK_NODE_IP}:${APP_LIGHTNING_FORK_NODE_REST_PORT}
       XBT_KEYS_TLS_CERT: /data/lightning/tls.cert
-      XBT_KEYS_ADMIN: /node/chain
+      XBT_KEYS_ADMIN: /node/admin.macaroon
       XBT_KEYS_RAIL_DIR: /data/run/ln
       XBT_KEYS_GW_DIR: /data/run/gateway
     volumes:

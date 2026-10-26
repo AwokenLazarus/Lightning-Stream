@@ -73,10 +73,12 @@ AGENTPAY = {
 # the Lightning node's certificate: the only file of another app's data a service here may mount
 CERT_MOUNT = {"type": "bind", "source": "${APP_LIGHTNING_FORK_NODE_DATA_DIR}/tls.cert", "target": "/data/lightning/tls.cert", "read_only": True,
               "bind": {"create_host_path": False}}
-# The Lightning node's chain data, where its admin macaroon is: only the one-shot node-keys (the UI
-# image, `command: ["node-keys"]`) may mount it, read-only, never created. It reads the admin macaroon
-# once to have the node bake the app's narrow macaroons, and writes only those (run/ln, run/gateway).
-NODE_DATA_MOUNT = {"type": "bind", "source": "${APP_LIGHTNING_FORK_NODE_DATA_DIR}/data/chain", "target": "/node/chain", "read_only": True,
+# The Lightning node's mainnet admin macaroon, the file alone (the directories above it are 0700):
+# only the one-shot node-keys (the UI image, `command: ["node-keys"]`) may mount it, read-only, never
+# created. It reads it once to have the node bake the app's narrow macaroons, and writes only those
+# (run/ln, run/gateway).
+NODE_DATA_MOUNT = {"type": "bind", "source": "${APP_LIGHTNING_FORK_NODE_DATA_DIR}/data/chain/bitcoin/mainnet/admin.macaroon",
+                   "target": "/node/admin.macaroon", "read_only": True,
                    "bind": {"create_host_path": False}}
 NODE_KEYS_MOUNTS = {"${APP_DATA_DIR}/data/run/ln:/data/run/ln", "${APP_DATA_DIR}/data/run/gateway:/data/run/gateway"}
 
