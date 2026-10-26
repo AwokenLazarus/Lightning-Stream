@@ -4,5 +4,5 @@ import { sdk } from './sdk'
 // The XBT node is still an external connection set in the Node connection action (no package here declares
 // Paul's knots-blake2b yet; Lightning Fork does, and declaring it is the next step).
 export const setDependencies = sdk.setupDependencies(async () => ({
-  'lightning-fork': { kind: 'running', versionRange: '>=0.21.0:0', healthChecks: [] },
+  'lightning-fork': { kind: 'running', versionRange: '>=0.21.4-beta.21.1:1', healthChecks: [] },
 }))

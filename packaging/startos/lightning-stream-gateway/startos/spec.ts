@@ -50,7 +50,7 @@ export type Config = {
  * gateway's own run/gateway. 'folder', once Lightning Fork keeps tls.cert in a folder of its own,
  * mounts that folder read-only (LF_CERT_FOLDER: Lightning Fork's public/ folder, which holds only tls.cert and is kept current).
  */
-export const CERT_SOURCE = 'pin' as 'pin' | 'folder'
+export const CERT_SOURCE = 'folder' as 'pin' | 'folder'
 const LF_CERT_FOLDER = 'public'
 
 export const LIGHTNING = {

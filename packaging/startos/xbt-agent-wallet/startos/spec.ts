@@ -65,7 +65,7 @@ export type Config = {
  * - 'folder' (once Lightning Fork keeps tls.cert in a folder of its own): mount that folder read-only
  *   (LF_CERT_FOLDER: Lightning Fork's public/ folder, which holds only tls.cert and is kept current) and the page offers no pinning.
  */
-export const CERT_SOURCE = 'pin' as 'pin' | 'folder'
+export const CERT_SOURCE = 'folder' as 'pin' | 'folder'
 const LF_CERT_FOLDER = 'public'
 
 /** Where the Lightning node's certificate is in the signer and the UI, and where the rail macaroon is. */
