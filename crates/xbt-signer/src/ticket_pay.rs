@@ -397,6 +397,9 @@ pub(crate) struct HttpSession {
     /// The seller's terms for prepaid tickets, where its 402 listed them beside the entry the
     /// session was opened on.
     prepaid: Option<Terms>,
+    /// The seller's BOLT 12 offer for its prepaid tickets (`extra.offer` of that entry), if it
+    /// names one: a prepaid ticket is paid by it first (`docs/TICKETS.md` section 15).
+    offer: Option<String>,
     /// The URL of the session endpoints: the origin and the terms' path.
     base: String,
     busy: Mutex<()>,
@@ -1158,8 +1161,9 @@ impl Signer {
                         let rule = str_or_empty(o.get("rule"));
                         break 'open Err(if NEXT_RAIL.contains(&rule.as_str()) { Tried::Next(format!("{rule}: {}", str_or_empty(o.get("reason")))) } else { Tried::Done(o) });
                     }
+                    let offer = prepaid.as_ref().and_then(|(_, a)| xbt402::offer::entry_offer(a)).map(str::to_string);
                     let h = Arc::new(HttpSession { origin: c.origin.into(), sid: str_or_empty(o.get("session")), task: task.clone(), terms: terms.clone(),
-                                                   prepaid: prepaid_terms.clone(), base, busy: Mutex::new(()),
+                                                   prepaid: prepaid_terms.clone(), offer, base, busy: Mutex::new(()),
                                                    paying: Mutex::new(()), link: Mutex::new(Link { seller_sid: String::new(), key: Zeroizing::new([0u8; 32]), next_seq: 0 }),
                                                    money: Mutex::new(Money::default()), streaming: AtomicBool::new(false), refilling: AtomicBool::new(false),
                                                    used: Mutex::new(self.engine.now()), unfilled: Mutex::new(None),
@@ -1429,12 +1433,22 @@ impl Signer {
     fn ticket_buy_prepaid(&self, hs: &HttpSession, spent: &mut Spent) -> std::result::Result<(), Value> {
         // the wallet's own node first: no invoice is asked for that the node could not then pay
         self.ticket_can_lock(&hs.terms.terms.payee)?;
-        let body = json!({"version": xbt402::ticket::VERSION, "settle": xbt402::ticket::SETTLE_ON_ARRIVAL, "count": 1});
-        let answer = self.ticket_lock_call(hs, body)?;
-        let Some(first) = answer.get("tickets").and_then(Value::as_array).and_then(|a| a.first()) else {
-            return Err(refusal("ticket_seller", "the seller issued no invoice for a prepaid ticket"));
+        // by the seller's offer first, where its terms name one: nothing is asked of the seller but its session
+        let by_offer = match &hs.offer {
+            Some(offer) if self.ticket_policy().offers => self.ticket_prepay_by_offer(hs, offer),
+            _ => None,
         };
-        let r = self.ticket_prepay(&json!({"session": hs.sid, "hash": first.get("hash"), "invoice": first.get("invoice")}));
+        let r = match by_offer {
+            Some(r) => r,
+            None => {
+                let body = json!({"version": xbt402::ticket::VERSION, "settle": xbt402::ticket::SETTLE_ON_ARRIVAL, "count": 1});
+                let answer = self.ticket_lock_call(hs, body)?;
+                let Some(first) = answer.get("tickets").and_then(Value::as_array).and_then(|a| a.first()) else {
+                    return Err(refusal("ticket_seller", "the seller issued no invoice for a prepaid ticket"));
+                };
+                self.ticket_prepay(&json!({"session": hs.sid, "hash": first.get("hash"), "invoice": first.get("invoice")}))
+            }
+        };
         if r["verdict"] == "pending" {
             // booked, and neither paid nor failed by the node's word: nothing more is paid in this session
             return Err(self.ticket_fault(hs, "the payment of a prepaid ticket has no final answer from the wallet's node: it is booked as spent until the node shows it failed"));
@@ -1454,6 +1468,26 @@ impl Signer {
         spent.prepaid += 1;
         spent.booked_sats = spent.booked_sats.saturating_add(py_int(r.get("charged_sats")).unwrap_or(0));
         self.ticket_deliver(hs)
+    }
+
+    /// A prepaid ticket by the seller's offer: the seller's side of the session first (a lock by
+    /// offer makes it where there is none yet, and issues no invoice), then the payment with the
+    /// note that names that session ([`Signer::ticket_pay_by_offer`]). `None`: nothing was paid,
+    /// and the ticket is bought by the seller's invoice.
+    fn ticket_prepay_by_offer(&self, hs: &HttpSession, offer: &str) -> Option<Value> {
+        if lock(&hs.link).seller_sid.is_empty() {
+            let body = json!({"version": xbt402::ticket::VERSION, "settle": xbt402::ticket::SETTLE_ON_ARRIVAL, "by": "offer"});
+            self.ticket_lock_call(hs, body).ok()?;
+        }
+        let (key, seller_session) = {
+            let link = lock(&hs.link);
+            (Zeroizing::new(*link.key), link.seller_sid.clone())
+        };
+        if seller_session.is_empty() {
+            return None;
+        }
+        let by = crate::ticket_rail::OfferWay { offer, key: &key, seller_session: &seller_session };
+        self.ticket_pay_by_offer(&hs.sid, &by, None, false)
     }
 
     /// How many hashes the session's pool wants now, by the book (0 when the book cannot be read:

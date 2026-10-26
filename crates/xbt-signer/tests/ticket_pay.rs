@@ -26,14 +26,15 @@ use sha2::{Digest, Sha256};
 use xbt402::wire::{b64json, settlement_response, unb64json};
 use xbt_gateway::config::Config;
 use xbt_gateway::gateway::Gateway;
-use xbt_gateway::node::{Hash, Info, Invoice, InvoiceState, Node as SellerNodeApi, NodeError};
+use xbt_gateway::node::{Hash, Info, Invoice, InvoiceState, Node as SellerNodeApi, NodeError, NodeOffer, OfferInvoice};
 use xbt_gateway::standin::StandIn;
 use xbt_primitives::ecdsa;
 use xbt_primitives::secp256k1::{PublicKey, Secp256k1, SecretKey};
 use xbt_primitives::tx::{OutPoint, Tx, TxIn, TxOut};
 use xbt_signer::bolt11::encode::{invoice_cltv, Spec};
 use xbt_signer::fsx::probe;
-use xbt_signer::ln::{HeldSend, LnBackend, SendRequest};
+use xbt_signer::bolt12;
+use xbt_signer::ln::{HeldSend, LnBackend, OfferPayRequest, SendRequest};
 use xbt_signer::node::Node;
 use xbt_signer::signer::{Signer, SignerOptions};
 use xbt_signer::ticket::TAG_RECORD;
@@ -236,6 +237,20 @@ impl SellerNodeApi for SellerNode {
     fn info(&self) -> Result<Info, NodeError> {
         self.inner.info()
     }
+
+    /// The seller's BOLT 12 offer: a real one, on this chain, with bit 512, naming the seller's node
+    /// as its issuer and no amount.
+    fn create_offer(&self, description: &str) -> Result<NodeOffer, NodeError> {
+        let o = bolt12::encode::offer(vec![(2, [0u8; 32].to_vec()), (10, description.as_bytes().to_vec()), (12, bolt12::encode::features(&[512])),
+                                           (22, bolt12::encode::pubkey(&self.key).to_vec())]);
+        let id = bolt12::decode_offer(&o).unwrap().id;
+        self.inner.set_offer(NodeOffer { id, bolt12: o });
+        self.inner.create_offer(description)
+    }
+
+    fn offer_invoices(&self, offer_id: &Hash) -> Result<Vec<OfferInvoice>, NodeError> {
+        self.inner.offer_invoices(offer_id)
+    }
 }
 
 /// The seller: a gateway beside its node, and the service behind it.
@@ -295,7 +310,7 @@ fn shop_config(origin: &str, upstream: &str, state: &std::path::Path, network: &
     }
     json!({"listen": "127.0.0.1:0", "public_url": origin, "upstream": upstream, "state_dir": state, "chain": "regtest",
            "network": network, "node": {"rest": "http://127.0.0.1:1", "macaroon": "unused", "info_macaroon": "unused"},
-           "tickets": conf["tickets"], "caps": caps, "lottery": conf["lottery"],
+           "tickets": conf["tickets"], "caps": caps, "lottery": conf["lottery"], "offers": conf["offers"],
            "times": {"refill_wait_ms": REFILL_WAIT_MS.load(Ordering::SeqCst), "upstream_wait_secs": 2, "tick_ms": 50},
            "routes": routes()})
 }
@@ -478,6 +493,12 @@ struct PayState {
     /// the node goes on calling them in flight.
     strand_next: usize,
     stranded_off_channel: bool,
+    /// The seller's offer gives no invoice (the onion message gets no answer).
+    offer_fetch_fails: bool,
+    /// The invoice the seller's node signs for its offer carries another note than the one asked for.
+    offer_note_lie: bool,
+    /// The payer notes of the invoices fetched from offers, in order.
+    fetched_notes: Vec<String>,
 }
 
 /// A fake LND for the buyer: a ticket payment is held by the seller's stand-in node, and ends as
@@ -494,6 +515,9 @@ struct PayLn {
     /// Plain invoices this node can pay: payment hash to preimage.
     plain: Mutex<HashMap<String, String>>,
     st: Mutex<PayState>,
+    /// The seller's node key, which signs the invoices of its offer, and the clock they are dated by.
+    offer_key: SecretKey,
+    clock: Arc<AtomicU64>,
 }
 
 fn node_err(m: &str) -> xbt402::ChannelError {
@@ -650,6 +674,57 @@ impl LnBackend for PayLn {
 
     fn utxos(&self) -> xbt402::Result<Vec<Value>> {
         Ok(vec![])
+    }
+
+    /// As Lightning Fork's FetchInvoice with a payer note: the seller's node issues an invoice for its
+    /// offer, repeats the note in it and signs it; the answer is the invoice and the node's summary.
+    fn fetch_invoice_noted(&self, offer: &str, amount_msat: u64, payer_note: &str, _timeout_s: i64) -> xbt402::Result<Value> {
+        let o = bolt12::decode_offer(offer).map_err(|e| node_err(&e))?;
+        {
+            let mut s = self.st.lock().unwrap();
+            if s.down || s.router_down {
+                return Err(node_err("LN node unreachable"));
+            }
+            s.fetched_notes.push(payer_note.to_string());
+            if s.offer_fetch_fails {
+                return Err(node_err("no invoice came back for the offer"));
+            }
+        }
+        let lie = self.st.lock().unwrap().offer_note_lie;
+        let payer_note = if lie { "xbt402-note/0 someone else's" } else { payer_note };
+        let now = self.clock.load(Ordering::SeqCst);
+        let pre = self.seller.issue_offer_invoice(Some(payer_note), now - 1);
+        let hash: [u8; 32] = Sha256::digest(pre).into();
+        let payer = SecretKey::from_slice(&[0x81; 32]).unwrap();
+        let spec = bolt12::encode::InvoiceSpec { offer_tlv: &o.tlv, chain: Some([0u8; 32]), payer_key: &payer, created_at: now - 1, relative_expiry: Some(3600),
+                                                 payment_hash: hash, amount_msat, features: &[512], key: &self.offer_key, node_id: None, cltv_expiry_delta: 40,
+                                                 extra: vec![(89, payer_note.as_bytes().to_vec())] };
+        let lni = bolt12::encode::invoice(&spec);
+        let d = bolt12::decode_invoice(&lni).map_err(|e| node_err(&e))?;
+        Ok(json!({"bolt12": lni, "offer_id": hex::encode(d.offer_id),
+                  "invoice": {"payment_hash": hex::encode(d.payment_hash), "amount_msat": d.amount_msat.to_string(), "node_id": hex::encode(d.node_id),
+                              "payer_id": hex::encode(d.payer_id), "created_at": d.created_at.to_string(), "relative_expiry": d.relative_expiry,
+                              "num_paths": 1, "signature_valid": true}}))
+    }
+
+    /// As Lightning Fork's PayOffer with an invoice fetched before: the seller's node settles it at once.
+    fn pay_offer(&self, r: &OfferPayRequest) -> xbt402::Result<Value> {
+        let d = bolt12::decode_invoice(&r.invoice).map_err(|e| node_err(&e))?;
+        let raw = d.payment_hash;
+        let mut s = self.st.lock().unwrap();
+        if s.down || s.router_down {
+            return Err(node_err("LN node unreachable"));
+        }
+        if !self.seller.pay_offer_invoice(&raw, d.amount_msat) {
+            return Err(node_err("the invoice cannot be paid"));
+        }
+        let pre = self.seller.offer_preimage(&raw).map(hex::encode).unwrap_or_default();
+        s.next_index += 1;
+        let p = json!({"payment_hash": d.payment_hash_hex(), "payment_index": s.next_index.to_string(), "status": "SUCCEEDED", "value_msat": d.amount_msat.to_string(),
+                       "fee_msat": FEE_MSAT.to_string(), "payment_preimage": pre, "payment_request": r.invoice, "creation_time_ns": (T0 * 1_000_000_000).to_string(),
+                       "failure_reason": "FAILURE_REASON_NONE", "htlcs": []});
+        s.payments.push(p.clone());
+        Ok(p)
     }
 
     fn describe(&self) -> String {
@@ -823,7 +898,7 @@ impl Rig {
         }
         let root = root_with(dir.path(), &runbook_policy(pol));
         let ln = Arc::new(PayLn { chain: chain.clone(), seller: shop.standin.clone(), preimages: shop.node.preimages.clone(), plain: Mutex::new(HashMap::new()),
-                                  st: Mutex::new(PayState::default()) });
+                                  st: Mutex::new(PayState::default()), offer_key: shop.node.key, clock: clock.clone() });
         ln.st.lock().unwrap().channel = json!({"chan_id": ((6_100u64 << 40) | (1 << 16)).to_string(), "active": true, "remote_pubkey": "02".to_string() + &"aa".repeat(32),
                                                "commitment_type": "ANCHORS", "unified_sigs": true, "capacity": "100000", "local_balance": "90000",
                                                "zero_conf": false, "channel_point": point, "fee_per_kw": "253",
@@ -3596,4 +3671,127 @@ fn a_ticket_that_is_on_none_of_the_nodes_channels_ends_its_session_and_the_next_
     let stranded: Vec<Value> = r.session(&sid)["session_tickets"].as_array().unwrap().iter().filter(|t| t["state"] == "locked").cloned().collect();
     assert_eq!((stranded.len(), stranded.iter().map(|t| t["booked_sats"].as_i64().unwrap()).sum::<i64>()), (2, 0),
                "locked for as long as the node calls them in flight, and no secret of theirs left: {stranded:?}");
+}
+
+// --- paying by the seller's BOLT 12 offer (docs/TICKETS.md, section 15) ---------------------------------
+
+/// The gateway as it ships (a prepaid ticket first), with payment by offer turned on.
+fn offer_shop() -> Value {
+    json!({"tickets": {}, "caps": {"sessions_per_address": 0, "strict": true}, "offers": {"enabled": true}})
+}
+
+fn lock_bodies(r: &Rig) -> Vec<Value> {
+    r.tap.seen("/x402/ticket/lock").iter().map(|s| serde_json::from_str(&s.body).unwrap()).collect()
+}
+
+/// A prepaid ticket is paid by the seller's offer: the session is made by a lock that asks for no
+/// invoice, the invoice is fetched with the note that names that session, booked before it is
+/// paid, and the seller credits the session it names. The ledger holds what the node paid.
+#[test]
+fn a_prepaid_ticket_is_paid_by_the_sellers_offer_with_the_note_that_names_its_session() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, offer_shop());
+    let v = r.pay("/page/10", 10);
+    assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{v}");
+    let locks = lock_bodies(&r);
+    assert_eq!((locks[0]["by"].as_str(), locks[0].get("count")), (Some("offer"), None), "the first lock asks for no invoice: {locks:?}");
+    assert!(locks.iter().all(|l| l["settle"] != "on-arrival" || l["by"] == "offer"), "no prepaid ticket was asked for by invoice: {locks:?}");
+    // the note: the seller's session, a prepaid ticket, its exact amount
+    let notes = r.ln.st.lock().unwrap().fetched_notes.clone();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    let n = xbt402::offer::parse(&notes[0]).expect("a note");
+    assert_eq!((n.purpose, n.amount_msat), (xbt402::offer::Purpose::Ticket, TICKET));
+    assert_eq!(v["untrusted_provider_response"]["receipt"]["session"].as_str(), Some(n.session.as_str()), "the note names the session the seller served: {v}");
+    // paid by the offer, and by no BOLT 11 invoice: the seller's node made none for a prepaid ticket
+    assert_eq!(r.shop.standin.offer_counts(), (1, 1));
+    assert_eq!(r.shop.standin.count(InvoiceState::Settled), r.shop.standin.count_held(InvoiceState::Settled), "no ordinary invoice was settled");
+    // booked before it was sent, and settled at what the node paid; its preimage is the proof the seller was shown
+    assert_eq!(r.audit("ticket_prepay").len(), 1);
+    assert_eq!(r.audit("ticket_prepaid").len(), 1);
+    let pay = r.ln.by_status("SUCCEEDED");
+    assert_eq!(pay.len(), 1);
+    assert!(r.tap.secrets().contains(&pay[0]["payment_preimage"].as_str().unwrap().to_string()), "the preimage went to the seller in release");
+    assert_eq!(r.ledger_sum(), SETTLED);
+    // paid: held tickets as before
+    wait_refill(&r, "two tickets held after the prepaid one", 2);
+    r.tick();
+    r.assert_booked();
+}
+
+/// An offer that gives no invoice costs nothing: the ticket is bought by the seller's invoice,
+/// and an owner who turned offers off is never asked for one.
+#[test]
+fn where_the_offer_gives_no_invoice_the_prepaid_ticket_is_paid_by_the_sellers_invoice() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, offer_shop());
+    r.ln.st.lock().unwrap().offer_fetch_fails = true;
+    let v = r.pay("/page/10", 10);
+    assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{v}");
+    let locks = lock_bodies(&r);
+    assert_eq!((locks[0]["by"].as_str(), locks[1]["count"].as_u64()), (Some("offer"), Some(1)), "{locks:?}");
+    let passed = r.audit("ticket_offer_passed");
+    assert_eq!((passed.len(), passed[0]["rule"].as_str()), (1, Some("ln_fetch_invoice")), "{passed:?}");
+    assert_eq!(r.shop.standin.offer_counts(), (0, 0));
+    assert_eq!(r.ledger_sum(), SETTLED, "one ticket, paid once");
+    // an invoice that does not repeat the wallet's note: the seller could not credit it, so it is not paid
+    let r = Rig::shipped(json!({}), 30, offer_shop());
+    r.ln.st.lock().unwrap().offer_note_lie = true;
+    let v = r.pay("/page/10", 10);
+    assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{v}");
+    assert_eq!(r.audit("ticket_offer_passed")[0]["rule"], "ticket_offer_note");
+    assert_eq!((r.shop.standin.offer_counts(), r.ledger_sum()), ((1, 0), SETTLED), "fetched, never paid; the ticket by invoice");
+    // the owner says no: no offer is asked for anything, no lock by offer is made
+    let r = Rig::shipped(json!({"tickets": {"enabled": true, "offers": false, "tasks": {"film": {"budget_sats": 40_000}}}}), 30, offer_shop());
+    let v = r.pay("/page/10", 10);
+    assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{v}");
+    assert!(r.ln.st.lock().unwrap().fetched_notes.is_empty());
+    assert!(lock_bodies(&r).iter().all(|l| l.get("by").is_none()));
+    assert_eq!(r.ledger_sum(), SETTLED);
+}
+
+/// The owner's rules hold for a payment by offer as for one by invoice: a task's budget below a
+/// ticket pays nothing, whatever the offer gave; and a refusal by the book is not undone by the
+/// seller's invoice.
+#[test]
+fn a_payment_by_offer_is_held_to_the_owners_budgets() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({"tickets": {"enabled": true, "tasks": {"film": {"budget_sats": BOOKING - 1}}}}), 30, offer_shop());
+    let v = r.pay("/page/10", 10);
+    assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("ticket_task_budget")), "{v}");
+    assert_eq!(r.ln.st.lock().unwrap().fetched_notes.len(), 1, "an invoice was fetched, and not paid");
+    assert_eq!((r.ln.state().payments.len(), r.ledger_sum(), r.shop.standin.offer_counts()), (0, 0, (1, 0)));
+    assert!(lock_bodies(&r).iter().all(|l| l.get("count").is_none()), "the seller's invoice is not tried after the book refused");
+}
+
+/// Wins of the lottery are paid by the seller's offer, each with the note that names its draw:
+/// the seller counts each paid, and its BOLT 11 invoice is never paid.
+#[test]
+fn wins_are_paid_by_the_sellers_offer_and_each_once() {
+    let _g = env_lock();
+    let mut shop = draws_shop();
+    shop["offers"] = json!({"enabled": true});
+    let r = Rig::shipped(json!({}), 30, shop);
+    let size = 256 * PIECE;
+    let v = r.pay(&format!("/pieces/{size}"), 1_000);
+    assert_eq!((v["rail"].as_str(), v["status"].as_u64(), v["complete"].as_bool()), (Some("lottery"), Some(200), Some(true)), "{v}");
+    let wins = v["wins"].as_u64().unwrap();
+    assert!(wins >= 1, "{v}");
+    assert_eq!((v["wins_paid"].as_u64(), v["charged_sats"].as_i64()), (Some(wins), Some(wins as i64 * WIN_SETTLED)), "{v}");
+    // every win by the offer, none by its invoice
+    assert_eq!(r.shop.standin.offer_counts(), (wins as usize, wins as usize));
+    assert_eq!(r.shop.settled(), 0, "no win's BOLT 11 invoice was paid");
+    let notes = r.ln.st.lock().unwrap().fetched_notes.clone();
+    let mut draws: Vec<u64> = notes.iter().map(|n| match xbt402::offer::parse(n).unwrap().purpose {
+        xbt402::offer::Purpose::Win(d) => d,
+        other => panic!("{other:?}"),
+    }).collect();
+    draws.sort_unstable();
+    draws.dedup();
+    assert_eq!(draws.len() as u64, wins, "one note per win, each for its own draw");
+    r.tick();
+    assert_eq!((r.ln.paid_msat(), r.ledger_sum()), (wins * WIN, wins as i64 * WIN_SETTLED));
+    // the seller's own count: every win paid
+    let sid = v["session"].as_str().unwrap().to_string();
+    assert_eq!(win_tickets(&r, &sid).len() as u64, wins);
+    assert!(win_tickets(&r, &sid).iter().all(|t| t["state"] == "settled"));
 }

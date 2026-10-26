@@ -62,6 +62,8 @@ use crate::upstream::{decoded_path, forwarded, returned, Answer, Upstream};
 use crate::Error;
 
 mod draws;
+mod offers;
+pub use offers::JOURNAL as OFFERS_JOURNAL;
 
 /// A body no larger than this, on a route priced per request only, is read whole so that its
 /// receipt can carry its hash. Larger or metered bodies are streamed.
@@ -124,6 +126,9 @@ pub struct Gateway {
     settle_max_us: AtomicU64,
     /// The lottery's sessions, where the runner offers it (`docs/TICKETS.md`, section 9).
     lottery: Option<draws::Lottery>,
+    /// The node's BOLT 12 offer and what was paid to it, where the runner turned payment by offer
+    /// on (`docs/TICKETS.md`, section 15).
+    offers: Option<offers::Offers>,
 }
 
 /// Wall-clock seconds.
@@ -270,6 +275,9 @@ impl Gateway {
             Some(l) => Some(draws::Lottery::open(l, &cfg.state_dir, clock())?),
             None => None,
         };
+        // the node's offer, made (or found again) before anything is served: terms that name it are
+        // terms the node can be paid on
+        let offers = Self::make_offer(&*node, &cfg, clock())?;
         let upstream = Upstream::new(&cfg.upstream, cfg.times.upstream_wait);
         let gw = Arc::new(Self {
             terms,
@@ -291,6 +299,7 @@ impl Gateway {
             settled: AtomicU64::new(0),
             settle_max_us: AtomicU64::new(0),
             lottery,
+            offers,
             cfg,
         });
         for hash in unfinished {
@@ -337,6 +346,9 @@ impl Gateway {
         drop(st);
         if let Some(l) = &self.lottery {
             l.close();
+        }
+        if let Some(o) = &self.offers {
+            o.close();
         }
         self.credited.notify_all();
     }
@@ -500,6 +512,7 @@ impl Gateway {
             self.cancel_on_node(hash);
         }
         self.lottery_tick();
+        self.offer_tick();
         let file = {
             let mut st = self.lock();
             let marks = st.book.take_marks();
@@ -615,8 +628,12 @@ impl Gateway {
 
     /// Steps 2 and 3 of a paid request for one secret: find its ticket, settle it at once, credit it.
     fn take_secret(&self, session: &str, secret: &[u8; 32]) -> Result<Hash, Refusal> {
-        if self.lock().book.presented_kind(session, secret) == Ok(true) {
-            return self.take_prepaid(secret);
+        let kind = self.lock().book.presented_kind(session, secret);
+        match kind {
+            Ok(true) => return self.take_prepaid(secret),
+            // no ticket of the book: a prepaid ticket paid by offer, where the terms name one
+            Err(Refusal::TicketUnknown) if self.offers.is_some() => return self.take_offer_secret(session, secret),
+            _ => {}
         }
         let arrived = Instant::now();
         let height = self.known_height();
@@ -746,6 +763,10 @@ impl Gateway {
                     // offering hashes the lock would refuse
                     if *settle == SETTLE_ON_USE && self.cfg.caps.held_after_paid {
                         e["extra"]["heldAfterPaid"] = true.into();
+                    }
+                    // a prepaid ticket can be paid by the node's offer as well as by its invoice
+                    if let Some(o) = self.offer_text().filter(|_| *settle == SETTLE_ON_ARRIVAL) {
+                        e["extra"][xbt402::offer::EXTRA_OFFER] = o.into();
                     }
                     e
                 })
@@ -1018,6 +1039,18 @@ impl Gateway {
                 "this seller's terms do not offer tickets settled that way",
             );
         }
+        // a buyer that pays its prepaid tickets by the node's offer asks for no invoice: a first
+        // such lock makes the session and its key, a later one is answered with the offer
+        match body.get("by") {
+            None => {}
+            Some(Value::String(b)) if b == "offer" && prepaid && self.offers.is_some() => {
+                if body.contains_key("count") || body.contains_key("hashes") {
+                    return error(400, "bad_request", "a lock to pay by offer names no count and no hashes");
+                }
+                return self.lock_by_offer(req, pay.as_ref(), body.get("session"));
+            }
+            Some(_) => return error(400, "bad_request", "by is \"offer\", in a lock for tickets settled on arrival of a seller whose terms name an offer"),
+        }
         // for a ticket settled on arrival the buyer sends a count and the hashes are the seller's:
         // the preimage of each is made here, given to the node with the invoice, and not kept
         let most = self.cfg.caps.max_tickets as usize;
@@ -1287,7 +1320,7 @@ impl Gateway {
             &json!({"height": s.height, "sessions": s.sessions, "activeSessions": s.active_sessions, "heldTickets": s.held_tickets,
                     "maxHeld": s.max_held, "prepaidTickets": s.prepaid_tickets,
                     "heldMsat": (s.held_tickets as u64).saturating_mul(self.cfg.caps.ticket_msat).to_string(), "settled": s.settled, "settleMaxUs": s.settle_max_us,
-                    "lottery": self.lottery_health()}),
+                    "lottery": self.lottery_health(), "offer": self.offer_text()}),
         )
     }
 
