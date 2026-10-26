@@ -497,6 +497,14 @@ impl App {
         caps["sessions_per_address"] = json!(spa);
         caps["max_held_tickets"] = json!(mh);
         c.insert("caps".into(), caps);
+        // a buyer whose call cannot take a whole ticket may ask for a smaller one, down to the smallest a held
+        // ticket may be (546 sat), unless the owner set another floor
+        let mut tickets = c.get("tickets").cloned().filter(Value::is_object).unwrap_or(json!({}));
+        if tickets.get("min_ticket_msat").is_none() {
+            let size = tickets.get("ticket_msat").and_then(Value::as_u64).unwrap_or(1_000_000);
+            tickets["min_ticket_msat"] = json!(546_000u64.min(size));
+        }
+        c.insert("tickets".into(), tickets);
         if proxies.is_empty() {
             c.remove("http");
         } else {
