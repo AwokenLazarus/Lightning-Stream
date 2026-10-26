@@ -1,8 +1,9 @@
 //! A stand-in Nostr relay on loopback, in process: for the tests and for trying the service on one
 //! machine. It is not a relay to run for anyone: it keeps everything in memory, checks each event's
 //! id and signature, keeps the newest replaceable event (kinds 10000-19999) per author and kind,
-//! forwards ephemeral ones (20000-29999) to the subscriptions open at the time, and matches
-//! filters on `ids`, `authors`, `kinds`, `#p`, `#e`, `since` and `until`.
+//! the newest addressable one (30000-39999) per author, kind and `d`, forwards ephemeral ones
+//! (20000-29999) to the subscriptions open at the time, and matches filters on `ids`, `authors`,
+//! `kinds`, single-letter tags (`#p`, `#t`, ...), `since` and `until`, newest first up to `limit`.
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -44,9 +45,10 @@ fn matches(f: &Value, ev: &Event) -> bool {
     if f.get("kinds").and_then(Value::as_array).is_some_and(|k| !k.iter().any(|x| x.as_u64() == Some(ev.kind))) {
         return false;
     }
-    for t in ["p", "e"] {
-        if let Some(l) = list(&format!("#{t}")) {
-            if !ev.tags.iter().any(|tg| tg.first().map(String::as_str) == Some(t) && tg.get(1).is_some_and(|v| l.contains(v))) {
+    let tag_filters = f.as_object().into_iter().flatten().filter_map(|(k, _)| k.strip_prefix('#').filter(|t| t.len() == 1).map(|t| (t.to_string(), k.clone())));
+    for (t, key) in tag_filters {
+        if let Some(l) = list(&key) {
+            if !ev.tags.iter().any(|tg| tg.first() == Some(&t) && tg.get(1).is_some_and(|v| l.contains(v))) {
                 return false;
             }
         }
@@ -147,6 +149,14 @@ fn serve(mut ws: WebSocket, st: Arc<Mutex<State>>, stop: Arc<AtomicBool>, log: A
                 if (10_000..20_000).contains(&ev.kind) {
                     s.stored.retain(|x| !(x.kind == ev.kind && x.pubkey == ev.pubkey));
                     s.stored.push(ev.clone());
+                } else if (30_000..40_000).contains(&ev.kind) {
+                    // addressable: the newest per author, kind and `d`; on a tie the lowest id (NIP-01)
+                    let d = ev.tag("d").unwrap_or("").to_string();
+                    let newer = !s.stored.iter().any(|x| x.kind == ev.kind && x.pubkey == ev.pubkey && x.tag("d").unwrap_or("") == d && (x.created_at, &ev.id) > (ev.created_at, &x.id));
+                    if newer {
+                        s.stored.retain(|x| !(x.kind == ev.kind && x.pubkey == ev.pubkey && x.tag("d").unwrap_or("") == d));
+                        s.stored.push(ev.clone());
+                    }
                 } else if !(20_000..30_000).contains(&ev.kind) {
                     s.stored.push(ev.clone());
                 }
@@ -163,8 +173,10 @@ fn serve(mut ws: WebSocket, st: Arc<Mutex<State>>, stop: Arc<AtomicBool>, log: A
                 let filters: Vec<Value> = a[2..].to_vec();
                 let mut s = st.lock().unwrap();
                 s.subs.retain(|x| !(x.client == me && x.id == id));
-                let old: Vec<String> = s.stored.iter().filter(|ev| filters.iter().any(|f| matches(f, ev)))
-                    .map(|ev| json!(["EVENT", id, ev.to_value()]).to_string()).collect();
+                let limit = filters.iter().filter_map(|f| f.get("limit").and_then(Value::as_u64)).max().map_or(usize::MAX, |l| l as usize);
+                let mut old: Vec<&Event> = s.stored.iter().filter(|ev| filters.iter().any(|f| matches(f, ev))).collect();
+                old.sort_by_key(|e| std::cmp::Reverse(e.created_at));
+                let old: Vec<String> = old.into_iter().take(limit).map(|ev| json!(["EVENT", id, ev.to_value()]).to_string()).collect();
                 s.subs.push(Sub { client: me, id: id.clone(), filters });
                 drop(s);
                 for m in old {
