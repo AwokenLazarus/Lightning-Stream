@@ -24,7 +24,7 @@ const TAG_1: &str = "xbt402/listing/1";
 const MAX_SERVICES: usize = 32;
 
 const KINDS: [&str; 4] = ["video", "files", "api", "ai"];
-const PRICE_KEYS: [&str; 4] = ["request_msat", "byte_msat", "per_bytes", "second_msat"];
+const PRICE_KEYS: [&str; 6] = ["request_msat", "byte_msat", "per_bytes", "second_msat", "per_1k_input_msat", "per_1k_output_msat"];
 /// A fetched document larger than this is refused before it is parsed.
 const MAX_BODY: usize = 256 << 10;
 

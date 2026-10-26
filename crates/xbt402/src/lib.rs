@@ -15,6 +15,7 @@
 //! * [`macaroon`]: a Lightning node's macaroon, read (shared with `xbt-signer`'s Lightning rail).
 //! * [`json`]: JSON written as the Python references write it, and integers above 2^64.
 //! * [`listing`]: a seller's signed catalog (`docs/LISTINGS.md`).
+//! * [`tokens`]: pricing an OpenAI-compatible service by the token: the request bounded, the answer counted.
 //!
 //! The crate began as the Rust port of the on-chain one-way channel (the x402 `batch-settlement`
 //! scheme on XBT: funding, signed states, close, rollover, refund). That channel was frozen on
@@ -35,6 +36,7 @@ pub mod offer;
 pub mod provider;
 pub mod scheme;
 pub mod ticket;
+pub mod tokens;
 pub mod wire;
 #[cfg(feature = "rpc")]
 pub mod rpc;
