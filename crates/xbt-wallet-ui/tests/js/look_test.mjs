@@ -47,7 +47,7 @@ const set = (sel, v) => ev(`(function(){var e=document.querySelector(${JSON.stri
 async function scheme(s) { await cdp("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: s }] }); }
 async function size(width, height) { await cdp("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile: width < 600 }); }
 async function sweep(x0, y0) {
-  // the pointer drifts across the middle of the screen, so a shot shows the bend and an arc
+  // the pointer drifts across the middle of the screen, so a shot shows the bend and the glow
   for (let i = 0; i < 14; i++) { await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: x0 + i * 9, y: y0 + Math.sin(i / 2) * 20 }); await sleep(35); }
 }
 const shots = [];
@@ -97,6 +97,47 @@ try {
   // the phone's menu, opened
   await scheme("light"); await size(390, 844); await go(BASE + "/browse"); await ev("document.querySelector('.menu-toggle').click()"); await sleep(200);
   { const png = await cdp("Page.captureScreenshot", { format: "png" }); const f = join(OUT, "menu-phone-light.png"); writeFileSync(f, Buffer.from(png.data, "base64")); shots.push(f); }
+  // no flash between pages: shots as fast as Chrome gives them while moving from one page to the
+  // next, each compared with the steady page by how much river shows in the left margin (below the
+  // bar, beside the content). A blank or reset canvas shows as a frame with little river in it.
+  {
+    await scheme("dark"); await size(1280, 900); await go(BASE + "/browse"); await sleep(1500);
+    const grab = async () => (await cdp("Page.captureScreenshot", { format: "png", clip: { x: 0, y: 90, width: 110, height: 780, scale: 1 } })).data;
+    const steady = [await grab()];
+    const early = [];
+    await ev("setTimeout(function(){Array.from(document.querySelectorAll('header nav a')).filter(function(a){return !a.getAttribute('aria-current')})[1].click()},0)");
+    const t0 = Date.now(); while (Date.now() - t0 < 900) early.push(await grab());
+    await loaded(); await sleep(1500); steady.push(await grab());
+    await cdp("Page.navigate", { url: "data:text/html,<canvas id=c></canvas>" }); await sleep(300);
+    const counts = await ev(`(async function(){
+      var c=document.getElementById('c'),x=c.getContext('2d'),out=[];
+      for (const d of ${JSON.stringify([...steady, ...early])}) {
+        var im=new Image(); im.src='data:image/png;base64,'+d; await im.decode();
+        c.width=im.width;c.height=im.height;x.drawImage(im,0,0);var p=x.getImageData(0,0,c.width,c.height).data,n=0;
+        for(var i=0;i<p.length;i+=4){if(0.2126*p[i]+0.7152*p[i+1]+0.0722*p[i+2]>34)n++}
+        out.push(n);
+      }
+      return out;
+    })()`);
+    const base = Math.min(counts[0], counts[1]), seen = counts.slice(2);
+    result.flicker = { steady_river_px: [counts[0], counts[1]], frames: seen.length, min_ratio: +(Math.min(...seen) / Math.max(1, base)).toFixed(3), counts: seen };
+  }
+
+  // the bar stays on top: after scrolling, the point in the middle of the bar is the bar's, on a
+  // desktop and on a phone with the menu open
+  {
+    result.header = {};
+    for (const [name, w, h, menu] of [["desktop", 1280, 600, false], ["phone-menu", 390, 700, true]]) {
+      await scheme("dark"); await size(w, h); await go(BASE + "/policy");
+      if (menu) { await ev("document.querySelector('.menu-toggle').click()"); await sleep(150); }
+      await ev("window.scrollTo(0, 400)"); await sleep(400);
+      const r = await ev(`(function(){var hd=document.querySelector('header'),b=hd.getBoundingClientRect(),pts=[[b.left+b.width/2,b.top+b.height/2],[b.left+20,b.top+8],[b.right-20,b.bottom-6]];
+        return {scrolled:window.scrollY,top:b.top,bar:pts.every(function(p){var e=document.elementFromPoint(p[0],p[1]);return !!e&&hd.contains(e)}),shadow:hd.classList.contains('scrolled')}})()`);
+      const png = await cdp("Page.captureScreenshot", { format: "png" }); const f = join(OUT, `scrolled-${name}-dark.png`); writeFileSync(f, Buffer.from(png.data, "base64")); shots.push(f);
+      result.header[name] = r;
+    }
+  }
+
   // the seller's side
   await scheme("dark"); await go(GW + "/");
   await set("[name=code]", GWCODE); await set("[name=password]", "look box password"); await set("[name=password2]", "look box password");

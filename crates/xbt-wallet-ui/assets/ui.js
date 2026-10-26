@@ -403,6 +403,11 @@
   if (doc && doc.documentElement) {
     doc.documentElement.classList.add("js");
     var toggle = $(".menu-toggle"), header = $("header");
+    // the bar casts a shadow once the page has scrolled under it
+    if (header) {
+      var edge = function () { header.classList.toggle("scrolled", (root.scrollY || 0) > 4); };
+      root.addEventListener("scroll", edge, { passive: true }); edge();
+    }
     if (toggle && header) {
       toggle.addEventListener("click", function () {
         var open = header.classList.toggle("open");

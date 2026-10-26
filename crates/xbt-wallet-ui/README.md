@@ -177,9 +177,12 @@ numbered first-run steps. Everything is local: no web fonts, nothing from anothe
 stays `default-src 'none'; script-src 'self'; style-src 'self'`.
 
 Behind every page, `assets/river.js` draws a few slow streams on a fixed canvas (`aria-hidden`, no
-pointer events). The pointer bends the streams near it, and near two of them a short arc joins them,
-like a channel opening; `lsRiver.pulse()` sends a pulse down a stream, for payment and stream
-events. It is decoration only: it reads nothing and sends nothing. To stay out of the way:
+pointer events). Near the pointer the streams brighten a little and ease aside in one smooth bump,
+and a soft glow trails the pointer; a click sends one pulse along the nearest stream from where it
+was clicked; `lsRiver.pulse()` sends one down a whole stream, for payment and stream events. Every
+effect is drawn along the streams' own curve (`tests/js/river_test.mjs` checks that each of its
+points lies on a stream). It is decoration only: it reads nothing and sends nothing. To stay out of
+the way:
 
 - it draws in a worker on an `OffscreenCanvas` where the browser has one, so the page's thread only
   forwards pointer positions; elsewhere it draws in the page with the same code;
@@ -187,24 +190,33 @@ events. It is decoration only: it reads nothing and sends nothing. To stay out o
   every display refresh), none while the tab is hidden or a video plays;
 - half resolution (at most 0.75 backing pixels per CSS pixel; the glow hides it), the stream count
   scaled to the window, one still frame when the system asks for reduced motion;
-- 7.7 kB as served (the source without indentation and comment lines).
+- no flash between pages: the streams' shape is a function of the clock, so every page shows the
+  same frame at the same moment; the page draws that first frame itself before it shows (the worker's
+  first frame then replaces it), and the browser cross-fades same-origin pages (`@view-transition`);
+- 8.7 kB as served (the source without indentation and comment lines).
+
+The bar at the top is sticky and above the page: the page scrolls under it, and it casts a shadow
+once it has.
 
 **Cost** (Chrome 152 headless, software rendering with no GPU, which is the dearest case; AMD Ryzen 9
-9950X3D; 1920x1080, dark, the Browse page; CPU of all the browser's processes as % of one core;
-two rounds of 30 s each, alternating with and without the river, averaged; 2026-10-26):
+9950X3D, load average about 6 from other work; 1920x1080, dark, the Browse page; CPU of all the
+browser's processes as % of one core; two rounds of 30 s each, alternating with and without the
+river, averaged; 2026-10-26):
 
 | | pointer still | pointer moving |
 |---|---|---|
-| without the river | 0.42% | 4.62% |
-| with the river (worker) | 3.27% (+2.85) | 17.05% (+12.43) |
-| with the river (in the page, the fallback) | 5.10% (+4.68) | 16.70% (+12.08) |
-| page thread busy, without / with (worker) | 0.07% / 0.08% | 0.67% / 0.92% |
+| without the river | 1.57% | 2.95% |
+| with the river (worker) | 3.25% (+1.68) | 7.23% (+4.28) |
+| with the river (in the page, the fallback) | 4.03% (+2.46) | 16.97% (+14.02) |
+| page thread busy, without / with (worker) | 0.04% / 0.04% | 0.45% / 0.66% |
 
-A frame of the river takes 0.12 ms on average and at most 3 ms, in the worker, never on the page's
-thread. A browser with a GPU composites the canvas there, so the cost on a normal desktop or phone
-is lower than this. **Contrast:** averaged over 8x8 px (a letter's size) at the brightest point the
-river and the glow reach, body text is 11.3:1 (dark) and 12.2:1 (light), secondary text 6.5:1 and
-5.7:1; on a card, body text is 15.5:1 and 14.6:1.
+A frame of the river takes 0.14 ms on average and at most 0.9 ms, in the worker, never on the
+page's thread (the first frame of each page is drawn on the page's thread, once). A browser with a
+GPU composites the canvas there, so the cost on a normal desktop or phone is lower than this.
+**Contrast:** averaged over 8x8 px (a letter's size) at the brightest point the river and the glow
+reach, body text is 10.4:1 (dark) and 11.5:1 (light), secondary text 5.9:1 and 5.4:1; on a card,
+body text is 15.5:1 and 14.6:1. **Between pages:** 17 shots taken as fast as Chrome gives them while
+moving from Browse to another page each show at least as much river as the steady page (ratio 1.0).
 
 Repro (writes the screenshots, `look.json` and the numbers above; about 6 minutes):
 
@@ -213,8 +225,10 @@ XBT_UI_LOOK=1 XBT_UI_LOOK_DIR=run/look cargo test -p xbt-wallet-ui --test look -
 ```
 
 The test fails if the river at rest costs 3% of one core or more over the page without it, if a
-frame takes more than 4 ms, or if body text falls under 7:1 or secondary text under 4.5:1 anywhere
-over the river.
+frame takes more than 4 ms, if body text falls under 7:1 or secondary text under 4.5:1 anywhere
+over the river, if a shot taken while moving between pages shows less than half the river of a
+steady page, or if, after scrolling (on a desktop, and on a phone with the menu open), the bar is
+not the top-most thing at its own middle and corners.
 
 ## Tests
 
