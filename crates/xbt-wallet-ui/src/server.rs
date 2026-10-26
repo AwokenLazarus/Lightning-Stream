@@ -145,8 +145,9 @@ impl xbt_svc::http::Handler for Ui {
         xbt_svc::http::Response::new(resp.status, resp.headers, resp.body)
     }
 
-    /// A paid video for the player: `GET /s/<seller URL>`, past the same checks as every page, relayed
-    /// from the connector as it streams. Everything else is [`Self::handle`].
+    /// A paid video: `GET /s/<seller URL>` for the page's player, past the same checks as every
+    /// page, or `GET /r/<token>` for an external player's link ([`crate::relay`]), relayed from the
+    /// connector as it streams, with the player's `Range`. Everything else is [`Self::handle`].
     fn reply(&self, rq: xbt_svc::http::Request) -> xbt_svc::http::Reply {
         let peer = rq.peer.map(|a| a.ip().to_string()).unwrap_or_default();
         let (raw_path, q) = rq.target.split_once('?').unwrap_or((&rq.target, ""));
@@ -158,24 +159,38 @@ impl xbt_svc::http::Handler for Ui {
                 security_headers(&mut resp);
                 xbt_svc::http::Reply::Whole(xbt_svc::http::Response::new(resp.status, resp.headers, resp.body))
             }
-            Some(Ok(())) => {
-                // the seller URL is everything after /s/, its own query included
-                let item = rq.target.split_once("/s/").map(|(_, u)| u).unwrap_or("");
-                relay(&self.0.cfg.connector, item)
+            Some(Ok(item)) => {
+                // for /s/, the seller URL is everything after /s/, its own query included
+                let item = item.unwrap_or_else(|| rq.target.split_once("/s/").map(|(_, u)| u.to_string()).unwrap_or_default());
+                relay(&self.0.cfg.connector, &item, req.headers.get("range").map(String::as_str))
             }
         }
     }
 }
 
-/// Stream the connector's answer for `item` (a seller URL) to the player.
-fn relay(connector: &str, item: &str) -> xbt_svc::http::Reply {
+/// The headers of a relayed answer that are passed on from the connector.
+const RELAYED: [&str; 3] = ["Content-Type", "Content-Range", "Accept-Ranges"];
+
+/// Stream the connector's answer for `item` (a seller URL) to the player, with the player's
+/// `Range` (the connector takes one plain byte range and ignores any other), and the connector's
+/// status, `Content-Range`, `Accept-Ranges` and `Content-Length` back.
+fn relay(connector: &str, item: &str, range: Option<&str>) -> xbt_svc::http::Reply {
     let url = format!("{}/s/{item}", connector.trim_end_matches('/'));
     let agent = ureq::AgentBuilder::new().timeout_connect(std::time::Duration::from_secs(5)).build();
-    let resp = match agent.get(&url).call() {
+    let mut rq = agent.get(&url);
+    if let Some(r) = range.map(str::trim).filter(|r| r.len() <= 128 && r.bytes().all(|b| b.is_ascii_graphic() || b == b' ')) {
+        rq = rq.set("Range", r);
+    }
+    let passed = |r: &ureq::Response| -> Vec<(String, String)> {
+        RELAYED.iter().filter_map(|k| r.header(k).map(|v| (k.to_string(), v.to_string()))).collect()
+    };
+    let resp = match rq.call() {
         Ok(r) => r,
         Err(ureq::Error::Status(code, r)) => {
+            let headers = passed(&r).into_iter().filter(|(k, _)| k != "Content-Type").collect::<Vec<_>>();
             let body = r.into_string().unwrap_or_default().into_bytes();
             let mut whole = Resp::text(code, "application/json", body);
+            whole.headers.extend(headers);
             security_headers(&mut whole);
             return xbt_svc::http::Reply::Whole(xbt_svc::http::Response::new(whole.status, whole.headers, whole.body));
         }
@@ -185,12 +200,19 @@ fn relay(connector: &str, item: &str) -> xbt_svc::http::Reply {
             return xbt_svc::http::Reply::Whole(xbt_svc::http::Response::new(whole.status, whole.headers, whole.body));
         }
     };
-    let ctype = resp.header("Content-Type").unwrap_or("application/octet-stream").to_string();
+    let status = resp.status();
+    let mut headers = passed(&resp);
+    if !headers.iter().any(|(k, _)| k == "Content-Type") {
+        headers.push(("Content-Type".into(), "application/octet-stream".into()));
+    }
+    headers.extend([("Cache-Control".to_string(), "no-store".to_string()), ("X-Content-Type-Options".into(), "nosniff".into()),
+                    ("Cross-Origin-Resource-Policy".into(), "same-origin".into())]);
+    let length = resp.header("Content-Length").and_then(|n| n.parse::<u64>().ok());
     let mut src = resp.into_reader();
     xbt_svc::http::Reply::Stream(xbt_svc::http::Streamed {
-        status: 200,
-        headers: vec![("Content-Type".into(), ctype), ("Cache-Control".into(), "no-store".into()), ("X-Content-Type-Options".into(), "nosniff".into())],
-        length: None,
+        status,
+        headers,
+        length,
         body: Box::new(move |out: &mut dyn xbt_svc::http::BodyWriter| {
             let mut buf = vec![0u8; 64 << 10];
             loop {
