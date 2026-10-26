@@ -189,7 +189,8 @@ def main() -> int:
         for d in m["dependencies"] or []:
             if d in SLOTS:
                 if not any(d in (am.get("implements") or []) for _, am in apps.values()):
-                    bad(f"{folder}: no app in this store implements the slot {d} (the fallback node)")
+                    # a store with this app alone: the owner installs the slot's node from another store
+                    warnings.append(f"{folder}: no app in this store implements the slot {d}: the owner installs it from another store")
             elif d not in apps and d not in OTHER_STORES:
                 bad(f"{folder}: dependency {d} is not in this store")
         for i in m.get("implements") or []:
@@ -230,6 +231,11 @@ def main() -> int:
         for v in sorted(set(re.findall(r"\$\{?([A-Z0-9_]+)", text_nc)) & set(slot)):
             if not re.search(r"\$\{" + v + r":-\$\{[A-Z0-9_]+\}\}", text_nc) or re.search(r"\$\{?" + v + r"(?!:-\$\{)\b", text_nc):
                 bad(f"{folder}: ${{{v}}} (slot) must be used as ${{{v}:-${{FALLBACK}}}}")
+        # with no app of this store filling a slot, its fallbacks are unset and take their defaults: the
+        # slot's own values (checked below) are what reach the services
+        if slot and not providers:
+            used -= {fb for _, fb in re.findall(r"\$\{([A-Z0-9_]+):-\$\{([A-Z0-9_]+)\}\}", text_nc)}
+            used -= set(re.findall(r"\$\{([A-Z0-9_]+):-\}", text_nc))
         for v in sorted(used - UMBREL_VARS - set(own) - set(dep)):
             bad(f"{folder}: ${{{v}}} is not set by umbrelOS, this app's exports or a dependency's")
         if "APP_PASSWORD" in used and not m.get("deterministicPassword"):
