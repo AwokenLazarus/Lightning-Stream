@@ -86,23 +86,22 @@ The images the wallet and gateway packages run are published on GitHub's contain
 `awokenlazarus` account, for linux/amd64, linux/arm64 and linux/arm/v7:
 
     ghcr.io/awokenlazarus/<image>:<version>-<commit>@sha256:<index digest>
-    <image>: xbt-init, xbt-signer, xbt-anchor-witness, xbt-wallet-mcp, xbt-wallet-ui, xbt-gateway
+    <image>: xbt-init, xbt-signer, xbt-anchor-witness, xbt-wallet-mcp, xbt-wallet-ui, xbt-gateway,
+             lightning-stream, xbt-hashlink
 
 `packaging/images.lock` lists them, one line per image. The tag names the workspace version and the commit
-the images were built from (`0.1.0-cc28002e474e`: commit cc28002e474e of this repository); a tag is never
+the images were built from (`0.1.0-686f46b4060a`: commit 686f46b4060a of this repository); a tag is never
 moved or reused, and there is no `latest`. The packages name each image by tag *and* digest, so Docker and
 start-cli use the digest and the tag is only a label for people. `packaging/pin_images.py` writes the lock's
 references into the Umbrel compose files and the StartOS specs (`startos/spec.ts`); `umbrel/lint.py` and
 `startos/build.sh` refuse a package that does not match the lock. The one image of the store that is not
 published is the stand-in XBT node's, `xbt-a3-knots:29.4.2` (amd64-only), which a box with Paul's Knots
-BLAKE2b Companion never installs. `lightning-stream` is built by `scripts/oci_build.sh` and is in
-`scripts/oci_publish.sh`'s list, and it has no lock line until that publish runs. The Lightning Stream
-app names `lightning-stream:0.1.0` until then. No digest is invented for it.
+BLAKE2b Companion never installs.
 
 Check what a reference serves, without pulling it:
 
 ```bash
-docker buildx imagetools inspect ghcr.io/awokenlazarus/xbt-signer:0.1.0-cc28002e474e
+docker buildx imagetools inspect ghcr.io/awokenlazarus/xbt-signer:0.1.0-686f46b4060a
 ```
 
 `Digest:` is the index digest, which must equal the one in `images.lock`, and the manifest list names the

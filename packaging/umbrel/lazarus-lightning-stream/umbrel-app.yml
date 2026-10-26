@@ -28,8 +28,8 @@ description: >-
 
 
   The keys stay in the signer, sealed on this box's disk. A separate anchor witness keeps a tamper
-  record of every signature. On mainnet this software moves real funds and has run on regtest only:
-  the Lightning page asks you to acknowledge that before it stores a macaroon.
+  record of every signature. On mainnet this software moves real funds and has been tested there with small
+  amounts only: the app asks you to acknowledge that before it pays with real money.
 
 
   Uninstalling removes the app's files, but the keys it made stay valid on your Lightning node
