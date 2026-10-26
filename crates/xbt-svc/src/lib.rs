@@ -84,6 +84,9 @@ pub const RUN_UI: &str = "ui";
 pub const RUN_LN: &str = "ln";
 /// The gateway's config and macaroons, written by the UI's gateway page, read by the gateway.
 pub const RUN_GATEWAY: &str = "gateway";
+/// A copy of the signer's one-time enrolment code for the UI's setup page (`B2_ENROLL_CODE_COPY`):
+/// the signer writes it, the UI reads it by group, the MCP is in neither the group nor the mount.
+pub const RUN_ENROLL: &str = "enroll";
 /// The MCP bearer token's name, in `run/ui/` on a box (AGP-042) or `mcp/secrets/` without a UI.
 pub const MCP_TOKEN: &str = "mcp-http-token";
 
