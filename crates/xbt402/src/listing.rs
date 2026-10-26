@@ -130,8 +130,16 @@ fn whole(v: &Value) -> Option<u64> {
 /// The config's `listing` object: no `seller`, no `receipt_key`, no `sig`. With `services` it is a
 /// `listing/1` draft, else a `listing/0` one.
 pub fn parse_draft(v: &Value) -> Result<Draft, String> {
+    parse_draft_as(v, false)
+}
+
+/// `parse_draft`, as a reader of a signed document takes it: with `skip_unknown`, a `listing/1`
+/// service of a kind this code does not know is left out and the rest is kept, so a seller that
+/// adds a newer kind of service stays readable by older apps. A `listing/0` has one service only,
+/// so its `kind` stays strict: with it unknown there is nothing left to read.
+fn parse_draft_as(v: &Value, skip_unknown: bool) -> Result<Draft, String> {
     if v.get("services").is_some() {
-        return parse_draft_1(v);
+        return parse_draft_1(v, skip_unknown);
     }
     let m = obj(v, "listing", &["name", "kind", "prices", "items", "licence", "credits", "updated"])?;
     let name = req_str(m, "name")?;
@@ -202,7 +210,7 @@ fn parse_section(v: &Value, n: usize) -> Result<Section, String> {
                  licence: opt_text(m, "licence")?, credits: opt_text(m, "credits")? })
 }
 
-fn parse_draft_1(v: &Value) -> Result<Draft, String> {
+fn parse_draft_1(v: &Value, skip_unknown: bool) -> Result<Draft, String> {
     let m = obj(v, "listing", &["name", "services", "licence", "credits", "updated"])?;
     let name = req_str(m, "name")?;
     if name.chars().count() > 200 {
@@ -214,6 +222,9 @@ fn parse_draft_1(v: &Value) -> Result<Draft, String> {
     }
     let mut services: Vec<Section> = Vec::with_capacity(list.len());
     for (i, s) in list.iter().enumerate() {
+        if skip_unknown && s.get("kind").and_then(Value::as_str).is_some_and(|k| !KINDS.contains(&k)) {
+            continue;
+        }
         let sec = parse_section(s, i + 1)?;
         if services.iter().any(|o| o.path == sec.path) {
             return Err(format!("service {}: path {} is named twice", i + 1, sec.path));
@@ -224,7 +235,7 @@ fn parse_draft_1(v: &Value) -> Result<Draft, String> {
     if updated.chars().count() > 64 {
         return Err("updated is at most 64 characters".into());
     }
-    let first = services[0].clone();
+    let first = services.first().cloned().ok_or("the listing has no service of a kind this app knows")?;
     Ok(Draft { name: name.to_string(), kind: first.kind, prices: first.prices, items: first.items, licence: opt_text(m, "licence")?,
                credits: opt_text(m, "credits")?, updated: updated.to_string(), services })
 }
@@ -384,7 +395,7 @@ fn read_signed(m: &Map<String, Value>) -> Result<Listing, String> {
     }
     let seller = m.get("seller").and_then(Value::as_str).filter(|s| http_url(s)).ok_or("seller is an http(s) URL")?;
     let receipt_key = m.get("receipt_key").and_then(Value::as_str).filter(|s| s.len() == 66 && s.chars().all(|c| c.is_ascii_hexdigit())).ok_or("receipt_key is 33 bytes of hex")?;
-    let draft = parse_draft(&Value::Object(strip_serve(m)))?;
+    let draft = parse_draft_as(&Value::Object(strip_serve(m)), true)?;
     if (version == VERSION_1) == draft.services.is_empty() {
         return Err("the version does not match the document's shape".into());
     }
@@ -623,6 +634,37 @@ mod tests {
         let got = verify(&sign(&sk, &document(&d, "https://seller.example", &pk)), &pk).unwrap();
         assert_eq!(got.services.iter().map(|s| (s.kind.as_str(), s.path.as_str())).collect::<Vec<_>>(), [("ai", "/ai/"), ("hashrate", "/hashrate/")]);
         assert_eq!(got.services[1].prices["request_msat"], "40000");
+    }
+
+    #[test]
+    fn a_reader_skips_a_service_of_a_kind_it_does_not_know_and_keeps_the_rest() {
+        let (sk, pk) = key();
+        let d = parse_draft(&json!({"name": "One box", "updated": "2026-10-26", "services": [
+            {"name": "Local model", "kind": "ai", "path": "/ai/", "prices": {"per_1k_output_msat": 10000}, "items": []},
+        ]}))
+        .unwrap();
+        // a newer seller's service: a kind, and a key, this code does not know
+        let mut doc = document(&d, "https://seller.example", &pk);
+        doc["services"].as_array_mut().unwrap().insert(0, json!({"name": "Later", "kind": "future-kind", "path": "/later/", "prices": {}, "items": [], "extra": 1}));
+        let doc = sign(&sk, &doc);
+        let got = verify(&doc, &pk).unwrap();
+        assert_eq!(got.services.iter().map(|s| (s.kind.as_str(), s.path.as_str())).collect::<Vec<_>>(), [("ai", "/ai/")]);
+        assert_eq!(got.kind, "ai", "the first service read stands for the listing");
+        // the skipped service is still signed: changed, the signature no longer holds
+        let mut tampered = doc.clone();
+        tampered["services"][0]["path"] = json!("/other/");
+        assert!(verify(&tampered, &pk).is_err());
+        // a service of a known kind is still checked whole
+        let mut bad = document(&d, "https://seller.example", &pk);
+        bad["services"][0]["extra"] = json!(1);
+        assert!(verify(&sign(&sk, &bad), &pk).is_err());
+        // nothing this code knows: not a listing it can use
+        let mut none = document(&d, "https://seller.example", &pk);
+        none["services"][0]["kind"] = json!("future-kind");
+        assert!(verify(&sign(&sk, &none), &pk).unwrap_err().contains("no service of a kind this app knows"));
+        // a seller's own config stays strict: it may only publish kinds this code knows
+        assert!(parse_draft(&json!({"name": "One box", "updated": "2026-10-26", "services": [
+            {"name": "Later", "kind": "future-kind", "path": "/later/", "prices": {}, "items": []}]})).is_err());
     }
 
     #[test]

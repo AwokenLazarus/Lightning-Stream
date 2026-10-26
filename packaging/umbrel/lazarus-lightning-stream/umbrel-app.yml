@@ -2,7 +2,7 @@ manifestVersion: 1.1
 id: lazarus-lightning-stream
 category: lightning
 name: Lightning Stream
-version: "0.1.9"
+version: "0.1.10"
 tagline: Buy and sell any service over Lightning from this box, paid as you use it
 description: >-
   One app for both sides. The wallet pays sellers with stream tickets under a policy you sign, and
@@ -46,6 +46,10 @@ gallery:
   - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/4.png
   - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/5.png
 releaseNotes: >-
+  0.1.10: a spending limit is now a hard cap, routing fees included: when the next ticket would go
+  over it, nothing more is paid. Buyers can ask for smaller tickets (down to 546 sats) to fit their
+  limit, and your shop sells them. Listings keep working when sellers add new kinds of service: an
+  app shows the services it knows and leaves out the rest.
   0.1.9: an update's changes to what your shop lists take effect when the app starts, without
   pressing Save on Sell.
   0.1.8: hashrate is listed beside your other services when you rent out your miners, and Browse has

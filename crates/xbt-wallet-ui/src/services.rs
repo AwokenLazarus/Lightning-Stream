@@ -237,7 +237,10 @@ pub fn parse(text: &str) -> Result<Vec<Service>, String> {
     if list.len() > MAX_SERVICES {
         return Err(format!("services file has more than {MAX_SERVICES} services"));
     }
-    list.iter().enumerate().map(|(i, s)| parse_service(s, i + 1)).collect()
+    // a service of a kind this app does not know (written by a newer app) is left out, not an error
+    list.iter().enumerate()
+        .filter(|(_, s)| !s.get("kind").and_then(Value::as_str).is_some_and(|k| Kind::parse(&json!(k)).is_err()))
+        .map(|(i, s)| parse_service(s, i + 1)).collect()
 }
 
 /// Read and parse the services file. The file is read on each page, so an edit is picked up
@@ -326,14 +329,8 @@ fn work_price_words(prices: &Value) -> String {
 /// under its own name; with several, each as `seller name: service name`.
 pub fn from_listing(l: &xbt402::listing::Listing) -> Vec<Service> {
     let several = l.services.len() > 1;
-    l.services.iter().map(|s| {
-        let kind = match s.kind.as_str() {
-            "video" => Kind::Video,
-            "files" => Kind::Files,
-            "ai" => Kind::Ai,
-            "hashrate" => Kind::Hashrate,
-            _ => Kind::Api,
-        };
+    // a kind this app does not know is left out: shown as something else, it would be bought wrongly
+    l.services.iter().filter_map(|s| Kind::parse(&json!(s.kind)).ok().map(|kind| (s, kind))).map(|(s, kind)| {
         let path = if s.path.is_empty() || s.path == "/" { String::new() } else { s.path.clone() };
         let credit = if s.credits.is_empty() { l.credits.clone() } else { s.credits.clone() };
         let name = if several { format!("{}: {}", l.name, s.name) } else { l.name.clone() };
@@ -527,7 +524,11 @@ mod tests {
         assert!(parse(r#"{"name": "x"}"#).is_err());
         assert!(parse(r#"[{"name": "x", "kind": "video", "seller": "https://a.example", "price_text": "1", "items": [
             {"title": "t", "year": 1, "url": "javascript:alert(1)", "credit": "c"}]}]"#).is_err());
-        assert!(parse(r#"[{"name": "x", "kind": "other", "seller": "https://a.example", "price_text": "1", "items": []}]"#).is_err());
+        // a kind a newer app wrote is left out; the services this app knows are still read
+        let mixed = parse(r#"[{"name": "x", "kind": "other", "seller": "https://a.example", "price_text": "1", "items": []},
+                             {"name": "y", "kind": "ai", "seller": "https://a.example", "price_text": "1", "items": []}]"#).unwrap();
+        assert_eq!(mixed.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["y"]);
+        assert!(parse(r#"[{"name": "x", "kind": 7, "seller": "https://a.example", "price_text": "1", "items": []}]"#).is_err());
         assert!(parse(r#"[{"name": "<b>", "kind": "video", "seller": "https://a.example", "price_text": "1 sat", "items": []}]"#).is_ok());
     }
 }

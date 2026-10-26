@@ -28,7 +28,7 @@ JSON. `version` is `listing/0`. The fields are closed: an unknown key is not thi
 | Field | What it is |
 | --- | --- |
 | `name` | The seller's name, as it writes it. |
-| `kind` | `video`, `files`, `api` or `ai` (a model asked over HTTP, such as a local language model). |
+| `kind` | `video`, `files`, `api`, `ai` (a model asked over HTTP, such as a local language model) or `hashrate` (pieces of mining work, rented as in [P2P-HASH.md](P2P-HASH.md)). |
 | `seller` | The seller's public origin, `http` or `https`, with no path. |
 | `receipt_key` | The receipt key, hex of the 33-byte compressed public key. |
 | `prices` | What a request costs, in millisatoshi, as decimal strings: `request_msat`, `byte_msat`, `per_bytes`, `second_msat`, and for a model priced by the token `per_1k_input_msat` and `per_1k_output_msat` (per 1,000 tokens; shown as "10 sat per 1,000 tokens", or "2 sat per 1,000 tokens in, 10 sat per 1,000 tokens out" when input is priced too). At least one. `per_bytes` is at least 1. A reader older than the token prices refuses a listing that names them. |
@@ -62,10 +62,17 @@ listing is then `listing/1`. The fields are closed here too:
 | `name` | The seller's name. |
 | `seller`, `receipt_key`, `updated`, `sig` | As in `listing/0`. |
 | `licence`, `credits` | Optional: what holds for every service that does not say its own. |
-| `services` | One to 32 entries, each `name`, `kind` (`video`, `files`, `api` or `ai`), `path`, `prices` and `items`, with an optional `licence` and `credits`. `path` is the gateway route the service is sold under; no two entries share one. |
+| `services` | One to 32 entries, each `name`, `kind` (`video`, `files`, `api`, `ai` or `hashrate`), `path`, `prices` and `items`, with an optional `licence` and `credits`. `path` is the gateway route the service is sold under; no two entries share one. |
 
-The kind `ai` came after the first apps that read `listing/1`: such an app refuses a listing with an
-`ai` service. A seller who must reach one lists its model as `api`; newer apps show both.
+New kinds come after the apps that read them. A reader skips a `listing/1` service whose `kind`
+it does not know, and reads the rest: the signature still covers the whole document, the skipped
+service included, so nothing in it can be changed unseen. A service of a kind the reader knows is
+checked whole, as before. A listing with no service of a kind the reader knows is refused. A
+`listing/0` has one service, so its `kind` stays strict: with it unknown there is nothing to read.
+A seller's own config is strict too: it can list only the kinds its gateway knows.
+
+The kinds `ai` and `hashrate` came before this rule: apps older than it refuse a listing with such
+a service. A seller who must reach those apps lists a model as `api`.
 
 The digest is built as for `listing/0`, under its own tag, `xbt402/listing/1`, so a document of one
 version cannot be passed off as the other.
