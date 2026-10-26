@@ -4,7 +4,7 @@
 use secp256k1::{SecretKey, SECP256K1};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use xbt_nwc::nip44;
+use xbt_nostr::nip44;
 
 const VECTORS: &str = include_str!("vectors/nip44.vectors.json");
 const VECTORS_SHA256: &str = "269ed0f69e4c192512cc779e78c555090cebc7c785b609e338a62afc3ce25040";

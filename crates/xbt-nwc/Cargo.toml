@@ -11,22 +11,13 @@ publish.workspace = true
 # the signer's socket client, its BOLT 11 decoder (feature bit 512) and its socket protocol, reused
 xbt-signer.workspace = true
 xbt-svc.workspace = true
+# events, NIP-44 v2, the WebSocket and the relay pool
+xbt-nostr.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 hex.workspace = true
-base64.workspace = true
-getrandom = "0.2"
-# NIP-44 v2 and Nostr events: ECDH and BIP-340 Schnorr (secp256k1), HKDF and HMAC (hmac + sha2),
-# ChaCha20. All already in the tree: chacha20 comes with xbt-work's chacha20poly1305
 secp256k1.workspace = true
 sha2.workspace = true
-hmac.workspace = true
-chacha20 = "0.9.1"
-# wss:// to relays: the tree's rustls (as the gateway and the signer use it), with Mozilla's roots
-# (already in the tree through ureq), and ring's SHA-1 for the WebSocket handshake's accept check
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-webpki-roots = "1"
-ring = "0.17"
 
 [dev-dependencies]
 tempfile = "3"

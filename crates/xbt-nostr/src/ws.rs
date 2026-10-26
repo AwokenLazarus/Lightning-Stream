@@ -180,7 +180,7 @@ impl WebSocket {
         let key = B64.encode(k);
         let host = if (u.tls && u.port == 443) || (!u.tls && u.port == 80) { u.host.clone() } else { format!("{}:{}", u.host, u.port) };
         let req = format!("GET {} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n\
-                           Sec-WebSocket-Version: 13\r\nUser-Agent: xbt-nwc\r\n\r\n", u.path);
+                           Sec-WebSocket-Version: 13\r\nUser-Agent: xbt-nostr\r\n\r\n", u.path);
         io.write_all(req.as_bytes())?;
         io.flush()?;
         let head = read_head(&mut *io)?;
