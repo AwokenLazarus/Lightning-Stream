@@ -204,6 +204,17 @@ struct Metered {
     /// Charged before the head and already in the meter: the first second.
     first_second: u64,
     started: Instant,
+    /// A request to a route priced by the token: what bounds its tokens.
+    tokens: Option<TokenCall>,
+}
+
+/// What bounds the tokens of one request to a route priced by the token.
+#[derive(Clone, Copy)]
+struct TokenCall {
+    /// The buyer's request body, in bytes, before the gateway bounded it.
+    body_len: u64,
+    /// The `max_tokens` the service was sent.
+    max_output: u64,
 }
 
 impl Gateway {
@@ -1356,10 +1367,15 @@ impl Gateway {
 
     /// Pass the request on to its route's service.
     pub(crate) fn send_upstream(&self, route: &Route, req: &Request) -> Result<Answer, crate::Error> {
+        self.send_upstream_body(route, req, &req.body)
+    }
+
+    /// Pass the request on with another body (a request to a route priced by the token, bounded).
+    fn send_upstream_body(&self, route: &Route, req: &Request, body: &[u8]) -> Result<Answer, crate::Error> {
         let base = route.upstream.as_ref().or(self.cfg.upstream.as_ref());
         // the config refuses a route with neither, and every base has its client
         let up = base.and_then(|b| self.upstreams.get(b)).ok_or_else(|| crate::Error::Upstream("no service for this route".into()))?;
-        up.send(&req.method, &route.upstream_target(&req.target), &forwarded(route, &req.headers), &req.body)
+        up.send(&req.method, &route.upstream_target(&req.target), &forwarded(route, &req.headers), body)
     }
 
     /// Read at most `cap` bytes of a body. `Err`: the service stopped in the middle.
@@ -1452,6 +1468,25 @@ impl Gateway {
                 return Reply::Whole(self.refused(&a, &req.target, Some(route), why));
             }
         }
+        // a request with a body to a route priced by the token: its output bounded, its counts asked
+        // for, and the most it can cost in the balance before the service is asked. A request with
+        // no body (a list of models, a page) costs the route's price per request alone
+        let tokens = route.price.tokens.active() && !req.body.is_empty();
+        let prepared = if tokens {
+            match xbt402::tokens::prepare(&req.body, route.price.tokens.max_output) {
+                Ok(p) => Some(p),
+                Err(why) => return Reply::Whole(self.answered(&a, error(400, "bad_request", why), 0)),
+            }
+        } else {
+            None
+        };
+        let token_bound = match &prepared {
+            None => Some(0),
+            Some(p) => route.price.tokens.bound(req.body.len() as u64, p.max_output),
+        };
+        let Some(token_bound) = token_bound else {
+            return Reply::Whole(self.refused(&a, &req.target, Some(route), Refusal::BalanceShort));
+        };
         // step 4: the request's price and the first second, before the service is asked; a body
         // priced per byte must be able to pay for its first byte
         let head_only = req.method == "HEAD";
@@ -1474,7 +1509,8 @@ impl Gateway {
             .price
             .request_msat
             .saturating_add(route.price.second_msat)
-            .saturating_add(first_byte);
+            .saturating_add(first_byte)
+            .saturating_add(token_bound);
         let charged = {
             let mut st = self.lock();
             if st.book.chargeable(&a.session, on_pledge) < needed {
@@ -1488,7 +1524,11 @@ impl Gateway {
         }
         let refund = |msat: u64| self.lock().book.refund(&a.session, msat);
         // step 5
-        let mut answer = match self.send_upstream(route, &req) {
+        let sent = match &prepared {
+            Some(p) => self.send_upstream_body(route, &req, &p.body),
+            None => self.send_upstream(route, &req),
+        };
+        let mut answer = match sent {
             // a service behind the gateway does not ask for payment through it
             Ok(ans) if ans.status != 402 => ans,
             _ => {
@@ -1590,8 +1630,23 @@ impl Gateway {
             at_head: route.price.request_msat,
             first_second,
             started: Instant::now(),
+            tokens: prepared.as_ref().map(|p| TokenCall { body_len: req.body.len() as u64, max_output: p.max_output }),
         };
-        let (gw, length, src) = (self.clone(), answer.length, answer.body);
+        let event_stream = answer.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v.to_ascii_lowercase().starts_with("text/event-stream"));
+        // a body priced by the token has no length known before it is counted
+        let length = if m.tokens.is_some() { None } else { answer.length };
+        if m.tokens.is_some() {
+            headers.retain(|(k, _)| !k.eq_ignore_ascii_case("content-length"));
+        }
+        let (gw, src) = (self.clone(), answer.body);
+        if m.tokens.is_some() {
+            return Reply::Stream(Streamed {
+                status: answer.status,
+                headers,
+                length,
+                body: Box::new(move |out| gw.pump_tokens(m, src, out, open, event_stream)),
+            });
+        }
         Reply::Stream(Streamed {
             status: answer.status,
             headers,
@@ -1640,8 +1695,8 @@ impl Gateway {
         }
     }
 
-    /// Take `due` for seconds that have started, waiting as [`Gateway::pay_bytes`] does.
-    fn pay_seconds(&self, m: &Metered, due: u64, gone: &mut dyn FnMut() -> bool) -> bool {
+    /// Take `due` msat (seconds that have started, tokens counted), waiting as [`Gateway::pay_bytes`] does.
+    fn pay_msat(&self, m: &Metered, due: u64, gone: &mut dyn FnMut() -> bool) -> bool {
         let on_pledge = m.route.release == Release::AfterVerify;
         let deadline = Instant::now() + self.cfg.times.refill_wait;
         let mut st = self.lock();
@@ -1691,7 +1746,7 @@ impl Gateway {
             }
             match meter.seconds_due(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)) {
                 Some((0, _)) => {}
-                Some((secs, due)) if self.pay_seconds(&m, due, &mut || out.gone()) => meter.seconds_charged(secs, due),
+                Some((secs, due)) if self.pay_msat(&m, due, &mut || out.gone()) => meter.seconds_charged(secs, due),
                 _ => break stopped("no balance for another second"),
             }
             let n = match src.read(&mut buf) {
@@ -1729,6 +1784,149 @@ impl Gateway {
             // beside the signed fields: how the body ended
             r["bytes"] = meter.bytes().into();
             r["complete"] = result.is_ok().into();
+            let finals = st.finals.entry(m.session.clone()).or_default();
+            if finals.len() >= FINALS_KEPT {
+                finals.pop_front();
+            }
+            finals.push_back(r);
+        }
+        let marks = st.book.take_marks();
+        self.journal(&mut st, &marks);
+        drop(st);
+        result
+    }
+}
+
+impl Gateway {
+    /// A body priced by the token: read event by event (a streamed answer) or whole, each part
+    /// paid for before it is sent, and the call settled on the counts the service states at its
+    /// end ([`xbt402::tokens`]). When the balance stops covering the next part, nothing more is
+    /// sent and the service's connection is closed, so it stops writing.
+    fn pump_tokens(
+        &self,
+        m: Metered,
+        mut src: Box<dyn Read + Send>,
+        out: &mut dyn BodyWriter,
+        _open: OpenResponse,
+        event_stream: bool,
+    ) -> io::Result<()> {
+        use xbt402::tokens::{settle, whole, Sse, Usage, MAX_WHOLE};
+        let call = m.tokens.expect("a call priced by the token");
+        let rule = m.route.price.tokens;
+        let mut hash = Sha256::new();
+        let (mut sent_bytes, mut counted, mut charged) = (0u64, 0u64, 0u64);
+        let mut usage = Usage::default();
+        let stopped = |why: &str| Err(io::Error::other(why.to_string()));
+        // pay `due`, then send `bytes`; false: not paid, or the buyer is gone
+        let mut part = |bytes: &[u8], due: u64, charged: &mut u64, sent: &mut u64, hash: &mut Sha256| -> io::Result<bool> {
+            if due > 0 && !self.pay_msat(&m, due, &mut || out.gone()) {
+                return Ok(false);
+            }
+            *charged = charged.saturating_add(due);
+            if let Err(e) = out.send(bytes) {
+                self.lock().book.refund(&m.session, due);
+                *charged = charged.saturating_sub(due);
+                return Err(e);
+            }
+            hash.update(bytes);
+            *sent = sent.saturating_add(bytes.len() as u64);
+            Ok(true)
+        };
+        // what is due to bring the charge to the settled total (0 when it is there or above)
+        let settle_due = |counted: u64, usage: Usage, charged: u64| -> (u64, u64) {
+            let t = settle(call.body_len, call.max_output, counted, usage);
+            let total = rule.cost(t).unwrap_or(u64::MAX);
+            (total.saturating_sub(charged), charged.saturating_sub(total))
+        };
+        let mut buf = vec![0u8; CHUNK];
+        let result: io::Result<()> = if event_stream {
+            let mut sse = Sse::default();
+            'body: loop {
+                if m.started.elapsed() > self.cfg.times.max_response {
+                    break stopped("the response reached its longest life");
+                }
+                let n = match src.read(&mut buf) {
+                    Ok(0) => {
+                        if let Some(ev) = sse.rest() {
+                            match part(&ev.bytes, 0, &mut charged, &mut sent_bytes, &mut hash) {
+                                Ok(true) => {}
+                                Ok(false) => break 'body stopped("no balance for the rest"),
+                                Err(e) => break 'body Err(e),
+                            }
+                        }
+                        break Ok(());
+                    }
+                    Ok(n) => n,
+                    Err(e) => break Err(e),
+                };
+                let events = match sse.feed(&buf[..n]) {
+                    Ok(evs) => evs,
+                    Err(why) => break stopped(why),
+                };
+                for ev in events {
+                    // output as it goes, never past the request's bound; with the first event, the
+                    // input as far as it can be told before the counts (a quarter of the body), so a
+                    // buyer that stops reading early has paid for what the service read
+                    let more = ev.tokens.min(call.max_output.saturating_sub(counted));
+                    let mut due = rule.output_due(counted, more).unwrap_or(u64::MAX);
+                    if sent_bytes == 0 && charged == 0 {
+                        due = due.saturating_add(rule.input_cost(xbt402::tokens::input_guess(call.body_len)).unwrap_or(u64::MAX));
+                    }
+                    counted += more;
+                    if let Some(u) = ev.usage {
+                        // the counts: the call is settled before the event that states them is sent
+                        usage = u;
+                        let (up, down) = settle_due(counted, usage, charged.saturating_add(due));
+                        due = due.saturating_add(up).saturating_sub(down);
+                    }
+                    match part(&ev.bytes, due, &mut charged, &mut sent_bytes, &mut hash) {
+                        Ok(true) => {}
+                        Ok(false) => break 'body stopped("no balance for the next tokens"),
+                        Err(e) => break 'body Err(e),
+                    }
+                }
+            }
+        } else {
+            // a whole answer: read, counted, paid for, then sent
+            let mut body = vec![];
+            match (&mut src).take(MAX_WHOLE as u64 + 1).read_to_end(&mut body) {
+                Err(e) => Err(e),
+                Ok(_) if body.len() > MAX_WHOLE => stopped("the answer is larger than the gateway reads whole"),
+                Ok(_) => {
+                    let (guess, u) = whole(&body);
+                    usage = u;
+                    counted = guess.min(call.max_output);
+                    let (due, _) = settle_due(counted, usage, 0);
+                    match part(&body, due, &mut charged, &mut sent_bytes, &mut hash) {
+                        Ok(true) => Ok(()),
+                        Ok(false) => stopped("no balance for the answer"),
+                        Err(e) => Err(e),
+                    }
+                }
+            }
+        };
+        // a stream that ended without its counts is settled on its chunks, and one that was charged
+        // more than its counts settle at is given the difference back
+        if result.is_ok() {
+            let (up, down) = settle_due(counted, usage, charged);
+            if up > 0 && self.pay_msat(&m, up, &mut || false) {
+                charged = charged.saturating_add(up);
+            }
+            if down > 0 {
+                self.lock().book.refund(&m.session, down);
+                charged = charged.saturating_sub(down);
+            }
+        }
+        // the service's connection is closed here, whatever was left of its answer
+        drop(src);
+        let total = m.at_head.saturating_add(charged);
+        let last = self.receipt(&m.session, m.seq, total, &m.digest, m.status, &hex::encode(hash.finalize()));
+        let mut st = self.lock();
+        if let Some(mut r) = last {
+            let t = settle(call.body_len, call.max_output, counted, usage);
+            r["bytes"] = sent_bytes.into();
+            r["complete"] = result.is_ok().into();
+            r["tokens"] = json!({"input": t.input, "output": t.output});
             let finals = st.finals.entry(m.session.clone()).or_default();
             if finals.len() >= FINALS_KEPT {
                 finals.pop_front();

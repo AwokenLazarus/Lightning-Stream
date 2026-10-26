@@ -34,5 +34,9 @@ xbt-svc = { workspace = true, optional = true }
 url = "2.5"
 
 [[test]]
+name = "tokens_live"
+required-features = ["http-client"]
+
+[[test]]
 name = "http_limits"
 required-features = ["http-client", "http-server"]

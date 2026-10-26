@@ -1,12 +1,14 @@
-//! What a piece costs. A route's price is the sum of three rules a runner can set without changing
+//! What a piece costs. A route's price is the sum of the rules a runner can set without changing
 //! the service behind the gateway: an amount per request, an amount per `per_bytes` bytes of the
-//! response, and an amount per started second the response is open. All in millisatoshi, all
-//! checked: a price that does not fit is no price, and the request is not served.
+//! response, an amount per started second the response is open, and, for an OpenAI-compatible
+//! service, an amount per 1,000 tokens read and written ([`xbt402::tokens`]). All in millisatoshi,
+//! all checked: a price that does not fit is no price, and the request is not served.
 //!
-//! What these rules cannot price is anything only the service can count, such as the tokens a model
-//! produced: the gateway sees bytes and time. [`UNITS_HEADER`] is the name kept for a count the
-//! service may one day state; this version reads no price from it and never passes it on.
+//! Tokens are counted from the answer the service streams and the counts it states at its end
+//! (`usage`): see [`xbt402::tokens`] for what that trusts. [`UNITS_HEADER`] is the name kept for a
+//! count a service may state in a header; this version reads no price from it and never passes it on.
 use serde_json::{json, Value};
+pub use xbt402::tokens::TokenRule;
 
 /// Reserved: a response header in which an upstream may state how many units it produced. Not read
 /// for money in this version, and removed from every response.
@@ -22,16 +24,19 @@ pub struct Price {
     pub per_bytes: u64,
     /// Charged for every started second between the response's head and its last byte.
     pub second_msat: u64,
+    /// Charged per 1,000 tokens of input and output, for an OpenAI-compatible service. Not set
+    /// beside a price per byte or per second.
+    pub tokens: TokenRule,
 }
 
 impl Price {
     pub fn is_free(&self) -> bool {
-        self.request_msat == 0 && self.byte_msat == 0 && self.second_msat == 0
+        self.request_msat == 0 && self.byte_msat == 0 && self.second_msat == 0 && !self.tokens.active()
     }
 
-    /// Whether the body is metered as it goes (per byte or per second).
+    /// Whether the body is metered as it goes (per byte, per second or per token).
     pub fn metered(&self) -> bool {
-        self.byte_msat > 0 || self.second_msat > 0
+        self.byte_msat > 0 || self.second_msat > 0 || self.tokens.active()
     }
 
     /// The price of the first `bytes` bytes of a body: `ceil(bytes * byte_msat / per_bytes)`.
@@ -60,8 +65,14 @@ impl Price {
 
     /// The rule as the terms state it.
     pub fn terms(&self) -> Value {
-        json!({"requestMsat": self.request_msat.to_string(), "byteMsat": self.byte_msat.to_string(), "perBytes": self.per_bytes.to_string(),
-               "secondMsat": self.second_msat.to_string()})
+        let mut v = json!({"requestMsat": self.request_msat.to_string(), "byteMsat": self.byte_msat.to_string(), "perBytes": self.per_bytes.to_string(),
+                           "secondMsat": self.second_msat.to_string()});
+        if self.tokens.active() {
+            v["inputPer1kMsat"] = self.tokens.input_per_1k_msat.to_string().into();
+            v["outputPer1kMsat"] = self.tokens.output_per_1k_msat.to_string().into();
+            v["maxOutputTokens"] = self.tokens.max_output.to_string().into();
+        }
+        v
     }
 }
 
@@ -136,6 +147,7 @@ mod tests {
         byte_msat: 1000,
         per_bytes: 1 << 20,
         second_msat: 0,
+        tokens: TokenRule::NONE,
     };
 
     #[test]
@@ -168,6 +180,7 @@ mod tests {
             byte_msat: u64::MAX,
             per_bytes: 1,
             second_msat: u64::MAX,
+            tokens: TokenRule::NONE,
         };
         assert_eq!(huge.for_bytes(2), None);
         assert_eq!(huge.for_seconds(2), None);
@@ -216,6 +229,7 @@ mod tests {
             byte_msat: 0,
             per_bytes: 1,
             second_msat: 50,
+            tokens: TokenRule::NONE,
         };
         let mut m = Meter::new(p);
         assert_eq!(

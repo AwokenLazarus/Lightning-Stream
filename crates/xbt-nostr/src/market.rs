@@ -80,12 +80,22 @@ pub fn price_parts(prices: &Value) -> Vec<(String, String)> {
     if let Some(m) = num(prices, "second_msat") {
         out.push((fmt_sat(m), "second".into()));
     }
+    // by the token: per 1,000 tokens, and "in" and "out" only when the input is priced too
+    let input = num(prices, "per_1k_input_msat").filter(|m| *m > 0);
+    if let Some(m) = input {
+        out.push((fmt_sat(m), "1,000 tokens in".into()));
+    }
+    if let Some(m) = num(prices, "per_1k_output_msat").filter(|m| *m > 0) {
+        out.push((fmt_sat(m), if input.is_some() { "1,000 tokens out" } else { "1,000 tokens" }.into()));
+    }
     out
 }
 
-/// `"20 sat a MiB"`, or several joined by commas.
+/// `"20 sat a MiB"`, `"10 sat per 1,000 tokens"`, or several joined by commas.
 pub fn price_text(prices: &Value) -> String {
-    let parts: Vec<String> = price_parts(prices).into_iter().map(|(s, u)| format!("{s} sat a {u}")).collect();
+    let parts: Vec<String> = price_parts(prices).into_iter()
+        .map(|(s, u)| if u.starts_with("1,000") { format!("{s} sat per {u}") } else { format!("{s} sat a {u}") })
+        .collect();
     if parts.is_empty() { "free".into() } else { parts.join(", ") }
 }
 
@@ -232,6 +242,8 @@ mod tests {
         assert_eq!(price_text(&json!({"byte_msat": "20000", "per_bytes": "1048576"})), "20 sat a MiB");
         assert_eq!(price_text(&json!({"request_msat": "1500", "second_msat": "250"})), "1.5 sat a request, 0.25 sat a second");
         assert_eq!(price_text(&json!({"byte_msat": "7", "per_bytes": "4096"})), "0.007 sat a piece of 4096 bytes");
+        assert_eq!(price_text(&json!({"per_1k_output_msat": "10000"})), "10 sat per 1,000 tokens");
+        assert_eq!(price_text(&json!({"per_1k_input_msat": "2000", "per_1k_output_msat": "10000"})), "2 sat per 1,000 tokens in, 10 sat per 1,000 tokens out");
         assert_eq!(price_text(&json!({})), "free");
     }
 }

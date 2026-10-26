@@ -25,6 +25,7 @@ use sha2::{Digest, Sha256};
 
 use crate::pyjson::str_or_empty;
 use crate::ticket::{outside_u64, Refusal, Terms};
+use xbt402::tokens::TokenRule;
 
 fn refuse<T>(rule: &'static str, msg: impl Into<String>) -> Result<T, Refusal> {
     Err((rule, msg.into()))
@@ -39,6 +40,8 @@ fn is_hex(s: &str, len: usize) -> bool {
 /// The price rule of one route, as the seller's terms state it (`extra.price`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Price {
+    /// Per 1,000 tokens read and written, for an OpenAI-compatible service ([`xbt402::tokens`]).
+    pub tokens: TokenRule,
     /// Once per request that is answered with a status below 400.
     pub request_msat: u64,
     /// For every `per_bytes` bytes of the answer's body, rounded up over the whole body.
@@ -55,7 +58,7 @@ impl Price {
     pub fn parse(acc: &Value) -> Result<Self, Refusal> {
         let amount = outside_u64(acc.get("amount")).ok_or(("ticket_terms", "amount is not a whole number of msat".to_string()))?;
         let Some(p) = acc.get("extra").and_then(|x| x.get("price")).filter(|p| !p.is_null()) else {
-            return Ok(Self { request_msat: amount, byte_msat: 0, per_bytes: 1, second_msat: 0 });
+            return Ok(Self { request_msat: amount, byte_msat: 0, per_bytes: 1, second_msat: 0, tokens: TokenRule::NONE });
         };
         if !p.is_object() {
             return refuse("ticket_terms", "price is not an object");
@@ -64,7 +67,16 @@ impl Price {
             None => Ok(dflt),
             Some(v) => outside_u64(Some(v)).ok_or(("ticket_terms", format!("price.{k} is not a whole number"))),
         };
-        let price = Self { request_msat: num("requestMsat", 0)?, byte_msat: num("byteMsat", 0)?, per_bytes: num("perBytes", 1)?, second_msat: num("secondMsat", 0)? };
+        let tokens = TokenRule {
+            input_per_1k_msat: num("inputPer1kMsat", 0)?,
+            output_per_1k_msat: num("outputPer1kMsat", 0)?,
+            max_output: num("maxOutputTokens", xbt402::tokens::DEFAULT_MAX_OUTPUT)?,
+        };
+        let tokens = if tokens.active() { tokens } else { TokenRule::NONE };
+        let price = Self { request_msat: num("requestMsat", 0)?, byte_msat: num("byteMsat", 0)?, per_bytes: num("perBytes", 1)?, second_msat: num("secondMsat", 0)?, tokens };
+        if tokens.active() && (price.byte_msat > 0 || price.second_msat > 0 || tokens.max_output == 0) {
+            return refuse("ticket_terms", "a price by the token has no price per byte or per second beside it, and a maxOutputTokens above 0");
+        }
         if price.per_bytes == 0 {
             return refuse("ticket_terms", "price.perBytes is 0");
         }
@@ -76,7 +88,7 @@ impl Price {
 
     /// Whether the body is paid for as it arrives.
     pub fn metered(&self) -> bool {
-        self.byte_msat > 0 || self.second_msat > 0
+        self.byte_msat > 0 || self.second_msat > 0 || self.tokens.active()
     }
 
     /// The price of the first `bytes` bytes of a body: `ceil(bytes * byte_msat / per_bytes)`.
@@ -106,6 +118,19 @@ impl Price {
     /// first second, and one msat for the first byte of a body priced by its size.
     pub fn reserve(&self) -> Option<u64> {
         self.request_msat.checked_add(self.second_msat)?.checked_add(u64::from(self.byte_msat > 0))
+    }
+
+    /// What the seller wants in the balance before it serves a request with `body`: by the token,
+    /// also the most the request can cost (its input at one token per two bytes, and the
+    /// `max_tokens` the seller will send the service), as the seller works it out. `None`: it does
+    /// not fit, or the body is not a request the seller takes.
+    pub fn reserve_for(&self, body: &[u8]) -> Option<u64> {
+        let base = self.reserve()?;
+        if !self.tokens.active() || body.is_empty() {
+            return Some(base);
+        }
+        let p = xbt402::tokens::prepare(body, self.tokens.max_output).ok()?;
+        base.checked_add(self.tokens.bound(body.len() as u64, p.max_output)?)
     }
 }
 
@@ -356,19 +381,19 @@ mod tests {
     #[test]
     fn a_price_is_read_strictly_and_never_wraps() {
         let p = Price::parse(&accepts(json!({"requestMsat": "2500", "byteMsat": "200000", "perBytes": "1048576", "secondMsat": "0"}))).unwrap();
-        assert_eq!(p, Price { request_msat: 2500, byte_msat: 200_000, per_bytes: 1 << 20, second_msat: 0 });
+        assert_eq!(p, Price { request_msat: 2500, byte_msat: 200_000, per_bytes: 1 << 20, second_msat: 0, tokens: TokenRule::NONE });
         assert!(p.metered());
         assert_eq!((p.for_bytes(0), p.for_bytes(1), p.for_bytes(1 << 20), p.for_bytes((1 << 20) + 1)), (Some(0), Some(1), Some(200_000), Some(200_001)));
         assert_eq!(p.bytes_for(1_000_000), 5 << 20, "a ticket of 1,000 sat pays for 5 MiB");
         assert_eq!(p.cost(1 << 20, 3), Some(202_500));
         assert_eq!(p.reserve(), Some(2501));
-        let dear = Price { request_msat: 0, byte_msat: u64::MAX, per_bytes: 1, second_msat: 0 };
+        let dear = Price { request_msat: 0, byte_msat: u64::MAX, per_bytes: 1, second_msat: 0, tokens: TokenRule::NONE };
         assert_eq!((dear.for_bytes(1), dear.for_bytes(2), dear.cost(2, 0)), (Some(u64::MAX), None, None), "a price that does not fit is no price");
-        let per_s = Price { request_msat: 0, byte_msat: 0, per_bytes: 1, second_msat: u64::MAX };
+        let per_s = Price { request_msat: 0, byte_msat: 0, per_bytes: 1, second_msat: u64::MAX, tokens: TokenRule::NONE };
         assert_eq!((per_s.for_seconds(1), per_s.for_seconds(2), per_s.cost(0, 2), per_s.bytes_for(5)), (Some(u64::MAX), None, None, u64::MAX));
         // no rule: the amount alone
         let mut a = accepts(Value::Null);
-        assert_eq!(Price::parse(&a).unwrap(), Price { request_msat: 2500, byte_msat: 0, per_bytes: 1, second_msat: 0 });
+        assert_eq!(Price::parse(&a).unwrap(), Price { request_msat: 2500, byte_msat: 0, per_bytes: 1, second_msat: 0, tokens: TokenRule::NONE });
         a["amount"] = json!(-1);
         assert!(Price::parse(&a).is_err());
         for bad in [json!({"requestMsat": "2501"}), json!({"requestMsat": "2500", "perBytes": 0}), json!({"requestMsat": "2500", "byteMsat": "1e3"}),

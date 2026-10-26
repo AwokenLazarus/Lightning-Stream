@@ -188,7 +188,8 @@ impl LotteryConfig {
     /// come, so this is what bounds, in wins, what a buyer that gives none is served.
     pub fn offers(&self, price: &Price) -> bool {
         let small = |d: u64| d < self.win_msat && u128::from(d) * u128::from(self.max_odds_den) <= u128::from(self.win_msat);
-        !price.is_free() && self.dearest_piece(price).is_some_and(small)
+        // a route priced by the token is paid with tickets: its pieces have no size before they are read
+        !price.is_free() && !price.tokens.active() && self.dearest_piece(price).is_some_and(small)
     }
 }
 
@@ -1119,7 +1120,7 @@ mod tests {
     #[test]
     fn a_route_is_offered_by_lottery_only_if_its_dearest_piece_is_a_quarter_of_a_win_or_less() {
         let c = LotteryConfig::parse(&json!({}), 40).unwrap();
-        let p = |request_msat, byte_msat, per_bytes, second_msat| Price { request_msat, byte_msat, per_bytes, second_msat };
+        let p = |request_msat, byte_msat, per_bytes, second_msat| Price { request_msat, byte_msat, per_bytes, second_msat, tokens: crate::price::TokenRule::NONE };
         assert!(c.offers(&p(100, 0, 1, 0)) && !c.offers(&p(0, 0, 1, 0)), "a free route has nothing to draw for");
         // a quarter of the 64-sat win is offered, one msat more is not: for a request, a second and a piece of bytes
         assert!(c.offers(&p(16_000, 0, 1, 0)) && !c.offers(&p(16_001, 0, 1, 0)));

@@ -307,6 +307,9 @@ pub fn price_words(prices: &Value) -> String {
     if n("second_msat") > 0 {
         parts.push(format!("{} sat a second", sat(u128::from(n("second_msat")), 1)));
     }
+    if n("per_1k_input_msat") > 0 || n("per_1k_output_msat") > 0 {
+        parts.push(xbt402::tokens::price_text(n("per_1k_input_msat"), n("per_1k_output_msat")));
+    }
     if parts.is_empty() { "free".into() } else { parts.join(" + ") }
 }
 
@@ -489,6 +492,8 @@ mod tests {
         use serde_json::json;
         assert_eq!(price_words(&json!({"byte_msat": "20000", "per_bytes": "1048576"})), "20 sat a MiB");
         assert_eq!(price_words(&json!({"byte_msat": "20", "per_bytes": "1048576"})), "0.02 sat a MiB");
+        assert_eq!(price_words(&json!({"per_1k_output_msat": "10000"})), "10 sat per 1,000 tokens");
+        assert_eq!(price_words(&json!({"per_1k_input_msat": "2000", "per_1k_output_msat": "10000"})), "2 sat per 1,000 tokens in, 10 sat per 1,000 tokens out");
         assert_eq!(price_words(&json!({"request_msat": "500"})), "0.5 sat a request");
         assert_eq!(price_words(&json!({"request_msat": "1000", "second_msat": "2000"})), "1 sat a request + 2 sat a second");
         assert_eq!(price_words(&json!({})), "free");
