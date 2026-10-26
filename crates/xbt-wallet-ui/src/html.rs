@@ -89,23 +89,63 @@ pub struct Nav<'a> {
     pub csrf: &'a str,
     pub pending: usize,
     pub logged_in: bool,
-    pub pages: &'a [(&'static str, &'static str)],
+    pub sections: &'a [&'static Section],
     pub brand: &'a str,
 }
 
-pub const WALLET_PAGES: [(&str, &str); 14] = [("./", "Overview"), ("./browse", "Browse"), ("./services", "Services"), ("./play", "Player"), ("./connections", "Connections"),
-                                              ("./apps", "Connected apps"),
-                                              ("./approvals", "Approvals"), ("./policy", "Policy"), ("./lightning", "Lightning"), ("./channels", "Channels"),
-                                              ("./signatures", "Signatures"), ("./keys", "Keys"), ("./agents", "Agents"), ("./setup", "Setup")];
-/// The wallet's pages with Sell (`XBT_UI_SELL=1`): the one Lightning Stream app, buying and selling.
-pub const STREAM_PAGES: [(&str, &str); 15] = [("./", "Overview"), ("./browse", "Browse"), ("./services", "Services"), ("./play", "Player"),
-                                              ("./connections", "Connections"), ("./sell", "Sell"), ("./apps", "Connected apps"),
-                                              ("./approvals", "Approvals"), ("./policy", "Policy"), ("./lightning", "Lightning"), ("./channels", "Channels"),
-                                              ("./signatures", "Signatures"), ("./keys", "Keys"), ("./agents", "Agents"), ("./setup", "Setup")];
+/// One page in a section: its address, the title it is shown under (and found by), the tab's words.
+pub struct Tab {
+    pub href: &'static str,
+    pub title: &'static str,
+    pub label: &'static str,
+}
+
+/// A top-level entry of the menu, with its pages as tabs. A page whose title no tab names (the
+/// player, a service's own page) still marks its section through `also`.
+pub struct Section {
+    pub label: &'static str,
+    pub tabs: &'static [Tab],
+    pub also: &'static [&'static str],
+}
+
+impl Section {
+    fn has(&self, title: &str) -> bool {
+        self.tabs.iter().any(|t| t.title == title) || self.also.contains(&title)
+    }
+}
+
+pub const SERVICES: Section = Section {
+    label: "Services",
+    tabs: &[Tab { href: "./browse", title: "Browse", label: "Browse" }, Tab { href: "./services", title: "Sellers", label: "Sellers" },
+            Tab { href: "./connections", title: "Live connections", label: "Live connections" }],
+    also: &["Service", "Player"],
+};
+pub const SELL: Section = Section { label: "Sell", tabs: &[Tab { href: "./sell", title: "Sell", label: "Sell" }], also: &[] };
+pub const WALLET: Section = Section {
+    label: "Wallet",
+    tabs: &[Tab { href: "./wallet", title: "Wallet", label: "Balance and activity" }, Tab { href: "./approvals", title: "Approvals", label: "Approvals" }],
+    also: &[],
+};
+pub const APPS: Section = Section {
+    label: "Apps & agents",
+    tabs: &[Tab { href: "./apps", title: "Apps", label: "Apps" }, Tab { href: "./agents", title: "AI agents", label: "AI agents" }],
+    also: &[],
+};
+pub const SETTINGS: Section = Section {
+    label: "Settings",
+    tabs: &[Tab { href: "./setup", title: "Setup", label: "Setup" }, Tab { href: "./lightning", title: "Your node", label: "Your node" },
+            Tab { href: "./policy", title: "Spending rules", label: "Spending rules" }, Tab { href: "./keys", title: "Keys and backup", label: "Keys and backup" },
+            Tab { href: "./signatures", title: "Records", label: "Records" }, Tab { href: "./channels", title: "Old channels", label: "Old channels" }],
+    also: &[],
+};
+/// The app with Sell (`XBT_UI_SELL=1`): buying and selling.
+pub const STREAM_SECTIONS: [&Section; 5] = [&SERVICES, &SELL, &WALLET, &APPS, &SETTINGS];
+/// The wallet alone: buying.
+pub const WALLET_SECTIONS: [&Section; 4] = [&SERVICES, &WALLET, &APPS, &SETTINGS];
+pub const GATEWAY_SECTIONS: [&Section; 0] = [];
 pub const STREAM_BRAND: &str = "Lightning Stream";
-pub const GATEWAY_PAGES: [(&str, &str); 1] = [("./", "Gateway")];
-pub const WALLET_BRAND: &str = "XBT Agent Wallet";
-pub const GATEWAY_BRAND: &str = "Lightning Stream Gateway";
+pub const WALLET_BRAND: &str = "Lightning Stream";
+pub const GATEWAY_BRAND: &str = "Lightning Stream";
 
 pub fn page(title: &str, nav: &Nav, flash: Option<(bool, String)>, body: &str) -> String {
     page_head(title, nav, flash, body, "")
@@ -115,33 +155,63 @@ pub fn page(title: &str, nav: &Nav, flash: Option<(bool, String)>, body: &str) -
 /// this crate's own markup, never a value from a request or from a seller.
 pub fn page_head(title: &str, nav: &Nav, flash: Option<(bool, String)>, body: &str, head: &str) -> String {
     let mut links = String::new();
+    let mut tabs = String::new();
+    let mut banner = String::new();
     if nav.logged_in {
-        for &(href, name) in nav.pages {
-            let cur = if name == nav.active { " aria-current=\"page\"" } else { "" };
-            let badge = if name == "Approvals" {
-                format!(" <span id=\"pending-badge\" class=\"badge\"{}>{}</span>", if nav.pending == 0 { " hidden" } else { "" },
+        for sec in nav.sections {
+            let here = sec.has(nav.active);
+            let cur = if here { " aria-current=\"page\"" } else { "" };
+            let badge = if std::ptr::eq(*sec, &WALLET) {
+                format!(" <span id=\"pending-badge\" class=\"badge\" title=\"waiting for your approval\"{}>{}</span>", if nav.pending == 0 { " hidden" } else { "" },
                         if nav.pending == 0 { String::new() } else { nav.pending.to_string() })
             } else {
                 String::new()
             };
-            links.push_str(&format!("<a href=\"{href}\"{cur}>{name}{badge}</a>"));
+            links.push_str(&format!("<a href=\"{}\"{cur}>{}{badge}</a>", sec.tabs[0].href, esc(sec.label)));
+            if here && sec.tabs.len() > 1 {
+                tabs.push_str(&format!("<nav class=\"tabs\" aria-label=\"{}\">", esc(sec.label)));
+                for t in sec.tabs {
+                    let cur = if t.title == nav.active { " aria-current=\"page\"" } else { "" };
+                    tabs.push_str(&format!("<a href=\"{}\"{cur}>{}</a>", t.href, esc(t.label)));
+                }
+                tabs.push_str("</nav>");
+            }
         }
         links.push_str(&format!("<form method=\"post\" action=\"./logout\" class=\"inline\"><input type=\"hidden\" name=\"csrf\" value=\"{}\">\
                                  <button class=\"link\">Log out</button></form>", esc(nav.csrf)));
+        if nav.pending > 0 && nav.active != "Approvals" {
+            banner = format!("<div class=\"flash warn banner\"><a href=\"./approvals\">{} payment{} wait{} for your approval. Review {} →</a></div>",
+                             nav.pending, if nav.pending == 1 { "" } else { "s" }, if nav.pending == 1 { "s" } else { "" },
+                             if nav.pending == 1 { "it" } else { "them" });
+        }
     }
+    let menu = if nav.logged_in && !nav.sections.is_empty() {
+        format!("<button type=\"button\" class=\"menu-toggle\" aria-expanded=\"false\" aria-controls=\"site-nav\">Menu</button>\
+                 <nav id=\"site-nav\" aria-label=\"Main\">{links}</nav>")
+    } else if nav.logged_in {
+        format!("<nav id=\"site-nav\" class=\"bare\" aria-label=\"Main\">{links}</nav>")
+    } else {
+        String::new()
+    };
+    let brand = if nav.logged_in { format!("<a class=\"brand\" href=\"./\">{MARK}{}</a>", esc(nav.brand)) } else { format!("<div class=\"brand\">{MARK}{}</div>", esc(nav.brand)) };
     let flash = flash.map(|(ok, m)| format!("<div class=\"flash {}\" role=\"status\">{}</div>", if ok { "ok" } else { "bad" }, esc(&m))).unwrap_or_default();
     format!("<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
              <meta name=\"referrer\" content=\"no-referrer\">{head}<link rel=\"icon\" href=\"data:,\"><title>{} · {}</title>\
              <link rel=\"stylesheet\" href=\"./ui.css?v={}\"></head><body>\
-             <header><div class=\"brand\">{}</div><nav>{links}</nav></header>\
-             <main>{flash}<h1>{}</h1>{body}</main>\
-             <footer>{}</footer>\
-             <script src=\"./ui.js?v={}\"></script></body></html>\n",
-            esc(title), esc(nav.brand), asset_version(crate::UI_CSS), esc(nav.brand), esc(title),
-            if nav.brand == GATEWAY_BRAND { "The macaroons stay on this box; the gateway can make invoices and read the node's height, nothing more." }
-            else { "Keys stay in the signer; your approval key stays in your browser." },
-            asset_version(crate::UI_JS))
+             <div class=\"glow\" aria-hidden=\"true\"></div><canvas id=\"river\" aria-hidden=\"true\"></canvas>\
+             <header>{brand}{menu}</header>\
+             <main>{tabs}{flash}{banner}<h1>{}</h1>{body}</main>\
+             <footer>Your money stays on your own Lightning node. Nobody else holds it.</footer>\
+             <script src=\"./ui.js?v={}\"></script><script src=\"./river.js?v={}\"></script></body></html>\n",
+            esc(title), esc(nav.brand), asset_version(crate::UI_CSS), esc(title),
+            asset_version(crate::UI_JS), asset_version(crate::river_js()))
 }
+
+/// The app's mark in the header: a lightning river, the app icon at header size.
+const MARK: &str = "<svg viewBox=\"0 0 32 32\" aria-hidden=\"true\"><rect x=\".5\" y=\".5\" width=\"31\" height=\"31\" rx=\"8\" fill=\"#05081c\" stroke=\"#2a3a80\"/>\
+    <path d=\"M17.5 3 14 11.5h4.5L12 19.5h4.5L10 29\" fill=\"none\" stroke=\"#38bdf8\" stroke-width=\"6\" stroke-linecap=\"round\" stroke-linejoin=\"round\" opacity=\".22\"/>\
+    <path d=\"M17.5 3 14 11.5h4.5L12 19.5h4.5L10 29\" fill=\"none\" stroke=\"#7dd3fc\" stroke-width=\"3\" stroke-linecap=\"round\" stroke-linejoin=\"round\" opacity=\".55\"/>\
+    <path d=\"M17.5 3 14 11.5h4.5L12 19.5h4.5L10 29\" fill=\"none\" stroke=\"#f0f9ff\" stroke-width=\"1.3\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg>";
 
 /// A short content hash for cache busting.
 pub fn asset_version(s: &str) -> String {

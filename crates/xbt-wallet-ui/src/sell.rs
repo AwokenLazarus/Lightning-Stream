@@ -29,6 +29,7 @@ pub enum Kind {
     Media,
     Ai,
     Web,
+    Other,
 }
 
 impl Kind {
@@ -37,6 +38,7 @@ impl Kind {
             "media" => Some(Kind::Media),
             "ai" => Some(Kind::Ai),
             "web" => Some(Kind::Web),
+            "other" => Some(Kind::Other),
             _ => None,
         }
     }
@@ -45,13 +47,15 @@ impl Kind {
             Kind::Media => "media",
             Kind::Ai => "ai",
             Kind::Web => "web",
+            Kind::Other => "other",
         }
     }
     pub fn words(self) -> &'static str {
         match self {
             Kind::Media => "Media server",
             Kind::Ai => "AI model",
-            Kind::Web => "Other web service",
+            Kind::Web => "Web service or API",
+            Kind::Other => "Something else",
         }
     }
     /// How the status names the service when it cannot be reached.
@@ -59,20 +63,22 @@ impl Kind {
         match self {
             Kind::Media => "your media server",
             Kind::Ai => "your AI model",
-            Kind::Web => "your service",
+            Kind::Web | Kind::Other => "your service",
         }
     }
     fn listing_kind(self) -> &'static str {
         match self {
             Kind::Media => "video",
-            Kind::Ai | Kind::Web => "api",
+            Kind::Ai => "ai",
+            Kind::Web | Kind::Other => "api",
         }
     }
     fn from_listing(k: &str) -> Self {
         match k {
             "video" => Kind::Media,
-            "files" => Kind::Web,
-            _ => Kind::Ai,
+            "ai" => Kind::Ai,
+            "files" => Kind::Other,
+            _ => Kind::Web,
         }
     }
     /// The suggested price: (sats, unit).
@@ -80,14 +86,14 @@ impl Kind {
         match self {
             Kind::Media => ("20", Unit::Mib),
             Kind::Ai => ("10", Unit::Request),
-            Kind::Web => ("1", Unit::Request),
+            Kind::Web | Kind::Other => ("1", Unit::Request),
         }
     }
     fn example(self) -> &'static str {
         match self {
             Kind::Media => "http://jellyfin:8096",
             Kind::Ai => "http://ollama:11434",
-            Kind::Web => "http://my-app:8080",
+            Kind::Web | Kind::Other => "http://my-app:8080",
         }
     }
 }
@@ -117,7 +123,7 @@ impl Unit {
     }
     fn words(self) -> &'static str {
         match self {
-            Unit::Mib => "a MiB watched or downloaded",
+            Unit::Mib => "a MiB of data sent",
             Unit::Request => "a request",
             Unit::Second => "a second",
         }
@@ -444,7 +450,7 @@ impl App {
                     .filter(Value::is_object).unwrap_or_else(|| match o.kind {
                         Kind::Media => json!({}),
                         // a model or a web service is asked with a body
-                        Kind::Ai | Kind::Web => json!({"methods": ["GET", "HEAD", "POST"], "max_body": MIB}),
+                        Kind::Ai | Kind::Web | Kind::Other => json!({"methods": ["GET", "HEAD", "POST"], "max_body": MIB}),
                     });
                 let m = r.as_object_mut().expect("an object");
                 m.insert("path".into(), json!(p));
@@ -540,6 +546,21 @@ impl App {
         (overall, each)
     }
 
+    /// For Home: the shop's state in a pill and a sentence, without asking each service (that is
+    /// the Sell page's job): (pill class, headline, next step).
+    pub(crate) fn sell_summary(&self) -> (&'static str, String, String) {
+        let shop = self.shop();
+        let live = shop.offers.iter().filter(|o| !o.paused).count();
+        match self.shop_config(&shop, &self.chain()) {
+            Err(_) if !self.keys_stored() => ("warn", "Not selling yet".into(), "Open Sell to connect your Lightning node and add what you sell.".into()),
+            Err(missing) => ("warn", "Not selling yet".into(), missing),
+            Ok(_) if shop.offers.is_empty() => ("warn", "Not selling yet".into(), "Add a service to sell: a media server, an AI model or another web service.".into()),
+            Ok(_) if live == 0 => ("warn", "Paused".into(), "Everything is paused. Resume a service to sell again.".into()),
+            Ok(_) => ("good", format!("Selling {live} service{}", if live == 1 { "" } else { "s" }),
+                      format!("Buyers find you at {}.", shop.public_url.trim_end_matches('/'))),
+        }
+    }
+
     // --- the page --------------------------------------------------------------------------------
 
     pub(crate) fn sell_page(&self, ctx: &Ctx, q: &HashMap<String, String>) -> Resp {
@@ -563,13 +584,13 @@ impl App {
         let keys = self.keys_stored();
         if !keys {
             b.push_str(&format!("<section class=\"card step-card\"><h2>1. Connect your Lightning node</h2>\
-                <p>Buyers pay you through your Lightning node. Let this app create payment requests there: in your Lightning node app, open \
-                <em>Macaroons</em> and make two keys as listed below, then paste them here. They let this app ask for payments and read the \
-                time on the network; they cannot spend your money.</p>\
+                <p>Buyers pay you through your Lightning node. Make two keys in your node's app and paste them here. They let this app ask \
+                for payments and read the time on the network; they cannot spend your money.</p>\
                 <form method=\"post\" action=\"./sell\">{csrf}<input type=\"hidden\" name=\"action\" value=\"connect\">\
                 <label>First key: payment requests<textarea name=\"invoices_macaroon\" rows=\"3\" class=\"mono\" autocomplete=\"off\" required></textarea></label>\
                 <label>Second key: network time<textarea name=\"info_macaroon\" rows=\"3\" class=\"mono\" autocomplete=\"off\" required></textarea></label>\
-                <details><summary>Exactly which permissions each key needs</summary><ul><li>First key: <code>{}</code></li><li>Second key: <code>{}</code></li></ul>\
+                <details><summary>How do I make them?</summary><p>In your Lightning node's app (Lightning Fork), open the page called <em>Macaroons</em> \
+                and make two, each with exactly these permissions:</p><ul><li>First key: <code>{}</code></li><li>Second key: <code>{}</code></li></ul>\
                 <p class=\"hint\">Give each its own root key, so you can revoke it alone. The app refuses a key with more permissions than these.</p></details>\
                 <button>Connect</button></form></section>", INVOICE_OPS.join(" "), INFO_OPS.join(" ")));
         }
@@ -580,18 +601,19 @@ impl App {
             .and_then(|(f, _)| f.get(k).cloned()).unwrap_or_else(|| d.to_string());
         b.push_str(&format!("<section class=\"card\"><h2>{}Your shop</h2><form method=\"post\" action=\"./sell\">{csrf}\
             <input type=\"hidden\" name=\"action\" value=\"shop\">\
-            <label>Shop name, as buyers see it<input name=\"name\" value=\"{}\" maxlength=\"200\" placeholder=\"My films\"></label>\
+            <label>Shop name, as buyers see it<input name=\"name\" value=\"{}\" maxlength=\"200\" placeholder=\"My shop\"></label>\
             <label>Where buyers find you<input name=\"public_url\" type=\"url\" inputmode=\"url\" value=\"{}\" required pattern=\"https://.+|http://(127\\.0\\.0\\.1|localhost|\\[::1\\])(:[0-9]+)?\" \
             title=\"The https:// address of your box's secure link, like https://films.example.com\" placeholder=\"https://films.example.com\"></label>\
-            <p class=\"hint\">The public https:// address that leads to this app's selling port ({}). Buyers' apps pay and stream there.</p>{}\
-            <button>Save</button></form></section>",
+            <p class=\"hint\">The public https:// address that leads to this app's selling port ({}). Buyers' apps pay and connect there.</p>{}\
+            <button class=\"secondary\">Save</button></form></section>",
             if keys { "" } else { "2. " }, esc(&pv("name", &shop.name)), esc(&pv("public_url", &shop.public_url)), gw.port,
             if main {
-                let mut n = String::from("<div class=\"flash warn\"><p><strong>This is real money.</strong></p><ul>");
+                let mut n = String::from("<div class=\"flash warn\"><p><strong>This is real money.</strong> Start with low prices and the low \
+                    limits under Advanced.</p><details><summary>Read the limits</summary><ul>");
                 for l in MAINNET_NOTICE {
                     n.push_str(&format!("<li>{}</li>", esc(l.trim_start_matches("- "))));
                 }
-                n.push_str("</ul></div>");
+                n.push_str("</ul></details></div>");
                 format!("{n}<label class=\"check\"><input type=\"checkbox\" name=\"mainnet_ok\" value=\"1\"{}> I understand, and I am ready to take real payments</label>",
                         if shop.mainnet_ok { " checked" } else { "" })
             } else {
@@ -599,7 +621,7 @@ impl App {
             }));
 
         // what is sold
-        b.push_str(&format!("<h2>{}What you sell</h2>", if keys { "" } else { "3. " }));
+        b.push_str(&format!("<h2>{}Your services</h2>", if keys { "" } else { "3. " }));
         if shop.offers.is_empty() {
             b.push_str("<p class=\"empty\">Nothing yet. Add your first service below.</p>");
         }
@@ -624,7 +646,7 @@ impl App {
         let kind = Kind::parse(&fv("kind", editing.map(|o| o.kind.id().to_string()).unwrap_or_else(|| "media".into()))).unwrap_or(Kind::Media);
         let (sug_price, sug_unit) = kind.suggested();
         let unit = Unit::parse(&fv("unit", editing.map(|o| o.unit).unwrap_or(sug_unit).id().to_string())).unwrap_or(sug_unit);
-        let kinds: String = [Kind::Media, Kind::Ai, Kind::Web].iter().map(|k| {
+        let kinds: String = [Kind::Media, Kind::Ai, Kind::Web, Kind::Other].iter().map(|k| {
             let (p, u) = k.suggested();
             format!("<label class=\"choice\"><input type=\"radio\" name=\"kind\" value=\"{}\"{}><span><strong>{}</strong><small>suggested {} sat {}</small></span></label>",
                     k.id(), if *k == kind { " checked" } else { "" }, k.words(), p, u.short())
@@ -642,11 +664,11 @@ impl App {
             title=\"A number of sats, like 20 or 0.5\"></label><label>for each<select name=\"unit\">{units}</select></label></div>\
             <label>Name, as buyers see it <small>(optional)</small><input name=\"name\" value=\"{}\" maxlength=\"120\" placeholder=\"{}\"></label>\
             <details><summary>Advanced</summary>\
-            <label>Films or items to list, one per line: <code>name | link</code><textarea name=\"titles\" rows=\"4\" class=\"mono\">{}</textarea></label>\
+            <label>Items to list for buyers (films, files, models…), one per line: <code>name | link</code><textarea name=\"titles\" rows=\"4\" class=\"mono\">{}</textarea></label>\
             <p class=\"hint\">A link may start with <code>/</code>: it is then on your shop's address.</p>\
             <label>Paths it is sold under, comma-separated (empty: chosen for you)<input name=\"paths\" value=\"{}\" class=\"mono\"></label>\
             <label class=\"check\"><input type=\"checkbox\" name=\"strip\" value=\"1\"{}> Pass requests on without that path</label></details>\
-            <div class=\"row\"><button>{}</button>{}</div></form></section>",
+            <div class=\"row\"><button{}>{}</button>{}</div></form></section>",
             if editing.is_some() { "Change this service" } else { "Add a service" },
             esc(editing.map(|o| o.id.as_str()).unwrap_or("")),
             esc(&fv("address", editing.map(|o| o.address.clone()).unwrap_or_default())), kind.example(), kind.example(),
@@ -655,7 +677,7 @@ impl App {
             esc(&fv("titles", titles)),
             esc(&fv("paths", editing.map(|o| o.paths.join(", ")).unwrap_or_default())),
             if fv("strip", editing.map(|o| if o.strip { "1" } else { "" }.to_string()).unwrap_or_else(|| "1".into())) == "1" { " checked" } else { "" },
-            if editing.is_some() { "Save changes" } else { "Add and start selling" },
+            if keys { "" } else { " class=\"secondary\"" }, if editing.is_some() { "Save changes" } else { "Add and start selling" },
             if editing.is_some() { "<a href=\"./sell\">Cancel</a>" } else { "" }));
 
         // advanced

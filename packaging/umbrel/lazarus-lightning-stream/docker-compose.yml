@@ -141,6 +141,8 @@ services:
       XBT_UI_GW_NODE_REST: https://${APP_LIGHTNING_FORK_NODE_IP}:${APP_LIGHTNING_FORK_NODE_REST_PORT}
       XBT_UI_GW_NODE_TLS_CERT: /data/lightning/tls.cert
       XBT_UI_GW_HEALTH_URL: http://lazarus-lightning-stream_gateway_1:8402/x402/ticket/health
+      # offered on Sellers and on an empty Browse, added only when the owner clicks
+      XBT_UI_SUGGESTED_SELLERS: https://media.lazarus-xbt.xyz
     volumes:
       - ${APP_DATA_DIR}/data/ui:/data/ui
       - ${APP_DATA_DIR}/data/run/signer:/data/run/signer:ro

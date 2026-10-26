@@ -29,6 +29,7 @@
 //! | `XBT_UI_MCP_TOKEN_FILE` | `$XBT_DATA_DIR/run/ui/mcp-http-token` when `XBT_DATA_DIR` is set, else `<data dir>/secrets/mcp-http-token` | the MCP bearer token, shown to the logged-in owner on the Agents page and rotated there (AGP-042). The UI owns it; the MCP only reads it (`xbt-init` makes it 0640, group `xbt-wallet-ui`). |
 //! | `XBT_UI_SERVICES` | `<data dir>/services.json` | path of the services JSON Browse and the player read (a list of `{name, kind, seller, price_text, items}`); the Services page writes it |
 //! | `XBT_UI_SELL` | `0` | `1`: the wallet's UI also has the Sell page (`/sell`), which sets up the gateway beside it (the `XBT_UI_GW_*` settings); the app is then branded Lightning Stream |
+//! | `XBT_UI_SUGGESTED_SELLERS` | | sellers' addresses (`https://`, comma-separated) the Sellers page and an empty Browse offer to add in one click. Nothing is fetched until the owner adds one |
 //! | `XBT_UI_NOSTR_RELAYS` | | Nostr relays to read sellers' signed listings from (`wss://`, comma-separated), for Browse's Nostr page. Unset: no relay is ever asked |
 //! | `XBT_UI_NWC_SOCK` | | the NWC wallet service's admin socket (`xbt-nwc`'s `NWC_ADMIN_SOCK`): the Connected apps page makes, lists and revokes NWC connections there |
 //! | `XBT_UI_CONNECTOR` | `http://127.0.0.1:8480` | the connector the player loads video from (`<connector>/s/<item URL>`). That is also the connector's default listen address, and the UI's own default bind: on one machine set one of the two ports. |
@@ -71,6 +72,8 @@ pub struct Config {
     pub nwc_sock: Option<PathBuf>,
     /// `XBT_UI_NOSTR_RELAYS`: where Browse's Nostr page reads listings; empty: it reads none.
     pub nostr_relays: Vec<String>,
+    /// `XBT_UI_SUGGESTED_SELLERS`: sellers offered to add in one click.
+    pub suggested_sellers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,6 +214,8 @@ impl Config {
             relay_ttl: Duration::from_secs(secs("XBT_UI_RELAY_LINK_S", 6 * 3600).clamp(60, 7 * 86_400)),
             nwc_sock: env("XBT_UI_NWC_SOCK").map(PathBuf::from),
             nostr_relays: nostr_relays(env("XBT_UI_NOSTR_RELAYS").as_deref())?,
+            suggested_sellers: env("XBT_UI_SUGGESTED_SELLERS").map(|v| v.split(',').map(|s| s.trim().trim_end_matches('/').to_string())
+                .filter(|s| crate::services::http_origin(s).is_some()).take(10).collect()).unwrap_or_default(),
         })
     }
 
@@ -226,6 +231,6 @@ impl Config {
                cmp_status_url: None, mcp_urls: vec![], mcp_token_file: PathBuf::from("/nonexistent/mcp-http-token"), threads: 4, role: Role::Wallet,
                ln: LnSetup::default(), gw: GatewaySetup { state_dir: "/data/gateway".into(), port: 8402, ..Default::default() },
                services_file: None, sell: false, connector: "http://127.0.0.1:8480".into(), relay_ttl: Duration::from_secs(6 * 3600),
-               nwc_sock: None, nostr_relays: vec![] }
+               nwc_sock: None, nostr_relays: vec![], suggested_sellers: vec![] }
     }
 }

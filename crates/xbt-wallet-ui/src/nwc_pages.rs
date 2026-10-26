@@ -31,11 +31,12 @@ impl App {
 
     pub(crate) fn apps_page(&self, ctx: &Ctx) -> Resp {
         let body = self.apps_html(ctx, None);
-        self.page("Connected apps", ctx, body)
+        self.page("Apps", ctx, body)
     }
 
     fn apps_html(&self, ctx: &Ctx, made: Option<(&Value, &str)>) -> String {
-        let mut b = String::new();
+        let mut b = String::from("<p class=\"lead\">Let another app, such as a phone wallet or a browser extension, pay through this wallet, \
+            each with its own budget and expiry. (For AI agents, see <a href=\"./agents\">AI agents</a>.)</p>");
         if let Some((c, uri)) = made {
             b.push_str(&format!(
                 "<section class=\"card\"><h2>Connection made: {}</h2>\
@@ -47,9 +48,10 @@ impl App {
                 esc(&txt(c.get("name"))), esc(uri)));
         }
         let Some(link) = self.nwc() else {
-            b.push_str("<section class=\"card\"><p class=\"empty\">Nostr Wallet Connect is not set up on this box.</p>\
-                        <p>Run the NWC wallet service (<code>xbt-nwc</code>) beside the signer and point <code>XBT_UI_NWC_SOCK</code> at its \
-                        admin socket. Then other apps can pay through this wallet, each with its own budget, expiry and allowed methods.</p></section>");
+            b.push_str("<section class=\"card\"><p class=\"empty\">Connecting other apps is not set up on this box.</p>\
+                        <p>When it is, other apps can pay through this wallet, each with its own budget, expiry and allowed actions.</p>\
+                        <details><summary>Technical details</summary><p>Run the Nostr Wallet Connect service (<code>xbt-nwc</code>) beside the signer \
+                        and point <code>XBT_UI_NWC_SOCK</code> at its admin socket.</p></details></section>");
             return b;
         };
         let status = link.call("nwc_status", json!({}));
@@ -57,7 +59,7 @@ impl App {
         let (status, list) = match (status, list) {
             (Ok(s), Ok(l)) => (s, l),
             (Err(e), _) | (_, Err(e)) => {
-                b.push_str(&Self::error_box(&format!("The NWC wallet service does not answer: {e}")));
+                b.push_str(&Self::error_box(&format!("The service that connects apps does not answer: {e}")));
                 return b;
             }
         };
@@ -87,7 +89,7 @@ impl App {
             Ok(r) => match r.get("uri").and_then(Value::as_str) {
                 Some(uri) => {
                     let body = self.apps_html(ctx, Some((&r["connection"], uri)));
-                    self.page("Connected apps", ctx, body)
+                    self.page("Apps", ctx, body)
                 }
                 None => {
                     self.flash(ctx, false, "The NWC wallet service made no connection string.");
@@ -116,24 +118,24 @@ fn new_form(ctx: &Ctx, status: &Value) -> String {
     let relays: Vec<String> = status.get("default_relays").and_then(Value::as_array).into_iter().flatten().map(|r| txt(Some(r))).collect();
     let mut methods = String::new();
     for (m, what) in METHODS {
-        methods.push_str(&format!("<label class=\"check\"><input type=\"checkbox\" name=\"m_{m}\" value=\"1\" checked> <code>{m}</code>: {}</label>",
+        methods.push_str(&format!("<label class=\"check\" title=\"{m}\"><input type=\"checkbox\" name=\"m_{m}\" value=\"1\" checked> {}</label>",
                                   esc(what)));
     }
     let mut expiry = String::new();
     for (s, name) in EXPIRIES {
         expiry.push_str(&format!("<option value=\"{s}\"{}>{name}</option>", if s == 30 * 86_400 { " selected" } else { "" }));
     }
-    format!("<section class=\"card\"><h2>Connect an app</h2>\
-             <p>Nostr Wallet Connect lets another app (a phone wallet, a browser extension, an agent) pay through this wallet. Every payment \
-             goes through the signer and your policy, as an agent's does: your budgets, your approval threshold, XBT Lightning invoices only. \
-             The connection's own budget, expiry and methods limit it further. The app never holds a key of this wallet, and this wallet holds \
-             nobody else's money. Making invoices (receiving) is not offered yet.</p>\
+    format!("<section class=\"card primary\"><h2>Connect an app</h2>\
+             <p>The app gets a connection string to paste or scan (Nostr Wallet Connect). Every payment it makes keeps to your spending rules \
+             and to the connection's own budget. It never holds a key of this wallet, and this wallet holds nobody else's money. \
+             Receiving payments this way is not offered yet.</p>\
              <form method=\"post\" action=\"./apps-create\" class=\"stack\">{}\
              <label>Name (for you)<input name=\"name\" maxlength=\"64\" placeholder=\"Phone wallet\" required></label>\
              <label>Budget (sats per 24 hours)<input name=\"budget_sats_per_day\" type=\"number\" min=\"1\" step=\"1\" value=\"1000\" required></label>\
              <label>Expires after<select name=\"expires_in_s\">{expiry}</select></label>\
              <fieldset><legend>The app may</legend>{methods}</fieldset>\
-             <label>Relays (one per line, <code>wss://</code>)<textarea name=\"relays\" rows=\"3\">{}</textarea></label>\
+             <details><summary>Advanced</summary><label>Relays the app's messages go through (one per line, <code>wss://</code>)\
+             <textarea name=\"relays\" rows=\"3\">{}</textarea></label></details>\
              <button type=\"submit\">Make the connection</button></form></section>",
             App::csrf_input(ctx), esc(&relays.join("\n")))
 }
@@ -141,7 +143,7 @@ fn new_form(ctx: &Ctx, status: &Value) -> String {
 fn list_html(ctx: &Ctx, list: &Value) -> String {
     let cs = list.get("connections").and_then(Value::as_array).cloned().unwrap_or_default();
     if cs.is_empty() {
-        return "<section class=\"card\"><h2>Connections</h2><p class=\"empty\">No app is connected.</p></section>".into();
+        return "<section class=\"card\"><h2>Connected apps</h2><p class=\"empty\">No app is connected.</p></section>".into();
     }
     let mut rows = String::new();
     for c in &cs {
@@ -166,7 +168,7 @@ fn list_html(ctx: &Ctx, list: &Value) -> String {
             if pending > 0 { format!(", {pending} in flight") } else { String::new() }, sats(int(c.get("spent_total_sats"))), methods.join(" "),
             relays.join("<br>"), if last > 0 { utc(last) } else { "never".into() }, App::csrf_input(ctx), esc(&txt(c.get("id")))));
     }
-    format!("<section class=\"card\"><h2>Connections</h2><div class=\"scroll\"><table><thead><tr><th>App</th><th>Expires</th>\
+    format!("<section class=\"card\"><h2>Connected apps</h2><div class=\"scroll\"><table><thead><tr><th>App</th><th>Expires</th>\
              <th>Spent (24 h)</th><th>Spent in all</th><th>May</th><th>Relays</th><th>Last used</th><th></th></tr></thead><tbody>{rows}</tbody>\
              </table></div><p class=\"small\">Revoking takes effect at once: the service stops answering that app.</p></section>")
 }
@@ -182,5 +184,5 @@ fn relays_html(status: &Value) -> String {
         let err = r.get("last_error").filter(|e| !e.is_null()).map(|e| format!(" <span class=\"small\">{}</span>", esc(&txt(Some(e))))).unwrap_or_default();
         items.push_str(&format!("<li><code>{}</code> {state}{err}</li>", esc(&txt(r.get("url")))));
     }
-    format!("<section class=\"card\"><h2>Relays</h2><ul>{items}</ul></section>")
+    format!("<details class=\"card\"><summary>Relays</summary><ul>{items}</ul></details>")
 }

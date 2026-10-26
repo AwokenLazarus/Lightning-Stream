@@ -23,7 +23,7 @@ const TAG_1: &str = "xbt402/listing/1";
 /// At most this many services in one listing.
 const MAX_SERVICES: usize = 32;
 
-const KINDS: [&str; 3] = ["video", "files", "api"];
+const KINDS: [&str; 4] = ["video", "files", "api", "ai"];
 const PRICE_KEYS: [&str; 4] = ["request_msat", "byte_msat", "per_bytes", "second_msat"];
 /// A fetched document larger than this is refused before it is parsed.
 const MAX_BODY: usize = 256 << 10;
@@ -140,7 +140,7 @@ pub fn parse_draft(v: &Value) -> Result<Draft, String> {
     }
     let kind = req_str(m, "kind")?;
     if !KINDS.contains(&kind) {
-        return Err("kind is video, files or api".into());
+        return Err("kind is video, files, api or ai".into());
     }
     let prices = price_strings(m.get("prices").ok_or("prices is missing")?)?;
     let items_v = m.get("items").and_then(Value::as_array).ok_or("items is a list")?;
@@ -191,7 +191,7 @@ fn parse_section(v: &Value, n: usize) -> Result<Section, String> {
     }
     let kind = req_str(m, "kind").map_err(|e| format!("{what}: {e}"))?;
     if !KINDS.contains(&kind) {
-        return Err(format!("{what}: kind is video, files or api"));
+        return Err(format!("{what}: kind is video, files, api or ai"));
     }
     let path = req_str(m, "path").map_err(|e| format!("{what}: {e}"))?;
     if !route_path(path) {
