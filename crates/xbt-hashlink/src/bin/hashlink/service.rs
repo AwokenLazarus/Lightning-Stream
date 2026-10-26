@@ -8,6 +8,10 @@
 //!   "graceMs": 45000, "rentable": 3, "name": "My miners", "linkPublic": "host:port",
 //!   "payUrl": "https://shop.example/hashrate", "payNode": "02…", "minersPublic": "host:port"}`
 //!
+//! `linkPublic` is the address renters outside this network reach the link at (a port forward or a
+//! tunnel). Without it no listing goes to the relays: an address only the LAN can reach would send
+//! renters nowhere. `--link-lan` is the address shown for renters on the same network.
+//!
 //! Without `payNode`, the node is read from the hasher's gateway (`--gateway`, its `/services`).
 //! A missing `--key` or `--nostr-key` file is made at the first start.
 
@@ -23,10 +27,45 @@ use xbt_hashlink::listing::Capacity;
 use xbt_hashlink::msg::Terms;
 use xbt_hashlink::rail::LabSeller;
 
-/// A listing is published again at most this often when what is free changes.
-const REPUBLISH_MIN: Duration = Duration::from_secs(15);
-/// And at least this often, so relays keep it.
-const REPUBLISH_MAX: Duration = Duration::from_secs(1800);
+/// A change in what is for rent (miners, free miners, renting on or off, the terms, the name) is
+/// published again after at least this long since the last publish.
+const REPUBLISH_CAPACITY: Duration = Duration::from_secs(60);
+/// A change in the measured hashrate alone is news only when it moves more than this share of the
+/// published value, and is published at most this often: public relays rate-limit.
+const REPUBLISH_HASHRATE: Duration = Duration::from_secs(600);
+const HASHRATE_MOVE: f64 = 0.20;
+/// And at least this often, so relays keep it (as the gateway's listing).
+const REPUBLISH_MAX: Duration = Duration::from_secs(6 * 3600);
+
+/// What a published listing said, to compare the next one against.
+#[derive(Clone, Debug, PartialEq)]
+struct Said {
+    cap: Capacity,
+    renting: bool,
+    terms: Terms,
+    name: String,
+}
+
+/// Whether to publish now, `since` after the last attempt (`ok`: whether it was taken).
+fn due(last: Option<(&Said, bool)>, now: &Said, since: Duration) -> bool {
+    let Some((l, ok)) = last else {
+        // the first: once a miner is there to offer
+        return now.cap.miners > 0;
+    };
+    if since >= REPUBLISH_MAX || (!ok && since >= REPUBLISH_CAPACITY) {
+        return true;
+    }
+    let what = l.cap.miners != now.cap.miners
+        || l.cap.free_miners != now.cap.free_miners
+        || l.renting != now.renting
+        || l.terms != now.terms
+        || l.name != now.name;
+    if what {
+        return since >= REPUBLISH_CAPACITY;
+    }
+    let (a, b) = (l.cap.free_hs as f64, now.cap.free_hs as f64);
+    (a - b).abs() > a.max(1.0) * HASHRATE_MOVE && since >= REPUBLISH_HASHRATE
+}
 
 #[derive(Clone, Debug, PartialEq)]
 struct Settings {
@@ -151,6 +190,7 @@ pub fn run(f: &HashMap<String, String>, key: SecretKey) -> Result<(), String> {
     if let Some(addr) = f.get("control") {
         let (h, published, shared) = (h.clone(), published.clone(), shared.clone());
         let miners_default = f.get("miners").cloned().unwrap_or_default();
+        let link_lan = f.get("link-lan").cloned().or_else(|| f.get("link").cloned()).unwrap_or_default();
         let listing = f.contains_key("relays");
         let token = f.get("control-token-file").map(|p| http::token(p)).transpose()?;
         http::serve(addr, token, Arc::new(move |method, path, _body| {
@@ -164,6 +204,7 @@ pub fn run(f: &HashMap<String, String>, key: SecretKey) -> Result<(), String> {
                         "linkPublic": s.link_public, "payUrl": s.pay_url, "payNode": s.pay_node,
                     });
                     v["minersAddress"] = json!(s.miners_public.clone().unwrap_or_else(|| miners_default.clone()));
+                    v["linkLan"] = json!(link_lan);
                     v["listing"] = if listing { published.lock().unwrap_or_else(|p| p.into_inner()).clone() } else { json!({"relays": "none set"}) };
                     (200, v)
                 }
@@ -181,8 +222,8 @@ pub fn run(f: &HashMap<String, String>, key: SecretKey) -> Result<(), String> {
     }
     eprintln!("hasher: serving; renting {}", if settings.enabled && settings.fallback.is_some() { "on" } else { "off" });
     let mut seen = mtime(&path);
-    let mut last_cap: Option<(Capacity, bool, Terms, String)> = None;
-    let mut last_pub = Instant::now() - REPUBLISH_MAX;
+    let mut last: Option<(Said, bool)> = None;
+    let mut last_pub = Instant::now();
     loop {
         std::thread::sleep(Duration::from_secs(2));
         let m = mtime(&path);
@@ -202,51 +243,120 @@ pub fn run(f: &HashMap<String, String>, key: SecretKey) -> Result<(), String> {
         let Some(r) = f.get("relays") else { continue };
         let renting = settings.enabled && settings.fallback.is_some();
         let cap = if renting { h.capacity() } else { Capacity { free_miners: 0, free_hs: 0, ..h.capacity() } };
-        let now = (cap, renting, settings.terms.clone(), settings.name.clone());
-        let changed = last_cap.as_ref().is_none_or(|l| {
-            // a hashrate that moves a little is not news
-            let (a, b) = (l.0.free_hs as f64, cap.free_hs as f64);
-            l.0.miners != cap.miners || l.0.free_miners != cap.free_miners || l.1 != renting || l.2 != now.2 || l.3 != now.3 || (a - b).abs() > a.max(b) * 0.25
-        });
-        if (changed && last_pub.elapsed() > REPUBLISH_MIN) || last_pub.elapsed() > REPUBLISH_MAX {
-            if cap.miners == 0 && last_cap.is_none() && last_pub.elapsed() < REPUBLISH_MAX {
-                // nothing to say yet: no miner has connected
-                continue;
-            }
-            last_pub = Instant::now();
-            let mut fl = f.clone();
-            fl.insert("name".into(), settings.name.clone());
-            if settings.pay_node.is_none() {
-                if let Some(n) = f.get("gateway").and_then(|g| gateway_node(g)) {
-                    settings.pay_node = Some(n);
-                    *shared.lock().unwrap_or_else(|p| p.into_inner()) = settings.clone();
-                }
-            }
-            for (k, v) in [("link-public", &settings.link_public), ("pay-url", &settings.pay_url), ("pay-node", &settings.pay_node)] {
-                match v {
-                    Some(v) => {
-                        fl.insert(k.into(), v.clone());
-                    }
-                    None => {
-                        *published.lock().unwrap_or_else(|p| p.into_inner()) =
-                            json!({"ok": false, "why": format!("not published: {k} is not set yet"), "atMs": xbt_hashlink::now_ms()});
-                        last_cap = Some(now.clone());
-                    }
-                }
-            }
-            if ["link-public", "pay-url", "pay-node"].iter().any(|k| !fl.contains_key(*k)) {
-                continue;
-            }
-            let res = super::listing_of(&fl, &key_of(f)?, &settings.terms, cap).and_then(|l| super::publish(&fl, r, &key_of(f)?, &l).map(|_| l));
-            *published.lock().unwrap_or_else(|p| p.into_inner()) = match &res {
-                Ok(l) => json!({"ok": true, "atMs": xbt_hashlink::now_ms(), "freeMiners": l.capacity.free_miners, "miners": l.capacity.miners}),
-                Err(e) => json!({"ok": false, "why": e, "atMs": xbt_hashlink::now_ms()}),
-            };
-            last_cap = Some(now);
+        let now = Said { cap, renting, terms: settings.terms.clone(), name: settings.name.clone() };
+        if !due(last.as_ref().map(|(s, ok)| (s, *ok)), &now, last_pub.elapsed()) {
+            continue;
         }
+        if settings.pay_node.is_none() {
+            if let Some(n) = f.get("gateway").and_then(|g| gateway_node(g)) {
+                settings.pay_node = Some(n);
+                *shared.lock().unwrap_or_else(|p| p.into_inner()) = settings.clone();
+            }
+        }
+        // no public address renters can reach: no listing on public relays (one naming an address
+        // only the LAN can reach would send renters nowhere)
+        let missing = [
+            ("link-public", &settings.link_public, "Add the address renters use to reach your miners (it needs a port forward or a tunnel). Until then your offer is not published; renters on your own network can still use this box's address."),
+            ("pay-url", &settings.pay_url, "Set your shop's public address on the Sell page first."),
+            ("pay-node", &settings.pay_node, "Your shop's Lightning node is not known yet."),
+        ]
+        .into_iter()
+        .find(|(_, v, _)| v.is_none());
+        if let Some((k, _, why)) = missing {
+            let was = published.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            if was.get("missing").and_then(Value::as_str) != Some(k) {
+                eprintln!("hasher: listing not published: {k} is not set");
+            }
+            *published.lock().unwrap_or_else(|p| p.into_inner()) = json!({"ok": false, "missing": k, "why": why, "atMs": xbt_hashlink::now_ms()});
+            // asked again only when something changes, or after the long timer
+            last = Some((now, true));
+            last_pub = Instant::now();
+            continue;
+        }
+        let mut fl = f.clone();
+        fl.insert("name".into(), settings.name.clone());
+        for (k, v) in [("link-public", &settings.link_public), ("pay-url", &settings.pay_url), ("pay-node", &settings.pay_node)] {
+            if let Some(v) = v {
+                fl.insert(k.into(), v.clone());
+            }
+        }
+        let res = super::listing_of(&fl, &key_of(f)?, &settings.terms, cap).and_then(|l| super::publish(&fl, r, &key_of(f)?, &l).map(|_| l));
+        *published.lock().unwrap_or_else(|p| p.into_inner()) = match &res {
+            Ok(l) => json!({"ok": true, "atMs": xbt_hashlink::now_ms(), "freeMiners": l.capacity.free_miners, "miners": l.capacity.miners}),
+            Err(e) => json!({"ok": false, "why": e, "atMs": xbt_hashlink::now_ms()}),
+        };
+        last = Some((now, res.is_ok()));
+        last_pub = Instant::now();
     }
 }
 
 fn key_of(f: &HashMap<String, String>) -> Result<SecretKey, String> {
     super::read_key(super::need(f, "key")?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn said(miners: u32, free: u32, hs: u64) -> Said {
+        Said { cap: Capacity { miners, free_miners: free, free_hs: hs }, renting: true, terms: Terms { slice_work: 1 << 47, price_msat: 40_000, grace_ms: 45_000 }, name: "m".into() }
+    }
+    const S: fn(u64) -> Duration = Duration::from_secs;
+
+    #[test]
+    fn a_wobbling_hashrate_is_not_republished() {
+        let last = said(1, 1, 4_000_000_000_000);
+        // 2.9 TH/s against 4.0 published: a 27% move, but only ten minutes after the last publish
+        let now = said(1, 1, 2_900_000_000_000);
+        assert!(!due(Some((&last, true)), &now, S(30)));
+        assert!(!due(Some((&last, true)), &now, S(599)));
+        assert!(due(Some((&last, true)), &now, S(600)));
+        // a move under 20% waits for the long timer
+        let small = said(1, 1, 3_500_000_000_000);
+        assert!(!due(Some((&last, true)), &small, S(3 * 3600)));
+        assert!(due(Some((&last, true)), &small, S(6 * 3600)));
+    }
+
+    #[test]
+    fn what_is_for_rent_is_republished_after_a_minute() {
+        let last = said(1, 1, 4_000_000_000_000);
+        let rented = said(1, 0, 0);
+        assert!(!due(Some((&last, true)), &rented, S(59)));
+        assert!(due(Some((&last, true)), &rented, S(60)));
+        let mut off = last.clone();
+        off.renting = false;
+        assert!(due(Some((&last, true)), &off, S(60)));
+        let mut priced = last.clone();
+        priced.terms.price_msat = 50_000;
+        assert!(due(Some((&last, true)), &priced, S(60)));
+    }
+
+    #[test]
+    fn the_first_waits_for_a_miner_and_a_refusal_is_retried_after_a_minute() {
+        assert!(!due(None, &said(0, 0, 0), S(0)));
+        assert!(due(None, &said(1, 1, 1), S(0)));
+        let last = said(1, 1, 4_000_000_000_000);
+        assert!(!due(Some((&last, false)), &last, S(30)));
+        assert!(due(Some((&last, false)), &last, S(60)));
+        assert!(!due(Some((&last, true)), &last, S(3600)));
+    }
+
+    #[test]
+    fn six_wobbles_in_two_minutes_publish_once() {
+        // what the box saw: the measured rate moving every 20 s
+        let rates = [4.1e12, 2.9e12, 3.8e12, 2.6e12, 4.4e12, 3.0e12, 3.9e12];
+        let mut last: Option<(Said, bool)> = None;
+        let mut since = S(0);
+        let mut published = 0;
+        for r in rates {
+            let now = said(1, 1, r as u64);
+            if due(last.as_ref().map(|(s, ok)| (s, *ok)), &now, since) {
+                published += 1;
+                last = Some((now, true));
+                since = S(0);
+            }
+            since += S(20);
+        }
+        assert_eq!(published, 1);
+    }
 }

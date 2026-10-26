@@ -105,6 +105,7 @@ ARG TARGETVARIANT
 COPY --chmod=0555 bin/${TARGETARCH}${TARGETVARIANT}/xbt-hashlink /usr/bin/xbt-hashlink
 USER xbt-hashrate
 ENTRYPOINT ["/usr/bin/xbt-hashlink"]
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 CMD ["/usr/bin/xbt-hashlink", "healthcheck"]
 
 # The one image that runs as root: it exits once the data dir's owners and modes are right. Run it with
 # cap_drop ALL + CHOWN, FOWNER, DAC_OVERRIDE, no network, read-only (docs/CONTAINER.md §7).

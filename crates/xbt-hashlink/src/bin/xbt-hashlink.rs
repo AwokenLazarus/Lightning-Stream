@@ -8,7 +8,7 @@
 //!                     [--relays URL,URL --nostr-key F --name N --link-public ADDR --pay-url URL --pay-node HEX
 //!                      --hashrate-hs N [--listing-out F]]    publish the hashrate listing first
 //!                     [--fallback ADDR [--rentable N] [--control ADDR [--control-token-file F]] [--config F]
-//!                      [--gateway URL] [--miners-public ADDR]]
+//!                      [--gateway URL] [--miners-public ADDR] [--link-lan ADDR]]
 //!                         keep serving: miners not rented hash at the fallback, any number of rentals,
 //!                         a control page for the app (GET /status, POST /stop/RENTAL), settings read
 //!                         from F as they change; without --fallback and --config: one rental, then exit
@@ -21,6 +21,9 @@
 //!                     | --find URL,URL [--expect-node HEX] [--max-price-msat P] [--found-out F] )
 //!                     [--signer SOCK --task T --max-sats N [--pay-url URL]]   pay through the wallet
 //! xbt-hashlink relay  --listen ADDR                 a stand-in Nostr relay (in memory, for a lab or a rehearsal)
+//! xbt-hashlink healthcheck [ADDR ...]              the image's HEALTHCHECK (it has no shell or curl): exit 0
+//!                                                  when a control page answers on one of ADDR (default
+//!                                                  127.0.0.1:23342, the hasher's, and 127.0.0.1:23343, the renter's)
 //! xbt-hashlink standin-pool  --listen ADDR --diff D [--job-ms MS] [--report F]
 //! xbt-hashlink standin-miner --pool ADDR --user U [--rate SHARES_PER_S] [--bad-every N] [--duration-s S]
 //!                            [--reconnect 1] [--extranonce-subscribe 1]
@@ -92,6 +95,20 @@ fn write_json(path: Option<&String>, v: &serde_json::Value) {
     }
 }
 
+/// A control page answers on `addr`: it takes a connection and replies to a request with an HTTP
+/// status line (401 without the token counts: the page is up).
+fn healthy(addr: &str) -> bool {
+    use std::io::{Read, Write};
+    let Some(sa) = std::net::ToSocketAddrs::to_socket_addrs(addr).ok().and_then(|mut a| a.next()) else { return false };
+    let Ok(mut s) = std::net::TcpStream::connect_timeout(&sa, Duration::from_secs(3)) else { return false };
+    let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+    if s.write_all(format!("GET /status HTTP/1.0\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes()).is_err() {
+        return false;
+    }
+    let mut head = [0u8; 12];
+    s.read_exact(&mut head).is_ok() && head.starts_with(b"HTTP/1.")
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Err(e) = run(&args) {
@@ -114,6 +131,15 @@ fn run(args: &[String]) -> Result<(), String> {
             let k = read_key(rest.first().ok_or("pubkey KEYFILE")?)?;
             println!("{}", hex::encode(pubkey(&k).serialize()));
             Ok(())
+        }
+        "healthcheck" => {
+            let defaults = ["127.0.0.1:23342".to_string(), "127.0.0.1:23343".to_string()];
+            let addrs = if rest.is_empty() { &defaults[..] } else { rest };
+            if addrs.iter().any(|a| healthy(a)) {
+                Ok(())
+            } else {
+                Err(format!("no control page answers on {}", addrs.join(", ")))
+            }
         }
         "hasher" => hasher_cmd(&flags(rest)?),
         "buyer" => buyer_cmd(&flags(rest)?),

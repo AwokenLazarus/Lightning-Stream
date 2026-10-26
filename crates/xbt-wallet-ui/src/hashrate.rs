@@ -217,6 +217,7 @@ impl App {
         let rentable = pick("rentable").and_then(|v| v.as_u64()).map(|n| n.to_string()).unwrap_or_default();
         let name = pick("name").and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
         let link_public = pick("linkPublic").and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+        let link_lan = st.as_ref().ok().and_then(|s| s["linkLan"].as_str().map(str::to_string)).filter(|a| !a.is_empty()).unwrap_or_else(|| "this box's address, port 23341".into());
         let grace_s = pick("graceMs").and_then(|v| v.as_u64()).unwrap_or(45_000) / 1000;
         b.push_str(&format!("<section class=\"card primary\"><h2>{}</h2><form method=\"post\" action=\"./sell-hashrate\">{csrf}\
             <input type=\"hidden\" name=\"action\" value=\"save\">\
@@ -227,23 +228,27 @@ impl App {
             <p class=\"hint\">At this price a {} miner earns about <strong>{}</strong> an hour while it is rented.</p>\
             <label>Miners to rent out at most <small>(empty: all of them)</small><input name=\"rentable\" value=\"{}\" inputmode=\"numeric\" pattern=\"[0-9]*\"></label>\
             <label>Name, as renters see it<input name=\"name\" value=\"{}\" maxlength=\"80\" placeholder=\"My miners\"></label>\
+            <label>Address renters use to reach your miners (needs a port forward or tunnel)<input name=\"link_public\" value=\"{}\" class=\"mono\" \
+            pattern=\"[A-Za-z0-9.\\-\\[\\]:]+:[0-9]+\" title=\"An address with its port, like my-box.example.com:23341\" placeholder=\"my-box.example.com:23341\"></label>\
+            <p class=\"hint\">Renters' apps connect to this box's port 23341. Leave it empty and your offer stays off public listings; renters on your own network can still use {}.</p>\
             <label class=\"check\"><input type=\"checkbox\" name=\"enabled\" value=\"1\"{}> Rent out my miners</label>\
             <details><summary>Advanced</summary>\
-            <label>Where renters' apps reach this box (address and port)<input name=\"link_public\" value=\"{}\" class=\"mono\" placeholder=\"my-box.example.com:23335\"></label>\
-            <p class=\"hint\">Renters connect here directly. It needs this box's port 23335 open to them, or a tunnel.</p>\
             <label>Work in each piece (hashes)<input name=\"slice_work\" value=\"{:.0}\" inputmode=\"numeric\" pattern=\"[0-9]+\" class=\"mono\"></label>\
             <label>How long to wait for each payment, in seconds<input name=\"grace_s\" value=\"{grace_s}\" inputmode=\"numeric\" pattern=\"[0-9]+\"></label>\
             </details><div class=\"row\"><button>{}</button></div></form></section>",
             if on { "Change renting" } else { "Rent out your miners" }, esc(&fallback), speed(EXAMPLE_HS), sats_n(per_hour(price as f64, slice, EXAMPLE_HS)),
-            esc(&rentable), esc(&name), if on || saved.get("enabled").is_none() { " checked" } else { "" }, esc(&link_public), slice,
+            esc(&rentable), esc(&name), esc(&link_public), esc(&link_lan), if on || saved.get("enabled").is_none() { " checked" } else { "" }, slice,
             if on { "Save" } else { "Save and start renting" }));
         if let Ok(s) = &st {
-            b.push_str(&format!("<details class=\"card advanced\"><summary>What renters see</summary><p class=\"small\">{}</p></details>",
-                match s["listing"].get("ok") {
-                    Some(Value::Bool(true)) => format!("Your offer is published: {} of {} miners free.", s["listing"]["freeMiners"], s["listing"]["miners"]),
-                    Some(Value::Bool(false)) => format!("Your offer is not published yet: {}", esc(s["listing"]["why"].as_str().unwrap_or(""))),
-                    _ => "Your offer is not published yet.".into(),
-                }));
+            match s["listing"].get("ok") {
+                Some(Value::Bool(true)) => b.push_str(&format!(
+                    "<section class=\"card\"><p><span class=\"pill good\">Listed</span> Your offer is on public listings: {} of {} miners free.</p></section>",
+                    s["listing"]["freeMiners"], s["listing"]["miners"])),
+                Some(Value::Bool(false)) => b.push_str(&format!(
+                    "<section class=\"card\"><p><span class=\"pill warn\">Not listed</span> {}</p></section>",
+                    esc(s["listing"]["why"].as_str().unwrap_or("Your offer is not published yet.")))),
+                _ => b.push_str("<section class=\"card\"><p><span class=\"pill warn\">Not listed yet</span> Your offer goes on public listings once a miner is connected.</p></section>"),
+            }
         }
         self.html_page("Sell hashrate", "Sell hashrate", ctx, &b, "")
     }
@@ -280,9 +285,12 @@ impl App {
                 v["sliceWork"] = json!(slice.to_string());
                 v["graceMs"] = json!(grace.clamp(5, 600) * 1000);
                 v["name"] = json!(if g("name").is_empty() { "Hashrate".to_string() } else { g("name").chars().take(80).collect() });
-                if !g("link_public").is_empty() {
-                    v["linkPublic"] = json!(g("link_public"));
+                let link = g("link_public");
+                if !link.is_empty() && (!link.contains(':') || link.contains(['/', ' '])) {
+                    return Err("Write the address renters use with its port, like my-box.example.com:23341.".into());
                 }
+                // empty clears it: no listing on public relays until it is set
+                v["linkPublic"] = json!(link);
                 if !shop.public_url.is_empty() {
                     v["payUrl"] = json!(format!("{}/hashrate", shop.public_url.trim_end_matches('/')));
                 }

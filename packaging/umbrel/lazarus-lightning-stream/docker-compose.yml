@@ -13,6 +13,7 @@
 #
 # Hashrate: two services of the xbt-hashlink image, as xbt-hashrate. The hasher takes this box's
 # miners on host port 23340 (LAN) and renters' apps on 23341, which needs a port forward or a tunnel
+# (the owner writes that public address on Sell → Hashrate; without it no listing goes to public relays)
 # to be reached from outside. Until the owner turns renting on (Sell → Hashrate, which writes
 # run/hashrate/settings.json), it publishes nothing and lets miners that connect go. A miner nobody
 # rents hashes for the owner's own pool. Renters pay each piece of work through this app's gateway,
@@ -270,7 +271,7 @@ services:
               "--control", "0.0.0.0:23342", "--control-token-file", "/data/run/hashrate/control-token",
               "--config", "/data/run/hashrate/settings.json", "--relays", "wss://relay.damus.io,wss://nos.lol",
               "--gateway", "http://lazarus-lightning-stream_gateway_1:8402",
-              "--miners-public", "${DEVICE_DOMAIN_NAME}:23340", "--link-public", "${DEVICE_DOMAIN_NAME}:23341",
+              "--miners-public", "${DEVICE_DOMAIN_NAME}:23340", "--link-lan", "${DEVICE_DOMAIN_NAME}:23341",
               "--report", "/data/hashrate/hasher.json"]
     ports:
       # this box's miners, on the LAN

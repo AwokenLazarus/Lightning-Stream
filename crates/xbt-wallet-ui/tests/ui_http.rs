@@ -1664,7 +1664,7 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
     // Sell → Hashrate: where to point the miners, each miner, the rental going on
     let p = br.get("/sell-hashrate");
     assert_eq!(p.status, 200);
-    for s in ["Renting out: 1 of 2 miners rented", "stratum+tcp://umbrel.local:23334", "Your pool", "Rented out", "4.10 TH/s", "120 sats", "Stop this rental"] {
+    for s in ["Renting out: 1 of 2 miners rented", "stratum+tcp://umbrel.local:23334", "Your pool", "Rented out", "4.10 TH/s", "120 sats", "Stop this rental", "Listed"] {
         assert!(p.body.contains(s), "{s} missing from Sell hashrate");
     }
     assert!(p.body.contains("href=\"./sell-hashrate\" aria-current"), "Hashrate is a tab of Sell");
@@ -1704,6 +1704,56 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
     let r = br.act("/connections", "/hashrate", &[("action", "cut"), ("rental", "r9"), ("back", "connections")]);
     assert_eq!(r.location(), "./connections");
     assert!(rseen.lock().unwrap().iter().any(|(m, p, _, b)| m == "POST" && p == "/cut" && b.contains("r9")));
+}
+
+/// Without an address renters outside can reach, the offer stays off public listings and the page
+/// says why in plain words; the address is set, and cleared, on the page.
+#[test]
+fn hashrate_without_a_public_address_is_not_listed_and_says_why() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (hasher, _hseen) = control_standin(|m, p| match (m, p) {
+        ("GET", "/status") => json!({
+            "open": true, "settings": {"enabled": true, "fallback": "192.168.1.20:23334", "priceSat": 40, "sliceWork": "140737488355328", "graceMs": 45000,
+                                       "rentable": 1, "name": "Basement miners", "linkPublic": null},
+            "minersAddress": "umbrel.local:23340", "linkLan": "umbrel.local:23341",
+            "listing": {"ok": false, "missing": "link-public",
+                        "why": "Add the address renters use to reach your miners (it needs a port forward or a tunnel). Until then your offer is not published; renters on your own network can still use this box's address."},
+            "miners": [{"name": "s11", "connected": true, "hashrateHs": 4.1e12, "rentedTo": null, "earnedMsat": 0}], "rentals": []}),
+        _ => json!({"error": "no"}),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let htok = dir.path().join("hasher-token");
+    std::fs::write(&htok, "h".repeat(64)).unwrap();
+    let settings = dir.path().join("hashrate/settings.json");
+    let gw = dir.path().join("gateway");
+    std::fs::create_dir_all(&gw).unwrap();
+    let bx = start(json!({}), false, |c| {
+        c.sell = true;
+        c.gw.dir = gw.clone();
+        c.gw.node_rest = Some("https://10.21.21.66:8180".into());
+        c.hash.hasher = Some(hasher.clone());
+        c.hash.hasher_token = Some(htok.clone());
+        c.hash.settings = settings.clone();
+    });
+    let mut br = logged_in(&bx);
+    let p = br.get("/sell-hashrate");
+    for s in ["Not listed", "Add the address renters use to reach your miners", "Address renters use to reach your miners (needs a port forward or tunnel)",
+              "umbrel.local:23341"] {
+        assert!(p.body.contains(s), "{s} missing from Sell hashrate: {}", p.body);
+    }
+    fn save(link: &str) -> [(&str, &str); 7] {
+        [("action", "save"), ("fallback", "192.168.1.20:23334"), ("price", "40"), ("rentable", "1"), ("name", "Basement miners"),
+                             ("enabled", "1"), ("link_public", link)]
+    }
+    let r = br.act("/sell-hashrate", "/sell-hashrate", &save("not an address"));
+    assert!(br.flash_after(&r).contains("with its port"), "a bad address is refused");
+    let r = br.act("/sell-hashrate", "/sell-hashrate", &save("miners.example.com:23341"));
+    assert!(br.flash_after(&r).starts_with("Saved."));
+    let read = || serde_json::from_str::<Value>(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    assert_eq!(read()["linkPublic"], json!("miners.example.com:23341"));
+    let r = br.act("/sell-hashrate", "/sell-hashrate", &save(""));
+    assert!(br.flash_after(&r).starts_with("Saved."));
+    assert_eq!(read()["linkPublic"], json!(""), "an empty address clears it: no listing on public relays");
 }
 
 // --- no setup on a box: the node connects itself, the box's login, the code, the player, your shop --
