@@ -2,7 +2,7 @@ manifestVersion: 1.1
 id: lazarus-lightning-stream
 category: lightning
 name: Lightning Stream
-version: "0.1.6"
+version: "0.1.7"
 tagline: Buy and sell any service over Lightning from this box, paid as you use it
 description: >-
   One app for both sides. The wallet pays sellers with stream tickets under a policy you sign, and
@@ -46,6 +46,9 @@ gallery:
   - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/4.png
   - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/5.png
 releaseNotes: >-
+  0.1.7: your hashrate offer goes on public listings only once you give the address renters use to reach
+  your miners (Sell, Hashrate; it needs a port forward or a tunnel), and is published again only when
+  what you offer changes, not with every wobble of the measured hashrate.
   0.1.6: rent out this box's miners and rent other people's (Sell and Services, Hashrate): idle miners
   hash for your own pool, each rental takes whole miners and pays per piece of work.
   0.1.5: the app no longer skips its password for a peer named like the box's login proxy (umbrelOS
