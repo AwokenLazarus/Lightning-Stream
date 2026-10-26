@@ -1161,7 +1161,15 @@ impl Signer {
                         let rule = str_or_empty(o.get("rule"));
                         break 'open Err(if NEXT_RAIL.contains(&rule.as_str()) { Tried::Next(format!("{rule}: {}", str_or_empty(o.get("reason")))) } else { Tried::Done(o) });
                     }
-                    let offer = prepaid.as_ref().and_then(|(_, a)| xbt402::offer::entry_offer(a)).map(str::to_string);
+                    // the offer of the prepaid entry: the one beside the held entry, or the entry itself where the
+                    // seller sells prepaid tickets only
+                    let prepaid_only = acc.get("extra").and_then(|e| e.get("settle")).and_then(Value::as_str) == Some(xbt402::ticket::SETTLE_ON_ARRIVAL);
+                    let offer = match &prepaid {
+                        Some((_, a)) => xbt402::offer::entry_offer(a),
+                        None if prepaid_only => xbt402::offer::entry_offer(acc),
+                        None => None,
+                    }
+                    .map(str::to_string);
                     let h = Arc::new(HttpSession { origin: c.origin.into(), sid: str_or_empty(o.get("session")), task: task.clone(), terms: terms.clone(),
                                                    prepaid: prepaid_terms.clone(), offer, base, busy: Mutex::new(()),
                                                    paying: Mutex::new(()), link: Mutex::new(Link { seller_sid: String::new(), key: Zeroizing::new([0u8; 32]), next_seq: 0 }),
@@ -1477,17 +1485,28 @@ impl Signer {
     fn ticket_prepay_by_offer(&self, hs: &HttpSession, offer: &str) -> Option<Value> {
         if lock(&hs.link).seller_sid.is_empty() {
             let body = json!({"version": xbt402::ticket::VERSION, "settle": xbt402::ticket::SETTLE_ON_ARRIVAL, "by": "offer"});
-            self.ticket_lock_call(hs, body).ok()?;
+            if let Err(d) = self.ticket_lock_call(hs, body) {
+                self.ticket_offer_passed(hs, &str_or_empty(d.get("rule")), str_or_empty(d.get("reason")));
+                return None;
+            }
         }
         let (key, seller_session) = {
             let link = lock(&hs.link);
             (Zeroizing::new(*link.key), link.seller_sid.clone())
         };
         if seller_session.is_empty() {
+            self.ticket_offer_passed(hs, "ticket_seller", "the seller's lock by offer named no session".into());
             return None;
         }
         let by = crate::ticket_rail::OfferWay { offer, key: &key, seller_session: &seller_session };
         self.ticket_pay_by_offer(&hs.sid, &by, None, false)
+    }
+
+    /// The seller's offer left for its invoice before the payment by offer was tried, and why:
+    /// written down as [`Signer::ticket_pay_by_offer`] writes its own.
+    fn ticket_offer_passed(&self, hs: &HttpSession, rule: &str, why: String) {
+        self.ticket_audit("ticket_offer_passed", json!({"session": hs.sid, "dest": format!("ln:{}", hs.terms.terms.payee), "rule": rule, "reason": why,
+                                                        "win": Value::Null, "then": "the seller's invoice"}));
     }
 
     /// How many hashes the session's pool wants now, by the book (0 when the book cannot be read:

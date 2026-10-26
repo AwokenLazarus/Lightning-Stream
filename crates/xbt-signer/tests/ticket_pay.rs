@@ -3718,6 +3718,21 @@ fn a_prepaid_ticket_is_paid_by_the_sellers_offer_with_the_note_that_names_its_se
     r.assert_booked();
 }
 
+/// A seller that sells prepaid tickets only names its offer on that one entry, and every ticket
+/// is paid by it: none by invoice.
+#[test]
+fn a_seller_of_prepaid_tickets_only_is_paid_by_its_offer() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, json!({"tickets": {"settle": ["on-arrival"]}, "caps": {"sessions_per_address": 0, "strict": true}, "offers": {"enabled": true}}));
+    let v = r.pay("/page/10", 10);
+    assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{v}");
+    let locks = lock_bodies(&r);
+    assert!(!locks.is_empty() && locks.iter().all(|l| l["by"] == "offer"), "no ticket was asked for by invoice: {locks:?}");
+    assert!(r.audit("ticket_offer_passed").is_empty());
+    assert_eq!(r.shop.standin.offer_counts(), (1, 1));
+    assert_eq!(r.ledger_sum(), SETTLED);
+}
+
 /// An offer that gives no invoice costs nothing: the ticket is bought by the seller's invoice,
 /// and an owner who turned offers off is never asked for one.
 #[test]

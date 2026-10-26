@@ -1504,7 +1504,11 @@ impl Signer {
             Ok(i) => i,
             Err(e) => return passed("ln_invoice", format!("the invoice for the seller's offer is not a valid BOLT 12 invoice: {e}")),
         };
-        let terms = crate::bolt12::InvoiceTerms { amount_msat: amount, genesis: &genesis, now, min_expiry_s: 5, max_cltv_blocks: tp.max_htlc_blocks };
+        // a prepaid ticket or a win settles on arrival, as any payment of an offer by the Lightning
+        // rail: its blinded paths are held to that rail's limit (`ln.max_cltv_blocks`). The node's
+        // own blinded paths ask more than `tickets.max_htlc_blocks`, which is sized for held tickets
+        // (Lightning Fork's: 259 blocks for one hop)
+        let terms = crate::bolt12::InvoiceTerms { amount_msat: amount, genesis: &genesis, now, min_expiry_s: 5, max_cltv_blocks: lp.max_cltv_blocks };
         if let Err((rule, why)) = crate::bolt12::check_invoice(&o, &inv, &terms) {
             return passed(&rule, why);
         }
