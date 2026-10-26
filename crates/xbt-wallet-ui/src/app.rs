@@ -828,7 +828,7 @@ impl App {
             <input type=\"hidden\" name=\"f_unseen\" value=\"{}\">\
             <div class=\"row\"><button>Review the change</button> <a class=\"button-link\" href=\"./policy?template=starter\">Start from the safe starter rules</a></div></form>",
             esc(&allow), esc(&cps), esc(&Self::unseen_sections(p).to_string())));
-        b.push_str(&format!("<details><summary>Edit the rules as a file (policy.json)</summary><form method=\"post\" action=\"./policy\">{}\
+        b.push_str(&format!("<details><summary>Advanced: edit the rules as a file</summary><form method=\"post\" action=\"./policy\">{}\
             <input type=\"hidden\" name=\"mode\" value=\"json\"><textarea name=\"json\" rows=\"20\" class=\"mono\">{}</textarea>\
             <button>Review the change</button></form></details>", Self::csrf_input(ctx), esc(&serde_json::to_string_pretty(p).unwrap_or_default())));
         b
@@ -882,7 +882,8 @@ impl App {
         let errs: Vec<String> = cur["errors"].as_array().map(|a| a.iter().map(|x| txt(Some(x))).collect()).unwrap_or_default();
         let warns: Vec<String> = cur["warnings"].as_array().map(|a| a.iter().map(|x| txt(Some(x))).collect()).unwrap_or_default();
         b.push_str(&self.policy_form(ctx, &p, &cur["effective"], &errs, &warns));
-        b.push_str(&format!("<p class=\"small\">policy.json SHA-256 <code>{}</code></p>", escv(cur.get("sha256"))));
+        b.push_str(&format!("<details><summary>Advanced: the rules file's fingerprint</summary><p class=\"small\">policy.json SHA-256 <code>{}</code></p></details>",
+                            escv(cur.get("sha256"))));
         self.page("Spending rules", ctx, b)
     }
 
