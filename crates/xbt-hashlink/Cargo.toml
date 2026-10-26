@@ -1,0 +1,27 @@
+[package]
+name = "xbt-hashlink"
+description = "p2p-hash: rented hashrate over Lightning Stream. The hashrate link (BOLT 8 Noise_XK between the hasher's app and the buyer's app), the hasher's Stratum V1 endpoint for its miners, the buyer's Stratum V1 client to its own DATUM Gateway, the work meter and per-slice ticket releases"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# BOLT 8: secp256k1 ECDH, SHA-256, HKDF (HMAC-SHA256), ChaCha20-Poly1305. All already in the tree
+secp256k1.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc"] }
+serde_json.workspace = true
+hex.workspace = true
+getrandom = "0.2"
+base64.workspace = true
+# the hashrate listing on Nostr (NIP-99), and the stand-in relay for the lab
+xbt-nostr.workspace = true
+# the stand-in pool's and miner's share hash (lab only)
+blake2.workspace = true
+
+[[bin]]
+name = "xbt-hashlink"
+path = "src/bin/xbt-hashlink.rs"
