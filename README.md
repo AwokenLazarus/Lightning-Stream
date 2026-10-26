@@ -287,6 +287,7 @@ tickets and the lottery on both sides, pay with work, and the services and packa
 | `xbt-wallet-mcp` | the wallet's MCP server, over stdio and streamable HTTP, so an AI agent can quote and pay without holding a key |
 | `xbt-wallet-ui` | the owner's web UI: approvals, policy, keys, signature log, connected apps |
 | `xbt-nwc` | Nostr Wallet Connect (NIP-47): other apps pay through the owner's node, under the owner's policy, through the signer (`docs/NWC.md`) |
+| `xbt-nostr` | the Nostr pieces, with no wallet in them: events, NIP-44 v2, a WebSocket and relay client, and sellers' signed listings published and read as NIP-99 classifieds (`docs/NOSTR.md`) |
 | `xbt-work`, `xbt-work-relay` | pay with work: a miner pays with pool shares, settled in the coinbase and checked by an audit |
 | `xbt-gateway` | the stream-ticket seller gateway: a reverse proxy beside a Lightning node that puts a price per piece on any HTTP service (regtest only) |
 | `xbt-svc` | container plumbing: data dir, secrets, readiness, the bounded HTTP server |

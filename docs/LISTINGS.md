@@ -12,7 +12,8 @@ document, and that key is the one the terms of the seller's URL name. A document
 different key, or a different origin, is not that seller's catalog.
 
 No directory and no relay is part of this. A buyer who already has a seller's URL fetches the
-listing from it.
+listing from it. A seller can also publish the same signed document on Nostr, so that buyers who
+do not have its URL can find it (`docs/NOSTR.md`).
 
 ## The document
 
