@@ -2,7 +2,7 @@ manifestVersion: 1.1
 id: lazarus-lightning-stream
 category: lightning
 name: Lightning Stream
-version: "0.1.5"
+version: "0.1.6"
 tagline: Buy and sell any service over Lightning from this box, paid as you use it
 description: >-
   One app for both sides. The wallet pays sellers with stream tickets under a policy you sign, and
@@ -46,6 +46,8 @@ gallery:
   - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/4.png
   - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/5.png
 releaseNotes: >-
+  0.1.6: rent out this box's miners and rent other people's (Sell and Services, Hashrate): idle miners
+  hash for your own pool, each rental takes whole miners and pays per piece of work.
   0.1.5: the app no longer skips its password for a peer named like the box's login proxy (umbrelOS
   2.0 runs no such container, so another app could have taken the name); log in with the app password
   Umbrel shows for this app.
