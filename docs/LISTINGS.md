@@ -12,7 +12,13 @@ document, and that key is the one the terms of the seller's URL name. A document
 different key, or a different origin, is not that seller's catalog.
 
 No directory and no relay is part of this. A buyer who already has a seller's URL fetches the
-listing from it.
+listing from it. To read the terms, the buyer asks that URL; when it is not a priced path (a seller
+whose `/` is no route answers 404), it asks the paths the listing sells under, all on the same
+origin.
+
+There are two versions. `listing/0` describes one service. `listing/1` lists several, each sold
+under a route of its own (a media server at `/`, a model's API at `/ai/`); it is described after
+the first.
 
 ## The document
 
@@ -43,6 +49,39 @@ The digest is one tagged hash, the same construction as a request digest: tag
 `xbt402/listing/0`, then one length-prefixed field of those bytes. The receipt key signs that
 32-byte digest. Key order and spaces in the served JSON do not change the digest, because a
 reader parses and writes the canonical form again before it checks.
+
+## `listing/1`: several services
+
+A gateway can sell several services, each behind a route with its own upstream and price. Its
+listing is then `listing/1`. The fields are closed here too:
+
+| Field | What it is |
+| --- | --- |
+| `version` | `listing/1`. |
+| `name` | The seller's name. |
+| `seller`, `receipt_key`, `updated`, `sig` | As in `listing/0`. |
+| `licence`, `credits` | Optional: what holds for every service that does not say its own. |
+| `services` | One to 32 entries, each `name`, `kind` (`video`, `files` or `api`), `path`, `prices` and `items`, with an optional `licence` and `credits`. `path` is the gateway route the service is sold under; no two entries share one. |
+
+The digest is built as for `listing/0`, under its own tag, `xbt402/listing/1`, so a document of one
+version cannot be passed off as the other.
+
+In the config, the `listing` section with a `services` list is a `listing/1` draft. Each service
+names a route that exists. A service that leaves out `prices` is given its route's price, which
+is how the page that writes the config keeps the two from disagreeing:
+
+```json
+"listing": {
+  "name": "One box",
+  "updated": "2026-10-26",
+  "services": [
+    {"name": "Films", "kind": "video", "path": "/", "items": [{"title": "Sintel", "url": "https://seller.example/Videos/s"}]},
+    {"name": "Local model", "kind": "api", "path": "/ai/", "items": []}
+  ]
+}
+```
+
+A reader sees a `listing/0` as one service under `/`.
 
 ## An entry
 

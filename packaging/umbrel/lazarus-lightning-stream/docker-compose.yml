@@ -5,9 +5,10 @@
 # It shares the UI's network namespace and listens on 127.0.0.1:8484, which is what XBT_UI_CONNECTOR
 # names. A browser on another machine cannot open that address. The UI process, in that namespace, can.
 # Sell: the gateway, the same image as the gateway app, so it stays idle until its config exists
-# (xbt-supervise --wait). The owner turns it on from the sell page (host port 8483), which is the UI
-# in its gateway role. The gateway mounts only its narrow macaroons. The signer is the only service
-# that can spend. No admin macaroon is mounted: of the Lightning node's data, only tls.cert.
+# (xbt-supervise --wait). The owner turns it on from the Sell page of the app's own page
+# (XBT_UI_SELL=1), which writes the gateway's config and its two narrow macaroons. The gateway mounts
+# only those. The signer is the only service that can spend. No admin macaroon is mounted: of the
+# Lightning node's data, only tls.cert.
 #
 # Stream sockets live in run/signer/streams (B2_STREAM_DIR for the signer and the connector). The
 # connector runs as the signer's user, because the published signer image cannot gain a group until
@@ -135,6 +136,11 @@ services:
       XBT_UI_LN_TLS_CERT: /data/lightning/tls.cert
       # the connector shares this container's network namespace and listens on loopback only
       XBT_UI_CONNECTOR: http://127.0.0.1:8484
+      # Sell: the gateway's setup on this page, as the gateway's container sees the node and the paths
+      XBT_UI_SELL: "1"
+      XBT_UI_GW_NODE_REST: https://${APP_LIGHTNING_FORK_NODE_IP}:${APP_LIGHTNING_FORK_NODE_REST_PORT}
+      XBT_UI_GW_NODE_TLS_CERT: /data/lightning/tls.cert
+      XBT_UI_GW_HEALTH_URL: http://lazarus-lightning-stream_gateway_1:8402/x402/ticket/health
     volumes:
       - ${APP_DATA_DIR}/data/ui:/data/ui
       - ${APP_DATA_DIR}/data/run/signer:/data/run/signer:ro
@@ -142,6 +148,8 @@ services:
       - ${APP_DATA_DIR}/data/run/ui:/data/run/ui
       # the Lightning page writes the rail macaroon here
       - ${APP_DATA_DIR}/data/run/ln:/data/run/ln
+      # the Sell page writes the gateway's config and macaroons here
+      - ${APP_DATA_DIR}/data/run/gateway:/data/run/gateway
       - *lightning-cert
 
   connector:
@@ -180,23 +188,3 @@ services:
       - ${APP_DATA_DIR}/data/run/gateway:/data/run/gateway:ro
       - *lightning-cert
 
-  sell:
-    <<: *service
-    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-cc28002e474e@sha256:c71d62e384b01b3910d50c21c4f4ff3bc59b847806c0a9b04cc30b130ff6ea53
-    stop_grace_period: 15s
-    environment:
-      XBT_UI_ROLE: gateway
-      XBT_UI_BIND: 0.0.0.0:8481
-      XBT_UI_PASSWORD_FILE: /data/ui/secrets/xbt-ui-password
-      XBT_UI_GW_NODE_REST: https://${APP_LIGHTNING_FORK_NODE_IP}:${APP_LIGHTNING_FORK_NODE_REST_PORT}
-      XBT_UI_GW_NODE_TLS_CERT: /data/lightning/tls.cert
-      XBT_UI_GW_HEALTH_URL: http://lazarus-lightning-stream_gateway_1:8402/x402/ticket/health
-    ports:
-      # the owner turns selling on here. 8480 and 8481 are the other two apps' pages.
-      - "8483:8481"
-    volumes:
-      - ${APP_DATA_DIR}/data/ui:/data/ui
-      - ${APP_DATA_DIR}/data/run/ui:/data/run/ui
-      # the gateway page writes the gateway's config and macaroons here
-      - ${APP_DATA_DIR}/data/run/gateway:/data/run/gateway
-      - *lightning-cert
