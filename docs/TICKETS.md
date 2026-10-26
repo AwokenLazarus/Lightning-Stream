@@ -1761,13 +1761,23 @@ invoice would meet the same rules.
 
 **Limits.**
 
-- Nothing of this has run on Lightning Fork nodes. Whether the node's `FetchInvoice` and
-  `PayOffer` reach a seller over onion messages in the time a call allows, and what that costs,
-  is not measured.
-- `PayOffer` takes no CLTV limit: a payment by offer is bounded by the node's own
-  (`ln.node_max_cltv_blocks`, 2,016 blocks by default), not by the owner's
-  `tickets.max_htlc_blocks`. A payment that settles at once locks nothing for long; one stuck
-  behind a hop that went away can be locked that long.
+- Run on Lightning Fork nodes in one regtest lab only (`scripts/ticket_e2e_regtest.sh offers`):
+  a seller that announces no address and has one private channel, reached through the one
+  blinded path of its offer by a buyer one hop away. Prepaid tickets and lottery wins were all
+  paid by the offer. The seller's node limits how fast it answers invoice requests: when a file
+  bought by draws won several times in a burst, it refused one ("rate limited: too many invoice
+  requests") and that win was paid by the seller's invoice. More hops, mainnet and Core
+  Lightning payers are not run.
+- The seller's node pads the fees of its blinded path, so it is paid a little more than the
+  invoice: in the lab 1,391,709 msat for invoices of 1,384,000 msat, out of 15,410 msat of fees
+  the buyer's node paid. The wallet books the amount and the fees, as for any payment.
+- The invoice's blinded paths are held to the Lightning rail's limit (`ln.max_cltv_blocks`,
+  1,008 blocks by default), as any payment of an offer is, not to `tickets.max_htlc_blocks`,
+  which is sized for held tickets: Lightning Fork's own path through one hop asked 259 blocks,
+  above that default of 204. `PayOffer` takes no CLTV limit, so the hops the buyer's node adds to
+  reach the path are bounded only by the node's own limit (`ln.node_max_cltv_blocks`, 2,016
+  blocks by default). A payment that settles at once locks nothing for long; one stuck behind a
+  hop that went away can be locked that long.
 - A payment by offer carries no wallet tag (section 2): `PayOffer` sends no custom record. A
   wallet restored from a backup older than such a payment does not find it in its node's list;
   the book written before the payment was sent is its only record.

@@ -32,6 +32,8 @@ funding proof), lf2->lf3 of 5,000,000 sat. A ticket is 1,000 sat for 40 blocks; 
   slots     the 30-slot channel: with half of the buyer's channel taken by others the wallet holds
             nothing and buys prepaid tickets; a seller at its cap says slots_short and is paid the
             same way; a lock that finds no slot on the way makes the session hold less and wait
+  offers    prepaid tickets and lottery wins paid by a BOLT 12 offer of an unannounced seller (lf4),
+            over its blinded paths; a wallet with offers off paid by the gateway's invoices
 
 Usage: drive.py [check ...]   (all, in this order, when none is named)
 Environment: LAB, RUN, OUT, BIN, TICKET_E2E_PORT_BASE (see the shell script).
@@ -1316,7 +1318,177 @@ def pruned() -> None:
     check("pruned: with no kept verdict, ln_pay is refused before anything is sent (ln_no_safe_channel)", r.get("rule") == "ln_no_safe_channel", {k: r.get(k) for k in ("verdict", "rule", "reason")})
 
 
-CHECKS = {"page": page, "latency": latency, "stream": stream, "slots": slots, "liar": liar, "kill": kill, "pruned": pruned}
+OFFER_NODE = "lf4"
+OFFERS_PORT = BASE + 10
+OFFERS = f"http://127.0.0.1:{OFFERS_PORT}"
+OFFERS_PAGE_MSAT = 100_000
+
+
+def passed_over() -> list[dict[str, Any]]:
+    """Each time the wallet left an offer for the seller's invoice, and why."""
+    return [{k: e.get(k) for k in ("rule", "reason", "win")} for e in events("ticket_offer_passed")]
+
+
+def offer_invoices(node: str) -> dict[str, dict[str, Any]]:
+    """Every invoice the node issued for an offer of its own, by payment hash."""
+    rows = lab.post(node, "/v2/offers/invoices", {}).get("invoices", [])
+    return {base64.b64decode(i["payment_hash"]).hex(): i for i in rows}
+
+
+def settled_on(node: str) -> dict[str, int]:
+    """What the node was paid, by payment hash: its BOLT 11 invoices and its offers' invoices."""
+    out: dict[str, int] = {}
+    offset = 0
+    while True:
+        page = lab.get(node, f"/v1/invoices?index_offset={offset}&num_max_invoices=1000")
+        for i in page.get("invoices", []):
+            if i["state"] == "SETTLED":
+                out[base64.b64decode(i["r_hash"]).hex()] = int(i["amt_paid_msat"])
+        if len(page.get("invoices", [])) < 1000:
+            break
+        offset = int(page["last_index_offset"])
+    for h, i in offer_invoices(node).items():
+        if i.get("state") == "SETTLED":
+            out[h] = int(i.get("amount_paid_msat") or 0)
+    return out
+
+
+def offers_gateway() -> dict[str, Any]:
+    """A gateway beside lf4 that sells prepaid tickets only, and the lottery, and names a BOLT 12 offer
+    of lf4's in both terms (docs/TICKETS.md, section 15). Its 402 for the page."""
+    cfg = {"listen": f"127.0.0.1:{OFFERS_PORT}", "public_url": OFFERS, "upstream": f"http://127.0.0.1:{UP_PORT}", "state_dir": f"{RUN}/state-offers",
+           "chain": "regtest", "network": NETWORK[0],
+           "node": {"rest": f"https://127.0.0.1:{lab.PORT[OFFER_NODE]}", "tls_cert": f"{RUN}/{OFFER_NODE}.tls.cert", "macaroon": f"{RUN}/offers-invoices.macaroon",
+                    "info_macaroon": f"{RUN}/offers-info.macaroon"},
+           "caps": {"sessions_per_address": 0, "unpaid_per_address": 0},
+           "tickets": {"settle": ["on-arrival"]},
+           "offers": {"enabled": True, "description": "ticket e2e shop"},
+           "lottery": {"piece_bytes": 65_536, "sessions_per_address": 0, "idle_secs": 300},
+           "times": {"height_max_age_secs": 30, "tick_ms": 500},
+           # the page costs more than a win, so it is sold by prepaid ticket and never by draws
+           "routes": [{"path": "/small.txt", "price": {"request_msat": OFFERS_PAGE_MSAT}},
+                      {"path": "/hot.bin", "price": {"byte_msat": 16_000, "per_bytes": 65_536}}]}
+    with open(f"{RUN}/offers.json", "w") as f:
+        json.dump(cfg, f, indent=1)
+    with open(f"{RUN}/offers.log", "ab") as log:
+        PROCS["offers"] = subprocess.Popen([f"{BIN}/xbt-gateway", f"{RUN}/offers.json"], stdout=log, stderr=log)
+    lab.wait("the offers gateway", 90, lambda: json.loads(send("GET", "/x402/ticket/health", OFFERS_PORT)[2])["height"] is not None, every=0.1)
+    return json.loads(send("GET", "/small.txt", OFFERS_PORT)[2])
+
+
+def offers_policy(on: bool) -> None:
+    """The wallet's policy with the offers gateway allowed and tied to lf4, and the signer restarted on it."""
+    pol = WALLET_PROC.policy()
+    pol["allowlist"].append(OFFERS)
+    pol["counterparties"][OFFERS] = {"ln_node": lab.pubkey(OFFER_NODE)}
+    pol["tickets"]["lottery"] = {"min_expected_wins": 0}
+    if not on:
+        pol["tickets"]["offers"] = False
+    with open(f"{WALLET}/policy.json", "w") as f:
+        json.dump(pol, f, indent=1)
+    restart_signer()
+
+
+def offers() -> None:
+    """BOLT 12 offers for prepaid tickets and lottery wins, on real nodes (docs/TICKETS.md, section 15).
+    The seller is lf4: it announces no address and its one channel, from the hop, is private, so it is
+    reached only by a route hint or a blinded path. The gateway beside it sells prepaid tickets and the
+    lottery and names one offer of lf4's. The wallet pays a page three times and buys a file by draws:
+    every payment lf4 takes must be an invoice of that offer, fetched over onion messages and paid
+    through the offer's blinded paths. Then the wallet with `tickets.offers` false: the same page is
+    paid with the gateway's BOLT 11 invoice, from /lock, as by a wallet that knows nothing of offers."""
+    stop_sessions()
+    lab.dc("up", "-d", OFFER_NODE)
+
+    def ready() -> bool:
+        lab.load_credentials(OFFER_NODE)
+        return lab.synced(OFFER_NODE)
+
+    lab.wait(f"{OFFER_NODE} answering and synced", 180, ready)
+    pk = lab.pubkey(OFFER_NODE)
+    # unchecked: "already connected" is as good as connected, and the wait below fails if neither holds
+    lab.dc("exec", "-T", HOP, "lncli", "--network=regtest", "--rpcserver=127.0.0.1:10009", "connect", f"{pk}@{OFFER_NODE}:9735", check=False)
+    lab.wait(f"{HOP} connected to {OFFER_NODE}", 30, lambda: any(p["pub_key"] == pk for p in lab.get(HOP, "/v1/peers")["peers"]))
+    for attempt in range(6):
+        try:
+            lab.lncli(HOP, "openchannel", f"--node_key={pk}", "--local_amt=2000000", "--private")
+            break
+        except LabError:
+            if attempt == 5:
+                raise
+            time.sleep(5)
+    tick(8)
+    lab.wait(f"{OFFER_NODE}'s channel active", 240, partial(active, OFFER_NODE, 1))
+    info = lab.info(OFFER_NODE)
+    chans = lab.channels(OFFER_NODE)
+    check("offers: lf4 announces no address and its one channel is private",
+          not info.get("uris") and len(chans) == 1 and chans[0].get("private") is True, {"uris": info.get("uris"), "private": [c.get("private") for c in chans]})
+    for name, perms in (("offers-invoices", lab.SELLER_PERMISSIONS), ("offers-info", ("info:read",))):
+        with open(f"{RUN}/{name}.macaroon", "wb") as f:
+            f.write(bytes.fromhex(lab.bake(OFFER_NODE, perms)))
+        os.chmod(f"{RUN}/{name}.macaroon", 0o600)
+    with open(f"{RUN}/www/hot.bin", "wb") as f:
+        f.write(os.urandom(2 << 20))
+    terms = offers_gateway()
+    by = {f"{a.get('scheme')}/{(a.get('extra') or {}).get('settle')}": (a.get("extra") or {}).get("offer") for a in terms.get("accepts", [])}
+    named = {v for v in by.values() if v}
+    lno = next(iter(named), "")
+    dec = lab.post(OFFER_NODE, "/v2/offers/decode", {"bolt12": lno}) if lno else {}
+    paths = int((dec.get("offer") or {}).get("num_paths") or 0)
+    measured("offers_terms", {"entries": {k: bool(v) for k, v in by.items()}, "num_paths": paths})
+    check("offers: the gateway's 402 names one BOLT 12 offer, on its prepaid entry, and the offer carries blinded paths (lf4's own decode)",
+          len(named) == 1 and by.get("ticket/on-arrival") == lno and paths >= 1, {"entries": {k: bool(v) for k, v in by.items()}, "num_paths": paths})
+    offers_policy(on=True)
+    before = settled_on(OFFER_NODE)
+    pages = [pay(f"{OFFERS}/small.txt", max_sats=200) for _ in range(3)]
+    check("offers: three priced pages from the unannounced seller, each paid with a prepaid ticket",
+          all(call_paid(r) and r.get("rail") == "ticket" and body_of(r) == PAGE for r in pages), [brief(r) for r in pages])
+    stop_sessions()
+    r = agent().tool("xbt402_pay", {"url": f"{OFFERS}/hot.bin", "max_sats": 1000, "task": "film"})
+    if r.get("saved_to") and os.path.exists(r["saved_to"]):
+        os.remove(r["saved_to"])
+    lot = {k: r.get(k) for k in ("verdict", "rule", "reason", "rail", "status", "complete", "wins", "wins_paid", "wins_unpaid", "ended")}
+    measured("offers_lottery", lot)
+    check("offers: a file bought by draws from the unannounced seller, every win paid", call_paid(r) and r.get("rail") == "lottery" and r.get("complete") is True
+          and int(r.get("wins") or 0) >= 1 and r.get("wins") == r.get("wins_paid") and not r.get("wins_unpaid"), lot)
+    stop_sessions()
+    after = settled_on(OFFER_NODE)
+    new = {h: m for h, m in after.items() if h not in before}
+    by_offer = set(offer_invoices(OFFER_NODE))
+    paid = {h: p for h, p in buyer_payments().items() if p["status"] == "SUCCEEDED"}
+    ledger = {row["txid"] for row in WALLET_PROC.ledger()}
+    over = passed_over()
+    seen = {"paid_to_lf4": len(new), "by_offer": sum(1 for h in new if h in by_offer), "received_msat": sum(new.values()),
+            "buyer_node_paid_msat": sum(int(paid[h]["value_msat"]) for h in new if h in paid),
+            "buyer_node_fees_msat": sum(int(paid[h]["fee_msat"]) for h in new if h in paid),
+            "on_buyer_node": sum(1 for h in new if h in paid), "not_in_ledger": sum(1 for h in new if f"ticket:{h}" not in ledger),
+            "passed_over": len(over), "passed_over_why": over[:5]}
+    if over:
+        # what the buyer's node said when it gave no invoice for the offer
+        logs = subprocess.run(["docker", "compose", "logs", "--no-color", BUYER], cwd=os.environ["LAB"], capture_output=True, text=True).stdout
+        seen["buyer_node_log"] = [ln[-300:] for ln in logs.splitlines() if any(w in ln.lower() for w in ("invoice request", "fetchinvoice", "fetch invoice", "onion message", "offer"))][-8:]
+    measured("offers_paid", seen)
+    # lf4 takes what the blinded path's padded fees leave over, so it is paid at least what the buyer's node sent it and
+    # no more than that and the fees together; a ticket or win the offer gave no invoice for is paid by the seller's invoice
+    # (docs/TICKETS.md, section 15), and only a failure to fetch one is let through here, never a failed check
+    check("offers: the payments lf4 took are invoices of its offer but for those the offer gave no invoice for, each one payment of the buyer's node and in the wallet's ledger",
+          seen["paid_to_lf4"] >= 4 and seen["on_buyer_node"] == seen["paid_to_lf4"] and seen["not_in_ledger"] == 0
+          and seen["by_offer"] + seen["passed_over"] == seen["paid_to_lf4"] and seen["by_offer"] * 2 >= seen["paid_to_lf4"]
+          and all(o["rule"] == "ln_fetch_invoice" for o in over)
+          and seen["buyer_node_paid_msat"] <= seen["received_msat"] <= seen["buyer_node_paid_msat"] + seen["buyer_node_fees_msat"], seen)
+    offers_policy(on=False)
+    before = after
+    r = pay(f"{OFFERS}/small.txt", max_sats=200)
+    stop_sessions()
+    new = {h: m for h, m in settled_on(OFFER_NODE).items() if h not in before}
+    by_offer = set(offer_invoices(OFFER_NODE))
+    seen = {"paid_to_lf4": len(new), "by_offer": sum(1 for h in new if h in by_offer)}
+    check("offers: a wallet with tickets.offers false is served the same page with the gateway's BOLT 11 invoice, from /lock",
+          call_paid(r) and body_of(r) == PAGE and seen["paid_to_lf4"] >= 1 and seen["by_offer"] == 0, {**seen, "reply": brief(r)})
+    offers_policy(on=True)
+
+
+CHECKS = {"page": page, "latency": latency, "stream": stream, "slots": slots, "liar": liar, "kill": kill, "offers": offers, "pruned": pruned}
 
 
 def main() -> int:
