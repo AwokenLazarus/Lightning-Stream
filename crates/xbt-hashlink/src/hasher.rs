@@ -526,6 +526,7 @@ impl Hasher {
 /// return its report (the lab's single rental, without a fallback).
 pub fn run(cfg: Config, rail: Box<dyn SellerRail>) -> Result<Value, String> {
     let mut first = Some(rail);
+    let report = cfg.report.clone();
     let h = Hasher::start(cfg, Box::new(move || first.take().unwrap_or_else(|| Box::<crate::rail::LabSeller>::default())))?;
     let r = loop {
         if let Some(r) = h.finished().into_iter().next() {
@@ -534,6 +535,9 @@ pub fn run(cfg: Config, rail: Box<dyn SellerRail>) -> Result<Value, String> {
         std::thread::sleep(Duration::from_millis(50));
     };
     h.shutdown();
+    // the report is the rental's own, as before several rentals (the ticker's last write is the status)
+    std::thread::sleep(Duration::from_millis(400));
+    write_report(&report, &r);
     Ok(r)
 }
 
