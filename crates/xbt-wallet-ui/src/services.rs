@@ -2,10 +2,15 @@
 //!
 //! A JSON list. Each service is `{name, kind, seller, price_text, items}`. `kind` is `video`,
 //! `files` or `api`. Each item is `{title, year, url, credit}`. `seller` and every item `url` are
-//! absolute `http` or `https` URLs. An example is `examples/services.example.json` in this crate.
+//! absolute `http` or `https` URLs. `year` and `credit` may be left out. An example is
+//! `examples/services.example.json` in this crate.
+//!
+//! The Services page writes this file: a seller added by its address is fetched, its signed
+//! listing checked ([`xbt402::listing::fetch`]), and each service it lists saved here
+//! ([`from_listing`], [`save`]).
 use std::path::Path;
 
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 const MAX_BYTES: u64 = 256 * 1024;
 const MAX_SERVICES: usize = 200;
@@ -150,11 +155,12 @@ fn text<'a>(obj: &'a Map<String, Value>, key: &str, what: &str) -> Result<&'a st
 
 fn year_of(v: Option<&Value>, what: &str) -> Result<String, String> {
     let y = match v {
+        None | Some(Value::Null) => return Ok(String::new()),
         Some(Value::String(s)) => s.trim().to_string(),
         Some(Value::Number(n)) => n.to_string(),
-        _ => return Err(format!("{what}: missing year")),
+        _ => return Err(format!("{what}: year is a string or a number")),
     };
-    if y.is_empty() || y.chars().count() > 16 || y.chars().any(|c| c.is_control()) {
+    if y.chars().count() > 16 || y.chars().any(|c| c.is_control()) {
         return Err(format!("{what}: year is empty or not a short year"));
     }
     Ok(y)
@@ -164,7 +170,8 @@ fn parse_item(v: &Value, what: &str) -> Result<Item, String> {
     let obj = v.as_object().ok_or_else(|| format!("{what}: an item is an object"))?;
     let url = text(obj, "url", what)?.to_string();
     http_url(&url, &format!("{what} url"))?;
-    Ok(Item { title: text(obj, "title", what)?.to_string(), year: year_of(obj.get("year"), what)?, url, credit: text(obj, "credit", what)?.to_string() })
+    let credit = if obj.contains_key("credit") { text(obj, "credit", what)?.to_string() } else { String::new() };
+    Ok(Item { title: text(obj, "title", what)?.to_string(), year: year_of(obj.get("year"), what)?, url, credit })
 }
 
 fn parse_service(v: &Value, n: usize) -> Result<Service, String> {
@@ -206,6 +213,85 @@ pub fn load(path: &Path) -> Result<Vec<Service>, String> {
     }
     let text = std::fs::read_to_string(path).map_err(|e| format!("services file: {e}"))?;
     parse(&text)
+}
+
+fn service_json(s: &Service) -> Value {
+    let items: Vec<Value> = s.items.iter().map(|i| {
+        let mut v = json!({"title": i.title, "url": i.url});
+        if !i.year.is_empty() {
+            v["year"] = json!(i.year);
+        }
+        if !i.credit.is_empty() {
+            v["credit"] = json!(i.credit);
+        }
+        v
+    }).collect();
+    json!({"name": s.name, "kind": s.kind.as_str(), "seller": s.seller, "price_text": s.price_text, "items": items})
+}
+
+/// Write the services file whole: a temp file beside it, then renamed over it.
+pub fn save(path: &Path, services: &[Service]) -> Result<(), String> {
+    if services.len() > MAX_SERVICES {
+        return Err(format!("at most {MAX_SERVICES} services"));
+    }
+    let text = serde_json::to_string_pretty(&services.iter().map(service_json).collect::<Vec<_>>()).map_err(|e| e.to_string())? + "\n";
+    // what this writes, this reads back
+    parse(&text)?;
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir).map_err(|e| format!("services file: {e}"))?;
+    let tmp = dir.join(format!(".services.{}.tmp", hex::encode(crate::random_bytes::<6>())));
+    let res = std::fs::write(&tmp, text.as_bytes()).and_then(|_| std::fs::rename(&tmp, path));
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res.map_err(|e| format!("services file {}: {e}", path.display()))
+}
+
+/// A price as a person reads it: `20 sat a MiB`, `5 sat a request`, `0.5 sat a second`.
+pub fn price_words(prices: &Value) -> String {
+    let n = |k: &str| prices.get(k).and_then(|v| v.as_str().and_then(|s| s.parse::<u64>().ok()).or_else(|| v.as_u64())).unwrap_or(0);
+    let sat = |msat: u128, per: u128| -> String {
+        // msat over `per` units, to a sat with up to three decimals
+        let milli = msat * 1000 / per.max(1) / 1000;
+        let whole = milli / 1000;
+        let frac = milli % 1000;
+        if frac == 0 { whole.to_string() } else { format!("{whole}.{:03}", frac).trim_end_matches('0').to_string() }
+    };
+    let mut parts = vec![];
+    if n("request_msat") > 0 {
+        parts.push(format!("{} sat a request", sat(u128::from(n("request_msat")), 1)));
+    }
+    if n("byte_msat") > 0 {
+        let per = u128::from(n("per_bytes").max(1));
+        parts.push(format!("{} sat a MiB", sat(u128::from(n("byte_msat")) * 1_048_576, per)));
+    }
+    if n("second_msat") > 0 {
+        parts.push(format!("{} sat a second", sat(u128::from(n("second_msat")), 1)));
+    }
+    if parts.is_empty() { "free".into() } else { parts.join(" + ") }
+}
+
+/// The services a checked listing lists, as Browse shows them. A seller with one service shows
+/// under its own name; with several, each as `seller name: service name`.
+pub fn from_listing(l: &xbt402::listing::Listing) -> Vec<Service> {
+    let several = l.services.len() > 1;
+    l.services.iter().map(|s| {
+        let kind = match s.kind.as_str() {
+            "video" => Kind::Video,
+            "files" => Kind::Files,
+            _ => Kind::Api,
+        };
+        let credit = if s.credits.is_empty() { l.credits.clone() } else { s.credits.clone() };
+        let name = if several { format!("{}: {}", l.name, s.name) } else { l.name.clone() };
+        Service {
+            name: name.chars().take(MAX_TEXT).collect(),
+            kind,
+            seller: l.seller.clone(),
+            price_text: price_words(&s.prices),
+            items: s.items.iter().map(|i| Item { title: i.title.clone(), year: i.year.map(|y| y.to_string()).unwrap_or_default(), url: i.url.clone(),
+                                                 credit: i.credit.clone().unwrap_or_else(|| credit.clone()).chars().take(MAX_TEXT).collect() }).collect(),
+        }
+    }).collect()
 }
 
 /// The first integer in a price line (`"20 sat a MiB"` → 20, `"about 1,200 sat"` → 1200).
@@ -353,6 +439,29 @@ mod tests {
         assert_eq!(price_num("20 sat a MiB"), Some(20));
         assert_eq!(price_num("about 1,200 sat"), Some(1200));
         assert_eq!(price_num("ask"), None);
+    }
+
+    #[test]
+    fn prices_read_as_people_say_them() {
+        use serde_json::json;
+        assert_eq!(price_words(&json!({"byte_msat": "20000", "per_bytes": "1048576"})), "20 sat a MiB");
+        assert_eq!(price_words(&json!({"byte_msat": "20", "per_bytes": "1048576"})), "0.02 sat a MiB");
+        assert_eq!(price_words(&json!({"request_msat": "500"})), "0.5 sat a request");
+        assert_eq!(price_words(&json!({"request_msat": "1000", "second_msat": "2000"})), "1 sat a request + 2 sat a second");
+        assert_eq!(price_words(&json!({})), "free");
+    }
+
+    #[test]
+    fn the_file_the_services_page_writes_reads_back_the_same() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("sub/services.json");
+        let v = parse(include_str!("../examples/services.example.json")).unwrap();
+        let mut v2 = v.clone();
+        v2[0].items[0].year = String::new();
+        v2[0].items[0].credit = String::new();
+        save(&p, &v2).unwrap();
+        assert_eq!(load(&p).unwrap(), v2);
+        assert_eq!(std::fs::read_dir(p.parent().unwrap()).unwrap().count(), 1, "no temp file left");
     }
 
     #[test]

@@ -11,7 +11,8 @@ use serde_json::{json, Map, Value};
 
 use crate::auth::Auth;
 use crate::config::{Config, Role};
-use crate::html::{esc, escv, int, json_block, kv, page, sats, short, txt, utc, Nav, GATEWAY_BRAND, GATEWAY_PAGES, WALLET_BRAND, WALLET_PAGES};
+use crate::html::{esc, escv, int, json_block, kv, page, sats, short, txt, utc, Nav, GATEWAY_BRAND, GATEWAY_PAGES, STREAM_BRAND, STREAM_PAGES, WALLET_BRAND,
+                  WALLET_PAGES};
 use crate::link::SignerLink;
 use crate::relay::RelayLinks;
 use crate::server::{strip_base, Req, Resp};
@@ -21,6 +22,10 @@ use crate::{msg, now};
 mod stream_pages;
 #[path = "nwc_pages.rs"]
 mod nwc_pages;
+#[path = "sell.rs"]
+mod sell;
+#[path = "services_page.rs"]
+mod services_page;
 
 pub const COOKIE: &str = "xbtui";
 /// How long a signed form stays valid.
@@ -259,6 +264,8 @@ impl App {
         match req.path.as_str() {
             "/" => self.overview(&ctx),
             "/browse" => self.browse(&ctx, &req.query),
+            "/services" => self.services_page(&ctx),
+            "/sell" if self.cfg.sell => self.sell_page(&ctx, &req.query),
             "/play" => self.play(&ctx, &req),
             "/connections" => self.connections(&ctx),
             "/apps" => self.apps_page(&ctx),
@@ -287,6 +294,7 @@ impl App {
 
     pub(crate) fn nav<'a>(&self, active: &'a str, csrf: &'a str, logged_in: bool) -> Nav<'a> {
         let (pages, brand): (&'static [(&'static str, &'static str)], &'static str) = match self.cfg.role {
+            Role::Wallet if self.cfg.sell => (&STREAM_PAGES, STREAM_BRAND),
             Role::Wallet => (&WALLET_PAGES, WALLET_BRAND),
             Role::Gateway => (&GATEWAY_PAGES, GATEWAY_BRAND),
         };
@@ -404,6 +412,8 @@ impl App {
         };
         match req.path.as_str() {
             "/play" => self.play_stop(ctx, f),
+            "/services" => self.services_post(ctx, f),
+            "/sell" if self.cfg.sell => self.sell_post(ctx, f),
             "/play-link" => self.play_link(ctx, f),
             "/connections" => self.connections_stop(ctx, f),
             "/apps-create" => self.apps_create(ctx, f),

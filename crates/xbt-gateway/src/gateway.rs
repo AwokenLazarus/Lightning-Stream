@@ -112,7 +112,8 @@ pub struct Gateway {
     cfg: Config,
     terms: Terms,
     node: Arc<dyn Node>,
-    upstream: Upstream,
+    /// One client per service: the config's `upstream` and each route's own, by base URL.
+    upstreams: HashMap<String, Upstream>,
     key: SecretKey,
     state: Mutex<State>,
     /// Signalled whenever a session is credited: metered responses out of balance wait on it.
@@ -270,11 +271,14 @@ impl Gateway {
             Some(l) => Some(draws::Lottery::open(l, &cfg.state_dir, clock())?),
             None => None,
         };
-        let upstream = Upstream::new(&cfg.upstream, cfg.times.upstream_wait);
+        let mut upstreams = HashMap::new();
+        for base in cfg.upstream.iter().chain(cfg.routes.iter().filter_map(|r| r.upstream.as_ref())) {
+            upstreams.entry(base.clone()).or_insert_with(|| Upstream::new(base, cfg.times.upstream_wait));
+        }
         let gw = Arc::new(Self {
             terms,
             node,
-            upstream,
+            upstreams,
             key,
             state: Mutex::new(State {
                 book,
@@ -1302,6 +1306,14 @@ impl Gateway {
             .collect()
     }
 
+    /// Pass the request on to its route's service.
+    pub(crate) fn send_upstream(&self, route: &Route, req: &Request) -> Result<Answer, crate::Error> {
+        let base = route.upstream.as_ref().or(self.cfg.upstream.as_ref());
+        // the config refuses a route with neither, and every base has its client
+        let up = base.and_then(|b| self.upstreams.get(b)).ok_or_else(|| crate::Error::Upstream("no service for this route".into()))?;
+        up.send(&req.method, &route.upstream_target(&req.target), &forwarded(route, &req.headers), &req.body)
+    }
+
     /// Read at most `cap` bytes of a body. `Err`: the service stopped in the middle.
     fn read_body(body: &mut dyn Read, cap: u64) -> io::Result<Vec<u8>> {
         let mut out = vec![];
@@ -1310,12 +1322,7 @@ impl Gateway {
     }
 
     fn free(&self, req: &Request, route: &Route) -> Reply {
-        let answer = match self.upstream.send(
-            &req.method,
-            &req.target,
-            &forwarded(route, &req.headers),
-            &req.body,
-        ) {
+        let answer = match self.send_upstream(route, req) {
             Ok(a) if a.status != 402 => a,
             _ => {
                 return Reply::Whole(error(
@@ -1433,12 +1440,7 @@ impl Gateway {
         }
         let refund = |msat: u64| self.lock().book.refund(&a.session, msat);
         // step 5
-        let mut answer = match self.upstream.send(
-            &req.method,
-            &req.target,
-            &forwarded(route, &req.headers),
-            &req.body,
-        ) {
+        let mut answer = match self.send_upstream(route, &req) {
             // a service behind the gateway does not ask for payment through it
             Ok(ans) if ans.status != 402 => ans,
             _ => {

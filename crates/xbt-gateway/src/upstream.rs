@@ -314,6 +314,8 @@ mod tests {
             release: Release::WithRequest,
             forward_headers: vec!["x-trace".into()],
             max_body: 0,
+            upstream: None,
+            strip_prefix: false,
         };
         let h = |v: &[(&str, &str)]| {
             v.iter()

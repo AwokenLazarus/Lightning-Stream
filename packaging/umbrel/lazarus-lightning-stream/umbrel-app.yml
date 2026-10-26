@@ -7,8 +7,8 @@ tagline: Buy and sell over Lightning from this box, and play what you pay for
 description: >-
   One app for both sides. The wallet pays sellers with stream tickets under a policy you sign, and
   agents connect to its MCP server. The connector, on this box only, asks the signer to pay for a
-  film and stream it. The sell side is the gateway: it stays idle until you save a service on the
-  sell page, and it holds only the narrow macaroons that page writes. The signer is the only
+  film and stream it. The sell side is the gateway: it stays idle until you add a service on the
+  Sell page, and it holds only the narrow macaroons that page writes. The signer is the only
   service that can spend.
 
 
@@ -18,10 +18,12 @@ description: >-
   onchain:read. The app reads only the node's certificate; it never holds an admin macaroon.
 
 
-  To sell, open port 8483 and log in with the same password. Set the service, the price and two
-  macaroons (invoices:read invoices:write; info:read). Buyers reach the gateway through an https
-  proxy you point at lazarus-lightning-stream_gateway_1:8402. Until that page is saved, the gateway
-  does not listen. Agents on the LAN use port 33511, with the bearer token from the Agents page.
+  To sell, open the Sell page: connect your Lightning node once (two macaroons: invoices:read
+  invoices:write; info:read), say where buyers find you, and add each service you sell (a media
+  server, an AI model, another web service) with its address on this box and a price in sats.
+  Buyers reach the gateway through an https proxy you point at lazarus-lightning-stream_gateway_1:8402.
+  Until a service is saved, the gateway does not listen. To buy from a seller, paste its address on
+  the Services page. Agents on the LAN use port 33511, with the bearer token from the Agents page.
 
 
   The keys stay in the signer, sealed on this box's disk. A separate anchor witness keeps a tamper

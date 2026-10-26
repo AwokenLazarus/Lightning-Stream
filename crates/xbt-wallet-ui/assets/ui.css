@@ -89,3 +89,33 @@ ol.steps { list-style: none; padding: 0; }
 dl.kv dt { overflow-wrap: normal; word-break: normal; }
 section.grid { margin-bottom: 24px; }
 video { display: block; width: 100%; max-height: 70vh; background: #000; border-radius: 8px; margin: 0 0 12px; }
+/* Sell and Services: one status in words and colour, cards per service, one main action */
+.lead { font-size: 1.05rem; margin: 0 0 16px; max-width: 65ch; }
+.status { border-radius: 12px; padding: 16px 20px; margin: 0 0 20px; border: 1px solid var(--line); background: var(--card); border-left-width: 6px; }
+.status p { margin: 4px 0 0; }
+.status .status-head { font-size: 1.3rem; font-weight: 700; margin: 0; }
+.status.ok { border-color: var(--ok); } .status.ok .status-head { color: var(--ok); }
+.status.warn { border-color: var(--warn); } .status.warn .status-head { color: var(--warn); }
+.status.bad { border-color: var(--bad); } .status.bad .status-head { color: var(--bad); }
+.pill { display: inline-block; font-size: 0.85em; font-weight: 600; padding: 2px 10px; border-radius: 999px; border: 1px solid var(--line); white-space: nowrap; }
+.pill.ok { color: var(--ok); border-color: var(--ok); background: var(--ok-bg); }
+.pill.warn { color: var(--warn); border-color: var(--warn); background: var(--warn-bg); }
+.pill.bad { color: var(--bad); border-color: var(--bad); background: var(--bad-bg); }
+.offer-head { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; justify-content: space-between; }
+.offer-head h3 { margin: 0; font-size: 1.1rem; }
+.card.primary { border: 2px solid var(--accent); }
+fieldset.choices { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; border: none; padding: 0; margin: 0 0 8px; }
+fieldset.choices legend { padding: 0 0 6px; }
+label.choice { display: flex; gap: 10px; align-items: flex-start; margin: 0; padding: 12px; border: 1px solid var(--line); border-radius: 8px; color: var(--fg); cursor: pointer; }
+label.choice input { width: 20px; height: 20px; min-height: 0; margin: 2px 0 0; flex: none; }
+label.choice span { display: flex; flex-direction: column; }
+label.choice small { color: var(--muted); }
+label.choice:has(input:checked) { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.price-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr); gap: 12px; }
+@media (max-width: 520px) { .price-row { grid-template-columns: 1fr; } }
+button.secondary { background: transparent; color: var(--accent); }
+a.button-link { display: inline-flex; align-items: center; min-height: 44px; padding: 0 18px; border: 1px solid var(--accent); border-radius: 6px; text-decoration: none; }
+details.card.advanced > summary { font-weight: 600; }
+ul.offers { list-style: none; padding: 0; margin: 0 0 8px; display: grid; gap: 6px; }
+.price { font-weight: 600; }
+input:invalid:not(:placeholder-shown) { border-color: var(--bad); }

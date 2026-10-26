@@ -118,6 +118,26 @@ a locked ticket before its secret arrives, up to one ticket's worth.
 What these rules cannot price is anything only your service can count, such as the tokens a
 model produced.
 
+## Several services behind one gateway
+
+`upstream` at the top of the config is the service every route passes requests to. A route may
+name its own instead, so one gateway sells several services, each under a path with its own
+price:
+
+```json
+"routes": [
+  {"path": "/", "upstream": "http://jellyfin:8096", "price": {"byte_msat": 20000, "per_bytes": 1048576}},
+  {"path": "/ai/", "upstream": "http://ollama:11434", "strip_prefix": true, "methods": ["GET", "HEAD", "POST"],
+   "max_body": 1048576, "price": {"request_msat": 10000}}
+]
+```
+
+The longest matching path wins, so `/ai/...` goes to the model and everything else to the media
+server. `"strip_prefix": true` (on a path ending in `/`) passes the request on without the route's
+path: `/ai/api/generate` reaches the model as `/api/generate`. When every route names its own,
+the top-level `upstream` may be left out. A `listing` with a `services` list (`docs/LISTINGS.md`,
+`listing/1`) tells buyers what each path sells.
+
 ## The rules it keeps
 
 | Rule | Where |

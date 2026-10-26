@@ -1201,3 +1201,154 @@ fn walk(d: &std::path::Path) -> Vec<std::path::PathBuf> {
     }
     out
 }
+
+/// The one Lightning Stream app (`XBT_UI_SELL=1`): Sell sets up the gateway beside the wallet in
+/// plain words, one service at a time, and writes a config the gateway takes.
+#[cfg(unix)]
+#[test]
+fn the_sell_page_sets_up_several_services_and_says_what_each_one_needs() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let gw = tempfile::tempdir().unwrap();
+    let dir = gw.path().to_path_buf();
+    let media = mock_http(|_| (200, "ok"));
+    let bx = start(json!({}), false, |c| {
+        c.sell = true;
+        c.gw.dir = dir.clone();
+        c.gw.node_rest = Some("https://10.21.21.66:8180".into());
+        c.gw.node_tls_cert = Some("/data/lightning/tls.cert".into());
+    });
+    let mut br = logged_in(&bx);
+    let page = br.get("/sell").body;
+    assert!(page.contains(">Lightning Stream<") && page.contains("href=\"./sell\"") && page.contains("href=\"./services\""), "{page}");
+    assert!(page.contains("Not selling yet") && page.contains("Connect your Lightning node"), "{page}");
+    // plain words on the main screen; the gateway's own terms only inside the collapsed parts
+    let main_part = page[page.find("<main").unwrap()..].split("<details").next().unwrap().replace("<em>Macaroons</em>", "");
+    // the words a person reads: the text between the tags
+    let main_part: String = main_part.split('<').map(|s| s.split_once('>').map(|(_, t)| t).unwrap_or(s)).collect::<String>().to_ascii_lowercase();
+    for jargon in ["macaroon", "msat", "upstream", "htlc", "receipt key", "cltv"] {
+        assert!(!main_part.contains(jargon), "{jargon} on the main screen");
+    }
+    let inv = mac(&[("invoices", &["read", "write"])]);
+    let info = mac(&[("info", &["read"])]);
+    let wide = mac(&[("invoices", &["read", "write"]), ("offchain", &["write"])]);
+    let r = br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &wide), ("info_macaroon", &info)]);
+    assert!(br.flash_after(&r).contains("does not fit"));
+    let r = br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &inv), ("info_macaroon", &info)]);
+    let f = br.flash_after(&r);
+    assert!(f.contains("connected") && f.contains("Say where buyers find you"), "{f}");
+    assert!(!br.get("/sell").body.contains("1. Connect your Lightning node"), "step 1 is done");
+    let r = br.act("/sell", "/sell", &[("action", "shop"), ("name", "Mike's box"), ("public_url", "http://seller.example")]);
+    assert_eq!(r.status, 200);
+    assert!(unescape(&r.body).contains("https:// address"), "said in a sentence, on the page kept as typed");
+    let r = br.act("/sell", "/sell", &[("action", "shop"), ("name", "Mike's box"), ("public_url", "https://seller.example/")]);
+    assert!(br.flash_after(&r).contains("network id"), "a test chain asks for its network under Advanced");
+    let r = br.act("/sell", "/sell", &[("action", "advanced"), ("max_sessions", "30"), ("sessions_per_address", "2"), ("max_held_tickets", "15"),
+                                       ("proxies", ""), ("network", "bip122:0123456789abcdef0123456789abcdef")]);
+    let f = br.flash_after(&r);
+    assert!(f.contains("Advanced settings saved"), "{f}");
+
+    // a price that is not a number is said so, and nothing changes
+    let addr = format!("http://{media}");
+    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("address", &addr), ("price", "twenty"), ("unit", "mib")]);
+    assert_eq!(r.status, 200);
+    assert!(unescape(&r.body).contains("The price is a number of sats"));
+    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("address", "jellyfin:8096"), ("price", "20"), ("unit", "mib")]);
+    assert!(unescape(&r.body).contains("not an address this box can reach"));
+    // the media server: the first service gets the root
+    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("address", &addr), ("price", "20"), ("unit", "mib"), ("strip", "1"),
+                                       ("titles", "Sintel | /Videos/s/stream")]);
+    assert!(br.flash_after(&r).contains("restarts"));
+    // an AI model nobody answers for: its own path, requests passed on without it, and POST
+    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "ai"), ("address", "http://127.0.0.1:9"), ("price", "0.5"), ("unit", "request"),
+                                       ("name", "My model"), ("strip", "1")]);
+    assert!(br.flash_after(&r).contains("restarts"));
+    let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    let cfg = xbt_gateway::config::Config::from_json(&c).unwrap();
+    assert_eq!(cfg.public_url, "https://seller.example");
+    assert_eq!(cfg.upstream, None);
+    assert_eq!(cfg.routes.iter().map(|r| (r.path.as_str(), r.upstream.clone().unwrap(), r.strip_prefix)).collect::<Vec<_>>(),
+               [("/", addr.clone(), false), ("/my-model/", "http://127.0.0.1:9".to_string(), true)]);
+    assert_eq!((cfg.routes[0].price.byte_msat, cfg.routes[0].price.per_bytes, cfg.routes[1].price.request_msat), (20_000, 1_048_576, 500));
+    assert!(cfg.routes[1].methods.contains(&"POST".to_string()));
+    let l = cfg.listing.unwrap();
+    assert_eq!((l.name.as_str(), l.services.len(), l.services[0].kind.as_str(), l.services[1].kind.as_str()), ("Mike's box", 2, "video", "api"));
+    assert_eq!(l.services[0].items[0].url, "https://seller.example/Videos/s/stream");
+
+    let page = br.get("/sell").body;
+    assert!(page.contains("Selling, with a problem") && page.contains("Can&#39;t reach your AI model"), "{page}");
+    assert!(page.contains("20 sat a MiB") && page.contains("0.5 sat a request"));
+    // pause: the route is gone and the listing with it; the shop says so
+    let shop: Value = serde_json::from_str(&std::fs::read_to_string(bx.data.path().join("ui/sell.json")).unwrap()).unwrap();
+    let ai = shop["offers"][1]["id"].as_str().unwrap().to_string();
+    let r = br.act("/sell", "/sell", &[("action", "pause"), ("id", &ai)]);
+    assert!(br.flash_after(&r).contains("Paused"));
+    let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    assert_eq!(c["routes"].as_array().unwrap().len(), 1);
+    let page = br.get("/sell").body;
+    assert!(page.contains(">Paused<") && page.contains(">Resume<") && page.contains(">Selling<"), "{page}");
+    // an edit keeps the path and the pause; remove drops it
+    let r = br.act("/sell", "/sell", &[("action", "service"), ("id", &ai), ("kind", "ai"), ("address", "http://127.0.0.1:9"), ("price", "2"),
+                                       ("unit", "request"), ("name", "My model")]);
+    assert!(br.flash_after(&r).contains("Changes saved"));
+    let shop: Value = serde_json::from_str(&std::fs::read_to_string(bx.data.path().join("ui/sell.json")).unwrap()).unwrap();
+    assert_eq!((shop["offers"][1]["paths"][0].as_str(), shop["offers"][1]["paused"].as_bool(), shop["offers"][1]["price_msat"].as_u64()),
+               (Some("/my-model/"), Some(true), Some(2000)));
+    let r = br.act("/sell", "/sell", &[("action", "remove"), ("id", &ai)]);
+    assert!(br.flash_after(&r).contains("Removed"));
+    assert!(!br.get("/sell").body.contains("My model"));
+}
+
+#[test]
+fn without_sell_the_wallet_has_no_sell_page() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let bx = start(json!({}), false, |_| {});
+    let mut br = logged_in(&bx);
+    assert_eq!(br.get("/sell").status, 404);
+    let page = br.get("/").body;
+    assert!(page.contains("XBT Agent Wallet") && !page.contains("href=\"./sell\"") && page.contains("href=\"./services\""));
+}
+
+/// Services: a seller added by its address shows on Browse with each service its signed listing
+/// names, and goes when removed. A listing that does not verify adds nothing.
+#[test]
+fn a_seller_added_by_address_shows_its_services_on_browse() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let bx = start(json!({}), false, |_| {});
+    let mut br = logged_in(&bx);
+    assert!(br.get("/services").body.contains("No sellers yet"));
+    let sk = xbt_primitives::ecdsa::secret_key(&xbt_primitives::hash::sha256(b"ui-services-test")).unwrap();
+    let pk = hex::encode(xbt_primitives::ecdsa::pubkey(&sk));
+    let origin = "https://seller.example";
+    let draft = xbt402::listing::parse_draft(&json!({"name": "Mike's box", "updated": "2026-10-26", "credits": "the makers", "services": [
+        {"name": "Films", "kind": "video", "path": "/", "prices": {"byte_msat": 20000, "per_bytes": 1048576},
+         "items": [{"title": "Sintel", "url": "https://seller.example/Videos/s", "year": 2010}]},
+        {"name": "Model", "kind": "api", "path": "/ai/", "prices": {"request_msat": 500}, "items": []}]})).unwrap();
+    let doc = serde_json::to_string(&xbt402::listing::sign(&sk, &xbt402::listing::document(&draft, origin, &pk))).unwrap();
+    let terms = serde_json::to_string(&json!({"accepts": [{"extra": {"receiptKey": pk}}]})).unwrap();
+    let get = |key: &str| {
+        let (doc, terms) = (doc.clone(), terms.replace(&pk, key));
+        move |u: &str| Ok(if u.ends_with(xbt402::listing::PATH) {
+            xbt402::listing::Page { status: 200, headers: vec![], body: doc.clone() }
+        } else {
+            xbt402::listing::Page { status: 402, headers: vec![], body: terms.clone() }
+        })
+    };
+    let other = "02".to_string() + &"11".repeat(32);
+    assert!(bx._app.add_seller(origin, get(&other)).unwrap_err().contains("could not be used"));
+    assert!(bx._app.add_seller("not a url", get(&pk)).is_err());
+    assert!(br.get("/services").body.contains("No sellers yet"), "nothing was added");
+    let m = bx._app.add_seller(origin, get(&pk)).unwrap();
+    assert!(m.contains("Added Mike's box: 2 services"), "{m}");
+    let page = br.get("/services").body;
+    assert!(page.contains("Mike&#39;s box: Films") && page.contains("20 sat a MiB") && page.contains("0.5 sat a request"), "{page}");
+    let browse = br.get("/browse").body;
+    assert!(browse.contains("Sintel") && browse.contains("Mike&#39;s box: Model"), "{browse}");
+    // again: replaced, not doubled
+    assert!(bx._app.add_seller(&format!("{origin}/"), get(&pk)).unwrap().starts_with("Updated"));
+    let all = xbt_wallet_ui::services::load(&bx.data.path().join("ui/services.json")).unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!((all[0].items[0].year.as_str(), all[0].items[0].credit.as_str()), ("2010", "the makers"));
+    let r = br.act("/services", "/services", &[("action", "remove"), ("url", origin)]);
+    assert!(br.flash_after(&r).contains("Seller removed"));
+    assert!(!br.get("/browse").body.contains("Sintel"));
+}

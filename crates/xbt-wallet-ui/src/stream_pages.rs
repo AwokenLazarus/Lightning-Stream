@@ -147,7 +147,11 @@ impl App {
     pub(crate) fn services(&self) -> Result<Vec<Service>, String> {
         match &self.cfg.services_file {
             Some(p) => services::load(p),
-            None => Ok(Vec::new()),
+            // the default file exists once the Services page added a seller
+            None => {
+                let p = self.cfg.services_path();
+                if p.exists() { services::load(&p) } else { Ok(Vec::new()) }
+            }
         }
     }
 

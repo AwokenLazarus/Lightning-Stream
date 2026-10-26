@@ -73,6 +73,11 @@ pub struct Route {
     pub forward_headers: Vec<String>,
     /// The largest request body passed on.
     pub max_body: usize,
+    /// The service this route's requests go to, when not the config's `upstream`: one gateway
+    /// can sell several services, each behind a path of its own.
+    pub upstream: Option<String>,
+    /// Pass the target on without this route's path (a route `/ai/` sends `/ai/v1/x` as `/v1/x`).
+    pub strip_prefix: bool,
 }
 
 /// Request headers every route passes on: they select what is returned and carry no authority.
@@ -131,8 +136,9 @@ pub struct Config {
     pub listen: String,
     /// The origin buyers reach the gateway under (`https://seller.example`): what a payment binds.
     pub public_url: String,
-    /// The service: `http://host:port`, optionally with a path prefix.
-    pub upstream: String,
+    /// The service: `http://host:port`, optionally with a path prefix. `None` when every route
+    /// names its own.
+    pub upstream: Option<String>,
     pub state_dir: PathBuf,
     /// `regtest` unless the file says otherwise. Another test chain's name with `network` given,
     /// or `main`, which also needs `mainnet_ack` ([`MAINNET_ACK`]).
@@ -297,11 +303,7 @@ impl Config {
         if !loopback && !origin.starts_with("https://") {
             return Err(format!("listen {listen} is not a loopback address (an address written as one: a name, even localhost, is whatever the resolver says), and public_url is not https. The gateway speaks plain HTTP: listen on 127.0.0.1 or [::1], or put a TLS proxy in front and set public_url to the https origin buyers use"));
         }
-        let upstream = req_str(top, "upstream")?.trim_end_matches('/').to_string();
-        let up = xbt402::wire::sendable_url(&upstream).map_err(|e| format!("upstream: {e}"))?;
-        if !up.starts_with("http://") || up.contains('?') || up.contains('@') {
-            return Err("upstream is http://host[:port][/prefix]: plain HTTP to a service beside the gateway, no query, no user name".into());
-        }
+        let up = opt_str(top, "upstream")?.map(|u| upstream_url(u, "upstream")).transpose()?;
 
         let n = obj(
             top.get("node").ok_or("node is missing")?,
@@ -548,6 +550,9 @@ impl Config {
             routes.push(route(r)?);
         }
         for (i, r) in routes.iter().enumerate() {
+            if r.upstream.is_none() && up.is_none() {
+                return Err(format!("route {}: no upstream, and the config names none for every route", r.path));
+            }
             if routes[..i].iter().any(|o| o.path == r.path) {
                 return Err(format!("route {}: named twice", r.path));
             }
@@ -576,12 +581,12 @@ impl Config {
         };
         let listing = match top.get("listing") {
             None | Some(Value::Null) => None,
-            Some(l) => Some(xbt402::listing::parse_draft(l).map_err(|e| format!("listing: {e}"))?),
+            Some(l) => Some(listing_draft(l, &routes)?),
         };
         Ok(Self {
             listen,
             public_url: origin.trim_end_matches('/').to_string(),
-            upstream: up.trim_end_matches('/').to_string(),
+            upstream: up,
             state_dir: PathBuf::from(req_str(top, "state_dir")?),
             chain,
             network,
@@ -619,6 +624,8 @@ fn route(v: &Value) -> Result<Route, String> {
             "release",
             "forward_headers",
             "max_body",
+            "upstream",
+            "strip_prefix",
         ],
     )?;
     let path = req_str(r, "path")?.to_string();
@@ -708,6 +715,15 @@ fn route(v: &Value) -> Result<Route, String> {
             "max_body is at most 64 MiB: a request body is read whole before it is passed on",
         ));
     }
+    let upstream = opt_str(r, "upstream")?.map(|u| upstream_url(u, &format!("route {path}: upstream"))).transpose()?;
+    let strip_prefix = match r.get("strip_prefix") {
+        None => false,
+        Some(Value::Bool(b)) => *b,
+        _ => return Err(bad("strip_prefix is true or false")),
+    };
+    if strip_prefix && !path.ends_with('/') {
+        return Err(bad("strip_prefix is for a path ending in /, which covers everything under it"));
+    }
     Ok(Route {
         path,
         methods,
@@ -716,7 +732,78 @@ fn route(v: &Value) -> Result<Route, String> {
         release,
         forward_headers,
         max_body: max_body as usize,
+        upstream,
+        strip_prefix,
     })
+}
+
+/// The config's `listing`. A `listing/1` names a route per service: the route must exist, and a
+/// service that names no price is given its route's, so the listing cannot say another price.
+fn listing_draft(l: &Value, routes: &[Route]) -> Result<xbt402::listing::Draft, String> {
+    let mut l = l.clone();
+    if let Some(list) = l.get_mut("services").and_then(Value::as_array_mut) {
+        for (i, s) in list.iter_mut().enumerate() {
+            let path = s.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+            let route = routes.iter().find(|r| r.path == path)
+                .ok_or_else(|| format!("listing: service {}: path {path:?} is not one of the routes", i + 1))?;
+            if s.get("prices").is_none() {
+                if let Some(o) = s.as_object_mut() {
+                    o.insert("prices".into(), price_json(&route.price));
+                }
+            }
+        }
+    }
+    xbt402::listing::parse_draft(&l).map_err(|e| format!("listing: {e}"))
+}
+
+/// A route's price as a listing writes it: the rules it sets.
+fn price_json(p: &Price) -> Value {
+    let mut o = Map::new();
+    if p.request_msat > 0 {
+        o.insert("request_msat".into(), p.request_msat.into());
+    }
+    if p.byte_msat > 0 {
+        o.insert("byte_msat".into(), p.byte_msat.into());
+        o.insert("per_bytes".into(), p.per_bytes.into());
+    }
+    if p.second_msat > 0 {
+        o.insert("second_msat".into(), p.second_msat.into());
+    }
+    if o.is_empty() {
+        // a free route: one rule of nothing, which a listing can state
+        o.insert("request_msat".into(), 0.into());
+    }
+    Value::Object(o)
+}
+
+/// A service beside the gateway: `http://host[:port][/prefix]`, without the trailing `/`.
+fn upstream_url(u: &str, what: &str) -> Result<String, String> {
+    let up = xbt402::wire::sendable_url(u.trim_end_matches('/')).map_err(|e| format!("{what}: {e}"))?;
+    if !up.starts_with("http://") || up.contains('?') || up.contains('@') {
+        return Err(format!("{what} is http://host[:port][/prefix]: plain HTTP to a service beside the gateway, no query, no user name"));
+    }
+    Ok(up.trim_end_matches('/').to_string())
+}
+
+impl Route {
+    /// The target as the route's service is sent it.
+    pub fn upstream_target(&self, target: &str) -> String {
+        if !self.strip_prefix {
+            return target.to_string();
+        }
+        // by segments of the raw target: an escaped `/` is refused before a route is chosen, so the
+        // route's segments are the target's first ones however the buyer spelled them
+        let n = self.path.trim_matches('/').split('/').filter(|s| !s.is_empty()).count();
+        let (path, query) = target.split_once('?').map(|(p, q)| (p, Some(q))).unwrap_or((target, None));
+        let rest: Vec<&str> = path.trim_start_matches('/').splitn(n + 1, '/').collect();
+        let tail = if rest.len() > n { rest[n] } else { "" };
+        let mut out = format!("/{tail}");
+        if let Some(q) = query {
+            out.push('?');
+            out.push_str(q);
+        }
+        out
+    }
 }
 
 pub(crate) fn obj<'a>(v: &'a Value, what: &str, known: &[&str]) -> Result<&'a Map<String, Value>, String> {
@@ -1279,6 +1366,54 @@ mod tests {
             let e = edit(&*f).unwrap_err().to_string();
             assert!(e.contains(want), "wanted {want:?}, got {e:?}");
         }
+    }
+
+    #[test]
+    fn a_route_may_name_its_own_service() {
+        let mut v = base();
+        v["routes"][2]["upstream"] = json!("http://127.0.0.1:9000/");
+        v["routes"][0]["strip_prefix"] = json!(true);
+        let c = Config::from_json(&v).unwrap();
+        assert_eq!(c.upstream.as_deref(), Some("http://127.0.0.1:8080"));
+        assert_eq!(c.routes[2].upstream.as_deref(), Some("http://127.0.0.1:9000"));
+        assert_eq!(c.routes[0].upstream, None);
+        assert_eq!(c.routes[0].upstream_target("/files/a/b.bin?x=1"), "/a/b.bin?x=1");
+        assert_eq!(c.routes[0].upstream_target("/files/"), "/");
+        // by segments of the raw target, however the buyer escaped them
+        assert_eq!(c.routes[0].upstream_target("/fil%65s/a"), "/a");
+        assert_eq!(c.routes[2].upstream_target("/api?x"), "/api?x", "without strip_prefix the target is passed as it is");
+        // no service at all for a route
+        let mut none = base();
+        none.as_object_mut().unwrap().remove("upstream");
+        assert!(Config::from_json(&none).unwrap_err().to_string().contains("no upstream"));
+        for r in none["routes"].as_array_mut().unwrap() {
+            r["upstream"] = json!("http://127.0.0.1:9001");
+        }
+        assert_eq!(Config::from_json(&none).unwrap().upstream, None);
+        for (want, f) in [
+            ("upstream is http://", Box::new(|v: &mut Value| v["routes"][0]["upstream"] = json!("https://127.0.0.1:1")) as Box<dyn Fn(&mut Value)>),
+            ("strip_prefix is for a path ending in /", Box::new(|v: &mut Value| v["routes"][2]["strip_prefix"] = json!(true))),
+            ("strip_prefix is true or false", Box::new(|v: &mut Value| v["routes"][0]["strip_prefix"] = json!("yes"))),
+        ] {
+            let mut v = base();
+            f(&mut v);
+            let e = Config::from_json(&v).unwrap_err().to_string();
+            assert!(e.contains(want), "wanted {want:?}, got {e:?}");
+        }
+    }
+
+    #[test]
+    fn a_listing_1_takes_each_services_price_from_its_route() {
+        let mut v = base();
+        v["listing"] = json!({"name": "One box", "updated": "2026-10-26", "services": [
+            {"name": "Files", "kind": "files", "path": "/files/", "items": []},
+            {"name": "Model", "kind": "api", "path": "/api", "items": []},
+        ]});
+        let d = Config::from_json(&v).unwrap().listing.unwrap();
+        assert_eq!(d.services[0].prices, json!({"byte_msat": "1000", "per_bytes": "1048576"}));
+        assert_eq!(d.services[1].prices, json!({"request_msat": "2500"}));
+        v["listing"]["services"][1]["path"] = json!("/nowhere");
+        assert!(Config::from_json(&v).unwrap_err().to_string().contains("not one of the routes"));
     }
 
     #[test]

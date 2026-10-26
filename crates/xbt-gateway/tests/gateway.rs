@@ -1959,3 +1959,33 @@ fn a_listing_is_free_and_signed_by_the_receipt_key() {
     assert_eq!(priced.status, 402);
     assert_eq!(priced.json()["accepts"][0]["extra"]["receiptKey"], KEY(&rig));
 }
+
+/// One gateway sells several services: a route that names its own upstream reaches only that
+/// service, without its own path when it says `strip_prefix`, and the listing lists each service
+/// at its route's price.
+#[test]
+fn one_gateway_sells_several_services_each_behind_its_own_route() {
+    let (second_run, second) = start_service();
+    let second_url = format!("http://{}", second_run.addr);
+    let (rig, _d) = start(&|v| {
+        v["routes"].as_array_mut().unwrap().push(json!({"path": "/model/", "free": true, "upstream": second_url, "strip_prefix": true}));
+        v["listing"] = json!({"name": "One box", "updated": "2026-10-26", "services": [
+            {"name": "Files", "kind": "files", "path": "/files/", "items": []},
+            {"name": "Model", "kind": "api", "path": "/model/", "items": []},
+        ]});
+    });
+    let got = http(&rig.addr, "GET", "/model/files/free/700", &[], b"", None);
+    assert_eq!((got.status, got.body.len()), (200, 700));
+    assert_eq!(rig.hits(), 0, "the gateway's own upstream is not asked");
+    let seen = second.seen.lock().unwrap().clone();
+    assert_eq!(seen.iter().map(|r| r.target.as_str()).collect::<Vec<_>>(), ["/files/free/700"]);
+    // the config's upstream still serves the other routes
+    let free = http(&rig.addr, "GET", "/files/free/50", &[], b"", None);
+    assert_eq!((free.status, free.body.len(), rig.hits()), (200, 50, 1));
+    assert_eq!(second.hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let listed = http(&rig.addr, "GET", "/.well-known/lightning-stream.json", &[], b"", None);
+    let l = xbt402::listing::verify(&listed.json(), &KEY(&rig)).unwrap();
+    assert_eq!(l.services.iter().map(|s| (s.name.as_str(), s.path.as_str())).collect::<Vec<_>>(), [("Files", "/files/"), ("Model", "/model/")]);
+    assert_eq!(l.services[0].prices["byte_msat"], rig.cfg["routes"][0]["price"]["byte_msat"].to_string());
+}
