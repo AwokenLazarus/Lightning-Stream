@@ -19,6 +19,7 @@ Report: run/p2p_hash_regtest.json.
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import subprocess
@@ -38,8 +39,8 @@ RELAY_URL = f"ws://127.0.0.1:{RELAY}"
 DIFF = 4
 SHARE = DIFF * 2**32
 SLICE_WORK = 10 * SHARE
-PRICE_MSAT = 60_000
-TICKET_MSAT = 600_000
+PRICE_MSAT = 100_000
+TICKET_MSAT = 1_000_000  # above the wallet's floor for a held ticket on these channels (no anchors), at its default most
 GRACE_MS = 8000
 REPORT: dict[str, Any] = {"checks": []}
 PROCS: list[subprocess.Popen[bytes]] = []
@@ -55,18 +56,18 @@ def policy() -> dict[str, Any]:
     return {
         "allowlist": [ORIGIN],
         "counterparties": {ORIGIN: {"ln_node": pk}},
-        "max_per_tx_sats": 3000,
-        "daily_budget_sats": 20_000,
-        "weekly_budget_sats": 40_000,
-        "per_counterparty_cap_sats": 20_000,
+        "max_per_tx_sats": 10_000,
+        "daily_budget_sats": 100_000,
+        "weekly_budget_sats": 200_000,
+        "per_counterparty_cap_sats": 100_000,
         "velocity_max": 1_000,
         "velocity_window_s": 3600,
-        "human_threshold_sats": 5000,
+        "human_threshold_sats": 50_000,
         "split_window_s": 0,
         "regtest_mine": False,
         "anchor_interval_s": 3600,
         "ln": {"enabled": True, "split_height": d.SPLIT},
-        "tickets": {"enabled": True, "tasks": {"hashrate": {"budget_sats": 2000}}},
+        "tickets": {"enabled": True, "tasks": {"hashrate": {"budget_sats": 50_000}}},
     }
 
 
@@ -116,6 +117,8 @@ def setup() -> None:
     with open(f"{RUN}/gateway.log", "ab") as log:
         PROCS.append(subprocess.Popen([f"{BIN}/xbt-gateway", f"{RUN}/gateway.json"], stdout=log, stderr=log))
     lab.wait("the gateway", 60, lambda: json.loads(d.send("GET", "/x402/ticket/health", GW)[2])["height"] is not None, every=0.2)
+    status, headers, _ = d.send("POST", "/hashrate/probe/1", GW, body=b"{}")
+    REPORT["terms_402"] = {"status": status, "accepts": json.loads(base64.b64decode(headers.get("payment-required", "e30="))).get("accepts")}
     d.Wallet.policy = lambda self: policy()  # the lab's wallet, with this lab's one seller and task
     d.WALLET_PROC.write_policy()
     d.WALLET_PROC.start()
@@ -147,7 +150,7 @@ def rental(name: str, stop_after: int | None, miner_secs: int, rate: float) -> d
     extra = ["--stop-paying-after", str(stop_after)] if stop_after is not None else []
     buyer = spawn(f"{name}-buyer", ["buyer", "--key", f"{RUN}/keys/buyer.key", "--find", RELAY_URL, "--expect-node", lab.pubkey(d.SELLER),
                                     "--found-out", f"{RUN}/{name}-found.json", "--upstream", f"127.0.0.1:{POOL}", "--user", "buyer.rented",
-                                    "--signer", d.SOCK, "--task", "hashrate", "--max-sats", "700", "--rental", f"rt-{name}",
+                                    "--signer", d.SOCK, "--task", "hashrate", "--max-sats", "1500", "--rental", f"rt-{name}",
                                     "--idle-s", "15", "--report", f"{RUN}/{name}-buyer.json", *extra])
     time.sleep(2)
     miners = [spawn(f"{name}-miner{i}", ["standin-miner", "--pool", f"127.0.0.1:{MINERS}", "--user", f"hasher.m{i}", "--rate", str(rate),
@@ -213,6 +216,15 @@ def main() -> int:
               len(settled) >= 2 and all(new_pay.get(h, {}).get("status") == "SUCCEEDED" for h in settled_hashes),
               {"tickets": REPORT["paid_tickets"], "fees_msat": sum(int(p["fee_msat"]) for p in new_pay.values())})
         REPORT["wallet_status"] = d.signer("ticket_status")
+        # how the wallet sized the session (its pool of held tickets, and why none, if none)
+        opened = []
+        for name in sorted(os.listdir(f"{d.WALLET}/.run")):
+            try:
+                with open(f"{d.WALLET}/.run/{name}", errors="replace") as f:
+                    opened += [line.strip()[:600] for line in f if "ticket_open" in line]
+            except (IsADirectoryError, OSError):
+                pass
+        REPORT["wallet_ticket_open"] = opened
         last = max(p["atMs"] for p in bz["pays"])
         stopped = [e for e in bz["events"] if e["ev"] == "wallet session stopped"]
         check("no-hash: nothing paid after the miners stopped, the wallet's session stopped, nothing held",

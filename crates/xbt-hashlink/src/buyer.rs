@@ -288,7 +288,8 @@ pub fn run(cfg: Config, rail: Box<dyn BuyerRail>) -> Result<Value, String> {
                 let _ = tx.send(&Msg::Pong { n });
             }
             Msg::Close { reason } => {
-                lock(&st).closed = Some(format!("hasher closed: {reason}"));
+                // the hasher answers our own close with one of its own: the first reason stands
+                lock(&st).closed.get_or_insert_with(|| format!("hasher closed: {reason}"));
                 break;
             }
             _ => {}

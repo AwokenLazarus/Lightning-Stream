@@ -29,9 +29,10 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-fn port() -> String {
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().to_string()
+/// `N` distinct free ports: all bound at once before any is let go, so none is picked twice.
+fn ports<const N: usize>() -> [String; N] {
+    let ls: Vec<TcpListener> = (0..N).map(|_| TcpListener::bind("127.0.0.1:0").unwrap()).collect();
+    std::array::from_fn(|i| ls[i].local_addr().unwrap().to_string())
 }
 
 fn wait_for(addr: &str) {
@@ -101,7 +102,7 @@ struct Run {
 
 fn rental(stop_paying_after: Option<u64>, miner_secs: u64, wallet: bool) -> Run {
     let _serial = serial();
-    let (pool_a, link_a, miners_a, slices_a) = (port(), port(), port(), port());
+    let [pool_a, link_a, miners_a, slices_a] = ports::<4>();
     let dir = tempdir();
     let pool_report = dir.join("pool.json");
     {
@@ -260,7 +261,7 @@ fn a_slice_the_hasher_did_not_count_is_refused() {
     // the hasher's endpoint, before any work: a receipt for slice 1 is refused (409), so a gateway
     // in front of it charges nothing
     let _serial = serial();
-    let (link_a, miners_a, slices_a) = (port(), port(), port());
+    let [link_a, miners_a, slices_a] = ports::<3>();
     let hk = noise::fresh_key();
     let hpub = PublicKey::from_secret_key(secp256k1::SECP256K1, &hk);
     let cfg = hasher::Config { miners: miners_a, link: link_a.clone(), key: hk, terms: terms(), report: None, slices: Some(slices_a.clone()) };
