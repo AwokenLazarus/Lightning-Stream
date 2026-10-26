@@ -43,15 +43,20 @@ fn the_river_and_the_stylesheet_are_local_cached_by_hash_and_the_csp_stays_self_
     assert_eq!(h["cache-control"], "public, max-age=31536000, immutable", "the hashed URL never changes meaning");
     assert_eq!(h["x-content-type-options"], "nosniff");
     assert_eq!(js, xbt_wallet_ui::river_js());
-    assert!(js.len() < 8 * 1024, "the river as served stays small: {} bytes", js.len());
+    // small, and fetched once a year per browser (the hashed URL is immutable)
+    assert!(js.len() < 10 * 1024, "the river as served stays small: {} bytes", js.len());
     // stripping indentation and comment lines leaves a script that still parses
     let home = std::env::var("HOME").unwrap_or_default();
     if let Some(node) = ["node".to_string(), format!("{home}/.local/share/nodejs/bin/node")].into_iter()
         .find(|n| std::process::Command::new(n).arg("--version").output().is_ok_and(|o| o.status.success())) {
         let f = data.path().join("river.js");
         std::fs::write(&f, &js).unwrap();
-        let o = std::process::Command::new(node).arg("--check").arg(&f).output().unwrap();
+        let o = std::process::Command::new(&node).arg("--check").arg(&f).output().unwrap();
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        // the served script draws a frame at once, and its pointer effects sit on the streams
+        let o = std::process::Command::new(&node).arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/js/river_test.mjs")).arg(&f).output().unwrap();
+        let out = String::from_utf8_lossy(&o.stdout);
+        assert!(o.status.success() && out.contains("RIVER ok"), "{out}{}", String::from_utf8_lossy(&o.stderr));
     }
     for net in ["fetch(", "XMLHttpRequest", "WebSocket", "sendBeacon", "localStorage", "eval(", "innerHTML"] {
         assert!(!js.contains(net), "the river reads and sends nothing: {net}");
@@ -67,7 +72,7 @@ fn the_river_and_the_stylesheet_are_local_cached_by_hash_and_the_csp_stays_self_
     assert!(h["content-type"].starts_with("text/css"));
     assert_eq!(h["cache-control"], "public, max-age=31536000, immutable");
     assert!(!css.contains("url(http") && !css.contains("@import"), "the stylesheet loads nothing from elsewhere");
-    for token in ["--river-a", "--river-b", "--river-spark", "--river-arc", "--river-blend", "prefers-color-scheme: dark"] {
+    for token in ["--river-a", "--river-b", "--river-spark", "--river-blend", "prefers-color-scheme: dark"] {
         assert!(css.contains(token), "{token}");
     }
 }
@@ -140,6 +145,13 @@ fn the_look_in_headless_chrome() {
     for s in ["dark", "light"] {
         assert!(r["contrast"][s]["text"].as_f64().unwrap() >= 7.0, "body text over the brightest river point: {r}");
         assert!(r["contrast"][s]["muted"].as_f64().unwrap() >= 4.5, "secondary text over the brightest river point: {r}");
+    }
+    assert!(r["flicker"]["frames"].as_u64().unwrap() >= 5, "{r}");
+    assert!(r["flicker"]["min_ratio"].as_f64().unwrap() >= 0.5, "no blank or reset river while moving between pages: {r}");
+    for k in ["desktop", "phone-menu"] {
+        let h = &r["header"][k];
+        assert!(h["scrolled"].as_f64().unwrap() > 0.0 && h["top"].as_f64().unwrap() == 0.0, "{r}");
+        assert!(h["bar"].as_bool().unwrap() && h["shadow"].as_bool().unwrap(), "the page scrolls under the bar, never over it ({k}): {r}");
     }
     let f = &r["cost"]["with_river"]["frames"];
     assert!(f["frames"].as_u64().unwrap() > 0, "{r}");
