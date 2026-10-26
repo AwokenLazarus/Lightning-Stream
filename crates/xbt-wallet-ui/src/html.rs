@@ -133,15 +133,22 @@ pub fn page_head(title: &str, nav: &Nav, flash: Option<(bool, String)>, body: &s
     format!("<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
              <meta name=\"referrer\" content=\"no-referrer\">{head}<link rel=\"icon\" href=\"data:,\"><title>{} · {}</title>\
              <link rel=\"stylesheet\" href=\"./ui.css?v={}\"></head><body>\
-             <header><div class=\"brand\">{}</div><nav>{links}</nav></header>\
+             <div class=\"glow\" aria-hidden=\"true\"></div><canvas id=\"river\" aria-hidden=\"true\"></canvas>\
+             <header><div class=\"brand\">{MARK}{}</div><nav>{links}</nav></header>\
              <main>{flash}<h1>{}</h1>{body}</main>\
              <footer>{}</footer>\
-             <script src=\"./ui.js?v={}\"></script></body></html>\n",
+             <script src=\"./ui.js?v={}\"></script><script src=\"./river.js?v={}\"></script></body></html>\n",
             esc(title), esc(nav.brand), asset_version(crate::UI_CSS), esc(nav.brand), esc(title),
-            if nav.brand == GATEWAY_BRAND { "The macaroons stay on this box; the gateway can make invoices and read the node's height, nothing more." }
-            else { "Keys stay in the signer; your approval key stays in your browser." },
-            asset_version(crate::UI_JS))
+            if nav.brand == GATEWAY_BRAND { "Your node's keys stay on this box. The gateway can only make invoices and read the block height." }
+            else { "Your keys stay in the signer. Your approval key stays in this browser." },
+            asset_version(crate::UI_JS), asset_version(crate::river_js()))
 }
+
+/// The app's mark in the header: a lightning river, the app icon at header size.
+const MARK: &str = "<svg viewBox=\"0 0 32 32\" aria-hidden=\"true\"><rect x=\".5\" y=\".5\" width=\"31\" height=\"31\" rx=\"8\" fill=\"#05081c\" stroke=\"#2a3a80\"/>\
+    <path d=\"M17.5 3 14 11.5h4.5L12 19.5h4.5L10 29\" fill=\"none\" stroke=\"#38bdf8\" stroke-width=\"6\" stroke-linecap=\"round\" stroke-linejoin=\"round\" opacity=\".22\"/>\
+    <path d=\"M17.5 3 14 11.5h4.5L12 19.5h4.5L10 29\" fill=\"none\" stroke=\"#7dd3fc\" stroke-width=\"3\" stroke-linecap=\"round\" stroke-linejoin=\"round\" opacity=\".55\"/>\
+    <path d=\"M17.5 3 14 11.5h4.5L12 19.5h4.5L10 29\" fill=\"none\" stroke=\"#f0f9ff\" stroke-width=\"1.3\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg>";
 
 /// A short content hash for cache busting.
 pub fn asset_version(s: &str) -> String {
