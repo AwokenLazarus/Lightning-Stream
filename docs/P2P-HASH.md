@@ -79,12 +79,18 @@ gateway's own accounting per session applies.
 
 ## What is left
 
-- **Real tickets**: `rail::BuyerRail` and `rail::SellerRail` are where the wallet's held tickets
-  plug in (the signer pays the hasher's hold invoice for each locked hash under a "hashrate" task
-  budget; the hasher's node makes and settles the hold invoices). The lab uses stand-ins.
+- **Real tickets**: done for the wallet path. Each finished slice is one paid request to the
+  hasher's gateway through the wallet's signer (`--signer`, a "hashrate" task budget);
+  `scripts/p2p_hash_regtest.sh` runs it with Lightning Fork nodes. The stand-in rails remain for
+  the lab.
+- **The meters at the end of a rental**: once in our runs (1 of 3 regtest runs), the hasher counted
+  one more finished slice than the buyer as the miners stopped, and closed the rental for that
+  slice unpaid. The buyer is never charged for work it did not count; the hasher can lose up to
+  one slice. Making both sides settle the last slice the same way is open.
 - **Which key signs the link**: today a key of the app's own. Open: the Lightning node key (a
   signing path to the node) or the app key bound to the node key by a signature in the listing.
-- **Listings** (`hashrate` kind on Nostr and directories), reconnect with resume, the Tor
+- **Listings** on public relays and directories (the signed `hashrate/0` listing on Nostr is
+  built and used by `--find`), reconnect with resume, the Tor
   transport, several rentals at once, the UI (Sell: hashrate, Buy: hashrate).
 - **Stale and reject thresholds**: rejected shares cost the hasher (no work counted); a rule to
   end a rental on a high reject rate is not yet there.
