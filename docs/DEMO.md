@@ -115,9 +115,11 @@ the seconds an answer is open, which for a segment that arrives in a tenth of a 
 nothing about the film. If you want a price per minute of film, price each segment as a request:
 a segment is a fixed length of film.
 
-The demo plays over HLS, for a reason on the buyer's side: the wallet's `xbt402_pay` asks for a
-whole address and cannot yet send a `Range` header, which direct play needs. The gateway already
-passes `Range` on to the service.
+The demo plays over HLS: its proxy asks the wallet for whole addresses. Direct play works too
+through the Lightning Stream connector (`crates/lightning-stream`): the wallet's `xbt402_pay` takes
+a `range` and sends it as the `Range` header, the gateway passes `Range` on to the service, and
+the connector hands the seller's 206 to the player, so a player that seeks pays for the bytes it
+fetches from there.
 
 ### 6. What you publish
 
