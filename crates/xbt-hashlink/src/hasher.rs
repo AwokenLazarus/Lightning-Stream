@@ -64,8 +64,8 @@ const PING_EVERY: Duration = Duration::from_secs(15);
 const QUIET_LIMIT: Duration = Duration::from_secs(60);
 const RATE_WINDOW: Duration = Duration::from_secs(60);
 const LOCK_WAIT: Duration = Duration::from_secs(10);
-/// How long a new connection may take to authorize (name its worker) before it is let go.
-const AUTHORIZE_WAIT: Duration = Duration::from_secs(10);
+/// How long a miner asked to connect again is expected back from its address.
+const RETURN_WAIT: Duration = Duration::from_secs(20);
 /// An old upstream session is kept this long after a switch, for shares of its jobs.
 const DRAIN: Duration = Duration::from_secs(10);
 /// After `client.reconnect`, the miner's connection is closed this long later if still open.
@@ -118,6 +118,9 @@ struct Conn {
 
 #[derive(Default)]
 struct Unit {
+    /// Named by its address until the miner authorizes (a miner waits for the answer to its
+    /// subscribe before it says its name, so it is placed before it is named).
+    provisional: bool,
     peer: String,
     rental: Option<String>,
     conn: Option<u64>,
@@ -238,6 +241,8 @@ struct Hub {
     next: u64,
     rails: Rails,
     methods: BTreeMap<String, u64>,
+    /// Miners asked to connect again, by address: the next connection from there is that miner.
+    returning: HashMap<String, (String, Instant)>,
     shutdown: bool,
 }
 
@@ -400,6 +405,7 @@ impl Hasher {
             next: 1,
             rails,
             methods: BTreeMap::new(),
+            returning: HashMap::new(),
             shutdown: false,
         }));
         let down = Arc::new(AtomicBool::new(false));
@@ -954,7 +960,12 @@ fn up_line(g: &mut Hub, id: u64, v: &Value, line: &str) -> bool {
     let Some(c) = g.conns.get_mut(&id) else { return false };
     match sv1::method(v) {
         Some("mining.subscribe") => c.subscribe = Some(v.clone()),
-        Some("mining.authorize") => c.authorize = Some(v.clone()),
+        Some("mining.authorize") => {
+            c.authorize = Some(v.clone());
+            if let Some(w) = sv1::authorize_user(v) {
+                name_unit(g, id, &w);
+            }
+        }
         Some("mining.configure") => c.configure = Some(v.clone()),
         Some("mining.extranonce.subscribe") => c.extranonce = true,
         _ => {}
@@ -1064,6 +1075,13 @@ fn gone(g: &mut Hub, id: u64) {
         if let Some(unit) = g.units.get_mut(u) {
             if unit.conn == Some(id) {
                 unit.conn = None;
+                // a miner that never said its name leaves no record
+                if unit.provisional {
+                    g.units.remove(u);
+                    for r in g.rentals.values_mut() {
+                        r.units.remove(u);
+                    }
+                }
             }
         }
     }
@@ -1094,7 +1112,7 @@ fn drop_slot(g: &mut Hub, id: u64, slot: u64) {
     if c.active == Some(slot) {
         // the miner's own upstream went away: the miner connects again and is placed afresh
         c.active = None;
-        ask_reconnect(c);
+        ask_reconnect(g, id);
     }
 }
 
@@ -1120,45 +1138,98 @@ fn release_slot(g: &mut Hub, id: u64, slot: u64) {
     }
 }
 
-fn ask_reconnect(c: &mut Conn) {
+fn ask_reconnect(g: &mut Hub, id: u64) {
+    let Some(c) = g.conns.get_mut(&id) else { return };
     let (host, port) = c.local.rsplit_once(':').map(|(h, p)| (h.trim_matches(['[', ']']).to_string(), p.parse::<u64>().unwrap_or(0))).unwrap_or_default();
     let m = json!({"id": null, "method": "client.reconnect", "params": [host, port, 0]});
     let _ = send_line(&mut c.w, &m.to_string());
     c.close_at = Some(Instant::now() + RECONNECT_CLOSE);
+    let (peer, unit) = (c.peer.clone(), c.unit.clone());
+    if let Some(u) = unit.filter(|u| g.units.get(u).is_some_and(|x| !x.provisional)) {
+        g.returning.insert(peer, (u, Instant::now()));
+    }
 }
 
-/// Place a new connection: name it by its worker name, then give it its upstream.
-fn place(hub: &Shared, id: u64) {
-    let t0 = Instant::now();
-    loop {
-        {
-            let mut g = lock(hub);
-            let Some(c) = g.conns.get(&id) else { return };
-            if c.authorize.is_none() && t0.elapsed() > AUTHORIZE_WAIT {
-                // a miner names itself before it is given work: anything else is let go
-                let _ = c.w.shutdown(std::net::Shutdown::Both);
-                gone(&mut g, id);
-                return;
-            }
-            if c.authorize.is_some() {
-                let worker = c.authorize.as_ref().and_then(sv1::authorize_user).unwrap_or_else(|| c.peer.clone());
-                let peer = c.peer.clone();
-                // two live connections under one worker name are two miners
-                let mut name = worker.clone();
-                let mut n = 1;
-                while g.units.get(&name).is_some_and(|u| u.conn.is_some_and(|o| o != id && g.conns.get(&o).is_some_and(|c| c.close_at.is_none()))) {
-                    n += 1;
-                    name = format!("{worker} #{n}");
-                }
-                let unit = g.units.entry(name.clone()).or_default();
-                unit.conn = Some(id);
-                unit.peer = peer;
-                unit.seen_ms = now_ms();
-                g.conns.get_mut(&id).unwrap().unit = Some(name);
-                break;
-            }
+/// A connection gets its miner's worker name when it authorizes: a provisional unit takes that
+/// name, and a connection placed as a returning miner that turns out to be another one (two
+/// miners behind one address) moves to its own unit. A record of that miner from an earlier
+/// connection is taken over (its work, earnings and rental).
+fn name_unit(g: &mut Hub, id: u64, worker: &str) {
+    let Some(cur) = g.conns.get(&id).and_then(|c| c.unit.clone()) else { return };
+    let provisional = g.units.get(&cur).is_some_and(|u| u.provisional);
+    if !provisional && (cur == worker || cur.strip_prefix(worker).is_some_and(|r| r.starts_with(" #"))) {
+        return;
+    }
+    // two live connections under one worker name are two miners
+    let live = |g: &Hub, n: &str| g.units.get(n).is_some_and(|u| u.conn.is_some_and(|o| o != id && g.conns.get(&o).is_some_and(|c| c.close_at.is_none())));
+    let mut name = worker.to_string();
+    let mut n = 1;
+    while live(g, &name) {
+        n += 1;
+        name = format!("{worker} #{n}");
+    }
+    let (mut carried, mut methods, peer) = (0u128, BTreeMap::new(), g.conns[&id].peer.clone());
+    if provisional {
+        if let Some(u) = g.units.remove(&cur) {
+            carried = u.work;
+            methods = u.methods;
         }
-        std::thread::sleep(Duration::from_millis(20));
+        for r in g.rentals.values_mut() {
+            r.units.remove(&cur);
+        }
+    } else if let Some(u) = g.units.get_mut(&cur) {
+        // that unit's own miner is still to come back
+        if u.conn == Some(id) {
+            u.conn = None;
+        }
+    }
+    let u = g.units.entry(name.clone()).or_default();
+    u.provisional = false;
+    u.conn = Some(id);
+    u.peer = peer;
+    u.work += carried;
+    for (m, k) in methods {
+        *u.methods.entry(m).or_default() += k;
+    }
+    if u.rental.as_ref().is_some_and(|r| !g.rentals.contains_key(r)) {
+        u.rental = None;
+    }
+    // the channels this connection uses credit their work to the miner's own name
+    let chans: Vec<(String, u32)> = g.conns[&id].slots.values().filter_map(|s| match &s.kind {
+        SlotKind::Rental { rental, chan } => Some((rental.clone(), *chan)),
+        SlotKind::Fallback { .. } => None,
+    }).collect();
+    for (r, chan) in chans {
+        if let Some(r) = g.rentals.get_mut(&r) {
+            r.chan_unit.insert(chan, name.clone());
+        }
+    }
+    g.conns.get_mut(&id).unwrap().unit = Some(name);
+}
+
+/// Place a new connection at once: a miner asked to connect again is the one it was; any other is
+/// named by its address until it authorizes. Then give it its upstream.
+fn place(hub: &Shared, id: u64) {
+    {
+        let mut g = lock(hub);
+        let Some(c) = g.conns.get(&id) else { return };
+        let peer = c.peer.clone();
+        let back = g.returning.remove(&peer).filter(|(_, t)| t.elapsed() < RETURN_WAIT).map(|(u, _)| u)
+            .filter(|u| g.units.get(u).is_some_and(|x| x.conn.is_none_or(|o| o == id || g.conns.get(&o).is_none_or(|c| c.close_at.is_some()))));
+        let (name, provisional) = match back {
+            Some(u) => (u, false),
+            None => (format!("{peer} #{id}"), true),
+        };
+        let unit = g.units.entry(name.clone()).or_default();
+        unit.provisional = provisional;
+        unit.conn = Some(id);
+        unit.peer = peer;
+        unit.seen_ms = now_ms();
+        g.conns.get_mut(&id).unwrap().unit = Some(name);
+        // a miner that authorized already (a stand-in sends it at once) is named now
+        if let Some(w) = g.conns.get(&id).and_then(|c| c.authorize.as_ref().and_then(sv1::authorize_user)) {
+            name_unit(&mut g, id, &w);
+        }
     }
     {
         let mut g = lock(hub);
@@ -1294,24 +1365,22 @@ fn attach(hub: &Shared, id: u64, rental: Option<String>, replay: bool) -> bool {
 
 /// Move a placed connection to `target` (a rental, or the fallback).
 fn switch(hub: &Shared, id: u64, target: Option<String>) {
-    let ext = {
+    {
         let mut g = lock(hub);
         let Some(c) = g.conns.get_mut(&id) else { return };
-        let ext = c.extranonce && c.subscribe.is_some();
-        if !ext {
-            // ask the miner to connect again; it is placed by its worker name when it does
-            ask_reconnect(c);
+        if !(c.extranonce && c.subscribe.is_some()) {
+            // ask the miner to connect again; it is placed where it belongs when it does
             c.busy = false;
+            ask_reconnect(&mut g, id);
             return;
         }
-        ext
-    };
-    let ok = ext && attach(hub, id, target, true);
+    }
+    let ok = attach(hub, id, target, true);
     let mut g = lock(hub);
+    if !ok {
+        ask_reconnect(&mut g, id);
+    }
     if let Some(c) = g.conns.get_mut(&id) {
-        if !ok {
-            ask_reconnect(c);
-        }
         c.busy = false;
     }
 }

@@ -262,11 +262,6 @@ pub fn miner(cfg: MinerConfig) -> Result<MinerResult, String> {
         }
         let mut w = c.try_clone().map_err(|e| e.to_string())?;
         let say = |w: &mut TcpStream, v: Value| w.write_all(format!("{v}\n").as_bytes()).map_err(|e| e.to_string());
-        let _ = say(&mut w, json!({"id": 1, "method": "mining.subscribe", "params": ["standin-miner/0"]}));
-        if cfg.extranonce_subscribe {
-            let _ = say(&mut w, json!({"id": 3, "method": "mining.extranonce.subscribe", "params": []}));
-        }
-        let _ = say(&mut w, json!({"id": 2, "method": "mining.authorize", "params": [cfg.user, "x"]}));
         {
             let st = st.clone();
             std::thread::spawn(move || {
@@ -320,6 +315,16 @@ pub fn miner(cfg: MinerConfig) -> Result<MinerResult, String> {
                 }
             });
         }
+        // as firmware does: subscribe, and authorize only once the subscribe is answered
+        let _ = say(&mut w, json!({"id": 1, "method": "mining.subscribe", "params": ["standin-miner/0"]}));
+        if cfg.extranonce_subscribe {
+            let _ = say(&mut w, json!({"id": 3, "method": "mining.extranonce.subscribe", "params": []}));
+        }
+        let asked = Instant::now();
+        while st.lock().unwrap().en1.is_empty() && !st.lock().unwrap().gone && asked.elapsed() < Duration::from_secs(30) && !over(t0) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = say(&mut w, json!({"id": 2, "method": "mining.authorize", "params": [cfg.user, "x"]}));
         loop {
             if over(t0) {
                 let _ = w.shutdown(std::net::Shutdown::Both);
