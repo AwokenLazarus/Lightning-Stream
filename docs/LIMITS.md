@@ -432,6 +432,24 @@ node.
 
 ### Seller gateway (`xbt-gateway`)
 
+- **Pricing by the token trusts the model's counts.** Tokenizers differ from model to model, and
+  only the seller's model knows how many tokens it read and wrote. The buyer takes the model's
+  stated `usage` on trust, bounded: input at most one token per two bytes of the request body,
+  output at most the request's `max_tokens`. Both sides count streamed chunks with text as one
+  token each, and a model that states no counts is charged those chunks and one input token per
+  four bytes of the body. Against a llama.cpp server running a 1.5B model, 64 streamed chunks
+  matched its stated 64 (`crates/xbt402/tests/tokens_live.rs`, run with `TOKENS_LIVE_URL` and
+  `--ignored`). A buyer that hangs up before the counts has paid for the output it was sent and
+  the input guess (a quarter of the body), not the model's count of its input.
+- **The bound is checked before, not held.** The balance must cover a request's most possible cost
+  before the model is asked, but nothing is set aside: two requests of one buyer at once can each
+  pass the check and together run out. The one that runs out stops where the balance does, never
+  sending a token unpaid; the buyer has paid for what it received. Not run on a Lightning lab
+  yet: the tests run the gateway in process against a stand-in model
+  (`crates/xbt-gateway/tests/tokens.rs`) and the wallet against that gateway
+  (`crates/xbt-signer/tests/ticket_pay.rs`).
+- **A whole (not streamed) reply is held until it is paid for**, up to 8 MiB; a larger one is cut.
+
 Regtest only. The gateway has run against Lightning Fork nodes on one host
 (`scripts/gateway_regtest.sh`, with a test buyer; `scripts/ticket_e2e_regtest.sh`, paid by the
 wallet) and against a stand-in node in its tests.

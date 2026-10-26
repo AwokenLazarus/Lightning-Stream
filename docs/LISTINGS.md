@@ -31,7 +31,7 @@ JSON. `version` is `listing/0`. The fields are closed: an unknown key is not thi
 | `kind` | `video`, `files`, `api` or `ai` (a model asked over HTTP, such as a local language model). |
 | `seller` | The seller's public origin, `http` or `https`, with no path. |
 | `receipt_key` | The receipt key, hex of the 33-byte compressed public key. |
-| `prices` | What a request costs, in millisatoshi, as decimal strings: `request_msat`, `byte_msat`, `per_bytes`, `second_msat`. At least one. `per_bytes` is at least 1. |
+| `prices` | What a request costs, in millisatoshi, as decimal strings: `request_msat`, `byte_msat`, `per_bytes`, `second_msat`, and for a model priced by the token `per_1k_input_msat` and `per_1k_output_msat` (per 1,000 tokens; shown as "10 sat per 1,000 tokens", or "2 sat per 1,000 tokens in, 10 sat per 1,000 tokens out" when input is priced too). At least one. `per_bytes` is at least 1. A reader older than the token prices refuses a listing that names them. |
 | `items` | The catalog. Each entry has `title` and `url` (`http` or `https`). `year` and `credit` are optional; `year` is a number. |
 | `licence` | The terms the works are offered under. |
 | `credits` | Who made them. |
