@@ -69,7 +69,10 @@ pub const SHARED_DIRS: &[SharedDir] = &[
 ];
 
 /// The socket dirs: (dir under `run/`, the component that serves it).
-pub const RUN_DIRS: &[(&str, &str)] = &[(crate::RUN_SIGNER, crate::SIGNER), (crate::RUN_ANCHOR, crate::WITNESS), (crate::RUN_UI, crate::UI)];
+/// `signer/streams` comes after `signer`: a platform that mounts it on its own (to share it with the
+/// connector) makes it owned by root before init runs, and init gives it back to the signer.
+pub const RUN_DIRS: &[(&str, &str)] =
+    &[(crate::RUN_SIGNER, crate::SIGNER), (crate::RUN_STREAMS, crate::SIGNER), (crate::RUN_ANCHOR, crate::WITNESS), (crate::RUN_UI, crate::UI)];
 
 /// The shared MCP token's mode: the UI reads and writes it, the MCP (in the UI's group) reads it.
 pub const MCP_TOKEN_MODE: u32 = 0o640;
@@ -474,6 +477,7 @@ mod tests {
             assert_eq!(std::fs::metadata(root.join(p)).unwrap().mode() & 0o777, 0o600, "{p}");
         }
         assert_eq!(std::fs::metadata(root.join("run/signer")).unwrap().mode() & 0o777, 0o750);
+        assert_eq!(std::fs::metadata(root.join("run/signer/streams")).unwrap().mode() & 0o777, 0o750, "the stream sockets' dir, the signer's");
         // a second run keeps the token and rewrites nothing
         let r2 = init_as(&root, &names, &prov, uid).unwrap();
         assert!(r2["secrets"].as_array().unwrap().iter().all(|s| s["result"] == "unchanged"), "{r2}");
