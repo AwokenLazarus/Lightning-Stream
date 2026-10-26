@@ -125,7 +125,9 @@ the workflow run that built it.
 To publish a new set (the project owner's decision): run the workflow at the commit, or `scripts/oci_publish.sh`
 with a token that may write packages; a package GitHub creates on the first push is private, so make it public
 in its settings once. Then put the new lock in `packaging/images.lock`, run `python3 packaging/pin_images.py`,
-and run the tests with `XBT_TEST_IMAGES=pinned`.
+and run the tests with `XBT_TEST_IMAGES=pinned`. Before a store or a package is published,
+`python3 packaging/pin_images.py --release` must pass: it refuses an image with no lock line (a local tag no
+box can pull) and a lock built from an older commit than the images' sources.
 
 ## What the apps do on a box
 

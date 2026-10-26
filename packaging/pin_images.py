@@ -9,7 +9,11 @@ With --check it writes nothing and exits 1 if a file is not pinned to the lock (
 it). Other images (the stand-in XBT node) are left alone. An image with no lock line yet is left as
 `<image>:0.1.0` (the tag scripts/oci_build.sh --load gives) and any other spelling of it fails --check.
 No digest is invented.
-    python3 packaging/pin_images.py [--check]
+With --release it also refuses what may not be released: an image the packages name that has no lock
+line (a local tag no box can pull), and a lock built from an older commit than the last change to the
+images' sources (crates/, Cargo.toml, Cargo.lock, container/): the pins would run old code. Run it before
+a store or a package is published; it passes only after the images of the commit are published and pinned.
+    python3 packaging/pin_images.py [--check] [--release]
 """
 from __future__ import annotations
 
@@ -19,11 +23,11 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 LOCK = HERE / "images.lock"
-REF = re.compile(r"^(?P<repo>[a-z0-9.-]+(?::\d+)?(?:/[a-z0-9._-]+)+)/(?P<name>xbt-[a-z0-9-]+):(?P<tag>[0-9]+\.[0-9]+\.[0-9]+-[0-9a-f]{12})"
+REF = re.compile(r"^(?P<repo>[a-z0-9.-]+(?::\d+)?(?:/[a-z0-9._-]+)+)/(?P<name>xbt-[a-z0-9-]+|lightning-stream):(?P<tag>[0-9]+\.[0-9]+\.[0-9]+-[0-9a-f]{12})"
                  r"@(?P<digest>sha256:[0-9a-f]{64})$")
-# an image reference of an agentpay service, local tag or pinned. lightning-stream is included so that
-# once images.lock has a line, this rewrites the local tag to that digest.
-ANY = r"(?:[a-z0-9.:/-]+/)?(xbt-(?:init|signer|anchor-witness|wallet-mcp|wallet-ui|gateway|work-relay)|lightning-stream)(?::[A-Za-z0-9._-]+)?(?:@sha256:[0-9a-f]{64})?"
+# an image reference of an agentpay service, local tag or pinned. lightning-stream and xbt-hashlink are
+# included so that once images.lock has their lines, this rewrites their local tags to those digests.
+ANY = r"(?:[a-z0-9.:/-]+/)?(xbt-(?:init|signer|anchor-witness|wallet-mcp|wallet-ui|gateway|work-relay|hashlink)|lightning-stream)(?::[A-Za-z0-9._-]+)?(?:@sha256:[0-9a-f]{64})?"
 
 
 def load_lock(path: Path = LOCK) -> dict[str, str]:
@@ -50,7 +54,7 @@ def targets() -> list[tuple[Path, re.Pattern, str]]:
     return out
 
 
-def pinned(text: str, pat: re.Pattern, pins: dict[str, str]) -> tuple[str, list[str]]:
+def pinned(text: str, pat: re.Pattern, pins: dict[str, str], release: bool = False) -> tuple[str, list[str]]:
     missing = []
 
     def sub(m: re.Match) -> str:
@@ -60,7 +64,7 @@ def pinned(text: str, pat: re.Pattern, pins: dict[str, str]) -> tuple[str, list[
         if name not in pins:
             # no digest exists yet. The local tag is the one oci_build.sh --load gives. Anything else
             # (a registry name, a tag we did not build) is reported, and no digest is invented.
-            if ref == f"{name}:0.1.0":
+            if ref == f"{name}:0.1.0" and not release:
                 return m.group(0)
             missing.append(name)
             return m.group(0)
@@ -69,13 +73,35 @@ def pinned(text: str, pat: re.Pattern, pins: dict[str, str]) -> tuple[str, list[
     return pat.sub(sub, text), missing
 
 
+# what the images are built from: a change here after the lock's commit makes the pins stale
+IMAGE_SOURCES = ["crates", "Cargo.toml", "Cargo.lock", "container"]
+
+
+def stale(pins: dict[str, str]) -> list[str]:
+    """The lock's commits whose images are older than the sources at HEAD (the reasons, one per commit)."""
+    import subprocess
+    out = []
+    for commit in sorted({REF.match(r)["tag"].rsplit("-", 1)[1] for r in pins.values()}):
+        r = subprocess.run(["git", "-C", str(HERE.parent), "diff", "--quiet", commit, "HEAD", "--", *IMAGE_SOURCES])
+        if r.returncode == 1:
+            out.append(f"images.lock pins images built from {commit}; their sources changed since (git diff {commit} HEAD -- {' '.join(IMAGE_SOURCES)})")
+        elif r.returncode != 0:
+            out.append(f"images.lock names commit {commit}, which this checkout does not have")
+    return out
+
+
 def main() -> int:
-    check = "--check" in sys.argv[1:]
+    check = "--check" in sys.argv[1:] or "--release" in sys.argv[1:]
+    release = "--release" in sys.argv[1:]
     pins = load_lock()
     bad = 0
+    if release:
+        for why in stale(pins):
+            print(f"pin_images: not releasable: {why}")
+            bad += 1
     for path, pat, _ in targets():
         text = path.read_text()
-        new, missing = pinned(text, pat, pins)
+        new, missing = pinned(text, pat, pins, release)
         rel = path.relative_to(HERE.parent)
         for name in missing:
             print(f"pin_images: {rel}: {name} has no line in images.lock")
