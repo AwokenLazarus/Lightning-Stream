@@ -3971,3 +3971,35 @@ fn a_seller_that_ignores_the_size_asked_for_is_paid_nothing() {
     assert_eq!((v["verdict"].as_str(), v["rule"].as_str()), (Some("deny"), Some("ticket_amount")), "{v}");
     assert!(r.ln.state().payments.is_empty() && r.ledger().is_empty(), "nothing booked and nothing sent");
 }
+
+/// A seller that answers every draw with a 200 and a valid receipt, and never with a reveal of
+/// the values the wallet gave: once the answer has ended, the wallet tries a few rounds and stops.
+///
+/// FAILS before: such a round counted as progress, so the drawer sent empty rounds without a pause
+/// for as long as a value stayed open, the call never returned, and the session stayed busy.
+#[test]
+fn a_seller_that_never_reveals_does_not_keep_the_call_open() {
+    let _g = env_lock();
+    let r = Arc::new(draws_rig(json!({"tickets": {"lottery": {"min_expected_wins": 0}}})));
+    r.tap.set(Box::new(move |seen, real| {
+        if !seen.path.starts_with("/x402/lottery/draw") {
+            return None;
+        }
+        let (status, headers, body) = whole(real().unwrap());
+        let mut v: Value = serde_json::from_slice(&body).unwrap();
+        if let Some(o) = v.as_object_mut() {
+            o.remove("reveal");
+        }
+        let body = serde_json::to_vec(&v).unwrap();
+        let headers: Vec<(String, String)> = headers.into_iter().filter(|(k, _)| !k.eq_ignore_ascii_case("content-length")).collect();
+        Some(Ok(answer(status, headers, body)))
+    }));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let r2 = r.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(r2.pay(&format!("/pieces/{}", 4 * PIECE), 100));
+    });
+    let v = rx.recv_timeout(Duration::from_secs(90)).expect("the call returns");
+    assert_eq!((v["rail"].as_str(), v["wins_paid"].as_u64()), (Some("lottery"), Some(0)), "{v}");
+    assert!(v["ended"].as_str().is_some_and(|e| e.contains("reveal")), "{v}");
+}

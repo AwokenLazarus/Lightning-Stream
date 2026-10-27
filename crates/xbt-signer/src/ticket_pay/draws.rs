@@ -38,6 +38,9 @@ const NEXT_WAY: [&str; 10] = ["lottery_disabled", "ticket_disabled", "ln_disable
 const ROUND_TRIES: usize = 6;
 /// How long the last pieces of an answer wait for the seller to know them.
 const ROUND_WAIT: Duration = Duration::from_millis(40);
+/// How long the drawer goes on once the answer has ended: for the reveals of the values still open
+/// and the invoices of the wins owed. A seller that gives neither in this time is given up on.
+const DONE_WAIT: Duration = Duration::from_secs(60);
 
 fn refused(rule: &str, reason: impl Into<String>) -> Value {
     with(deny(rule, reason), json!({"rail": "lottery", "charged_sats": 0}))
@@ -866,6 +869,7 @@ impl Signer {
             scope.spawn(|| {
                 let mut seconds = 0u64;
                 let mut tries = 0;
+                let mut done_at: Option<Instant> = None;
                 loop {
                     let (pieces, voids, done) = {
                         let mut s = lock(&shared);
@@ -886,8 +890,14 @@ impl Signer {
                     // reached the gate when its win became one
                     if !done {
                         self.draw_hurry(ds);
+                    } else if done_at.get_or_insert_with(Instant::now).elapsed() > DONE_WAIT {
+                        stop_now(format!("the seller neither revealed the values still open nor sent the invoices of the wins owed in the {} s after the answer ended",
+                                         DONE_WAIT.as_secs()));
+                        return;
                     }
-                    let open = lock(&ds.state).buyer.as_ref().is_some_and(|b| b.open().next().is_some());
+                    let open_n = || lock(&ds.state).buyer.as_ref().map_or(0, |b| b.open().count());
+                    let open_before = open_n();
+                    let open = open_before > 0;
                     if pieces.is_empty() && voids.is_empty() && !open {
                         if done && lock(&shared).pending.is_empty() {
                             return;
@@ -921,6 +931,9 @@ impl Signer {
                     }
                     match self.draw_round(ds, &pieces, &voids, false, counted) {
                         Ok(r) => {
+                            // after the answer has ended, a round that gave nothing, found no win and saw no open value
+                            // revealed is no progress: an answer of 200 with nothing new is tried a few times, not forever
+                            let stuck = done && pieces.is_empty() && voids.is_empty() && r.wins.is_empty() && open_n() >= open_before;
                             if !r.left.is_empty() {
                                 let mut s = lock(&shared);
                                 s.pending.splice(0..0, r.left);
@@ -931,10 +944,11 @@ impl Signer {
                                     scope.spawn(move || self.draw_pay(ds, &w, &inv, false, counted));
                                 }
                             }
-                            tries = if r.again { tries + 1 } else { 0 };
+                            tries = if r.again || stuck { tries + 1 } else { 0 };
                             if tries > 0 {
                                 if tries > ROUND_TRIES {
-                                    stop_now("the seller did not take the values for the last pieces".into());
+                                    stop_now(if stuck { "the seller answers and reveals none of the values still open".into() }
+                                             else { "the seller did not take the values for the last pieces".into() });
                                     return;
                                 }
                                 std::thread::sleep(ROUND_WAIT);
