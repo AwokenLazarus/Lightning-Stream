@@ -5,6 +5,30 @@ package (from 0.1.14) and the Linux package (from 0.1.12). Dates are UTC.
 
 Lightning Stream is early software. It runs on mainnet; use small amounts.
 
+## 0.1.16 (2026-10-27)
+
+**Selling**
+- A shop that moved to a new address is listed there whole: items saved at its old address move with
+  it, each time the shop is saved or the app starts.
+- A wallet can allow a moved shop to be paid. It reads the seller's Lightning node from each service's
+  address and an item of each, at the seller's address, and asks the front page last (a shop need not
+  price it). Before, it said "the seller asked for no payment at its address".
+
+**Linux package**
+- The signer starts while your XBT node is stopped or not set up yet, instead of restarting in a loop.
+  `LS_CHAIN` in `.env` says the chain (`main` unless set), and the wallet page says when the node does
+  not answer.
+- The signer waits a moment for the anchor witness at start, so a first start is clean.
+- `install.sh`: an empty answer to the admin macaroon question skips that step, as it says; a path with
+  no file is said to be missing, not blamed on the Lightning node.
+- `.env` holds a plain value as it is, so the random password is what you see; the install's last lines
+  say exactly what to type.
+- The guide: how a node that uses only its cookie gives the app a login (`rpcauth`, with a check), and
+  that some nodes take only channels of 100,000 sats or more.
+
+**Wording**
+- The Your node page says the app is tested on mainnet with small amounts only.
+
 ## 0.1.15 (2026-10-27)
 
 **Paying on a new wallet**
