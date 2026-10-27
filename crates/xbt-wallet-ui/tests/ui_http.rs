@@ -414,10 +414,12 @@ fn a_halted_lightning_rail_shows_as_a_resume_request_that_pays_nothing() {
 #[test]
 fn the_policy_editor_shows_the_signer_s_errors_and_applies_a_signed_change_live() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
-    let bx = start(json!({}), false, |_| {});
+    // paying on already: the page edits the rules in force (with paying off it opens on the starter rules)
+    let bx = start(json!({"ln": {"enabled": true}}), false, |_| {});
     let mut br = logged_in(&bx);
     let page = br.get("/policy").body;
     assert!(page.contains("name=\"f_human_threshold_sats\" value=\"1000\""));
+    assert!(!page.contains("Paying is not turned on yet") && page.contains("Start from the safe starter rules"), "{page}");
     // an invalid value: the page lists exactly what the signer's validator says
     let csrf = field(&page, "csrf");
     let mut form: Vec<(String, String)> = vec![("csrf".into(), csrf.clone()), ("mode".into(), "form".into())];
@@ -470,6 +472,48 @@ fn the_policy_editor_shows_the_signer_s_errors_and_applies_a_signed_change_live(
     assert!(br.post("/policy", &[("csrf", &csrf), ("mode", "json"), ("json", "{nope")]).body.contains("policy.json: key must be a string"));
     // the template
     assert!(br.get("/policy?template=starter").body.contains("name=\"f_max_per_tx_sats\" value=\"100000\""));
+}
+
+#[test]
+fn with_paying_off_the_rules_page_opens_on_the_starter_rules_and_signing_them_turns_paying_on() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let bx = start(json!({}), false, |_| {});
+    let mut br = logged_in(&bx);
+    let page = br.get("/policy").body;
+    assert!(page.contains("Paying is not turned on yet, so the safe starter rules are filled in below"), "{page}");
+    assert!(page.contains("name=\"f_max_per_tx_sats\" value=\"100000\""), "the starter value, not the rule in force");
+    // the node's limit: shown in words, empty off mainnet (not required there)
+    assert!(page.contains("The most your Lightning node may hold that this app trusts it with (sats)"), "{page}");
+    assert!(page.contains("name=\"f_ln_exposure_cap_sats\" value=\"\""), "{page}");
+    // what is posted: the starter's Lightning and ticket sections come along, and a cap typed in lands in ln
+    let mut f = policy_form_fields(&page);
+    f.push(("f_ln_exposure_cap_sats".into(), "120000".into()));
+    let prev = br.post("/policy", &f.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect::<Vec<_>>()).body;
+    let signed: Value = serde_json::from_str(&field(&prev, "text")).unwrap();
+    assert_eq!((signed["ln"]["enabled"].clone(), signed["ln"]["exposure_cap_sats"].clone(), signed["tickets"]["enabled"].clone()),
+               (json!(true), json!(120000), json!(true)), "{signed}");
+    // emptied: taken out of ln, the rest of ln kept
+    f.iter_mut().find(|(k, _)| k == "f_ln_exposure_cap_sats").unwrap().1 = "".into();
+    let prev = br.post("/policy", &f.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect::<Vec<_>>()).body;
+    let signed: Value = serde_json::from_str(&field(&prev, "text")).unwrap();
+    assert!(signed["ln"].get("exposure_cap_sats").is_none() && signed["ln"]["enabled"] == json!(true), "{signed}");
+}
+
+#[test]
+fn the_mainnet_starter_rules_set_the_node_s_exposure_cap_from_what_it_holds() {
+    use xbt_wallet_ui::app::{starter_exposure_cap, starter_policy, starter_policy_for, STARTER_EXPOSURE_CAP_SATS};
+    assert_eq!(STARTER_EXPOSURE_CAP_SATS, 100_000);
+    // twice what the channels hold, rounded up to 10,000, never below the least cap
+    for (held, cap) in [(0, 100_000), (29_692, 100_000), (50_000, 100_000), (50_001, 110_000), (70_000, 140_000), (-5, 100_000), (i64::MAX, i64::MAX / 10_000 * 10_000)] {
+        assert_eq!(starter_exposure_cap(held), cap, "held {held}");
+    }
+    let m = starter_policy("main");
+    // exactly the Lightning section the signer's mainnet readiness test signs (xbt-signer tests/ln_rail.rs)
+    assert_eq!(m["ln"], json!({"enabled": true, "split_height": xbt_wallet_ui::app::MAINNET_SPLIT_HEIGHT, "exposure_cap_sats": 100_000}));
+    assert_eq!(starter_policy_for("main", Some(70_000))["ln"]["exposure_cap_sats"], json!(140_000));
+    // off mainnet the signer needs no cap: none is set
+    assert!(starter_policy_for("regtest", Some(70_000))["ln"].get("exposure_cap_sats").is_none());
+    assert!(xbt_signer::policy::validate_policy(&m).0.is_empty(), "{m}");
 }
 
 /// Every field of the policy form on `page`, as a browser would post it.
@@ -1929,7 +1973,7 @@ fn the_enrolment_code_the_box_gives_is_filled_in() {
     let page = br.get("/setup").body;
     assert!(page.contains("<input type=\"hidden\" name=\"code\" value=\"ABCD-EFGH-IJKL\">"), "{page}");
     assert!(!page.contains("Enrolment code<input") && page.contains("Use this key for approvals"), "{page}");
-    assert!(page.contains("Download the backup file") && page.contains("I saved the downloaded file somewhere safe"), "{page}");
+    assert!(page.contains("Download the approval key backup (this is not your passphrase)") && page.contains("I saved the downloaded file somewhere safe"), "{page}");
     // what saving needs is said before Save is pressed: the download and the tick, or the last 8 characters
     assert!(page.contains("keep its backup in one of two ways") && page.contains("type the backup's last 8 characters"), "{page}");
     // without the box's copy the code is asked as before
@@ -2065,4 +2109,41 @@ fn the_sell_page_offers_the_services_found_on_the_box() {
     assert!(page.contains("Found on this box") && page.contains(&format!("data-value=\"http://{jelly}\"")), "{page}");
     assert!(!page.contains("http://127.0.0.1:1\""), "a service that does not answer is not offered");
     assert!(page.contains("I don&#39;t have an https address yet") || page.contains("I don't have an https address yet"), "{page}");
+}
+
+#[test]
+fn on_mainnet_the_rules_page_suggests_the_node_s_limit_and_never_prefills_the_signer_s_test_chain_defaults() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    // paying on, no exposure cap, and the money limits left out: the signer's own defaults would be huge
+    let mut rig = Rig::build(json!({"ln": {"enabled": true}}), false, "main");
+    let path = rig.root.join("policy.json");
+    let mut p: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    for k in ["max_per_tx_sats", "daily_budget_sats", "hot_balance_cap_sats"] {
+        p.as_object_mut().unwrap().remove(k);
+    }
+    std::fs::write(&path, serde_json::to_string(&p).unwrap()).unwrap();
+    rig.restart().unwrap();
+    let eff = rig.call("policy_get", json!({}))["effective"].clone();
+    assert!(eff["max_per_tx_sats"].as_i64().unwrap() > 2000, "the signer's default is above the starter's: {eff}");
+    let bx = start_on(rig, |_| {});
+    let mut br = logged_in(&bx);
+    let page = br.get("/policy").body;
+    assert!(!page.contains("Paying is not turned on yet"), "paying is on: the rules in force are edited");
+    assert!(page.contains("Your Lightning node needs a limit before the app can pay through it: <span class=\"money\">100,000 sats"), "{page}");
+    assert!(page.contains("name=\"f_ln_exposure_cap_sats\" value=\"100000\""), "{page}");
+    assert!(page.contains("the safe starter values are filled in below instead of the signer&#39;s built-in ones")
+            || page.contains("the safe starter values are filled in below instead of the signer's built-in ones"), "{page}");
+    let starter = xbt_wallet_ui::app::starter_policy("main");
+    for k in ["max_per_tx_sats", "daily_budget_sats", "hot_balance_cap_sats"] {
+        assert!(page.contains(&format!("name=\"f_{k}\" value=\"{}\"", starter[k])), "{k}: {page}");
+    }
+    // a limit the rules do set is shown as it is
+    assert!(page.contains("name=\"f_weekly_budget_sats\" value=\"6000\""), "{page}");
+    // signing the form as shown: the cap lands in ln, paying stays on
+    let mut f = policy_form_fields(&page);
+    f.push(("f_ln_exposure_cap_sats".into(), field(&page, "f_ln_exposure_cap_sats")));
+    let prev = br.post("/policy", &f.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect::<Vec<_>>()).body;
+    let signed: Value = serde_json::from_str(&field(&prev, "text")).unwrap();
+    assert_eq!((signed["ln"]["enabled"].clone(), signed["ln"]["exposure_cap_sats"].clone(), signed["max_per_tx_sats"].clone()),
+               (json!(true), json!(100000), starter["max_per_tx_sats"].clone()), "{signed}");
 }

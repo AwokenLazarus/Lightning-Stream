@@ -1905,6 +1905,18 @@ impl Signer {
         let halt_refusal = (!out["halted"].is_null())
             .then(|| format!("the rail is halted until the human resumes it: {}", str_or_empty(out["halted"].get("reason"))));
         let blocked: Vec<&String> = [&over, &tower_refusal, &mac_refusal, &halt_refusal].into_iter().flatten().collect();
+        // not ready: the first thing in the way, so a front end never shows "not ready" with no why
+        let reason = if chain["ok"] != true {
+            Some(format!("the LN node's chain check failed: {}", str_or_empty(chain.get("reason"))))
+        } else if let Some(b) = blocked.first() {
+            Some((*b).clone())
+        } else if blocking {
+            unread.first().cloned()
+        } else if ids.is_empty() {
+            Some("the LN node has no channel this wallet can pay through".to_string())
+        } else {
+            None
+        };
         let mut node_text = json!({"alias": str_or_empty(info.get("alias")), "version": str_or_empty(info.get("version"))});
         if !unread_said.is_empty() {
             node_text["node_messages"] = Value::Object(unread_said);
@@ -1922,6 +1934,9 @@ impl Signer {
             UNTRUSTED_LN_KEY: untrusted_ln(node_text),
             "channel_opens": "never: this wallet pays through the node's existing channels",
         }));
+        if let Some(r) = reason {
+            out["reason"] = r.into();
+        }
         if !presplit.is_empty() {
             warnings.insert(0, "the LN node holds coins confirmed below the split height: never fund a channel from them (their 0x01 commitments replay on the SHA-256 chain)".into());
         }

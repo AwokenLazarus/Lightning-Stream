@@ -129,6 +129,16 @@ pub(crate) fn plain_reason(r: &str) -> String {
     let l = r.to_ascii_lowercase();
     if l.contains("off in this policy") || l.contains("ln.enabled") {
         "Paying is not turned on in your spending rules yet. Sign the safe starter rules (Settings → Spending rules) to turn it on.".into()
+    } else if l.contains("mainnet needs ln.exposure_cap_sats") {
+        "Your spending rules don't say how much your Lightning node may hold. Sign the safe starter rules again (Settings → Spending rules): they set it.".into()
+    } else if l.contains("above ln.exposure_cap_sats") {
+        "Your Lightning node holds more than your spending rules allow it to. Raise \"The most your Lightning node may hold\" in Settings → Spending rules, or move some funds off the node.".into()
+    } else if l.contains("watchtower") {
+        "Your node's watchtower can't be checked. Remove unknown watchtowers in your node's app, or list the ones you trust under Advanced in Settings → Spending rules.".into()
+    } else if l.contains("halted") {
+        "Paying is paused until you resume it on Your node.".into()
+    } else if l.contains("chain check failed") {
+        "Your node is not on the expected chain, or is still catching up. Wait for it to sync.".into()
     } else if l.contains("mainnet") && (l.contains("ack") || l.contains("acknowledg")) {
         "Confirm that the app may pay with real money (on Your node).".into()
     } else if l.contains("no usable channel") || l.contains("no channel") {
@@ -219,7 +229,7 @@ pub fn follow_node(gw: &crate::config::GatewaySetup) -> Result<bool, String> {
 impl App {
     // --- the wallet: the Lightning rail ------------------------------------------------------------
 
-    fn signer_chain(&self) -> String {
+    pub(crate) fn signer_chain(&self) -> String {
         self.signer.call("health", json!({})).ok().and_then(|h| h.get("chain").and_then(Value::as_str).map(str::to_string)).unwrap_or_default()
     }
 

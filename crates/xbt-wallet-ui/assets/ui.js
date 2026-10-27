@@ -302,10 +302,25 @@
           $("[name=signature]", form).value = hex(sig);
           if (pinEl) pinEl.value = "";
           form.submit();
-        } catch (e) { say(out, e.message, true); }
+        } catch (e) {
+          if (e.message !== "wrong passphrase") { say(out, e.message, true); return; }
+          // the passphrase is the one chosen when the key was made; the backup file is the key itself
+          say(out, "Wrong passphrase. Forgot it? ", true);
+          var a = document.createElement("a");
+          a.href = "./keys#restore";
+          a.textContent = "Restore the key from its backup file and choose a new passphrase";
+          out.appendChild(a);
+          out.appendChild(document.createTextNode("."));
+        }
       }, 20);
     });
   });
+
+  // ./keys#restore: the restore from a backup, opened
+  if (root.location && root.location.hash === "#restore") {
+    var rs = $("#restore");
+    if (rs) { $$("details", rs).concat([rs]).forEach(function (d) { if (d.tagName === "DETAILS") d.open = true; }); rs.scrollIntoView(); }
+  }
 
   // A rotation of the human key finished: promote the pending key.
   var hk = $("#human-key-state");
@@ -351,12 +366,14 @@
     var dl = $("#keygen-download");
     if (dl) dl.addEventListener("click", function () {
       if (!seed) return;
-      var text = "Lightning Stream: approval key backup\n\n" + hex(seed) + "\n\nThis is the only copy of your approval key. Keep it offline and private: " +
+      var text = "Lightning Stream: approval key backup (this is not your passphrase)\n\n" + hex(seed) + "\n\nThis is the only copy of your approval key. Keep it offline and private: " +
                  "whoever has it can approve payments and change your spending rules. To restore it, open Keys, then " +
-                 "\"restore a key from its backup\", and paste the 64 characters above.\n";
+                 "\"restore a key from its backup\", paste the 64 characters above and choose a passphrase.\n\n" +
+                 "Your passphrase is not in this file. It is what you typed when you made the key, and it unlocks the key in your browser. " +
+                 "Forgot it? Restore the key from this file and choose a new one.\n";
       var a = document.createElement("a");
       a.href = URL.createObjectURL(new Blob([text], { type: "text/plain" }));
-      a.download = "lightning-stream-approval-key.txt";
+      a.download = "lightning-stream-approval-key-backup.txt";
       document.body.appendChild(a); a.click(); a.remove();
       downloaded = true;
       var box = $("#keygen-saved"); if (box) { box.disabled = false; box.checked = true; }

@@ -99,11 +99,40 @@ const INT_KEYS: [(&str, &str, &str); 12] = [
 /// coins older than this exists on both chains, and the rail refuses it.
 pub const MAINNET_SPLIT_HEIGHT: i64 = 961_640;
 
+/// The least `ln.exposure_cap_sats` the starter rules set on mainnet.
+pub const STARTER_EXPOSURE_CAP_SATS: i64 = 100_000;
+
+/// The exposure cap the starter rules suggest for a node that holds `held` sats in its channels:
+/// twice that, rounded up to 10,000 sats, and never below [`STARTER_EXPOSURE_CAP_SATS`]. The signer
+/// refuses every payment on mainnet without a cap, and while the node holds more than it.
+pub fn starter_exposure_cap(held: i64) -> i64 {
+    let twice = held.max(0).saturating_mul(2);
+    let rounded = twice.saturating_add(9_999) / 10_000 * 10_000;
+    rounded.max(STARTER_EXPOSURE_CAP_SATS)
+}
+
+/// The money limits the plain form never pre-fills above their mainnet starter value from the
+/// signer's built-in defaults (which are for test chains). For these, a larger number trusts more.
+const MAINNET_CAPPED_KEYS: [&str; 7] = ["max_per_tx_sats", "daily_budget_sats", "weekly_budget_sats", "per_counterparty_cap_sats",
+                                         "human_threshold_sats", "hot_balance_cap_sats", "velocity_max"];
+
+/// Whether paying over Lightning is turned on in `p`.
+fn paying_on(p: &Value) -> bool {
+    p.get("ln").and_then(|l| l.get("enabled")) == Some(&Value::Bool(true))
+}
+
 /// A conservative first policy (the setup wizard's template; `xbt-wallet-mcp/policy.example.json`'s limits),
 /// with the Lightning rail and stream tickets on (tickets are paid only under a task with a budget: `default`
 /// for buying, `hashrate` for the pieces of work of rented miners). On mainnet (`chain` "main") the caps are
-/// low: the software has been tested on mainnet with small amounts only.
+/// low (the software has been tested on mainnet with small amounts only), and the node's exposure cap is
+/// set (see [`starter_policy_for`] to size it from what the node holds).
 pub fn starter_policy(chain: &str) -> Value {
+    starter_policy_for(chain, None)
+}
+
+/// [`starter_policy`], with the exposure cap on mainnet sized from `held`, the sats the node holds
+/// in its channels now ([`starter_exposure_cap`]); `None`: the least cap.
+pub fn starter_policy_for(chain: &str, held: Option<i64>) -> Value {
     let mut p = json!({"allowlist": [], "counterparties": {}, "max_per_tx_sats": 100000, "daily_budget_sats": 200000, "weekly_budget_sats": 500000,
            "per_counterparty_cap_sats": 100000, "velocity_max": 60, "velocity_window_s": 3600, "human_threshold_sats": 50000,
            "split_window_s": 600, "approval_ttl_s": 900, "hot_balance_cap_sats": 1500000, "anchor_interval_s": 300,
@@ -114,6 +143,7 @@ pub fn starter_policy(chain: &str) -> Value {
             p[k] = json!(v);
         }
         p["ln"]["split_height"] = json!(MAINNET_SPLIT_HEIGHT);
+        p["ln"]["exposure_cap_sats"] = json!(starter_exposure_cap(held.unwrap_or(0)));
         p["tickets"]["tasks"]["default"]["budget_sats"] = json!(10000);
         p["tickets"]["tasks"]["hashrate"]["budget_sats"] = json!(5000);
     }
@@ -444,7 +474,7 @@ impl App {
         }
         format!("<form method=\"post\" action=\"{action}\" data-sign=\"{kind}\" data-human=\"{}\" class=\"signed\">{}{h}{visible}\
                  <input type=\"hidden\" name=\"signature\" value=\"\">\
-                 <div class=\"row\"><input class=\"pin\" type=\"password\" autocomplete=\"off\" inputmode=\"text\" placeholder=\"Key passphrase\" aria-label=\"Key passphrase\">\
+                 <div class=\"row\"><input class=\"pin\" type=\"password\" autocomplete=\"one-time-code\" data-lpignore=\"true\" data-1p-ignore data-bwignore inputmode=\"text\" placeholder=\"Approval key passphrase\" aria-label=\"Approval key passphrase\">\
                  <button type=\"submit\">{}</button></div><p class=\"sign-msg\" aria-live=\"polite\"></p>\
                  {}</form>",
                 esc(human), Self::csrf_input(ctx), esc(button), message.html())
@@ -799,27 +829,85 @@ impl App {
             }
             b.push_str("</ul></div>");
         }
-        b.push_str(&format!("<form method=\"post\" action=\"./policy\" class=\"policy\">{}<input type=\"hidden\" name=\"mode\" value=\"form\">", Self::csrf_input(ctx)));
+        let main = self.signer_chain() == "main";
+        let starter = starter_policy("main");
+        // on mainnet, a limit the rules leave out is shown at its starter value, not at the signer's
+        // built-in one (made for test chains): signing the form as shown never trusts more than that
+        let mut lowered: Vec<&str> = vec![];
+        let shown = |k: &str, label: &'static str, lowered: &mut Vec<&str>| -> Option<Value> {
+            if let Some(v) = p.get(k) {
+                return Some(v.clone());
+            }
+            let e = eff.get(k).cloned();
+            if !(main && MAINNET_CAPPED_KEYS.contains(&k)) {
+                return e;
+            }
+            let sv = starter.get(k).and_then(Value::as_i64);
+            let above = match (e.as_ref().and_then(Value::as_i64), sv) {
+                // the box's balance cap: 0 is no limit at all
+                (Some(0), Some(_)) if k == "hot_balance_cap_sats" => true,
+                (Some(ev), Some(sv)) => ev > sv,
+                (None, Some(_)) => true,
+                _ => false,
+            };
+            if above {
+                lowered.push(label);
+                starter.get(k).cloned()
+            } else {
+                e
+            }
+        };
+        let mut fields = String::new();
+        fields.push_str(&format!("<form method=\"post\" action=\"./policy\" class=\"policy\">{}<input type=\"hidden\" name=\"mode\" value=\"form\">", Self::csrf_input(ctx)));
+        let mut cap_suggested: Option<i64> = None;
         let groups = [("budgets", "Spending limits"), ("human", "Ask me first"), ("velocity", "How fast"), ("hot", "Money on this box"), ("anchor", "Records")];
         for (g, title) in groups {
             if g == "velocity" {
-                b.push_str("<details><summary>More rules</summary>");
+                fields.push_str("<details><summary>More rules</summary>");
             }
-            b.push_str(&format!("<fieldset><legend>{title}</legend>"));
+            fields.push_str(&format!("<fieldset><legend>{title}</legend>"));
             for (k, label, grp) in INT_KEYS {
                 if grp == g {
-                    b.push_str(&format!("<label>{}<input name=\"f_{k}\" value=\"{}\" inputmode=\"numeric\"></label>", esc(label), escv(p.get(k).or(eff.get(k)))));
+                    let v = shown(k, label, &mut lowered);
+                    fields.push_str(&format!("<label>{}<input name=\"f_{k}\" value=\"{}\" inputmode=\"numeric\"></label>", esc(label), escv(v.as_ref())));
                 }
             }
+            if g == "budgets" && p.get("ln").is_some() {
+                let set = p.get("ln").and_then(|l| l.get("exposure_cap_sats")).filter(|v| !v.is_null()).cloned();
+                let held = self.ln_held();
+                let value = match set {
+                    Some(v) => txt(Some(&v)),
+                    None if main && paying_on(p) => {
+                        let c = starter_exposure_cap(held);
+                        cap_suggested = Some(c);
+                        c.to_string()
+                    }
+                    None => String::new(),
+                };
+                fields.push_str(&format!("<label>The most your Lightning node may hold that this app trusts it with (sats)\
+                    <input name=\"f_ln_exposure_cap_sats\" value=\"{}\" inputmode=\"numeric\"></label>\
+                    <p class=\"hint\">Your node's channels hold {} now. The app pays through the node only while it holds no more than this{}.</p>",
+                    esc(&value), money(held), if main { "; on mainnet it is required" } else { "" }));
+            }
             if g == "anchor" {
-                b.push_str(&format!("<label class=\"check\"><input type=\"checkbox\" name=\"f_anchor_required\" value=\"1\"{}> Refuse to start without the separate record keeper (after a restart)</label>",
+                fields.push_str(&format!("<label class=\"check\"><input type=\"checkbox\" name=\"f_anchor_required\" value=\"1\"{}> Refuse to start without the separate record keeper (after a restart)</label>",
                                     if p.get("anchor_required").or(eff.get("anchor_required")) == Some(&Value::Bool(true)) { " checked" } else { "" }));
             }
-            b.push_str("</fieldset>");
+            fields.push_str("</fieldset>");
             if g == "anchor" {
-                b.push_str("</details>");
+                fields.push_str("</details>");
             }
         }
+        if let Some(c) = cap_suggested {
+            b.push_str(&format!("<div class=\"flash warn\"><p>Your Lightning node needs a limit before the app can pay through it: \
+                {} is filled in below (\"The most your Lightning node may hold\"). Review it, then sign.</p></div>", money(c)));
+        }
+        if !lowered.is_empty() {
+            b.push_str(&format!("<div class=\"flash warn\"><p>Your rules leave these out, so the safe starter values are filled in below \
+                instead of the signer's built-in ones, which are for test chains: {}. Signing the form sets them.</p></div>",
+                esc(&lowered.join("; "))));
+        }
+        b.push_str(&fields);
         let allow = p.get("allowlist").and_then(Value::as_array).map(|a| a.iter().map(|x| txt(Some(x))).collect::<Vec<_>>().join("\n")).unwrap_or_default();
         let cps = p.get("counterparties").and_then(Value::as_object).map(|m| m.iter().map(|(k, v)| format!("{k} {}", txt(v.get("ln_node")))).collect::<Vec<_>>().join("\n")).unwrap_or_default();
         b.push_str(&format!("<fieldset><legend>Who may be paid</legend>\
@@ -836,6 +924,12 @@ impl App {
         b
     }
 
+    /// The sats the Lightning node holds in its channels now, as the signer counts them against the
+    /// exposure cap (0 when the node can't be read).
+    fn ln_held(&self) -> i64 {
+        self.call("ln_status", json!({})).ok().and_then(|s| s["exposure"]["total_sats"].as_i64()).unwrap_or(0)
+    }
+
     fn policy_page(&self, ctx: &Ctx, template: bool, allow: Option<(&str, &str)>) -> Resp {
         let cur = match self.call("policy_get", json!({})) {
             Ok(v) => v,
@@ -850,17 +944,27 @@ impl App {
                                 esc(&pr.iter().map(|x| setting_name(&txt(Some(x)))).collect::<Vec<_>>().join(", "))));
         }
         let mut p = cur["policy"].clone();
-        if template {
+        // paying not on yet: the page opens on the starter rules, which turn it on
+        let auto = !template && allow.is_none() && !paying_on(&p);
+        if template || auto {
             let keep = p.clone();
-            let chain = self.call("health", json!({})).ok().and_then(|h| h.get("chain").and_then(Value::as_str).map(str::to_string)).unwrap_or_default();
-            p = starter_policy(&chain);
+            let chain = self.signer_chain();
+            p = starter_policy_for(&chain, Some(self.ln_held()));
             for k in ["allowlist", "counterparties", "human_pubkey"] {
                 if let Some(v) = keep.get(k) {
                     p[k] = v.clone();
                 }
             }
-            b.push_str("<div class=\"flash ok\">The safe starter rules are filled in below (your list of sellers is kept), with paying over \
-                        Lightning turned on and low limits. Review them, then sign.</div>");
+            b.push_str(if auto {
+                "<div class=\"flash ok\">Paying is not turned on yet, so the safe starter rules are filled in below (your list of sellers is \
+                 kept): they turn paying over Lightning on, with low limits. Review them, then sign.</div>"
+            } else {
+                "<div class=\"flash ok\">The safe starter rules are filled in below (your list of sellers is kept), with paying over \
+                 Lightning turned on and low limits. Review them, then sign.</div>"
+            });
+        } else {
+            b.push_str("<section class=\"card\"><p>Not sure what to set? The safe starter rules turn paying on with low limits, and keep your \
+                        list of sellers.</p><p><a class=\"button-link\" href=\"./policy?template=starter\">Start from the safe starter rules</a></p></section>");
         }
         // a seller to allow, from the Sellers page: its address on the list, tied to its node
         if let Some((origin, node)) = allow {
@@ -920,6 +1024,18 @@ impl App {
         for (k, _, _) in INT_KEYS {
             if let Some(v) = f.get(&format!("f_{k}")) {
                 p.insert(k.into(), num(v));
+            }
+        }
+        // the node's exposure cap, the one Lightning setting the form shows: empty takes it out
+        if let Some(v) = f.get("f_ln_exposure_cap_sats") {
+            let mut ln = p.get("ln").and_then(Value::as_object).cloned().unwrap_or_default();
+            if v.trim().is_empty() {
+                ln.remove("exposure_cap_sats");
+            } else {
+                ln.insert("exposure_cap_sats".into(), num(v));
+            }
+            if !ln.is_empty() {
+                p.insert("ln".into(), Value::Object(ln));
             }
         }
         p.insert("anchor_required".into(), Value::Bool(f.contains_key("f_anchor_required")));
@@ -1126,12 +1242,14 @@ impl App {
             (a USB stick in a drawer, or written on paper).</p><pre id=\"keygen-backup\" class=\"hex\"></pre>\
             <p class=\"hint\">Before the key is saved, keep its backup in one of two ways: download the backup file and tick the box, \
             or type the backup's last 8 characters.</p>\
-            <p><button type=\"button\" id=\"keygen-download\" class=\"secondary\">Download the backup file</button></p>\
+            <p><button type=\"button\" id=\"keygen-download\" class=\"secondary\">Download the approval key backup (this is not your passphrase)</button></p>\
             <label class=\"check\"><input type=\"checkbox\" id=\"keygen-saved\" disabled> I saved the downloaded file somewhere safe \
             <small>(download it first)</small></label>\
             <label>…or type the backup's last 8 characters<input id=\"keygen-confirm\" autocomplete=\"off\"></label>\
             <label>Passphrase for this browser (at least 12 characters, not only digits or a repeated pattern)\
             <input id=\"keygen-pin\" type=\"password\" autocomplete=\"new-password\" minlength=\"12\"></label>\
+            <p class=\"hint\">This passphrase unlocks the key in this browser each time you approve something. It is not the app's login \
+            password, and it is not in the backup file: write it down too.</p>\
             <p id=\"keygen-strength\" class=\"hint\" aria-live=\"polite\">At least 12 characters, not only digits, not a repeated pattern.</p>\
             <label>Passphrase again<input id=\"keygen-pin2\" type=\"password\" autocomplete=\"new-password\" minlength=\"12\"></label>\
             <button type=\"button\" id=\"keygen-save\">Save the key in this browser</button></div>\
@@ -1154,7 +1272,7 @@ impl App {
         if human.is_empty() {
             b.push_str(&self.keygen_block(ctx, true));
         } else {
-            b.push_str("<details><summary>Put the enrolled key in this browser (from its backup)</summary>");
+            b.push_str("<details id=\"restore\"><summary>Put the enrolled key in this browser, or forgot your passphrase? (from its backup)</summary>");
             b.push_str(&self.keygen_block(ctx, false));
             b.push_str("</details><details><summary>Replace the approval key</summary><p>A new key is made in this browser, and the \
                 current one signs the handover. The new key is kept under the same passphrase; write its backup down from the key page afterwards.</p>");

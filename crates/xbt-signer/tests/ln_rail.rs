@@ -2757,3 +2757,38 @@ fn agp134_each_error_of_the_node_is_carried_as_untrusted_text() {
     let st = rig.call("ln_status", json!({}));
     assert!(st["untrusted_ln_data"]["data"].get("node_messages").is_none() && st["ready"] == true, "{st}");
 }
+
+/// The wallet app's mainnet starter rules turn paying on: their Lightning section (`starter_policy("main")`
+/// in the wallet UI, which its own test pins to exactly this) leaves a mainnet node with an ordinary
+/// channel ready. Without the exposure cap, or over it, the status is not ready and says why.
+#[test]
+fn the_starter_lightning_section_makes_a_mainnet_node_ready_and_not_ready_says_why() {
+    let _g = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let starter = json!({"enabled": true, "split_height": 961_640, "exposure_cap_sats": 100_000});
+    let rig = LnRig::on("main", 962_000, 961_700, json!({"ln": starter}));
+    rig.ln.set(|s| s.macaroon = Some(lnd_macaroon(RAIL_OPS, &[])));
+    rig.ln.set(|s| s.channels.truncate(1));
+    let st = rig.call("ln_status", json!({}));
+    assert_eq!(st["ready"], true, "{st}");
+    assert!(st.get("reason").is_none_or(Value::is_null), "{st}");
+    // no cap: refused on mainnet, and the status names it
+    let rig = LnRig::on("main", 962_000, 961_700, json!({"ln": {"enabled": true, "split_height": 961_640}}));
+    rig.ln.set(|s| s.macaroon = Some(lnd_macaroon(RAIL_OPS, &[])));
+    let st = rig.call("ln_status", json!({}));
+    assert_eq!(st["ready"], false, "{st}");
+    assert!(st["reason"].as_str().unwrap().contains("mainnet needs ln.exposure_cap_sats"), "{st}");
+    // over the cap (the channel holds 90,000)
+    let rig = LnRig::on("main", 962_000, 961_700, json!({"ln": {"enabled": true, "split_height": 961_640, "exposure_cap_sats": 50_000}}));
+    rig.ln.set(|s| s.macaroon = Some(lnd_macaroon(RAIL_OPS, &[])));
+    rig.ln.set(|s| s.channels.truncate(1));
+    let st = rig.call("ln_status", json!({}));
+    assert_eq!(st["ready"], false, "{st}");
+    assert!(st["reason"].as_str().unwrap().contains("above ln.exposure_cap_sats 50000"), "{st}");
+    // no usable channel: not ready, said in words
+    let rig = LnRig::on("main", 962_000, 961_700, json!({"ln": starter}));
+    rig.ln.set(|s| s.macaroon = Some(lnd_macaroon(RAIL_OPS, &[])));
+    rig.ln.set(|s| s.channels.clear());
+    let st = rig.call("ln_status", json!({}));
+    assert_eq!(st["ready"], false, "{st}");
+    assert!(st["reason"].as_str().unwrap().contains("no channel"), "{st}");
+}

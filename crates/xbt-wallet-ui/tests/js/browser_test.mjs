@@ -123,7 +123,7 @@ try {
     await ev("document.querySelector('form[data-sign=approve] button[type=submit]').click()");
     for (let i = 0; i < 200; i++) { await sleep(50); const m = await ev("document.querySelector('form[data-sign=approve] .sign-msg').textContent"); if (m && m !== "signing…") return m; }
   };
-  check("a wrong passphrase is refused in the browser", (await wrongPin()) === "wrong passphrase");
+  check("a wrong passphrase is refused in the browser", (await wrongPin()).startsWith("Wrong passphrase. Forgot it? Restore the key from its backup file"));
   await set("form[data-sign=approve] input.pin", PASS);
   await submitAndWait("document.querySelector('form[data-sign=approve] button[type=submit]').click()");
   check("approved in the UI", (await flash()).startsWith("Approved and paid"), await flash());
