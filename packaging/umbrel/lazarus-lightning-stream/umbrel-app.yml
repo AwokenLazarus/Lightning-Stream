@@ -2,7 +2,7 @@ manifestVersion: 1.1
 id: lazarus-lightning-stream
 category: lightning
 name: Lightning Stream
-version: "0.1.11"
+version: "0.1.12"
 tagline: Buy and sell any service over Lightning from this box, paid as you use it
 description: >-
   One app for both sides. The wallet pays sellers with stream tickets under a policy you sign, and
@@ -50,6 +50,9 @@ gallery:
   - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/4.png
   - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/5.png
 releaseNotes: >-
+  0.1.12: the two sides of hashrate renting have names: the hashmaker brings the miners and lists
+  them, the hashtaker rents them into its own DATUM Gateway. The hashrate pages use them, with a line
+  saying which one you are. Nothing else changes: your settings and rentals carry over.
   0.1.11: signing the safe starter rules now turns paying on (before, a new install could not). The
   first run speaks plainly: the rules review lists each change in a sentence with its unit, Home and
   Your node agree on whether the node is connected, the approval key's backup step says up front what
