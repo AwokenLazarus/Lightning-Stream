@@ -116,6 +116,32 @@ fn an_unpaid_request_gets_the_terms_and_reaches_nothing() {
 }
 
 #[test]
+fn a_second_name_for_the_gateway_binds_a_payment_to_the_name_the_buyer_used() {
+    let other = "http://stream.test:8402";
+    let (rig, _d) = start(&|v| v["public_aliases"] = json!([other]));
+    // each name's terms name it
+    let got = http_host("stream.test:8402", &rig.addr, "GET", "/files/1000", &[], b"", None);
+    assert_eq!((got.status, got.json()["resource"]["url"].as_str()), (402, Some("http://stream.test:8402/files/1000")));
+    let got = http(&rig.addr, "GET", "/files/1000", &[], b"", None);
+    assert_eq!(got.json()["resource"]["url"], "http://gateway.test:8402/files/1000");
+    // a name it was not given is the public one
+    let got = http_host("elsewhere.test", &rig.addr, "GET", "/files/1000", &[], b"", None);
+    assert_eq!(got.json()["resource"]["url"], "http://gateway.test:8402/files/1000");
+    // paid under the second name: served, and the receipt binds that URL
+    let mut b = Buyer::new(&rig, 1);
+    let secrets = b.lock(&rig, 1);
+    b.origin = other.into();
+    let sig = b.sign("GET", "/api", b"", Some(&secrets[0]), None);
+    let got = http_host("stream.test:8402", &rig.addr, "GET", "/api", &[("PAYMENT-SIGNATURE", &sig)], b"", None);
+    assert_eq!(got.status, 200, "{}", String::from_utf8_lossy(&got.body));
+    assert_eq!(got.receipt(&KEY(&rig))["req"], xbt402::wire::request_digest_v2("GET", "http://stream.test:8402/api", b""));
+    // signed for one name and sent under the other: refused
+    let sig = b.sign("GET", "/api", b"", None, None);
+    let got = http(&rig.addr, "GET", "/api", &[("PAYMENT-SIGNATURE", &sig)], b"", None);
+    assert_eq!(got.status, 401, "{}", String::from_utf8_lossy(&got.body));
+}
+
+#[test]
 fn a_paid_request_is_settled_served_and_receipted() {
     let (rig, _d) = start(&|_| {});
     let mut b = Buyer::new(&rig, 1);

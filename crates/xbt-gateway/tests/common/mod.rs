@@ -334,9 +334,22 @@ pub fn http(
     body: &[u8],
     stop_after: Option<usize>,
 ) -> Got {
+    http_host("gateway.test:8402", addr, method, target, headers, body, stop_after)
+}
+
+/// [`http`], sent under another `Host`.
+pub fn http_host(
+    host: &str,
+    addr: &str,
+    method: &str,
+    target: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    stop_after: Option<usize>,
+) -> Got {
     let mut s = TcpStream::connect(addr).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
-    let mut head = format!("{method} {target} HTTP/1.1\r\nHost: gateway.test:8402\r\n");
+    let mut head = format!("{method} {target} HTTP/1.1\r\nHost: {host}\r\n");
     for (k, v) in headers {
         head.push_str(&format!("{k}: {v}\r\n"));
     }

@@ -464,6 +464,22 @@ impl App {
         let mut c: Map<String, Value> = self.gateway_now().and_then(|v| v.as_object().cloned()).unwrap_or_default();
         let old_routes: Vec<Value> = c.get("routes").and_then(Value::as_array).cloned().unwrap_or_default();
         c.insert("listen".into(), json!(if public_url.starts_with("https://") { format!("0.0.0.0:{}", gw.port) } else { format!("127.0.0.1:{}", gw.port) }));
+        // a shop that moves keeps answering at its old address, for the buyers that saved it
+        let mut aliases: Vec<String> = c.get("public_aliases").and_then(Value::as_array).into_iter().flatten()
+            .filter_map(Value::as_str).map(str::to_string).collect();
+        if let Some(old) = c.get("public_url").and_then(Value::as_str).map(|u| u.trim_end_matches('/').to_string()) {
+            if old != public_url && !aliases.contains(&old) {
+                aliases.insert(0, old);
+            }
+        }
+        let scheme = |u: &str| u.split("://").next().unwrap_or("").to_string();
+        aliases.retain(|a| *a != public_url && scheme(a) == scheme(&public_url));
+        aliases.truncate(xbt_gateway::config::MAX_ALIASES);
+        if aliases.is_empty() {
+            c.remove("public_aliases");
+        } else {
+            c.insert("public_aliases".into(), json!(aliases));
+        }
         c.insert("public_url".into(), json!(public_url));
         // every route names its own service
         c.remove("upstream");

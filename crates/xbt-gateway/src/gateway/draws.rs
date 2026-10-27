@@ -351,7 +351,7 @@ impl Gateway {
     }
 
     fn draw_authenticate(&self, l: &Lottery, req: &Request, pay: &DrawPay) -> Result<Authed, Response> {
-        let digest = request_digest_v2(&req.method, &self.url(&req.target), &req.body);
+        let digest = request_digest_v2(&req.method, &self.req_url(req), &req.body);
         let now = self.now();
         let checked = l.lock().authenticate(&pay.session, pay.seq, now, |key| {
             auth_eq(&lottery::request_auth(key, &pay.session, pay.seq, &digest), &pay.auth)

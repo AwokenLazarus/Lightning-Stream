@@ -147,6 +147,18 @@ fn lnd_network(chain: &str) -> &str {
     }
 }
 
+/// Whether `host`, a request's `Host` header in lowercase, names `origin` (`https://name[:port]`):
+/// the same name, and the same port with the scheme's default filled in.
+fn same_host(origin: &str, host: &str) -> bool {
+    let o = xbt402::wire::request_url(origin);
+    let (name, port) = match host.rsplit_once(':') {
+        Some((n, p)) if !p.contains(']') && p.bytes().all(|b| b.is_ascii_digit()) && !p.is_empty() => (n, p.trim_start_matches('0').to_string()),
+        _ => (host, String::new()),
+    };
+    let port = if port.is_empty() { if o.scheme == "https" { "443".to_string() } else { "80".to_string() } } else { port };
+    o.host == name && o.port == port
+}
+
 fn json_response(status: u16, body: &Value) -> Response {
     Response::new(
         status,
@@ -752,14 +764,23 @@ impl Gateway {
         Some(client.map_or(peer, |a| a.to_canonical()))
     }
 
-    fn url(&self, target: &str) -> String {
-        format!("{}{target}", self.cfg.public_url)
+    /// The origin a request came in on: an alias its `Host` names (`public_aliases`), else
+    /// `public_url`. A payment binds the URL the buyer used, so each origin's terms name it.
+    fn origin_of(&self, req: &Request) -> &str {
+        let host = req.header("host").map(|h| h.trim().to_ascii_lowercase());
+        host.and_then(|h| self.cfg.public_aliases.iter().find(|a| same_host(a, &h)))
+            .map_or(self.cfg.public_url.as_str(), String::as_str)
+    }
+
+    /// The URL a request was sent to: its origin, then its target.
+    fn req_url(&self, req: &Request) -> String {
+        format!("{}{}", self.origin_of(req), req.target)
     }
 
     /// The x402 `PaymentRequired`, as header and as body.
     fn required(
         &self,
-        target: &str,
+        resource: &str,
         route: Option<&Route>,
         head: bool,
         why: Option<Refusal>,
@@ -773,7 +794,7 @@ impl Gateway {
                 m.insert("retryAfter".into(), secs.into());
             }
         }
-        m.insert("resource".into(), json!({"url": self.url(target)}));
+        m.insert("resource".into(), json!({"url": resource}));
         // one entry per way of settling the runner offers, the held one first: a buyer takes the
         // first it can use
         let ways = [
@@ -815,8 +836,8 @@ impl Gateway {
     }
 
     /// The 402 of an unpaid request: the terms.
-    fn unpaid(&self, target: &str, route: &Route, head: bool) -> Response {
-        let (body, header) = self.required(target, Some(route), head, None, None);
+    fn unpaid(&self, resource: &str, route: &Route, head: bool) -> Response {
+        let (body, header) = self.required(resource, Some(route), head, None, None);
         let mut r = json_response(402, &body);
         r.headers.push(("PAYMENT-REQUIRED".into(), header));
         r
@@ -875,14 +896,14 @@ impl Gateway {
     }
 
     /// An authenticated request that is not served: the code, the terms again, the session's numbers.
-    fn refused(&self, a: &Authed, target: &str, route: Option<&Route>, why: Refusal) -> Response {
+    fn refused(&self, a: &Authed, resource: &str, route: Option<&Route>, why: Refusal) -> Response {
         let status = if why == Refusal::HeightUnknown {
             503
         } else {
             402
         };
         let (body, header) = self.required(
-            target,
+            resource,
             route,
             a.head,
             Some(why),
@@ -964,7 +985,7 @@ impl Gateway {
         pay: &Pay,
         route: Option<&Route>,
     ) -> Result<Authed, Response> {
-        let digest = request_digest_v2(&req.method, &self.url(&req.target), &req.body);
+        let digest = request_digest_v2(&req.method, &self.req_url(req), &req.body);
         let checked = self.lock().book.authenticate(&pay.session, pay.seq, |key| {
             auth_eq(
                 &ticket::request_auth(
@@ -995,7 +1016,7 @@ impl Gateway {
                 ))
             }
             Err(why) => {
-                let (body, header) = self.required(&req.target, route, req.method == "HEAD", Some(why), None);
+                let (body, header) = self.required(&self.req_url(req), route, req.method == "HEAD", Some(why), None);
                 let mut r = json_response(402, &body);
                 r.headers.push(("PAYMENT-REQUIRED".into(), header));
                 return Err(r);
@@ -1010,7 +1031,7 @@ impl Gateway {
         };
         if let Some(secret) = &pay.secret {
             if let Err(why) = self.take_secret(&a.session, secret) {
-                return Err(self.refused(&a, &req.target, route, why));
+                return Err(self.refused(&a, &self.req_url(req), route, why));
             }
         }
         Ok(a)
@@ -1183,7 +1204,7 @@ impl Gateway {
         };
         let g = match (granted, &authed) {
             (Ok(g), _) => g,
-            (Err(why), Some(a)) => return self.refused(a, &req.target, None, why),
+            (Err(why), Some(a)) => return self.refused(a, &self.req_url(req), None, why),
             (Err(Refusal::SlotsShort(secs)), None) => {
                 return json_response(
                     402,
@@ -1461,7 +1482,7 @@ impl Gateway {
         }
         let pay = match self.pay_header(&req) {
             Ok(Some(p)) => p,
-            Ok(None) => return Reply::Whole(self.unpaid(&req.target, route, req.method == "HEAD")),
+            Ok(None) => return Reply::Whole(self.unpaid(&self.req_url(&req), route, req.method == "HEAD")),
             Err(r) => return Reply::Whole(r),
         };
         let a = match self.authenticate(&req, &pay, Some(route)) {
@@ -1485,7 +1506,7 @@ impl Gateway {
             // the guard is gone before the refusal is written: `refused` reads the book again
             let pledged = self.lock().book.pledge(&a.session, hash, height);
             if let Err(why) = pledged {
-                return Reply::Whole(self.refused(&a, &req.target, Some(route), why));
+                return Reply::Whole(self.refused(&a, &self.req_url(&req), Some(route), why));
             }
         }
         // a request with a body to a route priced by the token: its output bounded, its counts asked
@@ -1505,7 +1526,7 @@ impl Gateway {
             Some(p) => route.price.tokens.bound(req.body.len() as u64, p.max_output),
         };
         let Some(token_bound) = token_bound else {
-            return Reply::Whole(self.refused(&a, &req.target, Some(route), Refusal::BalanceShort));
+            return Reply::Whole(self.refused(&a, &self.req_url(&req), Some(route), Refusal::BalanceShort));
         };
         // step 4: the request's price and the first second, before the service is asked; a body
         // priced per byte must be able to pay for its first byte
@@ -1516,7 +1537,7 @@ impl Gateway {
             route.price.second_msat
         };
         let Some(reserve) = route.price.request_msat.checked_add(first_second) else {
-            return Reply::Whole(self.refused(&a, &req.target, Some(route), Refusal::BalanceShort));
+            return Reply::Whole(self.refused(&a, &self.req_url(&req), Some(route), Refusal::BalanceShort));
         };
         // what the session must be able to pay to be served at all is the same with a body and
         // without: the request, the first second and the first byte. A HEAD is charged the
@@ -1540,7 +1561,7 @@ impl Gateway {
             }
         };
         if let Err(why) = charged {
-            return Reply::Whole(self.refused(&a, &req.target, Some(route), why));
+            return Reply::Whole(self.refused(&a, &self.req_url(&req), Some(route), why));
         }
         let refund = |msat: u64| self.lock().book.refund(&a.session, msat);
         // step 5

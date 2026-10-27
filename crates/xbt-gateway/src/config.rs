@@ -136,6 +136,10 @@ pub struct Config {
     pub listen: String,
     /// The origin buyers reach the gateway under (`https://seller.example`): what a payment binds.
     pub public_url: String,
+    /// Other origins that lead to this gateway (another name for the same box), each with
+    /// `public_url`'s scheme. A request whose `Host` names one is bound to that origin and its terms name
+    /// it; the listing and its signatures stay on `public_url`.
+    pub public_aliases: Vec<String>,
     /// The service: `http://host:port`, optionally with a path prefix. `None` when every route
     /// names its own.
     pub upstream: Option<String>,
@@ -189,6 +193,9 @@ pub struct NostrConfig {
 
 /// At most this many relays.
 pub const MAX_NOSTR_RELAYS: usize = 10;
+
+/// At most this many other origins for one gateway.
+pub const MAX_ALIASES: usize = 4;
 
 impl NostrConfig {
     fn parse(v: &Value) -> Result<Self, String> {
@@ -311,6 +318,7 @@ impl Config {
             &[
                 "listen",
                 "public_url",
+                "public_aliases",
                 "upstream",
                 "state_dir",
                 "chain",
@@ -368,6 +376,26 @@ impl Config {
         if !loopback && !origin.starts_with("https://") {
             return Err(format!("listen {listen} is not a loopback address (an address written as one: a name, even localhost, is whatever the resolver says), and public_url is not https. The gateway speaks plain HTTP: listen on 127.0.0.1 or [::1], or put a TLS proxy in front and set public_url to the https origin buyers use"));
         }
+        let public_aliases = match top.get("public_aliases") {
+            None => Vec::new(),
+            Some(Value::Array(a)) if a.len() <= MAX_ALIASES => a
+                .iter()
+                .map(|x| {
+                    let u = x.as_str().ok_or("public_aliases is a list of origins")?.trim_end_matches('/');
+                    let o = xbt402::wire::sendable_url(u).map_err(|e| format!("public_aliases {u}: {e}"))?;
+                    let scheme = |x: &str| x.split("://").next().unwrap_or("").to_ascii_lowercase();
+                    if xbt402::wire::request_url(&o).target != "/" || scheme(&o) != scheme(&origin) {
+                        return Err(format!("public_aliases {u}: an origin (scheme://host[:port]) with public_url's scheme, without a path"));
+                    }
+                    let o = o.trim_end_matches('/').to_string();
+                    if o == origin.trim_end_matches('/') {
+                        return Err(format!("public_aliases {u} is public_url itself"));
+                    }
+                    Ok(o)
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+            Some(_) => return Err(format!("public_aliases is a list of at most {MAX_ALIASES} origins")),
+        };
         let up = opt_str(top, "upstream")?.map(|u| upstream_url(u, "upstream")).transpose()?;
 
         let n = obj(
@@ -689,6 +717,7 @@ impl Config {
         Ok(Self {
             listen,
             public_url: origin.trim_end_matches('/').to_string(),
+            public_aliases,
             upstream: up,
             state_dir: PathBuf::from(req_str(top, "state_dir")?),
             chain,
@@ -1567,6 +1596,22 @@ mod tests {
             f(&mut w);
             let e = Config::from_json(&w).unwrap_err().to_string();
             assert!(e.contains(want), "wanted {want:?}, got {e:?}");
+        }
+    }
+
+    #[test]
+    fn other_names_for_the_gateway_are_origins_with_its_scheme() {
+        assert!(Config::from_json(&base()).unwrap().public_aliases.is_empty());
+        let mut v = base();
+        let public = v["public_url"].as_str().unwrap().to_string();
+        let scheme = public.split("://").next().unwrap().to_string();
+        let other = format!("{scheme}://other.example");
+        v["public_aliases"] = json!([format!("{other}/")]);
+        assert_eq!(Config::from_json(&v).unwrap().public_aliases, [other.clone()]);
+        for bad in [json!("x"), json!([format!("{other}/shop")]), json!([public.clone()]), json!(["ftp://other.example"]),
+                    json!([&other, &other, &other, &other, &other])] {
+            v["public_aliases"] = bad.clone();
+            assert!(Config::from_json(&v).is_err(), "{bad}");
         }
     }
 

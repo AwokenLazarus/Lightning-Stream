@@ -1386,6 +1386,7 @@ fn the_sell_page_sets_up_several_services_and_says_what_each_one_needs() {
     let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
     let cfg = xbt_gateway::config::Config::from_json(&c).unwrap();
     assert_eq!(cfg.public_url, "https://seller.example");
+    assert!(cfg.public_aliases.is_empty(), "a first address has none");
     assert_eq!(cfg.upstream, None);
     assert_eq!(cfg.routes.iter().map(|r| (r.path.as_str(), r.upstream.clone().unwrap(), r.strip_prefix)).collect::<Vec<_>>(),
                [("/", addr.clone(), false), ("/my-model/", "http://127.0.0.1:9".to_string(), true)]);
@@ -1454,6 +1455,16 @@ fn the_sell_page_sets_up_several_services_and_says_what_each_one_needs() {
     assert_eq!(r.status, 303);
     let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
     let n = xbt_gateway::config::Config::from_json(&c).unwrap().nostr.unwrap();
+    // a shop that moves answers at its old address too, and moving back drops it from the others
+    let r = br.act("/sell", "/sell", &[("action", "shop"), ("name", "Mike's box"), ("public_url", "https://new.example")]);
+    assert_eq!(r.status, 303);
+    let cfg = |dir: &std::path::Path| xbt_gateway::config::Config::from_json(&serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap()).unwrap();
+    let moved = cfg(&dir);
+    assert_eq!((moved.public_url.as_str(), moved.public_aliases.as_slice()), ("https://new.example", &["https://seller.example".to_string()][..]));
+    let r = br.act("/sell", "/sell", &[("action", "shop"), ("name", "Mike's box"), ("public_url", "https://seller.example")]);
+    assert_eq!(r.status, 303);
+    let back = cfg(&dir);
+    assert_eq!((back.public_url.as_str(), back.public_aliases.as_slice()), ("https://seller.example", &["https://new.example".to_string()][..]));
     assert!(!n.publish);
     assert_eq!(n.relays, ["wss://relay.one.example", "wss://relay.two.example", "wss://relay.own.example"]);
 }

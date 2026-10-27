@@ -100,6 +100,11 @@ start.
   `public_url` is an `https` origin: that is how you say a TLS reverse proxy stands in front.
   For a public seller, run that proxy and set `public_url` to the origin buyers use. The
   gateway cannot check that the proxy is there.
+- **Other names.** A payment binds the URL the buyer used, so a gateway reached under a second
+  name (a box that moved to a new address) lists it in `public_aliases`: up to four origins
+  with `public_url`'s scheme. A request whose `Host` names one is bound to that origin, and its
+  402 terms name it; any other `Host` gets `public_url`. The listing and its Nostr binding stay on
+  `public_url`.
 
 ## Pricing a piece
 
