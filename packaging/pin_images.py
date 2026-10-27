@@ -12,7 +12,7 @@ it). Other images (the stand-in XBT node) are left alone. An image with no lock 
 No digest is invented.
 With --release it also refuses what may not be released: an image the packages name that has no lock
 line (a local tag no box can pull), and a lock built from an older commit than the last change to the
-images' sources (crates/, Cargo.toml, Cargo.lock, container/): the pins would run old code. Run it before
+images' sources (crates/ but its tests, Cargo.toml, Cargo.lock, container/): the pins would run old code. Run it before
 a store or a package is published; it passes only after the images of the commit are published and pinned.
     python3 packaging/pin_images.py [--check] [--release]
 """
@@ -77,8 +77,9 @@ def pinned(text: str, pat: re.Pattern, pins: dict[str, str], release: bool = Fal
     return pat.sub(sub, text), missing
 
 
-# what the images are built from: a change here after the lock's commit makes the pins stale
-IMAGE_SOURCES = ["crates", "Cargo.toml", "Cargo.lock", "container"]
+# what the images are built from: a change here after the lock's commit makes the pins stale. A crate's
+# tests/ never go into an image (the images hold release binaries), so a change only there does not.
+IMAGE_SOURCES = ["crates", "Cargo.toml", "Cargo.lock", "container", ":(glob,exclude)crates/*/tests/**"]
 
 
 def stale(pins: dict[str, str]) -> list[str]:
