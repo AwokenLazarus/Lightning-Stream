@@ -19,7 +19,7 @@ small hold invoices on your Lightning Fork node, one secret released per paid pi
 ## Mainnet
 
 The setup page writes a test chain unless you choose mainnet and type the acknowledgement it shows. This
-software has run on regtest only; on mainnet it starts you with low caps (4 buyers, 4 held tickets of
+software is tested on mainnet with small amounts only; on mainnet it starts you with low caps (4 buyers, 4 held tickets of
 1,000 sat). Read the warning on the page first.
 
 ## Backups

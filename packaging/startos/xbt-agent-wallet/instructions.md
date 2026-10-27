@@ -19,7 +19,7 @@ the services your policy allows, within its budgets, and anything above your thr
      budgets, and the threshold above which you approve each payment yourself. The starter template turns
      Lightning and stream tickets on with low caps.
    - **Lightning**: paste the macaroon from step 0. On mainnet the page asks you to type an
-     acknowledgement first: this software has run on regtest only.
+     acknowledgement first: it moves real funds, and it is tested on mainnet with small amounts only.
 5. **Agents** page (or the *Agent connection* action): give your agent the MCP endpoint and the bearer token.
 
 ## Everyday use
