@@ -86,6 +86,9 @@ pub struct AppendLog {
     pub path: PathBuf,
     kind: String,
     file: File,
+    /// The open file may not be the one at `path`: a compaction renamed a new file into place and
+    /// could not open it. The next write opens `path` first.
+    stale: bool,
     /// Row lines in the file (the header is not one).
     pub file_rows: usize,
     /// Bytes of a torn last line cut off at open.
@@ -133,11 +136,22 @@ impl AppendLog {
         if created {
             fsx::sync_dir(dir).map_err(|e| io(dir, e))?;
         }
-        Ok((Self { path: path.into(), kind: kind.into(), file, file_rows: rows.len(), torn_bytes }, rows))
+        Ok((Self { path: path.into(), kind: kind.into(), file, stale: false, file_rows: rows.len(), torn_bytes }, rows))
     }
 
     /// One write and one fsync; returns once the row is durable.
+    /// Open `path` again if a compaction left the old file open: a row written to a file that was
+    /// renamed away would be lost.
+    fn fresh(&mut self) -> Result<()> {
+        if self.stale {
+            self.file = fsx::with_mode_rw_append(&self.path, 0o600).map_err(|e| io(&self.path, e))?;
+            self.stale = false;
+        }
+        Ok(())
+    }
+
     pub fn append(&mut self, row: &Value) -> Result<()> {
+        self.fresh()?;
         fsx::write_all(&mut self.file, &line(row)).map_err(|e| io(&self.path, e))?;
         fsx::sync(&self.file).map_err(|e| io(&self.path, e))?;
         self.file_rows += 1;
@@ -150,6 +164,7 @@ impl AppendLog {
         if rows.is_empty() {
             return Ok(());
         }
+        self.fresh()?;
         let body: Vec<u8> = rows.iter().flat_map(line).collect();
         fsx::write_all(&mut self.file, &body).map_err(|e| io(&self.path, e))?;
         fsx::sync(&self.file).map_err(|e| io(&self.path, e))?;
@@ -158,11 +173,17 @@ impl AppendLog {
     }
 
     /// Replace the log's rows with `rows`, atomically.
+    /// An error can come after the new file was renamed into place (the directory's fsync, or
+    /// opening it): the log then holds `rows`, and the next write opens it before it appends.
     pub fn compact(&mut self, rows: &[Value]) -> Result<()> {
-        replace_log(&self.path, &self.kind, rows)?;
-        self.file = fsx::with_mode_rw_append(&self.path, 0o600).map_err(|e| io(&self.path, e))?;
-        self.file_rows = rows.len();
-        Ok(())
+        let replaced = replace_log(&self.path, &self.kind, rows);
+        let renamed = !tmp_of(&self.path).exists();
+        if replaced.is_ok() || renamed {
+            self.file_rows = rows.len();
+            self.stale = true;
+            self.fresh()?;
+        }
+        replaced
     }
 }
 

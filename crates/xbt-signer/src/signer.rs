@@ -228,6 +228,10 @@ pub struct Signer {
     pub(crate) ticket_synced: std::sync::atomic::AtomicBool,
     /// How many ticket payments are with the node's router at once ([`crate::ticket_rail::Pace`]).
     pub(crate) ticket_pace: crate::ticket_rail::Pace,
+    /// Held tickets booked `sending` whose send has not come back yet: waiting their turn in
+    /// [`Self::ticket_pace`] or with the node. The node may have no record of one yet, and that
+    /// is not a sign it never reached the node.
+    pub(crate) ticket_queued: Mutex<std::collections::HashSet<String>>,
     /// Stream tickets over HTTP ([`crate::ticket_pay`]): the transport, one place per seller origin
     /// for its session, the sessions of an earlier run whose cancel was asked for, and this signer
     /// itself (for the thread that refills a pool behind a call).
@@ -314,7 +318,7 @@ impl Signer {
                                 keystore, sigaudit, anchor, hot, legacy_channels, net: Mutex::new(None), watch_interval,
                                 ln, ln_error, ln_book, ln_funding, tickets: Mutex::new(None),
                                 ticket_error: Mutex::new(None), ticket_seed: Mutex::new(None), ticket_synced: std::sync::atomic::AtomicBool::new(false),
-                                ticket_pace: crate::ticket_rail::Pace::default(),
+                                ticket_pace: crate::ticket_rail::Pace::default(), ticket_queued: Mutex::new(Default::default()),
                                 ticket_wire: opts.ticket_wire.clone().unwrap_or_else(|| Arc::new(crate::ticket_pay::UreqWire::default())),
                                 ticket_http: Mutex::new(HashMap::new()), draw_http: Mutex::new(HashMap::new()), ticket_cancel_tried: Mutex::new(HashSet::new()), me: std::sync::OnceLock::new(), enroll: Mutex::new(Default::default()),
                                 used_sigs: crate::admin::UsedSigs::new(&root.join(".run").join(crate::admin::USED_SIGS_FILE)) });
@@ -630,7 +634,7 @@ impl Signer {
         });
                 self.watch_step("ticket_reconcile", &mut actions, |actions| {
             // stream tickets: the book is brought to the node's payment records, and the node's list is read for tickets the book lacks
-            if self.ln.is_some() && self.run.join(crate::ticket_rail::BOOK_FILE).exists() {
+            if self.ln.is_some() && self.ticket_in_use() {
                 let _g = self.lock();
                 let _c = sigaudit::context(Some("watcher"), Some("watcher:ticket_reconcile"));
                 for r in self.ticket_reconcile_locked() {
@@ -710,10 +714,16 @@ impl Signer {
             }
             Err(e) => return Err(err(&e.code, format!("{}; the node may have sent this payment, so it stays in the ledger as {ahead}", e.msg))),
         };
-        // the row under the txid first: a crash here counts the payment twice, never not at all
-        self.engine.commit(&pay, &txid)?;
-        self.engine.store.amend(&ahead, None)?;
-        Ok(with(d.as_value(), json!({"txid": txid, "rail": "onchain"})))
+        // the row under the txid first: a crash here counts the payment twice, never not at all. The coins have
+        // left: an error from here on is the ledger's, and is said beside the txid, never as a failed payment (a
+        // caller told it failed would pay again). The write-ahead row stays and keeps the payment counted.
+        let booked = self.engine.commit(&pay, &txid).and_then(|()| self.engine.store.amend(&ahead, None).map(|_| ()));
+        let mut out = with(d.as_value(), json!({"txid": txid, "rail": "onchain"}));
+        if let Err(e) = booked {
+            eprintln!("xbt-signer: the payment {txid} was sent, and its ledger row was not written: {}", e.msg);
+            out["ledger_error"] = json!(format!("sent; the ledger keeps it counted as {ahead}: {}", e.msg));
+        }
+        Ok(out)
     }
 
     fn approve_signed(&self, p: &Value) -> Result<Value> {

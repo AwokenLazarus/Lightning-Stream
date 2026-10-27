@@ -106,6 +106,8 @@ enum Send {
     Lost,
     /// The call fails after the node locked the payment.
     LostLocked,
+    /// The call waits until the test lets it go (`HeldState::go`), then locks: a send that waits its turn.
+    Slow,
 }
 
 #[derive(Default)]
@@ -127,6 +129,9 @@ struct HeldState {
     decode_down: bool,
     /// What a failed payment names as its `failure_reason` (`None`: no route).
     fail_reason: Option<&'static str>,
+    /// `Send::Slow`: the sends waiting, and whether they may go on.
+    waiting: usize,
+    go: bool,
 }
 
 /// A fake LND that holds payments.
@@ -267,6 +272,12 @@ impl LnBackend for HeldLn {
         let mode = *self.mode.lock().unwrap();
         if mode == Send::Lost {
             return Err(self.down(&self.st.lock().unwrap(), "connection reset"));
+        }
+        if mode == Send::Slow {
+            self.st.lock().unwrap().waiting += 1;
+            while !self.st.lock().unwrap().go {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
         }
         self.st.lock().unwrap().sends.push(r.clone());
         // a ticket of 40 blocks through one hop of 80 and the node's 3: no route inside a smaller limit
@@ -1578,4 +1589,106 @@ fn agp134_the_nodes_message_goes_with_each_ticket_error_as_untrusted_text() {
     assert!(rows.iter().any(|x| x.get("payment_hash").is_none() && x["error"] == "LN node unreachable" && said(x).as_deref() == Some(SAID)), "the list: {st}");
     assert_eq!((st["node"]["error"].as_str(), said(&st["node"]).as_deref(), st["tickets"]["sending"].as_i64()), (Some("LN node unreachable"), Some(SAID), Some(2)), "{st}");
     clean(&st);
+}
+
+/// The wallet's files in `.run`, copied to a new directory: a backup.
+fn backup(r: &Rig) -> tempfile::TempDir {
+    let b = tempfile::tempdir().unwrap();
+    for f in std::fs::read_dir(r.root.join(".run")).unwrap().flatten().filter(|f| f.path().is_file()) {
+        std::fs::copy(f.path(), b.path().join(f.file_name())).unwrap();
+    }
+    b
+}
+
+fn restore(r: &mut Rig, b: &tempfile::TempDir) {
+    let run = r.root.join(".run");
+    for f in std::fs::read_dir(&run).unwrap().flatten().filter(|f| f.path().is_file()) {
+        std::fs::remove_file(f.path()).unwrap();
+    }
+    for f in std::fs::read_dir(b.path()).unwrap().flatten() {
+        std::fs::copy(f.path(), run.join(f.file_name())).unwrap();
+    }
+    r.restart();
+}
+
+fn held(r: &Rig, hash: &str) -> HeldSend {
+    HeldSend { invoice: r.seller.invoice(r.now(), hash, &Inv::default()), fee_limit_msat: 1, timeout_s: 1, cltv_limit: 500, outgoing_chan_ids: vec![], tag: vec![] }
+}
+
+#[test]
+fn a_payment_that_cannot_be_judged_yet_does_not_hide_the_tickets_after_it() {
+    let _g = env_lock();
+    let mut r = Rig::new(json!({"allowlist": naming(&[0x55])}));
+    let sid = r.open();
+    assert_eq!(r.fill(&sid).len(), 8);
+    let b = backup(&r);
+    // a payment on the node in flight with no HTLC yet, so no tag to read: not judged yet
+    let stuck = hex::encode([0x21u8; 32]);
+    r.ln.record(&held(&r, &stuck), "IN_FLIGHT").unwrap();
+    r.ln.with_payment(&stuck, |p| p["htlcs"] = json!([]));
+    // after it, tickets of a seller the backup has never heard of: money out
+    let other = Seller::new(0x55);
+    let mut two = r.terms(&other);
+    two["extra"]["maxTickets"] = 2.into();
+    let sid2 = r.call("ticket_open", json!({"terms": two, "task": "swarm"}))["session"].as_str().unwrap().to_string();
+    assert_eq!(r.fill_with(&sid2, &other).len(), 2);
+    restore(&mut r, &b);
+    let st = r.status();
+    assert_eq!((r.audit("ticket_recovered").len(), st["synced"].as_bool()), (2, Some(true)), "the tickets after it are read and booked: {st}");
+    assert_eq!(st["cursor"], "8", "the cursor stays before the payment not judged yet, which is read again next time: {st}");
+}
+
+#[test]
+fn a_seed_whose_book_is_lost_reads_the_nodes_list_before_the_book_counts_as_whole() {
+    let _g = env_lock();
+    let mut r = Rig::new(json!({}));
+    let sid = r.open();
+    let locked = r.fill(&sid);
+    assert_eq!(locked.len(), 8);
+    std::fs::remove_file(r.root.join(".run/tickets.jsonl")).unwrap();
+    r.restart();
+    let st = r.status();
+    assert_eq!(r.audit("ticket_recovered").len(), locked.len(), "the node's tickets of this seed are in the new book: {st}");
+    assert!(r.ledger_sum() >= 8 * BOOKING, "and counted: {}", r.ledger_sum());
+}
+
+#[test]
+fn a_ticket_given_up_that_reaches_the_node_late_is_booked_again() {
+    let _g = env_lock();
+    let r = Rig::new(json!({"tickets": {"seller_max_tickets": 2}}));
+    let sid = r.open();
+    r.ln.set_mode(Send::Lost);
+    assert!(r.fill(&sid).is_empty());
+    r.pass(130);
+    assert_eq!(r.status()["tickets"]["failed"], 2);
+    let late = r.audit("ticket_failed")[0]["payment_hash"].as_str().unwrap().to_string();
+    assert_eq!(r.booked_for(&late), 0);
+    // the node shows it after all
+    r.ln.record(&held(&r, &late), "IN_FLIGHT").unwrap();
+    r.call("watch_tick", json!({}));
+    assert_eq!(r.booked_for(&late), BOOKING, "money that left is counted again");
+    assert_eq!(r.state_of(&sid, &late), "retired");
+}
+
+#[test]
+fn a_send_that_waits_its_turn_longer_than_the_nodes_timeout_is_not_given_up() {
+    let _g = env_lock();
+    let r = Rig::new(json!({"tickets": {"seller_max_tickets": 2}}));
+    let sid = r.open();
+    r.ln.set_mode(Send::Slow);
+    std::thread::scope(|sc| {
+        let filled = sc.spawn(|| r.fill(&sid));
+        while r.ln.st.lock().unwrap().waiting < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // the sends are still on their way: the node has no record of them yet
+        r.pass(500);
+        r.call("watch_tick", json!({}));
+        let st = r.status();
+        r.ln.st.lock().unwrap().go = true;
+        assert_eq!((st["tickets"]["sending"].as_i64(), st["tickets"]["failed"].as_i64()), (Some(2), None), "{st}");
+        assert_eq!(filled.join().unwrap().len(), 2, "both lock, and their secrets can still be released");
+    });
+    let st = r.status();
+    assert_eq!((st["locked"]["tickets"].as_i64(), r.audit("ticket_retired").len()), (Some(2), 0), "{st}");
 }

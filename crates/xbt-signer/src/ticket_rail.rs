@@ -49,7 +49,7 @@ use crate::pyjson::{dumps_indent, py_int, str_or_empty, ts_value};
 use crate::sigaudit;
 use crate::signer::{deny, with, Signer};
 use crate::ticket::{self, booking_sats, check_prepaid_invoice, check_ticket_invoice, ledger_id, sats_ceil, sizing, Admit, Book, Limits, SState, Seed, Session,
-                    Settle, TState, TaskPolicy, Terms, Ticket, TicketPolicy, HOLD_SHORT, KEEP_DONE_S, MAX_BATCH, OFFER_TTL_S, ROUTE_FULL, SESSION_IDLE_S,
+                    Settle, TState, TaskPolicy, Terms, Ticket, TicketPolicy, HOLD_SHORT, KEEP_DONE_S, MAX_BATCH, MAX_TASK_WINDOW_S, OFFER_TTL_S, ROUTE_FULL, SESSION_IDLE_S,
                     TAG_RECORD};
 use crate::{err, Result};
 
@@ -229,7 +229,7 @@ impl TicketStore {
         if self.log.file_rows <= self.compact_above {
             return Ok(());
         }
-        let rows = self.book.snapshot(now - KEEP_DONE_S);
+        let rows = self.book.snapshot(now - KEEP_DONE_S, now - MAX_TASK_WINDOW_S as f64);
         self.log.compact(&rows)?;
         let mut book = Book::default();
         for r in &rows {
@@ -238,6 +238,36 @@ impl TicketStore {
         self.book = book;
         self.compact_above = 2 * rows.len() + 1024;
         Ok(())
+    }
+
+    /// [`Self::compact_if_grown`] after a write that has already happened: an error is logged, and
+    /// the book and its log stay as they were (the compaction is tried again at a later write).
+    pub fn compact_quietly(&mut self, now: f64) {
+        if let Err(e) = self.compact_if_grown(now) {
+            eprintln!("xbt-signer: the ticket book was not compacted, and will be at a later write: {}", e.msg);
+        }
+    }
+}
+
+/// Hashes in [`Signer::ticket_queued`] for as long as this lives, a panic included.
+struct Queued<'a> {
+    set: &'a Mutex<HashSet<String>>,
+    hashes: Vec<String>,
+}
+
+impl<'a> Queued<'a> {
+    fn new(set: &'a Mutex<HashSet<String>>, hashes: Vec<String>) -> Self {
+        set.lock().unwrap_or_else(|p| p.into_inner()).extend(hashes.iter().cloned());
+        Self { set, hashes }
+    }
+}
+
+impl Drop for Queued<'_> {
+    fn drop(&mut self) {
+        let mut s = self.set.lock().unwrap_or_else(|p| p.into_inner());
+        for h in &self.hashes {
+            s.remove(h);
+        }
     }
 }
 
@@ -298,6 +328,12 @@ struct Spent {
 impl Signer {
     fn ticket_path(&self) -> PathBuf {
         self.run.join(BOOK_FILE)
+    }
+
+    /// Whether this wallet has used tickets: a book, or a seed whose book is gone (a restore). The
+    /// node's list is read for a wallet that has; one with neither has no ticket on any node.
+    pub(crate) fn ticket_in_use(&self) -> bool {
+        self.ticket_path().exists() || self.run.join(SEED_FILE).exists()
     }
 
     pub(crate) fn ticket_policy(&self) -> TicketPolicy {
@@ -521,6 +557,11 @@ impl Signer {
                 self.ticket_audit("ticket_start_failed", json!({"error": e.msg}));
             }
         }
+    }
+
+    /// Whether a held send of this ticket has not come back yet ([`Signer::ticket_queued`]).
+    fn ticket_is_queued(&self, hash: &str) -> bool {
+        self.ticket_queued.lock().unwrap_or_else(|p| p.into_inner()).contains(hash)
     }
 
     fn ticket_shut(&self) -> Option<Value> {
@@ -867,6 +908,9 @@ impl Signer {
             Ok(s) => s,
             Err(d) => return d,
         };
+        // until each send has come back and the book has the node's word on it, a reconcile does not give it up
+        // as one that never reached the node: it may be waiting its turn in `Pace` for longer than the node's timeout
+        let _queued = Queued::new(&self.ticket_queued, sends.iter().map(|(h, _)| h.clone()).collect());
         for r in refused.iter_mut().filter(|r| r["rule"] == "ln_backend") {
             if let Some(e) = r["hash"].as_str().and_then(|h| node_errors.get(h)) {
                 *r = node_said(r.take(), e);
@@ -1142,18 +1186,19 @@ impl Signer {
                 // a row from a release that died before the book had it: it becomes this booking
                 self.engine.store.amend(&ledger_id(&t.hash), Some(sats))?;
             }
-            // 2. the ticket, released in the book
+            // 2. the signature log, which the anchor witness covers: its hash, never the secret. Before the book
+            // says released: an error here releases nothing, and the ledger row becomes the next release's booking
+            self.sigaudit.record("ticket_release", &[], "", &dest, json!({"payment_hash": t.hash, "session": sid, "booked_sats": sats}))?;
+            // 3. the ticket, released in the book: from here on the release has happened, and only cleanup is left
             t.state = TState::Released;
             t.released_ts = now;
             t.booked_sats = sats;
             s.active_ts = now;
             s.held_one();
             st.commit(&[t.row(), s.row()])?;
-            // 3. the signature log, which the anchor witness covers: its hash, never the secret
-            self.sigaudit.record("ticket_release", &[], "", &dest, json!({"payment_hash": t.hash, "session": sid, "booked_sats": sats}))?;
             self.ticket_audit("ticket_release", json!({"session": sid, "dest": dest, "payment_hash": t.hash, "booked_sats": sats, "task": s.task}));
             let want = st.book.want(&s, now);
-            st.compact_if_grown(now)?;
+            st.compact_quietly(now);
             // 4. only now does the secret exist outside this function
             Ok(json!({"verdict": "allow", "rail": "ticket", "session": sid, "hash": t.hash, "ticket_secret": hex::encode(*secret),
                       "ticket_msat": t.msat.to_string(), "charged_sats": sats, "want": want,
@@ -1270,7 +1315,9 @@ impl Signer {
     /// final by its hash, then the node's payment list from the book's cursor for tickets the book
     /// lacks, then sessions that have run out. Returns what changed.
     pub(crate) fn ticket_reconcile_locked(&self) -> Vec<Value> {
-        if !self.ticket_path().exists() || self.ticket_shut().is_some() {
+        // no book and no seed: nothing on the node can be this wallet's ticket. A seed without its book is a
+        // restore, and the node's list is read into a new book before the book counts as whole
+        if self.ticket_shut().is_some() || !self.ticket_in_use() {
             self.ticket_synced.store(self.ticket_shut().is_none(), Ordering::SeqCst);
             return vec![];
         }
@@ -1288,7 +1335,7 @@ impl Signer {
                     Ok(Some(pmt)) => self.ticket_apply(st, &t.hash, &pmt)?,
                     // the node never had it: a crash or an error between the write-ahead row and the send. Only
                     // a ticket the node never showed locked is given up, and only once no channel holds an HTLC for it
-                    Ok(None) if t.cltv_until == 0 && t.final_expiry == 0 && now - t.sent_ts > lp.timeout_s as f64 + 60.0 => {
+                    Ok(None) if t.cltv_until == 0 && t.final_expiry == 0 && now - t.sent_ts > lp.timeout_s as f64 + 60.0 && !self.ticket_is_queued(&t.hash) => {
                         let cs = chans.get_or_insert_with(|| ln.channels().ok());
                         if cs.as_ref().is_some_and(|cs| htlc_locks(cs, &|h: &str| h == t.hash).booked_sats == 0) {
                             let mut t = t.clone();
@@ -1344,7 +1391,8 @@ impl Signer {
     /// tag from). Read to the end of the list, the book is whole (`ticket_synced`).
     fn ticket_read_list(&self, st: &mut TicketStore, ln: &dyn LnBackend, lp: &LnPolicy, now: f64, out: &mut Vec<Value>) -> Result<()> {
         let mut cursor = st.book.cursor;
-        let mut stalled = false;
+        // the cursor before the first payment that could not be judged yet
+        let mut stalled: Option<u64> = None;
         let mut seed: Option<Arc<Seed>> = None;
         for _ in 0..LIST_PAGES {
             let page = ln.payments_after(cursor, LIST_PAGE)?;
@@ -1356,11 +1404,19 @@ impl Signer {
                     return Err(err("ln_backend", "ListPayments: a payment without a rising index or a payment hash"));
                 }
                 let status = str_or_empty(p.get("status"));
+                // a ticket the book gave up that the node has after all (it reached the node late): the node's word
+                if status != "FAILED" && st.book.tickets.get(&hash).is_some_and(|t| t.state == TState::Failed) {
+                    self.ticket_apply(st, &hash, p)?;
+                    out.push(json!({"payment_hash": hash, "late": true, "state": st.book.tickets.get(&hash).map(|t| t.state.as_str())}));
+                }
                 if !st.book.tickets.contains_key(&hash) && status != "FAILED" {
                     let tags = payment_tags(p);
                     if tags.is_empty() && status == "IN_FLIGHT" && !htlcs_in_flight(p) {
-                        stalled = true; // no HTLC yet to read a tag from: looked at again next time
-                        break;
+                        // no HTLC yet to read a tag from: it holds no money yet, and is looked at again next time. The
+                        // cursor stays before it, and the payments after it are read now: they may hold money
+                        stalled.get_or_insert(cursor);
+                        cursor = index;
+                        continue;
                     }
                     let Ok(raw) = <[u8; 32]>::try_from(hex::decode(&hash).unwrap_or_default().as_slice()) else { continue };
                     if !tags.is_empty() {
@@ -1377,14 +1433,17 @@ impl Signer {
                 }
                 cursor = index;
             }
-            if stalled || n < LIST_PAGE {
-                if cursor != st.book.cursor {
-                    st.commit(&[json!({"e": "cursor", "index": cursor.to_string()})])?;
+            let keep = stalled.unwrap_or(cursor);
+            if n < LIST_PAGE {
+                if keep != st.book.cursor {
+                    st.commit(&[json!({"e": "cursor", "index": keep.to_string()})])?;
                 }
                 self.ticket_synced.store(true, Ordering::SeqCst);
                 return Ok(());
             }
-            st.commit(&[json!({"e": "cursor", "index": cursor.to_string()})])?;
+            if keep != st.book.cursor {
+                st.commit(&[json!({"e": "cursor", "index": keep.to_string()})])?;
+            }
         }
         Ok(()) // more to read than one reconcile reads: the next one goes on from the cursor
     }
@@ -2086,7 +2145,7 @@ impl Signer {
         let tp = self.ticket_policy();
         let mut out = json!({"rail": "ticket", "enabled": tp.enabled, "halted": self.ln_book.halted(),
                              "book_error": self.ticket_error.lock().unwrap_or_else(|p| p.into_inner()).clone()});
-        if !self.ticket_path().exists() {
+        if !self.ticket_in_use() {
             return with(out, json!({"synced": false, "sessions": [], "tickets": {}, "locked": {"tickets": 0, "sats": 0}, "booked_sats": 0}));
         }
         let reconciled = self.ticket_reconcile_locked();

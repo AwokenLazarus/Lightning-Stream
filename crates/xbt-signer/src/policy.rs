@@ -554,7 +554,11 @@ impl PolicyStore {
         pay.entries.push(e.clone());
         pay.unpruned += 1;
         if pay.unpruned >= pay.prune_every {
-            pay.prune(e.ts)?;
+            // the row is durable: a prune that fails is cleanup, never a failed commit (the caller may
+            // already have paid, and would pay again)
+            if let Err(err) = pay.prune(e.ts) {
+                eprintln!("xbt-signer: the payments log was not compacted, and will be at a later commit: {}", err.msg);
+            }
         }
         Ok(())
     }
@@ -687,8 +691,14 @@ impl PolicyEngine {
     /// release is a payment, as every row of every other rail is; under `"session"` the releases of
     /// one session are one payment, and `own` (the session of the payment being decided) is not
     /// counted against itself.
+    /// Only rows the ticket rail wrote (under a ticket's ledger id) are grouped by their session: a
+    /// memo is the caller's word on any other payment, and a memo that looks like a ticket's would
+    /// otherwise make every such payment one for `velocity_max`.
     fn count(ledger: &[LedgerEntry], window_s: f64, now: f64, mode: crate::ticket::Velocity, own: Option<&str>) -> i64 {
-        crate::ticket::velocity_count(ledger.iter().filter(|p| now - p.ts <= window_s).map(|p| p.memo.as_str()), mode, own)
+        fn memo(p: &LedgerEntry) -> &str {
+            if crate::ticket::is_ledger_id(&p.txid) { p.memo.as_str() } else { "" }
+        }
+        crate::ticket::velocity_count(ledger.iter().filter(|p| now - p.ts <= window_s).map(memo), mode, own)
     }
 
     /// How many payments the velocity window holds now for a payment with this memo (a ticket
@@ -773,7 +783,9 @@ impl PolicyEngine {
             return Ok(decide(Deny, "per_counterparty", format!("counterparty spend {cpty_sum} exceeds cap {}", cfg.per_counterparty_cap_sats), None, None));
         }
         let velocity = crate::ticket::TicketPolicy::from_map(&cfg.tickets).velocity;
-        if Self::count(&ledger, cfg.velocity_window_s as f64, now, velocity, crate::ticket::memo_session(&p.memo)) >= cfg.velocity_max {
+        // the payment's own session is not counted against it only for a ticket the rail decides (`admitted`)
+        let own = if admitted { crate::ticket::memo_session(&p.memo) } else { None };
+        if Self::count(&ledger, cfg.velocity_window_s as f64, now, velocity, own) >= cfg.velocity_max {
             return Ok(decide(Deny, "velocity", format!("already {} payments in the last {}s", cfg.velocity_max, cfg.velocity_window_s), None, None));
         }
         if !human && p.amount_sats >= cfg.human_threshold_sats {
@@ -993,5 +1005,65 @@ mod tests {
         assert_eq!(normalize_dest("HTTP://h/x"), "HTTP://h/x");
         assert_eq!(normalize_dest(""), "");
         assert_eq!(normalize_dest(" LN:02AB "), "ln:02ab");
+    }
+
+    #[test]
+    fn a_compaction_that_fails_never_fails_a_commit_whose_row_is_on_disk() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("ledger.json");
+        let s = PolicyStore::open(&p).unwrap();
+        s.set_retain(Some(100.0));
+        s.pay().prune_every = 8;
+        // the compaction's new file cannot be made: a directory stands where it goes
+        let mut tmp = s.log_path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        fs::create_dir(&tmp).unwrap();
+        for i in 0..40 {
+            s.commit(&entry(i, 1000.0 + i as f64)).unwrap();
+        }
+        for i in 40..48 {
+            s.commit(&entry(i, 5000.0 + i as f64)).expect("the row is durable: a failed cleanup is not a failed commit");
+        }
+        drop(s);
+        assert_eq!(txids(&PolicyStore::open(&p).unwrap()).len(), 48, "every committed row is on disk");
+        // once it can, a later commit compacts, and the log is written after it, not into the file it replaced
+        fs::remove_dir(&tmp).unwrap();
+        let s = PolicyStore::open(&p).unwrap();
+        s.set_retain(Some(100.0));
+        s.pay().prune_every = 8;
+        for i in 48..56 {
+            s.commit(&entry(i, 5000.0 + i as f64)).unwrap();
+        }
+        s.commit(&entry(56, 5056.0)).unwrap();
+        drop(s);
+        let all = txids(&PolicyStore::open(&p).unwrap());
+        assert!(all.contains(&"t56".to_string()) && !all.contains(&"t0".to_string()), "{all:?}");
+    }
+
+    #[test]
+    fn a_memo_that_looks_like_a_tickets_does_not_make_ordinary_payments_one_for_velocity() {
+        let d = tempfile::tempdir().unwrap();
+        let store = PolicyStore::open(&d.path().join("ledger.json")).unwrap();
+        let audit = AuditLog::open(&d.path().join("audit.jsonl")).unwrap();
+        let dest = "ln:02".to_string() + &"ab".repeat(32);
+        let cfg = PolicyConfig { allowlist: vec![dest.clone()], velocity_max: 2, ..PolicyConfig::default() };
+        let e = PolicyEngine::new(cfg, store, audit, Some(Arc::new(|| 10_000.0)));
+        let memo = "ticket task=a session=x";
+        let pay = Payment::new(&dest, 10, memo);
+        for i in 0..2 {
+            assert!(e.evaluate(&pay, false).unwrap().allowed());
+            e.commit(&pay, &format!("ln {i}")).unwrap();
+        }
+        let d3 = e.evaluate(&pay, false).unwrap();
+        assert_eq!((d3.allowed(), d3.rule.as_str()), (false, "velocity"), "a third payment in the window is the third, whatever its memo says");
+        // the ticket rail's own rows of one session are one payment, as the owner's velocity setting says
+        let e2d = tempfile::tempdir().unwrap();
+        let cfg = PolicyConfig { allowlist: vec![dest.clone()], velocity_max: 2, ..PolicyConfig::default() };
+        let e2 = PolicyEngine::new(cfg, PolicyStore::open(&e2d.path().join("ledger.json")).unwrap(), AuditLog::open(&e2d.path().join("audit.jsonl")).unwrap(),
+                                   Some(Arc::new(|| 10_000.0)));
+        for i in 0..4 {
+            assert!(e2.evaluate_admitted(&pay, 10).unwrap().allowed(), "release {i} of one session");
+            e2.commit(&pay, &crate::ticket::ledger_id(&format!("{i:064x}"))).unwrap();
+        }
     }
 }

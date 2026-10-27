@@ -287,6 +287,11 @@ pub fn ledger_id(hash: &str) -> String {
     format!("ticket:{hash}")
 }
 
+/// Whether a ledger row's id is a ticket's ([`ledger_id`]): a row the ticket rail wrote.
+pub fn is_ledger_id(txid: &str) -> bool {
+    txid.starts_with("ticket:")
+}
+
 // --- the owner's policy ----------------------------------------------------------------------------
 
 /// Who a task pays.
@@ -1430,13 +1435,18 @@ impl Book {
         Ok(())
     }
 
-    /// The rows that rebuild this book, without what ended before `keep_from`.
-    pub fn snapshot(&self, keep_from: f64) -> Vec<Value> {
+    /// The rows that rebuild this book, without what ended before `keep_from`. Kept however long ago
+    /// they ended: every ticket of a session that is not closed (its `max_sats` and its one payment
+    /// per draw count them), and a win made since `wins_from` (the cap on wins paid to a seller the
+    /// owner has not named counts them over the task's window, up to [`MAX_TASK_WINDOW_S`]).
+    pub fn snapshot(&self, keep_from: f64, wins_from: f64) -> Vec<Value> {
         let mut rows = vec![json!({"e": "cursor", "index": self.cursor.to_string()}), json!({"e": "start", "ts": ts_value(self.started)})];
         let mut ss: Vec<&Session> = self.sessions.values().filter(|s| s.state != SState::Closed || s.closed_ts >= keep_from).collect();
         ss.sort_by(|a, b| a.opened_ts.total_cmp(&b.opened_ts).then_with(|| a.id.cmp(&b.id)));
         rows.extend(ss.into_iter().map(Session::row));
-        let mut ts: Vec<&Ticket> = self.tickets.values().filter(|t| !t.state.terminal() || t.done_ts >= keep_from).collect();
+        let live_session = |id: &str| self.sessions.get(id).is_some_and(|s| s.state != SState::Closed);
+        let kept = |t: &Ticket| !t.state.terminal() || t.done_ts >= keep_from || (t.win > 0 && t.ts >= wins_from) || live_session(&t.session);
+        let mut ts: Vec<&Ticket> = self.tickets.values().filter(|t| kept(t)).collect();
         ts.sort_by(|a, b| a.ts.total_cmp(&b.ts).then_with(|| a.hash.cmp(&b.hash)));
         rows.extend(ts.into_iter().map(Ticket::row));
         rows
@@ -2171,13 +2181,28 @@ mod tests {
         done.done_ts = 50.0;
         b.apply(&done.row()).unwrap();
         let mut again = Book::default();
-        for r in b.snapshot(0.0) {
+        for r in b.snapshot(0.0, 0.0) {
             again.apply(&r).unwrap();
         }
         assert_eq!((again.tickets.len(), again.sessions.len(), again.cursor, again.started), (2, 1, 17, 9.5));
         assert_eq!(again.tickets, b.tickets);
-        let kept: Vec<Value> = b.snapshot(60.0);
+        let kept: Vec<Value> = b.snapshot(60.0, 60.0);
+        assert!(kept.iter().any(|r| r["hash"] == done.hash), "a session that is not closed keeps every ticket: its max_sats and its draws count them");
+        let mut closed = b.sessions["s1"].clone();
+        closed.state = SState::Closed;
+        closed.closed_ts = 50.0;
+        let mut b2 = Book::default();
+        for r in b.snapshot(0.0, 0.0) {
+            b2.apply(&r).unwrap();
+        }
+        b2.apply(&closed.row()).unwrap();
+        let kept: Vec<Value> = b2.snapshot(60.0, 60.0);
         assert!(!kept.iter().any(|r| r["hash"] == done.hash) && kept.iter().any(|r| r["hash"] == t.hash), "a live ticket is never dropped");
+        // a win is kept for the longest task window: the cap on wins paid to an unnamed seller counts it
+        let mut won = ticket(3, "s1", TState::Settled, 40.0);
+        (won.win, won.done_ts) = (7, 45.0);
+        b2.apply(&won.row()).unwrap();
+        assert!(b2.snapshot(60.0, 30.0).iter().any(|r| r["hash"] == won.hash) && !b2.snapshot(60.0, 41.0).iter().any(|r| r["hash"] == won.hash));
         b.apply(&json!({"e": "drop", "tickets": [done.hash], "sessions": []})).unwrap();
         assert!(!b.tickets.contains_key(&done.hash));
     }
