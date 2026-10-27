@@ -1,7 +1,7 @@
 //! AGP-039: the UI in headless Chrome (tests/js/browser_test.mjs over the DevTools protocol) against a
 //! regtest signer: the approval key is made in the browser, enrolled, and signs an approval and a
 //! policy change in the page; then the agent's waiting xbt402 call is paid. Skipped (with a note) when
-//! node or Chrome is missing. Screenshots and HTML snapshots: `$XBT_UI_SNAPSHOT_DIR` (default
+//! node or Chrome is missing, except under CI (`$CI` set), where that is a failure. Screenshots and HTML snapshots: `$XBT_UI_SNAPSHOT_DIR` (default
 //! `target/ui-browser`).
 #[path = "../../xbt-signer/tests/common/mod.rs"]
 mod common;
@@ -20,6 +20,8 @@ fn the_ui_in_headless_chrome() {
     let home = std::env::var("HOME").unwrap_or_default();
     let (Some(node), Some(chrome)) = (find(&["node".into(), format!("{home}/.local/share/nodejs/bin/node")]),
                                       find(&[std::env::var("CHROME").unwrap_or_else(|_| "google-chrome".into()), "chromium".into(), "chromium-browser".into()])) else {
+        // CI installs both, so a missing one there is a broken setup, not a reason to skip
+        assert!(std::env::var_os("CI").is_none(), "node or chrome not found, and CI must have both (CHROME={:?})", std::env::var("CHROME"));
         return eprintln!("node or chrome not found: skipped");
     };
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());

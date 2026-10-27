@@ -3,7 +3,8 @@
 # What this runs: the unit and integration suites of the workspace. They need no Lightning node,
 # no chain node and no Docker: the tests use stand-in nodes in process. Two tests of the wallet's
 # web UI (crates/xbt-wallet-ui/tests/browser.rs and crypto_js.rs) drive node and headless Chrome
-# when they find them and print "skipped" when they do not; a hosted runner has both.
+# and print "skipped" when they find none; the Chrome step below installs one and passes its path
+# in CHROME, and under CI (the CI variable) a missing browser fails the test instead of skipping.
 #
 # What this does not run: the regtest lab scripts under scripts/ (they need Docker and build a
 # Lightning Fork lab) and the cross builds. Their latest reports are in reports/.
@@ -57,7 +58,14 @@ jobs:
         run: |
           command -v gdb || { sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends gdb; }
           sudo sysctl -w kernel.yama.ptrace_scope=0
+      - name: Install Chrome for the wallet UI browser test
+        id: chrome
+        uses: browser-actions/setup-chrome@48ad923757ca74d66703209fe939badbdf80f2f4 # v2.2.0
+        with:
+          chrome-version: stable
       - name: Test
+        env:
+          CHROME: ${{ steps.chrome.outputs.chrome-path }}
         run: cargo test --workspace --locked --no-fail-fast
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings

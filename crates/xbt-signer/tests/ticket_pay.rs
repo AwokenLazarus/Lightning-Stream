@@ -3905,7 +3905,7 @@ fn a_smaller_prepaid_ticket_is_asked_for_where_the_sellers_own_does_not_fit_the_
     let lock = r.tap.seen("/x402/ticket/lock");
     let asked: Value = serde_json::from_str(&lock.last().unwrap().body).unwrap();
     let size: u64 = asked["ticketMsat"].as_str().unwrap().parse().unwrap();
-    assert!((600_000..1_000_000).contains(&size) && size % 1000 == 0, "a whole-sat size the seller allows: {asked}");
+    assert!((600_000..1_000_000).contains(&size) && size.is_multiple_of(1000), "a whole-sat size the seller allows: {asked}");
     assert!(r.ledger_sum() <= 800, "the ledger holds what was booked: {}", r.ledger_sum());
     // below the seller's smallest ticket and its fee: refused before anything is asked of the seller
     let r = Rig::shipped(json!({}), 30, sized_shop(json!(["on-arrival"]), Some(600_000)));

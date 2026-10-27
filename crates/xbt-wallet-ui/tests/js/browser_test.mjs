@@ -13,26 +13,32 @@ mkdirSync(OUT, { recursive: true });
 const CHROME = process.env.CHROME || "google-chrome";
 const profile = mkdtempSync(join(tmpdir(), "xbtui-chrome-"));
 const chrome = spawn(CHROME, ["--headless=new", "--no-first-run", "--no-default-browser-check", "--disable-gpu", "--no-sandbox",
-  "--remote-debugging-port=0", `--user-data-dir=${profile}`, "about:blank"], { stdio: "ignore" });
+  "--disable-dev-shm-usage", "--remote-debugging-port=0", `--user-data-dir=${profile}`, "about:blank"], { stdio: ["ignore", "ignore", "pipe"] });
+// keep what Chrome says on stderr, so a start that fails can be told why
+let chromeErr = ""; let chromeExit = null;
+chrome.stderr.on("data", (d) => { chromeErr = (chromeErr + d).slice(-4000); });
+chrome.on("error", (e) => { chromeExit = `could not run ${CHROME}: ${e.message}`; });
 // a stalled or dead Chrome fails the test instead of hanging it: each DevTools call has a time limit,
 // a closed connection fails what waits on it, and the whole run has a deadline
 const CALL_MS = 30000;
 const LIMIT_S = Number(process.env.XBT_UI_JS_LIMIT_S || 600);
 function fail(why) { console.log(`FAIL ${why}`); try { chrome.kill("SIGKILL"); } catch (e) { /* gone */ } process.exit(1); }
 setTimeout(() => fail(`the run took over ${LIMIT_S} s: Chrome stopped answering`), LIMIT_S * 1000);
-chrome.on("exit", (code, sig) => { if (!finishing) fail(`Chrome exited (${code ?? sig}) during the run`); });
+chrome.on("exit", (code, sig) => { chromeExit = `exit ${code ?? "none"} signal ${sig ?? "none"}`; if (!finishing) fail(`Chrome exited (${code ?? sig}) during the run: ${chromeErr}`); });
 let finishing = false;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const results = [];
 function check(name, ok, detail) { results.push({ name, ok: !!ok, detail }); console.log(`${ok ? "PASS" : "FAIL"} ${name}${ok ? "" : " " + (detail || "")}`); }
 
+// wait for the DevTools port file however long a loaded machine takes; give up early only when
+// Chrome has exited (the cap keeps a hung start from hanging the run)
 let port;
-for (let i = 0; i < 100 && !port; i++) {
+for (let i = 0; i < 1200 && !port && chromeExit === null; i++) {
   await sleep(100);
   const f = join(profile, "DevToolsActivePort");
   if (existsSync(f)) port = readFileSync(f, "utf8").split("\n")[0];
 }
-if (!port) { console.log("FAIL chrome did not start"); process.exit(1); }
+if (!port) { console.log(`FAIL chrome did not start (${chromeExit ?? "no DevTools port after 120 s"}): ${chromeErr}`); process.exit(1); }
 const target = await (await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, { method: "PUT" })).json();
 const ws = new WebSocket(target.webSocketDebuggerUrl);
 await new Promise((r, j) => { ws.addEventListener("open", r); ws.addEventListener("error", () => j(new Error("the DevTools connection failed")));
