@@ -1,0 +1,68 @@
+# Build the static Linux binaries of Lightning Stream, for people who run it without Docker
+# (docs/LINUX.md, "Without Docker").
+#
+# Started by hand only (Actions -> "Linux binaries" -> Run workflow). It runs scripts/oci_build.sh
+# --binaries-only on the commit it is started from: static musl binaries for x86_64, aarch64 and armv7,
+# the same ones the images hold, checked to be static and to name no build host path. Each architecture
+# is one tarball with a SHA256SUMS file, uploaded as an artifact of the run. It makes no GitHub release:
+# a maintainer attaches the artifacts to a release by hand.
+name: Linux binaries
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_TOOLCHAIN: "1.98.0"
+  ZIGLANG_VERSION: "0.16.0"
+
+jobs:
+  binaries:
+    name: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain and the three musl targets
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --no-self-update \
+            --target x86_64-unknown-linux-musl --target aarch64-unknown-linux-musl --target armv7-unknown-linux-musleabihf
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Install zig (the linker tools/zig-cc runs)
+        run: |
+          python3 -m venv "$HOME/.local/share/ziglang-venv"
+          "$HOME/.local/share/ziglang-venv/bin/pip" install --quiet "ziglang==$ZIGLANG_VERSION"
+      - name: Install the tools the build checks with
+        run: sudo apt-get update -q && sudo apt-get install -y -q file
+      - name: Fetch the dependencies Cargo.lock names
+        run: cargo fetch --locked
+      - name: Build the binaries
+        run: scripts/oci_build.sh --binaries-only
+      - name: Pack one tarball per architecture
+        run: |
+          rev=$(git rev-parse --short=12 HEAD)
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          mkdir -p dist/linux
+          for a in amd64 arm64 armv7; do
+            d=lightning-stream-$version-$rev-linux-$a
+            mkdir -p "dist/linux/$d"
+            find "dist/oci/ctx/bin/$a" -maxdepth 1 -type f -exec cp {} "dist/linux/$d/" \;
+            (cd "dist/linux/$d" && sha256sum -- * > SHA256SUMS)
+            tar -C dist/linux --owner=0 --group=0 --numeric-owner -czf "dist/linux/$d.tar.gz" "$d"
+          done
+          (cd dist/linux && sha256sum -- *.tar.gz > SHA256SUMS)
+          cat dist/linux/SHA256SUMS
+      - name: Keep the tarballs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux-binaries
+          path: |
+            dist/linux/*.tar.gz
+            dist/linux/SHA256SUMS
+          if-no-files-found: error

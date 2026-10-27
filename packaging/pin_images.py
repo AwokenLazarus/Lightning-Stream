@@ -4,6 +4,7 @@
 The lock has one line per image: `<image> <registry>/<image>:<version>-<commit>@sha256:<index digest>`. This
 writes each reference into
   * the Umbrel apps' docker-compose.yml (`image:` lines of the agentpay services), as given: tag and digest;
+  * the Linux package's docker-compose.yml, the same way;
   * the StartOS packages' startos/spec.ts (the IMAGES table the manifest packs from), as given.
 With --check it writes nothing and exits 1 if a file is not pinned to the lock (packaging/umbrel/lint.py runs
 it). Other images (the stand-in XBT node) are left alone. An image with no lock line yet is left as
@@ -49,6 +50,9 @@ def targets() -> list[tuple[Path, re.Pattern, str]]:
     out = []
     for p in sorted((HERE / "umbrel").glob("lazarus-*/docker-compose.yml")):
         out.append((p, re.compile(r"(?m)^(    image: )" + ANY + r"$"), "compose"))
+    linux = HERE / "linux" / "docker-compose.yml"
+    if linux.exists():
+        out.append((linux, re.compile(r"(?m)^(    image: )" + ANY + r"$"), "compose"))
     for p in sorted((HERE / "startos").glob("*/startos/spec.ts")):
         out.append((p, re.compile(r"(?m)^(  [a-z]+: ')" + ANY + r"(',?)$"), "spec"))
     return out

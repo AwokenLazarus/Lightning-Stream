@@ -1,0 +1,5 @@
+# The Linux package test's overlay on the package lab (packaging/ln_lab.py): the chain node's RPC on
+# loopback, where the package (on the host's network) reaches it as an owner's own node.
+services:
+  knots-b2b:
+    ports: ["127.0.0.1:${LS_TEST_RPC_PORT}:18443"]

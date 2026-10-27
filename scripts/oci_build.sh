@@ -11,7 +11,8 @@
 # dependencies are the ones Cargo.lock names and a lockfile that is out of date stops the build, cargo -j2
 # under the soak rules); stage them with the shared base layer (container/mkbase.py); `docker buildx build` each image
 # for all three platforms into dist/oci/<image>.tar (an OCI archive with SOURCE_DATE_EPOCH = the commit
-# time and rewritten timestamps). With --load, also load the images into the local Docker: the amd64 ones as
+# time and rewritten timestamps). With --binaries-only, stop after staging the checked static binaries in
+# dist/oci/ctx/bin/<arch>/ (the binary release workflow packs those). With --load, also load the images into the local Docker: the amd64 ones as
 # <image>:agp038 (scripts/container_test.sh runs these), and every platform as <image>:<version> (the
 # regtest drivers of packaging/ run these in place of the published images). dist/oci/IMAGES.md gets digests and
 # sizes. With --push REGISTRY, also push each image, the same build from the same context and cache, as
@@ -28,6 +29,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
 LOAD=0
+BIN_ONLY=0
 CARGO=1
 ONLY=""
 PUSH=""
@@ -35,9 +37,10 @@ while [ $# -gt 0 ]; do
   case $1 in
     --load) LOAD=1 ;;
     --skip-cargo) CARGO=0 ;;
+    --binaries-only) BIN_ONLY=1 ;;
     --only) ONLY=$2; shift ;;
     --push) PUSH=${2%/}; shift ;;
-    *) echo "usage: $0 [--load] [--skip-cargo] [--only IMAGE[,IMAGE...]] [--push REGISTRY]" >&2; exit 2 ;;
+    *) echo "usage: $0 [--load] [--skip-cargo] [--binaries-only] [--only IMAGE[,IMAGE...]] [--push REGISTRY]" >&2; exit 2 ;;
   esac
   shift
 done
@@ -110,6 +113,12 @@ for t in "${!ARCH[@]}"; do
     fi
   done
 done
+# --binaries-only: the checked static binaries in dist/oci/ctx/bin/<arch>/ are the result (the binary
+# release workflow packs them); no image is built
+if [ $BIN_ONLY = 1 ]; then
+  echo "== binaries in $CTX/bin"
+  exit 0
+fi
 python3 container/mkbase.py "$CTX/base.tar"
 cp container/Dockerfile "$CTX/Dockerfile"
 

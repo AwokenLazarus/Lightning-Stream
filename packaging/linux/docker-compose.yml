@@ -1,0 +1,234 @@
+# Lightning Stream on a plain Linux machine: the same images as the Umbrel app, for an owner who runs
+# their own XBT node, Lightning node (lnd-family) and DATUM Gateway on this machine.
+#
+# install.sh writes .env beside this file and starts it; docs/LINUX.md is the guide. Every service
+# uses the host's network, so the app reaches the owner's node, Lightning node and DATUM Gateway on
+# 127.0.0.1, where they listen by default, and every port of the app is on 127.0.0.1 too, except:
+#   * the gateway (selling port 8402): it listens beyond loopback only once the owner saves a shop
+#     with an https:// address on the Sell page (the owner's reverse proxy or tunnel leads there);
+#   * the hashmaker (profile "hashmaker", off unless LS_HASHMAKER=1): this machine's miners on 23340
+#     (keep it on the LAN) and hashtakers' apps on 23341 (a port forward or tunnel makes it public).
+# The UI asks for the password in .env (LS_UI_PASSWORD), set at install. Of the Lightning node's files
+# the services mount only tls.cert; the admin macaroon reaches node-keys on standard input, once, and
+# is never written (install.sh pipes it in). All state is in LS_DATA_DIR. The project's name, and so
+# its containers' (lightning-stream-ui-1, ...), is COMPOSE_PROJECT_NAME in .env.
+
+x-service: &service
+  restart: unless-stopped
+  init: true
+  read_only: true
+  network_mode: host
+  tmpfs:
+    - /tmp:rw,size=16m
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  depends_on:
+    init:
+      condition: service_completed_successfully
+
+x-lightning-cert: &lightning-cert
+  type: bind
+  source: ${LS_LND_TLS_CERT:?set LS_LND_TLS_CERT in .env, the Lightning node's tls.cert}
+  target: /data/lightning/tls.cert
+  read_only: true
+  bind:
+    create_host_path: false
+
+services:
+  init:
+    image: ghcr.io/awokenlazarus/xbt-init:0.1.0-686f46b4060a@sha256:755e0db764e145322154cd4d91932f8eee76c7551b448656822bcf5698e618f0
+    user: "0:0"
+    restart: "no"
+    network_mode: none
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - FOWNER
+      - DAC_OVERRIDE
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      XBT_INIT_COMPONENTS: signer,witness,mcp,ui,gateway,hashrate
+      XBT_INIT_NODE_RPC_USER: ${LS_NODE_RPC_USER:?set LS_NODE_RPC_USER in .env, the XBT node's RPC user}
+      XBT_INIT_NODE_RPC_PASS: ${LS_NODE_RPC_PASS:?set LS_NODE_RPC_PASS in .env, the XBT node's RPC password}
+      XBT_INIT_UI_PASSWORD: ${LS_UI_PASSWORD:?set LS_UI_PASSWORD in .env, the app's login password}
+    volumes:
+      - ${LS_DATA_DIR:?LS_DATA_DIR}:/data
+
+  witness:
+    <<: *service
+    image: ghcr.io/awokenlazarus/xbt-anchor-witness:0.1.0-686f46b4060a@sha256:8911b7a1d6dbf92f19a07e9c38943aed5592d7ce8ee2264f3da4b0f70f84d851
+    network_mode: none
+    stop_grace_period: 30s
+    volumes:
+      - ${LS_DATA_DIR}/witness:/data/witness
+      - ${LS_DATA_DIR}/run/anchor:/data/run/anchor
+
+  signer:
+    <<: *service
+    image: ghcr.io/awokenlazarus/xbt-signer:0.1.0-686f46b4060a@sha256:53db4ee21400bf961bd79465f49f4d7cb78d48a20180ae841d2658d0a58d5181
+    entrypoint: ["/usr/bin/xbt-supervise", "--watch", "/data/run/ln/rail.macaroon", "--watch", "/data/lightning/tls.cert", "--", "/usr/bin/xbt-signer"]
+    stop_grace_period: 1m
+    environment:
+      XBT_NODE_RPC_HOST: ${LS_NODE_RPC_HOST:-127.0.0.1}
+      XBT_NODE_RPC_PORT: ${LS_NODE_RPC_PORT:?set LS_NODE_RPC_PORT in .env, the XBT node's RPC port}
+      XBT_CHAIN: ${LS_CHAIN:-}
+      B2_LN_REST: ${LS_LND_REST:?set LS_LND_REST in .env, the Lightning node's REST address like https://127.0.0.1:8080}
+      B2_LN_MACAROON: /data/run/ln/rail.macaroon
+      B2_MAINNET_ACK_FILE: /data/run/ln/mainnet-ack
+      B2_LN_TLS_CERT: /data/lightning/tls.cert
+      B2_STREAM_DIR: /data/run/signer/streams
+      B2_ENROLL_CODE_COPY: /data/run/enroll/enroll-code
+    volumes:
+      - ${LS_DATA_DIR}/signer:/data/signer
+      - ${LS_DATA_DIR}/run/signer:/data/run/signer
+      - ${LS_DATA_DIR}/run/anchor:/data/run/anchor:ro
+      - ${LS_DATA_DIR}/run/ln:/data/run/ln:ro
+      - ${LS_DATA_DIR}/run/enroll:/data/run/enroll
+      - *lightning-cert
+
+  # agents on this machine: http://127.0.0.1:${LS_MCP_PORT}/mcp, behind the bearer token on the Agents page
+  mcp:
+    <<: *service
+    image: ghcr.io/awokenlazarus/xbt-wallet-mcp:0.1.0-686f46b4060a@sha256:84e88bdbe0a9f244e0fb1531e3014f520bf99f7a5cd00a2c5b99ccc545fbc9e4
+    stop_grace_period: 30s
+    environment:
+      XBT_MCP_HTTP: 127.0.0.1:${LS_MCP_PORT:-33511}
+      XBT_MCP_APPROVAL_WAIT_S: "300"
+      XBT_MCP_LN: "1"
+      XBT_MCP_TICKETS: "1"
+    volumes:
+      - ${LS_DATA_DIR}/mcp:/data/mcp
+      - ${LS_DATA_DIR}/run/signer:/data/run/signer:ro
+      - ${LS_DATA_DIR}/run/ui:/data/run/ui:ro
+
+  ui:
+    <<: *service
+    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-686f46b4060a@sha256:2cf2b34cdc74e20ca9ffe0362d931c485d7a3ddf700799e9a85e34531247e422
+    stop_grace_period: 15s
+    environment:
+      # loopback only: from another machine, use an ssh tunnel (docs/LINUX.md)
+      XBT_UI_BIND: 127.0.0.1:${LS_UI_PORT:-8482}
+      XBT_UI_PASSWORD_FILE: /data/ui/secrets/xbt-ui-password
+      XBT_UI_SIGNER_SOCK: /data/run/signer/signer.sock
+      XBT_UI_MCP_URL: http://127.0.0.1:${LS_MCP_PORT:-33511}/mcp
+      XBT_UI_LN_REST: ${LS_LND_REST}
+      XBT_UI_LN_TLS_CERT: /data/lightning/tls.cert
+      XBT_UI_CONNECTOR: http://127.0.0.1:${LS_CONNECTOR_PORT:-8484}
+      XBT_UI_SELL: "1"
+      XBT_UI_GW_PORT: ${LS_GW_PORT:-8402}
+      XBT_UI_GW_NODE_REST: ${LS_LND_REST}
+      XBT_UI_GW_NODE_TLS_CERT: /data/lightning/tls.cert
+      XBT_UI_GW_HEALTH_URL: http://127.0.0.1:${LS_GW_PORT:-8402}/x402/ticket/health
+      XBT_UI_SUGGESTED_SELLERS: ${LS_SUGGESTED_SELLERS:-https://media.lazarus-xbt.xyz}
+      XBT_UI_NOSTR_RELAYS: ${LS_RELAYS:-wss://relay.damus.io,wss://nos.lol}
+      # the hashmaker's pages: set by install.sh only when LS_HASHMAKER=1
+      XBT_UI_HASHER: ${LS_UI_HASHMAKER:-}
+      XBT_UI_HASHER_SETTINGS: /data/run/hashrate/settings.json
+      XBT_UI_HASHER_SLICES: ${LS_UI_HASHMAKER_SLICES:-}
+      XBT_UI_HASHER_TOKEN_FILE: /data/run/hashrate/control-token
+      XBT_UI_HASHRENT: http://127.0.0.1:${LS_HASHTAKER_CONTROL_PORT:-23343}
+      XBT_UI_HASHRENT_TOKEN_FILE: /data/run/hashrate/control-token
+      XBT_UI_ENROLL_CODE_FILE: /data/run/enroll/enroll-code
+    volumes:
+      - ${LS_DATA_DIR}/ui:/data/ui
+      - ${LS_DATA_DIR}/run/signer:/data/run/signer:ro
+      - ${LS_DATA_DIR}/run/ui:/data/run/ui
+      - ${LS_DATA_DIR}/run/ln:/data/run/ln
+      - ${LS_DATA_DIR}/run/gateway:/data/run/gateway
+      - ${LS_DATA_DIR}/run/hashrate:/data/run/hashrate
+      - ${LS_DATA_DIR}/run/enroll:/data/run/enroll:ro
+      - *lightning-cert
+
+  # One-shot, run by install.sh (`docker compose --profile setup run --rm -T node-keys < admin.macaroon`): has the
+  # Lightning node bake the app's narrow macaroons, each under a root key of its own, from the admin
+  # macaroon on standard input, and exits. It is not started by `up` (profile "setup").
+  node-keys:
+    <<: *service
+    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-686f46b4060a@sha256:2cf2b34cdc74e20ca9ffe0362d931c485d7a3ddf700799e9a85e34531247e422
+    profiles: ["setup"]
+    command: ["node-keys"]
+    restart: "no"
+    healthcheck:
+      disable: true
+    environment:
+      XBT_KEYS_NODE_REST: ${LS_LND_REST}
+      XBT_KEYS_TLS_CERT: /data/lightning/tls.cert
+      XBT_KEYS_ADMIN: "-"
+      XBT_KEYS_RAIL_DIR: /data/run/ln
+      XBT_KEYS_GW_DIR: /data/run/gateway
+    volumes:
+      - ${LS_DATA_DIR}/run/ln:/data/run/ln
+      - ${LS_DATA_DIR}/run/gateway:/data/run/gateway
+      - *lightning-cert
+
+  connector:
+    <<: *service
+    image: ghcr.io/awokenlazarus/lightning-stream:0.1.0-686f46b4060a@sha256:7040054c1ddfa005ed8c529695a7a270bc938ab8a0c4abee9e08316fbd9ef900
+    stop_grace_period: 15s
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      signer:
+        condition: service_started
+    environment:
+      B2_SIGNER_SOCK: /data/run/signer/signer.sock
+      B2_STREAM_DIR: /data/run/signer/streams
+      LS_TASK: default
+      LS_MAX_SATS: "20000"
+      LS_LISTEN: 127.0.0.1:${LS_CONNECTOR_PORT:-8484}
+    volumes:
+      - ${LS_DATA_DIR}/run/signer:/data/run/signer:ro
+      - ${LS_DATA_DIR}/run/signer/streams:/data/run/signer/streams
+
+  # idle until the owner saves a shop on the Sell page, which writes run/gateway/config.json
+  gateway:
+    <<: *service
+    image: ghcr.io/awokenlazarus/xbt-gateway:0.1.0-686f46b4060a@sha256:a43fa628858eb4998ab2ae375f206c34c3fb796dcc2b1f8f1b0074a880875a4f
+    stop_grace_period: 30s
+    volumes:
+      - ${LS_DATA_DIR}/gateway:/data/gateway
+      - ${LS_DATA_DIR}/run/gateway:/data/run/gateway:ro
+      - *lightning-cert
+
+  # The hashmaker: rents this machine's miners out (Sell → Hashrate). Only with LS_HASHMAKER=1.
+  hashmaker:
+    <<: *service
+    image: ghcr.io/awokenlazarus/xbt-hashlink:0.1.0-686f46b4060a@sha256:72377add992a5dc3f3a2893123d4e92e94acf1e5c016ceda3bc554e0c4e466f0
+    profiles: ["hashmaker"]
+    stop_grace_period: 15s
+    command: ["hasher", "--key", "/data/hashrate/link.key", "--nostr-key", "/data/hashrate/nostr.key",
+              "--miners", "0.0.0.0:23340", "--link", "0.0.0.0:23341", "--slices", "127.0.0.1:23344",
+              "--control", "127.0.0.1:23342", "--control-token-file", "/data/run/hashrate/control-token",
+              "--config", "/data/run/hashrate/settings.json", "--relays", "${LS_RELAYS:-wss://relay.damus.io,wss://nos.lol}",
+              "--gateway", "http://127.0.0.1:${LS_GW_PORT:-8402}",
+              "--miners-public", "${LS_LAN_HOST:-127.0.0.1}:23340", "--link-lan", "${LS_LAN_HOST:-127.0.0.1}:23341",
+              "--report", "/data/hashrate/hasher.json"]
+    volumes:
+      - ${LS_DATA_DIR}/hashrate:/data/hashrate
+      - ${LS_DATA_DIR}/run/hashrate:/data/run/hashrate:ro
+
+  # The hashtaker: rents other people's miners into the owner's own DATUM Gateway (Services → Hashrate)
+  # and pays each piece of work through the signer, as the "hashrate" task of the spending rules.
+  hashtaker:
+    <<: *service
+    image: ghcr.io/awokenlazarus/xbt-hashlink:0.1.0-686f46b4060a@sha256:72377add992a5dc3f3a2893123d4e92e94acf1e5c016ceda3bc554e0c4e466f0
+    stop_grace_period: 15s
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      signer:
+        condition: service_started
+    command: ["renter", "--key", "/data/hashrate/renter.key", "--control", "127.0.0.1:${LS_HASHTAKER_CONTROL_PORT:-23343}",
+              "--control-token-file", "/data/run/hashrate/control-token", "--state", "/data/hashrate",
+              "--upstream", "${LS_DATUM:-127.0.0.1:23334}", "--user", "${LS_DATUM_USER:-rented}",
+              "--relays", "${LS_RELAYS:-wss://relay.damus.io,wss://nos.lol}",
+              "--signer", "/data/run/signer/signer.sock", "--task", "hashrate"]
+    volumes:
+      - ${LS_DATA_DIR}/hashrate:/data/hashrate
+      - ${LS_DATA_DIR}/run/hashrate:/data/run/hashrate:ro
+      - ${LS_DATA_DIR}/run/signer:/data/run/signer:ro
