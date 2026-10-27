@@ -80,8 +80,10 @@ later, run `install.sh` again: your current answers are the defaults.
 ## First run
 
 The page is at **http://127.0.0.1:8482/**. From another machine, open an ssh tunnel first:
-`ssh -L 8482:127.0.0.1:8482 you@your-node-machine`. The password is `LS_UI_PASSWORD` in
-`~/lightning-stream/.env`.
+`ssh -L 8482:127.0.0.1:8482 you@your-node-machine`. The password is what follows `LS_UI_PASSWORD=` in
+`~/lightning-stream/.env` (`grep LS_UI_PASSWORD ~/lightning-stream/.env` shows it). A password you chose
+with spaces or other signs in it is written in single quotes there: type it without them. (Earlier installs
+wrote every password in quotes.)
 
 1. **Make your approval key.** The app asks for it first. It's the key that signs your spending rules,
    and it stays in your browser. Save its backup.

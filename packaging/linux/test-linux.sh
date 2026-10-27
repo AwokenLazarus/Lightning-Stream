@@ -12,6 +12,9 @@ ROOT=$PWD
 OUT=$ROOT/run/linux-test/$(date +%Y%m%d-%H%M%S)
 mkdir -p "$OUT"
 
+echo "== install.sh's own steps, with a stand-in docker"
+packaging/linux/test/install_steps.sh | tee "$OUT/install-steps.txt" | grep -q "RESULT PASS" || { cat "$OUT/install-steps.txt"; echo "RESULT FAIL"; exit 1; }
+
 echo "== install.sh in a bare ubuntu:24.04: it names what is missing, and changes nothing"
 docker run --rm -v "$ROOT/packaging/linux:/pkg:ro" ubuntu:24.04 bash -c '/pkg/install.sh --yes --dir /tmp/ls; echo "rc=$?"' > "$OUT/deps-none.txt" 2>&1 || true
 grep -q "Docker is not installed" "$OUT/deps-none.txt" && grep -q "rc=1" "$OUT/deps-none.txt" || { cat "$OUT/deps-none.txt"; echo "RESULT FAIL"; exit 1; }
