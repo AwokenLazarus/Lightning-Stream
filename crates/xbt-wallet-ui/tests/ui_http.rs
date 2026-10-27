@@ -1545,11 +1545,17 @@ fn the_sell_page_sets_up_several_services_and_says_what_each_one_needs() {
     assert_eq!(r.status, 303);
     let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
     let n = xbt_gateway::config::Config::from_json(&c).unwrap().nostr.unwrap();
-    // a shop that moves answers at its old address too, and moving back drops it from the others
+    // a shop that moves answers at its old address too, and moving back drops it from the others. Its
+    // items move with it, also one saved as a whole address (as a shop of before 0.1.16 did)
+    let mut shop: Value = serde_json::from_str(&std::fs::read_to_string(bx.data.path().join("ui/sell.json")).unwrap()).unwrap();
+    shop["offers"][0]["titles"] = json!([{"title": "Sintel", "url": "https://seller.example/Videos/s/stream"}]);
+    std::fs::write(bx.data.path().join("ui/sell.json"), shop.to_string()).unwrap();
     let r = br.act("/sell", "/sell", &[("action", "shop"), ("name", "Mike's box"), ("public_url", "https://new.example")]);
     assert_eq!(r.status, 303);
     let cfg = |dir: &std::path::Path| xbt_gateway::config::Config::from_json(&serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap()).unwrap();
     let moved = cfg(&dir);
+    let films = moved.listing.as_ref().unwrap().services.iter().find(|s| s.kind == "video").unwrap().items.clone();
+    assert!(!films.is_empty() && films.iter().all(|i| i.url.starts_with("https://new.example/")), "the items follow the shop: {films:?}");
     let st: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("hashrate-settings.json")).unwrap()).unwrap();
     assert_eq!(st["payUrl"], "https://new.example/hashrate", "hashrate is paid at the new address");
     assert_eq!((moved.public_url.as_str(), moved.public_aliases.as_slice()), ("https://new.example", &["https://seller.example".to_string()][..]));
@@ -2199,6 +2205,34 @@ fn allowing_a_seller_fills_in_the_spending_rules_for_one_signature() {
     assert!(xbt_wallet_ui::app::services_page::seller_node(&["https://seller.example".into()], |_| {
         Ok(xbt402::listing::Page { status: 200, headers: vec![], body: String::new() })
     }).is_err());
+    // a shop that moved: its services at its new address, its items still at its old one (an alias of
+    // the same gateway). The node is read from a priced place on the new address, never the front page
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("services.json");
+    std::fs::write(&path, r#"[{"name": "Films", "kind": "video", "seller": "https://new.example", "address": "https://new.example/Videos/",
+        "price_text": "20 sat a MiB", "items": [{"title": "Sintel", "url": "https://old.example/Videos/s/stream?static=true"}]},
+        {"name": "Model", "kind": "ai", "seller": "https://new.example", "address": "https://new.example/ai/", "price_text": "1 sat", "items": []}]"#).unwrap();
+    let moved = start_on(Rig::new(json!({}), false), |c| c.services_file = Some(path.clone()));
+    let mut asked = vec![];
+    let link = moved._app.allow_link("https://new.example", |u| {
+        asked.push(u.to_string());
+        // the shop answers 402 only on its priced paths, and only on its new address here
+        Ok(if u.starts_with("https://new.example/") && u.len() > "https://new.example/".len() {
+            xbt402::listing::Page { status: 402, headers: vec![], body: terms.clone() }
+        } else { xbt402::listing::Page { status: 404, headers: vec![], body: String::new() } })
+    }).unwrap();
+    assert_eq!(link, format!("./policy?allow={}&node={node}", enc("https://new.example")));
+    assert_eq!(asked, ["https://new.example/Videos/"], "the service's own address first");
+    // with only the item to go by, it is asked at the seller's address, not the old one
+    std::fs::write(&path, r#"[{"name": "Films", "kind": "video", "seller": "https://new.example", "price_text": "20 sat a MiB",
+        "items": [{"title": "Sintel", "url": "https://old.example/Videos/s/stream?static=true"}]}]"#).unwrap();
+    let mut asked = vec![];
+    moved._app.allow_link("https://new.example", |u| {
+        asked.push(u.to_string());
+        Ok(if u.contains("/Videos/") { xbt402::listing::Page { status: 402, headers: vec![], body: terms.clone() } }
+           else { xbt402::listing::Page { status: 404, headers: vec![], body: String::new() } })
+    }).unwrap();
+    assert_eq!(asked, ["https://new.example/Videos/s/stream?static=true"]);
     let b = start(json!({}), false, |_| {});
     let mut br = logged_in(&b);
     let page = br.get(&format!("/policy?allow={}&node={node}", enc("https://seller.example"))).body;

@@ -36,7 +36,7 @@ pub fn get_page(url: &str) -> Result<xbt402::listing::Page, String> {
 pub fn seller_node(urls: &[String], mut get: impl FnMut(&str) -> Result<xbt402::listing::Page, String>) -> Result<String, String> {
     use base64::Engine;
     let mut why = String::from("the seller asked for no payment at its address");
-    for u in urls.iter().take(4) {
+    for u in urls.iter().take(6) {
         let page = match get(u) {
             Ok(p) => p,
             Err(e) => {
@@ -173,10 +173,18 @@ impl App {
     /// its own 402 terms, at its priced items first.
     pub fn allow_link(&self, url: &str, get: impl FnMut(&str) -> Result<xbt402::listing::Page, String>) -> Result<String, String> {
         let origin = services::http_origin(url).ok_or("That is not a web address.")?;
-        let mut urls: Vec<String> = self.file_services().unwrap_or_default().iter()
-            .filter(|s| services::same_origin(&s.seller, &origin))
-            .flat_map(|s| s.items.iter().map(|i| i.url.clone()).collect::<Vec<_>>())
-            .filter(|u| services::same_origin(u, &origin)).take(2).collect();
+        // the seller's priced places: each service's address, then a priced item of each, on the seller's own
+        // address (a seller that moved may still list items at its old one, which answers the same). The bare
+        // address last: a shop need not price its front page
+        let mut urls: Vec<String> = vec![];
+        for s in self.file_services().unwrap_or_default().iter().filter(|s| services::same_origin(&s.seller, &origin)) {
+            let here = std::iter::once(s.address().to_string()).chain(s.items.iter().take(1).map(|i| i.url.clone()));
+            for u in here.filter_map(|u| services::rebase(&u, &origin)) {
+                if !urls.contains(&u) && u.trim_end_matches('/') != origin.trim_end_matches('/') {
+                    urls.push(u);
+                }
+            }
+        }
         urls.push(origin.clone());
         let node = seller_node(&urls, get).map_err(|e| format!("This seller could not be allowed: {e}."))?;
         Ok(format!("./policy?allow={}&node={}", services::urlenc(&origin), node))

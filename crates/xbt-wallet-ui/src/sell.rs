@@ -572,7 +572,10 @@ impl App {
             }
             let base = public_url.clone();
             let items: Vec<Value> = o.titles.iter().map(|(t, u)| {
-                let url = if u.starts_with('/') { format!("{base}{u}") } else { u.clone() };
+                // an item at one of the shop's earlier addresses is listed at its address now
+                let moved = aliases.iter().any(|a| crate::services::same_origin(u, a));
+                let url = if u.starts_with('/') { format!("{base}{u}") }
+                          else if moved { crate::services::rebase(u, &base).unwrap_or_else(|| u.clone()) } else { u.clone() };
                 json!({"title": t, "url": url})
             }).collect();
             if let Some(p) = o.paths.first() {

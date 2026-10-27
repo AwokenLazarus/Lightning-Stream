@@ -163,6 +163,16 @@ pub fn http_origin(url: &str) -> Option<String> {
 }
 
 /// Whether two URLs or origins name the same seller origin.
+/// `url`'s path and query on `origin` instead of its own: `https://old.example/a?b` onto
+/// `https://new.example` is `https://new.example/a?b`. `None` for a URL that is not http(s).
+pub fn rebase(url: &str, origin: &str) -> Option<String> {
+    http_origin(url)?;
+    let rest = url.trim().split_once("://")?.1;
+    let tail = rest.find(['/', '?']).map_or("/", |i| &rest[i..]);
+    let tail = if tail.starts_with('?') { format!("/{tail}") } else { tail.to_string() };
+    Some(format!("{}{tail}", origin.trim_end_matches('/')))
+}
+
 pub fn same_origin(a: &str, b: &str) -> bool {
     match (http_origin(a), http_origin(b)) {
         (Some(x), Some(y)) => x == y,
@@ -445,6 +455,15 @@ pub fn urlenc(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_url_rebased_keeps_its_path_and_query() {
+        assert_eq!(rebase("https://old.example/Videos/a/stream?static=true", "https://new.example").as_deref(),
+                   Some("https://new.example/Videos/a/stream?static=true"));
+        assert_eq!(rebase("https://old.example", "https://new.example/").as_deref(), Some("https://new.example/"));
+        assert_eq!(rebase("https://old.example?x=1", "https://new.example").as_deref(), Some("https://new.example/?x=1"));
+        assert_eq!(rebase("ftp://old.example/a", "https://new.example"), None);
+    }
+
     use super::*;
 
     #[test]
