@@ -265,7 +265,8 @@ fn one_hashtaker_takes_three_and_the_fourth_stays_on_the_fallback() {
     let s = loop {
         let s = rig.hashmaker.status();
         let n = s["miners"].as_array().unwrap().iter().filter(|m| m["rentedTo"] == "big").count();
-        if n == 3 || t0.elapsed() > Duration::from_secs(30) {
+        // the free count follows the rentals a moment later: wait for both
+        if (n == 3 && s["capacity"]["freeMiners"] == 1) || t0.elapsed() > Duration::from_secs(30) {
             break s;
         }
         thread::sleep(Duration::from_millis(200));
