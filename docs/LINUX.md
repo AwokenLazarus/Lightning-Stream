@@ -83,6 +83,31 @@ The page is at **http://127.0.0.1:8482/**. From another machine, open an ssh tun
    under its own limit.
 3. **Check the Lightning page.** It should say the app connected to your node by itself.
 
+## Before you buy: get a channel
+
+The app pays from your own Lightning node, so your node needs a funded channel on the BLAKE2b Lightning
+network with a route to the shop you buy from. Without one, the first buy fails with "no route".
+
+1. **Open one channel** from your Lightning node. lnd refuses channels under 20,000 sats by default, so
+   20,000 to 50,000 sats is a good size for trying things out: a shop's ticket is about 1,000 sats.
+2. **Pick who to open it to:**
+   - **A well-connected public node.** Any node with many channels works. Payments to a shop find their
+     way from there, because every invoice carries hints for the last hop.
+   - **Our test shop's node, directly.** It's reachable over Tor only for now, so your node needs Tor
+     (Lightning Fork on Umbrel has it on). Connect with `lncli connect <key>@<address>`, using:
+     - key: `02c86d8dd97ac82338edece395f29369253894033464315c8d9e086a8cafe3a3b6`
+     - address: `37g2spzl2oe4smllorb4wkl6n4nm2zcux5ozv5wzwpibxq63h2mayjid.onion:9735`
+3. **Wait for the channel to be active.** That takes a few confirmations, then a few minutes for the
+   network to learn about it.
+
+If a payment can't find a route:
+
+- Check that the channel is **active** and that your side holds more than about 1,000 sats.
+- Wait ten minutes after the channel opens, then try again.
+- Open a second channel to a different well-connected node, or straight to the shop's node.
+- Still stuck? Open an issue at https://github.com/AwokenLazarus/Lightning-Stream/issues and include
+  your node's public key.
+
 ## Hashtaker
 
 You rent hashrate into your own DATUM Gateway and pay for each piece of work:
