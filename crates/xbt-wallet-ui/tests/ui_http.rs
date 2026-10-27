@@ -1556,6 +1556,17 @@ fn the_sell_page_sets_up_several_services_and_says_what_each_one_needs() {
     let moved = cfg(&dir);
     let films = moved.listing.as_ref().unwrap().services.iter().find(|s| s.kind == "video").unwrap().items.clone();
     assert!(!films.is_empty() && films.iter().all(|i| i.url.starts_with("https://new.example/")), "the items follow the shop: {films:?}");
+    // and at start, with no save: a shop that moved before this version still has its items at the old
+    // address in its saved settings; the config written at start lists them at the new one
+    let mut shop: Value = serde_json::from_str(&std::fs::read_to_string(bx.data.path().join("ui/sell.json")).unwrap()).unwrap();
+    shop["offers"][0]["titles"] = json!([{"title": "Sintel", "url": "https://seller.example/Videos/s/stream"}]);
+    std::fs::write(bx.data.path().join("ui/sell.json"), shop.to_string()).unwrap();
+    let mut c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    c["listing"]["services"][0]["items"] = json!([{"title": "Sintel", "url": "https://seller.example/Videos/s/stream"}]);
+    std::fs::write(dir.join("config.json"), c.to_string()).unwrap();
+    assert_eq!(bx._app.refresh_shop_config(), Some("written"));
+    let at_start = cfg(&dir).listing.unwrap().services.into_iter().find(|s| s.kind == "video").unwrap().items;
+    assert!(at_start.iter().all(|i| i.url.starts_with("https://new.example/")), "at start too: {at_start:?}");
     let st: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("hashrate-settings.json")).unwrap()).unwrap();
     assert_eq!(st["payUrl"], "https://new.example/hashrate", "hashrate is paid at the new address");
     assert_eq!((moved.public_url.as_str(), moved.public_aliases.as_slice()), ("https://new.example", &["https://seller.example".to_string()][..]));
