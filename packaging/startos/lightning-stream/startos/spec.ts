@@ -252,6 +252,7 @@ export function services(cfg: Config): ServiceSpec[] {
       env: {
         XBT_UI_BIND: `0.0.0.0:${PORTS.ui}`,
         XBT_UI_SIGNER_SOCK: '/data/run/signer/signer.sock',
+        XBT_UI_RESTART_HINT: 'restart Lightning Stream from your StartOS dashboard (Services, Lightning Stream, Restart)',
         XBT_UI_MCP_URL: cfg.mcpUrls.join(','),
         XBT_UI_CONNECTOR: `http://${local(PORTS.connector)}`,
         // the Lightning page asks the owner to approve the app in Lightning Fork, not to paste a key

@@ -221,7 +221,8 @@ impl Signer {
     fn pending_restart(&self, raw: &Value) -> Vec<String> {
         let (Ok(now), Ok(boot)) = (PolicyConfig::from_value(raw), PolicyConfig::from_value(&self.boot_policy)) else { return vec![] };
         let (a, b) = (effective(&now), effective(&boot));
-        RESTART_KEYS.iter().filter(|k| a.get(**k) != b.get(**k)).map(|k| k.to_string()).collect()
+        // mining is for regtest only: elsewhere its setting changes nothing, and no restart waits for it
+        RESTART_KEYS.iter().filter(|k| a.get(**k) != b.get(**k) && (**k != "regtest_mine" || self.chain == "regtest")).map(|k| k.to_string()).collect()
     }
 
     /// The human signed `msg`, it has not expired, and it was not used before: `None`, and the
@@ -424,7 +425,7 @@ impl Signer {
                 eprintln!("xbt-signer: the enrolment code's copy for the setup page was not written: {e}");
             }
         }
-        eprintln!("xbt-signer: no human key is enrolled. One-time enrolment code: {code} (also in {})", self.run.join(ENROLL_CODE_FILE).display());
+        eprintln!("xbt-signer: no human key is enrolled. One-time enrolment code: {code} ({})", self.enroll_code_where());
         *self.enroll.lock().unwrap_or_else(|p| p.into_inner()) = EnrollCode { code, failures: 0 };
         Ok(())
     }
@@ -449,8 +450,18 @@ impl Signer {
         if renew {
             self.issue_enroll_code()?;
         }
-        Ok(Some(deny("enroll_code", format!("missing or wrong enrolment code: read it in the signer's log or {}{}",
-                                             self.run.join(ENROLL_CODE_FILE).display(), if renew { " (a new code was issued)" } else { "" }))))
+        Ok(Some(deny("enroll_code", format!("missing or wrong enrolment code: read it in the signer's log ({}){}",
+                                             self.enroll_code_where(), if renew { "; a new code was issued" } else { "" }))))
+    }
+
+    /// Where the owner finds the code besides the log: a box's setup page shows its copy; else the file in the
+    /// signer's own run directory (inside a container, the container's path).
+    fn enroll_code_where(&self) -> String {
+        if enroll_code_copy().is_some() {
+            "the app's setup page shows it too".into()
+        } else {
+            format!("also in {}", self.run.join(ENROLL_CODE_FILE).display())
+        }
     }
 
     fn human_key_rotate(&self, p: &Value) -> Result<Value> {

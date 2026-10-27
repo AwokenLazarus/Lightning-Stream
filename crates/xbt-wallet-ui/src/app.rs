@@ -755,7 +755,15 @@ impl App {
             b.push_str(&t);
         }
         b.push_str("</section>");
-        if let Ok(h) = self.call("history", json!({"limit": 15})) {
+        let recent = self.call("history", json!({"limit": 15}));
+        // a seller that charged more than a call allowed: said at the top, with the numbers
+        if let Some(e) = recent.as_ref().ok().and_then(|h| h["events"].as_array().cloned()).unwrap_or_default().iter().rev().find(|e| e["type"] == "ticket_over_cap") {
+            let msat = |k: &str| e.get(k).and_then(|v| v.as_str().and_then(|s| s.parse::<u64>().ok()).or(v.as_u64())).unwrap_or(0);
+            b.push_str(&format!("<div class=\"flash bad\">{} charged {} sats for one answer, more than the {} sats the call allowed. \
+                                 The app stopped paying that seller in that session; the seller's signed receipt is kept in the wallet's records.</div>",
+                                esc(&txt(e.get("origin"))), sats_of_msat(msat("charged_msat")), msat("max_msat") / 1000));
+        }
+        if let Ok(h) = recent {
             b.push_str("<h2>Recent activity</h2><div class=\"scroll\"><table><thead><tr><th>When</th><th>What</th><th>To</th><th>Amount</th><th>Detail</th></tr></thead><tbody>");
             let events = h["events"].as_array().cloned().unwrap_or_default();
             if events.is_empty() {
@@ -765,6 +773,8 @@ impl App {
                 let what = match e["type"].as_str() {
                     Some("decision") => match e["verdict"].as_str() { Some("allow") => "Allowed".into(), Some("deny") => "Refused".into(),
                                                                        Some("needs_human") => "Asked for your approval".into(), v => format!("Decision: {}", v.unwrap_or("")) },
+                    Some("ticket_over_cap") => "A seller charged past the limit".into(),
+                    Some("ticket_seller_fault") => "A seller broke the rules: stopped".into(),
                     Some(t) => { let t = t.replace('_', " "); let mut c = t.chars(); c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default() }
                     None => String::new(),
                 };
@@ -1608,6 +1618,8 @@ fn setting_name(k: &str) -> String {
             "allowlist" => "Sellers that may be paid".into(),
             "counterparties" => "Sellers paid through their Lightning node".into(),
             "anchor_required" => "Refuse to start without the record keeper".into(),
+            "regtest_mine" => "Mining blocks on a test chain".into(),
+            "anchor_interval_s" => "How often the record keeper is asked".into(),
             "human_pubkey" => "Your approval key".into(),
             other => format!("The setting {other}"),
         },
@@ -1711,6 +1723,11 @@ fn plain_value(path: &str, v: Option<&Value>) -> String {
 /// Sats in plain text, grouped: "5,000 sats".
 fn plain_sats(n: i64) -> String {
     format!("{}{} sats", if n < 0 { "-" } else { "" }, crate::html::group3(n.unsigned_abs()))
+}
+
+/// Millisats as sats, with the fraction where there is one: 68244 is "68.244".
+fn sats_of_msat(m: u64) -> String {
+    if m.is_multiple_of(1000) { (m / 1000).to_string() } else { format!("{}.{:03}", m / 1000, m % 1000).trim_end_matches('0').to_string() }
 }
 
 pub(crate) fn money(n: i64) -> String {

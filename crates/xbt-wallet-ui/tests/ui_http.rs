@@ -2299,3 +2299,17 @@ fn on_mainnet_the_rules_page_suggests_the_node_s_limit_and_never_prefills_the_si
     assert_eq!((signed["ln"]["enabled"].clone(), signed["ln"]["exposure_cap_sats"].clone(), signed["max_per_tx_sats"].clone()),
                (json!(true), json!(100000), starter["max_per_tx_sats"].clone()), "{signed}");
 }
+
+/// A seller that charged a call past its limit is said at the top of the wallet page, with the
+/// numbers, and its line in the records reads as words.
+#[test]
+fn a_seller_that_charged_past_a_calls_limit_is_said_on_the_wallet_page() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let b = start(json!({}), false, |_| {});
+    b.rig.s.engine.audit.append(json!({"type": "ticket_over_cap", "ts": 1_793_000_000, "origin": "https://lab-shop.example", "dest": "ln:02ab",
+                                        "charged_msat": "68244", "max_msat": "50000", "receipt": {"charged": "68244"}}));
+    let mut br = logged_in(&b);
+    let page = unescape(&br.get("/wallet").body);
+    assert!(page.contains("https://lab-shop.example charged 68.244 sats for one answer, more than the 50 sats the call allowed"), "{page}");
+    assert!(page.contains("A seller charged past the limit"), "{page}");
+}

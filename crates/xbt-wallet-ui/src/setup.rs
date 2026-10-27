@@ -360,8 +360,11 @@ impl App {
         let result = match f.get("action").map(String::as_str) {
             Some("pin_cert") => pin_cert(ln.pin, ln.rest.as_deref(), ln.tls_cert.as_deref(), f.get("fingerprint").map(String::as_str).unwrap_or("")),
             Some("ack") => (|| {
-                if self.signer_chain() != "main" {
-                    return Ok("Nothing to confirm on a test network.".to_string());
+                // the chain is the signer's word: while it restarts there is none, and nothing is said about the network
+                match self.signer_chain().as_str() {
+                    "" => return Err("The wallet is starting. Try again in a moment.".into()),
+                    "main" => {}
+                    _ => return Ok("Nothing to confirm on a test network.".to_string()),
                 }
                 if f.get("ack").map(String::as_str) != Some("1") {
                     return Err("Tick the box to confirm that the app pays with real money.".into());
