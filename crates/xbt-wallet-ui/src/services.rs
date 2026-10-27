@@ -526,7 +526,9 @@ mod tests {
             ],
         };
         let all = from_listing(&l);
-        let model = all.iter().find(|s| s.name.ends_with("Model")).unwrap();
+        // one service of its own: it carries the shop's name, as before
+        let model = all.iter().find(|s| s.kind == Kind::Ai).unwrap();
+        assert_eq!(model.name, "Box");
         assert_eq!((model.app.as_str(), model.app_base.as_str()), ("https://seller.example/ai/", "https://seller.example/ai/"));
         let game = all.iter().find(|s| s.name.ends_with("Game")).unwrap();
         assert_eq!((game.kind, game.app.as_str(), game.app_base.as_str()), (Kind::Api, "https://seller.example/game/play/", "https://seller.example/game/"));
