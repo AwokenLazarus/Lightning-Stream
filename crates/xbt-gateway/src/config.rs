@@ -1607,7 +1607,7 @@ mod tests {
         let scheme = public.split("://").next().unwrap().to_string();
         let other = format!("{scheme}://other.example");
         v["public_aliases"] = json!([format!("{other}/")]);
-        assert_eq!(Config::from_json(&v).unwrap().public_aliases, [other.clone()]);
+        assert_eq!(Config::from_json(&v).unwrap().public_aliases, std::slice::from_ref(&other));
         for bad in [json!("x"), json!([format!("{other}/shop")]), json!([public.clone()]), json!(["ftp://other.example"]),
                     json!([&other, &other, &other, &other, &other])] {
             v["public_aliases"] = bad.clone();
