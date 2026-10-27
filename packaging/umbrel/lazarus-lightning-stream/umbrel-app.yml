@@ -56,7 +56,8 @@ releaseNotes: >-
   fills it in for you to sign. With paying off, Spending rules opens on the starter rules, and on
   mainnet the form never offers the large built-in limits meant for test chains. Your node says why
   it can't pay yet, in plain words. The key backup file says it is not your passphrase, and a wrong
-  passphrase leads to restoring the key from that file with a new one.
+  passphrase leads to restoring the key from that file with a new one. Hashrate offers are
+  read and published on a third relay, relay.kilombino.com.
   0.1.12: the two sides of hashrate renting have names: the hashmaker brings the miners and lists
   them, the hashtaker rents them into its own DATUM Gateway. The hashrate pages use them, with a line
   saying which one you are. Nothing else changes: your settings and rentals carry over.
