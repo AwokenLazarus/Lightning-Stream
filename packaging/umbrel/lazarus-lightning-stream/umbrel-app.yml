@@ -2,7 +2,7 @@ manifestVersion: 1.1
 id: lazarus-lightning-stream
 category: lightning
 name: Lightning Stream
-version: "0.1.14"
+version: "0.1.15"
 tagline: Buy and sell any service over Lightning from this box, paid as you use it
 description: >-
   One app for both sides. The wallet pays sellers with stream tickets under a policy you sign, and
@@ -50,6 +50,14 @@ gallery:
   - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/4.png
   - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/5.png
 releaseNotes: >-
+  0.1.15: a new wallet on mainnet can pay right after setup. The wallet asks a seller for a ticket
+  small enough not to need your approval, and only refuses, with the numbers, when even the seller's
+  smallest ticket is too large. Setup now asks you to confirm paying with real money straight after
+  the spending rules, and the app no longer says ready before you do. If your node holds more than
+  your rules allow, the Lightning page says how much and raises the limit in one click. Credit left
+  with a seller is used first, after a restart and under any of the shop's addresses, instead of
+  buying a new ticket. A stream you stop early costs no more than the limit you set for it. Agents can
+  buy part of a file or film (a byte range).
   0.1.14: your shop is published on Nostr as soon as it has an https address, on the app's relays,
   with nothing to set by hand. The relays are now four: relay.lazarus-xbt.xyz, which takes only
   Lightning Stream listings, then relay.kilombino.com, relay.damus.io and nos.lol. The suggested
