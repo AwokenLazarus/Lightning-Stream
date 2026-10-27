@@ -554,29 +554,40 @@ struct Call<'a> {
     stream_head: bool,
     /// The byte range asked for (`range`), sent as the `Range` header of every request for the URL.
     range: Option<ByteRange>,
+    /// The caller's own request headers (`headers`, [`caller_headers`]), sent on every request of
+    /// the call for its URL: a seller's web app asks with its cookies, its login and its formats.
+    extra: Vec<(String, String)>,
+    /// With `stream_head`: the head line carries the seller's response headers too
+    /// (`head_headers`, [`passed_headers`]), for a caller that hands the answer on to a browser.
+    head_headers: bool,
 }
 
 impl Call<'_> {
     /// The headers every request of the call for its URL carries beside the payment's.
     fn headers(&self) -> Vec<(String, String)> {
-        self.range.iter().map(|r| ("Range".to_string(), r.header())).collect()
+        let mut h: Vec<(String, String)> = self.range.iter().map(|r| ("Range".to_string(), r.header())).collect();
+        h.extend(self.extra.iter().cloned());
+        h
     }
 
     /// The answer's head, read ([`answer_head`]); with `stream_head`, the first line on the socket.
     /// `Some`: why its body is not read.
     fn head(&self, ans: &mut WireAnswer, sink: &mut Sink) -> (Value, Option<String>) {
-        head_to(ans, self.range, self.stream_head, sink)
+        head_to(ans, self.range, self.stream_head, self.head_headers, sink)
     }
 }
 
 /// [`answer_head`], and with `line` the head as the first line on the sink's socket (with `error`:
 /// why the body is not read, where it is not).
-fn head_to(ans: &mut WireAnswer, range: Option<ByteRange>, line: bool, sink: &mut Sink) -> (Value, Option<String>) {
+fn head_to(ans: &mut WireAnswer, range: Option<ByteRange>, line: bool, with_headers: bool, sink: &mut Sink) -> (Value, Option<String>) {
     let (head, refused) = answer_head(ans, range);
     if line {
         let mut l = head.clone();
         if let Some(why) = &refused {
             l["error"] = why.clone().into();
+        }
+        if with_headers {
+            l["headers"] = passed_headers(&ans.headers);
         }
         sink.head(&l);
     }
@@ -585,6 +596,64 @@ fn head_to(ans: &mut WireAnswer, range: Option<ByteRange>, line: bool, sink: &mu
 
 /// Why a call is refused when the seller's 402 offers nothing the wallet may pay.
 const NO_RAIL: &str = "the seller's 402 offers no way to pay that this wallet's policy allows: see rails_passed_over for what each entry needs";
+
+/// The most caller headers one call carries, and the longest value of one.
+const CALLER_HEADERS: usize = 32;
+const HEADER_VALUE: usize = 4096;
+
+/// Request headers a caller may not set: the wallet's own (the payment, the range it asks for
+/// itself), what frames the request, and what a proxy must not relay.
+const CALLER_REFUSED: [&str; 16] = ["host", "content-length", "transfer-encoding", "connection", "keep-alive", "upgrade", "te", "trailer", "expect",
+                                    "proxy-authorization", "proxy-connection", "range", "via", "forwarded", "accept-encoding", "payment-signature"];
+
+/// The caller's request headers (`headers`: a list of `[name, value]`), as they may go to the
+/// seller: a name of token characters that is not one of [`CALLER_REFUSED`] (nor `payment-*` or
+/// `x-forwarded-*`), a value of visible characters and spaces, at most [`CALLER_HEADERS`] of them.
+/// `Err`: why the call is refused. The seller's gateway passes on only the ones its route names.
+pub(crate) fn caller_headers(v: Option<&Value>) -> std::result::Result<Vec<(String, String)>, String> {
+    let Some(v) = v.filter(|v| !v.is_null()) else { return Ok(vec![]) };
+    let list = v.as_array().ok_or("headers is a list of [name, value]")?;
+    if list.len() > CALLER_HEADERS {
+        return Err(format!("at most {CALLER_HEADERS} headers"));
+    }
+    let token = |s: &str| !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b));
+    let mut out = Vec::with_capacity(list.len());
+    for h in list {
+        let (Some(k), Some(val)) = (h.get(0).and_then(Value::as_str), h.get(1).and_then(Value::as_str)) else {
+            return Err("headers is a list of [name, value]".into());
+        };
+        let lk = k.to_ascii_lowercase();
+        if !token(k) {
+            return Err(format!("header name {k:?} is not a plain token"));
+        }
+        if CALLER_REFUSED.contains(&lk.as_str()) || lk.starts_with("payment-") || lk.starts_with("x-forwarded-") {
+            return Err(format!("header {k} is the wallet's own, or not one a proxy passes on"));
+        }
+        if val.len() > HEADER_VALUE || !val.bytes().all(|b| b.is_ascii_graphic() || b == b' ' || b == b'\t') {
+            return Err(format!("header {k}: the value is too long or not plain text"));
+        }
+        out.push((k.to_string(), val.to_string()));
+    }
+    Ok(out)
+}
+
+/// Response headers that are not handed on to a caller that asked for them: what frames the body
+/// (the caller frames its own), the payment's, and the hop-by-hop ones.
+const NOT_PASSED: [&str; 9] = ["content-length", "transfer-encoding", "connection", "keep-alive", "upgrade", "te", "trailer", "proxy-authenticate", "alt-svc"];
+
+/// The seller's response headers, as the head line carries them for a caller that asked
+/// (`head_headers`): `[name, value]` pairs, without [`NOT_PASSED`] or `payment-*`, values of plain
+/// characters, at most 64 of them. What they say is the seller's, untrusted: the caller hands them
+/// on, it reads no money from them.
+pub(crate) fn passed_headers(headers: &[(String, String)]) -> Value {
+    let v: Vec<Value> = headers.iter()
+        .filter(|(k, _)| { let l = k.to_ascii_lowercase(); !NOT_PASSED.contains(&l.as_str()) && !l.starts_with("payment-") })
+        .filter(|(k, v)| k.len() <= 64 && v.len() <= HEADER_VALUE && v.bytes().all(|b| b.is_ascii_graphic() || b == b' ' || b == b'\t'))
+        .take(64)
+        .map(|(k, v)| json!([k, v]))
+        .collect();
+    Value::Array(v)
+}
 
 /// What one call released: the hashes, the sats the book put in the ledger for them, and how many
 /// of them were prepaid tickets. `limit_sats` is the call's `max_sats`: no ticket is released or
@@ -1008,9 +1077,16 @@ impl Signer {
             return deny("dest", "xbt402_pay needs an absolute http or https URL");
         };
         let method = Some(str_or_empty(p.get("method")).to_uppercase()).filter(|m| !m.is_empty()).unwrap_or_else(|| "GET".into());
-        let raw: Vec<u8> = match p.get("body") {
-            Some(Value::String(s)) => s.clone().into_bytes(),
-            Some(Value::Array(a)) => a.iter().filter_map(|x| x.as_u64().map(|b| b as u8)).collect(),
+        let raw: Vec<u8> = match (p.get("body"), p.get("body_b64").and_then(Value::as_str)) {
+            (_, Some(b)) => {
+                use base64::Engine as _;
+                match base64::engine::general_purpose::STANDARD.decode(b) {
+                    Ok(v) => v,
+                    Err(_) => return deny("body", "body_b64 is not base64"),
+                }
+            }
+            (Some(Value::String(s)), None) => s.clone().into_bytes(),
+            (Some(Value::Array(a)), None) => a.iter().filter_map(|x| x.as_u64().map(|b| b as u8)).collect(),
             _ => vec![],
         };
         let task = Self::ticket_task_for(&tp, &str_or_empty(p.get("task")));
@@ -1032,7 +1108,13 @@ impl Signer {
         if range.is_some() && !piece_hashes.is_empty() {
             return deny("range", "range and piece_sha256 do not go together: the pieces are counted from the body's first byte");
         }
-        let range_headers: Vec<(String, String)> = range.iter().map(|r| ("Range".to_string(), r.header())).collect();
+        let extra = match caller_headers(p.get("headers")) {
+            Ok(h) => h,
+            Err(why) => return deny("headers", why),
+        };
+        let head_headers = stream_head && p.get("head_headers").and_then(Value::as_bool) == Some(true);
+        let mut range_headers: Vec<(String, String)> = range.iter().map(|r| ("Range".to_string(), r.header())).collect();
+        range_headers.extend(extra.iter().cloned());
         // the owner's word before any request leaves: an allowlisted origin, or a task that pays any seller
         let listed = self.engine.allowlist().contains(&origin);
         if !self.ticket_may_reach(&origin, task.as_deref().unwrap_or("")) {
@@ -1057,7 +1139,7 @@ impl Signer {
             let status = probe.status;
             // as on the paid paths: a socket that cannot be reached is a reader already gone, and nothing is read for it
             let mut sink = Sink::streaming_to(stream_to.as_deref());
-            let (head, refused) = head_to(&mut probe, range, stream_head, &mut sink);
+            let (head, refused) = head_to(&mut probe, range, stream_head, head_headers, &mut sink);
             let ended = match refused {
                 Some(why) => Some(format!("not read: {why}")),
                 None => read_all(probe, &mut sink),
@@ -1074,7 +1156,7 @@ impl Signer {
         if max_sats == 0 {
             return with(deny("max_sats", "the seller asks to be paid and this call may spend nothing (max_sats 0)"), json!({"charged_sats": 0}));
         }
-        let call = Call { url: &url, origin: &origin, method: &method, body: &raw, max_sats, task, piece_hashes, stream_to, stream_head, range };
+        let call = Call { url: &url, origin: &origin, method: &method, body: &raw, max_sats, task, piece_hashes, stream_to, stream_head, range, extra, head_headers };
         let mut passed: Vec<Value> = vec![];
         let mut ways = offers(&pr, &lightning);
         // tickets or draws first: one rule ([`crate::lottery::choose`]); the other is tried after it

@@ -78,6 +78,14 @@ pub struct Route {
     pub upstream: Option<String>,
     /// Pass the target on without this route's path (a route `/ai/` sends `/ai/v1/x` as `/v1/x`).
     pub strip_prefix: bool,
+    /// Ask the service for a gzip body (`accept_gzip`): a web app that serves its pages only
+    /// compressed (llama.cpp's server does). The gateway unpacks it and sends the buyer the plain
+    /// body, which is what it meters and signs.
+    pub accept_gzip: bool,
+    /// Headers the gateway adds to every request of this route (`upstream_headers`), over any the
+    /// buyer sent of the same name: the seller's guest login for a service that needs one. They
+    /// never go to the buyer.
+    pub upstream_headers: Vec<(String, String)>,
 }
 
 /// Request headers every route passes on: they select what is returned and carry no authority.
@@ -762,6 +770,8 @@ fn route(v: &Value) -> Result<Route, String> {
             "upstream",
             "strip_prefix",
             "max_output_tokens",
+            "accept_gzip",
+            "upstream_headers",
         ],
     )?;
     let path = req_str(r, "path")?.to_string();
@@ -877,6 +887,30 @@ fn route(v: &Value) -> Result<Route, String> {
     if strip_prefix && !path.ends_with('/') {
         return Err(bad("strip_prefix is for a path ending in /, which covers everything under it"));
     }
+    let accept_gzip = match r.get("accept_gzip") {
+        None => false,
+        Some(Value::Bool(b)) => *b,
+        _ => return Err(bad("accept_gzip is true or false")),
+    };
+    let mut upstream_headers = vec![];
+    if let Some(h) = r.get("upstream_headers") {
+        let m = h.as_object().ok_or_else(|| bad("upstream_headers is an object of header names and values"))?;
+        if m.len() > 8 {
+            return Err(bad("upstream_headers has at most 8 headers"));
+        }
+        for (k, v) in m {
+            let name = k.to_ascii_lowercase();
+            if name.is_empty() || !name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-') {
+                return Err(bad("upstream_headers are header names"));
+            }
+            if NEVER_FORWARDED.contains(&name.as_str()) || name.starts_with("payment-") {
+                return Err(bad(&format!("{name} is never sent to the service")));
+            }
+            let v = v.as_str().filter(|v| v.len() <= 4096 && v.bytes().all(|b| b.is_ascii_graphic() || b == b' '))
+                .ok_or_else(|| bad("upstream_headers values are plain text"))?;
+            upstream_headers.push((name, v.to_string()));
+        }
+    }
     Ok(Route {
         path,
         methods,
@@ -887,6 +921,8 @@ fn route(v: &Value) -> Result<Route, String> {
         max_body: max_body as usize,
         upstream,
         strip_prefix,
+        accept_gzip,
+        upstream_headers,
     })
 }
 

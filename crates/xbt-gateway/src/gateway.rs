@@ -1425,7 +1425,11 @@ impl Gateway {
         let base = route.upstream.as_ref().or(self.cfg.upstream.as_ref());
         // the config refuses a route with neither, and every base has its client
         let up = base.and_then(|b| self.upstreams.get(b)).ok_or_else(|| crate::Error::Upstream("no service for this route".into()))?;
-        up.send(&req.method, &route.upstream_target(&req.target), &forwarded(route, &req.headers), body)
+        let mut headers = forwarded(route, &req.headers);
+        // the seller's own headers for this route (a guest login) win over any of the buyer's of the same name
+        headers.retain(|(k, _)| !route.upstream_headers.iter().any(|(n, _)| k.eq_ignore_ascii_case(n)));
+        headers.extend(route.upstream_headers.iter().cloned());
+        up.send_as(&req.method, &route.upstream_target(&req.target), &headers, body, route.accept_gzip)
     }
 
     /// Read at most `cap` bytes of a body. `Err`: the service stopped in the middle.

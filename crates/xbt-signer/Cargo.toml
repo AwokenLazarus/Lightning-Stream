@@ -36,3 +36,5 @@ tempfile = "3"
 # the ticket payer is tested against the real seller gateway, in process (tests/ticket_pay.rs)
 xbt-gateway = { path = "../xbt-gateway" }
 xbt402 = { workspace = true, features = ["http-client", "http-server"] }
+# a stand-in web app that serves its page only compressed, as llama.cpp's server does (already in the tree through ureq)
+flate2 = "1"

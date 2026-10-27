@@ -158,6 +158,23 @@ impl Handler for Service {
                 out.send(b"data: [DONE]\n\n")
             }) });
         }
+        // a web app: its page only compressed (as llama.cpp's server serves it), and an echo of what reached it
+        if path == "/app/" {
+            if !req.header("Accept-Encoding").is_some_and(|a| a.contains("gzip")) {
+                return Reply::Whole(Response::text(415, "text/plain", "Error: gzip is not supported by this browser"));
+            }
+            use std::io::Write as _;
+            let mut z = flate2::write::GzEncoder::new(vec![], flate2::Compression::default());
+            z.write_all(APP_PAGE.as_bytes()).unwrap();
+            return Reply::Whole(Response::new(200, vec![("Content-Type".into(), "text/html".into()), ("Content-Encoding".into(), "gzip".into())], z.finish().unwrap()));
+        }
+        if path == "/app/echo" {
+            let h = |k: &str| req.header(k).unwrap_or("").to_string();
+            let v = json!({"method": req.method, "body": String::from_utf8_lossy(&req.body), "cookie": h("Cookie"), "authorization": h("Authorization"),
+                           "guest": h("X-Guest"), "host": h("Host")});
+            return Reply::Whole(Response::new(200, vec![("Content-Type".into(), "application/json".into()), ("Set-Cookie".into(), "jf=abc; Path=/; HttpOnly".into()),
+                                                        ("X-Seller-App".into(), "yes".into()), ("Payment-Made-Up".into(), "no".into())], v.to_string().into_bytes()));
+        }
         Reply::Whole(match path.as_str() {
             "/api" => Response::text(200, "application/json", json!({"method": req.method, "body": String::from_utf8_lossy(&req.body)}).to_string()),
             "/broken" => Response::text(500, "text/plain", "the service failed"),
@@ -166,8 +183,14 @@ impl Handler for Service {
     }
 }
 
+/// The stand-in web app's page.
+const APP_PAGE: &str = "<!doctype html><title>A seller's app</title><script src=\"./app.js\"></script>";
+
 fn routes() -> Value {
     json!([
+        // a seller's own web page (docs/SELLER-APPS.md): the methods and headers a page uses, its compressed page, and the seller's guest login
+        {"path": "/app/", "methods": ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"], "price": {"request_msat": 2500}, "max_body": 65536,
+         "forward_headers": ["cookie", "authorization", "x-guest"], "accept_gzip": true, "upstream_headers": {"x-guest": "guest-token"}},
         {"path": "/page/", "price": {"request_msat": 2500}},
         {"path": "/api", "methods": ["GET", "POST"], "price": {"request_msat": 2500}, "max_body": 4096},
         {"path": "/broken", "price": {"request_msat": 2500}},
@@ -1207,6 +1230,66 @@ fn a_body_is_streamed_to_a_local_reader_as_it_is_paid_and_stops_when_the_reader_
     // a name with a path in it is refused before anything is sent
     let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": CALL, "task": "film", "stream_to": "../x"}));
     assert_eq!(v["rule"], "stream_to", "{v}");
+    std::env::remove_var("B2_STREAM_DIR");
+    r.assert_booked();
+}
+
+/// A seller's own web page, used inside the app (docs/SELLER-APPS.md): the caller's headers (its
+/// cookies, its login) reach the service, the seller's guest login wins over a forged one, the
+/// page the service serves only compressed comes back plain, and the seller's response headers come
+/// back in the head line for a caller that asks (`head_headers`), without the payment's. The wallet's
+/// own headers cannot be set by the caller.
+#[test]
+fn a_sellers_web_page_gets_the_callers_headers_and_its_answer_comes_back_with_its_own() {
+    use std::io::{BufRead as _, BufReader, Read as _};
+    use std::os::unix::net::UnixListener;
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = Rig::new(json!({}));
+    let read = |name: &'static str| {
+        let l = UnixListener::bind(dir.path().join(name)).unwrap();
+        std::thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            let mut b = BufReader::new(s);
+            let mut line = String::new();
+            b.read_line(&mut line).unwrap();
+            let mut rest = vec![];
+            b.read_to_end(&mut rest).unwrap();
+            (serde_json::from_str::<Value>(&line).unwrap(), rest)
+        })
+    };
+    // the page: asked compressed by the gateway, unpacked there, metered and signed plain
+    let page = read("page");
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/app/"), "max_sats": 5_000, "task": "film", "stream_to": "page", "stream_head": true, "head_headers": true}));
+    let (head, body) = page.join().unwrap();
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool()), (Some(200), Some(true)), "{v}");
+    assert_eq!(String::from_utf8_lossy(&body), APP_PAGE);
+    assert!(head["headers"].as_array().unwrap().iter().all(|h| !h[0].as_str().unwrap().eq_ignore_ascii_case("content-encoding")), "{head}");
+    // a request of the page, with its cookie and its login, and a guest login of its own making
+    let echo = read("echo");
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/app/echo"), "method": "POST", "body_b64": "eyJhIjoxfQ==", "max_sats": 5_000, "task": "film",
+                                        "stream_to": "echo", "stream_head": true, "head_headers": true,
+                                        "headers": [["Cookie", "jf=abc"], ["Authorization", "MediaBrowser Token=t1"], ["X-Guest", "forged"], ["Content-Type", "application/json"]]}));
+    let (head, body) = echo.join().unwrap();
+    assert_eq!(v["complete"], true, "{v}");
+    let got: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!((got["method"].as_str(), got["body"].as_str(), got["cookie"].as_str(), got["authorization"].as_str(), got["guest"].as_str()),
+               (Some("POST"), Some("{\"a\":1}"), Some("jf=abc"), Some("MediaBrowser Token=t1"), Some("guest-token")), "{got}");
+    let names: Vec<String> = head["headers"].as_array().unwrap().iter().map(|h| h[0].as_str().unwrap().to_ascii_lowercase()).collect();
+    assert!(names.contains(&"set-cookie".to_string()) && names.contains(&"x-seller-app".to_string()), "{head}");
+    assert!(!names.iter().any(|n| n.starts_with("payment-") || n == "content-length"), "{head}");
+    // a call without head_headers gets the head as before, with no headers in it
+    let plain = read("plain");
+    r.call("xbt402_pay", json!({"url": r.shop.url("/app/echo"), "max_sats": 5_000, "task": "film", "stream_to": "plain", "stream_head": true}));
+    assert!(plain.join().unwrap().0.get("headers").is_none());
+    // the wallet's own headers, and the ones a proxy must not pass on, are refused before anything is sent
+    for h in ["Host", "Payment-Signature", "Content-Length", "Range", "Transfer-Encoding", "X-Forwarded-For", "Accept-Encoding"] {
+        let v = r.call("xbt402_pay", json!({"url": r.shop.url("/app/echo"), "max_sats": 5_000, "task": "film", "headers": [[h, "x"]]}));
+        assert_eq!(v["rule"], "headers", "{h}: {v}");
+    }
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/app/echo"), "max_sats": 5_000, "task": "film", "headers": [["X-A", "line\nbreak"]]}));
+    assert_eq!(v["rule"], "headers", "{v}");
     std::env::remove_var("B2_STREAM_DIR");
     r.assert_booked();
 }

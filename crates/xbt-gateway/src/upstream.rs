@@ -136,11 +136,24 @@ impl Upstream {
         headers: &[(String, String)],
         body: &[u8],
     ) -> Result<Answer, Error> {
+        self.send_as(method, target, headers, body, false)
+    }
+
+    /// [`Self::send`], and with `gzip` the service may answer compressed: the client unpacks it,
+    /// so the body read (metered, signed, sent on) is the plain one either way.
+    pub fn send_as(
+        &self,
+        method: &str,
+        target: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+        gzip: bool,
+    ) -> Result<Answer, Error> {
         // identity: the bytes metered are the bytes the service sent
         let mut req = self
             .agent
             .request(method, &format!("{}{target}", self.base))
-            .set("Accept-Encoding", "identity")
+            .set("Accept-Encoding", if gzip { "gzip" } else { "identity" })
             .set("Via", VIA);
         for (k, v) in headers {
             req = req.set(k, v);
@@ -316,6 +329,8 @@ mod tests {
             max_body: 0,
             upstream: None,
             strip_prefix: false,
+            accept_gzip: false,
+            upstream_headers: vec![],
         };
         let h = |v: &[(&str, &str)]| {
             v.iter()
