@@ -1019,9 +1019,31 @@ impl LnBook {
         Ok(Self { path: path.into(), lock: Mutex::new(()), halt: Mutex::new(None) })
     }
 
-    fn read(&self) -> Map<String, Value> {
-        std::fs::read_to_string(&self.path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok())
-            .and_then(|v| v.get("payments").and_then(Value::as_object).cloned()).unwrap_or_default()
+    /// The records. Only a book that does not exist yet is empty: one that cannot be read or is not
+    /// a payments document halts the rail ([`Self::halted`]) and is an error, so no write replaces
+    /// the records it holds with a book that lacks them.
+    fn read(&self) -> Result<Map<String, Value>> {
+        let name = self.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let t = match std::fs::read_to_string(&self.path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Map::new()),
+            Err(e) => return Err(self.unreadable(format!("{name} cannot be read: {e}"))),
+        };
+        serde_json::from_str::<Value>(&t).ok().and_then(|v| v.get("payments").and_then(Value::as_object).cloned())
+            .ok_or_else(|| self.unreadable(format!("{name} is not a payments document")))
+    }
+
+    /// The records for a reader that only looks: empty when the book cannot be read, which has
+    /// halted the rail.
+    fn records(&self) -> Map<String, Value> {
+        self.read().unwrap_or_default()
+    }
+
+    /// Halt this process's rail (not the file: the book stays as it is for the owner to look at).
+    fn unreadable(&self, why: String) -> crate::Error {
+        let why = format!("{why}: the Lightning rail is halted and the file is left as it is");
+        *self.halt.lock().unwrap_or_else(|p| p.into_inner()) = Some(json!({"reason": why.clone()}));
+        err("ln_book", why)
     }
 
     fn write(&self, m: &Map<String, Value>) -> Result<()> {
@@ -1065,21 +1087,21 @@ impl LnBook {
 
     pub fn get(&self, hash: &str) -> Option<Value> {
         let _g = self.lock.lock();
-        self.read().get(hash).cloned()
+        self.records().get(hash).cloned()
     }
 
     /// Write a record as it is. Not for a payment about to be sent: that goes through
     /// [`Self::put_sending`], which is what the rate limit counts.
     pub fn put(&self, hash: &str, rec: Value) -> Result<()> {
         let _g = self.lock.lock();
-        let mut m = self.read();
+        let mut m = self.read()?;
         m.insert(hash.into(), rec);
         self.write(&m)
     }
 
     pub fn update(&self, hash: &str, fields: Value) -> Result<()> {
         let _g = self.lock.lock();
-        let mut m = self.read();
+        let mut m = self.read()?;
         if let (Some(Value::Object(r)), Value::Object(f)) = (m.get_mut(hash), fields) {
             for (k, v) in f {
                 r.insert(k, v);
@@ -1090,7 +1112,7 @@ impl LnBook {
 
     pub fn all(&self) -> Map<String, Value> {
         let _g = self.lock.lock();
-        self.read()
+        self.records()
     }
 
     pub fn in_flight(&self) -> Vec<(String, Value)> {
@@ -1113,7 +1135,7 @@ impl LnBook {
     /// hour (`sends`), so a retry, which replaces the record, is still counted (AGP-092).
     pub fn put_sending(&self, hash: &str, mut rec: Value, now: f64) -> Result<()> {
         let _g = self.lock.lock();
-        let mut m = self.read();
+        let mut m = self.read()?;
         let mut sends: Vec<Value> = m.get(hash).map(send_times).unwrap_or_default().into_iter()
             .filter(|t| *t >= now - 3600.0).map(ts_value).collect();
         sends.push(ts_value(now));
@@ -2012,5 +2034,23 @@ mod tests {
         let recent = book.recent(10);
         assert!(recent[0].get("failure").is_none() && recent[0].get("invoice").is_none(), "{recent:?}");
         assert_eq!(recent[0][UNTRUSTED_LN_KEY]["data"]["failure"], "not sent: seller-says-7f3a");
+    }
+
+    #[test]
+    fn a_payment_book_that_cannot_be_read_halts_the_rail_and_is_never_written_over() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("ln_payments.json");
+        let book = LnBook::open(&path).unwrap();
+        // none yet: empty, and the first write makes it
+        assert!(book.halted().is_none() && book.all().is_empty());
+        book.put_sending("aa", json!({"state": "sending"}), 1.0).unwrap();
+        for damaged in ["{\"payments\": {\"aa\": {\"state\": \"sending\"}", "[]"] {
+            std::fs::write(&path, damaged).unwrap();
+            let book = LnBook::open(&path).unwrap();
+            assert!(book.put_sending("bb", json!({"state": "sending"}), 2.0).is_err(), "no booking on a book that cannot be read");
+            assert!(book.update("aa", json!({"state": "failed"})).is_err() && book.put("cc", json!({})).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), damaged, "the records it holds are not replaced");
+            assert!(book.halted().is_some_and(|h| h["reason"].as_str().unwrap().contains("ln_payments.json")), "the rail is halted");
+        }
     }
 }
