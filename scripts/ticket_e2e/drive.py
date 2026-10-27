@@ -80,8 +80,11 @@ PAGE = "a small page\n" * 20
 REPORT: dict[str, Any] = {"checks": [], "measured": {}}
 FAILED: list[str] = []
 PROCS: dict[str, subprocess.Popen[bytes]] = {}
-#: The highest releasedMsat a seller's signed receipt has shown, by session.
+#: The highest releasedMsat a seller's signed receipt has shown, by the wallet's session.
 RECEIPTS: dict[str, int] = {}
+#: The seller's session of a wallet's session, where a reply named it: two sessions of the wallet
+#: that took over one balance share the seller's, whose totals count once.
+SELLER_OF: dict[str, str] = {}
 
 
 # The speed checks hold for a quiet machine. A run that starts with the load average above this
@@ -278,6 +281,8 @@ def note_receipts(r: dict[str, Any]) -> None:
     acct = r.get("account") or r
     if acct.get("session") and "credited_msat" in acct:
         RECEIPTS[acct["session"]] = max(RECEIPTS.get(acct["session"], 0), int(acct["credited_msat"]))
+        if acct.get("seller_session"):
+            SELLER_OF[acct["session"]] = acct["seller_session"]
 
 
 # the limit of a call that pays a few cents' worth: room for whole tickets, since the wallet never pays a ticket that
@@ -376,12 +381,25 @@ def quiet(secs: float = 120) -> float:
 ORPHANS: set[str] = set()  # payments the buyer's node calls in flight with nothing on its channel
 
 
-def stop_sessions(who: Mcp | None = None) -> None:
-    """The agent stops every session that is open, and the tickets come back."""
+def stop_sessions(who: Mcp | None = None, forget: bool = True) -> None:
+    """The agent stops every session that is open, and the tickets come back. With `forget` (each
+    check starts clean with the seller), the credit a session leaves there is given up as well, so
+    the next session starts with none instead of taking it over."""
     for s in status().get("sessions", []):
         if s["state"] == "open":
             note_receipts((who or agent()).tool("ticket_stop", {"session": s["session"]}).get("http") or {})
+            if forget:
+                signer("ticket_stop", {"session": s["session"], "forget_credit": True})
     quiet()
+
+
+def receipts_released() -> int:
+    """What the seller's receipts say was released, each seller session counted once."""
+    by_seller: dict[str, int] = {}
+    for wallet, msat in RECEIPTS.items():
+        seller = SELLER_OF.get(wallet, wallet)
+        by_seller[seller] = max(by_seller.get(seller, 0), msat)
+    return sum(by_seller.values())
 
 
 def money() -> dict[str, Any]:
@@ -395,7 +413,7 @@ def money() -> dict[str, Any]:
         "buyer_node_paid_msat": sum(int(p["value_msat"]) for p in pays),
         "seller_node_received_msat": sum(int(i["amt_paid_msat"]) for i in invs),
         "wallet_book_settled_msat": st["tickets"].get("settled", 0) * TICKET_MSAT,
-        "receipts_released_msat": sum(RECEIPTS.values()),
+        "receipts_released_msat": receipts_released(),
         "wallet_ledger_sats": sum(int(r["amount_sats"]) for r in rows),
         # booked as spent and not settled: after `quiet`, only tickets whose payment the buyer's node still calls in
         # flight with nothing on its channel (a node killed as it sent one). The wallet counts them until the node drops them
@@ -769,16 +787,14 @@ def page() -> None:
     check("page: one ticket was left and the next was locked behind the call: two are locked and unreleased again, and the wallet's book is its node's payments in flight",
           st["locked"] == {"tickets": 2, "sats": 2000} and st["node"]["agree"] is True and in_flight() == 2 and held() == 2,
           {"locked": st["locked"], "node": st["node"], "buyer_in_flight": in_flight(), "seller_held": held()})
-    # a first request on a new session: the unpaid request, the pool locked through the hop, the seller's word, the
-    # paid request; and one release, unless the balance the stopped session left with the seller pays for it (the
-    # new session takes that balance over)
+    # a first request on a new session: the unpaid request, the pool locked through the hop, the seller's word, one release, the paid request
     firsts = [round(first, 3)]
     for _ in range(4):
         stop_sessions()
         t0 = time.monotonic()
         r = pay(f"{ORIGIN}/small.txt")
         firsts.append(round(time.monotonic() - t0, 3))
-        if not call_paid(r) or r.get("tickets_released") not in (0, 1):
+        if not call_paid(r) or r.get("tickets_released") != 1:
             raise LabError(f"a first request: {brief(r)}")
     measured("first_request_s", firsts)
     timed_check("page: a first request, with the pool of 2 tickets locked through one hop, completes in 1 s (median of 5 new sessions, timed around the MCP tool call)",

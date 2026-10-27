@@ -4054,6 +4054,47 @@ fn a_balance_left_with_the_seller_is_used_through_another_name_for_the_same_shop
     }
 }
 
+/// A caller that gives up the credit a session leaves with the seller (`ticket_stop` with
+/// `forget_credit`) starts clean: the next session takes none of it over, and buys its own ticket.
+#[test]
+fn a_session_whose_credit_was_given_up_is_not_taken_over() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, sized_shop(json!(["on-arrival"]), None));
+    let v = r.pay("/page/10", 2_000);
+    assert_eq!(v["tickets_prepaid"].as_u64(), Some(1), "{v}");
+    r.call("ticket_stop", json!({"session": v["session"]}));
+    let forgot = r.call("ticket_stop", json!({"session": v["session"], "forget_credit": true}));
+    assert_eq!((forgot["already_stopped"].as_bool(), forgot["credit_given_up"].as_bool()), (Some(true), Some(true)), "{forgot}");
+    let w = r.pay("/page/10", 2_000);
+    assert_eq!((w["status"].as_u64(), w["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "a ticket of its own: {w}");
+}
+
+/// A session stopped for what the seller did (here a receipt that charged more than the terms) is
+/// never taken over: its balance is not spent, and the next session buys its own ticket.
+#[test]
+fn a_session_stopped_for_a_seller_fault_is_not_taken_over() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, sized_shop(json!(["on-arrival"]), None));
+    let v = r.pay("/page/10", 2_000);
+    assert_eq!(v["tickets_prepaid"].as_u64(), Some(1), "{v}");
+    // the seller's word on the next request is bent: its receipt no longer verifies
+    r.tap.set(Box::new(|seen, real| {
+        if !seen.paid {
+            return None;
+        }
+        let (status, mut headers, body) = whole(real().ok()?);
+        for (_, v) in headers.iter_mut().filter(|(k, _)| k == "PAYMENT-RESPONSE") {
+            v.push('x');
+        }
+        Some(Ok(answer(status, headers, body)))
+    }));
+    let bent = r.pay("/page/10", 2_000);
+    r.tap.clear();
+    assert_eq!(bent["rule"].as_str(), Some("ticket_seller_fault"), "{bent}");
+    let w = r.pay("/page/10", 2_000);
+    assert_eq!((w["status"].as_u64(), w["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "a ticket of its own, not the faulty session's balance: {w}");
+}
+
 /// Held tickets are sized when the session opens: to the opening call's `max_sats` where the seller's
 /// terms let the wallet choose.
 #[test]

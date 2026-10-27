@@ -514,8 +514,11 @@ impl HttpSession {
     }
 
     fn public(&self) -> Value {
+        // the seller's id for the session (never its key): two sessions of the wallet that took over the same
+        // balance name the same one, and the seller's totals are for it
+        let seller_session = lock_link(self).seller_sid.clone();
         let m = lock_money(self);
-        json!({"session": self.sid, "origin": self.origin, "released_msat": m.acct.sent_msat.to_string(), "credited_msat": m.acct.acked_msat.to_string(),
+        json!({"session": self.sid, "seller_session": seller_session, "origin": self.origin, "released_msat": m.acct.sent_msat.to_string(), "credited_msat": m.acct.acked_msat.to_string(),
                "spent_msat": m.acct.spent_msat.to_string(), "balance_msat": m.acct.balance().to_string(), "unconfirmed_release": m.pending.as_ref().map(|p| p.0.clone()),
                "fault": m.fault, "answer_open": self.streaming.load(Ordering::SeqCst), "answer_unclosed": m.tail.is_some()})
     }
@@ -2541,7 +2544,23 @@ impl Signer {
     /// `ticket_stop`: stop a session. Where the wallet itself speaks to the seller, it also asks
     /// for the cancel and reports what its own node then shows; otherwise it names the tickets for
     /// the caller to have cancelled, as before.
+    /// `forget_credit: true`: what the session leaves with the seller is given up, and no later
+    /// session takes it over (a caller that wants to start clean with the seller).
     pub(crate) fn ticket_stop(&self, p: &Value) -> Value {
+        if p.get("forget_credit") != Some(&Value::Bool(true)) {
+            return self.ticket_stop_inner(p);
+        }
+        let sid = str_or_empty(p.get("session"));
+        // a session already stopped is not stopped again (nor its seller asked again to cancel): only its credit goes
+        let stopped = self.ticket_http_of(&sid).is_none() && self.ticket_session(&sid).is_some_and(|s| s.state != SState::Open);
+        let out = if stopped { json!({"verdict": "allow", "session": sid, "already_stopped": true}) } else { self.ticket_stop_inner(p) };
+        match self.ticket_forget_credit(&sid) {
+            Ok(()) => with(out, json!({"credit_given_up": true})),
+            Err(e) => with(out, json!({"credit_given_up": false, "forget_credit": e.msg})),
+        }
+    }
+
+    fn ticket_stop_inner(&self, p: &Value) -> Value {
         let sid = str_or_empty(p.get("session"));
         // a session that pays by draws holds nothing: it is stopped, and the seller told
         if let Some(done) = self.draw_stop_by_id(&sid) {

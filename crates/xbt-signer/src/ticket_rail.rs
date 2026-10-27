@@ -2076,13 +2076,27 @@ impl Signer {
         let st = g.as_ref()?;
         let old = st.book.sessions.values()
             .filter(|s| s.id != sid && s.payee == payee && s.state != SState::Open && now - s.stopped_ts.max(s.active_ts) < RESUME_WITHIN_S)
-            .filter(|s| s.http.is_some())
+            // never one stopped for what the seller did (a fault, terms that changed under it): nothing more is
+            // released to a seller in such a session, and its balance is not spent either
+            .filter(|s| s.http.is_some() && !s.why.contains(CREDIT_GIVEN_UP) && !s.why.starts_with("seller fault") && !s.why.contains("terms changed"))
             .max_by(|a, b| a.stopped_ts.max(a.active_ts).total_cmp(&b.stopped_ts.max(b.active_ts)))?;
         let http = old.http.clone()?;
         let using: Vec<&str> = st.book.sessions.values().filter(|s| s.http.as_ref().is_some_and(|h| h.id == http.id)).map(|s| s.id.as_str()).collect();
         let sent = using.iter().flat_map(|id| st.book.of_session(id)).filter(|t| matches!(t.state, TState::Released | TState::Settled))
             .fold(0u64, |a, t| a.saturating_add(t.msat));
         Some((http, sent))
+    }
+
+    /// The caller gave up the credit `sid` left with its seller (`ticket_stop` with `forget_credit`):
+    /// no later session takes it over ([`Signer::ticket_resumable`]).
+    pub(crate) fn ticket_forget_credit(&self, sid: &str) -> Result<()> {
+        let mut g = self.ticket_store()?;
+        let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
+        let mut s = st.book.sessions.get(sid).cloned().ok_or_else(|| err("ticket_session", "no such session"))?;
+        if !s.why.contains(CREDIT_GIVEN_UP) {
+            s.why = if s.why.is_empty() { CREDIT_GIVEN_UP.to_string() } else { format!("{}; {CREDIT_GIVEN_UP}", s.why) };
+        }
+        st.commit(&[s.row()])
     }
 
     pub(crate) fn ticket_set_http(&self, sid: &str, http: ticket::SellerSession) -> Result<()> {
@@ -2452,6 +2466,9 @@ fn booking_of(lp: &LnPolicy, msat: u64) -> (i64, i64) {
 /// How long after a session stopped the wallet still looks for its balance at the seller: a seller
 /// forgets a session with a balance that has not been used for a day (`docs/TICKETS.md`).
 const RESUME_WITHIN_S: f64 = 20.0 * 3600.0;
+
+/// What a session's `why` says once its caller gave up the credit it left with the seller.
+const CREDIT_GIVEN_UP: &str = "its credit with the seller given up by the caller";
 
 /// The most one ticket may book, its fee limit included, in sats: below `human_threshold_sats`,
 /// since no one can approve a release as it happens, and at most `max_per_tx_sats`.
