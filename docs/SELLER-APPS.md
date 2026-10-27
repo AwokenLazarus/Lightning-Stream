@@ -90,3 +90,23 @@ they still read the rest of the shop.
   `https` cannot frame them.
 - A long answer that runs out of the session's credit while another request of the visit holds
   the turn to buy is cut short. A player asks again, but a page may not.
+
+## Status (work in progress, paused)
+
+Built and tested on the branch `app/seller-app` (rebased on main at 00d9c40, not merged):
+
+- signer `headers`, `head_headers` and `body_b64`;
+- gateway `accept_gzip` and `upstream_headers`;
+- the listing kind `app`, the connector's visits, and the UI's app ports, pages and same-site guard;
+- Sell's web-page option, the owner's free preview, the package ports and the docs.
+
+Test results: the workspace tests pass (118 suites), and so does clippy on 1.98.0. The seller-app browser test passes 20/20, with the hostile page shown to make the wallet pay when the guard is off.
+
+Left to do:
+
+1. Run the ticket_e2e and ln_rail labs. They were stopped before finishing.
+2. Rebase onto main, bump the Umbrel version, then merge and push.
+3. Publish and pin the images, and update the public store.
+4. Deploy to the box, and turn on the AI model's page there (its offer's `app`, base `/ai/`).
+5. StartOS: the app ports in the merged `lightning-stream` package.
+6. Jellyfin on the box needs a guest user and the owner's decision first.
