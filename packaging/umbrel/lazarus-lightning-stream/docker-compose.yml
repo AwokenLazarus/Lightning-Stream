@@ -74,7 +74,7 @@ services:
       APP_PORT: 8482
 
   init:
-    image: ghcr.io/awokenlazarus/xbt-init:0.1.0-2bfd7c04d76e@sha256:a7223b57bd869b2908750b2e3d07031b1eafe6d74659190936cdfaf70ea8d098
+    image: ghcr.io/awokenlazarus/xbt-init:0.1.0-2fe4f1051c00@sha256:16e0c94b588dd93435779184862c788ba465d6d47cf5040468b784af047c9224
     user: "0:0"
     restart: "no"
     network_mode: none
@@ -97,7 +97,7 @@ services:
 
   witness:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-anchor-witness:0.1.0-2bfd7c04d76e@sha256:941b6467f6ad128a5d037f822e10e347ae5719dfae3d9883a3099453a1c7b6f4
+    image: ghcr.io/awokenlazarus/xbt-anchor-witness:0.1.0-2fe4f1051c00@sha256:ab50f74a9e68d28497445364545a936b564b820e61c2484782b04bb01266deae
     network_mode: none
     stop_grace_period: 30s
     volumes:
@@ -106,7 +106,7 @@ services:
 
   signer:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-signer:0.1.0-2bfd7c04d76e@sha256:f2d997fd6851887a34d2421cbce60a6ea75fb8e3425c42cccfdf63ed74b5246d
+    image: ghcr.io/awokenlazarus/xbt-signer:0.1.0-2fe4f1051c00@sha256:830c973a897754c9a4256d0b326fcb20e1c0010972d6360b73f5e0ffbb341c7a
     entrypoint: ["/usr/bin/xbt-supervise", "--watch", "/data/run/ln/rail.macaroon", "--watch", "/data/lightning/tls.cert", "--", "/usr/bin/xbt-signer"]
     stop_grace_period: 1m
     environment:
@@ -132,7 +132,7 @@ services:
 
   mcp:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-wallet-mcp:0.1.0-2bfd7c04d76e@sha256:3e1ebbe081f7c216011ca96fc771e4a2ad4bd29ed4916666bd071a55e7eac8d6
+    image: ghcr.io/awokenlazarus/xbt-wallet-mcp:0.1.0-2fe4f1051c00@sha256:cc3218dc5f3dc941457a0d0087bc19d75baea4c37648942c8cb544e7481f131a
     stop_grace_period: 30s
     environment:
       # an over-threshold payment waits this long for the owner's approval in the UI
@@ -152,7 +152,7 @@ services:
 
   ui:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-2bfd7c04d76e@sha256:2fb070345ddbc1b46fb2eac01805fb7fd9972832e95868647399553c7a90bae6
+    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-2fe4f1051c00@sha256:f7c1fa2e9e4f4ebbc132b524a01ce992eb64a994a437619d3687135c07d58cbb
     stop_grace_period: 15s
     environment:
       XBT_UI_BIND: 0.0.0.0:8482
@@ -207,7 +207,7 @@ services:
   # the group. It waits for the node (starting, or its wallet still locked) and asks again.
   node-keys:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-2bfd7c04d76e@sha256:2fb070345ddbc1b46fb2eac01805fb7fd9972832e95868647399553c7a90bae6
+    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-2fe4f1051c00@sha256:f7c1fa2e9e4f4ebbc132b524a01ce992eb64a994a437619d3687135c07d58cbb
     command: ["node-keys"]
     restart: "no"
     group_add:
@@ -228,7 +228,7 @@ services:
 
   connector:
     <<: *service
-    image: ghcr.io/awokenlazarus/lightning-stream:0.1.0-2bfd7c04d76e@sha256:b1c93720ca8b3b0425cceec12c6ee5cf5878924492589ca1c97ebfe79f9521da
+    image: ghcr.io/awokenlazarus/lightning-stream:0.1.0-2fe4f1051c00@sha256:f58af6358f02418f61250db185301ed9357696c734e7190adf2cd527fb9125f7
     network_mode: "service:ui"
     stop_grace_period: 15s
     depends_on:
@@ -253,7 +253,7 @@ services:
 
   gateway:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-gateway:0.1.0-2bfd7c04d76e@sha256:6b6d38887b587b03da20bcf92bc871c95e2730fc5b2c24e8e8fda3e774a09e7a
+    image: ghcr.io/awokenlazarus/xbt-gateway:0.1.0-2fe4f1051c00@sha256:8277fb99bc2aa54e34b59bf8588db947936c1b37aba2a96badf02a4b8470f6be
     # each held ticket is followed on its own connection to the node; a stop cancels nothing.
     # the image starts the gateway only once run/gateway/config.json exists, and publishes no host port
     stop_grace_period: 30s
@@ -264,7 +264,7 @@ services:
 
   hasher:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-hashlink:0.1.0-2bfd7c04d76e@sha256:5190e20cb827b8e5ba830a6bef220eaa5c8c64d8fdb962671ccfe53fd191df5d
+    image: ghcr.io/awokenlazarus/xbt-hashlink:0.1.0-2fe4f1051c00@sha256:ac85f943f20cb7cbdadba74492860c1166dc423ec7eb13181c0492ff3afb90a3
     stop_grace_period: 15s
     command: ["hasher", "--key", "/data/hashrate/link.key", "--nostr-key", "/data/hashrate/nostr.key",
               "--miners", "0.0.0.0:23340", "--link", "0.0.0.0:23341", "--slices", "0.0.0.0:23344",
@@ -284,7 +284,7 @@ services:
 
   renter:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-hashlink:0.1.0-2bfd7c04d76e@sha256:5190e20cb827b8e5ba830a6bef220eaa5c8c64d8fdb962671ccfe53fd191df5d
+    image: ghcr.io/awokenlazarus/xbt-hashlink:0.1.0-2fe4f1051c00@sha256:ac85f943f20cb7cbdadba74492860c1166dc423ec7eb13181c0492ff3afb90a3
     stop_grace_period: 15s
     depends_on:
       init:
