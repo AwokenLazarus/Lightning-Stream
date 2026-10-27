@@ -1,10 +1,10 @@
 import { IMPOSSIBLE, VersionInfo } from '@start9labs/start-sdk'
 
 export const current = VersionInfo.of({
-  version: '0.1.16:0',
+  version: '0.1.17:0',
   releaseNotes: {
     en_US:
-      'A shop that moved to a new address is listed there whole, items included, and a wallet can allow it to be paid. A seller that charges a call more than its limit is stopped, and the wallet page says so. A rules change that waits for a restart says how to restart from StartOS. Tested on mainnet with small amounts only.',
+      'A wallet whose channel goes straight to a shop can pay it: when the shop\'s BOLT 12 offer cannot be reached, the shop\'s ordinary invoice is paid instead, once. Tested on mainnet with small amounts only.',
   },
   migrations: {
     up: async () => {},

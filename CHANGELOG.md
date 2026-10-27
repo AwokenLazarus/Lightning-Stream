@@ -5,6 +5,20 @@ package (from 0.1.14) and the Linux package (from 0.1.12). Dates are UTC.
 
 Lightning Stream is early software. It runs on mainnet; use small amounts.
 
+## 0.1.17 (2026-10-27)
+
+**Paying**
+- A wallet whose channel goes straight to a shop's node can pay it. A shop that sells by BOLT 12 offer
+  hands out invoices whose hidden route can enter through another node; when the wallet's node finds
+  no way there, the failed try (nothing was sent) is written off and the shop's ordinary invoice for
+  the same ticket or win is paid instead, once. A payment the shop itself refused is not retried.
+
+**If you are on an earlier version**
+- Until 0.1.17 is installed, open your channel to a well-connected public node, such as lazarus-xbt
+  (it takes channels of 20,000 sats or more), not straight to the shop.
+- If you added our shop before 0.1.16, press **Check for updates** on it under Services, Sellers,
+  before **Allow this seller to be paid**: the list saved before then names the shop's old address.
+
 ## 0.1.16 (2026-10-27)
 
 **Selling**
