@@ -5,10 +5,7 @@ package (from 0.1.14) and the Linux package (from 0.1.12). Dates are UTC.
 
 Lightning Stream is early software. It runs on mainnet; use small amounts.
 
-## 0.1.15 (in progress)
-
-Not released yet: the code is on `main`, and the images, the Umbrel store and the StartOS registry
-follow.
+## 0.1.15 (2026-10-27)
 
 **Paying on a new wallet**
 - A new wallet on mainnet can pay right after setup. It asks a seller for a ticket small enough not to
@@ -54,6 +51,10 @@ follow.
 
 **Other**
 - The real-money confirmation no longer says the software has only run on test chains.
+- After a change that waits for a restart, the app says how to restart it on your platform (on Linux,
+  `docker compose restart` in the install folder).
+- **Linux guide:** the first run includes the "Pay with real money" step, and a node that has only
+  its cookie file gets an `rpcauth` line for the app.
 - StartOS: 0.1.15 alongside the Umbrel app.
 
 ## 0.1.14 (2026-10-27)
