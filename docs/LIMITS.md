@@ -1118,7 +1118,8 @@ untrusted field.
   audited block. The provider never answers 429. *(test)*
 - The provider's relay pull asks for every invoice with a record and the 64 newest every 3
   seconds; the relay as shipped answers one client 10 requests a second, so past about 30 invoices
-  the same ones are not pulled, and their work is credited only when their payer calls. *(test)*
+  most are not pulled in a round (the ones that sort last, unless the relay's allowance comes back
+  as they are asked for), and their work is credited only when their payer calls. *(test)*
 - An invoice identifier shows when the invoice expires; its 4-byte check only tells this
   provider's identifiers from others'.
 - Losing the provider's state file loses every balance and every invoice not yet used; two
