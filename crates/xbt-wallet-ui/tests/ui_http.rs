@@ -917,7 +917,7 @@ fn the_gateway_page_writes_a_config_the_gateway_takes_and_mainnet_is_asked_for()
     xbt_gateway::config::Config::from_json(&c).unwrap();
 }
 
-const FILM: &str = "https://media.lazarus-xbt.xyz/Videos/057627270372dfed4d8ea15fa9ab5f01/stream?static=true";
+const FILM: &str = "https://stream.lazarus-xbt.xyz/Videos/057627270372dfed4d8ea15fa9ab5f01/stream?static=true";
 const NOTES: &str = "https://files.example/notes?a=1&b=2";
 
 #[test]
@@ -928,7 +928,7 @@ fn browse_player_and_connections_follow_the_services_file_and_stop_through_the_s
     std::fs::write(&path, format!(r#"[
         {{"name": "Zebra files", "kind": "files", "seller": "https://files.example", "price_text": "5 sat a file",
          "items": [{{"title": "<b>notes</b>", "year": 2020, "url": "{NOTES}", "credit": "CC0"}}]}},
-        {{"name": "Alpha films", "kind": "video", "seller": "https://media.lazarus-xbt.xyz", "price_text": "20 sat a MiB",
+        {{"name": "Alpha films", "kind": "video", "seller": "https://stream.lazarus-xbt.xyz", "price_text": "20 sat a MiB",
          "items": [{{"title": "Big Buck Bunny", "year": 2008, "url": "{FILM}", "credit": "(c) Blender Foundation, CC BY 3.0"}}]}}
     ]"#)).unwrap();
     let bx = start(json!({}), false, |c| c.services_file = Some(path.clone()));
@@ -946,7 +946,7 @@ fn browse_player_and_connections_follow_the_services_file_and_stop_through_the_s
     assert!(!page.body.contains("Big Buck Bunny"), "Browse lists services, not what a media service has inside");
     assert!(page.headers.get("content-security-policy").is_some_and(|v| v.contains("media-src 'self'")));
     // a media service's own page lists what it plays
-    let media = br.get(&format!("/service?seller={}&name={}", enc("https://media.lazarus-xbt.xyz"), enc("Alpha films"))).body;
+    let media = br.get(&format!("/service?seller={}&name={}", enc("https://stream.lazarus-xbt.xyz"), enc("Alpha films"))).body;
     assert!(media.contains("Big Buck Bunny") && media.contains(&format!("href=\"./play?item={}\"", enc(FILM))), "{media}");
     // any other service's page: its address for apps and agents, no player
     let files = br.get(&format!("/service?seller={}&name={}", enc("https://files.example"), enc("Zebra files"))).body;
@@ -970,7 +970,7 @@ fn browse_player_and_connections_follow_the_services_file_and_stop_through_the_s
     assert!(play.body.contains("CC BY 3.0") && play.body.contains("Stop and cut the connection"));
     assert!(play.body.contains("20 sat a MiB") && play.body.contains("<h1>Big Buck Bunny</h1>"));
     assert!(br.get("/play").body.contains("Choose something to play"));
-    assert!(br.get("/play?item=https://media.lazarus-xbt.xyz/missing").body.contains("not in your list of services"));
+    assert!(br.get("/play?item=https://stream.lazarus-xbt.xyz/missing").body.contains("not in your list of services"));
     let notes = br.get(&format!("/play?item={}", enc(NOTES))).body;
     assert!(!notes.contains("<video") && notes.contains("not something to play"));
 
@@ -1076,7 +1076,7 @@ fn the_ui_relays_the_players_video_from_the_connector_to_a_logged_in_owner() {
             let mut head = [0u8; 4096];
             let n = s.read(&mut head).unwrap_or(0);
             let asked = String::from_utf8_lossy(&head[..n]).to_string();
-            if asked.starts_with("GET /s/https://media.lazarus-xbt.xyz/v?static=true ") {
+            if asked.starts_with("GET /s/https://stream.lazarus-xbt.xyz/v?static=true ") {
                 let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
                 let _ = s.write_all(&body);
             } else {
@@ -1086,9 +1086,9 @@ fn the_ui_relays_the_players_video_from_the_connector_to_a_logged_in_owner() {
     });
     let b = start(json!({}), false, move |c| c.connector = connector);
     let mut anon = B::new(&b.base);
-    assert_eq!(anon.get("/s/https://media.lazarus-xbt.xyz/v?static=true").status, 401, "not logged in");
+    assert_eq!(anon.get("/s/https://stream.lazarus-xbt.xyz/v?static=true").status, 401, "not logged in");
     let br = logged_in(&b);
-    let resp = br.agent.get(&format!("{}/s/https://media.lazarus-xbt.xyz/v?static=true", b.base)).set("Cookie", &br.cookie).call().unwrap();
+    let resp = br.agent.get(&format!("{}/s/https://stream.lazarus-xbt.xyz/v?static=true", b.base)).set("Cookie", &br.cookie).call().unwrap();
     assert_eq!(resp.header("Content-Type"), Some("video/mp4"));
     let mut got = vec![];
     resp.into_reader().read_to_end(&mut got).unwrap();
@@ -1148,7 +1148,7 @@ fn the_relay_passes_range_and_a_players_link_plays_its_one_item_until_it_expires
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("services.json");
     std::fs::write(&path, format!(r#"[
-        {{"name": "Films", "kind": "video", "seller": "https://media.lazarus-xbt.xyz", "price_text": "20 sat a MiB",
+        {{"name": "Films", "kind": "video", "seller": "https://stream.lazarus-xbt.xyz", "price_text": "20 sat a MiB",
          "items": [{{"title": "Big Buck Bunny", "year": 2008, "url": "{FILM}", "credit": "CC BY 3.0"}}]}},
         {{"name": "Files", "kind": "files", "seller": "https://files.example", "price_text": "5 sat a file",
          "items": [{{"title": "notes", "year": 2020, "url": "{NOTES}", "credit": "CC0"}}]}}
@@ -1336,6 +1336,7 @@ fn the_sell_page_sets_up_several_services_and_says_what_each_one_needs() {
         c.gw.node_tls_cert = Some("/data/lightning/tls.cert".into());
         c.hash.slices = Some("http://127.0.0.1:9".into());
         c.hash.settings = dir.join("hashrate-settings.json");
+        c.nostr_relays = vec!["wss://relay.one.example".into(), "wss://relay.two.example".into()];
     });
     let mut br = logged_in(&bx);
     let page = br.get("/sell").body;
@@ -1392,6 +1393,10 @@ fn the_sell_page_sets_up_several_services_and_says_what_each_one_needs() {
     assert!(cfg.routes[1].methods.contains(&"POST".to_string()));
     let l = cfg.listing.unwrap();
     assert_eq!((l.name.as_str(), l.services.len(), l.services[0].kind.as_str(), l.services[1].kind.as_str()), ("Mike's box", 2, "video", "ai"));
+    // a new shop is published on Nostr, on the app's relays, with nothing written by hand
+    let n = cfg.nostr.as_ref().expect("a nostr section");
+    assert!(n.publish);
+    assert_eq!(n.relays, ["wss://relay.one.example", "wss://relay.two.example"]);
     assert_eq!(l.services[0].items[0].url, "https://seller.example/Videos/s/stream");
 
     let page = br.get("/sell").body;
@@ -1441,6 +1446,16 @@ fn the_sell_page_sets_up_several_services_and_says_what_each_one_needs() {
     assert_eq!(bx._app.refresh_shop_config(), Some("written"));
     assert!(listing().services.iter().any(|s| s.kind == "hashrate"));
     assert_eq!(bx._app.refresh_shop_config(), Some("unchanged"), "and only once");
+    // a relay named by hand is kept after the app's, and publishing written off stays off
+    let mut c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    c["nostr"] = json!({"relays": ["wss://relay.own.example", "wss://relay.two.example"], "publish": false});
+    std::fs::write(dir.join("config.json"), c.to_string()).unwrap();
+    let r = br.act("/sell", "/sell", &[("action", "shop"), ("name", "Mike's box"), ("public_url", "https://seller.example/")]);
+    assert_eq!(r.status, 303);
+    let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    let n = xbt_gateway::config::Config::from_json(&c).unwrap().nostr.unwrap();
+    assert!(!n.publish);
+    assert_eq!(n.relays, ["wss://relay.one.example", "wss://relay.two.example", "wss://relay.own.example"]);
 }
 
 #[test]
@@ -1982,7 +1997,7 @@ fn the_enrolment_code_the_box_gives_is_filled_in() {
     assert!(br.get("/setup").body.contains("Enrolment code<input"));
 }
 
-const FILM2: &str = "https://media.lazarus-xbt.xyz/Videos/0f0967c6719ebc0951976655686df3bc/stream?static=true";
+const FILM2: &str = "https://stream.lazarus-xbt.xyz/Videos/0f0967c6719ebc0951976655686df3bc/stream?static=true";
 
 /// The player never sits black: a wallet that cannot pay says so before anything is tried, with the
 /// next step, and a play that failed says why in plain words.
@@ -1991,7 +2006,7 @@ fn the_player_says_why_it_cannot_play_and_what_to_do() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("services.json");
-    std::fs::write(&path, format!(r#"[{{"name": "Films", "kind": "video", "seller": "https://media.lazarus-xbt.xyz", "price_text": "20 sat a MiB",
+    std::fs::write(&path, format!(r#"[{{"name": "Films", "kind": "video", "seller": "https://stream.lazarus-xbt.xyz", "price_text": "20 sat a MiB",
         "items": [{{"title": "Elephants Dream", "year": 2006, "url": "{FILM2}", "credit": "CC BY 2.5"}}]}}]"#)).unwrap();
     // no approval key: nothing can pay yet
     let b = start_on(Rig::new(json!({"human_pubkey": ""}), false), |c| c.services_file = Some(path.clone()));

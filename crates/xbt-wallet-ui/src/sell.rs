@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde_json::{json, Map, Value};
-use xbt_gateway::config::{Config as GatewayConfig, MAINNET_ACK, MAINNET_NOTICE};
+use xbt_gateway::config::{Config as GatewayConfig, MAINNET_ACK, MAINNET_NOTICE, MAX_NOSTR_RELAYS};
 use xbt_gateway::node::{checked_macaroon, INFO_OPS, INVOICE_OPS};
 
 use crate::setup::{decode_macaroon, pin_card, pin_cert, write_shared, GW_CONFIG, GW_INFO, GW_INVOICES, MAINNET_CAPS, TEST_CAPS};
@@ -571,6 +571,32 @@ impl App {
             c.insert("listing".into(), json!({"name": name, "updated": crate::html::utc(crate::now()).chars().take(10).collect::<String>(),
                                               "services": sections}));
         }
+        // the shop on Nostr, on the app's relays (first) and any the config already named, so a new
+        // install is found there too; publishing written off by hand stays off
+        let listed = c.contains_key("listing") && public_url.starts_with("https://");
+        let mut nostr = c.get("nostr").cloned().filter(Value::is_object);
+        if listed && !self.cfg.nostr_relays.is_empty() {
+            let mut n = nostr.unwrap_or(json!({}));
+            let mut relays = self.cfg.nostr_relays.clone();
+            for r in n["relays"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                if !relays.iter().any(|x| x == r) {
+                    relays.push(r.to_string());
+                }
+            }
+            relays.truncate(MAX_NOSTR_RELAYS);
+            n["relays"] = json!(relays);
+            if n.get("publish").is_none() {
+                n["publish"] = json!(true);
+            }
+            nostr = Some(n);
+        } else if let Some(n) = nostr.as_mut().filter(|_| !listed) {
+            // nothing to publish: the gateway refuses publish without a listing
+            n["publish"] = json!(false);
+        }
+        match nostr {
+            Some(n) => c.insert("nostr".into(), n),
+            None => c.remove("nostr"),
+        };
         let v = Value::Object(c);
         GatewayConfig::from_json(&v).map_err(|e| format!("These settings do not work together: {e}"))?;
         Ok(v)
