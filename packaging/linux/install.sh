@@ -118,7 +118,7 @@ LS_DATA_DIR=${LS_DATA_DIR:-$DIR/data}
 COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME:-lightning-stream}
 LS_UI_PORT=${LS_UI_PORT:-8482} LS_MCP_PORT=${LS_MCP_PORT:-33511} LS_CONNECTOR_PORT=${LS_CONNECTOR_PORT:-8484}
 LS_GW_PORT=${LS_GW_PORT:-8402} LS_HASHTAKER_CONTROL_PORT=${LS_HASHTAKER_CONTROL_PORT:-23343}
-LS_RELAYS=${LS_RELAYS:-wss://relay.damus.io,wss://nos.lol} LS_LAN_HOST=${LS_LAN_HOST:-}
+LS_RELAYS=${LS_RELAYS:-wss://relay.damus.io,wss://nos.lol,wss://relay.kilombino.com} LS_LAN_HOST=${LS_LAN_HOST:-}
 
 # --- 3. the files -------------------------------------------------------------------------------------
 say "writing $DIR/docker-compose.yml and $DIR/.env"

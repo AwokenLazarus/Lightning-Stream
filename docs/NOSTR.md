@@ -113,7 +113,11 @@ default): Browse has no Nostr page, and no relay is ever asked. When it is set, 
 asked only when the owner opens the Nostr page, for up to 200 listings each, with eight seconds per
 relay. The answer is kept for two minutes.
 
-No relay is set by default on either side. Which relays to use is the owner's choice.
+The programs set no relay by default on either side: which relays to use is the owner's choice. The
+packages choose for a new install, and the owner can change it: the Umbrel app and the Linux package
+use `wss://relay.damus.io`, `wss://nos.lol` and `wss://relay.kilombino.com` for what the wallet UI
+reads (`XBT_UI_NOSTR_RELAYS`) and for the hashmaker's and hashtaker's `--relays`; on Linux,
+`LS_RELAYS` in `.env` sets them all. The gateway's `nostr.relays` above is set in its own config. The StartOS packages don't use Nostr yet.
 
 ## Planned, not built: small messages over Nostr
 
