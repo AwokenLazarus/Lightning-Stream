@@ -1782,6 +1782,16 @@ seller answers a lock by offer with an error) the wallet pays by the seller's in
 and nothing was booked or sent. A refusal by the book's rules (a budget, a cap) is final: the
 invoice would meet the same rules.
 
+The invoice for an offer carries blinded paths, and their introduction node can be one the buyer's
+node has no route to: a buyer whose only channel goes straight to the seller's node cannot reach a
+path that enters through another node (lnd builds its paths from at least one real hop by default,
+`routing.blinding.min-num-real-hops`, which is the seller's node's setting, not the gateway's). Such
+a payment fails after its booking, with no route and nothing sent. The wallet then asks its node
+again: once it says the payment failed for good with no part in flight, and the book holds the row
+failed (booked back), the seller's ordinary invoice for the same ticket or win is paid, booked once
+(since 0.1.17). That hash can never be paid, so the win or ticket has one payment. A failure the
+payee gave (the details refused, say) is not tried again this way.
+
 **Limits.**
 
 - Run on Lightning Fork nodes in one regtest lab only (`scripts/ticket_e2e_regtest.sh offers`):

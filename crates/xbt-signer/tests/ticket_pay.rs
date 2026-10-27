@@ -520,6 +520,9 @@ struct PayState {
     late_fail: usize,
     /// The node takes no payment and answers no question about one (a connection that died as a
     /// payment was sent); everything else it still answers.
+    /// An offer's invoice whose blinded path this node cannot reach (its one channel goes straight to
+    /// the seller, the path enters elsewhere): its payments fail with this reason, nothing in flight.
+    offer_unroutable: Option<&'static str>,
     router_down: bool,
     /// How long a send takes to return: a payment's way through a hop.
     send_takes: Duration,
@@ -749,6 +752,14 @@ impl LnBackend for PayLn {
         let mut s = self.st.lock().unwrap();
         if s.down || s.router_down {
             return Err(node_err("LN node unreachable"));
+        }
+        if let Some(reason) = s.offer_unroutable {
+            s.next_index += 1;
+            let p = json!({"payment_hash": d.payment_hash_hex(), "payment_index": s.next_index.to_string(), "status": "FAILED", "value_msat": d.amount_msat.to_string(),
+                           "fee_msat": "0", "payment_preimage": "00".repeat(32), "payment_request": r.invoice, "creation_time_ns": (T0 * 1_000_000_000).to_string(),
+                           "failure_reason": reason, "htlcs": []});
+            s.payments.push(p.clone());
+            return Ok(p);
         }
         if !self.seller.pay_offer_invoice(&raw, d.amount_msat) {
             return Err(node_err("the invoice cannot be paid"));
@@ -3929,6 +3940,43 @@ fn a_payment_by_offer_is_held_to_the_owners_budgets() {
 
 /// Wins of the lottery are paid by the seller's offer, each with the note that names its draw:
 /// the seller counts each paid, and its BOLT 11 invoice is never paid.
+/// A buyer whose only channel goes straight to the seller cannot reach the offer's invoice when its
+/// blinded path enters through another node: the payment by offer fails with no route and nothing in
+/// flight, and the ticket, or the win, is paid by the seller's ordinary invoice, which that channel
+/// reaches. Once each. A payment the seller itself refused is not tried again by invoice.
+#[test]
+fn an_offer_whose_path_cannot_be_reached_is_paid_by_the_sellers_invoice_instead() {
+    let _g = env_lock();
+    // a prepaid ticket
+    let r = Rig::shipped(json!({}), 30, offer_shop());
+    r.ln.st.lock().unwrap().offer_unroutable = Some("FAILURE_REASON_NO_ROUTE");
+    let v = r.pay("/page/10", CALL);
+    assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{v}");
+    let passed = r.audit("ticket_offer_passed");
+    assert_eq!((passed.len(), passed[0]["rule"].as_str()), (1, Some("ln_route")), "{passed:?}");
+    assert_eq!(r.shop.standin.offer_counts().1, 0, "nothing reached the seller by the offer");
+    assert_eq!(r.ledger_sum(), SETTLED, "one ticket, paid once, by the invoice");
+    let failed: Vec<Value> = r.ln.state().payments.iter().filter(|p| p["status"] == "FAILED").cloned().collect();
+    assert_eq!(failed.len(), 1, "the offer's one try, failed for good");
+    // wins
+    let mut shop = draws_shop();
+    shop["offers"] = json!({"enabled": true});
+    let r = Rig::shipped(json!({}), 30, shop);
+    r.ln.st.lock().unwrap().offer_unroutable = Some("FAILURE_REASON_TIMEOUT");
+    let v = r.pay(&format!("/pieces/{}", 256 * PIECE), 1_000);
+    let wins = v["wins"].as_u64().unwrap();
+    assert!(wins >= 1 && v["wins_paid"].as_u64() == Some(wins), "every win paid: {v}");
+    assert_eq!(r.shop.settled() as u64, wins, "each win by its invoice, once");
+    assert_eq!(r.ln.paid_msat(), wins * WIN, "and nothing more");
+    // a payee that refused the payment: nothing to route around, the win is not paid again by invoice now
+    let mut shop = draws_shop();
+    shop["offers"] = json!({"enabled": true});
+    let r = Rig::shipped(json!({}), 30, shop);
+    r.ln.st.lock().unwrap().offer_unroutable = Some("FAILURE_REASON_INCORRECT_PAYMENT_DETAILS");
+    let v = r.pay(&format!("/pieces/{}", 64 * PIECE), 1_000);
+    assert!(r.audit("ticket_offer_passed").iter().all(|a| a["rule"] != "ln_route"), "{v}");
+}
+
 #[test]
 fn wins_are_paid_by_the_sellers_offer_and_each_once() {
     let _g = env_lock();

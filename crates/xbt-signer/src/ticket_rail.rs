@@ -24,7 +24,7 @@
 //! | At most 8 ticket payments are with the router at once. | [`Pace`]: every send of a ticket, held or prepaid, enters it. |
 //! | A prepaid ticket is spent when it is paid, and bought one at a time. | [`Signer::ticket_prepay`]: every rule of a release, the book row (`released`) and then the ledger row, both before the payment is sent; none while an earlier one of the session is not final. |
 //! | A win of the lottery is paid only for a draw the wallet worked out, once, as a prepaid ticket is paid. | [`Signer::lottery_pay_win`] takes a [`xbt402::lottery::Win`], which only the wallet's own check of a seller's reveal makes; [`Signer::ticket_book_prepay`] pays it only in the session it was drawn in, at that session's win size, and refuses a win that has a payment in the book that has not failed ([`crate::ticket::Book::win_payment`]). |
-//! | A prepaid ticket or a win paid by the seller's BOLT 12 offer is paid under every rule of one paid by invoice, and names the seller's session. | [`Signer::ticket_pay_by_offer`]: the offer and the fetched invoice are read and checked here (bit 512, the chain, the issuer, the exact amount, the wallet's own payer note repeated); every channel of the node must pass the guards, since `PayOffer` takes no set of outgoing channels; then the same book rows, ledger row and gate as [`Signer::ticket_pay_ordinary`]. Anything that fails before the booking leaves nothing booked and nothing sent, and the seller's invoice is paid instead. |
+//! | A prepaid ticket or a win paid by the seller's BOLT 12 offer is paid under every rule of one paid by invoice, and names the seller's session. | [`Signer::ticket_pay_by_offer`]: the offer and the fetched invoice are read and checked here (bit 512, the chain, the issuer, the exact amount, the wallet's own payer note repeated); every channel of the node must pass the guards, since `PayOffer` takes no set of outgoing channels; then the same book rows, ledger row and gate as [`Signer::ticket_pay_ordinary`]. Anything that fails before the booking leaves nothing booked and nothing sent, and the seller's invoice is paid instead; so does a payment the node found no route for (its blinded path entering where the node cannot reach), once the node says it failed for good with nothing in flight and the book holds it failed: that hash is never paid, and the invoice's is the one payment. |
 //! | An ordinary payment is on the channel until it settles, so it stays inside the gate until then. | [`Signer::ticket_pay_ordinary`] holds its place in [`Pace`] until the node shows the payment over. |
 //! | A win a seller's answer stands still for is not kept waiting behind wins no seller waits for. | [`Pace::hurry`], said by the session that found the win ([`crate::ticket_pay`]). It changes the order of payments the book allows anyway, and nothing else: which are paid, and how many at once, are as before. |
 //!
@@ -273,6 +273,12 @@ impl Drop for Queued<'_> {
 
 /// `v` with what the node wrote as a payment's `failure_reason`, if anything, under
 /// `untrusted_ln_data`: the wallet's own fields carry only [`ticket::failure_code`].
+/// A payment's failure that is about finding a way to the payee, as the node names it: no route, no
+/// path with the balance, or the search's time up. Not a payee that refused it.
+fn unroutable(reason: &str) -> bool {
+    matches!(reason, "FAILURE_REASON_NO_ROUTE" | "FAILURE_REASON_INSUFFICIENT_BALANCE" | "FAILURE_REASON_TIMEOUT")
+}
+
 fn node_failure(mut v: Value, pmt: Option<&Value>) -> Value {
     let raw = pmt.map(|p| str_or_empty(p.get("failure_reason"))).unwrap_or_default();
     if !raw.is_empty() {
@@ -1624,6 +1630,24 @@ impl Signer {
         // the invoice is paid, never the offer: paying the offer would fetch another invoice
         let req = OfferPayRequest { invoice: lni, fee_limit_msat: send.fee_limit_msat, timeout_s: send.timeout_s };
         let out = self.ticket_ordinary_sent(&*ln, &lp, sid, &dest, &hash, win, inside, &|| ln.pay_offer(&req));
+        // the offer's invoice could not be reached (its blinded path enters through a node this wallet has no route to,
+        // while a channel straight to the seller could pay the seller's own invoice): the seller's invoice is tried
+        // instead. Only when the node says the payment failed for good, with nothing of it in flight, and the book holds
+        // it failed: that hash can never be paid, so the invoice's own hash is the only payment for the ticket or win
+        let failed = if win.is_some() { "lottery_win_failed" } else { "ticket_prepay_failed" };
+        if out.get("rule").and_then(Value::as_str) == Some(failed) {
+            let pmt = ln.lookup(&hash).ok().flatten();
+            let reason = pmt.as_ref().map(|p| str_or_empty(p.get("failure_reason"))).unwrap_or_default();
+            let gone = pmt.as_ref().is_some_and(|p| str_or_empty(p.get("status")) == "FAILED" && !htlcs_in_flight(p));
+            let booked_failed = self.ticket_store().ok().and_then(|g| g.as_ref().and_then(|st| st.book.tickets.get(&hash).map(|t| t.state == TState::Failed)))
+                .unwrap_or(false);
+            if gone && booked_failed && unroutable(&reason) {
+                self.ticket_audit("ticket_offer_passed", json!({"session": sid, "dest": dest, "rule": "ln_route", "win": win.map(xbt402::lottery::Win::draw),
+                                                                "reason": format!("no route to the offer's invoice ({}): nothing was spent", crate::ticket::failure_code(&reason)),
+                                                                "payment_hash": hash, "then": "the seller's invoice"}));
+                return None;
+            }
+        }
         Some(with(out, json!({"by_offer": true, "offer_id": o.id_hex()})))
     }
 
