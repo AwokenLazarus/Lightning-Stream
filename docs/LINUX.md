@@ -119,9 +119,12 @@ network with a route to the shop you buy from. Without one, the first buy fails 
    20,000 to 50,000 sats is a good size for trying things out: a shop's ticket is about 1,000 sats.
 2. **Pick who to open it to:**
    - **A well-connected public node.** Any node with many channels works. Payments to a shop find their
-     way from there, because every invoice carries hints for the last hop.
-   - **Our test shop's node, directly.** It's reachable over Tor only for now, so your node needs Tor
-     (Lightning Fork on Umbrel has it on). Connect with `lncli connect <key>@<address>`, using:
+     way from there, because every invoice carries hints for the last hop. Some nodes take only larger
+     channels (100,000 sats or more): they refuse a smaller one before anything is paid, so a refusal
+     costs nothing. Try a larger channel there, or the shop's node below.
+   - **Our test shop's node, directly.** This is the one for a small channel. It's reachable over Tor
+     only for now, so your node needs Tor (Lightning Fork on Umbrel has it on). Connect with
+     `lncli connect <key>@<address>`, using:
      - key: `02c86d8dd97ac82338edece395f29369253894033464315c8d9e086a8cafe3a3b6`
      - address: `37g2spzl2oe4smllorb4wkl6n4nm2zcux5ozv5wzwpibxq63h2mayjid.onion:9735`
 3. **Wait for the channel to be active.** That takes a few confirmations, then a few minutes for the
