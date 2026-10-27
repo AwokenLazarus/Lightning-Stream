@@ -26,9 +26,16 @@ amounts only: the software is tested on mainnet with small amounts.
     ```
     python3 share/rpcauth/rpcauth.py lightning-stream
     ```
-    Run it in the Knots source or release folder; it prints an `rpcauth=lightning-stream:…` line and a
-    password. Add the line to the node's config file (`~/.bitcoin/bitcoin.conf` by default), restart
-    the node, and give `install.sh` the user `lightning-stream` and that password when it asks.
+    Run it in the Knots source folder, or the folder a Knots release download unpacks to (the script is
+    in its `share/rpcauth/`). It prints an `rpcauth=lightning-stream:…` line and a password; keep the
+    password. Add the line to the node's config file (`~/.bitcoin/bitcoin.conf` by default), restart the
+    node, and check that the login works:
+    ```
+    bitcoin-cli -rpcuser=lightning-stream -rpcpassword='THE PASSWORD' getblockcount
+    ```
+    It prints the node's block height. Then give `install.sh` the user `lightning-stream` and that
+    password when it asks. The app does not read the cookie file: the cookie is remade at every restart
+    of the node, and the app would lose its login each time.
 - **Your Lightning node (lnd-family, such as Lightning Fork)** on the same machine, unlocked, with its
   REST interface on (lnd's default is `https://127.0.0.1:8080`) and channels on the BLAKE2b Lightning
   network.
