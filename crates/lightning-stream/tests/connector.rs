@@ -77,7 +77,9 @@ fn start(sock: PathBuf, dir: &Path) -> String {
 
 fn get_with(addr: &str, target: &str, extra: &str) -> (u16, String, Vec<u8>) {
     let mut s = std::net::TcpStream::connect(addr).unwrap();
-    write!(s, "GET {target} HTTP/1.1\r\nHost: x\r\n{extra}Connection: close\r\n\r\n").unwrap();
+    // a Host header of its own in `extra` replaces the address
+    let host = if extra.to_ascii_lowercase().contains("host:") { String::new() } else { format!("Host: {addr}\r\n") };
+    write!(s, "GET {target} HTTP/1.1\r\n{host}{extra}Connection: close\r\n\r\n").unwrap();
     let mut all = vec![];
     s.read_to_end(&mut all).unwrap();
     let split = all.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
@@ -184,9 +186,31 @@ fn a_client_that_hangs_up_closes_the_signers_socket() {
     let (sock, wrote) = signer(dir.path(), vec![7u8; 40 << 20], None, None);
     let addr = start(sock, dir.path());
     let mut s = std::net::TcpStream::connect(&addr).unwrap();
-    write!(s, "GET /s/https://seller.example/big HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+    write!(s, "GET /s/https://seller.example/big HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").unwrap();
     let mut buf = vec![0u8; 256 << 10];
     s.read_exact(&mut buf).unwrap();
     drop(s);
     assert!(wrote.recv_timeout(Duration::from_secs(20)).unwrap().1, "the signer's writes failed once the client had gone");
+}
+
+/// A web page open in a browser on this machine reaches the connector on loopback: a `<video>`
+/// pointed at it, or a name made to resolve to 127.0.0.1. It must not have the owner pay for
+/// what it names. A player, which sends none of what a browser sends, still plays.
+#[test]
+fn a_web_page_cannot_have_the_connector_pay_and_a_player_still_can() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sock, calls) = signer(dir.path(), film(), None, None);
+    let addr = start(sock, dir.path());
+    let evil = "/s/https://evil.example/evil-video";
+    for extra in ["Sec-Fetch-Site: cross-site\r\nSec-Fetch-Mode: no-cors\r\nSec-Fetch-Dest: video\r\n", "Sec-Fetch-Dest: video\r\n",
+                  "Referer: https://evil.example/\r\n", "Origin: https://evil.example\r\n", "Host: evil.example\r\n",
+                  "Host: evil.example:8484\r\n"] {
+        let (status, head, _) = get_with(&addr, evil, extra);
+        assert_eq!(status, 403, "{extra:?}: {head}");
+    }
+    assert!(calls.recv_timeout(Duration::from_millis(300)).is_err(), "nothing was asked of the signer");
+    for host in ["localhost:8484", "[::1]:8484", "127.0.0.1"] {
+        assert_ne!(get_with(&addr, "/health", &format!("Host: {host}\r\n")).0, 403, "{host}");
+    }
+    assert_eq!(get(&addr, "/s/https://seller.example/Videos/1/stream?static=true").0, 200);
 }

@@ -419,14 +419,15 @@ pub fn pay_origins(service: &Service, item: &Item) -> Vec<String> {
     out
 }
 
-/// `connector` + `/s/` + the item URL. `connector` is `XBT_UI_CONNECTOR` (no trailing slash kept).
-pub fn player_src(connector: &str, item_url: &str) -> Result<String, String> {
+/// `./s/~<stream token>/` + the item URL ([`crate::app::stream_token`]), which the UI relays to
+/// `connector` (`XBT_UI_CONNECTOR`, no trailing slash kept).
+pub fn player_src(connector: &str, token: &str, item_url: &str) -> Result<String, String> {
     let base = connector.trim().trim_end_matches('/');
     http_url(base, "XBT_UI_CONNECTOR")?;
     http_url(item_url, "item url")?;
     // this page's own address: the UI relays it to the connector ([`crate::server`]), so a player on
     // another device of the network reaches it too (the connector itself listens on loopback only)
-    Ok(format!("./s/{item_url}"))
+    Ok(format!("./s/~{token}/{item_url}"))
 }
 
 /// Percent-encoding for a query value.
@@ -456,7 +457,7 @@ mod tests {
         assert!(v[0].items[1].credit.contains("CC BY 2.5"));
         assert!(v[0].items[0].credit.contains("CC BY 3.0") && v[0].items[2].credit.contains("CC BY 3.0"));
         assert_eq!(v[0].items[0].year, "2008");
-        assert!(player_src("http://127.0.0.1:8480", &v[0].items[0].url).unwrap().ends_with("/stream?static=true"));
+        assert!(player_src("http://127.0.0.1:8480", "t", &v[0].items[0].url).unwrap().ends_with("/stream?static=true"));
     }
 
     #[test]

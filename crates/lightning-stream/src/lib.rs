@@ -7,6 +7,14 @@
 //! `GET /s/<seller URL>`: the seller's answer, paid for as it streams.
 //! `GET /health`: whether the signer answers.
 //!
+//! **Not for web pages.** It listens on loopback, so a program elsewhere cannot reach it; but a web
+//! page open in a browser on the same machine can (a `<video>` pointed at `127.0.0.1`, or a host
+//! name made to resolve to it), and would have the owner pay for what it names. A request that
+//! carries what a browser sends with what a page asks for (`Sec-Fetch-*`, `Origin`, `Referer`), or
+//! whose `Host` is not a loopback address, is refused. A player, a download manager or the
+//! wallet's page (which relays its player's video from its own server) sends none of these. Pages
+//! play through the wallet's page, which pays only for its own player.
+//!
 //! **Seeking.** A client's `Range` header (one range, `bytes=N-` or `bytes=N-M`) goes to the signer
 //! as the call's `range`, and the signer sends it to the seller; a `Range` of any other form is
 //! ignored and the whole body is asked for, as HTTP lets a server do. Every answer says
@@ -183,6 +191,9 @@ impl Handler for Connector {
         if req.target == "/health" {
             return Reply::Whole(self.health());
         }
+        if let Some(why) = from_a_page(&req) {
+            return Reply::Whole(json_response(403, &json!({"error": why})));
+        }
         let Some(url) = req.target.strip_prefix("/s/") else {
             return Reply::Whole(json_response(404, &json!({"error": "ask for /s/<seller URL>"})));
         };
@@ -193,6 +204,21 @@ impl Handler for Connector {
         let range = req.header("Range").map(str::trim).filter(|r| one_range(r));
         self.stream(url, max_sats, range)
     }
+}
+
+/// Why `req` is refused as a web page's ([`crate`]'s "Not for web pages"); `None`: a program's.
+pub fn from_a_page(req: &Request) -> Option<&'static str> {
+    let has = |k: &str| req.headers.iter().any(|(n, _)| n.eq_ignore_ascii_case(k));
+    if req.headers.iter().any(|(n, _)| n.len() > 10 && n[..10].eq_ignore_ascii_case("sec-fetch-")) || has("Origin") || has("Referer") {
+        return Some("refused: a web page cannot have this connector pay; play through the wallet's page");
+    }
+    let host = req.header("Host").unwrap_or("").trim();
+    let name = match host.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => host.rsplit_once(':').map_or(host, |(h, _)| h),
+    };
+    let loopback = name.eq_ignore_ascii_case("localhost") || name.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    (!loopback).then_some("refused: a Host that is not this machine's loopback (a name made to resolve to it)")
 }
 
 /// Whether `r` is one byte range the signer takes: `bytes=N-` or `bytes=N-M`, N <= M.

@@ -130,12 +130,63 @@ pub fn security_headers(r: &mut Resp) {
 
 struct Ui(Arc<App>);
 
+/// The authority (`host[:port]`) of an `http(s)://` origin or URL; `None` for anything else,
+/// `"null"` included.
+fn authority(url: &str) -> Option<&str> {
+    let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
+    let a = rest.split(['/', '?', '#']).next().unwrap_or("");
+    (!a.is_empty()).then_some(a)
+}
+
+/// A request another page asked for: another origin of the same site (another app of the box, on
+/// another port of this host) or another site. The browser sends the wallet's cookie with the
+/// first, `SameSite=Strict` notwithstanding, so such a request could have the wallet stream, and
+/// pay for, what that page names, or act with the owner's session. Only the opening of the home
+/// page is answered; a page it names opens the home page instead, and anything else is refused.
+///
+/// Where the browser says (`Sec-Fetch-Site`), that is the answer. An older browser that does not is
+/// judged by `Origin`, then `Referer`, against `Host` (or `X-Forwarded-Host` behind a proxy): an
+/// action whose page is elsewhere is refused, and a page opened from elsewhere is the home page. A
+/// request that says nothing at all passes here: an action still needs the session's CSRF token,
+/// and a stream the session's stream token ([`App::stream_token`]), which no other page can read.
+fn foreign_refused(method: &str, target: &str, base: &str, headers: &[(String, String)]) -> Option<Resp> {
+    let h = |k: &str| headers.iter().find(|(n, _)| n.eq_ignore_ascii_case(k)).map(|(_, v)| v.trim()).unwrap_or("");
+    let read_only = matches!(method, "GET" | "HEAD");
+    let path = target.split('?').next().unwrap_or("");
+    let home = strip_base(path, base).is_some_and(|p| p.is_empty() || p == "/");
+    let home_url = format!("{}/", base.trim_end_matches('/'));
+    let (foreign, navigate) = match h("sec-fetch-site").to_ascii_lowercase().as_str() {
+        "same-origin" | "none" => return None,
+        "" => {
+            let own: Vec<&str> = [h("x-forwarded-host"), h("host")].into_iter().filter(|a| !a.is_empty()).collect();
+            let elsewhere = |v: &str| !v.is_empty() && authority(v).is_none_or(|a| !own.iter().any(|o| o.eq_ignore_ascii_case(a)));
+            // `null` is what the UI's own pages send under `Referrer-Policy: no-referrer`: no word, like none
+            let origin = Some(h("origin")).filter(|o| !o.is_empty() && !o.eq_ignore_ascii_case("null"));
+            let foreign = match origin { Some(o) => elsewhere(o), None => elsewhere(h("referer")) };
+            // an older browser does not say how it asks: a read is taken for the opening of a page
+            (foreign, read_only)
+        }
+        _ => (true, h("sec-fetch-mode").eq_ignore_ascii_case("navigate") && read_only),
+    };
+    if !foreign || (navigate && home) {
+        return None;
+    }
+    if navigate {
+        return Some(Resp::redirect(&home_url));
+    }
+    Some(Resp::text(403, "text/plain", "refused: a request from another page (another app of this box, or another site)"))
+}
+
 impl xbt_svc::http::Handler for Ui {
     fn body_limit(&self, _method: &str, _target: &str) -> usize {
         MAX_BODY
     }
 
     fn handle(&self, rq: xbt_svc::http::Request) -> xbt_svc::http::Response {
+        if let Some(mut r) = foreign_refused(&rq.method.to_uppercase(), &rq.target, &self.0.cfg.base_path, &rq.headers) {
+            security_headers(&mut r);
+            return xbt_svc::http::Response::new(r.status, r.headers, r.body);
+        }
         let peer = rq.peer.map(|a| a.ip().to_string()).unwrap_or_default();
         let (raw_path, q) = rq.target.split_once('?').unwrap_or((&rq.target, ""));
         let headers = rq.headers.iter().map(|(k, v)| (k.to_ascii_lowercase(), v.clone())).collect();
@@ -149,6 +200,10 @@ impl xbt_svc::http::Handler for Ui {
     /// page, or `GET /r/<token>` for an external player's link ([`crate::relay`]), relayed from the
     /// connector as it streams, with the player's `Range`. Everything else is [`Self::handle`].
     fn reply(&self, rq: xbt_svc::http::Request) -> xbt_svc::http::Reply {
+        if let Some(mut r) = foreign_refused(&rq.method.to_uppercase(), &rq.target, &self.0.cfg.base_path, &rq.headers) {
+            security_headers(&mut r);
+            return xbt_svc::http::Reply::Whole(xbt_svc::http::Response::new(r.status, r.headers, r.body));
+        }
         let peer = rq.peer.map(|a| a.ip().to_string()).unwrap_or_default();
         let (raw_path, q) = rq.target.split_once('?').unwrap_or((&rq.target, ""));
         let headers = rq.headers.iter().map(|(k, v)| (k.to_ascii_lowercase(), v.clone())).collect();
@@ -170,8 +225,11 @@ impl xbt_svc::http::Handler for Ui {
                 xbt_svc::http::Reply::Whole(xbt_svc::http::Response::new(resp.status, resp.headers, resp.body))
             }
             Some(Ok(item)) => {
-                // for /s/, the seller URL is everything after /s/, its own query included
-                let item = item.unwrap_or_else(|| rq.target.split_once("/s/").map(|(_, u)| u.to_string()).unwrap_or_default());
+                // for /s/~<stream token>/, the seller URL is everything after the token, its own query included
+                let item = item.unwrap_or_else(|| {
+                    let after = rq.target.split_once("/s/").map(|(_, u)| u).unwrap_or_default();
+                    after.strip_prefix('~').and_then(|t| t.split_once('/')).map(|(_, u)| u.to_string()).unwrap_or_default()
+                });
                 let url = format!("{}/s/{item}", self.0.cfg.connector.trim_end_matches('/'));
                 let app = self.0.clone();
                 relay(&url, req.headers.get("range").map(String::as_str), &move |code, body| app.note_play_error(&item, code, body))

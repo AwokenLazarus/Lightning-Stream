@@ -993,10 +993,13 @@ fn browse_player_and_connections_follow_the_services_file_and_stop_through_the_s
     assert!(old_link.contains("Alpha films") && !old_link.contains("Zebra files"), "a kind names its category");
     assert!(br.get("/browse?cat=ai").body.contains("No services in this category yet"));
 
-    let play = br.get(&format!("/play?item={}", enc(FILM)));
+    let play = br.send("GET", &format!("/play?item={}", enc(FILM)), None, &[("Sec-Fetch-Site", "same-origin")]);
     assert!(play.body.contains("aria-current=\"page\">Services"));
-    assert!(play.body.contains(&format!("src=\"./s/{FILM}\"")));
+    let token = xbt_wallet_ui::app::stream_token(&field(&play.body, "csrf"));
+    assert!(play.body.contains(&format!("src=\"./s/~{token}/{FILM}\"")), "the video carries the session's stream token");
     assert!(play.body.contains("<video controls autoplay"));
+    // opened by a browser that does not say from where: it waits for Play
+    assert!(!br.get(&format!("/play?item={}", enc(FILM))).body.contains("autoplay"));
     assert!(play.body.contains("CC BY 3.0") && play.body.contains("Stop and cut the connection"));
     assert!(play.body.contains("20 sat a MiB") && play.body.contains("<h1>Big Buck Bunny</h1>"));
     assert!(br.get("/play").body.contains("Choose something to play"));
@@ -1118,11 +1121,66 @@ fn the_ui_relays_the_players_video_from_the_connector_to_a_logged_in_owner() {
     let mut anon = B::new(&b.base);
     assert_eq!(anon.get("/s/https://stream.lazarus-xbt.xyz/v?static=true").status, 401, "not logged in");
     let br = logged_in(&b);
-    let resp = br.agent.get(&format!("{}/s/https://stream.lazarus-xbt.xyz/v?static=true", b.base)).set("Cookie", &br.cookie).call().unwrap();
+    let mut br = br;
+    let token = xbt_wallet_ui::app::stream_token(&field(&br.get("/browse").body, "csrf"));
+    let resp = br.agent.get(&format!("{}/s/~{token}/https://stream.lazarus-xbt.xyz/v?static=true", b.base)).set("Cookie", &br.cookie).call().unwrap();
     assert_eq!(resp.header("Content-Type"), Some("video/mp4"));
     let mut got = vec![];
     resp.into_reader().read_to_end(&mut got).unwrap();
     assert_eq!(got, film);
+}
+
+/// A page on another port of this host (another app of the box) is of the same site: the browser
+/// sends the wallet's cookie with what it asks, `SameSite=Strict` notwithstanding. It must not be
+/// able to have the wallet stream, and pay for, what it names, nor act with the owner's session:
+/// not in a browser that says where a request comes from (`Sec-Fetch-Site`), and not in an older
+/// one that does not.
+#[test]
+fn a_page_on_another_port_of_the_box_cannot_make_the_wallet_pay_or_act() {
+    use std::io::{Read, Write};
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    // a connector that serves whatever it is asked for, and notes what that was
+    let asked: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let connector = format!("http://{}", l.local_addr().unwrap());
+    let seen = asked.clone();
+    std::thread::spawn(move || {
+        for mut s in l.incoming().flatten() {
+            let mut head = [0u8; 4096];
+            let n = s.read(&mut head).unwrap_or(0);
+            let line = String::from_utf8_lossy(&head[..n]).lines().next().unwrap_or("").to_string();
+            seen.lock().unwrap().push(line);
+            let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: 4\r\nConnection: close\r\n\r\nfilm");
+        }
+    });
+    let b = start(json!({}), false, move |c| c.connector = connector);
+    let mut br = logged_in(&b);
+    let evil = "/s/https://evil.example/evil-film";
+    // a <video> on another port, in a browser that says so
+    let video = [("Sec-Fetch-Site", "same-site"), ("Sec-Fetch-Mode", "no-cors"), ("Sec-Fetch-Dest", "video")];
+    assert_eq!(br.send("GET", evil, None, &video).status, 403, "a stream asked by another page");
+    // the same in an older browser, which sends the cookie and says nothing else
+    let r = br.send("GET", evil, None, &[]);
+    assert!(r.status == 403 || r.status == 404, "a stream named by a page that cannot know this session's stream token: {}", r.status);
+    assert!(asked.lock().unwrap().is_empty(), "nothing reached the connector: {:?}", asked.lock().unwrap());
+    // an action with the right token even, from another page: by Sec-Fetch-Site, and by Origin in an older browser
+    let csrf = field(&br.get("/browse").body, "csrf");
+    let form = format!("csrf={}", enc(&csrf));
+    assert_eq!(br.send("POST", "/logout", Some(&form), &[("Sec-Fetch-Site", "same-site")]).status, 403);
+    assert_eq!(br.send("POST", "/logout", Some(&form), &[("Origin", "http://127.0.0.1:9")]).status, 403, "an older browser's Origin");
+    assert_eq!(br.send("POST", "/logout", Some(&form), &[("Referer", "http://127.0.0.1:9/x")]).status, 403, "and its Referer, with no Origin");
+    // a page another page opens is the home page, never the page it named
+    let nav = [("Sec-Fetch-Site", "same-site"), ("Sec-Fetch-Mode", "navigate"), ("Sec-Fetch-Dest", "document")];
+    let r = br.send("GET", "/play?item=https://evil.example/evil-film", None, &nav);
+    assert_eq!((r.status, r.location()), (303, "/"));
+    let r = br.send("GET", "/play?item=x", None, &[("Referer", "http://127.0.0.1:9/x")]);
+    assert_eq!((r.status, r.location()), (303, "/"), "an older browser opened from another page");
+    assert_eq!(br.send("GET", "/", None, &nav).status, 200, "the box's dashboard opens the app");
+    // the wallet's own pages, as before
+    assert_eq!(br.send("GET", "/browse", None, &[("Sec-Fetch-Site", "same-origin")]).status, 200);
+    let own = b.base.clone();
+    assert_eq!(br.send("GET", "/browse", None, &[("Referer", &format!("{own}/"))]).status, 200);
+    assert_eq!(br.send("POST", "/logout", Some(&form), &[("Sec-Fetch-Site", "same-origin"), ("Origin", &own)]).status, 303);
 }
 
 /// Each request a connector got: its path and its `Range`.
@@ -1213,14 +1271,15 @@ fn the_relay_passes_range_and_a_players_link_plays_its_one_item_until_it_expires
     };
 
     // the page's player seeks: the Range goes to the connector, the 206 comes back with its headers
-    let (status, h, body) = get_range(&format!("{}/s/{FILM}", b.base), Some(&br.cookie), Some("bytes=1000-"));
+    let st = xbt_wallet_ui::app::stream_token(&field(&br.get("/browse").body, "csrf"));
+    let (status, h, body) = get_range(&format!("{}/s/~{st}/{FILM}", b.base), Some(&br.cookie), Some("bytes=1000-"));
     assert_eq!(status, 206);
     assert_eq!((h.get("content-range").map(String::as_str), h.get("accept-ranges").map(String::as_str), h.get("content-type").map(String::as_str)),
                (Some(format!("bytes 1000-{}/{}", film.len() - 1, film.len()).as_str()), Some("bytes"), Some("video/mp4")));
     assert_eq!(h.get("content-length").map(String::as_str), Some((film.len() - 1000).to_string().as_str()));
     assert_eq!(body, film[1000..]);
     assert_eq!(seen.lock().unwrap().last().unwrap(), &(format!("/s/{FILM}"), Some("bytes=1000-".to_string())));
-    let (status, _, body) = get_range(&format!("{}/s/{FILM}", b.base), Some(&br.cookie), None);
+    let (status, _, body) = get_range(&format!("{}/s/~{st}/{FILM}", b.base), Some(&br.cookie), None);
     assert_eq!((status, body.len()), (200, film.len()));
     assert_eq!(seen.lock().unwrap().last().unwrap().1, None, "no Range where the player sent none");
 
@@ -1648,7 +1707,7 @@ fn browse_nostr_lists_checked_listings_unvetted_and_the_seller_confirms_its_own(
     // a film found on Nostr plays as one of the services file does
     let film = format!("{origin}/v/sintel");
     assert!(page.body.contains(&format!("href=\"./play?item={}\"", enc(&film))));
-    assert!(br.get(&format!("/play?item={}", enc(&film))).body.contains(&format!("src=\"./s/{film}\"")));
+    assert!(br.get(&format!("/play?item={}", enc(&film))).body.contains(&format!("/{film}\"")));
 
     let event_of = |name: &str| {
         let rest = &page.body[page.body.find(name).unwrap()..];

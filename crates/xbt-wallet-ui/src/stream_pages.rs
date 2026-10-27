@@ -82,7 +82,10 @@ impl App {
                             format!("<div class=\"flash warn\">{} <a href=\"{href}\">{link}</a></div>", esc(&w))
                         })
                             .unwrap_or_default();
-                        format!("{warn}{}{}", player_html(ctx, &self.cfg.connector, service, item),
+                        // opened from the wallet's own page, or by the owner: a page opened from elsewhere is the home page
+                        // ([`crate::server`]), and one whose browser says nothing of where it came from waits for Play
+                        let autoplay = matches!(req.header("sec-fetch-site"), "same-origin" | "none") || !req.header("referer").is_empty();
+                        format!("{warn}{}{}", player_html(ctx, &self.cfg.connector, service, item, autoplay),
                                 if service.kind == Kind::Video { links_html(ctx, &self.link_base(req), &item.url, &links) } else { String::new() })
                     }
                 }
@@ -368,24 +371,27 @@ fn service_html(s: &Service, own: bool) -> String {
     b
 }
 
-fn player_html(ctx: &Ctx, connector: &str, service: &Service, item: &services::Item) -> String {
+/// `autoplay`: the page was opened from the wallet's own page or by the owner (a typed address, a
+/// bookmark), so the video starts by itself; otherwise it waits for the owner's Play.
+fn player_html(ctx: &Ctx, connector: &str, service: &Service, item: &services::Item, autoplay: bool) -> String {
     if service.kind != Kind::Video {
         return format!("<p>{} is not something to play. Its service's page says how to use it: <a href=\"{}\">{}</a>.</p>",
                        esc(&item.title), service_href(service), esc(&service.name));
     }
-    let src = match services::player_src(connector, &item.url) {
+    let src = match services::player_src(connector, &crate::app::stream_token(&ctx.csrf), &item.url) {
         Ok(s) => s,
         Err(e) => return format!("{}<p><a href=\"./browse\">Back to Browse</a></p>", App::error_box(&e)),
     };
     format!("<p class=\"small\"><a href=\"{}\">← {}</a> · {} · <span class=\"price\">{}</span></p>\
-             <div class=\"player\" data-player data-item=\"{}\"><video controls autoplay src=\"{}\"></video>\
+             <div class=\"player\" data-player data-item=\"{}\"><video controls{} src=\"{}\"></video>\
              <p class=\"player-msg\" role=\"status\" aria-live=\"polite\" hidden></p></div>\
              <p class=\"small\">{}</p>\
              <form method=\"post\" action=\"./play\" data-stop-player>\
              {}<input type=\"hidden\" name=\"item\" value=\"{}\">\
              <button class=\"danger\" type=\"submit\">Stop and cut the connection</button></form>\
              <p class=\"hint\">You pay as it plays. Stopping ends the payments at once; <a href=\"./connections\">Live connections</a> shows what is open.</p>",
-            service_href(service), esc(&service.name), esc(&item.year), esc(&service.price_text), esc(&item.url), esc(&src), esc(&item.credit),
+            service_href(service), esc(&service.name), esc(&item.year), esc(&service.price_text), esc(&item.url),
+            if autoplay { " autoplay" } else { "" }, esc(&src), esc(&item.credit),
             App::csrf_input(ctx), esc(&item.url))
 }
 
@@ -667,8 +673,10 @@ mod tests {
                                 url: "https://stream.lazarus-xbt.xyz/v?static=true&x=1".into(), credit: "CC <BY>".into() }],
                             address: String::new() };
         let ctx = Ctx { sid: "s".into(), csrf: "tok&1".into(), flash: None };
-        let html = player_html(&ctx, "http://127.0.0.1:8480/", &svc, &svc.items[0]);
-        assert!(html.contains("src=\"./s/https://stream.lazarus-xbt.xyz/v?static=true&amp;x=1\""));
+        let html = player_html(&ctx, "http://127.0.0.1:8480/", &svc, &svc.items[0], true);
+        let token = crate::app::stream_token("tok&1");
+        assert!(html.contains(&format!("src=\"./s/~{token}/https://stream.lazarus-xbt.xyz/v?static=true&amp;x=1\"")) && html.contains(" autoplay "), "{html}");
+        assert!(!player_html(&ctx, "http://127.0.0.1:8480/", &svc, &svc.items[0], false).contains("autoplay"));
         assert!(html.contains("Stop and cut the connection"));
         assert!(html.contains("value=\"tok&amp;1\""));
         // the item's title is the page's heading (escaped by the layout); the credit is in the body

@@ -99,6 +99,14 @@ const INT_KEYS: [(&str, &str, &str); 12] = [
 /// coins older than this exists on both chains, and the rail refuses it.
 pub const MAINNET_SPLIT_HEIGHT: i64 = 961_640;
 
+/// The stream token of a login session whose CSRF token is `csrf`: the player's video URL carries
+/// it (`./s/~<token>/<seller URL>`), and the relay plays nothing without it. Derived, so the URL
+/// (which may be logged) never carries the CSRF token itself.
+pub fn stream_token(csrf: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(&Sha256::digest(format!("xbt-wallet-ui/stream|{csrf}").as_bytes())[..16])
+}
+
 /// The least `ln.exposure_cap_sats` the starter rules set on mainnet.
 pub const STARTER_EXPOSURE_CAP_SATS: i64 = 100_000;
 
@@ -242,8 +250,14 @@ impl App {
             });
         }
         let sid = req.cookie(COOKIE).unwrap_or_default();
-        if self.auth.with_session(&sid, |_| ()).is_none() {
+        let Some(csrf) = self.auth.with_session(&sid, |s| s.csrf.clone()) else {
             return Some(Err(Resp::text(401, "text/plain", "login required")));
+        };
+        // the session's stream token: only a page of the wallet's own knows it (another page of the box sends
+        // the cookie with a <video> it makes, but cannot read the token), so only the wallet's player pays
+        let token = path.strip_prefix("/s/~").and_then(|t| t.split_once('/')).map(|(t, _)| t).unwrap_or("");
+        if !crate::ct_eq(token.as_bytes(), stream_token(&csrf).as_bytes()) {
+            return Some(Err(Resp::text(403, "text/plain", "refused: a stream this page did not ask for")));
         }
         Some(Ok(None))
     }
