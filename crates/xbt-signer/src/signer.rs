@@ -341,7 +341,16 @@ impl Signer {
             }
             return Ok(());
         }
-        let chk = match anchor.check() {
+        // the witness may still be starting beside the signer (both start together): its socket is waited for a
+        // moment (B2_ANCHOR_WAIT_S, 30 s) before a required witness that does not answer stops the start
+        let wait = std::env::var("B2_ANCHOR_WAIT_S").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(30);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(wait);
+        let mut first = anchor.check();
+        while config.anchor_required && first.as_ref().is_err_and(|e| e.msg.contains("unreachable")) && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            first = anchor.check();
+        }
+        let chk = match first {
             Ok(c) => c,
             Err(e) => {
                 if config.anchor_required {

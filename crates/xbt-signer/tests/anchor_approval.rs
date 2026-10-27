@@ -51,7 +51,27 @@ fn anchor_required_needs_a_witness_and_without_one_anchoring_is_off() {
     let root = root_with(d.path(), &runbook_policy(json!({"anchor_required": true})));
     assert!(signer(&root, &chain, None).unwrap_err().msg.contains("anchor_required"));
     std::env::set_var("B2_ANCHOR_SOCK", d.path().join("nobody.sock"));
+    // a witness that does not come up is waited for a moment (B2_ANCHOR_WAIT_S), then the start stops
+    std::env::set_var("B2_ANCHOR_WAIT_S", "1");
+    let t0 = std::time::Instant::now();
     assert!(signer(&root, &chain, None).unwrap_err().msg.contains("anchor witness unreachable"));
+    assert!(t0.elapsed() >= std::time::Duration::from_secs(1));
+    // one that comes up within the wait (the two start together) lets the signer start
+    std::env::set_var("B2_ANCHOR_WAIT_S", "20");
+    let at = d.path().join("late");
+    let sock = at.join("w.sock");
+    let late = {
+        let (at, sock) = (at.clone(), sock.clone());
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            xbt_signer::anchor::serve_witness(&at, &sock, 0o600).unwrap()
+        })
+    };
+    std::env::set_var("B2_ANCHOR_SOCK", &sock);
+    let started = signer(&root, &chain, None);
+    let _w = late.join().unwrap();
+    assert!(started.is_ok(), "{:?}", started.err().map(|e| e.msg));
+    std::env::remove_var("B2_ANCHOR_WAIT_S");
     std::env::remove_var("B2_ANCHOR_SOCK");
     let d2 = tempfile::tempdir().unwrap();
     let root2 = root_with(d2.path(), &runbook_policy(json!({})));
