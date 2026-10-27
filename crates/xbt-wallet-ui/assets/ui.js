@@ -416,6 +416,34 @@
     if (forget) forget.addEventListener("click", function () { dropKey(); dropKey(PENDING); say($("#keygen-msg"), "Removed from this browser."); });
   }
 
+  // A seller's own app: its frame opens on the app port (another origin than this page), with the
+  // one-time code the port trades for its cookie; what the visit has spent is asked every 2 s, and the
+  // frame is closed when the visit ends (stopped, or its limit reached).
+  $$(".app-visit[data-visit]").forEach(function (box) {
+    var frame = $("iframe.seller-app", box), spent = $("[data-visit-spent]", box), state = $("[data-visit-state]", box), note = $("[data-visit-note]", box);
+    var visit = box.getAttribute("data-visit"), port = box.getAttribute("data-port"), code = box.getAttribute("data-code");
+    if (!frame || !/^[0-9a-f]+$/.test(visit || "") || !/^[0-9]+$/.test(port || "") || !/^[0-9a-f]+$/.test(code || "")) return;
+    frame.src = location.protocol + "//" + location.hostname + ":" + port + "/__ls/enter?c=" + code;
+    box.removeAttribute("data-code");
+    var timer = null;
+    function ended(words) {
+      if (timer) clearInterval(timer);
+      timer = null;
+      if (state) { state.textContent = "Ended"; state.className = "pill warn"; }
+      if (note) note.textContent = words + " Open the app again from its service's page to go on.";
+      frame.removeAttribute("src");
+      frame.hidden = true;
+    }
+    function ask() {
+      fetch("./api/visit?v=" + visit, { credentials: "same-origin" }).then(function (r) { return r.json(); }).then(function (v) {
+        if (spent && typeof v.spent_sats === "number") spent.textContent = v.spent_sats.toLocaleString();
+        if (v.ended) ended(String(v.ended));
+      }).catch(function () {});
+    }
+    timer = setInterval(ask, 2000);
+    ask();
+  });
+
   // The player never sits black: a short message while the first part is paid for and the seller
   // answers, and, when the play fails, why in plain words with the next step (the UI keeps the
   // connector's reason: ./api/play-error).

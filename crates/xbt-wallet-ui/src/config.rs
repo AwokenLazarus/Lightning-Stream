@@ -33,6 +33,7 @@
 //! | `XBT_UI_NOSTR_RELAYS` | | Nostr relays to read sellers' signed listings from (`wss://`, comma-separated), for Browse's Nostr page. Unset: no relay is ever asked |
 //! | `XBT_UI_NWC_SOCK` | | the NWC wallet service's admin socket (`xbt-nwc`'s `NWC_ADMIN_SOCK`): the Connected apps page makes, lists and revokes NWC connections there |
 //! | `XBT_UI_CONNECTOR` | `http://127.0.0.1:8480` | the connector the player loads video from (`<connector>/s/<item URL>`). That is also the connector's default listen address, and the UI's own default bind: on one machine set one of the two ports. |
+//! | `XBT_UI_APP_PORTS` | | ports (comma-separated) a seller's own web page is served on, one origin each, when the owner opens it inside the app (docs/SELLER-APPS.md); empty: off. The browser must reach them on the same host as this page |
 //! | `XBT_UI_PLATFORM_LOGIN` | | the host name of the platform's own login proxy (Umbrel: `<app id>_app_proxy_1`). A request from that peer is the owner's, already logged in by the platform: no app password is asked. Every other peer still needs the password. Set it only where no other app can take that name on the network: umbrelOS 2.0 runs no app-proxy container, so the Umbrel package leaves it unset |
 //! | `XBT_UI_ENROLL_CODE_FILE` | | the signer's one-time enrolment code, where the signer writes a copy for the UI (`B2_ENROLL_CODE_COPY`): the setup page fills it in, so the owner reads no log |
 //! | `XBT_UI_RESTART_HINT` | restart Lightning Stream from your Umbrel or StartOS dashboard | how the owner restarts the app on this platform, said where a signed change waits for a restart |
@@ -81,6 +82,8 @@ pub struct Config {
     pub sell: bool,
     /// `XBT_UI_CONNECTOR`: base URL of the connector, no trailing slash required.
     pub connector: String,
+    /// The ports sellers' own web pages are served on, one origin each (`XBT_UI_APP_PORTS`).
+    pub app_ports: Vec<u16>,
     /// `XBT_UI_RELAY_LINK_S`: how long a link for an external player lives.
     pub relay_ttl: Duration,
     /// `XBT_UI_NWC_SOCK`: the NWC wallet service's admin socket, when the box runs it.
@@ -256,6 +259,8 @@ impl Config {
             services_file: env("XBT_UI_SERVICES").map(PathBuf::from),
             sell: env("XBT_UI_SELL").as_deref() == Some("1"),
             connector: env("XBT_UI_CONNECTOR").unwrap_or_else(|| "http://127.0.0.1:8480".into()),
+            app_ports: env("XBT_UI_APP_PORTS").map(|v| v.split(',').filter_map(|p| p.trim().parse::<u16>().ok()).filter(|p| *p > 0).take(16).collect())
+                .unwrap_or_default(),
             relay_ttl: Duration::from_secs(secs("XBT_UI_RELAY_LINK_S", 6 * 3600).clamp(60, 7 * 86_400)),
             nwc_sock: env("XBT_UI_NWC_SOCK").map(PathBuf::from),
             nostr_relays: nostr_relays(env("XBT_UI_NOSTR_RELAYS").as_deref())?,
@@ -292,7 +297,7 @@ impl Config {
                session_max: Duration::from_secs(28_800), secure_cookie: None, allow_ips: vec![], allowed_hosts: vec![], setup_open: false, cmp_url: None,
                cmp_status_url: None, mcp_urls: vec![], mcp_token_file: PathBuf::from("/nonexistent/mcp-http-token"), threads: 4, role: Role::Wallet,
                ln: LnSetup::default(), gw: GatewaySetup { state_dir: "/data/gateway".into(), port: 8402, ..Default::default() },
-               services_file: None, sell: false, connector: "http://127.0.0.1:8480".into(), relay_ttl: Duration::from_secs(6 * 3600),
+               services_file: None, sell: false, connector: "http://127.0.0.1:8480".into(), app_ports: vec![], relay_ttl: Duration::from_secs(6 * 3600),
                nwc_sock: None, nostr_relays: vec![], suggested_sellers: vec![], platform_login: None, enroll_code_file: None,
                restart_hint: RESTART_HINT.into(), local_services: vec![],
                hash: HashSetup { settings: PathBuf::from("/nonexistent/hashrate/settings.json"), datum_guide: DATUM_GUIDE.into(), ..Default::default() } }

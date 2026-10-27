@@ -298,6 +298,7 @@ fn browse_html(all: &[Service], cat: &str, sort: Sort, suggested: &str, own: &dy
             Kind::Hashrate => "Rent miners by the piece of work".into(),
         };
         let mine = own(&s.seller);
+        let what = if s.app.is_empty() { what } else { format!("{what} · has its own app") };
         b.push_str(&format!("<a class=\"card service-card\" href=\"{}\"><span class=\"pill cat-{}\">{}</span>{}<h2>{}</h2>\
                              <p class=\"price\">{}</p><p class=\"small\">{} · {}</p></a>",
                             service_href(s), s.kind.category(), esc(s.kind.category_words()),
@@ -308,7 +309,7 @@ fn browse_html(all: &[Service], cat: &str, sort: Sort, suggested: &str, own: &dy
     b
 }
 
-fn host(url: &str) -> String {
+pub(crate) fn host(url: &str) -> String {
     services::http_origin(url).unwrap_or_else(|| url.to_string()).trim_start_matches("https://").trim_start_matches("http://").to_string()
 }
 
@@ -330,6 +331,18 @@ fn service_html(s: &Service, own: bool) -> String {
     if own {
         b.push_str("<section class=\"status ok\"><p class=\"status-head\">This is your shop</p><p>Buyers pay for this. You can preview it \
             here for free: it plays straight from your service on this box, and nothing is paid.</p></section>");
+    }
+    if !s.app.is_empty() {
+        let seller = host(&s.seller);
+        b.push_str(&if own {
+            "<section class=\"card\"><h2>Its own app</h2><p>Buyers can open this service's own web page inside their app, \
+             and pay your price for what it loads.</p></section>".to_string()
+        } else {
+            format!("<section class=\"card primary\"><h2>Its own app</h2><p>Use {}'s own page for this service, inside Lightning Stream. \
+                What it loads is paid at the price above, up to a limit you set.</p>\
+                <div class=\"row\"><a class=\"button-link primary\" href=\"./app?u={}&amp;b={}\">Open {}'s app</a></div></section>",
+                esc(&seller), services::urlenc(&s.app), services::urlenc(&s.app_base), esc(&seller))
+        });
     }
     let play = if own { "Preview (free)" } else { "Play" };
     match s.kind {
@@ -718,7 +731,7 @@ mod tests {
                             price_text: "20 sat a MiB".into(),
                             items: vec![services::Item { title: "<b>".into(), year: "2008".into(),
                                 url: "https://stream.lazarus-xbt.xyz/v?static=true&x=1".into(), credit: "CC <BY>".into() }],
-                            address: String::new() };
+                            address: String::new(), app: String::new(), app_base: String::new() };
         let ctx = Ctx { sid: "s".into(), csrf: "tok&1".into(), flash: None };
         let html = player_html(&ctx, "http://127.0.0.1:8480/", &svc, &svc.items[0], true);
         let token = crate::app::stream_token("tok&1");

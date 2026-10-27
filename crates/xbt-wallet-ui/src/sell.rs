@@ -164,6 +164,71 @@ pub struct Offer {
     pub strip: bool,
     /// What buyers can pick, as `(title, link)`.
     pub titles: Vec<(String, String)>,
+    /// Buyers may open the service's own web page inside their app (docs/SELLER-APPS.md).
+    pub app: Option<OfferApp>,
+}
+
+/// A service's own web page, sold to buyers who open it inside their app.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfferApp {
+    /// What the page sees as `/`: a path ending in `/`. Requests under it go to the service.
+    pub base: String,
+    /// Where it opens, under `base`.
+    pub entry: String,
+    /// A header the shop adds to every request of the page (`Name: value`): the seller's guest
+    /// login, for a service that needs one. Empty: none.
+    pub login: String,
+}
+
+/// Request headers a web app needs passed to its service: its cookies, its login and its
+/// requests' own marks. The gateway passes no other beyond the always-forwarded ones.
+const APP_HEADERS: [&str; 7] = ["cookie", "authorization", "x-emby-authorization", "x-mediabrowser-token", "x-requested-with", "x-csrf-token", "x-api-key"];
+
+/// A login header written `Name: value`, as the gateway's `upstream_headers` takes it.
+fn login_header(s: &str) -> Result<Option<(String, String)>, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(None);
+    }
+    let (k, v) = s.split_once(':').ok_or("Write the login header as Name: value, like Authorization: MediaBrowser Token=…")?;
+    let (k, v) = (k.trim(), v.trim());
+    if k.is_empty() || !k.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-') || v.is_empty() || v.len() > 4096
+        || !v.bytes().all(|b| b.is_ascii_graphic() || b == b' ') {
+        return Err("Write the login header as Name: value, in plain characters.".into());
+    }
+    if ["host", "cookie", "content-length", "connection", "transfer-encoding", "upgrade"].contains(&k.to_ascii_lowercase().as_str()) || k.to_ascii_lowercase().starts_with("payment-") {
+        return Err(format!("{k} cannot be the login header."));
+    }
+    Ok(Some((k.to_string(), v.to_string())))
+}
+
+/// A route's settings for a web app: the methods and headers a page uses, a body it may send, and
+/// the service's own compressed pages. A route that is not an app's loses them.
+fn app_route(m: &mut Map<String, Value>, app: Option<&OfferApp>) {
+    let Some(app) = app else {
+        m.remove("accept_gzip");
+        m.remove("upstream_headers");
+        return;
+    };
+    m.insert("methods".into(), json!(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]));
+    let body = m.get("max_body").and_then(Value::as_u64).unwrap_or(0).max(MIB);
+    m.insert("max_body".into(), json!(body));
+    let mut fw: Vec<String> = m.get("forward_headers").and_then(Value::as_array).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
+    for h in APP_HEADERS {
+        if !fw.iter().any(|x| x.eq_ignore_ascii_case(h)) {
+            fw.push(h.to_string());
+        }
+    }
+    m.insert("forward_headers".into(), json!(fw));
+    m.insert("accept_gzip".into(), json!(true));
+    match login_header(&app.login).ok().flatten() {
+        Some((k, v)) => {
+            m.insert("upstream_headers".into(), json!({k: v}));
+        }
+        None => {
+            m.remove("upstream_headers");
+        }
+    }
 }
 
 impl Offer {
@@ -240,9 +305,13 @@ fn check_address(a: &str, kind: Kind) -> Result<String, String> {
 }
 
 fn offer_json(o: &Offer) -> Value {
-    json!({"id": o.id, "name": o.name, "kind": o.kind.id(), "address": o.address, "price_msat": o.price_msat, "unit": o.unit.id(), "input_msat": o.input_msat,
+    let mut v = json!({"id": o.id, "name": o.name, "kind": o.kind.id(), "address": o.address, "price_msat": o.price_msat, "unit": o.unit.id(), "input_msat": o.input_msat,
            "paused": o.paused, "paths": o.paths, "strip": o.strip,
-           "titles": o.titles.iter().map(|(t, u)| json!({"title": t, "url": u})).collect::<Vec<_>>()})
+           "titles": o.titles.iter().map(|(t, u)| json!({"title": t, "url": u})).collect::<Vec<_>>()});
+    if let Some(a) = &o.app {
+        v["app"] = json!({"base": a.base, "entry": a.entry, "login": a.login});
+    }
+    v
 }
 
 fn offer_of(v: &Value) -> Option<Offer> {
@@ -261,6 +330,10 @@ fn offer_of(v: &Value) -> Option<Offer> {
         titles: v.get("titles").and_then(Value::as_array).map(|a| a.iter().filter_map(|t| {
             Some((t.get("title")?.as_str()?.to_string(), t.get("url")?.as_str()?.to_string()))
         }).collect()).unwrap_or_default(),
+        app: v.get("app").filter(|a| a.is_object()).map(|a| {
+            let t = |k: &str| a.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+            OfferApp { base: t("base"), entry: t("entry"), login: t("login") }
+        }).filter(|a| a.base.starts_with('/') && a.base.ends_with('/')),
     })
 }
 
@@ -321,7 +394,7 @@ impl Shop {
                 Some((i.get("title")?.as_str()?.to_string(), i.get("url")?.as_str()?.to_string()))
             }).collect()).unwrap_or_default();
             offers.push(Offer { id: format!("s{}", offers.len() + 1), name: if name.is_empty() { kind.words().into() } else { name }, kind, address,
-                                price_msat: msat, unit, input_msat, paused: false, paths: vec![path], strip, titles });
+                                price_msat: msat, unit, input_msat, paused: false, paths: vec![path], strip, titles, app: None });
         }
         let caps = c.get("caps").and_then(|k| Some((k.get("max_sessions")?.as_u64()?, k.get("sessions_per_address")?.as_u64()?,
                                                     k.get("max_held_tickets")?.as_u64()?)));
@@ -568,6 +641,29 @@ impl App {
                 } else {
                     m.remove("strip_prefix");
                 }
+                app_route(m, o.app.as_ref().filter(|a| a.base == *p));
+                routes.push(r);
+            }
+            // the service's own web page, under a route of its own where its base is not one of the service's paths
+            if let Some(a) = o.app.as_ref().filter(|a| !o.paths.contains(&a.base)) {
+                let mut r = old_routes.iter().find(|r| r.get("path").and_then(Value::as_str) == Some(a.base.as_str())).cloned()
+                    .filter(Value::is_object).unwrap_or_else(|| json!({}));
+                let m = r.as_object_mut().expect("an object");
+                m.insert("path".into(), json!(a.base));
+                m.insert("upstream".into(), json!(o.address));
+                if free {
+                    m.remove("price");
+                    m.insert("free".into(), json!(true));
+                } else {
+                    m.remove("free");
+                    m.insert("price".into(), price.clone());
+                }
+                if o.strip && a.base != "/" {
+                    m.insert("strip_prefix".into(), json!(true));
+                } else {
+                    m.remove("strip_prefix");
+                }
+                app_route(m, Some(a));
                 routes.push(r);
             }
             let base = public_url.clone();
@@ -580,6 +676,9 @@ impl App {
             }).collect();
             if let Some(p) = o.paths.first() {
                 sections.push(json!({"name": o.name, "kind": o.kind.listing_kind(), "path": p, "items": items}));
+            }
+            if let Some(a) = &o.app {
+                sections.push(json!({"name": o.name, "kind": "app", "path": a.base, "items": [{"title": format!("Open {}", o.name), "url": format!("{base}{}", a.entry)}]}));
             }
         }
         // pieces of work from this box's miners, when renting them out is on
@@ -862,6 +961,15 @@ impl App {
             <input name=\"input_price\" value=\"{}\" inputmode=\"decimal\" pattern=\"[0-9][0-9,]*(\\.[0-9]{{1,3}})?|\\.[0-9]{{1,3}}\" title=\"A number of sats, like 2 or 0.5\"></label>\
             <p class=\"hint\">Only for an AI model priced per 1,000 tokens. Usually left empty: buyers then pay for what the model writes.</p>\
             <label>Name, as buyers see it <small>(optional)</small><input name=\"name\" value=\"{}\" maxlength=\"120\" placeholder=\"{}\"></label>\
+            <label class=\"check\"><input type=\"checkbox\" name=\"app\" value=\"1\"{}> Buyers can open its own web page inside their app</label>\
+            <p class=\"hint\">They use it as they would on your network, and pay your price for what it loads. Give buyers a guest account of their own \
+            in the service, never yours.</p>\
+            <details><summary>Its web page</summary>\
+            <label>What the page sees as <code>/</code> <small>(empty: chosen for you)</small><input name=\"app_base\" value=\"{}\" class=\"mono\" placeholder=\"{}\"></label>\
+            <label>Where it opens <small>(empty: the same)</small><input name=\"app_entry\" value=\"{}\" class=\"mono\" placeholder=\"/web/\"></label>\
+            <label>A guest login the shop adds to every request <small>(optional, <code>Name: value</code>)</small>\
+            <input name=\"app_login\" value=\"{}\" class=\"mono\" autocomplete=\"off\" placeholder=\"Authorization: MediaBrowser Token=…\"></label>\
+            <p class=\"hint\">For a service whose page asks for a login. It goes from your shop to the service only, never to buyers.</p></details>\
             <details><summary>Advanced</summary>\
             <label>Items to list for buyers (films, files, models…), one per line: <code>name | link</code><textarea name=\"titles\" rows=\"4\" class=\"mono\">{}</textarea></label>\
             <p class=\"hint\">A link may start with <code>/</code>: it is then on your shop's address.</p>\
@@ -874,6 +982,11 @@ impl App {
             esc(&fv("price", editing.map(|o| msat_to_sats(o.price_msat)).unwrap_or_else(|| sug_price.to_string()))),
             esc(&fv("input_price", editing.filter(|o| o.input_msat > 0).map(|o| msat_to_sats(o.input_msat)).unwrap_or_default())),
             esc(&fv("name", editing.map(|o| o.name.clone()).unwrap_or_default())), kind.words(),
+            if fv("app", editing.map(|o| if o.app.is_some() { "1" } else { "" }.to_string()).unwrap_or_default()) == "1" { " checked" } else { "" },
+            esc(&fv("app_base", editing.and_then(|o| o.app.as_ref()).map(|a| a.base.clone()).unwrap_or_default())),
+            if kind == Kind::Media { "/" } else { "the path it is sold under" },
+            esc(&fv("app_entry", editing.and_then(|o| o.app.as_ref()).filter(|a| a.entry != a.base).map(|a| a.entry.clone()).unwrap_or_default())),
+            esc(&fv("app_login", editing.and_then(|o| o.app.as_ref()).map(|a| a.login.clone()).unwrap_or_default())),
             esc(&fv("titles", titles)),
             esc(&fv("paths", editing.map(|o| o.paths.join(", ")).unwrap_or_default())),
             if fv("strip", editing.map(|o| if o.strip { "1" } else { "" }.to_string()).unwrap_or_else(|| "1".into())) == "1" { " checked" } else { "" },
@@ -989,7 +1102,34 @@ impl App {
                         _ => vec![shop.free_path(&name, &new_id)],
                     };
                 }
-                let offer = Offer { id: new_id.clone(), name, kind, address, price_msat, unit, input_msat, paused: false, paths, strip: g("strip") == "1", titles };
+                let app = if g("app") == "1" {
+                    // a media server's page uses paths all over the service (Jellyfin: /web/, /Users/, /Items/…); an AI model's or a web app's, its own path
+                    let base = match g("app_base").trim() {
+                        "" if kind == Kind::Media => "/".to_string(),
+                        "" => paths.first().cloned().unwrap_or_else(|| "/".into()),
+                        b => format!("{}/", b.trim_end_matches('/')),
+                    };
+                    if !base.starts_with('/') || base.contains(['?', '#', '%', ' ', '\\']) || base.contains("//") {
+                        return Err(format!("{base} is not a path: it starts with / and has no spaces."));
+                    }
+                    if shop.offers.iter().filter(|o| o.id != new_id).any(|o| o.paths.contains(&base) || o.app.as_ref().is_some_and(|a| a.base == base)) {
+                        return Err(format!("Another service already uses {base}: give this page another path."));
+                    }
+                    let entry = match g("app_entry").trim() {
+                        "" => base.clone(),
+                        e if e.starts_with('/') && !e.contains(['#', ' ', '\\']) && !e.contains("//") => e.to_string(),
+                        e => return Err(format!("{e} is not a path: it starts with / and has no spaces.")),
+                    };
+                    if !entry.starts_with(&base) {
+                        return Err(format!("Where the page opens ({entry}) is under what it sees as / ({base})."));
+                    }
+                    let login = g("app_login").trim().to_string();
+                    login_header(&login)?;
+                    Some(OfferApp { base, entry, login })
+                } else {
+                    None
+                };
+                let offer = Offer { id: new_id.clone(), name, kind, address, price_msat, unit, input_msat, paused: false, paths, strip: g("strip") == "1", titles, app };
                 match shop.offers.iter_mut().find(|o| o.id == new_id) {
                     Some(o) => {
                         let paused = o.paused;
@@ -1142,7 +1282,7 @@ mod tests {
         let mut s = Shop::default();
         assert_eq!(s.free_path("Films", "a"), "/");
         s.offers.push(Offer { id: "a".into(), name: "Films".into(), kind: Kind::Media, address: "http://j:1".into(), price_msat: 1, unit: Unit::Mib, input_msat: 0,
-                              paused: false, paths: vec!["/".into()], strip: false, titles: vec![] });
+                              paused: false, paths: vec!["/".into()], strip: false, titles: vec![], app: None });
         assert_eq!(s.free_path("My AI model!", "b"), "/my-ai-model/");
         assert_eq!(s.free_path("Films", "a"), "/", "an offer keeps the root when it is the only one");
         s.offers.push(Offer { id: "b".into(), paths: vec!["/x/".into()], ..s.offers[0].clone() });

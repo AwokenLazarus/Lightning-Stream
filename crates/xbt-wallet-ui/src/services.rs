@@ -104,6 +104,11 @@ pub struct Service {
     pub items: Vec<Item>,
     /// Where apps and agents reach this service; empty: the seller's own address.
     pub address: String,
+    /// The service's own web page, which the buyer can open inside the app (a listed `app`, see
+    /// docs/SELLER-APPS.md): where it opens. Empty: it has none.
+    pub app: String,
+    /// That page's base: what the page sees as `/`. Empty with `app`.
+    pub app_base: String,
 }
 
 impl Service {
@@ -237,7 +242,19 @@ fn parse_service(v: &Value, n: usize) -> Result<Service, String> {
     if !address.is_empty() {
         http_url(&address, &format!("{what} address"))?;
     }
-    Ok(Service { name: text(obj, "name", &what)?.to_string(), kind, seller, price_text: text(obj, "price_text", &what)?.to_string(), items, address })
+    let opt_url = |k: &str| -> Result<String, String> {
+        let v = if obj.contains_key(k) { text(obj, k, &what)?.to_string() } else { String::new() };
+        if !v.is_empty() {
+            http_url(&v, &format!("{what} {k}"))?;
+            if !same_origin(&v, &seller) {
+                return Err(format!("{what}: {k} is not on the seller's own address"));
+            }
+        }
+        Ok(v)
+    };
+    let (app, app_base) = (opt_url("app")?, opt_url("app_base")?);
+    let (app, app_base) = if app.is_empty() || app_base.is_empty() { (String::new(), String::new()) } else { (app, app_base) };
+    Ok(Service { name: text(obj, "name", &what)?.to_string(), kind, seller, price_text: text(obj, "price_text", &what)?.to_string(), items, address, app, app_base })
 }
 
 /// Parse the services file's text.
@@ -281,6 +298,10 @@ fn service_json(s: &Service) -> Value {
     let mut v = json!({"name": s.name, "kind": s.kind.as_str(), "seller": s.seller, "price_text": s.price_text, "items": items});
     if !s.address.is_empty() {
         v["address"] = json!(s.address);
+    }
+    if !s.app.is_empty() {
+        v["app"] = json!(s.app);
+        v["app_base"] = json!(s.app_base);
     }
     v
 }
@@ -338,9 +359,10 @@ fn work_price_words(prices: &Value) -> String {
 /// The services a checked listing lists, as Browse shows them. A seller with one service shows
 /// under its own name; with several, each as `seller name: service name`.
 pub fn from_listing(l: &xbt402::listing::Listing) -> Vec<Service> {
-    let several = l.services.len() > 1;
+    let several = l.services.iter().filter(|s| s.kind != "app").count() > 1;
+    let seller = l.seller.trim_end_matches('/');
     // a kind this app does not know is left out: shown as something else, it would be bought wrongly
-    l.services.iter().filter_map(|s| Kind::parse(&json!(s.kind)).ok().map(|kind| (s, kind))).map(|(s, kind)| {
+    let mut out: Vec<Service> = l.services.iter().filter_map(|s| Kind::parse(&json!(s.kind)).ok().map(|kind| (s, kind))).map(|(s, kind)| {
         let path = if s.path.is_empty() || s.path == "/" { String::new() } else { s.path.clone() };
         let credit = if s.credits.is_empty() { l.credits.clone() } else { s.credits.clone() };
         let name = if several { format!("{}: {}", l.name, s.name) } else { l.name.clone() };
@@ -352,8 +374,34 @@ pub fn from_listing(l: &xbt402::listing::Listing) -> Vec<Service> {
             items: s.items.iter().map(|i| Item { title: i.title.clone(), year: i.year.map(|y| y.to_string()).unwrap_or_default(), url: i.url.clone(),
                                                  credit: i.credit.clone().unwrap_or_else(|| credit.clone()).chars().take(MAX_TEXT).collect() }).collect(),
             address: if path.is_empty() { String::new() } else { format!("{}{path}", l.seller.trim_end_matches('/')) },
+            app: String::new(),
+            app_base: String::new(),
         }
-    }).collect()
+    }).collect();
+    // a service's own web page: given to the service of its path (or its name), else listed alone
+    for a in l.services.iter().filter(|s| s.kind == "app") {
+        let base = format!("{seller}{}", a.path);
+        let entry = a.items.first().map(|i| i.url.clone()).filter(|u| same_origin(u, &l.seller) && u.starts_with(&base)).unwrap_or_else(|| base.clone());
+        let at = out.iter().position(|o| if a.path.is_empty() || a.path == "/" { o.address.is_empty() } else { o.address == base })
+            .or_else(|| out.iter().position(|o| o.name.ends_with(&a.name)));
+        match at.and_then(|i| out.get_mut(i)) {
+            Some(o) if o.app.is_empty() => {
+                o.app = entry;
+                o.app_base = base;
+            }
+            _ => out.push(Service {
+                name: (if several { format!("{}: {}", l.name, a.name) } else { a.name.clone() }).chars().take(MAX_TEXT).collect(),
+                kind: Kind::Api,
+                seller: l.seller.clone(),
+                price_text: price_words(&a.prices),
+                items: vec![],
+                address: String::new(),
+                app: entry,
+                app_base: base,
+            }),
+        }
+    }
+    out
 }
 
 /// The first integer in a price line (`"20 sat a MiB"` → 20, `"about 1,200 sat"` → 1200).
@@ -464,6 +512,40 @@ mod tests {
         assert_eq!(rebase("ftp://old.example/a", "https://new.example"), None);
     }
 
+
+    #[test]
+    fn a_services_own_web_page_goes_with_it_and_a_page_alone_is_listed_alone() {
+        let l = xbt402::listing::Listing {
+            name: "Box".into(), kind: "ai".into(), seller: "https://seller.example".into(), receipt_key: String::new(), prices: Default::default(),
+            items: vec![], licence: String::new(), credits: String::new(), updated: String::new(),
+            services: vec![
+                sec("Model", "ai", "/ai/", vec![]),
+                sec("Model", "app", "/ai/", vec![("Open", "https://seller.example/ai/")]),
+                sec("Game", "app", "/game/", vec![("Open", "https://seller.example/game/play/")]),
+                sec("Bad", "app", "/bad/", vec![("Open", "https://elsewhere.example/bad/")]),
+            ],
+        };
+        let all = from_listing(&l);
+        let model = all.iter().find(|s| s.name.ends_with("Model")).unwrap();
+        assert_eq!((model.app.as_str(), model.app_base.as_str()), ("https://seller.example/ai/", "https://seller.example/ai/"));
+        let game = all.iter().find(|s| s.name.ends_with("Game")).unwrap();
+        assert_eq!((game.kind, game.app.as_str(), game.app_base.as_str()), (Kind::Api, "https://seller.example/game/play/", "https://seller.example/game/"));
+        // a page that would open somewhere else opens at its own base instead
+        assert_eq!(all.iter().find(|s| s.name.ends_with("Bad")).unwrap().app, "https://seller.example/bad/");
+        // kept in the services file, and read back
+        let back = parse(&serde_json::to_string(&all.iter().map(service_json).collect::<Vec<_>>()).unwrap()).unwrap();
+        assert_eq!(back, all);
+        // an app on another seller's address is refused in the file
+        let mut v = service_json(game);
+        v["app"] = json!("https://elsewhere.example/game/");
+        assert!(parse(&json!([v]).to_string()).is_err());
+    }
+
+    fn sec(name: &str, kind: &str, path: &str, items: Vec<(&str, &str)>) -> xbt402::listing::Section {
+        xbt402::listing::Section { name: name.into(), kind: kind.into(), path: path.into(), prices: Default::default(),
+            items: items.into_iter().map(|(t, u)| xbt402::listing::Item { title: t.into(), url: u.into(), year: None, credit: None }).collect(),
+            licence: String::new(), credits: String::new() }
+    }
     use super::*;
 
     #[test]

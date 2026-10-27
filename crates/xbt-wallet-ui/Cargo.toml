@@ -41,3 +41,6 @@ xbt402 = { workspace = true, features = ["http-client", "http-server"] }
 xbt-primitives.workspace = true
 # a TLS node for the certificate-pinning test (the gateway's own version and features)
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# a seller's own web page in the browser test: the real connector, and a page served only compressed
+lightning-stream = { path = "../lightning-stream" }
+flate2 = "1"
