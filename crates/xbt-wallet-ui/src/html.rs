@@ -212,13 +212,13 @@ pub fn page_head(title: &str, nav: &Nav, flash: Option<(bool, String)>, body: &s
     let flash = flash.map(|(ok, m)| format!("<div class=\"flash {}\" role=\"status\">{}</div>", if ok { "ok" } else { "bad" }, esc(&m))).unwrap_or_default();
     format!("<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
              <meta name=\"referrer\" content=\"no-referrer\">{head}<link rel=\"icon\" href=\"data:,\"><title>{} · {}</title>\
-             <link rel=\"stylesheet\" href=\"./ui.css?v={}\"></head><body>\
+             <link rel=\"stylesheet\" href=\"./ui.css?v={}\"><script src=\"./vt.js?v={}\"></script></head><body>\
              <div class=\"glow\" aria-hidden=\"true\"></div><canvas id=\"river\" aria-hidden=\"true\"></canvas>\
              <header>{brand}{menu}</header>\
              <main>{tabs}{flash}{banner}<h1>{}</h1>{body}</main>\
              <footer>Your money stays on your own Lightning node. Nobody else holds it.</footer>\
              <script src=\"./ui.js?v={}\"></script><script src=\"./river.js?v={}\"></script></body></html>\n",
-            esc(title), esc(nav.brand), asset_version(crate::UI_CSS), esc(title),
+            esc(title), esc(nav.brand), asset_version(crate::UI_CSS), asset_version(crate::VT_JS), esc(title),
             asset_version(crate::UI_JS), asset_version(crate::river_js()))
 }
 

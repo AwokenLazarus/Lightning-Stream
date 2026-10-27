@@ -328,6 +328,7 @@ impl App {
             (true, "/ui.js") => return asset(&req, "text/javascript; charset=utf-8", crate::UI_JS),
             (true, "/river.js") => return asset(&req, "text/javascript; charset=utf-8", crate::river_js()),
             (true, "/ui.css") => return asset(&req, "text/css; charset=utf-8", crate::UI_CSS),
+            (true, "/vt.js") => return asset(&req, "text/javascript; charset=utf-8", crate::VT_JS),
             (true, "/healthz") => return Resp::json(200, &json!({"ok": true})),
             (true, "/readyz") if self.cfg.role == Role::Gateway => return Resp::json(200, &json!({"ok": true, "role": "gateway"})),
             (true, "/readyz") => {

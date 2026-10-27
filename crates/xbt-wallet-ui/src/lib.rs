@@ -29,6 +29,7 @@ pub mod setup;
 
 pub const UI_JS: &str = include_str!("../assets/ui.js");
 pub const UI_CSS: &str = include_str!("../assets/ui.css");
+pub const VT_JS: &str = include_str!("../assets/vt.js");
 /// The river drawn behind every page: decoration only, it reads and sends nothing.
 pub const RIVER_JS_SOURCE: &str = include_str!("../assets/river.js");
 
