@@ -142,7 +142,7 @@ impl App {
     pub(crate) fn sell_hashrate_page(&self, ctx: &Ctx) -> Resp {
         let Some(base) = self.cfg.hash.hasher.clone() else {
             return self.html_page("Sell hashrate", "Sell hashrate", ctx,
-                "<p class=\"empty\">This box does not rent out miners. The Lightning Stream app on Umbrel does.</p>", "");
+                "<p class=\"empty\">Renting out miners is off in this install. On Umbrel it is part of the app; on Linux, run install.sh again and turn the hashmaker on.</p>", "");
         };
         let st = call(&base, &self.cfg.hash.hasher_token, "GET", "/status", None);
         let saved = self.hash_settings();
@@ -339,7 +339,7 @@ impl App {
     pub(crate) fn hashrate_page(&self, ctx: &Ctx) -> Resp {
         let Some(base) = self.cfg.hash.renter.clone() else {
             return self.html_page("Hashrate", "Hashrate", ctx,
-                "<p class=\"empty\">This box does not rent miners. The Lightning Stream app on Umbrel does.</p>", "");
+                "<p class=\"empty\">Renting miners is off in this install. The Lightning Stream app on Umbrel and on Linux has it.</p>", "");
         };
         let token = self.cfg.hash.renter_token.clone();
         let st = call(&base, &token, "GET", "/status", None);
@@ -396,9 +396,20 @@ impl App {
                     let free_hs = num(&x["freeHs"]);
                     let per_miner = if free > 0 && free_hs > 0.0 { free_hs / free as f64 } else { EXAMPLE_HS };
                     let budget = per_hour(price, slice, per_miner).ceil().max(price) as u64;
-                    let can = ready && (free > 0 || total == 0);
+                    // the spending rules list who the app may pay: a seller not on them is allowed first, with the
+                    // node its signed listing names (the rules page shows the change to sign)
+                    let pay_url = x["payUrl"].as_str().unwrap_or("");
+                    let allowed = self.seller_allowed(pay_url);
+                    let allow = match (allowed, crate::services::http_origin(pay_url), x["payNode"].as_str()) {
+                        (false, Some(o), Some(n)) if !n.is_empty() => format!(
+                            "<p class=\"hint\">Your spending rules list who this app may pay. Allow this seller first: you sign the change with your approval key.</p>\
+                             <p><a class=\"button\" href=\"./policy?allow={}&amp;node={}\">Allow this seller to be paid</a></p>",
+                            crate::services::urlenc(&o), esc(n)),
+                        _ => String::new(),
+                    };
+                    let can = ready && allowed && (free > 0 || total == 0);
                     b.push_str(&format!("<section class=\"card offer\"><span class=\"pill cat-media\">Hashrate</span><h3>{}</h3>\
-                        <p class=\"price\">{} a piece of work</p><p class=\"small\">About <strong>{}</strong> an hour for each {} of speed · {}</p>\
+                        <p class=\"price\">{} a piece of work</p><p class=\"small\">About <strong>{}</strong> an hour for each {} of speed · {}</p>{allow}\
                         <form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"rent\"><input type=\"hidden\" name=\"key\" value=\"{}\">\
                         <div class=\"price-row\"><label>Machines<input name=\"miners\" value=\"1\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label>\
                         <label>For how long, in minutes<input name=\"minutes\" value=\"60\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label></div>\

@@ -100,13 +100,14 @@ const INT_KEYS: [(&str, &str, &str); 12] = [
 pub const MAINNET_SPLIT_HEIGHT: i64 = 961_640;
 
 /// A conservative first policy (the setup wizard's template; `xbt-wallet-mcp/policy.example.json`'s limits),
-/// with the Lightning rail and stream tickets on (one task, `default`, with a budget: tickets are paid only
-/// under a task). On mainnet (`chain` "main") the caps are low: the software has run on regtest only.
+/// with the Lightning rail and stream tickets on (tickets are paid only under a task with a budget: `default`
+/// for buying, `hashrate` for the pieces of work of rented miners). On mainnet (`chain` "main") the caps are
+/// low: the software has been tested on mainnet with small amounts only.
 pub fn starter_policy(chain: &str) -> Value {
     let mut p = json!({"allowlist": [], "counterparties": {}, "max_per_tx_sats": 100000, "daily_budget_sats": 200000, "weekly_budget_sats": 500000,
            "per_counterparty_cap_sats": 100000, "velocity_max": 60, "velocity_window_s": 3600, "human_threshold_sats": 50000,
            "split_window_s": 600, "approval_ttl_s": 900, "hot_balance_cap_sats": 1500000, "anchor_interval_s": 300,
-           "ln": {"enabled": true}, "tickets": {"enabled": true, "tasks": {"default": {"budget_sats": 100000}}}});
+           "ln": {"enabled": true}, "tickets": {"enabled": true, "tasks": {"default": {"budget_sats": 100000}, "hashrate": {"budget_sats": 100000}}}});
     if chain == "main" {
         for (k, v) in [("max_per_tx_sats", 2000), ("daily_budget_sats", 10000), ("weekly_budget_sats", 30000), ("per_counterparty_cap_sats", 10000),
                        ("human_threshold_sats", 1000), ("hot_balance_cap_sats", 50000)] {
@@ -114,6 +115,7 @@ pub fn starter_policy(chain: &str) -> Value {
         }
         p["ln"]["split_height"] = json!(MAINNET_SPLIT_HEIGHT);
         p["tickets"]["tasks"]["default"]["budget_sats"] = json!(10000);
+        p["tickets"]["tasks"]["hashrate"]["budget_sats"] = json!(5000);
     }
     p
 }

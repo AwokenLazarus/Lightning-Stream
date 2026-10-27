@@ -82,9 +82,24 @@ fn node_keys() -> i32 {
             return 2;
         }
     };
+    // XBT_KEYS_ADMIN=-: read once, kept in memory only; a node that does not answer is asked a few
+    // times, then the caller (an install script, waiting) is told why
+    let given = if s.admin_on_stdin() {
+        match xbt_wallet_ui::node_keys::read_admin(std::io::stdin().lock()) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                eprintln!("xbt-wallet-ui node-keys: {e}");
+                return 2;
+            }
+        }
+    } else {
+        None
+    };
+    let mut tries = 0;
     let mut wait = std::time::Duration::from_secs(5);
     loop {
-        match xbt_wallet_ui::node_keys::run(&s) {
+        tries += 1;
+        match xbt_wallet_ui::node_keys::run_with(&s, given.as_deref()) {
             Ok(o) if o.made.is_empty() => {
                 eprintln!("xbt-wallet-ui node-keys: the app's keys were already there; nothing made");
                 return 0;
@@ -92,6 +107,10 @@ fn node_keys() -> i32 {
             Ok(o) => {
                 eprintln!("xbt-wallet-ui node-keys: made {} through the box's Lightning node (each with a root key of its own)", o.made.join(", "));
                 return 0;
+            }
+            Err(e) if given.is_some() && tries >= 5 => {
+                eprintln!("xbt-wallet-ui node-keys: {e}");
+                return 1;
             }
             Err(e) => {
                 eprintln!("xbt-wallet-ui node-keys: not yet: {e}; asking again in {} s", wait.as_secs());

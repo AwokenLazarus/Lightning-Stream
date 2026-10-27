@@ -13,6 +13,10 @@
 //! | the gateway, invoices | [`INVOICE_OPS`] | `<gateway dir>/invoices.macaroon` |
 //! | the gateway, height | [`INFO_OPS`] | `<gateway dir>/info.macaroon` |
 //!
+//! Where no platform hands the app the node's data (a plain Linux machine), `XBT_KEYS_ADMIN=-` takes
+//! the admin macaroon on standard input instead, read once into memory ([`read_admin`]): the install
+//! script pipes the owner's file in, so no file of it is made and no service mounts it.
+//!
 //! A key that is already there (the owner's own, or one made before) is left alone. Beside the keys,
 //! `auto-keys.json` says they came from the box and names their root key ids (no secret), so the
 //! pages can say "connected automatically" and how to revoke them.
@@ -32,7 +36,8 @@ pub struct Settings {
     /// The node's REST address, `https://host:port`.
     pub rest: String,
     pub tls_cert: Option<PathBuf>,
-    /// The node's admin macaroon, or a directory to look for one in (the node's `data/chain`).
+    /// The node's admin macaroon, or a directory to look for one in (the node's `data/chain`), or
+    /// `-`: standard input ([`Settings::admin_on_stdin`]).
     pub admin: PathBuf,
     /// The wallet's key dir (`run/ln`); `None`: no wallet key is made.
     pub rail_dir: Option<PathBuf>,
@@ -59,6 +64,32 @@ impl Settings {
         }
         Ok(s)
     }
+}
+
+impl Settings {
+    /// Whether the admin macaroon comes on standard input (`XBT_KEYS_ADMIN=-`).
+    pub fn admin_on_stdin(&self) -> bool {
+        self.admin.as_os_str() == "-"
+    }
+}
+
+/// The admin macaroon as it came on standard input: the file's bytes, or the same as hex (what
+/// `xxd -p` or a node's dashboard shows), surrounding whitespace ignored.
+pub fn read_admin(mut input: impl std::io::Read) -> Result<Vec<u8>, String> {
+    let mut b = Vec::new();
+    input.read_to_end(&mut b).map_err(|e| format!("standard input: {e}"))?;
+    let text = std::str::from_utf8(&b).ok().map(|t| t.split_whitespace().collect::<String>());
+    if text.as_deref() == Some("") {
+        return Err("no admin macaroon on standard input".into());
+    }
+    let b = match text.as_deref().map(hex::decode) {
+        Some(Ok(h)) if !h.is_empty() => h,
+        _ => b,
+    };
+    if b.is_empty() {
+        return Err("no admin macaroon on standard input".into());
+    }
+    Ok(b)
 }
 
 /// The node's admin macaroon: `path` itself, or the one `admin.macaroon` under `path` (searched a
@@ -152,15 +183,27 @@ pub fn make_keys(s: &Settings, bake: &mut Bake) -> Result<Outcome, String> {
 
 /// Read the admin macaroon and make the missing keys through the node.
 pub fn run(s: &Settings) -> Result<Outcome, String> {
+    run_with(s, None)
+}
+
+/// [`run`], with the admin macaroon given (read from standard input) rather than read from `s.admin`.
+pub fn run_with(s: &Settings, given: Option<&[u8]>) -> Result<Outcome, String> {
     // nothing to make: the node is not asked and its admin macaroon is not read
     let missing = s.rail_dir.as_ref().is_some_and(|d| !is_off(d) && !d.join(RAIL_MACAROON).is_file())
         || s.gw_dir.as_ref().is_some_and(|d| !is_off(d) && (!d.join(GW_INVOICES).is_file() || !d.join(GW_INFO).is_file()));
     if !missing {
         return Ok(Outcome { made: vec![], kept: vec!["all".into()] });
     }
-    let path = find_admin(&s.admin)?;
-    let admin = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    make_keys(s, &mut |ops, id| bake_macaroon(&s.rest, s.tls_cert.as_deref(), &admin, ops, id))
+    let read;
+    let admin = match given {
+        Some(a) => a,
+        None => {
+            let path = find_admin(&s.admin)?;
+            read = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            &read
+        }
+    };
+    make_keys(s, &mut |ops, id| bake_macaroon(&s.rest, s.tls_cert.as_deref(), admin, ops, id))
 }
 
 fn read_record(dir: &Path) -> serde_json::Value {
@@ -215,6 +258,15 @@ mod tests {
         let d = root.join(name);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn the_admin_macaroon_on_standard_input_is_its_bytes_or_their_hex() {
+        assert_eq!(read_admin(&[0x02u8, 0x01, 0xff][..]).unwrap(), vec![0x02, 0x01, 0xff]);
+        assert_eq!(read_admin(&b"0201ff\n"[..]).unwrap(), vec![0x02, 0x01, 0xff]);
+        assert_eq!(read_admin(&b"  02 01\nff "[..]).unwrap(), vec![0x02, 0x01, 0xff]);
+        assert!(read_admin(&b""[..]).is_err());
+        assert!(read_admin(&b"\n"[..]).is_err());
     }
 
     #[test]

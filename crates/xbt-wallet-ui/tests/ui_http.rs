@@ -786,6 +786,9 @@ fn the_starter_policy_turns_the_rail_and_tickets_on_and_is_low_on_mainnet() {
     assert_eq!(m["ln"]["split_height"], json!(xbt_wallet_ui::app::MAINNET_SPLIT_HEIGHT));
     assert!(m["max_per_tx_sats"].as_i64().unwrap() <= 2000 && m["daily_budget_sats"].as_i64().unwrap() <= 10000);
     assert!(m["tickets"]["tasks"]["default"]["budget_sats"].as_i64().unwrap() <= 10000);
+    // renting miners pays under its own task: there from the start, low on mainnet, and only to listed sellers
+    assert!(m["tickets"]["tasks"]["hashrate"]["budget_sats"].as_i64().unwrap() <= 5000 && t["tickets"]["tasks"]["hashrate"]["budget_sats"].as_i64().unwrap() > 0);
+    assert!(m["tickets"]["tasks"]["hashrate"].get("admit").is_none());
     // the signer takes both
     for p in [t, m] {
         assert!(xbt_signer::policy::validate_policy(&p).0.is_empty(), "{p}");
@@ -1718,7 +1721,10 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
             "rentals": [{"rental": "r9", "hasher": "Basement miners", "miners": 1, "budgetSats": 4000, "minutes": 60, "ended": false,
                          "live": {"closed": null, "paidSlices": 5, "spentMsat": 200000, "miners": 1, "lastRate": {"hs": 4.1e12}}}]}),
         ("GET", "/offers") => json!({"offers": [{"name": "Basement miners", "linkKey": "02bb", "priceMsat": 40000, "sliceWork": "140737488355328",
-                                                  "miners": 2, "freeMiners": 1, "freeHs": "4000000000000"}]}),
+                                                  "miners": 2, "freeMiners": 1, "freeHs": "4000000000000"},
+                                                 {"name": "Garage miners", "linkKey": "02dd", "priceMsat": 40000, "sliceWork": "140737488355328",
+                                                  "miners": 1, "freeMiners": 1, "freeHs": "4000000000000",
+                                                  "payUrl": "https://miners.example/hashrate", "payNode": format!("03{}", "c".repeat(64))}]}),
         ("POST", "/rent") => json!({"ok": true, "rental": "r10"}),
         ("POST", "/cut") => json!({"ok": true}),
         ("POST", "/datum") => json!({"ok": true, "datum": "datum-gateway:23334", "reachable": true}),
@@ -1781,6 +1787,12 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
         assert!(p.body.contains(s), "{s} missing from Hashrate");
     }
     plain("/hashrate", &p.body);
+    // a seller the spending rules do not list yet: allowed first (the rules page, with its node), Rent waits
+    let garage = &p.body[p.body.find("Garage miners").unwrap()..];
+    let garage = &garage[..garage.find("</section>").unwrap()];
+    assert!(garage.contains("Allow this seller to be paid") && garage.contains("./policy?allow=") && garage.contains(&format!("node=03{}", "c".repeat(64))),
+            "{garage}");
+    assert!(garage.contains("<button disabled>Rent</button>"), "{garage}");
     let r = br.act("/hashrate", "/hashrate", &[("action", "rent"), ("key", "02bb"), ("miners", "1"), ("budget", "4000"), ("minutes", "60")]);
     assert!(br.flash_after(&r).starts_with("Renting."));
     let rent = rseen.lock().unwrap().iter().find(|(m, p, _, _)| m == "POST" && p == "/rent").cloned().unwrap();
