@@ -115,7 +115,8 @@ relay. The answer is kept for two minutes.
 
 The programs set no relay by default on either side: which relays to use is the owner's choice. The
 packages choose for a new install, and the owner can change it: the Umbrel app and the Linux package
-use `wss://relay.damus.io`, `wss://nos.lol` and `wss://relay.kilombino.com` for what the wallet UI
+use `wss://relay.lazarus-xbt.xyz` (ours: it takes only Lightning Stream listings, kinds 30402, 5 and
+10002, rate-limited per address), `wss://relay.kilombino.com`, `wss://relay.damus.io` and `wss://nos.lol` for what the wallet UI
 reads (`XBT_UI_NOSTR_RELAYS`) and for the hashmaker's and hashtaker's `--relays`; on Linux,
 `LS_RELAYS` in `.env` sets them all. The gateway's `nostr.relays` above is set in its own config. The StartOS packages don't use Nostr yet.
 

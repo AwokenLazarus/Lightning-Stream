@@ -661,14 +661,14 @@ mod tests {
 
     #[test]
     fn the_player_src_is_the_connector_plus_the_item_and_the_credit_is_escaped() {
-        let svc = Service { name: "Films".into(), kind: Kind::Video, seller: "https://media.lazarus-xbt.xyz".into(),
+        let svc = Service { name: "Films".into(), kind: Kind::Video, seller: "https://stream.lazarus-xbt.xyz".into(),
                             price_text: "20 sat a MiB".into(),
                             items: vec![services::Item { title: "<b>".into(), year: "2008".into(),
-                                url: "https://media.lazarus-xbt.xyz/v?static=true&x=1".into(), credit: "CC <BY>".into() }],
+                                url: "https://stream.lazarus-xbt.xyz/v?static=true&x=1".into(), credit: "CC <BY>".into() }],
                             address: String::new() };
         let ctx = Ctx { sid: "s".into(), csrf: "tok&1".into(), flash: None };
         let html = player_html(&ctx, "http://127.0.0.1:8480/", &svc, &svc.items[0]);
-        assert!(html.contains("src=\"./s/https://media.lazarus-xbt.xyz/v?static=true&amp;x=1\""));
+        assert!(html.contains("src=\"./s/https://stream.lazarus-xbt.xyz/v?static=true&amp;x=1\""));
         assert!(html.contains("Stop and cut the connection"));
         assert!(html.contains("value=\"tok&amp;1\""));
         // the item's title is the page's heading (escaped by the layout); the credit is in the body

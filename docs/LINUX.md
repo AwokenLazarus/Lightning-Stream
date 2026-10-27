@@ -89,8 +89,8 @@ You rent hashrate into your own DATUM Gateway and pay for each piece of work:
 
 1. **Services → Hashrate.** Check that it says *Ready to rent*, meaning your DATUM Gateway answers. If
    not, set its address under *Your DATUM Gateway*.
-2. **Miners for rent** lists the offers hashmakers publish on Nostr (relay.damus.io, nos.lol and
-   relay.kilombino.com by default). For a hashmaker you haven't paid before, press **Allow this hashmaker to be paid**. The rules
+2. **Miners for rent** lists the offers hashmakers publish on Nostr (relay.lazarus-xbt.xyz,
+   relay.kilombino.com, relay.damus.io and nos.lol by default). For a hashmaker you haven't paid before, press **Allow this hashmaker to be paid**. The rules
    page shows that hashmaker's address added, tied to the Lightning node its signed listing names, and you
    sign the change.
 3. Choose the machines, how long, and the most the rental may cost, then press **Rent**.

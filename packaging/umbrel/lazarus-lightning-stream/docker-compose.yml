@@ -169,9 +169,9 @@ services:
       XBT_UI_GW_NODE_TLS_CERT: /data/lightning/tls.cert
       XBT_UI_GW_HEALTH_URL: http://lazarus-lightning-stream_gateway_1:8402/x402/ticket/health
       # offered on Sellers and on an empty Browse, added only when the owner clicks
-      XBT_UI_SUGGESTED_SELLERS: https://media.lazarus-xbt.xyz
+      XBT_UI_SUGGESTED_SELLERS: https://stream.lazarus-xbt.xyz
       # Nostr relays the Services page reads sellers' signed listings from (opt-in Nostr page)
-      XBT_UI_NOSTR_RELAYS: wss://relay.damus.io,wss://nos.lol,wss://relay.kilombino.com
+      XBT_UI_NOSTR_RELAYS: wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol
       # Hashrate: renting this box's miners out (Sell) and other people's in (Services)
       XBT_UI_HASHER: http://lazarus-lightning-stream_hasher_1:23342
       XBT_UI_HASHER_SETTINGS: /data/run/hashrate/settings.json
@@ -269,7 +269,7 @@ services:
     command: ["hasher", "--key", "/data/hashrate/link.key", "--nostr-key", "/data/hashrate/nostr.key",
               "--miners", "0.0.0.0:23340", "--link", "0.0.0.0:23341", "--slices", "0.0.0.0:23344",
               "--control", "0.0.0.0:23342", "--control-token-file", "/data/run/hashrate/control-token",
-              "--config", "/data/run/hashrate/settings.json", "--relays", "wss://relay.damus.io,wss://nos.lol,wss://relay.kilombino.com",
+              "--config", "/data/run/hashrate/settings.json", "--relays", "wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol",
               "--gateway", "http://lazarus-lightning-stream_gateway_1:8402",
               "--miners-public", "${DEVICE_DOMAIN_NAME}:23340", "--link-lan", "${DEVICE_DOMAIN_NAME}:23341",
               "--report", "/data/hashrate/hasher.json"]
@@ -294,7 +294,7 @@ services:
     command: ["renter", "--key", "/data/hashrate/renter.key", "--control", "0.0.0.0:23343",
               "--control-token-file", "/data/run/hashrate/control-token", "--state", "/data/hashrate",
               "--upstream", "auto", "--datum-candidates", "datum_web_1:23334,datum-gateway_web_1:23334",
-              "--user", "rented", "--relays", "wss://relay.damus.io,wss://nos.lol,wss://relay.kilombino.com",
+              "--user", "rented", "--relays", "wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol",
               "--signer", "/data/run/signer/signer.sock", "--task", "hashrate"]
     volumes:
       - ${APP_DATA_DIR}/data/hashrate:/data/hashrate

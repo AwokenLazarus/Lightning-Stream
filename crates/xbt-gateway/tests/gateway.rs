@@ -1943,7 +1943,7 @@ fn a_listing_is_free_and_signed_by_the_receipt_key() {
             "name": "Films",
             "kind": "video",
             "prices": {"byte_msat": 20, "per_bytes": 1048576},
-            "items": [{"title": "Sintel", "url": "https://media.lazarus-xbt.xyz/Videos/s", "year": 2010, "credit": "(c) Blender Foundation"}],
+            "items": [{"title": "Sintel", "url": "https://stream.lazarus-xbt.xyz/Videos/s", "year": 2010, "credit": "(c) Blender Foundation"}],
             "licence": "CC BY 3.0",
             "credits": "(c) Blender Foundation, CC BY 3.0",
             "updated": "2026-10-25",

@@ -92,15 +92,15 @@ mod tests {
     #[test]
     fn a_link_names_its_item_until_it_expires_or_is_revoked() {
         let r = RelayLinks::new(Duration::from_millis(200));
-        let a = r.create("https://media.lazarus-xbt.xyz/a");
-        let b = r.create("https://media.lazarus-xbt.xyz/b");
+        let a = r.create("https://stream.lazarus-xbt.xyz/a");
+        let b = r.create("https://stream.lazarus-xbt.xyz/b");
         assert_eq!(a.len(), 64);
         assert_ne!(a, b);
-        assert_eq!(r.item_of(&a).as_deref(), Some("https://media.lazarus-xbt.xyz/a"));
-        assert_eq!(r.item_of(&b).as_deref(), Some("https://media.lazarus-xbt.xyz/b"));
+        assert_eq!(r.item_of(&a).as_deref(), Some("https://stream.lazarus-xbt.xyz/a"));
+        assert_eq!(r.item_of(&b).as_deref(), Some("https://stream.lazarus-xbt.xyz/b"));
         assert_eq!(r.item_of(&a.to_uppercase().replace(|c: char| c.is_ascii_digit(), "0")), None);
         assert_eq!(r.item_of(""), None);
-        assert_eq!(r.of_item("https://media.lazarus-xbt.xyz/a").len(), 1);
+        assert_eq!(r.of_item("https://stream.lazarus-xbt.xyz/a").len(), 1);
         assert!(r.revoke(&a) && !r.revoke(&a));
         assert_eq!(r.item_of(&a), None);
         std::thread::sleep(Duration::from_millis(250));

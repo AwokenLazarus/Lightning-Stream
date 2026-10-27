@@ -99,7 +99,7 @@ A reader sees a `listing/0` as one service under `/`.
 ```json
 {
   "title": "Sintel",
-  "url": "https://media.lazarus-xbt.xyz/Videos/b9937d76e453d11b407d84f188e23ed1/stream?static=true",
+  "url": "https://stream.lazarus-xbt.xyz/Videos/b9937d76e453d11b407d84f188e23ed1/stream?static=true",
   "year": 2010,
   "credit": "(c) Blender Foundation, CC BY 3.0"
 }

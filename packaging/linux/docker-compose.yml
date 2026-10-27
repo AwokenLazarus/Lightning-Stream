@@ -124,8 +124,8 @@ services:
       XBT_UI_GW_NODE_REST: ${LS_LND_REST}
       XBT_UI_GW_NODE_TLS_CERT: /data/lightning/tls.cert
       XBT_UI_GW_HEALTH_URL: http://127.0.0.1:${LS_GW_PORT:-8402}/x402/ticket/health
-      XBT_UI_SUGGESTED_SELLERS: ${LS_SUGGESTED_SELLERS:-https://media.lazarus-xbt.xyz}
-      XBT_UI_NOSTR_RELAYS: ${LS_RELAYS:-wss://relay.damus.io,wss://nos.lol,wss://relay.kilombino.com}
+      XBT_UI_SUGGESTED_SELLERS: ${LS_SUGGESTED_SELLERS:-https://stream.lazarus-xbt.xyz}
+      XBT_UI_NOSTR_RELAYS: ${LS_RELAYS:-wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol}
       # the hashmaker's pages: set by install.sh only when LS_HASHMAKER=1
       XBT_UI_HASHER: ${LS_UI_HASHMAKER:-}
       XBT_UI_HASHER_SETTINGS: /data/run/hashrate/settings.json
@@ -204,7 +204,7 @@ services:
     command: ["hasher", "--key", "/data/hashrate/link.key", "--nostr-key", "/data/hashrate/nostr.key",
               "--miners", "0.0.0.0:23340", "--link", "0.0.0.0:23341", "--slices", "127.0.0.1:23344",
               "--control", "127.0.0.1:23342", "--control-token-file", "/data/run/hashrate/control-token",
-              "--config", "/data/run/hashrate/settings.json", "--relays", "${LS_RELAYS:-wss://relay.damus.io,wss://nos.lol,wss://relay.kilombino.com}",
+              "--config", "/data/run/hashrate/settings.json", "--relays", "${LS_RELAYS:-wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol}",
               "--gateway", "http://127.0.0.1:${LS_GW_PORT:-8402}",
               "--miners-public", "${LS_LAN_HOST:-127.0.0.1}:23340", "--link-lan", "${LS_LAN_HOST:-127.0.0.1}:23341",
               "--report", "/data/hashrate/hasher.json"]
@@ -226,7 +226,7 @@ services:
     command: ["renter", "--key", "/data/hashrate/renter.key", "--control", "127.0.0.1:${LS_HASHTAKER_CONTROL_PORT:-23343}",
               "--control-token-file", "/data/run/hashrate/control-token", "--state", "/data/hashrate",
               "--upstream", "${LS_DATUM:-127.0.0.1:23334}", "--user", "${LS_DATUM_USER:-rented}",
-              "--relays", "${LS_RELAYS:-wss://relay.damus.io,wss://nos.lol,wss://relay.kilombino.com}",
+              "--relays", "${LS_RELAYS:-wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol}",
               "--signer", "/data/run/signer/signer.sock", "--task", "hashrate"]
     volumes:
       - ${LS_DATA_DIR}/hashrate:/data/hashrate

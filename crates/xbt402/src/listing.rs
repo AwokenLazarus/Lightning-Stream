@@ -565,7 +565,7 @@ mod tests {
             "name": "Films",
             "kind": "video",
             "prices": {"byte_msat": 20, "per_bytes": 1048576},
-            "items": [{"title": "Sintel", "url": "https://media.lazarus-xbt.xyz/Videos/s", "year": 2010, "credit": "(c) Blender Foundation"}],
+            "items": [{"title": "Sintel", "url": "https://stream.lazarus-xbt.xyz/Videos/s", "year": 2010, "credit": "(c) Blender Foundation"}],
             "licence": "CC BY 3.0",
             "credits": "(c) Blender Foundation, CC BY 3.0",
             "updated": "2026-10-25",
@@ -576,7 +576,7 @@ mod tests {
     #[test]
     fn a_listing_verifies_only_under_the_terms_key() {
         let (sk, pk) = key();
-        let doc = sign(&sk, &document(&draft(), "https://media.lazarus-xbt.xyz", &pk));
+        let doc = sign(&sk, &document(&draft(), "https://stream.lazarus-xbt.xyz", &pk));
         let got = verify(&doc, &pk).unwrap();
         assert_eq!(got.name, "Films");
         assert_eq!(got.items[0].year, Some(2010));
@@ -709,7 +709,7 @@ mod tests {
     #[test]
     fn fetch_finds_the_terms_under_an_item_when_each_item_is_its_own_route() {
         let (sk, pk) = key();
-        let origin = "https://media.lazarus-xbt.xyz";
+        let origin = "https://stream.lazarus-xbt.xyz";
         let body = serde_json::to_string(&sign(&sk, &document(&draft(), origin, &pk))).unwrap();
         let terms = serde_json::to_string(&json!({"accepts": [{"extra": {"receiptKey": pk}}]})).unwrap();
         let mut asked = vec![];
@@ -717,7 +717,7 @@ mod tests {
             asked.push(url.to_string());
             Ok(if url.ends_with(PATH) {
                 Page { status: 200, headers: vec![], body: body.clone() }
-            } else if url == "https://media.lazarus-xbt.xyz/Videos/s" {
+            } else if url == "https://stream.lazarus-xbt.xyz/Videos/s" {
                 Page { status: 402, headers: vec![], body: terms.clone() }
             } else {
                 Page { status: 404, headers: vec![], body: String::new() }
@@ -725,13 +725,13 @@ mod tests {
         })
         .unwrap();
         assert_eq!(got.services.len(), 1);
-        assert!(asked.contains(&"https://media.lazarus-xbt.xyz/Videos/s".to_string()));
+        assert!(asked.contains(&"https://stream.lazarus-xbt.xyz/Videos/s".to_string()));
     }
 
     #[test]
     fn fetch_reads_the_listing_and_the_402() {
         let (sk, pk) = key();
-        let origin = "https://media.lazarus-xbt.xyz";
+        let origin = "https://stream.lazarus-xbt.xyz";
         let doc = sign(&sk, &document(&draft(), origin, &pk));
         let body = serde_json::to_string(&doc).unwrap();
         let terms = json!({"accepts": [{"extra": {"receiptKey": pk}}]});

@@ -2,25 +2,25 @@
   {
     "name": "Creative Commons films",
     "kind": "video",
-    "seller": "https://media.lazarus-xbt.xyz",
+    "seller": "https://stream.lazarus-xbt.xyz",
     "price_text": "20 sat a MiB",
     "items": [
       {
         "title": "Big Buck Bunny",
         "year": 2008,
-        "url": "https://media.lazarus-xbt.xyz/Videos/057627270372dfed4d8ea15fa9ab5f01/stream?static=true",
+        "url": "https://stream.lazarus-xbt.xyz/Videos/057627270372dfed4d8ea15fa9ab5f01/stream?static=true",
         "credit": "(c) Blender Foundation, CC BY 3.0"
       },
       {
         "title": "Elephants Dream",
         "year": 2006,
-        "url": "https://media.lazarus-xbt.xyz/Videos/0f0967c6719ebc0951976655686df3bc/stream?static=true",
+        "url": "https://stream.lazarus-xbt.xyz/Videos/0f0967c6719ebc0951976655686df3bc/stream?static=true",
         "credit": "(c) Blender Foundation, CC BY 2.5"
       },
       {
         "title": "Sintel",
         "year": 2010,
-        "url": "https://media.lazarus-xbt.xyz/Videos/b9937d76e453d11b407d84f188e23ed1/stream?static=true",
+        "url": "https://stream.lazarus-xbt.xyz/Videos/b9937d76e453d11b407d84f188e23ed1/stream?static=true",
         "credit": "(c) Blender Foundation, CC BY 3.0"
       }
     ]

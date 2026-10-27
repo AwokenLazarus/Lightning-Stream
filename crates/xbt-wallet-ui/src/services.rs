@@ -450,7 +450,7 @@ mod tests {
     fn the_example_lists_the_three_films() {
         let v = parse(include_str!("../examples/services.example.json")).unwrap();
         assert_eq!(v.len(), 1);
-        assert_eq!((v[0].kind, v[0].price_text.as_str(), v[0].seller.as_str()), (Kind::Video, "20 sat a MiB", "https://media.lazarus-xbt.xyz"));
+        assert_eq!((v[0].kind, v[0].price_text.as_str(), v[0].seller.as_str()), (Kind::Video, "20 sat a MiB", "https://stream.lazarus-xbt.xyz"));
         let titles: Vec<_> = v[0].items.iter().map(|i| i.title.as_str()).collect();
         assert_eq!(titles, ["Big Buck Bunny", "Elephants Dream", "Sintel"]);
         assert!(v[0].items[1].credit.contains("CC BY 2.5"));

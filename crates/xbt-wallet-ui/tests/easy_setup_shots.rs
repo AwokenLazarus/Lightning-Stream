@@ -49,10 +49,10 @@ fn easy_setup_screenshots() {
     let keys = xbt_wallet_ui::node_keys::Settings { rest: "https://10.21.21.66:8180".into(), tls_cert: None, admin: ln.join("none"),
                                                     rail_dir: Some(ln.clone()), gw_dir: None };
     xbt_wallet_ui::node_keys::make_keys(&keys, &mut |_, _| Ok(rail.clone())).unwrap();
-    let film = "https://media.lazarus-xbt.xyz/Videos/0f0967c6719ebc0951976655686df3bc/stream?static=true";
+    let film = "https://stream.lazarus-xbt.xyz/Videos/0f0967c6719ebc0951976655686df3bc/stream?static=true";
     let services = data.path().join("services.json");
     std::fs::write(&services, json!([
-        {"name": "Creative Commons films", "kind": "video", "seller": "https://media.lazarus-xbt.xyz", "price_text": "20 sat a MiB",
+        {"name": "Creative Commons films", "kind": "video", "seller": "https://stream.lazarus-xbt.xyz", "price_text": "20 sat a MiB",
          "items": [{"title": "Elephants Dream", "year": 2006, "url": film, "credit": "(c) Blender Foundation, CC BY 2.5"}]},
         {"name": "My films", "kind": "video", "seller": "https://shop.example", "price_text": "20 sat a MiB",
          "items": [{"title": "Sintel", "year": 2010, "url": "https://shop.example/Videos/abc/stream", "credit": "(c) Blender Foundation, CC BY 3.0"}]}
@@ -102,7 +102,7 @@ fn easy_setup_screenshots() {
     let _s2 = xbt_signer::server::spawn(rig2.s.clone(), &sock2, false).unwrap();
     let data2 = tempfile::tempdir().unwrap();
     let services2 = data2.path().join("services.json");
-    std::fs::write(&services2, json!([{"name": "Creative Commons films", "kind": "video", "seller": "https://media.lazarus-xbt.xyz",
+    std::fs::write(&services2, json!([{"name": "Creative Commons films", "kind": "video", "seller": "https://stream.lazarus-xbt.xyz",
         "price_text": "20 sat a MiB", "items": [{"title": "Elephants Dream", "year": 2006, "url": film, "credit": "CC BY 2.5"}]}]).to_string()).unwrap();
     let mut cfg2 = Config::for_test(sock2, data2.path().join("ui"), "127.0.0.1:0");
     cfg2.platform_login = Some("localhost".into());
