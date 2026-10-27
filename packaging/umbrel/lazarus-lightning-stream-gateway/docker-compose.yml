@@ -45,7 +45,7 @@ services:
       APP_PORT: 8481
 
   init:
-    image: ghcr.io/awokenlazarus/xbt-init:0.1.0-2fe4f1051c00@sha256:16e0c94b588dd93435779184862c788ba465d6d47cf5040468b784af047c9224
+    image: ghcr.io/awokenlazarus/xbt-init:0.1.0-8752f3aaee30@sha256:6acead9eec3a4380558f9d93b2043d2c49dafbeffbbbba8f27d0c9384e17c2b7
     user: "0:0"
     restart: "no"
     network_mode: none
@@ -66,7 +66,7 @@ services:
 
   gateway:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-gateway:0.1.0-2fe4f1051c00@sha256:8277fb99bc2aa54e34b59bf8588db947936c1b37aba2a96badf02a4b8470f6be
+    image: ghcr.io/awokenlazarus/xbt-gateway:0.1.0-8752f3aaee30@sha256:85a9d729d81b8c9ddc6b76198a51d70446be97d81325fefcd24a0fffd6d9cda3
     # each held ticket is followed on its own connection to the node; a stop cancels nothing
     stop_grace_period: 30s
     volumes:
@@ -76,7 +76,7 @@ services:
 
   ui:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-2fe4f1051c00@sha256:f7c1fa2e9e4f4ebbc132b524a01ce992eb64a994a437619d3687135c07d58cbb
+    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-8752f3aaee30@sha256:21ef86c8497248d98aadeae8f60b38be668475b305c9e03d437164655d159282
     stop_grace_period: 15s
     environment:
       XBT_UI_ROLE: gateway

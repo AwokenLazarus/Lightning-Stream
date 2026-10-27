@@ -128,14 +128,14 @@ export const RELAYS = ['wss://relay.lazarus-xbt.xyz', 'wss://relay.kilombino.com
  * one image set for Umbrel, StartOS, Linux and xbt-compute.
  */
 export const IMAGES: Record<ImageKey, string> = {
-  init: 'ghcr.io/awokenlazarus/xbt-init:0.1.0-2fe4f1051c00@sha256:16e0c94b588dd93435779184862c788ba465d6d47cf5040468b784af047c9224',
-  signer: 'ghcr.io/awokenlazarus/xbt-signer:0.1.0-2fe4f1051c00@sha256:830c973a897754c9a4256d0b326fcb20e1c0010972d6360b73f5e0ffbb341c7a',
-  witness: 'ghcr.io/awokenlazarus/xbt-anchor-witness:0.1.0-2fe4f1051c00@sha256:ab50f74a9e68d28497445364545a936b564b820e61c2484782b04bb01266deae',
-  mcp: 'ghcr.io/awokenlazarus/xbt-wallet-mcp:0.1.0-2fe4f1051c00@sha256:cc3218dc5f3dc941457a0d0087bc19d75baea4c37648942c8cb544e7481f131a',
-  ui: 'ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-2fe4f1051c00@sha256:f7c1fa2e9e4f4ebbc132b524a01ce992eb64a994a437619d3687135c07d58cbb',
-  gateway: 'ghcr.io/awokenlazarus/xbt-gateway:0.1.0-2fe4f1051c00@sha256:8277fb99bc2aa54e34b59bf8588db947936c1b37aba2a96badf02a4b8470f6be',
-  connector: 'ghcr.io/awokenlazarus/lightning-stream:0.1.0-2fe4f1051c00@sha256:f58af6358f02418f61250db185301ed9357696c734e7190adf2cd527fb9125f7',
-  hashlink: 'ghcr.io/awokenlazarus/xbt-hashlink:0.1.0-2fe4f1051c00@sha256:ac85f943f20cb7cbdadba74492860c1166dc423ec7eb13181c0492ff3afb90a3',
+  init: 'ghcr.io/awokenlazarus/xbt-init:0.1.0-8752f3aaee30@sha256:6acead9eec3a4380558f9d93b2043d2c49dafbeffbbbba8f27d0c9384e17c2b7',
+  signer: 'ghcr.io/awokenlazarus/xbt-signer:0.1.0-8752f3aaee30@sha256:d523fad652bc1e90a6d3bc469494b3e4a9c673aafb1cee1fb1942d1e80ce1d30',
+  witness: 'ghcr.io/awokenlazarus/xbt-anchor-witness:0.1.0-8752f3aaee30@sha256:606c0be2671c9e8426d0bbf7e86cff5dd8447ab5c06c82b92d1138a891f6b805',
+  mcp: 'ghcr.io/awokenlazarus/xbt-wallet-mcp:0.1.0-8752f3aaee30@sha256:019406ee91a6de607117d54250140172cd6057c3d5dce5ce0104834411c188d6',
+  ui: 'ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-8752f3aaee30@sha256:21ef86c8497248d98aadeae8f60b38be668475b305c9e03d437164655d159282',
+  gateway: 'ghcr.io/awokenlazarus/xbt-gateway:0.1.0-8752f3aaee30@sha256:85a9d729d81b8c9ddc6b76198a51d70446be97d81325fefcd24a0fffd6d9cda3',
+  connector: 'ghcr.io/awokenlazarus/lightning-stream:0.1.0-8752f3aaee30@sha256:ebf045cc867356be8daa7ad6d7f04ad004d2b490f5cc1ec80aa0e74185851573',
+  hashlink: 'ghcr.io/awokenlazarus/xbt-hashlink:0.1.0-8752f3aaee30@sha256:9aa93c08282bb86ccc88f5abdf566d12dacee83dcb039c2857ac8dec79fed439',
 }
 
 const vol = (subpath: string | null, mountpoint: string, readonly = false): MountSpec => ({ subpath, mountpoint, readonly })
