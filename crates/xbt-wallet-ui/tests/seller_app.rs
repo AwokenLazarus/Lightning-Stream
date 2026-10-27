@@ -205,6 +205,20 @@ fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
 }
 
+/// The UI with `n` app ports, picked free just before it binds them: tried again on fresh ports
+/// when another test took one in between.
+fn spawn_ui(n: usize, make: impl Fn(Vec<u16>) -> Config) -> (xbt_wallet_ui::server::Running, Vec<u16>) {
+    // a port taken in between fails the start, so it can be tried again (the caller holds ENV)
+    std::env::set_var("XBT_UI_APP_PORTS_STRICT", "1");
+    for _ in 0..8 {
+        let ports: Vec<u16> = (0..n).map(|_| free_port()).collect();
+        if let Ok(srv) = xbt_wallet_ui::server::spawn(App::new(make(ports.clone())).unwrap()) {
+            return (srv, ports);
+        }
+    }
+    panic!("no free ports for the app");
+}
+
 #[test]
 fn a_sellers_own_page_works_inside_the_app_and_cannot_reach_the_wallet() {
     let home = std::env::var("HOME").unwrap_or_default();
@@ -230,9 +244,12 @@ fn a_sellers_own_page_works_inside_the_app_and_cannot_reach_the_wallet() {
     let _sock = xbt_signer::server::spawn(rig.s.clone(), &sock_path, false).unwrap();
     let data = tempfile::tempdir().unwrap();
     let ui_port = free_port();
-    let mut cfg = Config::for_test(sock_path, data.path().join("ui"), &format!("127.0.0.1:{ui_port}"));
-    cfg.connector = format!("http://{}", crun.addr);
-    cfg.app_ports = vec![free_port(), free_port()];
+    let make = |ports: Vec<u16>| {
+        let mut cfg = Config::for_test(sock_path.clone(), data.path().join("ui"), &format!("127.0.0.1:{ui_port}"));
+        cfg.connector = format!("http://{}", crun.addr);
+        cfg.app_ports = ports;
+        cfg
+    };
     let wallet = format!("http://127.0.0.1:{ui_port}");
     std::fs::create_dir_all(data.path().join("ui")).unwrap();
     let services = json!([
@@ -245,8 +262,7 @@ fn a_sellers_own_page_works_inside_the_app_and_cannot_reach_the_wallet() {
     ]);
     std::fs::write(data.path().join("ui/services.json"), services.to_string()).unwrap();
     let services_before = std::fs::read_to_string(data.path().join("ui/services.json")).unwrap();
-    let app = App::new(cfg).unwrap();
-    let srv = xbt_wallet_ui::server::spawn(app).unwrap();
+    let (srv, _) = spawn_ui(2, make);
     assert_eq!(srv.app_ports.len(), 2);
     let policy_before = rig.call("policy_get", json!({}))["sha256"].clone();
     let code = std::fs::read_to_string(data.path().join("ui/setup-code")).unwrap();
@@ -296,15 +312,17 @@ fn an_app_port_serves_only_the_visit_whose_cookie_it_gave() {
     let sock_path = rig.dir.path().join("signer.sock");
     let _sock = xbt_signer::server::spawn(rig.s.clone(), &sock_path, false).unwrap();
     let data = tempfile::tempdir().unwrap();
-    let mut cfg = Config::for_test(sock_path, data.path().join("ui"), "127.0.0.1:0");
-    cfg.connector = format!("http://{}", crun.addr);
-    let (pa, pb) = (free_port(), free_port());
-    cfg.app_ports = vec![pa, pb];
     std::fs::create_dir_all(data.path().join("ui")).unwrap();
     let base = format!("{seller}/jf/");
     std::fs::write(data.path().join("ui/services.json"), json!([{"name": "Films", "kind": "video", "seller": seller, "price_text": "20 sat a MiB", "items": [],
         "app": format!("{seller}/jf/web/"), "app_base": base}]).to_string()).unwrap();
-    let srv = xbt_wallet_ui::server::spawn(App::new(cfg).unwrap()).unwrap();
+    let (srv, ports) = spawn_ui(2, |ports| {
+        let mut cfg = Config::for_test(sock_path.clone(), data.path().join("ui"), "127.0.0.1:0");
+        cfg.connector = format!("http://{}", crun.addr);
+        cfg.app_ports = ports;
+        cfg
+    });
+    let (pa, pb) = (ports[0], ports[1]);
     let wallet = format!("http://{}", srv.addr);
     let agent = ureq::AgentBuilder::new().redirects(0).build();
     let send = |method: &str, url: &str, cookie: &str, body: Option<&str>| -> (u16, Vec<(String, String)>, String) {
@@ -363,4 +381,59 @@ fn an_app_port_serves_only_the_visit_whose_cookie_it_gave() {
     let (st, _, _) = send("GET", &format!("http://127.0.0.1:{port}/web/"), &both, None);
     assert_eq!(st, 403, "the stopped visit's cookie is gone");
     assert_eq!(paid_urls.lock().unwrap().len(), calls);
+}
+
+/// The owner's own shop: its page is previewed free, straight from the service on the box through
+/// the same app port; nothing goes to the connector, so nothing is paid.
+#[test]
+fn the_owner_previews_their_own_shops_page_for_free() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let sl = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let service = format!("http://{}", sl.local_addr().unwrap());
+    let _srun = xbt_svc::http::serve(Arc::new(Seller { report: Arc::new(Mutex::new(None)) }), sl, 8).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (pay_sock, paid_urls) = signer(dir.path());
+    let crun = lightning_stream::serve(lightning_stream::Config { signer: pay_sock, stream_dir: dir.path().to_path_buf(), task: "app".into(), max_sats: 2_000 },
+                                       std::net::TcpListener::bind("127.0.0.1:0").unwrap()).unwrap();
+    let rig = Rig::new(json!({}), true);
+    let sock_path = rig.dir.path().join("signer.sock");
+    let _sock = xbt_signer::server::spawn(rig.s.clone(), &sock_path, false).unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let gw = tempfile::tempdir().unwrap();
+    // this box's own shop sells the media server's page under /jf/, from the service on the box
+    std::fs::write(gw.path().join("config.json"), json!({"public_url": "https://shop.example",
+        "routes": [{"path": "/jf/", "upstream": service, "price": {"byte_msat": 20000, "per_bytes": 1048576}}]}).to_string()).unwrap();
+    std::fs::create_dir_all(data.path().join("ui")).unwrap();
+    std::fs::write(data.path().join("ui/services.json"), json!([{"name": "Films", "kind": "video", "seller": "https://shop.example", "price_text": "20 sat a MiB",
+        "items": [], "app": "https://shop.example/jf/web/", "app_base": "https://shop.example/jf/"}]).to_string()).unwrap();
+    let (srv, ports) = spawn_ui(1, |ports| {
+        let mut cfg = Config::for_test(sock_path.clone(), data.path().join("ui"), "127.0.0.1:0");
+        cfg.connector = format!("http://{}", crun.addr);
+        cfg.sell = true;
+        cfg.gw.dir = gw.path().to_path_buf();
+        cfg.app_ports = ports;
+        cfg
+    });
+    let port = ports[0];
+    let wallet = format!("http://{}", srv.addr);
+    let agent = ureq::AgentBuilder::new().redirects(0).build();
+    let code = std::fs::read_to_string(data.path().join("ui/setup-code")).unwrap();
+    let r = agent.post(&format!("{wallet}/setup-password")).set("Content-Type", "application/x-www-form-urlencoded")
+        .send_string(&format!("code={}&password=a+long+box+password&password2=a+long+box+password", code.trim()));
+    let r = match r { Ok(x) | Err(ureq::Error::Status(_, x)) => x, Err(e) => panic!("{e}") };
+    let session = r.header("set-cookie").unwrap().split(';').next().unwrap().to_string();
+    let enc = xbt_wallet_ui::services::urlenc;
+    let q = format!("u={}&b={}", enc("https://shop.example/jf/web/"), enc("https://shop.example/jf/"));
+    let page = agent.get(&format!("{wallet}/app?{q}")).set("Cookie", &session).call().unwrap().into_string().unwrap();
+    assert!(page.contains("Preview the app (free)") && !page.contains("Spend at most"), "{page}");
+    let csrf = { let i = page.find("name=\"csrf\" value=\"").unwrap() + 19; page[i..i + page[i..].find('"').unwrap()].to_string() };
+    let page = agent.post(&format!("{wallet}/app")).set("Cookie", &session).set("Content-Type", "application/x-www-form-urlencoded")
+        .send_string(&format!("csrf={csrf}&{q}&preview=1")).unwrap().into_string().unwrap();
+    assert!(page.contains("nothing is paid"), "{page}");
+    let code = { let i = page.find("data-code=\"").unwrap() + 11; page[i..i + page[i..].find('"').unwrap()].to_string() };
+    let r = agent.get(&format!("http://127.0.0.1:{port}/__ls/enter?c={code}")).call().unwrap();
+    let cookie = r.header("set-cookie").unwrap().split(';').next().unwrap().to_string();
+    let body = agent.get(&format!("http://127.0.0.1:{port}/web/")).set("Cookie", &cookie).call().unwrap().into_string().unwrap();
+    assert!(body.contains("media server"), "{body}");
+    assert!(paid_urls.lock().unwrap().is_empty(), "the preview went through the connector");
 }

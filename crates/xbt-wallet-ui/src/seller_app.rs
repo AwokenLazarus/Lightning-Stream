@@ -35,6 +35,9 @@ struct Grant {
     entry: String,
     /// The seller's mark in this port's cookie names: one seller's cookies never go to another.
     tag: String,
+    /// The owner's free preview of a page of their own shop: the service on the box it is asked
+    /// from directly, as the gateway would ask it. Nothing is paid; no connector visit.
+    direct: Option<String>,
 }
 
 #[derive(Default)]
@@ -45,11 +48,15 @@ struct State {
     codes: HashMap<String, (Instant, Grant, bool)>,
     /// Cookies: secret → grant.
     grants: HashMap<String, Grant>,
+    /// The owner's free previews, by visit id: nothing to ask the connector about.
+    previews: std::collections::HashSet<String>,
 }
 
 #[derive(Default)]
 pub struct AppOrigins {
     state: Mutex<State>,
+    /// The app ports that are being served: those of `XBT_UI_APP_PORTS` this UI could bind.
+    live: Mutex<Vec<u16>>,
 }
 
 impl AppOrigins {
@@ -99,14 +106,15 @@ fn secret() -> String {
 }
 
 impl App {
-    fn app_ports(&self) -> &[u16] {
-        &self.cfg.app_ports
+    fn app_ports(&self) -> Vec<u16> {
+        self.apps.live.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// A port for `seller`: the one it had, else a free one, else the one given out longest ago.
     /// `true`: the port's storage was another seller's.
     fn port_for(&self, seller: &str) -> Option<(u16, bool)> {
         let ports = self.app_ports();
+        let ports = ports.as_slice();
         let mut s = self.apps.lock();
         let pick = ports.iter().copied().find(|p| s.ports.get(p).is_some_and(|(o, _)| o == seller))
             .or_else(|| ports.iter().copied().find(|p| !s.ports.contains_key(p)))
@@ -131,6 +139,15 @@ impl App {
             return self.page("Open the app", ctx, "<p class=\"empty\">This box does not open sellers' apps.</p>".into());
         }
         let host = crate::app::stream_pages::host(&svc.seller);
+        if self.is_own_shop(&svc.seller) {
+            let b = format!("<section class=\"card primary\"><h2>Preview your own app</h2>\
+                <p>This is your shop: buyers open <strong>{}</strong> here and pay {} for what it loads. You can try it for free: it comes \
+                straight from your service on this box, and nothing is paid.</p>\
+                <form method=\"post\" action=\"./app\">{}<input type=\"hidden\" name=\"u\" value=\"{}\"><input type=\"hidden\" name=\"b\" value=\"{}\">\
+                <input type=\"hidden\" name=\"preview\" value=\"1\"><div class=\"row\"><button>Preview the app (free)</button><a href=\"./browse\">Cancel</a></div></form></section>",
+                esc(&svc.name), esc(&svc.price_text), App::csrf_input(ctx), esc(&entry), esc(&base));
+            return self.page("Open the app", ctx, b);
+        }
         let b = format!("<section class=\"card primary\"><h2>Open {}'s app</h2>\
             <p>You use <strong>{}</strong> as it is on {}'s own network, inside this page. What it loads is paid at {}, \
             and stops at the limit you set here.</p>\
@@ -150,8 +167,20 @@ impl App {
             self.flash(ctx, false, "That app is not one of your sellers' any more.");
             return Resp::redirect("./browse");
         };
-        let limit: i64 = f.get("limit").and_then(|v| v.trim().replace(',', "").parse().ok()).unwrap_or(0);
-        if !(1..=10_000_000).contains(&limit) {
+        let preview = f.get("preview").is_some_and(|v| v == "1") && self.is_own_shop(&svc.seller);
+        let direct = if preview {
+            match self.preview_upstream(&base) {
+                Ok(u) => Some(format!("{}/", u.trim_end_matches('/'))),
+                Err(e) => {
+                    self.flash(ctx, false, format!("The preview could not be opened: {e}"));
+                    return Resp::redirect("./browse");
+                }
+            }
+        } else {
+            None
+        };
+        let limit: i64 = if preview { 0 } else { f.get("limit").and_then(|v| v.trim().replace(',', "").parse().ok()).unwrap_or(0) };
+        if !preview && !(1..=10_000_000).contains(&limit) {
             self.flash(ctx, false, "Set a limit of 1 sat or more.");
             return Resp::redirect(&format!("./app?u={}&b={}", crate::services::urlenc(&entry), crate::services::urlenc(&base)));
         }
@@ -160,7 +189,9 @@ impl App {
             self.flash(ctx, false, "This box does not open sellers' apps.");
             return Resp::redirect("./browse");
         };
-        let opened = connector_json("POST", &format!("{}/visits", self.cfg.connector.trim_end_matches('/')), Some(&json!({"base": base, "limit_sats": limit})));
+        let opened = if preview { Ok((200, json!({"visit": secret()}))) } else {
+            connector_json("POST", &format!("{}/visits", self.cfg.connector.trim_end_matches('/')), Some(&json!({"base": base, "limit_sats": limit})))
+        };
         let visit = match opened {
             Ok((200, v)) => v.get("visit").and_then(Value::as_str).unwrap_or("").to_string(),
             Ok((_, v)) => {
@@ -173,22 +204,27 @@ impl App {
             }
         };
         let path = entry.strip_prefix(&base).unwrap_or("");
-        let grant = Grant { visit: visit.clone(), port, base: base.clone(), entry: format!("/{path}"), tag: seller_tag(&seller) };
+        let grant = Grant { visit: visit.clone(), port, base: base.clone(), entry: format!("/{path}"), tag: seller_tag(&seller), direct };
         let code = secret();
         {
             let mut s = self.apps.lock();
+            if preview {
+                s.previews.insert(visit.clone());
+            }
             s.codes.retain(|_, (t, _, _)| t.elapsed() < CODE_TTL);
             s.codes.insert(code.clone(), (Instant::now(), grant, other));
         }
         let host = crate::app::stream_pages::host(&svc.seller);
         let b = format!("<section class=\"card app-visit\" data-visit=\"{}\" data-port=\"{port}\" data-code=\"{}\">\
             <div class=\"offer-head\"><h2>{}</h2><span class=\"pill good\" data-visit-state>Open</span></div>\
-            <p><span data-visit-spent>0</span> of <strong>{} sat</strong> spent on this visit &middot; {} \
+            <p>{} &middot; {} \
             <form method=\"post\" action=\"./app-stop\" class=\"inline\">{}<input type=\"hidden\" name=\"visit\" value=\"{}\"><button class=\"danger\">Stop</button></form></p>\
             <iframe class=\"seller-app\" title=\"{}\" sandbox=\"allow-scripts allow-same-origin allow-forms allow-downloads allow-modals allow-pointer-lock\" \
             allow=\"fullscreen; autoplay; encrypted-media; picture-in-picture\" referrerpolicy=\"no-referrer\"></iframe>\
             <p class=\"hint\" data-visit-note>{}'s own page. It cannot see your wallet. Close this page or press Stop to end the visit.</p></section>",
-            esc(&visit), esc(&code), esc(&svc.name), limit, esc(&svc.price_text), App::csrf_input(ctx), esc(&visit), esc(&svc.name), esc(&host));
+            esc(&visit), esc(&code), esc(&svc.name),
+            if preview { "Your own shop, free: nothing is paid".to_string() } else { format!("<span data-visit-spent>0</span> of <strong>{limit} sat</strong> spent on this visit") },
+            esc(&svc.price_text), App::csrf_input(ctx), esc(&visit), esc(&svc.name), esc(&host));
         let frames: String = self.app_ports().iter().map(|p| format!(" http://*:{p} https://*:{p}")).collect();
         let csp = format!("{}; media-src 'self'; frame-src{frames}", crate::server::CSP);
         self.page(&format!("{}'s app", host), ctx, b).header("Content-Security-Policy", &csp)
@@ -198,7 +234,9 @@ impl App {
     pub(crate) fn app_stop(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {
         let visit = f.get("visit").cloned().unwrap_or_default();
         if visit.bytes().all(|b| b.is_ascii_hexdigit()) && !visit.is_empty() {
-            let _ = connector_json("POST", &format!("{}/visits/{visit}/stop", self.cfg.connector.trim_end_matches('/')), Some(&json!({})));
+            if !self.apps.lock().previews.remove(&visit) {
+                let _ = connector_json("POST", &format!("{}/visits/{visit}/stop", self.cfg.connector.trim_end_matches('/')), Some(&json!({})));
+            }
             self.apps.lock().grants.retain(|_, g| g.visit != visit);
         }
         self.flash(ctx, true, "Stopped. The app is closed and nothing more is paid for it.");
@@ -210,6 +248,9 @@ impl App {
         let visit = q.get("v").cloned().unwrap_or_default();
         if visit.is_empty() || !visit.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Resp::json(400, &json!({"error": "no visit"}));
+        }
+        if self.apps.lock().previews.contains(&visit) {
+            return Resp::json(200, &json!({"spent_sats": 0, "ended": null}));
         }
         match connector_json("GET", &format!("{}/visits/{visit}", self.cfg.connector.trim_end_matches('/')), None) {
             Ok((200, v)) => {
@@ -331,7 +372,11 @@ impl xbt_svc::http::Handler for AppOrigin {
         }
         let prefix = cookie_prefix(self.port, &g.tag);
         let target = rq.target.trim_start_matches('/');
-        let url = format!("{}/v/{}/{target}", self.app.cfg.connector.trim_end_matches('/'), g.visit);
+        // the owner's free preview: the service on the box itself; a visit: through the connector, paid
+        let url = match &g.direct {
+            Some(d) => format!("{d}{target}"),
+            None => format!("{}/v/{}/{target}", self.app.cfg.connector.trim_end_matches('/'), g.visit),
+        };
         let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(5)).redirects(0).build();
         let mut req = agent.request(&rq.method.to_ascii_uppercase(), &url);
         for (k, v) in &rq.headers {
@@ -370,7 +415,7 @@ impl xbt_svc::http::Handler for AppOrigin {
                         }
                     }
                     // a redirect to the seller's own address stays on this port
-                    "location" => headers.push(("Location".into(), match v.strip_prefix(&g.base) {
+                    "location" => headers.push(("Location".into(), match v.strip_prefix(&g.base).or_else(|| g.direct.as_deref().and_then(|d| v.strip_prefix(d))) {
                         Some(rest) => format!("/{rest}"),
                         None => v.to_string(),
                     })),
@@ -401,16 +446,22 @@ impl xbt_svc::http::Handler for AppOrigin {
     }
 }
 
-/// Serve every app port, on the UI's own address.
-pub fn spawn(app: &Arc<App>) -> Result<Vec<(u16, xbt_svc::http::Running)>, String> {
+/// Serve the app ports, on the UI's own address. A port this UI cannot bind is left out, and said
+/// in the log: the rest of the app works without it. `Err` only where `strict` and one is left out.
+pub fn spawn(app: &Arc<App>, strict: bool) -> Result<Vec<(u16, xbt_svc::http::Running)>, String> {
     let host = app.cfg.bind.rsplit_once(':').map(|(h, _)| h.to_string()).unwrap_or_else(|| "127.0.0.1".into());
     let mut out = vec![];
     for &port in &app.cfg.app_ports {
         let addr = format!("{host}:{port}");
-        let l = std::net::TcpListener::bind(&addr).map_err(|e| format!("bind {addr}: {e}"))?;
-        let run = xbt_svc::http::serve(Arc::new(AppOrigin { app: app.clone(), port }), l, 8).map_err(|e| format!("serve {addr}: {e}"))?;
-        out.push((port, run));
+        let run = std::net::TcpListener::bind(&addr).map_err(|e| format!("bind {addr}: {e}"))
+            .and_then(|l| xbt_svc::http::serve(Arc::new(AppOrigin { app: app.clone(), port }), l, 8).map_err(|e| format!("serve {addr}: {e}")));
+        match run {
+            Ok(r) => out.push((port, r)),
+            Err(e) if strict => return Err(e),
+            Err(e) => eprintln!("xbt-wallet-ui: a seller's app port is left out: {e}"),
+        }
     }
+    *app.apps.live.lock().unwrap_or_else(|p| p.into_inner()) = out.iter().map(|(p, _)| *p).collect();
     Ok(out)
 }
 

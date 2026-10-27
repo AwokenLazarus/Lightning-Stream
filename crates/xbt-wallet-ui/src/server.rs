@@ -367,7 +367,8 @@ impl Running {
 pub fn spawn(app: Arc<App>) -> Result<Running, String> {
     let listener = std::net::TcpListener::bind(&app.cfg.bind).map_err(|e| format!("bind {}: {e}", app.cfg.bind))?;
     let threads = app.cfg.threads;
-    let apps = crate::seller_app::spawn(&app)?;
+    // strict for a test (`XBT_UI_APP_PORTS_STRICT`), which tries a port taken in between again on another
+    let apps = crate::seller_app::spawn(&app, std::env::var_os("XBT_UI_APP_PORTS_STRICT").is_some())?;
     let run = xbt_svc::http::serve(Arc::new(Ui(app)), listener, threads).map_err(|e| format!("serve: {e}"))?;
     let app_ports = apps.iter().map(|(p, r)| (*p, r.addr)).collect();
     let apps = apps.iter().map(|(_, r)| r.stopper()).collect();

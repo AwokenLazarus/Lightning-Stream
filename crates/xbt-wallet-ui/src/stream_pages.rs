@@ -335,8 +335,10 @@ fn service_html(s: &Service, own: bool) -> String {
     if !s.app.is_empty() {
         let seller = host(&s.seller);
         b.push_str(&if own {
-            "<section class=\"card\"><h2>Its own app</h2><p>Buyers can open this service's own web page inside their app, \
-             and pay your price for what it loads.</p></section>".to_string()
+            format!("<section class=\"card\"><h2>Its own app</h2><p>Buyers can open this service's own web page inside their app, \
+                and pay your price for what it loads. You can try it here for free.</p>\
+                <div class=\"row\"><a class=\"button-link\" href=\"./app?u={}&amp;b={}\">Preview the app (free)</a></div></section>",
+                services::urlenc(&s.app), services::urlenc(&s.app_base))
         } else {
             format!("<section class=\"card primary\"><h2>Its own app</h2><p>Use {}'s own page for this service, inside Lightning Stream. \
                 What it loads is paid at the price above, up to a limit you set.</p>\
