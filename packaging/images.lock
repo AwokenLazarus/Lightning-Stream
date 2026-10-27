@@ -1,12 +1,12 @@
 # The published images the packages pin, written by scripts/oci_publish.sh. One line per image:
 #   <image> <registry>/<image>:<version>-<commit>@<index digest>
-# Built from commit 686f46b4060a for linux/amd64, linux/arm64 and linux/arm/v7. packaging/pin_images.py writes
+# Built from commit 1aae24193e77 for linux/amd64, linux/arm64 and linux/arm/v7. packaging/pin_images.py writes
 # them into the Umbrel compose files and the StartOS specs; packaging/umbrel/lint.py checks they agree.
-xbt-init ghcr.io/awokenlazarus/xbt-init:0.1.0-686f46b4060a@sha256:755e0db764e145322154cd4d91932f8eee76c7551b448656822bcf5698e618f0
-xbt-signer ghcr.io/awokenlazarus/xbt-signer:0.1.0-686f46b4060a@sha256:53db4ee21400bf961bd79465f49f4d7cb78d48a20180ae841d2658d0a58d5181
-xbt-anchor-witness ghcr.io/awokenlazarus/xbt-anchor-witness:0.1.0-686f46b4060a@sha256:8911b7a1d6dbf92f19a07e9c38943aed5592d7ce8ee2264f3da4b0f70f84d851
-xbt-wallet-mcp ghcr.io/awokenlazarus/xbt-wallet-mcp:0.1.0-686f46b4060a@sha256:84e88bdbe0a9f244e0fb1531e3014f520bf99f7a5cd00a2c5b99ccc545fbc9e4
-xbt-wallet-ui ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-686f46b4060a@sha256:2cf2b34cdc74e20ca9ffe0362d931c485d7a3ddf700799e9a85e34531247e422
-xbt-gateway ghcr.io/awokenlazarus/xbt-gateway:0.1.0-686f46b4060a@sha256:a43fa628858eb4998ab2ae375f206c34c3fb796dcc2b1f8f1b0074a880875a4f
-lightning-stream ghcr.io/awokenlazarus/lightning-stream:0.1.0-686f46b4060a@sha256:7040054c1ddfa005ed8c529695a7a270bc938ab8a0c4abee9e08316fbd9ef900
-xbt-hashlink ghcr.io/awokenlazarus/xbt-hashlink:0.1.0-686f46b4060a@sha256:72377add992a5dc3f3a2893123d4e92e94acf1e5c016ceda3bc554e0c4e466f0
+xbt-init ghcr.io/awokenlazarus/xbt-init:0.1.0-1aae24193e77@sha256:a5fb28acc36851142c3149c6867aaaaae584a586f8af4312ebdd76e7586794e4
+xbt-signer ghcr.io/awokenlazarus/xbt-signer:0.1.0-1aae24193e77@sha256:fc2c96af7756261745ade3dd06212ffbb85f1466db42f869bf43231c5cecf971
+xbt-anchor-witness ghcr.io/awokenlazarus/xbt-anchor-witness:0.1.0-1aae24193e77@sha256:756519db1b8c6d840a96ff2cc12e5f43455d04edbe3729f5b79e19993173a094
+xbt-wallet-mcp ghcr.io/awokenlazarus/xbt-wallet-mcp:0.1.0-1aae24193e77@sha256:6ad6835150a358abb46531b71574e239ed3ce175e7fc8aa8780e58871d89f868
+xbt-wallet-ui ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-1aae24193e77@sha256:175368e7e1bd105d24aa6f918c5fa658bfaaad521294b73b90e1db74e4a97b25
+xbt-gateway ghcr.io/awokenlazarus/xbt-gateway:0.1.0-1aae24193e77@sha256:a64c61e516dc42f107ceff54413b2fc8be5d8a79d37a985aae88d370b45e2826
+lightning-stream ghcr.io/awokenlazarus/lightning-stream:0.1.0-1aae24193e77@sha256:c7e0a94a770fa2ad0918f442155f409ab11f53e2a99aa126faacdecec203ba5d
+xbt-hashlink ghcr.io/awokenlazarus/xbt-hashlink:0.1.0-1aae24193e77@sha256:e57a26b5bc8010e47e7aea90f5bcd0f79fe7409564f33bd9a6cac8ca316f118a

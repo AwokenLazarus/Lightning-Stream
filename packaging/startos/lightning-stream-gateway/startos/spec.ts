@@ -64,9 +64,9 @@ export const LIGHTNING = {
  * the image set Umbrel and the wallet package use.
  */
 export const IMAGES: Record<ImageKey, string> = {
-  init: 'ghcr.io/awokenlazarus/xbt-init:0.1.0-686f46b4060a@sha256:755e0db764e145322154cd4d91932f8eee76c7551b448656822bcf5698e618f0',
-  gateway: 'ghcr.io/awokenlazarus/xbt-gateway:0.1.0-686f46b4060a@sha256:a43fa628858eb4998ab2ae375f206c34c3fb796dcc2b1f8f1b0074a880875a4f',
-  ui: 'ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-686f46b4060a@sha256:2cf2b34cdc74e20ca9ffe0362d931c485d7a3ddf700799e9a85e34531247e422',
+  init: 'ghcr.io/awokenlazarus/xbt-init:0.1.0-1aae24193e77@sha256:a5fb28acc36851142c3149c6867aaaaae584a586f8af4312ebdd76e7586794e4',
+  gateway: 'ghcr.io/awokenlazarus/xbt-gateway:0.1.0-1aae24193e77@sha256:a64c61e516dc42f107ceff54413b2fc8be5d8a79d37a985aae88d370b45e2826',
+  ui: 'ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-1aae24193e77@sha256:175368e7e1bd105d24aa6f918c5fa658bfaaad521294b73b90e1db74e4a97b25',
 }
 
 const vol = (subpath: string | null, mountpoint: string, readonly = false): MountSpec => ({ subpath, mountpoint, readonly })

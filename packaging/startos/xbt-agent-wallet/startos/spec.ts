@@ -81,11 +81,11 @@ export const LIGHTNING = {
  * one image set for Umbrel, StartOS and xbt-compute.
  */
 export const IMAGES: Record<ImageKey, string> = {
-  init: 'ghcr.io/awokenlazarus/xbt-init:0.1.0-686f46b4060a@sha256:755e0db764e145322154cd4d91932f8eee76c7551b448656822bcf5698e618f0',
-  signer: 'ghcr.io/awokenlazarus/xbt-signer:0.1.0-686f46b4060a@sha256:53db4ee21400bf961bd79465f49f4d7cb78d48a20180ae841d2658d0a58d5181',
-  witness: 'ghcr.io/awokenlazarus/xbt-anchor-witness:0.1.0-686f46b4060a@sha256:8911b7a1d6dbf92f19a07e9c38943aed5592d7ce8ee2264f3da4b0f70f84d851',
-  mcp: 'ghcr.io/awokenlazarus/xbt-wallet-mcp:0.1.0-686f46b4060a@sha256:84e88bdbe0a9f244e0fb1531e3014f520bf99f7a5cd00a2c5b99ccc545fbc9e4',
-  ui: 'ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-686f46b4060a@sha256:2cf2b34cdc74e20ca9ffe0362d931c485d7a3ddf700799e9a85e34531247e422',
+  init: 'ghcr.io/awokenlazarus/xbt-init:0.1.0-1aae24193e77@sha256:a5fb28acc36851142c3149c6867aaaaae584a586f8af4312ebdd76e7586794e4',
+  signer: 'ghcr.io/awokenlazarus/xbt-signer:0.1.0-1aae24193e77@sha256:fc2c96af7756261745ade3dd06212ffbb85f1466db42f869bf43231c5cecf971',
+  witness: 'ghcr.io/awokenlazarus/xbt-anchor-witness:0.1.0-1aae24193e77@sha256:756519db1b8c6d840a96ff2cc12e5f43455d04edbe3729f5b79e19993173a094',
+  mcp: 'ghcr.io/awokenlazarus/xbt-wallet-mcp:0.1.0-1aae24193e77@sha256:6ad6835150a358abb46531b71574e239ed3ce175e7fc8aa8780e58871d89f868',
+  ui: 'ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-1aae24193e77@sha256:175368e7e1bd105d24aa6f918c5fa658bfaaad521294b73b90e1db74e4a97b25',
 }
 
 const vol = (subpath: string | null, mountpoint: string, readonly = false): MountSpec => ({ subpath, mountpoint, readonly })
