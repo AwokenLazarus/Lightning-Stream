@@ -13,6 +13,7 @@
 //! * [`HotWallet::rotate`] makes a new key and sweeps the old one's coins into it; retired keys stay
 //!   sealed so later coins to them are swept by the watcher;
 //! * a balance cap is shown as exceeded until a human sweeps ([`HotWallet::sweep_to`]).
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -157,6 +158,22 @@ fn new_secret() -> SecretKey {
         if let Ok(sk) = SecretKey::from_slice(&b) {
             return sk;
         }
+    }
+}
+
+/// A transaction the hot wallet sent.
+struct HotSpend {
+    txid: String,
+    /// The coins could not be written after the send (they are right in memory).
+    booking_error: Option<String>,
+}
+
+impl HotSpend {
+    fn with(&self, mut v: Value) -> Value {
+        if let Some(e) = &self.booking_error {
+            v["booking_error"] = format!("sent; the hot wallet's coin file was not written, and will be at its next write: {e}").into();
+        }
+        v
     }
 }
 
@@ -370,34 +387,58 @@ impl HotWallet {
     }
 
     /// Check the stored coins against the node; with `scan`, also find coins the file lacks.
+    /// Bring the coins to the node. The node is asked without the wallet's lock held (a scan of the
+    /// UTXO set can take minutes on mainnet, and the status and balance wait on that lock), and its
+    /// answers are applied under the lock to the coins as they are then: a coin a send added
+    /// meanwhile is kept, and one a send spent meanwhile is not brought back.
     pub fn reconcile(&self, scan: bool) -> Value {
         let mut out = json!({"ok": false, "kept": 0, "stale": 0, "restored": 0, "dropped": 0, "found": 0, "scanned": false});
-        let mut g = self.lock();
+        let give_up = |out: Value| {
+            self.lock().last_reconcile = out.clone();
+            out
+        };
+        let (all, descs) = {
+            let g = self.lock();
+            let all: Vec<(Coin, bool)> = g.utxos.iter().map(|u| (u.clone(), false)).chain(g.stale.iter().map(|u| (u.clone(), true))).collect();
+            (all, Self::keys(&g).iter().map(|k| format!("raw({})", k.spk_hex())).collect::<Vec<String>>())
+        };
         match self.node.call("getblockchaininfo", json!([])) {
             Ok(info) if crate::pyjson::truthy(info.get("initialblockdownload")) => {
                 out["reason"] = "node is in initial block download: stored coins kept unverified".into();
-                g.last_reconcile = out.clone();
-                return out;
+                return give_up(out);
             }
             Ok(_) => {}
             Err(e) => {
                 out["reason"] = format!("node unreachable: {}; stored coins kept unverified", e.msg.chars().take(160).collect::<String>()).into();
-                g.last_reconcile = out.clone();
-                return out;
+                return give_up(out);
             }
         }
-        let bump = |out: &mut Value, k: &str| out[k] = (out[k].as_i64().unwrap_or(0) + 1).into();
-        let (mut keep, mut stale) = (vec![], vec![]);
-        let all: Vec<(Coin, bool)> = g.utxos.iter().map(|u| (u.clone(), false)).chain(g.stale.iter().map(|u| (u.clone(), true))).collect();
+        // the node's word on each coin, and the block of a coinbase output
+        let mut answers: Vec<(Coin, bool, Value, Option<u32>)> = vec![];
         for (u, was_stale) in all {
             let r = match self.node.call("gettxout", json!([u.txid, u.vout, true])) {
                 Ok(r) => r,
                 Err(e) => {
                     out["reason"] = format!("gettxout failed: {}; stored coins kept unverified", e.msg.chars().take(160).collect::<String>()).into();
-                    g.last_reconcile = out.clone();
-                    return out;
+                    return give_up(out);
                 }
             };
+            let coinbase = !r.is_null() && crate::pyjson::truthy(r.get("coinbase"));
+            let height = if coinbase { u.height.or_else(|| self.txout_height(&r)) } else { None };
+            answers.push((u, was_stale, r, height));
+        }
+        let scan_res = scan.then(|| self.node.call("scantxoutset", json!(["start", descs])));
+        let mut g = self.lock();
+        let asked: HashSet<(String, u32)> = answers.iter().map(|(u, ..)| u.op()).collect();
+        let present: HashSet<(String, u32)> = g.utxos.iter().chain(g.stale.iter()).map(Coin::op).collect();
+        let bump = |out: &mut Value, k: &str| out[k] = (out[k].as_i64().unwrap_or(0) + 1).into();
+        // what changed while the node was asked stays as it is now
+        let mut keep: Vec<Coin> = g.utxos.iter().filter(|u| !asked.contains(&u.op())).cloned().collect();
+        let mut stale: Vec<Coin> = g.stale.iter().filter(|u| !asked.contains(&u.op())).cloned().collect();
+        for (u, was_stale, r, height) in answers {
+            if !present.contains(&u.op()) {
+                continue; // spent by a send meanwhile
+            }
             if r.is_null() {
                 stale.push(Coin { why: "not unspent on the node".into(), ..u });
                 bump(&mut out, "stale");
@@ -411,30 +452,28 @@ impl HotWallet {
                 continue;
             }
             let coinbase = crate::pyjson::truthy(r.get("coinbase"));
-            let height = if coinbase { u.height.or_else(|| self.txout_height(&r)) } else { None };
             keep.push(Coin { why: String::new(), spk: check_spk.clone(), coinbase, height, ..u });
             bump(&mut out, if was_stale { "restored" } else { "kept" });
         }
-        if scan {
-            let descs: Vec<String> = Self::keys(&g).iter().map(|k| format!("raw({})", k.spk_hex())).collect();
-            match self.node.call("scantxoutset", json!(["start", descs])) {
-                Ok(res) => {
-                    let mut have: Vec<(String, u32)> = keep.iter().map(Coin::op).collect();
-                    for c in res.get("unspents").and_then(Value::as_array).into_iter().flatten() {
-                        let op = (c.get("txid").and_then(Value::as_str).unwrap_or("").to_string(), py_int(c.get("vout")).unwrap_or(0) as u32);
-                        let spk = c.get("scriptPubKey").and_then(Value::as_str).unwrap_or("");
-                        if have.contains(&op) || Self::key_for_spk(&g, spk).is_none() {
-                            continue;
-                        }
-                        keep.push(Coin { txid: op.0.clone(), vout: op.1, value: sats(c.get("amount")), spk: spk.into(), ..scanned(c) });
-                        stale.retain(|x| x.op() != op);
-                        have.push(op);
-                        bump(&mut out, "found");
+        match scan_res {
+            Some(Ok(res)) => {
+                let gone: HashSet<&(String, u32)> = asked.difference(&present).collect();
+                let mut have: Vec<(String, u32)> = keep.iter().map(Coin::op).collect();
+                for c in res.get("unspents").and_then(Value::as_array).into_iter().flatten() {
+                    let op = (c.get("txid").and_then(Value::as_str).unwrap_or("").to_string(), py_int(c.get("vout")).unwrap_or(0) as u32);
+                    let spk = c.get("scriptPubKey").and_then(Value::as_str).unwrap_or("");
+                    if have.contains(&op) || gone.contains(&op) || Self::key_for_spk(&g, spk).is_none() {
+                        continue;
                     }
-                    out["scanned"] = (!res.is_null() && res.get("success").map(|s| crate::pyjson::truthy(Some(s))).unwrap_or(true)).into();
+                    keep.push(Coin { txid: op.0.clone(), vout: op.1, value: sats(c.get("amount")), spk: spk.into(), ..scanned(c) });
+                    stale.retain(|x| x.op() != op);
+                    have.push(op);
+                    bump(&mut out, "found");
                 }
-                Err(e) => out["scan_error"] = e.msg.chars().take(160).collect::<String>().into(),
+                out["scanned"] = (!res.is_null() && res.get("success").map(|s| crate::pyjson::truthy(Some(s))).unwrap_or(true)).into();
             }
+            Some(Err(e)) => out["scan_error"] = e.msg.chars().take(160).collect::<String>().into(),
+            None => {}
         }
         let start = stale.len().saturating_sub(MAX_STALE);
         g.utxos = keep;
@@ -638,23 +677,32 @@ impl HotWallet {
     }
 
     /// The prepared transaction is sent: forget its inputs, learn its outputs to our keys.
+    /// The coins are changed in memory before anything is written: an error writing them leaves
+    /// this process right, and the file catches up at its next write.
     pub fn commit(&self, prep: &Prep) -> Result<()> {
         let mut g = self.lock();
         g.utxos.retain(|u| !prep.inputs.contains(&u.op()));
-        self.persist_utxos(&g)?;
         for (n, (value, spk)) in prep.outputs.iter().enumerate() {
-            if Self::key_for_spk(&g, spk).is_some() && *value >= DUST {
-                self.notice_locked(&mut g, &prep.txid, n as u32, *value, spk)?;
+            let op = (prep.txid.clone(), n as u32);
+            if Self::key_for_spk(&g, spk).is_some() && *value >= DUST && !g.utxos.iter().any(|u| u.op() == op) {
+                g.stale.retain(|u| u.op() != op);
+                g.utxos.push(Coin { txid: prep.txid.clone(), vout: n as u32, value: *value, spk: spk.clone(), ..Coin::default() });
             }
         }
         self.persist_utxos(&g)
     }
 
-    fn spend(&self, utxos: &[Coin], outs: Vec<TxOut>, kind: &str, extra: Value) -> Result<String> {
+    /// Sign, send, and then book. Once the node has the transaction the coins have left: an error
+    /// booking it is logged and said in `HotSpend::booking_error`, never returned as a failed send
+    /// (a caller told it failed would skip what follows a send, or send again).
+    fn spend(&self, utxos: &[Coin], outs: Vec<TxOut>, kind: &str, extra: Value) -> Result<HotSpend> {
         let prep = { let g = self.lock(); self.prepare_locked(&g, utxos, outs, kind, extra)? };
         let txid = self.broadcast(&prep)?;
-        self.commit(&prep)?;
-        Ok(txid)
+        let booking_error = self.commit(&prep).err().map(|e| {
+            eprintln!("xbt-signer: the hot wallet sent {txid}, and could not write its coins: {}", e.msg);
+            e.msg
+        });
+        Ok(HotSpend { txid, booking_error })
     }
 
     fn sweep(&self, utxos: &[Coin], dest_spk: &[u8], kind: &str, extra: Value) -> Result<Value> {
@@ -663,8 +711,8 @@ impl HotWallet {
         if total - fee < DUST {
             return Err(err("hot", format!("nothing to sweep ({total} sats)")));
         }
-        let txid = self.spend(utxos, vec![TxOut::new(total - fee, dest_spk.to_vec())], kind, extra)?;
-        Ok(json!({"txid": txid, "swept_sats": total - fee, "inputs": utxos.len(), "fee_sats": fee}))
+        let sent = self.spend(utxos, vec![TxOut::new(total - fee, dest_spk.to_vec())], kind, extra)?;
+        Ok(sent.with(json!({"txid": sent.txid, "swept_sats": total - fee, "inputs": utxos.len(), "fee_sats": fee})))
     }
 
     fn retired_utxos(g: &Inner) -> Vec<Coin> {
@@ -721,8 +769,8 @@ impl HotWallet {
             fee += change; // zero change, or change below dust: it goes to the fee, and is reported
         }
         let n_out = outs.len();
-        let txid = self.spend(&coins, outs, "human_sweep", json!({"dest_spk": hex::encode(dest_spk)}))?;
-        Ok(json!({"txid": txid, "swept_sats": amount_sats, "fee_sats": fee, "change_sats": if change >= DUST { change } else { 0 },
-                  "outputs": n_out, "hot_sats": self.balance_sats()}))
+        let sent = self.spend(&coins, outs, "human_sweep", json!({"dest_spk": hex::encode(dest_spk)}))?;
+        Ok(sent.with(json!({"txid": sent.txid, "swept_sats": amount_sats, "fee_sats": fee, "change_sats": if change >= DUST { change } else { 0 },
+                  "outputs": n_out, "hot_sats": self.balance_sats()})))
     }
 }

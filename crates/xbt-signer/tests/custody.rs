@@ -203,3 +203,53 @@ fn restart_keeps_coins_reconcile_marks_stale_restores_and_finds_unknown_coins() 
     rig.restart().unwrap();
     assert_eq!(rig.hot_sats(), 4_000 + 3_000 + 4_999);
 }
+
+#[test]
+fn a_noticed_transaction_adds_only_the_outputs_still_unspent() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let rig = Rig::new(json!({}), false);
+    let spk = rig.hot_spk();
+    // the node has the transaction, and its output to the hot key is already spent
+    let txid = "cc".repeat(32);
+    rig.chain.credit(&txid, 0, 6_000, &spk, false);
+    rig.chain.st.lock().unwrap().utxos.remove(&(txid.clone(), 0));
+    assert_eq!(rig.call("notice_hot_txid", json!({"txid": txid}))["noticed"], 0);
+    assert_eq!(rig.hot_sats(), 0, "a spent output is no coin: a sweep of it would fail");
+}
+
+#[test]
+fn a_sweep_or_rotation_the_node_took_is_never_reported_failed_for_its_bookkeeping() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let rig = Rig::new(json!({}), false);
+    rig.fund_hot(1, 12_000);
+    // the coin file can no longer be written: a directory stands where its new copy goes
+    std::fs::create_dir(rig.root.join(".run/hot_utxos.json.tmp")).unwrap();
+    let hot = rig.call("hot_address", json!({}))["hot_address"].as_str().unwrap().to_string();
+    let exp = xbt_signer::pyjson::now_f64() as i64 + 600;
+    let to = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+    let sig = sign_human(&xbt_signer::approval::sweep_message(&hot, to, 4_000, exp));
+    let s = rig.call("sweep_hot", json!({"to": to, "amount_sats": 4_000, "expiry": exp, "signature": sig}));
+    assert_eq!(s["ok"], true, "the node has the sweep: {s}");
+    assert!(s.to_string().contains("booking_error"), "and the bookkeeping error is said beside it: {s}");
+    assert_eq!(rig.hot_sats(), s["change_sats"].as_i64().unwrap(), "the coins are right in this process: {s}");
+    let r = rig.rotate_hot_key();
+    assert!(r["sweep"]["txid"].is_string(), "{r}");
+    let hist = rig.call("history", json!({"limit": 100}));
+    assert!(hist.to_string().contains("hot_rotation"), "the rotation is in the history: {hist}");
+}
+
+#[test]
+fn a_slow_scan_of_the_utxo_set_does_not_hold_up_the_wallets_status() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let rig = Rig::new(json!({}), false);
+    rig.fund_hot(1, 5_000);
+    rig.chain.st.lock().unwrap().scan_ms = 3_000;
+    std::thread::scope(|sc| {
+        let rec = sc.spawn(|| rig.call("hot_reconcile", json!({"scan": true})));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let t = std::time::Instant::now();
+        assert_eq!(rig.hot_sats(), 5_000);
+        assert!(t.elapsed() < std::time::Duration::from_secs(1), "the status waited {:?} for the scan", t.elapsed());
+        assert_eq!(rec.join().unwrap()["kept"], 1);
+    });
+}

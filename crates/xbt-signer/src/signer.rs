@@ -472,7 +472,8 @@ impl Signer {
             }
             "hot_address" => sanitize(self.hot.status()),
             "notice_hot_txid" => {
-                let n = self.hot.scan_from_txid(&s("txid"), false, "")?;
+                // only outputs still unspent: a spent one kept as a coin would make every later sweep fail
+                let n = self.hot.scan_from_txid(&s("txid"), true, "")?;
                 sanitize(with(self.hot.status(), json!({"noticed": n})))
             }
             // takes the spend lock itself, and only for each lock and release, where an answer may be long (crate::ticket_pay)

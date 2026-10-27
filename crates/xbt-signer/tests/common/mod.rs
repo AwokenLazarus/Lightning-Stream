@@ -36,6 +36,8 @@ pub struct State {
     pub coinbase: std::collections::HashSet<String>,
     /// `getdeploymentinfo`; None: the node does not answer it.
     pub deployments: Option<Value>,
+    /// How long `scantxoutset` takes (a scan of the UTXO set can take minutes on mainnet).
+    pub scan_ms: u64,
 }
 
 pub struct FakeChain {
@@ -270,6 +272,8 @@ impl Node for FakeChain {
                 json!(out)
             }
             "scantxoutset" => {
+                let wait = self.st.lock().unwrap().scan_ms;
+                std::thread::sleep(std::time::Duration::from_millis(wait));
                 let want: Vec<String> = p[1].as_array().cloned().unwrap_or_default().iter()
                     .filter_map(|d| d.as_str().and_then(|d| d.strip_prefix("raw(")).and_then(|d| d.strip_suffix(')')).map(str::to_string)).collect();
                 let s = self.st.lock().unwrap();
