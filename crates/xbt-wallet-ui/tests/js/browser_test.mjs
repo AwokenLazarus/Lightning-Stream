@@ -14,6 +14,14 @@ const CHROME = process.env.CHROME || "google-chrome";
 const profile = mkdtempSync(join(tmpdir(), "xbtui-chrome-"));
 const chrome = spawn(CHROME, ["--headless=new", "--no-first-run", "--no-default-browser-check", "--disable-gpu", "--no-sandbox",
   "--remote-debugging-port=0", `--user-data-dir=${profile}`, "about:blank"], { stdio: "ignore" });
+// a stalled or dead Chrome fails the test instead of hanging it: each DevTools call has a time limit,
+// a closed connection fails what waits on it, and the whole run has a deadline
+const CALL_MS = 30000;
+const LIMIT_S = Number(process.env.XBT_UI_JS_LIMIT_S || 600);
+function fail(why) { console.log(`FAIL ${why}`); try { chrome.kill("SIGKILL"); } catch (e) { /* gone */ } process.exit(1); }
+setTimeout(() => fail(`the run took over ${LIMIT_S} s: Chrome stopped answering`), LIMIT_S * 1000);
+chrome.on("exit", (code, sig) => { if (!finishing) fail(`Chrome exited (${code ?? sig}) during the run`); });
+let finishing = false;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const results = [];
 function check(name, ok, detail) { results.push({ name, ok: !!ok, detail }); console.log(`${ok ? "PASS" : "FAIL"} ${name}${ok ? "" : " " + (detail || "")}`); }
@@ -27,7 +35,9 @@ for (let i = 0; i < 100 && !port; i++) {
 if (!port) { console.log("FAIL chrome did not start"); process.exit(1); }
 const target = await (await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, { method: "PUT" })).json();
 const ws = new WebSocket(target.webSocketDebuggerUrl);
-await new Promise((r) => ws.addEventListener("open", r));
+await new Promise((r, j) => { ws.addEventListener("open", r); ws.addEventListener("error", () => j(new Error("the DevTools connection failed")));
+  setTimeout(() => j(new Error("the DevTools connection did not open")), CALL_MS); }).catch((e) => fail(e.message));
+ws.addEventListener("close", () => { if (!finishing) fail("Chrome closed the DevTools connection"); });
 let seq = 0; const pending = new Map(); const events = [];
 ws.addEventListener("message", (m) => {
   const d = JSON.parse(m.data);
@@ -36,7 +46,10 @@ ws.addEventListener("message", (m) => {
 function cdp(method, params = {}) {
   const id = ++seq;
   ws.send(JSON.stringify({ id, method, params }));
-  return new Promise((r) => pending.set(id, (d) => r(d.result || { error: d.error })));
+  return new Promise((r, j) => {
+    const t = setTimeout(() => { pending.delete(id); j(new Error(`${method}: no answer from Chrome in ${CALL_MS / 1000} s`)); }, CALL_MS);
+    pending.set(id, (d) => { clearTimeout(t); r(d.result || { error: d.error }); });
+  });
 }
 async function ev(expr) {
   const r = await cdp("Runtime.evaluate", { expression: expr, awaitPromise: true, returnByValue: true });
@@ -164,6 +177,7 @@ try {
 } catch (e) {
   check("browser run", false, e.stack);
 } finally {
+finishing = true;
   ws.close(); chrome.kill("SIGKILL"); await sleep(200);
   try { rmSync(profile, { recursive: true, force: true }); } catch (e) { /* ignore */ }
 }
