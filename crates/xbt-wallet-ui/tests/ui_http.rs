@@ -1387,6 +1387,7 @@ fn the_sell_page_sets_up_several_services_and_says_what_each_one_needs() {
     let cfg = xbt_gateway::config::Config::from_json(&c).unwrap();
     assert_eq!(cfg.public_url, "https://seller.example");
     assert!(cfg.public_aliases.is_empty(), "a first address has none");
+    assert_eq!(c["tickets"]["ticket_msat"], 900_000, "a ticket with its fee limit stays under the starter rules' 1,000 sat");
     assert_eq!(cfg.upstream, None);
     assert_eq!(cfg.routes.iter().map(|r| (r.path.as_str(), r.upstream.clone().unwrap(), r.strip_prefix)).collect::<Vec<_>>(),
                [("/", addr.clone(), false), ("/my-model/", "http://127.0.0.1:9".to_string(), true)]);

@@ -356,6 +356,9 @@ pub struct Status {
     pub next: String,
 }
 
+/// The ticket a new shop sells: 900 sat, so that with its fee limit it stays under 1,000 sat.
+const DEFAULT_TICKET_MSAT: u64 = 900_000;
+
 impl App {
     fn shop_path(&self) -> PathBuf {
         self.cfg.data_dir.join(SELL_FILE)
@@ -516,6 +519,11 @@ impl App {
         // a buyer whose call cannot take a whole ticket may ask for a smaller one, down to the smallest a held
         // ticket may be (546 sat), unless the owner set another floor
         let mut tickets = c.get("tickets").cloned().filter(Value::is_object).unwrap_or(json!({}));
+        // a ticket and its routing-fee limit stay under the buyer's starter rules' "ask me first"
+        // line (1,000 sat on mainnet), so a new buyer can pay without signing anything more
+        if tickets.get("ticket_msat").is_none() {
+            tickets["ticket_msat"] = json!(DEFAULT_TICKET_MSAT);
+        }
         if tickets.get("min_ticket_msat").is_none() {
             let size = tickets.get("ticket_msat").and_then(Value::as_u64).unwrap_or(1_000_000);
             tickets["min_ticket_msat"] = json!(546_000u64.min(size));
