@@ -1537,6 +1537,18 @@ released total never above what the wallet released, a charge never above the pr
 of what was asked for and received). The ledger holds the wallet's own tickets and the fees its
 node reports, and nothing else.
 
+**A seller that ignores the call's limit.** Each paid request names the call's limit to the seller
+(`X-Xbt402-Max-Msat`), and a seller that reads it never charges the answer more. One that does not
+(gateways before 0.1.15) charges for what it pushed: bytes in a proxy's or the network's buffers
+that the wallet never read. The wallet's own side holds without it: it releases no ticket once its
+own count reaches the limit, and a last receipt that charges more than the limit is a seller fault
+(`seller_fault`, with the two numbers): the session is stopped, so it releases and refills nothing
+more, the receipt goes into the audit log (`ticket_over_cap`), and the wallet page says it. What such
+a seller can take is bounded by credit it already holds: the session's balance (under one ticket,
+left from earlier calls) and the tickets this call released, the last of them released while the
+call was still under its limit. So past the limit it can take at most one ticket of this call, plus
+the balance it held before (under one ticket), and nothing after.
+
 **Stop.** `ticket_stop`, a session idle for `tickets.http_idle_s` (120 s by default), a seller
 fault and changed terms all end a session the same way: the book locks and releases nothing more,
 the wallet sends `cancel` for all the session's tickets, and its own node shows them back. A

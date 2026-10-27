@@ -1823,6 +1823,15 @@ impl Signer {
     }
 
     /// Mark the session faulty and stop it: nothing more is released to this seller in it.
+    /// A seller's signed charge for one answer above the call's limit: the receipt goes into the audit log as
+    /// evidence, and the words for the fault (which stops the session).
+    fn over_cap(&self, hs: &HttpSession, charged: u64, max_msat: u64, receipt: &Value) -> String {
+        self.ticket_audit("ticket_over_cap", json!({"session": hs.sid, "origin": hs.origin, "dest": format!("ln:{}", hs.terms.terms.payee),
+                                                    "charged_msat": charged.to_string(), "max_msat": max_msat.to_string(), "receipt": receipt}));
+        format!("the seller charged {charged} msat for one answer, more than the {max_msat} msat (max_sats {}) the call allowed and named to it; \
+                 it is paid nothing more, and its signed receipt is kept in the wallet's log", max_msat / 1000)
+    }
+
     fn ticket_fault(&self, hs: &HttpSession, why: &str) -> Value {
         lock_money(hs).fault.get_or_insert_with(|| why.to_string());
         // with the wallet's count as it stood, for the owner who has to judge the seller
@@ -2231,6 +2240,10 @@ impl Signer {
                 json!({"signed": true, "body": "as signed"})
             };
             out = with(out, json!({"complete": complete, "ended": ended}));
+            if head.charged > max_msat && out.get("seller_fault").is_none() {
+                let why = self.over_cap(hs, head.charged, max_msat, &head.raw);
+                out["seller_fault"] = self.ticket_fault(hs, &why)["reason"].clone();
+            }
             (head.charged, note)
         } else {
             let tokens = Some(c.body).filter(|b| price.tokens.active() && !b.is_empty())
@@ -2457,6 +2470,11 @@ impl Signer {
                        "body": if !complete { "cut short" } else if r.body_hash == own_digest { "as signed" } else { "differs from the receipt" }})
             }
         };
+        // the call's own limit, which the request named to the seller (X-Xbt402-Max-Msat): a seller that charged past it
+        // ignored it, and is paid nothing more. What it took is told with the numbers, and its receipt kept
+        if let Some(r) = last.as_ref().filter(|r| r.charged > max_msat) {
+            fault.get_or_insert(self.over_cap(hs, r.charged, max_msat, &r.raw));
+        }
         // the price of the answer: the seller's signed charge where it stands inside the wallet's own count, else that count
         let price_msat = last.as_ref().map(|r| r.charged).filter(|c| *c <= own_cost || !complete).unwrap_or_else(|| st.cost(sink.bytes));
         let mut m = json!({"complete": complete, "ended": ended, "price_msat": price_msat.to_string()});

@@ -14,7 +14,7 @@ mod common;
 use std::collections::HashMap;
 use std::io::Read;
 use std::net::TcpListener;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -789,6 +789,8 @@ struct Tap {
     log: Mutex<Vec<Seen>>,
     /// The certificate trust each request was sent with, by URL (`None`: the public authorities).
     trust: Mutex<Vec<(String, Option<SellerTls>)>>,
+    /// Leave out the call's limit (`X-Xbt402-Max-Msat`): the seller then charges as one that ignores it.
+    drop_cap: AtomicBool,
 }
 
 impl TicketWire for Tap {
@@ -802,7 +804,9 @@ impl TicketWire for Tap {
         let path = url.splitn(4, '/').nth(3).map(|p| format!("/{p}")).unwrap_or_default();
         let seen = Seen { method: method.into(), path, body: String::from_utf8_lossy(body).into_owned(), paid: headers.iter().any(|(k, _)| k == "PAYMENT-SIGNATURE") };
         self.log.lock().unwrap().push(seen.clone());
-        let real = || self.inner.send(method, url, body, headers, read_timeout);
+        let kept: Vec<(String, String)> = headers.iter().filter(|(k, _)| !(self.drop_cap.load(Ordering::SeqCst) && k.eq_ignore_ascii_case(xbt402::ticket::MAX_MSAT_HEADER)))
+            .cloned().collect();
+        let real = || self.inner.send(method, url, body, &kept, read_timeout);
         let mut hook = self.hook.lock().unwrap().take();
         let out = hook.as_mut().and_then(|h| h(&seen, &real));
         let mut slot = self.hook.lock().unwrap();
@@ -1981,6 +1985,36 @@ fn an_answer_left_unclosed_is_checked_for_without_inverting_the_session_locks() 
     assert_eq!((v["status"].as_u64(), v["complete"].as_bool()), (Some(200), Some(true)), "{v}");
     assert!(v["tickets_released"].as_u64().unwrap_or(0) > 0, "{v}");
     r.assert_booked();
+}
+
+/// A seller that ignores the call's limit (`X-Xbt402-Max-Msat`, which a gateway of before 0.1.15 did
+/// not read) and charges for what it pushed past it: the wallet's own count stops reading at the limit
+/// and releases nothing more, and the seller's receipt above the limit is a seller fault. The session
+/// is stopped, the call says what happened with the numbers, the receipt is in the wallet's log, and
+/// the seller took no more than the credit already released.
+#[test]
+fn a_seller_that_charges_past_the_calls_limit_is_stopped_and_said_so() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    // a first call buys a ticket and leaves most of it with the seller
+    let first = r.pay("/page/10", 1_003);
+    assert_eq!(first["status"].as_u64(), Some(200), "{first}");
+    r.tap.drop_cap.store(true, Ordering::SeqCst);
+    let v = r.pay(&format!("/files/{}", 30 * MIB), 20);
+    let price: u64 = v["price_msat"].as_str().unwrap_or("0").parse().unwrap();
+    assert!(price > 20_000, "the seller charged past the limit here: {v}");
+    let fault = v["seller_fault"].as_str().unwrap_or_default();
+    assert!(fault.contains(&format!("charged {price} msat")) && fault.contains("max_sats 20"), "{v}");
+    assert_eq!(v["tickets_released"].as_u64(), Some(0), "the credit left paid it, and nothing more was released: {v}");
+    assert!(price <= 1_000_000, "no more than the credit already released: {v}");
+    let sid = v["session"].as_str().unwrap();
+    assert_ne!(r.session(sid)["sessions"][0]["state"], "open", "the session is stopped");
+    let log = std::fs::read_to_string(r.root.join(".run/audit.jsonl")).unwrap();
+    assert!(log.lines().any(|l| l.contains("ticket_over_cap") && l.contains(&format!("\"charged_msat\":\"{price}\"")) && l.contains("\"receipt\"")), "the receipt is kept");
+    // the next call opens a new session; nothing more goes to the stopped one
+    r.tap.drop_cap.store(false, Ordering::SeqCst);
+    let next = r.pay(&format!("/files/{}", MIB), 500);
+    assert!(next["session"] != v["session"], "{next}");
 }
 
 #[test]
