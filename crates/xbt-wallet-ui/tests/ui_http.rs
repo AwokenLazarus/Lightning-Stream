@@ -1787,10 +1787,10 @@ fn hashrate_is_rented_out_and_rented_in_plain_words() {
         assert!(p.body.contains(s), "{s} missing from Hashrate");
     }
     plain("/hashrate", &p.body);
-    // a seller the spending rules do not list yet: allowed first (the rules page, with its node), Rent waits
+    // a hashmaker the spending rules do not list yet: allowed first (the rules page, with its node), Rent waits
     let garage = &p.body[p.body.find("Garage miners").unwrap()..];
     let garage = &garage[..garage.find("</section>").unwrap()];
-    assert!(garage.contains("Allow this seller to be paid") && garage.contains("./policy?allow=") && garage.contains(&format!("node=03{}", "c".repeat(64))),
+    assert!(garage.contains("Allow this hashmaker to be paid") && garage.contains("./policy?allow=") && garage.contains(&format!("node=03{}", "c".repeat(64))),
             "{garage}");
     assert!(garage.contains("<button disabled>Rent</button>"), "{garage}");
     let r = br.act("/hashrate", "/hashrate", &[("action", "rent"), ("key", "02bb"), ("miners", "1"), ("budget", "4000"), ("minutes", "60")]);

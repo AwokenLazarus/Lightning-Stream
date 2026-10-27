@@ -12,6 +12,8 @@ discovery: the hashmaker's signed listing on Nostr relays
 
 This page is the command line, which has run between two machines on one LAN with a private relay.
 The Umbrel app has screens for the same thing (Sell → Hashrate, and Rent hashrate). Use small amounts.
+On a plain Linux machine (Ubuntu or another distribution with Docker), the same app installs beside your
+own nodes with one script: [LINUX.md](LINUX.md).
 
 ## What happened when we ran it
 

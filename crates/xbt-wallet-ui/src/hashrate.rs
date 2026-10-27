@@ -396,14 +396,14 @@ impl App {
                     let free_hs = num(&x["freeHs"]);
                     let per_miner = if free > 0 && free_hs > 0.0 { free_hs / free as f64 } else { EXAMPLE_HS };
                     let budget = per_hour(price, slice, per_miner).ceil().max(price) as u64;
-                    // the spending rules list who the app may pay: a seller not on them is allowed first, with the
+                    // the spending rules list who the app may pay: a hashmaker not on them is allowed first, with the
                     // node its signed listing names (the rules page shows the change to sign)
                     let pay_url = x["payUrl"].as_str().unwrap_or("");
                     let allowed = self.seller_allowed(pay_url);
                     let allow = match (allowed, crate::services::http_origin(pay_url), x["payNode"].as_str()) {
                         (false, Some(o), Some(n)) if !n.is_empty() => format!(
-                            "<p class=\"hint\">Your spending rules list who this app may pay. Allow this seller first: you sign the change with your approval key.</p>\
-                             <p><a class=\"button\" href=\"./policy?allow={}&amp;node={}\">Allow this seller to be paid</a></p>",
+                            "<p class=\"hint\">Your spending rules list who this app may pay. Allow this hashmaker first: you sign the change with your approval key.</p>\
+                             <p><a class=\"button\" href=\"./policy?allow={}&amp;node={}\">Allow this hashmaker to be paid</a></p>",
                             crate::services::urlenc(&o), esc(n)),
                         _ => String::new(),
                     };
