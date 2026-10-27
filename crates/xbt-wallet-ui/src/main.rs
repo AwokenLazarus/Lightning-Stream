@@ -82,6 +82,26 @@ fn node_keys() -> i32 {
             return 2;
         }
     };
+    // XBT_KEYS_WATCH_S with a grant folder: keep watching it, so a grant the owner approves later (or
+    // revokes) is taken without a restart; nothing is baked in this mode
+    let watch = std::env::var("XBT_KEYS_WATCH_S").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|n| *n > 0);
+    if let (Some(every), true) = (watch, s.grant.is_some() && s.admin.as_os_str().is_empty()) {
+        eprintln!("xbt-wallet-ui node-keys: watching {} for the keys Lightning Fork grants", s.grant.as_ref().map(|p| p.display().to_string()).unwrap_or_default());
+        loop {
+            match xbt_wallet_ui::node_keys::run_with(&s, None) {
+                Ok(o) => {
+                    if !o.made.is_empty() {
+                        eprintln!("xbt-wallet-ui node-keys: took {} as granted", o.made.join(", "));
+                    }
+                    if !o.revoked.is_empty() {
+                        eprintln!("xbt-wallet-ui node-keys: {} revoked in Lightning Fork; removed", o.revoked.join(", "));
+                    }
+                }
+                Err(e) => eprintln!("xbt-wallet-ui node-keys: {e}"),
+            }
+            std::thread::sleep(std::time::Duration::from_secs(every));
+        }
+    }
     // XBT_KEYS_ADMIN=-: read once, kept in memory only; a node that does not answer is asked a few
     // times, then the caller (an install script, waiting) is told why
     let given = if s.admin_on_stdin() {
@@ -101,11 +121,11 @@ fn node_keys() -> i32 {
         tries += 1;
         match xbt_wallet_ui::node_keys::run_with(&s, given.as_deref()) {
             Ok(o) if o.made.is_empty() => {
-                eprintln!("xbt-wallet-ui node-keys: the app's keys were already there; nothing made");
+                eprintln!("xbt-wallet-ui node-keys: nothing made: the app's keys were already there, or the node has granted none yet (the owner can paste them)");
                 return 0;
             }
             Ok(o) => {
-                eprintln!("xbt-wallet-ui node-keys: made {} through the box's Lightning node (each with a root key of its own)", o.made.join(", "));
+                eprintln!("xbt-wallet-ui node-keys: made {} through the box's Lightning node (granted by it, or each with a root key of its own)", o.made.join(", "));
                 return 0;
             }
             Err(e) if given.is_some() && tries >= 5 => {

@@ -29,12 +29,12 @@ grep -q 'APP_XBT_KNOTS_NODE_HOST' packaging/umbrel/lazarus-xbt-knots/README.md
 grep -q 'amd64-only' packaging/umbrel/lazarus-xbt-knots/README.md
 echo "docs/compose contract: ok"
 step "4b. token rotation: no MCP rotation endpoint; run/ui mounts"
-if grep -rn 'rotate-token\|X-XBT-Rotate\|ROTATE_URL' crates/xbt-wallet-mcp/src packaging/umbrel/lazarus-* packaging/startos/xbt-agent-wallet/startos; then
+if grep -rn 'rotate-token\|X-XBT-Rotate\|ROTATE_URL' crates/xbt-wallet-mcp/src packaging/umbrel/lazarus-* packaging/startos/lightning-stream/startos; then
   echo "a rotation endpoint or its URL is still wired to the MCP" >&2; exit 1
 fi
 grep -q 'data/run/ui:/data/run/ui:ro' packaging/umbrel/lazarus-xbt-agent-wallet/docker-compose.yml
 grep -qE 'data/run/ui:/data/run/ui$' packaging/umbrel/lazarus-xbt-agent-wallet/docker-compose.yml
-grep -q "vol('run/ui', '/data/run/ui', true)" packaging/startos/xbt-agent-wallet/startos/spec.ts
+grep -q "vol('run/ui', '/data/run/ui', true)" packaging/startos/lightning-stream/startos/spec.ts
 grep -q '"xbt-wallet-ui": "xbt-wallet-mcp"' container/mkbase.py
 echo "rotation contract: ok"
 if [ "${PACKAGING:-}" = 1 ]; then

@@ -1941,7 +1941,7 @@ fn a_node_the_box_connected_by_itself_needs_no_key_and_a_disconnect_stays() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let ln = tempfile::tempdir().unwrap();
     let dir = ln.path().to_path_buf();
-    let s = xbt_wallet_ui::node_keys::Settings { rest: "https://10.21.21.66:8180".into(), tls_cert: None, admin: dir.join("none"),
+    let s = xbt_wallet_ui::node_keys::Settings { rest: "https://10.21.21.66:8180".into(), tls_cert: None, admin: dir.join("none"), grant: None,
                                                  rail_dir: Some(dir.clone()), gw_dir: None };
     let rail = mac(&[("info", &["read"]), ("offchain", &["read", "write"]), ("onchain", &["read"])]);
     let made = xbt_wallet_ui::node_keys::make_keys(&s, &mut |_, _| Ok(hex::decode(&rail).unwrap())).unwrap();

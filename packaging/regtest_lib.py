@@ -394,14 +394,29 @@ def ticket_policy(origin, seller_pubkey, split):
                 tickets={"enabled": True, "tasks": {"default": {"budget_sats": 20000}}})
 
 
-def paid_buy(group, agent, ui, gui, sign_bin, key_file, lab, sc, gateway_up, origin):
-    """The owner sets up both packages on their pages, then the agent buys a priced page from the
-    gateway with one `xbt402_pay` call through the wallet's MCP, paid with a stream ticket over lf1 ->
-    lf2. `sc(method, params)` calls the signer's socket; `gateway_up()` is the gateway's health as
-    its container reports it. Returns the facts a restart is compared with."""
+def sell_owner_setup(ui, facts, public_url, price_msat=2500):
+    """The shop's owner on the one app's Sell page, no terminal: the test chain's network id and the
+    caps, the two macaroons baked in the node's dashboard, the shop's address, and one web service
+    priced per request."""
+    ui.post("/sell", "/sell", {"action": "advanced", "max_sessions": "30", "sessions_per_address": "2", "max_held_tickets": "15",
+                               "proxies": "", "network": facts["network"]})
+    st, _, body = ui.post("/sell", "/sell", {"action": "connect", "invoices_macaroon": facts["invoices_macaroon"], "info_macaroon": facts["info_macaroon"]})
+    ui.post("/sell", "/sell", {"action": "shop", "name": "Test shop", "public_url": public_url})
+    st, loc, body = ui.post("/sell", "/sell", {"action": "service", "kind": "web", "name": "Test page", "address": facts["upstream"],
+                                               "price": f"{price_msat / 1000:g}", "unit": "request", "paths": "/"})
+    flash = ui.flash("/sell") if st == 303 else unescape(re.sub(r"<[^>]+>", " ", body))[-600:]
+    return st, ("Saved " + flash if st == 303 and "error" not in flash.lower() else flash)
+
+
+def paid_buy(group, agent, ui, gui, sign_bin, key_file, lab, sc, gateway_up, origin, setup=None, ticket_msat=1_000_000):
+    """The owner sets up the shop (the gateway package's page, or `setup`: the one app's Sell page),
+    then the agent buys a priced page from the gateway with one `xbt402_pay` call through the
+    wallet's MCP, paid with a stream ticket over lf1 -> lf2. `sc(method, params)` calls the signer's
+    socket; `gateway_up()` is the gateway's health as its container reports it. Returns the facts a
+    restart is compared with."""
     from ln_lab import PAGE  # noqa: PLC0415
     f = lab.facts
-    st, flash = gateway_owner_setup(gui, f, origin)
+    st, flash = (setup or gateway_owner_setup)(gui, f, origin)
     check(group, "gateway page: the owner's config (service, origin, price, network, two narrow macaroons) is checked by the gateway's parser and saved",
           st == 303 and "Saved" in flash, [st, flash])
     t0 = time.time()
@@ -443,9 +458,10 @@ def paid_buy(group, agent, ui, gui, sign_bin, key_file, lab, sc, gateway_up, ori
             [p for p in lab.buyer_payments() if p.get("payment_hash") == h]), 30, "the buyer's payment SUCCEEDED")
     except RuntimeError:
         mine = [p for p in lab.buyer_payments() if p.get("payment_hash") == h]
-    check(group, "the seller's node settled one ticket of 1,000 sat, and the buyer's node paid it: the same hash, SUCCEEDED, 1,000 sat",
-          int(t_settled.get("amt_paid_msat") or 0) == 1_000_000 and len(mine) == 1 and mine[0].get("status") == "SUCCEEDED"
-          and int(mine[0].get("value_msat") or 0) == 1_000_000,
+    t_sat = f"{ticket_msat // 1000:,}"
+    check(group, f"the seller's node settled one ticket of {t_sat} sat (the shop's size), and the buyer's node paid it: the same hash, SUCCEEDED, {t_sat} sat",
+          int(t_settled.get("amt_paid_msat") or 0) == ticket_msat and len(mine) == 1 and mine[0].get("status") == "SUCCEEDED"
+          and int(mine[0].get("value_msat") or 0) == ticket_msat,
           {"settled_msat": t_settled.get("amt_paid_msat"), "hash": h, "buyer": [{k: p.get(k) for k in ("payment_hash", "status", "value_msat")}
                                                                                 for p in lab.buyer_payments()][-4:]})
     r2 = agent.tool("xbt402_pay", url=f"{origin}/small.txt", max_sats=2_000)

@@ -109,6 +109,9 @@ pub struct LnSetup {
     /// The owner pins the node's certificate on the Lightning page (`XBT_UI_LN_TLS_PIN=1`): for a
     /// platform that cannot mount the certificate alone, the page writes it to `tls_cert`.
     pub pin: bool,
+    /// The node's own app grants this app its key when the owner approves a request there
+    /// (`XBT_UI_LN_GRANT=1`: StartOS with Lightning Fork's grant-app-access); the page says so.
+    pub grant: bool,
 }
 
 /// The gateway page: where it writes, and the node and paths as the gateway's container sees them.
@@ -203,6 +206,7 @@ impl Config {
             rest: env("XBT_UI_LN_REST"),
             tls_cert: env("XBT_UI_LN_TLS_CERT").map(PathBuf::from),
             pin: env("XBT_UI_LN_TLS_PIN").as_deref() == Some("1"),
+            grant: env("XBT_UI_LN_GRANT").as_deref() == Some("1"),
         };
         let gw = GatewaySetup {
             dir: env("XBT_UI_GW_DIR").map(PathBuf::from).unwrap_or_else(|| run_dir("gateway")),

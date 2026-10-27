@@ -46,7 +46,7 @@ fn easy_setup_screenshots() {
     let ln = data.path().join("ln");
     std::fs::create_dir_all(&ln).unwrap();
     let rail = xbt402::macaroon::lnd_macaroon_for_tests(&[("info", &["read"]), ("offchain", &["read", "write"]), ("onchain", &["read"])], &[]);
-    let keys = xbt_wallet_ui::node_keys::Settings { rest: "https://10.21.21.66:8180".into(), tls_cert: None, admin: ln.join("none"),
+    let keys = xbt_wallet_ui::node_keys::Settings { rest: "https://10.21.21.66:8180".into(), tls_cert: None, admin: ln.join("none"), grant: None,
                                                     rail_dir: Some(ln.clone()), gw_dir: None };
     xbt_wallet_ui::node_keys::make_keys(&keys, &mut |_, _| Ok(rail.clone())).unwrap();
     let film = "https://stream.lazarus-xbt.xyz/Videos/0f0967c6719ebc0951976655686df3bc/stream?static=true";
@@ -60,7 +60,7 @@ fn easy_setup_screenshots() {
     let gw = data.path().join("gateway");
     std::fs::create_dir_all(&gw).unwrap();
     // the gateway's two keys, made by the box too
-    let gw_keys = xbt_wallet_ui::node_keys::Settings { rest: "https://10.21.21.66:8180".into(), tls_cert: None, admin: gw.join("none"),
+    let gw_keys = xbt_wallet_ui::node_keys::Settings { rest: "https://10.21.21.66:8180".into(), tls_cert: None, admin: gw.join("none"), grant: None,
                                                        rail_dir: None, gw_dir: Some(gw.clone()) };
     xbt_wallet_ui::node_keys::make_keys(&gw_keys, &mut |ops, _| {
         let pairs: Vec<(&str, Vec<&str>)> = ops.iter().map(|o| o.split_once(':').unwrap()).fold(vec![], |mut v: Vec<(&str, Vec<&str>)>, (e, a)| {

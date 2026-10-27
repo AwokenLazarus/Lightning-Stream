@@ -17,6 +17,21 @@
 //! the admin macaroon on standard input instead, read once into memory ([`read_admin`]): the install
 //! script pipes the owner's file in, so no file of it is made and no service mounts it.
 //!
+//! Where the node's own package grants the app its keys (StartOS: Lightning Fork bakes one when the
+//! owner approves the app's request, under a root key of its own, and shares it read-only in
+//! `apps/<app>/`: `XBT_KEYS_GRANT_DIR`), it is copied from there and no admin macaroon is read:
+//!
+//! | granted file | becomes |
+//! |---|---|
+//! | [`GRANT_ACCESS`] (the app's one grant: the wallet's permissions only) | `<rail dir>/rail.macaroon` |
+//! | [`GRANT_GATEWAY`] (where the node grants the selling side a key of its own) | `<gateway dir>/invoices.macaroon` and `info.macaroon` |
+//!
+//! The one grant is never given to the gateway: it can pay, and only the signer may. A granted key the
+//! node replaces is copied again; one the owner revoked (its file gone) is removed here too, and the
+//! pages say so. With `XBT_KEYS_WATCH_S` the tool keeps watching the grant folder, so a grant the owner
+//! approves later is taken without a restart. With neither a grant nor an admin macaroon nothing is
+//! made, and the owner pastes the keys on the app's pages.
+//!
 //! A key that is already there (the owner's own, or one made before) is left alone. Beside the keys,
 //! `auto-keys.json` says they came from the box and names their root key ids (no secret), so the
 //! pages can say "connected automatically" and how to revoke them.
@@ -30,6 +45,11 @@ use crate::setup::{write_shared, GW_INFO, GW_INVOICES, RAIL_MACAROON, RAIL_OPS};
 /// The file beside the keys that says they were made by this tool.
 pub const AUTO_KEYS: &str = "auto-keys.json";
 
+/// The app's one grant (Lightning Fork's `grant-app-access`): the wallet's key.
+pub const GRANT_ACCESS: &str = "access.macaroon";
+/// The gateway's own key (invoices and node info), where the node grants one.
+pub const GRANT_GATEWAY: &str = "gateway.macaroon";
+
 /// Where to find the node and where the keys go (from the environment: [`Settings::from_env`]).
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -37,8 +57,10 @@ pub struct Settings {
     pub rest: String,
     pub tls_cert: Option<PathBuf>,
     /// The node's admin macaroon, or a directory to look for one in (the node's `data/chain`), or
-    /// `-`: standard input ([`Settings::admin_on_stdin`]).
+    /// `-`: standard input ([`Settings::admin_on_stdin`]). Empty: none (with a grant dir only).
     pub admin: PathBuf,
+    /// The folder the node's package shares granted keys in, read-only; `None`: no grant.
+    pub grant: Option<PathBuf>,
     /// The wallet's key dir (`run/ln`); `None`: no wallet key is made.
     pub rail_dir: Option<PathBuf>,
     /// The gateway's key dir (`run/gateway`); `None`: no gateway keys are made.
@@ -47,15 +69,21 @@ pub struct Settings {
 
 impl Settings {
     /// `XBT_KEYS_NODE_REST`, `XBT_KEYS_TLS_CERT`, `XBT_KEYS_ADMIN` (a file or a dir), `XBT_KEYS_RAIL_DIR`,
-    /// `XBT_KEYS_GW_DIR`.
+    /// `XBT_KEYS_GW_DIR`, `XBT_KEYS_GRANT_DIR` (with it, `XBT_KEYS_ADMIN` may be left out).
     pub fn from_env() -> Result<Self, String> {
         let get = |k: &str| std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
         let rest = get("XBT_KEYS_NODE_REST").ok_or("XBT_KEYS_NODE_REST is not set: this box did not say where its Lightning node is")?;
-        let admin = get("XBT_KEYS_ADMIN").ok_or("XBT_KEYS_ADMIN is not set: this box gave no node data to read")?;
+        let grant = get("XBT_KEYS_GRANT_DIR").map(PathBuf::from);
+        let admin = match get("XBT_KEYS_ADMIN") {
+            Some(a) => a,
+            None if grant.is_some() => String::new(),
+            None => return Err("XBT_KEYS_ADMIN is not set: this box gave no node data to read".into()),
+        };
         let s = Self {
             rest,
             tls_cert: get("XBT_KEYS_TLS_CERT").map(PathBuf::from),
             admin: PathBuf::from(admin),
+            grant,
             rail_dir: get("XBT_KEYS_RAIL_DIR").map(PathBuf::from),
             gw_dir: get("XBT_KEYS_GW_DIR").map(PathBuf::from),
         };
@@ -142,6 +170,8 @@ pub struct Outcome {
     pub made: Vec<String>,
     /// The files that were there and were left alone.
     pub kept: Vec<String>,
+    /// The granted files removed because the node revoked them.
+    pub revoked: Vec<String>,
 }
 
 /// Add `file`'s root key id and permissions to `dir`'s record of the keys this tool made.
@@ -181,6 +211,54 @@ pub fn make_keys(s: &Settings, bake: &mut Bake) -> Result<Outcome, String> {
     Ok(out)
 }
 
+/// Copy the keys the node granted into place: a missing key, or one copied from a grant before
+/// that the node has since replaced. A key copied from a grant whose file is gone (the owner revoked
+/// it in the node's app) is removed and the record says so. A key the owner pasted or the tool baked
+/// is left alone.
+pub fn take_grants(s: &Settings, out: &mut Outcome) -> Result<(), String> {
+    let Some(grant) = &s.grant else { return Ok(()) };
+    let groups: [(&Option<PathBuf>, &str, &[&str]); 2] = [(&s.rail_dir, GRANT_ACCESS, &[RAIL_MACAROON]), (&s.gw_dir, GRANT_GATEWAY, &[GW_INVOICES, GW_INFO])];
+    for (dir, name, files) in groups {
+        let Some(dir) = dir else { continue };
+        if is_off(dir) {
+            continue;
+        }
+        let src = grant.join(name);
+        let mac = if src.is_file() { std::fs::read(&src).map_err(|e| format!("{}: {e}", src.display()))? } else { vec![] };
+        for file in files {
+            let here = dir.join(file);
+            let granted_before = read_record(dir)[*file]["source"] == "grant";
+            if mac.is_empty() {
+                // revoked: the node took its grant back
+                if granted_before && here.is_file() {
+                    std::fs::remove_file(&here).map_err(|e| format!("{}: {e}", here.display()))?;
+                    let mut rec = read_record(dir);
+                    rec[*file]["revoked"] = json!(true);
+                    write_shared(dir, AUTO_KEYS, format!("{rec:#}\n").as_bytes())?;
+                    out.revoked.push(file.to_string());
+                }
+                continue;
+            }
+            if here.is_file() && !(granted_before && std::fs::read(&here).ok().as_deref() != Some(&mac[..])) {
+                continue;
+            }
+            write_shared(dir, file, &mac)?;
+            let mut rec = read_record(dir);
+            rec[*file] = json!({"source": "grant", "from": name,
+                                "made_at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)});
+            rec["made_by"] = json!("the Lightning node's own app, granted by the owner");
+            write_shared(dir, AUTO_KEYS, format!("{rec:#}\n").as_bytes())?;
+            out.made.push(file.to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Whether the owner revoked the key the node had granted for `file` in `dir` (for the pages).
+pub fn grant_revoked(dir: &Path, file: &str) -> bool {
+    read_record(dir)[file]["revoked"] == true && !dir.join(file).is_file()
+}
+
 /// Read the admin macaroon and make the missing keys through the node.
 pub fn run(s: &Settings) -> Result<Outcome, String> {
     run_with(s, None)
@@ -188,11 +266,18 @@ pub fn run(s: &Settings) -> Result<Outcome, String> {
 
 /// [`run`], with the admin macaroon given (read from standard input) rather than read from `s.admin`.
 pub fn run_with(s: &Settings, given: Option<&[u8]>) -> Result<Outcome, String> {
+    // the node's own grant first: then no admin macaroon is read for what it gave
+    let mut granted = Outcome::default();
+    take_grants(s, &mut granted)?;
     // nothing to make: the node is not asked and its admin macaroon is not read
     let missing = s.rail_dir.as_ref().is_some_and(|d| !is_off(d) && !d.join(RAIL_MACAROON).is_file())
         || s.gw_dir.as_ref().is_some_and(|d| !is_off(d) && (!d.join(GW_INVOICES).is_file() || !d.join(GW_INFO).is_file()));
     if !missing {
-        return Ok(Outcome { made: vec![], kept: vec!["all".into()] });
+        return Ok(if granted.made.is_empty() && granted.revoked.is_empty() { Outcome { kept: vec!["all".into()], ..Outcome::default() } } else { granted });
+    }
+    // no admin macaroon given (a grant only): what is still missing is the owner's to paste
+    if given.is_none() && s.admin.as_os_str().is_empty() {
+        return Ok(granted);
     }
     let read;
     let admin = match given {
@@ -203,7 +288,10 @@ pub fn run_with(s: &Settings, given: Option<&[u8]>) -> Result<Outcome, String> {
             &read
         }
     };
-    make_keys(s, &mut |ops, id| bake_macaroon(&s.rest, s.tls_cert.as_deref(), admin, ops, id))
+    let mut out = make_keys(s, &mut |ops, id| bake_macaroon(&s.rest, s.tls_cert.as_deref(), admin, ops, id))?;
+    out.made.splice(0..0, granted.made);
+    out.revoked = granted.revoked;
+    Ok(out)
 }
 
 fn read_record(dir: &Path) -> serde_json::Value {
@@ -294,7 +382,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let rail = shared_dir(t.path(), "ln");
         let gw = shared_dir(t.path(), "gateway");
-        let s = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: t.path().join("none"), rail_dir: Some(rail.clone()), gw_dir: Some(gw.clone()) };
+        let s = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: t.path().join("none"), grant: None, rail_dir: Some(rail.clone()), gw_dir: Some(gw.clone()) };
         let mut asked: Vec<(Vec<String>, u64)> = vec![];
         let out = make_keys(&s, &mut |ops, id| {
             asked.push((ops.iter().map(|o| o.to_string()).collect(), id));
@@ -322,7 +410,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let rail = shared_dir(t.path(), "ln");
         std::fs::write(rail.join(RAIL_MACAROON), b"owner's").unwrap();
-        let s = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: t.path().join("none"), rail_dir: Some(rail.clone()), gw_dir: None };
+        let s = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: t.path().join("none"), grant: None, rail_dir: Some(rail.clone()), gw_dir: None };
         // nothing missing: the admin macaroon is not even looked for
         assert_eq!(run(&s).unwrap().made, Vec::<String>::new());
         assert_eq!(std::fs::read(rail.join(RAIL_MACAROON)).unwrap(), b"owner's");
@@ -333,7 +421,7 @@ mod tests {
     fn a_key_the_owner_disconnected_is_not_made_again() {
         let t = tempfile::tempdir().unwrap();
         let rail = shared_dir(t.path(), "ln");
-        let s = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: t.path().join("none"), rail_dir: Some(rail.clone()), gw_dir: None };
+        let s = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: t.path().join("none"), grant: None, rail_dir: Some(rail.clone()), gw_dir: None };
         make_keys(&s, &mut |_, _| Ok(b"k".to_vec())).unwrap();
         assert!(made_by_box(&rail));
         assert!(root_key_line(&rail, RAIL_MACAROON).starts_with("root key id "));
@@ -346,10 +434,61 @@ mod tests {
     }
 
     #[test]
+    fn the_granted_key_is_the_wallets_only_and_no_admin_macaroon_is_read() {
+        let t = tempfile::tempdir().unwrap();
+        let rail = shared_dir(t.path(), "ln");
+        let gw = shared_dir(t.path(), "gateway");
+        let grant = shared_dir(t.path(), "grant");
+        let s = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: PathBuf::new(), grant: Some(grant.clone()),
+                           rail_dir: Some(rail.clone()), gw_dir: Some(gw.clone()) };
+        // no grant yet and no admin macaroon: nothing made, nothing refused (the owner approves, or pastes)
+        assert_eq!(run(&s).unwrap(), Outcome::default());
+        std::fs::write(grant.join(GRANT_ACCESS), b"w1").unwrap();
+        assert_eq!(run(&s).unwrap().made, vec![RAIL_MACAROON]);
+        assert_eq!(std::fs::read(rail.join(RAIL_MACAROON)).unwrap(), b"w1");
+        assert!(!gw.join(GW_INVOICES).exists() && !gw.join(GW_INFO).exists(), "the grant can pay: never the gateway's");
+        assert!(made_by_box(&rail));
+        assert!(root_key_ids(&rail).is_empty(), "a granted key is revoked in the node's own app, not by root key id");
+        // the node replaces it (a new grant): copied again; an unchanged one is kept
+        std::fs::write(grant.join(GRANT_ACCESS), b"w2").unwrap();
+        assert_eq!(run(&s).unwrap().made, vec![RAIL_MACAROON]);
+        assert_eq!(std::fs::read(rail.join(RAIL_MACAROON)).unwrap(), b"w2");
+        assert!(run(&s).unwrap().made.is_empty());
+        // a gateway key of its own, where the node grants one
+        std::fs::write(grant.join(GRANT_GATEWAY), b"g1").unwrap();
+        assert_eq!(run(&s).unwrap().made, vec![GW_INVOICES, GW_INFO]);
+        // the owner revokes it in the node's app: removed here, and the pages can say so
+        std::fs::remove_file(grant.join(GRANT_ACCESS)).unwrap();
+        assert_eq!(run(&s).unwrap().revoked, vec![RAIL_MACAROON]);
+        assert!(!rail.join(RAIL_MACAROON).exists() && grant_revoked(&rail, RAIL_MACAROON));
+        // approved again: taken, no longer revoked
+        std::fs::write(grant.join(GRANT_ACCESS), b"w3").unwrap();
+        assert_eq!(run(&s).unwrap().made, vec![RAIL_MACAROON]);
+        assert!(!grant_revoked(&rail, RAIL_MACAROON));
+    }
+
+    #[test]
+    fn an_owners_own_key_stays_beside_a_grant() {
+        let t = tempfile::tempdir().unwrap();
+        let rail = shared_dir(t.path(), "ln");
+        let grant = shared_dir(t.path(), "grant");
+        std::fs::write(rail.join(RAIL_MACAROON), b"owner's").unwrap();
+        std::fs::write(grant.join(GRANT_ACCESS), b"granted").unwrap();
+        let s = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: PathBuf::new(), grant: Some(grant.clone()),
+                           rail_dir: Some(rail.clone()), gw_dir: None };
+        assert!(run(&s).unwrap().made.is_empty());
+        assert_eq!(std::fs::read(rail.join(RAIL_MACAROON)).unwrap(), b"owner's");
+        // and it is not removed when there is no grant
+        std::fs::remove_file(grant.join(GRANT_ACCESS)).unwrap();
+        assert!(run(&s).unwrap().revoked.is_empty());
+        assert_eq!(std::fs::read(rail.join(RAIL_MACAROON)).unwrap(), b"owner's");
+    }
+
+    #[test]
     fn a_refused_bake_writes_nothing() {
         let t = tempfile::tempdir().unwrap();
         let gw = shared_dir(t.path(), "gateway");
-        let s = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: t.path().join("none"), rail_dir: None, gw_dir: Some(gw.clone()) };
+        let s = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: t.path().join("none"), grant: None, rail_dir: None, gw_dir: Some(gw.clone()) };
         let mut n = 0;
         let e = make_keys(&s, &mut |_, _| {
             n += 1;

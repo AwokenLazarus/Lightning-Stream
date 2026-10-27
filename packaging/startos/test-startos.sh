@@ -1,7 +1,7 @@
 #!/bin/bash
-# Verify for the StartOS packages: build them (build.sh: tsc, the SDK's eslint, ncc, `start-cli s9pk pack` for
-# x86_64 and aarch64), check the four .s9pk files (manifest, images per arch, static ELF of the right arch,
-# image users), then run both packages' own container specs on regtest the way StartOS does, beside a
+# Verify for the StartOS package: build it (build.sh: tsc, the SDK's eslint, ncc, `start-cli s9pk pack` for
+# x86_64 and aarch64), check the two .s9pk files (manifest, images per arch, static ELF of the right arch,
+# image users), then run the package's own container spec on regtest the way StartOS does, beside a
 # Lightning Fork lab, with a paid buy over stream tickets (test/startos_regtest.py). No StartOS VM runs here;
 # a real-box test needs a box chosen for it.
 # Ports 24100-24199 on 127.0.0.1 only (STARTOS_TEST_PORTS=LO-HI and STARTOS_TEST_{MCP,UI,PROV}_PORT move them). Soak rules: CPUQuota 200%, MemoryMax 4G, nice 19. Never publishes.
@@ -44,10 +44,10 @@ import json, os, subprocess, sys, tempfile
 cli, d, out = sys.argv[1:4]
 ELF = {"x86_64": 0x3E, "aarch64": 0xB7}
 PKGS = {
-    "xbt-agent-wallet": (["main", "startos"], {"init": ("xbt-init", "0:0"), "signer": ("xbt-signer", "xbt-signer"),
-                                                "witness": ("xbt-anchor-witness", "xbt-anchor-witness"), "mcp": ("xbt-wallet-mcp", "xbt-wallet-mcp"),
-                                                "ui": ("xbt-wallet-ui", "xbt-wallet-ui")}),
-    "lightning-stream-gateway": (["main"], {"init": ("xbt-init", "0:0"), "gateway": ("xbt-gateway", "xbt-gateway"), "ui": ("xbt-wallet-ui", "xbt-wallet-ui")}),
+    "lightning-stream": (["main", "startos"], {"init": ("xbt-init", "0:0"), "signer": ("xbt-signer", "xbt-signer"),
+                                               "witness": ("xbt-anchor-witness", "xbt-anchor-witness"), "mcp": ("xbt-wallet-mcp", "xbt-wallet-mcp"),
+                                               "ui": ("xbt-wallet-ui", "xbt-wallet-ui"), "gateway": ("xbt-gateway", "xbt-gateway"),
+                                               "connector": ("lightning-stream", "xbt-signer"), "hashlink": ("xbt-hashlink", "xbt-hashrate")}),
 }
 probs, rep = [], {}
 for (pkg, (volumes, IMAGES)) in PKGS.items():

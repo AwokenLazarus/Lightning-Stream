@@ -38,12 +38,11 @@ packaging/
     test-umbrel-apps.sh       verify: lint, then install both apps from cold beside the lab and buy, twice
     bundle.sh                 side-load bundle: the store + docker-saved images (dist/umbrel/)
   startos/
-    xbt-agent-wallet/         the wallet package (start-sdk 2.0.9, TypeScript); startos/spec.ts is its containers as data
-    lightning-stream-gateway/ the gateway package, the same way
-    build.sh                  tsc + the SDK's eslint + ncc + `start-cli s9pk pack` -> dist/startos/*_{x86_64,aarch64}.s9pk
+    lightning-stream/         the one package, the whole app as on Umbrel (start-sdk 2.0.9, TypeScript); startos/spec.ts is its containers as data
+    build.sh                  tsc + the SDK's eslint + ncc + `start-cli s9pk pack` -> dist/startos/lightning-stream_{x86_64,aarch64}.s9pk
     tools/tar2sqfs            a shim over mksquashfs -tar (pack needs tar2sqfs; this host has squashfs-tools)
-    test/startos_regtest.py   both packages' own containers beside the lab, StartOS-shaped, with the paid buy
-    test-startos.sh           verify: build, inspect the four .s9pk, then the regtest run
+    test/startos_regtest.py   the package's own containers beside the lab, StartOS-shaped, with the paid buy
+    test-startos.sh           verify: build, inspect the two .s9pk, then the regtest run
 ```
 
 ## Build and verify
@@ -269,9 +268,9 @@ applied there.
   (push the saved images there first). That drops the digest: an image loaded and pushed one platform at a
   time gets a manifest, and so a digest, of its own; `IMAGES.txt` has each image's id to compare. It adds community stores by git URL
   (smart HTTP), and lists only apps whose id starts with the store's id.
-- **StartOS:** in the StartOS UI, System → Sideload a service, with `dist/startos/xbt-agent-wallet_x86_64.s9pk`
-  and/or `dist/startos/lightning-stream-gateway_x86_64.s9pk` (or `_aarch64`). The packages are signed with the
-  workspace's developer key, not a Start9 registry key.
+- **StartOS:** from the Lightning Stream registry (`docs/STARTOS.md`), or in the StartOS UI, System → Sideload
+  a service, with `dist/startos/lightning-stream_x86_64.s9pk` (or `_aarch64`). The package is signed with the
+  workspace's developer key.
 
 ## Size and memory
 

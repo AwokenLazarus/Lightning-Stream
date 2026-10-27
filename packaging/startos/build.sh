@@ -1,6 +1,7 @@
 #!/bin/bash
-# Build the StartOS packages (packaging/startos/xbt-agent-wallet, packaging/startos/lightning-stream-gateway) into
-# dist/startos/: <package>_x86_64.s9pk and <package>_aarch64.s9pk. Side-load only: never `make publish`.
+# Build the StartOS package (packaging/startos/lightning-stream: the whole app, as the Umbrel app is) into
+# dist/startos/: lightning-stream_x86_64.s9pk and lightning-stream_aarch64.s9pk. Publishing to a registry is
+# its own step (docs/STARTOS.md): never `make publish`.
 #   - packs the published images the specs pin (packaging/images.lock, ghcr.io/awokenlazarus/<image>:<tag>@<digest>):
 #     a .s9pk carries its images, so a server installs it without a registry; pack takes each arch from the local
 #     Docker, so a pinned image missing there is pulled first (by digest);
@@ -13,7 +14,7 @@
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
-PKGS=(xbt-agent-wallet lightning-stream-gateway)
+PKGS=(lightning-stream)
 START_CLI=${START_CLI:-$HOME/.local/opt/start-cli/start-cli}
 [ -x "$START_CLI" ] || { echo "build: start-cli missing at $START_CLI (github.com/Start9Labs/start-technologies releases, start-cli/v2.1.0)" >&2; exit 1; }
 python3 "$ROOT/packaging/pin_images.py" --check || { echo "build: the specs are not pinned to packaging/images.lock" >&2; exit 1; }

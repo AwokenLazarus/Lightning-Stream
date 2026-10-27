@@ -3,6 +3,10 @@
 go: side-loaded, the owner's actions and pages, the Lightning dependency (a regtest stand-in with Lightning
 Fork's id), the agent's MCP over the LAN, and the paid buy attempted.
 
+This drives the two packages StartOS had before 0.1.13 (xbt-agent-wallet and lightning-stream-gateway,
+each with its own pages). The app is now one package, lightning-stream; this script records how that
+earlier run was done and needs reworking before it runs against the new package.
+
     realbox_startos.py OUT PHASE...   PHASE: chain wallet-start owner owner-resume buy restart uninstall
 
 Environment: STARTOS_HOST, STARTOS_ROOT_CA (the server's root CA, which `start-cli setup` prints at the end of

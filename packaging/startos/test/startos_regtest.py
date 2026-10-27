@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-"""The StartOS packages' containers on regtest, run the way StartOS runs them (test-startos.sh runs this), and a
-paid buy: the packaged wallet pays the packaged gateway with stream tickets over two Lightning Fork nodes.
+"""The StartOS package's containers on regtest, run the way StartOS runs them (test-startos.sh runs this), and a
+paid buy: the package's wallet pays the package's own shop with stream tickets over two Lightning Fork nodes.
 
-No StartOS VM runs here, so this runs each package's own container spec (<package>/startos/spec.ts, printed by
-its test/spec-json.mjs: the same data main.ts turns into daemons) on Docker, with what StartOS does around it:
-  * one volume per package, `main`, root-owned and empty at install (no image skeleton copied into it); every
-    container mounts only its sub-paths of it (volume-subpath), read-only where the spec says so;
-  * Lightning Fork's `tls.cert`, the one file of its volume the spec mounts (mountDependency, type file),
-    is a read-only bind of the lab node's certificate: lf1 for the wallet's server, lf2 for the gateway's;
-  * a package's containers share one network namespace (StartOS runs a service's subcontainers in one LXC
+No StartOS VM runs here, so this runs the package's own container spec (lightning-stream/startos/spec.ts, printed
+by its test/spec-json.mjs: the same data main.ts turns into daemons) on Docker, with what StartOS does around it:
+  * one volume, `main`, root-owned and empty at install (no image skeleton copied into it); every container
+    mounts only its sub-paths of it (volume-subpath), read-only where the spec says so;
+  * Lightning Fork's certificate folder, the part of its volume the services mount (mountDependency), is a
+    read-only bind of the lab node's certificate. One install plays both sides here: its wallet pays through
+    lf1, and its shop sells on lf2 (its node address and certificate set on the UI and the gateway for the
+    test), so the buyer reaches the seller at 127.0.0.1:8402 (on servers they are two machines:
+    packaging/DESIGN.md, section 3). node-keys does not run: the owner pastes the keys on the pages;
+  * the package's containers share one network namespace (StartOS runs a service's subcontainers in one LXC
     container, so they reach each other on 127.0.0.1), and each runs as its image's user unless the spec says
-    root. Here the two packages share that one namespace too: the wallet pays tickets over https or to its own
-    machine only, and a regtest has no https name with a public certificate, so the buyer reaches the seller
-    at 127.0.0.1:8402 (on servers they are two machines: packaging/DESIGN.md, section 3);
+    root;
   * `init` is a oneshot that must exit 0 before the daemons start, in the spec's `requires` order;
   * the XBT node is the lab's Knots BLAKE2b regtest (the Node connection action's values), and Lightning Fork's
     container address is the lab node's name.
@@ -33,20 +34,19 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-PKG = os.path.join(os.path.dirname(HERE), "xbt-agent-wallet")
-GW_PKG = os.path.join(os.path.dirname(HERE), "lightning-stream-gateway")
+PKG = os.path.join(os.path.dirname(HERE), "lightning-stream")
 sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
 from ln_lab import Lab  # noqa: E402
 from regtest_lib import (agent_and_custody, agent_rotation_attempts, leaks, POLICY_BASE, ROOT, Mcp, Ui, check, docker, http, log, open_log,  # noqa: E402
-                         image_of, owner_setup, paid_buy, sh, status, test_image, wait_until, write_results)
+                         image_of, owner_setup, paid_buy, sell_owner_setup, sh, status, test_image, wait_until, write_results)
 
 OUT = sys.argv[1]
 PID = os.getpid()
 P = f"pkgs9-{PID}"
 P_MCP = int(os.environ.get("STARTOS_TEST_MCP_PORT", "24110"))
 P_UI = int(os.environ.get("STARTOS_TEST_UI_PORT", "24130"))
-P_GW_UI = int(os.environ.get("STARTOS_TEST_GW_UI_PORT", "24131"))
 P_LF = (int(os.environ.get("STARTOS_TEST_LF1_PORT", "24150")), int(os.environ.get("STARTOS_TEST_LF2_PORT", "24151")))
+GW_CERT = "/data/lightning-gw/tls.cert"
 SIGN_BIN = os.path.join(ROOT, "dist/oci/ctx/bin/amd64/xbt-wallet-ui")
 ORIGIN = "http://127.0.0.1:8402"
 open_log(os.path.join(OUT, "startos_regtest.log"))
@@ -56,17 +56,18 @@ NET = LAB.net
 
 def spec():
     cfg = {"node": {"host": "knots-b2b", "port": 18443, "user": "lab", "password": "lab", "chain": "regtest"},
-           "mcpUrls": [f"http://127.0.0.1:{P_MCP}/mcp"], "lightningRest": "https://lf1:8080"}
+           "mcpUrls": [f"http://127.0.0.1:{P_MCP}/mcp"], "lightningRest": "https://lf1:8080", "proxies": [], "lanHost": ""}
     r = subprocess.run(["node", "--experimental-strip-types", "--no-warnings", "test/spec-json.mjs", json.dumps(cfg)], cwd=PKG,
                        capture_output=True, text=True, check=True)
-    return json.loads(r.stdout)
-
-
-def gw_spec():
-    cfg = {"lightningRest": "https://lf2:8080", "proxies": []}
-    r = subprocess.run(["node", "--experimental-strip-types", "--no-warnings", "test/spec-json.mjs", json.dumps(cfg)], cwd=GW_PKG,
-                       capture_output=True, text=True, check=True)
-    return json.loads(r.stdout)
+    sp = json.loads(r.stdout)
+    # the shop sells on lf2: its node address and certificate (a second certificate folder) on the UI and the gateway
+    for s in sp["services"]:
+        if s["id"] == "ui":
+            s["env"].update({"XBT_UI_GW_NODE_REST": "https://lf2:8080", "XBT_UI_GW_NODE_TLS_CERT": GW_CERT})
+        if s["id"] in ("ui", "gateway"):
+            s["mounts"].append({"subpath": "public", "mountpoint": os.path.dirname(GW_CERT), "readonly": True, "seller_cert": True,
+                                "dependency": {"packageId": "lightning-fork", "volumeId": "main", "type": "directory"}})
+    return sp
 
 
 def run_service(s, images, vol, name=None, cert=None):
@@ -79,7 +80,8 @@ def run_service(s, images, vol, name=None, cert=None):
         args += ["-e", f"{k}={v}"]
     for m in s["mounts"]:
         if m.get("dependency"):
-            args += ["--mount", f"type=bind,src={cert or wallet_cert()},dst={m['mountpoint']},readonly"]
+            src = seller_cert() if m.get("seller_cert") else (cert or wallet_cert())
+            args += ["--mount", f"type=bind,src={os.path.dirname(src)},dst={m['mountpoint']},readonly"]
             continue
         mnt = f"type=volume,src={vol},dst={m['mountpoint']},volume-nocopy=true"
         if m["subpath"]:
@@ -95,22 +97,12 @@ def wallet_cert():
     return os.path.join(LAB.facts["lf1_cert_dir"], "tls.cert")
 
 
-def start_gateway(gsp, vol):
-    """The gateway package: init (must exit 0), then its UI and the gateway (which waits for its config)."""
-    by = {s["id"]: s for s in gsp["services"]}
-    cert = os.path.join(LAB.facts["lf2_cert_dir"], "tls.cert")
-    docker("rm", "-f", f"{P}-gw-init", check_rc=False)
-    run_service(by["init"], gsp["images"], vol, name=f"{P}-gw-init")
-    code = int(docker("wait", f"{P}-gw-init").stdout.strip())
-    rep = docker("logs", f"{P}-gw-init").stdout.strip().splitlines()
-    for sid in ("ui", "gateway"):
-        docker("rm", "-f", f"{P}-gw-{sid}", check_rc=False)
-        run_service(by[sid], gsp["images"], vol, name=f"{P}-gw-{sid}", cert=cert)
-    return code, (json.loads(rep[-1]) if rep else {})
+def seller_cert():
+    return os.path.join(LAB.facts["lf2_cert_dir"], "tls.cert")
 
 
 def gateway_up():
-    return docker("exec", f"{P}-gw-gateway", "/usr/bin/xbt-supervise", "probe", "http://127.0.0.1:8402/x402/ticket/health", check_rc=False).returncode == 0
+    return docker("exec", f"{P}-gateway", "/usr/bin/xbt-supervise", "probe", "http://127.0.0.1:8402/x402/ticket/health", check_rc=False).returncode == 0
 
 
 def start_all(sp, vol, only=None):
@@ -120,7 +112,9 @@ def start_all(sp, vol, only=None):
     run_service(by["init"], sp["images"], vol)
     code = int(docker("wait", f"{P}-init").stdout.strip())
     rep = docker("logs", f"{P}-init").stdout.strip().splitlines()
-    for sid in ["witness", "signer", "mcp", "ui"]:
+    # the services this run uses; the connector and hashrate's two are checked by their spec only (they need
+    # relays and miners: packaging/linux/test runs them)
+    for sid in ["witness", "signer", "mcp", "ui", "gateway"]:
         if sid in by and (only is None or sid in only):
             docker("rm", "-f", f"{P}-{sid}", check_rc=False)
             run_service(by[sid], sp["images"], vol, cert=wallet_cert())
@@ -134,7 +128,7 @@ def start_all(sp, vol, only=None):
 
 
 def stop_all():
-    for sid in ["ui", "mcp", "signer", "witness", "init"]:
+    for sid in ["gateway", "ui", "mcp", "signer", "witness", "init"]:
         docker("rm", "-f", f"{P}-{sid}", check_rc=False)
 
 
@@ -147,24 +141,32 @@ def main():
     sp = spec()
     by = {s["id"]: s for s in sp["services"]}
     mounts = lambda sid: [(m["subpath"], m["readonly"], bool(m.get("dependency"))) for m in by[sid]["mounts"]]  # noqa: E731
-    check("I", "the wallet spec: init runs as root; every daemon as its image's user; each mounts only its own sub-paths; of Lightning Fork's "
-               "volume only tls.cert, read-only, in the signer and the UI; the MCP sees neither it nor run/ln",
-          by["init"].get("user") == "root" and all(not by[i].get("user") for i in ("witness", "signer", "mcp", "ui"))
-          and mounts("mcp") == [("mcp", False, False), ("run/signer", True, False), ("run/ui", True, False)]
-          and mounts("ui") == [("ui", False, False), ("run/signer", True, False), ("run/ui", False, False), ("run/ln", False, False), ("tls.cert", True, True)]
-          and mounts("signer") == [("signer", False, False), ("run/signer", False, False), ("run/anchor", True, False), ("run/ln", True, False),
-                                   ("tls.cert", True, True)]
+    lf = lambda sid: [m["subpath"] for m in by[sid]["mounts"] if m.get("dependency") and not m.get("seller_cert")]  # noqa: E731
+    own = lambda sid: [(m["subpath"], m["readonly"]) for m in by[sid]["mounts"] if not m.get("dependency")]  # noqa: E731
+    check("I", "the spec: init and node-keys run as root, every daemon as its image's user; each mounts only its own sub-paths; of Lightning "
+               "Fork's volume the certificate folder (public), read-only, where the node is used, and its folder of granted keys (apps) in "
+               "node-keys only, never its chain data or admin macaroon; node-keys watches for the grant and writes only run/ln; the MCP sees "
+               "neither it nor run/ln; the hashrate services see the signer only read-only",
+          by["init"].get("user") == "root" and by["node-keys"].get("user") == "root"
+          and all(not by[i].get("user") for i in ("witness", "signer", "mcp", "ui", "connector", "gateway", "hashmaker", "hashtaker"))
+          and own("mcp") == [("mcp", False), ("run/signer", True), ("run/ui", True)] and lf("mcp") == []
+          and own("ui") == [("ui", False), ("run/signer", True), ("run/ui", False), ("run/ln", False), ("run/gateway", False), ("run/hashrate", False),
+                            ("run/enroll", True)] and lf("ui") == ["public"]
+          and own("signer") == [("signer", False), ("run/signer", False), ("run/anchor", True), ("run/ln", True), ("run/enroll", False)]
+          and lf("signer") == ["public"]
+          and own("gateway") == [("gateway", False), ("run/gateway", True)] and lf("gateway") == ["public"]
+          and own("hashtaker") == [("hashrate", False), ("run/hashrate", True), ("run/signer", True)] and lf("hashtaker") == []
+          and own("hashmaker") == [("hashrate", False), ("run/hashrate", True)] and lf("hashmaker") == []
+          and sorted(lf("node-keys")) == ["apps", "public"] and own("node-keys") == [("run/ln", False)]
+          and by["node-keys"]["env"].get("XBT_KEYS_GRANT_DIR") == "/mnt/lightning-fork-apps/lightning-stream" and "XBT_KEYS_ADMIN" not in by["node-keys"]["env"]
+          and "XBT_KEYS_GW_DIR" not in by["node-keys"]["env"] and by["ui"]["env"].get("XBT_UI_LN_GRANT") == "1"
           and [m["subpath"] for m in by["witness"]["mounts"]] == ["witness", "run/anchor"], sp["services"])
-    gsp = gw_spec()
-    gby = {s["id"]: s for s in gsp["services"]}
-    check("I", "the gateway spec: init as root, the gateway and its UI as their images' users; the gateway reads run/gateway, the UI writes it; "
-               "of Lightning Fork's volume only tls.cert, read-only",
-          gby["init"].get("user") == "root" and not gby["gateway"].get("user") and not gby["ui"].get("user")
-          and [(m["subpath"], m["readonly"], bool(m.get("dependency"))) for m in gby["gateway"]["mounts"]]
-          == [("gateway", False, False), ("run/gateway", True, False), ("tls.cert", True, True)]
-          and [(m["subpath"], m["readonly"], bool(m.get("dependency"))) for m in gby["ui"]["mounts"]]
-          == [("ui", False, False), ("run/ui", False, False), ("run/gateway", False, False), ("tls.cert", True, True)]
-          and gby["ui"]["env"].get("XBT_UI_ROLE") == "gateway", gsp["services"])
+    check("I", "one package for the whole app: the wallet, the connector, the shop and hashrate, on 127.0.0.1 inside it; the shop's and the "
+               "hashrate pages' addresses on the UI",
+          {s["id"] for s in sp["services"]} == {"init", "node-keys", "witness", "signer", "mcp", "ui", "connector", "gateway", "hashmaker", "hashtaker"}
+          and by["ui"]["env"].get("XBT_UI_SELL") == "1" and by["ui"]["env"].get("XBT_UI_HASHRENT") == "http://127.0.0.1:23343"
+          and by["ui"]["env"].get("XBT_UI_GW_HEALTH_URL") == "http://127.0.0.1:8402/x402/ticket/health" and "XBT_UI_ROLE" not in by["ui"]["env"],
+          {s["id"]: s["env"] for s in sp["services"] if s["id"] == "ui"})
 
     # --- the Lightning lab: the XBT node (the Node connection action's values) and Lightning Fork's two nodes ----
     log("== the Lightning lab: a Knots BLAKE2b regtest, lf1 (the wallet's server) and lf2 (the gateway's), one channel")
@@ -176,8 +178,8 @@ def main():
     log("== install: main volume root-owned and empty; init, then the daemons")
     vol = f"{P}-main"
     docker("volume", "create", vol)
-    docker("run", "-d", "--name", f"{P}-ns", "--network", NET, "-p", f"127.0.0.1:{P_UI}:8480", "-p", f"127.0.0.1:{P_MCP}:33510",
-           "-p", f"127.0.0.1:{P_GW_UI}:8481", "debian:bookworm-slim", "sleep", "infinity")
+    docker("run", "-d", "--name", f"{P}-ns", "--network", NET, "-p", f"127.0.0.1:{P_UI}:8482", "-p", f"127.0.0.1:{P_MCP}:33510",
+           "debian:bookworm-slim", "sleep", "infinity")
     before = vol_sh(vol, "stat -c '%u:%g %a' /v; ls -A /v | wc -l").stdout.split()
     t0 = time.time()
     code, rep = start_all(sp, vol)
@@ -238,22 +240,14 @@ def main():
     agent.start()
     before = agent_and_custody("P", agent, ui, SIGN_BIN, key, chain, sc, tools="package")
 
-    # --- T: the gateway package, then the paid buy -------------------------------------------------------------
-    log("== T: install the gateway package (root-owned empty volume); both setup pages; the agent buys over stream tickets")
-    gvol = f"{P}-gw-main"
-    docker("volume", "create", gvol)
-    gcode, grep = start_gateway(gsp, gvol)
-    gls = vol_sh(gvol, "stat -c '%u:%g %a %n' /v/gateway /v/ui /v/run/ui /v/run/gateway").stdout.split("\n")
-    check("I", "gateway package: init on its root-owned empty volume exits 0; the gateway's state 10007, the setup dir the UI's with the gateway's group",
-          gcode == 0 and grep.get("ok") and [x for x in gls if x] == ["10007:10007 700 /v/gateway", "10005:10005 700 /v/ui", "10005:10005 750 /v/run/ui",
-                                                                      "10005:10007 750 /v/run/gateway"], {"init": grep, "ls": gls})
-    wait_until(lambda: status(f"http://127.0.0.1:{P_GW_UI}/healthz") == 200, 60, "the gateway's setup page")
-    gcode_txt = vol_sh(gvol, "cat /v/ui/setup-code").stdout.strip()
-    gui = Ui(f"http://127.0.0.1:{P_GW_UI}", headers={"X-Forwarded-Proto": "https"})
-    st_g = gui.req("POST", "/setup-password", {"code": gcode_txt, "password": "gateway owner pw", "password2": "gateway owner pw"})[0]
-    check("U", "gateway package: the Setup page code action's code sets the page's password; the page is the gateway's only",
-          st_g == 303 and "Lightning Stream Gateway" in gui.get("/") and gui.req("GET", "/policy")[0] == 404, st_g)
-    bought = paid_buy("T", agent, ui, gui, SIGN_BIN, key, LAB, sc, gateway_up, ORIGIN)
+    # --- T: the shop on the Sell page, then the paid buy -------------------------------------------------------------
+    log("== T: the shop on the app's Sell page; the agent buys over stream tickets")
+    gls = vol_sh(vol, "stat -c '%u:%g %a %n' /v/gateway /v/run/gateway").stdout.split("\n")
+    check("I", "the shop's state is the gateway's (10007), its config dir the UI's with the gateway's group",
+          [x for x in gls if x] == ["10007:10007 700 /v/gateway", "10005:10007 750 /v/run/gateway"], gls)
+    check("U", "the Sell page is the app's own (no separate gateway page)", "Your shop" in ui.get("/sell"), None)
+    # a shop made on the Sell page sells 900-sat tickets (they fit under the buyer's mainnet approval line with their fee)
+    bought = paid_buy("T", agent, ui, ui, SIGN_BIN, key, LAB, sc, gateway_up, ORIGIN, setup=sell_owner_setup, ticket_msat=900_000)
 
     # --- G: what the wallet-ready health check reads ----------------------------------------------------------------
     log("== G: readiness")
@@ -376,7 +370,7 @@ def main():
 
 
 def teardown():
-    for sid in ["init", "witness", "signer", "mcp", "ui", "gw-init", "gw-gateway", "gw-ui"]:
+    for sid in ["init", "witness", "signer", "mcp", "ui", "gateway"]:
         with open(os.path.join(OUT, f"{sid}.log"), "w") as f:
             r = docker("logs", f"{P}-{sid}", check_rc=False)
             f.write(r.stdout + r.stderr)

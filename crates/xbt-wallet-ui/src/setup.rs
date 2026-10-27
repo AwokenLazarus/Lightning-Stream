@@ -267,6 +267,11 @@ impl App {
             if ready { "Nothing to do here.".to_string() }
             else if needs_ack { "Confirm below that the app may pay with real money.".into() }
             else if have { format!("{} If this stays, open the details below.", esc(&plain_reason(&txt(status.get("reason").or(status.get("config_error")))))) }
+            else if crate::node_keys::grant_revoked(&ln.dir, RAIL_MACAROON) {
+                "Lightning Fork no longer gives this app access: it was revoked there. To connect again, run Lightning Fork's \
+                 Grant app access task for Lightning Stream, or paste a key below.".into() }
+            else if ln.grant { "Approve Lightning Stream in Lightning Fork: open Lightning Fork's tasks and run Grant app access. \
+                 The app connects by itself a few seconds later. Or paste a key below.".into() }
             else { "Make the key in your node's app and paste it below.".into() }));
         if needs_ack {
             b.push_str(&format!("<form method=\"post\" action=\"./lightning\" class=\"card primary\">{}<input type=\"hidden\" name=\"action\" value=\"ack\">\
