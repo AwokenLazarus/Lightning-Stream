@@ -3303,7 +3303,19 @@ fn a_win_whose_payment_fails_is_owed_until_the_sellers_next_invoice_and_never_pa
     assert_eq!(r.session(v["session"].as_str().unwrap())["sessions"][0]["why"], "a win's payment is not final on the wallet's node");
     let next = r.pay("/tiny/10", 5);
     assert!(next["status"] == 200 && next["rail"] == "lottery" && next["session"] != v["session"], "{next}");
-    assert_eq!((r.ledger_sum(), r.ln.paid_msat(), r.shop.settled()), (in_doubt * 67, 0, 0), "booked for as long as the node cannot say, and nothing paid twice");
+    // what the book holds for those sessions: the wins whose payments are in doubt, and a win that was
+    // still owed when the first call ended (its invoice not yet sent: counted in that call's wins, not
+    // in its wins_unpaid) and that a later call of the session booked, on the same unanswering node.
+    // Each win has one payment at most, none of them final, and the ledger holds exactly those
+    let rows: Vec<Value> = [v["session"].as_str().unwrap(), next["session"].as_str().unwrap()].iter().flat_map(|sid| win_tickets(&r, sid)).collect();
+    let booked: Vec<(String, u64)> = rows.iter().filter(|t| t["state"] != "failed")
+        .map(|t| (t["session"].as_str().unwrap_or_default().to_string(), t["win"].as_u64().unwrap())).collect();
+    let mut once = booked.clone();
+    once.sort_unstable();
+    once.dedup();
+    assert_eq!(once.len(), booked.len(), "no win has two payments: {rows:?}");
+    assert!(booked.len() as i64 >= in_doubt && rows.iter().all(|t| t["state"] != "settled"), "{rows:?}");
+    assert_eq!((r.ledger_sum(), r.ln.paid_msat(), r.shop.settled()), (booked.len() as i64 * 67, 0, 0), "booked for as long as the node cannot say, and nothing paid twice");
 }
 
 /// A win's payment that the wallet could not even begin (its own Lightning node gave no answer for
