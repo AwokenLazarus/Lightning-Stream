@@ -62,7 +62,12 @@ listing is then `listing/1`. The fields are closed here too:
 | `name` | The seller's name. |
 | `seller`, `receipt_key`, `updated`, `sig` | As in `listing/0`. |
 | `licence`, `credits` | Optional: what holds for every service that does not say its own. |
-| `services` | One to 32 entries, each `name`, `kind` (`video`, `files`, `api`, `ai` or `hashrate`), `path`, `prices` and `items`, with an optional `licence` and `credits`. `path` is the gateway route the service is sold under; no two entries share one. |
+| `services` | One to 32 entries, each `name`, `kind` (`video`, `files`, `api`, `ai`, `hashrate` or `app`), `path`, `prices` and `items`, with an optional `licence` and `credits`. `path` is the gateway route the service is sold under; no two entries of one kind share one, and an `app` may share its service's. |
+
+A service of kind `app` is a service's own web page, which buyers open inside their app
+([SELLER-APPS.md](SELLER-APPS.md)). Its `path` is the page's base: what the page sees as `/`.
+Its one item is where the page opens. It goes with the service of the same path, or of the same
+name, and is listed alone where there is none.
 
 New kinds come after the apps that read them. A reader skips a `listing/1` service whose `kind`
 it does not know, and reads the rest: the signature still covers the whole document, the skipped
@@ -71,7 +76,8 @@ checked whole, as before. A listing with no service of a kind the reader knows i
 `listing/0` has one service, so its `kind` stays strict: with it unknown there is nothing to read.
 A seller's own config is strict too: it can list only the kinds its gateway knows.
 
-The kinds `ai` and `hashrate` came before this rule: apps older than it refuse a listing with such
+The kind `app` came after this rule, so an app that follows it and does not know the kind skips
+the page and reads the service. The kinds `ai` and `hashrate` came before this rule: apps older than it refuse a listing with such
 a service. A seller who must reach those apps lists a model as `api`.
 
 The digest is built as for `listing/0`, under its own tag, `xbt402/listing/1`, so a document of one

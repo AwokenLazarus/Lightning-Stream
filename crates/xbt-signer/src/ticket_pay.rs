@@ -1057,6 +1057,10 @@ impl Signer {
     /// `content_range`, `content_length`, `accept_ranges` and `content_type` as the wallet read
     /// them ([`answer_head`]); with `stream_to` and `stream_head`, the same head is the first line
     /// on the socket, before the body.
+    ///
+    /// A caller that hands the answer on to a browser (a seller's own web page, docs/SELLER-APPS.md)
+    /// sends the page's own request headers (`headers`, [`caller_headers`]) and, with
+    /// `head_headers`, gets the seller's response headers in the head line ([`passed_headers`]).
     pub(crate) fn xbt402_pay(&self, p: &Value) -> Value {
         let tp = self.ticket_policy();
         let cfg = self.config();
