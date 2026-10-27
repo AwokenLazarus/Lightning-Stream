@@ -47,12 +47,15 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use xbt_svc::http::{BodyWriter, Handler, Reply, Request, Response, Streamed};
 
+mod visit;
+pub use visit::Visits;
+
 /// How long a call may wait for the seller's first byte, the payment included.
-const FIRST_BYTE: Duration = Duration::from_secs(60);
+pub(crate) const FIRST_BYTE: Duration = Duration::from_secs(60);
 /// The longest one paid answer is followed (a film).
-const LONGEST: Duration = Duration::from_secs(6 * 3600);
+pub(crate) const LONGEST: Duration = Duration::from_secs(6 * 3600);
 /// The longest head line the signer writes before the body.
-const HEAD_LINE: u64 = 4096;
+pub(crate) const HEAD_LINE: u64 = 4096;
 
 pub struct Config {
     /// The signer's socket.
@@ -67,11 +70,12 @@ pub struct Config {
 
 pub struct Connector {
     cfg: Config,
+    visits: Visits,
 }
 
 impl Connector {
     pub fn new(cfg: Config) -> Self {
-        Self { cfg }
+        Self { cfg, visits: Visits::default() }
     }
 
     fn health(&self) -> Response {
@@ -173,8 +177,14 @@ impl Connector {
 }
 
 impl Handler for Connector {
-    fn body_limit(&self, _m: &str, _t: &str) -> usize {
-        0
+    fn body_limit(&self, _m: &str, t: &str) -> usize {
+        if t.starts_with("/v/") {
+            visit::MAX_BODY
+        } else if t.starts_with("/visits") {
+            4096
+        } else {
+            0
+        }
     }
 
     fn handle(&self, req: Request) -> Response {
@@ -185,6 +195,9 @@ impl Handler for Connector {
     }
 
     fn reply(&self, req: Request) -> Reply {
+        if let Some(r) = self.visits_reply(&req) {
+            return r;
+        }
         if req.method != "GET" {
             return Reply::Whole(json_response(405, &json!({"error": "GET only"})));
         }
@@ -276,13 +289,13 @@ pub fn sniff(head: &[u8], url: &str) -> &'static str {
     "application/octet-stream"
 }
 
-fn json_response(status: u16, v: &Value) -> Response {
+pub(crate) fn json_response(status: u16, v: &Value) -> Response {
     Response::text(status, "application/json", v.to_string())
 }
 
 /// Bind `path` and make it group-writable. The signer's user connects to it; a process umask would
 /// leave the socket owner-only, and the directory's group is that user.
-fn listen_stream(path: &Path) -> io::Result<UnixListener> {
+pub(crate) fn listen_stream(path: &Path) -> io::Result<UnixListener> {
     let listener = UnixListener::bind(path)?;
     if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660)) {
         let _ = std::fs::remove_file(path);
@@ -291,7 +304,7 @@ fn listen_stream(path: &Path) -> io::Result<UnixListener> {
     Ok(listener)
 }
 
-fn random_hex() -> String {
+pub(crate) fn random_hex() -> String {
     let mut b = [0u8; 12];
     getrandom::getrandom(&mut b).expect("the system's random source");
     hex::encode(b)
