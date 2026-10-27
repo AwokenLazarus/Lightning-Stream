@@ -1099,14 +1099,18 @@ impl App {
             b.push_str("<ul class=\"changes\">");
             for d in &diff {
                 let k = txt(d.get("key"));
-                b.push_str(&format!("<li>{}{}</li>", esc(&change_words(&k, d.get("old").filter(|v| !v.is_null()), d.get("new").filter(|v| !v.is_null()))),
+                let (head, details) = change_words(&k, d.get("old").filter(|v| !v.is_null()), d.get("new").filter(|v| !v.is_null()));
+                let sub = if details.is_empty() { String::new() } else {
+                    format!("<ul>{}</ul>", details.iter().map(|x| format!("<li>{}</li>", esc(x))).collect::<String>())
+                };
+                b.push_str(&format!("<li>{}{}{sub}</li>", esc(&head),
                                     if d["restart"] == true { " <span class=\"tag warn\">after the app restarts</span>" } else { "" }));
             }
             b.push_str("</ul><details><summary>Advanced: each setting as the signer names it</summary><div class=\"scroll\"><table><thead><tr><th>Setting</th><th>Now</th><th>New</th><th></th></tr></thead><tbody>");
             for d in &diff {
                 b.push_str(&format!("<tr><td><code>{}</code></td><td><code>{}</code></td><td><code>{}</code></td><td>{}</td></tr>", escv(d.get("key")),
-                                    esc(&short(&d.get("old").map(|v| v.to_string()).unwrap_or_else(|| "(none)".into()), 200)),
-                                    esc(&short(&d.get("new").map(|v| v.to_string()).unwrap_or_else(|| "(none)".into()), 200)),
+                                    esc(&d.get("old").map(|v| v.to_string()).unwrap_or_else(|| "(none)".into())),
+                                    esc(&d.get("new").map(|v| v.to_string()).unwrap_or_else(|| "(none)".into())),
                                     if d["restart"] == true { "<span class=\"tag warn\">after restart</span>" } else { "" }));
             }
             b.push_str("</tbody></table></div></details>");
@@ -1530,8 +1534,13 @@ fn setting_name(k: &str) -> String {
     }
 }
 
+/// The most nested changes listed under one rule; the rest are in Advanced.
+const MAX_DETAILS: usize = 40;
+
 /// One change of the rules in a sentence, with its unit: what the owner reviews before signing.
-fn change_words(k: &str, old: Option<&Value>, new: Option<&Value>) -> String {
+/// A rule that holds settings of its own (Lightning, tickets, the sellers) comes with each of its
+/// changes, key by key, so that no change is signed unseen.
+fn change_words(k: &str, old: Option<&Value>, new: Option<&Value>) -> (String, Vec<String>) {
     let name = setting_name(k);
     let unit = INT_KEYS.iter().find(|(key, _, _)| *key == k).map(|(_, label, _)| {
         if label.contains("(sats") { "sats" } else if label.contains("seconds") { "seconds" } else if label.contains("(blocks") { "blocks" } else { "" }
@@ -1539,30 +1548,83 @@ fn change_words(k: &str, old: Option<&Value>, new: Option<&Value>) -> String {
     let count = |v: Option<&Value>| v.and_then(|v| v.as_array().map(Vec::len).or(v.as_object().map(|m| m.len()))).unwrap_or(0);
     let on = |v: Option<&Value>| v.and_then(|v| v.get("enabled")) == Some(&Value::Bool(true));
     let word = |b: bool| if b { "on" } else { "off" };
-    match (k, unit) {
+    let mut details = vec![];
+    let head = match (k, unit) {
         (_, Some(u)) => {
             let f = |v: Option<&Value>| match v.and_then(Value::as_i64) {
                 Some(n) if u == "sats" => plain_sats(n),
                 Some(n) => format!("{n} {u}").trim_end().to_string(),
                 None => v.map(|v| v.to_string()).unwrap_or_else(|| "not set".into()),
             };
-            match old {
+            return (match old {
                 Some(_) => format!("{name}: {} (was {})", f(new), f(old)),
                 None => format!("{name}: {}", f(new)),
+            }, vec![]);
+        }
+        ("anchor_required", _) => return (format!("{name}: {}", if new == Some(&Value::Bool(true)) { "yes" } else { "no" }), vec![]),
+        ("ln" | "tickets", _) => {
+            leaf_changes("", old, new, &mut details);
+            details.retain(|d| !d.starts_with("enabled:"));
+            match old {
+                Some(_) if on(old) == on(new) => format!("{name}: {}", word(on(new))),
+                Some(_) => format!("{name}: {} (was {})", word(on(new)), word(on(old))),
+                None => format!("{name}: {}", word(on(new))),
             }
         }
-        ("ln", _) if old.is_some() && on(old) == on(new) => format!("{name}: {} (its finer settings change: see Advanced)", word(on(new))),
-        ("ln", _) if old.is_some() => format!("{name}: {} (was {})", word(on(new)), word(on(old))),
-        ("ln", _) => format!("{name}: {}", word(on(new))),
-        ("tickets", _) => {
-            let tasks = new.and_then(|v| v.get("tasks")).and_then(Value::as_object).map(|m| {
-                m.iter().map(|(t, v)| format!("{t} up to {}", plain_sats(v.get("budget_sats").and_then(Value::as_i64).unwrap_or(0)))).collect::<Vec<_>>().join(", ")
-            }).unwrap_or_default();
-            format!("{name}: {}{}", word(on(new)), if tasks.is_empty() { String::new() } else { format!("; budgets: {tasks}") })
+        ("allowlist" | "counterparties", _) => {
+            leaf_changes("", old, new, &mut details);
+            format!("{name}: {} (was {})", count(new), count(old))
         }
-        ("allowlist" | "counterparties", _) => format!("{name}: {} (was {})", count(new), count(old)),
-        ("anchor_required", _) => format!("{name}: {}", if new == Some(&Value::Bool(true)) { "yes" } else { "no" }),
-        _ => format!("{name} changes (see Advanced)"),
+        _ => {
+            leaf_changes("", old, new, &mut details);
+            format!("{name} changes")
+        }
+    };
+    if details.len() > MAX_DETAILS {
+        let more = details.len() - MAX_DETAILS;
+        details.truncate(MAX_DETAILS);
+        details.push(format!("and {more} more: see Advanced"));
+    }
+    (head, details)
+}
+
+/// Every change between two values, key by key: `section › key: new (was old)`. A list of plain values is
+/// told as what it adds and removes.
+fn leaf_changes(path: &str, old: Option<&Value>, new: Option<&Value>, out: &mut Vec<String>) {
+    if old == new {
+        return;
+    }
+    let at = |k: &str| if path.is_empty() { k.to_string() } else { format!("{path} › {k}") };
+    match (old, new) {
+        (Some(Value::Object(_)) | None, Some(Value::Object(_))) | (Some(Value::Object(_)), None) => {
+            let (a, b) = (old.and_then(Value::as_object), new.and_then(Value::as_object));
+            let mut keys: Vec<&String> = a.into_iter().flat_map(|m| m.keys()).chain(b.into_iter().flat_map(|m| m.keys())).collect();
+            keys.sort();
+            keys.dedup();
+            for k in keys {
+                leaf_changes(&at(k), a.and_then(|m| m.get(k)), b.and_then(|m| m.get(k)), out);
+            }
+        }
+        (Some(Value::Array(a)), Some(Value::Array(b))) if a.iter().chain(b).all(|v| !v.is_object() && !v.is_array()) => {
+            let label = if path.is_empty() { String::new() } else { format!("{path}: ") };
+            out.extend(b.iter().filter(|v| !a.contains(v)).map(|v| format!("{label}adds {}", plain_value(path, Some(v)))));
+            out.extend(a.iter().filter(|v| !b.contains(v)).map(|v| format!("{label}removes {}", plain_value(path, Some(v)))));
+        }
+        (Some(_), None) => out.push(format!("{path}: removed (was {})", plain_value(path, old))),
+        (None, _) => out.push(format!("{path}: {}", plain_value(path, new))),
+        _ => out.push(format!("{path}: {} (was {})", plain_value(path, new), plain_value(path, old))),
+    }
+}
+
+/// A setting's value in full, as the owner reads it: sats grouped, switches on or off.
+fn plain_value(path: &str, v: Option<&Value>) -> String {
+    match v {
+        None | Some(Value::Null) => "not set".into(),
+        Some(Value::Number(n)) if path.ends_with("_sats") && n.as_i64().is_some() => plain_sats(n.as_i64().unwrap_or(0)),
+        Some(Value::Bool(b)) if path.ends_with("enabled") => (if *b { "on" } else { "off" }).into(),
+        Some(Value::Bool(b)) => (if *b { "yes" } else { "no" }).into(),
+        Some(Value::String(s)) => s.clone(),
+        Some(v) => v.to_string(),
     }
 }
 
@@ -1648,4 +1710,33 @@ pub fn origin_allowed(origin: &str, allowed: &[String]) -> bool {
     }
     let rest = o.strip_prefix("http://").or_else(|| o.strip_prefix("https://"));
     rest.is_some_and(|r| !r.is_empty() && !r.contains('/') && host_allowed(r, allowed))
+}
+
+#[cfg(test)]
+mod change_tests {
+    use super::*;
+
+    #[test]
+    fn a_nested_change_is_shown_key_by_key_and_never_hidden_behind_a_count() {
+        // a seller's node swapped for another: the same number of sellers
+        let (head, d) = change_words("counterparties", Some(&json!({"stream": {"ln_node": "03aa"}})), Some(&json!({"stream": {"ln_node": "02bb"}})));
+        assert_eq!((head.as_str(), d), ("Sellers paid through their Lightning node: 1 (was 1)", vec!["stream › ln_node: 02bb (was 03aa)".to_string()]));
+        // one seller swapped for another on the allowlist
+        let (_, d) = change_words("allowlist", Some(&json!(["a", "b", "c"])), Some(&json!(["a", "b", "evil"])));
+        assert_eq!(d, vec!["adds evil".to_string(), "removes c".to_string()]);
+        // Lightning turned on with its exposure cap in the same change
+        let (head, d) = change_words("ln", Some(&json!({"enabled": false})), Some(&json!({"enabled": true, "exposure_cap_sats": 100_000})));
+        assert_eq!((head.as_str(), d), ("Paying over Lightning: on (was off)", vec!["exposure_cap_sats: 100,000 sats".to_string()]));
+        // a ticket cap, deep in its section
+        let (_, d) = change_words("tickets", Some(&json!({"enabled": true, "seller_max_locked_sats": 2_000, "tasks": {"film": {"budget_sats": 10_000}}})),
+                                  Some(&json!({"enabled": true, "seller_max_locked_sats": 9_000, "tasks": {"film": {"budget_sats": 50_000}}})));
+        assert_eq!(d, vec!["seller_max_locked_sats: 9,000 sats (was 2,000 sats)".to_string(), "tasks › film › budget_sats: 50,000 sats (was 10,000 sats)".to_string()]);
+        // values are never cut, and a long list points at Advanced
+        let long = "x".repeat(400);
+        let (_, d) = change_words("counterparties", None, Some(&json!({"s": {"note": long}})));
+        assert!(d[0].ends_with(&long), "{d:?}");
+        let many: serde_json::Map<String, Value> = (0..50).map(|i| (format!("k{i:02}"), json!(i))).collect();
+        let (_, d) = change_words("ln", None, Some(&Value::Object(many)));
+        assert_eq!((d.len(), d.last().map(String::as_str)), (MAX_DETAILS + 1, Some("and 10 more: see Advanced")));
+    }
 }

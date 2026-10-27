@@ -293,3 +293,6 @@ form.policy > fieldset, form.policy > details > fieldset { background: var(--car
 
 [hidden] { display: none !important; }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+
+/* the rules a change touches: addresses and node ids break anywhere rather than run off a phone */
+ul.changes li { overflow-wrap: anywhere; }
