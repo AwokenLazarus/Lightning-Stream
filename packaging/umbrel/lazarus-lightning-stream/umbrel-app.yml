@@ -53,7 +53,8 @@ releaseNotes: >-
   0.1.14: your shop is published on Nostr as soon as it has an https address, on the app's relays,
   with nothing to set by hand. The relays are now four: relay.lazarus-xbt.xyz, which takes only
   Lightning Stream listings, then relay.kilombino.com, relay.damus.io and nos.lol. The suggested
-  seller is at its new address, https://stream.lazarus-xbt.xyz.
+  seller is at its new address, https://stream.lazarus-xbt.xyz. When you change your shop's
+  address, the old one keeps working for buyers who saved it, hashrate included.
   0.1.13: signing the safe starter rules on mainnet now lets the app pay: they set how much your
   Lightning node may hold (twice what it holds now, at least 100,000 sats), which the wallet needs
   before it pays through a mainnet node. If paying is on but that limit is missing, Spending rules
