@@ -70,6 +70,77 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+thread_local! {
+    /// How many session `money` locks this thread holds (debug builds): [`lock_link`] checks it.
+    static MONEY_HELD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// A held `money` lock of a session, counted for the lock-order check.
+struct MoneyGuard<'a>(MutexGuard<'a, Money>);
+
+impl std::ops::Deref for MoneyGuard<'_> {
+    type Target = Money;
+    fn deref(&self) -> &Money {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for MoneyGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Money {
+        &mut self.0
+    }
+}
+
+impl Drop for MoneyGuard<'_> {
+    fn drop(&mut self) {
+        MONEY_HELD.with(|n| n.set(n.get().saturating_sub(1)));
+    }
+}
+
+/// The most a release waits for a refill of its session that is out ([`Refilling`]).
+const REFILL_WAIT: Duration = Duration::from_secs(60);
+
+/// A session's `refilling` flag, taken: one refill at a time. Cleared when dropped, however the
+/// refill ended.
+struct Refilling<H: std::ops::Deref<Target = T>, T: RefillFlag + ?Sized>(H);
+
+/// What holds a refill flag: a session.
+trait RefillFlag {
+    fn refill_flag(&self) -> &AtomicBool;
+}
+
+impl RefillFlag for HttpSession {
+    fn refill_flag(&self) -> &AtomicBool {
+        &self.refilling
+    }
+}
+
+impl<H: std::ops::Deref<Target = T>, T: RefillFlag + ?Sized> Refilling<H, T> {
+    fn take(hs: H) -> Option<Self> {
+        (!hs.refill_flag().swap(true, Ordering::SeqCst)).then(|| Self(hs))
+    }
+}
+
+impl<H: std::ops::Deref<Target = T>, T: RefillFlag + ?Sized> Drop for Refilling<H, T> {
+    fn drop(&mut self) {
+        self.0.refill_flag().store(false, Ordering::SeqCst);
+    }
+}
+
+/// A session's `money`.
+fn lock_money(hs: &HttpSession) -> MoneyGuard<'_> {
+    let g = lock(&hs.money);
+    MONEY_HELD.with(|n| n.set(n.get() + 1));
+    MoneyGuard(g)
+}
+
+/// A session's `link`. Taken with `money` held, the two could deadlock against a request (which
+/// holds `link` and then takes `money`): debug builds refuse it.
+fn lock_link(hs: &HttpSession) -> MutexGuard<'_, Link> {
+    debug_assert_eq!(MONEY_HELD.with(std::cell::Cell::get), 0, "lock order: a session's link is taken before its money, never with it held");
+    lock(&hs.link)
+}
+
 fn refusal(rule: &str, reason: impl Into<String>) -> Value {
     with(deny(rule, reason), json!({"rail": "ticket", "charged_sats": 0}))
 }
@@ -282,8 +353,14 @@ impl Sink {
     /// A sink for `c`: one that streams to the call's socket where it named one. A socket that
     /// cannot be reached is a reader already gone.
     fn for_call(c: &Call) -> Self {
+        Self::streaming_to(c.stream_to.as_deref())
+    }
+
+    /// A sink that streams to the socket at `path`, where one is named; one that cannot be
+    /// reached is a reader already gone.
+    fn streaming_to(path: Option<&std::path::Path>) -> Self {
         let mut s = Self::new();
-        if let Some(path) = &c.stream_to {
+        if let Some(path) = path {
             match std::os::unix::net::UnixStream::connect(path) {
                 Ok(u) => s.out = Some(u),
                 Err(_) => s.gone = true,
@@ -404,6 +481,8 @@ pub(crate) struct HttpSession {
     base: String,
     busy: Mutex<()>,
     paying: Mutex<()>,
+    /// Lock order: `link` before `money`, never the other way ([`lock_link`], [`lock_money`]):
+    /// a request holds `link` across its call to the seller and then books into `money`.
     link: Mutex<Link>,
     money: Mutex<Money>,
     /// An answer priced as it goes is open: the seller's `spentMsat` moves between receipts.
@@ -421,21 +500,21 @@ pub(crate) struct HttpSession {
 
 impl HttpSession {
     fn fault(&self) -> Option<String> {
-        lock(&self.money).fault.clone()
+        lock_money(self).fault.clone()
     }
 
     fn balance(&self) -> u64 {
-        lock(&self.money).acct.balance()
+        lock_money(self).acct.balance()
     }
 
     /// What the seller's signed receipts say was released in this session, as far as the wallet
     /// took them.
     fn credited(&self) -> u64 {
-        lock(&self.money).acct.acked_msat
+        lock_money(self).acct.acked_msat
     }
 
     fn public(&self) -> Value {
-        let m = lock(&self.money);
+        let m = lock_money(self);
         json!({"session": self.sid, "origin": self.origin, "released_msat": m.acct.sent_msat.to_string(), "credited_msat": m.acct.acked_msat.to_string(),
                "spent_msat": m.acct.spent_msat.to_string(), "balance_msat": m.acct.balance().to_string(), "unconfirmed_release": m.pending.as_ref().map(|p| p.0.clone()),
                "fault": m.fault, "answer_open": self.streaming.load(Ordering::SeqCst), "answer_unclosed": m.tail.is_some()})
@@ -973,10 +1052,8 @@ impl Signer {
         };
         if probe.status != 402 {
             let status = probe.status;
-            let mut sink = match &stream_to {
-                Some(path) => Sink { out: std::os::unix::net::UnixStream::connect(path).ok(), ..Sink::new() },
-                None => Sink::new(),
-            };
+            // as on the paid paths: a socket that cannot be reached is a reader already gone, and nothing is read for it
+            let mut sink = Sink::streaming_to(stream_to.as_deref());
             let (head, refused) = head_to(&mut probe, range, stream_head, &mut sink);
             let ended = match refused {
                 Some(why) => Some(format!("not read: {why}")),
@@ -1379,7 +1456,7 @@ impl Signer {
     /// a lock round: a seller that does not answer cancels them itself when they lapse, and no
     /// money depends on it.
     fn ticket_cancel_dead(&self, hs: &HttpSession) {
-        if lock(&hs.link).seller_sid.is_empty() {
+        if lock_link(hs).seller_sid.is_empty() {
             return;
         }
         let dead: Vec<String> = {
@@ -1405,7 +1482,7 @@ impl Signer {
             return None;
         }
         let why = "the seller has forgotten the session";
-        lock(&hs.money).fault.get_or_insert_with(|| why.to_string());
+        lock_money(hs).fault.get_or_insert_with(|| why.to_string());
         self.ticket_http_stop(hs, why, Duration::ZERO);
         Some(format!("{why} (HTTP 402 session_unknown): the session was stopped, and the next call opens another"))
     }
@@ -1449,8 +1526,8 @@ impl Signer {
             }
             refusal("ticket_seller", format!("the seller refused the lock: HTTP {status} {code}"))
         };
-        if !lock(&hs.link).seller_sid.is_empty() {
-            body["session"] = lock(&hs.link).seller_sid.clone().into();
+        if !lock_link(hs).seller_sid.is_empty() {
+            body["session"] = lock_link(hs).seller_sid.clone().into();
             return match self.ticket_call(hs, "lock", &body, true) {
                 Ok((200, v, _)) => Ok(v),
                 Ok((status, v, _)) => Err(refused(status, &v)),
@@ -1476,7 +1553,7 @@ impl Signer {
         if let Err(e) = self.ticket_set_http(&hs.sid, SellerSession { id: seller_sid.clone(), key, base: hs.base.clone() }) {
             return Err(refusal("ticket", e.msg));
         }
-        let mut link = lock(&hs.link);
+        let mut link = lock_link(hs);
         link.seller_sid = seller_sid;
         link.key = Zeroizing::new(key);
         Ok(v)
@@ -1530,7 +1607,7 @@ impl Signer {
             return Err(refusal("ticket", "the book paid a prepaid ticket and returned no preimage"));
         };
         {
-            let mut m = lock(&hs.money);
+            let mut m = lock_money(hs);
             m.acct.released(crate::ticket::outside_u64(r.get("ticket_msat")).unwrap_or(0));
             m.pending = Some((hash.clone(), Zeroizing::new(secret.to_string())));
         }
@@ -1545,7 +1622,7 @@ impl Signer {
     /// note that names that session ([`Signer::ticket_pay_by_offer`]). `None`: nothing was paid,
     /// and the ticket is bought by the seller's invoice.
     fn ticket_prepay_by_offer(&self, hs: &HttpSession, offer: &str, msat: Option<u64>) -> Option<Value> {
-        if lock(&hs.link).seller_sid.is_empty() {
+        if lock_link(hs).seller_sid.is_empty() {
             let body = json!({"version": xbt402::ticket::VERSION, "settle": xbt402::ticket::SETTLE_ON_ARRIVAL, "by": "offer"});
             if let Err(d) = self.ticket_lock_call(hs, body) {
                 self.ticket_offer_passed(hs, &str_or_empty(d.get("rule")), str_or_empty(d.get("reason")));
@@ -1553,7 +1630,7 @@ impl Signer {
             }
         }
         let (key, seller_session) = {
-            let link = lock(&hs.link);
+            let link = lock_link(hs);
             (Zeroizing::new(*link.key), link.seller_sid.clone())
         };
         if seller_session.is_empty() {
@@ -1579,14 +1656,15 @@ impl Signer {
 
     /// Fill the pool behind a call, one refill of a session at a time.
     fn ticket_refill_later(&self, hs: &Arc<HttpSession>) {
-        if self.ticket_want(&hs.sid) == 0 || hs.fault().is_some() || hs.refilling.swap(true, Ordering::SeqCst) {
+        if self.ticket_want(&hs.sid) == 0 || hs.fault().is_some() {
             return;
         }
-        let (Some(me), hs2) = (self.me.get().and_then(std::sync::Weak::upgrade), hs.clone()) else {
-            hs.refilling.store(false, Ordering::SeqCst);
-            return;
-        };
-        let spawned = std::thread::Builder::new().name("ticket-refill".into()).spawn(move || {
+        let Some(guard) = Refilling::take(hs.clone()) else { return };
+        let Some(me) = self.me.get().and_then(std::sync::Weak::upgrade) else { return };
+        let hs2 = hs.clone();
+        // the flag goes with the thread, and is cleared however the thread ends, a panic included
+        let _ = std::thread::Builder::new().name("ticket-refill".into()).spawn(move || {
+            let _guard = guard;
             // a refusal here is the next release's to report: it finds no ticket and says why. A release that came
             // while a round was out has left the pool at its mark again (with a pool of 2, every release does):
             // another round, a few at most, and none after a round that locked nothing
@@ -1595,11 +1673,7 @@ impl Signer {
                     break;
                 }
             }
-            hs2.refilling.store(false, Ordering::SeqCst);
         });
-        if spawned.is_err() {
-            hs.refilling.store(false, Ordering::SeqCst);
-        }
     }
 
     /// One authenticated request to a session endpoint, in `seq` order. Returns the status, the
@@ -1613,7 +1687,7 @@ impl Signer {
         let raw = body.to_string().into_bytes();
         let timeout = Self::ticket_read_timeout(&self.ticket_policy());
         for _ in 0..3 {
-            let mut link = lock(&hs.link);
+            let mut link = lock_link(hs);
             if link.seller_sid.is_empty() {
                 return Err(err("ticket_session", "the session has no seller side yet"));
             }
@@ -1635,7 +1709,7 @@ impl Signer {
                 }
             }
             if let (true, Ok(r)) = (absorb, &receipt) {
-                let mut m = lock(&hs.money);
+                let mut m = lock_money(hs);
                 let due = if hs.streaming.load(Ordering::SeqCst) || m.tail.is_some() { Due::Balance } else { Due::AtMost(0) };
                 let outstanding = m.pending.is_some();
                 if let Err(why) = m.acct.absorb(r, 0, due, outstanding) {
@@ -1682,14 +1756,14 @@ impl Signer {
             return false;
         }
         {
-            let mut link = lock(&hs.link);
+            let mut link = lock_link(hs);
             link.seller_sid = old.id.clone();
             link.key = Zeroizing::new(old.key);
             link.next_seq = 0;
         }
         let taken = match self.ticket_call(hs, "status", &json!({}), false) {
             Ok((200, _, Ok(r))) if r.released_msat == sent && r.spent_msat <= r.released_msat && r.released_msat > r.spent_msat => {
-                let mut m = lock(&hs.money);
+                let mut m = lock_money(hs);
                 m.acct = Account { sent_msat: sent, acked_msat: r.released_msat, spent_msat: r.spent_msat };
                 Some(r.released_msat - r.spent_msat)
             }
@@ -1702,10 +1776,10 @@ impl Signer {
                 true
             }
             _ => {
-                let mut link = lock(&hs.link);
+                let mut link = lock_link(hs);
                 *link = Link { seller_sid: String::new(), key: Zeroizing::new([0u8; 32]), next_seq: 0 };
                 drop(link);
-                let mut m = lock(&hs.money);
+                let mut m = lock_money(hs);
                 m.acct = Account::default();
                 m.fault = None;
                 false
@@ -1717,7 +1791,9 @@ impl Signer {
     fn ticket_status_of(&self, hs: &HttpSession, absorb: bool) -> std::result::Result<Value, String> {
         match self.ticket_call(hs, "status", &json!({}), absorb) {
             Ok((200, v, Ok(_))) => {
-                let mut m = lock(&hs.money);
+                // the link before the money, as everywhere (`HttpSession`)
+                let sid = lock_link(hs).seller_sid.clone();
+                let mut m = lock_money(hs);
                 for t in v.get("tickets").and_then(Value::as_array).into_iter().flatten() {
                     let hash = str_or_empty(t.get("hash"));
                     if t.get("state").and_then(Value::as_str) == Some("ACCEPTED") {
@@ -1728,7 +1804,6 @@ impl Signer {
                 }
                 // the seller has closed the answer the wallet stopped reading: its last receipt is listed
                 let closed = m.tail.as_ref().is_some_and(|t| {
-                    let sid = lock(&hs.link).seller_sid.clone();
                     v.get("responses").and_then(Value::as_array).into_iter().flatten().filter_map(|r| Receipt::verify(r, &hs.terms.receipt_key, &sid).ok())
                         .any(|r| r.for_request(t.seq, &t.digest, t.status).is_ok() && !r.body_hash.is_empty())
                 });
@@ -1746,7 +1821,7 @@ impl Signer {
 
     /// Mark the session faulty and stop it: nothing more is released to this seller in it.
     fn ticket_fault(&self, hs: &HttpSession, why: &str) -> Value {
-        lock(&hs.money).fault.get_or_insert_with(|| why.to_string());
+        lock_money(hs).fault.get_or_insert_with(|| why.to_string());
         // with the wallet's count as it stood, for the owner who has to judge the seller
         self.ticket_audit("ticket_seller_fault", json!({"session": hs.sid, "origin": hs.origin, "dest": format!("ln:{}", hs.terms.terms.payee), "reason": why,
                                                         "account": hs.public()}));
@@ -1772,14 +1847,14 @@ impl Signer {
         }
         // an answer the wallet stopped reading and the seller has not closed: a ticket released now would wake it, and
         // the seller would charge for bytes nobody reads. Its last receipt in `status` is the seller's word that it is closed
-        let open_since = lock(&hs.money).tail.as_ref().map(|t| t.since);
+        let open_since = lock_money(hs).tail.as_ref().map(|t| t.since);
         if let Some(since) = open_since {
             let deadline = Instant::now() + TAIL_WAIT;
             loop {
                 if let Err(why) = self.ticket_status_of(hs, true) {
                     return Err(refusal(Self::status_rule(hs), format!("{why}: no secret was released")));
                 }
-                if lock(&hs.money).tail.is_none() {
+                if lock_money(hs).tail.is_none() {
                     break;
                 }
                 if since.elapsed() >= TAIL_GIVE_UP {
@@ -1798,18 +1873,25 @@ impl Signer {
             }
         }
         // a secret that has left and was not confirmed goes first, the same one: that is this release
-        if lock(&hs.money).pending.is_some() {
+        if lock_money(hs).pending.is_some() {
             return self.ticket_deliver(hs);
         }
         let tp = self.ticket_policy();
         let mut next = self.ticket_next(&hs.sid).0;
         if next.is_none() {
             // the pool is empty (a refill has not come back, or every ticket is too old): filled here, once
-            while hs.refilling.swap(true, Ordering::SeqCst) {
+            let deadline = Instant::now() + REFILL_WAIT;
+            let guard = loop {
+                if let Some(g) = Refilling::take(hs) {
+                    break g;
+                }
+                if Instant::now() >= deadline {
+                    return Err(refusal("ticket_busy", "a refill of this session's tickets has not ended: call again"));
+                }
                 std::thread::sleep(Duration::from_millis(20));
-            }
+            };
             let filled = self.ticket_fill(hs);
-            hs.refilling.store(false, Ordering::SeqCst);
+            drop(guard);
             next = self.ticket_next(&hs.sid).0;
             if next.is_none() {
                 // no held ticket, and none to be had now. Where the session holds nothing, or waits after a lock that
@@ -1853,11 +1935,11 @@ impl Signer {
         // 1. the seller's own word, bounded
         let deadline = Instant::now() + Duration::from_millis(tp.ready_wait_ms.clamp(0, 600_000) as u64);
         let mut wait = Duration::from_millis(10);
-        while !lock(&hs.money).ready.contains(&hash) {
+        while !lock_money(hs).ready.contains(&hash) {
             if let Err(why) = self.ticket_status_of(hs, true) {
                 return Err(refusal(Self::status_rule(hs), format!("{why}: no secret was released")));
             }
-            if lock(&hs.money).ready.contains(&hash) {
+            if lock_money(hs).ready.contains(&hash) {
                 break;
             }
             // the ticket may have failed since it was chosen: one that finds no slot at a later hop is in flight on the
@@ -1927,7 +2009,7 @@ impl Signer {
         }
         let Some(secret) = r.get("ticket_secret").and_then(Value::as_str) else { return Err(refusal("ticket", "the book released no secret")) };
         {
-            let mut m = lock(&hs.money);
+            let mut m = lock_money(hs);
             let ticket_msat = crate::ticket::outside_u64(r.get("ticket_msat")).unwrap_or(0);
             m.acct.released(ticket_msat);
             m.pending = Some((hash.clone(), Zeroizing::new(secret.to_string())));
@@ -1943,7 +2025,7 @@ impl Signer {
     /// answer to it. The same secret is sent again when the seller says its ticket is not locked
     /// yet or gives no answer that can be believed; no other secret is sent meanwhile.
     fn ticket_deliver(&self, hs: &HttpSession) -> std::result::Result<(), Value> {
-        let Some((hash, secret)) = lock(&hs.money).pending.as_ref().map(|(h, s)| (h.clone(), s.clone())) else { return Ok(()) };
+        let Some((hash, secret)) = lock_money(hs).pending.as_ref().map(|(h, s)| (h.clone(), s.clone())) else { return Ok(()) };
         let mut wait = Duration::from_millis(50);
         for _ in 0..5 {
             let taken = match self.ticket_call(hs, "release", &json!({"secrets": [secret.as_str()]}), true) {
@@ -1960,7 +2042,7 @@ impl Signer {
                             // taken before (an answer of ours was lost): the totals say whether it was credited
                             "ticket_used" => Some(true),
                             _ => {
-                                lock(&hs.money).pending = None;
+                                lock_money(hs).pending = None;
                                 return Err(self.ticket_fault(hs, &format!("the seller refused a released ticket ({code}); its secret has left and stays booked until \
                                                                            the wallet's node shows the ticket failed")));
                             }
@@ -1970,7 +2052,7 @@ impl Signer {
                 // no answer that can be believed: the seller's signed status decides
                 _ => match self.ticket_status_of(hs, true) {
                     Ok(_) => {
-                        let m = lock(&hs.money);
+                        let m = lock_money(hs);
                         (m.acct.acked_msat == m.acct.sent_msat).then_some(true)
                     }
                     // (a session that was stopped here sends nothing again: the ticket stays booked until the wallet's node says what became of it)
@@ -1985,7 +2067,7 @@ impl Signer {
                 return Err(self.ticket_fault(hs, &why));
             }
             if taken == Some(true) {
-                let mut m = lock(&hs.money);
+                let mut m = lock_money(hs);
                 m.pending = None;
                 if m.acct.acked_msat != m.acct.sent_msat {
                     let why = format!("the wallet released {} msat and the seller credits {}", m.acct.sent_msat, m.acct.acked_msat);
@@ -2030,7 +2112,7 @@ impl Signer {
         let (seq, digest, ans, head) = loop {
             // whole tickets until the seller's balance covers what it wants before it serves
             let mut rounds = 0;
-            while hs.balance() < reserve || lock(&hs.money).pending.is_some() {
+            while hs.balance() < reserve || lock_money(hs).pending.is_some() {
                 rounds += 1;
                 if rounds > 64 {
                     return fail(hs, &spent, refusal("ticket_terms", "the route's price needs more than 64 tickets before it is served"));
@@ -2039,7 +2121,7 @@ impl Signer {
                     return fail(hs, &spent, d);
                 }
             }
-            let mut link = lock(&hs.link);
+            let mut link = lock_link(hs);
             let (seq, digest) = (link.next_seq, request_digest_v2(c.method, c.url, c.body));
             let auth = xbt402::ticket::request_auth(&link.key, &link.seller_sid, seq, "", "", &digest);
             let header = b64json(&payment_payload(&hs.terms.accepted, &json!({"session": link.seller_sid, "seq": seq, "auth": auth})));
@@ -2091,7 +2173,7 @@ impl Signer {
                 _ => (price.request_msat, Due::AtMost(price.request_msat)),
             };
             {
-                let mut m = lock(&hs.money);
+                let mut m = lock_money(hs);
                 // an earlier answer the seller has not closed can still be charged or given back beside this one
                 let due = if m.tail.is_some() { Due::Balance } else { due };
                 if let Err(why) = m.acct.absorb(&head, charged_max, due, false) {
@@ -2183,7 +2265,7 @@ impl Signer {
         let event_stream = ans.header("content-type").is_some_and(|v| v.to_ascii_lowercase().starts_with("text/event-stream"));
         let mut sse = xbt402::tokens::Sse::default();
         let (mut counted, mut usage, mut whole_body) = (0u64, xbt402::tokens::Usage::default(), Vec::new());
-        let base_spent = lock(&hs.money).acct.spent_msat.saturating_sub(head.charged);
+        let base_spent = lock_money(hs).acct.spent_msat.saturating_sub(head.charged);
         let st = Stream { price: *price, base_spent, started, max_msat, max_open: Duration::from_secs(self.ticket_policy().max_answer_s.clamp(1, 86_400) as u64) };
         let length = ans.length;
         let mut body = ans.body;
@@ -2204,7 +2286,7 @@ impl Signer {
                 Err(d) => Some(format!("{}: {}", str_or_empty(d.get("rule")), str_or_empty(d.get("reason")))),
             }
         };
-        let credited = || lock(&hs.money).acct.acked_msat;
+        let credited = || lock_money(hs).acct.acked_msat;
         let mut read_error: Option<String> = None;
         std::thread::scope(|scope| {
             if price.second_msat > 0 {
@@ -2319,13 +2401,14 @@ impl Signer {
         loop {
             match self.ticket_call(hs, "status", &json!({}), false) {
                 Ok((200, v, Ok(own))) => {
+                    let sid = lock_link(hs).seller_sid.clone();
                     let found = v.get("responses").and_then(Value::as_array).into_iter().flatten()
-                        .filter_map(|r| Receipt::verify(r, &hs.terms.receipt_key, &lock(&hs.link).seller_sid).ok())
+                        .filter_map(|r| Receipt::verify(r, &hs.terms.receipt_key, &sid).ok())
                         .find(|r| r.for_request(seq, digest, c_status(head)).is_ok() && !r.body_hash.is_empty());
                     let done = found.is_some() || Instant::now() >= deadline;
                     if done {
                         hs.streaming.store(false, Ordering::SeqCst);
-                        let mut m = lock(&hs.money);
+                        let mut m = lock_money(hs);
                         // a whole body: the seller's totals rose by at most its price by the terms; one that was cut: by at most the balance
                         let due = if complete { Due::AtMost(own_cost.saturating_sub(head.charged)) } else { Due::Balance };
                         let outstanding = m.pending.is_some();
@@ -2350,7 +2433,7 @@ impl Signer {
             std::thread::sleep(Duration::from_millis(40));
         }
         if last.is_none() {
-            lock(&hs.money).tail = Some(Tail { seq, digest: digest.to_string(), status: c_status(head), since: Instant::now() });
+            lock_money(hs).tail = Some(Tail { seq, digest: digest.to_string(), status: c_status(head), since: Instant::now() });
         }
         hs.streaming.store(false, Ordering::SeqCst);
         let mut fault = hs.fault();
@@ -2413,7 +2496,7 @@ impl Signer {
         };
         let asked: Vec<String> = stopped.get("cancel").and_then(Value::as_array).into_iter().flatten().filter_map(|h| h.as_str().map(str::to_string)).collect();
         let mut sent = false;
-        if !asked.is_empty() && !lock(&hs.link).seller_sid.is_empty() {
+        if !asked.is_empty() && !lock_link(hs).seller_sid.is_empty() {
             sent = matches!(self.ticket_call(hs, "cancel", &json!({"hashes": "all"}), false), Ok((200, _, _)));
         }
         let still = self.ticket_wait_cancelled(&hs.sid, if sent { wait } else { Duration::ZERO });
@@ -2593,6 +2676,29 @@ fn read_all(ans: WireAnswer, sink: &mut Sink) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    struct Flag(AtomicBool);
+
+    impl RefillFlag for Flag {
+        fn refill_flag(&self) -> &AtomicBool {
+            &self.0
+        }
+    }
+
+    /// FAILS before: a refill that panicked left its session's flag set, and every later release
+    /// that found the pool empty waited for it forever.
+    #[test]
+    fn a_refill_that_panics_frees_the_session_for_the_next_one() {
+        let f = Arc::new(Flag(AtomicBool::new(false)));
+        let g = Refilling::take(f.clone()).expect("free");
+        assert!(Refilling::take(&*f).is_none(), "one refill at a time");
+        let t = std::thread::spawn(move || {
+            let _g = g;
+            panic!("a refill that fails as badly as it can");
+        });
+        assert!(t.join().is_err());
+        assert!(Refilling::take(&*f).is_some(), "the flag went with the thread");
+    }
     use super::*;
 
     #[test]

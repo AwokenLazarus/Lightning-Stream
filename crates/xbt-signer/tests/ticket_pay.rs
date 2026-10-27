@@ -1185,6 +1185,10 @@ fn a_body_is_streamed_to_a_local_reader_as_it_is_paid_and_stops_when_the_reader_
     assert_eq!(v["complete"].as_bool(), Some(false), "{v}");
     assert!(v["ended"].as_str().unwrap().contains("stopped by the buyer"), "{v}");
     assert!(v["tickets_released"].as_u64().unwrap() <= 2, "{v}");
+    // a free answer (no 402) to a reader that cannot be reached is read no further than a paid one
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("/free/{}", 4 * MIB)), "max_sats": CALL, "task": "film", "stream_to": "nobody-1"}));
+    assert_eq!((v["rule"].as_str(), v["complete"].as_bool()), (Some("free"), Some(false)), "{v}");
+    assert!(v["ended"].as_str().unwrap().contains("stopped by the buyer"), "{v}");
     // a name with a path in it is refused before anything is sent
     let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": CALL, "task": "film", "stream_to": "../x"}));
     assert_eq!(v["rule"], "stream_to", "{v}");
@@ -1946,6 +1950,36 @@ fn a_proxy_that_holds_back_the_tail_of_an_answer_does_not_stall_it() {
     r.tap.clear();
     assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["bytes"].as_u64()), (Some(200), Some(true), Some(n as u64)), "{v}");
     assert_eq!(v["body_digest"], pattern_digest(n));
+    r.assert_booked();
+}
+
+/// FAILS before (debug builds: a lock-order panic; release builds: a deadlock against a request in
+/// flight): an answer the wallet stopped reading and the seller had not closed yet is checked for in
+/// the seller's `status` with the session's money locked, and that check took the session's link,
+/// which a request holds across its call to the seller and then takes the money.
+#[test]
+fn an_answer_left_unclosed_is_checked_for_without_inverting_the_session_locks() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    assert_eq!(r.pay("/page/10", CALL)["status"].as_u64(), Some(200));
+    // the seller's status lists no closed answer for a while: the wallet's cut answer stays open in its count
+    r.tap.set(Box::new(|seen, real| {
+        if !seen.path.ends_with("/x402/ticket/status") {
+            return None;
+        }
+        let (status, headers, body) = whole(real().ok()?);
+        let mut v: Value = serde_json::from_slice(&body).ok()?;
+        v["responses"] = json!([]);
+        Some(Ok(answer(status, headers, v.to_string().into_bytes())))
+    }));
+    let cut = r.pay(&format!("/files/{}", 40 * MIB), 2_500);
+    assert_eq!(cut["complete"].as_bool(), Some(false), "{cut}");
+    assert!(r.status().to_string().contains(r#""answer_unclosed":true"#), "the cut answer is open in the wallet's count");
+    r.tap.clear();
+    // the next call needs a ticket: before releasing one it finds the answer closed in the seller's status, and pays
+    let v = r.pay(&format!("/files/{}", 8 * MIB), 5_000);
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool()), (Some(200), Some(true)), "{v}");
+    assert!(v["tickets_released"].as_u64().unwrap_or(0) > 0, "{v}");
     r.assert_booked();
 }
 

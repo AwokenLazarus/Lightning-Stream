@@ -657,7 +657,7 @@ impl Gateway {
         let hash = ticket::ticket_hash(secret);
         match self.node.lookup(&hash) {
             Ok(Some(inv)) => {
-                let face = self.lock().book.ticket_msat(&hash).unwrap_or(self.cfg.caps.ticket_msat);
+                let face = self.lock().book.ticket_msat(&hash, inv.paid_msat).unwrap_or(self.cfg.caps.ticket_msat);
                 let paid = inv.state == InvoiceState::Settled && inv.paid_msat >= face;
                 self.apply(&hash, &inv);
                 match inv.state {

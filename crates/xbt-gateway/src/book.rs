@@ -142,6 +142,19 @@ pub struct Ticket {
     pub first: bool,
     /// Its size: [`Caps::ticket_msat`], or the smaller one its lock asked for.
     pub msat: u64,
+    /// Whether `msat` is the size it was issued at. A ticket read back from a journal record that
+    /// names no size (written before every record named one, when a record left out the size the
+    /// gateway then had) is of a size this process cannot know: the gateway's size may have changed
+    /// since. Its size is then what the node shows paid into its invoice ([`Ticket::size`]).
+    pub size_known: bool,
+}
+
+impl Ticket {
+    /// Its size, `paid` msat having been paid into its invoice: [`Ticket::msat`], or for a ticket
+    /// of unknown size what was paid, which the node takes only up to the invoice's own amount.
+    pub fn size(&self, paid: u64) -> u64 {
+        if self.size_known || paid == 0 { self.msat } else { paid }
+    }
 }
 
 /// How many used hashes a session remembers, to answer `ticket_used` instead of `ticket_unknown`.
@@ -195,8 +208,8 @@ pub enum Rec {
         session: String,
         /// Settled on arrival. Written only when true, so a journal from before reads as held.
         prepaid: bool,
-        /// Its size, where its lock asked for one other than [`Caps::ticket_msat`]. Written only
-        /// then, so a journal from before reads as tickets of the gateway's own size.
+        /// Its size, always written. A record from before that has none is a ticket of unknown
+        /// size ([`Ticket::size_known`]): the gateway's size then may not be its size now.
         msat: Option<u64>,
     },
     /// The ticket is finished and paid nothing.
@@ -330,6 +343,9 @@ pub struct Book {
     sessions: BTreeMap<String, Session>,
     tickets: HashMap<Hash, Ticket>,
     dirty: HashSet<String>,
+    /// The latest time the book was told (a lock, a charge, a sweep): when a credit with no clock
+    /// of its own happened, within one sweep.
+    seen_now: u64,
 }
 
 impl Book {
@@ -339,6 +355,7 @@ impl Book {
             sessions: BTreeMap::new(),
             tickets: HashMap::new(),
             dirty: HashSet::new(),
+            seen_now: 0,
         }
     }
 
@@ -442,6 +459,7 @@ impl Book {
         entropy: &[u8; 48],
         now: u64,
     ) -> Result<Granted, Refusal> {
+        self.seen_now = self.seen_now.max(now);
         let mut recs = vec![];
         let room_session = self.lock_room(addr, session, prepaid)?;
         let (id, key) = match session {
@@ -485,6 +503,10 @@ impl Book {
         if issue.is_empty() {
             return Err(Refusal::TooManyTickets);
         }
+        // a buyer that locks is using its session: the idle sweep does not cancel what it just locked
+        if let Some(s) = self.sessions.get_mut(&id) {
+            s.last_paid = now;
+        }
         if let Some(key) = key {
             self.sessions.insert(
                 id.clone(),
@@ -519,13 +541,14 @@ impl Book {
                     prepaid,
                     first: key.is_some(),
                     msat,
+                    size_known: true,
                 },
             );
             recs.push(Rec::Ticket {
                 hash: *h,
                 session: id.clone(),
                 prepaid,
-                msat: (msat != self.caps.ticket_msat).then_some(msat),
+                msat: Some(msat),
             });
         }
         if let Some(s) = self.sessions.get_mut(&id) {
@@ -653,13 +676,14 @@ impl Book {
                 prepaid: true,
                 first: false,
                 msat,
+                size_known: true,
             },
         );
         if let Some(s) = self.sessions.get_mut(session) {
             s.live += 1;
             s.last_paid = now;
         }
-        let made = Rec::Ticket { hash: *hash, session: session.to_string(), prepaid: true, msat: (msat != self.caps.ticket_msat).then_some(msat) };
+        let made = Rec::Ticket { hash: *hash, session: session.to_string(), prepaid: true, msat: Some(msat) };
         match self.settled(hash, Some(msat)) {
             Some(r @ Rec::Released { .. }) => Ok(vec![made, r]),
             // short of a whole ticket: no credit, and the ticket is gone again
@@ -667,9 +691,10 @@ impl Book {
         }
     }
 
-    /// The size of the ticket `hash`, while it is in the book.
-    pub fn ticket_msat(&self, hash: &Hash) -> Option<u64> {
-        self.tickets.get(hash).map(|t| t.msat)
+    /// The size of the ticket `hash`, while it is in the book, `paid` msat having been paid into
+    /// its invoice ([`Ticket::size`]).
+    pub fn ticket_msat(&self, hash: &Hash, paid: u64) -> Option<u64> {
+        self.tickets.get(hash).map(|t| t.size(paid))
     }
 
     /// The node's answer to issuing `hash`: not issued, the ticket leaves the book.
@@ -750,7 +775,7 @@ impl Book {
             TicketState::Settling => return Err(Refusal::TicketUsed),
             TicketState::Accepted => {}
         }
-        if t.paid_msat < t.msat {
+        if t.paid_msat < t.size(t.paid_msat) {
             return Err(Refusal::TicketNotLocked);
         }
         Self::outside_margin(caps, t, height)?;
@@ -784,18 +809,23 @@ impl Book {
     /// credited before, or is not in the book.
     pub fn settled(&mut self, hash: &Hash, paid_msat: Option<u64>) -> Option<Rec> {
         let t = self.tickets.get(hash)?;
-        let msat = paid_msat.unwrap_or(t.paid_msat).min(t.msat);
+        let paid = paid_msat.unwrap_or(t.paid_msat);
+        let size = t.size(paid);
+        let msat = paid.min(size);
         // a ticket settled on arrival that arrived short is no ticket: the session is not
         // credited a part, and the invoice is finished on the node either way
-        if t.prepaid && msat < t.msat {
+        if t.prepaid && msat < size {
             return self
                 .remove(hash, false)
                 .then_some(Rec::Gone { hash: *hash });
         }
         let session = t.session.clone();
         self.remove(hash, true);
+        let now = self.seen_now;
         let s = self.sessions.get_mut(&session)?;
         s.released_msat = s.released_msat.saturating_add(msat);
+        // credit is use: a session just paid is not idle
+        s.last_paid = s.last_paid.max(now);
         self.dirty.insert(session);
         Some(Rec::Released { hash: *hash, msat })
     }
@@ -884,7 +914,7 @@ impl Book {
             _ if s.used.contains(hash) => return Err(Refusal::TicketUsed),
             _ => return Err(Refusal::TicketUnknown),
         };
-        if t.state != TicketState::Accepted || t.paid_msat < t.msat {
+        if t.state != TicketState::Accepted || t.paid_msat < t.size(t.paid_msat) {
             return Err(Refusal::TicketNotLocked);
         }
         Self::outside_margin(&self.caps, t, height)?;
@@ -902,7 +932,7 @@ impl Book {
             return 0;
         };
         let credit = match s.pledge {
-            Some(h) if on_pledge => self.tickets.get(&h).map_or(self.caps.ticket_msat, |t| t.msat),
+            Some(h) if on_pledge => self.tickets.get(&h).map_or(self.caps.ticket_msat, |t| t.size(t.paid_msat)),
             _ => 0,
         };
         s.released_msat
@@ -918,6 +948,7 @@ impl Book {
         on_pledge: bool,
         now: u64,
     ) -> Result<(), Refusal> {
+        self.seen_now = self.seen_now.max(now);
         if msat > self.chargeable(session, on_pledge) {
             return Err(Refusal::BalanceShort);
         }
@@ -984,6 +1015,7 @@ impl Book {
 
     /// What the passing of time and blocks asks for: tickets to cancel, sessions to forget.
     pub fn sweep(&mut self, now: u64, height: Option<u32>) -> Sweep {
+        self.seen_now = self.seen_now.max(now);
         let caps = self.caps.clone();
         let mut out = Sweep::default();
         let quiet = |s: &Session| {
@@ -1064,7 +1096,7 @@ impl Book {
                     hash: carry_hash(id),
                     session: id.clone(),
                     prepaid: false,
-                    msat: None,
+                    msat: Some(s.released_msat),
                 });
                 out.push(Rec::Released {
                     hash: carry_hash(id),
@@ -1078,7 +1110,8 @@ impl Book {
                 hash: h,
                 session: t.session.clone(),
                 prepaid: t.prepaid,
-                msat: (t.msat != self.caps.ticket_msat).then_some(t.msat),
+                // a ticket of unknown size stays one: the gateway's size now is not its size
+                msat: t.size_known.then_some(t.msat),
             });
         }
         for id in self.sessions.keys() {
@@ -1095,6 +1128,7 @@ impl Book {
 
     fn replay(caps: Caps, recs: &[Rec], now: u64) -> Result<Self, String> {
         let mut b = Self::new(caps);
+        b.seen_now = now;
         for r in recs {
             match r {
                 Rec::Session { id, key, addr } => {
@@ -1136,6 +1170,7 @@ impl Book {
                                 prepaid: *prepaid,
                                 first: false,
                                 msat: msat.unwrap_or(b.caps.ticket_msat),
+                                size_known: msat.is_some(),
                             },
                         )
                         .is_none()
@@ -1780,10 +1815,10 @@ mod tests {
         b.present(&t, &secret(7), Some(100)).unwrap();
         assert_eq!(b.sweep(161, Some(190)).cancel, vec![hash(2)]);
         b.settle_unanswered(&hash(7));
-        // s has released: idle after idle_secs from its last paid request, unless a response is open
-        assert!(!b.sweep(305, Some(100)).cancel.contains(&hash(2)));
-        assert!(b.sweep(306, Some(100)).cancel.contains(&hash(2)));
-        b.response(&s, true, 306);
+        // s has released: idle after idle_secs from its last use (its lock at t=10), unless a response is open
+        assert!(!b.sweep(310, Some(100)).cancel.contains(&hash(2)));
+        assert!(b.sweep(311, Some(100)).cancel.contains(&hash(2)));
+        b.response(&s, true, 311);
         assert!(!b.sweep(10_000, Some(100)).cancel.contains(&hash(2)));
         b.response(&s, false, 10_000);
         assert!(b.sweep(10_301, Some(100)).cancel.contains(&hash(2)));
@@ -2050,7 +2085,7 @@ mod tests {
                 hash: hash(2),
                 session: g.session.clone(),
                 prepaid: true,
-                msat: None,
+                msat: Some(1_000_000),
             })
         );
         assert_eq!((b.held(), b.prepaid_open()), (1, 1));
@@ -2155,12 +2190,69 @@ mod tests {
         assert!(g3.recs.iter().any(|r| matches!(r, Rec::Ticket { msat: Some(700_000), .. })));
         let restored = || Book::restore(b.caps().clone(), &b.snapshot(), 0).unwrap();
         let mut r = restored();
-        assert_eq!((r.ticket_msat(&hash(30)), r.ticket_msat(&hash(4))), (Some(700_000), Some(1_000_000)));
+        assert_eq!((r.ticket_msat(&hash(30), 0), r.ticket_msat(&hash(4), 0)), (Some(700_000), Some(1_000_000)));
         // credited for its own size, and one short of it is no ticket
         assert!(matches!(r.settled(&hash(30), Some(700_000)), Some(Rec::Released { msat: 700_000, .. })));
         assert!(matches!(restored().settled(&hash(30), Some(699_999)), Some(Rec::Gone { .. })));
         let mut bent = old.clone();
         bent["prepaid"] = "yes".into();
         assert_eq!(Rec::from_json(&bent), None);
+    }
+
+    /// A shop that changed its ticket size and restarted: a ticket the journal names a size for
+    /// keeps it, and one from a record that names none (written before every record did) is credited
+    /// what the node shows paid into its invoice, never resized to the gateway's size now, and a
+    /// prepaid one is not dropped as short.
+    #[test]
+    fn a_change_of_ticket_size_never_resizes_a_ticket_in_the_journal() {
+        let session = Rec::Session { id: "s".into(), key: [7; 32], addr: "a".into() };
+        let held_old = Rec::Ticket { hash: hash(1), session: "s".into(), prepaid: false, msat: None };
+        let prepaid_old = Rec::Ticket { hash: hash(2), session: "s".into(), prepaid: true, msat: None };
+        let prepaid_new = Rec::Ticket { hash: hash(3), session: "s".into(), prepaid: true, msat: Some(1_000_000) };
+        let recs = [session, held_old, prepaid_old, prepaid_new];
+        // written by a gateway of 1,000-sat tickets, read back by one of 900
+        let mut caps = caps();
+        caps.ticket_msat = 900_000;
+        let mut b = Book::restore(caps.clone(), &recs, 0).unwrap();
+        assert!(matches!(b.settled(&hash(2), Some(1_000_000)), Some(Rec::Released { msat: 1_000_000, .. })), "a prepaid ticket of the old size is credited");
+        assert!(matches!(b.settled(&hash(3), Some(1_000_000)), Some(Rec::Released { msat: 1_000_000, .. })), "its size is in the record");
+        assert!(matches!(b.settled(&hash(1), Some(1_000_000)), Some(Rec::Released { msat: 1_000_000, .. })), "a held ticket: not cut to 900");
+        // and the other way: 900-sat tickets read back by a gateway of 1,000
+        caps.ticket_msat = 1_000_000;
+        let mut b = Book::restore(caps.clone(), &recs, 0).unwrap();
+        assert!(matches!(b.settled(&hash(2), Some(900_000)), Some(Rec::Released { msat: 900_000, .. })), "not dropped as short");
+        assert!(matches!(b.settled(&hash(3), Some(900_000)), Some(Rec::Gone { .. })), "a ticket of known size paid short is still no ticket");
+        // a compacted journal keeps a ticket of unknown size unknown
+        let b = Book::restore(caps.clone(), &recs, 0).unwrap();
+        let snap = b.snapshot();
+        assert!(snap.iter().any(|r| matches!(r, Rec::Ticket { hash: h, msat: None, .. } if *h == hash(2))), "{snap:?}");
+        assert!(snap.iter().any(|r| matches!(r, Rec::Ticket { hash: h, msat: Some(1_000_000), .. } if *h == hash(3))), "{snap:?}");
+        // every new record names its size, the gateway's own included
+        let mut n = Book::new(caps.clone());
+        let g = n.lock_sized("c", None, &[hash(40)], false, caps.ticket_msat, &ent(1), 0).unwrap();
+        assert!(g.recs.iter().any(|r| matches!(r, Rec::Ticket { msat: Some(1_000_000), .. })), "{:?}", g.recs);
+    }
+
+    /// A buyer that comes back to a quiet session to spend its balance locks tickets, and is paid:
+    /// neither is idleness, and the sweep does not cancel what it just locked.
+    #[test]
+    fn tickets_just_locked_or_credited_are_not_cancelled_as_idle() {
+        let mut b = Book::new(caps());
+        let s = open(&mut b, 1, &[1, 2]);
+        assert!(matches!(b.settled(&hash(1), Some(1_000_000)), Some(Rec::Released { .. })));
+        // away for longer than idle_secs: the ticket it left locked is cancelled, as before
+        assert!(b.sweep(1_000, None).cancel.contains(&hash(2)));
+        // back: it locks two more, and they stay
+        let g = b.lock("a", Some(&s), &[hash(3), hash(4)], false, &ent(3), 1_000).unwrap();
+        for h in &g.issue {
+            b.issued(h, true);
+            b.node_update(h, &held(200));
+        }
+        let sw = b.sweep(1_001, None);
+        assert!(!sw.cancel.contains(&hash(3)) && !sw.cancel.contains(&hash(4)), "{:?}", sw.cancel);
+        // a credit long after its lock is use too: the other ticket stays
+        b.sweep(1_200, None);
+        assert!(matches!(b.settled(&hash(3), Some(1_000_000)), Some(Rec::Released { .. })));
+        assert!(!b.sweep(1_400, None).cancel.contains(&hash(4)), "credited at 1,200: not idle at 1,400");
     }
 }
