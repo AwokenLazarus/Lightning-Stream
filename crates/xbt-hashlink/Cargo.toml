@@ -1,6 +1,6 @@
 [package]
 name = "xbt-hashlink"
-description = "p2p-hash: rented hashrate over Lightning Stream. The hashrate link (BOLT 8 Noise_XK between the hasher's app and the buyer's app), the hasher's Stratum V1 endpoint for its miners, the buyer's Stratum V1 client to its own DATUM Gateway, the work meter and per-slice ticket releases"
+description = "p2p-hash: rented hashrate over Lightning Stream. The hashrate link (BOLT 8 Noise_XK between the hashmaker's app and the hashtaker's app), the hashmaker's Stratum V1 endpoint for its miners, the hashtaker's Stratum V1 client to its own DATUM Gateway, the work meter and per-slice ticket releases"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

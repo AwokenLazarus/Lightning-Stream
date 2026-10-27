@@ -1,19 +1,19 @@
 """p2p-hash on regtest with real tickets (scripts/p2p_hash_regtest.sh).
 
-The ticket lab's three Lightning Fork nodes (lf1 the buyer, lf2 a hop, lf3 the hasher's node), the
-wallet's signer on lf1 with a "hashrate" task, the hasher's gateway beside lf3 with one route,
-/hashrate/, passed to the hasher's paid-slice endpoint, a stand-in Nostr relay, a stand-in pool as
-the buyer's gateway and stand-in miners. The hasher publishes its listing to the relay; the buyer
+The ticket lab's three Lightning Fork nodes (lf1 the hashtaker, lf2 a hop, lf3 the hashmaker's node), the
+wallet's signer on lf1 with a "hashrate" task, the hashmaker's gateway beside lf3 with one route,
+/hashrate/, passed to the hashmaker's paid-slice endpoint, a stand-in Nostr relay, a stand-in pool as
+the hashtaker's gateway and stand-in miners. The hashmaker publishes its listing to the relay; the hashtaker
 finds it there, opens the link to the endpoint it names, and pays each finished slice through the
 wallet: one paid request per slice, on the gateway's tickets (prepaid first, then held).
 
 Checks:
-  listing   found on the relay, its link key the hasher's, the link opened to the address it names
+  listing   found on the relay, its link key the hashmaker's, the link opened to the address it names
   paid      every finished slice paid once through the wallet, each signed receipt equal to the
-            hasher's count, the gateway charging exactly slices x price, both meters equal; held
-            tickets used; the seller's node settled what the buyer's node paid
+            hashmaker's count, the gateway charging exactly slices x price, both meters equal; held
+            tickets used; the seller's node settled what the hashtaker's node paid
   no-hash   the miners stop: no payment after that, the wallet's session stopped, nothing left held
-  unpaid    the buyer stops paying after slice 3: the hasher stops within one slice past the
+  unpaid    the hashtaker stops paying after slice 3: the hashmaker stops within one slice past the
             unpaid slice, and the gateway charges nothing more
 Report: run/p2p_hash_regtest.json.
 """
@@ -89,7 +89,7 @@ def setup() -> None:
     lab.mine(8, d.NODES)
     for node, count in ((d.BUYER, 1), (d.HOP, 2), (d.SELLER, 1)):
         lab.wait(f"{node}'s channels active", 240, lambda n=node, c=count: d.active(n, c))
-    lab.wait("the buyer knows both channels", 300, lambda: lab.known_channels(d.BUYER) >= 2, every=2)
+    lab.wait("the hashtaker knows both channels", 300, lambda: lab.known_channels(d.BUYER) >= 2, every=2)
     os.makedirs(f"{RUN}/keys", exist_ok=True)
     with open(f"{RUN}/rpc.cookie", "w") as f:
         f.write("lab:lab")
@@ -140,15 +140,15 @@ def spawn(name: str, args: list[str]) -> subprocess.Popen[bytes]:
 def rental(name: str, stop_after: int | None, miner_secs: int, rate: float) -> dict[str, Any]:
     pool = spawn(f"{name}-pool", ["standin-pool", "--listen", f"127.0.0.1:{POOL}", "--diff", str(DIFF), "--job-ms", "1000", "--report", f"{RUN}/{name}-pool.json"])
     t = ["--slice-work", str(SLICE_WORK), "--price-msat", str(PRICE_MSAT), "--grace-ms", str(GRACE_MS)]
-    hasher = spawn(f"{name}-hasher", ["hasher", "--key", f"{RUN}/keys/hasher.key", "--miners", f"127.0.0.1:{MINERS}", "--link", f"127.0.0.1:{LINK}",
+    hashmaker = spawn(f"{name}-hashmaker", ["hashmaker", "--key", f"{RUN}/keys/hasher.key", "--miners", f"127.0.0.1:{MINERS}", "--link", f"127.0.0.1:{LINK}",
                                       "--slices", f"127.0.0.1:{SLICES}", *t, "--report", f"{RUN}/{name}-hasher.json",
-                                      "--relays", RELAY_URL, "--nostr-key", f"{RUN}/keys/nostr.key", "--name", "regtest hasher",
+                                      "--relays", RELAY_URL, "--nostr-key", f"{RUN}/keys/nostr.key", "--name", "regtest hashmaker",
                                       "--link-public", f"127.0.0.1:{LINK}", "--pay-url", f"{ORIGIN}/hashrate", "--pay-node", lab.pubkey(d.SELLER),
                                       "--hashrate-hs", "4000000000000", "--listing-out", f"{RUN}/{name}-listing.json"])
-    lab.wait("the hasher's listing", 30, lambda: os.path.exists(f"{RUN}/{name}-listing.json"), every=0.2)
+    lab.wait("the hashmaker's listing", 30, lambda: os.path.exists(f"{RUN}/{name}-listing.json"), every=0.2)
     time.sleep(0.5)
     extra = ["--stop-paying-after", str(stop_after)] if stop_after is not None else []
-    buyer = spawn(f"{name}-buyer", ["buyer", "--key", f"{RUN}/keys/buyer.key", "--find", RELAY_URL, "--expect-node", lab.pubkey(d.SELLER),
+    hashtaker = spawn(f"{name}-hashtaker", ["hashtaker", "--key", f"{RUN}/keys/buyer.key", "--find", RELAY_URL, "--expect-node", lab.pubkey(d.SELLER),
                                     "--found-out", f"{RUN}/{name}-found.json", "--upstream", f"127.0.0.1:{POOL}", "--user", "buyer.rented",
                                     "--signer", d.SOCK, "--task", "hashrate", "--max-sats", "1500", "--rental", f"rt-{name}",
                                     "--idle-s", "15", "--report", f"{RUN}/{name}-buyer.json", *extra])
@@ -158,8 +158,8 @@ def rental(name: str, stop_after: int | None, miner_secs: int, rate: float) -> d
     for m in miners:
         m.wait()
     done_ms = int(time.time() * 1000)
-    buyer.wait(240)
-    hasher.wait(60)
+    hashtaker.wait(240)
+    hashmaker.wait(60)
     time.sleep(1)
     pool.terminate()
     pool.wait(10)
@@ -181,17 +181,17 @@ def main() -> int:
         r = rental("paid", None, 70, 1.5)
         hz, bz = r["hasher"], r["buyer"]
         lk = r["found"]["listing"]
-        hasher_pub = subprocess.run([f"{BIN}/xbt-hashlink", "pubkey", f"{RUN}/keys/hasher.key"], check=True, capture_output=True, text=True).stdout.strip()
-        check("listing: found on the relay, the hasher's link key, the link opened to the address it names",
-              lk["link"]["key"] == hasher_pub and lk["link"]["addr"] == f"127.0.0.1:{LINK}" and hz["rental"] == "rt-paid"
+        hashmaker_pub = subprocess.run([f"{BIN}/xbt-hashlink", "pubkey", f"{RUN}/keys/hasher.key"], check=True, capture_output=True, text=True).stdout.strip()
+        check("listing: found on the relay, the hashmaker's link key, the link opened to the address it names",
+              lk["link"]["key"] == hashmaker_pub and lk["link"]["addr"] == f"127.0.0.1:{LINK}" and hz["rental"] == "rt-paid"
               and r["found"]["event"] == r["listing"]["event"]["id"],
               {"found": r["found"]["event"], "author": r["found"]["author"], "link": lk["link"], "refused": r["found"]["refused"]})
         paid = hz["paid"]
         oks = [p for p in bz["pays"] if p.get("ok")]
         REPORT["paid_pays"] = bz["pays"]
         check("paid: every finished slice paid once through the wallet", paid >= 6 and len(oks) == paid == len(hz["slicesDone"]) and not bz["payFailed"],
-              {"hasher paid": paid, "wallet ok": len(oks), "slices done": len(hz["slicesDone"]), "pay ms": [p["ms"] for p in bz["pays"]]})
-        check("paid: each receipt equals the hasher's count, meters equal", hz["receiptsAgree"] == paid and hz["receiptsDisagree"] == 0 and hz["meter"] == bz["meter"],
+              {"hashmaker paid": paid, "wallet ok": len(oks), "slices done": len(hz["slicesDone"]), "pay ms": [p["ms"] for p in bz["pays"]]})
+        check("paid: each receipt equals the hashmaker's count, meters equal", hz["receiptsAgree"] == paid and hz["receiptsDisagree"] == 0 and hz["meter"] == bz["meter"],
               {"agree": hz["receiptsAgree"], "meter": hz["meter"]})
         priced = sum(int(p["wallet"].get("price_msat", 0)) for p in oks)
         last_w = oks[-1]["wallet"] if oks else {}
@@ -212,7 +212,7 @@ def main() -> int:
         REPORT["paid_tickets"] = [{"hash": h, "state": i["state"], "value_msat": i.get("value_msat"), "paid_msat": i.get("amt_paid_msat")} for h, i in new_inv.items()]
         REPORT["paid_payments"] = [{"hash": h, "status": p["status"], "value_msat": p["value_msat"], "fee_msat": p["fee_msat"]} for h, p in new_pay.items()]
         settled_hashes = [h for h, i in new_inv.items() if i["state"] == "SETTLED"]
-        check("paid: the seller's node settled what the buyer's node paid (more than one ticket)",
+        check("paid: the seller's node settled what the hashtaker's node paid (more than one ticket)",
               len(settled) >= 2 and all(new_pay.get(h, {}).get("status") == "SUCCEEDED" for h in settled_hashes),
               {"tickets": REPORT["paid_tickets"], "fees_msat": sum(int(p["fee_msat"]) for p in new_pay.values())})
         REPORT["wallet_status"] = d.signer("ticket_status")
@@ -236,7 +236,7 @@ def main() -> int:
         st = hz["stopped"] or {}
         past = int(st.get("work", "0")) - 4 * SLICE_WORK
         REPORT["unpaid_pays"] = bz["pays"]
-        check("unpaid: the hasher stops within one slice past the unpaid slice",
+        check("unpaid: the hashmaker stops within one slice past the unpaid slice",
               st.get("reason") == "unpaid" and hz["paid"] == 3 and past <= SLICE_WORK,
               {"stopped": st.get("reason"), "paid": hz["paid"], "slices past": max(past, 0) / SLICE_WORK,
                "stop after slice 4 done ms": st.get("atMs", 0) - (hz["slicesDone"][3]["atMs"] if len(hz["slicesDone"]) > 3 else 0)})

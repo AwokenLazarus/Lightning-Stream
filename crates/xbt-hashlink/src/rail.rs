@@ -1,15 +1,15 @@
 //! How a slice is paid: Lightning Stream's held tickets, one per slice.
 //!
-//! The buyer makes each ticket's preimage and sends its payment hash (`lock`) before the slice
-//! is mined; the hasher's node holds the buyer's payment to that hash (a hold invoice) without
-//! being able to settle it. When the slice is done the buyer releases the preimage (`pay`) and
-//! the hasher settles. A ticket never released is cancelled and its payment returns to the buyer.
-//! So the buyer risks at most the slice in progress and the hasher at most the work done past
+//! The hashtaker makes each ticket's preimage and sends its payment hash (`lock`) before the slice
+//! is mined; the hashmaker's node holds the hashtaker's payment to that hash (a hold invoice) without
+//! being able to settle it. When the slice is done the hashtaker releases the preimage (`pay`) and
+//! the hashmaker settles. A ticket never released is cancelled and its payment returns to the hashtaker.
+//! So the hashtaker risks at most the slice in progress and the hashmaker at most the work done past
 //! the last released ticket.
 //!
-//! [`BuyerRail`] and [`SellerRail`] are where the wallet's ticket machinery plugs in: the buyer's
+//! [`HashtakerRail`] and [`SellerRail`] are where the wallet's ticket machinery plugs in: the hashtaker's
 //! signer pays the hold invoice for each locked hash under the wallet's policy and budgets (a
-//! "hashrate" task), and the hasher's node makes and settles the hold invoices. [`LabBuyer`] and
+//! "hashrate" task), and the hashmaker's node makes and settles the hold invoices. [`LabHashtaker`] and
 //! [`LabSeller`] stand in for both in the lab: they check the preimages and keep a ledger, and
 //! move no money.
 
@@ -22,26 +22,26 @@ pub fn sha256(b: &[u8]) -> Hash {
     Sha256::digest(b).into()
 }
 
-pub trait BuyerRail: Send {
+pub trait HashtakerRail: Send {
     /// Lock the ticket for `slice` at `price_msat`: returns its payment hash. (For a real ticket,
-    /// the signer pays the hasher's hold invoice for this hash before returning.)
+    /// the signer pays the hashmaker's hold invoice for this hash before returning.)
     fn lock(&mut self, slice: u64, price_msat: u64) -> Result<Hash, String>;
     /// Release the ticket for a finished slice: returns its preimage.
     fn release(&mut self, slice: u64) -> Result<[u8; 32], String>;
-    /// Give up a ticket never released (its held payment goes back to the buyer).
+    /// Give up a ticket never released (its held payment goes back to the hashtaker).
     fn cancel(&mut self, slice: u64);
 }
 
 pub trait SellerRail: Send {
-    /// Is the buyer's payment to `hash` held by the hasher's node?
+    /// Is the hashtaker's payment to `hash` held by the hashmaker's node?
     fn held(&mut self, slice: u64, hash: &Hash, price_msat: u64) -> bool;
     /// Settle a released ticket. `preimage` has already been checked against the hash.
     fn settle(&mut self, slice: u64, preimage: &[u8; 32]) -> Result<(), String>;
 }
 
-/// The lab's buyer: fresh preimages, a ledger of locks, releases and cancels.
+/// The lab's hashtaker: fresh preimages, a ledger of locks, releases and cancels.
 #[derive(Default)]
-pub struct LabBuyer {
+pub struct LabHashtaker {
     pre: BTreeMap<u64, [u8; 32]>,
     pub locked_msat: u64,
     pub released_msat: u64,
@@ -49,7 +49,7 @@ pub struct LabBuyer {
     price: BTreeMap<u64, u64>,
 }
 
-impl BuyerRail for LabBuyer {
+impl HashtakerRail for LabHashtaker {
     fn lock(&mut self, slice: u64, price_msat: u64) -> Result<Hash, String> {
         let mut p = [0u8; 32];
         getrandom::getrandom(&mut p).map_err(|e| e.to_string())?;
@@ -72,12 +72,12 @@ impl BuyerRail for LabBuyer {
     }
 }
 
-/// The buyer's slices paid through the wallet: each finished slice is one paid request to the
-/// hasher's gateway (`POST <url>/<rental>/<slice>`, the signed work receipt as the body), made by
+/// The hashtaker's slices paid through the wallet: each finished slice is one paid request to the
+/// hashmaker's gateway (`POST <url>/<rental>/<slice>`, the signed work receipt as the body), made by
 /// the wallet's signer with `xbt402_pay`. The signer keeps the owner's policy (the task's budget,
 /// the seller tied to its node, the caps on locked funds), chooses the rail (held tickets, else
 /// prepaid ones), locks tickets ahead and releases them; the gateway charges the slice's price
-/// only when the hasher's app answers that it counted the slice. Nothing here holds a key.
+/// only when the hashmaker's app answers that it counted the slice. Nothing here holds a key.
 pub struct SignerPayer {
     pub sock: std::path::PathBuf,
     pub url: String,
@@ -124,7 +124,7 @@ impl SignerPayer {
         }
     }
 
-    /// End the wallet's session with the hasher's gateway: its unused tickets are cancelled.
+    /// End the wallet's session with the hashmaker's gateway: its unused tickets are cancelled.
     pub fn stop(&mut self) -> Option<serde_json::Value> {
         let s = self.session.take()?;
         Some(signer_call(&self.sock, "ticket_stop", &serde_json::json!({"session": s})).unwrap_or_else(|e| serde_json::json!({"error": e})))

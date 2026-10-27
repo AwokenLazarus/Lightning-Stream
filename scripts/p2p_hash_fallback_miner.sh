@@ -1,17 +1,17 @@
 #!/bin/bash
-# The fallback with a real miner: the miner hashes for the hasher's own pool (the fallback) through
-# the app, is rented by a buyer into the buyer's pool, and goes back to the fallback by itself when
+# The fallback with a real miner: the miner hashes for the hashmaker's own pool (the fallback) through
+# the app, is rented by a hashtaker into the hashtaker's pool, and goes back to the fallback by itself when
 # the rental ends. No money moves: the slices are paid on the lab's rail over the link.
 #
-#   miner --SV1--> xbt-hashlink hasher (LISTEN) --> FALLBACK              (nobody renting)
-#                                     ==link==> xbt-hashlink buyer --> BUYER_POOL   (rented)
+#   miner --SV1--> xbt-hashlink hashmaker (LISTEN) --> FALLBACK              (nobody renting)
+#                                     ==link==> xbt-hashlink hashtaker --> BUYER_POOL   (rented)
 #
 # The miner's pools are saved first (mode 600: they hold the pool passwords) and restored on every
 # exit, then read back and compared. The miner's web login comes from the environment.
 #
 #   MINER=host DM_USER=... DM_PASS=... FALLBACK=host:port BUYER_POOL=host:port WORKER=name \
 #   LISTEN=ip:port scripts/p2p_hash_fallback_miner.sh
-# Evidence: run/p2p-hash/fallback/<time>/ (summary.json, the hasher's and the buyer's reports).
+# Evidence: run/p2p-hash/fallback/<time>/ (summary.json, the hashmaker's and the hashtaker's reports).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 : "${MINER:?}" "${DM_USER:?}" "${DM_PASS:?}" "${FALLBACK:?}" "${BUYER_POOL:?}" "${WORKER:?}" "${LISTEN:?}"
@@ -44,7 +44,7 @@ trap finish EXIT
 
 "$BIN" keygen "$D/hasher.key" > "$D/hasher.pub"
 "$BIN" keygen "$D/buyer.key" > /dev/null
-"$BIN" hasher --key "$D/hasher.key" --miners "$LISTEN" --link "$LINK" --control "$CONTROL" --fallback "$FALLBACK" --rentable 1 \
+"$BIN" hashmaker --key "$D/hasher.key" --miners "$LISTEN" --link "$LINK" --control "$CONTROL" --fallback "$FALLBACK" --rentable 1 \
   "${TERMS[@]}" --report "$D/hasher.json" 2> "$D/hasher.log" &
 pids+=($!)
 sleep 1
@@ -61,7 +61,7 @@ sleep "$ON_FALLBACK_S"
 status > "$D/status-fallback.json"
 
 echo "renting it for $RENT_S s into $BUYER_POOL"
-"$BIN" buyer --key "$D/buyer.key" --hasher "$LINK" --hasher-key "$(cat "$D/hasher.pub")" "${TERMS[@]}" --upstream "$BUYER_POOL" \
+"$BIN" hashtaker --key "$D/buyer.key" --hashmaker "$LINK" --hashmaker-key "$(cat "$D/hasher.pub")" "${TERMS[@]}" --upstream "$BUYER_POOL" \
   --user "$WORKER" --miners 1 --rental fallback-test --idle-s 120 --duration-s "$RENT_S" --report "$D/buyer.json" 2> "$D/buyer.log" &
 B=$!
 pids+=($B)
@@ -77,7 +77,7 @@ python3 -I - "$D" <<'PY' | tee "$D/summary.json"
 import json, sys
 d = sys.argv[1]
 r = lambda n: json.load(open(f"{d}/{n}"))
-fb, mid, after, buyer = r("status-fallback.json"), r("status-rented.json"), r("status-after.json"), r("buyer.json")
+fb, mid, after, hashtaker = r("status-fallback.json"), r("status-rented.json"), r("status-after.json"), r("buyer.json")
 m = lambda s: (s["miners"] or [{}])[0]
 rental = next((f for f in after["finished"] if f["rental"] == "fallback-test"), {})
 methods = m(after).get("methods", {})
@@ -88,8 +88,8 @@ out = {
     "hashrateHs": m(after).get("hashrateHs"),
     "rental": {k: rental.get(k) for k in ("paid", "receiptsAgree", "receiptsDisagree", "meter", "unitWork")},
     "rentalStopped": (rental.get("stopped") or {}).get("reason"),
-    "buyerClosed": buyer.get("closed"), "buyerMeter": buyer.get("meter"),
-    "metersEqual": rental.get("meter") == buyer.get("meter"),
+    "hashtakerClosed": hashtaker.get("closed"), "hashtakerMeter": hashtaker.get("meter"),
+    "metersEqual": rental.get("meter") == hashtaker.get("meter"),
     "methods": methods,
     "movedBy": "set_extranonce" if methods.get("mining.extranonce.subscribe") else "client.reconnect",
 }

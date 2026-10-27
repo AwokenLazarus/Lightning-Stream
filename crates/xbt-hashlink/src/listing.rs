@@ -1,17 +1,17 @@
-//! A hasher's `hashrate` listing on Nostr: what it rents, at what price, where its link answers
+//! A hashmaker's `hashrate` listing on Nostr: what it rents, at what price, where its link answers
 //! and where its slices are paid. Nostr is the directory only: the work goes over the link, the
 //! money over Lightning.
 //!
 //! The event is a NIP-99 classified listing (kind 30402), so any client that shows classifieds
 //! shows it. A reader of ours takes nothing from its human-readable tags: everything it uses is
 //! in the `xbt-hashrate` tag, a JSON object, and is believed only when
-//! * the event's own signature holds (its author is a Nostr key of the hasher's),
+//! * the event's own signature holds (its author is a Nostr key of the hashmaker's),
 //! * the `xbt-hashrate-bind` tag is the link key's ECDSA signature binding that Nostr key, and
 //! * the `d` tag is the link key.
 //!
 //! So whoever can publish a listing that names a link key holds that key, and the Noise handshake
-//! with that key is what the buyer then checks. What a listing does not prove: that its Lightning
-//! node is the hasher's (the gateway's own 402 names the node the tickets pay, and the buyer's
+//! with that key is what the hashtaker then checks. What a listing does not prove: that its Lightning
+//! node is the hashmaker's (the gateway's own 402 names the node the tickets pay, and the hashtaker's
 //! wallet ties the seller's origin to a node it trusts), or that the hashrate is real (the meter
 //! pays only for accepted work).
 
@@ -41,19 +41,19 @@ pub struct Hashrate {
     pub algorithm: String,
     /// Hashrate on offer, hashes a second.
     pub hashrate_hs: u64,
-    /// Where the hasher's link answers, and its static key.
+    /// Where the hashmaker's link answers, and its static key.
     pub link_addr: String,
     pub link_key: PublicKey,
-    /// Where finished slices are paid (the hasher's gateway route), and the node its tickets pay.
+    /// Where finished slices are paid (the hashmaker's gateway route), and the node its tickets pay.
     pub pay_url: String,
     pub pay_node: String,
     pub terms: Terms,
-    /// Miners behind the hasher's app, and how many of them (with how much hashrate) are free to
+    /// Miners behind the hashmaker's app, and how many of them (with how much hashrate) are free to
     /// rent now. A rental takes whole miners. Zero miners: the listing does not say.
     pub capacity: Capacity,
 }
 
-/// What a hasher has, and what of it is free, as the listing says when it was published.
+/// What a hashmaker has, and what of it is free, as the listing says when it was published.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Capacity {
     pub miners: u32,
@@ -95,7 +95,7 @@ impl Hashrate {
             pay_url: s("/pay/url")?,
             pay_node: s("/pay/node")?,
             terms: Terms::from_json(v.get("terms").ok_or("terms missing")?).ok_or("bad terms")?,
-            // optional: a listing from before several renters says nothing of its capacity
+            // optional: a listing from before several hashtakers says nothing of its capacity
             capacity: v.get("capacity").map(|c| Capacity {
                 miners: c.get("miners").and_then(Value::as_u64).and_then(|m| u32::try_from(m).ok()).unwrap_or(0),
                 free_miners: c.get("freeMiners").and_then(Value::as_u64).and_then(|m| u32::try_from(m).ok()).unwrap_or(0),
@@ -198,7 +198,7 @@ mod tests {
 
     fn listing(link: &SecretKey) -> Hashrate {
         Hashrate {
-            name: "test hasher".into(),
+            name: "test hashmaker".into(),
             algorithm: "blake2b".into(),
             hashrate_hs: 4_100_000_000_000,
             link_addr: "192.0.2.1:9".into(),

@@ -1,9 +1,9 @@
-//! The work meter, slices, and the buyer's signed work receipts.
+//! The work meter, slices, and the hashtaker's signed work receipts.
 //!
-//! Work is counted only for shares the buyer's gateway accepts, weighted by difficulty: a share
+//! Work is counted only for shares the hashtaker's gateway accepts, weighted by difficulty: a share
 //! at difficulty `d` is `d × 2^32` hashes. A share's difficulty is the one in force when its job
 //! was sent (the last `mining.set_difficulty` before that job's `mining.notify` on the same
-//! channel), so the hasher and the buyer, reading the same lines in the same order, count the
+//! channel), so the hashmaker and the hashtaker, reading the same lines in the same order, count the
 //! same work at every step.
 
 use secp256k1::ecdsa::Signature;
@@ -106,7 +106,7 @@ impl Meter {
     }
 }
 
-/// The buyer's receipt for a finished slice: the cumulative work the buyer's gateway accepted.
+/// The hashtaker's receipt for a finished slice: the cumulative work the hashtaker's gateway accepted.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Receipt {
     pub rental: String,

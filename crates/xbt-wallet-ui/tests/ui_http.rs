@@ -1807,7 +1807,7 @@ fn hashrate_without_a_public_address_is_not_listed_and_says_why() {
                                        "rentable": 1, "name": "Basement miners", "linkPublic": null},
             "minersAddress": "umbrel.local:23340", "linkLan": "umbrel.local:23341",
             "listing": {"ok": false, "missing": "link-public",
-                        "why": "Add the address renters use to reach your miners (it needs a port forward or a tunnel). Until then your offer is not published; renters on your own network can still use this box's address."},
+                        "why": "Add the address hashtakers use to reach your miners (it needs a port forward or a tunnel). Until then your offer is not published; hashtakers on your own network can still use this box's address."},
             "miners": [{"name": "s11", "connected": true, "hashrateHs": 4.1e12, "rentedTo": null, "earnedMsat": 0}], "rentals": []}),
         _ => json!({"error": "no"}),
     });
@@ -1827,7 +1827,7 @@ fn hashrate_without_a_public_address_is_not_listed_and_says_why() {
     });
     let mut br = logged_in(&bx);
     let p = br.get("/sell-hashrate");
-    for s in ["Not listed", "Add the address renters use to reach your miners", "Address renters use to reach your miners (needs a port forward or tunnel)",
+    for s in ["Not listed", "Add the address hashtakers use to reach your miners", "Address hashtakers use to reach your miners (needs a port forward or tunnel)",
               "umbrel.local:23341"] {
         assert!(p.body.contains(s), "{s} missing from Sell hashrate: {}", p.body);
     }

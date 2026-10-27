@@ -1,13 +1,13 @@
 #!/bin/bash
 # p2p-hash with a real miner: a short rental from a miner with the DragonMint web UI, through
-# this machine's hasher and buyer, into a real DATUM Gateway, and the miner's pools put back.
+# this machine's hashmaker and hashtaker, into a real DATUM Gateway, and the miner's pools put back.
 #
-#     miner ---SV1--- hasher (LISTEN) ====link==== buyer ---SV1--- GATEWAY (DATUM)
+#     miner ---SV1--- hashmaker (LISTEN) ====link==== hashtaker ---SV1--- GATEWAY (DATUM)
 #
-# Both apps run here. The buyer credits GW_USER at the gateway (default: the user the miner
+# Both apps run here. The hashtaker credits GW_USER at the gateway (default: the user the miner
 # already uses there), so the work goes where it went before. Tickets use the lab's stand-in
-# rails (no money moves). The buyer stops paying after STOP_PAYING_AFTER slices, so the run ends
-# with the hasher stopping the miner for non-payment; the miner's saved pool is its fallback in
+# rails (no money moves). The hashtaker stops paying after STOP_PAYING_AFTER slices, so the run ends
+# with the hashmaker stopping the miner for non-payment; the miner's saved pool is its fallback in
 # the meantime.
 #
 # The miner's pools are saved first (run/p2p-hash/miner/<time>/pools-before.json, mode 600: it
@@ -43,11 +43,11 @@ trap restore EXIT
 
 "$BIN" keygen "$D/hasher.key" > "$D/hasher.pub"
 "$BIN" keygen "$D/buyer.key" > /dev/null
-"$BIN" hasher --key "$D/hasher.key" --miners "$LISTEN" --link 127.0.0.1:34931 --slice-work $SLICE_WORK \
+"$BIN" hashmaker --key "$D/hasher.key" --miners "$LISTEN" --link 127.0.0.1:34931 --slice-work $SLICE_WORK \
   --price-msat 10000 --grace-ms 30000 --report "$D/hasher.json" 2> "$D/hasher.log" &
 pids+=($!)
 sleep 0.5
-"$BIN" buyer --key "$D/buyer.key" --hasher 127.0.0.1:34931 --hasher-key "$(cat "$D/hasher.pub")" \
+"$BIN" hashtaker --key "$D/buyer.key" --hashmaker 127.0.0.1:34931 --hashmaker-key "$(cat "$D/hasher.pub")" \
   --upstream "$GATEWAY" --user "$GW_USER" --slice-work $SLICE_WORK --price-msat 10000 --grace-ms 30000 \
   --rental "miner-$(date +%s)" --idle-s 180 --duration-s $((MINUTES * 60)) --stop-paying-after "$STOP_PAYING_AFTER" \
   --report "$D/buyer.json" 2> "$D/buyer.log" &

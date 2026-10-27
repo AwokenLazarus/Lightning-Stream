@@ -94,16 +94,17 @@ fn sats_n(n: f64) -> String {
 
 /// A closed rental's reason, in words.
 fn ended_words(why: &str) -> String {
-    let w = why.trim_start_matches("hasher closed: ").trim_start_matches("buyer closed: ");
+    // the earlier role names too: a hashlink from before the rename words its reasons with them
+    let w = ["hashmaker closed: ", "hashtaker closed: ", "hasher closed: ", "buyer closed: "].iter().fold(why, |w, p| w.trim_start_matches(p));
     match w {
-        "cut by the buyer" => "You cut it.".into(),
+        "cut by the hashtaker" | "cut by the buyer" => "You cut it.".into(),
         "budget used up" => "Its budget is used up.".into(),
         "rental time over" => "Its time is up.".into(),
         "no accepted work" => "The miners stopped sending work.".into(),
         "unpaid" => "A piece of work was not paid in time.".into(),
-        "stopped by the hasher" => "The seller stopped it.".into(),
-        "no miners free now" => "The seller has no miners free.".into(),
-        w if w.starts_with("link lost") => "The connection to the seller was lost.".into(),
+        "stopped by the hashmaker" | "stopped by the hasher" => "The hashmaker stopped it.".into(),
+        "no miners free now" => "The hashmaker has no miners free.".into(),
+        w if w.starts_with("link lost") => "The connection to the hashmaker was lost.".into(),
         w if w.starts_with("could not start") => format!("It could not start: {}", w.trim_start_matches("could not start: ")),
         w => format!("Ended: {w}."),
     }
@@ -146,7 +147,8 @@ impl App {
         let st = call(&base, &self.cfg.hash.hasher_token, "GET", "/status", None);
         let saved = self.hash_settings();
         let csrf = App::csrf_input(ctx);
-        let mut b = String::new();
+        let mut b = String::from("<p class=\"hint\">Renting out, you are the <strong>hashmaker</strong>: your miners make the hash. \
+            The people who rent them are <strong>hashtakers</strong>.</p>");
         let settings = st.as_ref().ok().map(|s| s["settings"].clone()).unwrap_or(json!({}));
         let pick = |k: &str| saved.get(k).filter(|v| !v.is_null()).cloned().or_else(|| settings.get(k).filter(|v| !v.is_null()).cloned());
         let on = pick("enabled") == Some(Value::Bool(true));
@@ -204,7 +206,7 @@ impl App {
                     <p>Earned so far: <span class=\"money\">{}</span> · {} piece{} of work paid</p>\
                     <form method=\"post\" action=\"./sell-hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"stop\"><input type=\"hidden\" name=\"rental\" value=\"{}\">\
                     <button class=\"danger\">Stop this rental</button></form>\
-                    <details><summary>Details</summary><p class=\"small\">Renter <code>{}</code> · rental <code>{}</code></p></details></section>",
+                    <details><summary>Details</summary><p class=\"small\">Hashtaker <code>{}</code> · rental <code>{}</code></p></details></section>",
                     names.len(), if names.len() == 1 { "" } else { "s" }, esc(&names.join(", ")),
                     sats_n(num(&r["earnedMsat"]) / 1000.0), r["paid"].as_u64().unwrap_or(0), if r["paid"].as_u64() == Some(1) { "" } else { "s" },
                     esc(id), esc(&short(r["buyer"].as_str().unwrap_or(""), 20)), esc(id)));
@@ -227,10 +229,10 @@ impl App {
             <label>Price for each piece of work, in sats<input name=\"price\" value=\"{price}\" required inputmode=\"numeric\" pattern=\"[0-9]+\" title=\"A whole number of sats\"></label>\
             <p class=\"hint\">At this price a {} miner earns about <strong>{}</strong> an hour while it is rented.</p>\
             <label>Miners to rent out at most <small>(empty: all of them)</small><input name=\"rentable\" value=\"{}\" inputmode=\"numeric\" pattern=\"[0-9]*\"></label>\
-            <label>Name, as renters see it<input name=\"name\" value=\"{}\" maxlength=\"80\" placeholder=\"My miners\"></label>\
-            <label>Address renters use to reach your miners (needs a port forward or tunnel)<input name=\"link_public\" value=\"{}\" class=\"mono\" \
+            <label>Name, as hashtakers see it<input name=\"name\" value=\"{}\" maxlength=\"80\" placeholder=\"My miners\"></label>\
+            <label>Address hashtakers use to reach your miners (needs a port forward or tunnel)<input name=\"link_public\" value=\"{}\" class=\"mono\" \
             pattern=\"[A-Za-z0-9.\\-\\[\\]:]+:[0-9]+\" title=\"An address with its port, like my-box.example.com:23341\" placeholder=\"my-box.example.com:23341\"></label>\
-            <p class=\"hint\">Renters' apps connect to this box's port 23341. Leave it empty and your offer stays off public listings; renters on your own network can still use {}.</p>\
+            <p class=\"hint\">Hashtakers' apps connect to this box's port 23341. Leave it empty and your offer stays off public listings; hashtakers on your own network can still use {}.</p>\
             <details><summary>How do I get this address?</summary><ol>\
             <li>On your router, forward <strong>TCP port 23341</strong> to this box ({}). Forward only 23341: your miners' port stays on your own network.</li>\
             <li>Write your router's public address with the port, like <code>203.0.113.7:23341</code>, or a name that points at it (dynamic DNS), \
@@ -254,7 +256,7 @@ impl App {
                 Some(Value::Bool(false)) => b.push_str(&format!(
                     "<section class=\"card\"><p><span class=\"pill warn\">Not listed</span> {}</p></section>",
                     esc(s["listing"]["why"].as_str().unwrap_or("Your offer is not published yet.")))),
-                _ => b.push_str("<section class=\"card\"><p><span class=\"pill warn\">Not listed yet</span> Your offer goes on public listings once a miner is connected and the address renters use is set.</p></section>"),
+                _ => b.push_str("<section class=\"card\"><p><span class=\"pill warn\">Not listed yet</span> Your offer goes on public listings once a miner is connected and the address hashtakers use is set.</p></section>"),
             }
         }
         self.html_page("Sell hashrate", "Sell hashrate", ctx, &b, "")
@@ -294,7 +296,7 @@ impl App {
                 v["name"] = json!(if g("name").is_empty() { "Hashrate".to_string() } else { g("name").chars().take(80).collect() });
                 let link = g("link_public");
                 if !link.is_empty() && (!link.contains(':') || link.contains(['/', ' '])) {
-                    return Err("Write the address renters use with its port, like my-box.example.com:23341.".into());
+                    return Err("Write the address hashtakers use with its port, like my-box.example.com:23341.".into());
                 }
                 // empty clears it: no listing on public relays until it is set
                 v["linkPublic"] = json!(link);
@@ -343,7 +345,8 @@ impl App {
         let st = call(&base, &token, "GET", "/status", None);
         let csrf = App::csrf_input(ctx);
         let mut b = String::from("<p class=\"lead\">Rent miners from other people, by the piece of work they do, into your own DATUM Gateway. \
-            You pay only for work your gateway accepts, a little at a time, and you can cut a rental at any moment.</p>");
+            You pay only for work your gateway accepts, a little at a time, and you can cut a rental at any moment.</p>\
+            <p class=\"hint\">Renting, you are the <strong>hashtaker</strong>: the hash comes to you. The people whose miners you rent are <strong>hashmakers</strong>.</p>");
         let st = match st {
             Ok(s) => s,
             Err(e) => {
@@ -382,7 +385,7 @@ impl App {
             Ok(o) => {
                 let offers: Vec<Value> = o["offers"].as_array().cloned().unwrap_or_default();
                 if offers.is_empty() {
-                    b.push_str("<p class=\"empty\">No miners for rent found right now. Sellers publish their offers on Nostr; look again in a while.</p>");
+                    b.push_str("<p class=\"empty\">No miners for rent found right now. Hashmakers publish their offers on Nostr; look again in a while.</p>");
                 }
                 b.push_str("<div class=\"grid services\">");
                 for x in &offers {
@@ -484,7 +487,7 @@ fn rental_card(ctx: &Ctx, r: &Value, _action: &str) -> String {
     };
     format!("<section class=\"card live\"><div class=\"offer-head\"><h3>Hashrate from {}</h3>{pill}</div>\
              <p>Spent so far: <span class=\"money\">{}</span> of {} · {} piece{} of work paid · {} on {} machine{}</p>{why}<div class=\"row\">{cut}</div></section>",
-            esc(r["hasher"].as_str().unwrap_or("a seller")), sats_n(spent), sats_n(num(&r["budgetSats"])), paid, if paid == 1 { "" } else { "s" },
+            esc(r["hasher"].as_str().unwrap_or("a hashmaker")), sats_n(spent), sats_n(num(&r["budgetSats"])), paid, if paid == 1 { "" } else { "s" },
             speed(hs), live["miners"].as_u64().unwrap_or(0), if live["miners"].as_u64() == Some(1) { "" } else { "s" })
 }
 
@@ -504,5 +507,7 @@ mod tests {
         assert_eq!(sats_n(1.0), "1 sat");
         assert_eq!(ended_words("hasher closed: unpaid"), "A piece of work was not paid in time.");
         assert_eq!(ended_words("cut by the buyer"), "You cut it.");
+        assert_eq!(ended_words("hashtaker closed: cut by the hashtaker"), "You cut it.");
+        assert_eq!(ended_words("hashmaker closed: stopped by the hashmaker"), "The hashmaker stopped it.");
     }
 }

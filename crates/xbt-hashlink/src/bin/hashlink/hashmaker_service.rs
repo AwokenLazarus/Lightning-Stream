@@ -1,5 +1,5 @@
-//! `xbt-hashlink hasher --fallback ...`: the hasher's side as a service. Miners not rented hash at
-//! the fallback; any number of buyers rent whole miners; the listing on Nostr says what is free
+//! `xbt-hashlink hashmaker --fallback ...`: the hashmaker's side as a service. Miners not rented hash at
+//! the fallback; any number of hashtakers rent whole miners; the listing on Nostr says what is free
 //! and is published again when that changes. The app writes the settings file (`--config`), and
 //! reads the state from the control page.
 //!
@@ -8,11 +8,11 @@
 //!   "graceMs": 45000, "rentable": 3, "name": "My miners", "linkPublic": "host:port",
 //!   "payUrl": "https://shop.example/hashrate", "payNode": "02…", "minersPublic": "host:port"}`
 //!
-//! `linkPublic` is the address renters outside this network reach the link at (a port forward or a
+//! `linkPublic` is the address hashtakers outside this network reach the link at (a port forward or a
 //! tunnel). Without it no listing goes to the relays: an address only the LAN can reach would send
-//! renters nowhere. `--link-lan` is the address shown for renters on the same network.
+//! hashtakers nowhere. `--link-lan` is the address shown for hashtakers on the same network.
 //!
-//! Without `payNode`, the node is read from the hasher's gateway (`--gateway`, its `/services`).
+//! Without `payNode`, the node is read from the hashmaker's gateway (`--gateway`, its `/services`).
 //! A missing `--key` or `--nostr-key` file is made at the first start.
 
 use crate::http;
@@ -22,13 +22,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
-use xbt_hashlink::hasher::{self, Hasher};
+use xbt_hashlink::hashmaker::{self, Hashmaker};
 use xbt_hashlink::listing::Capacity;
 use xbt_hashlink::msg::Terms;
 use xbt_hashlink::rail::LabSeller;
 
 /// A change in what is for rent (miners, free miners, renting on or off, the terms, the name, or
-/// where renters reach and pay the hasher) is published again after at least this long since the last publish.
+/// where hashtakers reach and pay the hashmaker) is published again after at least this long since the last publish.
 const REPUBLISH_CAPACITY: Duration = Duration::from_secs(60);
 /// A change in the measured hashrate alone is news only when it moves more than this share of the
 /// published value, and is published at most this often: public relays rate-limit.
@@ -44,7 +44,7 @@ struct Said {
     renting: bool,
     terms: Terms,
     name: String,
-    /// Where renters reach the link and pay for the work: an owner setting the address renters
+    /// Where hashtakers reach the link and pay for the work: an owner setting the address hashtakers
     /// use is news, not a wait for the long timer.
     link_public: Option<String>,
     pay_url: Option<String>,
@@ -82,11 +82,11 @@ struct Settings {
     terms: Terms,
     rentable: Option<u32>,
     name: String,
-    /// Where buyers' apps reach the link, where slices are paid and the node paid, as published.
+    /// Where hashtakers' apps reach the link, where slices are paid and the node paid, as published.
     link_public: Option<String>,
     pay_url: Option<String>,
     pay_node: Option<String>,
-    /// The address the hasher's miners use (shown by the app).
+    /// The address the hashmaker's miners use (shown by the app).
     miners_public: Option<String>,
 }
 
@@ -179,8 +179,8 @@ pub fn run(f: &HashMap<String, String>, key: SecretKey) -> Result<(), String> {
     let path = f.get("config").map(PathBuf::from);
     let base = defaults(f)?;
     let mut settings = read_settings(&path, &base);
-    let h = Arc::new(Hasher::start(
-        hasher::Config {
+    let h = Arc::new(Hashmaker::start(
+        hashmaker::Config {
             miners: super::need(f, "miners")?.into(),
             link: super::need(f, "link")?.into(),
             key,
@@ -228,7 +228,7 @@ pub fn run(f: &HashMap<String, String>, key: SecretKey) -> Result<(), String> {
             }
         }))?;
     }
-    eprintln!("hasher: serving; renting {}", if settings.enabled && settings.fallback.is_some() { "on" } else { "off" });
+    eprintln!("hashmaker: serving; renting {}", if settings.enabled && settings.fallback.is_some() { "on" } else { "off" });
     let mut seen = mtime(&path);
     let mut last: Option<(Said, bool)> = None;
     let mut last_pub = Instant::now();
@@ -239,7 +239,7 @@ pub fn run(f: &HashMap<String, String>, key: SecretKey) -> Result<(), String> {
             seen = m;
             let next = read_settings(&path, &base);
             if next != settings {
-                eprintln!("hasher: new settings: renting {}, fallback {}", if next.enabled { "on" } else { "off" }, next.fallback.as_deref().unwrap_or("none"));
+                eprintln!("hashmaker: new settings: renting {}, fallback {}", if next.enabled { "on" } else { "off" }, next.fallback.as_deref().unwrap_or("none"));
                 h.set_terms(next.terms.clone());
                 h.set_fallback(next.fallback.clone());
                 h.set_rentable(next.rentable);
@@ -263,10 +263,10 @@ pub fn run(f: &HashMap<String, String>, key: SecretKey) -> Result<(), String> {
         if !due(last.as_ref().map(|(s, ok)| (s, *ok)), &now, last_pub.elapsed()) {
             continue;
         }
-        // no public address renters can reach: no listing on public relays (one naming an address
-        // only the LAN can reach would send renters nowhere)
+        // no public address hashtakers can reach: no listing on public relays (one naming an address
+        // only the LAN can reach would send hashtakers nowhere)
         let missing = [
-            ("link-public", &settings.link_public, "Add the address renters use to reach your miners (it needs a port forward or a tunnel). Until then your offer is not published; renters on your own network can still use this box's address."),
+            ("link-public", &settings.link_public, "Add the address hashtakers use to reach your miners (it needs a port forward or a tunnel). Until then your offer is not published; hashtakers on your own network can still use this box's address."),
             ("pay-url", &settings.pay_url, "Set your shop's public address on the Sell page first."),
             ("pay-node", &settings.pay_node, "Your shop's Lightning node is not known yet."),
         ]
@@ -275,7 +275,7 @@ pub fn run(f: &HashMap<String, String>, key: SecretKey) -> Result<(), String> {
         if let Some((k, _, why)) = missing {
             let was = published.lock().unwrap_or_else(|p| p.into_inner()).clone();
             if was.get("missing").and_then(Value::as_str) != Some(k) {
-                eprintln!("hasher: listing not published: {k} is not set");
+                eprintln!("hashmaker: listing not published: {k} is not set");
             }
             *published.lock().unwrap_or_else(|p| p.into_inner()) = json!({"ok": false, "missing": k, "why": why, "atMs": xbt_hashlink::now_ms()});
             // asked again only when something changes, or after the long timer
@@ -343,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn setting_the_address_renters_use_is_published_after_a_minute() {
+    fn setting_the_address_hashtakers_use_is_published_after_a_minute() {
         // the owner adds the address after the "not set" check: published within the minute, not the long timer
         let last = said(1, 1, 4_000_000_000_000);
         let mut set = last.clone();

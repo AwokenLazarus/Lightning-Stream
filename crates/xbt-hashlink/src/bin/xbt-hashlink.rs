@@ -3,8 +3,8 @@
 //! ```text
 //! xbt-hashlink keygen KEYFILE                      make a key (prints its public key)
 //! xbt-hashlink pubkey KEYFILE
-//! xbt-hashlink hasher --key F --miners ADDR --link ADDR --slice-work W --price-msat P [--grace-ms G] [--report F]
-//!                     [--slices ADDR]              paid slices come from the hasher's gateway (else: the lab's rail)
+//! xbt-hashlink hashmaker --key F --miners ADDR --link ADDR --slice-work W --price-msat P [--grace-ms G] [--report F]
+//!                     [--slices ADDR]              paid slices come from the hashmaker's gateway (else: the lab's rail)
 //!                     [--relays URL,URL --nostr-key F --name N --link-public ADDR --pay-url URL --pay-node HEX
 //!                      --hashrate-hs N [--listing-out F]]    publish the hashrate listing first
 //!                     [--fallback ADDR [--rentable N] [--control ADDR [--control-token-file F]] [--config F]
@@ -12,18 +12,18 @@
 //!                         keep serving: miners not rented hash at the fallback, any number of rentals,
 //!                         a control page for the app (GET /status, POST /stop/RENTAL), settings read
 //!                         from F as they change; without --fallback and --config: one rental, then exit
-//! xbt-hashlink renter --key F --control ADDR [--control-token-file F] --upstream ADDR|auto --user U --relays URL,URL
+//! xbt-hashlink hashtaker --key F --control ADDR [--control-token-file F] --upstream ADDR|auto --user U --relays URL,URL
 //!                     [--signer SOCK --task T] [--expect-node HEX] [--datum-candidates ADDR,ADDR] [--state DIR]
 //!                         rent from the app: GET /status, GET /offers, POST /rent, POST /cut, POST /datum
-//! xbt-hashlink buyer  --key F --upstream ADDR --user U [--idle-s S] [--duration-s S] [--stop-paying-after N]
+//! xbt-hashlink hashtaker  --key F --upstream ADDR --user U [--idle-s S] [--duration-s S] [--stop-paying-after N]
 //!                     [--rental ID] [--report F] [--miners N] [--budget-sats N]
-//!                     ( --hasher ADDR --hasher-key HEX --slice-work W --price-msat P [--grace-ms G]
+//!                     ( --hashmaker ADDR --hashmaker-key HEX --slice-work W --price-msat P [--grace-ms G]
 //!                     | --find URL,URL [--expect-node HEX] [--max-price-msat P] [--found-out F] )
 //!                     [--signer SOCK --task T --max-sats N [--pay-url URL]]   pay through the wallet
 //! xbt-hashlink relay  --listen ADDR                 a stand-in Nostr relay (in memory, for a lab or a rehearsal)
 //! xbt-hashlink healthcheck [ADDR ...]              the image's HEALTHCHECK (it has no shell or curl): exit 0
 //!                                                  when a control page answers on one of ADDR (default
-//!                                                  127.0.0.1:23342, the hasher's, and 127.0.0.1:23343, the renter's)
+//!                                                  127.0.0.1:23342, the hashmaker's, and 127.0.0.1:23343, the hashtaker's)
 //! xbt-hashlink standin-pool  --listen ADDR --diff D [--job-ms MS] [--report F]
 //! xbt-hashlink standin-miner --pool ADDR --user U [--rate SHARES_PER_S] [--bad-every N] [--duration-s S]
 //!                            [--reconnect 1] [--extranonce-subscribe 1]
@@ -35,15 +35,15 @@ use std::path::PathBuf;
 use std::time::Duration;
 use xbt_hashlink::listing::{self, Capacity, Hashrate};
 use xbt_hashlink::msg::Terms;
-use xbt_hashlink::rail::{LabBuyer, LabSeller, SignerPayer};
-use xbt_hashlink::{buyer, hasher, noise, standin};
+use xbt_hashlink::rail::{LabHashtaker, LabSeller, SignerPayer};
+use xbt_hashlink::{hashtaker, hashmaker, noise, standin};
 
 #[path = "hashlink/http.rs"]
 mod http;
-#[path = "hashlink/renter.rs"]
-mod renter;
-#[path = "hashlink/service.rs"]
-mod service;
+#[path = "hashlink/hashtaker_service.rs"]
+mod hashtaker_service;
+#[path = "hashlink/hashmaker_service.rs"]
+mod hashmaker_service;
 
 fn flags(args: &[String]) -> Result<HashMap<String, String>, String> {
     let mut m = HashMap::new();
@@ -51,6 +51,12 @@ fn flags(args: &[String]) -> Result<HashMap<String, String>, String> {
     while let Some(a) = it.next() {
         let k = a.strip_prefix("--").ok_or_else(|| format!("unexpected argument {a}"))?;
         let v = it.next().ok_or_else(|| format!("--{k} needs a value"))?;
+        // the earlier names of the hashmaker's flags
+        let k = match k {
+            "hasher" => "hashmaker",
+            "hasher-key" => "hashmaker-key",
+            k => k,
+        };
         m.insert(k.to_string(), v.clone());
     }
     Ok(m)
@@ -118,7 +124,7 @@ fn main() {
 }
 
 fn run(args: &[String]) -> Result<(), String> {
-    let (cmd, rest) = args.split_first().ok_or("usage: xbt-hashlink keygen|pubkey|hasher|buyer|relay|standin-pool|standin-miner ...")?;
+    let (cmd, rest) = args.split_first().ok_or("usage: xbt-hashlink keygen|pubkey|hashmaker|hashtaker|relay|standin-pool|standin-miner ...")?;
     match cmd.as_str() {
         "keygen" => {
             let path = rest.first().ok_or("keygen KEYFILE")?;
@@ -141,9 +147,14 @@ fn run(args: &[String]) -> Result<(), String> {
                 Err(format!("no control page answers on {}", addrs.join(", ")))
             }
         }
-        "hasher" => hasher_cmd(&flags(rest)?),
-        "buyer" => buyer_cmd(&flags(rest)?),
-        "renter" => renter::run(&flags(rest)?),
+        // `hasher`, `buyer` and `renter` are the roles' earlier names, still taken
+        "hashmaker" | "hasher" => hashmaker_cmd(&flags(rest)?),
+        "hashtaker" => {
+            let f = flags(rest)?;
+            if f.contains_key("control") { hashtaker_service::run(&f) } else { hashtaker_cmd(&f) }
+        }
+        "buyer" => hashtaker_cmd(&flags(rest)?),
+        "renter" => hashtaker_service::run(&flags(rest)?),
         "relay" => {
             let f = flags(rest)?;
             let r = xbt_nostr::standin::StandinRelay::start_on(need(&f, "listen")?).map_err(|e| e.to_string())?;
@@ -182,10 +193,10 @@ fn run(args: &[String]) -> Result<(), String> {
     }
 }
 
-fn hasher_cmd(f: &HashMap<String, String>) -> Result<(), String> {
+fn hashmaker_cmd(f: &HashMap<String, String>) -> Result<(), String> {
     if f.contains_key("fallback") || f.contains_key("config") {
-        let key = service::key_file(need(f, "key")?)?;
-        return service::run(f, key);
+        let key = hashmaker_service::key_file(need(f, "key")?)?;
+        return hashmaker_service::run(f, key);
     }
     let key = read_key(need(f, "key")?)?;
     let t = terms(f)?;
@@ -193,7 +204,7 @@ fn hasher_cmd(f: &HashMap<String, String>) -> Result<(), String> {
         let h = listing_of(f, &key, &t, Capacity::default())?;
         publish(f, r, &key, &h)?;
     }
-    let cfg = hasher::Config {
+    let cfg = hashmaker::Config {
         miners: need(f, "miners")?.into(),
         link: need(f, "link")?.into(),
         key,
@@ -203,8 +214,8 @@ fn hasher_cmd(f: &HashMap<String, String>) -> Result<(), String> {
         fallback: None,
         rentable: None,
     };
-    let r = hasher::run(cfg, Box::<LabSeller>::default())?;
-    eprintln!("hasher: done: {}", r["stopped"]);
+    let r = hashmaker::run(cfg, Box::<LabSeller>::default())?;
+    eprintln!("hashmaker: done: {}", r["stopped"]);
     Ok(())
 }
 
@@ -226,7 +237,7 @@ pub(crate) fn publish(f: &HashMap<String, String>, relays_s: &str, key: &SecretK
     let nostr = xbt_nostr::event::Keys::new(read_key(need(f, "nostr-key")?)?);
     let ev = h.event(key, &nostr, xbt_nostr::now())?;
     let said = listing::publish(&relays(relays_s), &ev);
-    eprintln!("hasher: listing {} published: {}", ev.id, serde_json::Value::from(said.clone()));
+    eprintln!("hashmaker: listing {} published: {}", ev.id, serde_json::Value::from(said.clone()));
     write_json(f.get("listing-out"), &serde_json::json!({"event": ev.to_value(), "relays": said}));
     if !said.iter().any(|s| s["ok"] == true) {
         return Err("no relay took the listing".into());
@@ -234,8 +245,8 @@ pub(crate) fn publish(f: &HashMap<String, String>, relays_s: &str, key: &SecretK
     Ok(())
 }
 
-fn buyer_cmd(f: &HashMap<String, String>) -> Result<(), String> {
-    let (hasher, hasher_key, t, found_pay_url) = match f.get("find") {
+fn hashtaker_cmd(f: &HashMap<String, String>) -> Result<(), String> {
+    let (hashmaker, hashmaker_key, t, found_pay_url) = match f.get("find") {
         Some(r) => {
             let (found, refused) = listing::find(&relays(r), xbt_nostr::now());
             let max_price: u64 = num(f, "max-price-msat", Some(u64::MAX))?;
@@ -243,13 +254,13 @@ fn buyer_cmd(f: &HashMap<String, String>) -> Result<(), String> {
                 h.algorithm == "blake2b" && h.terms.price_msat <= max_price && f.get("expect-node").is_none_or(|n| *n == h.pay_node)
             });
             let (h, ev) = pick.ok_or(format!("no hashrate listing on the relays fits ({refused} refused)"))?;
-            eprintln!("buyer: found {} ({}) at {}, event {}", h.name, hex::encode(h.link_key.serialize()), h.link_addr, ev.id);
+            eprintln!("hashtaker: found {} ({}) at {}, event {}", h.name, hex::encode(h.link_key.serialize()), h.link_addr, ev.id);
             write_json(f.get("found-out"), &serde_json::json!({"listing": h.to_json(), "event": ev.id, "author": ev.pubkey, "refused": refused}));
             (h.link_addr.clone(), h.link_key, h.terms.clone(), Some(h.pay_url.clone()))
         }
         None => {
-            let hk = hex::decode(need(f, "hasher-key")?).map_err(|_| "--hasher-key: not hex")?;
-            (need(f, "hasher")?.to_string(), PublicKey::from_slice(&hk).map_err(|_| "--hasher-key: not a public key")?, terms(f)?, None)
+            let hk = hex::decode(need(f, "hashmaker-key")?).map_err(|_| "--hashmaker-key: not hex")?;
+            (need(f, "hashmaker")?.to_string(), PublicKey::from_slice(&hk).map_err(|_| "--hashmaker-key: not a public key")?, terms(f)?, None)
         }
     };
     let payer = match f.get("signer") {
@@ -262,13 +273,13 @@ fn buyer_cmd(f: &HashMap<String, String>) -> Result<(), String> {
         }),
         None => None,
     };
-    let cfg = buyer::Config {
+    let cfg = hashtaker::Config {
         miners: num(f, "miners", Some(0))?,
         budget_msat: f.get("budget-sats").map(|v| v.parse::<u64>().map(|s| s * 1000)).transpose().map_err(|_| "--budget-sats")?,
         cut: None,
         live: None,
-        hasher,
-        hasher_key,
+        hashmaker,
+        hashmaker_key,
         key: read_key(need(f, "key")?)?,
         upstream: need(f, "upstream")?.into(),
         user: need(f, "user")?.into(),
@@ -281,8 +292,8 @@ fn buyer_cmd(f: &HashMap<String, String>) -> Result<(), String> {
         report: f.get("report").map(PathBuf::from),
         payer,
     };
-    let r = buyer::run(cfg, Box::<LabBuyer>::default())?;
-    eprintln!("buyer: done: released {} slices, {}", r["released"], r["closed"]);
+    let r = hashtaker::run(cfg, Box::<LabHashtaker>::default())?;
+    eprintln!("hashtaker: done: released {} slices, {}", r["released"], r["closed"]);
     Ok(())
 }
 

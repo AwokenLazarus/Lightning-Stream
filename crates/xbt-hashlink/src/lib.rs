@@ -1,10 +1,10 @@
 //! p2p-hash: rented hashrate over Lightning Stream.
 //!
-//! A hasher rents its miners' hashrate to a buyer, who points it at the buyer's own DATUM Gateway
-//! (the buyer makes the jobs). The hasher's app serves Stratum V1 to its miners on its LAN and
-//! carries every line over an encrypted link to the buyer's app, which is a Stratum V1 client of
-//! the buyer's gateway, one upstream session per miner. Both apps meter the work the gateway
-//! accepts, by share difficulty, and the buyer pays for it slice by slice with Lightning Stream
+//! A hashmaker rents its miners' hashrate to a hashtaker, who points it at the hashtaker's own DATUM Gateway
+//! (the hashtaker makes the jobs). The hashmaker's app serves Stratum V1 to its miners on its LAN and
+//! carries every line over an encrypted link to the hashtaker's app, which is a Stratum V1 client of
+//! the hashtaker's gateway, one upstream session per miner. Both apps meter the work the gateway
+//! accepts, by share difficulty, and the hashtaker pays for it slice by slice with Lightning Stream
 //! tickets: a ticket is locked before its slice is mined and released when the slice is done.
 //! Nobody holds anyone's money, and either side's exposure is about one slice.
 //!
@@ -12,16 +12,16 @@
 //! * [`msg`]: the link's messages.
 //! * [`link`]: a framed, encrypted, thread-safe link over TCP.
 //! * [`sv1`]: the few Stratum V1 facts the relay and the meter read.
-//! * [`meter`]: accepted work, slices, and the buyer's signed work receipts.
-//! * [`rail`]: how a slice is paid: through the wallet's signer and the hasher's gateway (real
+//! * [`meter`]: accepted work, slices, and the hashtaker's signed work receipts.
+//! * [`rail`]: how a slice is paid: through the wallet's signer and the hashmaker's gateway (real
 //!   tickets), or the lab's stand-in over the link.
-//! * [`listing`]: the hasher's signed `hashrate` listing on Nostr.
-//! * [`hasher`]: the hasher's side (miners in, link out).
-//! * [`buyer`]: the buyer's side (link in, the buyer's gateway out).
+//! * [`listing`]: the hashmaker's signed `hashrate` listing on Nostr.
+//! * [`hashmaker`]: the hashmaker's side (miners in, link out).
+//! * [`hashtaker`]: the hashtaker's side (link in, the hashtaker's gateway out).
 //! * [`standin`]: a stand-in pool and miner for the lab, with a toy share hash.
 
-pub mod buyer;
-pub mod hasher;
+pub mod hashtaker;
+pub mod hashmaker;
 pub mod link;
 pub mod listing;
 pub mod meter;

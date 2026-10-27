@@ -1,6 +1,6 @@
 """A TLS front for a gateway on a LAN, for a rehearsal between machines: the gateway listens on
 loopback and speaks plain HTTP; this terminates TLS on a LAN address and passes the bytes on.
-The buyer's wallet pins this certificate (`tickets.seller_tls` with `cert_sha256`). Not for the
+The hashtaker's wallet pins this certificate (`tickets.seller_tls` with `cert_sha256`). Not for the
 internet: a public seller runs a real reverse proxy with a real certificate.
 
     tls_front.py LISTEN_HOST:PORT TARGET_HOST:PORT CERT KEY

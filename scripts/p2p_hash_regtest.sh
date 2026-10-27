@@ -1,7 +1,7 @@
 #!/bin/bash
-# p2p-hash on regtest with real tickets: the hasher publishes its hashrate listing to a stand-in
-# Nostr relay, the buyer finds it, opens the link, and pays every finished slice through the
-# wallet's signer as one paid request to the hasher's gateway, on the gateway's tickets. The
+# p2p-hash on regtest with real tickets: the hashmaker publishes its hashrate listing to a stand-in
+# Nostr relay, the hashtaker finds it, opens the link, and pays every finished slice through the
+# wallet's signer as one paid request to the hashmaker's gateway, on the gateway's tickets. The
 # checks and what each looks at: scripts/p2p_hash/regtest.py.
 #
 # Lab: the ticket lab's (scripts/ticket_e2e/compose.yml on lightning-fork-lab, three Lightning Fork

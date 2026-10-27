@@ -1,8 +1,8 @@
 //! BOLT 8: `Noise_XK_secp256k1_ChaChaPoly_SHA256`, the handshake and the framed transport that
-//! Lightning peers use, here between the hasher's app and the buyer's app.
+//! Lightning peers use, here between the hashmaker's app and the hashtaker's app.
 //!
-//! The buyer (initiator) knows the hasher's static key from its listing; the hasher learns the
-//! buyer's static key in act three. Both are secp256k1 keys. The prologue is a parameter: the
+//! The hashtaker (initiator) knows the hashmaker's static key from its listing; the hashmaker learns the
+//! hashtaker's static key in act three. Both are secp256k1 keys. The prologue is a parameter: the
 //! link uses [`PROLOGUE`], so a hashlink handshake never completes against a Lightning peer (or
 //! the other way round); BOLT 8's own test vectors use `b"lightning"`.
 //!

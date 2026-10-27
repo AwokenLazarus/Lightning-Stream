@@ -1,5 +1,5 @@
-//! `xbt-hashlink renter`: the buyer's side as a service, for the app's Rent page. It finds hashers'
-//! listings on Nostr, rents whole miners from them into the buyer's own DATUM Gateway (the pool is
+//! `xbt-hashlink hashtaker`: the hashtaker's side as a service, for the app's Rent page. It finds hashmakers'
+//! listings on Nostr, rents whole miners from them into the hashtaker's own DATUM Gateway (the pool is
 //! chosen there, not here), pays each slice through the wallet's signer under its policy, and keeps
 //! every rental's live state for the app. Several rentals can run at once.
 //!
@@ -15,15 +15,15 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use xbt_hashlink::buyer;
+use xbt_hashlink::hashtaker;
 use xbt_hashlink::listing::{self, Hashrate};
-use xbt_hashlink::rail::{LabBuyer, SignerPayer};
+use xbt_hashlink::rail::{LabHashtaker, SignerPayer};
 
 const OFFERS_FRESH: Duration = Duration::from_secs(20);
 const KEPT: usize = 50;
 
 struct Rental {
-    hasher: String,
+    hashmaker: String,
     started_ms: u64,
     miners: u32,
     budget_sats: u64,
@@ -60,7 +60,7 @@ pub fn run(f: &HashMap<String, String>) -> Result<(), String> {
         datum = f.get("datum-candidates").map(|c| super::relays(c)).unwrap_or_default().into_iter().find(|a| reachable(a)).unwrap_or_default();
     }
     let r = Arc::new(Mutex::new(R {
-        key: crate::service::key_file(super::need(f, "key")?)?,
+        key: crate::hashmaker_service::key_file(super::need(f, "key")?)?,
         datum,
         user: f.get("user").cloned().unwrap_or_else(|| "rented".into()),
         relays: f.get("relays").map(|r| super::relays(r)).unwrap_or_default(),
@@ -75,7 +75,7 @@ pub fn run(f: &HashMap<String, String>) -> Result<(), String> {
     let addr = super::need(f, "control")?.to_string();
     let token = f.get("control-token-file").map(|p| http::token(p)).transpose()?;
     http::serve(&addr, token, Arc::new(move |method, path, body| handle(&r, &candidates, method, path, body)))?;
-    eprintln!("renter: control page on {addr}");
+    eprintln!("hashtaker: control page on {addr}");
     loop {
         std::thread::sleep(Duration::from_secs(3600));
     }
@@ -130,7 +130,7 @@ fn handle(r: &Arc<Mutex<R>>, candidates: &[String], method: &str, path: &str, bo
                 .map(|(id, x)| {
                     let live = x.live.lock().unwrap_or_else(|p| p.into_inner()).clone();
                     json!({
-                        "rental": id, "hasher": x.hasher, "startedMs": x.started_ms, "miners": x.miners, "budgetSats": x.budget_sats,
+                        "rental": id, "hasher": x.hashmaker, "startedMs": x.started_ms, "miners": x.miners, "budgetSats": x.budget_sats,
                         "minutes": x.minutes, "ended": x.done.load(Ordering::Relaxed), "live": live,
                     })
                 })
@@ -191,7 +191,7 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
     }
     let pick = |o: Vec<(Hashrate, String)>| o.into_iter().find(|(h, _)| hex::encode(h.link_key.serialize()) == key_hex);
     let Some((h, event)) = pick(offers(r, false)).or_else(|| pick(offers(r, true))) else {
-        return (404, json!({"error": "that hasher's listing is no longer on the relays"}));
+        return (404, json!({"error": "that hashmaker's listing is no longer on the relays"}));
     };
     if h.terms.price_msat > budget_sats * 1000 {
         return (400, json!({"error": "the budget is less than one slice"}));
@@ -205,9 +205,9 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
         (g.key, g.user.clone(), g.signer.clone(), g.task.clone())
     };
     let payer = signer.map(|sock| SignerPayer { sock, url: h.pay_url.clone(), task, max_sats: budget_sats, session: None });
-    let cfg = buyer::Config {
-        hasher: h.link_addr.clone(),
-        hasher_key: h.link_key,
+    let cfg = hashtaker::Config {
+        hashmaker: h.link_addr.clone(),
+        hashmaker_key: h.link_key,
         key,
         upstream: datum,
         user,
@@ -232,7 +232,7 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
             }
         }
         g.rentals.insert(id.clone(), Rental {
-            hasher: h.name.clone(),
+            hashmaker: h.name.clone(),
             started_ms: xbt_hashlink::now_ms(),
             miners,
             budget_sats,
@@ -242,14 +242,14 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
             done: done.clone(),
         });
     }
-    let hasher_key: PublicKey = h.link_key;
+    let hashmaker_key: PublicKey = h.link_key;
     std::thread::spawn(move || {
-        let res = buyer::run(cfg, Box::<LabBuyer>::default());
+        let res = hashtaker::run(cfg, Box::<LabHashtaker>::default());
         if let Err(e) = res {
             *live.lock().unwrap_or_else(|p| p.into_inner()) = json!({"closed": format!("could not start: {e}")});
         }
         done.store(true, Ordering::Relaxed);
-        eprintln!("renter: rental with {} ended", hex::encode(hasher_key.serialize()));
+        eprintln!("hashtaker: rental with {} ended", hex::encode(hashmaker_key.serialize()));
     });
     (200, json!({"ok": true, "rental": id}))
 }

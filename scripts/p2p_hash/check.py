@@ -22,11 +22,11 @@ def check(name, ok, saw):
 h, b, p = load("paid", "hasher"), load("paid", "buyer"), load("paid", "pool")
 paid = h["paid"]
 check("receipts: slices paid", paid >= 5 and b["released"] == paid,
-      f"hasher paid {paid}, buyer released {b['released']}, slices done {len(h['slicesDone'])}")
-check("receipts: each receipt equals the hasher's count", h["receiptsAgree"] == paid and h["receiptsDisagree"] == 0,
+      f"hashmaker paid {paid}, hashtaker released {b['released']}, slices done {len(h['slicesDone'])}")
+check("receipts: each receipt equals the hashmaker's count", h["receiptsAgree"] == paid and h["receiptsDisagree"] == 0,
       f"agree {h['receiptsAgree']}, disagree {h['receiptsDisagree']}")
-check("receipts: meters equal", h["meter"] == b["meter"], f"hasher {h['meter']}, buyer {b['meter']}")
-check("receipts: gateway credits the buyer only", list(p["users"]) == ["buyer.rented"],
+check("receipts: meters equal", h["meter"] == b["meter"], f"hashmaker {h['meter']}, hashtaker {b['meter']}")
+check("receipts: gateway credits the hashtaker only", list(p["users"]) == ["buyer.rented"],
       f"pool users {p['users']}, pool work {p['work']}, rejected {p['rejected']} {p['reasons']}")
 check("receipts: rejected shares count no work", int(h["meter"]["work"]) == h["meter"]["accepted"] * share
       and h["meter"]["rejected"] > 0, f"accepted {h['meter']['accepted']}, rejected {h['meter']['rejected']}")
@@ -44,7 +44,7 @@ check("no-hash: the rental ends and locked tickets are cancelled", b["closed"] =
 h, b, p = load("unpaid", "hasher"), load("unpaid", "buyer"), load("unpaid", "pool")
 st = h["stopped"] or {}
 past = int(st.get("work", "0")) - 4 * slice_work
-check("unpaid: the hasher stops for non-payment", st.get("reason") == "unpaid" and h["paid"] == 3,
+check("unpaid: the hashmaker stops for non-payment", st.get("reason") == "unpaid" and h["paid"] == 3,
       f"stopped: {st.get('reason')}, paid {h['paid']}")
 check("unpaid: within one slice past the unpaid slice", past < slice_work,
       f"{max(past, 0) / slice_work:.2f} slice past slice 4 (unpaid work {st.get('unpaidSlices', 0):.2f} slices)")

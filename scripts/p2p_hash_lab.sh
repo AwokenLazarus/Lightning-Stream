@@ -1,17 +1,17 @@
 #!/bin/bash
 # p2p-hash, phase 1 lab: a rental between two apps on one machine, through the shipped binary.
 #
-#     stand-in miners ---SV1--- hasher ====link (BOLT 8)==== buyer ---SV1--- stand-in pool
-#     (the hasher's LAN)        (xbt-hashlink hasher)        (xbt-hashlink buyer)  (the buyer's gateway)
+#     stand-in miners ---SV1--- hashmaker ====link (BOLT 8)==== hashtaker ---SV1--- stand-in pool
+#     (the hashmaker's LAN)        (xbt-hashlink hashmaker)        (xbt-hashlink hashtaker)  (the hashtaker's gateway)
 #
-# The stand-in pool plays the buyer's DATUM Gateway and the stand-in miners play the hasher's
+# The stand-in pool plays the hashtaker's DATUM Gateway and the stand-in miners play the hashmaker's
 # miners; their share hash is a toy (see the crate's standin module). Tickets use the lab's
-# stand-in rails: the hasher checks each released preimage against the hash the buyer locked, and
+# stand-in rails: the hashmaker checks each released preimage against the hash the hashtaker locked, and
 # no money moves. It prints PASS or FAIL for each of the plan's pass lines:
-#   receipts   every finished slice paid once, each signed receipt equal to the hasher's own count
+#   receipts   every finished slice paid once, each signed receipt equal to the hashmaker's own count
 #              of accepted work at that slice, both meters equal at the end, the gateway crediting
-#              only the buyer's user name
-#   unpaid     the buyer stops paying after slice 3: the hasher stops within one slice of work
+#              only the hashtaker's user name
+#   unpaid     the hashtaker stops paying after slice 3: the hashmaker stops within one slice of work
 #              past the unpaid slice, by the grace time, and the gateway sees no more work
 #   no-hash    the miners stop: no payment after that, the rental ends, the tickets still locked
 #              are cancelled
@@ -34,7 +34,7 @@ SLICE_WORK=$((10 * WORK_PER_SHARE))
 "$BIN" keygen "$D/hasher.key" > "$D/hasher.pub"
 "$BIN" keygen "$D/buyer.key" > /dev/null
 
-# scenario: name, buyer flags, miner rate (shares/s each), miner seconds, grace ms
+# scenario: name, hashtaker flags, miner rate (shares/s each), miner seconds, grace ms
 scenario() {
   local name=$1 extra=$2 rate=$3 secs=$4 grace=$5 pool=127.0.0.1:34920 link=127.0.0.1:34921 miners=127.0.0.1:34922
   local dir="$D/$name"
@@ -42,13 +42,13 @@ scenario() {
   "$BIN" standin-pool --listen $pool --diff $DIFF --job-ms 1000 --report "$dir/pool.json" 2> "$dir/pool.log" &
   local pool_pid=$!
   pids+=($pool_pid)
-  "$BIN" hasher --key "$D/hasher.key" --miners $miners --link $link --slice-work $SLICE_WORK --price-msat 10000 \
+  "$BIN" hashmaker --key "$D/hasher.key" --miners $miners --link $link --slice-work $SLICE_WORK --price-msat 10000 \
     --grace-ms "$grace" --report "$dir/hasher.json" 2> "$dir/hasher.log" &
   local h_pid=$!
   pids+=($h_pid)
   sleep 0.5
   # shellcheck disable=SC2086
-  "$BIN" buyer --key "$D/buyer.key" --hasher $link --hasher-key "$(cat "$D/hasher.pub")" --upstream $pool \
+  "$BIN" hashtaker --key "$D/buyer.key" --hashmaker $link --hashmaker-key "$(cat "$D/hasher.pub")" --upstream $pool \
     --user buyer.rented --slice-work $SLICE_WORK --price-msat 10000 --grace-ms "$grace" --rental "lab-$name" \
     --idle-s 4 --report "$dir/buyer.json" $extra 2> "$dir/buyer.log" &
   local b_pid=$!

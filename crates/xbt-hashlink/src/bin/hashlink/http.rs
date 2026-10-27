@@ -1,4 +1,4 @@
-//! The control page of the hasher's and the renter's services: JSON over plain HTTP, for the app
+//! The control page of the hashmaker's and the hashtaker's services: JSON over plain HTTP, for the app
 //! beside them (on loopback, or the app's own private network). With a token file, every request
 //! carries `Authorization: Bearer <token>` (the app reads the same file), so another service on that
 //! network cannot stop a rental or start one. It holds no key and moves no money by itself: renting
@@ -44,7 +44,7 @@ pub fn serve(addr: &str, token: Option<String>, h: Handler) -> Result<(), String
             let (h, token) = (h.clone(), token.clone());
             std::thread::spawn(move || {
                 let _ = c.set_read_timeout(Some(Duration::from_secs(10)));
-                let Some((method, path, body, auth)) = xbt_hashlink::hasher::read_request_auth(&mut c) else { return };
+                let Some((method, path, body, auth)) = xbt_hashlink::hashmaker::read_request_auth(&mut c) else { return };
                 let (code, v) = match &token {
                     Some(t) if auth.strip_prefix("Bearer ").map(str::trim) != Some(t.as_str()) => (401, serde_json::json!({"error": "the control token is missing or wrong"})),
                     _ => h(&method, &path, &body),

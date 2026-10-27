@@ -1,17 +1,17 @@
-//! The buyer's side: dial the hasher, open one Stratum V1 session to the buyer's own gateway for
-//! each of the hasher's miners, carry the lines both ways (the gateway credits the buyer: its
+//! The hashtaker's side: dial the hashmaker, open one Stratum V1 session to the hashtaker's own gateway for
+//! each of the hashmaker's miners, carry the lines both ways (the gateway credits the hashtaker: its
 //! user name replaces the miner's), meter the gateway's verdicts, and pay each finished slice by
 //! releasing its ticket with a signed work receipt. Two tickets are kept locked ahead.
 //!
 //! A channel's meter is let go only after its upstream session has ended and its last verdict
-//! was sent on: the buyer then says `shut`, and the hasher lets the channel go at that same
-//! point, so both count the same work to the end. When the buyer ends the rental it says how many
+//! was sent on: the hashtaker then says `shut`, and the hashmaker lets the channel go at that same
+//! point, so both count the same work to the end. When the hashtaker ends the rental it says how many
 //! slices it counted.
 
 use crate::link::{self, Sender};
 use crate::meter::{Event, Meter, Receipt};
 use crate::msg::{Msg, Terms};
-use crate::rail::{BuyerRail, SignerPayer};
+use crate::rail::{HashtakerRail, SignerPayer};
 use crate::{now_ms, sv1};
 use secp256k1::{PublicKey, SecretKey};
 use serde_json::{json, Value};
@@ -24,27 +24,27 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub struct Config {
-    /// The hasher's link address and static key (from its listing).
-    pub hasher: String,
-    pub hasher_key: PublicKey,
+    /// The hashmaker's link address and static key (from its listing).
+    pub hashmaker: String,
+    pub hashmaker_key: PublicKey,
     pub key: SecretKey,
-    /// The buyer's own gateway (Stratum V1), and the user name it credits.
+    /// The hashtaker's own gateway (Stratum V1), and the user name it credits.
     pub upstream: String,
     pub user: String,
     pub terms: Terms,
     pub rental: String,
     pub listing: String,
-    /// Lab: stop paying after this many slices (to show the hasher stopping).
+    /// Lab: stop paying after this many slices (to show the hashmaker stopping).
     pub stop_paying_after: Option<u64>,
     /// End the rental when no work has been accepted for this long.
     pub idle: Duration,
     /// End the rental after this long.
     pub duration: Option<Duration>,
     pub report: Option<PathBuf>,
-    /// Slices paid by the wallet through the hasher's gateway; without it, over the link (the
+    /// Slices paid by the wallet through the hashmaker's gateway; without it, over the link (the
     /// lab's stand-in rail).
     pub payer: Option<SignerPayer>,
-    /// How many of the hasher's miners to rent (0: as many as are free).
+    /// How many of the hashmaker's miners to rent (0: as many as are free).
     pub miners: u32,
     /// The most the rental may cost: it ends once that much is paid.
     pub budget_msat: Option<u64>,
@@ -67,7 +67,7 @@ struct St {
     done: Vec<(u128, u64)>,
     receipts: Vec<Value>,
     upstreams: HashMap<u32, TcpStream>,
-    rail: Box<dyn BuyerRail>,
+    rail: Box<dyn HashtakerRail>,
     stop_paying_after: Option<u64>,
     last_work: Instant,
     rate: Option<Value>,
@@ -176,16 +176,16 @@ fn write_report(path: &Option<PathBuf>, v: &Value) {
 
 /// Run one rental to its end and return the report. `rail` makes, releases and cancels the
 /// tickets; whatever is still locked at the end is cancelled.
-pub fn run(cfg: Config, rail: Box<dyn BuyerRail>) -> Result<Value, String> {
-    let link::Link { tx, mut rx, .. } = link::dial(&cfg.hasher, cfg.key, cfg.hasher_key).map_err(|e| e.to_string())?;
+pub fn run(cfg: Config, rail: Box<dyn HashtakerRail>) -> Result<Value, String> {
+    let link::Link { tx, mut rx, .. } = link::dial(&cfg.hashmaker, cfg.key, cfg.hashmaker_key).map_err(|e| e.to_string())?;
     tx.send(&Msg::Hello { rental: cfg.rental.clone(), listing: cfg.listing.clone(), terms: cfg.terms.clone(), miners: cfg.miners })
         .map_err(|e| e.to_string())?;
     match rx.recv().map_err(|e| e.to_string())? {
         Some(Msg::Welcome { terms_hash, .. }) if terms_hash == hex::encode(cfg.terms.hash()) => {}
-        Some(Msg::Close { reason, .. }) => return Err(format!("hasher refused: {reason}")),
+        Some(Msg::Close { reason, .. }) => return Err(format!("hashmaker refused: {reason}")),
         _ => return Err("no welcome".into()),
     }
-    eprintln!("buyer: rental {} with hasher {}", cfg.rental, cfg.hasher);
+    eprintln!("hashtaker: rental {} with hashmaker {}", cfg.rental, cfg.hashmaker);
     let st = Arc::new(Mutex::new(St {
         terms: cfg.terms.clone(),
         rental: cfg.rental.clone(),
@@ -254,9 +254,9 @@ pub fn run(cfg: Config, rail: Box<dyn BuyerRail>) -> Result<Value, String> {
             }
             let spent = g.released * g.terms.price_msat;
             let why = if cut.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
-                Some("cut by the buyer")
+                Some("cut by the hashtaker")
             } else if g.budget_msat.is_some_and(|b| spent + g.terms.price_msat > b) {
-                // the next piece could not be paid: end before the hasher does it
+                // the next piece could not be paid: end before the hashmaker does it
                 Some("budget used up")
             } else if g.last_work.elapsed() > idle {
                 Some("no accepted work")
@@ -319,7 +319,7 @@ pub fn run(cfg: Config, rail: Box<dyn BuyerRail>) -> Result<Value, String> {
             }
             Msg::Shut { chan } => {
                 // the miner is gone: close its upstream session; the channel is let go (and the
-                // hasher told) when that session's last verdict has been read
+                // hashmaker told) when that session's last verdict has been read
                 let mut g = lock(&st);
                 if let Some(u) = g.upstreams.remove(&chan) {
                     let _ = u.shutdown(std::net::Shutdown::Both);
@@ -330,8 +330,8 @@ pub fn run(cfg: Config, rail: Box<dyn BuyerRail>) -> Result<Value, String> {
                 let _ = tx.send(&Msg::Pong { n });
             }
             Msg::Close { reason, .. } => {
-                // the hasher answers our own close with one of its own: the first reason stands
-                lock(&st).closed.get_or_insert_with(|| format!("hasher closed: {reason}"));
+                // the hashmaker answers our own close with one of its own: the first reason stands
+                lock(&st).closed.get_or_insert_with(|| format!("hashmaker closed: {reason}"));
                 break;
             }
             _ => {}
@@ -381,7 +381,7 @@ fn upstream(chan: u32, u: TcpStream, st: Arc<Mutex<St>>, tx: Sender) {
         if g.closed.is_some() {
             break;
         }
-        // meter, send, then pay: the hasher reads the verdict before the payment for it
+        // meter, send, then pay: the hashmaker reads the verdict before the payment for it
         let ev = g.meter.down(chan, &v);
         if tx.send(&Msg::Down { chan, line: line.trim_end().to_string() }).is_err() {
             break;

@@ -11,7 +11,7 @@ st = h.get("stopped") or {}
 past = int(st.get("work", "0")) - (stop_after + 1) * slice_work
 out = {
     "slicesPaid": h["paid"],
-    "buyerReleased": b["released"],
+    "hashtakerReleased": b["released"],
     "receiptsAgree": h["receiptsAgree"],
     "receiptsDisagree": h["receiptsDisagree"],
     "metersEqual": h["meter"] == b["meter"],
@@ -23,7 +23,7 @@ out = {
     "poolsRestored": after.get("restored"),
 }
 out["pass"] = (
-    out["slicesPaid"] == stop_after == out["buyerReleased"] == out["receiptsAgree"]
+    out["slicesPaid"] == stop_after == out["hashtakerReleased"] == out["receiptsAgree"]
     and out["receiptsDisagree"] == 0
     and out["metersEqual"]
     and out["stopped"] == "unpaid"

@@ -1,36 +1,36 @@
 # p2p-hash: try it
 
 Rent BLAKE2b hashrate from someone, or rent yours out, paid in sats as accepted work arrives.
-The buyer's own DATUM Gateway makes the jobs. Nobody holds anyone's money. How it works:
+The hashtaker's own DATUM Gateway makes the jobs. Nobody holds anyone's money. How it works:
 [P2P-HASH.md](P2P-HASH.md).
 
 ```
-miners ──SV1──> hasher: xbt-hashlink hasher ══ encrypted link ══> buyer: xbt-hashlink buyer ──SV1──> buyer's DATUM Gateway
-                hasher: xbt-gateway (sells slices)  <── one paid request per slice ──  buyer's wallet signer
-discovery: the hasher's signed listing on Nostr relays
+miners ──SV1──> hashmaker: xbt-hashlink hashmaker ══ encrypted link ══> hashtaker: xbt-hashlink hashtaker ──SV1──> hashtaker's DATUM Gateway
+                hashmaker: xbt-gateway (sells slices)  <── one paid request per slice ──  hashtaker's wallet signer
+discovery: the hashmaker's signed listing on Nostr relays
 ```
 
-This is command-line software that has run between two machines on one LAN, with a private relay.
-There are no app screens for it yet. Use small amounts.
+This page is the command line, which has run between two machines on one LAN with a private relay.
+The Umbrel app has screens for the same thing (Sell → Hashrate, and Rent hashrate). Use small amounts.
 
 ## What happened when we ran it
 
-A BLAKE2b ASIC on stock firmware rented into a real DATUM Gateway, with the hasher and the buyer on
+A BLAKE2b ASIC on stock firmware rented into a real DATUM Gateway, with the hashmaker and the hashtaker on
 two machines and the payments over the public XBT Lightning network:
 - 129 shares accepted, 0 rejected;
-- 14 slices paid, and all 14 signed work receipts matched the hasher's own count;
+- 14 slices paid, and all 14 signed work receipts matched the hashmaker's own count;
 - two 546-sat tickets paid, 4 sats of routing fees in all;
-- when the buyer stopped paying, the hasher cut the miner off about 1.1 slices later (41 s), and
+- when the hashtaker stopped paying, the hashmaker cut the miner off about 1.1 slices later (41 s), and
   the miner fell back to its own pool.
 
 ## What you need
 
-| | Hasher | Buyer |
+| | Hashmaker | Hashtaker |
 |---|---|---|
-| Lightning | a Lightning Fork (lnd-family) node with inbound capacity | a Lightning Fork node with a route to the hasher's |
+| Lightning | a Lightning Fork (lnd-family) node with inbound capacity | a Lightning Fork node with a route to the hashmaker's |
 | Mining | a BLAKE2b miner that can point at a Stratum V1 address | a DATUM Gateway (or any SV1 pool endpoint) and a user name on it |
 | Software | `xbt-hashlink`, `xbt-gateway`, a TLS front | `xbt-hashlink`, the wallet signer (`xbt-signer`) |
-| Network | one port for miners (LAN), one for the link and one https port, both reachable by the buyer | reaches the hasher's link and https ports |
+| Network | one port for miners (LAN), one for the link and one https port, both reachable by the hashtaker | reaches the hashmaker's link and https ports |
 
 Build (Rust 1.90 or newer):
 
@@ -41,12 +41,12 @@ cargo build --release -p xbt-hashlink -p xbt-gateway -p xbt-signer
 Each side makes its keys once:
 
 ```
-target/release/xbt-hashlink keygen hasher.key     # the hasher's link key; prints its public key
-target/release/xbt-hashlink keygen nostr.key      # the hasher's Nostr key
-target/release/xbt-hashlink keygen buyer.key      # the buyer's link key
+target/release/xbt-hashlink keygen hashmaker.key     # the hashmaker's link key; prints its public key
+target/release/xbt-hashlink keygen nostr.key      # the hashmaker's Nostr key
+target/release/xbt-hashlink keygen hashtaker.key      # the hashtaker's link key
 ```
 
-## Hasher
+## Hashmaker
 
 1. **A narrow node key.** Bake macaroons that can only make and read invoices, and read node info:
 
@@ -95,12 +95,12 @@ target/release/xbt-hashlink keygen buyer.key      # the buyer's link key
    python3 scripts/p2p_hash/tls_front.py HASHER_HOST:34942 127.0.0.1:34941 front.crt front.key
    ```
 
-   With a self-signed certificate, give the buyer its SHA-256 for the pin (step 1 of Buyer).
+   With a self-signed certificate, give the hashtaker its SHA-256 for the pin (step 1 of Hashtaker).
 
-4. **The hasher's side of the link**, publishing its listing first:
+4. **The hashmaker's side of the link**, publishing its listing first:
 
    ```
-   target/release/xbt-hashlink hasher --key hasher.key \
+   target/release/xbt-hashlink hashmaker --key hashmaker.key \
      --miners 0.0.0.0:34930 --link 0.0.0.0:34944 --slices 127.0.0.1:34943 \
      --slice-work 140737488355328 --price-msat 40000 --grace-ms 45000 \
      --relays wss://relay.example --nostr-key nostr.key --name "my hashrate" \
@@ -111,16 +111,16 @@ target/release/xbt-hashlink keygen buyer.key      # the buyer's link key
    - `--slice-work` is the work in a slice, in hashes. A share at difficulty `d` is `d × 2^32`
      hashes, so 140737488355328 is 8 shares at difficulty 4096: about 34 s of a 4.1 TH/s miner.
    - `--slices` is where the gateway's paid requests arrive (the route's upstream above). The
-     hasher answers 200 only for a slice its own meter counted, so nothing else is charged.
+     hashmaker answers 200 only for a slice its own meter counted, so nothing else is charged.
    - `--relays` takes `wss://` relays. Plain `ws://` is accepted only on loopback.
 
 5. **Point the miners** at `stratum+tcp://HASHER_HOST:34930`. Keep the usual pool as the fallback
-   pool: when payments stop, the hasher closes the miners' sessions and they fail over to it.
+   pool: when payments stop, the hashmaker closes the miners' sessions and they fail over to it.
 
-## Buyer
+## Hashtaker
 
-1. **Allow the hasher in the wallet's policy** (the signer's `policy.json`; see
-   [TICKETS.md](TICKETS.md) for the whole policy). Add the hasher's https origin, tie it to its
+1. **Allow the hashmaker in the wallet's policy** (the signer's `policy.json`; see
+   [TICKETS.md](TICKETS.md) for the whole policy). Add the hashmaker's https origin, tie it to its
    node, pin its certificate when it is self-signed, and give the rentals a task budget:
 
    ```json
@@ -135,10 +135,10 @@ target/release/xbt-hashlink keygen buyer.key      # the buyer's link key
 
    Merge these into the existing policy and keep its other caps. Restart the signer.
 
-2. **Find the hasher and rent:**
+2. **Find the hashmaker and rent:**
 
    ```
-   target/release/xbt-hashlink buyer --key buyer.key \
+   target/release/xbt-hashlink hashtaker --key hashtaker.key \
      --find wss://relay.example --expect-node HASHER_NODE_ID --max-price-msat 40000 \
      --upstream 127.0.0.1:23334 --user YOUR_GATEWAY_USER \
      --signer /path/to/signer.sock --task hashrate --max-sats 2000 \
@@ -146,16 +146,16 @@ target/release/xbt-hashlink keygen buyer.key      # the buyer's link key
    ```
 
    - `--find` reads signed hashrate listings from the relays and keeps one only if its
-     signatures and its binding to the hasher's link key hold. `--expect-node` and
+     signatures and its binding to the hashmaker's link key hold. `--expect-node` and
      `--max-price-msat` narrow the choice.
-   - `--upstream` and `--user` are the buyer's DATUM Gateway and the user it credits.
-   - Payment: each finished slice is one paid request to the hasher's gateway, through the
+   - `--upstream` and `--user` are the hashtaker's DATUM Gateway and the user it credits.
+   - Payment: each finished slice is one paid request to the hashmaker's gateway, through the
      wallet signer, under the task's budget and the policy's caps.
-   - `--stop-paying-after N` stops paying after N slices, to see the hasher stop.
+   - `--stop-paying-after N` stops paying after N slices, to see the hashmaker stop.
 
 ## Your DATUM Gateway
 
-Rented hashrate goes to the buyer's own DATUM Gateway: it builds the block templates, and the pool
+Rented hashrate goes to the hashtaker's own DATUM Gateway: it builds the block templates, and the pool
 that pays you is chosen in its own settings, not in Lightning Stream. If you do not run one yet,
 set one up first: a DATUM Gateway built for this chain's BLAKE2b work, pointed at a pool that takes
 DATUM work. For example Lazarus Pool: its site, lazarus-xbt.xyz, says which gateway to run and the
@@ -163,28 +163,28 @@ pool address to put in its settings. Do not point rentals at a
 pool's public stratum port in place of a DATUM Gateway: you would be paying for work credited to
 whoever that port pays.
 
-Then give the buyer side its address: `--upstream host:port` on the command line, or the "Your
+Then give the hashtaker side its address: `--upstream host:port` on the command line, or the "Your
 DATUM Gateway" box on the app's Hashrate page.
 
 ## Renting out several miners, with a fallback
 
-With `--fallback host:port` (or a settings file, `--config`), the hasher keeps serving: every miner
-nobody rents hashes there, buyers rent whole miners (`--miners N` on the buyer), and when a rental
+With `--fallback host:port` (or a settings file, `--config`), the hashmaker keeps serving: every miner
+nobody rents hashes there, hashtakers rent whole miners (`--miners N` on the hashtaker), and when a rental
 ends its miners go back to the fallback by themselves. `--rentable N` caps how many miners are
-rented out at once. See [P2P-HASH.md](P2P-HASH.md#the-fallback-pool-and-several-renters).
+rented out at once. See [P2P-HASH.md](P2P-HASH.md#the-fallback-pool-and-several-hashtakers).
 
 ## What each side sees, and stopping
 
 - `buyer.json` and `hasher.json`: accepted and rejected shares, the work counted, each slice and
   its payment, and why the rental ended.
-- The hasher stops serving when a finished slice is not paid within `--grace-ms`, or as soon as
-  a second slice finishes unpaid. The buyer stops paying when no accepted work arrives (`--idle-s`)
+- The hashmaker stops serving when a finished slice is not paid within `--grace-ms`, or as soon as
+  a second slice finishes unpaid. The hashtaker stops paying when no accepted work arrives (`--idle-s`)
   or at `--duration-s`.
 
 ## Known limits
 
 - **Prepaid credit on short rentals.** A ticket is at least 546 sats. A rental shorter than a
-  ticket's worth of slices leaves the rest as prepaid credit with the hasher.
+  ticket's worth of slices leaves the rest as prepaid credit with the hashmaker.
 - **App screens are in the Umbrel app only, and not released yet.** Elsewhere it is command line.
 - **Tested narrowly.** Two machines on one LAN, a private relay, one miner.
 - **One key question is open:** the link is signed with an app key bound to the listing, not
@@ -199,13 +199,13 @@ rented out at once. See [P2P-HASH.md](P2P-HASH.md#the-fallback-pool-and-several-
   saves and restores the miner's pools.
 - `scripts/p2p_hash_rehearsal.sh`: the two-machine run above. It reads its settings from an env
   file (`CONF`, default `run/p2p-hash/rehearsal/rehearsal.env`, not in the tree). Its variables:
-  - hasher machine: `HASHER_SSH` (ssh target), `HASHER_DIR` (its binaries, keys and gateway
+  - hashmaker machine: `HASHER_SSH` (ssh target), `HASHER_DIR` (its binaries, keys and gateway
     config), `HASHER_IP`, and the ports `MINERS_PORT`, `LINK_PORT`, `FRONT_PORT`, `GW_PORT`,
     `SLICES_PORT`;
-  - discovery: `RELAY_LISTEN` (a stand-in relay on the buyer's loopback, reached by the hasher
+  - discovery: `RELAY_LISTEN` (a stand-in relay on the hashtaker's loopback, reached by the hashmaker
     through an ssh tunnel), `LISTING_NAME`, `HASHRATE_HS`;
-  - buyer: `GATEWAY` and `GW_USER` (the DATUM Gateway and its user), `SIGNER_SOCK`, `TASK`,
-    `MAX_SATS`, `BUYER_KEY`, `PAY_NODE` (the hasher's node id);
+  - hashtaker: `GATEWAY` and `GW_USER` (the DATUM Gateway and its user), `SIGNER_SOCK`, `TASK`,
+    `MAX_SATS`, `BUYER_KEY`, `PAY_NODE` (the hashmaker's node id);
   - terms: `SLICE_WORK`, `PRICE_MSAT`, `GRACE_MS`, `STOP_PAYING_AFTER`, `MINUTES`;
   - evidence: `BUYER_LNCLI` and `SELLER_LNCLI` (lncli commands for each node).
 

@@ -7,7 +7,7 @@ import json
 import sys
 from pathlib import Path
 
-d, t0, slice_work, stop_after, hasher_ip, miner_ip = Path(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sys.argv[6]
+d, t0, slice_work, stop_after, hashmaker_ip, miner_ip = Path(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sys.argv[6]
 
 
 def load(p, default=None):
@@ -25,10 +25,10 @@ def hexhash(h):
     return base64.b64decode(h).hex()
 
 
-h = load("hasher/hasher.json", {})
+h = load("hashmaker/hasher.json", {})
 b = load("buyer.json", {})
 found = load("found.json", {})
-pays = load("buyer-payments.json", {}).get("payments", [])
+pays = load("hashtaker-payments.json", {}).get("payments", [])
 invs = load("seller-invoices.json", {}).get("invoices", [])
 after = load("pools-after.json", {})
 
@@ -48,12 +48,12 @@ def conns(name, ports):
 
 
 route = {
-    "miner -> hasher": [e.get("peer") for e in h.get("events", []) if e.get("ev") == "miner"],
-    "hasher's link peer (buyer key)": h.get("buyer"),
+    "miner -> hashmaker": [e.get("peer") for e in h.get("events", []) if e.get("ev") == "miner"],
+    "hashmaker's link peer (hashtaker key)": h.get("buyer"),
     "listing found": {k: found.get(k) for k in ("event", "author", "refused")} | {"link": (found.get("listing") or {}).get("link")},
-    "buyer -> gateway (upstream sessions opened)": [e for e in b.get("events", []) if e.get("ev") == "open"],
-    "connections on the hasher": conns("connections-hasher.txt", [":" + p for p in ("34930", "34944", "34942", "23334")]),
-    "connections on the buyer": conns("connections-buyer.txt", [hasher_ip]),
+    "hashtaker -> gateway (upstream sessions opened)": [e for e in b.get("events", []) if e.get("ev") == "open"],
+    "connections on the hashmaker": conns("connections-hasher.txt", [":" + p for p in ("34930", "34944", "34942", "23334")]),
+    "connections on the hashtaker": conns("connections-buyer.txt", [hashmaker_ip]),
 }
 slices = [
     {"slice": p["slice"], "ok": p.get("ok"), "ms": p.get("ms"), "charged_sats": (p.get("wallet") or {}).get("charged_sats"),
@@ -72,7 +72,7 @@ invoices = [{"hash": hexhash(i.get("r_hash")), "state": i.get("state"), "value_s
              "memo": i.get("memo")} for i in new_invs]
 out = {
     "route": route,
-    "slicesPaidByHasherCount": h.get("paid"),
+    "slicesPaidByHashmakerCount": h.get("paid"),
     "receiptsAgree": h.get("receiptsAgree"),
     "receiptsDisagree": h.get("receiptsDisagree"),
     "metersEqual": h.get("meter") == b.get("meter"),
@@ -80,12 +80,12 @@ out = {
     "minerMethods": h.get("methods"),
     "slices": slices,
     "chargedSats": sum(int(s["charged_sats"] or 0) for s in slices if s["ok"]),
-    "buyerNodePayments": payments,
+    "hashtakerNodePayments": payments,
     "feesMsat": sum(int(p["fee_msat"] or 0) for p in payments if p["status"] == "SUCCEEDED"),
     "sellerNodeInvoices": invoices,
     "stop": {"reason": st.get("reason"), "paid": st.get("paid"), "slicesPastUnpaid": max(int(st.get("work", "0")) - (stop_after + 1) * slice_work, 0) / slice_work,
              "msAfterUnpaidSliceDone": (st.get("atMs", 0) - unpaid_slice_done) if unpaid_slice_done else None},
-    "buyerClosed": b.get("closed"),
+    "hashtakerClosed": b.get("closed"),
     "walletSessionStop": [e for e in b.get("events", []) if e.get("ev") == "wallet session stopped"],
     "poolsRestored": after.get("restored"),
     "minerIp": miner_ip,

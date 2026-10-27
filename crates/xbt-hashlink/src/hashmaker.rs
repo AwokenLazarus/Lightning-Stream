@@ -1,9 +1,9 @@
-//! The hasher's side: a Stratum V1 endpoint for the hasher's miners, and any number of rentals.
+//! The hashmaker's side: a Stratum V1 endpoint for the hashmaker's miners, and any number of rentals.
 //!
-//! Every miner the hasher's app serves is a unit, named by its worker name (`mining.authorize`).
-//! A miner not in a rental hashes for the hasher's own pool or DATUM Gateway, the fallback: the
-//! hasher points each miner at the app once and never changes its settings again. A rental takes
-//! whole miners, so four miners can go to four buyers, two to each of two, or three to one buyer
+//! Every miner the hashmaker's app serves is a unit, named by its worker name (`mining.authorize`).
+//! A miner not in a rental hashes for the hashmaker's own pool or DATUM Gateway, the fallback: the
+//! hashmaker points each miner at the app once and never changes its settings again. A rental takes
+//! whole miners, so four miners can go to four hashtakers, two to each of two, or three to one hashtaker
 //! while the fourth stays on the fallback. Each rental has its own link, meter, receipts and
 //! tickets; when one ends, for whatever reason, only its miners go back to the fallback.
 //!
@@ -15,10 +15,10 @@
 //! * any other miner is asked to connect again (`client.reconnect` to the app's own address) and
 //!   placed by its worker name when it does.
 //!
-//! Within a rental the hasher meters the buyer's verdicts itself, takes a locked ticket before
+//! Within a rental the hashmaker meters the hashtaker's verdicts itself, takes a locked ticket before
 //! serving a slice (the lab's rail over the link), and ends the rental when a finished slice is
-//! not paid within the grace time, or as soon as a second slice finishes unpaid. When the buyer
-//! ends it, the buyer says how many slices it counted, and only slices both sides counted are
+//! not paid within the grace time, or as soon as a second slice finishes unpaid. When the hashtaker
+//! ends it, the hashtaker says how many slices it counted, and only slices both sides counted are
 //! billed.
 
 use crate::link::{self, Sender};
@@ -38,19 +38,19 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub struct Config {
-    /// Where the hasher's miners connect (Stratum V1, the hasher's LAN).
+    /// Where the hashmaker's miners connect (Stratum V1, the hashmaker's LAN).
     pub miners: String,
-    /// Where buyers' apps connect (the link).
+    /// Where hashtakers' apps connect (the link).
     pub link: String,
     pub key: SecretKey,
     pub terms: Terms,
     /// A JSON report, rewritten every second and at the end.
     pub report: Option<PathBuf>,
-    /// Where the hasher's gateway passes on paid slices (`POST <route>/<rental>/<slice>`). With
+    /// Where the hashmaker's gateway passes on paid slices (`POST <route>/<rental>/<slice>`). With
     /// it, slices are paid through the gateway's tickets; without it, over the link (the lab's
     /// stand-in rail), and a rental is served only once its first ticket is locked.
     pub slices: Option<String>,
-    /// The hasher's own pool or DATUM Gateway (Stratum V1): every miner not in a rental hashes
+    /// The hashmaker's own pool or DATUM Gateway (Stratum V1): every miner not in a rental hashes
     /// there. Without one (the lab), a miner waits for a rental and is let go when it ends.
     pub fallback: Option<String>,
     /// At most this many miners rented out at once (`None`: all of them).
@@ -144,12 +144,12 @@ impl Unit {
 struct Rental {
     terms: Terms,
     id: String,
-    buyer: PublicKey,
+    hashtaker: PublicKey,
     tx: Sender,
     /// Miners asked for (0: as many as are free).
     want: u32,
     units: BTreeSet<String>,
-    /// Channel → (connection, slot) for every miner session of this rental, until the buyer's
+    /// Channel → (connection, slot) for every miner session of this rental, until the hashtaker's
     /// `shut` for it (its last verdict).
     chans: HashMap<u32, (u64, u64)>,
     chan_unit: HashMap<u32, String>,
@@ -166,7 +166,7 @@ struct Rental {
     lock_missing_since: Option<Instant>,
     /// Miners are served (with the lab's rail, once the first ticket is locked).
     ready: bool,
-    /// The buyer ended it: billed are the slices both sides counted; payments for them may still
+    /// The hashtaker ended it: billed are the slices both sides counted; payments for them may still
     /// arrive until the deadline.
     closing: Option<(Instant, u64, String)>,
     stopped: Option<Value>,
@@ -214,7 +214,7 @@ impl Rental {
 
     fn report(&self) -> Value {
         json!({
-            "role": "hasher", "rental": self.id, "buyer": hex::encode(self.buyer.serialize()),
+            "role": "hasher", "rental": self.id, "buyer": hex::encode(self.hashtaker.serialize()),
             "terms": self.terms.to_json(), "meter": self.meter.to_json(),
             "miners": self.units.iter().collect::<Vec<_>>(), "want": self.want, "startedMs": self.started_ms,
             "unitWork": self.unit_work.iter().map(|(u, w)| (u.clone(), Value::from(w.to_string()))).collect::<serde_json::Map<_, _>>(),
@@ -231,7 +231,7 @@ struct Hub {
     terms: Terms,
     fallback: Option<String>,
     rentable: Option<u32>,
-    /// Rentals are taken (off: miners all hash for the fallback, new buyers are told so).
+    /// Rentals are taken (off: miners all hash for the fallback, new hashtakers are told so).
     open: bool,
     over_link: bool,
     units: BTreeMap<String, Unit>,
@@ -369,16 +369,16 @@ impl Hub {
     }
 }
 
-/// The hasher's app: running until [`Hasher::shutdown`].
-pub struct Hasher {
+/// The hashmaker's app: running until [`Hashmaker::shutdown`].
+pub struct Hashmaker {
     hub: Shared,
     report: Option<PathBuf>,
     down: Arc<AtomicBool>,
 }
 
-impl Hasher {
-    /// Listen for miners, buyers and (with `slices`) paid slices, and serve until shut down.
-    pub fn start(cfg: Config, rails: Rails) -> Result<Hasher, String> {
+impl Hashmaker {
+    /// Listen for miners, hashtakers and (with `slices`) paid slices, and serve until shut down.
+    pub fn start(cfg: Config, rails: Rails) -> Result<Hashmaker, String> {
         let link_l = TcpListener::bind(&cfg.link).map_err(|e| format!("link listen {}: {e}", cfg.link))?;
         let miners_l = TcpListener::bind(&cfg.miners).map_err(|e| format!("miner listen {}: {e}", cfg.miners))?;
         let slices_l = match &cfg.slices {
@@ -386,7 +386,7 @@ impl Hasher {
             None => None,
         };
         eprintln!(
-            "hasher: link {} (key {}), miners {}, fallback {}",
+            "hashmaker: link {} (key {}), miners {}, fallback {}",
             cfg.link,
             hex::encode(PublicKey::from_secret_key(secp256k1::SECP256K1, &cfg.key).serialize()),
             cfg.miners,
@@ -435,7 +435,7 @@ impl Hasher {
                     }
                     let Ok(s) = s else { continue };
                     let h = h.clone();
-                    std::thread::spawn(move || serve_buyer(s, key, h));
+                    std::thread::spawn(move || serve_hashtaker(s, key, h));
                 }
             });
         }
@@ -443,7 +443,7 @@ impl Hasher {
             let (h, d, report) = (hub.clone(), down.clone(), cfg.report.clone());
             std::thread::spawn(move || ticker(h, d, report));
         }
-        Ok(Hasher { hub, report: cfg.report, down })
+        Ok(Hashmaker { hub, report: cfg.report, down })
     }
 
     /// Everything: the miners, the rentals going on and the last ones that ended.
@@ -455,13 +455,13 @@ impl Hasher {
         lock(&self.hub).capacity()
     }
 
-    /// End a rental now, as the hasher (the buyer is told; its miners go back to the fallback).
+    /// End a rental now, as the hashmaker (the hashtaker is told; its miners go back to the fallback).
     pub fn stop_rental(&self, id: &str) -> bool {
         let mut g = lock(&self.hub);
         if !g.rentals.contains_key(id) {
             return false;
         }
-        g.finish(id, "stopped by the hasher", true);
+        g.finish(id, "stopped by the hashmaker", true);
         true
     }
 
@@ -485,7 +485,7 @@ impl Hasher {
         if !open {
             let ids: Vec<String> = g.rentals.keys().cloned().collect();
             for id in ids {
-                g.finish(&id, "the hasher stopped renting", true);
+                g.finish(&id, "the hashmaker stopped renting", true);
             }
         }
     }
@@ -514,7 +514,7 @@ impl Hasher {
         g.shutdown = true;
         let ids: Vec<String> = g.rentals.keys().cloned().collect();
         for id in ids {
-            g.finish(&id, "the hasher's app stopped", true);
+            g.finish(&id, "the hashmaker's app stopped", true);
         }
         for (_, c) in g.conns.drain() {
             let _ = c.w.shutdown(std::net::Shutdown::Both);
@@ -528,12 +528,12 @@ impl Hasher {
     }
 }
 
-/// Serve one rental: wait for the first buyer, serve the miners until that rental ends, and
+/// Serve one rental: wait for the first hashtaker, serve the miners until that rental ends, and
 /// return its report (the lab's single rental, without a fallback).
 pub fn run(cfg: Config, rail: Box<dyn SellerRail>) -> Result<Value, String> {
     let mut first = Some(rail);
     let report = cfg.report.clone();
-    let h = Hasher::start(cfg, Box::new(move || first.take().unwrap_or_else(|| Box::<crate::rail::LabSeller>::default())))?;
+    let h = Hashmaker::start(cfg, Box::new(move || first.take().unwrap_or_else(|| Box::<crate::rail::LabSeller>::default())))?;
     let r = loop {
         if let Some(r) = h.finished().into_iter().next() {
             break r;
@@ -574,21 +574,21 @@ fn status(g: &Hub) -> Value {
     })
 }
 
-// --- buyers ------------------------------------------------------------------------------------
+// --- hashtakers ------------------------------------------------------------------------------------
 
-fn serve_buyer(s: TcpStream, key: SecretKey, hub: Shared) {
+fn serve_hashtaker(s: TcpStream, key: SecretKey, hub: Shared) {
     let Ok(link::Link { tx, mut rx, remote }) = link::answer(s, key) else { return };
     let (id, want, terms) = match rx.recv() {
         Ok(Some(Msg::Hello { rental, terms, miners, .. })) => {
             let g = lock(&hub);
             let why = if !g.open {
-                Some("this hasher is not renting out miners now".to_string())
+                Some("this hashmaker is not renting out miners now".to_string())
             } else if terms != g.terms {
                 Some("terms differ from the listing".to_string())
             } else if g.rentals.contains_key(&rental) || g.finished.iter().any(|f| f["rental"] == rental.as_str()) {
                 Some("that rental id is taken".to_string())
             } else {
-                // a hasher whose miners are all rented says so; one with no miners yet waits
+                // a hashmaker whose miners are all rented says so; one with no miners yet waits
                 let c = g.capacity();
                 (c.miners > 0 && c.free_miners == 0).then(|| "no miners free now".to_string())
             };
@@ -607,7 +607,7 @@ fn serve_buyer(s: TcpStream, key: SecretKey, hub: Shared) {
     if tx.send(&Msg::Welcome { rental: id.clone(), terms_hash: hex::encode(terms.hash()) }).is_err() {
         return;
     }
-    eprintln!("hasher: rental {id} from buyer {} ({} miners asked)", hex::encode(remote.serialize()), if want == 0 { "any".into() } else { want.to_string() });
+    eprintln!("hashmaker: rental {id} from hashtaker {} ({} miners asked)", hex::encode(remote.serialize()), if want == 0 { "any".into() } else { want.to_string() });
     {
         let mut g = lock(&hub);
         let rail = (g.rails)();
@@ -615,7 +615,7 @@ fn serve_buyer(s: TcpStream, key: SecretKey, hub: Shared) {
         g.rentals.insert(id.clone(), Rental {
             terms,
             id: id.clone(),
-            buyer: remote,
+            hashtaker: remote,
             tx: tx.clone(),
             want,
             units: BTreeSet::new(),
@@ -709,7 +709,7 @@ fn serve_buyer(s: TcpStream, key: SecretKey, hub: Shared) {
                 r.note(json!({"ev": "pay", "slice": slice, "ok": ok.is_ok(), "why": ok.as_ref().err(), "atMs": now_ms()}));
             }
             Msg::Shut { chan } => {
-                // the buyer's last verdict for this channel has been read: both meters let it go here
+                // the hashtaker's last verdict for this channel has been read: both meters let it go here
                 r.meter.close(chan);
                 r.chan_unit.remove(&chan);
                 if let Some((conn, slot)) = r.chans.remove(&chan) {
@@ -722,9 +722,9 @@ fn serve_buyer(s: TcpStream, key: SecretKey, hub: Shared) {
             Msg::Close { reason, slices } => {
                 // only slices both sides counted are billed; payments for them may still be on the way
                 let billable = slices.map(|n| n.min(r.done.len() as u64)).unwrap_or(r.paid);
-                r.note(json!({"ev": "buyer closed", "reason": reason, "buyerSlices": slices, "billable": billable, "atMs": now_ms()}));
+                r.note(json!({"ev": "hashtaker closed", "reason": reason, "hashtakerSlices": slices, "billable": billable, "atMs": now_ms()}));
                 let grace = Duration::from_millis(r.terms.grace_ms);
-                r.closing = Some((Instant::now() + grace, billable, format!("buyer closed: {reason}")));
+                r.closing = Some((Instant::now() + grace, billable, format!("hashtaker closed: {reason}")));
                 r.due_since = None;
                 let units: Vec<String> = r.units.iter().cloned().collect();
                 for u in units {
@@ -762,7 +762,7 @@ fn check_receipt(r: &Rental, slice: u64, receipt: &Value) -> Result<(), String> 
     if slice != r.paid + 1 {
         return Err(format!("expected slice {}", r.paid + 1));
     }
-    let rc = Receipt::verify(receipt, &r.buyer).ok_or("bad receipt signature")?;
+    let rc = Receipt::verify(receipt, &r.hashtaker).ok_or("bad receipt signature")?;
     if rc.rental != r.id || rc.slice != slice {
         return Err("receipt for another rental or slice".into());
     }
@@ -771,7 +771,7 @@ fn check_receipt(r: &Rental, slice: u64, receipt: &Value) -> Result<(), String> 
     }
     if let Some((_, billable, _)) = &r.closing {
         if slice > *billable {
-            return Err(format!("slice {slice} is past the {billable} the buyer counted"));
+            return Err(format!("slice {slice} is past the {billable} the hashtaker counted"));
         }
     }
     Ok(())
@@ -1091,7 +1091,7 @@ fn gone(g: &mut Hub, id: u64) {
                 let _ = w.shutdown(std::net::Shutdown::Both);
             }
             SlotKind::Rental { rental, chan } => {
-                // the buyer closes its upstream and answers with its own `shut` (its last verdict)
+                // the hashtaker closes its upstream and answers with its own `shut` (its last verdict)
                 if let Some(r) = g.rentals.get_mut(&rental) {
                     r.chans.remove(&chan);
                     let _ = r.tx.send(&Msg::Shut { chan });
@@ -1128,7 +1128,7 @@ fn release_slot(g: &mut Hub, id: u64, slot: u64) {
         SlotKind::Rental { rental, chan } => {
             let (rental, chan) = (rental.clone(), *chan);
             c.slots.remove(&slot);
-            // the buyer closes that upstream and answers with its own `shut`: the channel's
+            // the hashtaker closes that upstream and answers with its own `shut`: the channel's
             // verdicts until then still count for the rental, and reach no miner
             if let Some(r) = g.rentals.get_mut(&rental) {
                 r.chans.remove(&chan);
@@ -1287,7 +1287,7 @@ fn attach(hub: &Shared, id: u64, rental: Option<String>, replay: bool) -> bool {
             match TcpStream::connect(&addr) {
                 Ok(s) => Some(s),
                 Err(e) => {
-                    eprintln!("hasher: fallback {addr}: {e}");
+                    eprintln!("hashmaker: fallback {addr}: {e}");
                     return false;
                 }
             }
@@ -1413,11 +1413,11 @@ fn fallback_reader(s: TcpStream, hub: Shared, id: u64, slot: u64) {
     drop_slot(&mut g, id, slot);
 }
 
-// --- paid slices (behind the hasher's gateway) ---------------------------------------------------
+// --- paid slices (behind the hashmaker's gateway) ---------------------------------------------------
 
-/// The hasher's paid-slice endpoint, behind its gateway: the gateway passes on only a request it
+/// The hashmaker's paid-slice endpoint, behind its gateway: the gateway passes on only a request it
 /// has been paid for, and charges it only when this answers below 400. So a slice is credited
-/// here exactly when its price was taken: the body is the buyer's signed work receipt for it.
+/// here exactly when its price was taken: the body is the hashtaker's signed work receipt for it.
 fn serve_slices(l: TcpListener, hub: Shared, down: Arc<AtomicBool>) {
     for conn in l.incoming() {
         if down.load(Ordering::Relaxed) {

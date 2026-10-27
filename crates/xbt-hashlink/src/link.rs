@@ -64,15 +64,15 @@ fn split(stream: TcpStream, t: noise::Transport) -> Result<Link, Error> {
     })
 }
 
-/// The buyer's side: connect to the hasher, whose static key is known.
-pub fn dial(addr: &str, me: SecretKey, hasher: PublicKey) -> Result<Link, Error> {
+/// The hashtaker's side: connect to the hashmaker, whose static key is known.
+pub fn dial(addr: &str, me: SecretKey, hashmaker: PublicKey) -> Result<Link, Error> {
     let mut s = TcpStream::connect(addr)?;
     s.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
-    let t = noise::connect(&mut s, noise::PROLOGUE, me, hasher)?;
+    let t = noise::connect(&mut s, noise::PROLOGUE, me, hashmaker)?;
     split(s, t)
 }
 
-/// The hasher's side: complete the handshake on an accepted stream.
+/// The hashmaker's side: complete the handshake on an accepted stream.
 pub fn answer(mut s: TcpStream, me: SecretKey) -> Result<Link, Error> {
     s.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
     let t = noise::accept(&mut s, noise::PROLOGUE, me)?;

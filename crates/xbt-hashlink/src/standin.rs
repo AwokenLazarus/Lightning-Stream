@@ -5,7 +5,7 @@
 //! `job|extranonce1|extranonce2|ntime|nonce`, and difficulty 1 is a hash under 2^240 (65536
 //! tries on average), so a CPU finds shares at any difficulty the lab picks. The pool checks
 //! every share (known job, authorized user, no repeat, the hash under the target) and keeps its
-//! own count of accepted work, a third witness beside the hasher's and the buyer's meters.
+//! own count of accepted work, a third witness beside the hashmaker's and the hashtaker's meters.
 
 use crate::meter::share_work;
 use crate::{now_ms, sv1};

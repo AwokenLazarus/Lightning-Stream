@@ -2,30 +2,30 @@
 //!
 //! | `t` | From | Meaning |
 //! |---|---|---|
-//! | `hello` | buyer | version, rental id, listing id, terms, how many miners (0: as many as are free) |
-//! | `welcome` | hasher | the terms are accepted; their hash |
-//! | `open` | hasher | a miner connected: channel id and its worker name |
-//! | `up` | hasher | a Stratum V1 line from that miner (subscribe, authorize, submit: the shares) |
-//! | `down` | buyer | a Stratum V1 line from the buyer's gateway (notify, set_difficulty: the jobs; the results of submits: the gateway's verdicts) |
+//! | `hello` | hashtaker | version, rental id, listing id, terms, how many miners (0: as many as are free) |
+//! | `welcome` | hashmaker | the terms are accepted; their hash |
+//! | `open` | hashmaker | a miner connected: channel id and its worker name |
+//! | `up` | hashmaker | a Stratum V1 line from that miner (subscribe, authorize, submit: the shares) |
+//! | `down` | hashtaker | a Stratum V1 line from the hashtaker's gateway (notify, set_difficulty: the jobs; the results of submits: the gateway's verdicts) |
 //! | `shut` | either | a channel ended |
-//! | `lock` | buyer | the ticket for a slice is locked: its payment hash |
-//! | `pay` | buyer | a slice is done: the ticket's preimage and the signed work receipt |
-//! | `rate` | hasher | hashrate report |
+//! | `lock` | hashtaker | the ticket for a slice is locked: its payment hash |
+//! | `pay` | hashtaker | a slice is done: the ticket's preimage and the signed work receipt |
+//! | `rate` | hashmaker | hashrate report |
 //! | `ping` / `pong` | either | keepalive |
-//! | `close` | either | the rental ends, with a reason; the buyer's also says how many slices it counted |
+//! | `close` | either | the rental ends, with a reason; the hashtaker's also says how many slices it counted |
 //!
 //! Work is a decimal string (it can pass 2^53).
 
 use serde_json::{json, Value};
 
-/// The terms of a rental, as the listing states them and the buyer repeats them in `hello`.
+/// The terms of a rental, as the listing states them and the hashtaker repeats them in `hello`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Terms {
     /// Work per slice, in hashes (share difficulty × 2^32 summed over accepted shares).
     pub slice_work: u128,
     /// The price of one slice.
     pub price_msat: u64,
-    /// How long the hasher waits for a slice's payment once the slice is done.
+    /// How long the hashmaker waits for a slice's payment once the slice is done.
     pub grace_ms: u64,
 }
 
