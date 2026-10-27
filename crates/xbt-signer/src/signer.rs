@@ -460,6 +460,11 @@ impl Signer {
             "health" => json!({"ok": true, "wallet": self.node.wallet(), "chain": self.chain, "hrp": self.hrp, "mining": self.mining,
                                "implementation": "xbt-signer (Rust)", "legacy_channels": self.legacy_channels.notice()}),
             "chain_backend" => json!({"backend": "rpc"}),
+            // whether the XBT node answers now: a signer whose chain is set (B2_CHAIN) starts without it, and says so here
+            "node_status" => match node::height(&*self.node) {
+                Ok(h) => json!({"reachable": true, "chain": self.chain, "height": h}),
+                Err(e) => json!({"reachable": false, "chain": self.chain, "reason": e.msg.chars().take(200).collect::<String>()}),
+            },
             "channels" => {
                 // `channels` lists what an earlier version's on-chain channel book holds; this version adds none
                 let mut out = json!({"channels": self.legacy_channels.public(), "legacy_channels": self.legacy_channels.notice(), "height": self.height_safe()});

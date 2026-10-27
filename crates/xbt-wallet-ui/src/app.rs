@@ -726,6 +726,12 @@ impl App {
         if hot["hot_over_cap"] == true {
             b.push_str("<div class=\"flash warn\">This box holds more than you allowed: <a href=\"./keys\">move the extra to your own wallet</a>.</div>");
         }
+        // the signer runs without the XBT node, and the amounts on it wait for it
+        if self.call("node_status", json!({})).is_ok_and(|n| n["reachable"] == false) {
+            b.push_str("<div class=\"flash warn\">The app cannot reach your XBT node yet, so the amounts on it below may be out of date. \
+                        Paying over Lightning does not need it. Check that the node is running and that the app has its address and \
+                        password (on Linux: LS_NODE_RPC_* in .env).</div>");
+        }
         b.push_str("<section class=\"grid\"><div class=\"card\"><h2>Money</h2>");
         b.push_str(&kv(&[("On your node", money(int(bal.get("trusted_sats")))), ("On its way to your node", money(int(bal.get("untrusted_pending_sats")))),
                          ("On this box, for agents", money(int(hot.get("hot_sats")))),

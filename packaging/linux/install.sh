@@ -29,6 +29,8 @@ DIR=$(mkdir -p "$DIR" && cd "$DIR" && pwd)
 
 die() { echo "install: $*" >&2; exit 1; }
 say() { echo "== $*"; }
+# a value .env holds without quotes: nothing in it that Compose or the shell would read otherwise
+plain() { [[ $1 =~ ^[A-Za-z0-9_./:,@+-]*$ ]]; }
 
 # --- 1. what it needs ---------------------------------------------------------------------------------
 say "checking Docker"
@@ -115,6 +117,7 @@ if [ -z "${LS_UI_PASSWORD:-}" ]; then
   [ "$YES" = 1 ] || ask_secret LS_UI_PASSWORD "A password for the app's page (empty: a random one, saved in $DIR/.env)"
 fi
 LS_DATA_DIR=${LS_DATA_DIR:-$DIR/data}
+LS_CHAIN=${LS_CHAIN:-main}
 COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME:-lightning-stream}
 LS_UI_PORT=${LS_UI_PORT:-8482} LS_MCP_PORT=${LS_MCP_PORT:-33511} LS_CONNECTOR_PORT=${LS_CONNECTOR_PORT:-8484}
 LS_GW_PORT=${LS_GW_PORT:-8402} LS_HASHTAKER_CONTROL_PORT=${LS_HASHTAKER_CONTROL_PORT:-23343}
@@ -128,13 +131,18 @@ mkdir -p "$LS_DATA_DIR"
   umask 077
   {
     echo "# Lightning Stream: written by install.sh on $(date -u +%Y-%m-%d). It holds passwords: keep it private."
-    for k in COMPOSE_PROJECT_NAME LS_DATA_DIR LS_UI_PASSWORD LS_LND_REST LS_LND_TLS_CERT LS_NODE_RPC_HOST LS_NODE_RPC_PORT LS_NODE_RPC_USER \
+    for k in COMPOSE_PROJECT_NAME LS_DATA_DIR LS_CHAIN LS_UI_PASSWORD LS_LND_REST LS_LND_TLS_CERT LS_NODE_RPC_HOST LS_NODE_RPC_PORT LS_NODE_RPC_USER \
              LS_NODE_RPC_PASS LS_DATUM LS_DATUM_USER LS_HASHMAKER LS_LAN_HOST COMPOSE_PROFILES LS_UI_HASHMAKER \
              LS_UI_HASHMAKER_SLICES LS_UI_PORT LS_MCP_PORT LS_CONNECTOR_PORT LS_GW_PORT LS_HASHTAKER_CONTROL_PORT LS_RELAYS; do
       v=${!k:-}
-      # single quotes: Compose and the shell both take the value as it is ($ and spaces included)
       case $v in *"'"*) die "$k may not contain a single quote" ;; esac
-      printf "%s='%s'\n" "$k" "$v"
+      # a plain value as it is, so what you read is what you type (the random password is one); any other in
+      # single quotes, which Compose and the shell both take as they are ($ and spaces included)
+      if plain "$v"; then
+        printf "%s=%s\n" "$k" "$v"
+      else
+        printf "%s='%s'\n" "$k" "$v"
+      fi
     done
   } > "$DIR/.env.tmp"
   mv "$DIR/.env.tmp" "$DIR/.env"
@@ -148,25 +156,38 @@ if [ "${LS_SKIP_PULL:-0}" != 1 ]; then
   docker compose --profile setup --profile hashmaker pull -q
 fi
 
-ADMIN=${LS_ADMIN_MACAROON:-$LND_DIR/data/chain/bitcoin/mainnet/admin.macaroon}
+# the admin macaroon is offered where lnd keeps it; empty skips this step (the app's pages take narrow ones later)
+FOUND=$LND_DIR/data/chain/bitcoin/mainnet/admin.macaroon
+ADMIN=${LS_ADMIN_MACAROON:-}
 if [ -s "$LS_DATA_DIR/run/ln/rail.macaroon" ] 2>/dev/null || sudo -n test -s "$LS_DATA_DIR/run/ln/rail.macaroon" 2>/dev/null; then
   say "the app's Lightning keys are already made; keeping them"
 else
-  echo
-  echo "The app now asks your Lightning node for its own narrow keys (macaroons), made from your admin"
-  echo "macaroon. It is read here, handed over once, and never saved. Leave it empty to skip: you can"
-  echo "paste narrow macaroons on the app's Lightning and Sell pages instead (docs/LINUX.md)."
-  ask ADMIN "Your admin macaroon" "$ADMIN"
-  if [ -n "$ADMIN" ]; then
+  exists() { [ -e "$1" ] || sudo -n test -e "$1" 2>/dev/null; }
+  if [ "$YES" = 1 ]; then
+    # unattended: the macaroon named in LS_ADMIN_MACAROON, else the one where lnd keeps it, else none
+    [ -n "$ADMIN" ] || { exists "$FOUND" && ADMIN=$FOUND; }
+  else
+    echo
+    echo "The app now asks your Lightning node for its own narrow keys (macaroons), made from your admin"
+    echo "macaroon. It is read here, handed over once, and never saved. Leave it empty to skip: you can"
+    echo "paste narrow macaroons on the app's Lightning and Sell pages instead (docs/LINUX.md)."
+    exists "$FOUND" && echo "Yours looks to be at: $FOUND"
+    read -r -p "Path to your admin macaroon (empty: skip): " ADMIN </dev/tty
+  fi
+  if [ -z "$ADMIN" ]; then
+    say "no admin macaroon: skipped. Connect your Lightning node on the app's Lightning page"
+  else
+    exists "$ADMIN" || die "there is no file at $ADMIN. Give the path to your admin macaroon, or leave it empty to skip"
     if [ -r "$ADMIN" ]; then
       reader=(cat -- "$ADMIN")
     elif sudo -n true 2>/dev/null || [ "$YES" != 1 ]; then
       echo "(this user cannot read it; reading it with sudo)"
       reader=(sudo cat -- "$ADMIN")
     else
-      die "cannot read $ADMIN"
+      die "this user cannot read $ADMIN (and sudo would ask for a password): run install.sh as a user that can, or leave it empty to skip"
     fi
     say "making the app's keys through your Lightning node"
+    "${reader[@]}" >/dev/null || die "could not read $ADMIN"
     "${reader[@]}" | docker compose --profile setup run --rm -T node-keys || die "your Lightning node did not make the keys (above: why). Is it running and unlocked, and is $LS_LND_REST its REST address?"
   fi
 fi
@@ -184,7 +205,8 @@ cat <<EOF
 
 Lightning Stream is running.
   Its page:     http://127.0.0.1:${LS_UI_PORT:-8482}/  (from another machine: ssh -L ${LS_UI_PORT:-8482}:127.0.0.1:${LS_UI_PORT:-8482} $(id -un)@this-machine, then open that address)
-  Its password: in $DIR/.env (LS_UI_PASSWORD)
+  Its password: $(if plain "$LS_UI_PASSWORD"; then echo "everything after LS_UI_PASSWORD= in $DIR/.env"; else echo "LS_UI_PASSWORD in $DIR/.env, without the single quotes around it"; fi)
+                (to see it: grep LS_UI_PASSWORD $DIR/.env)
   Next:         make your approval key, sign the safe starter rules, then Services → Hashrate (docs/LINUX.md)
   Stop / start: docker compose -f $DIR/docker-compose.yml down / up -d
 EOF

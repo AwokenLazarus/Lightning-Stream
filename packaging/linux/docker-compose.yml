@@ -76,7 +76,8 @@ services:
     environment:
       XBT_NODE_RPC_HOST: ${LS_NODE_RPC_HOST:-127.0.0.1}
       XBT_NODE_RPC_PORT: ${LS_NODE_RPC_PORT:?set LS_NODE_RPC_PORT in .env, the XBT node's RPC port}
-      XBT_CHAIN: ${LS_CHAIN:-}
+      # the chain is said, not asked of the node: the signer starts while the node is away, and says so
+      XBT_CHAIN: ${LS_CHAIN:-main}
       B2_LN_REST: ${LS_LND_REST:?set LS_LND_REST in .env, the Lightning node's REST address like https://127.0.0.1:8080}
       B2_LN_MACAROON: /data/run/ln/rail.macaroon
       B2_MAINNET_ACK_FILE: /data/run/ln/mainnet-ack

@@ -63,6 +63,37 @@ fn b2_chain_must_agree_with_the_node() {
     assert!(e.msg.contains("B2_CHAIN"), "{}", e.msg);
 }
 
+/// A node that does not answer (stopped, or not set up yet).
+struct Away;
+
+impl Node for Away {
+    fn call(&self, _method: &str, _params: serde_json::Value) -> xbt402::Result<serde_json::Value> {
+        Err(xbt_signer::err("rpc", "Connection Failed: Connect error: Connection refused (os error 111)"))
+    }
+}
+
+/// With its chain said (B2_CHAIN, as the packages set it), the signer starts while its XBT node is
+/// away, and `node_status` says the node does not answer: the app's page explains it, and nothing
+/// restarts in a loop. Without the chain said and no node, it still refuses to start.
+#[test]
+fn with_its_chain_said_the_signer_starts_without_its_node_and_says_so() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let d = tempfile::tempdir().unwrap();
+    env_for(d.path());
+    let root = root_with(d.path(), &runbook_policy(json!({})));
+    let opts = || xbt_signer::signer::SignerOptions { node: Some(std::sync::Arc::new(Away)), ..Default::default() };
+    let Err(e) = xbt_signer::signer::Signer::new(&root, opts()) else { panic!("no chain, no node: no start") };
+    assert!(e.msg.contains("B2_CHAIN"), "{}", e.msg);
+    std::env::set_var("B2_CHAIN", "main");
+    let s = xbt_signer::signer::Signer::new(&root, opts());
+    std::env::remove_var("B2_CHAIN");
+    let s = s.unwrap_or_else(|e| panic!("{}: {}", e.code, e.msg));
+    assert_eq!(call(&s, "health", json!({}))["chain"], "main");
+    let n = call(&s, "node_status", json!({}));
+    assert_eq!((n["reachable"].as_bool(), n["chain"].as_str()), (Some(false), Some("main")), "{n}");
+    assert!(n["reason"].as_str().unwrap().contains("Connection refused"), "{n}");
+}
+
 #[test]
 fn p6_the_signer_never_asks_for_txindex() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());

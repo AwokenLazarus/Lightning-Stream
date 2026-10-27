@@ -86,7 +86,7 @@ def install(name, lab):
     base = {k: v for k, v in os.environ.items() if not k.startswith(("COMPOSE_", "LN_TICKET_", "PKG_LAB_", "LAB", "RUN", "ACTIVATION_"))}
     env = dict(base, LS_UI_PASSWORD=f"pw-{name}-$ x", COMPOSE_PROJECT_NAME=f"lstest-{name}",
                LS_LND_REST=f"https://127.0.0.1:{P[node]}", LS_LND_TLS_CERT=os.path.join(lab.facts[f"{node}_cert_dir"], "tls.cert"),
-               LS_ADMIN_MACAROON=admin, LS_BITCOIN_CONF="/nonexistent", LS_NODE_RPC_HOST="127.0.0.1", LS_NODE_RPC_PORT=str(P["rpc"]),
+               LS_ADMIN_MACAROON=admin, LS_BITCOIN_CONF="/nonexistent", LS_CHAIN="regtest", LS_NODE_RPC_HOST="127.0.0.1", LS_NODE_RPC_PORT=str(P["rpc"]),
                LS_NODE_RPC_USER="lab", LS_NODE_RPC_PASS="lab", LS_DATUM=f"127.0.0.1:{P['datum']}", LS_DATUM_USER="rented",
                LS_HASHMAKER="1" if maker else "0", LS_LAN_HOST="127.0.0.1", LS_UI_PORT=str(ui), LS_MCP_PORT=str(mcp),
                LS_CONNECTOR_PORT=str(conn), LS_GW_PORT=str(gw), LS_HASHTAKER_CONTROL_PORT=str(ctl), LS_RELAYS=RELAYS, LS_SKIP_PULL="1")
@@ -97,6 +97,9 @@ def install(name, lab):
     check("I", f"{name}: install.sh --yes installs and starts the app ({time.time() - t0:.0f} s)", r.returncode == 0, (r.stdout + r.stderr)[-1500:])
     check("I", f"{name}: .env is private (0600) and its password survives quoting ($ and a space)",
           oct(os.stat(os.path.join(d, ".env")).st_mode & 0o777) == "0o600" and "pw-" + name + "-$ x" in open(os.path.join(d, ".env")).read())
+    envtext = open(os.path.join(d, ".env")).read()
+    check("I", f"{name}: a plain value is written as it is, a password with signs in quotes, and the end says which to type",
+          "\nLS_CHAIN=regtest\n" in envtext and f"\nLS_UI_PASSWORD='pw-{name}-$ x'\n" in envtext and "without the single quotes" in r.stdout, r.stdout[-600:])
     data = os.path.join(d, "data")
     keys = root_helper(data, "ls /d/run/ln /d/run/gateway 2>&1; cat /d/run/ln/auto-keys.json").stdout
     check("K", f"{name}: node-keys made the narrow keys from the admin macaroon on standard input (rail, invoices, info), each with its own root key",
