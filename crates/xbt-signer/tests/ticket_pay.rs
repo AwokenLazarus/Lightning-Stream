@@ -3926,6 +3926,59 @@ fn a_smaller_prepaid_ticket_is_asked_for_where_the_sellers_own_does_not_fit_the_
     assert!(r.ln.state().payments.is_empty() && r.ledger().is_empty());
 }
 
+/// The mainnet starter rules ask the owner first for any payment of 1,000 sats or more, and no one can
+/// approve a ticket as a service is used: against a seller of 1,000-sat tickets that lets the wallet ask
+/// for smaller ones, the wallet asks for one that fits under the threshold, its fee limit included,
+/// even where the call's own limit is larger.
+#[test]
+fn starter_rules_buy_a_ticket_under_the_approval_threshold_from_a_seller_that_allows_smaller_ones() {
+    let _g = env_lock();
+    for settle in ["on-arrival", "on-use"] {
+        let r = Rig::shipped(json!({"human_threshold_sats": 1_000, "max_per_tx_sats": 2_000}), 30, sized_shop(json!([settle]), Some(546_000)));
+        if settle == "on-use" {
+            let mut st = r.ln.st.lock().unwrap();
+            st.channel["remote_constraints"]["dust_limit_sat"] = "546".into();
+            st.channel["remote_pubkey"] = r.shop.id().into();
+        }
+        let v = r.pay("/page/10", 2_000);
+        assert_eq!(v["status"].as_u64(), Some(200), "{settle}: {v}");
+        let charged = v["charged_sats"].as_i64().unwrap();
+        assert!((546..1_000).contains(&charged), "{settle}: one ticket under the threshold, its fee limit included: {v}");
+        assert!(r.ledger_sum() < 1_000, "{settle}: {}", r.ledger_sum());
+    }
+}
+
+/// A seller of one ticket size above what the owner's threshold allows is refused before anything is
+/// paid, in words that say which limit and by how much.
+#[test]
+fn a_seller_whose_only_ticket_needs_approval_is_refused_in_plain_words() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({"human_threshold_sats": 1_000, "max_per_tx_sats": 2_000}), 30, sized_shop(json!(["on-arrival"]), None));
+    let v = r.pay("/page/10", 2_000);
+    assert_eq!((v["rule"].as_str(), v["charged_sats"].as_i64().unwrap_or(0)), (Some("no_rail"), 0), "{v}");
+    assert!(v["rails_passed_over"][0]["why"].as_str().unwrap_or_default().starts_with("ticket_size: "), "{v}");
+    let why = v["reason"].as_str().unwrap_or_default();
+    assert!(why.contains("1000 sats only") && why.contains("ask you first") && why.contains("Nothing was paid"), "{why}");
+    assert!(r.ln.state().payments.is_empty() && r.ledger().is_empty());
+}
+
+/// A balance the wallet left with a seller is used after the signer starts again: the next call
+/// takes over the seller's session (its signed totals matching the wallet's own count) and buys no
+/// new ticket while that balance lasts.
+#[test]
+fn a_balance_left_with_the_seller_is_used_after_the_signer_starts_again() {
+    let _g = env_lock();
+    let mut r = Rig::shipped(json!({}), 30, sized_shop(json!(["on-arrival"]), None));
+    let v = r.pay("/page/10", 2_000);
+    assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{v}");
+    let paid = r.ln.state().payments.len();
+    r.restart();
+    let v = r.pay("/page/10", 2_000);
+    assert_eq!(v["status"].as_u64(), Some(200), "{v}");
+    assert_eq!(r.ln.state().payments.len(), paid, "no new ticket while the old balance lasts: {v}");
+    assert_eq!(v["tickets_prepaid"].as_u64().unwrap_or(0), 0, "{v}");
+}
+
 /// Held tickets are sized when the session opens: to the opening call's `max_sats` where the seller's
 /// terms let the wallet choose.
 #[test]

@@ -88,7 +88,7 @@ ask LS_NODE_RPC_HOST "Its RPC host" "127.0.0.1"
 ask LS_NODE_RPC_PORT "Its RPC port" "8332"
 ask LS_NODE_RPC_USER "Its RPC user" ""
 [ -n "$LS_NODE_RPC_PASS" ] || ask_secret LS_NODE_RPC_PASS "Its RPC password"
-{ [ -n "$LS_NODE_RPC_USER" ] && [ -n "$LS_NODE_RPC_PASS" ]; } || die "the XBT node's RPC user and password are needed (rpcuser and rpcpassword in its config; a cookie changes at every restart, so it cannot be used)"
+{ [ -n "$LS_NODE_RPC_USER" ] && [ -n "$LS_NODE_RPC_PASS" ]; } || die "the XBT node's RPC user and password are needed. A cookie changes at every restart, so it cannot be used: if your node has only its cookie, add an rpcauth line for the app (docs/LINUX.md, What you need)"
 
 echo
 echo "Hashtaker: rented hashrate goes to your own DATUM Gateway."

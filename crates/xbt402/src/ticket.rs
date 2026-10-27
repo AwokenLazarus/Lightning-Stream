@@ -20,6 +20,11 @@ pub const ASSET: &str = "XBT:msat";
 pub const FEATURE_BLAKE2B: u64 = 512;
 /// Where the session endpoints live on the seller's origin unless its terms say otherwise.
 pub const SESSION_PATH: &str = "/x402/ticket";
+/// A paid request's optional header: the most, in msat, the buyer lets this one answer charge its
+/// session's balance. A seller that reads it never charges the answer more, and ends it there, so
+/// bytes a buyer never reads (in a proxy's or tunnel's buffers) cannot cost more than the buyer's
+/// own limit for the call. A seller that ignores it charges as before.
+pub const MAX_MSAT_HEADER: &str = "X-Xbt402-Max-Msat";
 pub const RECEIPT_TAG: &str = "xbt402/ticket-receipt/v0";
 /// How many blocks before a held invoice's HTLC expires the seller's node cancels it, unless its
 /// runner set otherwise: lnd's `invoices.holdexpirydelta`, which is 18 on the Lightning Fork node

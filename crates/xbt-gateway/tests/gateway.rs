@@ -932,6 +932,26 @@ fn a_body_of_unknown_length_and_a_cut_one_are_metered_the_same() {
     });
 }
 
+/// A paid request that names the most its answer may charge (`X-Xbt402-Max-Msat`) is charged no
+/// more: the body ends there, whatever the session's balance holds. Bytes in a tunnel's buffers that
+/// the buyer never reads cannot cost more than its own limit.
+#[test]
+fn an_answer_is_charged_no_more_than_the_buyers_limit_for_it() {
+    let (rig, _d) = start(&|_| {});
+    let mut b = Buyer::new(&rig, 1);
+    let s = b.lock(&rig, 1);
+    // a first request releases the ticket into the balance: 3,000,000 bytes at 1,000 msat per MiB
+    assert_eq!(b.get("/chunked/3000000", Some(&s[0])).status, 200);
+    let before: u64 = b.status()["session"]["spentMsat"].as_str().unwrap().parse().unwrap();
+    // then one asking for the same, with a limit of 1,000 msat: about one MiB, and no more charged
+    let sig = b.sign("GET", "/chunked/3000000", b"", None, None);
+    let got = http(&rig.addr, "GET", "/chunked/3000000", &[("PAYMENT-SIGNATURE", &sig), (xbt402::ticket::MAX_MSAT_HEADER, "1000")], b"", None);
+    assert_eq!(got.status, 200);
+    assert!(!got.complete && got.body.len() <= 1_048_576 && got.body.len() > 900_000, "{} bytes", got.body.len());
+    let after: u64 = b.status()["session"]["spentMsat"].as_str().unwrap().parse().unwrap();
+    assert!(after - before <= 1000, "charged {} msat for the answer", after - before);
+}
+
 #[test]
 fn a_body_priced_per_second_is_paid_second_by_second() {
     let (rig, _d) = start(&|_| {});

@@ -84,6 +84,12 @@
      "default": "",
      "title": "Task",
      "type": "string"
+    },
+    "range": {
+     "default": "",
+     "description": "Optional: one byte range of a GET, bytes=N- or bytes=N-M, to buy part of a file or a film. Billed per MiB for the bytes sent, as a player is. Empty: the whole body.",
+     "title": "Range",
+     "type": "string"
     }
    },
    "required": [

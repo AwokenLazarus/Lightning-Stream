@@ -641,6 +641,9 @@ impl Signer {
             self.ticket_reconcile_locked();
         }
         let lp_open = LnPolicy::from_map(&cfg.ln);
+        // the most one ticket may book, its fee limit included: below the owner's approval threshold (no
+        // one can approve a release as it happens) and within the most one payment may be
+        let ceiling = ticket_ceiling(&cfg);
         // the smallest prepaid ticket the seller lets the wallet ask for, below its own size
         let prepaid_min_msat = prepaid.as_ref().and_then(|t| t.min_ticket_msat).map(|m| m.max(1000)).filter(|m| *m < prepaid_msat).unwrap_or(0);
         let out = (|| -> Result<Value> {
@@ -679,9 +682,11 @@ impl Signer {
                                                     b.hold_until - now)));
                 }
                 let sized = sizing(t, &tp, sellers, expect_msat, cap_tickets, cap_locked, limits.dust_msat, room)?;
-                // the call that opens the session spends at most `fit_sats`: where the seller's terms let the
-                // wallet choose a size, its tickets are no larger than one of them, its fee limit included, can take
-                match (t.min_ticket_msat, fit_sats.and_then(|f| fitting_msat(&lp_open, t.min_ticket_msat.unwrap_or(0), sized.ticket_msat, f))) {
+                // the call that opens the session spends at most `fit_sats`, and no ticket may need the owner's
+                // approval: where the seller's terms let the wallet choose a size, its tickets are no larger than
+                // both allow, their fee limit included
+                let fit = Some(fit_sats.map_or(ceiling, |f| f.min(ceiling)));
+                match (t.min_ticket_msat, fit.and_then(|f| fitting_msat(&lp_open, t.min_ticket_msat.unwrap_or(0), sized.ticket_msat, f))) {
                     (Some(_), Some(fit)) if fit < sized.ticket_msat => {
                         sizing(&Terms { ticket_msat: fit, ..t.clone() }, &tp, sellers, expect_msat, cap_tickets, cap_locked, limits.dust_msat, room).or(Ok(sized))
                     }
@@ -708,12 +713,18 @@ impl Signer {
                 }
             }
             let lp = LnPolicy::from_map(&cfg.ln);
-            let largest = size.ticket_msat.max(prepaid_msat);
-            let one = booking_sats(largest, (lp.fee_limit_sats(sats_ceil(largest)).max(0) as u64).saturating_mul(1000));
+            // a prepaid ticket is sized per purchase: where the seller lets the wallet ask for a smaller one,
+            // the one that counts here is the largest that fits under the ceiling
+            let prepaid_used = if prepaid_min_msat > 0 { fitting_msat(&lp, prepaid_min_msat, prepaid_msat, ceiling).unwrap_or(prepaid_msat) } else { prepaid_msat };
+            // a session that holds nothing buys only prepaid tickets: its size is theirs
+            let largest = if size.pool > 0 { size.ticket_msat.max(prepaid_used) } else { prepaid_used };
+            let (face, one) = booking_of(&lp, largest);
             // no human can approve a release as it happens: a ticket that would need one is refused here
-            if one >= cfg.human_threshold_sats || one > cfg.max_per_tx_sats {
-                return Ok(refusal("ticket_size", format!("one ticket with its fee limit is {one} sats: at or above human_threshold_sats {} or above \
-                                                          max_per_tx_sats {}", cfg.human_threshold_sats, cfg.max_per_tx_sats)));
+            if one > ceiling {
+                let smallest = held.as_ref().and_then(|t| t.min_ticket_msat).or(prepaid.as_ref().and_then(|t| t.min_ticket_msat));
+                return Ok(with(refusal("ticket_size", ticket_size_words(face, one, smallest.map(|m| booking_of(&lp, m.max(1000))), &cfg)),
+                               json!({"ticket_sats": face, "ticket_booking_sats": one, "human_threshold_sats": cfg.human_threshold_sats,
+                                      "max_per_tx_sats": cfg.max_per_tx_sats})));
             }
             // `tickets.velocity: "session"`: the session is the payment `velocity_max` counts, so one that
             // could never release is refused before it locks anything
@@ -1983,6 +1994,9 @@ impl Signer {
         if s.prepaid_msat == 0 {
             return None;
         }
+        // no ticket may need the owner's approval, nor be above the most one payment may be
+        let ceiling = ticket_ceiling(&self.config());
+        let left = Some(left.map_or(ceiling, |l| l.min(ceiling)));
         let msat = match left {
             Some(left) if s.prepaid_min_msat > 0 && s.draws.is_none() => fitting_msat(&lp, s.prepaid_min_msat, s.prepaid_msat, left).unwrap_or(s.prepaid_msat),
             _ => s.prepaid_msat,
@@ -2049,6 +2063,26 @@ impl Signer {
     /// Write the seller's side of a session into the book: its id, its key and its endpoints. On
     /// disk when this returns, and before any ticket of the session is paid, so that a wallet that
     /// starts again can still ask the seller to cancel what it locked.
+    /// A stopped session with the seller `payee` at `base` whose seller side the seller may still
+    /// hold a balance in: the newest one stopped in the last [`RESUME_WITHIN_S`], other than `sid`,
+    /// with its seller side on record. With it, what the wallet's own book says left the wallet in
+    /// that seller session across every session of the wallet that used it (the seller's totals are
+    /// for its own session): the secrets released, and the tickets settled.
+    pub(crate) fn ticket_resumable(&self, payee: &str, base: &str, sid: &str) -> Option<(ticket::SellerSession, u64)> {
+        let now = self.engine.now();
+        let g = self.ticket_store().ok()?;
+        let st = g.as_ref()?;
+        let old = st.book.sessions.values()
+            .filter(|s| s.id != sid && s.payee == payee && s.state != SState::Open && now - s.stopped_ts.max(s.active_ts) < RESUME_WITHIN_S)
+            .filter(|s| s.http.as_ref().is_some_and(|h| h.base == base))
+            .max_by(|a, b| a.stopped_ts.max(a.active_ts).total_cmp(&b.stopped_ts.max(b.active_ts)))?;
+        let http = old.http.clone()?;
+        let using: Vec<&str> = st.book.sessions.values().filter(|s| s.http.as_ref().is_some_and(|h| h.id == http.id)).map(|s| s.id.as_str()).collect();
+        let sent = using.iter().flat_map(|id| st.book.of_session(id)).filter(|t| matches!(t.state, TState::Released | TState::Settled))
+            .fold(0u64, |a, t| a.saturating_add(t.msat));
+        Some((http, sent))
+    }
+
     pub(crate) fn ticket_set_http(&self, sid: &str, http: ticket::SellerSession) -> Result<()> {
         let mut g = self.ticket_store()?;
         let st = g.as_mut().ok_or_else(|| err("ticket", "no ticket book"))?;
@@ -2411,6 +2445,33 @@ fn dropped(t: &Ticket, now: f64) -> Value {
 fn booking_of(lp: &LnPolicy, msat: u64) -> (i64, i64) {
     let fee_limit_msat = (lp.fee_limit_sats(sats_ceil(msat)).max(0) as u64).saturating_mul(1000);
     (sats_ceil(msat), booking_sats(msat, fee_limit_msat))
+}
+
+/// How long after a session stopped the wallet still looks for its balance at the seller: a seller
+/// forgets a session with a balance that has not been used for a day (`docs/TICKETS.md`).
+const RESUME_WITHIN_S: f64 = 20.0 * 3600.0;
+
+/// The most one ticket may book, its fee limit included, in sats: below `human_threshold_sats`,
+/// since no one can approve a release as it happens, and at most `max_per_tx_sats`.
+fn ticket_ceiling(cfg: &crate::policy::PolicyConfig) -> i64 {
+    (cfg.human_threshold_sats - 1).min(cfg.max_per_tx_sats).max(0)
+}
+
+/// Why a ticket of `face` sats booking `one` is refused, in words for the owner, with the seller's
+/// smallest ticket (face, booked) where its terms let the wallet ask for one.
+fn ticket_size_words(face: i64, one: i64, smallest: Option<(i64, i64)>, cfg: &crate::policy::PolicyConfig) -> String {
+    let rule = if one >= cfg.human_threshold_sats {
+        format!("your rules ask you first for any payment of {} sats or more (human_threshold_sats), and a ticket cannot wait for your approval while a service is in use",
+                cfg.human_threshold_sats)
+    } else {
+        format!("your rules allow at most {} sats in one payment (max_per_tx_sats)", cfg.max_per_tx_sats)
+    };
+    match smallest {
+        Some((f, b)) => format!("this seller's smallest ticket is {f} sats ({b} sats with its routing fee limit), and {rule}. Nothing was paid. \
+                                 To use this seller, raise that limit above {b} sats"),
+        None => format!("this seller sells tickets of {face} sats only ({one} sats with its routing fee limit), and {rule}. Nothing was paid. \
+                         To use this seller, raise that limit above {one} sats, or ask the seller to offer smaller tickets (minTicketMsat)"),
+    }
 }
 
 /// The largest ticket from `lo_msat` to `hi_msat`, in whole sats, whose booking under `lp`, its fee

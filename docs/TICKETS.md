@@ -1800,3 +1800,32 @@ invoice would meet the same rules.
   in memory, and asks the node to decode each invoice once.
 - A session forgotten by the seller (section 4) before its payment by offer is seen is credited
   nothing: the seller keeps the payment.
+
+## 16. What real use changed in this draft (2026-10-27)
+
+Found buying from a mainnet seller behind a web tunnel, with the starter rules a new wallet signs.
+
+**A limit for each answer** (`X-Xbt402-Max-Msat`). A paid request may name the most, in msat, its
+answer may charge the session's balance. A seller that reads it charges the answer no more and ends
+the body there; one that ignores it charges as before. The wallet sends the call's `max_sats`. Why: a
+seller that meters what it writes counts bytes that sit in a proxy's or tunnel's buffers once the
+buyer stops reading. A buyer that stopped at its 200-sat limit was charged 345 sat that way, out of
+credit it had prepaid. The header fixes the bound before anything is sent, so it gives the buyer no
+way to take bytes unpaid; a stripped header only removes the buyer's own bound. It is not part of
+`auth`, for that reason.
+
+**No ticket that would need the owner's approval.** A ticket's release can't wait for a person while
+a service is in use, so a session refuses one whose booking, fee limit included, is at or above
+`human_threshold_sats` or above `max_per_tx_sats`. Where the seller lets the wallet ask for a smaller
+ticket (`minTicketMsat`), the wallet now asks for one that fits under both, held or prepaid, instead
+of refusing the seller's own size. It refuses only when even the seller's smallest ticket doesn't
+fit, and says which limit and by how much.
+
+**A balance left with the seller is used again.** A session the wallet stops (an idle stop, or the
+signer starting again) may leave prepaid credit at the seller, which keeps a session with a balance
+for a day (section 4). When the next call opens a session with the same seller and session path, the
+wallet first looks for the newest such session it stopped in the last 20 hours. If the seller's
+signed `status` for it credits exactly what the wallet's own book says left the wallet in that
+seller session, and shows a balance, the new session takes over its seller side; otherwise it starts
+fresh. The seller's word moves no money: it only lets the wallet spend credit the book already
+counts as paid.

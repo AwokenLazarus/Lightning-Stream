@@ -17,9 +17,18 @@ amounts only: the software is tested on mainnet with small amounts.
 - **Linux with Docker:** Docker 24 or newer and its Compose plugin, 2.20 or newer. On Ubuntu that's
   `sudo apt install docker.io docker-compose-v2`, or Docker's own packages. The user who installs needs
   to be able to run `docker` (the `docker` group). Images exist for x86_64, arm64 and armv7.
-- **Your XBT node (Knots BLAKE2b)** on the same machine, with `server=1` and an `rpcuser`/`rpcpassword`
-  in its config. A cookie changes at every restart, so it can't be used. The wallet asks the node about
+- **Your XBT node (Knots BLAKE2b)** on the same machine, with `server=1` and an RPC user and password
+  for the app. A cookie changes at every restart, so it can't be used. The wallet asks the node about
   the chain; it never holds your coins there.
+  - **If your node uses only its cookie** (no `rpcuser` in its config): add an `rpcauth` line for the
+    app. Unlike `rpcpassword`, it leaves the cookie in place for your other apps. Knots ships the
+    script that makes the line:
+    ```
+    python3 share/rpcauth/rpcauth.py lightning-stream
+    ```
+    Run it in the Knots source or release folder; it prints an `rpcauth=lightning-stream:…` line and a
+    password. Add the line to the node's config file (`~/.bitcoin/bitcoin.conf` by default), restart
+    the node, and give `install.sh` the user `lightning-stream` and that password when it asks.
 - **Your Lightning node (lnd-family, such as Lightning Fork)** on the same machine, unlocked, with its
   REST interface on (lnd's default is `https://127.0.0.1:8080`) and channels on the BLAKE2b Lightning
   network.
@@ -81,7 +90,13 @@ The page is at **http://127.0.0.1:8482/**. From another machine, open an ssh tun
    the app**, on mainnet as everywhere: the rules turn paying on and set its limits. On mainnet the
    limits are low. The rules include a `hashrate` task with a small budget, so rented hashrate is paid
    under its own limit.
-3. **Check the Lightning page.** It should say the app connected to your node by itself.
+3. **Confirm paying with real money.** On mainnet the Lightning page asks once: *Pay with real money*.
+   Tick the box and press *Start paying*. Until you do, the app pays nothing, even with the rules signed.
+4. **Check the Lightning page.** It should say the app connected to your node and is ready. If it says
+   your node holds more than your rules allow, press *Raise the limit* and sign.
+
+After you sign a change that waits for a restart, the app says so. On Linux, in the folder you
+installed to (`~/lightning-stream` unless you chose another), run `docker compose restart`.
 
 ## Before you buy: get a channel
 

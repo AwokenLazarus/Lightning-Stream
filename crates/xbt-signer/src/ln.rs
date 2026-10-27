@@ -1880,7 +1880,17 @@ impl Signer {
                              "backend": self.ln.as_ref().map(|b| b.describe()), "halted": self.ln_book.halted()});
         let (ln, pol) = match self.ln_ready() {
             Ok(x) => x,
-            Err(d) => return with(out, json!({"ready": false, "reason": d["reason"]})),
+            Err(d) => {
+                // paying is not on yet, but a node is configured: what it holds is still reported, so the
+                // owner's first rules can size the exposure cap from it (a list the node did not give is left out)
+                let mut o = with(out, json!({"ready": false, "reason": d["reason"]}));
+                if let (Some(b), None) = (&self.ln, &self.ln_error) {
+                    if let Ok(chans) = b.channels() {
+                        o["exposure"] = self.ln_exposure(&pol, &chans, None).0;
+                    }
+                }
+                return o;
+            }
         };
         let reconciled = self.ln_reconcile_locked();
         out["halted"] = json!(self.ln_book.halted());

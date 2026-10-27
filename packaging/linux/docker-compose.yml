@@ -134,6 +134,7 @@ services:
       XBT_UI_HASHRENT: http://127.0.0.1:${LS_HASHTAKER_CONTROL_PORT:-23343}
       XBT_UI_HASHRENT_TOKEN_FILE: /data/run/hashrate/control-token
       XBT_UI_ENROLL_CODE_FILE: /data/run/enroll/enroll-code
+      XBT_UI_RESTART_HINT: "in the folder you installed it to (~/lightning-stream unless you chose another), run: docker compose restart"
     volumes:
       - ${LS_DATA_DIR}/ui:/data/ui
       - ${LS_DATA_DIR}/run/signer:/data/run/signer:ro

@@ -218,6 +218,15 @@ struct Metered {
     started: Instant,
     /// A request to a route priced by the token: what bounds its tokens.
     tokens: Option<TokenCall>,
+    /// The most the buyer lets this answer charge, in msat ([`xbt402::ticket::MAX_MSAT_HEADER`]).
+    cap_msat: Option<u64>,
+}
+
+impl Metered {
+    /// What the buyer's cap leaves for this answer after `charged` msat of its own; no cap: all.
+    fn room(&self, charged: u64) -> u64 {
+        self.cap_msat.map_or(u64::MAX, |c| c.saturating_sub(self.at_head.saturating_add(charged)))
+    }
 }
 
 /// What bounds the tokens of one request to a route priced by the token.
@@ -1672,6 +1681,8 @@ impl Gateway {
             first_second,
             started: Instant::now(),
             tokens: prepared.as_ref().map(|p| TokenCall { body_len: req.body.len() as u64, max_output: p.max_output }),
+            cap_msat: req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(xbt402::ticket::MAX_MSAT_HEADER))
+                .and_then(|(_, v)| v.trim().parse::<u64>().ok()),
         };
         let event_stream = answer.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v.to_ascii_lowercase().starts_with("text/event-stream"));
         // a body priced by the token has no length known before it is counted
@@ -1703,8 +1714,13 @@ impl Gateway {
         let on_pledge = m.route.release == Release::AfterVerify;
         let deadline = Instant::now() + self.cfg.times.refill_wait;
         let mut st = self.lock();
+        let room = m.room(meter.charged());
         loop {
-            let take = meter.affordable(want, st.book.chargeable(&m.session, on_pledge));
+            let take = meter.affordable(want, st.book.chargeable(&m.session, on_pledge).min(room));
+            // the buyer's own limit for this answer is reached: it ends now, with nothing more charged
+            if take == 0 && meter.affordable(want, room) == 0 {
+                return (0, 0);
+            }
             if take > 0 {
                 return match meter.bytes_due(take) {
                     Some(due)
@@ -1737,7 +1753,12 @@ impl Gateway {
     }
 
     /// Take `due` msat (seconds that have started, tokens counted), waiting as [`Gateway::pay_bytes`] does.
-    fn pay_msat(&self, m: &Metered, due: u64, gone: &mut dyn FnMut() -> bool) -> bool {
+    /// For an answer that has charged `charged` msat so far: refused when `due` would take it past
+    /// the buyer's own limit for it.
+    fn pay_msat_charged(&self, m: &Metered, due: u64, charged: u64, gone: &mut dyn FnMut() -> bool) -> bool {
+        if due > m.room(charged) {
+            return false;
+        }
         let on_pledge = m.route.release == Release::AfterVerify;
         let deadline = Instant::now() + self.cfg.times.refill_wait;
         let mut st = self.lock();
@@ -1787,7 +1808,7 @@ impl Gateway {
             }
             match meter.seconds_due(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)) {
                 Some((0, _)) => {}
-                Some((secs, due)) if self.pay_msat(&m, due, &mut || out.gone()) => meter.seconds_charged(secs, due),
+                Some((secs, due)) if self.pay_msat_charged(&m, due, meter.charged(), &mut || out.gone()) => meter.seconds_charged(secs, due),
                 _ => break stopped("no balance for another second"),
             }
             let n = match src.read(&mut buf) {
@@ -1860,7 +1881,7 @@ impl Gateway {
         let stopped = |why: &str| Err(io::Error::other(why.to_string()));
         // pay `due`, then send `bytes`; false: not paid, or the buyer is gone
         let mut part = |bytes: &[u8], due: u64, charged: &mut u64, sent: &mut u64, hash: &mut Sha256| -> io::Result<bool> {
-            if due > 0 && !self.pay_msat(&m, due, &mut || out.gone()) {
+            if due > 0 && !self.pay_msat_charged(&m, due, *charged, &mut || out.gone()) {
                 return Ok(false);
             }
             *charged = charged.saturating_add(due);
@@ -1950,7 +1971,7 @@ impl Gateway {
         // more than its counts settle at is given the difference back
         if result.is_ok() {
             let (up, down) = settle_due(counted, usage, charged);
-            if up > 0 && self.pay_msat(&m, up, &mut || false) {
+            if up > 0 && self.pay_msat_charged(&m, up, charged, &mut || false) {
                 charged = charged.saturating_add(up);
             }
             if down > 0 {

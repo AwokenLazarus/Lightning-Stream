@@ -406,8 +406,11 @@ impl App {
             "/connections" => self.connections(&ctx),
             "/apps" => self.apps_page(&ctx),
             "/approvals" => self.approvals(&ctx),
-            "/policy" => self.policy_page(&ctx, req.query.get("template").map(|t| t == "starter").unwrap_or(false),
-                                          req.query.get("allow").zip(req.query.get("node")).map(|(a, n)| (a.as_str(), n.as_str()))),
+            "/policy" => match req.query.get("fix").map(String::as_str) {
+                Some("cap") => self.policy_fix_cap(&ctx),
+                _ => self.policy_page(&ctx, req.query.get("template").map(|t| t == "starter").unwrap_or(false),
+                                      req.query.get("allow").zip(req.query.get("node")).map(|(a, n)| (a.as_str(), n.as_str()))),
+            },
             "/channels" => self.channels(&ctx),
             "/signatures" => self.signatures(&ctx),
             "/keys" => self.keys(&ctx),
@@ -596,7 +599,7 @@ impl App {
                                                                               "prev_sha256": g("prev_sha256"), "expiry": i("expiry"), "signature": sig()})), &|v| {
                 let pr = v.get("pending_restart").and_then(Value::as_array).map(|a| a.iter().map(|x| setting_name(&txt(Some(x)))).collect::<Vec<_>>().join(", ")).unwrap_or_default();
                 if pr.is_empty() { "Policy applied; it is in force now.".into() } else {
-                    format!("Policy applied. One part waits for the app to restart ({pr}): restart Lightning Stream from your Umbrel or StartOS dashboard.")
+                    format!("Policy applied. One part waits for the app to restart ({pr}): {}.", self.cfg.restart_hint)
                 }
             }),
             "/human-key-enroll" => back("./setup", self.call("human_key_enroll", json!({"pubkey": g("pubkey"), "code": g("code")})), &|_| "Approval key enrolled.".into()),
@@ -927,8 +930,37 @@ impl App {
 
     /// The sats the Lightning node holds in its channels now, as the signer counts them against the
     /// exposure cap (0 when the node can't be read).
+    /// What the node holds in its channels, as the signer reads it; `None` where it could not.
+    fn ln_held_read(&self) -> Option<i64> {
+        self.call("ln_status", json!({})).ok().and_then(|s| s["exposure"]["total_sats"].as_i64())
+    }
+
     fn ln_held(&self) -> i64 {
-        self.call("ln_status", json!({})).ok().and_then(|s| s["exposure"]["total_sats"].as_i64()).unwrap_or(0)
+        self.ln_held_read().unwrap_or(0)
+    }
+
+    /// The rules page with only the node's exposure cap raised to what the starter rules suggest for
+    /// what the node holds now: the one-click fix where the node holds more than the signed cap.
+    fn policy_fix_cap(&self, ctx: &Ctx) -> Resp {
+        let cur = match self.call("policy_get", json!({})) {
+            Ok(v) => v,
+            Err(e) => return self.page("Spending rules", ctx, Self::error_box(&e)),
+        };
+        let mut p = cur["policy"].clone();
+        let Some(held) = self.ln_held_read() else {
+            return self.page("Spending rules", ctx, Self::error_box("The app can't read your Lightning node right now, so it can't suggest a limit. Try again in a minute."));
+        };
+        let cap = starter_exposure_cap(held);
+        if !p["ln"].is_object() {
+            p["ln"] = json!({});
+        }
+        p["ln"]["exposure_cap_sats"] = json!(cap);
+        let mut b = format!("<div class=\"flash ok\">Your Lightning node holds {} now. The limit on what it may hold is set to {} below (twice that, \
+            rounded up); nothing else changes. Review it, then sign.</div>", money(held), money(cap));
+        let errs: Vec<String> = cur["errors"].as_array().map(|a| a.iter().map(|x| txt(Some(x))).collect()).unwrap_or_default();
+        let warns: Vec<String> = cur["warnings"].as_array().map(|a| a.iter().map(|x| txt(Some(x))).collect()).unwrap_or_default();
+        b.push_str(&self.policy_form(ctx, &p, &cur["effective"], &errs, &warns));
+        self.page("Spending rules", ctx, b)
     }
 
     fn policy_page(&self, ctx: &Ctx, template: bool, allow: Option<(&str, &str)>) -> Resp {
@@ -940,9 +972,11 @@ impl App {
             effect once you sign it with your approval key. Apps and agents cannot change them.</p>");
         let pr = cur["pending_restart"].as_array().cloned().unwrap_or_default();
         if !pr.is_empty() {
-            b.push_str(&format!("<div class=\"flash warn\">Signed, and waiting for the app to restart: {}. Restart Lightning Stream from your \
-                                Umbrel or StartOS dashboard.</div>",
-                                esc(&pr.iter().map(|x| setting_name(&txt(Some(x)))).collect::<Vec<_>>().join(", "))));
+            let hint = self.cfg.restart_hint.clone();
+            let mut hint_cap = hint.clone();
+            if let Some(c) = hint_cap.get_mut(0..1) { c.make_ascii_uppercase(); }
+            b.push_str(&format!("<div class=\"flash warn\">Signed, and waiting for the app to restart: {}. {}.</div>",
+                                esc(&pr.iter().map(|x| setting_name(&txt(Some(x)))).collect::<Vec<_>>().join(", ")), esc(&hint_cap)));
         }
         let mut p = cur["policy"].clone();
         // paying not on yet: the page opens on the starter rules, which turn it on
@@ -950,11 +984,17 @@ impl App {
         if template || auto {
             let keep = p.clone();
             let chain = self.signer_chain();
-            p = starter_policy_for(&chain, Some(self.ln_held()));
+            let held = self.ln_held_read();
+            p = starter_policy_for(&chain, held);
             for k in ["allowlist", "counterparties", "human_pubkey"] {
                 if let Some(v) = keep.get(k) {
                     p[k] = v.clone();
                 }
+            }
+            if held.is_none() && chain == "main" {
+                b.push_str(&format!("<div class=\"flash warn\">The app could not read your Lightning node yet, so the least limit on what it may \
+                    hold ({}) is filled in below. If your node holds more, the app will say so after you sign, with a button that raises it.</div>",
+                    money(STARTER_EXPOSURE_CAP_SATS)));
             }
             b.push_str(if auto {
                 "<div class=\"flash ok\">Paying is not turned on yet, so the safe starter rules are filled in below (your list of sellers is \

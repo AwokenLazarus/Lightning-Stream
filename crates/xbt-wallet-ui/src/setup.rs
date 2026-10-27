@@ -132,7 +132,14 @@ pub(crate) fn plain_reason(r: &str) -> String {
     } else if l.contains("mainnet needs ln.exposure_cap_sats") {
         "Your spending rules don't say how much your Lightning node may hold. Sign the safe starter rules again (Settings → Spending rules): they set it.".into()
     } else if l.contains("above ln.exposure_cap_sats") {
-        "Your Lightning node holds more than your spending rules allow it to. Raise \"The most your Lightning node may hold\" in Settings → Spending rules, or move some funds off the node.".into()
+        // the signer's words carry both numbers: "holds N sats in its channels … above ln.exposure_cap_sats M"
+        let after = |key: &str| r.split(key).nth(1).and_then(|t| t.split_whitespace().next()).map(|n| n.trim_matches(|c: char| !c.is_ascii_digit()).to_string())
+            .filter(|n| !n.is_empty());
+        match (after("holds "), after("exposure_cap_sats ")) {
+            (Some(held), Some(cap)) => format!("Your Lightning node holds {held} sats, more than the {cap} sats your spending rules allow it to hold. \
+                Raise the limit (one click: \"Raise the limit\" below), or move some funds off the node."),
+            _ => "Your Lightning node holds more than your spending rules allow it to. Raise \"The most your Lightning node may hold\" in Settings → Spending rules, or move some funds off the node.".into(),
+        }
     } else if l.contains("watchtower") {
         "Your node's watchtower can't be checked. Remove unknown watchtowers in your node's app, or list the ones you trust under Advanced in Settings → Spending rules.".into()
     } else if l.contains("halted") {
@@ -273,6 +280,10 @@ impl App {
             else if ln.grant { "Approve Lightning Stream in Lightning Fork: open Lightning Fork's tasks and run Grant app access. \
                  The app connects by itself a few seconds later. Or paste a key below.".into() }
             else { "Make the key in your node's app and paste it below.".into() }));
+        // the node holds more than the signed cap: one click to the rules with it raised
+        if !ready && txt(status.get("reason")).contains("above ln.exposure_cap_sats") {
+            b.push_str("<p><a class=\"button-link\" href=\"./policy?fix=cap\">Raise the limit</a></p>");
+        }
         if needs_ack {
             b.push_str(&format!("<form method=\"post\" action=\"./lightning\" class=\"card primary\">{}<input type=\"hidden\" name=\"action\" value=\"ack\">\
                 <h2>Pay with real money</h2><p>This is a real Lightning node. Keep your spending rules low while you try the app.</p>\

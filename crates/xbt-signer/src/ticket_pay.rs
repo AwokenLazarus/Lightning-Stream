@@ -501,6 +501,9 @@ fn head_to(ans: &mut WireAnswer, range: Option<ByteRange>, line: bool, sink: &mu
     (head, refused)
 }
 
+/// Why a call is refused when the seller's 402 offers nothing the wallet may pay.
+const NO_RAIL: &str = "the seller's 402 offers no way to pay that this wallet's policy allows: see rails_passed_over for what each entry needs";
+
 /// What one call released: the hashes, the sats the book put in the ledger for them, and how many
 /// of them were prepaid tickets. `limit_sats` is the call's `max_sats`: no ticket is released or
 /// bought for the call that could take what the book puts in the ledger above it ([`Spent::room`]).
@@ -1037,7 +1040,12 @@ impl Signer {
         if offered.iter().any(|o| o["scheme"] == CHANNEL_SCHEME) {
             passed.push(json!({"rail": "channel", "why": "the seller offers the on-chain channel, which this wallet no longer has"}));
         }
-        with(deny("no_rail", "the seller's 402 offers no way to pay that this wallet's policy allows: see rails_passed_over for what each entry needs"),
+        // one way to pay, passed over for one reason: that reason, in its own words, is what the call says
+        let why = match passed.as_slice() {
+            [one] => one["why"].as_str().and_then(|w| w.split_once(": ")).map(|(_, w)| w.to_string()).unwrap_or_else(|| NO_RAIL.to_string()),
+            _ => NO_RAIL.to_string(),
+        };
+        with(deny("no_rail", why),
              json!({"charged_sats": 0, "rails_passed_over": passed, "offered": offered,
                     "wallet": {"lightning": lightning, "chain": chain, "tickets": tp.enabled, "tickets_off": tp.mainnet_off, "ln": LnPolicy::from_map(&cfg.ln).enabled}}))
     }
@@ -1207,6 +1215,9 @@ impl Signer {
                                                    money: Mutex::new(Money::default()), streaming: AtomicBool::new(false), refilling: AtomicBool::new(false),
                                                    used: Mutex::new(self.engine.now()), unfilled: Mutex::new(None),
                                                    cancel_asked: Mutex::new(HashSet::new()) });
+                    // a balance the wallet left with this seller in a session it stopped (a restart, or an idle stop) is
+                    // used first, not left there while a new ticket is bought
+                    self.ticket_resume(&h);
                     // the first pool, before the call goes on. A session that holds nothing, or that found no slot
                     // and waits, goes on where the seller offers prepaid tickets: the call buys one when it needs it
                     let filled = self.ticket_fill(&h);
@@ -1630,6 +1641,48 @@ impl Signer {
         Err(err("ticket_seller", "the seller keeps answering bad_seq"))
     }
 
+    /// Take over the seller side of the newest session the wallet stopped with this seller in the
+    /// last day ([`Signer::ticket_resumable`]) where the seller still holds a balance in it: the
+    /// seller's signed `status` must credit exactly what the wallet's own book says left the wallet
+    /// in that seller session, and spend no more than that. Otherwise `hs` starts with nothing of it.
+    /// `true`: taken over.
+    fn ticket_resume(&self, hs: &HttpSession) -> bool {
+        let Some((old, sent)) = self.ticket_resumable(&hs.terms.terms.payee, &hs.base, &hs.sid) else { return false };
+        if sent == 0 {
+            return false;
+        }
+        {
+            let mut link = lock(&hs.link);
+            link.seller_sid = old.id.clone();
+            link.key = Zeroizing::new(old.key);
+            link.next_seq = 0;
+        }
+        let taken = match self.ticket_call(hs, "status", &json!({}), false) {
+            Ok((200, _, Ok(r))) if r.released_msat == sent && r.spent_msat <= r.released_msat && r.released_msat > r.spent_msat => {
+                let mut m = lock(&hs.money);
+                m.acct = Account { sent_msat: sent, acked_msat: r.released_msat, spent_msat: r.spent_msat };
+                Some(r.released_msat - r.spent_msat)
+            }
+            _ => None,
+        };
+        match taken {
+            Some(balance) if self.ticket_set_http(&hs.sid, old.clone()).is_ok() => {
+                self.ticket_audit("ticket_resumed", json!({"session": hs.sid, "seller_session": old.id, "origin": hs.origin,
+                                                           "dest": format!("ln:{}", hs.terms.terms.payee), "balance_msat": balance}));
+                true
+            }
+            _ => {
+                let mut link = lock(&hs.link);
+                *link = Link { seller_sid: String::new(), key: Zeroizing::new([0u8; 32]), next_seq: 0 };
+                drop(link);
+                let mut m = lock(&hs.money);
+                m.acct = Account::default();
+                m.fault = None;
+                false
+            }
+        }
+    }
+
     /// The seller's signed `status`: its tickets by state into `ready`, and the body.
     fn ticket_status_of(&self, hs: &HttpSession, absorb: bool) -> std::result::Result<Value, String> {
         match self.ticket_call(hs, "status", &json!({}), absorb) {
@@ -1962,6 +2015,10 @@ impl Signer {
             let header = b64json(&payment_payload(&hs.terms.accepted, &json!({"session": link.seller_sid, "seq": seq, "auth": auth})));
             let mut headers = c.headers();
             headers.push(("PAYMENT-SIGNATURE".into(), header));
+            // the most this answer may charge the session's balance: the call's own limit
+            if c.max_sats > 0 {
+                headers.push((xbt402::ticket::MAX_MSAT_HEADER.into(), (c.max_sats as u64).saturating_mul(1000).to_string()));
+            }
             let ans = match self.wire(c.method, c.url, c.body, &headers, Self::ticket_read_timeout(&tp)) {
                 Ok(a) => a,
                 // no secret travels with a request, so a lost answer costs what the seller charged the balance, if anything
