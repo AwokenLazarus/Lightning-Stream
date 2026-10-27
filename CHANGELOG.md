@@ -14,6 +14,12 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   address and an item of each, at the seller's address, and asks the front page last (a shop need not
   price it). Before, it said "the seller asked for no payment at its address".
 
+**Paying**
+- A seller that charges a call more than its limit is stopped. The wallet sends the call's limit with
+  each paid request; a seller that ignores it (one of before 0.1.15) and charges past it gets nothing
+  more in that session, the wallet page says what happened with the numbers, and the seller's signed
+  receipt is kept in the wallet's records. Such a seller can take at most the credit it already held.
+
 **Linux package**
 - The signer starts while your XBT node is stopped or not set up yet, instead of restarting in a loop.
   `LS_CHAIN` in `.env` says the chain (`main` unless set), and the wallet page says when the node does
@@ -28,6 +34,12 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 
 **Wording**
 - The Your node page says the app is tested on mainnet with small amounts only.
+- Start paying while the wallet restarts says it is starting, not "Nothing to confirm on a test
+  network".
+- A signed rules change that waits for a restart says how to restart on your platform (Umbrel,
+  StartOS or Linux), and names no test-chain setting on mainnet.
+- The signer's log sends you to the setup page for the enrolment code, not to a file inside its
+  container.
 
 ## 0.1.15 (2026-10-27)
 
