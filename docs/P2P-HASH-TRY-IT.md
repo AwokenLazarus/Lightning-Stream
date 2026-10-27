@@ -67,7 +67,7 @@ target/release/xbt-hashlink keygen hashtaker.key      # the hashtaker's link key
      "public_url": "https://HASHER_HOST:34942",
      "state_dir": "state",
      "chain": "main",
-     "mainnet_ack": "real funds, software that has run on regtest only",
+     "mainnet_ack": "real funds, software tested on mainnet with small amounts only",
      "node": {
        "rest": "https://127.0.0.1:8080",
        "tls_cert": "tls.cert",

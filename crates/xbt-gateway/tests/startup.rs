@@ -56,7 +56,7 @@ fn mainnet_is_asked_for_twice_and_a_start_on_it_says_what_is_open() {
     }));
     assert!(ok, "{said}");
     let (notice, summary) = (said.find("docs/LIMITS.md").expect("the notice"), said.find("chain main, 1 routes").expect("the summary"));
-    assert!(notice < summary && said.contains("regtest only") && said.contains("dust limit") && said.contains("TLS proxy"), "{said}");
+    assert!(notice < summary && said.contains("small amounts only") && said.contains("dust limit") && said.contains("TLS proxy"), "{said}");
 }
 
 #[test]

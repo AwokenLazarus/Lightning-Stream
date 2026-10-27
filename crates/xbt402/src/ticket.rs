@@ -44,7 +44,15 @@ pub const MIN_TICKET_BLOCKS: u32 = 24;
 pub const INVOICE_EXPIRY_S: u32 = 60;
 /// What a seller's config (`mainnet_ack`) and a buyer's policy (`tickets.mainnet_ack`) must say,
 /// word for word, before tickets or draws move funds on mainnet.
-pub const MAINNET_ACK: &str = "real funds, software that has run on regtest only";
+pub const MAINNET_ACK: &str = "real funds, software tested on mainnet with small amounts only";
+/// The sentence [`MAINNET_ACK`] replaced. Still taken, so a config, policy or file written before
+/// the change keeps its acknowledgement; nothing new writes it.
+pub const MAINNET_ACK_BEFORE: &str = "real funds, software that has run on regtest only";
+
+/// Whether `s` is the acknowledgement, word for word: [`MAINNET_ACK`], or the sentence it replaced.
+pub fn is_mainnet_ack(s: &str) -> bool {
+    s == MAINNET_ACK || s == MAINNET_ACK_BEFORE
+}
 /// `settle` in the terms: a ticket is a held payment, settled when its secret is used.
 pub const SETTLE_ON_USE: &str = "on-use";
 /// `settle` in the terms: a ticket is an ordinary payment, settled when it arrives (a prepaid

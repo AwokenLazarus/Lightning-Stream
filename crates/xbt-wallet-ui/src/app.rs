@@ -595,10 +595,12 @@ impl App {
                             &|_| "Denied.".into()),
             "/policy" => self.policy_preview(ctx, f),
             // browsers submit line breaks as CRLF; the signed text is LF only (JSON escapes a CR inside a string)
-            "/policy-apply" => back("./policy", self.call("policy_set", json!({"text": f.get("text").map(|t| t.replace("\r\n", "\n")).unwrap_or_default(),
+            "/policy-apply" => back(if self.ack_needed() { "./lightning#ack" } else { "./policy" }, self.call("policy_set", json!({"text": f.get("text").map(|t| t.replace("\r\n", "\n")).unwrap_or_default(),
                                                                               "prev_sha256": g("prev_sha256"), "expiry": i("expiry"), "signature": sig()})), &|v| {
                 let pr = v.get("pending_restart").and_then(Value::as_array).map(|a| a.iter().map(|x| setting_name(&txt(Some(x)))).collect::<Vec<_>>().join(", ")).unwrap_or_default();
-                if pr.is_empty() { "Policy applied; it is in force now.".into() } else {
+                if pr.is_empty() && self.ack_needed() {
+                    "Policy applied. One last step before the app pays: confirm below that it may pay with real money.".into()
+                } else if pr.is_empty() { "Policy applied; it is in force now.".into() } else {
                     format!("Policy applied. One part waits for the app to restart ({pr}): {}.", self.cfg.restart_hint)
                 }
             }),
@@ -646,7 +648,11 @@ impl App {
         let human = !self.human_pub().is_empty();
         let ln = self.call("ln_status", json!({})).unwrap_or(json!({}));
         let (ready, connected, why) = self.node_state();
-        if !human || !ready {
+        let ack = connected && why == crate::setup::ACK_NEEDED;
+        if ack && human {
+            b.push_str(&format!("<section class=\"card primary\"><h2>Start paying</h2><p>{}</p>\
+                <p><a class=\"button-link primary\" href=\"./lightning#ack\">Start paying</a></p></section>", esc(&why)));
+        } else if !human || !ready {
             b.push_str(&progress(2));
             b.push_str(&format!("<section class=\"card primary\"><h2>Finish setting up</h2><p>{}</p>\
                 <p><a class=\"button-link primary\" href=\"./setup\">Continue setup</a></p></section>",
@@ -680,6 +686,8 @@ impl App {
         let line = if ready {
             let n = int(ln.get("usable_channels"));
             format!("<span class=\"pill good\">Ready to pay</span> Your Lightning node is connected, with {n} channel{} to pay through.", if n == 1 { "" } else { "s" })
+        } else if ack {
+            "<span class=\"pill warn\">One last step</span> Confirm that the app may pay with real money. <a href=\"./lightning#ack\">Start paying</a>".into()
         } else if connected {
             "<span class=\"pill warn\">Not ready</span> Your Lightning node is connected but cannot pay yet. <a href=\"./lightning\">See why</a>".into()
         } else {
@@ -977,6 +985,10 @@ impl App {
             if let Some(c) = hint_cap.get_mut(0..1) { c.make_ascii_uppercase(); }
             b.push_str(&format!("<div class=\"flash warn\">Signed, and waiting for the app to restart: {}. {}.</div>",
                                 esc(&pr.iter().map(|x| setting_name(&txt(Some(x)))).collect::<Vec<_>>().join(", ")), esc(&hint_cap)));
+        }
+        if paying_on(&cur["policy"]) && self.ack_needed() {
+            b.push_str("<div class=\"flash warn\">Your rules are signed, but the app pays nothing until you confirm that it may pay with real money. \
+                <a href=\"./lightning#ack\">Start paying</a></div>");
         }
         let mut p = cur["policy"].clone();
         // paying not on yet: the page opens on the starter rules, which turn it on
@@ -1478,7 +1490,8 @@ impl App {
         };
         let ln = self.call("ln_status", json!({})).unwrap_or(json!({}));
         let enc = ks["encrypted"] == true;
-        let done = [true, !human.is_empty(), seen("policy_change"), ln["ready"] == true, enc && seen("backup_export")];
+        let ack_needed = ln["real_money_ack_needed"] == true;
+        let done = [true, !human.is_empty(), seen("policy_change"), ln["ready"] == true && !ack_needed, enc && seen("backup_export")];
         let n = done.iter().filter(|d| **d).count();
         let mut b = progress(if n == done.len() { 3 } else { 2 });
         b.push_str(&format!("<p class=\"lead\">{n} of {} done. The app is safe to leave running after each step: nothing is paid until your rules allow it.</p><ol class=\"steps\">",
@@ -1501,9 +1514,16 @@ impl App {
         b.push_str(&step(done[2], "Your spending rules",
             format!("<p>How much may be spent, and when the app asks you first. The safe starter rules are a good start: {} seller{} allowed now.</p>\
                      <p><a href=\"./policy?template=starter\">Open the starter rules →</a></p>", allow_n, if allow_n == 1 { "" } else { "s" })));
+        // on mainnet: straight after the rules, the confirmation that the app may pay with real money
+        if ack_needed {
+            b.push_str(&step(false, "Pay with real money",
+                "<p>This box's Lightning node holds real money. Until you confirm that the app may pay with it, the app pays nothing, \
+                 even with your rules signed.</p><p><a href=\"./lightning#ack\">Start paying →</a></p>".into()));
+        }
         b.push_str(&step(done[3], "Your Lightning node",
             format!("<p>{}</p><p><a href=\"./lightning\">Your node →</a></p>",
                     if done[3] { "Connected and ready to pay.".to_string() }
+                    else if ack_needed && ln["ready"] == true { "Connected. Confirm paying with real money (above) and it is ready.".to_string() }
                     else {
                         let (_, connected, why) = self.node_state();
                         esc(&format!("{} {why}", if connected { "Connected, not ready yet." } else { "Not connected yet." }))

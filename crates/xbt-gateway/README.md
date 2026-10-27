@@ -91,7 +91,7 @@ start.
   block 101 (`getblockhash 101`); the example's is a placeholder. (The terms say it with
   `extra.layer: "lightning"`. A file that still writes `lightning:` and the same hex, the name of
   before 2026-10, is read for one release.) Mainnet is asked for twice:
-  `"chain": "main"` and `"mainnet_ack": "real funds, software that has run on regtest only"`,
+  `"chain": "main"` and `"mainnet_ack": "real funds, software tested on mainnet with small amounts only"`,
   word for word. With one and not the other nothing starts. A gateway that starts on mainnet
   prints, at every start and every `--check`, a short list of what is known to be open there;
   the whole of it is `docs/LIMITS.md`.

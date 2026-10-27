@@ -23,7 +23,7 @@ pub use xbt402::ticket::MAINNET_ACK;
 /// What a gateway prints when it starts on mainnet: the things its runner should know before a
 /// buyer does. A short fixed text; the whole of it, with the measurements, is `docs/LIMITS.md`.
 pub const MAINNET_NOTICE: [&str; 9] = [
-    "chain main: this gateway has run on regtest only. Before you rely on it, read docs/LIMITS.md. In short:",
+    "chain main: this gateway is tested on mainnet with small amounts only. Before you rely on it, read docs/LIMITS.md. In short:",
     "- A held ticket of 1,000 sat can be below a channel's dust limit at mainnet fee rates on a channel without anchors: it then has no output there, and is lost to the miners if that channel is force-closed while it is held. The gateway does not read its channels' dust limits.",
     "- Claiming settled tickets on chain after a force close cost 900 to 1,700 sat for three tickets at 1 sat/vB; at higher fee rates one ticket costs more to claim than it is worth.",
     "- Held tickets take pending-payment slots of every channel on their route for no fee, on your node and on the routing nodes before it. Nothing but this software keeps buyers to half of a channel's slots.",
@@ -339,9 +339,9 @@ impl Config {
         // a file that names no chain is a regtest file: mainnet is never what a missing key means
         let chain = opt_str(top, "chain")?.unwrap_or("regtest").to_string();
         match (chain.as_str(), opt_str(top, "mainnet_ack")?) {
-            ("main", Some(MAINNET_ACK)) => {}
+            ("main", Some(a)) if xbt402::ticket::is_mainnet_ack(a) => {}
             ("main", _) => return Err(format!(
-                "chain \"main\" moves real funds through software that has run on regtest only (docs/LIMITS.md). To run it on mainnet all the same, add \"mainnet_ack\": \"{MAINNET_ACK}\""
+                "chain \"main\" moves real funds through software tested on mainnet with small amounts only (docs/LIMITS.md). To run it on mainnet all the same, add \"mainnet_ack\": \"{MAINNET_ACK}\""
             )),
             (_, Some(_)) => return Err("mainnet_ack is for chain \"main\" only: leave it out".into()),
             (_, None) => {}
@@ -1100,7 +1100,7 @@ mod tests {
         assert_eq!(m.network, "bip122:0000000000000050c1e5f69672f45929");
         // and a start on mainnet says what its runner should know, and where the rest is
         let notice = m.mainnet_notice().join("\n");
-        assert!(notice.contains("docs/LIMITS.md") && notice.contains("regtest only") && notice.contains("dust"), "{notice}");
+        assert!(notice.contains("docs/LIMITS.md") && notice.contains("small amounts only") && notice.contains("dust"), "{notice}");
         // the word means nothing on another chain, and a key that means nothing is not taken
         let mut off = base();
         off["mainnet_ack"] = json!(MAINNET_ACK);

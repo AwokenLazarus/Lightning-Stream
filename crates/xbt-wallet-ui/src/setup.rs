@@ -20,6 +20,9 @@ use crate::server::{Req, Resp};
 pub const RAIL_OPS: [&str; 4] = ["info:read", "offchain:read", "offchain:write", "onchain:read"];
 pub const RAIL_MACAROON: &str = "rail.macaroon";
 pub const MAINNET_ACK_FILE: &str = "mainnet-ack";
+
+/// What every page says while the owner has yet to confirm paying with real money (mainnet).
+pub const ACK_NEEDED: &str = "One last step: confirm that the app may pay with real money. Until you do, it pays nothing.";
 pub const GW_CONFIG: &str = "config.json";
 pub const GW_INVOICES: &str = "invoices.macaroon";
 pub const GW_INFO: &str = "info.macaroon";
@@ -242,11 +245,20 @@ impl App {
 
     /// The node's state as every page tells it (Home, Setup and Your node read this one answer):
     /// (ready to pay, connected: the app holds a key for the node, why it cannot pay yet in words).
+    /// On mainnet the wallet is not ready to pay until the owner has confirmed paying with real
+    /// money on the Lightning page: then `why` says so.
     pub(crate) fn node_state(&self) -> (bool, bool, String) {
         let status = self.signer.call("ln_status", json!({})).unwrap_or_else(|e| json!({"ready": false, "reason": e}));
-        let ready = status["ready"] == true;
         let have = self.cfg.ln.dir.join(RAIL_MACAROON).is_file() || status["configured"] == true;
-        (ready, have, plain_reason(&txt(status.get("reason").or(status.get("config_error")))))
+        if status["ready"] == true && status["real_money_ack_needed"] == true {
+            return (false, have, ACK_NEEDED.into());
+        }
+        (status["ready"] == true, have, plain_reason(&txt(status.get("reason").or(status.get("config_error")))))
+    }
+
+    /// Whether the owner has yet to confirm paying with real money (mainnet only), by the signer's word.
+    pub(crate) fn ack_needed(&self) -> bool {
+        self.signer.call("ln_status", json!({})).is_ok_and(|s| s["real_money_ack_needed"] == true)
     }
 
     pub(crate) fn lightning_page(&self, ctx: &Ctx) -> Resp {
@@ -255,7 +267,8 @@ impl App {
         let status = self.signer.call("ln_status", json!({})).unwrap_or_else(|e| json!({"ready": false, "reason": e}));
         let have = ln.dir.join(RAIL_MACAROON).is_file();
         let acked = ln.dir.join(MAINNET_ACK_FILE).is_file();
-        let ready = status["ready"] == true;
+        // not ready to pay while paying with real money is still to be confirmed
+        let ready = status["ready"] == true && status["real_money_ack_needed"] != true;
         // the keys the app made itself through the box's own node (`node-keys`), with no step by the owner
         let auto = have && crate::node_keys::made_by_box(&ln.dir);
         let main = chain == "main";
@@ -266,7 +279,7 @@ impl App {
             "<p class=\"lead\">The app pays for services through your own Lightning node. Connect it once with a key \
              you make in your node's app. The key lets the app pay within your spending rules; it cannot open or close channels.</p>"
         });
-        let needs_ack = have && main && !acked;
+        let needs_ack = have && main && (!acked || status["real_money_ack_needed"] == true);
         b.push_str(&format!("<section class=\"status {}\"><p class=\"status-head\">{}</p><p>{}</p></section>",
             if ready { "ok" } else if have { "warn" } else { "bad" },
             if ready && auto { "Connected to your Lightning node" } else if ready { "Connected and ready to pay" }
@@ -285,7 +298,7 @@ impl App {
             b.push_str("<p><a class=\"button-link\" href=\"./policy?fix=cap\">Raise the limit</a></p>");
         }
         if needs_ack {
-            b.push_str(&format!("<form method=\"post\" action=\"./lightning\" class=\"card primary\">{}<input type=\"hidden\" name=\"action\" value=\"ack\">\
+            b.push_str(&format!("<form method=\"post\" action=\"./lightning\" class=\"card primary\" id=\"ack\">{}<input type=\"hidden\" name=\"action\" value=\"ack\">\
                 <h2>Pay with real money</h2><p>This is a real Lightning node. Keep your spending rules low while you try the app.</p>\
                 <details><summary>Read before you start</summary>{}</details>\
                 <label class=\"check\"><input type=\"checkbox\" name=\"ack\" value=\"1\" required> I understand that the app pays with real money, within my spending rules</label>\
@@ -368,7 +381,7 @@ impl App {
             Some("save") => (|| {
                 let chain = self.signer_chain();
                 let main = chain == "main";
-                if main && f.get("mainnet_ack").map(|a| a.trim()) != Some(MAINNET_ACK) {
+                if main && !f.get("mainnet_ack").is_some_and(|a| xbt402::ticket::is_mainnet_ack(a.trim())) {
                     return Err(format!("To pay with real money, type the sentence word for word: {MAINNET_ACK}"));
                 }
                 let mac = decode_macaroon(f.get("macaroon").map(String::as_str).unwrap_or("")).map_err(|_| "That is not a key: copy it again, whole.".to_string())?;
@@ -456,7 +469,7 @@ impl App {
         c.insert("state_dir".into(), json!(gw.state_dir));
         c.insert("chain".into(), json!(chain));
         if chain == "main" {
-            if g("mainnet_ack") != MAINNET_ACK {
+            if !xbt402::ticket::is_mainnet_ack(&g("mainnet_ack")) {
                 return Err(format!("mainnet needs the acknowledgement, word for word: {MAINNET_ACK}"));
             }
             c.insert("mainnet_ack".into(), json!(MAINNET_ACK));

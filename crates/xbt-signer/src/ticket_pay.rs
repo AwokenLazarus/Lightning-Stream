@@ -1042,7 +1042,8 @@ impl Signer {
         }
         // one way to pay, passed over for one reason: that reason, in its own words, is what the call says
         let why = match passed.as_slice() {
-            [one] => one["why"].as_str().and_then(|w| w.split_once(": ")).map(|(_, w)| w.to_string()).unwrap_or_else(|| NO_RAIL.to_string()),
+            [one] => one["why"].as_str().and_then(|w| w.split_once(": ")).filter(|(r, _)| !r.is_empty() && r.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'))
+                .map(|(_, w)| w.to_string()).unwrap_or_else(|| NO_RAIL.to_string()),
             _ => NO_RAIL.to_string(),
         };
         with(deny("no_rail", why),
@@ -1187,6 +1188,11 @@ impl Signer {
                 }
                 Some(h) => Ok(h.clone()),
                 None => {
+                    // the same seller (its node and receipt key) open under another address, an alias of this shop or
+                    // the one it moved from: that session is stopped, and the new one takes over its balance
+                    if let Err(busy) = self.ticket_http_move(c.origin, &terms) {
+                        break 'open Err(Tried::Done(busy));
+                    }
                     let task = match &c.task {
                         Ok(t) => t.clone(),
                         Err(why) => break 'open Err(Tried::Next(why.clone())),
@@ -1641,13 +1647,37 @@ impl Signer {
         Err(err("ticket_seller", "the seller keeps answering bad_seq"))
     }
 
+    /// Stop a session this process holds open with the seller of `terms` under an origin other than
+    /// `origin`, so that a session opened at `origin` takes over its balance ([`Signer::ticket_resume`]).
+    /// `Err`: that session is in use by another call right now, which is told to come back.
+    fn ticket_http_move(&self, origin: &str, terms: &PayTerms) -> std::result::Result<(), Value> {
+        let others: Vec<Arc<Slot>> = lock(&self.ticket_http).iter().filter(|(o, _)| o.as_str() != origin).map(|(_, s)| s.clone()).collect();
+        for slot in others {
+            // never waited for: a call through the other name may be waiting for this one's place
+            let Ok(mut open) = slot.open.try_lock() else {
+                return Err(refusal("ticket_busy", "a call to the same seller under another address is opening a session: call again"));
+            };
+            let Some(h) = open.as_ref().filter(|h| h.terms.same_seller(terms)).cloned() else { continue };
+            let Ok(busy) = h.busy.try_lock() else {
+                return Err(refusal("ticket_busy", "the same seller is being paid under another address right now: call again when that call ends"));
+            };
+            drop(busy);
+            *open = None;
+            self.ticket_http_stop(&h, "the same seller is reached under another address", Duration::ZERO);
+        }
+        Ok(())
+    }
+
     /// Take over the seller side of the newest session the wallet stopped with this seller in the
-    /// last day ([`Signer::ticket_resumable`]) where the seller still holds a balance in it: the
-    /// seller's signed `status` must credit exactly what the wallet's own book says left the wallet
-    /// in that seller session, and spend no more than that. Otherwise `hs` starts with nothing of it.
+    /// last day ([`Signer::ticket_resumable`]) where the seller still holds a balance in it, at the
+    /// address `hs` reaches the seller by now: the seller's `status` must be signed with the receipt
+    /// key of its terms now, credit exactly what the wallet's own book says left the wallet in that
+    /// seller session, and spend no more than that. Otherwise `hs` starts with nothing of it.
     /// `true`: taken over.
     fn ticket_resume(&self, hs: &HttpSession) -> bool {
-        let Some((old, sent)) = self.ticket_resumable(&hs.terms.terms.payee, &hs.base, &hs.sid) else { return false };
+        let Some((old, sent)) = self.ticket_resumable(&hs.terms.terms.payee, &hs.sid) else { return false };
+        // the seller as it is reached now: its id and key, at this call's address
+        let old = SellerSession { base: hs.base.clone(), ..old };
         if sent == 0 {
             return false;
         }

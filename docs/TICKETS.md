@@ -1823,9 +1823,11 @@ fit, and says which limit and by how much.
 
 **A balance left with the seller is used again.** A session the wallet stops (an idle stop, or the
 signer starting again) may leave prepaid credit at the seller, which keeps a session with a balance
-for a day (section 4). When the next call opens a session with the same seller and session path, the
-wallet first looks for the newest such session it stopped in the last 20 hours. If the seller's
-signed `status` for it credits exactly what the wallet's own book says left the wallet in that
+for a day (section 4). Credit is the seller's, not its address's: when the next call opens a session
+with the same seller (its node), under any address, the wallet first looks for the newest such
+session it stopped in the last 20 hours. One it still holds open under another address (an alias of
+the shop, or the address it moved from) is stopped first, unless a call is using it right now. If the seller's
+`status` for it, signed with the receipt key of the seller's terms now, credits exactly what the wallet's own book says left the wallet in that
 seller session, and shows a balance, the new session takes over its seller side; otherwise it starts
 fresh. The seller's word moves no money: it only lets the wallet spend credit the book already
 counts as paid.

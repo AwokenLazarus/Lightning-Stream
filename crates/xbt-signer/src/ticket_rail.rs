@@ -2063,18 +2063,20 @@ impl Signer {
     /// Write the seller's side of a session into the book: its id, its key and its endpoints. On
     /// disk when this returns, and before any ticket of the session is paid, so that a wallet that
     /// starts again can still ask the seller to cancel what it locked.
-    /// A stopped session with the seller `payee` at `base` whose seller side the seller may still
-    /// hold a balance in: the newest one stopped in the last [`RESUME_WITHIN_S`], other than `sid`,
-    /// with its seller side on record. With it, what the wallet's own book says left the wallet in
+    /// A stopped session with the seller `payee` whose seller side the seller may still hold a
+    /// balance in: the newest one stopped in the last [`RESUME_WITHIN_S`], other than `sid`, with its
+    /// seller side on record. Keyed on the seller's node, not its address: a shop reached under
+    /// another name (an alias, or an address it moved from) is the same seller. The caller checks
+    /// the rest against the seller's signed `status`, under the receipt key of its terms now. With it, what the wallet's own book says left the wallet in
     /// that seller session across every session of the wallet that used it (the seller's totals are
     /// for its own session): the secrets released, and the tickets settled.
-    pub(crate) fn ticket_resumable(&self, payee: &str, base: &str, sid: &str) -> Option<(ticket::SellerSession, u64)> {
+    pub(crate) fn ticket_resumable(&self, payee: &str, sid: &str) -> Option<(ticket::SellerSession, u64)> {
         let now = self.engine.now();
         let g = self.ticket_store().ok()?;
         let st = g.as_ref()?;
         let old = st.book.sessions.values()
             .filter(|s| s.id != sid && s.payee == payee && s.state != SState::Open && now - s.stopped_ts.max(s.active_ts) < RESUME_WITHIN_S)
-            .filter(|s| s.http.as_ref().is_some_and(|h| h.base == base))
+            .filter(|s| s.http.is_some())
             .max_by(|a, b| a.stopped_ts.max(a.active_ts).total_cmp(&b.stopped_ts.max(b.active_ts)))?;
         let http = old.http.clone()?;
         let using: Vec<&str> = st.book.sessions.values().filter(|s| s.http.as_ref().is_some_and(|h| h.id == http.id)).map(|s| s.id.as_str()).collect();

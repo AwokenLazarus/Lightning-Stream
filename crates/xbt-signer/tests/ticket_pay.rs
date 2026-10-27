@@ -340,6 +340,16 @@ fn shop_config(origin: &str, upstream: &str, state: &std::path::Path, network: &
            "routes": routes()})
 }
 
+/// [`shop_config`], answering under a second name too (`public_aliases`): the same gateway at
+/// `localhost` on its port, as a shop that moved, or answers under two names, is.
+fn shop_config_aliased(origin: &str, upstream: &str, state: &std::path::Path, network: &str, conf: &Value) -> Value {
+    let mut c = shop_config(origin, upstream, state, network, conf);
+    if conf["alias"] == true {
+        c["public_aliases"] = json!([origin.replace("127.0.0.1", "localhost")]);
+    }
+    c
+}
+
 fn start_gateway(cfg: &Value, node: &Arc<SellerNode>, clock: &Arc<AtomicU64>, listener: TcpListener) -> (Arc<Gateway>, Running) {
     let c = clock.clone();
     let gw = Gateway::start(Config::from_json(cfg).unwrap(), node.clone(), receipt_secret(), Box::new(move || c.load(Ordering::SeqCst))).unwrap();
@@ -360,7 +370,7 @@ impl Shop {
         let port = listener.local_addr().unwrap().port();
         let state = tempfile::tempdir().unwrap();
         let (origin, upstream) = (format!("http://127.0.0.1:{port}"), format!("http://{}", service_running.addr));
-        let (gw, running) = start_gateway(&shop_config(&origin, &upstream, state.path(), network, &conf), &node, clock, listener);
+        let (gw, running) = start_gateway(&shop_config_aliased(&origin, &upstream, state.path(), network, &conf), &node, clock, listener);
         Self { gw, running: Some(running), node, standin, service, _service_running: service_running, upstream, state, origin, port, network: network.into(), clock: clock.clone(),
                conf }
     }
@@ -902,7 +912,9 @@ impl Rig {
         let network = xbt_signer::node::network(&*node, "regtest", None).unwrap().replacen("bip122:", "lightning:", 1);
         let shop = Shop::new(&network, &clock, shop_conf);
         let more: Vec<Shop> = more.iter().map(|conf| Shop::beside(&shop, conf.clone())).collect();
-        let origins: Vec<&String> = std::iter::once(&shop.origin).chain(more.iter().map(|m| &m.origin)).collect();
+        // a shop that answers under a second name is named under both
+        let alias = (shop.conf["alias"] == true).then(|| shop.origin.replace("127.0.0.1", "localhost"));
+        let origins: Vec<&String> = std::iter::once(&shop.origin).chain(alias.iter()).chain(more.iter().map(|m| &m.origin)).collect();
         let named_origins: Vec<Value> = std::iter::once(json!(PROVIDER)).chain(origins.iter().filter(|_| named).map(|o| json!(o))).collect();
         let mut pol = json!({"allowlist": named_origins,
                              "counterparties": origins.iter().map(|o| ((*o).clone(), json!({"ln_node": shop.id()}))).collect::<serde_json::Map<String, Value>>(),
@@ -1108,10 +1120,12 @@ fn a_page_is_paid_with_one_ticket_and_the_next_pages_from_the_balance() {
     assert_eq!((end["sessions"][0]["state"].as_str(), end["locked"]["tickets"].as_i64(), end["node"]["agree"].as_bool()), (Some("closed"), Some(0), Some(true)), "{end}");
     assert_eq!(r.money(), (TICKET, TICKET, TICKET, SETTLED), "what came back is booked back: one ticket and its fee stay");
     r.assert_booked();
-    // the next call opens a new session
+    // the next call opens a new session, which takes over the balance the stopped one left with the seller:
+    // no new ticket while it lasts
     let again = r.pay("/page/10", CALL);
-    assert_eq!((again["status"].as_u64(), again["tickets_released"].as_u64()), (Some(200), Some(1)), "{again}");
+    assert_eq!((again["status"].as_u64(), again["tickets_released"].as_u64()), (Some(200), Some(0)), "{again}");
     assert_ne!(again["session"], first["session"]);
+    assert_eq!(again["credited_msat"], json!(TICKET.to_string()), "the stopped session's credit: {again}");
 }
 
 /// The most a session leaves with the seller when it ends is under one ticket: a ticket is released
@@ -2120,9 +2134,12 @@ fn a_kill_of_the_signer_at_every_write_of_a_paid_call_never_undercounts_and_the_
         assert_eq!((paid, taken, book), (paid, paid, paid), "step {step}");
         assert_eq!(ledger, (paid / TICKET) as i64 * SETTLED, "step {step}: only what the seller took stays booked");
         assert!(paid <= TICKET, "step {step}: at most the one ticket of the call");
-        // the next call opens a new session and pays; nothing is paid twice
+        // the next call opens a new session and pays; nothing is paid twice. Where the seller took the call's
+        // ticket, the new session spends what is left of it; otherwise it releases one
         let v = r.pay("/page/10", CALL);
-        assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64()), (Some(200), Some(1)), "step {step}: {v}");
+        let released = v["tickets_released"].as_u64();
+        assert_eq!(v["status"].as_u64(), Some(200), "step {step}: {v}");
+        assert!(released == Some(1) || (released == Some(0) && taken == TICKET), "step {step}: {v}");
         r.assert_booked();
         if done.is_some() {
             break;
@@ -2280,9 +2297,9 @@ fn a_restart_of_the_gateway_or_of_the_signer_in_the_middle_of_a_session_resumes_
     assert_eq!(asked, 2);
     r.tick();
     assert_eq!(r.tap.seen("/x402/ticket/cancel").len(), asked, "and not again");
-    // the next call resumes with a new session
+    // the next call resumes with a new session, on the balance the old process left with the seller
     let v = r.pay("/page/10", CALL);
-    assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64()), (Some(200), Some(1)), "{v}");
+    assert_eq!((v["status"].as_u64(), v["tickets_released"].as_u64()), (Some(200), Some(0)), "{v}");
     assert_ne!(v["session"], first["session"]);
     // the seller forgets the session (its state directory is gone): the wallet is told plainly and opens another
     r.shop.down();
@@ -2467,11 +2484,12 @@ fn where_no_slot_is_free_for_a_held_ticket_the_wallet_buys_prepaid_ones_one_at_a
     }
     assert_eq!(first["tickets"]["prepaid"], 1);
     assert_eq!(r.status()["node"]["agree"], true);
-    // the channel empties: a new session holds tickets again
+    // the channel empties: a new session holds tickets again (the page itself is paid from what the stopped
+    // session left with the seller, which the new one takes over)
     r.call("ticket_stop", json!({"session": first["session"]}));
     r.ln.st.lock().unwrap().foreign = 0;
     let again = r.pay("/page/1000", CALL);
-    assert_eq!((again["tickets_released"].as_u64(), again["tickets_prepaid"].as_u64()), (Some(1), Some(0)), "{again}");
+    assert_eq!((again["tickets_released"].as_u64(), again["tickets_prepaid"].as_u64()), (Some(0), Some(0)), "{again}");
     assert_eq!(session_of(&r, &again)["pool"], 2);
 }
 
@@ -3977,6 +3995,29 @@ fn a_balance_left_with_the_seller_is_used_after_the_signer_starts_again() {
     assert_eq!(v["status"].as_u64(), Some(200), "{v}");
     assert_eq!(r.ln.state().payments.len(), paid, "no new ticket while the old balance lasts: {v}");
     assert_eq!(v["tickets_prepaid"].as_u64().unwrap_or(0), 0, "{v}");
+}
+
+/// Credit is the seller's, not its address's: a balance left with a shop is spent first when the
+/// same shop (its node and receipt key) is reached under another name, whether the session there is
+/// still open or was stopped.
+#[test]
+fn a_balance_left_with_the_seller_is_used_through_another_name_for_the_same_shop() {
+    let _g = env_lock();
+    for stop_first in [true, false] {
+        let mut conf = sized_shop(json!(["on-arrival"]), None);
+        conf["alias"] = true.into();
+        let r = Rig::shipped(json!({}), 30, conf);
+        let v = r.pay("/page/10", 2_000);
+        assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{v}");
+        if stop_first {
+            r.call("ticket_stop", json!({"session": v["session"]}));
+        }
+        let paid = r.ln.state().payments.len();
+        let alias = r.shop.url("/page/10").replace("127.0.0.1", "localhost");
+        let w = r.call("xbt402_pay", json!({"url": alias, "max_sats": 2_000, "task": "film"}));
+        assert_eq!(w["status"].as_u64(), Some(200), "stopped first {stop_first}: {w}");
+        assert_eq!(r.ln.state().payments.len(), paid, "stopped first {stop_first}: no new ticket while the balance lasts: {w}");
+    }
 }
 
 /// Held tickets are sized when the session opens: to the opening call's `max_sats` where the seller's

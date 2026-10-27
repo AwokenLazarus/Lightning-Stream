@@ -461,7 +461,7 @@ pub const MAINNET_ACK_ENV: &str = "B2_MAINNET_ACK_FILE";
 pub fn mainnet_ack_file() -> bool {
     let Some(path) = std::env::var_os(MAINNET_ACK_ENV).filter(|p| !p.is_empty()) else { return false };
     std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() <= 1024)
-        && std::fs::read_to_string(&path).is_ok_and(|s| s.trim() == xbt402::ticket::MAINNET_ACK)
+        && std::fs::read_to_string(&path).is_ok_and(|s| xbt402::ticket::is_mainnet_ack(s.trim()))
 }
 
 /// The owner's caps on mainnet where the policy does not set them: at most 4 tickets and 4,000
@@ -521,7 +521,7 @@ impl TicketPolicy {
                            // a widening for the sellers named in it: only well-formed entries for https origins
                            seller_tls: m.get("seller_tls").and_then(Value::as_object).into_iter().flatten()
                                .filter_map(|(k, v)| Some((seller_tls_origin(k)?, SellerTls::parse(v).ok()?))).collect(),
-                           mainnet_ack: m.get("mainnet_ack").and_then(Value::as_str) == Some(xbt402::ticket::MAINNET_ACK), mainnet_off: None,
+                           mainnet_ack: m.get("mainnet_ack").and_then(Value::as_str).is_some_and(xbt402::ticket::is_mainnet_ack), mainnet_off: None,
                            tasks: BTreeMap::new() };
         for (name, t) in m.get("tasks").and_then(Value::as_object).into_iter().flatten() {
             let Some(t) = t.as_object() else { continue };
@@ -561,8 +561,9 @@ impl TicketPolicy {
         p.mainnet_ack |= file_ack;
         if p.enabled && !p.mainnet_ack {
             p.enabled = false;
-            p.mainnet_off = Some(format!("on mainnet stream tickets and draws are off until the owner acknowledges {:?}, in the policy's tickets.mainnet_ack or \
-                                          in the file {MAINNET_ACK_ENV} names: this software has run on regtest only (docs/LIMITS.md)",
+            p.mainnet_off = Some(format!("mainnet_ack: the owner has not yet confirmed that the app may pay with real money, so nothing was paid. \
+                                          In the app: Settings → Your node → Pay with real money, tick the box and press Start paying \
+                                          (or acknowledge {:?} in the policy's tickets.mainnet_ack, or in the file {MAINNET_ACK_ENV} names; docs/LIMITS.md)",
                                          xbt402::ticket::MAINNET_ACK));
         }
         p
@@ -614,7 +615,7 @@ pub fn validate(raw: &Value, errors: &mut Vec<String>, warnings: &mut Vec<String
     }
     match m.get("mainnet_ack") {
         None => {}
-        Some(Value::String(a)) if a == xbt402::ticket::MAINNET_ACK => {}
+        Some(Value::String(a)) if xbt402::ticket::is_mainnet_ack(a) => {}
         Some(_) => errors.push(format!("policy.json tickets.mainnet_ack: is {:?}, word for word, or left out (it lets tickets and draws move funds on mainnet)",
                                        xbt402::ticket::MAINNET_ACK)),
     }
@@ -2027,10 +2028,15 @@ mod tests {
         let main = TicketPolicy::for_chain(m, "main", false);
         assert!(!main.enabled);
         assert!(main.mainnet_off.as_deref().is_some_and(|w| w.contains("tickets.mainnet_ack") && w.contains(xbt402::ticket::MAINNET_ACK)), "{main:?}");
+        // the owner is told, in words, where to confirm
+        assert!(main.mainnet_off.as_deref().is_some_and(|w| w.starts_with("mainnet_ack: ") && w.contains("Pay with real money") && w.contains("Start paying")), "{main:?}");
         let mut acked = on.clone();
         acked["mainnet_ack"] = xbt402::ticket::MAINNET_ACK.into();
         let main = TicketPolicy::for_chain(acked.as_object().unwrap(), "main", false);
         assert!(main.enabled && main.mainnet_off.is_none());
+        acked["mainnet_ack"] = xbt402::ticket::MAINNET_ACK_BEFORE.into();
+        assert!(TicketPolicy::for_chain(acked.as_object().unwrap(), "main", false).enabled, "a policy signed with the sentence before still counts");
+        acked["mainnet_ack"] = xbt402::ticket::MAINNET_ACK.into();
         assert_eq!((main.max_locked_tickets, main.max_locked_sats, main.max_sellers, main.max_new_sellers_per_min, main.max_sends_per_hour), (4, 4_000, 4, 4, 120));
         // what the owner set is what it set
         acked["max_locked_tickets"] = 9.into();
@@ -2061,6 +2067,8 @@ mod tests {
             got
         };
         assert!(read(Some(&format!("{}\n", xbt402::ticket::MAINNET_ACK))));
+        // a file written before the sentence changed keeps its acknowledgement
+        assert!(read(Some(xbt402::ticket::MAINNET_ACK_BEFORE)));
         assert!(!read(Some("yes")) && !read(Some(&xbt402::ticket::MAINNET_ACK.to_uppercase())) && !read(None));
         assert!(!mainnet_ack_file(), "no variable, no file");
     }

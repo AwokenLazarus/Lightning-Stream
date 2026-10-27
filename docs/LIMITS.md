@@ -940,7 +940,7 @@ release binaries (`scripts/ticket_e2e_regtest.sh`).
   hands on its first 12,000 bytes, its length and its hash. Stored files are never removed by
   the wallet.
 - On mainnet the wallet pays no ticket and no win unless its owner acknowledges it with the same
-  fixed sentence the gateway asks for ("real funds, software that has run on regtest only"):
+  fixed sentence the gateway asks for ("real funds, software tested on mainnet with small amounts only"):
   in the policy's `tickets.mainnet_ack`, or alone in a file the environment variable
   `B2_MAINNET_ACK_FILE` names (what a package's setup page writes; white space around it is
   allowed, anything else is no acknowledgement). Without it the rail is off, the signer says so at start, and

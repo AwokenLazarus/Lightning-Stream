@@ -90,8 +90,11 @@ The page is at **http://127.0.0.1:8482/**. From another machine, open an ssh tun
    the app**, on mainnet as everywhere: the rules turn paying on and set its limits. On mainnet the
    limits are low. The rules include a `hashrate` task with a small budget, so rented hashrate is paid
    under its own limit.
-3. **Confirm paying with real money.** On mainnet the Lightning page asks once: *Pay with real money*.
-   Tick the box and press *Start paying*. Until you do, the app pays nothing, even with the rules signed.
+3. **Confirm paying with real money.** On mainnet the app pays nothing until you confirm, once, that it
+   may pay with real money, even with the rules signed. After you sign, the app takes you to the
+   Lightning page (Settings → Your node): under *Pay with real money*, tick the box and press *Start
+   paying*. Until then Home and Setup show a *Start paying* link instead of "ready", and a refused buy
+   says the same.
 4. **Check the Lightning page.** It should say the app connected to your node and is ready. If it says
    your node holds more than your rules allow, press *Raise the limit* and sign.
 

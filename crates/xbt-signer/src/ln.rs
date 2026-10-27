@@ -1876,8 +1876,11 @@ impl Signer {
     /// HTLC locks, and recent payments.
     pub(crate) fn ln_status_locked(&self) -> Value {
         let pol = LnPolicy::from_map(&self.config().ln);
+        // on mainnet, tickets and draws are off until the owner confirms paying with real money: said here, so a
+        // front end never calls the wallet ready to pay without it
+        let ack_needed = self.ticket_policy().mainnet_off.is_some();
         let mut out = json!({"rail": "ln", "enabled": pol.enabled, "configured": self.ln.is_some(), "config_error": self.ln_error,
-                             "backend": self.ln.as_ref().map(|b| b.describe()), "halted": self.ln_book.halted()});
+                             "backend": self.ln.as_ref().map(|b| b.describe()), "halted": self.ln_book.halted(), "real_money_ack_needed": ack_needed});
         let (ln, pol) = match self.ln_ready() {
             Ok(x) => x,
             Err(d) => {

@@ -516,6 +516,36 @@ fn the_mainnet_starter_rules_set_the_node_s_exposure_cap_from_what_it_holds() {
     assert!(xbt_signer::policy::validate_policy(&m).0.is_empty(), "{m}");
 }
 
+/// On mainnet the app pays nothing until the owner confirms paying with real money: setup lists that
+/// step straight after the rules, the rules page says so with a link to it, and neither calls the
+/// wallet ready. Once the confirmation is on file, both are gone.
+#[test]
+fn on_mainnet_setup_and_the_rules_page_ask_for_the_real_money_confirmation() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let ack = tempfile::tempdir().unwrap();
+    let ack_file = ack.path().join("mainnet-ack");
+    std::env::set_var(xbt_signer::ticket::MAINNET_ACK_ENV, &ack_file);
+    let policy = json!({"ln": {"enabled": true, "exposure_cap_sats": 100_000}, "tickets": {"enabled": true, "tasks": {"default": {"budget_sats": 10_000}}}});
+    let b = start_on(Rig::build(policy, false, "main"), |_| {});
+    let mut br = logged_in(&b);
+    assert_eq!(b.rig.call("ln_status", json!({}))["real_money_ack_needed"], true);
+    let setup = unescape(&br.get("/setup").body);
+    let (rules, ack_step) = (setup.find("Your spending rules").unwrap(), setup.find("Pay with real money").expect("the step is listed"));
+    assert!(rules < ack_step && ack_step < setup.find("Your Lightning node").unwrap(), "straight after the rules");
+    assert!(setup.contains("./lightning#ack") && !setup.contains("Connected and ready to pay"), "{setup}");
+    let page = unescape(&br.get("/policy").body);
+    assert!(page.contains("pays nothing until you confirm") && page.contains("./lightning#ack"), "{page}");
+    // a refused buy says what to do, in words
+    let off = xbt_signer::ticket::TicketPolicy::for_chain(&serde_json::Map::new(), "main", false);
+    assert!(off.mainnet_off.is_none(), "tickets off by policy: no confirmation asked");
+    // confirmed: the step and the warning are gone
+    std::fs::write(&ack_file, format!("{}\n", xbt402::ticket::MAINNET_ACK)).unwrap();
+    assert_eq!(b.rig.call("ln_status", json!({}))["real_money_ack_needed"], false);
+    assert!(!unescape(&br.get("/setup").body).contains("Pay with real money"));
+    assert!(!unescape(&br.get("/policy").body).contains("pays nothing until you confirm"));
+    std::env::remove_var(xbt_signer::ticket::MAINNET_ACK_ENV);
+}
+
 /// Every field of the policy form on `page`, as a browser would post it.
 fn policy_form_fields(page: &str) -> Vec<(String, String)> {
     let mut form: Vec<(String, String)> = vec![("csrf".into(), field(page, "csrf")), ("mode".into(), "form".into())];
@@ -907,7 +937,7 @@ fn the_gateway_page_writes_a_config_the_gateway_takes_and_mainnet_is_asked_for()
     assert_eq!(c["listen"], json!("127.0.0.1:8402"));
     // mainnet: refused without the acknowledgement word for word; with it, the warning shows and the caps go low
     let r = send(&mut br, form("https://seller.example", "", "main", "yes"));
-    assert!(unescape(&r.body).contains(xbt_gateway::config::MAINNET_ACK) && unescape(&r.body).contains("regtest only"), "{}", r.body);
+    assert!(unescape(&r.body).contains(xbt_gateway::config::MAINNET_ACK) && unescape(&r.body).contains("small amounts only"), "{}", r.body);
     let r = send(&mut br, form("https://seller.example", "", "main", xbt_gateway::config::MAINNET_ACK));
     assert!(br.flash_after(&r).contains("mainnet"));
     let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
