@@ -121,7 +121,7 @@ fn notice_html(lines: &[&str]) -> String {
 
 /// What the wallet's page says before mainnet is turned on.
 pub const WALLET_MAINNET_NOTICE: [&str; 4] = [
-    "This app is new, and has been tested on test networks. With real money it pays from your Lightning node's channels.",
+    "This app is new, and is tested on mainnet with small amounts only. With real money it pays from your Lightning node's channels.",
     "The key you give lets the app pay anything your spending rules allow: keep their limits low (the starter rules do).",
     "A payment your rules allow is final: the app checks the seller's prices, not the seller's honesty.",
     "Read the limits of the software (docs/LIMITS.md in the source) before you rely on it.",
