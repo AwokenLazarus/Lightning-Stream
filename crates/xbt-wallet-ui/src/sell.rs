@@ -618,6 +618,21 @@ impl App {
         Ok(v)
     }
 
+    /// Hashrate is paid at the shop's address: a shop that moves takes its hashrate payments along.
+    fn follow_public_url(&self, shop: &Shop) -> Result<(), String> {
+        let mut v = self.hash_settings();
+        let base = shop.public_url.trim_end_matches('/');
+        if v.get("payUrl").and_then(Value::as_str).is_none() || base.is_empty() {
+            return Ok(());
+        }
+        let pay = format!("{base}/hashrate");
+        if v["payUrl"] != pay {
+            v["payUrl"] = json!(pay);
+            crate::app::hashrate::write_settings(&self.cfg.hash.settings, &v)?;
+        }
+        Ok(())
+    }
+
     /// Save the shop, and the gateway's config when the shop is complete. `Ok`: the words for
     /// the owner.
     pub(crate) fn commit(&self, shop: &Shop, done: &str) -> Result<String, String> {
@@ -920,7 +935,7 @@ impl App {
                     && !shop.public_url.starts_with("http://localhost") && !shop.public_url.starts_with("http://[::1]") {
                     Err("Buyers reach you at an https:// address, like https://films.example.com.".into())
                 } else {
-                    self.commit(&shop, "Saved.")
+                    self.commit(&shop, "Saved.").and_then(|words| self.follow_public_url(&shop).map(|()| words))
                 }
             }
             "check_public" => self.check_public(&shop),

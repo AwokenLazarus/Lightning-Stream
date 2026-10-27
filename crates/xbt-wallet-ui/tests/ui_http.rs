@@ -1460,6 +1460,8 @@ fn the_sell_page_sets_up_several_services_and_says_what_each_one_needs() {
     assert_eq!(r.status, 303);
     let cfg = |dir: &std::path::Path| xbt_gateway::config::Config::from_json(&serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap()).unwrap();
     let moved = cfg(&dir);
+    let st: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("hashrate-settings.json")).unwrap()).unwrap();
+    assert_eq!(st["payUrl"], "https://new.example/hashrate", "hashrate is paid at the new address");
     assert_eq!((moved.public_url.as_str(), moved.public_aliases.as_slice()), ("https://new.example", &["https://seller.example".to_string()][..]));
     let r = br.act("/sell", "/sell", &[("action", "shop"), ("name", "Mike's box"), ("public_url", "https://seller.example")]);
     assert_eq!(r.status, 303);

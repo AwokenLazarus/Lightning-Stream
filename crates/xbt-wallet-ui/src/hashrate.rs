@@ -111,7 +111,7 @@ fn ended_words(why: &str) -> String {
 }
 
 /// The settings file, with its dir's group (the hasher service reads it by group).
-fn write_settings(path: &std::path::Path, v: &Value) -> Result<(), String> {
+pub(crate) fn write_settings(path: &std::path::Path, v: &Value) -> Result<(), String> {
     let dir = path.parent().ok_or("no folder for the settings")?;
     let name = path.file_name().and_then(|n| n.to_str()).ok_or("no file name for the settings")?;
     if !dir.is_dir() {
