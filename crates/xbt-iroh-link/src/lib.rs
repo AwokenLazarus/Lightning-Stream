@@ -169,6 +169,12 @@ fn watch(conn: Connection, paths: Arc<Mutex<HashMap<EndpointId, Path>>>, detail:
     });
 }
 
+/// [`watch`], on the link's own runtime (for a caller on another runtime).
+fn watch_on(rt: &tokio::runtime::Runtime, conn: Connection, paths: Arc<Mutex<HashMap<EndpointId, Path>>>, detail: bool) {
+    let _guard = rt.enter();
+    watch(conn, paths, detail);
+}
+
 fn io_err(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
 }
@@ -327,6 +333,13 @@ impl Link {
         })
     }
 
+    /// Like [`Link::connect_conn`], from inside a task (it does not block a runtime thread).
+    pub async fn connect_conn_async(self: &Arc<Self>, endpoint_id_hex: &str) -> io::Result<Connection> {
+        let addr = self.addr_of(parse_id(endpoint_id_hex)?);
+        let conn = self.ep.connect(addr, self.alpn).await.map_err(io_err)?;
+        watch_on(&self.rt, conn.clone(), self.paths.clone(), self.detail.load(Ordering::Relaxed));
+        Ok(conn)
+    }
 
     /// Remembers where a seller can be found, from its checked listing.
     pub fn learn(&self, endpoint_id_hex: &str, hints: Hints) -> io::Result<()> {

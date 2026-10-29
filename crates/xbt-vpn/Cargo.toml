@@ -17,6 +17,11 @@ serde_json.workspace = true
 # a userspace TCP/IP stack: the buyer's app ends its devices' connections on its own side and carries
 # each as a flow
 ipstack = "=1.0.1"
+# WireGuard's protocol in user space: the buyer's app is the WireGuard peer its devices and router add
+boringtun = { version = "=0.7.1", default-features = false }
+# a device's WireGuard config as a QR code to scan
+qrcode = { version = "=0.14.1", default-features = false, features = ["svg"] }
+base64.workspace = true
 
 [dev-dependencies]
 # a client TCP/IP stack, to originate connections inside the tunnel in tests without a TUN device

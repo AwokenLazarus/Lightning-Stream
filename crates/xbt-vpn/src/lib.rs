@@ -10,10 +10,18 @@
 //! - [`flow`]: the protocol: each TCP connection one QUIC stream, UDP in datagrams with a flow number.
 //! - [`exit`]: a seller's exit: a buyer's flows become ordinary connections, with no TUN or NAT.
 //! - [`filter`]: which packets an exit carries (blocked ports, IPv6).
+//! - [`buyer`]: the buyer's devices' connections ended on the buyer's box and carried to exits.
+//! - [`wg`]: the buyer's WireGuard endpoint, which devices and routers add, and their configs and QR codes.
+//! - [`router`]: which exit a new flow goes to (best, sticky, or spread with each destination kept on one).
+//! - [`region`]: checking an exit's announced region against its egress address, offline.
 //! - [`meter`]: bytes carried each way, for payment. It never records where a packet was going.
 
+pub mod buyer;
 pub mod exit;
 pub mod filter;
 pub mod flow;
 pub mod meter;
+pub mod region;
+pub mod router;
 pub mod tunnel;
+pub mod wg;
