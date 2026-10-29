@@ -479,7 +479,12 @@ impl App {
         }
         let mut c: Map<String, Value> = self.gateway_now().and_then(|v| v.as_object().cloned()).unwrap_or_default();
         let old_routes: Vec<Value> = c.get("routes").and_then(Value::as_array).cloned().unwrap_or_default();
-        c.insert("listen".into(), json!(if public_url.starts_with("https://") { format!("0.0.0.0:{}", gw.port) } else { format!("127.0.0.1:{}", gw.port) }));
+        // a direct shop listens where the app reaches it: its own loopback when the app runs beside it
+        // (Linux), the app's private network otherwise (Umbrel, StartOS: the port is published nowhere)
+        let app_beside = gw.health_url.as_deref().and_then(crate::services::http_origin)
+            .is_none_or(|o| o.starts_with("http://127.") || o.starts_with("http://localhost") || o.starts_with("http://[::1]"));
+        let open = public_url.starts_with("https://") || (shop.direct && !app_beside);
+        c.insert("listen".into(), json!(if open { format!("0.0.0.0:{}", gw.port) } else { format!("127.0.0.1:{}", gw.port) }));
         // a shop that moves keeps answering at its old address, for the buyers that saved it
         let mut aliases: Vec<String> = c.get("public_aliases").and_then(Value::as_array).into_iter().flatten()
             .filter_map(Value::as_str).map(str::to_string).collect();

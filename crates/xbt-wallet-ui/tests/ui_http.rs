@@ -2463,7 +2463,7 @@ fn a_shop_reached_directly_writes_a_link_and_no_web_address() {
     assert!(c.get("public_url").is_none(), "{c}");
     assert_eq!(c["link"], json!({"relays": ["https://iroh.lazarus-xbt.xyz"], "private": true}));
     assert_eq!(c["nostr"]["publish"], true, "a direct shop is found on Nostr");
-    assert!(c["listen"].as_str().unwrap().starts_with("127.0.0.1:"), "nothing listens beyond the box");
+    assert!(c["listen"].as_str().unwrap().starts_with("127.0.0.1:"), "with the app beside it (no health address), only on loopback");
     // the page keeps the choice; the https address went with "web"
     let page = br.get("/sell").body;
     assert!(page.contains("value=\"direct\" checked") && page.contains("name=\"private\" value=\"1\" checked"), "{page}");

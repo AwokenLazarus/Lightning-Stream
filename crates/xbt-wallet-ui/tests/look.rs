@@ -95,6 +95,7 @@ fn the_look_in_headless_chrome() {
     let film = "https://media.example/Videos/1/stream?static=true";
     let data = tempfile::tempdir().unwrap();
     let services = data.path().join("services.json");
+    let home_shop = xbt402::shop::origin_for(&[0x5a; 32]);
     std::fs::write(&services, json!([
         {"name": "Creative Commons films", "kind": "video", "seller": "https://media.example", "price_text": "20 sat a MiB",
          "items": [{"title": "Big Buck Bunny", "year": 2008, "url": film, "credit": "(c) Blender Foundation, CC BY 3.0"},
@@ -104,7 +105,10 @@ fn the_look_in_headless_chrome() {
          "items": []},
         {"name": "Weather data", "kind": "api", "seller": "https://weather.example", "price_text": "1 sat a request", "items": []},
         {"name": "Open lectures", "kind": "video", "seller": "https://lectures.example", "price_text": "12 sat a MiB",
-         "items": [{"title": "Tears of Steel", "year": 2012, "url": "https://lectures.example/v/4", "credit": "(c) Blender Foundation, CC BY 3.0"}]}
+         "items": [{"title": "Tears of Steel", "year": 2012, "url": "https://lectures.example/v/4", "credit": "(c) Blender Foundation, CC BY 3.0"}]},
+        // a shop without a web address, known by its key (docs/DIRECT-LINKS.md)
+        {"name": "Home films", "kind": "video", "seller": home_shop, "price_text": "1 sat a MiB",
+         "items": [{"title": "Cosmos Laundromat", "year": 2015, "url": format!("{home_shop}/v/5"), "credit": "(c) Blender Foundation, CC BY 4.0"}]}
     ]).to_string()).unwrap();
     let mut cfg = Config::for_test(sock_path, data.path().join("ui"), "127.0.0.1:0");
     cfg.services_file = Some(services);
