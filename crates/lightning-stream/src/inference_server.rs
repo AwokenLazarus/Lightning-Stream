@@ -47,6 +47,7 @@ const HEAD_LINE: u64 = 4096;
 /// `max_tokens` when a request names none, for the bound of what it may cost.
 const DEFAULT_MAX_TOKENS: u64 = 1024;
 
+#[derive(Clone)]
 pub struct Config {
     /// The signer's socket.
     pub signer: PathBuf,
@@ -58,9 +59,10 @@ pub struct Config {
     pub max_sats: i64,
     /// The credential store (AI keys and local links).
     pub credentials: PathBuf,
-    /// The sellers the app allowed for AI (JSON: `{"sellers": [{"name", "route", "prices", "max_output"}]}`).
+    /// The sellers the app offers for AI and the owner's pins and blocks, written by the app (JSON:
+    /// `{"sellers": [{"name", "route", "prices", "max_output"}], "pinned": [names], "blocked": [names]}`).
     pub sellers: PathBuf,
-    /// The router's health record and the owner's pins and blocks (JSON, written by the server).
+    /// The sellers' health record (JSON, written by this server; the app only reads it).
     pub state: PathBuf,
     /// How long a seller has for the first byte of its answer before the next is tried.
     pub first_byte: Duration,
@@ -72,10 +74,12 @@ struct Inner {
     store: Store,
     router: Router,
     fetched: Option<Instant>,
+    /// A fetch of the catalogue is running in the background.
+    fetching: bool,
 }
 
 pub struct AiServer {
-    cfg: Config,
+    cfg: Arc<Config>,
     inner: Arc<Mutex<Inner>>,
 }
 
@@ -104,12 +108,10 @@ fn listen_stream(path: &Path) -> io::Result<UnixListener> {
 fn state_json(r: &Router) -> Value {
     let health: serde_json::Map<String, Value> = r.health.iter().map(|(k, h)| (k.clone(), json!({
         "ttft_ms": h.ttft_ms, "fails_in_a_row": h.fails_in_a_row, "cooled_at": h.cooled_at, "ok": h.ok, "failed": h.failed}))).collect();
-    json!({"version": 1, "health": health, "pinned": r.prefs.pinned, "blocked": r.prefs.blocked})
+    json!({"version": 1, "health": health})
 }
 
 fn state_from(v: &Value, r: &mut Router) {
-    let strs = |k: &str| v.get(k).and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect::<Vec<_>>();
-    r.prefs = Prefs { pinned: strs("pinned"), blocked: strs("blocked") };
     for (k, h) in v.get("health").and_then(Value::as_object).into_iter().flatten() {
         let n = |f: &str| h.get(f).and_then(Value::as_u64).unwrap_or(0);
         r.health.insert(k.clone(), Health {
@@ -233,6 +235,29 @@ fn begin(cfg: &Config, method: &str, url: &str, body: &[u8], max_sats: i64, firs
     Ok(Begun { status, content_type, first, rest: src, done: rx, ttft: started.elapsed() })
 }
 
+/// The sellers' model lists, asked of them through the signer with nothing to spend, and the
+/// owner's pins and blocks, from the sellers file the app writes.
+fn fetch_catalogue(cfg: &Config) -> (Catalogue, Prefs) {
+    let sellers: Value = std::fs::read(&cfg.sellers).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+    let mut cat = Catalogue::default();
+    for s in sellers.get("sellers").and_then(Value::as_array).into_iter().flatten() {
+        let (Some(name), Some(route)) = (s.get("name").and_then(Value::as_str), s.get("route").and_then(Value::as_str)) else { continue };
+        if !route.ends_with('/') {
+            continue;
+        }
+        let max_output = s.get("max_output").and_then(Value::as_u64).unwrap_or(0);
+        let prices = s.get("prices").cloned().unwrap_or(Value::Null);
+        let Ok(mut b) = begin(cfg, "GET", &format!("{route}v1/models"), &[], 0, cfg.first_byte) else { continue };
+        let mut body = std::mem::take(&mut b.first);
+        let _ = (&mut b.rest).take(1 << 20).read_to_end(&mut body);
+        if let Ok(models) = serde_json::from_slice::<Value>(&body) {
+            cat.add_seller(name, route, &prices, max_output, &models);
+        }
+    }
+    let strs = |k: &str| sellers.get(k).and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect::<Vec<_>>();
+    (cat, Prefs { pinned: strs("pinned"), blocked: strs("blocked") })
+}
+
 impl AiServer {
     pub fn new(cfg: Config) -> io::Result<Self> {
         let store = Store::open(&cfg.credentials)?;
@@ -242,7 +267,47 @@ impl AiServer {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        Ok(Self { cfg, inner: Arc::new(Mutex::new(Inner { store, router, fetched: None })) })
+        let me = Self { cfg: Arc::new(cfg), inner: Arc::new(Mutex::new(Inner { store, router, fetched: None, fetching: false })) };
+        // the sellers' model lists are asked for at once, in the background: the first request does not wait for all of them
+        me.fetch_in_background();
+        Ok(me)
+    }
+
+    /// Starts a fetch of the catalogue in the background, unless one is running.
+    fn fetch_in_background(&self) {
+        {
+            let mut g = lock(&self.inner);
+            if g.fetching {
+                return;
+            }
+            g.fetching = true;
+        }
+        let (cfg, inner) = (Arc::clone(&self.cfg), Arc::clone(&self.inner));
+        std::thread::spawn(move || {
+            let (cat, prefs) = fetch_catalogue(&cfg);
+            let mut g = lock(&inner);
+            g.router.catalogue = cat;
+            g.router.prefs = prefs;
+            g.fetched = Some(Instant::now());
+            g.fetching = false;
+        });
+    }
+
+    /// The catalogue for a request: a stale one is refreshed in the background and used meanwhile;
+    /// before the first fetch has ended, the request waits for it (at most `first_byte`).
+    fn refresh(&self) {
+        let fetched = lock(&self.inner).fetched;
+        match fetched {
+            Some(t) if t.elapsed() <= CATALOGUE_TTL => {}
+            Some(_) => self.fetch_in_background(),
+            None => {
+                self.fetch_in_background();
+                let end = Instant::now() + self.cfg.first_byte.max(Duration::from_secs(2));
+                while lock(&self.inner).fetched.is_none() && Instant::now() < end {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
     }
 
     /// Re-reads the credential store (the app makes and revokes keys in it).
@@ -250,33 +315,6 @@ impl AiServer {
         if let Ok(s) = Store::open(&self.cfg.credentials) {
             inner.store = s;
         }
-    }
-
-    /// The catalogue, asked of the sellers again when it is older than [`CATALOGUE_TTL`].
-    fn refresh(&self) {
-        let stale = lock(&self.inner).fetched.is_none_or(|t| t.elapsed() > CATALOGUE_TTL);
-        if !stale {
-            return;
-        }
-        let sellers: Value = std::fs::read(&self.cfg.sellers).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
-        let mut cat = Catalogue::default();
-        for s in sellers.get("sellers").and_then(Value::as_array).into_iter().flatten() {
-            let (Some(name), Some(route)) = (s.get("name").and_then(Value::as_str), s.get("route").and_then(Value::as_str)) else { continue };
-            if !route.ends_with('/') {
-                continue;
-            }
-            let max_output = s.get("max_output").and_then(Value::as_u64).unwrap_or(0);
-            let prices = s.get("prices").cloned().unwrap_or(Value::Null);
-            let Ok(mut b) = begin(&self.cfg, "GET", &format!("{route}v1/models"), &[], 0, self.cfg.first_byte) else { continue };
-            let mut body = std::mem::take(&mut b.first);
-            let _ = (&mut b.rest).take(1 << 20).read_to_end(&mut body);
-            if let Ok(models) = serde_json::from_slice::<Value>(&body) {
-                cat.add_seller(name, route, &prices, max_output, &models);
-            }
-        }
-        let mut inner = lock(&self.inner);
-        inner.router.catalogue = cat;
-        inner.fetched = Some(Instant::now());
     }
 
     fn save_state(&self, inner: &Inner) {

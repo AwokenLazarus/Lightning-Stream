@@ -32,6 +32,8 @@ enum Plan {
     Cut(u64),
 }
 
+const EMBEDDING: &str = "{\"object\":\"list\",\"data\":[{\"object\":\"embedding\",\"index\":0,\"embedding\":[0.1,0.2]}]}";
+
 const ANSWER: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\" there\"}}]}\n\ndata: [DONE]\n\n";
 
 struct Sellers {
@@ -71,6 +73,12 @@ fn signer(dir: &Path, sellers: Arc<Mutex<Sellers>>) -> PathBuf {
                 } else {
                     let plan = { let mut g = sellers.lock().unwrap(); g.calls.push((url.clone(), serde_json::from_str(p["body"].as_str().unwrap()).unwrap())); g.plans[&seller] };
                     match plan {
+                        Plan::Answer(msat) if url.ends_with("/v1/embeddings") => {
+                            let mut s = connect();
+                            writeln!(s, "{}", head(200, "application/json")).unwrap();
+                            s.write_all(EMBEDDING.as_bytes()).unwrap();
+                            json!({"verdict": "allow", "rail": "ticket", "status": 200, "complete": true, "price_msat": msat.to_string(), "charged_sats": 900})
+                        }
                         Plan::Answer(msat) => {
                             let mut s = connect();
                             writeln!(s, "{}", head(200, "text/event-stream")).unwrap();
@@ -278,4 +286,26 @@ fn a_web_page_cannot_use_the_endpoint() {
     assert_eq!(status, 403);
     let (status, _, _) = call(&r.addr, "GET", "/v1/models", Some(&r.key), "Sec-Fetch-Site: cross-site\r\n", "");
     assert_eq!(status, 403);
+}
+
+#[test]
+fn an_embedding_request_goes_to_the_sellers_embeddings_and_comes_back_whole() {
+    let r = rig(Plan::Answer(42), Plan::Answer(1), 100);
+    let (status, head, body) = call(&r.addr, "POST", "/v1/embeddings", Some(&r.key), "", &json!({"model": "llama", "input": "hello"}).to_string());
+    assert_eq!(status, 200, "{body}");
+    assert!(head.to_ascii_lowercase().contains("content-type: application/json"));
+    assert_eq!(body, EMBEDDING);
+    let calls = r.sellers.lock().unwrap().calls.clone();
+    assert_eq!(calls[0].0, "https://cheap.example/ai/v1/embeddings");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(spent(&r), 42);
+}
+
+#[test]
+fn the_first_request_of_a_fresh_endpoint_waits_for_the_catalogue_fetched_in_the_background() {
+    // the rig's endpoint starts fetching the model lists when it starts; a request straight after finds the model
+    let r = rig(Plan::Answer(5), Plan::Answer(9), 100);
+    let (status, _, body) = chat(&r, "qwen");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(sellers_called(&r), ["cheap.example"]);
 }
