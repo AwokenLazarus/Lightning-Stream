@@ -218,3 +218,38 @@ fn a_listing_of_several_services_goes_out_and_comes_back_whole() {
     assert_eq!(names, ["Films", "Model"]);
     assert_eq!(got[0].listing.services[1].path, "/ai/");
 }
+
+fn keys(seed: u8) -> Keys {
+    Keys::new(SecretKey::from_slice(&[seed; 32]).unwrap())
+}
+
+#[test]
+fn a_shop_without_a_web_address_is_listed_only_by_its_own_nostr_key() {
+    let (sk, pk) = receipt(b"shop");
+    let own = keys(41);
+    let shop = xbt402::shop::origin_for(&own.public.serialize());
+    let ev = event(&own, &sk, &pk, &shop, "Home films", now());
+    let n = market::read_event(&ev, now()).unwrap();
+    assert_eq!(n.listing.seller, shop);
+    // another key, even with a binding the receipt key made for it, may not list that shop
+    let other = keys(42);
+    let doc = signed(&sk, &pk, &shop, "Home films");
+    let bind = listing::bind(&sk, &other.public.serialize(), &shop);
+    assert!(market::listing_event(&other, &doc, &bind, now()).is_err());
+    let forged = resign(&other, &ev, set_tag(&ev.tags, market::BIND_TAG, &bind));
+    assert!(market::read_event(&forged, now()).is_err());
+}
+
+#[test]
+fn a_transport_document_rides_in_its_own_tag_and_comes_back() {
+    let (sk, pk) = receipt(b"shop-t");
+    let own = keys(43);
+    let shop = xbt402::shop::origin_for(&own.public.serialize());
+    let doc = signed(&sk, &pk, &shop, "Home films");
+    let bind = listing::bind(&sk, &own.public.serialize(), &shop);
+    let link = xbt402::transport::Link { kind: "iroh".into(), endpoint_id: "1".repeat(64), relays: vec![], direct: vec![], expires: 9_999_999_999, node_sig: "s".into() };
+    let t = xbt402::transport::sign(&sk, &xbt402::transport::document(&shop, &pk, &[link], "2026-10-29"));
+    let ev = market::listing_event_with(&own, &doc, &bind, Some(&t), now()).unwrap();
+    assert_eq!(market::read_event(&ev, now()).unwrap().transport, Some(t));
+    assert_eq!(market::read_event(&event(&own, &sk, &pk, &shop, "x", now()), now()).unwrap().transport, None);
+}
