@@ -79,11 +79,6 @@ fn seller_tag(origin: &str) -> String {
     hex::encode(&Sha256::digest(origin.as_bytes())[..4])
 }
 
-/// `scheme://host[:port]/` of a URL, lower case.
-fn origin_of(url: &str) -> String {
-    crate::services::http_origin(url).unwrap_or_default()
-}
-
 /// A JSON request to the connector, which is on this box's loopback.
 fn connector_json(method: &str, url: &str, body: Option<&Value>) -> Result<(u16, Value), String> {
     let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(10)).redirects(0).build();
@@ -110,8 +105,9 @@ impl App {
         self.apps.live.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
-    /// A port for `seller`: the one it had, else a free one, else the one given out longest ago.
-    /// `true`: the port's storage was another seller's.
+    /// A port for the app at `app` (its base URL): the one it had, else a free one, else the one
+    /// given out longest ago. One app to a port, so two apps of one seller open at once are two
+    /// origins, with two sets of cookies and storage. `true`: the port's storage was another app's.
     fn port_for(&self, seller: &str) -> Option<(u16, bool)> {
         let ports = self.app_ports();
         let ports = ports.as_slice();
@@ -184,8 +180,8 @@ impl App {
             self.flash(ctx, false, "Set a limit of 1 sat or more.");
             return Resp::redirect(&format!("./app?u={}&b={}", crate::services::urlenc(&entry), crate::services::urlenc(&base)));
         }
-        let seller = origin_of(&base);
-        let Some((port, other)) = self.port_for(&seller) else {
+        // one port, one cookie prefix, for each app: a seller's two apps never share a page's state
+        let Some((port, other)) = self.port_for(&base) else {
             self.flash(ctx, false, "This box does not open sellers' apps.");
             return Resp::redirect("./browse");
         };
@@ -204,7 +200,7 @@ impl App {
             }
         };
         let path = entry.strip_prefix(&base).unwrap_or("");
-        let grant = Grant { visit: visit.clone(), port, base: base.clone(), entry: format!("/{path}"), tag: seller_tag(&seller), direct };
+        let grant = Grant { visit: visit.clone(), port, base: base.clone(), entry: format!("/{path}"), tag: seller_tag(&base), direct };
         let code = secret();
         {
             let mut s = self.apps.lock();

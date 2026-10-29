@@ -178,6 +178,35 @@ pub struct OfferApp {
     /// A header the shop adds to every request of the page (`Name: value`): the seller's guest
     /// login, for a service that needs one. Empty: none.
     pub login: String,
+    /// Paths of the app buyers may not open (its admin, other users'), as the app sees them.
+    pub deny: Vec<String>,
+    /// When not empty, the only paths of the app buyers may open; where a path is under entries of
+    /// both lists, the longer one decides (docs/SELLER-APPS.md).
+    pub allow: Vec<String>,
+    /// The page's live connections (WebSockets) are carried, paid for by the byte.
+    pub live: bool,
+}
+
+impl OfferApp {
+    /// A path of the app (as the app sees it) as the shop's route sees it: under `base`.
+    fn shop_path(&self, p: &str) -> String {
+        format!("{}{}", self.base.trim_end_matches('/'), if p.starts_with('/') { p.to_string() } else { format!("/{p}") })
+    }
+}
+
+/// The paths a seller lists for an app, one per line or comma-separated: each starts with `/`.
+fn app_paths(text: &str) -> Result<Vec<String>, String> {
+    let mut out = vec![];
+    for p in text.split(['\n', ',']).map(str::trim).filter(|p| !p.is_empty()) {
+        if !p.starts_with('/') || p.len() > 400 || p.contains(['?', '#', '%', ' ', '\\']) {
+            return Err(format!("{p} is not a path: it starts with / and has no spaces."));
+        }
+        if out.len() >= 60 {
+            return Err("At most 60 paths.".into());
+        }
+        out.push(p.to_string());
+    }
+    Ok(out)
 }
 
 /// Request headers a web app needs passed to its service: its cookies, its login and its
@@ -208,8 +237,29 @@ fn app_route(m: &mut Map<String, Value>, app: Option<&OfferApp>) {
     let Some(app) = app else {
         m.remove("accept_gzip");
         m.remove("upstream_headers");
+        m.remove("deny_paths");
+        m.remove("allow_paths");
+        m.remove("websocket");
         return;
     };
+    let paths = |list: &[String]| json!(list.iter().map(|p| app.shop_path(p)).collect::<Vec<_>>());
+    if app.deny.is_empty() {
+        m.remove("deny_paths");
+    } else {
+        m.insert("deny_paths".into(), paths(&app.deny));
+    }
+    if app.allow.is_empty() {
+        m.remove("allow_paths");
+    } else {
+        m.insert("allow_paths".into(), paths(&app.allow));
+    }
+    // a live connection is paid for by the byte: a route priced by the second or the token cannot carry one
+    let by_byte = m.get("price").and_then(Value::as_object).is_none_or(|p| !p.keys().any(|k| k.contains("second") || k.contains("1k")));
+    if app.live && by_byte {
+        m.insert("websocket".into(), json!(true));
+    } else {
+        m.remove("websocket");
+    }
     m.insert("methods".into(), json!(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]));
     let body = m.get("max_body").and_then(Value::as_u64).unwrap_or(0).max(MIB);
     m.insert("max_body".into(), json!(body));
@@ -309,7 +359,7 @@ fn offer_json(o: &Offer) -> Value {
            "paused": o.paused, "paths": o.paths, "strip": o.strip,
            "titles": o.titles.iter().map(|(t, u)| json!({"title": t, "url": u})).collect::<Vec<_>>()});
     if let Some(a) = &o.app {
-        v["app"] = json!({"base": a.base, "entry": a.entry, "login": a.login});
+        v["app"] = json!({"base": a.base, "entry": a.entry, "login": a.login, "deny": a.deny, "allow": a.allow, "live": a.live});
     }
     v
 }
@@ -332,7 +382,9 @@ fn offer_of(v: &Value) -> Option<Offer> {
         }).collect()).unwrap_or_default(),
         app: v.get("app").filter(|a| a.is_object()).map(|a| {
             let t = |k: &str| a.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-            OfferApp { base: t("base"), entry: t("entry"), login: t("login") }
+            let list = |k: &str| a.get(k).and_then(Value::as_array).map(|x| x.iter().filter_map(|p| p.as_str().map(str::to_string)).collect()).unwrap_or_default();
+            // an app saved before live connections were carried has them on
+            OfferApp { base: t("base"), entry: t("entry"), login: t("login"), deny: list("deny"), allow: list("allow"), live: a.get("live").and_then(Value::as_bool).unwrap_or(true) }
         }).filter(|a| a.base.starts_with('/') && a.base.ends_with('/')),
     })
 }
@@ -969,7 +1021,13 @@ impl App {
             <label>Where it opens <small>(empty: the same)</small><input name=\"app_entry\" value=\"{}\" class=\"mono\" placeholder=\"/web/\"></label>\
             <label>A guest login the shop adds to every request <small>(optional, <code>Name: value</code>)</small>\
             <input name=\"app_login\" value=\"{}\" class=\"mono\" autocomplete=\"off\" placeholder=\"Authorization: MediaBrowser Token=…\"></label>\
-            <p class=\"hint\">For a service whose page asks for a login. It goes from your shop to the service only, never to buyers.</p></details>\
+            <p class=\"hint\">For a service whose page asks for a login. It goes from your shop to the service only, never to buyers.</p>\
+            <label class=\"check\"><input type=\"checkbox\" name=\"app_live\" value=\"1\"{}> Live updates (WebSockets), paid for by what they carry</label>\
+            <label>Paths buyers may not open, one per line <small>(its admin and settings, other users')</small>\
+            <textarea name=\"app_deny\" rows=\"4\" class=\"mono\" placeholder=\"/System/&#10;/Sessions\">{}</textarea></label>\
+            <label>Only these paths <small>(optional, one per line)</small><textarea name=\"app_allow\" rows=\"3\" class=\"mono\">{}</textarea></label>\
+            <p class=\"hint\">Paths as the page sees them. Where a path is under entries of both lists, the longer one decides: \
+            <code>/</code> in the second list and <code>/Users</code> in the first refuse <code>/Users</code> but serve the rest.</p></details>\
             <details><summary>Advanced</summary>\
             <label>Items to list for buyers (films, files, models…), one per line: <code>name | link</code><textarea name=\"titles\" rows=\"4\" class=\"mono\">{}</textarea></label>\
             <p class=\"hint\">A link may start with <code>/</code>: it is then on your shop's address.</p>\
@@ -987,6 +1045,9 @@ impl App {
             if kind == Kind::Media { "/" } else { "the path it is sold under" },
             esc(&fv("app_entry", editing.and_then(|o| o.app.as_ref()).filter(|a| a.entry != a.base).map(|a| a.entry.clone()).unwrap_or_default())),
             esc(&fv("app_login", editing.and_then(|o| o.app.as_ref()).map(|a| a.login.clone()).unwrap_or_default())),
+            if editing.and_then(|o| o.app.as_ref()).is_none_or(|a| a.live) { " checked" } else { "" },
+            esc(&fv("app_deny", editing.and_then(|o| o.app.as_ref()).map(|a| a.deny.join("\n")).unwrap_or_default())),
+            esc(&fv("app_allow", editing.and_then(|o| o.app.as_ref()).map(|a| a.allow.join("\n")).unwrap_or_default())),
             esc(&fv("titles", titles)),
             esc(&fv("paths", editing.map(|o| o.paths.join(", ")).unwrap_or_default())),
             if fv("strip", editing.map(|o| if o.strip { "1" } else { "" }.to_string()).unwrap_or_else(|| "1".into())) == "1" { " checked" } else { "" },
@@ -1125,7 +1186,8 @@ impl App {
                     }
                     let login = g("app_login").trim().to_string();
                     login_header(&login)?;
-                    Some(OfferApp { base, entry, login })
+                    let (deny, allow) = (app_paths(&g("app_deny"))?, app_paths(&g("app_allow"))?);
+                    Some(OfferApp { base, entry, login, deny, allow, live: g("app_live") == "1" })
                 } else {
                     None
                 };

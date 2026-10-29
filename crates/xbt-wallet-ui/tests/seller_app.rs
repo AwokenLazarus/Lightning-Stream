@@ -144,6 +144,10 @@ impl xbt_svc::http::Handler for Seller {
                 Reply::Whole(Response::new(200, vec![("Content-Type".into(), "application/json".into())],
                                            json!({"Items": [{"Name": "Big Buck Bunny"}, {"Name": "Sintel"}]}).to_string().into_bytes()))
             }
+            // the same seller's second app: a podcast player, with a cookie of its own, that says which cookies reached it
+            ("GET", "/pod/") => Reply::Whole(Response::new(200, vec![("Content-Type".into(), "text/html; charset=utf-8".into()),
+                ("Set-Cookie".into(), "podsess=p1; Path=/".into())], b"<!doctype html><title>pod</title><h1>Podcasts</h1>".to_vec())),
+            ("GET", "/pod/me") => ok("application/json", &json!({"cookie": req.header("Cookie").unwrap_or("")}).to_string()),
             ("GET", "/evil/") => ok("text/html; charset=utf-8", EVIL_PAGE),
             ("GET", "/evil/evil.js") => ok("text/javascript", EVIL_JS),
             ("POST", "/evil/report") => {
@@ -514,4 +518,99 @@ fn the_owner_previews_their_own_shops_page_for_free() {
     let body = agent.get(&format!("http://127.0.0.1:{port}/web/")).set("Cookie", &cookie).call().unwrap().into_string().unwrap();
     assert!(body.contains("media server"), "{body}");
     assert!(paid_urls.lock().unwrap().is_empty(), "the preview went through the connector");
+}
+
+/// One seller, two apps (a media server and a podcast player), opened by one buyer at once: each is
+/// its own visit with its own limit, on its own port, so neither page sees the other's cookies, and
+/// stopping one leaves the other open.
+#[test]
+fn two_apps_of_one_seller_are_two_visits_on_two_origins() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let sl = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let seller = format!("http://{}", sl.local_addr().unwrap());
+    let _srun = xbt_svc::http::serve(Arc::new(Seller { report: Arc::new(Mutex::new(None)) }), sl, 8).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (pay_sock, paid_urls) = signer(dir.path());
+    let crun = lightning_stream::serve(lightning_stream::Config { signer: pay_sock, stream_dir: dir.path().to_path_buf(), task: "app".into(), max_sats: 2_000 },
+                                       std::net::TcpListener::bind("127.0.0.1:0").unwrap()).unwrap();
+    let rig = Rig::new(json!({}), true);
+    let sock_path = rig.dir.path().join("signer.sock");
+    let _sock = xbt_signer::server::spawn(rig.s.clone(), &sock_path, false).unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(data.path().join("ui")).unwrap();
+    let (jf, pod) = (format!("{seller}/jf/"), format!("{seller}/pod/"));
+    std::fs::write(data.path().join("ui/services.json"), json!([
+        {"name": "Films", "kind": "video", "seller": seller, "price_text": "20 sat a MiB", "items": [], "app": format!("{jf}web/"), "app_base": jf},
+        {"name": "Podcasts", "kind": "api", "seller": seller, "price_text": "1 sat a request", "items": [], "app": pod, "app_base": pod}]).to_string()).unwrap();
+    let (srv, ports) = spawn_ui(2, |ports| {
+        let mut cfg = Config::for_test(sock_path.clone(), data.path().join("ui"), "127.0.0.1:0");
+        cfg.connector = format!("http://{}", crun.addr);
+        cfg.app_ports = ports;
+        cfg
+    });
+    let wallet = format!("http://{}", srv.addr);
+    let agent = ureq::AgentBuilder::new().redirects(0).build();
+    let send = |method: &str, url: &str, cookie: &str, body: Option<&str>| -> (u16, Vec<(String, String)>, String) {
+        let mut r = agent.request(method, url);
+        if !cookie.is_empty() {
+            r = r.set("Cookie", cookie);
+        }
+        let resp = match match body { Some(b) => r.set("Content-Type", "application/x-www-form-urlencoded").send_string(b), None => r.call() } {
+            Ok(x) | Err(ureq::Error::Status(_, x)) => x,
+            Err(e) => panic!("{url}: {e}"),
+        };
+        let headers = resp.headers_names().iter().flat_map(|n| resp.all(n).into_iter().map(|v| (n.to_ascii_lowercase(), v.to_string())).collect::<Vec<_>>()).collect();
+        (resp.status(), headers, resp.into_string().unwrap_or_default())
+    };
+    let cookie_of = |h: &[(String, String)], name: &str| h.iter().filter(|(k, _)| k == "set-cookie").find_map(|(_, v)| v.split(';').next().filter(|c| c.contains(name)).map(str::to_string));
+    let code = std::fs::read_to_string(data.path().join("ui/setup-code")).unwrap();
+    let (st, h, _) = send("POST", &format!("{wallet}/setup-password"), "", Some(&format!("code={}&password=a+long+box+password&password2=a+long+box+password", code.trim())));
+    assert_eq!(st, 303);
+    let session = cookie_of(&h, "xbt").expect("a session cookie");
+    let field = |page: &str, attr: &str| { let i = page.find(&format!("{attr}=\"")).unwrap() + attr.len() + 2; page[i..i + page[i..].find('"').unwrap()].to_string() };
+    let enc = xbt_wallet_ui::services::urlenc;
+    // open both, each with its own limit, and enter each on its port
+    let mut open = |entry: &str, base: &str, limit: u32| {
+        let (_, _, page) = send("GET", &format!("{wallet}/app?u={}&b={}", enc(entry), enc(base)), &session, None);
+        let csrf = { let i = page.find("name=\"csrf\" value=\"").unwrap() + 19; page[i..i + page[i..].find('"').unwrap()].to_string() };
+        let (st, _, page) = send("POST", &format!("{wallet}/app"), &session, Some(&format!("csrf={csrf}&u={}&b={}&limit={limit}", enc(entry), enc(base))));
+        assert_eq!(st, 200, "{page}");
+        let (visit, port, code) = (field(&page, "data-visit"), field(&page, "data-port").parse::<u16>().unwrap(), field(&page, "data-code"));
+        let (st, h, _) = send("GET", &format!("http://127.0.0.1:{port}/__ls/enter?c={code}"), "", None);
+        assert_eq!(st, 302);
+        (visit, port, cookie_of(&h, "__ls_visit_").unwrap(), csrf)
+    };
+    let (jf_visit, jf_port, jf_cookie, csrf) = open(&format!("{jf}web/"), &jf, 900);
+    let (pod_visit, pod_port, pod_cookie, _) = open(&pod, &pod, 300);
+    assert_ne!(jf_port, pod_port, "two apps of one seller are two origins");
+    assert!(ports.contains(&jf_port) && ports.contains(&pod_port));
+    assert_ne!(jf_visit, pod_visit);
+    // each visit has the limit it was opened with
+    for (v, limit) in [(&jf_visit, 900), (&pod_visit, 300)] {
+        let (_, _, body) = send("GET", &format!("http://{}/visits/{v}", crun.addr), "", None);
+        assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["limit_sats"], limit, "{body}");
+    }
+    // each app's cookies stay with it: the media server's login cookie never reaches the podcast player
+    let jf_jar = format!("{session}; {jf_cookie}");
+    let (st, h, _) = send("POST", &format!("http://127.0.0.1:{jf_port}/Users/AuthenticateByName"), &jf_jar, Some("{}"));
+    assert_eq!(st, 200);
+    let jf_sess = h.iter().find(|(k, _)| k == "set-cookie").map(|(_, v)| v.split(';').next().unwrap().to_string()).unwrap();
+    let (st, h, _) = send("GET", &format!("http://127.0.0.1:{pod_port}/"), &format!("{session}; {pod_cookie}"), None);
+    assert_eq!(st, 200);
+    let pod_sess = h.iter().find(|(k, _)| k == "set-cookie").map(|(_, v)| v.split(';').next().unwrap().to_string()).unwrap();
+    assert_ne!(jf_sess.split('_').nth(1), pod_sess.split('_').nth(1), "each app's cookies are named for that app: {jf_sess} {pod_sess}");
+    // the browser sends a port all its cookies: the podcast player still gets only its own
+    let all = format!("{session}; {pod_cookie}; {jf_cookie}; {jf_sess}; {pod_sess}");
+    let (st, _, body) = send("GET", &format!("http://127.0.0.1:{pod_port}/me"), &all, None);
+    assert_eq!(st, 200, "{body}");
+    let seen = serde_json::from_str::<Value>(&body).unwrap()["cookie"].as_str().unwrap().to_string();
+    assert!(seen.contains("podsess=p1") && !seen.contains("jfsess") && !seen.contains("__ls_visit") && !seen.contains("xbt"), "{seen}");
+    // one visit's cookie opens nothing on the other's port
+    assert_eq!(send("GET", &format!("http://127.0.0.1:{pod_port}/"), &format!("{session}; {jf_cookie}"), None).0, 403);
+    // stopping the media server's visit leaves the podcast player open
+    let (st, _, _) = send("POST", &format!("{wallet}/app-stop"), &session, Some(&format!("csrf={csrf}&visit={jf_visit}")));
+    assert_eq!(st, 303);
+    assert_eq!(send("GET", &format!("http://127.0.0.1:{jf_port}/web/"), &jf_jar, None).0, 403);
+    assert_eq!(send("GET", &format!("http://127.0.0.1:{pod_port}/"), &format!("{session}; {pod_cookie}"), None).0, 200);
+    assert!(paid_urls.lock().unwrap().iter().all(|u| u.starts_with(&jf) || u.starts_with(&pod)), "only the two apps' own bases were asked for");
 }
