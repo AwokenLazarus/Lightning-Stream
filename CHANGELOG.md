@@ -5,6 +5,37 @@ package (from 0.1.14) and the Linux package (from 0.1.12). Dates are UTC.
 
 Lightning Stream is early software. It runs on mainnet; use small amounts.
 
+## 0.1.19 (2026-10-29)
+
+**Paying**
+- A session that is busy spending its credit stays open. The wallet closed a session ten minutes
+  after its last ticket purchase even while it was still being paid from that ticket's credit, so a
+  long film or rental bought a new ticket every ten minutes and left the old credit at the seller.
+  Every paid request now counts as use, and credit left by a session that did close is spent first
+  by the next one with that seller.
+
+**A local AI address**
+- New: Services, AI. The app gives this box an OpenAI-compatible address (`/v1`) on your network, so
+  any AI app or agent that speaks that API can use the AI models of sellers you allow, paid per
+  token within your spending rules. Each program gets its own key with a total and a daily limit,
+  and can be revoked. The app picks the cheapest seller that answers, moves to the next one if a
+  seller fails before it answers (never paying twice for one answer), and you can prefer or block
+  sellers. On Linux the address is local to the machine unless you open it to your network.
+- Known limit: a very long answer can pause briefly while the next ticket is bought.
+
+**Hashrate**
+- A rental survives a short break in the link between hashtaker and hashmaker: the miner goes back to
+  its own pool for the moment, and the rental carries on when the link returns, with no slice paid
+  twice.
+- A hashtaker whose wallet is restarting waits for it before a slice goes unpaid.
+- Offers show the price per TH/s per day beside the hourly figure.
+- The hashmaker measures each miner's speed over five minutes instead of one, which steadies it.
+
+**The look**
+- A new, calmer theme: new fonts (Inter and JetBrains Mono, carried in the app), a new mark and app
+  icon, a quieter background, and a click that runs along the streams like a spark. Light and dark,
+  and no motion for those who ask for less.
+
 ## 0.1.18 (2026-10-29)
 
 **Playing films**

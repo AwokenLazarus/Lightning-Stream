@@ -2,7 +2,7 @@ manifestVersion: 1.1
 id: lazarus-lightning-stream
 category: lightning
 name: Lightning Stream
-version: "0.1.18"
+version: "0.1.19"
 tagline: Buy and sell any service over Lightning from this box, paid as you use it
 description: >-
   One app for both sides. The wallet pays sellers with stream tickets under a policy you sign, and
@@ -50,6 +50,9 @@ gallery:
   - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/4.png
   - https://raw.githubusercontent.com/AwokenLazarus/Lightning-Stream/main/packaging/umbrel/lazarus-lightning-stream/5.png
 releaseNotes: >-
+  0.1.19: a session busy spending its credit stays open, so long films and rentals no longer strand
+  credit. New: a local AI address (Services, AI) any AI app can use, paid per token. Hashrate rentals
+  survive a short break in the link. A new, calmer look.
   0.1.18: closing or pausing the player stops the paying, and a film is bought at most 4 MiB at a
   time. With the starter rules you can play a film and then ask the AI of the same shop straight
   away. Live connections show what a stream has used as it plays.
