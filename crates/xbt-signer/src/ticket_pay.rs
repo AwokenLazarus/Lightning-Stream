@@ -850,6 +850,10 @@ struct Call<'a> {
     /// The request asks to become a WebSocket (`upgrade`): after a `101` the call carries the
     /// stream both ways through `stream_to`, every byte either way paid for as the body's are.
     upgrade: bool,
+    /// The call may draw only on the credit the seller already holds for the session and buys no
+    /// ticket (`credit_only`): a web app's other requests while one of them buys. Its `max_sats`
+    /// stays the most the answer may charge, which the seller is told.
+    credit_only: bool,
 }
 
 impl Call<'_> {
@@ -954,6 +958,8 @@ struct Spent {
     booked_sats: i64,
     prepaid: usize,
     limit_sats: Option<i64>,
+    /// No ticket may be released for the call (its `credit_only`).
+    credit_only: bool,
 }
 
 impl Spent {
@@ -1480,6 +1486,7 @@ impl Signer {
         };
         let head_headers = stream_head && p.get("head_headers").and_then(Value::as_bool) == Some(true);
         let upgrade = p.get("upgrade").and_then(Value::as_bool) == Some(true);
+        let credit_only = p.get("credit_only").and_then(Value::as_bool) == Some(true);
         if upgrade && (stream_to.is_none() || method != "GET" || range.is_some()) {
             return deny("upgrade", "a WebSocket (upgrade) is a GET with stream_to, and no range");
         }
@@ -1559,7 +1566,7 @@ impl Signer {
         if max_sats == 0 {
             return with(deny("max_sats", "the seller asks to be paid and this call may spend nothing (max_sats 0)"), json!({"charged_sats": 0}));
         }
-        let call = Call { url: &url, origin: &origin, method: &method, body: &raw, max_sats, task, piece_hashes, stream_to, stream_head, range, extra, head_headers, upgrade };
+        let call = Call { url: &url, origin: &origin, method: &method, body: &raw, max_sats, task, piece_hashes, stream_to, stream_head, range, extra, head_headers, upgrade, credit_only };
         let mut passed: Vec<Value> = vec![];
         let mut ways = offers(&pr, &lightning);
         // tickets or draws first: one rule ([`crate::lottery::choose`]); the other is tried after it
@@ -2392,6 +2399,10 @@ impl Signer {
     /// the ledger); the secret to the seller; the seller's signed word that it took it. `Err`: the
     /// refusal, with no secret out unless it says so.
     fn ticket_release_one(&self, hs: &HttpSession, spent: &mut Spent) -> std::result::Result<(), Value> {
+        if spent.credit_only {
+            // the same rule as a call whose limit is spent: the caller asks again with the right to buy
+            return Err(deny("max_sats", "this call draws only on the session's credit (credit_only) and buys no ticket"));
+        }
         let _paying = lock(&hs.paying);
         if let Some(why) = hs.fault() {
             return Err(self.ticket_fault(hs, &why));
@@ -2647,7 +2658,7 @@ impl Signer {
         let tp = self.ticket_policy();
         let max_msat = (c.max_sats.max(0) as u64).saturating_mul(1000);
         let dest = format!("ln:{}", hs.terms.terms.payee);
-        let mut spent = Spent { limit_sats: Some(c.max_sats.max(0)), ..Spent::default() };
+        let mut spent = Spent { limit_sats: Some(c.max_sats.max(0)), credit_only: c.credit_only, ..Spent::default() };
         let about = |hs: &HttpSession, spent: &Spent| {
             json!({"rail": "ticket", "session": hs.sid, "dest": dest, "origin": hs.origin, "charged_sats": spent.booked_sats, "tickets_released": spent.hashes.len(),
                    "tickets_prepaid": spent.prepaid,

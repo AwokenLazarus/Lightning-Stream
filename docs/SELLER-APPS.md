@@ -60,9 +60,12 @@ browser                         the buyer's box                                 
 
 Many requests of an app run at once. A visit lets one of them at a time buy a ticket: that call
 may spend what is left of the limit. The others may only use the credit the seller already
-holds for the session (`max_sats` 1: a ticket is never 1 sat, so none can be bought). One that
-needs a ticket waits for its turn and asks again. So the sats a visit spends never exceed its
-limit, however many requests run at once.
+holds for the session: they are sent `credit_only`, so the signer buys no ticket for them, with
+what is left of the limit as the most their answer may charge (the seller is told that figure and
+stops the answer there). One that needs a ticket before it starts waits for its turn and asks
+again. So tickets are bought only within the limit, however many requests run at once. One limit
+remains: an answer running on credit that runs out of it part-way ends there, since it may not
+buy; the page asks for it again.
 
 ## The seller's side
 

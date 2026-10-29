@@ -193,12 +193,15 @@ class Wallet:
             B2_HOT_KEYFILE=f"{RUN}/keys/wallet.key",
             B2_WATCH_INTERVAL="2",
             B2_BODY_DIR=f"{RUN}/bodies",
+            # the sockets a body is streamed to (the connector's visits): the same directory the connector uses
+            B2_STREAM_DIR=f"{RUN}/stream",
             B2_LN_REST=f"https://127.0.0.1:{lab.PORT[BUYER]}",
             B2_LN_MACAROON=f"{RUN}/rail.macaroon",
             B2_LN_TLS_CERT=f"{RUN}/{BUYER}.tls.cert",
         )
         if os.path.exists(SOCK):
             os.remove(SOCK)
+        os.makedirs(f"{RUN}/stream", exist_ok=True)
         with open(f"{RUN}/signer.log", "ab") as log:
             PROCS["signer"] = subprocess.Popen([f"{BIN}/xbt-signer", "--root", WALLET], env=env, stdout=log, stderr=subprocess.STDOUT)
         lab.wait("the signer's socket", 60, lambda: os.path.exists(SOCK) and signer("health")["ok"])
@@ -1745,6 +1748,24 @@ def jellyfin(link: str = "") -> None:
     if st != 200 or "data-port" not in opened:
         raise LabError(f"opening the app: {st} {opened[:300]}")
     port, code = attr(opened, "data-port"), attr(opened, "data-code")
+    if os.environ.get("JF_DIAG"):
+        # the visit fetched by hand: its one-time code for the visit's cookie, then a script Jellyfin
+        # serves gzipped, compared with the same script fetched straight from Jellyfin
+        diag: dict[str, Any] = {}
+        st, h, _ = send("GET", f"/__ls/enter?c={code}", int(port))
+        vc = h.get("set-cookie", "").split(";")[0]
+        diag["enter"] = [st, bool(vc), h.get("location")]
+        for target in ("/web/", "/web/main.jellyfin.bundle.js"):
+            st, h, body = send("GET", target, int(port), {"Cookie": vc, "Accept-Encoding": "gzip, deflate, br"})
+            u = urllib.parse.urlsplit(JF_URL)
+            c = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=30)
+            c.request("GET", target)
+            direct = c.getresponse().read()
+            c.close()
+            diag[target] = {"status": st, "got": len(body), "direct": len(direct), "same": body == direct,
+                            "headers": {k: v for k, v in h.items() if k in ("content-length", "content-encoding", "transfer-encoding", "content-type")}}
+        measured(f"jellyfin_diag_{link or 'https'}", diag)
+        print(json.dumps(diag, indent=1), flush=True)
     # the browser, from the visit's one-time code to a minute of the film and a seek
     before = money()
     shots = f"{OUT}/jellyfin"

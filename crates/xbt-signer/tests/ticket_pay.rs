@@ -4616,3 +4616,26 @@ fn the_credit_an_idle_session_left_with_its_seller_pays_the_next_call() {
     assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), 0), "paid from the credit left behind: {v}");
     assert!(!r.audit("ticket_resumed").is_empty(), "the old balance was taken over");
 }
+
+/// A web app's other requests while one buys (`credit_only`): such a call buys no ticket, and
+/// says so with the rule a spent limit gives; with credit at the seller it is served whole, its
+/// `max_sats` the most its answer may charge (not 1 sat, which would cut a page's scripts short).
+#[test]
+fn a_credit_only_call_buys_no_ticket_and_is_served_whole_from_credit() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    let only = |path: &str, max: i64| r.call("xbt402_pay", json!({"url": r.shop.url(path), "max_sats": max, "task": "film", "credit_only": true}));
+    // no credit yet: refused, nothing paid
+    let v = only("/hd20/1048576", CALL);
+    assert_eq!((v["verdict"].as_str(), v["rule"].as_str(), v["charged_sats"].as_i64().unwrap_or(0)), (Some("deny"), Some("max_sats"), 0), "{v}");
+    assert!(r.tap.secrets().is_empty(), "no ticket was released for a credit-only call");
+    // a call that may buy: one ticket, and credit left over
+    let first = r.pay("/hd20/1048576", CALL);
+    assert_eq!(first["status"], 200, "{first}");
+    let released = r.tap.secrets().len();
+    // 2 MiB at 20 sat a MiB from the credit: whole, and no ticket bought
+    let v = only("/hd20/2097152", CALL);
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["bytes"].as_u64()), (Some(200), Some(true), Some(2_097_152)), "{v}");
+    assert_eq!(r.tap.secrets().len(), released, "{v}");
+    assert_eq!(v["charged_sats"].as_i64().unwrap_or(0), 0, "drawn from credit already paid: {v}");
+}

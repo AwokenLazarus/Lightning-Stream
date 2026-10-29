@@ -8,9 +8,11 @@
 //!
 //! **The limit, exactly.** A page asks for many things at once. One request of a visit at a time
 //! holds the turn to buy: it may spend what is left of the limit. Every other one may use only the
-//! credit the seller already holds for the session: it is sent with `max_sats` 1, and a ticket is
-//! never 1 sat, so it buys none. One that needs a ticket waits for the turn and is sent again. A
-//! visit's spending, the sum of what the signer charged its calls, never exceeds its limit.
+//! credit the seller already holds for the session: it is sent `credit_only`, so the signer buys no
+//! ticket for it, with what is left of the limit as the most its answer may charge (the seller is
+//! told that figure and stops the answer there). One that needs a ticket before it starts waits for
+//! the turn and is sent again. Tickets are bought only within the limit; answers running at once on
+//! credit already bought each stop at what was left when they started.
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read};
@@ -71,6 +73,12 @@ impl Visit {
     }
 
     /// Wait for the turn to buy. `Err`: the visit ended, or the wait was too long.
+    /// What is left of the limit now, in sats.
+    fn left(&self) -> i64 {
+        let s = self.lock();
+        self.limit - s.spent
+    }
+
     fn take_turn(&self) -> Result<i64, String> {
         let mut s = self.lock();
         let until = Instant::now() + TURN_WAIT;
@@ -226,8 +234,9 @@ impl Connector {
             use base64::Engine as _;
             Some(base64::engine::general_purpose::STANDARD.encode(&req.body))
         };
-        let call = |max_sats: i64| -> Result<Started, Value> {
-            let mut params = json!({"url": url, "method": method, "max_sats": max_sats, "task": self.cfg.task, "headers": headers, "head_headers": true});
+        let call = |max_sats: i64, credit_only: bool| -> Result<Started, Value> {
+            let mut params = json!({"url": url, "method": method, "max_sats": max_sats, "task": self.cfg.task, "headers": headers, "head_headers": true,
+                                    "credit_only": credit_only});
             if let Some(b) = &body {
                 params["body_b64"] = b.clone().into();
             }
@@ -239,15 +248,20 @@ impl Connector {
             }
             self.start(params)
         };
-        // the session's credit only: no ticket is bought
-        let (started, turn) = match call(1) {
+        // the session's credit only: no ticket is bought, and the answer may charge at most what is left
+        let left_now = visit.left();
+        if left_now < 1 {
+            visit.lock().ended.get_or_insert_with(|| "This visit's spending limit is reached.".into());
+            return Reply::Whole(json_response(402, &json!({"error": "This visit's spending limit is reached.", "rule": "visit"})));
+        }
+        let (started, turn) = match call(left_now, true) {
             Ok(s) => (s, false),
             Err(v) if v.get("rule").and_then(Value::as_str) == Some("max_sats") => {
                 let left = match visit.take_turn() {
                     Ok(l) => l,
                     Err(e) => return Reply::Whole(json_response(402, &json!({"error": e, "rule": "visit"}))),
                 };
-                match call(left) {
+                match call(left, false) {
                     Ok(s) => (s, true),
                     Err(v) => {
                         let charged = v.get("charged_sats").and_then(Value::as_i64).unwrap_or(0);

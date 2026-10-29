@@ -46,7 +46,7 @@ fn signer(dir: &Path) -> (PathBuf, Arc<Mutex<Session>>) {
                     s.calls.push(p.clone());
                     let mut charged = 0;
                     if s.credit < COST {
-                        if max < TICKET {
+                        if max < TICKET || p["credit_only"] == true {
                             drop(s);
                             let _ = writeln!(conn, "{}", json!({"id": 1, "result": {"verdict": "deny", "rule": "max_sats", "reason": "a ticket does not fit", "charged_sats": 0}}));
                             return;
@@ -127,9 +127,11 @@ fn a_visit_spends_at_most_its_limit_however_many_requests_run_at_once() {
     let v: Value = serde_json::from_slice(&b).unwrap();
     assert_eq!((v["spent_sats"].as_i64(), v["limit_sats"].as_i64()), (Some(charged), Some(1_500)), "{v}");
     assert!(v["ended"].as_str().unwrap().contains("limit"), "{v}");
-    // only one call at a time could buy: every other one went with max_sats 1
+    // only one call at a time could buy: every other one went credit_only, each with what was left as its cap
     let calls = session.lock().unwrap().calls.clone();
-    assert!(calls.iter().all(|c| c["max_sats"] == 1 || c["max_sats"].as_i64().unwrap() <= 1_500), "{calls:?}");
+    assert!(calls.iter().all(|c| c["max_sats"].as_i64().unwrap() <= 1_500), "{calls:?}");
+    assert!(calls.iter().any(|c| c["credit_only"] == true) && calls.iter().any(|c| c["credit_only"] == false), "{calls:?}");
+    assert!(calls.iter().filter(|c| c["credit_only"] == true).all(|c| c["max_sats"].as_i64().unwrap() > 1), "a credit-only call's cap is what was left, not 1 sat: {calls:?}");
 }
 
 #[test]
