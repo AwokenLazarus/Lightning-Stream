@@ -23,6 +23,23 @@ impl Sender {
         Ok(())
     }
 
+    /// Whether `other` sends on the same link as this one.
+    pub fn same(&self, other: &Sender) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Take over `other`'s stream: after a link dropped and a new one was made, every clone of
+    /// this sender sends on the new one. The old stream goes with `other`.
+    pub fn adopt(&self, other: Sender) {
+        if Arc::ptr_eq(&self.inner, &other.inner) {
+            return;
+        }
+        let mut mine = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut theirs = other.inner.lock().unwrap_or_else(|p| p.into_inner());
+        std::mem::swap(&mut *mine, &mut *theirs);
+        let _ = theirs.0.shutdown(std::net::Shutdown::Both);
+    }
+
     /// Close the stream both ways (the reader then ends).
     pub fn shutdown(&self) {
         let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());

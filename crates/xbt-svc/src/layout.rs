@@ -78,6 +78,8 @@ pub const SHARED_DIRS: &[SharedDir] = &[
     // the built-in Stream relay: the owner's settings in, its status out
     SharedDir { dir: crate::RUN_RELAY, writer: crate::UI, reader: crate::STREAM_RELAY, gid: STREAM_RELAY_UID, mode: 0o750 },
     SharedDir { dir: crate::RUN_RELAY_STATUS, writer: crate::STREAM_RELAY, reader: crate::UI, gid: RELAY_STATUS_GID, mode: 0o750 },
+    // both write here: the credential store is booked by the endpoint and edited by the UI's AI page
+    SharedDir { dir: crate::RUN_AI, writer: crate::UI, reader: crate::SIGNER, gid: AI_GID, mode: 0o770 },
 ];
 
 /// The built-in Stream relay's user and group (10011 to 10013 are xbt-compute's, 10014 is the AI
@@ -89,6 +91,9 @@ pub const RELAY_STATUS_GID: u32 = 10017;
 /// The group `run/shops/` is read by: the signer's own, whose user the connector runs as and whose
 /// group the MCP is in.
 pub const SHOPS_GID: u32 = 10001;
+
+/// The AI endpoint's group (a group only): the UI and the signer's user, which the connector runs as.
+pub const AI_GID: u32 = 10014;
 
 /// The hashrate services' group: the settings the UI writes in `run/hashrate/`, and their control token.
 pub const HASHRATE_GID: u32 = 10010;
@@ -617,11 +622,13 @@ mod tests {
         for d in ["run/ln", "run/gateway"] {
             assert_eq!(std::fs::metadata(root.join(d)).unwrap().mode() & 0o7777, 0o750, "{d}");
         }
+        // the AI endpoint's files: the UI and the signer's user (the connector) both write there
+        assert_eq!(std::fs::metadata(root.join("run/ai")).unwrap().mode() & 0o7777, 0o770);
         assert_eq!(std::fs::metadata(root.join("gateway")).unwrap().mode() & 0o777, 0o700);
         let root2 = t.path().join("wallet-only");
         let names: Vec<String> = ["signer", "mcp"].iter().map(|s| s.to_string()).collect();
         init_as(&root2, &names, &Provision::default(), uid).unwrap();
-        assert!(!root2.join("run/ln").exists() && !root2.join("run/gateway").exists());
+        assert!(!root2.join("run/ln").exists() && !root2.join("run/gateway").exists() && !root2.join("run/ai").exists());
         // with the hashrate services: their settings dir, and one control token the UI owns and
         // they read by group, made once and kept across restarts
         let root3 = t.path().join("hashrate");

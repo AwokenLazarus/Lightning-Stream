@@ -32,6 +32,8 @@ mod nostr_pages;
 mod relay_pages;
 #[path = "hashrate.rs"]
 pub(crate) mod hashrate;
+#[path = "inference_page.rs"]
+pub(crate) mod inference_page;
 
 pub const COOKIE: &str = "xbtui";
 /// How long a signed form stays valid.
@@ -351,6 +353,12 @@ impl App {
             (true, "/river.js") => return asset(&req, "text/javascript; charset=utf-8", crate::river_js()),
             (true, "/ui.css") => return asset(&req, "text/css; charset=utf-8", crate::UI_CSS),
             (true, "/vt.js") => return asset(&req, "text/javascript; charset=utf-8", crate::VT_JS),
+            (true, "/mark.svg") => return asset(&req, "image/svg+xml", crate::MARK_SVG),
+            (true, p) if p.starts_with("/fonts/") => {
+                if let Some(b) = crate::font(&p["/fonts/".len()..]) {
+                    return Resp::text(200, "font/woff2", b.to_vec()).header("Cache-Control", "public, max-age=31536000, immutable");
+                }
+            }
             (true, "/healthz") => return Resp::json(200, &json!({"ok": true})),
             (true, "/readyz") if self.cfg.role == Role::Gateway => return Resp::json(200, &json!({"ok": true, "role": "gateway"})),
             (true, "/readyz") => {
@@ -423,6 +431,7 @@ impl App {
             "/sell" if self.cfg.sell => self.sell_page(&ctx, &req.query),
             "/sell-hashrate" if self.cfg.sell => self.sell_hashrate_page(&ctx),
             "/hashrate" => self.hashrate_page(&ctx),
+            "/ai" => self.ai_page(&ctx),
             "/nostr" => self.nostr_page(&ctx, &req.query),
             "/relays" => self.relays_page(&ctx, &req.query),
             "/play" => self.play(&ctx, &req),
@@ -598,6 +607,7 @@ impl App {
             "/sell" if self.cfg.sell => self.sell_post(ctx, f),
             "/sell-hashrate" if self.cfg.sell => self.sell_hashrate_post(ctx, f),
             "/hashrate" => self.hashrate_post(ctx, f),
+            "/ai" => self.ai_post(ctx, f),
             "/play-link" => self.play_link(ctx, f),
             "/nostr-check" => self.nostr_check(ctx, f),
             "/relays-prefs" => self.relays_prefs(ctx, f),

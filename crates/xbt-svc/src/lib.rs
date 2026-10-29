@@ -101,6 +101,9 @@ pub const STREAM_RELAY: &str = "stream-relay";
 pub const RUN_RELAY: &str = "relay";
 /// The relay's status file, written by the relay and read by the UI.
 pub const RUN_RELAY_STATUS: &str = "relay-status";
+/// The AI endpoint's files, which the UI and the connector (as the signer's user) both write: the
+/// credential store, the AI sellers the UI writes, and the sellers' health the endpoint writes.
+pub const RUN_AI: &str = "ai";
 /// The MCP bearer token's name, in `run/ui/` on a box (AGP-042) or `mcp/secrets/` without a UI.
 pub const MCP_TOKEN: &str = "mcp-http-token";
 

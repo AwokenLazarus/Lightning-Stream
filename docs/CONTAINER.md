@@ -62,6 +62,11 @@ tmpfs `/tmp`.
                    written by the UI's Stream relays page, read by the built-in relay
   run/relay-status/ uid 10016, gid 10017 (xbt-relay-status), 0750: status.json (0640), written by the relay,
                    read by the UI; the group has the relay and the UI in it
+  run/ai/          uid 10005, gid 10014 (xbt-ai), 0770: the AI endpoint's files (docs/INFERENCE.md):
+                   credentials.json (0660), the store of AI keys and local links, edited by the UI's AI page and
+                   booked by the connector; sellers.json (0640), written by the AI page; state.json (0640), the
+                   sellers' health, written by the connector. The group has the UI and the signer's user (the
+                   connector runs as it) in it; the MCP is not in it
   lightning/tls.cert   not under the data dir: the Lightning node's certificate, one file bind-mounted read-only
 ```
 
@@ -113,6 +118,8 @@ UID table (the images' `USER`; the cmp rows are reserved):
 | 10006 | xbt-work-relay | xbt-work-relay (AGP-043) |
 | 10007 | xbt-gateway | xbt-gateway |
 | 10008 | (group xbt-ln-rail only) | |
+| 10009 | (group xbt-enroll only) | |
+| 10014 | (group xbt-ai only) | the UI and the signer's user, for run/ai |
 | 10010 | xbt-hashrate | xbt-hashlink (the hasher's and the renter's services; in xbt-signer's group for the renter's payments) |
 | 10016 | xbt-stream-relay | xbt-stream-relay (the built-in Stream relay, off until switched on) |
 | 10017 | (group xbt-relay-status only) | |

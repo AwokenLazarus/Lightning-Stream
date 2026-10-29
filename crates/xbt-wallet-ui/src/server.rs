@@ -8,7 +8,7 @@ use crate::app::App;
 
 pub const MAX_BODY: usize = 256 * 1024;
 
-pub const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; \
+pub const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; \
                        form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
 
 #[derive(Debug, Default, Clone)]

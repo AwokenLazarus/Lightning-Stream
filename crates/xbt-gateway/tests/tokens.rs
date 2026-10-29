@@ -265,3 +265,16 @@ fn token_prices_are_in_the_terms_and_the_listing() {
     assert_eq!((price["outputPer1kMsat"].as_str(), price["inputPer1kMsat"].as_str(), price["maxOutputTokens"].as_str()),
                (Some("10000"), Some("0"), Some("512")));
 }
+
+#[test]
+fn the_model_list_of_a_token_priced_route_is_free_to_read() {
+    let (rig, _dir, _model, _m) = rig(0, 10_000, 512);
+    let got = http(&rig.addr, "GET", "/v1/models", &[], b"", None);
+    assert_eq!(got.status, 200, "a buyer reads the model list before paying");
+    let v: Value = serde_json::from_slice(&got.body).unwrap();
+    assert_eq!(v["data"][0]["id"], "m");
+    assert_eq!(http(&rig.addr, "HEAD", "/v1/models", &[], b"", None).status, 200);
+    // everything else on the route is still sold
+    assert_eq!(http(&rig.addr, "GET", "/v1/other", &[], b"", None).status, 402);
+    assert_eq!(http(&rig.addr, "POST", "/v1/models", &[], b"{}", None).status, 402);
+}

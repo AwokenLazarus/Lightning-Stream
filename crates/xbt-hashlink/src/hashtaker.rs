@@ -15,7 +15,7 @@ use crate::rail::{HashtakerRail, SignerPayer};
 use crate::{now_ms, sv1};
 use secp256k1::{PublicKey, SecretKey};
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -79,6 +79,11 @@ struct St {
     /// The wallet refused or failed a slice: no later slice is asked for.
     pay_failed: bool,
     budget_msat: Option<u64>,
+    /// The hashes of the tickets locked over the link, sent again after the link comes back.
+    lock_hashes: BTreeMap<u64, String>,
+    /// The last payments sent over the link, sent again after it comes back (the hashmaker takes
+    /// each slice once, so one that did arrive is not paid twice).
+    sent_pays: Vec<(u64, String, Value)>,
 }
 
 impl St {
@@ -92,6 +97,7 @@ impl St {
             match self.rail.lock(slice, self.terms.price_msat) {
                 Ok(h) => {
                     self.locked.insert(slice);
+                    self.lock_hashes.insert(slice, hex::encode(h));
                     let _ = tx.send(&Msg::Lock { slice, hash: hex::encode(h) });
                 }
                 Err(e) => {
@@ -136,6 +142,11 @@ impl St {
             }
             let Ok(pre) = self.rail.release(slice) else { return };
             self.locked.remove(&slice);
+            self.lock_hashes.remove(&slice);
+            self.sent_pays.push((slice, hex::encode(pre), receipt.clone()));
+            if self.sent_pays.len() > AHEAD as usize + 2 {
+                self.sent_pays.remove(0);
+            }
             let _ = tx.send(&Msg::Pay { slice, preimage: hex::encode(pre), receipt: receipt.clone() });
             self.receipts.push(receipt);
             self.pays.push(json!({"slice": slice, "atMs": now_ms()}));
@@ -206,11 +217,14 @@ pub fn run(cfg: Config, rail: Box<dyn HashtakerRail>) -> Result<Value, String> {
         queue: None,
         pay_failed: false,
         budget_msat: cfg.budget_msat,
+        lock_hashes: BTreeMap::new(),
+        sent_pays: Vec::new(),
     }));
     lock(&st).lock_ahead(&tx);
 
     // the wallet's payer, one slice at a time, off the relay's path
     let stopped_session: Arc<Mutex<Option<Value>>> = Arc::default();
+    let redial = Redial { hashmaker: cfg.hashmaker.clone(), key: cfg.key, hashmaker_key: cfg.hashmaker_key, rental: cfg.rental.clone(), terms: cfg.terms.clone() };
     let payer_thread = cfg.payer.map(|mut p| {
         let (qtx, qrx) = mpsc::channel::<(u64, Value)>();
         lock(&st).queue = Some(qtx);
@@ -281,6 +295,13 @@ pub fn run(cfg: Config, rail: Box<dyn HashtakerRail>) -> Result<Value, String> {
             Ok(Some(m)) => m,
             Ok(None) => continue,
             Err(e) => {
+                if lock(&st).closed.is_none() {
+                    // a link that dropped is made again within the grace time, and the rental carries on
+                    if let Some(back) = come_back(&redial, &tx, &st, &e.to_string()) {
+                        rx = back;
+                        continue;
+                    }
+                }
                 let mut g = lock(&st);
                 if g.closed.is_none() {
                     g.closed = Some(format!("link lost: {e}"));
@@ -361,6 +382,67 @@ pub fn run(cfg: Config, rail: Box<dyn HashtakerRail>) -> Result<Value, String> {
         *l.lock().unwrap_or_else(|p| p.into_inner()) = r.clone();
     }
     Ok(r)
+}
+
+/// What dialling the hashmaker again needs.
+struct Redial {
+    hashmaker: String,
+    key: SecretKey,
+    hashmaker_key: PublicKey,
+    rental: String,
+    terms: Terms,
+}
+
+/// The link dropped: the old upstream sessions end (the hashmaker has let their channels go and
+/// opens new ones), and the hashmaker is dialled again, with growing pauses, until most of its
+/// grace time is gone. On its welcome, every clone of `tx` sends on the new link, and the locks and
+/// the last payments are sent again. `None`: not back in time, or the hashmaker refused.
+fn come_back(cfg: &Redial, tx: &Sender, st: &Arc<Mutex<St>>, why: &str) -> Option<link::Receiver> {
+    let deadline = Instant::now() + Duration::from_millis(cfg.terms.grace_ms) * 4 / 5;
+    {
+        let mut g = lock(st);
+        g.events.push(json!({"ev": "link lost, dialling again", "why": why, "atMs": now_ms()}));
+        let ups: Vec<(u32, TcpStream)> = g.upstreams.drain().collect();
+        for (chan, u) in ups {
+            let _ = u.shutdown(std::net::Shutdown::Both);
+            g.meter.close(chan);
+        }
+    }
+    let mut pause = Duration::from_millis(250);
+    while Instant::now() + pause < deadline {
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(Duration::from_secs(2));
+        if lock(st).closed.is_some() {
+            return None;
+        }
+        let Ok(link::Link { tx: new_tx, rx: mut new_rx, .. }) = link::dial(&cfg.hashmaker, cfg.key, cfg.hashmaker_key) else { continue };
+        if new_tx.send(&Msg::Resume { rental: cfg.rental.clone() }).is_err() {
+            continue;
+        }
+        match new_rx.recv() {
+            Ok(Some(Msg::Welcome { terms_hash, .. })) if terms_hash == hex::encode(cfg.terms.hash()) => {
+                tx.adopt(new_tx);
+                let mut g = lock(st);
+                g.events.push(json!({"ev": "rental resumed", "atMs": now_ms()}));
+                let released = g.released;
+                for (slice, hash) in g.lock_hashes.clone() {
+                    if slice > released {
+                        let _ = tx.send(&Msg::Lock { slice, hash });
+                    }
+                }
+                for (slice, preimage, receipt) in g.sent_pays.clone() {
+                    let _ = tx.send(&Msg::Pay { slice, preimage, receipt });
+                }
+                return Some(new_rx);
+            }
+            Ok(Some(Msg::Close { reason, .. })) => {
+                lock(st).events.push(json!({"ev": "resume refused", "why": reason, "atMs": now_ms()}));
+                return None;
+            }
+            _ => continue,
+        }
+    }
+    None
 }
 
 fn lock(st: &Mutex<St>) -> std::sync::MutexGuard<'_, St> {

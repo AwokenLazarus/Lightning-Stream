@@ -64,6 +64,8 @@ const dict = {
   'Selling': 66,
   'Not selling yet: add a service on the Sell page': 67,
   'Let Lightning Stream pay through this node, within the spending rules you sign. It cannot open or close channels.': 68,
+  'AI address for programs': 69,
+  'Programs on your network that speak the OpenAI API use AI sellers here, each with a key from the AI page': 70,
 } as const
 
 /**
