@@ -141,10 +141,13 @@ fn run(args: &[String]) -> Result<(), String> {
         None => None,
     };
     // a shop reached by key only is named by its Nostr key (xbt402::shop): that name is its origin
-    let nostr_pk = match &cfg.link {
-        Some(_) => Some(xbt_gateway::nostr::load_key(&cfg.state_dir)?.public.serialize()),
+    let link_keys = match &cfg.link {
+        Some(_) => Some(xbt_gateway::nostr::load_key(&cfg.state_dir)?),
         None => None,
     };
+    let nostr_pk = link_keys.as_ref().map(|k| k.public.serialize());
+    // where the link is reached is told on the listing's own relays (xbt_iroh_link::nostr_lookup)
+    let link_relays: Vec<String> = cfg.nostr.as_ref().map(|n| n.relays.clone()).unwrap_or_default();
     if cfg.public_url == xbt_gateway::config::LINK_ONLY {
         let pk = nostr_pk.ok_or("a shop reached by key needs its Nostr key")?;
         cfg.public_url = xbt402::shop::origin_for(&pk);
@@ -163,7 +166,7 @@ fn run(args: &[String]) -> Result<(), String> {
     // the link: the same gateway, reached by key (crates/xbt-iroh-link). Its streams come in as
     // connections to the gateway's own port, so everything else is as for the web
     let _link = match &link_cfg {
-        Some(l) => Some(start_link(l, &state_dir, running.addr, &link_node, &seller, &sign_mac, &gw, nostr_pk)?),
+        Some(l) => Some(start_link(l, &state_dir, running.addr, &link_node, &seller, &sign_mac, &gw, nostr_pk, link_keys.clone(), link_relays.clone())?),
         None => None,
     };
     // after the link, so the first listing sent already names it
@@ -200,12 +203,14 @@ fn main() -> ExitCode {
 /// before the node's word runs out, for as long as the gateway runs.
 #[allow(clippy::too_many_arguments)]
 fn start_link(l: &xbt_gateway::config::LinkConfig, state_dir: &std::path::Path, addr: std::net::SocketAddr,
-              node: &Arc<LndRest>, seller: &str, sign_mac: &std::path::Path, gw: &Arc<Gateway>, nostr_pk: Option<[u8; 32]>)
+              node: &Arc<LndRest>, seller: &str, sign_mac: &std::path::Path, gw: &Arc<Gateway>, nostr_pk: Option<[u8; 32]>,
+              keys: Option<xbt_nostr::event::Keys>, nostr_relays: Vec<String>)
               -> Result<std::sync::Arc<xbt_iroh_link::Link>, String> {
     let secret = xbt402::provider::load_or_create_secret(&state_dir.join("link.key")).map_err(|e| e.to_string())?;
     // no relays named: ours, with iroh's public relays beside it
     let relays = if l.relays.is_empty() { xbt_iroh_link::Relays::OursThenPublic(vec![xbt_iroh_link::DEFAULT_RELAY.into()]) } else { xbt_iroh_link::Relays::Ours(l.relays.clone()) };
-    let link = xbt_iroh_link::Link::start_with(secret.secret_bytes(), xbt_iroh_link::Options { relays, serving: true, private: l.private })
+    let lookup = Some(Arc::new(xbt_iroh_link::nostr_lookup::NostrLookup::new(keys, nostr_relays)));
+    let link = xbt_iroh_link::Link::start_with(secret.secret_bytes(), xbt_iroh_link::Options { relays, serving: true, private: l.private, lookup })
         .map_err(|e| format!("link: {e}"))?;
     let upstream = if addr.ip().is_unspecified() { std::net::SocketAddr::from(([127, 0, 0, 1], addr.port())) } else { addr };
     link.serve(upstream);

@@ -63,3 +63,5 @@ panic = "abort"
 
 [patch.crates-io]
 ureq = { path = "vendor/ureq" }
+# iroh 1.4.1 with one patch (a preferred home relay): see vendor/iroh/XBT-PATCH.md
+iroh = { path = "vendor/iroh" }

@@ -18,10 +18,12 @@
 
 /// How the seller's node vouches for the link key: one implementation, in xbt402.
 pub use xbt402::claim;
+pub mod nostr_lookup;
 
 use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
@@ -73,6 +75,9 @@ pub struct Options {
     /// Private mode: relays only, never a direct path. Neither end learns the other's IP address;
     /// the relay sees both, and the volume, never the content.
     pub private: bool,
+    /// Where links are told and found: over Nostr ([`nostr_lookup`]). `None`: only what the
+    /// caller learns ([`Link::learn`]). Never a lookup service of iroh's makers.
+    pub lookup: Option<Arc<nostr_lookup::NostrLookup>>,
 }
 
 /// An iroh endpoint and the loopback ports that lead through it.
@@ -82,6 +87,65 @@ pub struct Link {
     ports: Mutex<HashMap<EndpointId, u16>>,
     hints: Mutex<HashMap<EndpointId, Hints>>,
     shops: Mutex<HashMap<String, String>>,
+    lookup: Option<Arc<nostr_lookup::NostrLookup>>,
+    paths: Arc<Mutex<HashMap<EndpointId, Path>>>,
+    detail: AtomicBool,
+}
+
+/// The path a connection to a peer runs over now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Path {
+    /// Straight between the two ends: the address and the round trip.
+    Direct { addr: SocketAddr, rtt_ms: u64 },
+    /// Through a relay.
+    Relay { url: String, rtt_ms: u64 },
+}
+
+impl Path {
+    /// "direct" or "relay", with the round trip: what a log may say without naming the peer's address.
+    pub fn kind(&self) -> String {
+        match self {
+            Path::Direct { rtt_ms, .. } => format!("direct, {rtt_ms} ms"),
+            Path::Relay { rtt_ms, .. } => format!("relay, {rtt_ms} ms"),
+        }
+    }
+}
+
+/// Watches a connection's selected path until it closes, recording it under the peer's key and
+/// saying so on stderr when it changes (`detail`: with the address, for tools; a gateway says only
+/// direct or relay).
+fn watch(conn: Connection, paths: Arc<Mutex<HashMap<EndpointId, Path>>>, detail: bool) {
+    tokio::spawn(async move {
+        let peer = conn.remote_id();
+        let mut last: Option<Path> = None;
+        while conn.close_reason().is_none() {
+            let now = conn.paths().iter().find(|p| p.is_selected()).and_then(|p| {
+                let rtt_ms = p.rtt().as_millis() as u64;
+                match p.remote_addr() {
+                    iroh::TransportAddr::Ip(a) => Some(Path::Direct { addr: *a, rtt_ms }),
+                    iroh::TransportAddr::Relay(u) => Some(Path::Relay { url: u.to_string(), rtt_ms }),
+                    _ => None,
+                }
+            });
+            let changed = match (&last, &now) {
+                (Some(Path::Direct { .. }), Some(Path::Direct { .. })) | (Some(Path::Relay { .. }), Some(Path::Relay { .. })) | (None, None) => false,
+                _ => true,
+            };
+            if let Some(p) = &now {
+                lock(&paths).insert(peer, p.clone());
+                if changed {
+                    let peer_short = &hex::encode(peer.as_bytes())[..12];
+                    match (detail, p) {
+                        (true, Path::Direct { addr, rtt_ms }) => eprintln!("link: {peer_short} direct {addr} rtt {rtt_ms} ms"),
+                        (true, Path::Relay { url, rtt_ms }) => eprintln!("link: {peer_short} relay {url} rtt {rtt_ms} ms"),
+                        (false, p) => eprintln!("link: {peer_short} {}", p.kind()),
+                    }
+                }
+            }
+            last = now;
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    });
 }
 
 fn io_err(e: impl std::fmt::Display) -> io::Error {
@@ -91,12 +155,12 @@ fn io_err(e: impl std::fmt::Display) -> io::Error {
 impl Link {
     /// Starts the link with this secret key (32 bytes, kept by the caller).
     pub fn start(secret: [u8; 32], relays: Relays, serving: bool) -> io::Result<Arc<Link>> {
-        Self::start_with(secret, Options { relays, serving, private: false })
+        Self::start_with(secret, Options { relays, serving, private: false, lookup: None })
     }
 
     /// Starts the link with these options.
     pub fn start_with(secret: [u8; 32], opts: Options) -> io::Result<Arc<Link>> {
-        let Options { relays, serving, private } = opts;
+        let Options { relays, serving, private, lookup } = opts;
         if private && matches!(relays, Relays::None) {
             return Err(io_err("private mode needs a relay"));
         }
@@ -105,10 +169,14 @@ impl Link {
             Relays::None => RelayMode::Disabled,
             Relays::Public => RelayMode::Default,
             Relays::Ours(urls) => RelayMode::Custom(relay_map(&urls)?),
-            // iroh makes the relay that answers fastest its home: with ours and the public ones in
-            // one map it would rarely be ours. So ours alone, and the public ones only if ours does
-            // not answer at start (below)
-            Relays::OursThenPublic(urls) => RelayMode::Custom(relay_map(&urls)?),
+            // ours home whenever it answers (vendor/iroh's preferred relay); the public ones beside
+            // it for finding this endpoint's own public address, which ours cannot (no UDP), and
+            // as home only when ours does not answer
+            Relays::OursThenPublic(urls) => {
+                let map = relay_map(&urls)?;
+                map.extend(&iroh::defaults::prod::default_relay_map());
+                RelayMode::Custom(map)
+            }
         };
         let mut b = Endpoint::builder(presets::Minimal).secret_key(SecretKey::from_bytes(&secret)).relay_mode(relay_mode);
         if serving {
@@ -117,22 +185,19 @@ impl Link {
         if private {
             b = b.clear_ip_transports();
         }
-        let mut ep = rt.block_on(b.bind()).map_err(io_err)?;
-        if matches!(relays, Relays::OursThenPublic(_)) {
-            let up = rt.block_on(async { tokio::time::timeout(std::time::Duration::from_secs(10), ep.online()).await.is_ok() });
-            if !up {
-                rt.block_on(ep.close());
-                let mut b = Endpoint::builder(presets::Minimal).secret_key(SecretKey::from_bytes(&secret)).relay_mode(RelayMode::Default);
-                if serving {
-                    b = b.alpns(vec![ALPN.to_vec()]);
-                }
-                if private {
-                    b = b.clear_ip_transports();
-                }
-                ep = rt.block_on(b.bind()).map_err(io_err)?;
+        if let Some(l) = &lookup {
+            l.set_own(SecretKey::from_bytes(&secret).public());
+            b = b.address_lookup(l.clone());
+        }
+        if let Relays::OursThenPublic(urls) = &relays {
+            if let Some(first) = urls.first().and_then(|u| u.parse::<RelayUrl>().ok()) {
+                let mut nr = iroh::NetReportConfig::default();
+                nr.preferred_relay = Some(first);
+                b = b.net_report_config(nr);
             }
         }
-        Ok(Arc::new(Link { rt, ep, ports: Mutex::new(HashMap::new()), hints: Mutex::new(HashMap::new()), shops: Mutex::new(HashMap::new()) }))
+        let ep = rt.block_on(b.bind()).map_err(io_err)?;
+        Ok(Arc::new(Link { rt, ep, lookup, ports: Mutex::new(HashMap::new()), hints: Mutex::new(HashMap::new()), shops: Mutex::new(HashMap::new()), paths: Arc::new(Mutex::new(HashMap::new())), detail: AtomicBool::new(false) }))
     }
 
     /// This link's key, as hex: what a seller's listing names and its node vouches for.
@@ -156,10 +221,13 @@ impl Link {
     /// A seller's link: every stream a buyer opens is joined to a new TCP connection to `upstream`.
     pub fn serve(self: &Arc<Self>, upstream: SocketAddr) {
         let ep = self.ep.clone();
+        let (paths, detail) = (self.paths.clone(), self.detail.load(Ordering::Relaxed));
         self.rt.spawn(async move {
             while let Some(incoming) = ep.accept().await {
+                let paths = paths.clone();
                 tokio::spawn(async move {
                     let Ok(conn) = incoming.await else { return };
+                    watch(conn.clone(), paths.clone(), detail);
                     let from = peer_loopback(conn.remote_id().as_bytes());
                     while let Ok((send, recv)) = conn.accept_bi().await {
                         tokio::spawn(async move {
@@ -172,6 +240,15 @@ impl Link {
                 });
             }
         });
+    }
+
+    /// Believes where `endpoint_id_hex` is reached (from Nostr) only from this Nostr key: the one the
+    /// seller's verified transport document is bound to.
+    pub fn expect_author(&self, endpoint_id_hex: &str, nostr_pubkey_hex: &str) -> io::Result<()> {
+        if let Some(l) = &self.lookup {
+            l.expect(parse_id(endpoint_id_hex)?, nostr_pubkey_hex);
+        }
+        Ok(())
     }
 
     /// Remembers where a seller can be found, from its checked listing.
@@ -210,13 +287,14 @@ impl Link {
             a
         };
         let ep = self.ep.clone();
+        let (paths, detail) = (self.paths.clone(), self.detail.load(Ordering::Relaxed));
         self.rt.spawn(async move {
             let conn: Arc<tokio::sync::Mutex<Option<Connection>>> = Arc::new(tokio::sync::Mutex::new(None));
             while let Ok((tcp, _)) = listener.accept().await {
-                let (ep, addr, conn) = (ep.clone(), addr.clone(), conn.clone());
+                let (ep, addr, conn, paths) = (ep.clone(), addr.clone(), conn.clone(), paths.clone());
                 tokio::spawn(async move {
                     let _ = tcp.set_nodelay(true);
-                    let Some((send, recv)) = open(&ep, &addr, &conn).await else { return };
+                    let Some((send, recv)) = open(&ep, &addr, &conn, &paths, detail).await else { return };
                     join(tcp, send, recv).await;
                 });
             }
@@ -224,11 +302,14 @@ impl Link {
         Ok(bound)
     }
 
-    /// Whether the link to this seller runs direct or through a relay right now, for display.
-    pub fn path(&self, endpoint_id_hex: &str) -> Option<String> {
-        let id = parse_id(endpoint_id_hex).ok()?;
-        let info = self.rt.block_on(self.ep.remote_info(id))?;
-        Some(format!("{info:?}"))
+    /// The path the link to this peer runs over now, once a connection has been made.
+    pub fn path(&self, endpoint_id_hex: &str) -> Option<Path> {
+        lock(&self.paths).get(&parse_id(endpoint_id_hex).ok()?).cloned()
+    }
+
+    /// Path changes are logged with the peer's address (for tools), not only direct or relay.
+    pub fn log_path_detail(&self, on: bool) {
+        self.detail.store(on, Ordering::Relaxed);
     }
 
     /// Records that the shop at `shop_host` (`<base32 key>.shop.invalid`) is reached through the link
@@ -341,7 +422,8 @@ async fn connect_from(from: Ipv4Addr, upstream: SocketAddr) -> io::Result<TcpStr
 }
 
 /// A stream on the link to `addr`, connecting (again) when there is no live connection.
-async fn open(ep: &Endpoint, addr: &EndpointAddr, conn: &tokio::sync::Mutex<Option<Connection>>) -> Option<(SendStream, RecvStream)> {
+async fn open(ep: &Endpoint, addr: &EndpointAddr, conn: &tokio::sync::Mutex<Option<Connection>>,
+              paths: &Arc<Mutex<HashMap<EndpointId, Path>>>, detail: bool) -> Option<(SendStream, RecvStream)> {
     let mut c = conn.lock().await;
     if let Some(live) = c.as_ref() {
         if let Ok(s) = live.open_bi().await {
@@ -349,6 +431,7 @@ async fn open(ep: &Endpoint, addr: &EndpointAddr, conn: &tokio::sync::Mutex<Opti
         }
     }
     let fresh = ep.connect(addr.clone(), ALPN).await.ok()?;
+    watch(fresh.clone(), paths.clone(), detail);
     let s = fresh.open_bi().await.ok()?;
     *c = Some(fresh);
     Some(s)

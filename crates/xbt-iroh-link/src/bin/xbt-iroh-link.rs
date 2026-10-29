@@ -65,7 +65,8 @@ fn main() {
     match args[0].as_str() {
         "serve" => {
             let upstream = pos.first().and_then(|s| s.parse().ok()).unwrap_or_else(|| usage());
-            let link = Link::start_with(secret(secret_file.as_deref()), Options { relays, serving: true, private }).expect("the link starts");
+            let link = Link::start_with(secret(secret_file.as_deref()), Options { relays, serving: true, private, lookup: None }).expect("the link starts");
+            link.log_path_detail(true);
             link.serve(upstream);
             let h = link.hints(Duration::from_secs(10));
             println!(
@@ -75,20 +76,20 @@ fn main() {
                 h.direct.iter().map(|a| a.to_string()).collect::<Vec<_>>()
             );
             loop {
-                std::thread::sleep(Duration::from_secs(3600));
+                std::thread::sleep(Duration::from_secs(20));
+                let h = link.hints(Duration::from_secs(1));
+                eprintln!("home relay {:?}, {} addresses", h.relays, h.direct.len());
             }
         }
         "dial" => {
             let (Some(id), Some(listen)) = (pos.first(), pos.get(1).and_then(|s| s.parse().ok())) else { usage() };
-            let link = Link::start_with(secret(secret_file.as_deref()), Options { relays, serving: false, private }).expect("the link starts");
+            let link = Link::start_with(secret(secret_file.as_deref()), Options { relays, serving: false, private, lookup: None }).expect("the link starts");
+            link.log_path_detail(true);
             link.learn(id, Hints { relays: hint_relays, direct: hint_direct }).expect("a seller key");
             let bound = link.forward(id, listen).expect("listen");
             eprintln!("dial: {bound} leads to {}", &id[..12]);
             loop {
-                std::thread::sleep(Duration::from_secs(30));
-                if let Some(p) = link.path(id) {
-                    eprintln!("path: {p}");
-                }
+                std::thread::sleep(Duration::from_secs(3600));
             }
         }
         _ => usage(),
