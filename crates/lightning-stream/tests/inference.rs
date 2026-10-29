@@ -64,7 +64,10 @@ fn signer(dir: &Path, sellers: Arc<Mutex<Sellers>>) -> PathBuf {
                     s
                 };
                 let head = |status: u16, t: &str| json!({"status": status, "content_type": t}).to_string();
-                let result = if url.ends_with("/v1/models") {
+                let result = if url.ends_with("/v1/models") && seller == "paid.example" {
+                    // a gateway that serves nothing outside a paid session: its list is not free
+                    json!({"verdict": "deny", "rule": "max_sats", "reason": "the seller asks to be paid and this call may spend nothing (max_sats 0)", "charged_sats": 0})
+                } else if url.ends_with("/v1/models") {
                     let mut s = connect();
                     let models = if seller == "cheap.example" { json!({"data": [{"id": "llama"}, {"id": "qwen"}]}) } else { json!({"data": [{"id": "llama"}]}) };
                     writeln!(s, "{}", head(200, "application/json")).unwrap();
@@ -308,4 +311,52 @@ fn the_first_request_of_a_fresh_endpoint_waits_for_the_catalogue_fetched_in_the_
     let (status, _, body) = chat(&r, "qwen");
     assert_eq!(status, 200, "{body}");
     assert_eq!(sellers_called(&r), ["cheap.example"]);
+}
+
+#[test]
+fn a_seller_whose_list_is_not_free_is_listed_with_the_models_its_entry_names() {
+    let r = rig(Plan::Answer(1), Plan::Answer(1), 100);
+    r.sellers.lock().unwrap().plans.insert("paid.example".into(), Plan::Answer(3));
+    let list = r._dir.path().join("ai-sellers.json");
+    let mut v: Value = serde_json::from_slice(&std::fs::read(&list).unwrap()).unwrap();
+    v["sellers"].as_array_mut().unwrap().push(json!({"name": "paid", "route": "https://paid.example/ai/", "prices": {"per_1k_output_msat": 1000},
+                                                      "max_output": 1024, "models": ["tiny"]}));
+    v["sellers"].as_array_mut().unwrap().push(json!({"name": "silent", "route": "https://paid.example/other/", "prices": {"per_1k_output_msat": 1}}));
+    std::fs::write(&list, v.to_string()).unwrap();
+    // the rig's endpoint read the sellers file when it started: one more endpoint on the changed file
+    let cfg = lightning_stream::inference_server::Config {
+        signer: r._dir.path().join("signer.sock"), stream_dir: r._dir.path().to_path_buf(), task: "ai".into(), max_sats: 2000,
+        credentials: r.creds.clone(), sellers: list, state: r._dir.path().join("ai-state-2.json"), first_byte: Duration::from_millis(1000), allowed_hosts: vec![],
+    };
+    let run = lightning_stream::inference_server::serve(cfg, TcpListener::bind("127.0.0.1:0").unwrap()).unwrap();
+    let addr = run.addr.to_string();
+    std::mem::forget(run);
+    let (status, _, body) = call(&addr, "GET", "/v1/models", Some(&r.key), "", "");
+    assert_eq!(status, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let ids: Vec<&str> = v["data"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap()).collect();
+    assert!(ids.contains(&"tiny") && ids.contains(&"paid/tiny"), "{ids:?}");
+    assert!(!ids.iter().any(|i| i.starts_with("silent/")), "a seller with no free list and no models named is not listed");
+    let (status, _, body) = call(&addr, "POST", "/v1/chat/completions", Some(&r.key), "", &json!({"model": "tiny", "stream": true, "max_tokens": 10}).to_string());
+    assert_eq!(status, 200, "{body}");
+    assert!(sellers_called(&r).contains(&"paid.example".to_string()));
+}
+
+#[test]
+fn a_pin_or_a_block_applies_to_the_next_request_and_a_request_too_dear_for_the_key_says_so() {
+    let r = rig(Plan::Answer(1), Plan::Answer(1), 1);
+    assert_eq!(chat(&r, "llama").0, 200);
+    let list = r._dir.path().join("ai-sellers.json");
+    let mut v: Value = serde_json::from_slice(&std::fs::read(&list).unwrap()).unwrap();
+    v["pinned"] = json!(["dear"]);
+    std::thread::sleep(Duration::from_millis(20));
+    std::fs::write(&list, v.to_string()).unwrap();
+    assert_eq!(chat(&r, "llama").0, 200);
+    assert_eq!(sellers_called(&r), ["cheap.example", "dear.example"], "the pin applies to the very next request");
+    // 1 sat of limit: a request that may cost up to 9 sats (1,000 tokens at the dearer price) is refused, and says why
+    let (status, _, body) = call(&r.addr, "POST", "/v1/chat/completions", Some(&r.key), "",
+                                 &json!({"model": "llama", "stream": true, "max_tokens": 1000}).to_string());
+    assert_eq!(status, 402);
+    let m = serde_json::from_str::<Value>(&body).unwrap()["error"]["message"].as_str().unwrap().to_string();
+    assert!(m.contains("may cost up to") && m.contains("fewer max_tokens"), "{m}");
 }
