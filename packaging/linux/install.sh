@@ -119,7 +119,7 @@ fi
 LS_DATA_DIR=${LS_DATA_DIR:-$DIR/data}
 LS_CHAIN=${LS_CHAIN:-main}
 COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME:-lightning-stream}
-LS_UI_PORT=${LS_UI_PORT:-8482} LS_MCP_PORT=${LS_MCP_PORT:-33511} LS_CONNECTOR_PORT=${LS_CONNECTOR_PORT:-8484}
+LS_UI_PORT=${LS_UI_PORT:-8482} LS_MCP_PORT=${LS_MCP_PORT:-33511} LS_CONNECTOR_PORT=${LS_CONNECTOR_PORT:-8484} LS_APP_PORTS=${LS_APP_PORTS:-33521,33522,33523,33524}
 LS_GW_PORT=${LS_GW_PORT:-8402} LS_HASHTAKER_CONTROL_PORT=${LS_HASHTAKER_CONTROL_PORT:-23343}
 LS_RELAYS=${LS_RELAYS:-wss://relay.lazarus-xbt.xyz,wss://relay.kilombino.com,wss://relay.damus.io,wss://nos.lol} LS_LAN_HOST=${LS_LAN_HOST:-}
 
@@ -133,7 +133,7 @@ mkdir -p "$LS_DATA_DIR"
     echo "# Lightning Stream: written by install.sh on $(date -u +%Y-%m-%d). It holds passwords: keep it private."
     for k in COMPOSE_PROJECT_NAME LS_DATA_DIR LS_CHAIN LS_UI_PASSWORD LS_LND_REST LS_LND_TLS_CERT LS_NODE_RPC_HOST LS_NODE_RPC_PORT LS_NODE_RPC_USER \
              LS_NODE_RPC_PASS LS_DATUM LS_DATUM_USER LS_HASHMAKER LS_LAN_HOST COMPOSE_PROFILES LS_UI_HASHMAKER \
-             LS_UI_HASHMAKER_SLICES LS_UI_PORT LS_MCP_PORT LS_CONNECTOR_PORT LS_GW_PORT LS_HASHTAKER_CONTROL_PORT LS_RELAYS; do
+             LS_UI_HASHMAKER_SLICES LS_UI_PORT LS_MCP_PORT LS_CONNECTOR_PORT LS_APP_PORTS LS_GW_PORT LS_HASHTAKER_CONTROL_PORT LS_RELAYS; do
       v=${!k:-}
       case $v in *"'"*) die "$k may not contain a single quote" ;; esac
       # a plain value as it is, so what you read is what you type (the random password is one); any other in

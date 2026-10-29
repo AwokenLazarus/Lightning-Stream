@@ -19,7 +19,7 @@ use crate::server::{strip_base, Req, Resp};
 use crate::{msg, now};
 
 #[path = "stream_pages.rs"]
-mod stream_pages;
+pub(crate) mod stream_pages;
 #[path = "nwc_pages.rs"]
 mod nwc_pages;
 #[path = "sell.rs"]
@@ -47,6 +47,8 @@ pub struct App {
     pub platform: Option<crate::auth::PlatformLogin>,
     /// Why the last play of an item failed, by item URL, for the player page to say (a few minutes).
     pub play_errors: std::sync::Mutex<HashMap<String, (std::time::Instant, u16, Value)>>,
+    /// Sellers' own pages on the app ports ([`crate::seller_app`]).
+    pub apps: crate::seller_app::AppOrigins,
 }
 
 /// What a human who signs on another device needs.
@@ -200,10 +202,11 @@ impl App {
         let relays = RelayLinks::new(cfg.relay_ttl);
         let nostr = crate::nostr::NostrCache::new(cfg.nostr_relays.clone());
         let platform = cfg.platform_login.as_deref().map(crate::auth::PlatformLogin::new);
-        Ok(Arc::new(Self { cfg, auth, signer, relays, nostr, platform, play_errors: std::sync::Mutex::new(HashMap::new()) }))
+        Ok(Arc::new(Self { cfg, auth, signer, relays, nostr, platform, play_errors: std::sync::Mutex::new(HashMap::new()),
+                         apps: Default::default() }))
     }
 
-    fn call(&self, method: &str, params: Value) -> Result<Value, String> {
+    pub(crate) fn call(&self, method: &str, params: Value) -> Result<Value, String> {
         self.signer.call(method, params)
     }
 
@@ -417,6 +420,8 @@ impl App {
             "/hashrate" => self.hashrate_page(&ctx),
             "/nostr" => self.nostr_page(&ctx, &req.query),
             "/play" => self.play(&ctx, &req),
+            "/app" => self.app_page(&ctx, &req.query),
+            "/api/visit" => self.api_visit(&req.query),
             "/connections" => self.connections(&ctx),
             "/apps" => self.apps_page(&ctx),
             "/approvals" => self.approvals(&ctx),
@@ -580,6 +585,9 @@ impl App {
         };
         match req.path.as_str() {
             "/play" => self.play_stop(ctx, f),
+            "/app" => self.app_open(ctx, f),
+            "/app-stop" => self.app_stop(ctx, f),
+            "/identity" => self.identity(ctx, f),
             "/services" => self.services_post(ctx, f),
             "/sell" if self.cfg.sell => self.sell_post(ctx, f),
             "/sell-hashrate" if self.cfg.sell => self.sell_hashrate_post(ctx, f),

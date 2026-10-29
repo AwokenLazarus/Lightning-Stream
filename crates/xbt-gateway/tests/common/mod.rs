@@ -53,6 +53,25 @@ impl Handler for Service {
         self.hits.fetch_add(1, Ordering::SeqCst);
         self.seen.lock().unwrap().push(req.clone());
         let path = req.path().to_string();
+        // a WebSocket that echoes every byte back, as a chat's does
+        if path.starts_with("/ws") && req.header("Upgrade").is_some_and(|u| u.eq_ignore_ascii_case("websocket")) {
+            let key = req.header("Sec-WebSocket-Key").unwrap_or("").to_string();
+            return Reply::Upgrade(xbt_svc::http::Upgraded {
+                headers: vec![("Upgrade".into(), "websocket".into()), ("Sec-WebSocket-Accept".into(), format!("accept-{key}"))],
+                run: Box::new(|mut s, early| {
+                    use std::io::{Read as _, Write as _};
+                    if !early.is_empty() && s.write_all(&early).is_err() {
+                        return;
+                    }
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = s.read(&mut buf) {
+                        if n == 0 || s.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                }),
+            });
+        }
         let sized = |p: &str| path.strip_prefix(p).and_then(|n| n.parse::<usize>().ok());
         let body = |n: usize, pause: Duration| -> xbt_svc::http::Body {
             Box::new(move |out| {
@@ -172,7 +191,11 @@ pub fn routes() -> Value {
         {"path": "/pay", "price": {"request_msat": 2500}},
         {"path": "/moved", "price": {"request_msat": 2500}},
         {"path": "/timed/", "price": {"second_msat": 100000}},
-        {"path": "/verify/", "price": {"request_msat": 400000}, "release": "after-verify"}
+        {"path": "/verify/", "price": {"request_msat": 400000}, "release": "after-verify"},
+        // WebSockets: 1 sat a KiB either way and 2.5 sat to open; a free one; and one that costs 1,000 sat a KiB
+        {"path": "/ws/", "price": {"request_msat": 2500, "byte_msat": 1000, "per_bytes": 1024}, "websocket": true},
+        {"path": "/wsfree/", "free": true, "websocket": true},
+        {"path": "/wsdear/", "price": {"byte_msat": 1_000_000, "per_bytes": 1024}, "websocket": true}
     ])
 }
 

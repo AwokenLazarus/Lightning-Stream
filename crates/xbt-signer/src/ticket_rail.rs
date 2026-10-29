@@ -369,6 +369,13 @@ impl Signer {
         }
     }
 
+    /// This wallet's key for the seller whose receipt key is `receipt_key` ([`Seed::buyer_key`]).
+    pub(crate) fn buyer_key(&self, receipt_key: &str) -> Result<xbt402::xbt_primitives::secp256k1::SecretKey> {
+        let g = self.ticket_store()?;
+        let st = g.as_ref().ok_or_else(|| err("ticket", "the ticket book is not open"))?;
+        Ok(self.ticket_seed(&st.book)?.buyer_key(receipt_key))
+    }
+
     /// The ticket seed: read from `ticket_seed.json`, or made when the wallet has neither a seed
     /// nor a ticket. A book with tickets and no seed is an error: a new seed could neither know
     /// their secrets nor read their tags.

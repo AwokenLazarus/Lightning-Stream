@@ -25,6 +25,7 @@ pub mod msg;
 pub mod nostr;
 pub mod relay;
 pub mod server;
+pub mod seller_app;
 pub mod setup;
 pub mod shops;
 

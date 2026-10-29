@@ -111,7 +111,7 @@ impl Handler for Service {
             let _ = n;
             Reply::Stream(Streamed { status: 200, headers: vec![("Content-Type".into(), "application/octet-stream".into())], length, body: b })
         };
-        if let Some(n) = sized("/files/").or_else(|| sized("/page/")).or_else(|| sized("/free/")).or_else(|| sized("/pieces/")).or_else(|| sized("/hot/")).or_else(|| sized("/tiny/")) {
+        if let Some(n) = sized("/files/").or_else(|| sized("/page/")).or_else(|| sized("/free/")).or_else(|| sized("/pieces/")).or_else(|| sized("/hot/")).or_else(|| sized("/tiny/")).or_else(|| sized("/uhd/")).or_else(|| sized("/hd20/")) {
             // one byte range, as a file server answers it: 206 and that part of the same bytes
             let range = req.header("Range").and_then(|r| r.strip_prefix("bytes=")).and_then(|r| r.split_once('-'))
                 .and_then(|(a, b)| Some((a.parse::<usize>().ok()?, if b.is_empty() { n.checked_sub(1)? } else { b.parse::<usize>().ok()?.min(n.checked_sub(1)?) })));
@@ -131,6 +131,23 @@ impl Handler for Service {
                                                 length: Some(span as u64), body: part });
             }
             return stream(n, Some(n as u64), body(n, 64 << 10, Duration::ZERO));
+        }
+        if let Some(n) = sized("/rate10/") {
+            // as a 4K film streams: 10 MiB a second (84 Mbit/s), 64 KiB at a time
+            return stream(n, Some(n as u64), Box::new(move |out| {
+                let start = std::time::Instant::now();
+                let mut sent = 0usize;
+                while sent < n {
+                    let k = (n - sent).min(64 << 10);
+                    out.send(&(sent..sent + k).map(pattern).collect::<Vec<u8>>())?;
+                    sent += k;
+                    let due = Duration::from_secs_f64(sent as f64 / (10.0 * MIB as f64));
+                    if let Some(wait) = due.checked_sub(start.elapsed()) {
+                        std::thread::sleep(wait);
+                    }
+                }
+                Ok(())
+            }));
         }
         if let Some(n) = sized("/slow/") {
             return stream(n, Some(n as u64), body(n, 64 << 10, Duration::from_millis(15)));
@@ -158,6 +175,42 @@ impl Handler for Service {
                 out.send(b"data: [DONE]\n\n")
             }) });
         }
+        // a WebSocket that echoes every byte back, as a chat's does
+        if path.starts_with("/ws") && req.header("Upgrade").is_some_and(|u| u.eq_ignore_ascii_case("websocket")) {
+            let key = req.header("Sec-WebSocket-Key").unwrap_or("").to_string();
+            return Reply::Upgrade(xbt_svc::http::Upgraded {
+                headers: vec![("Upgrade".into(), "websocket".into()), ("Sec-WebSocket-Accept".into(), format!("accept-{key}"))],
+                run: Box::new(|mut s, early| {
+                    use std::io::{Read as _, Write as _};
+                    if !early.is_empty() && s.write_all(&early).is_err() {
+                        return;
+                    }
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = s.read(&mut buf) {
+                        if n == 0 || s.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                }),
+            });
+        }
+        // a web app: its page only compressed (as llama.cpp's server serves it), and an echo of what reached it
+        if path == "/app/" {
+            if !req.header("Accept-Encoding").is_some_and(|a| a.contains("gzip")) {
+                return Reply::Whole(Response::text(415, "text/plain", "Error: gzip is not supported by this browser"));
+            }
+            use std::io::Write as _;
+            let mut z = flate2::write::GzEncoder::new(vec![], flate2::Compression::default());
+            z.write_all(APP_PAGE.as_bytes()).unwrap();
+            return Reply::Whole(Response::new(200, vec![("Content-Type".into(), "text/html".into()), ("Content-Encoding".into(), "gzip".into())], z.finish().unwrap()));
+        }
+        if path == "/app/echo" || path == "/acct/echo" {
+            let h = |k: &str| req.header(k).unwrap_or("").to_string();
+            let v = json!({"method": req.method, "body": String::from_utf8_lossy(&req.body), "cookie": h("Cookie"), "authorization": h("Authorization"),
+                           "guest": h("X-Guest"), "host": h("Host")});
+            return Reply::Whole(Response::new(200, vec![("Content-Type".into(), "application/json".into()), ("Set-Cookie".into(), "jf=abc; Path=/; HttpOnly".into()),
+                                                        ("X-Seller-App".into(), "yes".into()), ("Payment-Made-Up".into(), "no".into())], v.to_string().into_bytes()));
+        }
         Reply::Whole(match path.as_str() {
             "/api" => Response::text(200, "application/json", json!({"method": req.method, "body": String::from_utf8_lossy(&req.body)}).to_string()),
             "/broken" => Response::text(500, "text/plain", "the service failed"),
@@ -166,8 +219,17 @@ impl Handler for Service {
     }
 }
 
+/// The stand-in web app's page.
+const APP_PAGE: &str = "<!doctype html><title>A seller's app</title><script src=\"./app.js\"></script>";
+
+/// The seller's accounts hook in the rig: it names the buyer it is given in a header.
+const ACCOUNT_HOOK: &str = "/tmp/xbt-ticket-pay-account-hook.sh";
+
 fn routes() -> Value {
     json!([
+        // a seller's own web page (docs/SELLER-APPS.md): the methods and headers a page uses, its compressed page, and the seller's guest login
+        {"path": "/app/", "methods": ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"], "price": {"request_msat": 2500}, "max_body": 65536,
+         "forward_headers": ["cookie", "authorization", "x-guest"], "accept_gzip": true, "upstream_headers": {"x-guest": "guest-token"}},
         {"path": "/page/", "price": {"request_msat": 2500}},
         {"path": "/api", "methods": ["GET", "POST"], "price": {"request_msat": 2500}, "max_body": 4096},
         {"path": "/broken", "price": {"request_msat": 2500}},
@@ -179,6 +241,15 @@ fn routes() -> Value {
         // a quarter of a win of 64 sat for a piece of 64 KiB: one piece in four wins
         {"path": "/hot/", "price": {"byte_msat": 16_000, "per_bytes": 65_536}},
         {"path": "/tiny/", "price": {"request_msat": 500}},
+        // video priced for long viewing: 1 sat a MiB (4K at 80 Mbit/s is about 36 sat a minute), and 20 sat a MiB
+        {"path": "/uhd/", "price": {"byte_msat": 1000, "per_bytes": 1_048_576}},
+        {"path": "/hd20/", "price": {"byte_msat": 20_000, "per_bytes": 1_048_576}},
+        {"path": "/rate10/", "price": {"byte_msat": 20_000, "per_bytes": 1_048_576}},
+        // WebSockets: 2.5 sat to open and 1 sat a KiB either way, and a free one
+        {"path": "/ws/", "price": {"request_msat": 2500, "byte_msat": 1000, "per_bytes": 1024}, "websocket": true},
+        {"path": "/wsfree/", "free": true, "websocket": true},
+        // a buyer's own account (docs/BUYER-ACCOUNTS.md), made by the seller's hook: its headers say who the buyer is
+        {"path": "/acct/", "methods": ["GET", "POST"], "price": {"request_msat": 2500}, "accounts": {"kind": "hook", "command": ACCOUNT_HOOK}},
         {"path": "/tick/", "price": {"second_msat": 1000}},
         {"path": "/free/", "free": true},
         // a model: 4 sat per 1,000 tokens in, 20 sat per 1,000 tokens out, at most 500 tokens a reply
@@ -648,6 +719,8 @@ impl LnBackend for PayLn {
         let d = xbt_signer::bolt11::decode(&r.invoice).map_err(|e| node_err(&e))?;
         let hash = d.payment_hash_hex();
         let pre = self.plain.lock().unwrap().get(&hash).cloned().ok_or_else(|| node_err("no route"))?;
+        let takes = self.st.lock().unwrap().send_takes;
+        std::thread::sleep(takes);
         let mut s = self.st.lock().unwrap();
         s.next_index += 1;
         let p = json!({"payment_hash": hash, "payment_index": s.next_index.to_string(), "status": "SUCCEEDED", "value_msat": d.amount_msat.unwrap_or(0).to_string(),
@@ -805,6 +878,12 @@ struct Tap {
 }
 
 impl TicketWire for Tap {
+    fn upgrade(&self, url: &str, headers: &[(String, String)], read_timeout: Duration, tls: Option<&SellerTls>) -> xbt402::Result<xbt_signer::ticket_pay::WireUpgrade> {
+        let path = url.splitn(4, '/').nth(3).map(|p| format!("/{p}")).unwrap_or_default();
+        self.log.lock().unwrap().push(Seen { method: "GET".into(), path, body: String::new(), paid: headers.iter().any(|(k, _)| k == "PAYMENT-SIGNATURE") });
+        self.inner.upgrade(url, headers, read_timeout, tls)
+    }
+
     fn send_with(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)], read_timeout: Duration, tls: Option<&SellerTls>)
                  -> xbt402::Result<WireAnswer> {
         self.trust.lock().unwrap().push((url.to_string(), tls.cloned()));
@@ -1207,6 +1286,66 @@ fn a_body_is_streamed_to_a_local_reader_as_it_is_paid_and_stops_when_the_reader_
     // a name with a path in it is refused before anything is sent
     let v = r.call("xbt402_pay", json!({"url": r.shop.url("/page/10"), "max_sats": CALL, "task": "film", "stream_to": "../x"}));
     assert_eq!(v["rule"], "stream_to", "{v}");
+    std::env::remove_var("B2_STREAM_DIR");
+    r.assert_booked();
+}
+
+/// A seller's own web page, used inside the app (docs/SELLER-APPS.md): the caller's headers (its
+/// cookies, its login) reach the service, the seller's guest login wins over a forged one, the
+/// page the service serves only compressed comes back plain, and the seller's response headers come
+/// back in the head line for a caller that asks (`head_headers`), without the payment's. The wallet's
+/// own headers cannot be set by the caller.
+#[test]
+fn a_sellers_web_page_gets_the_callers_headers_and_its_answer_comes_back_with_its_own() {
+    use std::io::{BufRead as _, BufReader, Read as _};
+    use std::os::unix::net::UnixListener;
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = Rig::new(json!({}));
+    let read = |name: &'static str| {
+        let l = UnixListener::bind(dir.path().join(name)).unwrap();
+        std::thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            let mut b = BufReader::new(s);
+            let mut line = String::new();
+            b.read_line(&mut line).unwrap();
+            let mut rest = vec![];
+            b.read_to_end(&mut rest).unwrap();
+            (serde_json::from_str::<Value>(&line).unwrap(), rest)
+        })
+    };
+    // the page: asked compressed by the gateway, unpacked there, metered and signed plain
+    let page = read("page");
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/app/"), "max_sats": 5_000, "task": "film", "stream_to": "page", "stream_head": true, "head_headers": true}));
+    let (head, body) = page.join().unwrap();
+    assert_eq!((v["status"].as_u64(), v["complete"].as_bool()), (Some(200), Some(true)), "{v}");
+    assert_eq!(String::from_utf8_lossy(&body), APP_PAGE);
+    assert!(head["headers"].as_array().unwrap().iter().all(|h| !h[0].as_str().unwrap().eq_ignore_ascii_case("content-encoding")), "{head}");
+    // a request of the page, with its cookie and its login, and a guest login of its own making
+    let echo = read("echo");
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/app/echo"), "method": "POST", "body_b64": "eyJhIjoxfQ==", "max_sats": 5_000, "task": "film",
+                                        "stream_to": "echo", "stream_head": true, "head_headers": true,
+                                        "headers": [["Cookie", "jf=abc"], ["Authorization", "MediaBrowser Token=t1"], ["X-Guest", "forged"], ["Content-Type", "application/json"]]}));
+    let (head, body) = echo.join().unwrap();
+    assert_eq!(v["complete"], true, "{v}");
+    let got: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!((got["method"].as_str(), got["body"].as_str(), got["cookie"].as_str(), got["authorization"].as_str(), got["guest"].as_str()),
+               (Some("POST"), Some("{\"a\":1}"), Some("jf=abc"), Some("MediaBrowser Token=t1"), Some("guest-token")), "{got}");
+    let names: Vec<String> = head["headers"].as_array().unwrap().iter().map(|h| h[0].as_str().unwrap().to_ascii_lowercase()).collect();
+    assert!(names.contains(&"set-cookie".to_string()) && names.contains(&"x-seller-app".to_string()), "{head}");
+    assert!(!names.iter().any(|n| n.starts_with("payment-") || n == "content-length"), "{head}");
+    // a call without head_headers gets the head as before, with no headers in it
+    let plain = read("plain");
+    r.call("xbt402_pay", json!({"url": r.shop.url("/app/echo"), "max_sats": 5_000, "task": "film", "stream_to": "plain", "stream_head": true}));
+    assert!(plain.join().unwrap().0.get("headers").is_none());
+    // the wallet's own headers, and the ones a proxy must not pass on, are refused before anything is sent
+    for h in ["Host", "Payment-Signature", "Content-Length", "Range", "Transfer-Encoding", "X-Forwarded-For", "Accept-Encoding"] {
+        let v = r.call("xbt402_pay", json!({"url": r.shop.url("/app/echo"), "max_sats": 5_000, "task": "film", "headers": [[h, "x"]]}));
+        assert_eq!(v["rule"], "headers", "{h}: {v}");
+    }
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/app/echo"), "max_sats": 5_000, "task": "film", "headers": [["X-A", "line\nbreak"]]}));
+    assert_eq!(v["rule"], "headers", "{v}");
     std::env::remove_var("B2_STREAM_DIR");
     r.assert_booked();
 }
@@ -4287,4 +4426,147 @@ fn a_seller_that_never_reveals_does_not_keep_the_call_open() {
     let v = rx.recv_timeout(Duration::from_secs(90)).expect("the call returns");
     assert_eq!((v["rail"].as_str(), v["wins_paid"].as_u64()), (Some("lottery"), Some(0)), "{v}");
     assert!(v["ended"].as_str().is_some_and(|e| e.contains("reveal")), "{v}");
+}
+
+/// How fast a paid body reaches a local reader through the signer and the seller's gateway, and
+/// whether a ticket bought on the way ever holds the body up. Run on demand:
+/// `cargo test --release -p xbt-signer --test ticket_pay throughput -- --ignored --nocapture`.
+/// The stand-in node pays at once, so a refill here costs only the software's own time; on a real
+/// route a payment takes a second or more, which the gap figure does not include.
+#[test]
+#[ignore]
+fn throughput_of_a_paid_stream_and_the_longest_gap_at_a_refill() {
+    use std::io::Read as _;
+    use std::os::unix::net::UnixListener;
+    use std::time::Instant;
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let prepaid_only = || json!({"tickets": {"settle": ["on-arrival"]}, "caps": {"sessions_per_address": 0}});
+    // the gateway waits for a refill as long as it does as shipped (15 s), not the tests' 400 ms
+    REFILL_WAIT_MS.store(15_000, Ordering::SeqCst);
+    // (route, bytes, max_sats, the shop, how long one payment takes on the buyer's node)
+    for (route, n, max_sats, shop, takes) in [("/uhd/", 1024 * MIB, 5_000i64, shipped_shop(), 0u64), ("/hd20/", 512 * MIB, 20_000, shipped_shop(), 0),
+                                              ("/hd20/", 512 * MIB, 20_000, prepaid_only(), 0), ("/hd20/", 512 * MIB, 20_000, prepaid_only(), 1500),
+                                              // a 4K film's rate, a prepaid ticket that takes 1.5 s to pay: no read waits as long as a payment
+                                              ("/rate10/", 200 * MIB, 20_000, prepaid_only(), 1500)] {
+        let r = Rig::shipped(json!({}), 483, shop.clone());
+        r.ln.st.lock().unwrap().send_takes = Duration::from_millis(takes);
+        let name = format!("tp{}-{}-{takes}", route.trim_matches('/'), shop["tickets"]["settle"].is_array());
+        let l = UnixListener::bind(dir.path().join(&name)).unwrap();
+        let reader = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut buf = vec![0u8; 256 << 10];
+            let (mut got, mut gaps) = (0usize, vec![]);
+            let start = Instant::now();
+            let mut last = Instant::now();
+            loop {
+                let k = s.read(&mut buf).unwrap();
+                if k == 0 {
+                    break;
+                }
+                let now = Instant::now();
+                gaps.push(now.duration_since(last));
+                last = now;
+                got += k;
+            }
+            gaps.sort();
+            (got, start.elapsed(), gaps.last().copied().unwrap_or_default(), gaps.get(gaps.len() * 99 / 100).copied().unwrap_or_default())
+        });
+        let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("{route}{n}")), "max_sats": max_sats, "task": "film", "stream_to": name}));
+        let (got, took, worst, p99) = reader.join().unwrap();
+        println!("{route}: ended {} rule {} reason {}", v["ended"], v["rule"], v["reason"]);
+        let mbit = got as f64 * 8.0 / took.as_secs_f64() / 1e6;
+        print!("{route} prepaid-only {} payment {takes} ms: ", shop["tickets"]["settle"].is_array());
+        println!("{route}: {} MiB in {:.2} s = {mbit:.0} Mbit/s; tickets released {}, charged {} sat; longest gap between reads {:?}, p99 {:?}",
+                 got / MIB, took.as_secs_f64(), v["tickets_released"], v["charged_sats"], worst, p99);
+        assert_eq!((got, v["complete"].as_bool()), (n, Some(true)), "{v}");
+    }
+    REFILL_WAIT_MS.store(400, Ordering::SeqCst);
+    std::env::remove_var("B2_STREAM_DIR");
+}
+
+/// A WebSocket through the wallet (docs/SELLER-APPS.md): the caller's socket carries it both ways,
+/// the seller's 101 comes first as the head line, and every byte either way is paid for at the
+/// route's price, from tickets the wallet pays as the bytes pass. A free one is joined at once.
+#[test]
+fn a_websocket_is_carried_both_ways_and_every_byte_paid() {
+    use std::io::{BufRead as _, Read as _, Write as _};
+    use std::os::unix::net::UnixListener;
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = Rig::new(json!({}));
+    for (path, paid) in [("/ws/chat", true), ("/wsfree/chat", false)] {
+        let name = format!("ws{}", u8::from(paid));
+        let l = UnixListener::bind(dir.path().join(&name)).unwrap();
+        // the caller: the head line, then 64 KiB out and the same back, then it hangs up
+        let caller = std::thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+            let mut rd = std::io::BufReader::new(s.try_clone().unwrap());
+            let mut line = String::new();
+            rd.read_line(&mut line).unwrap();
+            let head: Value = serde_json::from_str(&line).unwrap();
+            let mut w = s;
+            let out: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
+            w.write_all(&out).unwrap();
+            let mut back = vec![0u8; out.len()];
+            rd.read_exact(&mut back).unwrap();
+            assert_eq!(back, out, "the echo came back whole");
+            w.shutdown(std::net::Shutdown::Both).unwrap();
+            head
+        });
+        let v = r.call("xbt402_pay", json!({"url": r.shop.url(path), "max_sats": 5_000, "task": "film", "stream_to": name, "stream_head": true,
+                                           "head_headers": true, "upgrade": true, "headers": [["Sec-WebSocket-Key", "k1"], ["Sec-WebSocket-Version", "13"]]}));
+        let head = caller.join().unwrap();
+        assert_eq!(head["status"], 101, "{head}");
+        assert!(head["headers"].as_array().unwrap().iter().any(|h| h[0].as_str().unwrap().eq_ignore_ascii_case("sec-websocket-accept") && h[1] == "accept-k1"), "{head}");
+        assert_eq!(v["status"], 101, "{v}");
+        if paid {
+            // 2,500 msat to open, and 128 KiB at 1,000 msat a KiB: 64 KiB each way, by the wallet's count and the seller's signed one
+            let want = (2_500 + 128 * 1_000).to_string();
+            assert_eq!((v["price_msat"].as_str(), v["receipt"]["last"]["charged"].as_str(), v["receipt"]["body"].as_str()),
+                       (Some(want.as_str()), Some(want.as_str()), Some("as signed")), "{v}");
+            assert_eq!(v["receipt"]["signed"], true, "{v}");
+        } else {
+            assert_eq!((v["rule"].as_str(), v["charged_sats"].as_u64()), (Some("free"), Some(0)), "{v}");
+        }
+    }
+    std::env::remove_var("B2_STREAM_DIR");
+}
+
+/// A seller that gives each buyer an account asks to know who they are, and the wallet tells it on
+/// its own: a key for that seller alone, the same in every session of one wallet, another for
+/// another wallet. A wallet that stays anonymous there says nothing, and that seller refuses it.
+#[test]
+fn a_wallet_tells_a_seller_with_accounts_who_it_is_and_stays_anonymous_when_told() {
+    let _g = env_lock();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(ACCOUNT_HOOK, "#!/bin/sh\nprintf '{\"headers\": {\"X-Guest\": \"buyer-%s\"}}' \"$1\"\n").unwrap();
+        std::fs::set_permissions(ACCOUNT_HOOK, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let who = |r: &Rig| -> String {
+        let v = r.call("xbt402_pay", json!({"url": r.shop.url("/acct/echo"), "max_sats": CALL, "task": "film"}));
+        assert_eq!(v["status"], 200, "{v}");
+        let body: Value = serde_json::from_str(v["untrusted_provider_response"]["body"].as_str().unwrap()).unwrap();
+        body["guest"].as_str().unwrap().to_string()
+    };
+    let r = Rig::new(json!({}));
+    let first = who(&r);
+    assert!(first.starts_with("buyer-") && first.len() == 18, "the service got the buyer's own account: {first}");
+    assert!(r.tap.seen("/x402/ticket/identify").len() == 1, "the wallet said who it is, once a session");
+    assert_eq!(who(&r), first, "the same wallet, the same buyer");
+    // another wallet: another buyer at the same seller
+    let other = Rig::new(json!({}));
+    assert_ne!(who(&other), first);
+    // staying anonymous there: nothing is said, and a seller with no guest for anonymous buyers refuses
+    let quiet = Rig::new(json!({}));
+    let set = quiet.call("identity_set", json!({"origin": quiet.shop.origin, "anonymous": true}));
+    assert_eq!(set["ok"], true, "{set}");
+    let v = quiet.call("xbt402_pay", json!({"url": quiet.shop.url("/acct/echo"), "max_sats": CALL, "task": "film"}));
+    assert_eq!(v["status"], 403, "{v}");
+    assert!(quiet.tap.seen("/x402/ticket/identify").is_empty(), "an anonymous wallet says nothing");
+    let _ = std::fs::remove_file(ACCOUNT_HOOK);
 }

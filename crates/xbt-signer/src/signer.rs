@@ -492,6 +492,9 @@ impl Signer {
             }
             // takes the spend lock itself, and only for each lock and release, where an answer may be long (crate::ticket_pay)
             "xbt402_pay" => sanitize(self.xbt402_pay(p)),
+            // the sellers this wallet stays anonymous at (docs/BUYER-ACCOUNTS.md)
+            "identity_get" => sanitize(json!({"ok": true, "anonymous": self.anonymous_origins()})),
+            "identity_set" => sanitize(self.identity_set(p)),
             // AGP-048 rail=ln
             "ln_pay" => {
                 let _g = self.lock();

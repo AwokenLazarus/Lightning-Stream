@@ -111,7 +111,7 @@ fn an_unpaid_request_gets_the_terms_and_reaches_nothing() {
             s["payTo"].as_str().map(str::len),
             s["routes"].as_array().map(Vec::len)
         ),
-        (Some(false), Some(66), Some(13))
+        (Some(false), Some(66), Some(16))
     );
 }
 

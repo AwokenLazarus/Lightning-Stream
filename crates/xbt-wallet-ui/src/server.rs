@@ -117,8 +117,11 @@ pub fn strip_base(path: &str, base: &str) -> Option<String> {
 /// The security headers of every answer. Video plays from this page's own origin: the UI relays
 /// the connector (`/s/…`).
 pub fn security_headers(r: &mut Resp) {
-    let csp = format!("{CSP}; media-src 'self'");
-    for (k, v) in [("Content-Security-Policy", csp.as_str()), ("X-Frame-Options", "DENY"), ("X-Content-Type-Options", "nosniff"),
+    // a page that frames a seller's own app sets its own policy, the same one with its frame-src
+    if !r.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("Content-Security-Policy")) {
+        r.headers.push(("Content-Security-Policy".into(), format!("{CSP}; media-src 'self'")));
+    }
+    for (k, v) in [("X-Frame-Options", "DENY"), ("X-Content-Type-Options", "nosniff"),
                    ("Referrer-Policy", "no-referrer"), ("Cross-Origin-Opener-Policy", "same-origin"),
                    ("Cross-Origin-Resource-Policy", "same-origin"), ("Permissions-Policy", "camera=(), microphone=(), geolocation=(), usb=()")] {
         r.headers.push((k.into(), v.into()));
@@ -338,11 +341,17 @@ fn relay(url: &str, range: Option<&str>, failed: &dyn Fn(u16, &[u8])) -> xbt_svc
 pub struct Running {
     pub addr: std::net::SocketAddr,
     stop: xbt_svc::http::Stop,
+    /// The app ports and their servers ([`crate::seller_app`]).
+    pub app_ports: Vec<(u16, std::net::SocketAddr)>,
+    apps: Vec<xbt_svc::http::Stop>,
 }
 
 impl Drop for Running {
     fn drop(&mut self) {
         self.stop.stop();
+        for s in &self.apps {
+            s.stop();
+        }
     }
 }
 
@@ -358,8 +367,12 @@ impl Running {
 pub fn spawn(app: Arc<App>) -> Result<Running, String> {
     let listener = std::net::TcpListener::bind(&app.cfg.bind).map_err(|e| format!("bind {}: {e}", app.cfg.bind))?;
     let threads = app.cfg.threads;
+    // strict for a test (`XBT_UI_APP_PORTS_STRICT`), which tries a port taken in between again on another
+    let apps = crate::seller_app::spawn(&app, std::env::var_os("XBT_UI_APP_PORTS_STRICT").is_some())?;
     let run = xbt_svc::http::serve(Arc::new(Ui(app)), listener, threads).map_err(|e| format!("serve: {e}"))?;
-    Ok(Running { addr: run.addr, stop: run.stopper() })
+    let app_ports = apps.iter().map(|(p, r)| (*p, r.addr)).collect();
+    let apps = apps.iter().map(|(_, r)| r.stopper()).collect();
+    Ok(Running { addr: run.addr, stop: run.stopper(), app_ports, apps })
 }
 
 #[cfg(test)]

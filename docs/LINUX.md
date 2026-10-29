@@ -91,6 +91,9 @@ The page is at **http://127.0.0.1:8482/**. From another machine, open an ssh tun
 `~/lightning-stream/.env` (`grep LS_UI_PASSWORD ~/lightning-stream/.env` shows it). A password you chose
 with spaces or other signs in it is written in single quotes there: type it without them. (Earlier installs
 wrote every password in quotes.)
+To open a seller's own app inside the page (docs/SELLER-APPS.md), forward
+its ports too: `ssh -L 8482:127.0.0.1:8482 -L 33521:127.0.0.1:33521 -L 33522:127.0.0.1:33522
+-L 33523:127.0.0.1:33523 -L 33524:127.0.0.1:33524 you@your-node-machine` (`LS_APP_PORTS`).
 
 1. **Make your approval key.** The app asks for it first. It's the key that signs your spending rules,
    and it stays in your browser. Save its backup.
