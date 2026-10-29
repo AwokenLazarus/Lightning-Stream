@@ -71,6 +71,12 @@ fn num(v: &Value) -> f64 {
     }
 }
 
+/// What a day of 1 TH/s costs at `price_sat` a piece of `slice_work` hashes: the figure miners
+/// compare prices by (sats per TH/s per day).
+pub fn per_ths_day(price_sat: f64, slice_work: f64) -> f64 {
+    per_hour(price_sat, slice_work, 1e12) * 24.0
+}
+
 /// What a piece of work of `slice_work` hashes at `price_sat` costs an hour at `hs`.
 pub fn per_hour(price_sat: f64, slice_work: f64, hs: f64) -> f64 {
     if slice_work <= 0.0 {
@@ -227,7 +233,7 @@ impl App {
             pattern=\"[A-Za-z0-9.\\-\\[\\]:]+:[0-9]+\" title=\"An address with its port, like 192.168.1.20:23334\" placeholder=\"192.168.1.20:23334\"></label>\
             <p class=\"hint\">Your DATUM Gateway or your pool, as your miners use it today. Every miner nobody rents keeps hashing there.</p>\
             <label>Price for each piece of work, in sats<input name=\"price\" value=\"{price}\" required inputmode=\"numeric\" pattern=\"[0-9]+\" title=\"A whole number of sats\"></label>\
-            <p class=\"hint\">At this price a {} miner earns about <strong>{}</strong> an hour while it is rented.</p>\
+            <p class=\"hint\">At this price a {} miner earns about <strong>{}</strong> an hour while it is rented. That is about <strong>{}</strong> a day for each 1 TH/s of speed.</p>\
             <label>Miners to rent out at most <small>(empty: all of them)</small><input name=\"rentable\" value=\"{}\" inputmode=\"numeric\" pattern=\"[0-9]*\"></label>\
             <label>Name, as hashtakers see it<input name=\"name\" value=\"{}\" maxlength=\"80\" placeholder=\"My miners\"></label>\
             <label>Address hashtakers use to reach your miners (needs a port forward or tunnel)<input name=\"link_public\" value=\"{}\" class=\"mono\" \
@@ -246,6 +252,7 @@ impl App {
             <label>How long to wait for each payment, in seconds<input name=\"grace_s\" value=\"{grace_s}\" inputmode=\"numeric\" pattern=\"[0-9]+\"></label>\
             </details><div class=\"row\"><button>{}</button></div></form></section>",
             if on { "Change renting" } else { "Rent out your miners" }, esc(&fallback), speed(EXAMPLE_HS), sats_n(per_hour(price as f64, slice, EXAMPLE_HS)),
+            sats_n(per_ths_day(price as f64, slice)),
             esc(&rentable), esc(&name), esc(&link_public), esc(&link_lan), esc(&link_lan), if on || saved.get("enabled").is_none() { " checked" } else { "" }, slice,
             if on { "Save" } else { "Save and start renting" }));
         if let Ok(s) = &st {
@@ -409,14 +416,14 @@ impl App {
                     };
                     let can = ready && allowed && (free > 0 || total == 0);
                     b.push_str(&format!("<section class=\"card offer\"><span class=\"pill cat-media\">Hashrate</span><h3>{}</h3>\
-                        <p class=\"price\">{} a piece of work</p><p class=\"small\">About <strong>{}</strong> an hour for each {} of speed · {}</p>{allow}\
+                        <p class=\"price\">{} a piece of work</p><p class=\"small\">About <strong>{}</strong> an hour for each {} of speed (about {} a day) · {}</p>{allow}\
                         <form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"rent\"><input type=\"hidden\" name=\"key\" value=\"{}\">\
                         <div class=\"price-row\"><label>Machines<input name=\"miners\" value=\"1\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label>\
                         <label>For how long, in minutes<input name=\"minutes\" value=\"60\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label></div>\
                         <label>The most it may cost, in sats<input name=\"budget\" value=\"{budget}\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label>\
                         <p class=\"hint\">About an hour of one machine. The rental ends when this much is spent.</p>\
                         <button{}>Rent</button></form></section>",
-                        esc(x["name"].as_str().unwrap_or("Miners")), sats_n(price), sats_n(per_hour(price, slice, 1e12)), "1 TH/s",
+                        esc(x["name"].as_str().unwrap_or("Miners")), sats_n(price), sats_n(per_hour(price, slice, 1e12)), "1 TH/s", sats_n(per_ths_day(price, slice)),
                         if total > 0 { format!("{free} of {total} machines free, {}", speed(free_hs)) } else { "free machines not given".into() },
                         esc(x["linkKey"].as_str().unwrap_or("")), if can { "" } else { " disabled" }));
                 }
@@ -511,6 +518,8 @@ mod tests {
         assert_eq!(speed(4.1e12), "4.10 TH/s");
         assert_eq!(speed(8.5e11), "850.00 GH/s");
         assert_eq!(speed(0.0), "—");
+        // 12 sats a piece of 2^47 hashes: about 307 sats an hour for 1 TH/s, about 7,367 a day
+        assert_eq!(per_ths_day(12.0, SLICE_WORK as f64).round(), 7367.0);
         // 40 sats a piece of 2^47 hashes, at 4 TH/s: about 4,093 sats an hour
         let h = per_hour(40.0, SLICE_WORK as f64, 4e12);
         assert!((h - 4093.0).abs() < 1.0, "{h}");
