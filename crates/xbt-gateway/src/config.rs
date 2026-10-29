@@ -86,6 +86,24 @@ pub struct Route {
     /// buyer sent of the same name: the seller's guest login for a service that needs one. They
     /// never go to the buyer.
     pub upstream_headers: Vec<(String, String)>,
+    /// Paths under this route the gateway refuses (`deny_paths`), whatever the method: parts of a
+    /// web app a buyer must not reach (an admin page, other users' sessions). Lower case; matched
+    /// against the decoded path, ignoring case, as a prefix.
+    pub deny_paths: Vec<String>,
+    /// When not empty, the only paths under this route the gateway serves (`allow_paths`), as
+    /// prefixes, ignoring case; everything else is refused.
+    pub allow_paths: Vec<String>,
+}
+
+impl Route {
+    /// Whether the gateway refuses `path` (decoded) on this route: under one of `deny_paths`, or
+    /// outside every one of `allow_paths` when there are some. Case is ignored, as many web
+    /// servers ignore it.
+    pub fn path_refused(&self, path: &str) -> bool {
+        let p = path.to_ascii_lowercase();
+        self.deny_paths.iter().any(|d| p.starts_with(d.as_str()))
+            || !self.allow_paths.is_empty() && !self.allow_paths.iter().any(|a| p.starts_with(a.as_str()))
+    }
 }
 
 /// Request headers every route passes on: they select what is returned and carry no authority.
@@ -772,6 +790,8 @@ fn route(v: &Value) -> Result<Route, String> {
             "max_output_tokens",
             "accept_gzip",
             "upstream_headers",
+            "deny_paths",
+            "allow_paths",
         ],
     )?;
     let path = req_str(r, "path")?.to_string();
@@ -911,6 +931,23 @@ fn route(v: &Value) -> Result<Route, String> {
             upstream_headers.push((name, v.to_string()));
         }
     }
+    let paths = |key: &str| -> Result<Vec<String>, String> {
+        let Some(v) = r.get(key) else { return Ok(vec![]) };
+        let list = v.as_array().ok_or_else(|| bad(&format!("{key} is a list of paths")))?;
+        if list.len() > 64 {
+            return Err(bad(&format!("{key} has at most 64 paths")));
+        }
+        list.iter()
+            .map(|p| {
+                p.as_str()
+                    .filter(|p| p.starts_with('/') && p.len() <= 512 && p.bytes().all(|c| c.is_ascii_graphic()) && !p.contains(['?', '#', '%', '\\']))
+                    .map(str::to_ascii_lowercase)
+                    .ok_or_else(|| bad(&format!("{key} are paths starting with /, without ?, #, % or \\")))
+            })
+            .collect()
+    };
+    let deny_paths = paths("deny_paths")?;
+    let allow_paths = paths("allow_paths")?;
     Ok(Route {
         path,
         methods,
@@ -923,6 +960,8 @@ fn route(v: &Value) -> Result<Route, String> {
         strip_prefix,
         accept_gzip,
         upstream_headers,
+        deny_paths,
+        allow_paths,
     })
 }
 
@@ -1052,6 +1091,28 @@ mod tests {
                "routes": [{"path": "/files/", "price": {"byte_msat": 1000, "per_bytes": 1048576}},
                           {"path": "/files/free/", "free": true},
                           {"path": "/api", "methods": ["POST"], "price": {"request_msat": 2500}, "max_body": 4096, "forward_headers": ["X-Trace"]}]})
+    }
+
+    /// A seller's web app sold whole, with the parts a buyer must not reach refused: case does not
+    /// help (many web servers ignore it), and an allow list refuses everything it does not name.
+    #[test]
+    fn a_route_refuses_the_paths_it_denies_and_those_its_allow_list_leaves_out() {
+        let mut v = base();
+        v["routes"] = json!([{"path": "/jf/", "price": {"request_msat": 100}, "deny_paths": ["/jf/Sessions", "/jf/system/"]},
+                             {"path": "/app/", "price": {"request_msat": 100}, "allow_paths": ["/app/web/", "/app/Videos/"]}]);
+        let c = Config::from_json(&v).unwrap();
+        let jf = c.route("/jf/web/index.html").unwrap();
+        assert!(!jf.path_refused("/jf/web/index.html"));
+        for p in ["/jf/Sessions", "/jf/sessions/abc/Playing", "/jf/SESSIONS", "/jf/System/Info"] {
+            assert!(jf.path_refused(p), "{p}");
+        }
+        let app = c.route("/app/web/").unwrap();
+        assert!(!app.path_refused("/app/web/main.js") && !app.path_refused("/app/videos/1/stream"));
+        assert!(app.path_refused("/app/Users") && app.path_refused("/app/"));
+        for bad in [json!("Sessions"), json!("/a?b"), json!("/a%2f"), json!(3)] {
+            v["routes"][0]["deny_paths"] = json!([bad.clone()]);
+            assert!(Config::from_json(&v).is_err(), "{bad}");
+        }
     }
 
     #[test]

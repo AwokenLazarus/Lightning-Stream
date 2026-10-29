@@ -331,6 +331,8 @@ mod tests {
             strip_prefix: false,
             accept_gzip: false,
             upstream_headers: vec![],
+            deny_paths: vec![],
+            allow_paths: vec![],
         };
         let h = |v: &[(&str, &str)]| {
             v.iter()

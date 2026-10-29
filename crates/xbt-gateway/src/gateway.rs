@@ -1480,6 +1480,10 @@ impl Gateway {
                 "nothing is sold or served at this path",
             ));
         };
+        if route.path_refused(&path) {
+            // before payment and before the service: nothing is charged, and the service never sees it
+            return Reply::Whole(error(403, "path_refused", "the seller does not serve this path to buyers"));
+        }
         if !route.methods.iter().any(|m| m == &req.method) {
             return Reply::Whole(error(
                 405,
