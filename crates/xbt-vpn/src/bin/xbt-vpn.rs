@@ -30,6 +30,9 @@
 //!     without one it is not announced). Keys are readable by their owner only. When `devices.json` or
 //!     `exit.json` changes the service exits (status 0) to start again with the new settings: run it
 //!     under a supervisor that restarts it.
+//! xbt-vpn healthcheck [--status DIR]
+//!     Exits 0 if `serve` wrote `status.json` in DIR (or XBT_VPN_STATUS, else XBT_VPN_DIR) in the last
+//!     30 s (it writes it every 5 s), 1 if not: the image's health check.
 //! xbt-vpn fetch --exit KEY --hints JSON --url http://HOST/PATH [--flows N] [--secs S] [--private] [--relay URL]
 //!               [--hop KEY --hop-hints JSON]
 //!     Downloads the URL through the exit on N flows at once for S seconds and prints one JSON line:
@@ -77,6 +80,7 @@ fn main() -> std::io::Result<()> {
         Some("buyer") => buyer(&args, relay, private),
         Some("fetch") => fetch(&args, relay, private),
         Some("serve") => serve(&args, relay),
+        Some("healthcheck") => healthcheck(&args),
         _ => {
             eprintln!("usage: xbt-vpn exit [--relay URL] [--speed-limit B/s] | xbt-vpn hop [--relay URL] | xbt-vpn fetch --exit KEY --hints JSON --url URL [--flows N] [--secs S] [--private] [--hop KEY --hop-hints JSON]");
             std::process::exit(2)
@@ -457,5 +461,17 @@ fn serve(args: &[String], relay: String) -> std::io::Result<()> {
             std::process::exit(0);
         }
         std::thread::sleep(Duration::from_secs(5));
+    }
+}
+
+fn healthcheck(args: &[String]) -> std::io::Result<()> {
+    let dir = arg_or_env(args, "--status", &["XBT_VPN_STATUS", "XBT_VPN_DIR"]).unwrap_or_else(|| "vpn".into());
+    let age = mtime(&std::path::Path::new(&dir).join("status.json")).and_then(|t| t.elapsed().ok());
+    match age {
+        Some(a) if a < Duration::from_secs(30) => Ok(()),
+        _ => {
+            eprintln!("status.json in {dir} is missing or more than 30 s old");
+            std::process::exit(1)
+        }
     }
 }

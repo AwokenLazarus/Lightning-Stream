@@ -130,6 +130,7 @@ COPY --chmod=0555 bin/${TARGETARCH}${TARGETVARIANT}/xbt-vpn /usr/bin/xbt-vpn
 USER xbt-vpn
 ENV XBT_VPN_DIR=/data/run/vpn XBT_VPN_STATUS=/data/run/vpn-status XBT_VPN_KEYS=/data/vpn XBT_VPN_WG_LISTEN=0.0.0.0:51820 RUST_LOG=warn NO_COLOR=1
 ENTRYPOINT ["/usr/bin/xbt-vpn", "serve"]
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 CMD ["/usr/bin/xbt-vpn", "healthcheck"]
 
 # `--build-arg IMAGE=<name>` without `--target` builds that one image (the ARG is at the top): for a
 # builder with no target option. scripts/oci_build.sh uses --target.
