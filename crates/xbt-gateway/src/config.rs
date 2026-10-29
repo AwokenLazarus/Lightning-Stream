@@ -179,6 +179,64 @@ pub struct Config {
     pub listing: Option<xbt402::listing::Draft>,
     /// Publishing the listing on Nostr (`docs/NOSTR.md`). Absent: nothing is published.
     pub nostr: Option<NostrConfig>,
+    /// Being reached by key over an iroh link (no web address, certificate or forwarded port). Absent:
+    /// web only.
+    pub link: Option<LinkConfig>,
+}
+
+/// The `link` section: the relays the gateway's link uses, whether it is relay-only, and the seller's
+/// node's statement vouching for the link key (written by the app; without it the link still serves,
+/// but buyers cannot check who is behind it, so nothing names it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkConfig {
+    /// `https://` (or `http://` for a lab) relay URLs; empty: iroh's public relays.
+    pub relays: Vec<String>,
+    /// Relays only: buyers never learn the seller's address.
+    pub private: bool,
+    /// lnd `SignMessage` over `xbt_iroh_link::claim::claim_text`, z-base32.
+    pub node_sig: Option<String>,
+    pub node_sig_expires: Option<u64>,
+}
+
+/// At most this many relays for the link.
+pub const MAX_LINK_RELAYS: usize = 4;
+
+impl LinkConfig {
+    fn parse(v: &Value) -> Result<Self, String> {
+        let m = obj(v, "link", &["relays", "private", "node_sig", "node_sig_expires"])?;
+        let relays = match m.get("relays") {
+            None => Vec::new(),
+            Some(Value::Array(a)) => a
+                .iter()
+                .map(|r| match r.as_str() {
+                    Some(r) if r.starts_with("https://") || r.starts_with("http://") => Ok(r.trim_end_matches('/').to_string()),
+                    _ => Err("link.relays is a list of https:// relay URLs".to_string()),
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+            Some(_) => return Err("link.relays is a list of https:// relay URLs".into()),
+        };
+        if relays.len() > MAX_LINK_RELAYS {
+            return Err(format!("link.relays: at most {MAX_LINK_RELAYS}"));
+        }
+        let private = match m.get("private") {
+            None => false,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => return Err("link.private is true or false".into()),
+        };
+        let node_sig = match m.get("node_sig") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+            Some(_) => return Err("link.node_sig is the node's signature, as text".into()),
+        };
+        let node_sig_expires = match m.get("node_sig_expires") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(v.as_u64().ok_or("link.node_sig_expires is a Unix time")?),
+        };
+        if node_sig.is_some() != node_sig_expires.is_some() {
+            return Err("link.node_sig and link.node_sig_expires come together".into());
+        }
+        Ok(Self { relays, private, node_sig, node_sig_expires })
+    }
 }
 
 /// The `nostr` section: the relays the listing goes to, and how often it is sent again.
@@ -334,6 +392,7 @@ impl Config {
                 "times",
                 "listing",
                 "nostr",
+                "link",
             ],
         )?;
         // a file that names no chain is a regtest file: mainnet is never what a missing key means
@@ -711,6 +770,10 @@ impl Config {
             None | Some(Value::Null) => None,
             Some(n) => Some(NostrConfig::parse(n)?),
         };
+        let link = match top.get("link") {
+            None | Some(Value::Null) => None,
+            Some(l) => Some(LinkConfig::parse(l)?),
+        };
         if nostr.as_ref().is_some_and(|n| n.publish) && listing.is_none() {
             return Err("nostr.publish publishes the listing: write a listing section, or leave publish out".into());
         }
@@ -738,6 +801,7 @@ impl Config {
             times,
             listing,
             nostr,
+            link,
         })
     }
 }

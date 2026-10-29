@@ -140,6 +140,7 @@ fn run(args: &[String]) -> Result<(), String> {
         Some(_) => Some(xbt_gateway::nostr::load_key(&cfg.state_dir)?),
         None => None,
     };
+    let (link_cfg, state_dir) = (cfg.link.clone(), cfg.state_dir.clone());
     let gw = Gateway::start(cfg, node, key, Box::new(unix_now)).map_err(|e| e.to_string())?;
     if let (Some(n), Some(k)) = (nostr, nostr_key) {
         eprintln!("xbt-gateway: publishing the listing on Nostr to {} relays every {} s, as Nostr key {}", n.relays.len(), n.republish.as_secs(), k.public_hex());
@@ -152,6 +153,12 @@ fn run(args: &[String]) -> Result<(), String> {
         gw.terms().pay_to,
         gw.terms().receipt_key
     );
+    // the link: the same gateway, reached by key (crates/xbt-iroh-link). Its streams come in as
+    // connections to the gateway's own port, so everything else is as for the web
+    let _link = match &link_cfg {
+        Some(l) => Some(start_link(l, &state_dir, running.addr)?),
+        None => None,
+    };
     let sig = signals.wait();
     xbt_svc::shutdown::say_stopping("xbt-gateway", sig);
     // the listener first, so that nothing new starts; then the requests in flight; then the book.
@@ -174,4 +181,31 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Starts the gateway's link and writes what the app needs to name it (`link.json` in the state
+/// directory: the key and where it is reached), for the seller's node to vouch for.
+fn start_link(l: &xbt_gateway::config::LinkConfig, state_dir: &std::path::Path, addr: std::net::SocketAddr)
+              -> Result<std::sync::Arc<xbt_iroh_link::Link>, String> {
+    let secret = xbt402::provider::load_or_create_secret(&state_dir.join("link.key")).map_err(|e| e.to_string())?;
+    let relays = if l.relays.is_empty() { xbt_iroh_link::Relays::Public } else { xbt_iroh_link::Relays::Ours(l.relays.clone()) };
+    let link = xbt_iroh_link::Link::start_with(secret.secret_bytes(), xbt_iroh_link::Options { relays, serving: true, private: l.private })
+        .map_err(|e| format!("link: {e}"))?;
+    let upstream = if addr.ip().is_unspecified() { std::net::SocketAddr::from(([127, 0, 0, 1], addr.port())) } else { addr };
+    link.serve(upstream);
+    let h = link.hints(Duration::from_secs(10));
+    let doc = serde_json::json!({
+        "endpoint_id": link.endpoint_id(),
+        "relays": h.relays,
+        "direct": if l.private { vec![] } else { h.direct.iter().map(|a| a.to_string()).collect::<Vec<_>>() },
+        "private": l.private,
+    });
+    std::fs::write(state_dir.join("link.json"), format!("{doc}\n")).map_err(|e| format!("link.json: {e}"))?;
+    eprintln!(
+        "xbt-gateway: reached by key {} over {}{}",
+        link.endpoint_id(),
+        if l.private { "relays only" } else { "direct links and relays" },
+        if l.node_sig.is_some() { "" } else { "; no node statement yet, so buyers cannot check it and nothing names it" }
+    );
+    Ok(link)
 }
