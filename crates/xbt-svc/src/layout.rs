@@ -77,7 +77,7 @@ pub const SHARED_DIRS: &[SharedDir] = &[
 ];
 
 /// The AI endpoint's group (a group only): the UI and the signer's user, which the connector runs as.
-pub const AI_GID: u32 = 10011;
+pub const AI_GID: u32 = 10014;
 
 /// The hashrate services' group: the settings the UI writes in `run/hashrate/`, and their control token.
 pub const HASHRATE_GID: u32 = 10010;
