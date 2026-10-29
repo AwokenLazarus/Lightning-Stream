@@ -139,6 +139,66 @@ miners to rent out, each miner and each rental, a Stop button) and Services → 
 a budget and a duration, each rental with a Cut button, the hashtaker's DATUM Gateway). Rentals also
 show on Live connections.
 
+## Trust before renting: a test slice and a delivery history
+
+A hashtaker has two ways to judge a hashmaker before committing a budget
+(`crates/xbt-hashlink/src/trust.rs`).
+
+**A test slice.** Services → Hashrate → *Try one slice first* rents one machine for one slice:
+its budget is one slice's price, and its time limit is three slices' worth at the advertised speed,
+between 5 and 60 minutes. It is an ordinary rental, paid the ordinary way, and the hashtaker's own
+DATUM Gateway checks every share. When it ends, the rental shows what it delivered: the speed
+(accepted work over the time from the start to the finished slice, so it includes the first seconds
+of connecting) against the speed the listing advertised, the share of stale shares (Stratum V1
+error 21, or an error that says stale) and of rejected shares, and the share round trip (submit to
+verdict, median and 95th percentile, as the hashtaker's app sees it).
+
+**A delivery record.** After any rental that paid at least one slice, the hashtaker may choose to
+publish a signed record of it (*Publish a delivery record*). It is a Nostr event of kind 30078
+(NIP-78 application data), signed by the hashtaker's link key used as a Nostr key, so the hashmaker,
+who saw that key on the link, can tell it is the hashtaker it served:
+
+- tags: `d` = `lightning-stream-hash-attest:<commitment>`, `t` = `lightning-stream-hash-attest`,
+  `p` = the hashmaker's link key (x-only), and nothing else;
+- content (at most 2 KiB): the hashmaker's and the hashtaker's link keys, the commitment
+  `SHA-256("xbt-hashlink/rental/0|<rental>|<hashtaker key>|<hashmaker key>")`, the slices and
+  millisatoshis paid, the slice size, the work the gateway accepted, the duration, accepted,
+  rejected and stale shares, the advertised and delivered speed, the median share round trip, a
+  hash of the signed work receipts behind the paid slices, whether it was a test slice, and when
+  it ended, rounded down to the hour.
+
+It names no pool, payout address, user name, rental name or IP address.
+
+**A hashmaker's summary.** A hashmaker with relays and a Nostr key set publishes, at most every ten
+minutes after a rental ends, its own signed list of the rentals it served: kind 30078, `d` =
+`lightning-stream-hash-summary:<link key>`, `t` = `lightning-stream-hash-summary`, `p` = its link
+key (x-only), content at most 16 KiB with its newest 40 rentals (the commitment, the hashtaker's
+key, slices and millisatoshis paid, work, the receipts hash, the hour it ended). It is signed by the
+Nostr key the hashmaker's listing is bound to; a summary by any other key is ignored. The hashmaker
+keeps it in `hash-summary.json` beside its settings, so it survives a restart.
+
+**What the offer shows.** Each offer on Services → Hashrate carries a delivery history built from
+the records and the summary on the app's relays: TH-hours confirmed by both sides, the records and
+how many the hashmaker confirmed, the speed delivered against the speed advertised (a weighted
+average), disputes, and the most recent rentals. A record is **confirmed** when the hashmaker's
+summary has the same commitment, hashtaker, slices paid and receipts hash; it is **disputed** when
+the summary has the rental but disagrees.
+
+**What it does not prove.** Lightning payments are private, so nobody but the two sides can check
+that a payment happened. The history is made hard to fake rather than impossible to fake:
+
+- a hashmaker's records about itself (its own link key, or its listing's Nostr key) are dropped;
+- a record the hashmaker did not confirm counts for 0.3 of one it did;
+- a record from a key with no record for any other hashmaker counts for half;
+- each key counts for at most its 3 most recent rentals with a hashmaker.
+
+A hashmaker can still make keys that rent from it and from others; the strongest evidence remains
+the hashtaker's own test slice.
+
+**Relays.** The relay at relay.lazarus-xbt.xyz accepts kind 30078 only in shapes it knows; these
+two shapes need its write policy updated (the change and its test are prepared with this work).
+Other relays take them as ordinary NIP-78 events.
+
 ## What is left
 
 - **Real tickets**: done for the wallet path. Each finished slice is one paid request to the
