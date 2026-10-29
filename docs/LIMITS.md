@@ -777,9 +777,16 @@ payer only: no socket method buys one. Run on regtest only (`scripts/ticket_book
   opens, and a session can release until a budget stops it. An owner who wants every release
   counted sets `"release"`: a wallet then releases at most 8 tickets an hour across all rails,
   and an answer priced as it goes stops at the eighth (8,000 sat with the default ticket). This
-  was the meaning of a policy without the setting until 2026-10-13. Releases to one seller
-  inside `split_window_s` add up against `max_per_tx_sats` and the human threshold as any split
-  payment does, under either setting.
+  was the meaning of a policy without the setting until 2026-10-13.
+- The split rule (`split_window_s`) does not apply to a ticket. It stops a caller from cutting one
+  large payment into small ones that each pass `max_per_tx_sats` and the human threshold; a
+  ticket is no such cut, because its size is the seller's, fixed when its session opens and
+  refused there if it would reach the human threshold. Its releases are bounded by the ticket
+  budgets, the cap on one seller, `max_sats`, and the wallet's daily, weekly and counterparty
+  sums. Ticket payments still count in the split window of every other payment to that seller.
+  Until 0.1.18 the split rule counted ticket refills too, so under the starter rules (ask above
+  1,000) a buyer got one 900-sat ticket a seller in ten minutes: a film and then an AI answer
+  from the same shop was refused.
 - A ticket released before this version has no session in its ledger row and counts as one
   payment under either setting.
 - No release can wait for a human: a session whose one ticket, with its fee limit, would reach

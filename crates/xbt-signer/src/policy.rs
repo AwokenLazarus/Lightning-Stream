@@ -765,12 +765,21 @@ impl PolicyEngine {
         if booked_sats < 0 {
             return Ok(decide(Deny, "amount", "the booked amount must not be negative".into(), None, None));
         }
-        let split_sum = Self::spent(&ledger, cfg.split_window_s as f64, now, Some(&p.dest))?.saturating_add(booked_sats);
-        if split_sum > cfg.max_per_tx_sats {
-            return Ok(decide(Deny, "split_bypass", format!("split window sum {split_sum} would exceed max_per_tx {}", cfg.max_per_tx_sats), None, None));
-        }
-        if !human && split_sum >= cfg.human_threshold_sats && p.amount_sats < cfg.human_threshold_sats {
-            return Ok(decide(Deny, "split_bypass", format!("split window sum {split_sum} evades human_threshold {}", cfg.human_threshold_sats), None, None));
+        // the split rule stops a caller from cutting one large payment into small ones that each pass
+        // max_per_tx and the human threshold. A ticket the rail decides (`admitted`) is not such a
+        // cut: its size is the seller's, fixed when the session opens and refused there if it would
+        // reach the human threshold, and its releases are bounded by the ticket budgets, the
+        // per-seller cap, max_sats and the wallet's day, week and counterparty sums below. Counting
+        // its refills here would let a buyer have one ticket a seller per window. Ticket payments
+        // still count in the window of every other payment to that seller.
+        if !admitted {
+            let split_sum = Self::spent(&ledger, cfg.split_window_s as f64, now, Some(&p.dest))?.saturating_add(booked_sats);
+            if split_sum > cfg.max_per_tx_sats {
+                return Ok(decide(Deny, "split_bypass", format!("split window sum {split_sum} would exceed max_per_tx {}", cfg.max_per_tx_sats), None, None));
+            }
+            if !human && split_sum >= cfg.human_threshold_sats && p.amount_sats < cfg.human_threshold_sats {
+                return Ok(decide(Deny, "split_bypass", format!("split window sum {split_sum} evades human_threshold {}", cfg.human_threshold_sats), None, None));
+            }
         }
         let (day_sum, week_sum, cpty_sum) = (daily.saturating_add(booked_sats), weekly.saturating_add(booked_sats), cpty.saturating_add(booked_sats));
         if day_sum > cfg.daily_budget_sats {
@@ -1065,5 +1074,46 @@ mod tests {
             assert!(e2.evaluate_admitted(&pay, 10).unwrap().allowed(), "release {i} of one session");
             e2.commit(&pay, &crate::ticket::ledger_id(&format!("{i:064x}"))).unwrap();
         }
+    }
+
+    /// The starter rules (2,000 a payment, ask above 1,000; the day's budget raised here so the seller cap is what binds): a buyer plays a film and then asks the
+    /// AI of the same shop inside ten minutes, two 900-sat tickets. The split rule must not take the
+    /// refill for a payment cut in two; a caller who cuts one payment in two is still caught.
+    #[test]
+    fn ticket_refills_inside_the_split_window_are_not_a_split_payment() {
+        let d = tempfile::tempdir().unwrap();
+        let dest = "ln:02".to_string() + &"cd".repeat(32);
+        let starter = || PolicyConfig { allowlist: vec![dest.clone()], max_per_tx_sats: 2_000, daily_budget_sats: 20_000, weekly_budget_sats: 30_000,
+                                        per_counterparty_cap_sats: 10_000, human_threshold_sats: 1_000, ..PolicyConfig::default() };
+        let e = PolicyEngine::new(starter(), PolicyStore::open(&d.path().join("ledger.json")).unwrap(), AuditLog::open(&d.path().join("audit.jsonl")).unwrap(),
+                                  Some(Arc::new(|| 10_000.0)));
+        let film = Payment::new(&dest, 904, &crate::ticket::memo("default", "film"));
+        let ai = Payment::new(&dest, 904, &crate::ticket::memo("default", "ai"));
+        assert!(e.evaluate_admitted(&film, 904).unwrap().allowed());
+        e.commit(&film, &crate::ticket::ledger_id(&format!("{:064x}", 1))).unwrap();
+        let second = e.evaluate_admitted(&ai, 904).unwrap();
+        assert!(second.allowed(), "a second ticket a minute later: {}", second.reason);
+        e.commit(&ai, &crate::ticket::ledger_id(&format!("{:064x}", 2))).unwrap();
+        let third = e.evaluate_admitted(&ai, 904).unwrap();
+        assert!(third.allowed(), "and a third: {}", third.reason);
+        // the per-seller cap still binds tickets: 10,000 a week to one seller
+        for i in 3..12 {
+            e.commit(&ai, &crate::ticket::ledger_id(&format!("{i:064x}"))).unwrap();
+        }
+        let over = e.evaluate_admitted(&ai, 904).unwrap();
+        assert_eq!((over.allowed(), over.rule.as_str()), (false, "per_counterparty"), "{}", over.reason);
+        // a ticket at the human threshold is still never admitted without the owner
+        let big = e.evaluate_admitted(&Payment::new(&dest, 1_000, &crate::ticket::memo("default", "big")), 1_000).unwrap();
+        assert!(!big.allowed());
+
+        // a caller that cuts one 1,800-sat payment into two of 900 is still caught
+        let d2 = tempfile::tempdir().unwrap();
+        let e2 = PolicyEngine::new(starter(), PolicyStore::open(&d2.path().join("ledger.json")).unwrap(),
+                                   AuditLog::open(&d2.path().join("audit.jsonl")).unwrap(), Some(Arc::new(|| 10_000.0)));
+        let half = Payment::new(&dest, 900, "invoice 1 of 2");
+        assert!(e2.evaluate(&half, false).unwrap().allowed());
+        e2.commit(&half, "ln a").unwrap();
+        let cut = e2.evaluate(&half, false).unwrap();
+        assert_eq!((cut.allowed(), cut.rule.as_str()), (false, "split_bypass"), "{}", cut.reason);
     }
 }
