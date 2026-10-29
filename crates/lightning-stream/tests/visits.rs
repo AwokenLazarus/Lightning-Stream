@@ -25,6 +25,12 @@ struct Session {
 
 /// The stand-in signer: one thread per connection, so a page's requests run at once.
 fn signer(dir: &Path) -> (PathBuf, Arc<Mutex<Session>>) {
+    signer_at(dir, TICKET)
+}
+
+/// The stand-in signer with tickets of `ticket` sat; a refusal names what one books, as the
+/// signer's does.
+fn signer_at(dir: &Path, ticket: i64) -> (PathBuf, Arc<Mutex<Session>>) {
     let sock = dir.join("signer.sock");
     let l = UnixListener::bind(&sock).unwrap();
     let stream_dir = dir.to_path_buf();
@@ -46,14 +52,15 @@ fn signer(dir: &Path) -> (PathBuf, Arc<Mutex<Session>>) {
                     s.calls.push(p.clone());
                     let mut charged = 0;
                     if s.credit < COST {
-                        if max < TICKET || p["credit_only"] == true {
+                        if max < ticket || p["credit_only"] == true {
                             drop(s);
-                            let _ = writeln!(conn, "{}", json!({"id": 1, "result": {"verdict": "deny", "rule": "max_sats", "reason": "a ticket does not fit", "charged_sats": 0}}));
+                            let _ = writeln!(conn, "{}", json!({"id": 1, "result": {"verdict": "deny", "rule": "max_sats", "reason": "a ticket does not fit",
+                                                                                    "charged_sats": 0, "ticket_booking_sats": ticket}}));
                             return;
                         }
-                        s.credit += TICKET;
-                        s.charged += TICKET;
-                        charged = TICKET;
+                        s.credit += ticket;
+                        s.charged += ticket;
+                        charged = ticket;
                     }
                     s.credit -= COST;
                     charged
@@ -211,4 +218,30 @@ fn a_range_goes_in_parts_each_within_a_share_of_the_limit() {
     let (_, _, b) = ask(&addr, "GET", &format!("/visits/{visit}"), "", b"");
     let v: Value = serde_json::from_slice(&b).unwrap();
     assert_eq!(v["spent_sats"].as_i64(), Some(charged), "only what was bought stays spent once every request ended: {v}");
+}
+
+#[test]
+fn a_ticket_dearer_than_a_share_is_bought_and_the_shares_after_it_have_room_for_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sock, session) = signer_at(dir.path(), 1_002);
+    let addr = start(sock, dir.path());
+    // a ticket of 1,000 sat and its fee: more than a request's share of its own, well within the limit
+    let visit = open(&addr, 30_000);
+    let results: Vec<u16> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..40).map(|i| { let (addr, visit) = (addr.clone(), visit.clone()); s.spawn(move || {
+            ask(&addr, "GET", &format!("/v/{visit}/asset/{i}.js"), "", b"").0
+        }) }).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert!(results.iter().all(|s| *s == 200), "{results:?}");
+    let charged = session.lock().unwrap().charged;
+    assert!((1_002..=30_000).contains(&charged), "{charged}");
+    // once the seller's ticket is known every share has room for one
+    let (_, _, b) = ask(&addr, "GET", &format!("/v/{visit}/next.js"), "", b"");
+    assert!(!b.is_empty());
+    let last = session.lock().unwrap().calls.last().cloned().unwrap();
+    assert!(last["max_sats"].as_i64().unwrap() >= 1_002, "{last}");
+    let (_, _, b) = ask(&addr, "GET", &format!("/visits/{visit}"), "", b"");
+    let v: Value = serde_json::from_slice(&b).unwrap();
+    assert!(v["ended"].is_null(), "{v}");
 }

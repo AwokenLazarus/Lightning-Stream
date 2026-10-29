@@ -33,14 +33,14 @@ const MAX_VISITS: usize = 32;
 const IDLE: Duration = Duration::from_secs(30 * 60);
 /// The largest request body of a page passed on.
 pub const MAX_BODY: usize = 1 << 20;
-/// How long a request waits for the turn to buy.
+/// How long a request waits for a share.
 const TURN_WAIT: Duration = Duration::from_secs(120);
 /// The most of a visit's limit one WebSocket holds while it is open: counted as spent until it
-/// ends, then only what it cost. A live connection does not hold the turn to buy, which the page's
-/// other requests need.
+/// ends, then only what it cost, with room for a ticket beside it as for [`ANSWER_SHARE`].
 const SOCKET_SHARE: i64 = 1_000;
-/// The most of a visit's limit one request holds while it runs: enough for a ticket to be bought for
-/// it, and for a part of a range ([`RANGE_CHUNK`]) at the prices sellers ask.
+/// The most of a visit's limit one request holds while it runs for its answer, a part of a range
+/// ([`RANGE_CHUNK`]) at the prices sellers ask; once a refusal has named what one of the seller's
+/// tickets books, each share also has room for one to be bought.
 const ANSWER_SHARE: i64 = 1_000;
 /// The longest part of a range a request asks for: `bytes=N-` and longer ranges become
 /// `bytes=N-(N+RANGE_CHUNK-1)`, and the page's player asks for the next part as it plays.
@@ -71,6 +71,9 @@ struct State {
     spent: i64,
     /// The shares of the requests running now: part of `spent` until each ends.
     held: i64,
+    /// What one of the seller's tickets books, fee included, as a refusal named it: each share has
+    /// room for one beside its own part, so that a request can buy the ticket it needs.
+    ticket: i64,
     ended: Option<String>,
     calls: u64,
     last: Option<Instant>,
@@ -93,7 +96,8 @@ impl Visit {
         json!({"base": self.base, "limit_sats": self.limit, "spent_sats": s.spent, "ended": s.ended, "calls": s.calls})
     }
 
-    /// Hold up to `most` of what is left of the limit for one request, waiting for a running one to
+    /// Hold up to `most` of what is left of the limit for one request, and room for a ticket once
+    /// the seller's price of one is known, waiting for a running one to
     /// give its share back where none is free. `Err`: the visit has ended, its limit is spent (with
     /// nothing running that could give some back), or the wait was too long.
     fn reserve(&self, most: i64) -> Result<i64, String> {
@@ -103,7 +107,7 @@ impl Visit {
             if let Some(e) = &s.ended {
                 return Err(e.clone());
             }
-            let share = (self.limit - s.spent).min(most);
+            let share = (self.limit - s.spent).min(most.saturating_add(s.ticket));
             if share >= 1 {
                 s.spent += share;
                 s.held += share;
@@ -148,6 +152,16 @@ impl Visit {
             return true;
         }
         false
+    }
+
+    /// A request that held `share` was refused, its call's reply `v`: what it was charged stays
+    /// spent, and what a ticket of the seller's books, where the reply names it, is kept.
+    fn refused(&self, share: i64, v: &Value) {
+        if let Some(t) = v.get("ticket_booking_sats").and_then(Value::as_i64) {
+            let mut s = self.lock();
+            s.ticket = s.ticket.max(t);
+        }
+        self.release(share, v.get("charged_sats").and_then(Value::as_i64).unwrap_or(0));
     }
 
     /// A request that held `share` has ended, having cost `charged`: only that stays spent.
@@ -234,7 +248,7 @@ impl Connector {
         Some(self.visit_call(visit, path, req))
     }
 
-    /// One request of a page: credit first, then the turn to buy when the credit is not enough.
+    /// One request of a page, paid for within a share of the visit's limit.
     fn visit_call(&self, visit: Arc<Visit>, path: &str, req: &Request) -> Reply {
         if req.header("Upgrade").is_some_and(|u| u.eq_ignore_ascii_case("websocket")) {
             return self.visit_socket(visit, path, req);
@@ -278,19 +292,20 @@ impl Connector {
         let (started, share) = match call(share) {
             Ok(s) => (s, share),
             Err(v) if v.get("rule").and_then(Value::as_str) == Some("max_sats") => {
-                // a ticket did not fit in the share: asked again with all that is left once the others have ended
-                visit.release(share, v.get("charged_sats").and_then(Value::as_i64).unwrap_or(0));
+                // a ticket did not fit in the share: asked again with all that is left once the others have
+                // ended; the shares after it have room for the ticket the refusal named
+                visit.refused(share, &v);
                 if visit.spent_out(share) {
                     return Reply::Whole(json_response(402, &json!({"error": "This visit's spending limit is reached.", "rule": "visit"})));
                 }
-                let share = match visit.reserve_alone(ANSWER_SHARE) {
+                let share = match visit.reserve_alone(i64::MAX) {
                     Ok(n) => n,
                     Err(e) => return Reply::Whole(json_response(402, &json!({"error": e, "rule": "visit"}))),
                 };
                 match call(share) {
                     Ok(s) => (s, share),
                     Err(v) => {
-                        visit.release(share, v.get("charged_sats").and_then(Value::as_i64).unwrap_or(0));
+                        visit.refused(share, &v);
                         if v.get("rule").and_then(Value::as_str) == Some("max_sats") && visit.spent_out(share) {
                             return Reply::Whole(json_response(402, &json!({"error": "This visit's spending limit is reached.", "rule": "visit"})));
                         }
@@ -299,7 +314,7 @@ impl Connector {
                 }
             }
             Err(v) => {
-                visit.release(share, v.get("charged_sats").and_then(Value::as_i64).unwrap_or(0));
+                visit.refused(share, &v);
                 return Reply::Whole(refusal(&v));
             }
         };
@@ -366,7 +381,7 @@ impl Connector {
         let Started { head, first, src, done } = match self.start(params) {
             Ok(s) => s,
             Err(v) => {
-                visit.release(share, v.get("charged_sats").and_then(Value::as_i64).unwrap_or(0));
+                visit.refused(share, &v);
                 return Reply::Whole(refusal(&v));
             }
         };
