@@ -2915,6 +2915,18 @@ impl Signer {
                 } else if unpaid.is_none() && price.second_msat > 0 && st.due_bytes(credited(), bytes, length) {
                     unpaid = pay(bytes);
                 }
+                // a ticket due and still being paid is waited for here, not the seller's next bytes: the seller
+                // sends no more until it arrives, and one that cannot go (a session stopped meanwhile) ends the
+                // answer now rather than after the seller's own wait. One that could not go early goes again now
+                if unpaid.is_none() && price.second_msat == 0 && paying.load(Ordering::SeqCst) && st.due_bytes(credited(), bytes, length) {
+                    while paying.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    if let Some((r, early)) = lock(&paid).take() {
+                        unpaid = if r.is_some() && early { pay(bytes) } else { r };
+                        retry_at_due = false;
+                    }
+                }
                 if let Some(why) = unpaid.as_ref().filter(|_| bytes >= st.covered(credited())) {
                     lock(&state).1.get_or_insert(why.clone());
                     break;

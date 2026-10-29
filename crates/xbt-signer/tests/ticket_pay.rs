@@ -1474,9 +1474,13 @@ fn a_file_priced_by_the_byte_is_paid_as_it_arrives_and_stops_where_the_call_or_t
         let t = sc.spawn(|| r.pay(&format!("/slow/{slow}"), 20_000));
         wait_for("the answer to be under way", || r.tap.seen("/slow/").iter().any(|s| s.paid) && r.status()["paying"][0]["answer_open"] == true);
         std::thread::sleep(Duration::from_millis(300));
+        let stopped_at = Instant::now();
         let stop = r.call("ticket_stop", json!({"session": sid}));
         assert_eq!(stop["http"]["cancel_sent"], true, "{stop}");
-        t.join().unwrap()
+        let out = t.join().unwrap();
+        // a ticket being paid beside the reading does not hold the answer open past the stop
+        assert!(stopped_at.elapsed() < Duration::from_secs(5), "the answer ended {:?} after the stop", stopped_at.elapsed());
+        out
     });
     assert_eq!(out["complete"], false, "{out}");
     assert!(out["ended"].as_str().unwrap().contains("ticket_session"), "{out}");
