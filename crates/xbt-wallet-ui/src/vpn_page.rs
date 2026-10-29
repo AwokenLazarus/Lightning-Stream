@@ -7,7 +7,7 @@
 //!   the form, `Cache-Control: no-store`), and never kept.
 //! - `exit.json`: this box's exit, if offered: its kind, what it blocks, its protections, its price.
 //!
-//! And they read what the service writes: `endpoint.json` (the WireGuard key devices pair with),
+//! And they read what the service writes, in `XBT_UI_VPN_STATUS_DIR` (the same dir unless set): `endpoint.json` (the WireGuard key devices pair with),
 //! `status.json` (each device's exit, use, and why its traffic is blocked, if it is) and
 //! `exit-status.json` (bytes the exit carried; counts only).
 //!
@@ -28,13 +28,14 @@ fn read(path: &Path) -> Value {
     std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null)
 }
 
+/// Writes a settings file the VPN service reads: whole, with the folder's group (the service's) and
+/// mode 0640.
 fn write(path: &Path, v: &Value) -> Result<(), String> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    }
-    let tmp = path.with_extension("json.part");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(v).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
+        return Err(format!("{} is not a file path", path.display()));
+    };
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    crate::setup::write_shared(dir, name, &serde_json::to_vec_pretty(v).map_err(|e| e.to_string())?)
 }
 
 fn b64(k: &[u8; 32]) -> String {
@@ -124,7 +125,7 @@ impl App {
 
     /// The WireGuard key devices pair with, as the VPN service wrote it.
     fn vpn_endpoint_key(&self) -> Option<[u8; 32]> {
-        read(&self.cfg.vpn.dir.join("endpoint.json"))["public_key"].as_str().and_then(key32)
+        read(&self.cfg.vpn.status_dir.join("endpoint.json"))["public_key"].as_str().and_then(key32)
     }
 
     pub(crate) fn vpn_page(&self, ctx: &Ctx) -> Resp {
@@ -140,7 +141,7 @@ impl App {
         if !ready {
             b.push_str("<section class=\"card\"><h2>Not running yet</h2><p class=\"empty\">The VPN isn't running on this box yet, so devices \
                 can't be added.</p><details><summary>Technical details</summary><p>The VPN service writes its WireGuard key to \
-                <code>endpoint.json</code> in <code>XBT_UI_VPN_DIR</code>, and this page needs <code>XBT_UI_VPN_ENDPOINT</code>: the address \
+                <code>endpoint.json</code> in <code>XBT_UI_VPN_STATUS_DIR</code> (or <code>XBT_UI_VPN_DIR</code>), and this page needs <code>XBT_UI_VPN_ENDPOINT</code>: the address \
                 devices reach this box on.</p></details></section>");
         }
         if let Some((name, config)) = made {
@@ -154,7 +155,7 @@ impl App {
                  <div class=\"row\"><button type=\"button\" data-copy=\"vpn-config\">Copy</button></div></section>",
                 esc(name), esc(config)));
         }
-        let status = read(&self.cfg.vpn.dir.join("status.json"));
+        let status = read(&self.cfg.vpn.status_dir.join("status.json"));
         let devices = self.vpn_devices();
         let live: Vec<&Value> = devices.iter().filter(|d| d["revoked"].as_bool() != Some(true)).collect();
         let rows: String = live.iter().map(|d| {
@@ -246,7 +247,7 @@ impl App {
 
     pub(crate) fn sell_vpn_page(&self, ctx: &Ctx) -> Resp {
         let e = read(&self.cfg.vpn.dir.join("exit.json"));
-        let st = read(&self.cfg.vpn.dir.join("exit-status.json"));
+        let st = read(&self.cfg.vpn.status_dir.join("exit-status.json"));
         let on = e["offer"].as_bool() == Some(true);
         let chk = |b: bool| if b { " checked" } else { "" };
         let filtered = e["kind"].as_str() == Some("filtered");
@@ -257,7 +258,8 @@ impl App {
         let own = e["own_blocklist"].as_array().into_iter().flatten().filter_map(|d| d.as_str()).collect::<Vec<_>>().join("\n");
         let carried = if on {
             let gb = (st["up_bytes"].as_u64().unwrap_or(0) + st["down_bytes"].as_u64().unwrap_or(0)) as f64 / 1e9;
-            format!("<p>Carried for buyers so far: {gb:.2} GB. Earned: {} sats.</p>", st["earned_msat"].as_u64().unwrap_or(0) / 1000)
+            let unlisted = st["not_announced_because"].as_str().map(|w| format!("<p class=\"hint warn\">Your exit isn't listed yet: {}.</p>", esc(w))).unwrap_or_default();
+            format!("<p>Carried for buyers so far: {gb:.2} GB. Earned: {} sats.</p>{unlisted}", st["earned_msat"].as_u64().unwrap_or(0) / 1000)
         } else {
             String::new()
         };
@@ -272,6 +274,8 @@ impl App {
              <label class=\"check\"><input type=\"checkbox\" name=\"offer\"{}> Offer my connection as an exit</label>\
              <label class=\"check\"><input type=\"checkbox\" name=\"understood\"{}> I've read the warning above</label>\
              <label>Price (sats a GB)<input name=\"sat_per_gb\" type=\"number\" min=\"1\" step=\"1\" value=\"{}\" required></label>\
+             <label>The country your connection is in (two letters, like DE)<input name=\"country\" maxlength=\"2\" value=\"{}\" \
+             placeholder=\"DE\"></label><p class=\"small\">Buyers choose exits by country, so your exit is listed only once this is set.</p>\
              <label>Kind<select name=\"kind\"><option value=\"private\"{}>Private: you can't see which sites buyers visit (most buyers want this)</option>\
              <option value=\"filtered\"{}>Filtered: block the sites below; your exit sees site names</option></select></label>\
              <fieldset><legend>Block, if filtered</legend>{cat_boxes}\
@@ -284,7 +288,7 @@ impl App {
              <label>Ports never carried (email's 25 by default)<input name=\"blocked_ports\" value=\"{}\"></label>\
              <p class=\"small\">Your exit never keeps a record of where buyers go, and never lets anyone reach your own network.</p></details>\
              <button type=\"submit\">Save</button></form></section>",
-            App::csrf_input(ctx), chk(on), chk(on), e["sat_per_gb"].as_u64().unwrap_or(20), if filtered { "" } else { " selected" },
+            App::csrf_input(ctx), chk(on), chk(on), e["sat_per_gb"].as_u64().unwrap_or(20), esc(e["country"].as_str().unwrap_or("")), if filtered { "" } else { " selected" },
             if filtered { " selected" } else { "" }, esc(&own), e["buyer_mbit"].as_u64().map(|n| n.to_string()).unwrap_or_default(),
             e["max_connections"].as_u64().unwrap_or(512),
             esc(&e["blocked_ports"].as_array().map(|p| p.iter().filter_map(|x| x.as_u64()).map(|x| x.to_string()).collect::<Vec<_>>().join(", ")).unwrap_or_else(|| "25".into())),
@@ -309,6 +313,7 @@ impl App {
             "categories": if filtered { cats } else { Vec::new() },
             "own_blocklist": if filtered { own } else { Vec::new() },
             "sat_per_gb": g("sat_per_gb").parse::<u64>().ok().filter(|n| *n > 0).unwrap_or(20),
+            "country": Some(g("country").to_ascii_uppercase()).filter(|c| c.len() == 2 && c.chars().all(|ch| ch.is_ascii_alphabetic())),
             "buyer_mbit": g("buyer_mbit").parse::<u64>().ok().filter(|n| *n > 0),
             "max_connections": g("max_connections").parse::<u64>().ok().filter(|n| *n > 0).unwrap_or(512),
             "blocked_ports": ports,

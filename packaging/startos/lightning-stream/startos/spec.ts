@@ -24,9 +24,13 @@ export const PORTS = {
   hashtakerControl: 23343,
   miners: 23340,
   link: 23341,
+  /** the VPN service's WireGuard endpoint (UDP) inside the package */
+  vpn: 51820,
+  /** where devices reach it on the LAN (51820 is left to WireGuard packages) */
+  vpnExternal: 51830,
 } as const
 
-export type ImageKey = 'init' | 'signer' | 'witness' | 'mcp' | 'ui' | 'gateway' | 'connector' | 'hashlink'
+export type ImageKey = 'init' | 'signer' | 'witness' | 'mcp' | 'ui' | 'gateway' | 'connector' | 'hashlink' | 'vpn'
 export type DaemonId =
   | 'init'
   | 'node-keys'
@@ -38,6 +42,7 @@ export type DaemonId =
   | 'gateway'
   | 'hashmaker'
   | 'hashtaker'
+  | 'vpn'
 
 /** A part of the `main` volume, or (with `dependency`) a folder of another package's volume, read-only. */
 export type MountSpec = {
@@ -155,6 +160,8 @@ export const IMAGES: Record<ImageKey, string> = {
   gateway: 'ghcr.io/awokenlazarus/xbt-gateway:0.1.0-12b8182c0bf6@sha256:feaf8a21dd394273760916757c7b80ac93c600a93a90d2e2453f960b60b93eb6',
   connector: 'ghcr.io/awokenlazarus/lightning-stream:0.1.0-12b8182c0bf6@sha256:b67c0c1e8649192283618b5fd7ced80022d85af5da035a1b2085cfdb7202bc24',
   hashlink: 'ghcr.io/awokenlazarus/xbt-hashlink:0.1.0-12b8182c0bf6@sha256:339a7caf0fda355b1c96e92001fa2cd55bfb8cfb0a228e6d0fb79c7430f924dd',
+  // not published yet (no line in images.lock): oci_build.sh --load tags it
+  vpn: 'xbt-vpn:0.1.0',
 }
 
 const vol = (subpath: string | null, mountpoint: string, readonly = false): MountSpec => ({ subpath, mountpoint, readonly })
@@ -189,7 +196,7 @@ export function services(cfg: Config): ServiceSpec[] {
   }
   const relays = RELAYS.join(',')
   const lan = cfg.lanHost || '127.0.0.1'
-  const components = ['signer', 'witness', 'mcp', 'ui', 'gateway', 'hashrate']
+  const components = ['signer', 'witness', 'mcp', 'ui', 'gateway', 'hashrate', 'vpn']
   return [
     {
       id: 'init',
@@ -320,6 +327,11 @@ export function services(cfg: Config): ServiceSpec[] {
         // Files: with File Browser chosen, the owner picks a folder of its files on the Sell page (read-only);
         // otherwise the folder is the UI's own (<data dir>/files), reached with StartOS's file tools
         ...(fb ? { XBT_UI_FILES_ROOT: FILE_BROWSER.mountpoint, XBT_UI_FILES_ROOT_WORDS: FILE_BROWSER.words } : {}),
+        // the VPN pages: the devices and exit they write for the vpn service, its status they read, and
+        // where devices reach its WireGuard endpoint on the LAN
+        XBT_UI_VPN_DIR: '/data/run/vpn',
+        XBT_UI_VPN_STATUS_DIR: '/data/run/vpn-status',
+        ...(cfg.lanHost ? { XBT_UI_VPN_ENDPOINT: `${cfg.lanHost}:${PORTS.vpnExternal}` } : {}),
       },
       // the UI owns the MCP token and rotates it on its Agents page; its pages write run/ln, run/gateway and
       // run/hashrate (the shop's and the hashrate settings)
@@ -332,6 +344,8 @@ export function services(cfg: Config): ServiceSpec[] {
         vol('run/hashrate', '/data/run/hashrate'),
         vol('run/shops', '/data/run/shops'),
         vol('run/ai', '/data/run/ai'),
+        vol('run/vpn', '/data/run/vpn'),
+        vol('run/vpn-status', '/data/run/vpn-status', true),
         vol('run/enroll', '/data/run/enroll', true),
         ...cert,
         ...(fb ? [fileBrowser] : []),
@@ -456,6 +470,23 @@ export function services(cfg: Config): ServiceSpec[] {
       env: {},
       mounts: [vol('hashrate', '/data/hashrate'), vol('run/hashrate', '/data/run/hashrate', true), vol('run/signer', '/data/run/signer', true)],
       requires: ['signer'],
+    },
+    {
+      // the VPN service: the WireGuard endpoint the owner's devices pair with, and this box's exit if the
+      // owner offers one. Userspace WireGuard and TCP/IP: no TUN device, no capabilities. It exits when the
+      // devices or the exit change, and StartOS starts it again with them
+      id: 'vpn',
+      image: 'vpn',
+      command: ['/usr/bin/xbt-vpn', 'serve'],
+      env: {
+        XBT_VPN_DIR: '/data/run/vpn',
+        XBT_VPN_STATUS: '/data/run/vpn-status',
+        XBT_VPN_KEYS: '/data/vpn',
+        XBT_VPN_WG_LISTEN: `0.0.0.0:${PORTS.vpn}`,
+        XBT_VPN_NOSTR_RELAYS: relays,
+      },
+      mounts: [vol('vpn', '/data/vpn'), vol('run/vpn', '/data/run/vpn', true), vol('run/vpn-status', '/data/run/vpn-status')],
+      requires: ['init'],
     },
   ]
 }

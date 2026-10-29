@@ -18,6 +18,18 @@
 //!     Runs a buyer's app for one device: a WireGuard endpoint the device adds, the buyer's stack and
 //!     router, private DNS (DNS-over-TLS to Quad9 through the exit). Prints the device's WireGuard
 //!     config once (keys made for this run), then the device's bytes and refusals every 10 s.
+//! xbt-vpn serve [--dir DIR] [--status DIR] [--keys DIR] [--wg-listen ADDR:PORT] [--relay URL] [--nostr wss://…,…] [--region CC]
+//!     The VPN service the app's pages drive, through files: it reads `devices.json` (the buyer's
+//!     devices and their policies) and `exit.json` (this box's exit, if offered) in `--dir` (or
+//!     XBT_VPN_DIR; default ./vpn), and writes `endpoint.json` (the WireGuard key devices pair with),
+//!     `status.json` and `exit-status.json` in `--status` (or XBT_VPN_STATUS; default the same dir). Its
+//!     keys and category lists are kept in `--keys` (or XBT_VPN_KEYS; default the same dir). Devices pair with the WireGuard endpoint on
+//!     `--wg-listen` (or XBT_VPN_WG_LISTEN; default 0.0.0.0:51820). Exits are found on the Nostr
+//!     relays of `--nostr` (or XBT_VPN_NOSTR_RELAYS, else XBT_UI_NOSTR_RELAYS), and an offered exit is
+//!     announced there, in the country `exit.json` gives, else `--region` (or XBT_VPN_REGION;
+//!     without one it is not announced). Keys are readable by their owner only. When `devices.json` or
+//!     `exit.json` changes the service exits (status 0) to start again with the new settings: run it
+//!     under a supervisor that restarts it.
 //! xbt-vpn fetch --exit KEY --hints JSON --url http://HOST/PATH [--flows N] [--secs S] [--private] [--relay URL]
 //!               [--hop KEY --hop-hints JSON]
 //!     Downloads the URL through the exit on N flows at once for S seconds and prints one JSON line:
@@ -64,6 +76,7 @@ fn main() -> std::io::Result<()> {
         Some("lists") => lists(&args),
         Some("buyer") => buyer(&args, relay, private),
         Some("fetch") => fetch(&args, relay, private),
+        Some("serve") => serve(&args, relay),
         _ => {
             eprintln!("usage: xbt-vpn exit [--relay URL] [--speed-limit B/s] | xbt-vpn hop [--relay URL] | xbt-vpn fetch --exit KEY --hints JSON --url URL [--flows N] [--secs S] [--private] [--hop KEY --hop-hints JSON]");
             std::process::exit(2)
@@ -289,4 +302,160 @@ fn fetch(args: &[String], relay: String, private: bool) -> std::io::Result<()> {
     })?;
     println!("{report}");
     Ok(())
+}
+
+fn arg_or_env(args: &[String], name: &str, envs: &[&str]) -> Option<String> {
+    arg(args, name).or_else(|| envs.iter().find_map(|e| std::env::var(e).ok().filter(|v| !v.trim().is_empty())))
+}
+
+fn read_json(p: &std::path::Path) -> serde_json::Value {
+    std::fs::read(p).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(serde_json::Value::Null)
+}
+
+fn mtime(p: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(p).and_then(|m| m.modified()).ok()
+}
+
+fn serve(args: &[String], relay: String) -> std::io::Result<()> {
+    use base64::Engine;
+    use std::collections::HashMap;
+    use std::net::IpAddr;
+    use xbt_vpn::announce::{self, ExitOffer};
+    use xbt_vpn::buyer::{Buyer, Device, EncryptedDns};
+    use xbt_vpn::content::LiveLists;
+    use xbt_vpn::router::{Requirements, Router};
+    use xbt_vpn::service::{self, device_status, devices_from, exit_config, exit_from, write_json};
+    use xbt_vpn::wg::{public_of, WgEndpoint, WgPeer};
+
+    // the settings the pages write (read only here), the status written for them, and this service's
+    // own keys and lists (by default all three in one dir)
+    let dir = std::path::PathBuf::from(arg_or_env(args, "--dir", &["XBT_VPN_DIR"]).unwrap_or_else(|| "vpn".into()));
+    let status_dir = arg_or_env(args, "--status", &["XBT_VPN_STATUS"]).map(std::path::PathBuf::from).unwrap_or_else(|| dir.clone());
+    let keys_dir = arg_or_env(args, "--keys", &["XBT_VPN_KEYS"]).map(std::path::PathBuf::from).unwrap_or_else(|| dir.clone());
+    std::fs::create_dir_all(&status_dir)?;
+    std::fs::create_dir_all(&keys_dir)?;
+    let wg_listen = arg_or_env(args, "--wg-listen", &["XBT_VPN_WG_LISTEN"]).unwrap_or_else(|| "0.0.0.0:51820".into());
+    let nostr: Vec<String> = arg_or_env(args, "--nostr", &["XBT_VPN_NOSTR_RELAYS", "XBT_UI_NOSTR_RELAYS"])
+        .map(|v| v.split(',').map(str::trim).filter(|r| r.starts_with("wss://")).map(String::from).collect())
+        .unwrap_or_default();
+    let region = arg_or_env(args, "--region", &["XBT_VPN_REGION"]).map(|r| r.trim().to_ascii_uppercase()).filter(|r| r.len() == 2);
+    let (devices_path, exit_path) = (dir.join("devices.json"), dir.join("exit.json"));
+    let started = (mtime(&devices_path), mtime(&exit_path));
+
+    // the WireGuard key devices pair with: kept, so devices keep working across restarts
+    let wg_secret = service::secret_in(&keys_dir.join("endpoint.key"))?;
+    let b64 = |k: &[u8; 32]| base64::engine::general_purpose::STANDARD.encode(k);
+    write_json(&status_dir.join("endpoint.json"), &serde_json::json!({ "public_key": b64(&public_of(wg_secret)), "listen": wg_listen }))?;
+    let opts = |serving| Options { relays: Relays::Ours(vec![relay.clone()]), serving, private: false, lookup: None };
+
+    // this box's exit, if offered
+    let mut own_exit = None;
+    let exit_meter = Arc::new(Meter::default());
+    let mut _exit_link = None;
+    let mut announced = false;
+    let mut exit_region = None;
+    if let Some(settings) = exit_from(&read_json(&exit_path)) {
+        // the country the owner set on the exit page, else the one the service was started with
+        exit_region = settings.country.clone().or(region.clone());
+        let region = exit_region.clone();
+        let exit_secret = service::secret_in(&keys_dir.join("exit.key"))?;
+        let link = Link::start_alpns(exit_secret, opts(true), ALPN_VPN, &[ALPN_VPN, ALPN_VPN_SEALED])?;
+        let live = LiveLists::default();
+        if settings.filtered && !settings.categories.is_empty() {
+            lists::keep_updated(settings.categories.clone(), keys_dir.join("lists"), live.clone(), lists::UPDATE_EVERY, lists::catalogue_url);
+        }
+        let cfg = Arc::new(exit_config(&settings, live));
+        let (m, buyers, tls) = (exit_meter.clone(), Arc::new(SealedBuyers::default()), sealed::exit_config(&exit_secret));
+        link.accept_with(move |conn| {
+            let (cfg, m, b, tls) = (cfg.clone(), m.clone(), buyers.clone(), tls.clone());
+            async move {
+                if conn.alpn() == ALPN_VPN_SEALED {
+                    serve_sealed(conn, cfg, m, tls, b).await
+                } else {
+                    serve_buyer(conn, cfg, m).await
+                }
+            }
+        });
+        let id = link.endpoint_id();
+        if let (Some(region), false) = (&region, nostr.is_empty()) {
+            let keys = xbt_nostr::event::Keys::from_hex(&hex::encode(service::secret_in(&keys_dir.join("nostr.key"))?)).ok_or_else(|| std::io::Error::other("a Nostr key that is not a key"))?;
+            let offer = ExitOffer {
+                exit: id.clone(), region: region.clone(), filtered: settings.filtered, categories: settings.categories.clone(),
+                logs: false, blocked_ports: settings.blocked_ports.clone(), two_hop: true,
+                price_msat_per_gb: settings.sat_per_gb.saturating_mul(1000), relay: Some(relay.clone()), note: String::new(), ttl_s: announce::MAX_TTL_S,
+            };
+            let ev = announce::announcement_event(&keys, &exit_secret, &offer, xbt_nostr::now()).map_err(std::io::Error::other)?;
+            announced = true;
+            let nostr = nostr.clone();
+            // refreshed every 6 hours: an announcement lives a week, so an exit nobody runs drops out
+            std::thread::spawn(move || loop {
+                let ev = announce::announcement_event(&keys, &exit_secret, &offer, xbt_nostr::now()).unwrap_or_else(|_| ev.clone());
+                let _ = xbt_nostr::oneshot::publish(&nostr, &ev, Duration::from_secs(15));
+                std::thread::sleep(Duration::from_secs(6 * 3600));
+            });
+        }
+        own_exit = Some(id);
+        _exit_link = Some(link);
+    }
+
+    // the buyer: the devices of devices.json, each with its own policy
+    let entries = devices_from(&read_json(&devices_path));
+    let buyer_link = Link::start_alpn(service::secret_in(&keys_dir.join("buyer.key"))?, opts(false), ALPN_VPN)?;
+    let rt = buyer_link.runtime();
+    let devices: HashMap<IpAddr, Arc<Device>> = entries
+        .iter()
+        .map(|e| (IpAddr::V4(e.tunnel_ip), Arc::new(Device { name: e.name.clone(), meter: Meter::default(), limit_bytes: None, requirements: Some(e.requirements.clone()) })))
+        .collect();
+    let peers: Vec<WgPeer> = entries.iter().map(|e| WgPeer { public: e.public, tunnel_ip: e.tunnel_ip }).collect();
+    let buyer = Buyer::new(buyer_link.clone(), Router::with_requirements(Requirements::default()), devices, Some(EncryptedDns::quad9()));
+    let wg = WgEndpoint::new(wg_secret, &peers);
+    let sock = rt.block_on(tokio::net::UdpSocket::bind(&wg_listen))?;
+    let (to_stack, from_devices) = tokio::sync::mpsc::channel(4096);
+    let (to_devices, from_stack) = tokio::sync::mpsc::unbounded_channel();
+    rt.spawn(buyer.clone().run(from_devices, to_devices));
+    rt.spawn(wg.run(sock, to_stack, from_stack));
+
+    // exits, found on Nostr every 10 minutes
+    {
+        let (buyer, link, nostr, own, relay, rt) = (buyer.clone(), buyer_link.clone(), nostr.clone(), own_exit.clone(), relay.clone(), rt.clone());
+        std::thread::spawn(move || loop {
+            if !nostr.is_empty() {
+                let (events, _) = xbt_nostr::oneshot::query(&nostr, &announce::filter(500), Duration::from_secs(15));
+                let (found, _) = announce::collect(&events, xbt_nostr::now());
+                for a in found.into_iter().filter(|a| Some(&a.exit.id) != own.as_ref()) {
+                    let relays = vec![a.relay.clone().unwrap_or_else(|| relay.clone())];
+                    if link.learn(&a.exit.id, Hints { relays, direct: Vec::new() }).is_ok() {
+                        rt.block_on(buyer.upsert_exit(a.exit));
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_secs(600));
+        });
+    }
+
+    println!("{}", serde_json::json!({ "endpoint": b64(&public_of(wg_secret)), "listen": wg_listen, "devices": entries.len(), "exit": own_exit, "announced": announced, "nostr_relays": nostr.len() }));
+    loop {
+        let rows: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|e| {
+                let ip = IpAddr::V4(e.tunnel_ip);
+                let c = buyer.device(ip).map(|d| d.meter.counts());
+                let why = rt.block_on(buyer.why_blocked(ip));
+                device_status(e, c.as_ref().map_or(0, |c| c.up_bytes), c.as_ref().map_or(0, |c| c.down_bytes), why)
+            })
+            .collect();
+        let _ = write_json(&status_dir.join("status.json"), &serde_json::json!({ "devices": rows }));
+        let c = exit_meter.counts();
+        let exit_status = match &own_exit {
+            Some(id) => serde_json::json!({ "offered": true, "exit": id, "announced": announced, "up_bytes": c.up_bytes, "down_bytes": c.down_bytes, "refused": c.dropped, "blocked": c.blocked,
+                "not_announced_because": if announced { None } else if exit_region.is_none() { Some("its country isn't set") } else { Some("no Nostr relays are set") } }),
+            None => serde_json::json!({ "offered": false }),
+        };
+        let _ = write_json(&status_dir.join("exit-status.json"), &exit_status);
+        if (mtime(&devices_path), mtime(&exit_path)) != started {
+            eprintln!("the settings changed: exiting to start again with them");
+            std::process::exit(0);
+        }
+        std::thread::sleep(Duration::from_secs(5));
+    }
 }

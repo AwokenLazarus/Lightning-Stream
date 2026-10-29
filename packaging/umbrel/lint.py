@@ -51,9 +51,9 @@ REGISTRY = "ghcr.io/awokenlazarus"
 # the one image of this store that is not published: the stand-in XBT node (lazarus-xbt-knots), amd64-only, which
 # a box with Paul's Knots BLAKE2b Companion never installs
 LOCAL_ONLY = {"lazarus-xbt-knots": re.compile(r"^xbt-a3-knots:29\.4\.2$")}
-# the connector and xbt-hashlink have no line in images.lock yet. oci_build.sh --load tags them
+# the connector, xbt-hashlink and xbt-vpn have no line in images.lock yet. oci_build.sh --load tags them
 # <image>:0.1.0. A digest is not invented here. Anything else (a registry name, a made-up digest) still fails.
-UNPUBLISHED = re.compile(r"^(lightning-stream|xbt-hashlink):0\.1\.0$")
+UNPUBLISHED = re.compile(r"^(lightning-stream|xbt-hashlink|xbt-vpn):0\.1\.0$")
 # the stream directory the connector writes, inside the signer's socket dir. Read-write, and the
 # only extra mount it may have. It does not get the signer's state.
 # Umbrel's shared Downloads (the Files app's Downloads), read-only, for the wallet's Files service only.
@@ -77,7 +77,8 @@ AGENTPAY = {
     "xbt-wallet-mcp": ("mcp", set(), {"signer", "ui", "shops"}),
     # the setup pages write run/ln (the rail macaroon), run/gateway (the gateway's config and macaroons)
     # and run/hashrate (the hasher's settings); the AI page writes run/ai (keys, sellers)
-    "xbt-wallet-ui": ("ui", {"ui", "ln", "gateway", "hashrate", "shops", "ai"}, {"signer", "enroll"}),
+    # and run/vpn (the devices and exit the VPN pages set), reading the VPN service's status
+    "xbt-wallet-ui": ("ui", {"ui", "ln", "gateway", "hashrate", "shops", "ai", "vpn"}, {"signer", "enroll", "vpn-status"}),
     "xbt-gateway": ("gateway", set(), {"gateway"}),
     # no state of its own. The control socket is read-only; the stream sockets are STREAM_MOUNT. The AI
     # endpoint books the keys' spend and the sellers' health in run/ai, shared by group with the UI
@@ -85,6 +86,8 @@ AGENTPAY = {
     # the hasher and the renter: their keys and state; the settings and token read-only; the renter
     # also the signer's socket, read-only
     "xbt-hashlink": ("hashrate", set(), {"hashrate", "signer"}),
+    # the VPN service: its keys and lists; the settings read-only; its status for the UI
+    "xbt-vpn": ("vpn", {"vpn-status"}, {"vpn"}),
 }
 # the Lightning node's certificate: the only file of another app's data a service here may mount
 CERT_MOUNT = {"type": "bind", "source": "${APP_LIGHTNING_FORK_NODE_DATA_DIR}/tls.cert", "target": "/data/lightning/tls.cert", "read_only": True,

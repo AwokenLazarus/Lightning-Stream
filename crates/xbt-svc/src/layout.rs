@@ -42,6 +42,7 @@ pub const COMPONENTS: &[Component] = &[
     Component { name: crate::GATEWAY, user: "xbt-gateway", uid: 10007 },
     Component { name: crate::HASHRATE, user: "xbt-hashrate", uid: 10010 },
     Component { name: crate::STREAM_RELAY, user: "xbt-stream-relay", uid: STREAM_RELAY_UID },
+    Component { name: crate::VPN, user: "xbt-vpn", uid: VPN_UID },
 ];
 
 /// The group of the wallet's Lightning rail files (`run/ln/`): the signer is its only member, so the
@@ -78,6 +79,9 @@ pub const SHARED_DIRS: &[SharedDir] = &[
     // the built-in Stream relay: the owner's settings in, its status out
     SharedDir { dir: crate::RUN_RELAY, writer: crate::UI, reader: crate::STREAM_RELAY, gid: STREAM_RELAY_UID, mode: 0o750 },
     SharedDir { dir: crate::RUN_RELAY_STATUS, writer: crate::STREAM_RELAY, reader: crate::UI, gid: RELAY_STATUS_GID, mode: 0o750 },
+    // the VPN service: the devices and exit the owner sets in, its status out
+    SharedDir { dir: crate::RUN_VPN, writer: crate::UI, reader: crate::VPN, gid: VPN_UID, mode: 0o750 },
+    SharedDir { dir: crate::RUN_VPN_STATUS, writer: crate::VPN, reader: crate::UI, gid: VPN_STATUS_GID, mode: 0o750 },
     // both write here: the credential store is booked by the endpoint and edited by the UI's AI page
     SharedDir { dir: crate::RUN_AI, writer: crate::UI, reader: crate::SIGNER, gid: AI_GID, mode: 0o770 },
 ];
@@ -87,6 +91,10 @@ pub const SHARED_DIRS: &[SharedDir] = &[
 pub const STREAM_RELAY_UID: u32 = 10016;
 /// A group only: the relay and the UI, for the relay's status file.
 pub const RELAY_STATUS_GID: u32 = 10017;
+/// The VPN service's user and group.
+pub const VPN_UID: u32 = 10018;
+/// A group only: the VPN service and the UI, for the service's status files.
+pub const VPN_STATUS_GID: u32 = 10019;
 
 /// The group `run/shops/` is read by: the signer's own, whose user the connector runs as and whose
 /// group the MCP is in.
@@ -481,7 +489,7 @@ mod tests {
     #[test]
     fn table_matches_container_md() {
         let t: Vec<_> = COMPONENTS.iter().map(|c| (c.name, c.uid)).collect();
-        assert_eq!(t, vec![("signer", 10001), ("witness", 10002), ("mcp", 10003), ("ui", 10005), ("relay", 10006), ("gateway", 10007), ("hashrate", 10010), ("stream-relay", 10016)]);
+        assert_eq!(t, vec![("signer", 10001), ("witness", 10002), ("mcp", 10003), ("ui", 10005), ("relay", 10006), ("gateway", 10007), ("hashrate", 10010), ("stream-relay", 10016), ("vpn", 10018)]);
     }
 
     #[test]

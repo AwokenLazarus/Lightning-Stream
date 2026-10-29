@@ -20,6 +20,7 @@
 //! - [`lists`]: category blocklists (adult, gambling, malware…) an operator ticks, kept up to date.
 //! - [`meter`]: bytes carried each way, for payment. It never records where a packet was going.
 
+pub mod announce;
 pub mod buyer;
 pub mod content;
 pub mod exit;
@@ -31,5 +32,6 @@ pub mod meter;
 pub mod region;
 pub mod router;
 pub mod sealed;
+pub mod service;
 pub mod tunnel;
 pub mod wg;

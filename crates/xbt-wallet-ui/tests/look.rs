@@ -160,7 +160,7 @@ fn the_look_in_headless_chrome() {
     std::fs::write(vpn.join("exit.json"), json!({"offer": true, "kind": "filtered", "categories": ["adult", "malware"],
         "own_blocklist": ["example-gambling.test"], "sat_per_gb": 20, "max_connections": 512, "blocked_ports": [25]}).to_string()).unwrap();
     std::fs::write(vpn.join("exit-status.json"), json!({"up_bytes": 1_200_000_000u64, "down_bytes": 9_800_000_000u64, "earned_msat": 220_000}).to_string()).unwrap();
-    cfg.vpn = xbt_wallet_ui::config::VpnSetup { dir: vpn, endpoint: Some("192.168.1.20:51830".into()) };
+    cfg.vpn = xbt_wallet_ui::config::VpnSetup { status_dir: vpn.clone(), dir: vpn, endpoint: Some("192.168.1.20:51830".into()) };
     let srv = xbt_wallet_ui::server::spawn(App::new(cfg).unwrap()).unwrap();
     let gdata = tempfile::tempdir().unwrap();
     let mut gcfg = Config::for_test(gdata.path().join("no-signer.sock"), gdata.path().join("ui"), "127.0.0.1:0");

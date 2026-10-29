@@ -10,6 +10,8 @@ publish.workspace = true
 
 [dependencies]
 xbt-iroh-link = { path = "../xbt-iroh-link" }
+# exits announce themselves on Nostr, and buyers find them there
+xbt-nostr.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "sync", "io-util", "net"] }
 bytes = "1"
 hex.workspace = true

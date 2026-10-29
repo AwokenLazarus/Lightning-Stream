@@ -34,6 +34,9 @@
 //! | `XBT_UI_STREAM_RELAY` | our relay, `https://iroh.lazarus-xbt.xyz/` | the Stream relay a direct link falls back to last; the Stream relays page (Settings) keeps the owner's other choices in `<data dir>/relays.json` (`docs/RUN-A-RELAY.md`) |
 //! | `XBT_UI_RELAY_DIR`, `XBT_UI_RELAY_STATUS` | | the package's own relay service: the folder it reads the owner's `relay.json` from, and its status file. Unset: the page offers no built-in relay |
 //! | `XBT_UI_RELAY_UNAVAILABLE` | | why this platform can't run the built-in relay, shown instead of the switch |
+//! | `XBT_UI_VPN_DIR` | `<data dir>/run/vpn` | the folder the VPN pages write `devices.json` and `exit.json` to, for the VPN service |
+//! | `XBT_UI_VPN_STATUS_DIR` | `XBT_UI_VPN_DIR` | the folder the VPN service writes `endpoint.json`, `status.json` and `exit-status.json` to, for the pages |
+//! | `XBT_UI_VPN_ENDPOINT` | | where devices reach this box's WireGuard endpoint (`host:port`), put in each device's config; unset: no devices can be added |
 //! | `XBT_UI_RELAY_START_HINT` | | how to start the relay service, shown when it is switched on but isn't running |
 //! | `XBT_UI_NWC_SOCK` | | the NWC wallet service's admin socket (`xbt-nwc`'s `NWC_ADMIN_SOCK`): the Connected apps page makes, lists and revokes NWC connections there |
 //! | `XBT_UI_CONNECTOR` | `http://127.0.0.1:8480` | the connector a seller's web app opens through (`<connector>/visits`). That is also the connector's default listen address, and the UI's own default bind: on one machine set one of the two ports. |
@@ -203,9 +206,12 @@ pub struct AiSetup {
 /// VPN exits: the buyer's devices and policies, and this box's own exit if its owner offers one.
 #[derive(Debug, Clone, Default)]
 pub struct VpnSetup {
-    /// `XBT_UI_VPN_DIR`: the files the VPN pages write (devices, exit settings) and the VPN service
-    /// writes (its WireGuard key, its status), shared with that service.
+    /// `XBT_UI_VPN_DIR`: the files the VPN pages write (devices, exit settings), which the VPN service
+    /// reads.
     pub dir: PathBuf,
+    /// `XBT_UI_VPN_STATUS_DIR`: the files the VPN service writes (its WireGuard key's public half, its
+    /// status), which the pages read. Unset: the same dir as `XBT_UI_VPN_DIR`.
+    pub status_dir: PathBuf,
     /// `XBT_UI_VPN_ENDPOINT`: where devices reach this box's WireGuard endpoint (`192.168.1.20:51830`),
     /// put in each device's config. Unset: the box does not run the buyer's VPN, and the page says so.
     pub endpoint: Option<String>,
@@ -309,8 +315,10 @@ impl Config {
             credentials: env("XBT_UI_CREDENTIALS").map(PathBuf::from).unwrap_or_else(|| run_dir("ai").join("credentials.json")),
             state: env("XBT_UI_AI_STATE").map(PathBuf::from).unwrap_or_else(|| run_dir("ai").join("state.json")),
         };
+        let vpn_dir = env("XBT_UI_VPN_DIR").map(PathBuf::from).unwrap_or_else(|| run_dir("vpn"));
         let vpn = VpnSetup {
-            dir: env("XBT_UI_VPN_DIR").map(PathBuf::from).unwrap_or_else(|| run_dir("vpn")),
+            status_dir: env("XBT_UI_VPN_STATUS_DIR").map(PathBuf::from).unwrap_or_else(|| vpn_dir.clone()),
+            dir: vpn_dir,
             endpoint: env("XBT_UI_VPN_ENDPOINT").filter(|e| !e.is_empty()),
         };
         let hash_settings = env("XBT_UI_HASHER_SETTINGS").map(PathBuf::from).unwrap_or_else(|| run_dir("hashrate").join("settings.json"));
@@ -425,7 +433,7 @@ impl Config {
                restart_hint: RESTART_HINT.into(), local_services: vec![],
                ai: AiSetup { endpoint: None, sellers: PathBuf::from("/nonexistent/ai/sellers.json"), credentials: PathBuf::from("/nonexistent/ai/credentials.json"),
                              state: PathBuf::from("/nonexistent/ai/state.json") },
-               vpn: VpnSetup { dir: PathBuf::from("/nonexistent/vpn"), endpoint: None },
+               vpn: VpnSetup { dir: PathBuf::from("/nonexistent/vpn"), status_dir: PathBuf::from("/nonexistent/vpn"), endpoint: None },
                hash: HashSetup { settings: PathBuf::from("/nonexistent/hashrate/settings.json"), datum_guide: DATUM_GUIDE.into(), ..Default::default() } }
     }
 }

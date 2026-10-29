@@ -71,6 +71,8 @@ const dict = {
   "This app's own folder": 73,
   'File Browser': 74,
   'Share your File Browser files with the Files service (read-only), or use the folder in this app': 75,
+  'VPN for your devices': 76,
+  'Your devices connect here with the WireGuard config the VPN page makes for each one. Keep it on your LAN': 77,
 } as const
 
 /**

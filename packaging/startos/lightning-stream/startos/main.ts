@@ -83,8 +83,8 @@ export const main = sdk.setupMain(async ({ effects }) => {
     gracePeriod,
   })
 
-  const [init, witness, signer, mcp, ui, connector, gateway, hashmaker, hashtaker] = (
-    ['init', 'witness', 'signer', 'mcp', 'ui', 'connector', 'gateway', 'hashmaker', 'hashtaker'] as const
+  const [init, witness, signer, mcp, ui, connector, gateway, hashmaker, hashtaker, vpn] = (
+    ['init', 'witness', 'signer', 'mcp', 'ui', 'connector', 'gateway', 'hashmaker', 'hashtaker', 'vpn'] as const
   ).map(spec)
   const witnessSub = sub(witness)
   const signerSub = sub(signer)
@@ -144,6 +144,7 @@ export const main = sdk.setupMain(async ({ effects }) => {
         requires: ['init'],
       })
       .addDaemon('hashtaker', { subcontainer: sub(hashtaker), exec: exec(hashtaker), ready: { display: null, fn: () => ({ result: 'success', message: null }) }, requires: ['signer'] })
+      .addDaemon('vpn', { subcontainer: sub(vpn), exec: exec(vpn), ready: { display: null, fn: () => ({ result: 'success', message: null }) }, requires: ['init'] })
       // Readiness as the wallet sees it: the MCP's /readyz (the signer is up, the node is reachable and synced,
       // the keys are unlocked, the witness answers). A 503 while the node syncs is "loading", with the reason.
       .addHealthCheck('wallet-ready', {

@@ -146,12 +146,13 @@ def main():
     check("I", "the spec: init and node-keys run as root, every daemon as its image's user; each mounts only its own sub-paths; of Lightning "
                "Fork's volume the certificate folder (public), read-only, where the node is used, and its folder of granted keys (apps) in "
                "node-keys only, never its chain data or admin macaroon; node-keys watches for the grant and writes only run/ln; the MCP sees "
-               "neither it nor run/ln; the hashrate services see the signer only read-only",
+               "neither it nor run/ln; the hashrate services see the signer only read-only; the VPN service reads the VPN settings and nothing of the wallet",
           by["init"].get("user") == "root" and by["node-keys"].get("user") == "root"
           and all(not by[i].get("user") for i in ("witness", "signer", "mcp", "ui", "connector", "gateway", "hashmaker", "hashtaker"))
           and own("mcp") == [("mcp", False), ("run/signer", True), ("run/ui", True)] and lf("mcp") == []
           and own("ui") == [("ui", False), ("run/signer", True), ("run/ui", False), ("run/ln", False), ("run/gateway", False), ("run/hashrate", False),
-                            ("run/enroll", True)] and lf("ui") == ["public"]
+                            ("run/shops", False), ("run/ai", False), ("run/vpn", False), ("run/vpn-status", True), ("run/enroll", True)] and lf("ui") == ["public"]
+          and own("vpn") == [("vpn", False), ("run/vpn", True), ("run/vpn-status", False)] and lf("vpn") == [] and not by["vpn"].get("user")
           and own("signer") == [("signer", False), ("run/signer", False), ("run/anchor", True), ("run/ln", True), ("run/enroll", False)]
           and lf("signer") == ["public"]
           and own("gateway") == [("gateway", False), ("run/gateway", True)] and lf("gateway") == ["public"]
@@ -161,9 +162,9 @@ def main():
           and by["node-keys"]["env"].get("XBT_KEYS_GRANT_DIR") == "/mnt/lightning-fork-apps/lightning-stream" and "XBT_KEYS_ADMIN" not in by["node-keys"]["env"]
           and "XBT_KEYS_GW_DIR" not in by["node-keys"]["env"] and by["ui"]["env"].get("XBT_UI_LN_GRANT") == "1"
           and [m["subpath"] for m in by["witness"]["mounts"]] == ["witness", "run/anchor"], sp["services"])
-    check("I", "one package for the whole app: the wallet, the connector, the shop and hashrate, on 127.0.0.1 inside it; the shop's and the "
+    check("I", "one package for the whole app: the wallet, the connector, the shop, hashrate and the VPN, on 127.0.0.1 inside it; the shop's and the "
                "hashrate pages' addresses on the UI",
-          {s["id"] for s in sp["services"]} == {"init", "node-keys", "witness", "signer", "mcp", "ui", "connector", "gateway", "hashmaker", "hashtaker"}
+          {s["id"] for s in sp["services"]} == {"init", "node-keys", "witness", "signer", "mcp", "ui", "connector", "gateway", "hashmaker", "hashtaker", "vpn"}
           and by["ui"]["env"].get("XBT_UI_SELL") == "1" and by["ui"]["env"].get("XBT_UI_HASHRENT") == "http://127.0.0.1:23343"
           and by["ui"]["env"].get("XBT_UI_GW_HEALTH_URL") == "http://127.0.0.1:8402/x402/ticket/health" and "XBT_UI_ROLE" not in by["ui"]["env"],
           {s["id"]: s["env"] for s in sp["services"] if s["id"] == "ui"})

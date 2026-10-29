@@ -101,6 +101,12 @@ pub const STREAM_RELAY: &str = "stream-relay";
 pub const RUN_RELAY: &str = "relay";
 /// The relay's status file, written by the relay and read by the UI.
 pub const RUN_RELAY_STATUS: &str = "relay-status";
+/// The VPN service (`docs/VPN-EXITS.md`): its keys (WireGuard, the exit's link, Nostr) and category lists.
+pub const VPN: &str = "vpn";
+/// The VPN settings (`devices.json`, `exit.json`), written by the UI's VPN pages and read by the service.
+pub const RUN_VPN: &str = "vpn";
+/// The VPN service's status (`endpoint.json`, `status.json`, `exit-status.json`), read by the UI.
+pub const RUN_VPN_STATUS: &str = "vpn-status";
 /// The AI endpoint's files, which the UI and the connector (as the signer's user) both write: the
 /// credential store, the AI sellers the UI writes, and the sellers' health the endpoint writes.
 pub const RUN_AI: &str = "ai";

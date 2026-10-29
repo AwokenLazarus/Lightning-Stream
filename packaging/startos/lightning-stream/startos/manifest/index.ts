@@ -25,6 +25,7 @@ export const manifest = setupManifest({
     gateway: { source: { dockerTag: IMAGES.gateway }, arch: ['x86_64', 'aarch64'] },
     connector: { source: { dockerTag: IMAGES.connector }, arch: ['x86_64', 'aarch64'] },
     hashlink: { source: { dockerTag: IMAGES.hashlink }, arch: ['x86_64', 'aarch64'] },
+    vpn: { source: { dockerTag: IMAGES.vpn }, arch: ['x86_64', 'aarch64'] },
   },
   hardwareRequirements: {
     ram: 512 * 1024 ** 2, // 512 MiB: every service is a small static binary

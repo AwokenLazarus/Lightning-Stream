@@ -88,8 +88,38 @@ well-known DNS-over-HTTPS services and QUIC, which closes the common routes.
   private or filtered; categories and an own list; protections under Advanced.
 
 The pages write `devices.json` and `exit.json` in `XBT_UI_VPN_DIR`, and read what the VPN service
-writes there: `endpoint.json` (the WireGuard key devices pair with), `status.json` and
-`exit-status.json`. A device's private key is shown once and never kept.
+writes in `XBT_UI_VPN_STATUS_DIR` (the same folder unless set): `endpoint.json` (the WireGuard key
+devices pair with), `status.json` and `exit-status.json`. A device's private key is shown once and
+never kept.
+
+## The VPN service
+
+`xbt-vpn serve` is the service the pages drive (the `xbt-vpn` image, as uid 10018). It reads the
+devices and the exit from those files, runs the WireGuard endpoint devices pair with, routes each
+device by its own rules, and runs this box's exit if the owner offers one. It keeps its keys
+(WireGuard, the exit's link key, its Nostr key) and the category lists in its own folder, readable by
+it only. When the devices or the exit change it exits, and the package starts it again with them.
+
+WireGuard and the TCP/IP stack run in the process (userspace), so the service needs no TUN device and
+no capabilities. Only one UDP port is published, for the devices on the LAN:
+
+| Package | Devices reach it on | How it is switched on |
+| --- | --- | --- |
+| Linux | UDP 51820 (`LS_VPN_PORT`), on Docker's own network | `LS_VPN=1` at install (profile `vpn`) |
+| Umbrel | UDP 51830 on the box's name | always installed, idle until a device is added or an exit offered |
+| StartOS | UDP 51830 (a two-port range, the way StartOS forwards UDP) | likewise |
+
+Exits are found on the package's Nostr relays: each exit signs an announcement (NIP-78, kind 30078,
+`d` = `lightning-stream-vpn-exit:<exit id>`) with its owner's Nostr key, and its link key signs the
+pairing of the two, so nobody can announce an exit that isn't theirs. The announcement says what the
+exit is (private or filtered, its categories, port rules, two hops, price a GB) and lives a week;
+the service renews it every 6 hours and looks for exits every 10 minutes. An exit is announced only
+once its owner sets its country on the exit page.
+
+Not yet: an announced exit's country is what its owner says. It is not checked against where its
+traffic comes out until the region check is wired to announced exits, so a device whose rules name
+a country is told no exit qualifies rather than sent to one that may be elsewhere. And a device's
+limit in sats applies once exits are paid.
 
 ## Measured
 
@@ -102,8 +132,16 @@ On a home LAN (a 100 MB HTTP file):
 | Exit on a PC, through a Pi 4 first hop | 4 | 111–120 Mbit/s | the Pi hop at 90% of one core (of 4) |
 | A WireGuard client (Pi) through the buyer's app | 1 | 43–48 Mbit/s | 94 Mbit/s without the tunnel |
 
-Category lists in memory: adult 953,393 names (0.3 s to load, about 82 MiB); malware 2,655,820
-names (0.8 s, about 140 MiB).
+Category lists, on a Raspberry Pi 4: each list is compiled once into a compact sorted set (a finite
+state transducer) on disk and memory-mapped, so it costs memory only for the pages a lookup touches.
+
+| List | Names | Before: loaded in memory | Now: file (mapped) | Now: added to the service |
+| --- | --- | --- | --- | --- |
+| adult | 953,393 | 95 MiB | 8.4 MiB | about 1 MiB |
+| malware | 2,655,820 | 178 MiB | 27.5 MiB | about 1 MiB |
+
+A name is checked, with each of its parent domains, in 1.1–1.6 µs. While a list is fetched and
+compiled the service peaks at 49 MiB (adult) and 114 MiB (malware), where it was 137 and 286 MiB.
 
 ## Paying (designed, not built)
 
