@@ -211,7 +211,8 @@ fn a_range_goes_in_parts_each_within_a_share_of_the_limit() {
         let r = c["range"].as_str().unwrap();
         let start: u64 = r.trim_start_matches("bytes=").split('-').next().unwrap().parse().unwrap();
         assert_eq!(r, format!("bytes={start}-{}", start + (4 << 20) - 1), "call {i}: {c}");
-        assert!((1..=1_000).contains(&c["max_sats"].as_i64().unwrap()), "call {i}: {c}");
+        // a share, or, for a request whose share was too small for a ticket, all that was left once it ran alone
+        assert!((1..=2_500).contains(&c["max_sats"].as_i64().unwrap()), "call {i}: {c}");
     }
     let charged = session.lock().unwrap().charged;
     assert!(charged <= 2_500, "{charged}");

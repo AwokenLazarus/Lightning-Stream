@@ -106,6 +106,8 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 thread_local! {
+    /// `order` locks of sessions this thread holds ([`lock_order`]).
+    static ORDER_HELD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// How many session `money` locks this thread holds (debug builds): [`lock_link`] checks it.
     static MONEY_HELD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// How many session `link` locks this thread holds (debug builds): [`lock_paying`] checks it.
@@ -202,13 +204,43 @@ fn lock_link(hs: &HttpSession) -> LinkGuard<'_> {
     LinkGuard(g)
 }
 
-/// A session's `paying`: taken before `link` and `money`, never with either held. Debug builds
-/// refuse it otherwise.
+/// A session's `paying`: taken before `order`, `link` and `money`, never with any of them held.
+/// Debug builds refuse it otherwise.
 fn lock_paying(hs: &HttpSession) -> MutexGuard<'_, ()> {
+    debug_assert_eq!(ORDER_HELD.with(std::cell::Cell::get), 0, "lock order: a session's paying is taken before its order, never with it held");
     debug_assert_eq!(LINK_HELD.with(std::cell::Cell::get), 0, "lock order: a session's paying is taken before its link, never with it held");
     debug_assert_eq!(MONEY_HELD.with(std::cell::Cell::get), 0, "lock order: a session's paying is taken before its money, never with it held");
     lock(&hs.paying)
 }
+
+/// A held `order` lock of a session, counted for the lock-order check.
+struct OrderGuard<'a>(#[allow(dead_code)] MutexGuard<'a, ()>);
+
+impl Drop for OrderGuard<'_> {
+    fn drop(&mut self) {
+        ORDER_HELD.with(|n| n.set(n.get().saturating_sub(1)));
+    }
+}
+
+/// A session's `order`, where its seller takes only the next seq (no `seqWindow` in its terms):
+/// held by a request from its seq to its answer's head, so that its requests reach the seller one
+/// at a time, in order. `None` where the seller takes requests side by side. Taken after `paying`
+/// and before `link` and `money`; debug builds refuse it otherwise.
+fn lock_order(hs: &HttpSession) -> Option<OrderGuard<'_>> {
+    if hs.terms.seq_window > 1 {
+        return None;
+    }
+    debug_assert_eq!(LINK_HELD.with(std::cell::Cell::get), 0, "lock order: a session's order is taken before its link, never with it held");
+    debug_assert_eq!(MONEY_HELD.with(std::cell::Cell::get), 0, "lock order: a session's order is taken before its money, never with it held");
+    let g = lock(&hs.order);
+    ORDER_HELD.with(|n| n.set(n.get() + 1));
+    Some(OrderGuard(g))
+}
+
+/// How long a seq is taken to be on its way to the seller. One sent longer ago that has no answer
+/// yet has arrived, its answer slow to come (a long poll, a model slow to its first word), or was
+/// lost: it no longer holds the window of the seqs sent after it ([`Signer::seq_take`]).
+const SEQ_ARRIVED: Duration = Duration::from_secs(1);
 
 /// How long a request waits for the seller to take the requests sent before it, whose seqs come
 /// first: they went out on other connections, and the seller takes seqs only in order.
@@ -796,16 +828,17 @@ struct Link {
     seller_sid: String,
     key: Zeroizing<[u8; 32]>,
     next_seq: u64,
-    /// Seqs of requests on their way to the seller: taken, sent, and not yet answered. The seller
-    /// takes seqs only in order, and requests go out side by side on their own connections, so one
-    /// may arrive before a seq it follows; that one is sent again once this set says the earlier
-    /// is on its way, or takes over the earlier seq where none is.
-    sent: HashSet<u64>,
+    /// Seqs of requests on their way to the seller, taken, sent and not yet answered, and when each
+    /// was taken. Requests go out side by side on their own connections and arrive in another
+    /// order; the seller takes each seq once within its window (`seqWindow`). One refused as past
+    /// the window is sent again once this says the earlier ones are on their way, or takes over
+    /// the earliest seq where none is.
+    sent: HashMap<u64, Instant>,
 }
 
 impl Link {
     fn new(seller_sid: String, key: [u8; 32], next_seq: u64) -> Self {
-        Self { seller_sid, key: Zeroizing::new(key), next_seq, sent: HashSet::new() }
+        Self { seller_sid, key: Zeroizing::new(key), next_seq, sent: HashMap::new() }
     }
 }
 
@@ -958,8 +991,11 @@ pub(crate) struct HttpSession {
     /// session to another address, stopping it as idle.
     calls: RwLock<()>,
     paying: Mutex<()>,
-    /// Lock order: `link` before `money`, never the other way ([`lock_link`], [`lock_money`]):
-    /// a request holds `link` across its call to the seller and then books into `money`.
+    /// With a seller that takes only the next seq, held by a request from its seq to its head
+    /// ([`lock_order`]).
+    order: Mutex<()>,
+    /// Lock order: `paying`, `order`, `link`, `money`, never the other way ([`lock_paying`],
+    /// [`lock_order`], [`lock_link`], [`lock_money`]).
     link: Mutex<Link>,
     money: Mutex<Money>,
     /// How many answers priced as they go are open: the seller's `spentMsat` moves between receipts.
@@ -2007,7 +2043,7 @@ impl Signer {
                     .map(str::to_string);
                     let h = Arc::new(HttpSession { origin: c.origin.into(), sid: str_or_empty(o.get("session")), task: task.clone(), terms: terms.clone(),
                                                    prepaid: prepaid_terms.clone(), offer, base, calls: RwLock::new(()),
-                                                   paying: Mutex::new(()), link: Mutex::new(Link::new(String::new(), [0u8; 32], 0)),
+                                                   paying: Mutex::new(()), order: Mutex::new(()), link: Mutex::new(Link::new(String::new(), [0u8; 32], 0)),
                                                    money: Mutex::new(Money::default()), streaming: AtomicUsize::new(0), refilling: AtomicBool::new(false),
                                                    used: Mutex::new(self.engine.now()), unfilled: Mutex::new(None),
                                                    cancel_asked: Mutex::new(HashSet::new()) });
@@ -2454,13 +2490,24 @@ impl Signer {
     /// A seq for one request to the session's seller, with the seller's session id and key: taken
     /// under `link`, which is let go at once, so that the request goes out beside the others.
     fn seq_take(&self, hs: &HttpSession) -> Result<(u64, String, Zeroizing<[u8; 32]>)> {
-        let mut link = lock_link(hs);
+        // within the seller's window of the lowest seq on its way, so that the seller can take it
+        let until = Instant::now() + SEQ_WAIT;
+        let mut link = loop {
+            let link = lock_link(hs);
+            // a seq out longer than that has reached the seller (its answer is slow to come) or was lost
+            let low = link.sent.iter().filter(|(_, at)| at.elapsed() < SEQ_ARRIVED).map(|(s, _)| *s).min();
+            if low.is_none_or(|l| link.next_seq < l.saturating_add(hs.terms.seq_window)) || Instant::now() >= until {
+                break link;
+            }
+            drop(link);
+            std::thread::sleep(Duration::from_millis(1));
+        };
         if link.seller_sid.is_empty() {
             return Err(err("ticket_session", "the session has no seller side yet"));
         }
         let seq = link.next_seq;
         link.next_seq = seq.saturating_add(1);
-        link.sent.insert(seq);
+        link.sent.insert(seq, Instant::now());
         Ok((seq, link.seller_sid.clone(), link.key.clone()))
     }
 
@@ -2471,16 +2518,17 @@ impl Signer {
     /// was given up): that one, taken over. `None`: the same seq, after a short wait.
     fn seq_bad(&self, hs: &HttpSession, seq: u64, next: u64) -> Option<u64> {
         let mut link = lock_link(hs);
-        if next > seq {
+        // below the next one, or refused inside the seller's window (taken already: an answer of ours was lost)
+        if next > seq || seq - next < hs.terms.seq_window {
             link.sent.remove(&seq);
             let s = link.next_seq.max(next);
             link.next_seq = s.saturating_add(1);
-            link.sent.insert(s);
+            link.sent.insert(s, Instant::now());
             return Some(s);
         }
-        if next < seq && !link.sent.contains(&next) {
+        if next < seq && !link.sent.contains_key(&next) {
             link.sent.remove(&seq);
-            link.sent.insert(next);
+            link.sent.insert(next, Instant::now());
             // the seq given up here is the next one handed out again, where none was handed out after it
             if link.next_seq == seq.saturating_add(1) {
                 link.next_seq = seq;
@@ -2507,6 +2555,8 @@ impl Signer {
         let raw = body.to_string().into_bytes();
         let timeout = Self::ticket_read_timeout(&self.ticket_policy());
         let digest = request_digest_v2("POST", &url, &raw);
+        // held to the end: the answer is read whole here
+        let _order = lock_order(hs);
         let (mut seq, sid, key) = self.seq_take(hs)?;
         let deadline = Instant::now() + SEQ_WAIT;
         loop {
@@ -3003,6 +3053,7 @@ impl Signer {
                 }
             }
             let digest = request_digest_v2(c.method, c.url, c.body);
+            let order = lock_order(hs);
             let (mut seq, sid, key) = match self.seq_take(hs) {
                 Ok(x) => x,
                 Err(e) => return fail(hs, &spent, refusal("ticket_session", e.msg)),
@@ -3061,6 +3112,7 @@ impl Signer {
                 }
                 break (ans, receipt);
             };
+            drop(order);
             self.seq_done(hs, seq);
             let head = match receipt {
                 Ok(r) => r,

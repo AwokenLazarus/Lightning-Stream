@@ -56,7 +56,7 @@ A seller that takes tickets adds one entry to `accepts` in its `402` (`PAYMENT-R
  "extra": {"version": "ticket/0", "layer": "lightning", "features": [512],
            "ticketMsat": "1000000", "maxTickets": 2, "ticketBlocks": 40,
            "release": "with-request", "settle": "on-use",
-           "receiptKey": "<33-byte public key>", "session": "/x402/ticket",
+           "receiptKey": "<33-byte public key>", "session": "/x402/ticket", "seqWindow": 64,
            "price": {"requestMsat": "2500", "byteMsat": "0", "perBytes": "1", "secondMsat": "0"}}}
 ```
 
@@ -231,12 +231,17 @@ its ticket**, since its hash is the ticket's payment hash.
 
 Every request of a session is authenticated this way: a paid request for a resource, and the
 session's own `lock`, `release`, `cancel` and `status` (section 4), whose JSON bodies the digest
-covers. A `seq` is used up by a request whose `auth` was good and whose `seq` was the next one,
-whether it was then served or refused; its answer carries a receipt. A request that was not
-authenticated uses up nothing and gets no receipt: `401 bad_auth`, or `402 bad_seq` with the
-`nextSeq` the seller expects, which a buyer adopts (a seller can lose its last half second of
-counters in a power cut). The buyer sends the requests of one session one after another, the next
-when the head of the last answer has arrived: two sent together can arrive out of order.
+covers. A `seq` is used up by a request whose `auth` was good and whose `seq` the seller takes, whether
+it was then served or refused; its answer carries a receipt. A seller takes each `seq` once: the
+next one, or, where its terms state `seqWindow` (`extra.seqWindow`, a whole number from 2 to 64),
+any one not taken yet from the next one up to `seqWindow - 1` past it; its next `seq` then moves
+past every one taken from it on. A request that was not authenticated uses up nothing and gets no
+receipt: `401 bad_auth`, or `402 bad_seq` with the `nextSeq` the seller expects (for a `seq` below
+it, taken already, or past the window), which a buyer adopts (a seller can lose its last half
+second of counters in a power cut). Requests sent together can arrive out of order. With a window,
+the buyer sends up to `seqWindow` requests of one session at once, each `seq` within the window of
+the lowest one still on its way; without one, one after another, the next when the head of the
+last answer has arrived.
 
 The session has a balance in msat. Each secret released adds `ticketMsat`; each request served
 subtracts its price.
@@ -257,8 +262,10 @@ covers both; no field of the terms says which a seller takes.
 In both places the seller does steps 2 and 3 below with the secret. The seller, for each
 request, in this order:
 
-1. Checks `auth` and that `seq` is the next one. Without `auth` anyone who sees a session id spends
-   its balance. Without `seq` a replayed request is served twice.
+1. Checks `auth` and that it takes `seq`: the next one, or one not taken yet within its window.
+   Without `auth` anyone who sees a session id spends its balance. Without `seq` a replayed
+   request is served twice. The seqs taken past the next one are kept with the session's other
+   counters, so a seller that starts again takes none of them again.
 2. If there is a secret: hashes it and finds that ticket in this session. The ticket MUST be
    `ACCEPTED` on the seller's own node for the full `ticketMsat` (by a lookup, or from the node's
    invoice subscription), not used before, and MUST have more than 24 blocks left before its HTLC
@@ -1863,14 +1870,22 @@ request to that seller until the read timeout. Now requests in one session run s
 
 - **Order at the seller.** A request holds the session's link only to take its `seq`; it is sent
   and its head read with nothing held, so a request slow to be answered (a long poll, a model slow
-  to its first word) holds up nothing. The seller takes seqs only in order, and the requests go out
-  on their own connections: one that arrives before a seq it follows is answered `bad_seq` and is
-  sent again once that one has arrived, or takes over a seq that no request holds any more (one
-  given up when its connection failed).
-- **Receipts out of order.** Receipts come back in another order than the seller signed them. The
-  seller's totals only grow, so a receipt with less than the wallet already holds is an older one:
-  its own figures are checked (its charge against its price), and its totals are passed over
-  rather than taken back.
+  to its first word) holds up nothing. The requests go out on their own connections and arrive in
+  another order than they left, so this needs a seller that states `seqWindow` (section 3): it takes
+  each seq where it falls in its window. The wallet takes a seq only within the window of the
+  lowest one still on its way. A seq the seller refuses as taken goes again as a fresh one; one
+  past the window goes again once the seqs before it have arrived, or takes over a seq that no
+  request holds any more (one given up when its connection failed). With a seller that states no
+  window, which takes only the next seq, a request holds the session's `order` from its seq to its
+  head: one at a time, as before 0.1.20. Without a window, requests side by side arrived out of
+  order and went again, a round trip each: over a relay a web app's page loaded in ten seconds.
+- **Receipts out of order.** Receipts come back in another order than the seller signed them. A
+  receipt with less than the wallet already holds, released or spent, is taken as an older one: its
+  own figures are checked (its charge against its price), and its totals are passed over rather
+  than taken back. The seller's released total only rises, but its spend can fall (it gives back a
+  charge that bought nothing, such as a page the browser dropped), so a receipt passed over for its
+  spend still confirms the releases it names. A head signed while a released ticket is on its way
+  rightly says less was released than the wallet sent.
 - **What the seller may have spent.** Every request may be charged from the moment it leaves until
   its answer's last receipt is read, and at most its call's limit. A receipt's spend is taken only
   inside the spend at the last quiet point (nothing open, nothing unclosed), plus what the wallet

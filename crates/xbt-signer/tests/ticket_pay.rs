@@ -4930,6 +4930,93 @@ fn an_older_receipt_read_after_a_newer_one_is_passed_over() {
     r.assert_booked();
 }
 
+/// Rounds of `n` pages side by side in one session: how many paid requests went again because
+/// the seller had not taken their seq (`bad_seq`).
+fn resent_in_rounds(r: &Rig, n: usize, rounds: usize) -> usize {
+    let first = r.pay("/page/10", CALL);
+    assert_eq!(first["status"], 200, "{first}");
+    let mut resent = 0;
+    for round in 0..rounds {
+        let before = r.tap.seen("/page/").iter().filter(|s| s.paid).count();
+        std::thread::scope(|sc| {
+            let pages: Vec<_> = (0..n).map(|i| sc.spawn(move || r.pay(&format!("/page/{}", 100 + i), CALL))).collect();
+            for p in pages {
+                let v = p.join().unwrap();
+                assert_eq!((v["status"].as_u64(), v.get("seller_fault")), (Some(200), None), "round {round}: {v}");
+            }
+        });
+        resent += r.tap.seen("/page/").iter().filter(|s| s.paid).count() - before - n;
+    }
+    resent
+}
+
+/// The seller takes each seq once anywhere in its window (`seqWindow`): requests side by side
+/// reach it in another order than they left and are taken all the same, not sent again.
+#[test]
+fn requests_side_by_side_are_taken_in_any_order_within_the_window() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    let resent = resent_in_rounds(&r, 30, 5);
+    assert!(resent <= 3, "{resent} of 150 pages went again for a seq the seller did not take");
+    r.assert_booked();
+}
+
+/// A seller with a narrow window: the wallet keeps no more of its requests on their way than the
+/// window holds, and the seller takes them all.
+#[test]
+fn the_wallet_sends_no_more_at_once_than_the_window_holds() {
+    let _g = env_lock();
+    let r = Rig::new(json!({"caps": {"sessions_per_address": 0, "seq_window": 4}}));
+    let resent = resent_in_rounds(&r, 30, 3);
+    assert!(resent <= 3, "{resent} of 90 pages went again");
+    r.assert_booked();
+}
+
+/// A request whose answer is slow to come (a long poll) has long reached the seller: it does not
+/// hold the window of the seqs after it, however many go by meanwhile.
+#[test]
+fn a_request_slow_to_answer_does_not_hold_the_window() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    let first = r.pay("/page/10", CALL);
+    assert_eq!(first["status"], 200, "{first}");
+    r.tap.set(Box::new(|seen, real| {
+        if seen.paid && seen.path == "/page/77" {
+            let a = real();
+            std::thread::sleep(Duration::from_secs(6));
+            return Some(a);
+        }
+        None
+    }));
+    std::thread::scope(|sc| {
+        let slow = sc.spawn(|| r.pay("/page/77", CALL));
+        wait_for("the slow request to be sent", || r.tap.seen("/page/77").iter().any(|s| s.paid));
+        let t = Instant::now();
+        // more requests than the window holds, one after another, while the slow one waits for its head
+        for i in 0..80 {
+            let v = r.pay(&format!("/page/{}", 200 + i), CALL);
+            assert_eq!((v["status"].as_u64(), v.get("seller_fault")), (Some(200), None), "page {i}: {v}");
+        }
+        assert!(t.elapsed() < Duration::from_secs(4), "the pages waited for the slow one: {:?}", t.elapsed());
+        let v = slow.join().unwrap();
+        assert_eq!((v["status"].as_u64(), v.get("seller_fault")), (Some(200), None), "{v}");
+    });
+    r.tap.clear();
+    r.assert_booked();
+}
+
+/// A seller that takes only the next seq and says nothing of a window (a gateway from before it):
+/// the wallet sends one request at a time, each once the one before has its head, and none goes
+/// again.
+#[test]
+fn a_seller_without_a_window_gets_one_request_at_a_time() {
+    let _g = env_lock();
+    let r = Rig::new(json!({"caps": {"sessions_per_address": 0, "seq_window": 1}}));
+    let resent = resent_in_rounds(&r, 30, 3);
+    assert_eq!(resent, 0, "a request sent before the one ahead of it was taken");
+    r.assert_booked();
+}
+
 /// A page's head read while a ticket released for a film is still on its way to the seller carries
 /// the seller's totals from before it: the secret has left the wallet and the seller has not taken
 /// it yet. That is no seller fault, and every answer goes on.
