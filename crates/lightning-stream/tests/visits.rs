@@ -148,11 +148,17 @@ fn a_pages_headers_and_body_reach_the_signer_and_the_sellers_headers_come_back()
     assert!(names.contains(&"cookie".into()) && names.contains(&"authorization".into()) && !names.contains(&"x-not-passed".into()), "{names:?}");
     let h = head.to_ascii_lowercase();
     assert!(h.contains("set-cookie: jf=1") && h.contains("x-seller: yes") && !h.contains("x-ls-refusal"), "{head}");
-    // a live connection is not carried, and nothing is paid for it
-    let before = session.lock().unwrap().calls.len();
-    let (st, head, _) = ask(&addr, "GET", &format!("/v/{visit}/socket"), "Upgrade: websocket\r\nConnection: Upgrade\r\n", b"");
-    assert_eq!(st, 501, "{head}");
-    assert_eq!(session.lock().unwrap().calls.len(), before);
+    // a live connection is asked of the signer as one (`upgrade`), with the WebSocket's own headers and
+    // a share of what is left of the limit; one the seller does not open is refused, and costs nothing
+    let spent = |addr: &str| serde_json::from_slice::<Value>(&ask(addr, "GET", &format!("/visits/{visit}"), "", b"").2).unwrap()["spent_sats"].clone();
+    let before = spent(&addr);
+    let (st, head, _) = ask(&addr, "GET", &format!("/v/{visit}/socket"), "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: k1\r\n\
+                                                                       Sec-WebSocket-Version: 13\r\n", b"");
+    assert_eq!(st, 502, "{head}");
+    let last = session.lock().unwrap().calls.last().cloned().unwrap();
+    assert_eq!((last["upgrade"].as_bool(), last["max_sats"].as_i64().is_some_and(|m| (1..=1_000).contains(&m))), (Some(true), true), "{last}");
+    assert!(last["headers"].as_array().unwrap().iter().any(|h| h[0].as_str().unwrap().eq_ignore_ascii_case("sec-websocket-key")), "{last}");
+    assert_eq!(spent(&addr), before, "the share held for it is given back");
 }
 
 #[test]

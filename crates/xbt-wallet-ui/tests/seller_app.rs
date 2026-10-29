@@ -93,6 +93,24 @@ impl xbt_svc::http::Handler for Seller {
     fn reply(&self, req: Request) -> Reply {
         let path = req.path().to_string();
         let ok = |t: &str, b: &str| Reply::Whole(Response::new(200, vec![("Content-Type".into(), t.into())], b.as_bytes().to_vec()));
+        // the media server's live connection: an echo, as a WebSocket
+        if path == "/jf/socket" && req.header("Upgrade").is_some_and(|u| u.eq_ignore_ascii_case("websocket")) {
+            let key = req.header("Sec-WebSocket-Key").unwrap_or("").to_string();
+            return Reply::Upgrade(xbt_svc::http::Upgraded {
+                headers: vec![("Upgrade".into(), "websocket".into()), ("Sec-WebSocket-Accept".into(), format!("accept-{key}"))],
+                run: Box::new(|mut s, early| {
+                    if !early.is_empty() && s.write_all(&early).is_err() {
+                        return;
+                    }
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = s.read(&mut buf) {
+                        if n == 0 || s.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                }),
+            });
+        }
         match (req.method.as_str(), path.as_str()) {
             // as llama.cpp's server: the page only compressed
             ("GET", "/app/") => {
@@ -161,6 +179,44 @@ fn signer(dir: &Path) -> (PathBuf, Arc<Mutex<Vec<String>>>) {
                 let p = &req["params"];
                 let url = p["url"].as_str().unwrap().to_string();
                 urls.lock().unwrap().push(url.clone());
+                if p["upgrade"] == true {
+                    // a WebSocket, asked of the seller as one, joined to the stream socket both ways
+                    let rest = url.strip_prefix("http://").unwrap();
+                    let (host, path) = rest.split_once('/').map(|(h, p)| (h, format!("/{p}"))).unwrap();
+                    let mut up = std::net::TcpStream::connect(host).unwrap();
+                    let mut head = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n");
+                    for h in p["headers"].as_array().into_iter().flatten() {
+                        head.push_str(&format!("{}: {}\r\n", h[0].as_str().unwrap(), h[1].as_str().unwrap()));
+                    }
+                    up.write_all(format!("{head}\r\n").as_bytes()).unwrap();
+                    let mut rd = BufReader::new(up.try_clone().unwrap());
+                    let mut status_line = String::new();
+                    rd.read_line(&mut status_line).unwrap();
+                    let mut headers = vec![];
+                    loop {
+                        let mut l = String::new();
+                        rd.read_line(&mut l).unwrap();
+                        if l.trim().is_empty() {
+                            break;
+                        }
+                        if let Some((k, v)) = l.split_once(':') {
+                            headers.push(json!([k.trim(), v.trim()]));
+                        }
+                    }
+                    let status: u64 = status_line.split(' ').nth(1).unwrap().parse().unwrap();
+                    let out = UnixStream::connect(streams.join(p["stream_to"].as_str().unwrap())).unwrap();
+                    let _ = writeln!(&out, "{}", json!({"status": status, "headers": headers}));
+                    let (mut o1, mut o2, mut u1) = (out.try_clone().unwrap(), out, up);
+                    let t = std::thread::spawn(move || {
+                        let _ = std::io::copy(&mut o1, &mut u1);
+                        let _ = u1.shutdown(std::net::Shutdown::Both);
+                    });
+                    let _ = std::io::copy(&mut rd, &mut o2);
+                    let _ = o2.shutdown(std::net::Shutdown::Both);
+                    let _ = t.join();
+                    let _ = writeln!(conn, "{}", json!({"id": 1, "result": {"verdict": "allow", "status": status, "charged_sats": 0, "complete": true}}));
+                    return;
+                }
                 let agent = ureq::AgentBuilder::new().redirects(0).build();
                 let mut r = agent.request(p["method"].as_str().unwrap_or("GET"), &url);
                 for h in p["headers"].as_array().into_iter().flatten() {
@@ -373,6 +429,28 @@ fn an_app_port_serves_only_the_visit_whose_cookie_it_gave() {
     let jar = format!("{both}; {}", sc.split(';').next().unwrap());
     let r = agent.get(&format!("http://127.0.0.1:{port}/Items")).set("Cookie", &jar).set("X-Emby-Authorization", "MediaBrowser Token=\"tok-123\"").call();
     assert_eq!(r.map(|x| x.status()).unwrap_or_else(|e| match e { ureq::Error::Status(c, _) => c, _ => 0 }), 200, "the seller got its cookie back, and its login header");
+    // the page's live connection: a WebSocket through the port, the visit and the wallet, both ways
+    {
+        let mut ws = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        ws.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        write!(ws, "GET /socket HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nCookie: {both}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+                    Sec-WebSocket-Key: k9\r\nSec-WebSocket-Version: 13\r\n\r\n").unwrap();
+        let mut rd = BufReader::new(ws.try_clone().unwrap());
+        let mut head = String::new();
+        loop {
+            let mut l = String::new();
+            rd.read_line(&mut l).unwrap();
+            head.push_str(&l);
+            if l == "\r\n" {
+                break;
+            }
+        }
+        assert!(head.starts_with("HTTP/1.1 101") && head.contains("accept-k9"), "{head}");
+        ws.write_all(b"hello over the socket").unwrap();
+        let mut back = [0u8; 21];
+        rd.read_exact(&mut back).unwrap();
+        assert_eq!(&back, b"hello over the socket");
+    }
     assert!(paid_urls.lock().unwrap().iter().all(|u| u.starts_with(&base)), "only the page's own base was asked for");
     // Stop: the next request pays nothing, and says so
     let calls = paid_urls.lock().unwrap().len();

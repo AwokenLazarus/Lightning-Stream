@@ -352,7 +352,7 @@ impl xbt_svc::http::Handler for AppOrigin {
     fn handle(&self, rq: xbt_svc::http::Request) -> xbt_svc::http::Response {
         match self.reply(rq) {
             xbt_svc::http::Reply::Whole(r) => r,
-            xbt_svc::http::Reply::Stream(_) => xbt_svc::http::Response::text(500, "text/plain", "streamed"),
+            xbt_svc::http::Reply::Stream(_) | xbt_svc::http::Reply::Upgrade(_) => xbt_svc::http::Response::text(500, "text/plain", "streamed"),
         }
     }
 
@@ -367,10 +367,10 @@ impl xbt_svc::http::Handler for AppOrigin {
         let Some(g) = self.grant_of(&rq) else {
             return text(403, "Open this app from Lightning Stream: Browse, then Open the app.");
         };
-        if rq.header("upgrade").is_some() {
-            return text(501, "This app asked for a live connection (WebSocket), which Lightning Stream cannot carry yet.");
-        }
         let prefix = cookie_prefix(self.port, &g.tag);
+        if rq.header("upgrade").is_some_and(|u| u.eq_ignore_ascii_case("websocket")) {
+            return self.socket(&rq, &g, &prefix);
+        }
         let target = rq.target.trim_start_matches('/');
         // the owner's free preview: the service on the box itself; a visit: through the connector, paid
         let url = match &g.direct {
@@ -426,7 +426,10 @@ impl xbt_svc::http::Handler for AppOrigin {
         if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("referrer-policy")) {
             headers.push(("Referrer-Policy".into(), "no-referrer".into()));
         }
-        let length = resp.header("content-length").and_then(|n| n.parse::<u64>().ok());
+        // a page's own absolute links to the seller (its base) stay on this port: rewritten in text answers as they stream
+        let mut rewrite = (rewritable(resp.header("content-type").unwrap_or("")) && resp.header("content-range").is_none())
+            .then(|| Rewriter::new(&[g.base.as_str()].into_iter().chain(g.direct.as_deref()).collect::<Vec<_>>()));
+        let length = resp.header("content-length").and_then(|n| n.parse::<u64>().ok()).filter(|_| rewrite.is_none());
         let mut src = resp.into_reader();
         xbt_svc::http::Reply::Stream(xbt_svc::http::Streamed {
             status,
@@ -437,12 +440,164 @@ impl xbt_svc::http::Handler for AppOrigin {
                 loop {
                     let n = std::io::Read::read(&mut src, &mut buf)?;
                     if n == 0 {
+                        if let Some(r) = rewrite.as_mut() {
+                            out.send(&r.finish())?;
+                        }
                         return Ok(());
                     }
-                    out.send(&buf[..n])?;
+                    match rewrite.as_mut() {
+                        Some(r) => out.send(&r.feed(&buf[..n]))?,
+                        None => out.send(&buf[..n])?,
+                    }
                 }
             }),
         })
+    }
+}
+
+impl AppOrigin {
+    /// A page's WebSocket: asked of the connector as part of the visit (or of the service itself,
+    /// for the owner's preview), and joined to the browser's connection when it opens.
+    fn socket(&self, rq: &xbt_svc::http::Request, g: &Grant, prefix: &str) -> xbt_svc::http::Reply {
+        use std::io::{Read as _, Write as _};
+        let target = rq.target.trim_start_matches('/');
+        let url = match &g.direct {
+            Some(d) => format!("{d}{target}"),
+            None => format!("{}/v/{}/{target}", self.app.cfg.connector.trim_end_matches('/'), g.visit),
+        };
+        let Some(rest) = url.strip_prefix("http://") else { return text(502, "The app's live connection could not be reached.") };
+        let (host, path) = rest.split_once('/').map_or((rest, "".to_string()), |(h, p)| (h, format!("/{p}")));
+        let Ok(mut up) = std::net::TcpStream::connect(host) else { return text(502, "The app's live connection could not be reached.") };
+        let _ = up.set_read_timeout(Some(Duration::from_secs(60)));
+        let mut head = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n");
+        for (k, v) in &rq.headers {
+            let l = k.to_ascii_lowercase();
+            if (PASSED.contains(&l.as_str()) || l.starts_with("sec-websocket-")) && !k.bytes().chain(v.bytes()).any(|c| matches!(c, b'\r' | b'\n' | 0)) {
+                head.push_str(&format!("{k}: {v}\r\n"));
+            }
+        }
+        let cookies = own_cookies(rq.header("cookie").unwrap_or(""), prefix);
+        if !cookies.is_empty() {
+            head.push_str(&format!("Cookie: {cookies}\r\n"));
+        }
+        head.push_str("\r\n");
+        if up.write_all(head.as_bytes()).is_err() {
+            return text(502, "The app's live connection could not be reached.");
+        }
+        let mut buf = vec![];
+        let mut tmp = [0u8; 2048];
+        let end = loop {
+            match up.read(&mut tmp) {
+                Ok(0) | Err(_) => return text(502, "The app's live connection ended before it opened."),
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            }
+            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i;
+            }
+            if buf.len() > 32 << 10 {
+                return text(502, "The app's live connection answered with too long a head.");
+            }
+        };
+        let early = buf.split_off(end + 4);
+        let head = String::from_utf8_lossy(&buf[..end]).to_string();
+        let mut lines = head.split("\r\n");
+        let status = lines.next().and_then(|l| l.split(' ').nth(1)).and_then(|c| c.parse::<u16>().ok()).unwrap_or(502);
+        let headers: Vec<(String, String)> = lines.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim().to_string(), v.trim().to_string())).collect();
+        if status != 101 {
+            // the visit's words, when the connector refused (the limit reached, the visit stopped)
+            let words = if headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("x-ls-refusal")) {
+                "The visit's limit is reached, or it was stopped."
+            } else {
+                "The app's live connection did not open."
+            };
+            return text(if status == 402 { 402 } else { 502 }, words);
+        }
+        let _ = up.set_read_timeout(None);
+        let passed: Vec<(String, String)> = headers.into_iter().filter(|(k, _)| k.to_ascii_lowercase().starts_with("sec-websocket-"))
+            .chain(std::iter::once(("Upgrade".to_string(), "websocket".to_string()))).collect();
+        xbt_svc::http::Reply::Upgrade(xbt_svc::http::Upgraded {
+            headers: passed,
+            run: Box::new(move |browser, from_browser| {
+                let (Ok(mut b2), Ok(mut u2)) = (browser.try_clone(), up.try_clone()) else { return };
+                let (mut b1, mut u1) = (browser, up);
+                std::thread::scope(|scope| {
+                    scope.spawn(move || {
+                        if u2.write_all(&from_browser).is_ok() {
+                            let _ = std::io::copy(&mut b1, &mut u2);
+                        }
+                        let _ = u2.shutdown(std::net::Shutdown::Both);
+                        let _ = b1.shutdown(std::net::Shutdown::Both);
+                    });
+                    if b2.write_all(&early).is_ok() {
+                        let _ = std::io::copy(&mut u1, &mut b2);
+                    }
+                    let _ = b2.shutdown(std::net::Shutdown::Both);
+                    let _ = u1.shutdown(std::net::Shutdown::Both);
+                });
+            }),
+        })
+    }
+}
+
+/// A text answer a page's own links are in: HTML, scripts, styles, JSON, SVG and manifests. Video,
+/// images and other bytes pass untouched.
+fn rewritable(content_type: &str) -> bool {
+    let t = content_type.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    t.starts_with("text/") || ["application/javascript", "application/json", "application/manifest+json", "application/xml", "image/svg+xml"].contains(&t.as_str())
+        || t.ends_with("+json") || t.ends_with("+xml")
+}
+
+/// Rewrites a seller's absolute address to `/` in a body as it streams: the app port serves the
+/// seller's base at its own `/`, so a page's absolute link to the seller stays in the visit. The
+/// base as written, without its scheme (`//host/...`) and with its slashes escaped as JSON writes
+/// them. Bytes that may begin an address are held back until the next chunk shows whether they do.
+struct Rewriter {
+    from: Vec<Vec<u8>>,
+    longest: usize,
+    held: Vec<u8>,
+}
+
+impl Rewriter {
+    fn new(bases: &[&str]) -> Self {
+        let mut from: Vec<Vec<u8>> = vec![];
+        for b in bases.iter().filter(|b| b.ends_with('/') && b.contains("://")) {
+            let bare = &b[b.find("://").map_or(0, |i| i + 1)..];
+            for f in [b.to_string(), bare.to_string(), b.replace('/', "\\/")] {
+                if !from.iter().any(|x| x == f.as_bytes()) {
+                    from.push(f.into_bytes());
+                }
+            }
+        }
+        // the longest first: `https://host/` before `//host/`
+        from.sort_by_key(|f| std::cmp::Reverse(f.len()));
+        let longest = from.iter().map(Vec::len).max().unwrap_or(0);
+        Self { from, longest, held: vec![] }
+    }
+
+    fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
+        let mut data = std::mem::take(&mut self.held);
+        data.extend_from_slice(chunk);
+        let mut out = Vec::with_capacity(data.len());
+        let mut i = 0;
+        while i < data.len() {
+            let rest = &data[i..];
+            if let Some(f) = self.from.iter().find(|f| rest.starts_with(f)) {
+                // the escaped form keeps its escaping
+                out.extend_from_slice(if f.ends_with(b"\\/") { b"\\/" } else { b"/" });
+                i += f.len();
+            } else if rest.len() < self.longest && self.from.iter().any(|f| f.starts_with(rest)) {
+                self.held = rest.to_vec();
+                break;
+            } else {
+                out.push(data[i]);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    fn finish(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.held)
     }
 }
 
@@ -475,6 +630,27 @@ mod tests {
         let h = format!("xbt_ui_session=SECRET; {p}jf=1; lsa8487_ffff0000_x=2; __ls_visit_8486=V; {p}theme=dark");
         assert_eq!(own_cookies(&h, &p), "jf=1; theme=dark");
         assert_eq!(own_cookies("xbt_ui_session=SECRET", &p), "");
+    }
+
+    /// A page's absolute links to the seller's base stay on the app port, however the body is cut
+    /// into chunks; links elsewhere, and the base's look-alikes, are left as they are.
+    #[test]
+    fn a_pages_absolute_links_to_the_seller_stay_in_the_visit() {
+        let page = r#"<a href="https://shop.example/jf/web/x">x</a> <img src="//shop.example/jf/i.png"> {"u":"https:\/\/shop.example\/jf\/api"}
+            <a href="https://shop.example/other/">out</a> <a href="https://shop.example.evil/jf/">no</a> https://shop.example/jf"#;
+        let want = r#"<a href="/web/x">x</a> <img src="/i.png"> {"u":"\/api"}
+            <a href="https://shop.example/other/">out</a> <a href="https://shop.example.evil/jf/">no</a> https://shop.example/jf"#;
+        for cut in [1, 2, 3, 7, 13, 64, 4096] {
+            let mut r = Rewriter::new(&["https://shop.example/jf/"]);
+            let mut got = vec![];
+            for c in page.as_bytes().chunks(cut) {
+                got.extend(r.feed(c));
+            }
+            got.extend(r.finish());
+            assert_eq!(String::from_utf8(got).unwrap(), want, "chunks of {cut}");
+        }
+        assert!(rewritable("text/html; charset=utf-8") && rewritable("application/javascript") && rewritable("application/vnd.api+json"));
+        assert!(!rewritable("video/mp4") && !rewritable("image/png") && !rewritable("application/octet-stream"));
     }
 
     #[test]

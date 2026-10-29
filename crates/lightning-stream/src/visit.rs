@@ -31,6 +31,13 @@ const IDLE: Duration = Duration::from_secs(30 * 60);
 pub const MAX_BODY: usize = 1 << 20;
 /// How long a request waits for the turn to buy.
 const TURN_WAIT: Duration = Duration::from_secs(120);
+/// The most of a visit's limit one WebSocket holds while it is open: counted as spent until it
+/// ends, then only what it cost. A live connection does not hold the turn to buy, which the page's
+/// other requests need.
+const SOCKET_SHARE: i64 = 1_000;
+
+/// The WebSocket's own request headers, passed to the seller beside [`PASSED`].
+const SOCKET_HEADERS: [&str; 4] = ["sec-websocket-key", "sec-websocket-version", "sec-websocket-protocol", "sec-websocket-extensions"];
 
 /// Request headers of a page that go to the seller. The seller's gateway passes on only those its
 /// route names; the signer refuses the wallet's own and the hop-by-hop ones.
@@ -86,6 +93,30 @@ impl Visit {
             }
             s = self.turn.wait_timeout(s, until - now).unwrap_or_else(|p| p.into_inner()).0;
         }
+    }
+
+    /// Hold up to [`SOCKET_SHARE`] of what is left for a WebSocket. `Err`: the visit has ended, or
+    /// nothing is left.
+    fn reserve(&self) -> Result<i64, String> {
+        let mut s = self.lock();
+        if let Some(e) = &s.ended {
+            return Err(e.clone());
+        }
+        let share = (self.limit - s.spent).min(SOCKET_SHARE);
+        if share < 1 {
+            s.ended = Some("This visit's spending limit is reached.".into());
+            return Err(s.ended.clone().unwrap_or_default());
+        }
+        s.spent += share;
+        Ok(share)
+    }
+
+    /// A WebSocket that held `share` has ended, having cost `charged`.
+    fn release(&self, share: i64, charged: i64) {
+        let mut s = self.lock();
+        s.spent = s.spent - share + charged.clamp(0, share);
+        drop(s);
+        self.turn.notify_all();
     }
 
     fn settle(&self, charged: i64, had_turn: bool) {
@@ -175,8 +206,8 @@ impl Connector {
 
     /// One request of a page: credit first, then the turn to buy when the credit is not enough.
     fn visit_call(&self, visit: Arc<Visit>, path: &str, req: &Request) -> Reply {
-        if req.header("Upgrade").is_some() {
-            return Reply::Whole(json_response(501, &json!({"error": "this app cannot open a live connection (WebSocket) to the seller yet"})));
+        if req.header("Upgrade").is_some_and(|u| u.eq_ignore_ascii_case("websocket")) {
+            return self.visit_socket(visit, path, req);
         }
         {
             let mut s = visit.lock();
@@ -268,6 +299,55 @@ impl Connector {
         })
     }
 
+    /// A page's WebSocket: paid for as its bytes pass, both ways, from a share of the visit's limit
+    /// held while it is open ([`SOCKET_SHARE`]).
+    fn visit_socket(&self, visit: Arc<Visit>, path: &str, req: &Request) -> Reply {
+        if req.method != "GET" {
+            return Reply::Whole(json_response(400, &json!({"error": "a WebSocket opens with a GET"})));
+        }
+        {
+            let mut s = visit.lock();
+            s.calls += 1;
+            s.last = Some(Instant::now());
+        }
+        let share = match visit.reserve() {
+            Ok(n) => n,
+            Err(e) => return Reply::Whole(json_response(402, &json!({"error": e, "rule": "visit"}))),
+        };
+        let headers: Vec<Value> = req.headers.iter()
+            .filter(|(k, _)| { let l = k.to_ascii_lowercase(); PASSED.contains(&l.as_str()) || SOCKET_HEADERS.contains(&l.as_str()) })
+            .take(24).map(|(k, v)| json!([k, v])).collect();
+        let params = json!({"url": format!("{}{path}", visit.base), "method": "GET", "max_sats": share, "task": self.cfg.task, "headers": headers,
+                            "head_headers": true, "upgrade": true});
+        let Started { head, first, src, done } = match self.start(params) {
+            Ok(s) => s,
+            Err(v) => {
+                visit.release(share, v.get("charged_sats").and_then(Value::as_i64).unwrap_or(0));
+                return Reply::Whole(refusal(&v));
+            }
+        };
+        let status = head.get("status").and_then(Value::as_u64).unwrap_or(502);
+        if status != 101 {
+            drop(src);
+            let charged = done.recv_timeout(Duration::from_secs(60)).ok().and_then(Result::ok).and_then(|v| v.get("charged_sats").and_then(Value::as_i64)).unwrap_or(0);
+            visit.release(share, charged);
+            return Reply::Whole(json_response(502, &json!({"error": format!("the seller did not open the WebSocket (HTTP {status})")})));
+        }
+        let headers: Vec<(String, String)> = head.get("headers").and_then(Value::as_array).into_iter().flatten()
+            .filter_map(|h| Some((h.get(0)?.as_str()?.to_string(), h.get(1)?.as_str()?.to_string())))
+            .filter(|(k, _)| k.to_ascii_lowercase().starts_with("sec-websocket-"))
+            .chain(std::iter::once(("Upgrade".to_string(), "websocket".to_string())))
+            .collect();
+        Reply::Upgrade(xbt_svc::http::Upgraded {
+            headers,
+            run: Box::new(move |client, early| {
+                join_socket(client, early, src, first);
+                let charged = done.recv_timeout(Duration::from_secs(60)).ok().and_then(Result::ok).and_then(|v| v.get("charged_sats").and_then(Value::as_i64)).unwrap_or(0);
+                visit.release(share, charged);
+            }),
+        })
+    }
+
     /// Ask the signer to pay for one request and stream its answer: the head line and the first
     /// bytes, or `Err` with the signer's answer when it ended before any byte came (a refusal).
     fn start(&self, mut params: Value) -> Result<Started, Value> {
@@ -345,6 +425,28 @@ impl Drop for Settle {
             .and_then(|v| v.get("charged_sats").and_then(Value::as_i64)).unwrap_or(0);
         self.visit.settle(charged, self.turn);
     }
+}
+
+/// A client's upgraded connection joined to the signer's stream socket, both ways, until either
+/// side ends; what each sent before the join goes first.
+fn join_socket(client: std::net::TcpStream, early: Vec<u8>, signer: UnixStream, first: Vec<u8>) {
+    use std::io::Write as _;
+    let (Ok(mut c2), Ok(mut s2)) = (client.try_clone(), signer.try_clone()) else { return };
+    let (mut c1, mut s1) = (client, signer);
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            if s2.write_all(&early).is_ok() {
+                let _ = io::copy(&mut c1, &mut s2);
+            }
+            let _ = s2.shutdown(std::net::Shutdown::Both);
+            let _ = c1.shutdown(std::net::Shutdown::Both);
+        });
+        if c2.write_all(&first).is_ok() {
+            let _ = io::copy(&mut s1, &mut c2);
+        }
+        let _ = c2.shutdown(std::net::Shutdown::Both);
+        let _ = s1.shutdown(std::net::Shutdown::Both);
+    });
 }
 
 /// The connector's own answer, marked so the app port tells it from the seller's.
