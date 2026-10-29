@@ -52,6 +52,8 @@ impl Terms {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Msg {
     Hello { rental: String, listing: String, terms: Terms, miners: u32 },
+    /// The hashtaker, on a new link after the old one dropped: carry on with this rental.
+    Resume { rental: String },
     Welcome { rental: String, terms_hash: String },
     Open { chan: u32, worker: String },
     Up { chan: u32, line: String },
@@ -73,6 +75,7 @@ impl Msg {
             Msg::Hello { rental, listing, terms, miners } => {
                 json!({"t": "hello", "v": VERSION, "rental": rental, "listing": listing, "terms": terms.to_json(), "miners": miners})
             }
+            Msg::Resume { rental } => json!({"t": "resume", "v": VERSION, "rental": rental}),
             Msg::Welcome { rental, terms_hash } => json!({"t": "welcome", "rental": rental, "termsHash": terms_hash}),
             Msg::Open { chan, worker } => json!({"t": "open", "chan": chan, "worker": worker}),
             Msg::Up { chan, line } => json!({"t": "up", "chan": chan, "line": line}),
@@ -103,6 +106,7 @@ impl Msg {
                 terms: Terms::from_json(v.get("terms")?)?,
                 miners: u("miners").and_then(|m| u32::try_from(m).ok()).unwrap_or(0),
             },
+            "resume" if s("v")? == VERSION => Msg::Resume { rental: s("rental")? },
             "welcome" => Msg::Welcome { rental: s("rental")?, terms_hash: s("termsHash")? },
             "open" => Msg::Open { chan: chan()?, worker: s("worker")? },
             "up" => Msg::Up { chan: chan()?, line: s("line")? },
@@ -128,6 +132,7 @@ mod tests {
         let t = Terms { slice_work: 1 << 60, price_msat: 2000, grace_ms: 3000 };
         for m in [
             Msg::Hello { rental: "r".into(), listing: "l".into(), terms: t.clone(), miners: 3 },
+            Msg::Resume { rental: "r".into() },
             Msg::Up { chan: 3, line: "{\"id\":1}".into() },
             Msg::Pay { slice: 2, preimage: "00".into(), receipt: json!({"a": 1}) },
             Msg::Rate { hs: 1.5e12, miners: 2 },

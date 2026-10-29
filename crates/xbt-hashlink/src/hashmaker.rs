@@ -172,6 +172,9 @@ struct Rental {
     /// The hashtaker ended it: billed are the slices both sides counted; payments for them may still
     /// arrive until the deadline.
     closing: Option<(Instant, u64, String)>,
+    /// The link dropped: until this deadline the rental waits for the hashtaker to come back
+    /// ([`Msg::Resume`]), its miners on the fallback meanwhile; past it, the rental ends.
+    suspended: Option<(Instant, String)>,
     stopped: Option<Value>,
     last_heard: Instant,
     last_ping: Instant,
@@ -289,7 +292,7 @@ impl Hub {
     /// Where a unit's miner should hash now: a ready rental, or the fallback (`None`).
     fn target(&self, unit: &str) -> Option<String> {
         let r = self.units.get(unit)?.rental.as_ref()?;
-        self.rentals.get(r).filter(|r| r.ready && r.closing.is_none() && r.stopped.is_none()).map(|r| r.id.clone())
+        self.rentals.get(r).filter(|r| r.ready && r.closing.is_none() && r.suspended.is_none() && r.stopped.is_none()).map(|r| r.id.clone())
     }
 
     fn slot_rental(&self, conn: u64, slot: u64) -> Option<String> {
@@ -306,7 +309,8 @@ impl Hub {
         }
         let mut changed = false;
         let cap = self.rentable.unwrap_or(u32::MAX);
-        let ids: Vec<String> = self.rentals.iter().filter(|(_, r)| r.closing.is_none() && r.stopped.is_none()).map(|(k, _)| k.clone()).collect();
+        let ids: Vec<String> =
+            self.rentals.iter().filter(|(_, r)| r.closing.is_none() && r.suspended.is_none() && r.stopped.is_none()).map(|(k, _)| k.clone()).collect();
         let mut order: Vec<(u64, String)> = ids.into_iter().map(|k| (self.rentals[&k].started_ms, k)).collect();
         order.sort();
         for (_, id) in order {
@@ -369,6 +373,35 @@ impl Hub {
     /// The rental's own reasons to end: no payment, no ticket, a quiet link.
     fn stop_unpaid(&mut self, id: &str, reason: &str) {
         self.finish(id, reason, true);
+    }
+
+    /// The link to the rental's hashtaker dropped: its miners go back to the fallback and its
+    /// channels are let go, so no work goes unbilled to a hashtaker that is not there, and the
+    /// rental waits a grace time for the hashtaker to come back. Its count, locks and payments are
+    /// kept: what was paid stays paid, and a slice is still paid at most once.
+    fn suspend(&mut self, id: &str, why: &str) {
+        let Some(r) = self.rentals.get_mut(id) else { return };
+        let grace = Duration::from_millis(r.terms.grace_ms);
+        r.suspended = Some((Instant::now() + grace, why.to_string()));
+        r.due_since = None;
+        r.lock_missing_since = None;
+        r.note(json!({"ev": "link lost, waiting for the hashtaker", "why": why, "graceMs": r.terms.grace_ms, "atMs": now_ms()}));
+        let chans: Vec<(u32, (u64, u64))> = r.chans.drain().collect();
+        for (chan, _) in &chans {
+            r.meter.close(*chan);
+        }
+        r.chan_unit.clear();
+        let units: Vec<String> = std::mem::take(&mut r.units).into_iter().collect();
+        for (_, (conn, slot)) in chans {
+            drop_slot(self, conn, slot);
+        }
+        for u in units {
+            if let Some(unit) = self.units.get_mut(&u) {
+                if unit.rental.as_deref() == Some(id) {
+                    unit.rental = None;
+                }
+            }
+        }
     }
 }
 
@@ -581,7 +614,21 @@ fn status(g: &Hub) -> Value {
 
 fn serve_hashtaker(s: TcpStream, key: SecretKey, hub: Shared) {
     let Ok(link::Link { tx, mut rx, remote }) = link::answer(s, key) else { return };
-    let (id, want, terms) = match rx.recv() {
+    let (id, want, terms, resumed) = match rx.recv() {
+        Ok(Some(Msg::Resume { rental })) => {
+            // the same hashtaker, back on a new link within the grace time: the rental carries on
+            let g = lock(&hub);
+            let back = g.rentals.get(&rental).filter(|r| r.suspended.is_some() && r.closing.is_none() && r.stopped.is_none() && r.hashtaker == remote);
+            match back {
+                Some(r) => (rental, r.want, r.terms.clone(), true),
+                None => {
+                    drop(g);
+                    let _ = tx.send(&Msg::Close { reason: "no rental of yours waits to be resumed".into(), slices: None });
+                    tx.shutdown();
+                    return;
+                }
+            }
+        }
         Ok(Some(Msg::Hello { rental, terms, miners, .. })) => {
             let g = lock(&hub);
             let why = if !g.open {
@@ -600,7 +647,7 @@ fn serve_hashtaker(s: TcpStream, key: SecretKey, hub: Shared) {
                 tx.shutdown();
                 return;
             }
-            (rental, miners, terms)
+            (rental, miners, terms, false)
         }
         _ => {
             tx.shutdown();
@@ -610,6 +657,21 @@ fn serve_hashtaker(s: TcpStream, key: SecretKey, hub: Shared) {
     if tx.send(&Msg::Welcome { rental: id.clone(), terms_hash: hex::encode(terms.hash()) }).is_err() {
         return;
     }
+    if resumed {
+        let mut g = lock(&hub);
+        let Some(r) = g.rentals.get_mut(&id) else { return };
+        r.tx = tx.clone();
+        r.suspended = None;
+        r.last_heard = Instant::now();
+        r.last_ping = Instant::now();
+        r.due_since = (r.completed() > r.paid).then(Instant::now);
+        // the hashtaker sends its locks again on the new link; the clock for a missing one starts afresh
+        r.lock_missing_since = None;
+        let r = g.rentals.get_mut(&id).unwrap();
+        r.note(json!({"ev": "hashtaker back, rental resumed", "atMs": now_ms()}));
+        eprintln!("hashmaker: rental {id} resumed by hashtaker {}", hex::encode(remote.serialize()));
+        g.allocate();
+    } else {
     eprintln!("hashmaker: rental {id} from hashtaker {} ({} miners asked)", hex::encode(remote.serialize()), if want == 0 { "any".into() } else { want.to_string() });
     {
         let mut g = lock(&hub);
@@ -636,6 +698,7 @@ fn serve_hashtaker(s: TcpStream, key: SecretKey, hub: Shared) {
             lock_missing_since: None,
             ready,
             closing: None,
+            suspended: None,
             stopped: None,
             last_heard: Instant::now(),
             last_ping: Instant::now(),
@@ -647,14 +710,16 @@ fn serve_hashtaker(s: TcpStream, key: SecretKey, hub: Shared) {
         });
         g.allocate();
     }
+    }
     loop {
         let m = match rx.recv() {
             Ok(Some(m)) => m,
             Ok(None) => continue,
             Err(e) => {
                 let mut g = lock(&hub);
-                if g.rentals.get(&id).is_some_and(|r| r.closing.is_none()) {
-                    g.finish(&id, &format!("link lost: {e}"), false);
+                // a link that dropped on its own (not one a resume replaced) puts the rental on hold
+                if g.rentals.get(&id).is_some_and(|r| r.closing.is_none() && r.suspended.is_none() && r.tx.same(&tx)) {
+                    g.suspend(&id, &format!("link lost: {e}"));
                 }
                 return;
             }
@@ -809,6 +874,12 @@ fn ticker(hub: Shared, down: Arc<AtomicBool>, report: Option<PathBuf>) {
             let ids: Vec<String> = g.rentals.keys().cloned().collect();
             for id in ids {
                 let r = g.rentals.get_mut(&id).unwrap();
+                if let Some((deadline, why)) = r.suspended.clone() {
+                    if Instant::now() > deadline {
+                        g.finish(&id, &format!("{why} (the hashtaker did not come back)"), false);
+                    }
+                    continue;
+                }
                 if let Some((deadline, billable, why)) = r.closing.clone() {
                     if r.paid >= billable || Instant::now() > deadline {
                         g.finish(&id, &why, false);
