@@ -1644,12 +1644,13 @@ def jellyfin_api(method: str, path: str, key: str, body: dict[str, Any] | None =
         conn.close()
 
 
-def jellyfin() -> None:
+def jellyfin(link: str = "") -> None:
     """A seller's whole web app, sold by the byte: the real Jellyfin web client in a browser, through the
     wallet app's app port, the connector and the signer, to a gateway that gives each buyer an account of
     their own (docs/SELLER-APPS.md, docs/BUYER-ACCOUNTS.md), paid with tickets on these nodes. Needs a
     Jellyfin (JELLYFIN_URL), its admin API key (JF_ADMIN_KEY_FILE), a library to sell (JF_LIBRARY), a film
-    in it (JF_ITEM), and Chrome; run by name only: `ticket_e2e_regtest.sh jellyfin`."""
+    in it (JF_ITEM), and Chrome; run by name only: `ticket_e2e_regtest.sh jellyfin`. `link`: "direct" or
+    "relay" sells it as a shop with no web address, over its iroh link (jellyfin_link, jellyfin_relay)."""
     need = {k: os.environ.get(k, "") for k in ("JELLYFIN_URL", "JF_ADMIN_KEY_FILE", "JF_LIBRARY", "JF_ITEM")}
     if not all(need.values()):
         raise LabError(f"set {', '.join(k for k, v in need.items() if not v)}")
@@ -1658,6 +1659,10 @@ def jellyfin() -> None:
     stop_sessions()
     gw_port, conn_port, ui_port, app_ports = BASE + 12, BASE + 13, BASE + 14, [BASE + 15, BASE + 16]
     jf_origin = f"http://127.0.0.1:{gw_port}"
+    if link:
+        with open(f"{RUN}/sign.macaroon", "wb") as f:
+            f.write(bytes.fromhex(lab.bake(SELLER, ("uri:/lnrpc.Lightning/SignMessage",))))
+        os.chmod(f"{RUN}/sign.macaroon", 0o600)
     # the wallet: this seller allowed, tied to the seller's node, and a task for what its app spends
     pol = WALLET_PROC.policy()
     pol["allowlist"].append(jf_origin)
@@ -1667,10 +1672,12 @@ def jellyfin() -> None:
         json.dump(pol, f, indent=1)
     restart_signer()
     # the seller: the whole of Jellyfin but its admin, each buyer an account of their own whose progress is kept
-    path = gateway_config("jf", gw_port, jf_origin)
+    path = gateway_config("jf", gw_port, "link" if link else jf_origin)
     with open(path) as f:
         cfg = json.load(f)
     cfg["times"]["upstream_wait_secs"] = 30
+    if link:
+        cfg["link"] = {"relays": ["https://iroh.lazarus-xbt.xyz"] if link == "relay" else [], "private": link == "relay"}
     cfg["routes"] = [{
         "path": "/", "upstream": JF_URL, "price": {"byte_msat": JF_PRICE_MSAT, "per_bytes": PER_BYTES},
         "methods": ["GET", "HEAD", "POST", "DELETE"], "max_body": 1_048_576, "websocket": True, "accept_gzip": True,
@@ -1682,7 +1689,33 @@ def jellyfin() -> None:
                        "/scheduledtasks/", "/library/", "/environment/", "/branding/"]}]
     with open(path, "w") as f:
         json.dump(cfg, f, indent=1)
+    if "jf" in PROCS and PROCS["jf"].poll() is None:
+        PROCS["jf"].terminate()
+        PROCS["jf"].wait(10)
     start_gateway("jf", gw_port)
+    if link:
+        # the shop's name and link come from its transport document, signed by the seller's node
+        doc: dict[str, Any] = {}
+
+        def signed() -> bool:
+            code, _, body = send("GET", "/.well-known/lightning-stream-transport.json", gw_port)
+            if code == 200:
+                doc.update(json.loads(body))
+            return code == 200 and bool(doc.get("transport")) and str(doc.get("seller", "")).startswith("http")
+
+        lab.wait("the Jellyfin shop's transport document", 60, signed, every=0.5)
+        jf_origin = str(doc["seller"])
+        with open(SHOPS_FILE, "w") as f:
+            json.dump({jf_origin: {"receipt_key": doc["receipt_key"], "transport": doc}}, f)
+        pol = WALLET_PROC.policy()
+        pol["allowlist"].append(jf_origin)
+        pol["counterparties"][jf_origin] = {"ln_node": lab.pubkey(SELLER)}
+        pol["tickets"]["tasks"]["app"] = {"budget_sats": 200_000}
+        with open(f"{WALLET}/policy.json", "w") as f:
+            json.dump(pol, f, indent=1)
+        if link == "relay":
+            os.environ["XBT_LINK_PRIVATE"] = "1"
+        restart_signer()
     # the buyer's app: the connector on the signer, the wallet app with two app ports, the seller listed in it
     os.makedirs(f"{RUN}/ui", exist_ok=True)
     with open(f"{RUN}/ui/services.json", "w") as f:
@@ -1690,7 +1723,7 @@ def jellyfin() -> None:
                     "app": f"{jf_origin}/web/", "app_base": f"{jf_origin}/"}], f)
     with open(f"{RUN}/connector.log", "ab") as log:
         PROCS["connector"] = subprocess.Popen([f"{BIN}/lightning-stream"], env=dict(os.environ, LS_LISTEN=f"127.0.0.1:{conn_port}", B2_SIGNER_SOCK=SOCK,
-                                              B2_STREAM_DIR=f"{RUN}/stream", LS_TASK="app", LS_MAX_SATS="30000"), stdout=log, stderr=log)
+                                              B2_STREAM_DIR=f"{RUN}/stream", LS_TASK="app", LS_MAX_SATS="30000", XBT_SHOPS_FILE=SHOPS_FILE), stdout=log, stderr=log)
     password = secrets.token_hex(12)
     with open(f"{RUN}/ui.log", "ab") as log:
         PROCS["ui"] = subprocess.Popen([f"{BIN}/xbt-wallet-ui"], env=dict(os.environ, XBT_UI_BIND=f"127.0.0.1:{ui_port}", XBT_UI_SIGNER_SOCK=SOCK,
@@ -1747,33 +1780,43 @@ def jellyfin() -> None:
     seen = {"after_login": rep.get("after_login"), "home": rep.get("home"), "startup_s": rep.get("startup_s"), "width": max((x.get("w", 0) for x in samples), default=0),
             "dropped": max((x.get("dropped", 0) or 0 for x in samples), default=None), "after_seek": rep.get("after_seek"), "seek_s": rep.get("seek_s"),
             "browser_mib": round(rep.get("bytes", 0) / PER_BYTES), "http_errors": len(rep.get("http_errors") or []), "ws": rep.get("ws"), "seconds": took}
-    measured("jellyfin", seen)
-    check("jellyfin: the whole web client opens through the app port and logs the buyer in, with one tap, as an account of their own",
+    tag = f"jellyfin_{link}" if link else "jellyfin"
+    measured(tag, seen)
+    check(f"{tag}: the whole web client opens through the app port and logs the buyer in, with one tap, as an account of their own",
           bool(rep.get("home")) and "/web/" in str(rep.get("after_login")) and len(users) == 1 and accounts == 1
           and all(not k["admin"] and not k["all_libraries"] and k["libraries"] == [need["JF_LIBRARY"]] for k in kept.values()),
           {**seen, "accounts": accounts, "users": kept})
-    check("jellyfin: the 4K film plays within 5 s, drops no frame, and a seek to 300 s plays again within 5 s",
+    check(f"{tag}: the 4K film plays within 5 s, drops no frame, and a seek to 300 s plays again within 5 s",
           bool(rep.get("started")) and float(rep.get("startup_s") or 99) <= 5 and seen["width"] >= 3840 and seen["dropped"] == 0
           and bool(rep.get("seek_resumed")) and float(rep.get("seek_s") or 99) <= 5, seen)
     paid = {k: after[k] - before[k] for k in ("buyer_node_paid_msat", "seller_node_received_msat", "wallet_book_settled_msat", "tickets")}
     # the browser counts what it decoded; the seller charges what it sent, about as much for a film
     priced = rep.get("bytes", 0) * JF_PRICE_MSAT // PER_BYTES
-    check("jellyfin: what it loaded was paid for on these nodes: the buyer's node paid, the seller's node received and the wallet booked one sum",
+    check(f"{tag}: what it loaded was paid for on these nodes: the buyer's node paid, the seller's node received and the wallet booked one sum",
           paid["tickets"] > 0 and len({paid["buyer_node_paid_msat"], paid["seller_node_received_msat"], paid["wallet_book_settled_msat"]}) == 1
           and paid["buyer_node_paid_msat"] >= priced // 2, {**paid, "priced_by_the_browser_msat": priced})
-    check("jellyfin: the buyer's progress is kept in their own account", any(k["position_s"] > 0 for k in kept.values()), kept)
+    check(f"{tag}: the buyer's progress is kept in their own account", any(k["position_s"] > 0 for k in kept.values()), kept)
+    check(f"{tag}: tickets were bought again while the film played (a refill mid-stream) and it never stalled",
+          paid["tickets"] >= 2 and seen["dropped"] == 0 and bool(rep.get("started")), {"tickets": paid["tickets"], **seen})
+    os.environ.pop("XBT_LINK_PRIVATE", None)
+    PROCS["jf"].terminate()
+    PROCS["jf"].wait(10)
+    for k in ("connector", "ui"):
+        PROCS[k].terminate()
+        PROCS[k].wait(10)
     # the next run starts with no buyer: Jellyfin names its users' ids after their names, so one left would come back
     for u in users:
         jellyfin_api("DELETE", f"/Users/{u['Id']}", key)
 
 
-CHECKS = {"page": page, "latency": latency, "stream": stream, "slots": slots, "liar": liar, "kill": kill, "offers": offers, "link": link, "link_relay": link_relay, "pruned": pruned, "jellyfin": jellyfin}
+CHECKS = {"page": page, "latency": latency, "stream": stream, "slots": slots, "liar": liar, "kill": kill, "offers": offers, "link": link, "link_relay": link_relay, "pruned": pruned, "jellyfin": jellyfin,
+          "jellyfin_link": lambda: jellyfin("direct"), "jellyfin_relay": lambda: jellyfin("relay")}
 
 
 def main() -> int:
     # with the pruned node, the pruned check; else every check that runs on the lab's own node
     # (link_relay goes through our public relay, jellyfin needs a real Jellyfin: run by name only)
-    names = sys.argv[1:] or (["pruned"] if PRUNED else [n for n in CHECKS if n not in ("pruned", "link_relay", "jellyfin")])
+    names = sys.argv[1:] or (["pruned"] if PRUNED else [n for n in CHECKS if n not in ("pruned", "link_relay", "jellyfin", "jellyfin_link", "jellyfin_relay")])
     unknown = [n for n in names if n not in CHECKS]
     if unknown:
         print(f"unknown check {unknown}; the checks are {' '.join(CHECKS)}", file=sys.stderr)

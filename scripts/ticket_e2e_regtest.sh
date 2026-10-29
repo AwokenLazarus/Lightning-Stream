@@ -41,7 +41,8 @@
 #            gives each buyer a Jellyfin account of their own, sold by the byte on these nodes: one
 #            tap logs the buyer in as themselves, a 4K film plays and seeks, every byte is paid,
 #            and the progress is the buyer's. Needs JELLYFIN_URL, JF_ADMIN_KEY_FILE, JF_LIBRARY,
-#            JF_ITEM, node and google-chrome
+#            JF_ITEM, node and google-chrome. jellyfin_link and jellyfin_relay: the same, the shop
+#            reached only over its iroh link, directly or through our relay
 # The names and what each checks: scripts/ticket_e2e/drive.py.
 #
 # Lab: the one scripts/ln_rail_regtest.sh uses (scripts/ln_rail/lab.sh: paulscode/lightning-fork-lab
@@ -109,7 +110,7 @@ R=$(mktemp -d "${TICKET_E2E_SCRATCH:-$ROOT/run}/ticket-e2e-XXXXXX")
 
 nice -n 19 cargo build -q -j4 --release --locked -p xbt-signer --bin xbt-signer -p xbt-wallet-mcp --bin xbt-wallet-mcp -p xbt-gateway --bin xbt-gateway
 # a seller's whole web app (the jellyfin check, run by name only) also needs the wallet app and the connector
-case " $* " in *" jellyfin "*)
+case " $* " in *" jellyfin"*)
   nice -n 19 cargo build -q -j4 --release --locked -p xbt-wallet-ui --bin xbt-wallet-ui -p lightning-stream --bin lightning-stream ;;
 esac
 BIN=${CARGO_TARGET_DIR:-$ROOT/target}/release
