@@ -225,7 +225,7 @@ mod filtered {
     fn filtered_cfg(resolver: Option<SocketAddr>) -> ExitConfig {
         let mut domains = DomainSet::default();
         domains.add_list("blocked.example\n");
-        let filter = Arc::new(ContentFilter { domains, nets: Vec::new(), categories: vec!["adult".into()] });
+        let filter = Arc::new(ContentFilter { domains, nets: Vec::new(), categories: vec!["adult".into()], ..ContentFilter::default() });
         ExitConfig { policy: test_policy(), kind: ExitKind::Filtered { filter, resolver }, ..ExitConfig::default() }
     }
 

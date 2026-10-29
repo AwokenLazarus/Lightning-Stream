@@ -19,6 +19,7 @@
 
 use std::collections::HashSet;
 use std::net::IpAddr;
+use std::sync::{Arc, RwLock};
 
 use crate::filter::Net;
 
@@ -89,6 +90,30 @@ impl DomainSet {
     }
 }
 
+/// Category lists an exit keeps up to date while it runs ([`crate::lists`]): replaced whole on each
+/// update, read by every flow.
+#[derive(Clone, Debug, Default)]
+pub struct LiveLists(Arc<RwLock<DomainSet>>);
+
+impl LiveLists {
+    /// Replaces the lists with a freshly loaded set.
+    pub fn replace(&self, d: DomainSet) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = d;
+    }
+
+    pub fn matches(&self, name: &str) -> bool {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).matches(name)
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// Well-known DNS-over-HTTPS services: refused while filtering is on.
 pub const DOH_HOSTS: &[&str] = &[
     "dns.google",
@@ -125,6 +150,8 @@ pub struct ContentFilter {
     pub nets: Vec<Net>,
     /// The categories this exit blocks, announced in its listing ("adult", "gambling", "malware"…).
     pub categories: Vec<String>,
+    /// The category lists' names, kept up to date while the exit runs.
+    pub lists: LiveLists,
 }
 
 /// Why the filter refused a flow. It carries no name or address, so nothing can log one.
@@ -143,7 +170,7 @@ pub enum Blocked {
 impl ContentFilter {
     /// Whether the filter does anything. An exit without one carries everything its policy allows.
     pub fn is_active(&self) -> bool {
-        !self.domains.is_empty() || !self.nets.is_empty()
+        !self.domains.is_empty() || !self.nets.is_empty() || !self.categories.is_empty()
     }
 
     /// Whether a site name is blocked, including the encrypted-DNS services.
@@ -155,7 +182,7 @@ impl ContentFilter {
         if DOH_HOSTS.iter().any(|h| n == *h || n.ends_with(&format!(".{h}"))) {
             return Some(Blocked::EncryptedDns);
         }
-        self.domains.matches(&n).then_some(Blocked::Site)
+        (self.domains.matches(&n) || self.lists.matches(&n)).then_some(Blocked::Site)
     }
 
     /// Whether a flow to `to` is refused before anything is read from it.
@@ -320,7 +347,7 @@ pub(crate) mod tests {
     fn filter() -> ContentFilter {
         let mut d = DomainSet::default();
         d.add_list("# a hosts file\n0.0.0.0 blocked.example\n127.0.0.1 localhost\n||ads.example^\nplain.example\n");
-        ContentFilter { domains: d, nets: Vec::new(), categories: vec!["adult".into()] }
+        ContentFilter { domains: d, nets: Vec::new(), categories: vec!["adult".into()], ..ContentFilter::default() }
     }
 
     #[test]

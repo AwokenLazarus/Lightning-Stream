@@ -17,6 +17,7 @@
 //! - [`content`]: sites an exit's operator chooses not to carry (by DNS, TLS name, HTTP Host), with no log.
 //! - [`hop`]: two hops: a first hop run by someone else joins a buyer's sealed flows to an exit.
 //! - [`sealed`]: the TLS session between a buyer and an exit that a first hop cannot read.
+//! - [`lists`]: category blocklists (adult, gambling, malware…) an operator ticks, kept up to date.
 //! - [`meter`]: bytes carried each way, for payment. It never records where a packet was going.
 
 pub mod buyer;
@@ -25,6 +26,7 @@ pub mod exit;
 pub mod filter;
 pub mod flow;
 pub mod hop;
+pub mod lists;
 pub mod meter;
 pub mod region;
 pub mod router;

@@ -5855,6 +5855,7 @@ dependencies = [
  "smoltcp",
  "tokio",
  "tokio-rustls",
+ "ureq",
  "webpki-roots 1.0.9",
  "xbt-iroh-link",
 ]

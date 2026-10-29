@@ -6,6 +6,11 @@
 //!     networks). Prints one JSON line: its key and where it can be reached. Then, every 10 s, the
 //!     bytes carried (sizes only).
 //!     It also takes buyers' flows sealed through a first hop (two hops).
+//!     With `--categories adult,gambling,…` it is a filtered exit: those category lists (saved in
+//!     `--lists DIR`, default ./vpn-lists) are blocked and kept up to date.
+//! xbt-vpn lists [--categories adult,…] [--lists DIR]
+//!     Fetches the category lists now and prints, per list, the names it holds, the time to load and
+//!     the memory used.
 //! xbt-vpn hop   [--relay URL]
 //!     Runs a first hop: it joins a buyer's sealed flows to the exit each names, reading neither the
 //!     destination nor the bytes. Prints its key and where it can be reached, then bytes carried.
@@ -23,7 +28,9 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use xbt_iroh_link::{Hints, Link, LinkConnection, Options, Relays, ALPN_VPN, ALPN_VPN_HOP, ALPN_VPN_SEALED, DEFAULT_RELAY};
-use xbt_vpn::exit::{serve_buyer, ExitConfig};
+use xbt_vpn::content::ContentFilter;
+use xbt_vpn::exit::{serve_buyer, ExitConfig, ExitKind};
+use xbt_vpn::lists;
 use xbt_vpn::flow::{open_tcp, open_tcp_on, Opened};
 use xbt_vpn::hop::{open_sealed, serve_hop, serve_sealed, HopConfig, SealedBuyers};
 use xbt_vpn::meter::Meter;
@@ -50,6 +57,7 @@ fn main() -> std::io::Result<()> {
     match args.get(1).map(String::as_str) {
         Some("exit") => exit(&args, relay),
         Some("hop") => hop(relay),
+        Some("lists") => lists(&args),
         Some("fetch") => fetch(&args, relay, private),
         _ => {
             eprintln!("usage: xbt-vpn exit [--relay URL] [--speed-limit B/s] | xbt-vpn hop [--relay URL] | xbt-vpn fetch --exit KEY --hints JSON --url URL [--flows N] [--secs S] [--private] [--hop KEY --hop-hints JSON]");
@@ -61,7 +69,14 @@ fn main() -> std::io::Result<()> {
 fn exit(args: &[String], relay: String) -> std::io::Result<()> {
     let key = secret();
     let link = Link::start_alpns(key, Options { relays: Relays::Ours(vec![relay]), serving: true, private: false, lookup: None }, ALPN_VPN, &[ALPN_VPN, ALPN_VPN_SEALED])?;
-    let cfg = Arc::new(ExitConfig { buyer_bytes_per_sec: arg(args, "--speed-limit").and_then(|s| s.parse().ok()), ..ExitConfig::default() });
+    let mut cfg = ExitConfig { buyer_bytes_per_sec: arg(args, "--speed-limit").and_then(|s| s.parse().ok()), ..ExitConfig::default() };
+    let cats = categories(args);
+    if !cats.is_empty() {
+        let filter = ContentFilter { categories: cats.clone(), ..ContentFilter::default() };
+        lists::keep_updated(cats, lists_dir(args), filter.lists.clone(), lists::UPDATE_EVERY, lists::catalogue_url);
+        cfg.kind = ExitKind::Filtered { filter: Arc::new(filter), resolver: None };
+    }
+    let cfg = Arc::new(cfg);
     let meter = Arc::new(Meter::default());
     let (m, tls, buyers) = (meter.clone(), sealed::exit_config(&key), Arc::new(SealedBuyers::default()));
     link.accept_with(move |conn| {
@@ -81,6 +96,38 @@ fn exit(args: &[String], relay: String) -> std::io::Result<()> {
         let c = meter.counts();
         eprintln!("carried up {} B, down {} B, refused {}", c.up_bytes, c.down_bytes, c.dropped);
     }
+}
+
+fn categories(args: &[String]) -> Vec<String> {
+    arg(args, "--categories").map(|c| c.split(',').map(str::trim).filter(|c| lists::category(c).is_some()).map(String::from).collect()).unwrap_or_default()
+}
+
+fn lists_dir(args: &[String]) -> std::path::PathBuf {
+    arg(args, "--lists").unwrap_or_else(|| "vpn-lists".into()).into()
+}
+
+fn rss_kib() -> u64 {
+    std::fs::read_to_string("/proc/self/status").ok().and_then(|s| s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| l.split_whitespace().nth(1)?.parse().ok())).unwrap_or(0)
+}
+
+fn lists(args: &[String]) -> std::io::Result<()> {
+    let dir = lists_dir(args);
+    let mut ids = categories(args);
+    if ids.is_empty() {
+        ids = lists::CATEGORIES.iter().map(|c| c.id.to_string()).collect();
+    }
+    for id in &ids {
+        let url = lists::catalogue_url(id).expect("a known category");
+        let t = Instant::now();
+        let fetched = lists::fetch(id, &url, &dir);
+        let fetch_ms = t.elapsed().as_millis();
+        let before = rss_kib();
+        let t = Instant::now();
+        let d = lists::load(std::slice::from_ref(id), &dir);
+        println!("{}", serde_json::json!({ "category": id, "fetched": format!("{fetched:?}"), "fetch_ms": fetch_ms, "names": d.len(), "load_ms": t.elapsed().as_millis(), "rss_added_mib": (rss_kib().saturating_sub(before)) / 1024 }));
+        drop(d);
+    }
+    Ok(())
 }
 
 fn hop(relay: String) -> std::io::Result<()> {
