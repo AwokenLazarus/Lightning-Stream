@@ -20,6 +20,8 @@ serde_json.workspace = true
 base64.workspace = true
 # the node's REST interface and the upstream service: blocking, no async runtime
 ureq.workspace = true
+# the passwords of buyers' accounts in a seller's web app (docs/BUYER-ACCOUNTS.md); already in the tree through xbt402
+getrandom = "0.2"
 # TLS to the node, pinned to its own certificate (as the wallet's Lightning rail pins it)
 secp256k1.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

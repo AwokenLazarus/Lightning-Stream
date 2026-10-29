@@ -398,6 +398,7 @@ mod tests {
             deny_paths: vec![],
             allow_paths: vec![],
             websocket: false,
+            accounts: None,
         };
         let h = |v: &[(&str, &str)]| {
             v.iter()

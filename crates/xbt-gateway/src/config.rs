@@ -96,6 +96,18 @@ pub struct Route {
     /// The route carries WebSockets (`websocket`): a `GET` asking to upgrade becomes a two-way byte
     /// stream with the service, every byte of it, either way, paid for as a body's byte is.
     pub websocket: bool,
+    /// Each buyer gets an account of their own in the service (`accounts`, docs/BUYER-ACCOUNTS.md).
+    pub accounts: Option<Accounts>,
+}
+
+/// How buyers' accounts are made in a route's service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Accounts {
+    /// Jellyfin, through its API with the seller's key (a file only the gateway reads): a user per
+    /// buyer, seeing only `libraries`.
+    Jellyfin { admin_key_file: PathBuf, libraries: Vec<String> },
+    /// A program of the seller's, given a buyer's handle, that prints the headers to send as them.
+    Hook { command: PathBuf },
 }
 
 impl Route {
@@ -803,6 +815,7 @@ fn route(v: &Value) -> Result<Route, String> {
             "deny_paths",
             "allow_paths",
             "websocket",
+            "accounts",
         ],
     )?;
     let path = req_str(r, "path")?.to_string();
@@ -970,6 +983,29 @@ fn route(v: &Value) -> Result<Route, String> {
     if websocket && !methods.iter().any(|m| m == "GET") {
         return Err(bad("a route that carries WebSockets takes GET"));
     }
+    let accounts = match r.get("accounts") {
+        None => None,
+        Some(a) => {
+            let a = a.as_object().ok_or_else(|| bad("accounts is an object"))?;
+            let file = |k: &str| a.get(k).and_then(Value::as_str).filter(|p| p.starts_with('/')).map(PathBuf::from)
+                .ok_or_else(|| bad(&format!("accounts.{k} is an absolute path")));
+            match a.get("kind").and_then(Value::as_str) {
+                Some("jellyfin") => {
+                    let libraries: Vec<String> = a.get("libraries").and_then(Value::as_array)
+                        .map(|l| l.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default();
+                    if libraries.is_empty() || libraries.iter().any(|l| l.len() > 64 || !l.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')) {
+                        return Err(bad("accounts.libraries names the ids of the libraries buyers see"));
+                    }
+                    Some(Accounts::Jellyfin { admin_key_file: file("admin_key_file")?, libraries })
+                }
+                Some("hook") => Some(Accounts::Hook { command: file("command")? }),
+                _ => return Err(bad("accounts.kind is jellyfin or hook")),
+            }
+        }
+    };
+    if accounts.is_some() && free {
+        return Err(bad("a route with accounts is a priced one: a buyer is known only by a paid session"));
+    }
     Ok(Route {
         path,
         methods,
@@ -985,6 +1021,7 @@ fn route(v: &Value) -> Result<Route, String> {
         deny_paths,
         allow_paths,
         websocket,
+        accounts,
     })
 }
 

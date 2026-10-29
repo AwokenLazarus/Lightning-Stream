@@ -40,14 +40,25 @@ type Opened = (Vec<(String, String)>, TcpStream, Vec<u8>);
 impl Gateway {
     /// Ask the service to upgrade, with the route's headers and the opening's own. `Err`: the
     /// answer for the buyer (the service said no, or gave none).
-    fn upgrade_upstream(&self, route: &Route, req: &Request) -> Result<Opened, Response> {
+    fn upgrade_upstream(&self, route: &Route, req: &Request, account: Option<&super::accounts::Account>) -> Result<Opened, Response> {
         let base = route.upstream.as_ref().or(self.cfg.upstream.as_ref());
         let up = base.and_then(|b| self.upstreams.get(b)).ok_or_else(|| error(502, "upstream_unavailable", "no service for this route"))?;
         let mut headers = forwarded(route, &req.headers);
         headers.retain(|(k, _)| !route.upstream_headers.iter().any(|(n, _)| k.eq_ignore_ascii_case(n)));
         headers.extend(route.upstream_headers.iter().cloned());
         headers.extend(req.headers.iter().filter(|(k, _)| WEBSOCKET_HEADERS.contains(&k.to_ascii_lowercase().as_str())).cloned());
-        let u = up.upgrade(&route.upstream_target(&req.target), &headers)
+        let mut target = route.upstream_target(&req.target);
+        // a buyer's own account: its token in place of the client's, in the headers and in the URL
+        if let Some(a) = account {
+            match self.as_account(route, a, "GET", &target, &headers) {
+                super::accounts::AsAccount::Send { target: t, headers: h, .. } => {
+                    target = t;
+                    headers = h;
+                }
+                super::accounts::AsAccount::Answer(status, _) => return Err(Response::new(status, vec![], vec![])),
+            }
+        }
+        let u = up.upgrade(&target, &headers)
             .map_err(|_| error(502, "upstream_unavailable", "the service gave no answer to the WebSocket; nothing was charged"))?;
         match u.stream {
             Some(s) => {
@@ -61,7 +72,7 @@ impl Gateway {
 
     /// A free route's WebSocket: joined as it is, nothing counted.
     pub(super) fn free_upgrade(self: &Arc<Self>, req: &Request, route: &Route) -> Reply {
-        let (mut headers, up, up_early) = match self.upgrade_upstream(route, req) {
+        let (mut headers, up, up_early) = match self.upgrade_upstream(route, req, None) {
             Ok(u) => u,
             Err(r) => return Reply::Whole(r),
         };
@@ -77,7 +88,14 @@ impl Gateway {
     /// A priced route's WebSocket, after its request's price was charged (`reserve`, refunded
     /// here if the service does not agree).
     pub(super) fn paid_upgrade(self: &Arc<Self>, a: Authed, route: &Route, req: &Request, reserve: u64) -> Reply {
-        let (mut headers, up, up_early) = match self.upgrade_upstream(route, req) {
+        let account = match self.account_for(route, &a.session) {
+            Ok(acc) => acc,
+            Err(r) => {
+                self.lock().book.refund(&a.session, reserve);
+                return Reply::Whole(self.answered(&a, r, 0));
+            }
+        };
+        let (mut headers, up, up_early) = match self.upgrade_upstream(route, req, account.as_ref()) {
             Ok(u) => u,
             Err(r) => {
                 self.lock().book.refund(&a.session, reserve);

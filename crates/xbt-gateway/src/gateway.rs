@@ -61,6 +61,7 @@ use crate::store::{Store, COMPACT_AT};
 use crate::upstream::{decoded_path, forwarded, returned, Answer, Upstream};
 use crate::Error;
 
+mod accounts;
 mod draws;
 mod offers;
 mod websocket;
@@ -131,6 +132,10 @@ pub struct Gateway {
     /// The node's BOLT 12 offer and what was paid to it, where the runner turned payment by offer
     /// on (`docs/TICKETS.md`, section 15).
     offers: Option<offers::Offers>,
+    /// The buyer each session proved it is (`identify`, docs/BUYER-ACCOUNTS.md): its key, hex.
+    buyers: Mutex<HashMap<String, String>>,
+    /// Buyers' accounts in the services of routes that give them.
+    accounts: accounts::Store,
 }
 
 /// Wall-clock seconds.
@@ -158,6 +163,11 @@ fn same_host(origin: &str, host: &str) -> bool {
     };
     let port = if port.is_empty() { if o.scheme == "https" { "443".to_string() } else { "80".to_string() } } else { port };
     o.host == name && o.port == port
+}
+
+/// A JSON string field, or `""`.
+fn str_of(v: Option<&Value>) -> String {
+    v.and_then(Value::as_str).unwrap_or("").to_string()
 }
 
 fn json_response(status: u16, body: &Value) -> Response {
@@ -338,6 +348,8 @@ impl Gateway {
             settle_max_us: AtomicU64::new(0),
             lottery,
             offers,
+            buyers: Mutex::new(HashMap::new()),
+            accounts: accounts::Store::open(&cfg.state_dir),
             cfg,
         });
         for hash in unfinished {
@@ -826,6 +838,10 @@ impl Gateway {
                     if *settle == SETTLE_ON_USE && self.cfg.caps.held_after_paid {
                         e["extra"]["heldAfterPaid"] = true.into();
                     }
+                    // a route that gives buyers accounts asks to know who the buyer is (docs/BUYER-ACCOUNTS.md)
+                    if r.accounts.is_some() {
+                        e["extra"]["identify"] = true.into();
+                    }
                     // a prepaid ticket can be paid by the node's offer as well as by its invoice
                     if let Some(o) = self.offer_text().filter(|_| *settle == SETTLE_ON_ARRIVAL) {
                         e["extra"][xbt402::offer::EXTRA_OFFER] = o.into();
@@ -1313,6 +1329,8 @@ impl Gateway {
             },
             _ => None,
         };
+        let buyer = str_of(body.get("buyer")).to_ascii_lowercase();
+        let buyer_sig = str_of(body.get("sig")).to_ascii_lowercase();
         let a = match self.authenticate(req, &pay, None) {
             Ok(a) => a,
             Err(r) => return r,
@@ -1327,6 +1345,17 @@ impl Gateway {
                     }
                 }
                 json!({"released": released, "refused": refused})
+            }
+            "identify" => {
+                // the buyer's key for this seller, and its signature over this session (docs/BUYER-ACCOUNTS.md)
+                let msg = ticket::buyer_message(&self.terms.receipt_key, &a.session);
+                let ok = buyer.len() == 66 && hex::decode(&buyer).ok().zip(hex::decode(&buyer_sig).ok())
+                    .is_some_and(|(k, s)| ecdsa::verify(&k, &msg, &s));
+                if !ok {
+                    return self.answered(&a, error(400, "bad_request", "identify: the key's signature over this session does not hold"), 0);
+                }
+                self.buyers.lock().unwrap_or_else(|p| p.into_inner()).insert(a.session.clone(), buyer.clone());
+                json!({"buyer": accounts::handle(&buyer)})
             }
             "cancel" => {
                 let candidates = self.lock().book.cancellable(&a.session, list.as_deref());
@@ -1373,8 +1402,15 @@ impl Gateway {
             .cfg
             .routes
             .iter()
-            .map(|r| json!({"path": r.path, "methods": r.methods, "free": r.free, "price": r.price.terms(), "release": r.release.name(),
-                            "lottery": self.lottery_entry(r, false).is_some()}))
+            .map(|r| {
+                let mut v = json!({"path": r.path, "methods": r.methods, "free": r.free, "price": r.price.terms(), "release": r.release.name(),
+                                   "lottery": self.lottery_entry(r, false).is_some()});
+                // a route that gives each buyer an account (docs/BUYER-ACCOUNTS.md): said here, for a buyer's app to tell its owner
+                if r.accounts.is_some() {
+                    v["accounts"] = true.into();
+                }
+                v
+            })
             .collect();
         let settle: Vec<&str> = [
             (self.cfg.held, SETTLE_ON_USE),
@@ -1589,10 +1625,26 @@ impl Gateway {
             return self.paid_upgrade(a, route, &req, reserve);
         }
         let refund = |msat: u64| self.lock().book.refund(&a.session, msat);
+        // a route that gives accounts: the buyer's request goes as their own account
+        let account = match self.account_for(route, &a.session) {
+            Ok(acc) => acc,
+            Err(r) => {
+                refund(reserve);
+                return Reply::Whole(self.answered(&a, r, 0));
+            }
+        };
         // step 5
-        let sent = match &prepared {
-            Some(p) => self.send_upstream_body(route, &req, &p.body),
-            None => self.send_upstream(route, &req),
+        let sent = match (&account, &prepared) {
+            (Some(acc), _) => match self.send_as_account(route, &req, acc, &a.session) {
+                Ok(Ok(ans)) => Ok(ans),
+                Ok(Err((status, v))) => {
+                    refund(reserve);
+                    return Reply::Whole(self.answered(&a, json_response(status, &v), 0));
+                }
+                Err(e) => Err(e),
+            },
+            (None, Some(p)) => self.send_upstream_body(route, &req, &p.body),
+            (None, None) => self.send_upstream(route, &req),
         };
         let mut answer = match sent {
             // a service behind the gateway does not ask for payment through it
@@ -2082,7 +2134,7 @@ impl Handler for Service {
             let loopback = gw.client_ip(&req).is_some_and(|a| a.is_loopback());
             return Reply::Whole(match (req.method.as_str(), call) {
                 ("POST", "lock") => gw.lock_tickets(&req),
-                ("POST", "release" | "cancel" | "status") => gw.session_call(&req, call),
+                ("POST", "release" | "cancel" | "status" | "identify") => gw.session_call(&req, call),
                 // the operator's view, for the machine the gateway runs on only
                 ("GET", "health") if loopback => gw.health(),
                 _ => error(404, "no_route", "no such session endpoint"),
