@@ -167,10 +167,19 @@ pub struct Streamed {
     pub body: Body,
 }
 
+/// An answer that takes the connection over: `101 Switching Protocols` with these headers (and
+/// `Connection: Upgrade`), then `run` gets the connection and any bytes the client sent after its
+/// request, and carries both directions itself (a WebSocket). The server writes nothing more.
+pub struct Upgraded {
+    pub headers: Vec<(String, String)>,
+    pub run: Box<dyn FnOnce(TcpStream, Vec<u8>) + Send>,
+}
+
 /// What a handler answers with.
 pub enum Reply {
     Whole(Response),
     Stream(Streamed),
+    Upgrade(Upgraded),
 }
 
 /// What a server serves.
@@ -515,7 +524,7 @@ fn accept(
 
 fn connection(mut sock: TcpStream, handler: &dyn Handler, gate: &Gate, limits: &Limits) {
     let peer = sock.peer_addr().ok();
-    let (head, rest) = match read_head(&mut sock, limits) {
+    let (head, mut rest) = match read_head(&mut sock, limits) {
         Ok(h) => h,
         Err(Fail::Large) => return write_error(&mut sock, 431, "header too large"),
         Err(Fail::Timeout) => return write_error(&mut sock, 408, "header timeout"),
@@ -529,6 +538,8 @@ fn connection(mut sock: TcpStream, handler: &dyn Handler, gate: &Gate, limits: &
         Ok(n) => n,
         Err((status, msg)) => return write_error(&mut sock, status, msg),
     };
+    // what a client sends straight after a request with no body: the first bytes of an upgraded connection
+    let early = if n == 0 { std::mem::take(&mut rest) } else { vec![] };
     if n > 0 {
         let expect = req.headers.iter().any(|(k, v)| {
             k.eq_ignore_ascii_case("Expect") && v.eq_ignore_ascii_case("100-continue")
@@ -554,6 +565,18 @@ fn connection(mut sock: TcpStream, handler: &dyn Handler, gate: &Gate, limits: &
         Reply::Whole(r) => write_response(&mut sock, &r, head_only),
         // outside the handler slot: a slow reader of a long body holds this connection only
         Reply::Stream(s) => write_stream(&mut sock, s, head_only, limits.stream_write),
+        Reply::Upgrade(u) => {
+            let mut head = head_of(101, &u.headers);
+            head.push_str("Connection: Upgrade\r\n\r\n");
+            let _ = sock.set_write_timeout(Some(limits.stream_write));
+            if sock.write_all(head.as_bytes()).is_ok() {
+                let _ = sock.set_read_timeout(None);
+                let _ = sock.set_write_timeout(None);
+                let run = u.run;
+                // a panicking connection ends itself; the server goes on
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || run(sock, early)));
+            }
+        }
     }
 }
 
@@ -704,6 +727,7 @@ fn content_length(headers: &[(String, String)], limit: usize) -> Result<usize, R
 fn reason(status: u16) -> &'static str {
     match status {
         100 => "Continue",
+        101 => "Switching Protocols",
         200 => "OK",
         201 => "Created",
         202 => "Accepted",

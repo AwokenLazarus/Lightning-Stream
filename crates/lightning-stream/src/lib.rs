@@ -190,7 +190,7 @@ impl Handler for Connector {
     fn handle(&self, req: Request) -> Response {
         match self.reply(req) {
             Reply::Whole(r) => r,
-            Reply::Stream(_) => json_response(500, &json!({"error": "a streamed answer where a whole one was asked for"})),
+            Reply::Stream(_) | Reply::Upgrade(_) => json_response(500, &json!({"error": "a streamed answer where a whole one was asked for"})),
         }
     }
 
