@@ -2119,6 +2119,7 @@ impl Signer {
             return fail(hs, &spent, self.ticket_fault(hs, &why));
         }
         *lock(&hs.used) = self.engine.now();
+        self.session_touch(&hs.sid);
         let started = Instant::now();
         let mut short = 0;
         let (seq, digest, ans, head) = loop {
@@ -2265,6 +2266,7 @@ impl Signer {
             out[UNTRUSTED_KEY]["last_receipt"] = seller_last;
         }
         *lock(&hs.used) = self.engine.now();
+        self.session_touch(&hs.sid);
         out
     }
 
@@ -2330,9 +2332,16 @@ impl Signer {
             }
             let mut buf = vec![0u8; 64 << 10];
             let mut unpaid: Option<String> = None;
+            // a long answer keeps its session in use: not idle while bytes still arrive
+            let mut touched = Instant::now();
             loop {
                 if lock(&state).1.is_some() {
                     break;
+                }
+                if touched.elapsed() >= Duration::from_secs(crate::ticket_rail::TOUCH_EVERY_S) {
+                    touched = Instant::now();
+                    *lock(&hs.used) = self.engine.now();
+                    self.session_touch(&hs.sid);
                 }
                 let n = match body.read(&mut buf) {
                     Ok(0) => break,

@@ -112,8 +112,44 @@ struct Run {
 }
 
 fn rental(stop_paying_after: Option<u64>, miner_secs: u64, wallet: bool) -> Run {
+    rental_cut(stop_paying_after, miner_secs, wallet, None)
+}
+
+/// A TCP relay between the hashtaker and the hashmaker that can cut every connection through it:
+/// the link drops as it does when a network goes away for a moment.
+fn cuttable(listen: String, to: String) -> Arc<Mutex<Vec<TcpStream>>> {
+    let open: Arc<Mutex<Vec<TcpStream>>> = Arc::default();
+    let l = TcpListener::bind(&listen).unwrap();
+    let o = open.clone();
+    thread::spawn(move || {
+        for c in l.incoming() {
+            let Ok(a) = c else { continue };
+            let Ok(b) = TcpStream::connect(&to) else { continue };
+            {
+                let mut g = o.lock().unwrap();
+                g.push(a.try_clone().unwrap());
+                g.push(b.try_clone().unwrap());
+            }
+            for (mut x, mut y) in [(a.try_clone().unwrap(), b.try_clone().unwrap()), (b, a)] {
+                thread::spawn(move || {
+                    let _ = std::io::copy(&mut x, &mut y);
+                    let _ = y.shutdown(std::net::Shutdown::Both);
+                });
+            }
+        }
+    });
+    open
+}
+
+fn cut(open: &Arc<Mutex<Vec<TcpStream>>>) {
+    for s in open.lock().unwrap().drain(..) {
+        let _ = s.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+fn rental_cut(stop_paying_after: Option<u64>, miner_secs: u64, wallet: bool, cut_after: Option<Duration>) -> Run {
     let _serial = serial();
-    let [pool_a, link_a, miners_a, slices_a] = ports::<4>();
+    let [pool_a, link_a, miners_a, slices_a, relay_a] = ports::<5>();
     let dir = tempdir();
     let pool_report = dir.join("pool.json");
     {
@@ -139,6 +175,17 @@ fn rental(stop_paying_after: Option<u64>, miner_secs: u64, wallet: bool) -> Run 
         thread::spawn(move || hashmaker::run(cfg, Box::<LabSeller>::default()).unwrap())
     };
     wait_for(&link_a);
+    let to_hashmaker = match cut_after {
+        Some(after) => {
+            let open = cuttable(relay_a.clone(), link_a.clone());
+            thread::spawn(move || {
+                thread::sleep(after);
+                cut(&open);
+            });
+            relay_a.clone()
+        }
+        None => link_a.clone(),
+    };
     let calls: Arc<Mutex<Vec<Value>>> = Arc::default();
     let payer = wallet.then(|| SignerPayer {
         sock: fake_wallet(&dir, slices_a.clone(), calls.clone()),
@@ -146,10 +193,11 @@ fn rental(stop_paying_after: Option<u64>, miner_secs: u64, wallet: bool) -> Run 
         task: "hashrate".into(),
         max_sats: 600,
         session: None,
+        wait_for_signer: std::time::Duration::from_secs(5),
     });
     let b = {
         let cfg = hashtaker::Config {
-            hashmaker: link_a.clone(),
+            hashmaker: to_hashmaker,
             hashmaker_key: hpub,
             key: noise::fresh_key(),
             upstream: pool_a.clone(),
@@ -180,7 +228,8 @@ fn rental(stop_paying_after: Option<u64>, miner_secs: u64, wallet: bool) -> Run 
                     max_rate: 8.0,
                     bad_every: 7,
                     duration: Some(Duration::from_secs(miner_secs)),
-                    reconnect: false,
+                    // miners whose rental waits for its hashtaker are let go in the lab (no fallback) and connect again
+                    reconnect: cut_after.is_some(),
                     extranonce_subscribe: false,
                 })
             })
@@ -350,4 +399,24 @@ fn the_hashtaker_finds_the_hashmaker_on_nostr() {
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].0, h);
     assert_eq!(refused, 1);
+}
+
+/// A link that drops for a moment does not end the rental: the hashtaker dials again within the
+/// grace time, the hashmaker takes it back, and the rental carries on to its end. Every slice is
+/// still paid once, and the receipts still agree.
+#[test]
+fn a_rental_survives_a_moment_without_its_link() {
+    let r = rental_cut(None, 12, false, Some(Duration::from_secs(4)));
+    let evs = |v: &Value| v["events"].as_array().cloned().unwrap_or_default();
+    let maker = evs(&r.hashmaker);
+    let taker = evs(&r.hashtaker);
+    assert!(maker.iter().any(|e| e["ev"] == "link lost, waiting for the hashtaker"), "{}", r.hashmaker);
+    assert!(maker.iter().any(|e| e["ev"] == "hashtaker back, rental resumed"), "{}", r.hashmaker);
+    assert!(taker.iter().any(|e| e["ev"] == "rental resumed"), "{}", r.hashtaker);
+    let paid = r.hashmaker["paid"].as_u64().unwrap();
+    assert!(paid >= 3, "only {paid} slices: {}", r.hashmaker);
+    assert_eq!(r.hashtaker["released"].as_u64().unwrap(), paid, "each slice paid once");
+    assert_eq!(r.hashmaker["receiptsDisagree"].as_u64().unwrap(), 0);
+    assert!(!r.hashmaker["stopped"]["reason"].as_str().unwrap_or("").starts_with("link lost"), "{}", r.hashmaker);
+    assert_eq!(r.hashtaker["closed"], "no accepted work", "it ended when the miners stopped, not when the link dropped");
 }
