@@ -480,5 +480,7 @@ fn json_response(status: u16, v: &Value) -> Response {
 fn refusal(v: &Value) -> Response {
     let reason = v.get("reason").or(v.get("error")).and_then(Value::as_str).unwrap_or("the call ended with no answer");
     let rule = v.get("rule").and_then(Value::as_str).unwrap_or("");
+    // the page only sees a status; the owner's log says why (no URL, no header, nothing of the buyer's)
+    eprintln!("lightning-stream: a page's request was refused: {}{reason}", if rule.is_empty() { String::new() } else { format!("{rule}: ") });
     json_response(if rule.is_empty() { 502 } else { 402 }, &json!({"error": reason, "rule": rule}))
 }
