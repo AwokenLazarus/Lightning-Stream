@@ -46,6 +46,9 @@ step(`page: ${await ev("location.href")} title=${await ev("document.title")}`);
 const loginForm = await waitFor("!!document.querySelector('#txtManualName, .manualLoginForm, input[type=password]')", 15000);
 step(`login form shown: ${loginForm}`);
 if (loginForm && TAP) {
+  // the login page lists the users once it has asked the server for them: on a slow link, seconds after the form
+  const listed = await waitFor(`[...document.querySelectorAll('[data-username], .cardBox, button')].some(x=>new RegExp(${JSON.stringify(TAP.source)}).test(x.textContent)||new RegExp(${JSON.stringify(TAP.source)}).test(x.getAttribute('data-username')||''))`, 20000);
+  step(`buyer listed: ${listed}`);
   const tapped = await ev(`(()=>{const c=[...document.querySelectorAll('[data-username], .cardBox, button')].find(x=>new RegExp(${JSON.stringify(TAP.source)}).test(x.textContent)||new RegExp(${JSON.stringify(TAP.source)}).test(x.getAttribute('data-username')||'')); if(c){c.click(); return c.tagName+' '+(c.className||'')} return false})()`);
   step(`tapped guest: ${tapped}`); await sleep(4000);
   const pwShown = await ev("!!document.querySelector('#txtManualPassword') && document.querySelector('.manualLoginForm:not(.hide)')!==null");
@@ -82,6 +85,10 @@ res.seek_resumed = resumed; res.seek_s = +((Date.now() - t2) / 1000).toFixed(1);
 await sleep(10000); await shot("06-after-seek");
 res.after_seek = await ev(`(()=>{const v=document.querySelector('video'); return v?{t:+v.currentTime.toFixed(1), stalls:window.__stalls, waitMs:Math.round(window.__waitT)}:null})()`);
 step(`after seek: ${JSON.stringify(await ev(`(()=>{const v=document.querySelector('video'); return v?{t:+v.currentTime.toFixed(1), stalls:window.__stalls, waitMs:Math.round(window.__waitT)}:null})()`))}`);
+// the film left as a viewer leaves it: the player reports where it stopped, and Jellyfin keeps that position now,
+// not when it gives up on a browser that went away (by then the next run may have started)
+await ev("(()=>{const v=document.querySelector('video'); if(v) v.pause(); history.back(); return true})()"); await sleep(4000);
+step("left the player");
 writeFileSync(join(OUT, "log.json"), JSON.stringify({ startup_s: startup, samples, ...res, ...log }, null, 1));
 console.log(`requests=${log.requests} bytes=${log.bytes} failed=${log.failed.length} http_errors=${log.http_errors.length} console=${log.console.length} ws=${log.ws.length}`);
 chrome.kill("SIGKILL"); process.exit(0);
