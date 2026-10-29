@@ -119,7 +119,13 @@ fn node_keys() -> i32 {
     let mut wait = std::time::Duration::from_secs(5);
     loop {
         tries += 1;
-        match xbt_wallet_ui::node_keys::run_with(&s, given.as_deref()) {
+        let result = xbt_wallet_ui::node_keys::run_with(&s, given.as_deref());
+        if let Ok(o) = &result {
+            for (file, why) in &o.skipped {
+                eprintln!("xbt-wallet-ui node-keys: {file} not made ({why}): selling over a direct link needs it, everything else works without it");
+            }
+        }
+        match result {
             Ok(o) if o.made.is_empty() => {
                 eprintln!("xbt-wallet-ui node-keys: nothing made: the app's keys were already there, or the node has granted none yet (the owner can paste them)");
                 return 0;

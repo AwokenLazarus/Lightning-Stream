@@ -26,6 +26,9 @@ pub const ACK_NEEDED: &str = "One last step: confirm that the app may pay with r
 pub const GW_CONFIG: &str = "config.json";
 pub const GW_INVOICES: &str = "invoices.macaroon";
 pub const GW_INFO: &str = "info.macaroon";
+/// The gateway's key for one call only, lnd's SignMessage: its node vouches for its link key with it
+/// (`docs/DIRECT-LINKS.md`).
+pub const GW_SIGN: &str = "sign.macaroon";
 
 /// The caps the gateway page writes on mainnet unless the owner sets others: a few buyers at a time,
 /// and at most 4 held tickets of 1,000 sat on the node's inbound channels.
