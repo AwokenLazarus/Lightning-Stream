@@ -93,16 +93,26 @@ pub struct Route {
     /// When not empty, the only paths under this route the gateway serves (`allow_paths`), as
     /// prefixes, ignoring case; everything else is refused.
     pub allow_paths: Vec<String>,
+    /// The route carries WebSockets (`websocket`): a `GET` asking to upgrade becomes a two-way byte
+    /// stream with the service, every byte of it, either way, paid for as a body's byte is.
+    pub websocket: bool,
 }
 
 impl Route {
-    /// Whether the gateway refuses `path` (decoded) on this route: under one of `deny_paths`, or
-    /// outside every one of `allow_paths` when there are some. Case is ignored, as many web
-    /// servers ignore it.
+    /// Whether the gateway refuses `path` (decoded) on this route. The longest prefix of the two
+    /// lists that `path` starts with decides: a `deny_paths` entry refuses, an `allow_paths` entry
+    /// serves; one that starts with neither is served when `allow_paths` is empty and refused when
+    /// it is not. So `allow` `/` and `/users/public` with `deny` `/users` serve everything but
+    /// `/users`, and of that only `/users/public`. Case is ignored, as many web servers ignore it.
     pub fn path_refused(&self, path: &str) -> bool {
         let p = path.to_ascii_lowercase();
-        self.deny_paths.iter().any(|d| p.starts_with(d.as_str()))
-            || !self.allow_paths.is_empty() && !self.allow_paths.iter().any(|a| p.starts_with(a.as_str()))
+        let longest = |list: &[String]| list.iter().filter(|x| p.starts_with(x.as_str())).map(String::len).max();
+        match (longest(&self.deny_paths), longest(&self.allow_paths)) {
+            (Some(d), Some(a)) => d > a,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => !self.allow_paths.is_empty(),
+        }
     }
 }
 
@@ -792,6 +802,7 @@ fn route(v: &Value) -> Result<Route, String> {
             "upstream_headers",
             "deny_paths",
             "allow_paths",
+            "websocket",
         ],
     )?;
     let path = req_str(r, "path")?.to_string();
@@ -948,6 +959,17 @@ fn route(v: &Value) -> Result<Route, String> {
     };
     let deny_paths = paths("deny_paths")?;
     let allow_paths = paths("allow_paths")?;
+    let websocket = match r.get("websocket") {
+        None => false,
+        Some(Value::Bool(b)) => *b,
+        _ => return Err(bad("websocket is true or false")),
+    };
+    if websocket && !free && (price.second_msat > 0 || price.tokens.active()) {
+        return Err(bad("a route that carries WebSockets is priced by the request and the byte, or free"));
+    }
+    if websocket && !methods.iter().any(|m| m == "GET") {
+        return Err(bad("a route that carries WebSockets takes GET"));
+    }
     Ok(Route {
         path,
         methods,
@@ -962,6 +984,7 @@ fn route(v: &Value) -> Result<Route, String> {
         upstream_headers,
         deny_paths,
         allow_paths,
+        websocket,
     })
 }
 
@@ -1109,6 +1132,16 @@ mod tests {
         let app = c.route("/app/web/").unwrap();
         assert!(!app.path_refused("/app/web/main.js") && !app.path_refused("/app/videos/1/stream"));
         assert!(app.path_refused("/app/Users") && app.path_refused("/app/"));
+        // the longest prefix decides: all of /one/ but /one/users, and of that only /one/users/public
+        let mut w = base();
+        w["routes"] = json!([{"path": "/one/", "price": {"request_msat": 100}, "allow_paths": ["/one/", "/one/users/public", "/one/users/g1/"],
+                              "deny_paths": ["/one/users"]}]);
+        let c = Config::from_json(&w).unwrap();
+        let one = c.route("/one/x").unwrap();
+        for (p, refused) in [("/one/web/a.js", false), ("/one/Users/Public", false), ("/one/users", true), ("/one/USERS/other/items", true),
+                             ("/one/users/g1/items", false), ("/one/usersx", true), ("/two", true)] {
+            assert_eq!(one.path_refused(p), refused, "{p}");
+        }
         for bad in [json!("Sessions"), json!("/a?b"), json!("/a%2f"), json!(3)] {
             v["routes"][0]["deny_paths"] = json!([bad.clone()]);
             assert!(Config::from_json(&v).is_err(), "{bad}");

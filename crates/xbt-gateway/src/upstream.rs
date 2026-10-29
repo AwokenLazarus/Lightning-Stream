@@ -107,7 +107,20 @@ pub struct Answer {
 pub struct Upstream {
     base: String,
     agent: ureq::Agent,
+    wait: Duration,
 }
+
+/// A service's answer to a request to upgrade: its head, and when it said `101`, the connection,
+/// with the bytes it sent after the head.
+pub struct Upgrade {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub stream: Option<std::net::TcpStream>,
+    pub early: Vec<u8>,
+}
+
+/// The request headers of a WebSocket's opening that go to the service beside a route's own.
+pub const WEBSOCKET_HEADERS: [&str; 4] = ["sec-websocket-key", "sec-websocket-version", "sec-websocket-protocol", "sec-websocket-extensions"];
 
 impl Upstream {
     /// `base` is the config's `upstream`, already checked. `wait`: the longest the service may
@@ -124,7 +137,58 @@ impl Upstream {
         Self {
             base: base.to_string(),
             agent,
+            wait,
         }
+    }
+
+    /// Ask the service to upgrade `target` to a WebSocket, over plain HTTP (a service the gateway
+    /// reaches by `https` is refused here). `headers` are the route's; the opening's own are added
+    /// by the caller. `Err`: the service gave no answer.
+    pub fn upgrade(&self, target: &str, headers: &[(String, String)]) -> Result<Upgrade, Error> {
+        use std::io::Write as _;
+        let rest = self.base.strip_prefix("http://").ok_or_else(|| Error::Upstream("a WebSocket goes to a service reached by http".into()))?;
+        let (host, prefix) = rest.split_once('/').map_or((rest, ""), |(h, p)| (h, p));
+        let path = format!("/{}{target}", prefix.trim_end_matches('/')).replacen("//", "/", 1);
+        let addr = std::net::ToSocketAddrs::to_socket_addrs(&(if host.contains(':') { host.to_string() } else { format!("{host}:80") }))
+            .map_err(|e| Error::Upstream(e.to_string()))?
+            .next()
+            .ok_or_else(|| Error::Upstream("the service's address resolves to nothing".into()))?;
+        let mut s = std::net::TcpStream::connect_timeout(&addr, self.wait.min(Duration::from_secs(5))).map_err(|e| Error::Upstream(e.to_string()))?;
+        let _ = s.set_read_timeout(Some(self.wait));
+        let _ = s.set_write_timeout(Some(self.wait));
+        let mut head = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nVia: {VIA}\r\n");
+        for (k, v) in headers {
+            if !k.bytes().chain(v.bytes()).any(|c| matches!(c, b'\r' | b'\n' | 0)) {
+                head.push_str(&format!("{k}: {v}\r\n"));
+            }
+        }
+        head.push_str("\r\n");
+        s.write_all(head.as_bytes()).map_err(|e| Error::Upstream(e.to_string()))?;
+        // its head, at most 16 KiB
+        let mut buf = vec![];
+        let mut tmp = [0u8; 2048];
+        let end = loop {
+            let n = std::io::Read::read(&mut s, &mut tmp).map_err(|e| Error::Upstream(e.to_string()))?;
+            if n == 0 {
+                return Err(Error::Upstream("the service closed before its answer".into()));
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i;
+            }
+            if buf.len() > 16 << 10 {
+                return Err(Error::Upstream("the service's answer head is too long".into()));
+            }
+        };
+        let early = buf.split_off(end + 4);
+        let text = String::from_utf8_lossy(&buf[..end]).to_string();
+        let mut lines = text.split("\r\n");
+        let status = lines.next().and_then(|l| l.split(' ').nth(1)).and_then(|c| c.parse::<u16>().ok())
+            .ok_or_else(|| Error::Upstream("the service's answer has no status".into()))?;
+        let headers = lines.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim().to_string(), v.trim().to_string())).collect();
+        let _ = s.set_read_timeout(None);
+        let _ = s.set_write_timeout(None);
+        Ok(Upgrade { status, headers, stream: (status == 101).then_some(s), early })
     }
 
     /// Pass one request on. `target` has been through [`decoded_path`]. `Err`: the service gave no
@@ -333,6 +397,7 @@ mod tests {
             upstream_headers: vec![],
             deny_paths: vec![],
             allow_paths: vec![],
+            websocket: false,
         };
         let h = |v: &[(&str, &str)]| {
             v.iter()

@@ -63,6 +63,7 @@ use crate::Error;
 
 mod draws;
 mod offers;
+mod websocket;
 pub use offers::JOURNAL as OFFERS_JOURNAL;
 
 /// A body no larger than this, on a route priced per request only, is read whole so that its
@@ -1492,6 +1493,9 @@ impl Gateway {
             ));
         }
         if route.free {
+            if route.websocket && websocket::asks_upgrade(&req) {
+                return self.free_upgrade(&req, route);
+            }
             return self.free(&req, route);
         }
         if Self::pays_by_lottery(&req) {
@@ -1579,6 +1583,10 @@ impl Gateway {
         };
         if let Err(why) = charged {
             return Reply::Whole(self.refused(&a, &self.req_url(&req), Some(route), why));
+        }
+        // a WebSocket: from here on a two-way stream, every byte paid for (gateway/websocket.rs)
+        if route.websocket && websocket::asks_upgrade(&req) {
+            return self.paid_upgrade(a, route, &req, reserve);
         }
         let refund = |msat: u64| self.lock().book.refund(&a.session, msat);
         // step 5
@@ -2058,7 +2066,7 @@ impl Handler for Service {
     fn handle(&self, req: Request) -> Response {
         match self.reply(req) {
             Reply::Whole(r) => r,
-            Reply::Stream(_) => error(
+            Reply::Stream(_) | Reply::Upgrade(_) => error(
                 500,
                 "internal",
                 "a streamed answer where a whole one was asked",
