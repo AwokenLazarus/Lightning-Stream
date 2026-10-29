@@ -2372,3 +2372,56 @@ fn a_seller_that_charged_past_a_calls_limit_is_said_on_the_wallet_page() {
     assert!(page.contains("https://lab-shop.example charged 68.244 sats for one answer, more than the 50 sats the call allowed"), "{page}");
     assert!(page.contains("A seller charged past the limit"), "{page}");
 }
+
+#[test]
+fn the_ai_page_makes_a_key_shown_once_and_keeps_its_hash_and_writes_pins_for_the_endpoint() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let services = dir.path().join("services.json");
+    std::fs::write(&services, r#"[{"name": "Lab model", "kind": "ai", "seller": "https://ai.invalid", "price_text": "10 sat per 1,000 tokens",
+        "items": [], "address": "https://ai.invalid/ai"}]"#).unwrap();
+    let ai = dir.path().join("ai");
+    let bx = start(json!({}), false, |c| {
+        c.services_file = Some(services.clone());
+        c.ai = xbt_wallet_ui::config::AiSetup { endpoint: Some("http://box.local:33540/v1".into()), sellers: ai.join("sellers.json"),
+                                                credentials: ai.join("credentials.json"), state: ai.join("state.json") };
+    });
+    let mut br = logged_in(&bx);
+    let page = br.get("/ai");
+    assert_eq!(page.status, 200);
+    assert!(page.body.contains("http://box.local:33540/v1") && page.body.contains("Lab model") && page.body.contains("not allowed"), "{}", page.body);
+    // the first visit wrote the sellers file (the seller's listing could not be read, so it is not offered yet)
+    let sellers: Value = serde_json::from_slice(&std::fs::read(ai.join("sellers.json")).unwrap()).unwrap();
+    assert_eq!(sellers["sellers"], json!([]));
+    // a key: shown once, kept as its hash
+    let made = br.act("/ai", "/ai", &[("do", "make"), ("name", "Open WebUI"), ("limit_sats", "500")]);
+    assert_eq!(made.status, 200, "{}", made.body);
+    assert_eq!(made.headers.get("cache-control").map(String::as_str), Some("no-store"));
+    let at = made.body.find("sk-stream-").expect("the key is shown");
+    let key: String = made.body[at..].chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();
+    assert_eq!(key.len(), "sk-stream-".len() + 22);
+    let store = std::fs::read_to_string(ai.join("credentials.json")).unwrap();
+    assert!(!store.contains(&key) && store.contains("Open WebUI"));
+    assert!(!br.get("/ai").body.contains(&key), "never shown again");
+    // the store's own check finds it, as the endpoint's does
+    let s = lightning_stream::credentials::Store::open(&ai.join("credentials.json")).unwrap();
+    let id = s.check(lightning_stream::credentials::Kind::AiKey, &key).unwrap().id.clone();
+    // a pin and a block, for the endpoint
+    br.act("/ai", "/ai", &[("do", "pin"), ("seller", "Lab model")]);
+    let sellers: Value = serde_json::from_slice(&std::fs::read(ai.join("sellers.json")).unwrap()).unwrap();
+    assert_eq!(sellers["pinned"], json!(["Lab model"]));
+    br.act("/ai", "/ai", &[("do", "block"), ("seller", "Lab model")]);
+    let sellers: Value = serde_json::from_slice(&std::fs::read(ai.join("sellers.json")).unwrap()).unwrap();
+    assert_eq!((sellers["pinned"].clone(), sellers["blocked"].clone()), (json!([]), json!(["Lab model"])), "a blocked seller is not preferred");
+    // a new limit, then revoke
+    let r = br.act("/ai", "/ai", &[("do", "limit"), ("id", &id), ("limit_sats", "900")]);
+    assert!(br.flash_after(&r).contains("900"));
+    let r = br.act("/ai", "/ai", &[("do", "revoke"), ("id", &id)]);
+    assert!(br.flash_after(&r).contains("Revoked"));
+    let s = lightning_stream::credentials::Store::open(&ai.join("credentials.json")).unwrap();
+    assert!(s.check(lightning_stream::credentials::Kind::AiKey, &key).is_err());
+    // without an endpoint the page says so, and still lists the sellers
+    let bx2 = start(json!({}), false, |c| c.services_file = Some(services.clone()));
+    let mut br2 = logged_in(&bx2);
+    assert!(br2.get("/ai").body.contains("does not serve an AI address yet"));
+}

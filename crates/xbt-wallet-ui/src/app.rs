@@ -30,6 +30,8 @@ pub mod services_page;
 mod nostr_pages;
 #[path = "hashrate.rs"]
 pub(crate) mod hashrate;
+#[path = "inference_page.rs"]
+pub(crate) mod inference_page;
 
 pub const COOKIE: &str = "xbtui";
 /// How long a signed form stays valid.
@@ -415,6 +417,7 @@ impl App {
             "/sell" if self.cfg.sell => self.sell_page(&ctx, &req.query),
             "/sell-hashrate" if self.cfg.sell => self.sell_hashrate_page(&ctx),
             "/hashrate" => self.hashrate_page(&ctx),
+            "/ai" => self.ai_page(&ctx),
             "/nostr" => self.nostr_page(&ctx, &req.query),
             "/play" => self.play(&ctx, &req),
             "/connections" => self.connections(&ctx),
@@ -584,6 +587,7 @@ impl App {
             "/sell" if self.cfg.sell => self.sell_post(ctx, f),
             "/sell-hashrate" if self.cfg.sell => self.sell_hashrate_post(ctx, f),
             "/hashrate" => self.hashrate_post(ctx, f),
+            "/ai" => self.ai_post(ctx, f),
             "/play-link" => self.play_link(ctx, f),
             "/nostr-check" => self.nostr_check(ctx, f),
             "/connections" => self.connections_stop(ctx, f),

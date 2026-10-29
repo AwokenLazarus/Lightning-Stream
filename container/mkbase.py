@@ -17,6 +17,10 @@ Deterministic (mtime 0, sorted, numeric owners) so the layer digest is the same 
                     (10009, a group only) has the signer and the UI in it, never the MCP
   /data/hashrate    0700, the hashrate services' keys and state (xbt-hashrate, 10010)
   /data/run/hashrate 0750 xbt-wallet-ui:xbt-hashrate, their settings the UI's Hashrate page writes, and their control token
+  /data/run/ai      0770 xbt-wallet-ui:xbt-ai, the AI endpoint's files: the credential store (AI keys and local links)
+                    both the UI and the connector (which runs as the signer's user) write, the sellers the UI's AI
+                    page writes, and the sellers' health the endpoint writes; the group (10014, a group only; 10011 to 10013 are reserved for xbt-compute) has
+                    the signer and the UI in it, never the MCP
 Uid 10004 is not used: it was the retired hub's, and the other uids keep their numbers.
     python3 container/mkbase.py OUT.tar
 """
@@ -31,7 +35,8 @@ HOME = {"xbt-signer": "/data/signer", "xbt-anchor-witness": "/data/witness", "xb
 MEMBERS = {"xbt-signer": "xbt-wallet-mcp,xbt-wallet-ui,xbt-hashrate", "xbt-anchor-witness": "xbt-signer", "xbt-wallet-ui": "xbt-wallet-mcp",
            "xbt-gateway": "xbt-wallet-ui", "xbt-hashrate": "xbt-wallet-ui"}
 # groups with no user of their own
-GROUPS = [("xbt-ln-rail", 10008, "xbt-signer,xbt-wallet-ui"), ("xbt-enroll", 10009, "xbt-signer,xbt-wallet-ui")]
+GROUPS = [("xbt-ln-rail", 10008, "xbt-signer,xbt-wallet-ui"), ("xbt-enroll", 10009, "xbt-signer,xbt-wallet-ui"),
+          ("xbt-ai", 10014, "xbt-signer,xbt-wallet-ui")]
 
 passwd = "root:x:0:0:root:/:/nonexistent\n" + "".join(f"{n}:x:{u}:{u}:{n}:{HOME[n]}:/nonexistent\n" for n, u in USERS)
 group = ("root:x:0:\n" + "".join(f"{n}:x:{u}:{MEMBERS.get(n, '')}\n" for n, u in USERS)
@@ -42,7 +47,7 @@ DIRS = [("etc", 0, 0, 0o755), ("tmp", 0, 0, 0o1777), ("usr", 0, 0, 0o755), ("usr
         ("data/ui", 10005, 10005, 0o700), ("data/relay", 10006, 10006, 0o700), ("data/gateway", 10007, 10007, 0o700), ("data/hashrate", 10010, 10010, 0o700), ("data/run", 0, 0, 0o755), ("data/run/signer", 10001, 10001, 0o750),
         ("data/run/anchor", 10002, 10002, 0o750), ("data/run/ui", 10005, 10005, 0o750),
         ("data/run/ln", 10005, 10008, 0o750), ("data/run/gateway", 10005, 10007, 0o750), ("data/run/enroll", 10001, 10009, 0o750),
-        ("data/run/hashrate", 10005, 10010, 0o750)]
+        ("data/run/hashrate", 10005, 10010, 0o750), ("data/run/ai", 10005, 10014, 0o770)]
 FILES = [("etc/passwd", passwd, 0o644), ("etc/group", group, 0o644)]
 
 entries = []

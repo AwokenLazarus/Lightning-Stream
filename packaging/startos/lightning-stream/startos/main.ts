@@ -17,6 +17,8 @@ export const main = sdk.setupMain(async ({ effects }) => {
   }
   // the MCP interface's addresses, for the UI's Agents page
   const mcpUrls = (await addresses('mcp', 'mcp')).map((u) => u.replace(/\/$/, '') + '/mcp')
+  // the AI interface's addresses, for the UI's AI page (http first: programs on the LAN rarely trust the OS's certificate)
+  const aiUrls = (await addresses('ai', 'ai')).map((u) => u.replace(/\/$/, '') + '/v1').sort((x, y) => Number(y.startsWith('http:')) - Number(x.startsWith('http:')))
   // this server's IPv4 address on the LAN, for the miners' and the link's addresses the hashrate pages show
   const lanHost =
     (await addresses('ui', 'ui'))
@@ -36,7 +38,7 @@ export const main = sdk.setupMain(async ({ effects }) => {
   // StartOS's proxy reaches this package from the OS's address on the bridge: its X-Forwarded-For is the buyer's
   const osIp = await sdk.getOsIp(effects).catch(() => '')
 
-  const specs = services({ node: store.node, mcpUrls, lightningRest, proxies: osIp ? [osIp] : [], lanHost })
+  const specs = services({ node: store.node, mcpUrls, lightningRest, proxies: osIp ? [osIp] : [], lanHost, aiUrls })
   const spec = (id: ServiceSpec['id']) => specs.find((s) => s.id === id) as ServiceSpec
 
   const sub = (s: ServiceSpec) => {

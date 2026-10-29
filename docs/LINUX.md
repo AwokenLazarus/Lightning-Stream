@@ -138,6 +138,14 @@ If a payment can't find a route:
 - Still stuck? Open an issue at https://github.com/AwokenLazarus/Lightning-Stream/issues and include
   your node's public key.
 
+## AI for your programs
+
+Programs on this machine that work with OpenAI's API (Open WebUI, coding agents, scripts) can use
+the AI sellers you allowed through `http://127.0.0.1:33540/v1`, each with a key you make on
+**Services → AI**. To let programs on other machines of your LAN use it, set
+`LS_AI_BIND=0.0.0.0:33540` and `LS_AI_ADDRESS=http://<this machine's LAN address>:33540/v1` in `.env`,
+then `docker compose up -d`. Every request needs a key either way. docs/INFERENCE.md has the rest.
+
 ## Hashtaker
 
 You rent hashrate into your own DATUM Gateway and pay for each piece of work:

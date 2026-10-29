@@ -13,6 +13,8 @@ xbt-wallet-mcp = { path = "../xbt-wallet-mcp" }
 serde_json.workspace = true
 getrandom = "0.2"
 hex.workspace = true
+sha2.workspace = true
+base64.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

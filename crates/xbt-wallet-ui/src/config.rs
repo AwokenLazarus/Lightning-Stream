@@ -43,6 +43,10 @@
 //! | `XBT_UI_HASHER_TOKEN_FILE` | | the hasher service's control token (its `--control-token-file`) |
 //! | `XBT_UI_HASHRENT` | | the renter service's control page (`http://…`): turns on Services → Hashrate, renting other people's miners |
 //! | `XBT_UI_HASHRENT_TOKEN_FILE` | | the renter service's control token |
+//! | `XBT_UI_AI_ENDPOINT` | | the AI endpoint's address for programs on the owner's network (`http://umbrel.local:33540/v1`): turns on the AI page's address and keys |
+//! | `XBT_UI_AI_SELLERS` | `$XBT_DATA_DIR/run/ai/sellers.json` | the AI sellers and the owner's pins and blocks, written by the AI page, read by the endpoint |
+//! | `XBT_UI_CREDENTIALS` | `$XBT_DATA_DIR/run/ai/credentials.json` | the store of AI keys and local links (hashed secrets, limits, spend), shared with the connector |
+//! | `XBT_UI_AI_STATE` | `$XBT_DATA_DIR/run/ai/state.json` | the endpoint's record of the sellers' health, shown on the AI page |
 //! | `XBT_UI_DATUM_GUIDE` | the project's guide | where a renter without a DATUM Gateway is sent to set one up |
 //! | `XBT_UI_RELAY_LINK_S` | `21600` (6 hours) | how long a link for an external player (VLC, mpv) made on the Player page lives (60 s to 7 days) |
 use std::path::PathBuf;
@@ -99,6 +103,8 @@ pub struct Config {
     pub local_services: Vec<(String, String)>,
     /// Hashrate: the hasher's and the renter's services, when this box runs them.
     pub hash: HashSetup,
+    /// The AI endpoint: the files the AI page writes and reads, and the address it shows.
+    pub ai: AiSetup,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +139,20 @@ pub struct GatewaySetup {
     pub port: u16,
     pub health_url: Option<String>,
     pub proxies: Vec<String>,
+}
+
+/// The AI endpoint the connector serves (`LS_AI_LISTEN`), as the AI page sees it.
+#[derive(Debug, Clone, Default)]
+pub struct AiSetup {
+    /// `XBT_UI_AI_ENDPOINT`: the address programs on the owner's network use (`http://umbrel.local:33540/v1`).
+    /// Unset: the box does not serve it, and the AI page says so.
+    pub endpoint: Option<String>,
+    /// `XBT_UI_AI_SELLERS`: the sellers file the page writes and the endpoint reads.
+    pub sellers: PathBuf,
+    /// `XBT_UI_CREDENTIALS`: the store of AI keys and local links.
+    pub credentials: PathBuf,
+    /// `XBT_UI_AI_STATE`: the endpoint's record of the sellers' health (read only here).
+    pub state: PathBuf,
 }
 
 /// Renting out this box's miners (the hasher service) and renting other people's (the renter).
@@ -225,6 +245,12 @@ impl Config {
             health_url: env("XBT_UI_GW_HEALTH_URL").filter(|u| u.starts_with("http://")),
             proxies: env("XBT_UI_GW_PROXIES").map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default(),
         };
+        let ai = AiSetup {
+            endpoint: env("XBT_UI_AI_ENDPOINT").filter(|u| u.starts_with("http://") || u.starts_with("https://")),
+            sellers: env("XBT_UI_AI_SELLERS").map(PathBuf::from).unwrap_or_else(|| run_dir("ai").join("sellers.json")),
+            credentials: env("XBT_UI_CREDENTIALS").map(PathBuf::from).unwrap_or_else(|| run_dir("ai").join("credentials.json")),
+            state: env("XBT_UI_AI_STATE").map(PathBuf::from).unwrap_or_else(|| run_dir("ai").join("state.json")),
+        };
         let hash_settings = env("XBT_UI_HASHER_SETTINGS").map(PathBuf::from).unwrap_or_else(|| run_dir("hashrate").join("settings.json"));
         let secure_cookie = match env("XBT_UI_SECURE_COOKIE").as_deref() {
             Some("1") | Some("true") => Some(true),
@@ -269,6 +295,7 @@ impl Config {
                 let (n, u) = (n.trim(), u.trim().trim_end_matches('/'));
                 (!n.is_empty() && u.starts_with("http://")).then(|| (n.to_string(), u.to_string()))
             }).take(20).collect()).unwrap_or_default(),
+            ai,
             hash: HashSetup {
                 hasher: env("XBT_UI_HASHER").filter(|u| u.starts_with("http://")),
                 settings: hash_settings,
@@ -295,6 +322,8 @@ impl Config {
                services_file: None, sell: false, connector: "http://127.0.0.1:8480".into(), relay_ttl: Duration::from_secs(6 * 3600),
                nwc_sock: None, nostr_relays: vec![], suggested_sellers: vec![], platform_login: None, enroll_code_file: None,
                restart_hint: RESTART_HINT.into(), local_services: vec![],
+               ai: AiSetup { endpoint: None, sellers: PathBuf::from("/nonexistent/ai/sellers.json"), credentials: PathBuf::from("/nonexistent/ai/credentials.json"),
+                             state: PathBuf::from("/nonexistent/ai/state.json") },
                hash: HashSetup { settings: PathBuf::from("/nonexistent/hashrate/settings.json"), datum_guide: DATUM_GUIDE.into(), ..Default::default() } }
     }
 }

@@ -65,11 +65,12 @@ AGENTPAY = {
     # run/ui holds the UI-owned MCP token; the MCP may only read it
     "xbt-wallet-mcp": ("mcp", set(), {"signer", "ui"}),
     # the setup pages write run/ln (the rail macaroon), run/gateway (the gateway's config and macaroons)
-    # and run/hashrate (the hasher's settings)
-    "xbt-wallet-ui": ("ui", {"ui", "ln", "gateway", "hashrate"}, {"signer", "enroll"}),
+    # and run/hashrate (the hasher's settings); the AI page writes run/ai (keys, sellers)
+    "xbt-wallet-ui": ("ui", {"ui", "ln", "gateway", "hashrate", "ai"}, {"signer", "enroll"}),
     "xbt-gateway": ("gateway", set(), {"gateway"}),
-    # no state of its own. The control socket is read-only; the stream sockets are STREAM_MOUNT.
-    "lightning-stream": (None, set(), {"signer"}),
+    # no state of its own. The control socket is read-only; the stream sockets are STREAM_MOUNT. The AI
+    # endpoint books the keys' spend and the sellers' health in run/ai, shared by group with the UI
+    "lightning-stream": (None, {"ai"}, {"signer"}),
     # the hasher and the renter: their keys and state; the settings and token read-only; the renter
     # also the signer's socket, read-only
     "xbt-hashlink": ("hashrate", set(), {"hashrate", "signer"}),
