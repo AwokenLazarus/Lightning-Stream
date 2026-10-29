@@ -148,6 +148,8 @@ impl xbt_svc::http::Handler for Seller {
             ("GET", "/pod/") => Reply::Whole(Response::new(200, vec![("Content-Type".into(), "text/html; charset=utf-8".into()),
                 ("Set-Cookie".into(), "podsess=p1; Path=/".into())], b"<!doctype html><title>pod</title><h1>Podcasts</h1>".to_vec())),
             ("GET", "/pod/me") => ok("application/json", &json!({"cookie": req.header("Cookie").unwrap_or("")}).to_string()),
+            // the shop's routes: the media server gives each buyer an account, the podcast player does not
+            ("GET", "/services") => ok("application/json", &json!({"routes": [{"path": "/jf/", "accounts": true}, {"path": "/pod/"}]}).to_string()),
             ("GET", "/evil/") => ok("text/html; charset=utf-8", EVIL_PAGE),
             ("GET", "/evil/evil.js") => ok("text/javascript", EVIL_JS),
             ("POST", "/evil/report") => {
@@ -570,7 +572,7 @@ fn two_apps_of_one_seller_are_two_visits_on_two_origins() {
     let field = |page: &str, attr: &str| { let i = page.find(&format!("{attr}=\"")).unwrap() + attr.len() + 2; page[i..i + page[i..].find('"').unwrap()].to_string() };
     let enc = xbt_wallet_ui::services::urlenc;
     // open both, each with its own limit, and enter each on its port
-    let mut open = |entry: &str, base: &str, limit: u32| {
+    let open = |entry: &str, base: &str, limit: u32| {
         let (_, _, page) = send("GET", &format!("{wallet}/app?u={}&b={}", enc(entry), enc(base)), &session, None);
         let csrf = { let i = page.find("name=\"csrf\" value=\"").unwrap() + 19; page[i..i + page[i..].find('"').unwrap()].to_string() };
         let (st, _, page) = send("POST", &format!("{wallet}/app"), &session, Some(&format!("csrf={csrf}&u={}&b={}&limit={limit}", enc(entry), enc(base))));
@@ -580,6 +582,18 @@ fn two_apps_of_one_seller_are_two_visits_on_two_origins() {
         assert_eq!(st, 302);
         (visit, port, cookie_of(&h, "__ls_visit_").unwrap(), csrf)
     };
+    // the media server keeps each buyer's history, and says so before it opens; the podcast player does not
+    let page_of = |entry: &str, base: &str| send("GET", &format!("{wallet}/app?u={}&b={}", enc(entry), enc(base)), &session, None).2;
+    assert!(page_of(&format!("{jf}web/"), &jf).contains("keeps your watch history"));
+    assert!(!page_of(&pod, &pod).contains("watch history"));
+    // staying anonymous there is the owner's choice, kept by the wallet
+    let p = page_of(&format!("{jf}web/"), &jf);
+    let csrf0 = { let i = p.find("name=\"csrf\" value=\"").unwrap() + 19; p[i..i + p[i..].find('"').unwrap()].to_string() };
+    let (st, _, _) = send("POST", &format!("{wallet}/identity"), &session,
+                          Some(&format!("csrf={csrf0}&origin={}&anonymous=1&u={}&b={}", enc(&seller), enc(&format!("{jf}web/")), enc(&jf))));
+    assert_eq!(st, 303);
+    assert!(page_of(&format!("{jf}web/"), &jf).contains("You stay anonymous at this shop"));
+    assert_eq!(rig.call("identity_get", json!({}))["anonymous"], json!([seller.clone()]));
     let (jf_visit, jf_port, jf_cookie, csrf) = open(&format!("{jf}web/"), &jf, 900);
     let (pod_visit, pod_port, pod_cookie, _) = open(&pod, &pod, 300);
     assert_ne!(jf_port, pod_port, "two apps of one seller are two origins");

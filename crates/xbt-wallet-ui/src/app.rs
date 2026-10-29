@@ -206,7 +206,7 @@ impl App {
                          apps: Default::default() }))
     }
 
-    fn call(&self, method: &str, params: Value) -> Result<Value, String> {
+    pub(crate) fn call(&self, method: &str, params: Value) -> Result<Value, String> {
         self.signer.call(method, params)
     }
 
@@ -587,6 +587,7 @@ impl App {
             "/play" => self.play_stop(ctx, f),
             "/app" => self.app_open(ctx, f),
             "/app-stop" => self.app_stop(ctx, f),
+            "/identity" => self.identity(ctx, f),
             "/services" => self.services_post(ctx, f),
             "/sell" if self.cfg.sell => self.sell_post(ctx, f),
             "/sell-hashrate" if self.cfg.sell => self.sell_hashrate_post(ctx, f),

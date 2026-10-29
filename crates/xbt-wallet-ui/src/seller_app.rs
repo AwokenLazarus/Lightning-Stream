@@ -151,9 +151,43 @@ impl App {
             <label>Spend at most, on this visit, in sats<input name=\"limit\" value=\"{SUGGESTED_LIMIT}\" required inputmode=\"numeric\" pattern=\"[0-9]+\"></label>\
             <p class=\"hint\">A seller sells in tickets, often 546 sats or more, so a visit needs at least that. Your spending rules apply as well.</p>\
             <div class=\"row\"><button>Open the app</button><a href=\"./browse\">Cancel</a></div></form></section>\
-            <p class=\"small\">The app runs apart from your wallet: it cannot see your keys, your rules or this page.</p>",
-            esc(&host), esc(&svc.name), esc(&host), esc(&svc.price_text), App::csrf_input(ctx), esc(&entry), esc(&base));
+            <p class=\"small\">The app runs apart from your wallet: it cannot see your keys, your rules or this page.</p>{}",
+            esc(&host), esc(&svc.name), esc(&host), esc(&svc.price_text), App::csrf_input(ctx), esc(&entry), esc(&base), self.identity_card(ctx, &svc.seller, &base, &entry));
         self.page("Open the app", ctx, b)
+    }
+
+    /// The note, and the choice, for a shop that keeps an account for each buyer of the app at
+    /// `base` (docs/BUYER-ACCOUNTS.md); nothing for a shop that does not.
+    fn identity_card(&self, ctx: &Ctx, seller: &str, base: &str, entry: &str) -> String {
+        if !shop_keeps_accounts(seller, base) {
+            return String::new();
+        }
+        let origin = crate::services::http_origin(seller).unwrap_or_default();
+        let anonymous = self.call("identity_get", json!({})).ok()
+            .and_then(|v| v.get("anonymous").and_then(Value::as_array).cloned()).unwrap_or_default()
+            .iter().any(|o| o.as_str().is_some_and(|o| o.trim_end_matches('/') == origin.trim_end_matches('/')));
+        let (state, button, to) = if anonymous {
+            ("You stay anonymous at this shop: it does not keep your history, and you use its shared guest where it has one.", "Let this shop recognise me", "0")
+        } else {
+            ("This shop keeps your watch history. It sees a private handle, not who you are, and it is the same each time you come back.", "Stay anonymous here", "1")
+        };
+        format!("<section class=\"card\"><h3>Your history at this shop</h3><p>{}</p>\
+            <form method=\"post\" action=\"./identity\" class=\"inline\">{}<input type=\"hidden\" name=\"origin\" value=\"{}\">\
+            <input type=\"hidden\" name=\"anonymous\" value=\"{to}\"><input type=\"hidden\" name=\"u\" value=\"{}\"><input type=\"hidden\" name=\"b\" value=\"{}\">\
+            <button class=\"secondary\">{button}</button></form>\
+            <p class=\"hint\">The handle is made for this shop alone: another shop cannot tell it is you. A restore from your backup keeps it.</p></section>",
+            state, App::csrf_input(ctx), esc(&origin), esc(entry), esc(base))
+    }
+
+    /// `POST /identity`: stay anonymous at a shop, or let it recognise this wallet.
+    pub(crate) fn identity(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {
+        let g = |k: &str| f.get(k).cloned().unwrap_or_default();
+        match self.call("identity_set", json!({"origin": g("origin"), "anonymous": g("anonymous") == "1"})) {
+            Ok(v) if v.get("ok") == Some(&json!(true)) => self.flash(ctx, true, if g("anonymous") == "1" { "You stay anonymous at that shop." } else { "That shop recognises you now." }),
+            Ok(v) => self.flash(ctx, false, format!("Not changed: {}", v.get("reason").and_then(Value::as_str).unwrap_or("the wallet refused"))),
+            Err(e) => self.flash(ctx, false, format!("Not changed: {e}")),
+        }
+        Resp::redirect(&format!("./app?u={}&b={}", crate::services::urlenc(&g("u")), crate::services::urlenc(&g("b"))))
     }
 
     /// `POST /app`: the visit opened, and the page in its frame.
@@ -533,6 +567,21 @@ impl AppOrigin {
             }),
         })
     }
+}
+
+/// Whether the shop's route for the app at `base` gives each buyer an account: its `/services`
+/// says so. Asked when the page is shown; a shop that does not answer is taken to keep none.
+fn shop_keeps_accounts(seller: &str, base: &str) -> bool {
+    let Some(origin) = crate::services::http_origin(seller) else { return false };
+    let path = base.strip_prefix(origin.trim_end_matches('/')).unwrap_or("/");
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(4)).redirects(0).build();
+    let Ok(r) = agent.get(&format!("{}/services", origin.trim_end_matches('/'))).call() else { return false };
+    let v: Value = serde_json::from_str(&r.into_string().unwrap_or_default()).unwrap_or(Value::Null);
+    // the route the app's base falls under: the longest that covers it
+    v.get("routes").and_then(Value::as_array).into_iter().flatten()
+        .filter(|r| r.get("path").and_then(Value::as_str).is_some_and(|p| path.starts_with(p)))
+        .max_by_key(|r| r.get("path").and_then(Value::as_str).map_or(0, str::len))
+        .is_some_and(|r| r.get("accounts") == Some(&json!(true)))
 }
 
 /// A text answer a page's own links are in: HTML, scripts, styles, JSON, SVG and manifests. Video,
