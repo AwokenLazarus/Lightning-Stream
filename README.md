@@ -49,6 +49,10 @@ money**, and allow a seller. Our test shop is `https://stream.lazarus-xbt.xyz`. 
   DATUM Gateway, paying for each slice of work after it is delivered. Only shares the hashtaker's
   own gateway accepted are counted. ([`docs/P2P-HASH.md`](docs/P2P-HASH.md))
 - **Agents.** An AI agent pays through the same wallet over MCP and never holds a key.
+- **A local AI address.** The app gives the box an OpenAI-compatible address on the owner's network.
+  Any AI app or agent that speaks that API uses the sellers' models through it, paid per token, each
+  program with its own key and limit. It picks the cheapest seller that answers and moves on if one
+  fails before answering. ([`docs/INFERENCE.md`](docs/INFERENCE.md))
 
 ## How it works
 
@@ -68,7 +72,7 @@ decides which pieces are paid, so the price is exact on average. The wire is wri
 | `xbt-signer` | the wallet's signer: keys, the owner's signed spending rules, a tamper-evident signature log, the Lightning rail (BOLT 11 and 12), the ticket book and the payer |
 | `xbt-wallet-ui` | the app: Services, Sell, Wallet, Apps & agents and Settings |
 | `xbt-wallet-mcp` | the wallet's MCP server, so an AI agent can quote and pay without holding a key |
-| `lightning-stream` | the connector: hands a paid answer to a local player as it is paid for, holding no keys |
+| `lightning-stream` | the connector: hands a paid answer to a local player as it is paid for, and serves the local AI address, holding no keys |
 | `xbt-gateway` | the seller's gateway beside a Lightning node, in front of any HTTP service |
 | `xbt-hashlink` | rented hashrate: the encrypted link between hashmaker and hashtaker, the Stratum relay, the work meter and listings |
 | `xbt-nostr` | Nostr events, relays and sellers' signed listings ([`docs/NOSTR.md`](docs/NOSTR.md)) |
