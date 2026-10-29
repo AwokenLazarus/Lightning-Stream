@@ -2615,6 +2615,7 @@ dependencies = [
  "tempfile",
  "ureq",
  "url",
+ "webpki-roots 0.26.11",
  "xbt-gateway",
  "xbt-primitives",
  "xbt-svc",

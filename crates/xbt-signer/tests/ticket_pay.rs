@@ -175,6 +175,25 @@ impl Handler for Service {
                 out.send(b"data: [DONE]\n\n")
             }) });
         }
+        // a WebSocket that echoes every byte back, as a chat's does
+        if path.starts_with("/ws") && req.header("Upgrade").is_some_and(|u| u.eq_ignore_ascii_case("websocket")) {
+            let key = req.header("Sec-WebSocket-Key").unwrap_or("").to_string();
+            return Reply::Upgrade(xbt_svc::http::Upgraded {
+                headers: vec![("Upgrade".into(), "websocket".into()), ("Sec-WebSocket-Accept".into(), format!("accept-{key}"))],
+                run: Box::new(|mut s, early| {
+                    use std::io::{Read as _, Write as _};
+                    if !early.is_empty() && s.write_all(&early).is_err() {
+                        return;
+                    }
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = s.read(&mut buf) {
+                        if n == 0 || s.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                }),
+            });
+        }
         // a web app: its page only compressed (as llama.cpp's server serves it), and an echo of what reached it
         if path == "/app/" {
             if !req.header("Accept-Encoding").is_some_and(|a| a.contains("gzip")) {
@@ -223,6 +242,9 @@ fn routes() -> Value {
         {"path": "/uhd/", "price": {"byte_msat": 1000, "per_bytes": 1_048_576}},
         {"path": "/hd20/", "price": {"byte_msat": 20_000, "per_bytes": 1_048_576}},
         {"path": "/rate10/", "price": {"byte_msat": 20_000, "per_bytes": 1_048_576}},
+        // WebSockets: 2.5 sat to open and 1 sat a KiB either way, and a free one
+        {"path": "/ws/", "price": {"request_msat": 2500, "byte_msat": 1000, "per_bytes": 1024}, "websocket": true},
+        {"path": "/wsfree/", "free": true, "websocket": true},
         {"path": "/tick/", "price": {"second_msat": 1000}},
         {"path": "/free/", "free": true},
         // a model: 4 sat per 1,000 tokens in, 20 sat per 1,000 tokens out, at most 500 tokens a reply
@@ -851,6 +873,12 @@ struct Tap {
 }
 
 impl TicketWire for Tap {
+    fn upgrade(&self, url: &str, headers: &[(String, String)], read_timeout: Duration, tls: Option<&SellerTls>) -> xbt402::Result<xbt_signer::ticket_pay::WireUpgrade> {
+        let path = url.splitn(4, '/').nth(3).map(|p| format!("/{p}")).unwrap_or_default();
+        self.log.lock().unwrap().push(Seen { method: "GET".into(), path, body: String::new(), paid: headers.iter().any(|(k, _)| k == "PAYMENT-SIGNATURE") });
+        self.inner.upgrade(url, headers, read_timeout, tls)
+    }
+
     fn send_with(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)], read_timeout: Duration, tls: Option<&SellerTls>)
                  -> xbt402::Result<WireAnswer> {
         self.trust.lock().unwrap().push((url.to_string(), tls.cloned()));
@@ -4450,5 +4478,55 @@ fn throughput_of_a_paid_stream_and_the_longest_gap_at_a_refill() {
         assert_eq!((got, v["complete"].as_bool()), (n, Some(true)), "{v}");
     }
     REFILL_WAIT_MS.store(400, Ordering::SeqCst);
+    std::env::remove_var("B2_STREAM_DIR");
+}
+
+/// A WebSocket through the wallet (docs/SELLER-APPS.md): the caller's socket carries it both ways,
+/// the seller's 101 comes first as the head line, and every byte either way is paid for at the
+/// route's price, from tickets the wallet pays as the bytes pass. A free one is joined at once.
+#[test]
+fn a_websocket_is_carried_both_ways_and_every_byte_paid() {
+    use std::io::{BufRead as _, Read as _, Write as _};
+    use std::os::unix::net::UnixListener;
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = Rig::new(json!({}));
+    for (path, paid) in [("/ws/chat", true), ("/wsfree/chat", false)] {
+        let name = format!("ws{}", u8::from(paid));
+        let l = UnixListener::bind(dir.path().join(&name)).unwrap();
+        // the caller: the head line, then 64 KiB out and the same back, then it hangs up
+        let caller = std::thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+            let mut rd = std::io::BufReader::new(s.try_clone().unwrap());
+            let mut line = String::new();
+            rd.read_line(&mut line).unwrap();
+            let head: Value = serde_json::from_str(&line).unwrap();
+            let mut w = s;
+            let out: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
+            w.write_all(&out).unwrap();
+            let mut back = vec![0u8; out.len()];
+            rd.read_exact(&mut back).unwrap();
+            assert_eq!(back, out, "the echo came back whole");
+            w.shutdown(std::net::Shutdown::Both).unwrap();
+            head
+        });
+        let v = r.call("xbt402_pay", json!({"url": r.shop.url(path), "max_sats": 5_000, "task": "film", "stream_to": name, "stream_head": true,
+                                           "head_headers": true, "upgrade": true, "headers": [["Sec-WebSocket-Key", "k1"], ["Sec-WebSocket-Version", "13"]]}));
+        let head = caller.join().unwrap();
+        assert_eq!(head["status"], 101, "{head}");
+        assert!(head["headers"].as_array().unwrap().iter().any(|h| h[0].as_str().unwrap().eq_ignore_ascii_case("sec-websocket-accept") && h[1] == "accept-k1"), "{head}");
+        assert_eq!(v["status"], 101, "{v}");
+        if paid {
+            // 2,500 msat to open, and 128 KiB at 1,000 msat a KiB: 64 KiB each way, by the wallet's count and the seller's signed one
+            let want = (2_500 + 128 * 1_000).to_string();
+            assert_eq!((v["price_msat"].as_str(), v["receipt"]["last"]["charged"].as_str(), v["receipt"]["body"].as_str()),
+                       (Some(want.as_str()), Some(want.as_str()), Some("as signed")), "{v}");
+            assert_eq!(v["receipt"]["signed"], true, "{v}");
+        } else {
+            assert_eq!((v["rule"].as_str(), v["charged_sats"].as_u64()), (Some("free"), Some(0)), "{v}");
+        }
+    }
     std::env::remove_var("B2_STREAM_DIR");
 }

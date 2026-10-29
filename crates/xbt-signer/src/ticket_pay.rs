@@ -28,9 +28,9 @@
 //! then `link` (one HTTP exchange at a time, in `seq` order), then `money`. The wallet's spend lock
 //! is taken with none of `link` and `money` held, and never while a seller is being waited for.
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -179,7 +179,24 @@ impl WireAnswer {
 
 /// How the ticket payer talks HTTP: one request, answered as soon as its head has arrived, the
 /// body left to be read. No redirect is followed.
+/// A seller's answer to a request to upgrade (a WebSocket): the answer, whose body is what the
+/// seller sends after the head, and when it said `101`, the half of the connection that writes to
+/// it. Dropping the writer ends the stream toward the seller.
+pub struct WireUpgrade {
+    pub answer: WireAnswer,
+    pub writer: Option<Box<dyn Write + Send>>,
+}
+
 pub trait TicketWire: Send + Sync {
+    /// The request asking `url` to become a WebSocket (`GET`, with `Connection: Upgrade` and
+    /// `Upgrade: websocket` added to `headers`), its certificate checked as [`TicketWire::send_with`]
+    /// checks one. Whatever carries a seller's connection (TCP and TLS, a QUIC stream) implements
+    /// this to carry its WebSockets; one that does not refuses, and the call is refused.
+    fn upgrade(&self, url: &str, headers: &[(String, String)], read_timeout: Duration, tls: Option<&SellerTls>) -> Result<WireUpgrade> {
+        let _ = (url, headers, read_timeout, tls);
+        Err(err("transport_error", "this connection to the seller cannot carry a WebSocket"))
+    }
+
     fn send(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)], read_timeout: Duration) -> Result<WireAnswer>;
 
     /// [`TicketWire::send`], with an https seller's certificate checked against `tls` in place of
@@ -282,7 +299,173 @@ fn seller_tls_config(tls: &SellerTls, roots: Vec<Vec<u8>>) -> Result<Arc<rustls:
     Ok(Arc::new(cfg))
 }
 
+/// One TLS connection shared by the two directions of a WebSocket: each takes it in turn, and a
+/// read gives it back every [`TLS_TURN`] so that a write is never kept waiting by a quiet seller.
+type SharedTls = Arc<Mutex<rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>>>;
+const TLS_TURN: Duration = Duration::from_millis(50);
+
+struct TlsReader(SharedTls);
+struct TlsWriter(SharedTls);
+
+impl Read for TlsReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            match lock(&self.0).read(buf) {
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => std::thread::sleep(Duration::from_millis(1)),
+                r => return r,
+            }
+        }
+    }
+}
+
+impl Write for TlsWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut t = lock(&self.0);
+        t.write_all(buf)?;
+        t.flush()?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        lock(&self.0).flush()
+    }
+}
+
+impl Drop for TlsWriter {
+    fn drop(&mut self) {
+        let mut t = lock(&self.0);
+        t.conn.send_close_notify();
+        let _ = t.flush();
+        let _ = t.sock.shutdown(std::net::Shutdown::Write);
+    }
+}
+
+/// The write half of a plain connection: dropping it ends the stream toward the seller.
+struct TcpWriter(std::net::TcpStream);
+
+impl Write for TcpWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl Drop for TcpWriter {
+    fn drop(&mut self) {
+        let _ = self.0.shutdown(std::net::Shutdown::Write);
+    }
+}
+
+/// The TLS client config for a WebSocket to an https seller: the named seller's own entry, or the
+/// public authorities as ureq trusts them.
+fn upgrade_tls_config(tls: Option<&SellerTls>) -> Result<Arc<rustls::ClientConfig>> {
+    if let Some(t) = tls {
+        let (_, roots) = seller_tls_key(t)?;
+        return seller_tls_config(t, roots);
+    }
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut store = rustls::RootCertStore::empty();
+    store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let cfg = rustls::ClientConfig::builder_with_provider(provider).with_safe_default_protocol_versions()
+        .map_err(|e| err("transport_error", e.to_string()))?
+        .with_root_certificates(store)
+        .with_no_client_auth();
+    Ok(Arc::new(cfg))
+}
+
+/// An HTTP answer's head: its status, its headers (names in upper case), and the bytes after it.
+type AnswerHead = (u16, Vec<(String, String)>, Vec<u8>);
+
+/// Read an HTTP answer's head from `r`.
+fn read_answer_head(r: &mut dyn Read) -> Result<AnswerHead> {
+    let mut buf = vec![];
+    let mut tmp = [0u8; 2048];
+    let end = loop {
+        let n = r.read(&mut tmp).map_err(|e| err("transport_error", format!("the seller's answer: {e}")))?;
+        if n == 0 {
+            return Err(err("transport_error", "the seller closed before its answer"));
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i;
+        }
+        if buf.len() > 32 << 10 {
+            return Err(err("transport_error", "the seller's answer head is too long"));
+        }
+    };
+    let early = buf.split_off(end + 4);
+    let text = String::from_utf8_lossy(&buf[..end]).to_string();
+    let mut lines = text.split("\r\n");
+    let status = lines.next().and_then(|l| l.split(' ').nth(1)).and_then(|c| c.parse::<u16>().ok())
+        .ok_or_else(|| err("transport_error", "the seller's answer has no status"))?;
+    let headers = lines.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim().to_ascii_uppercase(), v.trim().to_string())).collect();
+    Ok((status, headers, early))
+}
+
 impl TicketWire for UreqWire {
+    fn upgrade(&self, url: &str, headers: &[(String, String)], read_timeout: Duration, tls: Option<&SellerTls>) -> Result<WireUpgrade> {
+        let url = sendable_url(url)?;
+        let u = url::Url::parse(&url).map_err(|e| err("transport_error", e.to_string()))?;
+        let https = u.scheme() == "https";
+        let host = u.host_str().ok_or_else(|| err("transport_error", "the seller's URL has no host"))?.to_string();
+        let port = u.port_or_known_default().unwrap_or(if https { 443 } else { 80 });
+        let target = match u.query() {
+            Some(q) => format!("{}?{q}", u.path()),
+            None => u.path().to_string(),
+        };
+        let addr = std::net::ToSocketAddrs::to_socket_addrs(&(host.as_str(), port)).map_err(|e| err("transport_error", e.to_string()))?
+            .next().ok_or_else(|| err("transport_error", "the seller's host resolves to nothing"))?;
+        let sock = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(10)).map_err(|e| err("transport_error", e.to_string()))?;
+        let _ = sock.set_read_timeout(Some(read_timeout));
+        let _ = sock.set_write_timeout(Some(read_timeout));
+        let host_header = match u.port() {
+            Some(p) => format!("{host}:{p}"),
+            None => host.clone(),
+        };
+        let mut head = format!("GET {target} HTTP/1.1\r\nHost: {host_header}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nAccept-Encoding: identity\r\n");
+        for (k, v) in headers {
+            if !k.bytes().chain(v.bytes()).any(|c| matches!(c, b'\r' | b'\n' | 0)) {
+                head.push_str(&format!("{k}: {v}\r\n"));
+            }
+        }
+        head.push_str("\r\n");
+        // the answer's body: a 101's is the stream from the seller; anything else's, as long as it says, or to its end
+        let finish = |status: u16, headers: Vec<(String, String)>, early: Vec<u8>, rest: Box<dyn Read + Send>, writer: Box<dyn Write + Send>| {
+            let length = headers.iter().find(|(k, _)| k == "CONTENT-LENGTH").and_then(|(_, v)| v.parse::<u64>().ok());
+            let body: Box<dyn Read + Send> = Box::new(std::io::Cursor::new(early).chain(rest));
+            let (body, writer) = if status == 101 {
+                (body, Some(writer))
+            } else {
+                (match length {
+                    Some(n) => Box::new(body.take(n)) as Box<dyn Read + Send>,
+                    None => body,
+                }, None)
+            };
+            WireUpgrade { answer: WireAnswer { status, headers, length: if status == 101 { None } else { length }, body }, writer }
+        };
+        if !https {
+            let mut s = sock;
+            s.write_all(head.as_bytes()).map_err(|e| err("transport_error", e.to_string()))?;
+            let (status, headers, early) = read_answer_head(&mut s)?;
+            let _ = s.set_read_timeout(None);
+            let w = s.try_clone().map_err(|e| err("transport_error", e.to_string()))?;
+            return Ok(finish(status, headers, early, Box::new(s), Box::new(TcpWriter(w))));
+        }
+        let name = rustls::pki_types::ServerName::try_from(host.clone()).map_err(|e| err("transport_error", e.to_string()))?;
+        let conn = rustls::ClientConnection::new(upgrade_tls_config(tls)?, name).map_err(|e| err("transport_error", e.to_string()))?;
+        let mut t = rustls::StreamOwned::new(conn, sock);
+        t.write_all(head.as_bytes()).map_err(|e| err("transport_error", format!("TLS with the seller: {e}")))?;
+        let (status, headers, early) = read_answer_head(&mut t)?;
+        // the two directions take the connection in turn: a read lets go of it every TLS_TURN
+        let _ = t.sock.set_read_timeout(Some(TLS_TURN));
+        let shared: SharedTls = Arc::new(Mutex::new(t));
+        Ok(finish(status, headers, early, Box::new(TlsReader(shared.clone())), Box::new(TlsWriter(shared))))
+    }
+
+
     fn send(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)], read_timeout: Duration) -> Result<WireAnswer> {
         self.send_with(method, url, body, headers, read_timeout, None)
     }
@@ -354,6 +537,11 @@ impl Sink {
     /// cannot be reached is a reader already gone.
     fn for_call(c: &Call) -> Self {
         Self::streaming_to(c.stream_to.as_deref())
+    }
+
+    /// The socket's other direction, for a WebSocket: what the reader there sends on to the seller.
+    fn back_channel(&self) -> Option<std::os::unix::net::UnixStream> {
+        self.out.as_ref()?.try_clone().ok()
     }
 
     /// A sink that streams to the socket at `path`, where one is named; one that cannot be
@@ -560,6 +748,9 @@ struct Call<'a> {
     /// With `stream_head`: the head line carries the seller's response headers too
     /// (`head_headers`, [`passed_headers`]), for a caller that hands the answer on to a browser.
     head_headers: bool,
+    /// The request asks to become a WebSocket (`upgrade`): after a `101` the call carries the
+    /// stream both ways through `stream_to`, every byte either way paid for as the body's are.
+    upgrade: bool,
 }
 
 impl Call<'_> {
@@ -782,6 +973,25 @@ impl Stream {
     fn due_time(&self, credited: u64) -> bool {
         self.price.second_msat > 0 && self.avail(credited) < self.fixed().saturating_add(self.price.second_msat)
     }
+}
+
+/// A WebSocket's way to the seller: what the reader at the socket sends, passed on as it comes,
+/// counted in `up`. Ends when either side ends; dropping `writer` ends the stream toward the seller.
+fn forward_up(mut from: std::os::unix::net::UnixStream, mut writer: Box<dyn Write + Send>, up: &AtomicU64) {
+    let mut buf = vec![0u8; 16 << 10];
+    loop {
+        match from.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if writer.write_all(&buf[..n]).and_then(|()| writer.flush()).is_err() {
+                    break;
+                }
+                up.fetch_add(n as u64, Ordering::SeqCst);
+            }
+        }
+    }
+    drop(writer);
+    let _ = from.shutdown(std::net::Shutdown::Read);
 }
 
 /// How long a ticket's payment is taken to last before one of the answer has been timed: a
@@ -1038,6 +1248,38 @@ impl Signer {
 
     /// Every request this module sends to a seller: [`TicketWire::send_with`] with
     /// [`Signer::seller_tls_for`] its URL.
+    /// [`TicketWire::upgrade`], with the seller's certificate checked as [`Signer::wire`] checks it.
+    fn wire_upgrade(&self, url: &str, headers: &[(String, String)], read_timeout: Duration) -> Result<WireUpgrade> {
+        let tls = self.seller_tls_for(url);
+        self.ticket_wire.upgrade(url, headers, read_timeout, tls.as_ref())
+    }
+
+    /// A WebSocket the seller gives without payment: its head to the socket, then both directions
+    /// joined until either side ends it. Nothing is paid.
+    fn free_websocket(&self, mut ans: WireAnswer, writer: Box<dyn Write + Send>, stream_to: Option<&std::path::Path>, stream_head: bool, head_headers: bool) -> Value {
+        let mut sink = Sink::streaming_to(stream_to);
+        let (head, _) = head_to(&mut ans, None, stream_head, head_headers, &mut sink);
+        let up = AtomicU64::new(0);
+        let (back, stopper) = (sink.back_channel(), sink.back_channel());
+        let ended = std::thread::scope(|scope| {
+            match back {
+                Some(b) => {
+                    scope.spawn(|| forward_up(b, writer, &up));
+                }
+                None => drop(writer),
+            }
+            let ended = read_all(ans, &mut sink);
+            // the seller ended it: the reader's side ends too, and with it the way back
+            if let Some(s) = &stopper {
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            }
+            ended
+        });
+        let (_, stored, _) = sink.done();
+        with(with(with(json!({"verdict": "allow", "rule": "free", "rail": "none", "status": 101, "charged_sats": 0, "note": "a WebSocket the seller gives free",
+                              "complete": ended.is_none(), "bytes_up": up.load(Ordering::SeqCst)}), stored), json!({"ended": ended})), head)
+    }
+
     pub(crate) fn wire(&self, method: &str, url: &str, body: &[u8], headers: &[(String, String)], read_timeout: Duration) -> Result<WireAnswer> {
         let tls = self.seller_tls_for(url);
         self.ticket_wire.send_with(method, url, body, headers, read_timeout, tls.as_ref())
@@ -1135,6 +1377,10 @@ impl Signer {
             Err(why) => return deny("headers", why),
         };
         let head_headers = stream_head && p.get("head_headers").and_then(Value::as_bool) == Some(true);
+        let upgrade = p.get("upgrade").and_then(Value::as_bool) == Some(true);
+        if upgrade && (stream_to.is_none() || method != "GET" || range.is_some()) {
+            return deny("upgrade", "a WebSocket (upgrade) is a GET with stream_to, and no range");
+        }
         let mut range_headers: Vec<(String, String)> = range.iter().map(|r| ("Range".to_string(), r.header())).collect();
         range_headers.extend(extra.iter().cloned());
         // the owner's word before any request leaves: an allowlisted origin, or a task that pays any seller
@@ -1153,7 +1399,17 @@ impl Signer {
             (Ok(l), Ok(c)) => (l, c),
             (Err(e), _) | (_, Err(e)) => return deny("xbt402", e.msg),
         };
-        let mut probe = match self.wire(&method, &url, &raw, &range_headers, Self::ticket_read_timeout(&tp)) {
+        let probe = if upgrade {
+            // a WebSocket is asked for as one from the start: a free one is joined at once, a paid one is a 402 like any
+            match self.wire_upgrade(&url, &range_headers, Self::ticket_read_timeout(&tp)) {
+                Ok(WireUpgrade { answer, writer: Some(writer) }) if answer.status == 101 => return self.free_websocket(answer, writer, stream_to.as_deref(), stream_head, head_headers),
+                Ok(u) => Ok(u.answer),
+                Err(e) => Err(e),
+            }
+        } else {
+            self.wire(&method, &url, &raw, &range_headers, Self::ticket_read_timeout(&tp))
+        };
+        let mut probe = match probe {
             Ok(a) => a,
             Err(e) => return deny("xbt402", format!("the seller gave no answer: {}", e.msg)),
         };
@@ -1178,7 +1434,7 @@ impl Signer {
         if max_sats == 0 {
             return with(deny("max_sats", "the seller asks to be paid and this call may spend nothing (max_sats 0)"), json!({"charged_sats": 0}));
         }
-        let call = Call { url: &url, origin: &origin, method: &method, body: &raw, max_sats, task, piece_hashes, stream_to, stream_head, range, extra, head_headers };
+        let call = Call { url: &url, origin: &origin, method: &method, body: &raw, max_sats, task, piece_hashes, stream_to, stream_head, range, extra, head_headers, upgrade };
         let mut passed: Vec<Value> = vec![];
         let mut ways = offers(&pr, &lightning);
         // tickets or draws first: one rule ([`crate::lottery::choose`]); the other is tried after it
@@ -2225,6 +2481,8 @@ impl Signer {
         *lock(&hs.used) = self.engine.now();
         let started = Instant::now();
         let mut short = 0;
+        // a WebSocket's way to the seller, once it said 101
+        let mut up_writer: Option<Box<dyn Write + Send>> = None;
         let (seq, digest, ans, head) = loop {
             // whole tickets until the seller's balance covers what it wants before it serves
             let mut rounds = 0;
@@ -2247,7 +2505,15 @@ impl Signer {
             if c.max_sats > 0 {
                 headers.push((xbt402::ticket::MAX_MSAT_HEADER.into(), (c.max_sats as u64).saturating_mul(1000).to_string()));
             }
-            let ans = match self.wire(c.method, c.url, c.body, &headers, Self::ticket_read_timeout(&tp)) {
+            let sent = if c.upgrade {
+                self.wire_upgrade(c.url, &headers, Self::ticket_read_timeout(&tp)).map(|u| {
+                    up_writer = u.writer.filter(|_| u.answer.status == 101);
+                    u.answer
+                })
+            } else {
+                self.wire(c.method, c.url, c.body, &headers, Self::ticket_read_timeout(&tp))
+            };
+            let ans = match sent {
                 Ok(a) => a,
                 // no secret travels with a request, so a lost answer costs what the seller charged the balance, if anything
                 Err(e) => {
@@ -2352,7 +2618,7 @@ impl Signer {
         } else {
             let tokens = Some(c.body).filter(|b| price.tokens.active() && !b.is_empty())
                 .and_then(|b| xbt402::tokens::prepare(b, price.tokens.max_output).ok().map(|p| (b.len() as u64, p.max_output)));
-            let (m, note, last) = self.ticket_stream(hs, price, &head, seq, &digest, ans, started, max_msat, &mut sink, &mut spent, not_read, tokens);
+            let (m, note, last) = self.ticket_stream(hs, price, &head, seq, &digest, ans, started, max_msat, &mut sink, &mut spent, not_read, tokens, up_writer);
             seller_last = last;
             out = with(out, m);
             let price_msat = out.get("price_msat").and_then(|v| crate::ticket::outside_u64(Some(v))).unwrap_or(0);
@@ -2380,7 +2646,8 @@ impl Signer {
     /// stopped at its head, for that reason.
     #[allow(clippy::too_many_arguments)]
     fn ticket_stream(&self, hs: &Arc<HttpSession>, price: &Price, head: &Receipt, seq: u64, digest: &str, ans: WireAnswer, started: Instant, max_msat: u64,
-                     sink: &mut Sink, spent: &mut Spent, stop: Option<String>, tokens: Option<(u64, u64)>) -> (Value, Value, Value) {
+                     sink: &mut Sink, spent: &mut Spent, stop: Option<String>, tokens: Option<(u64, u64)>, up_writer: Option<Box<dyn Write + Send>>)
+                     -> (Value, Value, Value) {
         // by the token: the answer counted here as the seller counts it, to check its last receipt
         let event_stream = ans.header("content-type").is_some_and(|v| v.to_ascii_lowercase().starts_with("text/event-stream"));
         let mut sse = xbt402::tokens::Sse::default();
@@ -2412,8 +2679,54 @@ impl Signer {
         let paying = AtomicBool::new(false);
         let paid: Mutex<Option<(Option<String>, bool)>> = Mutex::new(None);
         let mut retry_at_due = false;
+        // a WebSocket: what the reader at the socket sends goes to the seller, counted here, and paid
+        // for with the bytes that come back. A watcher pays for both as they pass, since bytes on the
+        // way out do not wake the reading of the way back
+        let ws = up_writer.is_some();
+        let up = AtomicU64::new(0);
+        let (back, stopper) = if ws { (sink.back_channel(), sink.back_channel()) } else { (None, None) };
         let lead: Mutex<u64> = Mutex::new(0);
         std::thread::scope(|scope| {
+            if let Some(w) = up_writer {
+                match back {
+                    Some(b) => {
+                        let (up, wake) = (&up, &wake);
+                        scope.spawn(move || {
+                            forward_up(b, w, up);
+                            wake.notify_all();
+                        });
+                    }
+                    None => drop(w),
+                }
+                let (pay, credited, state, wake, up, stopper, st) = (&pay, &credited, &state, &wake, &up, &stopper, &st);
+                scope.spawn(move || loop {
+                    let mut s = lock(state);
+                    if s.2 || s.1.is_some() {
+                        return;
+                    }
+                    let total = s.0.saturating_add(up.load(Ordering::SeqCst));
+                    let rate = total as f64 / st.started.elapsed().as_secs_f64().max(0.001);
+                    let ahead = ((rate * FIRST_PAY_S) as u64).min(st.covered(credited()) / 2);
+                    if let Some(why) = st.over(total) {
+                        s.1.get_or_insert(why);
+                    } else if st.due_bytes_ahead(credited(), total, None, ahead) {
+                        drop(s);
+                        let r = pay(total);
+                        s = lock(state);
+                        if let Some(why) = r {
+                            s.1.get_or_insert(why);
+                        }
+                    }
+                    if s.1.is_some() {
+                        // the stream stops: both ways end, and the reading of the way back with them
+                        if let Some(st) = stopper {
+                            let _ = st.shutdown(std::net::Shutdown::Both);
+                        }
+                        return;
+                    }
+                    let _ = wake.wait_timeout(s, Duration::from_millis(20)).unwrap_or_else(|p| p.into_inner());
+                });
+            }
             if price.second_msat > 0 {
                 // an answer priced by the second is paid by the clock: the next second's ticket goes shortly before it starts
                 scope.spawn(|| loop {
@@ -2470,8 +2783,13 @@ impl Signer {
                 }
                 let bytes = sink.bytes;
                 lock(&state).0 = bytes;
+                wake.notify_all();
                 if length.is_some_and(|l| bytes >= l) {
                     break;
+                }
+                if ws {
+                    // a WebSocket is paid for by its watcher
+                    continue;
                 }
                 if let Some(why) = st.over(bytes) {
                     lock(&state).1.get_or_insert(why);
@@ -2542,6 +2860,10 @@ impl Signer {
             }
             lock(&state).2 = true;
             wake.notify_all();
+            // the way back has ended: so does the way out
+            if let Some(st) = &stopper {
+                let _ = st.shutdown(std::net::Shutdown::Both);
+            }
         });
         // the connection is closed here: a seller that was still sending stops within what the balance covers
         drop(body);
@@ -2556,7 +2878,8 @@ impl Signer {
         };
         let secs = if price.second_msat > 0 { started.elapsed().as_secs().saturating_add(2) } else { 0 };
         let own_cost = match tokens {
-            None => price.cost(sink.bytes, secs).unwrap_or(u64::MAX),
+            // a WebSocket's bytes either way
+            None => price.cost(sink.bytes.saturating_add(up.load(Ordering::SeqCst)), secs).unwrap_or(u64::MAX),
             Some((body_len, max_output)) => {
                 if !event_stream {
                     let (guess, u) = xbt402::tokens::whole(&whole_body);
