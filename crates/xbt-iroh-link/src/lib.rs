@@ -35,6 +35,10 @@ use tokio::net::{TcpListener, TcpStream};
 /// The link's protocol: one HTTP/1.1 exchange (or a WebSocket after its upgrade) per stream.
 pub const ALPN: &[u8] = b"xbt-stream/http/1";
 
+/// The hashrate link's protocol: each stream carries one hashlink connection (its own Noise
+/// handshake and messages) between a hashtaker's app and a hashmaker's app.
+pub const ALPN_HASHLINK: &[u8] = b"xbt-stream/hashlink/0";
+
 /// The suffix of a seller's link host name. `.invalid` never resolves through DNS.
 pub const HOST_SUFFIX: &str = ".link.invalid";
 
@@ -90,6 +94,8 @@ pub struct Link {
     lookup: Option<Arc<nostr_lookup::NostrLookup>>,
     paths: Arc<Mutex<HashMap<EndpointId, Path>>>,
     detail: AtomicBool,
+    /// The protocol this link serves and opens: [`ALPN`] unless started with [`Link::start_alpn`].
+    alpn: &'static [u8],
 }
 
 /// The path a connection to a peer runs over now.
@@ -160,6 +166,12 @@ impl Link {
 
     /// Starts the link with these options.
     pub fn start_with(secret: [u8; 32], opts: Options) -> io::Result<Arc<Link>> {
+        Self::start_alpn(secret, opts, ALPN)
+    }
+
+    /// Starts a link for another protocol than HTTP (e.g. [`ALPN_HASHLINK`]): its streams are still
+    /// joined to TCP connections, but a peer speaking another protocol is refused in the handshake.
+    pub fn start_alpn(secret: [u8; 32], opts: Options, alpn: &'static [u8]) -> io::Result<Arc<Link>> {
         let Options { relays, serving, private, lookup } = opts;
         if private && matches!(relays, Relays::None) {
             return Err(io_err("private mode needs a relay"));
@@ -180,7 +192,7 @@ impl Link {
         };
         let mut b = Endpoint::builder(presets::Minimal).secret_key(SecretKey::from_bytes(&secret)).relay_mode(relay_mode);
         if serving {
-            b = b.alpns(vec![ALPN.to_vec()]);
+            b = b.alpns(vec![alpn.to_vec()]);
         }
         if private {
             b = b.clear_ip_transports();
@@ -197,7 +209,7 @@ impl Link {
             }
         }
         let ep = rt.block_on(b.bind()).map_err(io_err)?;
-        Ok(Arc::new(Link { rt, ep, lookup, ports: Mutex::new(HashMap::new()), hints: Mutex::new(HashMap::new()), shops: Mutex::new(HashMap::new()), paths: Arc::new(Mutex::new(HashMap::new())), detail: AtomicBool::new(false) }))
+        Ok(Arc::new(Link { rt, ep, lookup, ports: Mutex::new(HashMap::new()), hints: Mutex::new(HashMap::new()), shops: Mutex::new(HashMap::new()), paths: Arc::new(Mutex::new(HashMap::new())), detail: AtomicBool::new(false), alpn }))
     }
 
     /// This link's key, as hex: what a seller's listing names and its node vouches for.
@@ -286,7 +298,7 @@ impl Link {
             }
             a
         };
-        let ep = self.ep.clone();
+        let (ep, alpn) = (self.ep.clone(), self.alpn);
         let (paths, detail) = (self.paths.clone(), self.detail.load(Ordering::Relaxed));
         self.rt.spawn(async move {
             let conn: Arc<tokio::sync::Mutex<Option<Connection>>> = Arc::new(tokio::sync::Mutex::new(None));
@@ -294,7 +306,7 @@ impl Link {
                 let (ep, addr, conn, paths) = (ep.clone(), addr.clone(), conn.clone(), paths.clone());
                 tokio::spawn(async move {
                     let _ = tcp.set_nodelay(true);
-                    let Some((send, recv)) = open(&ep, &addr, &conn, &paths, detail).await else { return };
+                    let Some((send, recv)) = open(&ep, &addr, &conn, &paths, detail, alpn).await else { return };
                     join(tcp, send, recv).await;
                 });
             }
@@ -423,14 +435,14 @@ async fn connect_from(from: Ipv4Addr, upstream: SocketAddr) -> io::Result<TcpStr
 
 /// A stream on the link to `addr`, connecting (again) when there is no live connection.
 async fn open(ep: &Endpoint, addr: &EndpointAddr, conn: &tokio::sync::Mutex<Option<Connection>>,
-              paths: &Arc<Mutex<HashMap<EndpointId, Path>>>, detail: bool) -> Option<(SendStream, RecvStream)> {
+              paths: &Arc<Mutex<HashMap<EndpointId, Path>>>, detail: bool, alpn: &[u8]) -> Option<(SendStream, RecvStream)> {
     let mut c = conn.lock().await;
     if let Some(live) = c.as_ref() {
         if let Ok(s) = live.open_bi().await {
             return Some(s);
         }
     }
-    let fresh = ep.connect(addr.clone(), ALPN).await.ok()?;
+    let fresh = ep.connect(addr.clone(), alpn).await.ok()?;
     watch(fresh.clone(), paths.clone(), detail);
     let s = fresh.open_bi().await.ok()?;
     *c = Some(fresh);

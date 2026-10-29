@@ -2085,6 +2085,49 @@ fn hashrate_without_a_public_address_is_not_listed_and_says_why() {
     assert_eq!(read()["linkPublic"], json!(""), "an empty address clears it: no listing on public relays");
 }
 
+/// A hashmaker whose direct link is up needs no port forward: the page says so in plain words, the
+/// forwarded address moves under Advanced as optional, and the offer is listed without one.
+#[test]
+fn hashrate_over_the_direct_link_needs_no_address() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (hasher, _hseen) = control_standin(|m, p| match (m, p) {
+        ("GET", "/status") => json!({
+            "open": true, "settings": {"enabled": true, "fallback": "192.168.1.20:23334", "priceSat": 40, "sliceWork": "140737488355328", "graceMs": 45000,
+                                       "rentable": 1, "name": "Basement miners", "linkPublic": null},
+            "minersAddress": "umbrel.local:23340", "linkLan": "umbrel.local:23341",
+            "iroh": {"id": "ab".repeat(32), "relays": ["https://relay.example/"]},
+            "listing": {"ok": true, "freeMiners": 1, "miners": 1},
+            "miners": [{"name": "s11", "connected": true, "hashrateHs": 4.1e12, "rentedTo": null, "earnedMsat": 0}], "rentals": []}),
+        _ => json!({"error": "no"}),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let htok = dir.path().join("hasher-token");
+    std::fs::write(&htok, "h".repeat(64)).unwrap();
+    let settings = dir.path().join("hashrate/settings.json");
+    let gw = dir.path().join("gateway");
+    std::fs::create_dir_all(&gw).unwrap();
+    let bx = start(json!({}), false, |c| {
+        c.sell = true;
+        c.gw.dir = gw.clone();
+        c.gw.node_rest = Some("https://10.21.21.66:8180".into());
+        c.hash.hasher = Some(hasher.clone());
+        c.hash.hasher_token = Some(htok.clone());
+        c.hash.settings = settings.clone();
+    });
+    let mut br = logged_in(&bx);
+    let p = br.get("/sell-hashrate");
+    for s in ["No setup", "no port forward, address or certificate is needed", "Listed", "Also reachable at a forwarded address"] {
+        assert!(p.body.contains(s), "{s} missing from Sell hashrate: {}", p.body);
+    }
+    assert!(!p.body.contains("(needs a port forward or tunnel)"), "the port forward is no longer asked for: {}", p.body);
+    // the forwarded address sits under Advanced, after the main choices
+    let adv = p.body.find("<summary>Advanced</summary>").unwrap();
+    assert!(p.body.find("Also reachable at a forwarded address").unwrap() > adv, "the forwarded address is under Advanced");
+    // saving without one is fine
+    let r = br.act("/sell-hashrate", "/sell-hashrate", &[("action", "save"), ("fallback", "192.168.1.20:23334"), ("price", "40"), ("enabled", "1")]);
+    assert!(br.flash_after(&r).starts_with("Saved."));
+}
+
 // --- no setup on a box: the node connects itself, the box's login, the code, the player, your shop --
 
 /// The keys the app makes itself through the box's node: the Lightning page says it is connected by

@@ -1,6 +1,6 @@
 [package]
 name = "xbt-hashlink"
-description = "p2p-hash: rented hashrate over Lightning Stream. The hashrate link (BOLT 8 Noise_XK between the hashmaker's app and the hashtaker's app), the hashmaker's Stratum V1 endpoint for its miners, the hashtaker's Stratum V1 client to its own DATUM Gateway, the work meter and per-slice ticket releases"
+description = "p2p-hash: rented hashrate over Lightning Stream. The hashrate link (BOLT 8 Noise_XK between the hashmaker's app and the hashtaker's app, carried over iroh or plain TCP), the hashmaker's Stratum V1 endpoint for its miners, the hashtaker's Stratum V1 client to its own DATUM Gateway, the work meter and per-slice ticket releases"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -19,6 +19,9 @@ getrandom = "0.2"
 base64.workspace = true
 # the hashrate listing on Nostr (NIP-99), and the stand-in relay for the lab
 xbt-nostr.workspace = true
+# the hashrate link over iroh: no port forward, through our relay or directly (the link's own Noise
+# handshake runs inside it, unchanged)
+xbt-iroh-link = { path = "../xbt-iroh-link" }
 # the stand-in pool's and miner's share hash (lab only)
 blake2.workspace = true
 

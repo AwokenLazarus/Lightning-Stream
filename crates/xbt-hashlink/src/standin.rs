@@ -211,6 +211,18 @@ pub struct MinerResult {
     /// after the miner started).
     pub max_gap_ms: u64,
     pub max_gap_end_ms: u64,
+    /// Each share's round trip, from its submit to the pool's answer, in microseconds.
+    pub share_rtt_us: Vec<u64>,
+}
+
+impl MinerResult {
+    /// The `q` quantile (0..=1) of the shares' round trips, in microseconds.
+    pub fn rtt_quantile_us(&self, q: f64) -> Option<u64> {
+        let mut v = self.share_rtt_us.clone();
+        v.sort_unstable();
+        let i = ((v.len() as f64 - 1.0) * q.clamp(0.0, 1.0)).round() as usize;
+        v.get(i).copied()
+    }
 }
 
 #[derive(Default)]
@@ -227,6 +239,9 @@ struct MinerSt {
     gone: bool,
     /// The connection now in use: a reader of an older one changes nothing.
     gen: u64,
+    /// When each share in flight was submitted, and the round trips of those answered.
+    sent: std::collections::HashMap<u64, Instant>,
+    rtt_us: Vec<u64>,
 }
 
 /// Run the stand-in miner until its time is up (or, without `reconnect`, its connection ends).
@@ -297,7 +312,10 @@ pub fn miner(cfg: MinerConfig) -> Result<MinerResult, String> {
                         return;
                     } else if v.get("id") == Some(&json!(1)) {
                         g.en1 = v["result"][1].as_str().unwrap_or("").to_string();
-                    } else if v.get("id").and_then(Value::as_u64).is_some_and(|i| i >= 10) {
+                    } else if let Some(i) = v.get("id").and_then(Value::as_u64).filter(|i| *i >= 10) {
+                        if let Some(at) = g.sent.remove(&i) {
+                            g.rtt_us.push(at.elapsed().as_micros() as u64);
+                        }
                         if sv1::accepted(&v) {
                             g.accepted += 1;
                             let now = Instant::now();
@@ -365,6 +383,7 @@ pub fn miner(cfg: MinerConfig) -> Result<MinerResult, String> {
             if cfg.bad_every > 0 && (id - 10).is_multiple_of(cfg.bad_every) {
                 nonce = "ffffffff".into();
             }
+            st.lock().unwrap().sent.insert(id, Instant::now());
             if say(&mut w, json!({"id": id, "method": "mining.submit", "params": [cfg.user, job, e2, ntime, nonce]})).is_err() {
                 st.lock().unwrap().gone = true;
             }
@@ -379,5 +398,6 @@ pub fn miner(cfg: MinerConfig) -> Result<MinerResult, String> {
     res.extranonce_changes = g.extranonce_changes;
     res.max_gap_ms = g.max_gap.as_millis() as u64;
     res.max_gap_end_ms = g.max_gap_end.map(|t| (t - t0).as_millis() as u64).unwrap_or(0);
+    res.share_rtt_us = g.rtt_us.clone();
     Ok(res)
 }
