@@ -119,6 +119,15 @@ pub fn request_auth(key: &[u8; 32], session: &str, seq: u64, secret: &str, ticke
     hex::encode(m.finalize().into_bytes())
 }
 
+/// The label of a buyer's key and of its proof (docs/BUYER-ACCOUNTS.md).
+pub const BUYER_TAG: &str = "xbt402 buyer v1";
+
+/// What a buyer signs to tie its key to one session of one seller (`identify`): the label, the
+/// seller's receipt key and the session id, so that a proof is good for that session alone.
+pub fn buyer_message(receipt_key: &str, session: &str) -> [u8; 32] {
+    Sha256::digest(format!("{BUYER_TAG}\n{}\n{session}", receipt_key.to_ascii_lowercase()).as_bytes()).into()
+}
+
 /// The fields a ticket receipt signs, in order.
 pub const RECEIPT_FIELDS: [&str; 9] = ["scheme", "session", "seq", "releasedMsat", "spentMsat", "charged", "req", "status", "bodyHash"];
 
@@ -201,9 +210,9 @@ impl Terms {
 /// The error codes of the ticket scheme and of the lottery beside it ([`crate::lottery`]): what a
 /// gateway answers a payer with. Every code the gateway in this tree can answer with is here (a
 /// test there holds it to that), so that a payer can name each.
-pub const PROTOCOL_CODES: [&str; 36] = [
-    "amount_mismatch", "amount_not_below_win", "bad_auth", "bad_payment", "bad_request", "bad_seq", "bad_target", "balance_short", "chain_spent",
-    "draw_out_of_order", "draw_used", "hash_refused", "internal", "journal", "method_not_allowed", "no_route", "node_unavailable", "path_refused",
+pub const PROTOCOL_CODES: [&str; 38] = [
+    "accounts_unavailable", "amount_mismatch", "amount_not_below_win", "bad_auth", "bad_payment", "bad_request", "bad_seq", "bad_target", "balance_short", "chain_spent",
+    "draw_out_of_order", "draw_used", "hash_refused", "identify_first", "internal", "journal", "method_not_allowed", "no_route", "node_unavailable", "path_refused",
     "piece_unknown", "pledge_outstanding", "prepaid_first", "session_unknown", "slots_short", "ticket_expiring", "ticket_not_locked", "ticket_unknown", "ticket_used",
     "too_many_sessions", "too_many_tickets", "too_many_voids", "upstream_unavailable", "value_conflict", "value_missing", "value_reused",
     "win_size", "win_unpaid",

@@ -42,6 +42,7 @@ use zeroize::Zeroizing;
 
 use crate::ln::LnPolicy;
 use crate::policy::normalize_dest;
+use crate::keystore::write_private;
 use crate::pyjson::{py_int, str_or_empty};
 use crate::sanitize::{untrusted, UNTRUSTED_KEY};
 use crate::signer::{deny, with, Signer};
@@ -994,6 +995,9 @@ fn forward_up(mut from: std::os::unix::net::UnixStream, mut writer: Box<dyn Writ
     let _ = from.shutdown(std::net::Shutdown::Read);
 }
 
+/// The sellers the owner stays anonymous at (docs/BUYER-ACCOUNTS.md), in the wallet's run directory.
+const IDENTITY_FILE: &str = "identity.json";
+
 /// How long a ticket's payment is taken to last before one of the answer has been timed: a
 /// Lightning payment across a route or two.
 const FIRST_PAY_S: f64 = 3.0;
@@ -1916,10 +1920,71 @@ impl Signer {
         if let Err(e) = self.ticket_set_http(&hs.sid, SellerSession { id: seller_sid.clone(), key, base: hs.base.clone() }) {
             return Err(refusal("ticket", e.msg));
         }
-        let mut link = lock_link(hs);
-        link.seller_sid = seller_sid;
-        link.key = Zeroizing::new(key);
+        {
+            let mut link = lock_link(hs);
+            link.seller_sid = seller_sid;
+            link.key = Zeroizing::new(key);
+        }
+        // a seller that gives its buyers accounts asks to recognise them: told who this wallet is to it, unless the owner said not to
+        if self.identify_wanted(hs) {
+            if let Err(why) = self.ticket_identify(hs) {
+                self.engine.audit.append(json!({"type": "identify_failed", "origin": hs.origin, "why": why}));
+            }
+        }
         Ok(v)
+    }
+
+    /// Whether to tell this seller who this wallet is: its terms ask (`identify`), and the owner has
+    /// not chosen to stay anonymous there (docs/BUYER-ACCOUNTS.md).
+    fn identify_wanted(&self, hs: &HttpSession) -> bool {
+        hs.terms.accepted["extra"]["identify"] == true && !self.anonymous_at(&hs.origin)
+    }
+
+    /// The sellers the owner stays anonymous at, by origin (`identity.json`).
+    pub(crate) fn anonymous_origins(&self) -> Vec<String> {
+        std::fs::read_to_string(self.run.join(IDENTITY_FILE)).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .and_then(|v| v.get("anonymous").and_then(Value::as_array).cloned()).unwrap_or_default()
+            .iter().filter_map(|o| o.as_str().map(normalize_dest)).collect()
+    }
+
+    fn anonymous_at(&self, origin: &str) -> bool {
+        self.anonymous_origins().contains(&normalize_dest(origin))
+    }
+
+    /// `identity_set`: stay anonymous at a seller (`anonymous: true`), or let it recognise this
+    /// wallet. Read again by every session that opens after it.
+    pub(crate) fn identity_set(&self, p: &Value) -> Value {
+        let origin = match origin_of(&str_or_empty(p.get("origin"))) {
+            Ok(o) => normalize_dest(&o),
+            Err(e) => return deny("dest", e.msg),
+        };
+        let mut all = self.anonymous_origins();
+        all.retain(|o| o != &origin);
+        if p.get("anonymous").and_then(Value::as_bool) == Some(true) {
+            all.push(origin);
+        }
+        all.sort();
+        match write_private(&self.run.join(IDENTITY_FILE), &json!({"anonymous": all}).to_string()) {
+            Ok(()) => json!({"ok": true, "anonymous": all}),
+            Err(e) => deny("identity", e.msg),
+        }
+    }
+
+    /// Tell the seller who this wallet is to it, for this session: its key for this seller alone,
+    /// and a signature over the seller's receipt key and this session's id (`identify`).
+    fn ticket_identify(&self, hs: &HttpSession) -> std::result::Result<(), String> {
+        let receipt_key = hex::encode(&hs.terms.receipt_key);
+        let sk = self.buyer_key(&receipt_key).map_err(|e| e.msg)?;
+        let session = lock_link(hs).seller_sid.clone();
+        let msg = xbt402::ticket::buyer_message(&receipt_key, &session);
+        let secp = xbt402::xbt_primitives::secp256k1::Secp256k1::signing_only();
+        let pubkey = xbt402::xbt_primitives::secp256k1::PublicKey::from_secret_key(&secp, &sk);
+        let body = json!({"buyer": hex::encode(pubkey.serialize()), "sig": hex::encode(xbt402::xbt_primitives::ecdsa::sign(&sk, &msg))});
+        match self.ticket_call(hs, "identify", &body, false) {
+            Ok((200, _, _)) => Ok(()),
+            Ok((status, v, _)) => Err(format!("the seller refused identify: HTTP {status} {}", protocol_code(v.get("error")))),
+            Err(e) => Err(e.msg),
+        }
     }
 
     /// Buy one prepaid ticket for the session and show the seller its preimage: the seller's
@@ -2483,6 +2548,7 @@ impl Signer {
         let mut short = 0;
         // a WebSocket's way to the seller, once it said 101
         let mut up_writer: Option<Box<dyn Write + Send>> = None;
+        let mut identified_again = false;
         let (seq, digest, ans, head) = loop {
             // whole tickets until the seller's balance covers what it wants before it serves
             let mut rounds = 0;
@@ -2568,6 +2634,17 @@ impl Signer {
             drop(link);
             if let Some(why) = hs.fault() {
                 return fail(hs, &spent, with(self.ticket_fault(hs, &why), json!({"status": ans.status})));
+            }
+            // a seller that gives accounts and has not been told who this wallet is (it restarted, say): told, and asked again, once
+            if ans.status == 403 && !identified_again && self.identify_wanted(hs) {
+                let v: Value = ans.read_small(SMALL_BODY).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+                if v.get("error").and_then(Value::as_str) == Some("identify_first") {
+                    identified_again = true;
+                    if self.ticket_identify(hs).is_ok() {
+                        continue;
+                    }
+                }
+                return fail(hs, &spent, with(refusal("ticket_refused", "the seller asks to know who this wallet is first, and could not be told"), json!({"status": 403})));
             }
             if matches!(ans.status, 402 | 503) {
                 let status = ans.status;

@@ -204,7 +204,7 @@ impl Handler for Service {
             z.write_all(APP_PAGE.as_bytes()).unwrap();
             return Reply::Whole(Response::new(200, vec![("Content-Type".into(), "text/html".into()), ("Content-Encoding".into(), "gzip".into())], z.finish().unwrap()));
         }
-        if path == "/app/echo" {
+        if path == "/app/echo" || path == "/acct/echo" {
             let h = |k: &str| req.header(k).unwrap_or("").to_string();
             let v = json!({"method": req.method, "body": String::from_utf8_lossy(&req.body), "cookie": h("Cookie"), "authorization": h("Authorization"),
                            "guest": h("X-Guest"), "host": h("Host")});
@@ -221,6 +221,9 @@ impl Handler for Service {
 
 /// The stand-in web app's page.
 const APP_PAGE: &str = "<!doctype html><title>A seller's app</title><script src=\"./app.js\"></script>";
+
+/// The seller's accounts hook in the rig: it names the buyer it is given in a header.
+const ACCOUNT_HOOK: &str = "/tmp/xbt-ticket-pay-account-hook.sh";
 
 fn routes() -> Value {
     json!([
@@ -245,6 +248,8 @@ fn routes() -> Value {
         // WebSockets: 2.5 sat to open and 1 sat a KiB either way, and a free one
         {"path": "/ws/", "price": {"request_msat": 2500, "byte_msat": 1000, "per_bytes": 1024}, "websocket": true},
         {"path": "/wsfree/", "free": true, "websocket": true},
+        // a buyer's own account (docs/BUYER-ACCOUNTS.md), made by the seller's hook: its headers say who the buyer is
+        {"path": "/acct/", "methods": ["GET", "POST"], "price": {"request_msat": 2500}, "accounts": {"kind": "hook", "command": ACCOUNT_HOOK}},
         {"path": "/tick/", "price": {"second_msat": 1000}},
         {"path": "/free/", "free": true},
         // a model: 4 sat per 1,000 tokens in, 20 sat per 1,000 tokens out, at most 500 tokens a reply
@@ -4529,4 +4534,39 @@ fn a_websocket_is_carried_both_ways_and_every_byte_paid() {
         }
     }
     std::env::remove_var("B2_STREAM_DIR");
+}
+
+/// A seller that gives each buyer an account asks to know who they are, and the wallet tells it on
+/// its own: a key for that seller alone, the same in every session of one wallet, another for
+/// another wallet. A wallet that stays anonymous there says nothing, and that seller refuses it.
+#[test]
+fn a_wallet_tells_a_seller_with_accounts_who_it_is_and_stays_anonymous_when_told() {
+    let _g = env_lock();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(ACCOUNT_HOOK, "#!/bin/sh\nprintf '{\"headers\": {\"X-Guest\": \"buyer-%s\"}}' \"$1\"\n").unwrap();
+        std::fs::set_permissions(ACCOUNT_HOOK, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let who = |r: &Rig| -> String {
+        let v = r.call("xbt402_pay", json!({"url": r.shop.url("/acct/echo"), "max_sats": CALL, "task": "film"}));
+        assert_eq!(v["status"], 200, "{v}");
+        let body: Value = serde_json::from_str(v["untrusted_provider_response"]["body"].as_str().unwrap()).unwrap();
+        body["guest"].as_str().unwrap().to_string()
+    };
+    let r = Rig::new(json!({}));
+    let first = who(&r);
+    assert!(first.starts_with("buyer-") && first.len() == 18, "the service got the buyer's own account: {first}");
+    assert!(r.tap.seen("/x402/ticket/identify").len() == 1, "the wallet said who it is, once a session");
+    assert_eq!(who(&r), first, "the same wallet, the same buyer");
+    // another wallet: another buyer at the same seller
+    let other = Rig::new(json!({}));
+    assert_ne!(who(&other), first);
+    // staying anonymous there: nothing is said, and a seller with no guest for anonymous buyers refuses
+    let quiet = Rig::new(json!({}));
+    let set = quiet.call("identity_set", json!({"origin": quiet.shop.origin, "anonymous": true}));
+    assert_eq!(set["ok"], true, "{set}");
+    let v = quiet.call("xbt402_pay", json!({"url": quiet.shop.url("/acct/echo"), "max_sats": CALL, "task": "film"}));
+    assert_eq!(v["status"], 403, "{v}");
+    assert!(quiet.tap.seen("/x402/ticket/identify").is_empty(), "an anonymous wallet says nothing");
+    let _ = std::fs::remove_file(ACCOUNT_HOOK);
 }
