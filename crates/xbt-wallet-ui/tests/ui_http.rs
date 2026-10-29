@@ -2731,7 +2731,9 @@ fn a_shop_without_a_web_address_is_added_by_its_key_and_allowed_through_the_node
     assert!(rules.contains(&format!("Allow {npub} to be paid")), "the rules page names the shop by its key");
 
     // a wrong key, and an unknown one
-    let r = br.act("/services", "/services", &[("action", "add"), ("url", &format!("{}x", &npub[..npub.len() - 1]))]);
+    // the last character changed to a different one: bech32's checksum catches any one changed character
+    let last = if npub.ends_with('q') { 'p' } else { 'q' };
+    let r = br.act("/services", "/services", &[("action", "add"), ("url", &format!("{}{last}", &npub[..npub.len() - 1]))]);
     assert!(br.flash_after(&r).contains("not a valid one"));
     let other = xbt402::shop::npub(&Keys::generate().public.serialize());
     let r = br.act("/services", "/services", &[("action", "add"), ("url", &other)]);
