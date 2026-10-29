@@ -5129,6 +5129,7 @@ dependencies = [
  "ureq",
  "url",
  "xbt-gateway",
+ "xbt-iroh-link",
  "xbt-primitives",
  "xbt-svc",
  "xbt402",
