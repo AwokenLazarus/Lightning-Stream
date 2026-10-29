@@ -1028,12 +1028,17 @@ fn a_release_is_under_every_rule_of_the_wallet() {
     assert_eq!(verdicts, ["ok", "ok", "ok", "velocity"]);
     assert_eq!((r.ledger_sum(), r.status()["tickets"]["released"].as_i64()), (3 * BOOKING, Some(3)), "a refused release books nothing and releases nothing");
     assert!(r.call("history", json!({"limit": 50}))["events"].as_array().unwrap().iter().all(|e| e["approval_token"].is_null()), "no approval is asked for a release");
-    // the split window: many small releases to one seller do not add up past the per-payment limit
-    let r = Rig::new(json!({"split_window_s": 600, "max_per_tx_sats": 2_500}));
+    // the split window is for payments cut in two: refills the ticket rail decides are not, so many
+    // releases to one seller inside the window pass the per-payment limit's sum; what binds them is
+    // the cap on one counterparty (and the ticket budgets, the day and the week)
+    let r = Rig::new(json!({"split_window_s": 600, "max_per_tx_sats": 2_500, "per_counterparty_cap_sats": 3 * BOOKING + 1}));
     let sid = r.open();
     r.fill(&sid);
-    let verdicts: Vec<String> = (0..3).map(|_| r.release(&sid)["rule"].as_str().unwrap_or("ok").to_string()).collect();
-    assert_eq!(verdicts, ["ok", "ok", "split_bypass"]);
+    let verdicts: Vec<String> = (0..4).map(|_| r.release(&sid)["rule"].as_str().unwrap_or("ok").to_string()).collect();
+    assert_eq!(verdicts[..3], ["ok", "ok", "ok"]);
+    // the fourth is not paid: the cap stops it at the lock or at the release
+    assert!(["per_counterparty", "ticket_none"].contains(&verdicts[3].as_str()), "{verdicts:?}");
+    assert_eq!(r.ledger_sum(), 3 * BOOKING, "nothing past the counterparty cap is paid");
     // a ticket too close to its expiry is not released: the seller would refuse it and keep the secret
     let r = Rig::new(json!({}));
     let sid = r.open();

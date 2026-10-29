@@ -4082,6 +4082,22 @@ fn starter_rules_buy_a_ticket_under_the_approval_threshold_from_a_seller_that_al
     }
 }
 
+/// Under the starter rules (ask above 1,000 sats, 2,000 a payment), one call that uses more than a
+/// ticket buys a second one minutes after the first: a refill the ticket rail decides is not a
+/// payment cut in two, so the split rule does not refuse it, and the caps still bound the whole.
+#[test]
+fn starter_rules_let_one_call_buy_a_second_ticket_inside_the_split_window() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({"human_threshold_sats": 1_000, "max_per_tx_sats": 2_000}), 30, sized_shop(json!(["on-arrival"]), Some(546_000)));
+    // 6 MiB at 200 sat a MiB: 1,200 sat, more than any ticket under the threshold
+    let v = r.pay(&format!("/files/{}", 6 * 1_048_576), 2_000);
+    assert_eq!(v["status"].as_u64(), Some(200), "{v}");
+    assert!(v["tickets_prepaid"].as_u64().unwrap_or(0) >= 2, "a second ticket was bought: {v}");
+    let tickets: Vec<i64> = r.ledger().iter().filter_map(|row| row["amount_sats"].as_i64()).collect();
+    assert!(tickets.len() >= 2 && tickets.iter().all(|t| *t < 1_000), "every ticket under the threshold: {tickets:?}");
+    assert!(r.ledger_sum() >= 1_000 && r.ledger_sum() <= 2_000, "{}", r.ledger_sum());
+}
+
 /// A seller of one ticket size above what the owner's threshold allows is refused before anything is
 /// paid, in words that say which limit and by how much.
 #[test]
