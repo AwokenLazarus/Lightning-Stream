@@ -614,8 +614,11 @@ fn session_card(ctx: &Ctx, id: &str, name: &str, origin: &str, state: &str, c: &
         "stopping" | "stopped" => "<span class=\"pill warn\">Stopping</span>",
         _ => "<span class=\"pill\">Closed</span>",
     };
-    let rate = if open && minutes >= 1.0 && spent > 0 {
-        format!(" · about <span class=\"money\">{}</span> a minute", sats_short((spent as f64 / minutes).round() as i64))
+    // the rate is of what the seller used, where its receipts say: a prepaid ticket is paid all at once
+    let used_msat = row.and_then(|p| p.get("spent_msat")).and_then(msat_of);
+    let per_min = used_msat.map_or(spent as f64, |m| m as f64 / 1000.0) / minutes.max(1.0);
+    let rate = if open && minutes >= 1.0 && per_min > 0.0 {
+        format!(" · about <span class=\"money\">{}</span> a minute", msat_text((per_min * 1000.0).round() as u64))
     } else {
         String::new()
     };
