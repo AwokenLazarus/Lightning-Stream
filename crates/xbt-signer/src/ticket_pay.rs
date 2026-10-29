@@ -870,8 +870,10 @@ impl Money {
     /// A receipt's totals into the wallet's count. Answers run side by side, so receipts are read in
     /// another order than the seller signed them: one older than the totals already taken (a lower
     /// `releasedMsat` or `spentMsat`) only had its own figures checked, and is otherwise passed over
-    /// (`Ok(false)`). A newer one is taken if its spend is inside what the wallet can account for:
-    /// the spend at the last quiet point, what the wallet counted since, and what the requests
+    /// (`Ok(false)`), but for a `releasedMsat` above the one held: the seller's spend can fall (it
+    /// gives back what bought nothing), its released total only rises. A newer one is taken if its
+    /// spend is inside what the wallet can account for: the spend at the last quiet point, what the
+    /// wallet counted since, and what the requests
     /// still open may add, each at most its call's limit. Where nothing is open, the spend since the
     /// last quiet point is at most what the seller's receipts charged the answers closed since.
     /// `charged_max`: the most this receipt may say its request was charged. `outstanding`: a secret
@@ -888,6 +890,9 @@ impl Money {
             return Err(format!("the seller says {} msat were released, the wallet released {}", r.released_msat, self.acct.sent_msat));
         }
         if r.released_msat < self.acct.acked_msat || r.spent_msat < self.acct.spent_msat {
+            // the seller gives back a charge that bought nothing, so a newer receipt can say less was spent; what it
+            // says was released only rises, and confirms the tickets it names
+            self.acct.acked_msat = self.acct.acked_msat.max(r.released_msat);
             return Ok(false);
         }
         if !outstanding && r.released_msat != self.acct.sent_msat {
@@ -3098,7 +3103,9 @@ impl Signer {
                     // a whole answer is paid for at its head: closed by its receipt
                     m.close(seq, head.charged, head.charged);
                 }
-                if let Err(why) = m.take(&head, charged_max, false) {
+                // a ticket another request released may be on its way: this head was signed before the seller took it
+                let outstanding = m.pending.is_some();
+                if let Err(why) = m.take(&head, charged_max, outstanding) {
                     m.fault.get_or_insert(why);
                 }
                 let metered = metered && m.fault.is_none();
@@ -3995,6 +4002,24 @@ mod tests {
         assert_eq!(m.acct.spent_msat, 5000);
         // its own charge is still held to its price
         assert!(m.take(&receipt(1, 1_000_000, 2500, 9999), 2500, false).is_err());
+    }
+
+    /// The seller gives a charge back when its answer could not be sent (a page the browser
+    /// dropped), so its spend can fall between two receipts, while what it says was released only
+    /// rises. A receipt passed over for its spend still confirms the tickets it says were released.
+    #[test]
+    fn a_receipt_passed_over_for_its_spend_still_confirms_what_was_released() {
+        let mut m = money(1_000_000);
+        m.open.insert(1, 50_000);
+        assert_eq!(m.take(&receipt(1, 1_000_000, 30_000, 2500), 50_000, false), Ok(true));
+        // a ticket released, and on its way
+        m.acct.released(1_000_000);
+        // the seller took it after giving back 20 sat of an answer it could not send
+        assert_eq!(m.take(&receipt(2, 2_000_000, 10_000, 0), 0, true), Ok(false));
+        assert_eq!((m.acct.acked_msat, m.acct.spent_msat), (2_000_000, 30_000), "released taken, the spend held");
+        // a receipt from before the ticket was taken changes nothing
+        assert_eq!(m.take(&receipt(1, 1_000_000, 30_000, 2500), 50_000, false), Ok(false));
+        assert_eq!(m.acct.acked_msat, 2_000_000);
     }
 
     #[test]

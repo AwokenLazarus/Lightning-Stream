@@ -4930,6 +4930,42 @@ fn an_older_receipt_read_after_a_newer_one_is_passed_over() {
     r.assert_booked();
 }
 
+/// A page's head read while a ticket released for a film is still on its way to the seller carries
+/// the seller's totals from before it: the secret has left the wallet and the seller has not taken
+/// it yet. That is no seller fault, and every answer goes on.
+#[test]
+fn a_head_read_while_a_released_ticket_is_on_its_way_is_no_seller_fault() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    let first = r.pay("/page/10", CALL);
+    assert_eq!(first["status"], 200, "{first}");
+    let releases = r.tap.seen("/x402/ticket/release").len();
+    r.tap.set(Box::new(|seen, real| {
+        if seen.path == "/x402/ticket/release" {
+            std::thread::sleep(Duration::from_millis(800));
+            return Some(real());
+        }
+        None
+    }));
+    std::thread::scope(|sc| {
+        let film = sc.spawn(|| r.pay(&format!("/hd20/{}", 80 * MIB), CALL));
+        wait_for("a ticket released for the film", || r.tap.seen("/x402/ticket/release").len() > releases);
+        let pages: Vec<_> = (0..4).map(|i| { let r = &r; sc.spawn(move || r.pay(&format!("/page/{}", 30 + i), CALL)) }).collect();
+        for p in pages {
+            let v = p.join().unwrap();
+            assert_eq!((v["status"].as_u64(), v.get("seller_fault")), (Some(200), None), "{v}");
+        }
+        // (held this long at this speed the film may run past its credit and be cut: that is no fault either)
+        let f = film.join().unwrap();
+        assert_eq!((f["status"].as_u64(), f.get("seller_fault")), (Some(200), None), "{f}");
+        assert!(!f.to_string().contains("ticket_seller_fault"), "{f}");
+    });
+    r.tap.clear();
+    let v = r.pay("/page/40", CALL);
+    assert_eq!((v["status"].as_u64(), v.get("seller_fault")), (Some(200), None), "{v}");
+    r.assert_booked();
+}
+
 /// A seller that marks the whole balance spent while a WebSocket of the page is open (its spend
 /// moves between receipts, so a receipt's totals cannot be held to one request's price) is caught:
 /// the open requests may add at most their own calls' limits, and a balance drained past them is a
