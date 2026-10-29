@@ -5054,9 +5054,9 @@ dependencies = [
  "getrandom 0.2.17",
  "hex",
  "iroh",
- "secp256k1",
  "sha2 0.10.9",
  "tokio",
+ "xbt402",
 ]
 
 [[package]]
@@ -5218,6 +5218,7 @@ dependencies = [
  "getrandom 0.2.17",
  "hex",
  "hmac",
+ "secp256k1",
  "serde",
  "serde_json",
  "sha2 0.10.9",

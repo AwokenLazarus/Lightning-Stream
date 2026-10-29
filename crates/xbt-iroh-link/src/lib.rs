@@ -16,7 +16,8 @@
 //!
 //! The link runs its own small async runtime on two threads, so callers stay synchronous.
 
-pub mod claim;
+/// How the seller's node vouches for the link key: one implementation, in xbt402.
+pub use xbt402::claim;
 
 use std::collections::HashMap;
 use std::io;

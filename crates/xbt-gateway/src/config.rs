@@ -184,26 +184,25 @@ pub struct Config {
     pub link: Option<LinkConfig>,
 }
 
-/// The `link` section: the relays the gateway's link uses, whether it is relay-only, and the seller's
-/// node's statement vouching for the link key (written by the app; without it the link still serves,
-/// but buyers cannot check who is behind it, so nothing names it).
+/// The `link` section: the relays the gateway's link uses and whether it is relay-only. The seller's
+/// node vouches for the link key itself, at start (`sign.macaroon` beside `node.macaroon`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkConfig {
     /// `https://` (or `http://` for a lab) relay URLs; empty: iroh's public relays.
     pub relays: Vec<String>,
     /// Relays only: buyers never learn the seller's address.
     pub private: bool,
-    /// lnd `SignMessage` over `xbt_iroh_link::claim::claim_text`, z-base32.
-    pub node_sig: Option<String>,
-    pub node_sig_expires: Option<u64>,
 }
+
+/// `public_url` for a shop reached by key only: replaced at start by its shop origin.
+pub const LINK_ONLY: &str = "link";
 
 /// At most this many relays for the link.
 pub const MAX_LINK_RELAYS: usize = 4;
 
 impl LinkConfig {
     fn parse(v: &Value) -> Result<Self, String> {
-        let m = obj(v, "link", &["relays", "private", "node_sig", "node_sig_expires"])?;
+        let m = obj(v, "link", &["relays", "private"])?;
         let relays = match m.get("relays") {
             None => Vec::new(),
             Some(Value::Array(a)) => a
@@ -223,19 +222,7 @@ impl LinkConfig {
             Some(Value::Bool(b)) => *b,
             Some(_) => return Err("link.private is true or false".into()),
         };
-        let node_sig = match m.get("node_sig") {
-            None | Some(Value::Null) => None,
-            Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
-            Some(_) => return Err("link.node_sig is the node's signature, as text".into()),
-        };
-        let node_sig_expires = match m.get("node_sig_expires") {
-            None | Some(Value::Null) => None,
-            Some(v) => Some(v.as_u64().ok_or("link.node_sig_expires is a Unix time")?),
-        };
-        if node_sig.is_some() != node_sig_expires.is_some() {
-            return Err("link.node_sig and link.node_sig_expires come together".into());
-        }
-        Ok(Self { relays, private, node_sig, node_sig_expires })
+        Ok(Self { relays, private })
     }
 }
 
@@ -417,12 +404,24 @@ impl Config {
             },
             (_, None) => return Err(NEEDS_NETWORK.into()),
         };
-        let public_url = req_str(top, "public_url")?
-            .trim_end_matches('/')
-            .to_string();
-        let origin =
-            xbt402::wire::sendable_url(&public_url).map_err(|e| format!("public_url: {e}"))?;
-        if xbt402::wire::request_url(&origin).target != "/" {
+        // a shop reached by key only has no web address: `public_url` absent, or the word "link". Its
+        // origin is its own shop name (xbt402::shop), set at start from its Nostr key
+        let has_link = top.get("link").is_some_and(|l| !l.is_null());
+        let by_key = matches!(top.get("public_url"), None | Some(Value::Null)) || opt_str(top, "public_url")? == Some(LINK_ONLY);
+        if by_key && !has_link {
+            return Err("public_url: a shop without a web address is reached by key: add a link section, or give the https origin buyers use".into());
+        }
+        let public_url = if by_key {
+            LINK_ONLY.to_string()
+        } else {
+            req_str(top, "public_url")?.trim_end_matches('/').to_string()
+        };
+        let origin = if by_key {
+            String::new()
+        } else {
+            xbt402::wire::sendable_url(&public_url).map_err(|e| format!("public_url: {e}"))?
+        };
+        if !by_key && xbt402::wire::request_url(&origin).target != "/" {
             return Err("public_url is an origin (scheme://host[:port]), without a path".into());
         }
         // the gateway speaks plain HTTP. On a loopback address that is the machine's own business;
@@ -432,8 +431,13 @@ impl Config {
         let loopback = listen
             .parse::<std::net::SocketAddr>()
             .is_ok_and(|a| a.ip().is_loopback());
-        if !loopback && !origin.starts_with("https://") {
+        // a shop reached by key is reached over the link (encrypted, into the gateway's own port);
+        // its listen address is the platform's container network
+        if !loopback && !by_key && !origin.starts_with("https://") {
             return Err(format!("listen {listen} is not a loopback address (an address written as one: a name, even localhost, is whatever the resolver says), and public_url is not https. The gateway speaks plain HTTP: listen on 127.0.0.1 or [::1], or put a TLS proxy in front and set public_url to the https origin buyers use"));
+        }
+        if by_key && top.get("public_aliases").is_some_and(|a| !a.is_null()) {
+            return Err("public_aliases: a shop without a web address has no other origins".into());
         }
         let public_aliases = match top.get("public_aliases") {
             None => Vec::new(),

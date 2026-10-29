@@ -26,7 +26,7 @@ pub fn load_key(state_dir: &std::path::Path) -> Result<Keys, String> {
 pub fn publish_once(gw: &Gateway, keys: &Keys, relays: &[String], now: u64) -> Result<Vec<Outcome>, String> {
     let doc = gw.listing().ok_or("the gateway has no listing")?;
     let bind = gw.bind_nostr(&keys.public.serialize());
-    let ev = market::listing_event(keys, &doc, &bind, now)?;
+    let ev = market::listing_event_with(keys, &doc, &bind, gw.transport().as_ref(), now)?;
     Ok(oneshot::publish(relays, &ev, PUBLISH_WAIT))
 }
 
