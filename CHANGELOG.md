@@ -5,6 +5,34 @@ package (from 0.1.14) and the Linux package (from 0.1.12). Dates are UTC.
 
 Lightning Stream is early software. It runs on mainnet; use small amounts.
 
+## 0.1.18 (2026-10-29)
+
+**Playing films**
+- Closing or pausing the player stops the paying. A browser's video reads ahead of the picture, and
+  a paused one went on filling its buffer, so closing the player half a minute in could cost a whole
+  ticket. The wallet now asks a seller for a film at most 4 MiB at a time, and the player lets go of
+  the film when it is paused for a few seconds, has ended, or its page is left; pressing play takes
+  it up where it was. However a player goes away, it is charged at most one 4 MiB part beyond what
+  it received.
+
+**Spending rules**
+- With the starter rules, a buyer can play a film and then ask the AI of the same shop straight
+  away. The rule that stops one large payment from being cut into small ones also counted the
+  wallet's own ticket refills, so a second 900-sat ticket to one shop within ten minutes was
+  refused. Tickets are now bounded by the ticket budgets, the cap on one seller and the daily,
+  weekly and counterparty limits, and a payment cut in two is still caught.
+
+**The app**
+- Live connections show what a stream has used and the credit left with the seller as it plays,
+  and whether anything is playing.
+- The pages no longer say that money paid ahead comes back: credit on a prepaid ticket stays with
+  that seller and is spent first next time.
+- For agents: `ticket_stop` takes a seller's address as well as a session.
+
+**StartOS**
+- The guide says how to add our registry: Marketplace, then the registry menu, then Add,
+  `https://registry.lazarus-xbt.xyz/`.
+
 ## 0.1.17 (2026-10-27)
 
 **Paying**
