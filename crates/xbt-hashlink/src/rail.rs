@@ -84,6 +84,15 @@ pub struct SignerPayer {
     pub task: String,
     pub max_sats: u64,
     pub session: Option<String>,
+    /// How long a slice's payment waits for a signer whose socket is not there (a wallet that
+    /// starts again): within the hashmaker's grace, so the slice is still paid in time.
+    pub wait_for_signer: std::time::Duration,
+}
+
+/// Whether a failed [`signer_call`] never reached the signer: its socket was missing or refused
+/// the connection, so nothing was asked and the call may be made again without asking twice.
+pub fn signer_unreached(why: &str) -> bool {
+    why.starts_with("signer socket ")
 }
 
 /// One call on the signer's socket.
@@ -109,7 +118,19 @@ impl SignerPayer {
             "url": format!("{}/{rental}/{slice}", self.url.trim_end_matches('/')), "method": "POST",
             "body": receipt.to_string(), "max_sats": self.max_sats, "task": self.task,
         });
-        let mut r = signer_call(&self.sock, "xbt402_pay", &params)?;
+        // a signer that is starting again is waited for, with growing pauses, as long as the call never
+        // reached it: a call that reached it is never made a second time
+        let start = std::time::Instant::now();
+        let mut pause = std::time::Duration::from_millis(250);
+        let mut r = loop {
+            match signer_call(&self.sock, "xbt402_pay", &params) {
+                Err(why) if signer_unreached(&why) && start.elapsed() + pause < self.wait_for_signer => {
+                    std::thread::sleep(pause);
+                    pause = (pause * 2).min(std::time::Duration::from_secs(4));
+                }
+                other => break other?,
+            }
+        };
         if let Some(o) = r.as_object_mut() {
             o.remove("untrusted_provider_response");
         }
@@ -149,5 +170,62 @@ impl SellerRail for LabSeller {
         self.settled_msat += self.price.remove(&slice).ok_or("settle of a ticket never held")?;
         self.settled += 1;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod signer_wait_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::time::{Duration, Instant};
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("xbt-hashlink-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A signer that is starting again (its socket not there yet) is waited for: the slice is
+    /// paid once it is back, and asked of it exactly once.
+    #[test]
+    fn a_slice_waits_for_a_signer_that_starts_again_and_is_asked_once() {
+        let dir = scratch("wait");
+        let sock = dir.join("signer.sock");
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (s2, a2) = (sock.clone(), asked.clone());
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            let l = UnixListener::bind(&s2).unwrap();
+            for c in l.incoming() {
+                let Ok(c) = c else { continue };
+                let mut line = String::new();
+                BufReader::new(c.try_clone().unwrap()).read_line(&mut line).unwrap();
+                a2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut w = c;
+                writeln!(w, "{}", serde_json::json!({"id": 1, "result": {"verdict": "allow", "status": 200, "session": "s1"}})).unwrap();
+            }
+        });
+        let mut p = SignerPayer { sock, url: "https://x/hashrate".into(), task: "hashrate".into(), max_sats: 10, session: None,
+                                  wait_for_signer: Duration::from_secs(10) };
+        let t0 = Instant::now();
+        let r = p.pay("r1", 0, &serde_json::json!({}));
+        assert!(r.is_ok(), "{r:?}");
+        assert!(t0.elapsed() >= Duration::from_millis(1400));
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Past the wait, the payment fails plainly: a signer that does not come back is not waited for
+    /// beyond the hashmaker's grace.
+    #[test]
+    fn a_signer_that_does_not_come_back_is_not_waited_for_beyond_the_wait() {
+        let dir = scratch("gone");
+        let mut p = SignerPayer { sock: dir.join("none.sock"), url: "https://x/hashrate".into(), task: "hashrate".into(), max_sats: 10,
+                                  session: None, wait_for_signer: Duration::from_millis(800) };
+        let t0 = Instant::now();
+        let r = p.pay("r1", 0, &serde_json::json!({}));
+        assert!(r.as_ref().is_err_and(|e| signer_unreached(e)), "{r:?}");
+        assert!(t0.elapsed() < Duration::from_secs(2));
     }
 }

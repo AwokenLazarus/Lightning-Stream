@@ -146,6 +146,7 @@ fn rental(stop_paying_after: Option<u64>, miner_secs: u64, wallet: bool) -> Run 
         task: "hashrate".into(),
         max_sats: 600,
         session: None,
+        wait_for_signer: std::time::Duration::from_secs(5),
     });
     let b = {
         let cfg = hashtaker::Config {

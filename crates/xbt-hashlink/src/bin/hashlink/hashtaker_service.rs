@@ -204,7 +204,8 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
         let g = lock(r);
         (g.key, g.user.clone(), g.signer.clone(), g.task.clone())
     };
-    let payer = signer.map(|sock| SignerPayer { sock, url: h.pay_url.clone(), task, max_sats: budget_sats, session: None });
+    let payer = signer.map(|sock| SignerPayer { sock, url: h.pay_url.clone(), task, max_sats: budget_sats, session: None,
+                                                       wait_for_signer: std::time::Duration::from_millis(h.terms.grace_ms / 2) });
     let cfg = hashtaker::Config {
         hashmaker: h.link_addr.clone(),
         hashmaker_key: h.link_key,
