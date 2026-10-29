@@ -246,6 +246,42 @@ fn a_download_the_server_ends_by_closing_ends_on_the_phone_too() {
     assert!(took < Duration::from_secs(10), "and promptly: {took:?}");
 }
 
+/// A trace page like 1.1.1.1's: it answers with the address the request came from.
+fn trace_page() -> SocketAddr {
+    let l = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for c in l.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut c = c;
+                let peer = c.peer_addr().unwrap().ip();
+                let mut req = [0u8; 1024];
+                let _ = std::io::Read::read(&mut c, &mut req);
+                let body = format!("fl=1\nip={peer}\nloc=ZZ\n");
+                let _ = std::io::Write::write_all(&mut c, format!("HTTP/1.0 200 OK\r\n\r\n{body}").as_bytes());
+            });
+        }
+    });
+    SocketAddr::new(lan_ip(), port)
+}
+
+#[test]
+fn an_exits_region_is_verified_from_its_egress_address_read_through_it() {
+    use xbt_vpn::region::{GeoTable, RegionCheck};
+    let s = setup(82, true, None);
+    let id = s.exit_id.clone().unwrap();
+    s.buyer.set_egress_echo(trace_page(), "trace.test", "/cdn-cgi/trace");
+    assert_eq!(s.rt.block_on(s.buyer.verify_region(&id, "DE")), RegionCheck::Unknown, "no table, nothing verified");
+    // the table puts the exit's egress (this machine's address) in Germany
+    let ip = lan_ip();
+    s.buyer.set_geo(GeoTable::from_csv(&format!("{ip},{ip},DE\n")));
+    assert_eq!(s.rt.block_on(s.buyer.verify_region(&id, "DE")), RegionCheck::Verified);
+    assert_eq!(s.rt.block_on(s.buyer.verify_region(&id, "JP")), RegionCheck::Elsewhere("DE".into()), "a claim elsewhere is caught");
+    // an owner in Japan reaching a "German" exit in a millisecond: faster than light allows
+    s.buyer.set_home_country(Some("JP".into()));
+    assert_eq!(s.rt.block_on(s.buyer.verify_region(&id, "DE")), RegionCheck::TooFast);
+}
+
 #[test]
 fn with_no_exit_nothing_gets_out() {
     let to = tcp_server(1 << 20);

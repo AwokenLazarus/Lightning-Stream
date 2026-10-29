@@ -86,9 +86,128 @@ pub fn check(table: &GeoTable, announced: &str, egress: IpAddr, rtt_ms: Option<f
     }
 }
 
+/// Reads the egress address out of an `ip=` line, as a trace page through the exit answers it
+/// (`/cdn-cgi/trace` on 1.1.1.1 prints `ip=<the address the request came from>`).
+pub fn parse_trace(body: &str) -> Option<IpAddr> {
+    body.lines().find_map(|l| l.strip_prefix("ip=")).and_then(|v| v.trim().parse().ok())
+}
+
+/// Rough centres of countries (latitude, longitude), for a lower bound on the distance to a region.
+/// Countries not listed get no round-trip check; their egress address is still checked.
+const CENTRES: &[(&str, f64, f64)] = &[
+    ("AE", 24.0, 54.0), ("AR", -34.0, -64.0), ("AT", 47.5, 14.5), ("AU", -25.0, 134.0), ("BE", 50.6, 4.6),
+    ("BG", 42.7, 25.5), ("BR", -10.0, -52.0), ("CA", 56.0, -96.0), ("CH", 46.8, 8.2), ("CL", -35.0, -71.0),
+    ("CN", 35.0, 104.0), ("CO", 4.0, -73.0), ("CZ", 49.8, 15.5), ("DE", 51.2, 10.4), ("DK", 56.0, 10.0),
+    ("EE", 58.6, 25.0), ("EG", 26.8, 30.8), ("ES", 40.4, -3.7), ("FI", 64.0, 26.0), ("FR", 46.6, 2.4),
+    ("GB", 54.0, -2.0), ("GR", 39.0, 22.0), ("HK", 22.3, 114.2), ("HR", 45.1, 15.2), ("HU", 47.2, 19.5),
+    ("ID", -2.5, 118.0), ("IE", 53.4, -8.2), ("IL", 31.0, 35.0), ("IN", 22.0, 79.0), ("IS", 65.0, -18.0),
+    ("IT", 42.8, 12.8), ("JP", 36.2, 138.3), ("KE", 0.0, 38.0), ("KR", 36.5, 127.9), ("KZ", 48.0, 67.0),
+    ("LT", 55.2, 23.9), ("LU", 49.8, 6.1), ("LV", 56.9, 24.6), ("MD", 47.4, 28.4), ("MX", 23.6, -102.5),
+    ("MY", 4.2, 102.0), ("NG", 9.1, 8.7), ("NL", 52.1, 5.3), ("NO", 61.0, 8.5), ("NZ", -41.0, 174.0),
+    ("PE", -9.2, -75.0), ("PH", 12.9, 121.8), ("PK", 30.4, 69.3), ("PL", 52.0, 19.1), ("PT", 39.6, -8.0),
+    ("RO", 45.9, 24.9), ("RS", 44.0, 21.0), ("RU", 60.0, 90.0), ("SA", 24.0, 45.0), ("SE", 62.0, 15.0),
+    ("SG", 1.35, 103.8), ("SI", 46.1, 14.9), ("SK", 48.7, 19.7), ("TH", 15.9, 101.0), ("TR", 39.0, 35.2),
+    ("TW", 23.7, 121.0), ("UA", 49.0, 31.4), ("US", 39.8, -98.6), ("VN", 16.0, 107.8), ("ZA", -29.0, 24.0),
+];
+
+/// Slack taken off the distance between two country centres, so the bound stays below the true
+/// distance even between the near edges of large countries.
+const CENTRE_SLACK_KM: f64 = 2500.0;
+
+/// A lower bound on the distance from `home` to `region` (country codes), if both are known.
+pub fn km_between(home: &str, region: &str) -> Option<f64> {
+    let at = |cc: &str| CENTRES.iter().find(|c| c.0.eq_ignore_ascii_case(cc)).map(|c| (c.1, c.2));
+    let ((la1, lo1), (la2, lo2)) = (at(home)?, at(region)?);
+    let (p1, p2) = (la1.to_radians(), la2.to_radians());
+    let (dp, dl) = ((la2 - la1).to_radians(), (lo2 - lo1).to_radians());
+    let a = (dp / 2.0).sin().powi(2) + p1.cos() * p2.cos() * (dl / 2.0).sin().powi(2);
+    let km = 2.0 * 6371.0 * a.sqrt().asin();
+    Some((km - CENTRE_SLACK_KM).max(0.0))
+}
+
+/// DB-IP's free "IP to Country Lite" table (CC BY 4.0, <https://db-ip.com>): one file a month.
+pub const DBIP_URL: &str = "https://download.db-ip.com/free/dbip-country-lite-{YYYY-MM}.csv.gz";
+
+/// How long a downloaded table is used before a newer month is fetched.
+pub const TABLE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(35 * 86400);
+
+/// The geo-IP table kept in `dir` (`dbip-country-lite.csv`), fetched when missing or older than
+/// [`TABLE_MAX_AGE`] (this month's file, else last month's). A failed fetch keeps the old copy.
+pub fn load_or_fetch(dir: &std::path::Path, url: &str) -> std::io::Result<GeoTable> {
+    use std::io::Read;
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join("dbip-country-lite.csv");
+    let fresh = std::fs::metadata(&path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age < TABLE_MAX_AGE);
+    if !fresh {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        for months_back in 0..2 {
+            let ym = year_month(now, months_back);
+            let resp = match ureq::get(&url.replace("{YYYY-MM}", &ym)).timeout(std::time::Duration::from_secs(300)).call() {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let mut gz = Vec::new();
+            if resp.into_reader().take(64 << 20).read_to_end(&mut gz).is_err() {
+                continue;
+            }
+            let mut text = String::new();
+            if flate2::read::GzDecoder::new(&gz[..]).take(512 << 20).read_to_string(&mut text).is_err() || text.lines().count() < 1000 {
+                continue;
+            }
+            let tmp = dir.join("dbip-country-lite.csv.tmp");
+            std::fs::write(&tmp, &text)?;
+            std::fs::rename(&tmp, &path)?;
+            break;
+        }
+    }
+    Ok(GeoTable::from_csv(&std::fs::read_to_string(&path)?))
+}
+
+/// `YYYY-MM` for the month `months_back` before the one holding `unix_secs` (UTC).
+fn year_month(unix_secs: u64, months_back: u32) -> String {
+    // civil-from-days (Howard Hinnant)
+    let z = (unix_secs / 86400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    let total = y * 12 + (m - 1) - i64::from(months_back);
+    format!("{:04}-{:02}", total.div_euclid(12), total.rem_euclid(12) + 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_egress_address_is_read_from_a_trace_page() {
+        let body = "fl=12f\nh=1.1.1.1\nip=203.0.113.7\nts=1\nloc=DE\n";
+        assert_eq!(parse_trace(body), Some("203.0.113.7".parse().unwrap()));
+        assert_eq!(parse_trace("ip=2001:db8::5\n"), Some("2001:db8::5".parse().unwrap()));
+        assert_eq!(parse_trace("nothing here"), None);
+    }
+
+    #[test]
+    fn a_distance_bound_is_below_the_true_distance_and_zero_nearby() {
+        let us_jp = km_between("US", "JP").unwrap();
+        assert!(us_jp > 5000.0 && us_jp < 10_500.0, "{us_jp}");
+        assert_eq!(km_between("DE", "NL"), Some(0.0), "neighbours are within the slack");
+        assert_eq!(km_between("DE", "XX"), None);
+        // a claim of Japan with a 5 ms round trip from the US cannot be true
+        assert!(!rtt_plausible(5.0, us_jp));
+        assert!(rtt_plausible(140.0, us_jp));
+    }
+
+    #[test]
+    fn months_count_back_across_a_new_year() {
+        // 2026-01-15
+        let t = 1_768_435_200;
+        assert_eq!(year_month(t, 0), "2026-01");
+        assert_eq!(year_month(t, 1), "2025-12");
+    }
 
     const CSV: &str = "\
 1.0.0.0,1.0.0.255,AU

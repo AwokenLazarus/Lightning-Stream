@@ -5858,6 +5858,7 @@ dependencies = [
  "base64 0.22.1",
  "boringtun",
  "bytes",
+ "flate2",
  "fst",
  "h2",
  "hex",

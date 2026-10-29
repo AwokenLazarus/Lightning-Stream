@@ -35,6 +35,7 @@ use crate::sealed;
 use rustls::pki_types::ServerName;
 use tokio_rustls::TlsConnector;
 use crate::meter::Meter;
+use crate::region::{self, GeoTable, RegionCheck};
 use crate::router::{ExitInfo, Requirements, Router};
 use std::collections::HashSet;
 use std::sync::RwLock;
@@ -155,7 +156,18 @@ pub struct Buyer {
     pub udp_refused_two_hop: AtomicU64,
     /// Flows refused (no exit, a device over its limit, an exit's refusal).
     pub refused: AtomicU64,
+    /// The offline geo-IP table exits' regions are checked against; none means no region is verified.
+    geo: RwLock<Option<Arc<GeoTable>>>,
+    /// The owner's own country, if they gave it: a lower bound on the distance to an exit's region,
+    /// so a round trip too fast for the claimed region is caught. Never looked up from the network.
+    home_country: RwLock<Option<String>>,
+    /// Where an exit's egress address is read: a trace page through the exit (address, Host, path).
+    egress_echo: RwLock<(SocketAddr, String, String)>,
 }
+
+/// The trace page an exit's egress address is read from, through that exit: 1.1.1.1 prints the
+/// address the request came from. Only the exit's address reaches it, never the buyer's.
+pub const EGRESS_ECHO: (&str, &str, &str) = ("1.1.1.1:80", "one.one.one.one", "/cdn-cgi/trace");
 
 impl Buyer {
     /// `devices`: each device's tunnel address and its state. `dns`: the resolver the buyer's app asks
@@ -184,7 +196,50 @@ impl Buyer {
             sealed_secret: rand_secret(),
             udp_refused_two_hop: AtomicU64::new(0),
             refused: AtomicU64::new(0),
+            geo: RwLock::new(None),
+            home_country: RwLock::new(None),
+            egress_echo: RwLock::new((EGRESS_ECHO.0.parse().expect("an address"), EGRESS_ECHO.1.into(), EGRESS_ECHO.2.into())),
         })
+    }
+
+    /// The geo-IP table regions are checked against (see [`crate::region::load_or_fetch`]).
+    pub fn set_geo(&self, t: GeoTable) {
+        *self.geo.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(t));
+    }
+
+    /// The owner's own country (two letters), for the round-trip check; `None` skips that check.
+    pub fn set_home_country(&self, cc: Option<String>) {
+        *self.home_country.write().unwrap_or_else(|e| e.into_inner()) = cc.map(|c| c.to_ascii_uppercase());
+    }
+
+    /// Reads exits' egress addresses from another trace page (tests).
+    pub fn set_egress_echo(&self, addr: SocketAddr, host: &str, path: &str) {
+        *self.egress_echo.write().unwrap_or_else(|e| e.into_inner()) = (addr, host.into(), path.into());
+    }
+
+    /// Checks the region an exit announced: its egress address, read through the exit itself, must
+    /// be in that country by the offline table, and the round trip to it must not be faster than the
+    /// distance from the owner's country allows. Nothing about the buyer leaves the box: the trace
+    /// page sees only the exit's address.
+    pub async fn verify_region(self: &Arc<Self>, id: &str, announced: &str) -> RegionCheck {
+        let Some(geo) = self.geo.read().unwrap_or_else(|e| e.into_inner()).clone() else { return RegionCheck::Unknown };
+        let (echo, host, path) = self.egress_echo.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let read = async {
+            let conn = self.link.connect_conn_async(id).await.ok()?;
+            let (Opened::Yes, mut send, mut recv) = open_tcp(&conn, echo).await.ok()? else { return None };
+            let req = format!("GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+            send.write_all(req.as_bytes()).await.ok()?;
+            let mut body = Vec::new();
+            (&mut recv).take(16 * 1024).read_to_end(&mut body).await.ok()?;
+            region::parse_trace(&String::from_utf8_lossy(&body))
+        };
+        let Some(egress) = tokio::time::timeout(Duration::from_secs(20), read).await.ok().flatten() else { return RegionCheck::Unknown };
+        let rtt = self.link.path(id).map(|p| match p {
+            xbt_iroh_link::Path::Direct { rtt_ms, .. } | xbt_iroh_link::Path::Relay { rtt_ms, .. } => rtt_ms as f64,
+        });
+        let home = self.home_country.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let km = home.and_then(|h| region::km_between(&h, announced));
+        region::check(&geo, announced, egress, rtt, km)
     }
 
     /// The router that decides for this device: its own policy's, or the buyer's default.

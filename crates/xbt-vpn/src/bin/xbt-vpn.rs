@@ -18,7 +18,7 @@
 //!     Runs a buyer's app for one device: a WireGuard endpoint the device adds, the buyer's stack and
 //!     router, private DNS (DNS-over-TLS to Quad9 through the exit). Prints the device's WireGuard
 //!     config once (keys made for this run), then the device's bytes and refusals every 10 s.
-//! xbt-vpn serve [--dir DIR] [--status DIR] [--keys DIR] [--wg-listen ADDR:PORT] [--relay URL] [--nostr wss://…,…] [--region CC]
+//! xbt-vpn serve [--dir DIR] [--status DIR] [--keys DIR] [--wg-listen ADDR:PORT] [--relay URL] [--nostr wss://…,…] [--region CC] [--home-country CC]
 //!     The VPN service the app's pages drive, through files: it reads `devices.json` (the buyer's
 //!     devices and their policies) and `exit.json` (this box's exit, if offered) in `--dir` (or
 //!     XBT_VPN_DIR; default ./vpn), and writes `endpoint.json` (the WireGuard key devices pair with),
@@ -419,21 +419,49 @@ fn serve(args: &[String], relay: String) -> std::io::Result<()> {
     rt.spawn(buyer.clone().run(from_devices, to_devices));
     rt.spawn(wg.run(sock, to_stack, from_stack));
 
-    // exits, found on Nostr every 10 minutes
+    // exits' regions are checked against an offline geo-IP table (DB-IP country lite, fetched once a
+    // month into the keys dir) and, if the owner gave their own country, a round-trip bound
+    {
+        let (buyer, geo_dir) = (buyer.clone(), keys_dir.join("geo"));
+        buyer.set_home_country(arg_or_env(args, "--home-country", &["XBT_VPN_HOME_COUNTRY"]).map(|c| c.trim().to_string()).filter(|c| c.len() == 2));
+        std::thread::spawn(move || loop {
+            match xbt_vpn::region::load_or_fetch(&geo_dir, xbt_vpn::region::DBIP_URL) {
+                Ok(t) => buyer.set_geo(t),
+                Err(e) => eprintln!("geo-IP table not available ({e}): exits' regions stay unverified"),
+            }
+            std::thread::sleep(Duration::from_secs(86400));
+        });
+    }
+
+    // exits, found on Nostr every 10 minutes; each announced region verified, and checked again every 6 h
     {
         let (buyer, link, nostr, own, relay, rt) = (buyer.clone(), buyer_link.clone(), nostr.clone(), own_exit.clone(), relay.clone(), rt.clone());
-        std::thread::spawn(move || loop {
-            if !nostr.is_empty() {
-                let (events, _) = xbt_nostr::oneshot::query(&nostr, &announce::filter(500), Duration::from_secs(15));
-                let (found, _) = announce::collect(&events, xbt_nostr::now());
-                for a in found.into_iter().filter(|a| Some(&a.exit.id) != own.as_ref()) {
-                    let relays = vec![a.relay.clone().unwrap_or_else(|| relay.clone())];
-                    if link.learn(&a.exit.id, Hints { relays, direct: Vec::new() }).is_ok() {
+        std::thread::spawn(move || {
+            let mut checked: HashMap<String, (String, bool, std::time::Instant)> = HashMap::new();
+            loop {
+                if !nostr.is_empty() {
+                    let (events, _) = xbt_nostr::oneshot::query(&nostr, &announce::filter(500), Duration::from_secs(15));
+                    let (found, _) = announce::collect(&events, xbt_nostr::now());
+                    for mut a in found.into_iter().filter(|a| Some(&a.exit.id) != own.as_ref()) {
+                        let relays = vec![a.relay.clone().unwrap_or_else(|| relay.clone())];
+                        if link.learn(&a.exit.id, Hints { relays, direct: Vec::new() }).is_err() {
+                            continue;
+                        }
+                        let region = a.exit.region.clone();
+                        let stale = checked.get(&a.exit.id).is_none_or(|(r, _, at)| *r != region || at.elapsed() > Duration::from_secs(6 * 3600));
+                        if stale && region.len() == 2 {
+                            let result = rt.block_on(buyer.verify_region(&a.exit.id, &region));
+                            if result != xbt_vpn::region::RegionCheck::Verified {
+                                eprintln!("exit {}…: region {region} not verified ({result:?})", &a.exit.id[..12.min(a.exit.id.len())]);
+                            }
+                            checked.insert(a.exit.id.clone(), (region, result == xbt_vpn::region::RegionCheck::Verified, std::time::Instant::now()));
+                        }
+                        a.exit.region_verified = checked.get(&a.exit.id).is_some_and(|c| c.1);
                         rt.block_on(buyer.upsert_exit(a.exit));
                     }
                 }
+                std::thread::sleep(Duration::from_secs(600));
             }
-            std::thread::sleep(Duration::from_secs(600));
         });
     }
 

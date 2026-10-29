@@ -116,10 +116,18 @@ exit is (private or filtered, its categories, port rules, two hops, price a GB) 
 the service renews it every 6 hours and looks for exits every 10 minutes. An exit is announced only
 once its owner sets its country on the exit page.
 
-Not yet: an announced exit's country is what its owner says. It is not checked against where its
-traffic comes out until the region check is wired to announced exits, so a device whose rules name
-a country is told no exit qualifies rather than sent to one that may be elsewhere. And a device's
-limit in sats applies once exits are paid.
+An announced exit's country is checked, not taken on its word. The buyer's app reads the exit's
+egress address through the exit itself (a trace page, 1.1.1.1's `/cdn-cgi/trace`, which sees only
+the exit's address, never the buyer's) and looks it up in an offline geo-IP table: DB-IP's "IP to
+Country Lite" (CC BY 4.0, <https://db-ip.com>), fetched once a month into the service's keys dir, so
+no lookup about an exit or a buyer leaves the box. If the owner gives their own country
+(`--home-country` / `XBT_VPN_HOME_COUNTRY`), a round trip faster than the distance to the claimed
+country allows is caught too; the app never looks the owner's country up from the network. An exit
+whose region does not check out is not offered for that region, and is checked again every 6 hours.
+Until the table has loaded, no region is verified, and a device whose rules name a country is told
+no exit qualifies rather than sent to one that may be elsewhere.
+
+Not yet: a device's limit in sats applies once exits are paid.
 
 ## Measured
 
