@@ -7,7 +7,9 @@
 #   * the gateway (selling port 8402): it listens beyond loopback only once the owner saves a shop
 #     with an https:// address on the Sell page (the owner's reverse proxy or tunnel leads there);
 #   * the hashmaker (profile "hashmaker", off unless LS_HASHMAKER=1): this machine's miners on 23340
-#     (keep it on the LAN) and hashtakers' apps on 23341 (a port forward or tunnel makes it public).
+#     (keep it on the LAN) and hashtakers' apps on 23341 (a port forward or tunnel makes it public);
+#   * the AI endpoint (33540), only if the owner sets LS_AI_BIND to a LAN address in .env: programs
+#     on the LAN then use AI sellers through it, each with a key made on the AI page.
 # The UI asks for the password in .env (LS_UI_PASSWORD), set at install. Of the Lightning node's files
 # the services mount only tls.cert; the admin macaroon reaches node-keys on standard input, once, and
 # is never written (install.sh pipes it in). All state is in LS_DATA_DIR. The project's name, and so
@@ -136,8 +138,14 @@ services:
       XBT_UI_HASHRENT_TOKEN_FILE: /data/run/hashrate/control-token
       XBT_UI_ENROLL_CODE_FILE: /data/run/enroll/enroll-code
       XBT_UI_RESTART_HINT: "in the folder you installed it to (~/lightning-stream unless you chose another), run: docker compose restart"
+      # AI: the address programs use (served by the connector) and the files the AI page shares with it
+      XBT_UI_AI_ENDPOINT: ${LS_AI_ADDRESS:-http://127.0.0.1:33540/v1}
+      XBT_UI_AI_SELLERS: /data/run/ai/sellers.json
+      XBT_UI_CREDENTIALS: /data/run/ai/credentials.json
+      XBT_UI_AI_STATE: /data/run/ai/state.json
     volumes:
       - ${LS_DATA_DIR}/ui:/data/ui
+      - ${LS_DATA_DIR}/run/ai:/data/run/ai
       - ${LS_DATA_DIR}/run/signer:/data/run/signer:ro
       - ${LS_DATA_DIR}/run/ui:/data/run/ui
       - ${LS_DATA_DIR}/run/ln:/data/run/ln
@@ -183,7 +191,14 @@ services:
       LS_TASK: default
       LS_MAX_SATS: "20000"
       LS_LISTEN: 127.0.0.1:${LS_CONNECTOR_PORT:-8484}
+      # the AI endpoint: loopback unless the owner sets LS_AI_BIND (0.0.0.0:33540 for the LAN); every
+      # program needs a key from the AI page either way
+      LS_AI_LISTEN: ${LS_AI_BIND:-127.0.0.1:33540}
+      LS_CREDENTIALS: /data/run/ai/credentials.json
+      LS_AI_SELLERS: /data/run/ai/sellers.json
+      LS_AI_STATE: /data/run/ai/state.json
     volumes:
+      - ${LS_DATA_DIR}/run/ai:/data/run/ai
       - ${LS_DATA_DIR}/run/signer:/data/run/signer:ro
       - ${LS_DATA_DIR}/run/signer/streams:/data/run/signer/streams
 

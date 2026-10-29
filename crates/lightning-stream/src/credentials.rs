@@ -8,7 +8,8 @@
 //! it away. An entry has a limit in sats (and optionally one per day). It pauses when it reaches
 //! the limit and resumes when the owner raises it, and it can be revoked at once.
 //!
-//! The file is JSON, written whole to a temporary file and renamed over the old one, mode 600.
+//! The file is JSON, written whole to a temporary file and renamed over the old one ([`write_file`]):
+//! mode 600, or 660 in a directory shared by group with the endpoint.
 //! Never log a secret: [`redact`] takes them out of a line that carries a path.
 
 use std::fs;
@@ -192,17 +193,11 @@ impl Store {
         Ok(Self { path: path.to_path_buf(), entries })
     }
 
-    /// Writes the store: a temporary file beside it, mode 600, then a rename over the old one.
+    /// Writes the store with [`write_file`]: the app and the endpoint both book in it, so in a dir
+    /// shared by group it is group-writable (0660), and otherwise the owner's alone (0600).
     pub fn save(&self) -> io::Result<()> {
-        let tmp = self.path.with_extension("tmp");
         let body = serde_json::to_vec_pretty(&json!({"version": 1, "entries": self.entries.iter().map(Entry::to_json).collect::<Vec<_>>()}))?;
-        {
-            let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
-            f.write_all(&body)?;
-            f.sync_all()?;
-        }
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
-        fs::rename(&tmp, &self.path)
+        write_file(&self.path, &body, true)
     }
 
     /// Makes an entry. Returns its id and its secret (an AI key carries [`AI_KEY_PREFIX`]); the
@@ -283,6 +278,34 @@ impl Store {
     }
 }
 
+/// Writes `body` to `path` whole: a temporary file beside it, then a rename over the old one, so a
+/// reader never sees half a file. The file's mode and group follow its directory: in a directory
+/// another service shares by group (group-searchable, as `run/ai/` on a box, 0770), the file takes
+/// the directory's group, readable by it (0640), or writable too (0660) with `group_write`; in any
+/// other directory it is the owner's alone (0600).
+pub fn write_file(path: &Path, body: &[u8], group_write: bool) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let dm = fs::metadata(dir)?;
+    let shared = dm.mode() & 0o010 != 0;
+    let mode = match (shared, group_write && dm.mode() & 0o020 != 0) {
+        (false, _) => 0o600,
+        (true, false) => 0o640,
+        (true, true) => 0o660,
+    };
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+        f.write_all(body)?;
+        f.sync_all()?;
+    }
+    if shared && fs::metadata(&tmp)?.gid() != dm.gid() {
+        std::os::unix::fs::chown(&tmp, None, Some(dm.gid()))?;
+    }
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?;
+    fs::rename(&tmp, path)
+}
+
 /// The UTC day of `secs`.
 pub fn day_of(secs: u64) -> u64 {
     secs / 86_400
@@ -295,6 +318,7 @@ mod tests {
     #[test]
     fn a_secret_is_kept_hashed_checked_by_kind_and_revoked() {
         let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let path = dir.path().join("credentials.json");
         let mut s = Store::open(&path).unwrap();
         let (id, key) = s.make(Kind::AiKey, "Open WebUI", 100, None, None);
@@ -332,6 +356,22 @@ mod tests {
         assert!(s.pause_if_over(&id, 13), "the 100 sats in all are spent");
         s.set_limits(&id, 200, None, 13);
         assert_eq!(s.may_spend(&id, 100_000, 13), Ok(100_000));
+    }
+
+    #[test]
+    fn a_file_in_a_dir_shared_by_group_is_the_groups_to_read_or_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared");
+        fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o770)).unwrap();
+        write_file(&shared.join("a.json"), b"{}", true).unwrap();
+        write_file(&shared.join("b.json"), b"{}", false).unwrap();
+        write_file(&dir.path().join("c.json"), b"{}", true).unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!((mode(&shared.join("a.json")), mode(&shared.join("b.json"))), (0o660, 0o640));
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        write_file(&dir.path().join("c.json"), b"{}", true).unwrap();
+        assert_eq!(mode(&dir.path().join("c.json")), 0o600);
     }
 
     #[test]

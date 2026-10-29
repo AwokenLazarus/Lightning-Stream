@@ -28,16 +28,11 @@ fn read_sellers(path: &Path) -> Value {
 }
 
 fn write_json(path: &Path, v: &Value) -> Result<(), String> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
-    let tmp = path.with_extension("tmp");
     let body = serde_json::to_vec_pretty(v).map_err(|e| e.to_string())?;
-    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o640).open(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
-    f.write_all(&body).and_then(|_| f.sync_all()).map_err(|e| format!("{}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
+    credentials::write_file(path, &body, false).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 fn names(v: &Value, k: &str) -> Vec<String> {

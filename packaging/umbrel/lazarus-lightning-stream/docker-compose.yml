@@ -1,6 +1,8 @@
 # Lightning Stream. Unpublished: side-load only. The wallet's services, the connector and the gateway.
 # Buy: the signer, the anchor witness, the MCP server and the web UI, as in the wallet app. The main
 # page is this app's own page (port 8482). Agents on the LAN use host port 33511.
+# AI: the connector also serves an OpenAI-compatible endpoint on host port 33540 for programs on the
+# LAN; each needs a key the owner makes on the AI page, with its own limit (run/ai, shared by group).
 # Play: the connector pays through the signer and streams the body. It is not published on the LAN.
 # It shares the UI's network namespace and listens on 127.0.0.1:8484, which is what XBT_UI_CONNECTOR
 # names. A browser on another machine cannot open that address. The UI process, in that namespace, can.
@@ -185,8 +187,20 @@ services:
       # The app password is Umbrel's deterministic one, shown on the app's page in the dashboard
       # the signer's one-time enrolment code: the setup page fills it in, so no log has to be read
       XBT_UI_ENROLL_CODE_FILE: /data/run/enroll/enroll-code
+      # AI: the address programs on the LAN use (the connector serves it, in this container's network),
+      # and the files the AI page shares with it in run/ai
+      XBT_UI_AI_ENDPOINT: http://${DEVICE_DOMAIN_NAME}:33540/v1
+      XBT_UI_AI_SELLERS: /data/run/ai/sellers.json
+      XBT_UI_CREDENTIALS: /data/run/ai/credentials.json
+      XBT_UI_AI_STATE: /data/run/ai/state.json
+    ports:
+      # the AI endpoint for programs on the LAN (served by the connector, which shares this container's
+      # network): every request needs a key the owner made on the AI page
+      - "33540:33540"
     volumes:
       - ${APP_DATA_DIR}/data/ui:/data/ui
+      # the AI page's files, shared by group with the connector (the credential store both write)
+      - ${APP_DATA_DIR}/data/run/ai:/data/run/ai
       - ${APP_DATA_DIR}/data/run/signer:/data/run/signer:ro
       # the UI owns the MCP token (run/ui/mcp-http-token) and rotates it on its Agents page
       - ${APP_DATA_DIR}/data/run/ui:/data/run/ui
@@ -246,7 +260,14 @@ services:
       LS_TASK: default
       LS_MAX_SATS: "20000"
       LS_LISTEN: 127.0.0.1:8484
+      # the AI endpoint: every program on the LAN needs a key from the AI page (run/ai/credentials.json)
+      LS_AI_LISTEN: 0.0.0.0:33540
+      LS_CREDENTIALS: /data/run/ai/credentials.json
+      LS_AI_SELLERS: /data/run/ai/sellers.json
+      LS_AI_STATE: /data/run/ai/state.json
     volumes:
+      # the AI endpoint's files: keys and their spend (read and booked), the sellers (read), their health (written)
+      - ${APP_DATA_DIR}/data/run/ai:/data/run/ai
       # the control socket, read-only: this service cannot replace it, and it holds no keys
       - ${APP_DATA_DIR}/data/run/signer:/data/run/signer:ro
       # the stream sockets, read-write. The same host directory the signer sees under run/signer.

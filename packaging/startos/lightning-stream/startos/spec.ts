@@ -18,6 +18,7 @@ export const PORTS = {
   mcp: 33510,
   gateway: 8402,
   connector: 8484,
+  ai: 33540,
   hashmakerControl: 23342,
   hashmakerSlices: 23344,
   hashtakerControl: 23343,
@@ -79,6 +80,8 @@ export type Config = {
   proxies: string[]
   /** this server's address on the LAN, for the miners' and the link's addresses the hashrate pages show */
   lanHost: string
+  /** the AI interface's addresses (`…/v1`), the first shown on the UI's AI page; empty before StartOS names one */
+  aiUrls?: string[]
 }
 
 /** The Lightning node's certificate: Lightning Fork's public/ folder, which holds only tls.cert. */
@@ -281,6 +284,11 @@ export function services(cfg: Config): ServiceSpec[] {
         XBT_UI_HASHRENT_TOKEN_FILE: '/data/run/hashrate/control-token',
         // the signer's one-time enrolment code: the setup page fills it in, so no log has to be read
         XBT_UI_ENROLL_CODE_FILE: '/data/run/enroll/enroll-code',
+        // AI: the address programs use (the connector serves it) and the files the AI page shares with it in run/ai
+        ...(cfg.aiUrls?.length ? { XBT_UI_AI_ENDPOINT: cfg.aiUrls[0] } : {}),
+        XBT_UI_AI_SELLERS: '/data/run/ai/sellers.json',
+        XBT_UI_CREDENTIALS: '/data/run/ai/credentials.json',
+        XBT_UI_AI_STATE: '/data/run/ai/state.json',
       },
       // the UI owns the MCP token and rotates it on its Agents page; its pages write run/ln, run/gateway and
       // run/hashrate (the shop's and the hashrate settings)
@@ -291,6 +299,7 @@ export function services(cfg: Config): ServiceSpec[] {
         vol('run/ln', '/data/run/ln'),
         vol('run/gateway', '/data/run/gateway'),
         vol('run/hashrate', '/data/run/hashrate'),
+        vol('run/ai', '/data/run/ai'),
         vol('run/enroll', '/data/run/enroll', true),
         ...cert,
       ],
@@ -308,8 +317,13 @@ export function services(cfg: Config): ServiceSpec[] {
         LS_TASK: 'default',
         LS_MAX_SATS: '20000',
         LS_LISTEN: local(PORTS.connector),
+        // the AI endpoint for programs on the LAN, each with a key from the AI page (run/ai, shared by group with the UI)
+        LS_AI_LISTEN: `0.0.0.0:${PORTS.ai}`,
+        LS_CREDENTIALS: '/data/run/ai/credentials.json',
+        LS_AI_SELLERS: '/data/run/ai/sellers.json',
+        LS_AI_STATE: '/data/run/ai/state.json',
       },
-      mounts: [vol('run/signer', '/data/run/signer', true), vol('run/signer/streams', '/data/run/signer/streams')],
+      mounts: [vol('run/signer', '/data/run/signer', true), vol('run/signer/streams', '/data/run/signer/streams'), vol('run/ai', '/data/run/ai')],
       requires: ['signer'],
       port: PORTS.connector,
     },

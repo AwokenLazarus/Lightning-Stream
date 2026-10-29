@@ -3,8 +3,8 @@ import { sdk } from './sdk'
 import { PORTS } from './spec'
 
 /**
- * The web UI (for the owner), the MCP server (for agents: an API with a bearer token), the gateway (for
- * buyers), and hashrate's two plain TCP ports: miners on the LAN, and the link hashtakers' apps reach.
+ * The web UI (for the owner), the MCP server (for agents: an API with a bearer token), the AI address
+ * (for programs on the LAN, each with a key), the gateway (for buyers), and hashrate's two plain TCP ports: miners on the LAN, and the link hashtakers' apps reach.
  * StartOS offers each on the LAN; the owner adds a public domain to the Gateway (and a port forward or a
  * tunnel for the link) to sell outside the LAN.
  */
@@ -40,6 +40,24 @@ export const setInterfaces = sdk.setupInterfaces(async ({ effects }) => {
         schemeOverride: null,
         username: null,
         path: '/mcp',
+        query: {},
+      }),
+    ]),
+  )
+
+  // the AI endpoint (the connector): programs on the LAN, each with a key the owner makes on the AI page
+  const ai = await sdk.MultiHost.of(effects, 'ai').bindPort(PORTS.ai, { protocol: 'http', preferredExternalPort: PORTS.ai })
+  receipts.push(
+    await ai.export([
+      sdk.createInterface(effects, {
+        name: i18n('AI address for programs'),
+        id: 'ai',
+        description: i18n('Programs on your network that speak the OpenAI API use AI sellers here, each with a key from the AI page'),
+        type: 'api',
+        masked: false,
+        schemeOverride: null,
+        username: null,
+        path: '/v1',
         query: {},
       }),
     ]),
