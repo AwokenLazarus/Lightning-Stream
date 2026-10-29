@@ -76,6 +76,8 @@ struct Inner {
     fetched: Option<Instant>,
     /// A fetch of the catalogue is running in the background.
     fetching: bool,
+    /// When the sellers file was last read for the owner's pins and blocks.
+    sellers_changed: Option<std::time::SystemTime>,
 }
 
 pub struct AiServer {
@@ -229,8 +231,9 @@ fn begin(cfg: &Config, method: &str, url: &str, body: &[u8], max_sats: i64, firs
     Ok(Begun { status, content_type, first, rest: src, done: rx, ttft: started.elapsed() })
 }
 
-/// The sellers' model lists, asked of them through the signer with nothing to spend, and the
-/// owner's pins and blocks, from the sellers file the app writes.
+/// The sellers' model lists, asked of them through the signer with nothing to spend (or, for a
+/// seller that will not answer that free, the `models` its entry in the sellers file names), and
+/// the owner's pins and blocks, from the sellers file the app writes.
 fn fetch_catalogue(cfg: &Config) -> (Catalogue, Prefs) {
     let sellers: Value = std::fs::read(&cfg.sellers).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
     let mut cat = Catalogue::default();
@@ -241,10 +244,16 @@ fn fetch_catalogue(cfg: &Config) -> (Catalogue, Prefs) {
         }
         let max_output = s.get("max_output").and_then(Value::as_u64).unwrap_or(0);
         let prices = s.get("prices").cloned().unwrap_or(Value::Null);
-        let Ok(mut b) = begin(cfg, "GET", &format!("{route}v1/models"), &[], 0, cfg.first_byte) else { continue };
-        let mut body = std::mem::take(&mut b.first);
-        let _ = (&mut b.rest).take(1 << 20).read_to_end(&mut body);
-        if let Ok(models) = serde_json::from_slice::<Value>(&body) {
+        // the seller's own list, asked for with nothing to spend; a seller that asks to be paid even for
+        // its list (a gateway that serves nothing outside a paid session) is listed with the models the
+        // sellers file names for it, if any
+        let asked = begin(cfg, "GET", &format!("{route}v1/models"), &[], 0, cfg.first_byte).ok().and_then(|mut b| {
+            let mut body = std::mem::take(&mut b.first);
+            let _ = (&mut b.rest).take(1 << 20).read_to_end(&mut body);
+            serde_json::from_slice::<Value>(&body).ok().filter(|m| m.get("data").is_some_and(Value::is_array))
+        });
+        let named = s.get("models").and_then(Value::as_array).map(|ids| json!({"data": ids.iter().filter_map(Value::as_str).map(|id| json!({"id": id})).collect::<Vec<_>>()}));
+        if let Some(models) = asked.or(named) {
             cat.add_seller(name, route, &prices, max_output, &models);
         }
     }
@@ -261,7 +270,7 @@ impl AiServer {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        let me = Self { cfg: Arc::new(cfg), inner: Arc::new(Mutex::new(Inner { store, router, fetched: None, fetching: false })) };
+        let me = Self { cfg: Arc::new(cfg), inner: Arc::new(Mutex::new(Inner { store, router, fetched: None, fetching: false, sellers_changed: None })) };
         // the sellers' model lists are asked for at once, in the background: the first request does not wait for all of them
         me.fetch_in_background();
         Ok(me)
@@ -288,8 +297,17 @@ impl AiServer {
     }
 
     /// The catalogue for a request: a stale one is refreshed in the background and used meanwhile;
-    /// before the first fetch has ended, the request waits for it (at most `first_byte`).
+    /// before the first fetch has ended, the request waits for it (at most `first_byte`). The owner's
+    /// pins and blocks apply at once: they are read again whenever the sellers file has changed.
     fn refresh(&self) {
+        let changed = std::fs::metadata(&self.cfg.sellers).and_then(|m| m.modified()).ok();
+        if changed.is_some() && changed != lock(&self.inner).sellers_changed {
+            let sellers: Value = std::fs::read(&self.cfg.sellers).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+            let strs = |k: &str| sellers.get(k).and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect::<Vec<_>>();
+            let mut g = lock(&self.inner);
+            g.router.prefs = Prefs { pinned: strs("pinned"), blocked: strs("blocked") };
+            g.sellers_changed = changed;
+        }
         let fetched = lock(&self.inner).fetched;
         match fetched {
             Some(t) if t.elapsed() <= CATALOGUE_TTL => {}
@@ -365,8 +383,19 @@ impl AiServer {
         let mut last: Option<Failed> = None;
         for offer in offers {
             let bound = offer.bound_msat(input, max_tokens);
-            if let Err(r) = lock(&self.inner).store.may_spend(key_id, bound, today) {
-                let (s, b) = refusal_answer(&r);
+            // one lock for both reads (a guard held in an `if let` scrutinee lives through its block)
+            let (may, left) = {
+                let g = lock(&self.inner);
+                (g.store.may_spend(key_id, bound, today), g.store.entries.iter().find(|e| e.id == key_id).map_or(0, |e| e.left_msat(today)))
+            };
+            if let Err(r) = may {
+                let (s, b) = match r {
+                    // room left, but not for the most this request may cost
+                    crate::credentials::Refusal::Paused { limit_sats } if left > 0 => (402, error_body("limit_reached", "insufficient_quota", &format!(
+                        "This request may cost up to {} sats, more than the {} sats this key has left of its limit of {limit_sats} sats. \
+                         Ask for fewer max_tokens, or raise the limit on the AI page of Lightning Stream.", bound.div_ceil(1000), left / 1000))),
+                    r => refusal_answer(&r),
+                };
                 return Reply::Whole(json_response(s, &b));
             }
             body["model"] = Value::String(offer.model.clone());
