@@ -288,7 +288,12 @@ impl Config {
 
     /// The shops without a web address the owner added: `shops.json` beside the services file.
     pub fn shops_path(&self) -> PathBuf {
-        self.services_path().with_file_name("shops.json")
+        // where the signer can read it too (it reads a shop's transport document there,
+        // XBT_SHOPS_FILE): run/ui under the platform's data directory, else beside the services file
+        match std::env::var_os("XBT_DATA_DIR") {
+            Some(d) => PathBuf::from(d).join("run").join("ui").join("shops.json"),
+            None => self.services_path().with_file_name("shops.json"),
+        }
     }
 
     /// A test or embedding configuration.

@@ -10,6 +10,8 @@ publish.workspace = true
 [dependencies]
 xbt-primitives.workspace = true
 xbt402 = { workspace = true, features = ["http-client"] }
+# a seller reached by its key (a shop without a web address): crates/xbt-iroh-link
+xbt-iroh-link = { path = "../xbt-iroh-link" }
 sha2.workspace = true
 # stream tickets: a ticket's secret and tag are HMAC-SHA256 of the sealed seed (already in the tree through xbt402)
 hmac.workspace = true

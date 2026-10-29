@@ -191,6 +191,14 @@ pub trait TicketWire: Send + Sync {
         let _ = tls;
         self.send(method, url, body, headers, read_timeout)
     }
+
+    /// Learns that `origin` is reached over an iroh link (`link`, from the seller's checked
+    /// transport document), believing where the link is from Nostr only from `nostr_author`. A
+    /// wire that has no links refuses: the seller is then not reached at all.
+    fn learn_link(&self, origin: &str, link: &xbt402::transport::Link, nostr_author: Option<&str>) -> Result<()> {
+        let _ = (origin, link, nostr_author);
+        Err(err("transport_error", "this wallet reaches sellers by web address only"))
+    }
 }
 
 /// [`TicketWire`] over ureq. No overall deadline (an answer may be long); a connect, a read and a
@@ -198,8 +206,60 @@ pub trait TicketWire: Send + Sync {
 #[derive(Default)]
 pub struct UreqWire {
     /// By read timeout, and the trust: "" the public authorities (ureq's own, the Mozilla roots),
-    /// else what [`seller_tls_key`] says of a `tickets.seller_tls` entry as it is now.
+    /// else what [`seller_tls_key`] says of a `tickets.seller_tls` entry as it is now; "link" for a
+    /// seller reached over the iroh link.
     agents: Mutex<HashMap<(u64, String), ureq::Agent>>,
+    /// Where the link's key is kept (`<root>/link.key`); `None`: no links.
+    root: Option<std::path::PathBuf>,
+    /// The iroh link, started the first time a seller is reached by key.
+    link: Mutex<Option<Arc<xbt_iroh_link::Link>>>,
+}
+
+/// Nostr relays a buyer asks where a seller's link is reached (`xbt_iroh_link::nostr_lookup`).
+const LINK_LOOKUP_RELAYS: [&str; 3] = ["wss://relay.kilombino.com", "wss://nos.lol", "wss://relay.damus.io"];
+
+impl UreqWire {
+    /// A wire that can also reach sellers by key, with the link's key kept under `root`.
+    pub fn with_root(root: &std::path::Path) -> Self {
+        Self { root: Some(root.to_path_buf()), ..Self::default() }
+    }
+
+    fn link(&self) -> Result<Arc<xbt_iroh_link::Link>> {
+        let mut l = lock(&self.link);
+        if let Some(l) = l.as_ref() {
+            return Ok(l.clone());
+        }
+        let root = self.root.as_ref().ok_or_else(|| err("transport_error", "this wallet reaches sellers by web address only"))?;
+        let secret = xbt402::provider::load_or_create_secret(&root.join("link.key")).map_err(|e| err("transport_error", e.to_string()))?;
+        // private mode for the buyer: relays only (the platform sets it; the app's switch is the seller's)
+        let private = std::env::var("XBT_LINK_PRIVATE").is_ok_and(|v| v == "1");
+        let lookup = Some(Arc::new(xbt_iroh_link::nostr_lookup::NostrLookup::new(None, LINK_LOOKUP_RELAYS.iter().map(|r| r.to_string()).collect())));
+        let opts = xbt_iroh_link::Options {
+            relays: xbt_iroh_link::Relays::OursThenPublic(vec![xbt_iroh_link::DEFAULT_RELAY.into()]),
+            serving: false,
+            private,
+            lookup,
+        };
+        let started = xbt_iroh_link::Link::start_with(secret.secret_bytes(), opts).map_err(|e| err("transport_error", format!("link: {e}")))?;
+        *l = Some(started.clone());
+        Ok(started)
+    }
+}
+
+/// A shop's receipt key and transport document from the app's shops file (`XBT_SHOPS_FILE`: an
+/// object of origin to `{receipt_key, transport}`, which the app writes when a shop is added).
+fn shop_entry(origin: &str) -> Option<(String, Value)> {
+    let path = std::env::var_os("XBT_SHOPS_FILE")?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let all: Value = serde_json::from_str(&text).ok()?;
+    let e = all.get(origin)?;
+    Some((e.get("receipt_key")?.as_str()?.to_string(), e.get("transport")?.clone()))
+}
+
+/// A host reached over the link: a seller's link name, or a shop without a web address.
+fn link_host(url: &str) -> bool {
+    let host = xbt402::wire::request_url(url).host.to_ascii_lowercase();
+    host.ends_with(xbt_iroh_link::HOST_SUFFIX) || host.ends_with(xbt_iroh_link::SHOP_SUFFIX)
 }
 
 /// A TLS verifier that accepts exactly one certificate, by the SHA-256 of its DER (a seller's own
@@ -296,13 +356,24 @@ impl TicketWire for UreqWire {
             Some(t) => seller_tls_key(t)?,
             None => (String::new(), vec![]),
         };
+        // a seller reached by key: its name resolves to the link's loopback port, and the link
+        // carries the bytes end to end encrypted (an http URL: no TLS on top of it)
+        let link = if link_host(&url) { Some(self.link()?) } else { None };
+        let key = if link.is_some() { "link".to_string() } else { key };
         let tls_config = match tls {
-            Some(t) if !lock(&self.agents).contains_key(&(secs, key.clone())) => Some(seller_tls_config(t, roots)?),
+            Some(t) if link.is_none() && !lock(&self.agents).contains_key(&(secs, key.clone())) => Some(seller_tls_config(t, roots)?),
             _ => None,
         };
         let agent = lock(&self.agents).entry((secs, key)).or_insert_with(|| {
             let b = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(secs)).timeout_write(Duration::from_secs(secs))
                 .redirects(0);
+            let b = match link {
+                Some(l) => b.resolver(move |hp: &str| match l.resolve(hp) {
+                    Some(r) => r,
+                    None => std::net::ToSocketAddrs::to_socket_addrs(hp).map(|a| a.collect()),
+                }),
+                None => b,
+            };
             match tls_config {
                 Some(c) => b.tls_config(c).build(),
                 None => b.build(),
@@ -324,6 +395,22 @@ impl TicketWire for UreqWire {
         let length = if bodiless { Some(0) } else { resp.header("Content-Length").and_then(|s| s.parse::<u64>().ok()) };
         let body: Box<dyn Read + Send> = if bodiless { Box::new(std::io::empty()) } else { Box::new(resp.into_reader()) };
         Ok(WireAnswer { status, headers, length, body })
+    }
+
+    fn learn_link(&self, origin: &str, link: &xbt402::transport::Link, nostr_author: Option<&str>) -> Result<()> {
+        let l = self.link()?;
+        let direct = link.direct.iter().filter_map(|a| a.parse().ok()).collect();
+        let hints = xbt_iroh_link::Hints { relays: link.relays.clone(), direct };
+        let bad = |e: std::io::Error| err("transport_error", format!("link: {e}"));
+        l.learn(&link.endpoint_id, hints).map_err(bad)?;
+        if let Some(a) = nostr_author {
+            l.expect_author(&link.endpoint_id, a).map_err(bad)?;
+        }
+        let host = xbt402::wire::request_url(origin).host;
+        if host.to_ascii_lowercase().ends_with(xbt_iroh_link::SHOP_SUFFIX) {
+            l.bind_shop(&host, &link.endpoint_id).map_err(bad)?;
+        }
+        Ok(())
     }
 }
 
@@ -1037,6 +1124,29 @@ impl Signer {
         let listed = self.engine.allowlist().contains(&origin);
         if !self.ticket_may_reach(&origin, task.as_deref().unwrap_or("")) {
             return deny("allowlist", format!("destination not on allowlist: {origin} (and the call names no task that pays any seller)"));
+        }
+        // a seller reached by key: its transport document (from its listing), checked before a byte
+        // goes. The node is the one the owner allowed for this seller, else the one that signed
+        // given by the caller, or, for a shop with no web address, read from the app's shops file
+        let from_file = (p.get("transport").is_none_or(Value::is_null) && xbt402::shop::is_shop(&origin)).then(|| shop_entry(&origin)).flatten();
+        let doc = p.get("transport").filter(|v| !v.is_null()).or(from_file.as_ref().map(|(_, d)| d));
+        if let Some(doc) = doc {
+            let rk = match &from_file {
+                Some((rk, _)) => rk.clone(),
+                None => str_or_empty(p.get("receipt_key")),
+            };
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            let node = cfg.counterparties.get(&origin).and_then(|c| c.get("ln_node")).and_then(Value::as_str).map(str::to_string)
+                .or_else(|| xbt402::transport::node_of(doc, &origin, &rk, now));
+            let Some(link) = node.and_then(|n| xbt402::transport::verified_iroh(doc, &origin, &rk, &n, now)) else {
+                return deny("transport", "the seller's transport document does not check out (its receipt key, its node's signature, or its expiry)");
+            };
+            let author = xbt402::shop::key_of(&origin).map(hex::encode);
+            if let Err(e) = self.ticket_wire.learn_link(&origin, &link, author.as_deref()) {
+                return deny("transport", e.msg);
+            }
+        } else if xbt402::shop::is_shop(&origin) {
+            return deny("transport", "a shop without a web address is reached through its transport document: pass `transport` and `receipt_key` from its listing, or add the shop in the app (XBT_SHOPS_FILE)");
         }
         // a seller the owner has not named, reached through a task that admits any: https and a public address,
         // before the first byte leaves (the owner may widen this for a lab: tickets.unlisted_private)
