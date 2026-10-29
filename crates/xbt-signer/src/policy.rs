@@ -47,6 +47,13 @@ pub fn normalize_dest(dest: &str) -> String {
         return String::new();
     }
     let lower = dest.to_lowercase();
+    // a shop without a web address (`docs/DIRECT-LINKS.md`) may be written as its Nostr key, an
+    // `npub` or `nostr:<hex>`; it is the same seller as its `http://<key>.shop.invalid` origin
+    if lower.starts_with("npub1") || lower.starts_with("nostr:") || lower.split(['/', '?', '#']).any(|p| p.ends_with(xbt402::shop::SUFFIX)) {
+        if let Some(origin) = xbt402::shop::parse(dest).filter(|o| xbt402::shop::is_shop(o)) {
+            return origin;
+        }
+    }
     // AGP-048: a Lightning payee is `ln:<node id>` (hex, case-folded)
     if lower.starts_with("ln:") {
         return lower;
@@ -866,6 +873,23 @@ mod tests {
 
     fn entry(i: i64, ts: f64) -> LedgerEntry {
         LedgerEntry { dest: "http://api.test".into(), amount_sats: 10 + i, ts, txid: format!("t{i}"), memo: "m".into() }
+    }
+
+    #[test]
+    fn a_shop_written_as_its_nostr_key_is_the_same_seller_as_its_shop_origin() {
+        // NIP-19's example key
+        let hex = "7e7e9c42a91bfef19fa929e5fda1b72e0ebc1a4c1141673e2794234d86addf4e";
+        let npub = "npub10elfcs4fr0l0r8af98jlmgdh9c8tcxjvz9qkw038js35mp4dma8qzvjptg";
+        let pk: [u8; 32] = hex::decode(hex).unwrap().try_into().unwrap();
+        let origin = xbt402::shop::origin_for(&pk);
+        for d in [npub, &npub.to_uppercase(), &format!("nostr:{npub}"), &format!("nostr:{hex}"), &origin, &format!("{origin}/ai/x")] {
+            assert_eq!(normalize_dest(d), origin, "{d}");
+        }
+        // web origins, Lightning payees and addresses are as before
+        assert_eq!(normalize_dest("https://Shop.example/a"), "https://Shop.example");
+        assert_eq!(normalize_dest("LN:02AB"), "ln:02ab");
+        // an npub with a bad checksum is not folded into any shop
+        assert_eq!(normalize_dest("npub1notakey"), "npub1notakey");
     }
 
     fn txids(s: &PolicyStore) -> Vec<String> {

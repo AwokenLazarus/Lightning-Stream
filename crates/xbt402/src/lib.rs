@@ -35,8 +35,10 @@ pub mod maturity;
 pub mod offer;
 pub mod provider;
 pub mod scheme;
+pub mod shop;
 pub mod ticket;
 pub mod tokens;
+pub mod transport;
 pub mod wire;
 #[cfg(feature = "rpc")]
 pub mod rpc;
