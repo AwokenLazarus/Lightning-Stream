@@ -15,10 +15,12 @@ export const main = sdk.setupMain(async ({ effects }) => {
       .find((i) => i.id === ifaceId)
     return iface?.addressInfo?.nonLocal.format('urlstring') ?? []
   }
+  // an interface's address already carries its path (`/mcp`, `/v1`): add it only where it is missing
+  const withPath = (u: string, path: string) => { const b = u.replace(/\/$/, ''); return b.endsWith(path) ? b : b + path }
   // the MCP interface's addresses, for the UI's Agents page
-  const mcpUrls = (await addresses('mcp', 'mcp')).map((u) => u.replace(/\/$/, '') + '/mcp')
+  const mcpUrls = (await addresses('mcp', 'mcp')).map((u) => withPath(u, '/mcp'))
   // the AI interface's addresses, for the UI's AI page (http first: programs on the LAN rarely trust the OS's certificate)
-  const aiUrls = (await addresses('ai', 'ai')).map((u) => u.replace(/\/$/, '') + '/v1').sort((x, y) => Number(y.startsWith('http:')) - Number(x.startsWith('http:')))
+  const aiUrls = (await addresses('ai', 'ai')).map((u) => withPath(u, '/v1')).sort((x, y) => Number(y.startsWith('http:')) - Number(x.startsWith('http:')))
   // this server's IPv4 address on the LAN, for the miners' and the link's addresses the hashrate pages show
   const lanHost =
     (await addresses('ui', 'ui'))
