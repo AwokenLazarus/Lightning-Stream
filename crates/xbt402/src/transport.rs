@@ -216,7 +216,7 @@ mod tests {
         let seller = "http://abc.shop.invalid";
         let (nk, np) = node();
         let l = link(seller, 2_000, &nk);
-        let (doc, pk) = signed(seller, &[l.clone()]);
+        let (doc, pk) = signed(seller, std::slice::from_ref(&l));
         assert_eq!(verify(&doc, seller, &pk, &np, 1_000).unwrap().links, vec![l.clone()]);
         assert_eq!(verified_iroh(&doc, seller, &pk, &np, 1_000), Some(l));
         assert_eq!(node_of(&doc, seller, &pk, 1_000), Some(np));

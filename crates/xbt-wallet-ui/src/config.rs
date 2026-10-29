@@ -286,6 +286,11 @@ impl Config {
         self.services_file.clone().unwrap_or_else(|| self.data_dir.join("services.json"))
     }
 
+    /// The shops without a web address the owner added: `shops.json` beside the services file.
+    pub fn shops_path(&self) -> PathBuf {
+        self.services_path().with_file_name("shops.json")
+    }
+
     /// A test or embedding configuration.
     pub fn for_test(signer_sock: PathBuf, data_dir: PathBuf, bind: &str) -> Self {
         Self { bind: bind.into(), signer_sock, data_dir, password: None, base_path: "/".into(), session_idle: Duration::from_secs(900),

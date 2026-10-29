@@ -176,10 +176,20 @@ impl Offer {
     }
 }
 
+/// The relays a direct link names unless the owner chose others: the project's own first.
+pub const DEFAULT_LINK_RELAYS: [&str; 1] = ["https://iroh.lazarus-xbt.xyz"];
+/// Where the gateway says how its direct link is doing.
+pub const LINK_STATUS_PATH: &str = "/.well-known/lightning-stream-link.json";
+
 /// The shop and its offers: `sell.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Shop {
     pub name: String,
+    /// Buyers reach the shop over a direct link (`docs/DIRECT-LINKS.md`): no web address, no
+    /// certificate, no port forward. `public_url` is then empty.
+    pub direct: bool,
+    /// The direct link always goes through a relay, so buyers never learn this box's IP address.
+    pub private: bool,
     pub public_url: String,
     pub proxies: String,
     pub network: String,
@@ -266,7 +276,7 @@ fn offer_of(v: &Value) -> Option<Offer> {
 
 impl Shop {
     pub fn to_json(&self) -> Value {
-        let mut v = json!({"name": self.name, "public_url": self.public_url, "proxies": self.proxies, "network": self.network,
+        let mut v = json!({"name": self.name, "direct": self.direct, "private": self.private, "public_url": self.public_url, "proxies": self.proxies, "network": self.network,
                            "mainnet_ok": self.mainnet_ok, "offers": self.offers.iter().map(offer_json).collect::<Vec<_>>()});
         if let Some((a, b, c)) = self.caps {
             v["caps"] = json!([a, b, c]);
@@ -277,7 +287,8 @@ impl Shop {
     pub fn from_json(v: &Value) -> Self {
         let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
         let caps = v.get("caps").and_then(Value::as_array).and_then(|a| Some((a.first()?.as_u64()?, a.get(1)?.as_u64()?, a.get(2)?.as_u64()?)));
-        Shop { name: s("name"), public_url: s("public_url"), proxies: s("proxies"), network: s("network"),
+        let b = |k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(false);
+        Shop { name: s("name"), direct: b("direct"), private: b("private"), public_url: s("public_url"), proxies: s("proxies"), network: s("network"),
                mainnet_ok: v.get("mainnet_ok").and_then(Value::as_bool).unwrap_or(false), caps,
                offers: v.get("offers").and_then(Value::as_array).map(|a| a.iter().filter_map(offer_of).collect()).unwrap_or_default() }
     }
@@ -327,7 +338,9 @@ impl Shop {
                                                     k.get("max_held_tickets")?.as_u64()?)));
         let proxies = c.pointer("/http/forwarded_address/proxies").and_then(Value::as_array)
             .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default();
-        Shop { name: s("/listing/name"), public_url: s("/public_url"), proxies, network: s("/network"),
+        let direct = c.get("link").is_some_and(Value::is_object) && !s("/public_url").starts_with("https://");
+        let private = c.pointer("/link/private").and_then(Value::as_bool).unwrap_or(false);
+        Shop { name: s("/listing/name"), direct, private, public_url: if direct { String::new() } else { s("/public_url") }, proxies, network: s("/network"),
                mainnet_ok: s("/chain") == "main" && s("/mainnet_ack") == MAINNET_ACK, caps, offers }
     }
 
@@ -450,13 +463,13 @@ impl App {
         if !self.keys_stored() {
             return Err("Connect your Lightning node first (step 1).".into());
         }
-        let public_url = shop.public_url.trim().trim_end_matches('/').to_string();
-        if public_url.is_empty() {
-            return Err("Say where buyers find you.".into());
+        let public_url = if shop.direct { String::new() } else { shop.public_url.trim().trim_end_matches('/').to_string() };
+        if public_url.is_empty() && !shop.direct {
+            return Err("Say how buyers reach you.".into());
         }
         let local = ["http://127.0.0.1", "http://[::1]", "http://localhost"].iter()
             .any(|p| public_url == *p || public_url.strip_prefix(p).is_some_and(|r| r.starts_with(':')));
-        if !public_url.starts_with("https://") && !local {
+        if !shop.direct && !public_url.starts_with("https://") && !local {
             return Err("Buyers reach you at an https:// address. Put the address of your box's secure link here.".into());
         }
         let active: Vec<&Offer> = shop.offers.iter().filter(|o| !o.paused).collect();
@@ -466,7 +479,12 @@ impl App {
         }
         let mut c: Map<String, Value> = self.gateway_now().and_then(|v| v.as_object().cloned()).unwrap_or_default();
         let old_routes: Vec<Value> = c.get("routes").and_then(Value::as_array).cloned().unwrap_or_default();
-        c.insert("listen".into(), json!(if public_url.starts_with("https://") { format!("0.0.0.0:{}", gw.port) } else { format!("127.0.0.1:{}", gw.port) }));
+        // a direct shop listens where the app reaches it: its own loopback when the app runs beside it
+        // (Linux), the app's private network otherwise (Umbrel, StartOS: the port is published nowhere)
+        let app_beside = gw.health_url.as_deref().and_then(crate::services::http_origin)
+            .is_none_or(|o| o.starts_with("http://127.") || o.starts_with("http://localhost") || o.starts_with("http://[::1]"));
+        let open = public_url.starts_with("https://") || (shop.direct && !app_beside);
+        c.insert("listen".into(), json!(if open { format!("0.0.0.0:{}", gw.port) } else { format!("127.0.0.1:{}", gw.port) }));
         // a shop that moves keeps answering at its old address, for the buyers that saved it
         let mut aliases: Vec<String> = c.get("public_aliases").and_then(Value::as_array).into_iter().flatten()
             .filter_map(Value::as_str).map(str::to_string).collect();
@@ -483,7 +501,19 @@ impl App {
         } else {
             c.insert("public_aliases".into(), json!(aliases));
         }
-        c.insert("public_url".into(), json!(public_url));
+        if shop.direct {
+            // the gateway names itself by its Nostr key and serves over its link: no address to write
+            c.remove("public_url");
+            c.remove("public_aliases");
+            let mut link = c.get("link").cloned().filter(Value::is_object).unwrap_or(json!({}));
+            if link.get("relays").and_then(Value::as_array).is_none_or(|a| a.is_empty()) {
+                link["relays"] = json!(DEFAULT_LINK_RELAYS);
+            }
+            link["private"] = json!(shop.private);
+            c.insert("link".into(), link);
+        } else {
+            c.insert("public_url".into(), json!(public_url));
+        }
         // every route names its own service
         c.remove("upstream");
         c.insert("state_dir".into(), json!(gw.state_dir));
@@ -600,7 +630,8 @@ impl App {
         }
         // the shop on Nostr, on the app's relays (first) and any the config already named, so a new
         // install is found there too; publishing written off by hand stays off
-        let listed = c.contains_key("listing") && public_url.starts_with("https://");
+        // a direct shop is found on Nostr only: its listing goes there whatever else
+        let listed = c.contains_key("listing") && (public_url.starts_with("https://") || shop.direct);
         let mut nostr = c.get("nostr").cloned().filter(Value::is_object);
         if listed && !self.cfg.nostr_relays.is_empty() {
             let mut n = nostr.unwrap_or(json!({}));
@@ -691,6 +722,53 @@ impl App {
         crate::app::http_get(&format!("{address}/")).is_ok_and(|(code, _)| code > 0)
     }
 
+    /// What the gateway says about its direct link (`/.well-known/lightning-stream-link.json` on its
+    /// own address): its shop key, its link and whether its node vouches for it.
+    pub(crate) fn link_status(&self) -> Option<Value> {
+        let base = self.cfg.gw.health_url.as_deref()?;
+        let origin = crate::services::http_origin(base)?;
+        match crate::app::http_get(&format!("{origin}{LINK_STATUS_PATH}")) {
+            Ok((200, body)) => serde_json::from_str(&body).ok(),
+            _ => None,
+        }
+    }
+
+    /// The shop key to share, and how the direct link is doing, in plain words.
+    fn shop_key_card(&self) -> String {
+        let Some(v) = self.link_status() else {
+            return "<section class=\"card\"><h2>Your shop key</h2><p>It shows here once your shop has started. Save above, then come back in a few seconds.</p></section>".into();
+        };
+        let t = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+        let npub = t("npub");
+        let state = if !t("sign_error").is_empty() {
+            format!("<p><span class=\"pill warn\">Not yet reachable</span> Your Lightning node has not vouched for this shop's link: {}. \
+                     Buyers' apps refuse a link their seller's node has not vouched for.</p>", esc(&t("sign_error")))
+        } else if v.get("signed_until").and_then(Value::as_u64).is_some() {
+            let how = if v.get("private").and_then(Value::as_bool).unwrap_or(false) { "through a relay only (private)" } else { "directly when the networks allow, through a relay when not" };
+            format!("<p><span class=\"pill good\">Reachable</span> Buyers' apps connect {how}, encrypted end to end.</p>")
+        } else {
+            "<p><span class=\"pill warn\">Starting</span> Your shop is getting its link ready. This takes a few seconds.</p>".into()
+        };
+        format!("<section class=\"card\"><h2>Your shop key</h2><p>Share this with buyers. They paste it in their app under Sellers, or find your shop on Browse.</p>\
+                 <p><code class=\"key\" id=\"shop-key\">{}</code></p><button type=\"button\" class=\"secondary\" data-copy=\"shop-key\">Copy</button>{state}\
+                 <details><summary>Advanced: the link</summary><ul class=\"small\"><li>Link key <code>{}</code></li><li>Relays: {}</li>\
+                 <li>Your node's word for it holds until {}</li></ul></details></section>",
+                esc(&npub), esc(&t("endpoint_id")),
+                esc(&v.get("relays").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default()),
+                v.get("signed_until").and_then(Value::as_i64).map(|u| esc(&crate::html::utc(u))).unwrap_or_else(|| "not yet".into()))
+    }
+
+    /// Where buyers find the shop, in a sentence.
+    fn where_buyers_find(&self, shop: &Shop) -> String {
+        if !shop.direct {
+            return format!("Buyers can find you at {}.", shop.public_url.trim_end_matches('/'));
+        }
+        match self.link_status().and_then(|v| v.get("npub").and_then(Value::as_str).map(str::to_string)) {
+            Some(npub) => format!("Buyers find you by your shop key {npub}, on Browse in their app, or when you share it."),
+            None => "Buyers find you by your shop key, on Browse in their app. It shows here once your shop has started.".into(),
+        }
+    }
+
     /// The shop's one status, and each offer's (by id).
     pub fn shop_status(&self, shop: &Shop, chain: &str) -> (Status, HashMap<String, Status>) {
         let st = |class: &'static str, h: &str, n: &str| Status { class, headline: h.into(), next: n.into() };
@@ -719,7 +797,7 @@ impl App {
                     if each.values().any(|s| s.class == "bad") {
                         st("bad", "Selling, with a problem", "One of your services can't be reached: see below.")
                     } else {
-                        st("ok", "Selling", &format!("Buyers can find you at {}.", shop.public_url.trim_end_matches('/')))
+                        st("ok", "Selling", &self.where_buyers_find(shop))
                     }
                 }
                 _ => st("bad", "Starting, or stopped", "Your shop is not answering yet. It starts by itself in a few seconds; if this stays, restart the app."),
@@ -739,7 +817,7 @@ impl App {
             Ok(_) if shop.offers.is_empty() => ("warn", "Not selling yet".into(), "Add a service to sell: a media server, an AI model or another web service.".into()),
             Ok(_) if live == 0 => ("warn", "Paused".into(), "Everything is paused. Resume a service to sell again.".into()),
             Ok(_) => ("good", format!("Selling {live} service{}", if live == 1 { "" } else { "s" }),
-                      format!("Buyers find you at {}.", shop.public_url.trim_end_matches('/'))),
+                      self.where_buyers_find(&shop)),
         }
     }
 
@@ -779,24 +857,36 @@ impl App {
         b.push_str(&pin_card(&csrf, gw.node_pin, gw.node_rest.as_deref(), gw.node_tls_cert.as_deref(), "./sell"));
 
         // the shop
+        // a new shop, and any shop without a web address, is reached directly
+        let direct = shop.direct || shop.public_url.trim().is_empty();
         let pv = |k: &str, d: &str| sent.as_ref().filter(|(f, _)| f.get("action").map(String::as_str) == Some("shop"))
             .and_then(|(f, _)| f.get(k).cloned()).unwrap_or_else(|| d.to_string());
         b.push_str(&format!("<section class=\"card\"><h2>{}Your shop</h2><form method=\"post\" action=\"./sell\">{csrf}\
             <input type=\"hidden\" name=\"action\" value=\"shop\">\
             <label>Shop name, as buyers see it<input name=\"name\" value=\"{}\" maxlength=\"200\" placeholder=\"My shop\"></label>\
-            <label>Where buyers find you<input name=\"public_url\" type=\"url\" inputmode=\"url\" value=\"{}\" required pattern=\"https://.+|http://(127\\.0\\.0\\.1|localhost|\\[::1\\])(:[0-9]+)?\" \
+            <fieldset class=\"reach\" id=\"shop-reach\"><legend>How buyers reach you</legend>\
+            <label class=\"check\"><input type=\"radio\" name=\"reach\" value=\"direct\"{}> <span><strong>Directly, through the app</strong> (recommended)<br>\
+            <span class=\"hint\">No web address, no certificate, no port forward. Buyers find you by your shop key.</span></span></label>\
+            <label class=\"check\"><input type=\"checkbox\" name=\"private\" value=\"1\"{}> <span>Private: always go through a relay, so buyers never see \
+            this box's internet address. A little slower.</span></label>\
+            <p class=\"hint\">Either way, what you sell is encrypted all the way from this box to the buyer's app. A relay sees internet addresses and how much \
+            is sent, never what.</p>\
+            <details{}><summary>Advanced: use my own https address instead</summary>\
+            <label class=\"check\"><input type=\"radio\" name=\"reach\" value=\"web\"{}> <span>At my own https address</span></label>\
+            <label>Your https address<input name=\"public_url\" type=\"url\" inputmode=\"url\" value=\"{}\" pattern=\"https://.+|http://(127\\.0\\.0\\.1|localhost|\\[::1\\])(:[0-9]+)?\" \
             title=\"The https:// address of your box's secure link, like https://films.example.com\" placeholder=\"https://films.example.com\"></label>\
-            <p class=\"hint\">The public https:// address that leads to this app's selling port ({}). Buyers' apps pay and connect there.</p>\
-            <details><summary>I don't have an https address yet</summary><p>Buyers on the internet need a secure address that leads to this \
-            app's selling port. Pick one of these, then paste the address above:</p><ol>\
+            <p class=\"hint\">The public https:// address that leads to this app's selling port ({}). Buyers' apps pay and connect there. \
+            Ways to make one:</p><ol>\
             <li><strong>Cloudflare Tunnel</strong> (an app in the Umbrel App Store, and a free Cloudflare account with your own domain): make a public \
             hostname, like <code>films.example.com</code>, that points at <code>{}</code>.</li>\
             <li><strong>Another tunnel app</strong> that offers a public https address for a service on this box (several VPN and \
             remote-access apps do): point it at <code>{}</code>.</li>\
             <li><strong>Your own domain and proxy</strong> (for example the Nginx Proxy Manager app): a proxy host with a certificate, forwarding \
-            to <code>{}</code>.</li></ol><p class=\"hint\">The app never makes a public address by itself: what is on the internet stays your choice.</p></details>{}\
+            to <code>{}</code>.</li></ol><p class=\"hint\">The app never makes a public address by itself: what is on the internet stays your choice.</p></details></fieldset>{}\
             <button class=\"secondary\">Save</button></form>{}</section>",
-            if keys { "" } else { "2. " }, esc(&pv("name", &shop.name)), esc(&pv("public_url", &shop.public_url)), gw.port,
+            if keys { "" } else { "2. " }, esc(&pv("name", &shop.name)),
+            if direct { " checked" } else { "" }, if shop.private { " checked" } else { "" }, if direct { "" } else { " open" }, if direct { "" } else { " checked" },
+            esc(&pv("public_url", &shop.public_url)), gw.port,
             esc(&self.selling_port()), esc(&self.selling_port()), esc(&self.selling_port()),
             if main {
                 let mut n = String::from("<div class=\"flash warn\"><p><strong>This is real money.</strong> Start with low prices and the low \
@@ -816,6 +906,9 @@ impl App {
             } else {
                 String::new()
             }));
+        if shop.direct {
+            b.push_str(&self.shop_key_card());
+        }
 
         // what is sold
         b.push_str(&format!("<h2>{}Your services</h2>", if keys { "" } else { "3. " }));
@@ -940,9 +1033,14 @@ impl App {
             })(),
             "shop" => {
                 shop.name = g("name").chars().take(200).collect();
-                shop.public_url = g("public_url").trim_end_matches('/').to_string();
+                // without a choice (an older page), a typed https address means a web shop
+                shop.direct = match g("reach").as_str() { "direct" => true, "web" => false, _ => g("public_url").trim().is_empty() };
+                shop.private = shop.direct && g("private") == "1";
+                shop.public_url = if shop.direct { String::new() } else { g("public_url").trim_end_matches('/').to_string() };
                 shop.mainnet_ok = g("mainnet_ok") == "1";
-                if !shop.public_url.is_empty() && !shop.public_url.starts_with("https://") && !shop.public_url.starts_with("http://127.0.0.1")
+                if !shop.direct && shop.public_url.is_empty() {
+                    Err("Paste your https:// address, or choose to be reached directly through the app.".into())
+                } else if !shop.public_url.is_empty() && !shop.public_url.starts_with("https://") && !shop.public_url.starts_with("http://127.0.0.1")
                     && !shop.public_url.starts_with("http://localhost") && !shop.public_url.starts_with("http://[::1]") {
                     Err("Buyers reach you at an https:// address, like https://films.example.com.".into())
                 } else {

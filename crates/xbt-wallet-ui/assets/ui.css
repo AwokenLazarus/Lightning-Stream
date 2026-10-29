@@ -113,6 +113,8 @@ dl.kv dd { margin: 0; overflow-wrap: anywhere; }
 .money { color: var(--money); font-weight: 600; font-variant-numeric: tabular-nums; }
 code, pre, .mono { font-family: var(--mono); font-size: 0.88em; }
 code { background: var(--mono-bg); padding: 1px 5px; border-radius: 5px; overflow-wrap: anywhere; }
+/* a section opened by its anchor (a shop by its key, the Sell page's reach choice) clears the fixed header */
+section[id], fieldset[id] { scroll-margin-top: 76px; }
 pre { background: var(--mono-bg); padding: 12px; border-radius: 10px; overflow-x: auto; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 420px; }
 pre.hex { word-break: break-all; }
 

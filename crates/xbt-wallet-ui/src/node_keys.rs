@@ -40,7 +40,11 @@ use std::path::{Path, PathBuf};
 use serde_json::json;
 use xbt_gateway::node::{bake_macaroon, INFO_OPS, INVOICE_OPS};
 
-use crate::setup::{write_shared, GW_INFO, GW_INVOICES, RAIL_MACAROON, RAIL_OPS};
+use crate::setup::{write_shared, GW_INFO, GW_INVOICES, GW_SIGN, RAIL_MACAROON, RAIL_OPS};
+
+/// What the gateway's sign key holds: lnd's SignMessage and no other call (a URI permission), so it
+/// can sign the statement that vouches for its link key and nothing that moves coins.
+pub const SIGN_OPS: [&str; 1] = ["uri:/lnrpc.Lightning/SignMessage"];
 
 /// The file beside the keys that says they were made by this tool.
 pub const AUTO_KEYS: &str = "auto-keys.json";
@@ -172,6 +176,9 @@ pub struct Outcome {
     pub kept: Vec<String>,
     /// The granted files removed because the node revoked them.
     pub revoked: Vec<String>,
+    /// Keys the app can do without that the node would not bake, each with the node's reason: the
+    /// app runs without them and the next run asks again.
+    pub skipped: Vec<(String, String)>,
 }
 
 /// Add `file`'s root key id and permissions to `dir`'s record of the keys this tool made.
@@ -189,7 +196,7 @@ pub fn make_keys(s: &Settings, bake: &mut Bake) -> Result<Outcome, String> {
     let mut out = Outcome::default();
     let groups: [Group; 2] = [
         (&s.rail_dir, &[(RAIL_MACAROON, &RAIL_OPS)]),
-        (&s.gw_dir, &[(GW_INVOICES, &INVOICE_OPS), (GW_INFO, &INFO_OPS)]),
+        (&s.gw_dir, &[(GW_INVOICES, &INVOICE_OPS), (GW_INFO, &INFO_OPS), (GW_SIGN, &SIGN_OPS)]),
     ];
     for (dir, files) in groups {
         let Some(dir) = dir else { continue };
@@ -202,7 +209,15 @@ pub fn make_keys(s: &Settings, bake: &mut Bake) -> Result<Outcome, String> {
                 continue;
             }
             let id = root_key_id();
-            let mac = bake(ops, id)?;
+            // the sign key only lets a seller offer a direct link: a node that will not bake it (an
+            // older lnd, a node that refuses URI permissions) must not stop the keys the app needs
+            let mac = match bake(ops, id) {
+                Err(e) if *file == GW_SIGN => {
+                    out.skipped.push((file.to_string(), e));
+                    continue;
+                }
+                r => r?,
+            };
             write_shared(dir, file, &mac)?;
             record(dir, file, id, ops)?;
             out.made.push(file.to_string());
@@ -388,11 +403,11 @@ mod tests {
             asked.push((ops.iter().map(|o| o.to_string()).collect(), id));
             Ok(format!("mac:{}", ops.join(",")).into_bytes())
         }).unwrap();
-        assert_eq!(out.made, vec![RAIL_MACAROON, GW_INVOICES, GW_INFO]);
+        assert_eq!(out.made, vec![RAIL_MACAROON, GW_INVOICES, GW_INFO, GW_SIGN]);
         assert_eq!(asked.iter().map(|(o, _)| o.join(" ")).collect::<Vec<_>>(),
-                   vec![RAIL_OPS.join(" "), INVOICE_OPS.join(" "), INFO_OPS.join(" ")]);
+                   vec![RAIL_OPS.join(" "), INVOICE_OPS.join(" "), INFO_OPS.join(" "), SIGN_OPS.join(" ")]);
         let ids: std::collections::HashSet<u64> = asked.iter().map(|(_, id)| *id).collect();
-        assert_eq!(ids.len(), 3, "a root key each");
+        assert_eq!(ids.len(), 4, "a root key each");
         assert!(ids.iter().all(|id| *id != 0));
         assert_eq!(std::fs::read(rail.join(RAIL_MACAROON)).unwrap(), format!("mac:{}", RAIL_OPS.join(",")).into_bytes());
         assert!(made_by_box(&rail) && made_by_box(&gw));
@@ -402,7 +417,7 @@ mod tests {
         // a second run: nothing asked, everything kept
         let out = make_keys(&s, &mut |_, _| panic!("asked again")).unwrap();
         assert!(out.made.is_empty());
-        assert_eq!(out.kept.len(), 3);
+        assert_eq!(out.kept.len(), 4);
     }
 
     #[test]
@@ -490,7 +505,10 @@ mod tests {
         let gw = shared_dir(t.path(), "gateway");
         let s = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: t.path().join("none"), grant: None, rail_dir: None, gw_dir: Some(gw.clone()) };
         let mut n = 0;
-        let e = make_keys(&s, &mut |_, _| {
+        let e = make_keys(&s, &mut |ops, _| {
+            if ops == SIGN_OPS {
+                return Ok(b"sign".to_vec());
+            }
             n += 1;
             if n == 1 { Ok(b"first".to_vec()) } else { Err("permission denied".into()) }
         }).unwrap_err();
@@ -501,9 +519,23 @@ mod tests {
         let rec: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(gw.join(AUTO_KEYS)).unwrap()).unwrap();
         assert!(rec.get(GW_INVOICES).is_some() && rec.get(GW_INFO).is_none());
         let out = make_keys(&s, &mut |_, _| Ok(b"second".to_vec())).unwrap();
-        assert_eq!(out.made, vec![GW_INFO]);
+        assert_eq!(out.made, vec![GW_INFO, GW_SIGN]);
         assert_eq!(out.kept, vec![GW_INVOICES]);
         let rec: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(gw.join(AUTO_KEYS)).unwrap()).unwrap();
         assert!(rec.get(GW_INVOICES).is_some() && rec.get(GW_INFO).is_some());
+    }
+
+    #[test]
+    fn a_node_that_will_not_bake_the_sign_key_still_gets_the_keys_the_app_needs() {
+        let t = tempfile::tempdir().unwrap();
+        let gw = shared_dir(t.path(), "gateway");
+        let s = Settings { rest: "https://node:8080".into(), tls_cert: None, admin: t.path().join("none"), grant: None, rail_dir: None, gw_dir: Some(gw.clone()) };
+        let out = make_keys(&s, &mut |ops, _| if ops == SIGN_OPS { Err("unknown permission".into()) } else { Ok(b"k".to_vec()) }).unwrap();
+        assert_eq!(out.made, vec![GW_INVOICES, GW_INFO]);
+        assert_eq!(out.skipped, vec![(GW_SIGN.to_string(), "unknown permission".to_string())]);
+        assert!(!gw.join(GW_SIGN).exists());
+        // the next run asks again
+        let out = make_keys(&s, &mut |_, _| Ok(b"k".to_vec())).unwrap();
+        assert_eq!(out.made, vec![GW_SIGN]);
     }
 }
