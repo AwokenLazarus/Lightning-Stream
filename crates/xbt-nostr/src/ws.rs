@@ -150,6 +150,14 @@ pub struct WebSocket {
 impl WebSocket {
     /// Open `url` (TCP connect bounded by `timeout`, then the TLS and WebSocket handshakes).
     pub fn connect(url: &str, timeout: Duration) -> io::Result<Self> {
+        Self::connect_with_protocol(url, None, timeout)
+    }
+
+    /// [`Self::connect`], asking for a WebSocket sub-protocol (`Sec-WebSocket-Protocol`).
+    pub fn connect_with_protocol(url: &str, protocol: Option<&str>, timeout: Duration) -> io::Result<Self> {
+        if protocol.is_some_and(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_graphic() && b != b',')) {
+            return Err(bad("a WebSocket sub-protocol is one token"));
+        }
         let u = parse_url(url).map_err(bad)?;
         let bare = u.host.trim_start_matches('[').trim_end_matches(']').to_string();
         let addrs: Vec<_> = (bare.as_str(), u.port).to_socket_addrs()?.collect();
@@ -180,7 +188,8 @@ impl WebSocket {
         let key = B64.encode(k);
         let host = if (u.tls && u.port == 443) || (!u.tls && u.port == 80) { u.host.clone() } else { format!("{}:{}", u.host, u.port) };
         let req = format!("GET {} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n\
-                           Sec-WebSocket-Version: 13\r\nUser-Agent: xbt-nostr\r\n\r\n", u.path);
+                           Sec-WebSocket-Version: 13\r\n{}User-Agent: xbt-nostr\r\n\r\n", u.path,
+                          protocol.map(|p| format!("Sec-WebSocket-Protocol: {p}\r\n")).unwrap_or_default());
         io.write_all(req.as_bytes())?;
         io.flush()?;
         let head = read_head(&mut *io)?;
