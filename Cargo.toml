@@ -69,3 +69,5 @@ panic = "abort"
 ureq = { path = "vendor/ureq" }
 # iroh 1.4.1 with one patch (a preferred home relay): see vendor/iroh/XBT-PATCH.md
 iroh = { path = "vendor/iroh" }
+# ipstack 1.0.1 with one fix (a closed write half sends its FIN once the data in flight is acknowledged): see vendor/ipstack/XBT-PATCH.md
+ipstack = { path = "vendor/ipstack" }

@@ -153,6 +153,12 @@ async fn phone_download(s: &Setup, to: SocketAddr, deadline: Duration) -> usize 
 
 /// [`phone_download`], stopping as soon as `want` bytes have arrived.
 async fn phone_download_until(s: &Setup, to: SocketAddr, deadline: Duration, want: usize) -> usize {
+    phone_fetch(s, to, deadline, want).await.0
+}
+
+/// What a phone's download saw: the bytes, and whether the far end closed (its FIN arrived), with the
+/// time it took.
+async fn phone_fetch(s: &Setup, to: SocketAddr, deadline: Duration, want: usize) -> (usize, bool, Duration) {
     let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let mut tunn = Tunn::new(StaticSecret::from(s.phone_private), PublicKey::from(s.endpoint_public), None, None, 7, None);
     let (mut out, mut inb) = (vec![0u8; 70000], vec![0u8; 70000]);
@@ -171,7 +177,7 @@ async fn phone_download_until(s: &Setup, to: SocketAddr, deadline: Duration, wan
     let o = v4.octets();
     sockets.get_mut::<tcp::Socket>(h).connect(iface.context(), (IpAddress::v4(o[0], o[1], o[2], o[3]), to.port()), 40000).unwrap();
     let (start, mut got, mut buf) = (Instant::now(), 0usize, vec![0u8; 1 << 16]);
-    let mut seen_open = false;
+    let (mut seen_open, mut fin) = (false, false);
     while start.elapsed() < deadline {
         iface.poll(SInstant::now(), &mut dev, &mut sockets);
         for p in dev.tx.drain(..) {
@@ -184,6 +190,10 @@ async fn phone_download_until(s: &Setup, to: SocketAddr, deadline: Duration, wan
             got += ts.recv_slice(&mut buf).unwrap();
         }
         seen_open |= ts.state() == tcp::State::Established;
+        if seen_open && !ts.may_recv() && !ts.can_recv() {
+            fin = true;
+            break;
+        }
         if (seen_open && !ts.is_open()) || got >= want {
             break;
         }
@@ -209,7 +219,7 @@ async fn phone_download_until(s: &Setup, to: SocketAddr, deadline: Duration, wan
             }
         }
     }
-    got
+    (got, fin, start.elapsed())
 }
 
 #[test]
@@ -222,6 +232,18 @@ fn a_phone_downloads_through_wireguard_the_buyer_and_an_exit() {
     let phone = s.buyer.device(IpAddr::V4(PHONE_IP)).unwrap();
     assert_eq!(phone.meter.counts().down_bytes, n as u64, "metered at the device");
     assert_eq!(s.exit_meter.counts().down_bytes, n as u64, "and at the exit");
+}
+
+#[test]
+fn a_download_the_server_ends_by_closing_ends_on_the_phone_too() {
+    // the server sends 1 MiB and closes: the phone must see the end (the FIN), not wait for its deadline
+    let n = 1 << 20;
+    let to = tcp_server(n);
+    let s = setup(81, true, None);
+    let (got, fin, took) = s.rt.block_on(phone_fetch(&s, to, Duration::from_secs(30), usize::MAX));
+    assert_eq!(got, n, "every byte arrived");
+    assert!(fin, "the phone saw the server close (took {took:?})");
+    assert!(took < Duration::from_secs(10), "and promptly: {took:?}");
 }
 
 #[test]
