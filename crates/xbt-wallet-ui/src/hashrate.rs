@@ -438,8 +438,14 @@ impl App {
                         _ => String::new(),
                     };
                     let can = ready && allowed && (free > 0 || total == 0);
+                    let history = history_panel(&x["history"]);
+                    let trial = format!("<form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"trial\">\
+                        <input type=\"hidden\" name=\"key\" value=\"{}\"><p class=\"hint\">Not sure yet? Rent one machine for one piece of work, \
+                        about {}, and see what your own DATUM Gateway accepts before renting more.</p>\
+                        <button class=\"secondary\"{}>Try one slice first</button></form>",
+                        esc(x["linkKey"].as_str().unwrap_or("")), sats_n(price.ceil()), if can { "" } else { " disabled" });
                     b.push_str(&format!("<section class=\"card offer\"><span class=\"pill cat-media\">Hashrate</span><h3>{}</h3>\
-                        <p class=\"price\">{} a piece of work</p><p class=\"small\">About <strong>{}</strong> an hour for each {} of speed (about {} a day) · {}</p>{allow}\
+                        <p class=\"price\">{} a piece of work</p><p class=\"small\">About <strong>{}</strong> an hour for each {} of speed (about {} a day) · {}</p>{history}{allow}{trial}\
                         <form method=\"post\" action=\"./hashrate\">{csrf}<input type=\"hidden\" name=\"action\" value=\"rent\"><input type=\"hidden\" name=\"key\" value=\"{}\">\
                         <div class=\"price-row\"><label>Machines<input name=\"miners\" value=\"1\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label>\
                         <label>For how long, in minutes<input name=\"minutes\" value=\"60\" inputmode=\"numeric\" pattern=\"[0-9]+\" required></label></div>\
@@ -488,6 +494,17 @@ impl App {
                         })
                 }
             }
+            "trial" => call(&base, &token, "POST", "/rent", Some(&json!({"linkKey": g("key"), "trial": true})))
+                .and_then(|v| match v["rental"].as_str() {
+                    Some(_) => Ok(format!("Trying one slice, at most {}. When it is done, its result shows under Your rentals.", sats_n(num(&v["budgetSats"])))),
+                    None => Err(v["error"].as_str().map(|e| format!("Not started: {e}.")).unwrap_or_else(|| "Not started.".into())),
+                }),
+            "attest" => call(&base, &token, "POST", "/attest", Some(&json!({"rental": g("rental")})))
+                .and_then(|v| if v["ok"] == true {
+                    Ok("Published. Other hashtakers see this rental in the hashmaker's delivery history.".into())
+                } else {
+                    Err(v["error"].as_str().map(|e| format!("Not published: {e}.")).unwrap_or_else(|| "Not published: no relay took it.".into()))
+                }),
             "cut" => call(&base, &token, "POST", "/cut", Some(&json!({"rental": g("rental")})))
                 .and_then(|v| if v["ok"] == true { Ok("Cut. The miners stop working for you and payments stop.".into()) } else { Err("That rental had ended already.".into()) }),
             "datum" => call(&base, &token, "POST", "/datum", Some(&json!({"addr": g("addr")}))).and_then(|v| {
@@ -526,15 +543,118 @@ fn rental_card(ctx: &Ctx, r: &Value, _action: &str) -> String {
                  <input type=\"hidden\" name=\"back\" value=\"{}\"><button class=\"danger\">Cut</button></form>",
                 App::csrf_input(ctx), esc(id), if _action.contains("connections") { "connections" } else { "hashrate" })
     };
-    format!("<section class=\"card live\"><div class=\"offer-head\"><h3>Hashrate from {}</h3>{pill}</div>\
-             <p>Spent so far: <span class=\"money\">{}</span> of {} · {} piece{} of work paid · {} on {} machine{}</p>{why}<div class=\"row\">{cut}</div></section>",
+    let trial = r["trial"] == true;
+    let result = if ended && paid > 0 { result_box(&r["result"], trial) } else { String::new() };
+    let attest = match (&r["attested"], ended && paid > 0) {
+        (a, _) if a["ok"] == true => "<p class=\"hint\">Its delivery record is published.</p>".to_string(),
+        (_, true) => format!("<form method=\"post\" action=\"./hashrate\">{}<input type=\"hidden\" name=\"action\" value=\"attest\">\
+                 <input type=\"hidden\" name=\"rental\" value=\"{}\"><p class=\"hint\">Help other hashtakers: publish a signed record of what this \
+                 hashmaker delivered. It names no pool, payout or address, only this app's key, the work and what was paid.</p>\
+                 <button class=\"secondary\">Publish a delivery record</button></form>", App::csrf_input(ctx), esc(id)),
+        _ => String::new(),
+    };
+    let title = if trial { "Test slice from" } else { "Hashrate from" };
+    format!("<section class=\"card live\"><div class=\"offer-head\"><h3>{title} {}</h3>{pill}</div>\
+             <p>Spent so far: <span class=\"money\">{}</span> of {} · {} piece{} of work paid · {} on {} machine{}</p>{why}{result}<div class=\"row\">{cut}</div>{attest}</section>",
             esc(r["hasher"].as_str().unwrap_or("a hashmaker")), sats_n(spent), sats_n(num(&r["budgetSats"])), paid, if paid == 1 { "" } else { "s" },
             speed(hs), live["miners"].as_u64().unwrap_or(0), if live["miners"].as_u64() == Some(1) { "" } else { "s" })
+}
+
+/// A whole percentage.
+fn pct(x: f64) -> String {
+    format!("{:.0}%", (x * 100.0).max(0.0))
+}
+
+/// What a finished rental, or a test slice, showed: delivered against advertised speed, stale and
+/// rejected shares, and the share round trip.
+fn result_box(r: &Value, trial: bool) -> String {
+    if r.is_null() {
+        return String::new();
+    }
+    let delivered = num(&r["deliveredHs"]);
+    let advertised = num(&r["advertisedHs"]);
+    let vs = match r["ratio"].as_f64() {
+        Some(x) => format!(" against {} advertised ({})", speed(advertised), pct(x)),
+        None => String::new(),
+    };
+    let rt = match (r["latencyMsP50"].as_u64(), r["latencyMsP95"].as_u64()) {
+        (Some(a), Some(b)) => format!(" · share round trip {a} ms, {b} ms at worst"),
+        (Some(a), None) => format!(" · share round trip {a} ms"),
+        _ => String::new(),
+    };
+    let head = if trial { "What the test slice showed" } else { "What this rental delivered" };
+    let after = if trial { "<p class=\"hint\">Your own DATUM Gateway checked every share. If this looks right, rent for longer below.</p>" } else { "" };
+    format!("<div class=\"result\"><p><strong>{head}:</strong> {}{vs} · stale shares {} · rejected {}{rt}</p>{after}</div>",
+            speed(delivered), pct(r["staleShare"].as_f64().unwrap_or(0.0)), pct(r["rejectedShare"].as_f64().unwrap_or(0.0)))
+}
+
+/// A hashmaker's delivery history, as the offer shows it.
+fn history_panel(h: &Value) -> String {
+    let records = h["records"].as_u64().unwrap_or(0);
+    let says = &h["hashmakerSays"];
+    if records == 0 {
+        let own = if says.is_null() { String::new() } else {
+            format!(" The hashmaker says it served {} rental{} ({} TH-hours), but no hashtaker has published a record yet.",
+                    says["rentals"].as_u64().unwrap_or(0), if says["rentals"].as_u64() == Some(1) { "" } else { "s" }, th_hours(says["thHours"].as_f64().unwrap_or(0.0)))
+        };
+        return format!("<p class=\"small history\">No delivery history yet.{own} Try one slice first to see for yourself.</p>");
+    }
+    let confirmed = h["confirmed"].as_u64().unwrap_or(0);
+    let vs = h["deliveredVsAdvertised"].as_f64().map(|x| format!(" · delivered about {} of what it advertised", pct(x))).unwrap_or_default();
+    let disputed = match h["disputed"].as_u64().unwrap_or(0) {
+        0 => String::new(),
+        n => format!(" · <strong>{n} disputed</strong> (the hashtaker and the hashmaker disagree on what was paid)"),
+    };
+    let recent: Vec<String> = h["recent"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|r| format!("{}{} ({}{})", speed(num(&r["deliveredHs"])), if r["trial"] == true { " test slice" } else { "" },
+                                 pct(r["ratio"].as_f64().unwrap_or(0.0)), if r["confirmed"] == true { ", confirmed" } else { "" }))
+                .collect()
+        })
+        .unwrap_or_default();
+    format!("<details class=\"history\"><summary>Delivery history: {} TH-hours confirmed by both sides · {records} record{} ({confirmed} confirmed){vs}{disputed}</summary>\
+             <p class=\"small\">Recent: {}.</p><p class=\"hint\">Records are signed by the hashtakers who rented, and confirmed when the hashmaker's \
+             own signed summary agrees. Lightning payments are private, so this is a signal, not proof: records the hashmaker did not confirm, \
+             and records from keys that never rented elsewhere, count for less.</p></details>",
+            th_hours(h["verifiedThHours"].as_f64().unwrap_or(0.0)), if records == 1 { "" } else { "s" }, esc(&recent.join("; ")))
+}
+
+fn th_hours(x: f64) -> String {
+    if x >= 10.0 {
+        format!("{x:.0}")
+    } else {
+        format!("{x:.1}")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_history_and_a_test_slice_read_plainly() {
+        assert!(history_panel(&json!({"records": 0})).contains("No delivery history yet"));
+        let says = history_panel(&json!({"records": 0, "hashmakerSays": {"rentals": 3, "thHours": 12.4}}));
+        assert!(says.contains("served 3 rentals (12 TH-hours)"), "{says}");
+        let h = history_panel(&json!({
+            "records": 4, "confirmed": 3, "disputed": 1, "verifiedThHours": 2.5, "deliveredVsAdvertised": 0.97,
+            "recent": [{"deliveredHs": "3900000000000", "ratio": 0.97, "confirmed": true, "trial": true}],
+        }));
+        assert!(h.contains("2.5 TH-hours confirmed by both sides"), "{h}");
+        assert!(h.contains("4 records (3 confirmed)"));
+        assert!(h.contains("delivered about 97% of what it advertised"));
+        assert!(h.contains("1 disputed"));
+        assert!(h.contains("3.90 TH/s test slice (97%, confirmed)"), "{h}");
+        let r = result_box(&json!({"deliveredHs": 3_900_000_000_000u64, "advertisedHs": 4_000_000_000_000u64, "ratio": 0.975,
+                                    "staleShare": 0.01, "rejectedShare": 0.02, "latencyMsP50": 110, "latencyMsP95": 300}), true);
+        assert!(r.contains("What the test slice showed"), "{r}");
+        assert!(r.contains("3.90 TH/s against 4.00 TH/s advertised (98%)"), "{r}");
+        assert!(r.contains("stale shares 1% · rejected 2%"));
+        assert!(r.contains("share round trip 110 ms, 300 ms at worst"));
+        assert_eq!(result_box(&Value::Null, true), "");
+    }
 
     #[test]
     fn speeds_and_prices_read_plainly() {

@@ -167,6 +167,7 @@ impl St {
     fn report(&self) -> Value {
         json!({
             "role": "buyer", "rental": self.rental, "terms": self.terms.to_json(), "meter": self.meter.to_json(),
+            "latencyMs": self.meter.latency_json(),
             "slicesDone": self.done.iter().map(|(w, t)| json!({"work": w.to_string(), "atMs": t})).collect::<Vec<_>>(),
             "released": self.released, "locked": self.locked, "pays": self.pays, "receipts": self.receipts,
             "lastRate": self.rate, "closed": self.closed, "payFailed": self.pay_failed, "events": self.events,
