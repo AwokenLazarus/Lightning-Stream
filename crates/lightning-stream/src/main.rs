@@ -7,7 +7,7 @@
 //! Environment: `LS_LISTEN` (default 127.0.0.1:8480), `B2_SIGNER_SOCK` (the signer's socket),
 //! `B2_STREAM_DIR` (the directory the signer streams bodies into: the same for both),
 //! `LS_TASK` (the owner's task the calls are paid under), `LS_MAX_SATS` (the most one call may
-//! spend; default 2,000).
+//! spend; default 2,000). With `LS_AI_LISTEN`, it also serves the AI endpoint (see `start_ai`).
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -63,6 +63,7 @@ fn main() {
     if prepare_stream_dir(&stream_dir) != 0 {
         std::process::exit(1);
     }
+    let cfg_paths = (PathBuf::from(&signer), PathBuf::from(&stream_dir), task.clone(), max_sats);
     let cfg = lightning_stream::Config { signer: PathBuf::from(signer), stream_dir: PathBuf::from(stream_dir), task, max_sats };
     let signals = match xbt_svc::shutdown::listen() {
         Ok(s) => s,
@@ -79,10 +80,49 @@ fn main() {
         }
     };
     eprintln!("lightning-stream: listening on {}", run.addr);
+    let ai = start_ai(&cfg_paths);
     let sig = signals.wait();
     xbt_svc::shutdown::say_stopping("lightning-stream", sig);
     // the listener stops; answers in flight end, and their sockets close, so the signer stops paying
     let _ = run.stopper().drain(xbt_svc::shutdown::DRAIN);
+    if let Some(ai) = ai {
+        let _ = ai.stopper().drain(xbt_svc::shutdown::DRAIN);
+    }
+}
+
+/// The AI endpoint, when `LS_AI_LISTEN` is set: an OpenAI-compatible address for programs on the
+/// owner's network, each with a key from `LS_CREDENTIALS` (see `inference_server`). It needs
+/// `LS_CREDENTIALS`, `LS_AI_SELLERS` and `LS_AI_STATE`; `LS_AI_HOSTS` (comma-separated) lists the
+/// host names it answers to, `LS_AI_FIRST_BYTE_S` how long a seller has for its first byte.
+fn start_ai(base: &(PathBuf, PathBuf, String, i64)) -> Option<xbt_svc::http::Running> {
+    let listen = env("LS_AI_LISTEN")?;
+    let (Some(credentials), Some(sellers), Some(state)) = (env("LS_CREDENTIALS"), env("LS_AI_SELLERS"), env("LS_AI_STATE")) else {
+        eprintln!("lightning-stream: LS_AI_LISTEN needs LS_CREDENTIALS, LS_AI_SELLERS and LS_AI_STATE; the AI endpoint is off");
+        return None;
+    };
+    let first_byte = Duration::from_secs(env("LS_AI_FIRST_BYTE_S").and_then(|v| v.parse().ok()).unwrap_or(20));
+    let allowed_hosts = env("LS_AI_HOSTS").map(|h| h.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default();
+    let (signer, stream_dir, task, max_sats) = base.clone();
+    let cfg = lightning_stream::inference_server::Config {
+        signer, stream_dir, task, max_sats, credentials: credentials.into(), sellers: sellers.into(), state: state.into(), first_byte, allowed_hosts,
+    };
+    let listener = match TcpListener::bind(&listen) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("lightning-stream: AI endpoint {listen}: {e}; it is off");
+            return None;
+        }
+    };
+    match lightning_stream::inference_server::serve(cfg, listener) {
+        Ok(r) => {
+            eprintln!("lightning-stream: AI endpoint on {}", r.addr);
+            Some(r)
+        }
+        Err(e) => {
+            eprintln!("lightning-stream: AI endpoint: {e}; it is off");
+            None
+        }
+    }
 }
 
 /// The stream directory has to be writable by this process: it creates the sockets there. On a

@@ -2,21 +2,18 @@
 //! allowed sellers offer, and which seller a request goes to.
 //!
 //! The endpoint (an OpenAI-compatible address on the owner's network) is a thin layer over these:
-//! it checks the key ([`Keys::check`]), asks the router for an order of sellers ([`Router::order`]),
+//! it checks the key ([`crate::credentials::Store::check`]), asks the router for an order of sellers ([`Router::order`]),
 //! pays the first through the signer, and on a failure before the first byte of an answer tries
 //! the next ([`Router::may_fall_back`]). A request is sent to one seller at a time, and never moved
 //! once a byte of the answer has arrived, so one answer is never paid for twice.
 //!
-//! Keys are kept as the SHA-256 of the key, so a copy of the file does not give them away; the key
-//! itself is shown to the owner once, when it is made.
+//! The keys themselves are the shared credential store's ([`crate::credentials`]), one store for
+//! AI keys and local links.
 
 use std::collections::HashMap;
 
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
-
-/// The prefix every key carries, so a key is recognised for what it is in a client's settings.
-pub const KEY_PREFIX: &str = "sk-stream-";
+use crate::credentials::Refusal;
 
 /// Most fallbacks after the first seller, for one request.
 pub const MAX_FALLBACKS: usize = 2;
@@ -33,114 +30,19 @@ pub const COOL_OFF_S: u64 = 300;
 /// Within this share of the cheapest price, the faster seller wins (a near-tie, in percent).
 pub const NEAR_TIE_PCT: u64 = 20;
 
-fn key_hash(key: &str) -> String {
-    hex::encode(Sha256::digest(key.as_bytes()))
-}
-
-/// A new key: [`KEY_PREFIX`] and 128 random bits, base64url without padding.
-pub fn new_key() -> String {
-    use base64::Engine as _;
-    let mut b = [0u8; 16];
-    getrandom::getrandom(&mut b).expect("the system's random source");
-    format!("{KEY_PREFIX}{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b))
-}
-
-/// One API key the owner made for a client app.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Key {
-    /// SHA-256 of the key, hex.
-    pub hash: String,
-    pub name: String,
-    /// The most the key may spend in all, in sats.
-    pub limit_sats: u64,
-    /// What it has spent, in sats (the sum of its calls' charges).
-    pub spent_sats: u64,
-    pub revoked: bool,
-}
-
-/// Why a key may not be used.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum KeyRefusal {
-    /// No key, an unknown one, or one revoked: OpenAI's 401.
-    Unknown,
-    /// The key has spent its limit: 402, and the owner raises the limit.
-    LimitReached { limit_sats: u64 },
-}
-
-impl KeyRefusal {
-    /// The HTTP status and the error body, in the shape OpenAI's clients read.
-    pub fn answer(&self) -> (u16, Value) {
-        match self {
-            Self::Unknown => (401, error_body("invalid_api_key", "authentication_error", "This key is not one this Lightning Stream knows, or it was revoked.")),
-            Self::LimitReached { limit_sats } => (402, error_body("limit_reached", "insufficient_quota",
-                &format!("This key has spent its limit of {limit_sats} sats. Raise the limit on the AI page of Lightning Stream."))),
-        }
-    }
-}
-
 /// An error in OpenAI's shape: `{"error": {"message", "type", "code"}}`.
 pub fn error_body(code: &str, kind: &str, message: &str) -> Value {
     json!({"error": {"message": message, "type": kind, "code": code}})
 }
 
-/// The owner's keys.
-#[derive(Debug, Default, Clone)]
-pub struct Keys {
-    keys: Vec<Key>,
-}
-
-impl Keys {
-    pub fn new(keys: Vec<Key>) -> Self {
-        Self { keys }
+/// A key refused, as OpenAI's clients read it: an unknown or revoked key is 401, a key at its limit
+/// 402 with words the client shows.
+pub fn refusal_answer(r: &Refusal) -> (u16, Value) {
+    match r {
+        Refusal::Unknown => (401, error_body("invalid_api_key", "authentication_error", "This key is not one this Lightning Stream knows, or it was revoked.")),
+        Refusal::Paused { limit_sats } => (402, error_body("limit_reached", "insufficient_quota",
+            &format!("This key has reached its limit of {limit_sats} sats. Raise the limit on the AI page of Lightning Stream."))),
     }
-
-    /// Makes a key and keeps only its hash: the key itself is returned, to be shown once.
-    pub fn make(&mut self, name: &str, limit_sats: u64) -> String {
-        let key = new_key();
-        self.keys.push(Key { hash: key_hash(&key), name: name.to_string(), limit_sats, spent_sats: 0, revoked: false });
-        key
-    }
-
-    /// The key an `Authorization` header names, when it may spend `need_sats` more.
-    pub fn check(&self, authorization: Option<&str>, need_sats: u64) -> Result<&Key, KeyRefusal> {
-        let given = authorization.and_then(|h| h.strip_prefix("Bearer ")).map(str::trim).unwrap_or("");
-        if !given.starts_with(KEY_PREFIX) {
-            return Err(KeyRefusal::Unknown);
-        }
-        let h = key_hash(given);
-        let k = self.keys.iter().find(|k| crate_ct_eq(k.hash.as_bytes(), h.as_bytes()) && !k.revoked).ok_or(KeyRefusal::Unknown)?;
-        if k.spent_sats.saturating_add(need_sats) > k.limit_sats {
-            return Err(KeyRefusal::LimitReached { limit_sats: k.limit_sats });
-        }
-        Ok(k)
-    }
-
-    /// What the key may still spend.
-    pub fn left(&self, hash: &str) -> u64 {
-        self.keys.iter().find(|k| k.hash == hash).map_or(0, |k| k.limit_sats.saturating_sub(k.spent_sats))
-    }
-
-    /// Books what a call charged against its key.
-    pub fn charge(&mut self, hash: &str, sats: u64) {
-        if let Some(k) = self.keys.iter_mut().find(|k| k.hash == hash) {
-            k.spent_sats = k.spent_sats.saturating_add(sats);
-        }
-    }
-
-    pub fn revoke(&mut self, hash: &str) {
-        if let Some(k) = self.keys.iter_mut().find(|k| k.hash == hash) {
-            k.revoked = true;
-        }
-    }
-
-    pub fn list(&self) -> &[Key] {
-        &self.keys
-    }
-}
-
-/// A comparison that takes the same time whatever the bytes, for keys.
-fn crate_ct_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// One model at one seller.
@@ -338,26 +240,6 @@ mod tests {
         c.add_seller("fast", "https://fast.example/ai/", &json!({"per_1k_output_msat": 5500}), 1024, &json!({"data": [{"id": "llama-3.1-8b"}]}));
         c.add_seller("dear", "https://dear.example/ai/", &json!({"per_1k_input_msat": 2000, "per_1k_output_msat": 20000}), 1024, &json!({"data": [{"id": "llama-3.1-8b"}]}));
         c
-    }
-
-    #[test]
-    fn a_key_is_kept_hashed_checked_and_limited() {
-        let mut k = Keys::default();
-        let key = k.make("Open WebUI", 1000);
-        assert!(key.starts_with(KEY_PREFIX) && key.len() == KEY_PREFIX.len() + 22);
-        assert!(k.list().iter().all(|x| x.hash != key && !x.hash.contains(&key)), "the key itself is not kept");
-        let auth = format!("Bearer {key}");
-        let h = k.check(Some(&auth), 10).unwrap().hash.clone();
-        assert_eq!(k.check(Some("Bearer sk-stream-nope"), 0), Err(KeyRefusal::Unknown));
-        assert_eq!(k.check(None, 0), Err(KeyRefusal::Unknown));
-        k.charge(&h, 995);
-        assert_eq!(k.left(&h), 5);
-        assert_eq!(k.check(Some(&auth), 10), Err(KeyRefusal::LimitReached { limit_sats: 1000 }));
-        assert!(k.check(Some(&auth), 5).is_ok());
-        k.revoke(&h);
-        assert_eq!(k.check(Some(&auth), 0), Err(KeyRefusal::Unknown));
-        let (status, body) = KeyRefusal::LimitReached { limit_sats: 1000 }.answer();
-        assert_eq!((status, body["error"]["code"].as_str()), (402, Some("limit_reached")));
     }
 
     #[test]
