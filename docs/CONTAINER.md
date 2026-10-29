@@ -37,6 +37,7 @@ tmpfs `/tmp`.
   relay/           agp  uid 10006  0700  blobs/ (the xbt-work receipt relay's sealed blobs, one file each), secrets/
   gateway/         agp  uid 10007  0700  the seller gateway's state: receipt.key, sessions, the journal
   hashrate/        agp  uid 10010  0700  p2p-hash: the hasher's link and Nostr keys, the renter's key and its saved DATUM Gateway address
+  stream-relay/    agp  uid 10016  0700  the built-in Stream relay: its Let's Encrypt certificates (certs/) and attempt log
   cmp-node/        cmp  uid 10011  0700  operator key, operator service, merchant ledgers and meters, secrets/
   cmpd/            cmp  uid 10012  0700  device runtime state, secrets/
   cmpd-cache/      cmp  uid 10012  0700  the model span cache: LARGE, its own mount (CMP_CACHE_DIR), safe to prune
@@ -57,6 +58,10 @@ tmpfs `/tmp`.
   run/hashrate/    uid 10005, gid 10010 (xbt-hashrate), 0750: settings.json (0640), written by the UI's Hashrate
                    page, read by the hasher service; control-token (0640), made once by init, owned by the
                    UI, read by both hashrate services (their control pages ask for it)
+  run/relay/       uid 10005, gid 10016 (xbt-stream-relay), 0750: relay.json (0640), the owner's relay settings
+                   written by the UI's Stream relays page, read by the built-in relay
+  run/relay-status/ uid 10016, gid 10017 (xbt-relay-status), 0750: status.json (0640), written by the relay,
+                   read by the UI; the group has the relay and the UI in it
   lightning/tls.cert   not under the data dir: the Lightning node's certificate, one file bind-mounted read-only
 ```
 
@@ -109,6 +114,8 @@ UID table (the images' `USER`; the cmp rows are reserved):
 | 10007 | xbt-gateway | xbt-gateway |
 | 10008 | (group xbt-ln-rail only) | |
 | 10010 | xbt-hashrate | xbt-hashlink (the hasher's and the renter's services; in xbt-signer's group for the renter's payments) |
+| 10016 | xbt-stream-relay | xbt-stream-relay (the built-in Stream relay, off until switched on) |
+| 10017 | (group xbt-relay-status only) | |
 | 0 | root | xbt-init (a one-shot that exits; §8) |
 | 10011 | cmp-node | cmp-node (reserved) |
 | 10012 | cmpd | cmpd-* (reserved) |

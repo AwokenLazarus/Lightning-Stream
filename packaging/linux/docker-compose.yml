@@ -7,7 +7,9 @@
 #   * the gateway (selling port 8402): it listens beyond loopback only once the owner saves a shop
 #     with an https:// address on the Sell page (the owner's reverse proxy or tunnel leads there);
 #   * the hashmaker (profile "hashmaker", off unless LS_HASHMAKER=1): this machine's miners on 23340
-#     (keep it on the LAN) and hashtakers' apps on 23341 (a port forward or tunnel makes it public).
+#     (keep it on the LAN) and hashtakers' apps on 23341 (a port forward or tunnel makes it public);
+#   * the built-in Stream relay (profile "relay", off unless LS_RELAY=1): public TCP 443 and UDP 7842,
+#     on its own network (not the host's), and idle until the owner switches it on in the app.
 # The UI asks for the password in .env (LS_UI_PASSWORD), set at install. Of the Lightning node's files
 # the services mount only tls.cert; the admin macaroon reaches node-keys on standard input, once, and
 # is never written (install.sh pipes it in). All state is in LS_DATA_DIR. The project's name, and so
@@ -52,7 +54,7 @@ services:
     security_opt:
       - no-new-privileges:true
     environment:
-      XBT_INIT_COMPONENTS: signer,witness,mcp,ui,gateway,hashrate
+      XBT_INIT_COMPONENTS: signer,witness,mcp,ui,gateway,hashrate,stream-relay
       XBT_INIT_NODE_RPC_USER: ${LS_NODE_RPC_USER:?set LS_NODE_RPC_USER in .env, the XBT node's RPC user}
       XBT_INIT_NODE_RPC_PASS: ${LS_NODE_RPC_PASS:?set LS_NODE_RPC_PASS in .env, the XBT node's RPC password}
       XBT_INIT_UI_PASSWORD: ${LS_UI_PASSWORD:?set LS_UI_PASSWORD in .env, the app's login password}
@@ -139,6 +141,10 @@ services:
       XBT_UI_ENROLL_CODE_FILE: /data/run/enroll/enroll-code
       XBT_SHOPS_FILE: /data/run/shops/shops.json
       XBT_UI_RESTART_HINT: "in the folder you installed it to (~/lightning-stream unless you chose another), run: docker compose restart"
+      # the built-in Stream relay's settings and status (Settings → Stream relays)
+      XBT_UI_RELAY_DIR: /data/run/relay
+      XBT_UI_RELAY_STATUS: /data/run/relay-status/status.json
+      XBT_UI_RELAY_START_HINT: "in the folder you installed it to, run: docker compose --profile relay up -d (or run install.sh again and answer 1 to the relay)"
     volumes:
       - ${LS_DATA_DIR}/ui:/data/ui
       - ${LS_DATA_DIR}/run/signer:/data/run/signer:ro
@@ -148,6 +154,8 @@ services:
       - ${LS_DATA_DIR}/run/hashrate:/data/run/hashrate
       - ${LS_DATA_DIR}/run/shops:/data/run/shops
       - ${LS_DATA_DIR}/run/enroll:/data/run/enroll:ro
+      - ${LS_DATA_DIR}/run/relay:/data/run/relay
+      - ${LS_DATA_DIR}/run/relay-status:/data/run/relay-status:ro
       - *lightning-cert
 
   # One-shot, run by install.sh (`docker compose --profile setup run --rm -T node-keys < admin.macaroon`): has the
@@ -240,3 +248,26 @@ services:
       - ${LS_DATA_DIR}/hashrate:/data/hashrate
       - ${LS_DATA_DIR}/run/hashrate:/data/run/hashrate:ro
       - ${LS_DATA_DIR}/run/signer:/data/run/signer:ro
+
+  # The built-in Stream relay (docs/RUN-A-RELAY.md): carries direct links between other people's apps
+  # when their routers block a direct connection. Profile "relay": started only with LS_RELAY=1,
+  # because it takes the machine's public port 443 (and UDP 7842). It runs on Docker's own network,
+  # unprivileged (443 is mapped to 8443 inside), and does nothing until the owner switches it on under
+  # Settings → Stream relays and its checks pass.
+  stream-relay:
+    <<: *service
+    image: ghcr.io/awokenlazarus/xbt-stream-relay:local
+    profiles: ["relay"]
+    network_mode: bridge
+    ports:
+      - "443:8443"
+      - "7842:7842/udp"
+    stop_grace_period: 15s
+    environment:
+      XBT_RELAY_SETTINGS: /data/run/relay/relay.json
+      XBT_RELAY_STATUS: /data/run/relay-status/status.json
+      XBT_RELAY_STATE: /data/stream-relay
+    volumes:
+      - ${LS_DATA_DIR}/stream-relay:/data/stream-relay
+      - ${LS_DATA_DIR}/run/relay:/data/run/relay:ro
+      - ${LS_DATA_DIR}/run/relay-status:/data/run/relay-status

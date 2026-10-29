@@ -2442,7 +2442,7 @@ fn the_stream_relays_page_lists_announced_relays_and_keeps_the_owner_s_choices()
     assert!(page.body.contains("https://relay-a.example/") && page.body.contains("us-west"));
     assert!(page.body.contains("not answering"));
     assert!(page.body.contains("2 relays announced on 1 of 1 Nostr relays"));
-    assert!(page.body.contains("Run a Stream relay") && page.body.contains("RUN-A-RELAY.md"));
+    assert!(page.body.contains("Run a relay for the Stream network") && page.body.contains("RUN-A-RELAY.md"));
 
     // prefer one, block another; the choices are kept in relays.json, with what they select
     let r = br.act("/relays", "/relays-prefs", &[("action", "pin"), ("relay", "https://Relay-A.example")]);
@@ -2476,6 +2476,7 @@ fn the_stream_relays_page_lists_announced_relays_and_keeps_the_owner_s_choices()
     assert_eq!((mine.region.as_str(), mine.capacity_mbit, mine.udp), ("home", Some(100), true));
     let r = br.act("/relays", "/relays-publish", &[("relay", "https://mine.example"), ("region", "home"), ("capacity_mbit", "lots")]);
     assert!(br.flash_after(&r).contains("whole number"));
+}
 
 /// A shop without a web address (`docs/DIRECT-LINKS.md`): added by its shop key from the app's Nostr
 /// relays, shown by that key, and allowed to be paid through the node its link's signature names.
@@ -2574,4 +2575,73 @@ fn a_shop_reached_directly_writes_a_link_and_no_web_address() {
     assert!(br.flash_after(&r).contains("restarts"));
     let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
     assert_eq!(c["public_url"], "https://films.example");
+}
+
+#[test]
+fn the_built_in_relay_is_switched_on_with_a_domain_and_shows_its_status() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let dirs = tempfile::tempdir().unwrap();
+    let (cfg_dir, status) = (dirs.path().join("relay"), dirs.path().join("status.json"));
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    let (cd, sp) = (cfg_dir.clone(), status.clone());
+    let bx = start(json!({}), false, move |c| {
+        c.stream_relay = "https://127.0.0.1:9/".into();
+        c.relay_dir = Some(cd);
+        c.relay_status = Some(sp);
+        c.relay_start_hint = Some("run: docker compose --profile relay up -d".into());
+    });
+    let mut br = logged_in(&bx);
+    let page = br.get("/relays").body;
+    assert!(page.contains("Run a relay for the Stream network") && page.contains("Switch the relay on"));
+    // a home-network name and a missing e-mail are refused before anything is written
+    let r = br.act("/relays", "/relay-run", &[("action", "on"), ("domain", "box.local"), ("contact", "ops@example.com")]);
+    assert!(br.flash_after(&r).contains("public domain name"));
+    let r = br.act("/relays", "/relay-run", &[("action", "on"), ("domain", "relay.example.com"), ("contact", "nope")]);
+    assert!(br.flash_after(&r).contains("e-mail"));
+    assert!(!cfg_dir.join("relay.json").exists());
+    // switched on: the settings the relay service reads
+    let r = br.act("/relays", "/relay-run", &[("action", "on"), ("domain", "Relay.Example.com"), ("contact", "ops@example.com"), ("udp", "1")]);
+    assert!(br.flash_after(&r).contains("checks the domain"));
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(cfg_dir.join("relay.json")).unwrap()).unwrap();
+    assert_eq!((v["enabled"].clone(), v["domain"].clone(), v["udp"].clone(), v["port_forwarded"].clone()),
+               (json!(true), json!("relay.example.com"), json!(true), json!(false)));
+    // no status yet: the service isn't running, and the page says how to start it
+    assert!(br.get("/relays").body.contains("docker compose --profile relay up -d"));
+    // a fresh status from the service: its checks, then traffic once running
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    std::fs::write(&status, json!({"state": "not_ready", "message": "Not ready: nothing was asked of Let's Encrypt.", "written": now,
+        "preflight": {"ready": false, "checks": [{"id": "dns", "level": "fail", "words": "relay.example.com doesn't resolve yet."}]}}).to_string()).unwrap();
+    let page = unescape(&br.get("/relays").body);
+    assert!(page.contains("doesn't resolve yet"), "{page}");
+    assert!(page.contains("needs attention"));
+    std::fs::write(&status, json!({"state": "running", "message": "Running.", "written": now, "bytes_sent": 2_500_000_000u64,
+        "bytes_recv": 1_000_000_000u64, "clients": 3}).to_string()).unwrap();
+    let page = br.get("/relays").body;
+    assert!(page.contains("2.50 GB out") && page.contains("3 apps connected now") && page.contains("UDP 7842"));
+    // the announce form is filled with the relay's address
+    assert!(page.contains("value=\"https://relay.example.com\""));
+    // try again bumps the attempt; off switches it off
+    let r = br.act("/relays", "/relay-run", &[("action", "retry")]);
+    br.flash_after(&r);
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(cfg_dir.join("relay.json")).unwrap()).unwrap();
+    assert_eq!(v["attempt"], json!(1));
+    let r = br.act("/relays", "/relay-run", &[("action", "off")]);
+    assert!(br.flash_after(&r).contains("switching off"));
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(cfg_dir.join("relay.json")).unwrap()).unwrap();
+    assert_eq!(v["enabled"], json!(false));
+}
+
+#[test]
+fn a_platform_without_the_relay_says_why_and_refuses_the_switch() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let bx = start(json!({}), false, |c| {
+        c.stream_relay = "https://127.0.0.1:9/".into();
+        c.relay_unavailable = Some("Umbrel apps can't take this box's port 443.".into());
+    });
+    let mut br = logged_in(&bx);
+    let page = unescape(&br.get("/relays").body);
+    assert!(page.contains("can't take this box"));
+    assert!(!page.contains("Switch the relay on"));
+    let r = br.act("/relays", "/relay-run", &[("action", "on"), ("domain", "relay.example.com"), ("contact", "ops@example.com")]);
+    assert!(br.flash_after(&r).contains("no built-in relay"));
 }

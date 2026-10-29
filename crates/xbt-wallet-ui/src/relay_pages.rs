@@ -81,13 +81,16 @@ impl App {
             esc(&ctx.csrf), if prefs.only_own { "only-own-off" } else { "only-own-on" },
             if prefs.only_own { "Use any relay again" } else { "Use only my own relays" }));
         // run one
-        b.push_str(&format!("<section class=\"card\"><h2>Run a Stream relay</h2>\
-            <p>A relay adds capacity for everyone whose router blocks direct connections. It needs a server with a public address, \
-            usually a small rented server (VPS): port 443 open, and a domain name. Running one is free for now; paying relays for what \
-            they carry is planned.</p><p><a href=\"{GUIDE}\">The setup guide</a> walks through it step by step.</p>\
-            <details><summary>Announce your relay</summary><form method=\"post\" action=\"./relays-publish\" class=\"stack\">\
+        let own = self.builtin_relay_html(ctx);
+        let prefill = self.builtin_relay_settings().filter(|r| r.enabled && !r.domain.is_empty()).map(|r| format!("https://{}", r.domain)).unwrap_or_default();
+        b.push_str(&format!("<section class=\"card\"><h2>Run a relay for the Stream network</h2>\
+            <p>A relay adds capacity for everyone whose router blocks direct connections. It needs a public address and port 443, \
+            so it suits a small rented server (VPS) better than a box at home. Running one is free for now; paying relays for what \
+            they carry is planned.</p>{own}<p><a href=\"{GUIDE}\">The setup guide</a> covers both ways: switching it on here, or \
+            running the relay on its own.</p>\
+            <details><summary>Announce a relay</summary><form method=\"post\" action=\"./relays-publish\" class=\"stack\">\
             <input type=\"hidden\" name=\"csrf\" value=\"{}\">\
-            <label>Your relay's address <input name=\"relay\" required placeholder=\"https://relay.example.com\"></label>\
+            <label>Your relay's address <input name=\"relay\" required placeholder=\"https://relay.example.com\" value=\"{}\"></label>\
             <label>Where it runs <input name=\"region\" required maxlength=\"{}\" placeholder=\"eu-central\"></label>\
             <label>What it can carry, in Mbit/s (optional) <input name=\"capacity_mbit\" inputmode=\"numeric\"></label>\
             <label><input type=\"checkbox\" name=\"udp\" value=\"1\"> It also answers on UDP (helps direct connections)</label>\
@@ -95,7 +98,7 @@ impl App {
             <button type=\"submit\">Announce</button></form>\
             <p class=\"small\">The announcement is signed with a key this app keeps for it, and lasts 30 days; announce again to keep it listed. \
             Apps check every relay themselves before using it.</p></details></section>",
-            esc(&ctx.csrf), relays::MAX_REGION, relays::MAX_CONTACT));
+            esc(&ctx.csrf), esc(&prefill), relays::MAX_REGION, relays::MAX_CONTACT));
         self.html_page("Settings", "Stream relays", ctx, &b, "")
     }
 
@@ -162,4 +165,151 @@ impl App {
         }
         Resp::redirect("./relays")
     }
+}
+
+/// What the built-in relay service reads (`relay.json`): the same fields as
+/// `xbt_stream_relay::config::Settings`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BuiltinRelay {
+    pub enabled: bool,
+    pub domain: String,
+    pub contact: String,
+    pub udp: bool,
+    pub port_forwarded: bool,
+    pub attempt: u64,
+}
+
+fn gb(bytes: u64) -> String {
+    format!("{:.2} GB", bytes as f64 / 1e9)
+}
+
+impl App {
+    fn builtin_relay_settings(&self) -> Option<BuiltinRelay> {
+        let dir = self.cfg.relay_dir.as_ref()?;
+        let v: serde_json::Value = std::fs::read_to_string(dir.join("relay.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        let st = |k: &str| v.get(k).and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+        let b = |k: &str| v.get(k).and_then(serde_json::Value::as_bool).unwrap_or(false);
+        Some(BuiltinRelay { enabled: b("enabled"), domain: st("domain"), contact: st("contact"), udp: b("udp"), port_forwarded: b("port_forwarded"),
+                            attempt: v.get("attempt").and_then(serde_json::Value::as_u64).unwrap_or(0) })
+    }
+
+    fn builtin_relay_status(&self) -> serde_json::Value {
+        self.cfg.relay_status.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    }
+
+    fn builtin_relay_html(&self, ctx: &Ctx) -> String {
+        if let Some(why) = &self.cfg.relay_unavailable {
+            return format!("<p class=\"flash warn\">This box can't run one: {}</p>", esc(why));
+        }
+        let Some(r) = self.builtin_relay_settings() else {
+            return "<p class=\"small\">This package doesn't include the built-in relay. The Linux package does.</p>".into();
+        };
+        let st = self.builtin_relay_status();
+        // the service rewrites its status every few seconds; an old one means it isn't running
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let fresh = st.get("written").and_then(serde_json::Value::as_u64).is_some_and(|t| now.saturating_sub(t) < 60);
+        let (state, words) = if r.enabled && !fresh {
+            ("stopped", match &self.cfg.relay_start_hint {
+                Some(h) => format!("The relay service isn't running. To start it, {h}."),
+                None => "The relay service isn't running.".to_string(),
+            })
+        } else {
+            (st.get("state").and_then(serde_json::Value::as_str).unwrap_or(if r.enabled { "starting" } else { "off" }),
+             st.get("message").and_then(serde_json::Value::as_str).unwrap_or("").to_string())
+        };
+        let words = words.as_str();
+        let pill = match state {
+            "running" => "<span class=\"pill\">running</span>",
+            "off" => "<span class=\"pill\">off</span>",
+            "checking" | "certifying" | "starting" => "<span class=\"pill warn\">starting</span>",
+            _ => "<span class=\"pill warn\">needs attention</span>",
+        };
+        let mut b = format!("<h3>On this box {pill}</h3><p>{}</p>", esc(words));
+        if let Some(checks) = st.pointer("/preflight/checks").and_then(serde_json::Value::as_array).filter(|_| fresh) {
+            b.push_str("<ul class=\"offers\">");
+            for c in checks {
+                let mark = match c.get("level").and_then(serde_json::Value::as_str) { Some("pass") => "✓", Some("warn") => "!", _ => "✗" };
+                b.push_str(&format!("<li>{mark} {}</li>", esc(c.get("words").and_then(serde_json::Value::as_str).unwrap_or(""))));
+            }
+            b.push_str("</ul>");
+        }
+        if state == "running" && fresh {
+            let n = |k: &str| st.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+            b.push_str(&format!("<p class=\"small\">Carried {} out and {} in since it started · {} apps connected now{}</p>",
+                                gb(n("bytes_sent")), gb(n("bytes_recv")), n("clients"),
+                                if r.udp { " · answering on UDP 7842" } else { "" }));
+        }
+        let csrf = esc(&ctx.csrf);
+        if r.enabled {
+            b.push_str(&format!("<form method=\"post\" action=\"./relay-run\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\
+                <button type=\"submit\" name=\"action\" value=\"off\" class=\"secondary\">Switch the relay off</button> \
+                <button type=\"submit\" name=\"action\" value=\"retry\" class=\"secondary\">Try again</button></form>"));
+        } else {
+            b.push_str(&format!("<details><summary>Switch on a relay on this box</summary>\
+                <form method=\"post\" action=\"./relay-run\" class=\"stack\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\
+                <input type=\"hidden\" name=\"action\" value=\"on\">\
+                <label>The relay's domain name <input name=\"domain\" required placeholder=\"relay.example.com\" value=\"{}\"></label>\
+                <p class=\"small\">Point it at this box first: an A record to this box's public address (with Cloudflare, DNS only).</p>\
+                <label>Your e-mail, for Let's Encrypt <input name=\"contact\" type=\"email\" required value=\"{}\"></label>\
+                <label><input type=\"checkbox\" name=\"udp\" value=\"1\"{}> Also answer on UDP 7842 (helps direct connections; open it in the firewall too)</label>\
+                <label><input type=\"checkbox\" name=\"port_forwarded\" value=\"1\"{}> TCP 443 is forwarded to this box (only behind a home router)</label>\
+                <button type=\"submit\">Switch the relay on</button></form>\
+                <p class=\"small\">Before asking Let's Encrypt for a certificate, the relay checks that the domain points here and that \
+                port 443 is free and reachable. Let's Encrypt refuses a name for an hour after 5 failed tries, so it only asks when the checks pass.</p></details>",
+                esc(&r.domain), esc(&r.contact), if r.udp { " checked" } else { "" }, if r.port_forwarded { " checked" } else { "" }));
+        }
+        b
+    }
+
+    /// `POST /relay-run`: switch the built-in relay on or off, or try again.
+    pub(crate) fn relay_run(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {
+        let Some(dir) = self.cfg.relay_dir.clone().filter(|_| self.cfg.relay_unavailable.is_none()) else {
+            self.flash(ctx, false, "This box has no built-in relay.");
+            return Resp::redirect("./relays");
+        };
+        let mut r = self.builtin_relay_settings().unwrap_or_default();
+        let g = |k: &str| f.get(k).map(|s| s.trim().to_string()).unwrap_or_default();
+        match f.get("action").map(String::as_str) {
+            Some("on") => {
+                r = BuiltinRelay { enabled: true, domain: g("domain").to_ascii_lowercase(), contact: g("contact"), udp: g("udp") == "1",
+                                   port_forwarded: g("port_forwarded") == "1", attempt: r.attempt };
+                if let Err(e) = check_domain(&r.domain).and_then(|_| check_contact(&r.contact)) {
+                    self.flash(ctx, false, e);
+                    return Resp::redirect("./relays");
+                }
+            }
+            Some("off") => r.enabled = false,
+            Some("retry") => r.attempt += 1,
+            _ => {
+                self.flash(ctx, false, "Unknown choice.");
+                return Resp::redirect("./relays");
+            }
+        }
+        let v = serde_json::json!({"enabled": r.enabled, "domain": r.domain, "contact": r.contact, "udp": r.udp,
+                                   "port_forwarded": r.port_forwarded, "attempt": r.attempt});
+        let tmp = dir.join("relay.json.tmp");
+        match std::fs::write(&tmp, format!("{v:#}\n")).and_then(|_| std::fs::rename(&tmp, dir.join("relay.json"))) {
+            Ok(()) => self.flash(ctx, true, if r.enabled { "Saved. The relay checks the domain and port 443 now; this page shows how it goes." }
+                                            else { "The relay is switching off." }),
+            Err(e) => self.flash(ctx, false, format!("{}: {e}", dir.display())),
+        }
+        Resp::redirect("./relays")
+    }
+}
+
+/// The same checks as the relay service's, so the owner hears at once.
+pub fn check_domain(d: &str) -> Result<(), String> {
+    if d.is_empty() || d.parse::<std::net::IpAddr>().is_ok() || !d.contains('.') || d.len() > 253
+        || d.split('.').any(|l| l.is_empty() || l.len() > 63 || l.starts_with('-') || l.ends_with('-') || !l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')) {
+        return Err("Enter the relay's full domain name, such as relay.example.com.".into());
+    }
+    if [".local", ".lan", ".internal", ".home.arpa"].iter().any(|t| d.ends_with(t)) {
+        return Err("That name only works on your home network: a relay needs a public domain name.".into());
+    }
+    Ok(())
+}
+
+pub fn check_contact(c: &str) -> Result<(), String> {
+    let ok = c.len() <= 128 && c.split_once('@').is_some_and(|(u, h)| !u.is_empty() && h.contains('.') && !h.starts_with('.')) && !c.chars().any(char::is_whitespace);
+    if ok { Ok(()) } else { Err("Enter an e-mail address Let's Encrypt can write to about the certificate.".into()) }
 }

@@ -5,8 +5,8 @@ between the two apps (iroh, QUIC with TLS 1.3), punched through both routers. So
 VPNs don't allow that. Then a **relay** passes the traffic between the two apps.
 
 Anyone can run a relay. Each one adds capacity for everyone whose network blocks direct
-connections, and apps prefer a relay near them. Running one is volunteer work for now; paying
-relays for what they carry is planned, as one more Stream service.
+connections, and apps prefer a relay near them. Running one is volunteer work for now; paid relays
+are planned for version 0.1.21 (below).
 
 ## What a relay sees, and what it doesn't
 
@@ -31,12 +31,56 @@ relays for what they carry is planned, as one more Stream service.
   1080p is about a third of that. Pick a plan whose transfer you won't mind using.
 - Linux with systemd 253 or newer (for `LogFilterPatterns`). Ubuntu 24.04 and Debian 13 are fine.
 
-## Set it up
+## The easy way: switch it on in Lightning Stream
+
+The Linux package has a relay built in. On a server with a public address:
+
+1. **Install Lightning Stream** with the Linux package (`docs/LINUX.md`), and answer **1** when
+   `install.sh` asks about the Stream relay. That installs the relay service; it stays idle.
+   (Already installed? Run `install.sh` again, or `docker compose --profile relay up -d` in the
+   folder you installed it to.)
+2. **Point a domain at the server:** an `A` record to its public address (with Cloudflare,
+   **DNS only**, not proxied).
+3. **Open TCP 443** (and UDP 7842 if you want QUIC address discovery) in the server's firewall and
+   the provider's.
+4. In the app, **Settings → Stream relays → Run a relay for the Stream network**: enter the domain
+   and an e-mail address for Let's Encrypt, and switch it on.
+
+Before anything is asked of Let's Encrypt, the relay checks:
+
+- that the domain resolves, and to this server's public address;
+- that port 443 is free on this server;
+- that a connection to the domain on 443 comes back to this server;
+- that it hasn't already tried 3 times in the last hour.
+
+Only when they pass does it ask for the certificate (Let's Encrypt refuses a name for an hour after
+5 failed validations, so the relay never loops). The page shows each check in plain words, what to
+fix when one fails, a **Try again** button, and once it runs, how much it has carried and how many
+apps are connected. Then **Announce a relay** lists it for other apps.
+
+The built-in relay uses the same settings as the hand-made one below: the same limits, no client
+addresses in the logs, its own unprivileged user, and Docker's own network (443 mapped to 8443
+inside), so it never touches the host's network.
+
+**Umbrel and StartOS** can't run it: an Umbrel app can't take the box's port 443, and StartOS keeps
+443 for itself. Those apps say so on the same page. A home box is a poor place for a relay
+anyway (it would carry strangers' encrypted traffic on your home connection); a small rented
+server is the right place.
+
+**Behind a home router** (if you do run it at home with the Linux package): forward TCP 443 to the
+box and tick **TCP 443 is forwarded to this box**. A box can't always reach itself through its own
+public address from behind a router, so there the relay takes your word for the forward.
+
+## Or: run the relay on its own
+
+Without Lightning Stream on the server, set up iroh-relay by hand.
+
+### Set it up by hand
 
 The steps below are what runs our own relay, `iroh.lazarus-xbt.xyz`. Replace
 `relay.example.com` and the contact address with yours.
 
-### 1. The firewall, first
+#### 1. The firewall, first
 
 Open the ports **before** the relay starts. It asks Let's Encrypt for its certificate in its first
 seconds, through port 443. Let's Encrypt allows **5 failed validations per hour** per name; a
@@ -53,7 +97,7 @@ udp dport 7842 accept    # only if you enable QUIC address discovery
 
 (With ufw: `ufw allow 443/tcp` and, if used, `ufw allow 7842/udp`.)
 
-### 2. The binary
+#### 2. The binary
 
 The relay is the stock `iroh-relay` 1.4.1, the version Lightning Stream's link is built against:
 
@@ -63,7 +107,7 @@ sudo install -m 755 ~/.cargo/bin/iroh-relay /usr/local/bin/iroh-relay
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin iroh-relay
 ```
 
-### 3. The configuration
+#### 3. The configuration
 
 `/etc/iroh-relay/iroh-relay.toml`:
 
@@ -104,7 +148,7 @@ sudo install -d -m 755 /etc/iroh-relay
 sudo cp iroh-relay.toml /etc/iroh-relay/iroh-relay.toml
 ```
 
-### 4. The service
+#### 4. The service
 
 `/etc/systemd/system/iroh-relay.service`: sandboxed, capped, and with no client addresses in
 the logs.
@@ -178,7 +222,7 @@ Keep the trailing space after `~opened from `. If the server also runs other ser
 their data directories to `InaccessiblePaths`. `systemd-analyze security iroh-relay` should rate
 the unit "OK".
 
-### 5. Faster single connections (BBR)
+#### 5. Faster single connections (BBR)
 
 A relay carries each app over one TCP connection, so how fast one connection can go is what
 matters. BBR keeps it fast over long or lossy paths, where the default (cubic) slows down:
@@ -193,7 +237,7 @@ sudo sysctl --system
 This applies to every service on the server. To undo it: delete the two files and run
 `sudo sysctl -w net.ipv4.tcp_congestion_control=cubic net.core.default_qdisc=fq_codel`.
 
-### 6. Start it, once
+#### 6. Start it, once
 
 Check the name points at the server (`dig +short relay.example.com`), then:
 
@@ -205,7 +249,7 @@ sudo systemctl enable --now iroh-relay
 Don't restart it in a loop if something is wrong: each failed certificate attempt counts against
 the hourly limit. The certificate is kept in `/var/lib/iroh-relay/certs` and renewed by itself.
 
-### 7. Check it
+#### 7. Check it
 
 ```
 systemctl is-active iroh-relay
@@ -219,7 +263,7 @@ sudo journalctl -u iroh-relay -n 50 | grep -c 'peer='     # 0
 
 `/` answers 404: that's expected.
 
-### 8. Watch it
+#### 8. Watch it
 
 The traffic, CPU and memory against the caps:
 
@@ -321,8 +365,28 @@ the newest per author and `d` replaces the older).
 refuses an announcement whose signature fails, whose `d` doesn't match its `relay`, that is dated
 more than 10 minutes ahead, or that has lapsed.
 
-## Later: paid relays
+## Paid relays (planned for version 0.1.21)
 
-A relay costs its operator bandwidth. The plan is for relays to charge per GB through Stream
-itself, like any other service: paid ahead, metered, receipts signed, no accounts. Until then,
-relays are run by volunteers.
+A relay costs its operator bandwidth. Paid relays let an operator charge for what the relay
+carries, through Stream itself, like any other service. The built-in relay in 0.1.20 is free; the
+design below is what 0.1.21 adds.
+
+- **What is charged:** bytes the relay carries between two apps, per GB. The operator sets the
+  price; the suggested default is **2 sats per GB**. Helping two apps find each other and punch
+  through (hole punching, address discovery) stays free: only relayed traffic is charged.
+- **Who pays:** whoever's **home relay** it is. A seller pays its own home relay for the traffic
+  its buyers reach it through, and builds that into its prices. A buyer pays only for a relay it
+  chooses itself (private mode, which sends everything through a relay).
+- **How:** the relay is a Stream seller. It meters each client by its iroh key and is paid with the
+  same prepaid tickets as everything else, inside the payer's signed spending rules, with signed
+  receipts. The operator receives into its own Lightning node: no custody, nobody else holds money.
+- **When credit runs out:** the relay stops carrying that client's traffic. The app then switches
+  to another relay or tells its owner, never silently.
+- **Cost on the page:** the relay page shows an estimate from the operator's own bandwidth price
+  (what a GB costs them) against the price charged.
+
+What 0.1.20 leaves ready for it: the built-in relay decides who may connect through a metering hook
+(`xbt_stream_relay::meter::Meter`, behind iroh-relay's per-client access control, which sees each
+client's iroh key on connect and on disconnect), free for everyone today. Metering by bytes needs a
+per-client byte count, which iroh-relay 1.4.1 doesn't expose: a small change to iroh-relay, planned
+with paid relays.

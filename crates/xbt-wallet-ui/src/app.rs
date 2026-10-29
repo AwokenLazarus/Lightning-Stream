@@ -594,6 +594,7 @@ impl App {
             "/nostr-check" => self.nostr_check(ctx, f),
             "/relays-prefs" => self.relays_prefs(ctx, f),
             "/relays-publish" => self.relays_publish(ctx, f),
+            "/relay-run" => self.relay_run(ctx, f),
             "/connections" => self.connections_stop(ctx, f),
             "/apps-create" => self.apps_create(ctx, f),
             "/apps-revoke" => self.apps_revoke(ctx, f),

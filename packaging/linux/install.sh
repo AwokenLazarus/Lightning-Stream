@@ -112,6 +112,17 @@ else
 fi
 
 echo
+echo "Stream relay: help other people's apps connect when their routers block it (docs/RUN-A-RELAY.md)."
+echo "It takes this machine's public port 443, so it suits a server with a public address. You switch it"
+echo "on, with your domain name, in the app afterwards (Settings → Stream relays); this only installs it."
+ask LS_RELAY "Install it? 1 for yes, 0 for no" "0"
+if [ "$LS_RELAY" = 1 ]; then
+  COMPOSE_PROFILES=${COMPOSE_PROFILES:+$COMPOSE_PROFILES,}relay
+else
+  LS_RELAY=0
+fi
+
+echo
 if [ -z "${LS_UI_PASSWORD:-}" ]; then
   LS_UI_PASSWORD=$(head -c 18 /dev/urandom | base64 | tr '+/' '-_')
   [ "$YES" = 1 ] || ask_secret LS_UI_PASSWORD "A password for the app's page (empty: a random one, saved in $DIR/.env)"
@@ -132,7 +143,7 @@ mkdir -p "$LS_DATA_DIR"
   {
     echo "# Lightning Stream: written by install.sh on $(date -u +%Y-%m-%d). It holds passwords: keep it private."
     for k in COMPOSE_PROJECT_NAME LS_DATA_DIR LS_CHAIN LS_UI_PASSWORD LS_LND_REST LS_LND_TLS_CERT LS_NODE_RPC_HOST LS_NODE_RPC_PORT LS_NODE_RPC_USER \
-             LS_NODE_RPC_PASS LS_DATUM LS_DATUM_USER LS_HASHMAKER LS_LAN_HOST COMPOSE_PROFILES LS_UI_HASHMAKER \
+             LS_NODE_RPC_PASS LS_DATUM LS_DATUM_USER LS_HASHMAKER LS_RELAY LS_LAN_HOST COMPOSE_PROFILES LS_UI_HASHMAKER \
              LS_UI_HASHMAKER_SLICES LS_UI_PORT LS_MCP_PORT LS_CONNECTOR_PORT LS_GW_PORT LS_HASHTAKER_CONTROL_PORT LS_RELAYS; do
       v=${!k:-}
       case $v in *"'"*) die "$k may not contain a single quote" ;; esac
@@ -153,7 +164,7 @@ docker compose config -q || die "the settings do not work together (docker compo
 # --- 4. the images, the keys, the start ---------------------------------------------------------------
 if [ "${LS_SKIP_PULL:-0}" != 1 ]; then
   say "downloading the app's images (pinned by digest)"
-  docker compose --profile setup --profile hashmaker pull -q
+  docker compose --profile setup --profile hashmaker --profile relay pull -q
 fi
 
 # the admin macaroon is offered where lnd keeps it; empty skips this step (the app's pages take narrow ones later)

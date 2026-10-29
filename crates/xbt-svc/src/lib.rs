@@ -95,6 +95,12 @@ pub const RUN_HASHRATE: &str = "hashrate";
 /// documents), written by the UI and read, by the signer's group, by the connector and the MCP, which
 /// hand them to the signer in each call to such a shop. The signer itself never mounts it.
 pub const RUN_SHOPS: &str = "shops";
+/// The Stream relay built into the package (`docs/RUN-A-RELAY.md`): its certificates and attempt log.
+pub const STREAM_RELAY: &str = "stream-relay";
+/// The owner's relay settings (`relay.json`), written by the UI and read by the relay.
+pub const RUN_RELAY: &str = "relay";
+/// The relay's status file, written by the relay and read by the UI.
+pub const RUN_RELAY_STATUS: &str = "relay-status";
 /// The MCP bearer token's name, in `run/ui/` on a box (AGP-042) or `mcp/secrets/` without a UI.
 pub const MCP_TOKEN: &str = "mcp-http-token";
 

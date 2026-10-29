@@ -19,6 +19,10 @@ Deterministic (mtime 0, sorted, numeric owners) so the layer digest is the same 
   /data/run/shops   0750 xbt-wallet-ui:xbt-signer, the shops without a web address the UI keeps (public data);
                     the connector (the signer's user) and the MCP (in its group) read it
   /data/run/hashrate 0750 xbt-wallet-ui:xbt-hashrate, their settings the UI's Hashrate page writes, and their control token
+  /data/stream-relay 0700, the built-in Stream relay's certificates and attempt log (xbt-stream-relay, 10016)
+  /data/run/relay   0750 xbt-wallet-ui:xbt-stream-relay, the owner's relay settings the UI's Stream relays page writes
+  /data/run/relay-status 0750 xbt-stream-relay:xbt-relay-status, the relay's status for the UI; the group
+                    (10017, a group only) has the relay and the UI in it
 Uid 10004 is not used: it was the retired hub's, and the other uids keep their numbers.
     python3 container/mkbase.py OUT.tar
 """
@@ -27,13 +31,15 @@ import sys
 import tarfile
 
 USERS = [("xbt-signer", 10001), ("xbt-anchor-witness", 10002), ("xbt-wallet-mcp", 10003), ("xbt-wallet-ui", 10005),
-         ("xbt-work-relay", 10006), ("xbt-gateway", 10007), ("xbt-hashrate", 10010)]
+         ("xbt-work-relay", 10006), ("xbt-gateway", 10007), ("xbt-hashrate", 10010), ("xbt-stream-relay", 10016)]
 HOME = {"xbt-signer": "/data/signer", "xbt-anchor-witness": "/data/witness", "xbt-wallet-mcp": "/data/mcp",
-        "xbt-wallet-ui": "/data/ui", "xbt-work-relay": "/data/relay", "xbt-gateway": "/data/gateway", "xbt-hashrate": "/data/hashrate"}
+        "xbt-wallet-ui": "/data/ui", "xbt-work-relay": "/data/relay", "xbt-gateway": "/data/gateway", "xbt-hashrate": "/data/hashrate",
+        "xbt-stream-relay": "/data/stream-relay"}
 MEMBERS = {"xbt-signer": "xbt-wallet-mcp,xbt-wallet-ui,xbt-hashrate", "xbt-anchor-witness": "xbt-signer", "xbt-wallet-ui": "xbt-wallet-mcp",
-           "xbt-gateway": "xbt-wallet-ui", "xbt-hashrate": "xbt-wallet-ui"}
+           "xbt-gateway": "xbt-wallet-ui", "xbt-hashrate": "xbt-wallet-ui", "xbt-stream-relay": "xbt-wallet-ui"}
 # groups with no user of their own
-GROUPS = [("xbt-ln-rail", 10008, "xbt-signer,xbt-wallet-ui"), ("xbt-enroll", 10009, "xbt-signer,xbt-wallet-ui")]
+GROUPS = [("xbt-ln-rail", 10008, "xbt-signer,xbt-wallet-ui"), ("xbt-enroll", 10009, "xbt-signer,xbt-wallet-ui"),
+          ("xbt-relay-status", 10017, "xbt-stream-relay,xbt-wallet-ui")]
 
 passwd = "root:x:0:0:root:/:/nonexistent\n" + "".join(f"{n}:x:{u}:{u}:{n}:{HOME[n]}:/nonexistent\n" for n, u in USERS)
 group = ("root:x:0:\n" + "".join(f"{n}:x:{u}:{MEMBERS.get(n, '')}\n" for n, u in USERS)
@@ -45,7 +51,8 @@ DIRS = [("etc", 0, 0, 0o755), ("tmp", 0, 0, 0o1777), ("usr", 0, 0, 0o755), ("usr
         ("data/run/anchor", 10002, 10002, 0o750), ("data/run/ui", 10005, 10005, 0o750),
         ("data/run/ln", 10005, 10008, 0o750), ("data/run/gateway", 10005, 10007, 0o750), ("data/run/enroll", 10001, 10009, 0o750),
         ("data/run/hashrate", 10005, 10010, 0o750),
-        ("data/run/shops", 10005, 10001, 0o750)]
+        ("data/run/shops", 10005, 10001, 0o750),
+        ("data/stream-relay", 10016, 10016, 0o700), ("data/run/relay", 10005, 10016, 0o750), ("data/run/relay-status", 10016, 10017, 0o750)]
 FILES = [("etc/passwd", passwd, 0o644), ("etc/group", group, 0o644)]
 
 entries = []
