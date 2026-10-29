@@ -2796,7 +2796,11 @@ impl Signer {
 /// https, or http to this machine.
 fn private_channel(origin: &str) -> bool {
     let u = xbt402::wire::request_url(origin);
-    u.scheme == "https" || (u.scheme == "http" && (u.host == "localhost" || u.host == "[::1]" || u.host.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| ip.is_loopback())))
+    u.scheme == "https"
+        || (u.scheme == "http" && (u.host == "localhost" || u.host == "[::1]" || u.host.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| ip.is_loopback())))
+        // a seller reached by key: a `.invalid` name no resolver answers (RFC 6761), reached only over
+        // its iroh link, end-to-end encrypted to the key its checked transport document names
+        || (u.scheme == "http" && link_host(origin))
 }
 
 fn c_status(head: &Receipt) -> u16 {
@@ -2890,10 +2894,11 @@ mod tests {
 
     #[test]
     fn tickets_are_paid_over_https_or_to_this_machine_only() {
-        for ok in ["https://seller.example", "https://seller.example:8443", "http://127.0.0.1:8402", "http://127.9.9.9", "http://localhost:80", "http://[::1]:8402"] {
+        let by_key = xbt402::shop::origin_for(&[7u8; 32]);
+        for ok in ["https://seller.example", "https://seller.example:8443", "http://127.0.0.1:8402", "http://127.9.9.9", "http://localhost:80", "http://[::1]:8402", by_key.as_str()] {
             assert!(private_channel(ok), "{ok}");
         }
-        for no in ["http://seller.example", "http://10.0.0.5:8402", "http://127.0.0.1.example", "http://[::2]", "ftp://127.0.0.1", "http://localhost.example", ""] {
+        for no in ["http://seller.example", "http://10.0.0.5:8402", "http://127.0.0.1.example", "http://[::2]", "ftp://127.0.0.1", "http://localhost.example", "http://shop.invalid.example", ""] {
             assert!(!private_channel(no), "{no}");
         }
     }
