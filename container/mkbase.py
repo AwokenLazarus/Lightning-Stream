@@ -16,6 +16,8 @@ Deterministic (mtime 0, sorted, numeric owners) so the layer digest is the same 
   /data/run/enroll  0750 xbt-signer:xbt-enroll, the signer's enrolment code for the UI's setup page; the group
                     (10009, a group only) has the signer and the UI in it, never the MCP
   /data/hashrate    0700, the hashrate services' keys and state (xbt-hashrate, 10010)
+  /data/run/shops   0750 xbt-wallet-ui:xbt-signer, the shops without a web address the UI keeps (public data);
+                    the connector (the signer's user) and the MCP (in its group) read it
   /data/run/hashrate 0750 xbt-wallet-ui:xbt-hashrate, their settings the UI's Hashrate page writes, and their control token
 Uid 10004 is not used: it was the retired hub's, and the other uids keep their numbers.
     python3 container/mkbase.py OUT.tar
@@ -42,7 +44,8 @@ DIRS = [("etc", 0, 0, 0o755), ("tmp", 0, 0, 0o1777), ("usr", 0, 0, 0o755), ("usr
         ("data/ui", 10005, 10005, 0o700), ("data/relay", 10006, 10006, 0o700), ("data/gateway", 10007, 10007, 0o700), ("data/hashrate", 10010, 10010, 0o700), ("data/run", 0, 0, 0o755), ("data/run/signer", 10001, 10001, 0o750),
         ("data/run/anchor", 10002, 10002, 0o750), ("data/run/ui", 10005, 10005, 0o750),
         ("data/run/ln", 10005, 10008, 0o750), ("data/run/gateway", 10005, 10007, 0o750), ("data/run/enroll", 10001, 10009, 0o750),
-        ("data/run/hashrate", 10005, 10010, 0o750)]
+        ("data/run/hashrate", 10005, 10010, 0o750),
+        ("data/run/shops", 10005, 10001, 0o750)]
 FILES = [("etc/passwd", passwd, 0o644), ("etc/group", group, 0o644)]
 
 entries = []

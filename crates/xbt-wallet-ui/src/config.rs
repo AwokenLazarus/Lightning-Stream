@@ -288,10 +288,14 @@ impl Config {
 
     /// The shops without a web address the owner added: `shops.json` beside the services file.
     pub fn shops_path(&self) -> PathBuf {
-        // where the signer can read it too (it reads a shop's transport document there,
-        // XBT_SHOPS_FILE): run/ui under the platform's data directory, else beside the services file
+        // where the connector and the MCP read it too, to hand a shop's transport document to the
+        // signer (XBT_SHOPS_FILE): that file when it is set, else run/shops under the platform's data
+        // directory, else beside the services file
+        if let Some(f) = std::env::var_os("XBT_SHOPS_FILE") {
+            return PathBuf::from(f);
+        }
         match std::env::var_os("XBT_DATA_DIR") {
-            Some(d) => PathBuf::from(d).join("run").join("ui").join("shops.json"),
+            Some(d) => PathBuf::from(d).join("run").join("shops").join("shops.json"),
             None => self.services_path().with_file_name("shops.json"),
         }
     }

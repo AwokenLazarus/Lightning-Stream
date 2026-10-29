@@ -95,6 +95,9 @@ impl Connector {
         if let Some(r) = range {
             params["range"] = r.into();
         }
+        if let Some(m) = params.as_object_mut() {
+            xbt_wallet_mcp::wallet::with_transport(m);
+        }
         let signer = self.cfg.signer.clone();
         std::thread::spawn(move || {
             let _ = done_tx.send(xbt_wallet_mcp::wallet::signer_call(&signer, LONGEST, "xbt402_pay", &params));

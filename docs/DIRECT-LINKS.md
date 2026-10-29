@@ -135,4 +135,9 @@ are shown by their key with a **Direct link** mark. Paying, playing and the play
 - `crates/xbt-nostr/src/market.rs`: the transport tag, and a shop listed only by its own key.
 - `crates/xbt-signer/src/policy.rs` (`normalize_dest`): a key typed into the rules.
 - `crates/xbt-wallet-ui`: the Sell and Sellers pages, `shops.json`, the sign key (`node_keys.rs`).
+- Where the shops live: the app writes `run/shops/shops.json` (`XBT_SHOPS_FILE`; public data only: each
+  shop's receipt key and signed transport document). The connector and the MCP read it, by the
+  signer's group, and hand a shop's document to the signer in each call to that shop
+  (`xbt_wallet_mcp::wallet::with_transport`). The signer never mounts it; it checks the document
+  it is given before a byte goes.
 - `crates/xbt-iroh-link` and the gateway and signer seams: the link.

@@ -239,9 +239,9 @@ export function services(cfg: Config): ServiceSpec[] {
       command: ['/usr/bin/xbt-wallet-mcp'],
       // an over-threshold payment waits this long for the owner's approval in the UI
       // the Lightning rail's and the tickets' own tools (status, stop) beside xbt402_pay
-      env: { XBT_MCP_HTTP: `0.0.0.0:${PORTS.mcp}`, XBT_MCP_APPROVAL_WAIT_S: '300', XBT_MCP_LN: '1', XBT_MCP_TICKETS: '1' },
+      env: { XBT_MCP_HTTP: `0.0.0.0:${PORTS.mcp}`, XBT_MCP_APPROVAL_WAIT_S: '300', XBT_MCP_LN: '1', XBT_MCP_TICKETS: '1', XBT_SHOPS_FILE: '/data/run/shops/shops.json' },
       // the bearer token is the UI's run/ui/mcp-http-token (0640, group xbt-wallet-ui): read-only here
-      mounts: [vol('mcp', '/data/mcp'), vol('run/signer', '/data/run/signer', true), vol('run/ui', '/data/run/ui', true)],
+      mounts: [vol('mcp', '/data/mcp'), vol('run/signer', '/data/run/signer', true), vol('run/ui', '/data/run/ui', true), vol('run/shops', '/data/run/shops', true)],
       requires: ['signer'],
       port: PORTS.mcp,
     },
@@ -281,6 +281,8 @@ export function services(cfg: Config): ServiceSpec[] {
         XBT_UI_HASHRENT_TOKEN_FILE: '/data/run/hashrate/control-token',
         // the signer's one-time enrolment code: the setup page fills it in, so no log has to be read
         XBT_UI_ENROLL_CODE_FILE: '/data/run/enroll/enroll-code',
+        // the shops without a web address the owner adds; the connector and the MCP read it
+        XBT_SHOPS_FILE: '/data/run/shops/shops.json',
       },
       // the UI owns the MCP token and rotates it on its Agents page; its pages write run/ln, run/gateway and
       // run/hashrate (the shop's and the hashrate settings)
@@ -291,6 +293,7 @@ export function services(cfg: Config): ServiceSpec[] {
         vol('run/ln', '/data/run/ln'),
         vol('run/gateway', '/data/run/gateway'),
         vol('run/hashrate', '/data/run/hashrate'),
+        vol('run/shops', '/data/run/shops'),
         vol('run/enroll', '/data/run/enroll', true),
         ...cert,
       ],
@@ -308,8 +311,9 @@ export function services(cfg: Config): ServiceSpec[] {
         LS_TASK: 'default',
         LS_MAX_SATS: '20000',
         LS_LISTEN: local(PORTS.connector),
+        XBT_SHOPS_FILE: '/data/run/shops/shops.json',
       },
-      mounts: [vol('run/signer', '/data/run/signer', true), vol('run/signer/streams', '/data/run/signer/streams')],
+      mounts: [vol('run/signer', '/data/run/signer', true), vol('run/signer/streams', '/data/run/signer/streams'), vol('run/shops', '/data/run/shops', true)],
       requires: ['signer'],
       port: PORTS.connector,
     },

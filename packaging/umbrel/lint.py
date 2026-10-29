@@ -62,14 +62,15 @@ AGENTPAY = {
     # run/enroll: the copy of the one-time enrolment code the signer writes for the setup page
     "xbt-signer": ("signer", {"signer", "enroll"}, {"anchor", "ln"}),
     "xbt-anchor-witness": ("witness", {"anchor"}, set()),
-    # run/ui holds the UI-owned MCP token; the MCP may only read it
-    "xbt-wallet-mcp": ("mcp", set(), {"signer", "ui"}),
+    # run/ui holds the UI-owned MCP token; the MCP may only read it. run/shops: the shops without a
+    # web address the UI keeps, read by the connector and the MCP to hand to the signer
+    "xbt-wallet-mcp": ("mcp", set(), {"signer", "ui", "shops"}),
     # the setup pages write run/ln (the rail macaroon), run/gateway (the gateway's config and macaroons)
     # and run/hashrate (the hasher's settings)
-    "xbt-wallet-ui": ("ui", {"ui", "ln", "gateway", "hashrate"}, {"signer", "enroll"}),
+    "xbt-wallet-ui": ("ui", {"ui", "ln", "gateway", "hashrate", "shops"}, {"signer", "enroll"}),
     "xbt-gateway": ("gateway", set(), {"gateway"}),
     # no state of its own. The control socket is read-only; the stream sockets are STREAM_MOUNT.
-    "lightning-stream": (None, set(), {"signer"}),
+    "lightning-stream": (None, set(), {"signer", "shops"}),
     # the hasher and the renter: their keys and state; the settings and token read-only; the renter
     # also the signer's socket, read-only
     "xbt-hashlink": ("hashrate", set(), {"hashrate", "signer"}),

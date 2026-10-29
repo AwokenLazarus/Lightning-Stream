@@ -140,6 +140,7 @@ services:
       # the Lightning rail's and the tickets' own tools (status, stop) beside xbt402_pay
       XBT_MCP_LN: "1"
       XBT_MCP_TICKETS: "1"
+      XBT_SHOPS_FILE: /data/run/shops/shops.json
     ports:
       # agents on the LAN. 33510 is the wallet app's host port, so this app uses 33511.
       # other apps on this box use lazarus-lightning-stream_mcp_1:33510, behind the bearer token
@@ -185,6 +186,8 @@ services:
       # The app password is Umbrel's deterministic one, shown on the app's page in the dashboard
       # the signer's one-time enrolment code: the setup page fills it in, so no log has to be read
       XBT_UI_ENROLL_CODE_FILE: /data/run/enroll/enroll-code
+      # the shops without a web address the owner adds; the connector and the MCP read it
+      XBT_SHOPS_FILE: /data/run/shops/shops.json
     volumes:
       - ${APP_DATA_DIR}/data/ui:/data/ui
       - ${APP_DATA_DIR}/data/run/signer:/data/run/signer:ro
@@ -196,6 +199,7 @@ services:
       - ${APP_DATA_DIR}/data/run/gateway:/data/run/gateway
       # the Hashrate page writes the hasher's settings here; the control token is here too
       - ${APP_DATA_DIR}/data/run/hashrate:/data/run/hashrate
+      - ${APP_DATA_DIR}/data/run/shops:/data/run/shops
       - ${APP_DATA_DIR}/data/run/enroll:/data/run/enroll:ro
       - *lightning-cert
 
@@ -246,11 +250,14 @@ services:
       LS_TASK: default
       LS_MAX_SATS: "20000"
       LS_LISTEN: 127.0.0.1:8484
+      XBT_SHOPS_FILE: /data/run/shops/shops.json
     volumes:
       # the control socket, read-only: this service cannot replace it, and it holds no keys
       - ${APP_DATA_DIR}/data/run/signer:/data/run/signer:ro
       # the stream sockets, read-write. The same host directory the signer sees under run/signer.
       - ${APP_DATA_DIR}/data/run/signer/streams:/data/run/signer/streams
+      # the shops without a web address, read-only: their transport documents go in each call to the signer
+      - ${APP_DATA_DIR}/data/run/shops:/data/run/shops:ro
 
   gateway:
     <<: *service

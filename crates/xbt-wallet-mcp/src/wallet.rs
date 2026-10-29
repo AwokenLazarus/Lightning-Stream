@@ -218,6 +218,10 @@ impl Wallet {
     /// pays under it. A deny or expiry answers the original `needs_human` with `approval_state`. The
     /// model never sees or needs a signature.
     fn pay_waiting(&self, method: &str, params: &Map<String, Value>) -> Result<Value, String> {
+        let mut params = params.clone();
+        if method == "xbt402_pay" {
+            with_transport(&mut params);
+        }
         let args = Value::Object(params.clone());
         let first = self.signer(method, &args)?;
         if self.approval_wait.is_zero() || first.get("verdict").and_then(Value::as_str) != Some("needs_human") {
@@ -268,8 +272,51 @@ impl Wallet {
     }
 }
 
+/// A pay call to a shop without a web address, with its receipt key and transport document from
+/// the app's shops file (`XBT_SHOPS_FILE`, which the app writes when the owner adds such a shop),
+/// unless the call names them itself. The signer checks the document before a byte goes; reading it
+/// here keeps the app's files out of the signer's sandbox. Any other call is left as it is.
+pub fn with_transport(params: &mut Map<String, Value>) {
+    let Some(url) = params.get("url").and_then(Value::as_str) else { return };
+    let u = xbt402::wire::request_url(url);
+    let origin = format!("{}://{}", u.scheme.to_ascii_lowercase(), u.host.to_ascii_lowercase());
+    if !xbt402::shop::is_shop(&origin) || params.get("transport").is_some_and(|v| !v.is_null()) {
+        return;
+    }
+    let Some(path) = std::env::var_os("XBT_SHOPS_FILE") else { return };
+    let Some(all) = std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) else { return };
+    let Some(e) = all.get(&origin) else { return };
+    if let (Some(rk), Some(doc)) = (e.get("receipt_key").and_then(Value::as_str), e.get("transport")) {
+        params.insert("receipt_key".into(), rk.into());
+        params.insert("transport".into(), doc.clone());
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_shop_by_key_gets_its_document_from_the_shops_file_and_nothing_else_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = xbt402::shop::origin_for(&[7u8; 32]);
+        let file = dir.path().join("shops.json");
+        std::fs::write(&file, serde_json::json!({origin.clone(): {"receipt_key": "02ab", "transport": {"version": "transport/1"}}}).to_string()).unwrap();
+        std::env::set_var("XBT_SHOPS_FILE", &file);
+        let call = |url: &str| {
+            let mut m = serde_json::json!({"url": url}).as_object().unwrap().clone();
+            with_transport(&mut m);
+            m
+        };
+        let shop = call(&format!("{origin}/film"));
+        assert_eq!(shop["receipt_key"], "02ab");
+        assert_eq!(shop["transport"]["version"], "transport/1");
+        assert!(call("https://shop.example/film").get("transport").is_none());
+        // a document the call names itself is kept
+        let mut own = serde_json::json!({"url": format!("{origin}/film"), "transport": {"mine": true}}).as_object().unwrap().clone();
+        with_transport(&mut own);
+        assert_eq!(own["transport"]["mine"], true);
+        std::env::remove_var("XBT_SHOPS_FILE");
+    }
+
     use super::*;
     use xbt_signer::sanitize::UNTRUSTED_KEY;
 
