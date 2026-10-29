@@ -18,7 +18,7 @@ use xbt_hashlink::listing::{self, Hashrate};
 use xbt_hashlink::meter::share_work;
 use xbt_hashlink::msg::Terms;
 use xbt_hashlink::rail::{LabHashtaker, LabSeller, SignerPayer};
-use xbt_hashlink::{hashtaker, hashmaker, noise, standin};
+use xbt_hashlink::{hashtaker, hashmaker, noise, standin, trust};
 
 const DIFF: f64 = 0.25;
 const SHARES_PER_SLICE: u128 = 8;
@@ -282,6 +282,17 @@ fn paid_then_stopped(wallet: bool) {
     assert!(last_pay <= r.miners_done_ms + 1500);
     assert_eq!(r.hashtaker["closed"], "no accepted work");
     assert!(w(&r.hashmaker["meter"]["work"]) < (paid as u128 + 1) * s);
+    // both sides name the rental and the receipts behind its payments the same way, so a hashtaker's
+    // delivery record and the hashmaker's summary of the same rental match
+    let taker = PublicKey::from_slice(&hex::decode(r.hashmaker["buyer"].as_str().unwrap()).unwrap()).unwrap();
+    let maker = PublicKey::from_secret_key(secp256k1::SECP256K1, &noise::fresh_key());
+    let record = trust::attestation_of(&r.hashtaker, "rental-1", 0, &taker, &maker, 0, false, 3600).unwrap();
+    let served = trust::served_of(&r.hashmaker, &maker, 3600).unwrap();
+    assert_eq!(
+        (&record.commit, &record.receipts_hash, record.paid_slices),
+        (&served.commit, &served.receipts_hash, served.paid_slices),
+        "{} / {}", r.hashtaker, r.hashmaker
+    );
     if wallet {
         // one paid request per slice, in order, each with its receipt; then the session stopped
         let pays: Vec<_> = r.wallet_calls.iter().filter(|c| c["method"] == "xbt402_pay").collect();

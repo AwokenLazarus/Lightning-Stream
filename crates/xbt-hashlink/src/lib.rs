@@ -18,6 +18,7 @@
 //! * [`listing`]: the hashmaker's signed `hashrate` listing on Nostr.
 //! * [`hashmaker`]: the hashmaker's side (miners in, link out).
 //! * [`hashtaker`]: the hashtaker's side (link in, the hashtaker's gateway out).
+//! * [`trust`]: a test slice's result, and the signed delivery history on Nostr.
 //! * [`standin`]: a stand-in pool and miner for the lab, with a toy share hash.
 
 pub mod hashtaker;
@@ -31,6 +32,7 @@ pub mod over_iroh;
 pub mod rail;
 pub mod standin;
 pub mod sv1;
+pub mod trust;
 
 /// Milliseconds since the Unix epoch.
 pub fn now_ms() -> u64 {
