@@ -51,7 +51,7 @@
 # Ports (loopback, below the kernel's ephemeral range): TICKET_E2E_PORT_BASE (default 17961) to
 # BASE+7: the chain node's RPC, the three nodes' REST, the gateway (BASE+4), the file server
 # (BASE+5), the second gateway (BASE+6) and the lying proxy in front of it (BASE+7); the offers
-# check's node lf4 (BASE+9) and its gateway (BASE+10); the jellyfin check's gateway (BASE+12),
+# check's node lf4 (BASE+9) and its gateway (BASE+10); the link check's gateway (BASE+11); the jellyfin check's gateway (BASE+12),
 # connector (BASE+13), wallet app (BASE+14) and its two app ports (BASE+15, BASE+16). Its own compose
 # project (tickete2e), so it runs beside the other regtest scripts. Each container is capped at 2
 # CPUs; host builds run at nice 19 with -j4. The lab's containers and volumes are removed on exit

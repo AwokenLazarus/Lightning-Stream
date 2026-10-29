@@ -68,7 +68,8 @@ BASE = int(os.environ.get("TICKET_E2E_PORT_BASE", "17961"))
 BUYER, HOP, SELLER = "lf1", "lf2", "lf3"
 NODES = (BUYER, HOP, SELLER)
 GW_PORT, UP_PORT, GW2_PORT, PROXY_PORT = BASE + 4, BASE + 5, BASE + 6, BASE + 7
-GW_LINK_PORT = BASE + 9
+# the link check's gateway: BASE + 9 is the offers check's node lf4
+GW_LINK_PORT = BASE + 11
 #: Shops reached by key (`link` checks): the app's shops file, which the MCP reads to hand each one's
 #: transport document to the signer, and the origins the policy allows, each paid through the seller.
 SHOPS_FILE = os.environ.setdefault("XBT_SHOPS_FILE", f"{RUN}/shops.json")
@@ -1554,6 +1555,10 @@ def link_check(relay: bool) -> None:
     (the gateway's link private, the wallet's XBT_LINK_PRIVATE), through our relay."""
     mode = "relay" if relay else "direct"
     stop_sessions()
+    # what earlier checks paid (the offers check pays another seller's node) is left out: this check's own
+    m0 = money()
+    paid0 = {h for h, p in buyer_payments().items() if p["status"] == "SUCCEEDED"}
+    settled0 = {h for h, i in seller_invoices().items() if i["state"] == "SETTLED"}
     # the seller's node vouches for the link key: a macaroon that may only sign
     with open(f"{RUN}/sign.macaroon", "wb") as f:
         f.write(bytes.fromhex(lab.bake(SELLER, ("uri:/lnrpc.Lightning/SignMessage",))))
@@ -1604,7 +1609,11 @@ def link_check(relay: bool) -> None:
     if stored:
         os.remove(stored)
     stop_sessions()
-    inv, m = booked_and_once(), money()
+    inv, m1 = booked_and_once(), money()
+    m = {k: (m1[k] - m0[k]) if isinstance(m1.get(k), (int, float)) and isinstance(m0.get(k), (int, float)) else m1[k] for k in m1}
+    paid = {h for h, p in buyer_payments().items() if p["status"] == "SUCCEEDED"} - paid0
+    settled = {h for h, i in seller_invoices().items() if i["state"] == "SETTLED"} - settled0
+    inv["same_tickets"] = paid == settled
     mbit = round(BIG * 8 / took / 1e6, 1) if took else None
     measured(f"link_{mode}_100mb_s", round(took, 2))
     measured(f"link_{mode}_mbit_s", mbit)
