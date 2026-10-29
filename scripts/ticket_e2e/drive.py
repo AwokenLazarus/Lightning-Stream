@@ -1095,7 +1095,11 @@ def kill() -> None:
         base = int((status().get("paying") or [{}])[0].get("released_msat", 0))
         t = threading.Thread(target=run)
         t.start()
-        lab.wait("the answer to be under way", 60, lambda: any(p.get("answer_open") and int(p["released_msat"]) >= base + 3 * TICKET_MSAT for p in status().get("paying", [])), every=0.02)
+        try:
+            lab.wait("the answer to be under way", 60, lambda: any(p.get("answer_open") and int(p["released_msat"]) >= base + 3 * TICKET_MSAT for p in status().get("paying", [])), every=0.02)
+        except LabError as e:
+            t.join(30)
+            raise LabError(f"{e} ({victim}): the call {json.dumps(brief(result))[:600]}; paying {json.dumps(status().get('paying'))[:600]}") from None
         if victim == "mcp":
             other.kill()
         else:
