@@ -429,6 +429,10 @@ impl xbt_svc::http::Handler for AppOrigin {
         if resp.header("x-ls-refusal").is_some() {
             let v: Value = serde_json::from_str(&resp.into_string().unwrap_or_default()).unwrap_or(Value::Null);
             let words = v.get("error").and_then(Value::as_str).unwrap_or("The visit has ended.");
+            // the seller's service is full: nothing was charged, and this page can simply be loaded again
+            if v.get("rule").and_then(Value::as_str) == Some("seller_busy") {
+                return text(503, &format!("{words} Nothing was charged. Reload this page to try again."));
+            }
             return text(status, &format!("{words} Back in Lightning Stream, you can open the app again with a new limit."));
         }
         let mut headers = vec![];
@@ -535,12 +539,14 @@ impl AppOrigin {
         let headers: Vec<(String, String)> = lines.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim().to_string(), v.trim().to_string())).collect();
         if status != 101 {
             // the visit's words, when the connector refused (the limit reached, the visit stopped)
-            let words = if headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("x-ls-refusal")) {
+            let words = if status == 503 {
+                "This shop is busy, so the app's live connection did not open. Nothing was charged. Reload this page to try again."
+            } else if headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("x-ls-refusal")) {
                 "The visit's limit is reached, or it was stopped."
             } else {
                 "The app's live connection did not open."
             };
-            return text(if status == 402 { 402 } else { 502 }, words);
+            return text(match status { 402 | 503 => status, _ => 502 }, words);
         }
         let _ = up.set_read_timeout(None);
         let passed: Vec<(String, String)> = headers.into_iter().filter(|(k, _)| k.to_ascii_lowercase().starts_with("sec-websocket-"))

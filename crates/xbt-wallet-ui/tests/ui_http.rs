@@ -1461,6 +1461,56 @@ fn walk(d: &std::path::Path) -> Vec<std::path::PathBuf> {
 /// server's at the root, each route given the methods and headers a page uses, its compressed pages,
 /// and the seller's guest login; the listing names each page beside its service. A guest login of
 /// the wallet's own headers is refused.
+/// A service's `capacity` set on the Sell page reaches each of its routes: a free one counts no
+/// buyers, an empty box sets no limit, and a number that is not one is refused in words.
+#[cfg(unix)]
+#[test]
+fn how_many_buyers_at_once_on_the_sell_page_becomes_each_routes_capacity() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let gw = tempfile::tempdir().unwrap();
+    let dir = gw.path().to_path_buf();
+    let media = mock_http(|_| (200, "ok"));
+    let bx = start(json!({}), false, |c| {
+        c.sell = true;
+        c.gw.dir = dir.clone();
+        c.gw.node_rest = Some("https://10.21.21.66:8180".into());
+        c.gw.node_tls_cert = Some("/data/lightning/tls.cert".into());
+    });
+    let mut br = logged_in(&bx);
+    let inv = mac(&[("invoices", &["read", "write"])]);
+    let info = mac(&[("info", &["read"])]);
+    br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &inv), ("info_macaroon", &info)]);
+    br.act("/sell", "/sell", &[("action", "advanced"), ("max_sessions", "30"), ("sessions_per_address", "2"), ("max_held_tickets", "15"),
+                               ("proxies", ""), ("network", "bip122:0123456789abcdef0123456789abcdef")]);
+    br.act("/sell", "/sell", &[("action", "shop"), ("name", "Box"), ("public_url", "https://seller.example")]);
+    assert!(br.get("/sell").body.contains("How many buyers at once"));
+    let addr = format!("http://{media}");
+    // a number that is not one: refused, in words
+    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("address", &addr), ("price", "20"), ("unit", "mib"),
+                                       ("paths", "/Videos/1/"), ("cap_buyers", "many")]);
+    assert_eq!(r.status, 200, "the form comes back with what is wrong");
+    assert!(r.body.contains("Most buyers at once is a whole number"), "{}", r.body);
+    // films with 5 buyers and 3 streams at once, the page at the root with them
+    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("address", &addr), ("price", "20"), ("unit", "mib"),
+                                       ("paths", "/Videos/1/"), ("app", "1"), ("cap_buyers", "5"), ("cap_streams", "3"), ("cap_streams_buyer", "")]);
+    assert!(br.flash_after(&r).contains("restarts"), "{}", br.flash_after(&r));
+    // a free service with a stream limit only
+    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "web"), ("address", "http://127.0.0.1:9"), ("price", "0"), ("unit", "request"),
+                                       ("name", "Free"), ("paths", "/free/"), ("cap_buyers", "4"), ("cap_streams", "2")]);
+    assert!(br.flash_after(&r).contains("restarts"), "{}", br.flash_after(&r));
+    let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    let cfg = xbt_gateway::config::Config::from_json(&c).unwrap();
+    let route = |p: &str| cfg.routes.iter().find(|r| r.path == p).unwrap_or_else(|| panic!("no route {p}"));
+    let want = xbt_gateway::config::Capacity { max_buyers: Some(5), max_streams: Some(3), max_streams_per_buyer: None, max_mbit: None };
+    assert_eq!(route("/Videos/1/").capacity, want);
+    assert_eq!(route("/").capacity, want, "the page counts with its service");
+    // the free one counts no buyers: a gateway would refuse that
+    assert_eq!(route("/free/").capacity, xbt_gateway::config::Capacity { max_streams: Some(2), ..Default::default() });
+    // and the page shows the limits again when the service is edited
+    let page = br.get("/sell").body;
+    assert!(page.contains("name=\"cap_streams\""));
+}
+
 #[cfg(unix)]
 #[test]
 fn a_service_sold_with_its_own_web_page_gets_a_route_and_a_listing_for_it() {

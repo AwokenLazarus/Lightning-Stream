@@ -1545,6 +1545,14 @@ impl Signer {
             Ok(a) => a,
             Err(e) => return deny("xbt402", format!("the seller gave no answer: {}", e.msg)),
         };
+        // a seller whose service is full turns a new visit away before it is sold anything
+        if probe.status == 503 {
+            let v: Value = probe.read_small(SMALL_BODY).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+            if let Some(d) = seller_busy(&v) {
+                return d;
+            }
+            return with(deny("xbt402", "the seller's service is unavailable (HTTP 503); nothing was paid"), json!({"status": 503, "charged_sats": 0}));
+        }
         if probe.status != 402 {
             let status = probe.status;
             // as on the paid paths: a socket that cannot be reached is a reader already gone, and nothing is read for it
@@ -2788,6 +2796,10 @@ impl Signer {
                     short += 1;
                     continue;
                 }
+                // the seller's service is full: the request was not charged, and the session goes on
+                if let Some(d) = (status == 503).then(|| seller_busy(&v)).flatten() {
+                    return fail(hs, &spent, d);
+                }
                 return fail(hs, &spent, with(refusal("ticket_refused", format!("the seller refused the paid request: HTTP {status} {code}; nothing was charged for it")),
                                              json!({"status": status, "seller_code": code})));
             }
@@ -3425,6 +3437,38 @@ fn read_all(ans: WireAnswer, sink: &mut Sink) -> Option<String> {
     length.filter(|l| *l != sink.bytes).map(|l| format!("cut short: {} of {l} bytes", sink.bytes))
 }
 
+/// A seller's `busy` (its service is full: `capacity` in the gateway's config) as the wallet tells
+/// it: the rule `seller_busy`, words of the wallet's own, and the counts, read as numbers only and
+/// bounded, never the seller's text. `None`: not a `busy` answer.
+pub(crate) fn seller_busy(v: &Value) -> Option<Value> {
+    if protocol_code(v.get("error")) != "busy" {
+        return None;
+    }
+    let b = v.get("busy");
+    let n = |k: &str| b.and_then(|b| b.get(k)).and_then(Value::as_u64).map(|n| n.min(1_000_000));
+    let scope = match b.and_then(|b| b.get("scope")).and_then(Value::as_str) {
+        Some("buyers") => "buyers",
+        Some("streams") => "streams",
+        Some("buyer_streams") => "buyer_streams",
+        Some("bandwidth") => "bandwidth",
+        _ => "service",
+    };
+    let (in_use, limit, retry) = (n("inUse"), n("limit"), n("retryAfter").unwrap_or(30).clamp(1, 3600));
+    let counts = |what: &str| match (in_use, limit) {
+        (Some(u), Some(l)) => format!(" ({u} of {l} {what})"),
+        _ => String::new(),
+    };
+    let words = match scope {
+        "buyers" => format!("This shop is busy{}. Try again in a moment.", counts("buyers served at once")),
+        "streams" => format!("This shop is busy{}. Try again in a moment.", counts("streams in use")),
+        "buyer_streams" => format!("You are using as many streams of this shop at once as it allows{}.", counts("for one buyer")),
+        "bandwidth" => format!("This shop is busy{}. Try again in a moment.", counts("Mbit/s carried")),
+        _ => "This shop is busy. Try again in a moment.".to_string(),
+    };
+    Some(with(deny("seller_busy", words), json!({"status": 503, "charged_sats": 0, "seller_code": "busy",
+                                                    "busy": {"scope": scope, "inUse": in_use, "limit": limit, "retryAfter": retry}})))
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -3569,5 +3613,20 @@ mod tests {
         let (digest, v, text) = s.done();
         assert_eq!((v["bytes"].as_u64(), text.as_str()), (Some(7), "abcd"));
         assert_eq!(digest, hex::encode(Sha256::digest(b"abcdefg")));
+    }
+
+    #[test]
+    fn a_busy_seller_is_told_in_the_wallets_own_words_and_counts_never_its_text() {
+        let v = json!({"error": "busy", "detail": "<script>evil</script>", "busy": {"scope": "streams", "inUse": 3, "limit": 3, "retryAfter": 30}});
+        let d = seller_busy(&v).unwrap();
+        assert_eq!(d["rule"], "seller_busy");
+        assert_eq!(d["reason"], "This shop is busy (3 of 3 streams in use). Try again in a moment.");
+        assert_eq!((d["charged_sats"].as_u64(), d["busy"]["retryAfter"].as_u64()), (Some(0), Some(30)));
+        // a scope the wallet does not know, numbers out of range: still the wallet's words, bounded
+        let odd = seller_busy(&json!({"error": "busy", "busy": {"scope": "<x>", "inUse": u64::MAX, "retryAfter": 99999}})).unwrap();
+        assert_eq!(odd["reason"], "This shop is busy. Try again in a moment.");
+        assert_eq!((odd["busy"]["inUse"].as_u64(), odd["busy"]["retryAfter"].as_u64()), (Some(1_000_000), Some(3600)));
+        // not a busy answer
+        assert!(seller_busy(&json!({"error": "upstream_unavailable"})).is_none());
     }
 }

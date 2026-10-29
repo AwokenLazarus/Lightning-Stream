@@ -482,5 +482,12 @@ fn refusal(v: &Value) -> Response {
     let rule = v.get("rule").and_then(Value::as_str).unwrap_or("");
     // the page only sees a status; the owner's log says why (no URL, no header, nothing of the buyer's)
     eprintln!("lightning-stream: a page's request was refused: {}{reason}", if rule.is_empty() { String::new() } else { format!("{rule}: ") });
+    // the seller's service is full: nothing was charged, and the page may try again
+    if rule == "seller_busy" {
+        let retry = v.pointer("/busy/retryAfter").and_then(Value::as_u64).unwrap_or(30).clamp(1, 3600);
+        let mut r = json_response(503, &json!({"error": reason, "rule": rule}));
+        r.headers.push(("Retry-After".into(), retry.to_string()));
+        return r;
+    }
     json_response(if rule.is_empty() { 502 } else { 402 }, &json!({"error": reason, "rule": rule}))
 }

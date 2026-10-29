@@ -166,6 +166,8 @@ pub struct Offer {
     pub titles: Vec<(String, String)>,
     /// Buyers may open the service's own web page inside their app (docs/SELLER-APPS.md).
     pub app: Option<OfferApp>,
+    /// How many buyers and streams it takes at once (the routes' `capacity`, docs/CAPACITY.md).
+    pub capacity: xbt_gateway::config::Capacity,
 }
 
 /// A service's own web page, sold to buyers who open it inside their app.
@@ -419,6 +421,10 @@ fn offer_json(o: &Offer) -> Value {
     let mut v = json!({"id": o.id, "name": o.name, "kind": o.kind.id(), "address": o.address, "price_msat": o.price_msat, "unit": o.unit.id(), "input_msat": o.input_msat,
            "paused": o.paused, "paths": o.paths, "strip": o.strip,
            "titles": o.titles.iter().map(|(t, u)| json!({"title": t, "url": u})).collect::<Vec<_>>()});
+    if o.capacity.is_set() {
+        let c = o.capacity;
+        v["capacity"] = json!({"max_buyers": c.max_buyers, "max_streams": c.max_streams, "max_streams_per_buyer": c.max_streams_per_buyer, "max_mbit": c.max_mbit});
+    }
     if let Some(a) = &o.app {
         v["app"] = json!({"base": a.base, "entry": a.entry, "login": a.login, "deny": a.deny, "allow": a.allow, "live": a.live});
         if let Some(l) = &a.accounts {
@@ -451,7 +457,28 @@ fn offer_of(v: &Value) -> Option<Offer> {
             OfferApp { base: t("base"), entry: t("entry"), login: t("login"), deny: list("deny"), allow: list("allow"), live: a.get("live").and_then(Value::as_bool).unwrap_or(true),
                        accounts: a.get("accounts").filter(|l| l.is_array()).map(|_| list("accounts")) }
         }).filter(|a| a.base.starts_with('/') && a.base.ends_with('/')),
+        capacity: {
+            let c = v.get("capacity");
+            let n = |k: &str| c.and_then(|c| c.get(k)).and_then(Value::as_u64).filter(|n| (1..=1_000_000).contains(n)).map(|n| n as u32);
+            xbt_gateway::config::Capacity { max_buyers: n("max_buyers"), max_streams: n("max_streams"), max_streams_per_buyer: n("max_streams_per_buyer"), max_mbit: n("max_mbit") }
+        },
     })
+}
+
+/// A route's `capacity` as the gateway takes it: a free route counts no buyers.
+fn route_capacity(m: &mut Map<String, Value>, c: &xbt_gateway::config::Capacity, free: bool) {
+    let c = xbt_gateway::config::Capacity { max_buyers: if free { None } else { c.max_buyers }, ..*c };
+    if c.is_set() {
+        let mut o = Map::new();
+        for (k, v) in [("max_buyers", c.max_buyers), ("max_streams", c.max_streams), ("max_streams_per_buyer", c.max_streams_per_buyer), ("max_mbit", c.max_mbit)] {
+            if let Some(v) = v {
+                o.insert(k.into(), json!(v));
+            }
+        }
+        m.insert("capacity".into(), Value::Object(o));
+    } else {
+        m.remove("capacity");
+    }
 }
 
 impl Shop {
@@ -512,7 +539,7 @@ impl Shop {
                 Some((i.get("title")?.as_str()?.to_string(), i.get("url")?.as_str()?.to_string()))
             }).collect()).unwrap_or_default();
             offers.push(Offer { id: format!("s{}", offers.len() + 1), name: if name.is_empty() { kind.words().into() } else { name }, kind, address,
-                                price_msat: msat, unit, input_msat, paused: false, paths: vec![path], strip, titles, app: None });
+                                price_msat: msat, unit, input_msat, paused: false, paths: vec![path], strip, titles, app: None, capacity: Default::default() });
         }
         let caps = c.get("caps").and_then(|k| Some((k.get("max_sessions")?.as_u64()?, k.get("sessions_per_address")?.as_u64()?,
                                                     k.get("max_held_tickets")?.as_u64()?)));
@@ -780,6 +807,7 @@ impl App {
                     m.remove("strip_prefix");
                 }
                 app_route(m, o.app.as_ref().filter(|a| a.base == *p), &key_file);
+                route_capacity(m, &o.capacity, free);
                 routes.push(r);
             }
             // the service's own web page, under a route of its own where its base is not one of the service's paths
@@ -802,6 +830,7 @@ impl App {
                     m.remove("strip_prefix");
                 }
                 app_route(m, Some(a), &key_file);
+                route_capacity(m, &o.capacity, free);
                 routes.push(r);
             }
             let base = public_url.clone();
@@ -938,6 +967,17 @@ impl App {
             Ok((200, body)) => serde_json::from_str(&body).ok(),
             _ => None,
         }
+    }
+
+    /// What each route carries now, by path, from the gateway's `/services` (only routes with a
+    /// `capacity` say). Empty when the gateway is not running or cannot be asked.
+    fn live_capacity(&self) -> HashMap<String, Value> {
+        let Some(origin) = self.cfg.gw.health_url.as_deref().and_then(crate::services::http_origin) else { return HashMap::new() };
+        let Ok((200, body)) = crate::app::http_get(&format!("{origin}{}", xbt_gateway::config::SERVICES_PATH)) else { return HashMap::new() };
+        let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+        v.get("routes").and_then(Value::as_array).into_iter().flatten()
+            .filter_map(|r| Some((r.get("path")?.as_str()?.to_string(), r.get("capacity").filter(|c| c.is_object())?.clone())))
+            .collect()
     }
 
     /// The shop key to share, and how the direct link is doing, in plain words.
@@ -1122,15 +1162,19 @@ impl App {
         if shop.offers.is_empty() {
             b.push_str("<p class=\"empty\">Nothing yet. Add your first service below.</p>");
         }
+        let live = if shop.offers.iter().any(|o| o.capacity.is_set()) { self.live_capacity() } else { HashMap::new() };
         for o in &shop.offers {
             let s = each.get(&o.id).cloned().unwrap_or(Status { class: "warn", headline: "Unknown".into(), next: String::new() });
+            let now = o.paths.first().and_then(|p| live.get(p)).map(capacity_words).unwrap_or_default();
+            let mut next_hint = if s.next.is_empty() { String::new() } else { format!("<p class=\"hint {}\">{}</p>", s.class, esc(&s.next)) };
+            next_hint.push_str(&now);
             let btn = |action: &str, label: &str, class: &str| format!("<form method=\"post\" action=\"./sell\">{csrf}<input type=\"hidden\" name=\"action\" value=\"{action}\">\
                 <input type=\"hidden\" name=\"id\" value=\"{}\"><button{class}>{label}</button></form>", esc(&o.id));
             b.push_str(&format!("<section class=\"card offer\"><div class=\"offer-head\"><h3>{}</h3><span class=\"pill {}\">{}</span></div>\
                 <p>{} &middot; <strong>{}</strong>{}</p>{}<div class=\"row\"><a class=\"button-link\" href=\"./sell?edit={}#service-form\">Edit</a>{}{}</div></section>",
                 esc(&o.name), s.class, esc(&s.headline), o.kind.words(), o.price_words(),
                 if o.titles.is_empty() { String::new() } else { format!(" &middot; {} to choose from", o.titles.len()) },
-                if s.next.is_empty() { String::new() } else { format!("<p class=\"hint {}\">{}</p>", s.class, esc(&s.next)) },
+                next_hint,
                 crate::services::urlenc(&o.id),
                 if o.paused { btn("resume", "Resume", "") } else { btn("pause", "Pause", " class=\"secondary\"") },
                 btn("remove", "Remove", " class=\"danger\"")));
@@ -1153,6 +1197,21 @@ impl App {
             },
             _ => "<p class=\"hint\">Buyers see every library. Once saved, you can choose which here.</p>".into(),
         };
+        // how many buyers and streams at once: off unless set; a hint for a media server
+        let cap = editing.map(|o| o.capacity).unwrap_or_default();
+        let cap_val = |k: &str, v: Option<u32>| esc(&fv(k, v.map(|n| n.to_string()).unwrap_or_default()));
+        let capacity_html = format!("<details class=\"capacity\" id=\"capacity\"{}><summary>How many buyers at once</summary>\
+            <p class=\"hint\">So that one buyer too many does not slow everyone down. Leave a box empty for no limit. A buyer turned away pays nothing, \
+            sees that your shop is busy, and can try again; no one already watching is cut off.</p>\
+            <label>Most buyers at once<input name=\"cap_buyers\" value=\"{}\" inputmode=\"numeric\" pattern=\"[0-9]*\" placeholder=\"no limit\"></label>\
+            <label>Most streams at once <small>(films, live connections, long downloads, over all buyers)</small><input name=\"cap_streams\" value=\"{}\" inputmode=\"numeric\" pattern=\"[0-9]*\" placeholder=\"no limit\"></label>\
+            <details><summary>Advanced</summary>\
+            <label>Most streams for one buyer<input name=\"cap_streams_buyer\" value=\"{}\" inputmode=\"numeric\" pattern=\"[0-9]*\" placeholder=\"no limit\"></label>\
+            <label>Most Mbit/s together <small>(no new stream starts above it)</small><input name=\"cap_mbit\" value=\"{}\" inputmode=\"numeric\" pattern=\"[0-9]*\" placeholder=\"no limit\"></label></details>\
+            <p class=\"hint\">For a media server such as Jellyfin on a small box, 5 buyers and 3 streams is a good start; each 4K film your server has to convert can use several processor cores.</p></details>",
+            if cap.is_set() { " open" } else { "" },
+            cap_val("cap_buyers", cap.max_buyers), cap_val("cap_streams", cap.max_streams),
+            cap_val("cap_streams_buyer", cap.max_streams_per_buyer), cap_val("cap_mbit", cap.max_mbit));
         let accounts_html = format!("<label class=\"check\"><input type=\"checkbox\" name=\"app_accounts\" value=\"1\"{}> Each buyer gets their own Jellyfin account: \
             their own watch history, and where they stopped</label>\
             <details{}><summary>Buyers' accounts</summary>\
@@ -1204,7 +1263,7 @@ impl App {
             <p class=\"hint\">A link may start with <code>/</code>: it is then on your shop's address.</p>\
             <label>Paths it is sold under, comma-separated (empty: chosen for you)<input name=\"paths\" value=\"{}\" class=\"mono\"></label>\
             <label class=\"check\"><input type=\"checkbox\" name=\"strip\" value=\"1\"{}> Pass requests on without that path</label></details>\
-            <div class=\"row\"><button{}>{}</button>{}</div></form></section>",
+            {}<div class=\"row\"><button{}>{}</button>{}</div></form></section>",
             if editing.is_some() { "Change this service" } else { "Add a service" },
             esc(editing.map(|o| o.id.as_str()).unwrap_or("")),
             esc(&fv("address", editing.map(|o| o.address.clone()).unwrap_or_default())), kind.example(), kind.example(), found_html(&self.found_services()),
@@ -1223,6 +1282,7 @@ impl App {
             esc(&fv("titles", titles)),
             esc(&fv("paths", editing.map(|o| o.paths.join(", ")).unwrap_or_default())),
             if fv("strip", editing.map(|o| if o.strip { "1" } else { "" }.to_string()).unwrap_or_else(|| "1".into())) == "1" { " checked" } else { "" },
+            capacity_html,
             if keys { "" } else { " class=\"secondary\"" }, if editing.is_some() { "Save changes" } else { "Add and start selling" },
             if editing.is_some() { "<a href=\"./sell\">Cancel</a>" } else { "" }));
 
@@ -1388,7 +1448,22 @@ impl App {
                 } else {
                     None
                 };
-                let offer = Offer { id: new_id.clone(), name, kind, address, price_msat, unit, input_msat, paused: false, paths, strip: g("strip") == "1", titles, app };
+                let limit = |k: &str, what: &str| -> Result<Option<u32>, String> {
+                    let t = g(k);
+                    let t = t.trim();
+                    if t.is_empty() {
+                        return Ok(None);
+                    }
+                    t.parse::<u32>().ok().filter(|n| (1..=1_000_000).contains(n)).map(Some)
+                        .ok_or_else(|| format!("{what} is a whole number from 1, or empty for no limit."))
+                };
+                let capacity = xbt_gateway::config::Capacity {
+                    max_buyers: limit("cap_buyers", "Most buyers at once")?,
+                    max_streams: limit("cap_streams", "Most streams at once")?,
+                    max_streams_per_buyer: limit("cap_streams_buyer", "Most streams for one buyer")?,
+                    max_mbit: limit("cap_mbit", "Most Mbit/s together")?,
+                };
+                let offer = Offer { id: new_id.clone(), name, kind, address, price_msat, unit, input_msat, paused: false, paths, strip: g("strip") == "1", titles, app, capacity };
                 match shop.offers.iter_mut().find(|o| o.id == new_id) {
                     Some(o) => {
                         let paused = o.paused;
@@ -1489,6 +1564,23 @@ fn found_html(found: &[(String, String)]) -> String {
     b
 }
 
+/// What a route carries now, in plain words, from its `/services` entry (`capacity`).
+fn capacity_words(c: &Value) -> String {
+    let n = |k: &str| c.get(k).and_then(Value::as_u64);
+    let part = |used: Option<u64>, max: Option<u64>, what: &str| match (used, max) {
+        (Some(u), Some(m)) => Some(format!("{u} of {m} {what}")),
+        (Some(u), None) => Some(format!("{u} {what}")),
+        _ => None,
+    };
+    let parts: Vec<String> = [part(n("buyers"), n("maxBuyers"), "buyers"), part(n("streams"), n("maxStreams"), "streams")].into_iter().flatten().collect();
+    if parts.is_empty() {
+        return String::new();
+    }
+    let busy = c.get("busy").and_then(Value::as_bool) == Some(true);
+    format!("<p class=\"hint{}\">Now: {}{}</p>", if busy { " warn" } else { "" }, parts.join(", "),
+            if busy { ". Full: new buyers are told to try again shortly." } else { "." })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1554,7 +1646,7 @@ mod tests {
         let mut s = Shop::default();
         assert_eq!(s.free_path("Films", "a"), "/");
         s.offers.push(Offer { id: "a".into(), name: "Films".into(), kind: Kind::Media, address: "http://j:1".into(), price_msat: 1, unit: Unit::Mib, input_msat: 0,
-                              paused: false, paths: vec!["/".into()], strip: false, titles: vec![], app: None });
+                              paused: false, paths: vec!["/".into()], strip: false, titles: vec![], app: None, capacity: Default::default() });
         assert_eq!(s.free_path("My AI model!", "b"), "/my-ai-model/");
         assert_eq!(s.free_path("Films", "a"), "/", "an offer keeps the root when it is the only one");
         s.offers.push(Offer { id: "b".into(), paths: vec!["/x/".into()], ..s.offers[0].clone() });
