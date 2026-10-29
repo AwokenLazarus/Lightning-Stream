@@ -321,6 +321,15 @@
     var rs = $("#restore");
     if (rs) { $$("details", rs).concat([rs]).forEach(function (d) { if (d.tagName === "DETAILS") d.open = true; }); rs.scrollIntoView(); }
   }
+  // ./sell#capacity: a service's "How many buyers at once", opened (on load, and when a link on the
+  // page itself leads there)
+  function openCapacity() {
+    if (!root.location || root.location.hash !== "#capacity") return;
+    var cp = $("#capacity");
+    if (cp) { cp.open = true; cp.scrollIntoView(); }
+  }
+  openCapacity();
+  if (root.addEventListener) root.addEventListener("hashchange", openCapacity);
 
   // A rotation of the human key finished: promote the pending key.
   var hk = $("#human-key-state");

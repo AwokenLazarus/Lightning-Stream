@@ -62,6 +62,7 @@ use crate::upstream::{decoded_path, forwarded, returned, Answer, Upstream};
 use crate::Error;
 
 mod accounts;
+pub mod admission;
 mod draws;
 mod offers;
 mod websocket;
@@ -142,6 +143,8 @@ pub struct Gateway {
     buyers: Mutex<HashMap<String, String>>,
     /// Buyers' accounts in the services of routes that give them.
     accounts: accounts::Store,
+    /// What each route carries at once, against its `capacity`.
+    load: Arc<admission::Load>,
 }
 
 /// Where the gateway says how its link stands, for the seller's app.
@@ -193,6 +196,14 @@ fn json_response(status: u16, body: &Value) -> Response {
 
 fn error(status: u16, code: &str, detail: &str) -> Response {
     json_response(status, &json!({"error": code, "detail": detail}))
+}
+
+/// A visit or an answer turned away because a route's `capacity` is reached: a 503 with the code
+/// `busy`, the counts, and when to try again. Nothing was sold or charged for it.
+fn busy(b: &admission::Busy) -> Response {
+    let mut r = json_response(503, &b.body());
+    r.headers.push(("Retry-After".into(), admission::RETRY_AFTER_S.to_string()));
+    r
 }
 
 fn addr_name(client: Option<IpAddr>) -> String {
@@ -361,6 +372,7 @@ impl Gateway {
             link_status: Mutex::new(None),
             buyers: Mutex::new(HashMap::new()),
             accounts: accounts::Store::open(&cfg.state_dir),
+            load: admission::Load::new(),
             cfg,
         });
         for hash in unfinished {
@@ -1083,6 +1095,15 @@ impl Gateway {
             ticket: pay.ticket,
             head: req.method == "HEAD",
         };
+        // a route that serves as many buyers as it takes turns a new one away here: its request is
+        // authenticated (its sequence number used, so the buyer's count stays in step) but a ticket's
+        // secret it carries is not taken, so nothing is sold or charged for it. A buyer already
+        // served is counted again and goes on.
+        if let Some(route) = route {
+            if let Err(b) = self.load.buyer(route, Some(&a.session), self.now()) {
+                return Err(self.answered(&a, busy(&b), 0));
+            }
+        }
         if let Some(secret) = &pay.secret {
             if let Err(why) = self.take_secret(&a.session, secret) {
                 return Err(self.refused(&a, &self.req_url(req), route, why));
@@ -1437,6 +1458,11 @@ impl Gateway {
                 if r.accounts.is_some() {
                     v["accounts"] = true.into();
                 }
+                // a route with a `capacity`: what it carries now, and whether it takes a new buyer
+                // (this document is not signed and is read fresh, so it can say so as it changes)
+                if r.capacity.is_set() {
+                    v["capacity"] = self.load.view(r, unix_now());
+                }
                 v
             })
             .collect();
@@ -1523,6 +1549,15 @@ impl Gateway {
             }
         };
         let headers = Self::passed_headers(&answer);
+        // a free route's long answers count against its `max_streams` and rate too
+        let slot = if answer.status < 300 && admission::is_long(&answer.headers, answer.length) {
+            match self.load.stream(route, "") {
+                Ok(slot) => Some(slot),
+                Err(b) => return Reply::Whole(busy(&b)),
+            }
+        } else {
+            None
+        };
         let (status, length, mut src) = (answer.status, answer.length, answer.body);
         Reply::Stream(Streamed {
             status,
@@ -1533,7 +1568,12 @@ impl Gateway {
                 loop {
                     match src.read(&mut buf)? {
                         0 => return Ok(()),
-                        n => out.send(&buf[..n])?,
+                        n => {
+                            out.send(&buf[..n])?;
+                            if let Some(slot) = &slot {
+                                slot.sent(n as u64);
+                            }
+                        }
                     }
                 }
             }),
@@ -1579,9 +1619,17 @@ impl Gateway {
         }
         let pay = match self.pay_header(&req) {
             Ok(Some(p)) => p,
-            Ok(None) => return Reply::Whole(self.unpaid(&self.req_url(&req), route, req.method == "HEAD")),
+            Ok(None) => {
+                // a new visit asking the price: turned away here, before it buys anything, when the
+                // route serves as many buyers as it takes
+                if let Err(b) = self.load.buyer(route, None, self.now()) {
+                    return Reply::Whole(busy(&b));
+                }
+                return Reply::Whole(self.unpaid(&self.req_url(&req), route, req.method == "HEAD"));
+            }
             Err(r) => return Reply::Whole(r),
         };
+        // a new buyer of a full route is turned away inside, before its ticket's secret is taken
         let a = match self.authenticate(&req, &pay, Some(route)) {
             Ok(a) => a,
             Err(r) => return Reply::Whole(r),
@@ -1649,6 +1697,16 @@ impl Gateway {
             .saturating_add(route.price.second_msat)
             .saturating_add(first_byte)
             .saturating_add(token_bound);
+        // a WebSocket holds the service for as long as it is open: its place among the route's
+        // long answers is taken before anything is charged
+        let socket_slot = if route.websocket && websocket::asks_upgrade(&req) {
+            match self.load.stream(route, &a.session) {
+                Ok(slot) => Some(slot),
+                Err(b) => return Reply::Whole(self.answered(&a, busy(&b), 0)),
+            }
+        } else {
+            None
+        };
         let charged = {
             let mut st = self.lock();
             if st.book.chargeable(&a.session, on_pledge) < needed {
@@ -1662,7 +1720,7 @@ impl Gateway {
         }
         // a WebSocket: from here on a two-way stream, every byte paid for (gateway/websocket.rs)
         if route.websocket && websocket::asks_upgrade(&req) {
-            return self.paid_upgrade(a, route, &req, reserve);
+            return self.paid_upgrade(a, route, &req, reserve, socket_slot);
         }
         let refund = |msat: u64| self.lock().book.refund(&a.session, msat);
         // a route that gives accounts: the buyer's request goes as their own account
@@ -1765,12 +1823,26 @@ impl Gateway {
                 }
             };
         }
-        // a body that is metered, long, or of unknown length: sent as it arrives
+        // a body that is metered, long, or of unknown length: sent as it arrives. A long one takes
+        // its place among the route's long answers first; with none left, it is not started, and
+        // nothing is charged for it
+        let slot = if admission::is_long(&answer.headers, answer.length) {
+            match self.load.stream(route, &a.session) {
+                Ok(slot) => Some(slot),
+                Err(b) => {
+                    refund(reserve);
+                    return Reply::Whole(self.answered(&a, busy(&b), 0));
+                }
+            }
+        } else {
+            None
+        };
         self.lock().book.response(&a.session, true, self.now());
         // counted out again when the body ends, or is never started (the buyer hung up first)
         let open = OpenResponse {
             gw: self.clone(),
             session: a.session.clone(),
+            slot,
         };
         self.flush();
         let mut headers = headers;
@@ -1902,7 +1974,7 @@ impl Gateway {
         m: Metered,
         mut src: Box<dyn Read + Send>,
         out: &mut dyn BodyWriter,
-        _open: OpenResponse,
+        open: OpenResponse,
     ) -> io::Result<()> {
         let mut meter = Meter::new(m.route.price);
         meter.seconds_charged(1, m.first_second);
@@ -1934,6 +2006,9 @@ impl Gateway {
                 if let Err(e) = out.send(&buf[off..off + take_n]) {
                     self.lock().book.refund(&m.session, due);
                     break 'body Err(e);
+                }
+                if let Some(slot) = &open.slot {
+                    slot.sent(take);
                 }
                 hash.update(&buf[off..off + take_n]);
                 meter.sent(take, due);
@@ -2115,6 +2190,8 @@ impl Gateway {
 struct OpenResponse {
     gw: Arc<Gateway>,
     session: String,
+    /// The answer's place in its route's `max_streams`, when it is a long one.
+    slot: Option<admission::Slot>,
 }
 
 impl Drop for OpenResponse {
