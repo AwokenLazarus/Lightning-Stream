@@ -54,6 +54,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -1533,12 +1534,156 @@ def offers() -> None:
     offers_policy(on=True)
 
 
-CHECKS = {"page": page, "latency": latency, "stream": stream, "slots": slots, "liar": liar, "kill": kill, "offers": offers, "pruned": pruned}
+# --- a seller's whole web app: Jellyfin, through the app port, paid for on these nodes -----------------------
+
+JF_URL = os.environ.get("JELLYFIN_URL", "")
+JF_PRICE_MSAT = 20_000  # 20 sat a MiB
+
+
+def jellyfin_api(method: str, path: str, key: str, body: dict[str, Any] | None = None) -> Any:
+    u = urllib.parse.urlsplit(JF_URL)
+    conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=30)
+    try:
+        conn.request(method, path, body=json.dumps(body).encode() if body is not None else None,
+                     headers={"X-Emby-Token": key, **({"Content-Type": "application/json"} if body is not None else {})})
+        r = conn.getresponse()
+        text = r.read()
+        if r.status >= 400:
+            raise LabError(f"Jellyfin {method} {path}: {r.status}")
+        return json.loads(text) if text.strip() else None
+    finally:
+        conn.close()
+
+
+def jellyfin() -> None:
+    """A seller's whole web app, sold by the byte: the real Jellyfin web client in a browser, through the
+    wallet app's app port, the connector and the signer, to a gateway that gives each buyer an account of
+    their own (docs/SELLER-APPS.md, docs/BUYER-ACCOUNTS.md), paid with tickets on these nodes. Needs a
+    Jellyfin (JELLYFIN_URL), its admin API key (JF_ADMIN_KEY_FILE), a library to sell (JF_LIBRARY), a film
+    in it (JF_ITEM), and Chrome; run by name only: `ticket_e2e_regtest.sh jellyfin`."""
+    need = {k: os.environ.get(k, "") for k in ("JELLYFIN_URL", "JF_ADMIN_KEY_FILE", "JF_LIBRARY", "JF_ITEM")}
+    if not all(need.values()):
+        raise LabError(f"set {', '.join(k for k, v in need.items() if not v)}")
+    with open(need["JF_ADMIN_KEY_FILE"]) as f:
+        key = next(ln.strip().rsplit("=", 1)[-1] for ln in f if ln.strip() and not ln.startswith("#"))
+    stop_sessions()
+    gw_port, conn_port, ui_port, app_ports = BASE + 12, BASE + 13, BASE + 14, [BASE + 15, BASE + 16]
+    jf_origin = f"http://127.0.0.1:{gw_port}"
+    # the wallet: this seller allowed, tied to the seller's node, and a task for what its app spends
+    pol = WALLET_PROC.policy()
+    pol["allowlist"].append(jf_origin)
+    pol["counterparties"][jf_origin] = {"ln_node": lab.pubkey(SELLER)}
+    pol["tickets"]["tasks"]["app"] = {"budget_sats": 200_000}
+    with open(f"{WALLET}/policy.json", "w") as f:
+        json.dump(pol, f, indent=1)
+    restart_signer()
+    # the seller: the whole of Jellyfin but its admin, each buyer an account of their own whose progress is kept
+    path = gateway_config("jf", gw_port, jf_origin)
+    with open(path) as f:
+        cfg = json.load(f)
+    cfg["times"]["upstream_wait_secs"] = 30
+    cfg["routes"] = [{
+        "path": "/", "upstream": JF_URL, "price": {"byte_msat": JF_PRICE_MSAT, "per_bytes": PER_BYTES},
+        "methods": ["GET", "HEAD", "POST", "DELETE"], "max_body": 1_048_576, "websocket": True, "accept_gzip": True,
+        "forward_headers": ["cookie", "authorization", "x-emby-authorization", "x-mediabrowser-token", "x-emby-token", "x-requested-with"],
+        "accounts": {"kind": "jellyfin", "admin_key_file": os.path.abspath(need["JF_ADMIN_KEY_FILE"]), "libraries": [need["JF_LIBRARY"]]},
+        "allow_paths": ["/", "/users/", "/sessions/playing", "/sessions/capabilities", "/system/info/public", "/system/endpoint",
+                        "/quickconnect/enabled", "/branding/configuration"],
+        "deny_paths": ["/users", "/sessions", "/system/", "/devices", "/quickconnect/", "/auth/", "/startup/", "/plugins/", "/packages/",
+                       "/scheduledtasks/", "/library/", "/environment/", "/branding/"]}]
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=1)
+    start_gateway("jf", gw_port)
+    # the buyer's app: the connector on the signer, the wallet app with two app ports, the seller listed in it
+    os.makedirs(f"{RUN}/ui", exist_ok=True)
+    with open(f"{RUN}/ui/services.json", "w") as f:
+        json.dump([{"name": "Films", "kind": "video", "seller": jf_origin, "price_text": "20 sat a MiB", "items": [],
+                    "app": f"{jf_origin}/web/", "app_base": f"{jf_origin}/"}], f)
+    with open(f"{RUN}/connector.log", "ab") as log:
+        PROCS["connector"] = subprocess.Popen([f"{BIN}/lightning-stream"], env=dict(os.environ, LS_LISTEN=f"127.0.0.1:{conn_port}", B2_SIGNER_SOCK=SOCK,
+                                              B2_STREAM_DIR=f"{RUN}/stream", LS_TASK="app", LS_MAX_SATS="30000"), stdout=log, stderr=log)
+    password = secrets.token_hex(12)
+    with open(f"{RUN}/ui.log", "ab") as log:
+        PROCS["ui"] = subprocess.Popen([f"{BIN}/xbt-wallet-ui"], env=dict(os.environ, XBT_UI_BIND=f"127.0.0.1:{ui_port}", XBT_UI_SIGNER_SOCK=SOCK,
+                                       XBT_UI_DATA_DIR=f"{RUN}/ui", XBT_UI_PASSWORD=password, XBT_UI_CONNECTOR=f"http://127.0.0.1:{conn_port}",
+                                       XBT_UI_APP_PORTS=",".join(map(str, app_ports))), stdout=log, stderr=log)
+    lab.wait("the connector and the wallet app", 60, lambda: all(p.poll() is None for p in (PROCS["connector"], PROCS["ui"]))
+             and send("GET", "/health", conn_port)[0] == 200 and send("GET", "/login", ui_port)[0] == 200, every=0.2)
+    form = lambda d: urllib.parse.urlencode(d).encode()
+    st, h, _ = send("POST", "/login", ui_port, {"Content-Type": "application/x-www-form-urlencoded"}, form({"password": password}))
+    cookie = h.get("set-cookie", "").split(";")[0]
+    if st != 303 or not cookie:
+        raise LabError(f"the wallet app's login: {st}")
+    q = urllib.parse.urlencode({"u": f"{jf_origin}/web/", "b": f"{jf_origin}/"})
+    page = send("GET", f"/app?{q}", ui_port, {"Cookie": cookie})[2].decode()
+    attr = lambda text, a: text.split(f'{a}="', 1)[1].split('"', 1)[0]
+    st, _, body = send("POST", "/app", ui_port, {"Cookie": cookie, "Content-Type": "application/x-www-form-urlencoded"},
+                       form({"csrf": attr(page, 'name="csrf" value'), "u": f"{jf_origin}/web/", "b": f"{jf_origin}/", "limit": "30000"}))
+    opened = body.decode()
+    if st != 200 or "data-port" not in opened:
+        raise LabError(f"opening the app: {st} {opened[:300]}")
+    port, code = attr(opened, "data-port"), attr(opened, "data-code")
+    # the browser, from the visit's one-time code to a minute of the film and a seek
+    before = money()
+    shots = f"{OUT}/jellyfin"
+    t0 = time.monotonic()
+    drove = subprocess.run(["node", os.path.join(os.path.dirname(__file__), "jellyfin_drive.mjs"), f"http://127.0.0.1:{port}/__ls/enter?c={code}",
+                            need["JF_ITEM"], shots], env=dict(os.environ, JF_TAP_USER="^buyer-"), capture_output=True, text=True, timeout=600)
+    took = round(time.monotonic() - t0)
+    with open(f"{RUN}/jellyfin-drive.log", "w") as f:
+        f.write(drove.stdout + drove.stderr)
+    if drove.returncode != 0 or not os.path.exists(f"{shots}/log.json"):
+        raise LabError(f"the browser: rc {drove.returncode} {drove.stderr[-300:]}")
+    with open(f"{shots}/log.json") as f:
+        rep = json.load(f)
+    # the visit stopped: what it locked comes back
+    send("POST", "/app-stop", ui_port, {"Cookie": cookie, "Content-Type": "application/x-www-form-urlencoded"},
+         form({"csrf": attr(opened, 'name="csrf" value'), "visit": attr(opened, "data-visit")}))
+    stop_sessions()
+    lab.wait("the visit's tickets back", 60, lambda: in_flight() == 0 and held() == 0, every=0.2)
+    after = money()
+    # the buyer's account, as Jellyfin keeps it
+    users = [u for u in jellyfin_api("GET", "/Users", key) if u["Name"].startswith("buyer-")]
+    kept = {}
+    for u in users:
+        d = jellyfin_api("GET", f"/Users/{u['Id']}/Items/{need['JF_ITEM']}", key)
+        kept[u["Name"]] = {"position_s": round(int((d.get("UserData") or {}).get("PlaybackPositionTicks") or 0) / 1e7), "admin": u["Policy"]["IsAdministrator"],
+                           "libraries": u["Policy"].get("EnabledFolders"), "all_libraries": u["Policy"].get("EnableAllFolders")}
+    try:
+        with open(f"{RUN}/state-jf/accounts.json") as f:
+            accounts = len(json.load(f))
+    except (OSError, ValueError):
+        accounts = -1
+    samples = [x for x in rep.get("samples") or [] if x]
+    seen = {"after_login": rep.get("after_login"), "home": rep.get("home"), "startup_s": rep.get("startup_s"), "width": max((x.get("w", 0) for x in samples), default=0),
+            "dropped": max((x.get("dropped", 0) or 0 for x in samples), default=None), "after_seek": rep.get("after_seek"), "seek_s": rep.get("seek_s"),
+            "browser_mib": round(rep.get("bytes", 0) / PER_BYTES), "http_errors": len(rep.get("http_errors") or []), "ws": rep.get("ws"), "seconds": took}
+    measured("jellyfin", seen)
+    check("jellyfin: the whole web client opens through the app port and logs the buyer in, with one tap, as an account of their own",
+          bool(rep.get("home")) and "/web/" in str(rep.get("after_login")) and len(users) == 1 and accounts == 1
+          and all(not k["admin"] and not k["all_libraries"] and k["libraries"] == [need["JF_LIBRARY"]] for k in kept.values()),
+          {**seen, "accounts": accounts, "users": kept})
+    check("jellyfin: the 4K film plays within 5 s, drops no frame, and a seek to 300 s plays again within 5 s",
+          bool(rep.get("started")) and float(rep.get("startup_s") or 99) <= 5 and seen["width"] >= 3840 and seen["dropped"] == 0
+          and bool(rep.get("seek_resumed")) and float(rep.get("seek_s") or 99) <= 5, seen)
+    paid = {k: after[k] - before[k] for k in ("buyer_node_paid_msat", "seller_node_received_msat", "wallet_book_settled_msat", "tickets")}
+    # the browser counts what it decoded; the seller charges what it sent, about as much for a film
+    priced = rep.get("bytes", 0) * JF_PRICE_MSAT // PER_BYTES
+    check("jellyfin: what it loaded was paid for on these nodes: the buyer's node paid, the seller's node received and the wallet booked one sum",
+          paid["tickets"] > 0 and len({paid["buyer_node_paid_msat"], paid["seller_node_received_msat"], paid["wallet_book_settled_msat"]}) == 1
+          and paid["buyer_node_paid_msat"] >= priced // 2, {**paid, "priced_by_the_browser_msat": priced})
+    check("jellyfin: the buyer's progress is kept in their own account", any(k["position_s"] > 0 for k in kept.values()), kept)
+    # the next run starts with no buyer: Jellyfin names its users' ids after their names, so one left would come back
+    for u in users:
+        jellyfin_api("DELETE", f"/Users/{u['Id']}", key)
+
+
+CHECKS = {"page": page, "latency": latency, "stream": stream, "slots": slots, "liar": liar, "kill": kill, "offers": offers, "pruned": pruned, "jellyfin": jellyfin}
 
 
 def main() -> int:
     # with the pruned node, the pruned check; else every check that runs on the lab's own node
-    names = sys.argv[1:] or (["pruned"] if PRUNED else [n for n in CHECKS if n != "pruned"])
+    names = sys.argv[1:] or (["pruned"] if PRUNED else [n for n in CHECKS if n not in ("pruned", "jellyfin")])
     unknown = [n for n in names if n not in CHECKS]
     if unknown:
         print(f"unknown check {unknown}; the checks are {' '.join(CHECKS)}", file=sys.stderr)
