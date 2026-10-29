@@ -16,6 +16,11 @@
 //! hashtakers nowhere. `--link-lan` is the address shown for hashtakers on the same network.
 //!
 //! Without `payNode`, the node is read from the hashmaker's gateway (`--gateway`, its `/services`).
+//!
+//! With relays and a Nostr key set, the hashmaker also publishes a signed summary of the rentals it
+//! served (by the same commitments the hashtakers' delivery records use, [`xbt_hashlink::trust`]),
+//! at most every ten minutes after a rental ends. It is kept in `hash-summary.json` beside the
+//! settings file, so it survives a restart.
 //! A missing `--key` or `--nostr-key` file is made at the first start.
 
 use crate::http;
@@ -26,10 +31,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use xbt_hashlink::hashmaker::{self, Hashmaker};
-use xbt_hashlink::listing::{Capacity, IrohLink};
+use xbt_hashlink::listing::{self, Capacity, IrohLink};
 use xbt_hashlink::msg::Terms;
 use xbt_hashlink::over_iroh;
 use xbt_hashlink::rail::LabSeller;
+use xbt_hashlink::trust;
 
 /// A change in what is for rent (miners, free miners, renting on or off, the terms, the name, or
 /// where hashtakers reach and pay the hashmaker) is published again after at least this long since the last publish.
@@ -257,8 +263,12 @@ pub fn run(f: &HashMap<String, String>, key: SecretKey) -> Result<(), String> {
     let mut seen = mtime(&path);
     let mut last: Option<(Said, bool)> = None;
     let mut last_pub = Instant::now();
+    let mut served = Served::load(path.as_ref().map(|p| p.with_file_name("hash-summary.json")));
     loop {
         std::thread::sleep(Duration::from_secs(2));
+        if let (Some(r), Some(n)) = (f.get("relays"), f.get("nostr-key")) {
+            served.tick(&h, &key, n, r);
+        }
         let m = mtime(&path);
         if m != seen {
             seen = m;
@@ -330,6 +340,62 @@ pub fn run(f: &HashMap<String, String>, key: SecretKey) -> Result<(), String> {
         };
         last = Some((now, res.is_ok()));
         last_pub = Instant::now();
+    }
+}
+
+/// The rentals this hashmaker served, kept in a file so its signed summary survives a restart, and
+/// published as that summary (at most every ten minutes, when a rental has ended since).
+struct Served {
+    file: Option<PathBuf>,
+    rentals: std::collections::BTreeMap<String, trust::Served>,
+    dirty: bool,
+    last: Option<Instant>,
+}
+
+impl Served {
+    const EVERY: Duration = Duration::from_secs(600);
+
+    fn load(file: Option<PathBuf>) -> Served {
+        let rentals = file
+            .as_ref()
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .and_then(|v| trust::Summary::from_json(&v))
+            .map(|s| s.rentals.into_iter().map(|r| (r.commit.clone(), r)).collect())
+            .unwrap_or_default();
+        Served { file, rentals, dirty: false, last: None }
+    }
+
+    fn tick(&mut self, h: &Hashmaker, key: &SecretKey, nostr_file: &str, relays: &str) {
+        let me = secp256k1::PublicKey::from_secret_key(secp256k1::SECP256K1, key);
+        for fin in h.finished() {
+            let ended = fin.pointer("/stopped/atMs").and_then(Value::as_u64).unwrap_or_else(xbt_hashlink::now_ms) / 1000;
+            if let Some(s) = trust::served_of(&fin, &me, ended) {
+                if !self.rentals.contains_key(&s.commit) {
+                    self.rentals.insert(s.commit.clone(), s);
+                    self.dirty = true;
+                }
+            }
+        }
+        if !self.dirty || self.last.is_some_and(|t| t.elapsed() < Self::EVERY) {
+            return;
+        }
+        let summary = trust::Summary { hashmaker: me, rentals: self.rentals.values().cloned().collect() };
+        if let Some(p) = &self.file {
+            let _ = std::fs::write(p, summary.to_json().to_string());
+        }
+        let Ok(nostr) = super::read_key(nostr_file).map(xbt_nostr::event::Keys::new) else { return };
+        self.last = Some(Instant::now());
+        match summary.event(&nostr, xbt_nostr::now()) {
+            Ok(ev) => {
+                let said = listing::publish(&super::relays(relays), &ev);
+                if said.iter().any(|s| s["ok"] == true) {
+                    self.dirty = false;
+                }
+                eprintln!("hashmaker: delivery summary ({} rentals) published: {}", summary.rentals.len(), Value::from(said));
+            }
+            Err(e) => eprintln!("hashmaker: delivery summary not published: {e}"),
+        }
     }
 }
 
