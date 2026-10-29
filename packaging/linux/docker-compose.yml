@@ -40,7 +40,7 @@ x-lightning-cert: &lightning-cert
 
 services:
   init:
-    image: ghcr.io/awokenlazarus/xbt-init:0.1.0-8f4a334734d8@sha256:a86d77496c2c0de78bbc14da60d557f9e334c21e531dcc9e2e9c18b65f612a37
+    image: ghcr.io/awokenlazarus/xbt-init:0.1.0-12b8182c0bf6@sha256:a4bcde9d5c8094a37aeb5f8c6bfb5083535cac585bba5ab08eb8e3af8bd4af05
     user: "0:0"
     restart: "no"
     network_mode: none
@@ -63,7 +63,7 @@ services:
 
   witness:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-anchor-witness:0.1.0-8f4a334734d8@sha256:50394a52e5545c393821b16fabdc86d36c34f15905198608b53d6889677cb143
+    image: ghcr.io/awokenlazarus/xbt-anchor-witness:0.1.0-12b8182c0bf6@sha256:47d0ba30c891927415ea75919713ef41252754acf32545071bf8bb741f4609e8
     network_mode: none
     stop_grace_period: 30s
     volumes:
@@ -72,7 +72,7 @@ services:
 
   signer:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-signer:0.1.0-8f4a334734d8@sha256:297982579e05664af06cd0e44d07c519878826d006007009f808430da2c862fb
+    image: ghcr.io/awokenlazarus/xbt-signer:0.1.0-12b8182c0bf6@sha256:e7d6cc4df4a55a9821ca61c72044080a5a7637d03b694de0eeff3c9ce5e6b1a3
     entrypoint: ["/usr/bin/xbt-supervise", "--watch", "/data/run/ln/rail.macaroon", "--watch", "/data/lightning/tls.cert", "--", "/usr/bin/xbt-signer"]
     stop_grace_period: 1m
     environment:
@@ -97,7 +97,7 @@ services:
   # agents on this machine: http://127.0.0.1:${LS_MCP_PORT}/mcp, behind the bearer token on the Agents page
   mcp:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-wallet-mcp:0.1.0-8f4a334734d8@sha256:8313b9ec5807be14d74b1b6cb076baea176539250aa796ce351c751c78027df9
+    image: ghcr.io/awokenlazarus/xbt-wallet-mcp:0.1.0-12b8182c0bf6@sha256:9b538dd6ea09eb852a2ff66d1a88ac64240012937490619c21e4302f0206c453
     stop_grace_period: 30s
     environment:
       XBT_MCP_HTTP: 127.0.0.1:${LS_MCP_PORT:-33511}
@@ -111,7 +111,7 @@ services:
 
   ui:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-8f4a334734d8@sha256:85a51ac5794a5689d279391e8ed8f1bd8131b120170e15629b06eb2f3082c085
+    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-12b8182c0bf6@sha256:2162a817631271904dc3f32d561f98a31537383420d88a2fdf0a1c0d155654f0
     stop_grace_period: 15s
     environment:
       # loopback only: from another machine, use an ssh tunnel (docs/LINUX.md)
@@ -159,7 +159,7 @@ services:
   # macaroon on standard input, and exits. It is not started by `up` (profile "setup").
   node-keys:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-8f4a334734d8@sha256:85a51ac5794a5689d279391e8ed8f1bd8131b120170e15629b06eb2f3082c085
+    image: ghcr.io/awokenlazarus/xbt-wallet-ui:0.1.0-12b8182c0bf6@sha256:2162a817631271904dc3f32d561f98a31537383420d88a2fdf0a1c0d155654f0
     profiles: ["setup"]
     command: ["node-keys"]
     restart: "no"
@@ -178,7 +178,7 @@ services:
 
   connector:
     <<: *service
-    image: ghcr.io/awokenlazarus/lightning-stream:0.1.0-8f4a334734d8@sha256:71748a25baa2aa3ec76d8327c8c6d2269ff956aea44016f8d2c5c168de878773
+    image: ghcr.io/awokenlazarus/lightning-stream:0.1.0-12b8182c0bf6@sha256:b67c0c1e8649192283618b5fd7ced80022d85af5da035a1b2085cfdb7202bc24
     stop_grace_period: 15s
     depends_on:
       init:
@@ -205,7 +205,7 @@ services:
   # idle until the owner saves a shop on the Sell page, which writes run/gateway/config.json
   gateway:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-gateway:0.1.0-8f4a334734d8@sha256:87a1467be3beb60e204629533237fb7c0b4d552f959d601b09f9d54dbac8cbc3
+    image: ghcr.io/awokenlazarus/xbt-gateway:0.1.0-12b8182c0bf6@sha256:feaf8a21dd394273760916757c7b80ac93c600a93a90d2e2453f960b60b93eb6
     stop_grace_period: 30s
     volumes:
       - ${LS_DATA_DIR}/gateway:/data/gateway
@@ -215,7 +215,7 @@ services:
   # The hashmaker: rents this machine's miners out (Sell → Hashrate). Only with LS_HASHMAKER=1.
   hashmaker:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-hashlink:0.1.0-8f4a334734d8@sha256:921be6f0886d4cb28cae6a1a7b634f9dfa14b6f38b9a7058174493a81088a3f2
+    image: ghcr.io/awokenlazarus/xbt-hashlink:0.1.0-12b8182c0bf6@sha256:339a7caf0fda355b1c96e92001fa2cd55bfb8cfb0a228e6d0fb79c7430f924dd
     profiles: ["hashmaker"]
     stop_grace_period: 15s
     command: ["hasher", "--key", "/data/hashrate/link.key", "--nostr-key", "/data/hashrate/nostr.key",
@@ -233,7 +233,7 @@ services:
   # and pays each piece of work through the signer, as the "hashrate" task of the spending rules.
   hashtaker:
     <<: *service
-    image: ghcr.io/awokenlazarus/xbt-hashlink:0.1.0-8f4a334734d8@sha256:921be6f0886d4cb28cae6a1a7b634f9dfa14b6f38b9a7058174493a81088a3f2
+    image: ghcr.io/awokenlazarus/xbt-hashlink:0.1.0-12b8182c0bf6@sha256:339a7caf0fda355b1c96e92001fa2cd55bfb8cfb0a228e6d0fb79c7430f924dd
     stop_grace_period: 15s
     depends_on:
       init:
