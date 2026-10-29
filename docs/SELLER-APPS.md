@@ -77,18 +77,31 @@ On Sell, a service gets **Buyers can open its own web page**, with:
 
 **Parts a buyer must not reach.** A web app sold whole also serves its admin pages, other
 users' sessions and its settings. The gateway's route takes two lists of path prefixes, matched
-on the decoded path and ignoring case (many servers ignore it):
+on the decoded path and ignoring case (many servers ignore it, and Jellyfin's own client asks
+`/users/public` in lower case and `/Users/...` elsewhere):
 
-- `deny_paths`: refused with 403, before payment and before the service sees the request;
-- `allow_paths`: when given, the only paths served; everything else is refused the same way.
+- `deny_paths` refuse, with 403 before payment and before the service sees the request;
+- `allow_paths` serve; when the list is given, a path that starts with none of its entries is
+  refused;
+- where a path starts with entries of both, **the longest one decides**.
 
-For Jellyfin, every buyer is the same guest user, so the guest must not see the server's
-sessions, its users or its settings: deny `/Sessions`, `/System/`, `/Devices`, `/QuickConnect/`,
-`/Auth/`, `/Startup/`, `/Plugins/`, `/Packages/`, `/ScheduledTasks/`, `/Library/` and
-`/Environment/`, `/Branding/Configuration`, `/UserPlayedItems` and `/UserItems/`, and let
-through of `/Users/` only `/Users/Public`, `/Users/AuthenticateByName`, `/Users/Me` and the guest's
-own `/Users/<guest id>/`. Denying `/Sessions` also keeps one buyer's playback progress from becoming
-the next buyer's resume point: every buyer is the same Jellyfin user. The guest is a user made for
+So one route says "all of the app, none of `/users` but the guest's own login and pages". For
+Jellyfin, every buyer is the same guest user, and this is the route, checked with Jellyfin 10.10's
+web client through a gateway (`crates/xbt-gateway/tests/app_hold.rs`):
+
+```json
+{"path": "/", "methods": ["GET", "HEAD", "POST", "DELETE"], "websocket": true,
+ "forward_headers": ["authorization", "x-emby-authorization", "x-mediabrowser-token", "x-emby-token"],
+ "allow_paths": ["/", "/users/public", "/users/authenticatebyname", "/users/me", "/users/<guest id>",
+                 "/system/info/public", "/system/endpoint", "/sessions/capabilities",
+                 "/quickconnect/enabled", "/branding/configuration"],
+ "deny_paths": ["/users", "/sessions", "/system/", "/devices", "/quickconnect/", "/auth/", "/startup/",
+                "/plugins/", "/packages/", "/scheduledtasks/", "/library/", "/environment/", "/branding/",
+                "/userplayeditems", "/useritems/"]}
+```
+
+Refusing `/Sessions` (but for the client's capabilities) also keeps one buyer's playback progress
+from becoming the next buyer's resume point: every buyer is the same Jellyfin user. The guest is a user made for
 buyers, shown on the login screen with an empty password and limited to the films on sale, so a
 buyer taps it once; it can download and delete nothing.
 
@@ -131,10 +144,11 @@ for long viewing is about 1 sat/MiB: 4K for about 3,600 sat an hour, 1080p for a
 900-sat ticket lasts about 90 s of 4K. The starter rules' 10,000 sat a day allow a little under
 three hours of 4K at that price, and a seller that charges by the MiB should say so in its terms.
 
-## WebSockets: the design
+## WebSockets
 
 A web app's live connection (Jellyfin's sync and remote control, a game, a chat) is a WebSocket:
-an HTTP request that becomes a two-way byte stream. Carrying one through a visit:
+an HTTP request that becomes a two-way byte stream. A route carries them with `"websocket": true`
+(priced by the request and the byte, or free). Carrying one through a visit:
 
 - **Every hop carries the upgraded connection as a byte stream**: the app port to the connector,
   the connector to the signer (its stream socket, used both ways), the signer to the seller's
@@ -144,19 +158,21 @@ an HTTP request that becomes a two-way byte stream. Carrying one through a visit
   The gateway charges each chunk before passing it on, as it charges a body; the signer counts the
   same bytes and seconds at the same price, and releases or buys the next ticket ahead, as for a
   film. Neither side reads money from the other's word: the gateway's receipts close the stream.
-- **The visit's limit holds**: the upgraded connection is one call of the visit, with the turn to
-  buy while it needs a ticket. Stop closes it.
-- **What it needs built**: an upgraded answer in the shared HTTP server (the head written, then the
-  connection handed to the handler); a two-way call in the signer's connection to the seller; the
-  gateway's upgraded route and its upstream; and the connector and app port passing the upgrade on.
+- **The visit's limit holds**: an open WebSocket holds a share of what is left of the visit's limit
+  (at most 1,000 sat), counted as spent while it is open and then only what it cost. It does not
+  hold the turn to buy, which the page's other requests need. Stop closes it.
+- **Where it is built**: the shared HTTP server's upgraded answer (`Reply::Upgrade`), the gateway's
+  `gateway/websocket.rs`, the signer's `TicketWire::upgrade` (plain TCP, or TLS with the seller's
+  certificate checked as for any request; a QUIC stream can implement the same method) and the
+  `upgrade` call, the connector's `visit_socket`, and the app port's `socket`. Tests:
+  `crates/xbt-gateway/tests/websocket.rs`, `a_websocket_is_carried_both_ways_and_every_byte_paid`
+  in the signer's, and the app port's in `crates/xbt-wallet-ui/tests/seller_app.rs`.
 
 ## Limits of this version
 
-- **WebSockets are not carried yet** (the design is above). A request to upgrade is answered
-  `501`. Jellyfin's web client works without its socket, but it does not get live updates. A game
-  that needs a socket will not work yet.
-- The app sees the box's address and an app port. A page that builds absolute links to the
-  seller's own host name leaves the visit. Relative links and links to its own `/` work.
+- A page's absolute links to the seller's base are rewritten to the app port in text answers
+  (HTML, scripts, styles, JSON, SVG), as written, without their scheme, or JSON-escaped. A link a
+  script builds from pieces at run time still leaves the visit.
 - The app ports are plain `http` on the LAN, as the wallet page is. A wallet page opened over
   `https` cannot frame them.
 - A long answer that runs out of the session's credit while another request of the visit holds
