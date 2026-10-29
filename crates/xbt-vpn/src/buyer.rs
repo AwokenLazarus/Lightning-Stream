@@ -58,12 +58,19 @@ impl Device {
     }
 }
 
-/// The resolver a buyer with private exits asks, over DNS-over-TLS through the tunnel.
+/// The resolver a buyer with private exits asks, over DNS-over-TLS through the tunnel, and over
+/// DNS-over-HTTPS (port 443) where the exit's network blocks DNS-over-TLS (port 853), as many home
+/// and office networks do.
 #[derive(Clone)]
 pub struct EncryptedDns {
     pub addr: SocketAddr,
     pub name: ServerName<'static>,
     pub tls: Arc<rustls::ClientConfig>,
+    /// DNS-over-HTTPS: the address and the path (`/dns-query`), asked when DNS-over-TLS fails.
+    pub https: Option<(SocketAddr, String)>,
+    https_tls: Arc<rustls::ClientConfig>,
+    /// Set once DNS-over-TLS has failed and HTTPS answered: later questions go straight to HTTPS.
+    tls_blocked: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl EncryptedDns {
@@ -81,14 +88,23 @@ impl EncryptedDns {
             .map_err(io::Error::other)?
             .with_root_certificates(roots)
             .with_no_client_auth();
+        let mut https_tls = tls.clone();
+        // DNS-over-HTTPS resolvers speak HTTP/2 (some refuse HTTP/1.1)
+        https_tls.alpn_protocols = vec![b"h2".to_vec()];
         let name = ServerName::try_from(name.to_string()).map_err(io::Error::other)?;
-        Ok(EncryptedDns { addr, name, tls: Arc::new(tls) })
+        Ok(EncryptedDns { addr, name, tls: Arc::new(tls), https: None, https_tls: Arc::new(https_tls), tls_blocked: Arc::default() })
+    }
+
+    /// Also asks over DNS-over-HTTPS at `addr` and `path`, when DNS-over-TLS fails.
+    pub fn with_https(mut self, addr: SocketAddr, path: &str) -> EncryptedDns {
+        self.https = Some((addr, path.to_string()));
+        self
     }
 
     /// Quad9's public resolver over TLS (it keeps no logs, and blocks known malicious domains); the
     /// buyer can choose another.
     pub fn quad9() -> EncryptedDns {
-        Self::new(([9, 9, 9, 9], 853).into(), "dns.quad9.net").expect("a valid name")
+        Self::new(([9, 9, 9, 9], 853).into(), "dns.quad9.net").expect("a valid name").with_https(([9, 9, 9, 9], 443).into(), "/dns-query")
     }
 }
 
@@ -204,9 +220,26 @@ impl Buyer {
         !self.disqualified.read().unwrap_or_else(|e| e.into_inner()).contains(&(device, exit.to_string()))
     }
 
-    /// Asks the buyer's own resolver one DNS question, over TLS through an exit.
+    /// Asks the buyer's own resolver one DNS question through an exit: over TLS, or over HTTPS where
+    /// the exit's network blocks DNS-over-TLS.
     async fn resolve(self: &Arc<Self>, device: IpAddr, query: &[u8]) -> Option<Vec<u8>> {
         let dns = self.dns.as_ref()?;
+        let blocked = dns.tls_blocked.load(Ordering::Relaxed);
+        if !blocked || dns.https.is_none() {
+            let wait = if dns.https.is_some() { Duration::from_secs(4) } else { Duration::from_secs(10) };
+            if let Some(a) = self.resolve_tls(device, dns, query, wait).await {
+                return Some(a);
+            }
+        }
+        let (addr, path) = dns.https.as_ref()?;
+        let a = self.resolve_https(device, dns, *addr, path, query).await;
+        if a.is_some() && !blocked {
+            dns.tls_blocked.store(true, Ordering::Relaxed);
+        }
+        a
+    }
+
+    async fn resolve_tls(self: &Arc<Self>, device: IpAddr, dns: &EncryptedDns, query: &[u8], wait: Duration) -> Option<Vec<u8>> {
         let (exit_id, exit) = self.route(device, dns.addr).await?;
         let answer = async {
             let flow = open_flow(&exit, dns.addr).await?;
@@ -219,6 +252,45 @@ impl Buyer {
             let mut a = vec![0u8; usize::from(u16::from_be_bytes(len))];
             tls.read_exact(&mut a).await.ok()?;
             Some(a)
+        };
+        let a = tokio::time::timeout(wait, answer).await.ok().flatten();
+        self.router_for(device).lock().await.flow_ended(&exit_id);
+        a
+    }
+
+    async fn resolve_https(self: &Arc<Self>, device: IpAddr, dns: &EncryptedDns, addr: SocketAddr, path: &str, query: &[u8]) -> Option<Vec<u8>> {
+        let (exit_id, exit) = self.route(device, addr).await?;
+        let answer = async {
+            let flow = open_flow(&exit, addr).await?;
+            let tls = TlsConnector::from(dns.https_tls.clone()).connect(dns.name.clone(), flow).await.ok()?;
+            let host = match &dns.name {
+                ServerName::DnsName(n) => n.as_ref().to_string(),
+                other => format!("{other:?}"),
+            };
+            let (mut client, conn) = h2::client::handshake(tls).await.ok()?;
+            tokio::spawn(conn);
+            let req = http::Request::post(format!("https://{host}{path}"))
+                .header("content-type", "application/dns-message")
+                .header("accept", "application/dns-message")
+                .body(())
+                .ok()?;
+            let (resp, mut body_out) = client.send_request(req, false).ok()?;
+            body_out.send_data(Bytes::copy_from_slice(query), true).ok()?;
+            let resp = resp.await.ok()?;
+            if resp.status() != http::StatusCode::OK {
+                return None;
+            }
+            let mut body = resp.into_body();
+            let mut a = Vec::new();
+            while let Some(chunk) = body.data().await {
+                let chunk = chunk.ok()?;
+                let _ = body.flow_control().release_capacity(chunk.len());
+                a.extend_from_slice(&chunk);
+                if a.len() > 65535 {
+                    return None;
+                }
+            }
+            (a.len() >= 12).then_some(a)
         };
         let a = tokio::time::timeout(Duration::from_secs(10), answer).await.ok().flatten();
         self.router_for(device).lock().await.flow_ended(&exit_id);
@@ -484,3 +556,4 @@ impl AsyncWrite for PacketPipe {
         Poll::Ready(Ok(()))
     }
 }
+

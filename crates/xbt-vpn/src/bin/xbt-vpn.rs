@@ -14,6 +14,10 @@
 //! xbt-vpn hop   [--relay URL]
 //!     Runs a first hop: it joins a buyer's sealed flows to the exit each names, reading neither the
 //!     destination nor the bytes. Prints its key and where it can be reached, then bytes carried.
+//! xbt-vpn buyer --exit KEY --hints JSON --wg-listen ADDR:PORT --wg-endpoint HOST:PORT [--private] [--relay URL]
+//!     Runs a buyer's app for one device: a WireGuard endpoint the device adds, the buyer's stack and
+//!     router, private DNS (DNS-over-TLS to Quad9 through the exit). Prints the device's WireGuard
+//!     config once (keys made for this run), then the device's bytes and refusals every 10 s.
 //! xbt-vpn fetch --exit KEY --hints JSON --url http://HOST/PATH [--flows N] [--secs S] [--private] [--relay URL]
 //!               [--hop KEY --hop-hints JSON]
 //!     Downloads the URL through the exit on N flows at once for S seconds and prints one JSON line:
@@ -58,6 +62,7 @@ fn main() -> std::io::Result<()> {
         Some("exit") => exit(&args, relay),
         Some("hop") => hop(relay),
         Some("lists") => lists(&args),
+        Some("buyer") => buyer(&args, relay, private),
         Some("fetch") => fetch(&args, relay, private),
         _ => {
             eprintln!("usage: xbt-vpn exit [--relay URL] [--speed-limit B/s] | xbt-vpn hop [--relay URL] | xbt-vpn fetch --exit KEY --hints JSON --url URL [--flows N] [--secs S] [--private] [--hop KEY --hop-hints JSON]");
@@ -128,6 +133,46 @@ fn lists(args: &[String]) -> std::io::Result<()> {
         drop(d);
     }
     Ok(())
+}
+
+fn buyer(args: &[String], relay: String, private: bool) -> std::io::Result<()> {
+    use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr};
+    use xbt_vpn::buyer::{Buyer, Device, EncryptedDns};
+    use xbt_vpn::router::{ExitInfo, Mode, Router};
+    use xbt_vpn::wg::{device_config, keypair, WgEndpoint, WgPeer};
+
+    let exit_id = arg(args, "--exit").expect("--exit KEY");
+    let hints: serde_json::Value = serde_json::from_str(&arg(args, "--hints").expect("--hints JSON")).map_err(std::io::Error::other)?;
+    let listen = arg(args, "--wg-listen").expect("--wg-listen ADDR:PORT");
+    let endpoint = arg(args, "--wg-endpoint").expect("--wg-endpoint HOST:PORT");
+    let link = Link::start_alpn(secret(), Options { relays: Relays::Ours(vec![relay]), serving: false, private, lookup: None }, ALPN_VPN)?;
+    let strings = |k: &str| hints[k].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>();
+    let direct = if private { vec![] } else { strings("direct").iter().filter_map(|s| s.parse().ok()).collect() };
+    link.learn(&exit_id, Hints { relays: strings("relays"), direct })?;
+
+    let mut router = Router::new(Mode::Best, None);
+    router.upsert(ExitInfo { id: exit_id, region: "XX".into(), healthy: true, ..ExitInfo::default() });
+    const DEVICE_IP: Ipv4Addr = Ipv4Addr::new(10, 66, 0, 2);
+    let dev = Arc::new(Device { name: "device".into(), meter: Meter::default(), limit_bytes: None, requirements: None });
+    let buyer = Buyer::new(link.clone(), router, HashMap::from([(IpAddr::V4(DEVICE_IP), dev.clone())]), Some(EncryptedDns::quad9()));
+    let (device_private, device_public) = keypair();
+    let (endpoint_private, endpoint_public) = keypair();
+    let wg = WgEndpoint::new(endpoint_private, &[WgPeer { public: device_public, tunnel_ip: DEVICE_IP }]);
+    let rt = link.runtime();
+    let sock = rt.block_on(tokio::net::UdpSocket::bind(&listen))?;
+    let (to_stack, from_devices) = tokio::sync::mpsc::channel(4096);
+    let (to_devices, from_stack) = tokio::sync::mpsc::unbounded_channel();
+    rt.spawn(buyer.clone().run(from_devices, to_devices));
+    rt.spawn(wg.run(sock, to_stack, from_stack));
+    print!("{}", device_config(device_private, DEVICE_IP, endpoint_public, &endpoint, "10.66.0.1"));
+    use std::io::Write;
+    std::io::stdout().flush()?;
+    loop {
+        std::thread::sleep(Duration::from_secs(10));
+        let c = dev.meter.counts();
+        eprintln!("device up {} B, down {} B; flows refused {}", c.up_bytes, c.down_bytes, buyer.refused.load(Ordering::Relaxed));
+    }
 }
 
 fn hop(relay: String) -> std::io::Result<()> {

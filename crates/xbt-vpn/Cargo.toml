@@ -31,6 +31,9 @@ webpki-roots = "1"
 ring = "0.17"
 # fetching category blocklists over HTTPS (the tree's HTTP client)
 ureq.workspace = true
+# DNS-over-HTTPS when an exit's network blocks DNS-over-TLS (resolvers speak HTTP/2)
+h2 = "0.4"
+http = "1"
 
 [dev-dependencies]
 # a test DNS-over-TLS server's certificate
