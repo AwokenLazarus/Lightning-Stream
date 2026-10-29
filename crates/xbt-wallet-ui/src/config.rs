@@ -131,6 +131,7 @@ pub struct Config {
     pub hash: HashSetup,
     /// The AI endpoint: the files the AI page writes and reads, and the address it shows.
     pub ai: AiSetup,
+    pub vpn: VpnSetup,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,6 +198,17 @@ pub struct AiSetup {
     pub credentials: PathBuf,
     /// `XBT_UI_AI_STATE`: the endpoint's record of the sellers' health (read only here).
     pub state: PathBuf,
+}
+
+/// VPN exits: the buyer's devices and policies, and this box's own exit if its owner offers one.
+#[derive(Debug, Clone, Default)]
+pub struct VpnSetup {
+    /// `XBT_UI_VPN_DIR`: the files the VPN pages write (devices, exit settings) and the VPN service
+    /// writes (its WireGuard key, its status), shared with that service.
+    pub dir: PathBuf,
+    /// `XBT_UI_VPN_ENDPOINT`: where devices reach this box's WireGuard endpoint (`192.168.1.20:51830`),
+    /// put in each device's config. Unset: the box does not run the buyer's VPN, and the page says so.
+    pub endpoint: Option<String>,
 }
 
 /// Renting out this box's miners (the hasher service) and renting other people's (the renter).
@@ -297,6 +309,10 @@ impl Config {
             credentials: env("XBT_UI_CREDENTIALS").map(PathBuf::from).unwrap_or_else(|| run_dir("ai").join("credentials.json")),
             state: env("XBT_UI_AI_STATE").map(PathBuf::from).unwrap_or_else(|| run_dir("ai").join("state.json")),
         };
+        let vpn = VpnSetup {
+            dir: env("XBT_UI_VPN_DIR").map(PathBuf::from).unwrap_or_else(|| run_dir("vpn")),
+            endpoint: env("XBT_UI_VPN_ENDPOINT").filter(|e| !e.is_empty()),
+        };
         let hash_settings = env("XBT_UI_HASHER_SETTINGS").map(PathBuf::from).unwrap_or_else(|| run_dir("hashrate").join("settings.json"));
         let secure_cookie = match env("XBT_UI_SECURE_COOKIE").as_deref() {
             Some("1") | Some("true") => Some(true),
@@ -361,6 +377,7 @@ impl Config {
                 (!n.is_empty() && u.starts_with("http://")).then(|| (n.to_string(), u.to_string()))
             }).take(20).collect()).unwrap_or_default(),
             ai,
+            vpn,
             hash: HashSetup {
                 hasher: env("XBT_UI_HASHER").filter(|u| u.starts_with("http://")),
                 settings: hash_settings,
@@ -408,6 +425,7 @@ impl Config {
                restart_hint: RESTART_HINT.into(), local_services: vec![],
                ai: AiSetup { endpoint: None, sellers: PathBuf::from("/nonexistent/ai/sellers.json"), credentials: PathBuf::from("/nonexistent/ai/credentials.json"),
                              state: PathBuf::from("/nonexistent/ai/state.json") },
+               vpn: VpnSetup { dir: PathBuf::from("/nonexistent/vpn"), endpoint: None },
                hash: HashSetup { settings: PathBuf::from("/nonexistent/hashrate/settings.json"), datum_guide: DATUM_GUIDE.into(), ..Default::default() } }
     }
 }

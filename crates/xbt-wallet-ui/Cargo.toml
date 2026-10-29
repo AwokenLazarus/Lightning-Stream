@@ -32,6 +32,8 @@ xbt-nostr.workspace = true
 xbt402.workspace = true
 # the AI page: the credential store of AI keys and local links, and the endpoint's catalogue rules
 lightning-stream = { path = "../lightning-stream" }
+# VPN exits: devices' WireGuard keys, configs and QR codes, and the category blocklists' catalogue
+xbt-vpn = { path = "../xbt-vpn" }
 
 [dev-dependencies]
 tempfile = "3"

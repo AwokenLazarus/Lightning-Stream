@@ -33,6 +33,8 @@ mod relay_pages;
 pub(crate) mod hashrate;
 #[path = "inference_page.rs"]
 pub(crate) mod inference_page;
+#[path = "vpn_page.rs"]
+pub(crate) mod vpn_page;
 
 pub const COOKIE: &str = "xbtui";
 /// How long a signed form stays valid.
@@ -373,6 +375,8 @@ impl App {
             "/sell-hashrate" if self.cfg.sell => self.sell_hashrate_page(&ctx),
             "/hashrate" => self.hashrate_page(&ctx),
             "/ai" => self.ai_page(&ctx),
+            "/vpn" => self.vpn_page(&ctx),
+            "/sell-vpn" if self.cfg.sell => self.sell_vpn_page(&ctx),
             "/nostr" => self.nostr_page(&ctx, &req.query),
             "/relays" => self.relays_page(&ctx, &req.query),
             "/app" => self.app_page(&ctx, &req.query),
@@ -541,6 +545,8 @@ impl App {
             "/hashrate" => self.hashrate_post(ctx, f),
             "/ai" => self.ai_post(ctx, f),
             "/file-link" => self.file_link(ctx, f),
+            "/vpn" => self.vpn_post(ctx, f),
+            "/sell-vpn" if self.cfg.sell => self.sell_vpn_post(ctx, f),
             "/nostr-check" => self.nostr_check(ctx, f),
             "/relays-prefs" => self.relays_prefs(ctx, f),
             "/relays-publish" => self.relays_publish(ctx, f),

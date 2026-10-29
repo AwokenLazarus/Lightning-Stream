@@ -1,0 +1,348 @@
+//! The VPN pages: a buyer's devices that go out through other people's exits, and an owner's own
+//! exit, if they offer one.
+//!
+//! The pages write settings files the VPN service reads, in `XBT_UI_VPN_DIR`:
+//! - `devices.json`: each device's name, WireGuard public key, tunnel address, limit and policy.
+//!   A device's private key is made here, shown once in its config and QR code (in the answer to
+//!   the form, `Cache-Control: no-store`), and never kept.
+//! - `exit.json`: this box's exit, if offered: its kind, what it blocks, its protections, its price.
+//!
+//! And they read what the service writes: `endpoint.json` (the WireGuard key devices pair with),
+//! `status.json` (each device's exit, use, and why its traffic is blocked, if it is) and
+//! `exit-status.json` (bytes the exit carried; counts only).
+//!
+//! Buyers pay as they use it, by the GB: the words never say "ahead" or "balance".
+
+use std::collections::HashMap;
+use std::net::Ipv4Addr;
+use std::path::Path;
+
+use base64::Engine;
+use serde_json::{json, Value};
+
+use super::{App, Ctx};
+use crate::html::esc;
+use crate::server::Resp;
+
+fn read(path: &Path) -> Value {
+    std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null)
+}
+
+fn write(path: &Path, v: &Value) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let tmp = path.with_extension("json.part");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(v).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
+fn b64(k: &[u8; 32]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(k)
+}
+
+fn key32(s: &str) -> Option<[u8; 32]> {
+    base64::engine::general_purpose::STANDARD.decode(s.trim()).ok()?.try_into().ok()
+}
+
+/// The first free tunnel address, 10.66.0.2 to 10.66.0.250 (10.66.0.1 is the box).
+fn next_ip(devices: &[Value]) -> Option<Ipv4Addr> {
+    let used: Vec<&str> = devices.iter().filter_map(|d| d["tunnel_ip"].as_str()).collect();
+    (2..=250u8).map(|n| Ipv4Addr::new(10, 66, 0, n)).find(|ip| !used.contains(&ip.to_string().as_str()))
+}
+
+/// A device's policy in plain words.
+pub fn policy_words(p: &Value) -> String {
+    let mut w = vec![match p["kind"].as_str() {
+        Some("filtered") => "Filtered exits only".to_string(),
+        Some("any") => "Any exit".to_string(),
+        _ => "Private exits".to_string(),
+    }];
+    if let Some(c) = p["country"].as_str().filter(|c| !c.is_empty()) {
+        w.push(format!("in {}", c.to_ascii_uppercase()));
+    }
+    if p["two_hop"].as_bool() == Some(true) {
+        w.push("two hops".into());
+    }
+    if let Some(n) = p["max_sat_per_gb"].as_u64() {
+        w.push(format!("up to {n} sats a GB"));
+    }
+    if let Some(n) = p["min_mbit"].as_u64() {
+        w.push(format!("at least {n} Mbit/s"));
+    }
+    if p["no_logs"].as_bool() == Some(true) {
+        w.push("no logs".into());
+    }
+    w.push(match p["mode"].as_str() {
+        Some("sticky") => "one exit at a time".to_string(),
+        Some("spread") => "spread over exits".to_string(),
+        _ => "the best exit".to_string(),
+    });
+    w.join(" · ")
+}
+
+/// A policy from the form's fields. Unknown or empty fields leave that requirement out.
+fn policy_from(g: &dyn Fn(&str) -> String) -> Value {
+    let num = |k: &str| g(k).parse::<u64>().ok().filter(|n| *n > 0);
+    let country: String = g("country").chars().filter(char::is_ascii_alphabetic).take(2).collect::<String>().to_ascii_uppercase();
+    json!({
+        "kind": match g("kind").as_str() { "filtered" => "filtered", "any" => "any", _ => "private" },
+        "country": (country.len() == 2).then_some(country),
+        "two_hop": g("two_hop") == "on",
+        "max_sat_per_gb": num("max_sat_per_gb"),
+        "min_mbit": num("min_mbit"),
+        "no_logs": g("no_logs") == "on",
+        "mode": match g("mode").as_str() { "sticky" => "sticky", "spread" => "spread", _ => "best" },
+    })
+}
+
+fn policy_fields(p: &Value) -> String {
+    let sel = |k: &str, v: &str| if p[k].as_str() == Some(v) { " selected" } else { "" };
+    let chk = |k: &str| if p[k].as_bool() == Some(true) { " checked" } else { "" };
+    let num = |k: &str| p[k].as_u64().map(|n| n.to_string()).unwrap_or_default();
+    format!(
+        "<label>Kind of exit<select name=\"kind\"><option value=\"private\"{}>Private: the exit cannot see which sites (recommended)</option>\
+         <option value=\"filtered\"{}>Filtered: the exit blocks some sites, and sees site names</option><option value=\"any\"{}>Either</option></select></label>\
+         <label>Country (two letters, optional)<input name=\"country\" maxlength=\"2\" placeholder=\"DE\" value=\"{}\"></label>\
+         <label class=\"check\"><input type=\"checkbox\" name=\"two_hop\"{}> Two hops: the exit never learns this device's address (slower)</label>\
+         <details><summary>Advanced</summary>\
+         <label>Most it may cost (sats a GB, optional)<input name=\"max_sat_per_gb\" type=\"number\" min=\"1\" step=\"1\" value=\"{}\"></label>\
+         <label>Slowest exit it may use (Mbit/s, optional)<input name=\"min_mbit\" type=\"number\" min=\"1\" step=\"1\" value=\"{}\"></label>\
+         <label class=\"check\"><input type=\"checkbox\" name=\"no_logs\"{}> Only exits that say they keep no logs</label>\
+         <label>Which exit<select name=\"mode\"><option value=\"best\"{}>The best one, switching new connections when a better one appears</option>\
+         <option value=\"sticky\"{}>One exit until it fails (for sites that dislike a changing address)</option>\
+         <option value=\"spread\"{}>Spread over several exits, each site on one</option></select></label></details>",
+        sel("kind", "private"), sel("kind", "filtered"), sel("kind", "any"), esc(p["country"].as_str().unwrap_or("")), chk("two_hop"),
+        num("max_sat_per_gb"), num("min_mbit"), chk("no_logs"), sel("mode", "best"), sel("mode", "sticky"), sel("mode", "spread"),
+    )
+}
+
+impl App {
+    fn vpn_devices(&self) -> Vec<Value> {
+        read(&self.cfg.vpn.dir.join("devices.json"))["devices"].as_array().cloned().unwrap_or_default()
+    }
+
+    /// The WireGuard key devices pair with, as the VPN service wrote it.
+    fn vpn_endpoint_key(&self) -> Option<[u8; 32]> {
+        read(&self.cfg.vpn.dir.join("endpoint.json"))["public_key"].as_str().and_then(key32)
+    }
+
+    pub(crate) fn vpn_page(&self, ctx: &Ctx) -> Resp {
+        let body = self.vpn_html(ctx, None);
+        self.page("VPN", ctx, body)
+    }
+
+    fn vpn_html(&self, ctx: &Ctx, made: Option<(&str, &str)>) -> String {
+        let mut b = String::from("<p class=\"lead\">Send a phone's, a laptop's or your whole home's traffic out through someone else's connection, \
+            in the country you choose. Paid as you use it, by the GB, within your spending rules. If no exit meets a device's rules, its \
+            traffic stops: it never goes out your own connection by mistake.</p>");
+        let ready = self.cfg.vpn.endpoint.is_some() && self.vpn_endpoint_key().is_some();
+        if !ready {
+            b.push_str("<section class=\"card\"><h2>Not running yet</h2><p class=\"empty\">The VPN isn't running on this box yet, so devices \
+                can't be added.</p><details><summary>Technical details</summary><p>The VPN service writes its WireGuard key to \
+                <code>endpoint.json</code> in <code>XBT_UI_VPN_DIR</code>, and this page needs <code>XBT_UI_VPN_ENDPOINT</code>: the address \
+                devices reach this box on.</p></details></section>");
+        }
+        if let Some((name, config)) = made {
+            let qr = xbt_vpn::wg::qr_svg(config).unwrap_or_default();
+            b.push_str(&format!(
+                "<section class=\"card\"><h2>Added: {}</h2>\
+                 <p class=\"hint warn\">This is the only time this device's settings are shown: they hold its private key. Scan the code with the \
+                 WireGuard app, or copy the text into it, now. If they're lost, remove the device and add it again.</p>\
+                 <div class=\"qr\">{qr}</div>\
+                 <label>Settings<textarea id=\"vpn-config\" class=\"mono\" rows=\"10\" readonly>{}</textarea></label>\
+                 <div class=\"row\"><button type=\"button\" data-copy=\"vpn-config\">Copy</button></div></section>",
+                esc(name), esc(config)));
+        }
+        let status = read(&self.cfg.vpn.dir.join("status.json"));
+        let devices = self.vpn_devices();
+        let live: Vec<&Value> = devices.iter().filter(|d| d["revoked"].as_bool() != Some(true)).collect();
+        let rows: String = live.iter().map(|d| {
+            let id = d["id"].as_str().unwrap_or("");
+            let st = &status["devices"][id];
+            let state = match (st["why_blocked"].as_str(), st["exit"].as_str()) {
+                (Some(why), _) => format!("<span class=\"tag bad\">blocked</span> <span class=\"small\">{}</span>", esc(why)),
+                (None, Some(exit)) => format!("<span class=\"tag ok\">out through {}</span>", esc(exit)),
+                _ => "<span class=\"tag\">no traffic yet</span>".to_string(),
+            };
+            let used = st["used_msat"].as_u64().unwrap_or(0) / 1000;
+            let limit = d["limit_sats"].as_u64().map(|l| format!(" of {l}")).unwrap_or_default();
+            format!("<tr><td>{}<div class=\"small\">{}</div></td><td>{}</td><td>{used}{limit} sats</td><td>\
+                     <form method=\"post\" action=\"./vpn\" class=\"inline\">{}<input type=\"hidden\" name=\"do\" value=\"remove\">\
+                     <input type=\"hidden\" name=\"id\" value=\"{}\"><button class=\"danger\" type=\"submit\">Remove</button></form></td></tr>",
+                    esc(d["name"].as_str().unwrap_or("")), esc(&policy_words(&d["policy"])), state, App::csrf_input(ctx), esc(id))
+        }).collect();
+        let list = if live.is_empty() {
+            "<p class=\"empty\">No device yet.</p>".to_string()
+        } else {
+            format!("<div class=\"scroll\"><table><thead><tr><th>Device and its rules</th><th>Now</th><th>Used</th><th></th></tr></thead>\
+                     <tbody>{rows}</tbody></table></div><p class=\"small\">Removing a device stops its traffic at once.</p>")
+        };
+        b.push_str(&format!("<section class=\"card\"><h2>Devices</h2>{list}</section>"));
+        if ready {
+            b.push_str(&format!(
+                "<section class=\"card\"><h2>Add a device</h2><form method=\"post\" action=\"./vpn\" class=\"stack\">{}\
+                 <input type=\"hidden\" name=\"do\" value=\"add\">\
+                 <label>Name (for you)<input name=\"name\" maxlength=\"64\" placeholder=\"Phone\" required></label>\
+                 <label>Limit (sats in all, optional)<input name=\"limit_sats\" type=\"number\" min=\"1\" step=\"1\"></label>\
+                 {}<button type=\"submit\">Add the device</button></form>\
+                 <p class=\"small\">You'll get settings and a QR code for the WireGuard app. A router can use the same settings.</p></section>",
+                App::csrf_input(ctx), policy_fields(&json!({}))));
+        }
+        b
+    }
+
+    pub(crate) fn vpn_post(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {
+        let g = |k: &str| f.get(k).map(|v| v.trim().to_string()).unwrap_or_default();
+        let path = self.cfg.vpn.dir.join("devices.json");
+        let mut devices = self.vpn_devices();
+        let r: Result<String, String> = match g("do").as_str() {
+            "add" => {
+                let name: String = g("name").chars().take(64).collect();
+                let (Some(endpoint), Some(endpoint_key)) = (self.cfg.vpn.endpoint.clone(), self.vpn_endpoint_key()) else {
+                    self.flash(ctx, false, "The VPN isn't running on this box yet.");
+                    return Resp::redirect("./vpn");
+                };
+                if name.is_empty() {
+                    self.flash(ctx, false, "Name the device.");
+                    return Resp::redirect("./vpn");
+                }
+                let Some(ip) = next_ip(&devices) else {
+                    self.flash(ctx, false, "This box has as many devices as it takes. Remove one first.");
+                    return Resp::redirect("./vpn");
+                };
+                let (private, public) = xbt_vpn::wg::keypair();
+                let policy = policy_from(&g);
+                devices.push(json!({
+                    "id": hex::encode(&public[..8]), "name": name, "public_key": b64(&public), "tunnel_ip": ip.to_string(),
+                    "limit_sats": g("limit_sats").parse::<u64>().ok().filter(|n| *n > 0), "policy": policy,
+                    "added": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+                }));
+                match write(&path, &json!({ "devices": devices })) {
+                    Ok(()) => {
+                        let config = xbt_vpn::wg::device_config(private, ip, endpoint_key, &endpoint, "10.66.0.1");
+                        let body = self.vpn_html(ctx, Some((&name, &config)));
+                        return self.page("VPN", ctx, body).header("Cache-Control", "no-store");
+                    }
+                    Err(e) => Err(format!("The devices file cannot be written: {e}")),
+                }
+            }
+            "remove" => {
+                let id = g("id");
+                for d in devices.iter_mut().filter(|d| d["id"].as_str() == Some(id.as_str())) {
+                    d["revoked"] = json!(true);
+                }
+                write(&path, &json!({ "devices": devices })).map(|_| "Removed: that device's traffic stops now.".into())
+                    .map_err(|e| format!("The devices file cannot be written: {e}"))
+            }
+            _ => Err("Unknown action.".into()),
+        };
+        match r {
+            Ok(m) => self.flash(ctx, true, m),
+            Err(e) => self.flash(ctx, false, e),
+        }
+        Resp::redirect("./vpn")
+    }
+
+    pub(crate) fn sell_vpn_page(&self, ctx: &Ctx) -> Resp {
+        let e = read(&self.cfg.vpn.dir.join("exit.json"));
+        let st = read(&self.cfg.vpn.dir.join("exit-status.json"));
+        let on = e["offer"].as_bool() == Some(true);
+        let chk = |b: bool| if b { " checked" } else { "" };
+        let filtered = e["kind"].as_str() == Some("filtered");
+        let cats: Vec<&str> = e["categories"].as_array().into_iter().flatten().filter_map(|c| c.as_str()).collect();
+        let cat_boxes: String = xbt_vpn::lists::CATEGORIES.iter().map(|c| format!(
+            "<label class=\"check\"><input type=\"checkbox\" name=\"cat_{}\"{}> {}</label>", c.id, chk(cats.contains(&c.id)), esc(c.name))).collect();
+        let sources: String = xbt_vpn::lists::CATEGORIES.iter().map(|c| format!("<li>{}: {}, {}</li>", esc(c.name), esc(c.source), esc(c.licence))).collect();
+        let own = e["own_blocklist"].as_array().into_iter().flatten().filter_map(|d| d.as_str()).collect::<Vec<_>>().join("\n");
+        let carried = if on {
+            let gb = (st["up_bytes"].as_u64().unwrap_or(0) + st["down_bytes"].as_u64().unwrap_or(0)) as f64 / 1e9;
+            format!("<p>Carried for buyers so far: {gb:.2} GB. Earned: {} sats.</p>", st["earned_msat"].as_u64().unwrap_or(0) / 1000)
+        } else {
+            String::new()
+        };
+        let body = format!(
+            "<p class=\"lead\">Let people use your internet connection as their exit, and get paid as they use it, by the GB. You need no \
+             port forward: buyers reach this box through Stream's encrypted links.</p>\
+             <section class=\"card\"><h2>Before you offer an exit</h2><p class=\"hint warn\">Strangers' traffic will leave the internet from \
+             your connection. Your internet provider will see it as yours, and complaints about it (copyright or abuse) will come to you. \
+             Your provider's terms may not allow sharing your connection. Running the exit on a rented server instead of at home keeps your \
+             home address out of it.</p>{carried}</section>\
+             <section class=\"card\"><h2>Your exit</h2><form method=\"post\" action=\"./sell-vpn\" class=\"stack\">{}\
+             <label class=\"check\"><input type=\"checkbox\" name=\"offer\"{}> Offer my connection as an exit</label>\
+             <label class=\"check\"><input type=\"checkbox\" name=\"understood\"{}> I've read the warning above</label>\
+             <label>Price (sats a GB)<input name=\"sat_per_gb\" type=\"number\" min=\"1\" step=\"1\" value=\"{}\" required></label>\
+             <label>Kind<select name=\"kind\"><option value=\"private\"{}>Private: you can't see which sites buyers visit (most buyers want this)</option>\
+             <option value=\"filtered\"{}>Filtered: block the sites below; your exit sees site names</option></select></label>\
+             <fieldset><legend>Block, if filtered</legend>{cat_boxes}\
+             <label>Your own list (one site a line)<textarea name=\"own_blocklist\" rows=\"4\" placeholder=\"example.com\">{}</textarea></label>\
+             <details><summary>Where the lists come from</summary><ul>{sources}</ul><p class=\"small\">Lists update once a day. A site can still \
+             get through by some routes (an address, some encrypted lookups); buyers see what your exit blocks before they choose it.</p></details></fieldset>\
+             <details><summary>Advanced: protections</summary>\
+             <label>Each buyer's speed (Mbit/s, optional)<input name=\"buyer_mbit\" type=\"number\" min=\"1\" step=\"1\" value=\"{}\"></label>\
+             <label>Each buyer's connections at once<input name=\"max_connections\" type=\"number\" min=\"1\" step=\"1\" value=\"{}\"></label>\
+             <label>Ports never carried (email's 25 by default)<input name=\"blocked_ports\" value=\"{}\"></label>\
+             <p class=\"small\">Your exit never keeps a record of where buyers go, and never lets anyone reach your own network.</p></details>\
+             <button type=\"submit\">Save</button></form></section>",
+            App::csrf_input(ctx), chk(on), chk(on), e["sat_per_gb"].as_u64().unwrap_or(20), if filtered { "" } else { " selected" },
+            if filtered { " selected" } else { "" }, esc(&own), e["buyer_mbit"].as_u64().map(|n| n.to_string()).unwrap_or_default(),
+            e["max_connections"].as_u64().unwrap_or(512),
+            esc(&e["blocked_ports"].as_array().map(|p| p.iter().filter_map(|x| x.as_u64()).map(|x| x.to_string()).collect::<Vec<_>>().join(", ")).unwrap_or_else(|| "25".into())),
+        );
+        self.page("VPN exit", ctx, body)
+    }
+
+    pub(crate) fn sell_vpn_post(&self, ctx: &Ctx, f: &HashMap<String, String>) -> Resp {
+        let g = |k: &str| f.get(k).map(|v| v.trim().to_string()).unwrap_or_default();
+        let offer = g("offer") == "on";
+        if offer && g("understood") != "on" {
+            self.flash(ctx, false, "Tick that you've read the warning before offering an exit.");
+            return Resp::redirect("./sell-vpn");
+        }
+        let cats: Vec<&str> = xbt_vpn::lists::CATEGORIES.iter().filter(|c| g(&format!("cat_{}", c.id)) == "on").map(|c| c.id).collect();
+        let own: Vec<String> = g("own_blocklist").lines().map(str::trim).filter(|l| l.contains('.') && !l.contains(char::is_whitespace)).take(5000).map(str::to_ascii_lowercase).collect();
+        let ports: Vec<u16> = g("blocked_ports").split(|c: char| c == ',' || c.is_whitespace()).filter_map(|p| p.parse().ok()).collect();
+        let filtered = g("kind") == "filtered";
+        let v = json!({
+            "offer": offer,
+            "kind": if filtered { "filtered" } else { "private" },
+            "categories": if filtered { cats } else { Vec::new() },
+            "own_blocklist": if filtered { own } else { Vec::new() },
+            "sat_per_gb": g("sat_per_gb").parse::<u64>().ok().filter(|n| *n > 0).unwrap_or(20),
+            "buyer_mbit": g("buyer_mbit").parse::<u64>().ok().filter(|n| *n > 0),
+            "max_connections": g("max_connections").parse::<u64>().ok().filter(|n| *n > 0).unwrap_or(512),
+            "blocked_ports": ports,
+        });
+        match write(&self.cfg.vpn.dir.join("exit.json"), &v) {
+            Ok(()) => self.flash(ctx, true, if offer { "Saved: your exit is offered." } else { "Saved: your exit isn't offered." }),
+            Err(e) => self.flash(ctx, false, format!("The exit's settings cannot be written: {e}")),
+        }
+        Resp::redirect("./sell-vpn")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_policy_reads_in_plain_words() {
+        let p = policy_from(&|k| match k {
+            "kind" => "private".into(),
+            "country" => "de".into(),
+            "two_hop" => "on".into(),
+            "max_sat_per_gb" => "50".into(),
+            _ => String::new(),
+        });
+        assert_eq!(policy_words(&p), "Private exits · in DE · two hops · up to 50 sats a GB · the best exit");
+        assert_eq!(policy_words(&json!({})), "Private exits · the best exit");
+    }
+
+    #[test]
+    fn tunnel_addresses_are_never_reused() {
+        let d = vec![json!({"tunnel_ip": "10.66.0.2"}), json!({"tunnel_ip": "10.66.0.3"})];
+        assert_eq!(next_ip(&d), Some(Ipv4Addr::new(10, 66, 0, 4)));
+        let full: Vec<Value> = (2..=250).map(|n| json!({"tunnel_ip": format!("10.66.0.{n}")})).collect();
+        assert_eq!(next_ip(&full), None);
+    }
+}

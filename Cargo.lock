@@ -5898,6 +5898,7 @@ dependencies = [
  "xbt-primitives",
  "xbt-signer",
  "xbt-svc",
+ "xbt-vpn",
  "xbt-wallet-mcp",
  "xbt402",
 ]

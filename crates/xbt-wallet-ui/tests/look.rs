@@ -148,6 +148,19 @@ fn the_look_in_headless_chrome() {
         "ttft_ms": [400, 650, 900]}}}).to_string()).unwrap();
     cfg.ai = xbt_wallet_ui::config::AiSetup { endpoint: Some("http://umbrel.local:33540/v1".into()), sellers: ai.join("sellers.json"),
                                               credentials: ai.join("credentials.json"), state: ai.join("state.json") };
+    // the VPN pages: two devices (one blocked by its rules), the service's key, and an offered exit
+    let vpn = data.path().join("vpn");
+    std::fs::create_dir_all(&vpn).unwrap();
+    std::fs::write(vpn.join("endpoint.json"), json!({"public_key": "cU8fZeCxiIIT7N2LpTYAJpqWmKp+UCHj4ffiFYuDSEc="}).to_string()).unwrap();
+    std::fs::write(vpn.join("devices.json"), json!({"devices": [
+        {"id": "a1", "name": "Phone", "tunnel_ip": "10.66.0.2", "limit_sats": 5000, "policy": {"kind": "private", "country": "DE", "two_hop": true, "mode": "best"}},
+        {"id": "b2", "name": "Living-room TV", "tunnel_ip": "10.66.0.3", "policy": {"kind": "private", "country": "JP", "mode": "sticky"}}]}).to_string()).unwrap();
+    std::fs::write(vpn.join("status.json"), json!({"devices": {"a1": {"exit": "Berlin exit", "used_msat": 1_240_000},
+        "b2": {"why_blocked": "No exit is verified to be in JP."}}}).to_string()).unwrap();
+    std::fs::write(vpn.join("exit.json"), json!({"offer": true, "kind": "filtered", "categories": ["adult", "malware"],
+        "own_blocklist": ["example-gambling.test"], "sat_per_gb": 20, "max_connections": 512, "blocked_ports": [25]}).to_string()).unwrap();
+    std::fs::write(vpn.join("exit-status.json"), json!({"up_bytes": 1_200_000_000u64, "down_bytes": 9_800_000_000u64, "earned_msat": 220_000}).to_string()).unwrap();
+    cfg.vpn = xbt_wallet_ui::config::VpnSetup { dir: vpn, endpoint: Some("192.168.1.20:51830".into()) };
     let srv = xbt_wallet_ui::server::spawn(App::new(cfg).unwrap()).unwrap();
     let gdata = tempfile::tempdir().unwrap();
     let mut gcfg = Config::for_test(gdata.path().join("no-signer.sock"), gdata.path().join("ui"), "127.0.0.1:0");
@@ -166,7 +179,7 @@ fn the_look_in_headless_chrome() {
         ["browse-apps", apps.clone()], ["browse-files", "/browse?cat=files"],
         ["service-files", format!("/service?seller={}&name={}", enc("https://files.example"), enc("Open films and books"))], ["live", "/connections"], ["sellers", "/services"], ["sellers-shop-key", format!("/services#key-{}", xbt402::shop::display(&home_shop))],
         ["sell", "/sell"], ["sell-files", "/sell#service-form"], ["sell-reach", "/sell#shop-reach"], ["sell-capacity", "/sell#capacity"], ["wallet", "/wallet"],
-        ["setup", "/setup"], ["apps", "/apps"], ["agents", "/agents"], ["rules", "/policy"], ["relays", "/relays"], ["ai", "/ai"]]).to_string();
+        ["setup", "/setup"], ["apps", "/apps"], ["agents", "/agents"], ["rules", "/policy"], ["relays", "/relays"], ["ai", "/ai"], ["vpn", "/vpn"], ["sell-vpn", "/sell-vpn"]]).to_string();
     let secs = std::env::var("XBT_UI_LOOK_SECONDS").unwrap_or_else(|_| "30".into());
     let o = std::process::Command::new(node).env("CHROME", chrome)
         .args([concat!(env!("CARGO_MANIFEST_DIR"), "/tests/js/look_test.mjs"), &format!("http://{}", srv.addr), code.trim(),

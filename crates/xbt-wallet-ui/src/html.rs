@@ -117,10 +117,14 @@ impl Section {
 pub const SERVICES: Section = Section {
     label: "Services",
     tabs: &[Tab { href: "./browse", title: "Browse", label: "Browse" }, Tab { href: "./ai", title: "AI", label: "AI" },
-            Tab { href: "./services", title: "Sellers", label: "Sellers" }, Tab { href: "./connections", title: "Live connections", label: "Live connections" }],
+            Tab { href: "./vpn", title: "VPN", label: "VPN" }, Tab { href: "./services", title: "Sellers", label: "Sellers" }, Tab { href: "./connections", title: "Live connections", label: "Live connections" }],
     also: &["Service"],
 };
-pub const SELL: Section = Section { label: "Sell", tabs: &[Tab { href: "./sell", title: "Sell", label: "Sell" }], also: &[] };
+pub const SELL: Section = Section {
+    label: "Sell",
+    tabs: &[Tab { href: "./sell", title: "Sell", label: "Your services" }, Tab { href: "./sell-vpn", title: "VPN exit", label: "VPN exit" }],
+    also: &[],
+};
 pub const WALLET: Section = Section {
     label: "Wallet",
     tabs: &[Tab { href: "./wallet", title: "Wallet", label: "Balance and activity" }, Tab { href: "./approvals", title: "Approvals", label: "Approvals" }],
@@ -144,12 +148,13 @@ pub const SETTINGS: Section = Section {
 pub const SERVICES_HASH: Section = Section {
     label: "Services",
     tabs: &[Tab { href: "./browse", title: "Browse", label: "Browse" }, Tab { href: "./ai", title: "AI", label: "AI" },
-            Tab { href: "./hashrate", title: "Hashrate", label: "Hashrate" }, Tab { href: "./services", title: "Sellers", label: "Sellers" }, Tab { href: "./connections", title: "Live connections", label: "Live connections" }],
+            Tab { href: "./hashrate", title: "Hashrate", label: "Hashrate" }, Tab { href: "./vpn", title: "VPN", label: "VPN" }, Tab { href: "./services", title: "Sellers", label: "Sellers" }, Tab { href: "./connections", title: "Live connections", label: "Live connections" }],
     also: &["Service"],
 };
 pub const SELL_HASH: Section = Section {
     label: "Sell",
-    tabs: &[Tab { href: "./sell", title: "Sell", label: "Your services" }, Tab { href: "./sell-hashrate", title: "Sell hashrate", label: "Hashrate" }],
+    tabs: &[Tab { href: "./sell", title: "Sell", label: "Your services" }, Tab { href: "./sell-hashrate", title: "Sell hashrate", label: "Hashrate" },
+            Tab { href: "./sell-vpn", title: "VPN exit", label: "VPN exit" }],
     also: &[],
 };
 /// The app with Sell (`XBT_UI_SELL=1`): buying and selling.
