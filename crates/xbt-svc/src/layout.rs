@@ -41,6 +41,7 @@ pub const COMPONENTS: &[Component] = &[
     Component { name: crate::RELAY, user: "xbt-work-relay", uid: 10006 },
     Component { name: crate::GATEWAY, user: "xbt-gateway", uid: 10007 },
     Component { name: crate::HASHRATE, user: "xbt-hashrate", uid: 10010 },
+    Component { name: crate::STREAM_RELAY, user: "xbt-stream-relay", uid: STREAM_RELAY_UID },
 ];
 
 /// The group of the wallet's Lightning rail files (`run/ln/`): the signer is its only member, so the
@@ -74,7 +75,16 @@ pub const SHARED_DIRS: &[SharedDir] = &[
     SharedDir { dir: crate::RUN_HASHRATE, writer: crate::UI, reader: crate::HASHRATE, gid: HASHRATE_GID, mode: 0o750 },
     // public data only (receipt keys, signed transport documents): read by the signer's group
     SharedDir { dir: crate::RUN_SHOPS, writer: crate::UI, reader: crate::SIGNER, gid: SHOPS_GID, mode: 0o750 },
+    // the built-in Stream relay: the owner's settings in, its status out
+    SharedDir { dir: crate::RUN_RELAY, writer: crate::UI, reader: crate::STREAM_RELAY, gid: STREAM_RELAY_UID, mode: 0o750 },
+    SharedDir { dir: crate::RUN_RELAY_STATUS, writer: crate::STREAM_RELAY, reader: crate::UI, gid: RELAY_STATUS_GID, mode: 0o750 },
 ];
+
+/// The built-in Stream relay's user and group (10011 to 10013 are xbt-compute's, 10014 is the AI
+/// endpoint's group).
+pub const STREAM_RELAY_UID: u32 = 10016;
+/// A group only: the relay and the UI, for the relay's status file.
+pub const RELAY_STATUS_GID: u32 = 10017;
 
 /// The group `run/shops/` is read by: the signer's own, whose user the connector runs as and whose
 /// group the MCP is in.
@@ -466,7 +476,7 @@ mod tests {
     #[test]
     fn table_matches_container_md() {
         let t: Vec<_> = COMPONENTS.iter().map(|c| (c.name, c.uid)).collect();
-        assert_eq!(t, vec![("signer", 10001), ("witness", 10002), ("mcp", 10003), ("ui", 10005), ("relay", 10006), ("gateway", 10007), ("hashrate", 10010)]);
+        assert_eq!(t, vec![("signer", 10001), ("witness", 10002), ("mcp", 10003), ("ui", 10005), ("relay", 10006), ("gateway", 10007), ("hashrate", 10010), ("stream-relay", 10016)]);
     }
 
     #[test]

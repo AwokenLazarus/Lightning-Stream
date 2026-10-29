@@ -271,6 +271,9 @@ export function services(cfg: Config): ServiceSpec[] {
         XBT_UI_GW_HEALTH_URL: `http://${local(PORTS.gateway)}/x402/ticket/health`,
         XBT_UI_GW_PROXIES: cfg.proxies.join(','),
         XBT_UI_SUGGESTED_SELLERS: 'https://stream.lazarus-xbt.xyz',
+        // the built-in Stream relay needs the server's public port 443, which StartOS keeps for itself
+        XBT_UI_RELAY_UNAVAILABLE:
+          "StartOS keeps the server's port 443 for itself, and a relay needs it. Run one with the Linux package on a server with a public address (see the setup guide).",
         XBT_UI_NOSTR_RELAYS: relays,
         // hashrate: the hashmaker's and the hashtaker's control ports (the token is xbt-init's run/hashrate/control-token)
         XBT_UI_HASHER: `http://${local(PORTS.hashmakerControl)}`,

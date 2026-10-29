@@ -122,3 +122,14 @@ HEALTHCHECK NONE
 # `--build-arg IMAGE=<name>` without `--target` builds that one image (the ARG is at the top): for a
 # builder with no target option. scripts/oci_build.sh uses --target.
 FROM ${IMAGE} AS selected
+
+# The built-in Stream relay (docs/RUN-A-RELAY.md): off until the owner switches it on in the app, then
+# iroh-relay's server behind a pre-flight check. Unprivileged: the package maps the public port 443
+# to 8443 here.
+FROM base AS xbt-stream-relay
+ARG TARGETARCH
+ARG TARGETVARIANT
+COPY --chmod=0555 bin/${TARGETARCH}${TARGETVARIANT}/xbt-stream-relay /usr/bin/xbt-stream-relay
+USER xbt-stream-relay
+ENV XBT_RELAY_LISTEN=0.0.0.0:8443 XBT_RELAY_QUIC_LISTEN=0.0.0.0:7842 RUST_LOG=warn,[conn]=off NO_COLOR=1
+ENTRYPOINT ["/usr/bin/xbt-stream-relay"]

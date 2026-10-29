@@ -111,6 +111,8 @@ fn the_look_in_headless_chrome() {
          "items": [{"title": "Cosmos Laundromat", "year": 2015, "url": format!("{home_shop}/v/5"), "credit": "(c) Blender Foundation, CC BY 4.0"}]}
     ]).to_string()).unwrap();
     let mut cfg = Config::for_test(sock_path, data.path().join("ui"), "127.0.0.1:0");
+    // the Stream relays page probes the default relay: keep it on this machine
+    cfg.stream_relay = "https://127.0.0.1:9/".into();
     cfg.services_file = Some(services);
     // the one app: buying and selling
     cfg.sell = true;
@@ -135,7 +137,7 @@ fn the_look_in_headless_chrome() {
         ["service-media", format!("/service?seller={}&name={}", enc("https://media.example"), enc("Creative Commons films"))],
         ["player", play.clone()], ["live", "/connections"], ["sellers", "/services"], ["sellers-shop-key", format!("/services#key-{}", xbt402::shop::display(&home_shop))],
         ["sell", "/sell"], ["sell-reach", "/sell#shop-reach"], ["wallet", "/wallet"],
-        ["setup", "/setup"], ["apps", "/apps"], ["agents", "/agents"], ["rules", "/policy"]]).to_string();
+        ["setup", "/setup"], ["apps", "/apps"], ["agents", "/agents"], ["rules", "/policy"], ["relays", "/relays"]]).to_string();
     let secs = std::env::var("XBT_UI_LOOK_SECONDS").unwrap_or_else(|_| "30".into());
     let o = std::process::Command::new(node).env("CHROME", chrome)
         .args([concat!(env!("CARGO_MANIFEST_DIR"), "/tests/js/look_test.mjs"), &format!("http://{}", srv.addr), code.trim(),
