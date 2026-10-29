@@ -1861,26 +1861,53 @@ that plays for an hour, a WebSocket that stays open as long as the page does. Un
 wallet sent one paid request at a time in a session, so a film or a socket held up every other
 request to that seller until the read timeout. Now requests in one session run side by side.
 
-- **Order at the seller.** A request holds the session's link only to take its `seq`, send, and
-  read its head and receipt. The seller sees the seqs in order, as the protocol requires, and the
-  bodies are read beside one another.
-- **One balance.** Every answer counts what it draws, the head's charge and the body as it
-  arrives, into one count for the session. An answer finds a ticket due on what is left for it
-  after what the others drew since it started. Without that, two answers would each count on the
-  same credit, and both would wait for bytes the seller stops sending when the balance is gone.
+- **Order at the seller.** A request holds the session's link only to take its `seq`; it is sent
+  and its head read with nothing held, so a request slow to be answered (a long poll, a model slow
+  to its first word) holds up nothing. The seller takes seqs only in order, and the requests go out
+  on their own connections: one that arrives before a seq it follows is answered `bad_seq` and is
+  sent again once that one has arrived, or takes over a seq that no request holds any more (one
+  given up when its connection failed).
+- **Receipts out of order.** Receipts come back in another order than the seller signed them. The
+  seller's totals only grow, so a receipt with less than the wallet already holds is an older one:
+  its own figures are checked (its charge against its price), and its totals are passed over
+  rather than taken back.
+- **What the seller may have spent.** Every request may be charged from the moment it leaves until
+  its answer's last receipt is read, and at most its call's limit. A receipt's spend is taken only
+  inside the spend at the last quiet point (nothing open, nothing unclosed), plus what the wallet
+  counted since, plus what the requests still open may add. Where nothing is open, it is taken only
+  inside what the seller's own receipts charged the answers closed since. A seller that marks the
+  balance spent while a WebSocket of the page stays open is a seller fault: the socket may add at
+  most its own call's limit, and every answer at most its own.
+- **One balance.** Every answer counts what it draws into one count for the session: its head, its
+  body as it arrives, its seconds as they start, and an answer priced by the token the most it may
+  cost until it ends. An answer finds a ticket due on what is left for it after what the others
+  drew since it started. One that closes with a charge above the wallet's count (bytes the seller
+  sent of an answer the wallet stopped reading) adds the difference to the count, so the answers
+  beside it do not count on credit the seller has spent.
 - **One release for one need.** Two answers can find a ticket due at the same moment. Releases
   stay one at a time, and each asks again whether it is still due once it holds the session's
   release lock: the second finds the first's ticket covers it, and releases nothing.
-- **Checks.** Each answer's own charge is checked against its terms and its call's `max_sats` at
-  its end, as before. Where answers overlap, the seller's session totals in a receipt are checked
-  against the balance (spent never above credited), as they already were while one answer priced
-  as it goes was open, since the spend of one answer moves while another's receipt is read.
+- **An answer the seller has not closed.** No ticket is released into a session while an answer the
+  wallet stopped reading is unclosed, as before, but only for the answers that open after it was
+  left, and the wait is not inside the release lock: the answers already open beside it (a page's
+  WebSocket while the viewer leaves a video) go on paying within their own calls' limits. An answer
+  that arrived whole waits longer for its last receipt before it is counted unclosed.
 - **Why one session and not one per request.** A session per request would lock a ticket for each
   request in flight, spread the credit thin across them, and use up the per-seller caps on a page
   with a dozen pictures. One session lets one ticket's credit serve the whole page.
+- **A visit's limit.** In the app, each request of a seller's page holds a share of the visit's
+  limit while it runs (at most 1,000 sat, as a WebSocket does), and may buy within it, before its
+  head or as its body arrives; the shares running at once never add up to more than the limit. A
+  range is asked for in parts of at most 4 MiB, so that a film segment is never cut for want of a
+  ticket mid-body.
 
-Tests: `requests_side_by_side_in_one_session_are_each_charged_exactly`,
-`a_websocket_open_does_not_hold_up_other_requests_to_the_seller` (it fails on the old code: the
-pages waited the socket's 3 s), `films_side_by_side_share_one_balance_and_each_pays_its_own_bytes`,
+Tests (crates/xbt-signer/tests/ticket_pay.rs): `requests_side_by_side_in_one_session_are_each_charged_exactly`,
+`a_websocket_open_does_not_hold_up_other_requests_to_the_seller`,
+`films_side_by_side_share_one_balance_and_each_pays_its_own_bytes`,
 `side_by_side_each_answer_stops_at_its_own_limit`, `a_stop_ends_every_answer_open_in_the_session`,
-`many_rounds_side_by_side_keep_the_counts_exact` (crates/xbt-signer/tests/ticket_pay.rs).
+`many_rounds_side_by_side_keep_the_counts_exact`, `a_request_slow_to_answer_does_not_hold_up_the_others`,
+`an_older_receipt_read_after_a_newer_one_is_passed_over`,
+`a_seller_that_drains_the_balance_while_a_websocket_is_open_is_caught`,
+`a_websocket_open_before_a_video_is_left_keeps_paying`; the unit tests of `Money::take` in
+crates/xbt-signer/src/ticket_pay.rs; and `a_range_goes_in_parts_each_within_a_share_of_the_limit`
+(crates/lightning-stream/tests/visits.rs).

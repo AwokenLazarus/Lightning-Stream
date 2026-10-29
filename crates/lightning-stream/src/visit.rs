@@ -6,13 +6,15 @@
 //! `POST /visits/<id>/stop`: end it; its next request is refused.
 //! `<any method> /v/<id>/<path>`: one request of the page, sent to `base` + `path` and paid.
 //!
-//! **The limit, exactly.** A page asks for many things at once. One request of a visit at a time
-//! holds the turn to buy: it may spend what is left of the limit. Every other one may use only the
-//! credit the seller already holds for the session: it is sent `credit_only`, so the signer buys no
-//! ticket for it, with what is left of the limit as the most its answer may charge (the seller is
-//! told that figure and stops the answer there). One that needs a ticket before it starts waits for
-//! the turn and is sent again. Tickets are bought only within the limit; answers running at once on
-//! credit already bought each stop at what was left when they started.
+//! **The limit, exactly.** A page asks for many things at once. Each request of a visit holds a share
+//! of what is left of the limit while it runs (at most [`ANSWER_SHARE`], a WebSocket
+//! [`SOCKET_SHARE`]), and is sent with its share as the most its answer may charge: the seller is
+//! told that figure and stops the answer there, and the signer buys tickets for it within it,
+//! before its head or as its body arrives. The shares held at once never add up to more than the
+//! limit, so answers running side by side cannot together spend past it; when one ends, only what
+//! it cost stays spent. A request that finds no share free waits for one. A range is asked for in
+//! parts of at most [`RANGE_CHUNK`], as a player asks for its next part, so that no answer needs
+//! more than its share.
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read};
@@ -37,6 +39,23 @@ const TURN_WAIT: Duration = Duration::from_secs(120);
 /// ends, then only what it cost. A live connection does not hold the turn to buy, which the page's
 /// other requests need.
 const SOCKET_SHARE: i64 = 1_000;
+/// The most of a visit's limit one request holds while it runs: enough for a ticket to be bought for
+/// it, and for a part of a range ([`RANGE_CHUNK`]) at the prices sellers ask.
+const ANSWER_SHARE: i64 = 1_000;
+/// The longest part of a range a request asks for: `bytes=N-` and longer ranges become
+/// `bytes=N-(N+RANGE_CHUNK-1)`, and the page's player asks for the next part as it plays.
+const RANGE_CHUNK: u64 = 4 << 20;
+
+/// A `Range` with its length bounded to `chunk`: `bytes=N-` and `bytes=N-M` longer than `chunk`
+/// become `bytes=N-(N+chunk-1)`. One that is not a single range from a start is kept as it is.
+fn bounded_range(r: &str, chunk: u64) -> String {
+    let parts = r.strip_prefix("bytes=").and_then(|s| s.split_once('-'))
+        .and_then(|(a, b)| Some((a.parse::<u64>().ok()?, if b.is_empty() { None } else { Some(b.parse::<u64>().ok()?) })));
+    match parts {
+        Some((a, b)) if b.is_none_or(|b| b >= a && b - a >= chunk) => format!("bytes={a}-{}", a.saturating_add(chunk - 1)),
+        _ => r.to_string(),
+    }
+}
 
 /// The WebSocket's own request headers, passed to the seller beside [`PASSED`].
 const SOCKET_HEADERS: [&str; 4] = ["sec-websocket-key", "sec-websocket-version", "sec-websocket-protocol", "sec-websocket-extensions"];
@@ -48,9 +67,11 @@ const PASSED: [&str; 13] = ["accept", "accept-language", "content-type", "if-mod
 
 #[derive(Default)]
 struct State {
+    /// What the visit has spent, the shares of the requests running now in it whole.
     spent: i64,
+    /// The shares of the requests running now: part of `spent` until each ends.
+    held: i64,
     ended: Option<String>,
-    buying: bool,
     calls: u64,
     last: Option<Instant>,
 }
@@ -72,28 +93,25 @@ impl Visit {
         json!({"base": self.base, "limit_sats": self.limit, "spent_sats": s.spent, "ended": s.ended, "calls": s.calls})
     }
 
-    /// Wait for the turn to buy. `Err`: the visit ended, or the wait was too long.
-    /// What is left of the limit now, in sats.
-    fn left(&self) -> i64 {
-        let s = self.lock();
-        self.limit - s.spent
-    }
-
-    fn take_turn(&self) -> Result<i64, String> {
+    /// Hold up to `most` of what is left of the limit for one request, waiting for a running one to
+    /// give its share back where none is free. `Err`: the visit has ended, its limit is spent (with
+    /// nothing running that could give some back), or the wait was too long.
+    fn reserve(&self, most: i64) -> Result<i64, String> {
         let mut s = self.lock();
         let until = Instant::now() + TURN_WAIT;
         loop {
             if let Some(e) = &s.ended {
                 return Err(e.clone());
             }
-            if !s.buying {
-                let left = self.limit - s.spent;
-                if left < 1 {
-                    s.ended = Some("This visit's spending limit is reached.".into());
-                    return Err(s.ended.clone().unwrap_or_default());
-                }
-                s.buying = true;
-                return Ok(left);
+            let share = (self.limit - s.spent).min(most);
+            if share >= 1 {
+                s.spent += share;
+                s.held += share;
+                return Ok(share);
+            }
+            if s.held == 0 {
+                s.ended = Some("This visit's spending limit is reached.".into());
+                return Err(s.ended.clone().unwrap_or_default());
             }
             let now = Instant::now();
             if now >= until {
@@ -103,36 +121,40 @@ impl Visit {
         }
     }
 
-    /// Hold up to [`SOCKET_SHARE`] of what is left for a WebSocket. `Err`: the visit has ended, or
-    /// nothing is left.
-    fn reserve(&self) -> Result<i64, String> {
+    /// Hold up to `most` of what is left once no other request holds a share: what a request whose
+    /// share was too small for a ticket waits for, the most it can then have. `Err` as for
+    /// [`Visit::reserve`].
+    fn reserve_alone(&self, most: i64) -> Result<i64, String> {
         let mut s = self.lock();
-        if let Some(e) = &s.ended {
-            return Err(e.clone());
+        let until = Instant::now() + TURN_WAIT;
+        while s.held > 0 && s.ended.is_none() {
+            let now = Instant::now();
+            if now >= until {
+                return Err("The page asked for too much at once: try again.".into());
+            }
+            s = self.turn.wait_timeout(s, until - now).unwrap_or_else(|p| p.into_inner()).0;
         }
-        let share = (self.limit - s.spent).min(SOCKET_SHARE);
-        if share < 1 {
-            s.ended = Some("This visit's spending limit is reached.".into());
-            return Err(s.ended.clone().unwrap_or_default());
-        }
-        s.spent += share;
-        Ok(share)
+        drop(s);
+        self.reserve(most)
     }
 
-    /// A WebSocket that held `share` has ended, having cost `charged`.
+    /// A request that held `share` was refused because a ticket did not fit in it: where nothing
+    /// else is running and no more than that share is left, nothing more can be bought in this
+    /// visit, and it ends. `true`: ended.
+    fn spent_out(&self, share: i64) -> bool {
+        let mut s = self.lock();
+        if s.held == 0 && self.limit - s.spent <= share {
+            s.ended.get_or_insert_with(|| "This visit's spending limit is reached.".into());
+            return true;
+        }
+        false
+    }
+
+    /// A request that held `share` has ended, having cost `charged`: only that stays spent.
     fn release(&self, share: i64, charged: i64) {
         let mut s = self.lock();
         s.spent = s.spent - share + charged.clamp(0, share);
-        drop(s);
-        self.turn.notify_all();
-    }
-
-    fn settle(&self, charged: i64, had_turn: bool) {
-        let mut s = self.lock();
-        s.spent = s.spent.saturating_add(charged.max(0));
-        if had_turn {
-            s.buying = false;
-        }
+        s.held -= share;
         drop(s);
         self.turn.notify_all();
     }
@@ -228,15 +250,15 @@ impl Connector {
         let url = format!("{}{path}", visit.base);
         let headers: Vec<Value> = req.headers.iter().filter(|(k, _)| PASSED.contains(&k.to_ascii_lowercase().as_str()))
             .take(24).map(|(k, v)| json!([k, v])).collect();
-        let range = req.header("Range").map(str::trim).filter(|r| one_range(r)).map(str::to_string);
+        // a range in parts, each paid for within one share
+        let range = req.header("Range").map(str::trim).filter(|r| one_range(r)).map(|r| bounded_range(r, RANGE_CHUNK));
         let method = req.method.to_ascii_uppercase();
         let body = if req.body.is_empty() { None } else {
             use base64::Engine as _;
             Some(base64::engine::general_purpose::STANDARD.encode(&req.body))
         };
-        let call = |max_sats: i64, credit_only: bool| -> Result<Started, Value> {
-            let mut params = json!({"url": url, "method": method, "max_sats": max_sats, "task": self.cfg.task, "headers": headers, "head_headers": true,
-                                    "credit_only": credit_only});
+        let call = |max_sats: i64| -> Result<Started, Value> {
+            let mut params = json!({"url": url, "method": method, "max_sats": max_sats, "task": self.cfg.task, "headers": headers, "head_headers": true});
             if let Some(b) = &body {
                 params["body_b64"] = b.clone().into();
             }
@@ -248,26 +270,28 @@ impl Connector {
             }
             self.start(params)
         };
-        // the session's credit only: no ticket is bought, and the answer may charge at most what is left
-        let left_now = visit.left();
-        if left_now < 1 {
-            visit.lock().ended.get_or_insert_with(|| "This visit's spending limit is reached.".into());
-            return Reply::Whole(json_response(402, &json!({"error": "This visit's spending limit is reached.", "rule": "visit"})));
-        }
-        let (started, turn) = match call(left_now, true) {
-            Ok(s) => (s, false),
+        // a share of what is left: the most this answer may charge, tickets bought for it included
+        let share = match visit.reserve(ANSWER_SHARE) {
+            Ok(n) => n,
+            Err(e) => return Reply::Whole(json_response(402, &json!({"error": e, "rule": "visit"}))),
+        };
+        let (started, share) = match call(share) {
+            Ok(s) => (s, share),
             Err(v) if v.get("rule").and_then(Value::as_str) == Some("max_sats") => {
-                let left = match visit.take_turn() {
-                    Ok(l) => l,
+                // a ticket did not fit in the share: asked again with all that is left once the others have ended
+                visit.release(share, v.get("charged_sats").and_then(Value::as_i64).unwrap_or(0));
+                if visit.spent_out(share) {
+                    return Reply::Whole(json_response(402, &json!({"error": "This visit's spending limit is reached.", "rule": "visit"})));
+                }
+                let share = match visit.reserve_alone(ANSWER_SHARE) {
+                    Ok(n) => n,
                     Err(e) => return Reply::Whole(json_response(402, &json!({"error": e, "rule": "visit"}))),
                 };
-                match call(left, false) {
-                    Ok(s) => (s, true),
+                match call(share) {
+                    Ok(s) => (s, share),
                     Err(v) => {
-                        let charged = v.get("charged_sats").and_then(Value::as_i64).unwrap_or(0);
-                        visit.settle(charged, true);
-                        if v.get("rule").and_then(Value::as_str) == Some("max_sats") {
-                            visit.lock().ended.get_or_insert_with(|| "This visit's spending limit is reached.".into());
+                        visit.release(share, v.get("charged_sats").and_then(Value::as_i64).unwrap_or(0));
+                        if v.get("rule").and_then(Value::as_str) == Some("max_sats") && visit.spent_out(share) {
                             return Reply::Whole(json_response(402, &json!({"error": "This visit's spending limit is reached.", "rule": "visit"})));
                         }
                         return Reply::Whole(refusal(&v));
@@ -275,7 +299,7 @@ impl Connector {
                 }
             }
             Err(v) => {
-                visit.settle(v.get("charged_sats").and_then(Value::as_i64).unwrap_or(0), false);
+                visit.release(share, v.get("charged_sats").and_then(Value::as_i64).unwrap_or(0));
                 return Reply::Whole(refusal(&v));
             }
         };
@@ -296,7 +320,7 @@ impl Connector {
             }
         }
         let length = head.get("content_length").and_then(Value::as_u64);
-        let mut settle = Settle { visit, turn, src: Some(src), done: Some(done) };
+        let mut settle = Settle { visit, share, src: Some(src), done: Some(done) };
         Reply::Stream(Streamed {
             status,
             headers: out_headers,
@@ -327,7 +351,7 @@ impl Connector {
             s.calls += 1;
             s.last = Some(Instant::now());
         }
-        let share = match visit.reserve() {
+        let share = match visit.reserve(SOCKET_SHARE) {
             Ok(n) => n,
             Err(e) => return Reply::Whole(json_response(402, &json!({"error": e, "rule": "visit"}))),
         };
@@ -430,10 +454,10 @@ struct Started {
 }
 
 /// When an answer has been handed on (or its reader has gone): the stream is closed, so the signer
-/// stops paying, then what the signer charged is counted against the visit, and the turn given up.
+/// stops paying, then what the signer charged stays spent and the rest of the share goes back.
 struct Settle {
     visit: Arc<Visit>,
-    turn: bool,
+    share: i64,
     src: Option<UnixStream>,
     done: Option<mpsc::Receiver<Result<Value, String>>>,
 }
@@ -441,9 +465,10 @@ struct Settle {
 impl Drop for Settle {
     fn drop(&mut self) {
         drop(self.src.take());
+        // the signer's count of what left the wallet for this answer; nothing known is the whole share, kept spent
         let charged = self.done.take().and_then(|d| d.recv_timeout(Duration::from_secs(60)).ok()).and_then(Result::ok)
-            .and_then(|v| v.get("charged_sats").and_then(Value::as_i64)).unwrap_or(0);
-        self.visit.settle(charged, self.turn);
+            .and_then(|v| v.get("charged_sats").and_then(Value::as_i64)).unwrap_or(self.share);
+        self.visit.release(self.share, charged);
     }
 }
 

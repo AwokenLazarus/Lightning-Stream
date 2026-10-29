@@ -4851,3 +4851,224 @@ fn many_rounds_side_by_side_keep_the_counts_exact() {
     assert_eq!((paid, took), (settled, settled));
     r.assert_booked();
 }
+
+/// A request slow to be answered (a long poll, a model slow to its first word) holds up nothing else
+/// of its session: the requests sent after it go out, are answered and paid meanwhile.
+#[test]
+fn a_request_slow_to_answer_does_not_hold_up_the_others() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    let first = r.pay("/page/10", CALL);
+    let sid = first["session"].as_str().unwrap().to_string();
+    r.tap.set(Box::new(|seen, real| {
+        if seen.paid && seen.path == "/page/77" {
+            let a = real();
+            std::thread::sleep(Duration::from_secs(3));
+            return Some(a);
+        }
+        None
+    }));
+    std::thread::scope(|sc| {
+        let slow = sc.spawn(|| r.pay("/page/77", CALL));
+        wait_for("the slow request to be sent", || r.tap.seen("/page/77").iter().any(|s| s.paid));
+        let t = Instant::now();
+        for i in 0..4 {
+            let v = r.pay(&format!("/page/{}", 20 + i), CALL);
+            assert_eq!((v["status"].as_u64(), v["session"].as_str(), v.get("seller_fault")), (Some(200), Some(sid.as_str()), None), "{v}");
+        }
+        assert!(t.elapsed() < Duration::from_millis(2000), "the pages went beside the slow one: {:?}", t.elapsed());
+        let v = slow.join().unwrap();
+        assert_eq!((v["status"].as_u64(), v.get("seller_fault")), (Some(200), None), "{v}");
+    });
+    r.tap.clear();
+    let (spent, _) = seller_totals(&r, &sid);
+    assert_eq!(spent, 2500 * 6);
+    r.assert_booked();
+}
+
+/// Receipts are read in another order than the seller signed them: the status that closes a film is
+/// slow to come back, and pages sent meanwhile are charged and their newer totals taken first. The
+/// film's older totals are passed over, not taken back: no honest seller is blamed for the pages'
+/// charges, and the counts stay exact.
+#[test]
+fn an_older_receipt_read_after_a_newer_one_is_passed_over() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    let first = r.pay("/page/10", CALL);
+    let sid = first["session"].as_str().unwrap().to_string();
+    let mut want = 2500u64;
+    for round in 0..5 {
+        let statuses = r.tap.seen("/x402/ticket/status").len();
+        r.tap.set(Box::new(|seen, real| {
+            if seen.path == "/x402/ticket/status" {
+                let a = real();
+                std::thread::sleep(Duration::from_millis(600));
+                return Some(a);
+            }
+            None
+        }));
+        std::thread::scope(|sc| {
+            let film = sc.spawn(|| r.pay(&format!("/hd20/{}", 2 * MIB), CALL));
+            wait_for("the film's closing status to be asked", || r.tap.seen("/x402/ticket/status").len() > statuses);
+            // pages sent while that status is on its way: their newer totals come back before its older ones
+            let pages: Vec<_> = (0..4).map(|i| { let r = &r; sc.spawn(move || r.pay(&format!("/page/{}", 30 + i), CALL)) }).collect();
+            for p in pages {
+                let v = p.join().unwrap();
+                assert_eq!((v["status"].as_u64(), v.get("seller_fault")), (Some(200), None), "round {round}: {v}");
+            }
+            let f = film.join().unwrap();
+            assert_eq!((f["complete"].as_bool(), f.get("seller_fault")), (Some(true), None), "round {round}: {f}");
+        });
+        r.tap.clear();
+        // alone again: a page whose head the wallet checks against the totals it holds
+        let v = r.pay("/page/40", CALL);
+        assert_eq!((v["status"].as_u64(), v.get("seller_fault")), (Some(200), None), "round {round}: {v}");
+        want += 2500 * 5 + 40_000;
+        let (spent, _) = seller_totals(&r, &sid);
+        assert_eq!(spent, want, "round {round}");
+    }
+    r.assert_booked();
+}
+
+/// A seller that marks the whole balance spent while a WebSocket of the page is open (its spend
+/// moves between receipts, so a receipt's totals cannot be held to one request's price) is caught:
+/// the open requests may add at most their own calls' limits, and a balance drained past them is a
+/// seller fault. The session stops, and nothing more is released into it.
+#[test]
+fn a_seller_that_drains_the_balance_while_a_websocket_is_open_is_caught() {
+    use std::io::{BufRead as _, Write as _};
+    use std::os::unix::net::UnixListener;
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = Rig::new(json!({}));
+    let first = r.pay("/page/10", CALL);
+    assert_eq!(first["status"], 200, "{first}");
+    let l = UnixListener::bind(dir.path().join("sock")).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let caller = std::thread::spawn(move || {
+        let (s, _) = l.accept().unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        let mut rd = std::io::BufReader::new(s.try_clone().unwrap());
+        let mut line = String::new();
+        rd.read_line(&mut line).unwrap();
+        let mut w = s;
+        tx.send(()).unwrap();
+        let _ = done_rx.recv_timeout(Duration::from_secs(20));
+        let _ = w.write_all(b"bye");
+        let _ = w.shutdown(std::net::Shutdown::Both);
+    });
+    std::thread::scope(|sc| {
+        // a socket whose own call may add at most 40 sat
+        let ws = sc.spawn(|| r.call("xbt402_pay", json!({"url": r.shop.url("/ws/page"), "max_sats": 40, "task": "film", "stream_to": "sock", "stream_head": true,
+                                                       "upgrade": true, "headers": [["Sec-WebSocket-Key", "k"], ["Sec-WebSocket-Version", "13"]]})));
+        rx.recv_timeout(Duration::from_secs(10)).expect("the socket opened");
+        // the seller marks every msat it was credited spent on a page's receipt
+        r.tap.set(Box::new(|seen, real| {
+            if !(seen.paid && seen.path.starts_with("/page/")) {
+                return None;
+            }
+            let (status, mut headers, body) = match real() {
+                Ok(a) => whole(a),
+                Err(e) => return Some(Err(e)),
+            };
+            resign(&mut headers, &|r| r["spentMsat"] = r["releasedMsat"].clone());
+            Some(Ok(answer(status, headers, body)))
+        }));
+        let v = r.pay("/page/31", CALL);
+        r.tap.clear();
+        assert_eq!(v["rule"], "ticket_seller_fault", "the drained balance is a seller fault: {v}");
+        assert!(v["reason"].as_str().unwrap_or_default().contains("spentMsat"), "{v}");
+        done_tx.send(()).unwrap();
+        let _ = ws.join().unwrap();
+    });
+    caller.join().unwrap();
+    let secrets = r.tap.secrets().len();
+    let next = r.pay("/page/11", CALL);
+    assert_ne!(next["session"], first["session"], "the next call opens another session: {next}");
+    assert_eq!(r.tap.secrets().len(), secrets + 1, "only the new session's first ticket went out");
+    std::env::remove_var("B2_STREAM_DIR");
+}
+
+/// The page leaves a video while its WebSocket stays open, and the seller is slow to close the
+/// video's answer. The socket was open before the video was left, and goes on paying for what passes
+/// through it: only the requests that open after the left answer wait for the seller to close it.
+#[test]
+fn a_websocket_open_before_a_video_is_left_keeps_paying() {
+    use std::io::{BufRead as _, Read as _, Write as _};
+    use std::os::unix::net::UnixListener;
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = Rig::new(json!({}));
+    let first = r.pay("/page/10", CALL);
+    let sid = first["session"].as_str().unwrap().to_string();
+    let hide = Arc::new(AtomicBool::new(false));
+    let h = hide.clone();
+    // while `hide` is set, the seller's status lists no closed answer: the left video stays unclosed
+    r.tap.set(Box::new(move |seen, real| {
+        if !(seen.path == "/x402/ticket/status" && h.load(Ordering::SeqCst)) {
+            return None;
+        }
+        let (status, headers, body) = match real() {
+            Ok(a) => whole(a),
+            Err(e) => return Some(Err(e)),
+        };
+        let mut v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        if let Some(o) = v.as_object_mut() {
+            o.remove("responses");
+        }
+        Some(Ok(answer(status, headers, serde_json::to_vec(&v).unwrap())))
+    }));
+    let l = UnixListener::bind(dir.path().join("sock")).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    // 768 KiB each way through the socket at 1 sat a KiB: more than the ticket the first page bought, well within the call's limit
+    const KIB: usize = 768;
+    let caller = std::thread::spawn(move || {
+        let (s, _) = l.accept().unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        let mut rd = std::io::BufReader::new(s.try_clone().unwrap());
+        let mut line = String::new();
+        rd.read_line(&mut line).unwrap();
+        let mut w = s;
+        tx.send(()).unwrap();
+        go_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        let mut ok = 0;
+        for _ in 0..KIB / 64 {
+            let out = vec![9u8; 64 << 10];
+            if w.write_all(&out).is_err() {
+                break;
+            }
+            let mut back = vec![0u8; 64 << 10];
+            if rd.read_exact(&mut back).is_err() {
+                break;
+            }
+            ok += 1;
+        }
+        let _ = w.shutdown(std::net::Shutdown::Both);
+        ok
+    });
+    std::thread::scope(|sc| {
+        let ws = sc.spawn(|| r.call("xbt402_pay", json!({"url": r.shop.url("/ws/page"), "max_sats": CALL, "task": "film", "stream_to": "sock", "stream_head": true,
+                                                       "upgrade": true, "headers": [["Sec-WebSocket-Key", "k"], ["Sec-WebSocket-Version", "13"]]})));
+        rx.recv_timeout(Duration::from_secs(10)).expect("the socket opened");
+        // the video, left after 150 KiB (its call's limit), and not closed by the seller while `hide` holds
+        hide.store(true, Ordering::SeqCst);
+        let video = r.pay(&format!("/slow/{}", 20 * MIB), 30);
+        assert_eq!(video["complete"], false, "{video}");
+        wait_for("the left video to be unclosed", || r.session(&sid)["paying"].as_array().unwrap().iter().any(|p| p["answer_unclosed"] == true));
+        // the socket now needs a ticket while the left video is unclosed
+        go_tx.send(()).unwrap();
+        let w = ws.join().unwrap();
+        hide.store(false, Ordering::SeqCst);
+        assert_eq!((w["status"].as_u64(), w.get("seller_fault")), (Some(101), None), "{w}");
+        assert!(w["tickets_released"].as_u64().unwrap_or(0) >= 1, "the socket bought its next ticket: {w}");
+    });
+    let ok = caller.join().unwrap();
+    assert_eq!(ok, KIB / 64, "every piece went through the socket and came back");
+    r.tap.clear();
+    r.assert_booked();
+    std::env::remove_var("B2_STREAM_DIR");
+}

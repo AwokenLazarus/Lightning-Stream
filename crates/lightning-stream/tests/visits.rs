@@ -127,11 +127,10 @@ fn a_visit_spends_at_most_its_limit_however_many_requests_run_at_once() {
     let v: Value = serde_json::from_slice(&b).unwrap();
     assert_eq!((v["spent_sats"].as_i64(), v["limit_sats"].as_i64()), (Some(charged), Some(1_500)), "{v}");
     assert!(v["ended"].as_str().unwrap().contains("limit"), "{v}");
-    // only one call at a time could buy: every other one went credit_only, each with what was left as its cap
+    // each call held a share of the limit as its cap, and the shares running at once never added up to more than it
     let calls = session.lock().unwrap().calls.clone();
-    assert!(calls.iter().all(|c| c["max_sats"].as_i64().unwrap() <= 1_500), "{calls:?}");
-    assert!(calls.iter().any(|c| c["credit_only"] == true) && calls.iter().any(|c| c["credit_only"] == false), "{calls:?}");
-    assert!(calls.iter().filter(|c| c["credit_only"] == true).all(|c| c["max_sats"].as_i64().unwrap() > 1), "a credit-only call's cap is what was left, not 1 sat: {calls:?}");
+    assert!(calls.iter().all(|c| (1..=1_000).contains(&c["max_sats"].as_i64().unwrap())), "{calls:?}");
+    assert!(calls.iter().all(|c| c.get("credit_only").is_none()), "{calls:?}");
 }
 
 #[test]
@@ -182,4 +181,34 @@ fn a_stopped_or_unknown_visit_pays_nothing_more() {
     for body in [json!({"base": "https://seller.example/app", "limit_sats": 10}), json!({"base": "ftp://x/", "limit_sats": 10}), json!({"base": "https://s/", "limit_sats": 0})] {
         assert_eq!(ask(&addr, "POST", "/visits", "", body.to_string().as_bytes()).0, 400, "{body}");
     }
+}
+
+/// A player's open range is asked for in parts of 4 MiB, each request holding a share of the
+/// visit's limit as its cap: the shares of the requests running at once never add up to more than
+/// the limit, and each part may be paid within its own share, before its head or as it arrives.
+#[test]
+fn a_range_goes_in_parts_each_within_a_share_of_the_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sock, session) = signer(dir.path());
+    let addr = start(sock, dir.path());
+    let visit = open(&addr, 2_500);
+    let results: Vec<u16> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..6).map(|i| { let (addr, visit) = (addr.clone(), visit.clone()); s.spawn(move || {
+            ask(&addr, "GET", &format!("/v/{visit}/video/{i}.mp4"), &format!("Range: bytes={}-\r\n", i * 1000), b"").0
+        }) }).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert!(results.iter().all(|s| *s == 200), "{results:?}");
+    let calls = session.lock().unwrap().calls.clone();
+    for (i, c) in calls.iter().enumerate() {
+        let r = c["range"].as_str().unwrap();
+        let start: u64 = r.trim_start_matches("bytes=").split('-').next().unwrap().parse().unwrap();
+        assert_eq!(r, format!("bytes={start}-{}", start + (4 << 20) - 1), "call {i}: {c}");
+        assert!((1..=1_000).contains(&c["max_sats"].as_i64().unwrap()), "call {i}: {c}");
+    }
+    let charged = session.lock().unwrap().charged;
+    assert!(charged <= 2_500, "{charged}");
+    let (_, _, b) = ask(&addr, "GET", &format!("/visits/{visit}"), "", b"");
+    let v: Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(v["spent_sats"].as_i64(), Some(charged), "only what was bought stays spent once every request ended: {v}");
 }
