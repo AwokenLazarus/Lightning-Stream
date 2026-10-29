@@ -520,7 +520,7 @@ impl Signer {
                 self.ticket_release_locked(p)
             }
             // takes the spend lock itself, and not while the seller is asked to cancel
-            "ticket_stop" => sanitize(self.ticket_stop(p)),
+            "ticket_stop" => sanitize(self.ticket_stop_by(p)),
             "ticket_status" => {
                 let _g = self.lock();
                 sanitize(self.ticket_status_locked(p))

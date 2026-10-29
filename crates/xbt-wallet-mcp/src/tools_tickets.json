@@ -28,17 +28,19 @@
   }
  },
  {
-  "description": "Stop a stream-ticket session: the wallet locks and releases nothing more for it, and an answer that is being paid for as it arrives ends within one ticket. Where the wallet itself is paying that seller over HTTP (xbt402_pay), it also asks the seller to cancel the tickets that are still locked and waits up to 5 seconds for its own Lightning node to show them back (`http.still_locked` lists those that are not); otherwise it returns their payment hashes (cancel), which only the seller can cancel. Until the seller cancels, or the tickets expire, their sats stay locked. What was already released stays spent, and the unused part of the last released ticket stays with the seller. Stopping cannot be undone: a new session is opened by the next paid call. It cannot release a ticket, pay anything, or free funds by itself.",
+  "description": "Stop a stream-ticket session, named by its session id (session) or by the seller's address (seller, for example https://shop.example), which stops every open session with that seller: the wallet locks and releases nothing more for it, and an answer that is being paid for as it arrives ends within one ticket. Where the wallet itself is paying that seller over HTTP (xbt402_pay), it also asks the seller to cancel the tickets that are still locked and waits up to 5 seconds for its own Lightning node to show them back (`http.still_locked` lists those that are not); otherwise it returns their payment hashes (cancel), which only the seller can cancel. Until the seller cancels, or the tickets expire, their sats stay locked. What was already released stays spent, and the unused part of the last released ticket stays with the seller. Stopping cannot be undone: a new session is opened by the next paid call. It cannot release a ticket, pay anything, or free funds by itself.",
   "inputSchema": {
    "properties": {
     "session": {
      "title": "Session",
      "type": "string"
+    },
+    "seller": {
+     "title": "Seller",
+     "type": "string"
     }
    },
-   "required": [
-    "session"
-   ],
+   "required": [],
    "type": "object",
    "title": "ticket_stopArguments"
   },

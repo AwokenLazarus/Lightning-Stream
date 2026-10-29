@@ -17,14 +17,13 @@ It is tested on mainnet with small amounts only. Start with low limits.
 ## 1. Add the Lightning Stream registry
 
 1. In StartOS, open **Marketplace**.
-2. Choose **Switch** (the registry menu at the top), then **Add**.
+2. Open the registry menu at the top (**Switch**), then choose **Add**.
 3. Paste `https://registry.lazarus-xbt.xyz` and save.
 4. Switch to it. You should see **Lightning Stream**.
 
-Add the registry Lightning Fork is published in the same way, so StartOS can find it when you
-install (its address is in Lightning Fork's own instructions; ask in the Lightning Fork community if
-you don't have it). It is a registry for StartOS, not a web page: opening it in a browser shows
-nothing.
+Add the registry Lightning Fork is published in the same way (its address is on the setup page,
+https://lazarus-xbt.xyz/stream/start/), and install Knots BLAKE2b and Lightning Fork from it first. A registry is for StartOS, not a web page:
+opening one in a browser shows nothing.
 
 ## 2. Install
 

@@ -1532,6 +1532,24 @@ fn velocity_counts_a_session_once_by_default_and_every_release_when_the_owner_sa
     assert_eq!(d["rule"], "velocity", "{d}");
 }
 
+#[test]
+fn ticket_stop_takes_the_sellers_address_for_a_caller_that_keeps_no_session_id() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    let v = r.pay("/page/10", CALL);
+    assert_eq!(v["status"].as_u64(), Some(200), "{v}");
+    let sid = v["session"].as_str().unwrap().to_string();
+    // the shop's address, with a path and a trailing slash: compared the way the policy compares sellers
+    let stop = r.call("ticket_stop", json!({"seller": format!("{}/page/", r.shop.origin)}));
+    assert_eq!((stop["verdict"].as_str(), stop["session"].as_str()), (Some("allow"), Some(sid.as_str())), "{stop}");
+    // nothing is left open with that seller, and a stop with neither name is refused with a reason
+    let again = r.call("ticket_stop", json!({"seller": r.shop.origin}));
+    assert_eq!((again["verdict"].as_str(), again["rule"].as_str()), (Some("deny"), Some("ticket_stop")), "{again}");
+    assert!(again["reason"].as_str().unwrap_or("").contains("no open session"), "{again}");
+    let none = r.call("ticket_stop", json!({}));
+    assert_eq!(none["verdict"].as_str(), Some("deny"), "{none}");
+}
+
 // --- the rail is chosen in one place ----------------------------------------------------------------
 
 /// A 402 as a seller with these entries sends it.

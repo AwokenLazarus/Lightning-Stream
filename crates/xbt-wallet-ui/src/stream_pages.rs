@@ -481,7 +481,12 @@ fn counts_of(tickets: &Value, stopped_ts: f64) -> Counts {
                 c.booked_sats = c.booked_sats.saturating_add(int(t.get("booked_sats")));
             }
             Some("retired") => c.booked_sats = c.booked_sats.saturating_add(int(t.get("booked_sats"))),
-            Some("settled") => c.settled += 1,
+            // a settled ticket was paid: a prepaid one settles as soon as it arrives, a held one when the
+            // seller collects it, and either way it is money that left the node
+            Some("settled") => {
+                c.settled += 1;
+                c.booked_sats = c.booked_sats.saturating_add(int(t.get("booked_sats")));
+            }
             Some("failed") => match failed_as(t, stopped_ts) {
                 "never_sent" => c.never_sent += 1,
                 "cancelled_at_stop" => c.cancelled_at_stop += 1,
@@ -551,8 +556,9 @@ fn balance_cell(paying: &Value, sid: &str, booked_sats: i64) -> String {
 /// `more`: other connections (rented hashrate) follow, so an empty list here is not "nothing open".
 fn connections_html(ctx: &Ctx, st: &Value, detail: &dyn Fn(&str) -> Result<Value, String>, names: &[Service], now: i64, more: bool) -> String {
     let csrf = App::csrf_input(ctx);
-    let mut b = String::from("<p class=\"lead\">Every service you are paying for right now. Stop one and its payments end at once; \
-                              what you paid ahead and did not use comes back to you. This page updates every few seconds.</p>");
+    let mut b = String::from("<p class=\"lead\">Every service you are paying for right now. Stop one and its payments end at once. \
+                              A ticket held but not yet taken comes back to you; credit left from a prepaid ticket stays with that \
+                              seller and is spent first next time. This page updates every few seconds.</p>");
     if let Some(e) = st.get("error").and_then(Value::as_str) {
         b.push_str(&App::error_box(e));
     }
@@ -600,8 +606,11 @@ fn session_card(ctx: &Ctx, id: &str, name: &str, origin: &str, state: &str, c: &
     } else {
         String::new()
     };
+    let row = paying.as_array().and_then(|a| a.iter().find(|p| p.get("session").and_then(Value::as_str) == Some(id)));
+    let streaming = row.and_then(|p| p.get("answer_open")).and_then(Value::as_bool).unwrap_or(false);
     let pill = match state {
-        "open" => "<span class=\"pill good\">Open</span>",
+        "open" if streaming => "<span class=\"pill good\">Streaming</span>",
+        "open" => "<span class=\"pill\">Open, nothing playing</span>",
         "stopping" | "stopped" => "<span class=\"pill warn\">Stopping</span>",
         _ => "<span class=\"pill\">Closed</span>",
     };
@@ -613,12 +622,35 @@ fn session_card(ctx: &Ctx, id: &str, name: &str, origin: &str, state: &str, c: &
     let how_long = if minutes >= 1.0 { format!(" · open {} min", minutes.round() as i64) } else { String::new() };
     let failed = format!("never sent {}<br>cancelled at stop {}<br>payment failed {}", c.never_sent, c.cancelled_at_stop, c.payment_failed);
     let err = err.map(|e| format!("<p class=\"hint bad\">{}</p>", esc(e))).unwrap_or_default();
+    let used = usage_line(row);
     format!("<section class=\"card live\"><div class=\"offer-head\"><h2>{}</h2>{pill}</div>\
-             <p>Spent so far: <span class=\"money\">{}</span>{rate}{how_long}</p>{err}<div class=\"row\">{stop}</div>\
+             <p>Paid so far: <span class=\"money\">{}</span>{rate}{how_long}</p>{used}{err}<div class=\"row\">{stop}</div>\
              <details><summary>Details</summary><p class=\"small\">{} · connection <code>{}</code></p><div class=\"scroll\"><table><thead><tr><th>Locked</th>\
              <th>Released</th><th>Prepaid</th><th>Settled</th><th>Failed by</th><th>Balance</th></tr></thead><tbody><tr><td>{}</td><td>{}</td><td>{}</td>\
              <td>{}</td><td class=\"small\">{failed}</td><td>{}</td></tr></tbody></table></div></details></section>",
             esc(name), sats_short(spent), esc(origin), esc(id), c.locked, c.released, c.prepaid, c.settled, balance_cell(paying, id, c.booked_sats))
+}
+
+/// What the seller has drawn from what was paid, and the credit it still holds, from the seller's
+/// signed receipts as far as the wallet has them (one arrives with each answer).
+fn usage_line(row: Option<&Value>) -> String {
+    let Some(row) = row else { return String::new() };
+    let msat = |k: &str| row.get(k).and_then(msat_of);
+    let (Some(spent), Some(left)) = (msat("spent_msat"), msat("balance_msat")) else { return String::new() };
+    if spent == 0 && left == 0 {
+        return String::new();
+    }
+    format!("<p class=\"small\">Used: <span class=\"money\">{}</span> · credit left with this seller: <span class=\"money\">{}</span></p>",
+            msat_text(spent), msat_text(left))
+}
+
+/// Sats with up to three decimals: `40 sats`, `0.12 sats`.
+fn msat_text(msat: u64) -> String {
+    if msat.is_multiple_of(1000) {
+        return sats_short(i64::try_from(msat / 1000).unwrap_or(i64::MAX));
+    }
+    let s = format!("{}.{:03}", msat / 1000, msat % 1000);
+    format!("{} sats", s.trim_end_matches('0'))
 }
 
 /// `1,234 sats`, without the XBT figure.
@@ -648,8 +680,20 @@ mod tests {
             ticket("failed", 1.0, 4.0, true, 0),
         ]);
         let c = counts_of(&tickets, 8.0);
-        assert_eq!((c.locked, c.released, c.prepaid, c.settled, c.booked_sats), (2, 2, 2, 1, 50));
+        assert_eq!((c.locked, c.released, c.prepaid, c.settled, c.booked_sats), (2, 2, 2, 1, 90));
         assert_eq!((c.never_sent, c.cancelled_at_stop, c.payment_failed), (1, 1, 1));
+    }
+
+    #[test]
+    fn a_prepaid_ticket_that_settled_still_counts_as_paid_and_the_usage_shows() {
+        // a prepaid ticket settles as soon as it arrives; the page once read it as nothing paid
+        let c = counts_of(&json!([ticket("settled", 1.0, 2.0, true, 901)]), 0.0);
+        assert_eq!((c.settled, c.booked_sats), (1, 901));
+        let row = json!({"session": "s1", "spent_msat": "120", "balance_msat": "879880", "answer_open": true});
+        let html = usage_line(Some(&row));
+        assert!(html.contains("Used: <span class=\"money\">0.12 sats</span>") && html.contains("879.88 sats"), "{html}");
+        assert!(usage_line(Some(&json!({"spent_msat": "0", "balance_msat": "0"}))).is_empty());
+        assert_eq!(msat_text(40_000), sats_short(40));
     }
 
     #[test]

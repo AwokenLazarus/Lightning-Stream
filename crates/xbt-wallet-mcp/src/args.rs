@@ -54,7 +54,7 @@ pub fn spec(tool: &str) -> Option<&'static [Arg]> {
     static LN_PAY: [Arg; 4] = [req("invoice", Ty::Str), req("max_sats", Ty::Int), opt("description", Ty::Str, empty),
                                opt("amount_sats", Ty::Int, || Value::from(0))];
     static TICKET_STATUS: [Arg; 1] = [opt("session", Ty::Str, empty)];
-    static TICKET_STOP: [Arg; 1] = [req("session", Ty::Str)];
+    static TICKET_STOP: [Arg; 2] = [opt("session", Ty::Str, empty), opt("seller", Ty::Str, empty)];
     Some(match tool {
         "balance" | "channels" => &[],
         "quote_payment" | "pay" => &PAYMENT,

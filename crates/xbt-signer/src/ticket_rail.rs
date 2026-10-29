@@ -1997,6 +1997,49 @@ impl Signer {
         self.ticket_store().ok()?.as_ref()?.book.sessions.get(sid).cloned()
     }
 
+    /// The sessions with a seller that are not stopped yet, oldest first: `ticket_stop` given the
+    /// seller's address (`https://shop.example`) rather than a session id. The address is compared
+    /// the way the policy compares destinations, so a path or a trailing slash makes no difference.
+    pub(crate) fn ticket_open_sessions_with(&self, seller: &str) -> Vec<String> {
+        let want = normalize_dest(seller);
+        if want.is_empty() {
+            return Vec::new();
+        }
+        let Ok(g) = self.ticket_store() else { return Vec::new() };
+        let Some(st) = g.as_ref() else { return Vec::new() };
+        let mut open: Vec<&Session> = st.book.sessions.values()
+            .filter(|s| s.state == SState::Open && normalize_dest(&s.origin) == want).collect();
+        open.sort_by(|a, b| a.opened_ts.total_cmp(&b.opened_ts));
+        open.into_iter().map(|s| s.id.clone()).collect()
+    }
+
+    /// `ticket_stop` by `session`, or by `seller` (the shop's address) for a caller that does not
+    /// keep session ids: every session with that seller that is still open is stopped, the same
+    /// way, `forget_credit` included.
+    pub(crate) fn ticket_stop_by(&self, p: &Value) -> Value {
+        if !str_or_empty(p.get("session")).is_empty() {
+            return self.ticket_stop(p);
+        }
+        let seller = str_or_empty(p.get("seller"));
+        if seller.is_empty() {
+            return deny("ticket_stop", "give the session to stop, or the seller's address (seller)");
+        }
+        let sids = self.ticket_open_sessions_with(&seller);
+        if sids.is_empty() {
+            return deny("ticket_stop", format!("no open session with {seller}: nothing to stop"));
+        }
+        let stopped: Vec<Value> = sids.iter().map(|sid| {
+            let mut q = p.clone();
+            q["session"] = json!(sid);
+            self.ticket_stop(&q)
+        }).collect();
+        if stopped.len() == 1 {
+            return with(stopped.into_iter().next().unwrap_or(Value::Null), json!({"seller": seller}));
+        }
+        let all = stopped.iter().all(|v| v.get("verdict").and_then(Value::as_str) == Some("allow"));
+        json!({"verdict": if all { "allow" } else { "partial" }, "seller": seller, "stopped": stopped})
+    }
+
     /// The face of the held ticket `hash` of a session and the most its release books, its fee
     /// limit included, in sats: what a call's `max_sats` is held against before its secret
     /// leaves. `None` where the book has no such ticket.
