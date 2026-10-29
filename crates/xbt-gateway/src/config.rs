@@ -783,7 +783,8 @@ impl Config {
         }
         Ok(Self {
             listen,
-            public_url: origin.trim_end_matches('/').to_string(),
+            // a shop reached by key keeps the word "link" here: main names it by its Nostr key at start
+            public_url: if by_key { public_url } else { origin.trim_end_matches('/').to_string() },
             public_aliases,
             upstream: up,
             state_dir: PathBuf::from(req_str(top, "state_dir")?),
@@ -1084,6 +1085,20 @@ mod tests {
                "routes": [{"path": "/files/", "price": {"byte_msat": 1000, "per_bytes": 1048576}},
                           {"path": "/files/free/", "free": true},
                           {"path": "/api", "methods": ["POST"], "price": {"request_msat": 2500}, "max_body": 4096, "forward_headers": ["X-Trace"]}]})
+    }
+
+    #[test]
+    fn a_shop_without_a_web_address_keeps_the_word_link_for_main_to_name_by_its_key() {
+        for public in [json!("link"), Value::Null] {
+            let mut v = base();
+            v["public_url"] = public;
+            v["link"] = json!({"relays": []});
+            let c = Config::from_json(&v).unwrap();
+            assert_eq!(c.public_url, LINK_ONLY, "a shop by key must keep LINK_ONLY until start names it, else it signs as no seller");
+        }
+        let mut v = base();
+        v["public_url"] = json!("link");
+        assert!(Config::from_json(&v).is_err(), "a shop by key without a link section is refused");
     }
 
     #[test]
