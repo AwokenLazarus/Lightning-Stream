@@ -694,6 +694,13 @@ mod tests {
             got.extend(r.finish());
             assert_eq!(String::from_utf8(got).unwrap(), want, "chunks of {cut}");
         }
+        // a shop reached by a direct link has no web address of its own: its base works the same
+        let link = "http://mfrggzdfmztwq2lknnwg23tpobyxe43uov3ho6dzpiyq.shop.invalid/jf/";
+        let mut r = Rewriter::new(&[link]);
+        let mut got = r.feed(format!("<a href=\"{link}web/\">x</a> {{\"u\":\"{}api\"}}", link.replace('/', "\\/")).as_bytes());
+        got.extend(r.finish());
+        assert_eq!(String::from_utf8(got).unwrap(), "<a href=\"/web/\">x</a> {\"u\":\"\\/api\"}");
+        assert_ne!(seller_tag(link), seller_tag("http://other.shop.invalid/jf/"), "two linked shops, two cookie prefixes");
         assert!(rewritable("text/html; charset=utf-8") && rewritable("application/javascript") && rewritable("application/vnd.api+json"));
         assert!(!rewritable("video/mp4") && !rewritable("image/png") && !rewritable("application/octet-stream"));
     }

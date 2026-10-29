@@ -894,7 +894,12 @@ def stream() -> None:
     t = threading.Thread(target=run)
     released_before = int((status().get("paying") or [{}])[0].get("released_msat", 0))
     t.start()
-    lab.wait("the answer to be under way", 60, lambda: any(p.get("answer_open") and int(p["released_msat"]) >= released_before + 3 * TICKET_MSAT for p in status().get("paying", [])), every=0.02)
+    try:
+        lab.wait("the answer to be under way", 60, lambda: any(p.get("answer_open") and int(p["released_msat"]) >= released_before + 3 * TICKET_MSAT for p in status().get("paying", [])), every=0.02)
+    except LabError as e:
+        # what the call came to, and the wallet's own view, say why it never got under way
+        t.join(30)
+        raise LabError(f"{e}: the call {json.dumps(brief(result))[:600]}; paying {json.dumps(status().get('paying'))[:600]}") from None
     sid = status()["sessions"][0]["session"]
     t0 = time.monotonic()
     stop = agent().tool("ticket_stop", {"session": sid})
