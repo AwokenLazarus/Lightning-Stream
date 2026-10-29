@@ -5,6 +5,7 @@
 //! * a rental over iroh pays every slice and both meters agree, as over TCP;
 //! * one hashtaker app's link reaches the hashmaker again for a second rental;
 //! * a miner moved into a rental over iroh and back loses no more than a job;
+//! * a rental over iroh whose link drops for a moment carries on, every slice paid once;
 //! * a byte changed on the way (what a relay could try) breaks the link instead of a job or a share;
 //! * (ignored) the round trip of a share, over TCP and over iroh, direct and through relays.
 
@@ -246,6 +247,62 @@ fn moving_a_miner_over_iroh_leaves_no_gap_longer_than_one_job() {
         assert!(m.max_gap_ms < JOB_MS, "a gap of {} ms between accepted shares, a job is {JOB_MS} ms", m.max_gap_ms);
         assert!(m.rejected * 10 <= m.accepted, "few rejected shares around the switches: {} of {}", m.rejected, m.accepted);
     }
+}
+
+/// The link drops for a moment while a rental runs over iroh: the hashtaker dials again through its
+/// iroh link and resumes, and the rental runs to its end with every slice paid once and both meters
+/// agreeing. The drop is a TCP relay in front of the hashtaker's way into its iroh link that closes
+/// every connection through it, as a network going away does.
+#[test]
+fn a_rental_over_iroh_whose_link_drops_carries_on_with_every_slice_paid_once() {
+    let _s = serial();
+    let rig = rig(true, Relays::None);
+    let m = miner(&rig.miners_addr, "m0", 30, 12.0, true, false);
+    let t0 = Instant::now();
+    while !rig.hashmaker.status()["miners"].as_array().is_some_and(|m| m.len() == 1 && m[0]["work"] != "0") {
+        assert!(t0.elapsed() < Duration::from_secs(20), "the miner never hashed at the fallback");
+        thread::sleep(Duration::from_millis(100));
+    }
+    let dialer = Dialer::start(Relays::None).unwrap();
+    let through = dialer.address_for(&rig.iroh).unwrap();
+    let [front] = ports::<1>();
+    let open: std::sync::Arc<Mutex<Vec<TcpStream>>> = Default::default();
+    {
+        let (l, o, to) = (TcpListener::bind(&front).unwrap(), open.clone(), through.clone());
+        thread::spawn(move || {
+            for c in l.incoming() {
+                let Ok(a) = c else { continue };
+                let Ok(b) = TcpStream::connect(&to) else { continue };
+                o.lock().unwrap().extend([a.try_clone().unwrap(), b.try_clone().unwrap()]);
+                for (mut x, mut y) in [(a.try_clone().unwrap(), b.try_clone().unwrap()), (b, a)] {
+                    thread::spawn(move || {
+                        let _ = std::io::copy(&mut x, &mut y);
+                        let _ = y.shutdown(std::net::Shutdown::Both);
+                    });
+                }
+            }
+        });
+    }
+    let pool = Pool::start(&rig.dir, "dropped", JOB_MS);
+    let h = hashtaker(&rig, front.clone(), &pool, "dropped", 1, 14);
+    // let a few slices go by, then drop every connection on the way
+    thread::sleep(Duration::from_secs(5));
+    let dropped = {
+        let mut g = open.lock().unwrap();
+        let n = g.len();
+        for s in g.drain(..) {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+        n
+    };
+    assert!(dropped >= 2, "a link was open to drop");
+    let b = h.join().unwrap();
+    let r = finished(&rig.hashmaker, "dropped");
+    check_paid(&r, &b);
+    assert!(open.lock().unwrap().len() >= 2, "the hashtaker dialed again through its iroh link");
+    assert!(pool.users()["dropped.rented"] > 0, "the work reached the hashtaker's pool");
+    rig.hashmaker.shutdown();
+    let _ = m.join();
 }
 
 /// A TCP stand-in for whatever carries the link (a relay): it passes bytes both ways, and changes
