@@ -429,13 +429,17 @@ impl AiServer {
                 let complete = account.get("complete").and_then(Value::as_bool).unwrap_or(false);
                 let now = credentials::now();
                 {
+                    // booked under the store's lock, so a change the app makes at the same time is kept
+                    let booked = Store::update(&credentials, |s| {
+                        s.add_spend(&key_id, price_msat, today);
+                        s.pause_if_over(&key_id, today);
+                    });
                     let mut g = lock(&inner);
-                    if let Ok(s) = Store::open(&credentials) {
-                        g.store = s;
+                    if booked.is_ok() {
+                        if let Ok(s) = Store::open(&credentials) {
+                            g.store = s;
+                        }
                     }
-                    g.store.add_spend(&key_id, price_msat, today);
-                    g.store.pause_if_over(&key_id, today);
-                    let _ = g.store.save();
                     let outcome = if complete { Outcome::Answered { ttft_ms: u64::try_from(ttft.as_millis()).unwrap_or(u64::MAX) } } else { Outcome::CutMidAnswer };
                     g.router.record(&seller, outcome, now);
                     let _ = write_atomic(&state, &state_json(&g.router));

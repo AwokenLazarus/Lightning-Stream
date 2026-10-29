@@ -220,14 +220,12 @@ impl App {
         let g = |k: &str| f.get(k).map(|v| v.trim().to_string()).unwrap_or_default();
         let today = credentials::day_of(credentials::now());
         let n = |k: &str| g(k).parse::<u64>().ok();
+        // every change under the store's lock (the endpoint books spend in it at the same time)
         let store = |f: &dyn Fn(&mut Store) -> Result<String, String>| -> Result<String, String> {
-            let mut s = Store::open(&self.cfg.ai.credentials).map_err(|e| format!("The store of keys cannot be read: {e}"))?;
-            let said = f(&mut s)?;
             if let Some(dir) = self.cfg.ai.credentials.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
-            s.save().map_err(|e| format!("The store of keys cannot be written: {e}"))?;
-            Ok(said)
+            Store::update(&self.cfg.ai.credentials, f).map_err(|e| format!("The store of keys cannot be changed: {e}"))?
         };
         let prefs = |name: &str, list: &str, add: bool| -> Result<String, String> {
             let mut v = read_sellers(&self.cfg.ai.sellers);

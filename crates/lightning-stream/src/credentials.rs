@@ -193,6 +193,20 @@ impl Store {
         Ok(Self { path: path.to_path_buf(), entries })
     }
 
+    /// Reads the store, changes it with `f` and writes it back, holding an exclusive advisory lock
+    /// (`flock`) on `<store>.lock` from before the read to after the write. The app and the endpoint
+    /// both change the store through this, so neither loses the other's change: a key the owner
+    /// edits while the endpoint books a call's spend keeps both.
+    pub fn update<T>(path: &Path, f: impl FnOnce(&mut Store) -> T) -> io::Result<T> {
+        let lock = open_lock(path)?;
+        lock.lock()?;
+        let mut store = Store::open(path)?;
+        let out = f(&mut store);
+        let saved = store.save();
+        let _ = lock.unlock();
+        saved.map(|()| out)
+    }
+
     /// Writes the store with [`write_file`]: the app and the endpoint both book in it, so in a dir
     /// shared by group it is group-writable (0660), and otherwise the owner's alone (0600).
     pub fn save(&self) -> io::Result<()> {
@@ -306,6 +320,28 @@ pub fn write_file(path: &Path, body: &[u8], group_write: bool) -> io::Result<()>
     fs::rename(&tmp, path)
 }
 
+/// The lock file beside the store (`<store>.lock`): made once, shared like the store (0660 and the
+/// directory's group in a directory shared by group, 0600 otherwise). Its content is never read.
+fn open_lock(path: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::MetadataExt;
+    let lock = path.with_extension("lock");
+    let f = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600).open(&lock)?;
+    let dir = lock.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let dm = fs::metadata(dir)?;
+    let fm = f.metadata()?;
+    // in a shared dir the other service must open it too. Only its owner may change its group and
+    // mode, so for anyone else these fail, and it stays as its owner (who made it so) left it
+    if dm.mode() & 0o010 != 0 {
+        if fm.gid() != dm.gid() {
+            let _ = std::os::unix::fs::chown(&lock, None, Some(dm.gid()));
+        }
+        if fm.mode() & 0o777 != 0o660 {
+            let _ = fs::set_permissions(&lock, fs::Permissions::from_mode(0o660));
+        }
+    }
+    Ok(f)
+}
+
 /// The UTC day of `secs`.
 pub fn day_of(secs: u64) -> u64 {
     secs / 86_400
@@ -372,6 +408,31 @@ mod tests {
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
         write_file(&dir.path().join("c.json"), b"{}", true).unwrap();
         assert_eq!(mode(&dir.path().join("c.json")), 0o600);
+    }
+
+    #[test]
+    fn two_writers_at_once_keep_every_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.json");
+        let (id, _) = Store::update(&path, |s| s.make(Kind::AiKey, "k", 1_000_000, None, None)).unwrap();
+        // one writer books spend, as the endpoint does, while the other makes keys, as the app does
+        let spend = {
+            let (path, id) = (path.clone(), id.clone());
+            std::thread::spawn(move || for _ in 0..200 {
+                Store::update(&path, |s| s.add_spend(&id, 1_000, 5)).unwrap();
+            })
+        };
+        let keys = {
+            let path = path.clone();
+            std::thread::spawn(move || for i in 0..50 {
+                Store::update(&path, |s| s.make(Kind::Link, &format!("link {i}"), 10, None, Some("https://s.example/"))).unwrap();
+            })
+        };
+        spend.join().unwrap();
+        keys.join().unwrap();
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.entries.iter().find(|e| e.id == id).unwrap().spent_msat, 200_000, "no booking lost");
+        assert_eq!(s.entries.iter().filter(|e| e.kind == Kind::Link).count(), 50, "no key lost");
     }
 
     #[test]
