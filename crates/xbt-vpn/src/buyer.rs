@@ -33,17 +33,21 @@ use crate::flow::{open_tcp, recv_udp, send_udp, Opened};
 use rustls::pki_types::ServerName;
 use tokio_rustls::TlsConnector;
 use crate::meter::Meter;
-use crate::router::Router;
+use crate::router::{ExitInfo, Requirements, Router};
+use std::collections::HashSet;
+use std::sync::RwLock;
 use crate::tunnel::TUNNEL_MTU;
 
 /// One of the buyer's devices (a phone, a laptop, a router): its tunnel address, what it has used,
-/// and its limit.
-#[derive(Debug)]
+/// its limit, and the exits it may use.
+#[derive(Debug, Default)]
 pub struct Device {
     pub name: String,
     pub meter: Meter,
     /// Bytes this device may carry in all, each way counted. `None`: only the wallet's rules limit it.
     pub limit_bytes: Option<u64>,
+    /// This device's own saved policy (e.g. a TV: private, Germany). `None`: the buyer's default.
+    pub requirements: Option<Requirements>,
 }
 
 impl Device {
@@ -96,6 +100,10 @@ struct ExitConn {
 pub struct Buyer {
     link: Arc<Link>,
     pub router: Mutex<Router>,
+    /// Routers for devices with their own policy.
+    device_routers: HashMap<IpAddr, Mutex<Router>>,
+    /// Exits that stopped meeting a device's policy: that device's live flows on them end.
+    disqualified: RwLock<HashSet<(IpAddr, String)>>,
     devices: HashMap<IpAddr, Arc<Device>>,
     dns: Option<EncryptedDns>,
     exits: Mutex<HashMap<String, Arc<ExitConn>>>,
@@ -108,13 +116,76 @@ impl Buyer {
     /// `devices`: each device's tunnel address and its state. `dns`: the resolver the buyer's app asks
     /// itself (private exits); `None` sends DNS to the exit (filtered exits).
     pub fn new(link: Arc<Link>, router: Router, devices: HashMap<IpAddr, Arc<Device>>, dns: Option<EncryptedDns>) -> Arc<Buyer> {
-        Arc::new(Buyer { link, router: Mutex::new(router), devices, dns, exits: Mutex::new(HashMap::new()), next_flow: AtomicU32::new(1), refused: AtomicU64::new(0) })
+        let device_routers = devices
+            .iter()
+            .filter_map(|(ip, d)| {
+                let req = d.requirements.clone()?;
+                let mut r = Router::with_requirements(req);
+                for e in router.exits() {
+                    r.upsert(e.clone());
+                }
+                Some((*ip, Mutex::new(r)))
+            })
+            .collect();
+        Arc::new(Buyer {
+            link,
+            router: Mutex::new(router),
+            device_routers,
+            disqualified: RwLock::new(HashSet::new()),
+            devices,
+            dns,
+            exits: Mutex::new(HashMap::new()),
+            next_flow: AtomicU32::new(1),
+            refused: AtomicU64::new(0),
+        })
+    }
+
+    /// The router that decides for this device: its own policy's, or the buyer's default.
+    fn router_for(&self, device: IpAddr) -> &Mutex<Router> {
+        self.device_routers.get(&device).unwrap_or(&self.router)
+    }
+
+    /// What is known about an exit (a listing, a measurement, a health change), for every policy.
+    pub async fn upsert_exit(&self, e: ExitInfo) {
+        self.router.lock().await.upsert(e.clone());
+        for r in self.device_routers.values() {
+            r.lock().await.upsert(e.clone());
+        }
+    }
+
+    /// Why this device's traffic is blocked, if no exit meets its policy: in plain words, naming the
+    /// requirement that has no exit.
+    pub async fn why_blocked(&self, device: IpAddr) -> Option<String> {
+        self.router_for(device).lock().await.unmet().map(|u| u.0)
+    }
+
+    /// A new policy for a device (or the default, for `None`): new flows follow it at once, and live
+    /// flows on exits that no longer qualify end. Returns those exits.
+    pub async fn set_requirements(&self, device: Option<IpAddr>, req: Requirements) -> Vec<String> {
+        let router = device.map_or(&self.router, |d| self.router_for(d));
+        let gone = router.lock().await.set_requirements(req);
+        let mut dq = self.disqualified.write().unwrap_or_else(|e| e.into_inner());
+        let affected: Vec<IpAddr> = match device {
+            Some(d) => vec![d],
+            None => self.devices.keys().filter(|ip| !self.device_routers.contains_key(ip)).copied().collect(),
+        };
+        dq.retain(|(d, _)| !affected.contains(d));
+        for d in affected {
+            for g in &gone {
+                dq.insert((d, g.clone()));
+            }
+        }
+        gone
+    }
+
+    fn still_qualifies(&self, device: IpAddr, exit: &str) -> bool {
+        !self.disqualified.read().unwrap_or_else(|e| e.into_inner()).contains(&(device, exit.to_string()))
     }
 
     /// Asks the buyer's own resolver one DNS question, over TLS through an exit.
-    async fn resolve(self: &Arc<Self>, query: &[u8]) -> Option<Vec<u8>> {
+    async fn resolve(self: &Arc<Self>, device: IpAddr, query: &[u8]) -> Option<Vec<u8>> {
         let dns = self.dns.as_ref()?;
-        let (exit_id, exit) = self.route(dns.addr).await?;
+        let (exit_id, exit) = self.route(device, dns.addr).await?;
         let answer = async {
             let (opened, send, recv) = open_tcp(&exit.conn, dns.addr).await.ok()?;
             if opened != Opened::Yes {
@@ -131,7 +202,7 @@ impl Buyer {
             Some(a)
         };
         let a = tokio::time::timeout(Duration::from_secs(10), answer).await.ok().flatten();
-        self.router.lock().await.flow_ended(&exit_id);
+        self.router_for(device).lock().await.flow_ended(&exit_id);
         a
     }
 
@@ -171,12 +242,13 @@ impl Buyer {
 
     /// The exit for a new flow and the connection to it; tries the router's next choice if the first
     /// cannot be reached.
-    async fn route(self: &Arc<Self>, dst: SocketAddr) -> Option<(String, Arc<ExitConn>)> {
+    async fn route(self: &Arc<Self>, device: IpAddr, dst: SocketAddr) -> Option<(String, Arc<ExitConn>)> {
         for _ in 0..3 {
-            let id = self.router.lock().await.pick(dst.ip(), Instant::now())?;
+            let id = self.router_for(device).lock().await.pick(dst.ip(), Instant::now())?;
             if let Some(e) = self.exit(&id).await {
                 return Some((id, e));
             }
+            self.router_for(device).lock().await.fail(&id);
         }
         None
     }
@@ -207,28 +279,32 @@ impl Buyer {
     async fn tcp(self: Arc<Self>, s: ipstack::IpStackTcpStream) {
         let (src, dst) = (s.local_addr(), s.peer_addr());
         let Some(dev) = self.device(src.ip()).filter(|d| !d.over_limit()) else { return self.refuse() };
-        let Some((exit_id, exit)) = self.route(dst).await else { return self.refuse() };
+        let Some((exit_id, exit)) = self.route(src.ip(), dst).await else { return self.refuse() };
         let opened = open_tcp(&exit.conn, dst).await;
         let (send, recv) = match opened {
             Ok((Opened::Yes, send, recv)) => (send, recv),
             _ => {
-                self.router.lock().await.flow_ended(&exit_id);
+                self.router_for(src.ip()).lock().await.flow_ended(&exit_id);
                 return self.refuse();
             }
         };
         let (r, w) = tokio::io::split(s);
         let (d1, d2, d3, d4) = (dev.clone(), dev.clone(), dev.clone(), dev);
-        tokio::join!(pump(r, send, move |n| d1.meter.up(n), d2), pump(recv, w, move |n| d3.meter.down(n), d4));
-        self.router.lock().await.flow_ended(&exit_id);
+        let (me1, me2, e1, e2, ip) = (self.clone(), self.clone(), exit_id.clone(), exit_id.clone(), src.ip());
+        tokio::join!(
+            pump(r, send, move |n| d1.meter.up(n), d2, move || me1.still_qualifies(ip, &e1)),
+            pump(recv, w, move |n| d3.meter.down(n), d4, move || me2.still_qualifies(ip, &e2))
+        );
+        self.router_for(src.ip()).lock().await.flow_ended(&exit_id);
     }
 
     async fn udp(self: Arc<Self>, s: ipstack::IpStackUdpStream) {
         let (src, dst) = (s.local_addr(), s.peer_addr());
         let Some(dev) = self.device(src.ip()).filter(|d| !d.over_limit()) else { return self.refuse() };
         if dst.port() == 53 && self.dns.is_some() {
-            return self.answer_dns(s, dev).await;
+            return self.answer_dns(s, src.ip(), dev).await;
         }
-        let Some((exit_id, exit)) = self.route(dst).await else { return self.refuse() };
+        let Some((exit_id, exit)) = self.route(src.ip(), dst).await else { return self.refuse() };
         let flow = self.next_flow.fetch_add(1, Ordering::Relaxed);
         let (tx, mut rx) = mpsc::channel::<Bytes>(256);
         exit.udp.lock().await.insert(flow, tx);
@@ -262,14 +338,14 @@ impl Buyer {
         };
         tokio::select! { _ = out => {}, _ = back => {} }
         exit.udp.lock().await.remove(&flow);
-        self.router.lock().await.flow_ended(&exit_id);
+        self.router_for(src.ip()).lock().await.flow_ended(&exit_id);
     }
 }
 
 impl Buyer {
     /// A device's DNS, answered by the buyer's own resolver whatever address the device asked: no
     /// DNS question reaches the exit.
-    async fn answer_dns(self: Arc<Self>, s: ipstack::IpStackUdpStream, dev: Arc<Device>) {
+    async fn answer_dns(self: Arc<Self>, s: ipstack::IpStackUdpStream, device: IpAddr, dev: Arc<Device>) {
         let (mut r, mut w) = tokio::io::split(s);
         let mut buf = vec![0u8; 4096];
         while let Ok(n) = r.read(&mut buf).await {
@@ -277,7 +353,7 @@ impl Buyer {
                 return;
             }
             dev.meter.up(n);
-            if let Some(a) = self.resolve(&buf[..n]).await {
+            if let Some(a) = self.resolve(device, &buf[..n]).await {
                 if w.write_all(&a).await.is_err() {
                     return;
                 }
@@ -287,15 +363,16 @@ impl Buyer {
     }
 }
 
-/// Copies one direction of a flow, counting what it carries; stops when the device reaches its limit.
-async fn pump<R, W>(mut r: R, mut w: W, count: impl Fn(usize), dev: Arc<Device>)
+/// Copies one direction of a flow, counting what it carries; stops when the device reaches its limit
+/// or its exit stops meeting the device's policy.
+async fn pump<R, W>(mut r: R, mut w: W, count: impl Fn(usize), dev: Arc<Device>, qualifies: impl Fn() -> bool)
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let mut buf = vec![0u8; 64 * 1024];
     loop {
-        if dev.over_limit() {
+        if dev.over_limit() || !qualifies() {
             break;
         }
         let n = match r.read(&mut buf).await {

@@ -127,9 +127,9 @@ fn a_private_exits_buyer_answers_dns_itself_and_the_exit_never_sees_it() {
     let direct = exit.hints(Duration::from_secs(1)).direct.into_iter().filter(|a| a.is_ipv4()).collect();
     buyer_link.learn(&id, Hints { relays: vec![], direct }).unwrap();
     let mut router = Router::new(Mode::Best, None);
-    router.upsert(ExitInfo { id, region: "XX".into(), price_msat_per_gb: 2000, rtt_ms: None, mbit_s: None, healthy: true, filtered: false, categories: vec![] });
+    router.upsert(ExitInfo { id, region: "XX".into(), price_msat_per_gb: 2000, rtt_ms: None, mbit_s: None, healthy: true, ..ExitInfo::default() });
     let phone: IpAddr = Ipv4Addr::new(10, 66, 0, 2).into();
-    let dev = Arc::new(Device { name: "phone".into(), meter: Meter::default(), limit_bytes: None });
+    let dev = Arc::new(Device { name: "phone".into(), meter: Meter::default(), limit_bytes: None, requirements: None });
     let dns = EncryptedDns::with_roots(dot, "dot.test", roots).unwrap();
     let buyer = Buyer::new(buyer_link.clone(), router, HashMap::from([(phone, dev)]), Some(dns));
     let rt = buyer_link.runtime();

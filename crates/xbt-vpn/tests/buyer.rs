@@ -23,7 +23,7 @@ use xbt_vpn::buyer::{Buyer, Device as BuyerDevice};
 use xbt_vpn::exit::{serve_buyer, ExitConfig};
 use xbt_vpn::filter::Policy;
 use xbt_vpn::meter::Meter;
-use xbt_vpn::router::{ExitInfo, Mode, Router};
+use xbt_vpn::router::{ExitInfo, Mode, Requirements, Router};
 use xbt_vpn::wg::{keypair, WgEndpoint, WgPeer};
 
 fn lan_ip() -> IpAddr {
@@ -96,6 +96,7 @@ const PHONE_IP: Ipv4Addr = Ipv4Addr::new(10, 66, 0, 2);
 
 struct Setup {
     _links: Vec<Arc<Link>>,
+    exit_id: Option<String>,
     buyer: Arc<Buyer>,
     exit_meter: Arc<Meter>,
     wg_addr: SocketAddr,
@@ -106,11 +107,16 @@ struct Setup {
 
 /// An exit (or none), the buyer's link, router, stack and WireGuard endpoint with one phone.
 fn setup(seed: u8, with_exit: bool, phone_limit: Option<u64>) -> Setup {
+    setup_with(seed, with_exit, phone_limit, None)
+}
+
+fn setup_with(seed: u8, with_exit: bool, phone_limit: Option<u64>, requirements: Option<Requirements>) -> Setup {
     let opts = |serving| Options { relays: Relays::None, serving, private: false, lookup: None };
     let mut links = Vec::new();
     let exit_meter = Arc::new(Meter::default());
     let buyer_link = Link::start_alpn([seed + 1; 32], opts(false), ALPN_VPN).unwrap();
     let mut router = Router::new(Mode::Best, None);
+    let mut exit_id = None;
     if with_exit {
         let exit = Link::start_alpn([seed; 32], opts(true), ALPN_VPN).unwrap();
         let cfg = Arc::new(ExitConfig { policy: Policy { allow_non_public: true, ..Policy::default() }, ..ExitConfig::default() });
@@ -119,12 +125,13 @@ fn setup(seed: u8, with_exit: bool, phone_limit: Option<u64>) -> Setup {
         let id = exit.endpoint_id();
         let direct = exit.hints(Duration::from_secs(1)).direct.into_iter().filter(|a| a.is_ipv4()).collect();
         buyer_link.learn(&id, Hints { relays: vec![], direct }).unwrap();
-        router.upsert(ExitInfo { id, region: "XX".into(), price_msat_per_gb: 2000, rtt_ms: None, mbit_s: None, healthy: true, filtered: false, categories: Vec::new() });
+        exit_id = Some(id.clone());
+        router.upsert(ExitInfo { id, region: "XX".into(), price_msat_per_gb: 2000, rtt_ms: None, mbit_s: None, healthy: true, ..ExitInfo::default() });
         links.push(exit);
     }
     let (phone_private, phone_public) = keypair();
     let (endpoint_private, endpoint_public) = keypair();
-    let dev = Arc::new(BuyerDevice { name: "phone".into(), meter: Meter::default(), limit_bytes: phone_limit });
+    let dev = Arc::new(BuyerDevice { name: "phone".into(), meter: Meter::default(), limit_bytes: phone_limit, requirements });
     let buyer = Buyer::new(buyer_link.clone(), router, HashMap::from([(IpAddr::V4(PHONE_IP), dev)]), None);
     let wg = WgEndpoint::new(endpoint_private, &[WgPeer { public: phone_public, tunnel_ip: PHONE_IP }]);
     let rt = buyer_link.runtime();
@@ -135,7 +142,7 @@ fn setup(seed: u8, with_exit: bool, phone_limit: Option<u64>) -> Setup {
     rt.spawn(buyer.clone().run(from_devices, to_devices));
     rt.spawn(wg.run(sock, to_stack, from_stack));
     links.push(buyer_link);
-    Setup { _links: links, buyer, exit_meter, wg_addr, endpoint_public, phone_private, rt }
+    Setup { _links: links, exit_id, buyer, exit_meter, wg_addr, endpoint_public, phone_private, rt }
 }
 
 /// The phone: downloads from `to` through WireGuard until the server closes or `deadline` passes.
@@ -230,4 +237,34 @@ fn a_device_past_its_limit_is_cut_off() {
     let used = s.buyer.device(IpAddr::V4(PHONE_IP)).unwrap().meter.counts().total_bytes();
     // the limit is checked between reads of up to 64 KiB, so at most one read past it
     assert!(used <= (1 << 20) + 64 * 1024, "used {used}");
+}
+
+#[test]
+fn a_device_whose_policy_no_exit_meets_is_blocked_and_told_why() {
+    let to = tcp_server(1 << 20);
+    // the phone wants an exit verified to be in Germany; the only exit is not
+    let req = Requirements { region: Some("DE".into()), ..Requirements::default() };
+    let s = setup_with(160, true, None, Some(req));
+    let got = s.rt.block_on(phone_download(&s, to, Duration::from_secs(4)));
+    assert_eq!(got, 0, "nothing is relaxed: the traffic is blocked");
+    let why = s.rt.block_on(s.buyer.why_blocked(IpAddr::V4(PHONE_IP)));
+    assert_eq!(why.as_deref(), Some("No exit is verified to be in DE."));
+}
+
+#[test]
+fn a_policy_change_ends_live_flows_on_an_exit_that_no_longer_qualifies() {
+    let n = 64 << 20;
+    let to = tcp_server(n);
+    let s = Arc::new(setup(170, true, None));
+    let exit = s.exit_id.clone().unwrap();
+    let s2 = s.clone();
+    // part-way through a long download, the buyer excludes the exit it is on
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(1500));
+        let req = Requirements { exclude: vec![exit], ..Requirements::default() };
+        let gone = s2.rt.block_on(s2.buyer.set_requirements(None, req));
+        assert_eq!(gone.len(), 1);
+    });
+    let got = s.rt.block_on(phone_download(&s, to, Duration::from_secs(30)));
+    assert!(got > 0 && got < n, "the flow ran, then ended when its exit stopped qualifying ({got} bytes)");
 }
