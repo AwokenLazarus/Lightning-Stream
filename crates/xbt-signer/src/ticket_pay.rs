@@ -764,11 +764,29 @@ impl Stream {
         bytes.saturating_add(PROXY_SLACK.min(covered / 4)) >= covered
     }
 
+    /// [`Stream::due_bytes`], `lead` bytes earlier: far enough ahead that a ticket paid now arrives
+    /// before the body reaches the end of what is paid for, so a payment that takes a second or two
+    /// does not hold the body up. `lead` is the caller's, and at most half of what one ticket covers.
+    fn due_bytes_ahead(&self, credited: u64, bytes: u64, length: Option<u64>, lead: u64) -> bool {
+        if self.price.byte_msat == 0 {
+            return false;
+        }
+        let covered = self.covered(credited);
+        if length.is_some_and(|l| l <= covered) {
+            return false;
+        }
+        self.due_bytes(credited, bytes, length) || bytes.saturating_add(lead) >= covered
+    }
+
     /// A body priced by the second: the balance does not cover the second that starts next.
     fn due_time(&self, credited: u64) -> bool {
         self.price.second_msat > 0 && self.avail(credited) < self.fixed().saturating_add(self.price.second_msat)
     }
 }
+
+/// How long a ticket's payment is taken to last before one of the answer has been timed: a
+/// Lightning payment across a route or two.
+const FIRST_PAY_S: f64 = 3.0;
 
 /// Why a call stopped reading when the program it streams to stopped reading first.
 const READER_GONE: &str = "stopped by the buyer: the reader the body was streamed to went away";
@@ -2390,6 +2408,11 @@ impl Signer {
         };
         let credited = || lock_money(hs).acct.acked_msat;
         let mut read_error: Option<String> = None;
+        // a ticket being paid beside the reading, what it came to, and how far ahead the next one goes
+        let paying = AtomicBool::new(false);
+        let paid: Mutex<Option<(Option<String>, bool)>> = Mutex::new(None);
+        let mut retry_at_due = false;
+        let lead: Mutex<u64> = Mutex::new(0);
         std::thread::scope(|scope| {
             if price.second_msat > 0 {
                 // an answer priced by the second is paid by the clock: the next second's ticket goes shortly before it starts
@@ -2455,13 +2478,61 @@ impl Signer {
                     break;
                 }
                 // by bytes: the next ticket goes a little before what the released ones pay for has all
-                // arrived. If it cannot go, what is paid for is still read, and the answer stops there
-                if unpaid.is_none() && st.due_bytes(credited(), bytes, length) {
+                // arrived. If it cannot go, what is paid for is still read, and the answer stops there.
+                // It is paid beside the reading, not in its way, and early by as much body as arrives
+                // while a payment takes: a prepaid ticket is a Lightning payment of a second or more,
+                // and a body that waited for it would stall at every ticket. One payment at a time, so
+                // the wallet is never more than one ticket ahead of the body
+                // a ticket that could not go early (a pool not refilled yet, a seller not ready) is tried
+                // again where it is due; only a refusal there ends the answer
+                if let Some((r, early)) = lock(&paid).take() {
+                    match r {
+                        Some(_) if early => retry_at_due = true,
+                        r if unpaid.is_none() => {
+                            unpaid = r;
+                            retry_at_due = false;
+                        }
+                        _ => {}
+                    }
+                }
+                if unpaid.is_none() && price.second_msat == 0 && !paying.load(Ordering::SeqCst) {
+                    let rate = bytes as f64 / st.started.elapsed().as_secs_f64().max(0.001);
+                    // before any payment of this answer was timed: what arrives in [`FIRST_PAY_S`], within half of what is paid for
+                    let ahead = match *lock(&lead) {
+                        _ if retry_at_due => 0,
+                        0 => ((rate * FIRST_PAY_S) as u64).min(st.covered(credited()) / 2),
+                        l => l,
+                    };
+                    if st.due_bytes_ahead(credited(), bytes, length, ahead) {
+                        paying.store(true, Ordering::SeqCst);
+                        let early = !st.due_bytes(credited(), bytes, length);
+                        let (before, asked) = (st.covered(credited()), Instant::now());
+                        let (pay, credited, paid, paying, lead_cell, st) = (&pay, &credited, &paid, &paying, &lead, &st);
+                        scope.spawn(move || {
+                            let r = pay(bytes);
+                            let span = st.covered(credited()).saturating_sub(before);
+                            // twice the body that arrived while this payment took, at most half a ticket's worth
+                            *lock(lead_cell) = ((rate * asked.elapsed().as_secs_f64() * 2.0) as u64).min(span / 2);
+                            *lock(paid) = Some((r, early));
+                            paying.store(false, Ordering::SeqCst);
+                        });
+                    }
+                } else if unpaid.is_none() && price.second_msat > 0 && st.due_bytes(credited(), bytes, length) {
                     unpaid = pay(bytes);
                 }
                 if let Some(why) = unpaid.as_ref().filter(|_| bytes >= st.covered(credited())) {
                     lock(&state).1.get_or_insert(why.clone());
                     break;
+                }
+            }
+            // a ticket still being paid beside the reading is waited for, and what it came to counted: a
+            // seller that ended the answer for want of it ended it for that refusal, early or not
+            while paying.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if let Some((r, _)) = lock(&paid).take() {
+                if unpaid.is_none() {
+                    unpaid = r;
                 }
             }
             // a seller that ended the answer where the paid bytes ran out ended it for the ticket that could not go

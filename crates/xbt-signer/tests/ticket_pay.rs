@@ -111,7 +111,7 @@ impl Handler for Service {
             let _ = n;
             Reply::Stream(Streamed { status: 200, headers: vec![("Content-Type".into(), "application/octet-stream".into())], length, body: b })
         };
-        if let Some(n) = sized("/files/").or_else(|| sized("/page/")).or_else(|| sized("/free/")).or_else(|| sized("/pieces/")).or_else(|| sized("/hot/")).or_else(|| sized("/tiny/")) {
+        if let Some(n) = sized("/files/").or_else(|| sized("/page/")).or_else(|| sized("/free/")).or_else(|| sized("/pieces/")).or_else(|| sized("/hot/")).or_else(|| sized("/tiny/")).or_else(|| sized("/uhd/")).or_else(|| sized("/hd20/")) {
             // one byte range, as a file server answers it: 206 and that part of the same bytes
             let range = req.header("Range").and_then(|r| r.strip_prefix("bytes=")).and_then(|r| r.split_once('-'))
                 .and_then(|(a, b)| Some((a.parse::<usize>().ok()?, if b.is_empty() { n.checked_sub(1)? } else { b.parse::<usize>().ok()?.min(n.checked_sub(1)?) })));
@@ -131,6 +131,23 @@ impl Handler for Service {
                                                 length: Some(span as u64), body: part });
             }
             return stream(n, Some(n as u64), body(n, 64 << 10, Duration::ZERO));
+        }
+        if let Some(n) = sized("/rate10/") {
+            // as a 4K film streams: 10 MiB a second (84 Mbit/s), 64 KiB at a time
+            return stream(n, Some(n as u64), Box::new(move |out| {
+                let start = std::time::Instant::now();
+                let mut sent = 0usize;
+                while sent < n {
+                    let k = (n - sent).min(64 << 10);
+                    out.send(&(sent..sent + k).map(pattern).collect::<Vec<u8>>())?;
+                    sent += k;
+                    let due = Duration::from_secs_f64(sent as f64 / (10.0 * MIB as f64));
+                    if let Some(wait) = due.checked_sub(start.elapsed()) {
+                        std::thread::sleep(wait);
+                    }
+                }
+                Ok(())
+            }));
         }
         if let Some(n) = sized("/slow/") {
             return stream(n, Some(n as u64), body(n, 64 << 10, Duration::from_millis(15)));
@@ -202,6 +219,10 @@ fn routes() -> Value {
         // a quarter of a win of 64 sat for a piece of 64 KiB: one piece in four wins
         {"path": "/hot/", "price": {"byte_msat": 16_000, "per_bytes": 65_536}},
         {"path": "/tiny/", "price": {"request_msat": 500}},
+        // video priced for long viewing: 1 sat a MiB (4K at 80 Mbit/s is about 36 sat a minute), and 20 sat a MiB
+        {"path": "/uhd/", "price": {"byte_msat": 1000, "per_bytes": 1_048_576}},
+        {"path": "/hd20/", "price": {"byte_msat": 20_000, "per_bytes": 1_048_576}},
+        {"path": "/rate10/", "price": {"byte_msat": 20_000, "per_bytes": 1_048_576}},
         {"path": "/tick/", "price": {"second_msat": 1000}},
         {"path": "/free/", "free": true},
         // a model: 4 sat per 1,000 tokens in, 20 sat per 1,000 tokens out, at most 500 tokens a reply
@@ -671,6 +692,8 @@ impl LnBackend for PayLn {
         let d = xbt_signer::bolt11::decode(&r.invoice).map_err(|e| node_err(&e))?;
         let hash = d.payment_hash_hex();
         let pre = self.plain.lock().unwrap().get(&hash).cloned().ok_or_else(|| node_err("no route"))?;
+        let takes = self.st.lock().unwrap().send_takes;
+        std::thread::sleep(takes);
         let mut s = self.st.lock().unwrap();
         s.next_index += 1;
         let p = json!({"payment_hash": hash, "payment_index": s.next_index.to_string(), "status": "SUCCEEDED", "value_msat": d.amount_msat.unwrap_or(0).to_string(),
@@ -4370,4 +4393,62 @@ fn a_seller_that_never_reveals_does_not_keep_the_call_open() {
     let v = rx.recv_timeout(Duration::from_secs(90)).expect("the call returns");
     assert_eq!((v["rail"].as_str(), v["wins_paid"].as_u64()), (Some("lottery"), Some(0)), "{v}");
     assert!(v["ended"].as_str().is_some_and(|e| e.contains("reveal")), "{v}");
+}
+
+/// How fast a paid body reaches a local reader through the signer and the seller's gateway, and
+/// whether a ticket bought on the way ever holds the body up. Run on demand:
+/// `cargo test --release -p xbt-signer --test ticket_pay throughput -- --ignored --nocapture`.
+/// The stand-in node pays at once, so a refill here costs only the software's own time; on a real
+/// route a payment takes a second or more, which the gap figure does not include.
+#[test]
+#[ignore]
+fn throughput_of_a_paid_stream_and_the_longest_gap_at_a_refill() {
+    use std::io::Read as _;
+    use std::os::unix::net::UnixListener;
+    use std::time::Instant;
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let prepaid_only = || json!({"tickets": {"settle": ["on-arrival"]}, "caps": {"sessions_per_address": 0}});
+    // the gateway waits for a refill as long as it does as shipped (15 s), not the tests' 400 ms
+    REFILL_WAIT_MS.store(15_000, Ordering::SeqCst);
+    // (route, bytes, max_sats, the shop, how long one payment takes on the buyer's node)
+    for (route, n, max_sats, shop, takes) in [("/uhd/", 1024 * MIB, 5_000i64, shipped_shop(), 0u64), ("/hd20/", 512 * MIB, 20_000, shipped_shop(), 0),
+                                              ("/hd20/", 512 * MIB, 20_000, prepaid_only(), 0), ("/hd20/", 512 * MIB, 20_000, prepaid_only(), 1500),
+                                              // a 4K film's rate, a prepaid ticket that takes 1.5 s to pay: no read waits as long as a payment
+                                              ("/rate10/", 200 * MIB, 20_000, prepaid_only(), 1500)] {
+        let r = Rig::shipped(json!({}), 483, shop.clone());
+        r.ln.st.lock().unwrap().send_takes = Duration::from_millis(takes);
+        let name = format!("tp{}-{}-{takes}", route.trim_matches('/'), shop["tickets"]["settle"].is_array());
+        let l = UnixListener::bind(dir.path().join(&name)).unwrap();
+        let reader = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut buf = vec![0u8; 256 << 10];
+            let (mut got, mut gaps) = (0usize, vec![]);
+            let start = Instant::now();
+            let mut last = Instant::now();
+            loop {
+                let k = s.read(&mut buf).unwrap();
+                if k == 0 {
+                    break;
+                }
+                let now = Instant::now();
+                gaps.push(now.duration_since(last));
+                last = now;
+                got += k;
+            }
+            gaps.sort();
+            (got, start.elapsed(), gaps.last().copied().unwrap_or_default(), gaps.get(gaps.len() * 99 / 100).copied().unwrap_or_default())
+        });
+        let v = r.call("xbt402_pay", json!({"url": r.shop.url(&format!("{route}{n}")), "max_sats": max_sats, "task": "film", "stream_to": name}));
+        let (got, took, worst, p99) = reader.join().unwrap();
+        println!("{route}: ended {} rule {} reason {}", v["ended"], v["rule"], v["reason"]);
+        let mbit = got as f64 * 8.0 / took.as_secs_f64() / 1e6;
+        print!("{route} prepaid-only {} payment {takes} ms: ", shop["tickets"]["settle"].is_array());
+        println!("{route}: {} MiB in {:.2} s = {mbit:.0} Mbit/s; tickets released {}, charged {} sat; longest gap between reads {:?}, p99 {:?}",
+                 got / MIB, took.as_secs_f64(), v["tickets_released"], v["charged_sats"], worst, p99);
+        assert_eq!((got, v["complete"].as_bool()), (n, Some(true)), "{v}");
+    }
+    REFILL_WAIT_MS.store(400, Ordering::SeqCst);
+    std::env::remove_var("B2_STREAM_DIR");
 }
