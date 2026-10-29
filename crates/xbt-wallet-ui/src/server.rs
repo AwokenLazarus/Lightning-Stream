@@ -232,10 +232,44 @@ impl xbt_svc::http::Handler for Ui {
                 });
                 let url = format!("{}/s/{item}", self.0.cfg.connector.trim_end_matches('/'));
                 let app = self.0.clone();
-                relay(&url, req.headers.get("range").map(String::as_str), &move |code, body| app.note_play_error(&item, code, body))
+                // a paid answer is asked for in pieces of at most PLAYER_CHUNK, whatever the player asked
+                let range = bounded_range(req.headers.get("range").map(String::as_str), PLAYER_CHUNK);
+                relay(&url, range.as_deref(), &move |code, body| app.note_play_error(&item, code, body))
             }
         }
     }
+}
+
+/// The most one request of a player buys at once: 4 MiB.
+///
+/// A browser's `<video>` reads ahead of the picture, and a paused one goes on filling its buffer,
+/// tens of MiB, and every byte of it is paid for. So the relay never asks the connector for more
+/// than this in one answer: a `Range` that is open (`bytes=N-`) or longer is cut to this length,
+/// and the seller answers `206` with that part. The browser asks for the next part when it needs it,
+/// as it does for any server that answers in parts. However a player stops (its page closed, the
+/// network gone), what it is charged beyond what it received is at most one such part.
+pub const PLAYER_CHUNK: u64 = 4 << 20;
+
+/// A player's `Range` with its length bounded to `chunk`: `bytes=N-` and `bytes=N-M` longer than
+/// `chunk` become `bytes=N-(N+chunk-1)`. A suffix range (`bytes=-N`), several ranges, a header that is
+/// not one plain byte range, or none at all are passed on as they are (the connector asks for the
+/// whole body then, as HTTP lets it).
+pub fn bounded_range(range: Option<&str>, chunk: u64) -> Option<String> {
+    let r = range?.trim();
+    let Some(spec) = r.strip_prefix("bytes=") else { return Some(r.to_string()) };
+    let Some((a, b)) = spec.split_once('-') else { return Some(r.to_string()) };
+    let (Ok(start), b) = (a.trim().parse::<u64>(), b.trim()) else { return Some(r.to_string()) };
+    if chunk == 0 || spec.contains(',') {
+        return Some(r.to_string());
+    }
+    let last = start.saturating_add(chunk - 1);
+    let end = if b.is_empty() { last } else {
+        match b.parse::<u64>() {
+            Ok(e) if e >= start => e.min(last),
+            _ => return Some(r.to_string()),
+        }
+    };
+    Some(format!("bytes={start}-{end}"))
 }
 
 /// The headers of a relayed answer that are passed on from the connector.
@@ -326,4 +360,22 @@ pub fn spawn(app: Arc<App>) -> Result<Running, String> {
     let threads = app.cfg.threads;
     let run = xbt_svc::http::serve(Arc::new(Ui(app)), listener, threads).map_err(|e| format!("serve: {e}"))?;
     Ok(Running { addr: run.addr, stop: run.stopper() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_players_range_is_cut_to_one_part() {
+        let c = 4 << 20;
+        assert_eq!(bounded_range(Some("bytes=0-"), c).as_deref(), Some("bytes=0-4194303"));
+        assert_eq!(bounded_range(Some("bytes=1000-"), c).as_deref(), Some("bytes=1000-4195303"));
+        assert_eq!(bounded_range(Some("bytes=0-99"), c).as_deref(), Some("bytes=0-99"), "a short range is kept");
+        assert_eq!(bounded_range(Some("bytes=10-99999999"), c).as_deref(), Some("bytes=10-4194313"));
+        assert_eq!(bounded_range(Some("bytes=-500"), c).as_deref(), Some("bytes=-500"), "a suffix range is passed on");
+        assert_eq!(bounded_range(Some("bytes=0-1,5-9"), c).as_deref(), Some("bytes=0-1,5-9"));
+        assert_eq!(bounded_range(Some("bytes=9-3"), c).as_deref(), Some("bytes=9-3"), "not a valid range: left to the connector");
+        assert_eq!(bounded_range(None, c), None);
+    }
 }

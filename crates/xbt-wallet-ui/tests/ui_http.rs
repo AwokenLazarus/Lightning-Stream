@@ -1206,12 +1206,17 @@ fn range_connector(film: Vec<u8>) -> (String, Seen) {
                 let _ = write!(s, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
                 continue;
             }
-            let from = range.as_deref().and_then(|r| r.strip_prefix("bytes=")).and_then(|r| r.strip_suffix('-')).and_then(|a| a.parse::<usize>().ok());
+            // `bytes=N-` or `bytes=N-M`, the end held to the film's last byte
+            let from = range.as_deref().and_then(|r| r.strip_prefix("bytes=")).and_then(|r| r.split_once('-')).and_then(|(a, e)| {
+                let a = a.parse::<usize>().ok()?;
+                let e = if e.is_empty() { film.len() - 1 } else { e.parse::<usize>().ok()?.min(film.len() - 1) };
+                Some((a, e))
+            });
             match from {
-                Some(a) => {
-                    let _ = write!(s, "HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {a}-{}/{}\r\n\
-                                       Content-Length: {}\r\nConnection: close\r\n\r\n", film.len() - 1, film.len(), film.len() - a);
-                    let _ = s.write_all(&film[a..]);
+                Some((a, e)) => {
+                    let _ = write!(s, "HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {a}-{e}/{}\r\n\
+                                       Content-Length: {}\r\nConnection: close\r\n\r\n", film.len(), e + 1 - a);
+                    let _ = s.write_all(&film[a..=e]);
                 }
                 None => {
                     let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", film.len());
@@ -1221,6 +1226,48 @@ fn range_connector(film: Vec<u8>) -> (String, Seen) {
         }
     });
     (connector, seen)
+}
+
+/// A player that reads a little of a long film and goes away (its page closed) is charged at most
+/// one part beyond what it read: the relay asks for an open range one PLAYER_CHUNK at a time, and
+/// asks for no more once the player has gone. The connector is what the wallet pays through, so
+/// what it was asked for bounds what the seller can meter.
+#[test]
+fn a_player_that_goes_away_early_is_asked_for_at_most_one_part() {
+    use std::io::{Read, Write};
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let film: Vec<u8> = b"\0\0\0\x20ftypisom".iter().copied().chain((0..(10u32 << 20)).map(|i| (i % 251) as u8)).collect();
+    let (connector, seen) = range_connector(film.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("services.json");
+    std::fs::write(&path, format!(r#"[{{"name": "Films", "kind": "video", "seller": "https://stream.lazarus-xbt.xyz", "price_text": "20 sat a MiB",
+         "items": [{{"title": "Big Buck Bunny", "year": 2008, "url": "{FILM}", "credit": "CC BY 3.0"}}]}}]"#)).unwrap();
+    let services = path.clone();
+    let b = start(json!({}), false, move |c| {
+        c.connector = connector;
+        c.services_file = Some(services);
+    });
+    let mut br = logged_in(&b);
+    let st = xbt_wallet_ui::app::stream_token(&field(&br.get("/browse").body, "csrf"));
+    // a browser's first request for a video: an open range from the start
+    let addr = b.base.trim_start_matches("http://").split('/').next().unwrap().to_string();
+    let mut sock = std::net::TcpStream::connect(&addr).unwrap();
+    let prefix = b.base.splitn(4, '/').nth(3).map(|p| format!("/{p}")).unwrap_or_default();
+    write!(sock, "GET {prefix}/s/~{st}/{FILM} HTTP/1.1\r\nHost: {addr}\r\nCookie: {}\r\nRange: bytes=0-\r\n\r\n", br.cookie).unwrap();
+    let mut got = vec![0u8; 256 << 10];
+    let mut have = 0;
+    while have < got.len() {
+        let n = sock.read(&mut got[have..]).unwrap();
+        if n == 0 { break; }
+        have += n;
+    }
+    drop(sock); // the page is closed
+    std::thread::sleep(Duration::from_millis(500));
+    let asked = seen.lock().unwrap().clone();
+    assert_eq!(asked.len(), 1, "one request reached the connector: {asked:?}");
+    assert_eq!(asked[0].1.as_deref(), Some("bytes=0-4194303"), "an open range is asked for one part (4 MiB) at a time");
+    let head = String::from_utf8_lossy(&got[..have.min(1024)]).to_string();
+    assert!(head.starts_with("HTTP/1.1 206") && head.contains(&format!("bytes 0-4194303/{}", film.len())), "{head}");
 }
 
 /// Seeking through the relay, and the links for VLC and mpv: the player's `Range` reaches the
@@ -1278,7 +1325,8 @@ fn the_relay_passes_range_and_a_players_link_plays_its_one_item_until_it_expires
                (Some(format!("bytes 1000-{}/{}", film.len() - 1, film.len()).as_str()), Some("bytes"), Some("video/mp4")));
     assert_eq!(h.get("content-length").map(String::as_str), Some((film.len() - 1000).to_string().as_str()));
     assert_eq!(body, film[1000..]);
-    assert_eq!(seen.lock().unwrap().last().unwrap(), &(format!("/s/{FILM}"), Some("bytes=1000-".to_string())));
+    // an open range is asked for as one part of at most PLAYER_CHUNK; this film is shorter than that
+    assert_eq!(seen.lock().unwrap().last().unwrap(), &(format!("/s/{FILM}"), Some("bytes=1000-4195303".to_string())));
     let (status, _, body) = get_range(&format!("{}/s/~{st}/{FILM}", b.base), Some(&br.cookie), None);
     assert_eq!((status, body.len()), (200, film.len()));
     assert_eq!(seen.lock().unwrap().last().unwrap().1, None, "no Range where the player sent none");
