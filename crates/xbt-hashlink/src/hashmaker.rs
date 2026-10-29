@@ -62,7 +62,10 @@ pub type Rails = Box<dyn FnMut() -> Box<dyn SellerRail> + Send>;
 
 const PING_EVERY: Duration = Duration::from_secs(15);
 const QUIET_LIMIT: Duration = Duration::from_secs(60);
-const RATE_WINDOW: Duration = Duration::from_secs(60);
+// Five minutes: a miner's accepted shares come a fraction of a second apart or more (one 4 TH/s
+// miner sent about 0.2 a second), so a one-minute window held a dozen or so and could read a third
+// high or low; five minutes holds five times as many.
+const RATE_WINDOW: Duration = Duration::from_secs(300);
 const LOCK_WAIT: Duration = Duration::from_secs(10);
 /// How long a miner asked to connect again is expected back from its address.
 const RETURN_WAIT: Duration = Duration::from_secs(20);
