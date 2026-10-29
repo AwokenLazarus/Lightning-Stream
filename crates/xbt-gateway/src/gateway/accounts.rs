@@ -116,7 +116,13 @@ impl Store {
         let _one = self.making.lock().unwrap_or_else(|p| p.into_inner());
         let mut a = self.get(buyer, base).ok_or("no account to renew")?;
         match cfg {
-            Accounts::Jellyfin { .. } => a.token = jellyfin_login(base, &a.name, &a.password, buyer)?,
+            Accounts::Jellyfin { admin_key_file, libraries } => match jellyfin_login(base, &a.name, &a.password, buyer) {
+                Ok(token) => a.token = token,
+                // the login kept no longer works (the seller removed or changed the user): made anew,
+                // still with the seller's key and still only for this buyer; if that fails too, nothing is
+                // served as anyone else
+                Err(_) => a = jellyfin_make(base, &read_key(admin_key_file)?, libraries, buyer)?,
+            },
             Accounts::Hook { command } => a = hook_make(command, buyer)?,
         }
         self.put(buyer, base, a.clone());

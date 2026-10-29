@@ -1768,7 +1768,7 @@ def jellyfin(link: str = "") -> None:
         print(json.dumps(diag, indent=1), flush=True)
     # the browser, from the visit's one-time code to a minute of the film and a seek
     before = money()
-    shots = f"{OUT}/jellyfin"
+    shots = f"{OUT}/jellyfin{'_' + link if link else ''}"
     t0 = time.monotonic()
     drove = subprocess.run(["node", os.path.join(os.path.dirname(__file__), "jellyfin_drive.mjs"), f"http://127.0.0.1:{port}/__ls/enter?c={code}",
                             need["JF_ITEM"], shots], env=dict(os.environ, JF_TAP_USER="^buyer-"), capture_output=True, text=True, timeout=600)
@@ -1828,6 +1828,11 @@ def jellyfin(link: str = "") -> None:
     # the next run starts with no buyer: Jellyfin names its users' ids after their names, so one left would come back
     for u in users:
         jellyfin_api("DELETE", f"/Users/{u['Id']}", key)
+    # and the gateway's own record of them, kept in its state directory, goes with them
+    try:
+        os.remove(f"{RUN}/state-jf/accounts.json")
+    except OSError:
+        pass
 
 
 CHECKS = {"page": page, "latency": latency, "stream": stream, "slots": slots, "liar": liar, "kill": kill, "offers": offers, "link": link, "link_relay": link_relay, "pruned": pruned, "jellyfin": jellyfin,

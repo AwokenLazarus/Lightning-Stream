@@ -145,9 +145,29 @@ fn each_buyer_has_an_account_of_their_own_in_jellyfin() {
     let refused = ask(&mut a4, "GET", &format!("/UserItems/{}/UserData", e.item), b"", Some(&s4[0]));
     assert_eq!((refused.status, refused.error()), (503, "accounts_unavailable".to_string()), "{}", String::from_utf8_lossy(&refused.body));
     assert_eq!(position(&mut again, &e.item), 1_111_000_000);
+    // the key back; the seller removes buyer 2's user in Jellyfin itself: buyer 2's next request makes it anew
+    // (a fresh account, its history gone with the old one) instead of a login that no longer works
+    std::fs::copy(&e.key_file, key_copy.path()).unwrap();
+    let id2 = kept.as_object().unwrap().values().map(|a| a["user_id"].as_str().unwrap().to_string())
+        .find(|id| ureq::get(&format!("{}/Users/{id}", e.url)).set("X-Emby-Token", &admin).call().ok()
+            .and_then(|r| r.into_string().ok()).and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .is_some_and(|u| u["Name"].as_str().is_some_and(|n| n.starts_with("buyer-")) && position_of(&e, &admin, &u, &e.item) == 2_222_000_000))
+        .unwrap();
+    ureq::delete(&format!("{}/Users/{id2}", e.url)).set("X-Emby-Token", &admin).call().unwrap();
+    let back = ask(&mut a2, "GET", &format!("/UserItems/{}/UserData", e.item), b"", None);
+    assert_eq!(back.status, 200, "made anew: {}", String::from_utf8_lossy(&back.body));
     // the accounts made here, deleted with the seller's real key
+    let kept: Value = serde_json::from_str(&std::fs::read_to_string(dir.path().join("accounts.json")).unwrap()).unwrap();
     for (_, a) in kept.as_object().unwrap() {
         let id = a["user_id"].as_str().unwrap();
         let _ = ureq::delete(&format!("{}/Users/{id}", e.url)).set("X-Emby-Token", &admin).call();
     }
+}
+
+/// A user's resume point for `item`, asked with the seller's key.
+fn position_of(e: &Env, admin: &str, user: &Value, item: &str) -> u64 {
+    let id = user["Id"].as_str().unwrap_or("");
+    ureq::get(&format!("{}/Users/{id}/Items/{item}", e.url)).set("X-Emby-Token", admin).call().ok()
+        .and_then(|r| r.into_string().ok()).and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| v["UserData"]["PlaybackPositionTicks"].as_u64()).unwrap_or(0)
 }
