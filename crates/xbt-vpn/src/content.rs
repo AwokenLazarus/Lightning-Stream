@@ -64,40 +64,156 @@ impl DomainSet {
         }
     }
 
-    /// Adds the names of a blocklist file in any of the common formats: one domain a line, a hosts
-    /// file (`0.0.0.0 example.com`), or adblock style (`||example.com^`). Comments are skipped.
+    /// Adds the names of a blocklist file in any of the common formats (see [`list_names`]): the
+    /// operator's own short lists. Category lists use [`CompactSet`].
     pub fn add_list(&mut self, text: &str) {
-        for line in text.lines() {
-            let line = line.split('#').next().unwrap_or("").trim();
-            if line.is_empty() || line.starts_with('!') {
-                continue;
+        for name in list_names(text) {
+            self.insert(name);
+        }
+    }
+}
+
+/// The names of one blocklist file in any of the common formats: one domain a line, a hosts file
+/// (`0.0.0.0 example.com`), or adblock style (`||example.com^`). Comments, `localhost` and bare
+/// addresses are skipped; the names come back as they are written (not yet normalized).
+fn list_names(text: &str) -> impl Iterator<Item = &str> {
+    text.lines().filter_map(|line| {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() || line.starts_with('!') {
+            return None;
+        }
+        let name = if let Some(r) = line.strip_prefix("||") {
+            r.trim_end_matches('^')
+        } else {
+            let mut f = line.split_whitespace();
+            let first = f.next().unwrap_or("");
+            match f.next() {
+                // a hosts file line: the address first, then the name
+                Some(second) if first.parse::<IpAddr>().is_ok() => second,
+                _ => first,
             }
-            let name = if let Some(r) = line.strip_prefix("||") {
-                r.trim_end_matches('^')
-            } else {
-                let mut f = line.split_whitespace();
-                let first = f.next().unwrap_or("");
-                match f.next() {
-                    // a hosts file line: the address first, then the name
-                    Some(second) if first.parse::<IpAddr>().is_ok() => second,
-                    _ => first,
-                }
-            };
-            if name != "localhost" && !name.ends_with(".localdomain") && name.parse::<IpAddr>().is_err() {
-                self.insert(name);
+        };
+        (name != "localhost" && !name.ends_with(".localdomain") && name.parse::<IpAddr>().is_err()).then_some(name)
+    })
+}
+
+/// The bytes behind a [`CompactSet`]: a memory-mapped file, or a set built in memory (tests).
+enum Backing {
+    Mapped(memmap2::Mmap),
+    Owned(Vec<u8>),
+}
+
+impl AsRef<[u8]> for Backing {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Backing::Mapped(m) => m,
+            Backing::Owned(v) => v,
+        }
+    }
+}
+
+/// A category list compiled to a finite-state set: the millions of names of a large list take a
+/// few MiB, and a set read from its file is memory-mapped, so the kernel pages it in and out
+/// instead of the exit holding every name in RAM. A name matches if it or any domain above it is in
+/// the set, as with [`DomainSet`].
+pub struct CompactSet {
+    set: fst::Set<Backing>,
+}
+
+impl std::fmt::Debug for CompactSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CompactSet({} names)", self.set.len())
+    }
+}
+
+impl CompactSet {
+    /// Compiles a blocklist's text into the set's bytes, written to `out`. The names are normalized,
+    /// sorted and deduplicated first: one copy of the text and one slice per name, briefly.
+    pub fn compile<W: std::io::Write>(text: &str, out: W) -> std::io::Result<()> {
+        Self::compile_lowercase(&text.to_ascii_lowercase(), out)
+    }
+
+    /// [`Self::compile`] for text already in lower case (a large list is lowered in place, so it is
+    /// held once).
+    pub fn compile_lowercase<W: std::io::Write>(lower: &str, out: W) -> std::io::Result<()> {
+        let mut names: Vec<&str> = list_names(lower).map(|n| n.trim().trim_end_matches('.')).filter(|n| n.contains('.')).collect();
+        names.sort_unstable();
+        names.dedup();
+        let mut b = fst::SetBuilder::new(out).map_err(std::io::Error::other)?;
+        for n in names {
+            b.insert(n).map_err(std::io::Error::other)?;
+        }
+        b.finish().map_err(std::io::Error::other)
+    }
+
+    /// A set built in memory from a list's text.
+    pub fn from_list(text: &str) -> Self {
+        let mut bytes = Vec::new();
+        Self::compile(text, &mut bytes).expect("a set built in memory");
+        Self { set: fst::Set::new(Backing::Owned(bytes)).expect("a set just built") }
+    }
+
+    /// The set compiled into `path`, memory-mapped. A file that isn't a valid set is an error.
+    pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
+        let f = std::fs::File::open(path)?;
+        // Safety: the file is the exit's own compiled list. It is never written in place: an update
+        // writes a new file and renames it over this one, so this mapping keeps reading the old
+        // inode until it is dropped.
+        let map = unsafe { memmap2::Mmap::map(&f)? };
+        Ok(Self { set: fst::Set::new(Backing::Mapped(map)).map_err(std::io::Error::other)? })
+    }
+
+    pub fn len(&self) -> usize {
+        self.set.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
+
+    /// Whether `name` or a domain above it is in the set.
+    pub fn matches(&self, name: &str) -> bool {
+        let n = normalize(name);
+        let mut rest = n.as_str();
+        loop {
+            if self.set.contains(rest) {
+                return true;
+            }
+            match rest.split_once('.') {
+                Some((_, up)) if up.contains('.') => rest = up,
+                _ => return false,
             }
         }
+    }
+}
+
+/// The category lists an exit blocks, one [`CompactSet`] each.
+#[derive(Debug, Default)]
+pub struct CategorySets(pub Vec<CompactSet>);
+
+impl CategorySets {
+    pub fn matches(&self, name: &str) -> bool {
+        self.0.iter().any(|s| s.matches(name))
+    }
+
+    /// Names across the lists (a name in two lists counts twice).
+    pub fn len(&self) -> usize {
+        self.0.iter().map(CompactSet::len).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
 /// Category lists an exit keeps up to date while it runs ([`crate::lists`]): replaced whole on each
 /// update, read by every flow.
 #[derive(Clone, Debug, Default)]
-pub struct LiveLists(Arc<RwLock<DomainSet>>);
+pub struct LiveLists(Arc<RwLock<CategorySets>>);
 
 impl LiveLists {
     /// Replaces the lists with a freshly loaded set.
-    pub fn replace(&self, d: DomainSet) {
+    pub fn replace(&self, d: CategorySets) {
         *self.0.write().unwrap_or_else(|e| e.into_inner()) = d;
     }
 
@@ -360,6 +476,36 @@ pub(crate) mod tests {
         assert_eq!(f.blocks_name("notblocked.example"), None);
         assert_eq!(f.blocks_name("example"), None);
         assert_eq!(f.blocks_name("localhost"), None);
+    }
+
+    #[test]
+    fn a_compact_list_matches_like_a_domain_set() {
+        let text = "# a hosts file\n0.0.0.0 Blocked.Example.\n127.0.0.1 localhost\n||ads.example^\nplain.example\nplain.example\n10.0.0.1\nnodot\n";
+        let c = CompactSet::from_list(text);
+        let mut d = DomainSet::default();
+        d.add_list(text);
+        assert_eq!(c.len(), 3, "normalized, deduplicated, no localhost, bare address or single label");
+        assert_eq!(c.len(), d.len());
+        for name in ["blocked.example", "WWW.Blocked.Example.", "a.b.ads.example", "plain.example", "notblocked.example", "example", "localhost", "ads.example.org"] {
+            assert_eq!(c.matches(name), d.matches(name), "{name}");
+        }
+        assert!(c.matches("deep.sub.plain.example") && !c.matches("xplain.example"));
+    }
+
+    #[test]
+    fn a_compiled_list_is_read_from_its_file_and_a_damaged_one_refused() {
+        let dir = std::env::temp_dir().join(format!("xbt-vpn-compact-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("adult.fst");
+        CompactSet::compile("one.example\ntwo.example\n", std::fs::File::create(&path).unwrap()).unwrap();
+        let c = CompactSet::open(&path).unwrap();
+        assert!(c.matches("www.two.example") && !c.matches("three.example"));
+        let lists = LiveLists::default();
+        lists.replace(CategorySets(vec![c, CompactSet::from_list("three.example\n")]));
+        assert!(lists.matches("three.example") && lists.matches("one.example") && lists.len() == 3);
+        std::fs::write(&path, b"not a set").unwrap();
+        assert!(CompactSet::open(&path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

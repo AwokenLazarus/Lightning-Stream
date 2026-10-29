@@ -1,7 +1,8 @@
 //! Category blocklists a filtered exit's operator can tick, kept up to date while the exit runs.
 //!
-//! Each category is one public list of domain names, fetched over HTTPS, saved next to the exit's
-//! other files, and loaded into the exit's [`LiveLists`]. The exit checks for a newer copy once a day
+//! Each category is one public list of domain names, fetched over HTTPS, compiled once into a
+//! compact finite-state set saved next to the exit's other files ([`CompactSet`]: millions of names
+//! in a few MiB, memory-mapped), and loaded into the exit's [`LiveLists`]. The exit checks for a newer copy once a day
 //! (`If-Modified-Since`), and keeps the last good copy if a fetch fails, so a list host being down
 //! never turns filtering off. A saved copy is used at start, before any fetch.
 //!
@@ -12,7 +13,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::content::{DomainSet, LiveLists};
+use crate::content::{CategorySets, CompactSet, LiveLists};
 
 /// One category an operator can block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +58,24 @@ fn list_path(dir: &Path, id: &str) -> PathBuf {
     dir.join(format!("{id}.txt"))
 }
 
+/// The compiled copy of a category, the one the exit reads.
+fn set_path(dir: &Path, id: &str) -> PathBuf {
+    dir.join(format!("{id}.fst"))
+}
+
+/// Compiles the saved text of a category into its compact set, replacing the old one whole, then
+/// removes the text (the compiled copy is all the exit needs).
+fn compile(dir: &Path, id: &str) -> io::Result<()> {
+    let mut text = std::fs::read_to_string(list_path(dir, id))?;
+    text.make_ascii_lowercase();
+    let tmp = dir.join(format!(".{id}.fst.part"));
+    let out = io::BufWriter::new(std::fs::File::create(&tmp)?);
+    CompactSet::compile_lowercase(&text, out)?;
+    drop(text);
+    std::fs::rename(&tmp, set_path(dir, id))?;
+    std::fs::remove_file(list_path(dir, id))
+}
+
 fn stamp_path(dir: &Path, id: &str) -> PathBuf {
     dir.join(format!("{id}.last-modified"))
 }
@@ -80,7 +99,7 @@ pub fn fetch(id: &str, url: &str, dir: &Path) -> io::Result<Fetched> {
     std::fs::create_dir_all(dir)?;
     let mut req = ureq::get(url).timeout(Duration::from_secs(120));
     let stamp = std::fs::read_to_string(stamp_path(dir, id)).ok();
-    if let Some(s) = stamp.as_deref().filter(|_| list_path(dir, id).exists()) {
+    if let Some(s) = stamp.as_deref().filter(|_| set_path(dir, id).exists() || list_path(dir, id).exists()) {
         req = req.set("If-Modified-Since", s.trim());
     }
     let resp = match req.call() {
@@ -92,14 +111,17 @@ pub fn fetch(id: &str, url: &str, dir: &Path) -> io::Result<Fetched> {
         return Ok(Fetched::Unchanged);
     }
     let modified = resp.header("Last-Modified").map(str::to_string);
-    let mut body = Vec::new();
-    resp.into_reader().take(MAX_LIST_BYTES + 1).read_to_end(&mut body)?;
-    if body.len() as u64 > MAX_LIST_BYTES {
+    // straight to disk, never whole in memory
+    let tmp = dir.join(format!(".{id}.txt.part"));
+    let mut f = std::fs::File::create(&tmp)?;
+    let n = io::copy(&mut resp.into_reader().take(MAX_LIST_BYTES + 1), &mut f)?;
+    drop(f);
+    if n > MAX_LIST_BYTES {
+        let _ = std::fs::remove_file(&tmp);
         return Err(io_err("a list larger than an exit takes"));
     }
-    let tmp = dir.join(format!(".{id}.txt.part"));
-    std::fs::write(&tmp, &body)?;
     std::fs::rename(&tmp, list_path(dir, id))?;
+    compile(dir, id)?;
     match modified {
         Some(m) => std::fs::write(stamp_path(dir, id), m)?,
         None => {
@@ -109,15 +131,19 @@ pub fn fetch(id: &str, url: &str, dir: &Path) -> io::Result<Fetched> {
     Ok(Fetched::Updated)
 }
 
-/// The names of the saved copies of these categories (a missing copy adds nothing).
-pub fn load(ids: &[String], dir: &Path) -> DomainSet {
-    let mut d = DomainSet::default();
+/// The compiled copies of these categories, memory-mapped (a missing copy adds nothing). A text copy
+/// left uncompiled, by an older version or an interrupted update, is compiled first.
+pub fn load(ids: &[String], dir: &Path) -> CategorySets {
+    let mut sets = Vec::new();
     for id in ids {
-        if let Ok(text) = std::fs::read_to_string(list_path(dir, id)) {
-            d.add_list(&text);
+        if list_path(dir, id).exists() {
+            let _ = compile(dir, id);
+        }
+        if let Ok(s) = CompactSet::open(&set_path(dir, id)) {
+            sets.push(s);
         }
     }
-    d
+    CategorySets(sets)
 }
 
 /// Keeps `lists` filled with these categories: loads the saved copies at once, then fetches newer

@@ -129,7 +129,13 @@ fn lists(args: &[String]) -> std::io::Result<()> {
         let before = rss_kib();
         let t = Instant::now();
         let d = lists::load(std::slice::from_ref(id), &dir);
-        println!("{}", serde_json::json!({ "category": id, "fetched": format!("{fetched:?}"), "fetch_ms": fetch_ms, "names": d.len(), "load_ms": t.elapsed().as_millis(), "rss_added_mib": (rss_kib().saturating_sub(before)) / 1024 }));
+        let load_ms = t.elapsed().as_millis();
+        // 100,000 look-ups of names not in the list, each walking up its domains (the slow case)
+        let t = Instant::now();
+        let hits = (0..100_000).filter(|i| d.matches(&format!("a.b.n{i}.not-listed.example"))).count();
+        let lookup_ns = t.elapsed().as_nanos() / 100_000;
+        let set_kib = std::fs::metadata(dir.join(format!("{id}.fst"))).map(|m| m.len() / 1024).unwrap_or(0);
+        println!("{}", serde_json::json!({ "category": id, "fetched": format!("{fetched:?}"), "fetch_ms": fetch_ms, "names": d.len(), "load_ms": load_ms, "rss_added_mib": (rss_kib().saturating_sub(before)) / 1024, "set_file_kib": set_kib, "lookup_ns": lookup_ns, "false_hits": hits }));
         drop(d);
     }
     Ok(())

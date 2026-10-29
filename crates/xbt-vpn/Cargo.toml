@@ -34,6 +34,10 @@ ureq.workspace = true
 # DNS-over-HTTPS when an exit's network blocks DNS-over-TLS (resolvers speak HTTP/2)
 h2 = "0.4"
 http = "1"
+# category blocklists kept compact: each list compiled once to a finite-state set (millions of names
+# in a few MiB) and memory-mapped, so a Pi exit holds them without hundreds of MiB of RAM
+fst = "=0.4.7"
+memmap2 = "0.9"
 
 [dev-dependencies]
 # a test DNS-over-TLS server's certificate
