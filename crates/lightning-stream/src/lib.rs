@@ -36,6 +36,8 @@
 //! another range than was asked): the client gets 502. One socket, one line, no second round trip
 //! to the signer and no second request to the seller.
 
+pub mod inference;
+
 use std::io::{self, BufRead, BufReader, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
