@@ -127,10 +127,10 @@ fn watch(conn: Connection, paths: Arc<Mutex<HashMap<EndpointId, Path>>>, detail:
                     _ => None,
                 }
             });
-            let changed = match (&last, &now) {
-                (Some(Path::Direct { .. }), Some(Path::Direct { .. })) | (Some(Path::Relay { .. }), Some(Path::Relay { .. })) | (None, None) => false,
-                _ => true,
-            };
+            let changed = !matches!(
+                (&last, &now),
+                (Some(Path::Direct { .. }), Some(Path::Direct { .. })) | (Some(Path::Relay { .. }), Some(Path::Relay { .. })) | (None, None)
+            );
             if let Some(p) = &now {
                 lock(&paths).insert(peer, p.clone());
                 if changed {
