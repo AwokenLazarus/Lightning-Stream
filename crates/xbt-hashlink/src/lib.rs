@@ -27,6 +27,7 @@ pub mod listing;
 pub mod meter;
 pub mod msg;
 pub mod noise;
+pub mod over_iroh;
 pub mod rail;
 pub mod standin;
 pub mod sv1;

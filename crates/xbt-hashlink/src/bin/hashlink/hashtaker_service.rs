@@ -3,6 +3,9 @@
 //! chosen there, not here), pays each slice through the wallet's signer under its policy, and keeps
 //! every rental's live state for the app. Several rentals can run at once.
 //!
+//! A hashmaker whose listing names an iroh link is reached over it (no port forward on either side;
+//! `--iroh off` turns it off, `--iroh-relays` names relays); one naming only a TCP address, over TCP.
+//!
 //! Control page: `GET /status`, `GET /offers`, `POST /rent {"linkKey", "miners", "budgetSats",
 //! "minutes"}`, `POST /cut {"rental"}`, `POST /datum {"addr"}`.
 
@@ -17,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use xbt_hashlink::hashtaker;
 use xbt_hashlink::listing::{self, Hashrate};
+use xbt_hashlink::over_iroh::{self, Dialer};
 use xbt_hashlink::rail::{LabHashtaker, SignerPayer};
 
 const OFFERS_FRESH: Duration = Duration::from_secs(20);
@@ -44,6 +48,11 @@ struct R {
     state: Option<PathBuf>,
     offers: Option<(Instant, Vec<(Hashrate, String)>)>,
     rentals: BTreeMap<String, Rental>,
+    /// The iroh link to hashmakers, started at the first rental that needs it; `None` inside when it
+    /// is turned off or did not start.
+    iroh: Option<Option<Arc<Dialer>>>,
+    iroh_off: bool,
+    iroh_relays: Option<String>,
 }
 
 /// Can a Stratum endpoint be reached (a TCP connection within a second)?
@@ -70,6 +79,9 @@ pub fn run(f: &HashMap<String, String>) -> Result<(), String> {
         state,
         offers: None,
         rentals: BTreeMap::new(),
+        iroh: None,
+        iroh_off: f.get("iroh").map(String::as_str) == Some("off"),
+        iroh_relays: f.get("iroh-relays").cloned(),
     }));
     let candidates = f.get("datum-candidates").map(|c| super::relays(c)).unwrap_or_default();
     let addr = super::need(f, "control")?.to_string();
@@ -88,6 +100,7 @@ fn lock(r: &Mutex<R>) -> std::sync::MutexGuard<'_, R> {
 fn offer_json(h: &Hashrate, event: &str) -> Value {
     json!({
         "name": h.name, "algorithm": h.algorithm, "linkKey": hex::encode(h.link_key.serialize()), "linkAddr": h.link_addr,
+        "directLink": h.iroh.is_some(),
         "priceMsat": h.terms.price_msat, "sliceWork": h.terms.slice_work.to_string(), "graceMs": h.terms.grace_ms,
         "hashrateHs": h.hashrate_hs.to_string(), "payUrl": h.pay_url, "payNode": h.pay_node,
         "miners": h.capacity.miners, "freeMiners": h.capacity.free_miners, "freeHs": h.capacity.free_hs.to_string(), "event": event,
@@ -196,6 +209,19 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
     if h.terms.price_msat > budget_sats * 1000 {
         return (400, json!({"error": "the budget is less than one slice"}));
     }
+    // over iroh when the listing offers it (no port forward needed on the hashmaker's side), else over
+    // TCP to the address it names
+    let addr = match &h.iroh {
+        Some(i) => match dialer(r) {
+            Some(d) => match d.address_for(i) {
+                Ok(a) => a,
+                Err(e) => return (502, json!({"error": format!("the direct link to that hashmaker did not open: {e}")})),
+            },
+            None if !h.link_addr.is_empty() => h.link_addr.clone(),
+            None => return (502, json!({"error": "that hashmaker is reached only over a direct link, and this app's direct link is off or did not start"})),
+        },
+        None => h.link_addr.clone(),
+    };
     let id = format!("r{}", xbt_hashlink::now_ms());
     let live = Arc::new(Mutex::new(json!({"closed": null})));
     let cut = Arc::new(AtomicBool::new(false));
@@ -206,7 +232,7 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
     };
     let payer = signer.map(|sock| SignerPayer { sock, url: h.pay_url.clone(), task, max_sats: budget_sats, session: None });
     let cfg = hashtaker::Config {
-        hashmaker: h.link_addr.clone(),
+        hashmaker: addr,
         hashmaker_key: h.link_key,
         key,
         upstream: datum,
@@ -252,4 +278,24 @@ fn rent(r: &Arc<Mutex<R>>, b: &Value) -> (u16, Value) {
         eprintln!("hashtaker: rental with {} ended", hex::encode(hashmaker_key.serialize()));
     });
     (200, json!({"ok": true, "rental": id}))
+}
+
+/// The iroh link to hashmakers, started once.
+fn dialer(r: &Mutex<R>) -> Option<Arc<Dialer>> {
+    let mut g = lock(r);
+    if g.iroh.is_none() {
+        let d = if g.iroh_off {
+            None
+        } else {
+            match Dialer::start(over_iroh::relays(g.iroh_relays.as_deref())) {
+                Ok(d) => Some(Arc::new(d)),
+                Err(e) => {
+                    eprintln!("hashtaker: the iroh link did not start: {e}");
+                    None
+                }
+            }
+        };
+        g.iroh = Some(d);
+    }
+    g.iroh.clone().flatten()
 }

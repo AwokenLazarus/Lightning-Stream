@@ -8,8 +8,11 @@
 //!   "graceMs": 45000, "rentable": 3, "name": "My miners", "linkPublic": "host:port",
 //!   "payUrl": "https://shop.example/hashrate", "payNode": "02…", "minersPublic": "host:port"}`
 //!
-//! `linkPublic` is the address hashtakers outside this network reach the link at (a port forward or a
-//! tunnel). Without it no listing goes to the relays: an address only the LAN can reach would send
+//! Hashtakers reach the link over iroh by default (`--iroh off` turns it off; `--iroh-relays` names
+//! relays, `none` for direct only): the listing names the link's iroh key and relay, and no port
+//! forward is needed. `linkPublic` is, besides, an address hashtakers outside this network reach the
+//! link at over plain TCP (a port forward or a tunnel), for hashtakers on apps from before the iroh
+//! link. With neither, no listing goes to the relays: an address only the LAN can reach would send
 //! hashtakers nowhere. `--link-lan` is the address shown for hashtakers on the same network.
 //!
 //! Without `payNode`, the node is read from the hashmaker's gateway (`--gateway`, its `/services`).
@@ -23,8 +26,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use xbt_hashlink::hashmaker::{self, Hashmaker};
-use xbt_hashlink::listing::Capacity;
+use xbt_hashlink::listing::{Capacity, IrohLink};
 use xbt_hashlink::msg::Terms;
+use xbt_hashlink::over_iroh;
 use xbt_hashlink::rail::LabSeller;
 
 /// A change in what is for rent (miners, free miners, renting on or off, the terms, the name, or
@@ -47,6 +51,8 @@ struct Said {
     /// Where hashtakers reach the link and pay for the work: an owner setting the address hashtakers
     /// use is news, not a wait for the long timer.
     link_public: Option<String>,
+    /// The iroh link's key and relay: a new relay is news too.
+    iroh: Option<IrohLink>,
     pay_url: Option<String>,
     pay_node: Option<String>,
 }
@@ -66,6 +72,7 @@ fn due(last: Option<(&Said, bool)>, now: &Said, since: Duration) -> bool {
         || l.terms != now.terms
         || l.name != now.name
         || l.link_public != now.link_public
+        || l.iroh != now.iroh
         || l.pay_url != now.pay_url
         || l.pay_node != now.pay_node;
     if what {
@@ -193,12 +200,26 @@ pub fn run(f: &HashMap<String, String>, key: SecretKey) -> Result<(), String> {
         Box::new(|| Box::<LabSeller>::default()),
     )?);
     h.set_open(settings.enabled && settings.fallback.is_some());
+    // the link over iroh: hashtakers reach it by key, through our relay or directly, with no port
+    // forward; the Noise handshake inside each stream is the same as over TCP
+    let iroh = if f.get("iroh").map(String::as_str) == Some("off") {
+        None
+    } else {
+        match over_iroh::serve(&key, over_iroh::relays(f.get("iroh-relays").map(String::as_str)), super::need(f, "link")?) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                eprintln!("hashmaker: the iroh link did not start ({e}); hashtakers reach the link over TCP only");
+                None
+            }
+        }
+    };
     let published: Arc<Mutex<Value>> = Arc::new(Mutex::new(Value::Null));
     let shared = Arc::new(Mutex::new(settings.clone()));
     if let Some(addr) = f.get("control") {
         let (h, published, shared) = (h.clone(), published.clone(), shared.clone());
         let miners_default = f.get("miners").cloned().unwrap_or_default();
         let link_lan = f.get("link-lan").cloned().or_else(|| f.get("link").cloned()).unwrap_or_default();
+        let iroh = iroh.clone();
         let listing = f.contains_key("relays");
         let token = f.get("control-token-file").map(|p| http::token(p)).transpose()?;
         http::serve(addr, token, Arc::new(move |method, path, _body| {
@@ -213,6 +234,10 @@ pub fn run(f: &HashMap<String, String>, key: SecretKey) -> Result<(), String> {
                     });
                     v["minersAddress"] = json!(s.miners_public.clone().unwrap_or_else(|| miners_default.clone()));
                     v["linkLan"] = json!(link_lan);
+                    v["iroh"] = match &iroh {
+                        Some(l) => json!({"id": l.endpoint_id(), "relays": over_iroh::advertise(l, Duration::ZERO).relays}),
+                        None => Value::Null,
+                    };
                     v["listing"] = if listing { published.lock().unwrap_or_else(|p| p.into_inner()).clone() } else { json!({"relays": "none set"}) };
                     (200, v)
                 }
@@ -258,15 +283,19 @@ pub fn run(f: &HashMap<String, String>, key: SecretKey) -> Result<(), String> {
                 *shared.lock().unwrap_or_else(|p| p.into_inner()) = settings.clone();
             }
         }
+        // the relay the link is found through, once one has answered (a link with no relay yet is
+        // not offered: a listing naming no way to reach it would send hashtakers nowhere)
+        let iroh_now = iroh.as_ref().map(|l| over_iroh::advertise(l, Duration::from_secs(10))).filter(|i| !i.relays.is_empty() || !i.direct.is_empty());
         let now = Said { cap, renting, terms: settings.terms.clone(), name: settings.name.clone(),
-                         link_public: settings.link_public.clone(), pay_url: settings.pay_url.clone(), pay_node: settings.pay_node.clone() };
+                         link_public: settings.link_public.clone(), iroh: iroh_now.clone(), pay_url: settings.pay_url.clone(), pay_node: settings.pay_node.clone() };
         if !due(last.as_ref().map(|(s, ok)| (s, *ok)), &now, last_pub.elapsed()) {
             continue;
         }
         // no public address hashtakers can reach: no listing on public relays (one naming an address
         // only the LAN can reach would send hashtakers nowhere)
+        let reach = iroh_now.as_ref().map(|i| i.id.clone()).or_else(|| settings.link_public.clone());
         let missing = [
-            ("link-public", &settings.link_public, "Add the address hashtakers use to reach your miners (it needs a port forward or a tunnel). Until then your offer is not published; hashtakers on your own network can still use this box's address."),
+            ("link", &reach, "Your miners cannot be reached from outside yet: the direct link has not found our relay. Check this box's internet connection; your offer is published once it has."),
             ("pay-url", &settings.pay_url, "Set your shop's public address on the Sell page first."),
             ("pay-node", &settings.pay_node, "Your shop's Lightning node is not known yet."),
         ]
@@ -290,6 +319,10 @@ pub fn run(f: &HashMap<String, String>, key: SecretKey) -> Result<(), String> {
                 fl.insert(k.into(), v.clone());
             }
         }
+        if let Some(i) = &iroh_now {
+            fl.insert("iroh-id".into(), i.id.clone());
+            fl.insert("iroh-relays".into(), i.relays.join(","));
+        }
         let res = super::listing_of(&fl, &key_of(f)?, &settings.terms, cap).and_then(|l| super::publish(&fl, r, &key_of(f)?, &l).map(|_| l));
         *published.lock().unwrap_or_else(|p| p.into_inner()) = match &res {
             Ok(l) => json!({"ok": true, "atMs": xbt_hashlink::now_ms(), "freeMiners": l.capacity.free_miners, "miners": l.capacity.miners}),
@@ -310,7 +343,7 @@ mod tests {
 
     fn said(miners: u32, free: u32, hs: u64) -> Said {
         Said { cap: Capacity { miners, free_miners: free, free_hs: hs }, renting: true, terms: Terms { slice_work: 1 << 47, price_msat: 40_000, grace_ms: 45_000 }, name: "m".into(),
-              link_public: None, pay_url: Some("https://box.example/hashrate".into()), pay_node: Some("02aa".into()) }
+              link_public: None, iroh: None, pay_url: Some("https://box.example/hashrate".into()), pay_node: Some("02aa".into()) }
     }
     const S: fn(u64) -> Duration = Duration::from_secs;
 
@@ -357,6 +390,11 @@ mod tests {
         node.pay_node = Some("02bb".into());
         assert!(due(Some((&set, true)), &node, S(60)));
         assert!(!due(Some((&set, true)), &set.clone(), S(3600)), "unchanged: the long timer");
+        // the iroh link finding (another) relay is news the same way
+        let mut relayed = set.clone();
+        relayed.iroh = Some(IrohLink { id: "ab".repeat(32), relays: vec!["https://relay.example".into()], direct: vec![] });
+        assert!(!due(Some((&set, true)), &relayed, S(30)));
+        assert!(due(Some((&set, true)), &relayed, S(60)));
     }
 
     #[test]

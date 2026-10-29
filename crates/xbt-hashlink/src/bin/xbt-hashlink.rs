@@ -224,8 +224,18 @@ pub(crate) fn listing_of(f: &HashMap<String, String>, key: &SecretKey, t: &Terms
         name: need(f, "name")?.into(),
         algorithm: "blake2b".into(),
         hashrate_hs: num(f, "hashrate-hs", Some(capacity.free_hs))?,
-        link_addr: need(f, "link-public")?.into(),
+        // over iroh only, a listing names no TCP address: hashtakers reach the link by its iroh key
+        link_addr: match (f.get("link-public"), f.get("iroh-id")) {
+            (Some(a), _) => a.clone(),
+            (None, Some(_)) => String::new(),
+            (None, None) => need(f, "link-public")?.into(),
+        },
         link_key: pubkey(key),
+        iroh: f.get("iroh-id").map(|id| listing::IrohLink {
+            id: id.clone(),
+            relays: f.get("iroh-relays").map(|r| relays(r)).unwrap_or_default(),
+            direct: Vec::new(),
+        }),
         pay_url: need(f, "pay-url")?.into(),
         pay_node: need(f, "pay-node")?.into(),
         terms: t.clone(),
