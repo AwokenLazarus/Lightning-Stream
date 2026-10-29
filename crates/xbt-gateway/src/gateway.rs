@@ -1435,6 +1435,13 @@ impl Gateway {
         Ok(out)
     }
 
+    /// A GET or HEAD of `…/v1/models` on a route priced by the token.
+    fn model_list(req: &Request, path: &str, route: &Route) -> bool {
+        route.price.tokens.active()
+            && (req.method == "GET" || req.method == "HEAD")
+            && path.trim_end_matches('/').ends_with("/v1/models")
+    }
+
     fn free(&self, req: &Request, route: &Route) -> Reply {
         let answer = match self.send_upstream(route, req) {
             Ok(a) if a.status != 402 => a,
@@ -1476,6 +1483,11 @@ impl Gateway {
                 "nothing is sold or served at this path",
             ));
         };
+        // An AI model's list of models is free to read: a buyer needs it to choose a model before
+        // paying, and it costs the service nothing.
+        if Self::model_list(&req, &path, route) {
+            return self.free(&req, route);
+        }
         if !route.methods.iter().any(|m| m == &req.method) {
             return Reply::Whole(error(
                 405,
