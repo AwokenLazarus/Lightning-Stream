@@ -27,9 +27,11 @@ use bytes::Bytes;
 use ipstack::{IpStack, IpStackConfig, IpStackStream};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::{mpsc, Mutex};
-use xbt_iroh_link::{Link, LinkConnection};
+use xbt_iroh_link::{Link, LinkConnection, ALPN_VPN_HOP};
 
-use crate::flow::{open_tcp, recv_udp, send_udp, Opened};
+use crate::flow::{open_tcp, open_tcp_on, recv_udp, send_udp, Opened};
+use crate::hop::open_sealed;
+use crate::sealed;
 use rustls::pki_types::ServerName;
 use tokio_rustls::TlsConnector;
 use crate::meter::Meter;
@@ -94,7 +96,20 @@ impl EncryptedDns {
 struct ExitConn {
     conn: LinkConnection,
     udp: Arc<Mutex<HashMap<u32, mpsc::Sender<Bytes>>>>,
+    /// Through a first hop (two hops): `conn` is to the hop, and each flow is sealed for the exit.
+    sealed: Option<Sealed>,
 }
+
+/// What a buyer needs to seal a flow for an exit behind a first hop.
+struct Sealed {
+    exit: [u8; 32],
+    exit_relays: Vec<String>,
+    tls: Arc<rustls::ClientConfig>,
+}
+
+/// A flow's stream to its exit, straight or sealed through a first hop.
+trait Duplex: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Duplex for T {}
 
 /// The buyer's devices, router and exit connections.
 pub struct Buyer {
@@ -108,6 +123,11 @@ pub struct Buyer {
     dns: Option<EncryptedDns>,
     exits: Mutex<HashMap<String, Arc<ExitConn>>>,
     next_flow: AtomicU32,
+    /// The key this buyer shows exits it reaches through a first hop: made for this run, it names
+    /// nobody, and exits count and limit flows by it.
+    sealed_secret: [u8; 32],
+    /// UDP flows refused because two hops carry TCP only.
+    pub udp_refused_two_hop: AtomicU64,
     /// Flows refused (no exit, a device over its limit, an exit's refusal).
     pub refused: AtomicU64,
 }
@@ -136,6 +156,8 @@ impl Buyer {
             dns,
             exits: Mutex::new(HashMap::new()),
             next_flow: AtomicU32::new(1),
+            sealed_secret: rand_secret(),
+            udp_refused_two_hop: AtomicU64::new(0),
             refused: AtomicU64::new(0),
         })
     }
@@ -187,11 +209,8 @@ impl Buyer {
         let dns = self.dns.as_ref()?;
         let (exit_id, exit) = self.route(device, dns.addr).await?;
         let answer = async {
-            let (opened, send, recv) = open_tcp(&exit.conn, dns.addr).await.ok()?;
-            if opened != Opened::Yes {
-                return None;
-            }
-            let mut tls = TlsConnector::from(dns.tls.clone()).connect(dns.name.clone(), tokio::io::join(recv, send)).await.ok()?;
+            let flow = open_flow(&exit, dns.addr).await?;
+            let mut tls = TlsConnector::from(dns.tls.clone()).connect(dns.name.clone(), flow).await.ok()?;
             let mut msg = (query.len() as u16).to_be_bytes().to_vec();
             msg.extend_from_slice(query);
             tls.write_all(&msg).await.ok()?;
@@ -212,12 +231,27 @@ impl Buyer {
 
     /// The connection to an exit, made on first use. A failed connection marks the exit failed in
     /// the router.
-    async fn exit(self: &Arc<Self>, id: &str) -> Option<Arc<ExitConn>> {
+    async fn exit(self: &Arc<Self>, device: IpAddr, id: &str) -> Option<Arc<ExitConn>> {
+        let hop = self.router_for(device).lock().await.first_hop_for(id);
+        let key = match &hop {
+            Some(h) => format!("{}>{id}", h.id),
+            None => id.to_string(),
+        };
         let mut ex = self.exits.lock().await;
-        if let Some(e) = ex.get(id) {
+        if let Some(e) = ex.get(&key) {
             if e.conn.close_reason().is_none() {
                 return Some(e.clone());
             }
+        }
+        if let Some(h) = hop {
+            // two hops: a connection to the first hop; each flow is sealed for the exit
+            let exit: [u8; 32] = hex::decode(id).ok()?.try_into().ok()?;
+            let conn = self.link.connect_conn_alpn(&h.id, ALPN_VPN_HOP).await.ok()?;
+            let tls = sealed::buyer_config(&self.sealed_secret, &exit);
+            let exit_relays = self.link.hints_for(id).relays;
+            let e = Arc::new(ExitConn { conn, udp: Arc::new(Mutex::new(HashMap::new())), sealed: Some(Sealed { exit, exit_relays, tls }) });
+            ex.insert(key, e.clone());
+            return Some(e);
         }
         let conn = match self.link.connect_conn_async(id).await {
             Ok(c) => c,
@@ -226,7 +260,7 @@ impl Buyer {
                 return None;
             }
         };
-        let e = Arc::new(ExitConn { conn: conn.clone(), udp: Arc::new(Mutex::new(HashMap::new())) });
+        let e = Arc::new(ExitConn { conn: conn.clone(), udp: Arc::new(Mutex::new(HashMap::new())), sealed: None });
         // the exit's UDP answers, to the flow each belongs to
         let routes = e.udp.clone();
         tokio::spawn(async move {
@@ -236,7 +270,7 @@ impl Buyer {
                 }
             }
         });
-        ex.insert(id.to_string(), e.clone());
+        ex.insert(key, e.clone());
         Some(e)
     }
 
@@ -245,7 +279,7 @@ impl Buyer {
     async fn route(self: &Arc<Self>, device: IpAddr, dst: SocketAddr) -> Option<(String, Arc<ExitConn>)> {
         for _ in 0..3 {
             let id = self.router_for(device).lock().await.pick(dst.ip(), Instant::now())?;
-            if let Some(e) = self.exit(&id).await {
+            if let Some(e) = self.exit(device, &id).await {
                 return Some((id, e));
             }
             self.router_for(device).lock().await.fail(&id);
@@ -280,20 +314,17 @@ impl Buyer {
         let (src, dst) = (s.local_addr(), s.peer_addr());
         let Some(dev) = self.device(src.ip()).filter(|d| !d.over_limit()) else { return self.refuse() };
         let Some((exit_id, exit)) = self.route(src.ip(), dst).await else { return self.refuse() };
-        let opened = open_tcp(&exit.conn, dst).await;
-        let (send, recv) = match opened {
-            Ok((Opened::Yes, send, recv)) => (send, recv),
-            _ => {
-                self.router_for(src.ip()).lock().await.flow_ended(&exit_id);
-                return self.refuse();
-            }
+        let Some(flow) = open_flow(&exit, dst).await else {
+            self.router_for(src.ip()).lock().await.flow_ended(&exit_id);
+            return self.refuse();
         };
         let (r, w) = tokio::io::split(s);
+        let (fr, fw) = tokio::io::split(flow);
         let (d1, d2, d3, d4) = (dev.clone(), dev.clone(), dev.clone(), dev);
         let (me1, me2, e1, e2, ip) = (self.clone(), self.clone(), exit_id.clone(), exit_id.clone(), src.ip());
         tokio::join!(
-            pump(r, send, move |n| d1.meter.up(n), d2, move || me1.still_qualifies(ip, &e1)),
-            pump(recv, w, move |n| d3.meter.down(n), d4, move || me2.still_qualifies(ip, &e2))
+            pump(r, fw, move |n| d1.meter.up(n), d2, move || me1.still_qualifies(ip, &e1)),
+            pump(fr, w, move |n| d3.meter.down(n), d4, move || me2.still_qualifies(ip, &e2))
         );
         self.router_for(src.ip()).lock().await.flow_ended(&exit_id);
     }
@@ -305,6 +336,12 @@ impl Buyer {
             return self.answer_dns(s, src.ip(), dev).await;
         }
         let Some((exit_id, exit)) = self.route(src.ip(), dst).await else { return self.refuse() };
+        if exit.sealed.is_some() {
+            // two hops carry TCP only; QUIC and the like fall back to TCP
+            self.udp_refused_two_hop.fetch_add(1, Ordering::Relaxed);
+            self.router_for(src.ip()).lock().await.flow_ended(&exit_id);
+            return self.refuse();
+        }
         let flow = self.next_flow.fetch_add(1, Ordering::Relaxed);
         let (tx, mut rx) = mpsc::channel::<Bytes>(256);
         exit.udp.lock().await.insert(flow, tx);
@@ -361,6 +398,28 @@ impl Buyer {
             }
         }
     }
+}
+
+/// Opens a TCP flow to `dst` on an exit connection: a stream of its own, or a sealed session through
+/// a first hop. `None` if the exit refused or could not reach `dst`.
+async fn open_flow(exit: &ExitConn, dst: SocketAddr) -> Option<Box<dyn Duplex>> {
+    match &exit.sealed {
+        Some(s) => {
+            let mut flow = open_sealed(&exit.conn, &s.exit, &s.exit_relays, s.tls.clone()).await.ok()?;
+            (open_tcp_on(&mut flow, dst).await.ok()? == Opened::Yes).then(|| Box::new(flow) as Box<dyn Duplex>)
+        }
+        None => match open_tcp(&exit.conn, dst).await.ok()? {
+            (Opened::Yes, send, recv) => Some(Box::new(tokio::io::join(recv, send))),
+            _ => None,
+        },
+    }
+}
+
+/// A fresh random key, from the operating system.
+fn rand_secret() -> [u8; 32] {
+    let mut k = [0u8; 32];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut k).expect("the system's random source");
+    k
 }
 
 /// Copies one direction of a flow, counting what it carries; stops when the device reaches its limit

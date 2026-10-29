@@ -5849,6 +5849,7 @@ dependencies = [
  "ipstack",
  "qrcode",
  "rcgen",
+ "ring",
  "rustls",
  "serde_json",
  "smoltcp",

@@ -82,22 +82,41 @@ pub(crate) fn take_addr(b: &[u8]) -> Option<(SocketAddr, &[u8])> {
     Some((SocketAddr::new(ip, port), &rest[2..]))
 }
 
-/// Opens a TCP flow to `to` through the exit. On [`Opened::Yes`] the streams carry the connection's
-/// bytes; otherwise they are already closed.
-pub async fn open_tcp(conn: &LinkConnection, to: SocketAddr) -> io::Result<(Opened, LinkSendStream, LinkRecvStream)> {
-    let (mut send, mut recv) = conn.open_bi().await.map_err(io_err)?;
+fn tcp_header(to: SocketAddr) -> BytesMut {
     let mut h = BytesMut::with_capacity(24);
     h.put_slice(MAGIC);
     h.put_u8(KIND_TCP);
     put_addr(&mut h, to);
-    send.write_all(&h).await.map_err(io_err)?;
+    h
+}
+
+/// Opens a TCP flow to `to` through the exit. On [`Opened::Yes`] the streams carry the connection's
+/// bytes; otherwise they are already closed.
+pub async fn open_tcp(conn: &LinkConnection, to: SocketAddr) -> io::Result<(Opened, LinkSendStream, LinkRecvStream)> {
+    let (mut send, mut recv) = conn.open_bi().await.map_err(io_err)?;
+    send.write_all(&tcp_header(to)).await.map_err(io_err)?;
     let mut status = [0u8; 1];
     recv.read_exact(&mut status).await.map_err(io_err)?;
     Ok((Opened::from_byte(status[0]), send, recv))
 }
 
+/// Opens a TCP flow to `to` on a stream already joined to the exit (a sealed session through a
+/// first hop, [`crate::hop`]).
+pub async fn open_tcp_on<S>(s: &mut S, to: SocketAddr) -> io::Result<Opened>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    s.write_all(&tcp_header(to)).await?;
+    s.flush().await?;
+    let mut status = [0u8; 1];
+    s.read_exact(&mut status).await?;
+    Ok(Opened::from_byte(status[0]))
+}
+
 /// The exit's side: reads a TCP flow's header from a stream the buyer opened.
-pub(crate) async fn read_tcp_header(recv: &mut LinkRecvStream) -> io::Result<SocketAddr> {
+pub(crate) async fn read_tcp_header<R: tokio::io::AsyncRead + Unpin>(recv: &mut R) -> io::Result<SocketAddr> {
+    use tokio::io::AsyncReadExt;
     let mut h = [0u8; 4];
     recv.read_exact(&mut h).await.map_err(io_err)?;
     if &h[..3] != MAGIC || h[3] != KIND_TCP {

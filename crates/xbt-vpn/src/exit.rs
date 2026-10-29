@@ -100,7 +100,7 @@ impl Bucket {
     }
 
     /// How long to wait before sending `bytes` more.
-    fn charge(&mut self, bytes: usize) -> Duration {
+    pub(crate) fn charge(&mut self, bytes: usize) -> Duration {
         let now = tokio::time::Instant::now();
         self.tokens = (self.tokens + now.duration_since(self.last).as_secs_f64() * self.rate).min(self.rate);
         self.last = now;
@@ -109,7 +109,7 @@ impl Bucket {
     }
 }
 
-type Shared<T> = Arc<Mutex<T>>;
+pub(crate) type Shared<T> = Arc<Mutex<T>>;
 
 /// Copies one direction of a flow, counting what it carries and keeping to the buyer's speed limit.
 async fn pump<R, W>(mut r: R, mut w: W, count: impl Fn(usize), bucket: Option<Shared<Bucket>>)
@@ -146,7 +146,7 @@ pub async fn serve_buyer(conn: LinkConnection, cfg: Arc<ExitConfig>, meter: Arc<
     };
     let udp = tokio::spawn(serve_udp(conn.clone(), cfg.clone(), meter.clone()));
     let open = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+    while let Ok((mut send, recv)) = conn.accept_bi().await {
         let (cfg, meter, up, down) = (cfg.clone(), meter.clone(), up.clone(), down.clone());
         // operators always have content-blind protections, private exit or not
         if open.load(std::sync::atomic::Ordering::Relaxed) >= cfg.max_tcp_flows {
@@ -158,73 +158,76 @@ pub async fn serve_buyer(conn: LinkConnection, cfg: Arc<ExitConfig>, meter: Arc<
         let guard = FlowCount::new(open.clone());
         tokio::spawn(async move {
             let _guard = guard;
-            let Ok(to) = flow::read_tcp_header(&mut recv).await else { return };
-            if cfg.policy.check_dst(to).is_err() {
-                meter.drop_one();
-                let _ = send.write_all(&[Opened::Refused.byte()]).await;
-                let _ = send.finish();
-                return;
-            }
-            if let Some(f) = cfg.kind.filter() {
-                if f.blocks_dst(to, false).is_some() {
-                    meter.block_one();
-                    let _ = send.write_all(&[Opened::Refused.byte()]).await;
-                    let _ = send.finish();
-                    return;
-                }
-                return filtered_tcp(to, send, recv, f, &cfg, &meter, up, down).await;
-            }
-            let out = match tokio::time::timeout(cfg.connect_timeout, TcpStream::connect(to)).await {
-                Ok(Ok(s)) => s,
-                _ => {
-                    let _ = send.write_all(&[Opened::Unreachable.byte()]).await;
-                    let _ = send.finish();
-                    return;
-                }
-            };
-            let _ = out.set_nodelay(true);
-            if send.write_all(&[Opened::Yes.byte()]).await.is_err() {
-                return;
-            }
-            let (or, ow) = out.into_split();
-            let (m1, m2) = (meter.clone(), meter.clone());
-            tokio::join!(pump(recv, ow, move |n| m1.up(n), up), pump(or, send, move |n| m2.down(n), down));
+            tcp_flow(tokio::io::join(recv, send), &cfg, &meter, up, down).await;
         });
     }
     udp.abort();
 }
 
+/// One TCP flow on a stream the buyer opened (straight, or sealed through a first hop): reads where
+/// it goes, answers whether it opened, then carries its bytes each way.
+pub(crate) async fn tcp_flow<S>(mut s: S, cfg: &ExitConfig, meter: &Arc<Meter>, up: Option<Shared<Bucket>>, down: Option<Shared<Bucket>>)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let Ok(to) = flow::read_tcp_header(&mut s).await else { return };
+    if cfg.policy.check_dst(to).is_err() {
+        meter.drop_one();
+        let _ = s.write_all(&[Opened::Refused.byte()]).await;
+        let _ = s.shutdown().await;
+        return;
+    }
+    if let Some(f) = cfg.kind.filter() {
+        if f.blocks_dst(to, false).is_some() {
+            meter.block_one();
+            let _ = s.write_all(&[Opened::Refused.byte()]).await;
+            let _ = s.shutdown().await;
+            return;
+        }
+        return filtered_tcp(to, s, f, cfg, meter, up, down).await;
+    }
+    let out = match tokio::time::timeout(cfg.connect_timeout, TcpStream::connect(to)).await {
+        Ok(Ok(out)) => out,
+        _ => {
+            let _ = s.write_all(&[Opened::Unreachable.byte()]).await;
+            let _ = s.shutdown().await;
+            return;
+        }
+    };
+    let _ = out.set_nodelay(true);
+    if s.write_all(&[Opened::Yes.byte()]).await.is_err() || s.flush().await.is_err() {
+        return;
+    }
+    let (r, w) = tokio::io::split(s);
+    let (or, ow) = out.into_split();
+    let (m1, m2) = (meter.clone(), meter.clone());
+    tokio::join!(pump(r, ow, move |n| m1.up(n), up), pump(or, w, move |n| m2.down(n), down));
+}
+
 /// A TCP flow on a filtered exit: the client's first bytes are read before connecting, and a
 /// blocked site's name (TLS or HTTP) closes the flow without the exit connecting anywhere.
-#[allow(clippy::too_many_arguments)]
-async fn filtered_tcp(
-    to: SocketAddr,
-    mut send: xbt_iroh_link::LinkSendStream,
-    mut recv: xbt_iroh_link::LinkRecvStream,
-    f: &ContentFilter,
-    cfg: &ExitConfig,
-    meter: &Arc<Meter>,
-    up: Option<Shared<Bucket>>,
-    down: Option<Shared<Bucket>>,
-) {
-    if send.write_all(&[Opened::Yes.byte()]).await.is_err() {
+async fn filtered_tcp<S>(to: SocketAddr, mut s: S, f: &ContentFilter, cfg: &ExitConfig, meter: &Arc<Meter>, up: Option<Shared<Bucket>>, down: Option<Shared<Bucket>>)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    if s.write_all(&[Opened::Yes.byte()]).await.is_err() || s.flush().await.is_err() {
         return;
     }
     let mut first = vec![0u8; 16 * 1024];
-    let n = match tokio::time::timeout(FIRST_BYTES_WAIT, recv.read(&mut first)).await {
-        Ok(Ok(Some(n))) => n,
-        Ok(_) => return,
+    let n = match tokio::time::timeout(FIRST_BYTES_WAIT, s.read(&mut first)).await {
+        Ok(Ok(0)) | Ok(Err(_)) => return,
+        Ok(Ok(n)) => n,
         Err(_) => 0,
     };
     first.truncate(n);
     let name = tls_sni(&first).or_else(|| http_host(&first));
     if name.as_deref().and_then(|n| f.blocks_name(n)).is_some() {
         meter.block_one();
-        let _ = send.finish();
+        let _ = s.shutdown().await;
         return;
     }
     let Ok(Ok(out)) = tokio::time::timeout(cfg.connect_timeout, TcpStream::connect(to)).await else {
-        let _ = send.finish();
+        let _ = s.shutdown().await;
         return;
     };
     let _ = out.set_nodelay(true);
@@ -235,8 +238,9 @@ async fn filtered_tcp(
         }
         meter.up(first.len());
     }
+    let (r, w) = tokio::io::split(s);
     let (m1, m2) = (meter.clone(), meter.clone());
-    tokio::join!(pump(recv, ow, move |n| m1.up(n), up), pump(or, send, move |n| m2.down(n), down));
+    tokio::join!(pump(r, ow, move |n| m1.up(n), up), pump(or, w, move |n| m2.down(n), down));
 }
 
 /// Counts a buyer's open TCP flows while it lives.

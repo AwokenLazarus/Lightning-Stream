@@ -15,6 +15,8 @@
 //! - [`router`]: which exit a new flow goes to (best, sticky, or spread with each destination kept on one).
 //! - [`region`]: checking an exit's announced region against its egress address, offline.
 //! - [`content`]: sites an exit's operator chooses not to carry (by DNS, TLS name, HTTP Host), with no log.
+//! - [`hop`]: two hops: a first hop run by someone else joins a buyer's sealed flows to an exit.
+//! - [`sealed`]: the TLS session between a buyer and an exit that a first hop cannot read.
 //! - [`meter`]: bytes carried each way, for payment. It never records where a packet was going.
 
 pub mod buyer;
@@ -22,8 +24,10 @@ pub mod content;
 pub mod exit;
 pub mod filter;
 pub mod flow;
+pub mod hop;
 pub mod meter;
 pub mod region;
 pub mod router;
+pub mod sealed;
 pub mod tunnel;
 pub mod wg;
