@@ -334,6 +334,7 @@ fn the_hashtaker_finds_the_hashmaker_on_nostr() {
         hashrate_hs: 4_000_000_000_000,
         link_addr: "127.0.0.1:1".into(),
         link_key: PublicKey::from_secret_key(secp256k1::SECP256K1, &link),
+        iroh: None,
         pay_url: "https://hashmaker.example/hashrate".into(),
         pay_node: "02".to_string() + &"aa".repeat(32),
         terms: terms(),

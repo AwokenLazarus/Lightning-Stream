@@ -67,6 +67,11 @@ BASE = int(os.environ.get("TICKET_E2E_PORT_BASE", "17961"))
 BUYER, HOP, SELLER = "lf1", "lf2", "lf3"
 NODES = (BUYER, HOP, SELLER)
 GW_PORT, UP_PORT, GW2_PORT, PROXY_PORT = BASE + 4, BASE + 5, BASE + 6, BASE + 7
+GW_LINK_PORT = BASE + 9
+#: Shops reached by key (`link` checks): the app's shops file, which the MCP reads to hand each one's
+#: transport document to the signer, and the origins the policy allows, each paid through the seller.
+SHOPS_FILE = os.environ.setdefault("XBT_SHOPS_FILE", f"{RUN}/shops.json")
+LINK_ORIGINS: list[str] = []
 ORIGIN = f"http://127.0.0.1:{GW_PORT}"
 LIAR = f"http://127.0.0.1:{PROXY_PORT}"
 SPLIT = 125  # the regtest stand-in for the height the chains split at
@@ -152,8 +157,8 @@ class Wallet:
         pk = lab.pubkey(SELLER)
         return {
             # the two origins of the one seller, each tied to its node id
-            "allowlist": [ORIGIN, LIAR],
-            "counterparties": {ORIGIN: {"ln_node": pk}, LIAR: {"ln_node": pk}},
+            "allowlist": [ORIGIN, LIAR, *LINK_ORIGINS],
+            "counterparties": {o: {"ln_node": pk} for o in (ORIGIN, LIAR, *LINK_ORIGINS)},
             "max_per_tx_sats": 50_000,
             "daily_budget_sats": 4_000_000,
             "weekly_budget_sats": 8_000_000,
@@ -1524,12 +1529,96 @@ def offers() -> None:
     offers_policy(on=True)
 
 
-CHECKS = {"page": page, "latency": latency, "stream": stream, "slots": slots, "liar": liar, "kill": kill, "offers": offers, "pruned": pruned}
+
+# --- a shop reached by key, over its iroh link (docs/DIRECT-LINKS.md) --------------------------------
+
+
+def link_check(relay: bool) -> None:
+    """The lab's seller as a shop with no web address: its gateway reached only over its iroh link,
+    found by its transport document (which the MCP hands to the signer from the shops file). The
+    100 MB file is paid as it arrives, ticket after ticket, the same as over http: whole, every
+    byte the seller's, every ticket booked once, the money agreeing. `relay`: both sides relay-only
+    (the gateway's link private, the wallet's XBT_LINK_PRIVATE), through our relay."""
+    mode = "relay" if relay else "direct"
+    stop_sessions()
+    # the seller's node vouches for the link key: a macaroon that may only sign
+    with open(f"{RUN}/sign.macaroon", "wb") as f:
+        f.write(bytes.fromhex(lab.bake(SELLER, ("uri:/lnrpc.Lightning/SignMessage",))))
+    os.chmod(f"{RUN}/sign.macaroon", 0o600)
+    path = gateway_config("gateway-link", GW_LINK_PORT, "link")
+    with open(path) as f:
+        cfg = json.load(f)
+    cfg["link"] = {"relays": ["https://iroh.lazarus-xbt.xyz"] if relay else [], "private": relay}
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=1)
+    if "gateway-link" in PROCS and PROCS["gateway-link"].poll() is None:
+        PROCS["gateway-link"].terminate()
+        PROCS["gateway-link"].wait(10)
+    start_gateway("gateway-link", GW_LINK_PORT)
+    doc: dict[str, Any] = {}
+
+    def signed() -> bool:
+        code, _, body = send("GET", "/.well-known/lightning-stream-transport.json", GW_LINK_PORT)
+        if code == 200:
+            doc.update(json.loads(body))
+        return code == 200 and bool(doc.get("transport"))
+
+    lab.wait("the link's transport document, signed by the seller's node", 60, signed, every=0.5)
+    origin = str(doc.get("seller") or "")
+    if not origin.startswith("http"):
+        status_code, _, status_body = send("GET", "/.well-known/lightning-stream-link.json", GW_LINK_PORT)
+        raise LabError(f"the link gateway's transport document names no seller: {json.dumps(doc)[:600]}; link status {status_code}: {status_body[:300]!r}")
+    with open(SHOPS_FILE, "w") as f:
+        json.dump({origin: {"receipt_key": doc["receipt_key"], "transport": doc}}, f)
+    if origin not in LINK_ORIGINS:
+        LINK_ORIGINS.append(origin)
+    WALLET_PROC.write_policy()
+    if relay:
+        os.environ["XBT_LINK_PRIVATE"] = "1"
+    try:
+        restart_signer()
+        for m in AGENT:
+            m.close()
+        AGENT.clear()
+        price_msat = -(-BIG * BYTE_MSAT // PER_BYTES)
+        t0 = time.monotonic()
+        r = pay(f"{origin}/big.bin", max_sats=25_000)
+        took = time.monotonic() - t0
+    finally:
+        os.environ.pop("XBT_LINK_PRIVATE", None)
+    stored = r.get("saved_to", "")
+    same_file = bool(stored) and os.path.getsize(stored) == BIG and hashlib.sha256(open(stored, "rb").read()).hexdigest() == r.get("body_digest")
+    if stored:
+        os.remove(stored)
+    stop_sessions()
+    inv, m = booked_and_once(), money()
+    mbit = round(BIG * 8 / took / 1e6, 1) if took else None
+    measured(f"link_{mode}_100mb_s", round(took, 2))
+    measured(f"link_{mode}_mbit_s", mbit)
+    ok = (call_paid(r) and r.get("complete") is True and r.get("bytes") == BIG and r.get("body_digest") == digest_of_prefix(BIG) and r.get("price_msat") == str(price_msat)
+          and r.get("tickets_released") == 20 and r["receipt"].get("body") == "as signed" and r["receipt"]["last"]["charged"] == str(price_msat))
+    check(f"link ({mode}): a shop with no web address, reached over its iroh link{' through a relay only' if relay else ''}: the 100 MB file came whole, paid as it arrived with 20 tickets released one at a time, the last receipt signs its hash and its exact price, every ticket the seller took is booked once and the money agrees",
+          ok and same_file and not inv["not_in_ledger"] and inv["same_tickets"] and agrees(m, receipts=False),
+          {**brief(r), "origin": origin, "seconds": round(took, 2), "mbit_s": mbit, "stored_is_the_file": same_file, **inv, "money": m})
+    PROCS["gateway-link"].terminate()
+    PROCS["gateway-link"].wait(10)
+
+
+def link() -> None:
+    link_check(relay=False)
+
+
+def link_relay() -> None:
+    link_check(relay=True)
+
+
+CHECKS = {"page": page, "latency": latency, "stream": stream, "slots": slots, "liar": liar, "kill": kill, "offers": offers, "link": link, "link_relay": link_relay, "pruned": pruned}
 
 
 def main() -> int:
     # with the pruned node, the pruned check; else every check that runs on the lab's own node
-    names = sys.argv[1:] or (["pruned"] if PRUNED else [n for n in CHECKS if n != "pruned"])
+    # (link_relay goes through our public relay: run by name only)
+    names = sys.argv[1:] or (["pruned"] if PRUNED else [n for n in CHECKS if n not in ("pruned", "link_relay")])
     unknown = [n for n in names if n not in CHECKS]
     if unknown:
         print(f"unknown check {unknown}; the checks are {' '.join(CHECKS)}", file=sys.stderr)

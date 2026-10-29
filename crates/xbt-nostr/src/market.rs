@@ -43,6 +43,10 @@ pub struct NostrListing {
     pub author: String,
     pub event_id: String,
     pub created_at: u64,
+    /// The seller's `transport/1` document, as the event carries it, unchecked: only the seller's
+    /// node, which the buyer learns from the seller's terms, can vouch for its links
+    /// ([`xbt402::transport::verify`]).
+    pub transport: Option<Value>,
 }
 
 fn fmt_sat(msat: u64) -> String {
@@ -139,10 +143,19 @@ fn summary(l: &Listing) -> String {
 /// The classified listing for `signed` (the document the gateway serves, with `sig`), by `keys`.
 /// `bind_sig` is [`xbt402::listing::bind`] of `keys`' public key and the listing's seller.
 pub fn listing_event(keys: &Keys, signed: &Value, bind_sig: &str, created_at: u64) -> Result<Event, String> {
+    listing_event_with(keys, signed, bind_sig, None, created_at)
+}
+
+/// [`listing_event`], carrying the seller's signed `transport/1` document too, in its own tag, so
+/// apps that do not know it read the listing as before.
+pub fn listing_event_with(keys: &Keys, signed: &Value, bind_sig: &str, transport: Option<&Value>, created_at: u64) -> Result<Event, String> {
     let l = listing::verify_self(signed)?;
     let seller = canonical_origin(&l.seller);
     if !listing::verify_bind(&l.receipt_key, &keys.public.serialize(), &seller, bind_sig) {
         return Err("the binding is not the receipt key's for this Nostr key and seller".into());
+    }
+    if xbt402::shop::key_of(&seller).is_some_and(|pk| pk != keys.public.serialize()) {
+        return Err("a shop without a web address is named by its Nostr key, and this is another key".into());
     }
     let mut tags = vec![
         tag("d", &seller),
@@ -163,6 +176,9 @@ pub fn listing_event(keys: &Keys, signed: &Value, bind_sig: &str, created_at: u6
     }
     tags.push(tag(LISTING_TAG, &serde_json::to_string(signed).map_err(|e| e.to_string())?));
     tags.push(tag(BIND_TAG, bind_sig));
+    if let Some(t) = transport {
+        tags.push(tag(xbt402::transport::TAG_NAME, &serde_json::to_string(t).map_err(|e| e.to_string())?));
+    }
     let ev = Event::sign(keys, created_at, KIND_CLASSIFIED, tags, markdown(&l));
     let size = ev.to_value().to_string().len();
     if size > MAX_EVENT {
@@ -204,7 +220,15 @@ pub fn read_event(ev: &Event, now: u64) -> Result<NostrListing, String> {
     if !listing::verify_bind(&l.receipt_key, &author, &seller, bind) {
         return Err("the receipt key did not bind this Nostr key to this seller".into());
     }
-    Ok(NostrListing { listing: l, author: ev.pubkey.clone(), event_id: ev.id.clone(), created_at: ev.created_at })
+    // a shop without a web address is named by its Nostr key: only that key may list it
+    if xbt402::shop::key_of(&seller).is_some_and(|pk| pk != author) {
+        return Err("the listing names a shop by another Nostr key than the event's".into());
+    }
+    let transport = match ev.tag(xbt402::transport::TAG_NAME) {
+        Some(t) if t.len() <= xbt402::transport::MAX_BODY => serde_json::from_str(t).ok(),
+        _ => None,
+    };
+    Ok(NostrListing { listing: l, author: ev.pubkey.clone(), event_id: ev.id.clone(), created_at: ev.created_at, transport })
 }
 
 /// Every good listing among `events`, the newest per receipt key and seller (a seller may move

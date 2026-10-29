@@ -91,6 +91,10 @@ pub const RUN_ENROLL: &str = "enroll";
 pub const HASHRATE: &str = "hashrate";
 /// Their settings, written by the UI's Hashrate page, and their control token.
 pub const RUN_HASHRATE: &str = "hashrate";
+/// The shops without a web address the owner added (`shops.json`: their receipt keys and transport
+/// documents), written by the UI and read, by the signer's group, by the connector and the MCP, which
+/// hand them to the signer in each call to such a shop. The signer itself never mounts it.
+pub const RUN_SHOPS: &str = "shops";
 /// The MCP bearer token's name, in `run/ui/` on a box (AGP-042) or `mcp/secrets/` without a UI.
 pub const MCP_TOKEN: &str = "mcp-http-token";
 

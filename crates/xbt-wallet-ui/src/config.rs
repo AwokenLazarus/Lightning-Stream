@@ -294,6 +294,20 @@ impl Config {
         self.services_file.clone().unwrap_or_else(|| self.data_dir.join("services.json"))
     }
 
+    /// The shops without a web address the owner added: `shops.json` beside the services file.
+    pub fn shops_path(&self) -> PathBuf {
+        // where the connector and the MCP read it too, to hand a shop's transport document to the
+        // signer (XBT_SHOPS_FILE): that file when it is set, else run/shops under the platform's data
+        // directory, else beside the services file
+        if let Some(f) = std::env::var_os("XBT_SHOPS_FILE") {
+            return PathBuf::from(f);
+        }
+        match std::env::var_os("XBT_DATA_DIR") {
+            Some(d) => PathBuf::from(d).join("run").join("shops").join("shops.json"),
+            None => self.services_path().with_file_name("shops.json"),
+        }
+    }
+
     /// A test or embedding configuration.
     pub fn for_test(signer_sock: PathBuf, data_dir: PathBuf, bind: &str) -> Self {
         Self { bind: bind.into(), signer_sock, data_dir, password: None, base_path: "/".into(), session_idle: Duration::from_secs(900),

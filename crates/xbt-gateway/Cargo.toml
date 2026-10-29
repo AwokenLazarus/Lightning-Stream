@@ -20,6 +20,7 @@ serde_json.workspace = true
 base64.workspace = true
 # the node's REST interface and the upstream service: blocking, no async runtime
 ureq.workspace = true
+xbt-iroh-link = { path = "../xbt-iroh-link" }
 # TLS to the node, pinned to its own certificate (as the wallet's Lightning rail pins it)
 secp256k1.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

@@ -179,6 +179,51 @@ pub struct Config {
     pub listing: Option<xbt402::listing::Draft>,
     /// Publishing the listing on Nostr (`docs/NOSTR.md`). Absent: nothing is published.
     pub nostr: Option<NostrConfig>,
+    /// Being reached by key over an iroh link (no web address, certificate or forwarded port). Absent:
+    /// web only.
+    pub link: Option<LinkConfig>,
+}
+
+/// The `link` section: the relays the gateway's link uses and whether it is relay-only. The seller's
+/// node vouches for the link key itself, at start (`sign.macaroon` beside `node.macaroon`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkConfig {
+    /// `https://` (or `http://` for a lab) relay URLs; empty: iroh's public relays.
+    pub relays: Vec<String>,
+    /// Relays only: buyers never learn the seller's address.
+    pub private: bool,
+}
+
+/// `public_url` for a shop reached by key only: replaced at start by its shop origin.
+pub const LINK_ONLY: &str = "link";
+
+/// At most this many relays for the link.
+pub const MAX_LINK_RELAYS: usize = 4;
+
+impl LinkConfig {
+    fn parse(v: &Value) -> Result<Self, String> {
+        let m = obj(v, "link", &["relays", "private"])?;
+        let relays = match m.get("relays") {
+            None => Vec::new(),
+            Some(Value::Array(a)) => a
+                .iter()
+                .map(|r| match r.as_str() {
+                    Some(r) if r.starts_with("https://") || r.starts_with("http://") => Ok(r.trim_end_matches('/').to_string()),
+                    _ => Err("link.relays is a list of https:// relay URLs".to_string()),
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+            Some(_) => return Err("link.relays is a list of https:// relay URLs".into()),
+        };
+        if relays.len() > MAX_LINK_RELAYS {
+            return Err(format!("link.relays: at most {MAX_LINK_RELAYS}"));
+        }
+        let private = match m.get("private") {
+            None => false,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => return Err("link.private is true or false".into()),
+        };
+        Ok(Self { relays, private })
+    }
 }
 
 /// The `nostr` section: the relays the listing goes to, and how often it is sent again.
@@ -334,6 +379,7 @@ impl Config {
                 "times",
                 "listing",
                 "nostr",
+                "link",
             ],
         )?;
         // a file that names no chain is a regtest file: mainnet is never what a missing key means
@@ -358,12 +404,24 @@ impl Config {
             },
             (_, None) => return Err(NEEDS_NETWORK.into()),
         };
-        let public_url = req_str(top, "public_url")?
-            .trim_end_matches('/')
-            .to_string();
-        let origin =
-            xbt402::wire::sendable_url(&public_url).map_err(|e| format!("public_url: {e}"))?;
-        if xbt402::wire::request_url(&origin).target != "/" {
+        // a shop reached by key only has no web address: `public_url` absent, or the word "link". Its
+        // origin is its own shop name (xbt402::shop), set at start from its Nostr key
+        let has_link = top.get("link").is_some_and(|l| !l.is_null());
+        let by_key = matches!(top.get("public_url"), None | Some(Value::Null)) || opt_str(top, "public_url")? == Some(LINK_ONLY);
+        if by_key && !has_link {
+            return Err("public_url: a shop without a web address is reached by key: add a link section, or give the https origin buyers use".into());
+        }
+        let public_url = if by_key {
+            LINK_ONLY.to_string()
+        } else {
+            req_str(top, "public_url")?.trim_end_matches('/').to_string()
+        };
+        let origin = if by_key {
+            String::new()
+        } else {
+            xbt402::wire::sendable_url(&public_url).map_err(|e| format!("public_url: {e}"))?
+        };
+        if !by_key && xbt402::wire::request_url(&origin).target != "/" {
             return Err("public_url is an origin (scheme://host[:port]), without a path".into());
         }
         // the gateway speaks plain HTTP. On a loopback address that is the machine's own business;
@@ -373,8 +431,13 @@ impl Config {
         let loopback = listen
             .parse::<std::net::SocketAddr>()
             .is_ok_and(|a| a.ip().is_loopback());
-        if !loopback && !origin.starts_with("https://") {
+        // a shop reached by key is reached over the link (encrypted, into the gateway's own port);
+        // its listen address is the platform's container network
+        if !loopback && !by_key && !origin.starts_with("https://") {
             return Err(format!("listen {listen} is not a loopback address (an address written as one: a name, even localhost, is whatever the resolver says), and public_url is not https. The gateway speaks plain HTTP: listen on 127.0.0.1 or [::1], or put a TLS proxy in front and set public_url to the https origin buyers use"));
+        }
+        if by_key && top.get("public_aliases").is_some_and(|a| !a.is_null()) {
+            return Err("public_aliases: a shop without a web address has no other origins".into());
         }
         let public_aliases = match top.get("public_aliases") {
             None => Vec::new(),
@@ -711,12 +774,17 @@ impl Config {
             None | Some(Value::Null) => None,
             Some(n) => Some(NostrConfig::parse(n)?),
         };
+        let link = match top.get("link") {
+            None | Some(Value::Null) => None,
+            Some(l) => Some(LinkConfig::parse(l)?),
+        };
         if nostr.as_ref().is_some_and(|n| n.publish) && listing.is_none() {
             return Err("nostr.publish publishes the listing: write a listing section, or leave publish out".into());
         }
         Ok(Self {
             listen,
-            public_url: origin.trim_end_matches('/').to_string(),
+            // a shop reached by key keeps the word "link" here: main names it by its Nostr key at start
+            public_url: if by_key { public_url } else { origin.trim_end_matches('/').to_string() },
             public_aliases,
             upstream: up,
             state_dir: PathBuf::from(req_str(top, "state_dir")?),
@@ -738,6 +806,7 @@ impl Config {
             times,
             listing,
             nostr,
+            link,
         })
     }
 }
@@ -1016,6 +1085,20 @@ mod tests {
                "routes": [{"path": "/files/", "price": {"byte_msat": 1000, "per_bytes": 1048576}},
                           {"path": "/files/free/", "free": true},
                           {"path": "/api", "methods": ["POST"], "price": {"request_msat": 2500}, "max_body": 4096, "forward_headers": ["X-Trace"]}]})
+    }
+
+    #[test]
+    fn a_shop_without_a_web_address_keeps_the_word_link_for_main_to_name_by_its_key() {
+        for public in [json!("link"), Value::Null] {
+            let mut v = base();
+            v["public_url"] = public;
+            v["link"] = json!({"relays": []});
+            let c = Config::from_json(&v).unwrap();
+            assert_eq!(c.public_url, LINK_ONLY, "a shop by key must keep LINK_ONLY until start names it, else it signs as no seller");
+        }
+        let mut v = base();
+        v["public_url"] = json!("link");
+        assert!(Config::from_json(&v).is_err(), "a shop by key without a link section is refused");
     }
 
     #[test]

@@ -1493,7 +1493,7 @@ fn the_sell_page_sets_up_several_services_and_says_what_each_one_needs() {
     assert!(br.flash_after(&r).contains("does not fit"));
     let r = br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &inv), ("info_macaroon", &info)]);
     let f = br.flash_after(&r);
-    assert!(f.contains("connected") && f.contains("Say where buyers find you"), "{f}");
+    assert!(f.contains("connected") && f.contains("Say how buyers reach you"), "{f}");
     assert!(!br.get("/sell").body.contains("1. Connect your Lightning node"), "step 1 is done");
     let r = br.act("/sell", "/sell", &[("action", "shop"), ("name", "Mike's box"), ("public_url", "http://seller.example")]);
     assert_eq!(r.status, 200);
@@ -2085,6 +2085,49 @@ fn hashrate_without_a_public_address_is_not_listed_and_says_why() {
     assert_eq!(read()["linkPublic"], json!(""), "an empty address clears it: no listing on public relays");
 }
 
+/// A hashmaker whose direct link is up needs no port forward: the page says so in plain words, the
+/// forwarded address moves under Advanced as optional, and the offer is listed without one.
+#[test]
+fn hashrate_over_the_direct_link_needs_no_address() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let (hasher, _hseen) = control_standin(|m, p| match (m, p) {
+        ("GET", "/status") => json!({
+            "open": true, "settings": {"enabled": true, "fallback": "192.168.1.20:23334", "priceSat": 40, "sliceWork": "140737488355328", "graceMs": 45000,
+                                       "rentable": 1, "name": "Basement miners", "linkPublic": null},
+            "minersAddress": "umbrel.local:23340", "linkLan": "umbrel.local:23341",
+            "iroh": {"id": "ab".repeat(32), "relays": ["https://relay.example/"]},
+            "listing": {"ok": true, "freeMiners": 1, "miners": 1},
+            "miners": [{"name": "s11", "connected": true, "hashrateHs": 4.1e12, "rentedTo": null, "earnedMsat": 0}], "rentals": []}),
+        _ => json!({"error": "no"}),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let htok = dir.path().join("hasher-token");
+    std::fs::write(&htok, "h".repeat(64)).unwrap();
+    let settings = dir.path().join("hashrate/settings.json");
+    let gw = dir.path().join("gateway");
+    std::fs::create_dir_all(&gw).unwrap();
+    let bx = start(json!({}), false, |c| {
+        c.sell = true;
+        c.gw.dir = gw.clone();
+        c.gw.node_rest = Some("https://10.21.21.66:8180".into());
+        c.hash.hasher = Some(hasher.clone());
+        c.hash.hasher_token = Some(htok.clone());
+        c.hash.settings = settings.clone();
+    });
+    let mut br = logged_in(&bx);
+    let p = br.get("/sell-hashrate");
+    for s in ["No setup", "no port forward, address or certificate is needed", "Listed", "Also reachable at a forwarded address"] {
+        assert!(p.body.contains(s), "{s} missing from Sell hashrate: {}", p.body);
+    }
+    assert!(!p.body.contains("(needs a port forward or tunnel)"), "the port forward is no longer asked for: {}", p.body);
+    // the forwarded address sits under Advanced, after the main choices
+    let adv = p.body.find("<summary>Advanced</summary>").unwrap();
+    assert!(p.body.find("Also reachable at a forwarded address").unwrap() > adv, "the forwarded address is under Advanced");
+    // saving without one is fine
+    let r = br.act("/sell-hashrate", "/sell-hashrate", &[("action", "save"), ("fallback", "192.168.1.20:23334"), ("price", "40"), ("enabled", "1")]);
+    assert!(br.flash_after(&r).starts_with("Saved."));
+}
+
 // --- no setup on a box: the node connects itself, the box's login, the code, the player, your shop --
 
 /// The keys the app makes itself through the box's node: the Lightning page says it is connected by
@@ -2319,7 +2362,9 @@ fn the_sell_page_offers_the_services_found_on_the_box() {
     let page = br.get("/sell").body;
     assert!(page.contains("Found on this box") && page.contains(&format!("data-value=\"http://{jelly}\"")), "{page}");
     assert!(!page.contains("http://127.0.0.1:1\""), "a service that does not answer is not offered");
-    assert!(page.contains("I don&#39;t have an https address yet") || page.contains("I don't have an https address yet"), "{page}");
+    // reached directly through the app by default; an https address of one's own is under Advanced
+    assert!(page.contains("Directly, through the app") && page.contains("value=\"direct\" checked"), "{page}");
+    assert!(page.contains("Advanced: use my own https address instead"), "{page}");
 }
 
 #[test]
@@ -2431,4 +2476,102 @@ fn the_stream_relays_page_lists_announced_relays_and_keeps_the_owner_s_choices()
     assert_eq!((mine.region.as_str(), mine.capacity_mbit, mine.udp), ("home", Some(100), true));
     let r = br.act("/relays", "/relays-publish", &[("relay", "https://mine.example"), ("region", "home"), ("capacity_mbit", "lots")]);
     assert!(br.flash_after(&r).contains("whole number"));
+
+/// A shop without a web address (`docs/DIRECT-LINKS.md`): added by its shop key from the app's Nostr
+/// relays, shown by that key, and allowed to be paid through the node its link's signature names.
+#[test]
+fn a_shop_without_a_web_address_is_added_by_its_key_and_allowed_through_the_node_that_vouches_for_its_link() {
+    use xbt_nostr::{event::Keys, market, oneshot, standin::StandinRelay};
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let relay = StandinRelay::start().unwrap();
+    let relays = vec![relay.url.clone()];
+    let keys = Keys::generate();
+    let shop = xbt402::shop::origin_for(&keys.public.serialize());
+    let npub = xbt402::shop::npub(&keys.public.serialize());
+    let (sk, pk) = receipt_key(b"home films");
+    let d = xbt402::listing::parse_draft(&json!({
+        "name": "Home films", "kind": "video", "prices": {"byte_msat": 1000, "per_bytes": 1048576},
+        "items": [{"title": "Sintel", "url": format!("{shop}/v/sintel"), "year": 2010, "credit": "(c) Blender Foundation, CC BY 3.0"}],
+        "licence": "CC BY 3.0", "credits": "Blender Foundation", "updated": "2026-10-29",
+    })).unwrap();
+    let doc = xbt402::listing::sign(&sk, &xbt402::listing::document(&d, &shop, &pk));
+    // the seller's node vouches for the shop's link
+    let node = Sk::from_slice(&[9u8; 32]).unwrap();
+    let node_hex = hex::encode(xbt_primitives::ecdsa::pubkey(&node));
+    let expires = xbt_nostr::now() + 30 * 86_400;
+    let ep = "ab".repeat(32);
+    let link = xbt402::transport::Link { kind: "iroh".into(), endpoint_id: ep.clone(), relays: vec!["https://relay.example".into()], direct: vec![], expires,
+                                         node_sig: xbt402::claim::sign(xbt402::claim::claim_text(&ep, &shop, expires).as_bytes(), &node) };
+    let t = xbt402::transport::sign(&sk, &xbt402::transport::document(&shop, &pk, &[link], "2026-10-29"));
+    let bind = xbt402::listing::bind(&sk, &keys.public.serialize(), &shop);
+    let ev = market::listing_event_with(&keys, &doc, &bind, Some(&t), xbt_nostr::now()).unwrap();
+    assert_eq!(oneshot::publish(&relays, &ev, Duration::from_secs(5))[0].result, Ok(()));
+
+    let bx = start(json!({}), false, |c| c.nostr_relays = relays.clone());
+    let mut br = logged_in(&bx);
+    assert!(br.get("/services").body.contains("npub1"), "the form asks for a shop key too");
+    let r = br.act("/services", "/services", &[("action", "add"), ("url", &format!("  {npub}  "))]);
+    let f = br.flash_after(&r);
+    assert!(f.contains("Added Home films: 1 service on Browse now"), "{f}");
+    let page = br.get("/services").body;
+    assert!(page.contains(&npub) && page.contains("Direct link"), "shown by its key: {page}");
+    assert!(!page.contains(&format!(">{shop}<")), "the made-up name is not shown as an address");
+    let kept = xbt_wallet_ui::shops::load(&bx.data.path().join("ui/shops.json")).unwrap();
+    assert_eq!(kept[&shop].transport, Some(t));
+    // allowed: the node is the one whose signature vouches for the link
+    let r = br.act("/services", "/services", &[("action", "allow"), ("url", &shop)]);
+    assert_eq!(r.status, 303, "{}", r.body);
+    assert!(r.location().contains(&format!("node={node_hex}")) && r.location().contains("shop.invalid"), "{}", r.location());
+    let rules = br.get(r.location().trim_start_matches('.')).body;
+    assert!(rules.contains(&format!("Allow {npub} to be paid")), "the rules page names the shop by its key");
+
+    // a wrong key, and an unknown one
+    let r = br.act("/services", "/services", &[("action", "add"), ("url", &format!("{}x", &npub[..npub.len() - 1]))]);
+    assert!(br.flash_after(&r).contains("not a valid one"));
+    let other = xbt402::shop::npub(&Keys::generate().public.serialize());
+    let r = br.act("/services", "/services", &[("action", "add"), ("url", &other)]);
+    assert!(br.flash_after(&r).contains("could not be found"));
+}
+
+/// A seller who picks "Directly, through the app": no web address is written, the gateway gets a
+/// link section (the app's relays, the private switch) and the listing goes to Nostr anyway.
+/// Needs the gateway to read the `link` section (the direct-links transport work).
+#[cfg(unix)]
+#[test]
+fn a_shop_reached_directly_writes_a_link_and_no_web_address() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let gw = tempfile::tempdir().unwrap();
+    let dir = gw.path().to_path_buf();
+    let media = mock_http(|_| (200, "ok"));
+    let bx = start(json!({}), false, |c| {
+        c.sell = true;
+        c.gw.dir = dir.clone();
+        c.gw.node_rest = Some("https://10.21.21.66:8180".into());
+        c.nostr_relays = vec!["wss://relay.one.example".into()];
+    });
+    let mut br = logged_in(&bx);
+    let inv = mac(&[("invoices", &["read", "write"])]);
+    let info = mac(&[("info", &["read"])]);
+    br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &inv), ("info_macaroon", &info)]);
+    br.act("/sell", "/sell", &[("action", "advanced"), ("max_sessions", "30"), ("sessions_per_address", "2"), ("max_held_tickets", "15"),
+                               ("proxies", ""), ("network", "bip122:0123456789abcdef0123456789abcdef")]);
+    let addr = format!("http://{media}");
+    br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("address", &addr), ("price", "1"), ("unit", "mib")]);
+    let r = br.act("/sell", "/sell", &[("action", "shop"), ("name", "Home films"), ("reach", "direct"), ("private", "1"), ("public_url", "https://ignored.example")]);
+    let f = br.flash_after(&r);
+    assert!(f.contains("restarts"), "{f}");
+    let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    assert!(c.get("public_url").is_none(), "{c}");
+    assert_eq!(c["link"], json!({"relays": ["https://iroh.lazarus-xbt.xyz"], "private": true}));
+    assert_eq!(c["nostr"]["publish"], true, "a direct shop is found on Nostr");
+    assert!(c["listen"].as_str().unwrap().starts_with("127.0.0.1:"), "with the app beside it (no health address), only on loopback");
+    // the page keeps the choice; the https address went with "web"
+    let page = br.get("/sell").body;
+    assert!(page.contains("value=\"direct\" checked") && page.contains("name=\"private\" value=\"1\" checked"), "{page}");
+    assert!(page.contains("Your shop key"));
+    // back to a web address: the link goes, the address comes back
+    let r = br.act("/sell", "/sell", &[("action", "shop"), ("name", "Home films"), ("reach", "web"), ("public_url", "https://films.example")]);
+    assert!(br.flash_after(&r).contains("restarts"));
+    let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    assert_eq!(c["public_url"], "https://films.example");
 }

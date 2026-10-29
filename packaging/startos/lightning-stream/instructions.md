@@ -33,8 +33,9 @@ https address as the shop's address, then add each service you sell with its pri
 ## Hashrate
 
 - **Rent your miners out** (you are the hashmaker): Sell → Hashrate. Point your miners at the *Miners*
-  interface's address. Renters outside your network reach the *Hashrate link* (TCP 23341): forward that
-  port on your router, or use a tunnel, and enter the public address on the page.
+  interface's address. Renters reach your miners through the app's direct link, encrypted end to end:
+  no port forward or address is needed. Only hashtakers on apps from before the direct link need the *Hashrate
+  link* (TCP 23341) forwarded; you can enter that address under Advanced on the page.
 - **Rent others' miners** (you are the hashtaker): Services → Hashrate. The work goes to your own DATUM
   Gateway (the BLAKE2b one, or the official one).
 

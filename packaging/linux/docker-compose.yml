@@ -102,10 +102,12 @@ services:
       XBT_MCP_APPROVAL_WAIT_S: "300"
       XBT_MCP_LN: "1"
       XBT_MCP_TICKETS: "1"
+      XBT_SHOPS_FILE: /data/run/shops/shops.json
     volumes:
       - ${LS_DATA_DIR}/mcp:/data/mcp
       - ${LS_DATA_DIR}/run/signer:/data/run/signer:ro
       - ${LS_DATA_DIR}/run/ui:/data/run/ui:ro
+      - ${LS_DATA_DIR}/run/shops:/data/run/shops:ro
 
   ui:
     <<: *service
@@ -135,6 +137,7 @@ services:
       XBT_UI_HASHRENT: http://127.0.0.1:${LS_HASHTAKER_CONTROL_PORT:-23343}
       XBT_UI_HASHRENT_TOKEN_FILE: /data/run/hashrate/control-token
       XBT_UI_ENROLL_CODE_FILE: /data/run/enroll/enroll-code
+      XBT_SHOPS_FILE: /data/run/shops/shops.json
       XBT_UI_RESTART_HINT: "in the folder you installed it to (~/lightning-stream unless you chose another), run: docker compose restart"
     volumes:
       - ${LS_DATA_DIR}/ui:/data/ui
@@ -143,6 +146,7 @@ services:
       - ${LS_DATA_DIR}/run/ln:/data/run/ln
       - ${LS_DATA_DIR}/run/gateway:/data/run/gateway
       - ${LS_DATA_DIR}/run/hashrate:/data/run/hashrate
+      - ${LS_DATA_DIR}/run/shops:/data/run/shops
       - ${LS_DATA_DIR}/run/enroll:/data/run/enroll:ro
       - *lightning-cert
 
@@ -183,9 +187,11 @@ services:
       LS_TASK: default
       LS_MAX_SATS: "20000"
       LS_LISTEN: 127.0.0.1:${LS_CONNECTOR_PORT:-8484}
+      XBT_SHOPS_FILE: /data/run/shops/shops.json
     volumes:
       - ${LS_DATA_DIR}/run/signer:/data/run/signer:ro
       - ${LS_DATA_DIR}/run/signer/streams:/data/run/signer/streams
+      - ${LS_DATA_DIR}/run/shops:/data/run/shops:ro
 
   # idle until the owner saves a shop on the Sell page, which writes run/gateway/config.json
   gateway:

@@ -41,9 +41,13 @@ pub struct Hashrate {
     pub algorithm: String,
     /// Hashrate on offer, hashes a second.
     pub hashrate_hs: u64,
-    /// Where the hashmaker's link answers, and its static key.
+    /// Where the hashmaker's link answers over plain TCP (a forwarded port), and its static key. Empty
+    /// when the link is reached over iroh only.
     pub link_addr: String,
     pub link_key: PublicKey,
+    /// Where the link answers over iroh: no port forward needed. The Noise handshake with
+    /// `link_key` runs inside it as over TCP, so this needs no proof of its own.
+    pub iroh: Option<IrohLink>,
     /// Where finished slices are paid (the hashmaker's gateway route), and the node its tickets pay.
     pub pay_url: String,
     pub pay_node: String,
@@ -51,6 +55,29 @@ pub struct Hashrate {
     /// Miners behind the hashmaker's app, and how many of them (with how much hashrate) are free to
     /// rent now. A rental takes whole miners. Zero miners: the listing does not say.
     pub capacity: Capacity,
+}
+
+/// A hashmaker's iroh link: its key (hex, 32 bytes) and where it can be found.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct IrohLink {
+    pub id: String,
+    pub relays: Vec<String>,
+    pub direct: Vec<String>,
+}
+
+impl IrohLink {
+    fn to_json(&self) -> Value {
+        json!({"id": self.id, "relays": self.relays, "direct": self.direct})
+    }
+
+    fn from_json(v: &Value) -> Option<IrohLink> {
+        let id = v.get("id")?.as_str()?.to_ascii_lowercase();
+        if hex::decode(&id).ok()?.len() != 32 {
+            return None;
+        }
+        let list = |k: &str| v.get(k).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default();
+        Some(IrohLink { id, relays: list("relays"), direct: list("direct") })
+    }
 }
 
 /// What a hashmaker has, and what of it is free, as the listing says when it was published.
@@ -73,7 +100,10 @@ impl Hashrate {
     pub fn to_json(&self) -> Value {
         json!({
             "version": VERSION, "name": self.name, "algorithm": self.algorithm, "hashrateHs": self.hashrate_hs.to_string(),
-            "link": {"addr": self.link_addr, "key": hex::encode(self.link_key.serialize())},
+            "link": match &self.iroh {
+                Some(i) => json!({"addr": self.link_addr, "key": hex::encode(self.link_key.serialize()), "iroh": i.to_json()}),
+                None => json!({"addr": self.link_addr, "key": hex::encode(self.link_key.serialize())}),
+            },
             "pay": {"url": self.pay_url, "node": self.pay_node},
             "terms": self.terms.to_json(),
             "capacity": {"miners": self.capacity.miners, "freeMiners": self.capacity.free_miners, "freeHs": self.capacity.free_hs.to_string()},
@@ -92,6 +122,8 @@ impl Hashrate {
             hashrate_hs: s("/hashrateHs")?.parse().map_err(|_| "bad hashrate")?,
             link_addr: s("/link/addr")?,
             link_key: key,
+            // optional: a listing from before the iroh link has none; an unreadable one is ignored
+            iroh: v.pointer("/link/iroh").and_then(IrohLink::from_json),
             pay_url: s("/pay/url")?,
             pay_node: s("/pay/node")?,
             terms: Terms::from_json(v.get("terms").ok_or("terms missing")?).ok_or("bad terms")?,
@@ -203,6 +235,7 @@ mod tests {
             hashrate_hs: 4_100_000_000_000,
             link_addr: "192.0.2.1:9".into(),
             link_key: PublicKey::from_secret_key(secp256k1::SECP256K1, link),
+            iroh: None,
             pay_url: "https://192.0.2.1:8443/hashrate".into(),
             pay_node: "02".to_string() + &"11".repeat(32),
             terms: Terms { slice_work: 1 << 50, price_msat: 40_000, grace_ms: 30_000 },
@@ -232,5 +265,24 @@ mod tests {
         assert!(Hashrate::read_event(&Event::sign(&nostr, 1000, KIND, tags, String::new()), 1000).is_err());
         assert!(Hashrate::read_event(&ev, 0).is_err(), "dated ahead");
         assert!(h.event(&link2, &nostr, 1).is_err());
+    }
+
+    #[test]
+    fn an_iroh_link_is_carried_and_an_old_or_odd_one_is_read_as_none() {
+        let link = SecretKey::from_slice(&[5; 32]).unwrap();
+        let nostr = Keys::generate();
+        let h = Hashrate {
+            link_addr: String::new(),
+            iroh: Some(IrohLink { id: "ab".repeat(32), relays: vec!["https://relay.example".into()], direct: vec![] }),
+            ..listing(&link)
+        };
+        let ev = h.event(&link, &nostr, 1000).unwrap();
+        assert_eq!(Hashrate::read_event(&ev, 1000).unwrap(), h);
+        // a listing from before the iroh link: none
+        assert_eq!(Hashrate::from_json(&listing(&link).to_json()).unwrap().iroh, None);
+        // a malformed iroh key: ignored, the listing still reads (its TCP address, if any, still works)
+        let mut v = h.to_json();
+        v["link"]["iroh"]["id"] = json!("abcd");
+        assert_eq!(Hashrate::from_json(&v).unwrap().iroh, None);
     }
 }

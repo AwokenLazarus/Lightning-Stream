@@ -26,7 +26,7 @@ fn run(args: &[String]) -> Result<(), String> {
         [path] if !path.starts_with('-') => (false, path),
         _ => return Err("usage: xbt-gateway [--check] <config.json>".into()),
     };
-    let cfg = Config::load(std::path::Path::new(path)).map_err(|e| e.to_string())?;
+    let mut cfg = Config::load(std::path::Path::new(path)).map_err(|e| e.to_string())?;
     // mainnet is asked for twice in the file (`chain` and `mainnet_ack`); a runner who did is told,
     // at every start and every check, what is known to be open there
     for line in cfg.mainnet_notice() {
@@ -140,11 +140,22 @@ fn run(args: &[String]) -> Result<(), String> {
         Some(_) => Some(xbt_gateway::nostr::load_key(&cfg.state_dir)?),
         None => None,
     };
-    let gw = Gateway::start(cfg, node, key, Box::new(unix_now)).map_err(|e| e.to_string())?;
-    if let (Some(n), Some(k)) = (nostr, nostr_key) {
-        eprintln!("xbt-gateway: publishing the listing on Nostr to {} relays every {} s, as Nostr key {}", n.relays.len(), n.republish.as_secs(), k.public_hex());
-        xbt_gateway::nostr::spawn(gw.clone(), k, n).map_err(|e| format!("nostr: {e}"))?;
+    // a shop reached by key only is named by its Nostr key (xbt402::shop): that name is its origin
+    let link_keys = match &cfg.link {
+        Some(_) => Some(xbt_gateway::nostr::load_key(&cfg.state_dir)?),
+        None => None,
+    };
+    let nostr_pk = link_keys.as_ref().map(|k| k.public.serialize());
+    // where the link is reached is told on the listing's own relays (xbt_iroh_link::nostr_lookup)
+    let link_relays: Vec<String> = cfg.nostr.as_ref().map(|n| n.relays.clone()).unwrap_or_default();
+    if cfg.public_url == xbt_gateway::config::LINK_ONLY {
+        let pk = nostr_pk.ok_or("a shop reached by key needs its Nostr key")?;
+        cfg.public_url = xbt402::shop::origin_for(&pk);
+        eprintln!("xbt-gateway: a shop without a web address, named {} ({})", cfg.public_url, xbt402::shop::npub(&pk));
     }
+    let (link_cfg, state_dir) = (cfg.link.clone(), cfg.state_dir.clone());
+    let (link_node, seller, sign_mac) = (node.clone(), cfg.public_url.clone(), cfg.node.macaroon.with_file_name("sign.macaroon"));
+    let gw = Gateway::start(cfg, node, key, Box::new(unix_now)).map_err(|e| e.to_string())?;
     let running = gw.serve(listener).map_err(|e| e.to_string())?;
     eprintln!(
         "xbt-gateway: listening on {}; an lnd-family node, {}; receipts signed by {}",
@@ -152,6 +163,17 @@ fn run(args: &[String]) -> Result<(), String> {
         gw.terms().pay_to,
         gw.terms().receipt_key
     );
+    // the link: the same gateway, reached by key (crates/xbt-iroh-link). Its streams come in as
+    // connections to the gateway's own port, so everything else is as for the web
+    let _link = match &link_cfg {
+        Some(l) => Some(start_link(l, &state_dir, running.addr, &link_node, &seller, &sign_mac, &gw, nostr_pk, link_keys.clone(), link_relays.clone())?),
+        None => None,
+    };
+    // after the link, so the first listing sent already names it
+    if let (Some(n), Some(k)) = (nostr, nostr_key) {
+        eprintln!("xbt-gateway: publishing the listing on Nostr to {} relays every {} s, as Nostr key {}", n.relays.len(), n.republish.as_secs(), k.public_hex());
+        xbt_gateway::nostr::spawn(gw.clone(), k, n).map_err(|e| format!("nostr: {e}"))?;
+    }
     let sig = signals.wait();
     xbt_svc::shutdown::say_stopping("xbt-gateway", sig);
     // the listener first, so that nothing new starts; then the requests in flight; then the book.
@@ -173,5 +195,137 @@ fn main() -> ExitCode {
             eprintln!("xbt-gateway: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Starts the gateway's link and writes what the app needs to name it (`link.json` in the state
+/// directory: the key and where it is reached), then has the seller's node vouch for it, again
+/// before the node's word runs out, for as long as the gateway runs.
+#[allow(clippy::too_many_arguments)]
+fn start_link(l: &xbt_gateway::config::LinkConfig, state_dir: &std::path::Path, addr: std::net::SocketAddr,
+              node: &Arc<LndRest>, seller: &str, sign_mac: &std::path::Path, gw: &Arc<Gateway>, nostr_pk: Option<[u8; 32]>,
+              keys: Option<xbt_nostr::event::Keys>, nostr_relays: Vec<String>)
+              -> Result<std::sync::Arc<xbt_iroh_link::Link>, String> {
+    let secret = xbt402::provider::load_or_create_secret(&state_dir.join("link.key")).map_err(|e| e.to_string())?;
+    // no relays named: ours, with iroh's public relays beside it
+    let relays = if l.relays.is_empty() { xbt_iroh_link::Relays::OursThenPublic(vec![xbt_iroh_link::DEFAULT_RELAY.into()]) } else { xbt_iroh_link::Relays::Ours(l.relays.clone()) };
+    let lookup = Some(Arc::new(xbt_iroh_link::nostr_lookup::NostrLookup::new(keys, nostr_relays)));
+    let link = xbt_iroh_link::Link::start_with(secret.secret_bytes(), xbt_iroh_link::Options { relays, serving: true, private: l.private, lookup })
+        .map_err(|e| format!("link: {e}"))?;
+    let upstream = if addr.ip().is_unspecified() { std::net::SocketAddr::from(([127, 0, 0, 1], addr.port())) } else { addr };
+    link.serve(upstream);
+    let v = Vouch { link: link.clone(), private: l.private, state_dir: state_dir.to_path_buf(), node: node.clone(), seller: seller.to_string(),
+                    sign_mac: sign_mac.to_path_buf(), gw: gw.clone(), nostr_pk };
+    let mut until = v.once()?;
+    eprintln!(
+        "xbt-gateway: reached by key {} over {}{}",
+        link.endpoint_id(),
+        if l.private { "relays only" } else { "direct links and relays" },
+        if until.is_some() { "; the node vouches for it" } else { "; the node has not vouched for it (see sign_error at /.well-known/lightning-stream-link.json), so buyers cannot check it and nothing names it" }
+    );
+    std::thread::Builder::new().name("link-vouch".into()).spawn(move || loop {
+        // an hour while the node has not vouched; otherwise again ten days before its word runs out
+        let wait = match until {
+            Some(u) => u.saturating_sub(VOUCH_AHEAD).saturating_sub(unix_now()).clamp(3600, 86_400),
+            None => 3600,
+        };
+        std::thread::sleep(Duration::from_secs(wait));
+        if v.gw.stopped() {
+            return;
+        }
+        if until.is_none_or(|u| unix_now() + VOUCH_AHEAD >= u) {
+            match v.once() {
+                Ok(u) => until = u.or(until.filter(|u| *u > unix_now())),
+                Err(e) => eprintln!("xbt-gateway: link: {e}"),
+            }
+        }
+    }).map_err(|e| format!("link: {e}"))?;
+    Ok(link)
+}
+
+/// How long the node's word for the link holds, and how long before its end it is asked again.
+const VOUCH_FOR: u64 = 30 * 86_400;
+const VOUCH_AHEAD: u64 = 10 * 86_400;
+
+/// What it takes to have the node vouch for the link and to say so.
+struct Vouch {
+    link: Arc<xbt_iroh_link::Link>,
+    private: bool,
+    state_dir: std::path::PathBuf,
+    node: Arc<LndRest>,
+    seller: String,
+    sign_mac: std::path::PathBuf,
+    gw: Arc<Gateway>,
+    nostr_pk: Option<[u8; 32]>,
+}
+
+impl Vouch {
+    /// Asks the node to sign the link claim (with a macaroon that allows only SignMessage, where
+    /// the app baked one), checks the signature is the node's own, and publishes the result: the
+    /// transport document, the link's state, `link.json`. `Some(expiry)` when the node vouched.
+    fn once(&self) -> Result<Option<u64>, String> {
+        let h = self.link.hints(Duration::from_secs(10));
+        let direct: Vec<String> = if self.private { vec![] } else { h.direct.iter().map(|a| a.to_string()).collect() };
+        let expires = unix_now() + VOUCH_FOR;
+        let mut sign_error: Option<String> = None;
+        let node_sig = match std::fs::read(&self.sign_mac) {
+            Ok(mac) => {
+                let text = xbt402::claim::claim_text(&self.link.endpoint_id(), &self.seller, expires);
+                match self.node.sign_message(&mac, text.as_bytes()) {
+                    Ok(sig) => match (self.node.info(), xbt402::claim::recover(text.as_bytes(), &sig)) {
+                        // the node's own key, checked before it is published
+                        (Ok(info), Ok(k)) if hex::encode(k.serialize()) == info.pubkey => Some(sig),
+                        _ => {
+                            eprintln!("xbt-gateway: link: the node's signature is not its own key's: not published");
+                            sign_error = Some("the node's signature did not check out against its own key".into());
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("xbt-gateway: link: the node did not sign the link key: {e}");
+                        sign_error = Some(format!("the node did not sign: {e}"));
+                        None
+                    }
+                }
+            }
+            Err(_) => {
+                sign_error = Some("no key to ask the node to sign with (sign.macaroon): buyers cannot check this link yet".into());
+                None
+            }
+        };
+        let doc = serde_json::json!({
+            "endpoint_id": self.link.endpoint_id(),
+            "relays": h.relays,
+            "direct": direct,
+            "private": self.private,
+            "seller": self.seller,
+            "node_sig": node_sig,
+            "expires": node_sig.as_ref().map(|_| expires),
+        });
+        std::fs::write(self.state_dir.join("link.json"), format!("{doc}\n")).map_err(|e| format!("link.json: {e}"))?;
+        self.gw.set_link_status(serde_json::json!({
+            "seller": self.seller,
+            "npub": self.nostr_pk.map(|pk| xbt402::shop::npub(&pk)),
+            "endpoint_id": self.link.endpoint_id(),
+            "relays": h.relays,
+            "direct": direct,
+            "home_relay": h.relays.first(),
+            "signed_until": node_sig.as_ref().map(|_| expires),
+            "sign_error": sign_error,
+            "private": self.private,
+        }));
+        let Some(sig) = node_sig else { return Ok(None) };
+        self.gw.set_link(
+            xbt402::transport::Link {
+                kind: "iroh".into(),
+                endpoint_id: self.link.endpoint_id(),
+                relays: h.relays.clone(),
+                direct,
+                expires,
+                node_sig: sig,
+            },
+            &unix_now().to_string(),
+        );
+        Ok(Some(expires))
     }
 }

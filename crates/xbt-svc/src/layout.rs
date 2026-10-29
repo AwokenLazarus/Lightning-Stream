@@ -72,7 +72,13 @@ pub const SHARED_DIRS: &[SharedDir] = &[
     SharedDir { dir: crate::RUN_GATEWAY, writer: crate::UI, reader: crate::GATEWAY, gid: 10007, mode: 0o750 },
     SharedDir { dir: crate::RUN_ENROLL, writer: crate::SIGNER, reader: crate::UI, gid: ENROLL_GID, mode: 0o750 },
     SharedDir { dir: crate::RUN_HASHRATE, writer: crate::UI, reader: crate::HASHRATE, gid: HASHRATE_GID, mode: 0o750 },
+    // public data only (receipt keys, signed transport documents): read by the signer's group
+    SharedDir { dir: crate::RUN_SHOPS, writer: crate::UI, reader: crate::SIGNER, gid: SHOPS_GID, mode: 0o750 },
 ];
+
+/// The group `run/shops/` is read by: the signer's own, whose user the connector runs as and whose
+/// group the MCP is in.
+pub const SHOPS_GID: u32 = 10001;
 
 /// The hashrate services' group: the settings the UI writes in `run/hashrate/`, and their control token.
 pub const HASHRATE_GID: u32 = 10010;

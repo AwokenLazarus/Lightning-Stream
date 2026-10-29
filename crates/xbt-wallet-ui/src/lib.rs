@@ -27,6 +27,7 @@ pub mod relay;
 pub mod relaynet;
 pub mod server;
 pub mod setup;
+pub mod shops;
 
 pub const UI_JS: &str = include_str!("../assets/ui.js");
 pub const UI_CSS: &str = include_str!("../assets/ui.css");

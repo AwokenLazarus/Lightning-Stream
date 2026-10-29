@@ -1073,7 +1073,7 @@ impl App {
                 p["counterparties"][origin.as_str()] = json!({"ln_node": node});
                 let cap = p.get("per_counterparty_cap_sats").or(cur["effective"].get("per_counterparty_cap_sats")).and_then(Value::as_i64).unwrap_or(0);
                 b.push_str(&format!("<div class=\"flash ok\"><p><strong>Allow {} to be paid.</strong> Sign below with your approval key. \
-                    The app may then pay this seller up to {} in any 7 days, within your other limits.</p></div>", esc(&origin), money(cap)));
+                    The app may then pay this seller up to {} in any 7 days, within your other limits.</p></div>", esc(&xbt402::shop::display(&origin)), money(cap)));
             }
         }
         let errs: Vec<String> = cur["errors"].as_array().map(|a| a.iter().map(|x| txt(Some(x))).collect()).unwrap_or_default();

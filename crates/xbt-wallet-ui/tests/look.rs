@@ -95,6 +95,7 @@ fn the_look_in_headless_chrome() {
     let film = "https://media.example/Videos/1/stream?static=true";
     let data = tempfile::tempdir().unwrap();
     let services = data.path().join("services.json");
+    let home_shop = xbt402::shop::origin_for(&[0x5a; 32]);
     std::fs::write(&services, json!([
         {"name": "Creative Commons films", "kind": "video", "seller": "https://media.example", "price_text": "20 sat a MiB",
          "items": [{"title": "Big Buck Bunny", "year": 2008, "url": film, "credit": "(c) Blender Foundation, CC BY 3.0"},
@@ -104,7 +105,10 @@ fn the_look_in_headless_chrome() {
          "items": []},
         {"name": "Weather data", "kind": "api", "seller": "https://weather.example", "price_text": "1 sat a request", "items": []},
         {"name": "Open lectures", "kind": "video", "seller": "https://lectures.example", "price_text": "12 sat a MiB",
-         "items": [{"title": "Tears of Steel", "year": 2012, "url": "https://lectures.example/v/4", "credit": "(c) Blender Foundation, CC BY 3.0"}]}
+         "items": [{"title": "Tears of Steel", "year": 2012, "url": "https://lectures.example/v/4", "credit": "(c) Blender Foundation, CC BY 3.0"}]},
+        // a shop without a web address, known by its key (docs/DIRECT-LINKS.md)
+        {"name": "Home films", "kind": "video", "seller": home_shop, "price_text": "1 sat a MiB",
+         "items": [{"title": "Cosmos Laundromat", "year": 2015, "url": format!("{home_shop}/v/5"), "credit": "(c) Blender Foundation, CC BY 4.0"}]}
     ]).to_string()).unwrap();
     let mut cfg = Config::for_test(sock_path, data.path().join("ui"), "127.0.0.1:0");
     // the Stream relays page probes the default relay: keep it on this machine
@@ -131,7 +135,8 @@ fn the_look_in_headless_chrome() {
     let pages = json!([["home", "/"], ["browse", "/browse"], ["browse-ai", "/browse?cat=ai"],
         ["service-ai", format!("/service?seller={}&name={}", enc("https://box.example"), enc("Local model"))],
         ["service-media", format!("/service?seller={}&name={}", enc("https://media.example"), enc("Creative Commons films"))],
-        ["player", play.clone()], ["live", "/connections"], ["sellers", "/services"], ["sell", "/sell"], ["wallet", "/wallet"],
+        ["player", play.clone()], ["live", "/connections"], ["sellers", "/services"], ["sellers-shop-key", format!("/services#key-{}", xbt402::shop::display(&home_shop))],
+        ["sell", "/sell"], ["sell-reach", "/sell#shop-reach"], ["wallet", "/wallet"],
         ["setup", "/setup"], ["apps", "/apps"], ["agents", "/agents"], ["rules", "/policy"], ["relays", "/relays"]]).to_string();
     let secs = std::env::var("XBT_UI_LOOK_SECONDS").unwrap_or_else(|_| "30".into());
     let o = std::process::Command::new(node).env("CHROME", chrome)

@@ -130,7 +130,16 @@ pub struct Gateway {
     /// The node's BOLT 12 offer and what was paid to it, where the runner turned payment by offer
     /// on (`docs/TICKETS.md`, section 15).
     offers: Option<offers::Offers>,
+    /// The signed transport document (`transport/1`): the iroh link that reaches this gateway by key,
+    /// with the node's statement vouching for it. `None` until the link has started with one.
+    transport: Mutex<Option<Value>>,
+    /// The link's state for the seller's own app (`LINK_STATUS_PATH`): its key, relays and whether
+    /// the node vouched for it. Public facts only.
+    link_status: Mutex<Option<Value>>,
 }
+
+/// Where the gateway says how its link stands, for the seller's app.
+pub const LINK_STATUS_PATH: &str = "/.well-known/lightning-stream-link.json";
 
 /// Wall-clock seconds.
 pub fn unix_now() -> u64 {
@@ -337,6 +346,8 @@ impl Gateway {
             settle_max_us: AtomicU64::new(0),
             lottery,
             offers,
+            transport: Mutex::new(None),
+            link_status: Mutex::new(None),
             cfg,
         });
         for hash in unfinished {
@@ -393,6 +404,23 @@ impl Gateway {
     /// The signed listing, as the well-known URL serves it; `None` without a listing section.
     pub fn listing(&self) -> Option<Value> {
         self.listing_doc()
+    }
+
+    /// Names the iroh link that reaches this gateway by key, signed by the receipt key, for the
+    /// well-known transport URL and the Nostr listing. `link.node_sig` is the seller's node's.
+    pub fn set_link(&self, link: xbt402::transport::Link, updated: &str) {
+        let doc = xbt402::transport::document(&self.cfg.public_url, &self.terms.receipt_key, &[link], updated);
+        *self.transport.lock().unwrap_or_else(|e| e.into_inner()) = Some(xbt402::transport::sign(&self.key, &doc));
+    }
+
+    /// Records how the link stands, for [`LINK_STATUS_PATH`].
+    pub fn set_link_status(&self, v: Value) {
+        *self.link_status.lock().unwrap_or_else(|e| e.into_inner()) = Some(v);
+    }
+
+    /// The signed transport document, if the link has one.
+    pub fn transport(&self) -> Option<Value> {
+        self.transport.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// The receipt key's binding of `nostr_pubkey` to this seller (`docs/NOSTR.md`).
@@ -2080,6 +2108,18 @@ impl Handler for Service {
         }
         if path == SERVICES_PATH && req.method == "GET" {
             return Reply::Whole(gw.services());
+        }
+        if path == LINK_STATUS_PATH && req.method == "GET" {
+            return Reply::Whole(match gw.link_status.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+                Some(body) => json_response(200, &body),
+                None => error(404, "no_route", "this seller has no link"),
+            });
+        }
+        if path == xbt402::transport::PATH && req.method == "GET" {
+            return Reply::Whole(match gw.transport() {
+                Some(body) => json_response(200, &body),
+                None => error(404, "no_route", "this seller is not reached by key"),
+            });
         }
         if path == LISTING_PATH && req.method == "GET" {
             return Reply::Whole(match gw.listing_doc() {
