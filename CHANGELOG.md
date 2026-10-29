@@ -34,6 +34,11 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 - Offers show the price per TH/s per day beside the hourly figure.
 - The hashmaker measures each miner's speed over five minutes instead of one, which steadies it.
 
+**StartOS**
+- Package 0.1.19:1: the AI page and the Agents page showed their addresses with the path twice
+  (`…/v1/v1`, `…/mcp/mcp`), so a copied address did not answer. They now show it once. The agents'
+  address had shown it twice since 0.1.14.
+
 **The look**
 - A new, calmer theme: new fonts (Inter and JetBrains Mono, carried in the app), a new mark and app
   icon, a quieter background, and a click that runs along the streams like a spark. Light and dark,
