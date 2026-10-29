@@ -8,6 +8,13 @@
 //! Every flow passes the exit's [`Policy`] first (blocked ports, IPv6, never the seller's own
 //! network), and the bytes carried are counted by the buyer's [`Meter`], in sizes only. Nothing
 //! records a destination.
+//!
+//! An exit is one of two kinds, chosen by its operator and announced in its listing:
+//! - **Private** (what buyers get by default): the buyer's own app resolves names over encrypted DNS
+//!   through the tunnel, so the exit sees addresses (and a site's name only where the site does not
+//!   use Encrypted ClientHello). Only address and port rules apply.
+//! - **Filtered:** DNS goes to the exit's resolver, and the operator's blocklist applies to names
+//!   seen in DNS, TLS and HTTP ([`ContentFilter`]). Labelled as filtered: the exit sees site names.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -20,6 +27,7 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use xbt_iroh_link::LinkConnection;
 
+use crate::content::{dns_nxdomain, dns_question, http_host, tls_sni, ContentFilter};
 use crate::filter::Policy;
 use crate::flow::{self, Opened, KIND_UDP_BACK, KIND_UDP_OUT};
 use crate::meter::Meter;
@@ -36,12 +44,46 @@ pub struct ExitConfig {
     pub udp_idle: Duration,
     /// The most UDP flows one buyer may have open.
     pub max_udp_flows: usize,
+    /// The most TCP connections one buyer may have open at once.
+    pub max_tcp_flows: usize,
+    pub kind: ExitKind,
 }
+
+/// The two kinds of exit.
+#[derive(Clone, Debug, Default)]
+pub enum ExitKind {
+    /// Only address and port rules; names are the buyer's own business.
+    #[default]
+    Private,
+    /// The operator's blocklist applies, and DNS goes to `resolver` (or where the buyer sent it).
+    Filtered { filter: Arc<ContentFilter>, resolver: Option<SocketAddr> },
+}
+
+impl ExitKind {
+    fn filter(&self) -> Option<&ContentFilter> {
+        match self {
+            ExitKind::Filtered { filter, .. } if filter.is_active() => Some(filter),
+            _ => None,
+        }
+    }
+}
+
+/// How long a filtered exit waits for a TLS or HTTP client's first bytes before connecting anyway
+/// (a protocol where the server speaks first sends nothing until then).
+const FIRST_BYTES_WAIT: Duration = Duration::from_millis(500);
 
 impl Default for ExitConfig {
     /// [`Policy::for_exit`] (this machine's own networks refused), no speed limit.
     fn default() -> ExitConfig {
-        ExitConfig { policy: Policy::for_exit(), buyer_bytes_per_sec: None, connect_timeout: Duration::from_secs(10), udp_idle: Duration::from_secs(60), max_udp_flows: 256 }
+        ExitConfig {
+            policy: Policy::for_exit(),
+            buyer_bytes_per_sec: None,
+            connect_timeout: Duration::from_secs(10),
+            udp_idle: Duration::from_secs(60),
+            max_udp_flows: 256,
+            max_tcp_flows: 512,
+            kind: ExitKind::Private,
+        }
     }
 }
 
@@ -103,15 +145,34 @@ pub async fn serve_buyer(conn: LinkConnection, cfg: Arc<ExitConfig>, meter: Arc<
         None => (None, None),
     };
     let udp = tokio::spawn(serve_udp(conn.clone(), cfg.clone(), meter.clone()));
+    let open = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     while let Ok((mut send, mut recv)) = conn.accept_bi().await {
         let (cfg, meter, up, down) = (cfg.clone(), meter.clone(), up.clone(), down.clone());
+        // operators always have content-blind protections, private exit or not
+        if open.load(std::sync::atomic::Ordering::Relaxed) >= cfg.max_tcp_flows {
+            meter.drop_one();
+            let _ = send.write_all(&[Opened::Refused.byte()]).await;
+            let _ = send.finish();
+            continue;
+        }
+        let guard = FlowCount::new(open.clone());
         tokio::spawn(async move {
+            let _guard = guard;
             let Ok(to) = flow::read_tcp_header(&mut recv).await else { return };
             if cfg.policy.check_dst(to).is_err() {
                 meter.drop_one();
                 let _ = send.write_all(&[Opened::Refused.byte()]).await;
                 let _ = send.finish();
                 return;
+            }
+            if let Some(f) = cfg.kind.filter() {
+                if f.blocks_dst(to, false).is_some() {
+                    meter.block_one();
+                    let _ = send.write_all(&[Opened::Refused.byte()]).await;
+                    let _ = send.finish();
+                    return;
+                }
+                return filtered_tcp(to, send, recv, f, &cfg, &meter, up, down).await;
             }
             let out = match tokio::time::timeout(cfg.connect_timeout, TcpStream::connect(to)).await {
                 Ok(Ok(s)) => s,
@@ -131,6 +192,67 @@ pub async fn serve_buyer(conn: LinkConnection, cfg: Arc<ExitConfig>, meter: Arc<
         });
     }
     udp.abort();
+}
+
+/// A TCP flow on a filtered exit: the client's first bytes are read before connecting, and a
+/// blocked site's name (TLS or HTTP) closes the flow without the exit connecting anywhere.
+#[allow(clippy::too_many_arguments)]
+async fn filtered_tcp(
+    to: SocketAddr,
+    mut send: xbt_iroh_link::LinkSendStream,
+    mut recv: xbt_iroh_link::LinkRecvStream,
+    f: &ContentFilter,
+    cfg: &ExitConfig,
+    meter: &Arc<Meter>,
+    up: Option<Shared<Bucket>>,
+    down: Option<Shared<Bucket>>,
+) {
+    if send.write_all(&[Opened::Yes.byte()]).await.is_err() {
+        return;
+    }
+    let mut first = vec![0u8; 16 * 1024];
+    let n = match tokio::time::timeout(FIRST_BYTES_WAIT, recv.read(&mut first)).await {
+        Ok(Ok(Some(n))) => n,
+        Ok(_) => return,
+        Err(_) => 0,
+    };
+    first.truncate(n);
+    let name = tls_sni(&first).or_else(|| http_host(&first));
+    if name.as_deref().and_then(|n| f.blocks_name(n)).is_some() {
+        meter.block_one();
+        let _ = send.finish();
+        return;
+    }
+    let Ok(Ok(out)) = tokio::time::timeout(cfg.connect_timeout, TcpStream::connect(to)).await else {
+        let _ = send.finish();
+        return;
+    };
+    let _ = out.set_nodelay(true);
+    let (or, mut ow) = out.into_split();
+    if !first.is_empty() {
+        if ow.write_all(&first).await.is_err() {
+            return;
+        }
+        meter.up(first.len());
+    }
+    let (m1, m2) = (meter.clone(), meter.clone());
+    tokio::join!(pump(recv, ow, move |n| m1.up(n), up), pump(or, send, move |n| m2.down(n), down));
+}
+
+/// Counts a buyer's open TCP flows while it lives.
+struct FlowCount(Arc<std::sync::atomic::AtomicUsize>);
+
+impl FlowCount {
+    fn new(n: Arc<std::sync::atomic::AtomicUsize>) -> FlowCount {
+        n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        FlowCount(n)
+    }
+}
+
+impl Drop for FlowCount {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 struct UdpFlow {
@@ -163,10 +285,34 @@ async fn serve_udp(conn: LinkConnection, cfg: Arc<ExitConfig>, meter: Arc<Meter>
             continue;
         }
         let id = u32::from_be_bytes([d[1], d[2], d[3], d[4]]);
-        let Some((to, payload)) = flow::take_addr(&d[5..]) else { continue };
+        let Some((mut to, payload)) = flow::take_addr(&d[5..]) else { continue };
         if cfg.policy.check_dst(to).is_err() {
             meter.drop_one();
             continue;
+        }
+        if let Some(f) = cfg.kind.filter() {
+            if f.blocks_dst(to, true).is_some() {
+                meter.block_one();
+                continue;
+            }
+            if to.port() == 53 {
+                // a blocked name is answered by the exit itself, never forwarded
+                if dns_question(payload).is_some_and(|q| f.blocks_name(&q).is_some()) {
+                    meter.block_one();
+                    if let Some(r) = dns_nxdomain(payload) {
+                        let mut b = BytesMut::with_capacity(r.len() + 5);
+                        b.put_u8(KIND_UDP_BACK);
+                        b.put_u32(id);
+                        b.put_slice(&r);
+                        let _ = conn.send_datagram(b.freeze());
+                    }
+                    continue;
+                }
+                // the rest of DNS goes to the exit's own resolver
+                if let ExitKind::Filtered { resolver: Some(r), .. } = &cfg.kind {
+                    to = *r;
+                }
+            }
         }
         let mut map = flows.lock().await;
         if !map.contains_key(&id) {

@@ -29,6 +29,32 @@ pub struct ExitInfo {
     /// Measured throughput through the exit.
     pub mbit_s: Option<f64>,
     pub healthy: bool,
+    /// A filtered exit (its operator's blocklist applies, and it sees site names); else private.
+    pub filtered: bool,
+    /// What a filtered exit says it blocks ("adult", "gambling", "malware"…).
+    pub categories: Vec<String>,
+}
+
+/// Which kind of exit the buyer wants.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Want {
+    /// Private exits only: what a buyer gets unless they choose otherwise.
+    #[default]
+    Private,
+    /// Filtered exits that block at least these categories (none: any filtered exit).
+    Filtered(Vec<String>),
+    /// Either kind.
+    Any,
+}
+
+impl Want {
+    fn allows(&self, e: &ExitInfo) -> bool {
+        match self {
+            Want::Private => !e.filtered,
+            Want::Filtered(cats) => e.filtered && cats.iter().all(|c| e.categories.iter().any(|x| x.eq_ignore_ascii_case(c))),
+            Want::Any => true,
+        }
+    }
 }
 
 /// How flows are given exits.
@@ -57,6 +83,7 @@ pub struct Router {
     exits: Vec<ExitInfo>,
     mode: Mode,
     region: Option<String>,
+    want: Want,
     sticky: Option<String>,
     dests: HashMap<IpAddr, (String, Instant)>,
     load: HashMap<String, u64>,
@@ -64,7 +91,18 @@ pub struct Router {
 
 impl Router {
     pub fn new(mode: Mode, region: Option<String>) -> Router {
-        Router { exits: Vec::new(), mode, region, sticky: None, dests: HashMap::new(), load: HashMap::new() }
+        Router { exits: Vec::new(), mode, region, want: Want::Private, sticky: None, dests: HashMap::new(), load: HashMap::new() }
+    }
+
+    /// Which kind of exit to use (private by default).
+    pub fn want(mut self, want: Want) -> Router {
+        self.want = want;
+        self
+    }
+
+    /// The kind of exit in use: a private exit's buyer resolves names itself.
+    pub fn wants(&self) -> &Want {
+        &self.want
     }
 
     /// Adds an exit, or replaces what is known about it (a new measurement, a health change).
@@ -87,7 +125,7 @@ impl Router {
     }
 
     fn usable(&self) -> impl Iterator<Item = &ExitInfo> {
-        self.exits.iter().filter(|e| e.healthy && self.region.as_ref().is_none_or(|r| &e.region == r))
+        self.exits.iter().filter(|e| e.healthy && self.want.allows(e) && self.region.as_ref().is_none_or(|r| &e.region == r))
     }
 
     fn best(&self) -> Option<&ExitInfo> {
@@ -146,7 +184,7 @@ mod tests {
     use super::*;
 
     fn exit(id: &str, region: &str, mbit: f64, rtt: f64) -> ExitInfo {
-        ExitInfo { id: id.into(), region: region.into(), price_msat_per_gb: 2000, rtt_ms: Some(rtt), mbit_s: Some(mbit), healthy: true }
+        ExitInfo { id: id.into(), region: region.into(), price_msat_per_gb: 2000, rtt_ms: Some(rtt), mbit_s: Some(mbit), healthy: true, filtered: false, categories: Vec::new() }
     }
 
     fn ip(s: &str) -> IpAddr {
@@ -211,6 +249,25 @@ mod tests {
         assert_eq!(r.pick(ip("1.1.1.1"), t).as_deref(), Some("de"));
         r.fail("de");
         assert_eq!(r.pick(ip("9.9.9.9"), t), None);
+    }
+
+    #[test]
+    fn private_exits_by_default_and_filtered_ones_only_when_asked() {
+        let t = Instant::now();
+        let filtered = ExitInfo { filtered: true, categories: vec!["adult".into(), "malware".into()], ..exit("f", "US", 900.0, 5.0) };
+        let mut r = Router::new(Mode::Best, None);
+        r.upsert(filtered.clone());
+        assert_eq!(r.pick(ip("1.1.1.1"), t), None, "a buyer gets private exits unless they choose otherwise");
+        r.upsert(exit("p", "US", 10.0, 90.0));
+        assert_eq!(r.pick(ip("1.1.1.1"), t).as_deref(), Some("p"));
+
+        let mut r = Router::new(Mode::Best, None).want(Want::Filtered(vec!["Adult".into()]));
+        r.upsert(exit("p", "US", 900.0, 5.0));
+        r.upsert(filtered.clone());
+        assert_eq!(r.pick(ip("1.1.1.1"), t).as_deref(), Some("f"));
+        let mut r = Router::new(Mode::Best, None).want(Want::Filtered(vec!["gambling".into()]));
+        r.upsert(filtered);
+        assert_eq!(r.pick(ip("1.1.1.1"), t), None, "an exit that does not block what the buyer asked for is not used");
     }
 
     #[test]

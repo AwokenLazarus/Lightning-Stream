@@ -119,13 +119,13 @@ fn setup(seed: u8, with_exit: bool, phone_limit: Option<u64>) -> Setup {
         let id = exit.endpoint_id();
         let direct = exit.hints(Duration::from_secs(1)).direct.into_iter().filter(|a| a.is_ipv4()).collect();
         buyer_link.learn(&id, Hints { relays: vec![], direct }).unwrap();
-        router.upsert(ExitInfo { id, region: "XX".into(), price_msat_per_gb: 2000, rtt_ms: None, mbit_s: None, healthy: true });
+        router.upsert(ExitInfo { id, region: "XX".into(), price_msat_per_gb: 2000, rtt_ms: None, mbit_s: None, healthy: true, filtered: false, categories: Vec::new() });
         links.push(exit);
     }
     let (phone_private, phone_public) = keypair();
     let (endpoint_private, endpoint_public) = keypair();
     let dev = Arc::new(BuyerDevice { name: "phone".into(), meter: Meter::default(), limit_bytes: phone_limit });
-    let buyer = Buyer::new(buyer_link.clone(), router, HashMap::from([(IpAddr::V4(PHONE_IP), dev)]));
+    let buyer = Buyer::new(buyer_link.clone(), router, HashMap::from([(IpAddr::V4(PHONE_IP), dev)]), None);
     let wg = WgEndpoint::new(endpoint_private, &[WgPeer { public: phone_public, tunnel_ip: PHONE_IP }]);
     let rt = buyer_link.runtime();
     let (to_stack, from_devices) = mpsc::channel::<Bytes>(4096);

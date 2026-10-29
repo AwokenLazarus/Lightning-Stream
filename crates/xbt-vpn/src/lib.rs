@@ -14,9 +14,11 @@
 //! - [`wg`]: the buyer's WireGuard endpoint, which devices and routers add, and their configs and QR codes.
 //! - [`router`]: which exit a new flow goes to (best, sticky, or spread with each destination kept on one).
 //! - [`region`]: checking an exit's announced region against its egress address, offline.
+//! - [`content`]: sites an exit's operator chooses not to carry (by DNS, TLS name, HTTP Host), with no log.
 //! - [`meter`]: bytes carried each way, for payment. It never records where a packet was going.
 
 pub mod buyer;
+pub mod content;
 pub mod exit;
 pub mod filter;
 pub mod flow;

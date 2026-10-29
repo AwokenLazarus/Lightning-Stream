@@ -8,6 +8,11 @@
 //! There is no way out except through an exit: a flow with no usable exit, or from a device past its
 //! limit, is refused. That is the kill switch: traffic never falls back to the buyer's own
 //! connection. IPv6 from devices is refused unless an exit carries it.
+//!
+//! With private exits (the default), the buyer's app answers every DNS question its devices ask
+//! itself, over DNS-over-TLS through the tunnel to a resolver of the buyer's choice
+//! ([`EncryptedDns`]), so no DNS question reaches the exit and browsers can use Encrypted
+//! ClientHello where sites offer it. With filtered exits, DNS goes to the exit's resolver.
 
 use std::collections::HashMap;
 use std::io;
@@ -25,6 +30,8 @@ use tokio::sync::{mpsc, Mutex};
 use xbt_iroh_link::{Link, LinkConnection};
 
 use crate::flow::{open_tcp, recv_udp, send_udp, Opened};
+use rustls::pki_types::ServerName;
+use tokio_rustls::TlsConnector;
 use crate::meter::Meter;
 use crate::router::Router;
 use crate::tunnel::TUNNEL_MTU;
@@ -45,6 +52,40 @@ impl Device {
     }
 }
 
+/// The resolver a buyer with private exits asks, over DNS-over-TLS through the tunnel.
+#[derive(Clone)]
+pub struct EncryptedDns {
+    pub addr: SocketAddr,
+    pub name: ServerName<'static>,
+    pub tls: Arc<rustls::ClientConfig>,
+}
+
+impl EncryptedDns {
+    /// A resolver checked against Mozilla's roots.
+    pub fn new(addr: SocketAddr, name: &str) -> io::Result<EncryptedDns> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        Self::with_roots(addr, name, roots)
+    }
+
+    /// A resolver checked against these roots (a resolver of the buyer's own, or a test's).
+    pub fn with_roots(addr: SocketAddr, name: &str, roots: rustls::RootCertStore) -> io::Result<EncryptedDns> {
+        let tls = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .map_err(io::Error::other)?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let name = ServerName::try_from(name.to_string()).map_err(io::Error::other)?;
+        Ok(EncryptedDns { addr, name, tls: Arc::new(tls) })
+    }
+
+    /// Quad9's public resolver over TLS (it keeps no logs, and blocks known malicious domains); the
+    /// buyer can choose another.
+    pub fn quad9() -> EncryptedDns {
+        Self::new(([9, 9, 9, 9], 853).into(), "dns.quad9.net").expect("a valid name")
+    }
+}
+
 /// An exit the buyer is connected to, and where its UDP answers go.
 struct ExitConn {
     conn: LinkConnection,
@@ -56,6 +97,7 @@ pub struct Buyer {
     link: Arc<Link>,
     pub router: Mutex<Router>,
     devices: HashMap<IpAddr, Arc<Device>>,
+    dns: Option<EncryptedDns>,
     exits: Mutex<HashMap<String, Arc<ExitConn>>>,
     next_flow: AtomicU32,
     /// Flows refused (no exit, a device over its limit, an exit's refusal).
@@ -63,9 +105,34 @@ pub struct Buyer {
 }
 
 impl Buyer {
-    /// `devices`: each device's tunnel address and its state.
-    pub fn new(link: Arc<Link>, router: Router, devices: HashMap<IpAddr, Arc<Device>>) -> Arc<Buyer> {
-        Arc::new(Buyer { link, router: Mutex::new(router), devices, exits: Mutex::new(HashMap::new()), next_flow: AtomicU32::new(1), refused: AtomicU64::new(0) })
+    /// `devices`: each device's tunnel address and its state. `dns`: the resolver the buyer's app asks
+    /// itself (private exits); `None` sends DNS to the exit (filtered exits).
+    pub fn new(link: Arc<Link>, router: Router, devices: HashMap<IpAddr, Arc<Device>>, dns: Option<EncryptedDns>) -> Arc<Buyer> {
+        Arc::new(Buyer { link, router: Mutex::new(router), devices, dns, exits: Mutex::new(HashMap::new()), next_flow: AtomicU32::new(1), refused: AtomicU64::new(0) })
+    }
+
+    /// Asks the buyer's own resolver one DNS question, over TLS through an exit.
+    async fn resolve(self: &Arc<Self>, query: &[u8]) -> Option<Vec<u8>> {
+        let dns = self.dns.as_ref()?;
+        let (exit_id, exit) = self.route(dns.addr).await?;
+        let answer = async {
+            let (opened, send, recv) = open_tcp(&exit.conn, dns.addr).await.ok()?;
+            if opened != Opened::Yes {
+                return None;
+            }
+            let mut tls = TlsConnector::from(dns.tls.clone()).connect(dns.name.clone(), tokio::io::join(recv, send)).await.ok()?;
+            let mut msg = (query.len() as u16).to_be_bytes().to_vec();
+            msg.extend_from_slice(query);
+            tls.write_all(&msg).await.ok()?;
+            let mut len = [0u8; 2];
+            tls.read_exact(&mut len).await.ok()?;
+            let mut a = vec![0u8; usize::from(u16::from_be_bytes(len))];
+            tls.read_exact(&mut a).await.ok()?;
+            Some(a)
+        };
+        let a = tokio::time::timeout(Duration::from_secs(10), answer).await.ok().flatten();
+        self.router.lock().await.flow_ended(&exit_id);
+        a
     }
 
     pub fn device(&self, ip: IpAddr) -> Option<Arc<Device>> {
@@ -158,6 +225,9 @@ impl Buyer {
     async fn udp(self: Arc<Self>, s: ipstack::IpStackUdpStream) {
         let (src, dst) = (s.local_addr(), s.peer_addr());
         let Some(dev) = self.device(src.ip()).filter(|d| !d.over_limit()) else { return self.refuse() };
+        if dst.port() == 53 && self.dns.is_some() {
+            return self.answer_dns(s, dev).await;
+        }
         let Some((exit_id, exit)) = self.route(dst).await else { return self.refuse() };
         let flow = self.next_flow.fetch_add(1, Ordering::Relaxed);
         let (tx, mut rx) = mpsc::channel::<Bytes>(256);
@@ -193,6 +263,27 @@ impl Buyer {
         tokio::select! { _ = out => {}, _ = back => {} }
         exit.udp.lock().await.remove(&flow);
         self.router.lock().await.flow_ended(&exit_id);
+    }
+}
+
+impl Buyer {
+    /// A device's DNS, answered by the buyer's own resolver whatever address the device asked: no
+    /// DNS question reaches the exit.
+    async fn answer_dns(self: Arc<Self>, s: ipstack::IpStackUdpStream, dev: Arc<Device>) {
+        let (mut r, mut w) = tokio::io::split(s);
+        let mut buf = vec![0u8; 4096];
+        while let Ok(n) = r.read(&mut buf).await {
+            if n == 0 || dev.over_limit() {
+                return;
+            }
+            dev.meter.up(n);
+            if let Some(a) = self.resolve(&buf[..n]).await {
+                if w.write_all(&a).await.is_err() {
+                    return;
+                }
+                dev.meter.down(a.len());
+            }
+        }
     }
 }
 

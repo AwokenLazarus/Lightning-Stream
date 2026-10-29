@@ -12,8 +12,11 @@ pub struct Counts {
     pub up_bytes: u64,
     /// IP bytes from the internet to the buyer.
     pub down_bytes: u64,
-    /// Packets refused by the exit's policy or too big for the tunnel.
+    /// Flows or packets refused by the exit's policy or too big for the tunnel.
     pub dropped: u64,
+    /// Flows a filtered exit refused for its operator's blocklist. A count only: what was blocked,
+    /// and for whom, is never kept.
+    pub blocked: u64,
 }
 
 impl Counts {
@@ -29,6 +32,7 @@ pub struct Meter {
     up: AtomicU64,
     down: AtomicU64,
     dropped: AtomicU64,
+    blocked: AtomicU64,
 }
 
 impl Meter {
@@ -44,11 +48,16 @@ impl Meter {
         self.dropped.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn block_one(&self) {
+        self.blocked.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn counts(&self) -> Counts {
         Counts {
             up_bytes: self.up.load(Ordering::Relaxed),
             down_bytes: self.down.load(Ordering::Relaxed),
             dropped: self.dropped.load(Ordering::Relaxed),
+            blocked: self.blocked.load(Ordering::Relaxed),
         }
     }
 }
@@ -65,7 +74,7 @@ mod tests {
         m.down(1280);
         m.drop_one();
         let c = m.counts();
-        assert_eq!(c, Counts { up_bytes: 1280, down_bytes: 1280, dropped: 1 });
+        assert_eq!(c, Counts { up_bytes: 1280, down_bytes: 1280, dropped: 1, blocked: 0 });
         assert_eq!(c.total_bytes(), 2560);
     }
 }

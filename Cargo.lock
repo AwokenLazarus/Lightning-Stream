@@ -5848,9 +5848,13 @@ dependencies = [
  "hex",
  "ipstack",
  "qrcode",
+ "rcgen",
+ "rustls",
  "serde_json",
  "smoltcp",
  "tokio",
+ "tokio-rustls",
+ "webpki-roots 1.0.9",
  "xbt-iroh-link",
 ]
 
