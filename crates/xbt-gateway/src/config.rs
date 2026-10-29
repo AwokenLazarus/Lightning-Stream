@@ -98,7 +98,36 @@ pub struct Route {
     pub websocket: bool,
     /// Each buyer gets an account of their own in the service (`accounts`, docs/BUYER-ACCOUNTS.md).
     pub accounts: Option<Accounts>,
+    /// How many buyers and streams the service takes at once (`capacity`, docs/CAPACITY.md).
+    pub capacity: Capacity,
 }
+
+/// A route's `capacity`: what the seller lets the service carry at once, so that one buyer too many
+/// does not slow every other down. Each limit is off when not set. A buyer turned away is turned
+/// away before paying anything; one already served is never cut off to make room.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Capacity {
+    /// Buyers served at once (`max_buyers`): sessions that used the route in the last
+    /// [`BUYER_IDLE_S`] seconds or have an answer of it open.
+    pub max_buyers: Option<u32>,
+    /// Long answers open at once over all buyers (`max_streams`): a film, a WebSocket, an event
+    /// stream, any body too long or too open-ended to be a page's part.
+    pub max_streams: Option<u32>,
+    /// Long answers open at once for one buyer (`max_streams_per_buyer`).
+    pub max_streams_per_buyer: Option<u32>,
+    /// Megabits a second the route's answers may carry together (`max_mbit`): over it, no new
+    /// long answer is started until the rate falls.
+    pub max_mbit: Option<u32>,
+}
+
+impl Capacity {
+    pub fn is_set(&self) -> bool {
+        *self != Capacity::default()
+    }
+}
+
+/// How long a buyer stays counted after its last request of a route, when nothing of it is open.
+pub const BUYER_IDLE_S: u64 = 300;
 
 /// How buyers' accounts are made in a route's service.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -864,6 +893,12 @@ pub const SERVICES_PATH: &str = "/services";
 /// The signed listing (`docs/LISTINGS.md`). Free. Absent from the config: 404.
 pub const LISTING_PATH: &str = xbt402::listing::PATH;
 
+/// A plain priced route at `path`, for tests elsewhere in the crate.
+#[cfg(test)]
+pub(crate) fn parse_route_for_tests(path: &str) -> Route {
+    route(&serde_json::json!({"path": path, "price": {"request_msat": 1000}})).expect("a test route")
+}
+
 fn route(v: &Value) -> Result<Route, String> {
     let r = obj(
         v,
@@ -885,6 +920,7 @@ fn route(v: &Value) -> Result<Route, String> {
             "allow_paths",
             "websocket",
             "accounts",
+            "capacity",
         ],
     )?;
     let path = req_str(r, "path")?.to_string();
@@ -1075,6 +1111,31 @@ fn route(v: &Value) -> Result<Route, String> {
     if accounts.is_some() && free {
         return Err(bad("a route with accounts is a priced one: a buyer is known only by a paid session"));
     }
+    let capacity = match r.get("capacity") {
+        None => Capacity::default(),
+        Some(c) => {
+            let c = c.as_object().ok_or_else(|| bad("capacity is an object"))?;
+            if let Some(k) = c.keys().find(|k| !["max_buyers", "max_streams", "max_streams_per_buyer", "max_mbit"].contains(&k.as_str())) {
+                return Err(bad(&format!("capacity has no setting {k:?}")));
+            }
+            let limit = |k: &str| -> Result<Option<u32>, String> {
+                match c.get(k) {
+                    None | Some(Value::Null) => Ok(None),
+                    Some(v) => v.as_u64().filter(|n| (1..=1_000_000).contains(n)).map(|n| Some(n as u32))
+                        .ok_or_else(|| bad(&format!("capacity.{k} is a whole number from 1"))),
+                }
+            };
+            Capacity {
+                max_buyers: limit("max_buyers")?,
+                max_streams: limit("max_streams")?,
+                max_streams_per_buyer: limit("max_streams_per_buyer")?,
+                max_mbit: limit("max_mbit")?,
+            }
+        }
+    };
+    if free && capacity.max_buyers.is_some() {
+        return Err(bad("a free route has no buyers to count: capacity.max_buyers is for a priced route"));
+    }
     Ok(Route {
         path,
         methods,
@@ -1091,6 +1152,7 @@ fn route(v: &Value) -> Result<Route, String> {
         allow_paths,
         websocket,
         accounts,
+        capacity,
     })
 }
 

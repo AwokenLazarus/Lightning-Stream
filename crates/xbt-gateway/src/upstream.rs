@@ -399,6 +399,7 @@ mod tests {
             allow_paths: vec![],
             websocket: false,
             accounts: None,
+            capacity: Default::default(),
         };
         let h = |v: &[(&str, &str)]| {
             v.iter()

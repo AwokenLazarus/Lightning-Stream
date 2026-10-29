@@ -87,7 +87,7 @@ impl Gateway {
 
     /// A priced route's WebSocket, after its request's price was charged (`reserve`, refunded
     /// here if the service does not agree).
-    pub(super) fn paid_upgrade(self: &Arc<Self>, a: Authed, route: &Route, req: &Request, reserve: u64) -> Reply {
+    pub(super) fn paid_upgrade(self: &Arc<Self>, a: Authed, route: &Route, req: &Request, reserve: u64, slot: Option<super::admission::Slot>) -> Reply {
         let account = match self.account_for(route, &a.session) {
             Ok(acc) => acc,
             Err(r) => {
@@ -103,7 +103,7 @@ impl Gateway {
             }
         };
         self.lock().book.response(&a.session, true, self.now());
-        let open = OpenResponse { gw: self.clone(), session: a.session.clone() };
+        let open = OpenResponse { gw: self.clone(), session: a.session.clone(), slot };
         self.flush();
         if let Some(head) = self.receipt(&a.session, a.seq, reserve, &a.digest, 101, "") {
             let mut sr = settlement_response(&head, &self.cfg.network, "", true);
