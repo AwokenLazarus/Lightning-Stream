@@ -4639,3 +4639,215 @@ fn a_credit_only_call_buys_no_ticket_and_is_served_whole_from_credit() {
     assert_eq!(r.tap.secrets().len(), released, "{v}");
     assert_eq!(v["charged_sats"].as_i64().unwrap_or(0), 0, "drawn from credit already paid: {v}");
 }
+
+// --- requests side by side in one session ---------------------------------------------------------------
+
+/// What the seller signed as spent in a session, and what it credits it.
+fn seller_totals(r: &Rig, sid: &str) -> (u64, u64) {
+    let st = r.session(sid);
+    let p = st["paying"].as_array().unwrap().iter().find(|p| p["session"] == sid).cloned().unwrap_or(Value::Null);
+    (p["spent_msat"].as_str().unwrap_or("0").parse().unwrap(), p["credited_msat"].as_str().unwrap_or("0").parse().unwrap())
+}
+
+/// A web page asks for many things at once. They go side by side in one session: every request is
+/// served, each is charged its own price, the seller's signed spend is their sum, and one ticket
+/// pays for them all.
+#[test]
+fn requests_side_by_side_in_one_session_are_each_charged_exactly() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    let first = r.pay("/page/1000", CALL);
+    assert_eq!(first["status"], 200, "{first}");
+    let sid = first["session"].as_str().unwrap().to_string();
+    let outs: Vec<Value> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..8).map(|i| { let r = &r; sc.spawn(move || r.pay(&format!("/page/{}", 100 + i), CALL)) }).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for v in &outs {
+        assert_eq!((v["status"].as_u64(), v["price_msat"].as_str(), v["receipt"]["body"].as_str(), v["session"].as_str()),
+                   (Some(200), Some("2500"), Some("as signed"), Some(sid.as_str())), "{v}");
+    }
+    let (spent, credited) = seller_totals(&r, &sid);
+    assert_eq!((spent, credited), (2500 * 9, TICKET), "nine pages at 2,500 msat, one ticket");
+    assert_eq!(r.tap.secrets().len(), 1, "one secret for nine pages");
+    assert_eq!(r.money(), (TICKET, TICKET, TICKET, SETTLED));
+    r.assert_booked();
+}
+
+/// A WebSocket stays open for as long as its page does. Other requests to the same seller go on
+/// beside it: none waits for it to end. When it ends, it is charged its own bytes.
+#[test]
+fn a_websocket_open_does_not_hold_up_other_requests_to_the_seller() {
+    use std::io::{BufRead as _, Read as _, Write as _};
+    use std::os::unix::net::UnixListener;
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    let r = Rig::new(json!({}));
+    let first = r.pay("/page/10", CALL);
+    let sid = first["session"].as_str().unwrap().to_string();
+    let l = UnixListener::bind(dir.path().join("sock")).unwrap();
+    // the page's socket: open for 3 s, 1 KiB out and back every 300 ms
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let caller = std::thread::spawn(move || {
+        let (s, _) = l.accept().unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        let mut rd = std::io::BufReader::new(s.try_clone().unwrap());
+        let mut line = String::new();
+        rd.read_line(&mut line).unwrap();
+        let mut w = s;
+        tx.send(()).unwrap();
+        for _ in 0..10 {
+            let out = vec![7u8; 1024];
+            w.write_all(&out).unwrap();
+            let mut back = vec![0u8; 1024];
+            rd.read_exact(&mut back).unwrap();
+            assert_eq!(back, out);
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        w.shutdown(std::net::Shutdown::Both).unwrap();
+    });
+    std::thread::scope(|sc| {
+        let ws = sc.spawn(|| r.call("xbt402_pay", json!({"url": r.shop.url("/ws/page"), "max_sats": CALL, "task": "film", "stream_to": "sock", "stream_head": true,
+                                                       "upgrade": true, "headers": [["Sec-WebSocket-Key", "k"], ["Sec-WebSocket-Version", "13"]]})));
+        rx.recv_timeout(Duration::from_secs(10)).expect("the socket opened");
+        // while it is open: five pages, each well within the socket's lifetime
+        let t = Instant::now();
+        for i in 0..5 {
+            let v = r.pay(&format!("/page/{}", 50 + i), CALL);
+            assert_eq!((v["status"].as_u64(), v["price_msat"].as_str(), v["session"].as_str()), (Some(200), Some("2500"), Some(sid.as_str())), "{v}");
+        }
+        assert!(t.elapsed() < Duration::from_secs(2), "the pages went beside the socket: {:?}", t.elapsed());
+        let w = ws.join().unwrap();
+        assert_eq!(w["status"], 101, "{w}");
+        // 2,500 msat to open, and 20 KiB at 1,000 msat a KiB
+        let want = (2_500 + 20 * 1_000).to_string();
+        assert_eq!((w["price_msat"].as_str(), w["receipt"]["last"]["charged"].as_str()), (Some(want.as_str()), Some(want.as_str())), "{w}");
+    });
+    caller.join().unwrap();
+    let (spent, _) = seller_totals(&r, &sid);
+    assert_eq!(spent, 2500 * 7 + 20_000, "six pages, and the socket");
+    r.assert_booked();
+    std::env::remove_var("B2_STREAM_DIR");
+}
+
+/// Films side by side in one session draw on one balance. Each answer pays the next ticket when
+/// the balance no longer covers it, counting what the others drew: no answer waits for bytes the
+/// seller will not send, a ticket that two find due at once is released once, and each answer is
+/// charged exactly its bytes.
+#[test]
+fn films_side_by_side_share_one_balance_and_each_pays_its_own_bytes() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    let first = r.pay("/page/10", CALL);
+    let sid = first["session"].as_str().unwrap().to_string();
+    // four films of 30 MiB at 20 sat a MiB: 2,400 sat in all, a ticket being 1,000
+    let t = Instant::now();
+    let outs: Vec<Value> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..4).map(|_| { let r = &r; sc.spawn(move || r.pay(&format!("/hd20/{}", 30 * MIB), CALL)) }).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert!(t.elapsed() < Duration::from_secs(60), "{:?}", t.elapsed());
+    for v in &outs {
+        assert_eq!((v["status"].as_u64(), v["complete"].as_bool(), v["bytes"].as_u64()), (Some(200), Some(true), Some(30 * MIB as u64)), "{v}");
+        assert_eq!((v["price_msat"].as_str(), v["receipt"]["last"]["charged"].as_str(), v["receipt"]["body"].as_str()),
+                   (Some("600000"), Some("600000"), Some("as signed")), "{v}");
+        assert!(v.get("seller_fault").is_none(), "{v}");
+    }
+    let (spent, credited) = seller_totals(&r, &sid);
+    assert_eq!(spent, 2500 + 4 * 600_000, "{spent}");
+    // released only as needed: what the seller holds is under one ticket, beside the four that ran together
+    assert!(credited >= spent && credited - spent < TICKET * 4, "credited {credited}, spent {spent}");
+    let (paid, took, settled, _) = r.money();
+    assert_eq!((paid, took), (settled, settled), "the node, the seller and the book agree");
+    assert_eq!(settled, credited, "every ticket the seller took is credited to the session");
+    r.assert_booked();
+}
+
+/// Side by side, each answer stops at its own call's limit, and none spends past it: the session's
+/// balance is not a way around a call's `max_sats`.
+#[test]
+fn side_by_side_each_answer_stops_at_its_own_limit() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    let first = r.pay("/page/10", CALL);
+    let sid = first["session"].as_str().unwrap().to_string();
+    // 10 MiB asked for at 20 sat a MiB, with a limit of 100 sat each: 5 MiB at most
+    let outs: Vec<Value> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..4).map(|_| { let r = &r; sc.spawn(move || r.pay(&format!("/hd20/{}", 10 * MIB), 100)) }).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let mut sum = 0u64;
+    for v in &outs {
+        let price: u64 = v["price_msat"].as_str().unwrap().parse().unwrap();
+        assert!(price <= 100_000, "{v}");
+        assert_eq!(v["complete"], false, "{v}");
+        assert!(v.get("seller_fault").is_none(), "{v}");
+        sum += price;
+    }
+    let (spent, _) = seller_totals(&r, &sid);
+    assert!(spent <= 2500 + sum + 4 * 20_000, "the seller spent {spent} for answers the wallet counts {sum}");
+    r.assert_booked();
+}
+
+/// A stop while answers are open ends them all, promptly: nothing more is released, and the
+/// counts of the node, the seller and the book still agree.
+#[test]
+fn a_stop_ends_every_answer_open_in_the_session() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    let first = r.pay("/page/10", CALL);
+    let sid = first["session"].as_str().unwrap().to_string();
+    let outs: Vec<Value> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..3).map(|_| { let r = &r; sc.spawn(move || r.pay(&format!("/slow/{}", 20 * MIB), CALL)) }).collect();
+        std::thread::sleep(Duration::from_millis(600));
+        let stop = r.call("ticket_stop", json!({"session": sid}));
+        assert!(stop.get("http").is_some(), "{stop}");
+        let t = Instant::now();
+        let outs: Vec<Value> = hs.into_iter().map(|h| h.join().unwrap()).collect();
+        assert!(t.elapsed() < Duration::from_secs(30), "the answers ended after the stop: {:?}", t.elapsed());
+        outs
+    });
+    for v in &outs {
+        assert_eq!(v["complete"], false, "{v}");
+    }
+    let secrets = r.tap.secrets().len();
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(r.tap.secrets().len(), secrets, "nothing released after the stop");
+    let (paid, took, settled, _) = r.money();
+    assert_eq!((paid, took), (settled, settled));
+    r.assert_booked();
+}
+
+/// Many rounds of pages and films side by side: every round, every request is served and charged
+/// its own price, and the node, the seller and the book agree.
+#[test]
+fn many_rounds_side_by_side_keep_the_counts_exact() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    let first = r.pay("/page/10", CALL);
+    let sid = first["session"].as_str().unwrap().to_string();
+    let mut want = 2500u64;
+    for round in 0..6 {
+        let outs: Vec<(bool, Value)> = std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..6).map(|i| {
+                let r = &r;
+                sc.spawn(move || if i % 2 == 0 { (true, r.pay(&format!("/page/{}", 10 + round), CALL)) } else { (false, r.pay(&format!("/hd20/{}", 2 * MIB), CALL)) })
+            }).collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for (page, v) in &outs {
+            assert_eq!(v["status"], 200, "round {round}: {v}");
+            assert!(v.get("seller_fault").is_none(), "round {round}: {v}");
+            let price = if *page { "2500" } else { "40000" };
+            assert_eq!(v["price_msat"].as_str(), Some(price), "round {round}: {v}");
+            want += if *page { 2500 } else { 40_000 };
+        }
+        let (spent, credited) = seller_totals(&r, &sid);
+        assert_eq!(spent, want, "round {round}");
+        assert!(credited >= spent, "round {round}");
+    }
+    let (paid, took, settled, _) = r.money();
+    assert_eq!((paid, took), (settled, settled));
+    r.assert_booked();
+}

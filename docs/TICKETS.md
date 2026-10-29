@@ -1853,3 +1853,34 @@ the shop, or the address it moved from) is stopped first, unless a call is using
 seller session, and shows a balance, the new session takes over its seller side; otherwise it starts
 fresh. The seller's word moves no money: it only lets the wallet spend credit the book already
 counts as paid.
+
+## 17. Requests side by side in one session (2026-10-29)
+
+A seller's web app asks for many things at once: a page's scripts and pictures together, a film
+that plays for an hour, a WebSocket that stays open as long as the page does. Until 0.1.20 the
+wallet sent one paid request at a time in a session, so a film or a socket held up every other
+request to that seller until the read timeout. Now requests in one session run side by side.
+
+- **Order at the seller.** A request holds the session's link only to take its `seq`, send, and
+  read its head and receipt. The seller sees the seqs in order, as the protocol requires, and the
+  bodies are read beside one another.
+- **One balance.** Every answer counts what it draws, the head's charge and the body as it
+  arrives, into one count for the session. An answer finds a ticket due on what is left for it
+  after what the others drew since it started. Without that, two answers would each count on the
+  same credit, and both would wait for bytes the seller stops sending when the balance is gone.
+- **One release for one need.** Two answers can find a ticket due at the same moment. Releases
+  stay one at a time, and each asks again whether it is still due once it holds the session's
+  release lock: the second finds the first's ticket covers it, and releases nothing.
+- **Checks.** Each answer's own charge is checked against its terms and its call's `max_sats` at
+  its end, as before. Where answers overlap, the seller's session totals in a receipt are checked
+  against the balance (spent never above credited), as they already were while one answer priced
+  as it goes was open, since the spend of one answer moves while another's receipt is read.
+- **Why one session and not one per request.** A session per request would lock a ticket for each
+  request in flight, spread the credit thin across them, and use up the per-seller caps on a page
+  with a dozen pictures. One session lets one ticket's credit serve the whole page.
+
+Tests: `requests_side_by_side_in_one_session_are_each_charged_exactly`,
+`a_websocket_open_does_not_hold_up_other_requests_to_the_seller` (it fails on the old code: the
+pages waited the socket's 3 s), `films_side_by_side_share_one_balance_and_each_pays_its_own_bytes`,
+`side_by_side_each_answer_stops_at_its_own_limit`, `a_stop_ends_every_answer_open_in_the_session`,
+`many_rounds_side_by_side_keep_the_counts_exact` (crates/xbt-signer/tests/ticket_pay.rs).
