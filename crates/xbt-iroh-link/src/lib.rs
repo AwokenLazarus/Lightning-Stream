@@ -39,6 +39,16 @@ pub const ALPN: &[u8] = b"xbt-stream/http/1";
 /// handshake and messages) between a hashtaker's app and a hashmaker's app.
 pub const ALPN_HASHLINK: &[u8] = b"xbt-stream/hashlink/0";
 
+/// The VPN exit's protocol: IP packets in QUIC datagrams (a length-prefixed stream when the path
+/// carries no datagrams) between a buyer's app and a seller's exit.
+pub const ALPN_VPN: &[u8] = b"xbt-stream/vpn/0";
+
+/// A connection on the link, for a protocol that uses it directly (datagrams) rather than through
+/// TCP ports.
+pub use iroh::endpoint::Connection as LinkConnection;
+/// The streams of a [`LinkConnection`].
+pub use iroh::endpoint::{RecvStream as LinkRecvStream, SendDatagramError, SendStream as LinkSendStream};
+
 /// The suffix of a seller's link host name. `.invalid` never resolves through DNS.
 pub const HOST_SUFFIX: &str = ".link.invalid";
 
@@ -276,6 +286,47 @@ impl Link {
         }
         Ok(())
     }
+
+    /// The runtime the link runs on, for a protocol that drives connections itself.
+    pub fn runtime(&self) -> tokio::runtime::Handle {
+        self.rt.handle().clone()
+    }
+
+    /// A seller's link that hands each accepted connection to `handler` (after recording its path),
+    /// for a protocol that uses the connection directly, such as [`ALPN_VPN`].
+    pub fn accept_with<F, Fut>(self: &Arc<Self>, handler: F)
+    where
+        F: Fn(Connection) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let ep = self.ep.clone();
+        let (paths, detail) = (self.paths.clone(), self.detail.load(Ordering::Relaxed));
+        let handler = Arc::new(handler);
+        self.rt.spawn(async move {
+            while let Some(incoming) = ep.accept().await {
+                let (paths, handler) = (paths.clone(), handler.clone());
+                tokio::spawn(async move {
+                    let Ok(conn) = incoming.await else { return };
+                    watch(conn.clone(), paths, detail);
+                    handler(conn).await;
+                });
+            }
+        });
+    }
+
+    /// A connection to the peer with this key, for the link's protocol, using the hints learned for
+    /// it ([`Link::learn`]) and the address lookup.
+    pub fn connect_conn(self: &Arc<Self>, endpoint_id_hex: &str) -> io::Result<Connection> {
+        let addr = self.addr_of(parse_id(endpoint_id_hex)?);
+        let (ep, alpn) = (self.ep.clone(), self.alpn);
+        let (paths, detail) = (self.paths.clone(), self.detail.load(Ordering::Relaxed));
+        self.rt.block_on(async move {
+            let conn = ep.connect(addr, alpn).await.map_err(io_err)?;
+            watch(conn.clone(), paths, detail);
+            Ok(conn)
+        })
+    }
+
 
     /// Remembers where a seller can be found, from its checked listing.
     pub fn learn(&self, endpoint_id_hex: &str, hints: Hints) -> io::Result<()> {

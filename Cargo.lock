@@ -5668,6 +5668,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "xbt-vpn"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "hex",
+ "serde_json",
+ "tokio",
+ "xbt-iroh-link",
+]
+
+[[package]]
 name = "xbt-wallet-mcp"
 version = "0.1.0"
 dependencies = [
