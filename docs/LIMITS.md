@@ -787,6 +787,9 @@ payer only: no socket method buys one. Run on regtest only (`scripts/ticket_book
   Until 0.1.18 the split rule counted ticket refills too, so under the starter rules (ask above
   1,000) a buyer got one 900-sat ticket a seller in ten minutes: a film and then an AI answer
   from the same shop was refused.
+  For a task that may pay any seller (one the owner has not named), the split rule was also a
+  soft limit on how fast tickets go out; now its task budget, the cap on one seller and
+  `velocity_max` bound it.
 - A ticket released before this version has no session in its ledger row and counts as one
   payment under either setting.
 - No release can wait for a human: a session whose one ticket, with its fee limit, would reach
