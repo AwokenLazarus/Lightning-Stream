@@ -1,9 +1,1 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
-  <!-- XBT Agent Wallet: a plain wallet with a policy check mark. Drawn for this project; no third-party marks. -->
-  <rect width="256" height="256" fill="#1d3557"/>
-  <rect x="44" y="72" width="168" height="124" rx="18" fill="#f1faee"/>
-  <path d="M60 72 L164 44 Q176 41 179 53 L184 72 Z" fill="#a8dadc"/>
-  <rect x="150" y="112" width="62" height="44" rx="12" fill="#457b9d"/>
-  <circle cx="172" cy="134" r="8" fill="#f1faee"/>
-  <path d="M70 134 L88 152 L122 112" fill="none" stroke="#1d3557" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
-</svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256"><!-- Lightning Stream: three currents, the middle one struck through with a bolt. Drawn for this project. --><rect width="256" height="256" rx="56" fill="#111418"/><g fill="none" stroke="#ffffff" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"><path d="M56 84c24-14 40 14 64 0s40-14 72 0" opacity=".45"/><path d="M56 132h44l20-28 20 56 20-28h44"/><path d="M56 180c24-14 40 14 64 0s40-14 72 0" opacity=".45"/></g></svg>

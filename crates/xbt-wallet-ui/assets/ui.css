@@ -1,33 +1,35 @@
-/* Lightning Stream: one stylesheet, no web fonts, nothing loaded from elsewhere.
-   The look: an electric river at night. Deep-night ground, currents in electric blue and violet,
-   and one warm colour for the main action on a page and for money. Light and dark follow the
-   system. The river itself is drawn by river.js on the canvas behind the page, with the
-   --river-* colours below. */
+/* Lightning Stream: one stylesheet, its own fonts, nothing loaded from elsewhere.
+   Theme "Slate": Neutral graphite and white, one quiet blue: an instrument, not a toy. Inter for UI, JetBrains Mono for numbers and keys.
+   The river behind the page is drawn by river.js with the --river-* values below: quiet at rest, a short
+   electric discharge on a click. Light and dark follow the system. */
+@font-face { font-family: "Inter"; src: url("./fonts/inter-var.woff2") format("woff2"); font-weight: 100 900; font-style: normal; font-display: swap; }
+@font-face { font-family: "JetBrains Mono"; src: url("./fonts/jetbrains-mono-var.woff2") format("woff2"); font-weight: 100 800; font-style: normal; font-display: swap; }
 :root {
-  --bg: #eef2fb; --bg-2: #dfe7fa; --fg: #0d1430; --muted: #424c6c; --card: rgba(255, 255, 255, 0.9); --card-edge: #d2dbef;
-  --line: #d6deef; --head: rgba(246, 248, 254, 0.94); --head-shadow: 0 6px 18px rgba(13, 20, 48, 0.08); --input: #ffffff; --mono-bg: #e8edf8;
-  --accent: #1c64d0; --accent-soft: rgba(28, 100, 208, 0.12); --accent-fg: #ffffff;
-  --cta: #f2a516; --cta-2: #ffbe3d; --cta-fg: #1d1404; --money: #9a5b00;
-  --ok: #11673b; --ok-bg: #dcf3e5; --bad: #ad221e; --bad-bg: #fde6e5; --warn: #835400; --warn-bg: #fff0cc;
-  --shadow: 0 1px 2px rgba(13, 20, 48, 0.06), 0 8px 24px rgba(13, 20, 48, 0.06);
-  --glow-1: rgba(56, 132, 248, 0.16); --glow-2: rgba(124, 58, 237, 0.1);
-  --river-a: #2f74e6; --river-b: #7c4ae0; --river-spark: #1d4ed8;
-  --river-glow: 0.05; --river-core: 0.22; --river-blend: normal;
-  --radius: 14px; --font: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Helvetica Neue", Arial, sans-serif;
-  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --bg: #f6f7f9; --bg-2: #f6f7f9; --fg: #111418; --muted: #4f5763; --card: #ffffff; --card-edge: #e3e6eb;
+  --line: #e3e6eb; --head: rgba(246,247,249,0.92); --head-shadow: 0 1px 0 #e3e6eb; --input: #ffffff; --mono-bg: #eef0f3;
+  --accent: #2b59c3; --accent-soft: rgba(43,89,195,0.08); --accent-fg: #ffffff;
+  --cta: #111418; --cta-2: #111418; --cta-fg: #ffffff; --money: #875400;
+  --ok: #16723f; --ok-bg: #e7f4ec; --bad: #b42318; --bad-bg: #fdecea; --warn: #8a5300; --warn-bg: #fbf1dc;
+  --shadow: 0 1px 2px rgba(17,20,24,0.04);
+  --glow-1: transparent; --glow-2: transparent;
+  --river-a: #6b7a96; --river-b: #8a93a8; --river-spark: #2b59c3;
+  --river-glow: 0.02; --river-core: 0.09; --river-blend: normal;
+  --river-pace: 0.55; --river-reach: 0.8; --river-width: 0.8; --river-halo: 0.4; --river-bump: 0.5; --river-sparks: 0.3; --river-zap: 0.9;
+  --radius: 10px; --font: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
   color-scheme: light;
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #05081c; --bg-2: #0b1238; --fg: #e8edff; --muted: #aab5d8; --card: rgba(11, 17, 46, 0.86); --card-edge: #1d2860;
-    --line: #1c2655; --head: rgba(6, 10, 32, 0.92); --head-shadow: 0 8px 24px rgba(0, 0, 0, 0.45); --input: #070c26; --mono-bg: #0d1440;
-    --accent: #7dd3fc; --accent-soft: rgba(125, 211, 252, 0.12); --accent-fg: #04122a;
-    --cta: #fbbf24; --cta-2: #ffd36b; --cta-fg: #1d1404; --money: #fcd27a;
-    --ok: #7fe2aa; --ok-bg: #0d2e22; --bad: #ff9f99; --bad-bg: #3b1322; --warn: #ffd27a; --warn-bg: #33260b;
-    --shadow: 0 1px 0 rgba(125, 211, 252, 0.04) inset, 0 12px 32px rgba(0, 0, 0, 0.35);
-    --glow-1: rgba(56, 189, 248, 0.13); --glow-2: rgba(167, 139, 250, 0.08);
-    --river-a: #38bdf8; --river-b: #a78bfa; --river-spark: #e0f2fe;
-    --river-glow: 0.05; --river-core: 0.27; --river-blend: lighter;
+    --bg: #0d0f12; --bg-2: #0d0f12; --fg: #e8eaed; --muted: #a0a8b3; --card: #15181d; --card-edge: #23272e;
+    --line: #23272e; --head: rgba(13,15,18,0.9); --head-shadow: 0 1px 0 #23272e; --input: #111418; --mono-bg: #1b1f25;
+    --accent: #94b2ff; --accent-soft: rgba(148,178,255,0.10); --accent-fg: #0d0f12;
+    --cta: #e8eaed; --cta-2: #e8eaed; --cta-fg: #0d0f12; --money: #e6b85f;
+    --ok: #7ad6a0; --ok-bg: #11261a; --bad: #ff9a8f; --bad-bg: #2e1513; --warn: #f0c26a; --warn-bg: #2b220f;
+    --shadow: 0 1px 0 rgba(255,255,255,0.02) inset;
+    --glow-1: transparent; --glow-2: transparent;
+    --river-a: #6f86b8; --river-b: #8a93a8; --river-spark: #dfe8ff;
+    --river-glow: 0.025; --river-core: 0.12; --river-blend: lighter;
     color-scheme: dark;
   }
 }
@@ -296,3 +298,20 @@ form.policy > fieldset, form.policy > details > fieldset { background: var(--car
 
 /* the rules a change touches: addresses and node ids break anywhere rather than run off a phone */
 ul.changes li { overflow-wrap: anywhere; }
+
+/* theme Slate: flat, calm surfaces */
+.glow { background: none; }
+.brand { font-weight: 600; letter-spacing: -0.01em; }
+.brand svg { width: 26px; height: 26px; border-radius: 0; }
+.brand .ls-b { fill: var(--fg); } .brand .ls-l { stroke: var(--bg); }
+.card.primary { border-color: color-mix(in srgb, var(--accent) 55%, var(--card-edge)); box-shadow: var(--shadow); }
+button, a.button-link, a.button-link.primary { border-radius: 8px; }
+button, a.button-link.primary { background: var(--cta); box-shadow: none; }
+button:hover { filter: none; background: color-mix(in srgb, var(--cta) 88%, var(--bg)); }
+button.secondary, button.danger { background: transparent; }
+header nav a, nav.tabs a, nav.chips a { border-radius: 8px; }
+header nav a[aria-current=page] { box-shadow: none; }
+.card, .step, .status { box-shadow: var(--shadow); }
+h1 { font-weight: 650; letter-spacing: -0.02em; }
+video { box-shadow: 0 0 0 1px var(--card-edge); }
+.empty::before { background: radial-gradient(circle, var(--accent-soft) 60%, transparent 61%); opacity: 1; }

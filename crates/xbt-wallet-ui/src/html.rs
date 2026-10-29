@@ -208,25 +208,23 @@ pub fn page_head(title: &str, nav: &Nav, flash: Option<(bool, String)>, body: &s
     } else {
         String::new()
     };
-    let brand = if nav.logged_in { format!("<a class=\"brand\" href=\"./\">{MARK}{}</a>", esc(nav.brand)) } else { format!("<div class=\"brand\">{MARK}{}</div>", esc(nav.brand)) };
+    let mark = MARK.trim_end();
+    let brand = if nav.logged_in { format!("<a class=\"brand\" href=\"./\">{mark}{}</a>", esc(nav.brand)) } else { format!("<div class=\"brand\">{mark}{}</div>", esc(nav.brand)) };
     let flash = flash.map(|(ok, m)| format!("<div class=\"flash {}\" role=\"status\">{}</div>", if ok { "ok" } else { "bad" }, esc(&m))).unwrap_or_default();
     format!("<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-             <meta name=\"referrer\" content=\"no-referrer\">{head}<link rel=\"icon\" href=\"data:,\"><title>{} · {}</title>\
+             <meta name=\"referrer\" content=\"no-referrer\">{head}<link rel=\"icon\" type=\"image/svg+xml\" href=\"./mark.svg?v={}\"><title>{} · {}</title>\
              <link rel=\"stylesheet\" href=\"./ui.css?v={}\"><script src=\"./vt.js?v={}\"></script></head><body>\
              <div class=\"glow\" aria-hidden=\"true\"></div><canvas id=\"river\" aria-hidden=\"true\"></canvas>\
              <header>{brand}{menu}</header>\
              <main>{tabs}{flash}{banner}<h1>{}</h1>{body}</main>\
              <footer>Your money stays on your own Lightning node. Nobody else holds it.</footer>\
              <script src=\"./ui.js?v={}\"></script><script src=\"./river.js?v={}\"></script></body></html>\n",
-            esc(title), esc(nav.brand), asset_version(crate::UI_CSS), asset_version(crate::VT_JS), esc(title),
+            asset_version(crate::MARK_SVG), esc(title), esc(nav.brand), asset_version(crate::UI_CSS), asset_version(crate::VT_JS), esc(title),
             asset_version(crate::UI_JS), asset_version(crate::river_js()))
 }
 
-/// The app's mark in the header: a lightning river, the app icon at header size.
-const MARK: &str = "<svg viewBox=\"0 0 32 32\" aria-hidden=\"true\"><rect x=\".5\" y=\".5\" width=\"31\" height=\"31\" rx=\"8\" fill=\"#05081c\" stroke=\"#2a3a80\"/>\
-    <path d=\"M17.5 3 14 11.5h4.5L12 19.5h4.5L10 29\" fill=\"none\" stroke=\"#38bdf8\" stroke-width=\"6\" stroke-linecap=\"round\" stroke-linejoin=\"round\" opacity=\".22\"/>\
-    <path d=\"M17.5 3 14 11.5h4.5L12 19.5h4.5L10 29\" fill=\"none\" stroke=\"#7dd3fc\" stroke-width=\"3\" stroke-linecap=\"round\" stroke-linejoin=\"round\" opacity=\".55\"/>\
-    <path d=\"M17.5 3 14 11.5h4.5L12 19.5h4.5L10 29\" fill=\"none\" stroke=\"#f0f9ff\" stroke-width=\"1.3\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg>";
+/// The app's mark in the header and as the page icon: assets/mark.svg, one theme's logo.
+const MARK: &str = crate::MARK_SVG;
 
 /// A short content hash for cache busting.
 pub fn asset_version(s: &str) -> String {

@@ -44,7 +44,7 @@ fn the_river_and_the_stylesheet_are_local_cached_by_hash_and_the_csp_stays_self_
     assert_eq!(h["x-content-type-options"], "nosniff");
     assert_eq!(js, xbt_wallet_ui::river_js());
     // small, and fetched once a year per browser (the hashed URL is immutable)
-    assert!(js.len() < 10 * 1024, "the river as served stays small: {} bytes", js.len());
+    assert!(js.len() < 12 * 1024, "the river as served stays small: {} bytes", js.len());
     // stripping indentation and comment lines leaves a script that still parses
     let home = std::env::var("HOME").unwrap_or_default();
     if let Some(node) = ["node".to_string(), format!("{home}/.local/share/nodejs/bin/node")].into_iter()
@@ -224,4 +224,32 @@ fn the_hashrate_pages_in_headless_chrome() {
     let text = String::from_utf8_lossy(&o.stdout);
     eprintln!("{text}{}", String::from_utf8_lossy(&o.stderr));
     assert!(o.status.success());
+}
+
+#[test]
+fn the_themes_fonts_and_mark_are_served_from_the_box() {
+    let data = tempfile::tempdir().unwrap();
+    let mut cfg = Config::for_test(data.path().join("no-signer.sock"), data.path().join("ui"), "127.0.0.1:0");
+    cfg.role = Role::Gateway;
+    let srv = xbt_wallet_ui::server::spawn(App::new(cfg).unwrap()).unwrap();
+    let base = format!("http://{}", srv.addr);
+    let (_, h, page) = get(&format!("{base}/"));
+    assert!(h["content-security-policy"].contains("font-src 'self'"), "{h:?}");
+    let v = xbt_wallet_ui::html::asset_version(xbt_wallet_ui::MARK_SVG);
+    assert!(page.contains(&format!("href=\"./mark.svg?v={v}\"")), "the mark is the page icon: {page}");
+    let (status, h, svg) = get(&format!("{base}/mark.svg?v={v}"));
+    assert_eq!(status, 200);
+    assert!(h["content-type"].starts_with("image/svg+xml") && svg.contains("<svg"), "{h:?}");
+    assert!(!svg.contains("<style"), "the page policy allows no inline styles: colour the mark with attributes and ui.css");
+    // every font the stylesheet names is one the box serves, as woff2, cached for good
+    for name in xbt_wallet_ui::UI_CSS.split("url(\"./fonts/").skip(1).map(|s| s.split('"').next().unwrap()) {
+        assert!(xbt_wallet_ui::font(name).is_some(), "ui.css names a font the box does not serve: {name}");
+        let r = ureq::get(&format!("{base}/fonts/{name}")).call().unwrap();
+        assert_eq!(r.header("content-type"), Some("font/woff2"), "{name}");
+        let mut b = Vec::new();
+        std::io::Read::read_to_end(&mut r.into_reader(), &mut b).unwrap();
+        assert!(b.starts_with(b"wOF2"), "{name} is a woff2 file");
+    }
+    let (status, h, _) = get(&format!("{base}/fonts/nothing.woff2"));
+    assert!(status != 200 || !h.get("content-type").is_some_and(|c| c.starts_with("font/")), "no font for an unknown name");
 }

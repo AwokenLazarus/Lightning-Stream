@@ -345,6 +345,12 @@ impl App {
             (true, "/river.js") => return asset(&req, "text/javascript; charset=utf-8", crate::river_js()),
             (true, "/ui.css") => return asset(&req, "text/css; charset=utf-8", crate::UI_CSS),
             (true, "/vt.js") => return asset(&req, "text/javascript; charset=utf-8", crate::VT_JS),
+            (true, "/mark.svg") => return asset(&req, "image/svg+xml", crate::MARK_SVG),
+            (true, p) if p.starts_with("/fonts/") => {
+                if let Some(b) = crate::font(&p["/fonts/".len()..]) {
+                    return Resp::text(200, "font/woff2", b.to_vec()).header("Cache-Control", "public, max-age=31536000, immutable");
+                }
+            }
             (true, "/healthz") => return Resp::json(200, &json!({"ok": true})),
             (true, "/readyz") if self.cfg.role == Role::Gateway => return Resp::json(200, &json!({"ok": true, "role": "gateway"})),
             (true, "/readyz") => {
