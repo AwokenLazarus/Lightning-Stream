@@ -28,6 +28,8 @@ pub(crate) mod sell;
 pub mod services_page;
 #[path = "nostr_pages.rs"]
 mod nostr_pages;
+#[path = "relay_pages.rs"]
+mod relay_pages;
 #[path = "hashrate.rs"]
 pub(crate) mod hashrate;
 
@@ -43,6 +45,8 @@ pub struct App {
     pub relays: RelayLinks,
     /// Sellers found on Nostr, when the owner set relays ([`crate::nostr`]).
     pub nostr: crate::nostr::NostrCache,
+    /// Stream relays: the owner's choices, those announced on Nostr, and their probes ([`crate::relaynet`]).
+    pub relay_net: crate::relaynet::RelayNet,
     /// The platform's login proxy, when it does the login ([`crate::auth::PlatformLogin`]).
     pub platform: Option<crate::auth::PlatformLogin>,
     /// Why the last play of an item failed, by item URL, for the player page to say (a few minutes).
@@ -199,8 +203,9 @@ impl App {
         let signer = SignerLink::new(cfg.signer_sock.clone(), std::time::Duration::from_secs(90));
         let relays = RelayLinks::new(cfg.relay_ttl);
         let nostr = crate::nostr::NostrCache::new(cfg.nostr_relays.clone());
+        let relay_net = crate::relaynet::RelayNet::with_default(cfg.nostr_relays.clone(), &cfg.data_dir, &cfg.stream_relay);
         let platform = cfg.platform_login.as_deref().map(crate::auth::PlatformLogin::new);
-        Ok(Arc::new(Self { cfg, auth, signer, relays, nostr, platform, play_errors: std::sync::Mutex::new(HashMap::new()) }))
+        Ok(Arc::new(Self { cfg, auth, signer, relays, nostr, relay_net, platform, play_errors: std::sync::Mutex::new(HashMap::new()) }))
     }
 
     fn call(&self, method: &str, params: Value) -> Result<Value, String> {
@@ -416,6 +421,7 @@ impl App {
             "/sell-hashrate" if self.cfg.sell => self.sell_hashrate_page(&ctx),
             "/hashrate" => self.hashrate_page(&ctx),
             "/nostr" => self.nostr_page(&ctx, &req.query),
+            "/relays" => self.relays_page(&ctx, &req.query),
             "/play" => self.play(&ctx, &req),
             "/connections" => self.connections(&ctx),
             "/apps" => self.apps_page(&ctx),
@@ -586,6 +592,8 @@ impl App {
             "/hashrate" => self.hashrate_post(ctx, f),
             "/play-link" => self.play_link(ctx, f),
             "/nostr-check" => self.nostr_check(ctx, f),
+            "/relays-prefs" => self.relays_prefs(ctx, f),
+            "/relays-publish" => self.relays_publish(ctx, f),
             "/connections" => self.connections_stop(ctx, f),
             "/apps-create" => self.apps_create(ctx, f),
             "/apps-revoke" => self.apps_revoke(ctx, f),

@@ -31,6 +31,7 @@
 //! | `XBT_UI_SELL` | `0` | `1`: the wallet's UI also has the Sell page (`/sell`), which sets up the gateway beside it (the `XBT_UI_GW_*` settings); the app is then branded Lightning Stream |
 //! | `XBT_UI_SUGGESTED_SELLERS` | | sellers' addresses (`https://`, comma-separated) the Sellers page and an empty Browse offer to add in one click. Nothing is fetched until the owner adds one |
 //! | `XBT_UI_NOSTR_RELAYS` | | Nostr relays to read sellers' signed listings from (`wss://`, comma-separated), for Browse's Nostr page. Unset: no relay is ever asked |
+//! | `XBT_UI_STREAM_RELAY` | our relay, `https://iroh.lazarus-xbt.xyz/` | the Stream relay a direct link falls back to last; the Stream relays page (Settings) keeps the owner's other choices in `<data dir>/relays.json` (`docs/RUN-A-RELAY.md`) |
 //! | `XBT_UI_NWC_SOCK` | | the NWC wallet service's admin socket (`xbt-nwc`'s `NWC_ADMIN_SOCK`): the Connected apps page makes, lists and revokes NWC connections there |
 //! | `XBT_UI_CONNECTOR` | `http://127.0.0.1:8480` | the connector the player loads video from (`<connector>/s/<item URL>`). That is also the connector's default listen address, and the UI's own default bind: on one machine set one of the two ports. |
 //! | `XBT_UI_PLATFORM_LOGIN` | | the host name of the platform's own login proxy (Umbrel: `<app id>_app_proxy_1`). A request from that peer is the owner's, already logged in by the platform: no app password is asked. Every other peer still needs the password. Set it only where no other app can take that name on the network: umbrelOS 2.0 runs no app-proxy container, so the Umbrel package leaves it unset |
@@ -87,6 +88,9 @@ pub struct Config {
     pub nwc_sock: Option<PathBuf>,
     /// `XBT_UI_NOSTR_RELAYS`: where Browse's Nostr page reads listings; empty: it reads none.
     pub nostr_relays: Vec<String>,
+    /// `XBT_UI_STREAM_RELAY`: the Stream relay a direct link falls back to last
+    /// (`docs/RUN-A-RELAY.md`); ours by default.
+    pub stream_relay: String,
     /// `XBT_UI_SUGGESTED_SELLERS`: sellers offered to add in one click.
     pub suggested_sellers: Vec<String>,
     /// `XBT_UI_PLATFORM_LOGIN`: the platform's login proxy, whose requests need no app password.
@@ -259,6 +263,10 @@ impl Config {
             relay_ttl: Duration::from_secs(secs("XBT_UI_RELAY_LINK_S", 6 * 3600).clamp(60, 7 * 86_400)),
             nwc_sock: env("XBT_UI_NWC_SOCK").map(PathBuf::from),
             nostr_relays: nostr_relays(env("XBT_UI_NOSTR_RELAYS").as_deref())?,
+            stream_relay: match env("XBT_UI_STREAM_RELAY") {
+                Some(u) => xbt_nostr::relays::canonical_relay(&u).map_err(|e| format!("XBT_UI_STREAM_RELAY: {e}"))?,
+                None => crate::relaynet::DEFAULT_RELAY.to_string(),
+            },
             suggested_sellers: env("XBT_UI_SUGGESTED_SELLERS").map(|v| v.split(',').map(|s| s.trim().trim_end_matches('/').to_string())
                 .filter(|s| crate::services::http_origin(s).is_some()).take(10).collect()).unwrap_or_default(),
             platform_login: env("XBT_UI_PLATFORM_LOGIN").filter(|h| h.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))),
@@ -293,7 +301,7 @@ impl Config {
                cmp_status_url: None, mcp_urls: vec![], mcp_token_file: PathBuf::from("/nonexistent/mcp-http-token"), threads: 4, role: Role::Wallet,
                ln: LnSetup::default(), gw: GatewaySetup { state_dir: "/data/gateway".into(), port: 8402, ..Default::default() },
                services_file: None, sell: false, connector: "http://127.0.0.1:8480".into(), relay_ttl: Duration::from_secs(6 * 3600),
-               nwc_sock: None, nostr_relays: vec![], suggested_sellers: vec![], platform_login: None, enroll_code_file: None,
+               nwc_sock: None, nostr_relays: vec![], stream_relay: crate::relaynet::DEFAULT_RELAY.to_string(), suggested_sellers: vec![], platform_login: None, enroll_code_file: None,
                restart_hint: RESTART_HINT.into(), local_services: vec![],
                hash: HashSetup { settings: PathBuf::from("/nonexistent/hashrate/settings.json"), datum_guide: DATUM_GUIDE.into(), ..Default::default() } }
     }

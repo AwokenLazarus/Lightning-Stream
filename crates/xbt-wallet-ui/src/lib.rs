@@ -24,6 +24,7 @@ pub mod own_shop;
 pub mod msg;
 pub mod nostr;
 pub mod relay;
+pub mod relaynet;
 pub mod server;
 pub mod setup;
 

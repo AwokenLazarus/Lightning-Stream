@@ -135,7 +135,8 @@ pub const SETTINGS: Section = Section {
     label: "Settings",
     tabs: &[Tab { href: "./setup", title: "Setup", label: "Setup" }, Tab { href: "./lightning", title: "Your node", label: "Your node" },
             Tab { href: "./policy", title: "Spending rules", label: "Spending rules" }, Tab { href: "./keys", title: "Keys and backup", label: "Keys and backup" },
-            Tab { href: "./signatures", title: "Records", label: "Records" }, Tab { href: "./channels", title: "Old channels", label: "Old channels" }],
+            Tab { href: "./signatures", title: "Records", label: "Records" }, Tab { href: "./relays", title: "Stream relays", label: "Stream relays" },
+            Tab { href: "./channels", title: "Old channels", label: "Old channels" }],
     also: &[],
 };
 /// With hashrate (the box runs the hasher's or the renter's service): renting miners is one

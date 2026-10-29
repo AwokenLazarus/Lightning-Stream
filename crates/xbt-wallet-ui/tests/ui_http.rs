@@ -2372,3 +2372,63 @@ fn a_seller_that_charged_past_a_calls_limit_is_said_on_the_wallet_page() {
     assert!(page.contains("https://lab-shop.example charged 68.244 sats for one answer, more than the 50 sats the call allowed"), "{page}");
     assert!(page.contains("A seller charged past the limit"), "{page}");
 }
+
+#[test]
+fn the_stream_relays_page_lists_announced_relays_and_keeps_the_owner_s_choices() {
+    use xbt_nostr::{event::Keys, oneshot, relays, standin::StandinRelay};
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let relay = StandinRelay::start().unwrap();
+    let nostr = vec![relay.url.clone()];
+    // two announced relays: neither answers a probe here (port 9 on this machine), so neither is used
+    for (host, region) in [("relay-a.example", "eu-central"), ("relay-b.example", "us-west")] {
+        let offer = relays::Offer { relay: format!("https://{host}"), region: region.into(), capacity_mbit: Some(200), udp: false,
+                                    contact: String::new(), note: String::new(), ttl_s: 86_400 };
+        let ev = relays::announcement_event(&Keys::generate(), &offer, xbt_nostr::now()).unwrap();
+        assert_eq!(oneshot::publish(&nostr, &ev, Duration::from_secs(5))[0].result, Ok(()));
+    }
+    let bx = start(json!({}), false, |c| {
+        c.nostr_relays = nostr.clone();
+        c.stream_relay = "https://127.0.0.1:9/".into();
+    });
+    let mut br = logged_in(&bx);
+    assert_eq!(B::new(&bx.base).get("/relays").location(), "./login");
+    let page = br.get("/relays");
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(page.body.contains("https://relay-a.example/") && page.body.contains("us-west"));
+    assert!(page.body.contains("not answering"));
+    assert!(page.body.contains("2 relays announced on 1 of 1 Nostr relays"));
+    assert!(page.body.contains("Run a Stream relay") && page.body.contains("RUN-A-RELAY.md"));
+
+    // prefer one, block another; the choices are kept in relays.json, with what they select
+    let r = br.act("/relays", "/relays-prefs", &[("action", "pin"), ("relay", "https://Relay-A.example")]);
+    assert!(br.flash_after(&r).contains("Saved"));
+    let r = br.act("/relays", "/relays-prefs", &[("action", "block"), ("relay", "https://127.0.0.1:9")]);
+    assert!(br.flash_after(&r).contains("Saved"));
+    let file: Value = serde_json::from_str(&std::fs::read_to_string(bx.data.path().join("ui/relays.json")).unwrap()).unwrap();
+    assert_eq!(file["pinned"], json!(["https://relay-a.example/"]));
+    assert_eq!(file["blocked"], json!(["https://127.0.0.1:9/"]));
+    // nothing answers and the default is blocked: nothing is selected (the link then uses the public relays)
+    assert_eq!(file["selected"], json!([]));
+    // a bad address is refused in words; only own needs an own relay first
+    let r = br.act("/relays", "/relays-prefs", &[("action", "pin"), ("relay", "http://plain.example")]);
+    assert!(br.flash_after(&r).contains("https://"));
+    let r = br.act("/relays", "/relays-prefs", &[("action", "only-own-on")]);
+    assert!(br.flash_after(&r).contains("own relay first"));
+    let r = br.act("/relays", "/relays-prefs", &[("action", "own-add"), ("relay", "https://mine.example")]);
+    assert!(br.flash_after(&r).contains("Saved"));
+    let r = br.act("/relays", "/relays-prefs", &[("action", "only-own-on")]);
+    assert!(br.flash_after(&r).contains("Saved"));
+    let file: Value = serde_json::from_str(&std::fs::read_to_string(bx.data.path().join("ui/relays.json")).unwrap()).unwrap();
+    assert_eq!((file["only_own"].clone(), file["selected"].clone()), (json!(true), json!(["https://mine.example/"])));
+
+    // announcing the owner's relay publishes a signed announcement and lists it as theirs
+    let r = br.act("/relays", "/relays-publish", &[("relay", "https://mine.example"), ("region", "home"), ("capacity_mbit", "100"), ("udp", "1")]);
+    assert!(br.flash_after(&r).contains("Announced on 1 of 1"));
+    let (events, _) = oneshot::query(&nostr, &relays::filter(10), Duration::from_secs(5));
+    let (found, refused) = relays::collect(&events, xbt_nostr::now());
+    assert_eq!(refused, 0);
+    let mine = found.iter().find(|a| a.relay == "https://mine.example/").unwrap();
+    assert_eq!((mine.region.as_str(), mine.capacity_mbit, mine.udp), ("home", Some(100), true));
+    let r = br.act("/relays", "/relays-publish", &[("relay", "https://mine.example"), ("region", "home"), ("capacity_mbit", "lots")]);
+    assert!(br.flash_after(&r).contains("whole number"));
+}
