@@ -31,7 +31,8 @@ the gateway has not seen, it has the adapter make the buyer's account, once, and
 account; the client's own login is replaced by the gateway's, so no buyer can act as another.
 
 - **Jellyfin** (`"accounts": {"kind": "jellyfin", "admin_key_file": "…", "libraries": ["…"]}`), with
-  the seller's API key (kept on the seller's box, mode 600, sent nowhere but to Jellyfin):
+  the seller's API key (kept on the seller's box, readable by its owner and the gateway's group
+  only, sent nowhere but to Jellyfin):
   - a user with a random password, hidden, not an administrator, seeing only the libraries for
     sale, allowed to download, delete and manage nothing;
   - a token for that user, kept for the buyer, and made again if Jellyfin refuses it (expired or
@@ -43,6 +44,13 @@ account; the client's own login is replaced by the gateway's, so no buyer can ac
 - **Any other app**: a hook the seller provides (`"kind": "hook", "command": "…"`), given the
   buyer's handle and returning the headers or the cookie to send as that buyer.
 - **An app without accounts** keeps the shared guest (`upstream_headers`).
+
+On the Sell page, a service sold with its web page has "Each buyer gets their own Jellyfin account".
+The seller pastes an API key made in Jellyfin (Dashboard, API Keys). The shop checks the key
+against the service, lists its libraries to tick (none ticked is all of them), and writes the key
+to a file of its own beside the gateway's config (`app-key-<service>.key`). The route names that
+file; the page never shows the key again. Turning accounts off, or removing the service, removes
+the file. Accounts are offered on a priced service only.
 
 The path lists stay as a second layer: the admin and the server's own pages stay refused, whatever
 the account may do.

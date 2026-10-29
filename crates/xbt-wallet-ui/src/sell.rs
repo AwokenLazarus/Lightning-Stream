@@ -185,6 +185,10 @@ pub struct OfferApp {
     pub allow: Vec<String>,
     /// The page's live connections (WebSockets) are carried, paid for by the byte.
     pub live: bool,
+    /// Each buyer gets a Jellyfin account of their own, seeing these libraries (their ids), made
+    /// with the seller's API key kept beside the gateway's (docs/BUYER-ACCOUNTS.md). `None`: no
+    /// accounts.
+    pub accounts: Option<Vec<String>>,
 }
 
 impl OfferApp {
@@ -207,6 +211,43 @@ fn app_paths(text: &str) -> Result<Vec<String>, String> {
         out.push(p.to_string());
     }
     Ok(out)
+}
+
+/// The file beside the gateway's config that holds an offer's Jellyfin API key: read by the
+/// gateway only, never shown again.
+pub(crate) fn app_key_name(id: &str) -> String {
+    format!("app-key-{}.key", id.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect::<String>())
+}
+
+/// A Jellyfin API key as the seller pastes it: letters and digits.
+fn api_key(s: &str) -> Result<String, String> {
+    let k = s.trim();
+    if k.len() < 16 || k.len() > 128 || !k.bytes().all(|c| c.is_ascii_alphanumeric()) {
+        return Err("That is not a Jellyfin API key: make one in Jellyfin under Dashboard, API Keys, and paste it here.".into());
+    }
+    Ok(k.to_string())
+}
+
+/// A Jellyfin's libraries as `(id, name)`, asked at `address` with the seller's key. `Err`: what
+/// the seller is told.
+pub(crate) fn jellyfin_libraries(address: &str, key: &str) -> Result<Vec<(String, String)>, String> {
+    let url = format!("{}/Library/VirtualFolders", address.trim_end_matches('/'));
+    let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(5)).build();
+    let text = match agent.get(&url).set("X-Emby-Token", key).call() {
+        Ok(r) => r.into_string().map_err(|e| format!("Jellyfin's answer could not be read: {e}"))?,
+        Err(ureq::Error::Status(401 | 403, _)) => return Err("Jellyfin did not accept that API key: make one under Dashboard, API Keys, and paste it here.".into()),
+        Err(ureq::Error::Status(code, _)) => return Err(format!("Jellyfin at {address} answered {code}: is this its address?")),
+        Err(_) => return Err(format!("Jellyfin did not answer at {address}.")),
+    };
+    let v: Value = serde_json::from_str(&text).map_err(|_| format!("{address} did not answer as Jellyfin does: is this its address?"))?;
+    let libs: Vec<(String, String)> = v.as_array().into_iter().flatten()
+        .filter_map(|f| Some((f.get("ItemId")?.as_str()?.to_string(), f.get("Name").and_then(Value::as_str).unwrap_or("").to_string())))
+        .filter(|(id, _)| !id.is_empty() && id.len() <= 64 && id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-'))
+        .collect();
+    if libs.is_empty() {
+        return Err("That Jellyfin has no libraries yet: add one, then save again.".into());
+    }
+    Ok(libs)
 }
 
 /// Request headers a web app needs passed to its service: its cookies, its login and its
@@ -233,15 +274,25 @@ fn login_header(s: &str) -> Result<Option<(String, String)>, String> {
 
 /// A route's settings for a web app: the methods and headers a page uses, a body it may send, and
 /// the service's own compressed pages. A route that is not an app's loses them.
-fn app_route(m: &mut Map<String, Value>, app: Option<&OfferApp>) {
+fn app_route(m: &mut Map<String, Value>, app: Option<&OfferApp>, key_file: &str) {
     let Some(app) = app else {
         m.remove("accept_gzip");
         m.remove("upstream_headers");
         m.remove("deny_paths");
         m.remove("allow_paths");
         m.remove("websocket");
+        m.remove("accounts");
         return;
     };
+    // a buyer is known only by a paid session: a free route has no accounts
+    match app.accounts.as_ref().filter(|l| !l.is_empty() && !m.contains_key("free")) {
+        Some(libraries) => {
+            m.insert("accounts".into(), json!({"kind": "jellyfin", "admin_key_file": key_file, "libraries": libraries}));
+        }
+        None => {
+            m.remove("accounts");
+        }
+    }
     let paths = |list: &[String]| json!(list.iter().map(|p| app.shop_path(p)).collect::<Vec<_>>());
     if app.deny.is_empty() {
         m.remove("deny_paths");
@@ -370,6 +421,9 @@ fn offer_json(o: &Offer) -> Value {
            "titles": o.titles.iter().map(|(t, u)| json!({"title": t, "url": u})).collect::<Vec<_>>()});
     if let Some(a) = &o.app {
         v["app"] = json!({"base": a.base, "entry": a.entry, "login": a.login, "deny": a.deny, "allow": a.allow, "live": a.live});
+        if let Some(l) = &a.accounts {
+            v["app"]["accounts"] = json!(l);
+        }
     }
     v
 }
@@ -394,7 +448,8 @@ fn offer_of(v: &Value) -> Option<Offer> {
             let t = |k: &str| a.get(k).and_then(Value::as_str).unwrap_or("").to_string();
             let list = |k: &str| a.get(k).and_then(Value::as_array).map(|x| x.iter().filter_map(|p| p.as_str().map(str::to_string)).collect()).unwrap_or_default();
             // an app saved before live connections were carried has them on
-            OfferApp { base: t("base"), entry: t("entry"), login: t("login"), deny: list("deny"), allow: list("allow"), live: a.get("live").and_then(Value::as_bool).unwrap_or(true) }
+            OfferApp { base: t("base"), entry: t("entry"), login: t("login"), deny: list("deny"), allow: list("allow"), live: a.get("live").and_then(Value::as_bool).unwrap_or(true),
+                       accounts: a.get("accounts").filter(|l| l.is_array()).map(|_| list("accounts")) }
         }).filter(|a| a.base.starts_with('/') && a.base.ends_with('/')),
     })
 }
@@ -692,6 +747,7 @@ impl App {
         let mut routes = vec![];
         let mut sections = vec![];
         for o in &active {
+            let key_file = gw.dir.join(app_key_name(&o.id)).display().to_string();
             let price = match o.unit {
                 Unit::Mib => json!({"byte_msat": o.price_msat, "per_bytes": MIB}),
                 Unit::Request => json!({"request_msat": o.price_msat}),
@@ -723,7 +779,7 @@ impl App {
                 } else {
                     m.remove("strip_prefix");
                 }
-                app_route(m, o.app.as_ref().filter(|a| a.base == *p));
+                app_route(m, o.app.as_ref().filter(|a| a.base == *p), &key_file);
                 routes.push(r);
             }
             // the service's own web page, under a route of its own where its base is not one of the service's paths
@@ -745,7 +801,7 @@ impl App {
                 } else {
                     m.remove("strip_prefix");
                 }
-                app_route(m, Some(a));
+                app_route(m, Some(a), &key_file);
                 routes.push(r);
             }
             let base = public_url.clone();
@@ -1084,6 +1140,28 @@ impl App {
         let editing = edit.and_then(|id| shop.offers.iter().find(|o| o.id == id));
         let from_form = sent.as_ref().filter(|(f, _)| f.get("action").map(String::as_str) == Some("service")).map(|(f, _)| *f);
         let fv = |k: &str, d: String| from_form.and_then(|f| f.get(k).cloned()).unwrap_or(d);
+        // buyers' own accounts: the key is never shown again, and the libraries are the service's own list, asked with it
+        let saved_libs = editing.and_then(|o| o.app.as_ref()).and_then(|a| a.accounts.clone());
+        let saved_key = editing.and_then(|o| std::fs::read_to_string(self.cfg.gw.dir.join(app_key_name(&o.id))).ok()).map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+        let libraries = match (editing, &saved_key, &saved_libs) {
+            (Some(o), Some(k), Some(chosen)) => match jellyfin_libraries(&o.address, k) {
+                Ok(libs) => format!("<fieldset><legend>Libraries buyers see</legend>{}</fieldset>",
+                                    libs.iter().map(|(id, name)| format!("<label class=\"check\"><input type=\"checkbox\" name=\"app_lib_{}\" value=\"1\"{}> {}</label>",
+                                                                         esc(id), if chosen.contains(id) { " checked" } else { "" }, esc(if name.is_empty() { id } else { name })))
+                                        .collect::<String>()),
+                Err(e) => format!("<p class=\"hint\">{}</p>", esc(&e)),
+            },
+            _ => "<p class=\"hint\">Buyers see every library. Once saved, you can choose which here.</p>".into(),
+        };
+        let accounts_html = format!("<label class=\"check\"><input type=\"checkbox\" name=\"app_accounts\" value=\"1\"{}> Each buyer gets their own Jellyfin account: \
+            their own watch history, and where they stopped</label>\
+            <details{}><summary>Buyers' accounts</summary>\
+            <label>Your Jellyfin API key <small>({})</small><input name=\"app_key\" type=\"password\" autocomplete=\"off\" class=\"mono\"></label>\
+            <p class=\"hint\">Make one in Jellyfin under Dashboard, API Keys. The shop makes each buyer's account with it. It stays on this box, \
+            beside the shop's own keys, and is never shown again. Buyers who stay anonymous use the guest login below, if you give one.</p>{libraries}</details>",
+            if fv("app_accounts", if saved_libs.is_some() { "1".into() } else { String::new() }) == "1" { " checked" } else { "" },
+            if saved_libs.is_some() && saved_key.is_none() { " open" } else { "" },
+            if saved_key.is_some() { "saved: leave empty to keep it" } else { "Dashboard, API Keys" });
         let kind = Kind::parse(&fv("kind", editing.map(|o| o.kind.id().to_string()).unwrap_or_else(|| "media".into()))).unwrap_or(Kind::Media);
         let (sug_price, sug_unit) = kind.suggested();
         let unit = Unit::parse(&fv("unit", editing.map(|o| o.unit).unwrap_or(sug_unit).id().to_string())).unwrap_or(sug_unit);
@@ -1108,7 +1186,7 @@ impl App {
             <label>Name, as buyers see it <small>(optional)</small><input name=\"name\" value=\"{}\" maxlength=\"120\" placeholder=\"{}\"></label>\
             <label class=\"check\"><input type=\"checkbox\" name=\"app\" value=\"1\"{}> Buyers can open its own web page inside their app</label>\
             <p class=\"hint\">They use it as they would on your network, and pay your price for what it loads. Give buyers a guest account of their own \
-            in the service, never yours.</p>\
+            in the service, never yours.</p>{}\
             <details><summary>Its web page</summary>\
             <label>What the page sees as <code>/</code> <small>(empty: chosen for you)</small><input name=\"app_base\" value=\"{}\" class=\"mono\" placeholder=\"{}\"></label>\
             <label>Where it opens <small>(empty: the same)</small><input name=\"app_entry\" value=\"{}\" class=\"mono\" placeholder=\"/web/\"></label>\
@@ -1134,6 +1212,7 @@ impl App {
             esc(&fv("input_price", editing.filter(|o| o.input_msat > 0).map(|o| msat_to_sats(o.input_msat)).unwrap_or_default())),
             esc(&fv("name", editing.map(|o| o.name.clone()).unwrap_or_default())), kind.words(),
             if fv("app", editing.map(|o| if o.app.is_some() { "1" } else { "" }.to_string()).unwrap_or_default()) == "1" { " checked" } else { "" },
+            accounts_html,
             esc(&fv("app_base", editing.and_then(|o| o.app.as_ref()).map(|a| a.base.clone()).unwrap_or_default())),
             if kind == Kind::Media { "/" } else { "the path it is sold under" },
             esc(&fv("app_entry", editing.and_then(|o| o.app.as_ref()).filter(|a| a.entry != a.base).map(|a| a.entry.clone()).unwrap_or_default())),
@@ -1261,6 +1340,7 @@ impl App {
                         _ => vec![shop.free_path(&name, &new_id)],
                     };
                 }
+                let mut accounts_key: Option<String> = None;
                 let app = if g("app") == "1" {
                     // a media server's page uses paths all over the service (Jellyfin: /web/, /Users/, /Items/…); an AI model's or a web app's, its own path
                     let base = match g("app_base").trim() {
@@ -1285,7 +1365,26 @@ impl App {
                     let login = g("app_login").trim().to_string();
                     login_header(&login)?;
                     let (deny, allow) = (app_paths(&g("app_deny"))?, app_paths(&g("app_allow"))?);
-                    Some(OfferApp { base, entry, login, deny, allow, live: g("app_live") == "1" })
+                    // each buyer an account of their own: the seller's key is checked against the service, and its
+                    // libraries listed; none ticked is all of them
+                    let accounts = if g("app_accounts") == "1" {
+                        if price_msat == 0 && input_msat == 0 {
+                            return Err("Buyers get accounts of their own only on a priced service: a buyer is known by what they paid.".into());
+                        }
+                        let saved = std::fs::read_to_string(self.cfg.gw.dir.join(app_key_name(&new_id))).ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+                        let key = match (g("app_key"), saved) {
+                            (k, _) if !k.is_empty() => api_key(&k)?,
+                            (_, Some(k)) => k,
+                            _ => return Err("Paste your Jellyfin API key, so the shop can make each buyer's account.".into()),
+                        };
+                        let libs = jellyfin_libraries(&address, &key)?;
+                        let ticked: Vec<String> = libs.iter().filter(|(id, _)| f.get(&format!("app_lib_{id}")).is_some_and(|v| v == "1")).map(|(id, _)| id.clone()).collect();
+                        accounts_key = Some(key);
+                        Some(if ticked.is_empty() { libs.into_iter().map(|(id, _)| id).collect() } else { ticked })
+                    } else {
+                        None
+                    };
+                    Some(OfferApp { base, entry, login, deny, allow, live: g("app_live") == "1", accounts })
                 } else {
                     None
                 };
@@ -1298,6 +1397,14 @@ impl App {
                     None if !id.is_empty() => return Err("That service is gone: add it again.".into()),
                     None => shop.offers.push(offer),
                 }
+                // the key goes beside the gateway's config before the route that names it; a service without accounts keeps none
+                let key_name = app_key_name(&new_id);
+                match &accounts_key {
+                    Some(k) => crate::setup::write_shared(&self.cfg.gw.dir, &key_name, format!("{k}\n").as_bytes())?,
+                    None => {
+                        crate::setup::remove_shared(&self.cfg.gw.dir, &key_name)?;
+                    }
+                }
                 self.commit(&shop, if id.is_empty() { "Added." } else { "Changes saved." })
             })(),
             "pause" | "resume" | "remove" => {
@@ -1308,7 +1415,12 @@ impl App {
                         let what = match action.as_str() {
                             "pause" => { shop.offers[i].paused = true; "Paused: buyers cannot buy it until you resume it." }
                             "resume" => { shop.offers[i].paused = false; "Resumed." }
-                            _ => { shop.offers.remove(i); "Removed." }
+                            _ => {
+                                // unchecked: its key, where buyers had accounts, goes with it; one left behind names no route
+                                let _ = crate::setup::remove_shared(&self.cfg.gw.dir, &app_key_name(&shop.offers[i].id));
+                                shop.offers.remove(i);
+                                "Removed."
+                            }
                         };
                         self.commit(&shop, what)
                     }

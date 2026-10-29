@@ -1527,6 +1527,100 @@ fn a_service_sold_with_its_own_web_page_gets_a_route_and_a_listing_for_it() {
     assert!(unescape(&r.body).contains("Another service already uses"), "{}", r.body);
 }
 
+/// Buyers' own accounts set up on the Sell page (docs/BUYER-ACCOUNTS.md): the seller pastes the
+/// Jellyfin API key, the shop checks it against the service and lists its libraries, keeps the key
+/// in a file beside the gateway's config that the page never shows again, and the route names the
+/// file and the libraries ticked (all of them where none is). A wrong key, no key and a free
+/// service are refused in plain words; turning accounts off removes the key.
+#[cfg(unix)]
+#[test]
+fn the_sell_page_sets_up_buyers_own_accounts_with_the_sellers_jellyfin_key() {
+    const KEY: &str = "5e11e7a9c0ffee5e11e7a9c0ffee5e11";
+    struct Jellyfin;
+    impl xbt_svc::http::Handler for Jellyfin {
+        fn body_limit(&self, _: &str, _: &str) -> usize {
+            0
+        }
+        fn handle(&self, req: xbt_svc::http::Request) -> xbt_svc::http::Response {
+            if req.header("x-emby-token") != Some(KEY) {
+                return xbt_svc::http::Response::text(401, "text/plain", "no");
+            }
+            match req.path() {
+                "/Library/VirtualFolders" => xbt_svc::http::Response::text(200, "application/json",
+                    r#"[{"Name": "Films", "ItemId": "aaaa1111"}, {"Name": "Shows", "ItemId": "bbbb2222"}]"#),
+                _ => xbt_svc::http::Response::text(404, "text/plain", "no"),
+            }
+        }
+    }
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let gw = tempfile::tempdir().unwrap();
+    let dir = gw.path().to_path_buf();
+    let jf = xbt_svc::http::serve(Arc::new(Jellyfin), std::net::TcpListener::bind("127.0.0.1:0").unwrap(), 2).unwrap().addr;
+    let bx = start(json!({}), false, |c| {
+        c.sell = true;
+        c.gw.dir = dir.clone();
+        c.gw.node_rest = Some("https://10.21.21.66:8180".into());
+    });
+    let mut br = logged_in(&bx);
+    let inv = mac(&[("invoices", &["read", "write"])]);
+    let info = mac(&[("info", &["read"])]);
+    br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &inv), ("info_macaroon", &info)]);
+    br.act("/sell", "/sell", &[("action", "advanced"), ("max_sessions", "30"), ("sessions_per_address", "2"), ("max_held_tickets", "15"),
+                               ("proxies", ""), ("network", "bip122:0123456789abcdef0123456789abcdef")]);
+    br.act("/sell", "/sell", &[("action", "shop"), ("name", "Box"), ("public_url", "https://seller.example")]);
+    assert!(br.get("/sell").body.contains("Each buyer gets their own Jellyfin account"));
+    let addr = format!("http://{jf}");
+    fn service<'a>(addr: &'a str, extra: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+        let mut f = vec![("action", "service"), ("kind", "media"), ("address", addr), ("price", "20"), ("unit", "mib"), ("app", "1"),
+                         ("app_entry", "/web/"), ("app_accounts", "1")];
+        f.extend_from_slice(extra);
+        f
+    }
+    let routes = || {
+        let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+        (xbt_gateway::config::Config::from_json(&c).unwrap(), c)
+    };
+    // no key, a key that is not one, and a key Jellyfin refuses: nothing is saved
+    let r = br.act("/sell", "/sell", &service(&addr, &[]));
+    assert!(unescape(&r.body).contains("Paste your Jellyfin API key"), "{}", r.body);
+    let r = br.act("/sell", "/sell", &service(&addr, &[("app_key", "not a key")]));
+    assert!(unescape(&r.body).contains("That is not a Jellyfin API key"), "{}", r.body);
+    let r = br.act("/sell", "/sell", &service(&addr, &[("app_key", "ffffffffffffffffffffffffffffffff")]));
+    assert!(unescape(&r.body).contains("Jellyfin did not accept that API key"), "{}", r.body);
+    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("address", &addr), ("price", "0"), ("unit", "mib"), ("app", "1"),
+                                       ("app_accounts", "1"), ("app_key", KEY)]);
+    assert!(unescape(&r.body).contains("only on a priced service"), "{}", r.body);
+    assert!(!dir.join("config.json").exists() || routes().0.routes.iter().all(|r| r.accounts.is_none()));
+    // the right key, no library ticked: every library, the key in a file of its own the route names
+    let r = br.act("/sell", "/sell", &service(&addr, &[("app_key", KEY)]));
+    assert!(br.flash_after(&r).contains("restarts"), "{}", br.flash_after(&r));
+    let (cfg, raw) = routes();
+    let root = cfg.routes.iter().find(|r| r.path == "/").expect("the page's route");
+    let shop: Value = serde_json::from_str(&std::fs::read_to_string(bx.data.path().join("ui/sell.json")).unwrap()).unwrap();
+    let id = shop["offers"][0]["id"].as_str().unwrap().to_string();
+    let key_file = dir.join(format!("app-key-{id}.key"));
+    assert_eq!(root.accounts, Some(xbt_gateway::config::Accounts::Jellyfin { admin_key_file: key_file.clone(), libraries: vec!["aaaa1111".into(), "bbbb2222".into()] }));
+    assert_eq!(std::fs::read_to_string(&key_file).unwrap().trim(), KEY);
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&key_file).unwrap().permissions().mode() & 0o077, 0o040, "the owner and the gateway's group only");
+    }
+    assert!(!raw.to_string().contains(KEY) && !shop.to_string().contains(KEY), "the key is in its file only");
+    // the page shows the libraries to tick, and never the key
+    let page = br.get(&format!("/sell?edit={id}")).body;
+    assert!(page.contains("Films") && page.contains("name=\"app_lib_bbbb2222\"") && page.contains("leave empty to keep it") && !page.contains(KEY), "{page}");
+    // one library ticked, the key kept: that library only
+    let r = br.act("/sell", "/sell", &service(&addr, &[("id", &id), ("app_lib_bbbb2222", "1")]));
+    assert!(br.flash_after(&r).contains("restarts"), "{}", br.flash_after(&r));
+    let root = routes().0.routes.into_iter().find(|r| r.path == "/").unwrap();
+    assert_eq!(root.accounts, Some(xbt_gateway::config::Accounts::Jellyfin { admin_key_file: key_file.clone(), libraries: vec!["bbbb2222".into()] }));
+    // accounts off: the route has none, and the key is gone
+    let r = br.act("/sell", "/sell", &[("action", "service"), ("id", &id), ("kind", "media"), ("address", &addr), ("price", "20"), ("unit", "mib"), ("app", "1"), ("app_entry", "/web/")]);
+    assert!(br.flash_after(&r).contains("restarts"), "{}", br.flash_after(&r));
+    assert!(routes().0.routes.iter().all(|r| r.accounts.is_none()));
+    assert!(!key_file.exists());
+}
+
 /// A page on another port of this host (a seller's own app, another app of the box) is of the same
 /// site: the browser sends the wallet's cookies with what it asks. Only the opening of the home page
 /// is answered; a stream, an action or another page is not.

@@ -84,7 +84,7 @@ pub fn write_shared(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), String> 
     res
 }
 
-fn remove_shared(dir: &Path, name: &str) -> Result<bool, String> {
+pub(crate) fn remove_shared(dir: &Path, name: &str) -> Result<bool, String> {
     let p = dir.join(name);
     match std::fs::remove_file(&p) {
         Ok(()) => Ok(true),

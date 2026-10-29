@@ -36,6 +36,12 @@
 #            killed with a pool locked and again in the middle of an answer, then started again:
 #            nothing the seller took that the wallet has not booked, nothing paid twice, and the
 #            next call pays or says why not
+#   jellyfin (by name only) a seller's whole web app: the real Jellyfin web client in Chrome,
+#            through the wallet app's app port, the connector and the signer, to a gateway that
+#            gives each buyer a Jellyfin account of their own, sold by the byte on these nodes: one
+#            tap logs the buyer in as themselves, a 4K film plays and seeks, every byte is paid,
+#            and the progress is the buyer's. Needs JELLYFIN_URL, JF_ADMIN_KEY_FILE, JF_LIBRARY,
+#            JF_ITEM, node and google-chrome
 # The names and what each checks: scripts/ticket_e2e/drive.py.
 #
 # Lab: the one scripts/ln_rail_regtest.sh uses (scripts/ln_rail/lab.sh: paulscode/lightning-fork-lab
@@ -44,7 +50,8 @@
 # Ports (loopback, below the kernel's ephemeral range): TICKET_E2E_PORT_BASE (default 17961) to
 # BASE+7: the chain node's RPC, the three nodes' REST, the gateway (BASE+4), the file server
 # (BASE+5), the second gateway (BASE+6) and the lying proxy in front of it (BASE+7); the offers
-# check's node lf4 (BASE+9) and its gateway (BASE+10). Its own compose
+# check's node lf4 (BASE+9) and its gateway (BASE+10); the jellyfin check's gateway (BASE+12),
+# connector (BASE+13), wallet app (BASE+14) and its two app ports (BASE+15, BASE+16). Its own compose
 # project (tickete2e), so it runs beside the other regtest scripts. Each container is capped at 2
 # CPUs; host builds run at nice 19 with -j4. The lab's containers and volumes are removed on exit
 # (TICKET_E2E_KEEP=1 keeps them and the scratch directory). About 25 minutes.
@@ -101,6 +108,10 @@ mkdir -p "${TICKET_E2E_SCRATCH:-$ROOT/run}"
 R=$(mktemp -d "${TICKET_E2E_SCRATCH:-$ROOT/run}/ticket-e2e-XXXXXX")
 
 nice -n 19 cargo build -q -j4 --release --locked -p xbt-signer --bin xbt-signer -p xbt-wallet-mcp --bin xbt-wallet-mcp -p xbt-gateway --bin xbt-gateway
+# a seller's whole web app (the jellyfin check, run by name only) also needs the wallet app and the connector
+case " $* " in *" jellyfin "*)
+  nice -n 19 cargo build -q -j4 --release --locked -p xbt-wallet-ui --bin xbt-wallet-ui -p lightning-stream --bin lightning-stream ;;
+esac
 BIN=${CARGO_TARGET_DIR:-$ROOT/target}/release
 
 # the lab and the node binaries: cloned and built when missing
