@@ -114,6 +114,21 @@ fn the_look_in_headless_chrome() {
     std::fs::create_dir_all(&cfg.gw.dir).unwrap();
     cfg.gw.node_rest = Some("https://10.21.21.66:8180".into());
     cfg.mcp_urls = vec!["http://umbrel.local:33511/mcp".into()];
+    // the AI page: its address, a key, and the sellers file as the page wrote it
+    let ai = data.path().join("ai");
+    std::fs::create_dir_all(&ai).unwrap();
+    {
+        let mut store = lightning_stream::credentials::Store::open(&ai.join("credentials.json")).unwrap();
+        let (id, _) = store.make(lightning_stream::credentials::Kind::AiKey, "Open WebUI", 2000, Some(500), None);
+        store.add_spend(&id, 312_400, 0);
+        store.save().unwrap();
+    }
+    std::fs::write(ai.join("sellers.json"), json!({"sellers": [{"name": "Local model", "route": "https://box.example/ai/",
+        "prices": {"per_1k_output_msat": 10000}, "max_output": 0}], "pinned": [], "blocked": []}).to_string()).unwrap();
+    std::fs::write(ai.join("state.json"), json!({"health": {"Local model": {"ok": 12, "failed": 1, "fails_in_a_row": 0,
+        "ttft_ms": [400, 650, 900]}}}).to_string()).unwrap();
+    cfg.ai = xbt_wallet_ui::config::AiSetup { endpoint: Some("http://umbrel.local:33540/v1".into()), sellers: ai.join("sellers.json"),
+                                              credentials: ai.join("credentials.json"), state: ai.join("state.json") };
     let srv = xbt_wallet_ui::server::spawn(App::new(cfg).unwrap()).unwrap();
     let gdata = tempfile::tempdir().unwrap();
     let mut gcfg = Config::for_test(gdata.path().join("no-signer.sock"), gdata.path().join("ui"), "127.0.0.1:0");
@@ -130,7 +145,7 @@ fn the_look_in_headless_chrome() {
         ["service-ai", format!("/service?seller={}&name={}", enc("https://box.example"), enc("Local model"))],
         ["service-media", format!("/service?seller={}&name={}", enc("https://media.example"), enc("Creative Commons films"))],
         ["player", play.clone()], ["live", "/connections"], ["sellers", "/services"], ["sell", "/sell"], ["wallet", "/wallet"],
-        ["setup", "/setup"], ["apps", "/apps"], ["agents", "/agents"], ["rules", "/policy"]]).to_string();
+        ["setup", "/setup"], ["apps", "/apps"], ["agents", "/agents"], ["rules", "/policy"], ["ai", "/ai"]]).to_string();
     let secs = std::env::var("XBT_UI_LOOK_SECONDS").unwrap_or_else(|_| "30".into());
     let o = std::process::Command::new(node).env("CHROME", chrome)
         .args([concat!(env!("CARGO_MANIFEST_DIR"), "/tests/js/look_test.mjs"), &format!("http://{}", srv.addr), code.trim(),

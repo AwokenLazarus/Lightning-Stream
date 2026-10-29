@@ -30,6 +30,8 @@ ureq.workspace = true
 xbt-nostr.workspace = true
 # the Services page and the Nostr page check a seller's signed listing (already in the tree through the gateway)
 xbt402.workspace = true
+# the AI page: the credential store of AI keys and local links, and the endpoint's catalogue rules
+lightning-stream = { path = "../lightning-stream" }
 
 [dev-dependencies]
 tempfile = "3"

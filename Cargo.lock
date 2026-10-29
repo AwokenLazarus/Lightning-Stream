@@ -2654,6 +2654,7 @@ dependencies = [
  "ed25519-dalek",
  "getrandom 0.2.17",
  "hex",
+ "lightning-stream",
  "rustls",
  "scrypt",
  "serde_json",

@@ -116,8 +116,8 @@ impl Section {
 
 pub const SERVICES: Section = Section {
     label: "Services",
-    tabs: &[Tab { href: "./browse", title: "Browse", label: "Browse" }, Tab { href: "./services", title: "Sellers", label: "Sellers" },
-            Tab { href: "./connections", title: "Live connections", label: "Live connections" }],
+    tabs: &[Tab { href: "./browse", title: "Browse", label: "Browse" }, Tab { href: "./ai", title: "AI", label: "AI" },
+            Tab { href: "./services", title: "Sellers", label: "Sellers" }, Tab { href: "./connections", title: "Live connections", label: "Live connections" }],
     also: &["Service", "Player"],
 };
 pub const SELL: Section = Section { label: "Sell", tabs: &[Tab { href: "./sell", title: "Sell", label: "Sell" }], also: &[] };
@@ -142,8 +142,8 @@ pub const SETTINGS: Section = Section {
 /// more kind of service, beside the others.
 pub const SERVICES_HASH: Section = Section {
     label: "Services",
-    tabs: &[Tab { href: "./browse", title: "Browse", label: "Browse" }, Tab { href: "./hashrate", title: "Hashrate", label: "Hashrate" },
-            Tab { href: "./services", title: "Sellers", label: "Sellers" }, Tab { href: "./connections", title: "Live connections", label: "Live connections" }],
+    tabs: &[Tab { href: "./browse", title: "Browse", label: "Browse" }, Tab { href: "./ai", title: "AI", label: "AI" },
+            Tab { href: "./hashrate", title: "Hashrate", label: "Hashrate" }, Tab { href: "./services", title: "Sellers", label: "Sellers" }, Tab { href: "./connections", title: "Live connections", label: "Live connections" }],
     also: &["Service", "Player"],
 };
 pub const SELL_HASH: Section = Section {
