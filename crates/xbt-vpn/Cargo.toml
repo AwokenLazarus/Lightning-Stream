@@ -10,7 +10,14 @@ publish.workspace = true
 
 [dependencies]
 xbt-iroh-link = { path = "../xbt-iroh-link" }
-tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "sync", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "sync", "io-util", "net"] }
 bytes = "1"
 hex.workspace = true
 serde_json.workspace = true
+# a userspace TCP/IP stack: the buyer's app ends its devices' connections on its own side and carries
+# each as a flow
+ipstack = "=1.0.1"
+
+[dev-dependencies]
+# a client TCP/IP stack, to originate connections inside the tunnel in tests without a TUN device
+smoltcp = { version = "=0.12.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp", "socket-udp"] }

@@ -7,9 +7,13 @@
 //! inside the tunnel never sits on top of a second retransmitting layer.
 //!
 //! - [`tunnel`]: the packet tunnel on one link connection.
+//! - [`flow`]: the protocol: each TCP connection one QUIC stream, UDP in datagrams with a flow number.
+//! - [`exit`]: a seller's exit: a buyer's flows become ordinary connections, with no TUN or NAT.
 //! - [`filter`]: which packets an exit carries (blocked ports, IPv6).
 //! - [`meter`]: bytes carried each way, for payment. It never records where a packet was going.
 
+pub mod exit;
 pub mod filter;
+pub mod flow;
 pub mod meter;
 pub mod tunnel;
