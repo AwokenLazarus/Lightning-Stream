@@ -108,6 +108,15 @@ impl EncryptedDns {
     }
 }
 
+/// How long reaching an exit may take before it counts as gone: a new flow fails over to the next
+/// qualifying exit instead of waiting for the link's own, much longer, timeout.
+pub const CONNECT_WAIT: Duration = Duration::from_secs(5);
+/// How long an exit may take to open a flow on a connection that looks alive. An exit that went away
+/// leaves its connection open until the link notices; this catches it first.
+pub const OPEN_WAIT: Duration = Duration::from_secs(5);
+/// How often exits that failed are tried again, so one that comes back is used again.
+pub const PROBE_EVERY: Duration = Duration::from_secs(15);
+
 /// An exit the buyer is connected to, and where its UDP answers go.
 struct ExitConn {
     conn: LinkConnection,
@@ -318,17 +327,25 @@ impl Buyer {
         if let Some(h) = hop {
             // two hops: a connection to the first hop; each flow is sealed for the exit
             let exit: [u8; 32] = hex::decode(id).ok()?.try_into().ok()?;
-            let conn = self.link.connect_conn_alpn(&h.id, ALPN_VPN_HOP).await.ok()?;
+            let conn = match tokio::time::timeout(CONNECT_WAIT, self.link.connect_conn_alpn(&h.id, ALPN_VPN_HOP)).await {
+                Ok(Ok(c)) => c,
+                _ => {
+                    drop(ex);
+                    self.fail_exit(id).await;
+                    return None;
+                }
+            };
             let tls = sealed::buyer_config(&self.sealed_secret, &exit);
             let exit_relays = self.link.hints_for(id).relays;
             let e = Arc::new(ExitConn { conn, udp: Arc::new(Mutex::new(HashMap::new())), sealed: Some(Sealed { exit, exit_relays, tls }) });
             ex.insert(key, e.clone());
             return Some(e);
         }
-        let conn = match self.link.connect_conn_async(id).await {
-            Ok(c) => c,
-            Err(_) => {
-                self.router.lock().await.fail(id);
+        let conn = match tokio::time::timeout(CONNECT_WAIT, self.link.connect_conn_async(id)).await {
+            Ok(Ok(c)) => c,
+            _ => {
+                drop(ex);
+                self.fail_exit(id).await;
                 return None;
             }
         };
@@ -354,7 +371,79 @@ impl Buyer {
             if let Some(e) = self.exit(device, &id).await {
                 return Some((id, e));
             }
-            self.router_for(device).lock().await.fail(&id);
+        }
+        None
+    }
+
+    /// Marks an exit failed for every policy, and forgets its connections (straight and through any
+    /// first hop): no new flow waits on it until a probe finds it answering again.
+    async fn fail_exit(&self, id: &str) {
+        self.router.lock().await.fail(id);
+        for r in self.device_routers.values() {
+            r.lock().await.fail(id);
+        }
+        let suffix = format!(">{id}");
+        let gone: Vec<Arc<ExitConn>> = {
+            let mut ex = self.exits.lock().await;
+            let keys: Vec<String> = ex.keys().filter(|k| *k == id || k.ends_with(&suffix)).cloned().collect();
+            keys.iter().filter_map(|k| ex.remove(k)).collect()
+        };
+        for e in gone {
+            e.conn.close(0u32.into(), b"exit not answering");
+        }
+    }
+
+    /// The exits marked failed (by the buyer's default policy).
+    pub async fn failed_exits(&self) -> Vec<String> {
+        self.router.lock().await.failed()
+    }
+
+    /// Marks an exit answering again, for every policy.
+    async fn recover_exit(&self, id: &str) {
+        self.router.lock().await.recover(id);
+        for r in self.device_routers.values() {
+            r.lock().await.recover(id);
+        }
+    }
+
+    /// Tries every failed exit again every [`PROBE_EVERY`]: one that answers is used again.
+    async fn probe_failed(self: Arc<Self>) {
+        loop {
+            tokio::time::sleep(PROBE_EVERY).await;
+            let mut failed = self.router.lock().await.failed();
+            for r in self.device_routers.values() {
+                failed.extend(r.lock().await.failed());
+            }
+            failed.sort();
+            failed.dedup();
+            for id in failed {
+                if let Ok(Ok(c)) = tokio::time::timeout(CONNECT_WAIT, self.link.connect_conn_async(&id)).await {
+                    c.close(0u32.into(), b"probe");
+                    self.recover_exit(&id).await;
+                }
+            }
+        }
+    }
+
+    /// A TCP flow to `dst` on an exit qualifying for this device: when an exit cannot open it in
+    /// [`OPEN_WAIT`] (gone, or refusing), that exit is marked failed and the next one is tried.
+    /// `None` if no qualifying exit opens it.
+    async fn open_tcp_flow(self: &Arc<Self>, device: IpAddr, dst: SocketAddr) -> Option<(String, Box<dyn Duplex>)> {
+        for _ in 0..3 {
+            let (exit_id, exit) = self.route(device, dst).await?;
+            match tokio::time::timeout(OPEN_WAIT, open_flow(&exit, dst)).await {
+                Ok(Some(flow)) => return Some((exit_id, flow)),
+                // the exit answered and refused (its policy, or `dst` unreachable from it): not its fault
+                Ok(None) if exit.conn.close_reason().is_none() => {
+                    self.router_for(device).lock().await.flow_ended(&exit_id);
+                    return None;
+                }
+                // no answer in time, or the connection closed under us: the exit is gone
+                _ => {
+                    self.router_for(device).lock().await.flow_ended(&exit_id);
+                    self.fail_exit(&exit_id).await;
+                }
+            }
         }
         None
     }
@@ -366,6 +455,7 @@ impl Buyer {
         let mut sc = IpStackConfig::default();
         sc.mtu_unchecked(TUNNEL_MTU as u16).udp_timeout(Duration::from_secs(60));
         let mut stack = IpStack::new(sc, device);
+        let probes = tokio::spawn(self.clone().probe_failed());
         while let Ok(s) = stack.accept().await {
             let me = self.clone();
             tokio::spawn(async move {
@@ -376,6 +466,7 @@ impl Buyer {
                 }
             });
         }
+        probes.abort();
     }
 
     fn refuse(&self) {
@@ -385,11 +476,7 @@ impl Buyer {
     async fn tcp(self: Arc<Self>, s: ipstack::IpStackTcpStream) {
         let (src, dst) = (s.local_addr(), s.peer_addr());
         let Some(dev) = self.device(src.ip()).filter(|d| !d.over_limit()) else { return self.refuse() };
-        let Some((exit_id, exit)) = self.route(src.ip(), dst).await else { return self.refuse() };
-        let Some(flow) = open_flow(&exit, dst).await else {
-            self.router_for(src.ip()).lock().await.flow_ended(&exit_id);
-            return self.refuse();
-        };
+        let Some((exit_id, flow)) = self.open_tcp_flow(src.ip(), dst).await else { return self.refuse() };
         let (r, w) = tokio::io::split(s);
         let (fr, fw) = tokio::io::split(flow);
         let (d1, d2, d3, d4) = (dev.clone(), dev.clone(), dev.clone(), dev);

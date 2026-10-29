@@ -87,13 +87,13 @@ pub struct Unmet(pub String);
 impl Requirements {
     /// The exits that meet every requirement, or the first requirement that leaves none.
     pub fn eligible<'a>(&self, exits: &'a [ExitInfo], hops: &[FirstHop]) -> Result<Vec<&'a ExitInfo>, Unmet> {
-        let mut c: Vec<&ExitInfo> = exits.iter().filter(|e| e.healthy).collect();
+        let mut c: Vec<&ExitInfo> = exits.iter().collect();
         let step = |c: &mut Vec<&'a ExitInfo>, keep: &dyn Fn(&ExitInfo) -> bool, why: String| -> Result<(), Unmet> {
             c.retain(|e| keep(e));
             if c.is_empty() { Err(Unmet(why)) } else { Ok(()) }
         };
         if c.is_empty() {
-            return Err(Unmet("No exit is answering right now.".into()));
+            return Err(Unmet("No exit is listed yet.".into()));
         }
         let kind = match &self.kind {
             Want::Private => "private".to_string(),
@@ -122,6 +122,14 @@ impl Requirements {
         if self.two_hop {
             step(&mut c, &|e| e.two_hop && first_hop(e, hops).is_some(), "No exit can be reached through a first hop run by someone else.".into())?;
         }
+        // last, so the message says which exits are down: the ones that meet every rule
+        let n = c.len();
+        let down = if n == 1 {
+            "The exit that meets these rules isn't answering right now. Stream keeps trying it.".to_string()
+        } else {
+            format!("The {n} exits that meet these rules aren't answering right now. Stream keeps trying them.")
+        };
+        step(&mut c, &|e| e.healthy, down)?;
         Ok(c)
     }
 }
@@ -267,6 +275,18 @@ impl Router {
         }
     }
 
+    /// Marks an exit answering again after it failed: new flows may go to it.
+    pub fn recover(&mut self, id: &str) {
+        if let Some(x) = self.exits.iter_mut().find(|x| x.id == id) {
+            x.healthy = true;
+        }
+    }
+
+    /// The exits marked failed.
+    pub fn failed(&self) -> Vec<String> {
+        self.exits.iter().filter(|e| !e.healthy).map(|e| e.id.clone()).collect()
+    }
+
     /// Marks an exit failed: no new flows go to it, and destinations it had are given again.
     pub fn fail(&mut self, id: &str) {
         if let Some(x) = self.exits.iter_mut().find(|x| x.id == id) {
@@ -408,6 +428,10 @@ mod tests {
         assert_eq!(r.pick(ip("1.1.1.1"), t).as_deref(), Some("de"));
         r.fail("de");
         assert_eq!(r.pick(ip("9.9.9.9"), t), None);
+        assert_eq!(r.unmet().map(|u| u.0).as_deref(), Some("The exit that meets these rules isn't answering right now. Stream keeps trying it."));
+        r.recover("de");
+        assert_eq!(r.pick(ip("9.9.9.9"), t).as_deref(), Some("de"), "a recovered exit is used again");
+        assert!(r.failed().is_empty());
     }
 
     #[test]

@@ -147,6 +147,11 @@ fn setup_with(seed: u8, with_exit: bool, phone_limit: Option<u64>, requirements:
 
 /// The phone: downloads from `to` through WireGuard until the server closes or `deadline` passes.
 async fn phone_download(s: &Setup, to: SocketAddr, deadline: Duration) -> usize {
+    phone_download_until(s, to, deadline, usize::MAX).await
+}
+
+/// [`phone_download`], stopping as soon as `want` bytes have arrived.
+async fn phone_download_until(s: &Setup, to: SocketAddr, deadline: Duration, want: usize) -> usize {
     let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let mut tunn = Tunn::new(StaticSecret::from(s.phone_private), PublicKey::from(s.endpoint_public), None, None, 7, None);
     let (mut out, mut inb) = (vec![0u8; 70000], vec![0u8; 70000]);
@@ -178,7 +183,7 @@ async fn phone_download(s: &Setup, to: SocketAddr, deadline: Duration) -> usize 
             got += ts.recv_slice(&mut buf).unwrap();
         }
         seen_open |= ts.state() == tcp::State::Established;
-        if seen_open && !ts.is_open() {
+        if (seen_open && !ts.is_open()) || got >= want {
             break;
         }
         if let TunnResult::WriteToNetwork(b) = tunn.update_timers(&mut out) {
@@ -267,4 +272,47 @@ fn a_policy_change_ends_live_flows_on_an_exit_that_no_longer_qualifies() {
     });
     let got = s.rt.block_on(phone_download(&s, to, Duration::from_secs(30)));
     assert!(got > 0 && got < n, "the flow ran, then ended when its exit stopped qualifying ({got} bytes)");
+}
+
+/// Lists an exit that has gone away (its key is known, but nothing answers at its address) as the
+/// best exit, so the router picks it first. Returns its id.
+fn add_gone_exit(s: &Setup, seed: u8) -> String {
+    let opts = Options { relays: Relays::None, serving: false, private: false, lookup: None };
+    let gone = Link::start_alpn([seed; 32], opts, ALPN_VPN).unwrap();
+    let id = gone.endpoint_id();
+    let buyer_link = s._links.last().unwrap();
+    // an address where nothing answers: the exit's machine is off
+    buyer_link.learn(&id, Hints { relays: vec![], direct: vec!["127.0.0.1:9".parse().unwrap()] }).unwrap();
+    let best = ExitInfo { id: id.clone(), region: "XX".into(), price_msat_per_gb: 1000, rtt_ms: Some(1.0), mbit_s: Some(10_000.0), healthy: true, ..ExitInfo::default() };
+    s.rt.block_on(s.buyer.upsert_exit(best));
+    id
+}
+
+#[test]
+fn an_exit_that_went_away_is_refused_quickly_and_the_next_one_used() {
+    let n = 1 << 20;
+    let to = tcp_server(n);
+    let s = setup(180, true, None);
+    let gone = add_gone_exit(&s, 185);
+    let t = Instant::now();
+    let got = s.rt.block_on(phone_download_until(&s, to, Duration::from_secs(30), n));
+    let took = t.elapsed();
+    assert_eq!(got, n, "the download went through the next exit");
+    // one connect deadline for the gone exit, then the working one, not the link's own long timeout
+    assert!(took < xbt_vpn::buyer::CONNECT_WAIT + Duration::from_secs(5), "took {took:?}");
+    assert!(s.rt.block_on(s.buyer.failed_exits()).contains(&gone), "the gone exit is marked failed");
+    assert_eq!(s.rt.block_on(s.buyer.why_blocked(IpAddr::V4(PHONE_IP))), None, "an exit still qualifies");
+}
+
+#[test]
+fn when_every_qualifying_exit_is_gone_the_device_is_told_why() {
+    let to = tcp_server(1 << 20);
+    let s = setup(190, false, None);
+    add_gone_exit(&s, 195);
+    let t = Instant::now();
+    let got = s.rt.block_on(phone_download(&s, to, Duration::from_secs(12)));
+    assert_eq!(got, 0, "nothing gets out");
+    let why = s.rt.block_on(s.buyer.why_blocked(IpAddr::V4(PHONE_IP)));
+    assert_eq!(why.as_deref(), Some("The exit that meets these rules isn't answering right now. Stream keeps trying it."));
+    assert!(t.elapsed() < Duration::from_secs(14));
 }
