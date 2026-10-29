@@ -110,6 +110,17 @@ try {
   for (const [page, path] of pages) {
     for (const s of ["dark", "light"]) { await scheme(s); await go(BASE + path); await shot(`${page}-${s}`, 1280); await shot(`${page}-phone-${s}`, 390); }
   }
+  // the app store's gallery (XBT_UI_GALLERY=dir): five 1100x900 shots in the dark scheme
+  if (process.env.XBT_UI_GALLERY) {
+    const dir = process.env.XBT_UI_GALLERY; mkdirSync(dir, { recursive: true });
+    const gal = [["1", "/"], ["2", "/browse"], ["3", "/service?seller=" + encodeURIComponent("https://media.example") + "&name=" + encodeURIComponent("Creative Commons films")], ["4", "/sell"], ["5", "/policy"]];
+    await scheme("dark"); await size(1100, 900);
+    for (const [n, path] of gal) {
+      await go(BASE + path); await sleep(600);
+      const png = await cdp("Page.captureScreenshot", { format: "png" });
+      writeFileSync(join(dir, `${n}.png`), Buffer.from(png.data, "base64"));
+    }
+  }
   // the phone's menu, opened
   await scheme("light"); await size(390, 844); await go(BASE + "/browse"); await ev("document.querySelector('.menu-toggle').click()"); await sleep(200);
   { const png = await cdp("Page.captureScreenshot", { format: "png" }); const f = join(OUT, "menu-phone-light.png"); writeFileSync(f, Buffer.from(png.data, "base64")); shots.push(f); }
@@ -124,19 +135,21 @@ try {
     await ev("setTimeout(function(){Array.from(document.querySelectorAll('header nav a')).filter(function(a){return !a.getAttribute('aria-current')})[1].click()},0)");
     const t0 = Date.now(); while (Date.now() - t0 < 900) early.push(await grab());
     await loaded(); await sleep(1500); steady.push(await grab());
+    // the theme's own ground, so a quiet river counts as well as a bright one
+    const ground = await ev("(function(){var m=getComputedStyle(document.body).backgroundColor.match(/[\\d.]+/g).map(Number);return 0.2126*m[0]+0.7152*m[1]+0.0722*m[2]})()");
     await cdp("Page.navigate", { url: "data:text/html,<canvas id=c></canvas>" }); await sleep(300);
     const counts = await ev(`(async function(){
       var c=document.getElementById('c'),x=c.getContext('2d'),out=[];
       for (const d of ${JSON.stringify([...steady, ...early])}) {
         var im=new Image(); im.src='data:image/png;base64,'+d; await im.decode();
         c.width=im.width;c.height=im.height;x.drawImage(im,0,0);var p=x.getImageData(0,0,c.width,c.height).data,n=0;
-        for(var i=0;i<p.length;i+=4){if(0.2126*p[i]+0.7152*p[i+1]+0.0722*p[i+2]>34)n++}
+        for(var i=0;i<p.length;i+=4){if(Math.abs(0.2126*p[i]+0.7152*p[i+1]+0.0722*p[i+2]-${ground})>3)n++}
         out.push(n);
       }
       return out;
     })()`);
     const base = Math.min(counts[0], counts[1]), seen = counts.slice(2);
-    result.flicker = { steady_river_px: [counts[0], counts[1]], frames: seen.length, min_ratio: +(Math.min(...seen) / Math.max(1, base)).toFixed(3), counts: seen };
+    result.flicker = { ground: +ground.toFixed(1), steady_river_px: [counts[0], counts[1]], frames: seen.length, min_ratio: +(Math.min(...seen) / Math.max(1, base)).toFixed(3), counts: seen };
   }
 
   // the bar stays on top: after scrolling, the point in the middle of the bar is the bar's, on a

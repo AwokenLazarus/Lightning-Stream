@@ -346,7 +346,9 @@ They cannot, yet:
   gallery (screenshots of its own pages) as raw.githubusercontent.com URLs of the files in its folder on this
   repository's main branch, because umbrelOS shows a community store's `icon` and `gallery` exactly as given (a
   bare file name, or an empty icon, shows nothing). So a changed picture shows on a box once it is on main.
-  `lint.py` checks every URL names a file in the app's folder and that each icon is a plain SVG.
+  `lint.py` checks every URL names a file in the app's folder and that each icon is a plain SVG. Lightning
+  Stream's five gallery shots come from the wallet UI's look test: `XBT_UI_LOOK=1 XBT_UI_GALLERY=<dir> cargo test
+  -p xbt-wallet-ui --test look the_look` writes `1.png`..`5.png` (1100x900, dark) to copy here.
 - The images are published and pinned by digest (Images, above), but byte-for-byte reproducible builds have
   not been checked, and no box has installed them from ghcr.io yet (the real-box run used a registry on the
   build host's loopback, tunnelled to the box's).

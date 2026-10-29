@@ -1,6 +1,6 @@
-// The river's pointer effects sit on the streams: the brightening near the pointer and a click's
-// pulse are drawn along points of the streams' own curves, never as a shape of their own between
-// them. river.js runs here as it does in its worker, drawing on a context that records each path.
+// The river's pointer effects sit on the streams: the brightening near the pointer is drawn along
+// points of the streams' own curves, never as a shape of their own between them; a click's discharge
+// (an arc, a jittered current and a few forks) stays close to them, and is gone within a second. river.js runs here as it does in its worker, drawing on a context that records each path.
 //   node river_test.mjs RIVER_JS
 // Prints "RIVER ok ..." or exits non-zero.
 import { readFileSync } from "node:fs";
@@ -43,18 +43,37 @@ send({ p: [600, near + 3], tap: [600, near + 3] });
 await sleep(300);
 
 let bright = 0, pulse = 0;
+// how far a point is from the nearest stream at its x
+const off = (f, x, y) => {
+  let d = 1e9;
+  for (const s of f.strokes) if (typeof s.style === "string" && s.pts.length > 40)
+    for (let i = 1; i < s.pts.length; i++) {
+      const [x0, y0] = s.pts[i - 1], [x1, y1] = s.pts[i];
+      if ((x0 - x) * (x1 - x) <= 0 && x0 !== x1) d = Math.min(d, Math.abs(y0 + (y1 - y0) * (x - x0) / (x1 - x0) - y));
+    }
+  return d;
+};
 for (const f of frames.slice(-4)) {
   const onStreams = new Set();
   for (const s of f.strokes) if (typeof s.style === "string" && s.pts.length > 40) for (const [x, y] of s.pts) onStreams.add(`${x},${y}`);
   for (const s of f.strokes) {
     const extra = (typeof s.style === "object" && s.style.kind === "linear") ? "bright" : (s.style === "#e0f2fe" ? "pulse" : null);
     if (!extra) continue;
-    if (extra === "bright") bright++; else pulse++;
-    for (const [x, y] of s.pts) if (!onStreams.has(`${x},${y}`)) fail(`a ${extra} point (${x}, ${y}) is off every stream`);
+    if (extra === "bright") {
+      bright++;
+      for (const [x, y] of s.pts) if (!onStreams.has(`${x},${y}`)) fail(`a bright point (${x}, ${y}) is off every stream`);
+    } else {
+      pulse++;
+      for (const [x, y] of s.pts) if (x < -50 || x > 1250 || off(f, x, y) > 60) fail(`a discharge point (${x}, ${y}) strays from the streams`);
+    }
   }
   if (f.strokes.some((s) => typeof s.style === "object" && s.style.kind === "radial")) fail("a radial gradient was stroked");
 }
+// and a second later it has faded out
+await sleep(1100);
+send({ p: [600, near + 3] }); await sleep(80);
+if (frames[frames.length - 1].strokes.some((s) => s.style === "#e0f2fe")) fail("the discharge was still drawn a second later");
 if (!bright) fail("nothing brightened near the pointer");
 if (!pulse) fail("a click sent no pulse");
-console.log(`RIVER ok: ${frames.length} frames, ${bright} brightened and ${pulse} pulse strokes, every point on a stream`);
+console.log(`RIVER ok: ${frames.length} frames, ${bright} brightened and ${pulse} discharge strokes, all near the streams`);
 process.exit(0);

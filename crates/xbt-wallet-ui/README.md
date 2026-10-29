@@ -168,21 +168,26 @@ fails if a word like "macaroon", "msat" or "upstream" reaches a main screen.
 
 ## The look
 
-The app is drawn as an electric river at night, after its icon: a deep-night ground, currents in
-electric blue and violet, and one warm colour (amber) for the main action on a page and for money.
-Light and dark follow the system. `assets/ui.css` holds the tokens and the components: cards,
-buttons (the warm one is the main action; `secondary`, `danger` and `link` for the rest), inputs,
-status pills (`pill good|warn|bad`, a word and a colour), the navigation, empty states and the
-numbered first-run steps. Everything is local: no web fonts, nothing from another host, and the CSP
-stays `default-src 'none'; script-src 'self'; style-src 'self'`.
+The theme is "Slate": graphite and white with one quiet blue, flat surfaces, and a quiet river behind
+the page that answers a click with a short electric discharge. Light and dark follow the system.
+`assets/ui.css` holds the tokens and the components: cards, buttons (the solid one is the main
+action; `secondary`, `danger` and `link` for the rest), inputs, status pills (`pill good|warn|bad`, a
+word and a colour), the navigation, empty states and the numbered first-run steps. Every text colour
+meets WCAG AA in both schemes. The fonts, Inter and JetBrains Mono (both under the SIL Open Font
+Licence, their texts in `assets/fonts/`), are served by the box itself at `/fonts/<name>`; the mark,
+`assets/mark.svg`, is the header logo and the page icon, and takes its colours from the stylesheet.
+Everything is local: nothing from another host, and the CSP stays `default-src 'none'; script-src
+'self'; style-src 'self'` with `font-src 'self'`.
 
 Behind every page, `assets/river.js` draws a few slow streams on a fixed canvas (`aria-hidden`, no
 pointer events). Near the pointer the streams brighten a little and ease aside in one smooth bump,
-and a soft glow trails the pointer; a click sends one pulse along the nearest stream from where it
-was clicked; `lsRiver.pulse()` sends one down a whole stream, for payment and stream events. Every
-effect is drawn along the streams' own curve (`tests/js/river_test.mjs` checks that each of its
-points lies on a stream). It is decoration only: it reads nothing and sends nothing. To stay out of
-the way:
+and a soft glow trails the pointer. A click is a short electric discharge: an arc from the pointer
+to the nearest stream, then a jagged, flickering current racing both ways along it (weaker along the
+next one) with a few forks, gone in under a second; `lsRiver.pulse()` sends one down a whole stream,
+for payment and stream events. How calm it is comes from the stylesheet (`--river-pace`, `-reach`,
+`-width`, `-halo`, `-bump`, `-sparks`, `-zap`). The brightening is drawn along the streams' own
+curve, and the discharge stays close to them (`tests/js/river_test.mjs` checks both). It is
+decoration only: it reads nothing and sends nothing. To stay out of the way:
 
 - it draws in a worker on an `OffscreenCanvas` where the browser has one, so the page's thread only
   forwards pointer positions; elsewhere it draws in the page with the same code;

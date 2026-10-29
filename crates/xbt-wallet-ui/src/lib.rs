@@ -30,6 +30,18 @@ pub mod setup;
 pub const UI_JS: &str = include_str!("../assets/ui.js");
 pub const UI_CSS: &str = include_str!("../assets/ui.css");
 pub const VT_JS: &str = include_str!("../assets/vt.js");
+/// The app's mark: the header logo and the page icon.
+pub const MARK_SVG: &str = include_str!("../assets/mark.svg");
+/// The theme's fonts, served from the box itself (never fetched from elsewhere): name and bytes.
+pub static FONTS: &[(&str, &[u8])] = &[
+    ("inter-var.woff2", include_bytes!("../assets/fonts/inter-var.woff2")),
+    ("jetbrains-mono-var.woff2", include_bytes!("../assets/fonts/jetbrains-mono-var.woff2")),
+];
+
+/// A theme font by its file name.
+pub fn font(name: &str) -> Option<&'static [u8]> {
+    FONTS.iter().find(|(n, _)| *n == name).map(|(_, b)| *b)
+}
 /// The river drawn behind every page: decoration only, it reads and sends nothing.
 pub const RIVER_JS_SOURCE: &str = include_str!("../assets/river.js");
 
