@@ -2436,7 +2436,6 @@ fn a_shop_without_a_web_address_is_added_by_its_key_and_allowed_through_the_node
 /// Needs the gateway to read the `link` section (the direct-links transport work).
 #[cfg(unix)]
 #[test]
-#[ignore = "needs the gateway to read the link section (the direct-links transport branch); run it once the two are merged"]
 fn a_shop_reached_directly_writes_a_link_and_no_web_address() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let gw = tempfile::tempdir().unwrap();

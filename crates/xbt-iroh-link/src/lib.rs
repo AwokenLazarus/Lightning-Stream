@@ -50,7 +50,12 @@ pub enum Relays {
     Public,
     /// Relays we name (self-hosted).
     Ours(Vec<String>),
+    /// Relays we name, with iroh's public relays beside them for when ours cannot be reached.
+    OursThenPublic(Vec<String>),
 }
+
+/// Our relay: the default.
+pub const DEFAULT_RELAY: &str = "https://iroh.lazarus-xbt.xyz";
 
 /// Where a seller can be found, besides its key: relays and direct addresses it last reported.
 #[derive(Clone, Debug, Default)]
@@ -96,13 +101,14 @@ impl Link {
             return Err(io_err("private mode needs a relay"));
         }
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).thread_name("iroh-link").enable_all().build()?;
-        let relay_mode = match relays {
+        let relay_mode = match relays.clone() {
             Relays::None => RelayMode::Disabled,
             Relays::Public => RelayMode::Default,
-            Relays::Ours(urls) => {
-                let urls = urls.iter().map(|u| u.parse::<RelayUrl>()).collect::<Result<Vec<_>, _>>().map_err(io_err)?;
-                RelayMode::Custom(RelayMap::from_iter(urls))
-            }
+            Relays::Ours(urls) => RelayMode::Custom(relay_map(&urls)?),
+            // iroh makes the relay that answers fastest its home: with ours and the public ones in
+            // one map it would rarely be ours. So ours alone, and the public ones only if ours does
+            // not answer at start (below)
+            Relays::OursThenPublic(urls) => RelayMode::Custom(relay_map(&urls)?),
         };
         let mut b = Endpoint::builder(presets::Minimal).secret_key(SecretKey::from_bytes(&secret)).relay_mode(relay_mode);
         if serving {
@@ -111,7 +117,21 @@ impl Link {
         if private {
             b = b.clear_ip_transports();
         }
-        let ep = rt.block_on(b.bind()).map_err(io_err)?;
+        let mut ep = rt.block_on(b.bind()).map_err(io_err)?;
+        if matches!(relays, Relays::OursThenPublic(_)) {
+            let up = rt.block_on(async { tokio::time::timeout(std::time::Duration::from_secs(10), ep.online()).await.is_ok() });
+            if !up {
+                rt.block_on(ep.close());
+                let mut b = Endpoint::builder(presets::Minimal).secret_key(SecretKey::from_bytes(&secret)).relay_mode(RelayMode::Default);
+                if serving {
+                    b = b.alpns(vec![ALPN.to_vec()]);
+                }
+                if private {
+                    b = b.clear_ip_transports();
+                }
+                ep = rt.block_on(b.bind()).map_err(io_err)?;
+            }
+        }
         Ok(Arc::new(Link { rt, ep, ports: Mutex::new(HashMap::new()), hints: Mutex::new(HashMap::new()), shops: Mutex::new(HashMap::new()) }))
     }
 
@@ -282,6 +302,11 @@ fn id_from_label(label: &str) -> io::Result<String> {
         return Err(io_err("not a link host name"));
     }
     Ok(hex::encode(out))
+}
+
+fn relay_map(urls: &[String]) -> io::Result<RelayMap> {
+    let urls = urls.iter().map(|u| u.parse::<RelayUrl>()).collect::<Result<Vec<_>, _>>().map_err(io_err)?;
+    Ok(RelayMap::from_iter(urls))
 }
 
 fn parse_id(hex_id: &str) -> io::Result<EndpointId> {

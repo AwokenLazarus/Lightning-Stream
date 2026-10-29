@@ -40,7 +40,7 @@ fn main() {
     if args.len() < 2 {
         usage();
     }
-    let (mut relays, mut private, mut secret_file) = (Relays::Public, false, None);
+    let (mut relays, mut private, mut secret_file) = (Relays::OursThenPublic(vec![xbt_iroh_link::DEFAULT_RELAY.into()]), false, None);
     let (mut hint_relays, mut hint_direct) = (vec![], vec![]);
     let mut pos = vec![];
     let mut it = args.iter().skip(1);
@@ -50,6 +50,7 @@ fn main() {
                 relays = match it.next().map(String::as_str) {
                     Some("none") => Relays::None,
                     Some("public") => Relays::Public,
+                    Some("default") => Relays::OursThenPublic(vec![xbt_iroh_link::DEFAULT_RELAY.into()]),
                     Some(list) => Relays::Ours(list.split(',').map(str::to_string).collect()),
                     None => usage(),
                 }
