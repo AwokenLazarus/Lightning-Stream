@@ -894,7 +894,12 @@ def stream() -> None:
     t = threading.Thread(target=run)
     released_before = int((status().get("paying") or [{}])[0].get("released_msat", 0))
     t.start()
-    lab.wait("the answer to be under way", 60, lambda: any(p.get("answer_open") and int(p["released_msat"]) >= released_before + 3 * TICKET_MSAT for p in status().get("paying", [])), every=0.02)
+    try:
+        lab.wait("the answer to be under way", 60, lambda: any(p.get("answer_open") and int(p["released_msat"]) >= released_before + 3 * TICKET_MSAT for p in status().get("paying", [])), every=0.02)
+    except LabError as e:
+        # what the call came to, and the wallet's own view, say why it never got under way
+        t.join(30)
+        raise LabError(f"{e}: the call {json.dumps(brief(result))[:600]}; paying {json.dumps(status().get('paying'))[:600]}") from None
     sid = status()["sessions"][0]["session"]
     t0 = time.monotonic()
     stop = agent().tool("ticket_stop", {"session": sid})
@@ -1599,7 +1604,7 @@ def link_check(relay: bool) -> None:
           and r.get("tickets_released") == 20 and r["receipt"].get("body") == "as signed" and r["receipt"]["last"]["charged"] == str(price_msat))
     check(f"link ({mode}): a shop with no web address, reached over its iroh link{' through a relay only' if relay else ''}: the 100 MB file came whole, paid as it arrived with 20 tickets released one at a time, the last receipt signs its hash and its exact price, every ticket the seller took is booked once and the money agrees",
           ok and same_file and not inv["not_in_ledger"] and inv["same_tickets"] and agrees(m, receipts=False),
-          {**brief(r), "origin": origin, "seconds": round(took, 2), "mbit_s": mbit, "stored_is_the_file": same_file, **inv, "money": m})
+          {**brief(r), "rails_passed_over": r.get("rails_passed_over"), "origin": origin, "seconds": round(took, 2), "mbit_s": mbit, "stored_is_the_file": same_file, **inv, "money": m})
     PROCS["gateway-link"].terminate()
     PROCS["gateway-link"].wait(10)
 

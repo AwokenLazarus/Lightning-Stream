@@ -143,6 +143,17 @@ impl Seed {
         &self.0
     }
 
+    /// The key this wallet is known by to the seller whose receipt key is `receipt_key`, and to
+    /// no other (docs/BUYER-ACCOUNTS.md): the same for every session with that seller, and for any
+    /// wallet with this seed; unrelated to its key for any other seller, and to the node's keys.
+    pub fn buyer_key(&self, receipt_key: &str) -> xbt402::xbt_primitives::secp256k1::SecretKey {
+        let label = xbt402::ticket::BUYER_TAG.as_bytes();
+        let key = receipt_key.to_ascii_lowercase();
+        // a digest that is not a valid key (one in 2^128) is followed by the next
+        (0u8..=255).find_map(|i| xbt402::xbt_primitives::secp256k1::SecretKey::from_slice(&hmac(&*self.0, &[label, key.as_bytes(), &[i]])).ok())
+            .expect("a valid key among 256 tries")
+    }
+
     /// The secret of the ticket with this nonce.
     pub fn secret(&self, nonce: &[u8; 16]) -> Zeroizing<[u8; 32]> {
         Zeroizing::new(hmac(&*self.0, &[b"xbt/ticket/secret/v0", nonce]))
@@ -1656,6 +1667,21 @@ pub fn check_prepaid_invoice(inv: &crate::bolt11::Invoice, s: &Session, msat: u6
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A buyer's key for a seller (docs/BUYER-ACCOUNTS.md): one seed, one key at that seller, in
+    /// every session and on every wallet with the seed; another seller, an unrelated key.
+    #[test]
+    fn a_buyer_key_is_the_same_at_one_seller_and_unrelated_at_another() {
+        let (a, b) = ("02".to_string() + &"11".repeat(32), "03".to_string() + &"22".repeat(32));
+        let seed = Seed::new([7u8; 32]);
+        let again = Seed::new([7u8; 32]);
+        assert_eq!(seed.buyer_key(&a).secret_bytes(), again.buyer_key(&a).secret_bytes(), "a restored wallet is the same buyer");
+        assert_eq!(seed.buyer_key(&a).secret_bytes(), seed.buyer_key(&a.to_uppercase()).secret_bytes(), "the key's spelling does not matter");
+        assert_ne!(seed.buyer_key(&a).secret_bytes(), seed.buyer_key(&b).secret_bytes(), "two sellers, two keys");
+        assert_ne!(seed.buyer_key(&a).secret_bytes(), Seed::new([8u8; 32]).buyer_key(&a).secret_bytes(), "two wallets, two buyers");
+        // nothing a ticket's secret is made of: the label is the buyer's own
+        assert_ne!(&seed.buyer_key(&a).secret_bytes(), &*seed.secret(&[0u8; 16]));
+    }
 
     fn seed() -> Seed {
         Seed::new([7u8; 32])

@@ -124,6 +124,8 @@ services:
       XBT_UI_LN_REST: ${LS_LND_REST}
       XBT_UI_LN_TLS_CERT: /data/lightning/tls.cert
       XBT_UI_CONNECTOR: http://127.0.0.1:${LS_CONNECTOR_PORT:-8484}
+      # a seller's own web page, opened inside the app: one origin per port, on the UI's own address (docs/SELLER-APPS.md)
+      XBT_UI_APP_PORTS: ${LS_APP_PORTS:-33521,33522,33523,33524}
       XBT_UI_SELL: "1"
       XBT_UI_GW_PORT: ${LS_GW_PORT:-8402}
       XBT_UI_GW_NODE_REST: ${LS_LND_REST}

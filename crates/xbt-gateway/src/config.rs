@@ -78,6 +78,54 @@ pub struct Route {
     pub upstream: Option<String>,
     /// Pass the target on without this route's path (a route `/ai/` sends `/ai/v1/x` as `/v1/x`).
     pub strip_prefix: bool,
+    /// Ask the service for a gzip body (`accept_gzip`): a web app that serves its pages only
+    /// compressed (llama.cpp's server does). The gateway unpacks it and sends the buyer the plain
+    /// body, which is what it meters and signs.
+    pub accept_gzip: bool,
+    /// Headers the gateway adds to every request of this route (`upstream_headers`), over any the
+    /// buyer sent of the same name: the seller's guest login for a service that needs one. They
+    /// never go to the buyer.
+    pub upstream_headers: Vec<(String, String)>,
+    /// Paths under this route the gateway refuses (`deny_paths`), whatever the method: parts of a
+    /// web app a buyer must not reach (an admin page, other users' sessions). Lower case; matched
+    /// against the decoded path, ignoring case, as a prefix.
+    pub deny_paths: Vec<String>,
+    /// When not empty, the only paths under this route the gateway serves (`allow_paths`), as
+    /// prefixes, ignoring case; everything else is refused.
+    pub allow_paths: Vec<String>,
+    /// The route carries WebSockets (`websocket`): a `GET` asking to upgrade becomes a two-way byte
+    /// stream with the service, every byte of it, either way, paid for as a body's byte is.
+    pub websocket: bool,
+    /// Each buyer gets an account of their own in the service (`accounts`, docs/BUYER-ACCOUNTS.md).
+    pub accounts: Option<Accounts>,
+}
+
+/// How buyers' accounts are made in a route's service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Accounts {
+    /// Jellyfin, through its API with the seller's key (a file only the gateway reads): a user per
+    /// buyer, seeing only `libraries`.
+    Jellyfin { admin_key_file: PathBuf, libraries: Vec<String> },
+    /// A program of the seller's, given a buyer's handle, that prints the headers to send as them.
+    Hook { command: PathBuf },
+}
+
+impl Route {
+    /// Whether the gateway refuses `path` (decoded) on this route. The longest prefix of the two
+    /// lists that `path` starts with decides: a `deny_paths` entry refuses, an `allow_paths` entry
+    /// serves; one that starts with neither is served when `allow_paths` is empty and refused when
+    /// it is not. So `allow` `/` and `/users/public` with `deny` `/users` serve everything but
+    /// `/users`, and of that only `/users/public`. Case is ignored, as many web servers ignore it.
+    pub fn path_refused(&self, path: &str) -> bool {
+        let p = path.to_ascii_lowercase();
+        let longest = |list: &[String]| list.iter().filter(|x| p.starts_with(x.as_str())).map(String::len).max();
+        match (longest(&self.deny_paths), longest(&self.allow_paths)) {
+            (Some(d), Some(a)) => d > a,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => !self.allow_paths.is_empty(),
+        }
+    }
 }
 
 /// Request headers every route passes on: they select what is returned and carry no authority.
@@ -831,6 +879,12 @@ fn route(v: &Value) -> Result<Route, String> {
             "upstream",
             "strip_prefix",
             "max_output_tokens",
+            "accept_gzip",
+            "upstream_headers",
+            "deny_paths",
+            "allow_paths",
+            "websocket",
+            "accounts",
         ],
     )?;
     let path = req_str(r, "path")?.to_string();
@@ -946,6 +1000,81 @@ fn route(v: &Value) -> Result<Route, String> {
     if strip_prefix && !path.ends_with('/') {
         return Err(bad("strip_prefix is for a path ending in /, which covers everything under it"));
     }
+    let accept_gzip = match r.get("accept_gzip") {
+        None => false,
+        Some(Value::Bool(b)) => *b,
+        _ => return Err(bad("accept_gzip is true or false")),
+    };
+    let mut upstream_headers = vec![];
+    if let Some(h) = r.get("upstream_headers") {
+        let m = h.as_object().ok_or_else(|| bad("upstream_headers is an object of header names and values"))?;
+        if m.len() > 8 {
+            return Err(bad("upstream_headers has at most 8 headers"));
+        }
+        for (k, v) in m {
+            let name = k.to_ascii_lowercase();
+            if name.is_empty() || !name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-') {
+                return Err(bad("upstream_headers are header names"));
+            }
+            if NEVER_FORWARDED.contains(&name.as_str()) || name.starts_with("payment-") {
+                return Err(bad(&format!("{name} is never sent to the service")));
+            }
+            let v = v.as_str().filter(|v| v.len() <= 4096 && v.bytes().all(|b| b.is_ascii_graphic() || b == b' '))
+                .ok_or_else(|| bad("upstream_headers values are plain text"))?;
+            upstream_headers.push((name, v.to_string()));
+        }
+    }
+    let paths = |key: &str| -> Result<Vec<String>, String> {
+        let Some(v) = r.get(key) else { return Ok(vec![]) };
+        let list = v.as_array().ok_or_else(|| bad(&format!("{key} is a list of paths")))?;
+        if list.len() > 64 {
+            return Err(bad(&format!("{key} has at most 64 paths")));
+        }
+        list.iter()
+            .map(|p| {
+                p.as_str()
+                    .filter(|p| p.starts_with('/') && p.len() <= 512 && p.bytes().all(|c| c.is_ascii_graphic()) && !p.contains(['?', '#', '%', '\\']))
+                    .map(str::to_ascii_lowercase)
+                    .ok_or_else(|| bad(&format!("{key} are paths starting with /, without ?, #, % or \\")))
+            })
+            .collect()
+    };
+    let deny_paths = paths("deny_paths")?;
+    let allow_paths = paths("allow_paths")?;
+    let websocket = match r.get("websocket") {
+        None => false,
+        Some(Value::Bool(b)) => *b,
+        _ => return Err(bad("websocket is true or false")),
+    };
+    if websocket && !free && (price.second_msat > 0 || price.tokens.active()) {
+        return Err(bad("a route that carries WebSockets is priced by the request and the byte, or free"));
+    }
+    if websocket && !methods.iter().any(|m| m == "GET") {
+        return Err(bad("a route that carries WebSockets takes GET"));
+    }
+    let accounts = match r.get("accounts") {
+        None => None,
+        Some(a) => {
+            let a = a.as_object().ok_or_else(|| bad("accounts is an object"))?;
+            let file = |k: &str| a.get(k).and_then(Value::as_str).filter(|p| p.starts_with('/')).map(PathBuf::from)
+                .ok_or_else(|| bad(&format!("accounts.{k} is an absolute path")));
+            match a.get("kind").and_then(Value::as_str) {
+                Some("jellyfin") => {
+                    let libraries: Vec<String> = a.get("libraries").and_then(Value::as_array)
+                        .map(|l| l.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default();
+                    if libraries.is_empty() || libraries.iter().any(|l| l.len() > 64 || !l.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')) {
+                        return Err(bad("accounts.libraries names the ids of the libraries buyers see"));
+                    }
+                    Some(Accounts::Jellyfin { admin_key_file: file("admin_key_file")?, libraries })
+                }
+                Some("hook") => Some(Accounts::Hook { command: file("command")? }),
+                _ => return Err(bad("accounts.kind is jellyfin or hook")),
+            }
+        }
+    };
+    if accounts.is_some() && free {
+        return Err(bad("a route with accounts is a priced one: a buyer is known only by a paid session"));
+    }
     Ok(Route {
         path,
         methods,
@@ -956,6 +1085,12 @@ fn route(v: &Value) -> Result<Route, String> {
         max_body: max_body as usize,
         upstream,
         strip_prefix,
+        accept_gzip,
+        upstream_headers,
+        deny_paths,
+        allow_paths,
+        websocket,
+        accounts,
     })
 }
 
@@ -1085,6 +1220,38 @@ mod tests {
                "routes": [{"path": "/files/", "price": {"byte_msat": 1000, "per_bytes": 1048576}},
                           {"path": "/files/free/", "free": true},
                           {"path": "/api", "methods": ["POST"], "price": {"request_msat": 2500}, "max_body": 4096, "forward_headers": ["X-Trace"]}]})
+    }
+
+    /// A seller's web app sold whole, with the parts a buyer must not reach refused: case does not
+    /// help (many web servers ignore it), and an allow list refuses everything it does not name.
+    #[test]
+    fn a_route_refuses_the_paths_it_denies_and_those_its_allow_list_leaves_out() {
+        let mut v = base();
+        v["routes"] = json!([{"path": "/jf/", "price": {"request_msat": 100}, "deny_paths": ["/jf/Sessions", "/jf/system/"]},
+                             {"path": "/app/", "price": {"request_msat": 100}, "allow_paths": ["/app/web/", "/app/Videos/"]}]);
+        let c = Config::from_json(&v).unwrap();
+        let jf = c.route("/jf/web/index.html").unwrap();
+        assert!(!jf.path_refused("/jf/web/index.html"));
+        for p in ["/jf/Sessions", "/jf/sessions/abc/Playing", "/jf/SESSIONS", "/jf/System/Info"] {
+            assert!(jf.path_refused(p), "{p}");
+        }
+        let app = c.route("/app/web/").unwrap();
+        assert!(!app.path_refused("/app/web/main.js") && !app.path_refused("/app/videos/1/stream"));
+        assert!(app.path_refused("/app/Users") && app.path_refused("/app/"));
+        // the longest prefix decides: all of /one/ but /one/users, and of that only /one/users/public
+        let mut w = base();
+        w["routes"] = json!([{"path": "/one/", "price": {"request_msat": 100}, "allow_paths": ["/one/", "/one/users/public", "/one/users/g1/"],
+                              "deny_paths": ["/one/users"]}]);
+        let c = Config::from_json(&w).unwrap();
+        let one = c.route("/one/x").unwrap();
+        for (p, refused) in [("/one/web/a.js", false), ("/one/Users/Public", false), ("/one/users", true), ("/one/USERS/other/items", true),
+                             ("/one/users/g1/items", false), ("/one/usersx", true), ("/two", true)] {
+            assert_eq!(one.path_refused(p), refused, "{p}");
+        }
+        for bad in [json!("Sessions"), json!("/a?b"), json!("/a%2f"), json!(3)] {
+            v["routes"][0]["deny_paths"] = json!([bad.clone()]);
+            assert!(Config::from_json(&v).is_err(), "{bad}");
+        }
     }
 
     #[test]

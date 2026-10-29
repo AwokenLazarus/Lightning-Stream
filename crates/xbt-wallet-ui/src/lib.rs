@@ -26,6 +26,7 @@ pub mod nostr;
 pub mod relay;
 pub mod relaynet;
 pub mod server;
+pub mod seller_app;
 pub mod setup;
 pub mod shops;
 

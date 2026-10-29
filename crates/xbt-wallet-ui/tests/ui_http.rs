@@ -1457,6 +1457,102 @@ fn walk(d: &std::path::Path) -> Vec<std::path::PathBuf> {
     out
 }
 
+/// A service's own web page (docs/SELLER-APPS.md): the AI model's page at its own path, a media
+/// server's at the root, each route given the methods and headers a page uses, its compressed pages,
+/// and the seller's guest login; the listing names each page beside its service. A guest login of
+/// the wallet's own headers is refused.
+#[cfg(unix)]
+#[test]
+fn a_service_sold_with_its_own_web_page_gets_a_route_and_a_listing_for_it() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let gw = tempfile::tempdir().unwrap();
+    let dir = gw.path().to_path_buf();
+    let media = mock_http(|_| (200, "ok"));
+    let bx = start(json!({}), false, |c| {
+        c.sell = true;
+        c.gw.dir = dir.clone();
+        c.gw.node_rest = Some("https://10.21.21.66:8180".into());
+        c.gw.node_tls_cert = Some("/data/lightning/tls.cert".into());
+    });
+    let mut br = logged_in(&bx);
+    let inv = mac(&[("invoices", &["read", "write"])]);
+    let info = mac(&[("info", &["read"])]);
+    br.act("/sell", "/sell", &[("action", "connect"), ("invoices_macaroon", &inv), ("info_macaroon", &info)]);
+    br.act("/sell", "/sell", &[("action", "advanced"), ("max_sessions", "30"), ("sessions_per_address", "2"), ("max_held_tickets", "15"),
+                               ("proxies", ""), ("network", "bip122:0123456789abcdef0123456789abcdef")]);
+    br.act("/sell", "/sell", &[("action", "shop"), ("name", "Box"), ("public_url", "https://seller.example")]);
+    assert!(br.get("/sell").body.contains("Buyers can open its own web page inside their app"));
+    let addr = format!("http://{media}");
+    // films sold under one path, the media server's own page at the root, with a guest login
+    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("address", &addr), ("price", "20"), ("unit", "mib"),
+                                       ("paths", "/Videos/1/"), ("app", "1"), ("app_entry", "/web/"), ("app_login", "X-Emby-Token: guest-1")]);
+    assert!(br.flash_after(&r).contains("restarts"), "{}", br.flash_after(&r));
+    // the model, its page at its own path
+    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "ai"), ("address", "http://127.0.0.1:9"), ("price", "10"), ("unit", "tokens"),
+                                       ("name", "Model"), ("strip", "1"), ("app", "1")]);
+    assert!(br.flash_after(&r).contains("restarts"), "{}", br.flash_after(&r));
+    let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    let cfg = xbt_gateway::config::Config::from_json(&c).unwrap();
+    let route = |p: &str| cfg.routes.iter().find(|r| r.path == p).unwrap_or_else(|| panic!("no route {p}"));
+    let (films, root, model) = (route("/Videos/1/"), route("/"), route("/model/"));
+    assert!(!films.accept_gzip && films.upstream_headers.is_empty(), "the films' own route is as it was");
+    assert!(root.accept_gzip && root.methods.contains(&"DELETE".to_string()) && root.forward_headers.contains(&"cookie".to_string()));
+    assert_eq!(root.upstream_headers, [("x-emby-token".to_string(), "guest-1".to_string())]);
+    assert_eq!((root.price.byte_msat, root.upstream.as_deref()), (20_000, Some(addr.as_str())));
+    assert!(model.accept_gzip && model.strip_prefix && model.methods.contains(&"POST".to_string()) && model.upstream_headers.is_empty());
+    let l = cfg.listing.unwrap();
+    let apps: Vec<(&str, &str, &str)> = l.services.iter().filter(|s| s.kind == "app").map(|s| (s.name.as_str(), s.path.as_str(), s.items[0].url.as_str())).collect();
+    assert_eq!(apps, [("Media server", "/", "https://seller.example/web/"), ("Model", "/model/", "https://seller.example/model/")]);
+    // the buyer's side reads each page with its service
+    let svc = xbt_wallet_ui::services::from_listing(&xbt402::listing::Listing { name: l.name.clone(), kind: l.kind.clone(), seller: "https://seller.example".into(),
+        receipt_key: String::new(), prices: l.prices.clone(), items: l.items.clone(), licence: l.licence.clone(), credits: l.credits.clone(), updated: l.updated.clone(),
+        services: l.services.clone() });
+    let m = svc.iter().find(|s| s.name.ends_with("Model")).unwrap();
+    assert_eq!((m.app.as_str(), m.app_base.as_str()), ("https://seller.example/model/", "https://seller.example/model/"));
+    // the page turned off: its routes are as any other, and the listing names no page
+    let shop: Value = serde_json::from_str(&std::fs::read_to_string(bx.data.path().join("ui/sell.json")).unwrap()).unwrap();
+    let id = shop["offers"][1]["id"].as_str().unwrap().to_string();
+    br.act("/sell", "/sell", &[("action", "service"), ("id", &id), ("kind", "ai"), ("address", "http://127.0.0.1:9"), ("price", "10"), ("unit", "tokens"),
+                               ("name", "Model"), ("strip", "1")]);
+    let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    let cfg = xbt_gateway::config::Config::from_json(&c).unwrap();
+    assert!(!cfg.routes.iter().find(|r| r.path == "/model/").unwrap().accept_gzip);
+    assert_eq!(cfg.listing.unwrap().services.iter().filter(|s| s.kind == "app").count(), 1);
+    // a guest login may not be the shop's own headers, and a page's base is not another service's path
+    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "ai"), ("address", "http://127.0.0.1:9"), ("price", "10"), ("unit", "tokens"),
+                                       ("name", "Other"), ("app", "1"), ("app_login", "Cookie: x=1")]);
+    assert!(unescape(&r.body).contains("cannot be the login header"), "{}", r.body);
+    let r = br.act("/sell", "/sell", &[("action", "service"), ("kind", "ai"), ("address", "http://127.0.0.1:9"), ("price", "10"), ("unit", "tokens"),
+                                       ("name", "Other"), ("app", "1"), ("app_base", "/Videos/1/")]);
+    assert!(unescape(&r.body).contains("Another service already uses"), "{}", r.body);
+}
+
+/// A page on another port of this host (a seller's own app, another app of the box) is of the same
+/// site: the browser sends the wallet's cookies with what it asks. Only the opening of the home page
+/// is answered; a stream, an action or another page is not.
+#[cfg(unix)]
+#[test]
+fn a_request_from_another_page_of_the_same_site_is_refused_and_home_still_opens() {
+    let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let bx = start(json!({}), false, |_| {});
+    let mut br = logged_in(&bx);
+    let site = [("Sec-Fetch-Site", "same-site"), ("Sec-Fetch-Mode", "no-cors"), ("Sec-Fetch-Dest", "video")];
+    let r = br.send("GET", "/s/https://seller.example/film", None, &site);
+    assert_eq!(r.status, 403, "a stream asked by another page");
+    let r = br.send("GET", "/browse", None, &[("Sec-Fetch-Site", "same-site"), ("Sec-Fetch-Mode", "cors"), ("Sec-Fetch-Dest", "empty")]);
+    assert_eq!(r.status, 403);
+    let nav = [("Sec-Fetch-Site", "same-site"), ("Sec-Fetch-Mode", "navigate"), ("Sec-Fetch-Dest", "document")];
+    let r = br.send("GET", "/sell", None, &nav);
+    assert_eq!((r.status, r.location()), (303, "/"), "a page another page opens is the home page");
+    assert_eq!(br.send("GET", "/", None, &nav).status, 200, "the box's dashboard opens the app");
+    let csrf = field(&br.get("/browse").body, "csrf");
+    let r = br.send("POST", "/logout", Some(&format!("csrf={}", enc(&csrf))), &[("Sec-Fetch-Site", "same-site")]);
+    assert_eq!(r.status, 403, "an action asked by another page, with the right token even");
+    // the page itself, as before
+    assert_eq!(br.send("GET", "/browse", None, &[("Sec-Fetch-Site", "same-origin")]).status, 200);
+    assert_eq!(br.send("POST", "/logout", Some(&format!("csrf={}", enc(&csrf))), &[("Sec-Fetch-Site", "same-origin")]).status, 303);
+}
+
 /// The one Lightning Stream app (`XBT_UI_SELL=1`): Sell sets up the gateway beside the wallet in
 /// plain words, one service at a time, and writes a config the gateway takes.
 #[cfg(unix)]

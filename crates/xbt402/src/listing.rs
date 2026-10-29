@@ -23,7 +23,10 @@ const TAG_1: &str = "xbt402/listing/1";
 /// At most this many services in one listing.
 const MAX_SERVICES: usize = 32;
 
-const KINDS: [&str; 5] = ["video", "files", "api", "ai", "hashrate"];
+/// `app`: a service's own web page, which buyers open inside their app (docs/SELLER-APPS.md). Its
+/// path is the app's base and may be the path of the service it belongs to; its one item is where
+/// it opens.
+const KINDS: [&str; 6] = ["video", "files", "api", "ai", "hashrate", "app"];
 const PRICE_KEYS: [&str; 6] = ["request_msat", "byte_msat", "per_bytes", "second_msat", "per_1k_input_msat", "per_1k_output_msat"];
 /// A fetched document larger than this is refused before it is parsed.
 const MAX_BODY: usize = 256 << 10;
@@ -148,7 +151,7 @@ fn parse_draft_as(v: &Value, skip_unknown: bool) -> Result<Draft, String> {
     }
     let kind = req_str(m, "kind")?;
     if !KINDS.contains(&kind) {
-        return Err("kind is video, files, api, ai or hashrate".into());
+        return Err("kind is video, files, api, ai, hashrate or app".into());
     }
     let prices = price_strings(m.get("prices").ok_or("prices is missing")?)?;
     let items_v = m.get("items").and_then(Value::as_array).ok_or("items is a list")?;
@@ -199,7 +202,7 @@ fn parse_section(v: &Value, n: usize) -> Result<Section, String> {
     }
     let kind = req_str(m, "kind").map_err(|e| format!("{what}: {e}"))?;
     if !KINDS.contains(&kind) {
-        return Err(format!("{what}: kind is video, files, api, ai or hashrate"));
+        return Err(format!("{what}: kind is video, files, api, ai, hashrate or app"));
     }
     let path = req_str(m, "path").map_err(|e| format!("{what}: {e}"))?;
     if !route_path(path) {
@@ -226,7 +229,8 @@ fn parse_draft_1(v: &Value, skip_unknown: bool) -> Result<Draft, String> {
             continue;
         }
         let sec = parse_section(s, i + 1)?;
-        if services.iter().any(|o| o.path == sec.path) {
+        // an app shares the path of the service it is the page of; two of one kind never do
+        if services.iter().any(|o| o.path == sec.path && (o.kind == "app") == (sec.kind == "app")) {
             return Err(format!("service {}: path {} is named twice", i + 1, sec.path));
         }
         services.push(sec);
@@ -235,7 +239,7 @@ fn parse_draft_1(v: &Value, skip_unknown: bool) -> Result<Draft, String> {
     if updated.chars().count() > 64 {
         return Err("updated is at most 64 characters".into());
     }
-    let first = services.first().cloned().ok_or("the listing has no service of a kind this app knows")?;
+    let first = services.iter().find(|s| s.kind != "app").or(services.first()).cloned().ok_or("the listing has no service of a kind this app knows")?;
     Ok(Draft { name: name.to_string(), kind: first.kind, prices: first.prices, items: first.items, licence: opt_text(m, "licence")?,
                credits: opt_text(m, "credits")?, updated: updated.to_string(), services })
 }
@@ -634,6 +638,20 @@ mod tests {
         let got = verify(&sign(&sk, &document(&d, "https://seller.example", &pk)), &pk).unwrap();
         assert_eq!(got.services.iter().map(|s| (s.kind.as_str(), s.path.as_str())).collect::<Vec<_>>(), [("ai", "/ai/"), ("hashrate", "/hashrate/")]);
         assert_eq!(got.services[1].prices["request_msat"], "40000");
+    }
+
+    #[test]
+    fn a_services_own_web_page_is_listed_beside_it_at_its_path_and_only_once() {
+        let (sk, pk) = key();
+        let svc = |kind: &str, path: &str| json!({"name": "Local model", "kind": kind, "path": path, "prices": {"per_1k_output_msat": 10000},
+                                                  "items": if kind == "app" { json!([{"title": "Open Local model", "url": "https://seller.example/ai/"}]) } else { json!([]) }});
+        let d = parse_draft(&json!({"name": "One box", "updated": "2026-10-27", "services": [svc("ai", "/ai/"), svc("app", "/ai/")]})).unwrap();
+        let got = verify(&sign(&sk, &document(&d, "https://seller.example", &pk)), &pk).unwrap();
+        assert_eq!(got.services.iter().map(|s| (s.kind.as_str(), s.path.as_str())).collect::<Vec<_>>(), [("ai", "/ai/"), ("app", "/ai/")]);
+        assert_eq!(got.kind, "ai", "the service, not its page, stands for the listing");
+        // two services of one kind, or two pages, never share a path
+        assert!(parse_draft(&json!({"name": "x", "updated": "u", "services": [svc("ai", "/ai/"), svc("ai", "/ai/")]})).is_err());
+        assert!(parse_draft(&json!({"name": "x", "updated": "u", "services": [svc("app", "/ai/"), svc("app", "/ai/")]})).is_err());
     }
 
     #[test]
