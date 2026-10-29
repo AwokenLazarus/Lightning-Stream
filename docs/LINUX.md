@@ -174,12 +174,14 @@ You rent your miners out, and they hash for your own pool whenever nobody rents 
 4. **Sell → Hashrate:**
    - set your own pool (your DATUM Gateway, or your pool, as your miners use it today);
    - set a price per piece of work and a name;
-   - set **the address hashtakers use**: your public address with port **23341**, after you forward TCP
-     23341 to this machine. The link is encrypted end to end, so it needs no certificate, and https
-     tunnels for websites can't carry it.
+   - nothing else: hashtakers reach your miners through the app's direct link, encrypted end to end,
+     with no port forward, address or certificate. It needs outbound internet only; when the two
+     routers don't allow a direct connection it goes through a relay, which sees only encrypted data.
+     Under Advanced you can also give an address with a forwarded TCP port 23341, for hashtakers on apps
+     from before the direct link.
 
-   Then tick *Rent out my miners* and save. With a miner connected and the address set, your offer goes
-   on the Nostr relays within a minute.
+   Then tick *Rent out my miners* and save. With a miner connected, your offer goes on the Nostr relays
+   within a minute.
 
 ## Update, stop, remove
 

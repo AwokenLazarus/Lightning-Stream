@@ -221,6 +221,33 @@ impl App {
         let link_public = pick("linkPublic").and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
         let link_lan = st.as_ref().ok().and_then(|s| s["linkLan"].as_str().map(str::to_string)).filter(|a| !a.is_empty()).unwrap_or_else(|| "this box's address, port 23341".into());
         let grace_s = pick("graceMs").and_then(|v| v.as_u64()).unwrap_or(45_000) / 1000;
+        // a hashmaker whose direct link is up is reached by key: no port forward, no address to type
+        let direct = st.as_ref().ok().is_some_and(|s| s["iroh"].is_object());
+        let forwarded = format!("<label>{}<input name=\"link_public\" value=\"{}\" class=\"mono\" \
+            pattern=\"[A-Za-z0-9.\\-\\[\\]:]+:[0-9]+\" title=\"An address with its port, like my-box.example.com:23341\" placeholder=\"my-box.example.com:23341\"></label>\
+            <p class=\"hint\">{}</p>\
+            <details><summary>How do I get this address?</summary><ol>\
+            <li>On your router, forward <strong>TCP port 23341</strong> to this box ({}). Forward only 23341: your miners' port stays on your own network.</li>\
+            <li>Write your router's public address with the port, like <code>203.0.113.7:23341</code>, or a name that points at it (dynamic DNS), \
+            like <code>my-box.example.com:23341</code>.</li>\
+            <li>Save. Your offer goes on public listings within a minute.</li></ol>\
+            <p class=\"hint\">This is a plain TCP port, so https tunnels for websites cannot carry it. The link is encrypted end to end, so it needs no \
+            certificate. If you cannot forward ports, a tunnel app that forwards a TCP port to this box works too.</p></details>",
+            if direct { "Also reachable at a forwarded address <small>(optional)</small>" } else { "Address hashtakers use to reach your miners (needs a port forward or tunnel)" },
+            esc(&link_public),
+            if direct {
+                "Only for hashtakers on apps from before the direct link, which cannot use it. Leave it empty if you have not forwarded a port."
+            } else {
+                "Hashtakers' apps connect to this box's port 23341. Leave it empty and your offer stays off public listings; hashtakers on your own network can still use this box's address."
+            },
+            esc(&link_lan));
+        let reach = if direct {
+            "<p class=\"hint\"><span class=\"pill good\">No setup</span> Hashtakers reach your miners directly through the app, encrypted end to end: \
+            no port forward, address or certificate is needed. When the two routers do not allow a direct connection, it goes through a relay, which \
+            sees only encrypted data.</p>".to_string()
+        } else {
+            forwarded.clone()
+        };
         b.push_str(&format!("<section class=\"card primary\"><h2>{}</h2><form method=\"post\" action=\"./sell-hashrate\">{csrf}\
             <input type=\"hidden\" name=\"action\" value=\"save\">\
             <label>Your own pool, where your miners hash when nobody rents them<input name=\"fallback\" value=\"{}\" required class=\"mono\" \
@@ -230,23 +257,15 @@ impl App {
             <p class=\"hint\">At this price a {} miner earns about <strong>{}</strong> an hour while it is rented.</p>\
             <label>Miners to rent out at most <small>(empty: all of them)</small><input name=\"rentable\" value=\"{}\" inputmode=\"numeric\" pattern=\"[0-9]*\"></label>\
             <label>Name, as hashtakers see it<input name=\"name\" value=\"{}\" maxlength=\"80\" placeholder=\"My miners\"></label>\
-            <label>Address hashtakers use to reach your miners (needs a port forward or tunnel)<input name=\"link_public\" value=\"{}\" class=\"mono\" \
-            pattern=\"[A-Za-z0-9.\\-\\[\\]:]+:[0-9]+\" title=\"An address with its port, like my-box.example.com:23341\" placeholder=\"my-box.example.com:23341\"></label>\
-            <p class=\"hint\">Hashtakers' apps connect to this box's port 23341. Leave it empty and your offer stays off public listings; hashtakers on your own network can still use {}.</p>\
-            <details><summary>How do I get this address?</summary><ol>\
-            <li>On your router, forward <strong>TCP port 23341</strong> to this box ({}). Forward only 23341: your miners' port stays on your own network.</li>\
-            <li>Write your router's public address with the port, like <code>203.0.113.7:23341</code>, or a name that points at it (dynamic DNS), \
-            like <code>my-box.example.com:23341</code>.</li>\
-            <li>Save. Your offer goes on public listings within a minute.</li></ol>\
-            <p class=\"hint\">This is a plain TCP port, so https tunnels for websites cannot carry it. The link is encrypted end to end, so it needs no \
-            certificate. If you cannot forward ports, a tunnel app that forwards a TCP port to this box works too.</p></details>\
+            {}\
             <label class=\"check\"><input type=\"checkbox\" name=\"enabled\" value=\"1\"{}> Rent out my miners</label>\
             <details><summary>Advanced</summary>\
             <label>Work in each piece (hashes)<input name=\"slice_work\" value=\"{:.0}\" inputmode=\"numeric\" pattern=\"[0-9]+\" class=\"mono\"></label>\
             <label>How long to wait for each payment, in seconds<input name=\"grace_s\" value=\"{grace_s}\" inputmode=\"numeric\" pattern=\"[0-9]+\"></label>\
-            </details><div class=\"row\"><button>{}</button></div></form></section>",
+            {}</details><div class=\"row\"><button>{}</button></div></form></section>",
             if on { "Change renting" } else { "Rent out your miners" }, esc(&fallback), speed(EXAMPLE_HS), sats_n(per_hour(price as f64, slice, EXAMPLE_HS)),
-            esc(&rentable), esc(&name), esc(&link_public), esc(&link_lan), esc(&link_lan), if on || saved.get("enabled").is_none() { " checked" } else { "" }, slice,
+            esc(&rentable), esc(&name), reach, if on || saved.get("enabled").is_none() { " checked" } else { "" }, slice,
+            if direct { forwarded.as_str() } else { "" },
             if on { "Save" } else { "Save and start renting" }));
         if let Ok(s) = &st {
             match s["listing"].get("ok") {
@@ -256,7 +275,11 @@ impl App {
                 Some(Value::Bool(false)) => b.push_str(&format!(
                     "<section class=\"card\"><p><span class=\"pill warn\">Not listed</span> {}</p></section>",
                     esc(s["listing"]["why"].as_str().unwrap_or("Your offer is not published yet.")))),
-                _ => b.push_str("<section class=\"card\"><p><span class=\"pill warn\">Not listed yet</span> Your offer goes on public listings once a miner is connected and the address hashtakers use is set.</p></section>"),
+                _ => b.push_str(if direct {
+                    "<section class=\"card\"><p><span class=\"pill warn\">Not listed yet</span> Your offer goes on public listings once a miner is connected.</p></section>"
+                } else {
+                    "<section class=\"card\"><p><span class=\"pill warn\">Not listed yet</span> Your offer goes on public listings once a miner is connected and the address hashtakers use is set.</p></section>"
+                }),
             }
         }
         self.html_page("Sell hashrate", "Sell hashrate", ctx, &b, "")

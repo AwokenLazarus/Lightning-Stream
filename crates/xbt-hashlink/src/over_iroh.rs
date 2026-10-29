@@ -54,7 +54,7 @@ fn loopback(listen: &str) -> io::Result<SocketAddr> {
 
 /// A hashmaker's link: serves hashtakers' streams into its own link listener at `link_listen`.
 pub fn serve(hashmaker: &SecretKey, relays: Relays, link_listen: &str) -> io::Result<Arc<Link>> {
-    let link = Link::start_alpn(link_secret(hashmaker), Options { relays, serving: true, private: false }, xbt_iroh_link::ALPN_HASHLINK)?;
+    let link = Link::start_alpn(link_secret(hashmaker), Options { relays, serving: true, private: false, lookup: None }, xbt_iroh_link::ALPN_HASHLINK)?;
     link.serve(loopback(link_listen)?);
     Ok(link)
 }
@@ -78,7 +78,7 @@ impl Dialer {
     pub fn start(relays: Relays) -> io::Result<Dialer> {
         let mut secret = [0u8; 32];
         getrandom::getrandom(&mut secret).map_err(|e| io::Error::other(e.to_string()))?;
-        Ok(Dialer { link: Link::start_alpn(secret, Options { relays, serving: false, private: false }, xbt_iroh_link::ALPN_HASHLINK)? })
+        Ok(Dialer { link: Link::start_alpn(secret, Options { relays, serving: false, private: false, lookup: None }, xbt_iroh_link::ALPN_HASHLINK)? })
     }
 
     /// A hashtaker's link that never takes a direct path: relays only. Neither end learns the
@@ -86,7 +86,7 @@ impl Dialer {
     pub fn start_private(relays: Relays) -> io::Result<Dialer> {
         let mut secret = [0u8; 32];
         getrandom::getrandom(&mut secret).map_err(|e| io::Error::other(e.to_string()))?;
-        Ok(Dialer { link: Link::start_alpn(secret, Options { relays, serving: false, private: true }, xbt_iroh_link::ALPN_HASHLINK)? })
+        Ok(Dialer { link: Link::start_alpn(secret, Options { relays, serving: false, private: true, lookup: None }, xbt_iroh_link::ALPN_HASHLINK)? })
     }
 
     /// A loopback address that leads to the hashmaker this listing names: give it to the hashlink
@@ -99,7 +99,7 @@ impl Dialer {
     }
 
     /// Whether the link to this hashmaker runs direct or through a relay now, for display.
-    pub fn path(&self, iroh: &IrohLink) -> Option<String> {
+    pub fn path(&self, iroh: &IrohLink) -> Option<xbt_iroh_link::Path> {
         self.link.path(&iroh.id)
     }
 }
