@@ -1,5 +1,6 @@
 //! With private exits, a device's DNS is answered by the buyer's own resolver over DNS-over-TLS
-//! through the tunnel: the question never reaches the exit as DNS.
+//! through the tunnel: the question never reaches the exit as DNS. Where DNS-over-TLS is blocked, the
+//! buyer falls back to DNS-over-HTTPS (HTTP/2), and keeps using it.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket as StdUdp};
@@ -154,4 +155,115 @@ fn a_private_exits_buyer_answers_dns_itself_and_the_exit_never_sees_it() {
     let c = exit_meter.counts();
     assert_eq!(c.dropped, 0, "nothing was sent to the address the phone asked");
     assert!(c.up_bytes > query.len() as u64, "the exit saw TLS, not the question");
+}
+
+/// A DNS-over-HTTPS server for `dot.test` speaking HTTP/2 only, answering POST `/dns-query` with the
+/// question's first byte flipped, counting the questions.
+fn doh_server() -> (SocketAddr, rustls::RootCertStore, Arc<AtomicUsize>) {
+    let ck = rcgen::generate_simple_self_signed(vec!["dot.test".into()]).unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ck.cert.der().clone()).unwrap();
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(ck.signing_key.serialize_der().into());
+    let mut cfg = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![ck.cert.der().clone()], key)
+        .unwrap();
+    // HTTP/2 only, like a resolver that refuses HTTP/1.1
+    cfg.alpn_protocols = vec![b"h2".to_vec()];
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(cfg));
+    let l = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    l.set_nonblocking(true).unwrap();
+    let port = l.local_addr().unwrap().port();
+    let count = Arc::new(AtomicUsize::new(0));
+    let c2 = count.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let l = tokio::net::TcpListener::from_std(l).unwrap();
+            while let Ok((tcp, _)) = l.accept().await {
+                let (acceptor, c2) = (acceptor.clone(), c2.clone());
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(tcp).await else { return };
+                    let Ok(mut h2c) = h2::server::handshake(tls).await else { return };
+                    while let Some(Ok((req, mut respond))) = h2c.accept().await {
+                        let ok = req.method() == http::Method::POST && req.uri().path() == "/dns-query";
+                        let mut body = req.into_body();
+                        let mut q = Vec::new();
+                        while let Some(Ok(chunk)) = body.data().await {
+                            let _ = body.flow_control().release_capacity(chunk.len());
+                            q.extend_from_slice(&chunk);
+                        }
+                        if !ok || q.len() < 12 {
+                            let _ = respond.send_response(http::Response::builder().status(400).body(()).unwrap(), true);
+                            continue;
+                        }
+                        c2.fetch_add(1, Ordering::SeqCst);
+                        q[0] ^= 0xff;
+                        let resp = http::Response::builder().status(200).header("content-type", "application/dns-message").body(()).unwrap();
+                        if let Ok(mut send) = respond.send_response(resp, false) {
+                            let _ = send.send_data(Bytes::from(q), true);
+                        }
+                    }
+                });
+            }
+        });
+    });
+    (SocketAddr::new(lan_ip(), port), roots, count)
+}
+
+/// An address on this machine where nothing listens: DNS-over-TLS "blocked" (refused at once).
+fn closed_port() -> SocketAddr {
+    let l = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    drop(l);
+    SocketAddr::new(lan_ip(), port)
+}
+
+#[test]
+fn where_dns_over_tls_is_blocked_the_buyer_asks_over_https_and_keeps_doing_so() {
+    let (doh, roots, asked) = doh_server();
+    let opts = |serving| Options { relays: Relays::None, serving, private: false, lookup: None };
+    let exit = Link::start_alpn([152; 32], opts(true), ALPN_VPN).unwrap();
+    let cfg = Arc::new(ExitConfig { policy: Policy { allow_non_public: true, ..Policy::default() }, ..ExitConfig::default() });
+    let m = Arc::new(Meter::default());
+    exit.accept_with(move |conn| serve_buyer(conn, cfg.clone(), m.clone()));
+    let buyer_link = Link::start_alpn([153; 32], opts(false), ALPN_VPN).unwrap();
+    let id = exit.endpoint_id();
+    let direct = exit.hints(Duration::from_secs(1)).direct.into_iter().filter(|a| a.is_ipv4()).collect();
+    buyer_link.learn(&id, Hints { relays: vec![], direct }).unwrap();
+    let mut router = Router::new(Mode::Best, None);
+    router.upsert(ExitInfo { id, region: "XX".into(), price_msat_per_gb: 2000, healthy: true, ..ExitInfo::default() });
+    let phone: IpAddr = Ipv4Addr::new(10, 66, 0, 2).into();
+    let dev = Arc::new(Device { name: "phone".into(), meter: Meter::default(), limit_bytes: None, requirements: None });
+    // DNS-over-TLS goes to a port nothing answers on; DNS-over-HTTPS to the test server
+    let dns = EncryptedDns::with_roots(closed_port(), "dot.test", roots).unwrap().with_https(doh, "/dns-query");
+    let buyer = Buyer::new(buyer_link.clone(), router, HashMap::from([(phone, dev)]), Some(dns));
+    let rt = buyer_link.runtime();
+    let (to_stack, from_devices) = mpsc::channel::<Bytes>(64);
+    let (to_devices, mut from_stack) = mpsc::unbounded_channel::<Bytes>();
+    rt.spawn(buyer.run(from_devices, to_devices));
+
+    let asked_resolver: SocketAddr = "203.0.113.53:53".parse().unwrap();
+    let mut ask = |id: u8, port: u16| {
+        let query = [id, 0xcd, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 3, b'w', b'w', b'w', 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0, 0, 1, 0, 1];
+        let src = SocketAddr::new(phone, port);
+        let start = std::time::Instant::now();
+        let answer = rt.block_on(async {
+            to_stack.send(Bytes::from(udp_packet(src, asked_resolver, &query))).await.unwrap();
+            let p = tokio::time::timeout(Duration::from_secs(20), from_stack.recv()).await.expect("an answer").unwrap();
+            let ihl = usize::from(p[0] & 0x0f) * 4;
+            p[ihl + 8..].to_vec()
+        });
+        assert_eq!(answer[0], query[0] ^ 0xff, "answered by the resolver over HTTPS");
+        assert_eq!(&answer[1..], &query[1..]);
+        start.elapsed()
+    };
+    let first = ask(0xab, 51000);
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+    // once DNS-over-TLS has failed, later questions go straight to HTTPS: no wait on TLS first
+    let second = ask(0xac, 51001);
+    assert_eq!(asked.load(Ordering::SeqCst), 2);
+    assert!(second < Duration::from_secs(3), "the second question did not wait on DNS-over-TLS ({second:?}, first {first:?})");
 }

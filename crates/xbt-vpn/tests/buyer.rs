@@ -18,12 +18,13 @@ use smoltcp::time::Instant as SInstant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
-use xbt_iroh_link::{Hints, Link, Options, Relays, ALPN_VPN};
+use xbt_iroh_link::{Hints, Link, Options, Relays, ALPN_VPN, ALPN_VPN_HOP, ALPN_VPN_SEALED};
 use xbt_vpn::buyer::{Buyer, Device as BuyerDevice};
 use xbt_vpn::exit::{serve_buyer, ExitConfig};
+use xbt_vpn::hop::{serve_hop, serve_sealed, HopConfig, SealedBuyers};
 use xbt_vpn::filter::Policy;
 use xbt_vpn::meter::Meter;
-use xbt_vpn::router::{ExitInfo, Mode, Requirements, Router};
+use xbt_vpn::router::{ExitInfo, FirstHop, Mode, Requirements, Router};
 use xbt_vpn::wg::{keypair, WgEndpoint, WgPeer};
 
 fn lan_ip() -> IpAddr {
@@ -315,4 +316,70 @@ fn when_every_qualifying_exit_is_gone_the_device_is_told_why() {
     let why = s.rt.block_on(s.buyer.why_blocked(IpAddr::V4(PHONE_IP)));
     assert_eq!(why.as_deref(), Some("The exit that meets these rules isn't answering right now. Stream keeps trying it."));
     assert!(t.elapsed() < Duration::from_secs(14));
+}
+
+/// A phone whose policy asks for two hops: its WireGuard flows go through the buyer's stack, sealed
+/// for an exit and carried by a first hop run by another operator. Returns the setup and what the exit
+/// saw connect to it.
+fn setup_two_hop(seed: u8) -> (Setup, Arc<std::sync::Mutex<Vec<String>>>, String) {
+    let opts = |serving| Options { relays: Relays::None, serving, private: false, lookup: None };
+    let exit_secret = [seed; 32];
+    let exit = Link::start_alpns(exit_secret, opts(true), ALPN_VPN, &[ALPN_VPN, ALPN_VPN_SEALED]).unwrap();
+    let hop = Link::start_alpns([seed + 1; 32], opts(true), ALPN_VPN_HOP, &[ALPN_VPN_HOP]).unwrap();
+    let buyer_link = Link::start_alpn([seed + 2; 32], opts(false), ALPN_VPN).unwrap();
+    let exit_meter = Arc::new(Meter::default());
+    let exit_saw = Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let cfg = Arc::new(ExitConfig { policy: Policy { allow_non_public: true, ..Policy::default() }, ..ExitConfig::default() });
+        let (m, b, saw, tls) = (exit_meter.clone(), Arc::new(SealedBuyers::default()), exit_saw.clone(), xbt_vpn::sealed::exit_config(&exit_secret));
+        exit.accept_with(move |conn| {
+            saw.lock().unwrap().push(hex::encode(conn.remote_id().as_bytes()));
+            let (cfg, m, b, tls) = (cfg.clone(), m.clone(), b.clone(), tls.clone());
+            async move {
+                if conn.alpn() == ALPN_VPN_SEALED {
+                    serve_sealed(conn, cfg, m, tls, b).await
+                } else {
+                    serve_buyer(conn, cfg, m).await
+                }
+            }
+        });
+    }
+    {
+        let (h, cfg) = (hop.clone(), Arc::new(HopConfig::default()));
+        hop.accept_with(move |conn| serve_hop(h.clone(), conn, cfg.clone(), Arc::new(Meter::default())));
+    }
+    let (exit_id, hop_id) = (exit.endpoint_id(), hop.endpoint_id());
+    let direct = |l: &Link| Hints { relays: vec![], direct: l.hints(Duration::from_secs(1)).direct.into_iter().filter(|a| a.is_ipv4()).collect() };
+    hop.learn(&exit_id, direct(&exit)).unwrap();
+    buyer_link.learn(&hop_id, direct(&hop)).unwrap();
+    let mut router = Router::with_requirements(Requirements { two_hop: true, ..Requirements::default() });
+    router.upsert(ExitInfo { id: exit_id.clone(), operator: "op-exit".into(), region: "XX".into(), price_msat_per_gb: 2000, healthy: true, two_hop: true, ..ExitInfo::default() });
+    router.set_first_hops(vec![FirstHop { id: hop_id.clone(), operator: "op-hop".into() }]);
+    let (phone_private, phone_public) = keypair();
+    let (endpoint_private, endpoint_public) = keypair();
+    let dev = Arc::new(BuyerDevice { name: "phone".into(), meter: Meter::default(), limit_bytes: None, requirements: None });
+    let buyer = Buyer::new(buyer_link.clone(), router, HashMap::from([(IpAddr::V4(PHONE_IP), dev)]), None);
+    let wg = WgEndpoint::new(endpoint_private, &[WgPeer { public: phone_public, tunnel_ip: PHONE_IP }]);
+    let rt = buyer_link.runtime();
+    let (to_stack, from_devices) = mpsc::channel::<Bytes>(4096);
+    let (to_devices, from_stack) = mpsc::unbounded_channel::<Bytes>();
+    let sock = rt.block_on(UdpSocket::bind("127.0.0.1:0")).unwrap();
+    let wg_addr = sock.local_addr().unwrap();
+    rt.spawn(buyer.clone().run(from_devices, to_devices));
+    rt.spawn(wg.run(sock, to_stack, from_stack));
+    let s = Setup { _links: vec![exit, hop, buyer_link], exit_id: Some(exit_id), buyer, exit_meter, wg_addr, endpoint_public, phone_private, rt };
+    (s, exit_saw, hop_id)
+}
+
+#[test]
+fn a_phones_flow_takes_two_hops_and_the_exit_never_sees_the_buyer() {
+    let n = 2 << 20;
+    let to = tcp_server(n);
+    let (s, exit_saw, hop_id) = setup_two_hop(200);
+    let got = s.rt.block_on(phone_download_until(&s, to, Duration::from_secs(30), n));
+    assert_eq!(got, n, "every byte arrived through the first hop and the exit");
+    assert_eq!(s.exit_meter.counts().down_bytes, n as u64, "the exit carried and metered it");
+    // the exit was reached only by the first hop's link: the buyer's link never connected to it
+    assert_eq!(*exit_saw.lock().unwrap(), vec![hop_id]);
+    assert_eq!(s.rt.block_on(s.buyer.why_blocked(IpAddr::V4(PHONE_IP))), None);
 }
