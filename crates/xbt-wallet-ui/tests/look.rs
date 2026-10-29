@@ -133,7 +133,8 @@ fn the_look_in_headless_chrome() {
     let pages = json!([["home", "/"], ["browse", "/browse"], ["browse-ai", "/browse?cat=ai"],
         ["service-ai", format!("/service?seller={}&name={}", enc("https://box.example"), enc("Local model"))],
         ["service-media", format!("/service?seller={}&name={}", enc("https://media.example"), enc("Creative Commons films"))],
-        ["player", play.clone()], ["live", "/connections"], ["sellers", "/services"], ["sell", "/sell"], ["wallet", "/wallet"],
+        ["player", play.clone()], ["live", "/connections"], ["sellers", "/services"], ["sellers-shop-key", format!("/services#key-{}", xbt402::shop::display(&home_shop))],
+        ["sell", "/sell"], ["sell-reach", "/sell#shop-reach"], ["wallet", "/wallet"],
         ["setup", "/setup"], ["apps", "/apps"], ["agents", "/agents"], ["rules", "/policy"]]).to_string();
     let secs = std::env::var("XBT_UI_LOOK_SECONDS").unwrap_or_else(|_| "30".into());
     let o = std::process::Command::new(node).env("CHROME", chrome)

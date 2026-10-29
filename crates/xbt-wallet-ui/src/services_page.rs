@@ -96,7 +96,9 @@ impl App {
                     } else {
                         esc(&origin)
                     };
-                    b.push_str(&format!("<section class=\"card seller\"><h3>{}</h3><p class=\"small\">{shown}</p><ul class=\"offers\">",
+                    // a shop known by its key can be linked to on this page, by that key
+                    let anchor = if xbt402::shop::is_shop(&origin) { format!(" id=\"key-{}\"", esc(&xbt402::shop::display(&origin))) } else { String::new() };
+                    b.push_str(&format!("<section class=\"card seller\"{anchor}><h3>{}</h3><p class=\"small\">{shown}</p><ul class=\"offers\">",
                                         esc(&list[0].name)));
                     for s in &list {
                         let n = s.items.len();

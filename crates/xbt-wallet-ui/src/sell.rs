@@ -864,7 +864,7 @@ impl App {
         b.push_str(&format!("<section class=\"card\"><h2>{}Your shop</h2><form method=\"post\" action=\"./sell\">{csrf}\
             <input type=\"hidden\" name=\"action\" value=\"shop\">\
             <label>Shop name, as buyers see it<input name=\"name\" value=\"{}\" maxlength=\"200\" placeholder=\"My shop\"></label>\
-            <fieldset class=\"reach\"><legend>How buyers reach you</legend>\
+            <fieldset class=\"reach\" id=\"shop-reach\"><legend>How buyers reach you</legend>\
             <label class=\"check\"><input type=\"radio\" name=\"reach\" value=\"direct\"{}> <span><strong>Directly, through the app</strong> (recommended)<br>\
             <span class=\"hint\">No web address, no certificate, no port forward. Buyers find you by your shop key.</span></span></label>\
             <label class=\"check\"><input type=\"checkbox\" name=\"private\" value=\"1\"{}> <span>Private: always go through a relay, so buyers never see \
