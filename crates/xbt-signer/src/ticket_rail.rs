@@ -2474,8 +2474,11 @@ impl Signer {
         st.commit(&[s.row()])
     }
 
-    /// The session was used now: it is not idle.
-    pub(crate) fn lottery_touch(&self, sid: &str) {
+    /// The session was used now: it is not idle. Called for every paid request, credit-only ones
+    /// included, and every [`TOUCH_EVERY_S`] while an answer streams, so that a session living on
+    /// its credit is never taken for idle ([`SESSION_IDLE_S`] counts from its last use, not its last
+    /// ticket). Written to the book at most every 30 s.
+    pub(crate) fn session_touch(&self, sid: &str) {
         let now = self.engine.now();
         let _ = (|| -> Result<()> {
             let mut g = self.ticket_store()?;
@@ -2487,7 +2490,15 @@ impl Signer {
             Ok(())
         })();
     }
+
+    /// [`Signer::session_touch`], for a session of draws.
+    pub(crate) fn lottery_touch(&self, sid: &str) {
+        self.session_touch(sid);
+    }
 }
+
+/// How often a streaming answer marks its session as used.
+pub(crate) const TOUCH_EVERY_S: u64 = 30;
 
 /// Why a failed ticket failed, for the counts: `never_sent` (a hash offered that no payment ever
 /// left for: refused by the seller, withdrawn, or dropped when its session ended),

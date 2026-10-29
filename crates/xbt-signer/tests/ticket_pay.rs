@@ -4288,3 +4288,45 @@ fn a_seller_that_never_reveals_does_not_keep_the_call_open() {
     assert_eq!((v["rail"].as_str(), v["wins_paid"].as_u64()), (Some("lottery"), Some(0)), "{v}");
     assert!(v["ended"].as_str().is_some_and(|e| e.contains("reveal")), "{v}");
 }
+
+// --- a session that lives on its credit (found on mainnet: a busy session was taken for idle) ------
+
+/// A session paid only from the credit of one prepaid ticket, one small request every 30 s for 30
+/// minutes, is never taken for idle: idle counts from its last request, not its last ticket. The
+/// one ticket pays for the whole half hour.
+#[test]
+fn a_session_living_on_its_credit_for_half_an_hour_is_never_taken_for_idle() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, json!({"tickets": {"settle": ["on-arrival"]}, "caps": {"sessions_per_address": 0}}));
+    let first = r.pay("/page/1", CALL);
+    assert_eq!((first["status"].as_u64(), first["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{first}");
+    let sid = first["session"].as_str().unwrap().to_string();
+    for i in 0..60 {
+        r.clock.fetch_add(30, Ordering::SeqCst);
+        let acts = r.tick();
+        assert!(acts["actions"].as_array().unwrap().iter().all(|a| a.get("ticket_idle_stop").is_none()), "minute {}: {acts}", i / 2);
+        let v = r.pay("/page/1", CALL);
+        assert_eq!((v["status"].as_u64(), v["session"].as_str(), v["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), Some(sid.as_str()), 0),
+                   "minute {}: the session kept, on its credit: {v}", i / 2);
+    }
+    assert_eq!(r.session(&sid)["sessions"][0]["state"], "open");
+}
+
+/// When a session does stop for idleness, the credit it left with the seller pays the next call:
+/// no new ticket is bought while the seller still holds the wallet's balance.
+#[test]
+fn the_credit_an_idle_session_left_with_its_seller_pays_the_next_call() {
+    let _g = env_lock();
+    let r = Rig::shipped(json!({}), 30, json!({"tickets": {"settle": ["on-arrival"]}, "caps": {"sessions_per_address": 0}}));
+    let first = r.pay("/page/1", CALL);
+    assert_eq!((first["status"].as_u64(), first["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "{first}");
+    // nothing at all for 11 minutes: the session is stopped, with credit left at the seller
+    r.clock.fetch_add(660, Ordering::SeqCst);
+    r.tick();
+    r.tick();
+    let st = r.session(first["session"].as_str().unwrap());
+    assert_ne!(st["sessions"][0]["state"], "open", "{st}");
+    let v = r.pay("/page/1", CALL);
+    assert_eq!((v["status"].as_u64(), v["tickets_prepaid"].as_u64().unwrap_or(0)), (Some(200), 0), "paid from the credit left behind: {v}");
+    assert!(!r.audit("ticket_resumed").is_empty(), "the old balance was taken over");
+}
