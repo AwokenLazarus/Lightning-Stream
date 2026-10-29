@@ -21,6 +21,9 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   and can be revoked. The app picks the cheapest seller that answers, moves to the next one if a
   seller fails before it answers (never paying twice for one answer), and you can prefer or block
   sellers. On Linux the address is local to the machine unless you open it to your network.
+- A seller's list of AI models is free to read, so the AI address finds sellers' models by itself.
+  Sellers need this release for their models to be listed. Preferring or blocking a seller applies
+  at once, and a key at its limit says what the request may cost and what the key has left.
 - Known limit: a very long answer can pause briefly while the next ticket is bought.
 
 **Hashrate**
