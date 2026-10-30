@@ -273,7 +273,10 @@ impl App {
         let own = e["own_blocklist"].as_array().into_iter().flatten().filter_map(|d| d.as_str()).collect::<Vec<_>>().join("\n");
         let carried = if on {
             let gb = (st["up_bytes"].as_u64().unwrap_or(0) + st["down_bytes"].as_u64().unwrap_or(0)) as f64 / 1e9;
-            let unlisted = st["not_announced_because"].as_str().map(|w| format!("<p class=\"hint warn\">Your exit isn't listed yet: {}.</p>", esc(w))).unwrap_or_default();
+            let mut unlisted = st["not_announced_because"].as_str().map(|w| format!("<p class=\"hint warn\">Your exit isn't listed yet: {}.</p>", esc(w))).unwrap_or_default();
+            if let Some(w) = st["paid_tunnels_closed_because"].as_str() {
+                unlisted.push_str(&format!("<p class=\"hint warn\">Buyers can't use your exit yet: {}.</p>", esc(w)));
+            }
             format!("<p>Carried for buyers so far: {gb:.2} GB. Earned: {} sats.</p>{unlisted}", st["earned_msat"].as_u64().unwrap_or(0) / 1000)
         } else {
             String::new()
@@ -384,16 +387,17 @@ impl App {
 /// The path a shop sells its VPN exit under.
 pub const VPN_PATH: &str = "/vpn/";
 
-/// The secret the shop's gateway and the exit's tunnel endpoint share, made once (owner-only).
+/// The secret the shop's gateway and the exit's tunnel endpoint share, made once. Written as the
+/// other files the VPN service reads ([`crate::setup::write_shared`]): whole or not at all, with the
+/// folder's group (the VPN service's) and mode 0640, so the service can read it and nobody else.
+/// A file that holds no whole secret (cut short, or garbled) is replaced.
 fn tunnel_secret(dir: &std::path::Path) -> Option<String> {
     if let Some(s) = xbt_vpn::paid::tunnel_secret_in(dir) {
         return Some(s);
     }
     let secret = xbt_vpn::paid::new_tunnel_secret();
-    let path = dir.join(xbt_vpn::paid::TUNNEL_SECRET_FILE);
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path).ok()?;
-    std::io::Write::write_all(&mut f, secret.as_bytes()).ok()?;
+    std::fs::create_dir_all(dir).ok()?;
+    crate::setup::write_shared(dir, xbt_vpn::paid::TUNNEL_SECRET_FILE, secret.as_bytes()).ok()?;
     Some(secret)
 }
 
@@ -429,7 +433,23 @@ mod tests {
         let first = tunnel_secret(d.path()).unwrap();
         assert_eq!(first.len(), 64);
         assert_eq!(tunnel_secret(d.path()).as_deref(), Some(first.as_str()), "the same secret every time the route is written");
-        let mode = std::fs::metadata(d.path().join(xbt_vpn::paid::TUNNEL_SECRET_FILE)).unwrap().permissions().mode();
-        assert_eq!(mode & 0o077, 0, "only its owner reads it");
+        let md = std::fs::metadata(d.path().join(xbt_vpn::paid::TUNNEL_SECRET_FILE)).unwrap();
+        assert_eq!(md.permissions().mode() & 0o777, 0o640, "its owner and the folder's group (the VPN service's) read it, nobody else");
+    }
+
+    /// The VPN service reads the secret by the folder's group: the file takes that group, so the
+    /// service (another user) can read it. One that holds no whole secret is replaced, whole.
+    #[test]
+    fn the_tunnel_secret_takes_the_folders_group_and_a_bad_one_is_replaced() {
+        use std::os::unix::fs::MetadataExt;
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join(xbt_vpn::paid::TUNNEL_SECRET_FILE);
+        std::fs::write(&path, "0123abcd").unwrap();
+        let s = tunnel_secret(d.path()).unwrap();
+        assert!(xbt_vpn::paid::is_tunnel_secret(&s), "{s}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), s, "the short file was replaced");
+        assert_eq!(std::fs::metadata(&path).unwrap().gid(), std::fs::metadata(d.path()).unwrap().gid(), "the folder's group");
+        let leftovers: Vec<_> = std::fs::read_dir(d.path()).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().starts_with('.')).collect();
+        assert!(leftovers.is_empty(), "no half-written file left behind");
     }
 }

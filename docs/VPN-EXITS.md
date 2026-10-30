@@ -130,6 +130,12 @@ link, as its licence asks. No lookup about an exit or a buyer leaves the box. If
 (`--home-country` / `XBT_VPN_HOME_COUNTRY`), a round trip faster than the distance to the claimed
 country allows is caught too; the app never looks the owner's country up from the network. An exit
 whose region does not check out is not offered for that region, and is checked again every 6 hours.
+A **priced** exit's region is read through a paid tunnel, so it is checked only when a device's own
+rules ask for that region and would otherwise take it, and under one budget
+(`xbt_vpn::holds::CheckGate`): 100 sats a day for all such checks together (each held to 20 sats), one
+check of an exit a day, none more that day for an operator (the exit's Nostr key) whose checks failed
+twice, and the exits seen longest first, so a crowd of new announcements can't spend the budget or
+push the others out.
 Until the table has loaded, no region is verified, and a device whose rules name a country is told
 no exit qualifies rather than sent to one that may be elsewhere. Each exit's result is in
 `status.json` (`exits`), in plain words, and on the VPN page.
@@ -172,6 +178,14 @@ approval threshold) apply.
   (`https://<shop>/vpn/tunnel`, the announcement's `tunnel` tag). A priced exit carries no flows over
   its link, so nothing reaches it unpaid; two hops (which reach an exit over the link) are for free
   exits only.
+- **Only the gateway is let in.** The tunnel endpoint listens where other apps on the box's network
+  could reach it, so the gateway and the endpoint share a secret: `tunnel.secret` beside the exit's
+  settings, 32 random bytes in hex, which the wallet app writes with the route (whole or not at all,
+  with the folder's group, the VPN service's, and mode 0640) and the gateway sends in
+  `X-Stream-Tunnel`. The endpoint reads the file again for each tunnel and compares by digest. Until
+  there is a whole one (none yet, or a short or garbled file) it lets **nobody** in (503): it fails
+  closed. A priced exit without one is not announced, and the Sell page says why
+  (`exit-status.json`, `paid_tunnels_closed_because`); the service starts again when the file appears.
 - **The buyer's side.** For each device and priced exit, the buyer's VPN service asks the owner's
   wallet to open the tunnel: the signer's `xbt402_pay` with `upgrade` and `stream_to`, the call a web
   app's WebSocket makes (`xbt_vpn::paid`). The wallet pays as the tunnel's bytes pass, under the
@@ -219,15 +233,35 @@ released, come from final receipts and `status`, as for any answer), and also:
    only for bytes it has counted). Over either, it is a seller fault.
 4. **The price shown:** the wallet opens the tunnel only if the shop's terms are within the price
    the exit announced (`price_ceiling`: its price a GB, and nothing per request); an exit asking
-   more is paid nothing and not used for a day.
+   more is paid nothing and not used for a day, nor are its operator's other exits, unless it
+   announces a higher price first (an honest exit raising its price). Announcing the same price or
+   less doesn't end the hold.
 5. **Liveness:** once a seller has sent one, bytes that keep flowing (2 MiB or more) with no newer
-   one (a `status` that fails or can't be taken counts as none) for 30 s (`B2_INTERIM_STALE_MS`) are a seller fault too. A seller that never sends any (one
-   from before interim receipts) is held to the rules every answer has: its spend never passes what
-   was released.
+   one for 30 s (`B2_INTERIM_STALE_MS`) are a seller fault too, once the seller has had its say: two
+   `status` answers in a row with nothing newer, or `status` failing (no answer, or none the wallet
+   can take) for three times as long. A slow or lossy link to an honest seller is not taken for one
+   that stopped counting, and a seller that answers only errors is still caught. (A `status` call
+   still holds the session's `order` lock where the seller's `seqWindow` is 1, so a slow one delays
+   the session's next request; it never stalls the tunnel's paying, which runs on its own thread.)
+   A seller that never sends any (one from before interim receipts) is held to the rules every
+   answer has: its spend never passes what was released.
 
-A seller fault ends the call, and the session takes no more releases (the rule the web-app work
-already applies); the receipt goes into the wallet's audit log as evidence (`ticket_interim_fault`).
-The final receipt then closes the call as any answer's does.
+A seller fault ends the call at once, the socket both ways, quiet or not, so the buyer's VPN fails
+over to another exit; the session takes no more releases (the rule the web-app work already
+applies); the receipt goes into the wallet's audit log as evidence (`ticket_interim_fault`). The
+final receipt then closes the call as any answer's does.
+
+### Exits that waste a buyer's money
+
+Each paid tunnel pays its opening, so the buyer holds off exits that would make it pay for nothing
+(`xbt_vpn::holds::Holds`), by exit and by **operator**, since exit ids cost nothing to make:
+- a tunnel that ends within 10 s having carried under 16 KiB died young: its exit is held off for
+  30 s, doubling to an hour, and an operator with three such exits in a day is held off as a whole.
+  A tunnel that served well (lived longer, or carried more) starts its exit's doubling again;
+- an exit asking more than it announced is held off for a day, with its operator (above);
+- at most 48 paid tunnels are opened to one exit in a day;
+- every hold and the daily count are asked again once a tunnel's turn to open comes, not only
+  before it waits.
 
 ### Fitting the concurrent-session ceiling
 

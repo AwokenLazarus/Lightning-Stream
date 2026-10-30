@@ -506,7 +506,8 @@ fn fake_wallet_with(exit_at: SocketAddr, cut_after: Option<u64>, die_at_once: bo
                 a.lock().unwrap().push(p.clone());
                 assert_eq!(p["upgrade"], true, "{p}");
                 let mut up = std::net::TcpStream::connect(exit_at).unwrap();
-                up.write_all(b"GET /vpn/tunnel HTTP/1.1\r\nHost: shop\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n").unwrap();
+                // as the shop's gateway joins it: with the secret the two share
+                up.write_all(format!("GET /vpn/tunnel HTTP/1.1\r\nHost: shop\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n{}: {TUNNEL_TEST_SECRET}\r\n\r\n", xbt_vpn::paid::TUNNEL_HEADER).as_bytes()).unwrap();
                 let mut head = Vec::new();
                 let mut b = [0u8; 1];
                 while !head.ends_with(b"\r\n\r\n") {
@@ -569,13 +570,60 @@ fn fake_wallet_with(exit_at: SocketAddr, cut_after: Option<u64>, die_at_once: bo
     FakeWallet { wallet, opened, carried, asked, _dir: dir }
 }
 
+/// The secret a test exit and its (fake) shop gateway share.
+const TUNNEL_TEST_SECRET: &str = "5ec7e75ec7e75ec7e75ec7e75ec7e75ec7e75ec7e75ec7e75ec7e75ec7e75ec7";
+
 /// A priced exit's tunnel endpoint, as its shop's gateway would reach it.
 fn paid_exit(rt: &tokio::runtime::Handle, meter: Arc<Meter>) -> SocketAddr {
     let cfg = Arc::new(ExitConfig { policy: Policy { allow_non_public: true, ..Policy::default() }, ..ExitConfig::default() });
     let l = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
     let at = l.local_addr().unwrap();
-    rt.spawn(xbt_vpn::paid::serve_tunnel_endpoint(l, None, move |c| xbt_vpn::exit::serve(c, cfg.clone(), meter.clone())));
+    rt.spawn(xbt_vpn::paid::serve_tunnel_endpoint(l, || Some(TUNNEL_TEST_SECRET.to_string()), move |c| xbt_vpn::exit::serve(c, cfg.clone(), meter.clone())));
     at
+}
+
+/// A wallet that refuses every tunnel as the exit's terms are above its announced price, counting
+/// how often it was asked.
+fn refusing_wallet() -> (xbt_vpn::paid::Wallet, Arc<std::sync::atomic::AtomicUsize>, tempdir_lite::Dir) {
+    use std::io::{BufRead, Write};
+    let dir = tempdir_lite::Dir::new("refusing");
+    let (sock, streams) = (dir.0.join("signer.sock"), dir.0.join("streams"));
+    std::fs::create_dir_all(&streams).unwrap();
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let a = asked.clone();
+    std::thread::spawn(move || {
+        for conn in l.incoming().flatten() {
+            a.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut line = String::new();
+            let _ = std::io::BufReader::new(conn.try_clone().unwrap()).read_line(&mut line);
+            let mut conn = conn;
+            let _ = conn.write_all(b"{\"id\":1,\"result\":{\"verdict\":\"deny\",\"rule\":\"price_ceiling\",\"reason\":\"the seller asks more than the price it was shown\"}}\n");
+        }
+    });
+    (xbt_vpn::paid::Wallet { signer: sock, stream_dir: streams, task: "vpn".into(), max_sats: 10_000 }, asked, dir)
+}
+
+#[test]
+fn an_exit_that_asked_more_than_it_announced_is_used_again_only_once_it_announces_more() {
+    let to = tcp_server(64 << 10);
+    let s = setup(118, false, None);
+    let (w, asked, _d) = refusing_wallet();
+    s.buyer.set_wallet(Some(w));
+    s.buyer.set_tunnel("paid-exit", Some("http://127.0.0.1:9/vpn/tunnel".into()), 2_000_000, "op");
+    s.rt.block_on(s.buyer.upsert_exit(priced("paid-exit")));
+    let _ = s.rt.block_on(phone_download(&s, to, Duration::from_secs(3)));
+    assert!(s.buyer.is_held_off("paid-exit"), "terms above its announcement: held off");
+    let n = asked.load(std::sync::atomic::Ordering::SeqCst);
+    // announcing the same price again (or less) doesn't end the hold: that is the bait
+    s.buyer.set_tunnel("paid-exit", Some("http://127.0.0.1:9/vpn/tunnel".into()), 2_000_000, "op");
+    s.buyer.set_tunnel("paid-exit", Some("http://127.0.0.1:9/vpn/tunnel".into()), 1_000_000, "op");
+    assert!(s.buyer.is_held_off("paid-exit"));
+    let _ = s.rt.block_on(phone_download(&s, to, Duration::from_secs(2)));
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), n, "a held exit isn't asked (or paid) again");
+    // an honest exit raising its price: used again
+    s.buyer.set_tunnel("paid-exit", Some("http://127.0.0.1:9/vpn/tunnel".into()), 3_000_000, "op");
+    assert!(!s.buyer.is_held_off("paid-exit"), "it now announces more than it did: used again");
 }
 
 fn priced(id: &str) -> ExitInfo {
@@ -591,7 +639,7 @@ fn a_phone_downloads_through_a_paid_tunnel_its_wallet_opens() {
     let at = paid_exit(&s.rt, meter.clone());
     let w = fake_wallet(at, None);
     s.buyer.set_wallet(Some(w.wallet.clone()));
-    s.buyer.set_tunnel("paid-exit", Some(format!("http://{at}/vpn/tunnel")), 2_000_000);
+    s.buyer.set_tunnel("paid-exit", Some(format!("http://{at}/vpn/tunnel")), 2_000_000, "op");
     s.rt.block_on(s.buyer.upsert_exit(priced("paid-exit")));
     let got = s.rt.block_on(phone_download(&s, to, Duration::from_secs(60)));
     assert_eq!(got, n, "every byte arrived through the tunnel");
@@ -607,7 +655,7 @@ fn a_paid_tunnel_is_paid_no_more_than_the_price_its_exit_announced() {
     let at = paid_exit(&s.rt, Arc::new(Meter::default()));
     let w = fake_wallet(at, None);
     s.buyer.set_wallet(Some(w.wallet.clone()));
-    s.buyer.set_tunnel("paid-exit", Some(format!("http://{at}/vpn/tunnel")), 2_000_000);
+    s.buyer.set_tunnel("paid-exit", Some(format!("http://{at}/vpn/tunnel")), 2_000_000, "op");
     s.rt.block_on(s.buyer.upsert_exit(priced("paid-exit")));
     assert_eq!(s.rt.block_on(phone_download(&s, to, Duration::from_secs(20))), 64 << 10);
     // the wallet is told the announced price: its 402 asking more is paid nothing
@@ -622,7 +670,7 @@ fn a_tunnel_that_dies_as_it_opens_is_not_paid_for_again_and_again() {
     let at = paid_exit(&s.rt, Arc::new(Meter::default()));
     let w = fake_wallet_with(at, None, true);
     s.buyer.set_wallet(Some(w.wallet.clone()));
-    s.buyer.set_tunnel("paid-exit", Some(format!("http://{at}/vpn/tunnel")), 2_000_000);
+    s.buyer.set_tunnel("paid-exit", Some(format!("http://{at}/vpn/tunnel")), 2_000_000, "op");
     s.rt.block_on(s.buyer.upsert_exit(priced("paid-exit")));
     for _ in 0..4 {
         let _ = s.rt.block_on(phone_download(&s, to, Duration::from_secs(3)));
@@ -650,7 +698,7 @@ fn a_paid_tunnel_that_ends_is_opened_again_for_the_next_flow() {
     // the wallet ends the first tunnel part way (its limit, say)
     let w = fake_wallet(at, Some(1 << 20));
     s.buyer.set_wallet(Some(w.wallet.clone()));
-    s.buyer.set_tunnel("paid-exit", Some(format!("http://{at}/vpn/tunnel")), 2_000_000);
+    s.buyer.set_tunnel("paid-exit", Some(format!("http://{at}/vpn/tunnel")), 2_000_000, "op");
     s.rt.block_on(s.buyer.upsert_exit(priced("paid-exit")));
     let first = s.rt.block_on(phone_download(&s, to, Duration::from_secs(20)));
     assert!(first > 0 && first < 4 << 20, "the first download is cut where its tunnel ended: {first}");
@@ -664,7 +712,7 @@ fn a_priced_exit_is_not_used_without_a_wallet_to_pay_it() {
     let to = tcp_server(1 << 20);
     let s = setup(85, false, None);
     let at = paid_exit(&s.rt, Arc::new(Meter::default()));
-    s.buyer.set_tunnel("paid-exit", Some(format!("http://{at}/vpn/tunnel")), 2_000_000);
+    s.buyer.set_tunnel("paid-exit", Some(format!("http://{at}/vpn/tunnel")), 2_000_000, "op");
     s.rt.block_on(s.buyer.upsert_exit(priced("paid-exit")));
     let got = s.rt.block_on(phone_download(&s, to, Duration::from_secs(8)));
     assert_eq!(got, 0, "nothing gets out unpaid");

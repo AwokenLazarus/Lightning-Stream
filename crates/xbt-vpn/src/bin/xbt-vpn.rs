@@ -381,7 +381,9 @@ fn serve(args: &[String], relay: String) -> std::io::Result<()> {
     let mut tunnel_url = arg_or_env(args, "--tunnel-url", &["XBT_VPN_TUNNEL_URL"]);
     let tunnel_listen = arg_or_env(args, "--tunnel-listen", &["XBT_VPN_TUNNEL_LISTEN"]).unwrap_or_else(|| "0.0.0.0:51880".into());
     let (devices_path, exit_path) = (dir.join("devices.json"), dir.join("exit.json"));
-    let started = (mtime(&devices_path), mtime(&exit_path));
+    // the tunnel secret too: a priced exit is announced only once it has one, so its arrival starts it again
+    let secret_path = dir.join(xbt_vpn::paid::TUNNEL_SECRET_FILE);
+    let started = (mtime(&devices_path), mtime(&exit_path), mtime(&secret_path));
 
     // the WireGuard key devices pair with: kept, so devices keep working across restarts
     let wg_secret = service::secret_in(&keys_dir.join("endpoint.key"))?;
@@ -416,12 +418,13 @@ fn serve(args: &[String], relay: String) -> std::io::Result<()> {
         if priced {
             let (cfg, m) = (cfg.clone(), exit_meter.clone());
             let listener = link.runtime().block_on(tokio::net::TcpListener::bind(&tunnel_listen))?;
-            // only the shop's gateway opens tunnels: it carries the secret the wallet app wrote with the route
-            let secret = xbt_vpn::paid::tunnel_secret_in(&dir);
-            if secret.is_none() {
-                eprintln!("no {} in {}: the tunnel endpoint answers anything that reaches it", xbt_vpn::paid::TUNNEL_SECRET_FILE, dir.display());
+            // only the shop's gateway opens tunnels: it carries the secret the wallet app wrote with the
+            // route, read again for each tunnel. Without a whole one, nobody is let in (fails closed)
+            if xbt_vpn::paid::tunnel_secret_in(&dir).is_none() {
+                eprintln!("no whole {} in {}: paid tunnels are refused until the wallet app writes one", xbt_vpn::paid::TUNNEL_SECRET_FILE, dir.display());
             }
-            link.runtime().spawn(xbt_vpn::paid::serve_tunnel_endpoint(listener, secret, move |c| xbt_vpn::exit::serve(c, cfg.clone(), m.clone())));
+            let secret_dir = dir.clone();
+            link.runtime().spawn(xbt_vpn::paid::serve_tunnel_endpoint(listener, move || xbt_vpn::paid::tunnel_secret_in(&secret_dir), move |c| xbt_vpn::exit::serve(c, cfg.clone(), m.clone())));
         }
         let (m, buyers, tls) = (exit_meter.clone(), Arc::new(SealedBuyers::default()), sealed::exit_config(&exit_secret));
         link.accept_with(move |conn| {
@@ -438,7 +441,9 @@ fn serve(args: &[String], relay: String) -> std::io::Result<()> {
             }
         });
         let id = link.endpoint_id();
-        if let (Some(region), false, true) = (&region, nostr.is_empty(), !priced || tunnel_url.is_some()) {
+        // a priced exit is announced only with somewhere to pay it and a secret to let the gateway in
+        let tunnel_ready = !priced || (tunnel_url.is_some() && xbt_vpn::paid::tunnel_secret_in(&dir).is_some());
+        if let (Some(region), false, true) = (&region, nostr.is_empty(), tunnel_ready) {
             let keys = xbt_nostr::event::Keys::from_hex(&hex::encode(service::secret_in(&keys_dir.join("nostr.key"))?)).ok_or_else(|| std::io::Error::other("a Nostr key that is not a key"))?;
             let offer = ExitOffer {
                 exit: id.clone(), region: region.clone(), filtered: settings.filtered, categories: settings.categories.clone(),
@@ -505,17 +510,20 @@ fn serve(args: &[String], relay: String) -> std::io::Result<()> {
         let (buyer, link, nostr, own, relay, rt) = (buyer.clone(), buyer_link.clone(), nostr.clone(), own_exit.clone(), relay.clone(), rt.clone());
         std::thread::spawn(move || {
             let mut checked: HashMap<String, (String, bool, std::time::Instant)> = HashMap::new();
-            // priced exits are paid to have their region checked: a few a round, and only those a
-            // device's own policy asks for by region (see Buyer::region_wanted)
-            const PRICED_CHECKS_PER_ROUND: usize = 3;
+            // priced exits are paid to have their region checked: only those a device's own policy asks
+            // for by region (see Buyer::region_wanted), under one daily budget, one check of an exit a
+            // day, none more for an operator whose checks keep failing, the longest seen first
+            let mut gate = xbt_vpn::holds::CheckGate::default();
             loop {
-                let mut priced_checks = 0;
                 if !nostr.is_empty() {
                     let (events, _) = xbt_nostr::oneshot::query(&nostr, &announce::filter(500), Duration::from_secs(15));
                     let (found, _) = announce::collect(&events, xbt_nostr::now());
                     // a priced exit that names no tunnel can't be paid: not used
-                    for mut a in found.into_iter().filter(|a| Some(&a.exit.id) != own.as_ref() && (a.exit.price_msat_per_gb == 0 || a.tunnel.is_some())) {
-                        buyer.set_tunnel(&a.exit.id, a.tunnel.clone(), a.exit.price_msat_per_gb);
+                    let mut found: Vec<_> = found.into_iter().filter(|a| Some(&a.exit.id) != own.as_ref() && (a.exit.price_msat_per_gb == 0 || a.tunnel.is_some())).collect();
+                    let now = std::time::Instant::now();
+                    found.sort_by_key(|a| gate.seen(&a.exit.id, now));
+                    for mut a in found {
+                        buyer.set_tunnel(&a.exit.id, a.tunnel.clone(), a.exit.price_msat_per_gb, &a.exit.operator);
                         let relays = vec![a.relay.clone().unwrap_or_else(|| relay.clone())];
                         if link.learn(&a.exit.id, Hints { relays, direct: Vec::new() }).is_err() {
                             continue;
@@ -523,10 +531,13 @@ fn serve(args: &[String], relay: String) -> std::io::Result<()> {
                         let region = a.exit.region.clone();
                         let stale = checked.get(&a.exit.id).is_none_or(|(r, _, at)| *r != region || at.elapsed() > Duration::from_secs(6 * 3600));
                         let priced = a.exit.price_msat_per_gb > 0;
-                        let worth = !priced || (buyer.region_wanted(&a.exit) && !buyer.is_held_off(&a.exit.id) && priced_checks < PRICED_CHECKS_PER_ROUND);
+                        let cost = xbt_vpn::buyer::REGION_CHECK_MAX_SATS;
+                        let worth = !priced || (buyer.region_wanted(&a.exit) && !buyer.is_held_off(&a.exit.id) && gate.may(&a.exit.id, &a.exit.operator, cost, std::time::Instant::now()));
                         if stale && region.len() == 2 && worth {
-                            priced_checks += usize::from(priced);
                             let result = rt.block_on(buyer.verify_region(&a.exit.id, &region));
+                            if priced {
+                                gate.record(&a.exit.id, &a.exit.operator, cost, result == xbt_vpn::region::RegionCheck::Verified, std::time::Instant::now());
+                            }
                             if result != xbt_vpn::region::RegionCheck::Verified {
                                 eprintln!("exit {}…: region {region} not verified ({result:?})", &a.exit.id[..12.min(a.exit.id.len())]);
                             }
@@ -569,11 +580,14 @@ fn serve(args: &[String], relay: String) -> std::io::Result<()> {
             Some(id) => serde_json::json!({ "offered": true, "exit": id, "announced": announced, "up_bytes": c.up_bytes, "down_bytes": c.down_bytes, "refused": c.dropped, "blocked": c.blocked,
                 "paid": exit_priced,
                 "not_announced_because": if announced { None } else if exit_region.is_none() { Some("its country isn't set") }
-                    else if exit_priced && tunnel_url.is_none() { Some("the shop's address for paid tunnels isn't set") } else { Some("no Nostr relays are set") } }),
+                    else if exit_priced && tunnel_url.is_none() { Some("the shop's address for paid tunnels isn't set") }
+                    else if exit_priced && xbt_vpn::paid::tunnel_secret_in(&dir).is_none() { Some("the shop hasn't given this exit its tunnel secret yet (open the Sell page's VPN exit and save it)") }
+                    else { Some("no Nostr relays are set") },
+                "paid_tunnels_closed_because": if exit_priced && xbt_vpn::paid::tunnel_secret_in(&dir).is_none() { Some("no tunnel secret from the wallet app: paid tunnels are refused") } else { None } }),
             None => serde_json::json!({ "offered": false }),
         };
         let _ = write_json(&status_dir.join("exit-status.json"), &exit_status);
-        if (mtime(&devices_path), mtime(&exit_path)) != started {
+        if (mtime(&devices_path), mtime(&exit_path), mtime(&secret_path)) != started {
             eprintln!("the settings changed: exiting to start again with them");
             std::process::exit(0);
         }

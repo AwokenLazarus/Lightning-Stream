@@ -171,17 +171,26 @@ pub fn new_tunnel_secret() -> String {
     hex::encode(b)
 }
 
-/// The secret in `dir`'s [`TUNNEL_SECRET_FILE`], if there is one.
+/// Whether `s` is a whole tunnel secret as [`new_tunnel_secret`] makes one: 64 lowercase hex
+/// digits. A short or partial file is not one.
+pub fn is_tunnel_secret(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// The secret in `dir`'s [`TUNNEL_SECRET_FILE`], if there is a whole one.
 pub fn tunnel_secret_in(dir: &std::path::Path) -> Option<String> {
-    std::fs::read_to_string(dir.join(TUNNEL_SECRET_FILE)).ok().map(|s| s.trim().to_string()).filter(|s| s.len() >= 32)
+    std::fs::read_to_string(dir.join(TUNNEL_SECRET_FILE)).ok().map(|s| s.trim().to_string()).filter(|s| is_tunnel_secret(s))
 }
 
 /// The exit's tunnel endpoint: the shop's gateway joins each paid tunnel here. Answers the
 /// WebSocket upgrade the gateway passes on, then serves the buyer's flows on the joined stream
-/// with `serve` (the exit's own [`crate::exit::serve`]). Each tunnel is one buyer's device. With a
-/// `secret`, an upgrade that does not carry it in [`TUNNEL_HEADER`] is refused.
-pub async fn serve_tunnel_endpoint<F, Fut>(listener: tokio::net::TcpListener, secret: Option<String>, serve: F)
+/// with `serve` (the exit's own [`crate::exit::serve`]). Each tunnel is one buyer's device.
+/// `secret` is asked for each upgrade (the file is read again, so a secret written after the
+/// service started, or replaced, holds at once): an upgrade that does not carry it in
+/// [`TUNNEL_HEADER`] is refused, and while there is none every upgrade is (fails closed).
+pub async fn serve_tunnel_endpoint<S, F, Fut>(listener: tokio::net::TcpListener, secret: S, serve: F)
 where
+    S: Fn() -> Option<String> + Send + Sync + 'static,
     F: Fn(crate::flow::Carrier) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
@@ -190,7 +199,8 @@ where
         let (serve, secret) = (serve.clone(), secret.clone());
         tokio::spawn(async move {
             let _ = s.set_nodelay(true);
-            if let Ok((s, early)) = answer_upgrade(s, secret.as_deref()).await {
+            let want = secret();
+            if let Ok((s, early)) = answer_upgrade(s, want.as_deref()).await {
                 serve(crate::flow::Carrier::Tunnel(Mux::new(s, early, false))).await;
             }
         });
@@ -224,7 +234,12 @@ async fn answer_upgrade(mut s: tokio::net::TcpStream, secret: Option<&str>) -> i
         let _ = s.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
         return Err(io::Error::other("not a tunnel"));
     }
-    if let Some(want) = secret {
+    // no secret (none written yet, or not a whole one): nobody is let in
+    let Some(want) = secret else {
+        let _ = s.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+        return Err(io::Error::other("the exit has no tunnel secret yet"));
+    };
+    {
         let name = format!("{}:", TUNNEL_HEADER.to_ascii_lowercase());
         let given = raw.lines().find(|l| l.to_ascii_lowercase().starts_with(&name)).and_then(|l| l.split_once(':')).map(|(_, v)| v.trim()).unwrap_or("");
         // compared by their digests, so the time taken says nothing about the secret
@@ -256,8 +271,9 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let at = l.local_addr().unwrap();
-        let secret = "s".repeat(32);
-        tokio::spawn(serve_tunnel_endpoint(l, Some(secret.clone()), |_c| async {}));
+        let secret = "5".repeat(64);
+        let s2 = secret.clone();
+        tokio::spawn(serve_tunnel_endpoint(l, move || Some(s2.clone()), |_c| async {}));
         let ask = |extra: String| async move {
             let mut s = tokio::net::TcpStream::connect(at).await.unwrap();
             s.write_all(format!("GET /vpn/tunnel HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: k\r\n{extra}\r\n").as_bytes()).await.unwrap();
@@ -270,6 +286,48 @@ mod tests {
         assert_eq!(ask(format!("X-Stream-Tunnel: {}\r\n", "t".repeat(32))).await, "HTTP/1.1 403");
         // the shop's gateway, with it: the tunnel opens
         assert_eq!(ask(format!("x-stream-tunnel: {secret}\r\n")).await, "HTTP/1.1 101");
+    }
+
+    /// A priced exit with no good secret (none yet, or a short or partial file) answers nobody: it
+    /// fails closed, so no app on the box's network rides it unpaid.
+    #[tokio::test]
+    async fn a_priced_exit_without_a_good_secret_answers_nobody() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = l.local_addr().unwrap();
+        tokio::spawn(serve_tunnel_endpoint(l, || None, |_c| async {}));
+        let mut s = tokio::net::TcpStream::connect(at).await.unwrap();
+        s.write_all(b"GET /vpn/tunnel HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: k\r\n\r\n").await.unwrap();
+        let mut b = [0u8; 12];
+        let _ = s.read_exact(&mut b).await;
+        assert_eq!(String::from_utf8_lossy(&b), "HTTP/1.1 503");
+    }
+
+    /// The secret is read for each upgrade: written after the service started (the wallet app
+    /// writes it with the shop's route), it holds at once; a short or partial file is no secret.
+    #[tokio::test]
+    async fn the_secret_is_read_for_each_tunnel_and_must_be_whole() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let d = tempfile::tempdir().unwrap();
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = l.local_addr().unwrap();
+        let dir = d.path().to_path_buf();
+        tokio::spawn(serve_tunnel_endpoint(l, move || tunnel_secret_in(&dir), |_c| async {}));
+        let ask = |extra: String| async move {
+            let mut s = tokio::net::TcpStream::connect(at).await.unwrap();
+            s.write_all(format!("GET /vpn/tunnel HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: k\r\n{extra}\r\n").as_bytes()).await.unwrap();
+            let mut b = [0u8; 12];
+            let _ = s.read_exact(&mut b).await;
+            String::from_utf8_lossy(&b).to_string()
+        };
+        let secret = new_tunnel_secret();
+        assert_eq!(ask(format!("{TUNNEL_HEADER}: {secret}\r\n")).await, "HTTP/1.1 503", "no secret yet: closed");
+        // a partial write, half the secret: still no secret
+        std::fs::write(d.path().join(TUNNEL_SECRET_FILE), &secret[..32]).unwrap();
+        assert_eq!(ask(format!("{TUNNEL_HEADER}: {}\r\n", &secret[..32])).await, "HTTP/1.1 503", "a short secret is none");
+        std::fs::write(d.path().join(TUNNEL_SECRET_FILE), &secret).unwrap();
+        assert_eq!(ask(format!("{TUNNEL_HEADER}: {secret}\r\n")).await, "HTTP/1.1 101", "written after start, it holds at once");
+        assert_eq!(ask(String::new()).await, "HTTP/1.1 403");
     }
 
     #[test]

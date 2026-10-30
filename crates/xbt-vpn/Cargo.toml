@@ -49,4 +49,6 @@ memmap2 = "0.9"
 # a test DNS-over-TLS server's certificate
 rcgen = "0.14"
 # a client TCP/IP stack, to originate connections inside the tunnel in tests without a TUN device
+# a folder for the tunnel secret tests
+tempfile = "3"
 smoltcp = { version = "=0.12.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp", "socket-udp"] }
