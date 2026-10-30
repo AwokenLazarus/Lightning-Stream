@@ -11,8 +11,12 @@
 //! 3. **The bytes:** the bytes it says it passed each way are no more than the wallet counted, with
 //!    room for what is still on the way ([`slack`]); and its charge is no more than those bytes cost.
 //! 4. **Liveness:** once a seller has sent one, bytes that keep flowing without a newer one for
-//!    [`INTERIM_STALE`] are a fault too. A seller that never sends any (one from before interim
-//!    receipts) is held to the rules every answer has: its spend never passes what was released.
+//!    [`INTERIM_STALE`] are a fault too, once the seller has had its say: [`STALE_ANSWERS`]
+//!    `status` answers in a row with no newer count, or `status` failing for [`STALE_FAILING`]
+//!    times as long (a slow or lossy link is not taken for a seller that stopped counting, and a
+//!    seller that answers only errors is still caught). A seller that never sends any (one from
+//!    before interim receipts) is held to the rules every answer has: its spend never passes what
+//!    was released.
 
 use std::time::{Duration, Instant};
 
@@ -117,10 +121,41 @@ pub fn check(
 
 /// Whether a seller that has sent interim receipts has stopped while bytes still flow: `own` is
 /// the wallet's byte count now, `after` how long the wallet waits for a newer one ([`stale_after`]).
-pub fn stale(last: &Option<Seen>, own: u64, now: Instant, after: Duration) -> Option<String> {
+/// `status` answers in a row with no newer count, past [`INTERIM_STALE`], before a seller is stale.
+pub const STALE_ANSWERS: u32 = 2;
+/// How many times [`INTERIM_STALE`] a failing `status` may last before its seller is stale.
+pub const STALE_FAILING: u32 = 3;
+
+/// How the seller's `status` answered since its last newer count: answers with none newer, and
+/// since when it has failed (no answer, or none the wallet can take).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Polls {
+    pub answered: u32,
+    pub failing_since: Option<Instant>,
+}
+
+impl Polls {
+    /// A `status` answer with no newer count.
+    pub fn answered(&mut self) {
+        self.answered = self.answered.saturating_add(1);
+        self.failing_since = None;
+    }
+    /// A `status` the wallet could not have or take.
+    pub fn failed(&mut self, now: Instant) {
+        self.failing_since.get_or_insert(now);
+    }
+    /// A newer count: the seller is counting.
+    pub fn counted(&mut self) {
+        *self = Polls::default();
+    }
+}
+
+pub fn stale(last: &Option<Seen>, polls: &Polls, own: u64, now: Instant, after: Duration) -> Option<String> {
     let l = last.as_ref()?;
     let flowed = own.saturating_sub(l.own_at);
-    (now.saturating_duration_since(l.at) >= after && flowed >= INTERIM_STALE_BYTES).then(|| {
+    // the seller has had its say: answers with nothing newer, or a status failing for a long while
+    let heard = polls.answered >= STALE_ANSWERS || polls.failing_since.is_some_and(|t| now.saturating_duration_since(t) >= after * STALE_FAILING);
+    (heard && now.saturating_duration_since(l.at) >= after && flowed >= INTERIM_STALE_BYTES).then(|| {
         format!(
             "the seller sent no count of an open answer for {} s while {flowed} more bytes passed",
             now.saturating_duration_since(l.at).as_secs()
@@ -215,10 +250,17 @@ mod tests {
     #[test]
     fn a_seller_that_stops_counting_while_bytes_flow_is_found() {
         let now = Instant::now();
-        assert_eq!(stale(&None, 1 << 30, now, INTERIM_STALE), None, "a seller that never sent one is held to the usual rules");
+        // the seller answered status twice with nothing newer
+        let answered = Polls { answered: STALE_ANSWERS, failing_since: None };
+        assert_eq!(stale(&None, &answered, 1 << 30, now, INTERIM_STALE), None, "a seller that never sent one is held to the usual rules");
         let seen = Some(Seen { part: 1, charged: 0, up: 0, down: 0, at: now, own_at: 1 << 20 });
-        assert_eq!(stale(&seen, 100 << 20, now + Duration::from_secs(5), INTERIM_STALE), None, "not long enough");
-        assert_eq!(stale(&seen, (1 << 20) + 1000, now + Duration::from_secs(60), INTERIM_STALE), None, "a quiet link");
-        assert!(stale(&seen, 100 << 20, now + Duration::from_secs(31), INTERIM_STALE).is_some());
+        assert_eq!(stale(&seen, &answered, 100 << 20, now + Duration::from_secs(5), INTERIM_STALE), None, "not long enough");
+        assert_eq!(stale(&seen, &answered, (1 << 20) + 1000, now + Duration::from_secs(60), INTERIM_STALE), None, "a quiet link");
+        assert!(stale(&seen, &answered, 100 << 20, now + Duration::from_secs(31), INTERIM_STALE).is_some());
+        // a status that failed for a short while is a slow link, not a seller that stopped counting
+        let failing = Polls { answered: 0, failing_since: Some(now + Duration::from_secs(20)) };
+        assert_eq!(stale(&seen, &failing, 100 << 20, now + Duration::from_secs(31), INTERIM_STALE), None, "an honest seller behind a slow status");
+        // one answering only errors for long enough is caught all the same
+        assert!(stale(&seen, &failing, 100 << 20, now + Duration::from_secs(20 + 90), INTERIM_STALE).is_some());
     }
 }

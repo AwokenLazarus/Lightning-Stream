@@ -3158,10 +3158,11 @@ impl Signer {
     /// check out, is no newer count: a seller that sent one and then none (by any means) while bytes flow is stale.
     #[allow(clippy::too_many_arguments)]
     fn ticket_interim(&self, hs: &HttpSession, seq: u64, digest: &str, own: &dyn Fn() -> (u64, u64), price: &Price, max_msat: u64,
-                      last: &mut Option<crate::ticket_interim::Seen>) -> Option<String> {
+                      last: &mut Option<crate::ticket_interim::Seen>, polls: &mut crate::ticket_interim::Polls) -> Option<String> {
         let v = self.ticket_status_of(hs, false).ok();
         let (own_up, own_down) = own();
         let sid = lock_link(hs).seller_sid.clone();
+        let before = last.as_ref().map(|l| l.part);
         let mut found = None;
         for raw in v.as_ref().and_then(|v| v.get("interim")).and_then(Value::as_array).into_iter().flatten() {
             let Ok(r) = Receipt::verify(raw, &hs.terms.receipt_key, &sid) else { continue };
@@ -3170,7 +3171,16 @@ impl Signer {
                 break;
             }
         }
-        let found = found.or_else(|| crate::ticket_interim::stale(last, own_up.saturating_add(own_down), Instant::now(), crate::ticket_interim::stale_after()).map(|w| (w, Value::Null)));
+        // how the seller answered: a newer count, an answer with none newer, or no answer the wallet could take
+        let now = Instant::now();
+        if last.as_ref().map(|l| l.part) != before {
+            polls.counted();
+        } else if v.is_some() {
+            polls.answered();
+        } else {
+            polls.failed(now);
+        }
+        let found = found.or_else(|| crate::ticket_interim::stale(last, polls, own_up.saturating_add(own_down), now, crate::ticket_interim::stale_after()).map(|w| (w, Value::Null)));
         let (why, receipt) = found?;
         self.ticket_audit("ticket_interim_fault", json!({"session": hs.sid, "origin": hs.origin, "dest": format!("ln:{}", hs.terms.terms.payee),
                                                          "reason": why, "receipt": receipt, "own_up": own_up, "own_down": own_down}));
@@ -3852,10 +3862,18 @@ impl Signer {
                     None => drop(w),
                 }
                 let (pay, credited, state, wake, up, stopper, st, account) = (&pay, &credited, &state, &wake, &up, &stopper, &st, &account);
+                // the stream stops: both ways end, and the reading of the way back with them, quiet or not
+                let stop = move || {
+                    if let Some(st) = stopper {
+                        let _ = st.shutdown(std::net::Shutdown::Both);
+                    }
+                };
                 // the seller's signed count of this open answer, checked against the wallet's as it runs: on its own
-                // thread, so a slow `status` never holds up the paying of the bytes
+                // thread, so a slow `status` never holds up the paying of the bytes. A fault found here ends the
+                // socket at once, so the buyer's side sees it close (a VPN fails over) even while nothing flows
                 scope.spawn(move || {
                     let mut last: Option<crate::ticket_interim::Seen> = None;
+                    let mut polls = crate::ticket_interim::Polls::default();
                     let mut next = Instant::now() + crate::ticket_interim::poll_every();
                     loop {
                         {
@@ -3873,8 +3891,9 @@ impl Signer {
                         }
                         next = Instant::now() + crate::ticket_interim::poll_every();
                         let own = || (up.load(Ordering::SeqCst), lock(state).0);
-                        if let Some(why) = self.ticket_interim(hs, seq, digest, &own, price, st.max_msat, &mut last) {
+                        if let Some(why) = self.ticket_interim(hs, seq, digest, &own, price, st.max_msat, &mut last, &mut polls) {
                             lock(state).1.get_or_insert(why);
+                            stop();
                             wake.notify_all();
                             return;
                         }
@@ -3882,7 +3901,12 @@ impl Signer {
                 });
                 scope.spawn(move || loop {
                     let mut s = lock(state);
-                    if s.2 || s.1.is_some() {
+                    if s.2 {
+                        return;
+                    }
+                    if s.1.is_some() {
+                        // stopped elsewhere (a fault, a limit): the socket ends with it
+                        stop();
                         return;
                     }
                     let total = s.0.saturating_add(up.load(Ordering::SeqCst));
@@ -3901,10 +3925,7 @@ impl Signer {
                         }
                     }
                     if s.1.is_some() {
-                        // the stream stops: both ways end, and the reading of the way back with them
-                        if let Some(st) = stopper {
-                            let _ = st.shutdown(std::net::Shutdown::Both);
-                        }
+                        stop();
                         return;
                     }
                     let _ = wake.wait_timeout(s, Duration::from_millis(20)).unwrap_or_else(|p| p.into_inner());

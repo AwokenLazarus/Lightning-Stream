@@ -5954,6 +5954,12 @@ fn a_websocket_open_before_a_video_is_left_keeps_paying() {
 /// count would, signing what it changed again with its receipt key. Returns the call's result,
 /// and how many `status` answers listed an interim receipt.
 fn interim_socket(r: &Rig, dir: &std::path::Path, name: &str, out: usize, max_sats: u64, edit: Option<fn(&mut Value, &mut u32)>) -> (Value, usize) {
+    let (v, listed, _) = interim_socket_sent(r, dir, name, out, max_sats, edit);
+    (v, listed)
+}
+
+/// [`interim_socket`], and how many bytes the caller got through the socket before it ended.
+fn interim_socket_sent(r: &Rig, dir: &std::path::Path, name: &str, out: usize, max_sats: u64, edit: Option<fn(&mut Value, &mut u32)>) -> (Value, usize, usize) {
     use std::io::{BufRead as _, Read as _, Write as _};
     use std::os::unix::net::UnixListener;
     let l = UnixListener::bind(dir.join(name)).unwrap();
@@ -6000,12 +6006,13 @@ fn interim_socket(r: &Rig, dir: &std::path::Path, name: &str, out: usize, max_sa
             std::thread::sleep(Duration::from_millis(25));
         }
         let _ = w.shutdown(std::net::Shutdown::Both);
+        sent
     });
     let v = r.call("xbt402_pay", json!({"url": r.shop.url("/ws/tunnel"), "max_sats": max_sats, "task": "film", "stream_to": name, "stream_head": true,
                                        "upgrade": true, "headers": [["Sec-WebSocket-Key", "k"], ["Sec-WebSocket-Version", "13"]]}));
-    caller.join().unwrap();
+    let sent = caller.join().unwrap();
     r.tap.clear();
-    (v, listed.load(Ordering::SeqCst))
+    (v, listed.load(Ordering::SeqCst), sent)
 }
 
 /// Each of a status body's interim receipts changed by `f` and signed again by the seller's key.
@@ -6110,6 +6117,68 @@ fn a_seller_that_overcharges_an_open_socket_is_caught_while_it_runs() {
     assert!(faults[0]["reason"].as_str().unwrap().contains("cost"), "{faults:?}");
     let next = r.pay("/page/11", CALL);
     assert_ne!(next["session"], first["session"], "the faulty session is not used again: {next}");
+    std::env::remove_var("B2_INTERIM_POLL_MS");
+    std::env::remove_var("B2_STREAM_DIR");
+}
+
+/// A seller fault found while a socket runs (here an overcharge in its signed count) ends the
+/// socket both ways at once, even while it is quiet: the buyer's side sees it close, so a VPN fails
+/// over to another exit instead of carrying on through one the wallet no longer pays.
+#[test]
+fn a_fault_found_while_a_socket_is_quiet_closes_it_both_ways() {
+    use std::io::{BufRead as _, Read as _, Write as _};
+    let _g = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("B2_STREAM_DIR", dir.path());
+    std::env::set_var("B2_INTERIM_POLL_MS", "100");
+    let r = Rig::new(json!({}));
+    let l = std::os::unix::net::UnixListener::bind(dir.path().join("quiet")).unwrap();
+    // once the socket goes quiet, every count the seller lists is charged twice over
+    let quiet = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let q = quiet.clone();
+    r.tap.set(Box::new(move |seen, real| {
+        if !seen.path.ends_with("/x402/ticket/status") {
+            return None;
+        }
+        let (status, headers, body) = match real() {
+            Ok(a) => whole(a),
+            Err(e) => return Some(Err(e)),
+        };
+        let mut v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        if q.load(Ordering::SeqCst) {
+            resign_interim(&mut v, &|r| r["charged"] = (r["charged"].as_str().unwrap().parse::<u64>().unwrap() * 2).to_string().into());
+        }
+        Some(Ok(answer(status, headers, serde_json::to_vec(&v).unwrap())))
+    }));
+    let caller = std::thread::spawn(move || {
+        let (s, _) = l.accept().unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        let mut rd = std::io::BufReader::new(s.try_clone().unwrap());
+        let mut line = String::new();
+        rd.read_line(&mut line).unwrap();
+        let mut w = s;
+        let piece: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let mut back = vec![0u8; piece.len()];
+        // 1.5 MiB through the echo: enough for the seller to sign a count of it
+        for _ in 0..24 {
+            if w.write_all(&piece).is_err() || rd.read_exact(&mut back).is_err() {
+                return Duration::ZERO;
+            }
+        }
+        // then quiet: nothing sent, waiting for the way back. The fault found now must close it
+        std::thread::sleep(Duration::from_millis(300));
+        quiet.store(true, Ordering::SeqCst);
+        let t = Instant::now();
+        let mut one = [0u8; 1];
+        let _ = rd.read(&mut one);
+        t.elapsed()
+    });
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/ws/tunnel"), "max_sats": 60_000, "task": "film", "stream_to": "quiet", "stream_head": true,
+                                       "upgrade": true, "headers": [["Sec-WebSocket-Key", "k"], ["Sec-WebSocket-Version", "13"]]}));
+    let waited = caller.join().unwrap();
+    r.tap.clear();
+    assert_eq!(r.audit("ticket_interim_fault").len(), 1, "{v}");
+    assert!(waited < Duration::from_secs(5), "the quiet socket stayed open {waited:?} after the fault ({v})");
     std::env::remove_var("B2_INTERIM_POLL_MS");
     std::env::remove_var("B2_STREAM_DIR");
 }
