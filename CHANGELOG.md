@@ -40,6 +40,11 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 - Higher default limits for a shop: 100 sessions and 512 connections. A shop behind a tunnel is
   limited as a whole, not as if all its buyers were one address.
 
+**VPN exits**
+- Sell or buy a VPN exit, paid as you use it: a buyer's devices go out through another box's internet
+  connection over Stream, by the GB, with no account; exits are checked for the country they claim,
+  an exit only its own shop's gateway can open, and exits that waste a buyer's money held off.
+
 **Hashrate**
 - Rentals run over the encrypted link.
 - A hashtaker can buy a short paid test slice before renting, and a hashmaker publishes a signed
