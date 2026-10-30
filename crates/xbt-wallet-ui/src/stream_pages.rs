@@ -707,4 +707,25 @@ mod tests {
         assert!(html.contains("cat-hashrate") && html.contains("Rent miners by the piece of work") && html.contains("href=\"./hashrate\""), "{html}");
         assert!(service_html(&all[0], false).contains("href=\"./hashrate\""));
     }
+
+    /// A service chosen from a listing keeps the listing's prices, through the services file, as
+    /// the ceiling the app pays it at; one not from a listing has none.
+    #[test]
+    fn a_service_keeps_its_listings_prices_as_its_price_ceiling() {
+        let section = xbt402::listing::Section { name: "Films".into(), kind: "files".into(), path: "/files/".into(),
+            prices: json!({"request_msat": "0", "byte_msat": 1000, "per_bytes": 1_048_576}), items: vec![], licence: String::new(), credits: String::new() };
+        let l = xbt402::listing::Listing { name: "Box".into(), kind: "files".into(), seller: "https://box.example".into(), receipt_key: String::new(),
+            prices: section.prices.clone(), items: vec![], licence: String::new(), credits: String::new(), updated: String::new(), services: vec![section] };
+        let all = services::from_listing(&l);
+        let want = xbt402::listing::price_ceiling(&l.prices);
+        assert_eq!(all[0].price_ceiling(), Some(want.clone()));
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("services.json");
+        services::save(&p, &all).unwrap();
+        let back = services::load(&p).unwrap();
+        assert_eq!(back[0].price_ceiling(), Some(want), "kept through the file");
+        let mut plain = back[0].clone();
+        plain.prices = serde_json::Value::Null;
+        assert_eq!(plain.price_ceiling(), None);
+    }
 }

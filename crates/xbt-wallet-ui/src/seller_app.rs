@@ -220,7 +220,12 @@ impl App {
             return Resp::redirect("./browse");
         };
         let opened = if preview { Ok((200, json!({"visit": secret()}))) } else {
-            connector_json("POST", &format!("{}/visits", self.cfg.connector.trim_end_matches('/')), Some(&json!({"base": base, "limit_sats": limit})))
+            // the seller's listed prices: the most each of the visit's calls pays
+            let mut body = json!({"base": base, "limit_sats": limit});
+            if let Some(c) = svc.price_ceiling() {
+                body["price_ceiling"] = c;
+            }
+            connector_json("POST", &format!("{}/visits", self.cfg.connector.trim_end_matches('/')), Some(&body))
         };
         let visit = match opened {
             Ok((200, v)) => v.get("visit").and_then(Value::as_str).unwrap_or("").to_string(),

@@ -288,7 +288,7 @@ mod tests {
     use crate::services::Item;
 
     fn ai(name: &str, seller: &str, address: &str) -> Service {
-        Service { name: name.into(), kind: services::Kind::Ai, seller: seller.into(), price_text: "10 sat per 1,000 tokens".into(), items: Vec::<Item>::new(),
+        Service { name: name.into(), kind: services::Kind::Ai, seller: seller.into(), price_text: "10 sat per 1,000 tokens".into(), prices: Value::Null, items: Vec::<Item>::new(),
                   address: address.into(), app: String::new(), app_base: String::new() }
     }
 

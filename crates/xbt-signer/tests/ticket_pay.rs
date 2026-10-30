@@ -1046,7 +1046,7 @@ impl Rig {
         let mut pol = json!({"allowlist": named_origins,
                              "counterparties": origins.iter().map(|o| ((*o).clone(), json!({"ln_node": shop.id()}))).collect::<serde_json::Map<String, Value>>(),
                              "max_per_tx_sats": 50_000, "daily_budget_sats": 60_000, "weekly_budget_sats": 90_000, "per_counterparty_cap_sats": 60_000,
-                             "human_threshold_sats": 40_000, "velocity_max": 1_000,
+                             "human_threshold_sats": 40_000, "velocity_max": 1_000, "human_pubkey": human_pub(),
                              "ln": {"enabled": true, "split_height": 6000, "max_fee_base_sats": 2, "max_fee_ppm": 1000},
                              "tickets": {"enabled": true, "tasks": {"film": {"budget_sats": 40_000}, "swarm": {"budget_sats": 5_000, "admit": "any"}}}});
         if !shipped {
@@ -2222,6 +2222,22 @@ fn terms_that_change_under_an_open_session_stop_it_and_pay_nothing_more() {
 
 /// Run one paid page after a first good one with `hook` on the wire, and return the rig and the
 /// answer: the session then holds one released ticket and seven locked ones.
+/// The owner's approval key in these tests.
+fn human() -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[7; 32])
+}
+
+fn human_pub() -> String {
+    hex::encode(human().verifying_key().to_bytes())
+}
+
+/// The owner lifts the block `id` with a signed message, as the Spending rules page does.
+fn unblock(r: &Rig, id: &str) -> Value {
+    let expiry = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 + 600;
+    let sig = ed25519_dalek::Signer::sign(&human(), &xbt_signer::approval::unblock_message(id, expiry));
+    r.call("seller_unblock", json!({"block": id, "expiry": expiry, "signature": hex::encode(sig.to_bytes())}))
+}
+
 fn lied_to(hook: Hook) -> (Rig, Value) {
     let r = Rig::new(json!({}));
     let first = r.pay("/page/10", CALL);
@@ -3982,6 +3998,27 @@ fn assert_wins(r: &Rig, wins: u64) {
     assert_eq!((r.shop.held(), r.ln.by_status("IN_FLIGHT").len()), (0, 0), "nothing is held, and nothing is in flight between wins");
     let st = r.status();
     assert_eq!((st["locked"]["tickets"].as_i64(), st["node"]["agree"].as_bool()), (Some(0), Some(true)), "{st}");
+}
+
+/// A seller blocked for over-charging is paid no draw either: the draw rail refuses it before a
+/// draw is made, as the ticket rail does.
+///
+/// FAILS before: a block was checked only where a ticket session opened.
+#[test]
+fn a_seller_blocked_for_over_charging_is_paid_no_draw() {
+    let _g = env_lock();
+    let r = draws_rig(json!({}));
+    // the owner's wallet blocked this seller's node earlier (as a fault on another of its sessions does)
+    let id = format!("{}||", r.shop.id());
+    std::fs::write(r.root.join(".run").join("blocked_sellers.json"),
+                   json!({id.clone(): {"payee": r.shop.id(), "receipt_key": "", "origin": "", "reason": "charged past the bound", "session": "s0", "ts": 1.0,
+                                       "evidence": {}}}).to_string()).unwrap();
+    let v = r.pay(&format!("/pieces/{}", 64 * PIECE), 1_000);
+    assert_eq!(v["rule"].as_str(), Some("seller_blocked"), "{v}");
+    assert_wins(&r, 0);
+    assert_eq!(unblock(&r, &id)["ok"], true);
+    let v = r.pay(&format!("/pieces/{}", 64 * PIECE), 1_000);
+    assert_eq!((v["rail"].as_str(), v["status"].as_u64()), (Some("lottery"), Some(200)), "unblocked, it is paid again: {v}");
 }
 
 #[test]
@@ -6028,6 +6065,28 @@ fn a_seller_that_charges_a_lost_request_past_what_could_have_arrived_is_a_seller
     r.tap.clear();
 }
 
+/// A receipt that signs another body than the one that arrived stops the session, but is not
+/// over-charging: the seller is not blocked, and the next call opens a new session with it.
+///
+/// FAILS before: every seller fault blocked the seller.
+#[test]
+fn a_receipt_for_another_body_stops_the_session_and_blocks_nothing() {
+    let _g = env_lock();
+    let (r, v) = lied_to(Box::new(|seen, real| {
+        if !(seen.paid && seen.path.starts_with("/page/")) {
+            return None;
+        }
+        let (status, mut headers, body) = whole(real().ok()?);
+        resign(&mut headers, &|rc| rc["bodyHash"] = "00".repeat(32).into());
+        Some(Ok(answer(status, headers, body)))
+    }));
+    let fault = v["seller_fault"].as_str().map(str::to_string).or_else(|| v["reason"].as_str().map(str::to_string)).unwrap_or_default();
+    assert!(!fault.is_empty() || v["rule"] == "ticket_seller_fault", "the body mismatch is a fault: {v}");
+    assert!(r.call("seller_blocks", json!({}))["blocked"].as_array().is_none_or(Vec::is_empty), "and blocks nothing");
+    let next = r.pay("/page/41", CALL);
+    assert_eq!(next["status"].as_u64(), Some(200), "the next call is served: {next}");
+}
+
 /// A seller caught over-charging is blocked: the wallet opens no new session with its node, even
 /// for an honest call, until the owner unblocks it; then it buys from it again.
 ///
@@ -6050,11 +6109,18 @@ fn a_seller_caught_over_charging_is_blocked_until_the_owner_unblocks_it() {
     r.tap.clear();
     let blocked = r.pay("/page/40", CALL);
     assert_eq!(blocked["rule"].as_str(), Some("seller_blocked"), "an honest call to the same seller is refused: {blocked}");
-    let node = blocked["seller_blocked"].as_str().unwrap_or_default().to_string();
+    let id = blocked["seller_blocked"].as_str().unwrap_or_default().to_string();
     let list = r.call("seller_blocks", json!({}));
     assert_eq!(list["blocked"].as_array().map(Vec::len), Some(1), "{list}");
-    assert_eq!(list["blocked"][0]["node"].as_str(), Some(node.as_str()), "{list}");
-    assert_eq!(r.call("seller_unblock", json!({"node": node}))["ok"], true);
+    let b = &list["blocked"][0];
+    assert_eq!(b["id"].as_str(), Some(id.as_str()), "{list}");
+    // blocked by all three, with the receipt that over-charged as the evidence
+    assert!(!b["payee"].as_str().unwrap_or_default().is_empty() && !b["receipt_key"].as_str().unwrap_or_default().is_empty()
+            && b["origin"].as_str().is_some_and(|o| o.starts_with("http")), "{b}");
+    assert_eq!(b["evidence"]["receipt"]["charged"], "5000", "{b}");
+    // only a signed message lifts it
+    assert_eq!(r.call("seller_unblock", json!({"block": id}))["rule"], "human_sig");
+    assert_eq!(unblock(&r, &id)["ok"], true);
     let again = r.pay("/page/41", CALL);
     assert_eq!(again["status"].as_u64(), Some(200), "unblocked, the seller is paid again: {again}");
 }
@@ -6209,7 +6275,7 @@ fn a_seller_that_drains_the_balance_while_a_websocket_is_open_is_caught() {
     // caught over-charging, the seller is blocked; the owner unblocks it
     let blocked = r.pay("/page/11", CALL);
     assert_eq!(blocked["rule"].as_str(), Some("seller_blocked"), "{blocked}");
-    assert_eq!(r.call("seller_unblock", json!({"node": blocked["seller_blocked"]}))["ok"], true);
+    assert_eq!(unblock(&r, blocked["seller_blocked"].as_str().unwrap_or_default())["ok"], true);
     let next = r.pay("/page/11", CALL);
     assert_ne!(next["session"], first["session"], "the next call opens another session: {next}");
     assert_eq!(r.tap.secrets().len(), secrets + 1, "only the new session's first ticket went out");

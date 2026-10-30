@@ -532,16 +532,8 @@ impl Signer {
             }
             // takes the spend lock itself, and not while the seller is asked to cancel
             "ticket_stop" => sanitize(self.ticket_stop_by(p)),
-            // the sellers caught charging more than the wallet could account for, and the owner lifting a block
+            // the sellers caught charging more than the wallet could account for (lifting a block is signed: admin)
             "seller_blocks" => sanitize(json!({"ok": true, "blocked": self.seller_blocks.list()})),
-            "seller_unblock" => {
-                let node = p.get("node").and_then(Value::as_str).unwrap_or_default();
-                let was = self.seller_blocks.unblock(node);
-                if was {
-                    self.ticket_audit("seller_unblock", json!({"node": node}));
-                }
-                sanitize(json!({"ok": was, "node": node}))
-            }
             "ticket_status" => {
                 let _g = self.lock();
                 sanitize(self.ticket_status_locked(p))

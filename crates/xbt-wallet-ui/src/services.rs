@@ -104,6 +104,10 @@ pub struct Service {
     pub kind: Kind,
     pub seller: String,
     pub price_text: String,
+    /// The prices its seller's signed listing named (`request_msat`, `byte_msat`, `per_bytes`, ...):
+    /// passed as the wallet's `price_ceiling` when the buyer uses it, so a seller whose terms ask more
+    /// than it listed is paid nothing. Null where the service was not chosen from a listing.
+    pub prices: Value,
     pub items: Vec<Item>,
     /// Where apps and agents reach this service; empty: the seller's own address.
     pub address: String,
@@ -115,6 +119,12 @@ pub struct Service {
 }
 
 impl Service {
+    /// The wallet's `price_ceiling` for this service: its listing's prices, the most the buyer agreed
+    /// to pay. `None` where it was not chosen from a listing.
+    pub fn price_ceiling(&self) -> Option<Value> {
+        self.prices.is_object().then(|| xbt402::listing::price_ceiling(&self.prices))
+    }
+
     /// The category Browse shows it under: a service with its own web app is a web app (a media
     /// server among them), whatever its listing's kind; an older media listing that names films
     /// (no app) is files, to download or open in a player; an AI model and hashrate keep their own.
@@ -279,7 +289,9 @@ fn parse_service(v: &Value, n: usize) -> Result<Service, String> {
     };
     let (app, app_base) = (opt_url("app")?, opt_url("app_base")?);
     let (app, app_base) = if app.is_empty() || app_base.is_empty() { (String::new(), String::new()) } else { (app, app_base) };
-    Ok(Service { name: text(obj, "name", &what)?.to_string(), kind, seller, price_text: text(obj, "price_text", &what)?.to_string(), items, address, app, app_base })
+    let prices = obj.get("prices").filter(|p| p.is_object()).cloned().unwrap_or(Value::Null);
+    Ok(Service { name: text(obj, "name", &what)?.to_string(), kind, seller, price_text: text(obj, "price_text", &what)?.to_string(), prices, items, address, app,
+                 app_base })
 }
 
 /// Parse the services file's text.
@@ -321,6 +333,9 @@ fn service_json(s: &Service) -> Value {
         v
     }).collect();
     let mut v = json!({"name": s.name, "kind": s.kind.as_str(), "seller": s.seller, "price_text": s.price_text, "items": items});
+    if s.prices.is_object() {
+        v["prices"] = s.prices.clone();
+    }
     if !s.address.is_empty() {
         v["address"] = json!(s.address);
     }
@@ -398,6 +413,7 @@ pub fn from_listing(l: &xbt402::listing::Listing) -> Vec<Service> {
             kind,
             seller: l.seller.clone(),
             price_text: if kind == Kind::Hashrate { work_price_words(&s.prices) } else { price_words(&s.prices) },
+            prices: s.prices.clone(),
             items: s.items.iter().map(|i| Item { title: i.title.clone(), year: i.year.map(|y| y.to_string()).unwrap_or_default(), url: i.url.clone(),
                                                  credit: i.credit.clone().unwrap_or_else(|| credit.clone()).chars().take(MAX_TEXT).collect() }).collect(),
             address: if path.is_empty() { String::new() } else { format!("{}{path}", l.seller.trim_end_matches('/')) },
@@ -415,12 +431,17 @@ pub fn from_listing(l: &xbt402::listing::Listing) -> Vec<Service> {
             Some(o) if o.app.is_empty() => {
                 o.app = entry;
                 o.app_base = base;
+                // the app's own price, where it lists one, is what its pages are paid at
+                if a.prices.is_object() && !a.prices.as_object().is_some_and(|m| m.is_empty()) {
+                    o.prices = a.prices.clone();
+                }
             }
             _ => out.push(Service {
                 name: (if several { format!("{}: {}", l.name, a.name) } else { a.name.clone() }).chars().take(MAX_TEXT).collect(),
                 kind: Kind::Api,
                 seller: l.seller.clone(),
                 price_text: price_words(&a.prices),
+                prices: a.prices.clone(),
                 items: vec![],
                 address: String::new(),
                 app: entry,

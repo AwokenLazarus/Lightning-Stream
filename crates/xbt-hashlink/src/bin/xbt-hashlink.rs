@@ -282,7 +282,7 @@ fn hashtaker_cmd(f: &HashMap<String, String>) -> Result<(), String> {
             max_sats: num(f, "max-sats", None)?,
             session: None,
             // the offer's price per slice: the most the shop is paid for one
-            ceiling: Some(serde_json::json!({"request_msat": t.price_msat})),
+            ceiling: Some(xbt_hashlink::rail::slice_ceiling(t.price_msat)),
             wait_for_signer: std::time::Duration::from_secs(num(f, "wait-for-signer-s", Some(15))?),
         }),
         None => None,

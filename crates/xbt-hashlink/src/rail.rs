@@ -78,6 +78,13 @@ impl HashtakerRail for LabHashtaker {
 /// the seller tied to its node, the caps on locked funds), chooses the rail (held tickets, else
 /// prepaid ones), locks tickets ahead and releases them; the gateway charges the slice's price
 /// only when the hashmaker's app answers that it counted the slice. Nothing here holds a key.
+/// The `price_ceiling` of a rental at `price_msat` a slice: the offer's price per slice and nothing by
+/// the byte, second or token (a slice's answer is priced by the request alone).
+pub fn slice_ceiling(price_msat: u64) -> serde_json::Value {
+    // the fields of xbt402::listing::price_ceiling, every one named: none left to mean "any"
+    serde_json::json!({"request_msat": price_msat, "gib_msat": 0, "second_msat": 0, "input_per_1k_msat": 0, "output_per_1k_msat": 0})
+}
+
 pub struct SignerPayer {
     pub sock: std::path::PathBuf,
     pub url: String,

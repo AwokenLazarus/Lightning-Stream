@@ -168,6 +168,28 @@ fn a_head_the_signer_will_not_read_past_is_a_502() {
     assert!(v["error"].as_str().unwrap().contains("not the range asked for"), "{v}");
 }
 
+/// A file's part asked with the listing's prices (`X-Price-Ceiling`, which the app's link sets from
+/// the listing the file was chosen from) carries them to the signer as the call's `price_ceiling`,
+/// so a seller whose terms ask more than it listed is paid nothing; a header that is not a price is
+/// left out.
+///
+/// FAILS before: the connector passed no ceiling, so a file was paid at whatever the seller asked.
+#[test]
+fn a_files_part_carries_the_listings_prices_to_the_signer() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sock, calls) = signer(dir.path(), film(), None, None);
+    let addr = start(sock, dir.path());
+    let ceiling = json!({"request_msat": 0, "gib_msat": 1_000_000, "second_msat": 0, "input_per_1k_msat": 0, "output_per_1k_msat": 0});
+    let (status, head, _) = get_with(&addr, "/s/https://seller.example/files/a.mkv", &format!("Range: bytes=0-99\r\nX-Price-Ceiling: {ceiling}\r\n"));
+    assert_eq!(status, 206, "{head}");
+    let (params, _) = calls.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(params["price_ceiling"], ceiling, "{params}");
+    let (status, head, _) = get_with(&addr, "/s/https://seller.example/files/a.mkv", "Range: bytes=0-99\r\nX-Price-Ceiling: not json\r\n");
+    assert_eq!(status, 206, "{head}");
+    let (params, _) = calls.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(params.get("price_ceiling").is_none(), "{params}");
+}
+
 #[test]
 fn a_call_the_signer_refuses_is_said_plainly_and_streams_nothing() {
     let dir = tempfile::tempdir().unwrap();

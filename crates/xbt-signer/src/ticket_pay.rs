@@ -946,6 +946,8 @@ struct Money {
     /// ([`crate::seller_block`]). Not set by a fault of another kind (a node that gives no final
     /// answer, a seller that forgot the session).
     overcharged: bool,
+    /// The receipt that over-charged, kept with the block as its evidence.
+    evidence: Option<Value>,
     /// Answers priced as they go that ended here and that the seller has not closed yet (their
     /// last receipt is not in `status`): the seller may still be waiting to send more of them, and
     /// would on the next ticket. Nothing is released into the session until all are closed.
@@ -965,6 +967,12 @@ struct Money {
     /// may still charge each, up to what could have arrived of it ([`uncounted_most`]), until a
     /// quiet point at least [`LOST_GRACE`] later.
     lost: HashMap<u64, (u64, Instant)>,
+    /// What lost requests not priced by the token have been allowed in all this session: capped at
+    /// [`LOST_CAP_TICKETS`] tickets, so losing many requests does not add up ([`Money::lose`]).
+    lost_allowed: u64,
+    /// Quiet points at which the seller's spend had risen by what lost requests allowed: each a
+    /// lost request it charged. [`LOST_CHARGED_MOST`] of them is over-charging.
+    lost_charged: u32,
     /// The ids handed out to requests so far.
     requests: u64,
     /// What answers priced by the token hold back until their end: the most each may still cost
@@ -1040,19 +1048,24 @@ impl Money {
     /// has left whose taking the seller has not yet confirmed. `Err`: the seller's word contradicts
     /// the wallet's count; nothing of it is taken.
     fn take(&mut self, r: &Receipt, charged_max: u64, outstanding: bool, sent_epoch: Option<u64>) -> std::result::Result<bool, String> {
-        let taken = self.take_checked(r, charged_max, outstanding, sent_epoch);
-        if taken.is_err() {
-            self.overcharged = true;
-        }
-        taken
+        self.take_checked(r, charged_max, outstanding, sent_epoch)
+    }
+
+    /// An over-charging fault of [`Money::take`]: a charge or a spend past what the wallet can
+    /// account for. The seller is blocked for it ([`Money::overcharged`]); a contradiction in what
+    /// was released only stops the session.
+    fn overcharge(&mut self, r: &Receipt, why: String) -> std::result::Result<bool, String> {
+        self.overcharged = true;
+        self.evidence.get_or_insert_with(|| r.raw.clone());
+        Err(why)
     }
 
     fn take_checked(&mut self, r: &Receipt, charged_max: u64, outstanding: bool, sent_epoch: Option<u64>) -> std::result::Result<bool, String> {
         if r.charged > charged_max {
-            return Err(format!("the seller charged {} msat for a request whose price by its terms is at most {charged_max}", r.charged));
+            return self.overcharge(r, format!("the seller charged {} msat for a request whose price by its terms is at most {charged_max}", r.charged));
         }
         if r.spent_msat > r.released_msat {
-            return Err(format!("the seller says {} msat were spent of {} released", r.spent_msat, r.released_msat));
+            return self.overcharge(r, format!("the seller says {} msat were spent of {} released", r.spent_msat, r.released_msat));
         }
         if r.released_msat > self.acct.sent_msat {
             return Err(format!("the seller says {} msat were released, the wallet released {}", r.released_msat, self.acct.sent_msat));
@@ -1081,15 +1094,22 @@ impl Money {
         let open: u64 = self.open.values().chain(self.lost.values().map(|(m, _)| m)).fold(0u64, |a, b| a.saturating_add(*b));
         let ceiling = self.quiet_spent.saturating_add(counted).saturating_add(open);
         if r.spent_msat > ceiling {
-            return Err(format!("the seller's spentMsat is {} msat, more than the {ceiling} the wallet can account for: {} at the last quiet point, {counted} counted \
+            return self.overcharge(r, format!("the seller's spentMsat is {} msat, more than the {ceiling} the wallet can account for: {} at the last quiet point, {counted} counted \
                                 since, and at most {open} more for the requests still open", r.spent_msat, self.quiet_spent));
         }
         let quiet = self.open.is_empty() && self.tails.is_empty() && self.lost.values().all(|(_, at)| at.elapsed() >= LOST_GRACE);
         // a lost request may have been charged up to what could have arrived of it ([`uncounted_most`]). All of that is
         // allowed here, once, even where the seller charged it less: the quiet point after it checks the spend no tighter
         let lost: u64 = self.lost.values().fold(0u64, |a, (m, _)| a.saturating_add(*m));
+        if quiet && !self.lost.is_empty() && r.spent_msat > self.quiet_spent.saturating_add(self.accepted) {
+            // the seller charged lost requests: rare for an honest one, and counted
+            self.lost_charged = self.lost_charged.saturating_add(1);
+            if self.lost_charged >= LOST_CHARGED_MOST {
+                return self.overcharge(r, format!("the seller charged for requests whose answers never arrived, {} times in this session", self.lost_charged));
+            }
+        }
         if quiet && r.spent_msat > self.quiet_spent.saturating_add(self.accepted).saturating_add(lost) {
-            return Err(format!("the seller's spentMsat rose by {} msat since the last quiet point, and its own receipts charged the answers closed since {}",
+            return self.overcharge(r, format!("the seller's spentMsat rose by {} msat since the last quiet point, and its own receipts charged the answers closed since {}",
                                r.spent_msat.saturating_sub(self.quiet_spent), self.accepted));
         }
         self.acct.acked_msat = acked;
@@ -1120,8 +1140,17 @@ impl Money {
     /// it up to `most` (what could have arrived of it, [`uncounted_most`]), as late as its own queue
     /// lets it. Kept in the bounds until a quiet point [`LOST_GRACE`] after; a spend past them then
     /// is the seller's fault.
-    fn lose(&mut self, rid: u64, most: u64) {
+    fn lose(&mut self, rid: u64, most: u64, quoted: bool, ticket_msat: u64) {
         if self.open.remove(&rid).is_some() {
+            // a reply held at its quote keeps it; any other lost request shares the session's cap
+            let most = if quoted {
+                most
+            } else {
+                let room = ticket_msat.saturating_mul(LOST_CAP_TICKETS).saturating_sub(self.lost_allowed);
+                let most = most.min(room);
+                self.lost_allowed = self.lost_allowed.saturating_add(most);
+                most
+            };
             self.lost.insert(rid, (most, Instant::now()));
         }
     }
@@ -1246,6 +1275,13 @@ impl Bound {
         self.most.saturating_sub(counted)
     }
 
+    /// Whether the answer's last receipt `r` charges more than the answer costs (one that arrived
+    /// whole) or its terms quote (a reply held at its quote): over-charging, for which the seller is
+    /// blocked. A receipt that signs another body is a fault, not over-charging.
+    fn overcharges(&self, r: &Receipt) -> bool {
+        self.whole.as_ref().is_some_and(|(cost, _)| r.charged > *cost) || self.quoted.is_some_and(|q| r.charged > q)
+    }
+
     /// The charge believed of the answer's last receipt `r`, and the seller's fault in it other
     /// than the call's limit (which `over_cap` words, keeping the receipt as evidence).
     fn judge(&self, r: &Receipt, m: &Money) -> (u64, Option<String>) {
@@ -1285,6 +1321,14 @@ const CUT_SLACK: u64 = (16 << 20) + PROXY_SLACK;
 /// any answer is waited for, so that the seller has served or dropped it by then.
 const LOST_GRACE: Duration = Duration::from_secs(120);
 
+/// The most that lost requests not priced by the token may be allowed in all, over a session, in
+/// tickets: a seller that drops many requests is believed for no more than this for all of them.
+const LOST_CAP_TICKETS: u64 = 1;
+
+/// How many lost requests a seller may charge in one session before that is over-charging: a lost
+/// answer is rare, and a seller that keeps charging for answers that never arrive is blocked.
+const LOST_CHARGED_MOST: u32 = 3;
+
 /// The most a request may add to the seller's spend past what the wallet has counted of it, by its
 /// price, never past its call's limit (`max_msat`), so that a seller that inflates its spend while
 /// an answer is open, or charges a request whose answer never came, takes no more than this:
@@ -1323,6 +1367,8 @@ pub(crate) struct HttpSession {
     /// The seller charged one answer past its call's limit ([`Signer::over_cap`]): over-charging, set
     /// where the `money` lock may be held already, so not in [`Money::overcharged`].
     over_cap: AtomicBool,
+    /// The receipt that charged past the call's limit ([`Signer::over_cap`]).
+    evidence: Mutex<Option<Value>>,
     /// The seller's terms for prepaid tickets, where its 402 listed them beside the entry the
     /// session was opened on.
     prepaid: Option<Terms>,
@@ -2512,11 +2558,13 @@ impl Signer {
             .map(|(p, a)| (p.terms, a));
         let prepaid_terms = prepaid.as_ref().map(|(t, _)| t.clone());
         // a seller caught charging more than it delivered gets no new session until the owner lifts the block
-        if let Some(b) = self.seller_blocks.get(&terms.terms.payee) {
+        let rk = hex::encode(&terms.receipt_key);
+        let who = crate::seller_block::Seller { payee: &terms.terms.payee, receipt_key: &rk, origin: c.origin };
+        if let Some(b) = self.seller_blocks.get(&who) {
             return Tried::Done(with(deny("seller_blocked", format!("this seller was caught charging more than it delivered ({}) and is blocked: \
                                                                        the owner can unblock it on the Spending rules page",
                                                                       b["reason"].as_str().unwrap_or_default())),
-                                    json!({"seller_blocked": terms.terms.payee})));
+                                    json!({"seller_blocked": b["id"]})));
         }
         if terms.release != "with-request" {
             return Tried::Next("the entry releases after-verify, which this wallet does not do: it releases a ticket before the piece it pays for".into());
@@ -2549,6 +2597,14 @@ impl Signer {
             // a session the book no longer holds open (stopped by the agent, idle, a fault) is gone
             if let Some(h) = open.as_ref().filter(|h| h.fault().is_some() || !self.ticket_session(&h.sid).is_some_and(|s| s.state == SState::Open)).cloned() {
                 *open = None;
+                // one stopped for over-charging blocks its seller, however its fault was found
+                let (overcharged, evidence) = {
+                    let m = lock_money(&h);
+                    (m.overcharged || h.over_cap.load(Ordering::SeqCst), m.evidence.clone().or_else(|| lock(&h.evidence).clone()))
+                };
+                if overcharged {
+                    self.seller_block(&h, &h.fault().unwrap_or_else(|| "over-charging".into()), evidence);
+                }
                 self.ticket_http_stop(&h, "its session ended", Duration::ZERO);
             }
             match open.as_ref() {
@@ -2590,7 +2646,7 @@ impl Signer {
                     }
                     .map(str::to_string);
                     let h = Arc::new(HttpSession { origin: c.origin.into(), sid: str_or_empty(o.get("session")), task: task.clone(), terms: terms.clone(),
-                                                   over_cap: AtomicBool::new(false),
+                                                   over_cap: AtomicBool::new(false), evidence: Mutex::new(None),
                                                    prepaid: prepaid_terms.clone(), offer, base, visit: c.url.strip_prefix(c.origin).unwrap_or("/").to_string(), calls: RwLock::new(()),
                                                    paying: Mutex::new(()), order: Mutex::new(()), link: Mutex::new(Link::new(String::new(), [0u8; 32], 0)),
                                                    money: Mutex::new(Money::default()), streaming: AtomicUsize::new(0), refilling: AtomicBool::new(false),
@@ -3292,6 +3348,7 @@ impl Signer {
                 // by the same rule as where the answer's receipt is found as it ends ([`Bound`])
                 // one at a time: each closed adds to the count what the next is judged against ([`Bound::most`])
                 let (mut over, mut wrong) = (None, None);
+                let mut overcharged = false;
                 let mut i = 0;
                 while i < m.tails.len() {
                     let t = &m.tails[i];
@@ -3304,15 +3361,21 @@ impl Signer {
                         over = Some(self.over_cap(hs, r.charged, t.bound.max_msat, &r.raw));
                     }
                     let (charged, why) = t.bound.judge(r, &m);
+                    if t.bound.overcharges(r) || r.charged > t.bound.max_msat {
+                        overcharged = true;
+                        m.evidence.get_or_insert_with(|| r.raw.clone());
+                    }
                     if wrong.is_none() {
                         wrong = why;
                     }
                     m.close_by(t.rid, charged, t.counted, &t.bound);
                 }
-                let over = over.or(wrong).map(|why| {
+                // over-charging (past the call's limit, past its cost or quote) blocks the seller; a receipt that signs
+                // another body only stops the session
+                if over.is_some() || overcharged {
                     m.overcharged = true;
-                    m.fault.get_or_insert(why).clone()
-                });
+                }
+                let over = over.or(wrong).map(|why| m.fault.get_or_insert(why).clone());
                 // the tickets' states as of this status: only where it is no older than the totals the wallet holds (another
                 // answer's newer receipt may have been read first). A status asked for after those totals were taken is
                 // newer, whatever its spend says (the seller may have given a charge back)
@@ -3384,23 +3447,43 @@ impl Signer {
     /// evidence, and the words for the fault (which stops the session).
     fn over_cap(&self, hs: &HttpSession, charged: u64, max_msat: u64, receipt: &Value) -> String {
         hs.over_cap.store(true, Ordering::SeqCst);
+        lock(&hs.evidence).get_or_insert_with(|| receipt.clone());
         self.ticket_audit("ticket_over_cap", json!({"session": hs.sid, "origin": hs.origin, "dest": format!("ln:{}", hs.terms.terms.payee),
                                                     "charged_msat": charged.to_string(), "max_msat": max_msat.to_string(), "receipt": receipt}));
         format!("the seller charged {charged} msat for one answer, more than the {max_msat} msat (max_sats {}) the call allowed and named to it; \
                  it is paid nothing more, and its signed receipt is kept in the wallet's log", max_msat / 1000)
     }
 
+    /// Who the session's seller is, for a block: its node, its receipt key and its origin.
+    fn seller_of(hs: &HttpSession) -> (String, String) {
+        (hs.terms.terms.payee.clone(), hex::encode(&hs.terms.receipt_key))
+    }
+
+    /// Block the session's seller for over-charging, with the evidence ([`crate::seller_block`]).
+    fn seller_block(&self, hs: &HttpSession, why: &str, evidence: Option<Value>) {
+        let (payee, rk) = Self::seller_of(hs);
+        let who = crate::seller_block::Seller { payee: &payee, receipt_key: &rk, origin: &hs.origin };
+        let evidence = json!({"receipt": evidence, "account": hs.public()});
+        self.seller_blocks.block(&who, why, &hs.sid, self.engine.now(), evidence);
+    }
+
+    /// The block on the session's seller, if it is blocked.
+    fn seller_blocked(&self, hs: &HttpSession) -> Option<Value> {
+        let (payee, rk) = Self::seller_of(hs);
+        self.seller_blocks.get(&crate::seller_block::Seller { payee: &payee, receipt_key: &rk, origin: &hs.origin })
+    }
+
     fn ticket_fault(&self, hs: &HttpSession, why: &str) -> Value {
-        let overcharged = {
+        let (overcharged, evidence) = {
             let mut m = lock_money(hs);
             m.fault.get_or_insert_with(|| why.to_string());
-            m.overcharged || hs.over_cap.load(Ordering::SeqCst)
+            (m.overcharged || hs.over_cap.load(Ordering::SeqCst), m.evidence.clone().or_else(|| lock(&hs.evidence).clone()))
         };
         // caught charging more than the wallet can account for: no new session with it until the owner lifts the block.
         // The evidence is the audit entry below. A fault of another kind (a node with no final answer, a seller that
         // forgot the session) stops the session and blocks nothing
         if overcharged {
-            self.seller_blocks.block(&hs.terms.terms.payee, &hs.origin, why, &hs.sid, self.engine.now());
+            self.seller_block(hs, why, evidence);
         }
         // with the wallet's count as it stood, for the owner who has to judge the seller
         self.ticket_audit("ticket_seller_fault", json!({"session": hs.sid, "origin": hs.origin, "dest": format!("ln:{}", hs.terms.terms.payee), "reason": why,
@@ -3419,6 +3502,11 @@ impl Signer {
     /// finding the balance covers them now, release nothing (`Ok`). A secret that has left and is
     /// not confirmed is delivered whatever it says.
     fn ticket_release_one(&self, hs: &HttpSession, spent: &mut Spent, opened: Instant, still_due: &dyn Fn() -> bool) -> std::result::Result<(), Value> {
+        // a seller blocked meanwhile (another session of it over-charged) is released nothing more
+        if let Some(b) = self.seller_blocked(hs) {
+            return Err(with(deny("seller_blocked", format!("this seller was caught charging more than it delivered ({}) and is blocked: nothing more \
+                                                            is released to it", b["reason"].as_str().unwrap_or_default())), json!({"seller_blocked": b["id"]})));
+        }
         if spent.credit_only {
             // the same rule as a call whose limit is spent: the caller asks again with the right to buy
             return Err(deny("max_sats", "this call draws only on the session's credit (credit_only) and buys no ticket"));
@@ -3784,12 +3872,16 @@ impl Signer {
                         self.seq_done(hs, seq);
                         // the seller may have it, queued, and charge it later: held as one it may still charge until a quiet
                         // point well after ([`Money::lose`]), but only for what could have arrived: nothing of its answer did
+                        // a request the wallet stopped waiting for (its own timeout) may still be served late by an honest
+                        // seller: held as one being answered, with what is paid ahead of it. One whose connection failed,
+                        // to what could have arrived. Either within the session's cap on lost requests ([`Money::lose`])
+                        let timed_out = { let w = e.msg.to_ascii_lowercase(); w.contains("timed out") || w.contains("timeout") };
                         let lost = if price.second_msat > 0 && !price.tokens.active() {
                             price.cost(CUT_SLACK, started.elapsed().as_secs().saturating_add(1)).unwrap_or(u64::MAX).min(max_msat)
                         } else {
-                            uncounted_most(price, reserve, max_msat, ticket_msat, 0, false)
+                            uncounted_most(price, reserve, max_msat, ticket_msat, 0, timed_out)
                         };
-                        lock_money(hs).lose(rid, lost);
+                        lock_money(hs).lose(rid, lost, price.tokens.active(), ticket_msat);
                         return fail(hs, &spent, with(refusal("ticket_seller", format!("the seller gave no answer to the paid request: {}", e.msg)), json!({"status": null})));
                     }
                 };
@@ -4433,8 +4525,13 @@ impl Signer {
                         // the answer's last receipt closes it: what the seller charged it is its word, as far as the wallet
                         // believes it ([`Bound`]), and the request adds nothing more to the seller's spend
                         let mut wrong = None;
+                        let mut overcharged = false;
                         if let Some(r) = &found {
                             let (believed, why) = bound.judge(r, &m);
+                            overcharged = r.charged > max_msat || bound.overcharges(r);
+                            if overcharged {
+                                m.evidence.get_or_insert_with(|| r.raw.clone());
+                            }
                             wrong = if r.charged > max_msat { Some(self.over_cap(hs, r.charged, max_msat, &r.raw)) } else { why };
                             m.close_by(rid, believed, head.charged.saturating_add(own.load(Ordering::SeqCst)), &bound);
                             believed_at = Some(believed);
@@ -4443,7 +4540,7 @@ impl Signer {
                         // releases another ticket to it from then on (one whose secret is already leaving the book, at
                         // most one, still goes: the fault is asked just before the book, not under its lock)
                         if let Some(why) = &wrong {
-                            m.overcharged = true;
+                            m.overcharged |= overcharged;
                             m.fault.get_or_insert_with(|| why.clone());
                         }
                         let wrong = wrong.is_some();
@@ -5147,7 +5244,7 @@ mod tests {
         let mut m = money(1_000_000);
         let rid = m.request_id();
         m.open.insert(rid, 40_000);
-        m.lose(rid, 40_000);
+        m.lose(rid, 40_000, false, 1_000_000);
         assert!(m.open.is_empty());
         // the seller served it after all and charged 30 sat: inside what it may, and not a quiet point
         assert_eq!(m.take(&receipt(3, 1_000_000, 30_000, 0), 0, false, None), Ok(true));
@@ -5158,6 +5255,42 @@ mod tests {
         m.lost.values_mut().for_each(|(_, at)| *at -= LOST_GRACE);
         assert_eq!(m.take(&receipt(5, 1_000_000, 30_000, 0), 0, false, None), Ok(true));
         assert!(m.lost.is_empty() && m.quiet_spent == 30_000);
+    }
+
+    /// Lost requests share one cap over the session (a ticket), so dropping many adds nothing past
+    /// it; and a seller that charges lost requests at three quiet points is over-charging.
+    ///
+    /// FAILS before: each lost request was allowed its own bound, and charging them was never a fault.
+    #[test]
+    fn lost_requests_share_one_cap_and_charging_them_again_and_again_is_over_charging() {
+        let mut m = money(10_000_000);
+        for _ in 0..5 {
+            let rid = m.request_id();
+            m.open.insert(rid, 600_000);
+            m.lose(rid, 600_000, false, 1_000_000);
+        }
+        let allowed: u64 = m.lost.values().map(|(a, _)| *a).sum();
+        assert_eq!(allowed, 1_000_000, "five lost requests of 600 sat each share one ticket");
+        // a reply held at its quote keeps it
+        let rid = m.request_id();
+        m.open.insert(rid, 300_000);
+        m.lose(rid, 300_000, true, 1_000_000);
+        assert_eq!(m.lost[&rid].0, 300_000);
+        // the seller charges lost requests at three quiet points: the third is over-charging
+        let mut spent = 0;
+        for i in 0..3u64 {
+            m.lost.values_mut().for_each(|(_, at)| *at -= LOST_GRACE);
+            spent += 10_000;
+            let r = m.take(&receipt(10 + i, 10_000_000, spent, 0), 0, false, None);
+            if i < 2 {
+                assert_eq!(r, Ok(true), "round {i}");
+                let rid = m.request_id();
+                m.open.insert(rid, 600_000);
+                m.lose(rid, 600_000, true, 1_000_000);
+            } else {
+                assert!(r.is_err() && m.overcharged, "{r:?}");
+            }
+        }
     }
 
     /// What an answer priced by the token holds back is not drawn: the estimate of the balance

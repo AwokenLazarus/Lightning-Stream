@@ -48,6 +48,14 @@ fn signer_at(dir: &Path, ticket: i64) -> (PathBuf, Arc<Mutex<Session>>) {
                 let p = req["params"].clone();
                 let max = p["max_sats"].as_i64().unwrap();
                 let url = p["url"].as_str().unwrap_or("").to_string();
+                // as the signer does: a seller whose terms (COST a request) are above the listing's price the buyer was shown
+                // is paid nothing
+                if p["price_ceiling"]["request_msat"].as_i64().is_some_and(|c| c < COST * 1000) {
+                    session.lock().unwrap().calls.push(p.clone());
+                    let _ = writeln!(conn, "{}", json!({"id": 1, "result": {"verdict": "deny", "rule": "price_ceiling",
+                                                                            "reason": "the seller's terms are above the price the buyer was shown", "charged_sats": 0}}));
+                    return;
+                }
                 if url.contains("/dear/") && max < 2_500 {
                     session.lock().unwrap().calls.push(p.clone());
                     let _ = writeln!(conn, "{}", json!({"id": 1, "result": {"verdict": "deny", "rule": "max_sats", "reason": "a dear answer",
@@ -123,6 +131,35 @@ fn open(addr: &str, limit: i64) -> String {
     let (status, _, b) = ask(addr, "POST", "/visits", "Content-Type: application/json\r\n", body.as_bytes());
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&b));
     serde_json::from_slice::<Value>(&b).unwrap()["visit"].as_str().unwrap().to_string()
+}
+
+/// A visit opened from a listing carries the listing's prices as the ceiling of every call it
+/// makes: within them the seller is paid; a seller whose terms ask more is refused and paid nothing.
+///
+/// FAILS before: a visit passed no ceiling, so a seller could ask more than it listed, up to each
+/// call's share.
+#[test]
+fn a_visit_pays_no_more_than_the_listing_it_was_chosen_from() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sock, session) = signer(dir.path());
+    let addr = start(sock, dir.path());
+    let open_at = |ceiling: Value| {
+        let body = json!({"base": "https://seller.example/app/", "limit_sats": 5_000, "price_ceiling": ceiling}).to_string();
+        let (status, _, b) = ask(&addr, "POST", "/visits", "Content-Type: application/json\r\n", body.as_bytes());
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&b));
+        serde_json::from_slice::<Value>(&b).unwrap()["visit"].as_str().unwrap().to_string()
+    };
+    let honest = json!({"request_msat": COST * 1000, "gib_msat": 0, "second_msat": 0, "input_per_1k_msat": 0, "output_per_1k_msat": 0});
+    let visit = open_at(honest.clone());
+    let (st, head, _) = ask(&addr, "GET", &format!("/v/{visit}/page"), "", b"");
+    assert_eq!(st, 200, "{head}");
+    assert_eq!(session.lock().unwrap().calls.last().unwrap()["price_ceiling"], honest);
+    // listed for less than it asks: refused, and nothing charged on this visit
+    let visit = open_at(json!({"request_msat": COST * 1000 - 1, "gib_msat": 0, "second_msat": 0, "input_per_1k_msat": 0, "output_per_1k_msat": 0}));
+    let (st, head, _) = ask(&addr, "GET", &format!("/v/{visit}/page"), "", b"");
+    assert_ne!(st, 200, "{head}");
+    let report: Value = serde_json::from_slice(&ask(&addr, "GET", &format!("/visits/{visit}"), "", b"").2).unwrap();
+    assert_eq!(report["spent_sats"], 0, "{report}");
 }
 
 #[test]

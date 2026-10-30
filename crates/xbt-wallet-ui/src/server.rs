@@ -227,7 +227,9 @@ impl xbt_svc::http::Handler for Ui {
                 let url = format!("{}/s/{item}", self.0.cfg.connector.trim_end_matches('/'));
                 // a range is asked for in parts of at most READ_CHUNK, whatever the reader asked
                 let range = bounded_range(req.headers.get("range").map(String::as_str), READ_CHUNK);
-                relay(&url, range.as_deref())
+                // the file's service's listed prices: the most each part is paid at
+                let ceiling = self.0.services().ok().and_then(|all| crate::services::find_item(&all, &item).and_then(|(s, _)| s.price_ceiling()));
+                relay(&url, range.as_deref(), ceiling.as_ref())
             }
         }
     }
@@ -271,9 +273,12 @@ const RELAYED: [&str; 3] = ["Content-Type", "Content-Range", "Accept-Ranges"];
 
 /// Stream the connector's answer for a seller URL to the reader, with the reader's `Range` (the
 /// connector takes one plain byte range and ignores any other).
-fn relay(url: &str, range: Option<&str>) -> xbt_svc::http::Reply {
+fn relay(url: &str, range: Option<&str>, ceiling: Option<&serde_json::Value>) -> xbt_svc::http::Reply {
     let agent = ureq::AgentBuilder::new().timeout_connect(std::time::Duration::from_secs(5)).redirects(0).build();
     let mut rq = agent.get(url);
+    if let Some(c) = ceiling {
+        rq = rq.set("X-Price-Ceiling", &c.to_string());
+    }
     if let Some(r) = range.map(str::trim).filter(|r| r.len() <= 128 && r.bytes().all(|b| b.is_ascii_graphic() || b == b' ')) {
         rq = rq.set("Range", r);
     }
