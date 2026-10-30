@@ -30,9 +30,12 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 - On StartOS, Files can share a folder from File Browser, read-only; File Browser stays optional.
 
 **Paying**
-- The price an AI seller or a VPN exit shows in its listing is now the most your wallet will pay it:
-  one that asks more than it advertised is refused before anything is paid. Other services stay
-  capped by each call's spending limit.
+- The price a shop shows in its listing is now the most your wallet will pay it: one that asks more
+  than it advertised is refused before anything is paid. This covers web apps, Files, AI, hashrate
+  and VPN exits.
+- A shop caught over-charging is blocked until you lift the block (with your signature); a shop that
+  loses requests is held to what they could have cost; each shop has a daily cap. Existing wallets
+  get a daily cap of 20,000 sats per shop until changed.
 - Several requests to one seller run side by side in one session, each exactly accounted, so a busy
   page no longer waits on itself. Whatever way an answer ends (whole, cut short, or reported late),
   the wallet believes the seller's charge by one rule, and a charge above it is a seller fault.
