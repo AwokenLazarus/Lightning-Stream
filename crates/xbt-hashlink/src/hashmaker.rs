@@ -285,7 +285,8 @@ impl Hub {
     }
 
     fn capacity(&self) -> Capacity {
-        let live: Vec<&Unit> = self.units.values().filter(|u| u.conn.is_some()).collect();
+        // the miners a rental could take (see `allocate`): with a fallback, only those that said their name
+        let live: Vec<&Unit> = self.units.values().filter(|u| u.conn.is_some() && (!u.provisional || self.fallback.is_none())).collect();
         let cap = self.rentable.unwrap_or(u32::MAX);
         let room = cap.saturating_sub(self.rented()) as usize;
         let mut free: Vec<&&Unit> = live.iter().filter(|u| u.rental.is_none()).collect();
@@ -330,9 +331,18 @@ impl Hub {
                 if r.want > 0 && r.units.len() as u32 >= r.want {
                     break;
                 }
-                let free = self.units.iter()
-                    .find(|(_, u)| u.rental.is_none() && u.conn.is_some_and(|c| self.conns.get(&c).is_some_and(|c| c.close_at.is_none() && !(c.hinted && u.provisional))))
-                    .map(|(k, _)| k.clone());
+                // a miner that has said its name. With no fallback (the lab) a new miner can say it only
+                // once a rental gives it an upstream, so one not yet named is taken too, after the named
+                // ones; with a fallback, a connection that never authorizes (a health check, a port
+                // scanner, a miner stuck before it authorizes) is never rented
+                let free_unit = |named: bool| {
+                    self.units.iter().find(|(_, u)| {
+                        u.rental.is_none()
+                            && u.provisional != named
+                            && u.conn.is_some_and(|c| self.conns.get(&c).is_some_and(|c| c.close_at.is_none() && !(c.hinted && u.provisional)))
+                    })
+                };
+                let free = free_unit(true).or_else(|| if self.fallback.is_none() { free_unit(false) } else { None }).map(|(k, _)| k.clone());
                 let Some(name) = free else { break };
                 self.units.get_mut(&name).unwrap().rental = Some(id.clone());
                 let r = self.rentals.get_mut(&id).unwrap();
