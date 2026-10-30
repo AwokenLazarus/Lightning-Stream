@@ -62,6 +62,7 @@ export const main = sdk.setupMain(async ({ effects }) => {
             mountpoint: m.mountpoint,
             readonly: true,
             type: m.dependency.type,
+            ...(m.idmap ? { idmap: m.idmap } : {}),
           })
         : mounts.mountVolume({ volumeId: 'main', subpath: m.subpath, mountpoint: m.mountpoint, readonly: m.readonly })
     }

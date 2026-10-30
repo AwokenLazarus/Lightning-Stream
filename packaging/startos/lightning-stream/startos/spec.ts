@@ -52,6 +52,8 @@ export type MountSpec = {
   mountpoint: string
   readonly: boolean
   dependency?: { packageId: string; volumeId: string; type: 'file' | 'directory' }
+  /** ids on the volume shown as other ids in the mount (the SDK's idmap), for another package's files */
+  idmap?: { fromId: number; toId: number; range?: number }[]
 }
 
 export type ServiceSpec = {
@@ -138,6 +140,13 @@ export const LF_GRANT = {
 export const FILE_BROWSER = {
   packageId: 'filebrowser',
   volumeId: 'data',
+  // what File Browser serves (its /srv); the rest of the volume is its config and database
+  subpath: 'data',
+  // File Browser writes its files as its own user (1000) with 0640/0750; the mount asks StartOS to show
+  // them as the UI's (10005). StartOS 0.4.0.1 does not apply it yet: there, only files others can read
+  // are shared
+  ownerId: 1000,
+  uiId: 10005,
   minVersion: '2.63.18:0',
   mountpoint: '/mnt/filebrowser',
   words: 'File Browser',
@@ -191,10 +200,11 @@ export function services(cfg: Config): ServiceSpec[] {
   const cert = ln ? [lightningCert] : []
   const fb = !!cfg.filesFromFileBrowser
   const fileBrowser: MountSpec = {
-    subpath: null,
+    subpath: FILE_BROWSER.subpath,
     mountpoint: FILE_BROWSER.mountpoint,
     readonly: true,
     dependency: { packageId: FILE_BROWSER.packageId, volumeId: FILE_BROWSER.volumeId, type: 'directory' },
+    idmap: [{ fromId: FILE_BROWSER.ownerId, toId: FILE_BROWSER.uiId }],
   }
   const relays = RELAYS.join(',')
   const lan = cfg.lanHost || '127.0.0.1'
