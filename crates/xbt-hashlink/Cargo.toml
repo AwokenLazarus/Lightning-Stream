@@ -24,6 +24,8 @@ xbt-nostr.workspace = true
 xbt-iroh-link = { path = "../xbt-iroh-link" }
 # the stand-in pool's and miner's share hash (lab only)
 blake2.workspace = true
+# a stand-in miner connecting from an address of its own, as miners on a LAN do (lab only; already in the tree)
+socket2 = "0.6"
 
 [[bin]]
 name = "xbt-hashlink"

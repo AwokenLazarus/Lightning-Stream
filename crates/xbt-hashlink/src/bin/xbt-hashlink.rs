@@ -182,6 +182,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 duration: f.get("duration-s").map(|v| v.parse().map(Duration::from_secs)).transpose().map_err(|_| "--duration-s")?,
                 reconnect: num(&f, "reconnect", Some(0u8))? == 1,
                 extranonce_subscribe: num(&f, "extranonce-subscribe", Some(0u8))? == 1,
+                bind: None,
             })?;
             eprintln!(
                 "miner: submitted {}, accepted {}, rejected {}, sessions {}, extranonce changes {}, longest gap {} ms",
