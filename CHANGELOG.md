@@ -44,6 +44,8 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
   once each way, instead of bouncing between connections under load. In a test of 25 rentals of 3
   miners each at once, every rental received 98–99% of the work its miners could do in that time.
   Buyers are charged only for work that reaches their pool.
+- A hashmaker rents out only miners that have connected and named themselves, so a rental never
+  gets a silent connection that does no work.
 
 ## 0.1.19 (2026-10-29)
 
