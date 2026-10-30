@@ -88,7 +88,7 @@ use crate::pyjson::{py_int, str_or_empty};
 use crate::sanitize::{untrusted, UNTRUSTED_KEY};
 use crate::signer::{deny, with, Signer};
 use crate::ticket::{sats_ceil, Admit, SState, SellerSession, SellerTls, Terms, TicketPolicy, HOLD_SHORT, ROUTE_FULL};
-use crate::ticket_http::{offers, Account, Offer, PayTerms, Price, Receipt};
+use crate::ticket_http::{offers, Account, Offer, PayTerms, Price, PriceCeiling, Receipt};
 use crate::{err, Result};
 
 mod draws;
@@ -2053,6 +2053,11 @@ impl Signer {
             Err(why) => return deny("headers", why),
         };
         let head_headers = stream_head && p.get("head_headers").and_then(Value::as_bool) == Some(true);
+        // the price the buyer was shown where it chose this seller: terms above it are paid nothing
+        let ceiling = match PriceCeiling::parse(p.get("price_ceiling")) {
+            Ok(c) => c,
+            Err(why) => return deny("price_ceiling", why),
+        };
         let upgrade = p.get("upgrade").and_then(Value::as_bool) == Some(true);
         let credit_only = p.get("credit_only").and_then(Value::as_bool) == Some(true);
         if upgrade && (stream_to.is_none() || method != "GET" || range.is_some()) {
@@ -2171,8 +2176,14 @@ impl Signer {
                 ways.insert(0, l);
             }
         }
+        let mut above: Option<String> = None;
         for offer in ways {
             let rail = offer.rail();
+            if let Some(why) = ceiling.as_ref().and_then(|c| offer.entries().into_iter().find_map(|a| c.over(a))) {
+                passed.push(json!({"rail": rail, "why": format!("price_ceiling: {why}")}));
+                above.get_or_insert(why);
+                continue;
+            }
             let tried = match &offer {
                 Offer::Ticket(..) | Offer::Lottery(_) if !tp.enabled => Tried::Next(tp.mainnet_off.clone().unwrap_or_else(|| "stream tickets are off in this policy (tickets.enabled)".into())),
                 Offer::Lottery(acc) => self.lottery_pay(&call, acc, &lightning),
@@ -2189,6 +2200,11 @@ impl Signer {
                 }
                 Tried::Next(why) => passed.push(json!({"rail": rail, "why": why})),
             }
+        }
+        // a seller asking more than the buyer was shown is refused as that, not as having no way to be paid
+        if let Some(why) = above {
+            return with(deny("price_ceiling", format!("the seller's terms are above the price the buyer was shown ({why}): nothing was paid")),
+                        json!({"charged_sats": 0, "rails_passed_over": passed}));
         }
         // what the 402 offers, in the wallet's words: a scheme it knows by name, and whether the network is one of its own
         let offered: Vec<Value> = pr.get("accepts").and_then(Value::as_array).into_iter().flatten()

@@ -117,6 +117,14 @@ pub const CONNECT_WAIT: Duration = Duration::from_secs(5);
 pub const OPEN_WAIT: Duration = Duration::from_secs(5);
 /// How often exits that failed are tried again, so one that comes back is used again.
 pub const PROBE_EVERY: Duration = Duration::from_secs(15);
+/// A paid tunnel that ends this soon, having carried less than [`YOUNG_BYTES`], died young: its
+/// exit is held off (30 s, doubling to an hour) instead of being paid to open again at once.
+pub const YOUNG: Duration = Duration::from_secs(10);
+pub const YOUNG_BYTES: u64 = 16 * 1024;
+/// The most a region check of a priced exit may cost (sats): it reads four small pages.
+pub const REGION_CHECK_MAX_SATS: u64 = 20;
+/// How long an exit whose terms are above what it announced is not used (bait and switch).
+pub const MISPRICED_HOLD: Duration = Duration::from_secs(24 * 3600);
 
 /// An exit the buyer is connected to, and where its UDP answers go.
 struct ExitConn {
@@ -166,8 +174,14 @@ pub struct Buyer {
     regions: RwLock<HashMap<String, (String, RegionCheck, std::time::SystemTime)>>,
     /// The owner's wallet, which pays for priced exits; none: only free exits are used.
     wallet: RwLock<Option<Arc<crate::paid::Wallet>>>,
-    /// Where each priced exit's paid tunnel opens (its announced `tunnel`), by exit id.
-    tunnels: RwLock<HashMap<String, String>>,
+    /// Where each priced exit's paid tunnel opens (its announced `tunnel`) and the price it
+    /// announced (msat a GB, the most the wallet pays it), by exit id.
+    tunnels: RwLock<HashMap<String, (String, u64)>>,
+    /// One opening of a paid tunnel at a time for each key, without holding [`Self::exits`] while
+    /// the wallet pays: other devices' and exits' flows go on.
+    opening: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Exits not to open paid tunnels to until a time: (until, the last hold, for doubling).
+    held_off: std::sync::Mutex<HashMap<String, (Instant, Duration)>>,
 }
 
 
@@ -204,6 +218,8 @@ impl Buyer {
             regions: RwLock::new(HashMap::new()),
             wallet: RwLock::new(None),
             tunnels: RwLock::new(HashMap::new()),
+            opening: std::sync::Mutex::new(HashMap::new()),
+            held_off: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -212,29 +228,78 @@ impl Buyer {
         *self.wallet.write().unwrap_or_else(|e| e.into_inner()) = w.map(Arc::new);
     }
 
-    /// Where `id`'s paid tunnel opens; `None`: the exit is reached straight (a free exit).
-    pub fn set_tunnel(&self, id: &str, url: Option<String>) {
+    /// Where `id`'s paid tunnel opens and the price it announced (msat a GB); `None`: the exit is
+    /// reached straight (a free exit).
+    pub fn set_tunnel(&self, id: &str, url: Option<String>, price_msat_per_gb: u64) {
         let mut t = self.tunnels.write().unwrap_or_else(|e| e.into_inner());
         match url {
-            Some(u) => t.insert(id.to_string(), u),
+            Some(u) => t.insert(id.to_string(), (u, price_msat_per_gb)),
             None => t.remove(id),
         };
     }
 
-    fn tunnel_of(&self, id: &str) -> Option<String> {
+    fn tunnel_of(&self, id: &str) -> Option<(String, u64)> {
         self.tunnels.read().unwrap_or_else(|e| e.into_inner()).get(id).cloned()
     }
 
-    /// What carries flows to `id` for a one-off use (a region check): its paid tunnel, or the link.
+    /// Whether `id` is held off (a tunnel that died young, or terms above its announcement).
+    pub fn is_held_off(&self, id: &str) -> bool {
+        let mut h = self.held_off.lock().unwrap_or_else(|e| e.into_inner());
+        match h.get(id) {
+            Some((until, _)) if Instant::now() < *until => true,
+            _ => false,
+        }
+    }
+
+    /// Holds `id` off for `hold`, or for twice its last hold (at most an hour) when `hold` is `None`.
+    fn hold_off(&self, id: &str, hold: Option<Duration>) {
+        let mut h = self.held_off.lock().unwrap_or_else(|e| e.into_inner());
+        let last = h.get(id).map(|(_, d)| *d);
+        let d = hold.unwrap_or_else(|| last.map_or(Duration::from_secs(30), |l| (l * 2).min(Duration::from_secs(3600))));
+        h.insert(id.to_string(), (Instant::now() + d, d));
+    }
+
+    /// Opens a paid tunnel to `id` at `url`, paying no more than its announced price (and, for a
+    /// one-off check, no more than `max_sats`). An exit whose terms are above its announcement is
+    /// held off for a day.
+    async fn open_paid(&self, id: &str, url: &str, price: u64, max_sats: Option<u64>) -> Option<crate::paid::Tunnel> {
+        let mut w = (*self.wallet.read().unwrap_or_else(|e| e.into_inner()).clone()?).clone();
+        if let Some(m) = max_sats {
+            w.max_sats = w.max_sats.min(m);
+        }
+        match tokio::time::timeout(crate::paid::OPEN_WAIT, crate::paid::open(&w, url, Some(crate::paid::ceiling(price)))).await {
+            Ok(Ok(t)) => Some(t),
+            Ok(Err(e)) => {
+                if e.to_string().contains("price_ceiling") {
+                    eprintln!("exit {}…: its terms are above the price it announced; not used for a day", &id[..12.min(id.len())]);
+                    self.hold_off(id, Some(MISPRICED_HOLD));
+                }
+                None
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// What carries flows to `id` for a one-off use (a region check): its paid tunnel, held to
+    /// [`REGION_CHECK_MAX_SATS`], or the link.
     async fn carrier_once(&self, id: &str) -> Option<Carrier> {
         match self.tunnel_of(id) {
-            Some(url) => {
-                let w = self.wallet.read().unwrap_or_else(|e| e.into_inner()).clone()?;
-                let t = tokio::time::timeout(crate::paid::OPEN_WAIT, crate::paid::open(&w, &url)).await.ok()?.ok()?;
-                Some(Carrier::Tunnel(t.mux))
-            }
+            Some(_) if self.is_held_off(id) => None,
+            Some((url, price)) => Some(Carrier::Tunnel(self.open_paid(id, &url, price, Some(REGION_CHECK_MAX_SATS)).await?.mux)),
             None => self.link.connect_conn_async(id).await.ok().map(Carrier::Link),
         }
+    }
+
+    /// Whether some device's own policy asks for `e`'s region and would otherwise take it: only
+    /// then is a priced exit's region worth paying to check. Its kind, price, and the owner's
+    /// exclusions must fit; its speed and health are measured after.
+    pub fn region_wanted(&self, e: &ExitInfo) -> bool {
+        self.devices.values().filter_map(|d| d.requirements.as_ref()).any(|r| {
+            r.region.as_deref().is_some_and(|w| w.eq_ignore_ascii_case(&e.region))
+                && r.max_price_msat_per_gb.is_none_or(|p| e.price_msat_per_gb <= p)
+                && r.kind.allows(e)
+                && !r.exclude.iter().any(|x| x == &e.id || x == &e.operator)
+        })
     }
 
     /// The geo-IP table regions are checked against (see [`crate::region::load_or_fetch`]).
@@ -471,30 +536,40 @@ impl Buyer {
                 return Some(e.clone());
             }
         }
-        if let (None, Some(url)) = (&hop, tunnel) {
-            let wallet = self.wallet.read().unwrap_or_else(|e| e.into_inner()).clone();
-            let opened = match wallet {
-                Some(w) => tokio::time::timeout(crate::paid::OPEN_WAIT, crate::paid::open(&w, &url)).await.ok().and_then(Result::ok),
-                // a priced exit with no wallet to pay it: not usable
-                None => None,
-            };
-            let Some(t) = opened else {
-                drop(ex);
+        if let (None, Some((url, price))) = (&hop, tunnel) {
+            // the map is not held while the wallet pays: one opening per key, the rest go on
+            drop(ex);
+            if self.is_held_off(id) {
+                self.fail_exit(id).await;
+                return None;
+            }
+            let gate = self.opening.lock().unwrap_or_else(|e| e.into_inner()).entry(key.clone()).or_default().clone();
+            let _one = gate.lock().await;
+            if let Some(e) = self.exits.lock().await.get(&key).filter(|e| !e.conn.is_closed()) {
+                return Some(e.clone());
+            }
+            let Some(t) = self.open_paid(id, &url, price, None).await else {
+                // a priced exit with no wallet to pay it, or one the wallet would not pay: not usable
                 self.fail_exit(id).await;
                 return None;
             };
+            let (mux, opened_at, me, exit_id) = (t.mux.clone(), Instant::now(), self.clone(), id.to_string());
             let conn = Carrier::Tunnel(t.mux);
-            // what the wallet said when the tunnel ended (charged, or why it stopped), for the log
+            // what the wallet said when the tunnel ended (charged, or why it stopped), for the log; a
+            // tunnel that died young holds its exit off, so its opening is not paid for again and again
             std::thread::spawn(move || {
                 if let Ok(Ok(v)) = t.done.recv() {
                     if let Some(why) = v.get("ended").and_then(serde_json::Value::as_str) {
                         eprintln!("a paid tunnel ended: {why}");
                     }
                 }
+                if opened_at.elapsed() < YOUNG && mux.received() < YOUNG_BYTES {
+                    me.hold_off(&exit_id, None);
+                }
             });
             let e = Arc::new(ExitConn { conn: conn.clone(), udp: Arc::new(Mutex::new(HashMap::new())), sealed: None });
             spawn_udp_routes(conn, e.udp.clone());
-            ex.insert(key, e.clone());
+            self.exits.lock().await.insert(key, e.clone());
             return Some(e);
         }
         if let Some(h) = hop {

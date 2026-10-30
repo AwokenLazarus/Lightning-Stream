@@ -134,6 +134,52 @@ impl Price {
     }
 }
 
+// --- the price the buyer was shown --------------------------------------------------------------------
+
+/// The most the buyer agreed to pay, per part of the price, as the listing or announcement it chose
+/// from showed it (`price_ceiling`): a seller whose 402 asks more than it advertised is paid
+/// nothing. A part the caller leaves out must be free in the seller's terms: a listing that showed a
+/// price per GB and nothing per request did not agree to a charge per request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PriceCeiling {
+    pub request_msat: u64,
+    /// Per GiB (2^30 bytes) of the answer's body.
+    pub gib_msat: u64,
+    pub second_msat: u64,
+    pub input_per_1k_msat: u64,
+    pub output_per_1k_msat: u64,
+}
+
+impl PriceCeiling {
+    /// From the call's `price_ceiling` object; `Ok(None)` when the caller gave none.
+    pub fn parse(v: Option<&Value>) -> Result<Option<Self>, String> {
+        let Some(v) = v.filter(|v| !v.is_null()) else { return Ok(None) };
+        if !v.is_object() {
+            return Err("price_ceiling is an object of whole msat amounts".into());
+        }
+        let num = |k: &str| match v.get(k).filter(|x| !x.is_null()) {
+            None => Ok(0),
+            Some(x) => outside_u64(Some(x)).ok_or(format!("price_ceiling.{k} is not a whole number of msat")),
+        };
+        Ok(Some(Self { request_msat: num("request_msat")?, gib_msat: num("gib_msat")?, second_msat: num("second_msat")?,
+                       input_per_1k_msat: num("input_per_1k_msat")?, output_per_1k_msat: num("output_per_1k_msat")? }))
+    }
+
+    /// Why an offer's price is above this ceiling, in words; `None` when it is within it.
+    pub fn over(&self, acc: &Value) -> Option<String> {
+        let p = match Price::parse(acc) {
+            Ok(p) => p,
+            Err((_, why)) => return Some(format!("its price could not be read ({why})")),
+        };
+        let gib = p.for_bytes(1 << 30).unwrap_or(u64::MAX);
+        let parts = [("request", p.request_msat, self.request_msat), ("per GiB", gib, self.gib_msat), ("per second", p.second_msat, self.second_msat),
+                     ("per 1,000 input tokens", p.tokens.input_per_1k_msat, self.input_per_1k_msat),
+                     ("per 1,000 output tokens", p.tokens.output_per_1k_msat, self.output_per_1k_msat)];
+        parts.iter().find(|(_, asked, most)| asked > most)
+            .map(|(what, asked, most)| format!("it asks {asked} msat {what}, above the {most} msat the buyer was shown"))
+    }
+}
+
 // --- the terms ---------------------------------------------------------------------------------------
 
 /// A ticket entry of a seller's 402, read whole: what the book needs ([`Terms`]) and what the HTTP
@@ -207,6 +253,15 @@ impl Offer {
             Offer::Ticket(..) => "ticket",
             Offer::Lottery(_) => "lottery",
             Offer::Lightning(_) => "ln",
+        }
+    }
+
+    /// The `accepts` entries this way of paying would pay by: a ticket entry and, beside it, the
+    /// seller's entry for prepaid tickets if it lists one.
+    pub fn entries(&self) -> Vec<&Value> {
+        match self {
+            Offer::Ticket(a, prepaid) => std::iter::once(a).chain(prepaid.as_ref()).collect(),
+            Offer::Lottery(a) | Offer::Lightning(a) => vec![a],
         }
     }
 }
@@ -387,6 +442,28 @@ mod tests {
         json!({"scheme": "ticket", "network": NET, "asset": "XBT:msat", "amount": "2500", "payTo": node_id(),
                "extra": {"version": "ticket/0", "layer": "lightning", "features": [512], "ticketMsat": "1000000", "maxTickets": 8, "ticketBlocks": 40,
                          "release": "with-request", "settle": "on-use", "receiptKey": hex::encode(key().1), "session": "/x402/ticket", "price": price}})
+    }
+
+    #[test]
+    fn a_price_above_what_the_buyer_was_shown_is_named_and_one_within_it_passes() {
+        // 200,000 msat a MiB is 204,800,000 msat a GiB
+        let per_mib = accepts(json!({"requestMsat": "2500", "byteMsat": "200000", "perBytes": "1048576"}));
+        let shown = PriceCeiling::parse(Some(&json!({"request_msat": 2500, "gib_msat": "204800000"}))).unwrap().unwrap();
+        assert_eq!(shown.over(&per_mib), None);
+        let cheaper = PriceCeiling { gib_msat: 204_799_999, ..shown };
+        assert!(cheaper.over(&per_mib).is_some_and(|w| w.contains("per GiB")), "{:?}", cheaper.over(&per_mib));
+        // a part the buyer was not shown must be free: a per-GB listing agreed to no charge per request
+        let per_gb_only = PriceCeiling { request_msat: 0, ..shown };
+        assert!(per_gb_only.over(&per_mib).is_some_and(|w| w.contains("request")));
+        let by_second = accepts(json!({"requestMsat": "2500", "secondMsat": "10"}));
+        assert!(shown.over(&by_second).is_some_and(|w| w.contains("per second")));
+        let by_token = accepts(json!({"requestMsat": "2500", "inputPer1kMsat": "100", "outputPer1kMsat": "300"}));
+        let ai = PriceCeiling { input_per_1k_msat: 100, output_per_1k_msat: 299, ..shown };
+        assert!(ai.over(&by_token).is_some_and(|w| w.contains("output")));
+        assert_eq!(PriceCeiling { output_per_1k_msat: 300, ..ai }.over(&by_token), None);
+        assert_eq!(PriceCeiling::parse(None), Ok(None));
+        assert!(PriceCeiling::parse(Some(&json!({"gib_msat": -1}))).is_err());
+        assert!(PriceCeiling::parse(Some(&json!("cheap"))).is_err());
     }
 
     #[test]

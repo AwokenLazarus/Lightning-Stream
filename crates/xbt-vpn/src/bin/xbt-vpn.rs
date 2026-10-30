@@ -268,7 +268,9 @@ fn fetch(args: &[String], relay: String, private: bool) -> std::io::Result<()> {
     let (way, via) = match (&tunnel, &hop_id) {
         (Some(url), _) => {
             let w = xbt_vpn::paid::Wallet::from_env().ok_or_else(|| std::io::Error::other("--tunnel needs B2_SIGNER_SOCK and B2_STREAM_DIR"))?;
-            let t = link.runtime().block_on(xbt_vpn::paid::open(&w, url))?;
+            // the exit's announced price a GB, if given, is the most the wallet pays it
+            let ceiling = arg(args, "--price-msat-gb").and_then(|p| p.parse().ok()).map(xbt_vpn::paid::ceiling);
+            let t = link.runtime().block_on(xbt_vpn::paid::open(&w, url, ceiling))?;
             // what the wallet says when the tunnel ends, printed once it does
             std::thread::spawn(move || {
                 if let Ok(r) = t.done.recv() {
@@ -497,20 +499,27 @@ fn serve(args: &[String], relay: String) -> std::io::Result<()> {
         let (buyer, link, nostr, own, relay, rt) = (buyer.clone(), buyer_link.clone(), nostr.clone(), own_exit.clone(), relay.clone(), rt.clone());
         std::thread::spawn(move || {
             let mut checked: HashMap<String, (String, bool, std::time::Instant)> = HashMap::new();
+            // priced exits are paid to have their region checked: a few a round, and only those a
+            // device's own policy asks for by region (see Buyer::region_wanted)
+            const PRICED_CHECKS_PER_ROUND: usize = 3;
             loop {
+                let mut priced_checks = 0;
                 if !nostr.is_empty() {
                     let (events, _) = xbt_nostr::oneshot::query(&nostr, &announce::filter(500), Duration::from_secs(15));
                     let (found, _) = announce::collect(&events, xbt_nostr::now());
                     // a priced exit that names no tunnel can't be paid: not used
                     for mut a in found.into_iter().filter(|a| Some(&a.exit.id) != own.as_ref() && (a.exit.price_msat_per_gb == 0 || a.tunnel.is_some())) {
-                        buyer.set_tunnel(&a.exit.id, a.tunnel.clone());
+                        buyer.set_tunnel(&a.exit.id, a.tunnel.clone(), a.exit.price_msat_per_gb);
                         let relays = vec![a.relay.clone().unwrap_or_else(|| relay.clone())];
                         if link.learn(&a.exit.id, Hints { relays, direct: Vec::new() }).is_err() {
                             continue;
                         }
                         let region = a.exit.region.clone();
                         let stale = checked.get(&a.exit.id).is_none_or(|(r, _, at)| *r != region || at.elapsed() > Duration::from_secs(6 * 3600));
-                        if stale && region.len() == 2 {
+                        let priced = a.exit.price_msat_per_gb > 0;
+                        let worth = !priced || (buyer.region_wanted(&a.exit) && !buyer.is_held_off(&a.exit.id) && priced_checks < PRICED_CHECKS_PER_ROUND);
+                        if stale && region.len() == 2 && worth {
+                            priced_checks += usize::from(priced);
                             let result = rt.block_on(buyer.verify_region(&a.exit.id, &region));
                             if result != xbt_vpn::region::RegionCheck::Verified {
                                 eprintln!("exit {}…: region {region} not verified ({result:?})", &a.exit.id[..12.min(a.exit.id.len())]);

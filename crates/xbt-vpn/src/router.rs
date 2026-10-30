@@ -156,7 +156,7 @@ pub enum Want {
 }
 
 impl Want {
-    fn allows(&self, e: &ExitInfo) -> bool {
+    pub fn allows(&self, e: &ExitInfo) -> bool {
         match self {
             Want::Private => !e.filtered,
             Want::Filtered(cats) => e.filtered && cats.iter().all(|c| e.categories.iter().any(|x| x.eq_ignore_ascii_case(c))),

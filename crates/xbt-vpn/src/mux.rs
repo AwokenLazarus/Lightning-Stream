@@ -69,6 +69,8 @@ struct Inner {
     next_id: AtomicU32,
     dgram_queued: AtomicUsize,
     closed: AtomicBool,
+    /// Bytes read from the other side, frames and all.
+    received: std::sync::atomic::AtomicU64,
 }
 
 impl Inner {
@@ -119,6 +121,7 @@ impl Mux {
             next_id: AtomicU32::new(if opener { 1 } else { 2 }),
             dgram_queued: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
+            received: std::sync::atomic::AtomicU64::new(0),
         });
         tokio::spawn(write_loop(wr, out_rx, inner.clone()));
         tokio::spawn(read_loop(rd, early, inner.clone(), acc_tx, dg_tx));
@@ -173,6 +176,11 @@ impl Mux {
 
     pub fn is_closed(&self) -> bool {
         self.inner.closed.load(Ordering::SeqCst)
+    }
+
+    /// The bytes read from the other side so far (frames and all).
+    pub fn received(&self) -> u64 {
+        self.inner.received.load(Ordering::Relaxed)
     }
 
     /// Ends the tunnel: every flow on it ends, and the byte stream with them (for a paid tunnel,
@@ -238,7 +246,10 @@ async fn read_loop<R: AsyncRead + Unpin>(mut rd: R, early: Vec<u8>, inner: Arc<I
         let mut chunk = [0u8; 64 * 1024];
         match rd.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
-            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Ok(n) => {
+                inner.received.fetch_add(n as u64, Ordering::Relaxed);
+                buf.extend_from_slice(&chunk[..n]);
+            }
         }
     }
     inner.close_all();

@@ -65,11 +65,19 @@ fn random_hex() -> String {
     hex::encode(b)
 }
 
-/// Opens a paid tunnel at `url` (the exit's announced `tunnel`). Must run inside a Tokio runtime.
-/// `Err`: the wallet refused (its rules, its balance) or the seller did not open it, in words.
-pub async fn open(w: &Wallet, url: &str) -> io::Result<Tunnel> {
+/// The `price_ceiling` of a tunnel to an exit that announced `price_msat_per_gb`: the shop's route
+/// is priced per GiB at that number and nothing per request, so the wallet pays no more than that.
+pub fn ceiling(price_msat_per_gb: u64) -> Value {
+    json!({"request_msat": 0, "gib_msat": price_msat_per_gb})
+}
+
+/// Opens a paid tunnel at `url` (the exit's announced `tunnel`), paying no more than `ceiling` (the
+/// price the exit announced, [`ceiling`]). Must run inside a Tokio runtime.
+/// `Err`: the wallet refused (its rules, its balance, terms above the ceiling) or the seller did not
+/// open it, in words.
+pub async fn open(w: &Wallet, url: &str, ceiling: Option<Value>) -> io::Result<Tunnel> {
     let (w, url) = (w.clone(), url.to_string());
-    let (std_stream, early, done) = tokio::task::spawn_blocking(move || open_blocking(&w, &url))
+    let (std_stream, early, done) = tokio::task::spawn_blocking(move || open_blocking(&w, &url, ceiling))
         .await
         .map_err(|e| io::Error::other(e.to_string()))??;
     std_stream.set_nonblocking(true)?;
@@ -79,7 +87,7 @@ pub async fn open(w: &Wallet, url: &str) -> io::Result<Tunnel> {
 
 type Opened = (std::os::unix::net::UnixStream, Vec<u8>, std::sync::mpsc::Receiver<Result<Value, String>>);
 
-fn open_blocking(w: &Wallet, url: &str) -> io::Result<Opened> {
+fn open_blocking(w: &Wallet, url: &str, ceiling: Option<Value>) -> io::Result<Opened> {
     let name = format!("vpn-{}", random_hex());
     let path = w.stream_dir.join(&name);
     let listener = std::os::unix::net::UnixListener::bind(&path)?;
@@ -88,6 +96,9 @@ fn open_blocking(w: &Wallet, url: &str) -> io::Result<Opened> {
                             "stream_to": name, "stream_head": true, "head_headers": true,
                             "headers": [["Sec-WebSocket-Key", random_hex()], ["Sec-WebSocket-Version", "13"]]});
     if let Some(m) = params.as_object_mut() {
+        if let Some(c) = ceiling {
+            m.insert("price_ceiling".into(), c);
+        }
         xbt_wallet_mcp::wallet::with_transport(m);
     }
     let (tx, done) = std::sync::mpsc::channel();

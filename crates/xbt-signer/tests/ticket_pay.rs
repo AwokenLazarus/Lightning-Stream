@@ -1186,6 +1186,27 @@ fn body_of(v: &Value) -> &str {
 // --- the path that works ------------------------------------------------------------------------------
 
 #[test]
+fn a_seller_asking_more_than_the_buyer_was_shown_is_paid_nothing() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    // /files/ is 200,000 msat a MiB: 204,800,000 msat a GiB. Shown one msat less, the buyer pays nothing,
+    // and no ticket is locked: the wallet asked the price and went no further
+    let url = r.shop.url("/files/1000");
+    let cheaper = json!({"request_msat": 10_000, "gib_msat": 204_799_999});
+    let v = r.call("xbt402_pay", json!({"url": url, "max_sats": CALL, "task": "film", "price_ceiling": cheaper}));
+    assert_eq!((v["verdict"].as_str(), v["rule"].as_str(), v["charged_sats"].as_i64()), (Some("deny"), Some("price_ceiling"), Some(0)), "{v}");
+    assert!(v["reason"].as_str().is_some_and(|w| w.contains("per GiB")), "{v}");
+    assert!(r.tap.log.lock().unwrap().iter().all(|s| !s.path.starts_with("/x402/") && !s.paid), "nothing but the unpaid ask left the wallet");
+    assert_eq!((r.shop.settled(), r.shop.held()), (0, 0));
+    // shown the price it asks, it is paid as before
+    let v = r.call("xbt402_pay", json!({"url": url, "max_sats": CALL, "task": "film", "price_ceiling": {"request_msat": 10_000, "gib_msat": 204_800_000}}));
+    assert_eq!((v["verdict"].as_str(), v["status"].as_u64()), (Some("allow"), Some(200)), "{v}");
+    // a ceiling that is not one is refused before anything is asked
+    let v = r.call("xbt402_pay", json!({"url": url, "max_sats": CALL, "task": "film", "price_ceiling": "cheap"}));
+    assert_eq!(v["rule"].as_str(), Some("price_ceiling"), "{v}");
+}
+
+#[test]
 fn a_page_is_paid_with_one_ticket_and_the_next_pages_from_the_balance() {
     let _g = env_lock();
     let r = Rig::new(json!({}));
