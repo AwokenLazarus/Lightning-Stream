@@ -141,3 +141,26 @@ fn a_shop_on_several_keys_is_reached_through_one_that_answers() {
         assert!(buyer.bind_shop_links(&shop, &[]).is_err());
     }
 }
+
+#[test]
+fn many_requests_at_once_reach_a_shop_on_several_keys() {
+    let size = 256 << 10;
+    let upstream = service(size);
+    let keys: Vec<_> = (0..4).map(|_| Link::start(secret(), Relays::None, true).unwrap()).collect();
+    for l in &keys {
+        l.serve(([127, 0, 0, 1], upstream).into());
+    }
+    let buyer = Link::start(secret(), Relays::None, false).unwrap();
+    for l in &keys {
+        buyer.learn(&l.endpoint_id(), Hints { relays: vec![], direct: l.hints(Duration::from_millis(200)).direct }).unwrap();
+    }
+    let shop = format!("{}{}", "c".repeat(52), xbt_iroh_link::SHOP_SUFFIX);
+    buyer.bind_shop_links(&shop, &keys.iter().map(|l| l.endpoint_id()).collect::<Vec<_>>()).unwrap();
+    let port = buyer.resolve(&format!("{shop}:80")).unwrap().unwrap()[0].port();
+    let t = std::time::Instant::now();
+    let hs: Vec<_> = (0..300).map(|_| { let shop = shop.clone(); std::thread::spawn(move || get(port, &shop, size)) }).collect();
+    for h in hs {
+        h.join().unwrap();
+    }
+    assert!(t.elapsed() < Duration::from_secs(30), "300 requests took {:?}", t.elapsed());
+}
