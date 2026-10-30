@@ -1644,7 +1644,7 @@ def link_relay() -> None:
 
 # --- a VPN exit, paid as it is used --------------------------------------------------------------------------
 
-VPN_SAT_GB = 500_000  # 500 sat a GiB: a 10 MiB download is a few tickets
+VPN_SAT_GB = 500_000  # 500,000 sat a GiB (about 4.9 sat a MiB): a 10 MiB download is several tickets
 VPN_FILES = ["http://speed.cloudflare.com/__down?bytes=10485760", "http://ipv4.download.thinkbroadband.com/10MB.zip"]
 VPN_BYTES = 10_485_760
 
@@ -1692,7 +1692,7 @@ def vpn() -> None:
                            capture_output=True, text=True, timeout=300)
         line = next((ln for ln in r.stdout.splitlines() if ln.startswith("{")), "")
         out = json.loads(line) if line else {"stderr": r.stderr[-800:]}
-        if out.get("bytes") == VPN_BYTES:
+        if VPN_BYTES <= int(out.get("bytes") or 0) <= VPN_BYTES + 4096:
             break
     took = time.monotonic() - t0
     # the tunnel ended as the fetch did: its last receipt closed it
@@ -1707,7 +1707,8 @@ def vpn() -> None:
     exit_status = json.load(open(f"{vdir}/exit-status.json")) if os.path.exists(f"{vdir}/exit-status.json") else {}
     mbit = round(VPN_BYTES * 8 / took / 1e6, 1) if took else None
     measured("vpn_10mib_mbit_s", mbit)
-    whole = bool(out) and out.get("bytes") == VPN_BYTES
+    # the file and its HTTP head: the fetch counts every byte the tunnel brought back
+    whole = bool(out) and VPN_BYTES <= int(out.get("bytes") or 0) <= VPN_BYTES + 4096
     check("vpn: a VPN exit sold as a Stream service: a 10 MiB download came whole through a paid tunnel the wallet opened, paid as its bytes passed "
           "with the exit's interim receipts checked and no fault; every ticket the seller took is booked once and the money agrees",
           whole and faults == 0 and len(paid) > 0 and not inv["not_in_ledger"] and inv["same_tickets"] and agrees(m, receipts=False),
