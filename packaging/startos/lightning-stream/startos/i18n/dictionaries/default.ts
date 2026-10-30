@@ -66,6 +66,11 @@ const dict = {
   'Let Lightning Stream pay through this node, within the spending rules you sign. It cannot open or close channels.': 68,
   'AI address for programs': 69,
   'Programs on your network that speak the OpenAI API use AI sellers here, each with a key from the AI page': 70,
+  'Files folder': 71,
+  "Where the Files service's folder is. File Browser: you put files in File Browser, then choose the folder on the Sell page; Stream only reads them. This app: a folder in this app's own storage.": 72,
+  "This app's own folder": 73,
+  'File Browser': 74,
+  'Share your File Browser files with the Files service (read-only), or use the folder in this app': 75,
 } as const
 
 /**

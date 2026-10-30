@@ -22,7 +22,7 @@ listed, four folders deep.
 |---|---|
 | Linux | `XBT_UI_FILES_DIR`, by default `<the UI's data dir>/files`: point it at any folder |
 | Umbrel | a folder the owner chooses on the Sell page, under the **Downloads** folder of Umbrel's Files app |
-| StartOS | `<the UI's data dir>/files` in the package's volume |
+| StartOS | a folder the owner chooses on the Sell page, of **File Browser**'s files (the *Files folder* action); otherwise `<the UI's data dir>/files` in the package's volume |
 
 **Umbrel.** The app mounts Umbrel's shared Downloads **read-only** (`/downloads` in the app; the
 `STORAGE_DOWNLOADS` permission), as media apps on Umbrel do. The owner puts files in Downloads with
@@ -35,8 +35,13 @@ of it; a choice that leads out (written by hand, say) shares nothing at all.
 Any Linux box can do the same: set `XBT_UI_FILES_ROOT` to a folder (mounted read-only if you like) and
 `XBT_UI_FILES_ROOT_WORDS` to what the page should call it; the owner then chooses under it.
 
-**StartOS** has no shared folder of the box's files that a package can read, so the folder stays in
-the package's own volume, reached with StartOS's file tools.
+**StartOS.** A package can read another package's volume as an optional dependency, as Jellyfin's
+StartOS package reads File Browser for media. The *Files folder* action (Actions in the StartOS
+dashboard) chooses File Browser: StartOS then asks for File Browser to be installed (it need not be
+running), and the UI mounts File Browser's `data` volume, what File Browser shows, **read-only** at
+`/mnt/filebrowser` (`XBT_UI_FILES_ROOT`). The owner puts files in File Browser and picks the folder on
+the Sell page, held to it as on Umbrel. Without that choice (the default) Stream needs no File Browser,
+and the folder stays in the package's own volume, reached with StartOS's file tools.
 
 ### How it is served
 

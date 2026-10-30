@@ -38,5 +38,13 @@ export const manifest = setupManifest({
         icon: 'https://raw.githubusercontent.com/paulscode/lightning-fork-startos/master/icon.png',
       },
     },
+    filebrowser: {
+      description: 'Optional. With "Files folder" set to File Browser, the Files service shares a folder of your File Browser files, read-only: Stream never changes or deletes them.',
+      optional: true,
+      metadata: {
+        title: 'File Browser',
+        icon: 'https://raw.githubusercontent.com/Start9Labs/filebrowser-quantum-startos/e936a6c85a97b930b43cad5e9c0dd4898a2df567/icon.svg',
+      },
+    },
   },
 })

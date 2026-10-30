@@ -40,7 +40,15 @@ export const main = sdk.setupMain(async ({ effects }) => {
   // StartOS's proxy reaches this package from the OS's address on the bridge: its X-Forwarded-For is the buyer's
   const osIp = await sdk.getOsIp(effects).catch(() => '')
 
-  const specs = services({ node: store.node, mcpUrls, lightningRest, proxies: osIp ? [osIp] : [], lanHost, aiUrls })
+  const specs = services({
+    node: store.node,
+    mcpUrls,
+    lightningRest,
+    proxies: osIp ? [osIp] : [],
+    lanHost,
+    aiUrls,
+    filesFromFileBrowser: store.filesSource === 'filebrowser',
+  })
   const spec = (id: ServiceSpec['id']) => specs.find((s) => s.id === id) as ServiceSpec
 
   const sub = (s: ServiceSpec) => {

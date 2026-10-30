@@ -82,6 +82,8 @@ export type Config = {
   lanHost: string
   /** the AI interface's addresses (`…/v1`), the first shown on the UI's AI page; empty before StartOS names one */
   aiUrls?: string[]
+  /** the Files service shares a folder of File Browser's files (read-only) instead of the package's own */
+  filesFromFileBrowser?: boolean
 }
 
 /** The Lightning node's certificate: Lightning Fork's public/ folder, which holds only tls.cert. */
@@ -118,6 +120,20 @@ export const LF_GRANT = {
   permissions: ['info:read', 'offchain:read', 'offchain:write', 'onchain:read'],
   /** how often node-keys looks for a grant, or a revocation, in seconds */
   watchS: 10,
+} as const
+
+/**
+ * File Browser's files, which the Files service can share instead of the package's own folder: its `data`
+ * volume (what File Browser shows, at /srv in its own container), mounted read-only into the UI, as
+ * Jellyfin's StartOS package mounts it for media. An optional dependency, needed only once the owner
+ * chooses it in the "Files folder" action.
+ */
+export const FILE_BROWSER = {
+  packageId: 'filebrowser',
+  volumeId: 'data',
+  minVersion: '2.63.18:0',
+  mountpoint: '/mnt/filebrowser',
+  words: 'File Browser',
 } as const
 
 /** The DATUM Gateways the hashtaker sends rented work to, by their StartOS names (the BLAKE2b one first). */
@@ -164,6 +180,13 @@ export function services(cfg: Config): ServiceSpec[] {
   }
   const ln = !!cfg.lightningRest
   const cert = ln ? [lightningCert] : []
+  const fb = !!cfg.filesFromFileBrowser
+  const fileBrowser: MountSpec = {
+    subpath: null,
+    mountpoint: FILE_BROWSER.mountpoint,
+    readonly: true,
+    dependency: { packageId: FILE_BROWSER.packageId, volumeId: FILE_BROWSER.volumeId, type: 'directory' },
+  }
   const relays = RELAYS.join(',')
   const lan = cfg.lanHost || '127.0.0.1'
   const components = ['signer', 'witness', 'mcp', 'ui', 'gateway', 'hashrate']
@@ -294,6 +317,9 @@ export function services(cfg: Config): ServiceSpec[] {
         XBT_UI_AI_SELLERS: '/data/run/ai/sellers.json',
         XBT_UI_CREDENTIALS: '/data/run/ai/credentials.json',
         XBT_UI_AI_STATE: '/data/run/ai/state.json',
+        // Files: with File Browser chosen, the owner picks a folder of its files on the Sell page (read-only);
+        // otherwise the folder is the UI's own (<data dir>/files), reached with StartOS's file tools
+        ...(fb ? { XBT_UI_FILES_ROOT: FILE_BROWSER.mountpoint, XBT_UI_FILES_ROOT_WORDS: FILE_BROWSER.words } : {}),
       },
       // the UI owns the MCP token and rotates it on its Agents page; its pages write run/ln, run/gateway and
       // run/hashrate (the shop's and the hashrate settings)
@@ -308,6 +334,7 @@ export function services(cfg: Config): ServiceSpec[] {
         vol('run/ai', '/data/run/ai'),
         vol('run/enroll', '/data/run/enroll', true),
         ...cert,
+        ...(fb ? [fileBrowser] : []),
       ],
       requires: ['signer'],
       port: PORTS.ui,
