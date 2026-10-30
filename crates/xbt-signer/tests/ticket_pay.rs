@@ -2217,6 +2217,57 @@ fn a_cut_answer_never_listed_closed_is_given_up_without_stopping_the_session() {
     r.assert_booked();
 }
 
+/// A cut answer whose last receipt is listed only after the wallet stopped waiting for it, charging
+/// past its call's limit: the seller's fault, as where it is listed at once. The session is stopped
+/// and nothing more is released into it.
+///
+/// FAILS before: the late receipt's charge was taken whole, past the limit, and the next call went on
+/// buying tickets.
+#[test]
+fn a_cut_answer_listed_late_and_charged_past_its_limit_is_a_seller_fault() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    assert_eq!(r.pay("/page/10", CALL)["status"].as_u64(), Some(200));
+    // the last receipts of answers that end while `hiding` are kept back; listed later, charged 3,000 sat
+    let hiding = Arc::new(AtomicBool::new(true));
+    let hidden = Arc::new(Mutex::new(vec![]));
+    let (h, gone) = (hiding.clone(), hidden.clone());
+    r.tap.set(Box::new(move |seen, real| {
+        if !seen.path.ends_with("/x402/ticket/status") {
+            return None;
+        }
+        let (status, headers, body) = whole(real().ok()?);
+        let mut v: Value = serde_json::from_slice(&body).ok()?;
+        let mut gone = gone.lock().unwrap();
+        let listed = v["responses"].as_array().cloned().unwrap_or_default();
+        let hiding = h.load(Ordering::SeqCst);
+        if hiding {
+            gone.extend(listed.iter().map(|r| r["seq"].clone()));
+        }
+        v["responses"] = listed.into_iter().filter(|r| !hiding || !gone.contains(&r["seq"])).map(|mut f| {
+            if gone.contains(&f["seq"]) {
+                f["charged"] = "3000000".into();
+                f["sig"] = hex::encode(ecdsa::sign(&receipt_secret(), &xbt402::ticket::receipt_message(&f))).into();
+            }
+            f
+        }).collect();
+        Some(Ok(answer(status, headers, v.to_string().into_bytes())))
+    }));
+    let cut = r.pay(&format!("/files/{}", 40 * MIB), 2_500);
+    assert_eq!(cut["complete"].as_bool(), Some(false), "{cut}");
+    assert!(cut.get("seller_fault").is_none(), "{cut}");
+    hiding.store(false, Ordering::SeqCst);
+    // the next answer finds it listed as the seller's status is read, and stops there
+    let v = r.pay(&format!("/files/{}", 8 * MIB), 5_000);
+    assert!(v["seller_fault"].as_str().unwrap_or_default().contains("charged 3000000 msat for one answer"), "{v}");
+    assert_eq!((v["complete"].as_bool(), v["tickets_released"].as_u64()), (Some(false), Some(0)), "nothing more was released: {v}");
+    let over = r.audit("ticket_over_cap");
+    assert_eq!(over.len(), 1, "{v}");
+    assert_eq!(over[0]["charged_msat"], "3000000", "{}", over[0]);
+    assert_ne!(r.status()["sessions"][0]["state"], "open");
+    r.tap.clear();
+}
+
 /// A seller that ignores the call's limit (`X-Xbt402-Max-Msat`, which a gateway of before 0.1.15 did
 /// not read) and charges for what it pushed past it: the wallet's own count stops reading at the limit
 /// and releases nothing more, and the seller's receipt above the limit is a seller fault. The session
@@ -5131,14 +5182,10 @@ fn an_answer_beside_a_reply_priced_by_the_token_is_paid_in_time() {
     r.assert_booked();
 }
 
-/// A seller that charges an answer cut short for far more than could have reached the wallet (a
-/// cut film charged as though it ran on) is caught at the next quiet point: the wallet believes a
-/// charge for a cut answer up to what it read and what could have been on its way, not up to the
-/// call's limit.
-///
-/// FAILS before: any charge inside the call's limit was taken.
-#[test]
-fn a_cut_answer_charged_past_what_could_have_arrived_is_a_seller_fault() {
+/// A film cut short after 1 MiB at 20 sat a MiB, under a limit of 5,000 sat, with one ticket of
+/// 1,000 sat released for it: its last receipt, as the seller lists it, charges `more` msat on top
+/// of what it read, and the seller's spend says so too. The call's reply and the faults said.
+fn cut_film_charged_more(more: u64) -> (Value, Vec<Value>) {
     use std::io::Read as _;
     use std::os::unix::net::UnixListener;
     let _g = env_lock();
@@ -5154,7 +5201,6 @@ fn a_cut_answer_charged_past_what_could_have_arrived_is_a_seller_fault() {
         }
         let (status, mut headers, body) = whole(real().ok()?);
         let mut v: Value = serde_json::from_slice(&body).ok()?;
-        let more = 500_000u64;
         let num = |x: &Value| x.as_str().and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
         if let Some(f) = v["responses"].as_array_mut().and_then(|l| l.iter_mut().find(|f| num(&f["charged"]) > 0)) {
             f["charged"] = (num(&f["charged"]) + more).to_string().into();
@@ -5177,10 +5223,31 @@ fn a_cut_answer_charged_past_what_could_have_arrived_is_a_seller_fault() {
     std::env::remove_var("B2_STREAM_DIR");
     assert_eq!(v["complete"].as_bool(), Some(false), "{v}");
     assert!(done.load(Ordering::SeqCst), "the film's last receipt was listed: {v}");
-    let faults = r.audit("ticket_seller_fault");
-    assert_eq!(faults.len(), 1, "{v}");
-    assert!(faults[0].to_string().contains("spentMsat"), "{}", faults[0]);
     r.tap.clear();
+    (v, r.audit("ticket_seller_fault"))
+}
+
+
+/// A seller that pushed a cut answer ahead within the credit it was given (into a proxy or relay that
+/// holds it, which the wallet never read) and charges for it is no fault: the wallet believes a charge
+/// for a cut answer up to the credit it had when it stopped, where that is more than what could be on
+/// its way from the seller.
+///
+/// FAILS before: the charge was believed only up to what was read and 16 MiB more, priced
+/// (about 340 sat here), and the seller's honest 520 sat was a fault.
+#[test]
+fn a_cut_answer_charged_within_the_credit_it_had_is_no_fault() {
+    let (v, faults) = cut_film_charged_more(500_000);
+    assert!(faults.is_empty() && v.get("seller_fault").is_none(), "{v} {faults:?}");
+    assert_eq!(v["price_msat"].as_str().map(|p| p.parse::<u64>().unwrap() > 500_000), Some(true), "{v}");
+}
+
+/// A seller that charges an answer cut short for more than the credit it had (a cut film charged as
+/// though it ran on) is a seller fault: no seller could have pushed that far.
+#[test]
+fn a_cut_answer_charged_past_the_credit_it_had_is_a_seller_fault() {
+    let (v, faults) = cut_film_charged_more(1_500_000);
+    assert_eq!(faults.len(), 1, "{v}");
 }
 
 /// A paid request whose answer is lost on the way back (the connection fails after the seller

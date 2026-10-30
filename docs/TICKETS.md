@@ -1900,7 +1900,11 @@ request to that seller until the read timeout. Now requests in one session run s
   after it left may still be served and charged from the seller's queue: it is held at its call's
   limit, and no quiet point is taken, for two minutes. An answer the wallet cut short is believed
   charged up to what it read and what could have been on its way when it stopped (16 MiB and a
-  proxy's slack, priced), not up to its call's limit. A receipt's spend is taken only
+  proxy's slack, priced), or up to the credit it had then where that is more (a seller pushes ahead
+  as far as the credit goes, and a proxy between them can hold all of it), not up to its call's
+  limit. That holds where its last receipt is listed late, and where it is never listed and the
+  wallet closes it after 30 s; a late receipt that charges past the call's limit is a seller fault,
+  as one read at once is. A receipt's spend is taken only
   inside the spend at the last quiet point (nothing open, nothing unclosed), plus what the wallet
   counted since, plus what the requests still open may add. Where nothing is open, it is taken only
   inside what the seller's own receipts charged the answers closed since. A seller that marks the

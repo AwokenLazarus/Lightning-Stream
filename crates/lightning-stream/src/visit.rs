@@ -13,9 +13,11 @@
 //! before its head or as its body arrives. The shares held at once never add up to more than the
 //! limit, so answers running side by side cannot together spend past it; when one ends, only what
 //! it cost stays spent; where the signer has not said what it cost (an answer that never started),
-//! all of the share stays spent until it does. A request that finds no share free waits for one;
-//! one that needs more than a share runs alone once the others have ended, and no new share is
-//! handed out while it waits. A range is asked for in
+//! all of the share stays spent until it does (for good, where it says nothing within
+//! [`SETTLE_WAIT`]). A request that finds no share free waits for one; one that needs more than a
+//! share runs alone once the others have ended or stopped (an open WebSocket, or an answer whose cost
+//! the signer has yet to say, holds no answer it must wait for), and no new share is handed out
+//! while it waits. A range is asked for in
 //! parts of at most [`RANGE_CHUNK`], as a player asks for its next part, so that no answer needs
 //! more than its share.
 
@@ -38,6 +40,10 @@ const IDLE: Duration = Duration::from_secs(30 * 60);
 pub const MAX_BODY: usize = 1 << 20;
 /// How long a request waits for a share.
 const TURN_WAIT: Duration = Duration::from_secs(120);
+/// How long a request whose answer has stopped waits for the signer to say what it cost, past which
+/// all of its share stays spent ([`Visit::settle`]): twice what the signer waits for a seller's
+/// first byte, by which it has ended a call whose answer is gone.
+const SETTLE_WAIT: Duration = Duration::from_secs(2 * FIRST_BYTE.as_secs());
 /// The most of a visit's limit one WebSocket holds while it is open: counted as spent until it
 /// ends, then only what it cost, with room for a ticket beside it as for [`ANSWER_SHARE`].
 const SOCKET_SHARE: i64 = 1_000;
@@ -77,6 +83,10 @@ struct State {
     /// The part of `held` that open WebSockets hold: they end when the page does, so a request
     /// waiting to run alone does not wait for them.
     sockets: i64,
+    /// The part of `held` of requests that have stopped and wait for the signer's word on what they
+    /// cost ([`Visit::settle`]): they hold no answer open, so a request waiting to run alone does not
+    /// wait for them either, and what is left of the limit beside them is its.
+    settling: i64,
     /// What one of the seller's tickets books, fee included, as a refusal named it: each share has
     /// room for one beside its own part, so that a request can buy the ticket it needs.
     ticket: i64,
@@ -155,7 +165,7 @@ impl Visit {
         s.alone += 1;
         let until = Instant::now() + TURN_WAIT;
         let mut timed_out = false;
-        while s.held > s.sockets && s.ended.is_none() {
+        while s.held > s.sockets + s.settling && s.ended.is_none() {
             let now = Instant::now();
             if now >= until {
                 timed_out = true;
@@ -185,7 +195,7 @@ impl Visit {
     /// A request that held `share` was refused, its call's reply `v`: what it was charged stays
     /// spent, and what a ticket of the seller's books, where the reply names it, is kept.
     fn refused(self: &Arc<Self>, share: i64, f: Failed) {
-        let Failed { v, done } = f;
+        let Failed { v, done, unknown } = f;
         if let Some(t) = v.get("ticket_booking_sats").and_then(Value::as_i64) {
             let mut s = self.lock();
             s.ticket = s.ticket.max(t);
@@ -198,12 +208,11 @@ impl Visit {
             // what it charged (nothing said: all of it)
             Some(done) => {
                 let visit = self.clone();
-                std::thread::spawn(move || {
-                    let charged = done.recv_timeout(LONGEST).ok().and_then(Result::ok)
-                        .and_then(|v| v.get("charged_sats").and_then(Value::as_i64)).unwrap_or(share);
-                    visit.release(share, charged);
-                });
+                std::thread::spawn(move || visit.settle(share, Some(done), false));
             }
+            // the signer's answer never came (the call to it failed or timed out): what it charged is not known, and
+            // all of the share stays spent
+            None if unknown => self.release(share, share),
             None => self.release(share, 0),
         }
     }
@@ -214,6 +223,23 @@ impl Visit {
         s.sockets += if open { share } else { -share };
         drop(s);
         self.turn.notify_all();
+    }
+
+    /// A request that held `share` has stopped (a WebSocket's, `socket`: and closed): what the signer
+    /// says it charged (`done`), within [`SETTLE_WAIT`], stays spent, all of the share where it says
+    /// nothing. Its share is counted apart while it waits ([`State::settling`]).
+    fn settle(&self, share: i64, done: Option<mpsc::Receiver<Result<Value, String>>>, socket: bool) {
+        let mut s = self.lock();
+        s.settling += share;
+        if socket {
+            s.sockets -= share;
+        }
+        drop(s);
+        self.turn.notify_all();
+        let charged = done.and_then(|d| d.recv_timeout(SETTLE_WAIT).ok()).and_then(Result::ok)
+            .and_then(|v| v.get("charged_sats").and_then(Value::as_i64)).unwrap_or(share);
+        self.lock().settling -= share;
+        self.release(share, charged);
     }
 
     /// A request that held `share` has ended, having cost `charged`: only that stays spent.
@@ -463,10 +489,8 @@ impl Connector {
         let status = head.get("status").and_then(Value::as_u64).unwrap_or(502);
         if status != 101 {
             drop(src);
-            visit.socket(share, false);
             // nothing said of what it charged: all of the share stays spent
-            let charged = done.recv_timeout(Duration::from_secs(60)).ok().and_then(Result::ok).and_then(|v| v.get("charged_sats").and_then(Value::as_i64)).unwrap_or(share);
-            visit.release(share, charged);
+            visit.settle(share, Some(done), true);
             return Reply::Whole(json_response(502, &json!({"error": format!("the seller did not open the WebSocket (HTTP {status})")})));
         }
         let headers: Vec<(String, String)> = head.get("headers").and_then(Value::as_array).into_iter().flatten()
@@ -478,9 +502,7 @@ impl Connector {
             headers,
             run: Box::new(move |client, early| {
                 join_socket(client, early, src, first);
-                visit.socket(share, false);
-                let charged = done.recv_timeout(Duration::from_secs(60)).ok().and_then(Result::ok).and_then(|v| v.get("charged_sats").and_then(Value::as_i64)).unwrap_or(share);
-                visit.release(share, charged);
+                visit.settle(share, Some(done), true);
             }),
         })
     }
@@ -490,7 +512,7 @@ impl Connector {
     fn start(&self, mut params: Value) -> Result<Started, Failed> {
         let name = format!("ls-{}", random_hex());
         let path = self.cfg.stream_dir.join(&name);
-        let listener = listen_stream(&path).map_err(|e| Failed { v: json!({"error": format!("stream socket: {e}")}), done: None })?;
+        let listener = listen_stream(&path).map_err(|e| Failed { v: json!({"error": format!("stream socket: {e}")}), done: None, unknown: false })?;
         let _ = listener.set_nonblocking(true);
         params["stream_to"] = name.into();
         params["stream_head"] = true.into();
@@ -506,16 +528,17 @@ impl Connector {
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 Err(e) => {
                     let _ = std::fs::remove_file(&path);
-                    return Err(Failed { v: json!({"error": format!("stream socket: {e}")}), done: Some(done) });
+                    return Err(Failed { v: json!({"error": format!("stream socket: {e}")}), done: Some(done), unknown: false });
                 }
             }
             if let Ok(d) = done.try_recv() {
                 let _ = std::fs::remove_file(&path);
-                return Err(Failed { v: d.unwrap_or_else(|e| json!({"error": e})), done: None });
+                let unknown = d.is_err();
+                return Err(Failed { v: d.unwrap_or_else(|e| json!({"error": e})), done: None, unknown });
             }
             if started.elapsed() > FIRST_BYTE {
                 let _ = std::fs::remove_file(&path);
-                return Err(Failed { v: json!({"error": "the seller sent nothing within 60 s"}), done: Some(done) });
+                return Err(Failed { v: json!({"error": "the seller sent nothing within 60 s"}), done: Some(done), unknown: false });
             }
             std::thread::sleep(Duration::from_millis(10));
         };
@@ -527,10 +550,10 @@ impl Connector {
         let ok = (&mut r).take(HEAD_LINE * 16).read_line(&mut line).is_ok() && line.ends_with('\n');
         let head: Value = if ok { serde_json::from_str(&line).unwrap_or(Value::Null) } else { Value::Null };
         if head.get("status").is_none() {
-            return Err(Failed { v: json!({"error": "the signer sent no head for the answer"}), done: Some(done) });
+            return Err(Failed { v: json!({"error": "the signer sent no head for the answer"}), done: Some(done), unknown: false });
         }
         if let Some(why) = head.get("error").and_then(Value::as_str) {
-            return Err(Failed { v: json!({"error": why}), done: Some(done) });
+            return Err(Failed { v: json!({"error": why}), done: Some(done), unknown: false });
         }
         let first = r.buffer().to_vec();
         let src = r.into_inner();
@@ -544,6 +567,9 @@ impl Connector {
 struct Failed {
     v: Value,
     done: Option<mpsc::Receiver<Result<Value, String>>>,
+    /// The signer's answer never came: the call to it failed or timed out, so what it charged is not
+    /// known.
+    unknown: bool,
 }
 
 struct Started {
@@ -566,9 +592,7 @@ impl Drop for Settle {
     fn drop(&mut self) {
         drop(self.src.take());
         // the signer's count of what left the wallet for this answer; nothing known is the whole share, kept spent
-        let charged = self.done.take().and_then(|d| d.recv_timeout(Duration::from_secs(60)).ok()).and_then(Result::ok)
-            .and_then(|v| v.get("charged_sats").and_then(Value::as_i64)).unwrap_or(self.share);
-        self.visit.release(self.share, charged);
+        self.visit.settle(self.share, self.done.take(), false);
     }
 }
 
@@ -638,5 +662,49 @@ mod tests {
         assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
         // and once it has its share, the next requests get theirs as before
         assert!(v.lock().alone == 0);
+    }
+
+    /// An answer that has stopped and waits for the signer to say what it cost holds no answer open:
+    /// a request waiting to run alone goes on beside it, with what is left of the limit past its
+    /// share, and the share is settled when the signer says (all of it, where it says nothing).
+    ///
+    /// FAILS before: the request waiting to run alone waited for the signer's word, up to its
+    /// [`TURN_WAIT`], and the page froze.
+    #[test]
+    fn a_request_that_runs_alone_does_not_wait_for_an_answer_being_settled() {
+        let v = visit(100_000);
+        let page = v.reserve(ANSWER_SHARE).unwrap();
+        let (tx, done) = mpsc::channel::<Result<Value, String>>();
+        std::thread::scope(|s| {
+            let settling = s.spawn(|| v.settle(page, Some(done), false));
+            std::thread::sleep(Duration::from_millis(100));
+            let t = Instant::now();
+            let got = v.reserve_alone(i64::MAX).unwrap();
+            assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+            assert_eq!(got, 100_000 - page);
+            v.release(got, 0);
+            tx.send(Ok(json!({"charged_sats": 12}))).unwrap();
+            settling.join().unwrap();
+        });
+        let s = v.lock();
+        assert_eq!((s.spent, s.held, s.settling), (12, 0, 0));
+    }
+
+    /// A call whose signer answer never came (the call to the signer failed or timed out) may have
+    /// been charged: all of its share stays spent.
+    ///
+    /// FAILS before: it was taken for a refusal that charged nothing, and the share went back.
+    #[test]
+    fn a_call_the_signer_never_answered_keeps_its_share_spent() {
+        let v = visit(10_000);
+        let share = v.reserve(ANSWER_SHARE).unwrap();
+        v.refused(share, Failed { v: json!({"error": "the signer did not answer"}), done: None, unknown: true });
+        let s = v.lock();
+        assert_eq!((s.spent, s.held), (share, 0));
+        drop(s);
+        // and one the signer refused before anything was sent gives it back
+        let other = v.reserve(ANSWER_SHARE).unwrap();
+        v.refused(other, Failed { v: json!({"rule": "max_sats"}), done: None, unknown: false });
+        assert_eq!(v.lock().spent, share);
     }
 }
