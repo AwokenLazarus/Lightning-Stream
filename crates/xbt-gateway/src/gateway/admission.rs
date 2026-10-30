@@ -68,8 +68,6 @@ impl Busy {
 
 #[derive(Default)]
 struct RouteLoad {
-    /// Buyer (session) → the unix time of its last request of the route.
-    buyers: HashMap<String, u64>,
     /// Buyer (session, or "" for a free route's answers) → its long answers open.
     streams: HashMap<String, u32>,
     /// Bytes sent in each of the last [`RATE_WINDOW_S`] seconds, by the second they were sent in.
@@ -81,11 +79,6 @@ impl RouteLoad {
         self.streams.values().sum()
     }
 
-    fn prune(&mut self, now: u64) {
-        let streams = &self.streams;
-        self.buyers.retain(|s, last| now.saturating_sub(*last) <= BUYER_IDLE_S || streams.get(s).is_some_and(|n| *n > 0));
-        self.bytes.retain(|(sec, _)| now.saturating_sub(*sec) < RATE_WINDOW_S);
-    }
 
     /// The route's rate over the window, in whole megabits a second.
     fn mbit(&self) -> u32 {
@@ -94,12 +87,36 @@ impl RouteLoad {
     }
 }
 
-/// Every route's load. Kept in memory: a restarted gateway starts with no buyer counted, and its
-/// buyers come back through the 402 as new ones would.
+/// Every route's load, and every service's buyers. Kept in memory: a restarted gateway starts with no
+/// buyer counted, and its buyers come back through the 402 as new ones would.
 #[derive(Default)]
 pub struct Load {
-    routes: Mutex<HashMap<String, RouteLoad>>,
+    routes: Mutex<Routes>,
     started: Option<Instant>,
+}
+
+#[derive(Default)]
+struct Routes {
+    /// By route path.
+    load: HashMap<String, RouteLoad>,
+    /// By service ([`Route::service`]): buyer (session) → the unix time of its last request of any of
+    /// the service's routes. A buyer is one buyer of a service however many of its routes it uses.
+    buyers: HashMap<String, HashMap<String, u64>>,
+}
+
+impl Routes {
+    fn entry(&mut self, path: &str) -> &mut RouteLoad {
+        self.load.entry(path.to_string()).or_default()
+    }
+
+    /// The buyers of `service`, those quiet for longer than [`BUYER_IDLE_S`] and with no long
+    /// answer open on any route left out.
+    fn buyers(&mut self, service: &str, now: u64) -> &mut HashMap<String, u64> {
+        let load = &self.load;
+        let b = self.buyers.entry(service.to_string()).or_default();
+        b.retain(|s, last| now.saturating_sub(*last) <= BUYER_IDLE_S || load.values().any(|l| l.streams.get(s).is_some_and(|n| *n > 0)));
+        b
+    }
 }
 
 impl Load {
@@ -107,7 +124,7 @@ impl Load {
         Arc::new(Load { routes: Mutex::default(), started: Some(Instant::now()) })
     }
 
-    fn lock(&self) -> MutexGuard<'_, HashMap<String, RouteLoad>> {
+    fn lock(&self) -> MutexGuard<'_, Routes> {
         self.routes.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -125,22 +142,22 @@ impl Load {
             return Ok(());
         }
         let mut all = self.lock();
-        let load = all.entry(route.path.clone()).or_default();
-        load.prune(now);
+        // counted by the service: a buyer of one of its routes is a buyer of all of them
+        let buyers = all.buyers(&route.service, now);
         if let Some(s) = session {
-            if let Some(last) = load.buyers.get_mut(s) {
+            if let Some(last) = buyers.get_mut(s) {
                 *last = now;
                 return Ok(());
             }
         }
         if let Some(max) = cap.max_buyers {
-            let in_use = load.buyers.len() as u32;
+            let in_use = buyers.len() as u32;
             if in_use >= max {
                 return Err(Busy { scope: Scope::Buyers, in_use, limit: max });
             }
         }
         if let Some(s) = session {
-            load.buyers.insert(s.to_string(), now);
+            buyers.insert(s.to_string(), now);
         }
         Ok(())
     }
@@ -154,7 +171,7 @@ impl Load {
         }
         let mono = self.mono();
         let mut all = self.lock();
-        let load = all.entry(route.path.clone()).or_default();
+        let load = all.entry(&route.path);
         load.bytes.retain(|(sec, _)| mono.saturating_sub(*sec) < RATE_WINDOW_S);
         if let Some(max) = cap.max_streams_per_buyer {
             let in_use = load.streams.get(session).copied().unwrap_or(0);
@@ -185,7 +202,7 @@ impl Load {
         }
         let mono = self.mono();
         let mut all = self.lock();
-        let Some(load) = all.get_mut(route) else { return };
+        let Some(load) = all.load.get_mut(route) else { return };
         match load.bytes.last_mut() {
             Some((sec, b)) if *sec == mono => *b += n,
             _ => load.bytes.push((mono, n)),
@@ -197,10 +214,10 @@ impl Load {
         let cap = route.capacity;
         let mono = self.mono();
         let mut all = self.lock();
-        let load = all.entry(route.path.clone()).or_default();
-        load.prune(now);
+        let buyers = all.buyers(&route.service, now).len() as u32;
+        let load = all.entry(&route.path);
         load.bytes.retain(|(sec, _)| mono.saturating_sub(*sec) < RATE_WINDOW_S);
-        let (buyers, streams, mbit) = (load.buyers.len() as u32, load.open(), load.mbit());
+        let (streams, mbit) = (load.open(), load.mbit());
         let full = |n: u32, max: Option<u32>| max.is_some_and(|m| n >= m);
         json!({"buyers": buyers, "maxBuyers": cap.max_buyers, "streams": streams, "maxStreams": cap.max_streams,
                "maxStreamsPerBuyer": cap.max_streams_per_buyer, "mbit": mbit, "maxMbit": cap.max_mbit,
@@ -209,7 +226,7 @@ impl Load {
 
     fn release(&self, route: &str, session: &str) {
         let mut all = self.lock();
-        if let Some(load) = all.get_mut(route) {
+        if let Some(load) = all.load.get_mut(route) {
             if let Some(n) = load.streams.get_mut(session) {
                 *n = n.saturating_sub(1);
                 if *n == 0 {
@@ -266,6 +283,26 @@ mod tests {
         let mut r = crate::config::parse_route_for_tests("/v/");
         r.capacity = cap;
         r
+    }
+
+    /// A web app's page, its API and its live socket are one service to a buyer: counted once over
+    /// all of them, so a buyer let in is never refused on the service's other routes, and a new one
+    /// is refused on any of them once the service is full.
+    #[test]
+    fn buyers_are_counted_once_per_service_over_all_its_routes() {
+        let load = Load::new();
+        let cap = Capacity { max_buyers: Some(1), ..Default::default() };
+        let (app, mut api) = (route(cap), route(cap));
+        api.path = "/api/".into();
+        assert!(load.buyer(&app, Some("a"), 100).is_ok());
+        assert_eq!(load.buyer(&api, Some("b"), 100).map_err(|b| b.scope), Err(Scope::Buyers), "the service is full");
+        assert!(load.buyer(&api, Some("a"), 101).is_ok(), "the buyer let in goes on at another route");
+        assert_eq!(load.view(&api, 101)["buyers"], 1);
+        // another service of the shop counts its own
+        let mut other = route(cap);
+        other.path = "/other/".into();
+        other.service = "http://127.0.0.1:9000".into();
+        assert!(load.buyer(&other, Some("b"), 101).is_ok());
     }
 
     #[test]

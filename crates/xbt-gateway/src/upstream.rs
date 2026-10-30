@@ -400,6 +400,7 @@ mod tests {
             websocket: false,
             accounts: None,
             capacity: Default::default(),
+            service: String::new(),
         };
         let h = |v: &[(&str, &str)]| {
             v.iter()

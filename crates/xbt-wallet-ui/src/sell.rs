@@ -812,6 +812,10 @@ impl App {
                 }
                 app_route(m, o.app.as_ref().filter(|a| a.base == *p), &key_file);
                 route_capacity(m, &o.capacity, free);
+                // one service to a buyer, however many routes: counted once over them (docs/CAPACITY.md)
+                if (1..=64).contains(&o.id.len()) {
+                    m.insert("service".into(), json!(o.id));
+                }
                 routes.push(r);
             }
             // the service's own web page, under a route of its own where its base is not one of the service's paths
@@ -835,6 +839,10 @@ impl App {
                 }
                 app_route(m, Some(a), &key_file);
                 route_capacity(m, &o.capacity, free);
+                // one service to a buyer, however many routes: counted once over them (docs/CAPACITY.md)
+                if (1..=64).contains(&o.id.len()) {
+                    m.insert("service".into(), json!(o.id));
+                }
                 routes.push(r);
             }
             let base = public_url.clone();

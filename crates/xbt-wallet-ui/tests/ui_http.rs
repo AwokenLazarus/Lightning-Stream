@@ -1508,6 +1508,8 @@ fn how_many_buyers_at_once_on_the_sell_page_becomes_each_routes_capacity() {
     let want = xbt_gateway::config::Capacity { max_buyers: Some(5), max_streams: Some(3), max_streams_per_buyer: None, max_mbit: None };
     assert_eq!(route("/Videos/1/").capacity, want);
     assert_eq!(route("/").capacity, want, "the page counts with its service");
+    assert_eq!(route("/").service, route("/Videos/1/").service, "and is one service with it");
+    assert_ne!(route("/free/").service, route("/").service);
     // the free one counts no buyers: a gateway would refuse that
     assert_eq!(route("/free/").capacity, xbt_gateway::config::Capacity { max_streams: Some(2), ..Default::default() });
     // and the page shows the limits again when the service is edited

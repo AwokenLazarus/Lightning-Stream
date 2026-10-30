@@ -100,6 +100,9 @@ pub struct Route {
     pub accounts: Option<Accounts>,
     /// How many buyers and streams the service takes at once (`capacity`, docs/CAPACITY.md).
     pub capacity: Capacity,
+    /// The service the route is part of (`service`, else its upstream; "" for the config's): the
+    /// routes of one service count a buyer once over all of them (`capacity.max_buyers`).
+    pub service: String,
 }
 
 /// A route's `capacity`: what the seller lets the service carry at once, so that one buyer too many
@@ -810,6 +813,12 @@ impl Config {
             routes.push(route(r)?);
         }
         for (i, r) in routes.iter().enumerate() {
+            // a service counts its buyers once over its routes: one number of them
+            if let Some(o) = routes[..i].iter().find(|o| o.service == r.service && o.capacity.max_buyers.is_some() && r.capacity.max_buyers.is_some()
+                                                       && o.capacity.max_buyers != r.capacity.max_buyers) {
+                return Err(format!("routes {} and {}: one service counts its buyers once over all its routes, so they take one capacity.max_buyers",
+                                   o.path, r.path));
+            }
             if r.upstream.is_none() && up.is_none() {
                 return Err(format!("route {}: no upstream, and the config names none for every route", r.path));
             }
@@ -936,6 +945,7 @@ fn route(v: &Value) -> Result<Route, String> {
             "websocket",
             "accounts",
             "capacity",
+            "service",
         ],
     )?;
     let path = req_str(r, "path")?.to_string();
@@ -1151,6 +1161,11 @@ fn route(v: &Value) -> Result<Route, String> {
     if free && capacity.max_buyers.is_some() {
         return Err(bad("a free route has no buyers to count: capacity.max_buyers is for a priced route"));
     }
+    let service = match r.get("service") {
+        None | Some(Value::Null) => upstream.clone().unwrap_or_default(),
+        Some(Value::String(s)) if (1..=64).contains(&s.len()) => s.clone(),
+        Some(_) => return Err(bad("service is a name of 1 to 64 characters")),
+    };
     Ok(Route {
         path,
         methods,
@@ -1168,6 +1183,7 @@ fn route(v: &Value) -> Result<Route, String> {
         websocket,
         accounts,
         capacity,
+        service,
     })
 }
 
@@ -1355,6 +1371,24 @@ mod tests {
         v["link"] = json!({"relays": ["http://127.0.0.1:3340"]});
         let e = Config::from_json(&v).unwrap_err().to_string();
         assert!(e.contains("https://") && e.contains("refuse"), "{e}");
+    }
+
+    /// Routes are one service where they name the same `service`, or, naming none, the same
+    /// upstream; such routes take one count of buyers, so they cannot give it two limits.
+    #[test]
+    fn routes_of_one_service_share_its_count_of_buyers() {
+        let mut v = base();
+        v["routes"] = json!([{"path": "/app/", "price": {"request_msat": 100}, "capacity": {"max_buyers": 20}},
+                             {"path": "/api/", "price": {"request_msat": 100}, "capacity": {"max_buyers": 20}},
+                             {"path": "/films/", "upstream": "http://127.0.0.1:8096", "price": {"request_msat": 100}, "capacity": {"max_buyers": 5}},
+                             {"path": "/shows/", "upstream": "http://127.0.0.1:8096", "service": "shows", "price": {"request_msat": 100}, "capacity": {"max_buyers": 3}}]);
+        let c = Config::from_json(&v).unwrap();
+        let svc = |p: &str| c.route(p).unwrap().service.clone();
+        assert_eq!((svc("/app/x"), svc("/api/x")), (String::new(), String::new()));
+        assert_eq!((svc("/films/x").as_str(), svc("/shows/x").as_str()), ("http://127.0.0.1:8096", "shows"));
+        v["routes"][1]["capacity"]["max_buyers"] = json!(10);
+        let e = Config::from_json(&v).unwrap_err().to_string();
+        assert!(e.contains("one service") && e.contains("max_buyers"), "{e}");
     }
 
     #[test]
