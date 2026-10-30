@@ -150,7 +150,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let link_relays: Vec<String> = cfg.nostr.as_ref().map(|n| n.relays.clone()).unwrap_or_default();
     if cfg.public_url == xbt_gateway::config::LINK_ONLY {
         let pk = nostr_pk.ok_or("a shop reached by key needs its Nostr key")?;
-        cfg.public_url = xbt402::shop::origin_for(&pk);
+        cfg.name_shop(xbt402::shop::origin_for(&pk));
         eprintln!("xbt-gateway: a shop without a web address, named {} ({})", cfg.public_url, xbt402::shop::npub(&pk));
     }
     let (link_cfg, state_dir) = (cfg.link.clone(), cfg.state_dir.clone());

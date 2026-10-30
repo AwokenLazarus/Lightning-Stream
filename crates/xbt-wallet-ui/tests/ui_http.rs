@@ -2761,8 +2761,8 @@ fn a_shop_reached_directly_writes_a_link_and_no_web_address() {
     br.act("/sell", "/sell", &[("action", "advanced"), ("max_sessions", "30"), ("sessions_per_address", "2"), ("max_held_tickets", "15"),
                                ("proxies", ""), ("network", "bip122:0123456789abcdef0123456789abcdef")]);
     let addr = format!("http://{media}");
-    // a web service without a page of its own: a media server is always its web app, which a direct shop
-    // cannot list yet (see `a_direct_shop_lists_its_media_servers_web_app`)
+    // a web service without a page of its own (a direct shop listing its media server's web app:
+    // `a_direct_shop_lists_its_media_servers_web_app`)
     br.act("/sell", "/sell", &[("action", "service"), ("kind", "web"), ("address", &addr), ("price", "1"), ("unit", "request")]);
     let r = br.act("/sell", "/sell", &[("action", "shop"), ("name", "Home films"), ("reach", "direct"), ("private", "1"), ("public_url", "https://ignored.example")]);
     let f = br.flash_after(&r);
@@ -2862,16 +2862,17 @@ fn a_shared_folder_is_sold_per_gb_with_each_file_listed_and_served_only_to_the_g
     assert_eq!(xbt_wallet_ui::services::price_words(&json!({"byte_msat": "1000000", "per_bytes": "1000000000"})), "1000 sat a GB");
 }
 
-/// A direct shop (no web address, reached by its key) sharing its media server as a web app: the
-/// listing names where the app opens at the shop's address, which a direct shop does not know until
-/// its gateway has named it by its key. The Sell page writes `/web/` with no origin, and the listing
-/// is refused ("url starts with http:// or https://"). Kept as the reproduction until that is fixed.
+/// A direct shop (no web address, reached by its key) selling its media server as a web app, a
+/// shared folder, a model and its miners: the Sell page lists each where it opens from the shop's
+/// own root, and the gateway lists those at the shop's name once it has named itself by its key.
 #[test]
-#[ignore = "known: a direct shop's web-app listing has no origin; fix before launch"]
 fn a_direct_shop_lists_its_media_servers_web_app() {
     let _e = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let gw = tempfile::tempdir().unwrap();
     let dir = gw.path().to_path_buf();
+    let shared = tempfile::tempdir().unwrap();
+    std::fs::write(shared.path().join("film.mkv"), b"frames").unwrap();
+    let sdir = shared.path().to_path_buf();
     let media = mock_http(|_| (200, "ok"));
     let bx = start(json!({}), false, |c| {
         c.sell = true;
@@ -2879,6 +2880,9 @@ fn a_direct_shop_lists_its_media_servers_web_app() {
         c.gw.node_rest = Some("https://10.21.21.66:8180".into());
         c.gw.node_tls_cert = Some("/data/lightning/tls.cert".into());
         c.nostr_relays = vec!["wss://relay.one.example".into()];
+        c.files.dir = sdir.clone();
+        c.hash.slices = Some("http://127.0.0.1:9".into());
+        c.hash.settings = dir.join("hashrate-settings.json");
     });
     let mut br = logged_in(&bx);
     let inv = mac(&[("invoices", &["read", "write"])]);
@@ -2888,9 +2892,28 @@ fn a_direct_shop_lists_its_media_servers_web_app() {
                                ("proxies", ""), ("network", "bip122:0123456789abcdef0123456789abcdef")]);
     let addr = format!("http://{media}");
     br.act("/sell", "/sell", &[("action", "service"), ("kind", "media"), ("address", &addr), ("price", "1"), ("unit", "mib"), ("app_entry", "/web/")]);
+    br.act("/sell", "/sell", &[("action", "service"), ("kind", "files"), ("address", ""), ("price", "1000"), ("unit", "gb"), ("name", "My files")]);
+    br.act("/sell", "/sell", &[("action", "service"), ("kind", "ai"), ("address", "http://127.0.0.1:9"), ("price", "10"), ("unit", "tokens"),
+                               ("name", "Model")]);
+    br.act("/sell-hashrate", "/sell-hashrate", &[("action", "save"), ("fallback", "192.168.1.20:23334"), ("price", "40"), ("enabled", "1")]);
     let r = br.act("/sell", "/sell", &[("action", "shop"), ("name", "Home films"), ("reach", "direct"), ("private", "1")]);
     let f = br.flash_after(&r);
     assert!(f.contains("restarts"), "{f}");
+    // the gateway takes it, and lists every address at the shop's name once it is known
+    let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    let mut cfg = xbt_gateway::config::Config::from_json(&c).unwrap();
+    let origin = xbt402::shop::origin_for(&[9; 32]);
+    cfg.name_shop(origin.clone());
+    let l = cfg.listing.unwrap();
+    let kinds: Vec<&str> = l.services.iter().map(|s| s.kind.as_str()).collect();
+    for k in ["app", "files", "hashrate"] {
+        assert!(kinds.contains(&k), "{k} in {kinds:?}");
+    }
+    assert!(kinds.iter().any(|k| *k == "ai" || *k == "api"), "the model in {kinds:?}");
+    let urls: Vec<&str> = l.services.iter().flat_map(|s| s.items.iter().map(|i| i.url.as_str())).collect();
+    assert!(urls.iter().any(|u| *u == format!("{origin}/web/")), "the media server opens at the shop: {urls:?}");
+    assert!(urls.iter().any(|u| u.starts_with(&origin) && u.ends_with("/film.mkv")), "the shared file: {urls:?}");
+    assert!(urls.iter().all(|u| u.starts_with(&origin)), "nothing left unnamed: {urls:?}");
 }
 
 #[test]
