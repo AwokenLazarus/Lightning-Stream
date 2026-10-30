@@ -54,8 +54,6 @@ LOCAL_ONLY = {"lazarus-xbt-knots": re.compile(r"^xbt-a3-knots:29\.4\.2$")}
 # the connector, xbt-hashlink and xbt-vpn have no line in images.lock yet. oci_build.sh --load tags them
 # <image>:0.1.0. A digest is not invented here. Anything else (a registry name, a made-up digest) still fails.
 UNPUBLISHED = re.compile(r"^(lightning-stream|xbt-hashlink|xbt-vpn):0\.1\.0$")
-# the stream directory the connector (and the VPN service, for paid tunnels) writes, inside the signer's
-# socket dir. Read-write, and the only extra mount either may have. Neither gets the signer's state.
 # Umbrel's shared Downloads (the Files app's Downloads), read-only, for the wallet's Files service only.
 # umbrelOS 1.x rewrites this compatibility path to ${UMBREL_ROOT}/home/Downloads; the app must declare
 # the STORAGE_DOWNLOADS permission (umbrel-apps .agents/skills/umbrel-package-app/SKILL.md).
@@ -66,6 +64,9 @@ def base_of(img):
     """An image reference's name: `<registry>/<name>:<tag>@<digest>` or a local `<name>:<tag>`."""
     m = REF.match(img)
     return m["name"] if m else img.split("/")[-1].split(":")[0]
+
+# the stream directory the connector (and the VPN service, for paid tunnels) writes, inside the signer's
+# socket dir. Read-write, and the only extra mount either may have. Neither gets the signer's state.
 STREAM_MOUNT = "${APP_DATA_DIR}/data/run/signer/streams:/data/run/signer/streams"
 # image -> (component sub-dir or None, run/ dirs it writes, run/ dirs it may mount read-only)
 AGENTPAY = {
