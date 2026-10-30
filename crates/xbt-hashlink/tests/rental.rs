@@ -193,6 +193,7 @@ fn rental_cut(stop_paying_after: Option<u64>, miner_secs: u64, wallet: bool, cut
         task: "hashrate".into(),
         max_sats: 600,
         session: None,
+        ceiling: None,
         wait_for_signer: std::time::Duration::from_secs(5),
     });
     let b = {
