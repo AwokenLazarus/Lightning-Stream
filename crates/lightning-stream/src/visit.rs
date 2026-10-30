@@ -42,11 +42,15 @@ pub const MAX_BODY: usize = 1 << 20;
 /// How long a request waits for a share.
 const TURN_WAIT: Duration = Duration::from_secs(120);
 /// How long a request whose answer has stopped waits for the signer to say what it cost, past which
-/// all of its share stays spent ([`Visit::settle`]): the longest the signer may wait for a seller's
-/// next byte (its `tickets.read_timeout_s`, at most an hour) before it ends a call whose answer is
-/// gone, and twice [`FIRST_BYTE`] for its last receipt and its reply. The share is counted apart
-/// while it waits, so nothing else waits for it; only the visit's budget is held.
-const SETTLE_WAIT: Duration = Duration::from_secs(3600 + 2 * FIRST_BYTE.as_secs());
+/// all of its share stays spent ([`Visit::settle`]). After the stop the signer may still, one after
+/// another: wait for the seller's next byte (its `tickets.read_timeout_s`, at most an hour) before it
+/// ends a call whose answer is gone; finish a ticket being paid beside the reading (the wait for a
+/// ready seller, a minute, and the Lightning payment, at most `lightning.timeout_s` of 600 s and 5 s
+/// more); and wait for the answer's last receipt, at most 10 s and a second since each `status` call
+/// is cut to what is left of that wait. Then its reply, within [`FIRST_BYTE`] twice. A signer that
+/// takes longer leaves the share spent: the visit's budget is held, no money moves. The share is
+/// counted apart while it waits, so nothing else waits for it.
+const SETTLE_WAIT: Duration = Duration::from_secs(3600 + 60 + 605 + 11 + 2 * FIRST_BYTE.as_secs());
 /// The most of a visit's limit one WebSocket holds while it is open: counted as spent until it
 /// ends, then only what it cost, with room for a ticket beside it as for [`ANSWER_SHARE`].
 const SOCKET_SHARE: i64 = 1_000;

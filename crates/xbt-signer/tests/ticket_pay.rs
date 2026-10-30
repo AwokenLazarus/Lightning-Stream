@@ -2327,6 +2327,57 @@ fn a_whole_answer_listed_late_and_charged_past_its_cost_is_a_seller_fault() {
     r.tap.clear();
 }
 
+/// A model's reply streamed with its counts (`usage`) and cut short just after them: the wallet knows
+/// what the reply cost, so a seller whose last receipt charges it all of the session's unspent
+/// credit is believed only that cost and a few tokens more, and its spend past that is its fault.
+///
+/// FAILS before: a reply priced by the token and cut short was believed up to the call's limit,
+/// counts read or not, and the seller kept the session's whole credit with no fault said.
+#[test]
+fn a_reply_cut_after_its_counts_is_believed_only_what_they_come_to() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    let more = Arc::new(AtomicU64::new(0));
+    let m2 = more.clone();
+    r.tap.set(Box::new(move |seen, real| {
+        if seen.path.ends_with("/chat/completions") {
+            // the whole reply, as the seller sent it, read only to the end of its counts: the connection drops there
+            let (status, headers, body) = whole(real().ok()?);
+            let text = String::from_utf8_lossy(&body).to_string();
+            let at = text.find("\"usage\"").and_then(|u| text[u..].find("\n\n").map(|e| u + e + 2))?;
+            let full = body.len() as u64;
+            let cut = body[..at].to_vec();
+            return Some(Ok(WireAnswer { status, length: Some(full), headers, body: Box::new(std::io::Cursor::new(cut)) }));
+        }
+        if !seen.path.ends_with("/x402/ticket/status") || m2.load(Ordering::SeqCst) > 0 {
+            return None;
+        }
+        let (status, mut headers, body) = whole(real().ok()?);
+        let mut v: Value = serde_json::from_slice(&body).ok()?;
+        let num = |x: &Value| x.as_str().and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
+        // the reply's last receipt: charged, and the spend, raised by all the credit left unspent
+        if let Some(f) = v["responses"].as_array_mut().and_then(|l| l.iter_mut().find(|f| num(&f["charged"]) > 0)) {
+            let add = num(&f["releasedMsat"]).saturating_sub(num(&f["spentMsat"]));
+            f["charged"] = (num(&f["charged"]) + add).to_string().into();
+            f["spentMsat"] = (num(&f["spentMsat"]) + add).to_string().into();
+            f["sig"] = hex::encode(ecdsa::sign(&receipt_secret(), &xbt402::ticket::receipt_message(f))).into();
+            resign(&mut headers, &|r| r["spentMsat"] = (num(&r["spentMsat"]) + add).to_string().into());
+            m2.store(add, Ordering::SeqCst);
+        }
+        Some(Ok(answer(status, headers, v.to_string().into_bytes())))
+    }));
+    let v = r.call("xbt402_pay", json!({"url": r.shop.url("/dear/v1/chat/completions"), "method": "POST", "max_sats": CALL, "task": "film",
+        "body": json!({"messages": [], "stream": true, "stream_options": {"include_usage": true}, "x_n": 20}).to_string()}));
+    r.tap.clear();
+    assert_eq!(v["complete"].as_bool(), Some(false), "{v}");
+    // more than the reply's cost and 64 tokens of slack at 1,600 msat a token: a charge the wallet must not believe
+    let add = more.load(Ordering::SeqCst);
+    assert!(add > 200_000, "the seller took {add} msat more: {v}");
+    assert!(v.get("seller_fault").is_some() || !r.audit("ticket_seller_fault").is_empty(), "{v}");
+    let price: u64 = v["price_msat"].as_str().unwrap_or("0").parse().unwrap();
+    assert!(price < 200_000, "believed {price} msat for a reply of 20 tokens: {v}");
+}
+
 /// A seller that ignores the call's limit (`X-Xbt402-Max-Msat`, which a gateway of before 0.1.15 did
 /// not read) and charges for what it pushed past it: the wallet's own count stops reading at the limit
 /// and releases nothing more, and the seller's receipt above the limit is a seller fault. The session
