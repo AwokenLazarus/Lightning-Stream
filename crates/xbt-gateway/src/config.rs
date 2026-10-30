@@ -654,7 +654,8 @@ impl Config {
             )?,
             None => &empty,
         };
-        let max_sessions = num32(c, "max_sessions", 30)?;
+        // measured: 100 buyers at once used a sixth of one core and 61 MiB (docs/CAPACITY.md)
+        let max_sessions = num32(c, "max_sessions", 100)?;
         if max_sessions == 0 {
             return Err("caps.max_sessions is at least 1".into());
         }
@@ -751,7 +752,8 @@ impl Config {
             _ => Err(format!("http.{k} is from {least} to 4096")),
         };
         let http = Http {
-            connections: small("connections", 64, 1)?,
+            // a buyer's film or live connection holds one for as long as it is open
+            connections: small("connections", 512, 1)?,
             per_address: small("per_address", 48, 0)?,
             threads: small("threads", 16, 1)?,
         };
@@ -768,6 +770,9 @@ impl Config {
                 let mut proxies = vec![];
                 for p in f.get("proxies").and_then(Value::as_array).filter(|a| !a.is_empty()).ok_or(bad)? {
                     proxies.push(p.as_str().and_then(|a| a.parse::<std::net::IpAddr>().ok()).ok_or(bad)?.to_canonical());
+                }
+                if proxies.len() > xbt_svc::http::MAX_PROXIES {
+                    return Err(format!("http.forwarded_address.proxies: at most {}", xbt_svc::http::MAX_PROXIES));
                 }
                 Some(Forwarded { header, proxies })
             }
@@ -1353,6 +1358,15 @@ mod tests {
     }
 
     #[test]
+    fn a_proxy_list_longer_than_the_server_keeps_is_refused() {
+        let mut v = base();
+        let many: Vec<String> = (1..=9).map(|i| format!("10.0.0.{i}")).collect();
+        v["http"] = json!({"forwarded_address": {"header": "x-forwarded-for", "proxies": many}});
+        let e = Config::from_json(&v).unwrap_err().to_string();
+        assert!(e.contains("at most 8"), "{e}");
+    }
+
+    #[test]
     fn the_defaults_are_the_drafts_numbers() {
         let c = Config::from_json(&base()).unwrap();
         assert_eq!(
@@ -1391,7 +1405,7 @@ mod tests {
                 c.caps.max_kept_sessions,
                 c.caps.max_held
             ),
-            (30, 2, 10_000, 15)
+            (100, 2, 10_000, 15)
         );
         assert_eq!(
             (
@@ -1404,7 +1418,7 @@ mod tests {
         );
         assert_eq!(
             (c.http.connections, c.http.per_address, c.http.threads),
-            (64, 48, 16)
+            (512, 48, 16)
         );
         assert!(!c.mainnet());
     }

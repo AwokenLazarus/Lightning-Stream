@@ -30,11 +30,13 @@ pub const GW_INFO: &str = "info.macaroon";
 /// (`docs/DIRECT-LINKS.md`).
 pub const GW_SIGN: &str = "sign.macaroon";
 
-/// The caps the gateway page writes on mainnet unless the owner sets others: a few buyers at a time,
-/// and at most 4 held tickets of 1,000 sat on the node's inbound channels.
-pub const MAINNET_CAPS: (u32, u32, u32) = (4, 1, 4);
+/// The caps the gateway page writes on mainnet unless the owner sets others: 25 buyers at a time
+/// (a buyer costs the box little; what is at stake is held tickets), and at most 4 held tickets of 1,000 sat on the node's inbound channels.
+pub const MAINNET_CAPS: (u32, u32, u32) = (25, 1, 4);
 /// The gateway's own defaults on a test chain (`xbt-gateway`'s config).
-pub const TEST_CAPS: (u32, u32, u32) = (30, 2, 15);
+pub const TEST_CAPS: (u32, u32, u32) = (100, 2, 15);
+/// The gateway's own default for connections open at once (`http.connections`).
+pub const GATEWAY_CONNECTIONS: u64 = 512;
 
 /// A macaroon as the node's dashboard shows it: hex, or base64 (standard or URL-safe).
 pub fn decode_macaroon(text: &str) -> Result<Vec<u8>, String> {
@@ -497,6 +499,9 @@ impl App {
                                        "max_held_tickets": num("max_held_tickets")?}));
         if !proxies.is_empty() {
             c.insert("http".into(), json!({"forwarded_address": {"header": "x-forwarded-for", "proxies": proxies}}));
+        } else if behind_proxy {
+            // and so is the cap on connections from one address: every buyer comes over the proxy's
+            c.insert("http".into(), json!({"per_address": 0}));
         }
         // the page asks for sats; a form that sends millisats (an older page, a script) still works
         let msat = if g("price").is_empty() { num("price_msat")? } else { crate::app::sell::sats_to_msat(&g("price"))? };

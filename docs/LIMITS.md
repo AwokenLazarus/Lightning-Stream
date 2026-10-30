@@ -557,8 +557,10 @@ wallet) and against a stand-in node in its tests.
   ticket has neither; the node is asked about it when its preimage is presented and at the sweep.
 - A buyer's balance, the part of its released tickets it has not used, is trusted to the seller:
   it is kept for 24 hours after the session's last paid request and then forgotten.
-- The gateway takes 64 connections in all and 48 from one address, one request per connection,
-  and an answer that is being sent holds its connection: 64 answers at once. A client that takes
+- The gateway takes 512 connections in all and 48 from one address, one request per connection,
+  and an answer that is being sent holds its connection: 512 answers at once. The reverse proxies
+  named in `http.forwarded_address` are held to the total only, since every buyer comes over their
+  address; the Sell page turns the cap per address off behind a proxy it was not told about. A client that takes
   no byte for 30 seconds is cut, and no answer stays open for more than 6 hours.
 - A body priced per byte is charged when the gateway hands the bytes to the operating system,
   not when the buyer has them: a buyer that disappears in the middle paid for what was in the

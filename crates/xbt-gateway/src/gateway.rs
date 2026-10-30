@@ -398,11 +398,15 @@ impl Gateway {
 
     /// Listen on `listener` with the config's limits.
     pub fn serve(self: &Arc<Self>, listener: TcpListener) -> io::Result<Running> {
+        // a reverse proxy the config names brings every buyer over its own address: held to the
+        // total only, while the caps on sessions count each buyer by the address it reports
+        let proxies = self.cfg.forwarded.as_ref().map_or(&[][..], |f| f.proxies.as_slice());
         let limits = Limits {
             connections: self.cfg.http.connections,
             per_address: self.cfg.http.per_address,
             ..Limits::default()
-        };
+        }
+        .with_proxies(proxies);
         xbt_svc::http::serve_with(
             Arc::new(Service(self.clone())),
             listener,

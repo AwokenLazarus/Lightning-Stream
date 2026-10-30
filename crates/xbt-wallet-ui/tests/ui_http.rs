@@ -904,7 +904,7 @@ fn the_gateway_page_writes_a_config_the_gateway_takes_and_mainnet_is_asked_for()
     let net = "lightning:0123456789abcdef0123456789abcdef";
     let form = |public: &str, inv: &str, chain: &str, ack: &str| -> Vec<(String, String)> {
         [("upstream", "http://10.21.21.50:8080"), ("price_msat", "2500"), ("unit", "request"), ("public_url", public), ("proxies", ""),
-         ("chain", chain), ("network", if chain == "main" { "" } else { net }), ("mainnet_ack", ack), ("max_sessions", "30"),
+         ("chain", chain), ("network", if chain == "main" { "" } else { net }), ("mainnet_ack", ack), ("max_sessions", "100"),
          ("sessions_per_address", "2"), ("max_held_tickets", "15"), ("invoices_macaroon", inv), ("info_macaroon", info.as_str())]
             .iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
     };
@@ -926,6 +926,8 @@ fn the_gateway_page_writes_a_config_the_gateway_takes_and_mainnet_is_asked_for()
     assert!(br.flash_after(&r).contains("Saved"));
     let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
     assert_eq!((c["listen"].as_str(), c["caps"]["sessions_per_address"].as_u64()), (Some("0.0.0.0:8402"), Some(0)));
+    // and so is the cap on connections from one address: every buyer comes over the proxy's
+    assert_eq!(c["http"]["per_address"], 0, "{c}");
     assert_eq!(c["node"]["macaroon"], json!(dir.join("invoices.macaroon").display().to_string()));
     assert_eq!(c["routes"], json!([{"path": "/", "price": {"request_msat": 2500}}]));
     xbt_gateway::config::Config::from_json(&c).unwrap();
@@ -942,7 +944,7 @@ fn the_gateway_page_writes_a_config_the_gateway_takes_and_mainnet_is_asked_for()
     assert!(br.flash_after(&r).contains("mainnet"));
     let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
     assert_eq!((c["chain"].as_str(), c["mainnet_ack"].as_str()), (Some("main"), Some(xbt_gateway::config::MAINNET_ACK)));
-    assert_eq!((c["caps"]["max_sessions"].as_u64(), c["caps"]["max_held_tickets"].as_u64()), (Some(4), Some(4)));
+    assert_eq!((c["caps"]["max_sessions"].as_u64(), c["caps"]["max_held_tickets"].as_u64()), (Some(25), Some(4)));
     assert!(c.get("network").is_none());
     xbt_gateway::config::Config::from_json(&c).unwrap();
 }
@@ -1500,6 +1502,8 @@ fn how_many_buyers_at_once_on_the_sell_page_becomes_each_routes_capacity() {
     assert!(br.flash_after(&r).contains("restarts"), "{}", br.flash_after(&r));
     let c: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
     let cfg = xbt_gateway::config::Config::from_json(&c).unwrap();
+    // behind a proxy that does not say who each buyer is, all buyers come from one address: no cap per address
+    assert_eq!((cfg.http.per_address, cfg.caps.sessions_per_address), (0, 0), "{c}");
     let route = |p: &str| cfg.routes.iter().find(|r| r.path == p).unwrap_or_else(|| panic!("no route {p}"));
     let want = xbt_gateway::config::Capacity { max_buyers: Some(5), max_streams: Some(3), max_streams_per_buyer: None, max_mbit: None };
     assert_eq!(route("/Videos/1/").capacity, want);
@@ -1509,6 +1513,8 @@ fn how_many_buyers_at_once_on_the_sell_page_becomes_each_routes_capacity() {
     // and the page shows the limits again when the service is edited
     let page = br.get("/sell").body;
     assert!(page.contains("name=\"cap_streams\""));
+    // the limits of the whole shop, which a seller meets before any of these, are said beside them
+    assert!(page.contains("Your whole shop serves up to 30 buyers at once and 512 open connections"), "{page}");
 }
 
 #[cfg(unix)]

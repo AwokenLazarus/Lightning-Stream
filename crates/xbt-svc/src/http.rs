@@ -36,6 +36,10 @@ pub struct Limits {
     /// (AGP-081, review T1: with only the global cap one address held every slot). 0: no cap per
     /// address, for a server whose only peer is its reverse proxy.
     pub per_address: usize,
+    /// Addresses held to [`Limits::connections`] only, not to [`Limits::per_address`]: a reverse
+    /// proxy or tunnel in front of the server, which brings every client over its own address.
+    /// At most [`MAX_PROXIES`]; [`Limits::with_proxies`] fills it.
+    pub proxies: [Option<IpAddr>; MAX_PROXIES],
     /// One write of a [`Streamed`] body: a client that takes nothing for this long ends the stream.
     pub stream_write: Duration,
 }
@@ -52,12 +56,26 @@ impl Default for Limits {
             body_deadline: Duration::from_secs(30),
             connections: 64,
             per_address: 48,
+            proxies: [None; MAX_PROXIES],
             stream_write: Duration::from_secs(30),
         }
     }
 }
 
+/// How many proxies [`Limits::proxies`] names at most.
+pub const MAX_PROXIES: usize = 8;
+
 impl Limits {
+    /// These limits, with `proxies` (at most [`MAX_PROXIES`] of them, the rest left out) held to the
+    /// total cap only.
+    pub fn with_proxies(mut self, proxies: &[IpAddr]) -> Self {
+        self.proxies = [None; MAX_PROXIES];
+        for (slot, ip) in self.proxies.iter_mut().zip(proxies) {
+            *slot = Some(ip.to_canonical());
+        }
+        self
+    }
+
     /// The default limits with [`PER_ADDRESS_ENV`] applied: a whole number, 0 for no cap per
     /// address. Anything else is an error, not the default.
     pub fn from_env() -> io::Result<Self> {
@@ -376,13 +394,23 @@ impl PerAddress {
 struct Slot {
     open: Arc<AtomicUsize>,
     per: Arc<PerAddress>,
-    key: Option<AddrKey>,
+    key: SlotKey,
 }
+
+/// Whose share of the cap per address a connection takes: an address's, or none (a named proxy's).
+#[derive(Clone, Copy)]
+enum SlotKey {
+    Counted(Option<AddrKey>),
+    Proxied,
+}
+use SlotKey::{Counted, Proxied};
 
 impl Drop for Slot {
     fn drop(&mut self) {
         self.open.fetch_sub(1, Ordering::SeqCst);
-        self.per.release(self.key);
+        if let Counted(k) = self.key {
+            self.per.release(k);
+        }
     }
 }
 
@@ -507,10 +535,17 @@ fn accept(
             write_error(&mut sock, 503, "too many connections");
             continue;
         }
-        let key = sock.peer_addr().ok().map(|a| AddrKey::of(a.ip()));
-        if !per.admit(key) {
-            write_error(&mut sock, 503, "too many connections from this address");
-            continue;
+        let peer = sock.peer_addr().ok().map(|a| a.ip().to_canonical());
+        // a named proxy's connections are every client's: counted against the total only
+        let key = match peer {
+            Some(ip) if limits.proxies.contains(&Some(ip)) => Proxied,
+            p => Counted(p.map(AddrKey::of)),
+        };
+        if let Counted(k) = key {
+            if !per.admit(k) {
+                write_error(&mut sock, 503, "too many connections from this address");
+                continue;
+            }
         }
         open.fetch_add(1, Ordering::SeqCst);
         let slot = Slot {
