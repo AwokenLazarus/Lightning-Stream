@@ -589,7 +589,8 @@ fn serve(args: &[String], relay: String) -> std::io::Result<()> {
         let _ = write_json(&status_dir.join("exit-status.json"), &exit_status);
         if (mtime(&devices_path), mtime(&exit_path), mtime(&secret_path)) != started {
             eprintln!("the settings changed: exiting to start again with them");
-            std::process::exit(0);
+            // not 0: a container restarted "on failure" (Umbrel's) is not started again after a clean exit
+            std::process::exit(75);
         }
         std::thread::sleep(Duration::from_secs(5));
     }
