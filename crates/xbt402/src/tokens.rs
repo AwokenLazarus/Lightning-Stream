@@ -137,6 +137,9 @@ pub fn prepare(body: &[u8], cap: u64) -> Result<Prepared, &'static str> {
             _ => Map::new(),
         };
         so.insert("include_usage".into(), true.into());
+        // counts on every chunk (vLLM's `continuous_usage_stats`) are not asked for: the counts a reply states are
+        // its final ones, so that a buyer can tell a reply whose cost is known from one cut before it
+        so.remove("continuous_usage_stats");
         v.insert("stream_options".into(), Value::Object(so));
     }
     let body = serde_json::to_vec(&Value::Object(v)).map_err(|_| "the request could not be written again")?;
@@ -199,6 +202,9 @@ pub struct Event {
     pub bytes: Vec<u8>,
     pub tokens: u64,
     pub usage: Option<Usage>,
+    /// The counts it states are the reply's final ones: it carries no choice (the last chunk an
+    /// OpenAI-style service sends when asked for `include_usage`), not counts on a chunk of text.
+    pub final_usage: bool,
 }
 
 /// A streamed answer (`text/event-stream`), cut into its events as the bytes arrive.
@@ -248,7 +254,9 @@ fn read_event(bytes: Vec<u8>) -> Event {
         Some(v) => (chunk_tokens(v), Usage::read(v)),
         None => (0, None),
     };
-    Event { bytes, tokens, usage }
+    let final_usage = usage.is_some()
+        && v.as_ref().and_then(|v| v.get("choices")).is_none_or(|c| c.as_array().is_some_and(Vec::is_empty) || c.is_null());
+    Event { bytes, tokens, usage, final_usage }
 }
 
 /// A whole answer: the tokens of output by its text (one per four characters) and its counts.
@@ -345,6 +353,20 @@ mod tests {
         }
         let mut sse = Sse::default();
         assert!(sse.feed(&vec![b'x'; MAX_EVENT + 1]).is_err());
+    }
+
+    /// Counts stated on a chunk of text are not a reply's final counts; those on the last event, with
+    /// no choices, are. Counts on every chunk are not asked for.
+    #[test]
+    fn only_counts_without_choices_are_a_replys_final_ones() {
+        let mut sse = Sse::default();
+        let evs = sse.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1}}\n\n\
+                             data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\n\
+                             data: {\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\n").unwrap();
+        assert_eq!(evs.iter().map(|e| (e.usage.is_some(), e.final_usage)).collect::<Vec<_>>(), vec![(true, false), (true, true), (true, true)]);
+        let p = prepare(br#"{"stream":true,"stream_options":{"continuous_usage_stats":true}}"#, 64).unwrap();
+        let v: Value = serde_json::from_slice(&p.body).unwrap();
+        assert_eq!(v["stream_options"], json!({"include_usage": true}));
     }
 
     #[test]

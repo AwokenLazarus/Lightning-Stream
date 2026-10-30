@@ -47,9 +47,11 @@ const TURN_WAIT: Duration = Duration::from_secs(120);
 /// ends a call whose answer is gone; finish a ticket being paid beside the reading (the wait for a
 /// ready seller, a minute, and the Lightning payment, at most `lightning.timeout_s` of 600 s and 5 s
 /// more); and wait for the answer's last receipt, at most 10 s and a second since each `status` call
-/// is cut to what is left of that wait. Then its reply, within [`FIRST_BYTE`] twice. A signer that
-/// takes longer leaves the share spent: the visit's budget is held, no money moves. The share is
-/// counted apart while it waits, so nothing else waits for it.
+/// is cut to what is left of that wait. Then its reply, within [`FIRST_BYTE`] twice. That is what
+/// it usually takes at most, not a bound: a release waiting on other answers' releases, a refill, or
+/// a seller that answers byte by byte can take longer. A signer that takes longer leaves the share
+/// spent, the safe side: the visit's budget is held, no money moves. The share is counted apart while
+/// it waits, so nothing else waits for it.
 const SETTLE_WAIT: Duration = Duration::from_secs(3600 + 60 + 605 + 11 + 2 * FIRST_BYTE.as_secs());
 /// The most of a visit's limit one WebSocket holds while it is open: counted as spent until it
 /// ends, then only what it cost, with room for a ticket beside it as for [`ANSWER_SHARE`].

@@ -1022,6 +1022,21 @@ impl Money {
         }
     }
 
+    /// An answer ending that held `held` back while it ran (one by the token), having drawn `had`
+    /// by the wallet's count and costing `cost` past its head: what it has drawn now, and what of
+    /// its hold comes back to the answers beside it ([`Money::freed`]). One cut short before its
+    /// final counts (`cut_uncounted`) keeps all it held as drawn and frees nothing: its seller may
+    /// yet be believed for all of it ([`Bound::quoted`]), and no answer beside it may count on the
+    /// same credit.
+    fn end_hold(&mut self, held: u64, had: u64, cost: u64, cut_uncounted: bool) -> u64 {
+        let drawn = if cut_uncounted { cost.max(held) } else { cost }.max(had);
+        self.reserved = self.reserved.saturating_sub(held);
+        if !cut_uncounted {
+            self.freed = self.freed.saturating_add(held.saturating_sub(drawn - had));
+        }
+        drawn
+    }
+
     /// The answers left unclosed for [`TAIL_GIVE_UP`], closed as charged the most they may by the
     /// wallet's count: what is left of their call's limit, but no more than the wallet believes of
     /// any charge for them ([`Bound`]). How many.
@@ -1063,9 +1078,11 @@ struct Tail {
 /// an answer closes, so that none of them believes more than another:
 /// - one that arrived whole: up to what it cost by the wallet's own count, and its receipt must
 ///   sign the body that arrived and charge no more than that;
-/// - one priced by the token and cut short after its counts (`usage`) or its end (`[DONE]`) were
-///   read: up to what it cost by those counts, and a few tokens more ([`TOKEN_SLACK`]); cut before
-///   them: up to the call's limit (its tokens are counted only whole);
+/// - one priced by the token and cut short after its final counts (`usage` with no choices) or its
+///   end (`[DONE]`) were read: up to what it cost by those counts, and a few tokens more
+///   ([`TOKEN_SLACK`]); cut before them: up to what its terms quote for it at most (its request and
+///   the most its tokens may come to, which it held back while it ran, and still holds as drawn),
+///   and a charge past that quote is the seller's fault;
 /// - one priced by its size and cut short: up to what the wallet read and what could be on its way
 ///   ([`CUT_SLACK`]), or the credit it could have drawn, whichever is more ([`Stream::cut_bound`]);
 ///   and, as it is closed, no more than that credit as it stands then ([`Share`]), so that answers
@@ -1080,6 +1097,9 @@ struct Bound {
     whole: Option<(u64, String)>,
     /// One priced by its size and cut short: what it is judged against again as it is closed.
     share: Option<Share>,
+    /// One priced by the token and cut short before its counts: the most its terms quote for it. A
+    /// charge past it is the seller's fault.
+    quoted: Option<u64>,
 }
 
 /// An answer priced by its size and cut short, as [`Bound::most`] judges it when it is closed: the
@@ -1125,7 +1145,9 @@ impl Bound {
             } else {
                 None
             }
-        });
+        }).or_else(|| self.quoted.filter(|q| r.charged > *q).map(|q| {
+            format!("the last receipt charges {} msat for a reply its terms quote at {q} at most", r.charged)
+        }));
         (r.charged.min(self.most(m)), fault)
     }
 }
@@ -3153,6 +3175,11 @@ impl Signer {
             }
             return Err(d);
         }
+        // asked again just before the book: another answer may have found the seller at fault while this one waited for it
+        // to show the ticket ready, and nothing more is released to a seller at fault
+        if let Some(why) = hs.fault() {
+            return Err(self.ticket_fault(hs, &why));
+        }
         // 2. the book: booked, then the secret exists here
         let r = {
             let _g = self.lock();
@@ -3510,7 +3537,8 @@ impl Signer {
         let event_stream = ans.header("content-type").is_some_and(|v| v.to_ascii_lowercase().starts_with("text/event-stream"));
         let mut sse = xbt402::tokens::Sse::default();
         let (mut counted, mut usage, mut whole_body) = (0u64, xbt402::tokens::Usage::default(), Vec::new());
-        // a streamed answer by the token whose counts (`usage`) or end (`[DONE]`) were read: its cost is known, cut or not
+        // a streamed answer by the token whose final counts (`usage` with no choices) or end (`[DONE]`) were read: its cost
+        // is known, cut or not
         let mut counts_read = false;
         let st = Stream { price: *price, base_spent: mark.base_spent, started, max_msat, max_open: Duration::from_secs(self.ticket_policy().max_answer_s.clamp(1, 86_400) as u64) };
         // what this answer has drawn past its head, by this count: added to the session's as it grows, and taken off
@@ -3693,7 +3721,9 @@ impl Signer {
                             counted = counted.saturating_add(ev.tokens).min(max_output);
                             if let Some(u) = ev.usage {
                                 usage = u;
-                                counts_read = true;
+                                // counts on a chunk of text (a service that states them as it goes) are not the
+                                // reply's cost: only its final ones are
+                                counts_read |= ev.final_usage;
                             }
                             if is_done_event(&ev.bytes) {
                                 counts_read = true;
@@ -3841,35 +3871,43 @@ impl Signer {
             }
         };
         let own_digest = hex::encode(sink.hash.clone().finalize());
+        // a reply by the token cut short before its final counts or its end: what it cost is not known, and its seller may
+        // still charge it up to what it held back
+        let cut_uncounted = tokens.is_some() && !complete && !counts_read;
         // what the answer drew is what it cost by the wallet's count now that it has ended (an answer by the token: its
         // tokens, where the most it could cost was drawn until now)
         let freed_since = {
             let mut m = lock_money(hs);
             let had = own.load(Ordering::SeqCst);
-            set_own(&mut m, own_cost.min(st.max_msat).saturating_sub(head.charged));
-            // what it held back is drawn now, as far as it cost; the rest comes back to the answers beside it
-            m.reserved = m.reserved.saturating_sub(held);
-            m.freed = m.freed.saturating_add(held.saturating_sub(own.load(Ordering::SeqCst).saturating_sub(had)));
+            let cost = own_cost.min(st.max_msat).saturating_sub(head.charged);
+            // what it held back is drawn now, as far as it cost, and the rest comes back to the answers beside it; one
+            // cut before its counts keeps all it held as drawn ([`Money::end_hold`])
+            let drawn = m.end_hold(held, had, cost, cut_uncounted);
+            set_own(&mut m, drawn);
             m.freed.saturating_sub(freed_before)
         };
         // what the wallet believes of the seller's charge for this answer, however its last receipt comes ([`Bound`])
+        // the most its terms quote for a reply by the token: its request and the most its tokens may come to (what an
+        // honest gateway charges at most, and what it held back while it ran)
+        let quote = reserve.min(st.max_msat).max(head.charged);
         let bound = if complete {
-            Bound { most: own_cost.min(st.max_msat), max_msat, whole: Some((own_cost, own_digest.clone())), share: None }
+            Bound { most: own_cost.min(st.max_msat), max_msat, whole: Some((own_cost, own_digest.clone())), share: None, quoted: None }
         } else if tokens.is_some() {
-            // cut after its counts or its end: what they come to, and a few tokens more; before them, the call's limit
-            let most = if counts_read {
-                own_cost.saturating_add(price.tokens.output_due(counted, TOKEN_SLACK).unwrap_or(u64::MAX)).min(st.max_msat)
+            // cut after its final counts or its end: what they come to, and a few tokens more; before them, the quote,
+            // and a charge past it is the seller's fault
+            if counts_read {
+                let most = own_cost.saturating_add(price.tokens.output_due(counted, TOKEN_SLACK).unwrap_or(u64::MAX)).min(quote);
+                Bound { most, max_msat, whole: None, share: None, quoted: None }
             } else {
-                st.max_msat
-            };
-            Bound { most, max_msat, whole: None, share: None }
+                Bound { most: quote, max_msat, whole: None, share: None, quoted: Some(quote) }
+            }
         } else {
             let read = sink.bytes.saturating_add(up.load(Ordering::SeqCst));
             let credit = start_avail.saturating_add(spent.released_msat.saturating_sub(released_before)).saturating_add(freed_since);
             let slack = price.cost(CUT_SLACK, 0).unwrap_or(u64::MAX);
             let share = Share { base_spent: st.base_spent, mark_consumed: mark.consumed, own: own.load(Ordering::SeqCst),
                                 read: price.cost(read.saturating_add(CUT_SLACK), secs).unwrap_or(u64::MAX), slack };
-            Bound { most: st.cut_bound(read, secs, credit), max_msat, whole: None, share: Some(share) }
+            Bound { most: st.cut_bound(read, secs, credit), max_msat, whole: None, share: Some(share), quoted: None }
         };
         // the last receipt of this answer, from the seller's signed status. One that arrived whole is waited for longer
         // before it is left unclosed: the seller has sent all of it, and an unclosed answer holds up the session's releases
@@ -3901,7 +3939,8 @@ impl Signer {
                             believed_at = Some(believed);
                         }
                         // the seller's fault is the session's at once, under the same lock: no answer beside this one
-                        // releases another ticket to it meanwhile
+                        // releases another ticket to it from then on (one whose secret is already leaving the book, at
+                        // most one, still goes: the fault is asked just before the book, not under its lock)
                         if let Some(why) = &wrong {
                             m.fault.get_or_insert_with(|| why.clone());
                         }
@@ -4533,14 +4572,14 @@ mod tests {
     #[test]
     fn every_way_an_answer_closes_believes_the_same_charge() {
         let m0 = money(3_000_000);
-        let whole = Bound { most: 20_000, max_msat: 5_000_000, whole: Some((20_000, "ab".into())), share: None };
+        let whole = Bound { most: 20_000, max_msat: 5_000_000, whole: Some((20_000, "ab".into())), share: None, quoted: None };
         let signed = |charged: u64, body: &str| Receipt { body_hash: body.into(), ..receipt(3, 0, 0, charged) };
         assert_eq!(whole.judge(&signed(20_000, "ab"), &m0), (20_000, None));
         let (taken, why) = whole.judge(&signed(4_999_000, "ab"), &m0);
         assert_eq!(taken, 20_000);
         assert!(why.unwrap().contains("costs 20000"));
         assert!(whole.judge(&signed(20_000, "cd"), &m0).1.unwrap().contains("another body"));
-        let cut = Bound { most: 360_000, max_msat: 5_000_000, whole: None, share: None };
+        let cut = Bound { most: 360_000, max_msat: 5_000_000, whole: None, share: None, quoted: None };
         assert_eq!(cut.judge(&signed(4_000_000, ""), &m0), (360_000, None));
         // given up: the same bound
         let mut m = money(3_000_000);
@@ -4560,7 +4599,7 @@ mod tests {
         let mut m = money(3_000_000);
         // a cut answer the wallet counted 20 sat for, under a limit of 5,000 sat, of which 360 sat could have reached it
         m.open.insert(7, 4_980_000);
-        m.tails.push(Tail { rid: 7, seq: 3, digest: String::new(), status: 200, since: Instant::now(), counted: 20_000, bound: Bound { most: 360_000, max_msat: 5_000_000, whole: None, share: None } });
+        m.tails.push(Tail { rid: 7, seq: 3, digest: String::new(), status: 200, since: Instant::now(), counted: 20_000, bound: Bound { most: 360_000, max_msat: 5_000_000, whole: None, share: None, quoted: None } });
         assert_eq!(m.give_up(), 0, "not before its time");
         m.tails[0].since -= TAIL_GIVE_UP;
         assert_eq!(m.give_up(), 1);
@@ -4568,7 +4607,7 @@ mod tests {
         assert_eq!((m.accepted, m.consumed), (360_000, 340_000));
         // one whose limit leaves less than that: what is left of the limit
         m.open.insert(8, 30_000);
-        m.tails.push(Tail { rid: 8, seq: 4, digest: String::new(), status: 200, since: Instant::now() - TAIL_GIVE_UP, counted: 20_000, bound: Bound { most: 360_000, max_msat: 50_000, whole: None, share: None } });
+        m.tails.push(Tail { rid: 8, seq: 4, digest: String::new(), status: 200, since: Instant::now() - TAIL_GIVE_UP, counted: 20_000, bound: Bound { most: 360_000, max_msat: 50_000, whole: None, share: None, quoted: None } });
         assert_eq!(m.give_up(), 1);
         assert_eq!((m.accepted, m.consumed), (410_000, 370_000));
     }
@@ -4589,7 +4628,7 @@ mod tests {
         let read = per_mib.cost(CUT_SLACK, 0).unwrap();
         let cut = |rid: u64| Tail { rid, seq: rid, digest: String::new(), status: 200, since: Instant::now(), counted: 0,
                                     bound: Bound { most: 1_000_000 + slack, max_msat: 5_000_000, whole: None,
-                                                   share: Some(Share { base_spent: 0, mark_consumed: 0, own: 0, read, slack }) } };
+                                                   share: Some(Share { base_spent: 0, mark_consumed: 0, own: 0, read, slack }), quoted: None } };
         m.open.insert(1, 5_000_000);
         m.open.insert(2, 5_000_000);
         let (a, b) = (cut(1), cut(2));
@@ -4610,7 +4649,7 @@ mod tests {
     fn credit_freed_by_a_reply_beside_it_counts_for_a_cut_answer() {
         let mut m = money(1_000_000);
         let b = Bound { most: 5_000_000, max_msat: 5_000_000, whole: None,
-                        share: Some(Share { base_spent: 0, mark_consumed: 0, own: 0, read: 10, slack: 10 }) };
+                        share: Some(Share { base_spent: 0, mark_consumed: 0, own: 0, read: 10, slack: 10 }), quoted: None };
         // a reply beside it holds 600 sat back: 400 left for this one
         m.reserved = 600_000;
         assert_eq!(b.most(&m), 400_010);
@@ -4618,6 +4657,48 @@ mod tests {
         m.reserved = 0;
         m.consumed = 100_000;
         assert_eq!(b.most(&m), 900_010);
+    }
+
+    /// A reply by the token cut short before its counts keeps its hold as drawn: an answer by its size
+    /// cut beside it is not believed for the same credit, and the two together stay inside what was
+    /// released (the case a review found: 600 sat held, 10 drawn, 400 left for the answer beside it).
+    #[test]
+    fn a_reply_cut_before_its_counts_frees_nothing_for_the_answer_beside_it() {
+        let mut m = money(1_000_000);
+        // the reply holds 600 sat back (it draws nothing while it runs) and its tokens so far come to 10 when it is cut
+        m.reserved = 600_000;
+        let drawn = m.end_hold(600_000, 0, 10_000, true);
+        assert_eq!(drawn, 600_000);
+        m.consumed += drawn;
+        assert_eq!((m.reserved, m.freed), (0, 0), "nothing freed");
+        // the reply is believed up to its quote, and adds nothing past what it holds drawn
+        let a = Bound { most: 600_000, max_msat: 5_000_000, whole: None, share: None, quoted: Some(600_000) };
+        let (first, why) = a.judge(&Receipt { ..receipt(1, 1_000_000, 600_000, 600_000) }, &m);
+        assert_eq!((first, why), (600_000, None));
+        // the answer by its size beside it, started before the reply: the seller charges it 990 sat
+        let b = Bound { most: 5_000_000, max_msat: 5_000_000, whole: None,
+                        share: Some(Share { base_spent: 0, mark_consumed: 0, own: 0, read: 10, slack: 10 }), quoted: None };
+        let (second, _) = b.judge(&Receipt { ..receipt(2, 1_000_000, 990_000, 990_000) }, &m);
+        assert_eq!(second, 400_010);
+        assert!(first + second <= 1_000_000 + 10, "{first} + {second}");
+        // a reply whose cost is known (cut after its counts, or whole) still frees what it held and did not draw
+        let mut k = money(1_000_000);
+        k.reserved = 600_000;
+        assert_eq!(k.end_hold(600_000, 0, 10_000, false), 10_000);
+        assert_eq!((k.reserved, k.freed), (0, 590_000));
+    }
+
+    /// A reply by the token cut before its counts is believed up to what its terms quote for it, not
+    /// up to the call's limit, and a charge past the quote is the seller's fault.
+    #[test]
+    fn a_reply_cut_before_its_counts_is_believed_up_to_its_quote_only() {
+        let m = money(1_000_000);
+        let quote = 120_000;
+        let a = Bound { most: quote, max_msat: 5_000_000, whole: None, share: None, quoted: Some(quote) };
+        assert_eq!(a.judge(&Receipt { ..receipt(1, 1_000_000, 100_000, 100_000) }, &m), (100_000, None));
+        let (believed, why) = a.judge(&Receipt { ..receipt(1, 1_000_000, 990_000, 990_000) }, &m);
+        assert_eq!(believed, quote);
+        assert!(why.is_some_and(|w| w.contains("quote")));
     }
 
     #[test]
