@@ -3132,6 +3132,30 @@ impl Signer {
         }
     }
 
+    /// The seller's interim receipt of an open answer (a WebSocket) against the wallet's own count of it
+    /// ([`crate::ticket_interim`]). `Some`: the seller's fault, recorded in the session (nothing more is released to it)
+    /// with the receipt in the wallet's log. A status that could not be had is no fault here: the answer goes on, within
+    /// what was released, as any answer does.
+    #[allow(clippy::too_many_arguments)]
+    fn ticket_interim(&self, hs: &HttpSession, seq: u64, digest: &str, own_up: u64, own_down: u64, price: &Price, max_msat: u64,
+                      last: &mut Option<crate::ticket_interim::Seen>) -> Option<String> {
+        let v = self.ticket_status_of(hs, false).ok()?;
+        let sid = lock_link(hs).seller_sid.clone();
+        let mut found = None;
+        for raw in v.get("interim").and_then(Value::as_array).into_iter().flatten() {
+            let Ok(r) = Receipt::verify(raw, &hs.terms.receipt_key, &sid) else { continue };
+            if let Err(why) = crate::ticket_interim::check(&r, seq, digest, 101, own_up, own_down, price, max_msat, last) {
+                found = Some((why, r.raw));
+                break;
+            }
+        }
+        let found = found.or_else(|| crate::ticket_interim::stale(last, own_up.saturating_add(own_down), Instant::now(), crate::ticket_interim::stale_after()).map(|w| (w, Value::Null)));
+        let (why, receipt) = found?;
+        self.ticket_audit("ticket_interim_fault", json!({"session": hs.sid, "origin": hs.origin, "dest": format!("ln:{}", hs.terms.terms.payee),
+                                                         "reason": why, "receipt": receipt, "own_up": own_up, "own_down": own_down}));
+        Some(lock_money(hs).fault.get_or_insert(why).clone())
+    }
+
     /// Mark the session faulty and stop it: nothing more is released to this seller in it.
     /// A seller's signed charge for one answer above the call's limit: the receipt goes into the audit log as
     /// evidence, and the words for the fault (which stops the session).
@@ -3807,10 +3831,22 @@ impl Signer {
                     None => drop(w),
                 }
                 let (pay, credited, state, wake, up, stopper, st, account) = (&pay, &credited, &state, &wake, &up, &stopper, &st, &account);
+                // the seller's signed count of this open answer, checked against the wallet's as it runs
+                let mut interim: (Option<crate::ticket_interim::Seen>, Instant) = (None, Instant::now() + crate::ticket_interim::poll_every());
                 scope.spawn(move || loop {
                     let mut s = lock(state);
                     if s.2 || s.1.is_some() {
                         return;
+                    }
+                    if Instant::now() >= interim.1 {
+                        let (down, out) = (s.0, up.load(Ordering::SeqCst));
+                        drop(s);
+                        interim.1 = Instant::now() + crate::ticket_interim::poll_every();
+                        let fault = self.ticket_interim(hs, seq, digest, out, down, price, st.max_msat, &mut interim.0);
+                        s = lock(state);
+                        if let Some(why) = fault {
+                            s.1.get_or_insert(why);
+                        }
                     }
                     let total = s.0.saturating_add(up.load(Ordering::SeqCst));
                     account(st.cost(total));

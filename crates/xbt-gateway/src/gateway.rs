@@ -88,6 +88,9 @@ struct State {
     book: Book,
     store: Store,
     finals: HashMap<String, VecDeque<Value>>,
+    /// The latest interim receipt of each answer still open (a WebSocket, a VPN tunnel), by
+    /// session and seq: listed in `status` until the answer's last receipt replaces it.
+    interim: HashMap<String, HashMap<u64, Value>>,
 }
 
 #[derive(Default)]
@@ -359,6 +362,7 @@ impl Gateway {
                 book,
                 store,
                 finals: HashMap::new(),
+                interim: HashMap::new(),
             }),
             credited: Condvar::new(),
             height: Mutex::new(Height {
@@ -616,6 +620,7 @@ impl Gateway {
             for r in &sweep.recs {
                 if let Rec::Drop { session } = r {
                     st.finals.remove(session);
+                    st.interim.remove(session);
                 }
             }
             self.journal(&mut st, &sweep.recs);
@@ -1459,8 +1464,11 @@ impl Gateway {
                     .get(&a.session)
                     .map(|f| f.iter().cloned().collect())
                     .unwrap_or_default();
+                // the answers still open, each with the seller's signed count so far (`interim`): a buyer checks them
+                // while the answer runs. Not among `responses`, which are answers that ended
+                let interim: Vec<Value> = st.interim.get(&a.session).map(|m| m.values().cloned().collect()).unwrap_or_default();
                 drop(st);
-                json!({"tickets": tickets, "height": self.known_height(), "responses": finals})
+                json!({"tickets": tickets, "height": self.known_height(), "responses": finals, "interim": interim})
             }
         };
         let mut out = out;
