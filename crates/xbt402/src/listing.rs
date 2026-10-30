@@ -28,6 +28,18 @@ const MAX_SERVICES: usize = 32;
 /// it opens.
 const KINDS: [&str; 6] = ["video", "files", "api", "ai", "hashrate", "app"];
 const PRICE_KEYS: [&str; 6] = ["request_msat", "byte_msat", "per_bytes", "second_msat", "per_1k_input_msat", "per_1k_output_msat"];
+
+/// The most a buyer who chose from a listing agreed to pay: the listing's `prices` as the wallet's
+/// `price_ceiling` (per request, per GiB, per second, per 1,000 tokens in and out). A seller whose
+/// 402 asks more than its own signed listing showed is paid nothing.
+pub fn price_ceiling(prices: &Value) -> Value {
+    let n = |k: &str| prices.get(k).and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))).unwrap_or(0);
+    let per_bytes = n("per_bytes").max(1);
+    let gib = (u128::from(n("byte_msat")) << 30).div_ceil(u128::from(per_bytes));
+    serde_json::json!({"request_msat": n("request_msat"), "gib_msat": u64::try_from(gib).unwrap_or(u64::MAX), "second_msat": n("second_msat"),
+                       "input_per_1k_msat": n("per_1k_input_msat"), "output_per_1k_msat": n("per_1k_output_msat")})
+}
+
 /// A fetched document larger than this is refused before it is parsed.
 const MAX_BODY: usize = 256 << 10;
 
@@ -568,6 +580,14 @@ pub fn fetch(seller_url: &str, mut get: impl FnMut(&str) -> Result<Page, String>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_listings_prices_are_the_ceiling_its_buyer_pays_within() {
+        let c = super::price_ceiling(&serde_json::json!({"request_msat": "2500", "byte_msat": 200_000, "per_bytes": 1_048_576}));
+        assert_eq!(c, serde_json::json!({"request_msat": 2500, "gib_msat": 204_800_000u64, "second_msat": 0, "input_per_1k_msat": 0, "output_per_1k_msat": 0}));
+        let ai = super::price_ceiling(&serde_json::json!({"per_1k_input_msat": "2000", "per_1k_output_msat": "10000"}));
+        assert_eq!((ai["input_per_1k_msat"].as_u64(), ai["output_per_1k_msat"].as_u64(), ai["request_msat"].as_u64()), (Some(2000), Some(10_000), Some(0)));
+    }
+
     use super::*;
     use xbt_primitives::hash::sha256;
 

@@ -245,10 +245,7 @@ impl Buyer {
     /// Whether `id` is held off (a tunnel that died young, or terms above its announcement).
     pub fn is_held_off(&self, id: &str) -> bool {
         let h = self.held_off.lock().unwrap_or_else(|e| e.into_inner());
-        match h.get(id) {
-            Some((until, _)) if Instant::now() < *until => true,
-            _ => false,
-        }
+        matches!(h.get(id), Some((until, _)) if Instant::now() < *until)
     }
 
     /// Holds `id` off for `hold`, or for twice its last hold (at most an hour) when `hold` is `None`.

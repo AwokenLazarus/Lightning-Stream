@@ -4532,8 +4532,6 @@ pub(crate) fn seller_busy(v: &Value) -> Option<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn a_body_streamed_to_a_caller_is_never_written_to_disk_by_the_wallet() {
         let d = tempfile::tempdir().unwrap();

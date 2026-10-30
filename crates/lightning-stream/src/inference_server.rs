@@ -153,7 +153,8 @@ struct Failed {
 
 /// Has the signer pay for one call and stream its body to a socket of ours; waits for the head
 /// and the first byte of the body, at most `first_byte`.
-fn begin(cfg: &Config, method: &str, url: &str, body: &[u8], max_sats: i64, first_byte: Duration) -> Result<Begun, Failed> {
+/// `ceiling`: the seller's listed prices, the most the wallet pays it (none for a free read).
+fn begin(cfg: &Config, method: &str, url: &str, body: &[u8], max_sats: i64, first_byte: Duration, ceiling: Option<&Value>) -> Result<Begun, Failed> {
     let fail = |status: u16, message: String| Failed { status, message, final_answer: None };
     let name = format!("ai-{}", random_hex());
     let path = cfg.stream_dir.join(&name);
@@ -163,6 +164,9 @@ fn begin(cfg: &Config, method: &str, url: &str, body: &[u8], max_sats: i64, firs
     let mut params = json!({"url": url, "method": method, "max_sats": max_sats, "task": cfg.task, "stream_to": name, "stream_head": true});
     if !body.is_empty() {
         params["body"] = Value::String(String::from_utf8_lossy(body).into_owned());
+    }
+    if let Some(c) = ceiling {
+        params["price_ceiling"] = c.clone();
     }
     let signer = cfg.signer.clone();
     std::thread::spawn(move || {
@@ -247,7 +251,7 @@ fn fetch_catalogue(cfg: &Config) -> (Catalogue, Prefs) {
         // the seller's own list, asked for with nothing to spend; a seller that asks to be paid even for
         // its list (a gateway that serves nothing outside a paid session) is listed with the models the
         // sellers file names for it, if any
-        let asked = begin(cfg, "GET", &format!("{route}v1/models"), &[], 0, cfg.first_byte).ok().and_then(|mut b| {
+        let asked = begin(cfg, "GET", &format!("{route}v1/models"), &[], 0, cfg.first_byte, None).ok().and_then(|mut b| {
             let mut body = std::mem::take(&mut b.first);
             let _ = (&mut b.rest).take(1 << 20).read_to_end(&mut body);
             serde_json::from_slice::<Value>(&body).ok().filter(|m| m.get("data").is_some_and(Value::is_array))
@@ -401,7 +405,8 @@ impl AiServer {
             body["model"] = Value::String(offer.model.clone());
             let sent = body.to_string().into_bytes();
             let url = format!("{}{}", offer.route, path.trim_start_matches('/'));
-            match begin(&self.cfg, "POST", &url, &sent, self.cfg.max_sats, self.cfg.first_byte) {
+            // the seller's own listed prices are the most it is paid: a 402 asking more is refused
+            match begin(&self.cfg, "POST", &url, &sent, self.cfg.max_sats, self.cfg.first_byte, Some(&offer.ceiling)) {
                 Ok(b) => return self.relay(b, offer.seller.clone(), key_id.to_string(), today),
                 Err(f) => {
                     let mut inner = lock(&self.inner);

@@ -58,6 +58,8 @@ pub struct Offer {
     /// The route's cap on output tokens.
     pub max_output: u64,
     pub context: Option<u64>,
+    /// The seller's listed prices as the most the wallet pays it (`price_ceiling`).
+    pub ceiling: Value,
 }
 
 impl Offer {
@@ -85,7 +87,8 @@ impl Catalogue {
             let Some(id) = m.get("id").and_then(Value::as_str).filter(|s| !s.is_empty() && s.len() <= 200) else { continue };
             let context = ["context_length", "max_model_len", "context_window"].iter().find_map(|k| m.get(*k).and_then(Value::as_u64));
             self.offers.push(Offer { model: id.to_string(), seller: seller.to_string(), route: route.to_string(),
-                                     input_per_1k_msat: input, output_per_1k_msat: output, max_output, context });
+                                     input_per_1k_msat: input, output_per_1k_msat: output, max_output, context,
+                                     ceiling: xbt402::listing::price_ceiling(prices) });
         }
     }
 
@@ -231,6 +234,15 @@ pub fn request_bounds(body: &Value, raw_len: usize, default_max: u64) -> (u64, u
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_sellers_listed_prices_are_what_the_wallet_pays_it_at_most() {
+        let mut c = super::Catalogue::default();
+        c.add_seller("cheap", "https://cheap.example/ai/", &serde_json::json!({"per_1k_input_msat": "2000", "per_1k_output_msat": 5000}), 1024,
+                     &serde_json::json!({"data": [{"id": "llama-3.1-8b"}]}));
+        let ceiling = &c.offers[0].ceiling;
+        assert_eq!((ceiling["input_per_1k_msat"].as_u64(), ceiling["output_per_1k_msat"].as_u64(), ceiling["request_msat"].as_u64()), (Some(2000), Some(5000), Some(0)));
+    }
+
     use super::*;
 
     fn cat() -> Catalogue {
