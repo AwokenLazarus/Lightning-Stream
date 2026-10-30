@@ -249,6 +249,8 @@ pub struct Signer {
     pub(crate) enroll: Mutex<crate::admin::EnrollCode>,
     /// AGP-089: the human-signed messages already used (one signature, one operation).
     pub(crate) used_sigs: crate::admin::UsedSigs,
+    /// Sellers caught charging more than the wallet could account for, blocked until the owner lifts it.
+    pub(crate) seller_blocks: crate::seller_block::SellerBlocks,
 }
 
 impl Signer {
@@ -317,6 +319,7 @@ impl Signer {
         };
         let ln_book = LnBook::open(&run.join("ln_payments.json"))?;
         let ln_funding = crate::ln_funding::Kept::open(&run.join(crate::ln_funding::KEPT_FILE));
+        let seller_blocks = crate::seller_block::SellerBlocks::open(&run);
         let s = Arc::new(Self { root: root.into(), run, config: RwLock::new(config), engine, node, chain, hrp, mining, sock_path,
                                 human_pubkey: RwLock::new(human_pubkey), spend: Mutex::new(()), approval_outcomes: Mutex::new(HashMap::new()), boot_policy: raw,
                                 keystore, sigaudit, anchor, hot, legacy_channels, net: Mutex::new(None), watch_interval,
@@ -325,7 +328,8 @@ impl Signer {
                                 ticket_pace: crate::ticket_rail::Pace::default(), ticket_queued: Mutex::new(Default::default()),
                                 ticket_wire: opts.ticket_wire.clone().unwrap_or_else(|| Arc::new(crate::ticket_pay::UreqWire::with_root(root))),
                                 ticket_http: Mutex::new(HashMap::new()), draw_http: Mutex::new(HashMap::new()), route_terms: Mutex::new(HashMap::new()), ticket_cancel_tried: Mutex::new(HashSet::new()), me: std::sync::OnceLock::new(), enroll: Mutex::new(Default::default()),
-                                used_sigs: crate::admin::UsedSigs::new(&root.join(".run").join(crate::admin::USED_SIGS_FILE)) });
+                                used_sigs: crate::admin::UsedSigs::new(&root.join(".run").join(crate::admin::USED_SIGS_FILE)),
+                                seller_blocks });
         let _ = s.me.set(Arc::downgrade(&s));
         // before any request: what the book holds locked is retired (a start may be a restore)
         s.ticket_start();
@@ -528,6 +532,16 @@ impl Signer {
             }
             // takes the spend lock itself, and not while the seller is asked to cancel
             "ticket_stop" => sanitize(self.ticket_stop_by(p)),
+            // the sellers caught charging more than the wallet could account for, and the owner lifting a block
+            "seller_blocks" => sanitize(json!({"ok": true, "blocked": self.seller_blocks.list()})),
+            "seller_unblock" => {
+                let node = p.get("node").and_then(Value::as_str).unwrap_or_default();
+                let was = self.seller_blocks.unblock(node);
+                if was {
+                    self.ticket_audit("seller_unblock", json!({"node": node}));
+                }
+                sanitize(json!({"ok": was, "node": node}))
+            }
             "ticket_status" => {
                 let _g = self.lock();
                 sanitize(self.ticket_status_locked(p))

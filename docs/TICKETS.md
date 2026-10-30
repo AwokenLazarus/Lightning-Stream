@@ -1580,45 +1580,44 @@ wallet that starts again has stopped every session (section 3); it asks each sel
 once, to cancel what it left locked. Stopping gives up the session's balance: the unused part of
 the last ticket.
 
-**The most a dishonest seller can take, in one place.** A seller is never paid more than the
-tickets the wallet released to it: its receipts may not say it spent more than that, and nothing
-else moves money. So the most a seller can take without delivering is **the credit the app has
-with that seller right then** (what it released and the seller has not yet earned), and on top of
-it **at most what is left of each running call's own limit** (`max_sats`) while answers are still
-running, and **a lost request's whole limit, once** (below). The session's pool of tickets locked
-but not released costs nothing until released. How
-much of that a seller can claim without delivering depends on what it sells and whether the answer
-has ended:
+**The most a dishonest seller can take, in one place.** In short: **a cheating shop can take at
+most about one or two tickets (a ticket is 1,000 sat by default) plus a small allowance per
+request, and is then blocked.** In detail:
 
-- **Priced by size (web pages, files, films):** about 1.5 tickets for each answer being paid as it
-  arrives, right after a release (a ticket is 1,000 sat by default), falling as the body arrives. A
-  seller that cuts answers short is believed for at most that credit, with 16 MiB of slack, priced,
-  for each answer it cuts: answers cut side by side are judged together, so cutting many at once
-  does not multiply the credit.
-- **Priced by the token (AI replies):** while a reply runs, what its terms quote for it at most
-  (its request and the price of its most output tokens) is held back and may have been bought
-  ahead. A reply cut short before its final counts is believed up to that quote and no more; it stays
-  counted as drawn, so no other answer is believed for the same credit. One cut after its final
-  counts, or that arrives whole, is believed only for what its counts come to.
-- **While an answer is still running**, the wallet cannot yet tell bytes or tokens still to come
-  from a spend the seller inflated: the seller's signed spend may run ahead of the wallet's count by
-  what is left of that call's limit, and the wallet may release tickets on that word, inside the
-  call's limit. As the answer ends, what it may still add to the seller's spend narrows to the most
-  the wallet could believe of its charge: nothing, for one that arrived whole or a reply held at
-  its quote; for one cut short by its size, its own bound above (the credit it could draw, with 16
-  MiB priced), until it is closed and judged together with the answers cut beside it. A spend past
-  that is a seller fault at the next receipt the wallet takes. Keep `max_sats` near what a call
-  should cost: it is the most a running call can lose.
-- **A request whose answer is lost** (the connection fails after the request has left, which a
-  seller can cause) can cost up to its whole `max_sats`, once: the seller may still have served it,
-  so the wallet allows its spend up to that limit until a quiet point after `LOST_GRACE` (two
-  minutes), and checks it no tighter than that there.
+A seller is never paid more than the tickets the wallet released to it: its receipts may not say it
+spent more than that, and nothing else moves money. So the most a seller can take without
+delivering is **the credit the app has with that seller right then** (what it released and the
+seller has not yet earned), and on top of it, for each request, **at most what that request may add
+past what the wallet has counted of it** (`uncounted_most` in `ticket_pay.rs`):
+
+- **Priced by size (web pages, files, films, VPN):** its request, 16 MiB of bytes on their way,
+  priced, and while it is answered and priced by the byte, two tickets (what the wallet pays ahead
+  of what it has read). About 1.5 tickets of credit sit with the seller for each answer right after
+  a release, falling as the body arrives. A seller that cuts answers short is believed for at most
+  that credit, with 16 MiB of slack, priced, for each answer it cuts: answers cut side by side are
+  judged together, so cutting many at once does not multiply the credit.
+- **Priced by the token (AI replies):** at most its quote (its request and the price of its most
+  output tokens), from the moment it is sent. A reply cut short before its final counts is believed
+  up to that quote and stays counted as drawn, so no other answer is believed for the same credit;
+  one cut after its final counts, or that arrives whole, is believed only for what its counts come to.
+- **Priced by the second:** the seconds a seller counts are not the wallet's to know, so such a
+  request may add up to its call's limit (`max_sats`). Keep `max_sats` near what it should cost.
+- **A request whose answer is lost** (the connection fails after the request left, which a seller
+  can cause) is held, until a quiet point after `LOST_GRACE` (two minutes), to what could have
+  arrived of it: by size, its request and 16 MiB priced; by the token, its quote; by the second, the
+  seconds since it was sent and 16 MiB priced. A seller whose connection drops before its answer
+  reaches the wallet is paid only for what could have arrived: honest sellers lose that request's
+  charge past it, which is the trade for not trusting a seller's word for a request nobody saw
+  answered.
 - **Never past a call's own limit** (`max_sats`), whatever it is.
 
-A seller that cheats inside those bounds gets it once: the wallet says the answer was cut short, and
-every charge is checked against the wallet's own count. A seller caught over-charging is a seller
-fault: the session stops at once, nothing more is released or bought for it (one release already
-leaving the book at that moment, at most, still goes), and the receipt is kept as evidence.
+A seller caught over-charging is a seller fault: the session stops at once, nothing more is
+released or bought for it (one release already leaving the book at that moment, at most, still
+goes), the receipts are kept as evidence in the audit log (`ticket_seller_fault`), and **the seller
+is blocked**: the wallet opens no new session with its node until the owner unblocks it (the
+Spending rules page; the signer's `seller_blocks` and `seller_unblock`). The owner's spending rules
+also cap what any one seller is paid (`per_counterparty_cap_sats`; 10,000 sat on a new mainnet
+install, inside a daily budget of 10,000).
 
 **What goes wrong, and what the wallet then does.**
 
@@ -1631,7 +1630,7 @@ leaving the book at that moment, at most, still goes), and the receipt is kept a
 | A refusal that is not signed (a forged `balance_short`, or `session_unknown` from a seller that lost its records). | Nothing is released on its word. The session is stopped; the next call opens a new one. | The session's balance. |
 | `session_unknown`, unsigned, to a `lock` or a `status` (the seller forgot a session that held nothing and was quiet for its `idle_secs`). | The session is stopped (`ticket_session_ended`); the next call opens a new one. | Nothing: the seller forgets only a session with no balance, or with one that was not used for a day. |
 | An unsigned `bad_seq` with `nextSeq`. | Adopted, twice at most: a `seq` only orders requests. | Nothing. |
-| A receipt's totals or charge contradict the wallet's count (inflated metering). | The session is stopped as faulty. | At most the ticket in use; while answers are still running, up to what is left of their calls' limits (see above). |
+| A receipt's totals or charge contradict the wallet's count (inflated metering). | The session is stopped as faulty, and the seller blocked until the owner unblocks it. | At most the credit in use and, for each request, what it may add past what is counted of it: by size, its request, 16 MiB priced and two tickets; by the token, its quote; by the second, its call's limit (see above). |
 | The body is not the one the receipt signs. | The body is handed on marked as such, and the session is stopped. | At most the ticket in use. |
 | The answer stops in the middle. | The call reports how far it came, and the last receipt if there is one. No ticket is released after the last byte. | By its size: what it could still draw when it stopped (the credit the session had for it when it started, the tickets its own call released and holds freed beside it), and no more than the session's credit left for it as it is closed, with 16 MiB priced on top; answers cut side by side share that credit, each with its own 16 MiB. By the token: what its counts come to and 64 tokens more where its final counts or its end were read, else up to what its terms quote for it (a charge past that is a seller fault). Never more than the credit the app has with the seller (see above), and the answers show cut short. |
 | The wallet stopped reading an answer when its pool ran out, and pays that seller again at once. | It waits until the seller has closed the old answer (the gateway does so after its wait for a refill, 15 s by default), then releases. | Up to that wait. Before this rule a ticket released in that time was charged for bytes of the old answer that nobody read, and the wallet took the honest seller's receipt for a lie. |
@@ -1997,7 +1996,13 @@ request to that seller until the read timeout. Now requests in one session run s
 - **What an ended answer may still add.** Once an answer has ended, what its request may still add
   to the seller's spend is no more than the wallet believes of any charge for it, past what it
   counted: nothing for one that arrived whole or a reply held at its quote, the rest of its bound for
-  one cut short. A request whose answer was lost keeps its whole limit until a quiet point.
+  one cut short. A request whose answer was lost keeps, until a quiet point, only what could have
+  arrived of it. Before it ends, a request may add no more than its price allows past what is counted
+  of it (`uncounted_most`): by size, its request, 16 MiB priced and two tickets; by the token, its
+  quote; by the second, its call's limit.
+- **A seller caught is blocked.** A seller fault blocks the seller's node in the wallet
+  (`blocked_sellers.json` in the signer's run folder): no new session with it until the owner
+  unblocks it.
 - **What the seller may have spent.** A receipt's spend is taken only
   inside the spend at the last quiet point (nothing open, nothing unclosed), plus what the wallet
   counted since, plus what the requests still open may add. Where nothing is open, it is taken only

@@ -5103,6 +5103,7 @@ fn a_session_stopped_for_a_seller_fault_is_not_taken_over() {
     let bent = r.pay("/page/10", 2_000);
     r.tap.clear();
     assert_eq!(bent["rule"].as_str(), Some("ticket_seller_fault"), "{bent}");
+    // a receipt that does not verify stops the session but is not over-charging: the seller is not blocked
     let w = r.pay("/page/10", 2_000);
     assert_eq!((w["status"].as_u64(), w["tickets_prepaid"].as_u64()), (Some(200), Some(1)), "a ticket of its own, not the faulty session's balance: {w}");
 }
@@ -5988,6 +5989,76 @@ fn a_seller_charging_a_request_whose_answer_was_lost_is_no_fault() {
     r.tap.clear();
 }
 
+/// A seller that drops a paid page request without answering it, then signs that its spend rose to
+/// all the session's credit (it says the lost request took it): a page is priced by the request, so
+/// nothing of a lost one could cost more than its price and the bytes on their way, and the rise is
+/// the seller's fault at once. The session is stopped, and no ticket is released on its word.
+///
+/// FAILS before: a lost request was held as one the seller may charge up to its call's limit
+/// (5,000 sat), and so was the page beside it, so the raised spend was taken.
+#[test]
+fn a_seller_that_charges_a_lost_request_past_what_could_have_arrived_is_a_seller_fault() {
+    let _g = env_lock();
+    let r = Rig::new(json!({}));
+    assert_eq!(r.pay("/page/10", CALL)["status"].as_u64(), Some(200));
+    let released = r.tap.secrets().len();
+    r.tap.set(Box::new(move |seen, real| {
+        if !seen.paid {
+            return None;
+        }
+        if seen.path == "/page/11" {
+            // the seller reads the request, then the connection fails before any answer
+            let _ = real();
+            return Some(Err(xbt402::ChannelError::new("transport_error", "connection reset")));
+        }
+        if seen.path.starts_with("/page/") {
+            // the next page: its receipt says all the credit released was spent
+            let (status, mut headers, body) = whole(real().ok()?);
+            resign(&mut headers, &|rc| rc["spentMsat"] = rc["releasedMsat"].clone());
+            return Some(Ok(answer(status, headers, body)));
+        }
+        None
+    }));
+    let lost = r.pay("/page/11", CALL);
+    assert!(lost.get("seller_fault").is_none(), "a lost answer alone is no fault: {lost}");
+    let v = r.pay("/page/12", CALL);
+    let fault = v["seller_fault"].as_str().map(str::to_string).or_else(|| r.audit("ticket_seller_fault").first().map(|e| e.to_string())).unwrap_or_default();
+    assert!(fault.contains("account for"), "the raised spend is the seller's fault: {v}");
+    assert_eq!(r.tap.secrets().len(), released, "no ticket released on the raised spend: {v}");
+    r.tap.clear();
+}
+
+/// A seller caught over-charging is blocked: the wallet opens no new session with its node, even
+/// for an honest call, until the owner unblocks it; then it buys from it again.
+///
+/// FAILS before: a fault stopped only its session, and the next call opened a new one.
+#[test]
+fn a_seller_caught_over_charging_is_blocked_until_the_owner_unblocks_it() {
+    let _g = env_lock();
+    let (r, v) = lied_to(Box::new(|seen, real| {
+        if !(seen.paid && seen.path.starts_with("/page/")) {
+            return None;
+        }
+        let (status, mut headers, body) = whole(real().ok()?);
+        resign(&mut headers, &|rc| {
+            rc["charged"] = "5000".into();
+            rc["spentMsat"] = "7500".into();
+        });
+        Some(Ok(answer(status, headers, body)))
+    }));
+    assert_eq!(v["rule"].as_str(), Some("ticket_seller_fault"), "{v}");
+    r.tap.clear();
+    let blocked = r.pay("/page/40", CALL);
+    assert_eq!(blocked["rule"].as_str(), Some("seller_blocked"), "an honest call to the same seller is refused: {blocked}");
+    let node = blocked["seller_blocked"].as_str().unwrap_or_default().to_string();
+    let list = r.call("seller_blocks", json!({}));
+    assert_eq!(list["blocked"].as_array().map(Vec::len), Some(1), "{list}");
+    assert_eq!(list["blocked"][0]["node"].as_str(), Some(node.as_str()), "{list}");
+    assert_eq!(r.call("seller_unblock", json!({"node": node}))["ok"], true);
+    let again = r.pay("/page/41", CALL);
+    assert_eq!(again["status"].as_u64(), Some(200), "unblocked, the seller is paid again: {again}");
+}
+
 /// A seller with a narrow window: the wallet keeps no more of its requests on their way than the
 /// window holds, and the seller takes them all.
 #[test]
@@ -6135,6 +6206,10 @@ fn a_seller_that_drains_the_balance_while_a_websocket_is_open_is_caught() {
     });
     caller.join().unwrap();
     let secrets = r.tap.secrets().len();
+    // caught over-charging, the seller is blocked; the owner unblocks it
+    let blocked = r.pay("/page/11", CALL);
+    assert_eq!(blocked["rule"].as_str(), Some("seller_blocked"), "{blocked}");
+    assert_eq!(r.call("seller_unblock", json!({"node": blocked["seller_blocked"]}))["ok"], true);
     let next = r.pay("/page/11", CALL);
     assert_ne!(next["session"], first["session"], "the next call opens another session: {next}");
     assert_eq!(r.tap.secrets().len(), secrets + 1, "only the new session's first ticket went out");

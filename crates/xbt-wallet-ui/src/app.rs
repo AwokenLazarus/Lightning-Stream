@@ -580,6 +580,8 @@ impl App {
             "/deny" => back("./approvals", self.call("deny_approval", json!({"token": g("token"), "reason": g("reason"), "expiry": i("expiry"), "signature": sig()})),
                             &|_| "Denied.".into()),
             "/policy" => self.policy_preview(ctx, f),
+            "/seller-unblock" => back("./policy", self.call("seller_unblock", json!({"node": g("node")})),
+                                      &|_| "Unblocked. The app may buy from this shop again.".into()),
             // browsers submit line breaks as CRLF; the signed text is LF only (JSON escapes a CR inside a string)
             "/policy-apply" => back(if self.ack_needed() { "./lightning#ack" } else { "./policy" }, self.call("policy_set", json!({"text": f.get("text").map(|t| t.replace("\r\n", "\n")).unwrap_or_default(),
                                                                               "prev_sha256": g("prev_sha256"), "expiry": i("expiry"), "signature": sig()})), &|v| {
@@ -973,6 +975,25 @@ impl App {
         self.page("Spending rules", ctx, b)
     }
 
+    /// Shops the wallet caught charging more than they delivered: blocked until the owner lifts it.
+    fn blocked_sellers(&self, ctx: &Ctx) -> String {
+        let list = self.call("seller_blocks", json!({})).ok().and_then(|v| v["blocked"].as_array().cloned()).unwrap_or_default();
+        if list.is_empty() {
+            return String::new();
+        }
+        let mut b = String::from("<section id=\"blocked\"><h2>Shops blocked for overcharging</h2><p>The app caught these shops charging more than \
+            they delivered. It stopped paying them at once (at most about one ticket was lost) and buys nothing more from them until you \
+            unblock them. The details are in the app's log.</p><ul>");
+        for e in &list {
+            b.push_str(&format!("<li><strong>{}</strong>: {} <form method=\"post\" action=\"./seller-unblock\" class=\"inline\">\
+                <input type=\"hidden\" name=\"csrf\" value=\"{}\"><input type=\"hidden\" name=\"node\" value=\"{}\">\
+                <button class=\"link\">Unblock</button></form></li>",
+                esc(&txt(e.get("origin"))), esc(&txt(e.get("reason"))), esc(&ctx.csrf), esc(&txt(e.get("node")))));
+        }
+        b.push_str("</ul></section>");
+        b
+    }
+
     fn policy_page(&self, ctx: &Ctx, template: bool, allow: Option<(&str, &str)>) -> Resp {
         let cur = match self.call("policy_get", json!({})) {
             Ok(v) => v,
@@ -980,6 +1001,7 @@ impl App {
         };
         let mut b = String::from("<p class=\"lead\">The rules the wallet applies to every payment an app or an agent asks for. A change takes \
             effect once you sign it with your approval key. Apps and agents cannot change them.</p>");
+        b.push_str(&self.blocked_sellers(ctx));
         let pr = cur["pending_restart"].as_array().cloned().unwrap_or_default();
         if !pr.is_empty() {
             let hint = self.cfg.restart_hint.clone();
