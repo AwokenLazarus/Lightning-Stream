@@ -466,7 +466,7 @@ def send(method: str, target: str, port: int, headers: dict[str, str] | None = N
         conn.close()
 
 
-def gateway_config(name: str, port: int, public: str, caps: dict[str, Any] | None = None) -> str:
+def gateway_config(name: str, port: int, public: str, caps: dict[str, Any] | None = None, page_msat: int = 0) -> str:
     cfg = {
         "listen": f"127.0.0.1:{port}",
         "public_url": public,
@@ -481,7 +481,7 @@ def gateway_config(name: str, port: int, public: str, caps: dict[str, Any] | Non
         "times": {"height_max_age_secs": 5},
         "routes": [
             {"path": "/big.bin", "price": {"byte_msat": BYTE_MSAT, "per_bytes": PER_BYTES}},
-            {"path": "/small.txt", "price": {"request_msat": REQUEST_MSAT}},
+            {"path": "/small.txt", "price": {"request_msat": page_msat or REQUEST_MSAT}},
             {"path": "/free/", "free": True},
         ],
     }
@@ -574,6 +574,7 @@ class Lies:
     kept_receipt: str | None = None
     cut_after = 0
     seen: list[tuple[str, str, bool]] = []  # (method, target, paid)
+    answers: list[tuple[str, bool, int, str]] = []  # (target, paid, status, error code), as the gateway answered
 
 
 def lie_headers(method: str, target: str, paid: bool, headers: dict[str, str]) -> dict[str, str]:
@@ -625,6 +626,13 @@ class Proxy(BaseHTTPRequestHandler):
         try:
             conn.request(method, self.path, body=body or None, headers=fwd)
             r = conn.getresponse()
+            code = ""
+            if r.status == 402 and "payment-required" in {k.lower() for k, _ in r.getheaders()}:
+                try:
+                    code = str(json.loads(base64.b64decode(r.getheader("PAYMENT-REQUIRED") or "")).get("error", ""))
+                except ValueError:
+                    code = "?"
+            Lies.answers.append((self.path, paid, r.status, code))
             headers = lie_headers(method, self.path, paid, {k.lower(): v for k, v in r.getheaders()})
             length = r.getheader("Content-Length")
             if self.path == "/x402/ticket/lock" and Lies.mode == "other_payee" and r.status == 200:
@@ -994,6 +1002,52 @@ def liar() -> None:
 
     lie("cut", "an answer that stops in the middle (7 MiB of a 100 MB file): what was released for it is paid, less than one ticket of it for nothing, and no ticket after it",
         from_the_start("cut", big_url, 25_000), cut_ok, 2)
+    price_change_in_a_visit(page_url)
+
+
+def page_read(url: str, max_sats: int = CALL_SATS) -> dict[str, Any]:
+    """A page of a web app, as the connector's visit asks for it: paid on the terms the seller stated for its
+    route, without asking the price first (known_terms)."""
+    r = signer("xbt402_pay", {"url": url, "max_sats": max_sats, "task": "film", "known_terms": True})
+    note_receipts(r)
+    return r
+
+
+def price_change_in_a_visit(page_url: str) -> None:
+    """The seller's own gateway changes the page's price in the middle of a web app's visit: the next page, sent
+    on the price the wallet was told, is refused unpaid with a receipt (terms_changed), the price is asked
+    again, and the page is paid at the new price within the owner's rules; the money agrees."""
+    stop_sessions()
+    before = money()
+    start = len(Lies.answers)
+    first, second = page_read(page_url), page_read(page_url)
+    # the first page asks the price; the second, on the terms it was told, does not
+    asked_before = sum(1 for t, paid, _, _ in Lies.answers[start:] if t == "/small.txt" and not paid)
+    # the seller's gateway, stopped and started again on its journal with the page at twice its price
+    PROCS["gateway2"].terminate()
+    PROCS["gateway2"].wait(10)
+    gateway_config("gateway2", GW2_PORT, LIAR, page_msat=2 * REQUEST_MSAT)
+    start_gateway("gateway2", GW2_PORT)
+    mark = len(Lies.answers)
+    third = page_read(page_url)
+    seen = [(paid, status, code) for t, paid, status, code in Lies.answers[mark:] if t == "/small.txt"]
+    # the page at its own price again, for the checks after this one
+    PROCS["gateway2"].terminate()
+    PROCS["gateway2"].wait(10)
+    gateway_config("gateway2", GW2_PORT, LIAR)
+    start_gateway("gateway2", GW2_PORT)
+    stop_sessions()
+    after = money()
+    exact = agrees(after, receipts=False)
+    refused_unpaid = bool(seen) and seen[0] == (True, 402, "terms_changed")
+    asked_again = any(not paid for paid, _, _ in seen[1:])
+    paid_new = call_paid(third) and str(third.get("price_msat")) == str(2 * REQUEST_MSAT)
+    no_fault = not any(r.get("seller_fault") for r in (first, second, third))
+    check("liar: the seller's own price changes in the middle of a web app's visit: the page sent on the old price is refused unpaid with a receipt "
+          "(terms_changed), the price is asked again, the new price is paid within the owner's rules, and the money agrees",
+          call_paid(first) and call_paid(second) and asked_before <= 1 and refused_unpaid and asked_again and paid_new and no_fault and exact,
+          {"first": brief(first), "third": brief(third), "asked_before_the_change": asked_before, "after_the_change": seen,
+           "booked_exactly": exact, "tickets": after["tickets"] - before["tickets"]})
 
 
 def next_call_pays(what: str) -> dict[str, Any]:
