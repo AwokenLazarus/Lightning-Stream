@@ -28,6 +28,9 @@ Lightning Stream is early software. It runs on mainnet; use small amounts.
 - On StartOS, Files can share a folder from File Browser, read-only; File Browser stays optional.
 
 **Paying**
+- The price an AI seller or a VPN exit shows in its listing is now the most your wallet will pay it:
+  one that asks more than it advertised is refused before anything is paid. Other services stay
+  capped by each call's spending limit.
 - Several requests to one seller run side by side in one session, each exactly accounted, so a busy
   page no longer waits on itself. Whatever way an answer ends (whole, cut short, or reported late),
   the wallet believes the seller's charge by one rule, and a charge above it is a seller fault.
