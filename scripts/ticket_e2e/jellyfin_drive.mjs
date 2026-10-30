@@ -68,11 +68,15 @@ res.after_login = await ev("location.href"); step(`after login: ${res.after_logi
 const home = await waitFor("!!document.querySelector('.card, .itemsContainer .card')", 20000);
 res.home = home; step(`home shows cards: ${home}`); await shot("03-home");
 step("open the 4K film"); await ev(`location.hash = '#/details?id=${ITEM}'`); await sleep(6000); await shot("04-details");
-const play = await ev(`(()=>{const b=document.querySelector('.btnPlay, button[data-action=resume], button[data-action=play]'); if(b){b.click(); return true} return false})()`);
+// The play button of the details page on show: Jellyfin keeps earlier pages (home, with its
+// "Continue watching" cards) in the document, hidden, so the first .btnPlay may be another film's.
+const play = await ev(`(()=>{const pg=[...document.querySelectorAll('.itemDetailPage')].find(p=>!p.classList.contains('hide')&&p.offsetParent!==null); const b=pg&&pg.querySelector('.mainDetailButtons .btnPlay, .mainDetailButtons button[data-action=resume], .mainDetailButtons button[data-action=play]'); if(b){b.click(); return true} return false})()`);
 step(`play pressed: ${play}`);
 const t1 = Date.now();
 const started = await waitFor("(()=>{const v=document.querySelector('video'); return !!(v && v.currentTime>0.5)})()", 60000);
-const startup = ((Date.now() - t1) / 1000).toFixed(1); res.started = started; step(`playback started: ${started} after ${startup}s`);
+const startup = ((Date.now() - t1) / 1000).toFixed(1); res.started = started;
+res.playing_item = await ev(`(()=>{const v=document.querySelector('video'); const m=v&&/[/]videos[/]([0-9a-f-]+)[/]/i.exec(v.currentSrc||v.src||''); return m?m[1].replace(/-/g,''):null})()`);
+res.played_requested = res.playing_item === ITEM.replace(/-/g, ""); step(`playing ${res.playing_item}, the requested film: ${res.played_requested}`); step(`playback started: ${started} after ${startup}s`);
 await ev(`(()=>{const v=document.querySelector('video'); if(!v) return; window.__stalls=0; window.__waitT=0; let w=0; v.addEventListener('waiting',()=>{window.__stalls++; w=performance.now()}); v.addEventListener('playing',()=>{ if(w){window.__waitT+=performance.now()-w; w=0} });})()`);
 const samples = []; for (let i = 0; i < 12; i++) { await sleep(5000);
   samples.push(await ev(`(()=>{const v=document.querySelector('video'); if(!v) return null; const q=v.getVideoPlaybackQuality? v.getVideoPlaybackQuality():{}; return {t:+v.currentTime.toFixed(1), w:v.videoWidth, h:v.videoHeight, rs:v.readyState, dropped:q.droppedVideoFrames, total:q.totalVideoFrames, stalls:window.__stalls, waitMs:Math.round(window.__waitT), src:(v.currentSrc||'').slice(0,140)}})()`)); }
