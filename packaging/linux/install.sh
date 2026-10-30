@@ -145,6 +145,13 @@ if [ -z "${LS_UI_PASSWORD:-}" ]; then
 fi
 LS_DATA_DIR=${LS_DATA_DIR:-$DIR/data}
 LS_CHAIN=${LS_CHAIN:-main}
+# the chain's name as the node itself says it (getblockchaininfo), not its common name: "mainnet" here
+# would stop the signer at its start with "the node is on main"
+case $LS_CHAIN in
+  main | test | testnet4 | signet | regtest) ;;
+  mainnet) die "LS_CHAIN is \"mainnet\": use \"main\", the name your node gives it" ;;
+  *) die "LS_CHAIN is \"$LS_CHAIN\": use main, test, testnet4, signet or regtest, the name your node gives its chain" ;;
+esac
 COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME:-lightning-stream}
 LS_UI_PORT=${LS_UI_PORT:-8482} LS_MCP_PORT=${LS_MCP_PORT:-33511} LS_CONNECTOR_PORT=${LS_CONNECTOR_PORT:-8484} LS_APP_PORTS=${LS_APP_PORTS:-33521,33522,33523,33524}
 LS_GW_PORT=${LS_GW_PORT:-8402} LS_HASHTAKER_CONTROL_PORT=${LS_HASHTAKER_CONTROL_PORT:-23343}
